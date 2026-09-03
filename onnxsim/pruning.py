@@ -12590,6 +12590,254 @@ def apply_structured_pruning_matmul_nbits(
 #   lengths (as well as different source tensors and different feature
 #   dimensions) throughout, oracle-verified via onnxruntime with no
 #   restriction of this pass's own.
+#
+# `com.microsoft::DecoderMaskedSelfAttention`/`com.microsoft
+# ::DecoderMaskedMultiHeadAttention` -- ONNX Runtime's own step-of-1
+# decode-time IN-PLACE REWRITE TARGETS for `Attention`/`MultiHeadAttention`,
+# not merely two more independently-exported op types. This is real,
+# shipped code, not a schema definition nobody exercises -- confirmed by
+# reading `onnxruntime.transformers.convert_generation`, installed in this
+# environment (``python3 -c "import onnxruntime.transformers
+# .convert_generation as m; print(m.__file__)"`` -- note this module itself
+# imports `torch` at module scope and fails to import in a torch-less
+# environment like this one, so it was read directly off disk rather than
+# imported):
+# `update_decoder_subgraph_use_decoder_masked_attention` (its own
+# `switch_attention` branch) literally reassigns an existing `Attention`
+# node's `op_type` to `"DecoderMaskedSelfAttention"` in place, and
+# `replace_mha_with_dmmha` does the same for `MultiHeadAttention` ->
+# `"DecoderMaskedMultiHeadAttention"`, both called from
+# `convert_generation.py`'s own T5/GPT2/Whisper beam-search/greedy-search
+# export path (`main()`'s own `--use_decoder_masked_attention` CLI flag).
+# Concretely, for a real BERT/ViT/CLIP/T5/Whisper-style export already
+# matched by this section's own `Attention`/`MultiHeadAttention` bullets
+# above, running that export a second time through ORT's own beam-search
+# chaining tool can turn either into one of these two -- so a model this
+# section already prunes correctly today can arrive already rewritten, and
+# would previously have gone entirely unmatched (`grep -c
+# "DecoderMasked.*Attention" onnxsim/pruning.py` returned ``0`` before this
+# change).
+#
+# Both ops' full live schemas were pulled directly, not assumed from name
+# similarity to `Attention`/`MultiHeadAttention`, via
+# ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+# filtered for ``name in ("DecoderMaskedSelfAttention",
+# "DecoderMaskedMultiHeadAttention")`` against this environment's installed
+# onnxruntime 1.29.0 -- every input (name/type/required-optional/position),
+# output, attribute (required/default), and doc string, cross-checked
+# against `update_decoder_subgraph_use_decoder_masked_attention`'s/
+# `replace_mha_with_dmmha`'s own literal node-construction code above:
+#
+# - `DecoderMaskedSelfAttention`: merged QKV `weights`
+#   ``(input_hidden_size, hidden_size + hidden_size + v_hidden_size)`` --
+#   the *same* layout `com.microsoft::Attention` already has -- confirmed
+#   to share `Attention`'s own input *positions* too for everything this
+#   section touches (`weights`/`bias`/`mask_index`/`attention_bias` at
+#   1/2/3/5, unchanged), so :func:`_match_attention_producer`'s own op_type
+#   check was simply widened to accept it, degenerating cleanly into the
+#   same code path `Attention` already uses. Two schema differences from
+#   `Attention`, both confirmed directly off the live attribute dump
+#   (`do_rotary`, `mask_filter_value`, `scale`,
+#   `past_present_share_buffer`, `num_heads` -- five attributes total, no
+#   more), not assumed from the name:
+#   * **No `qkv_hidden_sizes` attribute at all** -- confirmed by its
+#     absence from that five-attribute list, despite the op's own doc
+#     *string* mentioning the phrase verbatim (evidently copy-pasted from
+#     `Attention`'s own doc and never edited to match the real schema).
+#     This traces through cleanly: `_match_attention_producer` already has
+#     a "schema default: Q/K/V evenly split the merged width" branch for
+#     whenever `Attention`'s own (there, schema-*optional*)
+#     `qkv_hidden_sizes` attribute is absent -- confirmed, by tracing that
+#     branch directly, to be exactly the code path this op needs
+#     unconditionally, so no new branch was needed, only extending the
+#     existing absent-attribute one to also cover "never has one at all."
+#     Since the matcher only ever accepts this op's own always-even split,
+#     `dq == dk == dv` is guaranteed, so `keep_count * dq == keep_count *
+#     dk == keep_count * dv` remains true after pruning too --
+#     :func:`_apply_one_plain_attention_chain` skips writing a
+#     `qkv_hidden_sizes` attribute back for this op type at all (it would
+#     be a dead, schema-unrecognized attribute the real kernel never
+#     reads), rather than writing one unconditionally the way it already
+#     does for plain `Attention`.
+#   * A required (not `Attention`'s own schema-optional) `past` input
+#     (index 4, unchanged position) -- real step-of-1 decode exports always
+#     leave this dynamic (the caller's own growing KV-cache state), so
+#     nothing needs slicing in the realistic case; a *constant* one (no
+#     established, tested slicing path here, unlike the `past_key`/
+#     `past_value` *pair* every separate-Q/K/V op in this section already
+#     handles) conservatively declines the whole match rather than being
+#     left silently stale -- see :func:`_match_attention_producer`'s own
+#     docstring.
+#   * `do_rotary` (fused rotary embedding computed *inside* the op, no
+#     external `cos_cache`/`sin_cache` input on this op's own schema at
+#     all -- confirmed by its full input list having none) is declined
+#     outright when set. This needed its own correctness check before
+#     being trusted, per this module's own established
+#     :func:`_walk_back_through_qk_norm_rope` precedent for *external*,
+#     graph-level `RotaryEmbedding` composing safely with head pruning
+#     (per-head rotation using only that head's own `head_size` slice and
+#     a position-dependent, never head-dependent, `cos`/`sin` lookup) --
+#     but that precedent's own safety argument rests on being able to
+#     *run* the rotation and confirm bit-identical results before/after
+#     pruning a subset of heads, and no CPU kernel exists for
+#     `DecoderMaskedSelfAttention` in this environment at all (confirmed
+#     empirically -- see below), so there is nothing here to run. Reaching
+#     for the next-best evidence -- the closely related, CPU-kernel-backed
+#     `com.microsoft::Attention` op's own `do_rotary=1` path (identical
+#     "fused, no external cache" shape) -- turned up a real, confirming
+#     signal rather than one: a minimal `onnx.checker`-valid `Attention`
+#     node with `do_rotary=1` fails at `InferenceSession.run` with
+#     ``"Rotary embedding is not supported in Attention CPU kernel...
+#     Please fuse the model with MHA + RotaryEmbedding"`` -- i.e. fused
+#     do_rotary is unimplemented in *this* op's CPU kernel too, in this
+#     environment. With neither op's own fused-rotary path executable here,
+#     no solid, execution-confirmed safety argument can be built for
+#     `DecoderMaskedSelfAttention`'s `do_rotary=1` specifically -- so, per
+#     this module's own conservative precedent elsewhere, it is declined
+#     outright (`do_rotary=1` in `node.attribute` makes
+#     :func:`_match_attention_producer` return ``None``) rather than
+#     guessed at. `do_rotary=0` (the schema default) matches unconditionally.
+# - `DecoderMaskedMultiHeadAttention`: same pre-projected-Q/K/V shape
+#   family as `MultiHeadAttention` (`query`/`key`/`value` already-projected
+#   activation tensors, no projection weight owned by the node itself), a
+#   real CPU kernel exists for it in this environment (confirmed by
+#   successfully constructing and running an `InferenceSession` -- unlike
+#   `DecoderMaskedSelfAttention` above, which fails
+#   `InferenceSession` construction outright with
+#   ``NOT_IMPLEMENTED : ... Could not find an implementation for
+#   DecoderMaskedSelfAttention``), so every claim below was verified via
+#   real execution against a from-scratch numpy oracle, not schema-doc-only.
+#   Given by :func:`_match_decoder_masked_multi_head_attention_producer`, a
+#   genuinely *separate* matcher function from
+#   :func:`_match_multi_head_attention_producer` (see that function's own
+#   docstring for exactly why a single shared function accepting both
+#   op-types was judged the *less* safe shape here, unlike the merged-QKV
+#   `Attention`/`DecoderMaskedSelfAttention` pair above) -- but reusing
+#   every bit of shared :class:`_GQAChain`/:func:`_apply_one_gqa_chain`/
+#   :func:`_find_separate_qkv_chains` machinery `MultiHeadAttention` itself
+#   already uses, via a new :func:`_find_decoder_masked_mha_chains` wrapper.
+#   Confirmed schema/behavior differences from `MultiHeadAttention`, none
+#   assumed from the name:
+#   * Every input beyond `query`/`key`/`value` sits at a **different
+#     index** from `MultiHeadAttention`'s own: `mask_index` at 3 (was
+#     `key_padding_mask` at 4), `attention_bias` at 4 (was 5), `past_key`/
+#     `past_value` at 5/6 (was 6/7), three new optional inputs
+#     (`past_sequence_length`/`beam_width`/`cache_indirection` at 7/8/9 --
+#     confirmed genuinely runtime-only: none has a `num_heads`-sized axis
+#     on its own schema doc, the identical "ignored, not sliced" treatment
+#     `mask_index` already gets, cross-checked against
+#     `update_decoder_subgraph_use_decoder_masked_attention`'s own literal
+#     construction, which threads `beam_width`/`cache_indirection` through
+#     as plain pass-through graph inputs with no per-head shape at all),
+#     and -- the one difference a single shared matcher could too easily
+#     get wrong -- a combined `bias` moved from index 3 all the way to
+#     index **10**, the *last* input, not merely appended after the new
+#     ones (confirmed both off the live schema dump and independently off
+#     `replace_mha_with_dmmha`'s own literal ``inputs=[...]`` list, which
+#     builds exactly this reordering by hand: `query, key, value,
+#     mask_index="", relative_position_bias="", past_key, past_value,
+#     past_sequence_length, beam_width, cache_indirection, bias`). The
+#     combined bias's own *shape* is unchanged -- still exactly `[nq + nk +
+#     nv]`, per this op's own doc ("Bias tensor with shape (hidden_size +
+#     hidden_size + v_hidden_size) from input projection") -- only its
+#     input *position* differs, so :class:`_GQAChain`'s existing
+#     `mha_bias` field/slicing needed no changes at all, only a different
+#     `combined_bias_input_index` passed to
+#     :func:`_find_separate_qkv_chains` (``10``, not ``3``).
+#   * `allow_differing_v_head_size` is **`False`** here -- *not* the same
+#     value `MultiHeadAttention` itself gets (`True`) -- confirmed by a
+#     real `InferenceSession` run: a node whose V projection is a
+#     genuinely different width than Q's/K's shared one fails outright with
+#     ``"QK head size should be same as V head size to use
+#     DecoderMaskedMultiHeadAttention"``. The same hard equal-head-size
+#     requirement `GroupQueryAttention`/`PagedAttention` already have, for
+#     the identical reason (neither's own fusion path ever produces a
+#     mismatched one) -- a real, confirmed behavioral difference from
+#     `MultiHeadAttention` this module's own naming convention could
+#     otherwise suggest doesn't exist.
+#   * This environment's CPU kernel additionally *requires*
+#     `past_present_share_buffer=1` whenever `past_key`/`past_value` are
+#     connected at all (a `false`/absent attribute fails outright,
+#     ``"past_present_share_buffer_ was false"``) -- an implementation
+#     requirement beyond what the schema's own optional-attribute framing
+#     alone suggests. Doesn't change anything this pass matches or slices
+#     (the attribute is passed through untouched regardless of its value,
+#     like every other op-level attribute this section doesn't rewrite),
+#     but shapes how `tests/test_pruning.py`'s own past-KV-cache tests for
+#     this op are actually constructed.
+#   * `past_key`/`past_value` share the identical BNSH layout (`(batch,
+#     num_heads, seq, head_size)`, `num_heads` at axis 1) as every other op
+#     in this section's own analogous inputs -- reuses
+#     :func:`_past_kv_constants_are_sliceable` unchanged, just at this op's
+#     own indices (5/6) and with no `scale_indices` (no `k_scale`/`v_scale`
+#     inputs on this op's own schema at all). `attention_bias` (index 4)
+#     confirmed to have the identical real, per-head numeric effect
+#     `MultiHeadAttention`'s own already has (perturbing one head's own
+#     slice of a connected constant, through a real end-to-end run, changed
+#     only that head's own output slice and nothing else) -- gets the
+#     identical :func:`_head_bias_axis`-mediated treatment.
+#   * Reporting reuses `MultiHeadAttention`'s own `family="attention_mha_head"`
+#     string rather than a new one: the granularity is genuinely identical
+#     (no separate `kv_num_heads` attribute on this op's own schema either,
+#     confirmed off the same live dump -- `chain.kv_num_heads ==
+#     chain.num_heads` always, exactly as for `MultiHeadAttention`), so a
+#     distinct family string would report a structurally identical thing
+#     under a different name for no reason -- unlike `PagedAttention`'s own
+#     genuinely different (real GQA-style) grouping, which does get its own.
+#   * **Cross-attention was investigated and found NOT to compose the way
+#     it does for `MultiHeadAttention`** -- confirmed, not assumed, and
+#     left deliberately unmatched. `MultiHeadAttention`'s own cross-
+#     attention shape (Q from one MatMul-fed rank-3 source, K/V from a
+#     genuinely different one, also rank-3) is already fully supported here
+#     (see the `MultiHeadAttention` bullet above) via the same generic
+#     :func:`_find_separate_qkv_chains` machinery -- but
+#     `DecoderMaskedMultiHeadAttention`'s own `key`/`value` inputs, per
+#     their own schema doc, take a genuinely *different shape* for cross
+#     attention than for self-attention: "Key with shape (batch_size, 1,
+#     hidden_size) for self attention **or past_key with shape
+#     (batch_size, num_heads, kv_sequence_length, head_size) for cross
+#     attention**" -- a pre-projected, already-BNSH-transposed rank-4
+#     tensor fed directly into `key`/`value`, not a rank-3
+#     `(batch_size, kv_sequence_length, hidden_size)` tensor from an
+#     ordinary MatMul producer the way `MultiHeadAttention`'s own
+#     cross-attention convention (and this whole section's `_match_producer`
+#     machinery) expects. Confirmed via two real `InferenceSession` runs,
+#     not doc-string-only: passing a rank-3 `key`/`value` pair with
+#     `kv_sequence_length != 1` (the shape a naive port of the
+#     `MultiHeadAttention` cross-attention test would use) runs to
+#     completion but produces silently **wrong** numbers (no error raised
+#     at all -- max-abs-diff ~1.1 against the numpy oracle, versus the
+#     rank-4 form's ~1.2e-7); the documented rank-4
+#     `(batch_size, num_heads, kv_sequence_length, head_size)` form matches
+#     the same oracle to ~1.2e-7. `_find_separate_qkv_chains`'s own
+#     `_match_producer`/`_match_matmul_like` machinery already declines
+#     that rank-4 shape by construction -- it isn't fed by a MatMul/
+#     vanilla-Gemm producer with a 2-D weight at all, so the per-branch
+#     "must be internal, must resolve via `_match_producer`" loop simply
+#     never matches it -- so no additional check was needed to keep this
+#     op's own cross-attention shape out of scope, but this is a genuine,
+#     confirmed scope boundary worth being explicit about, not an accident
+#     of some other unrelated check. (Separately: this op's own kernel also
+#     hard-requires `query`'s -- and, for the *self*-attention rank-3
+#     `key`/`value` form, their own -- sequence length to be exactly 1
+#     ("Input sequence length should be 1 to use
+#     DecoderMaskedMultiHeadAttention. Actual length is N" otherwise); this
+#     is a purely runtime-shape constraint on the graph's own actual batch/
+#     seq dimensions, invisible to this pass's static graph matching and
+#     unaffected by anything this pass slices, so it needed no code of its
+#     own -- noted here only because it explains why every
+#     `DecoderMaskedMultiHeadAttention` correctness test in
+#     `tests/test_pruning.py` below uses `seq_len=1` throughout.)
+#
+# Both ops' own dry-run mirrors (`_analyze_attention_head_pruning`/
+# `_analyze_attention_head_wanda_pruning`, via the shared
+# `_analyze_attention_chains`) and `_attention_not_eligible`'s own
+# "recognized but declined" reporting were updated identically -- a
+# `DecoderMaskedSelfAttention`/`DecoderMaskedMultiHeadAttention` node that
+# fails to match (the `do_rotary=1`/non-empty-constant-`past`/cross-
+# attention/mismatched-V-head-size cases above) is reported by name in
+# `not_eligible`, exactly like every other declined op-type in this
+# section, rather than silently vanishing from the report.
 _ATTENTION_DOMAIN = "com.microsoft"
 
 # The three quantized-cache dtypes `GroupQueryAttention`'s own `T_CACHE` type
@@ -12723,7 +12971,8 @@ _AttnLikeChain = Union[_AttentionChain, _GQAChain]
 def _match_attention_producer(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> Optional[Tuple[str, Optional[str], int, int, int, int]]:
-    """If `node` is a ``com.microsoft::Attention`` node with a constant 2-D
+    """If `node` is a ``com.microsoft::Attention`` *or*
+    ``com.microsoft::DecoderMaskedSelfAttention`` node with a constant 2-D
     float32 merged QKV weight ``[K, Nq+Nk+Nv]`` (and, if present, a
     constant 1-D float32 merged bias), returns
     ``(weight_name, bias_name_or_None, num_heads, Nq, Nk, Nv)``.
@@ -12754,9 +13003,75 @@ def _match_attention_producer(
     dynamic, absent, or a constant that resolves to the latter --
     :func:`_apply_one_plain_attention_chain` performs the actual slice once
     a match succeeds.
+
+    ``DecoderMaskedSelfAttention`` (schema confirmed live the same way,
+    ``since_version`` 1) is ONNX Runtime's own in-place rewrite target for a
+    step-of-1 decoder ``Attention`` node -- see this module's own
+    "Attention-head pruning" section comment for the full empirical
+    investigation (the real, shipped
+    `onnxruntime.transformers.convert_generation
+    .update_decoder_subgraph_use_decoder_masked_attention` rewrite this was
+    confirmed against). Its own schema shares `Attention`'s exact input
+    *positions* for everything this matcher/its caller touch --
+    `weights`/`bias`/`mask_index`/`attention_bias` sit at the identical
+    indices 1/2/3/5 -- so this function degenerates cleanly to the same
+    code path for it, with three differences this function accounts for:
+
+    - `past` (index 4) is *required* by this op's own schema (``Single``,
+      not `Attention`'s own ``Optional``) and, per its own doc, holds
+      combined key+value state shaped ``(2, batch_size, num_heads,
+      past_sequence_length, head_size)`` -- the same combined layout
+      `Attention`'s own (schema-optional, and never populated by any real
+      export this module has confirmed, so never validated here at all)
+      `past` input would have. A real step-of-1 decode export always
+      leaves this dynamic (an ordinary graph input threaded through every
+      decode call, updated in place) -- the caller's own runtime state, not
+      a weight this pass could safely reslice -- but a hand-built or
+      unusual graph could in principle bind a *constant* here; since this
+      function has no established, tested slicing path for it (unlike the
+      `past_key`/`past_value` pair every separate-Q/K/V op in this section
+      already handles via :func:`_past_kv_constants_are_sliceable`), a
+      constant `past` conservatively declines the whole match rather than
+      being left silently stale.
+    - `qkv_hidden_sizes` does not exist on this op's own schema at all
+      (confirmed by enumerating every attribute the live schema dump
+      reports for it: `do_rotary`, `mask_filter_value`, `scale`,
+      `past_present_share_buffer`, `num_heads` -- no `qkv_hidden_sizes`
+      member, despite this op's own doc *string* mentioning the phrase
+      verbatim, evidently copy-pasted from `Attention`'s own doc and never
+      edited) -- so this op always takes the "Schema default: Q/K/V evenly
+      split the merged width" branch below unconditionally, the exact
+      branch `Attention` itself already falls into whenever *its own*
+      (schema-optional, for `Attention`) `qkv_hidden_sizes` attribute is
+      absent. A node of this op type carrying an attribute of that name
+      anyway (a malformed or hand-edited graph -- this attribute has no
+      meaning to the real kernel, which never reads it) still declines the
+      match outright here, conservatively, rather than guessing whether
+      whatever produced it intended an uneven split this op's own kernel
+      could never actually honor.
+    - `do_rotary` (fused rotary position embedding computed inside the op
+      itself, no external `cos_cache`/`sin_cache` input on this op's own
+      schema at all) is declined outright when set (`!= 0`): see this
+      module's own "Attention-head pruning" section comment for the full
+      reasoning -- in short, this environment's CPU kernel for the closely
+      related `Attention` op explicitly does *not* implement `do_rotary` at
+      all ("Rotary embedding is not supported in Attention CPU kernel...",
+      confirmed via a real `onnxruntime.InferenceSession` run), and
+      `DecoderMaskedSelfAttention` itself has no CPU kernel in this
+      environment either (confirmed the same way -- `NOT_IMPLEMENTED`), so
+      there is no way to execute *either* op's own fused-rotary path here
+      to confirm per-head independence the way this module's own
+      :func:`_walk_back_through_qk_norm_rope` precedent (external,
+      graph-level `RotaryEmbedding`) was confirmed. `do_rotary=0` (the
+      schema default, and the only value ever actually exercised here)
+      matches unconditionally, same as `Attention` itself.
     """
-    if node.domain != _ATTENTION_DOMAIN or node.op_type != "Attention":
+    if node.domain != _ATTENTION_DOMAIN or node.op_type not in (
+        "Attention",
+        "DecoderMaskedSelfAttention",
+    ):
         return None
+    is_dmsa = node.op_type == "DecoderMaskedSelfAttention"
     if len(node.input) < 2:
         return None
     w_name = node.input[1]
@@ -12780,15 +13095,27 @@ def _match_attention_producer(
         ):
             return None
 
+    if is_dmsa and len(node.input) > 4 and node.input[4]:  # past
+        if node.input[4] in initializer_map:
+            return None  # no established/tested slicing path -- decline
+
     num_heads = None
     qkv_hidden_sizes: Optional[List[int]] = None
+    do_rotary = 0
     for attr in node.attribute:
         if attr.name == "num_heads":
             num_heads = attr.i
         elif attr.name == "qkv_hidden_sizes":
             qkv_hidden_sizes = list(attr.ints)
+        elif attr.name == "do_rotary":
+            do_rotary = attr.i
     if not num_heads or num_heads <= 0:
         return None
+    if is_dmsa:
+        if do_rotary:
+            return None  # fused RoPE -- no confirmed per-head-safe execution path here
+        if qkv_hidden_sizes is not None:
+            return None  # not a real attribute on this op's own schema -- decline
 
     if qkv_hidden_sizes is not None:
         if len(qkv_hidden_sizes) != 3:
@@ -13318,6 +13645,144 @@ def _match_multi_head_attention_producer(
                 return None  # doesn't statically resolve -- decline rather than guess
 
     if not _past_kv_constants_are_sliceable(node, initializer_map, (6, 7), num_heads):
+        return None
+
+    return num_heads, num_heads
+
+
+def _match_decoder_masked_multi_head_attention_producer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[int, int]]:
+    """If `node` is a ``com.microsoft::DecoderMaskedMultiHeadAttention`` node
+    this module can safely act on, returns ``(num_heads, num_heads)`` -- the
+    same shape :func:`_match_multi_head_attention_producer` returns for
+    `MultiHeadAttention`, `kv_num_heads` always equal to `num_heads` (this
+    op's own schema, confirmed live the same way, has exactly one head-count
+    attribute, `num_heads` -- no `kv_num_heads`).
+
+    This is ONNX Runtime's own in-place rewrite target for a step-of-1
+    decoder `MultiHeadAttention` node -- see this module's own
+    "Attention-head pruning" section comment for the full empirical
+    investigation (the real, shipped
+    `onnxruntime.transformers.convert_generation.replace_mha_with_dmmha`
+    rewrite this was confirmed against) and exactly why this gets its own
+    matcher function rather than widening
+    :func:`_match_multi_head_attention_producer`'s own op_type check the way
+    :func:`_match_attention_producer` does for `DecoderMaskedSelfAttention`:
+    unlike that merged-QKV pair, this op's own input *positions* genuinely
+    differ from `MultiHeadAttention`'s own at almost every index beyond
+    `query`/`key`/`value` (confirmed live, not assumed from the name
+    alone) -- `mask_index` at 3 (was `key_padding_mask` at 4),
+    `attention_bias` at 4 (was 5), `past_key`/`past_value` at 5/6 (was
+    6/7), three new optional inputs (`past_sequence_length`/`beam_width`/
+    `cache_indirection` at 7/8/9, all confirmed head-count-independent, see
+    below), and -- the one a single shared matcher accepting both op types
+    could too easily get wrong -- its own combined `bias` moves from index
+    3 to index **10**, the *last* input, not merely appended after new ones
+    (confirmed both off the live schema dump and independently off
+    `replace_mha_with_dmmha`'s own literal ``inputs=[...]`` list, which
+    builds exactly this reordering by hand). A single shared function
+    threading a per-op-type index table through every one of these would
+    have five different index tables to keep in sync instead of one; two
+    small, independently-readable matcher functions (mirroring this
+    section's own existing `GroupQueryAttention`-vs-`PagedAttention` /
+    plain-ai.onnx-`Attention` split, already four matcher functions deep
+    before this one) was judged the safer shape.
+
+    Confirmed, via actual onnxruntime execution (a real CPU kernel exists
+    for this op in this environment, unlike `DecoderMaskedSelfAttention`
+    below -- see this module's own "Attention-head pruning" section
+    comment), to differ from `MultiHeadAttention` in three ways this
+    function accounts for:
+
+    - `mask_index` (index 3), per its own doc, is one of the same several
+      shapes `MultiHeadAttention`'s own `key_padding_mask` documents --
+      none with a `num_heads`-sized axis -- so, like that input, it is
+      unconditionally head-count-independent and never inspected here.
+    - `attention_bias` (index 4, **not** 5) is confirmed to have the exact
+      same real, per-head numeric effect `MultiHeadAttention`'s own
+      analogous input already has (a hand-built model perturbing one
+      head's own slice of a connected constant changed only that head's
+      own output slice and no other, run end to end through a real
+      `onnxruntime.InferenceSession`) -- gets the identical
+      constant-resolves-cleanly-or-is-declined treatment via
+      :func:`_head_bias_axis`.
+    - `past_key`/`past_value` (indices 5/6, **not** 6/7) are laid out in
+      the identical BNSH format (`(batch_size, num_heads,
+      past_sequence_length, head_size)`, axis 1 the `num_heads` axis) as
+      every other op in this section's own `past_key`/`past_value`, so
+      reuse the same :func:`_past_kv_constants_are_sliceable` gate with no
+      `scale_indices` (this op's own schema has no `k_scale`/`v_scale`
+      inputs at all, confirmed off the same live schema dump). Empirically
+      confirmed further: this environment's CPU kernel additionally
+      *requires* `past_present_share_buffer=1` whenever `past_key`/
+      `past_value` are connected at all (a `false`-valued or absent
+      attribute fails outright, ``"past_present_share_buffer_ was
+      false"``) -- an implementation requirement beyond what the schema's
+      own optional-attribute framing alone would suggest, noted here since
+      it shapes how this op is actually exercised in
+      ``tests/test_pruning.py``, but not something this matcher itself
+      needs to check: `past_present_share_buffer` is passed through
+      untouched regardless of its value, the same as every other
+      op-level attribute this whole section doesn't rewrite.
+
+    `past_sequence_length` (index 7), `beam_width` (index 8), and
+    `cache_indirection` (index 9) are, per their own schema docs, a scalar
+    decode-position counter, a `[1]`-shaped beam-count scalar, and a
+    `[batch_size, beam_width, max_output_length]` buffer respectively --
+    none with a `num_heads`-sized axis anywhere -- so all three are
+    unconditionally left alone (never inspected here, never touched by
+    :func:`_apply_one_gqa_chain`), the same "ignored, not sliced" treatment
+    `mask_index` already gets. `output_qk` (an attribute, not an input --
+    "Need output the cross attention MatMul(Q, K)", producing an optional
+    4th node *output*) needs no handling either: an output's own shape is
+    whatever the runtime kernel produces for the node's own (already
+    correctly rewritten) `num_heads` attribute -- there is no static tensor
+    here to slice, the same reasoning every other matched op's own
+    `output`/`present`/`present_key`/`present_value` outputs already get
+    (never touched, never even named on :class:`_GQAChain`).
+
+    Cross-attention was investigated explicitly and found **not** to
+    compose the way it does for `MultiHeadAttention` -- deliberately left
+    unmatched here rather than assumed to work, see this module's own
+    "Attention-head pruning" section comment for the full empirical
+    finding (this op's own `key`/`value` inputs, per their own doc, take a
+    *different* shape for cross-attention than for self-attention -- a
+    pre-projected rank-4 `(batch_size, num_heads, kv_sequence_length,
+    head_size)` tensor fed directly, not `MultiHeadAttention`'s own rank-3
+    `(batch_size, kv_sequence_length, hidden_size)` MatMul-producer-fed
+    convention -- confirmed via real onnxruntime execution: a rank-3
+    `key`/`value` pair with `kv_sequence_length != 1` runs but produces
+    silently *wrong* numbers, no error at all, while the rank-4 form
+    matches a numpy oracle to ~1.2e-7). :func:`_find_separate_qkv_chains`'s
+    own `_match_producer`/`_match_matmul_like` machinery already declines
+    that rank-4 shape by construction (it isn't fed by a MatMul/vanilla-Gemm
+    producer with a 2-D weight at all), so no extra check is needed *here*
+    to keep it unmatched -- but this is a genuine, confirmed scope boundary
+    worth being explicit about, not an accident of some other check.
+    """
+    if (
+        node.domain != _ATTENTION_DOMAIN
+        or node.op_type != "DecoderMaskedMultiHeadAttention"
+    ):
+        return None
+    if len(node.input) < 3 or not (node.input[0] and node.input[1] and node.input[2]):
+        return None
+
+    num_heads = None
+    for attr in node.attribute:
+        if attr.name == "num_heads":
+            num_heads = attr.i
+    if not num_heads or num_heads <= 0:
+        return None
+
+    if len(node.input) > 4 and node.input[4]:  # attention_bias
+        bias_init = initializer_map.get(node.input[4])
+        if bias_init is not None and int(np.prod(bias_init.dims)) > 0:
+            if _head_bias_axis(list(bias_init.dims), num_heads) is None:
+                return None  # doesn't statically resolve -- decline rather than guess
+
+    if not _past_kv_constants_are_sliceable(node, initializer_map, (5, 6), num_heads):
         return None
 
     return num_heads, num_heads
@@ -14321,6 +14786,39 @@ def _find_mha_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
     )
 
 
+def _find_decoder_masked_mha_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+    """The ``com.microsoft::DecoderMaskedMultiHeadAttention`` analogue of
+    :func:`_find_mha_chains` -- see :func:`_find_separate_qkv_chains` (the
+    shared body) and
+    :func:`_match_decoder_masked_multi_head_attention_producer` (what's
+    matched and why it's declined otherwise, including the full empirical
+    schema/execution investigation this whole function was built from).
+    Passes ``allow_differing_v_head_size=False`` -- **not** the same value
+    :func:`_find_mha_chains` passes for `MultiHeadAttention` -- confirmed
+    empirically via a real `onnxruntime.InferenceSession` run: a
+    `DecoderMaskedMultiHeadAttention` node whose V projection is a
+    genuinely different width than Q's/K's shared one fails outright
+    (``"QK head size should be same as V head size to use
+    DecoderMaskedMultiHeadAttention"``), the same hard equal-head-size
+    requirement `GroupQueryAttention`/`PagedAttention` already have (see
+    their own `_find_*_chains` docstrings) rather than `MultiHeadAttention`'s
+    own genuinely permissive one -- a real difference between two ops this
+    module's naming might otherwise suggest are identical in every way but
+    op_type. ``combined_bias_input_index=10`` -- this op's own `bias`
+    input, moved to the *last* position (not index 3, `MultiHeadAttention`'s
+    own) -- see :func:`_match_decoder_masked_multi_head_attention_producer`'s
+    own docstring for why that reordering is confirmed real rather than
+    assumed.
+    """
+    return _find_separate_qkv_chains(
+        graph,
+        _match_decoder_masked_multi_head_attention_producer,
+        "num_heads",
+        allow_differing_v_head_size=False,
+        combined_bias_input_index=10,
+    )
+
+
 def _find_paged_attention_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
     """The ``com.microsoft::PagedAttention`` analogue of
     :func:`_find_gqa_chains` -- see :func:`_find_separate_qkv_chains` (the
@@ -14522,7 +15020,15 @@ def _apply_one_plain_attention_chain(
             found_qkv = True
             del attr.ints[:]
             attr.ints.extend([keep_count * dq, keep_count * dk, keep_count * dv])
-    if not found_qkv:
+    # `DecoderMaskedSelfAttention` has no `qkv_hidden_sizes` attribute on its
+    # own schema at all (see :func:`_match_attention_producer`'s own
+    # docstring) -- `dq == dk == dv` is guaranteed for it (the matcher only
+    # ever accepts its own always-even 3-way split), so `keep_count * dq ==
+    # keep_count * dk == keep_count * dv` remains true after pruning too,
+    # and the kernel's own even-split default reproduces the right shape
+    # with no attribute needed. Writing one anyway would just be a dead,
+    # schema-unrecognized attribute on the node -- harmless but pointless.
+    if not found_qkv and chain.node.op_type != "DecoderMaskedSelfAttention":
         chain.node.attribute.append(
             onnx.helper.make_attribute(
                 "qkv_hidden_sizes",
@@ -14764,13 +15270,15 @@ def _apply_one_gqa_chain(
         _slice_last_axis(initializer_map[chain.mha_bias], full_bias_idx)
 
     # `GroupQueryAttention`'s past_key/past_value live at input indices 3/4,
-    # the plain ai.onnx op's own at 4/5, `MultiHeadAttention`'s own at 6/7
-    # (see `_match_gqa_producer`'s, `_match_onnx_attention_producer`'s, and
-    # `_match_multi_head_attention_producer`'s own docstrings) -- all three
-    # already confirmed, at match time, to be either absent/dynamic (nothing
-    # to do here) or a BNSH-format constant (plain FLOAT, or -- GQA only --
-    # quantized with a schema-conforming scale) safe to slice along axis 1
-    # by `keep_groups` (see :func:`_past_kv_constants_are_sliceable`).
+    # the plain ai.onnx op's own at 4/5, `MultiHeadAttention`'s own at 6/7,
+    # `DecoderMaskedMultiHeadAttention`'s own at 5/6 (see `_match_gqa_producer`'s,
+    # `_match_onnx_attention_producer`'s, `_match_multi_head_attention_producer`'s,
+    # and :func:`_match_decoder_masked_multi_head_attention_producer`'s own
+    # docstrings) -- all four already confirmed, at match time, to be either
+    # absent/dynamic (nothing to do here) or a BNSH-format constant (plain
+    # FLOAT, or -- GQA only -- quantized with a schema-conforming scale)
+    # safe to slice along axis 1 by `keep_groups` (see
+    # :func:`_past_kv_constants_are_sliceable`).
     is_gqa = (
         chain.node.domain == _ATTENTION_DOMAIN
         and chain.node.op_type == "GroupQueryAttention"
@@ -14778,6 +15286,10 @@ def _apply_one_gqa_chain(
     is_mha = (
         chain.node.domain == _ATTENTION_DOMAIN
         and chain.node.op_type == "MultiHeadAttention"
+    )
+    is_dmmha = (
+        chain.node.domain == _ATTENTION_DOMAIN
+        and chain.node.op_type == "DecoderMaskedMultiHeadAttention"
     )
     # `PagedAttention`'s own `key_cache`/`value_cache` (indices 3/4) are
     # never sliced at all -- already confirmed, at match time, to always be
@@ -14792,7 +15304,15 @@ def _apply_one_gqa_chain(
         and chain.node.op_type == "PagedAttention"
     )
     past_kv_indices = (
-        (3, 4) if is_gqa else (6, 7) if is_mha else () if is_paged else (4, 5)
+        (3, 4)
+        if is_gqa
+        else (6, 7)
+        if is_mha
+        else (5, 6)
+        if is_dmmha
+        else ()
+        if is_paged
+        else (4, 5)
     )
     for idx in past_kv_indices:
         if len(chain.node.input) <= idx or not chain.node.input[idx]:
@@ -14842,20 +15362,23 @@ def _apply_one_gqa_chain(
             # else: PER_TENSOR broadcast scalar -- no per-head axis to slice
 
     # `attention_bias`/`attn_mask` (index 10 for `GroupQueryAttention`, 3
-    # for the plain ai.onnx op, 5 for `MultiHeadAttention` -- see
-    # `_match_gqa_producer`'s, `_match_onnx_attention_producer`'s, and
-    # `_match_multi_head_attention_producer`'s own docstrings) is sliced
-    # along its own head axis by `keep_q_heads` -- *query*-head granularity,
-    # not `keep_groups`'s kv-group one -- whenever `_head_bias_axis` resolves
-    # it to a genuine per-head tensor against the pre-pruning
-    # `chain.num_heads`; left untouched when it resolves to a broadcast (or
-    # is absent/dynamic, matched the same "nothing to slice" way here as at
-    # match time). `PagedAttention` has no `attention_bias`/`attn_mask`-
-    # equivalent input on its own schema at all (confirmed off the same live
-    # schema dump this whole family was built from), so this whole block is
-    # skipped for it outright -- `chain.node.input[3]` (`key_cache` for
-    # `PagedAttention`) must never be mistaken for one.
-    mask_idx = 10 if is_gqa else 5 if is_mha else None if is_paged else 3
+    # for the plain ai.onnx op, 5 for `MultiHeadAttention`, 4 for
+    # `DecoderMaskedMultiHeadAttention` -- see `_match_gqa_producer`'s,
+    # `_match_onnx_attention_producer`'s, `_match_multi_head_attention_producer`'s,
+    # and :func:`_match_decoder_masked_multi_head_attention_producer`'s own
+    # docstrings) is sliced along its own head axis by `keep_q_heads` --
+    # *query*-head granularity, not `keep_groups`'s kv-group one -- whenever
+    # `_head_bias_axis` resolves it to a genuine per-head tensor against the
+    # pre-pruning `chain.num_heads`; left untouched when it resolves to a
+    # broadcast (or is absent/dynamic, matched the same "nothing to slice"
+    # way here as at match time). `PagedAttention` has no `attention_bias`/
+    # `attn_mask`-equivalent input on its own schema at all (confirmed off
+    # the same live schema dump this whole family was built from), so this
+    # whole block is skipped for it outright -- `chain.node.input[3]`
+    # (`key_cache` for `PagedAttention`) must never be mistaken for one.
+    mask_idx = (
+        10 if is_gqa else 5 if is_mha else 4 if is_dmmha else None if is_paged else 3
+    )
     if (
         mask_idx is not None
         and len(chain.node.input) > mask_idx
@@ -15124,6 +15647,7 @@ def apply_attention_head_pruning(
         *_find_gqa_chains(graph),
         *_find_onnx_attention_chains(graph),
         *_find_mha_chains(graph),
+        *_find_decoder_masked_mha_chains(graph),
         *_find_paged_attention_chains(graph),
     ]
     if chains:
@@ -15275,6 +15799,7 @@ def apply_attention_head_wanda_pruning(
         *_find_gqa_chains(graph),
         *_find_onnx_attention_chains(graph),
         *_find_mha_chains(graph),
+        *_find_decoder_masked_mha_chains(graph),
         *_find_paged_attention_chains(graph),
     ]
     if not chains:
@@ -23504,7 +24029,13 @@ def _attention_not_eligible(
             node.op_type == "Attention" and node.domain in (_ATTENTION_DOMAIN, "")
         ) or (
             node.op_type
-            in ("GroupQueryAttention", "MultiHeadAttention", "PagedAttention")
+            in (
+                "GroupQueryAttention",
+                "MultiHeadAttention",
+                "PagedAttention",
+                "DecoderMaskedSelfAttention",
+                "DecoderMaskedMultiHeadAttention",
+            )
             and node.domain == _ATTENTION_DOMAIN
         )
         if not is_attn_like or id(node) in matched_ids:
@@ -23559,7 +24090,19 @@ def _analyze_attention_chains(
             # `GroupQueryAttention` itself supports, so it gets its own
             # `"_group"`-suffixed family string rather than sharing
             # `MultiHeadAttention`'s own `"_head"` one.
-            if chain.node.op_type == "MultiHeadAttention":
+            # `DecoderMaskedMultiHeadAttention` is ONNX Runtime's own
+            # in-place decode-time rewrite target for `MultiHeadAttention`
+            # (see this module's own "Attention-head pruning" section
+            # comment) -- same one-head-per-group granularity
+            # (`chain.kv_num_heads == chain.num_heads` always for it too,
+            # confirmed off its own schema the same way), so it shares
+            # `MultiHeadAttention`'s own family string rather than getting a
+            # distinct one: the reporting granularity is genuinely
+            # identical, not merely similarly named.
+            if chain.node.op_type in (
+                "MultiHeadAttention",
+                "DecoderMaskedMultiHeadAttention",
+            ):
                 family = "attention_mha_head"
             elif chain.node.op_type == "PagedAttention":
                 family = "attention_paged_group"
@@ -23686,6 +24229,7 @@ def _analyze_attention_head_pruning(
         *_find_gqa_chains(graph),
         *_find_onnx_attention_chains(graph),
         *_find_mha_chains(graph),
+        *_find_decoder_masked_mha_chains(graph),
         *_find_paged_attention_chains(graph),
     ]
     layers = _analyze_attention_chains(
@@ -23743,6 +24287,7 @@ def _analyze_attention_head_wanda_pruning(
         *_find_gqa_chains(graph),
         *_find_onnx_attention_chains(graph),
         *_find_mha_chains(graph),
+        *_find_decoder_masked_mha_chains(graph),
         *_find_paged_attention_chains(graph),
     ]
     if not chains:

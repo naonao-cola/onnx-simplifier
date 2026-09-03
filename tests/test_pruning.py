@@ -13256,6 +13256,891 @@ def test_mha_wanda_pruning_matches_oracle_exactly():
     np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
 
 
+# --- apply_attention_head_pruning / _wanda_pruning -- DecoderMaskedSelfAttention --
+#
+# ONNX Runtime's own in-place decode-time rewrite target for
+# `com.microsoft::Attention` (`onnxruntime.transformers.convert_generation
+# .update_decoder_subgraph_use_decoder_masked_attention`'s own
+# `switch_attention` branch literally reassigns an `Attention` node's own
+# `op_type` to this) -- see onnxsim/pruning.py's own "Attention-head
+# pruning" section comment for the full empirical schema/execution
+# investigation this section's tests continue.
+#
+# **No CPU kernel exists for this op in this environment's onnxruntime at
+# all** (confirmed empirically: a minimal, `onnx.checker`-valid
+# `DecoderMaskedSelfAttention` node fails `onnxruntime.InferenceSession`
+# construction outright with ``NOT_IMPLEMENTED : ... Could not find an
+# implementation for DecoderMaskedSelfAttention``) -- so, following this
+# module's own `MatMulNBitsMlp`/`MatMulNBitsQkv`/`PagedAttention` precedent
+# for a matched op with no executable kernel (see onnxsim/pruning.py's own
+# section comments for those), every correctness test below decomposes a
+# pruned node's own sliced `weights`/`bias` into an equivalent, genuinely
+# executable plain `com.microsoft::Attention` node (same merged-QKV layout,
+# `do_rotary=0` -- the only value this pass ever matches for this op
+# anyway) and runs *that* through a real CPU-kernel `InferenceSession`,
+# compared against a numpy-oracle-equivalent independently-built smaller
+# `Attention` model using only the correctly-selected kept heads' own
+# original (pre-pruning) weight columns -- never the pruned
+# `DecoderMaskedSelfAttention` node itself, and never a comparison against
+# the *full, unpruned* model's own output.
+
+
+def _dmsa_model(
+    K=8,
+    H=4,
+    D=4,
+    Out=6,
+    seed=0,
+    batch=2,
+    bias=True,
+    wqkv=None,
+    bqkv=None,
+    wout=None,
+    do_rotary=0,
+    past="",  # "" (omitted) | "dynamic" | "constant"
+):
+    rng = np.random.default_rng(seed)
+    Nq = Nk = Nv = H * D
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + Nk + Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+    if bias and bqkv is None:
+        bqkv = rng.standard_normal((Nq + Nk + Nv,)).astype(np.float32)
+
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    operands = ["X", "Wqkv"]
+    if bias:
+        initializer.append(_f32(bqkv, "Bqkv"))
+        operands.append("Bqkv")
+    else:
+        operands.append("")
+
+    extra_graph_inputs = ""
+    if past == "constant":
+        past_init = rng.standard_normal((2, batch, H, 1, D)).astype(np.float32)
+        initializer.append(_f32(past_init, "Past"))
+        operands += ["", "Past"]  # mask_index="", past="Past"
+    elif past == "dynamic":
+        operands += ["", "PastIn"]
+        extra_graph_inputs = f", float[2,{batch},{H},1,{D}] PastIn"
+
+    while operands and operands[-1] == "":
+        operands.pop()
+    qkv_inputs = ", ".join(operands)
+
+    attrs = f"num_heads={H}"
+    if do_rotary:
+        attrs += f", do_rotary={do_rotary}"
+
+    body = f"""
+        g (float[{batch},1,{K}] X{extra_graph_inputs}) => (float[{batch},1,{Out}] Y)
+        {{
+          ctx = com.microsoft.DecoderMaskedSelfAttention <{attrs}> ({qkv_inputs})
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+        wqkv=wqkv,
+        bqkv=bqkv,
+        wout=wout,
+        batch=batch,
+    )
+
+
+def _dmsa_node(model):
+    return next(
+        n for n in model.graph.node if n.op_type == "DecoderMaskedSelfAttention"
+    )
+
+
+def _dmsa_num_heads(node):
+    return next(a.i for a in node.attribute if a.name == "num_heads")
+
+
+def _dmsa_has_qkv_hidden_sizes(node):
+    return any(a.name == "qkv_hidden_sizes" for a in node.attribute)
+
+
+def test_dmsa_pruning_shrinks_matched_block():
+    model, cfg = _dmsa_model(K=8, H=4, D=4, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    node = _dmsa_node(pruned)
+    assert _dmsa_num_heads(node) == 2  # max(1, 4 - round(4*0.5))
+    # No `qkv_hidden_sizes` attribute is ever written back for this op --
+    # it doesn't exist on the op's own real schema at all (see
+    # onnxsim/pruning.py's own "Attention-head pruning" section comment).
+    assert not _dmsa_has_qkv_hidden_sizes(node)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wqkv"].dims) == [8, 24]  # 2 heads * (4+4+4)
+    assert list(inits["Bqkv"].dims) == [24]
+    assert list(inits["Wout"].dims) == [8, 6]
+
+
+def test_dmsa_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _dmsa_model(K=8, H=8, D=4, Out=6, seed=7)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    node = _dmsa_node(pruned)
+    assert _dmsa_num_heads(node) == cfg["H"]
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wqkv"], cfg["wqkv"])
+
+
+def test_dmsa_pruning_matches_oracle_via_attention_proxy():
+    # Even split -- `dq == dk == dv` -- is the *only* shape this matcher
+    # ever accepts for this op (no `qkv_hidden_sizes` attribute exists on
+    # its own real schema at all, see onnxsim/pruning.py's own
+    # "Attention-head pruning" section comment) -- confirmed here by
+    # slicing manually and checking the pruned weight's own head-block
+    # structure is exactly what a plain `Attention` proxy of the same
+    # (now-smaller) head count would expect.
+    model, cfg = _dmsa_model(K=8, H=8, D=4, Out=6, seed=1)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    node = _dmsa_node(pruned)
+    num_heads = _dmsa_num_heads(node)
+    assert num_heads == 4  # max(1, 8 - round(8*0.5))
+
+    d = cfg["D"]
+    keep_heads = _oracle_keep_heads(
+        cfg["wqkv"], cfg["Nq"], cfg["Nk"], cfg["Nv"], cfg["H"], num_heads
+    )
+    idx = _head_idx(keep_heads, d)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    q_idx = idx
+    k_idx = idx + cfg["Nq"]
+    v_idx = idx + cfg["Nq"] + cfg["Nk"]
+    all_idx = np.concatenate([q_idx, k_idx, v_idx])
+    np.testing.assert_array_equal(inits["Wqkv"], cfg["wqkv"][:, all_idx])
+
+    # Decompose the pruned node's own sliced tensors into a genuinely
+    # executable plain `Attention` proxy (see this section's own comment
+    # above for why) and compare against an independently-built smaller
+    # `Attention` oracle sliced straight from the *original* (pre-pruning)
+    # weights -- never against the full unpruned model's own output.
+    proxy, _ = _attention_model(
+        K=cfg["K"],
+        H=num_heads,
+        D=d,
+        Out=cfg["Out"],
+        wqkv=inits["Wqkv"],
+        bqkv=inits["Bqkv"],
+        wout=inits["Wout"],
+    )
+    oracle, _ = _attention_model(
+        K=cfg["K"],
+        H=num_heads,
+        D=d,
+        Out=cfg["Out"],
+        wqkv=cfg["wqkv"][:, all_idx],
+        bqkv=cfg["bqkv"][all_idx],
+        wout=cfg["wout"][idx, :],
+    )
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    (y_proxy,) = _run(proxy, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_proxy, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_dmsa_pruning_declines_do_rotary():
+    # Fused rotary (computed inside the op, no external cos_cache/sin_cache
+    # input on this op's own schema at all) is declined outright: no CPU
+    # kernel exists for this op at all in this environment, and the closely
+    # related, CPU-kernel-backed `Attention` op's own `do_rotary=1` path is
+    # itself confirmed unimplemented in this environment's CPU kernel
+    # ("Rotary embedding is not supported in Attention CPU kernel...") --
+    # see onnxsim/pruning.py's own "Attention-head pruning" section comment
+    # for the full reasoning. `do_rotary=0` (the default) matches fine, see
+    # every other test in this section.
+    model, cfg = _dmsa_model(K=8, H=4, D=4, Out=6, seed=3, do_rotary=1)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmsa_node(pruned)
+    assert _dmsa_num_heads(node) == cfg["H"]  # left completely untouched
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert report.not_eligible == ["DecoderMaskedSelfAttention 'ctx'"]
+    assert report.layers == []
+
+
+def test_dmsa_pruning_declines_constant_past():
+    # `past` is *required* by this op's own schema (unlike `Attention`'s
+    # own optional one) and real step-of-1 decode exports always leave it
+    # dynamic -- but a hand-built graph could in principle bind a constant
+    # there, which this pass has no established slicing path for (unlike
+    # the `past_key`/`past_value` *pair* every separate-Q/K/V op in this
+    # section already handles) -- so it conservatively declines the whole
+    # match rather than leaving a stale-shaped constant behind.
+    model, cfg = _dmsa_model(K=8, H=4, D=4, Out=6, seed=4, past="constant")
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmsa_node(pruned)
+    assert _dmsa_num_heads(node) == cfg["H"]  # left completely untouched
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert report.not_eligible == ["DecoderMaskedSelfAttention 'ctx'"]
+
+
+def test_dmsa_pruning_dynamic_past_is_pruned_normally():
+    # A *dynamic* `past` (an ordinary graph input, the realistic step-of-1
+    # decode shape) is the caller's own runtime state, not a weight this
+    # pass could corrupt by leaving untouched -- matches and prunes
+    # normally, unlike the constant case above.
+    model, cfg = _dmsa_model(K=8, H=4, D=4, Out=6, seed=5, past="dynamic")
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmsa_node(pruned)
+    assert _dmsa_num_heads(node) == 2  # max(1, 4 - round(4*0.5))
+
+
+def test_dmsa_pruning_dry_run_matches_real_call():
+    model, cfg = _dmsa_model(K=8, H=8, D=4, Out=6, seed=6)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_head"
+    assert layer.total == 8
+    assert layer.would_drop == 4  # round(8*0.5)
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmsa_node(pruned)
+    assert cfg["H"] - _dmsa_num_heads(node) == layer.would_drop
+
+
+# --- apply_attention_head_pruning / _wanda_pruning -- DecoderMaskedMultiHeadAttention --
+#
+# ONNX Runtime's own in-place decode-time rewrite target for
+# `com.microsoft::MultiHeadAttention` (`onnxruntime.transformers
+# .convert_generation.replace_mha_with_dmmha`'s own literal node
+# construction) -- see onnxsim/pruning.py's own "Attention-head pruning"
+# section comment for the full empirical schema/execution investigation
+# this section's tests continue, including exactly why every input beyond
+# `query`/`key`/`value` sits at a different index than `MultiHeadAttention`'s
+# own (`mask_index`@3, `attention_bias`@4, `past_key`/`past_value`@5/6,
+# `past_sequence_length`/`beam_width`/`cache_indirection`@7/8/9, and a
+# combined `bias` moved all the way to index 10).
+#
+# Unlike `DecoderMaskedSelfAttention` above, a real CPU kernel *does* exist
+# for this op in this environment -- every correctness test below runs the
+# actual pruned `DecoderMaskedMultiHeadAttention` node through a real
+# `onnxruntime.InferenceSession`, matched against a numpy-oracle-equivalent
+# independently-built smaller `DecoderMaskedMultiHeadAttention` model using
+# only the correctly-selected kept heads' own original (pre-pruning)
+# weights -- never against the full unpruned model's own output. This
+# environment's own CPU kernel requires query/key/value sequence length to
+# be exactly 1 (``"Input sequence length should be 1 to use
+# DecoderMaskedMultiHeadAttention"`` otherwise) -- a purely runtime-shape
+# constraint invisible to this pass's own static graph matching, but every
+# model built below uses `seq_len=1` throughout so it can actually run.
+
+
+def _dmmha_model(
+    K=8,
+    H=4,
+    D=4,
+    Out=6,
+    seed=0,
+    batch=2,
+    combined_bias=False,
+    producer_bias=False,
+    wq=None,
+    wk=None,
+    wv=None,
+    bq=None,
+    bk=None,
+    bv=None,
+    wout=None,
+    attention_bias=None,
+    past_kv=None,  # None | "nonempty" | "dynamic"
+    past_key=None,
+    past_value=None,
+    past_seq=3,
+    max_seq=8,
+):
+    rng = np.random.default_rng(seed)
+    Nq = Nk = Nv = H * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    q_op, k_op, v_op = "MatMul(X, Wq)", "MatMul(X, Wk)", "MatMul(X, Wv)"
+    if producer_bias:
+        if bq is None:
+            bq = rng.standard_normal((Nq,)).astype(np.float32)
+        if bk is None:
+            bk = rng.standard_normal((Nk,)).astype(np.float32)
+        if bv is None:
+            bv = rng.standard_normal((Nv,)).astype(np.float32)
+        initializer += [_f32(bq, "Bq"), _f32(bk, "Bk"), _f32(bv, "Bv")]
+        q_op, k_op, v_op = "Gemm(X, Wq, Bq)", "Gemm(X, Wk, Bk)", "Gemm(X, Wv, Bv)"
+
+    # Fixed-index layout: query, key, value, mask_index, attention_bias,
+    # past_key, past_value, past_sequence_length, beam_width,
+    # cache_indirection, bias -- see this section's own comment above for
+    # why this differs from `MultiHeadAttention`'s own layout.
+    operands = ["q", "k", "v", "", "", "", "", "", "", "", ""]
+    extra_graph_inputs = ""
+    present_outputs = ""
+    attrs = f"num_heads={H}"
+
+    if attention_bias is not None:
+        initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
+        operands[4] = "AttentionBias"
+
+    if past_kv == "nonempty":
+        if past_key is None:
+            past_key = rng.standard_normal((batch, H, past_seq, D)).astype(np.float32)
+        if past_value is None:
+            past_value = rng.standard_normal((batch, H, past_seq, D)).astype(np.float32)
+        pk_buf = np.zeros((batch, H, max_seq, D), dtype=np.float32)
+        pv_buf = np.zeros((batch, H, max_seq, D), dtype=np.float32)
+        pk_buf[:, :, :past_seq, :] = past_key
+        pv_buf[:, :, :past_seq, :] = past_value
+        initializer += [_f32(pk_buf, "PastKey"), _f32(pv_buf, "PastValue")]
+        initializer.append(
+            onnx.numpy_helper.from_array(
+                np.array([past_seq], dtype=np.int32), "PastSeqLen"
+            )
+        )
+        operands[5] = "PastKey"
+        operands[6] = "PastValue"
+        operands[7] = "PastSeqLen"
+        present_outputs = ", present_key, present_value"
+        attrs += ", past_present_share_buffer=1"
+    elif past_kv == "dynamic":
+        operands[5] = "PastKeyIn"
+        operands[6] = "PastValueIn"
+        extra_graph_inputs += (
+            f", float[{batch},{H},{past_seq},{D}] PastKeyIn"
+            f", float[{batch},{H},{past_seq},{D}] PastValueIn"
+        )
+
+    if combined_bias:
+        if bq is None:
+            bq = rng.standard_normal((Nq,)).astype(np.float32)
+        if bk is None:
+            bk = rng.standard_normal((Nk,)).astype(np.float32)
+        if bv is None:
+            bv = rng.standard_normal((Nv,)).astype(np.float32)
+        combined = np.concatenate([bq, bk, bv]).astype(np.float32)
+        initializer.append(_f32(combined, "Bias"))
+        operands[10] = "Bias"
+
+    while operands and operands[-1] == "":
+        operands.pop()
+
+    ctx_outputs = "ctx" + present_outputs
+    body = f"""
+        g (float[{batch},1,{K}] X{extra_graph_inputs}) => (float[{batch},1,{Out}] Y)
+        {{
+          q = {q_op}
+          k = {k_op}
+          v = {v_op}
+          {ctx_outputs} = com.microsoft.DecoderMaskedMultiHeadAttention <{attrs}> ({", ".join(operands)})
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        bq=bq,
+        bk=bk,
+        bv=bv,
+        wout=wout,
+        batch=batch,
+        past_key=past_key,
+        past_value=past_value,
+    )
+
+
+def _dmmha_node(model):
+    return next(
+        n for n in model.graph.node if n.op_type == "DecoderMaskedMultiHeadAttention"
+    )
+
+
+def _dmmha_num_heads(node):
+    return next(a.i for a in node.attribute if a.name == "num_heads")
+
+
+def test_dmmha_pruning_shrinks_matched_block():
+    model, cfg = _dmmha_model(K=8, H=4, D=4, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _dmmha_node(pruned)
+    assert _dmmha_num_heads(node) == 2  # max(1, 4 - round(4*0.5))
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [8, 8]
+    assert list(inits["Wk"].dims) == [8, 8]
+    assert list(inits["Wv"].dims) == [8, 8]
+    assert list(inits["Wout"].dims) == [8, 6]
+
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    assert y.shape == (cfg["batch"], 1, cfg["Out"])
+
+
+def test_dmmha_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _dmmha_model(K=8, H=8, D=4, Out=6, seed=7)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    node = _dmmha_node(pruned)
+    assert _dmmha_num_heads(node) == cfg["H"]
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"])
+
+
+def test_dmmha_pruning_matches_oracle_exactly():
+    model, cfg = _dmmha_model(K=8, H=8, D=4, Out=6, seed=1, combined_bias=True)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _dmmha_node(pruned)
+    num_heads = _dmmha_num_heads(node)
+    assert num_heads == 4  # max(1, 8 - round(8*0.5))
+
+    d = cfg["D"]
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["H"], d, num_heads
+    )
+    idx = _head_idx(keep_heads, d)
+
+    oracle, _ = _dmmha_model(
+        K=cfg["K"],
+        H=len(keep_heads),
+        D=d,
+        Out=cfg["Out"],
+        seed=1,
+        combined_bias=True,
+        wq=cfg["wq"][:, idx],
+        wk=cfg["wk"][:, idx],
+        wv=cfg["wv"][:, idx],
+        bq=cfg["bq"][idx],
+        bk=cfg["bk"][idx],
+        bv=cfg["bv"][idx],
+        wout=cfg["wout"][idx, :],
+        batch=cfg["batch"],
+    )
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_dmmha_pruning_slices_combined_bias_exactly():
+    model, cfg = _dmmha_model(K=8, H=4, D=4, Out=6, seed=3, combined_bias=True)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    node = _dmmha_node(pruned)
+    num_heads = _dmmha_num_heads(node)
+    d = cfg["D"]
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["H"], d, num_heads
+    )
+    idx = _head_idx(keep_heads, d)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    expected = np.concatenate([cfg["bq"][idx], cfg["bk"][idx], cfg["bv"][idx]])
+    np.testing.assert_array_equal(inits["Bias"], expected)
+    # Confirms the combined bias really is read off input index 10 (the
+    # node's own *last* input), not index 3 (`MultiHeadAttention`'s own).
+    assert node.input[10] == "Bias"
+
+
+def test_dmmha_pruning_attention_bias_is_sliced_and_matches_oracle():
+    # This environment's own CPU kernel additionally requires a connected
+    # `attention_bias` to run in the (cached) self-attention mode -- with no
+    # `past_key`/`past_value` connected at all it errors outright
+    # ("DecoderMaskedMultiHeadAttention does not support attention bias for
+    # cross-attention") -- so this test connects a past cache too, and
+    # sizes `attention_bias`'s own last axis to `total_sequence_length`
+    # (`past_seq + 1`), per this op's own kernel-level shape requirement.
+    H, D = 4, 4
+    past_seq = 3
+    total_seq = past_seq + 1
+    rng = np.random.default_rng(16)
+    attention_bias = rng.standard_normal((1, H, 1, total_seq)).astype(np.float32)
+    model, cfg = _dmmha_model(
+        K=8,
+        H=H,
+        D=D,
+        Out=6,
+        seed=16,
+        attention_bias=attention_bias,
+        past_kv="nonempty",
+        past_seq=past_seq,
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _dmmha_node(pruned)
+    num_heads = _dmmha_num_heads(node)
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], H, H, D, num_heads
+    )
+    idx = _head_idx(keep_heads, D)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["AttentionBias"], attention_bias[:, keep_heads])
+    # Confirms the bias really is read off input index 4 (not 5, the
+    # position `MultiHeadAttention`'s own analogous input sits at).
+    assert node.input[4] == "AttentionBias"
+
+    oracle, _ = _dmmha_model(
+        K=cfg["K"],
+        H=len(keep_heads),
+        D=D,
+        Out=cfg["Out"],
+        seed=16,
+        attention_bias=attention_bias[:, keep_heads],
+        past_kv="nonempty",
+        past_seq=past_seq,
+        past_key=cfg["past_key"][:, keep_heads],
+        past_value=cfg["past_value"][:, keep_heads],
+        wq=cfg["wq"][:, idx],
+        wk=cfg["wk"][:, idx],
+        wv=cfg["wv"][:, idx],
+        wout=cfg["wout"][idx, :],
+        batch=cfg["batch"],
+    )
+    rng2 = np.random.default_rng(17)
+    x = rng2.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_dmmha_pruning_nonempty_past_kv_constant_matches_oracle_exactly():
+    past_seq = 3
+    model, cfg = _dmmha_model(
+        K=8, H=4, D=4, Out=6, seed=18, past_kv="nonempty", past_seq=past_seq
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _dmmha_node(pruned)
+    num_heads = _dmmha_num_heads(node)
+    d = cfg["D"]
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["H"], d, num_heads
+    )
+    idx = _head_idx(keep_heads, d)
+
+    # `inits["PastKey"]`/`["PastValue"]` are already the post-pruning
+    # buffer (axis 1 already sliced down to `num_heads`) -- compare its own
+    # real (non-padding) `:past_seq` slice against the *original* cache
+    # sliced the same way, not re-index it a second time.
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(
+        inits["PastKey"][:, :, :past_seq, :], cfg["past_key"][:, keep_heads]
+    )
+    np.testing.assert_array_equal(
+        inits["PastValue"][:, :, :past_seq, :], cfg["past_value"][:, keep_heads]
+    )
+    # Confirms past_key/past_value really are read off indices 5/6 (not
+    # 6/7, `MultiHeadAttention`'s own).
+    assert node.input[5] == "PastKey"
+    assert node.input[6] == "PastValue"
+
+    oracle, _ = _dmmha_model(
+        K=cfg["K"],
+        H=len(keep_heads),
+        D=d,
+        Out=cfg["Out"],
+        seed=18,
+        past_kv="nonempty",
+        past_seq=past_seq,
+        past_key=cfg["past_key"][:, keep_heads],
+        past_value=cfg["past_value"][:, keep_heads],
+        wq=cfg["wq"][:, idx],
+        wk=cfg["wk"][:, idx],
+        wv=cfg["wv"][:, idx],
+        wout=cfg["wout"][idx, :],
+        batch=cfg["batch"],
+    )
+    rng = np.random.default_rng(19)
+    x = rng.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_dmmha_pruning_dynamic_past_kv_is_left_untouched():
+    model, cfg = _dmmha_model(K=8, H=4, D=4, Out=6, seed=21, past_kv="dynamic")
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmmha_node(pruned)
+    assert _dmmha_num_heads(node) == 2  # still prunes the producer weights
+    # The dynamic past_key/past_value graph inputs themselves are the
+    # caller's own runtime data -- left completely alone, same names/shapes.
+    input_names = {i.name for i in pruned.graph.input}
+    assert "PastKeyIn" in input_names
+    assert "PastValueIn" in input_names
+
+
+def test_dmmha_pruning_diff_v_head_size_is_declined():
+    # Unlike `MultiHeadAttention` (which genuinely allows V its own
+    # head_size), this op's own CPU kernel hard-requires equal Q/K/V
+    # head_size -- confirmed empirically ("QK head size should be same as V
+    # head size to use DecoderMaskedMultiHeadAttention") -- so
+    # `_find_decoder_masked_mha_chains` passes
+    # `allow_differing_v_head_size=False` and a node whose V width
+    # genuinely differs declines the whole match rather than being pruned
+    # into a shape that could never execute anyway.
+    K, H, D, Dv, Out = 8, 2, 4, 3, 5
+    model, cfg = _dmmha_model(K=K, H=H, D=D, Out=Out, seed=22)
+    # Hand-widen V's own weight/Wout to a genuinely different per-head width.
+    rng = np.random.default_rng(23)
+    wv2 = rng.standard_normal((K, H * Dv)).astype(np.float32)
+    wout2 = rng.standard_normal((H * Dv, Out)).astype(np.float32)
+    inits = {t.name: t for t in model.graph.initializer}
+    inits["Wv"].CopyFrom(_f32(wv2, "Wv"))
+    inits["Wout"].CopyFrom(_f32(wout2, "Wout"))
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmmha_node(pruned)
+    assert _dmmha_num_heads(node) == H  # left completely untouched
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert report.not_eligible == ["DecoderMaskedMultiHeadAttention 'ctx'"]
+
+
+def test_dmmha_pruning_cross_attention_4d_kv_is_not_matched():
+    # The real cross-attention calling convention for this op feeds `key`/
+    # `value` as a pre-projected rank-4 `(batch, num_heads, kv_seq,
+    # head_size)` tensor directly (confirmed empirically -- see
+    # onnxsim/pruning.py's own "Attention-head pruning" section comment),
+    # not `MultiHeadAttention`'s own rank-3 MatMul-producer-fed convention.
+    # That rank-4 tensor is never fed by a MatMul/vanilla-Gemm producer
+    # with a 2-D weight at all, so `_find_separate_qkv_chains`'s own
+    # `_match_producer` naturally declines it -- confirmed here structurally
+    # (this test never claims the resulting model is numerically valid to
+    # actually run this way; only that this pass correctly leaves it alone
+    # rather than mis-slicing it).
+    H, D, K, Out = 4, 8, 8, 6
+    kv_seq = 7
+    rng = np.random.default_rng(24)
+    wq = rng.standard_normal((K, H * D)).astype(np.float32)
+    wout = rng.standard_normal((H * D, Out)).astype(np.float32)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        g (float[batch,1,{K}] X, float[batch,{H},{kv_seq},{D}] KeyIn, float[batch,{H},{kv_seq},{D}] ValueIn) => (float[batch,1,{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          ctx = com.microsoft.DecoderMaskedMultiHeadAttention <num_heads={H}> (q, KeyIn, ValueIn)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    )
+    model.graph.initializer.extend([_f32(wq, "Wq"), _f32(wout, "Wout")])
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmmha_node(pruned)
+    assert _dmmha_num_heads(node) == H  # left completely untouched
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert report.not_eligible == ["DecoderMaskedMultiHeadAttention 'ctx'"]
+
+
+def test_dmmha_pruning_runtime_only_inputs_left_untouched():
+    # `mask_index`, `past_sequence_length`, `beam_width`, and
+    # `cache_indirection` never carry a `num_heads`-sized axis on their own
+    # schema docs (confirmed live -- see onnxsim/pruning.py's own
+    # "Attention-head pruning" section comment) -- connected as ordinary
+    # dynamic graph inputs, they are never inspected or touched by this
+    # pass at all.
+    K, H, D, Out, batch = 8, 4, 4, 6, 2
+    rng = np.random.default_rng(25)
+    wq = rng.standard_normal((K, H * D)).astype(np.float32)
+    wk = rng.standard_normal((K, H * D)).astype(np.float32)
+    wv = rng.standard_normal((K, H * D)).astype(np.float32)
+    wout = rng.standard_normal((H * D, Out)).astype(np.float32)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        g (float[{batch},1,{K}] X,
+           int32[{batch},1] MaskIndex,
+           int32[1] PastSeqLen,
+           int32[1] BeamWidth,
+           int32[{batch},1,1] CacheIndirection)
+          => (float[{batch},1,{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx = com.microsoft.DecoderMaskedMultiHeadAttention <num_heads={H}> (q, k, v, MaskIndex, "", "", "", PastSeqLen, BeamWidth, CacheIndirection)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    )
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmmha_node(pruned)
+    assert _dmmha_num_heads(node) == 2  # matched/pruned normally
+    # The four runtime-only inputs are untouched -- same names, still
+    # present as graph inputs, unchanged.
+    assert list(node.input[3:4]) == ["MaskIndex"]
+    assert node.input[7:10] == ["PastSeqLen", "BeamWidth", "CacheIndirection"]
+    input_names = {i.name for i in pruned.graph.input}
+    assert {"MaskIndex", "PastSeqLen", "BeamWidth", "CacheIndirection"} <= input_names
+
+
+def test_dmmha_pruning_family_string_matches_mha():
+    # Reporting reuses `MultiHeadAttention`'s own family string rather than
+    # a distinct one -- the granularity is genuinely identical (no separate
+    # `kv_num_heads` on this op's own schema either), see
+    # onnxsim/pruning.py's own "Attention-head pruning" section comment.
+    model, cfg = _dmmha_model(K=8, H=8, D=4, Out=6, seed=26)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    assert report.layers[0].family == "attention_mha_head"
+
+
+def test_dmmha_pruning_dry_run_matches_real_call():
+    model, cfg = _dmmha_model(K=8, H=8, D=4, Out=6, seed=27, combined_bias=True)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.total == 8
+    assert layer.would_drop == 4  # round(8*0.5)
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmmha_node(pruned)
+    assert cfg["H"] - _dmmha_num_heads(node) == layer.would_drop
+
+
+def test_dmmha_wanda_pruning_matches_oracle_exactly():
+    model, cfg = _dmmha_model(K=8, H=8, D=4, Out=6, seed=28, combined_bias=True)
+
+    rng = np.random.default_rng(29)
+    x_cal = rng.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx"))
+    (_, ctx_cal) = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx_cal.astype(np.float64)), axis=(0, 1)))
+
+    d = cfg["D"]
+    importance = np.zeros(cfg["H"])
+    for h in range(cfg["H"]):
+        block = np.concatenate(
+            [
+                cfg["wq"][:, h * d : (h + 1) * d],
+                cfg["wk"][:, h * d : (h + 1) * d],
+                cfg["wv"][:, h * d : (h + 1) * d],
+            ],
+            axis=1,
+        )
+        base = np.linalg.norm(block)
+        act_head = np.linalg.norm(act_norm[h * d : (h + 1) * d])
+        importance[h] = base * max(act_head, 1e-8)
+    keep_heads = np.sort(np.argsort(-importance)[:4])  # max(1, 8 - round(8*0.5))
+    idx = _head_idx(keep_heads, d)
+
+    oracle, _ = _dmmha_model(
+        K=cfg["K"],
+        H=len(keep_heads),
+        D=d,
+        Out=cfg["Out"],
+        seed=28,
+        combined_bias=True,
+        wq=cfg["wq"][:, idx],
+        wk=cfg["wk"][:, idx],
+        wv=cfg["wv"][:, idx],
+        bq=cfg["bq"][idx],
+        bk=cfg["bk"][idx],
+        bv=cfg["bv"][idx],
+        wout=cfg["wout"][idx, :],
+        batch=cfg["batch"],
+    )
+
+    rng2 = np.random.default_rng(30)
+    x = rng2.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
 def test_attention_head_pruning_handles_all_three_attention_op_types_in_one_model():
     # Regression check for `_apply_attention_chains`'s per-chain-type
     # dispatch once a third node type shares it: a plain
