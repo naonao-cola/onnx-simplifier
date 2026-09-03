@@ -23986,6 +23986,454 @@ def test_embedding_vocab_pruning_embed_layer_norm_mask_index_and_embedding_sum_c
         np.testing.assert_allclose(p, r, atol=1e-5, rtol=1e-5)
 
 
+# --- Embedding / lm_head vocabulary pruning: GatherBlockQuantized ---------
+#
+# See ``onnxsim/pruning.py``'s own section-top comment directly above
+# ``_match_gather_block_quantized_producer`` for the full empirical schema/
+# packing facts and real-exporter evidence these tests exercise. Every
+# positive-match test below runs the pruned model through a real
+# onnxruntime session (this op has a real CPU kernel -- no decomposed-proxy
+# fallback needed) and compares against an INDEPENDENTLY built reference
+# model -- constructed from scratch directly from the ORIGINAL, pre-slice
+# logical (unpacked) integer codes/scales/zero-points, never by calling
+# any of onnxsim.pruning's own matching/slicing code -- so these are
+# genuine "slice, don't recompute" checks, not restatements of the pass's
+# own logic.
+
+
+def _gbq_pack_codes(vals, bits):
+    """Independent reference packer for GatherBlockQuantized's own
+    manually-packed-``uint8`` convention (``bits`` in ``{2, 4}``): last
+    axis packed low-order-value-first, ``8 // bits`` codes per byte,
+    padding any trailing partial byte with zero. ``bits == 8`` is a plain
+    dtype cast, no packing at all. Both conventions confirmed against a
+    real ``InferenceSession`` round-trip -- see ``onnxsim/pruning.py``'s
+    own section-top comment.
+    """
+    if bits == 8:
+        return vals.astype(np.uint8)
+    per_byte = 8 // bits
+    count = vals.shape[-1]
+    nbytes = (count + per_byte - 1) // per_byte
+    out = np.zeros(vals.shape[:-1] + (nbytes,), dtype=np.uint8)
+    for j in range(nbytes):
+        for k in range(per_byte):
+            idx = j * per_byte + k
+            if idx < count:
+                out[..., j] |= (
+                    vals[..., idx].astype(np.uint8) & ((1 << bits) - 1)
+                ) << (k * bits)
+    return out
+
+
+def _gbq_dequant(data, scales, zero_points, block_size):
+    """Independent float64 dequantize oracle from LOGICAL (unpacked)
+    integer `data`/`zero_points` arrays: ``(data[v, h] - zero_point[v, h //
+    block_size]) * scale[v, h // block_size]``.
+    """
+    n_blocks = scales.shape[1]
+    col_block = np.minimum(np.arange(data.shape[1]) // block_size, n_blocks - 1)
+    return (data.astype(np.float64) - zero_points.astype(np.float64)[:, col_block]) * (
+        scales.astype(np.float64)[:, col_block]
+    )
+
+
+def _gbq_data_tensor(vals, name, bits, native):
+    """Builds the `data`/`zero_points` `TensorProto` for a
+    GatherBlockQuantized test model from LOGICAL uint8 codes `vals` --
+    either ONNX's own native ``tensor(uint4)`` sub-byte type
+    (``native=True``, ``bits == 4`` only, packed per ONNX's own spec-defined
+    whole-tensor flat convention) or manually packed into a plain
+    ``tensor(uint8)`` (``native=False``, the only option for ``bits`` in
+    ``{2, 8}``, and also exercised for ``bits == 4``) via
+    :func:`_gbq_pack_codes`.
+    """
+    if native:
+        assert bits == 4, bits
+        return onnx.numpy_helper.from_array(vals.astype(ml_dtypes.uint4), name)
+    return onnx.numpy_helper.from_array(_gbq_pack_codes(vals, bits), name)
+
+
+def _gbq_model(
+    data_vals,
+    scales,
+    zero_points,
+    bits,
+    block_size,
+    native=False,
+    gather_axis=0,
+    quantize_axis=1,
+    name_prefix="",
+):
+    """Builds a minimal single-node ``com.microsoft::GatherBlockQuantized``
+    model directly from LOGICAL (unpacked) integer `data_vals` (shape
+    ``(vocab_size, hidden_size)``) and `zero_points` (``None`` to omit the
+    optional input entirely, relying on the schema's own documented
+    default). `native` selects the packing convention for both `data` and
+    `zero_points` (:func:`_gbq_data_tensor`).
+    """
+    v, h = data_vals.shape
+    data_t = _gbq_data_tensor(data_vals, name_prefix + "data", bits, native)
+    scales_t = onnx.numpy_helper.from_array(
+        scales.astype(np.float32), name_prefix + "scales"
+    )
+    inputs = [data_t.name, "input_ids", scales_t.name]
+    initializer = [data_t, scales_t]
+    if zero_points is not None:
+        zp_t = _gbq_data_tensor(zero_points, name_prefix + "zero_points", bits, native)
+        inputs.append(zp_t.name)
+        initializer.append(zp_t)
+    out_name = name_prefix + "output"
+    node = onnx.helper.make_node(
+        "GatherBlockQuantized",
+        inputs,
+        [out_name],
+        domain="com.microsoft",
+        bits=bits,
+        block_size=block_size,
+        quantize_axis=quantize_axis,
+        gather_axis=gather_axis,
+    )
+    out_shape = [h] if gather_axis == 0 else [v]
+    graph = onnx.helper.make_graph(
+        [node],
+        "g",
+        [
+            onnx.helper.make_tensor_value_info(
+                "input_ids", onnx.TensorProto.INT64, ["n"]
+            )
+        ],
+        [
+            onnx.helper.make_tensor_value_info(
+                out_name, onnx.TensorProto.FLOAT, ["n"] + out_shape
+            )
+        ],
+        initializer=initializer,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model
+
+
+def test_gather_block_quantized_pruning_bits4_native_matches_real_inference_session_oracle():
+    # bits=4, ONNX's own native uint4 packing for both `data`/`zero_points`
+    # -- the exact convention onnxruntime.quantization's own
+    # DefaultWeightOnlyQuantizer.quantize_gather emits (see this pass's own
+    # section-top comment for that real-tooling evidence).
+    V, H, block_size = 9, 20, 16  # H not a multiple of block_size -> 2 blocks
+    rng = np.random.default_rng(200)
+    n_blocks = -(-H // block_size)
+    data_vals = rng.integers(0, 16, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, n_blocks)).astype(np.float32) * 0.1 + 0.01
+    zero_points = rng.integers(0, 16, size=(V, n_blocks)).astype(np.uint8)
+
+    model = _gbq_model(
+        data_vals, scales, zero_points, bits=4, block_size=block_size, native=True
+    )
+    onnx.checker.check_model(model)
+
+    chain = onnxsim.pruning._match_embedding_chain(model.graph, None)
+    assert chain is not None
+    assert chain.quantized is not None
+    assert chain.vocab_size == V
+    assert chain.hidden_size == H
+
+    keep_token_ids = [0, 2, 3, 5, 8]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched
+    assert not result.lm_head_pruned
+    assert result.kept_token_ids == keep_token_ids
+
+    inits = {t.name: t for t in result.model.graph.initializer}
+    # "Slice, don't recompute": the pruned data/scales/zero_points must
+    # equal an exact row-selection of the ORIGINAL logical codes -- never a
+    # re-quantization -- confirmed via a byte-exact roundtrip.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["data"]).astype(np.uint8),
+        data_vals[keep_token_ids],
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["zero_points"]).astype(np.uint8),
+        zero_points[keep_token_ids],
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["scales"]), scales[keep_token_ids]
+    )
+
+    ref_model = _gbq_model(
+        data_vals[keep_token_ids],
+        scales[keep_token_ids],
+        zero_points[keep_token_ids],
+        bits=4,
+        block_size=block_size,
+        native=True,
+    )
+    onnx.checker.check_model(ref_model)
+
+    new_ids = np.arange(len(keep_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    (ref_out,) = _run(ref_model, {"input_ids": new_ids})
+    np.testing.assert_allclose(pruned_out, ref_out, atol=1e-6, rtol=1e-6)
+
+    # Tightest oracle: pure float64 dequantize, from-scratch, of the
+    # ORIGINAL (unsliced) codes, sliced by hand.
+    oracle = _gbq_dequant(data_vals, scales, zero_points, block_size)[keep_token_ids]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-4, rtol=1e-4)
+
+
+def test_gather_block_quantized_pruning_bits8_matches_real_inference_session_oracle():
+    V, H, block_size = 7, 32, 16
+    rng = np.random.default_rng(201)
+    n_blocks = H // block_size
+    data_vals = rng.integers(0, 256, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, n_blocks)).astype(np.float32) * 0.1 + 0.01
+    zero_points = rng.integers(0, 256, size=(V, n_blocks)).astype(np.uint8)
+
+    model = _gbq_model(data_vals, scales, zero_points, bits=8, block_size=block_size)
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [1, 2, 4, 6]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched
+
+    inits = {t.name: t for t in result.model.graph.initializer}
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["data"]), data_vals[keep_token_ids]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["zero_points"]), zero_points[keep_token_ids]
+    )
+
+    new_ids = np.arange(len(keep_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    oracle = _gbq_dequant(data_vals, scales, zero_points, block_size)[keep_token_ids]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-4, rtol=1e-4)
+
+
+def test_gather_block_quantized_pruning_bits2_packed_matches_real_inference_session_oracle():
+    # bits=2, manually-packed uint8 (4 codes/byte, low-order first) -- the
+    # convention only schema-legal, never emitted by the one real tool this
+    # module found evidence of (which only ever emits bits=4/native-int4).
+    V, H, block_size = 5, 16, 16
+    rng = np.random.default_rng(202)
+    data_vals = rng.integers(0, 4, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, 1)).astype(np.float32) * 0.1 + 0.01
+    zero_points = rng.integers(0, 4, size=(V, 1)).astype(np.uint8)
+
+    model = _gbq_model(data_vals, scales, zero_points, bits=2, block_size=block_size)
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [0, 1, 3, 4]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched
+
+    new_ids = np.arange(len(keep_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    oracle = _gbq_dequant(data_vals, scales, zero_points, block_size)[keep_token_ids]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-4, rtol=1e-4)
+
+
+def test_gather_block_quantized_pruning_absent_zero_points_uses_schema_default_uint8():
+    # data dtype uint8 -> schema default zero point is 2 ** (bits - 1).
+    V, H, block_size, bits = 6, 16, 16, 8
+    rng = np.random.default_rng(203)
+    data_vals = rng.integers(0, 256, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, 1)).astype(np.float32) * 0.1 + 0.01
+
+    model = _gbq_model(data_vals, scales, None, bits=bits, block_size=block_size)
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [0, 2, 5]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    assert result.matched
+    inits = {t.name: t for t in result.model.graph.initializer}
+    assert "zero_points" not in inits  # still absent post-prune, not invented
+
+    new_ids = np.arange(len(keep_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    default_zp = np.full((V, 1), float(1 << (bits - 1)))
+    oracle = _gbq_dequant(data_vals, scales, default_zp, block_size)[keep_token_ids]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-4, rtol=1e-4)
+
+
+def test_gather_block_quantized_pruning_absent_zero_points_uses_schema_default_native_uint4():
+    # data dtype native uint4 -> schema default zero point is 0 (NOT
+    # 2 ** (bits - 1), a genuinely different default from the uint8 case
+    # above -- both confirmed empirically, see this pass's own section-top
+    # comment).
+    V, H, block_size, bits = 6, 16, 16, 4
+    rng = np.random.default_rng(204)
+    data_vals = rng.integers(0, 16, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, 1)).astype(np.float32) * 0.1 + 0.01
+
+    model = _gbq_model(
+        data_vals, scales, None, bits=bits, block_size=block_size, native=True
+    )
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [1, 3, 4]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    assert result.matched
+
+    new_ids = np.arange(len(keep_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    default_zp = np.zeros((V, 1))
+    oracle = _gbq_dequant(data_vals, scales, default_zp, block_size)[keep_token_ids]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-4, rtol=1e-4)
+
+
+def test_gather_block_quantized_pruning_declines_degenerate_gather_axis_equals_quantize_axis():
+    V, H, block_size = 8, 16, 16
+    rng = np.random.default_rng(205)
+    data_vals = rng.integers(0, 256, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, 1)).astype(np.float32) * 0.1 + 0.01
+
+    model = _gbq_model(
+        data_vals,
+        scales,
+        None,
+        bits=8,
+        block_size=block_size,
+        gather_axis=1,
+        quantize_axis=1,
+    )
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=[0, 1])
+    assert result.matched is False
+    assert result.model.SerializeToString() == model.SerializeToString()
+
+
+def test_gather_block_quantized_pruning_declines_tied_second_consumer():
+    # A tied lm_head sharing the packed `data` tensor directly is always
+    # declined for this producer shape (see this pass's own section-top
+    # comment) -- the whole call must decline, not silently prune the
+    # embedding while leaving the unexplained second reader stale.
+    V, H, block_size = 8, 16, 16
+    rng = np.random.default_rng(206)
+    data_vals = rng.integers(0, 256, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, 1)).astype(np.float32) * 0.1 + 0.01
+
+    model = _gbq_model(data_vals, scales, None, bits=8, block_size=block_size)
+    other_ids = onnx.helper.make_tensor_value_info(
+        "other_ids", onnx.TensorProto.INT64, ["m"]
+    )
+    other_out = onnx.helper.make_tensor_value_info(
+        "other_out", onnx.TensorProto.FLOAT, ["m", H]
+    )
+    second_node = onnx.helper.make_node(
+        "GatherBlockQuantized",
+        ["data", "other_ids", "scales"],
+        ["other_out"],
+        domain="com.microsoft",
+        bits=8,
+        block_size=block_size,
+        quantize_axis=1,
+        gather_axis=0,
+    )
+    model.graph.node.append(second_node)
+    model.graph.input.append(other_ids)
+    model.graph.output.append(other_out)
+
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=[0, 1])
+    assert result.matched is False
+    assert result.model.SerializeToString() == model.SerializeToString()
+
+
+def test_gather_block_quantized_pruning_untied_plain_float_lm_head_still_matches_oracle():
+    # An UNTIED, fully independent plain-float lm_head is still
+    # auto-detected exactly as it is for the two plain-float producer
+    # shapes -- only a TIED lm_head sharing `data` itself is out of scope.
+    V, H, block_size = 10, 16, 16
+    rng = np.random.default_rng(207)
+    data_vals = rng.integers(0, 256, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, 1)).astype(np.float32) * 0.1 + 0.01
+    w_lm = rng.standard_normal((H, V)).astype(np.float32)
+
+    model = _gbq_model(data_vals, scales, None, bits=8, block_size=block_size)
+    model.graph.node.append(
+        onnx.helper.make_node("MatMul", ["output", "W_lm"], ["logits"])
+    )
+    model.graph.initializer.append(_f32(w_lm, "W_lm"))
+    del model.graph.output[:]
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("logits", onnx.TensorProto.FLOAT, ["n", V])
+    )
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [0, 2, 4, 6, 9]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched
+    assert result.lm_head_pruned
+
+    inits = {t.name: t for t in result.model.graph.initializer}
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["W_lm"]), w_lm[:, keep_token_ids]
+    )
+
+    new_ids = np.arange(len(keep_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    hidden_oracle = _gbq_dequant(data_vals, scales, np.full((V, 1), 128.0), block_size)[
+        keep_token_ids
+    ]
+    oracle = hidden_oracle @ w_lm[:, keep_token_ids]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-3, rtol=1e-3)
+
+
+def test_gather_block_quantized_magnitude_pruning_matches_oracle_ranking():
+    V, H, block_size = 10, 16, 16
+    rng = np.random.default_rng(208)
+    data_vals = rng.integers(120, 136, size=(V, H)).astype(np.uint8)  # near mid-range
+    data_vals[:5] = 200  # rows 0-4: large deviation from default zp -> kept
+    scales = np.full((V, 1), 0.05, dtype=np.float32)
+
+    model = _gbq_model(data_vals, scales, None, bits=8, block_size=block_size)
+    onnx.checker.check_model(model)
+
+    result = onnxsim.apply_embedding_vocab_magnitude_pruning(model, sparsity=0.5)
+    assert result.matched
+    assert result.kept_token_ids == [0, 1, 2, 3, 4]  # the 5 large-deviation rows
+
+    report = onnxsim.pruning._analyze_embedding_vocab_magnitude_pruning(
+        model, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "embedding_vocab_magnitude"
+    assert layer.total == V
+    assert layer.would_drop == V - len(result.kept_token_ids)
+
+    new_ids = np.arange(len(result.kept_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    oracle = _gbq_dequant(data_vals, scales, np.full((V, 1), 128.0), block_size)[
+        result.kept_token_ids
+    ]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-4, rtol=1e-4)
+
+
+def test_gather_block_quantized_pruning_declines_when_no_pattern_exists():
+    V, H = 6, 8
+    model = _model(
+        f"""
+        g (float[{V},{H}] x) => (float[{V},{H}] y)
+        {{
+          y = Identity(x)
+        }}
+        """,
+    )
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=[0, 1])
+    assert result.matched is False
+    assert result.model.SerializeToString() == model.SerializeToString()
+
+
 # --- apply_structured_pruning_qdq --------------------------------------------
 #
 # See ``onnxsim/pruning.py``'s own "QDQ (quantized-weight) structured
