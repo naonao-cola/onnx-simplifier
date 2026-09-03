@@ -2662,6 +2662,20 @@ _UNARY_PASS_THROUGH = {
     # backward counterparts, *and* `_trace_gate_producer_backward`'s own
     # gated-pair gate-activation matcher -- for free.
     "QuickGelu",
+    # ai.onnx (domain "") Swish(X) = X * Sigmoid(alpha * X), opset 24+ --
+    # `alpha` is a float *attribute* (default 1.0), not a second input,
+    # confirmed live via `onnx.defs.get_schema("Swish")`: single required
+    # input `X`, single output `Y`. Same shape as `QuickGelu` above (its own
+    # com.microsoft counterpart) -- unary, elementwise, no operand to slice
+    # -- so it belongs here for the identical reason.
+    "Swish",
+    # ai.onnx (domain "") HardSwish(X) = X * HardSigmoid<alpha=1/6,
+    # beta=0.5>(X), opset 22+ (the canonical MobileNetV3/EfficientNet-Lite
+    # activation) -- confirmed live via `onnx.defs.get_schema("HardSwish")`:
+    # single input `X`, single output `Y`, *no* attributes at all. Unary and
+    # elementwise like `HardSigmoid` already above, so the same reasoning
+    # applies.
+    "HardSwish",
 }
 _BINARY_CHANNEL_OPS = {"Add", "Mul"}
 _MAX_CHAIN_HOPS = 8
