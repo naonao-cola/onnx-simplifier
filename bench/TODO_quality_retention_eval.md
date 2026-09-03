@@ -10,7 +10,10 @@ unit-tested in `tests/test_compute_retention.py`) -- see
 `scripts/apple/README.md`'s "Quality and retention eval" section for usage.
 Retention is now computed on DeviceMark's own `acc_completed` definition
 (completed-only accuracy) when available, not plain `acc` -- see "What
-DeviceMark measures" -> "Retention" below. MMLU-Pro is validated as *working*
+DeviceMark measures" -> "Retention" below. `scripts/apple/aggregate_quality_trend.py`
+groups `compute_retention.py --output` files by `(model_id, benchmark, metric)`
+into a trend across runs -- not wired into CI itself, see "Reporting" below.
+MMLU-Pro is validated as *working*
 through the same scripts (see "What's been prototyped" below) but not yet in
 CI: the compute-cost problem is solved (`--max-gen-toks 256`), but the current
 CI model scores 0/10 on `mmlu_pro_biology` regardless, making retention always
@@ -265,11 +268,20 @@ print a human-readable summary and let the CI job `tee` it into
 quality + retention, all in one place per model). A machine-readable JSON artifact
 alongside it -- `compute_retention.py --output`'s `"records"` list, one object per
 (task, metric): `{model_id, benchmark, metric, subset_n, float_acc, quantized_acc,
-retention}` (`build_records()`, unit-tested in `test_compute_retention.py`) --
-now exists and is uploaded from `quality-eval-macos` as the `quality-retention-results`
-artifact, one JSON per benchmark (IFEval, MATH-500). Lets a later step turn a run
-history into a trend without re-parsing log text; nothing reads these back yet (no
-trend-plotting script exists) -- that's the next piece if this is picked up further.
+retention, float_basis, quantized_basis}` (`build_records()`, unit-tested in
+`test_compute_retention.py`) -- now exists and is uploaded from `quality-eval-macos`
+as the `quality-retention-results` artifact, one JSON per benchmark (IFEval,
+MATH-500). `scripts/apple/aggregate_quality_trend.py` (2026-09-03) is the "next
+piece" that used to be missing: it reads several of these files (grouped by
+`(model_id, benchmark, metric)`, preserving input order as the chronological axis
+since records carry no timestamp) and prints/writes a trend instead of one isolated
+data point per run -- see `scripts/apple/README.md`'s "Quality and retention eval"
+section for usage. It is **not** wired into CI itself: `quality-eval-macos` runs a
+single fixed model with no run-history persistence today (each run's artifact is
+independent, nothing accumulates them), so this script is meant to be run by hand
+against artifacts downloaded from a handful of past runs. Automatically fetching and
+persisting that history from inside the workflow is a separate, bigger decision, not
+attempted here.
 
 ## Next steps, if picking this up
 
@@ -344,6 +356,13 @@ trend-plotting script exists) -- that's the next piece if this is picked up furt
    IFEval (see item 4) gave a second data point, so `compute_retention.py --output`
    now writes a flat `"records"` list (`build_records()`) and `quality-eval-macos`
    uploads both benchmarks' JSON as the `quality-retention-results` artifact -- see
-   "Reporting" above. Nothing consumes these across runs yet (no trend-plotting
-   script) -- that would be the next piece once there's an actual run history worth
-   trending.
+   "Reporting" above. ~~Nothing consumes these across runs yet (no trend-plotting
+   script)~~ -- done (2026-09-03): `scripts/apple/aggregate_quality_trend.py` reads
+   several of these files and groups them into a trend -- see "Reporting" above.
+   Genuinely still open: nothing in CI *produces* a multi-run history to feed it yet
+   (`quality-eval-macos` has no run-history persistence -- each run's artifact is
+   independent), so today this only has value run by hand against manually-downloaded
+   past artifacts. Wiring automatic history collection into CI (persisting
+   `quality-retention-results` across runs, or fetching past runs' artifacts via the
+   Actions API from inside the workflow) is a separate, bigger decision, not attempted
+   here.
