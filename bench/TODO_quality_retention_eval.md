@@ -238,10 +238,13 @@ Following `run_llm_decode_benchmark.py`/`check_decode_parity.py`'s existing patt
 print a human-readable summary and let the CI job `tee` it into
 `$GITHUB_STEP_SUMMARY` (decode tok/s, memory, parity agreement, and now per-benchmark
 quality + retention, all in one place per model). A machine-readable JSON artifact
-alongside it (one object per model: `{model_id, benchmark, subset_n, quantized_acc,
-float_acc, retention}`) would let a later step turn a run history into a trend
-without re-parsing log text -- worth adding once there's more than one data point to
-actually compare.
+alongside it -- `compute_retention.py --output`'s `"records"` list, one object per
+(task, metric): `{model_id, benchmark, metric, subset_n, float_acc, quantized_acc,
+retention}` (`build_records()`, unit-tested in `test_compute_retention.py`) --
+now exists and is uploaded from `quality-eval-macos` as the `quality-retention-results`
+artifact, one JSON per benchmark (IFEval, MATH-500). Lets a later step turn a run
+history into a trend without re-parsing log text; nothing reads these back yet (no
+trend-plotting script exists) -- that's the next piece if this is picked up further.
 
 ## Next steps, if picking this up
 
@@ -290,6 +293,11 @@ actually compare.
    items from the denominator) to match how DeviceMark defines retention specifically,
    rather than the plain `acc` `run_quality_eval.py` currently reports -- not done here
    since it touches `run_quality_eval.py`'s output schema, not just docs.
-6. Once more than one model has been run through `quality-eval-macos` (or a MATH-500/
-   MMLU-Pro variant of it), consider the machine-readable JSON artifact idea in
-   "Reporting" below -- not worth building for a single data point.
+6. ~~Once more than one model has been run through `quality-eval-macos`... consider
+   the machine-readable JSON artifact idea~~ -- done: MATH-500 landing alongside
+   IFEval (see item 4) gave a second data point, so `compute_retention.py --output`
+   now writes a flat `"records"` list (`build_records()`) and `quality-eval-macos`
+   uploads both benchmarks' JSON as the `quality-retention-results` artifact -- see
+   "Reporting" above. Nothing consumes these across runs yet (no trend-plotting
+   script) -- that would be the next piece once there's an actual run history worth
+   trending.

@@ -499,7 +499,12 @@ definitions:
   and `--model coreml` (the quantized side -- macOS/real Core ML only) against
   the same task/subset, writing a small JSON summary.
 - `compute_retention.py` takes one JSON from each side and reports the
-  per-task, per-metric retention ratio.
+  per-task, per-metric retention ratio. `--output` also writes a flat
+  `"records"` list (one object per task/metric: `model_id`, `benchmark`,
+  `metric`, `subset_n`, `float_acc`, `quantized_acc`, `retention`) alongside
+  the nested summary -- `coreml-integration.yml` uploads these as the
+  `quality-retention-results` CI artifact, so a run's numbers don't have to
+  be re-parsed out of `$GITHUB_STEP_SUMMARY` text.
 
 ```bash
 pip install "optimum-onnx" transformers coremltools onnxruntime "lm-eval[ifeval]"

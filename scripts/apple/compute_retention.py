@@ -60,6 +60,37 @@ def compute_retention(float_tasks: dict, quantized_tasks: dict) -> dict:
     return retention
 
 
+def build_records(
+    model_id: str | None, subset_n: int | None, retention: dict
+) -> list[dict]:
+    """Flatten `compute_retention`'s `{task: {metric: {...}}}` into one flat
+    record per (task, metric): `{model_id, benchmark, metric, subset_n,
+    float_acc, quantized_acc, retention}`.
+
+    The nested shape is convenient to print but awkward to accumulate across
+    runs/models into a trend table without re-parsing it; this is the
+    machine-readable shape `bench/TODO_quality_retention_eval.md`'s
+    "Reporting" section describes, written to `--output` alongside the
+    existing nested `retention` payload (not instead of it, so nothing
+    reading the old shape breaks).
+    """
+    records = []
+    for task, metrics in retention.items():
+        for metric, values in metrics.items():
+            records.append(
+                {
+                    "model_id": model_id,
+                    "benchmark": task,
+                    "metric": metric,
+                    "subset_n": subset_n,
+                    "float_acc": values["float"],
+                    "quantized_acc": values["quantized"],
+                    "retention": values["retention"],
+                }
+            )
+    return records
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -72,6 +103,14 @@ def main() -> int:
     )
     ap.add_argument(
         "--output", help="Write the JSON summary here (default: stdout only)"
+    )
+    ap.add_argument(
+        "--model-id",
+        default=None,
+        help="Model id/name to embed in --output's flat 'records' list (default: "
+        "the float result file's own 'model_args' field, e.g. "
+        "'pretrained=HuggingFaceTB/SmolLM2-135M-Instruct,dtype=float32'). Only "
+        "affects --output's JSON, not the printed summary.",
     )
     args = ap.parse_args()
 
@@ -100,8 +139,17 @@ def main() -> int:
             )
 
     if args.output:
+        model_id = args.model_id or float_result.get("model_args")
+        subset_n = float_result.get("limit")
         with open(args.output, "w") as f:
-            json.dump(retention, f, indent=2)
+            json.dump(
+                {
+                    "retention": retention,
+                    "records": build_records(model_id, subset_n, retention),
+                },
+                f,
+                indent=2,
+            )
 
     return 0
 
