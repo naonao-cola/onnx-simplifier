@@ -42,9 +42,15 @@ are quantized at all -- ``quantized_model``'s INT4 codes are left completely
 untouched, including for those columns. Instead, it inserts a *correction*
 term at graph-run time: ``Gather`` those columns of the activation, multiply
 by a precomputed ``(W_float - W_rtn)`` residual (an exact, static
-initializer, computed once from the two already-available weights, needing
-no calibration data of its own), and ``Add`` the result to the layer's
-output -- the same "rename producer output, insert an op reproducing the
+initializer), and ``Add`` the result to the layer's output. ``W_rtn`` here
+is unpacked directly from ``quantized_model``'s own existing INT4
+initializer -- not recomputed from scratch in Python -- specifically so the
+residual is exact against whatever ``quantized_model`` actually contains:
+recomputing round-to-nearest independently (the way, e.g.,
+:mod:`onnxsim.adaround` does for its own starting point) can differ from
+the real codes by a single rounding tie at a bin boundary, which would
+silently turn this module's "exact restoration" claim into an
+approximation off by that tie's own quantization step. -- the same "rename producer output, insert an op reproducing the
 original name" mechanics :mod:`onnxsim.bias_correction`'s
 ``_apply_correction`` and :mod:`onnxsim.outlier_suppression_plus` already
 use. Because the correction term is exactly ``Gather(X, weak) @ (W_float -
@@ -72,10 +78,28 @@ import onnx.numpy_helper
 
 from onnxsim import backend
 from onnxsim.adaround import _find_int4_matmul_candidates
-from onnxsim.awq import _quantize_blockwise_int4
 from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.gptq import _inverse_hessian_cholesky
+
+
+def _unpack_int4(tensor: onnx.TensorProto) -> np.ndarray:
+    """Unpacks a ``TensorProto.INT4`` tensor's ``raw_data`` (the same
+    low-nibble-first packing ``weight_only_quantize_int4_matmul.h`` uses:
+    ``byte[i] = (code[2i] & 0xF) | ((code[2i+1] & 0xF) << 4)``) into a plain
+    float64 array shaped ``tensor.dims``.
+    """
+    dims = list(tensor.dims)
+    numel = int(np.prod(dims))
+    raw = np.frombuffer(tensor.raw_data, dtype=np.uint8)
+    lo = (raw & 0x0F).astype(np.int8)
+    hi = ((raw >> 4) & 0x0F).astype(np.int8)
+    lo = np.where(lo >= 8, lo - 16, lo)
+    hi = np.where(hi >= 8, hi - 16, hi)
+    codes = np.empty(numel, dtype=np.int8)
+    codes[0::2] = lo[: (numel + 1) // 2]
+    codes[1::2] = hi[: numel // 2]
+    return codes.reshape(dims).astype(np.float64)
 
 
 def apply_owq(
@@ -148,6 +172,8 @@ def apply_owq(
     if not candidates:
         return quantized_model
 
+    wq_init_map = {t.name: t for t in quantized_model.graph.initializer}
+
     probe_names = [c.float_node.input[0] for c in candidates]
     float_probe = _add_probe_outputs(float_model, probe_names)
 
@@ -184,9 +210,20 @@ def apply_owq(
         u = _inverse_hessian_cholesky(h, percdamp)  # inv(h) == u.T @ u
         h_inv_diag = np.maximum((u**2).sum(axis=0), 1e-12)  # [K]
 
-        codes_rtn, scale_blocks = _quantize_blockwise_int4(w_nk, c.block_size)
+        # Unpack quantized_model's own real INT4 codes (not a fresh
+        # from-scratch RTN recomputation) so the residual below is exact
+        # against what the graph actually contains -- see this module's own
+        # docstring for why that distinction matters here.
+        codes = _unpack_int4(wq_init_map[c.wq_name])
+        scale = onnx.numpy_helper.to_array(c.ws_init).astype(np.float64)
+        if c.weight_transposed:
+            codes_nk = codes  # already [N, K]
+            scale_blocks = scale  # already [N, K / block_size]
+        else:
+            codes_nk = codes.T  # [K, N] -> [N, K]
+            scale_blocks = scale.T  # [K / block_size, N] -> [N, K / block_size]
         scale_full = np.repeat(scale_blocks, c.block_size, axis=1)
-        w_rtn = codes_rtn * scale_full
+        w_rtn = codes_nk * scale_full
         col_error = np.mean((w_nk - w_rtn) ** 2, axis=0)  # [K]
 
         sensitivity = col_error / h_inv_diag
