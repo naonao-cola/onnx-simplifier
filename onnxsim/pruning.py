@@ -24589,6 +24589,716 @@ def apply_structured_pruning_qoperator(
     return out
 
 
+# --- DynamicQuantizeMatMul / MatMulIntegerToFloat (ORT dynamic-quantization
+#     fusion) structured pruning ------------------------------------------
+#
+# ``com.microsoft::DynamicQuantizeMatMul`` and ``com.microsoft::
+# MatMulIntegerToFloat`` were this module's other genuine blind spot before
+# this section: ``grep -c "DynamicQuantizeMatMul\|MatMulIntegerToFloat"
+# onnxsim/pruning.py`` returned 0 on the commit this section was added from.
+# Both are ONNX Runtime graph-optimizer FUSIONS, not something an exporter
+# emits directly: ``onnxruntime.quantization.quantize_dynamic()`` (ORT
+# quantization's other headline entry point, alongside the static QOperator/
+# QDQ formats the two sections above already cover) emits the portable
+# ``DynamicQuantizeLinear -> MatMulInteger -> Cast -> Mul`` sequence per
+# MatMul layer; loading that model in a real ``InferenceSession`` with the
+# default ``GraphOptimizationLevel.ORT_ENABLE_ALL`` collapses each such
+# sequence into ONE of these two contrib ops, never leaving the unfused
+# sequence behind. Confirmed directly, not assumed: a real 2-layer
+# ``MatMul -> Relu -> MatMul`` float model, run through
+# ``quantize_dynamic(..., per_channel=True)`` and then a real
+# ``InferenceSession`` (default optimization level,
+# ``sess_options.optimized_model_filepath`` capturing the optimized graph),
+# collapses to two chained ``DynamicQuantizeMatMul`` nodes -- see this
+# section's own test file for the exact reproduction this comment
+# summarizes.
+#
+# Live schemas (``onnxruntime.capi.onnxruntime_pybind11_state
+# .get_all_operator_schema()``, both ``com.microsoft``, since_version 1, NO
+# attributes on either op -- unlike ``QGemm``'s ``transB``, there is no
+# transposed-``B`` variant to consider at all):
+#
+#   * ``DynamicQuantizeMatMul(A, B, b_scale, b_zero_point?, bias?) -> Y``.
+#     `A` (``T1`` = float32 only) is the RAW FLOAT activation -- quantized
+#     internally by the fused op itself, so unlike every other quantized op
+#     this module already handles, there is no separate `a_scale`/
+#     `a_zero_point` input at all (confirmed live: the schema lists exactly
+#     five inputs). `B` (``T2`` = int8/uint8) is the quantized weight,
+#     `b_scale` (``T1`` = float32, REQUIRED -- not optional, unlike
+#     `b_zero_point`) and `b_zero_point` (``T2``, optional) its paired
+#     scale/zero-point. `bias`, when present, is ``T1`` (float32) -- PLAIN,
+#     UNQUANTIZED float, confirmed directly: a real ``MatMul(x, W) +
+#     Add(bias)`` float model, run through the identical `quantize_dynamic`
+#     -> `InferenceSession`-optimize round trip above, fuses the `Add`
+#     straight into `DynamicQuantizeMatMul`'s own `bias` input with the
+#     bias tensor's ORIGINAL float values completely unchanged (no
+#     quantization/rescaling applied to it at all) -- a real, material
+#     difference from `QGemm`/`QLinearConv`'s own INT32, per-channel-scaled
+#     bias convention (see the QOperator section's own top comment): this
+#     section's bias needs no "slice, don't recompute" caveat about a scale
+#     it doesn't carry -- it is just another float tensor, sliced exactly
+#     like a plain float `Gemm`'s own bias.
+#   * ``MatMulIntegerToFloat(A, B, a_scale, b_scale, a_zero_point?,
+#     b_zero_point?, bias?) -> Y``. The "pre-quantized-`A`" variant: `A`
+#     (``T1`` = int8/uint8) is ALREADY quantized, with its own `a_scale`/
+#     `a_zero_point` (``T3``/``T1``) supplied directly rather than derived
+#     internally. `B`/`b_scale`/`b_zero_point` follow the identical
+#     convention as `DynamicQuantizeMatMul` above (`B` is ``T2`` int8/
+#     uint8, `b_scale` is ``T3`` = float32 or float16, REQUIRED). `bias`
+#     (``T3``) is likewise plain, unquantized float. Confirmed live to be a
+#     REAL fusion output, not merely a schema that happens to exist: a
+#     branching model (one shared float activation feeding TWO separate
+#     `MatMul`s with different weights) run through the same
+#     `quantize_dynamic` -> optimize round trip produces exactly ONE shared
+#     `DynamicQuantizeLinear` node feeding TWO ``MatMulIntegerToFloat``
+#     nodes (`A`/`a_scale`/`a_zero_point` all read directly from that one
+#     `DynamicQuantizeLinear`'s own three outputs) -- `DynamicQuantizeMatMul`
+#     fusion requires its own private `DynamicQuantizeLinear` (one consumer
+#     only), so a branch forces the two-op split instead. In every
+#     single-producer/single-consumer CHAIN this section's own topology
+#     admits (see below), though, this branching precondition never arises
+#     -- a real 3-layer fully-quantized chain (`DynamicQuantizeMatMul ->
+#     Relu -> DynamicQuantizeMatMul -> Relu -> DynamicQuantizeMatMul`,
+#     confirmed live) never produces a `MatMulIntegerToFloat` CONSUMER at
+#     any point along a single, unbranched path -- `MatMulIntegerToFloat`
+#     is confirmed real only as a PRODUCER (or, symmetrically, as a
+#     consumer of an activation shared by an out-of-scope branch this
+#     section's own single-consumer walk already declines to enter, the
+#     identical branch-declining bar this module holds everywhere else).
+#     Both ops are still matched as EITHER role below -- mirroring the
+#     QOperator section's own `QLinearMatMul`/`QGemm` same-family pairing
+#     even though a real exporter favors one shape -- since nothing about
+#     either op's own schema restricts it to one role, and a hand-built or
+#     differently-tooled graph could legitimately pair them either way.
+#
+# `B`'s own storage layout, confirmed the identical way the QOperator
+# section's own `QLinearMatMul` finding was: `quantize_dynamic`'s emitted
+# (pre-fusion) `MatMulInteger`'s own `B` input, for a `MatMul(x, W)` with
+# `W` shaped `(K, N)`, is INT8 (`weight_type=QuantType.QInt8`, this
+# section's own tests' choice) shaped `(K, N)` UNCHANGED -- plain,
+# completely UNPACKED int8, no sub-byte packing at all, simpler than
+# `MatMulNBits`/`MatMulBnb4`/the block-quantized Fp4/Fp8 ops elsewhere in
+# this module (none of which apply here -- there is no `block_size`
+# anywhere in either live schema). Axis 1 (the LAST axis) is the output-
+# channel (`N`) axis -- identical to `QLinearMatMul`'s own convention, and
+# there is no `transB`-equivalent attribute on either op to ever flip that
+# (confirmed: both live schemas have an empty attribute list). With
+# `per_channel=True`, `b_scale`/`b_zero_point` are shaped `(N,)` -- an
+# axis-1 per-column reduction, structurally identical to the QOperator
+# section's own `QLinearMatMul` per-channel case (reusing
+# :func:`_qop_per_channel_scale_ok` directly below, rather than
+# reimplementing the identical scalar-or-length-`N` check). With
+# `per_channel=False` (the default), both are scalar (confirmed live: `()`-
+# shaped) -- left completely untouched by producer-role slicing, the same
+# established "a single scalar isn't shaped by channel count" reasoning the
+# QOperator section's own top comment gives.
+#
+# Consumer-role (`K`-axis) pruning is, if anything, SIMPLER than the
+# QOperator section's own consumer role: `B`'s own quantized int8/uint8
+# codes are plain, unpacked, and un-blocked, so :func:`_slice_consumer_weight`
+# applies completely unchanged with no block-alignment precondition to
+# check at all (unlike `MatMulNBits`/`MatMulBnb4`, which must first confirm
+# a block boundary isn't split). `b_scale`/`b_zero_point`/`bias` are never
+# indexed by `K` (all three are always sized by `N` or scalar, per every
+# schema/round-trip fact above), so the consumer role touches nothing but
+# the weight's own codes -- identical in spirit to the QOperator section's
+# own consumer role.
+#
+# Unlike the QOperator section's own same-family-ONLY chain walk, THIS
+# section's own producer's output was confirmed, live, to feed BOTH a
+# same-family consumer (a fully-quantized multi-layer chain, above) AND a
+# plain-float `MatMul`/vanilla-`Gemm` consumer -- confirmed by excluding one
+# layer of a 2-layer chain from `quantize_dynamic` via its own
+# `nodes_to_exclude` argument and re-running the identical optimize round
+# trip: the result is `DynamicQuantizeMatMul -> Relu -> MatMul` (a genuine,
+# common partial-quantization shape -- not every layer of a real deployment
+# graph need be quantized). Symmetrically, a plain-float PRODUCER feeding a
+# quantized consumer is an equally real shape (the mirror image of the same
+# partial-quantization scenario). So this section's own chain walk mirrors
+# the `MatMulNBits` section's own `MatMulNBits`-or-plain-float union
+# (:func:`_match_plain_matmul_nbits_peer`/:class:`_PlainMatMulNBitsPeer`,
+# reused directly here rather than duplicated -- fully generic despite its
+# name, see that section's own docstrings) far more closely than the
+# QOperator section's own same-family-only walk: EITHER side of a matched
+# chain may be a `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` node OR a
+# plain-float `MatMul`/`Gemm` peer, with at least one side required to be
+# one of this section's own two ops (a plain-float-to-plain-float pair
+# remains :func:`apply_structured_pruning`'s own job, mirroring
+# :func:`_find_matmul_nbits_chains`'s identical filter).
+#
+# `a_scale`/`a_zero_point` (on `MatMulIntegerToFloat`'s own `A` side) are
+# NEVER constant initializers in a real fusion output -- confirmed directly
+# above (they are literally a `DynamicQuantizeLinear` node's own live
+# OUTPUTS, not initializers at all) -- a fundamental difference from the
+# QOperator section's own `x_scale`/`x_zero_point`, which that section
+# requires to be constant, scalar initializers. This section never reads,
+# validates, or touches `a_scale`/`a_zero_point` at all (neither role ever
+# needs them), so no such requirement is imposed here; their names are
+# recorded on the match only where needed to index past them to `bias`.
+#
+# What's declined, deliberately, rather than guessed at (mirroring this
+# module's own conservative "decline anything ambiguous" bar everywhere
+# else):
+#
+#   * A non-constant `B`/`b_scale`/`bias`, or any of those read by more
+#     than one node (a shared/tied tensor). `b_zero_point` absent entirely
+#     (schema-legal, since it is marked optional) is ALSO declined outright
+#     -- every real fixture this investigation produced always emits it
+#     explicitly (even the per-tensor, presumably-symmetric case), so an
+#     absent one is simply outside what was empirically confirmed safe,
+#     the same "decline what wasn't confirmed" bar the QOperator section's
+#     own top comment already applies to a non-scalar activation scale.
+#   * A `B` of rank other than 2, or a `bias` of any shape other than
+#     exactly `(N,)` -- mirroring the QOperator section's own identical
+#     rank/shape bars (there is no scalar-broadcasting `bias` shape
+#     confirmed for either op the way `QGemm`'s own `C` allows, so that
+#     carve-out is not repeated here).
+#   * Mixing either of these two ops with a QDQ-, QOperator-, `MatMulNBits`-
+#     /`MatMulBnb4`-, or block-quantized-Fp4/Fp8-fed node on EITHER side of
+#     a chain -- a genuinely different quantization scheme this
+#     investigation did not confirm composes safely, the same bar every
+#     other quantized-weight section in this module already holds (see the
+#     QOperator section's own identical bullet).
+#   * Any residual/skip-connection merge, `Concat`-merged branch group, or
+#     gated (SwiGLU/GeGLU) pair -- only the plain single-producer/single-
+#     consumer/unary-hops-only topology above is matched, mirroring the
+#     QOperator section's own identical scope (and, for the same reason,
+#     `MatMulNBits`'s own gated-pair support is NOT mirrored here either --
+#     a real, tractable-looking follow-up deliberately left out of scope).
+#
+# Sensitivity-report family string: `"dynamic_quantize_matmul"` -- a single
+# family, unlike the QDQ/QOperator families' own Conv/MatMul split, since
+# neither op here has a Conv-shaped counterpart at all.
+
+
+def _dynquant_scalar_or_channel_bias_ok(bias_init: onnx.TensorProto, n: int) -> bool:
+    """`bias`, on either op, is always PLAIN float (never quantized -- see
+    this section's own top comment), so the only shape ever confirmed safe
+    is exactly `(n,)` -- no scalar-broadcast `bias` shape is confirmed for
+    either op the way `QGemm`'s own `C` allows (see this section's own top
+    comment), so that is not accepted here.
+    """
+    return _is_supported_float_dtype(bias_init.data_type) and list(bias_init.dims) == [
+        n
+    ]
+
+
+@dataclass(frozen=True)
+class _DynQuantMatMulWeight:
+    """A matched ``com.microsoft::DynamicQuantizeMatMul``/
+    ``MatMulIntegerToFloat`` node's own sliceable operands -- see this
+    section's own top comment for the schema facts this depends on
+    (empirically confirmed, not assumed). `op_kind` is ``"dynamic"``
+    (``DynamicQuantizeMatMul``) or ``"int_to_float"``
+    (``MatMulIntegerToFloat``) -- the two ops' `B`/`b_scale`/`b_zero_point`/
+    `bias` operands are structurally identical once each op's own
+    `_match_dynamic_quantize_matmul`/`_match_matmul_integer_to_float` has
+    unpacked its own input list (only the count/position of the leading
+    `A`-side operands this section never touches differs between them), so
+    one shared shape with a discriminant string is simpler here without
+    losing type safety, mirroring :class:`_QOpWeight`'s own identical
+    reasoning. `b_init` is always INT8/UINT8, stored `(K, N)` -- there is no
+    `transB`-equivalent attribute on either op (unlike `QGemm`), so `N` is
+    always axis 1, unconditionally. `b_scale_init`/`b_zero_point_init` are
+    its paired scale/zero-point (same shape as each other: scalar when
+    `per_channel` is ``False``, 1-D length `N` otherwise). `bias_init` is
+    the optional plain-float `bias` input, shape `(N,)`, or ``None`` when
+    genuinely absent.
+    """
+
+    node: onnx.NodeProto
+    op_kind: str
+    b_init: onnx.TensorProto
+    b_scale_init: onnx.TensorProto
+    b_zero_point_init: onnx.TensorProto
+    bias_init: Optional[onnx.TensorProto]
+    per_channel: bool
+    N: int
+    K: int
+
+
+def _match_dynquant_weight_operands(
+    node: onnx.NodeProto,
+    b_name: str,
+    b_scale_name: str,
+    b_zp_name: Optional[str],
+    bias_name: Optional[str],
+    op_kind: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_DynQuantMatMulWeight]:
+    """Shared `B`/`b_scale`/`b_zero_point`/`bias` validation for both
+    :func:`_match_dynamic_quantize_matmul` and
+    :func:`_match_matmul_integer_to_float`, once each has unpacked its own
+    op-specific input list -- see this section's own top comment for every
+    scope boundary checked here.
+    """
+    if b_zp_name is None:
+        return None  # absent b_zero_point -- not empirically confirmed
+        # safe, see this section's own top comment
+
+    b_init = initializer_map.get(b_name)
+    b_scale_init = initializer_map.get(b_scale_name)
+    b_zp_init = initializer_map.get(b_zp_name)
+    if b_init is None or b_scale_init is None or b_zp_init is None:
+        return None  # non-constant B/b_scale/b_zero_point
+    if b_init.data_type not in (onnx.TensorProto.INT8, onnx.TensorProto.UINT8):
+        return None
+    if b_zp_init.data_type != b_init.data_type:
+        return None  # schema: B and b_zero_point share one type
+    dims = list(b_init.dims)
+    if len(dims) != 2:
+        return None  # 2-D MatMul weight only
+    k, n = dims
+    if n <= 0 or k <= 0:
+        return None
+
+    per_channel = _qop_per_channel_scale_ok(b_scale_init, b_zp_init, n)
+    if per_channel is None:
+        return None
+
+    bias_init = None
+    if bias_name is not None:
+        bias_init = initializer_map.get(bias_name)
+        if bias_init is None or not _dynquant_scalar_or_channel_bias_ok(bias_init, n):
+            return None  # non-constant, or wrong-shaped/dtyped, bias
+
+    sliced_names = [b_name, b_scale_name, b_zp_name] if per_channel else [b_name]
+    if bias_name is not None:
+        sliced_names.append(bias_name)
+    for nm in sliced_names:
+        if len(consumers_of.get(nm, [])) != 1:
+            return None  # shared/tied tensor -- another node reads it too
+
+    return _DynQuantMatMulWeight(
+        node=node,
+        op_kind=op_kind,
+        b_init=b_init,
+        b_scale_init=b_scale_init,
+        b_zero_point_init=b_zp_init,
+        bias_init=bias_init,
+        per_channel=per_channel,
+        N=n,
+        K=k,
+    )
+
+
+def _match_dynamic_quantize_matmul(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_DynQuantMatMulWeight]:
+    """If `node` is a ``com.microsoft::DynamicQuantizeMatMul`` matching every
+    scope boundary this section's own top comment documents, returns the
+    match. Input order: ``A, B, b_scale, b_zero_point?, bias?`` (live
+    schema, confirmed via this section's own top comment).
+    """
+    if node.op_type != "DynamicQuantizeMatMul" or node.domain != "com.microsoft":
+        return None
+    if len(node.input) < 3 or len(node.input) > 5 or len(node.output) != 1:
+        return None
+    a_name, b_name, b_scale_name = node.input[:3]
+    if not (a_name and b_name and b_scale_name):
+        return None
+    b_zp_name = node.input[3] if len(node.input) > 3 and node.input[3] else None
+    bias_name = node.input[4] if len(node.input) > 4 and node.input[4] else None
+    return _match_dynquant_weight_operands(
+        node,
+        b_name,
+        b_scale_name,
+        b_zp_name,
+        bias_name,
+        "dynamic",
+        initializer_map,
+        consumers_of,
+    )
+
+
+def _match_matmul_integer_to_float(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_DynQuantMatMulWeight]:
+    """If `node` is a ``com.microsoft::MatMulIntegerToFloat`` matching every
+    scope boundary this section's own top comment documents, returns the
+    match. Input order: ``A, B, a_scale, b_scale, a_zero_point?,
+    b_zero_point?, bias?`` (live schema, confirmed via this section's own
+    top comment) -- `a_scale`/`a_zero_point` are read only to index past
+    them to `b_zero_point`/`bias`, never validated or touched (see this
+    section's own top comment for why: unlike the QOperator section's own
+    `x_scale`/`x_zero_point`, they are never constant initializers in a
+    real fusion output at all).
+    """
+    if node.op_type != "MatMulIntegerToFloat" or node.domain != "com.microsoft":
+        return None
+    if len(node.input) < 4 or len(node.input) > 7 or len(node.output) != 1:
+        return None
+    a_name, b_name, a_scale_name, b_scale_name = node.input[:4]
+    if not (a_name and b_name and a_scale_name and b_scale_name):
+        return None
+    b_zp_name = node.input[5] if len(node.input) > 5 and node.input[5] else None
+    bias_name = node.input[6] if len(node.input) > 6 and node.input[6] else None
+    return _match_dynquant_weight_operands(
+        node,
+        b_name,
+        b_scale_name,
+        b_zp_name,
+        bias_name,
+        "int_to_float",
+        initializer_map,
+        consumers_of,
+    )
+
+
+def _match_dynquant_producer(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_DynQuantMatMulWeight]:
+    """Dispatches to :func:`_match_dynamic_quantize_matmul` or
+    :func:`_match_matmul_integer_to_float` by `node.op_type` -- both ops are
+    matched as EITHER a producer or a consumer, see this section's own top
+    comment for why.
+    """
+    if node.op_type == "DynamicQuantizeMatMul":
+        return _match_dynamic_quantize_matmul(node, initializer_map, consumers_of)
+    if node.op_type == "MatMulIntegerToFloat":
+        return _match_matmul_integer_to_float(node, initializer_map, consumers_of)
+    return None
+
+
+_DynQuantMatMulChainSide = Union[_DynQuantMatMulWeight, _PlainMatMulNBitsPeer]
+
+
+def _dynquant_chain_side_key(side: _DynQuantMatMulChainSide) -> str:
+    """A name uniquely identifying the underlying weight tensor `side`
+    resolves to -- `b_init`'s own name for a `DynamicQuantizeMatMul`/
+    `MatMulIntegerToFloat` side, `w_init`'s own name for a plain-float peer.
+    Mirrors :func:`_matmul_nbits_chain_side_key`.
+    """
+    if isinstance(side, _DynQuantMatMulWeight):
+        return side.b_init.name
+    return side.w_init.name
+
+
+def _dynquant_dequantized_nk(w: _DynQuantMatMulWeight) -> np.ndarray:
+    """The full float64 ``(N, K)`` dequantized weight matrix `w` refers to,
+    for IMPORTANCE RANKING ONLY -- never written back to the graph. Mirrors
+    :func:`_qop_dequantized_nk`, specialized to this section's own always-
+    ``(K, N)``-stored, never-transposed convention (no `transB`-equivalent
+    attribute on either op, see this section's own top comment).
+    """
+    arr = onnx.numpy_helper.to_array(w.b_init).astype(np.float64).T  # (K,N)->(N,K)
+    zp = onnx.numpy_helper.to_array(w.b_zero_point_init).astype(np.float64)
+    scale = onnx.numpy_helper.to_array(w.b_scale_init).astype(np.float64)
+    if w.per_channel:
+        zp = zp.reshape(-1, 1)
+        scale = scale.reshape(-1, 1)
+    return (arr - zp) * scale
+
+
+def _dynquant_chain_producer_weight_nk(side: _DynQuantMatMulChainSide) -> np.ndarray:
+    """``[N, K]`` float64 view of one chain PRODUCER's own weight, for
+    IMPORTANCE RANKING ONLY -- never written back to the graph. Mirrors
+    :func:`_matmul_nbits_chain_producer_weight_nk`.
+    """
+    if isinstance(side, _DynQuantMatMulWeight):
+        return _dynquant_dequantized_nk(side)
+    w = _to_f64(side.w_init)
+    return w if side.weight_transposed else w.T
+
+
+def _slice_dynquant_producer(w: _DynQuantMatMulWeight, keep: np.ndarray) -> None:
+    """Slices `w`'s own `N` (output-channel) axis to `keep` (ascending
+    indices) -- the producer role. Mirrors :func:`_slice_qop_producer`,
+    specialized to this section's own always-untransposed convention. The
+    plain-float `bias` (never quantized, see this section's own top
+    comment) needs no "slice, don't recompute" caveat about a scale it
+    doesn't carry -- it is sliced exactly like a plain float `Gemm`'s own
+    bias, via the same :func:`_slice_last_axis`.
+    """
+    _slice_producer_weight(w.b_init, weight_transposed=False, keep=keep, is_conv=False)
+    if w.per_channel:
+        _slice_last_axis(w.b_scale_init, keep)
+        _slice_last_axis(w.b_zero_point_init, keep)
+    if w.bias_init is not None:
+        _slice_last_axis(w.bias_init, keep)
+
+
+def _slice_dynquant_consumer(w: _DynQuantMatMulWeight, keep: np.ndarray) -> None:
+    """Slices `w`'s own `K` (reduction/input-channel) axis to `keep` --
+    the consumer role. Never touches scale/zero-point/bias -- none of them
+    are indexed by `K` (see this section's own top comment). No block-
+    alignment precondition to check at all -- `B`'s own codes are plain,
+    unpacked, un-blocked int8/uint8 (see this section's own top comment),
+    simpler even than `MatMulNBits`'s own consumer role.
+    """
+    _slice_consumer_weight(w.b_init, weight_transposed=False, keep=keep, is_conv=False)
+
+
+def _slice_dynquant_chain_producer(
+    side: _DynQuantMatMulChainSide, keep: np.ndarray
+) -> None:
+    """Slices one chain PRODUCER's own output channels to `keep` (ascending
+    indices) -- dispatches to :func:`_slice_dynquant_producer` for a
+    `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` side, or a direct
+    :func:`_slice_producer_weight` (plus its own bias, if present) for a
+    plain-float peer. Mirrors :func:`_slice_matmul_nbits_chain_producer`.
+    """
+    if isinstance(side, _DynQuantMatMulWeight):
+        _slice_dynquant_producer(side, keep)
+        return
+    _slice_producer_weight(side.w_init, side.weight_transposed, keep, is_conv=False)
+    if side.bias_init is not None:
+        bias = onnx.numpy_helper.to_array(side.bias_init)
+        side.bias_init.CopyFrom(
+            onnx.numpy_helper.from_array(bias[keep], name=side.bias_init.name)
+        )
+
+
+def _slice_dynquant_chain_consumer(
+    side: _DynQuantMatMulChainSide, keep: np.ndarray
+) -> None:
+    """Slices one chain CONSUMER's own input channels to `keep` --
+    dispatches to :func:`_slice_dynquant_consumer` for a
+    `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` side, or a direct
+    :func:`_slice_consumer_weight` for a plain-float peer. Mirrors
+    :func:`_slice_matmul_nbits_chain_consumer`.
+    """
+    if isinstance(side, _DynQuantMatMulWeight):
+        _slice_dynquant_consumer(side, keep)
+        return
+    _slice_consumer_weight(side.w_init, side.weight_transposed, keep, is_conv=False)
+
+
+@dataclass(frozen=True)
+class _DynQuantMatMulChain:
+    producer: _DynQuantMatMulChainSide
+    chain_ops: Tuple[onnx.NodeProto, ...]
+    consumer: _DynQuantMatMulChainSide
+    n_channels: int
+
+
+def _walk_to_dynquant_consumer(
+    start: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+    max_hops: int,
+) -> Optional[Tuple[_DynQuantMatMulChainSide, Tuple[onnx.NodeProto, ...]]]:
+    """From tensor `start` (a `DynamicQuantizeMatMul`/`MatMulIntegerToFloat`
+    OR plain-float MatMul/Gemm producer's own output), walks forward
+    through shape-preserving unary activations (`_UNARY_PASS_THROUGH`) with
+    no other consumer anywhere along the way, until EITHER a
+    `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` consumer OR a plain-float
+    MatMul/vanilla-Gemm consumer (:func:`_match_plain_matmul_nbits_peer`) is
+    found whose input-channel count matches `n_channels` -- mirrors
+    :func:`_walk_to_matmul_nbits_consumer` closely (the identical
+    quantized-or-plain-float union), see this section's own top comment for
+    why. No gated pair, no branch. Returns ``None`` if the walk runs out of
+    hops, hits a branch, or never reaches such a consumer. The caller
+    (:func:`_find_dynquant_chains`) is responsible for discarding a plain-
+    float-to-plain-float result.
+    """
+    chain_ops: List[onnx.NodeProto] = []
+    cur = start
+    for _hop in range(max_hops):
+        candidates = consumers_of.get(cur, [])
+        if len(candidates) != 1:
+            return None
+        nxt = candidates[0]
+
+        if (
+            nxt.op_type in ("DynamicQuantizeMatMul", "MatMulIntegerToFloat")
+            and nxt.input
+            and nxt.input[0] == cur
+        ):
+            w = _match_dynquant_producer(nxt, initializer_map, consumers_of)
+            if w is None or w.K != n_channels:
+                return None
+            return w, tuple(chain_ops)
+
+        mm = _match_matmul_like(nxt)
+        if mm is not None and mm[0] == cur:
+            peer = _match_plain_matmul_nbits_peer(nxt, initializer_map, consumers_of)
+            if peer is None or peer.in_channels != n_channels:
+                return None
+            return peer, tuple(chain_ops)
+
+        if not (
+            nxt.op_type in _UNARY_PASS_THROUGH
+            and list(nxt.input) == [cur]
+            and len(nxt.output) == 1
+        ):
+            return None
+        out2 = nxt.output[0]
+        if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+            return None
+        chain_ops.append(nxt)
+        cur = out2
+    return None
+
+
+def _find_dynquant_chains(graph: onnx.GraphProto) -> List[_DynQuantMatMulChain]:
+    """Every producer/consumer pair connected by
+    :func:`_walk_to_dynquant_consumer` where AT LEAST ONE side is a
+    `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` node (a plain-float-to-
+    plain-float pair is :func:`apply_structured_pruning`'s own job, not
+    duplicated here -- mirrors :func:`_find_matmul_nbits_chains`'s identical
+    at-least-one-quantized filter).
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains: List[_DynQuantMatMulChain] = []
+    for node in graph.node:
+        producer: _DynQuantMatMulChainSide
+        n_channels: int
+        if node.op_type in ("DynamicQuantizeMatMul", "MatMulIntegerToFloat"):
+            w = _match_dynquant_producer(node, initializer_map, consumers_of)
+            if w is None:
+                continue
+            producer, n_channels = w, w.N
+        else:
+            peer = _match_plain_matmul_nbits_peer(node, initializer_map, consumers_of)
+            if peer is None:
+                continue
+            producer, n_channels = peer, peer.out_channels
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+        found = _walk_to_dynquant_consumer(
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+            _MAX_CHAIN_HOPS,
+        )
+        if found is None:
+            continue
+        consumer, chain_ops = found
+        if isinstance(producer, _PlainMatMulNBitsPeer) and isinstance(
+            consumer, _PlainMatMulNBitsPeer
+        ):
+            continue  # both plain float -- apply_structured_pruning's own job
+        chains.append(_DynQuantMatMulChain(producer, chain_ops, consumer, n_channels))
+    return chains
+
+
+def apply_structured_pruning_dynamic_quantize_matmul(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> onnx.ModelProto:
+    """Removes whole output channels from a
+    ``com.microsoft::DynamicQuantizeMatMul``/``MatMulIntegerToFloat`` node
+    -- ONNX Runtime's own graph-optimizer fusion of the dynamic-quantization
+    MatMul pattern (``DynamicQuantizeLinear -> MatMulInteger -> Cast ->
+    Mul``) ``onnxruntime.quantization.quantize_dynamic()`` emits, collapsed
+    by a real ``InferenceSession``'s default graph optimization -- see this
+    module's own "DynamicQuantizeMatMul / MatMulIntegerToFloat" section
+    comment for the full empirical investigation (exact schema facts, the
+    real node sequences reproduced, and why every scope boundary below is
+    drawn where it is).
+
+    For every ``DynamicQuantizeMatMul``/``MatMulIntegerToFloat`` node (a
+    "producer") whose output feeds, through zero or more shape-preserving
+    unary activations (`_UNARY_PASS_THROUGH`) with no other consumer
+    anywhere along that path, into exactly one downstream consumer -- EITHER
+    another `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` node OR a plain-
+    float `MatMul`/vanilla-`Gemm` (mirroring
+    :func:`apply_structured_pruning_matmul_nbits`'s own quantized-or-plain-
+    float union) -- whose own reduction (`K`) axis matches: ranks the
+    producer's output channels by L1/L2 norm of their own dequantized-or-
+    plain weight row, drops the lowest-``sparsity``-fraction of them, and
+    slices the producer's quantized weight/scale/zero-point (co-sliced
+    together only when per-channel; left untouched when per-tensor)/bias
+    together with the matching input channels of the consumer's own
+    weight. The producer's own PLAIN FLOAT `bias` (unlike `QGemm`/
+    `QLinearConv`'s own quantized one) is sliced directly, with no rescale
+    step at all.
+
+    Symmetrically, a plain-float PRODUCER feeding a quantized consumer is
+    also matched -- the mirror image of the same real partial-quantization
+    shape (see this module's own section comment for the live reproduction
+    this is drawn from). At least one side of every matched chain is always
+    a `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` node; a plain-float-to-
+    plain-float pair is never matched here (that is
+    :func:`apply_structured_pruning`'s own job).
+
+    No gated (SwiGLU/GeGLU) pair, residual/skip-connection merge, or
+    ``Concat``-merged branch group is matched -- only the plain single-
+    producer/single-consumer topology above (see this module's own section
+    comment for the full scope-boundary list).
+
+    :param model: onnx ModelProto object or file path
+    :param sparsity: fraction of each eligible producer's output channels to
+            drop (rounded, at least one channel is always kept)
+    :param importance_norm: ``"l2"`` (default, Li et al.'s original
+            filter-pruning criterion) or ``"l1"``
+    :returns: the pruned onnx ModelProto
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_dynquant_chains(graph)
+    if not chains:
+        return out
+
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    stale_value_info: Set[str] = set()
+
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_key = _dynquant_chain_side_key(p)
+        c_key = _dynquant_chain_side_key(c)
+        if p_key == c_key:
+            continue  # degenerate (the same weight in both roles)
+        if p_key in producer_touched or c_key in consumer_touched:
+            continue  # a shared/tied weight another chain already resized
+
+        n = chain.n_channels
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing for this layer -- no-op
+
+        w_nk = _dynquant_chain_producer_weight_nk(p)
+        importance = _qdq_channel_importance(w_nk, importance_norm)
+        # `kind="stable"` for the identical determinism reason this
+        # module's own established sections use it (see e.g.
+        # `apply_structured_pruning_matmul_nbits`'s own comment on this
+        # same line).
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+        _slice_dynquant_chain_producer(p, keep)
+        _slice_dynquant_chain_consumer(c, keep)
+
+        producer_touched.add(p_key)
+        consumer_touched.add(c_key)
+        stale_value_info.add(p.node.output[0])
+        stale_value_info.update(op.output[0] for op in chain.chain_ops)
+
+    if stale_value_info:
+        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
+    return out
+
+
 # --- Embedding / lm_head vocabulary pruning --------------------------------
 #
 # Every other pass in this module changes a graph's *internal* channel/
@@ -30170,6 +30880,138 @@ def _analyze_structured_pruning_qoperator(
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
 
+# --- DynamicQuantizeMatMul / MatMulIntegerToFloat family --------------------
+
+
+def _dynquant_not_eligible(
+    graph: onnx.GraphProto, chains: List[_DynQuantMatMulChain]
+) -> List[str]:
+    matched_ids: Set[int] = set()
+    for chain in chains:
+        matched_ids.add(id(chain.producer.node))
+        matched_ids.add(id(chain.consumer.node))
+    not_eligible = []
+    for node in graph.node:
+        if node.op_type not in ("DynamicQuantizeMatMul", "MatMulIntegerToFloat"):
+            continue
+        if id(node) in matched_ids:
+            continue
+        not_eligible.append(f"{node.op_type} '{_node_label(node)}'")
+    return not_eligible
+
+
+def _analyze_structured_pruning_dynamic_quantize_matmul(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> PruningSensitivityReport:
+    """Dry-run mirror of
+    :func:`apply_structured_pruning_dynamic_quantize_matmul` -- same
+    matching (:func:`_find_dynquant_chains`), touched-role bookkeeping (a
+    chain sharing a weight -- on either side -- with an earlier one in
+    `_find_dynquant_chains`'s own return order is reported `would_drop=0`/
+    `margin=None`, exactly the "left completely untouched" outcome the real
+    call gives it too), keep-count, and importance
+    (:func:`_dynquant_chain_producer_weight_nk` +
+    :func:`_qdq_channel_importance`, ranking the producer's own dequantized-
+    or-plain weight row, the exact same helper the real call itself calls,
+    never for the actual rewrite) logic, reused directly, but `model` is
+    never mutated. Every matched chain has at least one
+    `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` side; the other side may
+    instead be a plain-float peer (see :class:`_PlainMatMulNBitsPeer`) --
+    :func:`_dynquant_chain_side_key` dispatches on which. `family` is always
+    ``"dynamic_quantize_matmul"`` -- a single family, unlike the QDQ/
+    QOperator families' own Conv/MatMul split (see this module's own
+    section comment for why). Unlike the `MatMulNBits` family's own dry-run
+    mirror, there is no block-alignment precondition to check at all here
+    (`B`'s own codes are plain, unpacked, un-blocked int8/uint8), so every
+    genuinely matched chain either gets pruned or is reported already-
+    claimed/no-op -- never declined for block-alignment reasons.
+
+    A degenerate chain naming the exact same weight in both the producer
+    and consumer role gets no report row at all, mirroring
+    :func:`_analyze_structured_pruning_qoperator`'s own identical treatment.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    graph = model.graph
+
+    chains = _find_dynquant_chains(graph)
+    not_eligible = _dynquant_not_eligible(graph, chains)
+    if not chains:
+        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
+
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    layers: List[PruningLayerSensitivity] = []
+
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_key = _dynquant_chain_side_key(p)
+        c_key = _dynquant_chain_side_key(c)
+        if p_key == c_key:
+            continue  # degenerate (the same weight in both roles) -- no report row
+
+        label = _node_label(p.node)
+        family = "dynamic_quantize_matmul"
+        n = chain.n_channels
+
+        if p_key in producer_touched or c_key in consumer_touched:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # a shared/tied weight another chain already claimed
+
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # rounds down to nothing for this chain -- no-op
+
+        w_nk = _dynquant_chain_producer_weight_nk(p)
+        importance = _qdq_channel_importance(w_nk, importance_norm)
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[keep] = True
+
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family=family,
+                total=n,
+                would_drop=int(n - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+        producer_touched.add(p_key)
+        consumer_touched.add(c_key)
+
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
+
+
 # --- Embedding / lm_head vocabulary family ----------------------------------
 #
 # Only :func:`apply_embedding_vocab_magnitude_pruning` gets a `_analyze_*`
@@ -30502,6 +31344,9 @@ _SENSITIVITY_ANALYZERS: Dict[
     apply_structured_pruning_matmul_block_quantized_fp4: (
         _analyze_structured_pruning_matmul_block_quantized_fp4
     ),
+    apply_structured_pruning_dynamic_quantize_matmul: (
+        _analyze_structured_pruning_dynamic_quantize_matmul
+    ),
     apply_attention_head_pruning: _analyze_attention_head_pruning,
     apply_attention_head_wanda_pruning: _analyze_attention_head_wanda_pruning,
     apply_moe_expert_channel_pruning: _analyze_moe_expert_channel_pruning,
@@ -30531,7 +31376,7 @@ def analyze_pruning_sensitivity(
     measurement this module already had (actual zero-fraction of an
     already-pruned model); this is the *before* half that was missing.
 
-    `apply_fn` must be one of the eighteen functions this module itself
+    `apply_fn` must be one of the nineteen functions this module itself
     exports: :func:`apply_magnitude_pruning`, :func:`apply_wanda_pruning`,
     :func:`apply_structured_pruning`, :func:`apply_structured_wanda_pruning`,
     :func:`apply_structured_pruning_qdq`,
@@ -30540,6 +31385,7 @@ def analyze_pruning_sensitivity(
     :func:`apply_structured_pruning_matmul_bnb4`,
     :func:`apply_structured_pruning_matmul_block_quantized_fp8`,
     :func:`apply_structured_pruning_matmul_block_quantized_fp4`,
+    :func:`apply_structured_pruning_dynamic_quantize_matmul`,
     :func:`apply_attention_head_pruning`,
     :func:`apply_attention_head_wanda_pruning`,
     :func:`apply_moe_expert_channel_pruning`,
@@ -30557,7 +31403,7 @@ def analyze_pruning_sensitivity(
     same way the mutating call itself would compute them, up to (but never
     actually calling) the final slice/zero/delete step. :func:`apply_sparsegpt_pruning`
     is not supported, and neither is :func:`apply_embedding_vocab_pruning`
-    (a `ValueError` naming the eighteen functions that are supported); nor is
+    (a `ValueError` naming the nineteen functions that are supported); nor is
     `apply_structured_pruning`/`apply_structured_wanda_pruning`'s own
     `global_sparsity=True` mode or a model containing any `Concat`-merged
     skip-connection chain (both a `NotImplementedError`, from within the
@@ -30568,7 +31414,7 @@ def analyze_pruning_sensitivity(
     dry-run section comment specifically for that one).
 
     :param model: the onnx ModelProto or file path `apply_fn` would take
-    :param apply_fn: one of this module's own eighteen supported `apply_*`
+    :param apply_fn: one of this module's own nineteen supported `apply_*`
             functions, passed by reference
     :param kwargs: forwarded to `apply_fn`'s own dedicated `_analyze_*`
             counterpart, which accepts the same parameters `apply_fn`
