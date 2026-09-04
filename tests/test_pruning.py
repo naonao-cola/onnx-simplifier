@@ -6016,6 +6016,293 @@ def test_structured_pruning_resize_upsample_concat_unet_decoder_matches_oracle_e
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+# --- Conv chain: Clip (ReLU6) pass-through hop -------------------------------
+#
+# `Clip` -- the op `torch.nn.ReLU6` lowers to (opset 11+'s `input, min?, max?`
+# input-based signature) -- is a pure elementwise clamp with zero channel
+# dependence whenever a present `min`/`max` operand is a scalar constant (see
+# `_match_clip_channel_pass_through`'s own docstring): unlike `Resize`/`Pad`,
+# neither operand is axis-indexed at all, so no axis reasoning -- and no
+# dependence on the actual `min`/`max` *value* -- is needed to prove it's
+# safe to cross transparently. This closes the ReLU6 activation shape
+# MobileNetV2/V3 and EfficientNet-Lite backbones use throughout (confirmed
+# empirically, before this hop existed, via `grep -n "\"Clip\""` over this
+# Conv-chain-walking section returning zero hits).
+
+
+def _clip_conv_pair_model(w1, w2, min_val=None, max_val=None, b1=None, spatial=10):
+    """`Conv -> Clip -> Conv`, `min_val`/`max_val` (each `None` or a Python
+    float) become `Min`/`Max` 0-D float32 scalar initializers -- omitted
+    entirely from `Clip`'s own inputs when `None`, exactly like `ReLU6`'s own
+    two-sided clamp when both are given, or the one-sided shape some
+    exporters emit when only one is (`Clip`'s own schema makes both
+    optional)."""
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    if min_val is not None:
+        initializer.append(
+            onnx.numpy_helper.from_array(np.array(min_val, dtype=np.float32), "Min")
+        )
+    if max_val is not None:
+        initializer.append(
+            onnx.numpy_helper.from_array(np.array(max_val, dtype=np.float32), "Max")
+        )
+    if min_val is not None and max_val is not None:
+        clip_node = "p = Clip(h, Min, Max)"
+    elif min_val is not None:
+        clip_node = "p = Clip(h, Min)"
+    elif max_val is not None:
+        clip_node = "p = Clip(h, , Max)"
+    else:
+        clip_node = "p = Clip(h)"
+    out_spatial = spatial - 4  # two valid (no-pad) 3x3 convs
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          {clip_node}
+          Y = Conv<kernel_shape=[3,3]>(p, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_clip_relu6_pass_through_matches_oracle_exactly():
+    # Conv -> Clip(min=0, max=6) -> Conv, both bounds plain scalar constant
+    # initializers -- exactly `ReLU6`'s own two-sided clamp, and the shape
+    # `torch.onnx.export(nn.ReLU6(), ...)` emits live (`Clip` fed by
+    # `Constant`-folded scalar `min`/`max`, confirmed by direct export in
+    # this feature's own verification). Must be left entirely untouched
+    # (only its own `h`/`p` shapes change), weights sliced normally on both
+    # sides, output matching an independently, already-pruned reference
+    # model -- never a post-hoc slice of the full unpruned model's own
+    # output.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(79)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _clip_conv_pair_model(w1, w2, min_val=0.0, max_val=6.0, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["W2"][1] == C1 // 2
+    # The Clip node itself is untouched -- still a plain scalar Min/Max.
+    pruned_clip = next(n for n in pruned.graph.node if n.op_type == "Clip")
+    pruned_inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    np.testing.assert_array_equal(pruned_inits[pruned_clip.input[1]], np.float32(0.0))
+    np.testing.assert_array_equal(pruned_inits[pruned_clip.input[2]], np.float32(6.0))
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _clip_conv_pair_model(
+        w1[keep], w2[:, keep], min_val=0.0, max_val=6.0, b1=b1[keep]
+    )
+
+    rng_x = np.random.default_rng(80)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_clip_min_only_pass_through_matches_oracle_exactly():
+    # `max` omitted entirely (a one-sided lower-bound clamp -- plain `Relu`
+    # with an explicit `Clip` encoding some exporters use) -- both operands
+    # are optional per Clip's own schema, so this must still be recognized.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(81)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _clip_conv_pair_model(w1, w2, min_val=0.0, max_val=None)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["W2"][1] == C1 // 2
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _clip_conv_pair_model(w1[keep], w2[:, keep], min_val=0.0, max_val=None)
+
+    rng_x = np.random.default_rng(82)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_clip_max_only_pass_through_matches_oracle_exactly():
+    # `min` omitted entirely (empty-string placeholder, `Clip(h, , Max)`) --
+    # a one-sided upper-bound clamp, the mirror image of the min-only case
+    # above.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(83)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _clip_conv_pair_model(w1, w2, min_val=None, max_val=6.0)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["W2"][1] == C1 // 2
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _clip_conv_pair_model(w1[keep], w2[:, keep], min_val=None, max_val=6.0)
+
+    rng_x = np.random.default_rng(84)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_clip_nonconstant_min_declines():
+    # `min` fed by a non-constant node (an `Identity` of a graph input, the
+    # same "runtime-computed" shape `test_structured_pruning_pad_dynamic_
+    # pads_declines` already covers for `Pad`) -- this pass cannot confirm
+    # it has no channel dependence at all without evaluating the graph, so
+    # it must decline outright, never guessed at, leaving the whole chain
+    # untouched.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(85)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X, float MinIn) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          min_dyn = Identity(MinIn)
+          p = Clip(h, min_dyn)
+          Y = Conv<kernel_shape=[3,3]>(p, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_clip_nonscalar_min_declines():
+    # `min` a per-channel-shaped constant (`[C1]`, matching the producer's
+    # own channel count) rather than a genuine scalar -- `Clip`'s own schema
+    # requires `min`/`max` to be scalar, but nothing stops a non-conforming
+    # graph from naming a differently-shaped tensor there instead, so this
+    # must still be declined, never guessed at (mirroring
+    # `_match_clip_channel_pass_through`'s own docstring: trusted by
+    # confirmed shape, never by the schema's word alone).
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(86)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    min_per_channel = onnx.numpy_helper.from_array(
+        np.zeros((C1,), dtype=np.float32), "MinPerChannel"
+    )
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          p = Clip(h, MinPerChannel)
+          Y = Conv<kernel_shape=[3,3]>(p, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), min_per_channel],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def _mlp_clip_model(K=8, H=32, Out=4, min_val=0.0, max_val=6.0, bias=True, seed=0):
+    """The MatMul/Gemm-chain analogue of `_clip_conv_pair_model`: `MatMul/
+    Gemm -> Clip -> MatMul`, exercising `_walk_to_consumer`'s own `Clip`
+    hop (the QAT-style activation-clipping-after-Linear shape) rather than
+    the Conv-chain walkers the tests above exercise."""
+    rng = np.random.default_rng(seed)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if min_val is not None:
+        initializer.append(
+            onnx.numpy_helper.from_array(np.array(min_val, dtype=np.float32), "Min")
+        )
+    if max_val is not None:
+        initializer.append(
+            onnx.numpy_helper.from_array(np.array(max_val, dtype=np.float32), "Max")
+        )
+    if min_val is not None and max_val is not None:
+        clip_node = "a = Clip(h, Min, Max)"
+    elif min_val is not None:
+        clip_node = "a = Clip(h, Min)"
+    elif max_val is not None:
+        clip_node = "a = Clip(h, , Max)"
+    else:
+        clip_node = "a = Clip(h)"
+    if bias:
+        b1 = rng.standard_normal((H,)).astype(np.float32)
+        gemm1 = "h = Gemm(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        gemm1 = "h = MatMul(X, W1)"
+    return _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          {gemm1}
+          {clip_node}
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_matmul_clip_pass_through_matches_oracle_exactly():
+    # The MatMul/Gemm-chain analogue of
+    # `test_structured_pruning_clip_relu6_pass_through_matches_oracle_exactly`
+    # -- QAT-style activation clipping after a Linear layer is also common
+    # (`torch.nn.ReLU6`/`torch.ao.quantization`'s own fake-quant clamp
+    # shapes alike), and `Clip`'s complete axis-agnosticism means the exact
+    # same matcher already applies unchanged here, no MatMul/Gemm-specific
+    # machinery needed.
+    K, H, Out = 8, 32, 4
+    model = _mlp_clip_model(K=K, H=H, Out=Out, min_val=0.0, max_val=6.0)
+    orig = {t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer}
+    w1, b1, w2 = orig["W1"], orig["B1"], orig["W2"]
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][1] == H // 2
+    assert dims_after["W2"][0] == H // 2
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((6, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    h = x @ w1[:, keep] + b1[keep]
+    a = np.clip(h, 0.0, 6.0)
+    y_oracle = a @ w2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 def test_structured_wanda_pruning_conv_chain_matches_oracle_exactly():
     Cin, C1, C2 = 3, 16, 8
     rng = np.random.default_rng(40)

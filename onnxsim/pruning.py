@@ -602,7 +602,7 @@ docstring for why its own `scale`/`B` are held to a *narrower* shape bar
 (strictly rank-1) than GroupNorm's/LayerNorm's shared
 :func:`_flat_channel_const` check.
 
-A Conv chain also crosses four more op kinds transparently, each needing no
+A Conv chain also crosses five more op kinds transparently, each needing no
 weight of its own sliced (folded into `chain_ops` exactly like a unary
 activation, not a dedicated pass-through tuple) -- these close the two most
 common CNN backbone shapes this pass previously left completely unpruned end
@@ -639,14 +639,35 @@ outright). See :func:`_match_resize_channel_pass_through`/
 static-provability bar (including the `axes` attribute/input each op gained
 at a later opset, and why a negative `axes` entry declines rather than
 assumes a tensor rank this pass doesn't have on hand at that point in the
-walk). Unlike the depthwise-Conv/GroupNorm hops above, all four are
-recognized in *both* directions the Conv-chain machinery needs them --
+walk). ``Clip`` (the op ``torch.nn.ReLU6`` lowers to, opset 11+'s
+``input, min?, max?`` input-based signature -- confirmed live via
+``onnx.defs.get_schema("Clip")`` -- ubiquitous throughout MobileNetV2/V3,
+EfficientNet-Lite, and quantization-aware-training exports; confirmed
+empirically, before this support existed, via
+``grep -n "\"Clip\""`` over this Conv-chain-walking section returning zero
+hits) is narrower still in one sense and wider in another: unlike ``Resize``/
+``Pad``, its own `min`/`max` operands are never axis-indexed tensors at all
+(each "must be a scalar (tensor of empty shape)" per the op's own schema
+text), so once each present operand is confirmed to actually be a constant,
+single-element tensor -- declined, never guessed at, whenever it isn't --
+no axis reasoning, and no dependence on `n_channels`, is needed at all; see
+:func:`_match_clip_channel_pass_through`'s own docstring for the exact bar
+and why (unlike `scales[1] == 1.0`/`pads[axis] == 0`) neither operand's
+*value* needs inspecting either. Unlike the depthwise-Conv/GroupNorm hops
+above, all five are recognized in *both* directions the Conv-chain machinery
+needs them --
 :func:`_walk_to_conv_consumer`'s forward walk (reached by
 :func:`_find_conv_chains`'s own plain chains, a residual/merge group's
 fan-out branches, and a Concat-branch-merge's shared consumer alike) and
 :func:`_walk_conv_producer_backward`'s backward walk (reached by
 :func:`_find_conv_residual_chains`'s own ``Add``-operand resolution and
-:func:`_find_conv_concat_chains`'s own branch resolution). Deliberately left
+:func:`_find_conv_concat_chains`'s own branch resolution). ``Clip`` is, in
+addition, recognized the identical way by the MatMul/Gemm-chain walkers
+(:func:`_walk_to_consumer`/:func:`_walk_matmul_producer_backward`) -- unlike
+``Resize``/``Pad``, which stay Conv-chain-only (axis 1 is meaningless on a
+MatMul/Gemm chain's own last-channel-axis convention), ``Clip``'s complete
+axis-agnosticism means the identical matcher and reasoning already apply
+unchanged to a QAT-style activation-clipping-after-Linear shape too. Deliberately left
 out of scope, and not attempted: a
 ``GlobalAveragePool -> Flatten -> Gemm`` classifier head, where a Conv's
 surviving channel set would need to be re-derived through `Flatten`'s exact
@@ -3857,13 +3878,17 @@ def _walk_to_consumer(
     elementwise ops (an activation, an Add/Mul against a constant
     per-channel bias/scale, a fused ``com.microsoft::BiasGelu``/
     ``FastGelu`` node -- see `_FUSED_BIAS_GELU_OPS`'s own comment and
-    :func:`_match_fused_bias_gelu` -- or a plain `_NORM_PASS_THROUGH_OPS`
+    :func:`_match_fused_bias_gelu` -- a plain `_NORM_PASS_THROUGH_OPS`
     node whose own ``axis`` normalizes exactly `cur`'s last axis -- see that
     constant's own comment, :func:`_norm_axis_is_last`, and
-    :func:`_norm_pass_through_const_names`) with no other consumer anywhere
-    along the way, until a MatMul/vanilla-Gemm consumer is found whose
-    reduction dimension matches `n_channels`. Returns ``(None, ())`` if the
-    walk runs out of hops, hits a branch, or never reaches such a consumer.
+    :func:`_norm_pass_through_const_names` -- or a channel-agnostic ``Clip``
+    -- see :func:`_match_clip_channel_pass_through`, the QAT-style
+    activation-clipping-after-Linear shape, needing no axis reasoning at all
+    since neither `min` nor `max` is axis-indexed to begin with) with no
+    other consumer anywhere along the way, until a MatMul/vanilla-Gemm
+    consumer is found whose reduction dimension matches `n_channels`.
+    Returns ``(None, ())`` if the walk runs out of hops, hits a branch, or
+    never reaches such a consumer.
 
     `forced_first_hop`, when given, is used as the walk's very first hop
     instead of deriving it from `consumers_of[start]` -- see
@@ -3977,6 +4002,15 @@ def _walk_to_consumer(
                 break
             const_name = scale_name
             extra_const_name = bias_name
+        elif (
+            nxt.op_type == "Clip"
+            and nxt.domain == ""
+            and nxt.input
+            and nxt.input[0] == cur
+            and len(nxt.output) == 1
+            and _match_clip_channel_pass_through(nxt, initializer_map)
+        ):
+            pass  # channel-agnostic -- no const of its own to slice
         else:
             break
 
@@ -4782,6 +4816,91 @@ def _match_pad_channel_pass_through(
     return begin == 0 and end == 0
 
 
+def _match_clip_channel_pass_through(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> bool:
+    """True iff `node` (already confirmed by the caller to be a plain
+    (default-domain) ``Clip``, `node.input[0]` the tensor being walked
+    through) is a pure elementwise clamp with zero channel dependence, so it
+    is safe to cross transparently -- the op ``torch.nn.ReLU6`` (ubiquitous
+    in MobileNetV2/V3, EfficientNet-Lite, and quantization-aware-training
+    exports) lowers to (confirmed live: ``torch.onnx.export`` of a
+    ``Conv -> ReLU6 -> Conv`` module emits exactly a ``Clip`` node whose
+    `min`/`max` are fed by ``Constant``-producing nodes -- which this pass's
+    own docstring already assumes have been folded into initializers by the
+    time onnxsim's optimizer pipeline runs, the same assumption every other
+    "constant initializer only" hop in this module already relies on).
+
+    Unlike :func:`_match_resize_channel_pass_through`/
+    :func:`_match_pad_channel_pass_through`, which each need to statically
+    prove that some *specific* input axis is left untouched, ``Clip``'s own
+    `min`/`max` operands are never axis-indexed at all: per ``Clip``'s own
+    schema (confirmed live via ``onnx.defs.get_schema("Clip")``, the opset
+    11+ input-based signature -- `input, min?, max?` -- `since_version=13`
+    in this environment's own onnx==1.22.0), each "must be a scalar (tensor
+    of empty shape)", broadcast uniformly over *every* element regardless of
+    which axis -- let alone which channel -- it sits on. So once each is
+    confirmed to actually *be* such a scalar constant, no axis reasoning is
+    needed at all, unlike every other hop in this section, and the same
+    check works unchanged for a Conv chain's own axis-1 channel convention
+    and a MatMul/Gemm chain's own last-axis convention alike (this matcher
+    is shared by both -- see :func:`_walk_to_conv_consumer`/
+    :func:`_walk_conv_producer_backward` and :func:`_walk_to_consumer`/
+    :func:`_walk_matmul_producer_backward`).
+
+    Declines (``False``) rather than guesses whenever it cannot statically
+    confirm that:
+
+    - `min`/`max` (each optional per the schema -- ``ReLU6``'s own two-sided
+      clamp sets both, but a one-sided ``Relu``-with-only-an-upper-bound or
+      ``-only-a-lower-bound`` shape some exporters emit is just as safe and
+      still matched here), when actually present (a present-but-empty-string
+      placeholder, e.g. ``Clip(X, , Max)`` with `min` omitted, counts as
+      *not* present, mirroring `_resize_conv_pair_model`'s own `roi` slot),
+      is a constant initializer -- a runtime-computed bound (e.g. fed by a
+      `Shape`/`Cast`/reduction op elsewhere in the graph) means this pass
+      cannot confirm it has no channel dependence at all, so it's declined,
+      never guessed at, mirroring every other "statically-known-constant-
+      only" bar in this module (`_match_resize_channel_pass_through`'s own
+      `scales`, `_match_group_norm_pass_through`'s own `scale`/`bias`, ...).
+    - that constant is single-element -- `dims` exactly ``[]`` or ``[1]``,
+      the two ways a genuine per-tensor scalar is conventionally exported
+      (mirroring `_qop_scalar_dims_ok`'s own identical check elsewhere in
+      this module). ``Clip``'s own schema already requires `min`/`max` to be
+      scalar, but nothing stops a non-conforming graph from naming a
+      differently (e.g. per-channel-)shaped tensor there instead -- declined
+      the same conservative way a non-constant one is, never guessed at,
+      rather than trusted on the schema's word alone.
+
+    Neither `min` nor `max`'s own *value* is ever inspected -- unlike
+    `_match_resize_channel_pass_through`'s `scales[1] == 1.0`/
+    `_match_pad_channel_pass_through`'s `pads[axis] == 0` value checks, a
+    scalar clamp bound commutes with a channel-axis slice for *any* value:
+    clamping is a pure elementwise op, so slicing which channels survive
+    first and clamping after computes exactly the same surviving values as
+    clamping first and slicing after, whatever `min`/`max` actually are --
+    confirmed empirically via a real `onnxruntime.InferenceSession` (max abs
+    diff `0.0`), not just from the schema text -- see this feature's own
+    verification and `tests/test_pruning.py`'s Clip pass-through tests.
+    """
+    if node.op_type != "Clip" or node.domain != "":
+        return False
+    if not node.input or not node.input[0]:
+        return False
+    for idx in (1, 2):  # min, max -- both optional, opset 11+ input-based
+        if len(node.input) <= idx:
+            continue
+        name = node.input[idx]
+        if not name:
+            continue  # omitted optional input (empty-string placeholder)
+        init = initializer_map.get(name)
+        if init is None:
+            return False  # non-constant -- declined, never guessed at
+        if list(init.dims) not in ([], [1]):
+            return False  # not a scalar -- declined, never guessed at
+    return True
+
+
 def _walk_to_conv_consumer(
     start: str,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -4805,7 +4924,12 @@ def _walk_to_conv_consumer(
     see `_CONV_POOL_PASS_THROUGH`'s own comment), a channel-axis-unaffected
     ``Resize``/``Pad`` (see :func:`_match_resize_channel_pass_through`/
     :func:`_match_pad_channel_pass_through` -- declined, not guessed at,
-    whenever the channel axis can't be statically proven untouched), depthwise
+    whenever the channel axis can't be statically proven untouched), a
+    channel-agnostic ``Clip`` (see :func:`_match_clip_channel_pass_through`
+    -- the ``ReLU6`` op MobileNet/EfficientNet-Lite-style backbones use
+    throughout; declined whenever a present `min`/`max` operand isn't a
+    scalar constant, needing no axis reasoning at all since neither operand
+    is axis-indexed to begin with), depthwise
     Conv hops (see :func:`_match_depthwise_conv_pass_through` -- transparent
     to the channel-index mapping, but each still needs its own weight/bias
     sliced and its ``group`` attribute updated, so they're returned separately
@@ -4841,8 +4965,8 @@ def _walk_to_conv_consumer(
     the walk with no consumer found, same as any other unmatched topology.
     Unlike the MatMul/Gemm walk, no per-channel ``Add``/``Mul`` op is
     recognized -- see this module's own docstring for why that's out of
-    scope for Conv chains. A pooling/``Resize``/``Pad`` hop, like a unary
-    activation, needs no weight/bias of its own sliced at all -- it is folded
+    scope for Conv chains. A pooling/``Resize``/``Pad``/``Clip`` hop, like a
+    unary activation, needs no weight/bias of its own sliced at all -- it is folded
     into `chain_ops` (a plain ``(node, None)`` entry, the const-name always
     ``None``) rather than needing a dedicated tuple type the way
     `conv_pass_through`/`group_norm` do, since :func:`_apply_chains` already
@@ -5032,6 +5156,21 @@ def _walk_to_conv_consumer(
             and nxt.input[0] == cur
             and len(nxt.output) == 1
             and _match_pad_channel_pass_through(nxt, initializer_map)
+        ):
+            out2 = nxt.output[0]
+            if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+                break
+            chain_ops.append((nxt, None))
+            cur = out2
+            continue
+
+        if (
+            nxt.op_type == "Clip"
+            and nxt.domain == ""
+            and nxt.input
+            and nxt.input[0] == cur
+            and len(nxt.output) == 1
+            and _match_clip_channel_pass_through(nxt, initializer_map)
         ):
             out2 = nxt.output[0]
             if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
@@ -5337,7 +5476,10 @@ def _walk_conv_producer_backward(
     not-yet-known group channel count, since `_match_resize_channel_pass_
     through` only ever recognizes a `scales`-driven `Resize`, a ratio that
     needs no channel count to validate, never a `sizes`-driven one -- see
-    that function's own docstring for why), declining (only) whenever a
+    that function's own docstring for why), and a channel-agnostic ``Clip``
+    (see :func:`_match_clip_channel_pass_through` -- likewise needs no
+    channel count at all, since neither `min` nor `max` is axis-indexed to
+    begin with), declining (only) whenever a
     tensor crossed -- `start` itself included -- is a graph output (a
     caller-observed shape this pass never resizes); *how many* other things
     also read that same tensor is deliberately **not** checked here -- see
@@ -5454,6 +5596,14 @@ def _walk_conv_producer_backward(
             continue
 
         if node.op_type == "Pad" and _match_pad_channel_pass_through(
+            node, initializer_map
+        ):
+            unary_ops.append(node)
+            edges.append((node.input[0], node))
+            cur = node.input[0]
+            continue
+
+        if node.op_type == "Clip" and _match_clip_channel_pass_through(
             node, initializer_map
         ):
             unary_ops.append(node)
@@ -6231,8 +6381,10 @@ def _walk_matmul_producer_backward(
     whatever produces it -- the MatMul/Gemm analogue of
     :func:`_walk_conv_producer_backward` (see this function's own section
     comment above for how the two differ: a wider hop set mirroring
-    `_walk_to_consumer`'s own per-channel bias/scale ``Add``/``Mul`` hop,
-    and no depthwise-pass-through analogue at all). Declines (only) whenever
+    `_walk_to_consumer`'s own per-channel bias/scale ``Add``/``Mul`` hop
+    (plus a channel-agnostic ``Clip``, see
+    :func:`_match_clip_channel_pass_through`), and no depthwise-pass-through
+    analogue at all). Declines (only) whenever
     a tensor crossed -- `start` itself included -- is a graph output (a
     caller-observed shape this pass never resizes); *how many* other things
     also read that same tensor is deliberately **not** checked here -- see
@@ -6323,6 +6475,14 @@ def _walk_matmul_producer_backward(
             )
 
         if node.op_type in _UNARY_PASS_THROUGH and len(node.input) == 1:
+            chain_ops.append((node, None))
+            edges.append((node.input[0], node))
+            cur = node.input[0]
+            continue
+
+        if node.op_type == "Clip" and _match_clip_channel_pass_through(
+            node, initializer_map
+        ):
             chain_ops.append((node, None))
             edges.append((node.input[0], node))
             cur = node.input[0]
