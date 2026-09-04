@@ -903,7 +903,76 @@ from onnxsim import backend
 from onnxsim.bias_correction import _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.gptq import _inverse_hessian_cholesky
-from onnxsim.smoothquant import _match_matmul_like
+from onnxsim.smoothquant import _match_matmul_like as _match_matmul_like_base
+
+
+def _match_matmul_like(node: onnx.NodeProto):
+    """Wraps :func:`onnxsim.smoothquant._match_matmul_like` (MatMul, or a
+    Gemm with ``transA=0``, ``alpha=1`` and, when biased, ``beta=1``) to
+    also recognize ``com.microsoft::FusedGemm`` -- ONNX Runtime's own
+    ``GemmActivationFusion`` result (a plain Gemm plus a trailing
+    activation, collapsed into one node -- confirmed live via
+    ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+    and an actual ``ORT_ENABLE_EXTENDED``-optimized round trip: ``A``/``B``/
+    ``C`` and ``alpha``/``beta``/``transA``/``transB`` are ``Gemm``'s own,
+    byte-identical, verbatim -- only two *extra* attributes,
+    ``activation``/``activation_alpha``/``activation_beta``/
+    ``activation_gamma``, are added on top). Every caller in this module
+    that reaches a weight-bearing MatMul/Gemm through this matcher --
+    producer, K-axis consumer, QDQ, ``MatMulNBits``-peer, ``lm_head`` -- so
+    gains FusedGemm recognition for free, with no per-call-site change.
+
+    This override is deliberately local to :mod:`onnxsim.pruning` rather
+    than made to the shared :mod:`onnxsim.smoothquant` copy itself: that
+    function is also imported verbatim by :mod:`onnxsim.finetune` and used,
+    unmodified, by :mod:`onnxsim.smoothquant`'s own ``apply_smoothquant``
+    (SmoothQuant channel-scale migration) -- widening its own recognized
+    node shapes would silently change behavior for those other, unrelated
+    passes too, never verified or asked for here. Shadowing the imported
+    name at module scope (this function is defined once, at import time,
+    before any of this module's ~20 call sites are ever *invoked* -- Python
+    resolves a bare name against the module's global namespace at call
+    time, not definition time, so every one of them already sees this
+    wrapper, not the original) keeps the widening scoped to exactly this
+    module's own matchers, as directed.
+
+    The baked-in ``activation`` (and its params) never needs reading here:
+    pruning a Gemm's output/input channels only ever removes/reindexes rows
+    or columns of ``A``/``B``/``C`` before the (elementwise, per-output-
+    channel) activation is applied -- an activation function's own value
+    depends only on its own channel's pre-activation scalar, never on any
+    other channel, so slicing commutes with it regardless of which
+    activation (or none) is baked in. This is why FusedGemm needs no
+    separate "walk past a fused activation" handling at all, unlike a
+    *plain* Gemm followed by a *separate* activation node (`_UNARY_PASS_
+    THROUGH`) -- there is no separate node to walk past here; the
+    activation is already "inside" this one node, invisible to every hop of
+    chain-topology matching, confirmed end-to-end (a hand-built
+    FusedGemm->FusedGemm chain, and a real Gemm->Relu->Gemm model put
+    through ORT's own optimizer to get a genuine FusedGemm, both pruned and
+    re-run through a real ``InferenceSession`` -- see this module's own
+    tests).
+    """
+    if node.op_type == "FusedGemm":
+        attrs = {a.name: a for a in node.attribute}
+        num_inputs = len(node.input)
+        if num_inputs not in (2, 3):
+            return None
+        trans_a = attrs.get("transA")
+        if trans_a is not None and trans_a.i != 0:
+            return None
+        alpha = attrs.get("alpha")
+        if alpha is not None and alpha.f != 1.0:
+            return None
+        if num_inputs == 3:
+            beta = attrs.get("beta")
+            if beta is not None and beta.f != 1.0:
+                return None
+        trans_b = attrs.get("transB")
+        weight_transposed = bool(trans_b is not None and trans_b.i)
+        return node.input[0], node.input[1], weight_transposed
+    return _match_matmul_like_base(node)
+
 
 # Weight-magnitude norm choice for the *structured* (channel/filter/head)
 # importance rankings below (:func:`apply_structured_pruning`,
@@ -1136,7 +1205,7 @@ def _match_conv_weight_only(
     for consistency -- one matcher, one scope boundary, shared by all three
     calibration-based callers -- rather than silently diverging per-caller.
     """
-    if node.op_type != "Conv" or len(node.input) < 2:
+    if node.op_type not in ("Conv", "FusedConv") or len(node.input) < 2:
         return None
     w_name = node.input[1]
     w_init = initializer_map.get(w_name)
@@ -3267,7 +3336,7 @@ def _apply_conv_pass_through_hop(
         _slice_last_axis(initializer_map[hop.bias], keep)
     if hop.past_state is not None:
         _slice_axis1(initializer_map[hop.past_state], keep)
-    if hop.node.op_type == "Conv":
+    if hop.node.op_type in ("Conv", "FusedConv"):
         _set_conv_group_attr(hop.node, keep_count)
 
 
@@ -3299,7 +3368,7 @@ def _match_producer(
     ):
         return None
     bias_name = None
-    if node.op_type == "Gemm" and len(node.input) == 3:
+    if node.op_type in ("Gemm", "FusedGemm") and len(node.input) == 3:
         bias_name = node.input[2]
         if bias_name not in initializer_map:
             return None  # non-constant bias -- can't safely prune it
@@ -3597,7 +3666,7 @@ def _match_conv_producer(
     special-casing for this -- only *which* `keep` indices get chosen (one
     independent top-k per group, see :func:`_apply_chains`) changes.
     """
-    if node.op_type != "Conv" or len(node.input) < 2:
+    if node.op_type not in ("Conv", "FusedConv") or len(node.input) < 2:
         return None
     w_name = node.input[1]
     w_init = initializer_map.get(w_name)
@@ -3704,7 +3773,7 @@ def _match_conv_consumer(
     :func:`_slice_grouped_consumer_conv_weight`, not the flat
     ``w[:, keep, ...]`` an ordinary consumer's weight uses.
     """
-    if node.op_type != "Conv" or len(node.input) < 2:
+    if node.op_type not in ("Conv", "FusedConv") or len(node.input) < 2:
         return None
     w_name = node.input[1]
     w_init = initializer_map.get(w_name)
@@ -3796,7 +3865,7 @@ def _match_depthwise_conv_pass_through(
     set survives upstream straight through, unchanged -- rather than a
     producer or consumer of its own.
     """
-    if node.op_type != "Conv" or len(node.input) < 2:
+    if node.op_type not in ("Conv", "FusedConv") or len(node.input) < 2:
         return None
     w_name = node.input[1]
     w_init = initializer_map.get(w_name)
@@ -4325,7 +4394,7 @@ def _walk_to_conv_consumer(
                 break
             nxt = candidates[0]
 
-        if nxt.op_type == "Conv" and nxt.input[0] == cur:
+        if nxt.op_type in ("Conv", "FusedConv") and nxt.input[0] == cur:
             depthwise = _match_depthwise_conv_pass_through(
                 nxt, initializer_map, n_channels
             )
@@ -4679,7 +4748,7 @@ def _match_conv_pass_through_self(
     re-validates every such hop against the group's real, established
     channel count once the whole group is resolved.
     """
-    if node.op_type != "Conv" or len(node.input) < 2:
+    if node.op_type not in ("Conv", "FusedConv") or len(node.input) < 2:
         return None
     w_init = initializer_map.get(node.input[1])
     if (
@@ -10543,7 +10612,7 @@ def _match_conv_qdq(
     matched here -- see this section's own top-of-section comment for why
     that composition is out of scope.
     """
-    if node.op_type != "Conv" or len(node.input) < 2:
+    if node.op_type not in ("Conv", "FusedConv") or len(node.input) < 2:
         return None
     if _conv_group(node) != 1:
         return None
@@ -10638,7 +10707,7 @@ def _match_matmul_qdq(
     dims = _weight_ref_dims(ref)
     out_channels, in_channels = dims[axis], dims[1 - axis]
     bias_name = None
-    if node.op_type == "Gemm" and len(node.input) == 3 and node.input[2]:
+    if node.op_type in ("Gemm", "FusedGemm") and len(node.input) == 3 and node.input[2]:
         bias_name = node.input[2]
         b_init = initializer_map.get(bias_name)
         if b_init is None or not _is_supported_float_dtype(b_init.data_type):
@@ -10685,7 +10754,7 @@ def _walk_to_consumer_qdq(
         nxt = candidates[0]
 
         if is_conv:
-            if nxt.op_type == "Conv" and nxt.input[0] == cur:
+            if nxt.op_type in ("Conv", "FusedConv") and nxt.input[0] == cur:
                 m = _match_conv_qdq(nxt, initializer_map, dq_of, consumers_of)
                 if m is None or m[3] != n_channels:
                     return None
@@ -10748,7 +10817,7 @@ def _find_qdq_chains(graph: onnx.GraphProto) -> List[_QDQChain]:
     chains: List[_QDQChain] = []
     for node in graph.node:
         is_conv_transpose = False
-        if node.op_type == "Conv":
+        if node.op_type in ("Conv", "FusedConv"):
             m = _match_conv_qdq(node, initializer_map, dq_of, consumers_of)
             if m is None:
                 continue
@@ -12127,7 +12196,7 @@ def _match_plain_matmul_nbits_peer(
 
     bias_init = None
     bias_name = None
-    if node.op_type == "Gemm" and len(node.input) == 3 and node.input[2]:
+    if node.op_type in ("Gemm", "FusedGemm") and len(node.input) == 3 and node.input[2]:
         bias_name = node.input[2]
         bias_init = initializer_map.get(bias_name)
         if bias_init is None or not _is_supported_float_dtype(bias_init.data_type):
@@ -26160,7 +26229,7 @@ def _match_lm_head_tail(
             and list(b_init.dims) in ([vocab_size], [1, vocab_size])
         )
 
-    if node.op_type == "Gemm" and len(node.input) == 3 and node.input[2]:
+    if node.op_type in ("Gemm", "FusedGemm") and len(node.input) == 3 and node.input[2]:
         bias_name = node.input[2]
         if not _valid_bias(bias_name):
             return _LM_HEAD_BIAS_INVALID
@@ -27996,7 +28065,17 @@ def _unstructured_not_eligible(graph: onnx.GraphProto, candidates: List) -> List
     not_eligible = []
     for node in graph.node:
         is_attn = node.domain == _ATTENTION_DOMAIN and node.op_type == "Attention"
-        if node.op_type not in ("Conv", "MatMul", "Gemm") and not is_attn:
+        if (
+            node.op_type
+            not in (
+                "Conv",
+                "FusedConv",
+                "MatMul",
+                "Gemm",
+                "FusedGemm",
+            )
+            and not is_attn
+        ):
             continue
         if id(node) in matched_ids:
             continue
@@ -28275,7 +28354,7 @@ def _structured_not_eligible(
                 matched_ids.update(id(h.node) for h in b.conv_pass_through)
     not_eligible = []
     for node in graph.node:
-        if node.op_type not in ("Conv", "MatMul", "Gemm"):
+        if node.op_type not in ("Conv", "FusedConv", "MatMul", "Gemm", "FusedGemm"):
             continue
         if id(node) in matched_ids:
             continue
@@ -28583,7 +28662,14 @@ def _qdq_not_eligible(
         matched_ids.add(id(gchain.consumer.node))
     not_eligible = []
     for node in graph.node:
-        if node.op_type not in ("Conv", "ConvTranspose", "MatMul", "Gemm"):
+        if node.op_type not in (
+            "Conv",
+            "FusedConv",
+            "ConvTranspose",
+            "MatMul",
+            "Gemm",
+            "FusedGemm",
+        ):
             continue
         if id(node) in matched_ids:
             continue
