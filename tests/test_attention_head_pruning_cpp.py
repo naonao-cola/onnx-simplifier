@@ -1092,3 +1092,518 @@ def test_cpp_attention_head_pruning_matches_python_reference_output_with_if_subg
         (y_py,) = _run(pruned_py, feeds)
         (y_cpp,) = _run(pruned_cpp, feeds)
         np.testing.assert_allclose(y_py, y_cpp, rtol=1e-4, atol=1e-4)
+
+
+# --- com.microsoft::MatMulNBitsQkv (fused, block-quantized Q/K/V projection
+# --- feeding GroupQueryAttention) -------------------------------------------
+#
+# Tests for the fused ``MatMulNBitsQkv`` chain family
+# (``onnxsim/structured_pruning_entry.cpp``'s own "MatMulNBitsMlp/
+# MatMulNBitsQkv" subsection -- despite living in that file's own
+# "MatMulNBits" section, this chain kind is wired into
+# `ApplyAttentionHeadPruning`/``apply_attention_head_pruning_cpp`` rather
+# than `ApplyStructuredPruning`/``apply_structured_pruning_cpp``, since
+# pruning a whole KV group needs THIS function's own GQA head-count
+# matching machinery -- see that subsection's own top comment for the full
+# reasoning), mirroring ``tests/test_pruning.py``'s own
+# ``test_matmul_nbits_qkv_pruning_matches_decomposed_oracle``/
+# ``test_matmul_nbits_qkv_pruning_declines_non_block_aligned_consumer``.
+# Like ``MatMulNBitsMlp``, neither this op nor its Q/K/V branches has a
+# ``zero_points`` input at all -- every weight slot uses the schema's own
+# DEFAULT zero point (``2 ** (bits - 1)``, i.e. 8 for ``bits=4``). Unlike
+# ``MatMulNBitsMlp``, ``MatMulNBitsQkv`` itself ALSO cannot be executed via a
+# real CPU-EP ``InferenceSession`` here (confirmed the same empirical way) --
+# so its own oracle test below decomposes the PRUNED fused node's own
+# tensors into a real ``SimplifiedLayerNormalization`` + 3x real
+# ``MatMulNBits`` (both genuine CPU kernels) and checks their own outputs
+# against an independent RMSNorm + dequantize-then-matmul numpy oracle,
+# mirroring ``test_pruning.py``'s own identical proxy-topology technique.
+# The downstream ``GroupQueryAttention``/consumer half of this pass's own
+# slicing -- num_heads/kv_num_heads attribute rewrite, consumer weight
+# slicing -- is exactly the same code path every plain-GQA test above
+# already runs end to end through a real ``GroupQueryAttention`` CPU kernel
+# (`ApplyOneGqaChain`'s own head-count/attribute handling, reused verbatim
+# by `ApplyMatMulNBitsQkvChains` -- see that function's own comment), so
+# this section's own tests below check it via direct assertion instead
+# (attribute values, byte-exact consumer-weight slices) rather than
+# re-proving already-oracle-tested machinery a second time.
+
+
+def _nbits_pack_nibbles(vals):
+    """Independent reference nibble packer: last axis (uint8 in [0, 15]),
+    2-per-byte, LOW nibble first -- the schema's own documented layout.
+    """
+    count = vals.shape[-1]
+    nbytes = (count + 1) // 2
+    out = np.zeros(vals.shape[:-1] + (nbytes,), dtype=np.uint8)
+    for j in range(nbytes):
+        lo = vals[..., 2 * j]
+        hi = vals[..., 2 * j + 1] if 2 * j + 1 < count else np.zeros_like(lo)
+        out[..., j] = (lo & 0xF) | ((hi & 0xF) << 4)
+    return out
+
+
+def _nbits_pack_b(qcodes, n, k_blocks, block_size):
+    blob_size = block_size * 4 // 8
+    b = np.zeros((n, k_blocks, blob_size), dtype=np.uint8)
+    for kb in range(k_blocks):
+        k0 = kb * block_size
+        b[:, kb, :] = _nbits_pack_nibbles(qcodes[:, k0 : k0 + block_size])
+    return b
+
+
+def _nbits_quantize_default_zp(w, block_size, bits=4):
+    """Independent reference block quantizer using the schema's own DEFAULT
+    zero point (``2 ** (bits - 1)``) -- the only encoding ``MatMulNBitsQkv``
+    (and ``MatMulNBitsMlp``) supports, since neither has a ``zero_points``
+    input at all. Returns ``(qcodes uint8 [N, K], scales float32 [N,
+    k_blocks], k_blocks)``.
+    """
+    n, k = w.shape
+    assert k % block_size == 0
+    k_blocks = k // block_size
+    qmax = (1 << bits) - 1
+    zp = float(1 << (bits - 1))
+    scales = np.zeros((n, k_blocks), dtype=np.float32)
+    qcodes = np.zeros((n, k), dtype=np.uint8)
+    for row in range(n):
+        for kb in range(k_blocks):
+            k0, k1 = kb * block_size, (kb + 1) * block_size
+            block = w[row, k0:k1]
+            maxabs = max(float(np.max(np.abs(block))), 1e-8)
+            scale = maxabs / max(zp, qmax - zp)
+            scales[row, kb] = scale
+            codes = np.round(block / scale + zp).clip(0, qmax)
+            qcodes[row, k0:k1] = codes.astype(np.uint8)
+    return qcodes, scales, k_blocks
+
+
+def _nbits_dequant(qcodes, scales, block_size, bits=4):
+    """Independent reference dequantizer, schema DEFAULT zero point only."""
+    n, k = qcodes.shape
+    k_blocks = k // block_size
+    out = np.zeros((n, k), dtype=np.float64)
+    zp = float(1 << (bits - 1))
+    for row in range(n):
+        for kb in range(k_blocks):
+            k0, k1 = kb * block_size, (kb + 1) * block_size
+            out[row, k0:k1] = (qcodes[row, k0:k1].astype(np.float64) - zp) * scales[
+                row, kb
+            ]
+    return out
+
+
+def _nbits_no_zp_initializers(w, block_size, prefix, bits=4):
+    """Quantizes ``w`` (``[N, K]``) with the schema's own default zero point
+    and returns ``(initializer_list, info_dict)`` -- the zero_points-free
+    analogue of a ``_nbits_weight_initializers`` helper, since neither
+    ``MatMulNBitsQkv`` nor ``MatMulNBitsMlp`` ever carries one.
+    """
+    qcodes, scales, k_blocks = _nbits_quantize_default_zp(w, block_size, bits)
+    b = _nbits_pack_b(qcodes, w.shape[0], k_blocks, block_size)
+    inits = [
+        onnx.numpy_helper.from_array(b, name=f"{prefix}_B"),
+        onnx.numpy_helper.from_array(scales, name=f"{prefix}_scales"),
+    ]
+    return inits, dict(
+        qcodes=qcodes,
+        scales=scales,
+        k_blocks=k_blocks,
+        b_name=f"{prefix}_B",
+        scales_name=f"{prefix}_scales",
+    )
+
+
+def _matmul_nbits_qkv_model(
+    num_heads,
+    kv_num_heads,
+    d,
+    K,
+    block_size,
+    N2,
+    w_q,
+    w_k,
+    w_v,
+    bias_q,
+    bias_k,
+    bias_v,
+    norm_scale,
+    batch=2,
+    seq=5,
+    consumer="plain",
+    consumer_block_size=None,
+    attention_bias=None,
+):
+    """Builds ``A -> MatMulNBitsQkv(qkv) -> (Q, K, V) ->
+    GroupQueryAttention(attn) -> MatMul/MatMulNBits(down) -> Z``. ``Q``/``K``/
+    ``V`` feed the attention node's own query/key/value inputs DIRECTLY (no
+    per-head norm/RoPE hop -- a deliberate, documented scope boundary, see
+    ``structured_pruning_entry.cpp``'s own section comment).
+    ``consumer="plain"`` builds a plain-float output projection;
+    ``consumer="nbits"`` a real ``MatMulNBits`` one (block size
+    `consumer_block_size`), to exercise the block-alignment decline path.
+    `attention_bias`, if given, is wired as a constant GQA `attention_bias`
+    input (index 10) -- to exercise `MatMulNBitsQkvAttentionExtrasSafe`'s own
+    decline path.
+    """
+    Nq = num_heads * d
+    Nkv = kv_num_heads * d
+    inits_q, info_q = _nbits_no_zp_initializers(w_q, block_size, "qkvq")
+    inits_k, info_k = _nbits_no_zp_initializers(w_k, block_size, "qkvk")
+    inits_v, info_v = _nbits_no_zp_initializers(w_v, block_size, "qkvv")
+
+    seqlens_k = np.full((batch,), seq - 1, dtype=np.int32)
+    total_seq = np.array(seq, dtype=np.int32)
+    initializer = [
+        *inits_q,
+        *inits_k,
+        *inits_v,
+        _f32(bias_q, "qkv_bias_q"),
+        _f32(bias_k, "qkv_bias_k"),
+        _f32(bias_v, "qkv_bias_v"),
+        _f32(norm_scale, "qkv_norm_scale"),
+        onnx.numpy_helper.from_array(seqlens_k, "qkv_seqlens_k"),
+        onnx.numpy_helper.from_array(total_seq, "qkv_total_seq"),
+    ]
+
+    if consumer == "plain":
+        rng = np.random.default_rng(9202)
+        down_w = (rng.standard_normal((Nq, N2)) * 0.3).astype(np.float32)
+        initializer.append(_f32(down_w, "qkv_down_w"))
+        consumer_body = "Z = MatMul(ctx, qkv_down_w)"
+        consumer_info = dict(down_w=down_w)
+    else:
+        assert consumer_block_size is not None
+        rng = np.random.default_rng(9203)
+        w_c = (rng.standard_normal((N2, Nq)) * 0.3).astype(np.float32)
+        inits_c, info_c = _nbits_no_zp_initializers(w_c, consumer_block_size, "qkvdown")
+        initializer += inits_c
+        consumer_body = (
+            f"Z = com.microsoft.MatMulNBits<K={Nq},N={N2},bits=4,"
+            f"block_size={consumer_block_size}>"
+            f"(ctx, {info_c['b_name']}, {info_c['scales_name']})"
+        )
+        consumer_info = dict(
+            qcodes_c=info_c["qcodes"], scales_c=info_c["scales"], kbc=info_c["k_blocks"]
+        )
+
+    gqa_extra_inputs = ""
+    if attention_bias is not None:
+        initializer.append(_f32(attention_bias, "qkv_attention_bias"))
+        # attention_bias is input 10 -- pad cos_cache/sin_cache/position_ids
+        # (7/8/9) with blanks.
+        gqa_extra_inputs = ", , , , qkv_attention_bias"
+
+    body = f"""
+        g (float[{batch},{seq},{K}] A) => (float[{batch},{seq},{N2}] Z)
+        {{
+          Q, Kt, V = com.microsoft.MatMulNBitsQkv<block_size={block_size},bits=4,Nq={Nq},Nkv={Nkv},K={K}>(A, , qkv_norm_scale, {info_q["b_name"]}, {info_q["scales_name"]}, qkv_bias_q, {info_k["b_name"]}, {info_k["scales_name"]}, qkv_bias_k, {info_v["b_name"]}, {info_v["scales_name"]}, qkv_bias_v)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention<num_heads={num_heads}, kv_num_heads={kv_num_heads}>(Q, Kt, V, , , qkv_seqlens_k, qkv_total_seq{gqa_extra_inputs})
+          {consumer_body}
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    info = dict(
+        qcodes_q=info_q["qcodes"],
+        scales_q=info_q["scales"],
+        qcodes_k=info_k["qcodes"],
+        scales_k=info_k["scales"],
+        qcodes_v=info_v["qcodes"],
+        scales_v=info_v["scales"],
+        kb=info_q["k_blocks"],
+        Nq=Nq,
+        Nkv=Nkv,
+    )
+    info.update(consumer_info)
+    return model, info
+
+
+def test_cpp_matmul_nbits_qkv_pruning_matches_decomposed_oracle():
+    # 4 query heads, 2 KV heads (group_size=2), head_size=2. KV group 0
+    # (query heads 0,1 + kv head 0) engineered LARGE (kept); KV group 1
+    # (query heads 2,3 + kv head 1) engineered SMALL (dropped). sparsity=0.5
+    # -> keep exactly 1 of 2 groups: group 0 -- num_heads 4->2, kv_num_heads
+    # 2->1, preserving the 2:1 group ratio exactly.
+    num_heads, kv_num_heads, d, K, block_size, N2 = 4, 2, 2, 32, 32, 5
+    rng = np.random.default_rng(9300)
+    w_q = (rng.standard_normal((num_heads * d, K)) * 0.3).astype(np.float32)
+    w_k = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    w_v = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    w_q[:4] *= 8.0
+    w_q[4:] *= 0.05
+    w_k[:2] *= 8.0
+    w_k[2:] *= 0.05
+    w_v[:2] *= 8.0
+    w_v[2:] *= 0.05
+    bias_q = (rng.standard_normal(num_heads * d) * 0.05).astype(np.float32)
+    bias_k = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    bias_v = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    norm_scale = (1.0 + rng.standard_normal(K) * 0.1).astype(np.float32)
+
+    model, info = _matmul_nbits_qkv_model(
+        num_heads,
+        kv_num_heads,
+        d,
+        K,
+        block_size,
+        N2,
+        w_q,
+        w_k,
+        w_v,
+        bias_q,
+        bias_k,
+        bias_v,
+        norm_scale,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    q_keep = np.array([0, 1, 2, 3])  # heads 0,1 (group 0), d=2 -> rows 0-3
+    kv_keep = np.array([0, 1])  # kv head 0, d=2 -> rows 0-1
+
+    qkv_node = next(n for n in pruned.graph.node if n.op_type == "MatMulNBitsQkv")
+    assert next(a.i for a in qkv_node.attribute if a.name == "Nq") == 4
+    assert next(a.i for a in qkv_node.attribute if a.name == "Nkv") == 2
+    attn_node = next(n for n in pruned.graph.node if n.op_type == "GroupQueryAttention")
+    assert next(a.i for a in attn_node.attribute if a.name == "num_heads") == 2
+    assert next(a.i for a in attn_node.attribute if a.name == "kv_num_heads") == 1
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    q_B_expected = _nbits_pack_b(info["qcodes_q"][q_keep], 4, info["kb"], block_size)
+    k_B_expected = _nbits_pack_b(info["qcodes_k"][kv_keep], 2, info["kb"], block_size)
+    v_B_expected = _nbits_pack_b(info["qcodes_v"][kv_keep], 2, info["kb"], block_size)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["qkvq_B"]), q_B_expected
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["qkvk_B"]), k_B_expected
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["qkvv_B"]), v_B_expected
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["qkv_down_w"]), info["down_w"][q_keep]
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["qkv_bias_q"]), bias_q[q_keep]
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["qkv_bias_k"]), bias_k[kv_keep]
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["qkv_bias_v"]), bias_v[kv_keep]
+    )
+
+    # Decompose the fused MatMulNBitsQkv node's own (PRUNED) tensors into a
+    # real SimplifiedLayerNormalization + 3x real MatMulNBits and run THOSE
+    # through a CPU-kernel InferenceSession against an independent RMSNorm +
+    # dequantize-then-matmul numpy oracle -- see this section's own top
+    # comment for why the fused node itself cannot be executed here.
+    decomposed = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        g (float[batch,{K}] A) => (float[batch,4] q_out, float[batch,2] k_out, float[batch,2] v_out)
+        {{
+          A_norm = SimplifiedLayerNormalization<axis=-1,epsilon=1e-5>(A, qkv_norm_scale)
+          q_out = com.microsoft.MatMulNBits<K={K},N=4,bits=4,block_size={block_size}>(A_norm, qkvq_B, qkvq_scales, , , qkv_bias_q)
+          k_out = com.microsoft.MatMulNBits<K={K},N=2,bits=4,block_size={block_size}>(A_norm, qkvk_B, qkvk_scales, , , qkv_bias_k)
+          v_out = com.microsoft.MatMulNBits<K={K},N=2,bits=4,block_size={block_size}>(A_norm, qkvv_B, qkvv_scales, , , qkv_bias_v)
+        }}
+        """
+    )
+    decomposed.graph.initializer.extend(
+        [
+            inits["qkv_norm_scale"],
+            inits["qkvq_B"],
+            inits["qkvq_scales"],
+            inits["qkv_bias_q"],
+            inits["qkvk_B"],
+            inits["qkvk_scales"],
+            inits["qkv_bias_k"],
+            inits["qkvv_B"],
+            inits["qkvv_scales"],
+            inits["qkv_bias_v"],
+        ]
+    )
+    # No onnx.checker.check_model here -- the plain ONNX checker doesn't
+    # recognize `SimplifiedLayerNormalization` (an onnxruntime-only op
+    # registered under the "" domain, confirmed via live schema
+    # introspection) even though onnxruntime itself executes it fine;
+    # mirrors test_pruning.py's own identical omission for this same
+    # decomposed proxy graph.
+
+    x = np.random.default_rng(9301).standard_normal((3, K)).astype(np.float32)
+    q_actual, k_actual, v_actual = _run(decomposed, {"A": x})
+
+    def _rmsnorm(a, scale, eps):
+        rms = np.sqrt(np.mean(a.astype(np.float64) ** 2, axis=-1, keepdims=True) + eps)
+        return (a.astype(np.float64) / rms) * scale.astype(np.float64)
+
+    a_norm_ref = _rmsnorm(x, norm_scale, 1e-5)
+    w_q_dequant = _nbits_dequant(info["qcodes_q"], info["scales_q"], block_size)
+    w_k_dequant = _nbits_dequant(info["qcodes_k"], info["scales_k"], block_size)
+    w_v_dequant = _nbits_dequant(info["qcodes_v"], info["scales_v"], block_size)
+    q_ref = a_norm_ref @ w_q_dequant[q_keep].T + bias_q[q_keep]
+    k_ref = a_norm_ref @ w_k_dequant[kv_keep].T + bias_k[kv_keep]
+    v_ref = a_norm_ref @ w_v_dequant[kv_keep].T + bias_v[kv_keep]
+
+    np.testing.assert_allclose(q_actual, q_ref, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(k_actual, k_ref, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(v_actual, v_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_cpp_matmul_nbits_qkv_pruning_declines_non_block_aligned_consumer():
+    # head_size=3 (unlike the block-aligned test above's head_size=2):
+    # keep_q_heads=[0, 1] (group 0) -> q_idx = rows [0..5] (6 elements),
+    # which straddles the MatMulNBits consumer's own block boundary at row 4
+    # (block_size=4: blocks [0,4), [4,8), [8,12)) -- rows 4, 5 are only PART
+    # of block 1, so this keep-set is NOT block-aligned. The whole chain
+    # (qkv node, attention node, AND consumer) must be left completely
+    # untouched, mirroring the plain-MatMulNBits consumer's own identical
+    # decline precedent.
+    num_heads, kv_num_heads, d, K, block_size, N2 = 4, 2, 3, 32, 32, 4
+    consumer_block_size = 4
+    rng = np.random.default_rng(9310)
+    w_q = (rng.standard_normal((num_heads * d, K)) * 0.3).astype(np.float32)
+    w_k = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    w_v = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    w_q[:6] *= 8.0
+    w_q[6:] *= 0.05
+    w_k[:3] *= 8.0
+    w_k[3:] *= 0.05
+    w_v[:3] *= 8.0
+    w_v[3:] *= 0.05
+    bias_q = (rng.standard_normal(num_heads * d) * 0.05).astype(np.float32)
+    bias_k = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    bias_v = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    norm_scale = (1.0 + rng.standard_normal(K) * 0.1).astype(np.float32)
+
+    model, _info = _matmul_nbits_qkv_model(
+        num_heads,
+        kv_num_heads,
+        d,
+        K,
+        block_size,
+        N2,
+        w_q,
+        w_k,
+        w_v,
+        bias_q,
+        bias_k,
+        bias_v,
+        norm_scale,
+        consumer="nbits",
+        consumer_block_size=consumer_block_size,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+
+    inits_before = {t.name: t.SerializeToString() for t in model.graph.initializer}
+    inits_after = {t.name: t.SerializeToString() for t in pruned.graph.initializer}
+    assert inits_before == inits_after
+    attrs_before = [
+        (n.name, [(a.name, a.i) for a in n.attribute]) for n in model.graph.node
+    ]
+    attrs_after = [
+        (n.name, [(a.name, a.i) for a in n.attribute]) for n in pruned.graph.node
+    ]
+    assert attrs_before == attrs_after
+
+
+def test_cpp_matmul_nbits_qkv_pruning_declines_when_attention_bias_present():
+    # A genuinely per-head-shaped `attention_bias` (dims[1] == num_heads,
+    # not 1) on the downstream GroupQueryAttention node -- this port has no
+    # dynamic-Gather-insertion machinery to correctly re-slice it (see
+    # `MatMulNBitsQkvAttentionExtrasSafe`'s own comment), so the whole chain
+    # must be declined outright rather than silently leave it stale.
+    num_heads, kv_num_heads, d, K, block_size, N2 = 4, 2, 2, 32, 32, 5
+    batch, seq = 2, 5
+    rng = np.random.default_rng(9320)
+    w_q = (rng.standard_normal((num_heads * d, K)) * 0.3).astype(np.float32)
+    w_k = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    w_v = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    bias_q = (rng.standard_normal(num_heads * d) * 0.05).astype(np.float32)
+    bias_k = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    bias_v = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    norm_scale = (1.0 + rng.standard_normal(K) * 0.1).astype(np.float32)
+    attention_bias = rng.standard_normal((1, num_heads, seq, seq)).astype(np.float32)
+
+    model, _info = _matmul_nbits_qkv_model(
+        num_heads,
+        kv_num_heads,
+        d,
+        K,
+        block_size,
+        N2,
+        w_q,
+        w_k,
+        w_v,
+        bias_q,
+        bias_k,
+        bias_v,
+        norm_scale,
+        batch=batch,
+        seq=seq,
+        attention_bias=attention_bias,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    inits_before = {t.name: t.SerializeToString() for t in model.graph.initializer}
+    inits_after = {t.name: t.SerializeToString() for t in pruned.graph.initializer}
+    assert inits_before == inits_after
+    attrs_before = [
+        (n.name, [(a.name, a.i) for a in n.attribute]) for n in model.graph.node
+    ]
+    attrs_after = [
+        (n.name, [(a.name, a.i) for a in n.attribute]) for n in pruned.graph.node
+    ]
+    assert attrs_before == attrs_after
+
+
+def test_cpp_matmul_nbits_qkv_pruning_zero_sparsity_is_a_no_op():
+    num_heads, kv_num_heads, d, K, block_size, N2 = 4, 2, 2, 32, 32, 5
+    rng = np.random.default_rng(9330)
+    w_q = (rng.standard_normal((num_heads * d, K)) * 0.3).astype(np.float32)
+    w_k = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    w_v = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    bias_q = (rng.standard_normal(num_heads * d) * 0.05).astype(np.float32)
+    bias_k = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    bias_v = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    norm_scale = (1.0 + rng.standard_normal(K) * 0.1).astype(np.float32)
+
+    model, _info = _matmul_nbits_qkv_model(
+        num_heads,
+        kv_num_heads,
+        d,
+        K,
+        block_size,
+        N2,
+        w_q,
+        w_k,
+        w_v,
+        bias_q,
+        bias_k,
+        bias_v,
+        norm_scale,
+    )
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.0)
+    qkv_node = next(n for n in pruned.graph.node if n.op_type == "MatMulNBitsQkv")
+    assert next(a.i for a in qkv_node.attribute if a.name == "Nq") == num_heads * d
+    assert next(a.i for a in qkv_node.attribute if a.name == "Nkv") == kv_num_heads * d

@@ -73,6 +73,7 @@
 #include "structured_pruning_entry.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -6795,16 +6796,87 @@ void ApplySplitGatedChains(onnx::GraphProto* graph,
 // --- pruning -----------------------------------------------------------
 //
 // C++ port of pruning.py's own "MatMulNBits (block-quantized weight)
-// structured pruning" section -- specifically just its PLAIN
-// (_find_matmul_nbits_chains) and GATED (_find_matmul_nbits_gated_chains)
-// chain families, i.e. everything from that section's own
-// `_matmul_nbits_int_attr` through the end of
-// `apply_structured_pruning_matmul_nbits`. Deliberately NOT ported here (see
-// pruning.py's own section comments for each): `com.microsoft::MatMulBnb4`
-// (a different quantization format -- bitsandbytes FP4/NF4, not this
-// section's int4/int8 packing), and the fused `MatMulNBitsMlp`/
-// `MatMulNBitsQkv` WebGPU-EP-targeted variants (a separate, much larger
-// section further into pruning.py) -- both out of scope for this port.
+// structured pruning" section -- its PLAIN (_find_matmul_nbits_chains),
+// GATED (_find_matmul_nbits_gated_chains), and (as of this round) the two
+// fused-op variants from pruning.py's own "MatMulNBitsMlp/MatMulNBitsQkv
+// (fused block-quantized weight) structured pruning" section
+// (_find_matmul_nbits_mlp_chains/_apply_matmul_nbits_mlp_chains,
+// _find_matmul_nbits_qkv_chains/_apply_matmul_nbits_qkv_chains) -- i.e.
+// everything from this section's own `_matmul_nbits_int_attr` through the
+// end of `apply_structured_pruning_matmul_nbits`, MINUS
+// `com.microsoft::MatMulBnb4` (a different quantization format --
+// bitsandbytes FP4/NF4, not this section's int4/int8 packing -- still out of
+// scope, being ported by a separate effort). `MatMulNBitsMlp`/
+// `MatMulNBitsQkv` matching/struct/slicing code (MatMulNBitsMlpWeight/
+// MatchMatMulNBitsMlp/FindMatMulNBitsMlpChains/ApplyMatMulNBitsMlpChains,
+// MatMulNBitsQkvWeight/MatchMatMulNBitsQkv/FindMatMulNBitsQkvChains/
+// ApplyMatMulNBitsQkvChains) still lives in THIS section, right after
+// ApplyMatMulNBitsChains below, reusing every plain-`MatMulNBits` helper
+// above unchanged (MatMulNBitsWeight/NBitsSide/WalkToMatMulNBitsConsumer/
+// MatMulNBitsDequantized/MatMulNBitsBlockAlignedKeepBlocks/
+// SliceNBitsSideConsumer) -- but each fused chain kind is WIRED IN from a
+// different top-level entry point than the plain/gated ones just above,
+// mirroring how differently-shaped their own pruning units are (see each
+// one's own comment for the reasoning):
+//   * `MatMulNBitsMlp` co-slices its own `gate`/`up` branches' shared
+//     OUTPUT-channel axis -- structurally just another MatMul-chain
+//     producer/consumer pair, no attention-node metadata needed at all --
+//     so `FindMatMulNBitsMlpChains`/`ApplyMatMulNBitsMlpChains` are called
+//     from `ApplyStructuredPruning` below, sharing that function's own
+//     `TouchedState` with the plain/gated `MatMulNBits` chains (and every
+//     other chain family `ApplyStructuredPruning` already applies) the exact
+//     same way `ApplyMatMulNBitsChains` itself already does.
+//   * `MatMulNBitsQkv` prunes whole KV groups, which needs the downstream
+//     `GroupQueryAttention`/plain `ai.onnx::Attention` consumer's own
+//     `num_heads`/`kv_num_heads` metadata to even determine the pruning
+//     unit -- so `FindMatMulNBitsQkvChains`/`ApplyMatMulNBitsQkvChains`
+//     reuse this file's own "Attention-head pruning" section machinery
+//     directly (MatchGqaProducer/MatchOnnxAttentionProducer/
+//     HeadColumnIndices/AttnChainOp) and are called from
+//     `ApplyAttentionHeadPruning` instead, with their own dedicated
+//     producer/consumer-touched bookkeeping local to that call (not shared
+//     with `ApplyAttentionChains`'s own -- see ApplyMatMulNBitsQkvChains's
+//     own comment for why that's always safe: a `MatMulNBitsQkv` node's own
+//     `q_b`/`k_b`/`v_b` weight names can never collide with a plain/GQA
+//     chain's own separately-matched Q/K/V producer weight names).
+// This split-entry-point wiring is a real, deliberate divergence from
+// pruning.py's own structure -- where `_apply_matmul_nbits_mlp_chains` AND
+// `_apply_matmul_nbits_qkv_chains` are both called from ONE Python function,
+// `apply_structured_pruning_matmul_nbits`, sharing one `producer_touched`/
+// `consumer_touched` pair -- but continues, rather than introduces, this
+// port's own established precedent: the plain/gated `MatMulNBits` chain
+// families were ALREADY folded into `ApplyStructuredPruning` by an earlier
+// round of this port (rather than getting their own
+// `ApplyStructuredPruningMatMulNBits` C++ entry point mirroring Python's
+// separate function), so composing each new fused-op variant with whichever
+// EXISTING C++ top-level entry point actually owns the matching machinery
+// it needs is the consistent choice, confirmed by reading both
+// `ApplyStructuredPruning`'s own existing `MatMulNBits` handling and
+// `ApplyAttentionHeadPruning`'s own existing GQA-chain handling before
+// choosing (see this file's own git history/PR description for that
+// analysis) rather than guessed at.
+//
+// `MatMulNBitsQkv`'s own scope is narrower than pruning.py's here in one
+// more real, deliberately documented way: pruning.py's own
+// `_apply_matmul_nbits_qkv_chains` reuses `_slice_or_gather_head_bias` (this
+// module's shared dynamic-`attention_bias`-Gather-insertion fix -- see
+// pruning.py's own "Attention-head pruning" section comment for the full
+// narrative) for its own `attention_bias`/`head_sink` handling. This port
+// has no C++ analogue of that machinery AT ALL yet -- not even for the
+// PLAIN GQA chains `ApplyOneGqaChain` above already handles (that function
+// never touches `attention_bias`/`head_sink`/`k_scale`/`v_scale` either, a
+// pre-existing scope gap this round does not attempt to close). Rather than
+// silently reproduce that same gap for the new `MatMulNBitsQkv` chain kind
+// too, `FindMatMulNBitsQkvChains` adds its own narrow, explicit safety net
+// (MatMulNBitsQkvAttentionBiasSafe) declining the WHOLE chain whenever
+// `attention_bias`/`attn_mask` is anything other than absent or a provably
+// broadcast (never-per-head) constant, and whenever `head_sink` is anything
+// other than absent -- see that function's own comment for the exact
+// reasoning. `past_key`/`past_value` (constant, guaranteed-empty per
+// MatchGqaProducer's own existing precondition) and GQA's own `k_scale`/
+// `v_scale` (constant, per-KV-head-shaped) ARE sliced, mirroring
+// pruning.py's own identical handling -- both are cheap, bounded, and safe
+// to port exactly, unlike the dynamic-Gather-insertion machinery.
 //
 // `com.microsoft::MatMulNBits` packs a `[N, K]` weight-only-quantized Linear
 // layer's weight as `B` (`uint8[N, k_blocks, block_size * bits / 8]` --
@@ -8119,6 +8191,1040 @@ void ApplyMatMulNBitsChains(onnx::GraphProto* graph,
     for (auto* op : gchain.chain_ops) {
       touched.stale_value_info.insert(op->output(0));
     }
+  }
+}
+
+// --- MatMulNBitsMlp/MatMulNBitsQkv (fused block-quantized weight)
+// structured pruning, mirroring pruning.py's own section of (almost) the
+// same name -- see this section's own top comment (above
+// ApplyMatMulNBitsChains) for the empirical schema facts both fused ops
+// share, and for why each chain kind below is wired into a DIFFERENT
+// top-level entry point (ApplyStructuredPruning for MatMulNBitsMlp,
+// ApplyAttentionHeadPruning for MatMulNBitsQkv) rather than one shared
+// with plain/gated MatMulNBits chains here. ---------------------------
+
+// Row-slices (N/Nq/Nkv axis) `b_name`/`scales_name`/`bias_name` (if present)
+// in place, given directly by NAME rather than through a MatMulNBitsWeight
+// -- the zero_points-FREE analogue of SliceMatMulNBitsProducerRows, since
+// neither `MatMulNBitsMlp` nor `MatMulNBitsQkv` has a `zero_points` input at
+// all (see this section's own top comment). Never touches any node
+// attribute itself -- `MatMulNBitsMlp`'s single `N` is shared by two
+// branches (harmlessly redundant to set twice) and `MatMulNBitsQkv`'s own
+// `Nq`/`Nkv` aren't literally named `"N"` at all -- so the caller sets
+// whichever attribute is right, once, itself. Mirrors pruning.py's own
+// `_slice_matmul_nbits_rows_no_zp`.
+void SliceMatMulNBitsRowsNoZp(
+    const std::string& b_name, const std::string& scales_name,
+    const std::optional<std::string>& bias_name, int64_t block_size,
+    int64_t bits, int64_t k_blocks,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    const std::vector<int64_t>& keep) {
+  const int64_t blob_size = block_size * bits / 8;
+  const int64_t row_width = k_blocks * blob_size;
+  const int64_t kc = static_cast<int64_t>(keep.size());
+
+  onnx::TensorProto* b = init_map.at(b_name);
+  const std::vector<uint8_t> b_data = ReadUint8Tensor(*b);
+  std::vector<uint8_t> b_out(static_cast<size_t>(kc * row_width));
+  for (int64_t i = 0; i < kc; ++i) {
+    std::memcpy(b_out.data() + i * row_width,
+                b_data.data() + keep[i] * row_width,
+                static_cast<size_t>(row_width));
+  }
+  SetUint8TensorData(b, {kc, k_blocks, blob_size}, b_out);
+
+  onnx::TensorProto* scales = init_map.at(scales_name);
+  const std::vector<float> s_data = ReadFloatTensor(*scales);
+  std::vector<float> s_out(static_cast<size_t>(kc * k_blocks));
+  for (int64_t i = 0; i < kc; ++i) {
+    std::memcpy(s_out.data() + i * k_blocks, s_data.data() + keep[i] * k_blocks,
+                static_cast<size_t>(k_blocks) * sizeof(float));
+  }
+  SetFloatTensorData(scales, {kc, k_blocks}, s_out);
+
+  if (bias_name) {
+    SliceLastAxis(init_map.at(*bias_name), keep);
+  }
+}
+
+// Slices axis 1 (the second dimension) of a rank>=2 FLOAT tensor `t` in
+// place to `keep`, leaving every other axis untouched -- mirrors
+// pruning.py's own `_slice_axis1` (used there for GQA's own `past_key`/
+// `past_value` BNSH cache and `k_scale`/`v_scale`), generalized here to any
+// rank via the existing flat-buffer SliceAxis1 helper (`inner` = the
+// flattened size of every trailing axis past axis 1).
+void SliceFloatTensorAxis1(onnx::TensorProto* t,
+                           const std::vector<int64_t>& keep) {
+  std::vector<int64_t> dims(t->dims().begin(), t->dims().end());
+  const std::vector<float> data = ReadFloatTensor(*t);
+  int64_t inner = 1;
+  for (size_t i = 2; i < dims.size(); ++i) {
+    inner *= dims[i];
+  }
+  const std::vector<float> out =
+      SliceAxis1(data, dims[0], dims[1], inner, keep);
+  std::vector<int64_t> new_dims = dims;
+  new_dims[1] = static_cast<int64_t>(keep.size());
+  SetFloatTensorData(t, new_dims, out);
+}
+
+// A matched `com.microsoft::MatMulNBitsMlp` node's two block-quantized
+// weight operands (`gate`/`up`) -- mirrors pruning.py's own
+// `_MatMulNBitsMlpWeight`. No `zero_points` field at all: confirmed via live
+// schema introspection (pruning.py's own section comment) that neither this
+// op nor `MatMulNBitsQkv` has a `zero_points` input on any weight slot --
+// every one implicitly uses the schema's own default zero point,
+// `2 ** (bits - 1)`.
+struct MatMulNBitsMlpWeight {
+  onnx::NodeProto* node = nullptr;
+  std::string gate_b_name, gate_scales_name;
+  std::optional<std::string> gate_bias_name;
+  std::string up_b_name, up_scales_name;
+  std::optional<std::string> up_bias_name;
+  int64_t N = 0;
+  int64_t K = 0;
+  int64_t bits = 0;
+  int64_t block_size = 0;
+  int64_t k_blocks = 0;
+};
+
+// If `node` is a `com.microsoft::MatMulNBitsMlp` node matching every scope
+// boundary this section's own top comment documents, returns the match --
+// mirrors pruning.py's own `_match_matmul_nbits_mlp`. `skip`/`norm_scale`
+// (inputs 1/2), when present, are never inspected at all (not even read) --
+// this matcher, like the plain `MatMulNBits` one above, only ever prunes
+// `gate`'s/`up`'s own shared OUTPUT (`N`) axis, never their shared INPUT
+// (`K`) axis those two operands would need re-slicing for. `scales`/`bias`
+// restricted to FLOAT32 -- the same narrower-than-pruning.py scope
+// MatchMatMulNBits above already establishes for plain `MatMulNBits`
+// (pruning.py's own schema allows FLOAT16/BFLOAT16 there too).
+std::optional<MatMulNBitsMlpWeight> MatchMatMulNBitsMlp(
+    onnx::NodeProto* node, const InitMap& init_map,
+    const ConsumerMap& consumers_of) {
+  if (node->op_type() != "MatMulNBitsMlp" ||
+      node->domain() != kComMicrosoftDomain) {
+    return std::nullopt;
+  }
+  if (node->input_size() < 8 || node->output_size() < 1) {
+    return std::nullopt;
+  }
+  const std::string& a_name = node->input(0);
+  const std::string& gate_b_name = node->input(3);
+  const std::string& gate_scales_name = node->input(4);
+  const std::string gate_bias_name = node->input(5);
+  const std::string& up_b_name = node->input(6);
+  const std::string& up_scales_name = node->input(7);
+  const std::string up_bias_name =
+      (node->input_size() > 8) ? node->input(8) : std::string();
+  if (a_name.empty() || gate_b_name.empty() || gate_scales_name.empty() ||
+      up_b_name.empty() || up_scales_name.empty()) {
+    return std::nullopt;
+  }
+  if (gate_b_name == up_b_name) {
+    return std::nullopt;  // Degenerate -- can't independently slice a shared
+                          // weight.
+  }
+
+  const auto block_size_opt = MatMulNBitsIntAttr(*node, "block_size");
+  const auto n_opt = MatMulNBitsIntAttr(*node, "N");
+  const auto k_opt = MatMulNBitsIntAttr(*node, "K");
+  if (!block_size_opt || !n_opt || !k_opt || *n_opt <= 0 || *k_opt <= 0) {
+    return std::nullopt;
+  }
+  const int64_t block_size = *block_size_opt;
+  const int64_t N = *n_opt;
+  const int64_t K = *k_opt;
+  if (!MatMulNBitsValidBlockSizes().count(block_size)) {
+    return std::nullopt;
+  }
+  if (K % block_size != 0) {
+    return std::nullopt;
+  }
+  const int64_t bits = MatMulNBitsIntAttrOr(*node, "bits", 4);
+  if (bits != 4 && bits != 8) {
+    return std::nullopt;
+  }
+
+  const int64_t k_blocks = K / block_size;
+  const int64_t blob_size = block_size * bits / 8;
+
+  auto resolve_branch = [&](const std::string& b_name,
+                            const std::string& scales_name,
+                            const std::string& bias_name)
+      -> std::optional<
+          std::tuple<std::string, std::string, std::optional<std::string>>> {
+    auto b_it = init_map.find(b_name);
+    auto s_it = init_map.find(scales_name);
+    if (b_it == init_map.end() || s_it == init_map.end()) {
+      return std::nullopt;  // Non-constant B/scales -- can't safely slice.
+    }
+    if (b_it->second->data_type() != onnx::TensorProto::UINT8) {
+      return std::nullopt;
+    }
+    if (!MatMulNBitsDimsEqual(*b_it->second, {N, k_blocks, blob_size})) {
+      return std::nullopt;
+    }
+    if (s_it->second->data_type() != onnx::TensorProto::FLOAT) {
+      return std::nullopt;
+    }
+    if (!MatMulNBitsDimsEqual(*s_it->second, {N, k_blocks})) {
+      return std::nullopt;
+    }
+    std::optional<std::string> bias_opt;
+    if (!bias_name.empty()) {
+      auto bias_it = init_map.find(bias_name);
+      if (bias_it == init_map.end() ||
+          bias_it->second->data_type() != s_it->second->data_type()) {
+        return std::nullopt;
+      }
+      if (!MatMulNBitsDimsEqual(*bias_it->second, {N})) {
+        return std::nullopt;
+      }
+      bias_opt = bias_name;
+    }
+    std::vector<std::string> shared = {b_name, scales_name};
+    if (bias_opt) {
+      shared.push_back(*bias_opt);
+    }
+    for (const auto& nm : shared) {
+      if (ConsumerCount(consumers_of, nm) != 1) {
+        return std::nullopt;  // Shared/tied tensor -- another node reads it
+                              // too.
+      }
+    }
+    return std::make_tuple(b_name, scales_name, bias_opt);
+  };
+
+  auto gate = resolve_branch(gate_b_name, gate_scales_name, gate_bias_name);
+  if (!gate) {
+    return std::nullopt;
+  }
+  auto up = resolve_branch(up_b_name, up_scales_name, up_bias_name);
+  if (!up) {
+    return std::nullopt;
+  }
+
+  MatMulNBitsMlpWeight w;
+  w.node = node;
+  w.gate_b_name = std::get<0>(*gate);
+  w.gate_scales_name = std::get<1>(*gate);
+  w.gate_bias_name = std::get<2>(*gate);
+  w.up_b_name = std::get<0>(*up);
+  w.up_scales_name = std::get<1>(*up);
+  w.up_bias_name = std::get<2>(*up);
+  w.N = N;
+  w.K = K;
+  w.bits = bits;
+  w.block_size = block_size;
+  w.k_blocks = k_blocks;
+  return w;
+}
+
+// Wraps one branch (`gate=true`/`gate=false` for `up`) of a matched
+// MatMulNBitsMlpWeight as a synthetic MatMulNBitsWeight -- purely so
+// MatMulNBitsDequantized (IMPORTANCE RANKING ONLY, never written back) can
+// be reused verbatim. `zero_points_name` is always unset, exactly what
+// MatMulNBitsDequantized needs to fall back to the schema's own default
+// zero point. Mirrors pruning.py's own `_matmul_nbits_mlp_branch_weight`.
+MatMulNBitsWeight MlpBranchWeight(const MatMulNBitsMlpWeight& p, bool gate) {
+  MatMulNBitsWeight w;
+  w.node = p.node;
+  w.b_name = gate ? p.gate_b_name : p.up_b_name;
+  w.scales_name = gate ? p.gate_scales_name : p.up_scales_name;
+  w.zero_points_name = std::nullopt;
+  w.zero_points_packed = false;
+  w.bias_name = gate ? p.gate_bias_name : p.up_bias_name;
+  w.N = p.N;
+  w.K = p.K;
+  w.bits = p.bits;
+  w.block_size = p.block_size;
+  w.k_blocks = p.k_blocks;
+  return w;
+}
+
+struct MatMulNBitsMlpChain {
+  MatMulNBitsMlpWeight producer;
+  std::vector<onnx::NodeProto*> chain_ops;
+  NBitsSide consumer;
+  int64_t n_channels;
+};
+
+// The `MatMulNBitsMlp` analogue of FindMatMulNBitsChains: every matched
+// fused-gated-MLP node whose `Y` output feeds, through zero or more
+// shape-preserving unary activations with no other consumer along the way,
+// into a downstream `MatMulNBits`-or-plain-float consumer -- reusing
+// WalkToMatMulNBitsConsumer verbatim, the exact same walk an ordinary
+// single-`MatMulNBits`-producer chain uses. Mirrors pruning.py's own
+// `_find_matmul_nbits_mlp_chains`.
+std::vector<MatMulNBitsMlpChain> FindMatMulNBitsMlpChains(
+    onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  auto is_internal = [&](const std::string& name) {
+    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
+  };
+
+  std::vector<MatMulNBitsMlpChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto w = MatchMatMulNBitsMlp(node, init_map, consumers_of);
+    if (!w) {
+      continue;
+    }
+    const std::string& out_name = node->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    const int64_t n = w->N;
+    auto found = WalkToMatMulNBitsConsumer(out_name, init_map, consumers_of,
+                                           graph_outputs, n, kMaxChainHops);
+    if (!found) {
+      continue;
+    }
+    chains.push_back(MatMulNBitsMlpChain{std::move(*w),
+                                         std::move(found->chain_ops),
+                                         std::move(found->consumer), n});
+  }
+  return chains;
+}
+
+// Applies whole-output-channel pruning to every matched `MatMulNBitsMlp`
+// chain in place -- co-slicing `gate`'s and `up`'s own shared `N` axis to one
+// shared `keep` set (ranked by combined root-sum-square L2 row-norm
+// importance, the block-quantized analogue of this file's own gated-pair
+// criterion above), then the downstream consumer's own reduction axis
+// (block-alignment decline for a `MatMulNBits` consumer, direct application
+// for a plain-float one) -- mirrors pruning.py's own
+// `_apply_matmul_nbits_mlp_chains`. Shares `touched` with
+// ApplyStructuredPruning's every other chain family over this same graph
+// (see this section's own top comment for why this chain kind, unlike
+// MatMulNBitsQkv below, is wired in from ApplyStructuredPruning at all).
+void ApplyMatMulNBitsMlpChains(onnx::GraphProto* graph,
+                               std::vector<MatMulNBitsMlpChain>& chains,
+                               double sparsity, TouchedState& touched) {
+  std::unordered_map<std::string, onnx::TensorProto*> init_map;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    init_map[t->name()] = t;
+  }
+
+  auto row_sq_norms = [](const std::vector<double>& w_nk, int64_t n) {
+    const int64_t k = static_cast<int64_t>(w_nk.size()) / n;
+    std::vector<double> out(static_cast<size_t>(n), 0.0);
+    for (int64_t c = 0; c < n; ++c) {
+      double sq = 0.0;
+      for (int64_t j = 0; j < k; ++j) {
+        const double v = w_nk[static_cast<size_t>(c * k + j)];
+        sq += v * v;
+      }
+      out[static_cast<size_t>(c)] = sq;
+    }
+    return out;
+  };
+
+  for (auto& chain : chains) {
+    auto& p = chain.producer;
+    const std::string c_key = NBitsSideKey(chain.consumer);
+    if (p.gate_b_name == c_key || p.up_b_name == c_key) {
+      continue;  // Degenerate (the same weight in both roles).
+    }
+    if (touched.producer.count(p.gate_b_name) ||
+        touched.producer.count(p.up_b_name) || touched.consumer.count(c_key)) {
+      continue;  // A shared/tied weight another chain already resized.
+    }
+
+    const int64_t n = chain.n_channels;
+    const int64_t keep_count = std::max<int64_t>(
+        1, n - std::llround(static_cast<double>(n) * sparsity));
+    if (keep_count >= n) {
+      continue;  // Rounds down to nothing for this layer -- no-op.
+    }
+
+    const MatMulNBitsWeight gate_w = MlpBranchWeight(p, /*gate=*/true);
+    const MatMulNBitsWeight up_w = MlpBranchWeight(p, /*gate=*/false);
+    const std::vector<double> gate_nk =
+        MatMulNBitsDequantized(gate_w, init_map);
+    const std::vector<double> up_nk = MatMulNBitsDequantized(up_w, init_map);
+    const std::vector<double> gate_sq = row_sq_norms(gate_nk, n);
+    const std::vector<double> up_sq = row_sq_norms(up_nk, n);
+    std::vector<double> importance(static_cast<size_t>(n));
+    for (int64_t c = 0; c < n; ++c) {
+      importance[static_cast<size_t>(c)] = std::sqrt(
+          gate_sq[static_cast<size_t>(c)] + up_sq[static_cast<size_t>(c)]);
+    }
+    const std::vector<int64_t> keep =
+        TopKIndicesAscending(importance, keep_count);
+
+    std::vector<int64_t> consumer_keep;
+    if (const auto* cw = std::get_if<MatMulNBitsWeight>(&chain.consumer)) {
+      auto keep_blocks =
+          MatMulNBitsBlockAlignedKeepBlocks(keep, cw->k_blocks, cw->block_size);
+      if (!keep_blocks) {
+        continue;  // Non-block-aligned request -- decline, see this file's
+                   // own top-of-MatMulNBits-section comment.
+      }
+      consumer_keep = std::move(*keep_blocks);
+    } else {
+      consumer_keep = keep;  // Plain-float consumer -- no block structure.
+    }
+
+    SliceMatMulNBitsRowsNoZp(p.gate_b_name, p.gate_scales_name,
+                             p.gate_bias_name, p.block_size, p.bits, p.k_blocks,
+                             init_map, keep);
+    SliceMatMulNBitsRowsNoZp(p.up_b_name, p.up_scales_name, p.up_bias_name,
+                             p.block_size, p.bits, p.k_blocks, init_map, keep);
+    SetOrAddIntAttr(p.node, "N", static_cast<int64_t>(keep.size()));
+    SliceNBitsSideConsumer(chain.consumer, init_map, consumer_keep);
+
+    touched.producer.insert(p.gate_b_name);
+    touched.producer.insert(p.up_b_name);
+    touched.consumer.insert(c_key);
+    touched.stale_value_info.insert(p.node->output(0));
+    for (auto* op : chain.chain_ops) {
+      touched.stale_value_info.insert(op->output(0));
+    }
+  }
+}
+
+// A matched `com.microsoft::MatMulNBitsQkv` node's three block-quantized
+// weight operands (`q`/`k`/`v`) -- mirrors pruning.py's own
+// `_MatMulNBitsQkvWeight`. Like MatMulNBitsMlpWeight, no `zero_points` field
+// at all (see that struct's own comment).
+struct MatMulNBitsQkvWeight {
+  onnx::NodeProto* node = nullptr;
+  std::string q_b_name, q_scales_name;
+  std::optional<std::string> q_bias_name;
+  std::string k_b_name, k_scales_name;
+  std::optional<std::string> k_bias_name;
+  std::string v_b_name, v_scales_name;
+  std::optional<std::string> v_bias_name;
+  int64_t Nq = 0;
+  int64_t Nkv = 0;
+  int64_t K = 0;
+  int64_t bits = 0;
+  int64_t block_size = 0;
+  int64_t k_blocks = 0;
+};
+
+// If `node` is a `com.microsoft::MatMulNBitsQkv` node matching every scope
+// boundary this section's own top comment documents, returns the match --
+// mirrors pruning.py's own `_match_matmul_nbits_qkv`. `skip` (input 1,
+// optional) and `norm_scale` (input 2, always REQUIRED on this op's live
+// schema -- unlike `MatMulNBitsMlp`'s own optional one) are checked for
+// presence where the schema requires it, but never otherwise inspected: only
+// the shared `Nq`/`Nkv` OUTPUT axes are ever pruned here, never the shared
+// `K` INPUT axis.
+std::optional<MatMulNBitsQkvWeight> MatchMatMulNBitsQkv(
+    onnx::NodeProto* node, const InitMap& init_map,
+    const ConsumerMap& consumers_of) {
+  if (node->op_type() != "MatMulNBitsQkv" ||
+      node->domain() != kComMicrosoftDomain) {
+    return std::nullopt;
+  }
+  if (node->input_size() < 11 || node->output_size() < 3) {
+    return std::nullopt;
+  }
+  const std::string& a_name = node->input(0);
+  const std::string& norm_scale_name = node->input(2);
+  if (a_name.empty() || norm_scale_name.empty()) {
+    return std::nullopt;
+  }
+  const std::string& q_b_name = node->input(3);
+  const std::string& q_scales_name = node->input(4);
+  const std::string q_bias_name = node->input(5);
+  const std::string& k_b_name = node->input(6);
+  const std::string& k_scales_name = node->input(7);
+  const std::string k_bias_name = node->input(8);
+  const std::string& v_b_name = node->input(9);
+  const std::string& v_scales_name = node->input(10);
+  const std::string v_bias_name =
+      (node->input_size() > 11) ? node->input(11) : std::string();
+  if (q_b_name.empty() || q_scales_name.empty() || k_b_name.empty() ||
+      k_scales_name.empty() || v_b_name.empty() || v_scales_name.empty()) {
+    return std::nullopt;
+  }
+  if (q_b_name == k_b_name || q_b_name == v_b_name || k_b_name == v_b_name) {
+    return std::nullopt;  // Degenerate -- can't independently slice a shared
+                          // weight.
+  }
+
+  const auto block_size_opt = MatMulNBitsIntAttr(*node, "block_size");
+  const auto nq_opt = MatMulNBitsIntAttr(*node, "Nq");
+  const auto nkv_opt = MatMulNBitsIntAttr(*node, "Nkv");
+  const auto k_opt = MatMulNBitsIntAttr(*node, "K");
+  if (!block_size_opt || !nq_opt || !nkv_opt || !k_opt) {
+    return std::nullopt;
+  }
+  const int64_t block_size = *block_size_opt;
+  const int64_t Nq = *nq_opt;
+  const int64_t Nkv = *nkv_opt;
+  const int64_t K = *k_opt;
+  if (Nq <= 0 || Nkv <= 0 || K <= 0) {
+    return std::nullopt;
+  }
+  if (!MatMulNBitsValidBlockSizes().count(block_size)) {
+    return std::nullopt;
+  }
+  if (K % block_size != 0) {
+    return std::nullopt;
+  }
+  const int64_t bits = MatMulNBitsIntAttrOr(*node, "bits", 4);
+  if (bits != 4 && bits != 8) {
+    return std::nullopt;
+  }
+
+  const int64_t k_blocks = K / block_size;
+  const int64_t blob_size = block_size * bits / 8;
+
+  auto resolve_branch = [&](int64_t n, const std::string& b_name,
+                            const std::string& scales_name,
+                            const std::string& bias_name)
+      -> std::optional<
+          std::tuple<std::string, std::string, std::optional<std::string>>> {
+    auto b_it = init_map.find(b_name);
+    auto s_it = init_map.find(scales_name);
+    if (b_it == init_map.end() || s_it == init_map.end()) {
+      return std::nullopt;
+    }
+    if (b_it->second->data_type() != onnx::TensorProto::UINT8) {
+      return std::nullopt;
+    }
+    if (!MatMulNBitsDimsEqual(*b_it->second, {n, k_blocks, blob_size})) {
+      return std::nullopt;
+    }
+    if (s_it->second->data_type() != onnx::TensorProto::FLOAT) {
+      return std::nullopt;
+    }
+    if (!MatMulNBitsDimsEqual(*s_it->second, {n, k_blocks})) {
+      return std::nullopt;
+    }
+    std::optional<std::string> bias_opt;
+    if (!bias_name.empty()) {
+      auto bias_it = init_map.find(bias_name);
+      if (bias_it == init_map.end() ||
+          bias_it->second->data_type() != s_it->second->data_type()) {
+        return std::nullopt;
+      }
+      if (!MatMulNBitsDimsEqual(*bias_it->second, {n})) {
+        return std::nullopt;
+      }
+      bias_opt = bias_name;
+    }
+    std::vector<std::string> shared = {b_name, scales_name};
+    if (bias_opt) {
+      shared.push_back(*bias_opt);
+    }
+    for (const auto& nm : shared) {
+      if (ConsumerCount(consumers_of, nm) != 1) {
+        return std::nullopt;
+      }
+    }
+    return std::make_tuple(b_name, scales_name, bias_opt);
+  };
+
+  auto q = resolve_branch(Nq, q_b_name, q_scales_name, q_bias_name);
+  if (!q) {
+    return std::nullopt;
+  }
+  auto k = resolve_branch(Nkv, k_b_name, k_scales_name, k_bias_name);
+  if (!k) {
+    return std::nullopt;
+  }
+  auto v = resolve_branch(Nkv, v_b_name, v_scales_name, v_bias_name);
+  if (!v) {
+    return std::nullopt;
+  }
+
+  MatMulNBitsQkvWeight w;
+  w.node = node;
+  w.q_b_name = std::get<0>(*q);
+  w.q_scales_name = std::get<1>(*q);
+  w.q_bias_name = std::get<2>(*q);
+  w.k_b_name = std::get<0>(*k);
+  w.k_scales_name = std::get<1>(*k);
+  w.k_bias_name = std::get<2>(*k);
+  w.v_b_name = std::get<0>(*v);
+  w.v_scales_name = std::get<1>(*v);
+  w.v_bias_name = std::get<2>(*v);
+  w.Nq = Nq;
+  w.Nkv = Nkv;
+  w.K = K;
+  w.bits = bits;
+  w.block_size = block_size;
+  w.k_blocks = k_blocks;
+  return w;
+}
+
+// Wraps one branch (`'q'`/`'k'`/`'v'`) of a matched MatMulNBitsQkvWeight as a
+// synthetic MatMulNBitsWeight -- the MatMulNBitsQkv analogue of
+// MlpBranchWeight, so MatMulNBitsDequantized can be reused verbatim. Mirrors
+// pruning.py's own `_matmul_nbits_qkv_branch_weight`.
+MatMulNBitsWeight QkvBranchWeight(const MatMulNBitsQkvWeight& p, char branch) {
+  MatMulNBitsWeight w;
+  w.node = p.node;
+  if (branch == 'q') {
+    w.b_name = p.q_b_name;
+    w.scales_name = p.q_scales_name;
+    w.bias_name = p.q_bias_name;
+    w.N = p.Nq;
+  } else if (branch == 'k') {
+    w.b_name = p.k_b_name;
+    w.scales_name = p.k_scales_name;
+    w.bias_name = p.k_bias_name;
+    w.N = p.Nkv;
+  } else {
+    w.b_name = p.v_b_name;
+    w.scales_name = p.v_scales_name;
+    w.bias_name = p.v_bias_name;
+    w.N = p.Nkv;
+  }
+  w.zero_points_name = std::nullopt;
+  w.zero_points_packed = false;
+  w.K = p.K;
+  w.bits = p.bits;
+  w.block_size = p.block_size;
+  w.k_blocks = p.k_blocks;
+  return w;
+}
+
+// From a matched `GroupQueryAttention`/plain `ai.onnx::Attention` node's own
+// raw (`nv`-wide) output `start`, optionally through one `Reshape` hop
+// (identical shape/single-use safety check to WalkToAttentionConsumer's
+// own), to an output projection whose reduction dimension matches `nv` --
+// either a `MatMulNBits` node (MatchMatMulNBits) or a plain-float
+// MatMul/vanilla-Gemm (MatchPlainMatMulNBitsPeer), the same union
+// WalkToMatMulNBitsConsumer already supports for an ordinary chain. Mirrors
+// pruning.py's own `_walk_to_matmul_nbits_attention_consumer`.
+std::pair<std::optional<NBitsSide>, std::vector<AttnChainOp>>
+WalkToMatMulNBitsAttentionConsumer(
+    const std::string& start, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs, int64_t nv) {
+  auto cit = consumers_of.find(start);
+  if (cit == consumers_of.end() || cit->second.size() != 1) {
+    return {std::nullopt, {}};
+  }
+  onnx::NodeProto* node = cit->second[0];
+  std::vector<AttnChainOp> chain_ops;
+  std::string cur = start;
+
+  if (node->op_type() == "Reshape" && node->input_size() >= 1 &&
+      node->input(0) == cur) {
+    auto last_dim = ReshapeLastDim(*node, init_map);
+    if (!last_dim || *last_dim != nv) {
+      return {std::nullopt, {}};
+    }
+    const std::string& shape_name = node->input(1);
+    if (ConsumerCount(consumers_of, shape_name) != 1) {
+      return {std::nullopt, {}};  // Shared shape constant -- mutating unsafe.
+    }
+    const std::string& out_name = node->output(0);
+    if (ConsumerCount(consumers_of, out_name) != 1 ||
+        graph_outputs.count(out_name)) {
+      return {std::nullopt, {}};
+    }
+    chain_ops.push_back(AttnChainOp{node, shape_name});
+    cur = out_name;
+    auto nc = consumers_of.find(cur);
+    if (nc == consumers_of.end() || nc->second.size() != 1) {
+      return {std::nullopt, chain_ops};
+    }
+    node = nc->second[0];
+  }
+
+  if (node->op_type() == "MatMulNBits" &&
+      node->domain() == kComMicrosoftDomain && node->input_size() > 0 &&
+      node->input(0) == cur) {
+    auto w = MatchMatMulNBits(node, init_map, consumers_of);
+    if (!w || w->K != nv) {
+      return {std::nullopt, chain_ops};
+    }
+    return {NBitsSide(*w), chain_ops};
+  }
+
+  auto mm = MatchMatMulLikeRaw(*node);
+  if (mm && mm->x_name == cur) {
+    auto peer = MatchPlainMatMulNBitsPeer(node, init_map, consumers_of);
+    if (!peer || peer->in_channels != nv) {
+      return {std::nullopt, chain_ops};
+    }
+    return {NBitsSide(*peer), chain_ops};
+  }
+
+  return {std::nullopt, chain_ops};
+}
+
+struct MatMulNBitsQkvChain {
+  MatMulNBitsQkvWeight producer;
+  onnx::NodeProto* attn_node = nullptr;
+  int64_t num_heads = 0;
+  int64_t kv_num_heads = 0;
+  int64_t head_size = 0;
+  std::string num_heads_attr = "num_heads";
+  std::vector<AttnChainOp> chain_ops;
+  NBitsSide consumer;
+};
+
+// Match-time safety net for a `MatMulNBitsQkv` chain's own downstream
+// attention node's `attention_bias`/`attn_mask` (`mask_idx`) and, for GQA
+// only, `head_sink` (index 11) inputs -- see this file's own top-of-section
+// comment for why this exists at all (this port has no dynamic-Gather-
+// insertion machinery, unlike pruning.py's own `_slice_or_gather_head_bias`
+// fix). `attention_bias`/`attn_mask`: safe (returns `true`) when absent, OR
+// a constant whose shape provably can never carry a genuine per-head axis at
+// all -- rank < 3 (no axis can ever land on the schema's own num_heads
+// slot), or rank in [3, 4] with that slot's own size exactly 1 (an
+// unconditional broadcast, mirrors pruning.py's own `_head_bias_axis`
+// "-1" case) -- never touched by any head-count change, so leaving it
+// exactly as-is stays correct; declined (`false`) otherwise -- a genuine
+// per-head-sized constant (which this port could safely slice, but doesn't,
+// to keep this new safety net small and obviously correct) and a dynamic
+// tensor of any shape alike, rather than risk silently shipping a pruned
+// graph with a stale per-head mask. `head_sink`: safe only when ABSENT --
+// narrower still (pruning.py slices a genuine constant `(num_heads,)` one;
+// this port declines it outright) since it has no `HeadColumnIndices`-shaped
+// slice of its own to reuse here beyond one more bespoke branch this round
+// chooses not to add.
+bool MatMulNBitsQkvAttentionExtrasSafe(const onnx::NodeProto& attn,
+                                       const InitMap& init_map, int mask_idx,
+                                       std::optional<int> sink_idx) {
+  if (attn.input_size() > mask_idx && !attn.input(mask_idx).empty()) {
+    auto it = init_map.find(attn.input(mask_idx));
+    if (it == init_map.end()) {
+      return false;  // Dynamic -- no Gather-insertion machinery here.
+    }
+    const int64_t rank = it->second->dims_size();
+    if (rank > 4) {
+      return false;
+    }
+    const int64_t axis = rank - 3;
+    if (axis >= 0) {
+      const int64_t size = it->second->dims(static_cast<int>(axis));
+      if (size != 1) {
+        return false;  // Genuinely per-head (or unresolvable) -- decline
+                       // rather than mis-slice or silently leave stale.
+      }
+    }
+  }
+  if (sink_idx && attn.input_size() > *sink_idx &&
+      !attn.input(*sink_idx).empty()) {
+    return false;  // Present at all -- this port never slices head_sink.
+  }
+  return true;
+}
+
+// Matches a `MatMulNBitsQkv` node whose `Q`/`K`/`V` outputs each feed --
+// directly, single-consumer, no intermediate hop -- into the respective
+// query/key/value inputs of one shared downstream `GroupQueryAttention`
+// (MatchGqaProducer) or plain `ai.onnx::Attention` (MatchOnnxAttentionProducer)
+// node, and whose own output in turn reaches a `MatMulNBits`-or-plain-float
+// output projection (WalkToMatMulNBitsAttentionConsumer). Mirrors
+// pruning.py's own `_find_matmul_nbits_qkv_chains`. Unlike
+// `_find_separate_qkv_chains`'s own precedent, NO per-head Q/K-norm + RoPE
+// pass-through hop is matched between this fused node's own `Q`/`K` outputs
+// and the attention consumer -- a deliberate, documented scope boundary
+// (this file's own top-of-section comment), not an oversight.
+std::vector<MatMulNBitsQkvChain> FindMatMulNBitsQkvChains(
+    onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  auto is_internal = [&](const std::string& name) {
+    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
+  };
+
+  std::vector<MatMulNBitsQkvChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto w = MatchMatMulNBitsQkv(node, init_map, consumers_of);
+    if (!w) {
+      continue;
+    }
+
+    const std::string& q_out = node->output(0);
+    const std::string& k_out = node->output(1);
+    const std::string& v_out = node->output(2);
+    if (!(is_internal(q_out) && is_internal(k_out) && is_internal(v_out))) {
+      continue;
+    }
+    onnx::NodeProto* attn = consumers_of.at(q_out)[0];
+    if (consumers_of.at(k_out)[0] != attn ||
+        consumers_of.at(v_out)[0] != attn) {
+      continue;  // Q/K/V must feed the exact same downstream node.
+    }
+    if (attn->input_size() < 3) {
+      continue;
+    }
+    if (attn->input(0) != q_out || attn->input(1) != k_out ||
+        attn->input(2) != v_out) {
+      continue;  // Must land on the consumer's own query/key/value inputs.
+    }
+
+    std::string num_heads_attr = "num_heads";
+    int mask_idx = 3;
+    std::optional<int> sink_idx;
+    std::optional<HeadCountsMatch> info;
+    const bool is_gqa = attn->domain() == kComMicrosoftDomain &&
+                        attn->op_type() == "GroupQueryAttention";
+    if (is_gqa) {
+      info = MatchGqaProducer(*attn, init_map);
+      mask_idx = 10;
+      sink_idx = 11;
+    } else if (attn->domain().empty() && attn->op_type() == "Attention") {
+      info = MatchOnnxAttentionProducer(*attn, init_map);
+      num_heads_attr = "q_num_heads";
+      mask_idx = 3;
+    }
+    if (!info) {
+      continue;
+    }
+    if (!MatMulNBitsQkvAttentionExtrasSafe(*attn, init_map, mask_idx,
+                                           sink_idx)) {
+      continue;
+    }
+
+    const int64_t num_heads = info->num_heads;
+    const int64_t kv_num_heads = info->kv_num_heads;
+    if (w->Nq % num_heads != 0 || w->Nkv % kv_num_heads != 0) {
+      continue;
+    }
+    const int64_t head_size = w->Nq / num_heads;
+    if (head_size <= 0 || w->Nkv / kv_num_heads != head_size) {
+      continue;
+    }
+
+    const std::string& out_name = attn->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    const int64_t raw_out_width = num_heads * head_size;
+    auto [consumer, chain_ops] = WalkToMatMulNBitsAttentionConsumer(
+        out_name, init_map, consumers_of, graph_outputs, raw_out_width);
+    if (!consumer) {
+      continue;
+    }
+
+    chains.push_back(MatMulNBitsQkvChain{
+        std::move(*w), attn, num_heads, kv_num_heads, head_size, num_heads_attr,
+        std::move(chain_ops), std::move(*consumer)});
+  }
+  return chains;
+}
+
+// Applies whole-KV-group pruning to every matched `MatMulNBitsQkv` chain in
+// place -- the fused-op analogue of ApplyOneGqaChain, reusing that
+// function's own head-count/attribute-rewrite conventions directly against
+// `chain.attn_node`, since that node itself owns no weight of its own to
+// slice here -- only `q`'s/`k`'s/`v`'s own producer weights (this function's
+// own job) and the downstream output-projection consumer
+// (SliceNBitsSideConsumer, reused verbatim). Mirrors pruning.py's own
+// `_apply_matmul_nbits_qkv_chains`, MINUS the dynamic-`attention_bias`-Gather
+// path (see this file's own top-of-section comment for exactly why, and
+// what IS still ported: constant `past_key`/`past_value` and GQA's own
+// `k_scale`/`v_scale`). Uses its own dedicated producer/consumer-touched
+// bookkeeping local to this one call -- see this file's own top-of-section
+// comment for why that never risks a double-resize against
+// ApplyAttentionChains's own chains over the same graph.
+void ApplyMatMulNBitsQkvChains(onnx::GraphProto* graph,
+                               std::vector<MatMulNBitsQkvChain>& chains,
+                               double sparsity) {
+  std::unordered_map<std::string, onnx::TensorProto*> init_map;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    init_map[t->name()] = t;
+  }
+  std::unordered_set<std::string> producer_touched, consumer_touched,
+      stale_value_info;
+
+  for (auto& chain : chains) {
+    auto& p = chain.producer;
+    const std::unordered_set<std::string> p_keys = {p.q_b_name, p.k_b_name,
+                                                    p.v_b_name};
+    const std::string c_key = NBitsSideKey(chain.consumer);
+    if (p_keys.count(c_key)) {
+      continue;  // Degenerate (the same weight in both roles).
+    }
+    bool conflict = consumer_touched.count(c_key) != 0;
+    for (const auto& k : p_keys) {
+      if (producer_touched.count(k)) {
+        conflict = true;
+      }
+    }
+    if (conflict) {
+      continue;  // A shared/tied weight another chain already resized.
+    }
+
+    const int64_t h = chain.kv_num_heads;
+    const int64_t keep_count = std::max<int64_t>(
+        1, h - std::llround(static_cast<double>(h) * sparsity));
+    if (keep_count >= h) {
+      continue;  // Rounds down to nothing for this block -- no-op.
+    }
+
+    const int64_t d = chain.head_size;
+    const int64_t group_size = chain.num_heads / chain.kv_num_heads;
+
+    const MatMulNBitsWeight q_w = QkvBranchWeight(p, 'q');
+    const MatMulNBitsWeight k_w = QkvBranchWeight(p, 'k');
+    const MatMulNBitsWeight v_w = QkvBranchWeight(p, 'v');
+    const std::vector<double> q_nk = MatMulNBitsDequantized(q_w, init_map);
+    const std::vector<double> k_nk = MatMulNBitsDequantized(k_w, init_map);
+    const std::vector<double> v_nk = MatMulNBitsDequantized(v_w, init_map);
+
+    // Combined per-KV-group importance -- mirrors pruning.py's own
+    // `_matmul_nbits_qkv_group_importance` (L2 only, this port's own
+    // established scope elsewhere): every KV group's own query-head rows,
+    // K rows, and V rows are contiguous `head_size`-wide row ranges of
+    // `q_nk`'s/`k_nk`'s/`v_nk`'s own `N` axis.
+    std::vector<double> importance(static_cast<size_t>(h), 0.0);
+    for (int64_t kv = 0; kv < h; ++kv) {
+      double sq = 0.0;
+      for (int64_t r = kv * group_size * d; r < (kv + 1) * group_size * d;
+           ++r) {
+        for (int64_t j = 0; j < p.K; ++j) {
+          const double v = q_nk[static_cast<size_t>(r * p.K + j)];
+          sq += v * v;
+        }
+      }
+      for (int64_t r = kv * d; r < (kv + 1) * d; ++r) {
+        for (int64_t j = 0; j < p.K; ++j) {
+          const double v = k_nk[static_cast<size_t>(r * p.K + j)];
+          sq += v * v;
+        }
+      }
+      for (int64_t r = kv * d; r < (kv + 1) * d; ++r) {
+        for (int64_t j = 0; j < p.K; ++j) {
+          const double v = v_nk[static_cast<size_t>(r * p.K + j)];
+          sq += v * v;
+        }
+      }
+      importance[static_cast<size_t>(kv)] = std::sqrt(sq);
+    }
+    const std::vector<int64_t> keep_groups =
+        TopKIndicesAscending(importance, keep_count);
+    std::vector<int64_t> keep_q_heads;
+    keep_q_heads.reserve(keep_groups.size() * static_cast<size_t>(group_size));
+    for (int64_t g : keep_groups) {
+      for (int64_t hh = g * group_size; hh < (g + 1) * group_size; ++hh) {
+        keep_q_heads.push_back(hh);
+      }
+    }
+    const std::vector<int64_t> q_idx = HeadColumnIndices(keep_q_heads, d);
+    const std::vector<int64_t> kv_idx = HeadColumnIndices(keep_groups, d);
+
+    std::vector<int64_t> consumer_keep;
+    if (const auto* cw = std::get_if<MatMulNBitsWeight>(&chain.consumer)) {
+      auto keep_blocks = MatMulNBitsBlockAlignedKeepBlocks(q_idx, cw->k_blocks,
+                                                           cw->block_size);
+      if (!keep_blocks) {
+        continue;  // Non-block-aligned request -- decline.
+      }
+      consumer_keep = std::move(*keep_blocks);
+    } else {
+      consumer_keep = q_idx;  // Plain-float consumer -- no block structure.
+    }
+
+    SliceMatMulNBitsRowsNoZp(p.q_b_name, p.q_scales_name, p.q_bias_name,
+                             p.block_size, p.bits, p.k_blocks, init_map, q_idx);
+    SliceMatMulNBitsRowsNoZp(p.k_b_name, p.k_scales_name, p.k_bias_name,
+                             p.block_size, p.bits, p.k_blocks, init_map,
+                             kv_idx);
+    SliceMatMulNBitsRowsNoZp(p.v_b_name, p.v_scales_name, p.v_bias_name,
+                             p.block_size, p.bits, p.k_blocks, init_map,
+                             kv_idx);
+    SetOrAddIntAttr(p.node, "Nq", static_cast<int64_t>(q_idx.size()));
+    SetOrAddIntAttr(p.node, "Nkv", static_cast<int64_t>(kv_idx.size()));
+
+    const int64_t new_num_heads = keep_count * group_size;
+    for (auto& attr : *chain.attn_node->mutable_attribute()) {
+      if (attr.name() == chain.num_heads_attr) {
+        attr.set_i(new_num_heads);
+      } else if (attr.name() == "kv_num_heads") {
+        attr.set_i(keep_count);
+      }
+    }
+
+    const bool is_gqa = chain.attn_node->domain() == kComMicrosoftDomain &&
+                        chain.attn_node->op_type() == "GroupQueryAttention";
+    // Constant past_key/past_value -- guaranteed EMPTY (product-of-dims-0)
+    // by MatchGqaProducer's own existing precondition whenever they're a
+    // constant at all, so this is purely a dim-count metadata fix, never a
+    // real data copy of any live cache values. Mirrors pruning.py's own
+    // identical `past_kv_indices` handling.
+    for (int idx :
+         (is_gqa ? std::array<int, 2>{3, 4} : std::array<int, 2>{4, 5})) {
+      if (chain.attn_node->input_size() <= idx ||
+          chain.attn_node->input(idx).empty()) {
+        continue;
+      }
+      auto it = init_map.find(chain.attn_node->input(idx));
+      if (it != init_map.end() &&
+          it->second->data_type() == onnx::TensorProto::FLOAT) {
+        SliceFloatTensorAxis1(it->second, keep_groups);
+      }
+    }
+    // GQA's own `k_scale`/`v_scale` (indices 12/13), constant, per-KV-head
+    // shaped `[.., kv_num_heads, .., 1]` -- mirrors pruning.py's own
+    // identical shape check.
+    if (is_gqa) {
+      for (int idx : {12, 13}) {
+        if (chain.attn_node->input_size() <= idx ||
+            chain.attn_node->input(idx).empty()) {
+          continue;
+        }
+        auto it = init_map.find(chain.attn_node->input(idx));
+        if (it == init_map.end() ||
+            it->second->data_type() != onnx::TensorProto::FLOAT) {
+          continue;
+        }
+        if (it->second->dims_size() == 4 && it->second->dims(1) == h) {
+          SliceFloatTensorAxis1(it->second, keep_groups);
+        }
+      }
+    }
+
+    SliceNBitsSideConsumer(chain.consumer, init_map, consumer_keep);
+
+    for (const auto& co : chain.chain_ops) {
+      if (co.shape_name) {
+        SetInt64TensorLastDim(init_map.at(*co.shape_name), new_num_heads * d);
+      }
+    }
+
+    for (const auto& k : p_keys) {
+      producer_touched.insert(k);
+    }
+    consumer_touched.insert(c_key);
+    stale_value_info.insert(p.node->output(0));
+    stale_value_info.insert(p.node->output(1));
+    stale_value_info.insert(p.node->output(2));
+    stale_value_info.insert(chain.attn_node->output(0));
+    for (const auto& co : chain.chain_ops) {
+      stale_value_info.insert(co.node->output(0));
+    }
+  }
+
+  if (!stale_value_info.empty()) {
+    google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
+    for (const auto& vi : graph->value_info()) {
+      if (!stale_value_info.count(vi.name())) {
+        *kept.Add() = vi;
+      }
+    }
+    graph->mutable_value_info()->Swap(&kept);
   }
 }
 
@@ -9813,6 +10919,511 @@ void ApplyQdqChains(onnx::GraphProto* graph, std::vector<QdqChain>& chains,
   }
 }
 
+// --- MatMulBnb4 (bitsandbytes FP4/NF4 block-quantized weight) structured
+// --- pruning -------------------------------------------------------------
+//
+// Mirrors pruning.py's own "MatMulBnb4 (bitsandbytes FP4/NF4 block-quantized
+// weight) structured pruning" section -- read that section's top comment
+// first; it carries the full empirical schema/packing investigation (live
+// onnxruntime schema introspection, `matmul_bnb4_quantizer.py`'s own source,
+// and real `InferenceSession` round-trips) this whole section depends on,
+// none of which is re-derived here. The load-bearing facts this port relies
+// on, restated only as a checklist:
+//
+//   * `com.microsoft::MatMulBnb4` always has exactly 3 inputs (A, B,
+//     absmax) -- no zero_points, no g_idx, no bias, unlike `MatMulNBits`.
+//   * `B` is a FLAT 1-D `uint8` tensor of shape `[(N*K+1)//2]` -- the WHOLE
+//     `[N, K]` weight flattened row-major and packed 2 codes/byte, NOT
+//     `MatMulNBits`'s own `[N, k_blocks, blob_size]` (N kept as an explicit,
+//     never-packed-across leading axis). Nibbles are packed HIGH nibble
+//     first (flattened code `2*i` is byte `i`'s `>> 4`, code `2*i+1` is byte
+//     `i`'s `& 0xF`) -- the OPPOSITE of `MatMulNBits`'s own confirmed
+//     low-nibble-first convention, so the nibble unpack below is a
+//     deliberately separate, non-shared helper rather than reusing
+//     UnpackNibblesLastAxis with swapped arguments.
+//   * `absmax` is a flat 1-D tensor of shape `[(N*K+block_size-1)//
+//     block_size]`, one scale per flattened block.
+//   * A `block_size`-sized block stays entirely inside one output row's own
+//     `K` values -- and is therefore safe to keep/drop as a whole unit when
+//     N-axis-pruning -- if and only if `K % block_size == 0` (see
+//     pruning.py's own section comment for the full row-alignment argument,
+//     both mathematical and empirical). `MatchMatMulBnb4Producer` declines
+//     whenever this fails, mirroring `MatMulNBits`'s own analogous decline.
+//   * Because every valid `block_size` is even (>= 16, a power of two) and
+//     `K` is therefore always even too once that alignment check passes,
+//     row `n`'s own packed bytes occupy EXACTLY `[n*(K/2), (n+1)*(K/2))` of
+//     `B` -- a whole number of bytes, always -- so producer-side N-axis
+//     pruning is a plain byte-range/scale-range row slice, no nibble-level
+//     unpack/repack at all (simpler than `MatMulNBits`'s own producer-row
+//     slice, which still has to handle an optional packed `zero_points`).
+//
+// Scope boundaries, mirroring pruning.py's own section comment exactly
+// (each one restated there in more depth -- not re-argued here):
+//   * PRODUCER role only -- a `MatMulBnb4` node is never matched as a
+//     chain's CONSUMER (K-axis/input-channel pruning would need to
+//     re-slice every one of the consumer's own N rows in lockstep, a
+//     genuinely different problem left to a follow-up).
+//   * The chain's consumer is always a plain-float (directly-constant
+//     weight) `MatMul`/vanilla-`Gemm` -- `MatchPlainMatMulNBitsPeer`,
+//     reused directly, unmodified, from the `MatMulNBits` section above
+//     (fully generic despite its name).
+//   * `transB=0` and `training_mode != 0` always declined -- unverified
+//     semantics.
+//   * `quant_type` outside `{0 (FP4), 1 (NF4)}` declined.
+//   * `block_size` outside `{16, 32, 64, 128, 256}` declined (reuses
+//     MatMulNBitsValidBlockSizes directly, the same live-CPU-kernel-
+//     confirmed set).
+//   * `K % block_size != 0` declined -- the whole chain left untouched.
+//   * No grouped/gated (SwiGLU/GeGLU) pair -- only the plain single
+//     producer -> [unary hops] -> single plain-float consumer topology,
+//     mirroring `MatMulNBits`'s own identical scope decision.
+//   * `absmax` admitted only as plain FLOAT (float32) here -- this file's
+//     own float-tensor helpers have no FLOAT16/BFLOAT16 support anywhere
+//     yet, mirroring `MatMulNBits`'s own identical, already-established
+//     narrower-than-pruning.py restriction for its own `scales`/`bias`.
+//   * A shared/tied `B`/`absmax` tensor (read by more than one node) is
+//     declined by the matcher itself.
+//
+// Only L2 importance is supported here (reuses QdqChannelImportanceL2
+// directly) -- this port, like every other quantized-weight family in this
+// file, has no L1 option anywhere; StableTopKIndicesAscending (not the
+// unstable TopKIndicesAscending) is used for the same cross-platform-
+// determinism reason documented at its own definition above, so this
+// section's own keep-set selection stays byte-identical to pruning.py's own
+// `np.argsort(-importance, kind="stable")[:keep_count]` on exact ties.
+
+constexpr int64_t kMatMulBnb4Fp4 = 0;
+constexpr int64_t kMatMulBnb4Nf4 = 1;
+
+bool MatMulBnb4QuantTypeValid(int64_t quant_type) {
+  return quant_type == kMatMulBnb4Fp4 || quant_type == kMatMulBnb4Nf4;
+}
+
+// Empirically confirmed (see this section's own top comment) 16-level
+// dequantization code tables, code (0-15) -> double value, for each
+// `quant_type`. Used ONLY for producer-side importance ranking
+// (MatMulBnb4Dequantized) -- never written back to the graph.
+const std::array<double, 16>& MatMulBnb4Fp4Codes() {
+  static const std::array<double, 16> kCodes = {
+      0.0,
+      0.005208333333333333,
+      0.6666666666666666,
+      1.0,
+      0.3333333333333333,
+      0.5,
+      0.16666666666666666,
+      0.25,
+      -0.0,
+      -0.005208333333333333,
+      -0.6666666666666666,
+      -1.0,
+      -0.3333333333333333,
+      -0.5,
+      -0.16666666666666666,
+      -0.25,
+  };
+  return kCodes;
+}
+
+const std::array<double, 16>& MatMulBnb4Nf4Codes() {
+  static const std::array<double, 16> kCodes = {
+      -1.0,
+      -0.6961928009986877,
+      -0.5250730514526367,
+      -0.39491748809814453,
+      -0.28444138169288635,
+      -0.18477343022823334,
+      -0.09105003625154495,
+      0.0,
+      0.07958029955625534,
+      0.16093020141124725,
+      0.24611230194568634,
+      0.33791524171829224,
+      0.44070982933044434,
+      0.5626170039176941,
+      0.7229568362236023,
+      1.0,
+  };
+  return kCodes;
+}
+
+const std::array<double, 16>& MatMulBnb4CodeTable(int64_t quant_type) {
+  return quant_type == kMatMulBnb4Fp4 ? MatMulBnb4Fp4Codes()
+                                      : MatMulBnb4Nf4Codes();
+}
+
+// A `com.microsoft::MatMulBnb4` node's block-quantized weight operands,
+// matched by MatchMatMulBnb4Producer -- see this section's own top comment
+// for the schema facts and packing layout this depends on. `blocks_per_row`
+// (`K / block_size`) and `row_bytes` (`K / 2`) are precomputed here since
+// every producer-side slice needs both and MatchMatMulBnb4Producer has
+// already verified `K % block_size == 0` (so both divide evenly, and
+// `row_bytes` in particular is a whole number since `block_size` -- and
+// therefore `K` -- is always even) by the time this is constructed.
+struct MatMulBnb4Weight {
+  onnx::NodeProto* node = nullptr;
+  std::string b_name;
+  std::string absmax_name;
+  int64_t N = 0;
+  int64_t K = 0;
+  int64_t block_size = 0;
+  int64_t quant_type = 0;
+  int64_t blocks_per_row = 0;
+  int64_t row_bytes = 0;
+};
+
+// If `node` is a `com.microsoft::MatMulBnb4` node matching every scope
+// boundary this section's own top comment documents, returns the match --
+// mirrors pruning.py's own `_match_matmul_bnb4_producer` exactly. `nullopt`
+// whenever anything is ambiguous or out of scope, rather than guessing.
+std::optional<MatMulBnb4Weight> MatchMatMulBnb4Producer(
+    onnx::NodeProto* node, const InitMap& init_map,
+    const ConsumerMap& consumers_of) {
+  if (node->op_type() != "MatMulBnb4" ||
+      node->domain() != kComMicrosoftDomain) {
+    return std::nullopt;
+  }
+  if (node->input_size() != 3 || node->output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& a_name = node->input(0);
+  const std::string& b_name = node->input(1);
+  const std::string& absmax_name = node->input(2);
+  if (a_name.empty() || b_name.empty() || absmax_name.empty()) {
+    return std::nullopt;
+  }
+
+  if (MatMulNBitsIntAttrOr(*node, "transB", 1) != 1) {
+    return std::nullopt;  // "backward pass" orientation -- unverified,
+                          // declined.
+  }
+  if (MatMulNBitsIntAttrOr(*node, "training_mode", 0) != 0) {
+    return std::nullopt;  // training-mode semantics unverified -- declined.
+  }
+
+  const auto quant_type_opt = MatMulNBitsIntAttr(*node, "quant_type");
+  const auto n_opt = MatMulNBitsIntAttr(*node, "N");
+  const auto k_opt = MatMulNBitsIntAttr(*node, "K");
+  const auto block_size_opt = MatMulNBitsIntAttr(*node, "block_size");
+  if (!quant_type_opt || !n_opt || !k_opt || !block_size_opt) {
+    return std::nullopt;
+  }
+  const int64_t quant_type = *quant_type_opt;
+  const int64_t N = *n_opt;
+  const int64_t K = *k_opt;
+  const int64_t block_size = *block_size_opt;
+  if (!MatMulBnb4QuantTypeValid(quant_type)) {
+    return std::nullopt;
+  }
+  if (N <= 0 || K <= 0) {
+    return std::nullopt;
+  }
+  if (!MatMulNBitsValidBlockSizes().count(block_size)) {
+    return std::nullopt;
+  }
+  if (K % block_size != 0) {
+    return std::nullopt;  // A block would straddle two output rows.
+  }
+
+  const int64_t blocks_per_row = K / block_size;
+  const int64_t row_bytes = K / 2;  // K is always even here.
+
+  auto b_it = init_map.find(b_name);
+  auto absmax_it = init_map.find(absmax_name);
+  if (b_it == init_map.end() || absmax_it == init_map.end()) {
+    return std::nullopt;  // Non-constant B/absmax -- can't safely slice them.
+  }
+  const onnx::TensorProto* b_init = b_it->second;
+  const onnx::TensorProto* absmax_init = absmax_it->second;
+  if (b_init->data_type() != onnx::TensorProto::UINT8) {
+    return std::nullopt;
+  }
+  if (!MatMulNBitsDimsEqual(*b_init, {N * row_bytes})) {
+    return std::nullopt;
+  }
+  // Scope: FLOAT32 only -- see this section's own top comment.
+  if (absmax_init->data_type() != onnx::TensorProto::FLOAT) {
+    return std::nullopt;
+  }
+  if (!MatMulNBitsDimsEqual(*absmax_init, {N * blocks_per_row})) {
+    return std::nullopt;
+  }
+
+  for (const std::string& nm : {b_name, absmax_name}) {
+    if (ConsumerCount(consumers_of, nm) != 1) {
+      return std::nullopt;  // Shared/tied tensor -- another node reads it too.
+    }
+  }
+
+  MatMulBnb4Weight w;
+  w.node = node;
+  w.b_name = b_name;
+  w.absmax_name = absmax_name;
+  w.N = N;
+  w.K = K;
+  w.block_size = block_size;
+  w.quant_type = quant_type;
+  w.blocks_per_row = blocks_per_row;
+  w.row_bytes = row_bytes;
+  return w;
+}
+
+// Unpacks `packed` (`[outer, row_bytes]`, `row_bytes == count / 2`) into
+// `[outer, count]` codes in [0, 15], 2 per byte, HIGH NIBBLE FIRST -- see
+// this section's own top comment for why this is the opposite nibble order
+// from, and therefore not shared with, UnpackNibblesLastAxis
+// (`MatMulNBits`'s own low-nibble-first convention). `count` is always even
+// here (MatchMatMulBnb4Producer only ever constructs a `MatMulBnb4Weight`
+// once `K % block_size == 0` -- and therefore `K` itself -- is confirmed
+// even), so there is no odd-trailing-nibble case to handle, unlike
+// UnpackNibblesLastAxis's own general form.
+std::vector<uint8_t> UnpackBnb4CodesHighNibbleFirst(
+    const std::vector<uint8_t>& packed, int64_t outer, int64_t row_bytes,
+    int64_t count) {
+  std::vector<uint8_t> out(static_cast<size_t>(outer * count));
+  for (int64_t r = 0; r < outer; ++r) {
+    const uint8_t* prow = packed.data() + r * row_bytes;
+    uint8_t* orow = out.data() + r * count;
+    for (int64_t j = 0; j < row_bytes; ++j) {
+      const uint8_t byte = prow[j];
+      orow[2 * j] = (byte >> 4) & 0x0F;
+      orow[2 * j + 1] = byte & 0x0F;
+    }
+  }
+  return out;
+}
+
+// The full float64 `[N, K]` dequantized weight matrix `w` refers to, for
+// IMPORTANCE RANKING ONLY -- never written back to the graph (this file's
+// own "slice codes directly, never dequant-requant" invariant, restated in
+// this section's own top comment). `dequant[n, k] = table[code[n, k]] *
+// absmax[n, k / block_size]` -- mirrors pruning.py's own
+// `_matmul_bnb4_dequantized` exactly. `init_map` here is the Apply phase's
+// own MUTABLE name->TensorProto* map (this function is only ever called
+// from ApplyMatMulBnb4Chains, never during matching).
+std::vector<double> MatMulBnb4Dequantized(
+    const MatMulBnb4Weight& w,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map) {
+  const onnx::TensorProto* b_init = init_map.at(w.b_name);
+  const onnx::TensorProto* absmax_init = init_map.at(w.absmax_name);
+
+  const std::vector<uint8_t> packed =
+      ReadUint8Tensor(*b_init);  // [N*row_bytes]
+  const std::vector<uint8_t> codes =
+      UnpackBnb4CodesHighNibbleFirst(packed, w.N, w.row_bytes, w.K);  // [N, K]
+
+  const std::vector<float> absmax_data =
+      ReadFloatTensor(*absmax_init);  // [N * blocks_per_row]
+
+  const std::array<double, 16>& table = MatMulBnb4CodeTable(w.quant_type);
+
+  std::vector<double> out(static_cast<size_t>(w.N * w.K));
+  for (int64_t n = 0; n < w.N; ++n) {
+    for (int64_t kb = 0; kb < w.blocks_per_row; ++kb) {
+      const double scale = static_cast<double>(
+          absmax_data[static_cast<size_t>(n * w.blocks_per_row + kb)]);
+      for (int64_t j = 0; j < w.block_size; ++j) {
+        const int64_t idx = n * w.K + kb * w.block_size + j;
+        const uint8_t code = codes[static_cast<size_t>(idx)];
+        out[static_cast<size_t>(idx)] = table[code] * scale;
+      }
+    }
+  }
+  return out;
+}
+
+// Slices `w`'s own N (output-channel) axis to `keep` (ascending indices) --
+// a plain byte-range/scale-range row-slice, no nibble-level unpack/repack at
+// all (see this section's own top comment for why every row's own bytes/
+// scales are already whole-byte/whole-block aligned once
+// MatchMatMulBnb4Producer has confirmed `K % block_size == 0`). Both `B`
+// and `absmax` are stored FLAT (1-D), unlike `MatMulNBits`'s own `[N,
+// k_blocks, blob_size]`/`[N, k_blocks]`, so the sliced result is written
+// back flat too -- mirrors pruning.py's own `_slice_matmul_bnb4_producer_
+// rows` (`packed[keep].reshape(-1)`) exactly. Updates the node's own `N`
+// attribute to `len(keep)`.
+void SliceMatMulBnb4ProducerRows(
+    const MatMulBnb4Weight& w,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    const std::vector<int64_t>& keep) {
+  const int64_t kc = static_cast<int64_t>(keep.size());
+
+  onnx::TensorProto* b = init_map.at(w.b_name);
+  const std::vector<uint8_t> b_data = ReadUint8Tensor(*b);  // [N*row_bytes]
+  std::vector<uint8_t> b_out(static_cast<size_t>(kc * w.row_bytes));
+  for (int64_t i = 0; i < kc; ++i) {
+    std::memcpy(b_out.data() + i * w.row_bytes,
+                b_data.data() + keep[i] * w.row_bytes,
+                static_cast<size_t>(w.row_bytes));
+  }
+  SetUint8TensorData(b, {kc * w.row_bytes}, b_out);
+
+  onnx::TensorProto* absmax = init_map.at(w.absmax_name);
+  const std::vector<float> absmax_data =
+      ReadFloatTensor(*absmax);  // [N*blocks_per_row]
+  std::vector<float> absmax_out(static_cast<size_t>(kc * w.blocks_per_row));
+  for (int64_t i = 0; i < kc; ++i) {
+    std::memcpy(absmax_out.data() + i * w.blocks_per_row,
+                absmax_data.data() + keep[i] * w.blocks_per_row,
+                static_cast<size_t>(w.blocks_per_row) * sizeof(float));
+  }
+  SetFloatTensorData(absmax, {kc * w.blocks_per_row}, absmax_out);
+
+  SetOrAddIntAttr(w.node, "N", kc);
+}
+
+struct MatMulBnb4Chain {
+  MatMulBnb4Weight producer;
+  std::vector<onnx::NodeProto*> chain_ops;
+  PlainMatMulNBitsPeer consumer;
+  int64_t n_channels = 0;
+};
+
+// From tensor `start` (a `MatMulBnb4` producer's own output), walks forward
+// through shape-preserving unary activations (UnaryPassThroughOps) with no
+// other consumer anywhere along the way, until a plain-float (directly-
+// constant weight) `MatMul`/vanilla-`Gemm` consumer
+// (MatchPlainMatMulNBitsPeer -- reused directly here, fully generic despite
+// its name) is found whose input-channel count matches `n_channels`. Unlike
+// WalkToMatMulNBitsConsumer's own `MatMulNBits`/plain-float union, a
+// `MatMulBnb4` CONSUMER is never matched here at all -- see this section's
+// own top comment for why K-axis pruning of a `MatMulBnb4` weight remains
+// out of scope. Returns `nullopt` if the walk runs out of hops, hits a
+// branch, or never reaches such a consumer. Mirrors pruning.py's own
+// `_walk_to_matmul_bnb4_consumer`.
+std::optional<std::pair<PlainMatMulNBitsPeer, std::vector<onnx::NodeProto*>>>
+WalkToMatMulBnb4Consumer(const std::string& start, const InitMap& init_map,
+                         const ConsumerMap& consumers_of,
+                         const std::unordered_set<std::string>& graph_outputs,
+                         int64_t n_channels, int max_hops) {
+  std::vector<onnx::NodeProto*> chain_ops;
+  std::string cur = start;
+  for (int hop = 0; hop < max_hops; ++hop) {
+    auto cit = consumers_of.find(cur);
+    if (cit == consumers_of.end() || cit->second.size() != 1) {
+      return std::nullopt;
+    }
+    onnx::NodeProto* nxt = cit->second[0];
+
+    auto mm = MatchMatMulLikeRaw(*nxt);
+    if (mm && mm->x_name == cur) {
+      auto peer = MatchPlainMatMulNBitsPeer(nxt, init_map, consumers_of);
+      if (!peer || peer->in_channels != n_channels) {
+        return std::nullopt;
+      }
+      return std::make_pair(*peer, std::move(chain_ops));
+    }
+
+    if (!(UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
+          nxt->input_size() == 1 && nxt->input(0) == cur &&
+          nxt->output_size() == 1)) {
+      return std::nullopt;
+    }
+    const std::string& out2 = nxt->output(0);
+    auto oc = consumers_of.find(out2);
+    if (oc == consumers_of.end() || oc->second.size() != 1 ||
+        graph_outputs.count(out2)) {
+      return std::nullopt;
+    }
+    chain_ops.push_back(nxt);
+    cur = out2;
+  }
+  return std::nullopt;
+}
+
+// Every `MatMulBnb4` producer -> [unary hops] -> plain-float consumer pair
+// WalkToMatMulBnb4Consumer connects -- see this section's own top comment
+// for why the consumer side is always plain-float (never another
+// `MatMulBnb4`/`MatMulNBits` node). Mirrors pruning.py's own
+// `_find_matmul_bnb4_chains`.
+std::vector<MatMulBnb4Chain> FindMatMulBnb4Chains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  auto is_internal = [&](const std::string& name) {
+    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
+  };
+
+  std::vector<MatMulBnb4Chain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto producer = MatchMatMulBnb4Producer(node, init_map, consumers_of);
+    if (!producer) {
+      continue;
+    }
+    const std::string& out_name = node->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    auto found =
+        WalkToMatMulBnb4Consumer(out_name, init_map, consumers_of,
+                                 graph_outputs, producer->N, kMaxChainHops);
+    if (!found) {
+      continue;
+    }
+    chains.push_back(MatMulBnb4Chain{std::move(*producer),
+                                     std::move(found->second),
+                                     std::move(found->first), producer->N});
+  }
+  return chains;
+}
+
+// The actual apply step -- mirrors pruning.py's own
+// `apply_structured_pruning_matmul_bnb4`'s own per-chain loop. Shares
+// `touched` with every other chain family ApplyStructuredPruning already
+// applies over this same graph, so a plain-float weight this pass also
+// happens to match (as the consumer side of a chain) can never be
+// double-resized by, or double-resize, an ordinary chain that already
+// touched it.
+void ApplyMatMulBnb4Chains(onnx::GraphProto* graph,
+                           std::vector<MatMulBnb4Chain>& chains,
+                           double sparsity, TouchedState& touched) {
+  std::unordered_map<std::string, onnx::TensorProto*> init_map;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    init_map[t->name()] = t;
+  }
+
+  for (auto& chain : chains) {
+    const std::string& p_key = chain.producer.b_name;
+    const std::string& c_key = chain.consumer.w_name;
+    if (touched.producer.count(p_key) || touched.consumer.count(c_key)) {
+      continue;  // A shared/tied weight another chain already resized.
+    }
+
+    const int64_t n = chain.n_channels;
+    const int64_t keep_count = std::max<int64_t>(
+        1, n - std::llround(static_cast<double>(n) * sparsity));
+    if (keep_count >= n) {
+      continue;  // Rounds down to nothing for this layer -- no-op.
+    }
+
+    const std::vector<double> w_nk =
+        MatMulBnb4Dequantized(chain.producer, init_map);
+    const std::vector<double> importance =
+        QdqChannelImportanceL2(w_nk, n, chain.producer.K);
+    const std::vector<int64_t> keep =
+        StableTopKIndicesAscending(importance, keep_count);
+
+    SliceMatMulBnb4ProducerRows(chain.producer, init_map, keep);
+    SliceConsumerWeight(init_map.at(chain.consumer.w_name),
+                        chain.consumer.weight_transposed, keep, false);
+
+    touched.producer.insert(p_key);
+    touched.consumer.insert(c_key);
+    touched.stale_value_info.insert(chain.producer.node->output(0));
+    for (onnx::NodeProto* op : chain.chain_ops) {
+      touched.stale_value_info.insert(op->output(0));
+    }
+  }
+}
+
 // --- Subgraph recursion ------------------------------------------------
 //
 // Mirrors pruning.py's own `_iter_subgraphs` and the "Subgraph recursion"
@@ -9951,8 +11562,12 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
         FindMatMulNBitsChains(graph);
     std::vector<MatMulNBitsGatedChain> matmul_nbits_gated_chains =
         FindMatMulNBitsGatedChains(graph);
+    std::vector<MatMulNBitsMlpChain> matmul_nbits_mlp_chains =
+        FindMatMulNBitsMlpChains(graph);
     std::vector<QdqChain> qdq_chains = FindQdqChains(graph);
     std::vector<QdqGatedChain> qdq_gated_chains = FindQdqGatedChains(graph);
+    std::vector<MatMulBnb4Chain> matmul_bnb4_chains =
+        FindMatMulBnb4Chains(graph);
 
     TouchedState touched;
     if (!chains.empty()) {
@@ -9981,6 +11596,16 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
       ApplyMatMulNBitsChains(graph, matmul_nbits_chains,
                              matmul_nbits_gated_chains, sparsity, touched);
     }
+    if (!matmul_nbits_mlp_chains.empty()) {
+      // The fused `MatMulNBitsMlp` variant -- see the "MatMulNBitsMlp/
+      // MatMulNBitsQkv (fused block-quantized weight) structured pruning"
+      // section comment above ApplyMatMulNBitsChains for why this chain
+      // kind (unlike MatMulNBitsQkv) is wired in right here, sharing
+      // `touched` with every chain family above for the same reason
+      // ApplyMatMulNBitsChains itself does.
+      ApplyMatMulNBitsMlpChains(graph, matmul_nbits_mlp_chains, sparsity,
+                                touched);
+    }
     if (!qdq_chains.empty() || !qdq_gated_chains.empty()) {
       // QDQ-quantized chains -- see this file's own "QDQ (quantized-weight)
       // structured pruning" section comment. Additive and (per
@@ -9990,6 +11615,17 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
       // "one shared conflict ledger per graph" reason ApplySplitGatedChains
       // does.
       ApplyQdqChains(graph, qdq_chains, qdq_gated_chains, sparsity, touched);
+    }
+    if (!matmul_bnb4_chains.empty()) {
+      // The sixth and final application pass over this graph -- see this
+      // file's own "MatMulBnb4 (bitsandbytes FP4/NF4 block-quantized
+      // weight) structured pruning" section comment. Shares `touched` with
+      // every call above for the same "one shared conflict ledger per
+      // graph" reason ApplyMatMulNBitsChains/ApplyQdqChains both do: a
+      // plain-float consumer weight this pass matches can never be
+      // double-resized by, or double-resize, an ordinary chain/MatMulNBits/
+      // QDQ chain that already touched it.
+      ApplyMatMulBnb4Chains(graph, matmul_bnb4_chains, sparsity, touched);
     }
     if (!touched.stale_value_info.empty()) {
       google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
@@ -10036,6 +11672,25 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
                   std::make_move_iterator(onnx_attn_chains.end()));
     if (!chains.empty()) {
       ApplyAttentionChains(graph, chains, sparsity);
+    }
+    // The fused `com.microsoft::MatMulNBitsQkv` variant -- see the
+    // "MatMulNBitsMlp/MatMulNBitsQkv (fused block-quantized weight)
+    // structured pruning" section comment above ApplyMatMulNBitsChains
+    // (onnxsim's own "MatMulNBits" section) for why this chain kind is
+    // wired in HERE rather than alongside MatMulNBitsMlp in
+    // ApplyStructuredPruning: pruning a whole KV group needs this
+    // function's own GQA/plain-Attention head-count matching machinery
+    // (MatchGqaProducer/MatchOnnxAttentionProducer/HeadColumnIndices), which
+    // MatMulNBitsMlp's plain producer/consumer pruning unit never needs at
+    // all. Uses its own dedicated producer/consumer-touched bookkeeping,
+    // never shared with ApplyAttentionChains's own above -- always safe,
+    // since a `MatMulNBitsQkv` node's own `q_b`/`k_b`/`v_b` weight names can
+    // never collide with a plain/GQA chain's own separately-matched Q/K/V
+    // producer weight names (structurally different node/weight shapes).
+    std::vector<MatMulNBitsQkvChain> matmul_nbits_qkv_chains =
+        FindMatMulNBitsQkvChains(graph);
+    if (!matmul_nbits_qkv_chains.empty()) {
+      ApplyMatMulNBitsQkvChains(graph, matmul_nbits_qkv_chains, sparsity);
     }
   }
   return out;
