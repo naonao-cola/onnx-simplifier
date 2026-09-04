@@ -9,7 +9,8 @@ name: Backend Integration
 # tests/test_halide_integration.py, tests/test_tinygrad_integration.py,
 # tests/test_torch_integration.py, tests/test_mlx_integration.py,
 # tests/test_modelopt_integration.py, tests/test_mmdeploy_integration.py,
-# tests/test_jax_export_integration.py. See docs/dlpack-executor.md, which frames
+# tests/test_jax_export_integration.py, tests/test_jax_real_model_integration.py.
+# See docs/dlpack-executor.md, which frames
 # the DLPack executor boundary as an "embeddability" seam for stacks like these.
 # The xnnpack job below is the odd one out: it exercises
 # GetXnnpackModelExecutor() (onnxsim/xnnpack_executor_test.cpp) directly via a
@@ -49,6 +50,7 @@ on:
       - "tests/test_modelopt_integration.py"
       - "tests/test_mmdeploy_integration.py"
       - "tests/test_jax_export_integration.py"
+      - "tests/test_jax_real_model_integration.py"
       - ".github/workflows/backend-integration.yml"
       - "onnxsim/onnx_simplifier.py"
       - "onnxsim/onnxsim.cpp"
@@ -390,22 +392,34 @@ jobs:
           path: wheelhouse
       # jax2onnx pulls in jax, flax, onnxruntime, and its own onnx/onnx-ir
       # copies as ordinary dependencies -- no extra install step needed
-      # beyond it.
-      - name: Install onnxsim wheel + jax2onnx
+      # beyond it. transformers is only needed for
+      # test_jax_real_model_integration.py's real ViT/GPT-2 models, and only
+      # as `<5`: transformers 5.0 dropped its Flax model implementations
+      # entirely, so the newest transformers with FlaxViTModel /
+      # FlaxGPT2LMHeadModel still importable must be pinned explicitly here
+      # rather than left to just "transformers" resolving to latest. gemma
+      # is Google DeepMind's own actively-maintained Flax NNX package
+      # (that test's model needs onnxsim's rewrite_bool_where pass to even
+      # load on ORT -- see tests/test_rewrite_bool_where.py).
+      - name: Install onnxsim wheel + jax2onnx + transformers (Flax models) + gemma
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest jax2onnx
+          python -m pip install pytest jax2onnx "transformers<5" gemma
           python -m pip install wheelhouse/*.whl
       - name: Verify the installed wheel is used (not the source tree)
         working-directory: ${{ runner.temp }}
         run: |
           python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
           python -c "import jax, jax2onnx; print('jax', jax.__version__, 'jax2onnx', jax2onnx.__file__)"
+          python -c "import transformers; print('transformers', transformers.__version__, transformers.FlaxViTModel)"
+          python -c "import gemma; print('gemma', gemma.__version__)"
       # Run from a neutral directory so the repo root's ./onnxsim source package
       # (without the compiled extension) does not shadow the installed wheel.
       - name: Run JAX export integration tests
         working-directory: ${{ runner.temp }}
-        run: pytest -v "$GITHUB_WORKSPACE/tests/test_jax_export_integration.py"
+        run: |
+          pytest -v "$GITHUB_WORKSPACE/tests/test_jax_export_integration.py"
+          pytest -v "$GITHUB_WORKSPACE/tests/test_jax_real_model_integration.py"
 
   xnnpack:
     name: XNNPACK ModelExecutor backend (native)
