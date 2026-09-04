@@ -142,6 +142,7 @@ from onnxsim.quantease import apply_quantease
 from onnxsim.quarot import apply_quarot
 from onnxsim.quip_sharp import apply_quip_sharp
 from onnxsim.rptq import apply_rptq_reorder
+from onnxsim.slim_llm import apply_slim_llm
 from onnxsim.smoothquant import apply_smoothquant
 from onnxsim.spinquant import apply_spinquant
 from onnxsim.spqr import quantize_weight_only_spqr
@@ -186,6 +187,7 @@ __all__ = [
     "apply_llm_int8",
     "apply_low_rank_compensation",
     "apply_mixed_precision_quantization",
+    "apply_slim_llm",
     "apply_quip_sharp",
     "apply_quarot",
     "apply_quarot_cpp",
