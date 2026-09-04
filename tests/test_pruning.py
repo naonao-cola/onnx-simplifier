@@ -5231,6 +5231,292 @@ def test_analyze_structured_pruning_group_norm_pass_through_matches_real_call():
     assert dims_after["GNBias"][0] == kept
 
 
+# --- Conv chain: InstanceNormalization pass-through hop ---------------------
+#
+# `InstanceNormalization` (plain ONNX, standard domain) is a *second*
+# mid-chain norm hop, alongside `GroupNormalization` above -- but, unlike
+# GroupNorm, carries no `num_groups`/uniform-per-block constraint at all:
+# its own mean/variance are computed per instance *per channel*, never
+# pooled across a group, so an arbitrary channel subset may be kept/dropped
+# with no group-boundary-drift risk to guard against. See
+# `_INSTANCE_NORM_PASS_THROUGH_OP`'s own comment for the full reasoning and
+# empirical confirmation (`0.0` max abs diff commuting with channel slicing,
+# vs. GroupNorm's own ~0.42 divergence for a same-shape example).
+
+
+def _instance_norm_conv_pair_model(w1, w2, in_scale, in_bias, b1=None, spatial=10):
+    """The mid-chain-``InstanceNormalization`` analogue of `_conv_pair_model`/
+    `_group_norm_conv_pair_model`: an `InstanceNormalization` node (3
+    required inputs; `scale`/`B` both strictly rank-1 ``[C1]``, per
+    :func:`onnxsim.pruning._match_instance_norm_pass_through`'s own bar)
+    sits between the two Convs. Unlike `_group_norm_conv_pair_model`, there
+    is no `num_groups`/producer-`group` parameter to thread through here at
+    all -- this hop places no constraint on which channels survive.
+    """
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        _f32(in_scale, "INScale"),
+        _f32(in_bias, "INBias"),
+    ]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    out_spatial = spatial - 4  # two valid (no-pad) 3x3 convs
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          n = InstanceNormalization<epsilon=1e-05>(h, INScale, INBias)
+          Y = Conv<kernel_shape=[3,3]>(n, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=22,
+    )
+
+
+def test_structured_pruning_instance_norm_pass_through_matches_oracle_exactly():
+    # THE key correctness bar, same as every other Conv-chain hop's own
+    # oracle test: exact equivalence (float32 noise only) to an
+    # independently, already-pruned reference model -- never "matches the
+    # un-pruned model's own output sliced after the fact" (see
+    # `_INSTANCE_NORM_PASS_THROUGH_OP`'s own comment for why the latter isn't
+    # even the same computation). `_oracle_keep_indices_conv` -- the plain,
+    # unconstrained top-k `_apply_chains` itself uses for an ordinary
+    # (`group=1`) chain -- is the right oracle here precisely because this
+    # hop adds no grouping constraint of its own, unlike the GroupNorm hop's
+    # own `_oracle_keep_indices_conv_grouped`.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(60)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    in_scale = rng.standard_normal((C1,)).astype(np.float32)
+    in_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _instance_norm_conv_pair_model(w1, w2, in_scale, in_bias, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["INScale"][0] == C1 // 2
+    assert dims_after["INBias"][0] == C1 // 2
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _instance_norm_conv_pair_model(
+        w1[keep], w2[:, keep], in_scale[keep], in_bias[keep], b1=b1[keep]
+    )
+
+    rng_x = np.random.default_rng(61)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_instance_norm_tied_scale_bias_declines():
+    # `scale`/`B` naming the same initializer -- double-slicing it in
+    # `_apply_conv_pass_through_hop` would corrupt it, so the whole chain is
+    # declined outright, same as `_match_group_norm_pass_through`'s own
+    # tied-name bar.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(62)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    tied = rng.standard_normal((C1,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          n = InstanceNormalization<epsilon=1e-05>(h, Tied, Tied)
+          Y = Conv<kernel_shape=[3,3]>(n, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(tied, "Tied")],
+        opset=22,
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["Tied"], tied)
+
+
+def test_structured_pruning_instance_norm_non_constant_scale_declines():
+    # `scale` fed by a runtime value (here, a second graph input) rather than
+    # a constant initializer -- this pass cannot know its per-channel values
+    # ahead of time, so the whole chain is declined outright, never guessed
+    # at, the same "statically-known-constant-only" bar every other
+    # per-channel hop in this module already applies.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(63)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    in_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X, float[{C1}] Scale) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          n = InstanceNormalization<epsilon=1e-05>(h, Scale, INBias)
+          Y = Conv<kernel_shape=[3,3]>(n, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(in_bias, "INBias")],
+        opset=22,
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["INBias"], in_bias)
+
+
+def test_structured_pruning_instance_norm_non_1d_scale_declines():
+    # A `scale` shaped `[1, C1]` -- `_flat_channel_const`'s own looser
+    # "prod(dims) == dims[-1]" bar would admit this (a real GroupNorm/
+    # LayerNorm hop reuses that check), but `_match_instance_norm_pass_through`
+    # deliberately holds InstanceNorm's own `scale`/`B` to a *strictly*
+    # rank-1 bar instead (see its own docstring for why: this hop's `scale`/
+    # `B` are carried on a plain `_ConvPassThrough`, whose own slicing always
+    # slices axis 0, which is only ever the right axis when rank == 1).
+    # Declined outright rather than mis-sliced.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(64)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    in_scale_2d = rng.standard_normal((1, C1)).astype(np.float32)
+    in_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          n = InstanceNormalization<epsilon=1e-05>(h, INScale, INBias)
+          Y = Conv<kernel_shape=[3,3]>(n, W2)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(w2, "W2"),
+            _f32(in_scale_2d, "INScale"),
+            _f32(in_bias, "INBias"),
+        ],
+        opset=22,
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["INScale"], in_scale_2d)
+    np.testing.assert_array_equal(inits["INBias"], in_bias)
+
+
+def _residual_diamond_instance_norm_model(
+    w_f, in_scale, in_bias, w_s, w_out, spatial=10
+):
+    # The `_residual_diamond_model` shape, extended with an
+    # `InstanceNormalization` hop on the `f` branch between its own Conv
+    # producer and the `Add` merge -- exercises
+    # `_walk_conv_producer_backward`'s own new InstanceNorm branch (not just
+    # the forward `_walk_to_conv_consumer` one every other test above already
+    # covers), confirming the hop is crossed correctly walking *backward*
+    # from the `Add` operand to `f`'s own real Conv producer.
+    Cin = w_f.shape[1]
+    Cout = w_out.shape[0]
+    out_spatial = spatial - 4  # two chained 3x3 valid convs
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{out_spatial},{out_spatial}] Y)
+        {{
+          f = Conv<kernel_shape=[3,3]>(X, WF)
+          n = InstanceNormalization<epsilon=1e-05>(f, INScale, INBias)
+          s = Conv<kernel_shape=[3,3]>(X, WS)
+          addr = Add(n, s)
+          r = Relu(addr)
+          Y = Conv<kernel_shape=[3,3]>(r, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(w_f, "WF"),
+            _f32(in_scale, "INScale"),
+            _f32(in_bias, "INBias"),
+            _f32(w_s, "WS"),
+            _f32(w_out, "WOUT"),
+        ],
+        opset=22,
+    )
+
+
+def test_structured_pruning_conv_residual_add_instance_norm_pass_through_matches_oracle():
+    Cin, C, Cout = 3, 16, 8
+    rng = np.random.default_rng(65)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    in_scale = rng.standard_normal((C,)).astype(np.float32)
+    in_bias = rng.standard_normal((C,)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    model = _residual_diamond_instance_norm_model(w_f, in_scale, in_bias, w_s, w_out)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["WF"][0] == C // 2
+    assert dims_after["INScale"][0] == C // 2
+    assert dims_after["INBias"][0] == C // 2
+    assert dims_after["WS"][0] == C // 2
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    oracle = _residual_diamond_instance_norm_model(
+        w_f[keep], in_scale[keep], in_bias[keep], w_s[keep], w_out[:, keep]
+    )
+
+    rng_x = np.random.default_rng(66)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_analyze_structured_pruning_instance_norm_pass_through_matches_real_call():
+    # Dry-run/real-call cross-check for the InstanceNorm hop specifically,
+    # mirroring `test_analyze_structured_pruning_group_norm_pass_through_matches_real_call`
+    # above.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(67)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    in_scale = rng.standard_normal((C1,)).astype(np.float32)
+    in_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _instance_norm_conv_pair_model(w1, w2, in_scale, in_bias)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "conv_plain"
+    assert layer.total == C1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept = C1 - layer.would_drop
+    assert dims_after["W1"][0] == kept
+    assert dims_after["W2"][1] == kept
+    assert dims_after["INScale"][0] == kept
+    assert dims_after["INBias"][0] == kept
+
+
 # --- Conv chain: pooling/Resize/Pad pass-through hops -----------------------
 #
 # `MaxPool`/`AveragePool`/`GlobalAveragePool` (unconditional -- no weight of
