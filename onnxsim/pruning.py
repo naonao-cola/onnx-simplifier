@@ -22626,12 +22626,31 @@ def _find_sparse_attention_chains(
 #   `torch.onnx.export` -> `onnxsim.simplify()` ->
 #   `apply_attention_head_pruning` pipeline test), leaving the calibrated
 #   and dry-run variants for a future pass to extend.
-# - Packed-QKV (:func:`_match_packed_qkv_split`'s own shape), Q/K-norm+RoPE
-#   pass-through, and cross-attention (Q's own source tensor distinct from
-#   K's/V's) are none of them recognized here -- every one of them is a
-#   real, separate shape this section does not attempt; a graph combining
-#   any of them with this section's own decomposed shape simply declines
-#   the match (never guessed at), same as any other unrecognized topology.
+# - Packed-QKV (:func:`_match_packed_qkv_split`'s own shape -- one shared
+#   MatMul/vanilla-Gemm projection feeding a `Split` into Q-then-K-then-V
+#   column ranges, each of which then independently feeds this section's
+#   own `Reshape -> Transpose -> [repeat_kv]` head-split chain, the common
+#   GPT-2/GPT-J/GPT-NeoX/BLOOM/Falcon-style `c_attn`-family projection) IS
+#   recognized here -- see :class:`_DecomposedGQAChain`'s own
+#   `packed_split_sizes` field and :func:`_apply_one_decomposed_gqa_chain`'s
+#   own packed branch, which mirror :class:`_GQAChain`'s/
+#   :func:`_apply_one_gqa_chain`'s own analogous fused-node handling of this
+#   exact shape verbatim: a KV group's pruning removes that group's own Q/K/V
+#   column ranges from the *one* shared packed weight (and packed bias, if
+#   any) in a single combined slice, and shrinks the `Split` node's own
+#   split-sizes constant to match. Both the equal-split (plain MHA, e.g.
+#   GPT-2's `c_attn`) and unequal-split (GQA/MQA, e.g. Falcon's packed
+#   `query_key_value`) cases are handled -- `_match_packed_qkv_split` itself
+#   makes no MHA/GQA distinction, and this section's own combined-index-set
+#   slicing generalizes to any `nq`/`nk`/`nv` the same way the fused-node
+#   packed branch already does. Q/K-norm+RoPE pass-through and cross-
+#   attention (Q's own source tensor distinct from K's/V's) remain
+#   unrecognized here -- both are real, separate shapes this section does
+#   not attempt (nothing in the confirmed decomposed-export shape this
+#   section targets ever combines them with a packed producer); a graph
+#   combining either of them with this section's own decomposed shape simply
+#   declines the match (never guessed at), same as any other unrecognized
+#   topology.
 
 
 @dataclass(frozen=True)
@@ -22724,6 +22743,39 @@ class _DecomposedGQAChain:
     consumer_node: onnx.NodeProto
     consumer_weight: str
     consumer_weight_transposed: bool
+    packed_split_sizes: Optional[str] = None
+    # Set exactly when Q's/K's/V's own raw projection output all trace back
+    # to the *same* packed-QKV-then-``Split`` producer (see
+    # :func:`_match_packed_qkv_split`) rather than three independent
+    # MatMul/Gemm producers -- the decomposed-shape analogue of
+    # :class:`_GQAChain`'s own field of the same name (see that class's own
+    # field for the fused-node case this mirrors). When set, `q_weight`,
+    # `k_weight`, and `v_weight` all name the identical shared packed
+    # tensor (and `q_bias`/`k_bias`/`v_bias`, if not all ``None``, the
+    # identical shared packed bias) -- a column-range *view* into one
+    # ``[K, Nq+Nk+Nv]``-or-``[Nq+Nk+Nv, K]`` tensor rather than three
+    # separately-stored arrays -- and this field itself names the upstream
+    # ``Split`` node's own ``[nq, nk, nv]`` split-sizes initializer,
+    # rewritten post-pruning to the new column widths in
+    # :func:`_apply_one_decomposed_gqa_chain`'s own packed branch, mirroring
+    # :func:`_apply_one_gqa_chain`'s own `chain.packed_split_sizes` branch
+    # verbatim (see that function's own docstring for the exact combined-
+    # column-index-set construction both share).
+    packed_flatten_reshape: Optional[onnx.NodeProto] = None
+    packed_flatten_reshape_shape: Optional[str] = None
+    # Both set together, and only alongside `packed_split_sizes`, when the
+    # packed producer's own raw output is reshaped back to its original
+    # rank (`torch.onnx.export`'s own "flatten batch*seq before a Gemm"
+    # artifact -- see :func:`_match_decomposed_packed_qkv_producer`'s own
+    # docstring for the confirmed real export shape) before feeding the
+    # `Split` node -- `None`/`None` when the packed producer feeds `Split`
+    # directly (the onnxruntime-genai-model-builder shape
+    # :func:`_match_packed_qkv_split` was originally confirmed against).
+    # `packed_flatten_reshape_shape` names this `Reshape`'s own
+    # shape-constant input, whose LAST entry (the packed weight's own
+    # `nq + nk + nv` real output width) :func:`_apply_one_decomposed_gqa_chain`
+    # rewrites post-pruning via the same `_rewrite_shape_dim` clone-safety
+    # helper every other shape constant this chain owns already uses.
 
 
 # Either kind of matched whole-KV-group-pruned chain -- :func:`_gqa_group_importance`'s
@@ -22942,6 +22994,121 @@ def _match_decomposed_repeat_kv(
         merge_reshape_shape=reshape.input[1],
     )
     return branch, raw_name, kv_num_heads, n_rep
+
+
+def _match_decomposed_packed_qkv_producer(
+    split_node: onnx.NodeProto,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> Optional[
+    Tuple[
+        str,
+        bool,
+        Optional[str],
+        int,
+        int,
+        int,
+        str,
+        Optional[onnx.NodeProto],
+        Optional[str],
+    ]
+]:
+    """Resolves `split_node` -- already confirmed by the caller to be the
+    single shared producer of Q's/K's/V's own raw (pre-reshape) projection
+    outputs -- as this module's own packed-QKV producer
+    (:func:`_match_packed_qkv_split`'s own shape), optionally through one
+    intervening pass-through ``Reshape`` sitting directly between the
+    packed MatMul/Gemm projection and this `Split` node.
+
+    That extra ``Reshape`` -- absent from :func:`_match_packed_qkv_split`'s
+    own confirmed onnxruntime-genai-model-builder export (which wires the
+    packed projection's raw output into `Split` directly) -- is a
+    genuinely different, ALSO real artifact: onnxsim's own
+    `fuse_matmul_add_bias_into_gemm` optimizer pass flattens a packed
+    projection's rank-3 `MatMul`/`Add` into a rank-2 `Gemm` (mirroring
+    every other producer this module's "Decomposed (un-fused) attention
+    head pruning" section already handles -- see this module's own section
+    comment above :func:`_match_decomposed_head_split`), then reshapes that
+    `Gemm`'s own raw 2-D output back to the original rank-3 shape whenever
+    its immediate real consumer isn't itself a plain `Reshape` the pass can
+    trivially absorb into one combined target -- true for a `Split`
+    (confirmed empirically via a real `torch.onnx.export` of a GPT-2-style
+    packed `c_attn` `Linear` run through `onnxsim.simplify()`, not merely
+    hypothesized -- see `tests/test_pruning.py`'s own
+    `test_decomposed_packed_qkv_real_torch_export_pipeline`). This function
+    handles both: when `split_node.input[0]` is produced directly by a
+    `_match_producer`-accepted node, it behaves identically to
+    :func:`_match_packed_qkv_split` (a plain delegating call, no behavior
+    change for that already-working shape); when it is instead produced by
+    exactly this pass-through `Reshape`, it resolves one hop further back
+    before delegating, and additionally confirms the `Reshape`'s own target
+    shape is a fully resolved literal whose last entry equals the packed
+    weight's own real output width (`nq + nk + nv`) -- never guessed at
+    otherwise.
+
+    Returns :func:`_match_packed_qkv_split`'s own 7-tuple plus two more
+    entries, `(flatten_reshape, flatten_reshape_shape)` -- both ``None``
+    when no such `Reshape` was crossed (the direct case), otherwise the
+    crossed node and the name of its own shape-constant input for
+    :func:`_apply_one_decomposed_gqa_chain`'s own post-pruning rewrite (its
+    own real output width shrinks in lock-step with the packed weight's
+    own, so this constant's last entry must be rewritten too, via the
+    identical `_rewrite_shape_dim` clone-safety mechanism every other shape
+    constant this chain owns already uses) -- or ``None`` if neither shape
+    matches.
+    """
+    if split_node.op_type != "Split" or not split_node.input or not split_node.input[0]:
+        return None
+    data_name = split_node.input[0]
+
+    direct = _match_packed_qkv_split(
+        split_node, initializer_map, consumers_of, node_by_output
+    )
+    if direct is not None:
+        return direct + (None, None)
+
+    # Not a direct MatMul/Gemm-to-Split producer -- try resolving one
+    # pass-through `Reshape` hop first (see this function's own docstring).
+    # `data_name`'s own "exactly one consumer" bar (the ordinary
+    # single-consumer/not-a-graph-output invariant every hop in this
+    # module already holds) is checked here explicitly, since the
+    # delegating call below checks that same bar against the *reshape's*
+    # own input, not `data_name` itself.
+    if data_name in graph_outputs or len(consumers_of.get(data_name, [])) != 1:
+        return None
+    reshape = node_by_output.get(data_name)
+    if (
+        reshape is None
+        or reshape.domain != ""
+        or reshape.op_type != "Reshape"
+        or len(reshape.input) != 2
+        or not reshape.input[0]
+        or not reshape.input[1]
+        or len(reshape.output) != 1
+        or reshape.output[0] != data_name
+    ):
+        return None
+
+    synthetic = onnx.NodeProto()
+    synthetic.CopyFrom(split_node)
+    synthetic.input[0] = reshape.input[0]
+    resolved = _match_packed_qkv_split(
+        synthetic, initializer_map, consumers_of, node_by_output
+    )
+    if resolved is None:
+        return None
+    _, _, _, nq, nk, nv, _ = resolved
+
+    shape_init = initializer_map.get(reshape.input[1])
+    if shape_init is None or shape_init.data_type != onnx.TensorProto.INT64:
+        return None
+    dims = onnx.numpy_helper.to_array(shape_init)
+    if dims.size == 0 or int(dims[-1]) != nq + nk + nv:
+        return None
+
+    return resolved + (reshape, reshape.input[1])
 
 
 def _resolve_decomposed_qk_root(
@@ -23326,22 +23493,73 @@ def _find_decomposed_gqa_chains(
         v_prod_node = node_by_output.get(v_proj_out)
         if q_prod_node is None or k_prod_node is None or v_prod_node is None:
             continue
-        if (
+        packed_split_sizes: Optional[str] = None
+        packed_flatten_reshape: Optional[onnx.NodeProto] = None
+        packed_flatten_reshape_shape: Optional[str] = None
+        if q_prod_node is k_prod_node and q_prod_node is v_prod_node:
+            # All three raw projection outputs trace back to the exact
+            # same node -- either the packed-QKV-then-`Split` shape
+            # :func:`_match_decomposed_packed_qkv_producer` recognizes (see
+            # this module's own "Decomposed (un-fused) attention head
+            # pruning" section comment and :class:`_DecomposedGQAChain`'s
+            # own `packed_split_sizes` field docstring), or a genuinely
+            # degenerate share (three reshape/transpose chains all reading
+            # one tensor that ISN'T such a `Split`) this pass still can't
+            # independently slice.
+            packed = (
+                _match_decomposed_packed_qkv_producer(
+                    q_prod_node,
+                    consumers_of,
+                    graph_outputs,
+                    node_by_output,
+                    initializer_map,
+                )
+                if q_prod_node.op_type == "Split"
+                else None
+            )
+            if packed is None or list(q_prod_node.output) != [
+                q_proj_out,
+                k_proj_out,
+                v_proj_out,
+            ]:
+                # Either not the packed-QKV shape at all, or its three
+                # outputs aren't Q-then-K-then-V in that exact order --
+                # required here since the packed weight's own column
+                # offsets (`nq`-then-`nk`-then-`nv`, see
+                # :func:`_apply_one_decomposed_gqa_chain`) are only valid
+                # for that order; never guessed at otherwise.
+                continue
+            (
+                w_name,
+                w_transposed,
+                bias_name,
+                nq,
+                nk,
+                nv,
+                packed_split_sizes,
+                packed_flatten_reshape,
+                packed_flatten_reshape_shape,
+            ) = packed
+            wq = wk = wv = w_name
+            wq_t = wk_t = wv_t = w_transposed
+            bq = bk = bv = bias_name
+        elif (
             q_prod_node is k_prod_node
             or q_prod_node is v_prod_node
             or k_prod_node is v_prod_node
         ):
             continue  # degenerate -- shared producer, can't independently slice
-        q_info = _match_producer(q_prod_node, initializer_map)
-        k_info = _match_producer(k_prod_node, initializer_map)
-        v_info = _match_producer(v_prod_node, initializer_map)
-        if q_info is None or k_info is None or v_info is None:
-            continue
-        wq, wq_t, bq, nq = q_info
-        wk, wk_t, bk, nk = k_info
-        wv, wv_t, bv, nv = v_info
-        if wq == wk or wq == wv or wk == wv:
-            continue  # degenerate -- shared producer weight
+        else:
+            q_info = _match_producer(q_prod_node, initializer_map)
+            k_info = _match_producer(k_prod_node, initializer_map)
+            v_info = _match_producer(v_prod_node, initializer_map)
+            if q_info is None or k_info is None or v_info is None:
+                continue
+            wq, wq_t, bq, nq = q_info
+            wk, wk_t, bk, nk = k_info
+            wv, wv_t, bv, nv = v_info
+            if wq == wk or wq == wv or wk == wv:
+                continue  # degenerate -- shared producer weight
         if nq != num_heads * head_size or nk != kv_num_heads * head_size:
             continue
         if nv != kv_num_heads * v_head_size:
@@ -23407,6 +23625,9 @@ def _find_decomposed_gqa_chains(
                 consumer_node=consumer_node,
                 consumer_weight=cw_name,
                 consumer_weight_transposed=cw_transposed,
+                packed_split_sizes=packed_split_sizes,
+                packed_flatten_reshape=packed_flatten_reshape,
+                packed_flatten_reshape_shape=packed_flatten_reshape_shape,
             )
         )
     return chains
@@ -23445,6 +23666,20 @@ def _apply_one_decomposed_gqa_chain(
     target shape as this pass's own combine-back reshape) this protects
     against.
 
+    When `chain.packed_split_sizes` is set (a packed-QKV-then-`Split`
+    producer feeding all three of Q's/K's/V's own reshape/transpose
+    head-split chains -- see :class:`_DecomposedGQAChain`'s own field
+    docstring and :func:`_match_packed_qkv_split`), Q's/K's/V's "own
+    separate weight" below is the *same* single packed tensor for all
+    three, sliced exactly once by a combined column-index set (Q's own
+    kept columns, then K's shifted by the pre-pruning `nq_orig`, then V's
+    shifted by `nq_orig + nk_orig`) instead of three independent
+    :func:`_slice_producer_weight` calls, and the upstream `Split` node's
+    own split-sizes constant is rewritten to the three new (post-pruning)
+    column widths in the same Q-then-K-then-V order -- mirroring
+    :func:`_apply_one_gqa_chain`'s own `chain.packed_split_sizes` branch
+    verbatim (the fused-node analogue of this exact shape).
+
     Returns ``(producer_weight_names, consumer_weight_name,
     stale_output_names)`` on success, or ``None`` if `sparsity` rounds to no
     groups dropped for this block (a no-op, left for the caller to skip).
@@ -23458,18 +23693,41 @@ def _apply_one_decomposed_gqa_chain(
     dv = chain.v_head_size
     group_size = chain.num_heads // chain.kv_num_heads
 
+    # Pre-pruning flat widths of Q's/K's own producer weight -- needed by
+    # the packed-QKV branch below (a column-range view into, and later a
+    # combined-index slice of, one shared tensor) whenever
+    # `chain.packed_split_sizes` is set.
+    nq_orig = chain.num_heads * d
+    nk_orig = chain.kv_num_heads * d
+
     wq_init = initializer_map[chain.q_weight]
     wk_init = initializer_map[chain.k_weight]
     wv_init = initializer_map[chain.v_weight]
-    wq_kn = _to_f64(wq_init)
-    wk_kn = _to_f64(wk_init)
-    wv_kn = _to_f64(wv_init)
-    if chain.q_weight_transposed:
-        wq_kn = wq_kn.T
-    if chain.k_weight_transposed:
-        wk_kn = wk_kn.T
-    if chain.v_weight_transposed:
-        wv_kn = wv_kn.T
+    if chain.packed_split_sizes is not None:
+        # `.q_weight`, `.k_weight`, and `.v_weight` all name the *same*
+        # underlying packed tensor (`wq_init is wk_init is wv_init`), one
+        # contiguous `[K, Nq+Nk+Nv]` (or `[Nq+Nk+Nv, K]`, if
+        # `.q_weight_transposed`) storage split Q-then-K-then-V by column
+        # -- so `wq_kn`/`wk_kn`/`wv_kn` are column-range *views* into that
+        # one ``[K, N]`` array, computed from the chain's own original
+        # (before this call's own pruning) head counts, rather than three
+        # independently-stored arrays.
+        w_kn = _to_f64(wq_init)
+        if chain.q_weight_transposed:
+            w_kn = w_kn.T  # [K, Nq+Nk+Nv]
+        wq_kn = w_kn[:, :nq_orig]
+        wk_kn = w_kn[:, nq_orig : nq_orig + nk_orig]
+        wv_kn = w_kn[:, nq_orig + nk_orig :]
+    else:
+        wq_kn = _to_f64(wq_init)
+        wk_kn = _to_f64(wk_init)
+        wv_kn = _to_f64(wv_init)
+        if chain.q_weight_transposed:
+            wq_kn = wq_kn.T
+        if chain.k_weight_transposed:
+            wk_kn = wk_kn.T
+        if chain.v_weight_transposed:
+            wv_kn = wv_kn.T
 
     importance = compute_group_importance(chain, wq_kn, wk_kn, wv_kn)
     keep_groups = np.sort(np.argsort(-importance)[:keep_count])
@@ -23481,15 +23739,34 @@ def _apply_one_decomposed_gqa_chain(
     v_idx = _head_column_indices(keep_groups, dv)
     y_idx = _head_column_indices(keep_q_heads, dv)
 
-    _slice_producer_weight(wq_init, chain.q_weight_transposed, q_idx)
-    _slice_producer_weight(wk_init, chain.k_weight_transposed, k_idx)
-    _slice_producer_weight(wv_init, chain.v_weight_transposed, v_idx)
-    if chain.q_bias is not None:
-        _slice_last_axis(initializer_map[chain.q_bias], q_idx)
-    if chain.k_bias is not None:
-        _slice_last_axis(initializer_map[chain.k_bias], k_idx)
-    if chain.v_bias is not None:
-        _slice_last_axis(initializer_map[chain.v_bias], v_idx)
+    if chain.packed_split_sizes is not None:
+        # One shared tensor: a single combined-column slice (Q's own
+        # range, then K's shifted by the *original* `nq_orig`, then V's
+        # shifted by `nq_orig + nk_orig`) rather than three independent
+        # `_slice_producer_weight` calls, which would each invalidate the
+        # column offsets the other two still need to read from the same
+        # underlying storage.
+        full_idx = np.concatenate([q_idx, k_idx + nq_orig, v_idx + nq_orig + nk_orig])
+        _slice_producer_weight(wq_init, chain.q_weight_transposed, full_idx)
+        if chain.q_bias is not None:
+            _slice_last_axis(initializer_map[chain.q_bias], full_idx)
+        sizes_init = initializer_map[chain.packed_split_sizes]
+        sizes_init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.array([len(q_idx), len(k_idx), len(v_idx)], dtype=np.int64),
+                name=sizes_init.name,
+            )
+        )
+    else:
+        _slice_producer_weight(wq_init, chain.q_weight_transposed, q_idx)
+        _slice_producer_weight(wk_init, chain.k_weight_transposed, k_idx)
+        _slice_producer_weight(wv_init, chain.v_weight_transposed, v_idx)
+        if chain.q_bias is not None:
+            _slice_last_axis(initializer_map[chain.q_bias], q_idx)
+        if chain.k_bias is not None:
+            _slice_last_axis(initializer_map[chain.k_bias], k_idx)
+        if chain.v_bias is not None:
+            _slice_last_axis(initializer_map[chain.v_bias], v_idx)
 
     _slice_consumer_weight(
         initializer_map[chain.consumer_weight], chain.consumer_weight_transposed, y_idx
@@ -23530,6 +23807,22 @@ def _apply_one_decomposed_gqa_chain(
             shape_init.CopyFrom(
                 onnx.numpy_helper.from_array(dims, name=shape_init.name)
             )
+
+    if (
+        chain.packed_flatten_reshape is not None
+        and chain.packed_flatten_reshape_shape is not None
+    ):
+        # The packed producer's own pass-through `Reshape` (see
+        # :func:`_match_decomposed_packed_qkv_producer`'s own docstring) --
+        # its own real output width shrinks from `nq_orig + nk_orig +
+        # (total width - nq_orig - nk_orig)` to the new post-pruning total
+        # in lock-step with the packed weight's own combined slice above.
+        _rewrite_shape_dim(
+            chain.packed_flatten_reshape_shape,
+            (chain.packed_flatten_reshape,),
+            -1,
+            len(q_idx) + len(k_idx) + len(v_idx),
+        )
 
     _rewrite_shape_dim(chain.q_reshape_shape, (chain.q_reshape,), 2, new_num_heads)
     if chain.k_reshape_shape == chain.v_reshape_shape:
@@ -23618,6 +23911,7 @@ def _apply_one_decomposed_gqa_chain(
 
     stale: Set[str] = set()
     for maybe_node in (
+        chain.packed_flatten_reshape,
         chain.q_transpose,
         chain.q_reshape,
         chain.k_transpose,
