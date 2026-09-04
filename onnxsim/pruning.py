@@ -15790,6 +15790,159 @@ def _match_linear_attention_producer(
     return q_num_heads, kv_num_heads
 
 
+# ``com.microsoft::SparseAttention`` (block-sparse-KV attention used by
+# Phi-3-small-class long-context models exported via onnxruntime-genai --
+# schema confirmed live via
+# ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+# against this environment's installed onnxruntime 1.29.0, ``since_version``
+# 1): structurally the closest cousin of `GroupQueryAttention` itself, not
+# merely another entry in this "separate-Q/K/V" family -- `query`/`key`/
+# `value` (indices 0/1/2) are already-projected activation tensors (Q's/K's/
+# V's own separate MatMul/vanilla-Gemm producers are what gets pruned),
+# `num_heads`/`kv_num_heads` are both required attributes with `num_heads` a
+# positive multiple of `kv_num_heads` (same GQA/MQA taxonomy), and
+# `past_key`/`past_value` (indices 3/4 -- the *same* positions
+# `GroupQueryAttention`'s own occupy) are BNSH-format `(batch_size,
+# kv_num_heads, max_cache_sequence_length, head_size)` caches sliced along
+# the identical `kv_num_heads` axis by the same `keep_groups` index set --
+# so this whole op reuses :class:`_GQAChain`/:func:`_apply_one_gqa_chain`/
+# :func:`_gqa_group_importance` outright, via a seventh matcher,
+# :func:`_match_sparse_attention_producer`, exactly as `PagedAttention`/
+# `LinearAttention` already do. Genuinely different from `GroupQueryAttention`
+# in three ways:
+#
+# - `past_key`/`past_value` are **required** (`FormalParameterOption.Single`)
+#   here, not optional the way `GroupQueryAttention`'s own are -- this op has
+#   no "no cache at all" calling convention, per its own doc: "Only supports
+#   unidirectional attention with cache of past key and value in linear
+#   buffers." :func:`_past_kv_constants_are_sliceable` already handles a
+#   required-and-always-connected pair the identical way it handles
+#   GroupQueryAttention's optional one (its own per-index loop only ever
+#   *skips* an absent input; it never requires one) -- no dedicated branch
+#   needed there. This op's own `T` type constraint (confirmed via the live
+#   schema dump) is `{float, float16, bfloat16}` only -- no quantized
+#   `float8e4m3fn`/`uint8`/`int8` cache dtype at all, unlike
+#   `GroupQueryAttention`'s own `T_CACHE` -- so `scale_indices` is never
+#   passed here; a quantized-dtype cache is simply declined by
+#   :func:`_past_kv_constants_are_sliceable`'s own existing "no scale index
+#   to check against" branch, the correct outcome for a shape this op's
+#   schema doesn't even allow.
+# - `block_row_indices`/`block_col_indices` (indices 5/6, both required,
+#   `M`/int32) are the CSR representation of the block-sparse mask, shaped
+#   ``(num_layout, max_blocks + 1)``/``(num_layout, max_nnz_blocks)`` --
+#   *layout*-indexed, not head-indexed at all (per this op's own doc,
+#   `num_heads` cycles cyclically through `num_layout` layouts when
+#   `num_layout` doesn't equal `num_heads`), so neither tensor ever carries a
+#   `num_heads`-or-`kv_num_heads`-sized axis this pass could slice even if it
+#   wanted to -- both are always left completely untouched by
+#   :func:`_apply_one_gqa_chain`. What *does* need checking is the schema's
+#   own "`num_heads` is divisible by `num_layout`" invariant, which pruning
+#   `num_heads` down could silently break even though it held before pruning
+#   -- re-verified once the post-pruning head count is known (see
+#   :func:`_apply_one_gqa_chain`'s own `is_sparse_attention` branch), and the
+#   whole chain's pruning is declined (a no-op for that block, the same
+#   "sparsity rounds to no groups dropped" outcome) rather than emitting an
+#   invalid node. This requires knowing `num_layout` at all, which requires
+#   `block_row_indices` to be a *constant* -- a real block-sparse layout is a
+#   fixed structure baked at export time (unlike `GroupQueryAttention`'s own
+#   `past_key`/`past_value`, which can legitimately be genuine runtime data),
+#   so a *dynamic* `block_row_indices`/`block_col_indices` declines the whole
+#   match outright here, out of scope rather than guessed at.
+#   `total_sequence_length` (index 7, scalar)/`key_total_sequence_lengths`
+#   (index 8, `(batch_size,)`) are pure sequence-length bookkeeping, entirely
+#   head-count-independent, and `cos_cache`/`sin_cache` (indices 9/10,
+#   optional, `(max_rotary_sequence_length, head_size / 2)`) are the exact
+#   same broadcast-across-every-head shape `GroupQueryAttention`'s own
+#   `cos_cache`/`sin_cache` already are -- none of these four are ever
+#   inspected or touched here.
+# - This op has no `attention_bias`/`attn_mask`-equivalent input, and no
+#   `head_sink`, at all on its own schema (confirmed off the same live
+#   schema dump) -- so none of `GroupQueryAttention`'s own dynamic-bias
+#   safety-fix machinery (:func:`_head_bias_input_is_safe`/
+#   :func:`_slice_or_gather_head_bias`) applies here; `mask_idx` is simply
+#   `None` for this op in :func:`_apply_one_gqa_chain`, the same as
+#   `PagedAttention`/`LinearAttention`, both of which also have no such
+#   input.
+def _match_sparse_attention_producer(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> Optional[Tuple[int, int]]:
+    """If `node` is a ``com.microsoft::SparseAttention`` node this module can
+    safely act on, returns ``(num_heads, kv_num_heads)`` -- the same shape
+    every other matcher in this family returns, reusing the identical
+    :class:`_GQAChain`/:func:`_apply_one_gqa_chain`/:func:`_gqa_group_importance`
+    whole-KV-group machinery. See this section's own comment above for the
+    full empirical schema findings this matcher was built from.
+    `value_info_by_name` is accepted, unused, purely for
+    :func:`_find_separate_qkv_chains`'s own uniform ``match_producer(node,
+    initializer_map, value_info_by_name)`` call convention (this op has no
+    per-head bias/mask input at all -- see :func:`_match_paged_attention_producer`'s
+    own docstring for the identical reasoning).
+    """
+    if node.domain != _ATTENTION_DOMAIN or node.op_type != "SparseAttention":
+        return None
+    if len(node.input) < 9:
+        return None
+    if not (node.input[0] and node.input[1] and node.input[2]):
+        return None  # excludes this op's own packed-QKV calling convention
+        # (`query` alone carrying `(num_heads + 2 * kv_num_heads) * head_size`
+        # columns, `key`/`value` left empty), the same reasoning
+        # :func:`_match_gqa_producer` already gives for its own analogous
+        # exclusion.
+    if not (node.input[3] and node.input[4]):
+        return None  # past_key/past_value -- required (Single) by this op's
+        # own schema, checked here for presence the same defensive way every
+        # other required input below is; a genuinely incomplete node
+        # otherwise, not a real export.
+    if not (node.input[5] and node.input[6] and node.input[7] and node.input[8]):
+        return None  # block_row_indices/block_col_indices/
+        # total_sequence_length/key_total_sequence_lengths -- all
+        # schema-required
+
+    num_heads = kv_num_heads = None
+    for attr in node.attribute:
+        if attr.name == "num_heads":
+            num_heads = attr.i
+        elif attr.name == "kv_num_heads":
+            kv_num_heads = attr.i
+    if not num_heads or not kv_num_heads or num_heads <= 0 or kv_num_heads <= 0:
+        return None
+    if num_heads % kv_num_heads != 0:
+        return None
+
+    if not _past_kv_constants_are_sliceable(
+        node, initializer_map, (3, 4), kv_num_heads
+    ):
+        return None  # no `scale_indices` -- this op's own `T` type
+        # constraint (`{float, float16, bfloat16}`) has no quantized cache
+        # dtype at all, unlike `GroupQueryAttention`'s own `T_CACHE`
+
+    # `block_row_indices`/`block_col_indices` must both be constant (see
+    # this section's own comment above for why a dynamic one is out of
+    # scope) and agree on their own shared `num_layout` leading dimension --
+    # needed to re-verify the schema's own "num_heads divisible by
+    # num_layout" invariant once pruning's post-pruning head count is known
+    # (:func:`_apply_one_gqa_chain`).
+    row_init = initializer_map.get(node.input[5])
+    col_init = initializer_map.get(node.input[6])
+    if row_init is None or col_init is None:
+        return None  # dynamic block mask -- not a real export, see docstring
+    if (
+        not row_init.dims
+        or not col_init.dims
+        or row_init.dims[0] != col_init.dims[0]
+        or row_init.dims[0] <= 0
+    ):
+        return None
+    num_layout = row_init.dims[0]
+    if num_heads % num_layout != 0:
+        return None  # violates this op's own documented invariant already,
+        # before this pass even touches anything -- not a real export
+
+    return num_heads, kv_num_heads
+
+
 def _match_packed_qkv_split(
     split_node: onnx.NodeProto,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -17530,6 +17683,32 @@ def _find_linear_attention_chains(
     return out
 
 
+def _find_sparse_attention_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_GQAChain]:
+    """The ``com.microsoft::SparseAttention`` analogue of
+    :func:`_find_gqa_chains`/:func:`_find_paged_attention_chains` -- see
+    :func:`_find_separate_qkv_chains` (the shared body) and
+    :func:`_match_sparse_attention_producer` (what's matched and why it's
+    declined otherwise, including the full empirical schema dump this whole
+    function was built from). Passes ``allow_differing_v_head_size=False``:
+    this op's own schema gives `past_key`/`present_key` and `past_value`/
+    `present_value` the identical `(batch_size, kv_num_heads,
+    max_cache_sequence_length, head_size)` shape -- one shared `head_size`
+    symbol for both K and V, exactly `GroupQueryAttention`'s own convention,
+    not the plain ai.onnx op's/`MultiHeadAttention`'s genuinely independent
+    `v_head_size`.
+    """
+    return _find_separate_qkv_chains(
+        graph,
+        _match_sparse_attention_producer,
+        "num_heads",
+        value_info_by_name,
+        allow_differing_v_head_size=False,
+    )
+
+
 def _plain_attention_head_importance(
     chain: _AttentionChain,
     wq: np.ndarray,
@@ -17846,6 +18025,30 @@ def _apply_one_gqa_chain(
     d = chain.head_size
     dv = chain.v_head_size
     group_size = chain.num_heads // chain.kv_num_heads
+
+    # `SparseAttention`-only (see this module's own "Attention-head pruning"
+    # section comment, the `SparseAttention` bullet, and
+    # :func:`_match_sparse_attention_producer`'s own docstring): its own
+    # `block_row_indices` (index 5), already confirmed at match time to be a
+    # constant whose leading dimension is `num_layout`, must still divide
+    # the *post*-pruning query head count -- pruning `num_heads` down can
+    # break this op's own "num_heads is divisible by num_layout" invariant
+    # even though it held before pruning. Checked here, before anything is
+    # mutated, so a violation declines this block's pruning outright (the
+    # same "sparsity rounds to no groups dropped" no-op outcome
+    # `keep_count >= h` above already gives the caller) rather than emitting
+    # an invalid node.
+    is_sparse_attention = (
+        chain.node.domain == _ATTENTION_DOMAIN
+        and chain.node.op_type == "SparseAttention"
+    )
+    if is_sparse_attention:
+        row_init = initializer_map.get(chain.node.input[5])
+        if row_init is not None and row_init.dims:
+            num_layout = row_init.dims[0]
+            if num_layout and (keep_count * group_size) % num_layout != 0:
+                return None
+
     # Pre-pruning flat widths of Q's/K's own producer weight -- needed both
     # by the packed-QKV branch below (a column-range view into one shared
     # tensor) and, independently, by `chain.mha_bias`'s own combined-bias
@@ -17961,14 +18164,17 @@ def _apply_one_gqa_chain(
 
     # `GroupQueryAttention`'s past_key/past_value live at input indices 3/4,
     # the plain ai.onnx op's own at 4/5, `MultiHeadAttention`'s own at 6/7,
-    # `DecoderMaskedMultiHeadAttention`'s own at 5/6 (see `_match_gqa_producer`'s,
+    # `DecoderMaskedMultiHeadAttention`'s own at 5/6, `SparseAttention`'s own
+    # at the *same* 3/4 `GroupQueryAttention` uses (see `_match_gqa_producer`'s,
     # `_match_onnx_attention_producer`'s, `_match_multi_head_attention_producer`'s,
-    # and :func:`_match_decoder_masked_multi_head_attention_producer`'s own
-    # docstrings) -- all four already confirmed, at match time, to be either
-    # absent/dynamic (nothing to do here) or a BNSH-format constant (plain
-    # FLOAT, or -- GQA only -- quantized with a schema-conforming scale)
-    # safe to slice along axis 1 by `keep_groups` (see
-    # :func:`_past_kv_constants_are_sliceable`).
+    # :func:`_match_decoder_masked_multi_head_attention_producer`'s, and
+    # :func:`_match_sparse_attention_producer`'s own docstrings) -- all five
+    # already confirmed, at match time, to be either absent/dynamic (nothing
+    # to do here) or a BNSH-format constant (plain FLOAT, or -- GQA only --
+    # quantized with a schema-conforming scale) safe to slice along axis 1
+    # by `keep_groups` (see :func:`_past_kv_constants_are_sliceable`).
+    # `is_sparse_attention` was already computed above (needed earlier, by
+    # this function's own `num_layout` divisibility check).
     is_gqa = (
         chain.node.domain == _ATTENTION_DOMAIN
         and chain.node.op_type == "GroupQueryAttention"
@@ -18017,7 +18223,7 @@ def _apply_one_gqa_chain(
     )
     past_kv_indices = (
         (3, 4)
-        if is_gqa
+        if is_gqa or is_sparse_attention
         else (6, 7)
         if is_mha
         else (5, 6)
@@ -18130,10 +18336,13 @@ def _apply_one_gqa_chain(
     # at all (confirmed off the same live schema dump this whole family was
     # built from), so this whole block is skipped for it outright --
     # `chain.node.input[3]` (`key_cache` for `PagedAttention`, `past_state`
-    # for `LinearAttention`) must never be mistaken for one. `LinearAttention`
-    # has no `attention_bias`/`attn_mask`-equivalent input on its own schema
-    # either (confirmed off the same live schema dump), so it is excluded
-    # here the same way `PagedAttention` is.
+    # for `LinearAttention`, `past_key` for `SparseAttention`) must never be
+    # mistaken for one. `LinearAttention` has no `attention_bias`/`attn_mask`-
+    # equivalent input on its own schema either (confirmed off the same live
+    # schema dump), so it is excluded here the same way `PagedAttention` is.
+    # Neither does `SparseAttention` (confirmed off the same live schema
+    # dump -- see :func:`_match_sparse_attention_producer`'s own docstring),
+    # excluded here the identical way.
     mask_idx = (
         10
         if is_gqa
@@ -18144,7 +18353,7 @@ def _apply_one_gqa_chain(
         else 6
         if is_packed_mha
         else None
-        if is_paged or is_linear_attention
+        if is_paged or is_linear_attention or is_sparse_attention
         else 3
     )
     if mask_idx is not None:
@@ -18337,15 +18546,18 @@ def apply_attention_head_pruning(
     """Removes whole attention heads -- or, for grouped-query attention,
     whole KV groups -- from every matched ``com.microsoft::Attention``,
     ``com.microsoft::GroupQueryAttention``, ``com.microsoft::MultiHeadAttention``,
-    ``com.microsoft::PagedAttention``, or plain ``ai.onnx::Attention`` node
-    (the fused self-attention blocks onnxsim's own ``fuse_attention``/``fuse_gqa``
+    ``com.microsoft::PagedAttention``, ``com.microsoft::SparseAttention``, or
+    plain ``ai.onnx::Attention``/``LinearAttention`` node (the fused
+    self-attention blocks onnxsim's own ``fuse_attention``/``fuse_gqa``
     optimizer passes produce, `MultiHeadAttention`, which those passes
     deliberately never emit but ONNX Runtime's own transformer graph
     optimizer routinely does for BERT/ViT/CLIP/T5/Whisper-style exports,
     `PagedAttention`, a block-based-KV-cache continuous-batching op for LLM
-    serving, and the standard ONNX op the contrib ops are converging towards
-    -- see this module's own "Attention-head pruning" section comment for
-    the real schema each was confirmed against and how)
+    serving, `SparseAttention`, a block-sparse-KV attention op for
+    Phi-3-small-class long-context models, and the standard ONNX ops the
+    contrib ops are converging towards -- see this module's own
+    "Attention-head pruning" section comment for the real schema each was
+    confirmed against and how)
     whose output feeds, optionally through a single shape-preserving
     ``Reshape``, exactly one downstream MatMul/vanilla-Gemm's reduction
     dimension (the output projection) -- the attention analogue of
@@ -18456,6 +18668,7 @@ def apply_attention_head_pruning(
         *_find_decoder_masked_mha_chains(graph, value_info_by_name),
         *_find_paged_attention_chains(graph, value_info_by_name),
         *_find_linear_attention_chains(graph, value_info_by_name),
+        *_find_sparse_attention_chains(graph, value_info_by_name),
     ]
     if chains:
         _apply_attention_chains(
@@ -18612,6 +18825,7 @@ def apply_attention_head_wanda_pruning(
         *_find_decoder_masked_mha_chains(graph, value_info_by_name),
         *_find_paged_attention_chains(graph, value_info_by_name),
         *_find_linear_attention_chains(graph, value_info_by_name),
+        *_find_sparse_attention_chains(graph, value_info_by_name),
     ]
     if not chains:
         return out
@@ -28422,6 +28636,7 @@ def _attention_not_eligible(
                     "DecoderMaskedMultiHeadAttention",
                     "PackedAttention",
                     "PackedMultiHeadAttention",
+                    "SparseAttention",
                 )
                 and node.domain == _ATTENTION_DOMAIN
             )
@@ -28497,6 +28712,14 @@ def _analyze_attention_chains(
                 family = "attention_mha_head"
             elif chain.node.op_type == "PagedAttention":
                 family = "attention_paged_group"
+            elif chain.node.op_type == "SparseAttention":
+                # Its own dedicated family string, the same reasoning
+                # `attention_paged_group` gets for `PagedAttention` -- a
+                # genuine KV-group-granularity block-sparse op, distinguishable
+                # in a sensitivity report from plain `GroupQueryAttention`
+                # (see this module's own "Attention-head pruning" section
+                # comment, the `SparseAttention` bullet).
+                family = "attention_sparse_group"
             elif chain.node.op_type == "LinearAttention" and chain.node.domain == "":
                 # Plain ai.onnx domain, unlike every other op this shared
                 # machinery reports here -- its own dedicated family string
@@ -28633,6 +28856,7 @@ def _analyze_attention_head_pruning(
         *_find_decoder_masked_mha_chains(graph, value_info_by_name),
         *_find_paged_attention_chains(graph, value_info_by_name),
         *_find_linear_attention_chains(graph, value_info_by_name),
+        *_find_sparse_attention_chains(graph, value_info_by_name),
     ]
     layers = _analyze_attention_chains(
         graph,
@@ -28694,6 +28918,7 @@ def _analyze_attention_head_wanda_pruning(
         *_find_decoder_masked_mha_chains(graph, value_info_by_name),
         *_find_paged_attention_chains(graph, value_info_by_name),
         *_find_linear_attention_chains(graph, value_info_by_name),
+        *_find_sparse_attention_chains(graph, value_info_by_name),
     ]
     if not chains:
         return PruningSensitivityReport(
