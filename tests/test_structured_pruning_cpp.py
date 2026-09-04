@@ -15,6 +15,8 @@ plus a couple of tests confirming unmatched topologies are left untouched
 (never guessed at).
 """
 
+import os
+
 import numpy as np
 import onnx
 import onnx.helper
@@ -46,6 +48,25 @@ def _f32(array, name):
 
 
 def _run(model, feeds):
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    return sess.run(None, feeds)
+
+
+def _run27(model, feeds):
+    # `CausalConvWithState` is plain ai.onnx opset 27, which this
+    # environment's onnxruntime treats as "under development"
+    # (`ValidateOpsetForDomain` otherwise refuses to even load the graph --
+    # see onnxsim/pruning.py's own "Conv/pooling/Resize/Pad pass-through"
+    # section comment and tests/test_pruning.py's own identical `_run27`
+    # helper for the empirical finding). Setting this env var only relaxes
+    # that load-time opset-vintage check; it does not stub out or change the
+    # op's own real CPU kernel. Scoped to just this helper (not a
+    # module-level mutation) since only CausalConvWithState's own tests ever
+    # need it -- every other test in this file keeps using plain `_run`
+    # against a released opset unaffected either way.
+    os.environ["ALLOW_RELEASED_ONNX_OPSET_ONLY"] = "0"
     sess = ort.InferenceSession(
         model.SerializeToString(), providers=["CPUExecutionProvider"]
     )
@@ -3206,6 +3227,358 @@ def test_cpp_structured_pruning_conv_residual_pad_pass_through_hop_matches_oracl
     (y,) = _run(pruned, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+# --- Conv chain: InstanceNormalization pass-through hop -----------------------
+#
+# `Conv -> InstanceNormalization -> Conv`: mirrors test_pruning.py's own
+# `_instance_norm_conv_pair_model` and its instance-norm-pass-through test
+# coverage. Unlike GroupNormalization above, InstanceNormalization carries no
+# `num_groups`/uniform-per-block constraint at all -- its own mean/variance
+# are computed per instance *per channel*, never pooled across a group, so an
+# arbitrary channel subset may be kept/dropped with no group-boundary-drift
+# risk to guard against, and `scale`/`B` are held to a *strictly* rank-1 bar
+# (not GroupNorm's own looser `FlatChannelConst`) since they are carried on a
+# plain ConvPassThrough, whose own slicing always slices axis 0 -- see
+# MatchInstanceNormPassThrough's own comment in structured_pruning_entry.cpp.
+
+
+def _instance_norm_conv_pair_model(w1, w2, in_scale, in_bias, b1=None, spatial=10):
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        _f32(in_scale, "INScale"),
+        _f32(in_bias, "INBias"),
+    ]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    out_spatial = spatial - 4  # two valid (no-pad) 3x3 convs
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          n = InstanceNormalization<epsilon=1e-05>(h, INScale, INBias)
+          Y = Conv<kernel_shape=[3,3]>(n, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_cpp_structured_pruning_instance_norm_pass_through_matches_oracle():
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(240)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    in_scale = rng.standard_normal((C1,)).astype(np.float32)
+    in_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _instance_norm_conv_pair_model(w1, w2, in_scale, in_bias, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    assert inits["W1"].shape[0] == C1 // 2
+    assert inits["INScale"].shape == inits["INBias"].shape == (C1 // 2,)
+    # No `group` attribute is ever added to a non-Conv hop node.
+    in_node = next(n for n in pruned.graph.node if n.op_type == "InstanceNormalization")
+    assert [a.name for a in in_node.attribute] == ["epsilon"]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _instance_norm_conv_pair_model(
+        w1[keep], w2[:, keep], in_scale[keep], in_bias[keep], b1=b1[keep]
+    )
+
+    rng_x = np.random.default_rng(241)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_instance_norm_tied_scale_bias_declines():
+    # `scale`/`B` naming the *same* tensor -- double-slicing it would corrupt
+    # it, so the whole chain is declined outright, mirroring
+    # MatchInstanceNormPassThrough's own tied-name bar.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(242)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    tied = rng.standard_normal((C1,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          n = InstanceNormalization<epsilon=1e-05>(h, Tied, Tied)
+          Y = Conv<kernel_shape=[3,3]>(n, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(tied, "Tied")],
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["Tied"], tied)
+
+
+def test_cpp_structured_pruning_instance_norm_non_1d_scale_declines():
+    # A `scale` shaped `[1, C1]` -- FlatChannelConst's own looser
+    # "prod(dims) == dims[-1]" bar would admit this (a real GroupNorm hop
+    # reuses that check), but MatchInstanceNormPassThrough deliberately holds
+    # InstanceNorm's own `scale`/`B` to a *strictly* rank-1 bar instead (see
+    # that matcher's own comment for why: this hop's `scale`/`B` are carried
+    # on a plain ConvPassThrough, whose own slicing always slices axis 0,
+    # which is only ever the right axis when rank == 1). Declined outright
+    # rather than mis-sliced.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(243)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    in_scale_2d = rng.standard_normal((1, C1)).astype(np.float32)
+    in_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          n = InstanceNormalization<epsilon=1e-05>(h, INScale, INBias)
+          Y = Conv<kernel_shape=[3,3]>(n, W2)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(w2, "W2"),
+            _f32(in_scale_2d, "INScale"),
+            _f32(in_bias, "INBias"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["INScale"], in_scale_2d)
+    np.testing.assert_array_equal(inits["INBias"], in_bias)
+
+
+def test_cpp_structured_pruning_conv_residual_instance_norm_pass_through_matches_oracle():
+    # An InstanceNormalization hop crossed by the *backward* walk
+    # (WalkConvProducerBackward/MatchInstanceNormPassThroughSelf), not just
+    # the forward one every test above already covers -- exercises the
+    # residual-chain insertion point, mirroring
+    # test_cpp_structured_pruning_conv_residual_prelu_pass_through_hop_matches_oracle's
+    # own shape.
+    Cin, C, Cout = 3, 16, 8
+    rng = np.random.default_rng(244)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    in_scale = rng.standard_normal((C,)).astype(np.float32)
+    in_bias = rng.standard_normal((C,)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+
+    def _mk(w_f, in_scale, in_bias, w_s, w_out):
+        return _model(
+            f"""
+            g (float[N,{Cin},10,10] X) => (float[N,{Cout},6,6] Y)
+            {{
+              f0 = Conv<kernel_shape=[3,3]>(X, WF)
+              f = InstanceNormalization<epsilon=1e-05>(f0, INScale, INBias)
+              s = Conv<kernel_shape=[3,3]>(X, WS)
+              addr = Add(f, s)
+              r = Relu(addr)
+              Y = Conv<kernel_shape=[3,3]>(r, WOUT)
+            }}
+            """,
+            initializer=[
+                _f32(w_f, "WF"),
+                _f32(in_scale, "INScale"),
+                _f32(in_bias, "INBias"),
+                _f32(w_s, "WS"),
+                _f32(w_out, "WOUT"),
+            ],
+        )
+
+    model = _mk(w_f, in_scale, in_bias, w_s, w_out)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    assert inits["WF"].shape[0] == C // 2
+    assert inits["INScale"].shape == inits["INBias"].shape == (C // 2,)
+    assert inits["WS"].shape[0] == C // 2
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    oracle = _mk(w_f[keep], in_scale[keep], in_bias[keep], w_s[keep], w_out[:, keep])
+
+    rng_x = np.random.default_rng(245)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+# --- CausalConvWithState pass-through (plain ai.onnx, opset 27) --------------
+#
+# `Conv -> CausalConvWithState(depthwise) -> Conv`: mirrors test_pruning.py's
+# own `_causal_conv_model` and its causal-conv-with-state-pass-through test
+# coverage. This op has a real CPU kernel in this environment's onnxruntime,
+# so every test below runs the real fused op end to end (via `_run27`, since
+# opset 27 is still "under development" per onnxruntime's own load-time
+# guard) rather than a decomposed-proxy fallback. Unlike a depthwise Conv,
+# this op also carries an optional `past_state` (input 3) -- sliceable only
+# when it's itself a constant of the documented rank-3 `(*, n_channels, *)`
+# shape (axis 1 == n_channels), see MatchCausalConvWithStatePassThrough's own
+# comment in structured_pruning_entry.cpp -- and a second output
+# (`present_state`) that is a runtime output, never a tensor this pass
+# slices.
+
+
+def _causal_conv_model(C=8, K=6, L=5, kernel=3, seed=0, past_state=None, bias=True):
+    # Conv(K -> C, kernel=3) -> CausalConvWithState(C, depthwise, kernel) ->
+    # Conv(C -> Out, kernel=1). `past_state`, if given, is a constant
+    # ``(1, C, kernel - 1)`` array wired as the op's own 4th input; ``None``
+    # leaves it unconnected (needs no slicing at all).
+    rng = np.random.default_rng(seed)
+    w0 = rng.standard_normal((C, K, 3)).astype(np.float32) * 0.5
+    b0 = rng.standard_normal((C,)).astype(np.float32) * 0.1
+    w1 = rng.standard_normal((C, 1, kernel)).astype(np.float32) * 0.5
+    b1 = rng.standard_normal((C,)).astype(np.float32) * 0.1
+    out = 5
+    w2 = rng.standard_normal((out, C, 1)).astype(np.float32) * 0.5
+    b2 = rng.standard_normal((out,)).astype(np.float32) * 0.1
+
+    initializer = [
+        _f32(w0, "W0"),
+        _f32(b0, "B0"),
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        _f32(b2, "B2"),
+    ]
+    cc_inputs = "h0, W1"
+    if bias:
+        initializer.append(_f32(b1, "B1"))
+        cc_inputs += ", B1"
+    else:
+        cc_inputs += ", "
+    if past_state is not None:
+        initializer.append(_f32(np.asarray(past_state), "PastState"))
+        cc_inputs += ", PastState"
+
+    body = f"""
+        g (float[1,{K},{L}] X) => (float[1,{out},{L}] Y)
+        {{
+          h0 = Conv<kernel_shape=[3], pads=[1,1]>(X, W0, B0)
+          h1, ps = CausalConvWithState<activation="none">({cc_inputs})
+          Y = Conv<kernel_shape=[1]>(h1, W2, B2)
+        }}
+        """
+    model = _model(body, opset=27)
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        C=C,
+        K=K,
+        L=L,
+        kernel=kernel,
+        out=out,
+        w0=w0,
+        b0=b0,
+        w1=w1,
+        b1=b1 if bias else None,
+        w2=w2,
+        b2=b2,
+    )
+
+
+def _causal_conv_node(model):
+    return next(n for n in model.graph.node if n.op_type == "CausalConvWithState")
+
+
+def test_cpp_structured_pruning_causal_conv_with_state_pass_through_matches_oracle():
+    model, cfg = _causal_conv_model(C=8, K=6, L=5, kernel=3, seed=250)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    # No `group` attribute is ever added to a non-Conv hop node.
+    node = _causal_conv_node(pruned)
+    assert [a.name for a in node.attribute] == ["activation"]
+
+    dims = {t.name: t.dims[0] for t in pruned.graph.initializer}
+    assert dims["W0"] == 4  # C halved
+    assert dims["W1"] == 4  # depthwise weight follows the same keep set
+    w2_in_channels = next(t for t in pruned.graph.initializer if t.name == "W2").dims[1]
+    assert w2_in_channels == 4  # consumer's in_channels axis
+
+    imp = np.linalg.norm(cfg["w0"].reshape(cfg["C"], -1), axis=1)
+    keep = np.sort(np.argsort(-imp)[: cfg["C"] // 2])
+
+    rng = np.random.default_rng(251)
+    x = rng.standard_normal((1, cfg["K"], cfg["L"])).astype(np.float32)
+    y_pruned = _run27(pruned, {"X": x})[0]
+
+    oracle, _ = _causal_conv_model(
+        C=len(keep), K=cfg["K"], L=cfg["L"], kernel=cfg["kernel"]
+    )
+    # Every tensor built here overrides the oracle model's own freshly
+    # (differently) randomized placeholder of the same name -- only the
+    # *shape* of that placeholder construction is actually used.
+    oracle_inits = {
+        "W0": cfg["w0"][keep],
+        "B0": cfg["b0"][keep],
+        "W1": cfg["w1"][keep],
+        "B1": cfg["b1"][keep],
+        "W2": cfg["w2"][:, keep, :],
+        "B2": cfg["b2"],  # Consumer's own out_channels axis is untouched.
+    }
+    for init in oracle.graph.initializer:
+        init.CopyFrom(onnx.numpy_helper.from_array(oracle_inits[init.name], init.name))
+    y_oracle = _run27(oracle, {"X": x})[0]
+    np.testing.assert_array_equal(y_pruned, y_oracle)
+
+
+def test_cpp_structured_pruning_causal_conv_with_state_constant_past_state_sliced():
+    C, kernel = 8, 3
+    rng = np.random.default_rng(252)
+    past = rng.standard_normal((1, C, kernel - 1)).astype(np.float32)
+    model, cfg = _causal_conv_model(
+        C=C, K=6, L=5, kernel=kernel, seed=252, past_state=past
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    imp = np.linalg.norm(cfg["w0"].reshape(C, -1), axis=1)
+    keep = np.sort(np.argsort(-imp)[: C // 2])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["PastState"], past[:, keep, :])
+
+
+def test_cpp_structured_pruning_causal_conv_with_state_wrong_shape_past_state_declines():
+    # A constant `past_state` of any shape *other* than the documented
+    # rank-3 `(*, n_channels, *)` -- here, axis 1 deliberately doesn't equal
+    # `n_channels` -- declines the whole hop outright, never guessed at,
+    # mirroring MatchCausalConvWithStatePassThrough's own bar.
+    C, kernel = 8, 3
+    rng = np.random.default_rng(253)
+    wrong_past = rng.standard_normal((1, C + 1, kernel - 1)).astype(np.float32)
+    model, cfg = _causal_conv_model(
+        C=C, K=6, L=5, kernel=kernel, seed=253, past_state=wrong_past
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W0"], cfg["w0"])
+    np.testing.assert_array_equal(inits["W1"], cfg["w1"])
+    np.testing.assert_array_equal(inits["W2"], cfg["w2"])
+    np.testing.assert_array_equal(inits["PastState"], wrong_past)
 
 
 # --- Concat-merged (skip-connection) chains ----------------------------------

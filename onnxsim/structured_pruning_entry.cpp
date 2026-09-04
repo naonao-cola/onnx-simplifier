@@ -571,6 +571,19 @@ struct ConvPassThrough {
   onnx::NodeProto* node;
   std::string weight;
   std::optional<std::string> bias;
+  // Set only for a `CausalConvWithState` hop whose own `past_state` input
+  // (index 3) is itself a *constant* initializer -- a degenerate,
+  // unlikely-in-practice shape no real export produces (every real export
+  // feeds it as an ordinary graph input/runtime KV-cache-style buffer,
+  // needing no slicing at all -- the caller's own runtime data), but not
+  // one MatchCausalConvWithStatePassThrough assumes away: when set,
+  // ApplyChains/ApplyConcatChains slice its own channel axis (axis 1) by
+  // the same `keep` index set, mirroring GroupQueryAttention's own
+  // "slice if constant, leave alone if dynamic" treatment for its
+  // analogous `past_key`/`past_value`. Always nullopt for a depthwise Conv,
+  // InstanceNormalization, or PRelu hop. Mirrors pruning.py's own
+  // `_ConvPassThrough.past_state`.
+  std::optional<std::string> past_state;
 };
 
 struct ChainOp {
@@ -1011,9 +1024,17 @@ std::optional<ConvProducerMatch> MatchConvProducer(const onnx::NodeProto& node,
     return std::nullopt;
   }
   auto it = init_map.find(node.input(1));
+  // Any spatial rank n >= 1 (weight rank >= 3: one output-channel axis, one
+  // input-channel axis, at least one spatial axis) -- mirrors pruning.py's
+  // own _match_conv_producer exactly (see that function's own docstring:
+  // "1-D, 2-D, or 3-D alike"). Widened from this port's original
+  // exactly-rank-4 (2-D-only) bound so a 1-D Conv -- the only shape a real
+  // `CausalConvWithState` pipeline's own bracketing producer/consumer Conv
+  // can ever be, since that op's own I/O is always rank-3 -- can match here
+  // too; every existing rank-4 caller is unaffected, this only admits more.
   if (it == init_map.end() ||
       it->second->data_type() != onnx::TensorProto::FLOAT ||
-      it->second->dims_size() != 4) {
+      it->second->dims_size() < 3) {
     return std::nullopt;
   }
   const onnx::TensorProto* w = it->second;
@@ -1049,9 +1070,11 @@ std::optional<ConvConsumerMatch> MatchConvConsumer(const onnx::NodeProto& node,
     return std::nullopt;
   }
   auto it = init_map.find(node.input(1));
+  // See MatchConvProducer's own comment: any spatial rank n >= 1, mirroring
+  // pruning.py's own _match_conv_consumer.
   if (it == init_map.end() ||
       it->second->data_type() != onnx::TensorProto::FLOAT ||
-      it->second->dims_size() != 4) {
+      it->second->dims_size() < 3) {
     return std::nullopt;
   }
   const onnx::TensorProto* w = it->second;
@@ -1071,6 +1094,13 @@ std::optional<ConvConsumerMatch> MatchConvConsumer(const onnx::NodeProto& node,
 struct DepthwiseMatch {
   std::string weight;
   std::optional<std::string> bias;
+  // Set only by MatchCausalConvWithStatePassThrough, for a hop whose own
+  // `past_state` input (index 3) is itself a constant initializer of the
+  // documented rank-3 `(*, n_channels, *)` shape -- see that matcher's own
+  // comment. Always nullopt for a real depthwise Conv match
+  // (MatchDepthwiseConvPassThrough/MatchConvPassThroughSelf never set it --
+  // a plain Conv has no such fourth input at all).
+  std::optional<std::string> past_state;
 };
 
 std::optional<DepthwiseMatch> MatchDepthwiseConvPassThrough(
@@ -1083,7 +1113,9 @@ std::optional<DepthwiseMatch> MatchDepthwiseConvPassThrough(
     return std::nullopt;
   }
   const onnx::TensorProto* w = it->second;
-  if (w->data_type() != onnx::TensorProto::FLOAT || w->dims_size() != 4 ||
+  // Any spatial rank n >= 1 -- see MatchConvProducer's own comment; mirrors
+  // pruning.py's own _match_depthwise_conv_pass_through.
+  if (w->data_type() != onnx::TensorProto::FLOAT || w->dims_size() < 3 ||
       w->dims(0) != n_channels || w->dims(1) != 1 ||
       ConvGroupAttr(node) != n_channels) {
     return std::nullopt;
@@ -1097,7 +1129,75 @@ std::optional<DepthwiseMatch> MatchDepthwiseConvPassThrough(
       return std::nullopt;
     }
   }
-  return DepthwiseMatch{node.input(1), bias};
+  return DepthwiseMatch{node.input(1), bias, std::nullopt};
+}
+
+// The Conv-chain `CausalConvWithState` pass-through matcher used by
+// WalkToConvConsumer, mirroring pruning.py's own
+// _match_causal_conv_with_state_pass_through: if `node` is a plain
+// `ai.onnx::CausalConvWithState` node (opset 27+, domain "") whose constant
+// `weight` (input 1) is exactly the depthwise-Conv shape
+// MatchDepthwiseConvPassThrough already recognizes (`[n_channels, 1, k]`),
+// returns a DepthwiseMatch identical in shape to that matcher's own result
+// -- this op mixes no channels at all, identically to a depthwise Conv,
+// except it carries two extra per-channel-shaped operands a depthwise Conv
+// doesn't: an optional `bias` (input 2, identical treatment to a depthwise
+// Conv's own) and an optional `past_state` carry tensor (input 3), set on
+// the returned DepthwiseMatch only when it is itself a constant of the
+// documented rank-3 `(*, n_channels, *)` shape (axis 1 == n_channels) --
+// left nullopt (needing no slicing at all) when dynamic/absent, and this
+// whole match declined (nullopt) when it's a constant of any *other* shape
+// (never guessed at). This op's own second output, `present_state`, is
+// never a tensor this function slices (a runtime *output*, not a weight);
+// the caller (WalkToConvConsumer) is responsible for treating it as stale
+// alongside `output` -- see this file's own `stale_value_info` handling in
+// ApplyChains/ApplyConcatChains, which iterates every one of a hop node's
+// outputs, not just output(0), for exactly this reason.
+std::optional<DepthwiseMatch> MatchCausalConvWithStatePassThrough(
+    const onnx::NodeProto& node, const InitMap& init_map, int64_t n_channels) {
+  if (node.op_type() != "CausalConvWithState" || node.domain() != "") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 2) {
+    return std::nullopt;
+  }
+  const std::string& w_name = node.input(1);
+  auto wit = init_map.find(w_name);
+  if (wit == init_map.end() ||
+      wit->second->data_type() != onnx::TensorProto::FLOAT ||
+      wit->second->dims_size() != 3 || wit->second->dims(0) != n_channels ||
+      wit->second->dims(1) != 1) {
+    return std::nullopt;
+  }
+  std::optional<std::string> bias;
+  if (node.input_size() > 2 && !node.input(2).empty()) {
+    bias = node.input(2);
+    auto bit = init_map.find(*bias);
+    if (bit == init_map.end() ||
+        bit->second->data_type() != onnx::TensorProto::FLOAT) {
+      return std::nullopt;  // Non-constant bias -- can't safely prune it.
+    }
+  }
+  std::optional<std::string> past_state;
+  if (node.input_size() > 3 && !node.input(3).empty()) {
+    auto pit = init_map.find(node.input(3));
+    if (pit != init_map.end()) {
+      // A constant past_state -- degenerate, but if present it must be the
+      // documented rank-3 (batch, channels, k-1) shape with axis 1 ==
+      // n_channels to be safely sliceable; anything else declines the whole
+      // hop rather than guessing which axis (if any) is really the channel
+      // one.
+      const onnx::TensorProto* ps = pit->second;
+      if (ps->data_type() != onnx::TensorProto::FLOAT || ps->dims_size() != 3 ||
+          ps->dims(1) != n_channels) {
+        return std::nullopt;
+      }
+      past_state = node.input(3);
+      // else: dynamic (an ordinary graph input/runtime buffer) -- the
+      // caller's own runtime data, needs no slicing, not tracked here.
+    }
+  }
+  return DepthwiseMatch{w_name, bias, past_state};
 }
 
 // True if `name` names a constant FLOAT initializer shaped like a flat
@@ -1180,6 +1280,62 @@ std::optional<GroupNormMatch> MatchGroupNormPassThrough(
     return std::nullopt;
   }
   return GroupNormMatch{scale_name, bias_name, num_groups};
+}
+
+struct InstanceNormMatch {
+  std::string scale;
+  std::string bias;
+};
+
+// The Conv-chain InstanceNormalization pass-through matcher used by
+// WalkToConvConsumer, mirroring pruning.py's own
+// _match_instance_norm_pass_through: if `node` is a plain (default-domain)
+// `InstanceNormalization` node (opset 6+) with constant, exactly-1-D
+// (`dims == [n_channels]`) `scale` (input 1) and `B` (input 2) -- both
+// required by the op's own schema -- returns `{scale_name, bias_name}`.
+// Declines (nullopt) on a missing/non-constant/wrongly-shaped `scale`/`B`,
+// or `scale`/`B` naming the same tensor (double-slicing it would corrupt
+// it, the same tied-name bar MatchGroupNormPassThrough already applies) --
+// none of these is guessed at.
+//
+// Unlike MatchGroupNormPassThrough's own FlatChannelConst bar
+// (`prod(dims) == dims[-1]`, deliberately loose enough to admit a
+// broadcastable-but-not-strictly-1-D shape like `[1, 1, C]`), this requires
+// `scale`/`B` to be *strictly* rank-1: the returned names are carried on a
+// plain ConvPassThrough (this hop's own `scale`/`B` playing that struct's
+// `weight`/`bias` role -- no dedicated struct needed here the way
+// GroupNormPassThrough needed one), whose own slicing (ApplyChains's own
+// SliceProducerWeight(..., is_conv=true) call) always slices axis 0 --
+// correct only when axis 0 already *is* the one-and-only axis, i.e.
+// strictly rank-1. A looser broadcastable shape would silently slice the
+// wrong axis instead of being declined, so this bar is deliberately
+// narrower than FlatChannelConst's -- not a missed generalization: the ONNX
+// schema itself only ever documents `scale`/`B` as rank-1 `[C]` for this
+// op (no opset ever gave it GroupNorm's own per-*group* alternate shape),
+// so nothing real is excluded by holding to that.
+std::optional<InstanceNormMatch> MatchInstanceNormPassThrough(
+    const onnx::NodeProto& node, const InitMap& init_map, int64_t n_channels) {
+  if (node.op_type() != "InstanceNormalization" || node.domain() != "" ||
+      node.input_size() != 3 || node.input(1).empty() ||
+      node.input(2).empty() || node.output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& scale_name = node.input(1);
+  const std::string& bias_name = node.input(2);
+  if (scale_name == bias_name) {
+    return std::nullopt;  // Tied scale/B -- double-slicing would corrupt it.
+  }
+  auto sit = init_map.find(scale_name);
+  auto bit = init_map.find(bias_name);
+  if (sit == init_map.end() || bit == init_map.end() ||
+      sit->second->data_type() != onnx::TensorProto::FLOAT ||
+      bit->second->data_type() != onnx::TensorProto::FLOAT ||
+      sit->second->dims_size() != 1 || bit->second->dims_size() != 1 ||
+      sit->second->dims(0) != n_channels ||
+      bit->second->dims(0) != n_channels) {
+    return std::nullopt;
+  }
+  return InstanceNormMatch{scale_name, bias_name};
 }
 
 // True iff `node` (already confirmed by the caller to be a plain
@@ -1464,6 +1620,58 @@ WalkToConvConsumer(const std::string& start, const InitMap& init_map,
       break;
     }
 
+    if (nxt->op_type() == "CausalConvWithState" && nxt->domain() == "" &&
+        nxt->input_size() > 0 && nxt->input(0) == cur) {
+      // This op is never a consumer in its own right (unlike `Conv` above,
+      // which falls through to MatchConvConsumer on a depthwise-match
+      // miss), so a failed match here simply ends the walk -- mirrors
+      // pruning.py's own identical short-circuit in _walk_to_conv_consumer.
+      // See MatchCausalConvWithStatePassThrough's own comment for the full
+      // empirical schema findings, including why this hop is recognized
+      // only by this forward walk (WalkConvProducerBackward's own per-hop
+      // loop unconditionally declines any node with output_size() != 1, and
+      // this op always has two outputs).
+      auto cc = MatchCausalConvWithStatePassThrough(*nxt, init_map, n_channels);
+      if (cc) {
+        const std::string& out2 = nxt->output(0);
+        if (ConsumerCount(consumers_of, out2) != 1 ||
+            graph_outputs.count(out2)) {
+          break;
+        }
+        pass_through.push_back(
+            ConvPassThrough{nxt, cc->weight, cc->bias, cc->past_state});
+        cur = out2;
+        continue;
+      }
+      break;
+    }
+
+    if (nxt->op_type() == "InstanceNormalization" && nxt->domain() == "" &&
+        nxt->input_size() > 0 && nxt->input(0) == cur) {
+      // Recognized unconditionally (no `recognize_*` gate, and any number
+      // of times per chain, unlike the GroupNorm hop below) --
+      // InstanceNorm's per-channel-only statistics carry no
+      // group-boundary-drift risk to guard against, so this hop is exactly
+      // as unrestricted as a depthwise Conv hop above, reusing the same
+      // ConvPassThrough struct (its own `scale`/`B` playing that struct's
+      // `weight`/`bias` role) rather than needing a dedicated one. Like
+      // CausalConvWithState above, this op is never a consumer in its own
+      // right, so a failed match here simply ends the walk.
+      auto in_match = MatchInstanceNormPassThrough(*nxt, init_map, n_channels);
+      if (in_match) {
+        const std::string& out2 = nxt->output(0);
+        if (ConsumerCount(consumers_of, out2) != 1 ||
+            graph_outputs.count(out2)) {
+          break;
+        }
+        pass_through.push_back(
+            ConvPassThrough{nxt, in_match->scale, in_match->bias});
+        cur = out2;
+        continue;
+      }
+      break;
+    }
+
     if (recognize_group_norm && !group_norm &&
         nxt->op_type() == "GroupNormalization" && nxt->domain() == "" &&
         nxt->input_size() > 0 && nxt->input(0) == cur) {
@@ -1666,9 +1874,10 @@ std::optional<DepthwiseMatch> MatchConvPassThroughSelf(
     return std::nullopt;
   }
   auto it = init_map.find(node.input(1));
+  // Any spatial rank n >= 1 -- see MatchConvProducer's own comment.
   if (it == init_map.end() ||
       it->second->data_type() != onnx::TensorProto::FLOAT ||
-      it->second->dims_size() != 4) {
+      it->second->dims_size() < 3) {
     return std::nullopt;
   }
   return MatchDepthwiseConvPassThrough(node, init_map, it->second->dims(0));
@@ -1706,6 +1915,36 @@ std::optional<PreluMatch> MatchPreluPassThroughSelf(const onnx::NodeProto& node,
   const int64_t expected =
       it->second->dims_size() > 0 ? it->second->dims(0) : 1;
   return MatchPreluPassThrough(node, init_map, expected);
+}
+
+// The backward-walk (WalkConvProducerBackward) counterpart of
+// MatchInstanceNormPassThrough, mirroring pruning.py's own
+// _match_instance_norm_pass_through_self and MatchConvPassThroughSelf's own
+// identical trick: the backward walk doesn't know its group's shared
+// channel count yet at the point it first crosses this hop, so this checks
+// the node's own `scale` is self-consistently rank-1 by calling
+// MatchInstanceNormPassThrough with `scale`'s own `dims(0)` as the
+// "expected" n_channels -- trivially satisfying that one check and leaving
+// every other one (constant B, matching length, non-tied names) intact.
+// FindConvResidualChains/ResolveConvResidualGroupForConcat re-validate
+// every such hop against the group's real, established channel count once
+// resolved (the same generic pass_through re-validation a depthwise hop
+// already gets, keyed only on `hop.weight`'s own `dims(0)` -- `hop.weight`
+// here holds this op's own `scale` name, so that same generic check already
+// re-validates this hop correctly, with no dedicated InstanceNorm-specific
+// re-check needed).
+std::optional<InstanceNormMatch> MatchInstanceNormPassThroughSelf(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.op_type() != "InstanceNormalization" || node.input_size() < 2) {
+    return std::nullopt;
+  }
+  auto sit = init_map.find(node.input(1));
+  if (sit == init_map.end() ||
+      sit->second->data_type() != onnx::TensorProto::FLOAT ||
+      sit->second->dims_size() != 1) {
+    return std::nullopt;
+  }
+  return MatchInstanceNormPassThrough(node, init_map, sit->second->dims(0));
 }
 
 // Walks backward from tensor `start` through unary pass-through activations
@@ -1756,6 +1995,20 @@ ConvBackwardEdge WalkConvProducerBackward(
     auto dw = MatchConvPassThroughSelf(*node, init_map);
     if (dw) {
       pass_through.push_back(ConvPassThrough{node, dw->weight, dw->bias});
+      edges.push_back({node->input(0), node});
+      cur = node->input(0);
+      continue;
+    }
+
+    // Recognized unconditionally here too (no gate), mirroring
+    // MatchInstanceNormPassThrough's own unconditional recognition in
+    // WalkToConvConsumer -- InstanceNorm's per-channel-only statistics
+    // carry no group-boundary-drift risk to guard against, unlike the
+    // GroupNorm hop, which this backward walk never recognizes at all.
+    auto in_self = MatchInstanceNormPassThroughSelf(*node, init_map);
+    if (in_self) {
+      pass_through.push_back(
+          ConvPassThrough{node, in_self->scale, in_self->bias});
       edges.push_back({node->input(0), node});
       cur = node->input(0);
       continue;
@@ -3238,6 +3491,15 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
       if (hop.bias) {
         SliceLastAxis(init_map.at(*hop.bias), keep);
       }
+      if (hop.past_state) {
+        // A CausalConvWithState hop's own constant `past_state` -- rank-3
+        // `(batch, channels, k-1)`, channel axis 1 -- reuses
+        // SliceConsumerWeight's own `is_conv` branch (SliceAxis1 over
+        // dims(0)/dims(1) with `inner = prod(dims[2:])`), which slices
+        // exactly that axis; mirrors pruning.py's own _slice_axis1 call in
+        // _apply_conv_pass_through_hop.
+        SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
+      }
       // A PRelu per-channel-slope hop reuses ConvPassThrough for its own
       // slicing (see MatchPreluPassThrough's own comment) but, unlike a
       // depthwise Conv hop, has no `group` attribute of its own to update --
@@ -3283,6 +3545,9 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
         if (hop.bias) {
           SliceLastAxis(init_map.at(*hop.bias), keep);
         }
+        if (hop.past_state) {
+          SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
+        }
         if (hop.node->op_type() == "Conv") {
           SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
         }
@@ -3318,8 +3583,13 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
     for (const auto& co : chain.chain_ops) {
       stale_value_info.insert(co.node->output(0));
     }
+    // Every output, not just [0] -- a hop node can have more than one (e.g.
+    // `CausalConvWithState`'s own `present_state`); see ConvPassThrough's
+    // own docstring.
     for (const auto& hop : chain.conv_pass_through) {
-      stale_value_info.insert(hop.node->output(0));
+      for (const auto& out : hop.node->output()) {
+        stale_value_info.insert(out);
+      }
     }
     if (chain.group_norm) {
       stale_value_info.insert(chain.group_norm->node->output(0));
@@ -3329,7 +3599,9 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
         stale_value_info.insert(co.node->output(0));
       }
       for (const auto& hop : b->conv_pass_through) {
-        stale_value_info.insert(hop.node->output(0));
+        for (const auto& out : hop.node->output()) {
+          stale_value_info.insert(out);
+        }
       }
     }
   }
@@ -5008,6 +5280,9 @@ void ApplyConcatChains(onnx::GraphProto* graph,
         if (hop.bias) {
           SliceLastAxis(init_map.at(*hop.bias), keep);
         }
+        if (hop.past_state) {
+          SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
+        }
         if (hop.node->op_type() == "Conv") {
           SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
         }
@@ -5030,6 +5305,10 @@ void ApplyConcatChains(onnx::GraphProto* graph,
       SliceProducerWeight(init_map.at(hop.weight), false, global_keep, true);
       if (hop.bias) {
         SliceLastAxis(init_map.at(*hop.bias), global_keep);
+      }
+      if (hop.past_state) {
+        SliceConsumerWeight(init_map.at(*hop.past_state), false, global_keep,
+                            true);
       }
       if (hop.node->op_type() == "Conv") {
         SetOrAddIntAttr(hop.node, "group",
@@ -5059,15 +5338,22 @@ void ApplyConcatChains(onnx::GraphProto* graph,
       for (const auto& co : b.pre_ops) {
         touched.stale_value_info.insert(co.node->output(0));
       }
+      // Every output, not just [0] -- a hop node can have more than one
+      // (e.g. `CausalConvWithState`'s own `present_state`); see
+      // ConvPassThrough's own docstring.
       for (const auto& hop : b.conv_pass_through) {
-        touched.stale_value_info.insert(hop.node->output(0));
+        for (const auto& out : hop.node->output()) {
+          touched.stale_value_info.insert(out);
+        }
       }
     }
     for (const auto& co : chain.chain_ops) {
       touched.stale_value_info.insert(co.node->output(0));
     }
     for (const auto& hop : chain.conv_pass_through) {
-      touched.stale_value_info.insert(hop.node->output(0));
+      for (const auto& out : hop.node->output()) {
+        touched.stale_value_info.insert(out);
+      }
     }
   }
 }
