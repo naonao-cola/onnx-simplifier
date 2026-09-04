@@ -279,12 +279,30 @@ def _billm_quantize_block(
             scale1[cols] = alpha_ns
             scale2[cols] = 0.0
 
-        if block_end < k:
-            diag_hc = np.diag(hc_b)
-            diag_hc = np.where(np.abs(diag_hc) < 1e-12, 1e-12, diag_hc)
-            err_block = w_b - b_block
+        if block_end < k and nonsal_local.size > 0:
+            # Forward error compensation (paper Algorithm 1 lines 12-13,
+            # the same OBC/GPTQ mechanism onnxsim.gptq already implements):
+            # charge a column's leftover reconstruction error into
+            # not-yet-processed columns, in proportion to 1/diag(Hc) for
+            # that column. Deliberately restricted to non-salient columns:
+            # a column is selected salient *because* its Hc diagonal is
+            # close to singular (that is exactly what
+            # ``s_i = w_i^2/[H_c]_ii^2`` being large means), so dividing
+            # its own (already near-zero, thanks to the two-level residual
+            # approximation) leftover error by that same near-singular
+            # diagonal is numerically unstable by construction -- a small
+            # amount of floating-point residual gets amplified into a huge
+            # spurious correction. Salient columns already got dedicated,
+            # high-fidelity treatment above; skipping them here only drops
+            # a compensation term that both is negligible in principle (the
+            # residual approximation leaves very little error to charge
+            # forward) and is unsafe to compute in practice.
+            diag_hc = np.diag(hc_b)[nonsal_local]
+            diag_hc = np.where(np.abs(diag_hc) < 1e-8, 1e-8, diag_hc)
+            err_block = (w_b - b_block)[:, nonsal_local]
             err1 = err_block / diag_hc[np.newaxis, :]
-            w_work[:, block_end:] -= err1 @ hc[block_start:block_end, block_end:]
+            hc_future = hc[block_start:block_end, block_end:][nonsal_local, :]
+            w_work[:, block_end:] -= err1 @ hc_future
 
     return code1, code2, scale1, scale2
 
