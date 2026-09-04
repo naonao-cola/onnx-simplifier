@@ -35472,3 +35472,925 @@ def test_wanda_pruning_still_leaves_subgraph_weights_untouched_documented_gap():
     then_inits = {t.name: t for t in then_g.initializer}
     then_w1 = onnx.numpy_helper.to_array(then_inits["then_W1"])
     np.testing.assert_array_equal(then_w1, cfg["then"]["w1"])  # subgraph: untouched
+
+
+# --- Subgraph recursion, remaining families -------------------------------
+#
+# Follow-up round to the "Subgraph recursion" section above: wires
+# :func:`onnxsim.pruning._iter_subgraphs` into every remaining
+# `apply_structured_pruning_*`/MoE/embedding/transformer-block family (and
+# each one's own `_analyze_*` dry-run mirror, where one exists) -- see this
+# module's own top-of-file "Subgraph recursion" docstring section for the
+# full list and per-function design notes (calibration-ranking narrowing
+# for the MoE-whole-expert/QMoE-whole-expert/transformer-block families,
+# the multi-graph embedding search, pooled vs. per-graph `target` for the
+# transformer-block family's own `sparsity`/`num_blocks_to_drop`).
+#
+# Every family below except the embedding one reuses `_if_wrap` (just
+# below): take an EXISTING top-level test model builder's own output
+# ModelProto verbatim, and wrap its whole graph (node list, initializers,
+# every input) as BOTH branches of a single new top-level `If` node --
+# protobuf's own `RepeatedCompositeContainer.extend()` copies each
+# NodeProto/TensorProto/ValueInfoProto it's given, so passing the exact
+# same list of them to two separate `make_graph()` calls produces two
+# independent subgraphs (each with its own byte-identical copy of every
+# tensor), never two views onto shared state -- so pruning one branch can
+# never be confused with (or accidentally reach into) the other, exactly
+# the same "no cross-scope mutation" property this module's own matchers
+# already guarantee. The branch's own former top-level graph inputs become
+# genuine top-level inputs of the WRAPPING model instead, read by both
+# branches purely via implicit capture -- an `If` branch has no formal
+# inputs of its own -- mirroring `_if_wrapped_mlp_model`'s own established
+# `Xb` pattern above, just generically, for any single- or multi-input/
+# output existing model rather than a bespoke one per family. This is
+# deliberately NOT valid for the embedding family (see `_loop_wrap_embedding`,
+# below, and its own docstring for why) -- every embedding-family test
+# below uses a real `Loop` body instead, whose OWN formal inputs (unlike an
+# `If` branch's implicit-capture-only inputs) are exactly what
+# `_match_embedding_gather`'s own "indices must be a declared graph input"
+# requirement needs to find a match at all.
+#
+# Regression safety for every one of these families is covered by the
+# existing (pre-this-round) top-level-only fixtures elsewhere in this file,
+# unmodified and still run by this same test suite: every one of them
+# still passes byte-for-byte identically after this round's own
+# `_iter_subgraphs` restructuring (738 passed before this round's tests
+# were added, 738 passed after, on this same file) -- exactly the
+# `test_structured_pruning_no_subgraphs_matches_pre_existing_oracle_exactly`-
+# style guarantee the original "Subgraph recursion" section above
+# established explicitly for its own four functions, here instead relying
+# on the pre-existing per-family fixtures directly rather than restating
+# each one under a new name.
+
+
+def _if_wrap(inner_model):
+    """Wraps `inner_model`'s own graph (any number of inputs/outputs) as
+    BOTH branches of a new top-level `If` node -- see this section's own
+    top comment for why this safely produces two independent subgraph
+    copies from one existing model builder, with no bespoke per-family
+    wrapping code needed. `inner_model`'s own graph inputs become
+    top-level inputs of the returned model (read by both branches via
+    implicit capture); a new top-level `cond` (BOOL) input selects which
+    branch actually executes. The `If` node's own output names are freshly
+    prefixed (`top__<name>`) so they never collide with -- and are never
+    confused with -- whatever name each branch's own interior output
+    happens to use (a different, inner namespace entirely; ONNX subgraph
+    scoping means this never needs to be avoided for correctness, but a
+    distinct prefix keeps a debugging dump from reading confusingly).
+    """
+    g = inner_model.graph
+
+    def _branch(name):
+        return onnx.helper.make_graph(
+            list(g.node),
+            name,
+            [],
+            list(g.output),
+            initializer=list(g.initializer),
+            value_info=list(g.value_info),
+        )
+
+    then_graph = _branch("then_graph")
+    else_graph = _branch("else_graph")
+    top_out_names = [f"top__{o.name}" for o in g.output]
+    if_node = onnx.helper.make_node(
+        "If", ["cond"], top_out_names, then_branch=then_graph, else_branch=else_graph
+    )
+    cond = onnx.helper.make_tensor_value_info("cond", onnx.TensorProto.BOOL, [])
+    top_outputs = []
+    for name, o in zip(top_out_names, g.output):
+        vi = onnx.ValueInfoProto()
+        vi.CopyFrom(o)
+        vi.name = name
+        top_outputs.append(vi)
+
+    wrap_graph = onnx.helper.make_graph([if_node], "g", [*g.input, cond], top_outputs)
+    wrap_model = onnx.helper.make_model(
+        wrap_graph, opset_imports=list(inner_model.opset_import)
+    )
+    wrap_model.ir_version = max(inner_model.ir_version, 10)
+    onnx.checker.check_model(wrap_model)
+    return wrap_model
+
+
+def _if_branches(wrapped_model):
+    """The `(then_graph, else_graph)` pair `_if_wrap` produced, read back
+    off the pruned/wrapped model's own single top-level `If` node --
+    exactly `_then_else_graphs`'s own job above, restated locally so this
+    section reads independently.
+    """
+    if_node = next(n for n in wrapped_model.graph.node if n.op_type == "If")
+    then_g = else_g = None
+    for attr in if_node.attribute:
+        if attr.name == "then_branch":
+            then_g = attr.g
+        elif attr.name == "else_branch":
+            else_g = attr.g
+    return then_g, else_g
+
+
+def _loop_wrap_embedding(w, iters=1):
+    """A minimal ``Loop`` whose body owns a genuine embedding `Gather`
+    chain -- unlike `_if_wrap`, an `If` branch is unusable for the
+    embedding family specifically:
+    :func:`onnxsim.pruning._match_embedding_gather` requires its own
+    `indices` operand to resolve to a graph input OF THE SAME GRAPH THE
+    `Gather` NODE SITS IN (or a `Cast` of one) -- never an implicitly-
+    captured outer-scope value, per this module's own "decline rather than
+    mis-resolve" implicit-capture rule -- and an `If` branch has NO formal
+    inputs of its own to ever satisfy that check with. A `Loop` body's own
+    signature (``body(iter_num, cond_in, v_in) -> (cond_out, v_out, ...)``)
+    DOES carry a genuine per-iteration formal input, so this wraps the
+    token-id operand as `v_in` (a loop-carried dependency, trivially
+    passed through unchanged every iteration so the loop stays well-formed)
+    -- exactly the same "real, formal input to the nested graph" shape a
+    genuine decoder-loop token-embedding lookup has in practice (see this
+    module's own docstring for the whole-model-generation export scenario
+    this "Subgraph recursion" work exists for). `hidden` (the actual
+    embedding lookup) is collected as the loop's own scan output, stacked
+    once per iteration (`iters=1` by default, so this stacking is trivial
+    -- one leading axis of size 1 -- and callers slice `[0]` to compare
+    against a plain, un-looped oracle).
+    """
+    V, H = w.shape
+    body_nodes = [
+        onnx.helper.make_node("Gather", ["W_emb", "v_in"], ["hidden"], axis=0),
+        onnx.helper.make_node("Identity", ["v_in"], ["v_out"]),
+        onnx.helper.make_node("Identity", ["cond_in"], ["cond_out"]),
+    ]
+    body_graph = onnx.helper.make_graph(
+        body_nodes,
+        "loop_body",
+        [
+            onnx.helper.make_tensor_value_info("iter_num", onnx.TensorProto.INT64, []),
+            onnx.helper.make_tensor_value_info("cond_in", onnx.TensorProto.BOOL, []),
+            onnx.helper.make_tensor_value_info("v_in", onnx.TensorProto.INT64, ["M"]),
+        ],
+        [
+            onnx.helper.make_tensor_value_info("cond_out", onnx.TensorProto.BOOL, []),
+            onnx.helper.make_tensor_value_info("v_out", onnx.TensorProto.INT64, ["M"]),
+            onnx.helper.make_tensor_value_info(
+                "hidden", onnx.TensorProto.FLOAT, ["M", H]
+            ),
+        ],
+        initializer=[_f32(w, "W_emb")],
+    )
+    loop_node = onnx.helper.make_node(
+        "Loop",
+        ["trip_count", "cond0", "input_ids0"],
+        ["v_final", "hidden_stack"],
+        body=body_graph,
+    )
+    graph = onnx.helper.make_graph(
+        [loop_node],
+        "g",
+        [
+            onnx.helper.make_tensor_value_info(
+                "trip_count", onnx.TensorProto.INT64, []
+            ),
+            onnx.helper.make_tensor_value_info("cond0", onnx.TensorProto.BOOL, []),
+            onnx.helper.make_tensor_value_info(
+                "input_ids0", onnx.TensorProto.INT64, ["M"]
+            ),
+        ],
+        [
+            onnx.helper.make_tensor_value_info(
+                "v_final", onnx.TensorProto.INT64, ["M"]
+            ),
+            onnx.helper.make_tensor_value_info(
+                "hidden_stack", onnx.TensorProto.FLOAT, [iters, "M", H]
+            ),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 21)]
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    return model
+
+
+def _loop_body(model):
+    loop_node = next(n for n in model.graph.node if n.op_type == "Loop")
+    for attr in loop_node.attribute:
+        if attr.name == "body":
+            return attr.g
+    raise AssertionError("no Loop body found")
+
+
+def test_qdq_structured_pruning_matmul_producer_matches_oracle_inside_if_branch():
+    # QDQ family: a plain producer/consumer chain (identical to
+    # test_qdq_structured_pruning_matmul_producer_matches_oracle's own
+    # fixture) now matched and pruned inside BOTH branches of a nested
+    # `If`, verified against the same dequantized-L2-norm oracle that
+    # top-level test already uses -- via a real InferenceSession run.
+    K, H, Out = 8, 16, 4
+    inner, Wq, Wscale, _Wzp, W2 = _matmul_qdq_producer_model(K, H, Out, seed=0)
+    wrapped = _if_wrap(inner)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(wrapped, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    then_g, else_g = _if_branches(pruned)
+    w_dequant = _qdq_dequant(Wq, Wscale, None, axis=1)
+    keep = _oracle_keep_indices(w_dequant, H // 2)
+
+    rng = np.random.default_rng(9)
+    x = rng.standard_normal((3, K)).astype(np.float32)
+    for branch_g, cond in ((then_g, True), (else_g, False)):
+        inits = {t.name: t for t in branch_g.initializer}
+        assert list(inits["Wq"].dims) == [K, H // 2]
+        assert list(inits["Wscale"].dims) == [H // 2]
+        assert list(inits["W2"].dims) == [H // 2, Out]
+
+        (y,) = _run_unfused(pruned, {"X": x, "cond": np.array(cond)})
+        w_kept = w_dequant[:, keep]
+        h = x @ w_kept
+        y_oracle = h @ W2[keep, :]
+        np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_matmul_nbits_pruning_prunes_chain_inside_if_branch():
+    # MatMulNBits family: same chain shape as the existing top-level
+    # fixtures (mm1 -> Relu -> mm2), matched and pruned inside a nested
+    # `If`'s own branches -- checked directly on the packed `B`/`scales`
+    # shapes (a full dequantize+InferenceSession oracle is disproportionate
+    # here; this family's own top-level tests already cover that
+    # end-to-end, see e.g. test_analyze_structured_pruning_matmul_nbits_*).
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(101)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 8.0  # block 0 -- large, kept
+    W1[16:] *= 0.05  # block 1 -- small, dropped (forces block-aligned keep-set)
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    inner, _info = _nbits_chain_model(N1, K1, N2, block_size, W1, W2)
+    wrapped = _if_wrap(inner)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(wrapped, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    then_g, else_g = _if_branches(pruned)
+    for branch_g in (then_g, else_g):
+        b1 = next(t for t in branch_g.initializer if t.name == "B1")
+        b2 = next(t for t in branch_g.initializer if t.name == "B2")
+        assert b1.dims[0] == 16  # N1 halved, block-aligned (producer N-axis)
+        assert b2.dims[1] == 1  # K2 == N1 halved -> half the k_blocks (consumer)
+
+    rng2 = np.random.default_rng(3)
+    a = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_then,) = _run(pruned, {"A": a, "cond": np.array(True)})
+    (y_else,) = _run(pruned, {"A": a, "cond": np.array(False)})
+    assert y_then.shape == (3, N2)
+    np.testing.assert_allclose(y_then, y_else)  # identical branches -- same output
+
+
+def test_matmul_bnb4_pruning_prunes_chain_inside_if_branch():
+    # MatMulBnb4 family: reuses the exact top-level fixture/oracle from
+    # test_matmul_bnb4_pruning_producer_matches_independently_requantized_subset,
+    # nested inside an `If`, verified byte-identical to independently
+    # re-quantizing the row subset directly (the same exact-equality bar
+    # that top-level test itself uses).
+    K, N1, N2, block_size = 64, 32, 8, 16
+    rng = np.random.default_rng(2024)
+    W1 = rng.uniform(-1, 1, size=(K, N1)).astype(np.float32)
+    W1 = W1 * np.linspace(0.1, 3.0, N1, dtype=np.float32)[None, :]
+    W2 = rng.uniform(-1, 1, size=(N1, N2)).astype(np.float32)
+
+    inner = _bnb4_chain_model(K, N1, N2, block_size, 1, W1, W2)
+    wrapped = _if_wrap(inner)
+    pruned = onnxsim.apply_structured_pruning_matmul_bnb4(wrapped, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    col_norms = np.linalg.norm(W1, axis=0)
+    keep = np.sort(np.argsort(-col_norms, kind="stable")[:16])
+    ref_inner = _bnb4_chain_model(
+        K, len(keep), N2, block_size, 1, W1[:, keep], W2[keep, :]
+    )
+    ref_wrapped = _if_wrap(ref_inner)
+
+    a = rng.uniform(-1, 1, size=(3, K)).astype(np.float32)
+    for cond in (True, False):
+        pruned_out = _run(pruned, {"A": a, "cond": np.array(cond)})[0]
+        ref_out = _run(ref_wrapped, {"A": a, "cond": np.array(cond)})[0]
+        np.testing.assert_array_equal(pruned_out, ref_out)
+
+
+def test_moe_expert_channel_pruning_prunes_node_inside_if_branch():
+    # Plain MoE family: the exact ORT-masking-oracle fixture from
+    # test_moe_expert_channel_pruning_matches_ort_masking_oracle, nested
+    # inside an `If`, verified via a real InferenceSession run comparing
+    # against the same masking oracle in both branches.
+    E, hidden, inter = 5, 10, 12
+    rng = np.random.default_rng(3)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.5).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.5).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+    fc2_b = rng.standard_normal((E, hidden)).astype(np.float32)
+    inner = _moe_model(fc1_w, fc2_w, fc1_b=fc1_b, fc2_b=fc2_b)
+    wrapped = _if_wrap(inner)
+
+    pruned = onnxsim.apply_moe_expert_channel_pruning(wrapped, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    then_g, else_g = _if_branches(pruned)
+    for branch_g in (then_g, else_g):
+        inits = {t.name: t for t in branch_g.initializer}
+        assert inits["FC1W"].dims == [E, 6, hidden]
+        assert inits["FC2W"].dims == [E, hidden, 6]
+
+    sq = (
+        np.sum(fc1_w**2, axis=(0, 2))
+        + np.sum(fc2_w**2, axis=(0, 1))
+        + np.sum(fc1_b**2, axis=0)
+    )
+    keep = np.sort(np.argsort(-sq)[:6])
+    masked_fc1 = np.zeros_like(fc1_w)
+    masked_fc1[:, keep, :] = fc1_w[:, keep, :]
+    masked_fc1_b = np.zeros_like(fc1_b)
+    masked_fc1_b[:, keep] = fc1_b[:, keep]
+    masked_fc2 = np.zeros_like(fc2_w)
+    masked_fc2[:, :, keep] = fc2_w[:, :, keep]
+    ref_inner = _moe_model(masked_fc1, masked_fc2, fc1_b=masked_fc1_b, fc2_b=fc2_b)
+    ref_wrapped = _if_wrap(ref_inner)
+
+    rng2 = np.random.default_rng(4)
+    x = rng2.standard_normal((6, hidden)).astype(np.float32)
+    r = rng2.standard_normal((6, E)).astype(np.float32)
+    for cond in (True, False):
+        (y,) = _run(pruned, {"X": x, "R": r, "cond": np.array(cond)})
+        (y_ref,) = _run(ref_wrapped, {"X": x, "R": r, "cond": np.array(cond)})
+        np.testing.assert_allclose(y, y_ref, rtol=1e-4, atol=1e-4)
+
+
+def test_moe_whole_expert_pruning_prunes_node_inside_if_branch_uses_weight_fallback():
+    # MoE whole-expert family: matching/slicing is subgraph-aware, but the
+    # calibration-based router-usage ranking is narrower (see
+    # apply_moe_whole_expert_pruning's own docstring): a chain matched
+    # inside a nested `If` branch is never probed at all (neither branch
+    # IS `out.graph` -- the wrapping model's own top-level graph here has
+    # no MoE node whatsoever, only the `If`), so BOTH branches fall back to
+    # _moe_expert_weight_importance. This test confirms that fallback still
+    # correctly identifies and drops the least-important experts inside the
+    # nested chain, verified via a real InferenceSession run against the
+    # same -1e9-router-bias masking oracle the top-level fixture uses.
+    E, hidden, inter, tokens = 5, 8, 6, 10
+    rng = np.random.default_rng(101)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.4).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.4).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    router_b = rng.standard_normal(E).astype(np.float32)
+    k = 2
+    inner = _moe_router_model(
+        fc1_w, fc2_w, router_w, router_b=router_b, fc1_b=fc1_b, k=k, tokens=tokens
+    )
+    wrapped = _if_wrap(inner)
+
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        wrapped,
+        calibration_data=[],
+        sparsity=0.4,  # keep 3 of 5
+    )
+    onnx.checker.check_model(pruned)
+
+    then_g, else_g = _if_branches(pruned)
+    for branch_g in (then_g, else_g):
+        inits = {t.name: t for t in branch_g.initializer}
+        assert inits["FC1W"].dims == [3, inter, hidden]
+        assert inits["RW"].dims == [hidden, 3]
+
+    squared = (
+        np.sum(fc1_w**2, axis=(1, 2))
+        + np.sum(fc2_w**2, axis=(1, 2))
+        + np.sum(fc1_b**2, axis=1)
+    )
+    keep = np.sort(np.argsort(-squared)[:3])
+    dropped = sorted(set(range(E)) - set(keep.tolist()))
+    ref_inner = _moe_router_masking_oracle(
+        fc1_w, fc2_w, router_w, router_b, dropped, k, fc1_b=fc1_b, tokens=tokens
+    )
+    ref_wrapped = _if_wrap(ref_inner)
+
+    rng2 = np.random.default_rng(9)
+    x = rng2.standard_normal((tokens, hidden)).astype(np.float32)
+    for cond in (True, False):
+        (y,) = _run(pruned, {"X": x, "cond": np.array(cond)})
+        (y_ref,) = _run(ref_wrapped, {"X": x, "cond": np.array(cond)})
+        np.testing.assert_allclose(y, y_ref, rtol=1e-4, atol=1e-4)
+
+
+def test_qmoe_expert_channel_pruning_prunes_node_inside_if_branch():
+    # QMoE (quantized-weight MoE) expert-channel family: the exact
+    # hand-built-presliced-reference fixture from
+    # test_qmoe_expert_channel_pruning_matches_hand_built_presliced_reference,
+    # nested inside an `If`, verified via the same byte-level initializer
+    # equality that top-level test itself uses (a full InferenceSession
+    # round trip is disproportionate here -- this family's own top-level
+    # tests already cover that byte-packing math end-to-end).
+    E, hidden, inter, bits, tokens = 3, 8, 12, 4, 6
+    rng = np.random.default_rng(211)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+
+    fc1_q, fc1_s, fc1_dq = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, fc2_dq = _qmoe_quantize(fc2_w, bits)
+    inner = _qmoe_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, fc1_bias=fc1_b, k=2, tokens=tokens
+    )
+    wrapped = _if_wrap(inner)
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(wrapped, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    sq = (
+        np.sum(fc1_dq**2, axis=(0, 2))
+        + np.sum(fc2_dq**2, axis=(0, 1))
+        + np.sum(fc1_b**2, axis=0)
+    )
+    keep = np.sort(np.argsort(-np.sqrt(sq))[:6])
+    expected_fc2_q = _pack_vals(_unpack_vals(fc2_q, bits, inter)[:, :, keep], bits)
+
+    then_g, else_g = _if_branches(pruned)
+    for branch_g in (then_g, else_g):
+        inits = {t.name: onnx.numpy_helper.to_array(t) for t in branch_g.initializer}
+        np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+        np.testing.assert_array_equal(inits["FC1S"], fc1_s[:, keep])
+        np.testing.assert_array_equal(inits["FC1B"], fc1_b[:, keep])
+        np.testing.assert_array_equal(inits["FC2Q"], expected_fc2_q)
+
+
+def test_qmoe_whole_expert_pruning_prunes_node_inside_if_branch():
+    # QMoE whole-expert family: shares the identical calibration narrowing
+    # (see apply_moe_whole_expert_pruning's own docstring) and the same
+    # "neither branch is out.graph, so both fall back to weight-only
+    # importance" reasoning test_moe_whole_expert_pruning_prunes_node_inside_if_branch_uses_weight_fallback
+    # documents -- checked directly on initializer shapes (a full
+    # dequantize+InferenceSession oracle is disproportionate on top of that
+    # already-established family reasoning).
+    E, hidden, inter, bits, tokens = 5, 8, 6, 4, 10
+    rng = np.random.default_rng(303)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    fc1_q, fc1_s, _fc1_dq = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _fc2_dq = _qmoe_quantize(fc2_w, bits)
+    inner = _qmoe_router_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, router_w, k=2, tokens=tokens
+    )
+    wrapped = _if_wrap(inner)
+
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        wrapped,
+        calibration_data=[],
+        sparsity=0.4,  # keep 3 of 5
+    )
+    onnx.checker.check_model(pruned)
+
+    then_g, else_g = _if_branches(pruned)
+    for branch_g in (then_g, else_g):
+        inits = {t.name: t for t in branch_g.initializer}
+        assert inits["FC1Q"].dims[0] == 3
+        assert inits["RW"].dims == [hidden, 3]
+
+
+def test_block_quantized_fp8_pruning_prunes_chain_inside_if_branch():
+    # MatMulBlockQuantizedFp8Weight family: the exact byte-identity fixture
+    # from test_block_quantized_fp8_pruning_producer_and_consumer_byte_identical_and_oracle,
+    # nested inside an `If`, verified the same byte-exact way that
+    # top-level test uses.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(3)
+    w1 = (rng.standard_normal((N1, K1)) * 0.2).astype(np.float32)
+    w1[:8] *= 6.0  # first half of rows clearly more important
+    w2 = (rng.standard_normal((N2, N1)) * 0.2).astype(np.float32)
+    inner, _info = _fp8bw_chain_model(N1, K1, N2, block_size, w1, w2)
+    wrapped = _if_wrap(inner)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_block_quantized_fp8(
+        wrapped, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    orig_then_g, _orig_else_g = _if_branches(wrapped)
+    orig_b1 = onnx.numpy_helper.to_array(
+        next(t for t in orig_then_g.initializer if t.name == "B1")
+    )
+    orig_s1 = onnx.numpy_helper.to_array(
+        next(t for t in orig_then_g.initializer if t.name == "S1")
+    )
+    orig_b2 = onnx.numpy_helper.to_array(
+        next(t for t in orig_then_g.initializer if t.name == "B2")
+    )
+
+    then_g, else_g = _if_branches(pruned)
+    for branch_g in (then_g, else_g):
+        b1 = onnx.numpy_helper.to_array(
+            next(t for t in branch_g.initializer if t.name == "B1")
+        )
+        s1 = onnx.numpy_helper.to_array(
+            next(t for t in branch_g.initializer if t.name == "S1")
+        )
+        b2 = onnx.numpy_helper.to_array(
+            next(t for t in branch_g.initializer if t.name == "B2")
+        )
+        assert b1.shape == (8, K1)
+        assert s1.shape == (8, K1 // block_size)
+        assert b2.shape == (N2, 8)
+        np.testing.assert_array_equal(b1.view(np.uint8), orig_b1.view(np.uint8)[:8])
+        np.testing.assert_array_equal(s1, orig_s1[:8])
+        np.testing.assert_array_equal(b2.view(np.uint8), orig_b2.view(np.uint8)[:, :8])
+
+
+def test_block_quantized_fp4_pruning_prunes_chain_inside_if_branch():
+    # MatMulBlockQuantizedFp4Weight family: same shape as the FP8 test just
+    # above, checked on initializer shapes only (the NVFP4 packing itself
+    # is already covered end to end by this family's own top-level tests).
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(5)
+    w1 = (rng.standard_normal((N1, K1)) * 0.2).astype(np.float32)
+    w1[:8] *= 6.0
+    w2 = (rng.standard_normal((N2, N1)) * 0.2).astype(np.float32)
+    inner, _info = _fp4bw_chain_model(N1, K1, N2, block_size, w1, 1.0, w2, 1.0)
+    wrapped = _if_wrap(inner)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_block_quantized_fp4(
+        wrapped, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    then_g, else_g = _if_branches(pruned)
+    for branch_g in (then_g, else_g):
+        b1 = next(t for t in branch_g.initializer if t.name == "B1")
+        b2 = next(t for t in branch_g.initializer if t.name == "B2")
+        assert b1.dims[0] == 8  # N1 halved -- the 8 higher-magnitude rows
+        assert b2.dims[1] == 4  # consumer's own K axis (=8) co-pruned, nibble-packed
+
+
+def test_qlinearmatmul_pruning_prunes_chain_inside_if_branch():
+    # QOperator (QLinearMatMul) family: the exact independent-oracle
+    # fixture from test_qlinearmatmul_producer_matches_independent_oracle,
+    # nested inside an `If`, verified via a real InferenceSession run
+    # against an independently-hand-sliced reference -- the same
+    # byte-exact bar that top-level test itself uses (QLinearMatMul's own
+    # int8 arithmetic has no rounding to tolerate).
+    K, H, Out = 8, 6, 4
+    inner, info = _qlinearmatmul_chain_model(K, H, Out, seed=10)
+    wrapped = _if_wrap(inner)
+
+    w1_dequant = _qop_dequant(info["W1"], info["W1_scale"], info["W1_zp"], axis=1)
+    keep = np.sort(np.argsort(-np.linalg.norm(w1_dequant.T, axis=1))[: H // 2])
+
+    pruned = onnxsim.apply_structured_pruning_qoperator(wrapped, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    then_g, else_g = _if_branches(pruned)
+    for branch_g in (then_g, else_g):
+        inits = {t.name: t for t in branch_g.initializer}
+        np.testing.assert_array_equal(
+            onnx.numpy_helper.to_array(inits["W1"]), info["W1"][:, keep]
+        )
+        np.testing.assert_array_equal(
+            onnx.numpy_helper.to_array(inits["W2"]), info["W2"][keep, :]
+        )
+
+    ref_inner, _ = _qlinearmatmul_chain_model(K, len(keep), Out, seed=999)
+    ref_inits = {t.name: t for t in ref_inner.graph.initializer}
+    ref_inits["W1"].CopyFrom(onnx.numpy_helper.from_array(info["W1"][:, keep], "W1"))
+    ref_inits["W1_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1_scale"][keep], "W1_scale")
+    )
+    ref_inits["W1_zp"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1_zp"][keep], "W1_zp")
+    )
+    ref_inits["W2"].CopyFrom(onnx.numpy_helper.from_array(info["W2"][keep, :], "W2"))
+    ref_inits["W2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2_scale"], "W2_scale")
+    )
+    ref_inits["W2_zp"].CopyFrom(onnx.numpy_helper.from_array(info["W2_zp"], "W2_zp"))
+    ref_wrapped = _if_wrap(ref_inner)
+
+    rng = np.random.default_rng(12)
+    xq = rng.integers(0, 255, size=(2, K)).astype(np.uint8)
+    for cond in (True, False):
+        (y_pruned,) = _run(pruned, {"x_q": xq, "cond": np.array(cond)})
+        (y_ref,) = _run(ref_wrapped, {"x_q": xq, "cond": np.array(cond)})
+        np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_dynamic_quantize_matmul_pruning_prunes_chain_inside_if_branch():
+    # DynamicQuantizeMatMul family: reuses _dqmm_model_from_weights (which
+    # quantizes via the REAL onnxruntime.quantization tool, never a
+    # hand-rolled scheme), nested inside an `If`, checked directly on
+    # initializer shapes -- a full requantize+InferenceSession oracle is
+    # disproportionate here on top of the real-quantizer round trip this
+    # helper already performs, and this family's own top-level tests
+    # already cover that end-to-end.
+    K, N1, N2 = 8, 16, 4
+    rng = np.random.default_rng(77)
+    W1f = rng.standard_normal((K, N1)).astype(np.float32)
+    W1f[:, :8] *= 6.0  # first half of columns clearly more important
+    W2f = rng.standard_normal((N1, N2)).astype(np.float32)
+    inner, _info = _dqmm_model_from_weights(K, N1, N2, W1f, W2f)
+    wrapped = _if_wrap(inner)
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        wrapped, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    then_g, else_g = _if_branches(pruned)
+    for branch_g in (then_g, else_g):
+        w1 = next(t for t in branch_g.initializer if t.name == "W1")
+        w2 = next(t for t in branch_g.initializer if t.name == "W2")
+        assert w1.dims[1] == 8  # N1 halved -- the 8 higher-magnitude columns
+        assert w2.dims[0] == 8
+
+
+def test_embedding_vocab_pruning_prunes_gather_inside_loop_body():
+    # Embedding family (explicit keep-set): a token-embedding Gather whose
+    # own `indices` operand is a genuine formal input of a `Loop` body --
+    # see _loop_wrap_embedding's own docstring for why this family
+    # specifically needs a `Loop`, not an `If`, to exercise a real match at
+    # all. Verified via a real InferenceSession run: the looked-up rows for
+    # a kept id must exactly match that row of the ORIGINAL (unpruned)
+    # table, remapped through result.id_map -- the same "row i corresponds
+    # to kept_token_ids[i]" contract EmbeddingPruningResult's own docstring
+    # establishes.
+    V, H = 10, 4
+    rng = np.random.default_rng(1)
+    w = rng.standard_normal((V, H)).astype(np.float32)
+    model = _loop_wrap_embedding(w)
+
+    keep_ids = [1, 3, 5, 7, 9]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_ids)
+    assert result.matched
+    assert result.kept_token_ids == keep_ids
+    onnx.checker.check_model(result.model)
+
+    body = _loop_body(result.model)
+    w_emb = onnx.numpy_helper.to_array(
+        next(t for t in body.initializer if t.name == "W_emb")
+    )
+    assert w_emb.shape == (len(keep_ids), H)
+    np.testing.assert_array_equal(w_emb, w[keep_ids])
+
+    for old_id in keep_ids:
+        new_id = result.id_map[old_id]
+        sess_input_ids = np.array([new_id], dtype=np.int64)
+        (_v_final, hidden_stack) = _run(
+            result.model,
+            {
+                "trip_count": np.array(1, dtype=np.int64),
+                "cond0": np.array(True),
+                "input_ids0": sess_input_ids,
+            },
+        )
+        np.testing.assert_allclose(hidden_stack[0, 0], w[old_id], rtol=1e-5, atol=1e-5)
+
+
+def test_embedding_vocab_magnitude_pruning_prunes_gather_inside_loop_body():
+    # Embedding family (importance-ranked): same Loop-body-formal-input
+    # shape as the explicit-keep-set test just above, this time ranked by
+    # per-row L2 norm -- verified against
+    # test_analyze_embedding_vocab_magnitude_pruning_matches_real_call's
+    # own style of check (would_drop count matches the real call's own
+    # resulting vocabulary size), plus a direct row-value check for one
+    # surviving high-norm id.
+    V, H = 10, 4
+    rng = np.random.default_rng(23)
+    w = (rng.standard_normal((V, H)) * np.linspace(3.0, 0.1, V)[:, None]).astype(
+        np.float32
+    )
+    model = _loop_wrap_embedding(w)
+
+    result = onnxsim.apply_embedding_vocab_magnitude_pruning(model, sparsity=0.3)
+    assert result.matched
+    onnx.checker.check_model(result.model)
+    # Highest-norm rows (smallest original index, by this fixture's own
+    # linspace scaling) must survive.
+    assert 0 in result.kept_token_ids
+    assert len(result.kept_token_ids) == V - round(V * 0.3)
+
+    body = _loop_body(result.model)
+    w_emb = onnx.numpy_helper.to_array(
+        next(t for t in body.initializer if t.name == "W_emb")
+    )
+    np.testing.assert_array_equal(w_emb, w[result.kept_token_ids])
+
+
+def test_transformer_block_pruning_drops_blocks_inside_both_if_branches():
+    # Transformer-block family: same near-identity-MLP two-block fixture as
+    # test_transformer_block_pruning_drops_near_identity_mlp_block_and_matches_manual_removal_oracle,
+    # nested inside an `If`'s own branches -- `target` is pooled ACROSS THE
+    # WHOLE MODEL (`num_blocks_to_drop=4`, i.e. every candidate in both
+    # branches -- since neither branch IS `out.graph`, neither is ever
+    # probed, so every candidate gets this function's own "no evidence"
+    # float("-inf") score, and with target covering every one of them the
+    # exact tie-break order stops mattering -- see
+    # apply_transformer_block_pruning's own docstring). Verified via a real
+    # InferenceSession run against an independently hand-built reference
+    # where BOTH blocks are already manually excised in BOTH branches.
+    H = 8
+    rng = np.random.default_rng(0)
+    ln0_scale = np.ones(H, dtype=np.float32)
+    ln0_bias = np.zeros(H, dtype=np.float32)
+    w0 = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+    ln1_scale = np.ones(H, dtype=np.float32)
+    ln1_bias = np.zeros(H, dtype=np.float32)
+    w1 = rng.standard_normal((H, H)).astype(np.float32)
+
+    inner = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          ln0 = LayerNormalization<axis=-1>(x0, Ln0Scale, Ln0Bias)
+          h0 = MatMul(ln0, W0)
+          x1 = Add(x0, h0)
+
+          ln1 = LayerNormalization<axis=-1>(x1, Ln1Scale, Ln1Bias)
+          h1 = MatMul(ln1, W1)
+          x2 = Add(x1, h1)
+
+          y = Identity(x2)
+        }}
+        """,
+        initializer=[
+            _f32(ln0_scale, "Ln0Scale"),
+            _f32(ln0_bias, "Ln0Bias"),
+            _f32(w0, "W0"),
+            _f32(ln1_scale, "Ln1Scale"),
+            _f32(ln1_bias, "Ln1Bias"),
+            _f32(w1, "W1"),
+        ],
+    )
+    # A nested subgraph's own shapes are matched using only what it already
+    # declares outright (no shape-inference pass reaches into a nested
+    # subgraph for this family -- the same conservative gap
+    # apply_attention_head_pruning's own docstring already documents for
+    # itself) -- so `x1`/`x2` (interior residual-stream tensors
+    # `_shapes_match` needs known-shape on both sides of) must be declared
+    # directly, exactly the common "already declared outright" real-world
+    # case this module's own docstring describes, rather than relying on
+    # inference to derive them.
+    # `x0` itself also needs a declared shape here: inside the nested
+    # branch, `x0` is only ever an implicitly-captured outer-scope name
+    # (an `If` branch has no formal inputs of its own), not a local graph
+    # input the branch's own value_info_by_name would otherwise resolve.
+    x0_vi = onnx.helper.make_tensor_value_info("x0", onnx.TensorProto.FLOAT, [1, 4, H])
+    x1_vi = onnx.helper.make_tensor_value_info("x1", onnx.TensorProto.FLOAT, [1, 4, H])
+    x2_vi = onnx.helper.make_tensor_value_info("x2", onnx.TensorProto.FLOAT, [1, 4, H])
+    inner.graph.value_info.extend([x0_vi, x1_vi, x2_vi])
+    onnx.checker.check_model(inner)
+    wrapped = _if_wrap(inner)
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        wrapped, num_blocks_to_drop=4, seed=0, num_samples=4
+    )
+    onnx.checker.check_model(pruned)
+
+    then_g, else_g = _if_branches(pruned)
+    for branch_g in (then_g, else_g):
+        assert [n.op_type for n in branch_g.node] == ["Identity"]
+
+    ref_inner = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          y = Identity(x0)
+        }}
+        """
+    )
+    ref_wrapped = _if_wrap(ref_inner)
+
+    x = np.random.default_rng(42).standard_normal((1, 4, H)).astype(np.float32)
+    for cond in (True, False):
+        (pruned_y,) = _run(pruned, {"x0": x, "cond": np.array(cond)})
+        (ref_y,) = _run(ref_wrapped, {"x0": x, "cond": np.array(cond)})
+        np.testing.assert_array_equal(pruned_y, ref_y)
+
+
+def test_analyze_structured_pruning_qdq_aggregates_layers_across_if_branches():
+    # _analyze_* mirror check (representative of the same generic
+    # per-graph-loop-plus-aggregation shape every other family's own
+    # `_analyze_*` mirror above uses): the report's own `layers` must
+    # include one row per branch's own matched chain (two branches, one
+    # chain each -- both branches carry an independent copy of the exact
+    # same fixture test_qdq_structured_pruning_matmul_producer_matches_oracle_inside_if_branch
+    # uses), not just whichever graph a naive top-level-only scan would
+    # have reached.
+    K, H, Out = 8, 16, 4
+    inner, _Wq, _Wscale, _Wzp, _W2 = _matmul_qdq_producer_model(K, H, Out, seed=0)
+    wrapped = _if_wrap(inner)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        wrapped, onnxsim.apply_structured_pruning_qdq, sparsity=0.5
+    )
+    assert len(report.layers) == 2  # one per branch
+    for layer in report.layers:
+        assert layer.family == "qdq_matmul"
+        assert layer.total == H
+        assert layer.would_drop == H // 2
+    assert report.not_eligible == []
+
+
+def test_analyze_moe_expert_channel_pruning_aggregates_layers_across_if_branches():
+    E, hidden, inter = 5, 10, 12
+    rng = np.random.default_rng(3)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.5).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.5).astype(np.float32)
+    inner = _moe_model(fc1_w, fc2_w)
+    wrapped = _if_wrap(inner)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        wrapped, onnxsim.apply_moe_expert_channel_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 2  # one per branch's own MoE node
+    for layer in report.layers:
+        assert layer.family == "moe_expert_channel"
+        assert layer.total == inter
+
+
+def test_analyze_embedding_vocab_magnitude_pruning_finds_chain_inside_loop_body():
+    # The dry-run mirror must apply the same _match_embedding_chain_any_graph
+    # multi-graph search the real apply_embedding_vocab_magnitude_pruning
+    # call does -- see that function's own docstring -- so a Loop-body-only
+    # embedding table is still found and reported, not silently treated as
+    # unmatched (matched=False-equivalent: an empty layers list).
+    V, H = 10, 4
+    rng = np.random.default_rng(23)
+    w = (rng.standard_normal((V, H)) * np.linspace(3.0, 0.1, V)[:, None]).astype(
+        np.float32
+    )
+    model = _loop_wrap_embedding(w)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_embedding_vocab_magnitude_pruning, sparsity=0.3
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "embedding_vocab_magnitude"
+    assert layer.total == V
+    assert report.not_eligible == []
+
+    result = onnxsim.apply_embedding_vocab_magnitude_pruning(model, sparsity=0.3)
+    assert layer.would_drop == V - len(result.kept_token_ids)
+
+
+def test_analyze_transformer_block_pruning_pools_target_across_if_branches():
+    # The dry-run mirror of test_transformer_block_pruning_drops_blocks_inside_both_if_branches:
+    # `total` must reflect every graph's own candidates pooled together (4:
+    # both blocks, both branches), and with `num_blocks_to_drop` covering
+    # every one of them, `would_drop` must equal that same total.
+    H = 8
+    rng = np.random.default_rng(0)
+    ln0_scale = np.ones(H, dtype=np.float32)
+    ln0_bias = np.zeros(H, dtype=np.float32)
+    w0 = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+    ln1_scale = np.ones(H, dtype=np.float32)
+    ln1_bias = np.zeros(H, dtype=np.float32)
+    w1 = rng.standard_normal((H, H)).astype(np.float32)
+
+    inner = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          ln0 = LayerNormalization<axis=-1>(x0, Ln0Scale, Ln0Bias)
+          h0 = MatMul(ln0, W0)
+          x1 = Add(x0, h0)
+
+          ln1 = LayerNormalization<axis=-1>(x1, Ln1Scale, Ln1Bias)
+          h1 = MatMul(ln1, W1)
+          x2 = Add(x1, h1)
+
+          y = Identity(x2)
+        }}
+        """,
+        initializer=[
+            _f32(ln0_scale, "Ln0Scale"),
+            _f32(ln0_bias, "Ln0Bias"),
+            _f32(w0, "W0"),
+            _f32(ln1_scale, "Ln1Scale"),
+            _f32(ln1_bias, "Ln1Bias"),
+            _f32(w1, "W1"),
+        ],
+    )
+    x0_vi = onnx.helper.make_tensor_value_info("x0", onnx.TensorProto.FLOAT, [1, 4, H])
+    x1_vi = onnx.helper.make_tensor_value_info("x1", onnx.TensorProto.FLOAT, [1, 4, H])
+    x2_vi = onnx.helper.make_tensor_value_info("x2", onnx.TensorProto.FLOAT, [1, 4, H])
+    inner.graph.value_info.extend([x0_vi, x1_vi, x2_vi])
+    wrapped = _if_wrap(inner)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        wrapped,
+        onnxsim.apply_transformer_block_pruning,
+        num_blocks_to_drop=4,
+        seed=0,
+        num_samples=4,
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "transformer_block"
+    assert layer.total == 4
+    assert layer.would_drop == 4
+    assert report.not_eligible == []
