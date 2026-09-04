@@ -542,13 +542,13 @@ producers; L1's is a plain sum, with no square/sqrt involved at all) and
 support is deliberately
 narrower than the MatMul/Gemm path in one respect that stays true
 regardless of grouping: producers/consumers are joined by unary activations,
-channel-preserving spatial ops (see below), and depthwise/GroupNorm/PRelu
-pass-through hops -- no per-channel ``Add``/``Mul`` scale-or-bias op, since a
-real Conv already carries any bias in its own optional third input (a
-per-channel ``PRelu`` `slope` -- see below -- is not such a bias/scale op at
-all, just another "one value per channel" operand riding a shape-preserving
-activation, the same reason a depthwise Conv's own weight already crosses
-transparently here), and
+channel-preserving spatial ops (see below), and depthwise/InstanceNorm/
+GroupNorm/PRelu pass-through hops -- no per-channel ``Add``/``Mul``
+scale-or-bias op, since a real Conv already carries any bias in its own
+optional third input (a per-channel ``PRelu`` `slope` -- see below -- is not
+such a bias/scale op at all, just another "one value per channel" operand
+riding a shape-preserving activation, the same reason a depthwise Conv's own
+weight already crosses transparently here), and
 ``BatchNormalization`` is expected to already be fused into the preceding
 Conv's weight by the time this pass runs (onnxsim's own default
 optimization does exactly that, see ``fuse_bn_into_conv``), so a raw
@@ -579,6 +579,31 @@ are shaped per-channel (opset 21+'s schema; opset 18-20's differently-shaped,
 now-deprecated per-*group* schema is excluded by the same per-channel shape
 check every other hop in this module already applies, not by inspecting the
 model's own declared opset).
+
+A mid-chain ``InstanceNormalization`` (plain ONNX, standard domain) node is
+*also* special-cased, but reaches a substantially wider scope than GroupNorm
+above for a specific structural reason: its own ``y = scale * (x - mean) /
+sqrt(variance + epsilon) + B`` mean/variance are computed *per instance per
+channel* -- never pooled across a group of channels the way GroupNorm's own
+are -- so there is no group-boundary-drift risk to guard against at all.
+Confirmed both from the op's own math and directly by
+``onnxruntime.InferenceSession`` execution: dropping an *arbitrary* channel
+subset ahead of an InstanceNormalization commutes exactly (``0.0`` max abs
+diff) with slicing the channel axis before or after the op, for any subset
+-- unlike GroupNorm's own uniform-per-``num_groups``-block requirement, no
+constraint on *which* channels survive is needed here. This hop is
+therefore recognized unconditionally (no ``recognize_*`` gate the way
+GroupNorm's own is, and reached by every Conv-chain finder in this module,
+not just the plain single-producer/single-consumer one), any number of
+times per chain, in *both* directions -- treated exactly like a depthwise
+Conv's own "one weight row per channel" pass-through hop (its `scale`/`B`
+sliced by the same `keep` index set, no attribute of its own to rewrite)
+rather than needing GroupNorm's dedicated `num_groups`-aware machinery --
+see `_INSTANCE_NORM_PASS_THROUGH_OP`'s own comment for the full empirical
+finding and reasoning, and :func:`_match_instance_norm_pass_through`'s own
+docstring for why its own `scale`/`B` are held to a *narrower* shape bar
+(strictly rank-1) than GroupNorm's/LayerNorm's shared
+:func:`_flat_channel_const` check.
 
 A Conv chain also crosses five more op kinds transparently, each needing no
 weight of its own sliced (folded into `chain_ops` exactly like a unary
@@ -3350,6 +3375,54 @@ _NORM_PASS_THROUGH_OPS = (
 # rather than guessed" bar that mismatch already gets.
 _GROUP_NORM_PASS_THROUGH_OP = "GroupNormalization"
 
+# InstanceNormalization (plain ONNX, since_version=22 in this environment's
+# own onnx==1.22.0, but the 3-input/per-channel-scale shape below is
+# unchanged all the way back to opset 6 -- confirmed live via
+# ``onnx.defs.get_schema("InstanceNormalization")``) as a *second* Conv-chain
+# pass-through hop, alongside GroupNorm above. Its schema is much narrower
+# than GroupNorm's own multi-opset history: exactly three required inputs
+# (``input``, `scale`, `B` -- unlike GroupNorm's `scale`/`bias`, neither is
+# ever optional or shaped any way other than flat ``[C]``, so no opset-
+# dependent shape ambiguity like GroupNorm's opset-18-vs-21 `scale`/`bias`
+# layout change exists here at all), one required ``epsilon`` attribute this
+# hop never touches, and ``y = scale * (x - mean) / sqrt(variance + epsilon)
+# + B``, where -- this is the key structural difference from GroupNorm --
+# `mean`/`variance` are computed *per instance per channel*, never pooled
+# across a `num_groups`-wide block of channels the way GroupNorm's own
+# statistics are. Confirmed both from the op's own math and empirically
+# (a real `onnxruntime.InferenceSession` run, not assumed): dropping an
+# arbitrary channel *subset* ahead of an InstanceNormalization commutes
+# *exactly* (`0.0` max abs diff) with slicing the channel axis before or
+# after the op -- unlike GroupNorm's own ~0.42 divergence for a same-shape
+# example (see `_GROUP_NORM_PASS_THROUGH_OP`'s own comment), because every
+# channel's own mean/variance is computed from that channel alone, so
+# removing *other* channels can never perturb it. There is therefore no
+# group-boundary-drift risk to guard against at all here, and consequently
+# no `_chain_group`/uniform-per-block machinery to reuse or reimplement the
+# way the GroupNorm hop's own `num_groups` needs: this hop's `scale`/`B`
+# simply need to be sliced by whatever `keep` index set the chain's real
+# producer/consumer already agreed on, exactly like a depthwise Conv's own
+# per-channel weight/bias -- see :class:`_ConvPassThrough`'s own docstring,
+# which this hop reuses directly (its `weight`/`bias` fields hold this op's
+# own `scale`/`B` names) rather than a dedicated tuple type the way
+# :class:`_GroupNormPassThrough` needed one for its extra `num_groups` field.
+# `_apply_conv_pass_through_hop`'s own trailing ``group`` attribute rewrite
+# (keyed on ``node.op_type in ("Conv", "FusedConv")``) is simply never
+# reached for an ``InstanceNormalization`` node -- it has no such attribute
+# at all -- the same "no attribute to rewrite" shape `CausalConvWithState`'s
+# own hop already has. Because there is no per-hop constraint to enforce
+# (unlike GroupNorm, gated behind :func:`_walk_to_conv_consumer`'s own
+# `recognize_group_norm` parameter and gated to *at most one* hop per chain),
+# this hop needs neither restriction: it is recognized unconditionally, any
+# number of times per chain, by both :func:`_walk_to_conv_consumer` and
+# :func:`_walk_conv_producer_backward` alike -- the same "recognized in both
+# directions, everywhere the Conv-chain machinery already threads
+# `conv_pass_through`" scope a depthwise Conv hop already has (residual/merge
+# fan-out branches and Concat-branch resolution included, for free, since
+# they already thread `conv_pass_through` through unchanged). See
+# :func:`_match_instance_norm_pass_through`.
+_INSTANCE_NORM_PASS_THROUGH_OP = "InstanceNormalization"
+
 
 def _flat_channel_const(
     name: str, initializer_map: Dict[str, onnx.TensorProto]
@@ -3503,28 +3576,37 @@ class _Producer:
 
 @dataclass(frozen=True)
 class _ConvPassThrough:
-    """A depthwise Conv (``group == in_channels == out_channels``), a plain
-    ``ai.onnx::CausalConvWithState`` node, or a per-channel ``PRelu`` --
-    three genuinely different ops sharing the same "one weight row per
-    channel, no cross-channel mixing" shape (see
-    :func:`_match_causal_conv_with_state_pass_through`/
-    :func:`_match_prelu_pass_through` and this module's own "Conv/pooling/
+    """A depthwise Conv (``group == in_channels == out_channels``), a
+    plain ``ai.onnx::CausalConvWithState`` node, a plain
+    ``InstanceNormalization`` node, or a per-channel ``PRelu`` -- four
+    genuinely different ops sharing the same "one weight row per channel,
+    no cross-channel mixing" shape (see
+    :func:`_match_causal_conv_with_state_pass_through`,
+    :func:`_match_instance_norm_pass_through`,
+    :func:`_match_prelu_pass_through`, and this module's own "Conv/pooling/
     Resize/Pad pass-through" section comment) -- the chain walk crossed
     transparently between a Conv chain's real producer and real consumer.
-    None mixes channels at all -- output channel ``i`` depends only on input
-    channel ``i`` -- so none needs any independent importance of its own the
-    way a producer/consumer boundary does; each is carried on the matched
-    :class:`_Chain` purely so :func:`_apply_conv_pass_through_hop` can slice
-    its own ``[C, 1, k1, ..., kn]``-shaped weight (and bias, if present) by
-    the *same* `keep` index set as the chain's real producer -- PRelu's own
-    ``[C, 1, ..., 1]`` `slope` fits this identical axis-0, any-trailing-rank
-    slice with no kernel dims of its own to worry about, needing no
-    dedicated hop type. A depthwise Conv additionally gets its own ``group``
-    attribute updated to the new channel count; neither
-    ``CausalConvWithState`` nor ``PRelu`` has any such attribute at all
-    (`CausalConvWithState`'s channel count is implied purely by its weight's
-    own axis-0 size; `PRelu` has no channel-count attribute at all, ever),
-    so nothing is rewritten there for either. See
+    None of the four mixes channels at all -- output channel ``i`` depends
+    only on input channel ``i`` -- so none needs any independent importance
+    of its own the way a producer/consumer boundary does; each is carried on
+    the matched :class:`_Chain` purely so
+    :func:`_apply_conv_pass_through_hop` can slice its own ``[C, 1, k1, ...,
+    kn]`` weight (and bias, if present) by the *same* `keep` index set as the
+    chain's real producer -- or, for an ``InstanceNormalization`` hop, its
+    flat ``[C]`` `scale`/`B` (`weight`/`bias` playing that op's `scale`/`B`
+    role respectively; see `_INSTANCE_NORM_PASS_THROUGH_OP`'s own comment for
+    why no dedicated tuple type, and no `group`-style per-hop count
+    restriction, is needed here the way :class:`_GroupNormPassThrough`
+    needed one), or for a ``PRelu`` hop, its own ``[C, 1, ..., 1]`` `slope`
+    (`weight` playing that role, `bias` left ``None``) -- fitting this
+    identical axis-0, any-trailing-rank slice with no kernel dims of its own
+    to worry about, needing no dedicated hop type either. A depthwise Conv
+    additionally gets its own ``group`` attribute updated to the new channel
+    count; none of ``CausalConvWithState``, ``InstanceNormalization``, or
+    ``PRelu`` has any such attribute at all (each one's own channel count is
+    implied purely by its `weight`/`scale`/`slope`'s own axis-0 size, or --
+    for `PRelu` -- has no channel-count attribute at all, ever), so nothing
+    is rewritten there for any of them. See
     :func:`_walk_to_conv_consumer`.
     """
 
@@ -3717,20 +3799,31 @@ def _apply_conv_pass_through_hop(
 
     A depthwise ``Conv`` hop's own `group` attribute (`== in_channels ==
     out_channels`) drops to the new channel count right alongside its
-    weight/bias, via :func:`_set_conv_group_attr` -- neither
-    `CausalConvWithState` nor `PRelu` has any such attribute at all
-    (confirmed via live schema introspection,
+    weight/bias, via :func:`_set_conv_group_attr` -- none of
+    `CausalConvWithState`, `InstanceNormalization`, or `PRelu` has any such
+    attribute at all (confirmed via live schema introspection,
     ``onnx.defs.get_schema("CausalConvWithState", domain="")``/
-    ``onnx.defs.get_schema("PRelu")``: `CausalConvWithState`'s own channel
-    count is implied purely by its weight's own axis-0 size, and `PRelu` has
-    no channel-count-describing attribute of any kind, no
-    `group`/channel-count attribute exists on either to rewrite), so nothing
-    is rewritten there for either -- dispatched purely on `hop.node.op_type`,
-    since only these three op types ever reach this function (see
-    :func:`_match_depthwise_conv_pass_through`/
+    ``onnx.defs.get_schema("InstanceNormalization")``/
+    ``onnx.defs.get_schema("PRelu")``: each of `CausalConvWithState`'s and
+    `InstanceNormalization`'s own channel count is implied purely by its
+    `weight`/`scale`'s own axis-0 size, and `PRelu` has no
+    channel-count-describing attribute of any kind -- no `group`/
+    channel-count attribute exists on any of them to rewrite), so nothing is
+    rewritten there for any of them -- dispatched purely on
+    `hop.node.op_type`, since only these four op types ever reach this
+    function (see :func:`_match_depthwise_conv_pass_through`/
     :func:`_match_causal_conv_with_state_pass_through`/
+    :func:`_match_instance_norm_pass_through`/
+    :func:`_match_instance_norm_pass_through_self`/
     :func:`_match_prelu_pass_through`/:func:`_match_prelu_pass_through_self`,
     the only matchers that ever construct a :class:`_ConvPassThrough`).
+    `hop.weight` -- an ``InstanceNormalization`` hop's own `scale`, strictly
+    rank-1 by :func:`_match_instance_norm_pass_through`'s own bar, or a
+    ``PRelu`` hop's own `slope`, ``[C, 1, ..., 1]`` -- is sliced by the same
+    axis-0 :func:`_slice_producer_weight` call below as a depthwise Conv's
+    weight; for a rank-1 tensor that is exactly the same slice
+    :func:`_slice_last_axis`'s own axis ``-1`` would produce, so no dedicated
+    branch is needed for either here.
     """
     _slice_producer_weight(initializer_map[hop.weight], False, keep, is_conv=True)
     if hop.bias is not None:
@@ -4605,6 +4698,98 @@ def _match_group_norm_pass_through(
     return scale_name, bias_name, num_groups
 
 
+def _match_instance_norm_pass_through(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    n_channels: int,
+) -> Optional[Tuple[str, str]]:
+    """If `node` is a plain (default-domain) ``InstanceNormalization`` node
+    (opset 6+ -- see `_INSTANCE_NORM_PASS_THROUGH_OP`'s own comment) with
+    constant, exactly-1-D (``dims == [n_channels]``) `scale` (input 1) and
+    `B` (input 2) -- both required by the op's own schema -- returns
+    ``(scale_name, bias_name)``. Declines (``None``) on a missing/non-
+    constant/wrongly-shaped `scale` or `B`, or `scale`/`B` naming the same
+    tensor (double-slicing it in :func:`_apply_conv_pass_through_hop` would
+    corrupt it, the same tied-name bar :func:`_match_group_norm_pass_through`
+    already applies) -- none of these is guessed at.
+
+    Unlike :func:`_match_group_norm_pass_through`'s own
+    :func:`_flat_channel_const` bar (`prod(dims) == dims[-1]`, deliberately
+    loose enough to admit a broadcastable-but-not-strictly-1-D shape like
+    ``[1, 1, C]``), this requires `scale`/`B` to be *strictly* rank-1: the
+    returned names are carried on a plain :class:`_ConvPassThrough` (this
+    hop's own `scale`/`B` playing that class's `weight`/`bias` role -- see
+    `_INSTANCE_NORM_PASS_THROUGH_OP`'s own comment for why no dedicated
+    tuple type is needed here the way :class:`_GroupNormPassThrough` needed
+    one), whose own slicing (:func:`_apply_conv_pass_through_hop`) always
+    slices axis 0 (``is_conv=True``) rather than axis -1 -- correct only when
+    axis 0 already *is* the one-and-only axis, i.e. strictly rank-1. A
+    looser broadcastable shape would silently slice the wrong axis instead of
+    being declined, so this bar is deliberately narrower than
+    `_flat_channel_const`'s -- not a missed generalization: the ONNX schema
+    itself only ever documents `scale`/`B` as rank-1 ``[C]`` for this op (no
+    opset ever gave it GroupNorm's own per-*group* alternate shape), so
+    nothing real is excluded by holding to that.
+    """
+    if (
+        node.op_type != _INSTANCE_NORM_PASS_THROUGH_OP
+        or node.domain != ""
+        or len(node.input) != 3
+        or not node.input[1]
+        or not node.input[2]
+        or len(node.output) != 1
+    ):
+        return None
+    scale_name, bias_name = node.input[1], node.input[2]
+    if scale_name == bias_name:
+        return None  # tied scale/bias -- double-slicing would corrupt it
+    s_init = initializer_map.get(scale_name)
+    b_init = initializer_map.get(bias_name)
+    if (
+        s_init is None
+        or b_init is None
+        or not _is_supported_float_dtype(s_init.data_type)
+        or not _is_supported_float_dtype(b_init.data_type)
+        or len(s_init.dims) != 1
+        or len(b_init.dims) != 1
+        or s_init.dims[0] != n_channels
+        or b_init.dims[0] != n_channels
+    ):
+        return None
+    return scale_name, bias_name
+
+
+def _match_instance_norm_pass_through_self(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, str]]:
+    """The InstanceNorm analogue of :func:`_match_conv_pass_through_self`,
+    for exactly the same reason: :func:`_walk_conv_producer_backward`'s
+    backward walk doesn't know its group's shared channel count yet at the
+    point it first crosses a hop, so this checks `node`'s own `scale` is
+    self-consistently rank-1 (by calling :func:`_match_instance_norm_pass_through`
+    with `scale`'s own `dims[0]` as the "expected" `n_channels`, trivially
+    satisfying that one check and leaving every other one -- constant `B`,
+    matching length, non-tied names -- intact). :func:`_find_conv_residual_chains`/
+    :func:`_resolve_conv_residual_group_for_concat` re-validate every such
+    hop against the group's real, established channel count once the whole
+    group is resolved, the same re-validation a depthwise pass-through hop
+    already gets there (``initializer_map[hop.weight].dims[0] != n_channels``
+    -- `hop.weight` here holds this op's own `scale` name, so that same
+    generic check already re-validates this hop correctly, with no dedicated
+    InstanceNorm-specific re-check needed).
+    """
+    if node.op_type != _INSTANCE_NORM_PASS_THROUGH_OP or len(node.input) < 2:
+        return None
+    s_init = initializer_map.get(node.input[1])
+    if (
+        s_init is None
+        or not _is_supported_float_dtype(s_init.data_type)
+        or len(s_init.dims) != 1
+    ):
+        return None
+    return _match_instance_norm_pass_through(node, initializer_map, s_init.dims[0])
+
+
 def _match_resize_channel_pass_through(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> bool:
@@ -5011,7 +5196,14 @@ def _walk_to_conv_consumer(
     `conv_pass_through`, but with no `group` attribute to update; this
     forward walk is the *only* one of the two Conv-chain walkers that
     recognizes it -- see that section comment's own scope-boundary note for
-    why the backward walk, :func:`_walk_conv_producer_backward`, cannot), a
+    why the backward walk, :func:`_walk_conv_producer_backward`, cannot),
+    plain ``InstanceNormalization`` hops (see
+    :func:`_match_instance_norm_pass_through` and
+    `_INSTANCE_NORM_PASS_THROUGH_OP`'s own comment -- the same "one weight
+    row per channel" shape as a depthwise Conv, also returned via
+    `conv_pass_through`, with no `group` attribute to update and, unlike
+    every other hop in this list, no restriction on how many may appear per
+    chain -- both this forward walk *and* the backward one recognize it), a
     ``PRelu`` hop (see :func:`_match_prelu_pass_through`) -- a *scalar* or
     single-shared-parameter `slope` (every dimension size 1) is folded into
     `chain_ops` like a pooling/`Resize`/`Pad` hop (nothing to slice, the same
@@ -5141,6 +5333,35 @@ def _walk_to_conv_consumer(
                 conv_pass_through.append(
                     _ConvPassThrough(nxt, cc_weight, cc_bias, cc_past_state)
                 )
+                cur = out2
+                continue
+            break
+
+        if (
+            nxt.op_type == _INSTANCE_NORM_PASS_THROUGH_OP
+            and nxt.domain == ""
+            and nxt.input
+            and nxt.input[0] == cur
+        ):
+            # See `_INSTANCE_NORM_PASS_THROUGH_OP`'s own comment: recognized
+            # unconditionally (no `recognize_*` gate, and any number of times
+            # per chain, unlike the GroupNorm hop below) -- InstanceNorm's
+            # per-channel-only statistics carry no group-boundary-drift risk
+            # to guard against, so this hop is exactly as unrestricted as a
+            # depthwise Conv hop above, reusing the same `_ConvPassThrough`
+            # tuple type (its own `scale`/`B` playing that class's
+            # `weight`/`bias` role) rather than needing a dedicated one. Like
+            # `CausalConvWithState` above, this op is never a consumer in its
+            # own right, so a failed match here simply ends the walk.
+            instance_norm = _match_instance_norm_pass_through(
+                nxt, initializer_map, n_channels
+            )
+            if instance_norm is not None:
+                out2 = nxt.output[0]
+                if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+                    break
+                in_scale, in_bias = instance_norm
+                conv_pass_through.append(_ConvPassThrough(nxt, in_scale, in_bias))
                 cur = out2
                 continue
             break
@@ -5526,7 +5747,12 @@ def _walk_conv_producer_backward(
     producer, then merged via ``Concat`` with the encoder's skip branch).
     Walks backward from tensor `start` through unary pass-through
     activations, self-consistently-depthwise Conv hops (see
-    :func:`_match_conv_pass_through_self`), spatial pooling ops that never
+    :func:`_match_conv_pass_through_self`), self-consistent
+    ``InstanceNormalization`` hops (see
+    :func:`_match_instance_norm_pass_through_self` and
+    `_INSTANCE_NORM_PASS_THROUGH_OP`'s own comment -- recognized
+    unconditionally here too, unlike the GroupNorm hop, which this backward
+    walk never recognizes at all), spatial pooling ops that never
     mix channels (``MaxPool``/``AveragePool``/``GlobalAveragePool``,
     unconditionally -- see `_CONV_POOL_PASS_THROUGH`'s own comment), a
     channel-axis-unaffected ``Resize``/``Pad`` (see
@@ -5624,6 +5850,14 @@ def _walk_conv_producer_backward(
         if dw is not None:
             dw_weight, dw_bias = dw
             pass_through.append(_ConvPassThrough(node, dw_weight, dw_bias))
+            edges.append((node.input[0], node))
+            cur = node.input[0]
+            continue
+
+        instance_norm = _match_instance_norm_pass_through_self(node, initializer_map)
+        if instance_norm is not None:
+            in_scale, in_bias = instance_norm
+            pass_through.append(_ConvPassThrough(node, in_scale, in_bias))
             edges.append((node.input[0], node))
             cur = node.input[0]
             continue
