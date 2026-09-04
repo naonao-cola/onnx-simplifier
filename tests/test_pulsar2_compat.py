@@ -131,6 +131,34 @@ def test_onnxsim_corrupts_a_compiled_npu_subgraph():
     assert pulsar2.stripped_npu_data(simp) == {"npu_params"}
 
 
+def test_llm_layer_leaf_fixture_multi_node_detection():
+    """The same corruption bug, confirmed on a real per-layer LLM `.axmodel`.
+
+    A real `Qwen/Qwen3-0.6B` build (see `pulsar2_docker.llm_build()`'s and
+    `pulsar2_ops.py`'s docstrings) compiles each transformer layer to a
+    graph with *two* `neu mode` nodes (decode + prefill), not one --
+    `axera_llm_layer_leaf` reproduces that shape. Checks the detector
+    handles multiple NPU nodes sharing one initializer correctly, both
+    before (nothing missing) and after (everything referenced gets
+    stripped) simplification.
+    """
+    from onnxsim import simplify
+
+    model = models.axera_llm_layer_leaf()
+    assert pulsar2.unsafe_for_simplify(model)
+    assert not pulsar2.stripped_npu_data(model)
+    assert (
+        check("axera_llm_layer_leaf", None)["status"] == "pulsar2_unsafe_for_simplify"
+    )
+
+    simp, _ = simplify(model)
+    assert pulsar2.stripped_npu_data(simp) == {
+        "npu_params",
+        "subgraph_npu_b1_neu",
+        "subgraph_npu_1_b1_neu",
+    }
+
+
 def test_ax650_build_risks_matches_real_conversions():
     """Sanity-checks the confirmed AX650 op list against two real conversions.
 
