@@ -34303,6 +34303,634 @@ def test_apply_structured_pruning_dynamic_quantize_matmul_registered_in_sensitiv
     )
 
 
+# --- FusedConv/FusedGemm (com.microsoft, ConvActivationFusion/GemmActivationFusion) ---
+#
+# `com.microsoft::FusedConv`/`com.microsoft::FusedGemm` are ONNX Runtime's own
+# graph-optimizer fusion of a `Conv`/`Gemm` with a trailing activation
+# (`ConvActivationFusion`/`GemmActivationFusion`) into one node -- confirmed
+# live against this environment's installed onnxruntime (1.29.0):
+#
+#   * Schema (`onnxruntime.capi.onnxruntime_pybind11_state
+#     .get_all_operator_schema()`): `FusedConv(X, W, B?, Z?)` has the exact
+#     same inputs as plain `Conv`, plus `group`/`pads`/`strides`/`dilations`/
+#     `kernel_shape`/`auto_pad` attributes identical to `Conv`'s own, plus two
+#     *extra* attributes, `activation` (string) and `activation_params`
+#     (floats). `FusedGemm(A, B, C?)` has the exact same inputs as plain
+#     `Gemm`, plus `alpha`/`beta`/`transA`/`transB` identical to `Gemm`'s own,
+#     plus `activation`/`activation_alpha`/`activation_beta`/`activation_gamma`.
+#   * A real round trip -- a `Conv->Relu->Conv`/`Gemm->Relu->Gemm` model put
+#     through a real `onnxruntime.InferenceSession` with
+#     `graph_optimization_level=ORT_ENABLE_EXTENDED` and
+#     `optimized_model_filepath` set -- confirms ORT's own
+#     `ConvActivationFusion`/`GemmActivationFusion` really does collapse the
+#     first `{Conv,Gemm}+Relu` pair into one `FusedConv`/`FusedGemm` node with
+#     `activation="Relu"`, and that the weight/bias initializers feeding it
+#     are byte-identical (shape and values) to the pre-fusion `Conv`/`Gemm`'s
+#     own `W`/`B` -- a pure op-fusion, nothing quantization-related, nothing
+#     repacked. `Relu`/`LeakyRelu`/`Clip`/`Sigmoid`/`Tanh`/`HardSigmoid` were
+#     all observed to actually fuse this way in this environment (`Elu` did
+#     not, at least not through `ORT_ENABLE_EXTENDED`); the second, trailing
+#     `Conv`/`Gemm` in that same round trip (with no activation of its own
+#     following it) stays a plain, unfused node either way -- confirming the
+#     fusion is conditioned on a following activation, not unconditional.
+#
+# Since the weight/bias operands are byte-identical to plain Conv/Gemm's own
+# (see above), every producer/consumer/weight-only matcher in this module
+# that recognizes `Conv`/`Gemm` by a literal `op_type` check now also
+# recognizes `FusedConv`/`FusedGemm` (see `onnxsim/pruning.py`'s own diff) --
+# no new slicing machinery, just widened `op_type in (...)` membership at each
+# existing site, exactly like `Conv`'s own `op_type` checks already work.
+#
+# The one thing genuinely new about `FusedConv`/`FusedGemm` versus plain
+# `Conv`/`Gemm` is that their activation is now baked into the node itself
+# (an `activation` *attribute*) rather than expressed as a separate
+# downstream node this module's `_UNARY_PASS_THROUGH`-based chain walkers
+# would otherwise have to step over. This turns out to need no special
+# handling at all, not because it happens to already work, but because it
+# cannot NOT work: pruning a Conv/Gemm's output (or input) channels only ever
+# removes/reindexes whole rows/columns of its own weight/bias -- it never
+# touches what any activation function computes on the *surviving* channels,
+# and an elementwise activation's value for one channel never depends on any
+# other channel to begin with. So slicing trivially commutes with whatever
+# activation (or none) happens to be baked in, and the fused node's own
+# output already feeds the next producer/consumer directly, with no
+# intervening node to walk past at all -- simpler than the plain-`Conv`-plus-
+# separate-activation case, not harder. Confirmed empirically below with a
+# hand-built `FusedConv->FusedConv` chain (`test_structured_pruning_
+# fusedconv_chain_matches_oracle`) and a `FusedConv->Conv` mixed chain
+# (`test_structured_pruning_fusedconv_into_conv_chain_matches_oracle`), each
+# pruned and re-run through a real `InferenceSession`, plus the real-ORT-
+# optimizer round trips below.
+#
+# A hand-built `FusedConv`/`FusedGemm` node (this section's own fixtures, not
+# ORT's own optimizer output) is confirmed to execute correctly through a
+# real `InferenceSession` completely on its own, both directly
+# (`test_fusedconv_hand_built_node_executes_like_conv_then_relu`/
+# `test_fusedgemm_hand_built_node_executes_like_gemm_then_relu`) and via
+# every correctness-oracle comparison below, which all run the (fused)
+# pruned model through `_run` the same way every other test in this file
+# does.
+
+
+def _fused_model(body, initializer=(), opset=21):
+    # The `com.microsoft`-domain analogue of this file's own `_model()`
+    # helper: identical except for the extra `"com.microsoft": 1`
+    # opset_import `FusedConv`/`FusedGemm` need (`_model()` only declares the
+    # `""` domain, which every other test file section needs and this one
+    # doesn't want to widen for everybody else).
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": {opset}, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
+
+
+def _ort_optimize(model, opt_level=None):
+    """Runs `model` through a real onnxruntime graph-optimization pass
+    (default `ORT_ENABLE_EXTENDED`, which includes `ConvActivationFusion`/
+    `GemmActivationFusion` -- confirmed live, see this section's own top
+    comment) and returns the `ModelProto` it actually wrote out. Used only by
+    this section's own "real ORT optimizer round trip" tests, to prune a
+    genuine ORT-fused model rather than only this section's own hand-built
+    stand-ins.
+    """
+    if opt_level is None:
+        opt_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    with tempfile.TemporaryDirectory() as d:
+        in_path = os.path.join(d, "in.onnx")
+        out_path = os.path.join(d, "out.onnx")
+        onnx.save(model, in_path)
+        so = ort.SessionOptions()
+        so.graph_optimization_level = opt_level
+        so.optimized_model_filepath = out_path
+        ort.InferenceSession(in_path, so, providers=["CPUExecutionProvider"])
+        return onnx.load(out_path)
+
+
+def test_fusedconv_hand_built_node_executes_like_conv_then_relu():
+    # A hand-built FusedConv(activation="Relu") node, run through a real
+    # InferenceSession entirely on its own -- confirms this section's own
+    # fixtures (built the identical way) are meaningful test inputs,
+    # independent of whether ORT's own optimizer would ever emit this exact
+    # node (see the real-round-trip tests below for that separate question).
+    Cin, Cout = 3, 4
+    rng = np.random.default_rng(50)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    b = rng.standard_normal((Cout,)).astype(np.float32)
+    fused = _fused_model(
+        f"""
+        g (float[N,{Cin},8,8] X) => (float[N,{Cout},8,8] Y)
+        {{
+          Y = com.microsoft.FusedConv<kernel_shape=[3,3], pads=[1,1,1,1], activation="Relu">(X, W, B)
+        }}
+        """,
+        initializer=[_f32(w, "W"), _f32(b, "B")],
+    )
+    onnx.checker.check_model(fused)
+    plain = _model(
+        f"""
+        g (float[N,{Cin},8,8] X) => (float[N,{Cout},8,8] Y)
+        {{
+          h = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, W, B)
+          Y = Relu(h)
+        }}
+        """,
+        initializer=[_f32(w, "W"), _f32(b, "B")],
+    )
+    rng_x = np.random.default_rng(51)
+    x = rng_x.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y_fused,) = _run(fused, {"X": x})
+    (y_plain,) = _run(plain, {"X": x})
+    np.testing.assert_allclose(y_fused, y_plain, rtol=1e-6, atol=1e-6)
+
+
+def test_fusedgemm_hand_built_node_executes_like_gemm_then_relu():
+    K, H = 8, 6
+    rng = np.random.default_rng(52)
+    w = rng.standard_normal((K, H)).astype(np.float32)
+    b = rng.standard_normal((H,)).astype(np.float32)
+    fused = _fused_model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{H}] Y)
+        {{
+          Y = com.microsoft.FusedGemm<activation="Relu">(X, W, B)
+        }}
+        """,
+        initializer=[_f32(w, "W"), _f32(b, "B")],
+    )
+    onnx.checker.check_model(fused)
+    plain = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{H}] Y)
+        {{
+          h = Gemm(X, W, B)
+          Y = Relu(h)
+        }}
+        """,
+        initializer=[_f32(w, "W"), _f32(b, "B")],
+    )
+    rng_x = np.random.default_rng(53)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y_fused,) = _run(fused, {"X": x})
+    (y_plain,) = _run(plain, {"X": x})
+    np.testing.assert_allclose(y_fused, y_plain, rtol=1e-6, atol=1e-6)
+
+
+def _fusedconv_producer_chain_model(w1, w2, b1=None, spatial=10, activation="Relu"):
+    """The FusedConv-producer analogue of `_conv_pair_model`: `W1`'s own
+    activation is baked into the FusedConv node itself (`activation`
+    attribute), so -- unlike `_conv_pair_model` -- no separate activation
+    node sits between the two Convs at all; FusedConv's own output feeds the
+    second (plain) Conv directly.
+    """
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    out_spatial = spatial - 4
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        conv1 = (
+            f'h = com.microsoft.FusedConv<kernel_shape=[3,3], activation="{activation}">'
+            "(X, W1, B1)"
+        )
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = (
+            f'h = com.microsoft.FusedConv<kernel_shape=[3,3], activation="{activation}">'
+            "(X, W1)"
+        )
+    return _fused_model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          Y = Conv<kernel_shape=[3,3]>(h, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def _conv_fusedconv_consumer_chain_model(
+    w1, w2, b1=None, spatial=10, activation="Relu", consumer_activation="Sigmoid"
+):
+    """The FusedConv-consumer (K-axis) analogue of `_conv_pair_model`: the
+    producer is a plain Conv followed by a separate activation node (exactly
+    like `_conv_pair_model`), but the *consumer* is a FusedConv, whose own
+    baked `consumer_activation` applies to ITS OWN output -- irrelevant to
+    K-axis (input-channel) consumer matching, included only to confirm that
+    an unrelated baked activation on the consumer's own far side doesn't
+    somehow interfere either.
+    """
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    out_spatial = spatial - 4
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    return _fused_model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          a = {activation}(h)
+          Y = com.microsoft.FusedConv<kernel_shape=[3,3], activation="{consumer_activation}">(a, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def _fusedconv_pair_model(
+    w1, w2, b1=None, spatial=10, activation="Relu", second_activation="Sigmoid"
+):
+    """FusedConv->FusedConv: both nodes fused, each with its own (different,
+    to rule out a coincidental match) baked activation -- no separate
+    activation node anywhere in the graph at all. The core "baked-in
+    activation doesn't block chain matching" fixture: the chain walk must
+    match the second FusedConv as the first FusedConv's own single consumer
+    with zero intervening hops.
+    """
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    out_spatial = spatial - 4
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        conv1 = (
+            f'h = com.microsoft.FusedConv<kernel_shape=[3,3], activation="{activation}">'
+            "(X, W1, B1)"
+        )
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = (
+            f'h = com.microsoft.FusedConv<kernel_shape=[3,3], activation="{activation}">'
+            "(X, W1)"
+        )
+    return _fused_model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          Y = com.microsoft.FusedConv<kernel_shape=[3,3], activation="{second_activation}">(h, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_fusedconv_producer_matches_oracle():
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(60)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _fusedconv_producer_chain_model(w1, w2, b1=b1)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    pruned_optypes = {n.op_type for n in pruned.graph.node}
+    assert "FusedConv" in pruned_optypes  # still fused -- not decomposed
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _fusedconv_producer_chain_model(w1[keep], w2[:, keep], b1=b1[keep])
+
+    rng_x = np.random.default_rng(61)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_fusedconv_consumer_matches_oracle():
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(62)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_fusedconv_consumer_chain_model(w1, w2, b1=b1)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    pruned_optypes = {n.op_type for n in pruned.graph.node}
+    assert "FusedConv" in pruned_optypes
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_fusedconv_consumer_chain_model(w1[keep], w2[:, keep], b1=b1[keep])
+
+    rng_x = np.random.default_rng(63)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_fusedconv_chain_matches_oracle():
+    # FusedConv->FusedConv, no separate activation node anywhere -- the
+    # "baked-in activation doesn't block chain matching" claim, checked
+    # end-to-end.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(64)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _fusedconv_pair_model(w1, w2, b1=b1)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _fusedconv_pair_model(w1[keep], w2[:, keep], b1=b1[keep])
+
+    rng_x = np.random.default_rng(65)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_fusedconv_into_conv_chain_matches_oracle():
+    # FusedConv (producer, baked activation) -> plain Conv (consumer, no
+    # activation of its own) -- the mixed-op-type chain case. `Tanh` (not
+    # `LeakyRelu`) deliberately: a real FusedConv<activation="LeakyRelu">
+    # needs its own `activation_params=[alpha]` set too (onnxruntime's own
+    # NCHWc layout transformer -- which the default `_run()` session's
+    # ORT_ENABLE_ALL optimization level reaches -- refuses to construct its
+    # kernel otherwise, confirmed empirically), which is beside the point
+    # this test is actually after; `Tanh` needs no params, matching the
+    # live schema dump this section's own top comment already recorded.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(66)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _fusedconv_producer_chain_model(w1, w2, activation="Tanh")
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _fusedconv_producer_chain_model(w1[keep], w2[:, keep], activation="Tanh")
+
+    rng_x = np.random.default_rng(67)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_fusedconv_real_ort_optimizer_round_trip_matches_oracle():
+    # The real thing, not a hand-built stand-in: a plain Conv->Relu->Conv
+    # model put through onnxruntime's own optimizer (ORT_ENABLE_EXTENDED,
+    # which runs ConvActivationFusion -- confirmed live, see this section's
+    # own top comment) to get a genuine FusedConv node, then
+    # apply_structured_pruning is run on THAT real optimizer output.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(68)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    plain = _conv_pair_model(w1, w2, b1=b1)
+
+    fused = _ort_optimize(plain)
+    assert "FusedConv" in {n.op_type for n in fused.graph.node}  # really fused
+
+    pruned = onnxsim.apply_structured_pruning(fused, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_pair_model(w1[keep], w2[:, keep], b1=b1[keep])
+
+    rng_x = np.random.default_rng(69)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def _mlp_model_from_weights(w1, w2, b1=None, activation="Relu"):
+    """Like this file's own `_mlp_model`, but takes `W1`/`W2` (and optional
+    `B1`) directly instead of generating them from a seed -- needed here so
+    the real-ORT-optimizer-round-trip tests can build byte-identical
+    pre-fusion and sliced-oracle models from the exact same weight arrays.
+    """
+    K, H = w1.shape
+    Out = w2.shape[1]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        gemm1 = "h = Gemm(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        gemm1 = "h = MatMul(X, W1)"
+    return _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          {gemm1}
+          a = {activation}(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def _fusedgemm_producer_chain_model(w1, w2, b1=None, activation="Relu"):
+    K, H = w1.shape
+    Out = w2.shape[1]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        gemm1 = f'h = com.microsoft.FusedGemm<activation="{activation}">(X, W1, B1)'
+        initializer.append(_f32(b1, "B1"))
+    else:
+        gemm1 = f'h = com.microsoft.FusedGemm<activation="{activation}">(X, W1)'
+    return _fused_model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          {gemm1}
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def _matmul_fusedgemm_consumer_chain_model(
+    w1, w2, activation="Relu", consumer_activation="Sigmoid"
+):
+    K, H = w1.shape
+    Out = w2.shape[1]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    return _fused_model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          a = {activation}(h)
+          Y = com.microsoft.FusedGemm<activation="{consumer_activation}">(a, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def _fusedgemm_pair_model(
+    w1, w2, b1=None, activation="Relu", second_activation="Sigmoid"
+):
+    K, H = w1.shape
+    Out = w2.shape[1]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        gemm1 = f'h = com.microsoft.FusedGemm<activation="{activation}">(X, W1, B1)'
+        initializer.append(_f32(b1, "B1"))
+    else:
+        gemm1 = f'h = com.microsoft.FusedGemm<activation="{activation}">(X, W1)'
+    return _fused_model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          {gemm1}
+          Y = com.microsoft.FusedGemm<activation="{second_activation}">(h, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_fusedgemm_producer_matches_oracle():
+    K, H, Out = 8, 32, 4
+    rng = np.random.default_rng(70)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    b1 = rng.standard_normal((H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _fusedgemm_producer_chain_model(w1, w2, b1=b1)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    assert "FusedGemm" in {n.op_type for n in pruned.graph.node}
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    oracle = _fusedgemm_producer_chain_model(w1[:, keep], w2[keep, :], b1=b1[keep])
+
+    rng_x = np.random.default_rng(71)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_fusedgemm_consumer_matches_oracle():
+    K, H, Out = 8, 32, 4
+    rng = np.random.default_rng(72)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _matmul_fusedgemm_consumer_chain_model(w1, w2)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    assert "FusedGemm" in {n.op_type for n in pruned.graph.node}
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    oracle = _matmul_fusedgemm_consumer_chain_model(w1[:, keep], w2[keep, :])
+
+    rng_x = np.random.default_rng(73)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_fusedgemm_chain_matches_oracle():
+    # FusedGemm->FusedGemm, no separate activation node anywhere.
+    K, H, Out = 8, 32, 4
+    rng = np.random.default_rng(74)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    b1 = rng.standard_normal((H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _fusedgemm_pair_model(w1, w2, b1=b1)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, H // 2]
+    assert list(inits["W2"].dims) == [H // 2, Out]
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    oracle = _fusedgemm_pair_model(w1[:, keep], w2[keep, :], b1=b1[keep])
+
+    rng_x = np.random.default_rng(75)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_fusedgemm_real_ort_optimizer_round_trip_matches_oracle():
+    # Plain Gemm->Relu->Gemm put through onnxruntime's own optimizer
+    # (GemmActivationFusion) to get a genuine FusedGemm node, then pruned.
+    K, H, Out = 8, 32, 4
+    rng = np.random.default_rng(76)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    b1 = rng.standard_normal((H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    plain = _mlp_model_from_weights(w1, w2, b1=b1)
+
+    fused = _ort_optimize(plain)
+    assert "FusedGemm" in {n.op_type for n in fused.graph.node}
+
+    pruned = onnxsim.apply_structured_pruning(fused, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    oracle = _mlp_model_from_weights(w1[:, keep], w2[keep, :], b1=b1[keep])
+
+    rng_x = np.random.default_rng(77)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_not_eligible_reports_unmatched_fusedgemm():
+    # A FusedGemm that genuinely can't be matched (transA=1 -- declined by
+    # _match_matmul_like, same as a real Gemm with transA=1 already would
+    # be) is now a real, reportable decline this section can name, exactly
+    # like an unmatched plain Gemm already was -- confirms the diagnostic-
+    # eligibility sites were widened too, not just the pruning-correctness
+    # ones.
+    K, H = 8, 6
+    rng = np.random.default_rng(78)
+    w = rng.standard_normal((K, H)).astype(np.float32)
+    model = _fused_model(
+        f"""
+        g (float[{K},batch] X) => (float[batch,{H}] Y)
+        {{
+          Y = com.microsoft.FusedGemm<transA=1, activation="Relu">(X, W)
+        }}
+        """,
+        initializer=[_f32(w, "W")],
+    )
+    onnx.checker.check_model(model)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert report.not_eligible == ["FusedGemm 'Y'"]
+
+
 # --- Subgraph recursion --------------------------------------------------
 #
 # Covers :func:`onnxsim.pruning._iter_subgraphs` and the four entry points
