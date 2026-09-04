@@ -35418,6 +35418,283 @@ def test_structured_not_eligible_reports_unmatched_fusedgemm():
     assert report.not_eligible == ["FusedGemm 'Y'"]
 
 
+# --- GemmFastGelu (com.microsoft, FusionGemmFastGelu) ---------------------
+#
+# `com.microsoft::GemmFastGelu` is ONNX Runtime's own fusion of a plain
+# `MatMul` feeding a `FastGelu` (`FastGelu`'s own optional `bias` input
+# folded in) into one node -- confirmed live against this environment's
+# installed onnxruntime (1.29.0):
+#
+#   * Schema (`onnxruntime.capi.onnxruntime_pybind11_state
+#     .get_all_operator_schema()`): `GemmFastGelu(X, W, bias?) -> Y`, domain
+#     `com.microsoft`, **no attributes at all** -- no `transA`/`transB`/
+#     `alpha`/`beta` equivalent, unlike `Gemm`/`FusedGemm`.
+#   * The real fusion source shipped in the installed `onnxruntime` package
+#     (`onnxruntime/transformers/fusion_gemmfastgelu.py`,
+#     `FusionGemmFastGelu.fuse`) matches a plain `MatMul` feeding a
+#     `FastGelu` and re-emits `matmul.input[1 - weight_index]` (the non-
+#     weight operand) and `matmul.input[weight_index]` (`W`) verbatim,
+#     unrepacked, as `GemmFastGelu`'s own first two inputs -- a pure
+#     op-fusion, nothing quantization-related, nothing repacked, and `W` is
+#     stored the same way plain `MatMul`'s own weight always is (**not**
+#     transposed), never `Gemm`'s own optional `transB`-flagged layout.
+#   * This environment's onnxruntime has **no CPU kernel** for
+#     `GemmFastGelu` itself: `get_all_operator_schema()` registers only its
+#     schema (`GetOpSchema<GemmFastGelu_Microsoft_ver1>`), and a direct
+#     `onnxruntime.InferenceSession` load of a hand-built `GemmFastGelu`
+#     node raises `NOT_IMPLEMENTED` ("Could not find an implementation for
+#     GemmFastGelu(1) node") on `CPUExecutionProvider` -- unlike
+#     `FusedGemm`, which really does have one (`FusedGemm<T>::FusedGemm`,
+#     confirmed present in the same binary via `strings`). So every test
+#     below that needs to actually *execute* a (possibly pruned)
+#     `GemmFastGelu` node runs `_decompose_gemmfastgelu` first: it rewrites
+#     each `GemmFastGelu(X, W, bias?)` node, in place, into the literal
+#     unfused `MatMul(X, W) -> FastGelu(h, bias?)` pair the fusion source
+#     above confirms it's byte-identical to, reusing the exact same
+#     (already-pruned, where relevant) `W`/`bias` initializers -- so the
+#     real numbers actually being checked are still the pruned model's own
+#     real, sliced weights, executed through a real `InferenceSession`
+#     (`FastGelu` itself does have a CPU kernel -- this file's own
+#     `_FUSED_BIAS_GELU_OPS`-based tests above already run it directly) --
+#     only the fused node *type* is unfused for execution purposes, since
+#     the fused type has nowhere to run in this environment.
+#
+# Since `W`/`bias` are byte-identical to plain `MatMul`+`FastGelu`'s own
+# (see above), every producer/consumer/weight-only matcher in this module
+# that recognizes `MatMul` by a literal `op_type` check now also recognizes
+# `GemmFastGelu` via the shared `_match_matmul_like` choke point (see
+# `onnxsim/pruning.py`'s own diff) -- plus the small, separate set of
+# bias-handling call sites that special-case `("Gemm", "FusedGemm")` by a
+# literal `op_type in (...)` membership check, each widened to include
+# `"GemmFastGelu"` too (`_match_producer`, `_match_matmul_qdq`,
+# `_match_plain_matmul_nbits_peer`, `_match_lm_head_tail`). No new "walk
+# past an activation" chain-hop machinery is needed -- exactly like
+# `FusedGemm`, the activation (`FastGelu`'s own tanh-approximation Gelu) is
+# already baked into the node itself, invisible to chain-topology matching,
+# so pruning's channel-slicing simply commutes through it unchanged.
+
+
+def _decompose_gemmfastgelu(model):
+    """Rewrites every `com.microsoft::GemmFastGelu` node in `model` (a copy
+    -- the input is never mutated) into the literal unfused
+    `MatMul(X, W) -> FastGelu(h, bias?)` two-node sequence it is confirmed
+    byte-identical to (see this section's own top comment) -- needed only
+    because this environment's onnxruntime has no CPU kernel for
+    `GemmFastGelu` itself, so `_run` can't execute the fused node type
+    directly. Reuses the node's own `W`/`bias` initializer names verbatim
+    (no new initializers, no copying), so a caller can decompose a *pruned*
+    model and still be running its own real, sliced weights.
+    """
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    new_nodes = []
+    for i, node in enumerate(out.graph.node):
+        if node.op_type != "GemmFastGelu" or node.domain != "com.microsoft":
+            new_nodes.append(node)
+            continue
+        x_name, w_name = node.input[0], node.input[1]
+        bias_name = node.input[2] if len(node.input) == 3 and node.input[2] else None
+        (y_name,) = node.output
+        h_name = f"{y_name}__gemmfastgelu_h"
+        matmul = onnx.helper.make_node(
+            "MatMul", [x_name, w_name], [h_name], name=f"{node.name}__matmul"
+        )
+        fastgelu_inputs = [h_name, bias_name] if bias_name else [h_name]
+        fastgelu = onnx.helper.make_node(
+            "FastGelu",
+            fastgelu_inputs,
+            [y_name],
+            name=f"{node.name}__fastgelu",
+            domain="com.microsoft",
+        )
+        new_nodes.extend([matmul, fastgelu])
+    del out.graph.node[:]
+    out.graph.node.extend(new_nodes)
+    return out
+
+
+def _gemmfastgelu_producer_chain_model(w1, w2, b1=None):
+    K, H = w1.shape
+    Out = w2.shape[1]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        gemm1 = "h = com.microsoft.GemmFastGelu(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        gemm1 = "h = com.microsoft.GemmFastGelu(X, W1)"
+    return _fused_model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          {gemm1}
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_gemmfastgelu_hand_built_node_matches_matmul_then_fastgelu_via_decompose():
+    # Confirms _decompose_gemmfastgelu itself is a faithful, meaningful
+    # rewrite: a hand-built GemmFastGelu node, decomposed and run, must
+    # match an independently hand-built plain MatMul->FastGelu model run
+    # the ordinary way -- both executed by a real InferenceSession.
+    K, H = 8, 6
+    rng = np.random.default_rng(79)
+    w = rng.standard_normal((K, H)).astype(np.float32)
+    b = rng.standard_normal((H,)).astype(np.float32)
+    fused = _fused_model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{H}] Y)
+        {{
+          Y = com.microsoft.GemmFastGelu(X, W, B)
+        }}
+        """,
+        initializer=[_f32(w, "W"), _f32(b, "B")],
+    )
+    onnx.checker.check_model(fused)
+    plain = _fused_model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{H}] Y)
+        {{
+          h = MatMul(X, W)
+          Y = com.microsoft.FastGelu(h, B)
+        }}
+        """,
+        initializer=[_f32(w, "W"), _f32(b, "B")],
+    )
+    rng_x = np.random.default_rng(80)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y_decomposed,) = _run(_decompose_gemmfastgelu(fused), {"X": x})
+    (y_plain,) = _run(plain, {"X": x})
+    np.testing.assert_allclose(y_decomposed, y_plain, rtol=1e-6, atol=1e-6)
+
+
+def test_structured_pruning_gemmfastgelu_producer_matches_oracle():
+    # The real gap this section closes: pruning._candidates(graph) returned
+    # nothing at all for a hand-built, fused GemmFastGelu node before this
+    # change (confirmed live before writing this test), so
+    # apply_structured_pruning left its W completely untouched. Now the
+    # producer role is recognized via the shared _match_matmul_like choke
+    # point, exactly like FusedGemm's own producer test above.
+    K, H, Out = 8, 32, 4
+    rng = np.random.default_rng(81)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    b1 = rng.standard_normal((H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _gemmfastgelu_producer_chain_model(w1, w2, b1=b1)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    assert "GemmFastGelu" in {n.op_type for n in pruned.graph.node}
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, H // 2]
+    assert list(inits["B1"].dims) == [H // 2]  # bias slicing correctness
+    assert list(inits["W2"].dims) == [H // 2, Out]
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    oracle = _gemmfastgelu_producer_chain_model(w1[:, keep], w2[keep, :], b1=b1[keep])
+
+    rng_x = np.random.default_rng(82)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(_decompose_gemmfastgelu(pruned), {"X": x})
+    (y_oracle,) = _run(_decompose_gemmfastgelu(oracle), {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_gemmfastgelu_producer_no_bias_matches_oracle():
+    # GemmFastGelu's own bias is optional (unlike Gemm/FusedGemm's required-
+    # when-present-but-schema-optional C) -- confirms the no-bias (2-input)
+    # shape is matched too, not just the biased one above.
+    K, H, Out = 8, 24, 4
+    rng = np.random.default_rng(83)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _gemmfastgelu_producer_chain_model(w1, w2, b1=None)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.25)
+    onnx.checker.check_model(pruned)
+    keep = _oracle_keep_indices(w1, H - round(H * 0.25))
+    oracle = _gemmfastgelu_producer_chain_model(w1[:, keep], w2[keep, :], b1=None)
+
+    rng_x = np.random.default_rng(84)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(_decompose_gemmfastgelu(pruned), {"X": x})
+    (y_oracle,) = _run(_decompose_gemmfastgelu(oracle), {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_two_node_matmul_fastgelu_regression():
+    # Regression-safety check: the pre-existing, separate two-node MatMul +
+    # FastGelu path (_FUSED_BIAS_GELU_OPS/_match_fused_bias_gelu, unrelated
+    # to this section's own _match_matmul_like widening) must still prune
+    # identically to before -- FastGelu itself has a real CPU kernel here,
+    # so this one runs directly, no decomposition needed.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(85)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    b1 = rng.standard_normal((H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _fused_model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          up = MatMul(X, W1)
+          h = com.microsoft.FastGelu(up, Bias1)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(b1, "Bias1"), _f32(w2, "W2")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Bias1"].dims) == [H // 2]
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    rng_x = np.random.default_rng(86)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    h = x @ w1[:, keep] + b1[keep]
+    a = 0.5 * h * (1.0 + np.tanh(0.7978845608028654 * (h + 0.044715 * h**3)))
+    y_oracle = a @ w2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_not_eligible_reports_unmatched_gemmfastgelu():
+    # A GemmFastGelu that genuinely can't be matched (4 inputs -- GemmFastGelu
+    # has no attribute to misconfigure the way FusedGemm's transA=1 does
+    # above, so this uses the arity check _match_matmul_like's own
+    # GemmFastGelu branch applies instead) is a real, reportable decline
+    # this section can name, exactly like an unmatched FusedGemm already is
+    # -- confirms the diagnostic-eligibility sites were widened too, not
+    # just the pruning-correctness ones.
+    K, H = 8, 6
+    rng = np.random.default_rng(87)
+    w = rng.standard_normal((K, H)).astype(np.float32)
+    b = rng.standard_normal((H,)).astype(np.float32)
+    extra = rng.standard_normal((H,)).astype(np.float32)
+    model = _fused_model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{H}] Y)
+        {{
+          Y = com.microsoft.GemmFastGelu(X, W, B, Extra)
+        }}
+        """,
+        initializer=[_f32(w, "W"), _f32(b, "B"), _f32(extra, "Extra")],
+    )
+    onnx.checker.check_model(model)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert report.not_eligible == ["GemmFastGelu 'Y'"]
+
+
 # --- Subgraph recursion --------------------------------------------------
 #
 # Covers :func:`onnxsim.pruning._iter_subgraphs` and the four entry points
