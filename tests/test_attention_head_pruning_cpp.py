@@ -12,6 +12,7 @@ coverage for all three matched op families: plain ``com.microsoft::Attention``
 
 import numpy as np
 import onnx
+import onnx.helper
 import onnx.numpy_helper
 import pytest
 from onnx import parser
@@ -906,3 +907,188 @@ def test_cpp_attention_head_pruning_matches_python_reference_output():
     (y_py,) = _run(pruned_py, {"X": x})
     (y_cpp,) = _run(pruned_cpp, {"X": x})
     np.testing.assert_allclose(y_py, y_cpp, rtol=1e-4, atol=1e-4)
+
+
+# --- Subgraph recursion (If) -------------------------------------------------
+#
+# Covers `structured_pruning_entry.cpp`'s own `IterSubgraphs` and the
+# `ApplyAttentionHeadPruning` loop built on it -- a straight C++ port of
+# `onnxsim/pruning.py`'s own `_iter_subgraphs`/`apply_attention_head_pruning`
+# subgraph-recursion round (see that module's "Subgraph recursion" section
+# comment, and `structured_pruning_entry.cpp`'s own copy of it above
+# `IterSubgraphs`'s definition, for the full design rationale). Model shape
+# mirrors `tests/test_pruning.py`'s own `_if_attention_model`/
+# `test_attention_head_pruning_prunes_blocks_inside_if_branches` fixture,
+# just driven through `apply_attention_head_pruning_cpp` instead of the
+# pure-Python reference.
+#
+# `onnx.parser.parse_model`'s text format has no way to spell a graph-typed
+# node attribute (an `If`'s `then_branch`/`else_branch`), so the model below
+# uses `onnx.helper.make_node`/`make_graph` directly, per this repo's own
+# CLAUDE.md guidance for exactly this case -- see `test_structured_pruning_
+# cpp.py`'s own matching "Subgraph recursion" section for the `Loop`-body
+# half of this coverage (the two C++ port test files split the `If`/`Loop`
+# cases between them rather than duplicating both in each).
+
+
+def _attention_branch_nodes(K, H, D, Out, prefix, seed):
+    rng = np.random.default_rng(seed)
+    Nq = Nk = Nv = H * D
+    wqkv = rng.standard_normal((K, Nq + Nk + Nv)).astype(np.float32)
+    bqkv = rng.standard_normal((Nq + Nk + Nv,)).astype(np.float32)
+    wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+    nodes = [
+        onnx.helper.make_node(
+            "Attention",
+            ["Xb", f"{prefix}Wqkv", f"{prefix}Bqkv"],
+            [f"{prefix}ctx"],
+            domain="com.microsoft",
+            num_heads=H,
+            qkv_hidden_sizes=[Nq, Nk, Nv],
+        ),
+        onnx.helper.make_node("MatMul", [f"{prefix}ctx", f"{prefix}Wout"], ["Yb"]),
+    ]
+    inits = [
+        _f32(wqkv, f"{prefix}Wqkv"),
+        _f32(bqkv, f"{prefix}Bqkv"),
+        _f32(wout, f"{prefix}Wout"),
+    ]
+    return nodes, inits, dict(wqkv=wqkv, bqkv=bqkv, wout=wout)
+
+
+def _if_attention_model(K=8, H=4, D=4, Out=6):
+    then_nodes, then_inits, then_cfg = _attention_branch_nodes(
+        K, H, D, Out, "then_", seed=1
+    )
+    else_nodes, else_inits, else_cfg = _attention_branch_nodes(
+        K, H, D, Out, "else_", seed=2
+    )
+    out_vi = onnx.helper.make_tensor_value_info(
+        "Yb", onnx.TensorProto.FLOAT, ["batch", "seq", Out]
+    )
+    then_graph = onnx.helper.make_graph(
+        then_nodes, "then_graph", [], [out_vi], initializer=then_inits
+    )
+    else_graph = onnx.helper.make_graph(
+        else_nodes, "else_graph", [], [out_vi], initializer=else_inits
+    )
+    if_node = onnx.helper.make_node(
+        "If", ["cond"], ["Y1"], then_branch=then_graph, else_branch=else_graph
+    )
+    xb = onnx.helper.make_tensor_value_info(
+        "Xb", onnx.TensorProto.FLOAT, ["batch", "seq", K]
+    )
+    cond = onnx.helper.make_tensor_value_info("cond", onnx.TensorProto.BOOL, [])
+    y1 = onnx.helper.make_tensor_value_info(
+        "Y1", onnx.TensorProto.FLOAT, ["batch", "seq", Out]
+    )
+    graph = onnx.helper.make_graph([if_node], "g", [xb, cond], [y1])
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 17),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    return model, dict(then=then_cfg, else_=else_cfg)
+
+
+def _then_else_graphs(pruned_model):
+    if_node = next(n for n in pruned_model.graph.node if n.op_type == "If")
+    then_g = else_g = None
+    for attr in if_node.attribute:
+        if attr.name == "then_branch":
+            then_g = attr.g
+        elif attr.name == "else_branch":
+            else_g = attr.g
+    return then_g, else_g
+
+
+def test_cpp_attention_head_pruning_prunes_blocks_inside_if_branches():
+    # The core repro: apply_attention_head_pruning_cpp must match and prune
+    # the merged-QKV Attention block inside BOTH `then_branch` and
+    # `else_branch` -- each with its own independent weights and its own
+    # independently-computed importance ranking/kept-head set -- not just a
+    # top-level block. Verified by initializer shape, by the node's own
+    # updated `num_heads` attribute, and by an exact oracle cross-check per
+    # branch (mirroring `test_cpp_attention_head_pruning_matches_manual_
+    # head_deletion_exactly`'s own oracle, just built independently once per
+    # branch to prove neither branch's ranking leaked into the other's).
+    K, H, D, Out = 8, 4, 4, 6
+    model, cfg = _if_attention_model(K=K, H=H, D=D, Out=Out)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    then_g, else_g = _then_else_graphs(pruned)
+    rng = np.random.default_rng(4)
+    xb = rng.standard_normal((2, 3, K)).astype(np.float32)
+
+    for g, prefix, branch_cfg, cond in [
+        (then_g, "then_", cfg["then"], True),
+        (else_g, "else_", cfg["else_"], False),
+    ]:
+        inits = {t.name: t for t in g.initializer}
+        assert list(inits[f"{prefix}Wqkv"].dims) == [K, 3 * (H // 2) * D]
+        assert list(inits[f"{prefix}Wout"].dims) == [(H // 2) * D, Out]
+        node = next(n for n in g.node if n.op_type == "Attention")
+        num_heads = next(a.i for a in node.attribute if a.name == "num_heads")
+        assert num_heads == H // 2
+
+        wqkv, bqkv, wout = branch_cfg["wqkv"], branch_cfg["bqkv"], branch_cfg["wout"]
+        Nq = Nk = Nv = H * D
+        keep = _oracle_keep_heads(wqkv, Nq, Nk, Nv, H, H // 2)
+        qi, ki, vi = (
+            _head_idx(keep, D),
+            _head_idx(keep, D) + Nq,
+            _head_idx(keep, D) + Nq + Nk,
+        )
+        all_idx = np.concatenate([qi, ki, vi])
+        np.testing.assert_allclose(
+            onnx.numpy_helper.to_array(inits[f"{prefix}Wqkv"]),
+            wqkv[:, all_idx],
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            onnx.numpy_helper.to_array(inits[f"{prefix}Wout"]),
+            wout[_head_idx(keep, D), :],
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+        oracle_bqkv = bqkv[all_idx]
+        np.testing.assert_allclose(
+            onnx.numpy_helper.to_array(inits[f"{prefix}Bqkv"]),
+            oracle_bqkv,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+        (yb,) = _run(pruned, {"Xb": xb, "cond": np.array(cond)})
+        assert yb.shape == (2, 3, Out)
+        assert np.all(np.isfinite(yb))
+
+
+def test_cpp_attention_head_pruning_matches_python_reference_output_with_if_subgraph():
+    # Cross-check against onnxsim.apply_attention_head_pruning (the
+    # pure-Python reference this C++ port mirrors) on a model where the
+    # only prunable attention block lives inside the `If`'s own branches --
+    # both `cond` values are driven through InferenceSession so both
+    # branches' own subgraph-recursion behavior is exercised.
+    K, H, D, Out = 8, 4, 4, 6
+    model, _cfg = _if_attention_model(K=K, H=H, D=D, Out=Out)
+
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+
+    rng = np.random.default_rng(23)
+    xb = rng.standard_normal((2, 3, K)).astype(np.float32)
+    for cond in (True, False):
+        feeds = {"Xb": xb, "cond": np.array(cond)}
+        (y_py,) = _run(pruned_py, feeds)
+        (y_cpp,) = _run(pruned_cpp, feeds)
+        np.testing.assert_allclose(y_py, y_cpp, rtol=1e-4, atol=1e-4)

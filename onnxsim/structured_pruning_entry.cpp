@@ -5219,6 +5219,95 @@ void ApplySplitGatedChains(onnx::GraphProto* graph,
   }
 }
 
+// --- Subgraph recursion ------------------------------------------------
+//
+// Mirrors pruning.py's own `_iter_subgraphs` and the "Subgraph recursion"
+// section comment just above its definition there -- read that comment
+// block first if you're touching this; it's the design rationale for
+// everything below, not just for the Python side.
+//
+// A plain `If` node's `then_branch`/`else_branch`, a `Loop`/`Scan` node's
+// `body`, or (per pruning.py's own confirmation against onnxruntime's
+// contrib-op schema registry) a `com.microsoft::BeamSearch`/`GreedySearch`/
+// `Sampling`/`WhisperBeamSearch` node's own `decoder`/`encoder`/
+// `init_decoder` attribute is itself a full GraphProto that can carry
+// arbitrary weight-bearing nodes -- for a whole-model-generation export
+// (e.g. produced by `onnxruntime.transformers.models.{t5,gpt2,whisper}
+// .convert_generation`), essentially 100% of the actual prunable weight
+// lives inside one of these, not in the top-level graph at all. Without
+// this, the C++ port would silently prune nothing on such a model while
+// pruning.py's own `apply_structured_pruning`/`apply_attention_head_
+// pruning` (which this file is a behavior-identical port of) would prune
+// everything inside the subgraph -- a correctness gap, not just a missed
+// optimization.
+//
+// IterSubgraphs is the one shared primitive both public entry points below
+// build on: it walks `graph`'s own `node()` list and recursively every
+// nested GraphProto reachable from any node's GRAPH-/GRAPHS-typed
+// AttributeProto (genuinely recursive -- a subgraph's own nodes can
+// themselves carry further-nested subgraphs, e.g. an `If` inside a `Loop`
+// body), matched purely by `AttributeProto::type()` rather than a
+// per-op-name allowlist, so -- exactly like the Python original -- it
+// needs no update when some future op adds another graph-typed attribute.
+//
+// Every GraphProto* this returns is handed, completely independently, to
+// the existing per-graph Find*/Apply* functions below UNCHANGED -- never
+// merged with any sibling or ancestor graph's own state. This is what
+// makes the same two correctness properties pruning.py's own comment block
+// documents hold here too, with no extra bookkeeping:
+//
+// - Implicit-capture scoping: ONNX lets a subgraph's own node reference a
+//   name defined in an ENCLOSING graph's scope rather than its own
+//   node()/initializer() list (e.g. an `If` branch reading a weight that
+//   actually lives in the top-level graph's initializer list). Every
+//   Find*Chains function below resolves a weight/value strictly via an
+//   `init_map`/consumer map built from the one `graph` argument it was
+//   given -- never a caller's own enclosing scope -- so a node whose input
+//   only resolves in an outer scope simply fails to match and that chain
+//   is declined, the same "decline rather than mis-slice" behavior this
+//   file already applies to every other unresolvable topology. No
+//   subgraph is ever treated as if it could see outward.
+// - No double-counting across scopes: since every Apply*Chains function
+//   below only ever mutates a tensor found in the CURRENT graph's own
+//   mutable_initializer() list (never a parent's), and a parent-scope
+//   initializer an inner graph merely *reads* by implicit capture is --
+//   by the point above -- never even matched as prunable from inside that
+//   inner graph, there is no path by which processing a subgraph could
+//   reach into, and corrupt, a tensor that actually belongs to (and is
+//   separately, safely processed as part of) an ancestor or sibling
+//   graph's own pass. Each subgraph also gets its own fresh TouchedState
+//   (see ApplyStructuredPruning below) for the same reason pruning.py
+//   resets its own `_TouchedState` per graph: a name is only ever a
+//   "shared/tied initializer" conflict against another chain matched
+//   *within that same graph*, never across graphs -- ONNX names are
+//   scoped per-graph-tree-position and this file never merges two graphs'
+//   own initializer/consumer maps together.
+//
+// Depth-first, `graph.node()` then `node.attribute()` declaration order,
+// recursing into a found subgraph's own nested subgraphs before moving on
+// to the next node -- byte-for-byte the same traversal order as the
+// Python original, so a global_sparsity-style pooled ranking computed
+// per-graph (were the C++ port ever extended to that mode) would visit
+// graphs in the same order pruning.py does.
+std::vector<onnx::GraphProto*> IterSubgraphs(onnx::GraphProto* graph) {
+  std::vector<onnx::GraphProto*> graphs;
+  graphs.push_back(graph);
+  for (onnx::NodeProto& node : *graph->mutable_node()) {
+    for (onnx::AttributeProto& attr : *node.mutable_attribute()) {
+      if (attr.type() == onnx::AttributeProto::GRAPH) {
+        std::vector<onnx::GraphProto*> nested = IterSubgraphs(attr.mutable_g());
+        graphs.insert(graphs.end(), nested.begin(), nested.end());
+      } else if (attr.type() == onnx::AttributeProto::GRAPHS) {
+        for (onnx::GraphProto& g : *attr.mutable_graphs()) {
+          std::vector<onnx::GraphProto*> nested = IterSubgraphs(&g);
+          graphs.insert(graphs.end(), nested.begin(), nested.end());
+        }
+      }
+    }
+  }
+  return graphs;
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
@@ -5229,53 +5318,66 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
         std::to_string(sparsity));
   }
   onnx::ModelProto out = model;
-  onnx::GraphProto* graph = out.mutable_graph();
 
-  std::vector<Chain> chains = FindChains(graph);
-  std::vector<Chain> gated_chains = FindGatedChains(graph);
-  std::vector<Chain> conv_chains = FindConvChains(graph);
-  std::vector<Chain> conv_residual_chains = FindConvResidualChains(graph);
-  std::vector<Chain> matmul_residual_chains = FindMatmulResidualChains(graph);
-  chains.insert(chains.end(), std::make_move_iterator(gated_chains.begin()),
-                std::make_move_iterator(gated_chains.end()));
-  chains.insert(chains.end(), std::make_move_iterator(conv_chains.begin()),
-                std::make_move_iterator(conv_chains.end()));
-  chains.insert(chains.end(),
-                std::make_move_iterator(conv_residual_chains.begin()),
-                std::make_move_iterator(conv_residual_chains.end()));
-  chains.insert(chains.end(),
-                std::make_move_iterator(matmul_residual_chains.begin()),
-                std::make_move_iterator(matmul_residual_chains.end()));
-  std::vector<ConcatChain> concat_chains = FindMatmulConcatChains(graph);
-  std::vector<ConcatChain> conv_concat_chains = FindConvConcatChains(graph);
-  concat_chains.insert(concat_chains.end(),
-                       std::make_move_iterator(conv_concat_chains.begin()),
-                       std::make_move_iterator(conv_concat_chains.end()));
-  std::vector<SplitGatedChain> split_gated_chains = FindSplitGatedChains(graph);
+  // Subgraph-aware (IterSubgraphs, see this file's own "Subgraph
+  // recursion" section comment above): every chain family below is
+  // matched and pruned inside a nested If/Loop/Scan/BeamSearch-family
+  // subgraph, at any nesting depth, exactly as if that subgraph were its
+  // own top-level graph -- each returned GraphProto* gets its own fresh
+  // TouchedState, so a "shared/tied initializer" conflict is only ever
+  // detected against another chain matched *within that same graph*,
+  // mirroring pruning.py's own apply_structured_pruning loop over
+  // `_iter_subgraphs(out.graph)` exactly (including resetting `touched`,
+  // and flushing `stale_value_info` into that same graph's own
+  // `value_info`, once per graph rather than once for the whole model).
+  for (onnx::GraphProto* graph : IterSubgraphs(out.mutable_graph())) {
+    std::vector<Chain> chains = FindChains(graph);
+    std::vector<Chain> gated_chains = FindGatedChains(graph);
+    std::vector<Chain> conv_chains = FindConvChains(graph);
+    std::vector<Chain> conv_residual_chains = FindConvResidualChains(graph);
+    std::vector<Chain> matmul_residual_chains = FindMatmulResidualChains(graph);
+    chains.insert(chains.end(), std::make_move_iterator(gated_chains.begin()),
+                  std::make_move_iterator(gated_chains.end()));
+    chains.insert(chains.end(), std::make_move_iterator(conv_chains.begin()),
+                  std::make_move_iterator(conv_chains.end()));
+    chains.insert(chains.end(),
+                  std::make_move_iterator(conv_residual_chains.begin()),
+                  std::make_move_iterator(conv_residual_chains.end()));
+    chains.insert(chains.end(),
+                  std::make_move_iterator(matmul_residual_chains.begin()),
+                  std::make_move_iterator(matmul_residual_chains.end()));
+    std::vector<ConcatChain> concat_chains = FindMatmulConcatChains(graph);
+    std::vector<ConcatChain> conv_concat_chains = FindConvConcatChains(graph);
+    concat_chains.insert(concat_chains.end(),
+                         std::make_move_iterator(conv_concat_chains.begin()),
+                         std::make_move_iterator(conv_concat_chains.end()));
+    std::vector<SplitGatedChain> split_gated_chains = FindSplitGatedChains(graph);
 
-  TouchedState touched;
-  if (!chains.empty()) {
-    ApplyChains(graph, chains, sparsity, touched);
-  }
-  if (!concat_chains.empty()) {
-    ApplyConcatChains(graph, concat_chains, sparsity, touched);
-  }
-  if (!split_gated_chains.empty()) {
-    // A genuinely separate application pass, not folded into ApplyChains --
-    // see FindSplitGatedChains/ApplySplitGatedChains's own section comment
-    // for why. Shares `touched` with the calls above so a weight this pass
-    // resizes can never be double-resized by (or double-resize) an ordinary
-    // chain/Concat-chain that happens to touch the same initializer.
-    ApplySplitGatedChains(graph, split_gated_chains, sparsity, touched);
-  }
-  if (!touched.stale_value_info.empty()) {
-    google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
-    for (const auto& vi : graph->value_info()) {
-      if (!touched.stale_value_info.count(vi.name())) {
-        *kept.Add() = vi;
-      }
+    TouchedState touched;
+    if (!chains.empty()) {
+      ApplyChains(graph, chains, sparsity, touched);
     }
-    graph->mutable_value_info()->Swap(&kept);
+    if (!concat_chains.empty()) {
+      ApplyConcatChains(graph, concat_chains, sparsity, touched);
+    }
+    if (!split_gated_chains.empty()) {
+      // A genuinely separate application pass, not folded into ApplyChains
+      // -- see FindSplitGatedChains/ApplySplitGatedChains's own section
+      // comment for why. Shares `touched` with the calls above so a weight
+      // this pass resizes can never be double-resized by (or
+      // double-resize) an ordinary chain/Concat-chain that happens to
+      // touch the same initializer -- still scoped to this one graph only.
+      ApplySplitGatedChains(graph, split_gated_chains, sparsity, touched);
+    }
+    if (!touched.stale_value_info.empty()) {
+      google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
+      for (const auto& vi : graph->value_info()) {
+        if (!touched.stale_value_info.count(vi.name())) {
+          *kept.Add() = vi;
+        }
+      }
+      graph->mutable_value_info()->Swap(&kept);
+    }
   }
   return out;
 }
@@ -5288,17 +5390,31 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
         std::to_string(sparsity));
   }
   onnx::ModelProto out = model;
-  onnx::GraphProto* graph = out.mutable_graph();
 
-  std::vector<AttnChain> chains = FindAttentionChains(graph);
-  std::vector<AttnChain> gqa_chains = FindGqaChains(graph);
-  std::vector<AttnChain> onnx_attn_chains = FindOnnxAttentionChains(graph);
-  chains.insert(chains.end(), std::make_move_iterator(gqa_chains.begin()),
-                std::make_move_iterator(gqa_chains.end()));
-  chains.insert(chains.end(), std::make_move_iterator(onnx_attn_chains.begin()),
-                std::make_move_iterator(onnx_attn_chains.end()));
-  if (!chains.empty()) {
-    ApplyAttentionChains(graph, chains, sparsity);
+  // Subgraph-aware (IterSubgraphs, see this file's own "Subgraph
+  // recursion" section comment above): every chain family below is
+  // matched and pruned inside a nested If/Loop/Scan/BeamSearch-family
+  // subgraph, at any nesting depth, exactly as if that subgraph were its
+  // own top-level graph -- each Find*Chains call below is given one
+  // GraphProto* (top-level or nested) at a time, so a chain that would
+  // need to reach a producer/consumer only resolvable via an
+  // implicitly-captured name from an enclosing scope is declined (never
+  // matched) rather than mis-resolved, and ApplyAttentionChains only ever
+  // slices an initializer out of the one graph it was actually found in.
+  // Mirrors pruning.py's own apply_attention_head_pruning loop over
+  // `_iter_subgraphs(out.graph)`.
+  for (onnx::GraphProto* graph : IterSubgraphs(out.mutable_graph())) {
+    std::vector<AttnChain> chains = FindAttentionChains(graph);
+    std::vector<AttnChain> gqa_chains = FindGqaChains(graph);
+    std::vector<AttnChain> onnx_attn_chains = FindOnnxAttentionChains(graph);
+    chains.insert(chains.end(), std::make_move_iterator(gqa_chains.begin()),
+                  std::make_move_iterator(gqa_chains.end()));
+    chains.insert(chains.end(),
+                  std::make_move_iterator(onnx_attn_chains.begin()),
+                  std::make_move_iterator(onnx_attn_chains.end()));
+    if (!chains.empty()) {
+      ApplyAttentionChains(graph, chains, sparsity);
+    }
   }
   return out;
 }
