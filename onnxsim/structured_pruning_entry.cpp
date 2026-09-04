@@ -578,6 +578,34 @@ struct ChainOp {
   std::optional<std::string> const_name;
 };
 
+// One mid-chain `GroupNormalization` node WalkToConvConsumer crossed
+// transparently -- the Conv/spatial-path analogue of ConvPassThrough's
+// depthwise-Conv hop, for group-normalization statistics rather than a
+// channel-mixing-free Conv. Unlike ConvPassThrough, this needs BOTH its own
+// `scale` and `bias` sliced (both required by the op's own schema) -- via
+// SliceLastAxis, not ConvPassThrough's own axis-0 SliceProducerWeight: a
+// GroupNormalization `scale`/`bias` is only ever admitted here when
+// FlatChannelConst's `prod(dims) == dims[-1]` bar holds (mirroring
+// pruning.py's own `_flat_channel_const`), a looser bar than strictly
+// rank-1 that a naive axis-0 slice would get wrong for (e.g. a `[1, 1, C]`
+// shape), so this deliberately does NOT reuse ConvPassThrough the way a
+// per-channel PRelu `slope` (always exactly `[C, 1, ..., 1]`) safely does --
+// see MatchGroupNormPassThrough. Also unlike ConvPassThrough, this hop is
+// its own dedicated (at-most-one-per-chain) `Chain::group_norm` field rather
+// than living in a vector: its `num_groups` constrains ChainGroup()'s own
+// per-block `keep` selection exactly like a general grouped Conv's own
+// `group` does (see ChainGroup, MatchGroupNormPassThrough), a whole-chain
+// property no other conv_pass_through hop carries. `num_groups` itself is
+// never rewritten -- staying valid (the post-prune channel count still
+// divides it evenly) without changing it is the entire point of the
+// uniform-per-`num_groups`-block scope this hop is held to.
+struct GroupNormPassThrough {
+  onnx::NodeProto* node;
+  std::string scale;
+  std::string bias;
+  int64_t num_groups;
+};
+
 // One extra, independent forward-consumer branch a residual/merge group's
 // own fan-out resolves to -- mirroring pruning.py's own _ConsumerBranch --
 // fed by the exact same shared `keep` set as a Chain's own primary
@@ -606,6 +634,12 @@ struct Chain {
   // fan-out resolved -- see pruning.py's own _Chain.extra_consumers. Always
   // empty for every chain kind except a Conv/MatMul residual/merge group.
   std::vector<ConsumerBranch> extra_consumers;
+  // A single mid-chain `GroupNormalization` hop the chain walk crossed
+  // transparently -- FindConvChains only, for now (see WalkToConvConsumer's
+  // own `recognize_group_norm` parameter; always nullopt for every other
+  // chain kind -- residual/merge chains, Concat-merged chains, and every
+  // MatMul/Gemm chain -- mirroring pruning.py's own `_Chain.group_norm`).
+  std::optional<GroupNormPassThrough> group_norm;
 };
 
 // --- MatMul/Gemm plain chains, mirroring _match_producer/_walk_to_consumer/
@@ -1066,6 +1100,236 @@ std::optional<DepthwiseMatch> MatchDepthwiseConvPassThrough(
   return DepthwiseMatch{node.input(1), bias};
 }
 
+// True if `name` names a constant FLOAT initializer shaped like a flat
+// per-channel vector (`prod(dims) == dims[-1]`) -- mirrors pruning.py's own
+// `_flat_channel_const` exactly: the self-consistency bar every per-channel
+// affine/bias/scale hop in this module checks before ever accepting a
+// tensor as a slice target. The real `dims[-1] == n_channels` check, once
+// the chain's real channel count is known, is left to the caller
+// (MatchGroupNormPassThrough).
+bool FlatChannelConst(const std::string& name, const InitMap& init_map) {
+  auto it = init_map.find(name);
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT) {
+    return false;
+  }
+  const auto& dims = it->second->dims();
+  if (dims.size() == 0) {
+    return false;
+  }
+  int64_t prod = 1;
+  for (int64_t d : dims) {
+    prod *= d;
+  }
+  return prod == dims.Get(dims.size() - 1);
+}
+
+struct GroupNormMatch {
+  std::string scale;
+  std::string bias;
+  int64_t num_groups;
+};
+
+// The Conv-chain GroupNormalization pass-through matcher used by
+// WalkToConvConsumer, mirroring pruning.py's own
+// _match_group_norm_pass_through: if `node` is a plain (default-domain)
+// `GroupNormalization` node whose own `num_groups` attribute evenly divides
+// `n_channels`, with constant, per-channel-shaped (FlatChannelConst,
+// `dims[-1] == n_channels` -- this alone already excludes the deprecated
+// opset-18 per-*group*-shaped schema whenever `num_groups < n_channels`)
+// `scale` (input 1) and `bias` (input 2) -- both required by the op's own
+// schema -- returns `{scale_name, bias_name, num_groups}`. Declines
+// (nullopt) on a missing/non-constant/wrongly-shaped `scale`/`bias`,
+// `num_groups < 1`, `n_channels % num_groups != 0`, or `scale`/`bias`
+// naming the same tensor (double-slicing it in ApplyChains's own per-hop
+// loop would corrupt it) -- none of these is guessed at. The real "does
+// this hop's own `num_groups` agree with a same-chain grouped Conv
+// producer's/consumer's own `group`" check is left to the caller
+// (FindConvChains), which has visibility into both.
+std::optional<GroupNormMatch> MatchGroupNormPassThrough(
+    const onnx::NodeProto& node, const InitMap& init_map,
+    int64_t n_channels) {
+  if (node.op_type() != "GroupNormalization" || node.domain() != "") {
+    return std::nullopt;
+  }
+  if (node.input_size() != 3 || node.input(1).empty() ||
+      node.input(2).empty()) {
+    return std::nullopt;
+  }
+  int64_t num_groups = 0;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "num_groups") {
+      num_groups = attr.i();
+    }
+  }
+  if (num_groups < 1 || n_channels % num_groups != 0) {
+    return std::nullopt;
+  }
+  const std::string& scale_name = node.input(1);
+  const std::string& bias_name = node.input(2);
+  if (scale_name == bias_name) {
+    return std::nullopt;  // Tied scale/bias -- double-slicing would corrupt it.
+  }
+  if (!FlatChannelConst(scale_name, init_map) ||
+      !FlatChannelConst(bias_name, init_map)) {
+    return std::nullopt;
+  }
+  const auto& sdims = init_map.at(scale_name)->dims();
+  const auto& bdims = init_map.at(bias_name)->dims();
+  if (sdims.Get(sdims.size() - 1) != n_channels ||
+      bdims.Get(bdims.size() - 1) != n_channels) {
+    return std::nullopt;
+  }
+  return GroupNormMatch{scale_name, bias_name, num_groups};
+}
+
+// True iff `node` (already confirmed by the caller to be a plain
+// (default-domain) `Resize`, `node.input(0)` the tensor being walked
+// through) provably leaves axis 1 -- the NCHW channel axis this module's
+// Conv-chain machinery assumes throughout -- unresized, so it is safe to
+// cross transparently. Declines (false) rather than guesses whenever it
+// cannot statically prove that -- mirrors pruning.py's own
+// _match_resize_channel_pass_through exactly (see that function's own
+// docstring for the full reasoning, including the empirically-confirmed
+// commutativity argument and why a `sizes`-driven Resize is declined
+// outright rather than guessed at):
+//
+// - Needs a length-3-or-4 `node.input` (`X, roi, scales[, sizes]`, the
+//   opset 11+ signature) so `scales` lands at a known, fixed position.
+// - Only a `scales` (tensor(float))-driven Resize is ever recognized -- a
+//   `sizes`-driven one is declined outright, always, never guessed at.
+// - `scales` must be a constant FLOAT initializer -- a runtime-computed
+//   value means this pass cannot know which axis is affected.
+// - The (opset 18+) `axes` attribute, when present, restricts which input
+//   axes `scales` actually describes. A negative `axes` entry declines the
+//   whole hop (can't resolve without a known rank); axis 1 simply not being
+//   named in `axes` at all means it is by definition not resized.
+bool MatchResizeChannelPassThrough(const onnx::NodeProto& node,
+                                   const InitMap& init_map) {
+  if (node.op_type() != "Resize" || node.domain() != "") {
+    return false;
+  }
+  if ((node.input_size() != 3 && node.input_size() != 4) ||
+      node.input(0).empty()) {
+    return false;
+  }
+  const std::string& scales_name = node.input(2);
+  if (scales_name.empty()) {
+    return false;  // Only a `scales`-driven Resize is ever recognized.
+  }
+  auto it = init_map.find(scales_name);
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT) {
+    return false;
+  }
+  std::vector<float> values = ReadFloatTensor(*it->second);
+
+  std::optional<std::vector<int64_t>> axes_attr;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "axes") {
+      axes_attr = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    }
+  }
+
+  float channel_value;
+  if (!axes_attr) {
+    if (values.size() < 2) {
+      return false;  // No axis-1 slot in a `scales` this short.
+    }
+    channel_value = values[1];
+  } else {
+    for (int64_t a : *axes_attr) {
+      if (a < 0) {
+        return false;  // Can't resolve a negative axis without a known rank.
+      }
+    }
+    if (values.size() != axes_attr->size()) {
+      return false;  // Malformed -- schema requires equal length.
+    }
+    auto pos = std::find(axes_attr->begin(), axes_attr->end(), int64_t{1});
+    if (pos == axes_attr->end()) {
+      return true;  // Axis 1 isn't named -- definitely not resized.
+    }
+    channel_value = values[static_cast<size_t>(pos - axes_attr->begin())];
+  }
+  return channel_value == 1.0f;
+}
+
+// True iff `node` (already confirmed by the caller to be a plain
+// (default-domain) `Pad`, `node.input(0)` the tensor being walked through)
+// provably pads *nothing* on axis 1 -- the NCHW channel axis -- so it is
+// safe to cross transparently, whatever its `mode`. Declines (false) rather
+// than guesses whenever it cannot statically prove that -- mirrors
+// pruning.py's own _match_pad_channel_pass_through exactly (see that
+// function's own docstring for the full reasoning):
+//
+// - Needs a `pads` *input* at `node.input(1)` (opset 11+'s signature) that
+//   is a constant INT64 initializer -- opset < 11's older attribute-based
+//   `pads` is declined outright, mirroring MatchResizeChannelPassThrough's
+//   own "statically-known-constant-only" bar.
+// - The (opset 18+) `axes` *input* (`node.input(3)`), when present, must
+//   likewise be a constant INT64 initializer, and restricts which axes
+//   `pads` describes (`len(pads) == 2 * len(axes)`). A negative `axes`
+//   entry declines the whole hop; axis 1 not named in `axes` at all means
+//   it is by definition not padded.
+// - When `axes` is omitted, `pads` spans every input axis in order
+//   (`len(pads) == 2 * rank`), so `rank = len(pads) / 2` is recovered
+//   directly from `pads`'s own length, and axis 1's begin/end pads sit at
+//   `pads[1]`/`pads[rank + 1]`.
+bool MatchPadChannelPassThrough(const onnx::NodeProto& node,
+                                const InitMap& init_map) {
+  if (node.op_type() != "Pad" || node.domain() != "") {
+    return false;
+  }
+  if (node.input_size() < 2 || node.input(0).empty() ||
+      node.input(1).empty()) {
+    return false;
+  }
+  auto pit = init_map.find(node.input(1));
+  if (pit == init_map.end() ||
+      pit->second->data_type() != onnx::TensorProto::INT64) {
+    return false;
+  }
+  std::vector<int64_t> pads = ReadInt64Tensor(*pit->second);
+  std::string axes_name = node.input_size() > 3 ? node.input(3) : "";
+
+  int64_t begin, end;
+  if (!axes_name.empty()) {
+    auto ait = init_map.find(axes_name);
+    if (ait == init_map.end() ||
+        ait->second->data_type() != onnx::TensorProto::INT64) {
+      return false;
+    }
+    std::vector<int64_t> axes = ReadInt64Tensor(*ait->second);
+    for (int64_t a : axes) {
+      if (a < 0) {
+        return false;  // Can't resolve a negative axis without a known rank.
+      }
+    }
+    if (pads.size() != 2 * axes.size()) {
+      return false;  // Malformed -- schema requires equal length.
+    }
+    auto pos = std::find(axes.begin(), axes.end(), int64_t{1});
+    if (pos == axes.end()) {
+      return true;  // Axis 1 isn't named -- definitely not padded.
+    }
+    const size_t idx = static_cast<size_t>(pos - axes.begin());
+    begin = pads[idx];
+    end = pads[axes.size() + idx];
+  } else {
+    if (pads.size() % 2 != 0) {
+      return false;  // Malformed -- schema requires an even length.
+    }
+    const int64_t rank = static_cast<int64_t>(pads.size()) / 2;
+    if (rank < 2) {
+      return false;  // No axis-1 slot in a `pads` this short.
+    }
+    begin = pads[1];
+    end = pads[static_cast<size_t>(rank) + 1];
+  }
+  return begin == 0 && end == 0;
+}
+
 // The Conv-chain PRelu pass-through matcher used by WalkToConvConsumer,
 // mirroring pruning.py's own _match_prelu_pass_through: if `node` is a plain
 // (default-domain) PRelu whose own `slope` (input 1) is a constant float
@@ -1153,15 +1417,21 @@ struct ConvConsumerResult {
 };
 
 std::tuple<std::optional<ConvConsumerResult>, std::vector<ChainOp>,
-           std::vector<ConvPassThrough>>
+           std::vector<ConvPassThrough>, std::optional<GroupNormPassThrough>>
 WalkToConvConsumer(const std::string& start, const InitMap& init_map,
                    const ConsumerMap& consumers_of,
                    const std::unordered_set<std::string>& graph_outputs,
                    int64_t n_channels, int max_hops,
-                   onnx::NodeProto* forced_first_hop = nullptr) {
+                   onnx::NodeProto* forced_first_hop = nullptr,
+                   bool recognize_group_norm = false) {
   std::vector<ChainOp> chain_ops;
   std::vector<ConvPassThrough> pass_through;
   std::optional<ConvConsumerResult> consumer;
+  // At most one mid-chain GroupNormalization hop per chain -- mirrors
+  // pruning.py's own `group_norm is None` gate on _walk_to_conv_consumer's
+  // own matching `if`. Only ever recognized when `recognize_group_norm`
+  // (FindConvChains only, today -- see Chain::group_norm's own comment).
+  std::optional<GroupNormPassThrough> group_norm;
   std::string cur = start;
   for (int hop = 0; hop < max_hops; ++hop) {
     onnx::NodeProto* nxt;
@@ -1194,6 +1464,49 @@ WalkToConvConsumer(const std::string& start, const InitMap& init_map,
         consumer = ConvConsumerResult{nxt, match->weight, match->group};
       }
       break;
+    }
+
+    if (recognize_group_norm && !group_norm &&
+        nxt->op_type() == "GroupNormalization" && nxt->domain() == "" &&
+        nxt->input_size() > 0 && nxt->input(0) == cur) {
+      auto gn_match = MatchGroupNormPassThrough(*nxt, init_map, n_channels);
+      if (!gn_match) {
+        break;
+      }
+      const std::string& out2 = nxt->output(0);
+      if (ConsumerCount(consumers_of, out2) != 1 || graph_outputs.count(out2)) {
+        break;
+      }
+      group_norm = GroupNormPassThrough{nxt, gn_match->scale, gn_match->bias,
+                                        gn_match->num_groups};
+      cur = out2;
+      continue;
+    }
+
+    if (nxt->op_type() == "Resize" && nxt->domain() == "" &&
+        nxt->input_size() > 0 && nxt->input(0) == cur &&
+        nxt->output_size() == 1 &&
+        MatchResizeChannelPassThrough(*nxt, init_map)) {
+      const std::string& out2 = nxt->output(0);
+      if (ConsumerCount(consumers_of, out2) != 1 || graph_outputs.count(out2)) {
+        break;
+      }
+      chain_ops.push_back(ChainOp{nxt, std::nullopt});
+      cur = out2;
+      continue;
+    }
+
+    if (nxt->op_type() == "Pad" && nxt->domain() == "" &&
+        nxt->input_size() > 0 && nxt->input(0) == cur &&
+        nxt->output_size() == 1 &&
+        MatchPadChannelPassThrough(*nxt, init_map)) {
+      const std::string& out2 = nxt->output(0);
+      if (ConsumerCount(consumers_of, out2) != 1 || graph_outputs.count(out2)) {
+        break;
+      }
+      chain_ops.push_back(ChainOp{nxt, std::nullopt});
+      cur = out2;
+      continue;
     }
 
     if (nxt->op_type() == "PRelu" && nxt->domain() == "" &&
@@ -1242,7 +1555,7 @@ WalkToConvConsumer(const std::string& start, const InitMap& init_map,
     chain_ops.push_back(ChainOp{nxt, std::nullopt});
     cur = out2;
   }
-  return {consumer, chain_ops, pass_through};
+  return {consumer, chain_ops, pass_through, group_norm};
 }
 
 std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
@@ -1270,15 +1583,27 @@ std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
     if (!is_internal(out_name)) {
       continue;
     }
-    auto [consumer, chain_ops, pass_through] =
-        WalkToConvConsumer(out_name, init_map, consumers_of, graph_outputs,
-                           info->out_channels, kMaxChainHops);
+    auto [consumer, chain_ops, pass_through, group_norm] = WalkToConvConsumer(
+        out_name, init_map, consumers_of, graph_outputs, info->out_channels,
+        kMaxChainHops, /*forced_first_hop=*/nullptr,
+        /*recognize_group_norm=*/true);
     if (!consumer) {
       continue;
     }
     if (info->group > 1 && consumer->group > 1 &&
         info->group != consumer->group) {
       continue;  // Both sides grouped with mismatched group counts: declined.
+    }
+    if (group_norm &&
+        ((info->group > 1 && info->group != group_norm->num_groups) ||
+         (consumer->group > 1 && consumer->group != group_norm->num_groups))) {
+      // The mid-chain GroupNorm hop's own `num_groups` disagrees with a
+      // general grouped Conv producer's or consumer's own `group` -- the
+      // two partitions' own block boundaries wouldn't generally align,
+      // exactly the same "declined outright" bar the producer/consumer
+      // group mismatch above already gets. Mirrors pruning.py's own
+      // identical reconciliation check in _find_conv_chains.
+      continue;
     }
 
     Chain chain;
@@ -1292,6 +1617,7 @@ std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
     chain.consumer_is_conv = true;
     chain.conv_pass_through = std::move(pass_through);
     chain.consumer_group = consumer->group;
+    chain.group_norm = std::move(group_norm);
     chains.push_back(std::move(chain));
   }
   return chains;
@@ -1438,6 +1764,22 @@ ConvBackwardEdge WalkConvProducerBackward(
       continue;
     }
 
+    if (node->op_type() == "Resize" &&
+        MatchResizeChannelPassThrough(*node, init_map)) {
+      unary_ops.push_back(node);
+      edges.push_back({node->input(0), node});
+      cur = node->input(0);
+      continue;
+    }
+
+    if (node->op_type() == "Pad" &&
+        MatchPadChannelPassThrough(*node, init_map)) {
+      unary_ops.push_back(node);
+      edges.push_back({node->input(0), node});
+      cur = node->input(0);
+      continue;
+    }
+
     auto prelu_self = MatchPreluPassThroughSelf(*node, init_map);
     if (prelu_self) {
       if (prelu_self->is_per_channel) {
@@ -1524,9 +1866,15 @@ std::optional<std::vector<ConsumerBranch>> ResolveConvFanoutBranches(
       if (acc_it != accounted.end() && acc_it->second.count(consumer_node)) {
         continue;  // Already part of the group's own established wiring.
       }
-      auto [resolved, br_chain_ops, br_pass_through] =
+      // `recognize_group_norm` stays at its default (false) here -- a
+      // fan-out branch's own forward re-walk never recognizes a mid-chain
+      // GroupNorm hop, mirroring pruning.py's own _resolve_conv_fanout_branches
+      // (which never passes `recognize_group_norm=True` to its own
+      // _walk_to_conv_consumer call either).
+      auto [resolved, br_chain_ops, br_pass_through, br_group_norm] =
           WalkToConvConsumer(tensor, init_map, consumers_of, graph_outputs,
                              n_channels, kMaxChainHops, consumer_node);
+      (void)br_group_norm;  // Always nullopt -- see comment above.
       if (!resolved) {
         return std::nullopt;
       }
@@ -2474,12 +2822,25 @@ std::vector<Chain> FindMatmulResidualChains(onnx::GraphProto* graph) {
 }
 
 int64_t ChainGroup(const Chain& chain) {
+  int64_t group = chain.consumer_group;
   for (const auto& p : chain.producers) {
     if (p.group > 1) {
-      return p.group;
+      group = p.group;
+      break;
     }
   }
-  return chain.consumer_group;
+  // A mid-chain GroupNormalization hop's own `num_groups` takes priority
+  // over the plain producer/consumer `group` fields above -- FindConvChains
+  // already declined the chain outright if `num_groups` disagreed with a
+  // non-1 producer/consumer `group` (see its own reconciliation check), so
+  // whenever both are present they already agree, and returning
+  // `num_groups` unconditionally is equivalent to returning either. This is
+  // what makes GroupNorm's own per-group statistics stay valid after
+  // pruning -- mirrors pruning.py's own _chain_group exactly.
+  if (chain.group_norm) {
+    group = chain.group_norm->num_groups;
+  }
+  return group;
 }
 
 // --- Slicing, mirroring _slice_producer_weight/_slice_consumer_weight/
@@ -2767,6 +3128,14 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
         }
       }
     }
+    // A mid-chain GroupNorm hop's own `scale`/`bias` get exactly the same
+    // shared/tied-initializer conflict protection every other chain-op
+    // constant already does -- mirrors pruning.py's own
+    // `consts.update(_chain_group_norm_consts(chain))`.
+    if (chain.group_norm) {
+      consts.insert(chain.group_norm->scale);
+      consts.insert(chain.group_norm->bias);
+    }
 
     bool conflict = false;
     for (const auto& w : consumer_weights) {
@@ -2881,6 +3250,15 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
         SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
       }
     }
+    if (chain.group_norm) {
+      // Same `keep` index set as the real producer -- `num_groups` itself is
+      // left untouched (see GroupNormPassThrough's own comment for why it
+      // stays valid without changing it). Sliced via SliceLastAxis, not
+      // ConvPassThrough's own axis-0 SliceProducerWeight -- see
+      // GroupNormPassThrough's own comment for why.
+      SliceLastAxis(init_map.at(chain.group_norm->scale), keep);
+      SliceLastAxis(init_map.at(chain.group_norm->bias), keep);
+    }
     if (chain.consumer_is_conv && chain.consumer_group > 1) {
       SliceGroupedConsumerConvWeight(init_map.at(chain.consumer_weight), keep,
                                      chain.consumer_group, n);
@@ -2945,6 +3323,9 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
     }
     for (const auto& hop : chain.conv_pass_through) {
       stale_value_info.insert(hop.node->output(0));
+    }
+    if (chain.group_norm) {
+      stale_value_info.insert(chain.group_norm->node->output(0));
     }
     for (const auto* b : extra_ptrs) {
       for (const auto& co : b->chain_ops) {
@@ -4446,9 +4827,15 @@ std::vector<ConcatChain> FindConvConcatChains(onnx::GraphProto* graph) {
       continue;
     }
     const int64_t total_n = offset;
-    auto [consumer, fwd_chain_ops, fwd_pass_through] =
+    // `recognize_group_norm` stays at its default (false) here too -- a
+    // Concat-merged chain's own forward consumer walk never recognizes a
+    // mid-chain GroupNorm hop either, mirroring pruning.py's own
+    // FindConvConcatChains-equivalent walk (GroupNorm pass-through is
+    // FindConvChains-only, see Chain::group_norm's own comment).
+    auto [consumer, fwd_chain_ops, fwd_pass_through, fwd_group_norm] =
         WalkToConvConsumer(out_name, init_map, consumers_of, graph_outputs,
                            total_n, kMaxChainHops);
+    (void)fwd_group_norm;  // Always nullopt -- see comment above.
     if (!consumer) {
       continue;
     }

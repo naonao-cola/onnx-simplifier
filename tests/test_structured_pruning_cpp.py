@@ -2769,6 +2769,443 @@ def test_cpp_structured_pruning_matmul_residual_clip_pass_through_hop_matches_or
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+# --- Conv chain: GroupNormalization pass-through hop -------------------------
+#
+# `Conv -> GroupNormalization -> Conv`: mirrors test_pruning.py's own
+# `_group_norm_conv_pair_model` and its group-norm-pass-through test coverage.
+# Unlike PRelu/Clip, a mid-chain GroupNorm hop constrains `ChainGroup()`'s own
+# per-block `keep` selection to its own `num_groups` (see GroupNormPassThrough
+# and ChainGroup in structured_pruning_entry.cpp), so the oracle here uses
+# `_oracle_keep_indices_conv_grouped`, not the plain `_oracle_keep_indices_conv`
+# every other Conv-chain hop test uses.
+
+
+def _group_norm_conv_pair_model(w1, w2, gn_scale, gn_bias, num_groups, group1=1, b1=None):
+    Cin, C2 = w1.shape[1] * group1, w2.shape[0]
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        _f32(gn_scale, "GNScale"),
+        _f32(gn_bias, "GNBias"),
+    ]
+    g1 = f", group={group1}" if group1 != 1 else ""
+    if b1 is not None:
+        conv1 = f"h = Conv<kernel_shape=[3,3]{g1}>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = f"h = Conv<kernel_shape=[3,3]{g1}>(X, W1)"
+    return _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+        {{
+          {conv1}
+          gn = GroupNormalization<num_groups={num_groups}, epsilon=1e-05>(h, GNScale, GNBias)
+          Y = Conv<kernel_shape=[3,3]>(gn, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_cpp_structured_pruning_group_norm_pass_through_matches_oracle():
+    Cin, C1, C2, num_groups = 3, 16, 8, 4
+    rng = np.random.default_rng(220)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    gn_scale = rng.standard_normal((C1,)).astype(np.float32)
+    gn_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _group_norm_conv_pair_model(w1, w2, gn_scale, gn_bias, num_groups, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    # `num_groups` (a node attribute, not a tensor) is unchanged; the
+    # surviving channel count must still divide it evenly.
+    assert inits["W1"].shape[0] % num_groups == 0
+    assert inits["W1"].shape[0] < C1  # actually pruned, not a no-op
+    assert inits["GNScale"].shape == inits["GNBias"].shape == (C1 // 2,)
+    gn_node = next(n for n in pruned.graph.node if n.op_type == "GroupNormalization")
+    assert next(a.i for a in gn_node.attribute if a.name == "num_groups") == num_groups
+
+    keep = _oracle_keep_indices_conv_grouped(w1, num_groups, 0.5)
+    oracle = _group_norm_conv_pair_model(
+        w1[keep], w2[:, keep], gn_scale[keep], gn_bias[keep], num_groups, b1=b1[keep]
+    )
+
+    rng_x = np.random.default_rng(221)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_group_norm_num_groups_mismatch_with_grouped_conv_declines():
+    # A mid-chain GroupNorm hop's own `num_groups` disagreeing with a
+    # same-chain grouped Conv producer's own `group` -- the two partitions'
+    # block boundaries wouldn't generally align, so the whole chain is
+    # declined outright, never guessed at, the same bar a plain
+    # producer_group != consumer_group mismatch already gets.
+    Cin, C1, C2, group1, num_groups = 4, 8, 8, 2, 4
+    rng = np.random.default_rng(222)
+    w1 = rng.standard_normal((C1, Cin // group1, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    gn_scale = rng.standard_normal((C1,)).astype(np.float32)
+    gn_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _group_norm_conv_pair_model(
+        w1, w2, gn_scale, gn_bias, num_groups, group1=group1
+    )
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["GNScale"], gn_scale)
+    np.testing.assert_array_equal(inits["GNBias"], gn_bias)
+
+
+def test_cpp_structured_pruning_group_norm_tied_scale_bias_declines():
+    # `scale`/`bias` naming the *same* tensor -- double-slicing it in
+    # ApplyChains's own per-hop loop would corrupt it, so this is declined
+    # outright, mirroring pruning.py's own tied-name bar
+    # (_match_group_norm_pass_through).
+    Cin, C1, C2, num_groups = 3, 8, 4, 2
+    rng = np.random.default_rng(223)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    tied = rng.standard_normal((C1,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          gn = GroupNormalization<num_groups={num_groups}, epsilon=1e-05>(h, Tied, Tied)
+          Y = Conv<kernel_shape=[3,3]>(gn, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(tied, "Tied")],
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["Tied"], tied)
+
+
+# --- Conv chain: Resize channel-safe pass-through hop -------------------------
+#
+# `Conv -> Resize(scales, spatial-only) -> Conv`: the U-Net/diffusion-model-
+# decoder-style upsampling shape. Mirrors test_pruning.py's own
+# `_resize_conv_pair_model` and its Resize-pass-through test coverage.
+
+
+def _resize_conv_pair_model(w1, w2, scales, b1=None, spatial=8, out_spatial_hw=None):
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        onnx.numpy_helper.from_array(np.asarray(scales, dtype=np.float32), "Scales"),
+    ]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    after_conv1 = spatial - 2
+    if out_spatial_hw is None:
+        mid_h = round(after_conv1 * scales[2])
+        out_spatial_hw = mid_h - 2
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial_hw},{out_spatial_hw}] Y)
+        {{
+          {conv1}
+          p = Resize<mode="nearest">(h, , Scales)
+          Y = Conv<kernel_shape=[3,3]>(p, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_cpp_structured_pruning_resize_channel_safe_pass_through_matches_oracle():
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(224)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    scales = [1.0, 1.0, 2.0, 2.0]
+    model = _resize_conv_pair_model(w1, w2, scales, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _resize_conv_pair_model(w1[keep], w2[:, keep], scales, b1=b1[keep])
+
+    rng_x = np.random.default_rng(225)
+    x = rng_x.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_resize_channel_affecting_declines():
+    # scales[1] (the channel axis) == 2.0 -- genuinely resizes the channel
+    # axis itself, so it must be declined outright, never guessed at.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(226)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    scales = [1.0, 2.0, 1.0, 1.0]
+    w2 = rng.standard_normal((C2, C1 * 2, 3, 3)).astype(np.float32)
+    model = _resize_conv_pair_model(w1, w2, scales, out_spatial_hw=4)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_cpp_structured_pruning_resize_dynamic_scales_declines():
+    # `scales` computed at runtime (Shape -> Cast) rather than a constant
+    # initializer -- this pass cannot know which axis is affected without
+    # evaluating the graph, so it must decline outright, never guessed at.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(227)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},8,8] X) => (float[N,{C2},4,4] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          shp = Shape(h)
+          scales_dyn = Cast<to=1>(shp)
+          p = Resize<mode="nearest">(h, , scales_dyn)
+          Y = Conv<kernel_shape=[3,3]>(p, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_cpp_structured_pruning_conv_residual_resize_pass_through_hop_matches_oracle():
+    # A channel-safe Resize crossed by the *backward* walk
+    # (WalkConvProducerBackward) -- exercises the residual-chain insertion
+    # point, not just the forward one.
+    Cin, C, Cout = 3, 16, 8
+    rng = np.random.default_rng(228)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    scales = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+
+    def _mk(w_f, w_s, w_out):
+        return _model(
+            f"""
+            g (float[N,{Cin},10,10] X) => (float[N,{Cout},6,6] Y)
+            {{
+              f0 = Conv<kernel_shape=[3,3]>(X, WF)
+              f = Resize<mode="nearest">(f0, , Scales)
+              s = Conv<kernel_shape=[3,3]>(X, WS)
+              addr = Add(f, s)
+              r = Relu(addr)
+              Y = Conv<kernel_shape=[3,3]>(r, WOUT)
+            }}
+            """,
+            initializer=[
+                _f32(w_f, "WF"),
+                onnx.numpy_helper.from_array(scales, "Scales"),
+                _f32(w_s, "WS"),
+                _f32(w_out, "WOUT"),
+            ],
+        )
+
+    model = _mk(w_f, w_s, w_out)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    oracle = _mk(w_f[keep], w_s[keep], w_out[:, keep])
+
+    rng_x = np.random.default_rng(229)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+# --- Conv chain: Pad channel-safe pass-through hop ----------------------------
+#
+# `Conv -> Pad -> Conv`: mirrors test_pruning.py's own `_pad_conv_pair_model`
+# and its Pad-pass-through test coverage.
+
+
+def _pad_conv_pair_model(w1, w2, pads, b1=None, spatial=8):
+    """`Conv -> Pad -> Conv`, `pads` the raw 8-element (`2 * rank` for a
+    rank-4 NCHW tensor) ONNX `pads` layout: `[x1_begin, ..., xk_begin,
+    x1_end, ..., xk_end]`."""
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    pads = np.asarray(pads, dtype=np.int64)
+    rank = len(pads) // 2
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        onnx.numpy_helper.from_array(pads, "Pads"),
+    ]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    after_conv1 = spatial - 2
+    mid_h = after_conv1 + pads[2] + pads[rank + 2]  # axis 2 (H) begin+end pad
+    out_spatial = mid_h - 2
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          p = Pad<mode="constant">(h, Pads)
+          Y = Conv<kernel_shape=[3,3]>(p, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_cpp_structured_pruning_pad_channel_safe_pass_through_matches_oracle():
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(230)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    pads = [0, 0, 1, 1, 0, 0, 1, 1]
+    model = _pad_conv_pair_model(w1, w2, pads, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _pad_conv_pair_model(w1[keep], w2[:, keep], pads, b1=b1[keep])
+
+    rng_x = np.random.default_rng(231)
+    x = rng_x.standard_normal((2, Cin, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_pad_channel_affecting_declines():
+    # Nonzero padding on axis 1 (channel) -- changes the output channel
+    # count outright, so this must be declined, never guessed at.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(232)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    pads = [0, 1, 0, 0, 0, 1, 0, 0]
+    w2 = rng.standard_normal((C2, C1 + 2, 3, 3)).astype(np.float32)
+    model = _pad_conv_pair_model(w1, w2, pads)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_cpp_structured_pruning_pad_dynamic_pads_declines():
+    # `pads` computed at runtime (a non-constant node output) rather than a
+    # constant initializer -- declined outright for the same reason as a
+    # dynamic Resize `scales` above.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(233)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},8,8] X, int64[8] PadsIn) => (float[N,{C2},4,4] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          pads_dyn = Identity(PadsIn)
+          p = Pad<mode="constant">(h, pads_dyn)
+          Y = Conv<kernel_shape=[3,3]>(p, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_cpp_structured_pruning_conv_residual_pad_pass_through_hop_matches_oracle():
+    # A channel-safe Pad crossed by the *backward* walk
+    # (WalkConvProducerBackward) -- exercises the residual-chain insertion
+    # point, not just the forward one.
+    Cin, C, Cout = 3, 16, 8
+    rng = np.random.default_rng(234)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    # All-zero pads (a no-op Pad node) -- keeps both Add operands' shapes
+    # equal (the merge point's own requirement) while still exercising the
+    # channel-safety matcher (pads[1] == pads[rank+1] == 0 is trivially true).
+    pads = np.array([0, 0, 0, 0, 0, 0, 0, 0], dtype=np.int64)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+
+    def _mk(w_f, w_s, w_out):
+        return _model(
+            f"""
+            g (float[N,{Cin},10,10] X) => (float[N,{Cout},6,6] Y)
+            {{
+              f0 = Conv<kernel_shape=[3,3]>(X, WF)
+              f = Pad<mode="constant">(f0, Pads)
+              s = Conv<kernel_shape=[3,3]>(X, WS)
+              addr = Add(f, s)
+              r = Relu(addr)
+              Y = Conv<kernel_shape=[3,3]>(r, WOUT)
+            }}
+            """,
+            initializer=[
+                _f32(w_f, "WF"),
+                onnx.numpy_helper.from_array(pads, "Pads"),
+                _f32(w_s, "WS"),
+                _f32(w_out, "WOUT"),
+            ],
+        )
+
+    model = _mk(w_f, w_s, w_out)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    oracle = _mk(w_f[keep], w_s[keep], w_out[:, keep])
+
+    rng_x = np.random.default_rng(235)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 # --- Concat-merged (skip-connection) chains ----------------------------------
 
 
