@@ -88,9 +88,16 @@ _LATENCY_RE = re.compile(
 
 
 def docker_image_available(image: str = DEFAULT_IMAGE) -> bool:
-    proc = subprocess.run(
-        ["docker", "image", "inspect", image], capture_output=True, text=True
-    )
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", image], capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        # No `docker` binary at all (confirmed real: macOS CI wheel-test
+        # runners don't have one) -- distinct from "docker installed but no
+        # image loaded" (returncode != 0, handled below); both mean the
+        # same thing to a caller, so both resolve to False, not a crash.
+        return False
     return proc.returncode == 0
 
 
