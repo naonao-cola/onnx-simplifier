@@ -75,6 +75,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
@@ -143,6 +144,11 @@ class BuildResult:
     fused_subgraphs: Optional[int] = None
     trace_path: Optional[str] = None
     frontend_graph_path: Optional[str] = None
+    # Wall-clock seconds per pipeline stage -- only populated by
+    # `build_from_hf_checkpoint()` (see its docstring); empty for a plain
+    # `build()` call, which is already just the one Docker invocation this
+    # dict's own "pulsar2_build" entry measures.
+    phase_timings: Dict[str, float] = field(default_factory=dict)
     error: Optional[str] = None
     stdout_tail: str = ""
 
@@ -429,22 +435,53 @@ def build_from_hf_checkpoint(
     checkpoint whose architecture `reconstruct_hf_graph` doesn't support
     raises `onnxsim.UnsupportedArchitectureError` before Docker is ever
     invoked.
-    """
-    if not docker_image_available(image):
-        return BuildResult(success=False, error=f"docker image not loaded: {image}")
 
+    The returned `BuildResult.phase_timings` breaks the wall-clock time
+    down into `"docker_check"` (confirming the image is loaded),
+    `"import_onnxsim"` (importing `onnxsim` -- confirmed real: its
+    `__init__.py` eagerly imports dozens of quantization submodules, easily
+    over a second the *first* time in a process; `sys.modules`-cached to
+    ~0s on any later call in the same process), `"reconstruct_onnx"`
+    (onnxsim graph construction + `onnx.save`), `"calibration_data"`
+    (generating + tarring the calibration samples), `"pulsar2_build"` (the
+    real Docker `pulsar2 build` call -- itself container startup + quant +
+    NPU compile as one number; pass `profile=True` and load the resulting
+    `trace.json` at chrome://tracing for a breakdown *within* this stage),
+    and `"total"` -- the non-`"total"` entries always sum to it (modulo
+    float rounding).
+    """
+    total_start = time.perf_counter()
+    phase_timings: Dict[str, float] = {}
+
+    stage_start = time.perf_counter()
+    docker_ok = docker_image_available(image)
+    phase_timings["docker_check"] = time.perf_counter() - stage_start
+    if not docker_ok:
+        phase_timings["total"] = time.perf_counter() - total_start
+        return BuildResult(
+            success=False,
+            error=f"docker image not loaded: {image}",
+            phase_timings=phase_timings,
+        )
+
+    stage_start = time.perf_counter()
     import numpy as np
     import onnx
 
     import onnxsim
 
+    phase_timings["import_onnxsim"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     hf_config = onnxsim.read_hf_config(hf_dir)
     vocab_size = int(hf_config.get("vocab_size", 32000))
 
     model = onnxsim.reconstruct_hf_graph(hf_dir, batch_size=batch_size, seq_len=seq_len)
     onnx_rel_path = "model.onnx"
     onnx.save(model, os.path.join(work_dir, onnx_rel_path))
+    phase_timings["reconstruct_onnx"] = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
     rng = np.random.default_rng(0)
     dataset_dir = os.path.join(work_dir, "dataset")
     os.makedirs(dataset_dir, exist_ok=True)
@@ -478,8 +515,10 @@ def build_from_hf_checkpoint(
             ),
             f,
         )
+    phase_timings["calibration_data"] = time.perf_counter() - stage_start
 
-    return build(
+    stage_start = time.perf_counter()
+    result = build(
         work_dir,
         onnx_rel_path,
         output_rel_dir,
@@ -489,6 +528,10 @@ def build_from_hf_checkpoint(
         profile=profile,
         timeout=timeout,
     )
+    phase_timings["pulsar2_build"] = time.perf_counter() - stage_start
+    phase_timings["total"] = time.perf_counter() - total_start
+    result.phase_timings = phase_timings
+    return result
 
 
 @dataclass

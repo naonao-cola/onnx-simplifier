@@ -104,6 +104,9 @@ def main() -> int:
         return 1
     print(f"compiled: {result.axmodel_path}")
     print(f"max_cycle={result.max_cycle} fused_subgraphs={result.fused_subgraphs}")
+    print("phase timings:")
+    for phase, seconds in result.phase_timings.items():
+        print(f"  {phase}: {seconds:.2f}s")
 
     if args.skip_device:
         return 0

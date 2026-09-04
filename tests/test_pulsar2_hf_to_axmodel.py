@@ -115,6 +115,19 @@ def test_hf_checkpoint_reconstructed_onnx_compiles_to_a_real_axmodel(tmp_path):
     assert result.axmodel_path is not None
     assert os.path.exists(result.axmodel_path)
 
+    expected_phases = {
+        "docker_check",
+        "import_onnxsim",
+        "reconstruct_onnx",
+        "calibration_data",
+        "pulsar2_build",
+    }
+    assert expected_phases <= result.phase_timings.keys()
+    assert all(v >= 0 for v in result.phase_timings.values())
+    assert result.phase_timings["total"] == pytest.approx(
+        sum(v for k, v in result.phase_timings.items() if k != "total"), rel=1e-6
+    )
+
     compiled = onnx.load(result.axmodel_path)
     op_types = {n.op_type for n in compiled.graph.node}
     assert pulsar2_ops.AXERA_NPU_OP_TYPE in op_types
