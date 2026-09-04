@@ -3694,6 +3694,115 @@ def test_structured_pruning_decomposed_rms_norm_inv_std_and_x_feed_different_mul
     assert pruned.SerializeToString() == model.SerializeToString()
 
 
+# --- `_constant_map`: a scalar/shape operand fed by a `Constant` node -------
+#
+# Every hop above (and the Clip/decomposed-LayerNorm/decomposed-GroupNorm
+# hops elsewhere in this file) checks its own scalar/shape operand via
+# `initializer_map.get(name)` -- but a real `torch.onnx.export`, run through
+# onnxsim's own `simplify()`, leaves exactly this kind of operand (a literal
+# Python scalar like RMSNorm's `2`/`self.eps`/`1.0`, as opposed to a learned
+# `nn.Parameter`) as a plain `Constant` node, never promoted to an
+# initializer: `onnxsim.cpp`'s own `SimplifyImpl` always drops onnx-
+# optimizer's `extract_constant_to_initializer` pass for exactly this reason
+# (see that file's own comment), so `graph.initializer` alone never contains
+# it. Confirmed empirically (before `_constant_map` existed) via a real
+# `torch.onnx.export` of a hand-rolled `LlamaRMSNorm`-equivalent module, run
+# through `onnxsim.simplify()`, then `apply_structured_pruning` on the
+# result -- the exact chain below, `Pow`/`Add`/`Div` operands `Constant`-node-
+# fed rather than initializer-fed -- came back completely unpruned, purely
+# because those operands weren't found in `graph.initializer`, even though
+# the *same* logical chain built with those values as initializers (every
+# other test in this file) already matched and pruned correctly.
+# `_constant_map` closes this once, for every hop that already builds an
+# `initializer_map` this way, rather than per hop.
+
+
+def test_structured_pruning_decomposed_rms_norm_constant_node_operands_matches_oracle():
+    # The `_decomposed_rms_norm_model` chain above, rebuilt with `Two`/`Eps`/
+    # `One` as `Constant` nodes (the real torch-export shape for a literal
+    # Python scalar) instead of initializers -- confirms `_constant_map`
+    # resolves them exactly the same way, so this chain prunes exactly like
+    # its initializer-fed twin above, not like the still-genuinely-different-
+    # shape decline cases elsewhere in this section.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(347)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    weight = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          x = MatMul(X, W1)
+          Two = Constant<value = float[1] {{2.0}}>()
+          variance = Pow(x, Two)
+          meanvar = ReduceMean<axes=[-1]>(variance)
+          Eps = Constant<value = float[1] {{1e-05}}>()
+          vareps = Add(meanvar, Eps)
+          std = Sqrt(vareps)
+          One = Constant<value = float[1] {{1.0}}>()
+          invstd = Div(One, std)
+          scaled = Mul(x, invstd)
+          h = Mul(scaled, Weight)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(weight, "Weight"), _f32(w2, "W2")],
+        opset=17,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    keep_count = C // 2
+    assert list(inits["W1"].dims) == [K, keep_count]
+    assert list(inits["Weight"].dims) == [keep_count]
+    assert list(inits["W2"].dims) == [keep_count, Out]
+    # The `Constant` nodes themselves are untouched -- nothing to slice.
+    assert sorted(n.op_type for n in pruned.graph.node) == sorted(
+        n.op_type for n in model.graph.node
+    )
+
+    keep = _oracle_keep_indices(w1, keep_count)
+    x = np.random.default_rng(348).standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    h_correct = _rms_norm_oracle(x @ w1[:, keep], weight[keep], eps=1e-5)
+    y_correct = h_correct @ w2[keep, :]
+    np.testing.assert_allclose(y, y_correct, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_clip_constant_node_bounds_matches_oracle():
+    # A second, independent hop (Conv-chain `Clip`, not MatMul/Gemm-chain
+    # RMSNorm) with its own `min`/`max` fed by `Constant` nodes instead of
+    # initializers -- confirms `_constant_map`'s fix is not RMSNorm-specific:
+    # any hop built on the same `initializer_map.get(name)` pattern benefits.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(349)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          Min = Constant<value = float[1] {{0.0}}>()
+          Max = Constant<value = float[1] {{6.0}}>()
+          p = Clip(h, Min, Max)
+          Y = Conv<kernel_shape=[3,3]>(p, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = {t.name: list(t.dims) for t in pruned.graph.initializer}
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["W2"][1] == C1 // 2
+
+
 def test_structured_pruning_gated_ffn_layer_norm_pass_through_matches_oracle():
     # Composition check: a gated (SwiGLU-style) combine feeding a plain
     # LayerNormalization before the down-projection -- confirms the hop
