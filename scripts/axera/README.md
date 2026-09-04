@@ -126,24 +126,31 @@ physical hardware:
   PTQ *numeric convention* -- read directly off a real `quant_axmodel.onnx`
   from the `resnet18d` conversion: **U8 (uint8), per-tensor, asymmetric**
   activations and **S8 (int8), per-channel, symmetric** weights, MinMax
-  calibration -- via `onnxruntime.quantization.quantize_static`. It does
-  **not** reproduce Pulsar2's actual quantized IR: that file's ops are
-  proprietary (`AxQuantizedConv`, `AxQuantizeLinear`, ... all in the plain
-  default domain, not standard ONNX `QuantizeLinear`/`DequantizeLinear`, and
-  not executable by onnxruntime) -- see its docstring.
+  calibration. It turns out **onnxsim already has a quantizer with exactly
+  this convention** -- `onnxsim.quantize_static(method="minmax")`
+  (`onnxsim/calibration.py`, an "asymmetric uint8 affine quantization" per
+  its own C++ pass's comment) -- so this is now a thin wrapper over
+  onnxsim's own quantizer rather than a hand-rolled equivalent built on
+  `onnxruntime.quantization`. It does **not** reproduce Pulsar2's actual
+  quantized IR: that file's ops are proprietary (`AxQuantizedConv`,
+  `AxQuantizeLinear`, ... all in the plain default domain, not standard ONNX
+  `QuantizeLinear`/`DequantizeLinear`, and not executable by onnxruntime),
+  and onnxsim's quantizer only quantizes Conv/MatMul/"vanilla" Gemm nodes
+  where Pulsar2 quantizes essentially the whole graph -- see its docstring.
 - **`pulsar2_simulator.py`** adds `partition()`/`coverage()` (per-node
   `AX650_SUPPORTED_OPS` membership -- correctly predicted both real
   conversions: "full" for `resnet18d`, "partial" with
   `{"LRN": 2, "Dropout": 1}` for `googlenet-6`) and `simulate()` (runs the
   quantized graph through onnxruntime's CPU EP as an fp32-vs-INT8 estimate).
   Validated against real hardware: on `resnet18d` with the same input image,
-  this simulator's INT8 output had **0.941 cosine similarity** to the real
+  this simulator's INT8 output had **0.938 cosine similarity** to the real
   device's actual output, close to fp32-vs-real's own **0.949** -- similar
   *magnitude* of quantization noise, but **not** rank/bit-accurate (top-5
   didn't match between fp32, simulated, and real on that input). Both
   degrade gracefully (`SIMULATOR_AVAILABLE`/`PULSAR2_QUANTIZER_AVAILABLE`)
-  when `onnxruntime` isn't installed; `partition()`/`coverage()` need only
-  `onnx` and always work.
+  when `onnxruntime` isn't installed (onnxsim's own `quantize_static` only
+  imports it lazily, inside `calibrate()`); `partition()`/`coverage()` need
+  only `onnx` and always work.
 
 Use these for a fast first read before spending time on a real
 `pulsar2 build` -- always confirm anything that matters on the real
@@ -236,7 +243,7 @@ the tensor). `pulsar2_docker.run_on_device_with_input()` already does this.
 | `pulsar2_backend.py` | thin wrapper around `pulsar2_ops.py`: `coverage()`, `new_blocking_op_types()`, `stripped_npu_data()`, `unsafe_for_simplify()`, `ax650_build_risks()`. Shaped like the sibling `*_backend.py` modules for interface symmetry (`PULSAR2_AVAILABLE` is always `True` -- there's no external dependency to be missing). |
 | `inspect_axmodel.py` | standalone CLI for a **real** `.axmodel` file: loads it with `onnx.load()`, then reports non-standard-domain nodes, op types outside the model's declared opset, and suspiciously large raw attributes -- what originally found the `neu mode` node in the real YOLOv8 file. |
 | `models.py` | the shared `scripts/common/synthetic_models.py` suite plus `axera_npu_compiled_leaf`, a synthetic reproduction of the real `neu mode` node shape (no real device needed to exercise the corruption check in CI). |
-| `pulsar2_quantizer.py` | `quantize_like_pulsar2()`: a Docker/device-free INT8 PTQ matching Pulsar2's real numeric convention (U8 asymmetric activations, S8 per-channel weights, MinMax calibration), via `onnxruntime.quantization`. Degrades gracefully (`PULSAR2_QUANTIZER_AVAILABLE`) without `onnxruntime`. |
+| `pulsar2_quantizer.py` | `quantize_like_pulsar2()`: a thin wrapper over `onnxsim.quantize_static(method="minmax")`, which already matches Pulsar2's real numeric convention (U8 asymmetric activations, S8 per-channel weights, MinMax calibration). `PULSAR2_QUANTIZER_AVAILABLE` reflects `onnxruntime`'s availability (onnxsim's quantizer needs it internally, imported lazily). |
 | `pulsar2_simulator.py` | `partition()`/`coverage()` (real `AX650_SUPPORTED_OPS` membership, no dependency beyond `onnx`) and `simulate()` (fp32-vs-INT8 estimate via `pulsar2_quantizer.py` + onnxruntime's CPU EP). Validated against real hardware -- see above. |
 | `worker.py` | runs the check for one model in an isolated subprocess, printing one `__RESULT__<json>` line. |
 | `run_pulsar2_compat.py` | drives the suite, writes a CSV, and exits non-zero on any regression. No `--require-*` flag or `skipped` status -- unlike the EP harnesses, this needs no vendor package or device, so it always runs. Entry point for `axera-integration.yml`'s `pulsar2-compat` job (stock runner, no Docker/device). |

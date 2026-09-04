@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A local, Docker-free approximation of Pulsar2's INT8 PTQ, via onnxruntime.
+"""A local, Docker-free approximation of Pulsar2's INT8 PTQ, via onnxsim's own quantizer.
 
 Pulsar2's own quantizer is proprietary: inspecting the real
 `output/*/quant/quant_axmodel.onnx` that `pulsar2 build` writes (from the
@@ -21,42 +21,49 @@ What *is* confirmed from that same real file, read off its
 * `quant_method = 0`, matching the `"calibration_method": "MinMax"` in the
   build config (see `pulsar2_ops.py`'s docstring for the real build log).
 
-This module reproduces exactly that numeric convention --
-`onnxruntime.quantization.quantize_static` with `CalibrationMethod.MinMax`,
-`activation_type=QUInt8`, `weight_type=QInt8`, `per_channel=True` -- and
-outputs a standard QDQ ONNX model onnxruntime can actually run. Treat the
-result as **compatible in calibration methodology and numeric precision**,
-not a reproduction of Pulsar2's internal IR or exact rounding/fusion
-behavior. Always confirm on real hardware before trusting it for a
+**onnxsim already has a quantizer with exactly this numeric convention**:
+`onnxsim.quantize_static` (`onnxsim/calibration.py`) does calibration-based
+QDQ quantization with `method="minmax"` as its default, an "asymmetric
+uint8 affine quantization" for activations
+(`onnxsim/passes/static_quantize_matmul.h`'s own comment, byte-for-byte the
+scheme above), and per-output-channel symmetric INT8 weights. This module
+used to hand-roll the same thing via `onnxruntime.quantization.
+quantize_static` with matching `QuantType`/`CalibrationMethod` options --
+now it just calls onnxsim's own, which is more authoritative (it's this
+project's own quantizer, not a reimplementation of its intent in a
+different library) and needs no extra dependency beyond what
+`pulsar2_simulator.py` already required (onnxruntime, used internally by
+`onnxsim.calibrate()` to run the float model and record activation ranges).
+
+Still **not** a reproduction of Pulsar2's internal IR, exact per-op
+selection, or rounding/fusion behavior -- `onnxsim.quantize_static` quantizes
+Conv/MatMul/"vanilla" Gemm nodes with a constant float weight (see its own
+docstring); Pulsar2 quantizes essentially the whole graph. Treat the result
+as **compatible in calibration methodology and numeric precision**, not a
+faithful emulation. Always confirm on real hardware before trusting it for a
 deployment decision -- see `pulsar2_simulator.py` for how this is used
 against real-device output.
 """
 
 from __future__ import annotations
 
-import os
-import tempfile
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, Optional
 
-import numpy as np
 import onnx
+import onnxsim
 
 PULSAR2_QUANTIZER_AVAILABLE = False
 _UNAVAILABLE_REASON: Optional[str] = None
 
 try:
-    from onnxruntime.quantization import (
-        CalibrationMethod,
-        QuantFormat,
-        QuantType,
-        quantize_static,
-    )
-    from onnxruntime.quantization.calibrate import CalibrationDataReader
+    import onnxruntime  # noqa: F401
 
     PULSAR2_QUANTIZER_AVAILABLE = True
 except Exception as exc:  # pragma: no cover - depends on the host
+    # onnxsim.quantize_static imports onnxruntime lazily (inside
+    # onnxsim.calibration.calibrate()), so onnxsim itself always imports
+    # fine without it -- check for the real dependency here instead.
     _UNAVAILABLE_REASON = f"{type(exc).__name__}: {exc}"
-    CalibrationDataReader = object  # type: ignore[assignment,misc]
 
 
 def unavailable_reason() -> Optional[str]:
@@ -64,44 +71,23 @@ def unavailable_reason() -> Optional[str]:
     return _UNAVAILABLE_REASON
 
 
-if PULSAR2_QUANTIZER_AVAILABLE:
-
-    class _ListDataReader(CalibrationDataReader):
-        def __init__(self, feeds_list: List[Dict[str, np.ndarray]]):
-            self._iter = iter(feeds_list)
-
-        def get_next(self):
-            return next(self._iter, None)
-
-
 def quantize_like_pulsar2(
     model: onnx.ModelProto,
-    calibration_feeds: Iterable[Dict[str, np.ndarray]],
-    *,
-    per_channel: bool = True,
+    calibration_feeds: Iterable[Dict],
 ) -> onnx.ModelProto:
     """Return an INT8 QDQ ONNX model calibrated the way Pulsar2 does (MinMax).
 
-    ``calibration_feeds`` should be several representative input dicts (8-32,
-    matching typical PTQ calibration set sizes -- the real build used 16).
-    Raises if the quantizer is unavailable; check `PULSAR2_QUANTIZER_AVAILABLE`
-    first.
+    Thin wrapper over `onnxsim.quantize_static(model, calibration_data=...,
+    method="minmax")` -- see this module's docstring for why that already
+    matches Pulsar2's confirmed numeric convention with no reimplementation
+    needed. `calibration_feeds` should be several representative input dicts
+    (8-32, matching typical PTQ calibration set sizes -- the real build used
+    16). Raises if the quantizer is unavailable; check
+    `PULSAR2_QUANTIZER_AVAILABLE` first.
     """
     if not PULSAR2_QUANTIZER_AVAILABLE:
         raise RuntimeError(f"pulsar2_quantizer unavailable: {_UNAVAILABLE_REASON}")
 
-    with tempfile.TemporaryDirectory() as td:
-        in_path = os.path.join(td, "in.onnx")
-        out_path = os.path.join(td, "out.onnx")
-        onnx.save(model, in_path)
-        quantize_static(
-            in_path,
-            out_path,
-            calibration_data_reader=_ListDataReader(list(calibration_feeds)),
-            quant_format=QuantFormat.QDQ,
-            activation_type=QuantType.QUInt8,
-            weight_type=QuantType.QInt8,
-            calibrate_method=CalibrationMethod.MinMax,
-            per_channel=per_channel,
-        )
-        return onnx.load(out_path)
+    return onnxsim.quantize_static(
+        model, calibration_data=list(calibration_feeds), method="minmax"
+    )

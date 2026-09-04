@@ -103,10 +103,14 @@ def test_quantize_like_pulsar2_matches_confirmed_dtypes():
 
     See pulsar2_quantizer.py's docstring for where these numbers come from
     (a real `resnet18d_Opset18` `quant_axmodel.onnx`'s `AxQuantizedConv`
-    attributes). This checks our onnxruntime-based quantizer reproduces the
-    same *representation* (not the same values -- different quantizer).
+    attributes) and why `onnxsim.quantize_static` already matches this
+    convention exactly (asymmetric UINT8 activations, per-channel symmetric
+    INT8 weights). Initializers aren't named `*_scale`/`*_zero_point` here
+    (onnxsim uses synthetic `_v_NN` names), so check dtypes present instead
+    of names -- onnx.TensorProto INT8=3, UINT8=2.
     """
     import onnx
+    from collections import Counter
 
     import pulsar2_quantizer as pq
 
@@ -115,15 +119,10 @@ def test_quantize_like_pulsar2_matches_confirmed_dtypes():
     feeds = [{"x": rng.randn(1, 3, 16, 16).astype(np.float32)} for _ in range(4)]
     quantized = pq.quantize_like_pulsar2(model, feeds)
 
-    dtypes = set()
-    for init in quantized.graph.initializer:
-        if "scale" in init.name or "zero_point" in init.name:
-            dtypes.add((init.name.split("_")[-1], init.data_type))
-    # At least one weight-side zero_point should be int8 (S8) and one
-    # activation-side should be uint8 (U8) -- onnx.TensorProto INT8=3, UINT8=2.
-    zp_dtypes = {
-        init.data_type
-        for init in quantized.graph.initializer
-        if init.name.endswith("zero_point")
-    }
-    assert onnx.TensorProto.INT8 in zp_dtypes or onnx.TensorProto.UINT8 in zp_dtypes
+    op_types = Counter(n.op_type for n in quantized.graph.node)
+    assert op_types["QuantizeLinear"] >= 1
+    assert op_types["DequantizeLinear"] >= 1
+
+    init_dtypes = {init.data_type for init in quantized.graph.initializer}
+    assert onnx.TensorProto.UINT8 in init_dtypes, "no UINT8 activation quantization"
+    assert onnx.TensorProto.INT8 in init_dtypes, "no INT8 weight quantization"

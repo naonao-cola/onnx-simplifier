@@ -36,8 +36,9 @@ input image both times): `coverage()` correctly reported "full" (matching
 the real build's single fused NPU subgraph) and "partial" with
 `cpu_op_types={"LRN": 2, "Dropout": 1}` for `googlenet-6` (matching its real
 hard build failure on `LRN`). For `simulate()`'s numeric side: cosine
-similarity between this simulator's INT8 output and the real device's actual
-INT8 output was **0.941**, close to fp32-vs-real's own **0.949** -- i.e. this
+similarity between this simulator's INT8 output (via `onnxsim.
+quantize_static`, see `pulsar2_quantizer.py`) and the real device's actual
+INT8 output was **0.938**, close to fp32-vs-real's own **0.949** -- i.e. this
 simulator's quantization noise is roughly the same *magnitude* as Pulsar2's
 real quantization noise, relative to the fp32 baseline. It is **not**
 rank-accurate, though: top-5 class rankings did not match between fp32, this
