@@ -32,11 +32,14 @@ same representation :mod:`onnxsim.nf4` already uses for its own non-power-
 of-two scale), searched, together with the bit-split choice, by grid search
 against direct reconstruction MSE -- the same "hold everything else fixed,
 scan a small set of candidates, keep whichever minimizes a direct error
-metric" shape :func:`onnxsim.calibration._entropy_threshold` already uses
-for INT8 range calibration (that function scans candidate *clip cutoffs*
-against KL divergence; this module scans candidate *(format, clip ratio)*
-pairs against MSE -- a different search space and objective, same "grid
-search over candidates" shape).
+metric" shape :func:`onnxsim.calibration._mse_threshold`/:func:`onnxsim.
+calibration._entropy_threshold` already use for INT8 range calibration
+(``_mse_threshold`` scans candidate clip thresholds against *direct*
+reconstruction MSE -- the closer analogue to this module's own objective;
+``_entropy_threshold`` scans the same kind of candidates against a
+histogram-based KL divergence instead. This module scans candidate
+*(format, clip ratio)* pairs against MSE -- a different, two-dimensional
+search space, same "grid search over candidates" shape).
 
     Before:
       Y = MatMul(X, W) [+ bias]      -- W constant, [K, N], float32
@@ -208,8 +211,8 @@ def _search_llm_fp4_blockwise(
             # The "pre-shifted exponent bias" search, realized as a
             # real-valued per-block scale: r < 1 clips outliers harder but
             # sharpens resolution for the bulk of the block, exactly the
-            # clip-vs-resolution trade _entropy_threshold's own cutoff
-            # search makes for INT8 ranges.
+            # clip-vs-resolution trade _mse_threshold's own cutoff search
+            # makes for INT8 ranges.
             scale = np.maximum(max_abs * r / max_mag, 1e-30)  # [N, num_blocks]
             normalized = blocks / scale[:, :, np.newaxis]
             diffs = np.abs(normalized[..., np.newaxis] - codebook)
