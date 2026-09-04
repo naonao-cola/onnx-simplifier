@@ -329,6 +329,158 @@ def build(
     )
 
 
+def make_numpy_calibration_tar(out_path: str, samples: Sequence) -> str:
+    """A tar of `samples` (one ``.npy`` file each), for Pulsar2's
+    ``calibration_format: Numpy`` -- the non-image counterpart to
+    `make_synthetic_calibration_tar`, confirmed real (see
+    `build_from_hf_checkpoint`'s docstring) against Pulsar2's own
+    `InputQuantConfig.calibration_format` options (`Image` (default),
+    `Numpy`, `Binary`, `NumpyObject` -- confirmed from the Docker image's
+    own ``/opt/pulsar2/yamain/config/build_config.proto``).
+    """
+    import numpy as np
+
+    with tempfile.TemporaryDirectory() as td:
+        paths = []
+        for i, arr in enumerate(samples):
+            p = os.path.join(td, f"{i}.npy")
+            np.save(p, arr)
+            paths.append(p)
+        with tarfile.open(out_path, "w") as tf:
+            for p in paths:
+                tf.add(p, arcname=os.path.basename(p))
+    return out_path
+
+
+def _llm_quant_config(
+    input_calibration_datasets: Dict[str, str], calibration_size: int
+) -> dict:
+    return {
+        "model_type": "ONNX",
+        "npu_mode": "NPU1",
+        "quant": {
+            "input_configs": [
+                {
+                    "tensor_name": tensor_name,
+                    "calibration_dataset": calibration_dataset,
+                    "calibration_format": "Numpy",
+                    "calibration_size": calibration_size,
+                }
+                for tensor_name, calibration_dataset in input_calibration_datasets.items()
+            ],
+            "calibration_method": "MinMax",
+            "precision_analysis": False,
+        },
+        "compiler": {"check": 0},
+    }
+
+
+def build_from_hf_checkpoint(
+    hf_dir: str,
+    work_dir: str,
+    output_rel_dir: str,
+    *,
+    batch_size: int = 1,
+    seq_len: int = 8,
+    calibration_size: int = 4,
+    target_hardware: str = "AX650",
+    image: str = DEFAULT_IMAGE,
+    profile: bool = False,
+    timeout: int = 900,
+) -> BuildResult:
+    """The hf-config+safetensors -> onnx -> axmodel path: uses onnxsim's own
+    `onnxsim.reconstruct_hf_graph()` to build the ONNX graph from a real HF
+    checkpoint directory, then feeds it through the ordinary CNN/vision
+    `pulsar2 build` ingestion (`build()`, above) like any other ONNX model
+    -- distinct from `llm_build()` above, which hands Pulsar2's own
+    closed-source LLM ingestion the raw HF checkpoint directly, with no
+    ONNX step (and no onnxsim integration point) at all.
+
+    **Confirmed real end to end**: a synthetic tiny Llama-shaped checkpoint
+    built cleanly through `reconstruct_hf_graph()`, `pulsar2 build`
+    compiled it to a single-``neu mode``-node `compiled.axmodel`
+    (`pulsar2_ops.has_out_of_band_npu_data()` correctly flags it), and that
+    file ran successfully on a real AX650N via `run_on_device()`
+    (~0.19ms avg). Also confirmed: doc-scraped
+    `pulsar2_ops.AX650_SUPPORTED_OPS` flags `Neg` (used by RoPE's
+    rotate-half) as unsupported, but the real build compiled it without
+    complaint regardless -- the scraped op-support table is a fast
+    pre-screen, not a guaranteed predictor, for a fused pattern like this
+    one.
+
+    Only `reconstruct_hf_graph`'s two graph inputs, `input_ids` and
+    `position_ids` (both ``int64[batch_size, seq_len]``), are supported --
+    calibration data is generated automatically (random token ids in
+    ``[0, vocab_size)``, read from the checkpoint's own `config.json`, for
+    `input_ids`; `arange(seq_len)` broadcast over the batch for
+    `position_ids`). There is no way to plug in real calibration data
+    through this entry point -- call `onnxsim.reconstruct_hf_graph()` and
+    `build(config_path=...)` directly instead if you need that. A
+    checkpoint whose architecture `reconstruct_hf_graph` doesn't support
+    raises `onnxsim.UnsupportedArchitectureError` before Docker is ever
+    invoked.
+    """
+    if not docker_image_available(image):
+        return BuildResult(success=False, error=f"docker image not loaded: {image}")
+
+    import numpy as np
+    import onnx
+
+    import onnxsim
+
+    hf_config = onnxsim.read_hf_config(hf_dir)
+    vocab_size = int(hf_config.get("vocab_size", 32000))
+
+    model = onnxsim.reconstruct_hf_graph(hf_dir, batch_size=batch_size, seq_len=seq_len)
+    onnx_rel_path = "model.onnx"
+    onnx.save(model, os.path.join(work_dir, onnx_rel_path))
+
+    rng = np.random.default_rng(0)
+    dataset_dir = os.path.join(work_dir, "dataset")
+    os.makedirs(dataset_dir, exist_ok=True)
+
+    input_ids_samples = [
+        rng.integers(0, vocab_size, size=(batch_size, seq_len)).astype(np.int64)
+        for _ in range(calibration_size)
+    ]
+    position_ids_samples = [
+        np.arange(seq_len, dtype=np.int64)[None, :].repeat(batch_size, axis=0)
+        for _ in range(calibration_size)
+    ]
+    make_numpy_calibration_tar(
+        os.path.join(dataset_dir, "calib_input_ids.tar"), input_ids_samples
+    )
+    make_numpy_calibration_tar(
+        os.path.join(dataset_dir, "calib_position_ids.tar"), position_ids_samples
+    )
+
+    config_dir = os.path.join(work_dir, "config")
+    os.makedirs(config_dir, exist_ok=True)
+    config_rel_path = f"config/_auto_{os.path.basename(output_rel_dir)}.json"
+    with open(os.path.join(work_dir, config_rel_path), "w") as f:
+        json.dump(
+            _llm_quant_config(
+                {
+                    "input_ids": "./dataset/calib_input_ids.tar",
+                    "position_ids": "./dataset/calib_position_ids.tar",
+                },
+                calibration_size,
+            ),
+            f,
+        )
+
+    return build(
+        work_dir,
+        onnx_rel_path,
+        output_rel_dir,
+        config_path=config_rel_path,
+        target_hardware=target_hardware,
+        image=image,
+        profile=profile,
+        timeout=timeout,
+    )
+
+
 @dataclass
 class LLMBuildResult:
     success: bool

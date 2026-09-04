@@ -12,7 +12,9 @@ name: Axera Integration
 #
 # `pulsar2-docker-convert` is the real thing: an actual `pulsar2 build`
 # (Docker) + `axcl_run_model` (device) conversion, following
-# scripts/axera/README.md's confirmed-real workflow. Like
+# scripts/axera/README.md's confirmed-real workflow, plus
+# tests/test_pulsar2_hf_to_axmodel.py (the hf-config+safetensors ->
+# onnxsim.reconstruct_hf_graph() -> onnx -> axmodel path). Like
 # amd-integration.yml's MIGraphX check, this needs hardware this repository
 # does not provision (a loaded Pulsar2 Docker image + a connected AXCL
 # device on `[self-hosted, axcl]`), so it is workflow_dispatch-ONLY and
@@ -35,6 +37,7 @@ on:
       - "scripts/regression/model_zoo.py"
       - "tests/test_pulsar2_compat.py"
       - "tests/test_pulsar2_simulator.py"
+      - "tests/test_pulsar2_hf_to_axmodel.py"
 
 concurrency:
   group: axera-integration-${{ github.ref }}
@@ -134,7 +137,7 @@ jobs:
       - name: Install onnxsim + conversion deps
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install huggingface_hub pillow numpy onnxruntime
+          python3 -m pip install pytest huggingface_hub pillow numpy onnxruntime
           python3 -m pip install .
       - name: Show environment
         working-directory: ${{ runner.temp }}
@@ -142,6 +145,10 @@ jobs:
           python3 -c "import onnxsim; print('onnxsim', onnxsim.__version__)"
           docker images | grep '^pulsar2' || echo "no pulsar2 image loaded"
           axcl-smi || echo "no AXCL device found"
+      - name: Run hf-config+safetensors -> onnx -> axmodel integration test
+        working-directory: ${{ runner.temp }}
+        run: |
+          pytest -v "$GITHUB_WORKSPACE/tests/test_pulsar2_hf_to_axmodel.py"
       - name: Run real conversion
         working-directory: ${{ runner.temp }}
         env:
