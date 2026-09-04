@@ -115,7 +115,20 @@ def test_llm_fp4_quantizes_matmul_with_standard_ops_only():
     assert all(n.domain in ("", "ai.onnx") for n in q.graph.node)
 
 
-def test_llm_fp4_dequantized_values_match_hand_decoded_reference():
+def test_llm_fp4_dequantized_values_match_independently_recomputed_nearest_codebook():
+    # Unlike onnxsim.mx_quantization/onnxsim.nf4 (whose block scale always
+    # keeps the block's own max-abs element within the codebook's range),
+    # this module's own scale search can deliberately choose a *tighter*
+    # scale that clips outliers in exchange for lower total MSE -- so a
+    # fixed "within half a codebook gap" per-element bound (those other
+    # modules' own test pattern) does not hold here. Instead: trust only
+    # the search's chosen per-block *scale* (Ws), and independently
+    # recompute -- via nearest-codebook-index search, entirely in numpy,
+    # not using any op this module inserts into the graph -- what the
+    # *codes* (Wq) should be for that scale. This still catches any bug in
+    # either the code assignment or the Gather/Reshape/Mul dequantization
+    # subgraph, without assuming anything about how tightly the search
+    # itself clips.
     rng = np.random.default_rng(1)
     weight = rng.standard_normal((64, 16)).astype(np.float32) * 0.3
     model = _matmul_model(weight=weight)
@@ -123,20 +136,26 @@ def test_llm_fp4_dequantized_values_match_hand_decoded_reference():
 
     w_hand = _dequantize_llm_fp4_by_hand(q, block_size=32)
     codebook = _codebook_used_by(q)
-    max_gap = np.max(np.diff(np.sort(codebook)))
 
     ws = next(t for t in q.graph.initializer if t.name == "W_llmfp4_scale")
     scale = onnx.numpy_helper.to_array(ws).astype(np.float64)
     scale_full = np.repeat(scale, 32, axis=0)
 
-    # Every element's dequantization error must be within half the largest
-    # codebook gap scaled by that element's own block scale -- a real
-    # per-element correctness check against ground truth computed a
-    # completely different way (never via onnxruntime), per this repo's own
-    # cross-platform-numerics guidance.
-    assert np.all(
-        np.abs(w_hand - weight.astype(np.float64)) <= max_gap * scale_full / 2 + 1e-6
+    normalized = weight.astype(np.float64) / scale_full
+    diffs = np.abs(normalized[..., np.newaxis] - codebook[np.newaxis, np.newaxis, :])
+    nearest_idx = np.argmin(diffs, axis=-1)
+    independent_dequant = codebook[nearest_idx] * scale_full
+
+    assert np.allclose(w_hand, independent_dequant, atol=1e-4, rtol=1e-4)
+
+    # A loose sanity bound on overall reconstruction quality (this weight's
+    # own measured relative L2 error is ~0.09) -- catches a search that
+    # regressed to picking wildly bad scales/formats, without pinning an
+    # exact number.
+    rel_l2 = np.linalg.norm(w_hand - weight.astype(np.float64)) / np.linalg.norm(
+        weight.astype(np.float64)
     )
+    assert rel_l2 < 0.2
 
 
 def test_llm_fp4_output_stays_close_to_float_via_onnxruntime():
