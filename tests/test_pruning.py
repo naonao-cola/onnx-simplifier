@@ -36634,6 +36634,203 @@ def test_attention_head_pruning_prunes_blocks_inside_if_branches():
     assert np.all(np.isfinite(y_else))
 
 
+# --- Subgraph recursion, dry-run mirrors ----------------------------------
+#
+# _analyze_magnitude_pruning/_analyze_structured_pruning/
+# _analyze_attention_head_pruning were the three `_analyze_*` mirrors left
+# out of the "Subgraph recursion" round above purely as a scope decision
+# (see this module's own top-of-file docstring) even though their own
+# `apply_*` counterparts were already made subgraph-aware by it. These
+# tests cover that follow-up fix: one "reports a nested chain" test per
+# function (cross-checked against what the real `apply_*` call actually
+# does to that same model), plus one regression-safety test per function
+# on an existing top-level-only fixture.
+
+
+def test_analyze_magnitude_pruning_reports_subgraph_weights():
+    model, _cfg = _if_wrapped_mlp_model()
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_magnitude_pruning, sparsity=0.5
+    )
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+
+    # _iter_subgraphs/_candidates order is topology-only (pruning only
+    # mutates weight VALUES in place, never node/initializer order), so
+    # walking the same graphs/candidates over the pruned model lines up
+    # 1:1 with report.layers -- pairing every nested-subgraph layer's own
+    # would_drop/total against what apply_magnitude_pruning actually did
+    # to that exact weight.
+    expected = []
+    for graph in onnxsim.pruning._iter_subgraphs(pruned.graph):
+        imap = {t.name: t for t in graph.initializer}
+        for _, _, w_name, _, _ in onnxsim.pruning._candidates(graph):
+            w = onnx.numpy_helper.to_array(imap[w_name])
+            expected.append((w_name, int(w.size), int((w == 0).sum())))
+
+    # Six independent MatMul/Gemm weights total: two at the top level, two
+    # in then_branch, two in else_branch -- not just the top-level pair.
+    assert len(report.layers) == len(expected) == 6
+    for layer, (_w_name, size, zeros) in zip(report.layers, expected):
+        assert layer.total == size
+        assert layer.would_drop == zeros
+    assert report.not_eligible == []
+
+
+def test_analyze_magnitude_pruning_global_sparsity_pools_across_top_level_and_subgraphs():
+    model, _cfg = _if_wrapped_mlp_model()
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_magnitude_pruning, sparsity=0.3, global_sparsity=True
+    )
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.3, global_sparsity=True)
+
+    reported_total = sum(layer.total for layer in report.layers)
+    reported_drop = sum(layer.would_drop for layer in report.layers)
+
+    actual_total = 0
+    actual_drop = 0
+    for graph in onnxsim.pruning._iter_subgraphs(pruned.graph):
+        for _, _, w_name, _, _ in onnxsim.pruning._candidates(graph):
+            imap = {t.name: t for t in graph.initializer}
+            w = onnx.numpy_helper.to_array(imap[w_name])
+            actual_total += w.size
+            actual_drop += int((w == 0).sum())
+
+    # One single global cutoff pooled across every matched layer in every
+    # graph -- matching apply_magnitude_pruning's own whole-model pooling,
+    # not each graph/layer independently hitting 0.3 on its own.
+    assert reported_total == actual_total
+    assert reported_drop == actual_drop
+    assert reported_drop / reported_total == pytest.approx(0.3, abs=0.02)
+
+
+def test_analyze_magnitude_pruning_no_subgraphs_matches_pre_existing_behavior():
+    # Regression-safety: a subgraph-free model's report is unaffected by
+    # _analyze_magnitude_pruning becoming subgraph-aware -- same fixture
+    # and same expected numbers as
+    # test_analyze_magnitude_pruning_matches_real_call.
+    K, N = 64, 16
+    model = _matmul_model(K=K, N=N)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_magnitude_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "matmul"
+    assert layer.total == K * N
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    w = onnx.numpy_helper.to_array(pruned.graph.initializer[0])
+    assert layer.would_drop == int((w == 0).sum())
+
+
+def test_analyze_structured_pruning_reports_chain_inside_if_branch():
+    K0, H0, Out0 = 8, 16, 4
+    K1, H1, OutB = 6, 12, 3
+    model, _cfg = _if_wrapped_mlp_model(
+        K0=K0, H0=H0, Out0=Out0, K1=K1, H1=H1, OutB=OutB
+    )
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+
+    # Same alignment argument as the magnitude test above: chain-finder
+    # order only depends on topology, so re-deriving the chain groups from
+    # the PRUNED model's own graphs (post-slicing channel counts) lines up
+    # 1:1 with report.layers (computed from the ORIGINAL, unpruned model).
+    expected_totals = []
+    expected_drops = []
+    for orig_graph, pruned_graph in zip(
+        onnxsim.pruning._iter_subgraphs(model.graph),
+        onnxsim.pruning._iter_subgraphs(pruned.graph),
+    ):
+        orig_chains = onnxsim.pruning._structured_chain_groups(orig_graph)
+        pruned_chains = onnxsim.pruning._structured_chain_groups(pruned_graph)
+        for (_f1, chains), (_f2, pruned_chains_) in zip(orig_chains, pruned_chains):
+            for chain, pruned_chain in zip(chains, pruned_chains_):
+                expected_totals.append(chain.n_channels)
+                expected_drops.append(chain.n_channels - pruned_chain.n_channels)
+
+    # Three independent chains total: top level, then_branch, else_branch.
+    assert len(report.layers) == 3
+    assert [layer.total for layer in report.layers] == expected_totals == [H0, H1, H1]
+    assert [layer.would_drop for layer in report.layers] == expected_drops
+    assert report.not_eligible == []
+
+
+def test_analyze_structured_pruning_no_subgraphs_matches_pre_existing_behavior():
+    # Regression-safety: a subgraph-free model's report is unaffected by
+    # _analyze_structured_pruning becoming subgraph-aware -- same fixture
+    # and same expected numbers as
+    # test_analyze_structured_pruning_plain_chain_matches_real_call.
+    K, H, Out = 8, 32, 4
+    model = _mlp_model(K=K, H=H, Out=Out)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "matmul_plain"
+    assert layer.total == H
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][1] == H - layer.would_drop
+    assert dims_after["W2"][0] == H - layer.would_drop
+
+
+def test_analyze_attention_head_pruning_reports_blocks_inside_if_branches():
+    # The top-level graph here has NO Attention node at all (see
+    # _if_attention_model) -- before this fix, this exact model made
+    # analyze_pruning_sensitivity(model, apply_attention_head_pruning, ...)
+    # return an empty, misleading report (layers=[], not_eligible=[]) even
+    # though a real apply_attention_head_pruning call correctly prunes both
+    # branches' own attention blocks.
+    K, H, D, Out = 8, 4, 4, 6
+    model = _if_attention_model(K=K, H=H, D=D, Out=Out)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    assert len(report.layers) == 2  # then_branch's + else_branch's own block
+    for layer in report.layers:
+        assert layer.family == "attention_head"
+        assert layer.total == H
+        assert layer.would_drop == H // 2  # matches apply's own num_heads == H // 2
+    assert report.not_eligible == []
+
+    then_g, else_g = _then_else_graphs(pruned)
+    for g, prefix in [(then_g, "then_"), (else_g, "else_")]:
+        inits = {t.name: t for t in g.initializer}
+        assert list(inits[f"{prefix}Wqkv"].dims) == [K, 3 * (H // 2) * D]
+        assert list(inits[f"{prefix}Wout"].dims) == [(H // 2) * D, Out]
+
+
+def test_analyze_attention_head_pruning_no_subgraphs_matches_pre_existing_behavior():
+    # Regression-safety: a subgraph-free model's report is unaffected by
+    # _analyze_attention_head_pruning becoming subgraph-aware -- same
+    # fixture and same expected numbers as
+    # test_analyze_attention_head_pruning_plain_attention_matches_real_call.
+    K, H, D, Out = 8, 4, 4, 6
+    model, _info = _attention_model(K=K, H=H, D=D, Out=Out)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_head"
+    assert layer.total == H
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept = H - layer.would_drop
+    assert dims_after["Wqkv"][1] == kept * 3 * D
+
+
 def test_wanda_pruning_still_leaves_subgraph_weights_untouched_documented_gap():
     # apply_wanda_pruning is a calibration-data-driven function --
     # deliberately NOT made subgraph-aware by this change (see this
