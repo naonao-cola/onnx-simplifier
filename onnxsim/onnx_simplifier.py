@@ -20,6 +20,7 @@ from rich.text import Text
 import onnxsim.onnxsim_cpp2py_export as C
 
 from . import backend, model_checking, model_info, profile_merge, version
+from .pruning import EmbeddingPruningResult
 
 TensorShape = List[int]
 TensorShapes = Dict[str, TensorShape]
@@ -1550,6 +1551,161 @@ def apply_qmoe_expert_channel_pruning_cpp(
     return onnx.load_from_string(
         C.apply_qmoe_expert_channel_pruning(model.SerializeToString(), sparsity)
     )
+
+
+def _embedding_pruning_result_from_cpp(
+    model_bytes: bytes,
+    matched: bool,
+    kept_token_ids: List[int],
+    lm_head_pruned: bool,
+) -> EmbeddingPruningResult:
+    """Reconstructs the real, public :class:`onnxsim.pruning.EmbeddingPruningResult`
+    -- the exact same dataclass :func:`onnxsim.apply_embedding_vocab_pruning`/
+    :func:`onnxsim.apply_embedding_vocab_magnitude_pruning` already return --
+    from the C++ binding's own ``(model_bytes, matched, kept_token_ids,
+    lm_head_pruned)`` tuple. ``id_map`` (``{old_token_id: new_token_id}``) is
+    not carried across the nanobind boundary at all -- it is exactly
+    ``{tok: i for i, tok in enumerate(kept_token_ids)}``, trivial to
+    reconstruct here, so there is no reason for the C++ side to also
+    serialize an int64->int64 map.
+    """
+    model = onnx.load_from_string(model_bytes)
+    if not matched:
+        return EmbeddingPruningResult(model=model, matched=False)
+    id_map = {old: new for new, old in enumerate(kept_token_ids)}
+    return EmbeddingPruningResult(
+        model=model,
+        matched=True,
+        kept_token_ids=list(kept_token_ids),
+        id_map=id_map,
+        lm_head_pruned=lm_head_pruned,
+    )
+
+
+def apply_embedding_vocab_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    keep_token_ids: Optional[Sequence[int]] = None,
+    drop_token_ids: Optional[Sequence[int]] = None,
+    input_name: Optional[str] = None,
+) -> EmbeddingPruningResult:
+    """C++-backed port of :func:`onnxsim.apply_embedding_vocab_pruning`:
+    shrinks a matched token-embedding table's vocabulary axis -- a plain
+    ``Gather``'s ``data`` input feeding a graph input's token-id tensor --
+    (and, where a tied or confidently-auto-identified untied ``lm_head``
+    exists, its own vocab-logits projection too) down to a caller-supplied,
+    explicit keep-set.
+
+    **Contract change, unmissable on purpose, identical to the pure-Python
+    original**: the pruned model this returns does **not** accept the same
+    ``input_ids`` values the original model did. Token id ``i`` is only
+    ever a valid input going forward if ``i in result.id_map`` -- feed
+    ``result.id_map[i]`` in its place before running ``result.model``. See
+    :class:`onnxsim.pruning.EmbeddingPruningResult`'s own docstring for the
+    full return-value contract.
+
+    Unlike :func:`onnxsim.apply_embedding_vocab_pruning`, this C++ port
+    only ever matches a plain ``Gather`` producer -- not
+    ``com.microsoft::EmbedLayerNormalization`` or ``com.microsoft::
+    GatherBlockQuantized`` -- only ever auto-detects a bare ``MatMul``/
+    vanilla ``Gemm`` ``lm_head`` -- not ``com.microsoft::FusedGemm``/
+    ``GemmFastGelu`` -- and only ever admits a plain FLOAT (float32)
+    embedding table/``lm_head`` weight/bias, not also FLOAT16/BFLOAT16,
+    matching this codebase's own established narrower-than-pruning.py
+    C++-port scope decision elsewhere (e.g.
+    :func:`onnxsim.apply_moe_expert_channel_pruning_cpp`'s own FLOAT32-only
+    restriction). See ``onnxsim/structured_pruning_entry.cpp``'s own
+    "Embedding vocabulary pruning" section comment for the exact matched
+    topology.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+
+    :param model: the original onnx ModelProto or file path
+    :param keep_token_ids: the exact set of original token ids to keep, in
+            any order/with any duplicates. Give exactly one of
+            ``keep_token_ids``/``drop_token_ids``.
+    :param drop_token_ids: the exact set of original token ids to drop;
+            every other id in ``range(vocab_size)`` is kept. Give exactly
+            one of ``keep_token_ids``/``drop_token_ids``.
+    :param input_name: when the graph has more than one structurally-
+            eligible embedding ``Gather``, names which one to target by its
+            token-id operand's graph input name. Required in that case --
+            omitted, an ambiguous graph declines the whole call rather than
+            guessing. A name that matches no eligible producer raises
+            ``ValueError``.
+    :returns: an :class:`onnxsim.pruning.EmbeddingPruningResult` -- see its
+            own docstring. ``matched`` is False (model left completely
+            untouched) for any topology this pass doesn't confidently
+            recognize.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    result = C.apply_embedding_vocab_pruning(
+        model.SerializeToString(),
+        list(keep_token_ids) if keep_token_ids is not None else None,
+        list(drop_token_ids) if drop_token_ids is not None else None,
+        input_name,
+    )
+    return _embedding_pruning_result_from_cpp(*result)
+
+
+def apply_embedding_vocab_magnitude_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    protect_token_ids: Optional[Sequence[int]] = None,
+    input_name: Optional[str] = None,
+) -> EmbeddingPruningResult:
+    """C++-backed port of :func:`onnxsim.apply_embedding_vocab_magnitude_pruning`:
+    the importance-ranked variant of
+    :func:`onnxsim.apply_embedding_vocab_pruning_cpp` -- drops the lowest-
+    L2-norm ``sparsity`` fraction of vocabulary rows (combined,
+    root-sum-square, with a matched untied ``lm_head``'s own per-row weight
+    norm when one is identified), needing no calibration data at all.
+
+    **This mode's safety bar is meaningfully weaker than
+    :func:`onnxsim.apply_embedding_vocab_pruning_cpp`'s own explicit
+    keep-set** -- see that function's own docstring and
+    :func:`onnxsim.apply_embedding_vocab_magnitude_pruning`'s own (identical
+    caveat, ported verbatim): a small embedding-row norm means a token was
+    initialized/trained with small weights, not that it is safe to drop
+    from a real deployment's input space. ``protect_token_ids`` (below)
+    covers the common, cheap case of guaranteeing a known-important set
+    never gets ranked away by norm alone, but does not by itself make
+    norm-based ranking a safe substitute for the explicit-keep-set entry
+    point in general.
+
+    Same contract change as :func:`onnxsim.apply_embedding_vocab_pruning_cpp`
+    -- see its own docstring and
+    :class:`onnxsim.pruning.EmbeddingPruningResult`'s.
+
+    Same C++-port scope restrictions as
+    :func:`onnxsim.apply_embedding_vocab_pruning_cpp` (plain ``Gather``
+    producer only, plain ``MatMul``/``Gemm`` ``lm_head`` only, FLOAT32-only
+    tensors) -- see that function's own docstring.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+
+    :param model: the original onnx ModelProto or file path
+    :param sparsity: target fraction of ``vocab_size`` to drop (floored so
+            at least one row, and every ``protect_token_ids`` row, always
+            survives); must be in ``[0, 1)``
+    :param protect_token_ids: token ids to always keep regardless of their
+            own norm ranking
+    :param input_name: identical to
+            :func:`onnxsim.apply_embedding_vocab_pruning_cpp`'s own
+            ``input_name``
+    :returns: an :class:`onnxsim.pruning.EmbeddingPruningResult`
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    result = C.apply_embedding_vocab_magnitude_pruning(
+        model.SerializeToString(),
+        sparsity,
+        list(protect_token_ids) if protect_token_ids is not None else None,
+        input_name,
+    )
+    return _embedding_pruning_result_from_cpp(*result)
 
 
 def apply_quarot_cpp(

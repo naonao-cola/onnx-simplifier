@@ -7165,3 +7165,548 @@ def test_cpp_structured_pruning_matmul_bnb4_matches_python_reference_output():
     (y_py,) = _run(pruned_py, {"A": A})
     (y_cpp,) = _run(pruned_cpp, {"A": A})
     np.testing.assert_array_equal(y_py, y_cpp)
+
+
+# --- MatMulBlockQuantizedFp4Weight/MatMulBlockQuantizedFp8Weight -----------
+# --- (NVFP4/FP8 block-quantized weight) structured pruning ----------------
+#
+# Tests for the Fp8Weight/Fp4Weight plain chain families
+# (onnxsim/structured_pruning_entry.cpp's own "MatMulBlockQuantizedFp4Weight/
+# MatMulBlockQuantizedFp8Weight" section), mirroring tests/test_pruning.py's
+# own coverage for both ops (see that file's own `_fp8bw_*`/`_fp4bw_*`
+# helpers, independently re-implemented here rather than imported -- this
+# file's own established "no cross-import between test files" precedent).
+# Models are built via onnx.parser (per CLAUDE.md's convention); the packed
+# FLOAT8E4M3FN/uint8 `B`/scale-table initializers are attached
+# programmatically via onnx.numpy_helper.from_array afterward (CLAUDE.md's
+# documented exception -- these must be byte-exact, not spelled out as text
+# literals). Neither op has a real CPU kernel in this environment (see
+# onnxsim/pruning.py's own section comment for the empirical confirmation --
+# the same fact holds for this C++ port, which links the identical
+# onnxruntime), so every "oracle" test below uses the same decomposed-proxy-
+# topology methodology tests/test_pruning.py's own equivalent tests
+# establish: the pruned node's own packed tensors are dequantized BY HAND
+# (independently of onnxsim's own code) into a plain float32 weight, wired
+# into an equivalent plain Gemm/MatMul chain, and run through a REAL CPU
+# onnxruntime.InferenceSession against an independently-computed numpy
+# oracle.
+
+
+def _fp8bq_quantize(w, block_size):
+    """Independent (onnxsim-code-free) per-block E4M3 quantizer for one
+    ``MatMulBlockQuantizedFp8Weight``-style ``[N, K]`` float weight -- scale
+    chosen as ``amax(block) / 6.0``, a plausible representation (there is no
+    real kernel/reference quantizer to match, see this section's own top
+    comment). Returns ``(b_f8 [N, K] ml_dtypes.float8_e4m3fn, b_scale
+    [N, K // block_size] float32, dequant [N, K] float64)``.
+    """
+    n, k = w.shape
+    kb = k // block_size
+    w_blocks = w.reshape(n, kb, block_size).astype(np.float64)
+    amax = np.maximum(np.abs(w_blocks).max(axis=-1), 1e-8)
+    scale = (amax / 6.0).astype(np.float32)
+    scale_expanded = np.repeat(scale.astype(np.float64), block_size, axis=-1)
+    b_f8 = (w_blocks / scale_expanded.reshape(n, kb, block_size)).astype(
+        ml_dtypes.float8_e4m3fn
+    )
+    dequant = b_f8.astype(np.float64) * scale_expanded.reshape(n, kb, block_size)
+    return b_f8.reshape(n, k), scale, dequant.reshape(n, k)
+
+
+def _fp8bq_dequantize(b_f8, scale, block_size):
+    """Independent dequantizer -- inverse of :func:`_fp8bq_quantize`'s own
+    formula, used to re-dequantize the PRUNED node's own surviving tensors
+    (never the pass's own dequantize code) for the decomposed-proxy oracle.
+    """
+    n, k = b_f8.shape
+    scale_expanded = np.repeat(scale.astype(np.float64), block_size, axis=-1)
+    return b_f8.astype(np.float64) * scale_expanded
+
+
+_FP4BQ_E2M1_LUT = np.array(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=np.float64,
+)
+
+
+def _fp4bq_e2m1_encode_nearest(values):
+    values = np.asarray(values, dtype=np.float64)
+    flat = values.reshape(-1)
+    codes = np.argmin(np.abs(_FP4BQ_E2M1_LUT[None, :] - flat[:, None]), axis=1)
+    return codes.reshape(values.shape).astype(np.uint8)
+
+
+def _fp4bq_e2m1_decode(codes):
+    return _FP4BQ_E2M1_LUT[np.asarray(codes).astype(np.int64)]
+
+
+def _fp4bq_unpack_nibbles(packed, count):
+    """Independent inverse of :func:`_nbits_pack_nibbles` (defined above, in
+    this same file's own "MatMulNBits" section -- reused here unchanged,
+    same low-nibble-first convention, not a cross-file import): 2 codes per
+    byte, LOW nibble first. Drops the last, padding, half-byte when `count`
+    is odd.
+    """
+    packed = np.asarray(packed)
+    lo = packed & 0x0F
+    hi = (packed >> 4) & 0x0F
+    interleaved = np.stack([lo, hi], axis=-1).reshape(*packed.shape[:-1], -1)
+    return interleaved[..., :count].astype(np.uint8)
+
+
+def _fp4bq_quantize(w, global_scale, block_size):
+    """Independent (onnxsim-code-free) NVFP4 quantizer for one
+    ``MatMulBlockQuantizedFp4Weight``-style ``[N, K]`` float weight --
+    per-`block_size` E2M1 magnitude/sign code plus a ``float8e4m3fn`` block
+    scale, combined with a caller-supplied scalar `global_scale`. Returns
+    ``(packed uint8 [N, K/2] -- 2 codes/byte, low nibble first, flat across
+    the whole K axis, weight_scale uint8 [N, k_blocks] -- raw E4M3 bytes,
+    dequant [N, K] float64)``. Reuses :func:`_nbits_pack_nibbles` (defined
+    above in this same file) for the packing -- identical convention to
+    `Fp4Weight`'s own live schema, per onnxsim/pruning.py's own section
+    comment.
+    """
+    n, k = w.shape
+    kb = k // block_size
+    w_blocks = w.reshape(n, kb, block_size).astype(np.float64)
+    amax = np.maximum(np.abs(w_blocks).max(axis=-1), 1e-12)
+    block_scale_f64 = amax / (6.0 * global_scale)  # 6.0 == E2M1's own max magnitude
+    block_scale_f8 = block_scale_f64.astype(ml_dtypes.float8_e4m3fn)
+    block_scale_rt = block_scale_f8.astype(np.float64)
+    codes = _fp4bq_e2m1_encode_nearest(
+        w_blocks / (block_scale_rt[..., None] * global_scale)
+    )
+    packed = _nbits_pack_nibbles(codes.reshape(n, k))
+    dequant = (
+        _fp4bq_e2m1_decode(codes) * block_scale_rt[..., None] * global_scale
+    ).reshape(n, k)
+    return packed, block_scale_f8.view(np.uint8), dequant
+
+
+def _fp8bq_chain_model(N1, K1, N2, block_size, W1, W2):
+    """Builds ``A -> MatMulBlockQuantizedFp8Weight(mm1) -> Relu ->
+    MatMulBlockQuantizedFp8Weight(mm2) -> Y``, both nodes real. Returns
+    ``(model, info)`` where `info` carries the independently-quantized
+    artifacts needed to hand-build an oracle.
+    """
+    b1, s1, dq1 = _fp8bq_quantize(W1, block_size)
+    b2, s2, dq2 = _fp8bq_quantize(W2, block_size)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        g (float16[3,{K1}] A) => (float16[3,{N2}] Y)
+        {{
+          h1 = com.microsoft.MatMulBlockQuantizedFp8Weight <block_size={block_size}> (A, B1, S1)
+          h1a = Relu(h1)
+          Y = com.microsoft.MatMulBlockQuantizedFp8Weight <block_size={block_size}> (h1a, B2, S2)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(b1, name="B1"),
+            _f32(s1, "S1"),
+            onnx.numpy_helper.from_array(b2, name="B2"),
+            _f32(s2, "S2"),
+        ]
+    )
+    return model, dict(b1=b1, s1=s1, dequant1=dq1, b2=b2, s2=s2, dequant2=dq2)
+
+
+def test_cpp_structured_pruning_matmul_block_quantized_fp8_chain_matches_oracle():
+    # The core "slice, don't recompute" correctness invariant: the pruned
+    # graph's own B/b_scale tensors must equal a byte-exact hand-slice of
+    # the ORIGINAL quantized codes, and running an equivalent decomposed
+    # plain-float Gemm chain (built from the PRUNED tensors' own dequantized
+    # values) through a real CPU onnxruntime session matches an
+    # independently-computed numpy oracle.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(41001)
+    W1 = (rng.standard_normal((N1, K1)) * 0.2).astype(np.float32)
+    W1[:8] *= 6.0  # first half of rows clearly more important
+    W2 = (rng.standard_normal((N2, N1)) * 0.2).astype(np.float32)
+    model, info = _fp8bq_chain_model(N1, K1, N2, block_size, W1, W2)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.sort(np.argsort(-np.abs(info["dequant1"]).sum(axis=1))[:8])
+    assert list(keep) == list(range(8))  # engineered: rows 0-7 are important
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    b1p = onnx.numpy_helper.to_array(inits["B1"])
+    s1p = onnx.numpy_helper.to_array(inits["S1"])
+    b2p = onnx.numpy_helper.to_array(inits["B2"])
+    assert b1p.shape == (8, K1)
+    assert s1p.shape == (8, K1 // block_size)
+    assert b2p.shape == (N2, 8)
+
+    np.testing.assert_array_equal(b1p.view(np.uint8), info["b1"].view(np.uint8)[keep])
+    np.testing.assert_array_equal(s1p, info["s1"][keep])
+    np.testing.assert_array_equal(
+        b2p.view(np.uint8), info["b2"].view(np.uint8)[:, keep]
+    )
+
+    proxy_graph = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node("Gemm", ["A", "W1f"], ["T"], transB=1),
+            onnx.helper.make_node("Relu", ["T"], ["Ta"]),
+            onnx.helper.make_node("Gemm", ["Ta", "W2f"], ["Y"], transB=1),
+        ],
+        "g",
+        [onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [3, K1])],
+        [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [3, N2])],
+        initializer=[
+            _f32(info["dequant1"][keep].astype(np.float32), "W1f"),
+            _f32(info["dequant2"][:, keep].astype(np.float32), "W2f"),
+        ],
+    )
+    proxy_model = onnx.helper.make_model(
+        proxy_graph, opset_imports=[onnx.helper.make_opsetid("", 21)]
+    )
+    proxy_model.ir_version = 10
+    onnx.checker.check_model(proxy_model)
+
+    a = rng.standard_normal((3, K1)).astype(np.float32)
+    sess = ort.InferenceSession(
+        proxy_model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (y,) = sess.run(None, {"A": a})
+    oracle = (
+        np.maximum(a.astype(np.float64) @ info["dequant1"][keep].T, 0.0)
+        @ info["dequant2"][:, keep].T
+    )
+    np.testing.assert_allclose(y.astype(np.float64), oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_cpp_structured_pruning_matmul_block_quantized_fp8_declines_non_block_aligned():
+    # block_size=8, sparsity=0.25 -> keep_count=12, not a multiple of 8 --
+    # the consumer's own scale table can't represent a partial block, so the
+    # whole chain must be left byte-for-byte unchanged.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(41010)
+    W1 = (rng.standard_normal((N1, K1)) * 0.3).astype(np.float32)
+    W2 = (rng.standard_normal((N2, N1)) * 0.3).astype(np.float32)
+    model, _info = _fp8bq_chain_model(N1, K1, N2, block_size, W1, W2)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.25)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_structured_pruning_matmul_block_quantized_fp8_declines_shared_weight():
+    # B1/S1 read by both the plain chain's own producer node AND an extra
+    # node -- slicing them for the chain would silently corrupt that extra
+    # reader, so the whole model must be left untouched.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(41020)
+    W1 = (rng.standard_normal((N1, K1)) * 0.3).astype(np.float32)
+    W2 = (rng.standard_normal((N2, N1)) * 0.3).astype(np.float32)
+    model, _info = _fp8bq_chain_model(N1, K1, N2, block_size, W1, W2)
+
+    extra = onnx.helper.make_node(
+        "MatMulBlockQuantizedFp8Weight",
+        inputs=["A", "B1", "S1"],
+        outputs=["Y2"],
+        domain="com.microsoft",
+        name="mm_extra",
+        block_size=block_size,
+    )
+    model.graph.node.append(extra)
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("Y2", onnx.TensorProto.FLOAT16, [3, N1])
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_structured_pruning_matmul_block_quantized_fp8_matches_python_reference():
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(41030)
+    W1 = (rng.standard_normal((N1, K1)) * 0.2).astype(np.float32)
+    W1[:8] *= 6.0
+    W2 = (rng.standard_normal((N2, N1)) * 0.2).astype(np.float32)
+    model, _info = _fp8bq_chain_model(N1, K1, N2, block_size, W1, W2)
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_structured_pruning_matmul_block_quantized_fp8(
+        model, sparsity=0.5
+    )
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+
+    py_bytes = {t.name: t.SerializeToString() for t in pruned_py.graph.initializer}
+    cpp_bytes = {t.name: t.SerializeToString() for t in pruned_cpp.graph.initializer}
+    assert py_bytes == cpp_bytes
+
+
+def _fp4bq_chain_model(N1, K1, N2, block_size, W1, gs1, W2, gs2):
+    """``Fp4Weight`` analogue of :func:`_fp8bq_chain_model`."""
+    p1, ws1, dq1 = _fp4bq_quantize(W1, gs1, block_size)
+    p2, ws2, dq2 = _fp4bq_quantize(W2, gs2, block_size)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        g (float16[3,{K1}] A) => (float16[3,{N2}] Y)
+        {{
+          h1 = com.microsoft.MatMulBlockQuantizedFp4Weight <block_size={block_size}> (A, B1, WS1, WS21)
+          h1a = Relu(h1)
+          Y = com.microsoft.MatMulBlockQuantizedFp4Weight <block_size={block_size}> (h1a, B2, WS2, WS22)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(p1, name="B1"),
+            onnx.numpy_helper.from_array(ws1, name="WS1"),
+            _f32(np.array([gs1], dtype=np.float32), "WS21"),
+            onnx.numpy_helper.from_array(p2, name="B2"),
+            onnx.numpy_helper.from_array(ws2, name="WS2"),
+            _f32(np.array([gs2], dtype=np.float32), "WS22"),
+        ]
+    )
+    return model, dict(p1=p1, ws1=ws1, dequant1=dq1, p2=p2, ws2=ws2, dequant2=dq2)
+
+
+def test_cpp_structured_pruning_matmul_block_quantized_fp4_chain_matches_oracle():
+    # Same "slice, don't recompute" invariant as the Fp8Weight test above --
+    # here the byte-identity check on B needs an unpack/repack (Fp4Weight's
+    # own flat, whole-row nibble packing, not block-relative like
+    # MatMulNBits's), which this test checks explicitly.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(41101)
+    W1 = (rng.standard_normal((N1, K1)) * 1.0).astype(np.float32)
+    W1[:8] *= 6.0
+    W2 = (rng.standard_normal((N2, N1)) * 1.0).astype(np.float32)
+    model, info = _fp4bq_chain_model(N1, K1, N2, block_size, W1, 1.0, W2, 1.0)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.sort(np.argsort(-np.abs(info["dequant1"]).sum(axis=1))[:8])
+    assert list(keep) == list(range(8))
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    b1p = onnx.numpy_helper.to_array(inits["B1"])
+    ws1p = onnx.numpy_helper.to_array(inits["WS1"])
+    b2p = onnx.numpy_helper.to_array(inits["B2"])
+    assert b1p.shape == (8, K1 // 2)
+    assert ws1p.shape == (8, K1 // block_size)
+    assert b2p.shape == (N2, 8 // 2)  # K axis co-pruned: 8 kept K-values -> 4 bytes
+
+    # B1 (producer role) is a plain whole-row byte slice -- no unpack needed.
+    np.testing.assert_array_equal(b1p, info["p1"][keep])
+    np.testing.assert_array_equal(ws1p, info["ws1"][keep])
+
+    # B2's own kept COLUMNS need an unpack/repack (flat-across-K packing).
+    orig_codes2 = _fp4bq_unpack_nibbles(info["p2"], N1)
+    expect_b2 = _nbits_pack_nibbles(orig_codes2[:, keep])
+    np.testing.assert_array_equal(b2p, expect_b2)
+
+    proxy_graph = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node("Gemm", ["A", "W1f"], ["T"], transB=1),
+            onnx.helper.make_node("Relu", ["T"], ["Ta"]),
+            onnx.helper.make_node("Gemm", ["Ta", "W2f"], ["Y"], transB=1),
+        ],
+        "g",
+        [onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [3, K1])],
+        [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [3, N2])],
+        initializer=[
+            _f32(info["dequant1"][keep].astype(np.float32), "W1f"),
+            _f32(info["dequant2"][:, keep].astype(np.float32), "W2f"),
+        ],
+    )
+    proxy_model = onnx.helper.make_model(
+        proxy_graph, opset_imports=[onnx.helper.make_opsetid("", 21)]
+    )
+    proxy_model.ir_version = 10
+    onnx.checker.check_model(proxy_model)
+
+    a = rng.standard_normal((3, K1)).astype(np.float32)
+    sess = ort.InferenceSession(
+        proxy_model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (y,) = sess.run(None, {"A": a})
+    oracle = (
+        np.maximum(a.astype(np.float64) @ info["dequant1"][keep].T, 0.0)
+        @ info["dequant2"][:, keep].T
+    )
+    np.testing.assert_allclose(y.astype(np.float64), oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_cpp_structured_pruning_matmul_block_quantized_fp4_declines_non_block_aligned():
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(41110)
+    W1 = (rng.standard_normal((N1, K1)) * 1.0).astype(np.float32)
+    W2 = (rng.standard_normal((N2, N1)) * 1.0).astype(np.float32)
+    model, _info = _fp4bq_chain_model(N1, K1, N2, block_size, W1, 1.0, W2, 1.0)
+    onnx.checker.check_model(model)
+
+    # sparsity=0.25 -> keep_count=12, not a multiple of block_size=8.
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.25)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_structured_pruning_matmul_block_quantized_fp4_declines_odd_resulting_k():
+    # block_size=3 (odd), N1=12 -> k_blocks=4. Engineered so the top-9-by-
+    # importance keep-set is EXACTLY channels {0..8} -- blocks {0, 1, 2}
+    # fully kept, block 3 fully dropped: perfectly block-aligned by the
+    # SHARED (MatMulNBits-style) check, but the resulting K (9) is odd,
+    # which Fp4Weight's own flat (non-block-relative) nibble packing cannot
+    # honestly represent (the live schema derives K as exactly
+    # 2 * B.shape[1]) -- declined on top of the shared check, per this
+    # section's own top comment.
+    N1, K1, N2, block_size = 12, 15, 4, 3  # K1=15 divisible by block_size=3 too
+    rng = np.random.default_rng(41120)
+    W1 = (rng.standard_normal((N1, K1)) * 0.2).astype(np.float32)
+    W1[:9] *= 6.0  # channels 0-8 important, 9-11 unimportant
+    W2 = (rng.standard_normal((N2, N1)) * 0.2).astype(np.float32)
+    model, info = _fp4bq_chain_model(N1, K1, N2, block_size, W1, 1.0, W2, 1.0)
+    onnx.checker.check_model(model)
+
+    keep = np.sort(np.argsort(-np.abs(info["dequant1"]).sum(axis=1))[:9])
+    assert list(keep) == list(range(9))  # exactly blocks {0, 1, 2} of block_size=3
+
+    # sparsity=0.25 -> keep_count = 12 - round(12*0.25) = 9.
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.25)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_structured_pruning_matmul_block_quantized_fp4_declines_shared_weight():
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(41130)
+    W1 = (rng.standard_normal((N1, K1)) * 1.0).astype(np.float32)
+    W2 = (rng.standard_normal((N2, N1)) * 1.0).astype(np.float32)
+    model, _info = _fp4bq_chain_model(N1, K1, N2, block_size, W1, 1.0, W2, 1.0)
+
+    extra = onnx.helper.make_node(
+        "MatMulBlockQuantizedFp4Weight",
+        inputs=["A", "B1", "WS1", "WS21"],
+        outputs=["Y2"],
+        domain="com.microsoft",
+        name="mm_extra",
+        block_size=block_size,
+    )
+    model.graph.node.append(extra)
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("Y2", onnx.TensorProto.FLOAT16, [3, N1])
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_structured_pruning_matmul_block_quantized_fp4_mixed_plain_float_producer_matches_oracle():
+    # A plain-float (directly-constant weight) MatMul producer feeding a
+    # quantized Fp4Weight consumer -- the "unquantized embedding feeding the
+    # first quantized block" export shape this section's own top comment
+    # motivates (MatchPlainMatMulNBitsPeer, reused unchanged from the
+    # MatMulNBits section). The plain-float peer side of THIS C++ port only
+    # ever recognizes a FLOAT32 weight (see the MatMulNBits section's own
+    # top comment for why), so A/W1 are declared FLOAT32 here -- the
+    # quantized consumer's own `A` input dtype is never actually inspected
+    # by the matcher (see this section's own top comment), so this is not a
+    # scope violation of the live schema, just this test's own choice of a
+    # graph that both the plain MatMul op (real ai.onnx schema, dtype-
+    # checked by onnx.checker) and the quantized consumer accept.
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(41140)
+    W1 = (rng.standard_normal((K1, N1)) * 0.3).astype(
+        np.float32
+    )  # [K, N], untransposed
+    W1[:, :8] *= 6.0  # first half of N1 (producer's own output axis) important
+    W2 = (rng.standard_normal((N2, N1)) * 1.0).astype(np.float32)
+    p2, ws2, dq2 = _fp4bq_quantize(W2, 1.0, block_size)
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        g (float[3,{K1}] A) => (float16[3,{N2}] Y)
+        {{
+          T = MatMul(A, W1)
+          Y = com.microsoft.MatMulBlockQuantizedFp4Weight <block_size={block_size}> (T, B2, WS2, WS22)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            _f32(W1, "W1"),
+            onnx.numpy_helper.from_array(p2, name="B2"),
+            onnx.numpy_helper.from_array(ws2, name="WS2"),
+            _f32(np.array([1.0], dtype=np.float32), "WS22"),
+        ]
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    w1p = onnx.numpy_helper.to_array(inits["W1"])
+    b2p = onnx.numpy_helper.to_array(inits["B2"])
+    assert w1p.shape == (K1, 8)  # plain-float producer sliced on axis 1 (col)
+    assert b2p.shape == (N2, 4)  # consumer's own K axis co-pruned (8/2 nibbles)
+
+    keep = np.sort(np.argsort(-np.linalg.norm(W1.astype(np.float64), axis=0))[:8])
+    assert list(keep) == list(range(8))
+    np.testing.assert_array_equal(
+        w1p.astype(np.float64), W1.astype(np.float64)[:, keep]
+    )
+
+    orig_codes2 = _fp4bq_unpack_nibbles(p2, N1)
+    expect_b2 = _nbits_pack_nibbles(orig_codes2[:, keep])
+    np.testing.assert_array_equal(b2p, expect_b2)
+
+
+def test_cpp_structured_pruning_matmul_block_quantized_fp4_matches_python_reference():
+    N1, K1, N2, block_size = 16, 32, 8, 8
+    rng = np.random.default_rng(41150)
+    W1 = (rng.standard_normal((N1, K1)) * 1.0).astype(np.float32)
+    W1[:8] *= 6.0
+    W2 = (rng.standard_normal((N2, N1)) * 1.0).astype(np.float32)
+    model, _info = _fp4bq_chain_model(N1, K1, N2, block_size, W1, 1.0, W2, 1.0)
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_structured_pruning_matmul_block_quantized_fp4(
+        model, sparsity=0.5
+    )
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+
+    py_bytes = {t.name: t.SerializeToString() for t in pruned_py.graph.initializer}
+    cpp_bytes = {t.name: t.SerializeToString() for t in pruned_cpp.graph.initializer}
+    assert py_bytes == cpp_bytes

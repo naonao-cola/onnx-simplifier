@@ -11,6 +11,14 @@
 #include <vector>
 
 #include "dlpack/dlpack.h"
+// Pulls in EmbeddingVocabPruningResult (needed below by
+// ApplyEmbeddingVocabPruning/ApplyEmbeddingVocabMagnitudePruning's own
+// declarations) -- unlike every other entry point in this header, which
+// duplicates a bare `onnx::ModelProto`-returning prototype verbatim rather
+// than including its own home header, sharing a single struct definition
+// (rather than a byte-for-byte duplicate struct body in each header) avoids
+// two independently-edited copies of the same type ever drifting apart.
+#include "structured_pruning_entry.h"
 
 // RAII owner for a DLManagedTensor: releasing it invokes the tensor's own
 // DLPack deleter exactly once (per the DLPack contract), which frees whatever
@@ -729,6 +737,35 @@ onnx::ModelProto ApplyMoeExpertChannelPruning(const onnx::ModelProto& model,
 // topology above is left completely untouched.
 onnx::ModelProto ApplyQMoEExpertChannelPruning(const onnx::ModelProto& model,
                                                double sparsity);
+
+// Embedding vocabulary pruning: shrinks a matched token-embedding table's
+// vocabulary axis (a plain ``Gather``'s ``data`` input feeding a graph
+// input's token-id tensor, plus, where a tied or confidently-auto-
+// identified untied ``lm_head`` exists, its own vocab-logits projection
+// too) down to a caller-supplied, explicit keep-set -- the C++ port of
+// pruning.py's own ``apply_embedding_vocab_pruning``. See
+// structured_pruning_entry.h's own ``EmbeddingVocabPruningResult``/
+// ``ApplyEmbeddingVocabPruning`` doc comments for the full contract
+// (**unlike every other pass in this header, the pruned model this
+// returns does not accept the original model's own token ids -- see
+// those doc comments**), and structured_pruning_entry.cpp's own
+// "Embedding vocabulary pruning" section comment for the exact matched
+// topology, scope, and the deliberately-narrower-than-pruning.py
+// restrictions this C++ port makes (plain ``Gather`` producer only, plain
+// ``MatMul``/``Gemm`` ``lm_head`` only, FLOAT32-only tensors).
+EmbeddingVocabPruningResult ApplyEmbeddingVocabPruning(
+    const onnx::ModelProto& model,
+    const std::optional<std::vector<int64_t>>& keep_token_ids,
+    const std::optional<std::vector<int64_t>>& drop_token_ids,
+    const std::optional<std::string>& input_name);
+
+// The importance-ranked variant -- see structured_pruning_entry.h's own
+// ``ApplyEmbeddingVocabMagnitudePruning`` doc comment, the C++ port of
+// pruning.py's own ``apply_embedding_vocab_magnitude_pruning``.
+EmbeddingVocabPruningResult ApplyEmbeddingVocabMagnitudePruning(
+    const onnx::ModelProto& model, double sparsity,
+    const std::optional<std::vector<int64_t>>& protect_token_ids,
+    const std::optional<std::string>& input_name);
 
 // Lists the activation tensor names that ``QuantizeStatic`` could quantize in
 // ``model`` -- the first input of every MatMul, every "vanilla" Gemm
