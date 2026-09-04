@@ -50,6 +50,7 @@ from onnxsim.gguf_reconstruct import (
 )
 from onnxsim.gptq import apply_gptq
 from onnxsim.gptvq import quantize_weight_only_gptvq
+from onnxsim.hf_reconstruct import read_hf_config, reconstruct_hf_graph
 from onnxsim.hqq import quantize_weight_only_int4_hqq
 from onnxsim.kmeans_quantization import quantize_weight_only_kmeans
 from onnxsim.kv_cache_quantization import quantize_kv_cache
@@ -106,6 +107,7 @@ from onnxsim.outlier_suppression import apply_outlier_suppression
 from onnxsim.outlier_suppression_plus import apply_outlier_suppression_plus
 from onnxsim.owq import apply_owq
 from onnxsim.pb_llm import quantize_weight_only_pb_llm
+from onnxsim.ppq_integration import quantize_with_ppq
 from onnxsim.precision_estimator import (
     ModelQuantizationEstimate,
     estimate_model_quantization_drop,
@@ -181,6 +183,7 @@ __all__ = [
     "apply_flexround",
     "apply_fptq",
     "apply_owq",
+    "quantize_with_ppq",
     "apply_smoothquant",
     "apply_rptq_reorder",
     "apply_outlier_suppression_plus",
@@ -294,6 +297,8 @@ __all__ = [
     "load_model",
     "read_gguf_metadata",
     "reconstruct_gguf_graph",
+    "reconstruct_hf_graph",
+    "read_hf_config",
     "UnsupportedArchitectureError",
     "export_transformers_model",
     "export_mlir",
