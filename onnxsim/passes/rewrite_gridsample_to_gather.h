@@ -400,7 +400,7 @@ struct GridSampleToGatherBuilder {
       return ReflectToIndex(v, *reflect, dim_minus1_f);
     }
     return CastTo(Clip(v, ConstF(0.0f), dim_minus1_f),
-                 TensorProto_DataType_INT64);
+                  TensorProto_DataType_INT64);
   }
 
   // 0 <= v <= dim_minus1, as a bool tensor -- padding_mode="zeros"' validity
@@ -495,9 +495,9 @@ struct RewriteGridSampleToGather final : public PredicateBasedPass {
         GetValueFromAttrWithDefault<std::string>(node, kmode, "linear");
     const std::string padding_mode = GetValueFromAttrWithDefault<std::string>(
         node, Symbol("padding_mode"), "zeros");
-    const bool align_corners = GetValueFromAttrWithDefault<int64_t>(
-                                   node, Symbol("align_corners"),
-                                   int64_t(0)) != 0;
+    const bool align_corners =
+        GetValueFromAttrWithDefault<int64_t>(node, Symbol("align_corners"),
+                                             int64_t(0)) != 0;
 
     GridSampleToGatherBuilder b{graph, node};
 
@@ -537,8 +537,7 @@ struct RewriteGridSampleToGather final : public PredicateBasedPass {
       Value* iy = b.BuildIndex(yr, Hm1_f, padding_mode, &reflect_h);
       Value* gathered = b.GatherPixel(xt, ix, iy);
       if (padding_mode == "zeros") {
-        Value* valid =
-            b.And(b.InRange(xr, Wm1_f), b.InRange(yr, Hm1_f));
+        Value* valid = b.And(b.InRange(xr, Wm1_f), b.InRange(yr, Hm1_f));
         Value* mask_f = b.CastTo(valid, TensorProto_DataType_FLOAT);
         gathered = b.MulBroadcastLastAxis(gathered, mask_f);
       }
@@ -568,13 +567,12 @@ struct RewriteGridSampleToGather final : public PredicateBasedPass {
         valid_y1 = b.InRange(y1f, Hm1_f);
       }
 
-      auto corner = [&](Value* ix, Value* iy, Value* wx, Value* wy,
-                        Value* vx, Value* vy) -> Value* {
+      auto corner = [&](Value* ix, Value* iy, Value* wx, Value* wy, Value* vx,
+                        Value* vy) -> Value* {
         Value* gathered = b.GatherPixel(xt, ix, iy);
         Value* weight = b.Mul(wx, wy);
         if (padding_mode == "zeros") {
-          Value* mask_f =
-              b.CastTo(b.And(vx, vy), TensorProto_DataType_FLOAT);
+          Value* mask_f = b.CastTo(b.And(vx, vy), TensorProto_DataType_FLOAT);
           weight = b.Mul(weight, mask_f);
         }
         return b.MulBroadcastLastAxis(gathered, weight);
@@ -587,8 +585,8 @@ struct RewriteGridSampleToGather final : public PredicateBasedPass {
       result = b.Add(b.Add(c00, c10), b.Add(c01, c11));
     }
 
-    Value* final_out =
-        b.Transpose(result, {0, 3, 1, 2});  // (N,Hout,Wout,C) -> (N,C,Hout,Wout)
+    Value* final_out = b.Transpose(
+        result, {0, 3, 1, 2});  // (N,Hout,Wout,C) -> (N,C,Hout,Wout)
     if (!node->output()->sizes().empty()) {
       final_out->setSizes(node->output()->sizes());
     }
