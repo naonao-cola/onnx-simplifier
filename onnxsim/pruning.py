@@ -16825,7 +16825,30 @@ def _walk_back_through_qk_norm_rope(
     rope = node_by_output.get(cur)
     if (
         rope is not None
-        and rope.domain == _ATTENTION_DOMAIN
+        and (
+            rope.domain == _ATTENTION_DOMAIN
+            # ai.onnx::RotaryEmbedding (opset 23+, domain "") is the
+            # standardized counterpart of `com.microsoft::RotaryEmbedding`
+            # -- confirmed live (`onnx.defs.get_schema("RotaryEmbedding",
+            # domain="")`) to share the exact same `X`/`num_heads` shape
+            # this walk relies on (single tensor in, index 0; single tensor
+            # out; a `num_heads` attribute of the same name and "0 means
+            # infer from shape" semantics -- see this section's own comment
+            # above), differing only in details this walk never inspects
+            # (input ORDER -- native puts `position_ids` last and optional,
+            # `X, cos_cache, sin_cache, position_ids`, vs. contrib's
+            # `input, position_ids, cos_cache, sin_cache` -- and two
+            # contrib-only attributes, `is_packed_batching`/`scale`). Widened
+            # the same "same shape, wider domain" way this module already
+            # widens for native `Attention` (see `_attention_not_eligible`'s
+            # own `node.domain in (_ATTENTION_DOMAIN, "")` check). Deliberately
+            # NOT widened for `MRotaryEmbedding` -- confirmed live
+            # (`onnx.defs.get_schema("MRotaryEmbedding", domain="")` raises,
+            # no such schema registered) to have no native-domain equivalent
+            # at all, so it keeps requiring `_ATTENTION_DOMAIN` exactly, via
+            # `_ROTARY_SINGLE_TENSOR_OPS` membership alone, below.
+            or (rope.domain == "" and rope.op_type == "RotaryEmbedding")
+        )
         and rope.op_type in _ROTARY_SINGLE_TENSOR_OPS
         and len(rope.input) >= 1
         and rope.input[0]
