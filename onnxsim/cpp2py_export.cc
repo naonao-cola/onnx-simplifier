@@ -619,6 +619,41 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "sparsity"_a);
 
+  // The calibration-driven (Wanda-style) upgrade of apply_structured_pruning
+  // above -- same executor-as-first-argument shape as `simplify`'s own
+  // binding, since this is the first calibration-driven (not purely
+  // data-free) structured-pruning entry point: the executor is what
+  // actually runs `model_bytes` over `calibration_data` to capture
+  // per-channel activation norms. `calibration_data` is
+  // `List[Dict[str, onnx.TensorProto]]` -- one {graph input name: tensor}
+  // map per calibration batch, crossing via the very same
+  // `onnx::TensorProto` nanobind caster (ONNXSIM_PROTO_CASTER above) every
+  // other proto crosses this boundary with -- see
+  // ApplyStructuredWandaPruning/WandaCalibrationStats in
+  // structured_pruning_entry.cpp for the full calibration-crossing design
+  // (including exactly where the name -> ModelExecutor::Run-positional
+  // reordering happens). See ApplyStructuredWandaPruning in
+  // structured_pruning_entry.h.
+  m.def(
+      "apply_structured_wanda_pruning",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double sparsity, double epsilon) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyStructuredWandaPruning(
+            model, *executor, calibration_data, sparsity, epsilon);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
+      "epsilon"_a = 1e-8);
+
   // Attention-head pruning: removes whole attention heads (or, for
   // grouped-query attention, whole KV groups) from every matched fused
   // self-attention block. See ApplyAttentionHeadPruning in onnxsim.h.

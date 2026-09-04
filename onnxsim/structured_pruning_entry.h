@@ -20,7 +20,17 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+// Forward declaration only -- the full ``ModelExecutor`` interface (and the
+// DLPack machinery its ``Run`` signature needs) lives in onnxsim.h, which
+// itself includes *this* header (to reuse EmbeddingVocabPruningResult
+// below), so including onnxsim.h back from here would be circular. A
+// reference to an incomplete type is all ApplyStructuredWandaPruning's own
+// declaration needs; structured_pruning_entry.cpp includes onnxsim.h itself
+// for the definition, where ``executor.Run(...)`` is actually called.
+struct ModelExecutor;
 
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
                                         double sparsity);
@@ -127,3 +137,57 @@ EmbeddingVocabPruningResult ApplyEmbeddingVocabMagnitudePruning(
     const onnx::ModelProto& model, double sparsity,
     const std::optional<std::vector<int64_t>>& protect_token_ids,
     const std::optional<std::string>& input_name);
+
+// The calibration-driven (Wanda-style) upgrade of ApplyStructuredPruning --
+// the FIRST calibration-driven pass in this file, and the reusable pattern
+// every later one (SparseGPT, MoE whole-expert, transformer-block pruning)
+// is meant to build on. Mirrors pruning.py's own
+// apply_structured_wanda_pruning: same chain finding as
+// ApplyStructuredPruning's own plain (FindChains/FindGatedChains/
+// FindConvChains/FindConvResidualChains/FindMatmulResidualChains/
+// FindMatmulConcatChains/FindConvConcatChains/FindSplitGatedChains) chain
+// families -- deliberately NOT the additional quantized-weight families
+// (MatMulNBits, QDQ, Bnb4, Fp8/Fp4 block-quantized, QOperator,
+// DynamicQuantizeMatMul) ApplyStructuredPruning also folds in, since
+// pruning.py's own apply_structured_wanda_pruning has no quantized-weight
+// counterpart either -- but each chain's output channels are ranked by
+// ``||W_row||_2 * ||X||_2`` (weight-row/filter L2 norm times the L2 norm of
+// the *calibrated activation* actually flowing through that channel) rather
+// than weight magnitude alone. See structured_pruning_entry.cpp's own
+// "Wanda calibration" section comment for:
+//   - the calibration-crossing design (how `calibration_data` -- a plain
+//     {graph input name -> TensorProto} map per batch, the same shape as
+//     pruning.py's own `Sequence[Tensors]`, crossing the pybind boundary via
+//     the ordinary onnx::TensorProto nanobind caster rather than a bespoke
+//     bytes encoding -- gets reordered into ModelExecutor::Run's own
+//     positional contract), and
+//   - how the per-channel activation-norm multiplier threads into
+//     ApplyChains/ApplyConcatChains' existing importance computation
+//     (a new optional trailing parameter on each, defaulted to nullptr so
+//     ApplyStructuredPruning's own call sites are unchanged) rather than
+//     duplicating either function.
+//
+// Unlike ApplyStructuredPruning, this is NOT subgraph-aware (mirrors
+// pruning.py's own apply_structured_wanda_pruning, which likewise never
+// calls `_iter_subgraphs` and only ever prunes `model.graph` directly) --
+// calibration_data batches are keyed to the top-level graph's own inputs,
+// and a nested If/Loop/Scan/BeamSearch-family subgraph body has no
+// standalone way to be Run at all (it depends on its enclosing loop/branch's
+// own runtime state), so there is no meaningful calibrated variant of the
+// subgraph recursion ApplyStructuredPruning/ApplyAttentionHeadPruning/etc.
+// otherwise share.
+//
+// A `calibration_data` batch missing one of `model`'s own graph inputs
+// throws `std::invalid_argument` (ModelExecutor::Run needs every positional
+// input filled; there is no meaningful partial-batch fallback). An
+// otherwise-empty `calibration_data` (or one where every batch's probed
+// activation never resolves -- see the .cpp's own dtype/rank scope notes)
+// makes every matched chain fall back to ApplyStructuredPruning's own plain
+// ``||W_row||_2`` ranking, exactly mirroring pruning.py's own per-chain "no
+// matching activation observed" fallback, just triggered for every chain at
+// once instead of one at a time.
+onnx::ModelProto ApplyStructuredWandaPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity, double epsilon = 1e-8);

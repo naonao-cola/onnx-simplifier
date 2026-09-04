@@ -91,7 +91,14 @@
 #include <variant>
 #include <vector>
 
+#include "dlpack/dlpack.h"
+#include "dlpack_bridge.h"
 #include "dlpack_dtype.h"
+// Pulls in the full ModelExecutor definition (only forward-declared in
+// structured_pruning_entry.h -- see that header's own comment) --
+// WandaCalibrationStats below is the one place in this file that actually
+// calls executor.Run().
+#include "onnxsim.h"
 
 namespace {
 
@@ -4182,8 +4189,29 @@ struct TouchedState {
   std::unordered_set<std::string> stale_value_info;
 };
 
+// `act_norm`, when non-null, is a probe-name -> per-channel calibrated
+// activation-L2-norm map (see WandaCalibrationStats below), keyed by
+// `chain.consumer_node->input(0)` -- the same probe point
+// _wanda_structured_calibration_stats/_wanda_structured_importance use in
+// pruning.py. When present and its entry's size matches the chain's own
+// `n_channels` (the "no matching activation observed" case
+// pruning.py's own `_wanda_structured_importance` falls back from is
+// mirrored by *any* mismatch here too -- an absent probe name, or a
+// present one whose length no longer lines up with this chain because a
+// sibling chain already resliced the shared tensor first), each channel's
+// plain ``||W_row||_2`` importance is multiplied by
+// ``max(act_norm[c], epsilon)`` -- Wanda's own metric. `nullptr` (the
+// default, and every ApplyStructuredPruning call site's own unchanged
+// argument count) keeps this identically the plain L2-only ranking it
+// always was; this is the one shared importance-computation point both
+// ApplyStructuredPruning and ApplyStructuredWandaPruning go through, so
+// the two never duplicate the ranking/top-k/slicing logic below -- only
+// the *importance vector feeding into it* differs.
 void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
-                 double sparsity, TouchedState& touched) {
+                 double sparsity, TouchedState& touched,
+                 const std::unordered_map<std::string, std::vector<double>>*
+                     act_norm = nullptr,
+                 double epsilon = 1e-8) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
@@ -4359,6 +4387,22 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
     }
     for (double& v : importance) {
       v = std::sqrt(v);
+    }
+
+    // Wanda upgrade: multiply each channel's plain ||W_row||_2 by its own
+    // calibrated activation L2 norm -- mirrors pruning.py's own
+    // `_wanda_structured_importance` exactly, including the fallback to
+    // plain `importance` (left untouched) when no matching activation was
+    // observed for this chain's own probe point.
+    if (act_norm != nullptr) {
+      auto it = act_norm->find(chain.consumer_node->input(0));
+      if (it != act_norm->end() &&
+          it->second.size() == static_cast<size_t>(n)) {
+        for (int64_t c = 0; c < n; ++c) {
+          importance[static_cast<size_t>(c)] *=
+              std::max(it->second[static_cast<size_t>(c)], epsilon);
+        }
+      }
     }
 
     std::vector<int64_t> keep;
@@ -6037,9 +6081,17 @@ std::vector<ConcatChain> FindConvConcatChains(onnx::GraphProto* graph) {
 // concatenation of every branch's own keep, each shifted by its own fixed
 // offset. `touched` is the same TouchedState a sibling ApplyChains call
 // shares. Mirrors pruning.py's own _apply_concat_chains.
-void ApplyConcatChains(onnx::GraphProto* graph,
-                       std::vector<ConcatChain>& chains, double sparsity,
-                       TouchedState& touched) {
+// `act_norm`/`epsilon`: the Concat-branch analogue of ApplyChains' own
+// parameters of the same name -- see that function's own comment. Keyed by
+// `b.operand_name` (each branch's own probe point, per ConcatBranch's own
+// comment) rather than a shared consumer input, mirroring pruning.py's own
+// `_wanda_branch_importance`.
+void ApplyConcatChains(
+    onnx::GraphProto* graph, std::vector<ConcatChain>& chains, double sparsity,
+    TouchedState& touched,
+    const std::unordered_map<std::string, std::vector<double>>* act_norm =
+        nullptr,
+    double epsilon = 1e-8) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
@@ -6152,6 +6204,20 @@ void ApplyConcatChains(onnx::GraphProto* graph,
       }
       for (double& v : importance) {
         v = std::sqrt(v);
+      }
+      // Wanda upgrade -- see ApplyChains' own identical comment. Keyed by
+      // this branch's own probe point (`b.operand_name`) rather than a
+      // shared consumer input, exactly like pruning.py's own
+      // `_wanda_branch_importance`.
+      if (act_norm != nullptr) {
+        auto it = act_norm->find(b.operand_name);
+        if (it != act_norm->end() &&
+            it->second.size() == static_cast<size_t>(n)) {
+          for (int64_t c = 0; c < n; ++c) {
+            importance[static_cast<size_t>(c)] *=
+                std::max(it->second[static_cast<size_t>(c)], epsilon);
+          }
+        }
       }
       branch_keeps.push_back(TopKIndicesAscending(importance, keep_count));
     }
@@ -16527,6 +16593,223 @@ std::vector<double> EmbeddingVocabImportance(const EmbeddingChain& chain,
   return importance;
 }
 
+// --- Wanda calibration -------------------------------------------------
+//
+// C++ mirror of bias_correction.py's own `_add_probe_outputs` (expose an
+// intermediate tensor as an extra graph output, unchanged otherwise, so the
+// executor computes and returns it) plus pruning.py's own
+// `_wanda_structured_calibration_stats` (accumulate sqrt(sum-of-squares /
+// count) per probe name, reduced over every axis but its own declared
+// channel axis) -- the piece ApplyStructuredWandaPruning needs that
+// ApplyStructuredPruning has no analogue of at all: running the model.
+//
+// Calibration-crossing design (the actual point of this round): a batch of
+// calibration data is, on the Python side, a plain `{graph input name:
+// np.ndarray}` dict (pruning.py's own `Tensors` alias) -- named, not
+// positional. `ModelExecutor::Run`, by contrast, is strictly POSITIONAL
+// (see onnxsim.h's own doc comment on it): `inputs[i]` feeds
+// `model.graph().input(i)`, with no name in the call at all. Two decisions
+// bridge that gap:
+//
+//   1. *What* crosses the pybind boundary: `calibration_data`'s C++ type is
+//      `std::vector<std::unordered_map<std::string, onnx::TensorProto>>` --
+//      one named-tensor map per batch, over the wire via the SAME
+//      `onnx::TensorProto` nanobind caster (cpp2py_export.cc's own
+//      `ONNXSIM_PROTO_CASTER`) every other onnx proto already crosses this
+//      boundary with, rather than a bespoke bytes/array encoding invented
+//      for this one call. That caster already serializes through
+//      `SerializeToString`/`ParseFromString` under the hood, so this is the
+//      established "protobuf wire format at the boundary" convention this
+//      file uses everywhere else -- just reached through the pre-existing
+//      typed caster instead of a raw `py::bytes` parameter, since nanobind
+//      already knows how to marshal a `Dict[str, onnx.TensorProto]` (and a
+//      `List[...]` of them) automatically once the element caster exists.
+//      The Python wrapper's only job is turning each `np.ndarray` into an
+//      `onnx.TensorProto` via `onnx.numpy_helper.from_array` -- the same
+//      conversion `PyModelExecutor.Run`'s own Python-side deserialization
+//      path already performs in the opposite direction.
+//   2. *Where* the name -> position reordering happens: entirely HERE,
+//      inside this one function, rather than in the Python wrapper or at
+//      the pybind lambda. For each batch, this loop walks
+//      `probe_model.graph().input()` in order and looks up each input's own
+//      name in that batch's map -- the one place in the whole call chain
+//      that needs to know `ModelExecutor::Run`'s positional contract at
+//      all. This keeps the calibration_data *shape* (named, matching
+//      pruning.py's own `Sequence[Tensors]` exactly) decoupled from
+//      `ModelExecutor::Run`'s own calling convention (positional, an
+//      implementation detail of the DLPack executor boundary) -- neither
+//      the Python caller nor a future calibration-driven pass reusing this
+//      same pattern needs to reason about position at all, only names. A
+//      batch missing one of the model's own graph inputs throws
+//      `std::invalid_argument` rather than guessing (there is no partial-
+//      batch fallback -- Run() needs every positional slot filled).
+//
+// This is also the shape every later calibration-driven pass (SparseGPT,
+// MoE whole-expert pruning, transformer-block pruning) mentioned in this
+// round's own design brief is meant to reuse: a `{name: TensorProto}`-per-
+// batch calibration_data parameter, reordered to position inside the one
+// C++ function that actually calls `executor.Run`, never earlier.
+//
+// `probe_axis` mirrors pruning.py's own `channel_axis` dict exactly: probe
+// tensor name -> channel axis (1 for a Conv-fed probe -- axis 1 of
+// `[N, C, H, ...]` -- or -1, the last axis, for a MatMul/Gemm-fed probe).
+// Returns one entry per probe name that was actually observed at least
+// once with its axis in range; a name never observed (e.g. calibration_data
+// is empty, or every batch's own activation rank never reaches the
+// declared axis) is simply absent from the result, which is exactly the
+// "no matching activation observed" condition ApplyChains/ApplyConcatChains
+// fall back to plain weight-only importance on.
+std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
+    const ModelExecutor& executor, const onnx::ModelProto& model,
+    const std::unordered_map<std::string, int64_t>& probe_axis,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data) {
+  std::unordered_map<std::string, std::vector<double>> result;
+  if (probe_axis.empty()) {
+    // Nothing to probe (e.g. only split_gated_chains matched -- never
+    // calibrated, see ApplyStructuredWandaPruning's own comment). Skip
+    // running the executor entirely rather than doing what pruning.py's own
+    // reference implementation does (call it anyway, once per batch, with
+    // an empty probe set each time -- harmless there since Python already
+    // pays the interpreter round trip regardless, but a real, avoidable
+    // executor invocation here). The returned map is empty either way, so
+    // every chain still falls back to plain weight-only importance exactly
+    // as it would with a non-empty but unobserved probe set.
+    return result;
+  }
+
+  // The probe model: `model` plus one extra bare graph output per probe
+  // name not already a graph output -- mirrors _add_probe_outputs exactly
+  // (append a name-only ValueInfoProto, so the executor returns the tensor
+  // without the graph's own computation changing at all).
+  onnx::ModelProto probe_model = model;
+  std::unordered_set<std::string> existing_outputs;
+  for (const auto& o : probe_model.graph().output()) {
+    existing_outputs.insert(o.name());
+  }
+  for (const auto& [name, axis] : probe_axis) {
+    (void)axis;
+    if (existing_outputs.insert(name).second) {
+      probe_model.mutable_graph()->add_output()->set_name(name);
+    }
+  }
+
+  // probe_model.graph().output() position -> that output's own name --
+  // ModelExecutor::Run returns outputs positionally, matching this order
+  // exactly (see onnxsim.h's own ModelExecutor::Run doc comment).
+  std::unordered_map<std::string, size_t> output_index;
+  for (int i = 0; i < probe_model.graph().output_size(); ++i) {
+    output_index.emplace(probe_model.graph().output(i).name(),
+                         static_cast<size_t>(i));
+  }
+  const auto& graph_inputs = probe_model.graph().input();
+
+  std::unordered_map<std::string, std::vector<double>> sq_sum;
+  std::unordered_map<std::string, int64_t> count;
+
+  for (const auto& batch : calibration_data) {
+    // Reorder this batch's own {name: TensorProto} map into
+    // ModelExecutor::Run's positional contract -- see this function's own
+    // top comment, design decision (2).
+    std::vector<DLManagedTensorPtr> input_dls;
+    std::vector<const DLManagedTensor*> input_ptrs;
+    input_dls.reserve(static_cast<size_t>(graph_inputs.size()));
+    input_ptrs.reserve(static_cast<size_t>(graph_inputs.size()));
+    for (const auto& gi : graph_inputs) {
+      auto it = batch.find(gi.name());
+      if (it == batch.end()) {
+        throw std::invalid_argument(
+            "ApplyStructuredWandaPruning: calibration batch is missing "
+            "required graph input '" +
+            gi.name() + "'");
+      }
+      // Borrows `it->second`'s own buffer -- safe: `it->second` lives
+      // inside `calibration_data`, which outlives this whole function.
+      input_dls.emplace_back(
+          onnxsim::dlpack::FromTensorProtoBorrowing(it->second));
+      input_ptrs.push_back(input_dls.back().get());
+    }
+
+    std::vector<DLManagedTensorPtr> outputs =
+        executor.Run(probe_model, input_ptrs);
+
+    for (const auto& [name, axis_raw] : probe_axis) {
+      auto oit = output_index.find(name);
+      if (oit == output_index.end() || oit->second >= outputs.size()) {
+        continue;  // Defensive -- every probe name was added as an output
+                   // above.
+      }
+      const DLTensor& dl = outputs[oit->second]->dl_tensor;
+      // Scope decision, mirroring this file's own FLOAT32-only chain
+      // matching everywhere else (every producer/consumer weight this file
+      // matches is FLOAT32-only -- see e.g. MatchProducer): a probe
+      // activation of any other runtime dtype is simply skipped for this
+      // batch (never observed for this probe name), so the affected
+      // chain(s) fall back to plain weight-only importance -- never
+      // guessed at via an implicit upcast. In practice every chain this
+      // pass matches is itself FLOAT32-only, so its own probe activation is
+      // FLOAT32 too whenever the executor runs the *real* graph ops
+      // faithfully; this only guards against an executor that (legitimately
+      // per the ModelExecutor contract) returns some other dtype.
+      onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
+      if (tp.data_type() != onnx::TensorProto::FLOAT) {
+        continue;
+      }
+      const int64_t ndim = tp.dims_size();
+      int64_t axis = axis_raw;
+      if (axis < 0) {
+        axis += ndim;
+      }
+      if (axis < 0 || axis >= ndim) {
+        continue;  // Mirrors pruning.py's own
+                   // `if axis < 0 or axis >= x.ndim: continue`.
+      }
+      std::vector<int64_t> dims(tp.dims().begin(), tp.dims().end());
+      const int64_t channel_dim = dims[static_cast<size_t>(axis)];
+      if (channel_dim <= 0) {
+        continue;
+      }
+      // Row-major contiguous strides (ToTensorProto's own output is always
+      // freshly materialized raw_data, i.e. contiguous).
+      std::vector<int64_t> strides(static_cast<size_t>(ndim));
+      int64_t s = 1;
+      for (int64_t d = ndim - 1; d >= 0; --d) {
+        strides[static_cast<size_t>(d)] = s;
+        s *= dims[static_cast<size_t>(d)];
+      }
+      const int64_t channel_stride = strides[static_cast<size_t>(axis)];
+
+      std::vector<float> data = ReadFloatTensor(tp);
+      auto& acc = sq_sum[name];
+      if (acc.empty()) {
+        acc.assign(static_cast<size_t>(channel_dim), 0.0);
+      }
+      const int64_t total = static_cast<int64_t>(data.size());
+      // Sum of squares over every axis but the channel one -- correct for
+      // any activation rank, not just the 2-D case, mirroring
+      // pruning.py's own `np.square(x).sum(axis=reduce_axes)` (the channel
+      // index of flat position `flat` is `(flat / channel_stride) %
+      // channel_dim` for a row-major contiguous layout).
+      for (int64_t flat = 0; flat < total; ++flat) {
+        const int64_t c = (flat / channel_stride) % channel_dim;
+        const double v = static_cast<double>(data[static_cast<size_t>(flat)]);
+        acc[static_cast<size_t>(c)] += v * v;
+      }
+      count[name] += total / channel_dim;
+    }
+  }
+
+  result.reserve(sq_sum.size());
+  for (auto& [name, acc] : sq_sum) {
+    const int64_t cnt = std::max<int64_t>(count[name], 1);
+    for (double& v : acc) {
+      v = std::sqrt(v / static_cast<double>(cnt));
+    }
+    result.emplace(name, std::move(acc));
+  }
+  return result;
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
@@ -16694,6 +16977,107 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
       }
       graph->mutable_value_info()->Swap(&kept);
     }
+  }
+  return out;
+}
+
+onnx::ModelProto ApplyStructuredWandaPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity, double epsilon) {
+  if (!(sparsity >= 0.0 && sparsity < 1.0)) {
+    throw std::invalid_argument(
+        "ApplyStructuredWandaPruning: sparsity must be in [0, 1), got " +
+        std::to_string(sparsity));
+  }
+  onnx::ModelProto out = model;
+
+  // NOT subgraph-aware -- see this function's own declaration comment in
+  // structured_pruning_entry.h for why (mirrors pruning.py's own
+  // apply_structured_wanda_pruning, which likewise only ever prunes
+  // `model.graph` directly, never `_iter_subgraphs`).
+  onnx::GraphProto* graph = out.mutable_graph();
+
+  // Same chain-finding as ApplyStructuredPruning's own PLAIN family --
+  // deliberately excluding every quantized-weight family
+  // (MatMulNBits/QDQ/Bnb4/Fp8/Fp4/QOperator/DynamicQuantizeMatMul)
+  // ApplyStructuredPruning additionally folds in, since pruning.py's own
+  // apply_structured_wanda_pruning has no quantized-weight counterpart
+  // either -- see structured_pruning_entry.h's own declaration comment.
+  std::vector<Chain> chains = FindChains(graph);
+  std::vector<Chain> gated_chains = FindGatedChains(graph);
+  std::vector<Chain> conv_chains = FindConvChains(graph);
+  std::vector<Chain> conv_residual_chains = FindConvResidualChains(graph);
+  std::vector<Chain> matmul_residual_chains = FindMatmulResidualChains(graph);
+  chains.insert(chains.end(), std::make_move_iterator(gated_chains.begin()),
+                std::make_move_iterator(gated_chains.end()));
+  chains.insert(chains.end(), std::make_move_iterator(conv_chains.begin()),
+                std::make_move_iterator(conv_chains.end()));
+  chains.insert(chains.end(),
+                std::make_move_iterator(conv_residual_chains.begin()),
+                std::make_move_iterator(conv_residual_chains.end()));
+  chains.insert(chains.end(),
+                std::make_move_iterator(matmul_residual_chains.begin()),
+                std::make_move_iterator(matmul_residual_chains.end()));
+  std::vector<ConcatChain> concat_chains = FindMatmulConcatChains(graph);
+  std::vector<ConcatChain> conv_concat_chains = FindConvConcatChains(graph);
+  concat_chains.insert(concat_chains.end(),
+                       std::make_move_iterator(conv_concat_chains.begin()),
+                       std::make_move_iterator(conv_concat_chains.end()));
+  std::vector<SplitGatedChain> split_gated_chains = FindSplitGatedChains(graph);
+
+  if (chains.empty() && concat_chains.empty() && split_gated_chains.empty()) {
+    return out;  // Mirrors pruning.py's own early return.
+  }
+
+  // Every plain chain's own primary-consumer probe point, and every Concat
+  // branch's own operand probe point -- mirrors pruning.py's own
+  // `channel_axis` dict in `_wanda_structured_calibration_stats` exactly.
+  // split_gated_chains' own probe point is deliberately never added here --
+  // see ApplySplitGatedChains' own call below, always ranked by plain
+  // weight-magnitude importance, matching pruning.py's own
+  // `_split_gated_wanda_importance` scope decision (see
+  // apply_structured_wanda_pruning's own Python docstring).
+  std::unordered_map<std::string, int64_t> probe_axis;
+  for (const auto& chain : chains) {
+    probe_axis[chain.consumer_node->input(0)] = chain.consumer_is_conv ? 1 : -1;
+  }
+  for (const auto& cchain : concat_chains) {
+    for (const auto& b : cchain.branches) {
+      // Every producer of a given branch is always uniformly Conv or
+      // uniformly MatMul/Gemm -- mirrors pruning.py's own comment on the
+      // identical assumption in `_wanda_structured_calibration_stats`.
+      probe_axis[b.operand_name] = b.producers[0].is_conv ? 1 : -1;
+    }
+  }
+
+  const std::unordered_map<std::string, std::vector<double>> act_norm =
+      WandaCalibrationStats(executor, out, probe_axis, calibration_data);
+
+  TouchedState touched;
+  if (!chains.empty()) {
+    ApplyChains(graph, chains, sparsity, touched, &act_norm, epsilon);
+  }
+  if (!concat_chains.empty()) {
+    ApplyConcatChains(graph, concat_chains, sparsity, touched, &act_norm,
+                      epsilon);
+  }
+  if (!split_gated_chains.empty()) {
+    // Plain weight-magnitude importance only, unchanged -- see this
+    // function's own comment above on `probe_axis` for why: reused
+    // completely as-is, exactly like ApplyStructuredPruning's own call to
+    // it, no `act_norm`/`epsilon` parameters to thread through at all.
+    ApplySplitGatedChains(graph, split_gated_chains, sparsity, touched);
+  }
+  if (!touched.stale_value_info.empty()) {
+    google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
+    for (const auto& vi : graph->value_info()) {
+      if (!touched.stale_value_info.count(vi.name())) {
+        *kept.Add() = vi;
+      }
+    }
+    graph->mutable_value_info()->Swap(&kept);
   }
   return out;
 }

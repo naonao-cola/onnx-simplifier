@@ -20,6 +20,7 @@ from rich.text import Text
 import onnxsim.onnxsim_cpp2py_export as C
 
 from . import backend, model_checking, model_info, profile_merge, version
+from .calibration import Tensors, generate_random_calibration_data
 from .pruning import EmbeddingPruningResult
 
 TensorShape = List[int]
@@ -1350,6 +1351,107 @@ def apply_structured_pruning_cpp(
         model = onnx.load(model, load_external_data=False)
     return onnx.load_from_string(
         C.apply_structured_pruning(model.SerializeToString(), sparsity)
+    )
+
+
+def apply_structured_wanda_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    epsilon: float = 1e-8,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_structured_wanda_pruning`: the
+    calibrated upgrade of :func:`onnxsim.apply_structured_pruning_cpp`,
+    exactly as the pure-Python :func:`onnxsim.apply_wanda_pruning` is to
+    :func:`onnxsim.apply_magnitude_pruning`. This is onnxsim's first
+    calibration-driven (not purely data-free) C++ structured-pruning entry
+    point -- see :func:`onnxsim.simplify`'s own use of a
+    :class:`onnxsim.onnx_simplifier.PyModelExecutor` for the general "hand a
+    Python-backed model executor to the C++ core" pattern this reuses; every
+    prior C++-ported pruning pass (:func:`onnxsim.apply_structured_pruning_cpp`
+    and friends) is purely graph-structural and needs no executor at all.
+
+    Same real structural channel removal and topology matching as
+    :func:`onnxsim.apply_structured_pruning_cpp` (a single producer -> ...
+    -> consumer chain, a gated SwiGLU/GeGLU pair, or a bounded Conv or
+    MatMul/Gemm residual/merge group; a ``Concat``-merged branch; the
+    fused-``gate_up_proj`` split-gated FFN shape -- see that function's own
+    docstring for the full topology list), EXCEPT the additional
+    quantized-weight chain families it also matches
+    (``MatMulNBits``/QDQ/``MatMulBnb4``/FP8/FP4 block-quantized/QOperator/
+    ``DynamicQuantizeMatMul``) are out of scope here too -- mirroring the
+    pure-Python :func:`onnxsim.apply_structured_wanda_pruning`, which has no
+    quantized-weight counterpart either. Each matched chain's output
+    channels are ranked by ``||W_row||_2 * ||X||_2`` -- L2 norm of that
+    channel's own weight row (or, for Conv, whole filter), times the L2 norm
+    of the *activation* actually flowing through that channel over
+    ``calibration_data`` (captured right where the chain feeds into its
+    consumer -- or, for a ``Concat`` branch, right where it feeds into the
+    ``Concat`` node -- reduced over every axis but the channel one) --
+    instead of weight magnitude alone. The fused-``gate_up_proj`` split-gated
+    chain family is matched but always ranked by plain weight magnitude only
+    (never calibrated), matching the pure-Python original's own scope
+    decision for that one family.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to measure each
+            chain's consumer-side activation norm on. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching ``model``'s graph
+            inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: target fraction of each matched chain's output
+            channels to remove (at least one channel is always kept); must
+            be in ``[0, 1)``
+    :param epsilon: floor applied to the accumulated per-channel activation
+            norm, avoiding every channel of an all-zero activation tying at
+            exactly the weight-only importance
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations (passed to the shared
+            :func:`onnxsim.onnx_simplifier._get_model_executor` process-wide
+            executor, the same one :func:`onnxsim.simplify` itself uses)
+    :returns: ``model`` with every matched chain's tensors resized in place;
+            anything not matching that exact topology falls back to
+            :func:`onnxsim.apply_structured_pruning_cpp`'s own plain
+            L2-norm ranking if no matching activation was ever observed for
+            that chain's consumer (including whenever ``calibration_data``
+            is empty)
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Each batch crosses the pybind boundary as a {input_name: TensorProto}
+    # map (not raw ndarrays) -- the same onnx::TensorProto nanobind caster
+    # every other proto crosses this boundary with (see cpp2py_export.cc's
+    # own apply_structured_wanda_pruning binding comment), so this is the
+    # only conversion needed on the Python side; the name -> positional
+    # reordering ModelExecutor::Run itself requires happens entirely on the
+    # C++ side (WandaCalibrationStats in structured_pruning_entry.cpp).
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_structured_wanda_pruning(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            sparsity,
+            epsilon,
+        )
     )
 
 
