@@ -11,6 +11,7 @@ from onnxsim.accuracy import (
 )
 from onnxsim.adaquant import apply_adaquant
 from onnxsim.adaround import apply_adaround
+from onnxsim.affinequant import apply_affinequant
 from onnxsim.aqlm import quantize_weight_only_aqlm
 from onnxsim.attention_quantization import apply_attention_quantization
 from onnxsim.autoquant import AutoQuantResult, auto_quantize_int4
@@ -186,6 +187,7 @@ __all__ = [
     "apply_zeroquant",
     "apply_spinquant",
     "apply_omniquant",
+    "apply_affinequant",
     "apply_magnitude_pruning",
     "prune_magnitude_cpp",
     "apply_wanda_pruning",
