@@ -901,7 +901,9 @@ def test_cpp_structured_pruning_split_gated_ffn_gemm_producer_with_bias_matches_
     keep = _split_gate_up_keep_indices(w, H, H // 2)
     x = rng.standard_normal((5, K)).astype(np.float32)
     (y,) = _run(pruned, {"X": x})
-    combined = x @ w[:, np.concatenate([keep, H + keep])] + b[np.concatenate([keep, H + keep])]
+    combined = (
+        x @ w[:, np.concatenate([keep, H + keep])] + b[np.concatenate([keep, H + keep])]
+    )
     gate = 1.0 / (1.0 + np.exp(-combined[:, : H // 2]))
     up = combined[:, H // 2 :]
     y_oracle = (gate * up) @ wd[keep, :]
