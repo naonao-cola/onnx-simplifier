@@ -42,6 +42,7 @@ from onnxsim.embedding_quantization import (
 )
 from onnxsim.finetune import apply_pruning_finetune
 from onnxsim.flexround import apply_flexround
+from onnxsim.fptq import apply_fptq
 from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
@@ -168,6 +169,7 @@ __all__ = [
     "apply_gptq",
     "apply_quantease",
     "apply_flexround",
+    "apply_fptq",
     "apply_owq",
     "apply_smoothquant",
     "apply_rptq_reorder",
