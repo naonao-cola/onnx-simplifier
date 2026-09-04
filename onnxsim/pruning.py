@@ -31998,79 +31998,28 @@ def apply_transformer_block_pruning(
     subgraph is conservatively declined there even though the equivalent
     top-level-graph case would be handled -- a documented, conservative
     gap, not a correctness risk.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_transformer_block_pruning_cpp`
+    (``onnxsim/structured_pruning_entry.cpp``'s own ``ApplyTransformerBlockPruning``),
+    forwarding every argument unchanged. Imported lazily (inside the
+    function body, not at module scope) to avoid a circular import:
+    ``onnxsim.onnx_simplifier`` already imports from this module
+    (:class:`EmbeddingPruningResult`), so importing it back at module load
+    time here would deadlock the import machinery.
     """
-    if num_blocks_to_drop is not None:
-        if num_blocks_to_drop < 0:
-            raise ValueError(
-                f"num_blocks_to_drop must be >= 0, got {num_blocks_to_drop}"
-            )
-    elif not (0.0 <= sparsity <= 1.0):
-        raise ValueError(f"sparsity must be in [0, 1], got {sparsity}")
+    from onnxsim.onnx_simplifier import apply_transformer_block_pruning_cpp
 
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-
-    try:
-        inferred = onnx.shape_inference.infer_shapes(out, strict_mode=False)
-        top_value_info_by_name = _value_info_by_name(inferred.graph)
-    except Exception:
-        top_value_info_by_name = _value_info_by_name(out.graph)
-
-    # (graph, candidate, similarity) for every graph's own candidates,
-    # pooled together -- see this function's own docstring for why
-    # selection is pooled across the whole model while committing stays
-    # strictly per graph.
-    pooled: List[Tuple[onnx.GraphProto, _DroppableBlock, float]] = []
-    for graph in _iter_subgraphs(out.graph):
-        is_top = graph is out.graph
-        value_info_by_name = (
-            top_value_info_by_name if is_top else _value_info_by_name(graph)
-        )
-        candidates = _find_transformer_block_candidates(graph, value_info_by_name)
-        if not candidates:
-            continue
-        if is_top:
-            similarity = _transformer_block_similarity(
-                out, candidates, calibration_data, providers
-            )
-            pooled.extend((graph, c, similarity[i]) for i, c in enumerate(candidates))
-        else:
-            # Not probeable -- see this function's own docstring. Ranked
-            # last, never preferentially dropped, but still a real,
-            # committable candidate if `target` needs it.
-            pooled.extend((graph, c, float("-inf")) for c in candidates)
-
-    if not pooled:
-        return out
-
-    if num_blocks_to_drop is not None:
-        target = min(num_blocks_to_drop, len(pooled))
-    else:
-        target = int(round(sparsity * len(pooled)))
-    if target <= 0:
-        return out
-
-    ranked = [
-        (g, c) for g, c, _ in sorted(pooled, key=lambda item: item[2], reverse=True)
-    ]
-    committed = _select_droppable_blocks([c for _, c in ranked], target)
-    committed_by_graph: Dict[int, Tuple[onnx.GraphProto, List[_DroppableBlock]]] = {}
-    block_to_graph = {id(c): g for g, c in ranked}
-    for block in committed:
-        g = block_to_graph[id(block)]
-        entry = committed_by_graph.setdefault(id(g), (g, []))
-        entry[1].append(block)
-    for g, blocks in committed_by_graph.values():
-        _commit_transformer_block_drops(g, blocks)
-
-    return out
+    return apply_transformer_block_pruning_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        sparsity=sparsity,
+        num_blocks_to_drop=num_blocks_to_drop,
+        providers=providers,
+    )
 
 
 # --- Dry-run pruning sensitivity analysis ---------------------------------
