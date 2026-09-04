@@ -194,18 +194,71 @@ def test_affinequant_never_worse_than_plain_rtn():
     assert aq_err <= rtn_err + 1e-6
 
 
-def test_affinequant_rotation_matrix_is_block_diagonal_and_orthogonal():
+def test_block_diagonal_rotation_is_orthogonal_and_block_diagonal():
     # Directly verifies the numerical contract this module's docstring
-    # promises: the inserted rotation is exactly block-diagonal (zero
-    # outside affine_block_size x affine_block_size blocks along the
-    # diagonal) and exactly orthogonal (R @ R.T == I), checked against the
-    # ONNX initializers themselves with a tight relative tolerance -- not
-    # via an onnxruntime round trip, since onnxruntime's own MatMul kernel
-    # reduction order is not bit-exact across CPU architectures.
-    K, N, block = 32, 8, 8
-    model = _matmul_model(K=K, N=N, seed=8)
-    x = _correlated_outlier_calibration(
-        K=K, num_samples=64, outlier_dims=(2, 9), seed=9
+    # promises for its own core building block: the rotation is exactly
+    # orthogonal (R @ R.T == I -- so its inverse, used to compensate the
+    # weight side, is exactly its own transpose, no numerical solve
+    # needed) and exactly block-diagonal (zero outside each
+    # affine_block_size x affine_block_size block along the diagonal),
+    # checked directly against the returned numpy array with a tight
+    # tolerance -- not via an onnxruntime round trip, since onnxruntime's
+    # own MatMul kernel reduction order is not bit-exact across CPU
+    # architectures.
+    from onnxsim.affinequant import _block_diagonal_rotation
+
+    rng = np.random.default_rng(0)
+    k, block = 32, 8
+    x_centered = rng.standard_normal((64, k))
+
+    rotation = _block_diagonal_rotation(x_centered, block)
+
+    assert rotation.shape == (k, k)
+    np.testing.assert_allclose(rotation @ rotation.T, np.eye(k), atol=1e-8, rtol=1e-8)
+    off_block = rotation.copy()
+    for start in range(0, k, block):
+        stop = start + block
+        off_block[start:stop, start:stop] = 0.0
+    np.testing.assert_allclose(off_block, np.zeros((k, k)), atol=0.0)
+
+
+def _block_correlated_calibration(
+    K, block, num_samples, outlier_dims, seed, noise=0.005
+):
+    # Within each block, every channel is (up to small noise) a shared
+    # scalar latent factor times its own per-channel mixing weight -- a
+    # case a *diagonal* transform structurally cannot exploit (it can
+    # only rescale each channel on its own, not combine correlated ones),
+    # but a block-affine transform can, by rotating into the block's own
+    # covariance eigenbasis and concentrating the block's real variance
+    # into as few post-rotation channels as possible.
+    rng = np.random.default_rng(seed)
+    num_blocks = K // block
+    latent = rng.standard_normal((num_samples, num_blocks)).astype(np.float32)
+    mixing = rng.standard_normal((num_blocks, block)).astype(np.float32)
+    x = (latent[:, :, None] * mixing[None, :, :]).reshape(num_samples, K)
+    x = x + rng.standard_normal((num_samples, K)).astype(np.float32) * noise
+    x = x.astype(np.float32) + 2.0
+    for c in outlier_dims:
+        x[:, c] *= 20.0
+    return x
+
+
+def test_affinequant_block_affine_beats_diagonal_omniquant_on_correlated_channels():
+    # A scenario deliberately constructed to demonstrate this module's
+    # own core claim over onnxsim.apply_omniquant: with strongly
+    # correlated (not just independently-scaled) activation channels
+    # within a block, the block-affine LET candidate is chosen over the
+    # diagonal one and measurably reduces reconstruction error further
+    # than OmniQuant's diagonal-only transform can reach on the same
+    # data/model. (This complements
+    # ``test_affinequant_never_worse_than_diagonal_omniquant``, which
+    # only checks the "never worse" direction on data without deliberate
+    # cross-channel structure.)
+    K, N, block = 64, 16, 16
+    model = _matmul_model(K=K, N=N, seed=7)
+    x = _block_correlated_calibration(
+        K, block, num_samples=64, outlier_dims=(3, 7), seed=11
     )
     calibration_data = [{"X": x}]
 
@@ -215,20 +268,33 @@ def test_affinequant_rotation_matrix_is_block_diagonal_and_orthogonal():
     )
     onnx.checker.check_model(aq_model)
 
-    matmul_nodes = [n for n in aq_model.graph.node if n.op_type == "MatMul"]
-    assert len(matmul_nodes) == 1
-    rotation_name = matmul_nodes[0].input[1]
+    # There are two MatMul nodes in the final graph: the original
+    # activation-times-dequantized-weight computation (present in every
+    # quantized model, affine transform or not) and this module's own
+    # inserted rotation MatMul -- identified by name, not by being the
+    # only MatMul present.
+    rotation_matmuls = [
+        n
+        for n in aq_model.graph.node
+        if n.op_type == "MatMul" and "affinequant_matmul" in n.name
+    ]
+    assert len(rotation_matmuls) == 1
+    rotation_name = rotation_matmuls[0].input[1]
     rotation = onnx.numpy_helper.to_array(
         next(t for t in aq_model.graph.initializer if t.name == rotation_name)
     ).astype(np.float64)
-
     assert rotation.shape == (K, K)
     np.testing.assert_allclose(rotation @ rotation.T, np.eye(K), atol=1e-4, rtol=1e-4)
-    off_block = rotation.copy()
-    for start in range(0, K, block):
-        stop = start + block
-        off_block[start:stop, start:stop] = 0.0
-    np.testing.assert_allclose(off_block, np.zeros((K, K)), atol=1e-6)
+
+    w_float = onnx.numpy_helper.to_array(model.graph.initializer[0]).astype(np.float64)
+    y_float = x.astype(np.float64) @ w_float
+
+    oq_model = onnxsim.apply_omniquant(model, quant, calibration_data=calibration_data)
+    (oq_y,) = _run(oq_model, {"X": x})
+    (aq_y,) = _run(aq_model, {"X": x})
+    oq_err = np.linalg.norm(y_float - oq_y.astype(np.float64))
+    aq_err = np.linalg.norm(y_float - aq_y.astype(np.float64))
+    assert aq_err < oq_err * 0.5
 
 
 def test_affinequant_odd_k_skips_block_affine_candidate():
@@ -246,7 +312,10 @@ def test_affinequant_odd_k_skips_block_affine_candidate():
         model, quant, calibration_data=calibration_data, affine_block_size=32
     )
     onnx.checker.check_model(aq_model)
-    assert not any(n.op_type == "MatMul" for n in aq_model.graph.node)
+    # The base computation MatMul is always present; only this module's
+    # own rotation MatMul must be absent when the block-affine candidate
+    # is skipped.
+    assert not any("affinequant_matmul" in n.name for n in aq_model.graph.node)
 
 
 def test_affinequant_gemm_transb():
