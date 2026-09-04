@@ -1735,6 +1735,137 @@ def apply_sparsegpt_pruning_cpp(
     )
 
 
+def apply_wanda_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    n: Optional[int] = None,
+    m: Optional[int] = None,
+    epsilon: float = 1e-8,
+    global_sparsity: bool = False,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_wanda_pruning`: Wanda pruning
+    (Sun et al., 2023, "A Simple and Effective Pruning Approach for Large
+    Language Models", https://arxiv.org/abs/2306.11695) -- the calibration-
+    driven upgrade of :func:`onnxsim.apply_magnitude_pruning`'s data-free
+    baseline, zeroing the least-important entries of every matched layer's
+    constant 2-D weight to an unstructured or N:M sparsity pattern using
+    ``|W_ij| * ||X_j||_2`` (weight magnitude times its reduction-dimension
+    entry's CALIBRATED activation L2-norm) as the importance metric, instead
+    of plain ``|W|`` -- a one-shot static score, unlike
+    :func:`onnxsim.apply_sparsegpt_pruning_cpp`'s own sequential Hessian-
+    error-compensating algorithm (this pass never recomputes a *kept*
+    entry's value, only zeros dropped ones, exactly like
+    :func:`onnxsim.prune_magnitude_cpp`). Same real
+    :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed calibration
+    machinery as :func:`onnxsim.apply_structured_wanda_pruning_cpp`/
+    :func:`onnxsim.apply_sparsegpt_pruning_cpp` (see either function's own
+    docstring for the general pattern).
+
+    Matches every plain ``MatMul``/vanilla-``Gemm`` node with a constant 2-D
+    FLOAT32 weight (this already includes ``com.microsoft::
+    GroupQueryAttention``'s own separate Q/K/V projections -- ordinary
+    MatMul/Gemm nodes feeding it, not a weight the op itself owns), plus
+    every ``com.microsoft::Attention`` node's constant 2-D FLOAT32 merged
+    QKV weight -- EXACTLY the same candidate set as
+    :func:`onnxsim.apply_sparsegpt_pruning_cpp`. Deliberately narrower than
+    the pure-Python :func:`onnxsim.apply_wanda_pruning` in the same two ways
+    that function's own C++-port sibling already establishes (mirroring
+    this module's own established narrower-than-pruning.py C++-port scope
+    decisions elsewhere, e.g. :func:`onnxsim.apply_moe_expert_channel_pruning_cpp`'s
+    own FLOAT32-only restriction):
+
+    - FLOAT32 only, not also FLOAT16/BFLOAT16.
+    - 2-D ``Conv`` (ordinary/depthwise/general-grouped) is **not** matched
+      at all here -- the pure-Python original's own Conv support needs an
+      entirely new, from-first-principles im2col per-receptive-field-offset
+      activation norm (``_conv_patch_sq_sum``/``_conv_group_relative_norm``)
+      that :func:`onnxsim.apply_sparsegpt_pruning_cpp`'s own docstring
+      explains is out of scope here too, for the analogous Hessian case --
+      reaching that bar is materially bigger than the rest of this pass and
+      is out of scope for this C++ port. A Conv node is left completely
+      untouched here, never guessed at, exactly as if it were any other
+      unmatched node type -- use the pure-Python
+      :func:`onnxsim.apply_wanda_pruning` if Conv coverage is required.
+
+    Unlike :func:`onnxsim.apply_sparsegpt_pruning_cpp` (which has no data-
+    free fallback at all -- its entire mechanism IS the Hessian), a matched
+    layer with NO observed calibration activation for its own input (dead
+    input, an otherwise-empty ``calibration_data``, or every batch's
+    activation isn't FLOAT32) still gets pruned here, just to PLAIN
+    MAGNITUDE importance (``|W_ij|`` alone) instead -- mirrors the
+    pure-Python :func:`onnxsim.apply_wanda_pruning`'s own per-layer
+    fallback exactly.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to measure each
+            input channel's activation norm on. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching ``model``'s graph
+            inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: target fraction of each row's entries to zero, ignored
+            when ``n``/``m`` are given
+    :param n: keep the ``n`` highest-importance entries per group of ``m``
+            (semi-structured N:M pruning, e.g. NVIDIA's 2:4, per output
+            row). Must be given together with ``m``; incompatible with
+            ``global_sparsity``.
+    :param m: group size for N:M pruning; see ``n``
+    :param epsilon: floor applied to the accumulated per-channel activation
+            norm, avoiding every entry of an all-zero channel tying at
+            exactly-zero importance
+    :param global_sparsity: pools every matched layer's own importance into
+            one ranking across the whole model and picks a single
+            keep-count from ``sparsity``'s fraction of that pooled total,
+            mirroring the pure-Python :func:`onnxsim.apply_wanda_pruning`'s
+            own ``global_sparsity`` mode (see that function's own docstring
+            for the full mechanism and its honestly-noted cross-layer-scale
+            caveat). Incompatible with ``n``/``m``.
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations (passed to the shared
+            :func:`onnxsim.onnx_simplifier._get_model_executor` process-wide
+            executor, the same one :func:`onnxsim.simplify` itself uses)
+    :returns: ``model`` with every matched layer's weight zeroed in place to
+            the target pattern; a layer with no observed calibration
+            activation falls back to plain-magnitude importance rather than
+            being left untouched
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_structured_wanda_pruning_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_wanda_pruning(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            sparsity,
+            n,
+            m,
+            epsilon,
+            global_sparsity,
+        )
+    )
+
+
 def apply_moe_expert_channel_pruning_cpp(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,

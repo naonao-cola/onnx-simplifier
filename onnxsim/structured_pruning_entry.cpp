@@ -19969,6 +19969,404 @@ onnx::ModelProto ApplySparseGptPruning(
   return out;
 }
 
+// --- Wanda unstructured (element-wise) pruning --------------------------
+//
+// C++ port of pruning.py's own `apply_wanda_pruning` -- see
+// structured_pruning_entry.h's own ApplyWandaPruning declaration comment
+// for the full scope (candidate set identical to ApplySparseGptPruning
+// immediately above; FLOAT32-only, Conv out of scope) and the
+// per-layer/`global_sparsity` masking contract this implements. Reuses
+// WandaCalibrationStats verbatim for the calibration statistic (same shape
+// ApplyStructuredWandaPruning/ApplyAttentionHeadWandaPruning already
+// consume), and MatchMatMulLikeRaw/MatchAttentionProducer verbatim for
+// candidate matching (same as ApplySparseGptPruning) -- the only genuinely
+// new machinery here is the plain one-shot importance score
+// (`|W_ij| * ||X_j||_2`, WandaImportance below, no Hessian/Cholesky at all)
+// and its element-wise masking (WandaSparsityMaskNK/WandaNmMaskNK/the
+// `global_sparsity` pooling loop inside ApplyWandaPruning itself), mirroring
+// pruning.py's own `_wanda_importance`/`_sparsity_mask`/`_nm_mask`/
+// `_apply_global_unstructured_pruning` respectively.
+namespace {
+
+// One matched layer's weight, reshaped to row-major `[n_rows, kk]`
+// (output-channel-first) -- mirrors pruning.py's own `_weight_to_nk`
+// (non-Conv branch): `w_f64` as-is when already `weight_transposed`
+// (`[N, K]` on disk), else transposed from its own on-disk `[K, N]`
+// (`dim0 = K`, `dim1 = N`).
+struct WandaNK {
+  std::vector<double> w_nk;
+  int64_t n_rows = 0;
+  int64_t kk = 0;
+};
+
+WandaNK ToWandaNK(const std::vector<double>& w_f64, int64_t dim0, int64_t dim1,
+                  bool weight_transposed) {
+  const int64_t n_rows = weight_transposed ? dim0 : dim1;
+  const int64_t kk = weight_transposed ? dim1 : dim0;
+  std::vector<double> w_nk(static_cast<size_t>(n_rows * kk));
+  if (weight_transposed) {
+    w_nk = w_f64;
+  } else {
+    for (int64_t kx = 0; kx < dim0; ++kx) {
+      for (int64_t nx = 0; nx < dim1; ++nx) {
+        w_nk[static_cast<size_t>(nx * kk + kx)] =
+            w_f64[static_cast<size_t>(kx * dim1 + nx)];
+      }
+    }
+  }
+  return WandaNK{std::move(w_nk), n_rows, kk};
+}
+
+// Inverse of ToWandaNK -- mirrors pruning.py's own `_nk_to_weight`
+// (non-Conv branch). `w_pruned_nk` is row-major `[n_rows, kk]`; the
+// returned buffer is row-major `[dim0, dim1]`, ready for
+// SetFloatTensorData.
+std::vector<float> FromWandaNK(const std::vector<double>& w_pruned_nk,
+                               int64_t dim0, int64_t dim1,
+                               bool weight_transposed) {
+  std::vector<float> w_new(static_cast<size_t>(dim0 * dim1));
+  if (weight_transposed) {
+    for (size_t i = 0; i < w_new.size(); ++i) {
+      w_new[i] = static_cast<float>(w_pruned_nk[i]);
+    }
+  } else {
+    const int64_t kk = dim0;
+    for (int64_t nx = 0; nx < dim1; ++nx) {
+      for (int64_t kx = 0; kx < dim0; ++kx) {
+        w_new[static_cast<size_t>(kx * dim1 + nx)] =
+            static_cast<float>(w_pruned_nk[static_cast<size_t>(nx * kk + kx)]);
+      }
+    }
+  }
+  return w_new;
+}
+
+// Wanda's own ``|W_ij| * ||X_j||_2`` importance for an already-`[n_rows,
+// kk]`-shaped weight, given its own optional per-`kk`-column calibrated
+// activation norm -- mirrors pruning.py's own `_wanda_importance` exactly,
+// including its fallback: `norm` absent, or its width not matching `kk`
+// (no calibration activation was ever observed for this layer, or it was
+// observed at a mismatched width), falls back to plain magnitude
+// (`std::fabs(w)` alone).
+std::vector<double> WandaImportance(const std::vector<double>& w_nk,
+                                    int64_t n_rows, int64_t kk,
+                                    const std::vector<double>* norm,
+                                    double epsilon) {
+  const bool use_norm =
+      norm != nullptr && static_cast<int64_t>(norm->size()) == kk;
+  std::vector<double> importance(w_nk.size());
+  for (int64_t r = 0; r < n_rows; ++r) {
+    for (int64_t c = 0; c < kk; ++c) {
+      const size_t i = static_cast<size_t>(r * kk + c);
+      const double mag = std::fabs(w_nk[i]);
+      importance[i] =
+          use_norm ? mag * std::max((*norm)[static_cast<size_t>(c)], epsilon)
+                   : mag;
+    }
+  }
+  return importance;
+}
+
+// Row-wise unstructured sparsity mask over a row-major `[n_rows, kk]`
+// `importance` array: within each row independently, keeps the
+// `max(1, round(kk * (1 - sparsity)))` highest-importance entries and drops
+// the rest -- mirrors pruning.py's own `_sparsity_mask` exactly (same keep
+// count/floor, `std::nearbyint` rather than `std::lround` to match Python's
+// own round-half-to-even `round()`, same as this file's own
+// SparsityMaskRowMajor in passes/magnitude_pruning.h). Tie-breaking among
+// exactly-equal importances may differ from numpy's own (non-stable-by-
+// default) `argsort` -- immaterial for continuous real-valued weight/
+// activation data, which essentially never ties exactly.
+std::vector<uint8_t> WandaSparsityMaskNK(const std::vector<double>& importance,
+                                         int64_t n_rows, int64_t kk,
+                                         double sparsity) {
+  std::vector<uint8_t> mask(importance.size(), 1);
+  const int64_t keep = std::max<int64_t>(
+      1, static_cast<int64_t>(
+             std::nearbyint(static_cast<double>(kk) * (1.0 - sparsity))));
+  if (keep >= kk) {
+    return mask;
+  }
+  const int64_t drop = kk - keep;
+  std::vector<int64_t> order(static_cast<size_t>(kk));
+  for (int64_t r = 0; r < n_rows; ++r) {
+    const double* row = importance.data() + r * kk;
+    std::iota(order.begin(), order.end(), int64_t{0});
+    std::stable_sort(order.begin(), order.end(),
+                     [&](int64_t a, int64_t b) { return row[a] < row[b]; });
+    for (int64_t i = 0; i < drop; ++i) {
+      mask[static_cast<size_t>(r * kk + order[static_cast<size_t>(i)])] = 0;
+    }
+  }
+  return mask;
+}
+
+// Row-wise N:M mask over a row-major `[n_rows, kk]` `importance` array:
+// within every consecutive group of `m_pat` columns, keeps only the
+// `n_pat` highest-importance entries -- mirrors pruning.py's own `_nm_mask`
+// exactly, including its trailing-partial-group handling (fewer than
+// `m_pat` columns left over keeps a proportional share, rounded, at least
+// 1, rather than requiring `kk` to be a multiple of `m_pat`).
+std::vector<uint8_t> WandaNmMaskNK(const std::vector<double>& importance,
+                                   int64_t n_rows, int64_t kk, int64_t n_pat,
+                                   int64_t m_pat) {
+  std::vector<uint8_t> mask(importance.size(), 1);
+  const int64_t full_cols = (kk / m_pat) * m_pat;
+  const int64_t drop_per_group = m_pat - n_pat;
+  std::vector<int64_t> group_idx(static_cast<size_t>(m_pat));
+  for (int64_t r = 0; r < n_rows; ++r) {
+    const double* row = importance.data() + r * kk;
+    for (int64_t g = 0; g < full_cols; g += m_pat) {
+      std::iota(group_idx.begin(), group_idx.end(), g);
+      std::stable_sort(group_idx.begin(), group_idx.end(),
+                       [&](int64_t a, int64_t b) { return row[a] < row[b]; });
+      for (int64_t i = 0; i < drop_per_group; ++i) {
+        mask[static_cast<size_t>(r * kk + group_idx[static_cast<size_t>(i)])] =
+            0;
+      }
+    }
+    const int64_t tail = kk - full_cols;
+    if (tail > 0) {
+      const int64_t keep = std::min<int64_t>(
+          tail, std::max<int64_t>(1, static_cast<int64_t>(std::nearbyint(
+                                         static_cast<double>(n_pat) *
+                                         static_cast<double>(tail) /
+                                         static_cast<double>(m_pat)))));
+      const int64_t drop = tail - keep;
+      std::vector<int64_t> tail_idx(static_cast<size_t>(tail));
+      std::iota(tail_idx.begin(), tail_idx.end(), full_cols);
+      std::stable_sort(tail_idx.begin(), tail_idx.end(),
+                       [&](int64_t a, int64_t b) { return row[a] < row[b]; });
+      for (int64_t i = 0; i < drop; ++i) {
+        mask[static_cast<size_t>(r * kk + tail_idx[static_cast<size_t>(i)])] =
+            0;
+      }
+    }
+  }
+  return mask;
+}
+
+}  // namespace
+
+onnx::ModelProto ApplyWandaPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity, const std::optional<int64_t>& n,
+    const std::optional<int64_t>& m, double epsilon, bool global_sparsity) {
+  // Mirrors pruning.py's own _validate_pattern exactly.
+  if (n.has_value() != m.has_value()) {
+    throw std::invalid_argument(
+        "ApplyWandaPruning: n and m must be given together (N:M pruning) "
+        "or not at all");
+  }
+  if (n.has_value() && m.has_value()) {
+    if (!(*n > 0 && *n <= *m)) {
+      throw std::invalid_argument(
+          "ApplyWandaPruning: require 0 < n <= m, got n=" + std::to_string(*n) +
+          ", m=" + std::to_string(*m));
+    }
+  } else if (!(sparsity >= 0.0 && sparsity < 1.0)) {
+    throw std::invalid_argument(
+        "ApplyWandaPruning: sparsity must be in [0, 1), got " +
+        std::to_string(sparsity));
+  }
+  // Mirrors pruning.py's own apply_wanda_pruning check.
+  if (global_sparsity && n.has_value()) {
+    throw std::invalid_argument(
+        "ApplyWandaPruning: global_sparsity is not supported together with "
+        "N:M pruning (n/m) -- see ApplyWandaPruning's own declaration "
+        "comment");
+  }
+
+  onnx::ModelProto out = model;
+  // NOT subgraph-aware -- mirrors pruning.py's own apply_wanda_pruning,
+  // which likewise only ever prunes `model.graph` directly. See this file's
+  // own ApplyStructuredWandaPruning declaration comment in
+  // structured_pruning_entry.h for the shared reasoning across every
+  // calibration-driven pass in this file.
+  onnx::GraphProto* graph = out.mutable_graph();
+
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+
+  // Exactly ApplySparseGptPruning's own candidate matching -- see this
+  // file's own ApplyWandaPruning declaration comment (structured_pruning_
+  // entry.h) for why the scope is identical: every matched MatMul/vanilla-
+  // Gemm layer (MatchMatMulLikeRaw) with a constant 2-D FLOAT32 weight,
+  // plus every matched com.microsoft::Attention node's constant 2-D
+  // FLOAT32 merged QKV weight (MatchAttentionProducer). 2-D Conv is
+  // declined outright -- never matched by either case below, left
+  // completely untouched.
+  struct Candidate {
+    std::string x_name;
+    std::string w_name;
+    bool weight_transposed;
+  };
+  std::vector<Candidate> candidates;
+  for (const auto& node : graph->node()) {
+    auto mm = MatchMatMulLikeRaw(node);
+    if (mm) {
+      auto wit = init_map.find(mm->w_name);
+      if (wit != init_map.end() &&
+          wit->second->data_type() == onnx::TensorProto::FLOAT &&
+          wit->second->dims_size() == 2) {
+        candidates.push_back({mm->x_name, mm->w_name, mm->weight_transposed});
+      }
+      continue;
+    }
+    auto am = MatchAttentionProducer(node, init_map);
+    if (am) {
+      // The merged QKV weight has no transpose attribute of its own -- it
+      // is already [K, N]-shaped by construction (see
+      // MatchAttentionProducer's own comment), so it is matched exactly
+      // like a non-transposed MatMul weight.
+      candidates.push_back({node.input(0), am->weight, false});
+    }
+  }
+  if (candidates.empty()) {
+    return out;
+  }
+
+  // Wanda's own calibration statistic -- reuses WandaCalibrationStats
+  // verbatim, probe axis -1 (last axis) for every candidate, keyed by its
+  // own activation tensor name (see this file's own ApplyWandaPruning
+  // declaration comment for why keying by `x_name` rather than by weight
+  // name, unlike pruning.py's own `attn_act_norm`, is a safe, already-
+  // established simplification). A rank-3 Attention activation is reduced
+  // over every leading axis by WandaCalibrationStats' own "every axis but
+  // the channel one" reduction, exactly mirroring pruning.py's own
+  // `x.reshape(-1, x.shape[-1])`.
+  std::unordered_map<std::string, int64_t> probe_axis;
+  for (const auto& c : candidates) {
+    probe_axis[c.x_name] = -1;
+  }
+  const std::unordered_map<std::string, std::vector<double>> act_norm =
+      WandaCalibrationStats(executor, out, probe_axis, calibration_data);
+
+  MutInitMap mut_init_map = BuildMutInitMap(graph);
+
+  if (global_sparsity) {
+    // Global-sparsity companion to the per-layer loop below, mirroring
+    // pruning.py's own `_apply_global_unstructured_pruning`: pools every
+    // matched layer's own already-computed importance into one flat array,
+    // picks a SINGLE keep-count from `sparsity`'s fraction of the total
+    // pooled entry count across every layer combined, and zeros exactly
+    // the lowest-scoring `total - keep_count` pooled entries wherever they
+    // land -- no per-row/per-layer floor enforced (a layer can end up
+    // entirely zeroed), same as the Python original.
+    struct Entry {
+      onnx::TensorProto* w_init;
+      int64_t dim0 = 0;
+      int64_t dim1 = 0;
+      bool weight_transposed = false;
+      std::vector<double> w_nk;
+      std::vector<double> importance;
+    };
+    std::vector<Entry> entries;
+    entries.reserve(candidates.size());
+    for (const auto& c : candidates) {
+      onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
+      const int64_t dim0 = w_init->dims(0);
+      const int64_t dim1 = w_init->dims(1);
+      const std::vector<float> w_flat = ReadFloatTensor(*w_init);
+      const std::vector<double> w_f64(w_flat.begin(), w_flat.end());
+      WandaNK nk = ToWandaNK(w_f64, dim0, dim1, c.weight_transposed);
+
+      const std::vector<double>* norm = nullptr;
+      auto nit = act_norm.find(c.x_name);
+      if (nit != act_norm.end()) {
+        norm = &nit->second;
+      }
+      std::vector<double> importance =
+          WandaImportance(nk.w_nk, nk.n_rows, nk.kk, norm, epsilon);
+      entries.push_back({w_init, dim0, dim1, c.weight_transposed,
+                         std::move(nk.w_nk), std::move(importance)});
+    }
+
+    size_t total = 0;
+    for (const auto& e : entries) {
+      total += e.importance.size();
+    }
+    if (total == 0) {
+      return out;
+    }
+    std::vector<double> pooled;
+    pooled.reserve(total);
+    for (const auto& e : entries) {
+      pooled.insert(pooled.end(), e.importance.begin(), e.importance.end());
+    }
+    const int64_t keep_count = std::clamp<int64_t>(
+        static_cast<int64_t>(
+            std::llround(static_cast<double>(total) * (1.0 - sparsity))),
+        0, static_cast<int64_t>(total));
+    const int64_t drop_count = static_cast<int64_t>(total) - keep_count;
+
+    std::vector<uint8_t> drop_flat(total, 0);
+    if (drop_count > 0) {
+      // Ties broken by a fixed, deterministic pooled order (stable sort
+      // over the concatenated array, entries-then-row-major order) --
+      // mirrors pruning.py's own `np.argsort(pooled, kind="stable")`.
+      std::vector<size_t> order(total);
+      std::iota(order.begin(), order.end(), size_t{0});
+      std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return pooled[a] < pooled[b];
+      });
+      for (int64_t i = 0; i < drop_count; ++i) {
+        drop_flat[order[static_cast<size_t>(i)]] = 1;
+      }
+    }
+
+    size_t offset = 0;
+    for (auto& e : entries) {
+      const size_t size = e.w_nk.size();
+      std::vector<double> pruned_nk(size);
+      for (size_t i = 0; i < size; ++i) {
+        pruned_nk[i] = drop_flat[offset + i] ? 0.0 : e.w_nk[i];
+      }
+      offset += size;
+      const std::vector<float> w_new =
+          FromWandaNK(pruned_nk, e.dim0, e.dim1, e.weight_transposed);
+      SetFloatTensorData(e.w_init, {e.dim0, e.dim1}, w_new);
+    }
+    return out;
+  }
+
+  for (const auto& c : candidates) {
+    onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
+    const int64_t dim0 = w_init->dims(0);
+    const int64_t dim1 = w_init->dims(1);
+    const std::vector<float> w_flat = ReadFloatTensor(*w_init);
+    const std::vector<double> w_f64(w_flat.begin(), w_flat.end());
+    WandaNK nk = ToWandaNK(w_f64, dim0, dim1, c.weight_transposed);
+
+    const std::vector<double>* norm = nullptr;
+    auto nit = act_norm.find(c.x_name);
+    if (nit != act_norm.end()) {
+      norm = &nit->second;
+    }
+    const std::vector<double> importance =
+        WandaImportance(nk.w_nk, nk.n_rows, nk.kk, norm, epsilon);
+
+    const std::vector<uint8_t> mask =
+        n.has_value()
+            ? WandaNmMaskNK(importance, nk.n_rows, nk.kk, *n, *m)
+            : WandaSparsityMaskNK(importance, nk.n_rows, nk.kk, sparsity);
+
+    std::vector<double> pruned_nk(nk.w_nk.size());
+    for (size_t i = 0; i < pruned_nk.size(); ++i) {
+      pruned_nk[i] = mask[i] ? nk.w_nk[i] : 0.0;
+    }
+    const std::vector<float> w_new =
+        FromWandaNK(pruned_nk, dim0, dim1, c.weight_transposed);
+    SetFloatTensorData(w_init, {dim0, dim1}, w_new);
+  }
+
+  return out;
+}
+
 EmbeddingVocabPruningResult ApplyEmbeddingVocabPruning(
     const onnx::ModelProto& model,
     const std::optional<std::vector<int64_t>>& keep_token_ids,

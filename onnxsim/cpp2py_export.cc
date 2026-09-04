@@ -737,6 +737,46 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "n"_a.none(), "m"_a.none(), "percdamp"_a = 0.01,
       "proc_block_size"_a = 128);
 
+  // Wanda pruning (Sun et al., 2023): the calibration-driven upgrade of
+  // magnitude pruning's data-free baseline, zeroing the least-important
+  // entries of every matched layer's constant 2-D FLOAT32 weight to an
+  // unstructured or N:M sparsity pattern using ``|W_ij| * ||X_j||_2``
+  // (weight magnitude times its reduction-dimension entry's calibrated
+  // activation L2-norm) as the importance metric -- a one-shot static
+  // score, unlike apply_sparsegpt_pruning's own sequential Hessian-error-
+  // compensating algorithm. Same candidate set/scope (FLOAT32-only, no
+  // Conv) and same executor-as-first-argument, `calibration_data`
+  // (List[Dict[str, onnx.TensorProto]]) crossing convention as
+  // apply_sparsegpt_pruning's own binding above. See ApplyWandaPruning in
+  // structured_pruning_entry.h for the full scope and the data-free
+  // magnitude fallback an unobserved layer gets (unlike SparseGPT, which
+  // has none). `global_sparsity` pools every matched layer's importance
+  // into one whole-model ranking, mirroring apply_structured_wanda_
+  // pruning's own `sparsity`-only mode's structural analogue; incompatible
+  // with `n`/`m`.
+  m.def(
+      "apply_wanda_pruning",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double sparsity, std::optional<int64_t> n, std::optional<int64_t> m,
+         double epsilon, bool global_sparsity) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplyWandaPruning(model, *executor, calibration_data, sparsity, n,
+                              m, epsilon, global_sparsity);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
+      "n"_a.none(), "m"_a.none(), "epsilon"_a = 1e-8,
+      "global_sparsity"_a = false);
+
   // MoE expert-intermediate-channel pruning: removes intermediate
   // (`inter_size`) channels from every expert of a matched
   // `com.microsoft::MoE` node at once -- real structural pruning, data-free.

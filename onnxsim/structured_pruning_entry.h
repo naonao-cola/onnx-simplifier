@@ -449,3 +449,100 @@ onnx::ModelProto ApplySparseGptPruning(
     double sparsity, const std::optional<int64_t>& n,
     const std::optional<int64_t>& m, double percdamp = 0.01,
     int64_t proc_block_size = 128);
+
+// Wanda pruning (Sun et al., 2023, "A Simple and Effective Pruning Approach
+// for Large Language Models", https://arxiv.org/abs/2306.11695): the
+// calibration-driven upgrade of magnitude pruning's data-free baseline
+// (onnxsim.h's ApplyMagnitudePruning/PruneMagnitude) to Wanda's own
+// importance metric -- ``|W_ij| * ||X_j||_2`` (weight magnitude times its
+// reduction-dimension entry's CALIBRATED activation L2-norm) -- applied
+// ELEMENT-WISE (unstructured, or N:M semi-structured) rather than as a
+// whole-row/channel keep/drop decision. The C++ port of pruning.py's own
+// `apply_wanda_pruning`. Named ApplyWandaPruning, deliberately distinct
+// from the already-existing ApplyStructuredWandaPruning above (Wanda-ranked
+// whole-CHANNEL structural pruning, a completely different output shape
+// change): like ApplySparseGptPruning immediately above, this NEVER changes
+// any tensor's shape -- only individual weight entries are zeroed in place.
+//
+// Matches EXACTLY the same candidate set as ApplySparseGptPruning, via the
+// same matchers (MatchMatMulLikeRaw, MatchAttentionProducer): every plain
+// `MatMul`/vanilla-`Gemm` node with a constant 2-D FLOAT32 weight (already
+// covering `com.microsoft::GroupQueryAttention`'s own separate Q/K/V
+// projections -- ordinary MatMul/Gemm nodes feeding it, not a weight the op
+// itself owns), plus every `com.microsoft::Attention` node's constant 2-D
+// FLOAT32 merged QKV weight. Deliberately narrower than pruning.py's own
+// `apply_wanda_pruning` in the same two ways ApplySparseGptPruning's own
+// declaration comment above already documents and justifies at length:
+//   - FLOAT32 only, not also FLOAT16/BFLOAT16.
+//   - 2-D `Conv` (ordinary/depthwise/general-grouped) is NOT matched at
+//     all -- pruning.py's own Conv support for THIS function needs the same
+//     from-first-principles im2col per-receptive-field-offset activation
+//     norm (`_conv_patch_sq_sum`, `_conv_group_relative_norm`) that
+//     ApplySparseGptPruning's own declaration comment explains is out of
+//     scope here for the analogous Hessian case -- materially bigger than
+//     the rest of this pass, and deliberately left to the pure-Python
+//     implementation. A Conv node here simply never matches either
+//     candidate case and is left completely untouched, never guessed at.
+//
+// Wanda's own calibration statistic -- one shared per-reduction-channel
+// activation L2-norm per matched layer's own input, reduced over every
+// leading axis (so a rank-3 `com.microsoft::Attention` input is handled
+// exactly like a rank-2 MatMul/Gemm one, mirroring pruning.py's own
+// `x.reshape(-1, x.shape[-1])`) -- is exactly WandaCalibrationStats' own
+// output shape, reused verbatim: probe axis -1 for every candidate, keyed
+// by each candidate's own activation tensor name (`x_name`) rather than by
+// weight name the way pruning.py's own `attn_act_norm` is keyed for
+// Attention -- mirroring ApplyAttentionHeadWandaPruning's own already-
+// established simplification of that same distinction (two distinct
+// Attention nodes sharing one activation tensor name is a purely
+// theoretical edge case neither C++ port bothers distinguishing). See
+// structured_pruning_entry.cpp's own "Wanda unstructured (element-wise)
+// pruning" section comment for the masking mechanics.
+//
+// `n`/`m` (both std::nullopt, or both given together: N:M semi-structured
+// pruning, `0 < n <= m`) and `sparsity` (target unstructured-sparsity
+// fraction, ignored when `n`/`m` are given, `[0, 1)`) mirror pruning.py's
+// own identical parameters and validation (`_validate_pattern`) exactly.
+// `epsilon` floors the per-channel activation norm before multiplying it
+// into the importance score, avoiding every entry of an all-zero-activation
+// channel tying at exactly-zero importance. `global_sparsity` pools every
+// matched layer's own already-computed importance into one ranking across
+// the WHOLE model and picks a single keep-count from `sparsity`'s fraction
+// of that pooled total -- mirrors pruning.py's own `apply_wanda_pruning`/
+// `apply_magnitude_pruning` `global_sparsity` mode (same honestly-noted
+// cross-layer-scale caveat; see pruning.py's own docstring). Incompatible
+// with `n`/`m` (same reasoning as the Python original): throws
+// `std::invalid_argument` when both are given.
+//
+// A matched layer with NO observed calibration activation for its own
+// input (dead input, an otherwise-empty `calibration_data`, every batch's
+// own activation isn't FLOAT32, or an observed width mismatched with the
+// weight's own reduction dimension) falls back to PLAIN MAGNITUDE
+// importance (``|W_ij|`` alone) for that one layer -- mirrors pruning.py's
+// own per-layer `_wanda_importance` fallback exactly. This is the one
+// meaningful behavioral difference from ApplySparseGptPruning's own
+// declaration comment: SparseGPT has no data-free fallback (its entire
+// mechanism IS the Hessian) and leaves an unobserved layer completely
+// untouched, whereas Wanda always has a well-defined, data-free importance
+// score to fall back to, so an unobserved layer is still pruned (to plain
+// magnitude, i.e. `apply_magnitude_pruning`'s own metric) rather than
+// skipped.
+//
+// Same executor-as-first-argument, `calibration_data` (one
+// `{graph input name: TensorProto}` map per batch) shape as every other
+// calibration-driven pass in this file -- see ApplyStructuredWandaPruning's
+// own declaration comment for the full calibration-crossing design. A
+// `calibration_data` batch missing one of `model`'s own graph inputs throws
+// `std::invalid_argument`. NOT subgraph-aware (mirrors pruning.py's own
+// `apply_wanda_pruning`, which likewise never calls `_iter_subgraphs`) --
+// same reasoning as every other calibration-driven pass's own declaration
+// comment: calibration_data batches are keyed to the top-level graph's own
+// inputs, and a nested If/Loop/Scan/BeamSearch-family subgraph body has no
+// standalone way to be Run at all.
+onnx::ModelProto ApplyWandaPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity, const std::optional<int64_t>& n,
+    const std::optional<int64_t>& m, double epsilon = 1e-8,
+    bool global_sparsity = false);
