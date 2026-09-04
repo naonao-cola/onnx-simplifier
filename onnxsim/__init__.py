@@ -9,6 +9,7 @@ from onnxsim.accuracy import (
     quantize_auto,
     recommend_quantization,
 )
+from onnxsim.adaquant import apply_adaquant
 from onnxsim.adaround import apply_adaround
 from onnxsim.aqlm import quantize_weight_only_aqlm
 from onnxsim.attention_quantization import apply_attention_quantization
@@ -39,6 +40,7 @@ from onnxsim.embedding_quantization import (
     quantize_embedding_int8,
 )
 from onnxsim.finetune import apply_pruning_finetune
+from onnxsim.flexround import apply_flexround
 from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
@@ -90,6 +92,7 @@ from onnxsim.optimize_pipeline import (
     apply_optimization_pipeline,
 )
 from onnxsim.ort_matmul_nbits_workaround import workaround_ort_matmul_nbits_axis0_bug
+from onnxsim.outlier_suppression_plus import apply_outlier_suppression_plus
 from onnxsim.precision_estimator import (
     ModelQuantizationEstimate,
     estimate_model_quantization_drop,
@@ -125,6 +128,7 @@ from onnxsim.pruning import (
 )
 from onnxsim.quarot import apply_quarot
 from onnxsim.quip_sharp import apply_quip_sharp
+from onnxsim.rptq import apply_rptq_reorder
 from onnxsim.smoothquant import apply_smoothquant
 from onnxsim.spinquant import apply_spinquant
 from onnxsim.spqr import quantize_weight_only_spqr
@@ -145,6 +149,7 @@ __all__ = [
     "cross_layer_equalize",
     "correct_bias",
     "apply_adaround",
+    "apply_adaquant",
     "apply_pruning_finetune",
     "apply_autoround",
     "auto_quantize_int4",
@@ -154,7 +159,10 @@ __all__ = [
     "apply_awq",
     "apply_attention_quantization",
     "apply_gptq",
+    "apply_flexround",
     "apply_smoothquant",
+    "apply_rptq_reorder",
+    "apply_outlier_suppression_plus",
     "apply_llm_int8",
     "apply_low_rank_compensation",
     "apply_mixed_precision_quantization",

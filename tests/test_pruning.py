@@ -4695,6 +4695,206 @@ def test_structured_pruning_conv_chain_hardswish_matches_oracle_exactly():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+# --- Self-gated activation decomposition (SiLU/erf-GELU, unfused) --------
+#
+# A raw `torch.onnx.export` of `nn.SiLU()`/`nn.GELU()` -- at any opset below
+# the fused op's own opset floor (`Gelu` needs 20+, `Swish` needs 24+), i.e.
+# the overwhelming majority of real exports -- emits the literal
+# decomposition instead of the fused node: the producer's own output tensor
+# feeds *two* consumers at once (a gate branch, and the `Mul` that combines
+# it with that branch's own output), confirmed live via `torch.onnx.export`
+# (see `onnxsim/pruning.py`'s own "Self-gated activation decomposition"
+# section comment for the exact two node shapes below and how they were
+# verified).
+
+
+def _conv_silu_decomposed_pair_model(w1, w2, b1=None, spatial=10):
+    # `nn.SiLU()`'s own raw export shape (any opset): `s = Sigmoid(h); a =
+    # Mul(h, s)` -- `h` (the producer's raw output) consumed twice.
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    out_spatial = spatial - 4
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          s = Sigmoid(h)
+          a = Mul(h, s)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def _conv_erf_gelu_decomposed_pair_model(w1, w2, b1=None, spatial=10):
+    # erf-based `nn.GELU()`'s own raw export shape at opset < 20 (the
+    # overwhelming majority of real exports): `d = Div(h, sqrt(2)); e =
+    # Erf(d); ao = Add(e, 1.0); m = Mul(h, ao); a = Mul(m, 0.5)` -- `h`
+    # consumed twice (by the first `Div` and the middle `Mul`), plus one
+    # more trailing scalar `Mul` after the self-gating `Mul` itself.
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    out_spatial = spatial - 4
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        <float Sqrt2 = {{1.4142135}}, float One = {{1.0}}, float Half = {{0.5}}>
+        {{
+          {conv1}
+          d = Div(h, Sqrt2)
+          e = Erf(d)
+          ao = Add(e, One)
+          m = Mul(h, ao)
+          a = Mul(m, Half)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_conv_chain_silu_decomposed_matches_oracle_exactly():
+    # Before this hop existed, this exact chain came out completely
+    # unpruned end to end -- `h`'s own two consumers broke the forward
+    # walk's single-consumer-per-tensor assumption outright, so the walk
+    # never even started. Same oracle bar as the fused-Swish test above:
+    # exact equivalence, via a real onnxruntime InferenceSession, to an
+    # independently, already-pruned reference model -- never the full
+    # unpruned model's own output.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(501)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_silu_decomposed_pair_model(w1, w2, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+    # The diamond's own nodes (Sigmoid, Mul) are untouched -- nothing on
+    # either has a per-channel operand to slice.
+    pruned_node_types = sorted(n.op_type for n in pruned.graph.node)
+    assert pruned_node_types == sorted(n.op_type for n in model.graph.node)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_silu_decomposed_pair_model(w1[keep], w2[:, keep], b1=b1[keep])
+
+    rng_x = np.random.default_rng(502)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    assert np.isfinite(y).all()
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_chain_erf_gelu_decomposed_matches_oracle_exactly():
+    # The longer (five-node) decomposition, plus its own trailing scalar
+    # `Mul` -- same oracle bar as the SiLU test above.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(503)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_erf_gelu_decomposed_pair_model(w1, w2, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+    pruned_node_types = sorted(n.op_type for n in pruned.graph.node)
+    assert pruned_node_types == sorted(n.op_type for n in model.graph.node)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_erf_gelu_decomposed_pair_model(w1[keep], w2[:, keep], b1=b1[keep])
+
+    rng_x = np.random.default_rng(504)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    assert np.isfinite(y).all()
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_chain_fused_gelu_still_matches_oracle_exactly():
+    # The control case this feature's own gap analysis started from: the
+    # *fused* `Gelu` node (opset 20+, already unary/`_UNARY_PASS_THROUGH`)
+    # must keep pruning correctly, completely unaffected by the new
+    # decomposition hop -- isolating that the fix is scoped to the
+    # decomposition specifically, never a regression on the fused case.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(505)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_pair_model(w1, w2, b1=b1, activation="Gelu", opset=21)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_pair_model(
+        w1[keep], w2[:, keep], b1=b1[keep], activation="Gelu", opset=21
+    )
+
+    rng_x = np.random.default_rng(506)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    assert np.isfinite(y).all()
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_chain_erf_gelu_decomposed_declines_on_branch_fanout():
+    # `d` (the gate branch's own `Div` output) is *also* read by a second,
+    # spurious consumer (`Extra`, tapped as a second graph output) -- the
+    # gate branch is no longer a strict single-consumer chain, so
+    # `_walk_gate_branch` must decline the whole diamond outright, leaving
+    # both weights completely untouched, never guessed at or partially cut.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(507)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y, float[N,{C1},10,10] Extra)
+        <float Sqrt2 = {{1.4142135}}, float One = {{1.0}}, float Half = {{0.5}}>
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          d = Div(h, Sqrt2)
+          Extra = Identity(d)
+          e = Erf(d)
+          ao = Add(e, One)
+          m = Mul(h, ao)
+          a = Mul(m, Half)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
 # --- Conv1d / Conv3d / ConvTranspose structural pruning ------------------
 #
 # _match_conv_producer/_match_conv_consumer/_match_depthwise_conv_pass_through
@@ -6973,6 +7173,242 @@ def test_structured_pruning_matmul_clip_pass_through_matches_oracle_exactly():
     a = np.clip(h, 0.0, 6.0)
     y_oracle = a @ w2[keep, :]
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+# --- Self-gated activation decomposition, MatMul/Gemm chains -------------
+#
+# The MatMul/Gemm-chain analogue of the Conv-chain section above -- SiLU/GELU
+# are just as common after a Linear layer as after a Conv (an FFN's own
+# `up = MatMul(x, W1); h = act(up); down = MatMul(h, W2)`), and neither
+# decomposed shape needs any per-channel operand or axis reasoning at all, so
+# the identical matcher (:func:`_match_self_gated_activation` in
+# `onnxsim/pruning.py`) already applies unchanged here.
+
+
+def _mlp_silu_decomposed_model(K, H, Out, bias=True, seed=0):
+    rng = np.random.default_rng(seed)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if bias:
+        b1 = rng.standard_normal((H,)).astype(np.float32)
+        gemm1 = "h = Gemm(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        gemm1 = "h = MatMul(X, W1)"
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          {gemm1}
+          s = Sigmoid(h)
+          a = Mul(h, s)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, w1, w2, (b1 if bias else None)
+
+
+def _mlp_erf_gelu_decomposed_model(K, H, Out, bias=True, seed=0):
+    rng = np.random.default_rng(seed)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if bias:
+        b1 = rng.standard_normal((H,)).astype(np.float32)
+        gemm1 = "h = Gemm(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        gemm1 = "h = MatMul(X, W1)"
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        <float Sqrt2 = {{1.4142135}}, float One = {{1.0}}, float Half = {{0.5}}>
+        {{
+          {gemm1}
+          d = Div(h, Sqrt2)
+          e = Erf(d)
+          ao = Add(e, One)
+          m = Mul(h, ao)
+          a = Mul(m, Half)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, w1, w2, (b1 if bias else None)
+
+
+def test_structured_pruning_matmul_silu_decomposed_matches_oracle_exactly():
+    # Before this hop existed, this exact chain came out completely
+    # unpruned end to end. Oracle built directly (not by re-invoking the
+    # helper, which always draws fresh random weights) so it's sliced from
+    # these exact same arrays -- the same bar every other pass-through-hop
+    # test in this file holds.
+    K, H, Out = 8, 32, 4
+    model, w1, w2, b1 = _mlp_silu_decomposed_model(K, H, Out)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    keep_count = H // 2
+    assert dims_after["W1"][1] == keep_count
+    assert dims_after["W2"][0] == keep_count
+    pruned_node_types = sorted(n.op_type for n in pruned.graph.node)
+    assert pruned_node_types == sorted(n.op_type for n in model.graph.node)
+
+    keep = _oracle_keep_indices(w1, keep_count)
+    oracle = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = Gemm(X, W1, B1)
+          s = Sigmoid(h)
+          a = Mul(h, s)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[
+            _f32(w1[:, keep], "W1"),
+            _f32(w2[keep], "W2"),
+            _f32(b1[keep], "B1"),
+        ],
+    )
+
+    rng_x = np.random.default_rng(511)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_matmul_erf_gelu_decomposed_matches_oracle_exactly():
+    K, H, Out = 8, 32, 4
+    model, w1, w2, b1 = _mlp_erf_gelu_decomposed_model(K, H, Out)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    keep_count = H // 2
+    assert dims_after["W1"][1] == keep_count
+    assert dims_after["W2"][0] == keep_count
+    pruned_node_types = sorted(n.op_type for n in pruned.graph.node)
+    assert pruned_node_types == sorted(n.op_type for n in model.graph.node)
+
+    keep = _oracle_keep_indices(w1, keep_count)
+    oracle = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        <float Sqrt2 = {{1.4142135}}, float One = {{1.0}}, float Half = {{0.5}}>
+        {{
+          h = Gemm(X, W1, B1)
+          d = Div(h, Sqrt2)
+          e = Erf(d)
+          ao = Add(e, One)
+          m = Mul(h, ao)
+          a = Mul(m, Half)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[
+            _f32(w1[:, keep], "W1"),
+            _f32(w2[keep], "W2"),
+            _f32(b1[keep], "B1"),
+        ],
+    )
+
+    rng_x = np.random.default_rng(512)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_matmul_fused_gelu_still_matches_oracle_exactly():
+    # The control case: the *fused* `Gelu` node (opset 20+, already
+    # `_UNARY_PASS_THROUGH`) must keep pruning correctly, unaffected by the
+    # new decomposition hop.
+    K, H, Out = 8, 32, 4
+    rng = np.random.default_rng(513)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    b1 = rng.standard_normal((H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = Gemm(X, W1, B1)
+          a = Gelu(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(b1, "B1"), _f32(w2, "W2")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    keep_count = H // 2
+    assert dims_after["W1"][1] == keep_count
+    assert dims_after["W2"][0] == keep_count
+
+    keep = _oracle_keep_indices(w1, keep_count)
+    oracle = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = Gemm(X, W1, B1)
+          a = Gelu(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[
+            _f32(w1[:, keep], "W1"),
+            _f32(b1[keep], "B1"),
+            _f32(w2[keep], "W2"),
+        ],
+    )
+
+    rng_x = np.random.default_rng(514)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_matmul_erf_gelu_decomposed_declines_on_nonconstant_scalar():
+    # `Sqrt2` (the gate branch's own `Div` divisor) fed by a non-constant
+    # node (an `Identity` of a graph input) rather than a genuine constant --
+    # this pass cannot confirm it's a channel-agnostic scalar without
+    # evaluating the graph, so the whole diamond must decline outright,
+    # leaving both weights completely untouched.
+    K, H, Out = 8, 32, 4
+    rng = np.random.default_rng(515)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X, float Sqrt2In) => (float[batch,{Out}] Y)
+        <float One = {{1.0}}, float Half = {{0.5}}>
+        {{
+          h = MatMul(X, W1)
+          Sqrt2 = Identity(Sqrt2In)
+          d = Div(h, Sqrt2)
+          e = Erf(d)
+          ao = Add(e, One)
+          m = Mul(h, ao)
+          a = Mul(m, Half)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
 
 
 def test_structured_wanda_pruning_conv_chain_matches_oracle_exactly():
