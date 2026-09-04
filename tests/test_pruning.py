@@ -12950,6 +12950,493 @@ def test_onnx_attention_wanda_pruning_cross_attention_matches_oracle_exactly():
     np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
 
 
+# --- apply_attention_head_pruning -- packed-QKV Split + RotaryEmbedding
+#     pass-through, ai.onnx::Attention -----------------------------------
+#
+# `_walk_back_through_qk_norm_rope`'s own RoPE hop (see this module's own
+# "packed-QKV-then-Split, CPU/DirectML Q/K-norm + RoPE pass-through" section
+# comment far above) originally only crossed `com.microsoft::RotaryEmbedding`/
+# `MRotaryEmbedding` -- gated on `rope.domain == _ATTENTION_DOMAIN` --  so a
+# packed-QKV `Split` feeding `ai.onnx::Attention` (this module's own native,
+# non-`com.microsoft` op family -- `_find_onnx_attention_chains`/
+# `_match_onnx_attention_producer` above) through the also-now-standardized
+# `ai.onnx::RotaryEmbedding` (opset 23+, domain "") was silently declined
+# entirely, even though `_match_onnx_attention_producer` itself has always
+# recognized the native `Attention` op on the *other* side of that same hop.
+# Confirmed live (`onnx.defs.get_schema("RotaryEmbedding", domain="")`,
+# `since_version == 23`) that the native op shares plain `RotaryEmbedding`'s
+# exact single-tensor-in/single-tensor-out shape and `num_heads` attribute
+# (same name, same "0 means infer from the input's own trailing width"
+# semantics) this walk relies on -- differing only in details the walk never
+# inspects: input ORDER (`X, cos_cache, sin_cache, position_ids` -- the last
+# one optional -- vs. contrib's `input, position_ids, cos_cache, sin_cache`,
+# confirmed live the same way) and two contrib-only attributes
+# (`is_packed_batching`/`scale`). `com.microsoft::MRotaryEmbedding` has no
+# native counterpart at all (confirmed live: `onnx.defs.get_schema
+# ("MRotaryEmbedding", domain="")` raises "No schema registered") so it
+# still requires `_ATTENTION_DOMAIN` exactly -- see
+# `test_onnx_attention_packed_qkv_mrotary_embedding_native_domain_is_declined`
+# below.
+
+
+def _onnx_attention_packed_rope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    packed=True,
+    rope_domain="",  # "" (native ai.onnx) | "com.microsoft" (contrib) | None (no RoPE hop)
+    rope_op_type="RotaryEmbedding",
+    wqkv=None,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+    cos=None,
+    sin=None,
+    position_ids=None,
+    max_pos=32,
+    q_rotary_num_heads=None,
+    k_rotary_num_heads=None,
+):
+    # Mirrors `_gqa_qk_norm_rope_model`'s own `packed=True`/`packed=False`
+    # scaffolding (see this module's own "packed-QKV-then-Split" section
+    # comment far above) with `ai.onnx::Attention` as the consumer instead of
+    # `com.microsoft::GroupQueryAttention`, and `rope_domain` selecting which
+    # domain the RoPE hop itself sits under -- the one axis that section's
+    # own helper never varied (always `com.microsoft`).
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wout, "Wout")]
+
+    if packed:
+        if wqkv is None:
+            wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+        initializer.append(_f32(wqkv, "Wqkv"))
+        split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+        initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+        producer_body = (
+            "qkv = MatMul(X, Wqkv)\n"
+            "          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)"
+        )
+    else:
+        if wq is None:
+            wq = rng.standard_normal((K, Nq)).astype(np.float32)
+        if wk is None:
+            wk = rng.standard_normal((K, Nkv)).astype(np.float32)
+        if wv is None:
+            wv = rng.standard_normal((K, Nkv)).astype(np.float32)
+        initializer += [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv")]
+        producer_body = (
+            "q_raw = MatMul(X, Wq)\n"
+            "          k_raw = MatMul(X, Wk)\n"
+            "          v = MatMul(X, Wv)"
+        )
+
+    q_body, k_body, hop_body = "q_raw", "k_raw", ""
+    opset_imports = {"": 24}
+    if rope_domain is not None:
+        half = D // 2
+        if cos is None:
+            cos = rng.standard_normal((max_pos, half)).astype(np.float32)
+        if sin is None:
+            sin = rng.standard_normal((max_pos, half)).astype(np.float32)
+        if position_ids is None:
+            position_ids = np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+        initializer += [_f32(cos, "CosCache"), _f32(sin, "SinCache")]
+        initializer.append(onnx.numpy_helper.from_array(position_ids, "PosIds"))
+
+        qnh = q_rotary_num_heads if q_rotary_num_heads is not None else 0
+        knh = k_rotary_num_heads if k_rotary_num_heads is not None else 0
+        domain_prefix = f"{rope_domain}." if rope_domain else ""
+        q_body, k_body = "q", "k"
+        if rope_domain == "":
+            # Native ai.onnx::RotaryEmbedding's own input order: `X,
+            # cos_cache, sin_cache, position_ids` (`position_ids` optional,
+            # LAST) -- confirmed live, a genuinely different order from the
+            # contrib op's own below.
+            hop_body = (
+                f"q = {domain_prefix}{rope_op_type} <num_heads={qnh}> "
+                f"(q_raw, CosCache, SinCache, PosIds)\n"
+                f"          k = {domain_prefix}{rope_op_type} <num_heads={knh}> "
+                f"(k_raw, CosCache, SinCache, PosIds)"
+            )
+        else:
+            # com.microsoft::RotaryEmbedding/MRotaryEmbedding's own input
+            # order: `input, position_ids, cos_cache, sin_cache`.
+            hop_body = (
+                f"q = {domain_prefix}{rope_op_type} <num_heads={qnh}> "
+                f"(q_raw, PosIds, CosCache, SinCache)\n"
+                f"          k = {domain_prefix}{rope_op_type} <num_heads={knh}> "
+                f"(k_raw, PosIds, CosCache, SinCache)"
+            )
+            opset_imports[rope_domain] = 1
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          {producer_body}
+          {hop_body}
+          ctx = Attention <q_num_heads={H}, kv_num_heads={KVH}> ({q_body}, {k_body}, v)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    opset_import_text = (
+        "[" + ", ".join(f'"{d}": {v}' for d, v in opset_imports.items()) + "]"
+    )
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: {opset_import_text}
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        cos=cos,
+        sin=sin,
+        position_ids=position_ids,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def _onnx_attention_packed_rope_oracle_and_pruned(
+    K, H, KVH, D, Out, seed, sparsity, rope_domain, **extra
+):
+    # Mirrors `_qk_norm_rope_oracle_and_pruned`'s own pattern one section
+    # above: builds the packed (to-be-pruned) model, prunes it, and builds an
+    # *independently* constructed (`packed=False`) already-correctly-reduced
+    # oracle model from the exact same pre-pruning weights/cos/sin/
+    # position_ids -- reused verbatim, unsliced, since `RotaryEmbedding`'s
+    # own `cos_cache`/`sin_cache` have no per-head axis to begin with (this
+    # section's own comment above / `test_rotary_embedding_is_head_
+    # independent_for_pruning`).
+    model, cfg = _onnx_attention_packed_rope_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=seed, rope_domain=rope_domain, **extra
+    )
+    assert len(onnxsim.pruning._find_onnx_attention_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=sparsity)
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+
+    group_size = H // KVH
+    keep_count = max(1, KVH - round(KVH * sparsity))
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, keep_count)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    oracle_extra = dict(extra)
+    q_rotary_num_heads = extra.get("q_rotary_num_heads")
+    k_rotary_num_heads = extra.get("k_rotary_num_heads")
+    oracle_extra.pop("q_rotary_num_heads", None)
+    oracle_extra.pop("k_rotary_num_heads", None)
+
+    oracle, _ = _onnx_attention_packed_rope_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=D,
+        Out=Out,
+        seed=seed,
+        packed=False,
+        rope_domain=rope_domain,
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        cos=cfg["cos"],
+        sin=cfg["sin"],
+        position_ids=cfg["position_ids"],
+        q_rotary_num_heads=(
+            None
+            if q_rotary_num_heads is None or q_rotary_num_heads == 0
+            else len(keep_q_heads)
+        ),
+        k_rotary_num_heads=(
+            None
+            if k_rotary_num_heads is None or k_rotary_num_heads == 0
+            else len(keep_groups)
+        ),
+        **oracle_extra,
+    )
+
+    rng = np.random.default_rng(seed + 1000)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    return pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads
+
+
+def test_onnx_attention_packed_qkv_native_rotary_embedding_pruning_matches_oracle_exactly():
+    # The core gap this section closes: a packed-QKV `Split` feeding
+    # `ai.onnx::Attention` through a NATIVE-domain (`""`) `RotaryEmbedding`
+    # hop on each of Q's/K's own branch now prunes the shared `Wqkv` and
+    # narrows `q_num_heads`/`kv_num_heads`, matching an independently
+    # reconstructed already-pruned oracle exactly -- verified via a real
+    # `InferenceSession` run, this module's own established correctness
+    # invariant (never the full unpruned model's own output).
+    #
+    # Explicit (non-`0`) `q_rotary_num_heads`/`k_rotary_num_heads` here --
+    # unlike the `com.microsoft` op's own tests, which happily leave this at
+    # the schema's self-adjusting `0` default -- because of a genuine
+    # kernel-level difference confirmed live: this environment's
+    # onnxruntime 1.29.0 real CPU kernel for the NATIVE op rejects `0` for
+    # rank-3 input outright ("RotaryEmbedding: num_heads must be greater
+    # than 0 for rank-3 input" -- the same real-kernel restriction this
+    # module's own comment already documents for `MRotaryEmbedding`, just
+    # not previously known to also apply to native `RotaryEmbedding`), while
+    # the contrib op's own kernel accepts it fine (confirmed live too, same
+    # rank-3 input). Orthogonal to this walk's own correctness -- the
+    # `num_heads`-rewrite code path this exercises is covered independently
+    # by `test_onnx_attention_packed_qkv_native_rotary_embedding_pruning_
+    # updates_explicit_num_heads` below -- just a real-kernel constraint on
+    # which value is actually *runnable* here.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads = (
+        _onnx_attention_packed_rope_oracle_and_pruned(
+            K,
+            H,
+            KVH,
+            D,
+            Out,
+            seed=101,
+            sparsity=0.5,
+            rope_domain="",
+            q_rotary_num_heads=H,
+            k_rotary_num_heads=KVH,
+        )
+    )
+    attn = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(attn)
+    assert kv_num_heads == len(keep_groups) == 1
+    assert q_num_heads == len(keep_q_heads) == 4
+
+    rotary_nodes = [n for n in pruned.graph.node if n.op_type == "RotaryEmbedding"]
+    assert len(rotary_nodes) == 2
+    for n in rotary_nodes:
+        assert n.domain == ""  # native-domain hop actually crossed, not declined
+
+    # `Wqkv` itself narrowed -- the whole point of crossing the hop instead
+    # of declining at it.
+    wqkv_pruned = next(t for t in pruned.graph.initializer if t.name == "Wqkv")
+    assert wqkv_pruned.dims[1] == len(keep_q_heads) * D + 2 * len(keep_groups) * D
+
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_onnx_attention_packed_qkv_native_rotary_embedding_pruning_updates_explicit_num_heads():
+    # The partial-rotary case (non-`0` `num_heads`, the one crossed-hop
+    # constant that genuinely does need rewriting post-pruning -- see this
+    # module's own "packed-QKV-then-Split" section comment far above)
+    # exercised for the NATIVE-domain hop specifically -- the attribute
+    # rewrite code itself (`num_heads` by NAME, not by domain) is shared
+    # unchanged with the `com.microsoft` path, but this is the first time it
+    # runs on a native-domain node at all.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads = (
+        _onnx_attention_packed_rope_oracle_and_pruned(
+            K,
+            H,
+            KVH,
+            D,
+            Out,
+            seed=102,
+            sparsity=0.5,
+            rope_domain="",
+            q_rotary_num_heads=H,
+            k_rotary_num_heads=KVH,
+        )
+    )
+    q_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "RotaryEmbedding" and n.input[0] == "q_raw"
+    )
+    k_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "RotaryEmbedding" and n.input[0] == "k_raw"
+    )
+    assert q_rot.domain == "" and k_rot.domain == ""
+    assert next(a.i for a in q_rot.attribute if a.name == "num_heads") == len(
+        keep_q_heads
+    )
+    assert next(a.i for a in k_rot.attribute if a.name == "num_heads") == len(
+        keep_groups
+    )
+
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_onnx_attention_packed_qkv_contrib_rotary_embedding_pruning_matches_oracle_exactly():
+    # Regression-safety companion to the two tests above: the pre-existing
+    # `com.microsoft::RotaryEmbedding` case, run through this same new
+    # helper (packed-QKV + native `ai.onnx::Attention` -- a pairing that
+    # simply never had a dedicated test before this section, since the
+    # native-domain hop was declined outright), still works identically --
+    # confirming the widened domain check is genuinely additive, not a
+    # behavior change for the already-working contrib path.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads = (
+        _onnx_attention_packed_rope_oracle_and_pruned(
+            K, H, KVH, D, Out, seed=103, sparsity=0.5, rope_domain="com.microsoft"
+        )
+    )
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(_onnx_attention_node(pruned))
+    assert kv_num_heads == len(keep_groups) == 1
+    assert q_num_heads == len(keep_q_heads) == 4
+
+    rotary_nodes = [n for n in pruned.graph.node if n.op_type == "RotaryEmbedding"]
+    assert len(rotary_nodes) == 2
+    for n in rotary_nodes:
+        assert n.domain == "com.microsoft"
+
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_onnx_attention_packed_qkv_mrotary_embedding_native_domain_is_declined():
+    # `com.microsoft::MRotaryEmbedding` has no native-domain equivalent at
+    # all (confirmed live: `onnx.defs.get_schema("MRotaryEmbedding",
+    # domain="")` raises "No schema registered for 'MRotaryEmbedding' and
+    # domain ''" -- so a domain-`""` `MRotaryEmbedding` node isn't even a
+    # schema-legal ai.onnx op to begin with; this model is a deliberately
+    # synthetic/adversarial one, never executed, purely to confirm the
+    # widened domain check stayed narrow) -- so it must keep declining the
+    # RoPE hop the exact same way it always did pre-fix, leaving `Wqkv`
+    # completely untouched rather than silently (and incorrectly) matching.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _onnx_attention_packed_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=104,
+        rope_domain="",
+        rope_op_type="MRotaryEmbedding",
+    )
+    assert len(onnxsim.pruning._find_onnx_attention_chains(model.graph)) == 0
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(_onnx_attention_node(pruned))
+    assert q_num_heads == H
+    assert kv_num_heads == KVH
+    wqkv_pruned = next(t for t in pruned.graph.initializer if t.name == "Wqkv")
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(wqkv_pruned), cfg["wqkv"])
+
+
+def test_onnx_attention_wanda_packed_qkv_native_rotary_embedding_pruning_matches_oracle_exactly():
+    # `apply_attention_head_wanda_pruning` shares `_find_onnx_attention_chains`
+    # (and, transitively, `_walk_back_through_qk_norm_rope`) with the
+    # data-free path above -- only `compute_group_importance` differs -- so
+    # this confirms the native-domain RoPE hop is recognized under the
+    # Wanda-calibrated path too, not just the data-free default. Explicit
+    # `q_rotary_num_heads`/`k_rotary_num_heads` for the same real-kernel
+    # reason as `test_onnx_attention_packed_qkv_native_rotary_embedding_
+    # pruning_matches_oracle_exactly` above (this test's own calibration run
+    # is itself a real `InferenceSession` execution of the native op).
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _onnx_attention_packed_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=105,
+        rope_domain="",
+        q_rotary_num_heads=H,
+        k_rotary_num_heads=KVH,
+    )
+    rng = np.random.default_rng(106)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx"))
+    (_, ctx_cal) = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx_cal.astype(np.float64)), axis=(0, 1)))
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+
+    group_size = H // KVH
+    importance = np.zeros(KVH)
+    for kv in range(KVH):
+        q_block = np.concatenate(
+            [
+                wq[:, h * D : (h + 1) * D]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = wk[:, kv * D : (kv + 1) * D]
+        v_block = wv[:, kv * D : (kv + 1) * D]
+        base = np.linalg.norm(np.concatenate([q_block, k_block, v_block], axis=1))
+        act_group = np.linalg.norm(
+            act_norm[kv * group_size * D : (kv + 1) * group_size * D]
+        )
+        importance[kv] = base * max(act_group, 1e-8)
+    keep_groups = np.sort(np.argsort(-importance)[:1])  # max(1, 2 - round(2*0.5)) == 1
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    oracle, _ = _onnx_attention_packed_rope_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=D,
+        Out=Out,
+        seed=105,
+        packed=False,
+        rope_domain="",
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        cos=cfg["cos"],
+        sin=cfg["sin"],
+        position_ids=cfg["position_ids"],
+        q_rotary_num_heads=len(keep_q_heads),
+        k_rotary_num_heads=len(keep_groups),
+    )
+
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
 # --- apply_attention_head_pruning / _wanda_pruning -- MultiHeadAttention --
 #
 # ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
