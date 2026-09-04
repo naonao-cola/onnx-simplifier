@@ -9,6 +9,7 @@ from onnxsim.accuracy import (
     quantize_auto,
     recommend_quantization,
 )
+from onnxsim.adaquant import apply_adaquant
 from onnxsim.adaround import apply_adaround
 from onnxsim.aqlm import quantize_weight_only_aqlm
 from onnxsim.attention_quantization import apply_attention_quantization
@@ -90,6 +91,7 @@ from onnxsim.optimize_pipeline import (
     apply_optimization_pipeline,
 )
 from onnxsim.ort_matmul_nbits_workaround import workaround_ort_matmul_nbits_axis0_bug
+from onnxsim.outlier_suppression_plus import apply_outlier_suppression_plus
 from onnxsim.precision_estimator import (
     ModelQuantizationEstimate,
     estimate_model_quantization_drop,
@@ -146,6 +148,7 @@ __all__ = [
     "cross_layer_equalize",
     "correct_bias",
     "apply_adaround",
+    "apply_adaquant",
     "apply_pruning_finetune",
     "apply_autoround",
     "auto_quantize_int4",
@@ -157,6 +160,7 @@ __all__ = [
     "apply_gptq",
     "apply_smoothquant",
     "apply_rptq_reorder",
+    "apply_outlier_suppression_plus",
     "apply_llm_int8",
     "apply_low_rank_compensation",
     "apply_mixed_precision_quantization",
