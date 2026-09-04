@@ -460,6 +460,46 @@ def test_fuse_consecutive_reduce_through_reshape():
     assert ops["ReduceSum"] == 1
 
 
+def test_fuse_consecutive_reduce_through_unsqueeze():
+    # Same idiom as test_fuse_consecutive_reduce_through_reshape, but the
+    # keepdims-toggling reshape is spelled as an Unsqueeze on the dropped
+    # axis instead of a generic Reshape.
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[2,3] Z)
+        <int64[1] ax = {2}>
+        {
+          y = ReduceSum<keepdims = 0>(X, ax)
+          u = Unsqueeze(y, ax)
+          Z = ReduceSum<keepdims = 0>(u, ax)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["Unsqueeze"] == 0
+    assert ops["ReduceSum"] == 1
+
+
+def test_fuse_consecutive_reduce_through_squeeze():
+    # Mirror image of the Unsqueeze case: the first reduction keeps its
+    # reduced axis (keepdims=1) and a Squeeze drops it back down to the
+    # keepdims=False shape before the second reduction.
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[2] Z)
+        <int64[1] ax = {2}, int64[1] ax1 = {1}, int64[1] sq = {2}>
+        {
+          y = ReduceSum<keepdims = 1>(X, ax)
+          s = Squeeze(y, sq)
+          Z = ReduceSum<keepdims = 0>(s, ax1)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["Squeeze"] == 0
+    assert ops["ReduceSum"] == 1
+
+
 def test_fuse_consecutive_reduce_declines_different_kind():
     # ReduceSum followed by ReduceMax must not fuse -- the two ops don't
     # combine associatively across a shared axis group.

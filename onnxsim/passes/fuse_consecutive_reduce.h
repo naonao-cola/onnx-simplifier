@@ -25,12 +25,15 @@
 // sum(x)^2 summed again is not sum(x^2) -- so they are intentionally
 // excluded.
 //
-// The two reductions may additionally be separated by a Reshape that only
-// inserts/removes the size-1 dimensions keepdims leaves behind -- the
-// "reduce(keepdims=False) -> reshape back to the keepdims=True shape" idiom
-// some exporters emit before a second reduction -- which this pass verifies
-// against the static shapes involved and folds away as part of the same
-// rewrite.
+// The two reductions may additionally be separated by a single Reshape,
+// Squeeze or Unsqueeze that only inserts/removes the size-1 dimensions
+// keepdims leaves behind -- the "reduce(keepdims=False) -> reshape/unsqueeze
+// back to the keepdims=True shape" idiom some exporters emit before a second
+// reduction -- which this pass verifies against the static shapes involved
+// and folds away as part of the same rewrite. The check is purely
+// shape-based (does it produce exactly the other keepdims setting's shape?),
+// so it applies identically regardless of which of the three ops performs
+// the reshape.
 
 #include <algorithm>
 #include <numeric>
@@ -52,17 +55,15 @@ struct FuseConsecutiveReduce final : public PredicateBasedPass {
   explicit FuseConsecutiveReduce()
       : PredicateBasedPass(PassType::Fuse, PassEfficiency::Complete,
                            PassOptimizationType::Compute) {}
-  std::string getPassName() const override {
-    return "fuse_consecutive_reduce";
-  }
+  std::string getPassName() const override { return "fuse_consecutive_reduce"; }
 
   // Reduction ops whose two-step application over disjoint axis groups
   // equals a single application over the union of those axes. See the file
   // comment for why ReduceLogSum/ReduceSumSquare are excluded.
   static bool IsFusableReduceKind(NodeKind k) {
     static const std::unordered_set<NodeKind> kKinds{
-        kReduceSum, kReduceMean, kReduceMax,      kReduceMin,
-        kReduceProd, kReduceL1,  kReduceL2,       kReduceLogSumExp};
+        kReduceSum,  kReduceMean, kReduceMax, kReduceMin,
+        kReduceProd, kReduceL1,   kReduceL2,  kReduceLogSumExp};
     return kKinds.count(k) != 0;
   }
 
@@ -142,8 +143,8 @@ struct FuseConsecutiveReduce final : public PredicateBasedPass {
   // The shape a Reduce* over `in_shape` with (normalized, sorted, deduped)
   // `axes` produces, for a given keepdims setting.
   static std::vector<Dimension> ReducedShape(
-      const std::vector<Dimension>& in_shape,
-      const std::vector<int64_t>& axes, bool keepdims) {
+      const std::vector<Dimension>& in_shape, const std::vector<int64_t>& axes,
+      bool keepdims) {
     std::vector<Dimension> out;
     out.reserve(in_shape.size());
     size_t ai = 0;
@@ -205,6 +206,13 @@ struct FuseConsecutiveReduce final : public PredicateBasedPass {
     }
   }
 
+  // Ops that can implement the keepdims-toggling reshape between two
+  // reductions: a plain Reshape, or a Squeeze/Unsqueeze targeting the same
+  // axes directly.
+  static bool IsReshapeLike(NodeKind k) {
+    return k == kReshape || k == kSqueeze || k == kUnsqueeze;
+  }
+
   bool patternMatchPredicate(Node* node) override {
     if (!IsFusableReduceKind(node->kind())) {
       return false;
@@ -213,7 +221,7 @@ struct FuseConsecutiveReduce final : public PredicateBasedPass {
     if (prev->kind() == node->kind()) {
       return prev->output()->uses().size() == 1;
     }
-    if (prev->kind() == kReshape) {
+    if (IsReshapeLike(prev->kind())) {
       if (prev->output()->uses().size() != 1) {
         return false;
       }
@@ -230,12 +238,13 @@ struct FuseConsecutiveReduce final : public PredicateBasedPass {
 
     Node* reshape = nullptr;
     Node* a = n->input(0)->node();
-    if (a->kind() == kReshape) {
+    if (IsReshapeLike(a->kind())) {
       reshape = a;
       a = reshape->input(0)->node();
     }
     // patternMatchPredicate only lets same-kind reduces (directly, or
-    // through a single-use Reshape) reach here; re-check defensively.
+    // through a single-use Reshape/Squeeze/Unsqueeze) reach here; re-check
+    // defensively.
     if (a->kind() != n->kind()) {
       return false;
     }
@@ -275,10 +284,10 @@ struct FuseConsecutiveReduce final : public PredicateBasedPass {
 
     const bool have_mid_rank = have_x_rank;
     const int64_t mid_rank =
-        have_x_rank ? (effective_ka != 0
-                          ? x_rank
-                          : x_rank - static_cast<int64_t>(a_axes.size()))
-                    : 0;
+        have_x_rank
+            ? (effective_ka != 0 ? x_rank
+                                 : x_rank - static_cast<int64_t>(a_axes.size()))
+            : 0;
     std::vector<int64_t> n_axes;
     bool n_identity = false;
     if (!ResolveAxes(n, have_mid_rank, mid_rank, n_axes, n_identity) ||
