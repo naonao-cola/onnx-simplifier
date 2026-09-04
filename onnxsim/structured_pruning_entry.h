@@ -23,5 +23,18 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
 onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
                                            double sparsity);
 
+// Removes intermediate (`inter_size`) channels from every expert of a
+// matched `com.microsoft::MoE` node at once -- real structural pruning
+// (smaller fc1/fc2 weight tensors, smaller per-expert matmuls on any
+// runtime), the C++ port of pruning.py's own
+// `apply_moe_expert_channel_pruning`. `num_experts` (whole-expert pruning,
+// which needs runtime calibration data this build has no ONNX Runtime to
+// provide -- see CLAUDE.md) is out of scope; see
+// structured_pruning_entry.cpp's own "MoE (com.microsoft::MoE) expert-
+// intermediate-channel pruning" section comment for the full scope and
+// safety argument.
+onnx::ModelProto ApplyMoeExpertChannelPruning(const onnx::ModelProto& model,
+                                              double sparsity);
+
 onnx::ModelProto ApplyQMoEExpertChannelPruning(const onnx::ModelProto& model,
                                                double sparsity);

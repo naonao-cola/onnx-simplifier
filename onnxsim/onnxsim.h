@@ -645,6 +645,40 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
 onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
                                            double sparsity);
 
+// MoE expert-intermediate-channel pruning: removes intermediate
+// (``inter_size``) channels from every expert of a matched
+// ``com.microsoft::MoE`` node at once -- real structural pruning (smaller
+// ``fc1_experts_weights``/``fc2_experts_weights``, smaller per-expert
+// matmuls on any runtime), data-free.
+//
+// Ranks every ``inter_size`` index by combined (root-sum-square) L2 norm of
+// ``fc1_experts_weights``' own row (across every expert and ``hidden_size``
+// at once) and ``fc2_experts_weights``' own column (same reduction), plus
+// ``fc1_experts_bias``'s own entry when present, drops the lowest-
+// ``sparsity``-fraction of indices (at least one is always kept), and
+// removes the matching row from ``fc1_experts_weights``/
+// ``fc1_experts_bias`` and column from ``fc2_experts_weights``, identically
+// across every expert -- ``num_experts``, ``k``, and every node attribute
+// are untouched, since pruning ``inter_size`` changes no other tensor's
+// shape anywhere in the graph, including the node's own output.
+//
+// A node with ``fc3_experts_weights`` present, a ``swiglu``/unrecognized
+// ``activation_type``, a non-constant or tied/shared weight, or any other
+// shape this pass doesn't recognize is left completely untouched. This is
+// the C++ port of ``onnxsim.apply_moe_expert_channel_pruning`` --
+// whole-expert pruning (shrinking ``num_experts`` itself, which needs
+// runtime calibration data this build has no ONNX Runtime linked in to
+// provide) is a deliberately separate, NOT-ported feature. See
+// ``structured_pruning_entry.cpp``'s own "MoE (com.microsoft::MoE)
+// expert-intermediate-channel pruning" section comment for the full scope
+// and safety argument.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass. ``sparsity`` must be in [0, 1); throws
+// ``std::invalid_argument`` otherwise.
+onnx::ModelProto ApplyMoeExpertChannelPruning(const onnx::ModelProto& model,
+                                              double sparsity);
+
 // QMoE expert-channel pruning: removes intermediate (``inter_size``)
 // channels from every expert of a matched ``com.microsoft::QMoE`` node at
 // once -- the quantized-weight counterpart of ``ApplyStructuredPruning``,

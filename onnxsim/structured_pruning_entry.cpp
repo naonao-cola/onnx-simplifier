@@ -11425,6 +11425,346 @@ void ApplyMatMulBnb4Chains(onnx::GraphProto* graph,
   }
 }
 
+// --- MoE (com.microsoft::MoE) expert-intermediate-channel pruning --------
+//
+// C++ port of pruning.py's own apply_moe_expert_channel_pruning -- see that
+// function's own section comment (the "MoE expert-intermediate-channel
+// pruning" block just above `class _MoEChain` in pruning.py) for the full
+// safety argument: `fc1_experts_weights`/`fc2_experts_weights` each carry a
+// clean `[num_experts, ...]` leading axis (`inter_size` living on fc1's own
+// axis 1 -- `[num_experts, inter_size, hidden_size]` -- and fc2's own axis 2
+// -- `[num_experts, hidden_size, inter_size]`), so dropping the same
+// `inter_size` index from both, identically across every expert, needs no
+// upstream producer, no downstream consumer, and no attribute update at all
+// (`num_experts`/`k`/`activation_type` are untouched, and the node's own
+// output shape always equals its input's) -- the "narrowest safe slice" of
+// NVIDIA's "Iterative Puzzle" paper (arXiv:2607.04371) this module can
+// precisely justify.
+//
+// Two scope boundaries, both already decided (and empirically verified
+// against a real onnxruntime CPU MoE kernel) on the Python side and simply
+// carried over unchanged here, never re-derived:
+//   * `fc3_experts_weights` (present) and `swiglu`/unrecognized
+//     `activation_type` (or nonzero `swiglu_fusion`) are declined outright --
+//     see pruning.py's own comment for why (no CPU execution provider in
+//     this environment implements fc3; a real fused-swiglu fc1 doubles its
+//     own row count, which the `fc1.dims(1) == fc2.dims(2)` shape check
+//     below already declines structurally, without even reading
+//     `swiglu_fusion`).
+//   * Whole-expert pruning (shrinking `num_experts` itself, pruning.py's own
+//     separate "MoE whole-expert pruning" section right after this one) is
+//     NOT ported here -- it needs runtime calibration data (an
+//     `onnxruntime.InferenceSession` observing router activations over a
+//     representative batch) to rank experts by usage, and this C++ port has
+//     no ONNX Runtime linked into it at all (see CLAUDE.md: the wheel build
+//     always passes `-DONNXSIM_BUILTIN_ORT=OFF`). This section stays
+//     entirely within the data-free, fully structural `inter_size` slice.
+//
+// `fc1_experts_weights`/`fc2_experts_weights`/`fc1_experts_bias` are
+// admitted only as plain FLOAT (float32) tensors here -- this file's own
+// float-tensor helpers (ReadFloatTensor/SetFloatTensorData) have no
+// FLOAT16/BFLOAT16 support anywhere yet, unlike pruning.py's own
+// `_is_supported_float_dtype`, which additionally admits both. Mirrors this
+// file's own already-established narrower-than-pruning.py scope decision
+// (e.g. the "MatMulNBits" section's identical restriction on its own
+// scales/zero_points/bias tensors) -- a FLOAT16/BFLOAT16 MoE export is
+// simply never matched here (declined, not mis-handled).
+//
+// This is exposed as its own top-level entry point (ApplyMoeExpertChannel
+// Pruning, alongside ApplyStructuredPruning/ApplyAttentionHeadPruning at the
+// bottom of this file) rather than folded into ApplyStructuredPruning's own
+// per-graph dispatch: `fc1_experts_weights`/`fc2_experts_weights`/
+// `fc1_experts_bias` are 3-D tensors that no other chain family in this file
+// could ever also match (every other chain-finder requires a rank-2 MatMul/
+// Gemm-shaped or rank-4 Conv-shaped weight), so there is no shared/tied-
+// initializer conflict to guard against between this pass and any of
+// ApplyStructuredPruning's own six chain families -- the touched-initializer
+// bookkeeping below only ever needs to guard MoE nodes against each other
+// (mirrors pruning.py's own `_apply_moe_chains`, whose own local
+// `touched: Set[str]` is likewise never shared with `_TouchedState`).
+
+struct MoEChain {
+  onnx::NodeProto* node;
+  std::string fc1_w;
+  std::optional<std::string> fc1_b;
+  std::string fc2_w;
+  std::optional<std::string> fc2_b;
+  int64_t num_experts;
+  int64_t inter_size;
+  int64_t hidden_size;
+};
+
+const std::unordered_set<std::string>& MoeActivations() {
+  static const std::unordered_set<std::string> kOps = {"relu", "identity",
+                                                       "silu", "gelu"};
+  return kOps;
+}
+
+// One optional-bias input (`fc1_experts_bias`/`fc2_experts_bias`) match
+// result, mirroring pruning.py's own `_optional_bias`'s
+// `Tuple[bool, Optional[str]]` return convention: `ok=false` means the
+// input is PRESENT but fails one of its own checks (declining the WHOLE
+// node, not just that bias), while `ok=true, name=nullopt` means the input
+// is simply absent (a well-formed unbiased MoE node).
+struct MoeOptionalBiasResult {
+  bool ok;
+  std::optional<std::string> name;
+};
+
+MoeOptionalBiasResult MatchMoeOptionalBias(const onnx::NodeProto& node,
+                                           int index, int64_t expected_dim0,
+                                           int64_t expected_dim1,
+                                           const InitMap& init_map,
+                                           const ConsumerMap& consumers_of) {
+  if (node.input_size() <= index || node.input(index).empty()) {
+    return {true, std::nullopt};
+  }
+  const std::string& name = node.input(index);
+  auto it = init_map.find(name);
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT ||
+      it->second->dims_size() != 2 || it->second->dims(0) != expected_dim0 ||
+      it->second->dims(1) != expected_dim1 ||
+      ConsumerCount(consumers_of, name) != 1) {
+    return {false, std::nullopt};
+  }
+  return {true, name};
+}
+
+// If `node` is a `com.microsoft::MoE` node this pass can safely prune the
+// `inter_size` axis of, returns the matched MoEChain -- mirrors pruning.py's
+// own `_match_moe_producer` exactly, check for check, in the same order (see
+// that function's own docstring for the full per-check safety argument).
+std::optional<MoEChain> MatchMoeProducer(onnx::NodeProto* node,
+                                         const InitMap& init_map,
+                                         const ConsumerMap& consumers_of) {
+  if (node->domain() != kComMicrosoftDomain || node->op_type() != "MoE") {
+    return std::nullopt;
+  }
+
+  std::string activation = "relu";
+  int64_t swiglu_fusion = 0;
+  for (const auto& attr : node->attribute()) {
+    if (attr.name() == "activation_type") {
+      activation = attr.s();
+    } else if (attr.name() == "swiglu_fusion") {
+      swiglu_fusion = attr.i();
+    }
+  }
+  if (!MoeActivations().count(activation) || swiglu_fusion != 0) {
+    return std::nullopt;
+  }
+
+  if (node->input_size() > 6 && !node->input(6).empty()) {
+    return std::nullopt;  // fc3_experts_weights present -- no CPU oracle, see
+                          // above.
+  }
+  if (node->input_size() < 5 || node->input(2).empty() ||
+      node->input(4).empty()) {
+    return std::nullopt;
+  }
+  const std::string fc1_w_name = node->input(2);
+  const std::string fc2_w_name = node->input(4);
+  auto fc1_it = init_map.find(fc1_w_name);
+  auto fc2_it = init_map.find(fc2_w_name);
+  if (fc1_it == init_map.end() || fc2_it == init_map.end() ||
+      fc1_it->second->data_type() != onnx::TensorProto::FLOAT ||
+      fc2_it->second->data_type() != onnx::TensorProto::FLOAT ||
+      fc1_it->second->dims_size() != 3 || fc2_it->second->dims_size() != 3 ||
+      ConsumerCount(consumers_of, fc1_w_name) != 1 ||
+      ConsumerCount(consumers_of, fc2_w_name) != 1) {
+    return std::nullopt;
+  }
+  const onnx::TensorProto* fc1_w = fc1_it->second;
+  const onnx::TensorProto* fc2_w = fc2_it->second;
+  const int64_t num_experts = fc1_w->dims(0);
+  const int64_t inter_size = fc1_w->dims(1);
+  const int64_t hidden_size = fc1_w->dims(2);
+  if (fc2_w->dims(0) != num_experts || fc2_w->dims(1) != hidden_size ||
+      fc2_w->dims(2) != inter_size) {
+    return std::nullopt;  // also rules out a fused-swiglu fc1 (doubled row
+                          // count)
+  }
+
+  MoeOptionalBiasResult fc1_b = MatchMoeOptionalBias(
+      *node, 3, num_experts, inter_size, init_map, consumers_of);
+  if (!fc1_b.ok) {
+    return std::nullopt;
+  }
+  MoeOptionalBiasResult fc2_b = MatchMoeOptionalBias(
+      *node, 5, num_experts, hidden_size, init_map, consumers_of);
+  if (!fc2_b.ok) {
+    return std::nullopt;
+  }
+
+  return MoEChain{node,       fc1_w_name,  fc1_b.name, fc2_w_name,
+                  fc2_b.name, num_experts, inter_size, hidden_size};
+}
+
+std::vector<MoEChain> FindMoeChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+
+  std::vector<MoEChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto chain = MatchMoeProducer(node, init_map, consumers_of);
+    if (chain) {
+      chains.push_back(std::move(*chain));
+    }
+  }
+  return chains;
+}
+
+// Combined (root-sum-square) L2-norm importance per `inter_size` channel
+// index, accumulated in float64 (mirrors this file's own established
+// accumulate-then-sqrt-once convention, e.g. ApplyChains's own `importance`
+// loop) over every expert and the full `hidden_size` axis at once -- index
+// `j` is one shared row of fc1 (and, if present, fc1_experts_bias) and one
+// shared column of fc2, across EVERY expert simultaneously (the node's own
+// `[num_experts, inter_size, ...]`/`[num_experts, ..., inter_size]` layout
+// gives every expert the identical `inter_size` axis, with no independent
+// per-expert choice possible), mirroring pruning.py's own `_moe_importance`
+// exactly.
+std::vector<double> MoeImportance(const MoEChain& chain,
+                                  const MutInitMap& init_map) {
+  const int64_t e_n = chain.num_experts;
+  const int64_t inter = chain.inter_size;
+  const int64_t hidden = chain.hidden_size;
+  std::vector<double> squared(static_cast<size_t>(inter), 0.0);
+
+  const std::vector<float> fc1_w = ReadFloatTensor(*init_map.at(chain.fc1_w));
+  for (int64_t e = 0; e < e_n; ++e) {
+    for (int64_t j = 0; j < inter; ++j) {
+      double sq = 0.0;
+      for (int64_t h = 0; h < hidden; ++h) {
+        const double v =
+            fc1_w[static_cast<size_t>((e * inter + j) * hidden + h)];
+        sq += v * v;
+      }
+      squared[static_cast<size_t>(j)] += sq;
+    }
+  }
+
+  const std::vector<float> fc2_w = ReadFloatTensor(*init_map.at(chain.fc2_w));
+  for (int64_t e = 0; e < e_n; ++e) {
+    for (int64_t h = 0; h < hidden; ++h) {
+      for (int64_t j = 0; j < inter; ++j) {
+        const double v =
+            fc2_w[static_cast<size_t>((e * hidden + h) * inter + j)];
+        squared[static_cast<size_t>(j)] += v * v;
+      }
+    }
+  }
+
+  if (chain.fc1_b) {
+    const std::vector<float> fc1_b =
+        ReadFloatTensor(*init_map.at(*chain.fc1_b));
+    for (int64_t e = 0; e < e_n; ++e) {
+      for (int64_t j = 0; j < inter; ++j) {
+        const double v = fc1_b[static_cast<size_t>(e * inter + j)];
+        squared[static_cast<size_t>(j)] += v * v;
+      }
+    }
+  }
+
+  std::vector<double> importance(squared.size());
+  for (size_t i = 0; i < squared.size(); ++i) {
+    importance[i] = std::sqrt(squared[i]);
+  }
+  return importance;
+}
+
+// The actual apply step, mirroring pruning.py's own `_apply_moe_chains`:
+// ranks every `inter_size` index by MoeImportance, drops the lowest-
+// `sparsity`-fraction (at least one always kept), and removes the matching
+// row from fc1_experts_weights/fc1_experts_bias and column from
+// fc2_experts_weights, identically across every expert. `fc2_experts_bias`
+// indexes `hidden_size` (fc2's own *output* axis, not `inter_size`), so it
+// is never sliced here -- exactly like the Python original.
+//
+// `touched` guards only against another MoE node in this SAME graph sharing
+// one of these weights (see this section's own top comment for why that is
+// never a cross-pass concern here) -- a fresh, empty set per call, mirroring
+// pruning.py's own local `touched: Set[str]` inside `_apply_moe_chains`
+// (never the module-wide `_TouchedState` `apply_structured_pruning` uses).
+void ApplyMoeChains(onnx::GraphProto* graph, std::vector<MoEChain>& chains,
+                    double sparsity) {
+  MutInitMap init_map = BuildMutInitMap(graph);
+  std::unordered_set<std::string> touched;
+
+  for (const auto& chain : chains) {
+    std::unordered_set<std::string> weight_names{chain.fc1_w, chain.fc2_w};
+    if (chain.fc1_b) {
+      weight_names.insert(*chain.fc1_b);
+    }
+    bool conflict = false;
+    for (const auto& w : weight_names) {
+      if (touched.count(w)) {
+        conflict = true;
+        break;
+      }
+    }
+    if (conflict) {
+      continue;  // A shared/tied initializer another MoE node already resized.
+    }
+    touched.insert(weight_names.begin(), weight_names.end());
+
+    const int64_t n = chain.inter_size;
+    const int64_t keep_count = std::max<int64_t>(
+        1, n - std::llround(static_cast<double>(n) * sparsity));
+    if (keep_count >= n) {
+      continue;  // Rounds down to nothing for this layer -- no-op.
+    }
+
+    const std::vector<double> importance = MoeImportance(chain, init_map);
+    const std::vector<int64_t> keep =
+        TopKIndicesAscending(importance, keep_count);
+    const int64_t kc = static_cast<int64_t>(keep.size());
+
+    // fc1_experts_weights: [num_experts, inter_size, hidden_size] -- SliceAxis1
+    // slices exactly its own middle (`inter_size`) axis, `inner = hidden_size`.
+    {
+      onnx::TensorProto* fc1_w = init_map.at(chain.fc1_w);
+      const std::vector<float> data = ReadFloatTensor(*fc1_w);
+      const std::vector<float> out = SliceAxis1(
+          data, chain.num_experts, chain.inter_size, chain.hidden_size, keep);
+      SetFloatTensorData(fc1_w, {chain.num_experts, kc, chain.hidden_size},
+                         out);
+    }
+
+    // fc2_experts_weights: [num_experts, hidden_size, inter_size] --
+    // `inter_size` is the LAST axis here; row-major layout makes this
+    // byte-identical to a flat [num_experts * hidden_size, inter_size]
+    // matrix, so the same SliceAxis1 (dim1 = inter_size, inner = 1) slices
+    // exactly that trailing axis without any new slicing routine.
+    {
+      onnx::TensorProto* fc2_w = init_map.at(chain.fc2_w);
+      const std::vector<float> data = ReadFloatTensor(*fc2_w);
+      const std::vector<float> out =
+          SliceAxis1(data, chain.num_experts * chain.hidden_size,
+                     chain.inter_size, 1, keep);
+      SetFloatTensorData(fc2_w, {chain.num_experts, chain.hidden_size, kc},
+                         out);
+    }
+
+    if (chain.fc1_b) {
+      // fc1_experts_bias: [num_experts, inter_size] -- same trailing-axis
+      // shape SliceAxis1 already handles (inner = 1), no reshape needed.
+      onnx::TensorProto* fc1_b = init_map.at(*chain.fc1_b);
+      const std::vector<float> data = ReadFloatTensor(*fc1_b);
+      const std::vector<float> out =
+          SliceAxis1(data, chain.num_experts, chain.inter_size, 1, keep);
+      SetFloatTensorData(fc1_b, {chain.num_experts, kc}, out);
+    }
+    // fc2_experts_bias indexes hidden_size, fc2's own *output* axis --
+    // unaffected by an inter_size cut, so it is never sliced here.
+  }
+}
+
 // --- QMoE (com.microsoft, quantized-weight Mixture-of-Experts) expert-
 // channel structured pruning -------------------------------------------
 //
@@ -12960,6 +13300,37 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
         FindMatMulNBitsQkvChains(graph);
     if (!matmul_nbits_qkv_chains.empty()) {
       ApplyMatMulNBitsQkvChains(graph, matmul_nbits_qkv_chains, sparsity);
+    }
+  }
+  return out;
+}
+
+onnx::ModelProto ApplyMoeExpertChannelPruning(const onnx::ModelProto& model,
+                                              double sparsity) {
+  if (!(sparsity >= 0.0 && sparsity < 1.0)) {
+    throw std::invalid_argument(
+        "ApplyMoeExpertChannelPruning: sparsity must be in [0, 1), got " +
+        std::to_string(sparsity));
+  }
+  onnx::ModelProto out = model;
+
+  // Subgraph-aware (IterSubgraphs, see this file's own "Subgraph recursion"
+  // section comment above): every `com.microsoft::MoE` node is matched and
+  // pruned inside a nested If/Loop/Scan/BeamSearch-family subgraph, at any
+  // nesting depth, exactly as if that subgraph were its own top-level graph
+  // -- each returned GraphProto* gets its own fresh FindMoeChains call and
+  // its own fresh ApplyMoeChains-local `touched` set, mirroring pruning.py's
+  // own `apply_moe_expert_channel_pruning` loop over
+  // `_iter_subgraphs(out.graph)` exactly. Unlike ApplyStructuredPruning/
+  // ApplyAttentionHeadPruning, there is no shared per-graph TouchedState to
+  // thread through here -- see the "MoE (com.microsoft::MoE) expert-
+  // intermediate-channel pruning" section comment above for why no other
+  // chain family in this file could ever also match one of these 3-D
+  // weights.
+  for (onnx::GraphProto* graph : IterSubgraphs(out.mutable_graph())) {
+    std::vector<MoEChain> chains = FindMoeChains(graph);
+    if (!chains.empty()) {
+      ApplyMoeChains(graph, chains, sparsity);
     }
   }
   return out;

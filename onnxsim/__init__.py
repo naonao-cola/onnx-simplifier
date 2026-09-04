@@ -63,6 +63,7 @@ from onnxsim.omniquant import apply_omniquant
 from onnxsim.onnx_simplifier import (
     apply_attention_head_pruning_cpp,
     apply_double_quantization_cpp,
+    apply_moe_expert_channel_pruning_cpp,
     apply_qmoe_expert_channel_pruning_cpp,
     apply_quarot_cpp,
     apply_structured_pruning_cpp,
@@ -205,6 +206,7 @@ __all__ = [
     "apply_attention_head_pruning_cpp",
     "apply_attention_head_wanda_pruning",
     "apply_moe_expert_channel_pruning",
+    "apply_moe_expert_channel_pruning_cpp",
     "apply_moe_whole_expert_pruning",
     "apply_qmoe_expert_channel_pruning",
     "apply_qmoe_expert_channel_pruning_cpp",
