@@ -4163,30 +4163,34 @@ def _apply_conv_pass_through_hop(
     A depthwise ``Conv`` hop's own `group` attribute (`== in_channels ==
     out_channels`) drops to the new channel count right alongside its
     weight/bias, via :func:`_set_conv_group_attr` -- none of
-    `CausalConvWithState`, `InstanceNormalization`, or `PRelu` has any such
-    attribute at all (confirmed via live schema introspection,
+    `CausalConvWithState`, `InstanceNormalization`, `PRelu`, or the decomposed-
+    GroupNorm hop's own trailing `Mul`/`Add` has any such attribute at all
+    (confirmed via live schema introspection,
     ``onnx.defs.get_schema("CausalConvWithState", domain="")``/
     ``onnx.defs.get_schema("InstanceNormalization")``/
-    ``onnx.defs.get_schema("PRelu")``: each of `CausalConvWithState`'s and
+    ``onnx.defs.get_schema("PRelu")``/``onnx.defs.get_schema("Mul")``/
+    ``onnx.defs.get_schema("Add")``: each of `CausalConvWithState`'s and
     `InstanceNormalization`'s own channel count is implied purely by its
-    `weight`/`scale`'s own axis-0 size, and `PRelu` has no
-    channel-count-describing attribute of any kind -- no `group`/
-    channel-count attribute exists on any of them to rewrite), so nothing is
-    rewritten there for any of them -- dispatched purely on
-    `hop.node.op_type`, since only these four op types ever reach this
-    function (see :func:`_match_depthwise_conv_pass_through`/
+    `weight`/`scale`'s own axis-0 size, and neither `PRelu` nor a plain
+    `Mul`/`Add` has any channel-count-describing attribute at all -- no
+    `group`/channel-count attribute exists on any of them to rewrite), so
+    nothing is rewritten there for any of them -- dispatched purely on
+    `hop.node.op_type`, since only these op types ever reach this function
+    (see :func:`_match_depthwise_conv_pass_through`/
     :func:`_match_causal_conv_with_state_pass_through`/
     :func:`_match_instance_norm_pass_through`/
     :func:`_match_instance_norm_pass_through_self`/
-    :func:`_match_prelu_pass_through`/:func:`_match_prelu_pass_through_self`,
-    the only matchers that ever construct a :class:`_ConvPassThrough`).
-    `hop.weight` -- an ``InstanceNormalization`` hop's own `scale`, strictly
-    rank-1 by :func:`_match_instance_norm_pass_through`'s own bar, or a
-    ``PRelu`` hop's own `slope`, ``[C, 1, ..., 1]`` -- is sliced by the same
-    axis-0 :func:`_slice_producer_weight` call below as a depthwise Conv's
-    weight; for a rank-1 tensor that is exactly the same slice
+    :func:`_match_prelu_pass_through`/:func:`_match_prelu_pass_through_self`/
+    :func:`_match_decomposed_group_norm_pass_through`, the only matchers that
+    ever construct a :class:`_ConvPassThrough`). `hop.weight` -- an
+    ``InstanceNormalization`` hop's own `scale`, strictly rank-1 by
+    :func:`_match_instance_norm_pass_through`'s own bar, a ``PRelu`` hop's own
+    `slope`, or the decomposed-GroupNorm hop's own `gamma`/`beta` (each of the
+    latter two ``[C, 1, ..., 1]``) -- is sliced by the same axis-0
+    :func:`_slice_producer_weight` call below as a depthwise Conv's weight;
+    for a rank-1 tensor that is exactly the same slice
     :func:`_slice_last_axis`'s own axis ``-1`` would produce, so no dedicated
-    branch is needed for either here.
+    branch is needed for any of them here.
     """
     _slice_producer_weight(initializer_map[hop.weight], False, keep, is_conv=True)
     if hop.bias is not None:
