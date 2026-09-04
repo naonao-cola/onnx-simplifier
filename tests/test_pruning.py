@@ -34301,3 +34301,546 @@ def test_apply_structured_pruning_dynamic_quantize_matmul_registered_in_sensitiv
         onnxsim.apply_structured_pruning_dynamic_quantize_matmul
         in onnxsim.pruning._SENSITIVITY_ANALYZERS
     )
+
+
+# --- Subgraph recursion --------------------------------------------------
+#
+# Covers :func:`onnxsim.pruning._iter_subgraphs` and the four entry points
+# built on it (:func:`apply_structured_pruning`, :func:`apply_magnitude_pruning`,
+# :func:`apply_attention_head_pruning`, :func:`weight_sparsity`) -- see
+# ``onnxsim/pruning.py``'s own top-of-file docstring, the "Subgraph
+# recursion" section comment directly above :func:`_iter_subgraphs`'s own
+# definition, and each of those four functions' own docstrings for the
+# full design.
+#
+# ``onnx.parser.parse_model``'s text format has no way to spell a
+# graph-typed node attribute (an ``If``'s ``then_branch``/``else_branch``),
+# so every model built below uses ``onnx.helper.make_node``/``make_graph``
+# directly instead, per this repo's own CLAUDE.md guidance for exactly
+# this case.
+
+
+def _mlp_branch_nodes(K, H, Out, prefix, seed):
+    # A minimal MatMul(Gemm)->Relu->MatMul chain, exactly
+    # :func:`_mlp_model`'s own shape, but returning bare
+    # nodes/initializers (not a whole model) so it can be dropped into a
+    # subgraph's own `node`/`initializer` lists.
+    rng = np.random.default_rng(seed)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    b1 = rng.standard_normal((H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    nodes = [
+        onnx.helper.make_node(
+            "Gemm", ["Xb", f"{prefix}W1", f"{prefix}B1"], [f"{prefix}h"]
+        ),
+        onnx.helper.make_node("Relu", [f"{prefix}h"], [f"{prefix}a"]),
+        onnx.helper.make_node("MatMul", [f"{prefix}a", f"{prefix}W2"], ["Yb"]),
+    ]
+    inits = [
+        _f32(w1, f"{prefix}W1"),
+        _f32(b1, f"{prefix}B1"),
+        _f32(w2, f"{prefix}W2"),
+    ]
+    return nodes, inits, dict(w1=w1, b1=b1, w2=w2)
+
+
+def _if_wrapped_mlp_model(K0=8, H0=16, Out0=4, K1=6, H1=12, OutB=3):
+    """A top-level MatMul(Gemm)->Relu->MatMul chain (`W1t`/`W2t`) PLUS an
+    ``If`` node whose `then_branch`/`else_branch` each carry their OWN
+    independent, identically-shaped MLP chain (`then_*`/`else_*`), with
+    their own weights living only in that branch's own `initializer` list
+    -- the core repro from this module's own subgraph-recursion
+    investigation: real prunable compute inside a plain ``If``'s branches,
+    invisible to every pass in this module before :func:`_iter_subgraphs`.
+    `Xb` (the branch chains' shared activation input) is an ordinary
+    top-level graph input, read by both branches purely via implicit
+    capture (an ``If`` branch subgraph takes no formal inputs of its own).
+    `cond` selects which branch actually executes at run time -- the
+    caller drives both `True` and `False` through `InferenceSession` to
+    exercise (and verify) both branches' own pruning independently, not
+    just whichever one happens to be tested first.
+    """
+    rng = np.random.default_rng(0)
+    w1t = rng.standard_normal((K0, H0)).astype(np.float32)
+    b1t = rng.standard_normal((H0,)).astype(np.float32)
+    w2t = rng.standard_normal((H0, Out0)).astype(np.float32)
+    top_nodes = [
+        onnx.helper.make_node("Gemm", ["X0", "W1t", "B1t"], ["ht"]),
+        onnx.helper.make_node("Relu", ["ht"], ["at"]),
+        onnx.helper.make_node("MatMul", ["at", "W2t"], ["Y0"]),
+    ]
+    top_inits = [_f32(w1t, "W1t"), _f32(b1t, "B1t"), _f32(w2t, "W2t")]
+
+    then_nodes, then_inits, then_cfg = _mlp_branch_nodes(K1, H1, OutB, "then_", seed=1)
+    else_nodes, else_inits, else_cfg = _mlp_branch_nodes(K1, H1, OutB, "else_", seed=2)
+
+    out_vi = onnx.helper.make_tensor_value_info(
+        "Yb", onnx.TensorProto.FLOAT, ["batch", OutB]
+    )
+    then_graph = onnx.helper.make_graph(
+        then_nodes, "then_graph", [], [out_vi], initializer=then_inits
+    )
+    else_graph = onnx.helper.make_graph(
+        else_nodes, "else_graph", [], [out_vi], initializer=else_inits
+    )
+    if_node = onnx.helper.make_node(
+        "If", ["cond"], ["Y1"], then_branch=then_graph, else_branch=else_graph
+    )
+
+    x0 = onnx.helper.make_tensor_value_info("X0", onnx.TensorProto.FLOAT, ["batch", K0])
+    xb = onnx.helper.make_tensor_value_info("Xb", onnx.TensorProto.FLOAT, ["batch", K1])
+    cond = onnx.helper.make_tensor_value_info("cond", onnx.TensorProto.BOOL, [])
+    y0 = onnx.helper.make_tensor_value_info(
+        "Y0", onnx.TensorProto.FLOAT, ["batch", Out0]
+    )
+    y1 = onnx.helper.make_tensor_value_info(
+        "Y1", onnx.TensorProto.FLOAT, ["batch", OutB]
+    )
+
+    graph = onnx.helper.make_graph(
+        [*top_nodes, if_node],
+        "g",
+        [x0, xb, cond],
+        [y0, y1],
+        initializer=top_inits,
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    return model, dict(w1t=w1t, b1t=b1t, w2t=w2t, then=then_cfg, else_=else_cfg)
+
+
+def _then_else_graphs(pruned_model):
+    if_node = next(n for n in pruned_model.graph.node if n.op_type == "If")
+    then_g = else_g = None
+    for attr in if_node.attribute:
+        if attr.name == "then_branch":
+            then_g = attr.g
+        elif attr.name == "else_branch":
+            else_g = attr.g
+    return then_g, else_g
+
+
+def test_iter_subgraphs_returns_only_top_graph_when_no_subgraphs_present():
+    # The regression-safety invariant every subgraph-aware function relies
+    # on: a model with no If/Loop/Scan node at all makes the new
+    # subgraph-aware loop run its existing per-graph body exactly once, on
+    # exactly the graph it always ran on -- byte-identical to before this
+    # change, not merely "close."
+    model = _mlp_model(K=8, H=32, Out=4)
+    graphs = onnxsim.pruning._iter_subgraphs(model.graph)
+    assert graphs == [model.graph]
+
+
+def test_iter_subgraphs_finds_nested_if_branches_recursively():
+    model, _cfg = _if_wrapped_mlp_model()
+    graphs = onnxsim.pruning._iter_subgraphs(model.graph)
+    names = [g.name for g in graphs]
+    # `graph` itself always comes first; `then_branch`/`else_branch` are
+    # each found (order between the two sibling branches isn't itself
+    # semantically meaningful -- only that both are reached).
+    assert names[0] == "g"
+    assert sorted(names[1:]) == ["else_graph", "then_graph"]
+
+
+def test_structured_pruning_no_subgraphs_matches_pre_existing_oracle_exactly():
+    # Same scenario (and same oracle) as
+    # test_structured_pruning_matches_manual_channel_deletion_exactly --
+    # restated here explicitly as this change's own regression-safety
+    # test: a subgraph-free model's pruning output is unaffected by
+    # apply_structured_pruning becoming subgraph-aware.
+    K, H, Out = 8, 32, 4
+    model = _mlp_model(K=K, H=H, Out=Out, bias=True)
+    orig = {t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer}
+    w1, b1, w2 = orig["W1"], orig["B1"], orig["W2"]
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    keep = _oracle_keep_indices(w1, H // 2)
+
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal((6, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    h = x @ w1[:, keep] + b1[keep]
+    a = np.maximum(h, 0)
+    y_oracle = a @ w2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_prunes_top_level_and_both_if_branches():
+    # The core repro: apply_structured_pruning must now match and prune
+    # the chain inside BOTH `then_branch` and `else_branch` (each with its
+    # own independent weights), not just the top-level chain -- verified
+    # both by initializer shape and by driving real execution (through
+    # InferenceSession) into EACH branch via `cond`, comparing against an
+    # independently reconstructed "already pruned" numpy oracle for that
+    # branch's own weights, plus a full-model onnx.checker.check_model
+    # pass on the pruned model (including its subgraphs).
+    K0, H0, Out0 = 8, 16, 4
+    K1, H1, OutB = 6, 12, 3
+    model, cfg = _if_wrapped_mlp_model(K0=K0, H0=H0, Out0=Out0, K1=K1, H1=H1, OutB=OutB)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    top_inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(top_inits["W1t"].dims) == [K0, H0 // 2]
+    assert list(top_inits["W2t"].dims) == [H0 // 2, Out0]
+
+    then_g, else_g = _then_else_graphs(pruned)
+    then_inits = {t.name: t for t in then_g.initializer}
+    else_inits = {t.name: t for t in else_g.initializer}
+    assert list(then_inits["then_W1"].dims) == [K1, H1 // 2]
+    assert list(then_inits["then_W2"].dims) == [H1 // 2, OutB]
+    assert list(else_inits["else_W1"].dims) == [K1, H1 // 2]
+    assert list(else_inits["else_W2"].dims) == [H1 // 2, OutB]
+
+    rng = np.random.default_rng(5)
+    x0 = rng.standard_normal((3, K0)).astype(np.float32)
+    xb = rng.standard_normal((3, K1)).astype(np.float32)
+
+    y0_true, y1_then = _run(pruned, {"X0": x0, "Xb": xb, "cond": np.array(True)})
+    y0_false, y1_else = _run(pruned, {"X0": x0, "Xb": xb, "cond": np.array(False)})
+
+    def _oracle(branch_cfg, keep_count):
+        w1, b1, w2 = branch_cfg["w1"], branch_cfg["b1"], branch_cfg["w2"]
+        keep = _oracle_keep_indices(w1, keep_count)
+        h = xb @ w1[:, keep] + b1[keep]
+        a = np.maximum(h, 0)
+        return a @ w2[keep, :]
+
+    np.testing.assert_allclose(
+        y1_then, _oracle(cfg["then"], H1 // 2), rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        y1_else, _oracle(cfg["else_"], H1 // 2), rtol=1e-5, atol=1e-5
+    )
+
+    keep_top = _oracle_keep_indices(cfg["w1t"], H0 // 2)
+    h0 = x0 @ cfg["w1t"][:, keep_top] + cfg["b1t"][keep_top]
+    a0 = np.maximum(h0, 0)
+    y0_oracle = a0 @ cfg["w2t"][keep_top, :]
+    np.testing.assert_allclose(y0_true, y0_oracle, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(y0_false, y0_oracle, rtol=1e-5, atol=1e-5)
+
+
+def _implicit_capture_model(K=6, H=12, Out=5, seed=3):
+    """A ``then_branch`` whose own producer (`W1`) and Relu look exactly
+    like the first half of an ordinary matchable chain, but whose
+    "consumer" MatMul reads `W_shared` -- a weight that exists ONLY in the
+    TOP-LEVEL graph's own `initializer` list, reached from inside the
+    subgraph purely by implicit capture. `W_shared` is also given a
+    genuine top-level use (`Identity`) so it's an ordinary, real top-level
+    initializer, not merely dead weight the subgraph happens to name.
+    """
+    rng = np.random.default_rng(seed)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    b1 = rng.standard_normal((H,)).astype(np.float32)
+    w_shared = rng.standard_normal((H, Out)).astype(np.float32)
+
+    then_nodes = [
+        onnx.helper.make_node("Gemm", ["Xb", "W1", "B1"], ["h"]),
+        onnx.helper.make_node("Relu", ["h"], ["a"]),
+        onnx.helper.make_node("MatMul", ["a", "W_shared"], ["Yb"]),
+    ]
+    then_inits = [_f32(w1, "W1"), _f32(b1, "B1")]
+    out_vi = onnx.helper.make_tensor_value_info(
+        "Yb", onnx.TensorProto.FLOAT, ["batch", Out]
+    )
+    then_graph = onnx.helper.make_graph(
+        then_nodes, "then_graph", [], [out_vi], initializer=then_inits
+    )
+
+    w_else = rng.standard_normal((K, Out)).astype(np.float32)
+    else_nodes = [onnx.helper.make_node("MatMul", ["Xb", "WElse"], ["Yb"])]
+    else_inits = [_f32(w_else, "WElse")]
+    else_graph = onnx.helper.make_graph(
+        else_nodes, "else_graph", [], [out_vi], initializer=else_inits
+    )
+
+    if_node = onnx.helper.make_node(
+        "If", ["cond"], ["Y1"], then_branch=then_graph, else_branch=else_graph
+    )
+    top_nodes = [
+        if_node,
+        onnx.helper.make_node("Identity", ["W_shared"], ["WSharedOut"]),
+    ]
+
+    xb = onnx.helper.make_tensor_value_info("Xb", onnx.TensorProto.FLOAT, ["batch", K])
+    cond = onnx.helper.make_tensor_value_info("cond", onnx.TensorProto.BOOL, [])
+    y1 = onnx.helper.make_tensor_value_info(
+        "Y1", onnx.TensorProto.FLOAT, ["batch", Out]
+    )
+    wshared_out = onnx.helper.make_tensor_value_info(
+        "WSharedOut", onnx.TensorProto.FLOAT, [H, Out]
+    )
+
+    graph = onnx.helper.make_graph(
+        top_nodes,
+        "g",
+        [xb, cond],
+        [y1, wshared_out],
+        initializer=[_f32(w_shared, "W_shared")],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    return model, dict(w1=w1, b1=b1, w_shared=w_shared)
+
+
+def test_structured_pruning_declines_chain_needing_implicitly_captured_parent_weight():
+    # The correctness subtlety this module's own "Subgraph recursion"
+    # section comment calls out by name: a subgraph chain that would
+    # otherwise match, except its consumer weight only resolves via
+    # implicit capture from the PARENT graph's own initializer list, must
+    # be declined outright -- never matched by mistakenly reaching into
+    # the parent's own initializer_map, and never corrupting that parent
+    # initializer (which a sibling/parent pass legitimately also uses).
+    model, cfg = _implicit_capture_model()
+
+    then_g, _else_g = onnxsim.pruning._iter_subgraphs(model.graph)[1:3][0], None
+    chains = onnxsim.pruning._find_chains(then_g)
+    assert chains == []  # declined: W_shared isn't in then_graph's own initializer
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    top_inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(top_inits["W_shared"].dims) == list(cfg["w_shared"].shape)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(top_inits["W_shared"]), cfg["w_shared"]
+    )
+
+    then_g_pruned, _else_g_pruned = _then_else_graphs(pruned)
+    then_inits = {t.name: t for t in then_g_pruned.initializer}
+    assert list(then_inits["W1"].dims) == list(cfg["w1"].shape)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(then_inits["W1"]), cfg["w1"]
+    )
+
+    rng = np.random.default_rng(9)
+    xb = rng.standard_normal((3, 6)).astype(np.float32)
+    (y1, _wshared_out) = _run(pruned, {"Xb": xb, "cond": np.array(True)})
+    assert y1.shape == (3, 5)
+
+
+def test_weight_sparsity_counts_subgraph_initializers_too():
+    # Deliberately leave every TOP-LEVEL initializer untouched (so a
+    # top-level-only computation would report exactly 0.0) and zero out
+    # only a nested subgraph's own weight -- the sharpest possible
+    # demonstration that weight_sparsity's own pooled number really does
+    # include subgraph weights, not merely "a slightly different number
+    # that happens not to contradict it."
+    model, _cfg = _if_wrapped_mlp_model()
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+
+    then_g, _else_g = _then_else_graphs(out)
+    then_inits = {t.name: t for t in then_g.initializer}
+    then_w1 = onnx.numpy_helper.to_array(then_inits["then_W1"]).copy()
+    then_w1[:] = 0.0
+    then_inits["then_W1"].CopyFrom(
+        onnx.numpy_helper.from_array(then_w1, name="then_W1")
+    )
+
+    reported = onnxsim.weight_sparsity(out)
+
+    top_level_only_zeros = 0
+    top_level_only_total = 0
+    top_level_imap = {t.name: t for t in out.graph.initializer}
+    for _, _, w_name, _, _ in onnxsim.pruning._candidates(out.graph):
+        w = onnx.numpy_helper.to_array(top_level_imap[w_name])
+        top_level_only_zeros += int(np.count_nonzero(w == 0))
+        top_level_only_total += w.size
+    assert top_level_only_zeros == 0  # nothing at the top level was touched
+
+    zeros = 0
+    total = 0
+    for g in onnxsim.pruning._iter_subgraphs(out.graph):
+        imap = {t.name: t for t in g.initializer}
+        for _, _, w_name, _, _ in onnxsim.pruning._candidates(g):
+            w = onnx.numpy_helper.to_array(imap[w_name])
+            zeros += int(np.count_nonzero(w == 0))
+            total += w.size
+    expected = zeros / total
+
+    assert expected > 0.0  # the subgraph's own zeroed weight does count
+    assert reported == pytest.approx(expected)
+    # Strictly more than the (zero) top-level-only number -- the
+    # pre-existing top-level-only computation this module's own "Subgraph
+    # recursion" section comment says would otherwise be actively
+    # misleading, not merely incomplete.
+    assert reported > top_level_only_zeros / max(top_level_only_total, 1)
+
+
+def test_magnitude_pruning_masks_subgraph_weights():
+    model, _cfg = _if_wrapped_mlp_model()
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    top_inits = {t.name: t for t in pruned.graph.initializer}
+    w1t = onnx.numpy_helper.to_array(top_inits["W1t"])
+    assert np.mean(w1t == 0) == pytest.approx(0.5, abs=0.05)
+
+    then_g, else_g = _then_else_graphs(pruned)
+    then_inits = {t.name: t for t in then_g.initializer}
+    else_inits = {t.name: t for t in else_g.initializer}
+    then_w1 = onnx.numpy_helper.to_array(then_inits["then_W1"])
+    else_w1 = onnx.numpy_helper.to_array(else_inits["else_W1"])
+    assert np.mean(then_w1 == 0) == pytest.approx(0.5, abs=0.05)
+    assert np.mean(else_w1 == 0) == pytest.approx(0.5, abs=0.05)
+
+
+def test_magnitude_pruning_global_sparsity_pools_across_top_level_and_subgraphs():
+    model, _cfg = _if_wrapped_mlp_model()
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.3, global_sparsity=True)
+    onnx.checker.check_model(pruned)
+
+    top_inits = {t.name: t for t in pruned.graph.initializer}
+    then_g, else_g = _then_else_graphs(pruned)
+    then_inits = {t.name: t for t in then_g.initializer}
+    else_inits = {t.name: t for t in else_g.initializer}
+
+    total = 0
+    zeros = 0
+    for name_map, names in [
+        (top_inits, ["W1t", "W2t"]),
+        (then_inits, ["then_W1", "then_W2"]),
+        (else_inits, ["else_W1", "else_W2"]),
+    ]:
+        for name in names:
+            arr = onnx.numpy_helper.to_array(name_map[name])
+            total += arr.size
+            zeros += int(np.count_nonzero(arr == 0))
+
+    # One single global cutoff pooled across every matched layer in every
+    # graph -- not each graph/layer independently hitting 0.3 on its own.
+    assert zeros / total == pytest.approx(0.3, abs=0.02)
+
+
+def _attention_branch_nodes(K, H, D, Out, prefix, seed):
+    rng = np.random.default_rng(seed)
+    Nq = Nk = Nv = H * D
+    wqkv = rng.standard_normal((K, Nq + Nk + Nv)).astype(np.float32)
+    bqkv = rng.standard_normal((Nq + Nk + Nv,)).astype(np.float32)
+    wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+    nodes = [
+        onnx.helper.make_node(
+            "Attention",
+            ["Xb", f"{prefix}Wqkv", f"{prefix}Bqkv"],
+            [f"{prefix}ctx"],
+            domain="com.microsoft",
+            num_heads=H,
+            qkv_hidden_sizes=[Nq, Nk, Nv],
+        ),
+        onnx.helper.make_node("MatMul", [f"{prefix}ctx", f"{prefix}Wout"], ["Yb"]),
+    ]
+    inits = [
+        _f32(wqkv, f"{prefix}Wqkv"),
+        _f32(bqkv, f"{prefix}Bqkv"),
+        _f32(wout, f"{prefix}Wout"),
+    ]
+    return nodes, inits
+
+
+def _if_attention_model(K=8, H=4, D=4, Out=6):
+    then_nodes, then_inits = _attention_branch_nodes(K, H, D, Out, "then_", seed=1)
+    else_nodes, else_inits = _attention_branch_nodes(K, H, D, Out, "else_", seed=2)
+    out_vi = onnx.helper.make_tensor_value_info(
+        "Yb", onnx.TensorProto.FLOAT, ["batch", "seq", Out]
+    )
+    then_graph = onnx.helper.make_graph(
+        then_nodes, "then_graph", [], [out_vi], initializer=then_inits
+    )
+    else_graph = onnx.helper.make_graph(
+        else_nodes, "else_graph", [], [out_vi], initializer=else_inits
+    )
+    if_node = onnx.helper.make_node(
+        "If", ["cond"], ["Y1"], then_branch=then_graph, else_branch=else_graph
+    )
+    xb = onnx.helper.make_tensor_value_info(
+        "Xb", onnx.TensorProto.FLOAT, ["batch", "seq", K]
+    )
+    cond = onnx.helper.make_tensor_value_info("cond", onnx.TensorProto.BOOL, [])
+    y1 = onnx.helper.make_tensor_value_info(
+        "Y1", onnx.TensorProto.FLOAT, ["batch", "seq", Out]
+    )
+    graph = onnx.helper.make_graph([if_node], "g", [xb, cond], [y1])
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 17),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_attention_head_pruning_prunes_blocks_inside_if_branches():
+    K, H, D, Out = 8, 4, 4, 6
+    model = _if_attention_model(K=K, H=H, D=D, Out=Out)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    then_g, else_g = _then_else_graphs(pruned)
+    for g, prefix in [(then_g, "then_"), (else_g, "else_")]:
+        inits = {t.name: t for t in g.initializer}
+        assert list(inits[f"{prefix}Wqkv"].dims) == [K, 3 * (H // 2) * D]
+        assert list(inits[f"{prefix}Wout"].dims) == [(H // 2) * D, Out]
+        node = next(n for n in g.node if n.op_type == "Attention")
+        num_heads = next(a.i for a in node.attribute if a.name == "num_heads")
+        assert num_heads == H // 2
+
+    rng = np.random.default_rng(4)
+    xb = rng.standard_normal((2, 3, K)).astype(np.float32)
+    (y_then,) = _run(pruned, {"Xb": xb, "cond": np.array(True)})
+    (y_else,) = _run(pruned, {"Xb": xb, "cond": np.array(False)})
+    assert y_then.shape == (2, 3, Out)
+    assert y_else.shape == (2, 3, Out)
+    assert np.all(np.isfinite(y_then))
+    assert np.all(np.isfinite(y_else))
+
+
+def test_wanda_pruning_still_leaves_subgraph_weights_untouched_documented_gap():
+    # apply_wanda_pruning is a calibration-data-driven function --
+    # deliberately NOT made subgraph-aware by this change (see this
+    # module's own top-of-file docstring, "Deliberately NOT subgraph-aware
+    # yet"). This test documents that gap explicitly: the top-level chain
+    # is pruned as always, but the subgraph's own identical chain is left
+    # completely, byte-for-byte untouched -- not approximated, not
+    # partially handled, exactly the same blind spot every function in
+    # this module had for every subgraph before this change, still true
+    # here on purpose.
+    model, cfg = _if_wrapped_mlp_model()
+
+    rng = np.random.default_rng(11)
+    calibration_data = [
+        {
+            "X0": rng.standard_normal((4, 8)).astype(np.float32),
+            "Xb": rng.standard_normal((4, 6)).astype(np.float32),
+            "cond": np.array(True),
+        }
+        for _ in range(3)
+    ]
+
+    pruned = onnxsim.apply_wanda_pruning(
+        model, sparsity=0.5, calibration_data=calibration_data
+    )
+    onnx.checker.check_model(pruned)
+
+    top_inits = {t.name: t for t in pruned.graph.initializer}
+    w1t = onnx.numpy_helper.to_array(top_inits["W1t"])
+    assert np.mean(w1t == 0) == pytest.approx(0.5, abs=0.05)  # top-level: pruned
+
+    then_g, _else_g = _then_else_graphs(pruned)
+    then_inits = {t.name: t for t in then_g.initializer}
+    then_w1 = onnx.numpy_helper.to_array(then_inits["then_W1"])
+    np.testing.assert_array_equal(then_w1, cfg["then"]["w1"])  # subgraph: untouched
