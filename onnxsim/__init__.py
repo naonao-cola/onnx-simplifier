@@ -40,6 +40,7 @@ from onnxsim.embedding_quantization import (
     quantize_embedding_int8,
 )
 from onnxsim.finetune import apply_pruning_finetune
+from onnxsim.flexround import apply_flexround
 from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
@@ -157,6 +158,7 @@ __all__ = [
     "apply_awq",
     "apply_attention_quantization",
     "apply_gptq",
+    "apply_flexround",
     "apply_smoothquant",
     "apply_outlier_suppression_plus",
     "apply_llm_int8",
