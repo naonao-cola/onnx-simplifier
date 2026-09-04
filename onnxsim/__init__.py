@@ -99,6 +99,7 @@ from onnxsim.ort_matmul_nbits_workaround import workaround_ort_matmul_nbits_axis
 from onnxsim.outlier_suppression import apply_outlier_suppression
 from onnxsim.outlier_suppression_plus import apply_outlier_suppression_plus
 from onnxsim.owq import apply_owq
+from onnxsim.pb_llm import quantize_weight_only_pb_llm
 from onnxsim.precision_estimator import (
     ModelQuantizationEstimate,
     estimate_model_quantization_drop,
@@ -223,6 +224,7 @@ __all__ = [
     "quantize_weight_only",
     "quantize_weight_only_int4",
     "quantize_weight_only_billm",
+    "quantize_weight_only_pb_llm",
     "quantize_weight_only_int4_hqq",
     "quantize_weight_only_kmeans",
     "quantize_weight_only_nf4",
