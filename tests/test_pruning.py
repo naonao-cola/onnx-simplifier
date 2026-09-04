@@ -4,6 +4,7 @@ pruning, see ``onnxsim/pruning.py``.
 """
 
 import os
+import tempfile
 
 import ml_dtypes
 import numpy as np
@@ -32550,5 +32551,639 @@ def test_analyze_structured_pruning_qoperator_reports_not_eligible():
 def test_apply_structured_pruning_qoperator_registered_in_sensitivity_analyzers():
     assert (
         onnxsim.apply_structured_pruning_qoperator
+        in onnxsim.pruning._SENSITIVITY_ANALYZERS
+    )
+
+
+# --- DynamicQuantizeMatMul / MatMulIntegerToFloat --------------------------
+#
+# ``com.microsoft::DynamicQuantizeMatMul``/``MatMulIntegerToFloat`` are ONNX
+# Runtime graph-optimizer FUSIONS of the dynamic-quantization MatMul pattern
+# ``onnxruntime.quantization.quantize_dynamic()`` emits
+# (``DynamicQuantizeLinear -> MatMulInteger -> Cast -> Mul``) -- see
+# onnxsim/pruning.py's own "DynamicQuantizeMatMul / MatMulIntegerToFloat"
+# section comment for the full empirical investigation this pass's scope
+# was reached from (live schema introspection, the real fused node
+# sequences reproduced via a genuine ``quantize_dynamic`` ->
+# ``InferenceSession``-optimize round trip, and why every scope boundary is
+# drawn where it is).
+#
+# Fixture weights are quantized via the REAL
+# ``onnxruntime.quantization.quantize_dynamic`` tool -- never a hand-rolled
+# re-implementation of the quantization scheme -- by wrapping each weight in
+# a minimal ``Y = MatMul(X, W)`` model, running the real tool on it, and
+# reading back its own emitted ``W_quantized``/``W_scale``/``W_zero_point``
+# initializers (:func:`_quantize_dynamic_weight`). The graph skeleton
+# actually under test is then built directly via ``onnx.parser.parse_model``
+# (this file's own ``_model`` helper) with those genuine quantized tensors
+# attached programmatically afterward -- the same "real quantizer for
+# fixtures, parser for graph structure" pattern this repo's own CLAUDE.md
+# and the MatMulBnb4-round tests above establish (the scale/zero-point/int8
+# tensors need real array data a parser text literal can't spell out).
+#
+# One test below (`test_dynamic_quantize_matmul_real_quantize_dynamic_pipeline_end_to_end`)
+# goes further still: it runs the REAL ``quantize_dynamic`` tool on a plain
+# float model AND a real ``InferenceSession``'s default graph optimization
+# on the result -- the exact same two-step reproduction this section's own
+# top comment describes -- so that test's own fixture is not merely
+# *quantized* by real tooling but *fused* by it too, the strongest
+# confirmation available that this pass matches what a real deployment
+# graph actually looks like.
+
+
+def _quantize_dynamic_weight(W, per_channel=True):
+    """Runs the REAL ``onnxruntime.quantization.quantize_dynamic`` tool on a
+    minimal ``Y = MatMul(X, W)`` wrapper model and returns the genuine
+    quantized ``(W_int8[K,N], W_scale, W_zero_point)`` triple it emits for
+    `W` -- never a hand-rolled re-implementation of the quantization
+    scheme.
+    """
+    from onnxruntime.quantization import QuantType, quantize_dynamic
+
+    K, N = W.shape
+    src = _model(
+        f"""
+        g (float[1,{K}] X) => (float[1,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(W, "W")],
+        opset=21,
+    )
+    with tempfile.TemporaryDirectory() as d:
+        src_path = os.path.join(d, "src.onnx")
+        dst_path = os.path.join(d, "dst.onnx")
+        onnx.save(src, src_path)
+        quantize_dynamic(
+            src_path, dst_path, per_channel=per_channel, weight_type=QuantType.QInt8
+        )
+        q = onnx.load(dst_path)
+    inits = {t.name: t for t in q.graph.initializer}
+    Wq = onnx.numpy_helper.to_array(inits["W_quantized"]).copy()
+    Wscale = onnx.numpy_helper.to_array(inits["W_scale"]).copy()
+    Wzp = onnx.numpy_helper.to_array(inits["W_zero_point"]).copy()
+    return Wq, Wscale, Wzp
+
+
+def _dqmm_model_from_weights(
+    K, N1, N2, W1f, W2f, per_channel=True, activation="Relu", B1f=None, seed=0
+):
+    """Builds ``DynamicQuantizeMatMul(mm1) -> activation ->
+    DynamicQuantizeMatMul(mm2)`` -- a same-family chain -- from explicit
+    float weights, quantized via the real tool (:func:`_quantize_dynamic_weight`).
+    Returns ``(model, info)`` where `info` carries every float/quantized
+    array needed to hand-build an "already pruned" oracle.
+    """
+    W1q, W1s, W1zp = _quantize_dynamic_weight(W1f, per_channel)
+    W2q, W2s, W2zp = _quantize_dynamic_weight(W2f, per_channel)
+
+    bias_arg = ", B1" if B1f is not None else ""
+    body = f"""
+    g (float[1,{K}] X) => (float[1,{N2}] Y)
+    {{
+      h1 = com.microsoft.DynamicQuantizeMatMul(X, W1, W1_scale, W1_zero_point{bias_arg})
+      h1_act = {activation}(h1)
+      Y = com.microsoft.DynamicQuantizeMatMul(h1_act, W2, W2_scale, W2_zero_point)
+    }}
+    """
+    inits = [
+        onnx.numpy_helper.from_array(W1q, "W1"),
+        onnx.numpy_helper.from_array(W1s, "W1_scale"),
+        onnx.numpy_helper.from_array(W1zp, "W1_zero_point"),
+        onnx.numpy_helper.from_array(W2q, "W2"),
+        onnx.numpy_helper.from_array(W2s, "W2_scale"),
+        onnx.numpy_helper.from_array(W2zp, "W2_zero_point"),
+    ]
+    if B1f is not None:
+        inits.append(_f32(B1f, "B1"))
+    model = _model(body, initializer=inits, opset=21)
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    return model, {
+        "W1f": W1f,
+        "W2f": W2f,
+        "B1f": B1f,
+        "W1q": W1q,
+        "W1s": W1s,
+        "W1zp": W1zp,
+        "W2q": W2q,
+        "W2s": W2s,
+        "W2zp": W2zp,
+    }
+
+
+def _dqmm_chain_model(
+    K, N1, N2, per_channel=True, activation="Relu", bias1=False, seed=0
+):
+    rng = np.random.default_rng(seed)
+    W1f = (rng.standard_normal((K, N1)) * 0.3).astype(np.float32)
+    W2f = (rng.standard_normal((N1, N2)) * 0.3).astype(np.float32)
+    B1f = (rng.standard_normal(N1) * 0.05).astype(np.float32) if bias1 else None
+    return _dqmm_model_from_weights(
+        K, N1, N2, W1f, W2f, per_channel=per_channel, activation=activation, B1f=B1f
+    )
+
+
+def _dqmm_mixed_model(K, N1, N2, per_channel=True, quantized="producer", seed=0):
+    """`quantized="producer"`: ``DynamicQuantizeMatMul(mm1) -> Relu ->
+    plain MatMul(mm2)``. `quantized="consumer"`: ``plain MatMul(mm1) ->
+    Relu -> DynamicQuantizeMatMul(mm2)``. Mirrors the real partial-
+    quantization shape confirmed via `quantize_dynamic`'s own
+    `nodes_to_exclude` (see onnxsim/pruning.py's own section comment).
+    """
+    rng = np.random.default_rng(seed)
+    W1f = (rng.standard_normal((K, N1)) * 0.3).astype(np.float32)
+    W2f = (rng.standard_normal((N1, N2)) * 0.3).astype(np.float32)
+    if quantized == "producer":
+        W1q, W1s, W1zp = _quantize_dynamic_weight(W1f, per_channel)
+        body = f"""
+        g (float[1,{K}] X) => (float[1,{N2}] Y)
+        {{
+          h1 = com.microsoft.DynamicQuantizeMatMul(X, W1, W1_scale, W1_zero_point)
+          h1_act = Relu(h1)
+          Y = MatMul(h1_act, W2)
+        }}
+        """
+        inits = [
+            onnx.numpy_helper.from_array(W1q, "W1"),
+            onnx.numpy_helper.from_array(W1s, "W1_scale"),
+            onnx.numpy_helper.from_array(W1zp, "W1_zero_point"),
+            _f32(W2f, "W2"),
+        ]
+        info = {"W1f": W1f, "W1q": W1q, "W1s": W1s, "W1zp": W1zp, "W2f": W2f}
+    else:
+        W2q, W2s, W2zp = _quantize_dynamic_weight(W2f, per_channel)
+        body = f"""
+        g (float[1,{K}] X) => (float[1,{N2}] Y)
+        {{
+          h1 = MatMul(X, W1)
+          h1_act = Relu(h1)
+          Y = com.microsoft.DynamicQuantizeMatMul(h1_act, W2, W2_scale, W2_zero_point)
+        }}
+        """
+        inits = [
+            _f32(W1f, "W1"),
+            onnx.numpy_helper.from_array(W2q, "W2"),
+            onnx.numpy_helper.from_array(W2s, "W2_scale"),
+            onnx.numpy_helper.from_array(W2zp, "W2_zero_point"),
+        ]
+        info = {"W1f": W1f, "W2f": W2f, "W2q": W2q, "W2s": W2s, "W2zp": W2zp}
+    model = _model(body, initializer=inits, opset=21)
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    return model, info
+
+
+def _m2f_model(K, N1, N2, per_channel=True, seed=0):
+    """``MatMulIntegerToFloat(mm1) -> Relu -> plain MatMul(mm2)``, `A`
+    pre-quantized as a genuine uint8 graph input. `a_scale`/`a_zero_point`
+    are supplied as plain constants -- never touched by this pass (see
+    this module's own section comment for why: they are never constant
+    initializers in a real fusion output at all, but that doesn't matter
+    here since nothing about this pass reads them).
+    """
+    rng = np.random.default_rng(seed)
+    W1f = (rng.standard_normal((K, N1)) * 0.3).astype(np.float32)
+    W2f = (rng.standard_normal((N1, N2)) * 0.3).astype(np.float32)
+    W1q, W1s, W1zp = _quantize_dynamic_weight(W1f, per_channel)
+    body = f"""
+    g (uint8[1,{K}] Xq) => (float[1,{N2}] Y)
+    {{
+      h1 = com.microsoft.MatMulIntegerToFloat(Xq, W1, x_scale, W1_scale, x_zero_point, W1_zero_point)
+      h1_act = Relu(h1)
+      Y = MatMul(h1_act, W2)
+    }}
+    """
+    inits = [
+        _f32(np.array(0.01), "x_scale"),
+        _u8(np.array(120), "x_zero_point"),
+        onnx.numpy_helper.from_array(W1q, "W1"),
+        onnx.numpy_helper.from_array(W1s, "W1_scale"),
+        onnx.numpy_helper.from_array(W1zp, "W1_zero_point"),
+        _f32(W2f, "W2"),
+    ]
+    model = _model(body, initializer=inits, opset=21)
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    return model, {"W1f": W1f, "W1q": W1q, "W1s": W1s, "W1zp": W1zp, "W2f": W2f}
+
+
+def _dqmm_importance_keep(W_q, W_s, W_zp, keep_count):
+    w_dequant = (
+        W_q.astype(np.float64) - W_zp.astype(np.float64)[None, :]
+    ) * W_s.astype(np.float64)[None, :]
+    importance = np.linalg.norm(w_dequant, axis=0)  # per output channel
+    return np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+
+def test_dynamic_quantize_matmul_chain_is_matched_and_prunes():
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_chain_model(K, N1, N2, per_channel=True, seed=1)
+    onnx.checker.check_model(model)
+    chains = onnxsim.pruning._find_dynquant_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == N1
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, N1 // 2]
+    assert list(inits["W1_scale"].dims) == [N1 // 2]
+    assert list(inits["W1_zero_point"].dims) == [N1 // 2]
+    assert list(inits["W2"].dims) == [N1 // 2, N2]
+
+
+def test_dynamic_quantize_matmul_producer_matches_independently_requantized_subset():
+    # The core correctness invariant this project's earlier rounds
+    # established: a pruned model's output must match a reference built by
+    # quantizing the already-column-subset weight directly via the REAL
+    # quantizer -- NOT the full unpruned model's own output. Per-channel
+    # quantization is column-independent (confirmed empirically, see this
+    # module's own section comment), so slicing the original quantized
+    # codes and independently re-quantizing the float subset are
+    # byte-identical -- this test checks both.
+    K, N1, N2 = 16, 24, 12
+    model, info = _dqmm_chain_model(K, N1, N2, per_channel=True, seed=2)
+    keep = _dqmm_importance_keep(info["W1q"], info["W1s"], info["W1zp"], N1 // 2)
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+
+    # "slice, don't recompute": the pruned graph's own quantized codes/
+    # scale/zero_point are EXACTLY a hand-slice of the original ones.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1"]), info["W1q"][:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1_scale"]), info["W1s"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1_zero_point"]), info["W1zp"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W2"]), info["W2q"][keep, :]
+    )
+
+    # Independently reconstructed "already pruned" reference model: the
+    # PRODUCER's kept-column weight is quantized FRESH via the real
+    # quantizer (per-channel quantization is column-independent, confirmed
+    # byte-identical to slicing above). The CONSUMER's own weight is NEVER
+    # requantized here -- a fresh quantization of a *row*-sliced weight
+    # would generally compute a DIFFERENT per-column scale than the
+    # original (each column's own scale is an aggregate over exactly the
+    # rows being sliced), so, mirroring the QOperator family's own
+    # identical oracle-construction pattern
+    # (`test_qlinearconv_producer_matches_independent_oracle_via_real_inference_session`),
+    # the consumer's own quantized CODES are sliced directly and its
+    # scale/zero-point copied UNCHANGED from the original -- exactly what
+    # the consumer role itself does (see this module's own section
+    # comment: the consumer role never touches scale/zero-point at all).
+    ref_model, _ = _dqmm_model_from_weights(
+        K,
+        len(keep),
+        N2,
+        info["W1f"][:, keep],
+        info["W2f"][keep, :],  # shape placeholder only -- overwritten below
+        per_channel=True,
+        seed=987654,
+    )
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    ref_inits["W2"].CopyFrom(onnx.numpy_helper.from_array(info["W2q"][keep, :], "W2"))
+    ref_inits["W2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2s"], "W2_scale")
+    )
+    ref_inits["W2_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2zp"], "W2_zero_point")
+    )
+
+    rng = np.random.default_rng(11)
+    x = rng.standard_normal((1, K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_ref,) = _run(ref_model, {"X": x})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_dynamic_quantize_matmul_per_tensor_scale_left_untouched():
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_chain_model(K, N1, N2, per_channel=False, seed=3)
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    # per-tensor scale/zero-point are scalars -- never sliced, regardless
+    # of channel count
+    assert list(inits["W1_scale"].dims) == []
+    assert list(inits["W1_zero_point"].dims) == []
+    assert list(inits["W1"].dims) == [K, N1 // 2]
+
+
+def test_dynamic_quantize_matmul_per_tensor_reuses_original_scale_not_a_resampled_one():
+    # For a per-tensor (scalar) scale, "slice, don't recompute" means the
+    # pruned model must reuse the ORIGINAL, full-weight scale/zero-point --
+    # NOT a scale independently re-derived from just the kept columns. This
+    # is a real, confirmed distinction (unlike the per-channel case just
+    # above): a per-tensor scale is a function of the WHOLE weight's
+    # absmax, so re-quantizing a column subset from scratch gives a
+    # genuinely DIFFERENT scale whenever the dropped columns held the
+    # tensor's own max magnitude.
+    #
+    # Forced deliberately below: column 0 holds a single K=64-row spike
+    # (one entry 8.0, the rest ~0) -- large enough to set the WHOLE
+    # tensor's per-tensor absmax to 8.0, but, spread over only one row out
+    # of 64, still a smaller L2 NORM (~8.0) than the other 7 columns (each
+    # filled with a moderate ~2.0 magnitude across all 64 rows, L2 norm
+    # ~16.0) -- so column 0 is this pass's own least-important, first-
+    # dropped column, while still being the one that set the original
+    # scale.
+    K, N1, N2 = 64, 8, 4
+    rng = np.random.default_rng(4)
+    W1f = (
+        rng.uniform(1.8, 2.2, size=(K, N1)) * rng.choice([-1, 1], size=(K, N1))
+    ).astype(np.float32)
+    W1f[:, 0] = 0.0
+    W1f[0, 0] = 8.0  # dominates the full tensor's absmax
+    W2f = (rng.standard_normal((N1, N2)) * 0.3).astype(np.float32)
+
+    model, info = _dqmm_model_from_weights(K, N1, N2, W1f, W2f, per_channel=False)
+    keep = _dqmm_importance_keep(
+        info["W1q"], np.atleast_1d(info["W1s"]), np.atleast_1d(info["W1zp"]), N1 // 2
+    )
+    assert 0 not in keep  # confirms column 0 is indeed dropped
+
+    # An independently fresh-requantized subset gives a DIFFERENT scale --
+    # confirming this isn't a vacuous check.
+    _, W1s_resampled, _ = _quantize_dynamic_weight(W1f[:, keep], per_channel=False)
+    assert float(W1s_resampled) != pytest.approx(float(info["W1s"]))
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    # the ORIGINAL scale/zero-point survive untouched, not a resampled one.
+    assert onnx.numpy_helper.to_array(inits["W1_scale"]) == pytest.approx(
+        float(info["W1s"])
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1"]), info["W1q"][:, keep]
+    )
+
+    rng2 = np.random.default_rng(12)
+    x = rng2.standard_normal((1, K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    assert y_pruned.shape == (1, N2)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_dynamic_quantize_matmul_bias_is_sliced_as_plain_float():
+    K, N1, N2 = 16, 24, 12
+    model, info = _dqmm_chain_model(K, N1, N2, per_channel=True, bias1=True, seed=8)
+    onnx.checker.check_model(model)
+    keep = _dqmm_importance_keep(info["W1q"], info["W1s"], info["W1zp"], N1 // 2)
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert inits["B1"].data_type == onnx.TensorProto.FLOAT
+    assert list(inits["B1"].dims) == [N1 // 2]
+    # bias values are UNCHANGED (plain float, never quantized/rescaled) --
+    # unlike QGemm/QLinearConv's own quantized int32 bias.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["B1"]), info["B1f"][keep]
+    )
+
+
+def test_dynamic_quantize_matmul_plain_float_consumer_is_matched_and_pruned():
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_mixed_model(K, N1, N2, quantized="producer", seed=9)
+    onnx.checker.check_model(model)
+    chains = onnxsim.pruning._find_dynquant_chains(model.graph)
+    assert len(chains) == 1
+    assert isinstance(chains[0].producer, onnxsim.pruning._DynQuantMatMulWeight)
+    assert isinstance(chains[0].consumer, onnxsim.pruning._PlainMatMulNBitsPeer)
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, N1 // 2]
+    assert list(inits["W2"].dims) == [N1 // 2, N2]
+
+    rng = np.random.default_rng(20)
+    x = rng.standard_normal((1, K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    assert y_pruned.shape == (1, N2)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_dynamic_quantize_matmul_plain_float_producer_is_matched_and_pruned():
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_mixed_model(K, N1, N2, quantized="consumer", seed=10)
+    onnx.checker.check_model(model)
+    chains = onnxsim.pruning._find_dynquant_chains(model.graph)
+    assert len(chains) == 1
+    assert isinstance(chains[0].producer, onnxsim.pruning._PlainMatMulNBitsPeer)
+    assert isinstance(chains[0].consumer, onnxsim.pruning._DynQuantMatMulWeight)
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, N1 // 2]
+    assert list(inits["W2"].dims) == [N1 // 2, N2]
+
+    rng = np.random.default_rng(21)
+    x = rng.standard_normal((1, K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    assert y_pruned.shape == (1, N2)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_matmul_integer_to_float_producer_weight_side_matches_dynamic_quantize_matmul():
+    # Confirms the two ops' weight-side handling is IDENTICAL (both
+    # dispatch to the same `_match_dynquant_weight_operands` -- see this
+    # module's own section comment) by running the exact same producer-role
+    # correctness check the DynamicQuantizeMatMul test above does, just
+    # against a MatMulIntegerToFloat node instead.
+    K, N1, N2 = 16, 24, 12
+    model, info = _m2f_model(K, N1, N2, per_channel=True, seed=11)
+    onnx.checker.check_model(model)
+    chains = onnxsim.pruning._find_dynquant_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].producer.node.op_type == "MatMulIntegerToFloat"
+
+    keep = _dqmm_importance_keep(info["W1q"], info["W1s"], info["W1zp"], N1 // 2)
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1"]), info["W1q"][:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1_scale"]), info["W1s"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1_zero_point"]), info["W1zp"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W2"]), info["W2f"][keep, :]
+    )
+
+    xq = np.random.default_rng(30).integers(0, 255, size=(1, K)).astype(np.uint8)
+    (y_pruned,) = _run(pruned, {"Xq": xq})
+    assert y_pruned.shape == (1, N2)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_dynamic_quantize_matmul_missing_zero_point_is_declined():
+    # `b_zero_point` is schema-optional, but never confirmed empirically to
+    # be omitted by any real fixture -- declined outright, see this
+    # module's own section comment.
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_chain_model(K, N1, N2, per_channel=True, seed=5)
+    for node in model.graph.node:
+        if node.output and node.output[0] == "h1":
+            node.input[3] = ""  # blank b_zero_point
+    chains = onnxsim.pruning._find_dynquant_chains(model.graph)
+    assert chains == []
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_dynamic_quantize_matmul, sparsity=0.5
+    )
+    assert report.layers == []
+    assert any("DynamicQuantizeMatMul" in ne for ne in report.not_eligible)
+
+
+def test_dynamic_quantize_matmul_tied_weight_is_declined():
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_chain_model(K, N1, N2, per_channel=True, seed=6)
+    # a second, unrelated node also reads W1 -- shared/tied, can't be sliced
+    extra = onnx.helper.make_node("Identity", ["W1"], ["W1_alias"], name="alias")
+    model.graph.node.append(extra)
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("W1_alias", onnx.TensorProto.INT8, [K, N1])
+    )
+    chains = onnxsim.pruning._find_dynquant_chains(model.graph)
+    assert chains == []
+
+
+def test_dynamic_quantize_matmul_zero_sparsity_is_a_no_op():
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_chain_model(K, N1, N2, per_channel=True, seed=12)
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.0
+    )
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_dynamic_quantize_matmul_invalid_sparsity_raises():
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_chain_model(K, N1, N2, per_channel=True, seed=13)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_pruning_dynamic_quantize_matmul(model, sparsity=1.0)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_pruning_dynamic_quantize_matmul(model, sparsity=-0.1)
+
+
+def test_dynamic_quantize_matmul_real_quantize_dynamic_pipeline_end_to_end():
+    # The strongest confirmation available: run the REAL `quantize_dynamic`
+    # tool on a plain float model, then a real `InferenceSession`'s default
+    # graph optimization on the result -- the exact reproduction this
+    # module's own section comment describes -- and confirm this pass
+    # matches and correctly prunes the genuine fused output, not merely a
+    # hand-built approximation of it.
+    from onnxruntime.quantization import quantize_dynamic
+
+    K, N1, N2, N3 = 16, 24, 12, 8
+    rng = np.random.default_rng(7)
+    W0 = (rng.standard_normal((K, N1)) * 0.3).astype(np.float32)
+    W1 = (rng.standard_normal((N1, N2)) * 0.3).astype(np.float32)
+    W2 = (rng.standard_normal((N2, N3)) * 0.3).astype(np.float32)
+    float_model = _model(
+        f"""
+        g (float[1,{K}] x) => (float[1,{N3}] y)
+        {{
+          h0 = MatMul(x, W0)
+          h0a = Relu(h0)
+          h1 = MatMul(h0a, W1)
+          h1a = Relu(h1)
+          y = MatMul(h1a, W2)
+        }}
+        """,
+        initializer=[_f32(W0, "W0"), _f32(W1, "W1"), _f32(W2, "W2")],
+        opset=21,
+    )
+
+    with tempfile.TemporaryDirectory() as d:
+        src_path = os.path.join(d, "src.onnx")
+        quant_path = os.path.join(d, "quant.onnx")
+        opt_path = os.path.join(d, "opt.onnx")
+        onnx.save(float_model, src_path)
+        quantize_dynamic(src_path, quant_path, per_channel=True)
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.optimized_model_filepath = opt_path
+        ort.InferenceSession(
+            quant_path, sess_options=so, providers=["CPUExecutionProvider"]
+        )
+        fused = onnx.load(opt_path)
+
+    op_types = {n.op_type for n in fused.graph.node}
+    assert "DynamicQuantizeMatMul" in op_types  # confirms the real fusion
+    # actually happened, not merely that the schema exists
+
+    chains = onnxsim.pruning._find_dynquant_chains(fused.graph)
+    assert len(chains) == 2
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        fused, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    pruned_inits = {t.name: list(t.dims) for t in pruned.graph.initializer}
+    w0_name = next(
+        n.input[1] for n in pruned.graph.node if n.op_type == "DynamicQuantizeMatMul"
+    )
+    assert pruned_inits[w0_name][1] == N1 // 2
+
+    x = rng.standard_normal((1, K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"x": x})
+    assert y_pruned.shape == (1, N3)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_analyze_structured_pruning_dynamic_quantize_matmul_matches_real_call():
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_chain_model(K, N1, N2, per_channel=True, seed=40)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_dynamic_quantize_matmul, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "dynamic_quantize_matmul"
+    assert layer.total == N1
+    assert layer.would_drop == N1 // 2
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    dims_after = {t.name: list(t.dims) for t in pruned.graph.initializer}
+    assert dims_after["W1"][1] == N1 - layer.would_drop
+
+
+def test_apply_structured_pruning_dynamic_quantize_matmul_registered_in_sensitivity_analyzers():
+    assert (
+        onnxsim.apply_structured_pruning_dynamic_quantize_matmul
         in onnxsim.pruning._SENSITIVITY_ANALYZERS
     )
