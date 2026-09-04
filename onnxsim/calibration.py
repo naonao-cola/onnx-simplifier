@@ -370,6 +370,71 @@ def _entropy_threshold(
     return best_threshold
 
 
+def _mse_threshold(
+    values: np.ndarray,
+    num_candidates: int = 100,
+    min_coverage: float = 0.5,
+) -> float:
+    """
+    Find the symmetric clip threshold ``T`` minimizing the *direct* mean
+    squared quantization error against ``values`` themselves (not a
+    histogram-binned KL-divergence proxy the way :func:`_entropy_threshold`
+    does) -- the "MSE calibration" family of clip-range search, e.g. the
+    percentile/MSE calibrators several PTQ toolkits ship, and specifically
+    the paper this repo's own :mod:`onnxsim.outlier_suppression` explicitly
+    declined to port: Outlier Suppression's own "Token-Wise Clipping" (Wei
+    et al., 2022, https://arxiv.org/abs/2209.13325) searches a clip range
+    the same way -- minimizing quantized reconstruction error directly --
+    rather than accepting a fixed min/max or an entropy-matched range.
+
+    The search: for ``num_candidates`` candidate thresholds ``t`` evenly
+    spaced between the ``min_coverage`` percentile of ``|values|`` and the
+    observed max, simulate symmetric INT8 quantization (``scale = t / 127``,
+    round-to-nearest, clip to ``[-127, 127]``, dequantize) of the *actual*
+    ``values`` (not a coarsened histogram) and measure the mean squared
+    error against the unquantized values. The threshold with the lowest MSE
+    wins. Unlike :func:`_entropy_threshold` (which only ever sees a
+    ``num_bins``-histogram approximation of the data), this measures the
+    real reconstruction error every candidate would actually produce, at
+    the cost of one full quantize-and-compare pass per candidate rather
+    than one histogram pass total.
+
+    ``min_coverage`` bounds the search from below (default: the search
+    never considers clipping away more than the top 50% by magnitude),
+    the same purpose :func:`_entropy_threshold`'s own ``min_coverage``
+    serves -- without it, a smooth, tail-free distribution (e.g. a raw
+    Gaussian) can still show a spuriously low MSE at a pathologically
+    small threshold purely from candidates degenerating together.
+
+    Falls back to the observed max (i.e. no clipping) when there is too
+    little data, or too little dynamic range, to search meaningfully.
+    """
+    v = values.astype(np.float64).ravel()
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return 0.0
+    abs_v = np.abs(v)
+    abs_max = float(abs_v.max())
+    if abs_max <= 0.0:
+        return abs_max
+
+    floor = max(float(np.percentile(abs_v, min_coverage * 100.0)), abs_max * 1e-6)
+    if floor >= abs_max:
+        return abs_max
+
+    best_threshold = abs_max
+    best_mse = float("inf")
+    for t in np.linspace(floor, abs_max, num_candidates):
+        scale = t / 127.0
+        q = np.clip(np.round(v / scale), -127, 127) * scale
+        mse = float(np.mean((v - q) ** 2))
+        if mse < best_mse:
+            best_mse = mse
+            best_threshold = float(t)
+
+    return best_threshold
+
+
 def calibrate(
     model: Union[str, onnx.ModelProto],
     calibration_data: Sequence[Tensors],
@@ -377,6 +442,8 @@ def calibrate(
     method: str = "minmax",
     num_bins: int = 2048,
     num_quantized_bins: int = 128,
+    num_mse_candidates: int = 100,
+    mse_min_coverage: float = 0.5,
     extra_tensor_names: Optional[Sequence[str]] = None,
 ) -> Dict[str, Tuple[float, float]]:
     """
@@ -419,13 +486,30 @@ def calibrate(
             :func:`_entropy_threshold`. Left at INT8's 128 (one sign's worth)
             regardless of onnxsim's own uint8 range, matching the standard
             entropy-calibration convention this implements.
+            ``"mse"`` instead searches, per tensor, the symmetric clip
+            threshold minimizing quantized reconstruction error measured
+            directly against the observed values (see
+            :func:`_mse_threshold`) -- Outlier Suppression's own
+            "Token-Wise Clipping" (the technique :mod:`onnxsim.
+            outlier_suppression`'s own docstring explicitly declines to
+            port, since this function is where it belongs instead). Unlike
+            ``"entropy"``'s histogram-KL proxy, this measures real
+            reconstruction error at the cost of one full pass per candidate
+            threshold rather than one histogram pass total; needs the same
+            "at least a few hundred observed values per tensor" amount of
+            calibration data ``"entropy"`` does.
+    :param num_mse_candidates: (``"mse"`` only) number of candidate clip
+            thresholds the search evaluates -- see :func:`_mse_threshold`.
+    :param mse_min_coverage: (``"mse"`` only) floor on the search, as a
+            percentile of ``|values|`` below which no threshold is
+            considered -- see :func:`_mse_threshold`.
     :returns: ``{tensor_name: (min, max)}`` for every tensor
             ``onnxsim_cpp2py_export.list_quantizable_activations`` reports,
             plus ``extra_tensor_names`` if given
     """
     import onnxruntime as ort
 
-    if method not in ("minmax", "entropy"):
+    if method not in ("minmax", "entropy", "mse"):
         raise ValueError(f"unknown calibration method: {method!r}")
 
     if isinstance(model, str):
@@ -453,8 +537,9 @@ def calibrate(
     output_names = [o.name for o in sess.get_outputs()]
 
     ranges: Dict[str, Tuple[float, float]] = {}
-    # Only "entropy" needs every observed value kept around (to build a
-    # histogram from); "minmax" only ever needs a running (min, max).
+    # Only "entropy"/"mse" need every observed value kept around (to build a
+    # histogram from, or to measure reconstruction error against directly);
+    # "minmax" only ever needs a running (min, max).
     collected: Dict[str, List[np.ndarray]] = {}
     for batch in calibration_data:
         outputs = sess.run(output_names, batch)
@@ -471,7 +556,7 @@ def calibrate(
                 ranges[name] = (min(prev_min, batch_min), max(prev_max, batch_max))
             else:
                 ranges[name] = (batch_min, batch_max)
-            if method == "entropy":
+            if method in ("entropy", "mse"):
                 collected.setdefault(name, []).append(arr.ravel())
 
     if method == "entropy":
@@ -480,6 +565,15 @@ def calibrate(
                 np.concatenate(chunks),
                 num_bins=num_bins,
                 num_quantized_bins=num_quantized_bins,
+            )
+            obs_min, obs_max = ranges[name]
+            ranges[name] = (max(obs_min, -threshold), min(obs_max, threshold))
+    elif method == "mse":
+        for name, chunks in collected.items():
+            threshold = _mse_threshold(
+                np.concatenate(chunks),
+                num_candidates=num_mse_candidates,
+                min_coverage=mse_min_coverage,
             )
             obs_min, obs_max = ranges[name]
             ranges[name] = (max(obs_min, -threshold), min(obs_max, threshold))
@@ -523,9 +617,10 @@ def quantize_static(
             ``calibration_data`` is supplied)
     :param providers: onnxruntime execution providers to run calibration on
     :param method: calibration range method, passed through to
-            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
-            (KL-divergence calibration; see that function for the tradeoff
-            and its extra data requirement).
+            :func:`calibrate` -- ``"minmax"`` (default), ``"entropy"``
+            (KL-divergence calibration), or ``"mse"`` (direct reconstruction-
+            error calibration); see that function for the tradeoffs and
+            their extra data requirement.
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -572,9 +667,10 @@ def quantize_static_int16(
             ``calibration_data`` is supplied)
     :param providers: onnxruntime execution providers to run calibration on
     :param method: calibration range method, passed through to
-            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
-            (KL-divergence calibration; see that function for the tradeoff
-            and its extra data requirement).
+            :func:`calibrate` -- ``"minmax"`` (default), ``"entropy"``
+            (KL-divergence calibration), or ``"mse"`` (direct reconstruction-
+            error calibration); see that function for the tradeoffs and
+            their extra data requirement.
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -629,9 +725,10 @@ def quantize_qoperator(
             ``calibration_data`` is supplied)
     :param providers: onnxruntime execution providers to run calibration on
     :param method: calibration range method, passed through to
-            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
-            (KL-divergence calibration; see that function for the tradeoff
-            and its extra data requirement).
+            :func:`calibrate` -- ``"minmax"`` (default), ``"entropy"``
+            (KL-divergence calibration), or ``"mse"`` (direct reconstruction-
+            error calibration); see that function for the tradeoffs and
+            their extra data requirement.
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -702,9 +799,10 @@ def quantize_qoperator_elementwise(
             ``calibration_data`` is supplied)
     :param providers: onnxruntime execution providers to run calibration on
     :param method: calibration range method, passed through to
-            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
-            (KL-divergence calibration; see that function for the tradeoff
-            and its extra data requirement).
+            :func:`calibrate` -- ``"minmax"`` (default), ``"entropy"``
+            (KL-divergence calibration), or ``"mse"`` (direct reconstruction-
+            error calibration); see that function for the tradeoffs and
+            their extra data requirement.
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -765,9 +863,10 @@ def quantize_qoperator_activation(
             ``calibration_data`` is supplied)
     :param providers: onnxruntime execution providers to run calibration on
     :param method: calibration range method, passed through to
-            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
-            (KL-divergence calibration; see that function for the tradeoff
-            and its extra data requirement).
+            :func:`calibrate` -- ``"minmax"`` (default), ``"entropy"``
+            (KL-divergence calibration), or ``"mse"`` (direct reconstruction-
+            error calibration); see that function for the tradeoffs and
+            their extra data requirement.
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -828,9 +927,10 @@ def quantize_qoperator_concat(
             ``calibration_data`` is supplied)
     :param providers: onnxruntime execution providers to run calibration on
     :param method: calibration range method, passed through to
-            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
-            (KL-divergence calibration; see that function for the tradeoff
-            and its extra data requirement).
+            :func:`calibrate` -- ``"minmax"`` (default), ``"entropy"``
+            (KL-divergence calibration), or ``"mse"`` (direct reconstruction-
+            error calibration); see that function for the tradeoffs and
+            their extra data requirement.
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -899,9 +999,10 @@ def quantize_qoperator_softmax(
             ``calibration_data`` is supplied)
     :param providers: onnxruntime execution providers to run calibration on
     :param method: calibration range method, passed through to
-            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
-            (KL-divergence calibration; see that function for the tradeoff
-            and its extra data requirement).
+            :func:`calibrate` -- ``"minmax"`` (default), ``"entropy"``
+            (KL-divergence calibration), or ``"mse"`` (direct reconstruction-
+            error calibration); see that function for the tradeoffs and
+            their extra data requirement.
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -969,9 +1070,10 @@ def quantize_qoperator_pool(
             ``calibration_data`` is supplied)
     :param providers: onnxruntime execution providers to run calibration on
     :param method: calibration range method, passed through to
-            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
-            (KL-divergence calibration; see that function for the tradeoff
-            and its extra data requirement).
+            :func:`calibrate` -- ``"minmax"`` (default), ``"entropy"``
+            (KL-divergence calibration), or ``"mse"`` (direct reconstruction-
+            error calibration); see that function for the tradeoffs and
+            their extra data requirement.
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -1034,9 +1136,10 @@ def quantize_qoperator_where(
             ``calibration_data`` is supplied)
     :param providers: onnxruntime execution providers to run calibration on
     :param method: calibration range method, passed through to
-            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
-            (KL-divergence calibration; see that function for the tradeoff
-            and its extra data requirement).
+            :func:`calibrate` -- ``"minmax"`` (default), ``"entropy"``
+            (KL-divergence calibration), or ``"mse"`` (direct reconstruction-
+            error calibration); see that function for the tradeoffs and
+            their extra data requirement.
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -1112,9 +1215,10 @@ def quantize_qoperator_gemm(
             ``calibration_data`` is supplied)
     :param providers: onnxruntime execution providers to run calibration on
     :param method: calibration range method, passed through to
-            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
-            (KL-divergence calibration; see that function for the tradeoff
-            and its extra data requirement).
+            :func:`calibrate` -- ``"minmax"`` (default), ``"entropy"``
+            (KL-divergence calibration), or ``"mse"`` (direct reconstruction-
+            error calibration); see that function for the tradeoffs and
+            their extra data requirement.
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
