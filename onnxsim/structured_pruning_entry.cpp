@@ -115,6 +115,17 @@ const std::unordered_set<std::string>& UnaryPassThroughOps() {
       // membership here alone extends every walker that already consults
       // this set, mirroring pruning.py's own _UNARY_PASS_THROUGH.
       "QuickGelu",
+      // ai.onnx (domain "") Erf(X) -> Y, the error function: a single
+      // required input, a single output, no attributes at all -- exactly as
+      // unary/elementwise/parameter-free as every other entry here.
+      // Membership alone extends every walker that already consults this
+      // set for free, mirroring pruning.py's own identical addition -- but
+      // note it's only *part* of what a decomposed erf-GELU export needs:
+      // the rest (the scalar Div/Add operands, and the self-gating Mul
+      // against the walk's own running tensor) is a different shape unary
+      // membership alone can't reach -- see the "Self-gated activation
+      // decomposition" section comment above WalkGateBranch below.
+      "Erf",
   };
   return kOps;
 }
@@ -391,6 +402,34 @@ size_t ConsumerCount(const ConsumerMap& consumers_of, const std::string& name) {
   return it == consumers_of.end() ? 0 : it->second.size();
 }
 
+// True if `name` names a constant FLOAT initializer shaped like a flat
+// per-channel vector (`prod(dims) == dims[-1]`) -- mirrors pruning.py's own
+// `_flat_channel_const` exactly: the self-consistency bar every per-channel
+// affine/bias/scale hop in this module checks before ever accepting a
+// tensor as a slice target. The real `dims[-1] == n_channels` check, once
+// the chain's real channel count is known, is left to the caller
+// (MatchGroupNormPassThrough, MatchDecomposedLayerNormPassThrough). Moved
+// ahead of MatchClipChannelPassThrough (its original position, still
+// unchanged relative to every other caller) so
+// MatchDecomposedLayerNormPassThrough below -- itself needed by WalkToConsumer,
+// which sits well before this function's own original location -- can call it.
+bool FlatChannelConst(const std::string& name, const InitMap& init_map) {
+  auto it = init_map.find(name);
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT) {
+    return false;
+  }
+  const auto& dims = it->second->dims();
+  if (dims.size() == 0) {
+    return false;
+  }
+  int64_t prod = 1;
+  for (int64_t d : dims) {
+    prod *= d;
+  }
+  return prod == dims.Get(dims.size() - 1);
+}
+
 // True iff `node` (already confirmed by the caller to be a plain
 // (default-domain) `Clip`, `node.input(0)` the tensor being walked through)
 // is a pure elementwise clamp with zero channel dependence, so it is safe to
@@ -571,6 +610,19 @@ struct ConvPassThrough {
   onnx::NodeProto* node;
   std::string weight;
   std::optional<std::string> bias;
+  // Set only for a `CausalConvWithState` hop whose own `past_state` input
+  // (index 3) is itself a *constant* initializer -- a degenerate,
+  // unlikely-in-practice shape no real export produces (every real export
+  // feeds it as an ordinary graph input/runtime KV-cache-style buffer,
+  // needing no slicing at all -- the caller's own runtime data), but not
+  // one MatchCausalConvWithStatePassThrough assumes away: when set,
+  // ApplyChains/ApplyConcatChains slice its own channel axis (axis 1) by
+  // the same `keep` index set, mirroring GroupQueryAttention's own
+  // "slice if constant, leave alone if dynamic" treatment for its
+  // analogous `past_key`/`past_value`. Always nullopt for a depthwise Conv,
+  // InstanceNormalization, or PRelu hop. Mirrors pruning.py's own
+  // `_ConvPassThrough.past_state`.
+  std::optional<std::string> past_state;
 };
 
 struct ChainOp {
@@ -682,6 +734,719 @@ struct ConsumerMatch {
   bool weight_transposed;
 };
 
+// --- Decomposed (not-yet-fused) LayerNorm pass-through, mirroring
+// pruning.py's own _match_decomposed_layer_norm_pass_through -----------------
+//
+// LayerNormalization's own schema is only opset 17+, so a model exported at
+// opset <= 16 -- still extremely common for broad runtime/NPU/TensorRT
+// compatibility -- has no fused op to lower nn.LayerNorm to at all, and
+// torch.onnx.export emits LayerNorm's own canonical decomposition as plain
+// ops instead:
+//
+//     mean     = ReduceMean(x, axes=[-1])
+//     centered = Sub(x, mean)
+//     sq       = Pow(centered, 2.0)
+//     var      = ReduceMean(sq, axes=[-1])
+//     var_eps  = Add(var, eps)
+//     std      = Sqrt(var_eps)
+//     normed   = Div(centered, std)
+//     scaled   = Mul(normed, gamma)
+//     out      = Add(scaled, beta)
+//
+// -- `x` consumed twice (by the first ReduceMean and by Sub), `centered`
+// consumed twice (by Pow and by Div), every other intermediate tensor
+// consumed exactly once. Recognized by WalkToConsumer as one more
+// MatMul/Gemm-chain-only hop (never WalkMatmulProducerBackward -- mirroring
+// pruning.py's own scope decision: the far more common shape a residual
+// Add's own operand resolves back through is an FFN's down-projection or an
+// attention block's own output projection, with no LayerNorm in between at
+// all), folding all 9 nodes into chain_ops in one hop. Only the Mul's own
+// gamma (input 1) and the final Add's own beta (input 1) have anything
+// sliced; every other node's entry carries no const name.
+//
+// Since this shape's own root tensor (`x`) is read *twice* by design, every
+// WalkToConsumer call site that used to gate on a strict single-consumer
+// check before ever calling it now uses MatmulWalkRootOk instead -- see its
+// own comment below for why dropping that gate down to "not a graph output"
+// is safe for every previously-supported shape, not just this one.
+//
+// Positive-axis ReduceMean `axes` (needing the tensor's own known rank to
+// resolve) is deliberately out of scope for this port -- only the
+// unambiguous `axes=[-1]` case is recognized (see ReduceMeanAxisIsLast's own
+// comment); pruning.py's own value_info-threaded rank resolution is not
+// mirrored here, and WalkToConsumer gains no such parameter. This only
+// narrows coverage (declines a case pruning.py's own version might still
+// accept), never a correctness gap -- the same "declined, not guessed at"
+// bar this port always holds itself to.
+constexpr int kMaxGateBranchHops = 4;
+
+// True iff `name` names a constant float *scalar* initializer (`dims`
+// exactly [] or [1]) -- the same scalar bar MatchClipChannelPassThrough's
+// own inline `min`/`max` check already uses, reused here for two different
+// callers that each need a plain, channel-agnostic constant operand: the
+// decomposed LayerNorm's own `eps` operand
+// (DecomposedLayerNormPowExponentIsTwo additionally checks the Pow
+// exponent's own *value* is exactly 2.0; `eps`'s own value is never
+// inspected, only its shape -- any epsilon is equally safe, it's never
+// sliced), and a self-gated activation decomposition's own gate-branch
+// "other operand" (sqrt(2), 1.0, erf-GELU's own trailing 0.5 -- see
+// WalkGateBranch below). Mirrors pruning.py's own
+// _flat_scalar_float_const/_gate_branch_scalar_const, which have identical
+// bodies for the identical reason.
+bool ScalarFloatConst(const std::string& name, const InitMap& init_map) {
+  auto it = init_map.find(name);
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT) {
+    return false;
+  }
+  const auto& dims = it->second->dims();
+  return dims.size() == 0 || (dims.size() == 1 && dims.Get(0) == 1);
+}
+
+// True iff `name` names a constant float scalar (ScalarFloatConst) whose
+// value is exactly 2.0 -- Pow's own schema (X, Y -> X ** Y, a fixed operand
+// order) makes `name` its second input; this confirms the node genuinely
+// computes `(x - mean) ** 2`, LayerNorm's own variance term, rather than
+// some other exponent this pass has no basis for treating as
+// channel-pruning-safe. Mirrors pruning.py's own
+// _decomposed_layer_norm_pow_exponent_is_two.
+bool DecomposedLayerNormPowExponentIsTwo(const std::string& name,
+                                         const InitMap& init_map) {
+  if (!ScalarFloatConst(name, init_map)) {
+    return false;
+  }
+  std::vector<float> values = ReadFloatTensor(*init_map.at(name));
+  return values.size() == 1 && values[0] == 2.0f;
+}
+
+// True iff a plain (default-domain) `ReduceMean` `node` -- one of
+// MatchDecomposedLayerNormPassThrough's own two ReduceMean nodes,
+// `input_name` its own single input -- is confirmed to reduce *only*
+// `input_name`'s last axis, keeping that axis (`keepdims=1`, the shape
+// LayerNorm's own mean/variance reduction needs). Only the unambiguous
+// `axes == [-1]` case is recognized here -- unlike pruning.py's own
+// _reduce_mean_axis_is_last, this deliberately never resolves a positive
+// axis against the tensor's own rank (see this section's own comment above
+// for why); narrower coverage, declined rather than guessed at, never a
+// correctness gap. Declines whenever `axes` is absent (the schema default
+// then reduces *every* axis, a different computation) or names more than
+// one axis, or `keepdims` is anything but its schema default/an explicit 1
+// (`keepdims=0` would drop the reduced axis entirely, breaking the
+// following Sub's/Add's own broadcast).
+bool ReduceMeanAxisIsLast(const onnx::NodeProto& node,
+                          const std::string& input_name) {
+  if (node.op_type() != "ReduceMean" || node.domain() != "" ||
+      node.input_size() != 1 || node.input(0) != input_name) {
+    return false;
+  }
+  std::optional<std::vector<int64_t>> axes_attr;
+  int64_t keepdims = 1;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "axes") {
+      axes_attr.emplace(attr.ints().begin(), attr.ints().end());
+    } else if (attr.name() == "keepdims") {
+      keepdims = attr.i();
+    }
+  }
+  if (keepdims != 1 || !axes_attr || axes_attr->size() != 1) {
+    return false;
+  }
+  return (*axes_attr)[0] == -1;
+}
+
+struct DecomposedLayerNormMatch {
+  std::string out_name;
+  std::vector<ChainOp> chain_ops;  // All 9 nodes, forward order.
+};
+
+// If `x_name` is the root of exactly the fixed 9-node decomposed-LayerNorm
+// sequence documented in this section's own comment above, returns
+// `(out_name, chain_ops)` -- see that comment for the full shape and the
+// exact "declined, never partially matched" bar this holds every node/
+// tensor along the way to (an extra reader of `x_name`/`centered` beyond the
+// two each expects, any other intermediate tensor read more than once or
+// itself a graph output, a non-constant-2.0 Pow exponent, a ReduceMean axis
+// not resolving to -1, or a non-constant/wrongly-shaped/tied gamma/beta).
+// Mirrors pruning.py's own _match_decomposed_layer_norm_pass_through,
+// called by WalkToConsumer at two points -- before its own ordinary
+// single-consumer dispatch (`cur` itself the sequence's own root), and
+// again wherever an ordinary hop's own output would otherwise fail that
+// dispatch's single-consumer bar -- both needed because this shape's own
+// root tensor is read *twice*, a shape the ordinary single-consumer walk
+// can never reach on its own from either point.
+std::optional<DecomposedLayerNormMatch> MatchDecomposedLayerNormPassThrough(
+    const std::string& x_name, const ConsumerMap& consumers_of,
+    const InitMap& init_map,
+    const std::unordered_set<std::string>& graph_outputs, int64_t n_channels) {
+  auto xit = consumers_of.find(x_name);
+  if (xit == consumers_of.end() || xit->second.size() != 2) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* reduce_mean = nullptr;
+  onnx::NodeProto* sub = nullptr;
+  for (onnx::NodeProto* cand : xit->second) {
+    if (cand->op_type() == "ReduceMean" && reduce_mean == nullptr) {
+      reduce_mean = cand;
+    } else if (cand->op_type() == "Sub" && sub == nullptr) {
+      sub = cand;
+    }
+  }
+  if (reduce_mean == nullptr || sub == nullptr || reduce_mean == sub) {
+    return std::nullopt;
+  }
+  if (reduce_mean->output_size() != 1 || reduce_mean->output(0).empty()) {
+    return std::nullopt;
+  }
+  if (!ReduceMeanAxisIsLast(*reduce_mean, x_name)) {
+    return std::nullopt;
+  }
+  const std::string& mean_name = reduce_mean->output(0);
+  if (graph_outputs.count(mean_name) ||
+      ConsumerCount(consumers_of, mean_name) != 1) {
+    return std::nullopt;
+  }
+
+  if (sub->domain() != "" || sub->input_size() != 2 ||
+      sub->input(0) != x_name || sub->input(1) != mean_name ||
+      sub->output_size() != 1 || sub->output(0).empty()) {
+    return std::nullopt;
+  }
+  const std::string& centered_name = sub->output(0);
+  if (graph_outputs.count(centered_name)) {
+    return std::nullopt;
+  }
+  auto cit = consumers_of.find(centered_name);
+  if (cit == consumers_of.end() || cit->second.size() != 2) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* pow_node = nullptr;
+  onnx::NodeProto* div_node = nullptr;
+  for (onnx::NodeProto* cand : cit->second) {
+    if (cand->op_type() == "Pow" && pow_node == nullptr) {
+      pow_node = cand;
+    } else if (cand->op_type() == "Div" && div_node == nullptr) {
+      div_node = cand;
+    }
+  }
+  if (pow_node == nullptr || div_node == nullptr || pow_node == div_node) {
+    return std::nullopt;
+  }
+
+  if (pow_node->domain() != "" || pow_node->input_size() != 2 ||
+      pow_node->input(0) != centered_name || pow_node->output_size() != 1 ||
+      pow_node->output(0).empty() ||
+      !DecomposedLayerNormPowExponentIsTwo(pow_node->input(1), init_map)) {
+    return std::nullopt;
+  }
+  const std::string& sq_name = pow_node->output(0);
+  if (graph_outputs.count(sq_name) ||
+      ConsumerCount(consumers_of, sq_name) != 1) {
+    return std::nullopt;
+  }
+
+  onnx::NodeProto* var_reduce = consumers_of.at(sq_name)[0];
+  if (var_reduce->output_size() != 1 || var_reduce->output(0).empty()) {
+    return std::nullopt;
+  }
+  if (!ReduceMeanAxisIsLast(*var_reduce, sq_name)) {
+    return std::nullopt;
+  }
+  const std::string& var_name = var_reduce->output(0);
+  if (graph_outputs.count(var_name) ||
+      ConsumerCount(consumers_of, var_name) != 1) {
+    return std::nullopt;
+  }
+
+  onnx::NodeProto* add_eps = consumers_of.at(var_name)[0];
+  if (add_eps->op_type() != "Add" || add_eps->domain() != "" ||
+      add_eps->input_size() != 2 ||
+      (add_eps->input(0) != var_name && add_eps->input(1) != var_name) ||
+      add_eps->output_size() != 1 || add_eps->output(0).empty()) {
+    return std::nullopt;
+  }
+  const std::string& eps_name =
+      (add_eps->input(0) == var_name) ? add_eps->input(1) : add_eps->input(0);
+  if (eps_name == var_name || !ScalarFloatConst(eps_name, init_map)) {
+    return std::nullopt;
+  }
+  const std::string& var_eps_name = add_eps->output(0);
+  if (graph_outputs.count(var_eps_name) ||
+      ConsumerCount(consumers_of, var_eps_name) != 1) {
+    return std::nullopt;
+  }
+
+  onnx::NodeProto* sqrt_node = consumers_of.at(var_eps_name)[0];
+  if (sqrt_node->op_type() != "Sqrt" || sqrt_node->domain() != "" ||
+      sqrt_node->input_size() != 1 || sqrt_node->input(0) != var_eps_name ||
+      sqrt_node->output_size() != 1 || sqrt_node->output(0).empty()) {
+    return std::nullopt;
+  }
+  const std::string& std_name = sqrt_node->output(0);
+  if (graph_outputs.count(std_name) ||
+      ConsumerCount(consumers_of, std_name) != 1) {
+    return std::nullopt;
+  }
+  if (consumers_of.at(std_name)[0] != div_node) {
+    return std::nullopt;  // std must feed the *same* Div node centered forked
+                          // to.
+  }
+
+  if (div_node->domain() != "" || div_node->input_size() != 2 ||
+      div_node->input(0) != centered_name || div_node->input(1) != std_name ||
+      div_node->output_size() != 1 || div_node->output(0).empty()) {
+    return std::nullopt;
+  }
+  const std::string& normed_name = div_node->output(0);
+  if (graph_outputs.count(normed_name) ||
+      ConsumerCount(consumers_of, normed_name) != 1) {
+    return std::nullopt;
+  }
+
+  onnx::NodeProto* mul_node = consumers_of.at(normed_name)[0];
+  if (mul_node->op_type() != "Mul" || mul_node->domain() != "" ||
+      mul_node->input_size() != 2 ||
+      (mul_node->input(0) != normed_name &&
+       mul_node->input(1) != normed_name) ||
+      mul_node->output_size() != 1 || mul_node->output(0).empty()) {
+    return std::nullopt;
+  }
+  const std::string& gamma_name = (mul_node->input(0) == normed_name)
+                                      ? mul_node->input(1)
+                                      : mul_node->input(0);
+  if (gamma_name == normed_name || !FlatChannelConst(gamma_name, init_map) ||
+      init_map.at(gamma_name)->dims(init_map.at(gamma_name)->dims_size() - 1) !=
+          n_channels) {
+    return std::nullopt;
+  }
+  const std::string& scaled_name = mul_node->output(0);
+  if (graph_outputs.count(scaled_name) ||
+      ConsumerCount(consumers_of, scaled_name) != 1) {
+    return std::nullopt;
+  }
+
+  onnx::NodeProto* add_beta = consumers_of.at(scaled_name)[0];
+  if (add_beta->op_type() != "Add" || add_beta->domain() != "" ||
+      add_beta->input_size() != 2 ||
+      (add_beta->input(0) != scaled_name &&
+       add_beta->input(1) != scaled_name) ||
+      add_beta->output_size() != 1 || add_beta->output(0).empty()) {
+    return std::nullopt;
+  }
+  const std::string& beta_name = (add_beta->input(0) == scaled_name)
+                                     ? add_beta->input(1)
+                                     : add_beta->input(0);
+  if (beta_name == scaled_name || beta_name == gamma_name ||
+      !FlatChannelConst(beta_name, init_map) ||
+      init_map.at(beta_name)->dims(init_map.at(beta_name)->dims_size() - 1) !=
+          n_channels) {
+    return std::nullopt;
+  }
+
+  DecomposedLayerNormMatch result;
+  result.out_name = add_beta->output(0);
+  result.chain_ops = {
+      ChainOp{reduce_mean, std::nullopt}, ChainOp{sub, std::nullopt},
+      ChainOp{pow_node, std::nullopt},    ChainOp{var_reduce, std::nullopt},
+      ChainOp{add_eps, std::nullopt},     ChainOp{sqrt_node, std::nullopt},
+      ChainOp{div_node, std::nullopt},    ChainOp{mul_node, gamma_name},
+      ChainOp{add_beta, beta_name},
+  };
+  return result;
+}
+
+// True unless `name` is itself a graph output -- the one condition
+// WalkToConsumer can never itself recover from once called (a
+// caller-observed tensor's own shape must never silently change out from
+// under it). Every *other* "is this safe to walk forward from" question --
+// an ordinary single consumer, the decomposed-LayerNorm-root two-consumer
+// shape (MatchDecomposedLayerNormPassThrough), or a self-gated activation
+// decomposition's own two-consumer origin (MatchSelfGatedActivation, below)
+// -- is left entirely to WalkToConsumer's own hop-0 dispatch, which
+// declines (returns no consumer) exactly the same way skipping the call
+// here already did for every case this module supported before either hop
+// existed: a tensor with zero consumers, or two or more that don't happen
+// to match either shape, still makes the very first hop's own dispatch fail
+// immediately, with no wasted walking. Mirrors pruning.py's own
+// _matmul_walk_root_ok. Used, in place of a plain single-consumer gate, by
+// every MatMul/Gemm-chain finder (FindChains/FindGatedChains/
+// FindSplitGatedChains/FindMatmulConcatChains) that hands WalkToConsumer a
+// producer's, a gated combine's, or a Concat's own raw output as `start` --
+// never used ahead of a forced_first_hop call (ResolveMatmulFanoutBranches's
+// own extra-branch resolution), which always takes hop 0's own dispatch
+// directly regardless, so this gate can never be reached there.
+bool MatmulWalkRootOk(const std::string& name,
+                      const std::unordered_set<std::string>& graph_outputs) {
+  return !graph_outputs.count(name);
+}
+
+// --- Self-gated activation decomposition (SiLU/erf-GELU, unfused),
+// mirroring pruning.py's own "Self-gated activation decomposition" section
+// comment, _match_self_gated_activation[_backward], and _walk_gate_branch --
+//
+// Gelu/com.microsoft::Gelu (already unary, UnaryPassThroughOps()) and the
+// fused BiasGelu/FastGelu/QuickGelu hops all require either a late opset
+// (native Gelu needs opset 20+, Swish needs opset 24+) or onnxruntime's own
+// transformer-optimizer fusion pass. A raw torch.onnx.export, at any
+// earlier/default opset and without that fusion pass having run, emits the
+// literal decomposition instead -- a "self-gated" shape where the
+// producer's own output tensor `cur` feeds *two* consumers at once: the
+// gate branch's own first op, and the Mul that combines `cur` with the gate
+// branch's own final output. Two concrete shapes, both confirmed live via
+// torch.onnx.export in pruning.py's own commit history:
+//
+// - SiLU/Swish (the default activation in Ultralytics YOLOv5/v8's own Conv
+//   blocks, and the gate activation in Llama-family SwiGLU): `s =
+//   Sigmoid(cur); out = Mul(cur, s)`.
+// - erf-GELU (opset < 20, the overwhelming majority of real exports): `d =
+//   Div(cur, sqrt(2)); e = Erf(d); a = Add(e, 1.0); m = Mul(cur, a); out =
+//   Mul(m, 0.5)` -- the SiLU shape's own gate Mul plus a longer (Div, Erf,
+//   Add) gate branch and one trailing scalar-scale Mul.
+//
+// On a match, the whole diamond folds into the chain the same "nothing to
+// slice" way a pooling/Resize/Pad/Clip hop's own chain_ops entries already
+// do -- none of Sigmoid/Erf/the scalar Div/Add/Mul operands need their own
+// weight sliced, so every diamond node becomes one more (node, no-const)
+// chain_ops entry, and the walk continues from the diamond's own true
+// output tensor.
+//
+// Forward (WalkToConsumer/WalkToConvConsumer), the diamond is recognized
+// only as a walk's very *first* hop (`cur == start`, on the ordinary,
+// non-forced_first_hop path): every hop *after* the first already only ever
+// promotes `out2` to `cur` once `out2`'s own single-consumer bar is
+// confirmed, so `cur` can never legitimately have two consumers past hop 0
+// in the first place. Reaching hop 0 with a two-consumer `cur` at all needs
+// FindChains/FindConvChains's own pre-walk gate to admit exactly two
+// consumers there too (see each function's own comment) -- a false
+// admission there costs one wasted, safely-declining call, never a wrong
+// slice. A forced_first_hop call (ResolveMatmulFanoutBranches/
+// ResolveConvFanoutBranches) and a Concat-merge finder's own downstream walk
+// from a Concat node's merged output are deliberately left out of that
+// admission -- neither is the shape a real export ever produces directly, so
+// a diamond immediately following one of those is still declined, the same
+// conservative scope boundary pruning.py's own version draws.
+//
+// Backward (WalkMatmulProducerBackward/WalkConvProducerBackward), no
+// equivalent admission problem exists: every hop the backward walk crosses
+// is already checked fresh via node_by_output, with no "already vetted as
+// single-consumer" precondition the way the forward walk's post-hop-0 `cur`
+// has -- so the diamond is recognized the same way as any other backward
+// hop, checked ahead of the ordinary Add/Mul bias/scale dispatch (otherwise
+// indistinguishable from it by op type alone), at whatever position in the
+// chain it's actually crossed. The diamond's own origin tensor legitimately
+// has *two* real in-group consumers (the branch's own first node, and the
+// gate Mul) -- both recorded as `edges` entries, tolerated natively by the
+// `accounted` bookkeeping every residual/merge-group finder already builds
+// from them (a plain multiset-like structure, built for exactly this
+// "more than one in-group consumer of the same tensor" case). The one
+// caller this does *not* compose with safely is the direct Concat-branch
+// walk (BranchWalkHasFanout) -- that check re-derives a strict *linear*
+// single-consumer chain directly from `edges`, an assumption a
+// two-entries-sharing-one-tensor diamond genuinely breaks, so a Concat
+// branch that crosses one is simply declined there, the same safe (if
+// suboptimal) fallback a residual/merge fan-out already gets for other
+// shapes -- no change needed to that check for this feature.
+const std::unordered_set<std::string>& GateBranchBinaryOps() {
+  static const std::unordered_set<std::string> kOps = {"Div", "Mul", "Add",
+                                                       "Sub"};
+  return kOps;
+}
+
+// Walks forward from `branch_start`, whose own (already known) sole
+// consumer is `first_node`, through a strict chain of single-consumer hops
+// -- each either a node already in UnaryPassThroughOps() or a binary op in
+// GateBranchBinaryOps() against a genuine scalar constant (ScalarFloatConst)
+// -- until the chain's own running tensor reaches `target` exactly. Returns
+// the matched node tuple, in forward (execution) order, or nullopt if the
+// chain runs past kMaxGateBranchHops, crosses a graph output, hits an
+// intermediate tensor with anything other than exactly one consumer, or
+// never reaches `target` at all -- declined, never guessed at, the same
+// conservative bar every other hop in this file already holds a mid-chain
+// tensor to. Shared by both MatchSelfGatedActivation (forward) and
+// MatchSelfGatedActivationBackward (backward) -- the shared question both
+// ask is identical ("does this chain of allowed ops connect `branch_start`
+// to `target`"), only the direction differs. Mirrors pruning.py's own
+// _walk_gate_branch.
+std::optional<std::vector<onnx::NodeProto*>> WalkGateBranch(
+    onnx::NodeProto* first_node, const std::string& branch_start,
+    const std::string& target, const ConsumerMap& consumers_of,
+    const InitMap& init_map,
+    const std::unordered_set<std::string>& graph_outputs) {
+  std::vector<onnx::NodeProto*> nodes;
+  onnx::NodeProto* nxt = first_node;
+  std::string cur = branch_start;
+  for (int hop = 0; hop < kMaxGateBranchHops; ++hop) {
+    if (UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
+        nxt->input_size() == 1 && nxt->input(0) == cur &&
+        nxt->output_size() == 1) {
+      // Ok -- unary, no operand of its own to check.
+    } else if (GateBranchBinaryOps().count(nxt->op_type()) != 0 &&
+               nxt->domain() == "" && nxt->input_size() == 2 &&
+               (nxt->input(0) == cur || nxt->input(1) == cur) &&
+               nxt->output_size() == 1) {
+      const std::string& other =
+          (nxt->input(0) == cur) ? nxt->input(1) : nxt->input(0);
+      if (other == cur || !ScalarFloatConst(other, init_map)) {
+        return std::nullopt;
+      }
+    } else {
+      return std::nullopt;
+    }
+    nodes.push_back(nxt);
+    const std::string& out = nxt->output(0);
+    if (graph_outputs.count(out)) {
+      return std::nullopt;
+    }
+    if (out == target) {
+      return nodes;
+    }
+    auto cit = consumers_of.find(out);
+    if (cit == consumers_of.end() || cit->second.size() != 1) {
+      return std::nullopt;
+    }
+    nxt = cit->second[0];
+    cur = out;
+  }
+  return std::nullopt;
+}
+
+struct SelfGatedMatch {
+  std::vector<onnx::NodeProto*> diamond_nodes;  // Forward order.
+  std::string final_out;
+};
+
+// If `cur` (a tensor with *exactly* two consumers) is the origin of a
+// self-gated activation decomposition -- see this section's own comment
+// above -- returns `(diamond_nodes, final_out)`: `diamond_nodes` every node
+// the diamond spans in forward order (the gate branch's own nodes, then the
+// self-gating Mul, then -- only for the erf-GELU shape -- one trailing
+// scalar-scale Mul); `final_out` the diamond's own true output tensor the
+// caller should continue walking from. Used by WalkToConsumer/
+// WalkToConvConsumer as a walk's very first hop only. Declines (nullopt)
+// unless `cur` has exactly two consumers, exactly one of which is a plain
+// `Mul(cur, branch_out)` with `branch_out` distinct from `cur` and not
+// itself a constant, `branch_out` has exactly one consumer and isn't a
+// graph output, and the remaining consumer, walked via WalkGateBranch,
+// resolves `cur` to `branch_out` exactly. A candidate optional trailing
+// scalar Mul is folded in whenever present; its absence (SiLU's own shape)
+// is not itself a decline. Mirrors pruning.py's own
+// _match_self_gated_activation.
+std::optional<SelfGatedMatch> MatchSelfGatedActivation(
+    const std::string& cur, const ConsumerMap& consumers_of,
+    const InitMap& init_map,
+    const std::unordered_set<std::string>& graph_outputs) {
+  auto cit = consumers_of.find(cur);
+  if (cit == consumers_of.end() || cit->second.size() != 2) {
+    return std::nullopt;
+  }
+  const std::vector<onnx::NodeProto*>& consumers = cit->second;
+
+  onnx::NodeProto* gate_node = nullptr;
+  std::string branch_out;
+  int gate_matches = 0;
+  for (onnx::NodeProto* c : consumers) {
+    if (c->op_type() == "Mul" && c->domain() == "" && c->input_size() == 2 &&
+        (c->input(0) == cur || c->input(1) == cur) && c->output_size() == 1) {
+      const std::string& other =
+          (c->input(0) == cur) ? c->input(1) : c->input(0);
+      if (other != cur && !init_map.count(other)) {
+        gate_node = c;
+        branch_out = other;
+        ++gate_matches;
+      }
+    }
+  }
+  if (gate_matches != 1) {
+    return std::nullopt;  // No gate Mul, or an ambiguous second candidate.
+  }
+
+  onnx::NodeProto* branch_first_node = nullptr;
+  int branch_first_count = 0;
+  for (onnx::NodeProto* c : consumers) {
+    if (c != gate_node) {
+      branch_first_node = c;
+      ++branch_first_count;
+    }
+  }
+  if (branch_first_count != 1) {
+    return std::nullopt;
+  }
+
+  if (graph_outputs.count(branch_out) ||
+      ConsumerCount(consumers_of, branch_out) != 1) {
+    return std::nullopt;
+  }
+
+  auto branch_nodes = WalkGateBranch(branch_first_node, cur, branch_out,
+                                     consumers_of, init_map, graph_outputs);
+  if (!branch_nodes) {
+    return std::nullopt;
+  }
+
+  SelfGatedMatch result;
+  result.diamond_nodes = std::move(*branch_nodes);
+  result.diamond_nodes.push_back(gate_node);
+  result.final_out = gate_node->output(0);
+
+  if (!graph_outputs.count(result.final_out) &&
+      ConsumerCount(consumers_of, result.final_out) == 1) {
+    onnx::NodeProto* trailing = consumers_of.at(result.final_out)[0];
+    if (trailing->op_type() == "Mul" && trailing->domain() == "" &&
+        trailing->input_size() == 2 &&
+        (trailing->input(0) == result.final_out ||
+         trailing->input(1) == result.final_out) &&
+        trailing->output_size() == 1) {
+      const std::string& scale = (trailing->input(0) == result.final_out)
+                                     ? trailing->input(1)
+                                     : trailing->input(0);
+      if (scale != result.final_out && ScalarFloatConst(scale, init_map)) {
+        result.diamond_nodes.push_back(trailing);
+        result.final_out = trailing->output(0);
+      }
+    }
+  }
+
+  return result;
+}
+
+struct SelfGatedBackwardMatch {
+  std::vector<onnx::NodeProto*> diamond_nodes;  // Forward order.
+  std::string origin;
+  onnx::NodeProto* gate_node;
+};
+
+// The backward-walk (WalkMatmulProducerBackward/WalkConvProducerBackward)
+// counterpart of MatchSelfGatedActivation: `cur` is the diamond's own
+// candidate *output* tensor (node_by_output[cur] either the self-gating Mul
+// itself, or -- for the erf-GELU shape -- the trailing scalar-scale Mul
+// wrapping it), and this resolves back to the diamond's own true *origin*
+// tensor. Returns `(diamond_nodes, origin, gate_node)` -- `diamond_nodes` in
+// the identical forward order MatchSelfGatedActivation returns them in (so
+// a caller building chain_ops in reverse-of-visit order can walk
+// `diamond_nodes` in reverse, the same as any other single node this walk
+// crosses); `gate_node` is `diamond_nodes`' own self-gating Mul specifically
+// (not necessarily its last element -- the erf-GELU shape's own trailing
+// scalar Mul sits after it), returned separately so the caller can record
+// `origin`'s own *two* real in-group consumers (the gate branch's own first
+// node and this Mul) as two `edges` entries without having to re-derive
+// which element of `diamond_nodes` is which.
+//
+// Since a Mul's two operands are unordered, both candidate origin/target
+// pairings are tried (WalkGateBranch, forward from the candidate origin --
+// the *same* function MatchSelfGatedActivation uses); a match is accepted
+// only when *exactly one* ordering resolves, the same "decline on
+// ambiguity" bar MatchSelfGatedActivation's own gate-candidate search
+// already applies. Mirrors pruning.py's own
+// _match_self_gated_activation_backward.
+std::optional<SelfGatedBackwardMatch> MatchSelfGatedActivationBackward(
+    const std::string& cur,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const ConsumerMap& consumers_of, const InitMap& init_map,
+    const std::unordered_set<std::string>& graph_outputs) {
+  auto nit = node_by_output.find(cur);
+  if (nit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* node = nit->second;
+  if (node->op_type() != "Mul" || node->domain() != "" ||
+      node->input_size() != 2 || node->output_size() != 1 ||
+      node->output(0) != cur) {
+    return std::nullopt;
+  }
+
+  onnx::NodeProto* gate_node = node;
+  onnx::NodeProto* trailing_node = nullptr;
+  std::string a_name = node->input(0);
+  std::string b_name = node->input(1);
+  bool a_const = init_map.count(a_name) != 0;
+  bool b_const = init_map.count(b_name) != 0;
+  if (a_const != b_const) {
+    // A candidate trailing scalar-scale Mul (erf-GELU's own final `* 0.5`)
+    // -- its own non-constant operand must itself be a plain Mul (the real
+    // gate Mul) with no other consumer.
+    const std::string& const_name = a_const ? a_name : b_name;
+    const std::string& gate_out = a_const ? b_name : a_name;
+    if (!ScalarFloatConst(const_name, init_map)) {
+      return std::nullopt;
+    }
+    if (ConsumerCount(consumers_of, gate_out) != 1) {
+      return std::nullopt;
+    }
+    auto git = node_by_output.find(gate_out);
+    if (git == node_by_output.end()) {
+      return std::nullopt;
+    }
+    onnx::NodeProto* gate_candidate = git->second;
+    if (gate_candidate->op_type() != "Mul" || gate_candidate->domain() != "" ||
+        gate_candidate->input_size() != 2 ||
+        gate_candidate->output_size() != 1 ||
+        gate_candidate->output(0) != gate_out) {
+      return std::nullopt;
+    }
+    trailing_node = node;
+    gate_node = gate_candidate;
+    a_name = gate_node->input(0);
+    b_name = gate_node->input(1);
+    a_const = init_map.count(a_name) != 0;
+    b_const = init_map.count(b_name) != 0;
+  }
+
+  if (a_const || b_const || a_name == b_name) {
+    return std::nullopt;  // Not a genuine two-non-constant-operand gate Mul.
+  }
+
+  std::vector<onnx::NodeProto*> resolved_branch_nodes;
+  std::string resolved_origin;
+  int resolved_count = 0;
+  const std::pair<std::string, std::string> orderings[2] = {{a_name, b_name},
+                                                            {b_name, a_name}};
+  for (const auto& ordering : orderings) {
+    const std::string& origin_cand = ordering.first;
+    const std::string& target = ordering.second;
+    if (graph_outputs.count(target) ||
+        ConsumerCount(consumers_of, target) != 1) {
+      continue;
+    }
+    auto oit = consumers_of.find(origin_cand);
+    if (oit == consumers_of.end() || oit->second.size() != 2) {
+      continue;
+    }
+    onnx::NodeProto* first_node = nullptr;
+    int first_count = 0;
+    bool has_gate = false;
+    for (onnx::NodeProto* c : oit->second) {
+      if (c == gate_node) {
+        has_gate = true;
+      } else {
+        first_node = c;
+        ++first_count;
+      }
+    }
+    if (!has_gate || first_count != 1) {
+      continue;
+    }
+    auto branch_nodes = WalkGateBranch(first_node, origin_cand, target,
+                                       consumers_of, init_map, graph_outputs);
+    if (branch_nodes) {
+      resolved_branch_nodes = std::move(*branch_nodes);
+      resolved_origin = origin_cand;
+      ++resolved_count;
+    }
+  }
+  if (resolved_count != 1) {
+    return std::nullopt;  // No resolvable ordering, or an ambiguous second one.
+  }
+
+  SelfGatedBackwardMatch result;
+  result.diamond_nodes = std::move(resolved_branch_nodes);
+  result.diamond_nodes.push_back(gate_node);
+  if (trailing_node != nullptr) {
+    result.diamond_nodes.push_back(trailing_node);
+  }
+  result.origin = resolved_origin;
+  result.gate_node = gate_node;
+  return result;
+}
+
 std::pair<std::optional<ConsumerMatch>, std::vector<ChainOp>> WalkToConsumer(
     const std::string& start, const InitMap& init_map,
     const ConsumerMap& consumers_of,
@@ -698,11 +1463,54 @@ std::pair<std::optional<ConsumerMatch>, std::vector<ChainOp>> WalkToConsumer(
       // so more than one consumer is expected here -- the caller has
       // already picked this one specific consumer to resolve this branch
       // through. Every hop after the first still enforces the ordinary
-      // single-consumer bar unchanged below.
+      // single-consumer bar unchanged below. Neither the decomposed-
+      // LayerNorm nor the self-gated-activation hop below is ever attempted
+      // on this path -- see MatchDecomposedLayerNormPassThrough's/this
+      // file's own "Self-gated activation decomposition" section comment
+      // for why that composition is out of scope.
       nxt = forced_first_hop;
     } else {
+      // Tried before the ordinary "exactly one consumer" dispatch below,
+      // since a decomposed LayerNorm's own root tensor is read *twice* (by
+      // its first ReduceMean and its Sub) -- a shape that dispatch can
+      // never reach on its own. Declines instantly whenever `cur` doesn't
+      // have exactly two consumers, so this costs an ordinary hop nothing.
+      auto ln_match = MatchDecomposedLayerNormPassThrough(
+          cur, consumers_of, init_map, graph_outputs, n_channels);
+      if (ln_match) {
+        chain_ops.insert(chain_ops.end(), ln_match->chain_ops.begin(),
+                         ln_match->chain_ops.end());
+        cur = ln_match->out_name;
+        continue;
+      }
+
       auto cit = consumers_of.find(cur);
-      if (cit == consumers_of.end() || cit->second.size() != 1) {
+      const size_t num_candidates =
+          cit == consumers_of.end() ? 0 : cit->second.size();
+      if (num_candidates == 2) {
+        // A self-gated activation decomposition's own origin tensor -- see
+        // this file's own "Self-gated activation decomposition" section
+        // comment above. Recognized only here, at a walk's very first hop
+        // (`cur == start` the very first time this branch runs) -- every
+        // later hop only ever promotes `out2` to `cur` once its own
+        // single-consumer bar already holds, so `cur` can never
+        // legitimately have two consumers past hop 0.
+        auto diamond = MatchSelfGatedActivation(cur, consumers_of, init_map,
+                                                graph_outputs);
+        if (diamond) {
+          if (ConsumerCount(consumers_of, diamond->final_out) != 1 ||
+              graph_outputs.count(diamond->final_out)) {
+            break;
+          }
+          for (onnx::NodeProto* n : diamond->diamond_nodes) {
+            chain_ops.push_back(ChainOp{n, std::nullopt});
+          }
+          cur = diamond->final_out;
+          continue;
+        }
+        break;  // Two consumers but not this shape -- declined, as before.
+      }
+      if (num_candidates != 1) {
         break;
       }
       nxt = cit->second[0];
@@ -781,11 +1589,37 @@ std::pair<std::optional<ConsumerMatch>, std::vector<ChainOp>> WalkToConsumer(
     }
 
     const std::string& out2 = nxt->output(0);
-    if (ConsumerCount(consumers_of, out2) != 1 || graph_outputs.count(out2)) {
+    if (graph_outputs.count(out2)) {
       break;
     }
+    // Ordinarily `out2` must have exactly one consumer to safely become the
+    // walk's new `cur` -- but a decomposed LayerNorm's own root tensor is,
+    // by its own fixed shape, read *twice* (see
+    // MatchDecomposedLayerNormPassThrough's own comment), so an `out2` this
+    // hop produces right where such a sequence begins (e.g. a bias Add
+    // feeding both the sequence's own ReduceMean and Sub) would otherwise
+    // always fail this check and break the walk before ever reaching the
+    // top-of-loop dispatch that tries this hop for `cur` -- that dispatch
+    // only ever sees `cur` *after* a hop already committed to advancing past
+    // it. Trying the same matcher here first, before the ordinary
+    // single-consumer bar, closes that gap: every other multi-consumer
+    // `out2` still declines exactly as before.
+    std::optional<DecomposedLayerNormMatch> out2_ln;
+    if (ConsumerCount(consumers_of, out2) != 1) {
+      out2_ln = MatchDecomposedLayerNormPassThrough(
+          out2, consumers_of, init_map, graph_outputs, n_channels);
+      if (!out2_ln) {
+        break;
+      }
+    }
     chain_ops.push_back(ChainOp{nxt, const_name});
-    cur = out2;
+    if (out2_ln) {
+      chain_ops.insert(chain_ops.end(), out2_ln->chain_ops.begin(),
+                       out2_ln->chain_ops.end());
+      cur = out2_ln->out_name;
+    } else {
+      cur = out2;
+    }
   }
   return {consumer, chain_ops};
 }
@@ -800,9 +1634,6 @@ std::vector<Chain> FindChains(onnx::GraphProto* graph) {
   for (const auto& o : graph->output()) {
     graph_outputs.insert(o.name());
   }
-  auto is_internal = [&](const std::string& name) {
-    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
-  };
 
   std::vector<Chain> chains;
   for (int i = 0; i < graph->node_size(); ++i) {
@@ -812,7 +1643,14 @@ std::vector<Chain> FindChains(onnx::GraphProto* graph) {
       continue;
     }
     const std::string& out_name = node->output(0);
-    if (!is_internal(out_name)) {
+    // MatmulWalkRootOk only rules out a graph output -- every other "is
+    // this safe to walk forward from" question (an ordinary single
+    // consumer, the decomposed-LayerNorm two-consumer root shape, or a
+    // self-gated activation decomposition's own two-consumer origin) is
+    // left entirely to WalkToConsumer's own hop-0 dispatch, which declines
+    // (same as before) if the actual consumers don't form a recognized
+    // shape.
+    if (!MatmulWalkRootOk(out_name, graph_outputs)) {
       continue;
     }
     auto [consumer, chain_ops] =
@@ -968,7 +1806,9 @@ std::vector<Chain> FindGatedChains(onnx::GraphProto* graph) {
     }
 
     const std::string& out_name = node->output(0);
-    if (!is_internal(out_name)) {
+    // See FindChains's own identical comment -- the gated combine's own raw
+    // output can be a decomposed-LayerNorm/self-gated-activation root too.
+    if (!MatmulWalkRootOk(out_name, graph_outputs)) {
       continue;
     }
     auto [consumer, chain_ops] =
@@ -1011,9 +1851,17 @@ std::optional<ConvProducerMatch> MatchConvProducer(const onnx::NodeProto& node,
     return std::nullopt;
   }
   auto it = init_map.find(node.input(1));
+  // Any spatial rank n >= 1 (weight rank >= 3: one output-channel axis, one
+  // input-channel axis, at least one spatial axis) -- mirrors pruning.py's
+  // own _match_conv_producer exactly (see that function's own docstring:
+  // "1-D, 2-D, or 3-D alike"). Widened from this port's original
+  // exactly-rank-4 (2-D-only) bound so a 1-D Conv -- the only shape a real
+  // `CausalConvWithState` pipeline's own bracketing producer/consumer Conv
+  // can ever be, since that op's own I/O is always rank-3 -- can match here
+  // too; every existing rank-4 caller is unaffected, this only admits more.
   if (it == init_map.end() ||
       it->second->data_type() != onnx::TensorProto::FLOAT ||
-      it->second->dims_size() != 4) {
+      it->second->dims_size() < 3) {
     return std::nullopt;
   }
   const onnx::TensorProto* w = it->second;
@@ -1049,9 +1897,11 @@ std::optional<ConvConsumerMatch> MatchConvConsumer(const onnx::NodeProto& node,
     return std::nullopt;
   }
   auto it = init_map.find(node.input(1));
+  // See MatchConvProducer's own comment: any spatial rank n >= 1, mirroring
+  // pruning.py's own _match_conv_consumer.
   if (it == init_map.end() ||
       it->second->data_type() != onnx::TensorProto::FLOAT ||
-      it->second->dims_size() != 4) {
+      it->second->dims_size() < 3) {
     return std::nullopt;
   }
   const onnx::TensorProto* w = it->second;
@@ -1071,6 +1921,13 @@ std::optional<ConvConsumerMatch> MatchConvConsumer(const onnx::NodeProto& node,
 struct DepthwiseMatch {
   std::string weight;
   std::optional<std::string> bias;
+  // Set only by MatchCausalConvWithStatePassThrough, for a hop whose own
+  // `past_state` input (index 3) is itself a constant initializer of the
+  // documented rank-3 `(*, n_channels, *)` shape -- see that matcher's own
+  // comment. Always nullopt for a real depthwise Conv match
+  // (MatchDepthwiseConvPassThrough/MatchConvPassThroughSelf never set it --
+  // a plain Conv has no such fourth input at all).
+  std::optional<std::string> past_state;
 };
 
 std::optional<DepthwiseMatch> MatchDepthwiseConvPassThrough(
@@ -1083,7 +1940,9 @@ std::optional<DepthwiseMatch> MatchDepthwiseConvPassThrough(
     return std::nullopt;
   }
   const onnx::TensorProto* w = it->second;
-  if (w->data_type() != onnx::TensorProto::FLOAT || w->dims_size() != 4 ||
+  // Any spatial rank n >= 1 -- see MatchConvProducer's own comment; mirrors
+  // pruning.py's own _match_depthwise_conv_pass_through.
+  if (w->data_type() != onnx::TensorProto::FLOAT || w->dims_size() < 3 ||
       w->dims(0) != n_channels || w->dims(1) != 1 ||
       ConvGroupAttr(node) != n_channels) {
     return std::nullopt;
@@ -1097,31 +1956,75 @@ std::optional<DepthwiseMatch> MatchDepthwiseConvPassThrough(
       return std::nullopt;
     }
   }
-  return DepthwiseMatch{node.input(1), bias};
+  return DepthwiseMatch{node.input(1), bias, std::nullopt};
 }
 
-// True if `name` names a constant FLOAT initializer shaped like a flat
-// per-channel vector (`prod(dims) == dims[-1]`) -- mirrors pruning.py's own
-// `_flat_channel_const` exactly: the self-consistency bar every per-channel
-// affine/bias/scale hop in this module checks before ever accepting a
-// tensor as a slice target. The real `dims[-1] == n_channels` check, once
-// the chain's real channel count is known, is left to the caller
-// (MatchGroupNormPassThrough).
-bool FlatChannelConst(const std::string& name, const InitMap& init_map) {
-  auto it = init_map.find(name);
-  if (it == init_map.end() ||
-      it->second->data_type() != onnx::TensorProto::FLOAT) {
-    return false;
+// The Conv-chain `CausalConvWithState` pass-through matcher used by
+// WalkToConvConsumer, mirroring pruning.py's own
+// _match_causal_conv_with_state_pass_through: if `node` is a plain
+// `ai.onnx::CausalConvWithState` node (opset 27+, domain "") whose constant
+// `weight` (input 1) is exactly the depthwise-Conv shape
+// MatchDepthwiseConvPassThrough already recognizes (`[n_channels, 1, k]`),
+// returns a DepthwiseMatch identical in shape to that matcher's own result
+// -- this op mixes no channels at all, identically to a depthwise Conv,
+// except it carries two extra per-channel-shaped operands a depthwise Conv
+// doesn't: an optional `bias` (input 2, identical treatment to a depthwise
+// Conv's own) and an optional `past_state` carry tensor (input 3), set on
+// the returned DepthwiseMatch only when it is itself a constant of the
+// documented rank-3 `(*, n_channels, *)` shape (axis 1 == n_channels) --
+// left nullopt (needing no slicing at all) when dynamic/absent, and this
+// whole match declined (nullopt) when it's a constant of any *other* shape
+// (never guessed at). This op's own second output, `present_state`, is
+// never a tensor this function slices (a runtime *output*, not a weight);
+// the caller (WalkToConvConsumer) is responsible for treating it as stale
+// alongside `output` -- see this file's own `stale_value_info` handling in
+// ApplyChains/ApplyConcatChains, which iterates every one of a hop node's
+// outputs, not just output(0), for exactly this reason.
+std::optional<DepthwiseMatch> MatchCausalConvWithStatePassThrough(
+    const onnx::NodeProto& node, const InitMap& init_map, int64_t n_channels) {
+  if (node.op_type() != "CausalConvWithState" || node.domain() != "") {
+    return std::nullopt;
   }
-  const auto& dims = it->second->dims();
-  if (dims.size() == 0) {
-    return false;
+  if (node.input_size() < 2) {
+    return std::nullopt;
   }
-  int64_t prod = 1;
-  for (int64_t d : dims) {
-    prod *= d;
+  const std::string& w_name = node.input(1);
+  auto wit = init_map.find(w_name);
+  if (wit == init_map.end() ||
+      wit->second->data_type() != onnx::TensorProto::FLOAT ||
+      wit->second->dims_size() != 3 || wit->second->dims(0) != n_channels ||
+      wit->second->dims(1) != 1) {
+    return std::nullopt;
   }
-  return prod == dims.Get(dims.size() - 1);
+  std::optional<std::string> bias;
+  if (node.input_size() > 2 && !node.input(2).empty()) {
+    bias = node.input(2);
+    auto bit = init_map.find(*bias);
+    if (bit == init_map.end() ||
+        bit->second->data_type() != onnx::TensorProto::FLOAT) {
+      return std::nullopt;  // Non-constant bias -- can't safely prune it.
+    }
+  }
+  std::optional<std::string> past_state;
+  if (node.input_size() > 3 && !node.input(3).empty()) {
+    auto pit = init_map.find(node.input(3));
+    if (pit != init_map.end()) {
+      // A constant past_state -- degenerate, but if present it must be the
+      // documented rank-3 (batch, channels, k-1) shape with axis 1 ==
+      // n_channels to be safely sliceable; anything else declines the whole
+      // hop rather than guessing which axis (if any) is really the channel
+      // one.
+      const onnx::TensorProto* ps = pit->second;
+      if (ps->data_type() != onnx::TensorProto::FLOAT || ps->dims_size() != 3 ||
+          ps->dims(1) != n_channels) {
+        return std::nullopt;
+      }
+      past_state = node.input(3);
+      // else: dynamic (an ordinary graph input/runtime buffer) -- the
+      // caller's own runtime data, needs no slicing, not tracked here.
+    }
+  }
+  return DepthwiseMatch{w_name, bias, past_state};
 }
 
 struct GroupNormMatch {
@@ -1180,6 +2083,62 @@ std::optional<GroupNormMatch> MatchGroupNormPassThrough(
     return std::nullopt;
   }
   return GroupNormMatch{scale_name, bias_name, num_groups};
+}
+
+struct InstanceNormMatch {
+  std::string scale;
+  std::string bias;
+};
+
+// The Conv-chain InstanceNormalization pass-through matcher used by
+// WalkToConvConsumer, mirroring pruning.py's own
+// _match_instance_norm_pass_through: if `node` is a plain (default-domain)
+// `InstanceNormalization` node (opset 6+) with constant, exactly-1-D
+// (`dims == [n_channels]`) `scale` (input 1) and `B` (input 2) -- both
+// required by the op's own schema -- returns `{scale_name, bias_name}`.
+// Declines (nullopt) on a missing/non-constant/wrongly-shaped `scale`/`B`,
+// or `scale`/`B` naming the same tensor (double-slicing it would corrupt
+// it, the same tied-name bar MatchGroupNormPassThrough already applies) --
+// none of these is guessed at.
+//
+// Unlike MatchGroupNormPassThrough's own FlatChannelConst bar
+// (`prod(dims) == dims[-1]`, deliberately loose enough to admit a
+// broadcastable-but-not-strictly-1-D shape like `[1, 1, C]`), this requires
+// `scale`/`B` to be *strictly* rank-1: the returned names are carried on a
+// plain ConvPassThrough (this hop's own `scale`/`B` playing that struct's
+// `weight`/`bias` role -- no dedicated struct needed here the way
+// GroupNormPassThrough needed one), whose own slicing (ApplyChains's own
+// SliceProducerWeight(..., is_conv=true) call) always slices axis 0 --
+// correct only when axis 0 already *is* the one-and-only axis, i.e.
+// strictly rank-1. A looser broadcastable shape would silently slice the
+// wrong axis instead of being declined, so this bar is deliberately
+// narrower than FlatChannelConst's -- not a missed generalization: the ONNX
+// schema itself only ever documents `scale`/`B` as rank-1 `[C]` for this
+// op (no opset ever gave it GroupNorm's own per-*group* alternate shape),
+// so nothing real is excluded by holding to that.
+std::optional<InstanceNormMatch> MatchInstanceNormPassThrough(
+    const onnx::NodeProto& node, const InitMap& init_map, int64_t n_channels) {
+  if (node.op_type() != "InstanceNormalization" || node.domain() != "" ||
+      node.input_size() != 3 || node.input(1).empty() ||
+      node.input(2).empty() || node.output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& scale_name = node.input(1);
+  const std::string& bias_name = node.input(2);
+  if (scale_name == bias_name) {
+    return std::nullopt;  // Tied scale/B -- double-slicing would corrupt it.
+  }
+  auto sit = init_map.find(scale_name);
+  auto bit = init_map.find(bias_name);
+  if (sit == init_map.end() || bit == init_map.end() ||
+      sit->second->data_type() != onnx::TensorProto::FLOAT ||
+      bit->second->data_type() != onnx::TensorProto::FLOAT ||
+      sit->second->dims_size() != 1 || bit->second->dims_size() != 1 ||
+      sit->second->dims(0) != n_channels ||
+      bit->second->dims(0) != n_channels) {
+    return std::nullopt;
+  }
+  return InstanceNormMatch{scale_name, bias_name};
 }
 
 // True iff `node` (already confirmed by the caller to be a plain
@@ -1435,11 +2394,37 @@ WalkToConvConsumer(const std::string& start, const InitMap& init_map,
     onnx::NodeProto* nxt;
     if (hop == 0 && forced_first_hop != nullptr) {
       // See WalkToConsumer's own matching parameter -- used only by
-      // ResolveConvFanoutBranches.
+      // ResolveConvFanoutBranches. The self-gated-activation hop below is
+      // never attempted on this path either -- see this file's own
+      // "Self-gated activation decomposition" section comment for why.
       nxt = forced_first_hop;
     } else {
       auto cit = consumers_of.find(cur);
-      if (cit == consumers_of.end() || cit->second.size() != 1) {
+      const size_t num_candidates =
+          cit == consumers_of.end() ? 0 : cit->second.size();
+      if (num_candidates == 2) {
+        // A self-gated activation decomposition's own origin tensor (SiLU/
+        // Swish, ubiquitous after Conv in YOLO-style backbones) -- see this
+        // file's own "Self-gated activation decomposition" section comment
+        // above WalkGateBranch. Recognized only at a walk's very first hop
+        // -- see that comment for why every later hop can never see a
+        // two-consumer `cur` in the first place.
+        auto diamond = MatchSelfGatedActivation(cur, consumers_of, init_map,
+                                                graph_outputs);
+        if (diamond) {
+          if (ConsumerCount(consumers_of, diamond->final_out) != 1 ||
+              graph_outputs.count(diamond->final_out)) {
+            break;
+          }
+          for (onnx::NodeProto* n : diamond->diamond_nodes) {
+            chain_ops.push_back(ChainOp{n, std::nullopt});
+          }
+          cur = diamond->final_out;
+          continue;
+        }
+        break;  // Two consumers but not this shape -- declined, as before.
+      }
+      if (num_candidates != 1) {
         break;
       }
       nxt = cit->second[0];
@@ -1460,6 +2445,58 @@ WalkToConvConsumer(const std::string& start, const InitMap& init_map,
       auto match = MatchConvConsumer(*nxt, init_map);
       if (match && match->in_channels == n_channels) {
         consumer = ConvConsumerResult{nxt, match->weight, match->group};
+      }
+      break;
+    }
+
+    if (nxt->op_type() == "CausalConvWithState" && nxt->domain() == "" &&
+        nxt->input_size() > 0 && nxt->input(0) == cur) {
+      // This op is never a consumer in its own right (unlike `Conv` above,
+      // which falls through to MatchConvConsumer on a depthwise-match
+      // miss), so a failed match here simply ends the walk -- mirrors
+      // pruning.py's own identical short-circuit in _walk_to_conv_consumer.
+      // See MatchCausalConvWithStatePassThrough's own comment for the full
+      // empirical schema findings, including why this hop is recognized
+      // only by this forward walk (WalkConvProducerBackward's own per-hop
+      // loop unconditionally declines any node with output_size() != 1, and
+      // this op always has two outputs).
+      auto cc = MatchCausalConvWithStatePassThrough(*nxt, init_map, n_channels);
+      if (cc) {
+        const std::string& out2 = nxt->output(0);
+        if (ConsumerCount(consumers_of, out2) != 1 ||
+            graph_outputs.count(out2)) {
+          break;
+        }
+        pass_through.push_back(
+            ConvPassThrough{nxt, cc->weight, cc->bias, cc->past_state});
+        cur = out2;
+        continue;
+      }
+      break;
+    }
+
+    if (nxt->op_type() == "InstanceNormalization" && nxt->domain() == "" &&
+        nxt->input_size() > 0 && nxt->input(0) == cur) {
+      // Recognized unconditionally (no `recognize_*` gate, and any number
+      // of times per chain, unlike the GroupNorm hop below) --
+      // InstanceNorm's per-channel-only statistics carry no
+      // group-boundary-drift risk to guard against, so this hop is exactly
+      // as unrestricted as a depthwise Conv hop above, reusing the same
+      // ConvPassThrough struct (its own `scale`/`B` playing that struct's
+      // `weight`/`bias` role) rather than needing a dedicated one. Like
+      // CausalConvWithState above, this op is never a consumer in its own
+      // right, so a failed match here simply ends the walk.
+      auto in_match = MatchInstanceNormPassThrough(*nxt, init_map, n_channels);
+      if (in_match) {
+        const std::string& out2 = nxt->output(0);
+        if (ConsumerCount(consumers_of, out2) != 1 ||
+            graph_outputs.count(out2)) {
+          break;
+        }
+        pass_through.push_back(
+            ConvPassThrough{nxt, in_match->scale, in_match->bias});
+        cur = out2;
+        continue;
       }
       break;
     }
@@ -1565,9 +2602,6 @@ std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
   for (const auto& o : graph->output()) {
     graph_outputs.insert(o.name());
   }
-  auto is_internal = [&](const std::string& name) {
-    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
-  };
 
   std::vector<Chain> chains;
   for (int i = 0; i < graph->node_size(); ++i) {
@@ -1577,7 +2611,19 @@ std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
       continue;
     }
     const std::string& out_name = node->output(0);
-    if (!is_internal(out_name)) {
+    // Ordinarily exactly one consumer -- but also admit exactly two, the
+    // shape a self-gated activation decomposition's own origin tensor
+    // takes (see this file's own "Self-gated activation decomposition"
+    // section comment above WalkGateBranch): WalkToConvConsumer decides, at
+    // its own first hop, whether those two consumers actually form that
+    // shape, declining (same as before) if not. Unlike FindChains's own
+    // MatmulWalkRootOk gate, this stays narrower (1 or 2 only, never a bare
+    // "not a graph output") -- the decomposed-LayerNorm hop is MatMul/Gemm-
+    // chain-only, so there's no analogous reason to admit an arbitrary
+    // consumer count here.
+    if (graph_outputs.count(out_name) ||
+        (ConsumerCount(consumers_of, out_name) != 1 &&
+         ConsumerCount(consumers_of, out_name) != 2)) {
       continue;
     }
     auto [consumer, chain_ops, pass_through, group_norm] = WalkToConvConsumer(
@@ -1666,9 +2712,10 @@ std::optional<DepthwiseMatch> MatchConvPassThroughSelf(
     return std::nullopt;
   }
   auto it = init_map.find(node.input(1));
+  // Any spatial rank n >= 1 -- see MatchConvProducer's own comment.
   if (it == init_map.end() ||
       it->second->data_type() != onnx::TensorProto::FLOAT ||
-      it->second->dims_size() != 4) {
+      it->second->dims_size() < 3) {
     return std::nullopt;
   }
   return MatchDepthwiseConvPassThrough(node, init_map, it->second->dims(0));
@@ -1708,6 +2755,36 @@ std::optional<PreluMatch> MatchPreluPassThroughSelf(const onnx::NodeProto& node,
   return MatchPreluPassThrough(node, init_map, expected);
 }
 
+// The backward-walk (WalkConvProducerBackward) counterpart of
+// MatchInstanceNormPassThrough, mirroring pruning.py's own
+// _match_instance_norm_pass_through_self and MatchConvPassThroughSelf's own
+// identical trick: the backward walk doesn't know its group's shared
+// channel count yet at the point it first crosses this hop, so this checks
+// the node's own `scale` is self-consistently rank-1 by calling
+// MatchInstanceNormPassThrough with `scale`'s own `dims(0)` as the
+// "expected" n_channels -- trivially satisfying that one check and leaving
+// every other one (constant B, matching length, non-tied names) intact.
+// FindConvResidualChains/ResolveConvResidualGroupForConcat re-validate
+// every such hop against the group's real, established channel count once
+// resolved (the same generic pass_through re-validation a depthwise hop
+// already gets, keyed only on `hop.weight`'s own `dims(0)` -- `hop.weight`
+// here holds this op's own `scale` name, so that same generic check already
+// re-validates this hop correctly, with no dedicated InstanceNorm-specific
+// re-check needed).
+std::optional<InstanceNormMatch> MatchInstanceNormPassThroughSelf(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.op_type() != "InstanceNormalization" || node.input_size() < 2) {
+    return std::nullopt;
+  }
+  auto sit = init_map.find(node.input(1));
+  if (sit == init_map.end() ||
+      sit->second->data_type() != onnx::TensorProto::FLOAT ||
+      sit->second->dims_size() != 1) {
+    return std::nullopt;
+  }
+  return MatchInstanceNormPassThrough(node, init_map, sit->second->dims(0));
+}
+
 // Walks backward from tensor `start` through unary pass-through activations
 // and self-consistently-depthwise Conv hops, declining (only) whenever a
 // tensor crossed -- `start` itself included -- is a graph output. Unlike the
@@ -1721,7 +2798,7 @@ std::optional<PreluMatch> MatchPreluPassThroughSelf(const onnx::NodeProto& node,
 ConvBackwardEdge WalkConvProducerBackward(
     const std::string& start,
     const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
-    const InitMap& init_map,
+    const InitMap& init_map, const ConsumerMap& consumers_of,
     const std::unordered_set<std::string>& graph_outputs, int max_hops) {
   std::vector<ConvPassThrough> pass_through;  // Backward order.
   std::vector<onnx::NodeProto*> unary_ops;    // Backward order.
@@ -1756,6 +2833,20 @@ ConvBackwardEdge WalkConvProducerBackward(
     auto dw = MatchConvPassThroughSelf(*node, init_map);
     if (dw) {
       pass_through.push_back(ConvPassThrough{node, dw->weight, dw->bias});
+      edges.push_back({node->input(0), node});
+      cur = node->input(0);
+      continue;
+    }
+
+    // Recognized unconditionally here too (no gate), mirroring
+    // MatchInstanceNormPassThrough's own unconditional recognition in
+    // WalkToConvConsumer -- InstanceNorm's per-channel-only statistics
+    // carry no group-boundary-drift risk to guard against, unlike the
+    // GroupNorm hop, which this backward walk never recognizes at all.
+    auto in_self = MatchInstanceNormPassThroughSelf(*node, init_map);
+    if (in_self) {
+      pass_through.push_back(
+          ConvPassThrough{node, in_self->scale, in_self->bias});
       edges.push_back({node->input(0), node});
       cur = node->input(0);
       continue;
@@ -1804,6 +2895,31 @@ ConvBackwardEdge WalkConvProducerBackward(
       edges.push_back({node->input(0), node});
       cur = node->input(0);
       continue;
+    }
+
+    if (node->op_type() == "Mul" && node->domain() == "") {
+      // See WalkMatmulProducerBackward's own identical check for the full
+      // reasoning (checked here, ahead of nothing else in this Conv-chain
+      // walker -- unlike the MatMul/Gemm walk, there is no ordinary
+      // bias/scale Mul hop here to shadow). `origin`'s own two real
+      // in-group consumers (the gate branch's own first node, and the gate
+      // Mul itself) both become `edges` entries, tolerated natively by the
+      // `accounted` bookkeeping FindConvResidualChains builds from them.
+      // This is the reason this function gained a `consumers_of` parameter
+      // at all -- every other hop above reaches `cur`'s own producer purely
+      // via `node_by_output`, needing no forward-consumer lookups.
+      auto diamond = MatchSelfGatedActivationBackward(
+          cur, node_by_output, consumers_of, init_map, graph_outputs);
+      if (diamond) {
+        for (auto it = diamond->diamond_nodes.rbegin();
+             it != diamond->diamond_nodes.rend(); ++it) {
+          unary_ops.push_back(*it);
+        }
+        edges.push_back({diamond->origin, diamond->diamond_nodes.front()});
+        edges.push_back({diamond->origin, diamond->gate_node});
+        cur = diamond->origin;
+        continue;
+      }
     }
 
     if (IsEligibleAddMerge(*node, init_map)) {
@@ -1952,8 +3068,9 @@ std::vector<Chain> FindConvResidualChains(onnx::GraphProto* graph) {
   for (size_t idx = 0; idx < eligible_adds.size(); ++idx) {
     std::vector<ConvBackwardEdge> results;
     for (const auto& operand : eligible_adds[idx]->input()) {
-      ConvBackwardEdge edge = WalkConvProducerBackward(
-          operand, node_by_output, init_map, graph_outputs, kMaxChainHops);
+      ConvBackwardEdge edge =
+          WalkConvProducerBackward(operand, node_by_output, init_map,
+                                   consumers_of, graph_outputs, kMaxChainHops);
       if (edge.kind == BackwardEdgeKind::kFail) {
         poisoned.insert(static_cast<int>(idx));
       } else if (edge.kind == BackwardEdgeKind::kAdd) {
@@ -2366,6 +3483,38 @@ MatMulBackwardEdge WalkMatmulProducerBackward(
       edges.push_back({node->input(0), node});
       cur = node->input(0);
       continue;
+    }
+
+    if (node->op_type() == "Mul" && node->domain() == "") {
+      // Checked ahead of the ordinary Add/Mul dispatch below: a self-gated
+      // activation decomposition's own gate Mul (and, for erf-GELU, its
+      // trailing scalar-scale Mul) is otherwise indistinguishable from a
+      // plain bias/scale Mul hop by op type alone -- see this file's own
+      // "Self-gated activation decomposition" section comment above
+      // WalkGateBranch. The diamond's own origin tensor legitimately has
+      // two in-group consumers (the gate branch's own first node, and this
+      // Mul), so *two* `edges` entries share that one tensor -- the
+      // `accounted` bookkeeping every caller of this walk already builds
+      // tolerates that natively; the direct Concat-branch walk
+      // (BranchWalkHasFanout) does not, and simply declines a branch that
+      // crosses one, the same safe fallback a residual/merge fan-out
+      // already gets there before this feature existed.
+      auto diamond = MatchSelfGatedActivationBackward(
+          cur, node_by_output, consumers_of, init_map, graph_outputs);
+      if (diamond) {
+        for (auto it = diamond->diamond_nodes.rbegin();
+             it != diamond->diamond_nodes.rend(); ++it) {
+          chain_ops.push_back(ChainOp{*it, std::nullopt});
+        }
+        // `origin` has two real in-group consumers -- the gate branch's
+        // own first node and the gate Mul itself -- both recorded so
+        // neither is later mistaken for a stray extra consumer needing its
+        // own separate resolution.
+        edges.push_back({diamond->origin, diamond->diamond_nodes.front()});
+        edges.push_back({diamond->origin, diamond->gate_node});
+        cur = diamond->origin;
+        continue;
+      }
     }
 
     if ((node->op_type() == "Add" || node->op_type() == "Mul") &&
@@ -3238,6 +4387,15 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
       if (hop.bias) {
         SliceLastAxis(init_map.at(*hop.bias), keep);
       }
+      if (hop.past_state) {
+        // A CausalConvWithState hop's own constant `past_state` -- rank-3
+        // `(batch, channels, k-1)`, channel axis 1 -- reuses
+        // SliceConsumerWeight's own `is_conv` branch (SliceAxis1 over
+        // dims(0)/dims(1) with `inner = prod(dims[2:])`), which slices
+        // exactly that axis; mirrors pruning.py's own _slice_axis1 call in
+        // _apply_conv_pass_through_hop.
+        SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
+      }
       // A PRelu per-channel-slope hop reuses ConvPassThrough for its own
       // slicing (see MatchPreluPassThrough's own comment) but, unlike a
       // depthwise Conv hop, has no `group` attribute of its own to update --
@@ -3283,6 +4441,9 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
         if (hop.bias) {
           SliceLastAxis(init_map.at(*hop.bias), keep);
         }
+        if (hop.past_state) {
+          SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
+        }
         if (hop.node->op_type() == "Conv") {
           SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
         }
@@ -3318,8 +4479,13 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
     for (const auto& co : chain.chain_ops) {
       stale_value_info.insert(co.node->output(0));
     }
+    // Every output, not just [0] -- a hop node can have more than one (e.g.
+    // `CausalConvWithState`'s own `present_state`); see ConvPassThrough's
+    // own docstring.
     for (const auto& hop : chain.conv_pass_through) {
-      stale_value_info.insert(hop.node->output(0));
+      for (const auto& out : hop.node->output()) {
+        stale_value_info.insert(out);
+      }
     }
     if (chain.group_norm) {
       stale_value_info.insert(chain.group_norm->node->output(0));
@@ -3329,7 +4495,9 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
         stale_value_info.insert(co.node->output(0));
       }
       for (const auto& hop : b->conv_pass_through) {
-        stale_value_info.insert(hop.node->output(0));
+        for (const auto& out : hop.node->output()) {
+          stale_value_info.insert(out);
+        }
       }
     }
   }
@@ -4420,7 +5588,7 @@ struct ResolvedConvResidualGroup {
 std::optional<ResolvedConvResidualGroup> ResolveConvResidualGroupForConcat(
     onnx::NodeProto* root,
     const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
-    const InitMap& init_map,
+    const InitMap& init_map, const ConsumerMap& consumers_of,
     const std::unordered_set<std::string>& graph_outputs) {
   std::vector<onnx::NodeProto*> visited{root};
   std::unordered_set<onnx::NodeProto*> visited_ids{root};
@@ -4446,8 +5614,9 @@ std::optional<ResolvedConvResidualGroup> ResolveConvResidualGroupForConcat(
     }
     for (const auto& operand : add_node->input()) {
       mark_backbone(operand, add_node);
-      ConvBackwardEdge edge = WalkConvProducerBackward(
-          operand, node_by_output, init_map, graph_outputs, kMaxChainHops);
+      ConvBackwardEdge edge =
+          WalkConvProducerBackward(operand, node_by_output, init_map,
+                                   consumers_of, graph_outputs, kMaxChainHops);
       for (const auto& e : edge.edges) {
         mark_backbone(e.first, e.second);
       }
@@ -4532,9 +5701,6 @@ std::vector<ConcatChain> FindMatmulConcatChains(onnx::GraphProto* graph) {
     graph_outputs.insert(o.name());
   }
   auto value_info_by_name = ValueInfoByName(*graph);
-  auto is_internal = [&](const std::string& name) {
-    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
-  };
 
   std::unordered_map<std::string, FullProducerMatch> producer_infos;
   for (int i = 0; i < graph->node_size(); ++i) {
@@ -4663,7 +5829,9 @@ std::vector<ConcatChain> FindMatmulConcatChains(onnx::GraphProto* graph) {
     }
 
     const std::string& out_name = node->output(0);
-    if (!is_internal(out_name)) {
+    // See FindChains's own identical comment -- the Concat merge's own raw
+    // output can be a decomposed-LayerNorm/self-gated-activation root too.
+    if (!MatmulWalkRootOk(out_name, graph_outputs)) {
       continue;
     }
     const int64_t total_n = offset;
@@ -4740,8 +5908,9 @@ std::vector<ConcatChain> FindConvConcatChains(onnx::GraphProto* graph) {
     int64_t offset = 0;
     bool declined = false;
     for (const auto& operand : node->input()) {
-      ConvBackwardEdge edge = WalkConvProducerBackward(
-          operand, node_by_output, init_map, graph_outputs, kMaxChainHops);
+      ConvBackwardEdge edge =
+          WalkConvProducerBackward(operand, node_by_output, init_map,
+                                   consumers_of, graph_outputs, kMaxChainHops);
       if (edge.kind == BackwardEdgeKind::kFail) {
         declined = true;
         break;
@@ -4752,7 +5921,8 @@ std::vector<ConcatChain> FindConvConcatChains(onnx::GraphProto* graph) {
       }
       if (edge.kind == BackwardEdgeKind::kAdd) {
         auto resolved = ResolveConvResidualGroupForConcat(
-            edge.add_node, node_by_output, init_map, graph_outputs);
+            edge.add_node, node_by_output, init_map, consumers_of,
+            graph_outputs);
         if (!resolved) {
           declined = true;
           break;
@@ -5008,6 +6178,9 @@ void ApplyConcatChains(onnx::GraphProto* graph,
         if (hop.bias) {
           SliceLastAxis(init_map.at(*hop.bias), keep);
         }
+        if (hop.past_state) {
+          SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
+        }
         if (hop.node->op_type() == "Conv") {
           SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
         }
@@ -5030,6 +6203,10 @@ void ApplyConcatChains(onnx::GraphProto* graph,
       SliceProducerWeight(init_map.at(hop.weight), false, global_keep, true);
       if (hop.bias) {
         SliceLastAxis(init_map.at(*hop.bias), global_keep);
+      }
+      if (hop.past_state) {
+        SliceConsumerWeight(init_map.at(*hop.past_state), false, global_keep,
+                            true);
       }
       if (hop.node->op_type() == "Conv") {
         SetOrAddIntAttr(hop.node, "group",
@@ -5059,15 +6236,22 @@ void ApplyConcatChains(onnx::GraphProto* graph,
       for (const auto& co : b.pre_ops) {
         touched.stale_value_info.insert(co.node->output(0));
       }
+      // Every output, not just [0] -- a hop node can have more than one
+      // (e.g. `CausalConvWithState`'s own `present_state`); see
+      // ConvPassThrough's own docstring.
       for (const auto& hop : b.conv_pass_through) {
-        touched.stale_value_info.insert(hop.node->output(0));
+        for (const auto& out : hop.node->output()) {
+          touched.stale_value_info.insert(out);
+        }
       }
     }
     for (const auto& co : chain.chain_ops) {
       touched.stale_value_info.insert(co.node->output(0));
     }
     for (const auto& hop : chain.conv_pass_through) {
-      touched.stale_value_info.insert(hop.node->output(0));
+      for (const auto& out : hop.node->output()) {
+        touched.stale_value_info.insert(out);
+      }
     }
   }
 }
@@ -5418,7 +6602,9 @@ std::vector<SplitGatedChain> FindSplitGatedChains(onnx::GraphProto* graph) {
     const SplitMatch& sm = split_matches.at(split_a);
 
     const std::string& out_name = node->output(0);
-    if (!is_internal(out_name)) {
+    // See FindChains's own identical comment -- the combine's own raw
+    // output can be a decomposed-LayerNorm/self-gated-activation root too.
+    if (!MatmulWalkRootOk(out_name, graph_outputs)) {
       continue;
     }
     auto [consumer, chain_ops] = WalkToConsumer(
