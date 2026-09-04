@@ -47,6 +47,7 @@ from onnxsim.gguf_reconstruct import (
     reconstruct_gguf_graph,
 )
 from onnxsim.gptq import apply_gptq
+from onnxsim.gptvq import quantize_weight_only_gptvq
 from onnxsim.hqq import quantize_weight_only_int4_hqq
 from onnxsim.kmeans_quantization import quantize_weight_only_kmeans
 from onnxsim.kv_cache_quantization import quantize_kv_cache
@@ -227,6 +228,7 @@ __all__ = [
     "MXFP4_CODEBOOK",
     "quantize_weight_only_squeezellm",
     "quantize_weight_only_aqlm",
+    "quantize_weight_only_gptvq",
     "quantize_weight_only_spqr",
     "apply_double_quantization",
     "apply_double_quantization_cpp",
