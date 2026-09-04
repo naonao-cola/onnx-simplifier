@@ -1,3 +1,4 @@
+import copy
 import dataclasses
 from typing import Dict, List, Tuple
 
@@ -6,12 +7,18 @@ from rich import print
 from rich.table import Table
 from rich.text import Text
 
-from onnxsim.model_info import human_readable_size
+from onnxsim.model_info import (
+    METADATA_PREFIX,
+    ModelInfo,
+    _set_metadata,
+    human_readable_size,
+)
 
 __all__ = [
     "MemoryPlan",
     "plan_activation_memory",
     "print_memory_plan",
+    "annotate_memory_plan",
 ]
 
 
@@ -119,3 +126,77 @@ def print_memory_plan(plan: MemoryPlan, limit: int = 50) -> None:
                 style="yellow",
             )
         )
+
+
+def _join_capped(items: List[str], limit: int) -> str:
+    # Same "capped list, one line" shape as model_info.h's C++ JoinCapped /
+    # RecordCappedListMetadata: join up to `limit` entries with ", ", appending
+    # a "... (+N more)" marker when there were more, so a long unplanned list
+    # doesn't blow up a single metadata_props value.
+    joined = ", ".join(items[:limit])
+    if len(items) > limit:
+        joined += f", ... (+{len(items) - limit} more)"
+    return joined
+
+
+def annotate_memory_plan(
+    model: onnx.ModelProto, prefix: str = METADATA_PREFIX
+) -> onnx.ModelProto:
+    """Return a shape-inferred copy of ``model`` with :func:`plan_activation_memory`'s
+    result stored in ``metadata_props``, so a downstream consumer -- an embedded
+    runtime, a code generator, anything that doesn't have onnxsim installed --
+    can read the plan directly off the model instead of recomputing it:
+
+    - **Model**: ``<prefix>memory_plan_arena_bytes``, ``naive_bytes`` and
+      ``compression_ratio`` (:class:`MemoryPlan`'s totals); ``unplanned_count``
+      always, plus ``unplanned`` (a capped, comma-joined list of names) when
+      non-empty.
+    - **Value** (inputs, outputs, value_info -- i.e. every *planned* tensor):
+      ``<prefix>mem_offset`` and ``<prefix>mem_size``, matching
+      :attr:`MemoryPlan.tensor_offsets`. A tensor onnxsim could not plan (see
+      :attr:`MemoryPlan.unplanned`) is simply left unannotated, the same way
+      :func:`annotate_metadata` leaves an unknown-shape tensor's ``bytes``
+      unset rather than guessing.
+
+    Values are strings. The input model is never mutated; the returned copy is
+    shape-inferred so intermediate values carry a matching ``value_info`` entry
+    to annotate. Weights are never annotated here -- they are outside the
+    activation arena by construction (see :func:`plan_activation_memory`).
+    """
+    plan = plan_activation_memory(model)
+    # Work on an inferred copy: infer_shapes returns a fresh model on success,
+    # but the original object on failure -- deep-copy first so the caller's
+    # model is never touched and the annotations land on populated value_info.
+    # Shape inference runs a second time here (plan_activation_memory already
+    # ran it once internally, in C++, to compute the plan itself) -- the same
+    # duplication onnxsim.model_info.annotate_metadata already accepts, for
+    # the same reason: the C++ side never hands its shape-inferred model back.
+    work = ModelInfo._infer_shapes(copy.deepcopy(model))
+
+    value_infos = {
+        vi.name: vi
+        for vi in list(work.graph.input)
+        + list(work.graph.output)
+        + list(work.graph.value_info)
+    }
+    for name, (offset, size) in plan.tensor_offsets.items():
+        vi = value_infos.get(name)
+        if vi is not None:
+            _set_metadata(vi, prefix + "mem_offset", str(offset))
+            _set_metadata(vi, prefix + "mem_size", str(size))
+
+    _set_metadata(work, prefix + "memory_plan_arena_bytes", str(plan.arena_bytes))
+    _set_metadata(work, prefix + "memory_plan_naive_bytes", str(plan.naive_bytes))
+    _set_metadata(
+        work,
+        prefix + "memory_plan_compression_ratio",
+        f"{plan.compression_ratio:.4f}",
+    )
+    _set_metadata(
+        work, prefix + "memory_plan_unplanned_count", str(len(plan.unplanned))
+    )
+    if plan.unplanned:
+        _set_metadata(
+            work, prefix + "memory_plan_unplanned", _join_capped(plan.unplanned, 20)
+        )
+    return work

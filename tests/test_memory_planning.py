@@ -12,7 +12,13 @@ import numpy as np
 from onnx import numpy_helper, parser
 
 import onnxsim
-from onnxsim import MemoryPlan, plan_activation_memory, print_memory_plan
+from onnxsim import (
+    MemoryPlan,
+    annotate_memory_plan,
+    plan_activation_memory,
+    print_memory_plan,
+)
+from onnxsim.model_info import METADATA_PREFIX
 
 
 def _model(body, initializer=(), opset=23, ir_version=10):
@@ -31,6 +37,10 @@ def _model(body, initializer=(), opset=23, ir_version=10):
 
 def _weight(shape, name):
     return numpy_helper.from_array(np.zeros(shape, np.float32), name)
+
+
+def _metadata(proto):
+    return {entry.key: entry.value for entry in proto.metadata_props}
 
 
 def test_chain_reuse():
@@ -142,3 +152,93 @@ def test_print_memory_plan_caps_output(capsys):
     print_memory_plan(plan, limit=2)
     captured = capsys.readouterr()
     assert "... and 3 more" in captured.out
+
+
+# --------------------------------------------------------------------------- #
+# annotate_memory_plan
+# --------------------------------------------------------------------------- #
+def test_annotate_memory_plan_model_level_metadata():
+    body = """
+    g (float[25] x) => (float[25] y)
+    {
+      a = Relu(x)
+      b = Relu(a)
+      y = Relu(b)
+    }
+    """
+    model = _model(body)
+    annotated = annotate_memory_plan(model)
+
+    meta = _metadata(annotated)
+    assert meta[METADATA_PREFIX + "memory_plan_arena_bytes"] == "200"
+    assert meta[METADATA_PREFIX + "memory_plan_naive_bytes"] == "400"
+    assert meta[METADATA_PREFIX + "memory_plan_compression_ratio"] == "0.5000"
+    assert meta[METADATA_PREFIX + "memory_plan_unplanned_count"] == "0"
+    assert METADATA_PREFIX + "memory_plan_unplanned" not in meta
+
+    # The original model is untouched.
+    assert len(model.metadata_props) == 0
+
+
+def test_annotate_memory_plan_value_level_metadata():
+    body = """
+    g (float[25] x) => (float[25] y)
+    {
+      a = Relu(x)
+      b = Relu(a)
+      y = Relu(b)
+    }
+    """
+    model = _model(body)
+    plan = plan_activation_memory(model)
+    annotated = annotate_memory_plan(model)
+
+    value_infos = {
+        vi.name: vi
+        for vi in list(annotated.graph.input)
+        + list(annotated.graph.output)
+        + list(annotated.graph.value_info)
+    }
+    for name, (offset, size) in plan.tensor_offsets.items():
+        meta = _metadata(value_infos[name])
+        assert meta[METADATA_PREFIX + "mem_offset"] == str(offset)
+        assert meta[METADATA_PREFIX + "mem_size"] == str(size)
+
+
+def test_annotate_memory_plan_unplanned_tensors_left_unannotated():
+    body = """
+    g (float[batch,8] x) => (float[batch,8] y)
+    {
+      y = Relu(x)
+    }
+    """
+    model = _model(body)
+    annotated = annotate_memory_plan(model)
+
+    meta = _metadata(annotated)
+    assert meta[METADATA_PREFIX + "memory_plan_arena_bytes"] == "0"
+    assert meta[METADATA_PREFIX + "memory_plan_unplanned_count"] == "2"
+    assert set(meta[METADATA_PREFIX + "memory_plan_unplanned"].split(", ")) == {
+        "x",
+        "y",
+    }
+
+    x_info = annotated.graph.input[0]
+    y_info = annotated.graph.output[0]
+    assert METADATA_PREFIX + "mem_offset" not in _metadata(x_info)
+    assert METADATA_PREFIX + "mem_offset" not in _metadata(y_info)
+
+
+def test_annotate_memory_plan_custom_prefix():
+    body = """
+    g (float[1,3,8,8] x) => (float[1,4,8,8] y)
+    {
+      y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(x, w)
+    }
+    """
+    model = _model(body, [_weight([4, 3, 3, 3], "w")])
+    annotated = annotate_memory_plan(model, prefix="custom.")
+
+    meta = _metadata(annotated)
+    assert "custom.memory_plan_arena_bytes" in meta
+    assert METADATA_PREFIX + "memory_plan_arena_bytes" not in meta

@@ -70,6 +70,37 @@ allow that, and this allocator has no notion of which ops are in-place-safe).
   a partial lower bound, not a complete one — check it before trusting
   `arena_bytes` as the true requirement.
 
+## Annotating a model with the plan (`annotate_memory_plan`)
+
+`onnxsim.annotate_memory_plan` writes a `plan_activation_memory` result
+straight onto a shape-inferred copy of the model's `metadata_props`, the same
+way `onnxsim.annotate_metadata` persists the MACs/FLOPs/memory-footprint
+report. This is how the plan actually reaches a consumer that can't (or
+shouldn't have to) run onnxsim itself — an embedded runtime, a code
+generator, or any other tool that just reads the `.onnx` file:
+
+```python
+import onnx
+import onnxsim
+
+model = onnx.load("model.onnx")
+annotated = onnxsim.annotate_memory_plan(model)
+onnx.save(annotated, "model.annotated.onnx")
+```
+
+- **Model**: `onnxsim.memory_plan_arena_bytes`, `naive_bytes` and
+  `compression_ratio` (the `MemoryPlan` totals); `unplanned_count` always,
+  plus `unplanned` (a capped, comma-joined list of names) when non-empty.
+- **Value** (every planned graph input, node output, or graph output):
+  `onnxsim.mem_offset` and `onnxsim.mem_size`. A tensor that
+  `plan_activation_memory` couldn't plan is simply left unannotated, the same
+  way `annotate_metadata` leaves an unknown-shape tensor's `bytes` unset.
+
+The input model is never mutated; `annotate_memory_plan` returns a shape-
+inferred copy, since the per-value metadata needs a matching `value_info`
+entry to attach to (a `NodeProto` doesn't get its own offset — a node's
+*output value* does, keyed by tensor name, same as the metric annotations).
+
 ## Scope (v1)
 
 - **Concrete shapes only.** A tensor with a dynamic `dim_param` dimension has

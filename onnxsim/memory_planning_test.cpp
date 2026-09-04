@@ -46,7 +46,8 @@ void TestSingleNodeNoReuse() {
   assert(plan.unplanned.empty());
   assert(plan.offsets.count("w") == 0);  // weights are never planned
   assert(plan.naive_bytes == xb + yb);
-  assert(plan.arena_bytes == xb + yb);  // no reuse possible: only one pair, overlapping
+  assert(plan.arena_bytes ==
+         xb + yb);  // no reuse possible: only one pair, overlapping
   assert(plan.offsets.at("x").second == xb);
   assert(plan.offsets.at("y").second == yb);
 }
@@ -86,7 +87,7 @@ void TestChainReuse() {
 
   const auto& off = plan.offsets;
   assert(off.at("a").first == 0);
-  assert(off.at("y").first == 0);    // shares a's freed slot
+  assert(off.at("y").first == 0);  // shares a's freed slot
   assert(off.at("b").first == 100);
   assert(off.at("x").first == 100);  // shares b's (later-claimed) slot
 

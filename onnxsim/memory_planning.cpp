@@ -10,8 +10,9 @@ namespace {
 struct Interval {
   std::string name;
   int64_t size = 0;
-  int start = 0;  // node index after which the tensor is available (-1 = before node 0)
-  int end = 0;    // last node index at which the tensor is still needed
+  int start =
+      0;  // node index after which the tensor is available (-1 = before node 0)
+  int end = 0;  // last node index at which the tensor is still needed
 };
 
 // True when `a` and `b` are never simultaneously live, i.e. safe to share
@@ -71,8 +72,8 @@ MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph) {
       continue;
     }
     const auto it = last_use.find(name);
-    intervals.push_back(
-        {name, bytes->to_int(), start, it == last_use.end() ? end : it->second});
+    intervals.push_back({name, bytes->to_int(), start,
+                         it == last_use.end() ? end : it->second});
     plan.naive_bytes += bytes->to_int();
   }
 
@@ -90,7 +91,8 @@ MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph) {
             });
 
   std::vector<Interval> placed;
-  std::vector<std::pair<int64_t, int64_t>> placed_ranges;  // parallel: [off, off+size)
+  std::vector<std::pair<int64_t, int64_t>>
+      placed_ranges;  // parallel: [off, off+size)
 
   for (const Interval& iv : intervals) {
     std::vector<std::pair<int64_t, int64_t>> blocking;
@@ -110,7 +112,8 @@ MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph) {
       }
       cursor = std::max(cursor, b_end);
     }
-    if (best_offset < 0) best_offset = cursor;  // no gap fit; append after every blocker
+    if (best_offset < 0)
+      best_offset = cursor;  // no gap fit; append after every blocker
 
     plan.offsets[iv.name] = {best_offset, iv.size};
     placed.push_back(iv);

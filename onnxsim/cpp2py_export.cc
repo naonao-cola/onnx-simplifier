@@ -381,8 +381,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
             GetGraphView(model, run_shape_inference);
         const onnxsim::MemoryPlan plan =
             onnxsim::ComputeActivationMemoryPlan(view);
-        return std::make_tuple(plan.offsets, plan.arena_bytes,
-                               plan.naive_bytes, plan.unplanned);
+        return std::make_tuple(plan.offsets, plan.arena_bytes, plan.naive_bytes,
+                               plan.unplanned);
       },
       "model_bytes"_a, "run_shape_inference"_a = true);
 
