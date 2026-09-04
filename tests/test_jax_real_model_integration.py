@@ -35,6 +35,16 @@ ONNX Runtime rejects at load time. That is a jax2onnx/transformers
 interaction issue, not something onnxsim can be expected to compensate for,
 so it is left out here rather than adding a test pinned to a known-broken
 upstream lowering.
+
+A third model, ``test_jax_export_gemma_dummy_model`` below, covers Google
+DeepMind's own actively-maintained ``gemma`` package (PyPI) -- RoPE,
+grouped-query attention, and RMSNorm, none of which the two transformers
+models above exercise. It needed onnxsim's own
+``rewrite_bool_where`` pass (onnxsim/passes/rewrite_bool_where.h) to become
+loadable on ONNX Runtime at all: Gemma's attention-mask construction
+combines two boolean masks via a jax `where` whose *data* operands are
+themselves bool, which ORT's CPU execution provider has no kernel for --
+see that pass's doc comment.
 """
 
 import numpy as np
@@ -124,4 +134,54 @@ def test_jax_export_gpt2_causal_lm():
     orig_out = _run(onnx_model, {input_name: input_ids})[output_name]
     sim_out = _run(sim_model, {input_name: input_ids})[output_name]
     np.testing.assert_allclose(orig_out, expected, rtol=1e-3, atol=1e-4)
+    np.testing.assert_allclose(sim_out, expected, rtol=1e-3, atol=1e-4)
+
+
+def test_jax_export_gemma_dummy_model():
+    gm = pytest.importorskip("gemma.gm")
+
+    # gm.testing.DummyGemma is the Gemma package's own tiny (1-layer,
+    # embed_dim=32) architecture instance built specifically for tests like
+    # this one -- the same "real model class, tiny/random config, no
+    # checkpoint download" shape as the two transformers models above.
+    model = gm.testing.DummyGemma()
+    params = model.init(
+        jax.random.PRNGKey(0), tokens=jnp.zeros((1, 8), dtype=jnp.int32)
+    )
+    # Gemma's default param dtype is bfloat16 (the shipped-checkpoint dtype);
+    # ONNX Runtime's CPU EP has no kernel for a bfloat16 Einsum operand
+    # (separately from the bool-Where issue this test also exercises), so
+    # cast to float32 -- a real CPU deployment would need to do the same.
+    params = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), params)
+
+    def f(tokens):
+        return model.apply(params, tokens=tokens).logits
+
+    tokens = np.random.RandomState(0).randint(0, 13, size=(1, 8)).astype(np.int32)
+    # Computed *before* to_onnx: jax2onnx monkey-patches jax.numpy primitives
+    # (including jnp.sqrt, which Gemma's embedder calls directly) globally
+    # while tracing, and does not restore them, so calling `f` again after
+    # exporting raises inside jax2onnx's own patched primitive instead of
+    # running plain JAX.
+    expected = np.asarray(f(jnp.asarray(tokens)))
+    onnx_model = to_onnx(f, [jnp.asarray(tokens)])
+
+    # Anchor for why this needs onnxsim's rewrite_bool_where pass: the
+    # original export combines two boolean attention-mask tensors through a
+    # bool-operand Where, which ORT's CPU EP cannot even load.
+    assert "Where" in [n.op_type for n in onnx_model.graph.node]
+    with pytest.raises(Exception, match="Where"):
+        _run(onnx_model, {onnx_model.graph.input[0].name: tokens})
+
+    # check_n=0: see the analogous note in test_rewrite_bool_where.py --
+    # onnxsim's own correctness check would run the *original* model through
+    # the same (onnxruntime) backend, hitting the exact load failure just
+    # confirmed above.
+    sim_model, check_ok = onnxsim.simplify(onnx_model, check_n=0)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+
+    input_name = onnx_model.graph.input[0].name
+    output_name = onnx_model.graph.output[0].name
+    sim_out = _run(sim_model, {input_name: tokens})[output_name]
     np.testing.assert_allclose(sim_out, expected, rtol=1e-3, atol=1e-4)
