@@ -311,9 +311,7 @@ def test_wanda_pruning_cpp_no_calibration_batches_falls_back_to_plain_magnitude(
     K, N = 16, 4
     model, w = _matmul_model(K=K, N=N, seed=56)
 
-    pruned = onnxsim.apply_wanda_pruning_cpp(
-        model, calibration_data=[], sparsity=0.5
-    )
+    pruned = onnxsim.apply_wanda_pruning_cpp(model, calibration_data=[], sparsity=0.5)
     magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
     np.testing.assert_array_equal(_weight(pruned), _weight(magnitude_pruned))
     # Actually pruned, not a no-op.
