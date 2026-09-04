@@ -126,6 +126,7 @@ from onnxsim.pruning import (
     apply_wanda_pruning,
     weight_sparsity,
 )
+from onnxsim.quantease import apply_quantease
 from onnxsim.quarot import apply_quarot
 from onnxsim.quip_sharp import apply_quip_sharp
 from onnxsim.rptq import apply_rptq_reorder
@@ -159,6 +160,7 @@ __all__ = [
     "apply_awq",
     "apply_attention_quantization",
     "apply_gptq",
+    "apply_quantease",
     "apply_flexround",
     "apply_smoothquant",
     "apply_rptq_reorder",
