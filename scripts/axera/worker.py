@@ -52,6 +52,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+from _local_import import fresh  # noqa: E402
+
 
 def check(model_name: str, onnx_path: str | None) -> dict:
     res = {
@@ -75,7 +77,7 @@ def check(model_name: str, onnx_path: str | None) -> dict:
         if onnx_path:
             model = onnx.load(onnx_path)
         else:
-            import models
+            models = fresh("models", HERE)
 
             model = models.build(model_name)
         res["orig_nodes"] = len(model.graph.node)

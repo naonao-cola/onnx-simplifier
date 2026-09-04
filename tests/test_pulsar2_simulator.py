@@ -19,8 +19,14 @@ _AXERA_DIR = os.path.join(
 if _AXERA_DIR not in sys.path:
     sys.path.insert(0, _AXERA_DIR)
 
-import models  # noqa: E402
+# fresh(), not a bare `import models`: every scripts/<vendor>/ directory has
+# its own models.py, all imported by the same bare name -- see
+# _local_import.py's docstring for why a plain import here can silently
+# resolve to a *different* vendor's module in the full test suite.
 import pulsar2_simulator as sim  # noqa: E402
+from _local_import import fresh  # noqa: E402
+
+models = fresh("models", _AXERA_DIR)
 
 
 def test_partition_reports_full_coverage_for_clean_models():
@@ -109,9 +115,9 @@ def test_quantize_like_pulsar2_matches_confirmed_dtypes():
     (onnxsim uses synthetic `_v_NN` names), so check dtypes present instead
     of names -- onnx.TensorProto INT8=3, UINT8=2.
     """
-    import onnx
     from collections import Counter
 
+    import onnx
     import pulsar2_quantizer as pq
 
     model = models.conv_bn_relu()

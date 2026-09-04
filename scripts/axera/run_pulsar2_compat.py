@@ -28,7 +28,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import models  # noqa: E402
+from _local_import import fresh  # noqa: E402
+
+models = fresh("models", HERE)
 
 FAIL_STATUSES = {
     "pulsar2_regression",
