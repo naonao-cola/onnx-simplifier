@@ -542,9 +542,13 @@ producers; L1's is a plain sum, with no square/sqrt involved at all) and
 support is deliberately
 narrower than the MatMul/Gemm path in one respect that stays true
 regardless of grouping: producers/consumers are joined by unary activations,
-channel-preserving spatial ops (see below), and depthwise/GroupNorm
+channel-preserving spatial ops (see below), and depthwise/GroupNorm/PRelu
 pass-through hops -- no per-channel ``Add``/``Mul`` scale-or-bias op, since a
-real Conv already carries any bias in its own optional third input, and
+real Conv already carries any bias in its own optional third input (a
+per-channel ``PRelu`` `slope` -- see below -- is not such a bias/scale op at
+all, just another "one value per channel" operand riding a shape-preserving
+activation, the same reason a depthwise Conv's own weight already crosses
+transparently here), and
 ``BatchNormalization`` is expected to already be fused into the preceding
 Conv's weight by the time this pass runs (onnxsim's own default
 optimization does exactly that, see ``fuse_bn_into_conv``), so a raw
@@ -649,6 +653,52 @@ memory layout into the Gemm weight's own input columns -- a fundamentally
 different, harder problem than the plain axis slice every hop in this
 section performs, not a bigger version of the same one (see
 `_CONV_POOL_PASS_THROUGH`'s own comment for the precise boundary).
+
+A Conv chain also crosses a mid-chain ``PRelu`` -- the
+``Conv -> PRelu -> Conv`` shape a real MobileFaceNet/ResNet-style
+face-recognition backbone's own per-channel activation takes, previously
+unpruned end to end the same way the un-recognized `MaxPool`/`Resize`/`Pad`
+shapes above once were (confirmed empirically with zero live hits before
+this support existed, via ``grep -n "PRelu"`` over this Conv-chain-walking
+section) -- transparently, but only when `slope` (its second input) cleanly
+falls into one of the two shapes real exporters produce (see
+:func:`_match_prelu_pass_through`'s own docstring for the exact bar,
+confirmed live via a real ``torch.onnx.export`` of both
+``nn.PReLU(num_parameters=C)`` and ``nn.PReLU(1)``, and by direct
+``onnxruntime.InferenceSession`` execution against an independently,
+already-pruned reference model for both): a **per-channel** `slope`
+(``[C, 1, ..., 1]``, one value per channel, no cross-channel mixing at all --
+the same "one weight row per channel" shape a depthwise Conv's own weight
+already is) is co-sliced by the chain's own `keep` index set, reusing
+:class:`_ConvPassThrough`/:func:`_apply_conv_pass_through_hop` directly
+rather than a dedicated hop type -- PRelu has no ``group`` attribute for
+that shared apply path's own op-type dispatch to (correctly) leave alone,
+the same way it already leaves `CausalConvWithState` alone; a **scalar**
+(single-shared-parameter) `slope` multiplies every channel identically, so
+pruning some away changes nothing about it -- it is left completely
+untouched, folded into `chain_ops` exactly like a pooling/`Resize`/`Pad`
+hop's own "nothing to slice" entry. Unlike `CausalConvWithState` (forward
+walk only) but like every other hop in this paragraph's family, a PRelu hop
+is recognized in *both* directions (:func:`_walk_to_conv_consumer`'s forward
+walk and :func:`_walk_conv_producer_backward`'s backward walk, the latter
+via :func:`_match_prelu_pass_through_self`'s self-consistent variant,
+mirroring the depthwise-Conv self-check's own trick), so it composes for
+free with the residual/merge and Concat-branch machinery described below,
+the same way a depthwise Conv hop already does. A MatMul/Gemm chain crosses
+a mid-chain ``PRelu`` too (:func:`_walk_to_consumer`/
+:func:`_walk_matmul_producer_backward`, via
+:func:`_match_prelu_pass_through_matmul`/
+:func:`_match_prelu_pass_through_matmul_self`) -- the same scalar-vs-
+per-channel split, just against that chain family's own last-axis-is-channel
+convention (:func:`_flat_channel_const`'s own bar) rather than axis 1, so a
+per-channel `slope` there is a bare ``[C]``, not `[C, 1, 1]`, and needs no
+dedicated hop type at all -- an ordinary ``(node, slope_name)`` `chain_ops`
+entry, exactly like a bias/scale ``Add``/``Mul`` hop's own constant, already
+suffices. A bare rank-1 `[C]` slope is deliberately *not* treated as
+per-channel on the Conv side -- see :func:`_match_prelu_pass_through`'s own
+docstring for why the two chain families' opposite channel-axis conventions
+make the same literal shape safe on one side and unsafe, unproven, on the
+other.
 
 Within that, three ``group`` shapes are distinguished. Ordinary
 (``group=1``) Conv is the base case already described above. The
@@ -3453,23 +3503,29 @@ class _Producer:
 
 @dataclass(frozen=True)
 class _ConvPassThrough:
-    """A depthwise Conv (``group == in_channels == out_channels``) -- or a
-    plain ``ai.onnx::CausalConvWithState`` node, the same "one weight row
-    per channel, no cross-channel mixing" shape (see
-    :func:`_match_causal_conv_with_state_pass_through` and this module's own
-    "Conv/pooling/Resize/Pad pass-through" section comment) -- the chain walk
-    crossed transparently between a Conv chain's real producer and real
-    consumer. Neither mixes channels at all -- output channel ``i`` depends
-    only on input channel ``i`` -- so neither needs any independent
-    importance of its own the way a producer/consumer boundary does; each is
-    carried on the matched :class:`_Chain` purely so
-    :func:`_apply_conv_pass_through_hop` can slice its own ``[C, 1, k1, ...,
-    kn]`` weight (and bias, if present) by the *same* `keep` index set as the
-    chain's real producer. A depthwise Conv additionally gets its own
-    ``group`` attribute updated to the new channel count;
-    ``CausalConvWithState`` has no such attribute at all (its channel count
-    is implied purely by its weight's own axis-0 size), so nothing is
-    rewritten there for it. See :func:`_walk_to_conv_consumer`.
+    """A depthwise Conv (``group == in_channels == out_channels``), a plain
+    ``ai.onnx::CausalConvWithState`` node, or a per-channel ``PRelu`` --
+    three genuinely different ops sharing the same "one weight row per
+    channel, no cross-channel mixing" shape (see
+    :func:`_match_causal_conv_with_state_pass_through`/
+    :func:`_match_prelu_pass_through` and this module's own "Conv/pooling/
+    Resize/Pad pass-through" section comment) -- the chain walk crossed
+    transparently between a Conv chain's real producer and real consumer.
+    None mixes channels at all -- output channel ``i`` depends only on input
+    channel ``i`` -- so none needs any independent importance of its own the
+    way a producer/consumer boundary does; each is carried on the matched
+    :class:`_Chain` purely so :func:`_apply_conv_pass_through_hop` can slice
+    its own ``[C, 1, k1, ..., kn]``-shaped weight (and bias, if present) by
+    the *same* `keep` index set as the chain's real producer -- PRelu's own
+    ``[C, 1, ..., 1]`` `slope` fits this identical axis-0, any-trailing-rank
+    slice with no kernel dims of its own to worry about, needing no
+    dedicated hop type. A depthwise Conv additionally gets its own ``group``
+    attribute updated to the new channel count; neither
+    ``CausalConvWithState`` nor ``PRelu`` has any such attribute at all
+    (`CausalConvWithState`'s channel count is implied purely by its weight's
+    own axis-0 size; `PRelu` has no channel-count attribute at all, ever),
+    so nothing is rewritten there for either. See
+    :func:`_walk_to_conv_consumer`.
     """
 
     node: onnx.NodeProto
@@ -3661,16 +3717,20 @@ def _apply_conv_pass_through_hop(
 
     A depthwise ``Conv`` hop's own `group` attribute (`== in_channels ==
     out_channels`) drops to the new channel count right alongside its
-    weight/bias, via :func:`_set_conv_group_attr` -- `CausalConvWithState`
-    has no such attribute at all (confirmed via live schema introspection,
-    ``onnx.defs.get_schema("CausalConvWithState", domain="")``: its own
-    channel count is implied purely by its weight's own axis-0 size, no
-    `group`/channel-count attribute exists on it to rewrite), so nothing is
-    rewritten there for it -- dispatched purely on `hop.node.op_type`, since
-    only these two op types ever reach this function (see
+    weight/bias, via :func:`_set_conv_group_attr` -- neither
+    `CausalConvWithState` nor `PRelu` has any such attribute at all
+    (confirmed via live schema introspection,
+    ``onnx.defs.get_schema("CausalConvWithState", domain="")``/
+    ``onnx.defs.get_schema("PRelu")``: `CausalConvWithState`'s own channel
+    count is implied purely by its weight's own axis-0 size, and `PRelu` has
+    no channel-count-describing attribute of any kind, no
+    `group`/channel-count attribute exists on either to rewrite), so nothing
+    is rewritten there for either -- dispatched purely on `hop.node.op_type`,
+    since only these three op types ever reach this function (see
     :func:`_match_depthwise_conv_pass_through`/
-    :func:`_match_causal_conv_with_state_pass_through`, the only two
-    matchers that ever construct a :class:`_ConvPassThrough`).
+    :func:`_match_causal_conv_with_state_pass_through`/
+    :func:`_match_prelu_pass_through`/:func:`_match_prelu_pass_through_self`,
+    the only matchers that ever construct a :class:`_ConvPassThrough`).
     """
     _slice_producer_weight(initializer_map[hop.weight], False, keep, is_conv=True)
     if hop.bias is not None:
@@ -3716,6 +3776,82 @@ def _match_producer(
             return None  # non-constant bias -- can't safely prune it
     n_channels = w_init.dims[0] if weight_transposed else w_init.dims[1]
     return w_name, weight_transposed, bias_name, n_channels
+
+
+def _match_prelu_pass_through_matmul(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    n_channels: int,
+) -> Optional[Tuple[bool, Optional[str]]]:
+    """The MatMul/Gemm-chain analogue of :func:`_match_prelu_pass_through`
+    (that function's own docstring covers the shared reasoning in full --
+    only what differs is restated here): since a MatMul/Gemm chain's own
+    channel axis is the tensor's *last* axis, not axis 1 (see this module's
+    own docstring), `slope`'s per-channel shape here is the same flat,
+    last-axis-is-channel vector every other MatMul/Gemm hop's own constant
+    operand is already held to (:func:`_flat_channel_const`'s own
+    ``prod(dims) == dims[-1]`` bar -- e.g. a bare `[C]`, safe here in a way
+    it is *not* for a Conv chain's own `[C, 1, 1]` convention, since there is
+    no trailing spatial axis for a rank-1 `[C]` to spuriously align against
+    instead). Returns ``(is_per_channel, slope_name_or_None)`` with the
+    identical scalar (``prod(dims) == 1`` -- left untouched) vs. per-channel
+    (``dims[-1] == n_channels`` -- co-sliced, folded into the caller's own
+    `chain_ops` as an ordinary ``(node, slope_name)`` entry, no dedicated hop
+    type needed here the way the Conv walk's axis-0 slice needs
+    :class:`_ConvPassThrough`) split :func:`_match_prelu_pass_through` makes,
+    just against the opposite axis convention. Declines (``None``) the same
+    conservative way for a missing/non-constant/otherwise-malformed `slope`.
+    """
+    if node.op_type != "PRelu" or node.domain != "":
+        return None
+    if len(node.input) != 2 or not node.input[0] or not node.input[1]:
+        return None
+    if len(node.output) != 1:
+        return None
+    slope_name = node.input[1]
+    s_init = initializer_map.get(slope_name)
+    if s_init is None or not _is_supported_float_dtype(s_init.data_type):
+        return None
+    dims = list(s_init.dims)
+    if not dims:
+        return None
+    if int(np.prod(dims)) == 1:
+        return False, None  # scalar / single shared parameter -- untouched
+    if int(np.prod(dims)) == dims[-1] and dims[-1] == n_channels:
+        return True, slope_name
+    return None
+
+
+def _match_prelu_pass_through_matmul_self(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[bool, Optional[str]]]:
+    """The backward-walk (:func:`_walk_matmul_producer_backward`) counterpart
+    of :func:`_match_prelu_pass_through_matmul`, mirroring
+    :func:`_match_prelu_pass_through_self`'s identical trick for the Conv
+    walk: the backward residual/``Concat``-branch walk doesn't know its
+    group's real shared channel count yet at the point it first crosses a
+    PRelu hop, so this checks `slope`'s own shape is self-consistent by
+    calling that same matcher with `slope`'s own `dims[-1]` as the "expected"
+    channel count -- trivially satisfying the per-channel case's own
+    ``dims[-1] == n_channels`` check (and never even consulted by the scalar
+    case, which only ever compares `slope`'s own total size to ``1``).
+    :func:`_find_matmul_residual_chains` already re-validates every
+    `chain_ops` constant this walk returns against the group's real channel
+    count once resolved (the same generic, hop-kind-agnostic check its own
+    bias/scale ``Add``/``Mul`` and ``BiasGelu``/``FastGelu`` hops already
+    get -- see that function's own comment), so no PRelu-specific
+    re-validation is needed here.
+    """
+    if node.op_type != "PRelu" or node.domain != "" or len(node.input) != 2:
+        return None
+    slope_name = node.input[1]
+    if not slope_name:
+        return None
+    s_init = initializer_map.get(slope_name)
+    if s_init is None:
+        return None
+    expected = s_init.dims[-1] if list(s_init.dims) else 1
+    return _match_prelu_pass_through_matmul(node, initializer_map, expected)
 
 
 def _match_fused_bias_gelu(
@@ -3790,8 +3926,14 @@ def _walk_to_consumer(
     :func:`_match_fused_bias_gelu` -- a plain `_NORM_PASS_THROUGH_OPS`
     node whose own ``axis`` normalizes exactly `cur`'s last axis -- see that
     constant's own comment, :func:`_norm_axis_is_last`, and
-    :func:`_norm_pass_through_const_names` -- or a channel-agnostic ``Clip``
-    -- see :func:`_match_clip_channel_pass_through`, the QAT-style
+    :func:`_norm_pass_through_const_names` -- a ``PRelu`` node (see
+    :func:`_match_prelu_pass_through_matmul`): a *scalar* or
+    single-shared-parameter `slope` (every dimension size 1) needs no
+    operand of its own sliced, the same shape a plain unary activation hop
+    already gets; a *per-channel* `slope` (flat, last-axis-is-channel,
+    exactly :func:`_flat_channel_const`'s own bar) is co-sliced exactly like
+    an `Add`/`Mul` hop's own constant already is -- or a channel-agnostic
+    ``Clip`` (see :func:`_match_clip_channel_pass_through`, the QAT-style
     activation-clipping-after-Linear shape, needing no axis reasoning at all
     since neither `min` nor `max` is axis-indexed to begin with) with no
     other consumer anywhere along the way, until a MatMul/vanilla-Gemm
@@ -3878,6 +4020,16 @@ def _walk_to_consumer(
             ):
                 break
             const_name = bias_name
+        elif nxt.op_type == "PRelu" and nxt.domain == "":
+            if not nxt.input or nxt.input[0] != cur:
+                break
+            prelu_match = _match_prelu_pass_through_matmul(
+                nxt, initializer_map, n_channels
+            )
+            if prelu_match is None:
+                break
+            is_per_channel, slope_name = prelu_match
+            const_name = slope_name if is_per_channel else None
         elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
             if not nxt.input or nxt.input[0] != cur:
                 break
@@ -4633,6 +4785,107 @@ def _match_pad_channel_pass_through(
     return begin == 0 and end == 0
 
 
+def _match_prelu_pass_through(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    n_channels: int,
+) -> Optional[Tuple[bool, Optional[str]]]:
+    """If `node` is a plain (default-domain) ``PRelu`` node (`node.input[0]`
+    the tensor being walked through) whose own ``slope`` (input 1) is a
+    constant float initializer cleanly falling into one of the two shapes
+    real exporters produce, returns ``(is_per_channel, slope_name_or_None)``:
+
+    - **scalar / single shared parameter** (every dimension size 1 --
+      ``prod(dims) == 1``, e.g. a bare scalar, `[1]`, or the `[1, 1, 1]` a
+      real ``torch.onnx.export`` of ``nn.PReLU(1)`` emits, confirmed live)
+      -- ``(False, None)``: the same value multiplies every channel, so
+      pruning some away changes nothing about it -- it is left completely
+      untouched, the same "no operand of its own to slice" shape a unary
+      activation hop already gets.
+    - **per-channel** (``dims[0] == n_channels``, every other dimension size
+      1 -- e.g. the `[C, 1, 1]` a real ``torch.onnx.export`` of
+      ``nn.PReLU(C)`` emits for a 2-D Conv, confirmed live) --
+      ``(True, slope_name)``: one independent value per channel, co-sliced
+      by the chain's own `keep` index set exactly like a depthwise Conv
+      hop's own weight already is (see :class:`_ConvPassThrough`, which this
+      module reuses for this hop rather than a dedicated type -- `slope`'s
+      ``[C, 1, ..., 1]`` layout needs exactly the same axis-0,
+      any-trailing-rank slice :func:`_slice_producer_weight` already
+      performs for a depthwise Conv's own weight, and PRelu has no `group`
+      attribute for :func:`_apply_conv_pass_through_hop`'s own dispatch to
+      (correctly) leave untouched).
+
+    A bare rank-1 `[C]` slope is deliberately **not** treated as per-channel
+    here, unlike a MatMul/Gemm chain's own last-axis-is-channel convention
+    (:func:`_flat_channel_const`) -- this module's Conv-chain machinery
+    assumes NCHW's axis-1-is-channel convention throughout (see this
+    module's own docstring), and ONNX's unidirectional broadcasting aligns
+    a slope's own dimensions against `X`'s *trailing* ones: a `[C]` slope
+    padded against a rank-4 `NCHW` tensor lands on axis 3 (`W`), not axis 1,
+    unless `C` happens to equal `W` by coincidence -- confirmed live via a
+    real ``torch.onnx.export`` of ``nn.PReLU(C)``, which always emits the
+    trailing-``1``s-padded `[C, 1, 1]` shape above, never a bare `[C]`, for
+    exactly this reason. Requiring at least one trailing size-1 dimension
+    (``len(dims) >= 2``) is what rules a bare `[C]` out here.
+
+    Declines (``None``) whenever `node` isn't a plain ``PRelu``, `slope`
+    is missing or non-constant, or its shape doesn't cleanly fall into
+    either shape above (e.g. a per-*group*, non-per-channel, or otherwise
+    malformed shape) -- never guessed at, the same conservative bar every
+    other hop in this module already holds its own constant operand to.
+    """
+    if node.op_type != "PRelu" or node.domain != "":
+        return None
+    if len(node.input) != 2 or not node.input[0] or not node.input[1]:
+        return None
+    if len(node.output) != 1:
+        return None
+    slope_name = node.input[1]
+    s_init = initializer_map.get(slope_name)
+    if s_init is None or not _is_supported_float_dtype(s_init.data_type):
+        return None
+    dims = list(s_init.dims)
+    if not dims:
+        return None
+    if int(np.prod(dims)) == 1:
+        return False, None  # scalar / single shared parameter -- untouched
+    if len(dims) >= 2 and dims[0] == n_channels and all(d == 1 for d in dims[1:]):
+        return True, slope_name
+    return None
+
+
+def _match_prelu_pass_through_self(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[bool, Optional[str]]]:
+    """The PRelu pass-through check :func:`_walk_conv_producer_backward` uses:
+    unlike :func:`_match_prelu_pass_through`, which validates a hop against an
+    externally supplied `n_channels`, the backward residual walk doesn't know
+    its group's shared channel count yet at the point it first crosses a
+    PRelu hop, so this checks the node's own `slope` is self-consistently
+    shaped by calling that same matcher with `slope`'s own `dims[0]` as the
+    "expected" channel count -- trivially satisfying the per-channel case's
+    own `dims[0] == n_channels` check and leaving every other one (including
+    the scalar case, which never even looks at `n_channels`) intact. Mirrors
+    :func:`_match_conv_pass_through_self`'s identical trick for a depthwise
+    Conv hop. :func:`_find_conv_residual_chains`/:func:`_find_conv_concat_chains`'s
+    own branch resolution re-validates every per-channel hop this returns
+    against the group's real, established channel count once the whole group
+    is resolved (the same generic `pass_through` re-validation a depthwise
+    hop already gets, keyed only on `hop.weight`'s own `dims[0]`, needing no
+    PRelu-specific case of its own).
+    """
+    if node.op_type != "PRelu" or node.domain != "" or len(node.input) != 2:
+        return None
+    slope_name = node.input[1]
+    if not slope_name:
+        return None
+    s_init = initializer_map.get(slope_name)
+    if s_init is None:
+        return None
+    expected = s_init.dims[0] if list(s_init.dims) else 1
+    return _match_prelu_pass_through(node, initializer_map, expected)
+
+
 def _match_clip_channel_pass_through(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> bool:
@@ -4758,8 +5011,16 @@ def _walk_to_conv_consumer(
     `conv_pass_through`, but with no `group` attribute to update; this
     forward walk is the *only* one of the two Conv-chain walkers that
     recognizes it -- see that section comment's own scope-boundary note for
-    why the backward walk, :func:`_walk_conv_producer_backward`, cannot),
-    and -- when
+    why the backward walk, :func:`_walk_conv_producer_backward`, cannot), a
+    ``PRelu`` hop (see :func:`_match_prelu_pass_through`) -- a *scalar* or
+    single-shared-parameter `slope` (every dimension size 1) is folded into
+    `chain_ops` like a pooling/`Resize`/`Pad` hop (nothing to slice, the same
+    value multiplies every surviving channel unchanged), while a
+    *per-channel* `slope` (`[C, 1, ..., 1]`) is returned via
+    `conv_pass_through` instead, exactly like a depthwise Conv's own weight
+    -- recognized by *both* Conv-chain walkers, unlike `CausalConvWithState`,
+    since :func:`_match_prelu_pass_through_self` needs no externally supplied
+    channel count the way `CausalConvWithState`'s own hop would, and -- when
     `recognize_group_norm` -- at most one mid-chain ``GroupNormalization``
     hop (see :func:`_match_group_norm_pass_through` and
     `_GROUP_NORM_PASS_THROUGH_OP`'s own comment for why only one, and why
@@ -4944,6 +5205,28 @@ def _walk_to_conv_consumer(
             chain_ops.append((nxt, None))
             cur = out2
             continue
+
+        if (
+            nxt.op_type == "PRelu"
+            and nxt.domain == ""
+            and nxt.input
+            and nxt.input[0] == cur
+            and len(nxt.output) == 1
+        ):
+            prelu_match = _match_prelu_pass_through(nxt, initializer_map, n_channels)
+            if prelu_match is not None:
+                out2 = nxt.output[0]
+                if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+                    break
+                is_per_channel, slope_name = prelu_match
+                if is_per_channel:
+                    assert slope_name is not None
+                    conv_pass_through.append(_ConvPassThrough(nxt, slope_name, None))
+                else:
+                    chain_ops.append((nxt, None))
+                cur = out2
+                continue
+            break
 
         if (
             nxt.op_type == "Clip"
@@ -5245,17 +5528,23 @@ def _walk_conv_producer_backward(
     activations, self-consistently-depthwise Conv hops (see
     :func:`_match_conv_pass_through_self`), spatial pooling ops that never
     mix channels (``MaxPool``/``AveragePool``/``GlobalAveragePool``,
-    unconditionally -- see `_CONV_POOL_PASS_THROUGH`'s own comment), and a
+    unconditionally -- see `_CONV_POOL_PASS_THROUGH`'s own comment), a
     channel-axis-unaffected ``Resize``/``Pad`` (see
     :func:`_match_resize_channel_pass_through`/
     :func:`_match_pad_channel_pass_through` -- neither needs this walk's own
     not-yet-known group channel count, since `_match_resize_channel_pass_
     through` only ever recognizes a `scales`-driven `Resize`, a ratio that
     needs no channel count to validate, never a `sizes`-driven one -- see
-    that function's own docstring for why), and a channel-agnostic ``Clip``
-    (see :func:`_match_clip_channel_pass_through` -- likewise needs no
-    channel count at all, since neither `min` nor `max` is axis-indexed to
-    begin with), declining (only) whenever a
+    that function's own docstring for why), a self-consistently-shaped
+    ``PRelu`` hop (see :func:`_match_prelu_pass_through_self`, which -- like
+    the depthwise-Conv self-check above -- needs no externally supplied
+    channel count either, since a scalar `slope`'s own shape needs none at
+    all and a per-channel `slope`'s own `dims[0]` trivially satisfies its
+    own "expected count" check; re-validated for real once the group's
+    channel count is known, exactly like a depthwise Conv hop already is),
+    and a channel-agnostic ``Clip`` (see :func:`_match_clip_channel_pass_through`
+    -- likewise needs no channel count at all, since neither `min` nor `max`
+    is axis-indexed to begin with), declining (only) whenever a
     tensor crossed -- `start` itself included -- is a graph output (a
     caller-observed shape this pass never resizes); *how many* other things
     also read that same tensor is deliberately **not** checked here -- see
@@ -5367,6 +5656,18 @@ def _walk_conv_producer_backward(
             node, initializer_map
         ):
             unary_ops.append(node)
+            edges.append((node.input[0], node))
+            cur = node.input[0]
+            continue
+
+        prelu_self_match = _match_prelu_pass_through_self(node, initializer_map)
+        if prelu_self_match is not None:
+            is_per_channel, slope_name = prelu_self_match
+            if is_per_channel:
+                assert slope_name is not None
+                pass_through.append(_ConvPassThrough(node, slope_name, None))
+            else:
+                unary_ops.append(node)
             edges.append((node.input[0], node))
             cur = node.input[0]
             continue
@@ -6143,16 +6444,21 @@ def _walk_matmul_producer_backward(
     Tuple[Tuple[onnx.NodeProto, Optional[str]], ...],
     Tuple[Tuple[str, onnx.NodeProto], ...],
 ]:
-    """The backward counterpart of :func:`_walk_to_consumer`, used only by
+    """The backward counterpart of :func:`_walk_to_consumer`, used by
     :func:`_find_matmul_residual_chains` to resolve one operand of an
     eligible merge node (see :func:`_match_matmul_residual_merge`) back to
-    whatever produces it -- the MatMul/Gemm analogue of
-    :func:`_walk_conv_producer_backward` (see this function's own section
-    comment above for how the two differ: a wider hop set mirroring
-    `_walk_to_consumer`'s own per-channel bias/scale ``Add``/``Mul`` hop
-    (plus a channel-agnostic ``Clip``, see
-    :func:`_match_clip_channel_pass_through`), and no depthwise-pass-through
-    analogue at all). Declines (only) whenever
+    whatever produces it, and by :func:`_find_matmul_concat_chains` to
+    resolve one branch of a channel-axis ``Concat`` the same way -- the
+    MatMul/Gemm analogue of :func:`_walk_conv_producer_backward` (see this
+    function's own section comment above for how the two differ: a wider hop
+    set mirroring `_walk_to_consumer`'s own per-channel bias/scale
+    ``Add``/``Mul`` hop, a channel-agnostic ``Clip`` (see
+    :func:`_match_clip_channel_pass_through`), and a ``PRelu`` hop -- the
+    latter via :func:`_match_prelu_pass_through_matmul_self`, the
+    self-consistent backward-walk counterpart of
+    :func:`_match_prelu_pass_through_matmul`, mirroring the depthwise-Conv
+    self-check's identical trick -- and no depthwise-pass-through analogue
+    at all). Declines (only) whenever
     a tensor crossed -- `start` itself included -- is a graph output (a
     caller-observed shape this pass never resizes); *how many* other things
     also read that same tensor is deliberately **not** checked here -- see
@@ -6395,6 +6701,16 @@ def _walk_matmul_producer_backward(
                 chain_ops.append((node, bias_name))
                 edges.append((data_name, node))
                 cur = data_name
+                continue
+            return "fail", None, (), ()
+
+        if node.op_type == "PRelu" and node.domain == "" and len(node.input) == 2:
+            prelu_match = _match_prelu_pass_through_matmul_self(node, initializer_map)
+            if prelu_match is not None:
+                is_per_channel, slope_name = prelu_match
+                chain_ops.append((node, slope_name if is_per_channel else None))
+                edges.append((node.input[0], node))
+                cur = node.input[0]
                 continue
             return "fail", None, (), ()
 
@@ -8776,14 +9092,15 @@ def _apply_concat_chains(
                 # handling: channel i is exactly upstream channel i, so the
                 # hop's own weight/bias slice by this branch's own `keep`
                 # -- see :func:`_apply_conv_pass_through_hop`. (In practice
-                # this is always a depthwise `Conv` hop here, never a
-                # `CausalConvWithState` one -- see that op's own "Conv/
-                # pooling/Resize/Pad pass-through" section-comment scope
-                # note: it's only ever recognized by the forward walk, and
-                # this `b.conv_pass_through` is populated by the *backward*
-                # one -- but routing through the shared helper regardless
-                # keeps this branch correct even if that ever changes,
-                # rather than duplicating its op-type dispatch here too.)
+                # this is always a depthwise `Conv` or per-channel `PRelu`
+                # hop here, never a `CausalConvWithState` one -- see that
+                # op's own "Conv/pooling/Resize/Pad pass-through"
+                # section-comment scope note: it's only ever recognized by
+                # the forward walk, and this `b.conv_pass_through` is
+                # populated by the *backward* one -- but routing through the
+                # shared helper regardless keeps this branch correct even if
+                # that ever changes, rather than duplicating its op-type
+                # dispatch here too.)
                 _apply_conv_pass_through_hop(hop, initializer_map, keep, len(keep))
 
         global_keep = np.concatenate(
