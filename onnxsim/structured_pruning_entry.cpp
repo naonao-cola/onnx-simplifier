@@ -14208,6 +14208,887 @@ void ApplyFp4BlockQuantizedChains(onnx::GraphProto* graph,
   }
 }
 
+// --- QOperator (QLinearConv/QLinearMatMul/QGemm static-quantization)
+// --- structured pruning, mirroring pruning.py's own "QOperator
+// --- (QLinearConv/QLinearMatMul/QGemm static-quantization) structured
+// --- pruning" section (_QOpWeight through apply_structured_pruning_qoperator)
+//
+// A `QLinearConv`/`QLinearMatMul`/`com.microsoft::QGemm` node -- ONNX
+// Runtime's "QOperator" static-quantization format, the alternative to the
+// QDQ pattern the section above already handles -- takes/produces its own
+// quantized tensors directly, with its own `_scale`/`_zero_point` operand
+// pairs baked into the op's own input list, rather than a separate
+// `DequantizeLinear` node wrapping a plain op. Unlike the QDQ section, this
+// section needs no `DequantizeLinear`-walking resolution step at all: each
+// op's own dedicated `MatchQLinearConv`/`MatchQLinearMatMul`/`MatchQGemm`
+// unpacks its own input list directly into one shared `QOpWeightMatch`
+// shape (an `op_kind` discriminant rather than three separate structs,
+// mirroring pruning.py's own identical `_QOpWeight`/`op_kind` choice --
+// these three ops' pruning-relevant operands, a quantized weight, its own
+// scale/zero-point, an optional INT32 bias, are structurally identical once
+// each op's own input list is unpacked).
+//
+// Producer-role (output-channel, `N`-axis) pruning slices `w`'s own int8/
+// uint8 codes along `N` (axis 0 for `QLinearConv`, axis 1 or 0 for
+// `QLinearMatMul`/`QGemm` depending on `QGemm`'s own `transB` --
+// `QdqWeightAxis(/*producer_role=*/true, ...)`, reused directly: the QDQ
+// section's own per-tensor/per-channel axis convention is identical here,
+// there being no ConvTranspose-equivalent reversed layout for any of these
+// three ops). A per-channel `w_scale`/`w_zero_point` (rank-1, length `N`) is
+// co-sliced by the SAME `keep` set, in lockstep -- exactly the QDQ section's
+// own per-channel producer-role principle, reusing `SliceLastAxis`/
+// `ReadQuantCodes`/`SetQuantCodes`/`SliceAlongAxis` unchanged. A per-TENSOR
+// (scalar) `w_scale`/`w_zero_point` is left completely untouched -- not
+// shaped by channel count. `bias` (`QLinearConv`'s optional `B`, `QGemm`'s
+// optional `C`; `QLinearMatMul` has none at all), when present and not a
+// broadcasting scalar, is co-sliced identically -- its own values already
+// encode whatever per-channel scale the schema's own bias-quantization
+// formula describes, so this never recomputes it, only relocates existing
+// INT32 entries (`SliceLastAxisInt32`, the INT32 analogue of
+// `SliceLastAxis` this section needs since neither the QDQ section nor
+// anything else in this file has an INT32-dtype bias to slice before now).
+// A `C` given as a broadcasting SCALAR (rank 0 or `[1]`, `QGemm`'s own doc
+// explicitly allows this) is never sliced, mirroring the per-tensor-scale
+// reasoning above; any OTHER `C` shape is declined outright by the matcher.
+//
+// Consumer-role (reduction/input-channel, `K`-axis) pruning slices only
+// `w`'s own codes along `K` (`QdqWeightAxis(/*producer_role=*/false, ...)`)
+// -- `w_scale`/`w_zero_point`/bias are never indexed by `K` in any of the
+// three live schemas, so the consumer role touches nothing else at all,
+// simpler even than the QDQ section's own consumer role (no blockwise
+// granularity ever arises here -- nothing in any of the three schemas
+// describes a blocked/`block_size` quantization grain for any of these ops).
+//
+// Chain-finding (`FindQopChains`/`WalkToQopConsumer`) mirrors the QDQ
+// section's own `FindQdqChains`/`WalkToConsumerQdq` closely: a single
+// producer's output feeds, through zero or more shape-preserving unary
+// activations (`UnaryPassThroughOps`) with no other consumer anywhere along
+// that path, into exactly one downstream SAME-FAMILY node (`QLinearConv`
+// only pairs with `QLinearConv`; `QLinearMatMul`/`QGemm` only pair with
+// `QLinearMatMul`/`QGemm`, either combination) whose own `K` matches the
+// producer's own `N`. A `QLinearConv` producer feeding a `QLinearMatMul`/
+// `QGemm` consumer through a `Flatten`/`Reshape` reinterpretation (the real
+// shape a Conv-backbone classifier head takes) is a REAL, confirmed gap,
+// not an oversight -- see pruning.py's own section comment for the full
+// empirical round-trip this inherits verbatim; neither walker recognizes a
+// `Flatten`/`Reshape` hop at all. Unlike the QDQ section, no gated
+// (SwiGLU/GeGLU) pair is matched here either -- a genuine, deliberately
+// left-out follow-up, mirrored from pruning.py's own identical scope
+// boundary for this section.
+//
+// What's declined, deliberately, rather than guessed at (mirroring every
+// matcher elsewhere in this file, and pruning.py's own section comment):
+//
+//   * A non-constant `w`/`w_scale`/`w_zero_point`/bias, or any of the
+//     operands this section actually slices (`w`, `w_scale`/`w_zero_point`
+//     when per-channel, and a non-scalar bias) read by more than one node
+//     (a shared/tied tensor -- slicing it here would silently corrupt
+//     whatever else reads it). `x_scale`/`x_zero_point`/`y_scale`/
+//     `y_zero_point`/`a_scale`/`a_zero_point` are NEVER touched by either
+//     role, so a legitimately shared/reused activation scale across many
+//     quantized layers -- the realistic, common shape a real chain takes,
+//     since a producer's own `y_scale`/`y_zero_point` typically ARE the
+//     very same initializers its consumer's `x_scale`/`x_zero_point`/
+//     `a_scale`/`a_zero_point` read -- is never needlessly blocked.
+//   * A non-scalar `x_scale`/`x_zero_point`/`a_scale`/`a_zero_point`/
+//     `y_scale`/`y_zero_point` -- every live schema technically permits a
+//     wider activation-quantization granularity, but no real exporter this
+//     investigation found ever emits one; declined outright rather than
+//     built and verified against nothing.
+//   * A general grouped or depthwise `QLinearConv` (`group != 1`). No
+//     `QLinearConvTranspose` op exists in `ai.onnx` at all, so unlike the
+//     QDQ section's own Conv/ConvTranspose pairing, there is only ever one
+//     Conv-family QOperator op to match in the first place.
+//   * A `QGemm` with `transA != 0` or `alpha != 1.0` -- mirroring
+//     `MatchMatMulLikeRaw`'s own identical `transA`/`alpha`/`beta`
+//     restriction for plain `Gemm`.
+//   * A weight rank other than 4 for `QLinearConv` (2-D spatial Conv only)
+//     or other than 2 for `QLinearMatMul`/`QGemm` -- mirroring the QDQ
+//     section's own identical rank restriction.
+//   * Any residual/skip-connection merge, `Concat`-merged branch group, or
+//     gated (SwiGLU/GeGLU) pair -- only the plain single-producer/single-
+//     consumer/unary-hops-only topology above is matched.
+//   * Mixing a QOperator node with a QDQ-fed, plain-float, or
+//     `MatMulNBits`/block-quantized Fp4/Fp8 node on EITHER side of a chain
+//     -- every one of those is a genuinely different quantization scheme
+//     this investigation did not confirm composes safely, so a QOperator
+//     node feeding, or fed by, any of those is simply never matched as
+//     either role here (its own producer/consumer search only ever tries
+//     the other two QOperator ops).
+//
+// This entire section is a genuinely separate match: `QLinearConv`/
+// `QLinearMatMul`/`QGemm` are node types no other Find*Chains call in this
+// file's `ApplyStructuredPruning` recognizes at all, so `FindQopChains`
+// below can never double-match a tensor any other pass already claimed --
+// but it still shares this graph's own single `TouchedState` with every
+// other Apply* call, for the same "one shared conflict ledger per graph"
+// reason every other quantized-weight pass here already does.
+
+// --- INT32 tensor <-> flat buffer, the INT32 analogue of ReadFloatTensor/
+// SetFloatTensorData/SliceLastAxis -- needed only for QLinearConv's/
+// QGemm's own optional INT32 per-channel bias (`B`/`C`): "slice, don't
+// requantize" applies to it exactly as it does to the int8/uint8 weight
+// codes above -- its own values already encode whatever per-channel scale
+// the schema's own bias-quantization formula describes, so this never
+// recomputes them, only relocates existing entries. No other section in
+// this file has an INT32-dtype tensor to slice before now.
+std::vector<int32_t> ReadInt32Tensor(const onnx::TensorProto& t) {
+  int64_t numel = 1;
+  for (int64_t d : t.dims()) {
+    numel *= d;
+  }
+  std::vector<int32_t> out(static_cast<size_t>(numel));
+  if (t.has_raw_data()) {
+    std::memcpy(out.data(), t.raw_data().data(), out.size() * sizeof(int32_t));
+    if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+      onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(out.data()),
+                                        out.size() * sizeof(int32_t),
+                                        sizeof(int32_t));
+    }
+  } else {
+    for (int64_t i = 0; i < numel; ++i) {
+      out[static_cast<size_t>(i)] = t.int32_data(static_cast<int>(i));
+    }
+  }
+  return out;
+}
+
+void SetInt32TensorData(onnx::TensorProto* t, const std::vector<int64_t>& dims,
+                        const std::vector<int32_t>& data) {
+  const std::string name = t->name();
+  t->Clear();
+  t->set_name(name);
+  t->set_data_type(onnx::TensorProto::INT32);
+  for (int64_t d : dims) {
+    t->add_dims(d);
+  }
+  std::string raw(data.size() * sizeof(int32_t), '\0');
+  std::memcpy(raw.data(), data.data(), raw.size());
+  if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+    onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(raw.data()),
+                                      raw.size(), sizeof(int32_t));
+  }
+  t->set_raw_data(std::move(raw));
+}
+
+void SliceLastAxisInt32(onnx::TensorProto* t,
+                        const std::vector<int64_t>& keep) {
+  std::vector<int64_t> dims(t->dims().begin(), t->dims().end());
+  std::vector<int32_t> data = ReadInt32Tensor(*t);
+  std::vector<int32_t> out(keep.size());
+  for (size_t i = 0; i < keep.size(); ++i) {
+    out[i] = data[static_cast<size_t>(keep[i])];
+  }
+  std::vector<int64_t> new_dims = dims;
+  if (new_dims.empty()) {
+    new_dims.push_back(static_cast<int64_t>(keep.size()));
+  } else {
+    new_dims.back() = static_cast<int64_t>(keep.size());
+  }
+  SetInt32TensorData(t, new_dims, out);
+}
+
+// --- Matching, mirroring _QOpWeight/_match_qlinearconv/_match_qlinearmatmul/
+// _match_qgemm -----------------------------------------------------------
+
+enum class QOpKind { kConv, kMatMul, kGemm };
+
+// A matched QLinearConv/QLinearMatMul/QGemm node's own sliceable operands --
+// see this section's own top comment. `w_name` is QLinearConv's `w`,
+// QLinearMatMul's `b`, or QGemm's `B` -- the quantized weight, always INT8/
+// UINT8. `w_scale_name`/`w_zero_point_name` are its paired scale/zero-point
+// (always the same shape as each other: scalar when `per_channel` is
+// false, 1-D length `N` otherwise). `bias_name` is QLinearConv's optional
+// `B` or QGemm's optional `C` (always INT32, nullopt for QLinearMatMul --
+// which has no bias input at all -- or when genuinely absent);
+// `bias_is_scalar` is true only for a QGemm `C` given as a broadcasting
+// scalar (never sliced). `weight_transposed` is QGemm's own `transB`
+// (always false for QLinearConv/QLinearMatMul).
+struct QOpWeightMatch {
+  QOpKind op_kind;
+  std::string w_name;
+  std::string w_scale_name;
+  std::string w_zero_point_name;
+  std::optional<std::string> bias_name;
+  bool bias_is_scalar;
+  bool weight_transposed;
+  bool per_channel;
+  int64_t N;
+  int64_t K;
+};
+
+// True for a 0-D ([]) or single-element 1-D ([1]) shape -- the two ways a
+// per-tensor activation scale/zero-point might reasonably be exported.
+bool QopScalarDimsOk(const onnx::TensorProto& t) {
+  return t.dims_size() == 0 || (t.dims_size() == 1 && t.dims(0) == 1);
+}
+
+// Checks a weight's own (scale, zero_point) pair against the live schemas'
+// shared "scalar (per-tensor) or 1-D length N (per-channel)" rule --
+// returns false (per-tensor), true (per-channel), or nullopt (anything
+// else -- declined, see this section's own top comment).
+std::optional<bool> QopPerChannelScaleOk(const onnx::TensorProto& scale_init,
+                                         const onnx::TensorProto& zp_init,
+                                         int64_t n) {
+  if (scale_init.data_type() != onnx::TensorProto::FLOAT) {
+    return std::nullopt;
+  }
+  if (!DimsEqual(scale_init.dims(), zp_init.dims())) {
+    return std::nullopt;  // Schema: scale and zero_point must share one shape.
+  }
+  int64_t numel = 1;
+  for (int64_t d : scale_init.dims()) {
+    numel *= d;
+  }
+  if (numel == 1) {
+    return false;
+  }
+  if (scale_init.dims_size() == 1 && scale_init.dims(0) == n) {
+    return true;
+  }
+  return std::nullopt;
+}
+
+// If `node` is an ordinary (group=1) `QLinearConv` matching every scope
+// boundary this section's own top comment documents, returns the match.
+// nullopt whenever anything is ambiguous or out of the empirically-verified
+// scope, rather than guessing.
+std::optional<QOpWeightMatch> MatchQLinearConv(
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const ConsumerMap& consumers_of) {
+  if (node.op_type() != "QLinearConv" || !node.domain().empty()) {
+    return std::nullopt;
+  }
+  if ((node.input_size() != 8 && node.input_size() != 9) ||
+      node.output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& x_name = node.input(0);
+  const std::string& x_scale_name = node.input(1);
+  const std::string& x_zp_name = node.input(2);
+  const std::string& w_name = node.input(3);
+  const std::string& w_scale_name = node.input(4);
+  const std::string& w_zp_name = node.input(5);
+  const std::string& y_scale_name = node.input(6);
+  const std::string& y_zp_name = node.input(7);
+  if (x_name.empty() || x_scale_name.empty() || x_zp_name.empty() ||
+      w_name.empty() || w_scale_name.empty() || w_zp_name.empty() ||
+      y_scale_name.empty() || y_zp_name.empty()) {
+    return std::nullopt;
+  }
+  std::optional<std::string> bias_name;
+  if (node.input_size() == 9 && !node.input(8).empty()) {
+    bias_name = node.input(8);
+  }
+
+  if (ConvGroupAttr(node) != 1) {
+    return std::nullopt;  // Grouped/depthwise QLinearConv -- out of scope,
+                          // see this section's own top comment.
+  }
+
+  auto wit = init_map.find(w_name);
+  auto sit = init_map.find(w_scale_name);
+  auto zit = init_map.find(w_zp_name);
+  if (wit == init_map.end() || sit == init_map.end() || zit == init_map.end()) {
+    return std::nullopt;  // Non-constant w/w_scale/w_zero_point.
+  }
+  const onnx::TensorProto* w_init = wit->second;
+  const onnx::TensorProto* w_scale_init = sit->second;
+  const onnx::TensorProto* w_zp_init = zit->second;
+  if (w_init->data_type() != onnx::TensorProto::INT8 &&
+      w_init->data_type() != onnx::TensorProto::UINT8) {
+    return std::nullopt;
+  }
+  if (w_zp_init->data_type() != w_init->data_type()) {
+    return std::nullopt;  // Schema: w and w_zero_point share one type.
+  }
+  if (w_init->dims_size() != 4) {
+    return std::nullopt;  // 2-D spatial Conv only -- see this section's own
+                          // top comment.
+  }
+  const int64_t n = w_init->dims(0);
+  const int64_t k = w_init->dims(1);
+  if (n <= 0 || k <= 0) {
+    return std::nullopt;
+  }
+
+  auto per_channel = QopPerChannelScaleOk(*w_scale_init, *w_zp_init, n);
+  if (!per_channel) {
+    return std::nullopt;
+  }
+
+  for (const std::string& nm :
+       {x_scale_name, x_zp_name, y_scale_name, y_zp_name}) {
+    auto it = init_map.find(nm);
+    if (it == init_map.end() || !QopScalarDimsOk(*it->second)) {
+      return std::nullopt;  // Non-constant, or non-scalar, activation scale
+                            // -- declined, see this section's own top
+                            // comment.
+    }
+  }
+
+  if (bias_name) {
+    auto bit = init_map.find(*bias_name);
+    if (bit == init_map.end() ||
+        bit->second->data_type() != onnx::TensorProto::INT32) {
+      return std::nullopt;  // Non-constant, or dtype-mismatched, bias.
+    }
+    if (!(bit->second->dims_size() == 1 && bit->second->dims(0) == n)) {
+      return std::nullopt;
+    }
+  }
+
+  std::vector<std::string> sliced_names = {w_name};
+  if (*per_channel) {
+    sliced_names.push_back(w_scale_name);
+    sliced_names.push_back(w_zp_name);
+  }
+  if (bias_name) {
+    sliced_names.push_back(*bias_name);
+  }
+  for (const auto& nm : sliced_names) {
+    if (ConsumerCount(consumers_of, nm) != 1) {
+      return std::nullopt;  // Shared/tied tensor -- another node reads it
+                            // too.
+    }
+  }
+
+  return QOpWeightMatch{
+      QOpKind::kConv, w_name, w_scale_name, w_zp_name, bias_name,
+      false,          false,  *per_channel, n,         k};
+}
+
+// If `node` is a `QLinearMatMul` matching every scope boundary this
+// section's own top comment documents, returns the match. nullopt whenever
+// anything is ambiguous or out of the empirically-verified scope.
+std::optional<QOpWeightMatch> MatchQLinearMatMul(
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const ConsumerMap& consumers_of) {
+  if (node.op_type() != "QLinearMatMul" || !node.domain().empty()) {
+    return std::nullopt;
+  }
+  if (node.input_size() != 8 || node.output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& a_name = node.input(0);
+  const std::string& a_scale_name = node.input(1);
+  const std::string& a_zp_name = node.input(2);
+  const std::string& b_name = node.input(3);
+  const std::string& b_scale_name = node.input(4);
+  const std::string& b_zp_name = node.input(5);
+  const std::string& y_scale_name = node.input(6);
+  const std::string& y_zp_name = node.input(7);
+  if (a_name.empty() || a_scale_name.empty() || a_zp_name.empty() ||
+      b_name.empty() || b_scale_name.empty() || b_zp_name.empty() ||
+      y_scale_name.empty() || y_zp_name.empty()) {
+    return std::nullopt;
+  }
+
+  auto bit = init_map.find(b_name);
+  auto sit = init_map.find(b_scale_name);
+  auto zit = init_map.find(b_zp_name);
+  if (bit == init_map.end() || sit == init_map.end() || zit == init_map.end()) {
+    return std::nullopt;
+  }
+  const onnx::TensorProto* b_init = bit->second;
+  const onnx::TensorProto* b_scale_init = sit->second;
+  const onnx::TensorProto* b_zp_init = zit->second;
+  if (b_init->data_type() != onnx::TensorProto::INT8 &&
+      b_init->data_type() != onnx::TensorProto::UINT8) {
+    return std::nullopt;
+  }
+  if (b_zp_init->data_type() != b_init->data_type()) {
+    return std::nullopt;
+  }
+  if (b_init->dims_size() != 2) {
+    return std::nullopt;  // 2-D MatMul weight only, mirroring this file's
+                          // own MatchMatMulLikeRaw/MatchMatmulQdq rank bar.
+  }
+  const int64_t k = b_init->dims(0);
+  const int64_t n = b_init->dims(1);
+  if (n <= 0 || k <= 0) {
+    return std::nullopt;
+  }
+
+  auto per_channel = QopPerChannelScaleOk(*b_scale_init, *b_zp_init, n);
+  if (!per_channel) {
+    return std::nullopt;
+  }
+
+  for (const std::string& nm :
+       {a_scale_name, a_zp_name, y_scale_name, y_zp_name}) {
+    auto it = init_map.find(nm);
+    if (it == init_map.end() || !QopScalarDimsOk(*it->second)) {
+      return std::nullopt;  // Non-constant, or non-scalar (per-row/
+                            // per-column), activation scale -- declined.
+    }
+  }
+
+  std::vector<std::string> sliced_names = {b_name};
+  if (*per_channel) {
+    sliced_names.push_back(b_scale_name);
+    sliced_names.push_back(b_zp_name);
+  }
+  for (const auto& nm : sliced_names) {
+    if (ConsumerCount(consumers_of, nm) != 1) {
+      return std::nullopt;  // Shared/tied tensor -- another node reads it
+                            // too.
+    }
+  }
+
+  return QOpWeightMatch{QOpKind::kMatMul,
+                        b_name,
+                        b_scale_name,
+                        b_zp_name,
+                        std::nullopt,
+                        false,
+                        false,
+                        *per_channel,
+                        n,
+                        k};
+}
+
+// If `node` is a `com.microsoft::QGemm` with `transA=0`, `alpha=1.0`
+// (mirroring `MatchMatMulLikeRaw`'s own identical restriction for plain
+// `Gemm`) matching every other scope boundary this section's own top
+// comment documents, returns the match. nullopt whenever anything is
+// ambiguous or out of the empirically-verified scope.
+std::optional<QOpWeightMatch> MatchQGemm(const onnx::NodeProto& node,
+                                         const InitMap& init_map,
+                                         const ConsumerMap& consumers_of) {
+  if (node.op_type() != "QGemm" || node.domain() != kComMicrosoftDomain) {
+    return std::nullopt;
+  }
+  if (node.input_size() < 6 || node.output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& a_name = node.input(0);
+  const std::string& a_scale_name = node.input(1);
+  const std::string& a_zp_name = node.input(2);
+  const std::string& b_name = node.input(3);
+  const std::string& b_scale_name = node.input(4);
+  const std::string& b_zp_name = node.input(5);
+  if (a_name.empty() || a_scale_name.empty() || a_zp_name.empty() ||
+      b_name.empty() || b_scale_name.empty() || b_zp_name.empty()) {
+    return std::nullopt;
+  }
+  std::optional<std::string> c_name;
+  if (node.input_size() > 6 && !node.input(6).empty()) {
+    c_name = node.input(6);
+  }
+  std::optional<std::string> y_scale_name;
+  if (node.input_size() > 7 && !node.input(7).empty()) {
+    y_scale_name = node.input(7);
+  }
+  std::optional<std::string> y_zp_name;
+  if (node.input_size() > 8 && !node.input(8).empty()) {
+    y_zp_name = node.input(8);
+  }
+
+  int64_t trans_a = 0, trans_b = 0;
+  double alpha = 1.0;
+  bool has_trans_a = false, has_alpha = false;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "transA") {
+      trans_a = attr.i();
+      has_trans_a = true;
+    } else if (attr.name() == "alpha") {
+      alpha = attr.f();
+      has_alpha = true;
+    } else if (attr.name() == "transB") {
+      trans_b = attr.i();
+    }
+  }
+  if (has_trans_a && trans_a != 0) {
+    return std::nullopt;
+  }
+  if (has_alpha && alpha != 1.0) {
+    return std::nullopt;
+  }
+  const bool weight_transposed = trans_b != 0;
+
+  auto bit = init_map.find(b_name);
+  auto sit = init_map.find(b_scale_name);
+  auto zit = init_map.find(b_zp_name);
+  if (bit == init_map.end() || sit == init_map.end() || zit == init_map.end()) {
+    return std::nullopt;
+  }
+  const onnx::TensorProto* b_init = bit->second;
+  const onnx::TensorProto* b_scale_init = sit->second;
+  const onnx::TensorProto* b_zp_init = zit->second;
+  if (b_init->data_type() != onnx::TensorProto::INT8 &&
+      b_init->data_type() != onnx::TensorProto::UINT8) {
+    return std::nullopt;
+  }
+  if (b_zp_init->data_type() != b_init->data_type()) {
+    return std::nullopt;
+  }
+  if (b_init->dims_size() != 2) {
+    return std::nullopt;
+  }
+  const int64_t n = weight_transposed ? b_init->dims(0) : b_init->dims(1);
+  const int64_t k = weight_transposed ? b_init->dims(1) : b_init->dims(0);
+  if (n <= 0 || k <= 0) {
+    return std::nullopt;
+  }
+
+  auto per_channel = QopPerChannelScaleOk(*b_scale_init, *b_zp_init, n);
+  if (!per_channel) {
+    return std::nullopt;
+  }
+
+  for (const std::string& nm : {a_scale_name, a_zp_name}) {
+    auto it = init_map.find(nm);
+    if (it == init_map.end() || !QopScalarDimsOk(*it->second)) {
+      return std::nullopt;
+    }
+  }
+  for (const auto& opt_nm : {y_scale_name, y_zp_name}) {
+    if (!opt_nm) {
+      continue;
+    }
+    auto it = init_map.find(*opt_nm);
+    if (it == init_map.end() || !QopScalarDimsOk(*it->second)) {
+      return std::nullopt;
+    }
+  }
+
+  std::optional<std::string> bias_name;
+  bool bias_is_scalar = false;
+  if (c_name) {
+    auto cit = init_map.find(*c_name);
+    if (cit == init_map.end() ||
+        cit->second->data_type() != onnx::TensorProto::INT32) {
+      return std::nullopt;  // Non-constant, or dtype-mismatched, bias.
+    }
+    const onnx::TensorProto* c_init = cit->second;
+    if (c_init->dims_size() == 0 ||
+        (c_init->dims_size() == 1 && c_init->dims(0) == 1)) {
+      bias_is_scalar = true;  // Broadcasting scalar -- never sliced, see
+                              // this section's own top comment.
+    } else if (!(c_init->dims_size() == 1 && c_init->dims(0) == n)) {
+      return std::nullopt;  // Ambiguous broadcast shape -- declined.
+    }
+    bias_name = c_name;
+  }
+
+  std::vector<std::string> sliced_names = {b_name};
+  if (*per_channel) {
+    sliced_names.push_back(b_scale_name);
+    sliced_names.push_back(b_zp_name);
+  }
+  if (c_name && !bias_is_scalar) {
+    sliced_names.push_back(*c_name);
+  }
+  for (const auto& nm : sliced_names) {
+    if (ConsumerCount(consumers_of, nm) != 1) {
+      return std::nullopt;  // Shared/tied tensor -- another node reads it
+                            // too.
+    }
+  }
+
+  return QOpWeightMatch{QOpKind::kGemm,
+                        b_name,
+                        b_scale_name,
+                        b_zp_name,
+                        bias_name,
+                        bias_is_scalar,
+                        weight_transposed,
+                        *per_channel,
+                        n,
+                        k};
+}
+
+// --- Chain data model + plain-chain walker/finder, mirroring _QOpChain and
+// _walk_to_qop_consumer/_find_qop_chains -----------------------------------
+
+struct QOpProducer {
+  onnx::NodeProto* node;
+  QOpWeightMatch w;
+};
+
+struct QOpConsumerMatch {
+  onnx::NodeProto* node;
+  QOpWeightMatch w;
+};
+
+struct QOpChain {
+  QOpProducer producer;
+  std::vector<onnx::NodeProto*> chain_ops;
+  QOpConsumerMatch consumer;
+  int64_t n_channels;
+};
+
+// From tensor `start`, walks forward through shape-preserving unary
+// activations (UnaryPassThroughOps) with no other consumer anywhere along
+// the way, until a same-family (QLinearConv-only when `is_conv`,
+// QLinearMatMul/QGemm-only otherwise) consumer is found whose own `K`
+// matches `n_channels`. Mirrors WalkToConsumerQdq closely -- see this
+// section's own top comment for why no Flatten/Reshape cross-family hop is
+// recognized. Returns nullopt if the walk runs out of hops, hits a branch,
+// or never reaches such a consumer -- including when the very next node IS
+// a same-family op but fails to match or has a mismatched K, mirroring
+// pruning.py's own `_walk_to_qop_consumer` returning None immediately in
+// that case rather than falling through to the unary-activation check.
+std::pair<std::optional<QOpConsumerMatch>, std::vector<onnx::NodeProto*>>
+WalkToQopConsumer(const std::string& start, bool is_conv,
+                  const InitMap& init_map, const ConsumerMap& consumers_of,
+                  const std::unordered_set<std::string>& graph_outputs,
+                  int64_t n_channels, int max_hops) {
+  std::vector<onnx::NodeProto*> chain_ops;
+  std::string cur = start;
+  for (int hop = 0; hop < max_hops; ++hop) {
+    auto cit = consumers_of.find(cur);
+    if (cit == consumers_of.end() || cit->second.size() != 1) {
+      return {std::nullopt, chain_ops};
+    }
+    onnx::NodeProto* nxt = cit->second[0];
+
+    if (is_conv) {
+      if (nxt->op_type() == "QLinearConv" && nxt->domain().empty() &&
+          nxt->input_size() > 0 && nxt->input(0) == cur) {
+        auto m = MatchQLinearConv(*nxt, init_map, consumers_of);
+        if (!m || m->K != n_channels) {
+          return {std::nullopt, chain_ops};
+        }
+        return {QOpConsumerMatch{nxt, *m}, chain_ops};
+      }
+    } else {
+      if (nxt->op_type() == "QLinearMatMul" && nxt->domain().empty() &&
+          nxt->input_size() > 0 && nxt->input(0) == cur) {
+        auto m = MatchQLinearMatMul(*nxt, init_map, consumers_of);
+        if (!m || m->K != n_channels) {
+          return {std::nullopt, chain_ops};
+        }
+        return {QOpConsumerMatch{nxt, *m}, chain_ops};
+      }
+      if (nxt->op_type() == "QGemm" && nxt->domain() == kComMicrosoftDomain &&
+          nxt->input_size() > 0 && nxt->input(0) == cur) {
+        auto m = MatchQGemm(*nxt, init_map, consumers_of);
+        if (!m || m->K != n_channels) {
+          return {std::nullopt, chain_ops};
+        }
+        return {QOpConsumerMatch{nxt, *m}, chain_ops};
+      }
+    }
+
+    const bool is_unary = UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
+                          nxt->input_size() == 1 && nxt->input(0) == cur &&
+                          nxt->output_size() == 1;
+    if (!is_unary) {
+      return {std::nullopt, chain_ops};
+    }
+    const std::string& out2 = nxt->output(0);
+    auto oit = consumers_of.find(out2);
+    if (oit == consumers_of.end() || oit->second.size() != 1 ||
+        graph_outputs.count(out2)) {
+      return {std::nullopt, chain_ops};
+    }
+    chain_ops.push_back(nxt);
+    cur = out2;
+  }
+  return {std::nullopt, chain_ops};
+}
+
+// The QOperator analogue of FindQdqChains, restricted to the single-
+// producer/single-consumer/unary-hops-only, same-family-only topology
+// WalkToQopConsumer matches. Tries a QLinearConv producer, then a
+// QLinearMatMul producer, then a QGemm producer -- the three matchers' own
+// op_type checks are mutually exclusive, so this is never ambiguous.
+std::vector<QOpChain> FindQopChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  auto is_internal = [&](const std::string& name) {
+    auto it = consumers_of.find(name);
+    return it != consumers_of.end() && it->second.size() == 1 &&
+           !graph_outputs.count(name);
+  };
+
+  std::vector<QOpChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    std::optional<QOpWeightMatch> m;
+    bool is_conv = false;
+    if (node->op_type() == "QLinearConv") {
+      m = MatchQLinearConv(*node, init_map, consumers_of);
+      is_conv = true;
+    } else if (node->op_type() == "QLinearMatMul") {
+      m = MatchQLinearMatMul(*node, init_map, consumers_of);
+    } else if (node->op_type() == "QGemm") {
+      m = MatchQGemm(*node, init_map, consumers_of);
+    } else {
+      continue;
+    }
+    if (!m) {
+      continue;
+    }
+
+    const std::string& out_name = node->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    auto [consumer, chain_ops] =
+        WalkToQopConsumer(out_name, is_conv, init_map, consumers_of,
+                          graph_outputs, m->N, kMaxChainHops);
+    if (!consumer) {
+      continue;
+    }
+
+    QOpChain chain;
+    chain.producer = QOpProducer{node, *m};
+    chain.chain_ops = std::move(chain_ops);
+    chain.consumer = *consumer;
+    chain.n_channels = m->N;
+    chains.push_back(std::move(chain));
+  }
+  return chains;
+}
+
+// --- Apply: slicing + ranking, mirroring _qop_dequantized_nk/
+// _slice_qop_producer/_slice_qop_consumer/apply_structured_pruning_qoperator
+
+// The full float64 (N, K) dequantized weight matrix `w` refers to, for
+// IMPORTANCE RANKING ONLY -- never written back to the graph (this
+// section's own "slice, don't recompute" principle). Reuses
+// PerChannelDequantFlat (the QDQ section's own per-channel dequant helper --
+// applies identically here, a QOperator weight's own scale/zero-point pair
+// being the same "scalar or 1-D length N" shape) and QdqWeightToNk (to
+// reshape/transpose into (N, K) row-major), mirroring pruning.py's own
+// `_qop_dequantized_nk` exactly.
+std::vector<double> QopDequantizedNk(const QOpWeightMatch& w,
+                                     const MutInitMap& init_map) {
+  const bool is_conv = w.op_kind == QOpKind::kConv;
+  const onnx::TensorProto* wt = init_map.at(w.w_name);
+  const std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
+  const std::vector<int64_t> codes = ReadQuantCodes(*wt);
+  const std::vector<float> scale =
+      ReadFloatTensor(*init_map.at(w.w_scale_name));
+  const std::vector<int64_t> zp =
+      ReadQuantCodes(*init_map.at(w.w_zero_point_name));
+  const int64_t axis =
+      QdqWeightAxis(/*producer_role=*/true, w.weight_transposed, is_conv,
+                    /*is_conv_transpose=*/false);
+  const std::vector<double> flat =
+      PerChannelDequantFlat(codes, dims, scale, zp, w.per_channel, axis);
+  return QdqWeightToNk(flat, dims, w.weight_transposed, is_conv,
+                       /*is_conv_transpose=*/false);
+}
+
+// Slices `w`'s own N (output-channel) axis to `keep` (ascending indices) --
+// the producer role. See this section's own top comment for exactly which
+// of w/w_scale/w_zero_point/bias get co-sliced.
+void SliceQopProducer(const QOpWeightMatch& w, const std::vector<int64_t>& keep,
+                      MutInitMap& init_map) {
+  const bool is_conv = w.op_kind == QOpKind::kConv;
+  const int64_t axis =
+      QdqWeightAxis(/*producer_role=*/true, w.weight_transposed, is_conv,
+                    /*is_conv_transpose=*/false);
+
+  onnx::TensorProto* wt = init_map.at(w.w_name);
+  const std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
+  const std::vector<int64_t> codes = ReadQuantCodes(*wt);
+  const std::vector<int64_t> new_codes =
+      SliceAlongAxis(codes, dims, axis, keep);
+  std::vector<int64_t> new_dims = dims;
+  new_dims[static_cast<size_t>(axis)] = static_cast<int64_t>(keep.size());
+  SetQuantCodes(wt, wt->data_type(), new_dims, new_codes);
+
+  if (w.per_channel) {
+    SliceLastAxis(init_map.at(w.w_scale_name), keep);
+    onnx::TensorProto* zt = init_map.at(w.w_zero_point_name);
+    const std::vector<int64_t> zdims(zt->dims().begin(), zt->dims().end());
+    const std::vector<int64_t> zcodes = ReadQuantCodes(*zt);
+    const std::vector<int64_t> new_z = SliceAlongAxis(zcodes, zdims, 0, keep);
+    std::vector<int64_t> new_zdims = zdims;
+    new_zdims[0] = static_cast<int64_t>(keep.size());
+    SetQuantCodes(zt, zt->data_type(), new_zdims, new_z);
+  }
+  if (w.bias_name && !w.bias_is_scalar) {
+    SliceLastAxisInt32(init_map.at(*w.bias_name), keep);
+  }
+}
+
+// Slices `w`'s own K (reduction/input-channel) axis to `keep` -- the
+// consumer role. Never touches scale/zero_point/bias -- none of the three
+// live schemas index any of them by K (see this section's own top comment).
+void SliceQopConsumer(const QOpWeightMatch& w, const std::vector<int64_t>& keep,
+                      MutInitMap& init_map) {
+  const bool is_conv = w.op_kind == QOpKind::kConv;
+  const int64_t axis =
+      QdqWeightAxis(/*producer_role=*/false, w.weight_transposed, is_conv,
+                    /*is_conv_transpose=*/false);
+  onnx::TensorProto* wt = init_map.at(w.w_name);
+  const std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
+  const std::vector<int64_t> codes = ReadQuantCodes(*wt);
+  const std::vector<int64_t> new_codes =
+      SliceAlongAxis(codes, dims, axis, keep);
+  std::vector<int64_t> new_dims = dims;
+  new_dims[static_cast<size_t>(axis)] = static_cast<int64_t>(keep.size());
+  SetQuantCodes(wt, wt->data_type(), new_dims, new_codes);
+}
+
+// The apply body for QOperator chains, mirroring
+// `apply_structured_pruning_qoperator`'s own main loop over
+// `_find_qop_chains` -- see this section's own top comment for the
+// producer/consumer co-slicing rules this enforces.
+void ApplyQopChains(onnx::GraphProto* graph, std::vector<QOpChain>& chains,
+                    double sparsity, TouchedState& touched) {
+  MutInitMap init_map = BuildMutInitMap(graph);
+  auto& producer_touched = touched.producer;
+  auto& consumer_touched = touched.consumer;
+  auto& stale_value_info = touched.stale_value_info;
+
+  for (const auto& chain : chains) {
+    const QOpProducer& p = chain.producer;
+    const QOpConsumerMatch& c = chain.consumer;
+    const std::string& p_key = p.w.w_name;
+    const std::string& c_key = c.w.w_name;
+    if (p_key == c_key) {
+      continue;  // Degenerate (the same weight in both roles).
+    }
+    if (producer_touched.count(p_key) || consumer_touched.count(c_key)) {
+      continue;  // A shared/tied weight another chain already resized.
+    }
+
+    const int64_t n = chain.n_channels;
+    const int64_t keep_count = std::max<int64_t>(
+        1, n - std::llround(static_cast<double>(n) * sparsity));
+    if (keep_count >= n) {
+      continue;  // Rounds down to nothing for this layer -- no-op.
+    }
+
+    const std::vector<double> w_nk = QopDequantizedNk(p.w, init_map);
+    // NOT `p.w.K` -- for a QLinearConv weight the per-row flattened length
+    // (C*kH*kW) differs from `K` (just C, the reduction-CHANNEL count the
+    // matcher/consumer-role slicing use); mirrors ApplyQdqChains's own
+    // identical `w_nk.size() / n` derivation for the same reason.
+    const int64_t row_len = static_cast<int64_t>(w_nk.size()) / n;
+    const std::vector<double> importance =
+        QdqChannelImportanceL2(w_nk, n, row_len);
+    // Stable tie-break for the identical determinism reason
+    // ApplyQdqChains's own identical line documents.
+    const std::vector<int64_t> keep =
+        StableTopKIndicesAscending(importance, keep_count);
+
+    SliceQopProducer(p.w, keep, init_map);
+    SliceQopConsumer(c.w, keep, init_map);
+
+    producer_touched.insert(p_key);
+    consumer_touched.insert(c_key);
+    stale_value_info.insert(p.node->output(0));
+    for (onnx::NodeProto* op : chain.chain_ops) {
+      stale_value_info.insert(op->output(0));
+    }
+  }
+}
+
 // --- Subgraph recursion ------------------------------------------------
 //
 // Mirrors pruning.py's own `_iter_subgraphs` and the "Subgraph recursion"
@@ -15043,6 +15924,7 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
         FindFp8BlockQuantizedChains(graph);
     std::vector<Fp4Chain> fp4_block_quantized_chains =
         FindFp4BlockQuantizedChains(graph);
+    std::vector<QOpChain> qop_chains = FindQopChains(graph);
 
     TouchedState touched;
     if (!chains.empty()) {
@@ -15111,12 +15993,24 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
                                    touched);
     }
     if (!fp4_block_quantized_chains.empty()) {
-      // The ninth and final application pass over this graph -- `Fp8Weight`/
-      // `Fp4Weight` are never mixed with each other (see that section's own
-      // top comment), so this is always a genuinely separate match, still
-      // sharing `touched` with every call above for the same reason.
+      // `Fp8Weight`/`Fp4Weight` are never mixed with each other (see that
+      // section's own top comment), so this is always a genuinely separate
+      // match, still sharing `touched` with every call above for the same
+      // reason.
       ApplyFp4BlockQuantizedChains(graph, fp4_block_quantized_chains, sparsity,
                                    touched);
+    }
+    if (!qop_chains.empty()) {
+      // The tenth and final application pass over this graph -- QOperator
+      // (QLinearConv/QLinearMatMul/QGemm static-quantization) chains, see
+      // this file's own "QOperator (QLinearConv/QLinearMatMul/QGemm
+      // static-quantization) structured pruning" section comment. A
+      // genuinely separate match (QLinearConv/QLinearMatMul/QGemm are node
+      // types no other Find*Chains call above recognizes at all), still
+      // sharing `touched` with every call above for the same "one shared
+      // conflict ledger per graph" reason every other quantized-weight pass
+      // here does.
+      ApplyQopChains(graph, qop_chains, sparsity, touched);
     }
     if (!touched.stale_value_info.empty()) {
       google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
