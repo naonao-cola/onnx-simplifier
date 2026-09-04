@@ -19071,34 +19071,36 @@ class _GQAChain:
 # separate-Q/K/V-producer shape and whole-KV-group pruning unit are
 # identical to `GroupQueryAttention`'s own.
 #
-# The original two-member alias, kept under its own name for
-# :func:`_attention_not_eligible`/:func:`_analyze_attention_chains` (the
-# dry-run sensitivity-report family, :func:`analyze_pruning_sensitivity`'s
-# own "Attention-head family" section below) -- deliberately NOT widened to
-# include :class:`_DecomposedGQAChain` (see this module's own "Decomposed
-# (un-fused) attention head pruning" section comment for why that family
-# isn't wired up to recognize the decomposed shape yet): both functions
-# switch on `isinstance(chain, _GQAChain)` and otherwise assume
-# `_AttentionChain`'s own `.weight`/`.nq`/`.nk`/`.nv` fields, which
-# :class:`_DecomposedGQAChain` has no equivalent of at all, so a real type
-# checker correctly flags that `else` branch once the wider alias below is
-# used there -- narrower here is the honest fix, not a workaround.
-_FusedAttnLikeChain = Union[_AttentionChain, _GQAChain]
-
 # A *third* matched shape, :class:`_DecomposedGQAChain` (see this module's
 # own "Decomposed (un-fused) attention head pruning" section comment,
-# further down), is folded into this WIDER alias -- used by
-# :func:`_apply_attention_chains`/:func:`apply_attention_head_pruning`,
-# which do dispatch on it -- via a plain string forward reference: that
-# class is defined much later in the file (after every fused-node matcher
-# it partially mirrors), and `_AttnLikeChain` itself is a runtime
-# `Union[...]` assignment, evaluated at import time, not merely a type
-# annotation -- unlike this module's usual `from __future__ import
-# annotations`-deferred annotations, a bare string element inside `Union[]`
-# is never resolved at runtime at all (only by a static type checker, which
-# resolves it against the whole module regardless of definition order), so
-# this is safe regardless of where :class:`_DecomposedGQAChain` itself ends
-# up defined.
+# further down), is folded into this alias -- used by every "Attention-head
+# pruning" entry point, real (:func:`_apply_attention_chains`/
+# :func:`apply_attention_head_pruning`/
+# :func:`apply_attention_head_wanda_pruning`) and dry-run
+# (:func:`_attention_not_eligible`/:func:`_analyze_attention_chains`, the
+# family behind :func:`analyze_pruning_sensitivity`'s own "Attention-head
+# family" section) alike, all of which dispatch on it -- via a plain string
+# forward reference: that class is defined much later in the file (after
+# every fused-node matcher it partially mirrors), and `_AttnLikeChain`
+# itself is a runtime `Union[...]` assignment, evaluated at import time, not
+# merely a type annotation -- unlike this module's usual `from __future__
+# import annotations`-deferred annotations, a bare string element inside
+# `Union[]` is never resolved at runtime at all (only by a static type
+# checker, which resolves it against the whole module regardless of
+# definition order), so this is safe regardless of where
+# :class:`_DecomposedGQAChain` itself ends up defined.
+#
+# :class:`_DecomposedGQAChain` shares every `_GQAChain`-side field
+# (`.q_weight`/`.k_weight`/`.v_weight`/`.kv_num_heads`/`.head_size`/
+# `.v_head_size`/`.consumer_weight`/`.consumer_node`) every dispatch site
+# below reads for it, but has no `.node` field at all (its matched shape has
+# no single fused node) -- every dispatch site that would otherwise read
+# `.node` (`_attention_not_eligible`'s own `matched_ids` set,
+# `_analyze_attention_chains`'s own `label`) special-cases
+# `isinstance(chain, _DecomposedGQAChain)` first, using `.softmax_node` (the
+# chain's own defining anchor node) in `_analyze_attention_chains`'s case,
+# or excluding it from a fused-op-only `id()` set in
+# `_attention_not_eligible`'s.
 _AttnLikeChain = Union[_AttentionChain, _GQAChain, "_DecomposedGQAChain"]
 
 
@@ -22617,15 +22619,19 @@ def _find_sparse_attention_chains(
 #   classify declines the whole chain.
 # - The scale (if any) must be a scalar `Mul` or `Div`-by-constant -- never
 #   inspected/touched beyond that (a global scalar has no per-head axis).
-# - Not (yet) wired into :func:`apply_attention_head_wanda_pruning` (the
-#   Wanda-calibrated variant) or the dry-run sensitivity-report family
-#   (:func:`_analyze_attention_head_pruning` and friends) -- a deliberate
-#   scope decision for this pass's first cut, not an oversight: get
-#   plain-L1/L2-ranked pruning genuinely correct and well-verified first
-#   (see `tests/test_pruning.py`'s own real end-to-end
-#   `torch.onnx.export` -> `onnxsim.simplify()` ->
-#   `apply_attention_head_pruning` pipeline test), leaving the calibrated
-#   and dry-run variants for a future pass to extend.
+# - Wired into every entry point in this module's own "Attention-head
+#   pruning" family: :func:`apply_attention_head_pruning` (plain L1/L2),
+#   :func:`apply_attention_head_wanda_pruning` (the Wanda-calibrated
+#   variant), and the dry-run sensitivity-report family
+#   (:func:`_analyze_attention_head_pruning`/
+#   :func:`_analyze_attention_head_wanda_pruning`, via
+#   :func:`_analyze_attention_chains` -- reported under its own
+#   ``"attention_decomposed_group"`` family string). All three route matched
+#   :class:`_DecomposedGQAChain` chains through the exact same
+#   :func:`_gqa_group_importance`-based ranking (plain or Wanda-wrapped) and
+#   :func:`_apply_one_decomposed_gqa_chain` slicing this section already
+#   built for the plain variant -- pure wiring, no matching/slicing logic
+#   specific to either the calibrated or dry-run path.
 # - Packed-QKV (:func:`_match_packed_qkv_split`'s own shape -- one shared
 #   MatMul/vanilla-Gemm projection feeding a `Split` into Q-then-K-then-V
 #   column ranges, each of which then independently feeds this section's
@@ -22643,14 +22649,22 @@ def _find_sparse_attention_chains(
 #   `query_key_value`) cases are handled -- `_match_packed_qkv_split` itself
 #   makes no MHA/GQA distinction, and this section's own combined-index-set
 #   slicing generalizes to any `nq`/`nk`/`nv` the same way the fused-node
-#   packed branch already does. Q/K-norm+RoPE pass-through and cross-
-#   attention (Q's own source tensor distinct from K's/V's) remain
-#   unrecognized here -- both are real, separate shapes this section does
-#   not attempt (nothing in the confirmed decomposed-export shape this
-#   section targets ever combines them with a packed producer); a graph
-#   combining either of them with this section's own decomposed shape simply
-#   declines the match (never guessed at), same as any other unrecognized
-#   topology.
+#   packed branch already does.
+# - Q/K-norm+RoPE pass-through is not recognized here -- a real, separate
+#   shape this section does not attempt; a graph combining it with this
+#   section's own decomposed shape (packed-producer or not) simply declines
+#   the match (never guessed at), same as any other unrecognized topology.
+#   Cross-attention (Q's own source tensor distinct from K's/V's, including
+#   a genuinely different `seq_len` between the two) *is* recognized here,
+#   despite an earlier draft of this comment claiming otherwise: neither
+#   :func:`_find_decomposed_gqa_chains` nor :func:`_gqa_group_importance`
+#   ever ties Q's own producer weight (or its row count/source tensor) to
+#   K's/V's own -- confirmed empirically with a hand-built decomposed graph
+#   whose Q branch reads one input tensor and whose K/V branches read a
+#   second, differently-shaped one (see
+#   `test_decomposed_attention_cross_attention_matches_oracle_exactly` in
+#   `tests/test_pruning.py`), which matches and prunes correctly with zero
+#   code changes needed.
 
 
 @dataclass(frozen=True)
@@ -24870,9 +24884,11 @@ def apply_attention_head_pruning(
     passes decline to fuse it either -- see this module's own "Decomposed
     (un-fused) attention head pruning" section comment for the full scope,
     empirical shape, and why this is a common, not merely hypothetical,
-    real-world export path). Not (yet) matched by
-    :func:`apply_attention_head_wanda_pruning`'s own calibrated variant --
-    see that same section comment.
+    real-world export path). Also matched by
+    :func:`apply_attention_head_wanda_pruning`'s own calibrated variant and
+    by :func:`analyze_pruning_sensitivity`'s own dry-run report (family
+    string ``"attention_decomposed_group"``) -- see that same section
+    comment.
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched block's heads (or, for
@@ -24989,14 +25005,15 @@ def apply_attention_head_pruning(
 def _wanda_attention_calibration_stats(
     out: onnx.ModelProto,
     # `Sequence`, not `List` -- read-only here (only ever iterated, never
-    # mutated), so this accepts either `_apply_attention_head_wanda_pruning`'s
-    # own `List[_AttnLikeChain]` (all four chain kinds) or
-    # `_analyze_attention_head_wanda_pruning`'s own narrower
-    # `List[_FusedAttnLikeChain]` (see this module's own comment above
-    # `_FusedAttnLikeChain`'s definition) without a covariance mismatch --
-    # `List[...]` itself is invariant, `Sequence[...]` is not, and every
-    # chain kind this function is ever handed shares the one field it
-    # actually reads (`.consumer_node`).
+    # mutated). Both real callers (`apply_attention_head_wanda_pruning` and
+    # `_analyze_attention_head_wanda_pruning`) now pass a
+    # `List[_AttnLikeChain]` (all four chain kinds, since both were widened
+    # to also collect `_DecomposedGQAChain` via
+    # `_find_decomposed_gqa_chains`) -- `Sequence` here is `List[...]`'s own
+    # read-only supertype, kept rather than `List[_AttnLikeChain]` outright
+    # purely to signal that intent, not to paper over an actual type
+    # mismatch between the two call sites. Every chain kind this function is
+    # ever handed shares the one field it actually reads (`.consumer_node`).
     chains: Sequence[_AttnLikeChain],
     calibration_data: Sequence[Tensors],
     providers: Optional[Sequence[str]],
@@ -25069,7 +25086,12 @@ def apply_attention_head_wanda_pruning(
     how :func:`_gqa_group_importance` combines that same group's weight norm
     across Q+K+V -- all three matched separate-Q/K/V-producer ops share that
     one importance function (and this one calibrated wrapper around it)
-    unmodified.
+    unmodified. Also matches the *decomposed* (not-yet-fused) attention
+    block :func:`apply_attention_head_pruning`'s own docstring describes --
+    see this module's own "Decomposed (un-fused) attention head pruning"
+    section comment -- at the identical whole-KV-group granularity, ranked
+    by the same calibrated importance, since :class:`_DecomposedGQAChain`
+    shares every field :func:`_gqa_group_importance` and this wrapper read.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to measure each
@@ -25134,6 +25156,7 @@ def apply_attention_head_wanda_pruning(
         *_find_paged_attention_chains(graph, value_info_by_name),
         *_find_linear_attention_chains(graph, value_info_by_name),
         *_find_sparse_attention_chains(graph, value_info_by_name),
+        *_find_decomposed_gqa_chains(graph, value_info_by_name),
     ]
     if not chains:
         return out
@@ -34407,11 +34430,16 @@ class PruningLayerSensitivity:
             group granularity -- it genuinely supports `kv_num_heads !=
             num_heads`, the same real GQA-style grouping
             `GroupQueryAttention` itself supports, unlike
-            `MultiHeadAttention`) for attention pruning (shared by
-            :func:`apply_attention_head_pruning` and its Wanda-calibrated
-            counterpart :func:`apply_attention_head_wanda_pruning` alike --
-            `family` names the topology a unit was matched by, not the
-            calibration method used to rank it, exactly as unstructured/
+            `MultiHeadAttention`)/``"attention_decomposed_group"`` (a
+            *decomposed*, not-yet-fused attention block -- see this module's
+            own "Decomposed (un-fused) attention head pruning" section
+            comment -- whole-KV-group granularity, identical to
+            ``"attention_gqa_group"``'s own but reported under its own
+            string since no single fused node backs it) for attention
+            pruning (shared by :func:`apply_attention_head_pruning` and its
+            Wanda-calibrated counterpart :func:`apply_attention_head_wanda_pruning`
+            alike -- `family` names the topology a unit was matched by, not
+            the calibration method used to rank it, exactly as unstructured/
             structured pruning's own plain-vs-Wanda variants already share
             their family strings above); ``"moe_expert_channel"`` for
             :func:`apply_moe_expert_channel_pruning`; ``"moe_whole_expert"``
@@ -36016,9 +36044,15 @@ def _analyze_structured_pruning_matmul_bnb4(
 
 
 def _attention_not_eligible(
-    graph: onnx.GraphProto, chains: List[_FusedAttnLikeChain]
+    graph: onnx.GraphProto, chains: List[_AttnLikeChain]
 ) -> List[str]:
-    matched_ids = {id(c.node) for c in chains}
+    # `_DecomposedGQAChain` has no `.node` field at all (see this module's
+    # own comment above `_AttnLikeChain`'s definition) -- excluded here, not
+    # just skipped over, since its own anchor node is a plain `Softmax`,
+    # never one of the fused op types `is_attn_like` below checks for, so it
+    # could never have appeared in `matched_ids` for a real fused node
+    # anyway.
+    matched_ids = {id(c.node) for c in chains if not isinstance(c, _DecomposedGQAChain)}
     not_eligible = []
     for node in graph.node:
         is_attn_like = (
@@ -36047,7 +36081,7 @@ def _attention_not_eligible(
 
 def _analyze_attention_chains(
     graph: onnx.GraphProto,
-    chains: List[_FusedAttnLikeChain],
+    chains: List[_AttnLikeChain],
     sparsity: float,
     compute_importance: Callable[..., np.ndarray],
     compute_group_importance: Callable[..., np.ndarray],
@@ -36066,6 +36100,16 @@ def _analyze_attention_chains(
     :func:`_gqa_group_importance` (optionally wrapped, as
     :func:`_analyze_attention_head_wanda_pruning` does, to fold in a
     calibrated activation norm) unmodified.
+
+    `chains` also carries :class:`_DecomposedGQAChain` (see this module's
+    own "Decomposed (un-fused) attention head pruning" section comment),
+    reported under its own ``"attention_decomposed_group"`` family string:
+    it shares every `_GQAChain`-side field this function reads
+    (`.q_weight`/`.k_weight`/`.v_weight`/`.kv_num_heads`/`.head_size`/
+    `.v_head_size`/`.consumer_weight`) but has no `.node` field at all (its
+    matched shape has no single fused node), so `label` is taken from
+    `.softmax_node` -- the chain's own defining anchor node,
+    :func:`_find_decomposed_gqa_chains`'s own match point -- instead.
     """
     initializer_map = _constant_map(graph)
     producer_touched: Set[str] = set()
@@ -36073,8 +36117,17 @@ def _analyze_attention_chains(
     layers: List[PruningLayerSensitivity] = []
 
     for chain in chains:
-        label = _node_label(chain.node)
-        if isinstance(chain, _GQAChain):
+        if isinstance(chain, _DecomposedGQAChain):
+            # No `.node` field at all (its matched shape has no single
+            # fused node) -- `.softmax_node`, the chain's own defining
+            # anchor node, stands in for it here, same as
+            # :func:`_find_decomposed_gqa_chains`'s own match point.
+            label = _node_label(chain.softmax_node)
+            producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
+            h = chain.kv_num_heads
+            family = "attention_decomposed_group"
+        elif isinstance(chain, _GQAChain):
+            label = _node_label(chain.node)
             producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
             h = chain.kv_num_heads
             # `MultiHeadAttention` has no separate `kv_num_heads` at all
@@ -36128,6 +36181,7 @@ def _analyze_attention_chains(
             else:
                 family = "attention_gqa_group"
         else:
+            label = _node_label(chain.node)
             producer_names = {chain.weight}
             h = chain.num_heads
             family = "attention_head"
@@ -36164,12 +36218,20 @@ def _analyze_attention_chains(
             )
             continue
 
-        if isinstance(chain, _GQAChain):
+        if isinstance(chain, (_GQAChain, _DecomposedGQAChain)):
             d = chain.head_size
             wq_init = initializer_map[chain.q_weight]
             wk_init = initializer_map[chain.k_weight]
             wv_init = initializer_map[chain.v_weight]
-            if chain.packed_split_sizes is not None:
+            # `_DecomposedGQAChain` has no `packed_split_sizes` field at all
+            # (that packed-QKV shape is a `_GQAChain`-only match -- see this
+            # module's own "Decomposed (un-fused) attention head pruning"
+            # section comment, the packed-QKV scope bullet) -- only checked
+            # for an actual `_GQAChain`.
+            packed_split_sizes = (
+                chain.packed_split_sizes if isinstance(chain, _GQAChain) else None
+            )
+            if packed_split_sizes is not None:
                 nq_orig = chain.num_heads * d
                 nk_orig = chain.kv_num_heads * d
                 w_kn = onnx.numpy_helper.to_array(wq_init).astype(np.float64)
@@ -36268,7 +36330,7 @@ def _analyze_attention_head_pruning(
             if graph is model.graph
             else _value_info_by_name(graph)
         )
-        chains: List[_FusedAttnLikeChain] = [
+        chains: List[_AttnLikeChain] = [
             *_find_attention_chains(graph, value_info_by_name),
             *_find_gqa_chains(graph, value_info_by_name),
             *_find_onnx_attention_chains(graph, value_info_by_name),
@@ -36278,6 +36340,7 @@ def _analyze_attention_head_pruning(
             *_find_paged_attention_chains(graph, value_info_by_name),
             *_find_linear_attention_chains(graph, value_info_by_name),
             *_find_sparse_attention_chains(graph, value_info_by_name),
+            *_find_decomposed_gqa_chains(graph, value_info_by_name),
         ]
         layers.extend(
             _analyze_attention_chains(
@@ -36331,7 +36394,7 @@ def _analyze_attention_head_wanda_pruning(
     graph = model.graph
     value_info_by_name = _shape_inferred_value_info_by_name(model)
 
-    chains: List[_FusedAttnLikeChain] = [
+    chains: List[_AttnLikeChain] = [
         *_find_attention_chains(graph, value_info_by_name),
         *_find_gqa_chains(graph, value_info_by_name),
         *_find_onnx_attention_chains(graph, value_info_by_name),
@@ -36341,6 +36404,7 @@ def _analyze_attention_head_wanda_pruning(
         *_find_paged_attention_chains(graph, value_info_by_name),
         *_find_linear_attention_chains(graph, value_info_by_name),
         *_find_sparse_attention_chains(graph, value_info_by_name),
+        *_find_decomposed_gqa_chains(graph, value_info_by_name),
     ]
     if not chains:
         return PruningSensitivityReport(

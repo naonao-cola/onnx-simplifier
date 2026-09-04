@@ -41408,6 +41408,247 @@ def test_decomposed_attention_real_torch_export_pipeline():
     np.testing.assert_allclose(ort_out, oracle_out, rtol=1e-3, atol=1e-3)
 
 
+# ---------------------------------------------------------------------------
+# Decomposed (un-fused) attention -- Wanda-calibrated pruning and dry-run
+# sensitivity-report wiring
+# ---------------------------------------------------------------------------
+# `_find_decomposed_gqa_chains` (see the section above) is now also wired
+# into `apply_attention_head_wanda_pruning`'s own chain-collection list and
+# `_analyze_attention_chains`'s own (backing `analyze_pruning_sensitivity`'s
+# dry-run report) -- previously it fed only the plain (non-calibrated)
+# `apply_attention_head_pruning`. `_DecomposedGQAChain` shares every field
+# `_gqa_group_importance`/the Wanda-calibrated wrapper around it reads with
+# `_GQAChain`, so this is pure wiring: the tests below mirror
+# `test_gqa_wanda_pruning_matches_oracle_exactly`/
+# `test_analyze_attention_head_wanda_pruning_gqa_matches_real_call`/
+# `test_analyze_attention_head_pruning_gqa_gemma_rope_matches_real_call`
+# exactly, just against `_decomposed_gqa_model` instead of `_gqa_model`.
+
+
+def test_decomposed_gqa_wanda_pruning_matches_oracle_exactly():
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=2, D=8, Out=16, seed=101)
+
+    rng = np.random.default_rng(102)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    # `ctx2` -- the flattened `[batch*seq, H*Dv]` tensor feeding the
+    # O-projection Gemm -- is exactly `chain.consumer_node.input[0]`, the
+    # tensor `_wanda_attention_calibration_stats` probes for every chain
+    # kind uniformly (see that function's own docstring).
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx2"))
+    (_, ctx2_cal) = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx2_cal.astype(np.float64)), axis=0))
+
+    d = cfg["D"]
+    group_size = cfg["H"] // cfg["KVH"]
+    importance = np.zeros(cfg["KVH"])
+    for kv in range(cfg["KVH"]):
+        q_block = np.concatenate(
+            [
+                cfg["wq"][:, h * d : (h + 1) * d]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = cfg["wk"][:, kv * d : (kv + 1) * d]
+        v_block = cfg["wv"][:, kv * d : (kv + 1) * d]
+        base = np.linalg.norm(np.concatenate([q_block, k_block, v_block], axis=1))
+        act_group = np.linalg.norm(
+            act_norm[kv * group_size * d : (kv + 1) * group_size * d]
+        )
+        importance[kv] = base * max(act_group, 1e-8)
+    keep_groups = np.sort(np.argsort(-importance)[:1])  # max(1, 2 - round(2*0.5)) == 1
+
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _decomposed_gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=d,
+        Out=cfg["Out"],
+        seed=101,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        bq=cfg["bq"][q_idx],
+        bk=cfg["bk"][kv_idx],
+        bv=cfg["bv"][kv_idx],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_decomposed_gqa_wanda_pruning_falls_back_to_plain_with_no_calibration_batches():
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=2, D=8, Out=16, seed=103)
+    plain = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    wanda = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    inits_plain = {
+        t.name: onnx.numpy_helper.to_array(t) for t in plain.graph.initializer
+    }
+    inits_wanda = {
+        t.name: onnx.numpy_helper.to_array(t) for t in wanda.graph.initializer
+    }
+    for name in inits_plain:
+        np.testing.assert_array_equal(inits_plain[name], inits_wanda[name])
+
+
+def test_analyze_attention_head_pruning_decomposed_gqa_matches_real_call():
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=2, D=8, Out=16, seed=104)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_decomposed_group"
+    assert layer.total == cfg["KVH"]
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    wq_new, wk_new, wv_new, _wo_new = _decomposed_weight_shapes(pruned)
+    kept_groups = cfg["KVH"] - layer.would_drop
+    group_size = cfg["H"] // cfg["KVH"]
+    assert wq_new.shape[1] == kept_groups * group_size * cfg["D"]
+    assert wk_new.shape[1] == kept_groups * cfg["D"]
+    assert wv_new.shape[1] == kept_groups * cfg["D"]
+
+
+def test_analyze_attention_head_wanda_pruning_decomposed_gqa_matches_real_call():
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=2, D=8, Out=16, seed=105)
+    rng = np.random.default_rng(106)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_attention_head_wanda_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.5,
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_decomposed_group"
+    assert layer.total == cfg["KVH"]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    wq_new, wk_new, wv_new, _wo_new = _decomposed_weight_shapes(pruned)
+    kept_groups = cfg["KVH"] - layer.would_drop
+    group_size = cfg["H"] // cfg["KVH"]
+    assert wq_new.shape[1] == kept_groups * group_size * cfg["D"]
+    assert wk_new.shape[1] == kept_groups * cfg["D"]
+    assert wv_new.shape[1] == kept_groups * cfg["D"]
+
+
+def test_decomposed_attention_cross_attention_matches_oracle_exactly():
+    # Locks in this module's own corrected "Decomposed (un-fused) attention
+    # head pruning" section comment: cross-attention (Q's own source tensor
+    # distinct from K's/V's, with a genuinely different seq_len between the
+    # two) is recognized and correctly pruned by
+    # `_find_decomposed_gqa_chains`/`apply_attention_head_pruning` -- NOT
+    # new logic. Neither that matcher nor `_gqa_group_importance` ever ties
+    # Q's own producer weight (row count/source tensor) to K's/V's own; this
+    # test only confirms already-existing matcher/ranking/slicing behavior
+    # on a decomposed (not fused) cross-attention shape, mirroring
+    # `test_gqa_pruning_cross_attention_matches_oracle_exactly`'s own
+    # confirmation for the fused `GroupQueryAttention` shape.
+    batch, seq_q, seq_kv, H, D, K_dec, K_enc, Out = 1, 3, 5, 4, 4, 6, 5, 8
+    rng = np.random.default_rng(500)
+    wq = rng.standard_normal((K_dec, H * D)).astype(np.float32)
+    wk = rng.standard_normal((K_enc, H * D)).astype(np.float32)
+    wv = rng.standard_normal((K_enc, H * D)).astype(np.float32)
+    wout = rng.standard_normal((H * D, Out)).astype(np.float32)
+
+    def _cross_model(wq, wk, wv, wout, h):
+        initializer = [
+            _f32(wq, "Wq"),
+            _f32(wk, "Wk"),
+            _f32(wv, "Wv"),
+            _f32(wout, "Wout"),
+            onnx.numpy_helper.from_array(
+                np.array([batch, seq_q, h, D], dtype=np.int64), "Sq"
+            ),
+            onnx.numpy_helper.from_array(
+                np.array([batch, seq_kv, h, D], dtype=np.int64), "Skv"
+            ),
+            onnx.numpy_helper.from_array(
+                np.array([batch, seq_q, h * D], dtype=np.int64), "OutShape"
+            ),
+            _f32(np.array(D**-0.5, dtype=np.float32), "Scale"),
+        ]
+        return _model(
+            f"""
+            g (float[{batch},{seq_q},{K_dec}] Xdec, float[{batch},{seq_kv},{K_enc}] Xenc) => (float[{batch},{seq_q},{Out}] Y)
+            {{
+              q0 = MatMul(Xdec, Wq)
+              qr = Reshape(q0, Sq)
+              qt = Transpose<perm=[0,2,1,3]>(qr)
+              k0 = MatMul(Xenc, Wk)
+              kr = Reshape(k0, Skv)
+              kt = Transpose<perm=[0,2,3,1]>(kr)
+              v0 = MatMul(Xenc, Wv)
+              vr = Reshape(v0, Skv)
+              vt = Transpose<perm=[0,2,1,3]>(vr)
+              qk = MatMul(qt, kt)
+              scaled = Mul(qk, Scale)
+              attn = Softmax<axis=-1>(scaled)
+              ctx0 = MatMul(attn, vt)
+              ctx1 = Transpose<perm=[0,2,1,3]>(ctx0)
+              ctx2 = Reshape(ctx1, OutShape)
+              Y = MatMul(ctx2, Wout)
+            }}
+            """,
+            initializer=initializer,
+            opset=17,
+        )
+
+    model = _cross_model(wq, wk, wv, wout, H)
+    chains = onnxsim.pruning._find_decomposed_gqa_chains(model.graph)
+    assert len(chains) == 1
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_count = max(1, H - round(H * 0.5))
+    keep_heads = _oracle_keep_groups_cross(wq, wk, wv, H, H, D, keep_count)
+    idx = _head_idx(keep_heads, D)
+
+    oracle = _cross_model(
+        wq[:, idx], wk[:, idx], wv[:, idx], wout[idx, :], len(keep_heads)
+    )
+
+    xdec = rng.standard_normal((batch, seq_q, K_dec)).astype(np.float32)
+    xenc = rng.standard_normal((batch, seq_kv, K_enc)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc})
+    (y_oracle,) = _run(oracle, {"Xdec": xdec, "Xenc": xenc})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+    # Sanity: Q and K/V really are independently sourced, not accidentally
+    # both reading the same tensor -- perturbing Xenc alone (Xdec held
+    # fixed) must still change the output.
+    (y_pruned2,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc + 1.0})
+    assert not np.allclose(y_pruned, y_pruned2)
+
+
 # Decomposed (un-fused) attention head pruning -- packed QKV producer
 # ---------------------------------------------------------------------------
 # `_packed_decomposed_gqa_model` mirrors `_decomposed_gqa_model`'s own
