@@ -909,7 +909,71 @@ nested subgraph's own dynamic per-head bias/mask/head_sink classification
 is conservatively less capable than the top-level graph's own -- see that
 function's own docstring for exactly why and what that means in practice).
 
-Deliberately NOT subgraph-aware yet, a scope decision rather than an
+Extended to every remaining structural/MoE/embedding/depth family in a
+follow-up round, exactly the mechanical
+`graph = out.graph`/`model.graph` -> chain-find -> slice-or-report shape
+:func:`apply_structured_pruning` established, applied to each family's own
+`apply_*`/`_analyze_*` pair (every `_analyze_*` mirror got the identical
+treatment its own `apply_*` did, for the same "report what a real call
+would actually do" reason the dry-run family exists at all -- unlike this
+note's original four, whose own `_analyze_*` mirrors -- `_analyze_magnitude_pruning`,
+`_analyze_structured_pruning`, `_analyze_attention_head_pruning` --
+:func:`weight_sparsity` has none -- were left NOT subgraph-aware by the
+round that added this note, a pre-existing gap this follow-up round did
+not touch since none of those three were in its own assigned scope):
+:func:`apply_structured_pruning_qdq`, :func:`apply_structured_pruning_matmul_nbits`
+(including its own fused `MatMulNBitsMlp`/`MatMulNBitsQkv` shapes; a nested
+subgraph's `value_info_by_name` is narrowed the same conservative way
+:func:`apply_attention_head_pruning`'s already is, see that function's own
+docstring), :func:`apply_structured_pruning_matmul_bnb4`,
+:func:`apply_structured_pruning_matmul_block_quantized_fp8`,
+:func:`apply_structured_pruning_matmul_block_quantized_fp4`,
+:func:`apply_structured_pruning_qoperator`,
+:func:`apply_structured_pruning_dynamic_quantize_matmul` (every one of
+these seven: a chain's `producer_touched`/`consumer_touched`/
+`stale_value_info` reset per graph, exactly :func:`apply_structured_pruning`'s
+own pattern, no `global_sparsity`-equivalent mode of its own to reason
+about); :func:`apply_moe_expert_channel_pruning`/
+:func:`apply_qmoe_expert_channel_pruning` (weight-only importance, no
+calibration involved at all, so nothing narrows); :func:`apply_moe_whole_expert_pruning`/
+:func:`apply_qmoe_whole_expert_pruning` (matching/slicing fully
+subgraph-aware, but the calibration-based router-usage *ranking* is
+narrower, for the identical reason the calibration-driven bullet below
+gives: only a chain found in the TOP-LEVEL graph is ever actually probed;
+a nested-subgraph chain still gets correctly pruned, just always via each
+function's own pre-existing "no matching activation observed" weight-norm
+fallback rather than measured usage -- see either function's own docstring);
+:func:`apply_embedding_vocab_pruning`/:func:`apply_embedding_vocab_magnitude_pruning`
+(the one eligible embedding producer these two require may now live in any
+graph, not only the top level -- :func:`_match_embedding_chain_any_graph`
+applies the exact same "exactly one qualifying match across every graph
+combined, else decline" rule :func:`_match_embedding_chain` already applied
+within one graph; `apply_embedding_vocab_pruning` itself has no `_analyze_*`
+mirror at all, unrelated to subgraph awareness -- see
+:func:`analyze_pruning_sensitivity`'s own docstring for why); and
+:func:`apply_transformer_block_pruning` (matching AND committing a
+droppable block fully subgraph-aware, but -- since this function has no
+literal `global_sparsity` flag to begin with, `sparsity`/`num_blocks_to_drop`
+already being its only "how many total blocks" knobs -- `target` is pooled
+ACROSS THE WHOLE MODEL rather than computed independently per graph,
+unlike :func:`apply_structured_pruning`'s own `global_sparsity` mode; the
+calibration-based redundancy ranking has the identical narrower reach the
+two MoE whole-expert functions above have, with `float("-inf")` --
+this function's own pre-existing "no evidence" score -- standing in for a
+nested-subgraph candidate instead of a weight-norm fallback; ALSO, exactly
+like :func:`apply_structured_pruning_matmul_nbits`'s own `value_info_by_name`
+narrowing above, a nested subgraph's own `_shapes_match` safety check
+(guarding against a merge `Add` having silently broadcast `x_in` up to a
+wider `x_out`) only ever sees that subgraph's own as-declared `value_info`/
+`input`/`output` -- no shape-inference pass reaches into a nested subgraph
+for this family either, so a candidate whose `x_in`/`x_out` shape is only
+*derivable*, never already declared outright, inside a nested subgraph is
+conservatively declined there even though the equivalent top-level-graph
+case would be handled -- a documented, conservative gap, not a correctness
+risk; see that function's own docstring for the full reasoning behind
+every one of these choices).
+
+Deliberately NOT subgraph-aware, a scope decision rather than an
 oversight -- each remains exactly as top-level-graph-only as it already
 was:
 
@@ -930,23 +994,16 @@ was:
   subgraph nested inside another subgraph -- a materially different,
   higher-risk engineering problem from applying an already-self-contained
   per-graph matcher/slicer to more graphs, and out of scope for this
-  change.
-- Every other structural `apply_structured_pruning_*` family variant
-  (QDQ, MatMulNBits, MatMulBnb4, the FP8/FP4 block-quantized weight
-  families, QOperator, DynamicQuantizeMatMul, both MoE families
-  (expert-channel and whole-expert) and their QMoE counterparts, the
-  embedding/vocabulary family, and :func:`apply_transformer_block_pruning`)
-  follows the same generic `graph = out.graph` -> chain-find -> slice
-  shape :func:`apply_structured_pruning` does, and the same
-  :func:`_iter_subgraphs`-loop treatment applies to each mechanically --
-  but each is its own several-hundred-line, independently-tested function
-  body, and wiring roughly fifteen more of them through in the same change
-  was judged too large a single PR's worth of surface to review safely
-  alongside the four entry points above, which already cover this
-  module's two most emblematic scope gaps (SparseGPT-shaped no-calibration
-  structural pruning and the "sparsity report is actively misleading"
-  case). Left for a follow-up change; the pattern established by
-  :func:`apply_structured_pruning`'s own edit is the template to repeat.
+  change. :func:`apply_moe_whole_expert_pruning`/
+  :func:`apply_qmoe_whole_expert_pruning`/:func:`apply_transformer_block_pruning`
+  hit this exact same probe-hoisting limitation for their own calibration
+  ranking, but -- unlike this bullet's four functions -- each already had a
+  well-defined no-calibration-evidence fallback (a weight-norm importance,
+  or, for the transformer-block family, its own existing `float("-inf")`
+  "conservatively keep" score) that a nested-subgraph candidate can
+  correctly fall back to without declining the whole function outright, so
+  those three ARE subgraph-aware for matching/slicing/committing -- see the
+  paragraph above.
 - :func:`analyze_pruning_sensitivity` itself dispatches to nineteen
   separate `_analyze_*` implementations (one per supported `apply_fn`),
   each with its own bespoke top-level-graph-only body mirroring its real
@@ -11467,6 +11524,16 @@ def apply_structured_pruning_qdq(
     :param importance_norm: ``"l2"`` (default, Li et al.'s original
             filter-pruning criterion) or ``"l1"``
     :returns: the pruned onnx ModelProto
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): both the plain and gated QDQ
+    chain families above are matched and pruned inside a nested
+    ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph, at any nesting
+    depth, exactly as if that subgraph were its own top-level graph --
+    `producer_touched`/`consumer_touched`/`stale_value_info` are all reset
+    per graph, so a weight tied within one graph never suppresses or
+    interferes with a same-named-by-coincidence weight in a sibling or
+    ancestor graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -11475,161 +11542,162 @@ def apply_structured_pruning_qdq(
         model = onnx.load(model, load_external_data=False)
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
 
-    chains = _find_qdq_chains(graph)
-    gated_chains = _find_qdq_gated_chains(graph)
-    if not chains and not gated_chains:
-        return out
+    for graph in _iter_subgraphs(out.graph):
+        chains = _find_qdq_chains(graph)
+        gated_chains = _find_qdq_gated_chains(graph)
+        if not chains and not gated_chains:
+            continue
 
-    initializer_map = {t.name: t for t in graph.initializer}
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
-    stale_value_info: Set[str] = set()
+        initializer_map = {t.name: t for t in graph.initializer}
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
+        stale_value_info: Set[str] = set()
 
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key = _weight_ref_key(p.ref)
-        c_key = _weight_ref_key(c.ref)
-        if p_key == c_key:
-            continue  # degenerate (the same weight in both roles)
-        if p_key in producer_touched or c_key in consumer_touched:
-            continue  # a shared/tied weight another chain already resized
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = _weight_ref_key(p.ref)
+            c_key = _weight_ref_key(c.ref)
+            if p_key == c_key:
+                continue  # degenerate (the same weight in both roles)
+            if p_key in producer_touched or c_key in consumer_touched:
+                continue  # a shared/tied weight another chain already resized
 
-        n = chain.n_channels
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            continue  # rounds down to nothing for this layer -- no-op
+            n = chain.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                continue  # rounds down to nothing for this layer -- no-op
 
-        w = _weight_ref_dequantized(p.ref)
-        w_nk = _weight_to_nk(w, p.weight_transposed, p.is_conv, p.is_conv_transpose)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        # `kind="stable"` matters here specifically (unlike most other
-        # argsort call sites in this module, which never feed into a
-        # block-alignment check): with an exactly-tied `importance` vector,
-        # an unstable sort's tie-break order is platform-dependent, and a
-        # reordered tie can select a keep-set that no longer aligns to a
-        # blockwise consumer's own block boundaries below -- flipping a
-        # would-have-been-aligned chain to "declined" nondeterministically
-        # (the same hazard confirmed empirically, on a real ARM CI runner,
-        # for the MatMulNBits family's own identical block-alignment
-        # pattern -- see that function's own comment on this same line). A
-        # stable sort preserves input (channel index) order for ties, so an
-        # all-tied producer's top-`keep_count` channels are always its
-        # first `keep_count` indices, deterministic across platforms, and
-        # matching this function's own `_analyze_*` dry-run mirror exactly.
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+            w = _weight_ref_dequantized(p.ref)
+            w_nk = _weight_to_nk(w, p.weight_transposed, p.is_conv, p.is_conv_transpose)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            # `kind="stable"` matters here specifically (unlike most other
+            # argsort call sites in this module, which never feed into a
+            # block-alignment check): with an exactly-tied `importance` vector,
+            # an unstable sort's tie-break order is platform-dependent, and a
+            # reordered tie can select a keep-set that no longer aligns to a
+            # blockwise consumer's own block boundaries below -- flipping a
+            # would-have-been-aligned chain to "declined" nondeterministically
+            # (the same hazard confirmed empirically, on a real ARM CI runner,
+            # for the MatMulNBits family's own identical block-alignment
+            # pattern -- see that function's own comment on this same line). A
+            # stable sort preserves input (channel index) order for ties, so an
+            # all-tied producer's top-`keep_count` channels are always its
+            # first `keep_count` indices, deterministic across platforms, and
+            # matching this function's own `_analyze_*` dry-run mirror exactly.
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
-        keep_blocks = None
-        if c.ref.qdq_block is not None:
-            keep_blocks = _qdq_block_aligned_keep_blocks(
-                keep, n, c.ref.qdq_block.block_size
+            keep_blocks = None
+            if c.ref.qdq_block is not None:
+                keep_blocks = _qdq_block_aligned_keep_blocks(
+                    keep, n, c.ref.qdq_block.block_size
+                )
+                if keep_blocks is None:
+                    continue  # non-block-aligned keep set for this blockwise
+                    # consumer -- decline the whole chain, see this function's
+                    # own top comment
+
+            _slice_producer_weight_qdq(
+                p.ref, p.weight_transposed, keep, p.is_conv, p.is_conv_transpose
             )
-            if keep_blocks is None:
-                continue  # non-block-aligned keep set for this blockwise
-                # consumer -- decline the whole chain, see this function's
-                # own top comment
+            if p.bias is not None:
+                _slice_last_axis(initializer_map[p.bias], keep)
+            if keep_blocks is not None:
+                assert c.ref.qdq_block is not None
+                _slice_consumer_weight_qdq_block(c.ref.qdq_block, keep, keep_blocks)
+            else:
+                _slice_consumer_weight_qdq(
+                    c.ref, c.weight_transposed, keep, c.is_conv, c.is_conv_transpose
+                )
 
-        _slice_producer_weight_qdq(
-            p.ref, p.weight_transposed, keep, p.is_conv, p.is_conv_transpose
-        )
-        if p.bias is not None:
-            _slice_last_axis(initializer_map[p.bias], keep)
-        if keep_blocks is not None:
-            assert c.ref.qdq_block is not None
-            _slice_consumer_weight_qdq_block(c.ref.qdq_block, keep, keep_blocks)
-        else:
-            _slice_consumer_weight_qdq(
-                c.ref, c.weight_transposed, keep, c.is_conv, c.is_conv_transpose
-            )
-
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
-        stale_value_info.add(p.node.output[0])
-        stale_value_info.update(op.output[0] for op in chain.chain_ops)
-        if p.ref.qdq is not None:
-            stale_value_info.add(p.ref.qdq.dq_node.output[0])
-        elif p.ref.qdq_block is not None:
-            stale_value_info.add(p.ref.qdq_block.dq_node.output[0])
-        if c.ref.qdq is not None:
-            stale_value_info.add(c.ref.qdq.dq_node.output[0])
-        elif c.ref.qdq_block is not None:
-            stale_value_info.add(c.ref.qdq_block.dq_node.output[0])
-
-    for gchain in gated_chains:
-        pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
-        pa_key = _weight_ref_key(pa.ref)
-        pb_key = _weight_ref_key(pb.ref)
-        c_key = _weight_ref_key(c.ref)
-        if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
-            continue  # degenerate (a weight tied across two roles)
-        if (
-            pa_key in producer_touched
-            or pb_key in producer_touched
-            or c_key in consumer_touched
-        ):
-            continue  # a shared/tied weight another chain already resized
-
-        n = gchain.n_channels
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            continue  # rounds down to nothing for this layer -- no-op
-
-        w_a_nk = _weight_to_nk(
-            _weight_ref_dequantized(pa.ref), pa.weight_transposed, False
-        )
-        w_b_nk = _weight_to_nk(
-            _weight_ref_dequantized(pb.ref), pb.weight_transposed, False
-        )
-        importance = _qdq_gated_channel_importance(w_a_nk, w_b_nk, importance_norm)
-        # `kind="stable"` for the identical block-alignment-determinism
-        # reason the single-producer loop above documents on this same line.
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
-
-        keep_blocks = None
-        if c.ref.qdq_block is not None:
-            keep_blocks = _qdq_block_aligned_keep_blocks(
-                keep, n, c.ref.qdq_block.block_size
-            )
-            if keep_blocks is None:
-                continue  # non-block-aligned keep set for this blockwise
-                # consumer -- decline the whole gated group, see this
-                # function's own top comment
-
-        _slice_producer_weight_qdq(pa.ref, pa.weight_transposed, keep, False)
-        if pa.bias is not None:
-            _slice_last_axis(initializer_map[pa.bias], keep)
-        _slice_producer_weight_qdq(pb.ref, pb.weight_transposed, keep, False)
-        if pb.bias is not None:
-            _slice_last_axis(initializer_map[pb.bias], keep)
-        if keep_blocks is not None:
-            assert c.ref.qdq_block is not None
-            _slice_consumer_weight_qdq_block(c.ref.qdq_block, keep, keep_blocks)
-        else:
-            _slice_consumer_weight_qdq(c.ref, c.weight_transposed, keep, False)
-
-        producer_touched.add(pa_key)
-        producer_touched.add(pb_key)
-        consumer_touched.add(c_key)
-        stale_value_info.add(pa.node.output[0])
-        stale_value_info.update(op.output[0] for op in pa.pre_ops)
-        stale_value_info.add(pb.node.output[0])
-        stale_value_info.update(op.output[0] for op in pb.pre_ops)
-        stale_value_info.update(op.output[0] for op in gchain.chain_ops)
-        for p in (pa, pb):
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
+            stale_value_info.add(p.node.output[0])
+            stale_value_info.update(op.output[0] for op in chain.chain_ops)
             if p.ref.qdq is not None:
                 stale_value_info.add(p.ref.qdq.dq_node.output[0])
             elif p.ref.qdq_block is not None:
                 stale_value_info.add(p.ref.qdq_block.dq_node.output[0])
-        if c.ref.qdq is not None:
-            stale_value_info.add(c.ref.qdq.dq_node.output[0])
-        elif c.ref.qdq_block is not None:
-            stale_value_info.add(c.ref.qdq_block.dq_node.output[0])
+            if c.ref.qdq is not None:
+                stale_value_info.add(c.ref.qdq.dq_node.output[0])
+            elif c.ref.qdq_block is not None:
+                stale_value_info.add(c.ref.qdq_block.dq_node.output[0])
 
-    if stale_value_info:
-        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
-        del graph.value_info[:]
-        graph.value_info.extend(kept)
+        for gchain in gated_chains:
+            pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
+            pa_key = _weight_ref_key(pa.ref)
+            pb_key = _weight_ref_key(pb.ref)
+            c_key = _weight_ref_key(c.ref)
+            if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
+                continue  # degenerate (a weight tied across two roles)
+            if (
+                pa_key in producer_touched
+                or pb_key in producer_touched
+                or c_key in consumer_touched
+            ):
+                continue  # a shared/tied weight another chain already resized
+
+            n = gchain.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                continue  # rounds down to nothing for this layer -- no-op
+
+            w_a_nk = _weight_to_nk(
+                _weight_ref_dequantized(pa.ref), pa.weight_transposed, False
+            )
+            w_b_nk = _weight_to_nk(
+                _weight_ref_dequantized(pb.ref), pb.weight_transposed, False
+            )
+            importance = _qdq_gated_channel_importance(w_a_nk, w_b_nk, importance_norm)
+            # `kind="stable"` for the identical block-alignment-determinism
+            # reason the single-producer loop above documents on this same line.
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+            keep_blocks = None
+            if c.ref.qdq_block is not None:
+                keep_blocks = _qdq_block_aligned_keep_blocks(
+                    keep, n, c.ref.qdq_block.block_size
+                )
+                if keep_blocks is None:
+                    continue  # non-block-aligned keep set for this blockwise
+                    # consumer -- decline the whole gated group, see this
+                    # function's own top comment
+
+            _slice_producer_weight_qdq(pa.ref, pa.weight_transposed, keep, False)
+            if pa.bias is not None:
+                _slice_last_axis(initializer_map[pa.bias], keep)
+            _slice_producer_weight_qdq(pb.ref, pb.weight_transposed, keep, False)
+            if pb.bias is not None:
+                _slice_last_axis(initializer_map[pb.bias], keep)
+            if keep_blocks is not None:
+                assert c.ref.qdq_block is not None
+                _slice_consumer_weight_qdq_block(c.ref.qdq_block, keep, keep_blocks)
+            else:
+                _slice_consumer_weight_qdq(c.ref, c.weight_transposed, keep, False)
+
+            producer_touched.add(pa_key)
+            producer_touched.add(pb_key)
+            consumer_touched.add(c_key)
+            stale_value_info.add(pa.node.output[0])
+            stale_value_info.update(op.output[0] for op in pa.pre_ops)
+            stale_value_info.add(pb.node.output[0])
+            stale_value_info.update(op.output[0] for op in pb.pre_ops)
+            stale_value_info.update(op.output[0] for op in gchain.chain_ops)
+            for p in (pa, pb):
+                if p.ref.qdq is not None:
+                    stale_value_info.add(p.ref.qdq.dq_node.output[0])
+                elif p.ref.qdq_block is not None:
+                    stale_value_info.add(p.ref.qdq_block.dq_node.output[0])
+            if c.ref.qdq is not None:
+                stale_value_info.add(c.ref.qdq.dq_node.output[0])
+            elif c.ref.qdq_block is not None:
+                stale_value_info.add(c.ref.qdq_block.dq_node.output[0])
+
+        if stale_value_info:
+            kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+            del graph.value_info[:]
+            graph.value_info.extend(kept)
+
     return out
 
 
@@ -12978,6 +13046,27 @@ def apply_structured_pruning_matmul_nbits(
     :param importance_norm: ``"l2"`` (default, Li et al.'s original
             filter-pruning criterion) or ``"l1"``
     :returns: the pruned onnx ModelProto
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): every chain family above
+    (plain, gated, and the fused MLP/QKV shapes) is matched and pruned
+    inside a nested ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph,
+    at any nesting depth, exactly as if that subgraph were its own
+    top-level graph. `value_info_by_name` is the one exception: it's a
+    shape-inference-seeded map built once from the whole model
+    (:func:`_shape_inferred_value_info_by_name`, which only ever returns
+    the *top-level* graph's own inferred `value_info`), reused as-is for
+    the top-level graph itself but rebuilt from a nested subgraph's own
+    as-declared `value_info`/`input`/`output` (:func:`_value_info_by_name`,
+    no shape inference) when processing that subgraph -- the same
+    conservative fallback :func:`apply_attention_head_pruning` already
+    established for this exact situation (see that function's own
+    docstring): a nested subgraph's own QKV grouping is therefore only as
+    capable as whatever shape it already declares outright, never one only
+    derivable by inference. `producer_touched`/`consumer_touched`/
+    `stale_value_info` are all reset per graph, so a weight tied within one
+    graph never suppresses or interferes with a same-named-by-coincidence
+    weight in a sibling or ancestor graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -12986,148 +13075,152 @@ def apply_structured_pruning_matmul_nbits(
         model = onnx.load(model, load_external_data=False)
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
+    top_value_info_by_name = _shape_inferred_value_info_by_name(out)
 
-    value_info_by_name = _shape_inferred_value_info_by_name(out)
-    chains = _find_matmul_nbits_chains(graph)
-    mlp_chains = _find_matmul_nbits_mlp_chains(graph)
-    qkv_chains = _find_matmul_nbits_qkv_chains(graph, value_info_by_name)
-    gated_chains = _find_matmul_nbits_gated_chains(graph)
-    if not chains and not mlp_chains and not qkv_chains and not gated_chains:
-        return out
-
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
-    stale_value_info: Set[str] = set()
-
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key = _matmul_nbits_chain_side_key(p)
-        c_key = _matmul_nbits_chain_side_key(c)
-        if p_key == c_key:
-            continue  # degenerate (the same weight in both roles)
-        if p_key in producer_touched or c_key in consumer_touched:
-            continue  # a shared/tied weight another chain already resized
-
-        n = chain.n_channels
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            continue  # rounds down to nothing for this layer -- no-op
-
-        w_nk = _matmul_nbits_chain_producer_weight_nk(p)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        # `kind="stable"` matters here specifically (unlike most other
-        # argsort call sites in this module, which never feed into a
-        # block-alignment check): with an exactly-tied `importance` vector,
-        # an unstable sort's tie-break order is platform-dependent
-        # (confirmed: reordered on an ARM CI runner vs. x86_64), and a
-        # reordered tie can select a keep-set that no longer aligns to the
-        # consumer's own block boundaries below -- flipping a
-        # would-have-been-aligned chain to "declined" nondeterministically,
-        # and diverging from this section's own `_analyze_*` dry-run mirror
-        # (which must make the identical selection for its predictions to
-        # stay trustworthy). A stable sort preserves input (channel index)
-        # order for ties, so an all-tied producer's top-`keep_count`
-        # channels are always its first `keep_count` indices, deterministic
-        # across platforms.
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
-
-        if isinstance(c, _MatMulNBitsWeight):
-            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
-                keep, c.k_blocks, c.block_size
-            )
-            if keep_blocks is None:
-                continue  # non-block-aligned request for this consumer --
-                # decline, see this section's own top comment
-            consumer_keep = keep_blocks
-        else:
-            consumer_keep = keep  # plain-float consumer -- no block structure
-
-        _slice_matmul_nbits_chain_producer(p, keep)
-        _slice_matmul_nbits_chain_consumer(c, consumer_keep)
-
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
-        stale_value_info.add(p.node.output[0])
-        stale_value_info.update(op.output[0] for op in chain.chain_ops)
-
-    for gchain in gated_chains:
-        pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
-        pa_key = _matmul_nbits_chain_side_key(pa)
-        pb_key = _matmul_nbits_chain_side_key(pb)
-        c_key = _matmul_nbits_chain_side_key(c)
-        if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
-            continue  # degenerate (a weight tied across two roles)
-        if (
-            pa_key in producer_touched
-            or pb_key in producer_touched
-            or c_key in consumer_touched
-        ):
-            continue  # a shared/tied weight another chain already resized
-
-        n = gchain.n_channels
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            continue  # rounds down to nothing for this layer -- no-op
-
-        w_a_nk = _matmul_nbits_chain_producer_weight_nk(pa)
-        w_b_nk = _matmul_nbits_chain_producer_weight_nk(pb)
-        importance = _matmul_nbits_gated_channel_importance(
-            w_a_nk, w_b_nk, importance_norm
+    for graph in _iter_subgraphs(out.graph):
+        value_info_by_name = (
+            top_value_info_by_name if graph is out.graph else _value_info_by_name(graph)
         )
-        # `kind="stable"` for the identical block-alignment-determinism
-        # reason the single-producer loop above documents on this same line.
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+        chains = _find_matmul_nbits_chains(graph)
+        mlp_chains = _find_matmul_nbits_mlp_chains(graph)
+        qkv_chains = _find_matmul_nbits_qkv_chains(graph, value_info_by_name)
+        gated_chains = _find_matmul_nbits_gated_chains(graph)
+        if not chains and not mlp_chains and not qkv_chains and not gated_chains:
+            continue
 
-        if isinstance(c, _MatMulNBitsWeight):
-            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
-                keep, c.k_blocks, c.block_size
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
+        stale_value_info: Set[str] = set()
+
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = _matmul_nbits_chain_side_key(p)
+            c_key = _matmul_nbits_chain_side_key(c)
+            if p_key == c_key:
+                continue  # degenerate (the same weight in both roles)
+            if p_key in producer_touched or c_key in consumer_touched:
+                continue  # a shared/tied weight another chain already resized
+
+            n = chain.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                continue  # rounds down to nothing for this layer -- no-op
+
+            w_nk = _matmul_nbits_chain_producer_weight_nk(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            # `kind="stable"` matters here specifically (unlike most other
+            # argsort call sites in this module, which never feed into a
+            # block-alignment check): with an exactly-tied `importance` vector,
+            # an unstable sort's tie-break order is platform-dependent
+            # (confirmed: reordered on an ARM CI runner vs. x86_64), and a
+            # reordered tie can select a keep-set that no longer aligns to the
+            # consumer's own block boundaries below -- flipping a
+            # would-have-been-aligned chain to "declined" nondeterministically,
+            # and diverging from this section's own `_analyze_*` dry-run mirror
+            # (which must make the identical selection for its predictions to
+            # stay trustworthy). A stable sort preserves input (channel index)
+            # order for ties, so an all-tied producer's top-`keep_count`
+            # channels are always its first `keep_count` indices, deterministic
+            # across platforms.
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+            if isinstance(c, _MatMulNBitsWeight):
+                keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                    keep, c.k_blocks, c.block_size
+                )
+                if keep_blocks is None:
+                    continue  # non-block-aligned request for this consumer --
+                    # decline, see this section's own top comment
+                consumer_keep = keep_blocks
+            else:
+                consumer_keep = keep  # plain-float consumer -- no block structure
+
+            _slice_matmul_nbits_chain_producer(p, keep)
+            _slice_matmul_nbits_chain_consumer(c, consumer_keep)
+
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
+            stale_value_info.add(p.node.output[0])
+            stale_value_info.update(op.output[0] for op in chain.chain_ops)
+
+        for gchain in gated_chains:
+            pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
+            pa_key = _matmul_nbits_chain_side_key(pa)
+            pb_key = _matmul_nbits_chain_side_key(pb)
+            c_key = _matmul_nbits_chain_side_key(c)
+            if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
+                continue  # degenerate (a weight tied across two roles)
+            if (
+                pa_key in producer_touched
+                or pb_key in producer_touched
+                or c_key in consumer_touched
+            ):
+                continue  # a shared/tied weight another chain already resized
+
+            n = gchain.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                continue  # rounds down to nothing for this layer -- no-op
+
+            w_a_nk = _matmul_nbits_chain_producer_weight_nk(pa)
+            w_b_nk = _matmul_nbits_chain_producer_weight_nk(pb)
+            importance = _matmul_nbits_gated_channel_importance(
+                w_a_nk, w_b_nk, importance_norm
             )
-            if keep_blocks is None:
-                continue  # non-block-aligned request for this consumer --
-                # decline the whole gated group, see this section's own top
-                # comment
-            consumer_keep = keep_blocks
-        else:
-            consumer_keep = keep  # plain-float consumer -- no block structure
+            # `kind="stable"` for the identical block-alignment-determinism
+            # reason the single-producer loop above documents on this same line.
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
-        _slice_matmul_nbits_chain_producer(pa, keep)
-        _slice_matmul_nbits_chain_producer(pb, keep)
-        _slice_matmul_nbits_chain_consumer(c, consumer_keep)
+            if isinstance(c, _MatMulNBitsWeight):
+                keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                    keep, c.k_blocks, c.block_size
+                )
+                if keep_blocks is None:
+                    continue  # non-block-aligned request for this consumer --
+                    # decline the whole gated group, see this section's own top
+                    # comment
+                consumer_keep = keep_blocks
+            else:
+                consumer_keep = keep  # plain-float consumer -- no block structure
 
-        producer_touched.add(pa_key)
-        producer_touched.add(pb_key)
-        consumer_touched.add(c_key)
-        stale_value_info.add(pa.node.output[0])
-        stale_value_info.update(op.output[0] for op in gchain.producer_a_pre_ops)
-        stale_value_info.add(pb.node.output[0])
-        stale_value_info.update(op.output[0] for op in gchain.producer_b_pre_ops)
-        stale_value_info.update(op.output[0] for op in gchain.chain_ops)
+            _slice_matmul_nbits_chain_producer(pa, keep)
+            _slice_matmul_nbits_chain_producer(pb, keep)
+            _slice_matmul_nbits_chain_consumer(c, consumer_keep)
 
-    _apply_matmul_nbits_mlp_chains(
-        graph,
-        mlp_chains,
-        sparsity,
-        importance_norm,
-        producer_touched,
-        consumer_touched,
-        stale_value_info,
-    )
-    _apply_matmul_nbits_qkv_chains(
-        graph,
-        qkv_chains,
-        sparsity,
-        importance_norm,
-        producer_touched,
-        consumer_touched,
-        stale_value_info,
-        value_info_by_name,
-    )
+            producer_touched.add(pa_key)
+            producer_touched.add(pb_key)
+            consumer_touched.add(c_key)
+            stale_value_info.add(pa.node.output[0])
+            stale_value_info.update(op.output[0] for op in gchain.producer_a_pre_ops)
+            stale_value_info.add(pb.node.output[0])
+            stale_value_info.update(op.output[0] for op in gchain.producer_b_pre_ops)
+            stale_value_info.update(op.output[0] for op in gchain.chain_ops)
 
-    if stale_value_info:
-        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
-        del graph.value_info[:]
-        graph.value_info.extend(kept)
+        _apply_matmul_nbits_mlp_chains(
+            graph,
+            mlp_chains,
+            sparsity,
+            importance_norm,
+            producer_touched,
+            consumer_touched,
+            stale_value_info,
+        )
+        _apply_matmul_nbits_qkv_chains(
+            graph,
+            qkv_chains,
+            sparsity,
+            importance_norm,
+            producer_touched,
+            consumer_touched,
+            stale_value_info,
+            value_info_by_name,
+        )
+
+        if stale_value_info:
+            kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+            del graph.value_info[:]
+            graph.value_info.extend(kept)
+
     return out
 
 
@@ -13661,6 +13754,13 @@ def apply_structured_pruning_matmul_bnb4(
     :param importance_norm: ``"l2"`` (default, Li et al.'s original
             filter-pruning criterion) or ``"l1"``
     :returns: the pruned onnx ModelProto
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): matched and pruned inside a
+    nested ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph, at any
+    nesting depth, exactly as if that subgraph were its own top-level
+    graph; `producer_touched`/`consumer_touched`/`stale_value_info` are all
+    reset per graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -13669,48 +13769,49 @@ def apply_structured_pruning_matmul_bnb4(
         model = onnx.load(model, load_external_data=False)
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
 
-    chains = _find_matmul_bnb4_chains(graph)
-    if not chains:
-        return out
+    for graph in _iter_subgraphs(out.graph):
+        chains = _find_matmul_bnb4_chains(graph)
+        if not chains:
+            continue
 
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
-    stale_value_info: Set[str] = set()
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
+        stale_value_info: Set[str] = set()
 
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key, c_key = p.b_init.name, c.w_init.name
-        if p_key in producer_touched or c_key in consumer_touched:
-            continue  # a shared/tied weight another chain already resized
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key, c_key = p.b_init.name, c.w_init.name
+            if p_key in producer_touched or c_key in consumer_touched:
+                continue  # a shared/tied weight another chain already resized
 
-        n = chain.n_channels
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            continue  # rounds down to nothing for this layer -- no-op
+            n = chain.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                continue  # rounds down to nothing for this layer -- no-op
 
-        w_nk = _matmul_bnb4_dequantized(p)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        # `kind="stable"` for the same cross-platform-determinism reason
-        # :func:`apply_structured_pruning_matmul_nbits`'s own identical line
-        # documents (this section's own `_analyze_*` dry-run mirror must
-        # make the identical selection for its predictions to stay
-        # trustworthy).
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+            w_nk = _matmul_bnb4_dequantized(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            # `kind="stable"` for the same cross-platform-determinism reason
+            # :func:`apply_structured_pruning_matmul_nbits`'s own identical line
+            # documents (this section's own `_analyze_*` dry-run mirror must
+            # make the identical selection for its predictions to stay
+            # trustworthy).
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
-        _slice_matmul_bnb4_producer_rows(p, keep)
-        _slice_consumer_weight(c.w_init, c.weight_transposed, keep, is_conv=False)
+            _slice_matmul_bnb4_producer_rows(p, keep)
+            _slice_consumer_weight(c.w_init, c.weight_transposed, keep, is_conv=False)
 
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
-        stale_value_info.add(p.node.output[0])
-        stale_value_info.update(op.output[0] for op in chain.chain_ops)
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
+            stale_value_info.add(p.node.output[0])
+            stale_value_info.update(op.output[0] for op in chain.chain_ops)
 
-    if stale_value_info:
-        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
-        del graph.value_info[:]
-        graph.value_info.extend(kept)
+        if stale_value_info:
+            kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+            del graph.value_info[:]
+            graph.value_info.extend(kept)
+
     return out
 
 
@@ -20594,6 +20695,16 @@ def apply_moe_expert_channel_pruning(
     each tensor's own original dtype with no separate downcast needed --
     see the "FP16/BFloat16 weight support" section comment above
     :func:`_match_conv_weight_only`).
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): every ``MoE`` node is matched
+    and pruned inside a nested ``If``/``Loop``/``Scan``/``BeamSearch``-
+    family subgraph, at any nesting depth, exactly as if that subgraph
+    were its own top-level graph -- each graph gets its own
+    :func:`_find_moe_chains` call and its own touched-role state inside
+    :func:`_apply_moe_chains`, so an `MoE` node's own tensors are never
+    confused with a same-named-by-coincidence node in a sibling or
+    ancestor graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -20602,11 +20713,12 @@ def apply_moe_expert_channel_pruning(
 
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
 
-    chains = _find_moe_chains(graph)
-    if chains:
-        _apply_moe_chains(graph, chains, sparsity, _moe_importance)
+    for graph in _iter_subgraphs(out.graph):
+        chains = _find_moe_chains(graph)
+        if chains:
+            _apply_moe_chains(graph, chains, sparsity, _moe_importance)
+
     return out
 
 
@@ -21049,6 +21161,27 @@ def apply_moe_whole_expert_pruning(
     projection weight); the router-gate calibration activations here are
     likewise captured via a real ``onnxruntime`` run and cast to float64
     on capture regardless of the graph's own declared dtype.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment) for MATCHING and SLICING: every
+    ``MoE`` node is matched and pruned inside a nested ``If``/``Loop``/
+    ``Scan``/``BeamSearch``-family subgraph, at any nesting depth, exactly
+    as if that subgraph were its own top-level graph. The calibration-based
+    *ranking* is narrower, though, for the same reason this module's own
+    "Subgraph recursion" section comment gives for excluding the Wanda/
+    SparseGPT family outright: :func:`_moe_router_gate_calibration_stats`
+    reads each chain's `router_probs` back via :func:`_add_probe_outputs`,
+    which only ever appends to the TOP-LEVEL graph's own `output` list --
+    a `router_probs` tensor produced only inside a nested subgraph has no
+    such route to becoming a top-level output. So only chains found in the
+    TOP-LEVEL graph take part in the calibration run at all; a chain
+    matched inside a nested subgraph always falls back to
+    :func:`_moe_expert_weight_importance` (the same "no matching
+    activation observed" fallback path this function already has for a
+    top-level chain calibration never reached, e.g. an empty
+    `calibration_data`) -- so a nested-subgraph `MoE` node is still
+    correctly pruned, just by weight norm rather than measured router
+    usage, never silently skipped.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -21061,14 +21194,12 @@ def apply_moe_whole_expert_pruning(
 
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
 
-    chains = _find_moe_whole_expert_chains(graph)
-    if not chains:
-        return out
-
-    mean_gate_weight = _moe_router_gate_calibration_stats(
-        out, chains, calibration_data, providers
+    top_chains = _find_moe_whole_expert_chains(out.graph)
+    mean_gate_weight = (
+        _moe_router_gate_calibration_stats(out, top_chains, calibration_data, providers)
+        if top_chains
+        else {}
     )
 
     def _importance(
@@ -21079,13 +21210,21 @@ def apply_moe_whole_expert_pruning(
             return _moe_expert_weight_importance(chain, initializer_map)
         return gate
 
-    stale_value_info = _apply_moe_whole_expert_chains(
-        graph, chains, sparsity, _importance
-    )
-    if stale_value_info:
-        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
-        del graph.value_info[:]
-        graph.value_info.extend(kept)
+    for graph in _iter_subgraphs(out.graph):
+        chains = (
+            top_chains if graph is out.graph else _find_moe_whole_expert_chains(graph)
+        )
+        if not chains:
+            continue
+
+        stale_value_info = _apply_moe_whole_expert_chains(
+            graph, chains, sparsity, _importance
+        )
+        if stale_value_info:
+            kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+            del graph.value_info[:]
+            graph.value_info.extend(kept)
+
     return out
 
 
@@ -22433,6 +22572,14 @@ def apply_qmoe_expert_channel_pruning(
             `fc2`'s own `scales`/`zero_points` too when `block_size` is
             set) resized in place; any node this pass doesn't recognize is
             left completely untouched
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): every ``QMoE`` node is matched
+    and pruned inside a nested ``If``/``Loop``/``Scan``/``BeamSearch``-
+    family subgraph, at any nesting depth, exactly as if that subgraph
+    were its own top-level graph -- each graph gets its own
+    :func:`_find_qmoe_chains` call and its own touched-role state inside
+    :func:`_apply_qmoe_channel_chains`.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -22441,11 +22588,14 @@ def apply_qmoe_expert_channel_pruning(
 
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
 
-    chains = _find_qmoe_chains(graph)
-    if chains:
-        _apply_qmoe_channel_chains(graph, chains, sparsity, _qmoe_channel_importance)
+    for graph in _iter_subgraphs(out.graph):
+        chains = _find_qmoe_chains(graph)
+        if chains:
+            _apply_qmoe_channel_chains(
+                graph, chains, sparsity, _qmoe_channel_importance
+            )
+
     return out
 
 
@@ -22739,6 +22889,19 @@ def apply_qmoe_whole_expert_pruning(
             tensors and its router projection's weight(/bias) resized in
             place; any node this pass doesn't recognize is left completely
             untouched
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment) for MATCHING and SLICING, with
+    the exact same calibration-ranking narrowing
+    :func:`apply_moe_whole_expert_pruning`'s own docstring documents (see
+    there for the full reasoning): only a chain found in the TOP-LEVEL
+    graph takes part in the :func:`_moe_router_gate_calibration_stats`
+    probe run at all (`router_probs` produced only inside a nested
+    subgraph has no route to becoming a top-level probe output via
+    :func:`_add_probe_outputs`); a chain matched inside a nested subgraph
+    always falls back to :func:`_qmoe_expert_weight_importance` instead,
+    so it is still correctly pruned, just by weight norm rather than
+    measured router usage.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -22751,14 +22914,12 @@ def apply_qmoe_whole_expert_pruning(
 
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
 
-    chains = _find_qmoe_whole_expert_chains(graph)
-    if not chains:
-        return out
-
-    mean_gate_weight = _moe_router_gate_calibration_stats(
-        out, chains, calibration_data, providers
+    top_chains = _find_qmoe_whole_expert_chains(out.graph)
+    mean_gate_weight = (
+        _moe_router_gate_calibration_stats(out, top_chains, calibration_data, providers)
+        if top_chains
+        else {}
     )
 
     def _importance(
@@ -22769,13 +22930,21 @@ def apply_qmoe_whole_expert_pruning(
             return _qmoe_expert_weight_importance(chain, initializer_map)
         return gate
 
-    stale_value_info = _apply_qmoe_whole_expert_chains(
-        graph, chains, sparsity, _importance
-    )
-    if stale_value_info:
-        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
-        del graph.value_info[:]
-        graph.value_info.extend(kept)
+    for graph in _iter_subgraphs(out.graph):
+        chains = (
+            top_chains if graph is out.graph else _find_qmoe_whole_expert_chains(graph)
+        )
+        if not chains:
+            continue
+
+        stale_value_info = _apply_qmoe_whole_expert_chains(
+            graph, chains, sparsity, _importance
+        )
+        if stale_value_info:
+            kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+            del graph.value_info[:]
+            graph.value_info.extend(kept)
+
     return out
 
 
@@ -23868,6 +24037,13 @@ def apply_structured_pruning_matmul_block_quantized_fp8(
             drop (rounded, at least one channel is always kept)
     :param importance_norm: ``"l2"`` (default) or ``"l1"``
     :returns: the pruned onnx ModelProto
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): matched and pruned inside a
+    nested ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph, at any
+    nesting depth, exactly as if that subgraph were its own top-level
+    graph; `producer_touched`/`consumer_touched`/`stale_value_info` are all
+    reset per graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -23876,61 +24052,62 @@ def apply_structured_pruning_matmul_block_quantized_fp8(
         model = onnx.load(model, load_external_data=False)
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
 
-    chains = _find_fp8_block_quantized_chains(graph)
-    if not chains:
-        return out
+    for graph in _iter_subgraphs(out.graph):
+        chains = _find_fp8_block_quantized_chains(graph)
+        if not chains:
+            continue
 
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
-    stale_value_info: Set[str] = set()
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
+        stale_value_info: Set[str] = set()
 
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key = _fp8_chain_side_key(p)
-        c_key = _fp8_chain_side_key(c)
-        if p_key == c_key:
-            continue  # degenerate (the same weight in both roles)
-        if p_key in producer_touched or c_key in consumer_touched:
-            continue  # a shared/tied weight another chain already resized
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = _fp8_chain_side_key(p)
+            c_key = _fp8_chain_side_key(c)
+            if p_key == c_key:
+                continue  # degenerate (the same weight in both roles)
+            if p_key in producer_touched or c_key in consumer_touched:
+                continue  # a shared/tied weight another chain already resized
 
-        n = chain.n_channels
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            continue  # rounds down to nothing for this layer -- no-op
+            n = chain.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                continue  # rounds down to nothing for this layer -- no-op
 
-        w_nk = _fp8_chain_producer_weight_nk(p)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        # `kind="stable"` -- see apply_structured_pruning_matmul_nbits's own
-        # identical comment: an exactly-tied importance vector's tie-break
-        # order must be deterministic across platforms so a block-alignment
-        # decision never diverges from this family's own `_analyze_*`
-        # dry-run mirror.
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+            w_nk = _fp8_chain_producer_weight_nk(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            # `kind="stable"` -- see apply_structured_pruning_matmul_nbits's own
+            # identical comment: an exactly-tied importance vector's tie-break
+            # order must be deterministic across platforms so a block-alignment
+            # decision never diverges from this family's own `_analyze_*`
+            # dry-run mirror.
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
-        if isinstance(c, _BlockQuantizedFp8Weight):
-            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
-                keep, c.k_blocks, c.block_size
-            )
-            if keep_blocks is None:
-                continue  # non-block-aligned -- decline, see section comment
-            consumer_keep = keep_blocks
-        else:
-            consumer_keep = keep  # plain-float consumer -- no block structure
+            if isinstance(c, _BlockQuantizedFp8Weight):
+                keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                    keep, c.k_blocks, c.block_size
+                )
+                if keep_blocks is None:
+                    continue  # non-block-aligned -- decline, see section comment
+                consumer_keep = keep_blocks
+            else:
+                consumer_keep = keep  # plain-float consumer -- no block structure
 
-        _slice_fp8_chain_producer(p, keep)
-        _slice_fp8_chain_consumer(c, consumer_keep)
+            _slice_fp8_chain_producer(p, keep)
+            _slice_fp8_chain_consumer(c, consumer_keep)
 
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
-        stale_value_info.add(p.node.output[0])
-        stale_value_info.update(op.output[0] for op in chain.chain_ops)
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
+            stale_value_info.add(p.node.output[0])
+            stale_value_info.update(op.output[0] for op in chain.chain_ops)
 
-    if stale_value_info:
-        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
-        del graph.value_info[:]
-        graph.value_info.extend(kept)
+        if stale_value_info:
+            kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+            del graph.value_info[:]
+            graph.value_info.extend(kept)
+
     return out
 
 
@@ -23955,6 +24132,13 @@ def apply_structured_pruning_matmul_block_quantized_fp4(
             drop (rounded, at least one channel is always kept)
     :param importance_norm: ``"l2"`` (default) or ``"l1"``
     :returns: the pruned onnx ModelProto
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): matched and pruned inside a
+    nested ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph, at any
+    nesting depth, exactly as if that subgraph were its own top-level
+    graph; `producer_touched`/`consumer_touched`/`stale_value_info` are all
+    reset per graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -23963,54 +24147,57 @@ def apply_structured_pruning_matmul_block_quantized_fp4(
         model = onnx.load(model, load_external_data=False)
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
 
-    chains = _find_fp4_block_quantized_chains(graph)
-    if not chains:
-        return out
-
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
-    stale_value_info: Set[str] = set()
-
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key = _fp4_chain_side_key(p)
-        c_key = _fp4_chain_side_key(c)
-        if p_key == c_key:
-            continue
-        if p_key in producer_touched or c_key in consumer_touched:
+    for graph in _iter_subgraphs(out.graph):
+        chains = _find_fp4_block_quantized_chains(graph)
+        if not chains:
             continue
 
-        n = chain.n_channels
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            continue
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
+        stale_value_info: Set[str] = set()
 
-        w_nk = _fp4_chain_producer_weight_nk(p)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
-
-        if isinstance(c, _BlockQuantizedFp4Weight):
-            keep_blocks = _fp4_block_aligned_keep_blocks(keep, c.k_blocks, c.block_size)
-            if keep_blocks is None:
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = _fp4_chain_side_key(p)
+            c_key = _fp4_chain_side_key(c)
+            if p_key == c_key:
                 continue
-            consumer_keep = keep_blocks
-        else:
-            consumer_keep = keep
+            if p_key in producer_touched or c_key in consumer_touched:
+                continue
 
-        _slice_fp4_chain_producer(p, keep)
-        _slice_fp4_chain_consumer(c, consumer_keep)
+            n = chain.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                continue
 
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
-        stale_value_info.add(p.node.output[0])
-        stale_value_info.update(op.output[0] for op in chain.chain_ops)
+            w_nk = _fp4_chain_producer_weight_nk(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
-    if stale_value_info:
-        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
-        del graph.value_info[:]
-        graph.value_info.extend(kept)
+            if isinstance(c, _BlockQuantizedFp4Weight):
+                keep_blocks = _fp4_block_aligned_keep_blocks(
+                    keep, c.k_blocks, c.block_size
+                )
+                if keep_blocks is None:
+                    continue
+                consumer_keep = keep_blocks
+            else:
+                consumer_keep = keep
+
+            _slice_fp4_chain_producer(p, keep)
+            _slice_fp4_chain_consumer(c, consumer_keep)
+
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
+            stale_value_info.add(p.node.output[0])
+            stale_value_info.update(op.output[0] for op in chain.chain_ops)
+
+        if stale_value_info:
+            kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+            del graph.value_info[:]
+            graph.value_info.extend(kept)
+
     return out
 
 
@@ -24899,6 +25086,13 @@ def apply_structured_pruning_qoperator(
     :param importance_norm: ``"l2"`` (default, Li et al.'s original
             filter-pruning criterion) or ``"l1"``
     :returns: the pruned onnx ModelProto
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): matched and pruned inside a
+    nested ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph, at any
+    nesting depth, exactly as if that subgraph were its own top-level
+    graph; `producer_touched`/`consumer_touched`/`stale_value_info` are all
+    reset per graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -24907,49 +25101,50 @@ def apply_structured_pruning_qoperator(
         model = onnx.load(model, load_external_data=False)
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
 
-    chains = _find_qop_chains(graph)
-    if not chains:
-        return out
+    for graph in _iter_subgraphs(out.graph):
+        chains = _find_qop_chains(graph)
+        if not chains:
+            continue
 
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
-    stale_value_info: Set[str] = set()
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
+        stale_value_info: Set[str] = set()
 
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key = p.w_init.name
-        c_key = c.w_init.name
-        if p_key == c_key:
-            continue  # degenerate (the same weight in both roles)
-        if p_key in producer_touched or c_key in consumer_touched:
-            continue  # a shared/tied weight another chain already resized
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = p.w_init.name
+            c_key = c.w_init.name
+            if p_key == c_key:
+                continue  # degenerate (the same weight in both roles)
+            if p_key in producer_touched or c_key in consumer_touched:
+                continue  # a shared/tied weight another chain already resized
 
-        n = chain.n_channels
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            continue  # rounds down to nothing for this layer -- no-op
+            n = chain.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                continue  # rounds down to nothing for this layer -- no-op
 
-        w_nk = _qop_dequantized_nk(p)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        # `kind="stable"` for the identical determinism reason
-        # `apply_structured_pruning_qdq`'s own comment on this same line
-        # documents.
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+            w_nk = _qop_dequantized_nk(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            # `kind="stable"` for the identical determinism reason
+            # `apply_structured_pruning_qdq`'s own comment on this same line
+            # documents.
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
-        _slice_qop_producer(p, keep)
-        _slice_qop_consumer(c, keep)
+            _slice_qop_producer(p, keep)
+            _slice_qop_consumer(c, keep)
 
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
-        stale_value_info.add(p.node.output[0])
-        stale_value_info.update(op.output[0] for op in chain.chain_ops)
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
+            stale_value_info.add(p.node.output[0])
+            stale_value_info.update(op.output[0] for op in chain.chain_ops)
 
-    if stale_value_info:
-        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
-        del graph.value_info[:]
-        graph.value_info.extend(kept)
+        if stale_value_info:
+            kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+            del graph.value_info[:]
+            graph.value_info.extend(kept)
+
     return out
 
 
@@ -25608,6 +25803,13 @@ def apply_structured_pruning_dynamic_quantize_matmul(
     :param importance_norm: ``"l2"`` (default, Li et al.'s original
             filter-pruning criterion) or ``"l1"``
     :returns: the pruned onnx ModelProto
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): matched and pruned inside a
+    nested ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph, at any
+    nesting depth, exactly as if that subgraph were its own top-level
+    graph; `producer_touched`/`consumer_touched`/`stale_value_info` are all
+    reset per graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -25616,50 +25818,51 @@ def apply_structured_pruning_dynamic_quantize_matmul(
         model = onnx.load(model, load_external_data=False)
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
 
-    chains = _find_dynquant_chains(graph)
-    if not chains:
-        return out
+    for graph in _iter_subgraphs(out.graph):
+        chains = _find_dynquant_chains(graph)
+        if not chains:
+            continue
 
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
-    stale_value_info: Set[str] = set()
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
+        stale_value_info: Set[str] = set()
 
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key = _dynquant_chain_side_key(p)
-        c_key = _dynquant_chain_side_key(c)
-        if p_key == c_key:
-            continue  # degenerate (the same weight in both roles)
-        if p_key in producer_touched or c_key in consumer_touched:
-            continue  # a shared/tied weight another chain already resized
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = _dynquant_chain_side_key(p)
+            c_key = _dynquant_chain_side_key(c)
+            if p_key == c_key:
+                continue  # degenerate (the same weight in both roles)
+            if p_key in producer_touched or c_key in consumer_touched:
+                continue  # a shared/tied weight another chain already resized
 
-        n = chain.n_channels
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            continue  # rounds down to nothing for this layer -- no-op
+            n = chain.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                continue  # rounds down to nothing for this layer -- no-op
 
-        w_nk = _dynquant_chain_producer_weight_nk(p)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        # `kind="stable"` for the identical determinism reason this
-        # module's own established sections use it (see e.g.
-        # `apply_structured_pruning_matmul_nbits`'s own comment on this
-        # same line).
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+            w_nk = _dynquant_chain_producer_weight_nk(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            # `kind="stable"` for the identical determinism reason this
+            # module's own established sections use it (see e.g.
+            # `apply_structured_pruning_matmul_nbits`'s own comment on this
+            # same line).
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
-        _slice_dynquant_chain_producer(p, keep)
-        _slice_dynquant_chain_consumer(c, keep)
+            _slice_dynquant_chain_producer(p, keep)
+            _slice_dynquant_chain_consumer(c, keep)
 
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
-        stale_value_info.add(p.node.output[0])
-        stale_value_info.update(op.output[0] for op in chain.chain_ops)
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
+            stale_value_info.add(p.node.output[0])
+            stale_value_info.update(op.output[0] for op in chain.chain_ops)
 
-    if stale_value_info:
-        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
-        del graph.value_info[:]
-        graph.value_info.extend(kept)
+        if stale_value_info:
+            kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+            del graph.value_info[:]
+            graph.value_info.extend(kept)
+
     return out
 
 
@@ -26688,7 +26891,10 @@ def _match_untied_lm_head(
 
 
 def _match_embedding_chain(
-    graph: onnx.GraphProto, input_name: Optional[str]
+    graph: onnx.GraphProto,
+    input_name: Optional[str],
+    *,
+    strict_input_name: bool = True,
 ) -> Optional[_EmbeddingChain]:
     """Finds the one token-embedding producer this pass should act on --
     a plain `Gather` (:func:`_match_embedding_gather`), a
@@ -26703,15 +26909,22 @@ def _match_embedding_chain(
     own docstring) -- see this section's own comment above for the full
     matching/safety bar. When `input_name` is given, only a producer whose
     token-id operand resolves to that exact graph input is considered, and
-    it is an error (`ValueError` -- a caller mistake, not an ambiguous
-    topology) if none does. When `input_name` is omitted, exactly one
-    qualifying producer -- of *any* of the three shapes, counted together --
-    must exist in the whole graph -- zero or more than one (with no way to
-    tell which is "the" token embedding, e.g. a `position_ids`-driven
-    positional embedding matches the identical `Gather` structural shape,
-    or a graph could mix a plain-`Gather` embedding with an unrelated
-    `EmbedLayerNormalization` block) declines the whole call (`None`), the
-    model left completely untouched.
+    -- when `strict_input_name` (the default) -- it is an error (`ValueError`
+    -- a caller mistake, not an ambiguous topology) if none does.
+    `strict_input_name=False` (only ever passed by
+    :func:`_match_embedding_chain_any_graph`, see its own docstring for why)
+    instead treats that exact same "no producer here reads `input_name`"
+    outcome as an ordinary decline (`None`, no exception) -- `graph` here is
+    only one of possibly several graphs a caller searching a whole model's
+    worth of nested subgraphs is trying in turn, so "not in THIS graph" is
+    not yet an error until every graph has been tried. When `input_name` is
+    omitted, exactly one qualifying producer -- of *any* of the three
+    shapes, counted together -- must exist in the whole graph -- zero or
+    more than one (with no way to tell which is "the" token embedding, e.g.
+    a `position_ids`-driven positional embedding matches the identical
+    `Gather` structural shape, or a graph could mix a plain-`Gather`
+    embedding with an unrelated `EmbedLayerNormalization` block) declines
+    the whole call (`None`), the model left completely untouched.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
@@ -26744,6 +26957,8 @@ def _match_embedding_chain(
         matches.append((node, w_name, indices_name, quantized))
 
     if input_name is not None and not matches:
+        if not strict_input_name:
+            return None
         raise ValueError(
             f"no embedding Gather/EmbedLayerNormalization/GatherBlockQuantized "
             f"found reading graph input {input_name!r}"
@@ -26788,6 +27003,54 @@ def _match_embedding_chain(
         lm_head=lm_head,
         quantized=quantized,
     )
+
+
+def _match_embedding_chain_any_graph(
+    model_graph: onnx.GraphProto, input_name: Optional[str]
+) -> Tuple[Optional[onnx.GraphProto], Optional[_EmbeddingChain]]:
+    """Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment) wrapper around
+    :func:`_match_embedding_chain`: tries every graph
+    :func:`_iter_subgraphs(model_graph)` returns -- `model_graph` itself
+    first, then every nested ``If``/``Loop``/``Scan``/``BeamSearch``-family
+    subgraph, at any nesting depth -- independently, exactly the same
+    within-one-graph matching/disambiguation :func:`_match_embedding_chain`
+    already does (`strict_input_name=False`, so a graph that simply doesn't
+    contain a producer reading `input_name` is an ordinary "no match here,
+    try the next graph" rather than a raised error), and applies the
+    IDENTICAL "exactly one qualifying match, or decline" rule *across the
+    whole model* rather than one single graph: zero matches anywhere, or a
+    match in more than one graph (e.g. two sibling `If` branches each
+    independently matching their own eligible embedding producer), both
+    decline the whole call the same way an in-graph ambiguity already does.
+    `ValueError` for an unmatched `input_name` is raised here instead,
+    exactly once, only after every graph has been tried and NONE contained
+    a producer reading it -- never per-graph, which would incorrectly raise
+    on the first graph that simply isn't the one `input_name` names.
+
+    Returns the `(graph, chain)` pair when exactly one match was found --
+    `graph` is whichever one it came from, the same `GraphProto` object
+    identity `_iter_subgraphs` returned it as (never copied), so a caller
+    already holding a reference to that same object tree (e.g. `out.graph`
+    for a working copy) can mutate it in place -- or `(None, None)` when
+    the call should be declined.
+    """
+    found_graph: Optional[onnx.GraphProto] = None
+    found_chain: Optional[_EmbeddingChain] = None
+    n_found = 0
+    for graph in _iter_subgraphs(model_graph):
+        chain = _match_embedding_chain(graph, input_name, strict_input_name=False)
+        if chain is not None:
+            n_found += 1
+            found_graph, found_chain = graph, chain
+    if input_name is not None and n_found == 0:
+        raise ValueError(
+            f"no embedding Gather/EmbedLayerNormalization/GatherBlockQuantized "
+            f"found reading graph input {input_name!r}"
+        )
+    if n_found != 1:
+        return None, None  # zero, or ambiguous across graphs -- decline
+    return found_graph, found_chain
 
 
 def _drop_value_info(graph: onnx.GraphProto, name: str) -> None:
@@ -26861,27 +27124,33 @@ def _finalize_embedding_shapes(
 
 
 def _apply_embedding_vocab_prune(
-    model: onnx.ModelProto, chain: _EmbeddingChain, keep_ids: List[int]
-) -> onnx.ModelProto:
-    """Performs the actual slicing for an already-decided (ascending)
-    `keep_ids` set: the embedding table's own `vocab_size` axis (axis 0 for
-    the two plain-float producer shapes -- the `Gather`'s own `axis=0`
-    requirement; `chain.quantized.gather_axis` -- always also `0`, see
-    :func:`_match_gather_block_quantized_producer`'s own docstring -- for
-    the `GatherBlockQuantized` shape), and, for an untied `lm_head`, its own
-    independent weight/bias. A tied `lm_head`'s weight needs no separate
-    slicing call at all: it *is* the embedding table (the exact same
-    initializer object), already fully accounted for by the one slice
-    below. For the `GatherBlockQuantized` shape, `scales`/(if present)
-    `zero_points` are ALSO row-sliced along that same axis -- a plain
-    ``onnx.numpy_helper``-roundtripping :func:`_slice_axis` call, byte-exact
-    regardless of `bits`/packing convention, per this section's own top
-    comment (`gather_axis` is never `quantize_axis`, so this never touches
-    a packed axis).
+    graph: onnx.GraphProto, chain: _EmbeddingChain, keep_ids: List[int]
+) -> None:
+    """Performs the actual slicing, IN PLACE on `graph`, for an
+    already-decided (ascending) `keep_ids` set: the embedding table's own
+    `vocab_size` axis (axis 0 for the two plain-float producer shapes -- the
+    `Gather`'s own `axis=0` requirement; `chain.quantized.gather_axis` --
+    always also `0`, see :func:`_match_gather_block_quantized_producer`'s
+    own docstring -- for the `GatherBlockQuantized` shape), and, for an
+    untied `lm_head`, its own independent weight/bias. A tied `lm_head`'s
+    weight needs no separate slicing call at all: it *is* the embedding
+    table (the exact same initializer object), already fully accounted for
+    by the one slice below. For the `GatherBlockQuantized` shape, `scales`/
+    (if present) `zero_points` are ALSO row-sliced along that same axis --
+    a plain ``onnx.numpy_helper``-roundtripping :func:`_slice_axis` call,
+    byte-exact regardless of `bits`/packing convention, per this section's
+    own top comment (`gather_axis` is never `quantize_axis`, so this never
+    touches a packed axis).
+
+    `graph` must be whichever graph `chain` was actually matched in --
+    :func:`_match_embedding_chain_any_graph`'s own returned `graph`, still
+    reachable from the caller's own working-copy `out.graph` (never a
+    separate copy) -- so this mutates that graph's own `initializer`/
+    `output`/`value_info` in place, exactly the same "only ever slice a
+    tensor out of the one graph a matcher actually found it in" scoping
+    rule every other subgraph-aware pass in this module already follows
+    (see this module's own "Subgraph recursion" section comment).
     """
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
     initializer_map = {t.name: t for t in graph.initializer}
     keep = np.asarray(keep_ids, dtype=np.int64)
     new_v = len(keep_ids)
@@ -26912,7 +27181,6 @@ def _apply_embedding_vocab_prune(
         _slice_last_axis(initializer_map[chain.lm_head.bias], keep)
 
     _finalize_embedding_shapes(graph, chain, new_v)
-    return out
 
 
 @dataclass(frozen=True)
@@ -27029,6 +27297,15 @@ def apply_embedding_vocab_pruning(
             :func:`_match_embed_layer_norm_producer`'s own docstring); for
             either shape, an ambiguous/absent match for `input_name` (or no
             `input_name` given, more than one eligible producer).
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): the one eligible embedding
+    producer this function requires may live inside a nested ``If``/
+    ``Loop``/``Scan``/``BeamSearch``-family subgraph, at any nesting depth,
+    not only the top-level graph -- see
+    :func:`_match_embedding_chain_any_graph`'s own docstring for exactly
+    how the "exactly one eligible producer, or decline" rule is applied
+    *across the whole model* now, not just one single graph.
     """
     if (keep_token_ids is None) == (drop_token_ids is None):
         raise ValueError(
@@ -27037,11 +27314,13 @@ def apply_embedding_vocab_pruning(
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
 
-    chain = _match_embedding_chain(model.graph, input_name)
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+
+    graph, chain = _match_embedding_chain_any_graph(out.graph, input_name)
     if chain is None:
-        out = onnx.ModelProto()
-        out.CopyFrom(model)
         return EmbeddingPruningResult(model=out, matched=False)
+    assert graph is not None
 
     vocab_size = chain.vocab_size
     if keep_token_ids is not None:
@@ -27064,7 +27343,7 @@ def apply_embedding_vocab_pruning(
         raise ValueError("keep_token_ids resolves to an empty vocabulary")
     keep_ids = sorted(keep_set)
 
-    out = _apply_embedding_vocab_prune(model, chain, keep_ids)
+    _apply_embedding_vocab_prune(graph, chain, keep_ids)
     id_map = {old: new for new, old in enumerate(keep_ids)}
     return EmbeddingPruningResult(
         model=out,
@@ -27200,20 +27479,27 @@ def apply_embedding_vocab_magnitude_pruning(
     :returns: an :class:`EmbeddingPruningResult` -- see
             :func:`apply_embedding_vocab_pruning`'s own docstring for
             exactly which topologies decline (`matched=False`)
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment) exactly the same way
+    :func:`apply_embedding_vocab_pruning` is -- see
+    :func:`_match_embedding_chain_any_graph`'s own docstring.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
 
-    chain = _match_embedding_chain(model.graph, input_name)
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+
+    graph, chain = _match_embedding_chain_any_graph(out.graph, input_name)
     if chain is None:
-        out = onnx.ModelProto()
-        out.CopyFrom(model)
         return EmbeddingPruningResult(model=out, matched=False)
+    assert graph is not None
 
     vocab_size = chain.vocab_size
-    initializer_map = {t.name: t for t in model.graph.initializer}
+    initializer_map = {t.name: t for t in graph.initializer}
     importance = _embedding_vocab_importance(chain, initializer_map)
 
     protect = {int(i) for i in (protect_token_ids or ())}
@@ -27233,7 +27519,7 @@ def apply_embedding_vocab_magnitude_pruning(
         keep_set.add(int(idx))
     keep_ids = sorted(keep_set)
 
-    out = _apply_embedding_vocab_prune(model, chain, keep_ids)
+    _apply_embedding_vocab_prune(graph, chain, keep_ids)
     id_map = {old: new for new, old in enumerate(keep_ids)}
     return EmbeddingPruningResult(
         model=out,
@@ -27782,11 +28068,44 @@ def _select_droppable_blocks(
 def _apply_transformer_block_pruning(
     graph: onnx.GraphProto, ranked: Sequence[_DroppableBlock], target: int
 ) -> int:
-    """Commits :func:`_select_droppable_blocks`'s own selection from
-    `ranked` (already sorted most- to least-redundant) -- up to `target`
-    blocks, skipping any candidate whose own `block_nodes` overlaps an
-    already-committed one's -- then applies every commit at once. Returns
-    the number of blocks actually dropped.
+    """Selects (:func:`_select_droppable_blocks`) up to `target` blocks from
+    `ranked` (already sorted most- to least-redundant), skipping any
+    candidate whose own `block_nodes` overlaps an already-committed one's,
+    then commits every selected block via :func:`_commit_transformer_block_drops`
+    -- see that function's own docstring for the actual rewrite/deletion
+    mechanics. Returns the number of blocks actually dropped. `ranked`
+    must be entirely `graph`'s own candidates (every `block.block_nodes`
+    reachable from `graph.node`) -- see
+    :func:`apply_transformer_block_pruning`'s own docstring for why, when
+    more than one graph is involved, selection is pooled globally
+    (:func:`_select_droppable_blocks` called once, across every graph's
+    candidates together) but committing is always done one graph at a
+    time (:func:`_commit_transformer_block_drops` called separately per
+    graph, each time with only that graph's own share of the one global
+    selection) rather than through this function directly.
+    """
+    committed = _select_droppable_blocks(ranked, target)
+    return _commit_transformer_block_drops(graph, committed)
+
+
+def _commit_transformer_block_drops(
+    graph: onnx.GraphProto, committed: Sequence[_DroppableBlock]
+) -> int:
+    """Applies an already-decided `committed` selection (e.g. from
+    :func:`_select_droppable_blocks`) to `graph` -- the actual rewrite/
+    deletion mechanics :func:`_apply_transformer_block_pruning` used to
+    perform inline, factored out so a pooled, multi-graph selection (see
+    :func:`apply_transformer_block_pruning`'s own docstring) can be split
+    by originating graph and committed to each one separately, without
+    re-deriving the selection per graph. Returns `len(committed)`.
+
+    Every `committed` block must belong to `graph` (every one of its own
+    `block_nodes` reachable from `graph.node`) -- a block from a different
+    graph is silently a no-op here (its own nodes are never found in
+    `graph.node`, so neither the rewire nor the deletion pass below ever
+    touches it), which is exactly why callers with candidates from more
+    than one graph must group `committed` by graph themselves and call
+    this once per graph, each time with only that graph's own share.
 
     Each commit rewrites every current reference to its own `x_out` --
     every node's own input, in place, plus (via a small inserted
@@ -27812,7 +28131,6 @@ def _apply_transformer_block_pruning(
     deleting nodes (never reordering or inserting anything ahead of what
     it depends on) can't break that.
     """
-    committed = _select_droppable_blocks(ranked, target)
     committed_ids: Set[int] = {id(n) for block in committed for n in block.block_nodes}
 
     alias: Dict[str, str] = {}
@@ -27934,6 +28252,57 @@ def apply_transformer_block_pruning(
             candidate was matched, ``sparsity``/``num_blocks_to_drop``
             rounds to zero blocks, or ``calibration_data`` never gives any
             candidate a valid (non-degenerate) token to rank on
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment) for MATCHING, SELECTION, and
+    COMMITTING alike: a droppable candidate is found in, and dropped from,
+    a nested ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph, at
+    any nesting depth, exactly as if that subgraph were its own top-level
+    graph -- committing (:func:`_commit_transformer_block_drops`) is always
+    done separately per graph (a block's own node deletions/rewires can
+    only ever touch the one graph its own nodes actually live in), but
+    ``sparsity``/``num_blocks_to_drop`` are pooled ACROSS THE WHOLE MODEL,
+    not computed independently per graph: `target` is one count, derived
+    from (or capped at) the TOTAL candidate count across every graph
+    combined, and :func:`_select_droppable_blocks` is called exactly once
+    over one ranked list spanning every graph's own candidates together --
+    the same "one shared global ranking/cutoff" reasoning
+    :func:`apply_magnitude_pruning`'s own `global_sparsity` mode documents
+    (there is no literal `global_sparsity` flag here, since `sparsity`/
+    `num_blocks_to_drop` already *are* this pass's only "how many total
+    blocks" knobs -- pooling them is simply what honoring their own
+    existing "fraction/count of however many candidates this pass actually
+    matched" contract means once "matched" can span more than one graph),
+    unlike :func:`apply_structured_pruning`'s own `global_sparsity` mode,
+    which pools independently per graph specifically because
+    `num_blocks_to_drop` has no analogue there to make a per-call total
+    count meaningful across graphs in the first place. The redundancy
+    RANKING itself has the same narrower calibration reach this module's
+    own "Subgraph recursion" section comment gives for the Wanda/SparseGPT
+    family and :func:`apply_moe_whole_expert_pruning`/
+    :func:`apply_qmoe_whole_expert_pruning`: :func:`_transformer_block_similarity`
+    reads each candidate's own `x_in`/`x_out` back via
+    :func:`_add_probe_outputs`, which only ever appends to the TOP-LEVEL
+    graph's own `output` list, so only a TOP-LEVEL-graph candidate is ever
+    actually probed; a candidate matched inside a nested subgraph is
+    assigned this function's own existing "no evidence" similarity score
+    (``float("-inf")``, the same score a top-level candidate with no valid
+    calibration token already falls back to) -- conservatively ranked
+    LAST, never preferentially dropped, but still genuinely droppable (and
+    correctly committed) once `target` calls for more blocks than the
+    top-level graph alone has real evidence for.
+
+    MATCHING itself has one further narrowing for a nested subgraph, same
+    reasoning as :func:`apply_structured_pruning_matmul_nbits`'s own
+    `value_info_by_name` note: :func:`_shapes_match` (the safety check
+    guarding against a merge `Add` having silently broadcast `x_in` up to
+    a wider `x_out`) only ever consults that subgraph's own as-declared
+    `value_info`/`input`/`output` -- no `onnx.shape_inference` pass reaches
+    into a nested subgraph for this family, so a candidate whose shape is
+    only *derivable*, never already declared outright, inside a nested
+    subgraph is conservatively declined there even though the equivalent
+    top-level-graph case would be handled -- a documented, conservative
+    gap, not a correctness risk.
     """
     if num_blocks_to_drop is not None:
         if num_blocks_to_drop < 0:
@@ -27952,35 +28321,60 @@ def apply_transformer_block_pruning(
 
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
 
     try:
         inferred = onnx.shape_inference.infer_shapes(out, strict_mode=False)
-        value_info_by_name = _value_info_by_name(inferred.graph)
+        top_value_info_by_name = _value_info_by_name(inferred.graph)
     except Exception:
-        value_info_by_name = _value_info_by_name(graph)
+        top_value_info_by_name = _value_info_by_name(out.graph)
 
-    candidates = _find_transformer_block_candidates(graph, value_info_by_name)
-    if not candidates:
+    # (graph, candidate, similarity) for every graph's own candidates,
+    # pooled together -- see this function's own docstring for why
+    # selection is pooled across the whole model while committing stays
+    # strictly per graph.
+    pooled: List[Tuple[onnx.GraphProto, _DroppableBlock, float]] = []
+    for graph in _iter_subgraphs(out.graph):
+        is_top = graph is out.graph
+        value_info_by_name = (
+            top_value_info_by_name if is_top else _value_info_by_name(graph)
+        )
+        candidates = _find_transformer_block_candidates(graph, value_info_by_name)
+        if not candidates:
+            continue
+        if is_top:
+            similarity = _transformer_block_similarity(
+                out, candidates, calibration_data, providers
+            )
+            pooled.extend((graph, c, similarity[i]) for i, c in enumerate(candidates))
+        else:
+            # Not probeable -- see this function's own docstring. Ranked
+            # last, never preferentially dropped, but still a real,
+            # committable candidate if `target` needs it.
+            pooled.extend((graph, c, float("-inf")) for c in candidates)
+
+    if not pooled:
         return out
 
     if num_blocks_to_drop is not None:
-        target = min(num_blocks_to_drop, len(candidates))
+        target = min(num_blocks_to_drop, len(pooled))
     else:
-        target = int(round(sparsity * len(candidates)))
+        target = int(round(sparsity * len(pooled)))
     if target <= 0:
         return out
 
-    similarity = _transformer_block_similarity(
-        out, candidates, calibration_data, providers
-    )
     ranked = [
-        c
-        for _, c in sorted(
-            enumerate(candidates), key=lambda item: similarity[item[0]], reverse=True
-        )
+        (g, c) for g, c, _ in sorted(pooled, key=lambda item: item[2], reverse=True)
     ]
-    _apply_transformer_block_pruning(graph, ranked, target)
+    committed = _select_droppable_blocks([c for _, c in ranked], target)
+    committed_by_graph: Dict[int, Tuple[onnx.GraphProto, List[_DroppableBlock]]] = {}
+    block_to_graph = {id(c): g for g, c in ranked}
+    for block in committed:
+        g = block_to_graph[id(block)]
+        entry = committed_by_graph.setdefault(id(g), (g, []))
+        entry[1].append(block)
+    for g, blocks in committed_by_graph.values():
+        _commit_transformer_block_drops(g, blocks)
+
     return out
 
 
@@ -29037,79 +29431,49 @@ def _analyze_structured_pruning_qdq(
     QDQ-specific label of its own distinguishing *why* it was declined (the
     real function itself gives none either -- these topologies are out of
     scope, not individually diagnosed).
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment), the dry-run mirror of
+    :func:`apply_structured_pruning_qdq`'s own subgraph awareness: every
+    chain family above is matched inside a nested ``If``/``Loop``/``Scan``/
+    ``BeamSearch``-family subgraph, at any nesting depth, exactly as if
+    that subgraph were its own top-level graph, and `layers`/`not_eligible`
+    are aggregated across every graph -- `producer_touched`/
+    `consumer_touched` are reset per graph, so a weight tied within one
+    graph never suppresses or interferes with a same-named-by-coincidence
+    weight in a sibling or ancestor graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
     _validate_importance_norm(importance_norm)
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
 
-    chains = _find_qdq_chains(graph)
-    gated_chains = _find_qdq_gated_chains(graph)
-    not_eligible = _qdq_not_eligible(graph, chains, gated_chains)
-    if not chains and not gated_chains:
-        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
-
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
     layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
 
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key = _weight_ref_key(p.ref)
-        c_key = _weight_ref_key(c.ref)
-        if p_key == c_key:
-            continue  # degenerate (the same weight in both roles) -- no report row
+    for graph in _iter_subgraphs(model.graph):
+        chains = _find_qdq_chains(graph)
+        gated_chains = _find_qdq_gated_chains(graph)
+        not_eligible.extend(_qdq_not_eligible(graph, chains, gated_chains))
+        if not chains and not gated_chains:
+            continue
 
-        label = _node_label(p.node)
-        family = "qdq_conv" if p.is_conv else "qdq_matmul"
-        n = chain.n_channels
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
 
-        if p_key in producer_touched or c_key in consumer_touched:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue  # a shared/tied weight another chain already claimed
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = _weight_ref_key(p.ref)
+            c_key = _weight_ref_key(c.ref)
+            if p_key == c_key:
+                continue  # degenerate (the same weight in both roles) -- no report row
 
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue  # rounds down to nothing for this chain -- no-op
+            label = _node_label(p.node)
+            family = "qdq_conv" if p.is_conv else "qdq_matmul"
+            n = chain.n_channels
 
-        w = _weight_ref_dequantized(p.ref)
-        w_nk = _weight_to_nk(w, p.weight_transposed, p.is_conv, p.is_conv_transpose)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        # `kind="stable"` to match `apply_structured_pruning_qdq`'s own
-        # tie-break exactly (see that function's own comment on this same
-        # line) -- otherwise an exactly-tied `importance` vector could make
-        # this dry-run mirror's block-alignment decision diverge from the
-        # real call's, platform-dependently.
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
-
-        if c.ref.qdq_block is not None:
-            keep_blocks = _qdq_block_aligned_keep_blocks(
-                keep, n, c.ref.qdq_block.block_size
-            )
-            if keep_blocks is None:
+            if p_key in producer_touched or c_key in consumer_touched:
                 layers.append(
                     PruningLayerSensitivity(
                         label=label,
@@ -29121,86 +29485,10 @@ def _analyze_structured_pruning_qdq(
                         importance_max=0.0,
                     )
                 )
-                continue  # non-block-aligned keep set -- real call declines
-                # this whole chain too, see this function's own docstring
+                continue  # a shared/tied weight another chain already claimed
 
-        keep_mask = np.zeros(n, dtype=bool)
-        keep_mask[keep] = True
-
-        layers.append(
-            PruningLayerSensitivity(
-                label=label,
-                family=family,
-                total=n,
-                would_drop=int(n - keep_count),
-                margin=_normalized_margin(importance, keep_mask),
-                importance_min=float(importance.min()),
-                importance_max=float(importance.max()),
-            )
-        )
-
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
-
-    for gchain in gated_chains:
-        pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
-        pa_key = _weight_ref_key(pa.ref)
-        pb_key = _weight_ref_key(pb.ref)
-        c_key = _weight_ref_key(c.ref)
-        if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
-            continue  # degenerate (a weight tied across two roles) -- no report row
-
-        label = f"{_node_label(pa.node)} + {_node_label(pb.node)}"
-        family = "qdq_matmul_gated"
-        n = gchain.n_channels
-
-        if (
-            pa_key in producer_touched
-            or pb_key in producer_touched
-            or c_key in consumer_touched
-        ):
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue  # a shared/tied weight another chain already claimed
-
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue  # rounds down to nothing for this chain -- no-op
-
-        w_a_nk = _weight_to_nk(
-            _weight_ref_dequantized(pa.ref), pa.weight_transposed, False
-        )
-        w_b_nk = _weight_to_nk(
-            _weight_ref_dequantized(pb.ref), pb.weight_transposed, False
-        )
-        importance = _qdq_gated_channel_importance(w_a_nk, w_b_nk, importance_norm)
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
-
-        if c.ref.qdq_block is not None:
-            keep_blocks = _qdq_block_aligned_keep_blocks(
-                keep, n, c.ref.qdq_block.block_size
-            )
-            if keep_blocks is None:
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
                 layers.append(
                     PruningLayerSensitivity(
                         label=label,
@@ -29212,27 +29500,146 @@ def _analyze_structured_pruning_qdq(
                         importance_max=0.0,
                     )
                 )
-                continue  # non-block-aligned keep set -- real call declines
-                # this whole gated group too, see this function's own docstring
+                continue  # rounds down to nothing for this chain -- no-op
 
-        keep_mask = np.zeros(n, dtype=bool)
-        keep_mask[keep] = True
+            w = _weight_ref_dequantized(p.ref)
+            w_nk = _weight_to_nk(w, p.weight_transposed, p.is_conv, p.is_conv_transpose)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            # `kind="stable"` to match `apply_structured_pruning_qdq`'s own
+            # tie-break exactly (see that function's own comment on this same
+            # line) -- otherwise an exactly-tied `importance` vector could make
+            # this dry-run mirror's block-alignment decision diverge from the
+            # real call's, platform-dependently.
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
-        layers.append(
-            PruningLayerSensitivity(
-                label=label,
-                family=family,
-                total=n,
-                would_drop=int(n - keep_count),
-                margin=_normalized_margin(importance, keep_mask),
-                importance_min=float(importance.min()),
-                importance_max=float(importance.max()),
+            if c.ref.qdq_block is not None:
+                keep_blocks = _qdq_block_aligned_keep_blocks(
+                    keep, n, c.ref.qdq_block.block_size
+                )
+                if keep_blocks is None:
+                    layers.append(
+                        PruningLayerSensitivity(
+                            label=label,
+                            family=family,
+                            total=n,
+                            would_drop=0,
+                            margin=None,
+                            importance_min=0.0,
+                            importance_max=0.0,
+                        )
+                    )
+                    continue  # non-block-aligned keep set -- real call declines
+                    # this whole chain too, see this function's own docstring
+
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[keep] = True
+
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=int(n - keep_count),
+                    margin=_normalized_margin(importance, keep_mask),
+                    importance_min=float(importance.min()),
+                    importance_max=float(importance.max()),
+                )
             )
-        )
 
-        producer_touched.add(pa_key)
-        producer_touched.add(pb_key)
-        consumer_touched.add(c_key)
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
+
+        for gchain in gated_chains:
+            pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
+            pa_key = _weight_ref_key(pa.ref)
+            pb_key = _weight_ref_key(pb.ref)
+            c_key = _weight_ref_key(c.ref)
+            if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
+                continue  # degenerate (a weight tied across two roles) -- no report row
+
+            label = f"{_node_label(pa.node)} + {_node_label(pb.node)}"
+            family = "qdq_matmul_gated"
+            n = gchain.n_channels
+
+            if (
+                pa_key in producer_touched
+                or pb_key in producer_touched
+                or c_key in consumer_touched
+            ):
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # a shared/tied weight another chain already claimed
+
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # rounds down to nothing for this chain -- no-op
+
+            w_a_nk = _weight_to_nk(
+                _weight_ref_dequantized(pa.ref), pa.weight_transposed, False
+            )
+            w_b_nk = _weight_to_nk(
+                _weight_ref_dequantized(pb.ref), pb.weight_transposed, False
+            )
+            importance = _qdq_gated_channel_importance(w_a_nk, w_b_nk, importance_norm)
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+            if c.ref.qdq_block is not None:
+                keep_blocks = _qdq_block_aligned_keep_blocks(
+                    keep, n, c.ref.qdq_block.block_size
+                )
+                if keep_blocks is None:
+                    layers.append(
+                        PruningLayerSensitivity(
+                            label=label,
+                            family=family,
+                            total=n,
+                            would_drop=0,
+                            margin=None,
+                            importance_min=0.0,
+                            importance_max=0.0,
+                        )
+                    )
+                    continue  # non-block-aligned keep set -- real call declines
+                    # this whole gated group too, see this function's own docstring
+
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[keep] = True
+
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=int(n - keep_count),
+                    margin=_normalized_margin(importance, keep_mask),
+                    importance_min=float(importance.min()),
+                    importance_max=float(importance.max()),
+                )
+            )
+
+            producer_touched.add(pa_key)
+            producer_touched.add(pb_key)
+            consumer_touched.add(c_key)
 
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
@@ -29359,84 +29766,58 @@ def _analyze_structured_pruning_matmul_nbits(
     `family` is ``"matmul_nbits_mlp"``/``"matmul_nbits_qkv"`` respectively;
     the latter's `total`/`would_drop` are in KV-GROUP units, not raw
     channel counts (this fused op's own pruning unit).
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment), the dry-run mirror of
+    :func:`apply_structured_pruning_matmul_nbits`'s own subgraph awareness
+    -- including its `value_info_by_name` narrowing for a nested subgraph
+    (see that function's own docstring): `layers`/`not_eligible` are
+    aggregated across every graph, and `producer_touched`/`consumer_touched`
+    are reset per graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
     _validate_importance_norm(importance_norm)
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
 
-    chains = _find_matmul_nbits_chains(graph)
-    mlp_chains = _find_matmul_nbits_mlp_chains(graph)
-    qkv_chains = _find_matmul_nbits_qkv_chains(
-        graph, _shape_inferred_value_info_by_name(model)
-    )
-    gated_chains = _find_matmul_nbits_gated_chains(graph)
-    not_eligible = _matmul_nbits_not_eligible(
-        graph, chains, mlp_chains, qkv_chains, gated_chains
-    )
-    if not chains and not mlp_chains and not qkv_chains and not gated_chains:
-        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
-
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
+    top_value_info_by_name = _shape_inferred_value_info_by_name(model)
     layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
 
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key = _matmul_nbits_chain_side_key(p)
-        c_key = _matmul_nbits_chain_side_key(c)
-        if p_key == c_key:
-            continue  # degenerate (the same weight in both roles) -- no report row
-
-        label = _node_label(p.node)
-        family = "matmul_nbits"
-        n = chain.n_channels
-
-        if p_key in producer_touched or c_key in consumer_touched:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
+    for graph in _iter_subgraphs(model.graph):
+        value_info_by_name = (
+            top_value_info_by_name
+            if graph is model.graph
+            else _value_info_by_name(graph)
+        )
+        chains = _find_matmul_nbits_chains(graph)
+        mlp_chains = _find_matmul_nbits_mlp_chains(graph)
+        qkv_chains = _find_matmul_nbits_qkv_chains(graph, value_info_by_name)
+        gated_chains = _find_matmul_nbits_gated_chains(graph)
+        not_eligible.extend(
+            _matmul_nbits_not_eligible(
+                graph, chains, mlp_chains, qkv_chains, gated_chains
             )
-            continue  # a shared/tied weight another chain already claimed
+        )
+        if not chains and not mlp_chains and not qkv_chains and not gated_chains:
+            continue
 
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue  # rounds down to nothing for this chain -- no-op
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
 
-        w_nk = _matmul_nbits_chain_producer_weight_nk(p)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        # `kind="stable"` to match `apply_structured_pruning_matmul_nbits`'s
-        # own tie-break exactly (see that function's own comment on this
-        # same line) -- otherwise an exactly-tied `importance` vector could
-        # make this dry-run mirror's block-alignment decision diverge from
-        # the real call's, platform-dependently.
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = _matmul_nbits_chain_side_key(p)
+            c_key = _matmul_nbits_chain_side_key(c)
+            if p_key == c_key:
+                continue  # degenerate (the same weight in both roles) -- no report row
 
-        if isinstance(c, _MatMulNBitsWeight):
-            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
-                keep, c.k_blocks, c.block_size
-            )
-            if keep_blocks is None:
+            label = _node_label(p.node)
+            family = "matmul_nbits"
+            n = chain.n_channels
+
+            if p_key in producer_touched or c_key in consumer_touched:
                 layers.append(
                     PruningLayerSensitivity(
                         label=label,
@@ -29448,88 +29829,10 @@ def _analyze_structured_pruning_matmul_nbits(
                         importance_max=0.0,
                     )
                 )
-                continue  # non-block-aligned keep-set for this consumer --
-                # the real call declines this chain entirely too, see this
-                # function's own docstring
-        # else: a plain-float consumer has no block structure -- the real
-        # call applies any keep-set directly, see this function's own
-        # docstring.
+                continue  # a shared/tied weight another chain already claimed
 
-        keep_mask = np.zeros(n, dtype=bool)
-        keep_mask[keep] = True
-
-        layers.append(
-            PruningLayerSensitivity(
-                label=label,
-                family=family,
-                total=n,
-                would_drop=int(n - keep_count),
-                margin=_normalized_margin(importance, keep_mask),
-                importance_min=float(importance.min()),
-                importance_max=float(importance.max()),
-            )
-        )
-
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
-
-    for gchain in gated_chains:
-        pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
-        pa_key = _matmul_nbits_chain_side_key(pa)
-        pb_key = _matmul_nbits_chain_side_key(pb)
-        c_key = _matmul_nbits_chain_side_key(c)
-        if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
-            continue  # degenerate (a weight tied across two roles) -- no report row
-
-        label = f"{_node_label(pa.node)} + {_node_label(pb.node)}"
-        family = "matmul_nbits_gated"
-        n = gchain.n_channels
-
-        if (
-            pa_key in producer_touched
-            or pb_key in producer_touched
-            or c_key in consumer_touched
-        ):
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue  # a shared/tied weight another chain already claimed
-
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue  # rounds down to nothing for this chain -- no-op
-
-        w_a_nk = _matmul_nbits_chain_producer_weight_nk(pa)
-        w_b_nk = _matmul_nbits_chain_producer_weight_nk(pb)
-        importance = _matmul_nbits_gated_channel_importance(
-            w_a_nk, w_b_nk, importance_norm
-        )
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
-
-        if isinstance(c, _MatMulNBitsWeight):
-            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
-                keep, c.k_blocks, c.block_size
-            )
-            if keep_blocks is None:
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
                 layers.append(
                     PruningLayerSensitivity(
                         label=label,
@@ -29541,41 +29844,169 @@ def _analyze_structured_pruning_matmul_nbits(
                         importance_max=0.0,
                     )
                 )
-                continue  # non-block-aligned keep-set for this consumer --
-                # the real call declines this whole gated group too, see
-                # this function's own docstring
-        # else: a plain-float consumer has no block structure -- the real
-        # call applies any keep-set directly.
+                continue  # rounds down to nothing for this chain -- no-op
 
-        keep_mask = np.zeros(n, dtype=bool)
-        keep_mask[keep] = True
+            w_nk = _matmul_nbits_chain_producer_weight_nk(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            # `kind="stable"` to match `apply_structured_pruning_matmul_nbits`'s
+            # own tie-break exactly (see that function's own comment on this
+            # same line) -- otherwise an exactly-tied `importance` vector could
+            # make this dry-run mirror's block-alignment decision diverge from
+            # the real call's, platform-dependently.
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
-        layers.append(
-            PruningLayerSensitivity(
-                label=label,
-                family=family,
-                total=n,
-                would_drop=int(n - keep_count),
-                margin=_normalized_margin(importance, keep_mask),
-                importance_min=float(importance.min()),
-                importance_max=float(importance.max()),
+            if isinstance(c, _MatMulNBitsWeight):
+                keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                    keep, c.k_blocks, c.block_size
+                )
+                if keep_blocks is None:
+                    layers.append(
+                        PruningLayerSensitivity(
+                            label=label,
+                            family=family,
+                            total=n,
+                            would_drop=0,
+                            margin=None,
+                            importance_min=0.0,
+                            importance_max=0.0,
+                        )
+                    )
+                    continue  # non-block-aligned keep-set for this consumer --
+                    # the real call declines this chain entirely too, see this
+                    # function's own docstring
+            # else: a plain-float consumer has no block structure -- the real
+            # call applies any keep-set directly, see this function's own
+            # docstring.
+
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[keep] = True
+
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=int(n - keep_count),
+                    margin=_normalized_margin(importance, keep_mask),
+                    importance_min=float(importance.min()),
+                    importance_max=float(importance.max()),
+                )
+            )
+
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
+
+        for gchain in gated_chains:
+            pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
+            pa_key = _matmul_nbits_chain_side_key(pa)
+            pb_key = _matmul_nbits_chain_side_key(pb)
+            c_key = _matmul_nbits_chain_side_key(c)
+            if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
+                continue  # degenerate (a weight tied across two roles) -- no report row
+
+            label = f"{_node_label(pa.node)} + {_node_label(pb.node)}"
+            family = "matmul_nbits_gated"
+            n = gchain.n_channels
+
+            if (
+                pa_key in producer_touched
+                or pb_key in producer_touched
+                or c_key in consumer_touched
+            ):
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # a shared/tied weight another chain already claimed
+
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # rounds down to nothing for this chain -- no-op
+
+            w_a_nk = _matmul_nbits_chain_producer_weight_nk(pa)
+            w_b_nk = _matmul_nbits_chain_producer_weight_nk(pb)
+            importance = _matmul_nbits_gated_channel_importance(
+                w_a_nk, w_b_nk, importance_norm
+            )
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+            if isinstance(c, _MatMulNBitsWeight):
+                keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                    keep, c.k_blocks, c.block_size
+                )
+                if keep_blocks is None:
+                    layers.append(
+                        PruningLayerSensitivity(
+                            label=label,
+                            family=family,
+                            total=n,
+                            would_drop=0,
+                            margin=None,
+                            importance_min=0.0,
+                            importance_max=0.0,
+                        )
+                    )
+                    continue  # non-block-aligned keep-set for this consumer --
+                    # the real call declines this whole gated group too, see
+                    # this function's own docstring
+            # else: a plain-float consumer has no block structure -- the real
+            # call applies any keep-set directly.
+
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[keep] = True
+
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=int(n - keep_count),
+                    margin=_normalized_margin(importance, keep_mask),
+                    importance_min=float(importance.min()),
+                    importance_max=float(importance.max()),
+                )
+            )
+
+            producer_touched.add(pa_key)
+            producer_touched.add(pb_key)
+            consumer_touched.add(c_key)
+
+        layers.extend(
+            _analyze_matmul_nbits_mlp_chains(
+                mlp_chains,
+                sparsity,
+                importance_norm,
+                producer_touched,
+                consumer_touched,
             )
         )
-
-        producer_touched.add(pa_key)
-        producer_touched.add(pb_key)
-        consumer_touched.add(c_key)
-
-    layers.extend(
-        _analyze_matmul_nbits_mlp_chains(
-            mlp_chains, sparsity, importance_norm, producer_touched, consumer_touched
+        layers.extend(
+            _analyze_matmul_nbits_qkv_chains(
+                qkv_chains,
+                sparsity,
+                importance_norm,
+                producer_touched,
+                consumer_touched,
+            )
         )
-    )
-    layers.extend(
-        _analyze_matmul_nbits_qkv_chains(
-            qkv_chains, sparsity, importance_norm, producer_touched, consumer_touched
-        )
-    )
 
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
@@ -29625,83 +30056,91 @@ def _analyze_structured_pruning_matmul_bnb4(
     `not_eligible` instead -- there is no extra alignment condition still to
     check against the CONSUMER once a chain is already found, since the
     consumer here is always plain-float and has no block structure at all.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment), the dry-run mirror of
+    :func:`apply_structured_pruning_matmul_bnb4`'s own subgraph awareness:
+    `layers`/`not_eligible` are aggregated across every graph, and
+    `producer_touched`/`consumer_touched` are reset per graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
     _validate_importance_norm(importance_norm)
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
 
-    chains = _find_matmul_bnb4_chains(graph)
-    not_eligible = _matmul_bnb4_not_eligible(graph, chains)
-    if not chains:
-        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
-
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
     layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
 
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key, c_key = p.b_init.name, c.w_init.name
-        label = _node_label(p.node)
-        family = "matmul_bnb4"
-        n = chain.n_channels
+    for graph in _iter_subgraphs(model.graph):
+        chains = _find_matmul_bnb4_chains(graph)
+        not_eligible.extend(_matmul_bnb4_not_eligible(graph, chains))
+        if not chains:
+            continue
 
-        if p_key in producer_touched or c_key in consumer_touched:
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
+
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key, c_key = p.b_init.name, c.w_init.name
+            label = _node_label(p.node)
+            family = "matmul_bnb4"
+            n = chain.n_channels
+
+            if p_key in producer_touched or c_key in consumer_touched:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # a shared/tied weight another chain already claimed
+
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # rounds down to nothing for this chain -- no-op
+
+            w_nk = _matmul_bnb4_dequantized(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            # `kind="stable"` to match :func:`apply_structured_pruning_matmul_bnb4`'s
+            # own tie-break exactly, for the same cross-platform-determinism
+            # reason :func:`_analyze_structured_pruning_matmul_nbits`'s own
+            # identical line documents.
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[keep] = True
+
             layers.append(
                 PruningLayerSensitivity(
                     label=label,
                     family=family,
                     total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
+                    would_drop=int(n - keep_count),
+                    margin=_normalized_margin(importance, keep_mask),
+                    importance_min=float(importance.min()),
+                    importance_max=float(importance.max()),
                 )
             )
-            continue  # a shared/tied weight another chain already claimed
 
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue  # rounds down to nothing for this chain -- no-op
-
-        w_nk = _matmul_bnb4_dequantized(p)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        # `kind="stable"` to match :func:`apply_structured_pruning_matmul_bnb4`'s
-        # own tie-break exactly, for the same cross-platform-determinism
-        # reason :func:`_analyze_structured_pruning_matmul_nbits`'s own
-        # identical line documents.
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
-        keep_mask = np.zeros(n, dtype=bool)
-        keep_mask[keep] = True
-
-        layers.append(
-            PruningLayerSensitivity(
-                label=label,
-                family=family,
-                total=n,
-                would_drop=int(n - keep_count),
-                margin=_normalized_margin(importance, keep_mask),
-                importance_min=float(importance.min()),
-                importance_max=float(importance.max()),
-            )
-        )
-
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
 
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
@@ -30396,18 +30835,24 @@ def _analyze_moe_expert_channel_pruning(
     matching (:func:`_find_moe_chains`), keep-count, and importance
     (:func:`_moe_importance`) logic, reused directly, but `model` is never
     mutated.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): `layers`/`not_eligible` are
+    aggregated across every graph, mirroring
+    :func:`apply_moe_expert_channel_pruning`'s own subgraph awareness.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
 
-    chains = _find_moe_chains(graph)
-    layers = _analyze_moe_chains(graph, chains, sparsity, _moe_importance)
-    return PruningSensitivityReport(
-        layers=layers, not_eligible=_moe_not_eligible(graph, chains)
-    )
+    layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
+    for graph in _iter_subgraphs(model.graph):
+        chains = _find_moe_chains(graph)
+        layers.extend(_analyze_moe_chains(graph, chains, sparsity, _moe_importance))
+        not_eligible.extend(_moe_not_eligible(graph, chains))
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
 
 # --- MoE whole-expert family -------------------------------------------
@@ -30509,6 +30954,15 @@ def _analyze_moe_whole_expert_pruning(
     activation was observed for a chain's `router_probs` -- exactly
     :func:`apply_moe_whole_expert_pruning`'s own `_importance` closure)
     logic, reused directly, but `model` is never mutated.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment) for matching, exactly mirroring
+    :func:`apply_moe_whole_expert_pruning`'s own narrower calibration reach
+    (see that function's own docstring): only a chain found in the
+    TOP-LEVEL graph takes part in the calibration probe run at all; a
+    chain matched inside a nested subgraph always falls back to
+    :func:`_moe_expert_weight_importance`. `layers`/`not_eligible` are
+    aggregated across every graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -30518,16 +30972,14 @@ def _analyze_moe_whole_expert_pruning(
         calibration_data = generate_random_calibration_data(
             model, num_samples=num_samples, seed=seed
         )
-    graph = model.graph
 
-    chains = _find_moe_whole_expert_chains(graph)
-    if not chains:
-        return PruningSensitivityReport(
-            layers=[], not_eligible=_moe_not_eligible(graph, chains)
+    top_chains = _find_moe_whole_expert_chains(model.graph)
+    mean_gate_weight = (
+        _moe_router_gate_calibration_stats(
+            model, top_chains, calibration_data, providers
         )
-
-    mean_gate_weight = _moe_router_gate_calibration_stats(
-        model, chains, calibration_data, providers
+        if top_chains
+        else {}
     )
 
     def _importance(
@@ -30538,10 +30990,19 @@ def _analyze_moe_whole_expert_pruning(
             return _moe_expert_weight_importance(chain, initializer_map)
         return gate
 
-    layers = _analyze_moe_whole_expert_chains(graph, chains, sparsity, _importance)
-    return PruningSensitivityReport(
-        layers=layers, not_eligible=_moe_not_eligible(graph, chains)
-    )
+    layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
+    for graph in _iter_subgraphs(model.graph):
+        chains = (
+            top_chains if graph is model.graph else _find_moe_whole_expert_chains(graph)
+        )
+        not_eligible.extend(_moe_not_eligible(graph, chains))
+        if not chains:
+            continue
+        layers.extend(
+            _analyze_moe_whole_expert_chains(graph, chains, sparsity, _importance)
+        )
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
 
 # --- QMoE (quantized-weight MoE) family --------------------------------
@@ -30698,20 +31159,28 @@ def _analyze_qmoe_expert_channel_pruning(
     dispatcher the real function uses to rank, never for the actual
     packed-byte rewrite) logic, reused directly, but `model` is never
     mutated.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): `layers`/`not_eligible` are
+    aggregated across every graph, mirroring
+    :func:`apply_qmoe_expert_channel_pruning`'s own subgraph awareness.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
 
-    chains = _find_qmoe_chains(graph)
-    layers = _analyze_qmoe_channel_chains(
-        graph, chains, sparsity, _qmoe_channel_importance
-    )
-    return PruningSensitivityReport(
-        layers=layers, not_eligible=_qmoe_not_eligible(graph, chains)
-    )
+    layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
+    for graph in _iter_subgraphs(model.graph):
+        chains = _find_qmoe_chains(graph)
+        layers.extend(
+            _analyze_qmoe_channel_chains(
+                graph, chains, sparsity, _qmoe_channel_importance
+            )
+        )
+        not_eligible.extend(_qmoe_not_eligible(graph, chains))
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
 
 def _analyze_qmoe_whole_expert_chains(
@@ -30832,6 +31301,15 @@ def _analyze_qmoe_whole_expert_pruning(
     activation was observed for a chain's `router_probs` -- exactly
     :func:`apply_qmoe_whole_expert_pruning`'s own `_importance` closure)
     logic, reused directly, but `model` is never mutated.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment) for matching, exactly mirroring
+    :func:`apply_qmoe_whole_expert_pruning`'s own narrower calibration
+    reach (see :func:`apply_moe_whole_expert_pruning`'s own docstring for
+    the full reasoning): only a chain found in the TOP-LEVEL graph takes
+    part in the calibration probe run; a chain matched inside a nested
+    subgraph always falls back to :func:`_qmoe_expert_weight_importance`.
+    `layers`/`not_eligible` are aggregated across every graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -30841,16 +31319,14 @@ def _analyze_qmoe_whole_expert_pruning(
         calibration_data = generate_random_calibration_data(
             model, num_samples=num_samples, seed=seed
         )
-    graph = model.graph
 
-    chains = _find_qmoe_whole_expert_chains(graph)
-    if not chains:
-        return PruningSensitivityReport(
-            layers=[], not_eligible=_qmoe_not_eligible(graph, chains)
+    top_chains = _find_qmoe_whole_expert_chains(model.graph)
+    mean_gate_weight = (
+        _moe_router_gate_calibration_stats(
+            model, top_chains, calibration_data, providers
         )
-
-    mean_gate_weight = _moe_router_gate_calibration_stats(
-        model, chains, calibration_data, providers
+        if top_chains
+        else {}
     )
 
     def _importance(
@@ -30861,10 +31337,21 @@ def _analyze_qmoe_whole_expert_pruning(
             return _qmoe_expert_weight_importance(chain, initializer_map)
         return gate
 
-    layers = _analyze_qmoe_whole_expert_chains(graph, chains, sparsity, _importance)
-    return PruningSensitivityReport(
-        layers=layers, not_eligible=_qmoe_not_eligible(graph, chains)
-    )
+    layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
+    for graph in _iter_subgraphs(model.graph):
+        chains = (
+            top_chains
+            if graph is model.graph
+            else _find_qmoe_whole_expert_chains(graph)
+        )
+        not_eligible.extend(_qmoe_not_eligible(graph, chains))
+        if not chains:
+            continue
+        layers.extend(
+            _analyze_qmoe_whole_expert_chains(graph, chains, sparsity, _importance)
+        )
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
 
 # --- MatMulBlockQuantizedFp4Weight/MatMulBlockQuantizedFp8Weight family -----
@@ -30932,72 +31419,43 @@ def _analyze_structured_pruning_matmul_block_quantized_fp8(
     ``MatMulBlockQuantizedFp8Weight``) is also reported `would_drop=0`/
     `margin=None`, mirroring the real call's own decline. A degenerate chain
     naming the exact same weight in both roles gets no report row at all.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment), the dry-run mirror of
+    :func:`apply_structured_pruning_matmul_block_quantized_fp8`'s own
+    subgraph awareness: `layers`/`not_eligible` are aggregated across every
+    graph, and `producer_touched`/`consumer_touched` are reset per graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
     _validate_importance_norm(importance_norm)
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
 
-    chains = _find_fp8_block_quantized_chains(graph)
-    not_eligible = _block_quantized_fp8_not_eligible(graph, chains)
-    if not chains:
-        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
-
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
     layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
 
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key = _fp8_chain_side_key(p)
-        c_key = _fp8_chain_side_key(c)
-        if p_key == c_key:
-            continue  # degenerate (the same weight in both roles) -- no report row
+    for graph in _iter_subgraphs(model.graph):
+        chains = _find_fp8_block_quantized_chains(graph)
+        not_eligible.extend(_block_quantized_fp8_not_eligible(graph, chains))
+        if not chains:
+            continue
 
-        label = _node_label(p.node)
-        family = "matmul_fp8_block_quantized"
-        n = chain.n_channels
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
 
-        if p_key in producer_touched or c_key in consumer_touched:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue  # a shared/tied weight another chain already claimed
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = _fp8_chain_side_key(p)
+            c_key = _fp8_chain_side_key(c)
+            if p_key == c_key:
+                continue  # degenerate (the same weight in both roles) -- no report row
 
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue  # rounds down to nothing for this chain -- no-op
+            label = _node_label(p.node)
+            family = "matmul_fp8_block_quantized"
+            n = chain.n_channels
 
-        w_nk = _fp8_chain_producer_weight_nk(p)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
-
-        if isinstance(c, _BlockQuantizedFp8Weight):
-            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
-                keep, c.k_blocks, c.block_size
-            )
-            if keep_blocks is None:
+            if p_key in producer_touched or c_key in consumer_touched:
                 layers.append(
                     PruningLayerSensitivity(
                         label=label,
@@ -31009,26 +31467,63 @@ def _analyze_structured_pruning_matmul_block_quantized_fp8(
                         importance_max=0.0,
                     )
                 )
-                continue  # non-block-aligned -- the real call declines this
-                # chain entirely too
+                continue  # a shared/tied weight another chain already claimed
 
-        keep_mask = np.zeros(n, dtype=bool)
-        keep_mask[keep] = True
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # rounds down to nothing for this chain -- no-op
 
-        layers.append(
-            PruningLayerSensitivity(
-                label=label,
-                family=family,
-                total=n,
-                would_drop=int(n - keep_count),
-                margin=_normalized_margin(importance, keep_mask),
-                importance_min=float(importance.min()),
-                importance_max=float(importance.max()),
+            w_nk = _fp8_chain_producer_weight_nk(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+            if isinstance(c, _BlockQuantizedFp8Weight):
+                keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                    keep, c.k_blocks, c.block_size
+                )
+                if keep_blocks is None:
+                    layers.append(
+                        PruningLayerSensitivity(
+                            label=label,
+                            family=family,
+                            total=n,
+                            would_drop=0,
+                            margin=None,
+                            importance_min=0.0,
+                            importance_max=0.0,
+                        )
+                    )
+                    continue  # non-block-aligned -- the real call declines this
+                    # chain entirely too
+
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[keep] = True
+
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=int(n - keep_count),
+                    margin=_normalized_margin(importance, keep_mask),
+                    importance_min=float(importance.min()),
+                    importance_max=float(importance.max()),
+                )
             )
-        )
 
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
 
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
@@ -31044,70 +31539,43 @@ def _analyze_structured_pruning_matmul_block_quantized_fp4(
     ``"matmul_fp4_block_quantized"``; block-alignment uses
     :func:`_fp4_block_aligned_keep_blocks` (the additional even-resulting-K
     check), matching the real call exactly.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment), mirroring
+    :func:`_analyze_structured_pruning_matmul_block_quantized_fp8`'s own --
+    `layers`/`not_eligible` are aggregated across every graph, and
+    `producer_touched`/`consumer_touched` are reset per graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
     _validate_importance_norm(importance_norm)
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
 
-    chains = _find_fp4_block_quantized_chains(graph)
-    not_eligible = _block_quantized_fp4_not_eligible(graph, chains)
-    if not chains:
-        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
-
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
     layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
 
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key = _fp4_chain_side_key(p)
-        c_key = _fp4_chain_side_key(c)
-        if p_key == c_key:
+    for graph in _iter_subgraphs(model.graph):
+        chains = _find_fp4_block_quantized_chains(graph)
+        not_eligible.extend(_block_quantized_fp4_not_eligible(graph, chains))
+        if not chains:
             continue
 
-        label = _node_label(p.node)
-        family = "matmul_fp4_block_quantized"
-        n = chain.n_channels
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
 
-        if p_key in producer_touched or c_key in consumer_touched:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = _fp4_chain_side_key(p)
+            c_key = _fp4_chain_side_key(c)
+            if p_key == c_key:
+                continue
 
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue
+            label = _node_label(p.node)
+            family = "matmul_fp4_block_quantized"
+            n = chain.n_channels
 
-        w_nk = _fp4_chain_producer_weight_nk(p)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
-
-        if isinstance(c, _BlockQuantizedFp4Weight):
-            keep_blocks = _fp4_block_aligned_keep_blocks(keep, c.k_blocks, c.block_size)
-            if keep_blocks is None:
+            if p_key in producer_touched or c_key in consumer_touched:
                 layers.append(
                     PruningLayerSensitivity(
                         label=label,
@@ -31121,23 +31589,60 @@ def _analyze_structured_pruning_matmul_block_quantized_fp4(
                 )
                 continue
 
-        keep_mask = np.zeros(n, dtype=bool)
-        keep_mask[keep] = True
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue
 
-        layers.append(
-            PruningLayerSensitivity(
-                label=label,
-                family=family,
-                total=n,
-                would_drop=int(n - keep_count),
-                margin=_normalized_margin(importance, keep_mask),
-                importance_min=float(importance.min()),
-                importance_max=float(importance.max()),
+            w_nk = _fp4_chain_producer_weight_nk(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+            if isinstance(c, _BlockQuantizedFp4Weight):
+                keep_blocks = _fp4_block_aligned_keep_blocks(
+                    keep, c.k_blocks, c.block_size
+                )
+                if keep_blocks is None:
+                    layers.append(
+                        PruningLayerSensitivity(
+                            label=label,
+                            family=family,
+                            total=n,
+                            would_drop=0,
+                            margin=None,
+                            importance_min=0.0,
+                            importance_max=0.0,
+                        )
+                    )
+                    continue
+
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[keep] = True
+
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=int(n - keep_count),
+                    margin=_normalized_margin(importance, keep_mask),
+                    importance_min=float(importance.min()),
+                    importance_max=float(importance.max()),
+                )
             )
-        )
 
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
 
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
@@ -31180,83 +31685,91 @@ def _analyze_structured_pruning_qoperator(
     A degenerate chain naming the exact same weight in both the producer and
     consumer role gets no report row at all, mirroring
     :func:`_analyze_structured_pruning_qdq`'s own identical treatment.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment), the dry-run mirror of
+    :func:`apply_structured_pruning_qoperator`'s own subgraph awareness:
+    `layers`/`not_eligible` are aggregated across every graph, and
+    `producer_touched`/`consumer_touched` are reset per graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
     _validate_importance_norm(importance_norm)
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
 
-    chains = _find_qop_chains(graph)
-    not_eligible = _qop_not_eligible(graph, chains)
-    if not chains:
-        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
-
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
     layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
 
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key = p.w_init.name
-        c_key = c.w_init.name
-        if p_key == c_key:
-            continue  # degenerate (the same weight in both roles) -- no report row
+    for graph in _iter_subgraphs(model.graph):
+        chains = _find_qop_chains(graph)
+        not_eligible.extend(_qop_not_eligible(graph, chains))
+        if not chains:
+            continue
 
-        label = _node_label(p.node)
-        family = "qoperator_conv" if p.op_kind == "conv" else "qoperator_matmul"
-        n = chain.n_channels
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
 
-        if p_key in producer_touched or c_key in consumer_touched:
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = p.w_init.name
+            c_key = c.w_init.name
+            if p_key == c_key:
+                continue  # degenerate (the same weight in both roles) -- no report row
+
+            label = _node_label(p.node)
+            family = "qoperator_conv" if p.op_kind == "conv" else "qoperator_matmul"
+            n = chain.n_channels
+
+            if p_key in producer_touched or c_key in consumer_touched:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # a shared/tied weight another chain already claimed
+
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # rounds down to nothing for this chain -- no-op
+
+            w_nk = _qop_dequantized_nk(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[keep] = True
+
             layers.append(
                 PruningLayerSensitivity(
                     label=label,
                     family=family,
                     total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
+                    would_drop=int(n - keep_count),
+                    margin=_normalized_margin(importance, keep_mask),
+                    importance_min=float(importance.min()),
+                    importance_max=float(importance.max()),
                 )
             )
-            continue  # a shared/tied weight another chain already claimed
 
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue  # rounds down to nothing for this chain -- no-op
-
-        w_nk = _qop_dequantized_nk(p)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
-        keep_mask = np.zeros(n, dtype=bool)
-        keep_mask[keep] = True
-
-        layers.append(
-            PruningLayerSensitivity(
-                label=label,
-                family=family,
-                total=n,
-                would_drop=int(n - keep_count),
-                margin=_normalized_margin(importance, keep_mask),
-                importance_min=float(importance.min()),
-                importance_max=float(importance.max()),
-            )
-        )
-
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
 
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
@@ -31312,83 +31825,91 @@ def _analyze_structured_pruning_dynamic_quantize_matmul(
     A degenerate chain naming the exact same weight in both the producer
     and consumer role gets no report row at all, mirroring
     :func:`_analyze_structured_pruning_qoperator`'s own identical treatment.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment), the dry-run mirror of
+    :func:`apply_structured_pruning_dynamic_quantize_matmul`'s own subgraph
+    awareness: `layers`/`not_eligible` are aggregated across every graph,
+    and `producer_touched`/`consumer_touched` are reset per graph.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
     _validate_importance_norm(importance_norm)
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
 
-    chains = _find_dynquant_chains(graph)
-    not_eligible = _dynquant_not_eligible(graph, chains)
-    if not chains:
-        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
-
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
     layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
 
-    for chain in chains:
-        p, c = chain.producer, chain.consumer
-        p_key = _dynquant_chain_side_key(p)
-        c_key = _dynquant_chain_side_key(c)
-        if p_key == c_key:
-            continue  # degenerate (the same weight in both roles) -- no report row
+    for graph in _iter_subgraphs(model.graph):
+        chains = _find_dynquant_chains(graph)
+        not_eligible.extend(_dynquant_not_eligible(graph, chains))
+        if not chains:
+            continue
 
-        label = _node_label(p.node)
-        family = "dynamic_quantize_matmul"
-        n = chain.n_channels
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
 
-        if p_key in producer_touched or c_key in consumer_touched:
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = _dynquant_chain_side_key(p)
+            c_key = _dynquant_chain_side_key(c)
+            if p_key == c_key:
+                continue  # degenerate (the same weight in both roles) -- no report row
+
+            label = _node_label(p.node)
+            family = "dynamic_quantize_matmul"
+            n = chain.n_channels
+
+            if p_key in producer_touched or c_key in consumer_touched:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # a shared/tied weight another chain already claimed
+
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # rounds down to nothing for this chain -- no-op
+
+            w_nk = _dynquant_chain_producer_weight_nk(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[keep] = True
+
             layers.append(
                 PruningLayerSensitivity(
                     label=label,
                     family=family,
                     total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
+                    would_drop=int(n - keep_count),
+                    margin=_normalized_margin(importance, keep_mask),
+                    importance_min=float(importance.min()),
+                    importance_max=float(importance.max()),
                 )
             )
-            continue  # a shared/tied weight another chain already claimed
 
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue  # rounds down to nothing for this chain -- no-op
-
-        w_nk = _dynquant_chain_producer_weight_nk(p)
-        importance = _qdq_channel_importance(w_nk, importance_norm)
-        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
-        keep_mask = np.zeros(n, dtype=bool)
-        keep_mask[keep] = True
-
-        layers.append(
-            PruningLayerSensitivity(
-                label=label,
-                family=family,
-                total=n,
-                would_drop=int(n - keep_count),
-                margin=_normalized_margin(importance, keep_mask),
-                importance_min=float(importance.min()),
-                importance_max=float(importance.max()),
-            )
-        )
-
-        producer_touched.add(p_key)
-        consumer_touched.add(c_key)
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
 
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
@@ -31500,20 +32021,36 @@ def _analyze_embedding_vocab_magnitude_pruning(
     the same thing whichever producer shape matched, so no separate family
     name is introduced for it (see this module's own "Embedding / lm_head
     vocabulary pruning" section comment for the full scope decision).
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment) exactly the same way
+    :func:`apply_embedding_vocab_magnitude_pruning` is -- see
+    :func:`_match_embedding_chain_any_graph`'s own docstring: the one
+    eligible embedding producer this function requires may live inside a
+    nested ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph, at any
+    nesting depth, not only the top-level graph, and the "exactly one
+    eligible producer, or decline" rule applies across the whole model.
+    `not_eligible` is aggregated across every graph (:func:`_embedding_not_eligible`
+    called once per graph, `chain` -- found in at most one of them -- only
+    ever excludes its own producer from that one graph's own contribution).
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
 
-    chain = _match_embedding_chain(graph, input_name)
-    not_eligible = _embedding_not_eligible(graph, chain, input_name)
+    _match_graph, chain = _match_embedding_chain_any_graph(model.graph, input_name)
+    not_eligible = [
+        n
+        for graph in _iter_subgraphs(model.graph)
+        for n in _embedding_not_eligible(graph, chain, input_name)
+    ]
     if chain is None:
         return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
 
     vocab_size = chain.vocab_size
-    initializer_map = {t.name: t for t in graph.initializer}
+    assert _match_graph is not None
+    initializer_map = {t.name: t for t in _match_graph.initializer}
     importance = _embedding_vocab_importance(chain, initializer_map)
 
     protect = {int(i) for i in (protect_token_ids or ())}
@@ -31621,6 +32158,16 @@ def _analyze_transformer_block_pruning(
     :func:`apply_transformer_block_pruning`'s own docstring), only the
     sign convention this report's own `importance_min`/`importance_max`/
     `margin` fields are expressed in.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment) exactly the same way
+    :func:`apply_transformer_block_pruning` is -- see that function's own
+    docstring for the full reasoning (pooled `target`/ranking/selection
+    across every graph combined; a nested-subgraph candidate gets this
+    function's own existing "no evidence" ``float("-inf")`` similarity,
+    never probed, ranked last but still a real reportable/droppable
+    candidate). `total`/`label`/`not_eligible` all reflect every graph's
+    own candidates pooled together, not just the top-level graph's.
     """
     if num_blocks_to_drop is not None:
         if num_blocks_to_drop < 0:
@@ -31632,21 +32179,32 @@ def _analyze_transformer_block_pruning(
 
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
 
     try:
         inferred = onnx.shape_inference.infer_shapes(model, strict_mode=False)
-        value_info_by_name = _value_info_by_name(inferred.graph)
+        top_value_info_by_name = _value_info_by_name(inferred.graph)
     except Exception:
-        value_info_by_name = _value_info_by_name(graph)
+        top_value_info_by_name = _value_info_by_name(model.graph)
 
-    candidates = _find_transformer_block_candidates(graph, value_info_by_name)
-    not_eligible = _transformer_block_not_eligible(graph, candidates)
-    if not candidates:
+    all_candidates: List[_DroppableBlock] = []
+    is_top_level: List[bool] = []
+    not_eligible: List[str] = []
+
+    for graph in _iter_subgraphs(model.graph):
+        is_top = graph is model.graph
+        value_info_by_name = (
+            top_value_info_by_name if is_top else _value_info_by_name(graph)
+        )
+        candidates = _find_transformer_block_candidates(graph, value_info_by_name)
+        not_eligible.extend(_transformer_block_not_eligible(graph, candidates))
+        all_candidates.extend(candidates)
+        is_top_level.extend([is_top] * len(candidates))
+
+    if not all_candidates:
         return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
 
-    label = " + ".join(_node_label(c.merge_node) for c in candidates)
-    total = len(candidates)
+    label = " + ".join(_node_label(c.merge_node) for c in all_candidates)
+    total = len(all_candidates)
 
     if num_blocks_to_drop is not None:
         target = min(num_blocks_to_drop, total)
@@ -31674,15 +32232,32 @@ def _analyze_transformer_block_pruning(
             model, num_samples=num_samples, seed=seed
         )
 
-    similarity = _transformer_block_similarity(
-        model, candidates, calibration_data, providers
+    top_candidates = [c for c, t in zip(all_candidates, is_top_level) if t]
+    top_similarity = (
+        _transformer_block_similarity(
+            model, top_candidates, calibration_data, providers
+        )
+        if top_candidates
+        else {}
     )
+    similarity: List[float] = []
+    top_i = 0
+    for t in is_top_level:
+        if t:
+            similarity.append(top_similarity[top_i])
+            top_i += 1
+        else:
+            # Not probeable -- see this function's own docstring.
+            similarity.append(float("-inf"))
+
     ranked_idx = sorted(range(total), key=lambda i: similarity[i], reverse=True)
-    ranked = [candidates[i] for i in ranked_idx]
+    ranked = [all_candidates[i] for i in ranked_idx]
     committed_ids = {id(c.merge_node) for c in _select_droppable_blocks(ranked, target)}
 
     importance = np.array([-similarity[i] for i in range(total)])
-    keep_mask = np.array([id(c.merge_node) not in committed_ids for c in candidates])
+    keep_mask = np.array(
+        [id(c.merge_node) not in committed_ids for c in all_candidates]
+    )
 
     return PruningSensitivityReport(
         layers=[
