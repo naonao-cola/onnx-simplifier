@@ -4,6 +4,14 @@ calibration-based static quantization via PPQ's own calibration/observer
 algorithms and quantization scheduler instead of onnxsim's own
 :func:`onnxsim.quantize_static`.
 
+**PPQ itself appears unmaintained and is confirmed broken against any
+current environment (see below) -- for a PPQ-API-shaped interface that
+actually works today, with no PPQ install at all, prefer
+:mod:`onnxsim.ppq_compat` instead of this module.** This module remains
+for whoever specifically needs real PPQ's own dispatch/optimization
+machinery in an environment where its incompatibilities have been
+separately worked around.
+
 **Confirmed, not speculative: the latest PyPI release (``ppq==0.6.6`` at the
 time this was written) cannot be imported at all in an environment with the
 modern ``onnx``/``protobuf`` versions onnxsim itself requires.** Verified by
