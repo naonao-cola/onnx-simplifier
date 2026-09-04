@@ -20,6 +20,7 @@ namespace onnxsim {
 //   - fuse_mul_into_conv
 //   - fuse_preceding_mul_into_conv
 //   - fuse_consecutive_mul
+//   - fuse_consecutive_reduce
 //   - fuse_matmul_add_bias_into_gemm_batched
 //   - fuse_matmul_into_conv
 //   - eliminate_reshape_around_elementwise
