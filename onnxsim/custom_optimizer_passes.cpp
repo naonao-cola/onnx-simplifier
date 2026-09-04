@@ -16,6 +16,7 @@
 #include "passes/dynamic_quantize_matmul.h"
 #include "passes/dynamic_quantize_matmul_integer_to_float.h"
 #include "passes/dynamic_quantize_ternary_matmul.h"
+#include "passes/eliminate_consecutive_idempotent_ops.h"
 #include "passes/eliminate_loop_with_const_trip_count.h"
 #include "passes/eliminate_nop_dropout.h"
 #include "passes/eliminate_optional_get_element.h"
@@ -28,6 +29,7 @@
 #include "passes/fuse_bn_into_conv.h"
 #include "passes/fuse_consecutive_mul.h"
 #include "passes/fuse_consecutive_reduce.h"
+#include "passes/fuse_consecutive_reshapes.h"
 #include "passes/fuse_consecutive_unsqueezes.h"
 #include "passes/fuse_gelu.h"
 #include "passes/fuse_gqa.h"
@@ -39,6 +41,7 @@
 #include "passes/fuse_pad_into_pool.h"
 #include "passes/fuse_preceding_mul_into_conv.h"
 #include "passes/fuse_qkv.h"
+#include "passes/fuse_reshape_family.h"
 #include "passes/fuse_rms_norm.h"
 #include "passes/fuse_rope.h"
 #include "passes/magnitude_pruning.h"
@@ -120,6 +123,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseAttention>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);
     RegisterOrReplace<p::FuseConsecutiveReduce>(registry);
+    RegisterOrReplace<p::FuseConsecutiveReshapes>(registry);
     RegisterOrReplace<p::FuseGelu>(registry);
     RegisterOrReplace<p::FuseGQA>(registry);
     RegisterOrReplace<p::FuseLayerNorm>(registry);
@@ -127,6 +131,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseMatMulIntoConv>(registry);
     RegisterOrReplace<p::FuseMulIntoConv>(registry);
     RegisterOrReplace<p::FusePrecedingMulIntoConv>(registry);
+    RegisterOrReplace<p::FuseReshapeFamily>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::FuseRope>(registry);
     RegisterOrReplace<p::MagnitudePruningConv>(registry);
@@ -165,6 +170,7 @@ void RegisterCustomOptimizerPasses() {
     // names, so onnxsim's fixes/extensions (ConvTranspose fusions, no-op
     // opset-12 Dropout, zero-padding MaxPool, ...) apply while the fork itself
     // tracks upstream onnxoptimizer.
+    RegisterOrReplace<p::EliminateConsecutiveIdempotentOps>(registry);
     RegisterOrReplace<p::EliminateNopDropout>(registry);
     RegisterOrReplace<p::FuseAddBiasIntoConv>(registry);
     RegisterOrReplace<p::FuseBNIntoConv>(registry);

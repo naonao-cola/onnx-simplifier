@@ -753,6 +753,140 @@ def test_fuse_concat_into_reshape():
     assert ops["Reshape"] == 1
 
 
+def test_fuse_consecutive_reshapes():
+    # Only the final target shape matters -- Reshape(Reshape(X, s1), s2)
+    # collapses to Reshape(X, s2) (fuse_consecutive_reshapes).
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[3,8] Y)
+        <int64[2] s1 = {6,4}, int64[2] s2 = {3,8}>
+        {
+          y = Reshape(X, s1)
+          Y = Reshape(y, s2)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["Reshape"] == 1
+
+
+def test_fuse_consecutive_reshapes_chain():
+    # A longer chain collapses all the way down to the final reshape.
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[3,8] Y)
+        <int64[2] s1 = {4,6}, int64[2] s2 = {2,12}, int64[2] s3 = {3,8}>
+        {
+          y1 = Reshape(X, s1)
+          y2 = Reshape(y1, s2)
+          Y = Reshape(y2, s3)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["Reshape"] == 1
+
+
+def test_fuse_consecutive_reshapes_declines_ambiguous_zero_copy():
+    # The outer reshape's `0` (under the default allowzero=0) means "copy
+    # this dim from the node's own input", i.e. from the inner reshape's
+    # output shape [2,3,4] (dim0=2) -- not from X's shape [6,4] (dim0=6).
+    # Fusing the two would silently change which shape the `0` copies from,
+    # so the pass must leave this chain alone.
+    model = _model(
+        """
+        g (float[6,4] X) => (float[2,12] Y)
+        <int64[3] s1 = {2,3,4}, int64[2] s2 = {0,-1}>
+        {
+          y = Reshape(X, s1)
+          Y = Reshape(y, s2)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["Reshape"] == 2
+
+
+def test_fuse_reshape_family_flatten_then_reshape():
+    # Flatten and Reshape both just rearrange a tensor's shape, so a Flatten
+    # immediately followed by a Reshape collapses into one Reshape
+    # (fuse_reshape_family), same as two consecutive Reshapes would.
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[3,8] Y)
+        <int64[2] s = {3,8}>
+        {
+          y = Flatten<axis = 1>(X)
+          Y = Reshape(y, s)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["Flatten"] == 0
+    assert ops["Reshape"] == 1
+
+
+def test_fuse_reshape_family_squeeze_then_reshape():
+    # Squeeze followed by Reshape collapses the same way.
+    model = _model(
+        """
+        g (float[1,2,3,4] X) => (float[6,4] Y)
+        <int64[1] axes = {0}, int64[2] s = {6,4}>
+        {
+          y = Squeeze(X, axes)
+          Y = Reshape(y, s)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["Squeeze"] == 0
+    assert ops["Reshape"] == 1
+
+
+def test_fuse_reshape_family_reshape_then_squeeze():
+    # The *outer* op need not be Reshape either -- Reshape followed by
+    # Squeeze collapses to a single Reshape (the outer Squeeze is replaced,
+    # not just bypassed).
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[2,12] Y)
+        <int64[3] s = {2,1,12}, int64[1] axes = {1}>
+        {
+          y = Reshape(X, s)
+          Y = Squeeze(y, axes)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["Squeeze"] == 0
+    assert ops["Reshape"] == 1
+
+
+def test_fuse_reshape_family_declines_unresolved_output_shape():
+    # y's shape ([N, unk__0]) has two independent unresolved dims -- N and M
+    # are both symbolic -- and Unsqueeze's shape inference can't propagate a
+    # rank for Y from that, so the pass has no target shape to fuse to and
+    # must leave both nodes (rather than, say, guess a scalar target from an
+    # empty shape). N and M are dynamic, so this calls onnxsim.simplify
+    # directly with check_n=0 -- onnxsim's random-input equivalence check
+    # needs concrete dims -- and only asserts on graph structure.
+    model = _model(
+        """
+        g (float[N,M,4,5] X) => (float Y)
+        <int64[1] axes = {0}>
+        {
+          y = Flatten<axis = 1>(X)
+          Y = Unsqueeze(y, axes)
+        }
+        """
+    )
+    sim_model, _ = onnxsim.simplify(model, check_n=0)
+    ops = collections.Counter(n.op_type for n in sim_model.graph.node)
+    assert ops["Flatten"] == 1
+    assert ops["Unsqueeze"] == 1
+    assert ops["Reshape"] == 0
+
+
 # --------------------------------------------------------------------------- #
 # Dead-node / no-op elimination
 # --------------------------------------------------------------------------- #
