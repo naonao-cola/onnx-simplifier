@@ -873,6 +873,87 @@ depthwise extreme (``group == Cin == Cout``, ``Cin/group == 1``), where
 each group's own Hessian correctly degenerates to a ``[kh*kw, kh*kw]``
 per-channel Hessian rather than anything degenerate or wrong at that
 boundary.
+
+Subgraph recursion (nested ``If``/``Loop``/``Scan``/``BeamSearch``-family
+graphs): every function above this paragraph was, until this note was
+added, blind to any node's ``GRAPH``-/``GRAPHS``-typed attribute -- a
+plain ``If``'s ``then_branch``/``else_branch``, ``Loop``/``Scan``'s
+``body``, or (confirmed live against onnxruntime's own contrib-op schema
+registry) ``com.microsoft::BeamSearch``/``GreedySearch``/``Sampling``/
+``WhisperBeamSearch``'s own ``decoder``/``encoder``/``init_decoder``
+attribute. Each of those is itself a full ``GraphProto`` that can carry
+arbitrary weight-bearing nodes -- for a whole-model-generation export
+(``onnxruntime.transformers.models.{t5,gpt2,whisper}.convert_generation``),
+essentially 100% of the actual prunable weight lives inside exactly one of
+these, invisible to every pass in this module, with no error and no report
+entry, until now. See :func:`_iter_subgraphs` and this module's own
+"Subgraph recursion" section comment (just above :func:`_iter_subgraphs`'s
+own definition) for the shared traversal primitive and the two
+correctness properties (implicit-capture scoping, no cross-scope
+initializer slicing) every subgraph-aware function below gets for free by
+construction.
+
+Subgraph-aware as of this note: :func:`weight_sparsity` (its pooled
+zero-fraction now sums across every nested subgraph too, not just the
+top-level graph -- otherwise it would be actively misleading, not merely
+incomplete, on a model whose real weight lives almost entirely inside one),
+:func:`apply_magnitude_pruning` (including its own `global_sparsity` mode,
+which pools every matched layer across every graph -- top-level and every
+nested subgraph alike -- into the one shared global ranking, consistent
+with "global" meaning the whole model), :func:`apply_structured_pruning`
+(every chain family it matches, with its own `global_sparsity` mode pooled
+*independently per graph* rather than across the whole model -- see that
+function's own docstring for exactly why), and
+:func:`apply_attention_head_pruning` (every block family it matches; a
+nested subgraph's own dynamic per-head bias/mask/head_sink classification
+is conservatively less capable than the top-level graph's own -- see that
+function's own docstring for exactly why and what that means in practice).
+
+Deliberately NOT subgraph-aware yet, a scope decision rather than an
+oversight -- each remains exactly as top-level-graph-only as it already
+was:
+
+- Every calibration-data-driven function
+  (:func:`apply_wanda_pruning`, :func:`apply_structured_wanda_pruning`,
+  :func:`apply_attention_head_wanda_pruning`, :func:`apply_sparsegpt_pruning`,
+  and any `_analyze_*` mirror of one of these reached through
+  :func:`analyze_pruning_sensitivity`): each works by adding extra graph
+  OUTPUTS to a probe copy of the model (:func:`_add_probe_outputs`) and
+  reading their values back from a real ``InferenceSession`` run. A tensor
+  that is only ever produced *inside* a nested subgraph has no such direct
+  route to becoming a top-level graph output -- doing this correctly would
+  need a new mechanism to hoist a probe value out through every enclosing
+  ``If``/``Loop`` node's own `output` list (extending each such node's own
+  output arity, and, for `If`, keeping `then_branch`/`else_branch` outputs
+  in lock-step, and for `Loop`, reconciling with its scan-output stacking
+  semantics), all the way up to the top level, and recursively so for a
+  subgraph nested inside another subgraph -- a materially different,
+  higher-risk engineering problem from applying an already-self-contained
+  per-graph matcher/slicer to more graphs, and out of scope for this
+  change.
+- Every other structural `apply_structured_pruning_*` family variant
+  (QDQ, MatMulNBits, MatMulBnb4, the FP8/FP4 block-quantized weight
+  families, QOperator, DynamicQuantizeMatMul, both MoE families
+  (expert-channel and whole-expert) and their QMoE counterparts, the
+  embedding/vocabulary family, and :func:`apply_transformer_block_pruning`)
+  follows the same generic `graph = out.graph` -> chain-find -> slice
+  shape :func:`apply_structured_pruning` does, and the same
+  :func:`_iter_subgraphs`-loop treatment applies to each mechanically --
+  but each is its own several-hundred-line, independently-tested function
+  body, and wiring roughly fifteen more of them through in the same change
+  was judged too large a single PR's worth of surface to review safely
+  alongside the four entry points above, which already cover this
+  module's two most emblematic scope gaps (SparseGPT-shaped no-calibration
+  structural pruning and the "sparsity report is actively misleading"
+  case). Left for a follow-up change; the pattern established by
+  :func:`apply_structured_pruning`'s own edit is the template to repeat.
+- :func:`analyze_pruning_sensitivity` itself dispatches to nineteen
+  separate `_analyze_*` implementations (one per supported `apply_fn`),
+  each with its own bespoke top-level-graph-only body mirroring its real
+  `apply_*` counterpart -- extending it would mean the same per-function
+  treatment as the point above, all nineteen of them, not a change to
+  :func:`analyze_pruning_sensitivity` itself; deferred for the same
+  review-size reason.
 """
 
 from __future__ import annotations
@@ -1255,6 +1336,103 @@ def _match_attention_weight_only(
     if info is None:
         return None
     return node.input[0], node.input[1]
+
+
+# --- Subgraph recursion -------------------------------------------------
+#
+# Every function above this section operates on a single ``GraphProto`` --
+# historically always ``model.graph``/``out.graph``, the top-level graph.
+# That leaves an entire class of real models invisible to every pass in
+# this module: a plain ``If``/``Loop``/``Scan`` node's ``then_branch``/
+# ``else_branch``/``body`` attribute, or (confirmed live against
+# onnxruntime's own contrib-op schema registry, ``AttrType.GRAPH``-typed)
+# ``com.microsoft::BeamSearch``/``GreedySearch``/``Sampling``/
+# ``WhisperBeamSearch``'s own ``decoder``/``encoder``/``init_decoder``
+# attributes, is itself a full ``GraphProto`` that can carry arbitrary
+# weight-bearing nodes -- for a whole-model-generation export produced by
+# ``onnxruntime.transformers.models.{t5,gpt2,whisper}.convert_generation``,
+# essentially 100% of the actual prunable weight lives inside exactly one
+# of these, not in the top-level graph at all.
+#
+# :func:`_iter_subgraphs` is the one shared primitive every subgraph-aware
+# entry point below builds on: it walks `graph`'s own `node` list, and
+# recursively every nested `GraphProto` reachable from any node's
+# `GRAPH`-/`GRAPHS`-typed attribute (genuinely recursive -- a subgraph's
+# own nodes can themselves carry further-nested subgraphs, e.g. an `If`
+# inside a `Loop` body), keyed purely on `onnx.AttributeProto.type` rather
+# than a per-op-name allowlist, so it needs no update when some future op
+# adds another graph-typed attribute.
+#
+# Every graph :func:`_iter_subgraphs` returns is then handed, completely
+# independently, to this module's existing per-graph chain-finders/
+# candidate-matchers/slicers UNCHANGED -- never merged with any sibling or
+# ancestor graph's own state. This is deliberate, not an oversight, and is
+# what makes the two correctness properties below hold for free, with no
+# extra bookkeeping:
+#
+# - Implicit-capture scoping: ONNX lets a subgraph's own node reference a
+#   name defined in an ENCLOSING graph's scope rather than its own
+#   `node`/`initializer` list (e.g. an `If` branch reading a weight that
+#   actually lives in the top-level graph's `initializer`). Every matcher
+#   in this module resolves a weight/value strictly via
+#   ``{t.name: t for t in graph.initializer}``/consumer maps built from
+#   the one `graph` it was given -- never the caller's own enclosing
+#   scope -- so a node whose input only resolves in an outer scope simply
+#   fails to match (`initializer_map.get(name) is None`, or the input
+#   isn't found as an internal producer at all) and that chain is
+#   declined, the same "decline rather than mis-slice" behavior this
+#   module already applies to every other unresolvable topology. No
+#   subgraph is ever treated as if it could see outward.
+# - Shared initializers across scopes: since every one of this module's
+#   slicers only ever mutates a tensor found in the CURRENT graph's own
+#   `initializer` list (never a parent's), and a parent-scope initializer
+#   an inner graph merely *reads* by implicit capture is -- by the point
+#   above -- never even matched as prunable from inside that inner graph,
+#   there is no path by which processing a subgraph could reach into, and
+#   corrupt, a tensor that actually belongs to (and is separately, safely
+#   processed as part of) an ancestor or sibling graph's own pass.
+#
+# What subgraph recursion does NOT change: shape/type validity. A
+# subgraph's own declared output `value_info` must still describe
+# whatever the actual (possibly now-differently-shaped, post-pruning)
+# tensor is once pruning is done -- exactly the same "keep the graph
+# valid, not just runnable" bar this module already holds for the
+# top-level graph everywhere else; a fixed (non-symbolic) subgraph output
+# dim that this module's ordinary `graph.value_info` staleness-eviction
+# doesn't reach (only interior `value_info` is evicted, never `input`/
+# `output`) is exactly the same kind of pre-existing "caller-declared,
+# not this module's to override" limitation this module already accepts
+# for the top-level graph's own inputs/outputs.
+#
+# Coverage is intentionally NOT comprehensive across every `apply_*`/
+# `analyze_*` function in this module -- see each subgraph-aware
+# function's own docstring for exactly what it covers, and this module's
+# own top-of-file docstring for the full list of what remains top-level-
+# graph-only and why.
+def _iter_subgraphs(graph: onnx.GraphProto) -> List[onnx.GraphProto]:
+    """Returns `graph` itself, first, followed by every ``GraphProto``
+    nested (recursively, to any depth) inside any of `graph`'s own nodes'
+    ``GRAPH``-/``GRAPHS``-typed attributes -- depth-first, in `graph.node`
+    then `node.attribute` declaration order, recursing into a found
+    subgraph's own nested subgraphs before moving on to the next node.
+    Matches purely by `onnx.AttributeProto.type`, so it needs no
+    op-specific allowlist: plain ``If``'s ``then_branch``/``else_branch``,
+    ``Loop``/``Scan``'s ``body``, and any other current or future op with
+    a graph-typed attribute (e.g. ``com.microsoft::BeamSearch``'s own
+    ``decoder``/``encoder``/``init_decoder``) are all picked up the same
+    way. See this section's own top comment for why every caller below is
+    safe to run its existing single-graph logic on each returned graph
+    completely independently.
+    """
+    graphs = [graph]
+    for node in graph.node:
+        for attr in node.attribute:
+            if attr.type == onnx.AttributeProto.GRAPH:
+                graphs.extend(_iter_subgraphs(attr.g))
+            elif attr.type == onnx.AttributeProto.GRAPHS:
+                for g in attr.graphs:
+                    graphs.extend(_iter_subgraphs(g))
+    return graphs
 
 
 def _candidates(
@@ -1824,6 +2002,20 @@ def apply_magnitude_pruning(
             to the target pattern; layers with a non-constant weight, a
             non-2-D MatMul/Gemm weight, or a non-4-D Conv weight are left
             untouched
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): every matched layer inside a
+    nested ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph, at any
+    nesting depth, is matched and masked exactly as if it were its own
+    top-level graph -- :func:`_candidates` is given one subgraph's own
+    `node`/`initializer` list at a time, so a chain that would need to
+    reach an implicitly-captured name from an enclosing scope is declined
+    (never matched at all) rather than mis-resolved. In `global_sparsity`
+    mode, every matched layer across every graph (top-level and every
+    nested subgraph alike) is pooled into the *same* single global ranking
+    -- consistent with "global" meaning the whole model, not just its
+    top-level graph -- so `sparsity`'s fraction is chosen from, and applied
+    to, that combined pool.
     """
     _validate_pattern(sparsity, n, m)
     if global_sparsity and n is not None:
@@ -1836,34 +2028,35 @@ def apply_magnitude_pruning(
 
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    initializer_map = {t.name: t for t in out.graph.initializer}
-
-    candidates = _candidates(out.graph)
 
     if global_sparsity:
         entries = []
-        for _, _, w_name, weight_transposed, is_conv in candidates:
-            w_init = initializer_map[w_name]
-            w = _to_f64(w_init)
-            w_nk = _weight_to_nk(w, weight_transposed, is_conv)
-            entries.append(
-                (w_init, weight_transposed, is_conv, w.shape, w_nk, np.abs(w_nk))
-            )
+        for graph in _iter_subgraphs(out.graph):
+            initializer_map = {t.name: t for t in graph.initializer}
+            for _, _, w_name, weight_transposed, is_conv in _candidates(graph):
+                w_init = initializer_map[w_name]
+                w = _to_f64(w_init)
+                w_nk = _weight_to_nk(w, weight_transposed, is_conv)
+                entries.append(
+                    (w_init, weight_transposed, is_conv, w.shape, w_nk, np.abs(w_nk))
+                )
         _apply_global_unstructured_pruning(entries, sparsity)
         return out
 
-    for _, _, w_name, weight_transposed, is_conv in candidates:
-        w_init = initializer_map[w_name]
+    for graph in _iter_subgraphs(out.graph):
+        initializer_map = {t.name: t for t in graph.initializer}
+        for _, _, w_name, weight_transposed, is_conv in _candidates(graph):
+            w_init = initializer_map[w_name]
 
-        def importance_of_nk(w_nk, n=n, m=m, sparsity=sparsity):
-            importance = np.abs(w_nk)
-            return (
-                _nm_mask(importance, n, m)
-                if n is not None
-                else _sparsity_mask(importance, sparsity)
-            )
+            def importance_of_nk(w_nk, n=n, m=m, sparsity=sparsity):
+                importance = np.abs(w_nk)
+                return (
+                    _nm_mask(importance, n, m)
+                    if n is not None
+                    else _sparsity_mask(importance, sparsity)
+                )
 
-        _prune_weight(w_init, weight_transposed, importance_of_nk, is_conv=is_conv)
+            _prune_weight(w_init, weight_transposed, importance_of_nk, is_conv=is_conv)
 
     return out
 
@@ -2251,18 +2444,37 @@ def weight_sparsity(model: Union[str, onnx.ModelProto]) -> float:
     handling here: an exact-zero comparison and ``.size`` mean the same
     thing regardless of float precision), with no separate list to keep in
     sync.
-    Returns ``0.0`` if no matching layer is present.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): every matched layer inside a
+    nested ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph, at any
+    nesting depth, is counted into the same pooled ``zeros``/``total``
+    tally as the top-level graph's own matches -- otherwise this number
+    would be actively misleading (not merely incomplete) on a model whose
+    real weight lives almost entirely inside such a subgraph, e.g. a
+    whole-model-generation export from
+    ``onnxruntime.transformers.models.{t5,gpt2,whisper}.convert_generation``
+    -- silently reporting a top-level-only sparsity that has nothing to do
+    with the model's actual overall zero-fraction. Each subgraph's own
+    matches are drawn strictly from that subgraph's own `initializer` list
+    (:func:`_candidates`, given that one subgraph at a time) -- a name only
+    resolvable via implicit capture from an enclosing scope is never
+    counted here, the same conservative "local initializers only" rule
+    every subgraph-aware `apply_*` function in this module already follows
+    (see this module's own "Subgraph recursion" section comment).
+    Returns ``0.0`` if no matching layer is present anywhere in the model.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
 
     zeros = 0
     total = 0
-    initializer_map = {t.name: t for t in model.graph.initializer}
-    for _, _, w_name, _, _ in _candidates(model.graph):
-        w = onnx.numpy_helper.to_array(initializer_map[w_name])
-        zeros += int(np.count_nonzero(w == 0))
-        total += w.size
+    for graph in _iter_subgraphs(model.graph):
+        initializer_map = {t.name: t for t in graph.initializer}
+        for _, _, w_name, _, _ in _candidates(graph):
+            w = onnx.numpy_helper.to_array(initializer_map[w_name])
+            zeros += int(np.count_nonzero(w == 0))
+            total += w.size
 
     return zeros / total if total else 0.0
 
@@ -9177,6 +9389,33 @@ def apply_structured_pruning(
     the "FP16/BFloat16 weight support" section comment above
     :func:`_match_conv_weight_only` for why that needs no separate
     downcast step.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): every chain family above is
+    matched and pruned inside a nested ``If``/``Loop``/``Scan``/
+    ``BeamSearch``-family subgraph, at any nesting depth, exactly as if
+    that subgraph were its own top-level graph -- every chain-finder above
+    is given one graph (top-level or nested) at a time, so a chain that
+    would need to reach a producer/consumer/constant only resolvable via
+    an implicitly-captured name from an enclosing scope is declined
+    (never matched) rather than mis-resolved, and a weight is only ever
+    sliced out of the one graph's own `initializer` list it was actually
+    found in -- never an ancestor's or a sibling subgraph's. `touched`
+    (the shared touched-role/stale-`value_info` state) is reset per graph:
+    a name is only ever a "shared/tied initializer" conflict against
+    another chain matched *within that same graph*, never across graphs,
+    since ONNX names are scoped per-graph-tree-position and this module
+    never merges two graphs' own initializer/consumer maps together (see
+    this section's own top comment on implicit-capture scoping). In
+    `global_sparsity` mode, the pooled ranking/cutoff is likewise computed
+    *independently per graph* (not pooled across the whole model the way
+    :func:`apply_magnitude_pruning`'s own `global_sparsity` mode is) --
+    :func:`_apply_chains_global` builds its own `initializer_map` from a
+    single `graph` argument, so chains from two different graphs can never
+    share one of its calls; recomputing model-wide pooling into that
+    function was judged out of scope for this change (see this module's
+    own "Subgraph recursion" section comment), and per-graph pooling is
+    still a strict improvement over the prior top-level-only blind spot.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -9186,57 +9425,59 @@ def apply_structured_pruning(
 
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
 
-    chains = (
-        _find_chains(graph)
-        + _find_gated_chains(graph)
-        + _find_conv_chains(graph)
-        + _find_conv_residual_chains(graph)
-        + _find_matmul_residual_chains(graph)
-    )
-    concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(graph)
+    for graph in _iter_subgraphs(out.graph):
+        chains = (
+            _find_chains(graph)
+            + _find_gated_chains(graph)
+            + _find_conv_chains(graph)
+            + _find_conv_residual_chains(graph)
+            + _find_matmul_residual_chains(graph)
+        )
+        concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(
+            graph
+        )
 
-    touched = _TouchedState()
-    if global_sparsity:
-        global_chains = [c for c in chains if _chain_is_global_sparsity_eligible(c)]
-        if global_chains:
-            _apply_chains_global(
-                graph,
-                global_chains,
-                sparsity,
-                lambda chain, w_arrays_nk: _plain_structured_importance(
-                    chain, w_arrays_nk, importance_norm
-                ),
-                touched,
-            )
-    else:
-        if chains:
-            _apply_chains(
-                graph,
-                chains,
-                sparsity,
-                lambda chain, w_arrays_nk: _plain_structured_importance(
-                    chain, w_arrays_nk, importance_norm
-                ),
-                touched,
-            )
-        if concat_chains:
-            _apply_concat_chains(
-                graph,
-                concat_chains,
-                sparsity,
-                lambda _operand_name, w_arrays_nk: _plain_branch_importance(
-                    w_arrays_nk, importance_norm
-                ),
-                touched,
-            )
-    if touched.stale_value_info:
-        kept = [
-            vi for vi in graph.value_info if vi.name not in touched.stale_value_info
-        ]
-        del graph.value_info[:]
-        graph.value_info.extend(kept)
+        touched = _TouchedState()
+        if global_sparsity:
+            global_chains = [c for c in chains if _chain_is_global_sparsity_eligible(c)]
+            if global_chains:
+                _apply_chains_global(
+                    graph,
+                    global_chains,
+                    sparsity,
+                    lambda chain, w_arrays_nk: _plain_structured_importance(
+                        chain, w_arrays_nk, importance_norm
+                    ),
+                    touched,
+                )
+        else:
+            if chains:
+                _apply_chains(
+                    graph,
+                    chains,
+                    sparsity,
+                    lambda chain, w_arrays_nk: _plain_structured_importance(
+                        chain, w_arrays_nk, importance_norm
+                    ),
+                    touched,
+                )
+            if concat_chains:
+                _apply_concat_chains(
+                    graph,
+                    concat_chains,
+                    sparsity,
+                    lambda _operand_name, w_arrays_nk: _plain_branch_importance(
+                        w_arrays_nk, importance_norm
+                    ),
+                    touched,
+                )
+        if touched.stale_value_info:
+            kept = [
+                vi for vi in graph.value_info if vi.name not in touched.stale_value_info
+            ]
+            del graph.value_info[:]
+            graph.value_info.extend(kept)
 
     return out
 
@@ -18716,6 +18957,33 @@ def apply_attention_head_pruning(
     removal is pure index slicing that preserves each tensor's own original
     dtype untouched -- see the "FP16/BFloat16 weight support" section
     comment above :func:`_match_conv_weight_only`.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): every block family above is
+    matched and pruned inside a nested ``If``/``Loop``/``Scan``/
+    ``BeamSearch``-family subgraph, at any nesting depth, exactly as if
+    that subgraph were its own top-level graph, with the same
+    implicit-capture decline behavior and local-initializer-only slicing
+    documented there. One deliberate difference from the top-level graph:
+    the top-level graph's own `value_info_by_name` is seeded by a real
+    ``onnx.shape_inference.infer_shapes()`` pass (unchanged from before
+    this function became subgraph-aware, so its own matching behavior is
+    byte-identical to before); a nested subgraph instead uses only its own
+    already-declared `input`/`output`/`value_info` with no inference step
+    (:func:`_value_info_by_name`, not :func:`_shape_inferred_value_info_by_name`)
+    -- re-running shape inference once per nested subgraph and mapping its
+    result back onto the *original* (not shape-inference's own internal
+    copy of the) subgraph was judged unnecessary complexity for this
+    change. This can only make a subgraph's own matching *more*
+    conservative than the top-level graph's, never less: every place this
+    value/info map is read (:func:`_dynamic_head_bias_axis` and friends)
+    already treats an unresolvable shape as "decline this one dynamic
+    input," not as an error, so a subgraph's own dynamic
+    `attention_bias`/`attn_mask`/`head_sink` input that is only
+    shape-resolvable via inference (rather than already declared outright)
+    is left unsliced there even though the equivalent top-level-graph case
+    would be handled -- a documented, conservative gap, not a correctness
+    risk.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -18725,33 +18993,37 @@ def apply_attention_head_pruning(
 
     out = onnx.ModelProto()
     out.CopyFrom(model)
-    graph = out.graph
-    value_info_by_name = _shape_inferred_value_info_by_name(out)
+    top_value_info_by_name = _shape_inferred_value_info_by_name(out)
 
-    chains: List[_AttnLikeChain] = [
-        *_find_attention_chains(graph, value_info_by_name),
-        *_find_gqa_chains(graph, value_info_by_name),
-        *_find_onnx_attention_chains(graph, value_info_by_name),
-        *_find_mha_chains(graph, value_info_by_name),
-        *_find_packed_mha_chains(graph, value_info_by_name),
-        *_find_decoder_masked_mha_chains(graph, value_info_by_name),
-        *_find_paged_attention_chains(graph, value_info_by_name),
-        *_find_linear_attention_chains(graph, value_info_by_name),
-        *_find_sparse_attention_chains(graph, value_info_by_name),
-    ]
-    if chains:
-        _apply_attention_chains(
-            graph,
-            chains,
-            sparsity,
-            lambda chain, wq, wk, wv, dq, dk, dv: _plain_attention_head_importance(
-                chain, wq, wk, wv, dq, dk, dv, importance_norm
-            ),
-            lambda chain, wq, wk, wv: _gqa_group_importance(
-                chain, wq, wk, wv, importance_norm
-            ),
-            value_info_by_name,
+    for graph in _iter_subgraphs(out.graph):
+        value_info_by_name = (
+            top_value_info_by_name if graph is out.graph else _value_info_by_name(graph)
         )
+
+        chains: List[_AttnLikeChain] = [
+            *_find_attention_chains(graph, value_info_by_name),
+            *_find_gqa_chains(graph, value_info_by_name),
+            *_find_onnx_attention_chains(graph, value_info_by_name),
+            *_find_mha_chains(graph, value_info_by_name),
+            *_find_packed_mha_chains(graph, value_info_by_name),
+            *_find_decoder_masked_mha_chains(graph, value_info_by_name),
+            *_find_paged_attention_chains(graph, value_info_by_name),
+            *_find_linear_attention_chains(graph, value_info_by_name),
+            *_find_sparse_attention_chains(graph, value_info_by_name),
+        ]
+        if chains:
+            _apply_attention_chains(
+                graph,
+                chains,
+                sparsity,
+                lambda chain, wq, wk, wv, dq, dk, dv: _plain_attention_head_importance(
+                    chain, wq, wk, wv, dq, dk, dv, importance_norm
+                ),
+                lambda chain, wq, wk, wv: _gqa_group_importance(
+                    chain, wq, wk, wv, importance_norm
+                ),
+                value_info_by_name,
+            )
 
     return out
 
