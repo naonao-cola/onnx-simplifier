@@ -1,0 +1,161 @@
+name: Axera Integration
+
+# Checks onnxsim's output against Axera's Pulsar2/AXCL NPU compiler stack
+# (the .axmodel toolchain for AX6xx/AX8xx) -- see scripts/axera/README.md.
+#
+# Unlike ep-integration.yml's OpenVINO/QNN checks, Pulsar2 has no pip package
+# or ONNX Runtime execution provider, so `pulsar2-compat` below is a static,
+# dependency-light check (tests/test_pulsar2_compat.py,
+# tests/test_pulsar2_simulator.py, scripts/axera/run_pulsar2_compat.py) that
+# runs on any stock runner with just onnxsim + onnxruntime -- no Docker, no
+# device.
+#
+# `pulsar2-docker-convert` is the real thing: an actual `pulsar2 build`
+# (Docker) + `axcl_run_model` (device) conversion, following
+# scripts/axera/README.md's confirmed-real workflow. Like
+# amd-integration.yml's MIGraphX check, this needs hardware this repository
+# does not provision (a loaded Pulsar2 Docker image + a connected AXCL
+# device on `[self-hosted, axcl]`), so it is workflow_dispatch-ONLY and
+# dormant until such a runner exists.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1" # Mondays 07:00 UTC (weekly)
+  workflow_dispatch:
+    inputs:
+      convert_models:
+        description: "Space-separated onnxmodelzoo short names for pulsar2-docker-convert (self-hosted only)"
+        default: "resnet18d_Opset18"
+        required: false
+  pull_request:
+    paths:
+      - ".github/workflows/axera-integration.yml"
+      - "scripts/axera/**"
+      - "scripts/common/**"
+      - "scripts/regression/model_zoo.py"
+      - "tests/test_pulsar2_compat.py"
+      - "tests/test_pulsar2_simulator.py"
+
+concurrency:
+  group: axera-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build onnxsim wheel
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Build cp312 wheel
+        uses: pypa/cibuildwheel@v4.2.0
+        env:
+          CIBW_BUILD: "cp312-manylinux_x86_64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel-axera
+          path: ./wheelhouse/*.whl
+
+  pulsar2-compat:
+    name: Pulsar2 compatibility check (static, no Docker/device)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-axera
+          path: wheelhouse
+      - name: Install onnxsim wheel + onnxruntime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest onnxruntime
+          python -m pip install wheelhouse/*.whl
+      # Run from runner.temp, not the checkout: the repo root contains the
+      # `onnxsim/` source dir (no compiled extension), which would shadow the
+      # installed wheel on `import onnxsim`. Reference the harness by absolute
+      # $GITHUB_WORKSPACE path. Same guard the EP/model-regression workflows use.
+      - name: Show environment
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxruntime as ort; print('onnxsim', onnxsim.__version__); print('onnxruntime', ort.__version__)"
+      - name: Run in-tree smoke tests
+        working-directory: ${{ runner.temp }}
+        run: |
+          pytest -v "$GITHUB_WORKSPACE/tests/test_pulsar2_compat.py" "$GITHUB_WORKSPACE/tests/test_pulsar2_simulator.py"
+      - name: Run static Pulsar2 compatibility suite
+        working-directory: ${{ runner.temp }}
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/axera/run_pulsar2_compat.py" \
+            --output pulsar2-compat.csv
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pulsar2-compat-report
+          path: ${{ runner.temp }}/pulsar2-compat.csv
+          if-no-files-found: ignore
+
+  pulsar2-docker-convert:
+    name: Real Pulsar2 build + AXCL device conversion
+    if: github.event_name == 'workflow_dispatch'
+    # Requires a self-hosted runner with Docker, a loaded `pulsar2:*` image
+    # (see scripts/axera/pulsar2_docker.py's docstring for how to get one),
+    # and ideally a connected AXCL device, labeled "axcl". Not provided by
+    # this repository -- dormant until one is provisioned.
+    runs-on: [self-hosted, axcl]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install onnxsim + conversion deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install huggingface_hub pillow numpy onnxruntime
+          python3 -m pip install .
+      - name: Show environment
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 -c "import onnxsim; print('onnxsim', onnxsim.__version__)"
+          docker images | grep '^pulsar2' || echo "no pulsar2 image loaded"
+          axcl-smi || echo "no AXCL device found"
+      - name: Run real conversion
+        working-directory: ${{ runner.temp }}
+        env:
+          # Passed via env, not interpolated into the command line, so a
+          # crafted workflow_dispatch input can't inject shell syntax.
+          CONVERT_MODELS: ${{ github.event.inputs.convert_models }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/axera/convert_onnxmodelzoo.py" \
+            --models ${CONVERT_MODELS:-resnet18d_Opset18} \
+            --profile \
+            --output pulsar2-convert.csv
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pulsar2-convert-report
+          path: ${{ runner.temp }}/pulsar2-convert.csv
+          if-no-files-found: ignore
