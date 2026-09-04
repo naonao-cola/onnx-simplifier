@@ -213,16 +213,19 @@ def test_olive_ovp_pair_reconstructs_outlier_far_better_than_plain_quantization(
         assert abs(codes[idx, 0]) <= ordinary_qmax
         assert abs(float(dequant[idx, 0]) - true_val) < 0.02
 
-    # Sanity: an ordinary group-wide quantizer (scale sized by the block's
-    # overall absmax, qmax=7) would have clipped the OVP outlier just as
-    # badly as it did the declined ones -- OVP's own benefit for idx 0 is
-    # real, not an artifact of a lucky scale.
-    naive_scale = np.abs(weight).max() / ordinary_qmax
-    naive_code = np.clip(
-        np.round(weight[0, 0] / naive_scale), -ordinary_qmax, ordinary_qmax
+    # Sanity: if idx 0 had instead been *declined* (quantized against
+    # base_scale/ordinary_qmax, exactly like idx 4/5), it would have
+    # clipped just as hard as they did -- the same mechanism-consistent
+    # comparison, using this run's own base_scale rather than an
+    # arbitrarily defined "naive" quantizer. OVP's own benefit for idx 0
+    # is real, not an artifact of a lucky scale.
+    declined_code = np.clip(
+        np.round(5.0 / base_scale[0, 0]), -ordinary_qmax, ordinary_qmax
     )
-    naive_dequant = naive_code * naive_scale
-    assert abs(float(naive_dequant) - 5.0) / 5.0 > outlier_rel_err
+    declined_dequant = float(declined_code * base_scale[0, 0])
+    declined_rel_err = abs(declined_dequant - 5.0) / 5.0
+    assert declined_rel_err > 0.5
+    assert declined_rel_err > outlier_rel_err
 
 
 def test_olive_bit_budget_matches_ordinary_pair():

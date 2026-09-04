@@ -303,7 +303,7 @@ def quantize_weight_only_olive(
         match = _match_matmul_like(node)
         if match is None:
             continue
-        x_name, w_name, weight_transposed = match
+        x_name, w_name, bias_name, weight_transposed = match
         w_init = initializer_map.get(w_name)
         if (
             w_init is None
@@ -311,15 +311,14 @@ def quantize_weight_only_olive(
             or len(w_init.dims) != 2
         ):
             continue
-        candidates.append((node, x_name, w_name, weight_transposed))
+        candidates.append((node, x_name, w_name, bias_name, weight_transposed))
 
     if not candidates:
         return out
 
-    for node, x_name, w_name, weight_transposed in candidates:
+    for node, x_name, w_name, bias_name, weight_transposed in candidates:
         w_init = initializer_map[w_name]
         w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w.shape
         w_nk = w if weight_transposed else w.T  # [N, K], output channel first
         n, k = w_nk.shape
         if k % block_size != 0:
@@ -330,21 +329,17 @@ def quantize_weight_only_olive(
         )
         has_any_outlier = bool(outlier_mask_nk.any())
 
-        codes_orig = codes_nk if weight_transposed else codes_nk.T
-        mask_orig = outlier_mask_nk if weight_transposed else outlier_mask_nk.T
-        # base_scale/outlier_scale are [N, K // block_size]; DequantizeLinear
-        # (axis=0, block_size=block_size) wants the scale shaped like the
-        # weight with its axis-0 (reduction) dimension divided by
-        # block_size -- so transpose to [K // block_size, N] to match
-        # w_nk's own [N, K] -> [K, N] transpose below (mirrors
-        # onnxsim.spqr's own scale_kn convention).
-        base_scale_kn = base_scale.T
-        outlier_scale_kn = outlier_scale.T
-        assert codes_orig.shape == (dim0, dim1)
+        # The codes/scale/mask tensors below are brand-new initializers (the
+        # original W is replaced, not overwritten in place), so -- like
+        # onnxsim.spqr's own scale_kn/codes_kn -- they are always stored
+        # reduction-axis-first ([K, N] / [K // block_size, N]), independent
+        # of whether the original W happened to be stored transposed.
+        codes_kn = codes_nk.T  # [K, N]
+        mask_kn = outlier_mask_nk.T  # [K, N]
+        base_scale_kn = base_scale.T  # [K // block_size, N]
+        outlier_scale_kn = outlier_scale.T  # [K // block_size, N]
 
         prefix = f"{w_name}_olive"
-        codes_kn = codes_orig if weight_transposed else codes_orig.T  # [K, N]
-        mask_kn = mask_orig if weight_transposed else mask_orig.T  # [K, N]
 
         codes_name = _unique_name(f"{prefix}_codes", taken_names)
         wq = onnx.TensorProto()
@@ -410,7 +405,6 @@ def quantize_weight_only_olive(
             w_reconstructed = base_dequant
 
         old_output = node.output[0]
-        bias_name = node.input[2] if len(node.input) > 2 else None
         node_idx = next(i for i, n_ in enumerate(graph.node) if n_ is node)
 
         core = _new("MatMul", [x_name, w_reconstructed], "core")
