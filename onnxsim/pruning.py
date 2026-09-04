@@ -1869,23 +1869,25 @@ def _match_attention_weight_only(
 #   name defined in an ENCLOSING graph's scope rather than its own
 #   `node`/`initializer` list (e.g. an `If` branch reading a weight that
 #   actually lives in the top-level graph's `initializer`). Every matcher
-#   in this module resolves a weight/value strictly via
-#   ``{t.name: t for t in graph.initializer}``/consumer maps built from
-#   the one `graph` it was given -- never the caller's own enclosing
-#   scope -- so a node whose input only resolves in an outer scope simply
-#   fails to match (`initializer_map.get(name) is None`, or the input
-#   isn't found as an internal producer at all) and that chain is
+#   in this module resolves a weight/value strictly via :func:`_constant_map`
+#   (an initializer, or a plain `Constant` node's own embedded value --
+#   see that function's own docstring for why both are needed)/consumer
+#   maps built from the one `graph` it was given -- never the caller's own
+#   enclosing scope -- so a node whose input only resolves in an outer
+#   scope simply fails to match (`initializer_map.get(name) is None`, or
+#   the input isn't found as an internal producer at all) and that chain is
 #   declined, the same "decline rather than mis-slice" behavior this
 #   module already applies to every other unresolvable topology. No
 #   subgraph is ever treated as if it could see outward.
 # - Shared initializers across scopes: since every one of this module's
-#   slicers only ever mutates a tensor found in the CURRENT graph's own
-#   `initializer` list (never a parent's), and a parent-scope initializer
-#   an inner graph merely *reads* by implicit capture is -- by the point
-#   above -- never even matched as prunable from inside that inner graph,
-#   there is no path by which processing a subgraph could reach into, and
-#   corrupt, a tensor that actually belongs to (and is separately, safely
-#   processed as part of) an ancestor or sibling graph's own pass.
+#   slicers only ever mutates a tensor :func:`_constant_map` resolved from
+#   the CURRENT graph's own `initializer` list or its own `Constant` nodes
+#   (never a parent's), and a parent-scope initializer/`Constant` an inner
+#   graph merely *reads* by implicit capture is -- by the point above --
+#   never even matched as prunable from inside that inner graph, there is
+#   no path by which processing a subgraph could reach into, and corrupt, a
+#   tensor that actually belongs to (and is separately, safely processed as
+#   part of) an ancestor or sibling graph's own pass.
 #
 # What subgraph recursion does NOT change: shape/type validity. A
 # subgraph's own declared output `value_info` must still describe
@@ -1930,6 +1932,98 @@ def _iter_subgraphs(graph: onnx.GraphProto) -> List[onnx.GraphProto]:
     return graphs
 
 
+def _constant_map(graph: onnx.GraphProto) -> Dict[str, onnx.TensorProto]:
+    """Like ``{t.name: t for t in graph.initializer}`` -- the "is this name
+    a genuine constant, and what's its value" lookup every matcher/slicer in
+    this module already builds -- but also includes every plain (default-
+    domain) ``Constant`` node's own embedded ``value`` tensor, keyed by that
+    node's single output name.
+
+    This closes a real gap, not a hypothetical one: onnxsim's own
+    `simplify()`/`Optimize()` pipeline deliberately leaves a `Constant` node
+    as a `Constant` node rather than promoting it to an initializer --
+    `onnxsim.cpp`'s own `SimplifyImpl` always drops onnx-optimizer's
+    `extract_constant_to_initializer` pass from its optimizer list for
+    exactly this reason (see that file's own comment, and
+    `constant_folding.cpp`'s own `RebuildNodeList` comment) -- so a real,
+    `simplify()`-processed model still has one wherever the *source* Python
+    code fed a node a literal scalar/shape rather than a learned parameter
+    (confirmed live: `torch.onnx.export` of a hand-rolled RMSNorm emits
+    `nn.Parameter`s like `weight` as genuine top-level initializers
+    throughout, exactly as every matcher already expects, but lowers an
+    inline literal like `x.pow(2)`'s `2`, `+ self.eps`, or `1.0 /
+    std` to a `Constant` node instead). Every hop in this module that
+    checks a scalar/shape *operand* via a plain `initializer_map.get(name)`
+    -- `Clip`'s `min`/`max`, decomposed LayerNorm's `Pow` exponent/`eps`,
+    decomposed GroupNorm's `Reshape` shape, decomposed RMSNorm's `Pow`
+    exponent/`eps`/`Div` numerator, and others -- previously declined
+    outright on exactly this real, common shape, since `graph.initializer`
+    alone never contains it: confirmed empirically by reproducing a real
+    `LlamaRMSNorm`-equivalent module's `torch.onnx.export` output run
+    through `onnxsim.simplify()`, then `apply_structured_pruning` on the
+    result -- the decomposed-RMSNorm hop (and, by the identical mechanism,
+    every other "constant-fed scalar/shape operand" hop in this module)
+    silently failed to match, leaving the chain completely unpruned, purely
+    because its own `Pow`/`Add`/`Div` operands were `Constant`-node-fed
+    rather than initializer-fed -- even though the *same* chain, hand-built
+    with those same values already sitting in `graph.initializer` (this
+    module's own `tests/test_pruning.py` convention throughout), matched
+    and pruned correctly. This helper is the fix, applied once at every
+    site that already builds an `initializer_map` this way, rather than
+    reimplemented ad hoc at each one.
+
+    Never mutates `graph` itself -- purely an additive, read-only lookup
+    dict layered over the real `graph.initializer` entries (which still win
+    on a genuine name collision, vanishingly unlikely in practice: `set`s a
+    `Constant` node's own entry, so an actual initializer of the same name
+    already present is left untouched) -- so this is exactly as safe to call
+    from a read-only `_analyze_*`/dry-run function operating on the
+    caller's own original `model.graph` as from a mutating `apply_*`
+    function's own already-copied `out.graph`; neither ever risks leaking a
+    mutation back to the caller's own object. A hop that goes on to *slice*
+    a value resolved this way (e.g. a genuine per-channel `gamma`/`beta`
+    that happens to be `Constant`-node-fed rather than initializer-fed, an
+    unusual but not impossible shape) still slices it correctly in place:
+    `attr.t` on a `Constant` node's own `value` attribute is a live
+    reference into that node's own embedded `TensorProto`, not a copy (this
+    module's own existing `_slice_producer_weight`/`_slice_last_axis`
+    calls already mutate whatever `onnx.TensorProto` they're handed via
+    protobuf's own in-place field/`CopyFrom` semantics, which apply
+    identically here -- confirmed directly, not assumed), so the node's own
+    serialized form reflects the slice exactly as if it had been a real
+    initializer entry all along.
+
+    Only a `Constant` node's own `value` *tensor* attribute is recognized
+    here (`sparse_value`/`value_float`/`value_int`/`value_string`-family
+    attributes and their `*_ints`/`*_floats`/`*_strings` list forms are a
+    different representation this helper does not resolve) -- confirmed
+    live via ``onnx.defs.get_schema("Constant")`` that `value` is the one
+    attribute a real exporter actually uses for a full tensor payload (the
+    scalar/list-typed alternatives exist for a human-authored graph to
+    avoid spelling out a full `TensorProto`, not something `torch.onnx.
+    export` itself ever emits) -- a real gap this helper does not close is
+    therefore not a concern in practice, and is declined here the same
+    conservative way any other unrecognized shape already is: simply
+    absent from the returned map, exactly as if the tensor did not exist at
+    all (every caller already handles a missing name as "not a constant,
+    decline the chain").
+    """
+    constants = {t.name: t for t in graph.initializer}
+    for node in graph.node:
+        if (
+            node.op_type != "Constant"
+            or node.domain not in ("", "ai.onnx")
+            or len(node.output) != 1
+            or not node.output[0]
+        ):
+            continue
+        for attr in node.attribute:
+            if attr.name == "value" and attr.type == onnx.AttributeProto.TENSOR:
+                constants.setdefault(node.output[0], attr.t)
+                break
+    return constants
+
+
 def _candidates(
     graph: onnx.GraphProto, include_conv: bool = True, allow_grouped_conv: bool = True
 ):
@@ -1971,7 +2065,7 @@ def _candidates(
     weight has no Conv-style gap of its own and is included in every
     candidate list regardless.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     out = []
     for node in graph.node:
         match = _match_matmul_like(node)
@@ -2527,7 +2621,7 @@ def apply_magnitude_pruning(
     if global_sparsity:
         entries = []
         for graph in _iter_subgraphs(out.graph):
-            initializer_map = {t.name: t for t in graph.initializer}
+            initializer_map = _constant_map(graph)
             for _, _, w_name, weight_transposed, is_conv in _candidates(graph):
                 w_init = initializer_map[w_name]
                 w = _to_f64(w_init)
@@ -2539,7 +2633,7 @@ def apply_magnitude_pruning(
         return out
 
     for graph in _iter_subgraphs(out.graph):
-        initializer_map = {t.name: t for t in graph.initializer}
+        initializer_map = _constant_map(graph)
         for _, _, w_name, weight_transposed, is_conv in _candidates(graph):
             w_init = initializer_map[w_name]
 
@@ -2643,7 +2737,7 @@ def _wanda_unstructured_calibration_stats(
     doesn't mutate what's passed to it either.
     """
     graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     probe_names = sorted({x_name for _, x_name, _, _, _ in candidates})
     probe_model = _add_probe_outputs(out, probe_names)
 
@@ -2856,7 +2950,7 @@ def apply_wanda_pruning(
     out = onnx.ModelProto()
     out.CopyFrom(model)
     graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
 
     candidates = _candidates(graph)
     if not candidates:
@@ -2965,7 +3059,7 @@ def weight_sparsity(model: Union[str, onnx.ModelProto]) -> float:
     zeros = 0
     total = 0
     for graph in _iter_subgraphs(model.graph):
-        initializer_map = {t.name: t for t in graph.initializer}
+        initializer_map = _constant_map(graph)
         for _, _, w_name, _, _ in _candidates(graph):
             w = onnx.numpy_helper.to_array(initializer_map[w_name])
             zeros += int(np.count_nonzero(w == 0))
@@ -3254,7 +3348,7 @@ def apply_sparsegpt_pruning(
     out = onnx.ModelProto()
     out.CopyFrom(model)
     graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
 
     # Unlike an earlier version of this function, grouped/depthwise Conv is
     # matched too (_candidates' own allow_grouped_conv default, True) -- see
@@ -5961,7 +6055,7 @@ def _walk_to_consumer(
 
 
 def _find_chains(graph: onnx.GraphProto) -> List[_Chain]:
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
     value_info_by_name = _value_info_by_name(graph)
@@ -7635,7 +7729,7 @@ def _walk_to_conv_consumer(
 
 
 def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
@@ -8270,7 +8364,7 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
     exact same shared `keep` set (itself computed per-`group`-block when
     that shared count is > 1) once :func:`_apply_chains` computes it.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     node_by_output = {out: node for node in graph.node for out in node.output}
     graph_outputs = {o.name for o in graph.output}
@@ -9289,7 +9383,7 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
     independent forward branches, all fed by the exact same shared `keep`
     set once :func:`_apply_chains` computes it.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     node_by_output = {out: node for node in graph.node for out in node.output}
     graph_outputs = {o.name for o in graph.output}
@@ -9584,7 +9678,7 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
     than a single ``Sigmoid``/native ``Swish``) isn't recognized -- that
     block is safely left untouched, not guessed at.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
     node_by_output = {out: node for node in graph.node for out in node.output}
@@ -9977,7 +10071,7 @@ def _find_split_gated_chains(graph: onnx.GraphProto) -> List[_SplitGatedChain]:
     comment for the full shape, the co-selection semantics, and exactly
     what's supported/declined and why.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
     node_by_output = {out: node for node in graph.node for out in node.output}
@@ -10189,7 +10283,7 @@ def _apply_split_gated_chains(
     completely untouched) rather than corrupting the first chain's own
     already-applied rewrite.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     touched_split_size_inits: Set[str] = set()
 
     for chain in chains:
@@ -10958,7 +11052,7 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     branch's own) name the very same producer weight (degenerate), the whole
     `Concat` node is declined -- never partially pruned.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     node_by_output = {out: node for node in graph.node for out in node.output}
     graph_outputs = {o.name for o in graph.output}
@@ -11225,7 +11319,7 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     still declined, the same conservative way a residual/merge group
     declines one outright regardless of alignment.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     node_by_output = {out: node for node in graph.node for out in node.output}
     graph_outputs = {o.name for o in graph.output}
@@ -11468,7 +11562,7 @@ def _apply_concat_chains(
     :func:`_slice_grouped_consumer_conv_weight` rather than
     :func:`_slice_consumer_weight` whenever `consumer_group > 1`.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
 
     for chain in chains:
         producer_weights = {p.weight for b in chain.branches for p in b.producers}
@@ -12511,7 +12605,7 @@ def _apply_chains(
     selection) stays byte-identical to before this function learned about
     grouped Conv at all.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     # A weight legitimately plays both roles across two different chains --
     # e.g. the middle layer of a 3-layer MLP is the *consumer* of the first
     # chain (its reduction/input axis gets pruned) and the *producer* of the
@@ -12694,7 +12788,7 @@ def _apply_chains_global(
     ``round`` already introduces at the single-chain level, just visible
     in aggregate here instead of averaged away across independent chains.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     producer_touched = touched.producer
     consumer_touched = touched.consumer
     const_touched = touched.const
@@ -14787,7 +14881,7 @@ def _find_qdq_chains(graph: onnx.GraphProto) -> List[_QDQChain]:
     :func:`_find_conv_chains`'s own identical producer-matching order for
     the plain-float case.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     dq_of = {
         n.output[0]: n
@@ -14953,7 +15047,7 @@ def _find_qdq_gated_chains(graph: onnx.GraphProto) -> List[_QDQGatedChain]:
     either, for the identical reason :func:`_find_gated_chains`'s own
     docstring gives -- that block is safely left untouched.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     dq_of = {
         n.output[0]: n
@@ -15236,7 +15330,7 @@ def apply_structured_pruning_qdq(
         if not chains and not gated_chains:
             continue
 
-        initializer_map = {t.name: t for t in graph.initializer}
+        initializer_map = _constant_map(graph)
         producer_touched: Set[str] = set()
         consumer_touched: Set[str] = set()
         stale_value_info: Set[str] = set()
@@ -16384,7 +16478,7 @@ def _find_matmul_nbits_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsChain]
     duplicated here -- mirrors :func:`_find_qdq_chains`'s identical
     at-least-one-quantized filter).
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
@@ -16508,7 +16602,7 @@ def _find_matmul_nbits_gated_chains(
     actually be ``MatMulNBits`` (an all-plain-float triple is
     :func:`_find_gated_chains`'s own job, not duplicated here).
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
     node_by_output = {out: node for node in graph.node for out in node.output}
@@ -17373,7 +17467,7 @@ def _find_matmul_bnb4_chains(graph: onnx.GraphProto) -> List[_MatMulBnb4Chain]:
     own top comment for why the consumer side is always plain-float (never
     another ``MatMulBnb4``/``MatMulNBits`` node).
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
@@ -18794,7 +18888,7 @@ def _find_attention_chains(
     """
     if value_info_by_name is None:
         value_info_by_name = {}
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
@@ -21321,7 +21415,7 @@ def _find_separate_qkv_chains(
     """
     if value_info_by_name is None:
         value_info_by_name = {}
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
     node_by_output = {out: node for node in graph.node for out in node.output}
@@ -21791,7 +21885,7 @@ def _find_linear_attention_chains(
         value_info_by_name,
         allow_differing_v_head_size=True,
     )
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     out = []
     for chain in chains:
         decay_name = chain.node.input[4] if len(chain.node.input) > 4 else ""
@@ -22619,7 +22713,7 @@ def _apply_attention_chains(
     comment, the paragraph directly above :func:`_dynamic_head_bias_axis`,
     for the full reasoning.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     producer_touched: Set[str] = set()
     consumer_touched: Set[str] = set()
     stale_value_info: Set[str] = set()
@@ -23402,7 +23496,7 @@ def _find_matmul_nbits_mlp_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsMl
     node's own `Y` is no different a producer, from the consumer's own
     point of view, than a plain ``MatMulNBits`` node's output).
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
@@ -23828,7 +23922,7 @@ def _find_matmul_nbits_qkv_chains(
     """
     if value_info_by_name is None:
         value_info_by_name = {}
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
@@ -23919,7 +24013,7 @@ def _apply_matmul_nbits_qkv_chains(
     downstream output-projection consumer
     (:func:`_slice_matmul_nbits_chain_consumer`, reused verbatim).
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     bias_ctx = _DynamicHeadBiasContext(
         graph=graph,
         value_info_by_name=value_info_by_name,
@@ -24251,7 +24345,7 @@ def _match_moe_producer(
 
 
 def _find_moe_chains(graph: onnx.GraphProto) -> List[_MoEChain]:
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     chains = []
     for node in graph.node:
@@ -24295,7 +24389,7 @@ def _apply_moe_chains(
     sparsity: float,
     compute_importance,
 ) -> None:
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     touched: Set[str] = set()
 
     for chain in chains:
@@ -24603,7 +24697,7 @@ def _match_moe_whole_expert_producer(
 
 
 def _find_moe_whole_expert_chains(graph: onnx.GraphProto) -> List[_MoEExpertChain]:
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     node_by_output = {out: node for node in graph.node for out in node.output}
     graph_outputs = {o.name for o in graph.output}
@@ -24647,7 +24741,7 @@ def _apply_moe_whole_expert_chains(
     sparsity: float,
     compute_importance,
 ) -> Set[str]:
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     touched: Set[str] = set()
     stale_value_info: Set[str] = set()
 
@@ -25918,7 +26012,7 @@ def _match_qmoe_producer(
 
 
 def _find_qmoe_chains(graph: onnx.GraphProto) -> List[_QMoEChannelChain]:
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     chains = []
     for node in graph.node:
@@ -26012,7 +26106,7 @@ def _apply_qmoe_channel_chains(
     sparsity: float,
     compute_importance,
 ) -> None:
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     touched: Set[str] = set()
 
     for chain in chains:
@@ -26393,7 +26487,7 @@ def _match_qmoe_whole_expert_producer(
 
 
 def _find_qmoe_whole_expert_chains(graph: onnx.GraphProto) -> List[_QMoEExpertChain]:
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     node_by_output = {out: node for node in graph.node for out in node.output}
     graph_outputs = {o.name for o in graph.output}
@@ -26451,7 +26545,7 @@ def _apply_qmoe_whole_expert_chains(
     needed anywhere, the "comparatively simpler" half of this section's own
     two techniques.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     touched: Set[str] = set()
     stale_value_info: Set[str] = set()
 
@@ -27582,7 +27676,7 @@ def _find_fp8_block_quantized_chains(
     is a ``MatMulBlockQuantizedFp8Weight`` node (a plain-float-to-plain-
     float pair is :func:`apply_structured_pruning`'s own job).
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
@@ -27635,7 +27729,7 @@ def _find_fp4_block_quantized_chains(
     graph: onnx.GraphProto,
 ) -> List[_BlockQuantizedFp4Chain]:
     """``Fp4Weight`` analogue of :func:`_find_fp8_block_quantized_chains`."""
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
@@ -28680,7 +28774,7 @@ def _find_qop_chains(graph: onnx.GraphProto) -> List[_QOpChain]:
     the three matchers' own `op_type` checks are mutually exclusive, so this
     is never ambiguous.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
@@ -29398,7 +29492,7 @@ def _find_dynquant_chains(graph: onnx.GraphProto) -> List[_DynQuantMatMulChain]:
     duplicated here -- mirrors :func:`_find_matmul_nbits_chains`'s identical
     at-least-one-quantized filter).
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
@@ -30621,7 +30715,7 @@ def _match_embedding_chain(
     embedding with an unrelated `EmbedLayerNormalization` block) declines
     the whole call (`None`), the model left completely untouched.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     node_by_output = {out: n for n in graph.node for out in n.output}
     graph_outputs = {o.name for o in graph.output}
@@ -30846,7 +30940,7 @@ def _apply_embedding_vocab_prune(
     rule every other subgraph-aware pass in this module already follows
     (see this module's own "Subgraph recursion" section comment).
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     keep = np.asarray(keep_ids, dtype=np.int64)
     new_v = len(keep_ids)
 
@@ -31194,7 +31288,7 @@ def apply_embedding_vocab_magnitude_pruning(
     assert graph is not None
 
     vocab_size = chain.vocab_size
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     importance = _embedding_vocab_importance(chain, initializer_map)
 
     protect = {int(i) for i in (protect_token_ids or ())}
@@ -31639,7 +31733,7 @@ def _find_transformer_block_candidates(
     between the two), and whose `x_in`/`x_out` shapes
     :func:`_shapes_match` independently confirms identical.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     node_by_output: Dict[str, onnx.NodeProto] = {}
     for node in graph.node:
         for out_name in node.output:
@@ -31998,79 +32092,28 @@ def apply_transformer_block_pruning(
     subgraph is conservatively declined there even though the equivalent
     top-level-graph case would be handled -- a documented, conservative
     gap, not a correctness risk.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_transformer_block_pruning_cpp`
+    (``onnxsim/structured_pruning_entry.cpp``'s own ``ApplyTransformerBlockPruning``),
+    forwarding every argument unchanged. Imported lazily (inside the
+    function body, not at module scope) to avoid a circular import:
+    ``onnxsim.onnx_simplifier`` already imports from this module
+    (:class:`EmbeddingPruningResult`), so importing it back at module load
+    time here would deadlock the import machinery.
     """
-    if num_blocks_to_drop is not None:
-        if num_blocks_to_drop < 0:
-            raise ValueError(
-                f"num_blocks_to_drop must be >= 0, got {num_blocks_to_drop}"
-            )
-    elif not (0.0 <= sparsity <= 1.0):
-        raise ValueError(f"sparsity must be in [0, 1], got {sparsity}")
+    from onnxsim.onnx_simplifier import apply_transformer_block_pruning_cpp
 
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-
-    try:
-        inferred = onnx.shape_inference.infer_shapes(out, strict_mode=False)
-        top_value_info_by_name = _value_info_by_name(inferred.graph)
-    except Exception:
-        top_value_info_by_name = _value_info_by_name(out.graph)
-
-    # (graph, candidate, similarity) for every graph's own candidates,
-    # pooled together -- see this function's own docstring for why
-    # selection is pooled across the whole model while committing stays
-    # strictly per graph.
-    pooled: List[Tuple[onnx.GraphProto, _DroppableBlock, float]] = []
-    for graph in _iter_subgraphs(out.graph):
-        is_top = graph is out.graph
-        value_info_by_name = (
-            top_value_info_by_name if is_top else _value_info_by_name(graph)
-        )
-        candidates = _find_transformer_block_candidates(graph, value_info_by_name)
-        if not candidates:
-            continue
-        if is_top:
-            similarity = _transformer_block_similarity(
-                out, candidates, calibration_data, providers
-            )
-            pooled.extend((graph, c, similarity[i]) for i, c in enumerate(candidates))
-        else:
-            # Not probeable -- see this function's own docstring. Ranked
-            # last, never preferentially dropped, but still a real,
-            # committable candidate if `target` needs it.
-            pooled.extend((graph, c, float("-inf")) for c in candidates)
-
-    if not pooled:
-        return out
-
-    if num_blocks_to_drop is not None:
-        target = min(num_blocks_to_drop, len(pooled))
-    else:
-        target = int(round(sparsity * len(pooled)))
-    if target <= 0:
-        return out
-
-    ranked = [
-        (g, c) for g, c, _ in sorted(pooled, key=lambda item: item[2], reverse=True)
-    ]
-    committed = _select_droppable_blocks([c for _, c in ranked], target)
-    committed_by_graph: Dict[int, Tuple[onnx.GraphProto, List[_DroppableBlock]]] = {}
-    block_to_graph = {id(c): g for g, c in ranked}
-    for block in committed:
-        g = block_to_graph[id(block)]
-        entry = committed_by_graph.setdefault(id(g), (g, []))
-        entry[1].append(block)
-    for g, blocks in committed_by_graph.values():
-        _commit_transformer_block_drops(g, blocks)
-
-    return out
+    return apply_transformer_block_pruning_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        sparsity=sparsity,
+        num_blocks_to_drop=num_blocks_to_drop,
+        providers=providers,
+    )
 
 
 # --- Dry-run pruning sensitivity analysis ---------------------------------
@@ -32521,7 +32564,7 @@ def _analyze_unstructured(
     if global_sparsity:
         entries = []
         for graph, candidates in graph_candidates:
-            initializer_map = {t.name: t for t in graph.initializer}
+            initializer_map = _constant_map(graph)
             for node, x_name, w_name, weight_transposed, is_conv in candidates:
                 w_init = initializer_map[w_name]
                 w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
@@ -32570,7 +32613,7 @@ def _analyze_unstructured(
             )
     else:
         for graph, candidates in graph_candidates:
-            initializer_map = {t.name: t for t in graph.initializer}
+            initializer_map = _constant_map(graph)
             for node, x_name, w_name, weight_transposed, is_conv in candidates:
                 w_init = initializer_map[w_name]
                 w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
@@ -32807,7 +32850,7 @@ def _analyze_chains(
     preserving it is required for the reported would-drop counts to match
     the real call's own chain-by-chain outcome exactly.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     producer_touched: Set[str] = set()
     consumer_touched: Set[str] = set()
     const_touched: Set[str] = set()
@@ -33966,7 +34009,7 @@ def _analyze_attention_chains(
     :func:`_analyze_attention_head_wanda_pruning` does, to fold in a
     calibrated activation norm) unmodified.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     producer_touched: Set[str] = set()
     consumer_touched: Set[str] = set()
     layers: List[PruningLayerSensitivity] = []
@@ -34558,7 +34601,7 @@ def _analyze_moe_chains(
     (``max(1, n - round(n * sparsity))``, :func:`_apply_moe_chains`'s own
     formula) exactly, but never actually slicing `fc1`/`fc2`(`/fc1_experts_bias`).
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     touched: Set[str] = set()
     layers: List[PruningLayerSensitivity] = []
 
@@ -34665,7 +34708,7 @@ def _analyze_moe_whole_expert_chains(
     :func:`_apply_moe_whole_expert_chains`'s own formula) exactly, but never
     actually slicing `fc1`/`fc2`/the router projection.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     touched: Set[str] = set()
     layers: List[PruningLayerSensitivity] = []
 
@@ -34849,7 +34892,7 @@ def _analyze_qmoe_channel_chains(
     -- so `would_drop`/`margin` here can never diverge from what the real
     mutating call actually does, for either quant_type.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     touched: Set[str] = set()
     layers: List[PruningLayerSensitivity] = []
 
@@ -34993,7 +35036,7 @@ def _analyze_qmoe_whole_expert_chains(
     :func:`_apply_qmoe_whole_expert_chains`'s own formula) exactly, but
     never actually slicing `fc1`/`fc2`/the router projection.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     touched: Set[str] = set()
     layers: List[PruningLayerSensitivity] = []
 
@@ -35752,7 +35795,7 @@ def _embedding_not_eligible(
     given `input_name` is still reported here -- this call would never touch
     it either.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     node_by_output = {out: n for n in graph.node for out in n.output}
     graph_input_names = {i.name for i in graph.input}
@@ -35841,7 +35884,7 @@ def _analyze_embedding_vocab_magnitude_pruning(
 
     vocab_size = chain.vocab_size
     assert _match_graph is not None
-    initializer_map = {t.name: t for t in _match_graph.initializer}
+    initializer_map = _constant_map(_match_graph)
     importance = _embedding_vocab_importance(chain, initializer_map)
 
     protect = {int(i) for i in (protect_token_ids or ())}
@@ -35885,7 +35928,7 @@ def _analyze_embedding_vocab_magnitude_pruning(
 def _transformer_block_not_eligible(
     graph: onnx.GraphProto, candidates: List[_DroppableBlock]
 ) -> List[str]:
-    initializer_map = {t.name: t for t in graph.initializer}
+    initializer_map = _constant_map(graph)
     matched_ids = {id(c.merge_node) for c in candidates}
     not_eligible = []
     for node in graph.node:
