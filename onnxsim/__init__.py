@@ -17,6 +17,7 @@ from onnxsim.autoquant import AutoQuantResult, auto_quantize_int4
 from onnxsim.autoround import apply_autoround
 from onnxsim.awq import apply_awq
 from onnxsim.bias_correction import correct_bias
+from onnxsim.billm import quantize_weight_only_billm
 from onnxsim.calibration import (
     calibrate,
     generate_random_calibration_data,
@@ -209,6 +210,7 @@ __all__ = [
     "quantize_ternary",
     "quantize_weight_only",
     "quantize_weight_only_int4",
+    "quantize_weight_only_billm",
     "quantize_weight_only_int4_hqq",
     "quantize_weight_only_kmeans",
     "quantize_weight_only_nf4",
