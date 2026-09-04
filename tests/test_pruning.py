@@ -3506,6 +3506,427 @@ def test_structured_pruning_native_swiglu_node_prunes_both_producers_together():
     np.testing.assert_array_equal(inits["Wd"], wd[keep, :])
 
 
+# --- Split-merged (fused gate_up_proj) gated FFN chains ------------------
+#
+# Real Phi-3/Phi-3.5 (onnxruntime-genai) exports use ONE gate_up_proj MatMul
+# whose 2*H-wide output is halved by a Split into a gate half and an up half,
+# rather than two separate gate_proj/up_proj producers -- see
+# onnxsim/pruning.py's own "Split-merged (fused gate_up_proj) gated FFN
+# chains" section comment for the full shape and co-selection semantics
+# these tests exercise.
+
+
+def _split_gate_up_keep_indices(w, H, keep_count):
+    # The correct paired-importance ranking: combined (root-sum-square)
+    # norm of the gate half (columns [0, H)) and the up half (columns
+    # [H, 2H)) of the ONE combined weight `w`, mirroring
+    # _combined_keep_indices's own formula for the two-separate-producer
+    # case above -- the two must agree exactly since both halves represent
+    # the very same physical weight tensor's own two-producer analogue.
+    gate_half, up_half = w[:, :H], w[:, H:]
+    importance = np.sqrt(
+        np.square(np.linalg.norm(gate_half.T, axis=1))
+        + np.square(np.linalg.norm(up_half.T, axis=1))
+    )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def _split_gate_up_mlp_model(
+    K=8,
+    H=16,
+    Out=4,
+    gate_activation="Sigmoid",
+    seed=0,
+    opset=21,
+    split_attrs="axis=-1, num_outputs=2",
+):
+    rng = np.random.default_rng(seed)
+    w = rng.standard_normal((K, 2 * H)).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    split_attr_text = f"<{split_attrs}>" if split_attrs else ""
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          combined = MatMul(X, W)
+          gate, up = Split {split_attr_text} (combined)
+          gate_act = {gate_activation}(gate)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[_f32(w, "W"), _f32(wd, "Wd")],
+        opset=opset,
+    )
+    return model, w, wd
+
+
+def test_structured_pruning_split_gated_ffn_matches_oracle():
+    K, H, Out = 8, 16, 4
+    model, w, wd = _split_gate_up_mlp_model(K=K, H=H, Out=Out)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W"].dims) == [K, H]  # 2 * (H // 2)
+    assert list(inits["Wd"].dims) == [H // 2, Out]
+
+    keep = _split_gate_up_keep_indices(w, H, H // 2)
+    rng = np.random.default_rng(20)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    gate = 1.0 / (1.0 + np.exp(-(x @ w[:, keep])))
+    up = x @ w[:, H + keep]
+    y_oracle = (gate * up) @ wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_split_gated_ffn_prunes_both_halves_of_one_tensor():
+    # The real bug this pattern risks: only one of the two halves getting
+    # sliced (or the two halves disagreeing on which columns survive) --
+    # assert the SAME index set is dropped from both, out of the single
+    # physical weight tensor.
+    K, H, Out = 8, 20, 4
+    model, w, wd = _split_gate_up_mlp_model(K=K, H=H, Out=Out, seed=1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.3)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    keep = _split_gate_up_keep_indices(w, H, H - round(H * 0.3))
+
+    np.testing.assert_array_equal(inits["W"][:, : len(keep)], w[:, keep])
+    np.testing.assert_array_equal(inits["W"][:, len(keep) :], w[:, H + keep])
+    np.testing.assert_array_equal(inits["Wd"], wd[keep, :])
+
+
+def test_structured_pruning_split_gated_ffn_uses_combined_paired_importance():
+    # Adversarial case: gate-half and up-half columns for the SAME neuron
+    # index deliberately have very different magnitudes, constructed so
+    # that ranking by EITHER half alone (a "sliced/ranked only one half"
+    # bug) picks a DIFFERENT keep-set than the correct combined
+    # (root-sum-square) ranking of the pair. K=2 with only row 0 non-zero
+    # makes each column's own L2 norm exactly its row-0 value, so the
+    # desired per-half magnitudes can be set directly and exactly.
+    K, H, Out = 2, 5, 3
+    gate_vals = np.array([9.0, 1.0, 6.0, 7.0, 0.5], dtype=np.float32)
+    up_vals = np.array([1.0, 8.9, 6.0, 0.5, 6.9], dtype=np.float32)
+    # combined (root-sum-square) importance per column:
+    #   col0: sqrt(9.0^2+1.0^2) = 9.0554  (rank 1)
+    #   col1: sqrt(1.0^2+8.9^2) = 8.9556  (rank 2)
+    #   col2: sqrt(6.0^2+6.0^2) = 8.4853  (rank 3)
+    #   col3: sqrt(7.0^2+0.5^2) = 7.0178  (rank 4)
+    #   col4: sqrt(0.5^2+6.9^2) = 6.9181  (rank 5)
+    # correct keep (top 3, combined) = [0, 1, 2]; gate-only top 3 would be
+    # [0, 2, 3] and up-only top 3 would be [1, 2, 4] -- both wrong.
+    w = np.zeros((K, 2 * H), dtype=np.float32)
+    w[0, :H] = gate_vals
+    w[0, H:] = up_vals
+    rng = np.random.default_rng(2)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          combined = MatMul(X, W)
+          gate, up = Split <axis=-1, num_outputs=2> (combined)
+          gate_act = Sigmoid(gate)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[_f32(w, "W"), _f32(wd, "Wd")],
+    )
+
+    # H=5, sparsity=0.4 -> keep_count = 5 - round(5*0.4) = 3.
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.4)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    correct_keep = np.array([0, 1, 2])
+    gate_only_keep = np.array([0, 2, 3])  # what a gate-only-ranked bug would pick
+    up_only_keep = np.array([1, 2, 4])  # what an up-only-ranked bug would pick
+
+    np.testing.assert_array_equal(inits["W"][:, :3], w[:, correct_keep])
+    np.testing.assert_array_equal(inits["W"][:, 3:], w[:, H + correct_keep])
+    assert not np.array_equal(inits["W"][0, :3], w[0, gate_only_keep])
+    assert not np.array_equal(inits["W"][0, :3], w[0, up_only_keep])
+
+
+def test_structured_pruning_split_gated_ffn_swish_activation_matches_oracle():
+    # Native ai.onnx Swish(X) = X * Sigmoid(alpha * X), opset 24+ -- the
+    # fused-single-node spelling of SiLU real gate_up_proj exports use.
+    K, H, Out = 8, 16, 4
+    model, w, wd = _split_gate_up_mlp_model(
+        K=K, H=H, Out=Out, gate_activation="Swish", seed=3, opset=24
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _split_gate_up_keep_indices(w, H, H // 2)
+    rng = np.random.default_rng(30)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    g = x @ w[:, keep]
+    gate = g * (1.0 / (1.0 + np.exp(-g)))
+    up = x @ w[:, H + keep]
+    y_oracle = (gate * up) @ wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_split_gated_ffn_explicit_equal_split_input_matches_oracle():
+    # opset 13+'s explicit `split` *input* (rather than the fully-automatic
+    # even split) spelled out as literally [H, H] -- the same semantic
+    # split, a different spelling; the pruned model's own Split input must
+    # be rewritten to the new, still-even [h', h'].
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(4)
+    w = rng.standard_normal((K, 2 * H)).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    sizes = onnx.numpy_helper.from_array(np.array([H, H], dtype=np.int64), name="Sizes")
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          combined = MatMul(X, W)
+          gate, up = Split <axis=-1> (combined, Sizes)
+          gate_act = Sigmoid(gate)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[_f32(w, "W"), _f32(wd, "Wd"), sizes],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    split_node = next(n for n in pruned.graph.node if n.op_type == "Split")
+    sizes_init = next(
+        t for t in pruned.graph.initializer if t.name == split_node.input[1]
+    )
+    assert list(onnx.numpy_helper.to_array(sizes_init)) == [H // 2, H // 2]
+
+    keep = _split_gate_up_keep_indices(w, H, H // 2)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    gate = 1.0 / (1.0 + np.exp(-(x @ w[:, keep])))
+    up = x @ w[:, H + keep]
+    y_oracle = (gate * up) @ wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_split_gated_ffn_declines_unequal_explicit_split():
+    K, H = 8, 16
+    rng = np.random.default_rng(5)
+    w = rng.standard_normal((K, 2 * H)).astype(np.float32)
+    sizes = onnx.numpy_helper.from_array(
+        np.array([H + 2, H - 2], dtype=np.int64), name="Sizes"
+    )
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{H + 2}] Gate, float[batch,{H - 2}] Up)
+        {{
+          combined = MatMul(X, W)
+          Gate, Up = Split <axis=-1> (combined, Sizes)
+        }}
+        """,
+        initializer=[_f32(w, "W"), sizes],
+    )
+    before = model.SerializeToString()
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == before
+
+
+def test_structured_pruning_split_gated_ffn_declines_dynamic_split_sizes():
+    # A `split` input that is a genuine graph input (not a constant
+    # initializer) -- this module has no way to confirm ahead of time it's
+    # really [H, H], nor to keep it pruning-consistent afterward.
+    K, H, Out = 8, 16, 4
+    model, w, wd = _split_gate_up_mlp_model(
+        K=K, H=H, Out=Out, seed=6, split_attrs="axis=-1"
+    )
+    # Rewrite the Split node to take a dynamic `sizes` graph input instead
+    # of relying on the automatic even split.
+    split_node = next(n for n in model.graph.node if n.op_type == "Split")
+    del split_node.input[:]
+    split_node.input.extend(["combined", "Sizes"])
+    model.graph.input.append(
+        onnx.helper.make_tensor_value_info("Sizes", onnx.TensorProto.INT64, [2])
+    )
+    onnx.checker.check_model(model)
+
+    before = model.SerializeToString()
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == before
+
+
+def test_structured_pruning_split_gated_ffn_declines_decomposed_silu():
+    # SiLU decomposed as the self-referencing x * Sigmoid(x) (two nodes)
+    # rather than a single Sigmoid/native Swish -- not recognized, the same
+    # decline _find_gated_chains's own two-producer case already documents.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(7)
+    w = rng.standard_normal((K, 2 * H)).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          combined = MatMul(X, W)
+          gate, up = Split <axis=-1, num_outputs=2> (combined)
+          gate_sig = Sigmoid(gate)
+          gate_act = Mul(gate, gate_sig)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[_f32(w, "W"), _f32(wd, "Wd")],
+    )
+    before = model.SerializeToString()
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == before
+
+
+def test_structured_pruning_split_gated_ffn_declines_bias_add_before_split():
+    # A separate MatMul -> Add(bias) -> Split, rather than the producer's
+    # raw output feeding Split directly -- out of scope for this first
+    # pass (see this module's own section comment).
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(8)
+    w = rng.standard_normal((K, 2 * H)).astype(np.float32)
+    bias = rng.standard_normal((2 * H,)).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          combined = MatMul(X, W)
+          combined_b = Add(combined, Bias)
+          gate, up = Split <axis=-1, num_outputs=2> (combined_b)
+          gate_act = Sigmoid(gate)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[_f32(w, "W"), _f32(bias, "Bias"), _f32(wd, "Wd")],
+    )
+    before = model.SerializeToString()
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == before
+
+
+def test_structured_pruning_split_gated_ffn_declines_three_way_split():
+    K, H3 = 8, 6  # 3*H3 total, split into three equal parts
+    rng = np.random.default_rng(9)
+    w = rng.standard_normal((K, 3 * H3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{H3}] A, float[batch,{H3}] B, float[batch,{H3}] C)
+        {{
+          combined = MatMul(X, W)
+          A, B, C = Split <axis=-1, num_outputs=3> (combined)
+        }}
+        """,
+        initializer=[_f32(w, "W")],
+    )
+    before = model.SerializeToString()
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == before
+
+
+def test_structured_pruning_split_gated_ffn_declines_when_axis_defaults_to_zero():
+    # Split's own schema default axis is 0, unlike Concat's *required*
+    # attribute -- an un-annotated Split here would target the batch axis,
+    # not the channel axis, and must be declined, not assumed.
+    K, H, Out = 8, 16, 4
+    model, w, wd = _split_gate_up_mlp_model(
+        K=K, H=H, Out=Out, seed=10, split_attrs="num_outputs=2"
+    )
+    before = model.SerializeToString()
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == before
+
+
+def test_structured_pruning_global_sparsity_leaves_split_gated_ffn_chain_untouched():
+    # Same reasoning as the two-producer gated pair's own identical test
+    # above: a single physical tensor's own two-half co-selection must
+    # already agree with itself before a second, global layer of agreement
+    # is even meaningful -- excluded from global_sparsity's own pool, left
+    # completely untouched rather than approximated. Made uniformly tiny so
+    # a naive pooled ranking would otherwise be eager to prune it hard.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(31)
+    w1 = (rng.standard_normal((K, H)) * 50.0).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    w = (rng.standard_normal((K, 2 * H)) * 0.01).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Yplain, float[batch,{Out}] Ygated)
+        {{
+          h = MatMul(X, W1)
+          a = Relu(h)
+          Yplain = MatMul(a, W2)
+          combined = MatMul(X, W)
+          gate, up = Split <axis=-1, num_outputs=2> (combined)
+          gate_act = Sigmoid(gate)
+          hg = Mul(gate_act, up)
+          Ygated = MatMul(hg, Wd)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(w, "W"), _f32(wd, "Wd")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5, global_sparsity=True)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) != [K, H]  # the eligible plain chain IS pruned
+    assert list(inits["W"].dims) == [K, 2 * H]  # the split-gated chain is not
+    assert list(inits["Wd"].dims) == [H, Out]
+
+
+def test_structured_wanda_pruning_split_gated_ffn_matches_plain_fallback_oracle():
+    # This family is deliberately ranked by plain weight-magnitude
+    # importance only in the calibrated (Wanda) entry point too -- see
+    # apply_structured_wanda_pruning's own docstring -- so the result must
+    # match the exact same oracle apply_structured_pruning's own test above
+    # uses, calibration data notwithstanding.
+    K, H, Out = 8, 16, 4
+    model, w, wd = _split_gate_up_mlp_model(K=K, H=H, Out=Out, seed=23)
+
+    rng = np.random.default_rng(24)
+    x_cal = rng.standard_normal((32, K)).astype(np.float32)
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    keep = _split_gate_up_keep_indices(w, H, H // 2)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    gate = 1.0 / (1.0 + np.exp(-(x @ w[:, keep])))
+    up = x @ w[:, H + keep]
+    y_oracle = (gate * up) @ wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_split_gated_ffn_prunes_inside_if_branch():
+    K, H, Out = 8, 16, 4
+    model, w, wd = _split_gate_up_mlp_model(K=K, H=H, Out=Out, seed=7)
+    wrapped = _if_wrap(model)
+
+    pruned = onnxsim.apply_structured_pruning(wrapped, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _split_gate_up_keep_indices(w, H, H // 2)
+    rng = np.random.default_rng(21)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    for cond in (True, False):
+        (y,) = _run(pruned, {"X": x, "cond": np.array(cond)})
+        gate = 1.0 / (1.0 + np.exp(-(x @ w[:, keep])))
+        up = x @ w[:, H + keep]
+        y_oracle = (gate * up) @ wd[keep, :]
+        np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 # --- Conv2D structured pruning ------------------------------------------
 
 
@@ -22634,6 +23055,18 @@ def test_analyze_structured_pruning_rejects_concat_merged_models():
     with pytest.raises(NotImplementedError, match="Concat"):
         onnxsim.analyze_pruning_sensitivity(
             model, onnxsim.apply_structured_pruning, sparsity=0.5
+        )
+
+
+def test_analyze_structured_pruning_rejects_split_gated_models():
+    model, _w, _wd = _split_gate_up_mlp_model(K=8, H=16, Out=4)
+    with pytest.raises(NotImplementedError, match="gate_up_proj"):
+        onnxsim.analyze_pruning_sensitivity(
+            model, onnxsim.apply_structured_pruning, sparsity=0.5
+        )
+    with pytest.raises(NotImplementedError, match="gate_up_proj"):
+        onnxsim.analyze_pruning_sensitivity(
+            model, onnxsim.apply_structured_wanda_pruning, sparsity=0.5
         )
 
 

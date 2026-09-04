@@ -6738,6 +6738,592 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
     return chains
 
 
+# --- Split-merged (fused gate_up_proj) gated FFN chains ---------------------
+#
+# :func:`_find_gated_chains` above only recognizes the TWO-SEPARATE-PRODUCER
+# shape: ``Mul(gate_proj(x), up_proj(x))`` with two distinct MatMul/Gemm
+# weight tensors, each independently prunable by dropping the same
+# channel-index set from both, since they're about to be multiplied
+# elementwise. Real, currently-shipped exports of the Phi-3/Phi-3.5 family
+# (via ``onnxruntime-genai``) use a different, equally common shape instead --
+# confirmed directly against the real HF ``transformers`` source
+# (``Phi3MLP.forward``):
+#
+#     up_states = self.gate_up_proj(hidden_states)   # ONE Linear, 2*H out
+#     gate, up_states = up_states.chunk(2, dim=-1)     # traces to Split
+#     up_states = up_states * self.activation_fn(gate)
+#     return self.down_proj(up_states)
+#
+# i.e. ``combined = MatMul(x, W)`` (one producer, `W` with `2*H` output
+# columns) -> ``Split(combined, axis=-1, num_outputs=2)`` -> ``(gate, up)``
+# -> ``act(gate) * up`` -> ``down_proj`` MatMul/Gemm. Unlike the two-producer
+# case, `gate` and `up` here are two HALVES of the SAME physical weight `W`:
+# columns ``[0, H)`` are gate, columns ``[H, 2H)`` are up (`Split`'s own
+# output-order guarantee -- ONNX always lays a `Split` node's outputs out in
+# increasing-index order along the split axis, confirmed live via
+# ``onnx.defs.get_schema("Split")`` across every opset this module might see,
+# see :func:`_split_explicit_sizes`'s own comment). "Neuron" `i` of the
+# intermediate dimension is represented by BOTH column `i` (its gate half)
+# AND column `H + i` (its up half) of the one producer weight -- they must
+# always be kept or dropped TOGETHER, the identical pairing constraint
+# :func:`_find_gated_chains`'s own two-producer case already enforces, just
+# expressed as a co-selection within one tensor (`keep` and `H + keep` for
+# the same index set) rather than two independently-sliced tensors. Verified
+# directly, not just reasoned about: dropping neuron `i` means dropping BOTH
+# column `i` and column `H + i` of `W` AND row `i` of `down_proj`'s own
+# weight -- confirmed to reproduce an independently-computed "run the full
+# unpruned network, then slice its hidden activation post-hoc" reference to
+# float32 rounding precision via a real ``InferenceSession`` run (see
+# ``tests/test_pruning.py``'s own adversarial/oracle tests for this family).
+#
+# What's supported, and why:
+#
+# - The `Split` node's own `axis` must be confirmed to select the producer's
+#   last (output-channel) axis -- `axis == -1` outright, or a positive `axis`
+#   only when the producer output's own rank is known via `value_info` and
+#   agrees (:func:`_split_axis_is_last`, the same "confirm via value_info,
+#   decline rather than guess" bar :func:`_concat_axis_is_last` already
+#   holds a `Concat` node's own `axis` to) -- `Split`'s own schema default
+#   (`axis == 0`) is *not* the channel axis for this shape, unlike `Concat`'s
+#   required attribute, so an un-annotated or wrong-axis `Split` is declined,
+#   never assumed.
+# - Exactly two outputs, splitting the producer's own `2*H` output columns
+#   into two EQUAL `H`-wide halves (:func:`_split_explicit_sizes`) -- either
+#   spelling ONNX allows for that: no explicit sizes at all (`Split`'s own
+#   "even split" default, any opset), or an explicit `split` sizes
+#   attribute (pre-opset-13) / constant `split` *input* (opset 13+) that
+#   literally reads `[H, H]` -- both are the identical semantic split, just
+#   two different spellings; anything else (an unequal split, more than two
+#   outputs, or a *non-constant* `split` input this module can't resolve
+#   ahead of time) is declined outright, the same "decline rather than
+#   guess" bar every other topology ambiguity in this module gets.
+# - The producer must be a plain MatMul/vanilla-Gemm with a constant 2-D
+#   float weight (:func:`_match_producer`, reused unchanged), and its raw
+#   output must feed the `Split` node DIRECTLY -- single consumer, not a
+#   graph output, with no bias-Add/activation hop in between. A separate
+#   ``MatMul -> Add(bias)`` (rather than a fused `Gemm` with its own
+#   constant bias, which `_match_producer` already handles) feeding `Split`
+#   is therefore declined, not walked through -- :func:`_walk_to_consumer`'s
+#   forward hop machinery was built to walk *toward* an ordinary consumer,
+#   not to be re-purposed for matching a producer's own pre-`Split` hop, and
+#   doing so safely would need its own bookkeeping for a `Split`-bound
+#   per-channel constant split into two halves; out of scope for a first
+#   pass, and this is also the narrower case in practice -- `gate_up_proj`
+#   is `bias=False` in the real Phi-3 HF source this shape comes from.
+# - The combine step is either a plain elementwise ``Mul`` of two
+#   non-constant operands (each traced back to one of the `Split`'s own two
+#   outputs through zero or more `_UNARY_PASS_THROUGH` activation hops via
+#   :func:`_trace_split_half_backward` -- the split-half analogue of
+#   :func:`_trace_gate_producer_backward`, reusing the exact same
+#   `_UNARY_PASS_THROUGH` set so SiLU/Swish, Sigmoid, GeGLU's `Gelu`,
+#   `QuickGelu`, etc. are all recognized for free, exactly as they already
+#   are for the two-producer case) or ONNX's native fused
+#   ``SwiGLU(a, b[, alpha]) = swish(a) * b`` node (opset 28+), whose operands
+#   must already *be* the `Split`'s own two raw outputs with nothing in
+#   between -- mirroring :func:`_find_gated_chains`'s own identical
+#   restriction on that op (`SwiGLU`'s swish lives entirely inside the op,
+#   so there's nowhere to hang a pre-op). Either shape is accepted with the
+#   two `Split` outputs in EITHER role/order -- correctness here only needs
+#   both to trace back to the two *different* outputs of the *same* `Split`
+#   node, never which one is "the" gate; whatever the graph actually
+#   computes is what gets faithfully pruned, the identical stance
+#   :func:`_find_gated_chains` already takes for its own two-producer `Mul`
+#   case. A gate activation decomposed into more than one node (plain
+#   ``x * Sigmoid(x)`` rather than a single `Sigmoid`/native `Swish`/
+#   `SwiGLU`) isn't recognized -- left safely untouched, not guessed at,
+#   the same decline :func:`_find_gated_chains` already documents for the
+#   identical decomposed-SiLU shape.
+# - The combined `Mul`/`SwiGLU` output must feed, through zero or more of
+#   :func:`_walk_to_consumer`'s own existing forward hops (activation,
+#   per-channel bias/scale, fused `BiasGelu`/`FastGelu`, a trailing norm),
+#   into exactly one downstream MatMul/vanilla-Gemm's reduction dimension
+#   (`down_proj`) -- :func:`_walk_to_consumer` reused completely unchanged,
+#   exactly as :func:`_find_gated_chains` already reuses it for its own
+#   two-producer case.
+#
+# What's declined, deliberately, and why:
+#
+# - Conv has no analogue of this shape in any real export this module
+#   targets (a Conv producer's own `2*C`-channel output split in half along
+#   axis 1 isn't a pattern any known real model or exporter produces the way
+#   `gate_up_proj` is) -- MatMul/Gemm-only, mirroring
+#   :func:`_find_gated_chains`'s own identical restriction.
+# - A quantized producer or consumer (QDQ `DequantizeLinear`-fed,
+#   `MatMulNBits`-block-quantized, or any other of this module's other
+#   quantized-weight families) is out of scope for this first pass -- the
+#   co-selection slicing this section adds (one physical tensor's own two
+#   symmetric halves, plus a `Split` node's own size bookkeeping) would need
+#   to be re-derived for each of those weight representations' own storage
+#   layout independently; a real fused `gate_up_proj` this shape targets is
+#   also, in every export this module has actually seen, plain float, not
+#   pre-quantized -- declined and documented rather than attempted, per this
+#   module's own "decline rather than mis-slice" bar.
+# - `global_sparsity` mode: this chain's own `keep` set is chosen once, from
+#   *this one chain's own* combined-importance ranking over `h` candidates,
+#   exactly the same "every producer already needs mutual agreement before a
+#   second, global layer of agreement is even meaningful" reasoning
+#   :func:`apply_structured_pruning`'s own `global_sparsity` docstring gives
+#   for excluding an ordinary two-producer gated pair -- so this family is
+#   excluded from that mode's eligible pool too, left completely untouched
+#   by it rather than approximated, the same as a gated pair already is.
+# - :func:`analyze_pruning_sensitivity`'s dry-run mirror
+#   (:func:`_analyze_structured_pruning`/:func:`_analyze_structured_wanda_pruning`)
+#   doesn't have a `_SplitGatedChain`-shaped branch of its own -- exactly
+#   the same scope line already drawn for `Concat`-merged chains (see those
+#   functions' own bodies): a model containing any chain this section
+#   matches raises `NotImplementedError` from the dry-run entry points
+#   rather than silently omitting or mis-reporting it.
+
+
+_SplitSizesKind = Literal["auto", "attr", "input"]
+
+
+@dataclass(frozen=True)
+class _SplitGatedChain:
+    """One matched fused-`gate_up_proj` gated FFN block -- see this
+    section's own comment. `weight`/`bias` are the ONE physical producer
+    tensor shared by both the gate and up halves (columns ``[0, h)`` and
+    ``[h, 2h)`` respectively, per `Split`'s own output-order guarantee); a
+    single `keep` set, chosen over `h` (not `2h`) candidates by combining
+    both halves' own importance (root-sum-square, the same combining
+    formula an ordinary two-producer gated pair's two producers already get
+    -- see :func:`_apply_split_gated_chains`), is applied at BOTH offsets of
+    that one tensor.
+    """
+
+    split_node: onnx.NodeProto
+    producer_node: onnx.NodeProto
+    weight: str
+    weight_transposed: bool
+    bias: Optional[str]
+    h: int  # width of EACH half; the combined producer output is 2*h wide
+    split_sizes_kind: _SplitSizesKind
+    # Unary activation hops crossed between `split_node.output[0]`/`[1]` and
+    # the combine node -- purely for value_info staleness bookkeeping (see
+    # :attr:`_Producer.pre_ops`'s own comment); nothing here ever needs its
+    # own slicing, being pure single-input/single-output activations.
+    half0_pre_ops: Tuple[onnx.NodeProto, ...]
+    half1_pre_ops: Tuple[onnx.NodeProto, ...]
+    combine_node: onnx.NodeProto
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
+    consumer_node: onnx.NodeProto
+    consumer_weight: str
+    consumer_weight_transposed: bool
+
+
+def _split_axis(node: onnx.NodeProto) -> int:
+    for attr in node.attribute:
+        if attr.name == "axis":
+            return attr.i
+    return 0  # Split's own schema default -- unlike Concat's required attribute
+
+
+def _split_axis_is_last(
+    node: onnx.NodeProto, value_info_by_name: Dict[str, onnx.ValueInfoProto]
+) -> bool:
+    """The `Split`-node analogue of :func:`_concat_axis_is_last`, with a
+    single operand (`Split` has exactly one data input) rather than
+    `Concat`'s several: `axis == -1` outright, or a positive `axis` only
+    when `node.input[0]`'s own rank is known via `value_info` and agrees --
+    declined (never guessed at) when that rank isn't known at all. Unlike
+    `_concat_axis`, `Split`'s own `axis` attribute is optional (schema
+    default ``0``, see :func:`_split_axis`), so an un-annotated `Split`
+    still has a real (non-last, for any producer output of rank > 1) axis
+    to check against -- it isn't itself grounds for decline the way a
+    missing *required* attribute would be.
+    """
+    axis = _split_axis(node)
+    if axis < 0:
+        return axis == -1
+    rank = _tensor_rank(node.input[0], value_info_by_name)
+    if rank is None:
+        return False  # rank unknown -- decline rather than guess
+    return axis == rank - 1
+
+
+def _split_explicit_sizes(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[Optional[List[int]], _SplitSizesKind]]:
+    """Describes how `node` (assumed already confirmed to be a `Split`)
+    spells out its own two output sizes -- confirmed live via
+    ``onnx.defs.get_schema("Split")`` across every opset (1, 2, 11, 13, 18)
+    this module might encounter: opsets before 13 spell explicit sizes as an
+    integer-list `split` *attribute*; opset 13+ moved that to an optional
+    `split` *input* instead (still accepting no sizes at all, for an even
+    split); opset 18+ additionally allows a `num_outputs` attribute, which
+    this function never needs to read, since the actual output count is
+    already known directly from ``len(node.output)``.
+
+    Returns ``(sizes, "attr")`` for the legacy attribute spelling,
+    ``(sizes, "input")`` when the opset-13+ `split` input is present and
+    resolves to a constant ``INT64`` initializer, or ``(None, "auto")`` when
+    neither is present at all (a fully automatic even split, driven purely
+    by the actual output count). Returns ``None`` outright -- decline,
+    exactly this module's own "can't resolve ahead of time, don't guess"
+    bar -- when a `split` input IS present but is not a resolvable constant
+    (a genuinely dynamic, runtime-computed split size this module has no way
+    to confirm is really `[h, h]`, or reason to keep pruning-consistent
+    afterward).
+    """
+    if len(node.input) >= 2 and node.input[1]:
+        init = initializer_map.get(node.input[1])
+        if init is None or init.data_type != onnx.TensorProto.INT64:
+            return None
+        sizes = [int(v) for v in onnx.numpy_helper.to_array(init).reshape(-1)]
+        return sizes, "input"
+    for attr in node.attribute:
+        if attr.name == "split":
+            return list(attr.ints), "attr"
+    return None, "auto"
+
+
+def _trace_split_half_backward(
+    tensor_name: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    split_half_of: Dict[str, Tuple[onnx.NodeProto, int]],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    max_hops: int,
+) -> Optional[Tuple[onnx.NodeProto, int, Tuple[onnx.NodeProto, ...]]]:
+    """The split-half analogue of :func:`_trace_gate_producer_backward`:
+    walks backward from `tensor_name` through unary activation ops until it
+    resolves to one output of an already-matched gate_up `Split` node (a key
+    of `split_half_of`, built by :func:`_find_split_gated_chains`) instead
+    of a real MatMul/Gemm producer's own raw output. Returns
+    ``(split_node, half_index, pre_ops)`` -- `half_index` is `0` or `1`,
+    `node.output`'s own index, per `Split`'s own output-order guarantee (see
+    this section's own comment). Every tensor walked through, `tensor_name`
+    itself included, must have exactly one consumer and not be a graph
+    output -- the same safety bar :func:`_trace_gate_producer_backward`
+    already holds every intermediate tensor to.
+    """
+    pre_ops: List[onnx.NodeProto] = []
+    cur = tensor_name
+    for _ in range(max_hops):
+        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+            return None
+        if cur in split_half_of:
+            split_node, half = split_half_of[cur]
+            return split_node, half, tuple(reversed(pre_ops))
+        producer_node = node_by_output.get(cur)
+        if producer_node is None:
+            return None
+        if not (
+            producer_node.op_type in _UNARY_PASS_THROUGH
+            and len(producer_node.input) == 1
+            and len(producer_node.output) == 1
+        ):
+            return None
+        pre_ops.append(producer_node)
+        cur = producer_node.input[0]
+    return None
+
+
+def _find_split_gated_chains(graph: onnx.GraphProto) -> List[_SplitGatedChain]:
+    """Finds fused-`gate_up_proj` gated FFN blocks -- see this section's own
+    comment for the full shape, the co-selection semantics, and exactly
+    what's supported/declined and why.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+    node_by_output = {out: node for node in graph.node for out in node.output}
+    value_info_by_name = _value_info_by_name(graph)
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    producer_infos: Dict[str, Tuple[onnx.NodeProto, str, bool, Optional[str], int]] = {}
+    for node in graph.node:
+        info = _match_producer(node, initializer_map)
+        if info is not None:
+            w_name, weight_transposed, bias_name, n_channels = info
+            producer_infos[node.output[0]] = (
+                node,
+                w_name,
+                weight_transposed,
+                bias_name,
+                n_channels,
+            )
+
+    # Every gate_up-style Split matched, up front -- keyed by `id(node)` for
+    # the per-chain lookup below (the producer-side fields only; the
+    # combine/consumer-side fields are only known once a combine node is
+    # found, below), and by each of its own two output tensor names (->
+    # `(split_node, half_index)`) for _trace_split_half_backward's own
+    # bottom-out check.
+    split_matches: Dict[
+        int, Tuple[onnx.NodeProto, str, bool, Optional[str], int, _SplitSizesKind]
+    ] = {}
+    split_half_of: Dict[str, Tuple[onnx.NodeProto, int]] = {}
+    for node in graph.node:
+        if node.op_type != "Split" or len(node.output) != 2:
+            continue
+        if not node.input or not node.input[0]:
+            continue
+        if len(set(node.output)) != 2:
+            continue  # degenerate -- same tensor name twice
+        in_name = node.input[0]
+        if not _is_internal(in_name):
+            continue
+        producer_info = producer_infos.get(in_name)
+        if producer_info is None:
+            continue
+        producer_node, w_name, weight_transposed, bias_name, n2 = producer_info
+        if n2 % 2 != 0:
+            continue
+        h = n2 // 2
+        if not _split_axis_is_last(node, value_info_by_name):
+            continue
+        sizes_result = _split_explicit_sizes(node, initializer_map)
+        if sizes_result is None:
+            continue  # a dynamic (non-constant) split-sizes input -- decline
+        sizes, kind = sizes_result
+        if kind != "auto" and sizes != [h, h]:
+            continue  # not an equal two-way split of the producer's own output
+        if not (_is_internal(node.output[0]) and _is_internal(node.output[1])):
+            continue
+        split_matches[id(node)] = (
+            producer_node,
+            w_name,
+            weight_transposed,
+            bias_name,
+            h,
+            kind,
+        )
+        split_half_of[node.output[0]] = (node, 0)
+        split_half_of[node.output[1]] = (node, 1)
+
+    chains: List[_SplitGatedChain] = []
+    for node in graph.node:
+        if node.op_type == "Mul" and len(node.input) == 2 and len(node.output) == 1:
+            a_name, b_name = node.input
+            if (
+                a_name == b_name
+                or a_name in initializer_map
+                or b_name in initializer_map
+            ):
+                continue
+            trace_a = _trace_split_half_backward(
+                a_name,
+                node_by_output,
+                split_half_of,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            trace_b = _trace_split_half_backward(
+                b_name,
+                node_by_output,
+                split_half_of,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            if trace_a is None or trace_b is None:
+                continue
+            split_a, half_a, pre_a = trace_a
+            split_b, half_b, pre_b = trace_b
+        elif (
+            node.op_type == "SwiGLU" and len(node.input) == 2 and len(node.output) == 1
+        ):
+            a_name, b_name = node.input
+            if a_name in initializer_map or b_name in initializer_map:
+                continue
+            if not (_is_internal(a_name) and _is_internal(b_name)):
+                continue
+            info_a = split_half_of.get(a_name)
+            info_b = split_half_of.get(b_name)
+            if info_a is None or info_b is None:
+                continue
+            split_a, half_a = info_a
+            split_b, half_b = info_b
+            pre_a, pre_b = (), ()
+        else:
+            continue
+
+        if split_a is not split_b or half_a == half_b:
+            continue  # not both halves of the very same Split
+        producer_node, w_name, weight_transposed, bias_name, h, kind = split_matches[
+            id(split_a)
+        ]
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+
+        consumer, chain_ops = _walk_to_consumer(
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            h,
+            _MAX_CHAIN_HOPS,
+            value_info_by_name=value_info_by_name,
+        )
+        if consumer is None:
+            continue
+        if consumer[1] == w_name:
+            continue  # degenerate -- consumer tied to the combined producer weight
+
+        half0_pre_ops = pre_a if half_a == 0 else pre_b
+        half1_pre_ops = pre_b if half_a == 0 else pre_a
+
+        chains.append(
+            _SplitGatedChain(
+                split_node=split_a,
+                producer_node=producer_node,
+                weight=w_name,
+                weight_transposed=weight_transposed,
+                bias=bias_name,
+                h=h,
+                split_sizes_kind=kind,
+                half0_pre_ops=half0_pre_ops,
+                half1_pre_ops=half1_pre_ops,
+                combine_node=node,
+                chain_ops=chain_ops,
+                consumer_node=consumer[0],
+                consumer_weight=consumer[1],
+                consumer_weight_transposed=consumer[2],
+            )
+        )
+    return chains
+
+
+def _apply_split_gated_chains(
+    graph: onnx.GraphProto,
+    chains: List[_SplitGatedChain],
+    sparsity: float,
+    compute_importance,
+    touched: _TouchedState,
+) -> None:
+    """Applies every matched :class:`_SplitGatedChain` -- the fused
+    `gate_up_proj` analogue of :func:`_apply_chains`'s own gated-pair
+    handling, deliberately a separate function (like
+    :func:`_apply_concat_chains`) rather than folding into `_apply_chains`,
+    since the shape genuinely differs: `_apply_chains` slices `len(keep)`
+    columns from each of one-or-more *independent* producer tensors, all by
+    the exact same index set; here there is exactly ONE physical producer
+    tensor, and `keep` (chosen once, over `h` candidates -- see this
+    section's own comment) is applied at BOTH of its own two fixed offsets
+    (`[0, h)` and `[h, 2h)`), not to two different tensors.
+
+    `compute_importance(chain, w_arrays_nk) -> np.ndarray[h]` mirrors
+    :func:`_apply_chains`'s own callback shape exactly, `w_arrays_nk` being
+    `[gate_half_nk, up_half_nk]` -- the real call sites simply forward this
+    straight to :func:`_plain_branch_importance` (reused unchanged: it
+    already combines an arbitrary list of ``[N, K]`` arrays by root-sum-square
+    (L2) or plain sum (L1), exactly the formula a `_Chain` gated pair's own
+    two independent producers already get combined by), so a channel whose
+    gate-half weight is large but whose up-half is negligible (or vice
+    versa) ranks by their *combined*, not independently-considered,
+    importance -- the adversarial case this section's own tests construct
+    directly.
+
+    A `Split` node's own explicit output-size spelling (if any -- see
+    :func:`_split_explicit_sizes`), when present, is rewritten to the new,
+    still-EVEN `[len(keep), len(keep)]` once pruning finishes -- "still
+    even" isn't a coincidence needing reconciliation, it's the entire point
+    of co-selection: both halves are always pruned by the exact same `keep`
+    set, so they always stay the same width as each other post-prune, same
+    as pre-prune. A `Split` `input`-spelled size that happens to be a
+    *shared* constant initializer (reused, e.g. by common-subexpression
+    elimination, across more than one distinct `Split` node whose own `h`
+    values might disagree) is protected against a silent double-rewrite
+    conflict by `touched_split_size_inits` below, local to this one call --
+    a second chain that would need to rewrite an already-rewritten shared
+    initializer to a *different* value is declined outright (left
+    completely untouched) rather than corrupting the first chain's own
+    already-applied rewrite.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    touched_split_size_inits: Set[str] = set()
+
+    for chain in chains:
+        if (
+            chain.weight in touched.producer
+            or chain.consumer_weight in touched.consumer
+            or (chain.bias is not None and chain.bias in touched.const)
+        ):
+            continue  # a shared/tied initializer another chain already resized
+
+        if chain.split_sizes_kind == "input":
+            size_init_name = chain.split_node.input[1]
+            if size_init_name in touched_split_size_inits:
+                continue  # a shared split-sizes constant another chain already rewrote
+        else:
+            size_init_name = None
+
+        h = chain.h
+        keep_count = max(1, h - round(h * sparsity))
+        if keep_count >= h:
+            continue  # rounds down to a no-op for this layer
+
+        w = _to_f64(initializer_map[chain.weight])
+        w_nk = w if chain.weight_transposed else w.T  # [2h, k]
+        w_half0_nk = w_nk[:h, :]
+        w_half1_nk = w_nk[h:, :]
+        importance = compute_importance(chain, [w_half0_nk, w_half1_nk])
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+        # `keep` (< h) and `keep + h` (>= h) are disjoint ranges, each
+        # already ascending -- their concatenation is therefore already
+        # ascending overall too, same `keep`-is-ascending invariant every
+        # other chain family in this module maintains.
+        global_keep = np.concatenate([keep, keep + h])
+
+        _slice_producer_weight(
+            initializer_map[chain.weight], chain.weight_transposed, global_keep
+        )
+        if chain.bias is not None:
+            _slice_last_axis(initializer_map[chain.bias], global_keep)
+
+        for _, const_name in chain.chain_ops:
+            if const_name is not None:
+                _slice_last_axis(initializer_map[const_name], keep)
+
+        _slice_consumer_weight(
+            initializer_map[chain.consumer_weight],
+            chain.consumer_weight_transposed,
+            keep,
+        )
+
+        if chain.split_sizes_kind == "attr":
+            for attr in chain.split_node.attribute:
+                if attr.name == "split":
+                    del attr.ints[:]
+                    attr.ints.extend([keep_count, keep_count])
+                    break
+        elif chain.split_sizes_kind == "input":
+            assert size_init_name is not None
+            size_init = initializer_map[size_init_name]
+            size_init.CopyFrom(
+                onnx.numpy_helper.from_array(
+                    np.array([keep_count, keep_count], dtype=np.int64),
+                    name=size_init.name,
+                )
+            )
+            touched_split_size_inits.add(size_init_name)
+        # "auto": no explicit sizes anywhere -- the even split stays
+        # automatic at the new width, nothing to rewrite.
+
+        touched.producer.add(chain.weight)
+        touched.consumer.add(chain.consumer_weight)
+        if chain.bias is not None:
+            touched.const.add(chain.bias)
+        touched.const.update(
+            const_name for _, const_name in chain.chain_ops if const_name is not None
+        )
+
+        touched.stale_value_info.add(chain.producer_node.output[0])
+        touched.stale_value_info.update(chain.split_node.output)
+        touched.stale_value_info.update(op.output[0] for op in chain.half0_pre_ops)
+        touched.stale_value_info.update(op.output[0] for op in chain.half1_pre_ops)
+        touched.stale_value_info.add(chain.combine_node.output[0])
+        touched.stale_value_info.update(
+            chain_node.output[0] for chain_node, _ in chain.chain_ops
+        )
+
+
 # --- Concat-merged (skip-connection) chains ---------------------------------
 #
 # A `Concat` merge -- the U-Net-style encoder/decoder skip connection,
@@ -9304,6 +9890,23 @@ def apply_structured_pruning(
     surviving channel indices, since they're about to be multiplied. This
     gated form is MatMul/Gemm-only -- Conv chains don't take part in it.
 
+    Also handles the *fused*-`gate_up_proj` gated FFN shape real Phi-3/
+    Phi-3.5 exports use in place of two separate gate/up producers (see
+    :func:`_find_split_gated_chains` and this module's own "Split-merged
+    (fused gate_up_proj) gated FFN chains" section comment): ONE MatMul/
+    vanilla-Gemm producer whose ``2*h``-wide output is halved by a `Split`
+    node into a gate half and an up half, combined the same way as an
+    ordinary gated pair. Since both halves are two fixed offsets
+    (``[0, h)``/``[h, 2h)``) of the very same physical weight tensor rather
+    than two independent tensors, a single `keep` set -- chosen once, over
+    `h` (not `2h`) candidates, by the two halves' own combined (root-sum-
+    square) importance -- is applied at BOTH offsets of that one tensor,
+    keeping the `Split` exactly even (and its own explicit size spelling,
+    if any, rewritten to match) after pruning, same as before. MatMul/
+    Gemm-only, like the two-producer gated form above; not eligible for
+    `global_sparsity` either, for the identical reason a two-producer gated
+    pair already isn't (see `global_sparsity` below).
+
     Also handles a bounded slice of the Conv residual/skip-connection case
     (see :func:`_find_conv_residual_chains` and this module's own
     docstring): a channel-preserving ``Add(a, b)`` with two non-constant
@@ -9546,6 +10149,7 @@ def apply_structured_pruning(
         concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(
             graph
         )
+        split_gated_chains = _find_split_gated_chains(graph)
 
         touched = _TouchedState()
         if global_sparsity:
@@ -9560,6 +10164,10 @@ def apply_structured_pruning(
                     ),
                     touched,
                 )
+            # split_gated_chains, like an ordinary two-producer gated pair,
+            # is not eligible for global_sparsity's own pooled ranking --
+            # see this module's own "Split-merged (fused gate_up_proj)
+            # gated FFN chains" section comment for why.
         else:
             if chains:
                 _apply_chains(
@@ -9577,6 +10185,16 @@ def apply_structured_pruning(
                     concat_chains,
                     sparsity,
                     lambda _operand_name, w_arrays_nk: _plain_branch_importance(
+                        w_arrays_nk, importance_norm
+                    ),
+                    touched,
+                )
+            if split_gated_chains:
+                _apply_split_gated_chains(
+                    graph,
+                    split_gated_chains,
+                    sparsity,
+                    lambda _chain, w_arrays_nk: _plain_branch_importance(
                         w_arrays_nk, importance_norm
                     ),
                     touched,
@@ -9700,6 +10318,15 @@ def apply_structured_wanda_pruning(
     way, over every axis but the channel one), not at the shared downstream
     consumer -- consistent with each branch needing no other branch's
     agreement on anything, unlike a gated pair or residual merge.
+    The fused-`gate_up_proj` gated FFN shape (see
+    :func:`apply_structured_pruning`'s own docstring and
+    :func:`_find_split_gated_chains`) is matched and pruned here too, but
+    deliberately ranked by plain weight-magnitude importance only (the same
+    ``|W|``-only criterion :func:`apply_structured_pruning` itself always
+    uses) -- a dedicated calibrated ranking for it, wired through
+    :func:`_wanda_structured_calibration_stats`'s own shared probe-capture
+    pass, was judged out of scope for this round; every chain this function
+    *does* calibrate is completely unaffected by that scope decision.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to measure each
@@ -9785,7 +10412,8 @@ def apply_structured_wanda_pruning(
         + _find_matmul_residual_chains(graph)
     )
     concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(graph)
-    if not chains and not concat_chains:
+    split_gated_chains = _find_split_gated_chains(graph)
+    if not chains and not concat_chains and not split_gated_chains:
         return out
 
     act_norm = _wanda_structured_calibration_stats(
@@ -9810,6 +10438,20 @@ def apply_structured_wanda_pruning(
             return base  # no matching activation observed -- fall back to |W|
         return base * np.maximum(norm, epsilon)
 
+    # split_gated_chains' own probe point (its consumer's own input, exactly
+    # like an ordinary chain's) is deliberately never added to
+    # `_wanda_structured_calibration_stats`'s own probe set above -- ranked
+    # by plain weight-magnitude importance only, the same "no matching
+    # activation observed" fallback `_wanda_structured_importance` already
+    # falls back to, always taken here rather than sometimes -- see this
+    # module's own "Split-merged (fused gate_up_proj) gated FFN chains"
+    # section comment for why a dedicated calibrated ranking for this
+    # family was left out of scope for this round.
+    def _split_gated_wanda_importance(
+        _chain: _SplitGatedChain, w_arrays_nk: List[np.ndarray]
+    ) -> np.ndarray:
+        return _plain_branch_importance(w_arrays_nk, importance_norm)
+
     touched = _TouchedState()
     if global_sparsity:
         global_chains = [c for c in chains if _chain_is_global_sparsity_eligible(c)]
@@ -9825,6 +10467,14 @@ def apply_structured_wanda_pruning(
         if concat_chains:
             _apply_concat_chains(
                 graph, concat_chains, sparsity, _wanda_branch_importance, touched
+            )
+        if split_gated_chains:
+            _apply_split_gated_chains(
+                graph,
+                split_gated_chains,
+                sparsity,
+                _split_gated_wanda_importance,
+                touched,
             )
     if touched.stale_value_info:
         kept = [
@@ -29324,7 +29974,8 @@ def _analyze_structured_pruning(
     """Dry-run mirror of :func:`apply_structured_pruning` -- see
     :func:`analyze_pruning_sensitivity`'s own docstring for exactly which
     of that function's own topologies/modes are (and, for `Concat`-merged
-    chains and `global_sparsity`, deliberately are not) covered.
+    chains, fused-`gate_up_proj` split-gated chains, and `global_sparsity`,
+    deliberately are not) covered.
 
     Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
     "Subgraph recursion" section comment): every chain family is matched
@@ -29332,9 +29983,10 @@ def _analyze_structured_pruning(
     ``BeamSearch``-family subgraph, at any nesting depth, exactly as if
     that subgraph were its own top-level graph, mirroring
     :func:`apply_structured_pruning`'s own subgraph awareness. A
-    `Concat`-merged skip-connection chain found in ANY graph -- top-level
-    or nested -- still declines the whole call (`NotImplementedError`), the
-    same as it always did for the top-level graph alone.
+    `Concat`-merged skip-connection chain or a fused-`gate_up_proj`
+    split-gated chain found in ANY graph -- top-level or nested -- still
+    declines the whole call (`NotImplementedError`), the same as it always
+    did for the top-level graph alone.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -29359,6 +30011,13 @@ def _analyze_structured_pruning(
                 "analyze_pruning_sensitivity does not support models containing "
                 "Concat-merged skip-connection chains for the structured family "
                 "yet -- see analyze_pruning_sensitivity's own docstring for why"
+            )
+        if _find_split_gated_chains(graph):
+            raise NotImplementedError(
+                "analyze_pruning_sensitivity does not support models containing "
+                "fused-gate_up_proj split-gated FFN chains for the structured "
+                "family yet -- see analyze_pruning_sensitivity's own docstring "
+                "for why"
             )
 
         chain_groups = _structured_chain_groups(graph)
@@ -29417,6 +30076,13 @@ def _analyze_structured_wanda_pruning(
             "analyze_pruning_sensitivity does not support models containing "
             "Concat-merged skip-connection chains for the structured family "
             "yet -- see analyze_pruning_sensitivity's own docstring for why"
+        )
+    if _find_split_gated_chains(graph):
+        raise NotImplementedError(
+            "analyze_pruning_sensitivity does not support models containing "
+            "fused-gate_up_proj split-gated FFN chains for the structured "
+            "family yet -- see analyze_pruning_sensitivity's own docstring "
+            "for why"
         )
 
     chain_groups = _structured_chain_groups(graph)
@@ -32506,8 +33172,9 @@ def analyze_pruning_sensitivity(
     (a `ValueError` naming the nineteen functions that are supported); nor is
     `apply_structured_pruning`/`apply_structured_wanda_pruning`'s own
     `global_sparsity=True` mode or a model containing any `Concat`-merged
-    skip-connection chain (both a `NotImplementedError`, from within the
-    structured family's own dispatch) -- see this module's own "Dry-run
+    skip-connection chain or fused-`gate_up_proj` split-gated FFN chain
+    (all three a `NotImplementedError`, from within the structured family's
+    own dispatch) -- see this module's own "Dry-run
     pruning sensitivity analysis" section comment for the full reasoning
     behind every one of these scope decisions, `apply_embedding_vocab_pruning`
     included (see this module's own "Embedding / lm_head vocabulary family"
