@@ -22,3 +22,6 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
 
 onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
                                            double sparsity);
+
+onnx::ModelProto ApplyQMoEExpertChannelPruning(const onnx::ModelProto& model,
+                                               double sparsity);
