@@ -24,8 +24,16 @@ from onnx import parser
 import onnxsim
 
 
-def _model(x_shape, grid_shape, out_shape, mode, padding_mode, align_corners,
-          opset=20, ir_version=10):
+def _model(
+    x_shape,
+    grid_shape,
+    out_shape,
+    mode,
+    padding_mode,
+    align_corners,
+    opset=20,
+    ir_version=10,
+):
     body = f"""
     <
       ir_version: {ir_version},
@@ -74,8 +82,12 @@ def test_linear_all_padding_modes(padding_mode, align_corners):
     grid = _rand_grid(rng, (2, 4, 6, 2))
 
     model = _model(
-        "[2,3,5,7]", "[2,4,6,2]", "[2,3,4,6]",
-        mode="linear", padding_mode=padding_mode, align_corners=align_corners,
+        "[2,3,5,7]",
+        "[2,4,6,2]",
+        "[2,3,4,6]",
+        mode="linear",
+        padding_mode=padding_mode,
+        align_corners=align_corners,
     )
     _simplify_and_check(model, {"X": X, "grid": grid})
 
@@ -92,8 +104,12 @@ def test_nearest_all_padding_modes(padding_mode):
     grid = _rand_grid(rng, (2, 4, 6, 2))
 
     model = _model(
-        "[2,3,5,7]", "[2,4,6,2]", "[2,3,4,6]",
-        mode="nearest", padding_mode=padding_mode, align_corners=0,
+        "[2,3,5,7]",
+        "[2,4,6,2]",
+        "[2,3,4,6]",
+        mode="nearest",
+        padding_mode=padding_mode,
+        align_corners=0,
     )
     _simplify_and_check(model, {"X": X, "grid": grid})
 
@@ -123,8 +139,12 @@ def test_out_of_range_grid_values(padding_mode):
     grid = np.broadcast_to(base, (2, 4, 4, 2)).copy()
 
     model = _model(
-        "[2,3,4,4]", "[2,4,4,2]", "[2,3,4,4]",
-        mode="linear", padding_mode=padding_mode, align_corners=0,
+        "[2,3,4,4]",
+        "[2,4,4,2]",
+        "[2,3,4,4]",
+        mode="linear",
+        padding_mode=padding_mode,
+        align_corners=0,
     )
     _simplify_and_check(model, {"X": X, "grid": grid})
 
@@ -141,8 +161,12 @@ def test_dynamic_input_shape():
     grid = _rand_grid(rng, (2, 4, 6, 2))
 
     model = _model(
-        "[N,3,H,W]", "[N,4,6,2]", "[N,3,4,6]",
-        mode="linear", padding_mode="zeros", align_corners=0,
+        "[N,3,H,W]",
+        "[N,4,6,2]",
+        "[N,3,4,6]",
+        mode="linear",
+        padding_mode="zeros",
+        align_corners=0,
     )
     _simplify_and_check(model, {"X": X, "grid": grid})
 
@@ -156,7 +180,11 @@ def test_dynamic_input_shape_reflection_nearest():
     grid = _rand_grid(rng, (1, 3, 5, 2))
 
     model = _model(
-        "[N,2,H,W]", "[N,3,5,2]", "[N,2,3,5]",
-        mode="nearest", padding_mode="reflection", align_corners=1,
+        "[N,2,H,W]",
+        "[N,3,5,2]",
+        "[N,2,3,5]",
+        mode="nearest",
+        padding_mode="reflection",
+        align_corners=1,
     )
     _simplify_and_check(model, {"X": X, "grid": grid})
