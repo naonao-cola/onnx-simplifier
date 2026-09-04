@@ -628,19 +628,20 @@ def run_on_device(
     }
 
 
-def run_on_device_with_input(
+def run_on_device_with_inputs(
     axmodel_path: str,
-    input_tensor_name: str,
-    input_bytes: bytes,
+    inputs: Dict[str, bytes],
     *,
     binary: str = "/usr/bin/axcl/axcl_run_model",
     timeout: int = 120,
 ) -> Optional[List[bytes]]:
-    """Feed exactly `input_bytes` to `input_tensor_name` on a real device and
-    return the raw output tensor bytes (one per output, model's declared
-    order). Uses the confirmed real `-i/-o/-l` folder layout: `<in>/0/
-    <tensor_name>.bin`, `list.txt` containing `0`, outputs land at `<out>/0/
-    <output_name>.bin`. **The input filename must exactly match the tensor
+    """Feed exactly `inputs` (`{tensor_name: raw_bytes}`, one entry per
+    graph input -- e.g. a real reconstructed LLM graph's `input_ids` *and*
+    `position_ids`, see `demo_hf_llm.py`) to a real device and return the
+    raw output tensor bytes (one per output, model's declared order). Uses
+    the confirmed real `-i/-o/-l` folder layout: `<in>/0/<tensor_name>.bin`
+    per input, `list.txt` containing `0`, outputs land at `<out>/0/
+    <output_name>.bin`. **Each input filename must exactly match its tensor
     name** -- confirmed by trial: `axcl_run_model` errors with "Stimulus
     file ... is not exist" naming the *tensor's* name specifically, not an
     arbitrary/first-found file.
@@ -652,8 +653,9 @@ def run_on_device_with_input(
         out_dir = os.path.join(td, "out")
         os.makedirs(in_dir)
         os.makedirs(out_dir)
-        with open(os.path.join(in_dir, f"{input_tensor_name}.bin"), "wb") as f:
-            f.write(input_bytes)
+        for tensor_name, tensor_bytes in inputs.items():
+            with open(os.path.join(in_dir, f"{tensor_name}.bin"), "wb") as f:
+                f.write(tensor_bytes)
         list_path = os.path.join(td, "list.txt")
         with open(list_path, "w") as f:
             f.write("0\n")
@@ -685,3 +687,18 @@ def run_on_device_with_input(
             with open(p, "rb") as f:
                 outputs.append(f.read())
         return outputs or None
+
+
+def run_on_device_with_input(
+    axmodel_path: str,
+    input_tensor_name: str,
+    input_bytes: bytes,
+    *,
+    binary: str = "/usr/bin/axcl/axcl_run_model",
+    timeout: int = 120,
+) -> Optional[List[bytes]]:
+    """Single-input convenience wrapper over `run_on_device_with_inputs()`,
+    for the (still common) single-image-input-classifier case."""
+    return run_on_device_with_inputs(
+        axmodel_path, {input_tensor_name: input_bytes}, binary=binary, timeout=timeout
+    )
