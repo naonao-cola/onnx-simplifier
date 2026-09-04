@@ -915,12 +915,9 @@ follow-up round, exactly the mechanical
 :func:`apply_structured_pruning` established, applied to each family's own
 `apply_*`/`_analyze_*` pair (every `_analyze_*` mirror got the identical
 treatment its own `apply_*` did, for the same "report what a real call
-would actually do" reason the dry-run family exists at all -- unlike this
-note's original four, whose own `_analyze_*` mirrors -- `_analyze_magnitude_pruning`,
-`_analyze_structured_pruning`, `_analyze_attention_head_pruning` --
-:func:`weight_sparsity` has none -- were left NOT subgraph-aware by the
-round that added this note, a pre-existing gap this follow-up round did
-not touch since none of those three were in its own assigned scope):
+would actually do" reason the dry-run family exists at all --
+:func:`weight_sparsity` has no `_analyze_*` mirror to extend, so it is
+untouched by this round):
 :func:`apply_structured_pruning_qdq`, :func:`apply_structured_pruning_matmul_nbits`
 (including its own fused `MatMulNBitsMlp`/`MatMulNBitsQkv` shapes; a nested
 subgraph's `value_info_by_name` is narrowed the same conservative way
@@ -973,6 +970,30 @@ case would be handled -- a documented, conservative gap, not a correctness
 risk; see that function's own docstring for the full reasoning behind
 every one of these choices).
 
+Extended in a later round still to the three `_analyze_*` mirrors the very
+first paragraph above's own round left out purely because they fell
+outside that round's own assigned scope, not any technical obstacle --
+their own `apply_*` counterparts were already subgraph-aware from that
+first paragraph onward: :func:`_analyze_magnitude_pruning` (including its
+own `global_sparsity` mode, pooled every matched layer across every
+graph -- top-level and every nested subgraph alike -- into the one shared
+global ranking, the identical whole-model pooling
+:func:`apply_magnitude_pruning`'s own `global_sparsity` mode already
+uses); :func:`_analyze_structured_pruning` (every chain family it
+matches, reported inside every graph the same way
+:func:`apply_structured_pruning` prunes it in -- `global_sparsity=True`
+remains a flat `NotImplementedError` for this dry-run function regardless
+of subgraphs, per :func:`analyze_pruning_sensitivity`'s own docstring, so
+there is no separate per-graph-vs-whole-model pooling decision to make
+here the way there was for the unstructured family above); and
+:func:`_analyze_attention_head_pruning` (every block family it matches,
+mirroring the same conservatively-narrower-in-subgraphs
+`value_info_by_name` behavior :func:`apply_attention_head_pruning`'s own
+docstring already establishes -- see that function's own docstring --
+so this report never over-predicts what a nested subgraph's own dynamic
+per-head bias/mask/head_sink classification would actually do; a real
+call would leave those cases untouched, and so does this report).
+
 Deliberately NOT subgraph-aware, a scope decision rather than an
 oversight -- each remains exactly as top-level-graph-only as it already
 was:
@@ -1004,13 +1025,6 @@ was:
   correctly fall back to without declining the whole function outright, so
   those three ARE subgraph-aware for matching/slicing/committing -- see the
   paragraph above.
-- :func:`analyze_pruning_sensitivity` itself dispatches to nineteen
-  separate `_analyze_*` implementations (one per supported `apply_fn`),
-  each with its own bespoke top-level-graph-only body mirroring its real
-  `apply_*` counterpart -- extending it would mean the same per-function
-  treatment as the point above, all nineteen of them, not a change to
-  :func:`analyze_pruning_sensitivity` itself; deferred for the same
-  review-size reason.
 """
 
 from __future__ import annotations
@@ -28781,8 +28795,7 @@ def _unstructured_family(node: onnx.NodeProto, is_conv: bool) -> str:
 
 
 def _analyze_unstructured(
-    graph: onnx.GraphProto,
-    candidates: List,
+    graph_candidates: List[Tuple[onnx.GraphProto, List]],
     compute_importance: Callable[
         [onnx.NodeProto, str, str, bool, bool, onnx.TensorProto, np.ndarray],
         np.ndarray,
@@ -28802,20 +28815,40 @@ def _analyze_unstructured(
     ``(node, x_name, w_name, weight_transposed, is_conv, w_init, w_nk)`` and
     returns an importance array shaped like `w_nk` -- plain ``|w_nk|`` for
     magnitude, :func:`_wanda_importance`'s metric for Wanda.
+
+    `graph_candidates` is a ``(graph, candidates)`` pair per graph to
+    analyze, `candidates` being that graph's own :func:`_candidates` result.
+    :func:`_analyze_magnitude_pruning` passes one entry per
+    :func:`_iter_subgraphs`-returned graph (top-level and every nested
+    ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph alike), mirroring
+    :func:`apply_magnitude_pruning`'s own subgraph awareness (see this
+    module's own "Subgraph recursion" section comment);
+    :func:`_analyze_wanda_pruning` always passes exactly one entry, its own
+    top-level graph only -- deliberately not subgraph-aware, see this
+    module's own top-of-file docstring for why. In `global_sparsity` mode
+    every candidate from every `graph_candidates` entry is pooled into one
+    shared ranking, so the pooling scope is whatever span of graphs the
+    caller itself passed in -- the whole model for
+    :func:`_analyze_magnitude_pruning` (consistent with
+    :func:`apply_magnitude_pruning`'s own `global_sparsity` mode, which
+    pools the same way), a single graph for :func:`_analyze_wanda_pruning`.
     """
-    initializer_map = {t.name: t for t in graph.initializer}
     layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
 
     if global_sparsity:
         entries = []
-        for node, x_name, w_name, weight_transposed, is_conv in candidates:
-            w_init = initializer_map[w_name]
-            w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-            w_nk = _weight_to_nk(w, weight_transposed, is_conv)
-            importance = compute_importance(
-                node, x_name, w_name, weight_transposed, is_conv, w_init, w_nk
-            )
-            entries.append((node, is_conv, w_nk, importance))
+        for graph, candidates in graph_candidates:
+            initializer_map = {t.name: t for t in graph.initializer}
+            for node, x_name, w_name, weight_transposed, is_conv in candidates:
+                w_init = initializer_map[w_name]
+                w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
+                w_nk = _weight_to_nk(w, weight_transposed, is_conv)
+                importance = compute_importance(
+                    node, x_name, w_name, weight_transposed, is_conv, w_init, w_nk
+                )
+                entries.append((node, is_conv, w_nk, importance))
+            not_eligible.extend(_unstructured_not_eligible(graph, candidates))
 
         pooled = (
             np.concatenate([importance.reshape(-1) for *_, importance in entries])
@@ -28854,35 +28887,36 @@ def _analyze_unstructured(
                 )
             )
     else:
-        for node, x_name, w_name, weight_transposed, is_conv in candidates:
-            w_init = initializer_map[w_name]
-            w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-            w_nk = _weight_to_nk(w, weight_transposed, is_conv)
-            importance = compute_importance(
-                node, x_name, w_name, weight_transposed, is_conv, w_init, w_nk
-            )
-            mask = (
-                _nm_mask(importance, n, m)
-                if n is not None and m is not None
-                else _sparsity_mask(importance, sparsity)
-            )
-            would_drop = int((~mask).sum())
-            margin = _normalized_margin(importance, mask) if would_drop else None
-            layers.append(
-                PruningLayerSensitivity(
-                    label=_node_label(node),
-                    family=_unstructured_family(node, is_conv),
-                    total=int(mask.size),
-                    would_drop=would_drop,
-                    margin=margin,
-                    importance_min=float(importance.min()),
-                    importance_max=float(importance.max()),
+        for graph, candidates in graph_candidates:
+            initializer_map = {t.name: t for t in graph.initializer}
+            for node, x_name, w_name, weight_transposed, is_conv in candidates:
+                w_init = initializer_map[w_name]
+                w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
+                w_nk = _weight_to_nk(w, weight_transposed, is_conv)
+                importance = compute_importance(
+                    node, x_name, w_name, weight_transposed, is_conv, w_init, w_nk
                 )
-            )
+                mask = (
+                    _nm_mask(importance, n, m)
+                    if n is not None and m is not None
+                    else _sparsity_mask(importance, sparsity)
+                )
+                would_drop = int((~mask).sum())
+                margin = _normalized_margin(importance, mask) if would_drop else None
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=_node_label(node),
+                        family=_unstructured_family(node, is_conv),
+                        total=int(mask.size),
+                        would_drop=would_drop,
+                        margin=margin,
+                        importance_min=float(importance.min()),
+                        importance_max=float(importance.max()),
+                    )
+                )
+            not_eligible.extend(_unstructured_not_eligible(graph, candidates))
 
-    return PruningSensitivityReport(
-        layers=layers, not_eligible=_unstructured_not_eligible(graph, candidates)
-    )
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
 
 def _analyze_magnitude_pruning(
@@ -28897,6 +28931,16 @@ def _analyze_magnitude_pruning(
     (:func:`_sparsity_mask`/:func:`_nm_mask`/
     :func:`_apply_global_unstructured_pruning`) logic, reused directly, but
     `model` is never mutated: see :func:`analyze_pruning_sensitivity`.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): every matched layer inside a
+    nested ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph, at any
+    nesting depth, is matched and reported exactly as if it were its own
+    top-level graph, mirroring :func:`apply_magnitude_pruning`'s own
+    subgraph awareness -- including its `global_sparsity` mode, which pools
+    every matched layer across every graph (top-level and every nested
+    subgraph alike) into the one shared global ranking, exactly like the
+    real call.
     """
     _validate_pattern(sparsity, n, m)
     if global_sparsity and n is not None:
@@ -28906,8 +28950,6 @@ def _analyze_magnitude_pruning(
         )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
-    candidates = _candidates(graph)
 
     def _importance(
         node: onnx.NodeProto,
@@ -28920,8 +28962,11 @@ def _analyze_magnitude_pruning(
     ) -> np.ndarray:
         return np.abs(w_nk)
 
+    graph_candidates = [
+        (graph, _candidates(graph)) for graph in _iter_subgraphs(model.graph)
+    ]
     return _analyze_unstructured(
-        graph, candidates, _importance, sparsity, n, m, global_sparsity
+        graph_candidates, _importance, sparsity, n, m, global_sparsity
     )
 
 
@@ -28993,7 +29038,7 @@ def _analyze_wanda_pruning(
         return _wanda_importance(w_nk, norm, epsilon)
 
     return _analyze_unstructured(
-        graph, candidates, _importance, sparsity, n, m, global_sparsity
+        [(graph, candidates)], _importance, sparsity, n, m, global_sparsity
     )
 
 
@@ -29222,6 +29267,16 @@ def _analyze_structured_pruning(
     :func:`analyze_pruning_sensitivity`'s own docstring for exactly which
     of that function's own topologies/modes are (and, for `Concat`-merged
     chains and `global_sparsity`, deliberately are not) covered.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): every chain family is matched
+    and reported inside a nested ``If``/``Loop``/``Scan``/
+    ``BeamSearch``-family subgraph, at any nesting depth, exactly as if
+    that subgraph were its own top-level graph, mirroring
+    :func:`apply_structured_pruning`'s own subgraph awareness. A
+    `Concat`-merged skip-connection chain found in ANY graph -- top-level
+    or nested -- still declines the whole call (`NotImplementedError`), the
+    same as it always did for the top-level graph alone.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -29234,28 +29289,33 @@ def _analyze_structured_pruning(
         )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
 
-    concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(graph)
-    if concat_chains:
-        raise NotImplementedError(
-            "analyze_pruning_sensitivity does not support models containing "
-            "Concat-merged skip-connection chains for the structured family "
-            "yet -- see analyze_pruning_sensitivity's own docstring for why"
+    layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
+    for graph in _iter_subgraphs(model.graph):
+        concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(
+            graph
         )
+        if concat_chains:
+            raise NotImplementedError(
+                "analyze_pruning_sensitivity does not support models containing "
+                "Concat-merged skip-connection chains for the structured family "
+                "yet -- see analyze_pruning_sensitivity's own docstring for why"
+            )
 
-    chain_groups = _structured_chain_groups(graph)
-    layers = _analyze_chains(
-        graph,
-        chain_groups,
-        sparsity,
-        lambda chain, w_arrays_nk: _plain_structured_importance(
-            chain, w_arrays_nk, importance_norm
-        ),
-    )
-    return PruningSensitivityReport(
-        layers=layers, not_eligible=_structured_not_eligible(graph, chain_groups)
-    )
+        chain_groups = _structured_chain_groups(graph)
+        layers.extend(
+            _analyze_chains(
+                graph,
+                chain_groups,
+                sparsity,
+                lambda chain, w_arrays_nk: _plain_structured_importance(
+                    chain, w_arrays_nk, importance_norm
+                ),
+            )
+        )
+        not_eligible.extend(_structured_not_eligible(graph, chain_groups))
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
 
 def _analyze_structured_wanda_pruning(
@@ -30368,40 +30428,65 @@ def _analyze_attention_head_pruning(
     :func:`_analyze_attention_head_wanda_pruning` uses), with plain
     (:func:`_plain_attention_head_importance`/:func:`_gqa_group_importance`)
     importance, reused directly, but `model` is never mutated.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): every block family is matched
+    and reported inside a nested ``If``/``Loop``/``Scan``/
+    ``BeamSearch``-family subgraph, at any nesting depth, mirroring
+    :func:`apply_attention_head_pruning`'s own subgraph awareness --
+    including that same function's own conservative narrowing there: a
+    nested subgraph's `value_info_by_name` comes from its own
+    already-declared `input`/`output`/`value_info` only
+    (:func:`_value_info_by_name`, no shape-inference pass), never from
+    :func:`_shape_inferred_value_info_by_name` the way the top-level
+    graph's own is, so this report predicts the exact same conservative
+    outcome a real call would have for a nested subgraph's own dynamic
+    `attention_bias`/`attn_mask`/`head_sink` input that is only
+    shape-resolvable via inference rather than already declared outright
+    (left unmatched/undropped here too, not over-predicted) -- see
+    :func:`apply_attention_head_pruning`'s own docstring for exactly why.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
     _validate_importance_norm(importance_norm)
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    graph = model.graph
-    value_info_by_name = _shape_inferred_value_info_by_name(model)
+    top_value_info_by_name = _shape_inferred_value_info_by_name(model)
 
-    chains: List[_AttnLikeChain] = [
-        *_find_attention_chains(graph, value_info_by_name),
-        *_find_gqa_chains(graph, value_info_by_name),
-        *_find_onnx_attention_chains(graph, value_info_by_name),
-        *_find_mha_chains(graph, value_info_by_name),
-        *_find_packed_mha_chains(graph, value_info_by_name),
-        *_find_decoder_masked_mha_chains(graph, value_info_by_name),
-        *_find_paged_attention_chains(graph, value_info_by_name),
-        *_find_linear_attention_chains(graph, value_info_by_name),
-        *_find_sparse_attention_chains(graph, value_info_by_name),
-    ]
-    layers = _analyze_attention_chains(
-        graph,
-        chains,
-        sparsity,
-        lambda chain, wq, wk, wv, dq, dk, dv: _plain_attention_head_importance(
-            chain, wq, wk, wv, dq, dk, dv, importance_norm
-        ),
-        lambda chain, wq, wk, wv: _gqa_group_importance(
-            chain, wq, wk, wv, importance_norm
-        ),
-    )
-    return PruningSensitivityReport(
-        layers=layers, not_eligible=_attention_not_eligible(graph, chains)
-    )
+    layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
+    for graph in _iter_subgraphs(model.graph):
+        value_info_by_name = (
+            top_value_info_by_name
+            if graph is model.graph
+            else _value_info_by_name(graph)
+        )
+        chains: List[_AttnLikeChain] = [
+            *_find_attention_chains(graph, value_info_by_name),
+            *_find_gqa_chains(graph, value_info_by_name),
+            *_find_onnx_attention_chains(graph, value_info_by_name),
+            *_find_mha_chains(graph, value_info_by_name),
+            *_find_packed_mha_chains(graph, value_info_by_name),
+            *_find_decoder_masked_mha_chains(graph, value_info_by_name),
+            *_find_paged_attention_chains(graph, value_info_by_name),
+            *_find_linear_attention_chains(graph, value_info_by_name),
+            *_find_sparse_attention_chains(graph, value_info_by_name),
+        ]
+        layers.extend(
+            _analyze_attention_chains(
+                graph,
+                chains,
+                sparsity,
+                lambda chain, wq, wk, wv, dq, dk, dv: _plain_attention_head_importance(
+                    chain, wq, wk, wv, dq, dk, dv, importance_norm
+                ),
+                lambda chain, wq, wk, wv: _gqa_group_importance(
+                    chain, wq, wk, wv, importance_norm
+                ),
+            )
+        )
+        not_eligible.extend(_attention_not_eligible(graph, chains))
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
 
 def _analyze_attention_head_wanda_pruning(
