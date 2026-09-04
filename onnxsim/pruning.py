@@ -281,6 +281,46 @@ residual/gated/`Concat` machinery described below, since all three reuse
 this same :func:`_walk_to_consumer` for their own forward continuation, with
 no composition-specific code of its own.
 
+That same raw, not-yet-optimizer-fused export has one more gap the
+`BiasGelu`/`FastGelu`/`QuickGelu` fusions above don't close: the fused
+`Gelu`/`com.microsoft::Gelu` op itself needs a late opset (native `Gelu`
+needs opset 20+, `Swish` needs opset 24+, confirmed live via
+`onnx.defs.get_schema`), so a raw `torch.onnx.export` at any earlier/default
+opset emits the literal decomposition instead -- a "self-gated" shape where
+the producer's own output tensor feeds *two* consumers at once (a gate
+branch, and the `Mul` that combines it with that branch's own output),
+breaking every other hop's own single-consumer-per-tensor assumption, which
+is why a chain hitting this shape used to just stop dead, completely
+unpruned end to end (confirmed empirically -- see
+:func:`_match_self_gated_activation`'s own section comment, just above
+:func:`_walk_to_consumer`, for the exact verification and the two concrete
+node shapes this reaches: `nn.SiLU()`/`nn.Swish()` -- the default activation
+in Ultralytics YOLOv5/v8's own Conv blocks, and the gate activation in
+Llama-family SwiGLU -- and erf-based `nn.GELU()` at opset < 20, the
+overwhelming majority of real exports). Recognized by all four chain
+walkers (:func:`_walk_to_consumer`/:func:`_walk_matmul_producer_backward`
+for MatMul/Gemm chains, :func:`_walk_to_conv_consumer`/
+:func:`_walk_conv_producer_backward` for Conv chains -- `SiLU` is as
+ubiquitous after Conv in YOLO-style backbones as after Linear layers, and
+neither shape needs any per-channel operand or axis reasoning at all, so
+one matcher serves both chain families unchanged) as one more "nothing to
+slice" hop, the same shape a pooling/`Resize`/`Pad`/`Clip` hop's own
+`chain_ops` entries already are -- every node the decomposition spans
+(`Sigmoid`/`Erf`, and each scalar `Div`/`Add`/`Mul` operand) has no
+per-channel parameter to slice, and the shared `keep` set flows through
+unchanged. Forward, it's recognized only as a walk's very first hop (the
+shape every real export above actually produces -- see that section's own
+comment for why a later hop can never see it); backward, at whatever
+position in the chain it's actually crossed. Declines (never guesses) the
+same conservative way every other hop in this module does: a non-single-
+consumer intermediate tensor anywhere on the gate branch, a non-scalar or
+non-constant "other operand" on any binary step (`Div`/`Mul`/`Add`/`Sub`
+against a genuine constant only), an unrecognized op, a branch longer than
+this hop's own bounded search, or an ambiguous match (more than one
+candidate gate `Mul`, or, backward, more than one operand ordering that both
+resolve) -- every one of these simply means "no self-gated diamond here,"
+the chain declines exactly as it always did before this hop existed.
+
 A `Concat` merge -- the U-Net-style encoder/decoder skip connection
 (`merged = Concat(a, b, axis=1)`, each branch keeping its own disjoint slice
 of the merged channel range) -- looks at first glance like it needs the same
@@ -3161,6 +3201,25 @@ _UNARY_PASS_THROUGH = {
     # elementwise like `HardSigmoid` already above, so the same reasoning
     # applies.
     "HardSwish",
+    # ai.onnx (domain "") Erf(X) -> Y, the error function -- confirmed live
+    # via `onnx.defs.get_schema("Erf")`: single required input, single
+    # output, *no* attributes at all, unchanged since its very first opset
+    # (`since_version=13` here). Exactly as unary/elementwise/parameter-free
+    # as every other entry in this set, and -- unlike `QuickGelu`/`Swish`
+    # above, which were already fused single-node activations -- this is the
+    # one piece a *decomposed* erf-based `nn.GELU()` export (opset < 20, the
+    # overwhelming majority of real `torch.onnx.export` output -- native
+    # `Gelu` needs opset 20+, confirmed live via
+    # `onnx.defs.get_schema("Gelu")`) actually needs: `Div(x, sqrt(2)) ->
+    # Erf -> Add(1) -> ...` (see this module's own "self-gated activation
+    # decomposition" section comment below for the full shape). Adding it
+    # here, alone, already extends every walker that already consults
+    # `_UNARY_PASS_THROUGH` for free, the same way `QuickGelu` did -- but
+    # note the *rest* of that decomposition (the `Div`/`Add` against a
+    # genuine scalar constant, and the self-gating `Mul` against the walk's
+    # own running tensor) is a fundamentally different shape unary
+    # membership alone can't reach; see that section for what closes the gap.
+    "Erf",
 }
 _BINARY_CHANNEL_OPS = {"Add", "Mul"}
 _MAX_CHAIN_HOPS = 8
@@ -4002,6 +4061,467 @@ def _match_fused_bias_gelu(
     return data_name, bias_name
 
 
+# --- Self-gated activation decomposition ("SiLU"/erf-"GELU", unfused) ------
+#
+# `Gelu`/`com.microsoft::Gelu` (already unary, `_UNARY_PASS_THROUGH`) and the
+# fused `BiasGelu`/`FastGelu`/`QuickGelu` (`_FUSED_BIAS_GELU_OPS`, above) all
+# require either a late opset (native `Gelu` needs opset 20+, confirmed live
+# via `onnx.defs.get_schema("Gelu")`; `Swish` needs opset 24+, see
+# `_UNARY_PASS_THROUGH`'s own comment) or onnxruntime's own transformer-
+# optimizer fusion pass. A raw `torch.onnx.export`, at any earlier/default
+# opset and *without* that optimizer pass having run, emits the literal
+# decomposition instead -- a "self-gated" shape where the producer's own
+# output tensor `cur` feeds *two* consumers at once: one is the gate branch's
+# own first op, the other is the `Mul` that combines `cur` with the gate
+# branch's own final output. Every other hop in this module -- including
+# every one of this section's own neighbors above -- assumes `cur` has
+# exactly one consumer at the point it's crossed; this shape breaks that
+# assumption outright, which is why, before this section existed, a chain
+# hitting one of these two decompositions just stopped dead, completely
+# unpruned end to end (confirmed empirically: building a small
+# `Conv -> {SiLU decomposition} -> Conv`/`Gemm -> {...} -> Gemm` model via
+# `onnx.parser` and running `apply_structured_pruning` at this feature's own
+# starting commit left every weight on both sides of the chain completely
+# untouched, while the identical model built with the *fused* `Gelu` node
+# instead pruned correctly -- isolating the gap to the decomposition
+# specifically, not the pruning logic in general).
+#
+# Two concrete shapes, both confirmed live via `torch.onnx.export` (not
+# assumed from the math):
+#
+# - `nn.SiLU()`/`nn.Swish()` -- the default activation in Ultralytics
+#   YOLOv5/v8's own Conv blocks, and the gate activation in Llama-family
+#   SwiGLU -- exports (`torch.onnx.export(nn.SiLU(), ...)`, any opset) to
+#   exactly two nodes, `cur` consumed twice: ``s = Sigmoid(cur); out =
+#   Mul(cur, s)``.
+# - `nn.GELU()` (erf, the default `approximate="none"`) at opset < 20 --
+#   the overwhelming majority of real exports, since native `Gelu` needs
+#   opset 20+ -- exports (`torch.onnx.export(nn.GELU(), opset_version=17,
+#   ...)`) to exactly five nodes, `cur` consumed twice (by the first `Div`
+#   and the middle `Mul`): ``d = Div(cur, sqrt(2)); e = Erf(d); a = Add(e,
+#   1.0); m = Mul(cur, a); out = Mul(m, 0.5)``. This is the SiLU shape above
+#   plus two differences: a longer gate branch (`Div, Erf, Add` instead of
+#   just `Sigmoid`), and one *more* node -- a trailing scalar `Mul` -- after
+#   the self-gating `Mul` itself, since the final output isn't the gate
+#   `Mul`'s own output, it's that scaled by a constant `0.5`.
+#
+# :func:`_match_self_gated_activation` (forward) and
+# :func:`_match_self_gated_activation_backward` (backward) recognize a
+# *fixed* node shape generalizing both -- not a general subgraph search, the
+# same "recognize this exact topology, decline everything else" discipline
+# :func:`_match_fused_bias_gelu` above already applies to its own two fused
+# ops -- built on one shared piece, :func:`_walk_gate_branch`, since both
+# directions need to answer the identical question ("does a chain of allowed
+# ops, each a strict single-consumer/single-producer hop, connect this tensor
+# to that one"), just walked in opposite directions over opposite maps
+# (`consumers_of` forward, `node_by_output` backward). A gate branch step is
+# either a node already in `_UNARY_PASS_THROUGH` (`Sigmoid` for SiLU;
+# `Erf` for erf-GELU, added there for exactly this reason -- see its own
+# comment) or a binary op in `_GATE_BRANCH_BINARY_OPS` (`Div`/`Mul`/`Add`/
+# `Sub`) whose *other* operand (not the branch's own running tensor) is a
+# genuine scalar constant initializer (:func:`_gate_branch_scalar_const`,
+# reusing :func:`_match_clip_channel_pass_through`'s own identical
+# "`dims` exactly `[]` or `[1]`" scalar bar as precedent -- neither
+# `sqrt(2)`, `1.0`, nor the trailing `0.5` is ever per-channel, each
+# broadcasts over every element uniformly, exactly like `Clip`'s own scalar
+# `min`/`max`). Declines (never guesses) the same conservative way every
+# other hop in this module does: a non-single-consumer intermediate tensor
+# anywhere on the gate branch, a non-scalar or non-constant "other operand"
+# on any binary step, an unrecognized op, a branch that runs past
+# `_MAX_GATE_BRANCH_HOPS` without reaching its expected target, `cur`
+# consumed by anything other than exactly these two roles, or an ambiguous
+# match (more than one candidate gate `Mul`, or more than one operand
+# ordering that both resolve) -- every one of these just means "no self-gated
+# diamond here," the chain declines exactly as it always did before this
+# section existed, never a partial or guessed slice.
+#
+# On a full match, the whole diamond -- every node crossed, branch and gate
+# (and, for erf-GELU, the trailing scalar `Mul`) alike -- folds into the
+# chain the same "nothing to slice" way a pooling/`Resize`/`Pad`/`Clip` hop's
+# own `chain_ops` entries already do: none of `Sigmoid`/`Erf`/the scalar
+# `Div`/`Add`/`Mul` operands need their own weight sliced at all (the running
+# tensor's *value* changes as channels are removed, exactly as it always
+# does through any elementwise op, but there is no per-channel *parameter* on
+# any of these nodes for slicing to even mean anything), so every diamond
+# node becomes one more `(node, None)` `chain_ops` entry, in the branch's own
+# execution order (branch nodes, then the gate `Mul`, then the optional
+# trailing scalar `Mul`), and the walk continues from the diamond's own true
+# output tensor.
+#
+# Forward (:func:`_walk_to_consumer`/:func:`_walk_to_conv_consumer`), the
+# diamond is recognized only as a walk's very *first* hop (`cur == start`,
+# and only on the ordinary, non-`forced_first_hop` path -- see each walker's
+# own docstring for why `forced_first_hop` is skipped): every hop *after* the
+# first already only ever promotes `out2` to `cur` once `out2`'s own single-
+# consumer bar is confirmed (see e.g. this file's own `_walk_to_consumer`
+# loop), so `cur` can never legitimately have two consumers past hop 0 in the
+# first place -- there is no "diamond mid-chain" shape to reach, only
+# "diamond as the chain's first hop," which is also the shape every real
+# export above actually produces (the decomposition sits directly on the
+# producer's own raw output, or on a residual/`Concat` merge's own resolved
+# tensor). Reaching hop 0 with a two-consumer `cur` at all needs the two
+# plain, single-producer/single-consumer chain finders
+# (:func:`_find_chains`/:func:`_find_conv_chains`) to admit it there too --
+# each's own `_is_internal` gate, requiring a producer's raw output to have
+# *exactly* one consumer before ever calling the forward walker at all, is
+# relaxed to also admit *exactly two*, deferring the real validation to the
+# walker's own new check (a false admission here costs one wasted, safely-
+# declining call, never a wrong slice). `forced_first_hop` callers
+# (:func:`_resolve_matmul_fanout_branches`/:func:`_resolve_conv_fanout_branches`,
+# resolving one specific extra consumer of an already-multi-consumer
+# backbone tensor) and the two `Concat`-merge finders' own downstream walk
+# from a `Concat` node's merged output are deliberately left out of this
+# admission -- both are lower-value, narrower extensions of an already-broad
+# change, not the shape either real export above ever produces directly (a
+# gated activation sits on a producer's own output, never directly on a
+# residual fan-out branch's forced entry point or a `Concat`'s own merged
+# output) -- so a diamond immediately following one of *those* is still
+# declined, the same conservative "not attempted" scope every other hop in
+# this module draws somewhere.
+#
+# Backward (:func:`_walk_matmul_producer_backward`/
+# :func:`_walk_conv_producer_backward`), no equivalent admission problem
+# exists: every hop the backward walk crosses is already checked by looking
+# up `node_by_output[cur]` fresh, at any position in the chain, with no
+# "already vetted as single-consumer" precondition the way the forward walk's
+# post-hop-0 `cur` has -- so the diamond is recognized the same way as any
+# other backward hop, checked first (before the ordinary `_BINARY_CHANNEL_OPS`
+# dispatch, since a plain `Add`/`Mul` bias/scale hop and the diamond's own
+# gate/trailing `Mul` are otherwise indistinguishable by op type alone) at
+# whatever position in the chain it's actually crossed, mirroring how a
+# `PRelu`/`Clip` hop's own backward counterpart needs no externally-supplied
+# channel count either. The diamond's own origin tensor legitimately has
+# *two* real in-group consumers (the branch's own first node, and the gate
+# `Mul`) -- both are recorded as `edges` entries (mirroring every other
+# backward hop's own `(new_cur, node)` bookkeeping, just two entries sharing
+# one `new_cur` instead of the usual one), which
+# :func:`_find_matmul_residual_chains`/:func:`_find_conv_residual_chains`'s
+# own `accounted: Dict[str, Set[int]]` bookkeeping already tolerates natively
+# (a plain `Set`, built for exactly this "more than one in-group consumer of
+# the same tensor" case -- see :func:`_resolve_matmul_fanout_branches`'s own
+# `id(consumer_node) in accounted.get(tensor, ())` check). The one caller
+# this does *not* compose with safely is the direct `Concat`-branch walk
+# (:func:`_branch_walk_has_fanout`, used only by
+# :func:`_find_matmul_concat_chains`/:func:`_find_conv_concat_chains`'s own
+# per-operand branch resolution, not the residual-group-composed-into-a-
+# branch case above): that check re-derives a *strict linear* single-
+# consumer chain directly from `edges`, one tensor per step, an assumption a
+# two-entries-sharing-one-tensor diamond genuinely breaks. This does not
+# cause a correctness bug -- `_branch_walk_has_fanout` returning `True`
+# (its own conservative "declined" answer) for a branch that happens to
+# cross a diamond simply means that one `Concat` branch doesn't get pruned,
+# exactly the same safe (if suboptimal) fallback a residual/merge fan-out
+# already got there before this feature existed -- so a direct `Concat`
+# branch crossing this decomposition is, for now, left declined rather than
+# taught `_branch_walk_has_fanout`'s own stricter bookkeeping to tolerate it;
+# a residual/merge group that itself contains the decomposition and is then
+# *composed* into a `Concat` branch (via
+# :func:`_resolve_matmul_residual_group_for_concat`/
+# :func:`_resolve_conv_residual_group_for_concat`, which reuse the same
+# `accounted`-`Set` bookkeeping as the plain residual case, not
+# `_branch_walk_has_fanout`) is unaffected and composes correctly, for free.
+# :func:`_walk_conv_producer_backward` needed one signature change to make
+# this backward matching possible at all: unlike
+# :func:`_walk_matmul_producer_backward` (which already threaded
+# `consumers_of` through for its own gated-`Mul`/`SwiGLU` resolution), the
+# Conv backward walker previously had no need for `consumers_of` at all --
+# every hop it recognized was a strict single-input node reached purely via
+# `node_by_output`, needing no forward-consumer lookups anywhere -- so it
+# gained a `consumers_of` parameter (threaded through its three call sites)
+# purely to answer this hop's own "does `cur` have exactly two consumers, and
+# does one branch's own intermediate tensor have exactly one" questions the
+# same way the MatMul/Gemm walker already could.
+
+_GATE_BRANCH_BINARY_OPS = {"Div", "Mul", "Add", "Sub"}
+# Long enough for erf-GELU's own three-node gate branch (`Div, Erf, Add`)
+# with a little headroom, short enough to keep the search bounded the same
+# way `_MAX_CHAIN_HOPS` bounds the outer walk -- see this section's own
+# comment above for the two concrete shapes this covers.
+_MAX_GATE_BRANCH_HOPS = 4
+
+
+def _gate_branch_scalar_const(
+    name: str, initializer_map: Dict[str, onnx.TensorProto]
+) -> bool:
+    """True iff `name` names a constant float initializer that is a genuine
+    per-tensor scalar (`dims` exactly ``[]`` or ``[1]``) -- reusing
+    :func:`_match_clip_channel_pass_through`'s own identical scalar-constant
+    bar (see that function's own docstring for why this shape, not
+    :func:`_flat_channel_const`'s per-channel one, is the right bar here:
+    none of the "other operand" constants a self-gated activation
+    decomposition's gate branch divides/adds/multiplies by -- `sqrt(2)`,
+    `1.0`, the erf-GELU shape's own trailing `0.5` -- is ever per-channel;
+    each broadcasts uniformly over every element of the tensor it combines
+    with, exactly like `Clip`'s own scalar `min`/`max`).
+    """
+    init = initializer_map.get(name)
+    if init is None or not _is_supported_float_dtype(init.data_type):
+        return False
+    return list(init.dims) in ([], [1])
+
+
+def _walk_gate_branch(
+    first_node: onnx.NodeProto,
+    branch_start: str,
+    target: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[onnx.NodeProto, ...]]:
+    """Walks forward from `branch_start`, whose own (already known) sole
+    consumer is `first_node`, through a strict chain of single-consumer
+    hops -- each either a node already in `_UNARY_PASS_THROUGH` or a binary
+    op in `_GATE_BRANCH_BINARY_OPS` against a genuine scalar constant (see
+    :func:`_gate_branch_scalar_const`) -- until the chain's own running
+    tensor reaches `target` exactly. Returns the matched node tuple, in
+    forward (execution) order, or ``None`` if the chain runs past
+    `_MAX_GATE_BRANCH_HOPS`, crosses a graph output, hits an intermediate
+    tensor with anything other than exactly one consumer, or never reaches
+    `target` at all -- declined, never guessed at, the same conservative bar
+    every other hop in this module already holds a mid-chain tensor to.
+    Shared by both :func:`_match_self_gated_activation` (forward, called with
+    `first_node` already known to be one of `branch_start`'s -- i.e. `cur`'s
+    -- two consumers) and :func:`_match_self_gated_activation_backward`
+    (backward, called once a candidate origin/target pair is already
+    resolved from a gate `Mul`'s own two operands) -- the shared question
+    both ask is identical ("does this chain of allowed ops connect
+    `branch_start` to `target`"), only the direction differs.
+    """
+    nodes: List[onnx.NodeProto] = []
+    nxt = first_node
+    cur = branch_start
+    for _ in range(_MAX_GATE_BRANCH_HOPS):
+        if (
+            nxt.op_type in _UNARY_PASS_THROUGH
+            and list(nxt.input) == [cur]
+            and len(nxt.output) == 1
+        ):
+            pass
+        elif (
+            nxt.op_type in _GATE_BRANCH_BINARY_OPS
+            and nxt.domain == ""
+            and len(nxt.input) == 2
+            and cur in nxt.input
+            and len(nxt.output) == 1
+        ):
+            other = nxt.input[1] if nxt.input[0] == cur else nxt.input[0]
+            if other == cur or not _gate_branch_scalar_const(other, initializer_map):
+                return None
+        else:
+            return None
+        nodes.append(nxt)
+        out = nxt.output[0]
+        if out in graph_outputs:
+            return None
+        if out == target:
+            return tuple(nodes)
+        cands = consumers_of.get(out, [])
+        if len(cands) != 1:
+            return None
+        nxt = cands[0]
+        cur = out
+    return None
+
+
+def _match_self_gated_activation(
+    cur: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str]]:
+    """If `cur` (a tensor with *exactly* two consumers) is the origin of a
+    self-gated activation decomposition -- see this module's own "Self-gated
+    activation decomposition" section comment above for the two concrete
+    shapes this reaches (`SiLU`/`Swish`'s ``cur * Sigmoid(cur)``, erf-`GELU`'s
+    longer gate branch plus a trailing scalar scale) and the exact
+    decline-not-guess bar -- returns ``(diamond_nodes, final_out)``:
+    `diamond_nodes` is every node the diamond spans, in forward order (the
+    gate branch's own nodes, then the self-gating `Mul`, then -- only for the
+    erf-GELU shape -- one trailing scalar-scale `Mul`); `final_out` is the
+    diamond's own true output tensor (the gate `Mul`'s own output for SiLU,
+    the trailing `Mul`'s own output for erf-GELU) the caller should continue
+    walking from. Used by :func:`_walk_to_consumer`/
+    :func:`_walk_to_conv_consumer` as a walk's very first hop only -- see
+    this section's own comment above for why a later hop never needs this
+    check at all.
+
+    Declines (``None``) unless `cur` has exactly two consumers, exactly one
+    of which is a plain `Mul(cur, branch_out)` (domain ``""``, two inputs,
+    one output, its *other* operand -- `branch_out` -- distinct from `cur`
+    itself and not itself a constant), `branch_out` has exactly one consumer
+    (that same `Mul`) and isn't a graph output, and the remaining consumer,
+    walked via :func:`_walk_gate_branch`, resolves `cur` to `branch_out`
+    exactly. A candidate optional trailing scalar `Mul` (the gate `Mul`'s own
+    single consumer, if any, multiplying its output by a genuine scalar
+    constant -- see :func:`_gate_branch_scalar_const`) is folded in the same
+    way whenever present; its absence (SiLU's own shape) is not itself a
+    decline.
+    """
+    consumers = consumers_of.get(cur, [])
+    if len(consumers) != 2:
+        return None
+
+    gate_matches: List[Tuple[onnx.NodeProto, str]] = []
+    for c in consumers:
+        if (
+            c.op_type == "Mul"
+            and c.domain == ""
+            and len(c.input) == 2
+            and cur in c.input
+            and len(c.output) == 1
+        ):
+            other = c.input[1] if c.input[0] == cur else c.input[0]
+            if other != cur and other not in initializer_map:
+                gate_matches.append((c, other))
+    if len(gate_matches) != 1:
+        return None  # no gate `Mul`, or an ambiguous second candidate
+    gate_node, branch_out = gate_matches[0]
+
+    branch_first_nodes = [c for c in consumers if c is not gate_node]
+    if len(branch_first_nodes) != 1:
+        return None
+    branch_first_node = branch_first_nodes[0]
+
+    if branch_out in graph_outputs or len(consumers_of.get(branch_out, [])) != 1:
+        return None
+
+    branch_nodes = _walk_gate_branch(
+        branch_first_node, cur, branch_out, consumers_of, initializer_map, graph_outputs
+    )
+    if branch_nodes is None:
+        return None
+
+    diamond_nodes: Tuple[onnx.NodeProto, ...] = branch_nodes + (gate_node,)
+    final_out = gate_node.output[0]
+
+    if final_out not in graph_outputs and len(consumers_of.get(final_out, [])) == 1:
+        trailing = consumers_of[final_out][0]
+        if (
+            trailing.op_type == "Mul"
+            and trailing.domain == ""
+            and len(trailing.input) == 2
+            and final_out in trailing.input
+            and len(trailing.output) == 1
+        ):
+            scale = (
+                trailing.input[1]
+                if trailing.input[0] == final_out
+                else trailing.input[0]
+            )
+            if scale != final_out and _gate_branch_scalar_const(scale, initializer_map):
+                diamond_nodes = diamond_nodes + (trailing,)
+                final_out = trailing.output[0]
+
+    return diamond_nodes, final_out
+
+
+def _match_self_gated_activation_backward(
+    cur: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str, onnx.NodeProto]]:
+    """The backward-walk (:func:`_walk_matmul_producer_backward`/
+    :func:`_walk_conv_producer_backward`) counterpart of
+    :func:`_match_self_gated_activation`: `cur` is the diamond's own
+    candidate *output* tensor (`node_by_output[cur]` either the self-gating
+    `Mul` itself, or -- for the erf-GELU shape -- the trailing scalar-scale
+    `Mul` wrapping it), and this resolves back to the diamond's own true
+    *origin* tensor (mirroring that function's `final_out`/`cur` roles,
+    reversed). Returns ``(diamond_nodes, origin, gate_node)`` -- `diamond_nodes`
+    in the identical forward order :func:`_match_self_gated_activation`
+    returns them in (so a caller building `chain_ops` in reverse-of-visit
+    order can ``reversed(diamond_nodes)`` it, the same as any other single
+    node this walk crosses); `gate_node` is `diamond_nodes`' own self-gating
+    `Mul` specifically (not necessarily its last element -- the erf-GELU
+    shape's own trailing scalar `Mul` sits after it), returned separately so
+    the caller can record `origin`'s own *two* real in-group consumers (the
+    gate branch's own first node, `diamond_nodes[0]`, and this `Mul`) as two
+    `edges` entries without having to re-derive which element of
+    `diamond_nodes` is which. Returns ``None`` on any deviation from the
+    shapes :func:`_match_self_gated_activation`'s own docstring documents,
+    checked the same way just from the opposite end.
+
+    Since a `Mul`'s two operands are unordered, both candidate origin/target
+    pairings are tried (:func:`_walk_gate_branch`, forward from the
+    candidate origin -- the *same* function :func:`_match_self_gated_activation`
+    uses, since both directions ask the identical "does this chain connect
+    these two tensors" question); a match is accepted only when *exactly one*
+    ordering resolves, the same "decline on ambiguity" bar
+    :func:`_match_self_gated_activation`'s own gate-candidate search already
+    applies -- if both orderings somehow resolved, there would be no
+    principled way to pick one over the other.
+    """
+    node = node_by_output.get(cur)
+    if (
+        node is None
+        or node.op_type != "Mul"
+        or node.domain != ""
+        or len(node.input) != 2
+        or len(node.output) != 1
+        or node.output[0] != cur
+    ):
+        return None
+
+    gate_node = node
+    trailing_node: Optional[onnx.NodeProto] = None
+    a_name, b_name = node.input
+    a_const = a_name in initializer_map
+    b_const = b_name in initializer_map
+    if a_const != b_const:
+        # A candidate trailing scalar-scale `Mul` (erf-GELU's own final
+        # `* 0.5`) -- its own non-constant operand must itself be a plain
+        # `Mul` (the real gate `Mul`) with no other consumer.
+        const_name, gate_out = (a_name, b_name) if a_const else (b_name, a_name)
+        if not _gate_branch_scalar_const(const_name, initializer_map):
+            return None
+        if len(consumers_of.get(gate_out, [])) != 1:
+            return None
+        gate_candidate = node_by_output.get(gate_out)
+        if (
+            gate_candidate is None
+            or gate_candidate.op_type != "Mul"
+            or gate_candidate.domain != ""
+            or len(gate_candidate.input) != 2
+            or len(gate_candidate.output) != 1
+            or gate_candidate.output[0] != gate_out
+        ):
+            return None
+        trailing_node = node
+        gate_node = gate_candidate
+        a_name, b_name = gate_node.input
+        a_const = a_name in initializer_map
+        b_const = b_name in initializer_map
+
+    if a_const or b_const or a_name == b_name:
+        return None  # not a genuine two-non-constant-operand gate `Mul`
+
+    matches: List[Tuple[Tuple[onnx.NodeProto, ...], str]] = []
+    for origin, target in ((a_name, b_name), (b_name, a_name)):
+        if target in graph_outputs or len(consumers_of.get(target, [])) != 1:
+            continue
+        origin_consumers = consumers_of.get(origin, [])
+        if len(origin_consumers) != 2 or gate_node not in origin_consumers:
+            continue
+        first_nodes = [c for c in origin_consumers if c is not gate_node]
+        if len(first_nodes) != 1:
+            continue
+        branch_nodes = _walk_gate_branch(
+            first_nodes[0], origin, target, consumers_of, initializer_map, graph_outputs
+        )
+        if branch_nodes is not None:
+            matches.append((branch_nodes, origin))
+    if len(matches) != 1:
+        return None  # no resolvable ordering, or an ambiguous second one
+    branch_nodes, origin = matches[0]
+
+    diamond_nodes: Tuple[onnx.NodeProto, ...] = branch_nodes + (gate_node,)
+    if trailing_node is not None:
+        diamond_nodes = diamond_nodes + (trailing_node,)
+    return diamond_nodes, origin, gate_node
+
+
 def _walk_to_consumer(
     start: str,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -4034,6 +4554,15 @@ def _walk_to_consumer(
     Returns ``(None, ())`` if the walk runs out of hops, hits a branch, or
     never reaches such a consumer.
 
+    As the walk's very first hop only (`cur == start`, on the ordinary,
+    non-`forced_first_hop` path), a self-gated activation decomposition --
+    `cur` consumed by both a gate branch and the `Mul` that combines it with
+    that branch's own output -- is also recognized (see this module's own
+    "Self-gated activation decomposition" section comment and
+    :func:`_match_self_gated_activation`); every hop after the first can
+    never see a two-consumer `cur` in the first place (see that section's own
+    comment for why), so this is checked nowhere else in the loop.
+
     `forced_first_hop`, when given, is used as the walk's very first hop
     instead of deriving it from `consumers_of[start]` -- see
     :func:`_walk_to_conv_consumer`'s own matching parameter for why (used
@@ -4059,6 +4588,21 @@ def _walk_to_consumer(
             nxt = forced_first_hop
         else:
             candidates = consumers_of.get(cur, [])
+            if len(candidates) == 2:
+                diamond = _match_self_gated_activation(
+                    cur, consumers_of, initializer_map, graph_outputs
+                )
+                if diamond is not None:
+                    diamond_nodes, diamond_out = diamond
+                    if (
+                        len(consumers_of.get(diamond_out, [])) != 1
+                        or diamond_out in graph_outputs
+                    ):
+                        break
+                    chain_ops.extend((n, None) for n in diamond_nodes)
+                    cur = diamond_out
+                    continue
+                break  # two consumers but not this shape -- declined, as before
             if len(candidates) != 1:
                 break
             nxt = candidates[0]
@@ -4185,11 +4729,6 @@ def _find_chains(graph: onnx.GraphProto) -> List[_Chain]:
     graph_outputs = {o.name for o in graph.output}
     value_info_by_name = _value_info_by_name(graph)
 
-    def _is_internal(name: str) -> bool:
-        # Safe to reshape only if exactly one node reads it and it isn't
-        # itself something the caller observes (a graph output).
-        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
-
     chains = []
     for node in graph.node:
         info = _match_producer(node, initializer_map)
@@ -4198,7 +4737,17 @@ def _find_chains(graph: onnx.GraphProto) -> List[_Chain]:
         w_name, weight_transposed, bias_name, n_channels = info
 
         out_name = node.output[0]
-        if not _is_internal(out_name):
+        # Ordinarily exactly one consumer (`_is_internal`) -- but also admit
+        # exactly two, the shape a self-gated activation decomposition's own
+        # origin tensor takes (see this module's own "Self-gated activation
+        # decomposition" section comment): :func:`_walk_to_consumer` decides,
+        # at its own first hop, whether those two consumers actually form
+        # that shape, declining (same as before) if not -- a false admission
+        # here costs one wasted, safely-declining call, never a wrong slice.
+        if out_name in graph_outputs or len(consumers_of.get(out_name, [])) not in (
+            1,
+            2,
+        ):
             continue
 
         consumer, chain_ops = _walk_to_consumer(
@@ -5236,6 +5785,16 @@ def _walk_to_conv_consumer(
     treats a ``None``-const `chain_ops` entry as "mark its output stale, slice
     nothing" -- exactly what these ops need too.
 
+    As the walk's very first hop only (`cur == start`, on the ordinary,
+    non-`forced_first_hop` path), a self-gated activation decomposition
+    (``SiLU``/``Swish``, ubiquitous after Conv in YOLO-style backbones) is
+    also recognized -- see this module's own "Self-gated activation
+    decomposition" section comment and :func:`_match_self_gated_activation`;
+    folded into `chain_ops` the identical "nothing to slice" way a pooling/
+    `Resize`/`Pad`/`Clip` hop already is. Every hop after the first can never
+    see a two-consumer `cur` in the first place (see that section's own
+    comment for why), so this is checked nowhere else in the loop.
+
     The returned consumer tuple's own 4th element is `is_conv_transpose`
     (see :class:`_Chain`'s own field of the same name) -- always ``False``
     for a Conv consumer, so every existing caller that only ever saw a
@@ -5288,6 +5847,21 @@ def _walk_to_conv_consumer(
             nxt = forced_first_hop
         else:
             candidates = consumers_of.get(cur, [])
+            if len(candidates) == 2:
+                diamond = _match_self_gated_activation(
+                    cur, consumers_of, initializer_map, graph_outputs
+                )
+                if diamond is not None:
+                    diamond_nodes, diamond_out = diamond
+                    if (
+                        len(consumers_of.get(diamond_out, [])) != 1
+                        or diamond_out in graph_outputs
+                    ):
+                        break
+                    chain_ops.extend((n, None) for n in diamond_nodes)
+                    cur = diamond_out
+                    continue
+                break  # two consumers but not this shape -- declined, as before
             if len(candidates) != 1:
                 break
             nxt = candidates[0]
@@ -5488,9 +6062,6 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
-    def _is_internal(name: str) -> bool:
-        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
-
     chains = []
     for node in graph.node:
         # Try an ordinary/grouped Conv producer first, then (only if that
@@ -5508,7 +6079,16 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         w_name, bias_name, n_channels, producer_group = info
 
         out_name = node.output[0]
-        if not _is_internal(out_name):
+        # Ordinarily exactly one consumer -- but also admit exactly two, the
+        # shape a self-gated activation decomposition's own origin tensor
+        # takes (see :func:`_find_chains`'s own identical comment and this
+        # module's own "Self-gated activation decomposition" section
+        # comment); :func:`_walk_to_conv_consumer` decides, at its own first
+        # hop, whether those two consumers actually form that shape.
+        if out_name in graph_outputs or len(consumers_of.get(out_name, [])) not in (
+            1,
+            2,
+        ):
             continue
 
         consumer, chain_ops, conv_pass_through, group_norm = _walk_to_conv_consumer(
@@ -5728,6 +6308,7 @@ def _walk_conv_producer_backward(
     start: str,
     node_by_output: Dict[str, onnx.NodeProto],
     initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
     graph_outputs: Set[str],
     max_hops: int,
 ) -> Tuple[
@@ -5770,7 +6351,15 @@ def _walk_conv_producer_backward(
     channel count is known, exactly like a depthwise Conv hop already is),
     and a channel-agnostic ``Clip`` (see :func:`_match_clip_channel_pass_through`
     -- likewise needs no channel count at all, since neither `min` nor `max`
-    is axis-indexed to begin with), declining (only) whenever a
+    is axis-indexed to begin with), a self-gated activation decomposition
+    (``SiLU``/``Swish``, checked ahead of every other hop above whenever
+    `node` is a plain ``Mul`` -- see this module's own "Self-gated activation
+    decomposition" section comment and
+    :func:`_match_self_gated_activation_backward`; unlike every other hop in
+    this list, this is the reason `consumers_of` is threaded through at all
+    -- every other hop reaches `cur`'s own producer purely via
+    `node_by_output`, needing no forward-consumer lookups), declining (only)
+    whenever a
     tensor crossed -- `start` itself included -- is a graph output (a
     caller-observed shape this pass never resizes); *how many* other things
     also read that same tensor is deliberately **not** checked here -- see
@@ -5913,6 +6502,27 @@ def _walk_conv_producer_backward(
             edges.append((node.input[0], node))
             cur = node.input[0]
             continue
+
+        if node.op_type == "Mul" and node.domain == "":
+            # See :func:`_walk_matmul_producer_backward`'s own identical
+            # check for the full reasoning (checked here, ahead of nothing
+            # else in this Conv-chain walker -- unlike the MatMul/Gemm walk,
+            # there is no ordinary bias/scale `Mul` hop here to shadow, see
+            # this module's own docstring for why). `origin`'s own two real
+            # in-group consumers (the gate branch's own first node, and the
+            # gate `Mul` itself) both become `edges` entries, tolerated
+            # natively by the `Dict[str, Set[int]]` `accounted` bookkeeping
+            # :func:`_find_conv_residual_chains` builds from them.
+            diamond = _match_self_gated_activation_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, origin, gate_node = diamond
+                unary_ops.extend(reversed(diamond_nodes))
+                edges.append((origin, diamond_nodes[0]))
+                edges.append((origin, gate_node))
+                cur = origin
+                continue
 
         if _is_eligible_add_merge(node, initializer_map):
             return (
@@ -6101,6 +6711,7 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 operand,
                 node_by_output,
                 initializer_map,
+                consumers_of,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -6795,6 +7406,38 @@ def _walk_matmul_producer_backward(
             edges.append((node.input[0], node))
             cur = node.input[0]
             continue
+
+        if node.op_type == "Mul" and node.domain == "":
+            # Checked ahead of the ordinary `_BINARY_CHANNEL_OPS` dispatch
+            # below: a self-gated activation decomposition's own gate `Mul`
+            # (and, for erf-GELU, its trailing scalar-scale `Mul`) is
+            # otherwise indistinguishable from a plain bias/scale `Mul` hop
+            # by op type alone -- see this module's own "Self-gated
+            # activation decomposition" section comment and
+            # :func:`_match_self_gated_activation_backward`. The diamond's
+            # own origin tensor legitimately has two in-group consumers (the
+            # gate branch's own first node, and this `Mul`), so *two* `edges`
+            # entries share that one tensor -- the `Dict[str, Set[int]]`
+            # `accounted` bookkeeping every caller of this walk already
+            # builds tolerates that natively (see that section comment for
+            # why); the direct `Concat`-branch walk does not, and simply
+            # declines a branch that crosses one, the same safe fallback a
+            # residual/merge fan-out already got there before this feature
+            # existed.
+            diamond = _match_self_gated_activation_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if diamond is not None:
+                diamond_nodes, origin, gate_node = diamond
+                chain_ops.extend((n, None) for n in reversed(diamond_nodes))
+                # `origin` has two real in-group consumers -- the gate
+                # branch's own first node and the gate `Mul` itself -- both
+                # recorded so neither is later mistaken for a stray extra
+                # consumer needing its own separate resolution.
+                edges.append((origin, diamond_nodes[0]))
+                edges.append((origin, gate_node))
+                cur = origin
+                continue
 
         if node.op_type in _BINARY_CHANNEL_OPS and len(node.input) == 2:
             a_name, b_name = node.input
@@ -8589,6 +9232,7 @@ def _resolve_conv_residual_group_for_concat(
     root: onnx.NodeProto,
     node_by_output: Dict[str, onnx.NodeProto],
     initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
     graph_outputs: Set[str],
 ) -> Optional[_ResolvedConvResidualGroup]:
     """The Conv analogue of :func:`_resolve_matmul_residual_group_for_concat`
@@ -8628,6 +9272,7 @@ def _resolve_conv_residual_group_for_concat(
                 operand,
                 node_by_output,
                 initializer_map,
+                consumers_of,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -9010,6 +9655,7 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
                     operand,
                     node_by_output,
                     initializer_map,
+                    consumers_of,
                     graph_outputs,
                     _MAX_CHAIN_HOPS,
                 )
@@ -9023,7 +9669,11 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
             if kind == "add":
                 assert isinstance(payload, onnx.NodeProto)
                 resolved = _resolve_conv_residual_group_for_concat(
-                    payload, node_by_output, initializer_map, graph_outputs
+                    payload,
+                    node_by_output,
+                    initializer_map,
+                    consumers_of,
+                    graph_outputs,
                 )
                 if resolved is None:
                     declined = True
