@@ -5330,6 +5330,130 @@ def test_structured_pruning_conv_chain_erf_gelu_decomposed_declines_on_branch_fa
     np.testing.assert_array_equal(inits["W2"], w2)
 
 
+# --- Decomposed tanh-approximate GELU pass-through, Conv chains ----------
+#
+# `nn.GELU(approximate="tanh")` -- PyTorch's tanh-approximate/"new GELU",
+# used by GPT-2, BERT's `gelu_new`, and any `approximate="tanh"` config --
+# decomposes to a structurally distinct shape from either case the self-gated
+# activation decomposition section above recognizes: the producer's own raw
+# output `h` is read *four* times (not two), confirmed live via
+# `torch.onnx.export(nn.Linear/Conv -> nn.GELU(approximate="tanh"), ...,
+# opset_version=17, dynamo=False)` -- see `onnxsim/pruning.py`'s own
+# "Decomposed tanh-approximate GELU pass-through" section comment for the
+# exact node shape and how it was verified. The four scalar constants
+# (`0.044715`, `sqrt(2/pi)`, `1.0`, `0.5`) are built as `Constant` nodes here,
+# not initializers -- the real exporter's own shape for a literal Python
+# scalar (see this file's own "_constant_map" section above), confirming
+# that helper resolves them here exactly like it already does for decomposed
+# RMSNorm/`Clip`.
+
+
+def _conv_tanh_gelu_decomposed_pair_model(w1, w2, b1=None, spatial=10):
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    out_spatial = spatial - 4
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          x2 = Mul(h, h)
+          x3 = Mul(h, x2)
+          Cube = Constant<value = float[1] {{0.044715}}>()
+          m2 = Mul(Cube, x3)
+          inner = Add(h, m2)
+          Sqrt2OverPi = Constant<value = float[1] {{0.7978845608}}>()
+          arg = Mul(Sqrt2OverPi, inner)
+          t = Tanh(arg)
+          One = Constant<value = float[1] {{1.0}}>()
+          onePlusT = Add(One, t)
+          gated = Mul(h, onePlusT)
+          Half = Constant<value = float[1] {{0.5}}>()
+          a = Mul(Half, gated)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_conv_chain_tanh_gelu_decomposed_matches_oracle_exactly():
+    # Before this hop existed, this exact chain came out completely unpruned
+    # end to end -- `h`'s own four reads broke the forward walk's
+    # single-consumer-per-tensor assumption outright (and its own two-
+    # consumer self-gated-activation dispatch doesn't reach a four-read root
+    # either), so the walk never even started.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(521)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_tanh_gelu_decomposed_pair_model(w1, w2, b1=b1)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+    # The diamond's own nodes (Mul/Add/Tanh/Constant) are untouched -- none
+    # of them has a per-channel operand to slice.
+    pruned_node_types = sorted(n.op_type for n in pruned.graph.node)
+    assert pruned_node_types == sorted(n.op_type for n in model.graph.node)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_tanh_gelu_decomposed_pair_model(w1[keep], w2[:, keep], b1=b1[keep])
+
+    rng_x = np.random.default_rng(522)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    assert np.isfinite(y).all()
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_chain_tanh_gelu_decomposed_declines_on_nonconstant_scalar():
+    # `Cube` (the cubic term's own scale) fed by a non-constant node (an
+    # `Identity` of a graph input) rather than a genuine constant -- this
+    # pass cannot confirm it's a channel-agnostic scalar without evaluating
+    # the graph, so the whole diamond must decline outright, leaving both
+    # weights completely untouched.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(523)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X, float CubeIn) => (float[N,{C2},6,6] Y)
+        <float Sqrt2OverPi = {{0.7978845608}}, float One = {{1.0}}, float Half = {{0.5}}>
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          x2 = Mul(h, h)
+          x3 = Mul(h, x2)
+          Cube = Identity(CubeIn)
+          m2 = Mul(Cube, x3)
+          inner = Add(h, m2)
+          arg = Mul(Sqrt2OverPi, inner)
+          t = Tanh(arg)
+          onePlusT = Add(One, t)
+          gated = Mul(h, onePlusT)
+          a = Mul(Half, gated)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
 # --- Conv1d / Conv3d / ConvTranspose structural pruning ------------------
 #
 # _match_conv_producer/_match_conv_consumer/_match_depthwise_conv_pass_through
@@ -8194,6 +8318,159 @@ def test_structured_pruning_matmul_erf_gelu_decomposed_declines_on_nonconstant_s
           ao = Add(e, One)
           m = Mul(h, ao)
           a = Mul(m, Half)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+# --- Decomposed tanh-approximate GELU pass-through, MatMul/Gemm chains ---
+#
+# The MatMul/Gemm-chain analogue of the Conv-chain section above -- see this
+# module's own section comment there, and `onnxsim/pruning.py`'s own
+# "Decomposed tanh-approximate GELU pass-through" section comment, for the
+# exact node shape (confirmed live via `torch.onnx.export`) and how it
+# differs from the two-consumer self-gated activation decomposition
+# (SiLU/erf-GELU) tested just above.
+
+
+def _mlp_tanh_gelu_decomposed_model(K, H, Out, bias=True, seed=0):
+    rng = np.random.default_rng(seed)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if bias:
+        b1 = rng.standard_normal((H,)).astype(np.float32)
+        gemm1 = "h = Gemm(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        gemm1 = "h = MatMul(X, W1)"
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          {gemm1}
+          x2 = Mul(h, h)
+          x3 = Mul(h, x2)
+          Cube = Constant<value = float[1] {{0.044715}}>()
+          m2 = Mul(Cube, x3)
+          inner = Add(h, m2)
+          Sqrt2OverPi = Constant<value = float[1] {{0.7978845608}}>()
+          arg = Mul(Sqrt2OverPi, inner)
+          t = Tanh(arg)
+          One = Constant<value = float[1] {{1.0}}>()
+          onePlusT = Add(One, t)
+          gated = Mul(h, onePlusT)
+          Half = Constant<value = float[1] {{0.5}}>()
+          a = Mul(Half, gated)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, w1, w2, (b1 if bias else None)
+
+
+def test_structured_pruning_matmul_tanh_gelu_decomposed_matches_oracle_exactly():
+    # Before this hop existed, this exact chain came out completely unpruned
+    # end to end (confirmed independently against this feature's own
+    # starting commit) -- `h`'s own four reads (not the self-gated
+    # activation decomposition's own two) broke the forward walk outright.
+    # The four scalar constants are `Constant`-node-fed here (see this
+    # section's own comment above), so this also exercises `_constant_map`'s
+    # own fix for exactly this hop, not just the plain-initializer shape.
+    K, H, Out = 8, 32, 4
+    model, w1, w2, b1 = _mlp_tanh_gelu_decomposed_model(K, H, Out)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    keep_count = H // 2
+    assert dims_after["W1"][1] == keep_count
+    assert dims_after["W2"][0] == keep_count
+    pruned_node_types = sorted(n.op_type for n in pruned.graph.node)
+    assert pruned_node_types == sorted(n.op_type for n in model.graph.node)
+
+    keep = _oracle_keep_indices(w1, keep_count)
+    oracle_w1 = w1[:, keep]
+    oracle_w2 = w2[keep]
+    oracle_b1 = b1[keep]
+    oracle = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = Gemm(X, W1, B1)
+          x2 = Mul(h, h)
+          x3 = Mul(h, x2)
+          Cube = Constant<value = float[1] {{0.044715}}>()
+          m2 = Mul(Cube, x3)
+          inner = Add(h, m2)
+          Sqrt2OverPi = Constant<value = float[1] {{0.7978845608}}>()
+          arg = Mul(Sqrt2OverPi, inner)
+          t = Tanh(arg)
+          One = Constant<value = float[1] {{1.0}}>()
+          onePlusT = Add(One, t)
+          gated = Mul(h, onePlusT)
+          Half = Constant<value = float[1] {{0.5}}>()
+          a = Mul(Half, gated)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[
+            _f32(oracle_w1, "W1"),
+            _f32(oracle_b1, "B1"),
+            _f32(oracle_w2, "W2"),
+        ],
+    )
+
+    rng_x = np.random.default_rng(524)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+    # Independently cross-check the oracle model against a pure-numpy
+    # evaluation of the same tanh-GELU formula (`_tanh_gelu`, this file's
+    # own oracle for FastGelu's tanh approximation above) -- confirms the
+    # hand-built decomposed-node oracle model actually computes tanh-GELU,
+    # not merely something `onnxruntime` happens to agree with itself on.
+    h_correct = _tanh_gelu(x @ oracle_w1 + oracle_b1)
+    y_correct = h_correct @ oracle_w2
+    np.testing.assert_allclose(y_oracle, y_correct, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(y, y_correct, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_matmul_tanh_gelu_decomposed_declines_on_nonconstant_scalar():
+    # `Cube` (the cubic term's own scale) fed by a non-constant node (an
+    # `Identity` of a graph input) rather than a genuine constant -- same
+    # decline bar as the erf-GELU test above, just on the tanh-GELU shape's
+    # own analogous operand.
+    K, H, Out = 8, 32, 4
+    rng = np.random.default_rng(525)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X, float CubeIn) => (float[batch,{Out}] Y)
+        <float Sqrt2OverPi = {{0.7978845608}}, float One = {{1.0}}, float Half = {{0.5}}>
+        {{
+          h = MatMul(X, W1)
+          x2 = Mul(h, h)
+          x3 = Mul(h, x2)
+          Cube = Identity(CubeIn)
+          m2 = Mul(Cube, x3)
+          inner = Add(h, m2)
+          arg = Mul(Sqrt2OverPi, inner)
+          t = Tanh(arg)
+          onePlusT = Add(One, t)
+          gated = Mul(h, onePlusT)
+          a = Mul(Half, gated)
           Y = MatMul(a, W2)
         }}
         """,

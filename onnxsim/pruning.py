@@ -5763,6 +5763,456 @@ def _match_self_gated_activation_backward(
     return diamond_nodes, origin, gate_node
 
 
+# --- Decomposed tanh-approximate GELU pass-through --------------------------
+#
+# `nn.GELU(approximate="tanh")` (PyTorch's "tanh-approximate"/"new GELU" --
+# GPT-2's, BERT's `gelu_new`, and any `approximate="tanh"` config) computes
+# ``0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x**3)))``, structurally
+# distinct from both shapes the self-gated activation decomposition above
+# recognizes: `x` itself is read *four* times (not the self-gated shape's
+# two), by the cubing branch's own squaring step, its cubing step, the
+# ``x + 0.044715 * x**3`` combining `Add`, and the final gating `Mul`, none of
+# which is a strict linear "gate branch, then one combining `Mul`" chain the
+# way SiLU's/erf-GELU's own shape is -- so neither `_walk_gate_branch` nor
+# :func:`_match_self_gated_activation` itself can reach it; before this
+# section existed, a chain hitting this decomposition just stopped dead,
+# completely unpruned end to end.
+#
+# Confirmed live (not assumed from the textbook formula), via
+# `torch.onnx.export(nn.Linear(...) -> nn.GELU(approximate="tanh"), ...,
+# opset_version=17, dynamo=False)`, to lower to exactly this fixed 8-node
+# sequence (elementwise, so a preceding `Conv` produces the identical
+# topology):
+#
+#   x2 = Mul(x, x);            x3 = Mul(x, x2);
+#   m2 = Mul(0.044715, x3);    inner = Add(x, m2);
+#   arg = Mul(sqrt(2/pi), inner); t = Tanh(arg);
+#   one_plus_t = Add(1.0, t);  gated = Mul(x, one_plus_t);
+#   out = Mul(0.5, gated)
+#
+# `sqrt(2/pi)` and `0.044715` (and, less interestingly, `1.0`/`0.5`) are
+# emitted as plain `Constant` nodes, not initializers -- exactly the gap
+# :func:`_constant_map` (this module's own "constant-fed scalar operand" fix,
+# see that function's own docstring) already closes, so every caller here
+# threads an `initializer_map` built via that helper, the same as every
+# sibling hop already does. `x`'s own four direct reads surface in
+# `consumers_of` as *five* entries, not four -- `x2 = Mul(x, x)` reads `x`
+# twice over, once per input slot of that one node, since :func:`_consumers_of`
+# records one entry per `node.input` occurrence, not one per distinct
+# consumer node -- so this hop's own dispatch keys on `len(candidates) == 5`
+# (forward) wherever the self-gated activation decomposition's own dispatch
+# keys on `== 2`, and :func:`_walk_gelu_tanh_from_root` below de-duplicates
+# that one doubly-counted squaring node itself rather than leaving that
+# quirk to ripple through every caller.
+#
+# Recognized the same "fixed exact topology, decline everything else" way
+# every other multi-node hop in this module already is (mirrors
+# :func:`_match_decomposed_rms_norm_pass_through` most closely: a single
+# straight-line node-by-node walk from the root, no bounded generic search
+# the way :func:`_walk_gate_branch` needs) -- declines (never guesses) on any
+# deviation: `x` read by anything other than exactly these four nodes in
+# these four roles, any intermediate tensor (`x2`, `x3`, `m2`, `inner`,
+# `arg`, `t`, `one_plus_t`, and the gate `Mul`'s own output before an optional
+# trailing scale) read by more than one consumer or itself a graph output,
+# any of the four scalar operands (`0.044715`, `sqrt(2/pi)`, `1.0`, and,
+# for the trailing scale, `0.5`) not a genuine scalar constant (see
+# :func:`_gate_branch_scalar_const`, reused unchanged -- none of these is
+# ever per-channel either), or any node's own op type/domain/input-output
+# arity off the exact shape above. On a full match every node crossed folds
+# into the chain the identical "nothing to slice" way the self-gated
+# activation decomposition's own diamond does -- none of `Mul`/`Add`/`Tanh`
+# here has a per-channel *parameter*, only the running tensor's own *value*
+# changes as channels are removed -- so every matched node becomes one more
+# `(node, None)` `chain_ops` entry, and the walk continues from the sequence's
+# own true output tensor: the gate `Mul`'s own output (`gated`) if no
+# trailing scalar-scale `Mul` follows it, or that trailing `Mul`'s own output
+# otherwise -- the identical "gate `Mul`, then an optional trailing scalar
+# `Mul`" shape :func:`_match_self_gated_activation`'s own erf-GELU case
+# already folds in, reused via the identical inline check (not
+# :func:`_walk_gate_branch` -- that helper is scoped to a single linear
+# branch, not this shape's own internal fork).
+#
+# Wired into the identical four call sites :func:`_match_self_gated_activation`/
+# :func:`_match_self_gated_activation_backward` are (:func:`_walk_to_consumer`,
+# :func:`_walk_to_conv_consumer`, :func:`_walk_matmul_producer_backward`,
+# :func:`_walk_conv_producer_backward`), tried right alongside that shape at
+# each -- the two shapes never overlap (one keys on exactly two consumers,
+# this one on exactly five), so trying both costs nothing beyond one more
+# declining call whenever neither is actually present. The two Conv-chain
+# finders' own root-admission checks (:func:`_find_conv_chains`'s "ordinarily
+# exactly one consumer, but also admit exactly two" gate, and
+# :func:`_find_conv_residual_chains`'s own fan-out `accounted` bookkeeping)
+# need the identical treatment `_matmul_walk_root_ok` already gives the
+# MatMul/Gemm side for free (that function only ever rules out a graph
+# output, deferring every consumer-count question to the walker's own hop-0
+# dispatch) -- see :func:`_find_conv_chains`'s own comment at its call site
+# for the one-line change this needed.
+
+
+def _walk_gelu_tanh_from_root(
+    x_name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], onnx.NodeProto, str]]:
+    """The shared core both :func:`_match_gelu_tanh_pass_through` (forward)
+    and :func:`_match_gelu_tanh_pass_through_backward` (backward, which
+    re-derives a candidate `x_name` from a gate `Mul`'s own two operands and
+    calls this the same way) use: if `x_name` is the root of exactly the
+    fixed decomposed tanh-GELU shape this section's own comment above
+    documents (everything up to, but not including, the optional trailing
+    scalar-scale `Mul`), returns ``(structural_nodes, gate_node, gated_name)``
+    -- `structural_nodes` the seven nodes strictly before the gate `Mul`
+    itself, in forward (execution) order (``x2 = Mul(x, x)``, ``x3 = Mul(x,
+    x2)``, ``m2 = Mul(<0.044715>, x3)``, ``inner = Add(x, m2)``, ``arg =
+    Mul(<sqrt(2/pi)>, inner)``, ``Tanh(arg)``, ``one_plus_t = Add(<1.0>,
+    t)``), `gate_node` the final ``gated = Mul(x, one_plus_t)`` kept separate
+    (not folded into `structural_nodes`) so a backward caller can compare it
+    by identity against the `Mul` node it already resolved `cur` from
+    without re-deriving which element of a combined tuple is which, and
+    `gated_name` that `Mul`'s own output name. Declines (``None``) on any
+    deviation from the exact shape -- see this section's own comment above
+    for the full list.
+    """
+    x_consumers = consumers_of.get(x_name, [])
+    if len(x_consumers) != 5:
+        return None
+
+    # `x_name`'s four *distinct* direct consumer nodes -- the squaring `Mul`
+    # appears twice in `x_consumers` (both its own inputs are `x_name`); see
+    # this section's own comment above for why.
+    occurrences: Dict[int, int] = {}
+    first_seen: List[onnx.NodeProto] = []
+    for c in x_consumers:
+        key = id(c)
+        occurrences[key] = occurrences.get(key, 0) + 1
+        if occurrences[key] == 1:
+            first_seen.append(c)
+    if len(first_seen) != 4:
+        return None  # not four distinct consumer nodes -- declined
+
+    square_node: Optional[onnx.NodeProto] = None
+    singles: List[onnx.NodeProto] = []
+    for node in first_seen:
+        cnt = occurrences[id(node)]
+        if cnt == 2:
+            if square_node is not None:
+                return None  # more than one doubly-read consumer -- ambiguous
+            square_node = node
+        elif cnt == 1:
+            singles.append(node)
+        else:
+            return None
+    if square_node is None or len(singles) != 3:
+        return None
+
+    if (
+        square_node.op_type != "Mul"
+        or square_node.domain != ""
+        or list(square_node.input) != [x_name, x_name]
+        or len(square_node.output) != 1
+        or not square_node.output[0]
+    ):
+        return None
+    x2_name = square_node.output[0]
+    if x2_name in graph_outputs or len(consumers_of.get(x2_name, [])) != 1:
+        return None
+
+    cube_node = consumers_of[x2_name][0]
+    if not any(cube_node is n for n in singles):
+        return None  # the cube step must also be one of x_name's own reads
+    if (
+        cube_node.op_type != "Mul"
+        or cube_node.domain != ""
+        or len(cube_node.input) != 2
+        or x_name not in cube_node.input
+        or x2_name not in cube_node.input
+        or len(cube_node.output) != 1
+        or not cube_node.output[0]
+    ):
+        return None
+    x3_name = cube_node.output[0]
+    if x3_name in graph_outputs or len(consumers_of.get(x3_name, [])) != 1:
+        return None
+
+    scale_cube_node = consumers_of[x3_name][0]
+    if (
+        scale_cube_node.op_type != "Mul"
+        or scale_cube_node.domain != ""
+        or len(scale_cube_node.input) != 2
+        or x3_name not in scale_cube_node.input
+        or len(scale_cube_node.output) != 1
+        or not scale_cube_node.output[0]
+    ):
+        return None
+    cube_coeff_name = (
+        scale_cube_node.input[1]
+        if scale_cube_node.input[0] == x3_name
+        else scale_cube_node.input[0]
+    )
+    if cube_coeff_name == x3_name or not _gate_branch_scalar_const(
+        cube_coeff_name, initializer_map
+    ):
+        return None
+    m2_name = scale_cube_node.output[0]
+    if m2_name in graph_outputs or len(consumers_of.get(m2_name, [])) != 1:
+        return None
+
+    remaining = [n for n in singles if n is not cube_node]
+    if len(remaining) != 2:
+        return None
+    add_node: Optional[onnx.NodeProto] = None
+    gate_node: Optional[onnx.NodeProto] = None
+    for n in remaining:
+        if n.op_type == "Add" and n.domain == "" and add_node is None:
+            add_node = n
+        elif n.op_type == "Mul" and n.domain == "" and gate_node is None:
+            gate_node = n
+        else:
+            return None
+    if add_node is None or gate_node is None:
+        return None
+
+    if consumers_of[m2_name][0] is not add_node:
+        return None  # scaled cube must feed the *same* Add x_name forked to
+    if (
+        len(add_node.input) != 2
+        or x_name not in add_node.input
+        or m2_name not in add_node.input
+        or len(add_node.output) != 1
+        or not add_node.output[0]
+    ):
+        return None
+    inner_name = add_node.output[0]
+    if inner_name in graph_outputs or len(consumers_of.get(inner_name, [])) != 1:
+        return None
+
+    arg_scale_node = consumers_of[inner_name][0]
+    if (
+        arg_scale_node.op_type != "Mul"
+        or arg_scale_node.domain != ""
+        or len(arg_scale_node.input) != 2
+        or inner_name not in arg_scale_node.input
+        or len(arg_scale_node.output) != 1
+        or not arg_scale_node.output[0]
+    ):
+        return None
+    sqrt_2_over_pi_name = (
+        arg_scale_node.input[1]
+        if arg_scale_node.input[0] == inner_name
+        else arg_scale_node.input[0]
+    )
+    if sqrt_2_over_pi_name == inner_name or not _gate_branch_scalar_const(
+        sqrt_2_over_pi_name, initializer_map
+    ):
+        return None
+    arg_name = arg_scale_node.output[0]
+    if arg_name in graph_outputs or len(consumers_of.get(arg_name, [])) != 1:
+        return None
+
+    tanh_node = consumers_of[arg_name][0]
+    if (
+        tanh_node.op_type != "Tanh"
+        or tanh_node.domain != ""
+        or list(tanh_node.input) != [arg_name]
+        or len(tanh_node.output) != 1
+        or not tanh_node.output[0]
+    ):
+        return None
+    t_name = tanh_node.output[0]
+    if t_name in graph_outputs or len(consumers_of.get(t_name, [])) != 1:
+        return None
+
+    one_plus_node = consumers_of[t_name][0]
+    if (
+        one_plus_node.op_type != "Add"
+        or one_plus_node.domain != ""
+        or len(one_plus_node.input) != 2
+        or t_name not in one_plus_node.input
+        or len(one_plus_node.output) != 1
+        or not one_plus_node.output[0]
+    ):
+        return None
+    one_name = (
+        one_plus_node.input[1]
+        if one_plus_node.input[0] == t_name
+        else one_plus_node.input[0]
+    )
+    if one_name == t_name or not _gate_branch_scalar_const(one_name, initializer_map):
+        return None
+    one_plus_t_name = one_plus_node.output[0]
+    if (
+        one_plus_t_name in graph_outputs
+        or len(consumers_of.get(one_plus_t_name, [])) != 1
+    ):
+        return None
+    if consumers_of[one_plus_t_name][0] is not gate_node:
+        return None  # one_plus_t must feed the *same* Mul x_name forked to
+
+    if (
+        len(gate_node.input) != 2
+        or x_name not in gate_node.input
+        or one_plus_t_name not in gate_node.input
+        or len(gate_node.output) != 1
+        or not gate_node.output[0]
+    ):
+        return None
+
+    structural_nodes: Tuple[onnx.NodeProto, ...] = (
+        square_node,
+        cube_node,
+        scale_cube_node,
+        add_node,
+        arg_scale_node,
+        tanh_node,
+        one_plus_node,
+    )
+    return structural_nodes, gate_node, gate_node.output[0]
+
+
+def _match_gelu_tanh_pass_through(
+    x_name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str]]:
+    """If `x_name` (a tensor with *exactly* five `consumers_of` entries --
+    four distinct consumer nodes, one of them read twice, see this section's
+    own comment above) is the root of the fixed decomposed tanh-GELU shape,
+    returns ``(diamond_nodes, final_out)`` -- the same shape
+    :func:`_match_self_gated_activation` returns, and used the identical way
+    by :func:`_walk_to_consumer`/:func:`_walk_to_conv_consumer` as a walk's
+    very first hop only. `diamond_nodes` is every node the sequence spans, in
+    forward order (:func:`_walk_gelu_tanh_from_root`'s own seven
+    `structural_nodes`, then the gate `Mul`, then -- if present -- one
+    trailing scalar-scale `Mul`, mirroring erf-GELU's own optional final
+    ``* 0.5`` in :func:`_match_self_gated_activation`); `final_out` is
+    whichever of those two is the sequence's own true output.
+    """
+    core = _walk_gelu_tanh_from_root(
+        x_name, consumers_of, initializer_map, graph_outputs
+    )
+    if core is None:
+        return None
+    structural_nodes, gate_node, gated_name = core
+
+    diamond_nodes: Tuple[onnx.NodeProto, ...] = structural_nodes + (gate_node,)
+    final_out = gated_name
+
+    if gated_name not in graph_outputs and len(consumers_of.get(gated_name, [])) == 1:
+        trailing = consumers_of[gated_name][0]
+        if (
+            trailing.op_type == "Mul"
+            and trailing.domain == ""
+            and len(trailing.input) == 2
+            and gated_name in trailing.input
+            and len(trailing.output) == 1
+        ):
+            scale = (
+                trailing.input[1]
+                if trailing.input[0] == gated_name
+                else trailing.input[0]
+            )
+            if scale != gated_name and _gate_branch_scalar_const(
+                scale, initializer_map
+            ):
+                diamond_nodes = diamond_nodes + (trailing,)
+                final_out = trailing.output[0]
+
+    return diamond_nodes, final_out
+
+
+def _match_gelu_tanh_pass_through_backward(
+    cur: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str, onnx.NodeProto]]:
+    """The backward-walk (:func:`_walk_matmul_producer_backward`/
+    :func:`_walk_conv_producer_backward`) counterpart of
+    :func:`_match_gelu_tanh_pass_through`, mirroring
+    :func:`_match_self_gated_activation_backward` in every structural
+    respect but the shape itself: `cur` is the sequence's own candidate
+    *output* tensor (`node_by_output[cur]` either the gate `Mul` itself, or
+    the optional trailing scalar-scale `Mul` wrapping it), resolved back to
+    the sequence's own true *origin* tensor. Returns ``(diamond_nodes,
+    origin, gate_node)`` in the identical shape/order
+    :func:`_match_self_gated_activation_backward` does.
+
+    Since the gate `Mul`'s own two operands (`x_name` and `one_plus_t`) are
+    unordered, both candidate origins are tried via
+    :func:`_walk_gelu_tanh_from_root` (the same core function the forward
+    direction uses); a match is accepted only when *exactly one* candidate
+    both resolves the fixed shape at all *and* resolves back to this exact
+    `gate_node` (checked by identity, not merely "resolves to *some* gate
+    `Mul`") -- declined on ambiguity, the same bar every sibling hop in this
+    module already holds itself to.
+    """
+    node = node_by_output.get(cur)
+    if (
+        node is None
+        or node.op_type != "Mul"
+        or node.domain != ""
+        or len(node.input) != 2
+        or len(node.output) != 1
+        or node.output[0] != cur
+    ):
+        return None
+
+    gate_node = node
+    trailing_node: Optional[onnx.NodeProto] = None
+    a_name, b_name = node.input
+    a_const = a_name in initializer_map
+    b_const = b_name in initializer_map
+    if a_const != b_const:
+        # A candidate trailing scalar-scale `Mul` (the final `* 0.5`) -- its
+        # own non-constant operand must itself be a plain `Mul` (the real
+        # gate `Mul`) with no other consumer.
+        const_name, gate_out = (a_name, b_name) if a_const else (b_name, a_name)
+        if not _gate_branch_scalar_const(const_name, initializer_map):
+            return None
+        if len(consumers_of.get(gate_out, [])) != 1:
+            return None
+        gate_candidate = node_by_output.get(gate_out)
+        if (
+            gate_candidate is None
+            or gate_candidate.op_type != "Mul"
+            or gate_candidate.domain != ""
+            or len(gate_candidate.input) != 2
+            or len(gate_candidate.output) != 1
+            or gate_candidate.output[0] != gate_out
+        ):
+            return None
+        trailing_node = node
+        gate_node = gate_candidate
+        a_name, b_name = gate_node.input
+        a_const = a_name in initializer_map
+        b_const = b_name in initializer_map
+
+    if a_const or b_const or a_name == b_name:
+        return None  # not a genuine two-non-constant-operand gate `Mul`
+
+    matches: List[Tuple[Tuple[onnx.NodeProto, ...], str]] = []
+    for x_candidate in (a_name, b_name):
+        core = _walk_gelu_tanh_from_root(
+            x_candidate, consumers_of, initializer_map, graph_outputs
+        )
+        if core is None:
+            continue
+        structural_nodes, found_gate, _gated_name = core
+        if found_gate is gate_node:
+            matches.append((structural_nodes, x_candidate))
+    if len(matches) != 1:
+        return None  # no resolvable ordering, or an ambiguous second one
+    structural_nodes, origin = matches[0]
+
+    diamond_nodes: Tuple[onnx.NodeProto, ...] = structural_nodes + (gate_node,)
+    if trailing_node is not None:
+        diamond_nodes = diamond_nodes + (trailing_node,)
+    return diamond_nodes, origin, gate_node
+
+
 def _walk_to_consumer(
     start: str,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -5893,6 +6343,24 @@ def _walk_to_consumer(
                     cur = diamond_out
                     continue
                 break  # two consumers but not this shape -- declined, as before
+            if len(candidates) == 5:
+                # The decomposed tanh-GELU shape's own root -- see this
+                # module's own "Decomposed tanh-approximate GELU pass-through"
+                # section comment and :func:`_match_gelu_tanh_pass_through`.
+                gelu_diamond = _match_gelu_tanh_pass_through(
+                    cur, consumers_of, initializer_map, graph_outputs
+                )
+                if gelu_diamond is not None:
+                    diamond_nodes, diamond_out = gelu_diamond
+                    if (
+                        len(consumers_of.get(diamond_out, [])) != 1
+                        or diamond_out in graph_outputs
+                    ):
+                        break
+                    chain_ops.extend((n, None) for n in diamond_nodes)
+                    cur = diamond_out
+                    continue
+                break  # five consumers but not this shape -- declined, as before
             if len(candidates) != 1:
                 break
             nxt = candidates[0]
@@ -7526,6 +7994,24 @@ def _walk_to_conv_consumer(
                     cur = diamond_out
                     continue
                 break  # two consumers but not this shape -- declined, as before
+            if len(candidates) == 5:
+                # The decomposed tanh-GELU shape's own root -- see this
+                # module's own "Decomposed tanh-approximate GELU pass-through"
+                # section comment and :func:`_match_gelu_tanh_pass_through`.
+                gelu_diamond = _match_gelu_tanh_pass_through(
+                    cur, consumers_of, initializer_map, graph_outputs
+                )
+                if gelu_diamond is not None:
+                    diamond_nodes, diamond_out = gelu_diamond
+                    if (
+                        len(consumers_of.get(diamond_out, [])) != 1
+                        or diamond_out in graph_outputs
+                    ):
+                        break
+                    chain_ops.extend((n, None) for n in diamond_nodes)
+                    cur = diamond_out
+                    continue
+                break  # five consumers but not this shape -- declined, as before
             if len(candidates) != 1:
                 break
             nxt = candidates[0]
@@ -7750,15 +8236,22 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         w_name, bias_name, n_channels, producer_group = info
 
         out_name = node.output[0]
-        # Ordinarily exactly one consumer -- but also admit exactly two, the
+        # Ordinarily exactly one consumer -- but also admit exactly two (the
         # shape a self-gated activation decomposition's own origin tensor
-        # takes (see :func:`_find_chains`'s own identical comment and this
+        # takes -- see :func:`_find_chains`'s own identical comment and this
         # module's own "Self-gated activation decomposition" section
-        # comment); :func:`_walk_to_conv_consumer` decides, at its own first
-        # hop, whether those two consumers actually form that shape.
+        # comment) or exactly five (the decomposed tanh-GELU shape's own
+        # origin tensor -- see this module's own "Decomposed tanh-approximate
+        # GELU pass-through" section comment; `consumers_of` counts one entry
+        # per `node.input` occurrence, and that shape's own squaring `Mul`
+        # reads its root twice over, so its four distinct direct consumers
+        # surface as five entries there, not four).
+        # :func:`_walk_to_conv_consumer` decides, at its own first hop,
+        # whether those consumers actually form either shape.
         if out_name in graph_outputs or len(consumers_of.get(out_name, [])) not in (
             1,
             2,
+            5,
         ):
             continue
 
@@ -8209,6 +8702,28 @@ def _walk_conv_producer_backward(
                 diamond_nodes, origin, gate_node = diamond
                 unary_ops.extend(reversed(diamond_nodes))
                 edges.append((origin, diamond_nodes[0]))
+                edges.append((origin, gate_node))
+                cur = origin
+                continue
+
+            # The decomposed tanh-GELU shape's own gate `Mul` -- see this
+            # module's own "Decomposed tanh-approximate GELU pass-through"
+            # section comment and :func:`_match_gelu_tanh_pass_through_backward`.
+            # `origin`'s own *four* real in-group consumers (the squaring
+            # `Mul`, the cubing `Mul`, the `x + 0.044715 * x**3` `Add`, and the
+            # gate `Mul` itself) all become `edges` entries, the identical
+            # "more than one in-group consumer of the same tensor" shape the
+            # self-gated activation decomposition's own two-entries case
+            # already tolerates, just with four instead of two.
+            gelu_diamond = _match_gelu_tanh_pass_through_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if gelu_diamond is not None:
+                diamond_nodes, origin, gate_node = gelu_diamond
+                unary_ops.extend(reversed(diamond_nodes))
+                edges.append((origin, diamond_nodes[0]))  # squaring Mul
+                edges.append((origin, diamond_nodes[1]))  # cubing Mul
+                edges.append((origin, diamond_nodes[3]))  # x + 0.044715*x**3
                 edges.append((origin, gate_node))
                 cur = origin
                 continue
@@ -9129,6 +9644,28 @@ def _walk_matmul_producer_backward(
                 # recorded so neither is later mistaken for a stray extra
                 # consumer needing its own separate resolution.
                 edges.append((origin, diamond_nodes[0]))
+                edges.append((origin, gate_node))
+                cur = origin
+                continue
+
+            # The decomposed tanh-GELU shape's own gate `Mul` -- see this
+            # module's own "Decomposed tanh-approximate GELU pass-through"
+            # section comment and :func:`_match_gelu_tanh_pass_through_backward`.
+            # `origin` has *four* real in-group consumers here (the squaring
+            # `Mul`, the cubing `Mul`, the `x + 0.044715 * x**3` `Add`, and
+            # the gate `Mul` itself), the identical "more than one in-group
+            # consumer of the same tensor" shape the self-gated activation
+            # decomposition's own two-entries case above already tolerates,
+            # just with four instead of two.
+            gelu_diamond = _match_gelu_tanh_pass_through_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if gelu_diamond is not None:
+                diamond_nodes, origin, gate_node = gelu_diamond
+                chain_ops.extend((n, None) for n in reversed(diamond_nodes))
+                edges.append((origin, diamond_nodes[0]))  # squaring Mul
+                edges.append((origin, diamond_nodes[1]))  # cubing Mul
+                edges.append((origin, diamond_nodes[3]))  # x + 0.044715*x**3
                 edges.append((origin, gate_node))
                 cur = origin
                 continue
