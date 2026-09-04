@@ -3,6 +3,7 @@ Wanda pruning (calibrated on activation norms), and structured (channel)
 pruning, see ``onnxsim/pruning.py``.
 """
 
+import io
 import os
 import tempfile
 
@@ -40263,3 +40264,868 @@ def test_analyze_transformer_block_pruning_pools_target_across_if_branches():
     assert layer.total == 4
     assert layer.would_drop == 4
     assert report.not_eligible == []
+
+
+# ---------------------------------------------------------------------------
+# Decomposed (un-fused) attention head pruning
+# ---------------------------------------------------------------------------
+# `_decomposed_gqa_model` builds the exact node sequence a raw
+# `torch.onnx.export(..., opset_version=17, dynamo=False)` of an eager/
+# manual-SDPA attention module emits when never post-processed by ONNX
+# Runtime's own transformer-fusion pass -- confirmed empirically (see
+# onnxsim/pruning.py's own "Decomposed (un-fused) attention head pruning"
+# section comment) by writing and exporting a real HuggingFace-style eager
+# attention `nn.Module` and inspecting the resulting graph directly, for
+# both the plain (no-GQA) and GQA/MQA-with-`repeat_kv` cases, with and
+# without a mask. `test_decomposed_attention_real_torch_export_pipeline`
+# below is that same real export, run through the actual
+# `torch.onnx.export -> onnxsim.simplify() -> apply_attention_head_pruning`
+# pipeline end to end -- every other test in this section uses a hand-built
+# `onnx.parser` model reproducing that confirmed shape directly, per this
+# repo's own `CLAUDE.md` convention.
+def _decomposed_gqa_model(
+    K=16,
+    H=4,
+    KVH=2,
+    D=8,
+    Dv=None,
+    Out=16,
+    batch=1,
+    seq=4,
+    seed=0,
+    bias=True,
+    masked=False,
+    mask_dynamic=False,
+    mask=None,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+    bq=None,
+    bk=None,
+    bv=None,
+    bout=None,
+    out_reshape_wildcard=False,
+    share_kv_reshape_shape=True,
+    extra_foreign_q_reshape_consumer=False,
+):
+    """Builds the decomposed-attention graph:
+    ``Linear(Q/K/V) -> Reshape(to heads) -> Transpose(to BHSD) ->
+    [repeat_kv: Unsqueeze -> Expand -> Reshape, only when KVH < H] ->
+    MatMul(Q, K^T) -> scale -> [+mask] -> Softmax -> MatMul(., V) ->
+    Transpose(back) -> Reshape(back to hidden) -> Linear(O)``.
+
+    K's own dot-product transpose is built in whichever of the two real
+    shapes a real export uses (see onnxsim/pruning.py's own section comment
+    above `_match_decomposed_head_split`): the single, pre-composed
+    ``perm=[0, 2, 3, 1]`` form when `KVH == H` (no `repeat_kv` -- what
+    PyTorch's own ONNX exporter peephole optimization actually emits when
+    there is no intervening op to block it), or the ordinary separate
+    ``perm=[0, 2, 1, 3]`` head-split followed later by its own
+    ``perm=[0, 1, 3, 2]`` swap when `KVH < H` (`repeat_kv` genuinely present,
+    breaking that adjacency).
+
+    `share_kv_reshape_shape` (default `True`, matching the common,
+    empirically-confirmed onnxsim-CSE outcome) makes K's and V's own
+    head-split `Reshape` reference the *same* shape-constant tensor when
+    `Dv is None` (so both target an identical `[batch, seq, KVH, D]`) --
+    exercising :func:`_apply_one_decomposed_gqa_chain`'s own "edit in
+    place, no cloning needed" fast path. `extra_foreign_q_reshape_consumer`
+    adds a second, wholly unrelated `Reshape` reading Q's own head-split
+    shape constant (simulating cross-layer CSE) to exercise the *cloning*
+    path instead -- see that function's own docstring.
+    """
+    if Dv is None:
+        Dv = D
+    rng = np.random.default_rng(seed)
+    Nq, Nk, Nv = H * D, KVH * D, KVH * Dv
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((H * Dv, Out)).astype(np.float32)
+
+    def _i64(arr, name):
+        return onnx.numpy_helper.from_array(np.array(arr, dtype=np.int64), name)
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+
+    # Gemm requires a rank-2 input (unlike MatMul, which happily broadcasts
+    # over the leading batch/seq axes) -- flattening `X` to `[batch*seq, K]`
+    # first, exactly the shape onnxsim's own `fuse_matmul_add_bias_into_gemm`
+    # optimizer pass produces for a real `torch.onnx.export`-then-`simplify()`
+    # pipeline (confirmed empirically -- see onnxsim/pruning.py's own
+    # section comment above `_match_decomposed_head_split`), keeps this
+    # hand-built model runnable through a real `onnxruntime.InferenceSession`
+    # regardless of `bias`, with no separate code path for either case.
+    initializer.append(_i64([batch * seq, K], "XFlatShape"))
+    lines = ["xf = Reshape(X, XFlatShape)"]
+    q_op, k_op, v_op, o_op = (
+        "MatMul(xf, Wq)",
+        "MatMul(xf, Wk)",
+        "MatMul(xf, Wv)",
+        "MatMul(ctx2, Wout)",
+    )
+    if bias:
+        if bq is None:
+            bq = rng.standard_normal((Nq,)).astype(np.float32)
+        if bk is None:
+            bk = rng.standard_normal((Nk,)).astype(np.float32)
+        if bv is None:
+            bv = rng.standard_normal((Nv,)).astype(np.float32)
+        if bout is None:
+            bout = rng.standard_normal((Out,)).astype(np.float32)
+        initializer += [
+            _f32(bq, "Bq"),
+            _f32(bk, "Bk"),
+            _f32(bv, "Bv"),
+            _f32(bout, "Bout"),
+        ]
+        q_op, k_op, v_op = "Gemm(xf, Wq, Bq)", "Gemm(xf, Wk, Bk)", "Gemm(xf, Wv, Bv)"
+        o_op = "Gemm(ctx2, Wout, Bout)"
+
+    initializer.append(_i64([batch, seq, H, D], "Sq"))
+    lines += [
+        "q0 = " + q_op,
+        "qr = Reshape(q0, Sq)",
+        "qt = Transpose<perm=[0,2,1,3]>(qr)",
+    ]
+
+    if extra_foreign_q_reshape_consumer:
+        # A second, wholly unrelated Reshape reading the SAME shape
+        # constant as Q's own head-split -- simulates cross-layer CSE
+        # merging two textually-identical `[batch, seq, H, D]` shape
+        # constants (see this function's own docstring). Reshapes `xf`
+        # itself (always exactly `batch*seq*K == batch*seq*H*D` elements
+        # whenever a caller building this scenario sets `K == H * D`, the
+        # realistic case since a real model's own hidden size and
+        # `num_heads * head_size` coincide) rather than manufacturing an
+        # unrelated tensor from nothing.
+        lines.append("foreign_out = Reshape(xf, Sq)")
+
+    kv_shape_name = "Skv" if share_kv_reshape_shape and Dv == D else None
+    if kv_shape_name:
+        initializer.append(_i64([batch, seq, KVH, D], kv_shape_name))
+        sk_name = sv_name = kv_shape_name
+    else:
+        initializer.append(_i64([batch, seq, KVH, D], "Sk"))
+        initializer.append(_i64([batch, seq, KVH, Dv], "Sv"))
+        sk_name, sv_name = "Sk", "Sv"
+
+    lines += ["k0 = " + k_op, f"kr = Reshape(k0, {sk_name})"]
+    lines += ["v0 = " + v_op, f"vr = Reshape(v0, {sv_name})"]
+
+    n_rep = H // KVH
+    if KVH == H:
+        lines.append("kt = Transpose<perm=[0,2,3,1]>(kr)")
+        lines.append("vt = Transpose<perm=[0,2,1,3]>(vr)")
+    else:
+        assert H % KVH == 0
+        initializer.append(_i64([2], "Ax2"))
+        initializer.append(_i64([batch, KVH, n_rep, seq, D], "KExpandShape"))
+        initializer.append(_i64([batch, H, seq, D], "KMergeShape"))
+        initializer.append(_i64([batch, KVH, n_rep, seq, Dv], "VExpandShape"))
+        initializer.append(_i64([batch, H, seq, Dv], "VMergeShape"))
+        lines += [
+            "kt0 = Transpose<perm=[0,2,1,3]>(kr)",
+            "ku = Unsqueeze(kt0, Ax2)",
+            "ke = Expand(ku, KExpandShape)",
+            "kre = Reshape(ke, KMergeShape)",
+            "kt = Transpose<perm=[0,1,3,2]>(kre)",
+            "vt0 = Transpose<perm=[0,2,1,3]>(vr)",
+            "vu = Unsqueeze(vt0, Ax2)",
+            "ve = Expand(vu, VExpandShape)",
+            "vt = Reshape(ve, VMergeShape)",
+        ]
+
+    initializer.append(_f32(np.array(D**-0.5, dtype=np.float32), "Scale"))
+    lines += ["qk = MatMul(qt, kt)", "scaled = Mul(qk, Scale)"]
+
+    extra_inputs = ""
+    if masked:
+        if mask is None:
+            mask = np.triu(np.full((seq, seq), -1e4, dtype=np.float32), k=1)[
+                None, None, :, :
+            ]
+        if mask_dynamic:
+            extra_inputs = f", float[1,1,{seq},{seq}] Mask"
+        else:
+            initializer.append(_f32(np.asarray(mask), "Mask"))
+        lines.append("premask = Add(scaled, Mask)")
+        smax_in = "premask"
+    else:
+        smax_in = "scaled"
+    lines.append(f"attn = Softmax<axis=-1>({smax_in})")
+    lines.append("ctx0 = MatMul(attn, vt)")
+    lines.append("ctx1 = Transpose<perm=[0,2,1,3]>(ctx0)")
+
+    # `ctx2`, like `xf` above, is deliberately flattened to rank 2
+    # (`[batch*seq, H*Dv]`) -- the same real, `Gemm`-rank-2-compatible shape
+    # onnxsim's own optimizer produces (confirmed empirically: the raw
+    # export's own `Reshape(ctx1, [batch, seq, -1])` gets rewritten to
+    # exactly `[-1, H*Dv]` once the `fuse_matmul_add_bias_into_gemm` pass
+    # needs a 2-D operand for the O-projection Gemm it creates) -- with an
+    # extra trailing `Reshape` back to the graph's own declared 3-D `Y`
+    # output, exactly mirroring that same real shape.
+    if out_reshape_wildcard:
+        initializer.append(_i64([batch * seq, -1], "OutShape"))
+    else:
+        initializer.append(_i64([batch * seq, H * Dv], "OutShape"))
+    initializer.append(_i64([batch, seq, Out], "YShape"))
+    lines.append("ctx2 = Reshape(ctx1, OutShape)")
+    lines.append("y0 = " + o_op)
+    lines.append("Y = Reshape(y0, YShape)")
+
+    body_lines = "\n          ".join(lines)
+    model = _model(
+        f"""
+        g (float[{batch},{seq},{K}] X{extra_inputs}) => (float[{batch},{seq},{Out}] Y)
+        {{
+          {body_lines}
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Dv=Dv,
+        Out=Out,
+        batch=batch,
+        seq=seq,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        bq=bq,
+        bk=bk,
+        bv=bv,
+        bout=bout,
+        mask=mask,
+    )
+
+
+def _decomposed_q_gemm(model):
+    return next(n for n in model.graph.node if n.output and n.output[0] == "q0")
+
+
+def _decomposed_k_gemm(model):
+    return next(n for n in model.graph.node if n.output and n.output[0] == "k0")
+
+
+def _decomposed_v_gemm(model):
+    return next(n for n in model.graph.node if n.output and n.output[0] == "v0")
+
+
+def _decomposed_out_gemm(model):
+    return next(n for n in model.graph.node if n.output and n.output[0] == "y0")
+
+
+def _decomposed_weight_shapes(model):
+    inits = {t.name: t for t in model.graph.initializer}
+    q = _decomposed_q_gemm(model)
+    k = _decomposed_k_gemm(model)
+    v = _decomposed_v_gemm(model)
+    o = _decomposed_out_gemm(model)
+    wq = onnx.numpy_helper.to_array(inits[q.input[1]])
+    wk = onnx.numpy_helper.to_array(inits[k.input[1]])
+    wv = onnx.numpy_helper.to_array(inits[v.input[1]])
+    wo = onnx.numpy_helper.to_array(inits[o.input[1]])
+    return wq, wk, wv, wo
+
+
+def test_decomposed_gqa_pruning_matches_oracle_exactly():
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=2, D=8, Out=16, seed=1)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned)
+    group_size = cfg["H"] // cfg["KVH"]
+    new_kv = cfg["KVH"] - round(cfg["KVH"] * 0.5)
+    assert wk_new.shape[1] == new_kv * cfg["D"]
+    assert wq_new.shape[1] == new_kv * group_size * cfg["D"]
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], new_kv
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _decomposed_gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=new_kv,
+        D=d,
+        Out=cfg["Out"],
+        seed=1,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        bq=cfg["bq"][q_idx],
+        bk=cfg["bk"][kv_idx],
+        bv=cfg["bv"][kv_idx],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_decomposed_plain_attention_pruning_matches_oracle_exactly():
+    # KVH == H -- the no-GQA, single pre-composed `perm=[0,2,3,1]`
+    # dot-product-transpose form (see `_decomposed_gqa_model`'s own
+    # docstring). Every "group" is exactly one query head wide.
+    model, cfg = _decomposed_gqa_model(K=16, H=4, KVH=4, D=8, Out=16, seed=3)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned)
+    new_h = cfg["H"] - round(cfg["H"] * 0.5)
+    assert wq_new.shape[1] == new_h * cfg["D"]
+    assert wk_new.shape[1] == new_h * cfg["D"]
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], new_h
+    )
+    d = cfg["D"]
+    idx = _head_idx(keep_groups, d)
+
+    oracle, _ = _decomposed_gqa_model(
+        K=cfg["K"],
+        H=new_h,
+        KVH=new_h,
+        D=d,
+        Out=cfg["Out"],
+        seed=3,
+        wq=cfg["wq"][:, idx],
+        wk=cfg["wk"][:, idx],
+        wv=cfg["wv"][:, idx],
+        wout=cfg["wout"][idx, :],
+        bq=cfg["bq"][idx],
+        bk=cfg["bk"][idx],
+        bv=cfg["bv"][idx],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_decomposed_gqa_pruning_with_constant_mask_matches_oracle_exactly():
+    model, cfg = _decomposed_gqa_model(
+        K=16, H=8, KVH=2, D=8, Out=16, seed=5, masked=True
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    group_size = cfg["H"] // cfg["KVH"]
+    new_kv = cfg["KVH"] - round(cfg["KVH"] * 0.5)
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], new_kv
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _decomposed_gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=new_kv,
+        D=d,
+        Out=cfg["Out"],
+        seed=5,
+        masked=True,
+        mask=cfg["mask"],
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        bq=cfg["bq"][q_idx],
+        bk=cfg["bk"][kv_idx],
+        bv=cfg["bv"][kv_idx],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(6)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_decomposed_gqa_pruning_with_dynamic_mask_matches_oracle_exactly():
+    model, cfg = _decomposed_gqa_model(
+        K=16, H=8, KVH=2, D=8, Out=16, seed=7, masked=True, mask_dynamic=True
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    group_size = cfg["H"] // cfg["KVH"]
+    new_kv = cfg["KVH"] - round(cfg["KVH"] * 0.5)
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], new_kv
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _decomposed_gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=new_kv,
+        D=d,
+        Out=cfg["Out"],
+        seed=7,
+        masked=True,
+        mask_dynamic=True,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        bq=cfg["bq"][q_idx],
+        bk=cfg["bk"][kv_idx],
+        bv=cfg["bv"][kv_idx],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(8)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    mask = np.triu(np.full((cfg["seq"], cfg["seq"]), -1e4, dtype=np.float32), k=1)[
+        None, None, :, :
+    ]
+    (y_pruned,) = _run(pruned, {"X": x, "Mask": mask})
+    (y_oracle,) = _run(oracle, {"X": x, "Mask": mask})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_decomposed_gqa_pruning_out_reshape_wildcard_still_prunes():
+    # The combine-back Reshape's own target shape already ends in a
+    # wildcard (`-1`) -- confirmed the common real-export shape (see
+    # onnxsim/pruning.py's own section comment) -- so
+    # `_apply_one_decomposed_gqa_chain` never needs to (and doesn't) touch
+    # it at all; pruning must still fire correctly for every other tensor.
+    model, cfg = _decomposed_gqa_model(
+        K=16, H=8, KVH=2, D=8, Out=16, seed=9, out_reshape_wildcard=True
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    wq_new, wk_new, _, _ = _decomposed_weight_shapes(pruned)
+    assert wk_new.shape[1] == 1 * cfg["D"]  # KVH 2 -> 1
+    assert wq_new.shape[1] == 4 * cfg["D"]  # H 8 -> 4 (group_size=4 preserved)
+
+    rng = np.random.default_rng(10)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
+    assert np.all(np.isfinite(y))
+
+
+def test_decomposed_gqa_pruning_shared_kv_reshape_shape_matches_oracle():
+    # K's and V's own head-split `Reshape` intentionally share ONE literal
+    # shape constant (`share_kv_reshape_shape=True`, the default -- the
+    # common onnxsim-CSE outcome, confirmed empirically) -- exercises the
+    # "edit in place" fast path of `_rewrite_shape_dim`, not cloning, since
+    # both of that constant's own readers belong to this one matched chain.
+    model, cfg = _decomposed_gqa_model(
+        K=16, H=8, KVH=2, D=8, Out=16, seed=11, share_kv_reshape_shape=True
+    )
+    names = {n.output[0] for n in model.graph.node if n.op_type == "Reshape"}
+    assert {"kr", "vr"} <= names
+    k_reshape = next(n for n in model.graph.node if n.output[0] == "kr")
+    v_reshape = next(n for n in model.graph.node if n.output[0] == "vr")
+    assert k_reshape.input[1] == v_reshape.input[1]  # genuinely shared
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    wq_new, wk_new, wv_new, _ = _decomposed_weight_shapes(pruned)
+    assert wk_new.shape[1] == 1 * cfg["D"]
+    assert wv_new.shape[1] == 1 * cfg["D"]
+
+    rng = np.random.default_rng(12)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
+    assert np.all(np.isfinite(y))
+
+
+def test_decomposed_gqa_pruning_clones_shape_constant_shared_with_foreign_reader():
+    # Q's own head-split shape constant is ALSO read by a wholly unrelated
+    # `Reshape` (`foreign_out`, simulating cross-layer CSE) -- editing it in
+    # place would silently corrupt that unrelated node too, so
+    # `_apply_one_decomposed_gqa_chain`'s own `_rewrite_shape_dim` must
+    # clone a fresh tensor for this chain's own Q reshape instead, leaving
+    # the original -- and `foreign_out`'s own shape -- completely untouched.
+    model, cfg = _decomposed_gqa_model(
+        # K == H * D (64) so `foreign_out = Reshape(xf, Sq)` is a genuinely
+        # valid reshape (same total element count) -- the realistic shape
+        # too, since a real model's own hidden size and `num_heads *
+        # head_size` coincide.
+        K=64,
+        H=8,
+        KVH=2,
+        D=8,
+        Out=16,
+        seed=13,
+        extra_foreign_q_reshape_consumer=True,
+    )
+    assert any(n.output and n.output[0] == "foreign_out" for n in model.graph.node)
+    sq_before = next(t for t in model.graph.initializer if t.name == "Sq")
+    assert list(onnx.numpy_helper.to_array(sq_before)) == [
+        cfg["batch"],
+        cfg["seq"],
+        cfg["H"],
+        cfg["D"],
+    ]
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    # The original `Sq` tensor must be byte-identical to before -- still
+    # read by `foreign_out`'s own Reshape, which must keep working at the
+    # ORIGINAL (unpruned) head count.
+    sq_after = next(t for t in pruned.graph.initializer if t.name == "Sq")
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(sq_after), onnx.numpy_helper.to_array(sq_before)
+    )
+    foreign_after = next(
+        n for n in pruned.graph.node if n.output and n.output[0] == "foreign_out"
+    )
+    assert foreign_after.input[1] == "Sq"  # still reads the original, untouched
+
+    # Q's own reshape must have been rewired to a NEW, cloned tensor.
+    q_reshape = next(n for n in pruned.graph.node if n.output[0] == "qr")
+    assert q_reshape.input[1] != "Sq"
+    cloned = next(t for t in pruned.graph.initializer if t.name == q_reshape.input[1])
+    cloned_dims = onnx.numpy_helper.to_array(cloned)
+    assert cloned_dims[2] == 4  # H 8 -> 4, the NEW post-pruning head count
+
+    rng = np.random.default_rng(14)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
+    assert np.all(np.isfinite(y))
+
+
+def test_decomposed_gqa_pruning_zero_sparsity_is_a_no_op():
+    model, _ = _decomposed_gqa_model(K=16, H=8, KVH=2, D=8, Out=16, seed=15)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    before = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in model.graph.initializer
+    }
+    after = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in pruned.graph.initializer
+    }
+    assert before == after
+
+
+def test_decomposed_gqa_pruning_l1_norm_favors_total_magnitude():
+    # Mirrors `test_gqa_pruning_l1_norm_favors_total_magnitude`'s own
+    # construction exactly (see that test's own comment for the full
+    # reasoning): Q and K stay entirely zero -- only V carries weight,
+    # concentrated in KV group 0's own slice (Frobenius == L1 == 16, no
+    # ambiguity) versus spread evenly across KV group 1's own slice
+    # (Frobenius = sqrt(64) = 8, L1 = 64). With two KV groups and
+    # keep_count = 1, L2 keeps group 0, L1 keeps group 1.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 3
+    Nkv = KVH * D
+    wq = np.zeros((K, H * D), dtype=np.float32)
+    wk = np.zeros((K, Nkv), dtype=np.float32)
+    wv = np.zeros((K, Nkv), dtype=np.float32)
+    wv[0, 0] = 16.0  # KV group 0's own V slice (columns 0:D) -- concentrated
+    wv[:, D : 2 * D] = 1.0  # KV group 1's own V slice (columns D:2D) -- spread
+
+    # `bias=False` -- no bias to keep this construction's discriminating
+    # weight-only values the whole story, exactly like the fused-op L1 test
+    # this one mirrors.
+    model, cfg = _decomposed_gqa_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=21, wq=wq, wk=wk, wv=wv, bias=False
+    )
+    pruned_l2 = onnxsim.apply_attention_head_pruning(
+        model, sparsity=0.5, importance_norm="l2"
+    )
+    pruned_l1 = onnxsim.apply_attention_head_pruning(
+        model, sparsity=0.5, importance_norm="l1"
+    )
+    onnx.checker.check_model(pruned_l2)
+    onnx.checker.check_model(pruned_l1)
+
+    group_size = H // KVH
+
+    def _oracle_model(keep_group):
+        q_idx = np.arange(
+            keep_group * group_size * D, (keep_group + 1) * group_size * D
+        )
+        kv_idx = np.arange(keep_group * D, (keep_group + 1) * D)
+        return _decomposed_gqa_model(
+            K=K,
+            H=group_size,
+            KVH=1,
+            D=D,
+            Out=Out,
+            seed=21,
+            bias=False,
+            wq=wq[:, q_idx],
+            wk=wk[:, kv_idx],
+            wv=wv[:, kv_idx],
+            wout=cfg["wout"][q_idx, :],
+        )[0]
+
+    oracle_l2 = _oracle_model(0)
+    oracle_l1 = _oracle_model(1)
+
+    rng = np.random.default_rng(22)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_l2,) = _run(pruned_l2, {"X": x})
+    (y_oracle_l2,) = _run(oracle_l2, {"X": x})
+    (y_l1,) = _run(pruned_l1, {"X": x})
+    (y_oracle_l1,) = _run(oracle_l1, {"X": x})
+    np.testing.assert_allclose(y_l2, y_oracle_l2, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(y_l1, y_oracle_l1, rtol=1e-4, atol=1e-4)
+    assert not np.allclose(y_l2, y_l1)
+
+
+def test_decomposed_gqa_pruning_mismatched_head_size_is_declined():
+    # Q's own head-split reshape claims a different head_size (D=8) than
+    # K's own (rewritten to 4 below) -- structurally invalid for a real
+    # QK^T dot product, so this must decline the whole match, leaving every
+    # tensor completely untouched.
+    model, cfg = _decomposed_gqa_model(
+        K=16, H=4, KVH=4, D=8, Out=16, seed=17, share_kv_reshape_shape=False
+    )
+    for t in model.graph.initializer:
+        if t.name == "Sk":
+            t.CopyFrom(
+                onnx.numpy_helper.from_array(
+                    np.array([cfg["batch"], cfg["seq"], cfg["KVH"], 4], dtype=np.int64),
+                    "Sk",
+                )
+            )
+    assert any(t.name == "Sk" for t in model.graph.initializer)
+    before = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in model.graph.initializer
+    }
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    after = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in pruned.graph.initializer
+    }
+    assert before == after
+
+
+def test_decomposed_gqa_pruning_unsupported_transpose_perm_is_declined():
+    # A non-standard perm on Q's own head-split Transpose -- this pass only
+    # ever recognizes the exact `[0, 2, 1, 3]`/`[0, 2, 3, 1]`/`[0, 1, 3, 2]`
+    # shapes real exports use (see onnxsim/pruning.py's own section
+    # comment); anything else must decline outright, never guessed at.
+    model, _ = _decomposed_gqa_model(K=16, H=4, KVH=4, D=8, Out=16, seed=19)
+    for n in model.graph.node:
+        if n.output and n.output[0] == "qt":
+            n.ClearField("attribute")
+            n.attribute.append(onnx.helper.make_attribute("perm", [0, 1, 2, 3]))
+    before = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in model.graph.initializer
+    }
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    after = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in pruned.graph.initializer
+    }
+    assert before == after
+
+
+def test_decomposed_attention_real_torch_export_pipeline():
+    """The real end-to-end pipeline this whole feature targets:
+    ``torch.onnx.export -> onnxsim.simplify() -> apply_attention_head_pruning``
+    on an actual hand-written eager-attention `nn.Module` (mirroring
+    HuggingFace's own `eager_attention_forward` shape, GQA + a causal mask,
+    the common real-world case) -- confirming pruning genuinely fires on a
+    real export (not just a hand-built fixture) and the pruned model's
+    output matches an independently-computed numpy oracle built directly
+    from the PRUNED model's own (already-sliced) tensors, run through a
+    real `onnxruntime.InferenceSession`.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("onnxruntime")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, num_kv_heads, head_dim, seq, batch = 32, 8, 2, 8, 4, 1
+
+    class EagerGQA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_heads = num_heads
+            self.num_kv_heads = num_kv_heads
+            self.head_dim = head_dim
+            self.q_proj = nn.Linear(hidden, num_heads * head_dim, bias=True)
+            self.k_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.v_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.o_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.scaling = head_dim**-0.5
+
+        def _repeat_kv(self, x, n_rep):
+            if n_rep == 1:
+                return x
+            b, kvh, s, d = x.shape
+            x = x[:, :, None, :, :].expand(b, kvh, n_rep, s, d)
+            return x.reshape(b, kvh * n_rep, s, d)
+
+        def forward(self, hidden_states, attn_mask):
+            b, s, _ = hidden_states.shape
+            q = (
+                self.q_proj(hidden_states)
+                .view(b, s, self.num_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            k = (
+                self.k_proj(hidden_states)
+                .view(b, s, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            v = (
+                self.v_proj(hidden_states)
+                .view(b, s, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            n_rep = self.num_heads // self.num_kv_heads
+            k = self._repeat_kv(k, n_rep)
+            v = self._repeat_kv(v, n_rep)
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.o_proj(attn_output)
+
+    m = EagerGQA()
+    m.eval()
+    x = torch.randn(batch, seq, hidden)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+
+    buf = io.BytesIO()
+    torch.onnx.export(
+        m,
+        (x, mask),
+        buf,
+        input_names=["hidden_states", "attn_mask"],
+        output_names=["output"],
+        opset_version=17,
+        dynamo=False,
+    )
+    raw = onnx.load_from_string(buf.getvalue())
+
+    simplified, ok = onnxsim.onnx_simplifier.simplify(raw)
+    assert ok
+
+    # Sanity check this test isn't vacuous: the decomposed shape genuinely
+    # reached `apply_attention_head_pruning` un-fused (a masked GQA block --
+    # neither onnxsim's own `fuse_attention`/`fuse_gqa` optimizer pass, nor
+    # any existing fused-node matcher in onnxsim/pruning.py, ever produces
+    # or recognizes a fused attention op for this shape -- see this
+    # module's own section comment).
+    assert not any(
+        n.op_type
+        in ("Attention", "GroupQueryAttention", "MultiHeadAttention", "PagedAttention")
+        for n in simplified.graph.node
+    )
+
+    pruned = onnxsim.apply_attention_head_pruning(simplified, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    def _find_gemm(model, bias_substr):
+        for n in model.graph.node:
+            if n.op_type == "Gemm" and len(n.input) == 3 and bias_substr in n.input[2]:
+                return n
+        raise AssertionError(f"no Gemm found for {bias_substr!r}")
+
+    def _init(model, name):
+        for t in model.graph.initializer:
+            if t.name == name:
+                return onnx.numpy_helper.to_array(t)
+        for n in model.graph.node:
+            if n.op_type == "Constant" and n.output[0] == name:
+                for a in n.attribute:
+                    if a.name == "value":
+                        return onnx.numpy_helper.to_array(a.t)
+        raise AssertionError(f"no initializer/Constant found for {name!r}")
+
+    q_gemm = _find_gemm(pruned, "q_proj.bias")
+    k_gemm = _find_gemm(pruned, "k_proj.bias")
+    v_gemm = _find_gemm(pruned, "v_proj.bias")
+    o_gemm = _find_gemm(pruned, "o_proj.bias")
+    wq, bq = _init(pruned, q_gemm.input[1]), _init(pruned, q_gemm.input[2])
+    wk, bk = _init(pruned, k_gemm.input[1]), _init(pruned, k_gemm.input[2])
+    wv, bv = _init(pruned, v_gemm.input[1]), _init(pruned, v_gemm.input[2])
+    wo, bo = _init(pruned, o_gemm.input[1]), _init(pruned, o_gemm.input[2])
+
+    new_num_heads = wq.shape[1] // head_dim
+    new_kv_num_heads = wk.shape[1] // head_dim
+    new_v_head_dim = wv.shape[1] // new_kv_num_heads
+    # Pruning must have actually fired -- the whole point of this test.
+    assert new_num_heads < num_heads
+    assert new_kv_num_heads < num_kv_heads
+    assert new_num_heads // new_kv_num_heads == num_heads // num_kv_heads
+
+    rng = np.random.default_rng(0)
+    hidden_states = rng.standard_normal((batch, seq, hidden)).astype(np.float32)
+    mask_np = mask.numpy().astype(np.float32)
+
+    sess = ort.InferenceSession(
+        pruned.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (ort_out,) = sess.run(None, {"hidden_states": hidden_states, "attn_mask": mask_np})
+
+    def linear(x, w, b):
+        return x @ w + b
+
+    q = (
+        linear(hidden_states, wq, bq)
+        .reshape(batch, seq, new_num_heads, head_dim)
+        .transpose(0, 2, 1, 3)
+    )
+    k = (
+        linear(hidden_states, wk, bk)
+        .reshape(batch, seq, new_kv_num_heads, head_dim)
+        .transpose(0, 2, 1, 3)
+    )
+    v = (
+        linear(hidden_states, wv, bv)
+        .reshape(batch, seq, new_kv_num_heads, new_v_head_dim)
+        .transpose(0, 2, 1, 3)
+    )
+    n_rep = new_num_heads // new_kv_num_heads
+    if n_rep > 1:
+        k = np.repeat(k, n_rep, axis=1)
+        v = np.repeat(v, n_rep, axis=1)
+    scale = head_dim**-0.5
+    scores = np.matmul(q, k.transpose(0, 1, 3, 2)) * scale
+    scores = scores + mask_np
+    scores = scores - scores.max(axis=-1, keepdims=True)
+    exp = np.exp(scores)
+    attn = exp / exp.sum(axis=-1, keepdims=True)
+    ctx = np.matmul(attn, v)
+    ctx = ctx.transpose(0, 2, 1, 3).reshape(batch, seq, new_num_heads * new_v_head_dim)
+    oracle_out = linear(ctx, wo, bo)
+
+    np.testing.assert_allclose(ort_out, oracle_out, rtol=1e-3, atol=1e-3)
