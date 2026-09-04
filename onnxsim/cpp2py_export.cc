@@ -636,6 +636,43 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "sparsity"_a);
 
+  // MoE expert-intermediate-channel pruning: removes intermediate
+  // (`inter_size`) channels from every expert of a matched
+  // `com.microsoft::MoE` node at once -- real structural pruning, data-free.
+  // Whole-expert pruning (shrinking `num_experts` itself) is NOT ported --
+  // see ApplyMoeExpertChannelPruning in structured_pruning_entry.h.
+  m.def(
+      "apply_moe_expert_channel_pruning",
+      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyMoeExpertChannelPruning(model, sparsity);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "sparsity"_a);
+
+  // QMoE expert-channel pruning: removes intermediate (inter_size) channels
+  // from every expert of a matched com.microsoft::QMoE node -- the
+  // quantized-weight counterpart of apply_structured_pruning. See
+  // ApplyQMoEExpertChannelPruning in onnxsim.h.
+  m.def(
+      "apply_qmoe_expert_channel_pruning",
+      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyQMoEExpertChannelPruning(model, sparsity);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "sparsity"_a);
+
   // QuaRot (Ashkboos et al., 2024): rotation preprocessing plus INT4
   // round-to-nearest quantization of both the weight and the activation of
   // every MatMul/vanilla-Gemm layer. Data-free. See ApplyQuarot in

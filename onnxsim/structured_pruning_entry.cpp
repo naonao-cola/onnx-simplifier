@@ -78,6 +78,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -11424,6 +11425,1614 @@ void ApplyMatMulBnb4Chains(onnx::GraphProto* graph,
   }
 }
 
+// --- MoE (com.microsoft::MoE) expert-intermediate-channel pruning --------
+//
+// C++ port of pruning.py's own apply_moe_expert_channel_pruning -- see that
+// function's own section comment (the "MoE expert-intermediate-channel
+// pruning" block just above `class _MoEChain` in pruning.py) for the full
+// safety argument: `fc1_experts_weights`/`fc2_experts_weights` each carry a
+// clean `[num_experts, ...]` leading axis (`inter_size` living on fc1's own
+// axis 1 -- `[num_experts, inter_size, hidden_size]` -- and fc2's own axis 2
+// -- `[num_experts, hidden_size, inter_size]`), so dropping the same
+// `inter_size` index from both, identically across every expert, needs no
+// upstream producer, no downstream consumer, and no attribute update at all
+// (`num_experts`/`k`/`activation_type` are untouched, and the node's own
+// output shape always equals its input's) -- the "narrowest safe slice" of
+// NVIDIA's "Iterative Puzzle" paper (arXiv:2607.04371) this module can
+// precisely justify.
+//
+// Two scope boundaries, both already decided (and empirically verified
+// against a real onnxruntime CPU MoE kernel) on the Python side and simply
+// carried over unchanged here, never re-derived:
+//   * `fc3_experts_weights` (present) and `swiglu`/unrecognized
+//     `activation_type` (or nonzero `swiglu_fusion`) are declined outright --
+//     see pruning.py's own comment for why (no CPU execution provider in
+//     this environment implements fc3; a real fused-swiglu fc1 doubles its
+//     own row count, which the `fc1.dims(1) == fc2.dims(2)` shape check
+//     below already declines structurally, without even reading
+//     `swiglu_fusion`).
+//   * Whole-expert pruning (shrinking `num_experts` itself, pruning.py's own
+//     separate "MoE whole-expert pruning" section right after this one) is
+//     NOT ported here -- it needs runtime calibration data (an
+//     `onnxruntime.InferenceSession` observing router activations over a
+//     representative batch) to rank experts by usage, and this C++ port has
+//     no ONNX Runtime linked into it at all (see CLAUDE.md: the wheel build
+//     always passes `-DONNXSIM_BUILTIN_ORT=OFF`). This section stays
+//     entirely within the data-free, fully structural `inter_size` slice.
+//
+// `fc1_experts_weights`/`fc2_experts_weights`/`fc1_experts_bias` are
+// admitted only as plain FLOAT (float32) tensors here -- this file's own
+// float-tensor helpers (ReadFloatTensor/SetFloatTensorData) have no
+// FLOAT16/BFLOAT16 support anywhere yet, unlike pruning.py's own
+// `_is_supported_float_dtype`, which additionally admits both. Mirrors this
+// file's own already-established narrower-than-pruning.py scope decision
+// (e.g. the "MatMulNBits" section's identical restriction on its own
+// scales/zero_points/bias tensors) -- a FLOAT16/BFLOAT16 MoE export is
+// simply never matched here (declined, not mis-handled).
+//
+// This is exposed as its own top-level entry point (ApplyMoeExpertChannel
+// Pruning, alongside ApplyStructuredPruning/ApplyAttentionHeadPruning at the
+// bottom of this file) rather than folded into ApplyStructuredPruning's own
+// per-graph dispatch: `fc1_experts_weights`/`fc2_experts_weights`/
+// `fc1_experts_bias` are 3-D tensors that no other chain family in this file
+// could ever also match (every other chain-finder requires a rank-2 MatMul/
+// Gemm-shaped or rank-4 Conv-shaped weight), so there is no shared/tied-
+// initializer conflict to guard against between this pass and any of
+// ApplyStructuredPruning's own six chain families -- the touched-initializer
+// bookkeeping below only ever needs to guard MoE nodes against each other
+// (mirrors pruning.py's own `_apply_moe_chains`, whose own local
+// `touched: Set[str]` is likewise never shared with `_TouchedState`).
+
+struct MoEChain {
+  onnx::NodeProto* node;
+  std::string fc1_w;
+  std::optional<std::string> fc1_b;
+  std::string fc2_w;
+  std::optional<std::string> fc2_b;
+  int64_t num_experts;
+  int64_t inter_size;
+  int64_t hidden_size;
+};
+
+const std::unordered_set<std::string>& MoeActivations() {
+  static const std::unordered_set<std::string> kOps = {"relu", "identity",
+                                                       "silu", "gelu"};
+  return kOps;
+}
+
+// One optional-bias input (`fc1_experts_bias`/`fc2_experts_bias`) match
+// result, mirroring pruning.py's own `_optional_bias`'s
+// `Tuple[bool, Optional[str]]` return convention: `ok=false` means the
+// input is PRESENT but fails one of its own checks (declining the WHOLE
+// node, not just that bias), while `ok=true, name=nullopt` means the input
+// is simply absent (a well-formed unbiased MoE node).
+struct MoeOptionalBiasResult {
+  bool ok;
+  std::optional<std::string> name;
+};
+
+MoeOptionalBiasResult MatchMoeOptionalBias(const onnx::NodeProto& node,
+                                           int index, int64_t expected_dim0,
+                                           int64_t expected_dim1,
+                                           const InitMap& init_map,
+                                           const ConsumerMap& consumers_of) {
+  if (node.input_size() <= index || node.input(index).empty()) {
+    return {true, std::nullopt};
+  }
+  const std::string& name = node.input(index);
+  auto it = init_map.find(name);
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT ||
+      it->second->dims_size() != 2 || it->second->dims(0) != expected_dim0 ||
+      it->second->dims(1) != expected_dim1 ||
+      ConsumerCount(consumers_of, name) != 1) {
+    return {false, std::nullopt};
+  }
+  return {true, name};
+}
+
+// If `node` is a `com.microsoft::MoE` node this pass can safely prune the
+// `inter_size` axis of, returns the matched MoEChain -- mirrors pruning.py's
+// own `_match_moe_producer` exactly, check for check, in the same order (see
+// that function's own docstring for the full per-check safety argument).
+std::optional<MoEChain> MatchMoeProducer(onnx::NodeProto* node,
+                                         const InitMap& init_map,
+                                         const ConsumerMap& consumers_of) {
+  if (node->domain() != kComMicrosoftDomain || node->op_type() != "MoE") {
+    return std::nullopt;
+  }
+
+  std::string activation = "relu";
+  int64_t swiglu_fusion = 0;
+  for (const auto& attr : node->attribute()) {
+    if (attr.name() == "activation_type") {
+      activation = attr.s();
+    } else if (attr.name() == "swiglu_fusion") {
+      swiglu_fusion = attr.i();
+    }
+  }
+  if (!MoeActivations().count(activation) || swiglu_fusion != 0) {
+    return std::nullopt;
+  }
+
+  if (node->input_size() > 6 && !node->input(6).empty()) {
+    return std::nullopt;  // fc3_experts_weights present -- no CPU oracle, see
+                          // above.
+  }
+  if (node->input_size() < 5 || node->input(2).empty() ||
+      node->input(4).empty()) {
+    return std::nullopt;
+  }
+  const std::string fc1_w_name = node->input(2);
+  const std::string fc2_w_name = node->input(4);
+  auto fc1_it = init_map.find(fc1_w_name);
+  auto fc2_it = init_map.find(fc2_w_name);
+  if (fc1_it == init_map.end() || fc2_it == init_map.end() ||
+      fc1_it->second->data_type() != onnx::TensorProto::FLOAT ||
+      fc2_it->second->data_type() != onnx::TensorProto::FLOAT ||
+      fc1_it->second->dims_size() != 3 || fc2_it->second->dims_size() != 3 ||
+      ConsumerCount(consumers_of, fc1_w_name) != 1 ||
+      ConsumerCount(consumers_of, fc2_w_name) != 1) {
+    return std::nullopt;
+  }
+  const onnx::TensorProto* fc1_w = fc1_it->second;
+  const onnx::TensorProto* fc2_w = fc2_it->second;
+  const int64_t num_experts = fc1_w->dims(0);
+  const int64_t inter_size = fc1_w->dims(1);
+  const int64_t hidden_size = fc1_w->dims(2);
+  if (fc2_w->dims(0) != num_experts || fc2_w->dims(1) != hidden_size ||
+      fc2_w->dims(2) != inter_size) {
+    return std::nullopt;  // also rules out a fused-swiglu fc1 (doubled row
+                          // count)
+  }
+
+  MoeOptionalBiasResult fc1_b = MatchMoeOptionalBias(
+      *node, 3, num_experts, inter_size, init_map, consumers_of);
+  if (!fc1_b.ok) {
+    return std::nullopt;
+  }
+  MoeOptionalBiasResult fc2_b = MatchMoeOptionalBias(
+      *node, 5, num_experts, hidden_size, init_map, consumers_of);
+  if (!fc2_b.ok) {
+    return std::nullopt;
+  }
+
+  return MoEChain{node,       fc1_w_name,  fc1_b.name, fc2_w_name,
+                  fc2_b.name, num_experts, inter_size, hidden_size};
+}
+
+std::vector<MoEChain> FindMoeChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+
+  std::vector<MoEChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto chain = MatchMoeProducer(node, init_map, consumers_of);
+    if (chain) {
+      chains.push_back(std::move(*chain));
+    }
+  }
+  return chains;
+}
+
+// Combined (root-sum-square) L2-norm importance per `inter_size` channel
+// index, accumulated in float64 (mirrors this file's own established
+// accumulate-then-sqrt-once convention, e.g. ApplyChains's own `importance`
+// loop) over every expert and the full `hidden_size` axis at once -- index
+// `j` is one shared row of fc1 (and, if present, fc1_experts_bias) and one
+// shared column of fc2, across EVERY expert simultaneously (the node's own
+// `[num_experts, inter_size, ...]`/`[num_experts, ..., inter_size]` layout
+// gives every expert the identical `inter_size` axis, with no independent
+// per-expert choice possible), mirroring pruning.py's own `_moe_importance`
+// exactly.
+std::vector<double> MoeImportance(const MoEChain& chain,
+                                  const MutInitMap& init_map) {
+  const int64_t e_n = chain.num_experts;
+  const int64_t inter = chain.inter_size;
+  const int64_t hidden = chain.hidden_size;
+  std::vector<double> squared(static_cast<size_t>(inter), 0.0);
+
+  const std::vector<float> fc1_w = ReadFloatTensor(*init_map.at(chain.fc1_w));
+  for (int64_t e = 0; e < e_n; ++e) {
+    for (int64_t j = 0; j < inter; ++j) {
+      double sq = 0.0;
+      for (int64_t h = 0; h < hidden; ++h) {
+        const double v =
+            fc1_w[static_cast<size_t>((e * inter + j) * hidden + h)];
+        sq += v * v;
+      }
+      squared[static_cast<size_t>(j)] += sq;
+    }
+  }
+
+  const std::vector<float> fc2_w = ReadFloatTensor(*init_map.at(chain.fc2_w));
+  for (int64_t e = 0; e < e_n; ++e) {
+    for (int64_t h = 0; h < hidden; ++h) {
+      for (int64_t j = 0; j < inter; ++j) {
+        const double v =
+            fc2_w[static_cast<size_t>((e * hidden + h) * inter + j)];
+        squared[static_cast<size_t>(j)] += v * v;
+      }
+    }
+  }
+
+  if (chain.fc1_b) {
+    const std::vector<float> fc1_b =
+        ReadFloatTensor(*init_map.at(*chain.fc1_b));
+    for (int64_t e = 0; e < e_n; ++e) {
+      for (int64_t j = 0; j < inter; ++j) {
+        const double v = fc1_b[static_cast<size_t>(e * inter + j)];
+        squared[static_cast<size_t>(j)] += v * v;
+      }
+    }
+  }
+
+  std::vector<double> importance(squared.size());
+  for (size_t i = 0; i < squared.size(); ++i) {
+    importance[i] = std::sqrt(squared[i]);
+  }
+  return importance;
+}
+
+// The actual apply step, mirroring pruning.py's own `_apply_moe_chains`:
+// ranks every `inter_size` index by MoeImportance, drops the lowest-
+// `sparsity`-fraction (at least one always kept), and removes the matching
+// row from fc1_experts_weights/fc1_experts_bias and column from
+// fc2_experts_weights, identically across every expert. `fc2_experts_bias`
+// indexes `hidden_size` (fc2's own *output* axis, not `inter_size`), so it
+// is never sliced here -- exactly like the Python original.
+//
+// `touched` guards only against another MoE node in this SAME graph sharing
+// one of these weights (see this section's own top comment for why that is
+// never a cross-pass concern here) -- a fresh, empty set per call, mirroring
+// pruning.py's own local `touched: Set[str]` inside `_apply_moe_chains`
+// (never the module-wide `_TouchedState` `apply_structured_pruning` uses).
+void ApplyMoeChains(onnx::GraphProto* graph, std::vector<MoEChain>& chains,
+                    double sparsity) {
+  MutInitMap init_map = BuildMutInitMap(graph);
+  std::unordered_set<std::string> touched;
+
+  for (const auto& chain : chains) {
+    std::unordered_set<std::string> weight_names{chain.fc1_w, chain.fc2_w};
+    if (chain.fc1_b) {
+      weight_names.insert(*chain.fc1_b);
+    }
+    bool conflict = false;
+    for (const auto& w : weight_names) {
+      if (touched.count(w)) {
+        conflict = true;
+        break;
+      }
+    }
+    if (conflict) {
+      continue;  // A shared/tied initializer another MoE node already resized.
+    }
+    touched.insert(weight_names.begin(), weight_names.end());
+
+    const int64_t n = chain.inter_size;
+    const int64_t keep_count = std::max<int64_t>(
+        1, n - std::llround(static_cast<double>(n) * sparsity));
+    if (keep_count >= n) {
+      continue;  // Rounds down to nothing for this layer -- no-op.
+    }
+
+    const std::vector<double> importance = MoeImportance(chain, init_map);
+    const std::vector<int64_t> keep =
+        TopKIndicesAscending(importance, keep_count);
+    const int64_t kc = static_cast<int64_t>(keep.size());
+
+    // fc1_experts_weights: [num_experts, inter_size, hidden_size] -- SliceAxis1
+    // slices exactly its own middle (`inter_size`) axis, `inner = hidden_size`.
+    {
+      onnx::TensorProto* fc1_w = init_map.at(chain.fc1_w);
+      const std::vector<float> data = ReadFloatTensor(*fc1_w);
+      const std::vector<float> out = SliceAxis1(
+          data, chain.num_experts, chain.inter_size, chain.hidden_size, keep);
+      SetFloatTensorData(fc1_w, {chain.num_experts, kc, chain.hidden_size},
+                         out);
+    }
+
+    // fc2_experts_weights: [num_experts, hidden_size, inter_size] --
+    // `inter_size` is the LAST axis here; row-major layout makes this
+    // byte-identical to a flat [num_experts * hidden_size, inter_size]
+    // matrix, so the same SliceAxis1 (dim1 = inter_size, inner = 1) slices
+    // exactly that trailing axis without any new slicing routine.
+    {
+      onnx::TensorProto* fc2_w = init_map.at(chain.fc2_w);
+      const std::vector<float> data = ReadFloatTensor(*fc2_w);
+      const std::vector<float> out =
+          SliceAxis1(data, chain.num_experts * chain.hidden_size,
+                     chain.inter_size, 1, keep);
+      SetFloatTensorData(fc2_w, {chain.num_experts, chain.hidden_size, kc},
+                         out);
+    }
+
+    if (chain.fc1_b) {
+      // fc1_experts_bias: [num_experts, inter_size] -- same trailing-axis
+      // shape SliceAxis1 already handles (inner = 1), no reshape needed.
+      onnx::TensorProto* fc1_b = init_map.at(*chain.fc1_b);
+      const std::vector<float> data = ReadFloatTensor(*fc1_b);
+      const std::vector<float> out =
+          SliceAxis1(data, chain.num_experts, chain.inter_size, 1, keep);
+      SetFloatTensorData(fc1_b, {chain.num_experts, kc}, out);
+    }
+    // fc2_experts_bias indexes hidden_size, fc2's own *output* axis --
+    // unaffected by an inter_size cut, so it is never sliced here.
+  }
+}
+
+// --- QMoE (com.microsoft, quantized-weight Mixture-of-Experts) expert-
+// channel structured pruning -------------------------------------------
+//
+// Port of pruning.py's own "QMoE (quantized-weight MoE) pruning" section --
+// see that section's own top comment there for the full schema/packing
+// derivation (re-derived from QMoE's own live onnxruntime schema and real
+// CPU `onnxruntime.InferenceSession` runs, not assumed from its name or
+// from a superficially similar op). Only the EXPERT-CHANNEL half
+// (`apply_qmoe_expert_channel_pruning`, narrowing every expert's own
+// `inter_size` identically across all experts) is ported here -- the
+// complementary WHOLE-EXPERT half (`apply_qmoe_whole_expert_pruning`)
+// needs runtime calibration data (an ONNX Runtime inference session
+// observing router activations), which this C++ port has no ONNX Runtime
+// linked into at all (see CLAUDE.md: the wheel build never builds ORT) --
+// so it stays out of scope here, exactly like every other calibration-
+// driven pass this file's own established precedent already excludes
+// (Wanda-style importance, whole-expert usage-based pruning, ...).
+//
+// *** THE CORE INVARIANT: SLICE CODES DIRECTLY, NEVER DEQUANT-REQUANT ***.
+// Exactly like this file's own MatMulNBits/MatMulBnb4/QDQ sections above:
+// `fc1_experts_weights`/`fc2_experts_weights` are never dequantized and
+// re-quantized from a sliced float weight. QMoEDequantizeInt/
+// QMoEDequantizeNvfp4 exist ONLY to rank channels by importance -- the
+// actual channel removal (QMoESlice*Axis1/QMoESlice*Axis2, and the packed-
+// axis unpack/select/repack helpers) always row/column-selects (and, for a
+// sub-byte-packed axis, unpacks codes to bytes, re-selects, and re-packs)
+// the EXISTING quantized codes. A pruned model's surviving channels must
+// therefore produce BIT-IDENTICAL results to the unpruned model's own real
+// quantization, not merely numerically close ones -- re-quantizing a
+// sliced float weight from scratch would recompute a different scale
+// wherever the dropped values happened to hold that row's own max (see
+// pruning.py's own test suite, and tests/test_qmoe_pruning_cpp.py's own
+// "hand-built presliced reference" tests here, which check exactly this:
+// the pruned graph's own tensors must equal a HAND-SLICE of the ORIGINAL
+// quantized codes, never a re-quantization of the sliced float weight).
+//
+// *** THE BLOCK-ALIGNMENT CONSTRAINT ***. With `block_size` set (groupwise
+// quantization), `fc2_experts_weights`' own quantization blocks group
+// along `inter_size` -- this pass's own pruned axis -- so every value in
+// one `block_size`-sized group shares one `(scale, zero_point)` pair an
+// individual channel cannot be dropped out of without re-quantizing the
+// whole group (out of scope: this module never invents a new quantized
+// value). So the keep-set is resolved to WHOLE `block_size`-sized groups
+// from the very start (QMoEBlockAlignedKeep ranks and keeps *blocks*, not
+// individual channels, by the same combined-L2-norm criterion aggregated
+// one level up) -- never a channel-level keep-set checked for alignment
+// after the fact, so the result is always block-aligned by construction,
+// never partial. `fc1_experts_weights`' own blocks, by contrast, group
+// along `hidden_size` (an axis this pass never touches), so `fc1`'s own
+// slicing needs no such alignment check either way -- mirrors
+// MatMulNBitsBlockAlignedKeepBlocks's own precedent for `MatMulNBits`'
+// analogous K-axis case, just resolved eagerly here rather than validated
+// against an already-chosen keep-set.
+//
+// Covers `quant_type='int'` (both with no `block_size` -- whole-row
+// per-channel scale -- and with a groupwise `block_size`) and
+// `quant_type='nvfp4'` (E2M1-packed weights, `float8e4m3fn` per-block
+// scales, a required per-expert `float32` global scale, `block_size` fixed
+// at 16 -- schema-derived only, since this environment's onnxruntime has
+// no CPU kernel for any FP4/FP8 `quant_type` to verify against at all; see
+// pruning.py's own section comment, point 9, for the full reasoning).
+// `'fp4'`, `'fp8'`, and `'wfp4afp8'` remain explicitly out of scope, same
+// as pruning.py's own Python reference.
+//
+// Two deliberate, narrower-than-pruning.py scope decisions specific to
+// this C++ port (both consistent with this file's own established
+// narrower-subset-of-pruning.py precedent elsewhere, e.g. MatMulNBits'
+// own FLOAT-only scales/zero_points/bias above):
+//   * `fc1_experts_scales`/`fc2_experts_scales` (quant_type='int') and
+//     `fc1_experts_bias`/`fc2_experts_bias` (either quant_type) are
+//     admitted only as plain FLOAT (float32) tensors -- this file's own
+//     float-tensor helpers have no FLOAT16/BFLOAT16 support anywhere yet,
+//     unlike pruning.py's own `_is_supported_float_dtype`. A FLOAT16/
+//     BFLOAT16-quantized export is simply never matched here (declined,
+//     not mis-handled).
+//   * `expert_weight_bits` (`quant_type='int'`) is supported for every
+//     value pruning.py's own reference supports (2, 4, 8) -- QMoE's own
+//     sub-byte packing generalizes to `bits` in {2, 4, 8} unlike
+//     MatMulNBits' own {4, 8}-only packing, so this section writes its own
+//     generic QMoEUnpackSubbyte/QMoEPackSubbyte rather than reusing
+//     MatMulNBits' UnpackNibblesLastAxis/UnpackCodesLastAxis (bits=4/8
+//     only) -- see those functions' own comments.
+//
+// The E2M1 (`quant_type='nvfp4'`) magnitude table below (QMoEE2M1Table) is
+// its OWN table, independently re-derived from pruning.py's own
+// `_e2m1_decode`/`_E2M1_MAGNITUDE` -- NOT the same table as this file's own
+// `MatMulBnb4Fp4Codes()` above (bitsandbytes' own FP4 format, a completely
+// different, non-IEEE-754-shaped 16-value codebook -- {0, 0.0052, 0.667,
+// 1.0, 0.333, 0.5, 0.167, 0.25, ...} -- verified by comparing the two
+// tables' own raw values, not assumed compatible just because both are
+// "4-bit float weights"). QMoE's own E2M1 format is the standard, publicly
+// documented OCP Microscaling (MX) spec 4-bit float element: 1 sign + 2
+// exponent + 1 mantissa bit, magnitude {0, 0.5, 1, 1.5, 2, 3, 4, 6} indexed
+// by the code's own low 3 bits, sign the top bit -- a fresh table, since
+// bnb4's own table is for an unrelated, differently-shaped format.
+//
+// FLOAT8E4M3FN (nvfp4's own block-scale dtype) has no existing support
+// anywhere else in this file (no FP8-quantized pruning pass is ported to
+// C++ yet) -- QMoEFloat8E4M3Table (256 entries, code -> double, generated
+// once from the OCP FP8 E4M3FN spec: sign/4-bit-exponent(bias 7)/
+// 3-bit-mantissa, no infinities, 0x7F/0xFF reserved for NaN) is this
+// section's own, used ONLY for IMPORTANCE RANKING (QMoEDequantizeNvfp4) --
+// the actual `fc1_scales`/`fc2_scales` bytes are always sliced as opaque
+// raw bytes (QMoESliceFloat8Axis1/QMoESliceFloat8Axis2), never decoded and
+// re-encoded, so a single-bit table error here could only ever bias which
+// channels get RANKED higher, never corrupt what gets WRITTEN back.
+
+enum class QMoEQuantType { kInt, kNvfp4 };
+
+const std::unordered_set<std::string>& QMoEActivations() {
+  static const std::unordered_set<std::string> kSet = {"relu", "identity",
+                                                       "silu", "gelu"};
+  return kSet;
+}
+
+std::string QMoEStringAttrOr(const onnx::NodeProto& node,
+                             const std::string& name,
+                             const std::string& default_value) {
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == name) {
+      return attr.s();
+    }
+  }
+  return default_value;
+}
+
+bool QMoEDimsEqual(const onnx::TensorProto& t,
+                   const std::vector<int64_t>& expected) {
+  if (static_cast<size_t>(t.dims_size()) != expected.size()) {
+    return false;
+  }
+  for (int i = 0; i < t.dims_size(); ++i) {
+    if (t.dims(i) != expected[static_cast<size_t>(i)]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// `2 ** (bits - 1)` -- the schema's own documented default `zero_point`
+// for whichever of `fc1_zero_points`/`fc2_zero_points` is absent.
+int64_t QMoEDefaultZeroPoint(int64_t bits) { return int64_t{1} << (bits - 1); }
+
+// Generic sub-byte pack/unpack, LOW INDEX IN LOW BITS -- QMoE's own raw
+// (`weights_prepacked` in {-1, 0}) storage convention for
+// `fc1_experts_weights`/`fc2_experts_weights` and `fc1_zero_points`/
+// `fc2_zero_points` alike (empirically confirmed in pruning.py's own
+// section comment, point 2), for `bits` in {2, 4, 8} -- unlike this file's
+// own MatMulNBits UnpackNibblesLastAxis/UnpackCodesLastAxis (bits in
+// {4, 8} only, since MatMulNBits itself never admits 2), QMoE's own
+// `expert_weight_bits` also admits 2, so this is written fresh rather than
+// reused. `outer` independent packed rows sharing one packing granularity
+// (an expert's own N channels, or an (expert, channel) pair's own K
+// values, depending on caller); mirrors pruning.py's own `_unpack_subbyte`
+// exactly, including its own "drop the unused top slot" trim to
+// `logical_len`.
+std::vector<uint8_t> QMoEUnpackSubbyte(const std::vector<uint8_t>& packed,
+                                       int64_t outer, int64_t packed_width,
+                                       int64_t logical_len, int64_t bits) {
+  const int64_t pack = 8 / bits;
+  const uint8_t mask = static_cast<uint8_t>((1 << bits) - 1);
+  std::vector<uint8_t> out(static_cast<size_t>(outer * logical_len));
+  for (int64_t r = 0; r < outer; ++r) {
+    const uint8_t* prow = packed.data() + r * packed_width;
+    uint8_t* orow = out.data() + r * logical_len;
+    for (int64_t j = 0; j < logical_len; ++j) {
+      const int64_t byte_idx = j / pack;
+      const int64_t slot = j % pack;
+      orow[j] = static_cast<uint8_t>((prow[byte_idx] >> (bits * slot)) & mask);
+    }
+  }
+  return out;
+}
+
+// Inverse of QMoEUnpackSubbyte -- pads `count` up to a whole number of
+// `8 / bits` values with zeros (the same "one wasted slot" case
+// QMoEUnpackSubbyte trims away), mirrors pruning.py's own `_pack_subbyte`.
+std::vector<uint8_t> QMoEPackSubbyte(const std::vector<uint8_t>& vals,
+                                     int64_t outer, int64_t count,
+                                     int64_t bits) {
+  const int64_t pack = 8 / bits;
+  const int64_t packed_width = (count + pack - 1) / pack;
+  const uint8_t mask = static_cast<uint8_t>((1 << bits) - 1);
+  std::vector<uint8_t> out(static_cast<size_t>(outer * packed_width), 0);
+  for (int64_t r = 0; r < outer; ++r) {
+    const uint8_t* vrow = vals.data() + r * count;
+    uint8_t* orow = out.data() + r * packed_width;
+    for (int64_t j = 0; j < count; ++j) {
+      const int64_t byte_idx = j / pack;
+      const int64_t slot = j % pack;
+      orow[byte_idx] = static_cast<uint8_t>(
+          orow[byte_idx] | ((vrow[j] & mask) << (bits * slot)));
+    }
+  }
+  return out;
+}
+
+// E2M1 (1 sign + 2 exponent + 1 mantissa bit) magnitude table, code's own
+// low 3 bits -> magnitude, top bit -> sign -- the OCP Microscaling (MX)
+// spec's own FP4 element format `quant_type` in {'fp4', 'nvfp4'} uses. See
+// this section's own top comment for why this is a FRESH table, not
+// `MatMulBnb4Fp4Codes()` (a completely different, bitsandbytes-specific
+// 16-value codebook). Mirrors pruning.py's own `_E2M1_MAGNITUDE`/
+// `_e2m1_decode` exactly.
+const std::array<double, 16>& QMoEE2M1Table() {
+  static const std::array<double, 16> kTable = {
+      0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+      -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+  };
+  return kTable;
+}
+
+// OCP FP8 E4M3FN (`float8e4m3fn`) code -> double, all 256 codes -- nvfp4's
+// own `fc1_scales`/`fc2_scales` block-scale dtype. Generated once (offline,
+// via `ml_dtypes.float8_e4m3fn`, the same reference library
+// tests/test_qmoe_pruning_cpp.py itself uses to build test tensors) rather
+// than computed from the sign/exponent/mantissa formula inline, so a
+// transcription error here is directly checkable by inspection against
+// that same reference rather than trusted to a from-scratch bit-twiddling
+// implementation. NaN entries (codes 0x7F/0xFF -- E4M3FN has no infinity,
+// unlike standard IEEE-754) use quiet_NaN(); this table is used ONLY for
+// IMPORTANCE RANKING (QMoEDequantizeNvfp4), never written back, so a NaN
+// input byte (never produced by a real quantizer) can only ever bias
+// ranking, not corrupt output.
+const std::array<double, 256>& QMoEFloat8E4M3Table() {
+  static const double kNaN = std::numeric_limits<double>::quiet_NaN();
+  static const std::array<double, 256> kTable = {
+      0.0,          0.001953125,  0.00390625,   0.005859375,  0.0078125,
+      0.009765625,  0.01171875,   0.013671875,  0.015625,     0.017578125,
+      0.01953125,   0.021484375,  0.0234375,    0.025390625,  0.02734375,
+      0.029296875,  0.03125,      0.03515625,   0.0390625,    0.04296875,
+      0.046875,     0.05078125,   0.0546875,    0.05859375,   0.0625,
+      0.0703125,    0.078125,     0.0859375,    0.09375,      0.1015625,
+      0.109375,     0.1171875,    0.125,        0.140625,     0.15625,
+      0.171875,     0.1875,       0.203125,     0.21875,      0.234375,
+      0.25,         0.28125,      0.3125,       0.34375,      0.375,
+      0.40625,      0.4375,       0.46875,      0.5,          0.5625,
+      0.625,        0.6875,       0.75,         0.8125,       0.875,
+      0.9375,       1.0,          1.125,        1.25,         1.375,
+      1.5,          1.625,        1.75,         1.875,        2.0,
+      2.25,         2.5,          2.75,         3.0,          3.25,
+      3.5,          3.75,         4.0,          4.5,          5.0,
+      5.5,          6.0,          6.5,          7.0,          7.5,
+      8.0,          9.0,          10.0,         11.0,         12.0,
+      13.0,         14.0,         15.0,         16.0,         18.0,
+      20.0,         22.0,         24.0,         26.0,         28.0,
+      30.0,         32.0,         36.0,         40.0,         44.0,
+      48.0,         52.0,         56.0,         60.0,         64.0,
+      72.0,         80.0,         88.0,         96.0,         104.0,
+      112.0,        120.0,        128.0,        144.0,        160.0,
+      176.0,        192.0,        208.0,        224.0,        240.0,
+      256.0,        288.0,        320.0,        352.0,        384.0,
+      416.0,        448.0,        kNaN,         -0.0,         -0.001953125,
+      -0.00390625,  -0.005859375, -0.0078125,   -0.009765625, -0.01171875,
+      -0.013671875, -0.015625,    -0.017578125, -0.01953125,  -0.021484375,
+      -0.0234375,   -0.025390625, -0.02734375,  -0.029296875, -0.03125,
+      -0.03515625,  -0.0390625,   -0.04296875,  -0.046875,    -0.05078125,
+      -0.0546875,   -0.05859375,  -0.0625,      -0.0703125,   -0.078125,
+      -0.0859375,   -0.09375,     -0.1015625,   -0.109375,    -0.1171875,
+      -0.125,       -0.140625,    -0.15625,     -0.171875,    -0.1875,
+      -0.203125,    -0.21875,     -0.234375,    -0.25,        -0.28125,
+      -0.3125,      -0.34375,     -0.375,       -0.40625,     -0.4375,
+      -0.46875,     -0.5,         -0.5625,      -0.625,       -0.6875,
+      -0.75,        -0.8125,      -0.875,       -0.9375,      -1.0,
+      -1.125,       -1.25,        -1.375,       -1.5,         -1.625,
+      -1.75,        -1.875,       -2.0,         -2.25,        -2.5,
+      -2.75,        -3.0,         -3.25,        -3.5,         -3.75,
+      -4.0,         -4.5,         -5.0,         -5.5,         -6.0,
+      -6.5,         -7.0,         -7.5,         -8.0,         -9.0,
+      -10.0,        -11.0,        -12.0,        -13.0,        -14.0,
+      -15.0,        -16.0,        -18.0,        -20.0,        -22.0,
+      -24.0,        -26.0,        -28.0,        -30.0,        -32.0,
+      -36.0,        -40.0,        -44.0,        -48.0,        -52.0,
+      -56.0,        -60.0,        -64.0,        -72.0,        -80.0,
+      -88.0,        -96.0,        -104.0,       -112.0,       -120.0,
+      -128.0,       -144.0,       -160.0,       -176.0,       -192.0,
+      -208.0,       -224.0,       -240.0,       -256.0,       -288.0,
+      -320.0,       -352.0,       -384.0,       -416.0,       -448.0,
+      kNaN,
+  };
+  return kTable;
+}
+
+// Overwrites `t` in place with a FLOAT8E4M3FN tensor of `dims`/`data` (raw
+// bytes, one per element -- no endianness concerns, mirrors
+// SetUint8TensorData exactly but for this dtype).
+void SetFloat8E4M3TensorData(onnx::TensorProto* t,
+                             const std::vector<int64_t>& dims,
+                             const std::vector<uint8_t>& data) {
+  const std::string name = t->name();
+  t->Clear();
+  t->set_name(name);
+  t->set_data_type(onnx::TensorProto::FLOAT8E4M3FN);
+  for (int64_t d : dims) {
+    t->add_dims(d);
+  }
+  t->set_raw_data(
+      std::string(reinterpret_cast<const char*>(data.data()), data.size()));
+}
+
+struct QMoEChannelChain {
+  onnx::NodeProto* node = nullptr;
+  std::string fc1_w;
+  std::string fc1_scale;
+  std::optional<std::string> fc1_bias;
+  std::optional<std::string> fc1_zp;
+  std::string fc2_w;
+  std::string fc2_scale;
+  std::optional<std::string> fc2_bias;
+  std::optional<std::string> fc2_zp;
+  int64_t num_experts = 0;
+  int64_t inter_size = 0;
+  int64_t hidden_size = 0;
+  int64_t bits = 4;
+  int64_t block_size = 0;
+  QMoEQuantType quant_type = QMoEQuantType::kInt;
+  std::optional<std::string> fc1_global_scale;
+  std::optional<std::string> fc2_global_scale;
+};
+
+// {true, name} for a present-and-well-formed optional FLOAT input, {true,
+// nullopt} for a genuinely absent one, {false, _} to decline the whole
+// chain -- mirrors pruning.py's own `_optional_float` closure inside
+// `_match_qmoe_producer` exactly (used for `fc1_experts_bias`/
+// `fc2_experts_bias`, either quant_type).
+bool QMoEOptionalFloatInput(const onnx::NodeProto& node, int idx,
+                            const std::vector<int64_t>& expected_dims,
+                            const InitMap& init_map,
+                            const ConsumerMap& consumers_of,
+                            std::optional<std::string>* out_name) {
+  if (idx >= node.input_size() || node.input(idx).empty()) {
+    *out_name = std::nullopt;
+    return true;
+  }
+  const std::string& name = node.input(idx);
+  auto it = init_map.find(name);
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT ||
+      !QMoEDimsEqual(*it->second, expected_dims) ||
+      ConsumerCount(consumers_of, name) != 1) {
+    return false;
+  }
+  *out_name = name;
+  return true;
+}
+
+// The UINT8 analogue of QMoEOptionalFloatInput -- mirrors pruning.py's own
+// `_optional_uint8` closure (used for `fc1_zero_points`/`fc2_zero_points`,
+// `quant_type='int'` only).
+bool QMoEOptionalUint8Input(const onnx::NodeProto& node, int idx,
+                            const std::vector<int64_t>& expected_dims,
+                            const InitMap& init_map,
+                            const ConsumerMap& consumers_of,
+                            std::optional<std::string>* out_name) {
+  if (idx >= node.input_size() || node.input(idx).empty()) {
+    *out_name = std::nullopt;
+    return true;
+  }
+  const std::string& name = node.input(idx);
+  auto it = init_map.find(name);
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::UINT8 ||
+      !QMoEDimsEqual(*it->second, expected_dims) ||
+      ConsumerCount(consumers_of, name) != 1) {
+    return false;
+  }
+  *out_name = name;
+  return true;
+}
+
+// If `node` is a `com.microsoft::QMoE` node this pass can safely prune the
+// `inter_size` axis of, returns the matched QMoEChannelChain -- mirrors
+// pruning.py's own `_match_qmoe_producer` exactly (see this section's own
+// top comment, and pruning.py's own section comment points 1-5/9, for the
+// full derivation of every check below).
+std::optional<QMoEChannelChain> MatchQMoEProducer(
+    onnx::NodeProto* node, const InitMap& init_map,
+    const ConsumerMap& consumers_of) {
+  if (node->domain() != kComMicrosoftDomain || node->op_type() != "QMoE") {
+    return std::nullopt;
+  }
+
+  const std::string activation =
+      QMoEStringAttrOr(*node, "activation_type", "relu");
+  const int64_t swiglu_fusion = MatMulNBitsIntAttrOr(*node, "swiglu_fusion", 0);
+  const std::string quant_type_s = QMoEStringAttrOr(*node, "quant_type", "int");
+  int64_t bits = MatMulNBitsIntAttrOr(*node, "expert_weight_bits", 4);
+  int64_t block_size = MatMulNBitsIntAttrOr(*node, "block_size", 0);
+  const int64_t weights_prepacked =
+      MatMulNBitsIntAttrOr(*node, "weights_prepacked", -1);
+
+  if (!QMoEActivations().count(activation) || swiglu_fusion != 0) {
+    return std::nullopt;
+  }
+  if (quant_type_s != "int" && quant_type_s != "nvfp4") {
+    return std::nullopt;  // 'fp4'/'fp8'/'wfp4afp8' -- out of scope, see
+    // this section's own top comment.
+  }
+  if (weights_prepacked != -1 && weights_prepacked != 0) {
+    return std::nullopt;  // A CUTLASS mixed-GEMM prepacked byte layout, not
+    // the raw [N, K/pack] storage this pass slices.
+  }
+
+  auto has_input = [&](int idx) {
+    return idx < node->input_size() && !node->input(idx).empty();
+  };
+  if (has_input(8)) {
+    return std::nullopt;  // fc3_experts_weights present -- no CPU oracle.
+  }
+  if (has_input(14)) {
+    return std::nullopt;  // router_weights present -- DeepSeek-style
+    // combine-weight topology, out of scope.
+  }
+
+  // Matches `fc1_experts_weights`/`fc2_experts_weights` (inputs 2/5): both
+  // constant UINT8 rank-3 initializers, single consumer, agreeing on
+  // `num_experts` and on `hidden_size`/`inter_size` once `pack` codes/byte
+  // is accounted for -- shared by both quant_type paths below, since the
+  // raw weight shape/packing convention is identical either way (`bits=4`,
+  // `pack=2` for nvfp4; `pack = 8 / expert_weight_bits` for 'int').
+  auto match_weight_pair =
+      [&](int64_t pack) -> std::optional<std::array<int64_t, 3>> {
+    if (node->input_size() < 7 || !has_input(2) || !has_input(5)) {
+      return std::nullopt;
+    }
+    const std::string& fc1_name = node->input(2);
+    const std::string& fc2_name = node->input(5);
+    auto it1 = init_map.find(fc1_name);
+    auto it2 = init_map.find(fc2_name);
+    if (it1 == init_map.end() || it2 == init_map.end() ||
+        it1->second->data_type() != onnx::TensorProto::UINT8 ||
+        it2->second->data_type() != onnx::TensorProto::UINT8 ||
+        it1->second->dims_size() != 3 || it2->second->dims_size() != 3 ||
+        ConsumerCount(consumers_of, fc1_name) != 1 ||
+        ConsumerCount(consumers_of, fc2_name) != 1) {
+      return std::nullopt;
+    }
+    const int64_t num_experts = it1->second->dims(0);
+    const int64_t inter_size = it1->second->dims(1);
+    const int64_t fc1_k_packed = it1->second->dims(2);
+    const int64_t fc2_num_experts = it2->second->dims(0);
+    const int64_t hidden_size = it2->second->dims(1);
+    const int64_t fc2_k_packed = it2->second->dims(2);
+    if (fc2_num_experts != num_experts || fc1_k_packed * pack != hidden_size ||
+        fc2_k_packed * pack != inter_size) {
+      return std::nullopt;  // Also rules out a fused-swiglu fc1 (doubled
+      // row count).
+    }
+    return std::array<int64_t, 3>{num_experts, inter_size, hidden_size};
+  };
+
+  if (quant_type_s == "int") {
+    for (int idx = 15; idx <= 20; ++idx) {
+      if (has_input(idx)) {
+        return std::nullopt;  // FP4/FP8/global-scale/activation-scale
+        // inputs -- naturally absent for quant_type='int', checked
+        // explicitly rather than assumed.
+      }
+    }
+    if (bits != 2 && bits != 4 && bits != 8) {
+      return std::nullopt;
+    }
+    const int64_t pack = 8 / bits;
+    if (block_size != 0) {
+      if (block_size < 16) {
+        return std::nullopt;  // The CPU kernel's own floor.
+      }
+      if (block_size % pack != 0) {
+        return std::nullopt;  // Not byte-aligned to the sub-byte packing
+        // width -- every real block_size this op's kernel accepts already
+        // is, so this excludes no genuine configuration.
+      }
+    }
+
+    auto weight_shape = match_weight_pair(pack);
+    if (!weight_shape) {
+      return std::nullopt;
+    }
+    const int64_t num_experts = (*weight_shape)[0];
+    const int64_t inter_size = (*weight_shape)[1];
+    const int64_t hidden_size = (*weight_shape)[2];
+    if (block_size != 0 &&
+        (hidden_size % block_size != 0 || inter_size % block_size != 0)) {
+      return std::nullopt;  // Partial/padded final block -- declined; also
+      // transitively enforces "hidden_size/inter_size divisible by
+      // block_size * pack_size" via the zero_points shape checks below.
+    }
+
+    if (!has_input(3) || !has_input(6)) {
+      return std::nullopt;  // fc1_scales/fc2_scales required by this pass,
+      // even though the schema itself marks them optional.
+    }
+    const std::string& fc1_scale_name = node->input(3);
+    const std::string& fc2_scale_name = node->input(6);
+
+    int64_t hidden_blocks = 0, inter_blocks = 0;
+    std::vector<int64_t> fc1_scale_dims, fc2_scale_dims;
+    if (block_size != 0) {
+      hidden_blocks = hidden_size / block_size;
+      inter_blocks = inter_size / block_size;
+      fc1_scale_dims = {num_experts, inter_size, hidden_blocks};
+      fc2_scale_dims = {num_experts, hidden_size, inter_blocks};
+    } else {
+      fc1_scale_dims = {num_experts, inter_size};
+      fc2_scale_dims = {num_experts, hidden_size};
+    }
+    auto s1 = init_map.find(fc1_scale_name);
+    auto s2 = init_map.find(fc2_scale_name);
+    if (s1 == init_map.end() || s2 == init_map.end() ||
+        s1->second->data_type() != onnx::TensorProto::FLOAT ||
+        s2->second->data_type() != onnx::TensorProto::FLOAT ||
+        !QMoEDimsEqual(*s1->second, fc1_scale_dims) ||
+        !QMoEDimsEqual(*s2->second, fc2_scale_dims) ||
+        ConsumerCount(consumers_of, fc1_scale_name) != 1 ||
+        ConsumerCount(consumers_of, fc2_scale_name) != 1) {
+      return std::nullopt;
+    }
+
+    std::optional<std::string> fc1_bias, fc2_bias, fc1_zp, fc2_zp;
+    if (!QMoEOptionalFloatInput(*node, 4, {num_experts, inter_size}, init_map,
+                                consumers_of, &fc1_bias)) {
+      return std::nullopt;
+    }
+    if (!QMoEOptionalFloatInput(*node, 7, {num_experts, hidden_size}, init_map,
+                                consumers_of, &fc2_bias)) {
+      return std::nullopt;
+    }
+    // `zero_points`' own packed axis moves from N (whole-row case) to the
+    // trailing K-block axis (blockwise case) -- see pruning.py's own
+    // section comment, point 3.
+    std::vector<int64_t> fc1_zp_dims, fc2_zp_dims;
+    if (block_size != 0) {
+      fc1_zp_dims = {num_experts, inter_size, hidden_blocks / pack};
+      fc2_zp_dims = {num_experts, hidden_size, inter_blocks / pack};
+    } else {
+      fc1_zp_dims = {num_experts, inter_size / pack};
+      fc2_zp_dims = {num_experts, hidden_size / pack};
+    }
+    if (!QMoEOptionalUint8Input(*node, 11, fc1_zp_dims, init_map, consumers_of,
+                                &fc1_zp)) {
+      return std::nullopt;
+    }
+    if (!QMoEOptionalUint8Input(*node, 12, fc2_zp_dims, init_map, consumers_of,
+                                &fc2_zp)) {
+      return std::nullopt;
+    }
+
+    QMoEChannelChain chain;
+    chain.node = node;
+    chain.fc1_w = node->input(2);
+    chain.fc1_scale = fc1_scale_name;
+    chain.fc1_bias = fc1_bias;
+    chain.fc1_zp = fc1_zp;
+    chain.fc2_w = node->input(5);
+    chain.fc2_scale = fc2_scale_name;
+    chain.fc2_bias = fc2_bias;
+    chain.fc2_zp = fc2_zp;
+    chain.num_experts = num_experts;
+    chain.inter_size = inter_size;
+    chain.hidden_size = hidden_size;
+    chain.bits = bits;
+    chain.block_size = block_size;
+    chain.quant_type = QMoEQuantType::kInt;
+    return chain;
+  }
+
+  // quant_type == "nvfp4" -- see pruning.py's own section comment, point 9,
+  // for the full schema-derived (never real-kernel-confirmed -- there is no
+  // CPU kernel for this quant_type in this environment) reasoning below.
+  if (bits != 4) {
+    return std::nullopt;  // E2M1 is inherently 4-bit; must agree (or
+    // default) for pack=2 to match "2 values per byte".
+  }
+  if (block_size != 0 && block_size != 16) {
+    return std::nullopt;  // nvfp4 is normalized to block_size=16 regardless
+    // of the attribute; declined defensively for any other explicit value.
+  }
+  block_size = 16;  // The effective value the schema says the kernel
+  // always uses for nvfp4, even when the attribute itself is 0/absent.
+
+  for (int idx : {11, 12, 13}) {  // fc1/fc2/fc3_zero_points -- no zero-point
+    // concept for a signed E2M1 code.
+    if (has_input(idx)) {
+      return std::nullopt;
+    }
+  }
+  for (int idx : {17, 18, 19, 20}) {  // FP8-activation-only inputs -- nvfp4
+    // keeps float/fp16/bf16 activations.
+    if (has_input(idx)) {
+      return std::nullopt;
+    }
+  }
+
+  auto weight_shape = match_weight_pair(2);
+  if (!weight_shape) {
+    return std::nullopt;
+  }
+  const int64_t num_experts = (*weight_shape)[0];
+  const int64_t inter_size = (*weight_shape)[1];
+  const int64_t hidden_size = (*weight_shape)[2];
+  if (hidden_size % block_size != 0 || inter_size % block_size != 0) {
+    return std::nullopt;  // Partial/padded final block -- declined,
+    // mirroring the int blockwise case.
+  }
+
+  if (!has_input(3) || !has_input(6)) {
+    return std::nullopt;
+  }
+  const std::string& fc1_scale_name = node->input(3);
+  const std::string& fc2_scale_name = node->input(6);
+  const int64_t hidden_blocks = hidden_size / block_size;
+  const int64_t inter_blocks = inter_size / block_size;
+  const std::vector<int64_t> fc1_scale_dims = {num_experts, inter_size,
+                                               hidden_blocks};
+  const std::vector<int64_t> fc2_scale_dims = {num_experts, hidden_size,
+                                               inter_blocks};
+  auto s1 = init_map.find(fc1_scale_name);
+  auto s2 = init_map.find(fc2_scale_name);
+  if (s1 == init_map.end() || s2 == init_map.end() ||
+      s1->second->data_type() != onnx::TensorProto::FLOAT8E4M3FN ||
+      s2->second->data_type() != onnx::TensorProto::FLOAT8E4M3FN ||
+      !QMoEDimsEqual(*s1->second, fc1_scale_dims) ||
+      !QMoEDimsEqual(*s2->second, fc2_scale_dims) ||
+      ConsumerCount(consumers_of, fc1_scale_name) != 1 ||
+      ConsumerCount(consumers_of, fc2_scale_name) != 1) {
+    return std::nullopt;
+  }
+
+  if (node->input_size() <= 16 || !has_input(15) || !has_input(16)) {
+    return std::nullopt;  // fc1/fc2_global_scale -- required present for
+    // nvfp4 per the live schema's own input doc.
+  }
+  const std::string& fc1_gs_name = node->input(15);
+  const std::string& fc2_gs_name = node->input(16);
+  auto g1 = init_map.find(fc1_gs_name);
+  auto g2 = init_map.find(fc2_gs_name);
+  if (g1 == init_map.end() || g2 == init_map.end() ||
+      g1->second->data_type() != onnx::TensorProto::FLOAT ||
+      g2->second->data_type() != onnx::TensorProto::FLOAT ||
+      !QMoEDimsEqual(*g1->second, {num_experts}) ||
+      !QMoEDimsEqual(*g2->second, {num_experts}) ||
+      ConsumerCount(consumers_of, fc1_gs_name) != 1 ||
+      ConsumerCount(consumers_of, fc2_gs_name) != 1) {
+    return std::nullopt;
+  }
+
+  std::optional<std::string> fc1_bias, fc2_bias;
+  if (!QMoEOptionalFloatInput(*node, 4, {num_experts, inter_size}, init_map,
+                              consumers_of, &fc1_bias)) {
+    return std::nullopt;
+  }
+  if (!QMoEOptionalFloatInput(*node, 7, {num_experts, hidden_size}, init_map,
+                              consumers_of, &fc2_bias)) {
+    return std::nullopt;
+  }
+
+  QMoEChannelChain chain;
+  chain.node = node;
+  chain.fc1_w = node->input(2);
+  chain.fc1_scale = fc1_scale_name;
+  chain.fc1_bias = fc1_bias;
+  chain.fc1_zp = std::nullopt;
+  chain.fc2_w = node->input(5);
+  chain.fc2_scale = fc2_scale_name;
+  chain.fc2_bias = fc2_bias;
+  chain.fc2_zp = std::nullopt;
+  chain.num_experts = num_experts;
+  chain.inter_size = inter_size;
+  chain.hidden_size = hidden_size;
+  chain.bits = 4;
+  chain.block_size = block_size;
+  chain.quant_type = QMoEQuantType::kNvfp4;
+  chain.fc1_global_scale = fc1_gs_name;
+  chain.fc2_global_scale = fc2_gs_name;
+  return chain;
+}
+
+std::vector<QMoEChannelChain> FindQMoEChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::vector<QMoEChannelChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto chain = MatchQMoEProducer(node, init_map, consumers_of);
+    if (chain) {
+      chains.push_back(std::move(*chain));
+    }
+  }
+  return chains;
+}
+
+// Dequantizes a QMoE `quant_type='int'` fc1/fc2 weight tensor to a
+// float64 `[E, N, K]` array, for IMPORTANCE RANKING ONLY -- never written
+// back (this section's own top comment's "slice codes directly, never
+// dequant-requant" invariant). Mirrors pruning.py's own `_qmoe_dequantize`
+// exactly: `w` raw `[E, N, K/pack]` storage; `scale` `[E, N]`
+// (block_size==0) or `[E, N, K/block_size]` (block_size set);
+// `zero_points`, when present, packs along N (block_size==0) or the
+// trailing K-block axis (block_size set) -- see pruning.py's own section
+// comment, point 3.
+std::vector<double> QMoEDequantizeInt(const onnx::TensorProto& w,
+                                      const onnx::TensorProto& scale,
+                                      const onnx::TensorProto* zero_points,
+                                      int64_t bits, int64_t k,
+                                      int64_t block_size) {
+  const int64_t e = w.dims(0);
+  const int64_t n = w.dims(1);
+  const int64_t kp = w.dims(2);
+  const std::vector<uint8_t> packed = ReadUint8Tensor(w);  // [E*N, kp]
+  const std::vector<uint8_t> codes =
+      QMoEUnpackSubbyte(packed, e * n, kp, k, bits);  // [E*N, K]
+  const std::vector<float> scale_data = ReadFloatTensor(scale);
+  const double default_zp = static_cast<double>(QMoEDefaultZeroPoint(bits));
+  std::vector<double> out(static_cast<size_t>(e * n * k));
+
+  if (block_size > 0) {
+    const int64_t k_blocks = k / block_size;
+    std::vector<double> zp(static_cast<size_t>(e * n * k_blocks), default_zp);
+    if (zero_points != nullptr) {
+      const int64_t zp_packed_width = zero_points->dims(2);
+      const std::vector<uint8_t> zp_packed = ReadUint8Tensor(*zero_points);
+      const std::vector<uint8_t> zp_codes =
+          QMoEUnpackSubbyte(zp_packed, e * n, zp_packed_width, k_blocks, bits);
+      for (size_t i = 0; i < zp.size(); ++i) {
+        zp[i] = static_cast<double>(zp_codes[i]);
+      }
+    }
+    for (int64_t en = 0; en < e * n; ++en) {
+      for (int64_t kb = 0; kb < k_blocks; ++kb) {
+        const double s = static_cast<double>(
+            scale_data[static_cast<size_t>(en * k_blocks + kb)]);
+        const double z = zp[static_cast<size_t>(en * k_blocks + kb)];
+        for (int64_t j = 0; j < block_size; ++j) {
+          const int64_t idx = en * k + kb * block_size + j;
+          out[static_cast<size_t>(idx)] =
+              (static_cast<double>(codes[static_cast<size_t>(idx)]) - z) * s;
+        }
+      }
+    }
+  } else {
+    std::vector<double> zp(static_cast<size_t>(e * n), default_zp);
+    if (zero_points != nullptr) {
+      const int64_t zp_packed_width = zero_points->dims(1);
+      const std::vector<uint8_t> zp_packed = ReadUint8Tensor(*zero_points);
+      const std::vector<uint8_t> zp_codes =
+          QMoEUnpackSubbyte(zp_packed, e, zp_packed_width, n, bits);  // [E, N]
+      for (size_t i = 0; i < zp.size(); ++i) {
+        zp[i] = static_cast<double>(zp_codes[i]);
+      }
+    }
+    for (int64_t en = 0; en < e * n; ++en) {
+      const double s = static_cast<double>(scale_data[static_cast<size_t>(en)]);
+      const double z = zp[static_cast<size_t>(en)];
+      for (int64_t j = 0; j < k; ++j) {
+        const int64_t idx = en * k + j;
+        out[static_cast<size_t>(idx)] =
+            (static_cast<double>(codes[static_cast<size_t>(idx)]) - z) * s;
+      }
+    }
+  }
+  return out;
+}
+
+// Dequantizes a QMoE `quant_type='nvfp4'` fc1/fc2 weight tensor to a
+// float64 `[E, N, K]` array, IMPORTANCE RANKING ONLY. Mirrors pruning.py's
+// own `_qmoe_dequantize_nvfp4` exactly: `dequantized[e, n, k] =
+// e2m1_decode(code[e, n, k]) * block_scale[e, n, k // 16] * global_scale[e]`
+// -- `block_size` fixed at 16.
+std::vector<double> QMoEDequantizeNvfp4(const onnx::TensorProto& w,
+                                        const onnx::TensorProto& block_scale,
+                                        const onnx::TensorProto& global_scale,
+                                        int64_t k) {
+  constexpr int64_t kBlockSize = 16;
+  const int64_t e = w.dims(0);
+  const int64_t n = w.dims(1);
+  const int64_t kp = w.dims(2);
+  const std::vector<uint8_t> packed = ReadUint8Tensor(w);
+  const std::vector<uint8_t> codes =
+      QMoEUnpackSubbyte(packed, e * n, kp, k, 4);  // [E*N, K] E2M1 codes.
+  const int64_t k_blocks = k / kBlockSize;
+  const std::vector<uint8_t> bs_raw = ReadUint8Tensor(block_scale);
+  const std::vector<float> gs = ReadFloatTensor(global_scale);
+  const auto& f8_table = QMoEFloat8E4M3Table();
+  const auto& e2m1_table = QMoEE2M1Table();
+
+  std::vector<double> out(static_cast<size_t>(e * n * k));
+  for (int64_t ei = 0; ei < e; ++ei) {
+    const double g = static_cast<double>(gs[static_cast<size_t>(ei)]);
+    for (int64_t ni = 0; ni < n; ++ni) {
+      const int64_t en = ei * n + ni;
+      for (int64_t kb = 0; kb < k_blocks; ++kb) {
+        const double bscale =
+            f8_table[bs_raw[static_cast<size_t>(en * k_blocks + kb)]];
+        for (int64_t j = 0; j < kBlockSize; ++j) {
+          const int64_t idx = en * k + kb * kBlockSize + j;
+          const uint8_t code = codes[static_cast<size_t>(idx)];
+          out[static_cast<size_t>(idx)] = e2m1_table[code] * bscale * g;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// Dispatches to QMoEDequantizeInt/QMoEDequantizeNvfp4 for `which` fc1/fc2 of
+// `chain` -- mirrors pruning.py's own `_qmoe_dequantize_fc`.
+std::vector<double> QMoEDequantizeFc(
+    const QMoEChannelChain& chain,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    bool is_fc1) {
+  const std::string& w_name = is_fc1 ? chain.fc1_w : chain.fc2_w;
+  const std::string& scale_name = is_fc1 ? chain.fc1_scale : chain.fc2_scale;
+  const int64_t k = is_fc1 ? chain.hidden_size : chain.inter_size;
+  const onnx::TensorProto* w = init_map.at(w_name);
+  const onnx::TensorProto* scale = init_map.at(scale_name);
+  if (chain.quant_type == QMoEQuantType::kNvfp4) {
+    const std::string& gs_name =
+        is_fc1 ? *chain.fc1_global_scale : *chain.fc2_global_scale;
+    return QMoEDequantizeNvfp4(*w, *scale, *init_map.at(gs_name), k);
+  }
+  const std::optional<std::string>& zp_name =
+      is_fc1 ? chain.fc1_zp : chain.fc2_zp;
+  const onnx::TensorProto* zp = zp_name ? init_map.at(*zp_name) : nullptr;
+  return QMoEDequantizeInt(*w, *scale, zp, chain.bits, k, chain.block_size);
+}
+
+// Combined (root-sum-square) L2-norm importance per `inter_size` channel
+// index -- mirrors pruning.py's own `_qmoe_channel_importance` exactly:
+// `fc1`'s own dequantized row (across every expert and `hidden_size` at
+// once) plus `fc2`'s own dequantized column (same reduction), plus
+// `fc1_experts_bias`'s own entry when present.
+std::vector<double> QMoEChannelImportance(
+    const QMoEChannelChain& chain,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map) {
+  const int64_t e = chain.num_experts;
+  const int64_t inter = chain.inter_size;
+  const int64_t hidden = chain.hidden_size;
+  const std::vector<double> fc1_dq =
+      QMoEDequantizeFc(chain, init_map, true);  // [E, inter, hidden]
+  const std::vector<double> fc2_dq =
+      QMoEDequantizeFc(chain, init_map, false);  // [E, hidden, inter]
+
+  std::vector<double> squared(static_cast<size_t>(inter), 0.0);
+  for (int64_t ei = 0; ei < e; ++ei) {
+    for (int64_t ni = 0; ni < inter; ++ni) {
+      double sq = 0.0;
+      const double* row = fc1_dq.data() + (ei * inter + ni) * hidden;
+      for (int64_t h = 0; h < hidden; ++h) {
+        sq += row[h] * row[h];
+      }
+      squared[static_cast<size_t>(ni)] += sq;
+    }
+  }
+  for (int64_t ei = 0; ei < e; ++ei) {
+    for (int64_t h = 0; h < hidden; ++h) {
+      const double* row = fc2_dq.data() + (ei * hidden + h) * inter;
+      for (int64_t ni = 0; ni < inter; ++ni) {
+        squared[static_cast<size_t>(ni)] += row[ni] * row[ni];
+      }
+    }
+  }
+  if (chain.fc1_bias) {
+    const std::vector<float> bias =
+        ReadFloatTensor(*init_map.at(*chain.fc1_bias));
+    for (int64_t ei = 0; ei < e; ++ei) {
+      for (int64_t ni = 0; ni < inter; ++ni) {
+        const double v =
+            static_cast<double>(bias[static_cast<size_t>(ei * inter + ni)]);
+        squared[static_cast<size_t>(ni)] += v * v;
+      }
+    }
+  }
+  std::vector<double> importance(static_cast<size_t>(inter));
+  for (int64_t ni = 0; ni < inter; ++ni) {
+    importance[static_cast<size_t>(ni)] =
+        std::sqrt(squared[static_cast<size_t>(ni)]);
+  }
+  return importance;
+}
+
+// Resolves a target `inter_size` keep-set to whole `block_size`-sized
+// groups: aggregates `importance` into one combined (root-sum-square)
+// score per block, ranks BLOCKS (not individual channels) by that score,
+// and keeps the top
+// `max(1, n / block_size - round(n / block_size * sparsity))` of them --
+// mirrors pruning.py's own `_qmoe_block_aligned_keep` exactly (see this
+// section's own top comment, "THE BLOCK-ALIGNMENT CONSTRAINT"). Ranking at
+// block granularity from the start (rather than computing a channel-level
+// keep-set and checking alignment after the fact) means the result is
+// ALWAYS block-aligned by construction. Returns nullopt when every block
+// would be kept (rounds down to nothing to prune for this layer). The
+// returned indices are ascending and, since blocks are visited in
+// ascending block-id order, each kept block contributes exactly
+// `block_size` CONSECUTIVE entries -- the caller (ApplyQMoEChannelChains)
+// relies on this to recover `keep_block_idx` cheaply (`keep[i] /
+// block_size` for `i` stepping by `block_size`) rather than a separate
+// dedup pass.
+std::optional<std::vector<int64_t>> QMoEBlockAlignedKeep(
+    const std::vector<double>& importance, int64_t n, int64_t block_size,
+    double sparsity) {
+  const int64_t num_blocks = n / block_size;
+  std::vector<double> block_importance(static_cast<size_t>(num_blocks));
+  for (int64_t b = 0; b < num_blocks; ++b) {
+    double sq = 0.0;
+    for (int64_t j = 0; j < block_size; ++j) {
+      const double v = importance[static_cast<size_t>(b * block_size + j)];
+      sq += v * v;
+    }
+    block_importance[static_cast<size_t>(b)] = std::sqrt(sq);
+  }
+  const int64_t keep_blocks_count = std::max<int64_t>(
+      1, num_blocks - std::llround(static_cast<double>(num_blocks) * sparsity));
+  if (keep_blocks_count >= num_blocks) {
+    return std::nullopt;
+  }
+  const std::vector<int64_t> keep_block_idx =
+      StableTopKIndicesAscending(block_importance, keep_blocks_count);
+  std::vector<int64_t> keep;
+  keep.reserve(static_cast<size_t>(keep_blocks_count * block_size));
+  for (int64_t b : keep_block_idx) {
+    for (int64_t j = 0; j < block_size; ++j) {
+      keep.push_back(b * block_size + j);
+    }
+  }
+  return keep;
+}
+
+// Per-expert row (axis 1) index-select of a FLOAT tensor shaped `[E, N]`
+// (`force_rank3 == false`, `row_width` always 1) or `[E, N, row_width]`
+// (`force_rank3 == true`) -- used for `fc1/fc2_experts_bias` (always
+// rank-2) and, for `quant_type='int'`, `fc1/fc2_scales` (rank-2 whole-row,
+// rank-3 blockwise). `force_rank3` is passed explicitly by the caller
+// rather than inferred from `row_width == 1` -- `row_width` (`hidden_blocks`
+// for `fc1_scales`) can genuinely equal 1 in the BLOCKWISE case too
+// (`hidden_size == block_size`), which must still come back rank-3 (a real
+// shape this op's own schema documents, re-confirmed live in pruning.py's
+// own section comment) rather than collapsing to the whole-row tensor's
+// own rank-2 shape.
+void QMoESliceFloatAxis1(onnx::TensorProto* t, int64_t e, int64_t n,
+                         int64_t row_width, const std::vector<int64_t>& keep,
+                         bool force_rank3) {
+  const std::vector<float> data = ReadFloatTensor(*t);  // [E, N, row_width]
+  const int64_t kc = static_cast<int64_t>(keep.size());
+  std::vector<float> out(static_cast<size_t>(e * kc * row_width));
+  for (int64_t ei = 0; ei < e; ++ei) {
+    for (int64_t i = 0; i < kc; ++i) {
+      std::memcpy(
+          out.data() + (ei * kc + i) * row_width,
+          data.data() + (ei * n + keep[static_cast<size_t>(i)]) * row_width,
+          static_cast<size_t>(row_width) * sizeof(float));
+    }
+  }
+  const std::vector<int64_t> dims = force_rank3
+                                        ? std::vector<int64_t>{e, kc, row_width}
+                                        : std::vector<int64_t>{e, kc};
+  SetFloatTensorData(t, dims, out);
+}
+
+// The FLOAT8E4M3FN analogue of QMoESliceFloatAxis1 -- used for
+// `quant_type='nvfp4'`'s own `fc1_scales` (always rank-3, `row_width` =
+// `hidden_blocks`). Raw-byte slice, no decode/re-encode (1-byte dtype, no
+// endianness concern either).
+void QMoESliceFloat8Axis1(onnx::TensorProto* t, int64_t e, int64_t n,
+                          int64_t row_width, const std::vector<int64_t>& keep) {
+  const std::vector<uint8_t> data = ReadUint8Tensor(*t);
+  const int64_t kc = static_cast<int64_t>(keep.size());
+  std::vector<uint8_t> out(static_cast<size_t>(e * kc * row_width));
+  for (int64_t ei = 0; ei < e; ++ei) {
+    for (int64_t i = 0; i < kc; ++i) {
+      std::memcpy(
+          out.data() + (ei * kc + i) * row_width,
+          data.data() + (ei * n + keep[static_cast<size_t>(i)]) * row_width,
+          static_cast<size_t>(row_width));
+    }
+  }
+  SetFloat8E4M3TensorData(t, {e, kc, row_width}, out);
+}
+
+// The UINT8 analogue -- used for `fc1_experts_weights` (`row_width` = the
+// packed `K/pack` width, an axis-1 index-select since the pruned
+// `inter_size` axis is never the packed one for `fc1`) and, when
+// `block_size` is set, `fc1_zero_points` (whose own packed axis has moved
+// off `inter_size` entirely, so it too is a plain index-select here).
+void QMoESliceUint8Axis1(onnx::TensorProto* t, int64_t e, int64_t n,
+                         int64_t row_width, const std::vector<int64_t>& keep,
+                         const std::vector<int64_t>& out_dims) {
+  const std::vector<uint8_t> data = ReadUint8Tensor(*t);
+  const int64_t kc = static_cast<int64_t>(keep.size());
+  std::vector<uint8_t> out(static_cast<size_t>(e * kc * row_width));
+  for (int64_t ei = 0; ei < e; ++ei) {
+    for (int64_t i = 0; i < kc; ++i) {
+      std::memcpy(
+          out.data() + (ei * kc + i) * row_width,
+          data.data() + (ei * n + keep[static_cast<size_t>(i)]) * row_width,
+          static_cast<size_t>(row_width));
+    }
+  }
+  SetUint8TensorData(t, out_dims, out);
+}
+
+// Per-expert, per-`hidden_size`-row, LAST-axis (block-index) select of a
+// FLOAT tensor shaped `[E, hidden, num_blocks]` -- `quant_type='int'`'s own
+// `fc2_scales` in the blockwise case, sliced by *block* index
+// (`keep_block_idx`), not channel index, since `fc2`'s own blocks group
+// along `inter_size` (this pass's own pruned axis) -- see this section's
+// own top comment.
+void QMoESliceFloatAxis2(onnx::TensorProto* t, int64_t e, int64_t hidden,
+                         int64_t num_blocks,
+                         const std::vector<int64_t>& keep_block_idx) {
+  const std::vector<float> data =
+      ReadFloatTensor(*t);  // [E, hidden, num_blocks]
+  const int64_t kb = static_cast<int64_t>(keep_block_idx.size());
+  std::vector<float> out(static_cast<size_t>(e * hidden * kb));
+  for (int64_t r = 0; r < e * hidden; ++r) {
+    for (int64_t i = 0; i < kb; ++i) {
+      out[static_cast<size_t>(r * kb + i)] = data[static_cast<size_t>(
+          r * num_blocks + keep_block_idx[static_cast<size_t>(i)])];
+    }
+  }
+  SetFloatTensorData(t, {e, hidden, kb}, out);
+}
+
+// The FLOAT8E4M3FN analogue of QMoESliceFloatAxis2 -- `quant_type='nvfp4'`'s
+// own `fc2_scales`.
+void QMoESliceFloat8Axis2(onnx::TensorProto* t, int64_t e, int64_t hidden,
+                          int64_t num_blocks,
+                          const std::vector<int64_t>& keep_block_idx) {
+  const std::vector<uint8_t> data = ReadUint8Tensor(*t);
+  const int64_t kb = static_cast<int64_t>(keep_block_idx.size());
+  std::vector<uint8_t> out(static_cast<size_t>(e * hidden * kb));
+  for (int64_t r = 0; r < e * hidden; ++r) {
+    for (int64_t i = 0; i < kb; ++i) {
+      out[static_cast<size_t>(r * kb + i)] = data[static_cast<size_t>(
+          r * num_blocks + keep_block_idx[static_cast<size_t>(i)])];
+    }
+  }
+  SetFloat8E4M3TensorData(t, {e, hidden, kb}, out);
+}
+
+// The actual apply step -- mirrors pruning.py's own
+// `_apply_qmoe_channel_chains` exactly, including its own two distinct
+// slicing shapes (whole-row/`pack`-floored vs. block-aligned) and every
+// per-tensor packing special case documented on each call site below. A
+// standalone application pass (not sharing state with
+// ApplyStructuredPruning's own combined TouchedState -- `com.microsoft::
+// QMoE`'s own weight names can never collide with any plain-float/
+// MatMulNBits/QDQ/MatMulBnb4 chain this file's other passes match, so a
+// local `touched` set mirroring pruning.py's own is all that's needed).
+void ApplyQMoEChannelChains(onnx::GraphProto* graph,
+                            std::vector<QMoEChannelChain>& chains,
+                            double sparsity) {
+  std::unordered_map<std::string, onnx::TensorProto*> init_map;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    init_map[t->name()] = t;
+  }
+  std::unordered_set<std::string> touched;
+
+  for (auto& chain : chains) {
+    std::vector<std::string> weight_names = {chain.fc1_w, chain.fc2_w,
+                                             chain.fc1_scale};
+    if (chain.fc1_bias) weight_names.push_back(*chain.fc1_bias);
+    if (chain.fc1_zp) weight_names.push_back(*chain.fc1_zp);
+    if (chain.block_size) {
+      // Blockwise fc2_scales -- and fc2_zero_points, if present -- are now
+      // also mutated below (their own trailing axis is inter_size-block-
+      // indexed), unlike the whole-row case where neither depends on
+      // inter_size at all.
+      weight_names.push_back(chain.fc2_scale);
+      if (chain.fc2_zp) weight_names.push_back(*chain.fc2_zp);
+    }
+    bool already_touched = false;
+    for (const auto& nm : weight_names) {
+      if (touched.count(nm)) {
+        already_touched = true;
+        break;
+      }
+    }
+    if (already_touched) {
+      continue;  // A shared/tied initializer another QMoE node already
+      // resized.
+    }
+    for (const auto& nm : weight_names) {
+      touched.insert(nm);
+    }
+
+    const int64_t n = chain.inter_size;
+    const int64_t pack = 8 / chain.bits;
+    const int64_t block_size = chain.block_size;
+    const int64_t e = chain.num_experts;
+    const int64_t hidden = chain.hidden_size;
+
+    std::vector<int64_t> keep;
+    std::vector<int64_t> keep_block_idx;
+    if (block_size > 0) {
+      // Resolved at block granularity from the start -- see
+      // QMoEBlockAlignedKeep. A block is always a multiple of `pack` (the
+      // matcher itself requires `block_size % pack == 0`), so this also
+      // transitively satisfies the same "survivor count is a multiple of
+      // `pack`" constraint the whole-row case floors to separately below.
+      const std::vector<double> importance =
+          QMoEChannelImportance(chain, init_map);
+      auto keep_opt = QMoEBlockAlignedKeep(importance, n, block_size, sparsity);
+      if (!keep_opt) {
+        continue;  // Rounds down to nothing for this layer -- no-op.
+      }
+      keep = std::move(*keep_opt);
+      keep_block_idx.reserve(keep.size() / static_cast<size_t>(block_size));
+      for (size_t i = 0; i < keep.size();
+           i += static_cast<size_t>(block_size)) {
+        keep_block_idx.push_back(keep[i] / block_size);
+      }
+    } else {
+      int64_t keep_count = std::max<int64_t>(
+          1, n - std::llround(static_cast<double>(n) * sparsity));
+      // The survivor count must itself stay an exact multiple of `pack`:
+      // this environment's own QMoE kernel derives `inter_size` purely
+      // from `fc2_experts_weights`' own packed last axis length times
+      // `pack` -- it has no way to represent "the last packed byte's own
+      // high nibble is unused padding". So a survivor count that isn't
+      // itself a multiple of `pack` is rounded DOWN to the nearest one
+      // here (floored at `pack`, never below it), mirroring pruning.py's
+      // own `_apply_qmoe_channel_chains` exactly.
+      keep_count = std::max<int64_t>(pack, (keep_count / pack) * pack);
+      if (keep_count >= n) {
+        continue;  // Rounds down to nothing for this layer -- no-op.
+      }
+      const std::vector<double> importance =
+          QMoEChannelImportance(chain, init_map);
+      keep = StableTopKIndicesAscending(importance, keep_count);
+    }
+
+    // fc1_experts_weights: [E, inter_size, hidden_size/pack] -- the pruned
+    // axis (1) is the UNPACKED one (packing lives on axis 2, untouched), so
+    // this is a plain per-expert row index-select, no unpack/repack needed
+    // at all -- unaffected by block_size (fc1's own blocks, if any, group
+    // along hidden_size, an axis this pass never touches).
+    {
+      onnx::TensorProto* fc1_w = init_map.at(chain.fc1_w);
+      const int64_t kp = fc1_w->dims(2);
+      const int64_t kc = static_cast<int64_t>(keep.size());
+      QMoESliceUint8Axis1(fc1_w, e, n, kp, keep, {e, kc, kp});
+    }
+
+    // fc1_scales: [E, inter_size] (whole-row) or [E, inter_size,
+    // hidden_blocks] (blockwise) -- `keep` always indexes axis 1 either
+    // way. FLOAT for quant_type='int', FLOAT8E4M3FN for quant_type='nvfp4'.
+    {
+      onnx::TensorProto* fc1_scale = init_map.at(chain.fc1_scale);
+      const int64_t row_width = block_size > 0 ? (hidden / block_size) : 1;
+      if (chain.quant_type == QMoEQuantType::kNvfp4) {
+        QMoESliceFloat8Axis1(fc1_scale, e, n, row_width, keep);
+      } else {
+        QMoESliceFloatAxis1(fc1_scale, e, n, row_width, keep, block_size > 0);
+      }
+    }
+
+    if (chain.fc1_bias) {
+      onnx::TensorProto* fc1_bias = init_map.at(*chain.fc1_bias);
+      QMoESliceFloatAxis1(fc1_bias, e, n, 1, keep, /*force_rank3=*/false);
+    }
+
+    if (chain.fc1_zp) {
+      onnx::TensorProto* fc1_zp = init_map.at(*chain.fc1_zp);
+      const int64_t kc = static_cast<int64_t>(keep.size());
+      if (block_size > 0) {
+        // fc1_zero_points: [E, inter_size, hidden_blocks/pack] -- blockwise
+        // moves the packed axis off of N entirely, so slicing N (axis 1)
+        // is now a plain index-select, no unpack/repack needed at all.
+        const int64_t hb = hidden / block_size;
+        QMoESliceUint8Axis1(fc1_zp, e, n, hb / pack, keep, {e, kc, hb / pack});
+      } else {
+        // fc1_zero_points: [E, inter_size/pack] -- packed along the SAME
+        // axis being pruned, so this genuinely needs unpack/select/repack.
+        const int64_t zp_packed_width = fc1_zp->dims(1);
+        const std::vector<uint8_t> packed = ReadUint8Tensor(*fc1_zp);
+        const std::vector<uint8_t> unpacked = QMoEUnpackSubbyte(
+            packed, e, zp_packed_width, n, chain.bits);  // [E, N]
+        std::vector<uint8_t> selected(static_cast<size_t>(e * kc));
+        for (int64_t ei = 0; ei < e; ++ei) {
+          for (int64_t i = 0; i < kc; ++i) {
+            selected[static_cast<size_t>(ei * kc + i)] =
+                unpacked[static_cast<size_t>(ei * n +
+                                             keep[static_cast<size_t>(i)])];
+          }
+        }
+        const std::vector<uint8_t> repacked =
+            QMoEPackSubbyte(selected, e, kc, chain.bits);
+        const int64_t new_pw = (kc + pack - 1) / pack;
+        SetUint8TensorData(fc1_zp, {e, new_pw}, repacked);
+      }
+    }
+
+    // fc2_experts_weights: [E, hidden_size, inter_size/pack] -- the pruned
+    // axis (inter_size) IS the packed one here, so this needs a real
+    // unpack/select/repack round trip. Packing is flat/block-boundary-
+    // oblivious (confirmed empirically in pruning.py's own section
+    // comment, point 3), so this is unaffected by block_size beyond `keep`
+    // itself already being block-aligned.
+    {
+      onnx::TensorProto* fc2_w = init_map.at(chain.fc2_w);
+      const int64_t packed_width = fc2_w->dims(2);
+      const int64_t kc = static_cast<int64_t>(keep.size());
+      const std::vector<uint8_t> packed = ReadUint8Tensor(*fc2_w);
+      const std::vector<uint8_t> unpacked = QMoEUnpackSubbyte(
+          packed, e * hidden, packed_width, n, chain.bits);  // [E*hidden, n]
+      std::vector<uint8_t> selected(static_cast<size_t>(e * hidden * kc));
+      for (int64_t r = 0; r < e * hidden; ++r) {
+        for (int64_t i = 0; i < kc; ++i) {
+          selected[static_cast<size_t>(r * kc + i)] =
+              unpacked[static_cast<size_t>(r * n +
+                                           keep[static_cast<size_t>(i)])];
+        }
+      }
+      const std::vector<uint8_t> repacked =
+          QMoEPackSubbyte(selected, e * hidden, kc, chain.bits);
+      const int64_t new_pw = (kc + pack - 1) / pack;
+      SetUint8TensorData(fc2_w, {e, hidden, new_pw}, repacked);
+    }
+
+    if (block_size > 0) {
+      // fc2_scales/fc2_zero_points: [E, hidden_size, inter_blocks(/pack)]
+      // -- unlike the whole-row case, these now DO depend on inter_size,
+      // via the block axis, so they must be cut too -- by BLOCK index
+      // (`keep_block_idx`), not channel index (`keep`).
+      onnx::TensorProto* fc2_scale = init_map.at(chain.fc2_scale);
+      const int64_t inter_blocks = n / block_size;
+      if (chain.quant_type == QMoEQuantType::kNvfp4) {
+        QMoESliceFloat8Axis2(fc2_scale, e, hidden, inter_blocks,
+                             keep_block_idx);
+      } else {
+        QMoESliceFloatAxis2(fc2_scale, e, hidden, inter_blocks, keep_block_idx);
+      }
+      if (chain.fc2_zp) {
+        onnx::TensorProto* fc2_zp = init_map.at(*chain.fc2_zp);
+        const int64_t zp_packed_width = fc2_zp->dims(2);
+        const std::vector<uint8_t> packed = ReadUint8Tensor(*fc2_zp);
+        const std::vector<uint8_t> unpacked = QMoEUnpackSubbyte(
+            packed, e * hidden, zp_packed_width, inter_blocks, chain.bits);
+        const int64_t kb = static_cast<int64_t>(keep_block_idx.size());
+        std::vector<uint8_t> selected(static_cast<size_t>(e * hidden * kb));
+        for (int64_t r = 0; r < e * hidden; ++r) {
+          for (int64_t i = 0; i < kb; ++i) {
+            selected[static_cast<size_t>(r * kb + i)] =
+                unpacked[static_cast<size_t>(
+                    r * inter_blocks + keep_block_idx[static_cast<size_t>(i)])];
+          }
+        }
+        const std::vector<uint8_t> repacked =
+            QMoEPackSubbyte(selected, e * hidden, kb, chain.bits);
+        const int64_t new_pw = (kb + pack - 1) / pack;
+        SetUint8TensorData(fc2_zp, {e, hidden, new_pw}, repacked);
+      }
+    }
+    // fc2_experts_bias always indexes hidden_size, fc2's own OUTPUT axis --
+    // unaffected by an inter_size cut regardless of block_size, the same
+    // reasoning plain MoE's own fc2 bias already gets -- never sliced
+    // here. fc1/fc2_global_scale (nvfp4 only) are per-EXPERT, not
+    // per-channel -- expert-channel pruning never touches these either. In
+    // the whole-row case (block_size == 0), fc2_scales/fc2_zero_points are
+    // the same "indexes hidden_size only" shape and are likewise never
+    // sliced.
+  }
+}
+
 // --- Subgraph recursion ------------------------------------------------
 //
 // Mirrors pruning.py's own `_iter_subgraphs` and the "Subgraph recursion"
@@ -11691,6 +13300,79 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
         FindMatMulNBitsQkvChains(graph);
     if (!matmul_nbits_qkv_chains.empty()) {
       ApplyMatMulNBitsQkvChains(graph, matmul_nbits_qkv_chains, sparsity);
+    }
+  }
+  return out;
+}
+
+onnx::ModelProto ApplyMoeExpertChannelPruning(const onnx::ModelProto& model,
+                                              double sparsity) {
+  if (!(sparsity >= 0.0 && sparsity < 1.0)) {
+    throw std::invalid_argument(
+        "ApplyMoeExpertChannelPruning: sparsity must be in [0, 1), got " +
+        std::to_string(sparsity));
+  }
+  onnx::ModelProto out = model;
+
+  // Subgraph-aware (IterSubgraphs, see this file's own "Subgraph recursion"
+  // section comment above): every `com.microsoft::MoE` node is matched and
+  // pruned inside a nested If/Loop/Scan/BeamSearch-family subgraph, at any
+  // nesting depth, exactly as if that subgraph were its own top-level graph
+  // -- each returned GraphProto* gets its own fresh FindMoeChains call and
+  // its own fresh ApplyMoeChains-local `touched` set, mirroring pruning.py's
+  // own `apply_moe_expert_channel_pruning` loop over
+  // `_iter_subgraphs(out.graph)` exactly. Unlike ApplyStructuredPruning/
+  // ApplyAttentionHeadPruning, there is no shared per-graph TouchedState to
+  // thread through here -- see the "MoE (com.microsoft::MoE) expert-
+  // intermediate-channel pruning" section comment above for why no other
+  // chain family in this file could ever also match one of these 3-D
+  // weights.
+  for (onnx::GraphProto* graph : IterSubgraphs(out.mutable_graph())) {
+    std::vector<MoEChain> chains = FindMoeChains(graph);
+    if (!chains.empty()) {
+      ApplyMoeChains(graph, chains, sparsity);
+    }
+  }
+  return out;
+}
+
+// QMoE expert-channel pruning: removes intermediate (`inter_size`) channels
+// from every expert of a matched `com.microsoft::QMoE` node at once -- the
+// quantized-weight counterpart of ApplyStructuredPruning's own plain-float
+// channel pruning, targeting QMoE's own packed `uint8` `fc1`/`fc2` weights
+// (plus their `scales`/`zero_points`/`global_scale`, co-sliced in lockstep)
+// instead of plain floats. See this file's own "QMoE (com.microsoft,
+// quantized-weight Mixture-of-Experts) expert-channel structured pruning"
+// section comment above (MatchQMoEProducer/ApplyQMoEChannelChains) for the
+// exact matched topology, every empirically-confirmed decline, and why
+// whole-expert removal (needing runtime calibration data this C++ port has
+// no ONNX Runtime linked in to gather) stays out of scope. A standalone
+// entry point -- unlike MatMulNBits/MatMulBnb4/QDQ above, QMoE is not
+// folded into ApplyStructuredPruning's own combined pass, since it targets
+// a wholly disjoint node type (`com.microsoft::QMoE`) that can never
+// collide with anything that pass already matches; mirrors pruning.py's
+// own separate `apply_qmoe_expert_channel_pruning` top-level function.
+onnx::ModelProto ApplyQMoEExpertChannelPruning(const onnx::ModelProto& model,
+                                               double sparsity) {
+  if (!(sparsity >= 0.0 && sparsity < 1.0)) {
+    throw std::invalid_argument(
+        "ApplyQMoEExpertChannelPruning: sparsity must be in [0, 1), got " +
+        std::to_string(sparsity));
+  }
+  onnx::ModelProto out = model;
+
+  // Subgraph-aware (IterSubgraphs, see this file's own "Subgraph
+  // recursion" section comment above): every `QMoE` node is matched and
+  // pruned inside a nested If/Loop/Scan/BeamSearch-family subgraph, at any
+  // nesting depth, exactly as if that subgraph were its own top-level
+  // graph -- each returned GraphProto* gets its own fresh FindQMoEChains
+  // call and its own local `touched` state inside ApplyQMoEChannelChains,
+  // mirroring pruning.py's own `apply_qmoe_expert_channel_pruning` loop
+  // over `_iter_subgraphs(out.graph)` exactly.
+  for (onnx::GraphProto* graph : IterSubgraphs(out.mutable_graph())) {
+    std::vector<QMoEChannelChain> chains = FindQMoEChains(graph);
+    if (!chains.empty()) {
+      ApplyQMoEChannelChains(graph, chains, sparsity);
     }
   }
   return out;

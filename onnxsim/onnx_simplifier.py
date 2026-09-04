@@ -1419,6 +1419,139 @@ def apply_attention_head_pruning_cpp(
     )
 
 
+def apply_moe_expert_channel_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_moe_expert_channel_pruning`:
+    removes intermediate (``inter_size``) channels from every expert of a
+    matched ``com.microsoft::MoE`` node at once -- real structural pruning
+    (smaller ``fc1_experts_weights``/``fc2_experts_weights``, smaller
+    per-expert matmuls on any runtime), as opposed to value-only zeroing.
+
+    For every matched ``MoE`` node: ranks every ``inter_size`` index by
+    combined (root-sum-square) L2 norm of ``fc1_experts_weights``' own row
+    (across every expert and ``hidden_size`` at once) and
+    ``fc2_experts_weights``' own column (same reduction), plus
+    ``fc1_experts_bias``'s own entry when present, drops the lowest-
+    ``sparsity``-fraction of indices (at least one is always kept), and
+    removes the matching row from ``fc1_experts_weights``/
+    ``fc1_experts_bias`` and column from ``fc2_experts_weights``, identically
+    across every expert. ``num_experts``, ``k``, and every node attribute are
+    untouched -- pruning ``inter_size`` changes no other tensor's shape
+    anywhere in the graph, including the node's own output (always equal to
+    ``input``'s shape).
+
+    A node with ``fc3_experts_weights`` present, a ``swiglu``/unrecognized
+    ``activation_type`` (or nonzero ``swiglu_fusion``), a non-constant or
+    tied/shared ``fc1``/``fc2`` weight (or bias), or a shape this pass
+    doesn't recognize (e.g. mismatched ``hidden_size`` between
+    ``fc1_experts_weights``/``fc2_experts_weights``) is left completely
+    untouched -- the same conservative "decline rather than mis-slice" bar
+    every other chain-matcher in this codebase holds.
+
+    Unlike the pure-Python :func:`onnxsim.apply_moe_expert_channel_pruning`,
+    ``fc1_experts_weights``/``fc2_experts_weights``/``fc1_experts_bias`` are
+    admitted only as plain FLOAT (float32) tensors here, not also FLOAT16/
+    BFLOAT16 -- matching this codebase's own established narrower-than-
+    pruning.py C++-port scope decision elsewhere (e.g.
+    :func:`onnxsim.apply_structured_pruning_cpp`'s own ``MatMulNBits``
+    ``scales``/``zero_points``/``bias`` restriction). Whole-expert pruning
+    (shrinking ``num_experts`` itself -- :func:`onnxsim.apply_moe_whole_expert_
+    pruning`, which needs runtime calibration data via an
+    ``onnxruntime.InferenceSession`` observing router activations) is a
+    deliberately separate, NOT-ported feature: this C++ port has no ONNX
+    Runtime linked into it at all.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+
+    :param model: the original onnx ModelProto or file path
+    :param sparsity: target fraction of each matched node's ``inter_size``
+            channels to remove (at least one channel is always kept); must
+            be in ``[0, 1)``
+    :returns: ``model`` with every matched ``MoE`` node's ``fc1``/``fc2``
+            tensors resized in place; anything not matching the exact
+            topology above is left completely untouched
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_moe_expert_channel_pruning(model.SerializeToString(), sparsity)
+    )
+
+
+def apply_qmoe_expert_channel_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_qmoe_expert_channel_pruning`:
+    removes intermediate (``inter_size``) channels from every expert of a
+    matched ``com.microsoft::QMoE`` node at once -- the quantized-weight
+    counterpart of :func:`onnxsim.apply_structured_pruning_cpp`, targeting
+    ``QMoE``'s own packed ``uint8`` ``fc1_experts_weights``/
+    ``fc2_experts_weights`` (plus their ``scales``/``zero_points``/
+    ``global_scale`` operands, co-sliced in lockstep) instead of plain float
+    weights.
+
+    Supports ``quant_type='int'`` (``expert_weight_bits`` in ``{2, 4, 8}``,
+    with no ``block_size`` -- whole-row per-channel scale -- or a groupwise
+    ``block_size``) and ``quant_type='nvfp4'`` (E2M1-packed weights,
+    ``float8e4m3fn`` per-block scales, a required per-expert ``float32``
+    global scale, ``block_size`` fixed at 16 -- schema-derived only, since no
+    onnxruntime build has a CPU kernel for any FP4/FP8 ``quant_type`` to
+    verify against). ``'fp4'``, ``'fp8'``, and ``'wfp4afp8'`` remain out of
+    scope, as does ``fc3_experts_weights``, ``router_weights``, a
+    ``swiglu``/unrecognized ``activation_type``, and a CUTLASS-prepacked
+    (``weights_prepacked`` outside ``{-1, 0}``) weight layout.
+
+    Ranks every ``inter_size`` index by combined (root-sum-square) L2 norm of
+    ``fc1_experts_weights``'/``fc2_experts_weights``' own DEQUANTIZED row/
+    column (never written back -- the actual rewrite always slices the
+    existing packed codes/scales/zero_points in place, re-packing a
+    sub-byte-packed axis rather than ever re-quantizing a sliced float
+    weight from scratch) plus ``fc1_experts_bias``'s own entry when present,
+    drops the lowest-``sparsity``-fraction of indices (at least one always
+    kept, floored to a multiple of ``8 / expert_weight_bits`` -- or, with
+    ``block_size`` set, to whole ``block_size``-sized groups, since
+    ``fc2_experts_weights``' own quantization blocks group along
+    ``inter_size`` and a value can't be dropped out of a shared-scale group
+    without re-quantizing it), and removes the matching row from ``fc1``'s
+    own weight/scales/bias/zero_points and column from ``fc2``'s own weight
+    (plus, only when ``block_size`` is set, ``fc2``'s own scales/
+    zero_points too), identically across every expert. ``num_experts``, `k`,
+    and every node attribute are untouched.
+
+    Unlike :func:`onnxsim.apply_qmoe_expert_channel_pruning`, this port only
+    admits FLOAT32 (not FLOAT16/BFLOAT16) ``fc1``/``fc2`` scales and bias,
+    matching this codebase's C++-port scope decision for
+    :func:`onnxsim.apply_structured_pruning_matmul_nbits` above; and does
+    not include the complementary whole-expert-removal pass
+    (:func:`onnxsim.apply_qmoe_whole_expert_pruning`), which needs runtime
+    calibration data (an ONNX Runtime inference session observing router
+    activations) this C++ port has no ONNX Runtime linked into at all.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+
+    :param model: the original onnx ModelProto or file path
+    :param sparsity: target fraction of each matched node's `inter_size`
+            channels (or, with `block_size` set, `block_size`-sized groups)
+            to remove (at least one channel is always kept); must be in
+            ``[0, 1)``
+    :returns: ``model`` with every matched ``QMoE`` node's `fc1`/`fc2`
+            tensors resized in place; anything not matching the exact
+            topology above is left completely untouched
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_qmoe_expert_channel_pruning(model.SerializeToString(), sparsity)
+    )
+
+
 def apply_quarot_cpp(
     model: Union[str, onnx.ModelProto],
     seed: int = 0,
