@@ -27,6 +27,7 @@
 #include "passes/fuse_attention.h"
 #include "passes/fuse_bn_into_conv.h"
 #include "passes/fuse_consecutive_mul.h"
+#include "passes/fuse_consecutive_reduce.h"
 #include "passes/fuse_consecutive_unsqueezes.h"
 #include "passes/fuse_gelu.h"
 #include "passes/fuse_gqa.h"
@@ -118,6 +119,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::EliminateSequenceLengthConstruct>(registry);
     RegisterOrReplace<p::FuseAttention>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);
+    RegisterOrReplace<p::FuseConsecutiveReduce>(registry);
     RegisterOrReplace<p::FuseGelu>(registry);
     RegisterOrReplace<p::FuseGQA>(registry);
     RegisterOrReplace<p::FuseLayerNorm>(registry);
