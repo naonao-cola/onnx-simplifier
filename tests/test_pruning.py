@@ -6047,6 +6047,365 @@ def test_analyze_structured_pruning_instance_norm_pass_through_matches_real_call
     assert dims_after["INBias"][0] == kept
 
 
+# --- Conv chain: decomposed-GroupNorm pass-through hop -----------------------
+#
+# The fixed 5-node ``Reshape -> InstanceNormalization -> Reshape -> Mul ->
+# Add`` sequence PyTorch's own default/legacy (TorchScript-based) ONNX
+# exporter emits for `nn.GroupNorm` in place of the native
+# `GroupNormalization` node above -- see
+# `onnxsim.pruning._match_decomposed_group_norm_pass_through`'s own
+# docstring and this module's own top-of-file docstring for the full
+# empirical gap confirmation and correctness argument. `_model` can express
+# this shape directly (`Reshape`'s own int64 shape and `Shape`'s own dynamic
+# second `Reshape` operand are both just ordinary named initializers/nodes in
+# the text body -- no `ClearField`/byte-equality escape hatch needed the way
+# CLAUDE.md's own "rare case" carve-out anticipates), so no `onnx.helper`
+# fallback is needed here despite the `Reshape`/`Shape` dynamic-shape
+# dependency.
+
+
+def _decomposed_group_norm_conv_pair_model(
+    w1,
+    w2,
+    gamma,
+    beta,
+    num_groups,
+    in_scale=None,
+    in_bias=None,
+    reshape_shape=None,
+    group1=1,
+    b1=None,
+    spatial=10,
+):
+    """The decomposed analogue of `_group_norm_conv_pair_model`: the fixed
+    5-node sequence sits between the two Convs instead of a single native
+    `GroupNormalization` node. `in_scale`/`in_bias` (length `num_groups`)
+    default to arbitrary, deliberately non-trivial values (never `1.0`/
+    `0.0`) -- confirming this hop's own correctness doesn't depend on them
+    being the trivial identity a real PyTorch export always emits, the same
+    empirical claim this feature's own docstring makes. `reshape_shape`
+    defaults to the real, exact shape PyTorch's own exporter emits
+    (`[0, num_groups, -1]`); tests that need a *different* shape (to probe
+    the matcher's own decline behavior) override it directly.
+    """
+    C1, C2 = w1.shape[0], w2.shape[0]
+    Cin = w1.shape[1] * group1
+    if in_scale is None:
+        in_scale = np.full(num_groups, 1.7, dtype=np.float32)
+    if in_bias is None:
+        in_bias = np.full(num_groups, -0.4, dtype=np.float32)
+    if reshape_shape is None:
+        reshape_shape = [0, num_groups, -1]
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        onnx.numpy_helper.from_array(
+            np.array(reshape_shape, dtype=np.int64), "ReshapeShape"
+        ),
+        _f32(np.asarray(in_scale), "INScale"),
+        _f32(np.asarray(in_bias), "INBias"),
+        _f32(np.asarray(gamma).reshape(C1, 1, 1), "Gamma"),
+        _f32(np.asarray(beta).reshape(C1, 1, 1), "Beta"),
+    ]
+    g1 = f", group={group1}" if group1 != 1 else ""
+    if b1 is not None:
+        conv1 = f"h = Conv<kernel_shape=[3,3]{g1}>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = f"h = Conv<kernel_shape=[3,3]{g1}>(X, W1)"
+    out_spatial = spatial - 4  # two valid (no-pad) 3x3 convs
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          reshaped = Reshape(h, ReshapeShape)
+          inorm = InstanceNormalization<epsilon=1e-05>(reshaped, INScale, INBias)
+          hshape = Shape(h)
+          back = Reshape(inorm, hshape)
+          scaled = Mul(back, Gamma)
+          gn = Add(scaled, Beta)
+          Y = Conv<kernel_shape=[3,3]>(gn, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_decomposed_group_norm_pass_through_matches_oracle_exactly():
+    # THE key correctness bar, identical to the native-node hop's own test:
+    # exact equivalence (float32 noise only) to an independently,
+    # already-pruned reference model -- never "matches the un-pruned model's
+    # own output sliced after the fact" (confirmed, empirically, to actually
+    # diverge -- see `_match_decomposed_group_norm_pass_through`'s own
+    # docstring). Also confirms, directly on the pruned model's own
+    # initializers, the two claims specific to this hop: `INScale`/`INBias`
+    # are left completely untouched (still length `num_groups`, still their
+    # original, deliberately non-trivial values), and `Gamma`/`Beta` (the
+    # *real* per-channel affine) are co-sliced by the exact same
+    # non-contiguous, per-group-uniform `keep` set the producer/consumer
+    # weights are.
+    Cin, C1, C2, num_groups = 3, 16, 8, 4
+    rng = np.random.default_rng(150)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    gamma = rng.standard_normal((C1,)).astype(np.float32)
+    beta = rng.standard_normal((C1,)).astype(np.float32)
+    in_scale = (
+        rng.standard_normal((num_groups,)).astype(np.float32) + 2.0
+    )  # non-trivial
+    in_bias = rng.standard_normal((num_groups,)).astype(np.float32)
+    model = _decomposed_group_norm_conv_pair_model(
+        w1, w2, gamma, beta, num_groups, in_scale=in_scale, in_bias=in_bias, b1=b1
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] % num_groups == 0
+    assert dims_after["W1"][0] < C1  # actually pruned, not a no-op
+
+    pruned_inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    np.testing.assert_array_equal(pruned_inits["INScale"], in_scale)
+    np.testing.assert_array_equal(pruned_inits["INBias"], in_bias)
+
+    keep = _oracle_keep_indices_conv_grouped(w1, num_groups, 0.5)
+    # Uniform-per-group, but not necessarily contiguous -- confirming this
+    # hop's own safety claim isn't accidentally only exercised by a
+    # contiguous "keep the first half of every group" special case.
+    block = C1 // num_groups
+    per_group_counts = {
+        gi: int(np.sum((keep >= gi * block) & (keep < (gi + 1) * block)))
+        for gi in range(num_groups)
+    }
+    assert len(set(per_group_counts.values())) == 1  # uniform per group
+
+    np.testing.assert_array_equal(pruned_inits["Gamma"].reshape(-1), gamma[keep])
+    np.testing.assert_array_equal(pruned_inits["Beta"].reshape(-1), beta[keep])
+
+    oracle = _decomposed_group_norm_conv_pair_model(
+        w1[keep],
+        w2[:, keep],
+        gamma[keep],
+        beta[keep],
+        num_groups,
+        in_scale=in_scale,
+        in_bias=in_bias,
+        b1=b1[keep],
+    )
+
+    rng_x = np.random.default_rng(151)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_decomposed_group_norm_num_groups_mismatch_with_grouped_conv_declines():
+    # The decomposed-hop analogue of
+    # `test_structured_pruning_group_norm_num_groups_mismatch_with_grouped_conv_declines`:
+    # `num_groups` disagreeing with a same-chain grouped Conv producer's own
+    # `group` is declined outright, never guessed at.
+    Cin, C1, C2, group1, num_groups = 4, 8, 8, 2, 4
+    rng = np.random.default_rng(152)
+    w1 = rng.standard_normal((C1, Cin // group1, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    gamma = rng.standard_normal((C1,)).astype(np.float32)
+    beta = rng.standard_normal((C1,)).astype(np.float32)
+    model = _decomposed_group_norm_conv_pair_model(
+        w1, w2, gamma, beta, num_groups, group1=group1
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["Gamma"].reshape(-1), gamma)
+    np.testing.assert_array_equal(inits["Beta"].reshape(-1), beta)
+
+
+def test_structured_pruning_decomposed_group_norm_num_groups_not_dividing_declines():
+    # `num_groups` not evenly dividing `n_channels` -- declined outright by
+    # `_decomposed_group_norm_reshape_num_groups`, mirroring the native
+    # hop's own identical `n_channels % num_groups != 0` bar.
+    Cin, C1, C2, num_groups = 3, 8, 4, 3  # 8 % 3 != 0
+    rng = np.random.default_rng(153)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    gamma = rng.standard_normal((C1,)).astype(np.float32)
+    beta = rng.standard_normal((C1,)).astype(np.float32)
+    model = _decomposed_group_norm_conv_pair_model(w1, w2, gamma, beta, num_groups)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+@pytest.mark.parametrize(
+    "reshape_shape",
+    [
+        [4, 0, -1],  # num_groups/batch swapped
+        [0, 4, 2],  # no -1 at all -- not the fixed group-split form
+        [0, 4, -1, 1],  # wrong length
+    ],
+)
+def test_structured_pruning_decomposed_group_norm_wrong_reshape_shape_declines(
+    reshape_shape,
+):
+    # Any deviation from the exact `[0|batch_dim, num_groups, -1]` form is
+    # declined outright, never guessed at -- see
+    # `_decomposed_group_norm_reshape_num_groups`'s own docstring.
+    Cin, C1, C2, num_groups = 3, 8, 4, 4
+    rng = np.random.default_rng(154)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    gamma = rng.standard_normal((C1,)).astype(np.float32)
+    beta = rng.standard_normal((C1,)).astype(np.float32)
+    model = _decomposed_group_norm_conv_pair_model(
+        w1, w2, gamma, beta, num_groups, reshape_shape=reshape_shape
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_decomposed_group_norm_non_channel_gamma_declines():
+    # `Gamma`/`Beta` not held to the `[C, 1, ..., 1]` per-channel shape bar
+    # `_match_prelu_pass_through`'s own per-channel branch already uses --
+    # here, a bare `[C]` (this hop's own matcher, unlike a MatMul/Gemm
+    # chain's own last-axis convention, requires at least one trailing
+    # size-1 dimension, mirroring `_match_prelu_pass_through`'s own
+    # "a bare [C] slope is deliberately not per-channel here" bar) -- is
+    # declined outright, the whole chain left unpruned.
+    Cin, C1, C2, num_groups = 3, 8, 4, 4
+    rng = np.random.default_rng(155)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    gamma = rng.standard_normal((C1,)).astype(np.float32)
+    beta = rng.standard_normal((C1,)).astype(np.float32)
+    model = _decomposed_group_norm_conv_pair_model(w1, w2, gamma, beta, num_groups)
+    # Overwrite `Gamma` with a bare rank-1 `[C1]` shape instead of `[C1,1,1]`.
+    for init in model.graph.initializer:
+        if init.name == "Gamma":
+            init.CopyFrom(_f32(gamma, "Gamma"))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_decomposed_group_norm_tied_gamma_beta_declines():
+    # A tied `Gamma`/`Beta` (the same initializer used for both) would be
+    # double-sliced by `_apply_chains`'s own per-hop loop, corrupting it --
+    # declined outright, mirroring `_match_group_norm_pass_through`'s own
+    # identical tied-`scale`/`bias` check.
+    Cin, C1, C2, num_groups = 3, 8, 4, 4
+    rng = np.random.default_rng(156)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    tied = rng.standard_normal((C1,)).astype(np.float32)
+    model = _decomposed_group_norm_conv_pair_model(w1, w2, tied, tied, num_groups)
+    # Point both Mul's and Add's own per-channel operand at the same name.
+    for node in model.graph.node:
+        if node.op_type == "Add" and list(node.input) == ["scaled", "Beta"]:
+            node.input[1] = "Gamma"
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_decomposed_group_norm_extra_consumer_on_root_declines():
+    # `h` (the producer Conv's own output, this sequence's own root) read by
+    # a THIRD consumer beyond the `Reshape`/`Shape` pair this shape expects
+    # -- declined outright, the same "no stray fan-out" bar every hop in
+    # this module already applies.
+    Cin, C1, C2, num_groups = 3, 8, 4, 4
+    rng = np.random.default_rng(157)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    gamma = rng.standard_normal((C1,)).astype(np.float32)
+    beta = rng.standard_normal((C1,)).astype(np.float32)
+    model = _decomposed_group_norm_conv_pair_model(w1, w2, gamma, beta, num_groups)
+    extra_out = onnx.helper.make_tensor_value_info(
+        "Extra", onnx.TensorProto.FLOAT, None
+    )
+    model.graph.node.append(onnx.helper.make_node("Relu", ["h"], ["Extra"]))
+    model.graph.output.append(extra_out)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_analyze_structured_pruning_decomposed_group_norm_pass_through_matches_real_call():
+    # Dry-run/real-call cross-check for the decomposed-hop specifically,
+    # mirroring `test_analyze_structured_pruning_group_norm_pass_through_matches_real_call`.
+    Cin, C1, C2, num_groups = 3, 16, 8, 4
+    rng = np.random.default_rng(158)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    gamma = rng.standard_normal((C1,)).astype(np.float32)
+    beta = rng.standard_normal((C1,)).astype(np.float32)
+    model = _decomposed_group_norm_conv_pair_model(w1, w2, gamma, beta, num_groups)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "conv_plain"
+    assert layer.total == C1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept = C1 - layer.would_drop
+    assert dims_after["W1"][0] == kept
+    assert dims_after["W2"][1] == kept
+    assert dims_after["Gamma"][0] == kept
+    assert dims_after["Beta"][0] == kept
+
+
+def test_structured_pruning_native_and_decomposed_group_norm_still_supported_together():
+    # Regression check: the native `GroupNormalization` node (opset 21+) and
+    # the bare `InstanceNormalization` shape both remain unaffected by this
+    # hop's own addition -- each is a completely different op-type dispatch
+    # inside `_walk_to_conv_consumer`, gated by its own
+    # `recognize_group_norm`/`recognize_decomposed_group_norm` flag, mutually
+    # exclusive per chain (see that function's own docstring) -- confirmed
+    # here by running one of each shape through the same call and checking
+    # both still prune correctly.
+    Cin, C1, C2, num_groups = 3, 16, 8, 4
+    rng = np.random.default_rng(159)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    gn_scale = rng.standard_normal((C1,)).astype(np.float32)
+    gn_bias = rng.standard_normal((C1,)).astype(np.float32)
+    native_model = _group_norm_conv_pair_model(w1, w2, gn_scale, gn_bias, num_groups)
+    native_pruned = onnxsim.apply_structured_pruning(native_model, sparsity=0.5)
+    native_dims = _initializer_dims(native_pruned)
+    assert native_dims["W1"][0] < C1
+    assert native_dims["W1"][0] % num_groups == 0
+
+    w1b = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2b = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    in_scale = rng.standard_normal((C1,)).astype(np.float32)
+    in_bias = rng.standard_normal((C1,)).astype(np.float32)
+    instance_model = _instance_norm_conv_pair_model(w1b, w2b, in_scale, in_bias)
+    instance_pruned = onnxsim.apply_structured_pruning(instance_model, sparsity=0.5)
+    instance_dims = _initializer_dims(instance_pruned)
+    assert instance_dims["W1"][0] < C1
+
+
 # --- Conv chain: pooling/Resize/Pad pass-through hops -----------------------
 #
 # `MaxPool`/`AveragePool`/`GlobalAveragePool` (unconditional -- no weight of
