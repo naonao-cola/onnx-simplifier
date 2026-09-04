@@ -18466,6 +18466,529 @@ void CommitTransformerBlockDrops(
   }
 }
 
+// --- SparseGPT (unstructured / N:M) pruning -----------------------------
+//
+// C++ port of pruning.py's own apply_sparsegpt_pruning / _sparsegpt_prune_
+// columns / onnxsim.gptq._inverse_hessian_cholesky. See structured_pruning_
+// entry.h's own ApplySparseGptPruning declaration comment for the full
+// scope decision (FLOAT32-only weights, MatMul/vanilla-Gemm/`com.microsoft
+// ::Attention` merged-QKV weight only -- 2-D Conv is NOT ported here, see
+// that comment for why) and pruning.py's own module-level docstring /
+// gptq.py's own module-level docstring for the algorithm itself. Three
+// genuinely new pieces this pass needs that no earlier pass in this file
+// does:
+//
+//   1. Dense Cholesky decomposition + triangular-matrix inversion (double
+//      precision, hand-written -- CholeskyLower/InvertLowerTriangular/
+//      InverseHessianCholesky below), computing the Cholesky-factored
+//      inverse Hessian GPTQ/SparseGPT both key their whole reformulation
+//      on. No general (non-SPD) matrix solver is needed anywhere in this
+//      pass -- see InverseHessianCholesky's own comment for exactly how
+//      "invert an SPD matrix" reduces to two Cholesky factorizations plus
+//      one triangular inversion, with no separate Gauss-Jordan/LU step at
+//      all.
+//   2. A genuinely different calibration statistic than WandaCalibrationStats
+//      accumulates: not a per-channel activation norm, but the full `K x K`
+//      cross-covariance `H = X^T X` of a matched layer's own input
+//      activation -- SparseGptHessianStats below, reusing WandaCalibration
+//      Stats' own probe-injection/batch-iteration/executor-call plumbing
+//      (see that function's own top comment for the calibration-crossing
+//      design every calibration-driven pass in this file shares) but
+//      accumulating an entirely different per-batch statistic.
+//   3. The sequential, per-column-block, Hessian-error-compensating
+//      processing loop itself (SparseGptPruneColumns below), a faithful
+//      port of _sparsegpt_prune_columns -- unlike every earlier pass in
+//      this file, this returns fully rewritten VALUES for the surviving
+//      entries, not merely a keep/drop index set to slice by.
+//
+// Unlike every earlier pass in this file (all of them purely structural:
+// they drop whole rows/columns/experts/filters and leave every surviving
+// entry's own value byte-for-byte unchanged), this pass never changes any
+// tensor's shape at all -- only individual weight entries, whether pruned
+// (zeroed) or merely kept (Hessian-compensated, so their own value can also
+// change), are rewritten in place. Every matched layer is processed
+// completely independently -- no producer/consumer chain-walking, no
+// shared keep/drop index set propagated downstream, unlike every chain-
+// based pass elsewhere in this file.
+
+// Returns the k*k row-major LOWER-triangular Cholesky factor L of
+// symmetric-positive-definite `a` (a == L @ L.T), via the standard
+// Cholesky-Banachiewicz algorithm (row by row, each row's own off-diagonal
+// entries computed from already-finished earlier rows/columns -- no
+// pivoting, since a genuinely SPD matrix never needs it). `a` is read only
+// from its lower triangle (`a[i*k+j]` for `j <= i`) -- the upper triangle
+// is never touched, so a caller need not symmetrize a matrix that is only
+// SPD up to floating-point round-off (e.g. InverseHessianCholesky's own
+// `linv.T @ linv` product below, mathematically exactly symmetric but
+// written out explicitly-symmetric there anyway). Throws
+// std::runtime_error if a computed diagonal pivot is non-positive -- should
+// never happen for a Hessian that has already been through
+// InverseHessianCholesky's own damping (percdamp keeps every diagonal
+// entry strictly positive and dominant enough), but this guards a
+// malformed/degenerate calibration Hessian rather than silently emitting
+// NaN into every downstream weight.
+std::vector<double> CholeskyLower(const std::vector<double>& a, int64_t k) {
+  std::vector<double> l(static_cast<size_t>(k * k), 0.0);
+  for (int64_t j = 0; j < k; ++j) {
+    double sum = a[static_cast<size_t>(j * k + j)];
+    for (int64_t p = 0; p < j; ++p) {
+      const double ljp = l[static_cast<size_t>(j * k + p)];
+      sum -= ljp * ljp;
+    }
+    if (!(sum > 0.0)) {
+      throw std::runtime_error(
+          "ApplySparseGptPruning: calibration Hessian is not positive "
+          "definite even after damping (percdamp too small, or degenerate "
+          "calibration data) -- cannot Cholesky-factor it");
+    }
+    const double ljj = std::sqrt(sum);
+    l[static_cast<size_t>(j * k + j)] = ljj;
+    for (int64_t i = j + 1; i < k; ++i) {
+      double sum2 = a[static_cast<size_t>(i * k + j)];
+      for (int64_t p = 0; p < j; ++p) {
+        sum2 -= l[static_cast<size_t>(i * k + p)] *
+                l[static_cast<size_t>(j * k + p)];
+      }
+      l[static_cast<size_t>(i * k + j)] = sum2 / ljj;
+    }
+  }
+  return l;
+}
+
+// Returns the k*k row-major inverse of lower-triangular `l` (itself lower-
+// triangular) via forward substitution, one column of the identity at a
+// time, in closed form (`linv[i][i] = 1/l[i][i]`; `linv[i][j] =
+// -(sum_{p=j}^{i-1} l[i][p] * linv[p][j]) / l[i][i]` for `j < i`) -- the
+// "triangular solve" InverseHessianCholesky below needs to turn a Cholesky
+// factor into the matrix's own inverse.
+std::vector<double> InvertLowerTriangular(const std::vector<double>& l,
+                                          int64_t k) {
+  std::vector<double> linv(static_cast<size_t>(k * k), 0.0);
+  for (int64_t i = 0; i < k; ++i) {
+    linv[static_cast<size_t>(i * k + i)] =
+        1.0 / l[static_cast<size_t>(i * k + i)];
+    for (int64_t j = 0; j < i; ++j) {
+      double sum = 0.0;
+      for (int64_t p = j; p < i; ++p) {
+        sum += l[static_cast<size_t>(i * k + p)] *
+               linv[static_cast<size_t>(p * k + j)];
+      }
+      linv[static_cast<size_t>(i * k + j)] =
+          -sum / l[static_cast<size_t>(i * k + i)];
+    }
+  }
+  return linv;
+}
+
+// C++ port of onnxsim.gptq._inverse_hessian_cholesky: returns the k*k
+// row-major UPPER-triangular Cholesky factor U of `h`'s inverse (h_inv ==
+// U.T @ U) -- every entry strictly below the diagonal is exactly 0.0. A
+// "dead" channel (h's own diagonal entry exactly 0.0 -- calibration data
+// never activated it) gets a fixed diagonal of 1.0 first, the same
+// standard GPTQ trick the Python original uses to keep `h` invertible
+// without giving that channel any influence over any other channel's own
+// correction. `percdamp` is the same Hessian-damping fraction the Python
+// original takes: `damp = max(percdamp * mean(diag(h)), 1e-8)` added to
+// every diagonal entry, computed from the ALREADY-dead-fixed diagonal
+// (mirrors the Python original's own order: dead-fix happens first,
+// damp's own mean is over the post-fix diagonal) -- keeps the
+// factorization numerically stable even when calibration data doesn't
+// fully activate (or too tightly correlates) this layer's own input
+// channels.
+//
+// Rather than a general (non-SPD-aware) matrix-inverse routine, this
+// reduces "invert an SPD matrix" to two Cholesky factorizations plus one
+// triangular inversion -- mathematically: h = L @ L.T (CholeskyLower),
+// h^-1 = (L^-1).T @ (L^-1) (InvertLowerTriangular once, plus one dense
+// matrix product), then h^-1's own Cholesky factor is taken a SECOND time
+// (CholeskyLower again) and transposed to upper-triangular form. Since the
+// Cholesky factorization of an SPD matrix is mathematically UNIQUE (up to
+// the standard "positive diagonal" sign convention both this and NumPy's
+// own `np.linalg.cholesky` use), this reproduces the exact same `U` the
+// Python original's `np.linalg.cholesky(np.linalg.inv(h)).T` computes, up
+// to ordinary floating-point rounding -- regardless of the different
+// intermediate algorithm (this never calls a general LU-based `inv` at
+// all).
+std::vector<double> InverseHessianCholesky(const std::vector<double>& h_in,
+                                           int64_t k, double percdamp) {
+  std::vector<double> h = h_in;
+  for (int64_t i = 0; i < k; ++i) {
+    if (h[static_cast<size_t>(i * k + i)] == 0.0) {
+      h[static_cast<size_t>(i * k + i)] = 1.0;
+    }
+  }
+  double mean_diag = 0.0;
+  for (int64_t i = 0; i < k; ++i) {
+    mean_diag += h[static_cast<size_t>(i * k + i)];
+  }
+  mean_diag /= static_cast<double>(k);
+  const double damp = std::max(percdamp * mean_diag, 1e-8);
+  for (int64_t i = 0; i < k; ++i) {
+    h[static_cast<size_t>(i * k + i)] += damp;
+  }
+
+  const std::vector<double> l = CholeskyLower(h, k);
+  const std::vector<double> linv = InvertLowerTriangular(l, k);
+
+  // h_inv = linv.T @ linv (dense k*k product -- h_inv[i][j] =
+  // sum_p linv[p][i] * linv[p][j]), written out symmetrically so the
+  // result is EXACTLY symmetric (not merely so up to summation-order
+  // round-off), matching np.linalg.inv's own conceptually-symmetric result
+  // for an SPD input as closely as double-precision allows.
+  std::vector<double> h_inv(static_cast<size_t>(k * k), 0.0);
+  for (int64_t i = 0; i < k; ++i) {
+    for (int64_t j = i; j < k; ++j) {
+      double sum = 0.0;
+      for (int64_t p = 0; p < k; ++p) {
+        sum += linv[static_cast<size_t>(p * k + i)] *
+               linv[static_cast<size_t>(p * k + j)];
+      }
+      h_inv[static_cast<size_t>(i * k + j)] = sum;
+      h_inv[static_cast<size_t>(j * k + i)] = sum;
+    }
+  }
+
+  const std::vector<double> l2 = CholeskyLower(h_inv, k);
+  std::vector<double> u(static_cast<size_t>(k * k), 0.0);
+  for (int64_t i = 0; i < k; ++i) {
+    for (int64_t j = i; j < k; ++j) {
+      u[static_cast<size_t>(i * k + j)] = l2[static_cast<size_t>(j * k + i)];
+    }
+  }
+  return u;
+}
+
+// C++ port of pruning.py's own _sparsegpt_prune_columns: returns SparseGPT-
+// pruned VALUES (not a mask) for `w_nk` (`n_rows` x `k`, output-channel-
+// first, row-major) against Hessian `h` (`k` x `k`, row-major, symmetric,
+// dense). Every KEPT entry may also change value, having accumulated
+// Hessian-based compensation for every entry pruned before it -- see this
+// section's own top comment.
+//
+// Exactly one of two masking modes, matching pruning.py's own dispatch:
+//   - Unstructured (`n_pat`/`m_pat` both nullopt): one THRESHOLD is shared
+//     across every output row within each `proc_block_size`-wide column
+//     block (computed once, up front, from that block's own PRE-block
+//     weight values -- never recomputed as earlier columns in the block get
+//     error-compensated) -- the one deliberate departure from every other
+//     unstructured-pruning function in pruning.py, faithfully reproduced
+//     here rather than "corrected" to a per-row threshold, since the whole
+//     point of this port is to reproduce SparseGPT specifically (see this
+//     file's own top comment and pruning.py's own module docstring).
+//   - N:M (`n_pat`/`m_pat` both given): a per-row mask, recomputed fresh at
+//     the start of every `m_pat`-wide group from that group's OWN current
+//     (already error-compensated by any earlier column in this same block)
+//     weight values -- ordinary per-row N:M semantics, unaffected by the
+//     unstructured case's shared-threshold departure.
+std::vector<double> SparseGptPruneColumns(
+    const std::vector<double>& w_nk, int64_t n_rows, int64_t k,
+    const std::vector<double>& h, double sparsity,
+    const std::optional<int64_t>& n_pat, const std::optional<int64_t>& m_pat,
+    double percdamp, int64_t proc_block_size) {
+  std::vector<uint8_t> dead(static_cast<size_t>(k), 0);
+  for (int64_t c = 0; c < k; ++c) {
+    dead[static_cast<size_t>(c)] =
+        h[static_cast<size_t>(c * k + c)] == 0.0 ? 1 : 0;
+  }
+
+  std::vector<double> w_work = w_nk;
+  for (int64_t r = 0; r < n_rows; ++r) {
+    for (int64_t c = 0; c < k; ++c) {
+      if (dead[static_cast<size_t>(c)]) {
+        w_work[static_cast<size_t>(r * k + c)] = 0.0;
+      }
+    }
+  }
+
+  if (!n_pat.has_value() && sparsity <= 0.0) {
+    return w_nk;  // True no-op, matching pruning.py's own early return
+                  // rather than the reference implementation's own "always
+                  // drop the single lowest-scoring entry" edge case at
+                  // sparsity == 0.0.
+  }
+
+  const std::vector<double> hinv = InverseHessianCholesky(h, k, percdamp);
+  std::vector<double> w_pruned(static_cast<size_t>(n_rows * k), 0.0);
+
+  for (int64_t i1 = 0; i1 < k; i1 += proc_block_size) {
+    const int64_t i2 = std::min(i1 + proc_block_size, k);
+    const int64_t count = i2 - i1;
+
+    // w1: n_rows x count working copy of w_work[:, i1:i2] -- mutated in
+    // place by the per-column error-compensation loop below, exactly
+    // mirroring the Python original's own in-place `w1` updates.
+    std::vector<double> w1(static_cast<size_t>(n_rows * count));
+    for (int64_t r = 0; r < n_rows; ++r) {
+      for (int64_t c = 0; c < count; ++c) {
+        w1[static_cast<size_t>(r * count + c)] =
+            w_work[static_cast<size_t>(r * k + i1 + c)];
+      }
+    }
+    std::vector<double> err1(static_cast<size_t>(n_rows * count), 0.0);
+
+    std::vector<double> hinv1_diag(static_cast<size_t>(count));
+    for (int64_t c = 0; c < count; ++c) {
+      hinv1_diag[static_cast<size_t>(c)] =
+          hinv[static_cast<size_t>((i1 + c) * k + (i1 + c))];
+    }
+
+    std::vector<uint8_t> mask1(static_cast<size_t>(n_rows * count), 0);
+    if (!n_pat.has_value()) {
+      // Unstructured: one shared threshold across the whole block, from
+      // this block's own PRE-processing w1 -- see this function's own top
+      // comment.
+      std::vector<double> score(static_cast<size_t>(n_rows * count));
+      for (int64_t r = 0; r < n_rows; ++r) {
+        for (int64_t c = 0; c < count; ++c) {
+          const double wv = w1[static_cast<size_t>(r * count + c)];
+          const double d = hinv1_diag[static_cast<size_t>(c)];
+          score[static_cast<size_t>(r * count + c)] = (wv * wv) / (d * d);
+        }
+      }
+      std::vector<double> sorted_score = score;
+      std::sort(sorted_score.begin(), sorted_score.end());
+      int64_t idx = static_cast<int64_t>(
+          static_cast<double>(sorted_score.size()) * sparsity);
+      idx = std::clamp<int64_t>(idx, 0,
+                                static_cast<int64_t>(sorted_score.size()) - 1);
+      const double thresh = sorted_score[static_cast<size_t>(idx)];
+      for (size_t i = 0; i < score.size(); ++i) {
+        mask1[i] = score[i] <= thresh ? 1 : 0;
+      }
+    }
+
+    for (int64_t i = 0; i < count; ++i) {
+      if (n_pat.has_value() && m_pat.has_value() && (i % *m_pat) == 0) {
+        const int64_t group_end = std::min(i + *m_pat, count);
+        const int64_t prune_count = std::min(group_end - i, *m_pat - *n_pat);
+        for (int64_t r = 0; r < n_rows; ++r) {
+          for (int64_t c = i; c < group_end; ++c) {
+            mask1[static_cast<size_t>(r * count + c)] = 0;
+          }
+        }
+        if (prune_count > 0) {
+          // Per row: rank this group's own columns by ascending OBS score
+          // (w^2 / hinv_diag^2), mark the `prune_count` lowest-scoring ones
+          // -- mirrors np.argsort(group_score, axis=1)[:, :prune_count] +
+          // put_along_axis. Ties are broken by column index (std::sort is
+          // not required to be stable, but real weight data essentially
+          // never ties exactly).
+          std::vector<std::pair<double, int64_t>> gs(
+              static_cast<size_t>(group_end - i));
+          for (int64_t r = 0; r < n_rows; ++r) {
+            for (int64_t c = i; c < group_end; ++c) {
+              const double wv = w1[static_cast<size_t>(r * count + c)];
+              const double d = hinv1_diag[static_cast<size_t>(c)];
+              gs[static_cast<size_t>(c - i)] = {(wv * wv) / (d * d), c};
+            }
+            std::sort(gs.begin(), gs.end(), [](const auto& a, const auto& b) {
+              return a.first < b.first;
+            });
+            for (int64_t p = 0; p < prune_count; ++p) {
+              mask1[static_cast<size_t>(r * count +
+                                        gs[static_cast<size_t>(p)].second)] = 1;
+            }
+          }
+        }
+      }
+
+      const double d = hinv1_diag[static_cast<size_t>(i)];
+      for (int64_t r = 0; r < n_rows; ++r) {
+        const double w_col = w1[static_cast<size_t>(r * count + i)];
+        const bool masked = mask1[static_cast<size_t>(r * count + i)] != 0;
+        const double q_col = masked ? 0.0 : w_col;
+        w_pruned[static_cast<size_t>(r * k + i1 + i)] = q_col;
+        const double err = (w_col - q_col) / d;
+        err1[static_cast<size_t>(r * count + i)] = err;
+        if (i + 1 < count) {
+          for (int64_t c = i + 1; c < count; ++c) {
+            w1[static_cast<size_t>(r * count + c)] -=
+                err * hinv[static_cast<size_t>((i1 + i) * k + (i1 + c))];
+          }
+        }
+      }
+    }
+
+    if (i2 < k) {
+      // w_work[:, i2:] -= err1 @ hinv[i1:i2, i2:] -- carries every pruned
+      // entry's own compensation forward into every not-yet-processed
+      // block.
+      for (int64_t r = 0; r < n_rows; ++r) {
+        for (int64_t cc = i2; cc < k; ++cc) {
+          double sum = 0.0;
+          for (int64_t c = 0; c < count; ++c) {
+            sum += err1[static_cast<size_t>(r * count + c)] *
+                   hinv[static_cast<size_t>((i1 + c) * k + cc)];
+          }
+          w_work[static_cast<size_t>(r * k + cc)] -= sum;
+        }
+      }
+    }
+  }
+
+  return w_pruned;
+}
+
+// One matched layer's own accumulated Hessian -- `h` is a dense, exactly
+// symmetric `k * k` row-major matrix.
+struct SparseGptHessian {
+  int64_t k = 0;
+  std::vector<double> h;
+};
+
+// The calibration statistic SparseGPT needs that WandaCalibrationStats has
+// no analogue of: not a per-channel activation norm, but each matched
+// layer's own full `K x K` cross-covariance `H = X^T X` of its input
+// activation -- mirrors pruning.py's own per-candidate `h = x.T @ x` (`x`
+// being every calibration batch's own activation, reshaped to
+// `[-1, x.shape[-1]]` and concatenated). Rather than concatenating
+// (pruning.py's own approach, fine there since a single layer's whole
+// calibration set is small enough to keep in memory at once), this
+// accumulates `H` incrementally, one batch's own `X_b.T @ X_b` at a time --
+// mathematically identical (`(X1;X2).T @ (X1;X2) == X1.T@X1 + X2.T@X2`),
+// and mirrors WandaCalibrationStats' own already-established "accumulate
+// across batches, never hold every batch's own activation at once" style.
+//
+// Reuses WandaCalibrationStats' own probe-injection/batch-iteration/
+// executor-call plumbing verbatim (see that function's own top comment for
+// the full calibration-crossing design every calibration-driven pass in
+// this file shares) -- same FLOAT32-only, `ndim >= 2` scope decision for a
+// probed activation (reshaped to `[-1, dims.back()]`, mirroring
+// pruning.py's own `x.reshape(-1, x.shape[-1])`). Unlike pruning.py's own
+// `np.concatenate`, which would raise if two batches' own activations for
+// the same probe name disagreed on `dims.back()` (never happens for a
+// well-formed model -- that last dim is a fixed layer property, not a
+// per-batch one), a later batch that DOES disagree with the first batch's
+// own `k` is simply skipped for that probe (a documented, deliberate
+// deviation -- there is no meaningful partial-Hessian fallback either way,
+// and a well-formed model never triggers it).
+std::unordered_map<std::string, SparseGptHessian> SparseGptHessianStats(
+    const ModelExecutor& executor, const onnx::ModelProto& model,
+    const std::vector<std::string>& probe_names,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data) {
+  std::unordered_map<std::string, SparseGptHessian> result;
+  if (probe_names.empty()) {
+    return result;
+  }
+
+  onnx::ModelProto probe_model = model;
+  std::unordered_set<std::string> existing_outputs;
+  for (const auto& o : probe_model.graph().output()) {
+    existing_outputs.insert(o.name());
+  }
+  for (const auto& name : probe_names) {
+    if (existing_outputs.insert(name).second) {
+      probe_model.mutable_graph()->add_output()->set_name(name);
+    }
+  }
+
+  std::unordered_map<std::string, size_t> output_index;
+  for (int i = 0; i < probe_model.graph().output_size(); ++i) {
+    output_index.emplace(probe_model.graph().output(i).name(),
+                         static_cast<size_t>(i));
+  }
+  const auto& graph_inputs = probe_model.graph().input();
+
+  for (const auto& batch : calibration_data) {
+    // Reorder this batch's own {name: TensorProto} map into
+    // ModelExecutor::Run's positional contract -- see WandaCalibrationStats'
+    // own top comment, design decision (2).
+    std::vector<DLManagedTensorPtr> input_dls;
+    std::vector<const DLManagedTensor*> input_ptrs;
+    input_dls.reserve(static_cast<size_t>(graph_inputs.size()));
+    input_ptrs.reserve(static_cast<size_t>(graph_inputs.size()));
+    for (const auto& gi : graph_inputs) {
+      auto it = batch.find(gi.name());
+      if (it == batch.end()) {
+        throw std::invalid_argument(
+            "ApplySparseGptPruning: calibration batch is missing required "
+            "graph input '" +
+            gi.name() + "'");
+      }
+      input_dls.emplace_back(
+          onnxsim::dlpack::FromTensorProtoBorrowing(it->second));
+      input_ptrs.push_back(input_dls.back().get());
+    }
+
+    std::vector<DLManagedTensorPtr> outputs =
+        executor.Run(probe_model, input_ptrs);
+
+    for (const auto& name : probe_names) {
+      auto oit = output_index.find(name);
+      if (oit == output_index.end() || oit->second >= outputs.size()) {
+        continue;  // Defensive -- every probe name was added as an output
+                   // above.
+      }
+      const DLTensor& dl = outputs[oit->second]->dl_tensor;
+      onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
+      if (tp.data_type() != onnx::TensorProto::FLOAT) {
+        continue;  // Scope decision mirroring WandaCalibrationStats' own.
+      }
+      const int64_t ndim = tp.dims_size();
+      if (ndim < 2) {
+        continue;  // Mirrors pruning.py's own `if x.ndim < 2: continue`.
+      }
+      const std::vector<int64_t> dims(tp.dims().begin(), tp.dims().end());
+      const int64_t kk = dims.back();
+      if (kk <= 0) {
+        continue;
+      }
+      int64_t numel = 1;
+      for (int64_t d : dims) {
+        numel *= d;
+      }
+      if (numel <= 0) {
+        continue;
+      }
+      const int64_t rows = numel / kk;
+
+      auto& acc = result[name];
+      if (acc.h.empty()) {
+        acc.k = kk;
+        acc.h.assign(static_cast<size_t>(kk * kk), 0.0);
+      } else if (acc.k != kk) {
+        continue;  // See this function's own top comment.
+      }
+
+      const std::vector<float> data = ReadFloatTensor(tp);
+      // H += X.T @ X, accumulated over the upper triangle only (H is
+      // symmetric by construction) then mirrored into the lower triangle
+      // once, after every batch, below.
+      for (int64_t r = 0; r < rows; ++r) {
+        const float* row = data.data() + r * kk;
+        double* hbase = acc.h.data();
+        for (int64_t i = 0; i < kk; ++i) {
+          const double xi = static_cast<double>(row[i]);
+          if (xi == 0.0) {
+            continue;
+          }
+          double* hrow = hbase + i * kk;
+          for (int64_t j = i; j < kk; ++j) {
+            hrow[j] += xi * static_cast<double>(row[j]);
+          }
+        }
+      }
+    }
+  }
+
+  // Mirror the accumulated upper triangle (including the diagonal) into
+  // the lower triangle so `h` is a fully-populated, exactly-symmetric
+  // dense matrix -- CholeskyLower only ever reads the lower triangle, but
+  // SparseGptPruneColumns' own row-wise `hinv[(i1+i)*k + (i1+c)]` reads
+  // elsewhere need the full matrix.
+  for (auto& [name, acc] : result) {
+    for (int64_t i = 0; i < acc.k; ++i) {
+      for (int64_t j = i + 1; j < acc.k; ++j) {
+        acc.h[static_cast<size_t>(j * acc.k + i)] =
+            acc.h[static_cast<size_t>(i * acc.k + j)];
+      }
+    }
+  }
+
+  return result;
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
@@ -19254,6 +19777,193 @@ onnx::ModelProto ApplyTransformerBlockPruning(
   }
   for (auto& [g, blocks] : committed_by_graph) {
     CommitTransformerBlockDrops(g, blocks);
+  }
+
+  return out;
+}
+
+// SparseGPT (Frantar & Alistarh, 2023) unstructured/N:M pruning. The C++
+// port of pruning.py's own apply_sparsegpt_pruning -- see this file's own
+// "SparseGPT (unstructured / N:M) pruning" section comment above
+// (CholeskyLower through SparseGptHessianStats) for the full technique and
+// every new piece of machinery it needed, and structured_pruning_entry.h's
+// own declaration comment for the exact scope this port covers versus the
+// Python original.
+onnx::ModelProto ApplySparseGptPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity, const std::optional<int64_t>& n,
+    const std::optional<int64_t>& m, double percdamp, int64_t proc_block_size) {
+  // Mirrors pruning.py's own _validate_pattern exactly.
+  if (n.has_value() != m.has_value()) {
+    throw std::invalid_argument(
+        "ApplySparseGptPruning: n and m must be given together (N:M "
+        "pruning) or not at all");
+  }
+  if (n.has_value() && m.has_value()) {
+    if (!(*n > 0 && *n <= *m)) {
+      throw std::invalid_argument(
+          "ApplySparseGptPruning: require 0 < n <= m, got n=" +
+          std::to_string(*n) + ", m=" + std::to_string(*m));
+    }
+  } else if (!(sparsity >= 0.0 && sparsity < 1.0)) {
+    throw std::invalid_argument(
+        "ApplySparseGptPruning: sparsity must be in [0, 1), got " +
+        std::to_string(sparsity));
+  }
+  // Not one of pruning.py's own parameters to validate (Python's `range`
+  // would either infinite-loop or silently process zero columns) -- a
+  // deliberate, documented C++-side safety addition rather than a faithful
+  // reproduction of undefined Python behavior no caller should rely on.
+  if (proc_block_size <= 0) {
+    throw std::invalid_argument(
+        "ApplySparseGptPruning: proc_block_size must be positive, got " +
+        std::to_string(proc_block_size));
+  }
+
+  onnx::ModelProto out = model;
+  // NOT subgraph-aware -- mirrors pruning.py's own apply_sparsegpt_pruning,
+  // which likewise only ever prunes `model.graph` directly (see this
+  // file's own ApplyStructuredWandaPruning declaration comment in
+  // structured_pruning_entry.h for the identical reasoning shared by every
+  // calibration-driven pass in this file: calibration_data batches are
+  // keyed to the top-level graph's own inputs, and a nested If/Loop/Scan/
+  // BeamSearch-family subgraph body has no standalone way to be Run at
+  // all).
+  onnx::GraphProto* graph = out.mutable_graph();
+
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+
+  // Every matched MatMul/vanilla-Gemm layer (MatchMatMulLikeRaw -- NOT
+  // pruning.py's own widened _match_matmul_like, which additionally
+  // recognizes com.microsoft::FusedGemm/GemmFastGelu -- mirrors this
+  // file's own established, already-documented narrower C++-port scope
+  // decision everywhere else MatchMatMulLikeRaw is reused, e.g.
+  // MatchProducer/WalkToAttentionConsumer above) with a constant 2-D
+  // FLOAT32 weight (NOT also FLOAT16/BFLOAT16, unlike pruning.py's own
+  // _is_supported_float_dtype -- mirrors this file's own established
+  // FLOAT32-only C++-port scope decision, e.g.
+  // ApplyMoeExpertChannelPruning's own doc comment), plus every matched
+  // `com.microsoft::Attention` node's constant 2-D FLOAT32 merged QKV
+  // weight (MatchAttentionProducer, already FLOAT32-2-D-only itself --
+  // reused verbatim, exactly mirroring pruning.py's own
+  // _match_attention_weight_only, which reuses _match_attention_producer's
+  // own identical validation, minus its bias handling: SparseGPT never
+  // touches bias, only weight). `com.microsoft::GroupQueryAttention`'s
+  // separate Q/K/V projections need no special-casing at all -- they are
+  // ordinary MatMul/vanilla-Gemm nodes, already matched by the first case
+  // above (see pruning.py's own module docstring for the full reasoning on
+  // why this is correct, not an oversight, for both).
+  //
+  // 2-D Conv (ordinary/depthwise/general-grouped) is declined outright,
+  // NOT ported here -- see structured_pruning_entry.h's own
+  // ApplySparseGptPruning declaration comment for why (it needs an
+  // entirely new, from-first-principles im2col cross-covariance Hessian
+  // pruning.py's own module docstring documents at length, materially
+  // bigger than the rest of this pass, with no correct upstream reference
+  // to port from at all) -- a Conv node here simply never matches either
+  // case below and is left completely untouched, never guessed at.
+  struct Candidate {
+    std::string x_name;
+    std::string w_name;
+    bool weight_transposed;
+  };
+  std::vector<Candidate> candidates;
+  for (const auto& node : graph->node()) {
+    auto mm = MatchMatMulLikeRaw(node);
+    if (mm) {
+      auto wit = init_map.find(mm->w_name);
+      if (wit != init_map.end() &&
+          wit->second->data_type() == onnx::TensorProto::FLOAT &&
+          wit->second->dims_size() == 2) {
+        candidates.push_back({mm->x_name, mm->w_name, mm->weight_transposed});
+      }
+      continue;
+    }
+    auto am = MatchAttentionProducer(node, init_map);
+    if (am) {
+      // The merged QKV weight has no transpose attribute of its own -- it
+      // is already [K, N]-shaped by construction (see
+      // MatchAttentionProducer's own comment), so it is matched exactly
+      // like a non-transposed MatMul weight.
+      candidates.push_back({node.input(0), am->weight, false});
+    }
+  }
+  if (candidates.empty()) {
+    return out;
+  }
+
+  std::set<std::string> uniq_probe_names;
+  for (const auto& c : candidates) {
+    uniq_probe_names.insert(c.x_name);
+  }
+  const std::vector<std::string> probe_names(uniq_probe_names.begin(),
+                                             uniq_probe_names.end());
+  const std::unordered_map<std::string, SparseGptHessian> hessians =
+      SparseGptHessianStats(executor, out, probe_names, calibration_data);
+
+  MutInitMap mut_init_map = BuildMutInitMap(graph);
+  for (const auto& c : candidates) {
+    auto hit = hessians.find(c.x_name);
+    if (hit == hessians.end()) {
+      continue;  // No usable calibration activation ever observed for this
+                 // layer's own input -- left completely untouched, there
+                 // being no data-free fallback for SparseGPT (mirrors
+                 // pruning.py's own `if not acts: continue`).
+    }
+    onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
+    const int64_t dim0 = w_init->dims(0);
+    const int64_t dim1 = w_init->dims(1);
+    const std::vector<float> w_flat = ReadFloatTensor(*w_init);
+    const std::vector<double> w_f64(w_flat.begin(), w_flat.end());
+
+    // w_nk: [n_rows, kk], output-channel-first -- w as-is when already
+    // weight_transposed ([N, K] = [dim0, dim1]), else w's own transpose
+    // ([K, N] = [dim0, dim1] -> [N, K]). Mirrors pruning.py's own
+    // _weight_to_nk (non-Conv branch).
+    const int64_t n_rows = c.weight_transposed ? dim0 : dim1;
+    const int64_t kk = c.weight_transposed ? dim1 : dim0;
+    if (hit->second.k != kk) {
+      continue;  // Mirrors pruning.py's own
+                 // `if x.shape[1] != w_nk.shape[1]: continue`.
+    }
+
+    std::vector<double> w_nk(static_cast<size_t>(n_rows * kk));
+    if (c.weight_transposed) {
+      w_nk = w_f64;
+    } else {
+      for (int64_t kx = 0; kx < dim0; ++kx) {
+        for (int64_t nx = 0; nx < dim1; ++nx) {
+          w_nk[static_cast<size_t>(nx * kk + kx)] =
+              w_f64[static_cast<size_t>(kx * dim1 + nx)];
+        }
+      }
+    }
+
+    const std::vector<double> w_pruned_nk =
+        SparseGptPruneColumns(w_nk, n_rows, kk, hit->second.h, sparsity, n, m,
+                              percdamp, proc_block_size);
+
+    // Inverse of the w -> w_nk reshape/transpose above, mirroring
+    // pruning.py's own _nk_to_weight (non-Conv branch).
+    std::vector<float> w_new(static_cast<size_t>(dim0 * dim1));
+    if (c.weight_transposed) {
+      for (size_t i = 0; i < w_new.size(); ++i) {
+        w_new[i] = static_cast<float>(w_pruned_nk[i]);
+      }
+    } else {
+      for (int64_t nx = 0; nx < dim1; ++nx) {
+        for (int64_t kx = 0; kx < dim0; ++kx) {
+          w_new[static_cast<size_t>(kx * dim1 + nx)] = static_cast<float>(
+              w_pruned_nk[static_cast<size_t>(nx * kk + kx)]);
+        }
+      }
+    }
+    SetFloatTensorData(w_init, {dim0, dim1}, w_new);
   }
 
   return out;
