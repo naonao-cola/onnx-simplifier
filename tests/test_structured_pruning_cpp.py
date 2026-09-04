@@ -2780,7 +2780,9 @@ def test_cpp_structured_pruning_matmul_residual_clip_pass_through_hop_matches_or
 # every other Conv-chain hop test uses.
 
 
-def _group_norm_conv_pair_model(w1, w2, gn_scale, gn_bias, num_groups, group1=1, b1=None):
+def _group_norm_conv_pair_model(
+    w1, w2, gn_scale, gn_bias, num_groups, group1=1, b1=None
+):
     Cin, C2 = w1.shape[1] * group1, w2.shape[0]
     initializer = [
         _f32(w1, "W1"),
@@ -3795,7 +3797,9 @@ def _loop_wrapped_mlp_model(K0=8, H0=16, Out0=4, K1=6, H1=12, OutB=3, M=3):
     iter_num_vi = onnx.helper.make_tensor_value_info(
         "iter_num", onnx.TensorProto.INT64, []
     )
-    cond_in_vi = onnx.helper.make_tensor_value_info("cond_in", onnx.TensorProto.BOOL, [])
+    cond_in_vi = onnx.helper.make_tensor_value_info(
+        "cond_in", onnx.TensorProto.BOOL, []
+    )
     cond_out_vi = onnx.helper.make_tensor_value_info(
         "cond_out", onnx.TensorProto.BOOL, []
     )
@@ -3968,7 +3972,9 @@ def test_cpp_structured_pruning_matches_python_reference_output_with_if_subgraph
     # whichever one a single run happens to select.
     K0, H0, Out0 = 8, 16, 4
     K1, H1, OutB = 6, 12, 3
-    model, _cfg = _if_wrapped_mlp_model(K0=K0, H0=H0, Out0=Out0, K1=K1, H1=H1, OutB=OutB)
+    model, _cfg = _if_wrapped_mlp_model(
+        K0=K0, H0=H0, Out0=Out0, K1=K1, H1=H1, OutB=OutB
+    )
 
     pruned_py = onnxsim.apply_structured_pruning(model, sparsity=0.5)
     pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)

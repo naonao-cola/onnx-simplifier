@@ -1147,8 +1147,7 @@ struct GroupNormMatch {
 // producer's/consumer's own `group`" check is left to the caller
 // (FindConvChains), which has visibility into both.
 std::optional<GroupNormMatch> MatchGroupNormPassThrough(
-    const onnx::NodeProto& node, const InitMap& init_map,
-    int64_t n_channels) {
+    const onnx::NodeProto& node, const InitMap& init_map, int64_t n_channels) {
   if (node.op_type() != "GroupNormalization" || node.domain() != "") {
     return std::nullopt;
   }
@@ -1281,8 +1280,7 @@ bool MatchPadChannelPassThrough(const onnx::NodeProto& node,
   if (node.op_type() != "Pad" || node.domain() != "") {
     return false;
   }
-  if (node.input_size() < 2 || node.input(0).empty() ||
-      node.input(1).empty()) {
+  if (node.input_size() < 2 || node.input(0).empty() || node.input(1).empty()) {
     return false;
   }
   auto pit = init_map.find(node.input(1));
@@ -1498,8 +1496,7 @@ WalkToConvConsumer(const std::string& start, const InitMap& init_map,
 
     if (nxt->op_type() == "Pad" && nxt->domain() == "" &&
         nxt->input_size() > 0 && nxt->input(0) == cur &&
-        nxt->output_size() == 1 &&
-        MatchPadChannelPassThrough(*nxt, init_map)) {
+        nxt->output_size() == 1 && MatchPadChannelPassThrough(*nxt, init_map)) {
       const std::string& out2 = nxt->output(0);
       if (ConsumerCount(consumers_of, out2) != 1 || graph_outputs.count(out2)) {
         break;
@@ -5738,7 +5735,8 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
     concat_chains.insert(concat_chains.end(),
                          std::make_move_iterator(conv_concat_chains.begin()),
                          std::make_move_iterator(conv_concat_chains.end()));
-    std::vector<SplitGatedChain> split_gated_chains = FindSplitGatedChains(graph);
+    std::vector<SplitGatedChain> split_gated_chains =
+        FindSplitGatedChains(graph);
 
     TouchedState touched;
     if (!chains.empty()) {
