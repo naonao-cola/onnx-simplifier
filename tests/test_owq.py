@@ -128,13 +128,17 @@ def test_owq_restores_selected_column_to_exact_precision():
     y_float = probe.astype(np.float64) @ w_float
 
     (owq_y,) = _run(owq_model, {"X": probe})
-    owq_err = np.linalg.norm(y_float - owq_y.astype(np.float64))
     # OWQ's correction restores the selected column's contribution exactly
     # (computed directly from the float weight, independent of the INT4
     # code), so isolating it should reproduce the float output almost
     # exactly, regardless of how well or poorly plain RTN happened to
-    # handle that same column on its own.
-    assert owq_err < 1e-3
+    # handle that same column on its own. Relative (not absolute) error --
+    # the float32 MatMul's own accumulation error scales with the output's
+    # magnitude, which this synthetic scenario deliberately makes large
+    # (a 20x-magnitude weight column), so a fixed absolute threshold is the
+    # wrong comparison and is sensitive to platform-specific float32
+    # rounding (observed to vary between x86_64 and arm64 CI runners).
+    assert _rel_l2(y_float, owq_y) < 1e-4
 
 
 def test_owq_leaves_int4_codes_untouched():
