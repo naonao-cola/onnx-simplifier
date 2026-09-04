@@ -50,6 +50,7 @@ from onnxsim.gptq import apply_gptq
 from onnxsim.hqq import quantize_weight_only_int4_hqq
 from onnxsim.kmeans_quantization import quantize_weight_only_kmeans
 from onnxsim.kv_cache_quantization import quantize_kv_cache
+from onnxsim.llm_fp4 import FP4_FORMATS, quantize_weight_only_llm_fp4
 from onnxsim.llm_int8 import apply_llm_int8
 from onnxsim.low_rank_compensation import apply_low_rank_compensation
 from onnxsim.mixed_precision import apply_mixed_precision_quantization
@@ -225,6 +226,8 @@ __all__ = [
     "NF4_CODEBOOK",
     "quantize_weight_only_mxfp4",
     "MXFP4_CODEBOOK",
+    "quantize_weight_only_llm_fp4",
+    "FP4_FORMATS",
     "quantize_weight_only_squeezellm",
     "quantize_weight_only_aqlm",
     "quantize_weight_only_spqr",
