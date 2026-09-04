@@ -78,6 +78,16 @@ def main() -> int:
     parser.add_argument(
         "--skip-device", action="store_true", help="only build, don't run on hardware"
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help=(
+            "pass --compiler.npu_perf --debug.dump_frontend_graph to pulsar2 "
+            "build, for a per-op NPU trace.json (load at chrome://tracing) "
+            "plus optimized_quant_axmodel.onnx (open in Netron) -- see "
+            "README.md's 'Real NPU profiling' section"
+        ),
+    )
     args = parser.parse_args()
 
     if not pulsar2_docker.docker_image_available(args.image):
@@ -98,6 +108,7 @@ def main() -> int:
         calibration_size=args.calibration_size,
         target_hardware=args.target_hardware,
         image=args.image,
+        profile=args.profile,
     )
     if not result.success:
         print(f"build failed:\n{result.error}", file=sys.stderr)
@@ -107,6 +118,18 @@ def main() -> int:
     print("phase timings:")
     for phase, seconds in result.phase_timings.items():
         print(f"  {phase}: {seconds:.2f}s")
+    if args.profile:
+        if result.trace_path is not None:
+            print(f"NPU trace (open at chrome://tracing): {result.trace_path}")
+        else:
+            print(
+                f"no trace.json found; build log tail:\n{result.stdout_tail}",
+                file=sys.stderr,
+            )
+        if result.frontend_graph_path is not None:
+            print(
+                f"optimized quantized graph (open in Netron): {result.frontend_graph_path}"
+            )
 
     if args.skip_device:
         return 0
