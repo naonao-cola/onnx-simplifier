@@ -3038,6 +3038,336 @@ def test_structured_pruning_layer_norm_positive_axis_needs_known_rank():
     assert list(inits["Gamma"].dims) == [C // 2]
 
 
+# --- apply_structured_pruning: *decomposed* (not-yet-fused) LayerNorm -------
+#
+# `LayerNormalization`'s own schema is only opset 17+ (confirmed live:
+# `onnx.defs.get_schema("LayerNormalization").since_version == 17`), so an
+# export at opset <= 16 -- still extremely common -- has no fused op to lower
+# `nn.LayerNorm` to at all. Confirmed live (`torch.onnx.export(nn.LayerNorm(C),
+# ..., opset_version=16)`, both a bare 2-D input and a 3-D one sitting between
+# two Linear layers), the exporter emits the exact 9-node canonical
+# decomposition below instead -- `up` read twice (by the first `ReduceMean`
+# and by `Sub`), `centered` read twice (by `Pow` and by `Div`), every other
+# tensor read once. At opset 18 the very same `nn.LayerNorm` module lowers
+# straight to the fused op instead (also confirmed live) -- so this is a
+# second, additive shape, never overlapping with the fused-node hop tested
+# above for the same module. `_match_decomposed_layer_norm_pass_through`
+# recognizes it as one more `_walk_to_consumer` hop; before this pass gained
+# it, this exact "MatMul -> decomposed LayerNorm -> MatMul" chain went
+# completely unpruned (confirmed independently against this task's own base
+# commit before this feature existed).
+
+
+def _decomposed_layer_norm_model(w1, gamma, beta, w2, axis=-1, opset=16, pow_exp=2.0):
+    K, C = w1.shape
+    Out = w2.shape[1]
+    initializer = [
+        _f32(w1, "W1"),
+        onnx.numpy_helper.from_array(np.array(pow_exp, dtype=np.float32), "Two"),
+        onnx.numpy_helper.from_array(np.array(1e-5, dtype=np.float32), "Eps"),
+        _f32(gamma, "Gamma"),
+        _f32(beta, "Beta"),
+        _f32(w2, "W2"),
+    ]
+    return _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          up = MatMul(X, W1)
+          mean = ReduceMean<axes=[{axis}]>(up)
+          centered = Sub(up, mean)
+          sq = Pow(centered, Two)
+          var = ReduceMean<axes=[{axis}]>(sq)
+          var_eps = Add(var, Eps)
+          std = Sqrt(var_eps)
+          normed = Div(centered, std)
+          scaled = Mul(normed, Gamma)
+          h = Add(scaled, Beta)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=opset,
+    )
+
+
+def test_structured_pruning_decomposed_layer_norm_pass_through_shrinks_matched_layers():
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(240)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _decomposed_layer_norm_model(w1, gamma, beta, w2)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, C // 2]
+    assert list(inits["Gamma"].dims) == [C // 2]
+    assert list(inits["Beta"].dims) == [C // 2]
+    assert list(inits["W2"].dims) == [C // 2, Out]
+    # Every decomposition node itself is untouched (still the same 9 nodes,
+    # same op types/wiring) -- only the two per-channel constants shrink.
+    assert [n.op_type for n in pruned.graph.node] == [
+        "MatMul",
+        "ReduceMean",
+        "Sub",
+        "Pow",
+        "ReduceMean",
+        "Add",
+        "Sqrt",
+        "Div",
+        "Mul",
+        "Add",
+        "MatMul",
+    ]
+
+
+def test_structured_pruning_decomposed_layer_norm_pass_through_matches_oracle_adversarially():
+    # Mirrors test_structured_pruning_layer_norm_pass_through_matches_oracle_adversarially
+    # exactly, for the decomposed shape: W1 engineered so the surviving `keep`
+    # set is deliberately not the first C//2 channels, Gamma/Beta spanning
+    # three orders of magnitude, strictly increasing by channel index -- a
+    # positional (rather than index-set) slice of Gamma/Beta would misapply a
+    # wildly-wrong-magnitude affine term to a kept channel, detectably wrong
+    # by orders of magnitude. The reference is built from scratch (never a
+    # post-hoc slice of the full unpruned model's own output), run through
+    # real onnxruntime.
+    K, C, Out = 4, 8, 2
+    rng = np.random.default_rng(241)
+    col_scale = np.linspace(0.1, 2.0, C).astype(np.float32)
+    w1 = (rng.standard_normal((K, C)) * col_scale).astype(np.float32)
+    gamma = (np.arange(1, C + 1, dtype=np.float64) * 0.001).astype(np.float32)
+    beta = (np.arange(1, C + 1, dtype=np.float64) * 1000.0).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _decomposed_layer_norm_model(w1, gamma, beta, w2)
+    onnx.checker.check_model(model)
+
+    keep_count = C // 2
+    keep = _oracle_keep_indices(w1, keep_count)
+    assert not np.array_equal(keep, np.arange(keep_count))  # confirm adversarial
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    def _layer_norm(v, g, b, eps=1e-5):
+        mean = v.mean(axis=-1, keepdims=True)
+        var = v.var(axis=-1, keepdims=True)
+        return (v - mean) / np.sqrt(var + eps) * g + b
+
+    h_correct = _layer_norm(x @ w1[:, keep], gamma[keep], beta[keep])
+    y_correct = h_correct @ w2[keep, :]
+    np.testing.assert_allclose(y, y_correct, rtol=1e-4, atol=1e-4)
+
+    wrong_gamma = gamma[:keep_count]
+    wrong_beta = beta[:keep_count]
+    h_wrong = _layer_norm(x @ w1[:, keep], wrong_gamma, wrong_beta)
+    y_wrong = h_wrong @ w2[keep, :]
+    assert np.max(np.abs(y - y_wrong)) > 1e-2 * max(1.0, np.max(np.abs(y_correct)))
+
+
+def test_structured_pruning_decomposed_layer_norm_pow_exponent_not_two_is_declined():
+    # Pow's own exponent must be confirmed a genuine constant scalar 2 (the
+    # variance term LayerNorm's own math actually computes) -- any other
+    # exponent is a different computation this pass has no basis for treating
+    # as channel-pruning-safe, and must be declined outright, never guessed
+    # at.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(242)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _decomposed_layer_norm_model(w1, gamma, beta, w2, pow_exp=3.0)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_structured_pruning_decomposed_layer_norm_axis_not_last_is_declined():
+    # axis=-2 on a rank-2 [batch, C] tensor normalizes over the batch axis,
+    # not the trailing channel axis being pruned -- out of this hop's own
+    # declared scope, mirroring the fused-node axis=-2 decline case above.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(243)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _decomposed_layer_norm_model(w1, gamma, beta, w2, axis=-2)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_structured_pruning_decomposed_layer_norm_extra_root_consumer_is_declined():
+    # `up` (the decomposition's own root tensor) must be read by *exactly*
+    # the ReduceMean/Sub pair this shape expects -- a third reader (here, an
+    # extra Identity tapping the same tensor for a second graph output) means
+    # this pass can no longer prove pruning `up`'s channels leaves that third
+    # reader's own expectations intact, so the whole chain is declined
+    # outright, never partially matched.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(244)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    initializer = [
+        _f32(w1, "W1"),
+        onnx.numpy_helper.from_array(np.array(2.0, dtype=np.float32), "Two"),
+        onnx.numpy_helper.from_array(np.array(1e-5, dtype=np.float32), "Eps"),
+        _f32(gamma, "Gamma"),
+        _f32(beta, "Beta"),
+        _f32(w2, "W2"),
+    ]
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y, float[batch,{C}] Extra)
+        {{
+          up = MatMul(X, W1)
+          Extra = Identity(up)
+          mean = ReduceMean<axes=[-1]>(up)
+          centered = Sub(up, mean)
+          sq = Pow(centered, Two)
+          var = ReduceMean<axes=[-1]>(sq)
+          var_eps = Add(var, Eps)
+          std = Sqrt(var_eps)
+          normed = Div(centered, std)
+          scaled = Mul(normed, Gamma)
+          h = Add(scaled, Beta)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=16,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_structured_pruning_decomposed_layer_norm_extra_centered_consumer_is_declined():
+    # `centered` (Sub's own output) must likewise be read by *exactly* the
+    # Pow/Div pair this shape expects -- an extra reader is declined the
+    # same conservative way as an extra reader of `up` above.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(245)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    initializer = [
+        _f32(w1, "W1"),
+        onnx.numpy_helper.from_array(np.array(2.0, dtype=np.float32), "Two"),
+        onnx.numpy_helper.from_array(np.array(1e-5, dtype=np.float32), "Eps"),
+        _f32(gamma, "Gamma"),
+        _f32(beta, "Beta"),
+        _f32(w2, "W2"),
+    ]
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y, float[batch,{C}] Extra)
+        {{
+          up = MatMul(X, W1)
+          mean = ReduceMean<axes=[-1]>(up)
+          centered = Sub(up, mean)
+          Extra = Identity(centered)
+          sq = Pow(centered, Two)
+          var = ReduceMean<axes=[-1]>(sq)
+          var_eps = Add(var, Eps)
+          std = Sqrt(var_eps)
+          normed = Div(centered, std)
+          scaled = Mul(normed, Gamma)
+          h = Add(scaled, Beta)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=16,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_structured_pruning_decomposed_layer_norm_after_bias_add_matches_oracle():
+    # The decomposition's own root tensor (`up`, read twice) sitting right
+    # after an ordinary preceding hop (a per-channel bias `Add`, itself
+    # producing a tensor read twice) -- confirms the fix composes with an
+    # already-established chain_ops hop, not just a bare producer output
+    # feeding the decomposition directly (every test above starts the
+    # decomposition right at the MatMul's own raw output).
+    K, C, Out = 6, 12, 3
+    rng = np.random.default_rng(246)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    b1 = rng.standard_normal((C,)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(b1, "B1"),
+        onnx.numpy_helper.from_array(np.array(2.0, dtype=np.float32), "Two"),
+        onnx.numpy_helper.from_array(np.array(1e-5, dtype=np.float32), "Eps"),
+        _f32(gamma, "Gamma"),
+        _f32(beta, "Beta"),
+        _f32(w2, "W2"),
+    ]
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          mm = MatMul(X, W1)
+          up = Add(mm, B1)
+          mean = ReduceMean<axes=[-1]>(up)
+          centered = Sub(up, mean)
+          sq = Pow(centered, Two)
+          var = ReduceMean<axes=[-1]>(sq)
+          var_eps = Add(var, Eps)
+          std = Sqrt(var_eps)
+          normed = Div(centered, std)
+          scaled = Mul(normed, Gamma)
+          h = Add(scaled, Beta)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=16,
+    )
+    onnx.checker.check_model(model)
+
+    keep_count = C // 2
+    keep = _oracle_keep_indices(w1, keep_count)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Gamma"].dims) == [keep_count]
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    def _layer_norm(v, g, b, eps=1e-5):
+        mean = v.mean(axis=-1, keepdims=True)
+        var = v.var(axis=-1, keepdims=True)
+        return (v - mean) / np.sqrt(var + eps) * g + b
+
+    up_ref = x @ w1[:, keep] + b1[keep]
+    h_correct = _layer_norm(up_ref, gamma[keep], beta[keep])
+    y_correct = h_correct @ w2[keep, :]
+    np.testing.assert_allclose(y, y_correct, rtol=1e-4, atol=1e-4)
+
+
 def test_structured_pruning_gated_ffn_layer_norm_pass_through_matches_oracle():
     # Composition check: a gated (SwiGLU-style) combine feeding a plain
     # LayerNormalization before the down-projection -- confirms the hop
