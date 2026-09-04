@@ -400,11 +400,20 @@ jobs:
       # rather than left to just "transformers" resolving to latest. gemma
       # is Google DeepMind's own actively-maintained Flax NNX package
       # (that test's model needs onnxsim's rewrite_bool_where pass to even
-      # load on ORT -- see tests/test_rewrite_bool_where.py).
+      # load on ORT -- see tests/test_rewrite_bool_where.py). gemma>=4.0.0
+      # (released 2026-09-04) requires jax>=0.11, and jax2onnx 0.16.1's
+      # jax.core.Var()-construction plugin code
+      # (jax2onnx/plugins/jax/core/jit.py) hard-codes jax<0.11's 3-positional-
+      # argument Var.__init__ signature -- jax 0.11 dropped two of those
+      # positional args, so tracing through to_onnx() raises "TypeError:
+      # Var.__init__() takes 2 positional arguments but 4 were given" before
+      # onnxsim ever sees the graph. Pin gemma to the last release that still
+      # resolves jax<0.11 until jax2onnx releases a fix for the newer jax
+      # Var() signature.
       - name: Install onnxsim wheel + jax2onnx + transformers (Flax models) + gemma
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest jax2onnx "transformers<5" gemma
+          python -m pip install pytest jax2onnx "transformers<5" "gemma==3.3.0"
           python -m pip install wheelhouse/*.whl
       - name: Verify the installed wheel is used (not the source tree)
         working-directory: ${{ runner.temp }}

@@ -23,7 +23,7 @@ module therefore needs ``transformers < 5`` specifically (not just
 whenever the installed transformers is too new (or missing) rather than
 failing on an AttributeError. To run locally::
 
-    pip install jax2onnx "transformers<5"
+    pip install jax2onnx "transformers<5" "gemma==3.3.0"
     pip install --force-reinstall --no-deps .   # the onnxsim under test
     pytest tests/test_jax_real_model_integration.py -v
 
@@ -45,6 +45,17 @@ loadable on ONNX Runtime at all: Gemma's attention-mask construction
 combines two boolean masks via a jax `where` whose *data* operands are
 themselves bool, which ORT's CPU execution provider has no kernel for --
 see that pass's doc comment.
+
+``gemma`` is pinned to ``==3.3.0`` rather than left to resolve to latest:
+``gemma>=4.0.0`` requires ``jax>=0.11``, and jax2onnx 0.16.1's
+``jax.core.Var()``-construction plugin code
+(``jax2onnx/plugins/jax/core/jit.py``) is written against jax<0.11's
+3-positional-argument ``Var.__init__`` signature, which jax 0.11 changed --
+tracing through ``to_onnx()`` then raises ``TypeError: Var.__init__() takes
+2 positional arguments but 4 were given`` before onnxsim ever sees the
+graph. ``gemma==3.3.0`` is the last release that still resolves ``jax<0.11``;
+drop this pin once jax2onnx ships a fix for the newer ``jax`` ``Var()``
+signature.
 """
 
 import numpy as np
