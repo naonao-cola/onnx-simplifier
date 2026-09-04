@@ -673,6 +673,65 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "sparsity"_a);
 
+  // Embedding vocabulary pruning: shrinks a matched token-embedding
+  // table's vocabulary axis (plus, where a tied/untied lm_head exists, its
+  // own vocab-logits projection too) down to a caller-supplied explicit
+  // keep/drop set. Unlike every `apply_*` binding above, the pruned model
+  // this returns does not accept the original model's own token ids -- see
+  // EmbeddingVocabPruningResult/ApplyEmbeddingVocabPruning in
+  // structured_pruning_entry.h. Returned as a
+  // (model_bytes, matched, kept_token_ids, lm_head_pruned) tuple rather
+  // than bare bytes -- reconstructed into the real, public
+  // `onnxsim.pruning.EmbeddingPruningResult` dataclass by the Python
+  // wrapper (onnx_simplifier.py's own
+  // apply_embedding_vocab_pruning_cpp), which also derives `id_map` from
+  // `kept_token_ids` (trivial: `{tok: i for i, tok in
+  // enumerate(kept_token_ids)}`) rather than this needing to also cross
+  // the nanobind boundary as a separate map.
+  m.def(
+      "apply_embedding_vocab_pruning",
+      [](const py::bytes& model_proto_bytes,
+         std::optional<std::vector<int64_t>> keep_token_ids,
+         std::optional<std::vector<int64_t>> drop_token_ids,
+         std::optional<std::string> input_name)
+          -> std::tuple<py::bytes, bool, std::vector<int64_t>, bool> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyEmbeddingVocabPruning(
+            model, keep_token_ids, drop_token_ids, input_name);
+        std::string out;
+        result.model.SerializeToString(&out);
+        return {py::bytes(out.data(), out.size()), result.matched,
+                result.kept_token_ids, result.lm_head_pruned};
+      },
+      "model_bytes"_a, "keep_token_ids"_a.none(), "drop_token_ids"_a.none(),
+      "input_name"_a.none());
+
+  // The importance-ranked variant -- see EmbeddingVocabPruningResult/
+  // ApplyEmbeddingVocabMagnitudePruning in structured_pruning_entry.h.
+  // Same return shape as apply_embedding_vocab_pruning above.
+  m.def(
+      "apply_embedding_vocab_magnitude_pruning",
+      [](const py::bytes& model_proto_bytes, double sparsity,
+         std::optional<std::vector<int64_t>> protect_token_ids,
+         std::optional<std::string> input_name)
+          -> std::tuple<py::bytes, bool, std::vector<int64_t>, bool> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyEmbeddingVocabMagnitudePruning(
+            model, sparsity, protect_token_ids, input_name);
+        std::string out;
+        result.model.SerializeToString(&out);
+        return {py::bytes(out.data(), out.size()), result.matched,
+                result.kept_token_ids, result.lm_head_pruned};
+      },
+      "model_bytes"_a, "sparsity"_a = 0.5, "protect_token_ids"_a.none(),
+      "input_name"_a.none());
+
   // QuaRot (Ashkboos et al., 2024): rotation preprocessing plus INT4
   // round-to-nearest quantization of both the weight and the activation of
   // every MatMul/vanilla-Gemm layer. Data-free. See ApplyQuarot in

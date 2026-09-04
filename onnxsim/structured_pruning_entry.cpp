@@ -81,6 +81,7 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -13033,6 +13034,1180 @@ void ApplyQMoEChannelChains(onnx::GraphProto* graph,
   }
 }
 
+// --- MatMulBlockQuantizedFp4Weight/MatMulBlockQuantizedFp8Weight
+//     (NVFP4/FP8 block-quantized weight) structured pruning ----------------
+//
+// C++ port of pruning.py's own "MatMulBlockQuantizedFp4Weight/
+// MatMulBlockQuantizedFp8Weight (NVFP4/FP8 block-quantized weight)
+// structured pruning" section -- read that section's own top comment FIRST
+// (onnxsim/pruning.py, just above `_decode_e4m3_bytes`) for the full
+// empirical schema investigation (every input/output/attribute of both
+// `com.microsoft::MatMulBlockQuantizedFp8Weight`/`MatMulBlockQuantizedFp4
+// Weight`, confirmed live against onnxruntime rather than assumed) and the
+// full list of scope boundaries; this comment only covers what's specific
+// to (or narrowed further by) this C++ port.
+//
+// Both ops are weight-only block-quantized dense `MatMul` variants -- the
+// same *shape* of problem `MatMulNBits` (this file's own "MatMulNBits"
+// section, above) solves for int4/int8 weights -- for two different
+// low-precision FLOAT encodings instead: `Fp8Weight`'s `B` is one full
+// FLOAT8E4M3FN byte per weight element, `[N, K]`, no packing at all;
+// `Fp4Weight`'s `B` is `uint8[N, K/2]`, two E2M1 (4-bit) codes per byte, LOW
+// NIBBLE FIRST, packed FLAT across the WHOLE `K` axis -- unlike
+// `MatMulNBits`'s own `B`, which is packed BLOCK-RELATIVE (a fresh byte
+// boundary at every block start). This structural difference is why
+// `Fp4Weight`'s own consumer-role (K-axis) slice always unpacks/repacks a
+// FULL row's worth of `K` nibbles at once (SliceBlockQuantizedFp4Consumer
+// Blocks, below), never a per-block byte copy the way `MatMulNBits`'s own
+// consumer slice can get away with for its block-relative `B`. Both ops'
+// own scale table (`b_scale`/`weight_scale`) is one full value per
+// `(n, block)` pair -- never packed along ANY axis -- so slicing it is
+// always a plain row/column selection, no unpack/repack ever needed there.
+//
+// *** THE CORE CORRECTNESS INVARIANT, IDENTICAL TO `MatMulNBits`'s OWN ***:
+// "slice codes directly, never dequant-requant". A matched weight is only
+// ever DEQUANTIZED (BlockQuantizedFp8Dequantized/BlockQuantizedFp4
+// Dequantized, below) for IMPORTANCE RANKING; the rewrite always operates
+// on the ORIGINAL packed `B`/scale-table bytes.
+//
+// *** THE BLOCK-ALIGNMENT CONSTRAINT, IDENTICAL IN SPIRIT ***: a CONSUMER's
+// own `K` axis is quantized in whole `block_size`-sized blocks, so a
+// candidate keep-set is only ever applied to a quantized consumer when it
+// lands on whole block boundaries (MatMulNBitsBlockAlignedKeepBlocks,
+// REUSED UNCHANGED from the `MatMulNBits` section -- it depends only on
+// `keep`/`k_blocks`/`block_size` as plain integers, never on packing
+// details, so it applies here without modification). `Fp4Weight` adds ONE
+// extra condition (Fp4BlockAlignedKeepBlocks, below): the RESULTING `K`
+// (`len(keep_blocks) * block_size`) must itself be even, since the live
+// schema derives `K` as exactly `2 * B.shape[1]` with no padding-nibble
+// concept -- an odd resulting `K` cannot be honestly represented and is
+// declined the same way a non-block-aligned keep-set already is.
+//
+// Neither op's live schema documents a `block_size` power-of-two/minimum
+// constraint (unlike `MatMulNBits`'s explicit one) -- so, unlike
+// MatMulNBitsValidBlockSizes, this section does NOT restrict `block_size`
+// to a fixed set; any `block_size >= 1` is accepted so long as the
+// ORIGINAL `K` is an exact multiple of it (a padded/partial final block is
+// declined at the matcher level, mirroring `MatMulNBits`'s identical
+// stance for the identical reason: no verified kernel behavior for that
+// case). Neither op's matched struct needs to rewrite an `N`/`K` node
+// attribute after slicing either (unlike `MatMulNBits`, which stores both
+// as explicit attributes) -- both live schemas derive `N`/`K` purely from
+// `B`'s own tensor shape at graph-execution time, so resizing the tensor
+// alone is sufficient; `block_size` itself is never touched by a prune.
+//
+// A GLOBAL (not per-row/per-block) scalar operand -- `Fp8Weight`'s optional
+// `a_scale`, `Fp4Weight`'s required `weight_scale_2` and optional
+// `input_scale` -- is validated at match time (present, FLOAT32, scalar-or-
+// [1]-shaped) but NEVER sliced, in EITHER role, mirroring pruning.py's own
+// deliberate departure from `MatMulNBits`'s blanket single-consumer-tied-
+// tensor policy for these specific operands (see pruning.py's own section
+// comment for the full reasoning: none of these appears, at all, in either
+// op's own dequantization formula in a per-row/per-block way). `weight_
+// scale_2` (`Fp4Weight`'s own required global scale) is still READ, by
+// name, at Apply time for importance-ranking dequantization -- but the
+// tensor itself is left byte-for-byte untouched either way.
+//
+// `bias` is OUT OF SCOPE ENTIRELY in this C++ port, a real, deliberate
+// narrowing beyond pruning.py's own scope: both live schemas type `bias`
+// ALWAYS FLOAT16/BFLOAT16 (never FLOAT32, unlike every other bias
+// convention this file otherwise handles), and this file has NO FLOAT16/
+// BFLOAT16 tensor read/write support anywhere yet (see the `MatMulNBits`
+// section's own top comment for this same established precedent, and its
+// own identical narrowing for `scales`/`zero_points`/`bias`). A node with
+// any `bias` input present (a name at that position, non-empty) is simply
+// DECLINED at the matcher level -- never mishandled, never silently
+// dropped from a graph this pass otherwise touches.
+//
+// The E4M3 byte decode (`Fp8Weight`'s own `B`, already tagged
+// FLOAT8E4M3FN in-graph, AND `Fp4Weight`'s own `weight_scale`, raw `uint8`
+// bytes that are E4M3 codes per the live schema) reuses QMoEFloat8E4M3Table
+// UNCHANGED from the QMoE section, above -- the identical standard E4M3FN
+// codebook (byte value -> double), not a fresh table: `ReadUint8Tensor`
+// already reads raw bytes regardless of a tensor's own declared dtype (it
+// only ever looks at `raw_data`/`int32_data`, never the dtype tag), so no
+// FLOAT8E4M3FN-specific tensor reader is needed to decode `Fp8Weight`'s own
+// `B` this way either. `Fp4Weight`'s own E2M1 magnitude table reuses
+// QMoEE2M1Table UNCHANGED for the identical reason pruning.py's own
+// `_matmul_block_quantized_fp4_dequantized` reuses `_E2M1_MAGNITUDE`/
+// `_e2m1_decode` unchanged from its own QMoE nvfp4 section. `Fp4Weight`'s
+// own flat nibble packing reuses UnpackNibblesLastAxis/PackNibblesLastAxis
+// UNCHANGED from the `MatMulNBits` section (bits fixed at 4, no `bits`
+// parameter needed) -- both already operate on a `[outer, packed_width]`
+// flat buffer, exactly the shape `Fp4Weight`'s own flat-across-K `B`
+// needs, whether `outer` is `N` (producer-role whole-row copy, no
+// unpack/repack needed at all) or -- for the consumer-role slice -- still
+// `N`, now selecting `count` = the new `K` out of each row's full nibble
+// span. The plain-float peer side of a mixed chain reuses
+// PlainMatMulNBitsPeer/MatchPlainMatMulNBitsPeer UNCHANGED from the
+// `MatMulNBits` section too (same "quantized transformer block feeding an
+// unquantized lm_head" export shape that section's own top comment
+// motivates).
+//
+// `Fp8Weight` and `Fp4Weight` are NEVER mixed with each other, or with
+// `MatMulNBits`/`MatMulBnb4`/QDQ, in one chain -- two entirely separate
+// chain-finding passes below (FindFp8BlockQuantizedChains/
+// FindFp4BlockQuantizedChains), each requiring at least one side to
+// actually be its own op (an all-plain-float pair is FindChains's own job,
+// not duplicated here), mirroring pruning.py's own identical stance. No
+// grouped/gated (SwiGLU/GeGLU) pair, residual/Concat-merge topology, or
+// fused-MLP/QKV analogue is matched -- only the plain single producer ->
+// [zero or more shape-preserving unary activations] -> single consumer
+// chain, identical in spirit to `MatMulNBits`'s own base (non-gated,
+// non-fused) chain matching, and simpler: neither op has any such fused-op
+// analogue at all as of this writing (see pruning.py's own section comment).
+//
+// Wiring: pruning.py itself exposes these as two separate top-level
+// functions (`apply_structured_pruning_matmul_block_quantized_fp8`/`_fp4`),
+// but -- mirroring this port's own established `MatMulNBits`/`MatMulBnb4`/
+// QDQ precedent (each still just one more call inside `ApplyStructuredPruning`
+// despite having its own separately-named Python top-level function) -- both
+// are folded directly into `ApplyStructuredPruning`'s own existing
+// `TouchedState`/`IterSubgraphs` loop below (two more application passes
+// over each graph) rather than getting new standalone top-level C++ entry
+// points.
+
+// A matched `com.microsoft::MatMulBlockQuantizedFp8Weight` node's weight
+// operands -- see this section's own top comment for the schema facts this
+// depends on. Every tensor stored by NAME, mirroring MatMulNBitsWeight's
+// own established convention (a match is built against a read-only InitMap;
+// the later Apply step rebuilds its own mutable name->TensorProto* map).
+// `node` is safe to store as a pointer for the identical reason
+// MatMulNBitsWeight's own comment gives: it comes from
+// `graph->mutable_node(i)`, and no node is ever inserted/removed by this
+// whole pruning pass. Unlike MatMulNBitsWeight, there is no `N`/`K` node
+// attribute to rewrite after slicing (see this section's own top comment),
+// and no `bias`/`a_scale` field at all -- `bias` is declined entirely at
+// the matcher (see top comment), `a_scale` is validated but never stored
+// (never sliced in either role, and never needed for dequantization either
+// -- unlike `Fp4Weight`'s own `weight_scale_2`, `a_scale` doesn't even
+// appear in `Fp8Weight`'s own dequantization formula).
+struct BlockQuantizedFp8Weight {
+  onnx::NodeProto* node = nullptr;
+  std::string b_name;        // FLOAT8E4M3FN [N, K], no packing.
+  std::string b_scale_name;  // FLOAT [N, k_blocks].
+  int64_t N = 0;
+  int64_t K = 0;
+  int64_t block_size = 0;
+  int64_t k_blocks = 0;
+};
+
+// A matched `com.microsoft::MatMulBlockQuantizedFp4Weight` node's weight
+// operands -- see this section's own top comment. `weight_scale_2_name` is
+// stored (unlike `Fp8Weight`'s never-needed `a_scale`) because `Fp4Weight`'s
+// own dequantization formula DOES need this global scale's own value for
+// importance ranking (BlockQuantizedFp4Dequantized, below) -- the tensor
+// itself is still never resliced.
+struct BlockQuantizedFp4Weight {
+  onnx::NodeProto* node = nullptr;
+  std::string b_name;               // UINT8 [N, K/2], flat nibble-packed.
+  std::string weight_scale_name;    // UINT8 (raw E4M3 bytes) [N, k_blocks].
+  std::string weight_scale_2_name;  // FLOAT scalar (global scale).
+  int64_t N = 0;
+  int64_t K = 0;
+  int64_t block_size = 0;
+  int64_t k_blocks = 0;
+};
+
+// True for a 0-D (`[]`) or single-element 1-D (`[1]`) shape -- the two ways
+// a "scalar" global scale (`a_scale`/`weight_scale_2`/`input_scale`) might
+// reasonably be exported, mirroring pruning.py's own
+// `_block_quantized_scalar_dims_ok`.
+bool BlockQuantizedScalarDimsOk(const onnx::TensorProto& t) {
+  return t.dims_size() == 0 || (t.dims_size() == 1 && t.dims(0) == 1);
+}
+
+// If `node` is a `com.microsoft::MatMulBlockQuantizedFp8Weight` node
+// matching every scope boundary this section's own top comment documents,
+// returns the match -- mirrors pruning.py's own
+// `_match_matmul_block_quantized_fp8`. `nullopt` whenever anything is
+// ambiguous or out of the empirically-verified scope, rather than guessing.
+std::optional<BlockQuantizedFp8Weight> MatchMatMulBlockQuantizedFp8(
+    onnx::NodeProto* node, const InitMap& init_map,
+    const ConsumerMap& consumers_of) {
+  if (node->op_type() != "MatMulBlockQuantizedFp8Weight" ||
+      node->domain() != kComMicrosoftDomain) {
+    return std::nullopt;
+  }
+  if (node->input_size() < 3 || node->output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& a_name = node->input(0);
+  const std::string& b_name = node->input(1);
+  const std::string& scale_name = node->input(2);
+  if (a_name.empty() || b_name.empty() || scale_name.empty()) {
+    return std::nullopt;
+  }
+  const std::string a_scale_name =
+      (node->input_size() > 3) ? node->input(3) : std::string();
+  const std::string bias_name =
+      (node->input_size() > 4) ? node->input(4) : std::string();
+  if (!bias_name.empty()) {
+    return std::nullopt;  // Always FLOAT16/BFLOAT16 -- unsupported here, see
+                          // this section's own top comment.
+  }
+
+  const int64_t block_size =
+      MatMulNBitsIntAttrOr(*node, "block_size", 128);  // schema default.
+  if (block_size < 1) {
+    return std::nullopt;
+  }
+
+  auto b_it = init_map.find(b_name);
+  auto s_it = init_map.find(scale_name);
+  if (b_it == init_map.end() || s_it == init_map.end()) {
+    return std::nullopt;  // Non-constant B/b_scale -- can't safely slice.
+  }
+  const onnx::TensorProto* b_init = b_it->second;
+  const onnx::TensorProto* scale_init = s_it->second;
+  if (b_init->data_type() != onnx::TensorProto::FLOAT8E4M3FN) {
+    return std::nullopt;
+  }
+  if (b_init->dims_size() != 2) {
+    return std::nullopt;
+  }
+  const int64_t n = b_init->dims(0);
+  const int64_t k = b_init->dims(1);
+  if (n <= 0 || k <= 0 || k % block_size != 0) {
+    return std::nullopt;  // Padded/partial final block -- declined.
+  }
+  const int64_t k_blocks = k / block_size;
+
+  if (scale_init->data_type() != onnx::TensorProto::FLOAT) {
+    return std::nullopt;
+  }
+  if (!MatMulNBitsDimsEqual(*scale_init, {n, k_blocks})) {
+    return std::nullopt;
+  }
+
+  if (!a_scale_name.empty()) {
+    auto as_it = init_map.find(a_scale_name);
+    if (as_it == init_map.end() ||
+        as_it->second->data_type() != onnx::TensorProto::FLOAT ||
+        !BlockQuantizedScalarDimsOk(*as_it->second)) {
+      return std::nullopt;  // Non-constant, dtype-mismatched, or non-scalar.
+    }
+    // a_scale is never sliced in either role (see this section's own top
+    // comment) -- deliberately NOT subject to the single-consumer bar below.
+  }
+
+  for (const auto& nm : {b_name, scale_name}) {
+    if (ConsumerCount(consumers_of, nm) != 1) {
+      return std::nullopt;  // Shared/tied tensor -- another node reads it.
+    }
+  }
+
+  BlockQuantizedFp8Weight w;
+  w.node = node;
+  w.b_name = b_name;
+  w.b_scale_name = scale_name;
+  w.N = n;
+  w.K = k;
+  w.block_size = block_size;
+  w.k_blocks = k_blocks;
+  return w;
+}
+
+// If `node` is a `com.microsoft::MatMulBlockQuantizedFp4Weight` node
+// matching every scope boundary this section's own top comment documents,
+// returns the match -- mirrors pruning.py's own
+// `_match_matmul_block_quantized_fp4`.
+std::optional<BlockQuantizedFp4Weight> MatchMatMulBlockQuantizedFp4(
+    onnx::NodeProto* node, const InitMap& init_map,
+    const ConsumerMap& consumers_of) {
+  if (node->op_type() != "MatMulBlockQuantizedFp4Weight" ||
+      node->domain() != kComMicrosoftDomain) {
+    return std::nullopt;
+  }
+  if (node->input_size() < 4 || node->output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& a_name = node->input(0);
+  const std::string& b_name = node->input(1);
+  const std::string& ws_name = node->input(2);
+  const std::string& ws2_name = node->input(3);
+  if (a_name.empty() || b_name.empty() || ws_name.empty() || ws2_name.empty()) {
+    return std::nullopt;
+  }
+  const std::string input_scale_name =
+      (node->input_size() > 4) ? node->input(4) : std::string();
+  const std::string bias_name =
+      (node->input_size() > 5) ? node->input(5) : std::string();
+  if (!bias_name.empty()) {
+    return std::nullopt;  // Always FLOAT16/BFLOAT16 -- unsupported here.
+  }
+
+  const int64_t block_size =
+      MatMulNBitsIntAttrOr(*node, "block_size", 16);  // schema default.
+  if (block_size < 1) {
+    return std::nullopt;
+  }
+
+  auto b_it = init_map.find(b_name);
+  auto ws_it = init_map.find(ws_name);
+  auto ws2_it = init_map.find(ws2_name);
+  if (b_it == init_map.end() || ws_it == init_map.end() ||
+      ws2_it == init_map.end()) {
+    return std::nullopt;  // Non-constant B/weight_scale/weight_scale_2.
+  }
+  const onnx::TensorProto* b_init = b_it->second;
+  const onnx::TensorProto* ws_init = ws_it->second;
+  const onnx::TensorProto* ws2_init = ws2_it->second;
+  if (b_init->data_type() != onnx::TensorProto::UINT8) {
+    return std::nullopt;
+  }
+  if (b_init->dims_size() != 2) {
+    return std::nullopt;
+  }
+  const int64_t n = b_init->dims(0);
+  const int64_t half_k = b_init->dims(1);
+  const int64_t k = 2 * half_k;  // Schema: "K = 2 * B.shape[1]" -- always even.
+  if (n <= 0 || k <= 0 || k % block_size != 0) {
+    return std::nullopt;  // Padded/partial final block -- declined.
+  }
+  const int64_t k_blocks = k / block_size;
+
+  if (ws_init->data_type() != onnx::TensorProto::UINT8) {
+    return std::nullopt;  // Raw E4M3 bytes stored as uint8, per live schema.
+  }
+  if (!MatMulNBitsDimsEqual(*ws_init, {n, k_blocks})) {
+    return std::nullopt;
+  }
+
+  if (ws2_init->data_type() != onnx::TensorProto::FLOAT ||
+      !BlockQuantizedScalarDimsOk(*ws2_init)) {
+    return std::nullopt;
+  }
+
+  if (!input_scale_name.empty()) {
+    auto is_it = init_map.find(input_scale_name);
+    if (is_it == init_map.end() ||
+        is_it->second->data_type() != onnx::TensorProto::FLOAT ||
+        !BlockQuantizedScalarDimsOk(*is_it->second)) {
+      return std::nullopt;
+    }
+    // Never sliced -- a no-op on the weight-only path anyway, per the live
+    // schema's own doc string (see this section's own top comment).
+  }
+
+  for (const auto& nm : {b_name, ws_name}) {
+    if (ConsumerCount(consumers_of, nm) != 1) {
+      return std::nullopt;  // Shared/tied tensor -- another node reads it.
+    }
+  }
+
+  BlockQuantizedFp4Weight w;
+  w.node = node;
+  w.b_name = b_name;
+  w.weight_scale_name = ws_name;
+  w.weight_scale_2_name = ws2_name;
+  w.N = n;
+  w.K = k;
+  w.block_size = block_size;
+  w.k_blocks = k_blocks;
+  return w;
+}
+
+// Mirrors pruning.py's own `_Fp8ChainSide = Union[_BlockQuantizedFp8Weight,
+// _PlainMatMulNBitsPeer]`/`_Fp4ChainSide`.
+using Fp8ChainSide =
+    std::variant<BlockQuantizedFp8Weight, PlainMatMulNBitsPeer>;
+using Fp4ChainSide =
+    std::variant<BlockQuantizedFp4Weight, PlainMatMulNBitsPeer>;
+
+std::string Fp8ChainSideKey(const Fp8ChainSide& side) {
+  if (const auto* w = std::get_if<BlockQuantizedFp8Weight>(&side)) {
+    return w->b_name;
+  }
+  return std::get<PlainMatMulNBitsPeer>(side).w_name;
+}
+
+std::string Fp4ChainSideKey(const Fp4ChainSide& side) {
+  if (const auto* w = std::get_if<BlockQuantizedFp4Weight>(&side)) {
+    return w->b_name;
+  }
+  return std::get<PlainMatMulNBitsPeer>(side).w_name;
+}
+
+onnx::NodeProto* Fp8ChainSideNode(const Fp8ChainSide& side) {
+  if (const auto* w = std::get_if<BlockQuantizedFp8Weight>(&side)) {
+    return w->node;
+  }
+  return std::get<PlainMatMulNBitsPeer>(side).node;
+}
+
+onnx::NodeProto* Fp4ChainSideNode(const Fp4ChainSide& side) {
+  if (const auto* w = std::get_if<BlockQuantizedFp4Weight>(&side)) {
+    return w->node;
+  }
+  return std::get<PlainMatMulNBitsPeer>(side).node;
+}
+
+// The full float64 `[N, K]` dequantized weight matrix `w` refers to, for
+// IMPORTANCE RANKING ONLY -- never written back. `dequant[n, k] =
+// fp8_e4m3(B[n, k]) * b_scale[n, k / block_size]` -- mirrors pruning.py's
+// own `_matmul_block_quantized_fp8_dequantized`. `ReadUint8Tensor` reads
+// `B`'s own raw bytes regardless of its FLOAT8E4M3FN dtype tag (see this
+// section's own top comment), so `QMoEFloat8E4M3Table` decodes them
+// directly, the same way it already decodes QMoE's own FLOAT8E4M3FN block
+// scales.
+std::vector<double> BlockQuantizedFp8Dequantized(
+    const BlockQuantizedFp8Weight& w,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map) {
+  const onnx::TensorProto* b_init = init_map.at(w.b_name);
+  const onnx::TensorProto* scale_init = init_map.at(w.b_scale_name);
+  const std::vector<uint8_t> b_raw = ReadUint8Tensor(*b_init);  // [N, K] bytes.
+  const std::vector<float> scales =
+      ReadFloatTensor(*scale_init);  // [N, k_blocks].
+  const auto& f8_table = QMoEFloat8E4M3Table();
+
+  std::vector<double> out(static_cast<size_t>(w.N * w.K));
+  for (int64_t n = 0; n < w.N; ++n) {
+    for (int64_t kb = 0; kb < w.k_blocks; ++kb) {
+      const double s =
+          static_cast<double>(scales[static_cast<size_t>(n * w.k_blocks + kb)]);
+      for (int64_t j = 0; j < w.block_size; ++j) {
+        const int64_t idx = n * w.K + kb * w.block_size + j;
+        out[static_cast<size_t>(idx)] =
+            f8_table[b_raw[static_cast<size_t>(idx)]] * s;
+      }
+    }
+  }
+  return out;
+}
+
+// The full float64 `[N, K]` dequantized weight matrix `w` refers to, for
+// IMPORTANCE RANKING ONLY -- never written back. `dequant[n, k] =
+// e2m1(B[n, k]) * weight_scale_2 * e4m3(weight_scale[n, k / block_size])` --
+// mirrors pruning.py's own `_matmul_block_quantized_fp4_dequantized`.
+// Reuses UnpackNibblesLastAxis (`B`'s own flat, whole-row nibble packing)
+// and QMoEE2M1Table/QMoEFloat8E4M3Table for the weight codes/block scale.
+std::vector<double> BlockQuantizedFp4Dequantized(
+    const BlockQuantizedFp4Weight& w,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map) {
+  const onnx::TensorProto* b_init = init_map.at(w.b_name);
+  const onnx::TensorProto* ws_init = init_map.at(w.weight_scale_name);
+  const onnx::TensorProto* ws2_init = init_map.at(w.weight_scale_2_name);
+
+  const std::vector<uint8_t> b_raw = ReadUint8Tensor(*b_init);  // [N, K/2].
+  const std::vector<uint8_t> codes =
+      UnpackNibblesLastAxis(b_raw, w.N, w.K / 2, w.K);  // [N, K] in [0, 16).
+  const std::vector<uint8_t> ws_raw =
+      ReadUint8Tensor(*ws_init);  // [N, k_blocks] raw E4M3 bytes.
+  const std::vector<float> ws2 = ReadFloatTensor(*ws2_init);
+  const double global_scale = static_cast<double>(ws2.at(0));
+
+  const auto& e2m1_table = QMoEE2M1Table();
+  const auto& f8_table = QMoEFloat8E4M3Table();
+
+  std::vector<double> out(static_cast<size_t>(w.N * w.K));
+  for (int64_t n = 0; n < w.N; ++n) {
+    for (int64_t kb = 0; kb < w.k_blocks; ++kb) {
+      const double block_scale =
+          f8_table[ws_raw[static_cast<size_t>(n * w.k_blocks + kb)]];
+      for (int64_t j = 0; j < w.block_size; ++j) {
+        const int64_t idx = n * w.K + kb * w.block_size + j;
+        const double mag = e2m1_table[codes[static_cast<size_t>(idx)]];
+        out[static_cast<size_t>(idx)] = mag * block_scale * global_scale;
+      }
+    }
+  }
+  return out;
+}
+
+// `[N, K]` float64 view of one chain PRODUCER's own weight, for IMPORTANCE
+// RANKING ONLY -- mirrors pruning.py's own
+// `_fp8_chain_producer_weight_nk`/`_fp4_chain_producer_weight_nk`.
+std::vector<double> Fp8SideProducerWeightNK(
+    const Fp8ChainSide& side,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map) {
+  if (const auto* w = std::get_if<BlockQuantizedFp8Weight>(&side)) {
+    return BlockQuantizedFp8Dequantized(*w, init_map);
+  }
+  const auto& p = std::get<PlainMatMulNBitsPeer>(side);
+  const onnx::TensorProto* wt = init_map.at(p.w_name);
+  const std::vector<float> data = ReadFloatTensor(*wt);
+  std::vector<float> nk = p.weight_transposed
+                              ? data
+                              : TransposeFlat(data, wt->dims(0), wt->dims(1));
+  return std::vector<double>(nk.begin(), nk.end());
+}
+
+std::vector<double> Fp4SideProducerWeightNK(
+    const Fp4ChainSide& side,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map) {
+  if (const auto* w = std::get_if<BlockQuantizedFp4Weight>(&side)) {
+    return BlockQuantizedFp4Dequantized(*w, init_map);
+  }
+  const auto& p = std::get<PlainMatMulNBitsPeer>(side);
+  const onnx::TensorProto* wt = init_map.at(p.w_name);
+  const std::vector<float> data = ReadFloatTensor(*wt);
+  std::vector<float> nk = p.weight_transposed
+                              ? data
+                              : TransposeFlat(data, wt->dims(0), wt->dims(1));
+  return std::vector<double>(nk.begin(), nk.end());
+}
+
+// --- Slicing, mirroring _slice_block_quantized_fp8_producer_rows/
+// _slice_block_quantized_fp4_producer_rows/..._consumer_blocks -------------
+
+// Slices `w`'s own N (output-channel) axis to `keep` (ascending indices) --
+// the producer role. `B`/`b_scale` are both row-sliced directly (their
+// leading dim IS `N`, and NEITHER is packed along `N` at all -- see this
+// section's own top comment), a plain row-slice with no byte-parity hazard
+// whatsoever. No node attribute needs updating (see top comment).
+void SliceBlockQuantizedFp8ProducerRows(
+    const BlockQuantizedFp8Weight& w,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    const std::vector<int64_t>& keep) {
+  const int64_t kc = static_cast<int64_t>(keep.size());
+
+  onnx::TensorProto* b = init_map.at(w.b_name);
+  const std::vector<uint8_t> b_data = ReadUint8Tensor(*b);  // [N, K].
+  std::vector<uint8_t> b_out(static_cast<size_t>(kc * w.K));
+  for (int64_t i = 0; i < kc; ++i) {
+    std::memcpy(b_out.data() + i * w.K, b_data.data() + keep[i] * w.K,
+                static_cast<size_t>(w.K));
+  }
+  SetFloat8E4M3TensorData(b, {kc, w.K}, b_out);
+
+  onnx::TensorProto* scale = init_map.at(w.b_scale_name);
+  const std::vector<float> s_data = ReadFloatTensor(*scale);  // [N, k_blocks].
+  std::vector<float> s_out(static_cast<size_t>(kc * w.k_blocks));
+  for (int64_t i = 0; i < kc; ++i) {
+    std::memcpy(s_out.data() + i * w.k_blocks,
+                s_data.data() + keep[i] * w.k_blocks,
+                static_cast<size_t>(w.k_blocks) * sizeof(float));
+  }
+  SetFloatTensorData(scale, {kc, w.k_blocks}, s_out);
+}
+
+// Slices `w`'s own N (output-channel) axis to `keep` -- the producer role.
+// `B` is packed FLAT across the whole `K` axis (per this section's own top
+// comment) but never ACROSS rows -- a byte never straddles two different
+// `N` rows -- so a row-slice is whole-byte-safe with no unpack/repack
+// needed at all. `weight_scale` is a plain row-slice too (not packed along
+// `N`).
+void SliceBlockQuantizedFp4ProducerRows(
+    const BlockQuantizedFp4Weight& w,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    const std::vector<int64_t>& keep) {
+  const int64_t kc = static_cast<int64_t>(keep.size());
+  const int64_t half_k = w.K / 2;
+
+  onnx::TensorProto* b = init_map.at(w.b_name);
+  const std::vector<uint8_t> b_data = ReadUint8Tensor(*b);  // [N, K/2].
+  std::vector<uint8_t> b_out(static_cast<size_t>(kc * half_k));
+  for (int64_t i = 0; i < kc; ++i) {
+    std::memcpy(b_out.data() + i * half_k, b_data.data() + keep[i] * half_k,
+                static_cast<size_t>(half_k));
+  }
+  SetUint8TensorData(b, {kc, half_k}, b_out);
+
+  onnx::TensorProto* ws = init_map.at(w.weight_scale_name);
+  const std::vector<uint8_t> ws_data = ReadUint8Tensor(*ws);  // [N, k_blocks].
+  std::vector<uint8_t> ws_out(static_cast<size_t>(kc * w.k_blocks));
+  for (int64_t i = 0; i < kc; ++i) {
+    std::memcpy(ws_out.data() + i * w.k_blocks,
+                ws_data.data() + keep[i] * w.k_blocks,
+                static_cast<size_t>(w.k_blocks));
+  }
+  SetUint8TensorData(ws, {kc, w.k_blocks}, ws_out);
+}
+
+// Drops entire `k_blocks`-axis blocks NOT in `keep_blocks` (ascending block
+// indices) from `w`'s own `B`/`b_scale` -- the consumer role. `B` has NO
+// sub-byte packing at all for this op, so this is a whole-block byte copy
+// per `(n, kept k_block)` pair -- no unpack/repack needed, unlike
+// `Fp4Weight`'s own packed `B` below. Never invoked with a non-block-aligned
+// `keep_blocks` (MatMulNBitsBlockAlignedKeepBlocks already validates it).
+void SliceBlockQuantizedFp8ConsumerBlocks(
+    const BlockQuantizedFp8Weight& w,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    const std::vector<int64_t>& keep_blocks) {
+  const int64_t new_kb = static_cast<int64_t>(keep_blocks.size());
+  const int64_t new_k = new_kb * w.block_size;
+
+  onnx::TensorProto* b = init_map.at(w.b_name);
+  const std::vector<uint8_t> b_data = ReadUint8Tensor(*b);  // [N, K].
+  std::vector<uint8_t> b_out(static_cast<size_t>(w.N * new_k));
+  for (int64_t n = 0; n < w.N; ++n) {
+    for (int64_t j = 0; j < new_kb; ++j) {
+      const uint8_t* src =
+          b_data.data() + n * w.K + keep_blocks[j] * w.block_size;
+      uint8_t* dst = b_out.data() + n * new_k + j * w.block_size;
+      std::memcpy(dst, src, static_cast<size_t>(w.block_size));
+    }
+  }
+  SetFloat8E4M3TensorData(b, {w.N, new_k}, b_out);
+
+  onnx::TensorProto* scale = init_map.at(w.b_scale_name);
+  const std::vector<float> s_data = ReadFloatTensor(*scale);  // [N, k_blocks].
+  std::vector<float> s_out(static_cast<size_t>(w.N * new_kb));
+  for (int64_t n = 0; n < w.N; ++n) {
+    for (int64_t j = 0; j < new_kb; ++j) {
+      s_out[static_cast<size_t>(n * new_kb + j)] =
+          s_data[static_cast<size_t>(n * w.k_blocks + keep_blocks[j])];
+    }
+  }
+  SetFloatTensorData(scale, {w.N, new_kb}, s_out);
+}
+
+// pruning.py's own `_fp4_block_aligned_keep_blocks`: wraps
+// MatMulNBitsBlockAlignedKeepBlocks with ONE additional `Fp4Weight`-specific
+// decline -- the resulting `K` (`len(keep_blocks) * block_size`) must
+// itself be even, since this op's own `B` has no padding-nibble concept
+// (the live schema derives `K` as exactly `2 * B.shape[1]`, see this
+// section's own top comment). Returns `nullopt` (the same "leave this chain
+// completely untouched" outcome a non-block-aligned keep-set already gets)
+// when either check fails.
+std::optional<std::vector<int64_t>> Fp4BlockAlignedKeepBlocks(
+    const std::vector<int64_t>& keep, int64_t k_blocks, int64_t block_size) {
+  auto keep_blocks =
+      MatMulNBitsBlockAlignedKeepBlocks(keep, k_blocks, block_size);
+  if (!keep_blocks) {
+    return std::nullopt;
+  }
+  if ((static_cast<int64_t>(keep_blocks->size()) * block_size) % 2 != 0) {
+    return std::nullopt;  // Resulting K would be odd -- declined.
+  }
+  return keep_blocks;
+}
+
+// Drops entire `k_blocks`-axis blocks NOT in `keep_blocks` from `w`'s own
+// `B`/`weight_scale` -- the consumer role. Never invoked with a keep-set
+// Fp4BlockAlignedKeepBlocks didn't already validate (block-aligned AND even
+// resulting K). Unlike the producer-side row-slice above, `B` genuinely
+// must be unpacked/re-sliced/re-packed here: its own nibble packing is FLAT
+// across the whole `K` axis (not block-relative like `MatMulNBits`'s own
+// `B`), so this always unpacks a FULL row's worth of `K` nibbles, takes the
+// kept element positions, and re-packs -- exact and padding-free because
+// Fp4BlockAlignedKeepBlocks already guarantees an even element count.
+// `weight_scale` has no packing along this axis at all, so it's a plain
+// block-index column slice.
+void SliceBlockQuantizedFp4ConsumerBlocks(
+    const BlockQuantizedFp4Weight& w,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    const std::vector<int64_t>& keep_blocks) {
+  const int64_t new_kb = static_cast<int64_t>(keep_blocks.size());
+  const int64_t new_k = new_kb * w.block_size;  // Guaranteed even by caller.
+
+  std::vector<int64_t> keep_elems(static_cast<size_t>(new_k));
+  {
+    int64_t idx = 0;
+    for (int64_t j = 0; j < new_kb; ++j) {
+      const int64_t base = keep_blocks[j] * w.block_size;
+      for (int64_t e = 0; e < w.block_size; ++e) {
+        keep_elems[static_cast<size_t>(idx++)] = base + e;
+      }
+    }
+  }
+
+  onnx::TensorProto* b = init_map.at(w.b_name);
+  const std::vector<uint8_t> b_data = ReadUint8Tensor(*b);  // [N, K/2].
+  const std::vector<uint8_t> codes =
+      UnpackNibblesLastAxis(b_data, w.N, w.K / 2, w.K);
+  std::vector<uint8_t> selected(static_cast<size_t>(w.N * new_k));
+  for (int64_t n = 0; n < w.N; ++n) {
+    for (int64_t j = 0; j < new_k; ++j) {
+      selected[static_cast<size_t>(n * new_k + j)] =
+          codes[static_cast<size_t>(n * w.K + keep_elems[j])];
+    }
+  }
+  const std::vector<uint8_t> repacked =
+      PackNibblesLastAxis(selected, w.N, new_k);
+  SetUint8TensorData(b, {w.N, new_k / 2}, repacked);
+
+  onnx::TensorProto* ws = init_map.at(w.weight_scale_name);
+  const std::vector<uint8_t> ws_data = ReadUint8Tensor(*ws);  // [N, k_blocks].
+  std::vector<uint8_t> ws_out(static_cast<size_t>(w.N * new_kb));
+  for (int64_t n = 0; n < w.N; ++n) {
+    for (int64_t j = 0; j < new_kb; ++j) {
+      ws_out[static_cast<size_t>(n * new_kb + j)] =
+          ws_data[static_cast<size_t>(n * w.k_blocks + keep_blocks[j])];
+    }
+  }
+  SetUint8TensorData(ws, {w.N, new_kb}, ws_out);
+}
+
+// Slices one chain PRODUCER's own output channels to `keep` -- dispatches to
+// SliceBlockQuantizedFp8ProducerRows for a `Fp8Weight` side, or a direct
+// SliceProducerWeight (plus its own bias, if present -- the PLAIN-FLOAT
+// peer's own bias, always FLOAT32, unrelated to `Fp8Weight`'s own declined
+// FLOAT16/BFLOAT16 `bias`) for a plain-float peer. Mirrors pruning.py's own
+// `_slice_fp8_chain_producer`.
+void SliceFp8SideProducer(
+    const Fp8ChainSide& side,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    const std::vector<int64_t>& keep) {
+  if (const auto* w = std::get_if<BlockQuantizedFp8Weight>(&side)) {
+    SliceBlockQuantizedFp8ProducerRows(*w, init_map, keep);
+    return;
+  }
+  const auto& p = std::get<PlainMatMulNBitsPeer>(side);
+  SliceProducerWeight(init_map.at(p.w_name), p.weight_transposed, keep, false);
+  if (p.bias_name) {
+    SliceLastAxis(init_map.at(*p.bias_name), keep);
+  }
+}
+
+void SliceFp4SideProducer(
+    const Fp4ChainSide& side,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    const std::vector<int64_t>& keep) {
+  if (const auto* w = std::get_if<BlockQuantizedFp4Weight>(&side)) {
+    SliceBlockQuantizedFp4ProducerRows(*w, init_map, keep);
+    return;
+  }
+  const auto& p = std::get<PlainMatMulNBitsPeer>(side);
+  SliceProducerWeight(init_map.at(p.w_name), p.weight_transposed, keep, false);
+  if (p.bias_name) {
+    SliceLastAxis(init_map.at(*p.bias_name), keep);
+  }
+}
+
+// Slices one chain CONSUMER's own input channels to `keep` -- a quantized
+// side requires `keep` to already be whole, block-aligned BLOCK indices
+// (checked by the caller before this is ever invoked); a plain-float peer
+// has no block structure at all, dispatched straight to SliceConsumerWeight.
+// Mirrors pruning.py's own `_slice_fp8_chain_consumer`/`_slice_fp4_chain_
+// consumer`.
+void SliceFp8SideConsumer(
+    const Fp8ChainSide& side,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    const std::vector<int64_t>& keep) {
+  if (const auto* w = std::get_if<BlockQuantizedFp8Weight>(&side)) {
+    SliceBlockQuantizedFp8ConsumerBlocks(*w, init_map, keep);
+    return;
+  }
+  const auto& p = std::get<PlainMatMulNBitsPeer>(side);
+  SliceConsumerWeight(init_map.at(p.w_name), p.weight_transposed, keep, false);
+}
+
+void SliceFp4SideConsumer(
+    const Fp4ChainSide& side,
+    const std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    const std::vector<int64_t>& keep) {
+  if (const auto* w = std::get_if<BlockQuantizedFp4Weight>(&side)) {
+    SliceBlockQuantizedFp4ConsumerBlocks(*w, init_map, keep);
+    return;
+  }
+  const auto& p = std::get<PlainMatMulNBitsPeer>(side);
+  SliceConsumerWeight(init_map.at(p.w_name), p.weight_transposed, keep, false);
+}
+
+// --- Chain finding, mirroring _walk_to_fp8_consumer/_find_fp8_block_
+// quantized_chains and their `_fp4_` analogues -----------------------------
+
+struct Fp8WalkResult {
+  Fp8ChainSide consumer;
+  std::vector<onnx::NodeProto*> chain_ops;
+};
+
+// From tensor `start` (a `Fp8Weight` OR plain-float MatMul/Gemm producer's
+// own output), walks forward through shape-preserving unary activations
+// with no other consumer anywhere along the way, until EITHER a
+// `MatMulBlockQuantizedFp8Weight` consumer OR a plain-float MatMul/vanilla-
+// Gemm consumer (MatchPlainMatMulNBitsPeer) is found whose input-channel
+// count matches `n_channels`. No gated pair, no branch, never a `Fp4Weight`/
+// `MatMulNBits`/QDQ consumer -- mirrors pruning.py's own `_walk_to_fp8_
+// consumer` exactly.
+std::optional<Fp8WalkResult> WalkToFp8Consumer(
+    const std::string& start, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs, int64_t n_channels,
+    int max_hops) {
+  std::vector<onnx::NodeProto*> chain_ops;
+  std::string cur = start;
+  for (int hop = 0; hop < max_hops; ++hop) {
+    auto cit = consumers_of.find(cur);
+    if (cit == consumers_of.end() || cit->second.size() != 1) {
+      return std::nullopt;
+    }
+    onnx::NodeProto* nxt = cit->second[0];
+
+    if (nxt->op_type() == "MatMulBlockQuantizedFp8Weight" &&
+        nxt->domain() == kComMicrosoftDomain && nxt->input_size() > 0 &&
+        nxt->input(0) == cur) {
+      auto w = MatchMatMulBlockQuantizedFp8(nxt, init_map, consumers_of);
+      if (!w || w->K != n_channels) {
+        return std::nullopt;
+      }
+      return Fp8WalkResult{Fp8ChainSide(*w), std::move(chain_ops)};
+    }
+
+    auto mm = MatchMatMulLikeRaw(*nxt);
+    if (mm && mm->x_name == cur) {
+      auto peer = MatchPlainMatMulNBitsPeer(nxt, init_map, consumers_of);
+      if (!peer || peer->in_channels != n_channels) {
+        return std::nullopt;
+      }
+      return Fp8WalkResult{Fp8ChainSide(*peer), std::move(chain_ops)};
+    }
+
+    if (!(UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
+          nxt->input_size() == 1 && nxt->input(0) == cur &&
+          nxt->output_size() == 1)) {
+      return std::nullopt;
+    }
+    const std::string& out2 = nxt->output(0);
+    auto oc = consumers_of.find(out2);
+    if (oc == consumers_of.end() || oc->second.size() != 1 ||
+        graph_outputs.count(out2)) {
+      return std::nullopt;
+    }
+    chain_ops.push_back(nxt);
+    cur = out2;
+  }
+  return std::nullopt;
+}
+
+struct Fp4WalkResult {
+  Fp4ChainSide consumer;
+  std::vector<onnx::NodeProto*> chain_ops;
+};
+
+// `Fp4Weight` analogue of WalkToFp8Consumer -- see that function's own
+// docstring. Mirrors pruning.py's own `_walk_to_fp4_consumer`.
+std::optional<Fp4WalkResult> WalkToFp4Consumer(
+    const std::string& start, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs, int64_t n_channels,
+    int max_hops) {
+  std::vector<onnx::NodeProto*> chain_ops;
+  std::string cur = start;
+  for (int hop = 0; hop < max_hops; ++hop) {
+    auto cit = consumers_of.find(cur);
+    if (cit == consumers_of.end() || cit->second.size() != 1) {
+      return std::nullopt;
+    }
+    onnx::NodeProto* nxt = cit->second[0];
+
+    if (nxt->op_type() == "MatMulBlockQuantizedFp4Weight" &&
+        nxt->domain() == kComMicrosoftDomain && nxt->input_size() > 0 &&
+        nxt->input(0) == cur) {
+      auto w = MatchMatMulBlockQuantizedFp4(nxt, init_map, consumers_of);
+      if (!w || w->K != n_channels) {
+        return std::nullopt;
+      }
+      return Fp4WalkResult{Fp4ChainSide(*w), std::move(chain_ops)};
+    }
+
+    auto mm = MatchMatMulLikeRaw(*nxt);
+    if (mm && mm->x_name == cur) {
+      auto peer = MatchPlainMatMulNBitsPeer(nxt, init_map, consumers_of);
+      if (!peer || peer->in_channels != n_channels) {
+        return std::nullopt;
+      }
+      return Fp4WalkResult{Fp4ChainSide(*peer), std::move(chain_ops)};
+    }
+
+    if (!(UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
+          nxt->input_size() == 1 && nxt->input(0) == cur &&
+          nxt->output_size() == 1)) {
+      return std::nullopt;
+    }
+    const std::string& out2 = nxt->output(0);
+    auto oc = consumers_of.find(out2);
+    if (oc == consumers_of.end() || oc->second.size() != 1 ||
+        graph_outputs.count(out2)) {
+      return std::nullopt;
+    }
+    chain_ops.push_back(nxt);
+    cur = out2;
+  }
+  return std::nullopt;
+}
+
+struct Fp8Chain {
+  Fp8ChainSide producer;
+  std::vector<onnx::NodeProto*> chain_ops;
+  Fp8ChainSide consumer;
+  int64_t n_channels;
+};
+
+struct Fp4Chain {
+  Fp4ChainSide producer;
+  std::vector<onnx::NodeProto*> chain_ops;
+  Fp4ChainSide consumer;
+  int64_t n_channels;
+};
+
+// Every producer/consumer pair connected by WalkToFp8Consumer where AT
+// LEAST ONE side is a `MatMulBlockQuantizedFp8Weight` node (an all-plain-
+// float pair is FindChains's own job, not duplicated here). Mirrors
+// pruning.py's own `_find_fp8_block_quantized_chains`.
+std::vector<Fp8Chain> FindFp8BlockQuantizedChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  auto is_internal = [&](const std::string& name) {
+    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
+  };
+
+  std::vector<Fp8Chain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    std::optional<Fp8ChainSide> producer;
+    int64_t n_channels = 0;
+    if (node->op_type() == "MatMulBlockQuantizedFp8Weight" &&
+        node->domain() == kComMicrosoftDomain) {
+      auto w = MatchMatMulBlockQuantizedFp8(node, init_map, consumers_of);
+      if (!w) {
+        continue;
+      }
+      n_channels = w->N;
+      producer = Fp8ChainSide(*w);
+    } else {
+      auto peer = MatchPlainMatMulNBitsPeer(node, init_map, consumers_of);
+      if (!peer) {
+        continue;
+      }
+      n_channels = peer->out_channels;
+      producer = Fp8ChainSide(*peer);
+    }
+
+    const std::string& out_name = node->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    auto found = WalkToFp8Consumer(out_name, init_map, consumers_of,
+                                   graph_outputs, n_channels, kMaxChainHops);
+    if (!found) {
+      continue;
+    }
+    if (std::holds_alternative<PlainMatMulNBitsPeer>(*producer) &&
+        std::holds_alternative<PlainMatMulNBitsPeer>(found->consumer)) {
+      continue;  // Both plain float -- FindChains's own job.
+    }
+    chains.push_back(Fp8Chain{std::move(*producer), std::move(found->chain_ops),
+                              std::move(found->consumer), n_channels});
+  }
+  return chains;
+}
+
+// `Fp4Weight` analogue of FindFp8BlockQuantizedChains. Mirrors pruning.py's
+// own `_find_fp4_block_quantized_chains`.
+std::vector<Fp4Chain> FindFp4BlockQuantizedChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  auto is_internal = [&](const std::string& name) {
+    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
+  };
+
+  std::vector<Fp4Chain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    std::optional<Fp4ChainSide> producer;
+    int64_t n_channels = 0;
+    if (node->op_type() == "MatMulBlockQuantizedFp4Weight" &&
+        node->domain() == kComMicrosoftDomain) {
+      auto w = MatchMatMulBlockQuantizedFp4(node, init_map, consumers_of);
+      if (!w) {
+        continue;
+      }
+      n_channels = w->N;
+      producer = Fp4ChainSide(*w);
+    } else {
+      auto peer = MatchPlainMatMulNBitsPeer(node, init_map, consumers_of);
+      if (!peer) {
+        continue;
+      }
+      n_channels = peer->out_channels;
+      producer = Fp4ChainSide(*peer);
+    }
+
+    const std::string& out_name = node->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    auto found = WalkToFp4Consumer(out_name, init_map, consumers_of,
+                                   graph_outputs, n_channels, kMaxChainHops);
+    if (!found) {
+      continue;
+    }
+    if (std::holds_alternative<PlainMatMulNBitsPeer>(*producer) &&
+        std::holds_alternative<PlainMatMulNBitsPeer>(found->consumer)) {
+      continue;
+    }
+    chains.push_back(Fp4Chain{std::move(*producer), std::move(found->chain_ops),
+                              std::move(found->consumer), n_channels});
+  }
+  return chains;
+}
+
+// --- Apply, mirroring apply_structured_pruning_matmul_block_quantized_fp8/
+// _fp4's own per-chain loop --------------------------------------------
+
+// Ranks the producer's output channels by L2 norm of their own (dequantized,
+// for a `Fp8Weight` producer) weight row, drops the lowest-`sparsity`-
+// fraction, and -- only when the CONSUMER side is itself `Fp8Weight` --
+// requires that keep-set to land on whole `block_size` blocks
+// (MatMulNBitsBlockAlignedKeepBlocks), declining the WHOLE chain otherwise.
+// Shares `touched` with every other chain family ApplyStructuredPruning
+// already applies over this same graph.
+void ApplyFp8BlockQuantizedChains(onnx::GraphProto* graph,
+                                  std::vector<Fp8Chain>& chains,
+                                  double sparsity, TouchedState& touched) {
+  std::unordered_map<std::string, onnx::TensorProto*> init_map;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    init_map[t->name()] = t;
+  }
+
+  auto row_norms = [](const std::vector<double>& w_nk, int64_t n) {
+    const int64_t k = static_cast<int64_t>(w_nk.size()) / n;
+    std::vector<double> importance(static_cast<size_t>(n), 0.0);
+    for (int64_t c = 0; c < n; ++c) {
+      double sq = 0.0;
+      for (int64_t j = 0; j < k; ++j) {
+        const double v = w_nk[static_cast<size_t>(c * k + j)];
+        sq += v * v;
+      }
+      importance[static_cast<size_t>(c)] = std::sqrt(sq);
+    }
+    return importance;
+  };
+
+  for (auto& chain : chains) {
+    const std::string p_key = Fp8ChainSideKey(chain.producer);
+    const std::string c_key = Fp8ChainSideKey(chain.consumer);
+    if (p_key == c_key) {
+      continue;  // Degenerate (the same weight in both roles).
+    }
+    if (touched.producer.count(p_key) || touched.consumer.count(c_key)) {
+      continue;  // A shared/tied weight another chain already resized.
+    }
+
+    const int64_t n = chain.n_channels;
+    const int64_t keep_count = std::max<int64_t>(
+        1, n - std::llround(static_cast<double>(n) * sparsity));
+    if (keep_count >= n) {
+      continue;  // Rounds down to nothing for this layer -- no-op.
+    }
+
+    const std::vector<double> w_nk =
+        Fp8SideProducerWeightNK(chain.producer, init_map);
+    std::vector<double> importance = row_norms(w_nk, n);
+    const std::vector<int64_t> keep =
+        TopKIndicesAscending(importance, keep_count);
+
+    std::vector<int64_t> consumer_keep;
+    if (const auto* cw =
+            std::get_if<BlockQuantizedFp8Weight>(&chain.consumer)) {
+      auto keep_blocks =
+          MatMulNBitsBlockAlignedKeepBlocks(keep, cw->k_blocks, cw->block_size);
+      if (!keep_blocks) {
+        continue;  // Non-block-aligned -- decline, see section comment.
+      }
+      consumer_keep = std::move(*keep_blocks);
+    } else {
+      consumer_keep = keep;  // Plain-float consumer -- no block structure.
+    }
+
+    SliceFp8SideProducer(chain.producer, init_map, keep);
+    SliceFp8SideConsumer(chain.consumer, init_map, consumer_keep);
+
+    touched.producer.insert(p_key);
+    touched.consumer.insert(c_key);
+    touched.stale_value_info.insert(
+        Fp8ChainSideNode(chain.producer)->output(0));
+    for (auto* op : chain.chain_ops) {
+      touched.stale_value_info.insert(op->output(0));
+    }
+  }
+}
+
+// `Fp4Weight` analogue of ApplyFp8BlockQuantizedChains -- the one packing-
+// driven difference: a candidate consumer-side keep-set is checked via
+// Fp4BlockAlignedKeepBlocks rather than MatMulNBitsBlockAlignedKeepBlocks
+// directly, since this op's own flat (whole-row) nibble packing additionally
+// requires the resulting K to stay even.
+void ApplyFp4BlockQuantizedChains(onnx::GraphProto* graph,
+                                  std::vector<Fp4Chain>& chains,
+                                  double sparsity, TouchedState& touched) {
+  std::unordered_map<std::string, onnx::TensorProto*> init_map;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    init_map[t->name()] = t;
+  }
+
+  auto row_norms = [](const std::vector<double>& w_nk, int64_t n) {
+    const int64_t k = static_cast<int64_t>(w_nk.size()) / n;
+    std::vector<double> importance(static_cast<size_t>(n), 0.0);
+    for (int64_t c = 0; c < n; ++c) {
+      double sq = 0.0;
+      for (int64_t j = 0; j < k; ++j) {
+        const double v = w_nk[static_cast<size_t>(c * k + j)];
+        sq += v * v;
+      }
+      importance[static_cast<size_t>(c)] = std::sqrt(sq);
+    }
+    return importance;
+  };
+
+  for (auto& chain : chains) {
+    const std::string p_key = Fp4ChainSideKey(chain.producer);
+    const std::string c_key = Fp4ChainSideKey(chain.consumer);
+    if (p_key == c_key) {
+      continue;
+    }
+    if (touched.producer.count(p_key) || touched.consumer.count(c_key)) {
+      continue;
+    }
+
+    const int64_t n = chain.n_channels;
+    const int64_t keep_count = std::max<int64_t>(
+        1, n - std::llround(static_cast<double>(n) * sparsity));
+    if (keep_count >= n) {
+      continue;
+    }
+
+    const std::vector<double> w_nk =
+        Fp4SideProducerWeightNK(chain.producer, init_map);
+    std::vector<double> importance = row_norms(w_nk, n);
+    const std::vector<int64_t> keep =
+        TopKIndicesAscending(importance, keep_count);
+
+    std::vector<int64_t> consumer_keep;
+    if (const auto* cw =
+            std::get_if<BlockQuantizedFp4Weight>(&chain.consumer)) {
+      auto keep_blocks =
+          Fp4BlockAlignedKeepBlocks(keep, cw->k_blocks, cw->block_size);
+      if (!keep_blocks) {
+        continue;  // Non-block-aligned, or odd resulting K -- decline.
+      }
+      consumer_keep = std::move(*keep_blocks);
+    } else {
+      consumer_keep = keep;  // Plain-float consumer -- no block structure.
+    }
+
+    SliceFp4SideProducer(chain.producer, init_map, keep);
+    SliceFp4SideConsumer(chain.consumer, init_map, consumer_keep);
+
+    touched.producer.insert(p_key);
+    touched.consumer.insert(c_key);
+    touched.stale_value_info.insert(
+        Fp4ChainSideNode(chain.producer)->output(0));
+    for (auto* op : chain.chain_ops) {
+      touched.stale_value_info.insert(op->output(0));
+    }
+  }
+}
+
 // --- Subgraph recursion ------------------------------------------------
 //
 // Mirrors pruning.py's own `_iter_subgraphs` and the "Subgraph recursion"
@@ -13122,6 +14297,693 @@ std::vector<onnx::GraphProto*> IterSubgraphs(onnx::GraphProto* graph) {
   return graphs;
 }
 
+// --- Embedding vocabulary pruning, mirroring pruning.py's own "Embedding /
+// lm_head vocabulary pruning" section (search that name in pruning.py) -----
+//
+// A GENUINELY DIFFERENT shape of pass from every chain family above: those
+// all prune a FEATURE/CHANNEL axis shared symmetrically by a producer and
+// its consumer(s). This prunes the VOCABULARY axis of a token-embedding
+// table -- axis 0 of a plain `Gather(data=[vocab_size, hidden_size],
+// indices=input_ids)`, the export shape of `torch.nn.Embedding` -- and,
+// where a tied or auto-identified untied `lm_head` (the output vocab-logits
+// projection) exists, its own matching axis too. `hidden_size` is never
+// touched, and (unlike every pass above) the pruned axis routinely reaches
+// a genuine graph OUTPUT (the `lm_head`'s own logits) -- so this is also
+// the first pass in this file that must actively correct a stale graph
+// OUTPUT shape (UpdateVocabOutputShape), not just drop an internal
+// value_info entry the way every chain family above's `stale_value_info`
+// handling does.
+//
+// Because which vocabulary rows are safe to keep is a question this pass
+// cannot answer from the graph alone (unlike a channel's activation
+// magnitude, calibration data can show a token id *was* used, never that it
+// is safe to drop), the primary entry point below
+// (ApplyEmbeddingVocabPruning) takes an explicit, caller-supplied keep/drop
+// set; ApplyEmbeddingVocabMagnitudePruning is a second, explicitly weaker
+// entry point ranking by embedding-row L2 norm -- mirroring pruning.py's
+// own two-entry-point split and its own safety caveats (see each
+// function's own doc comment in structured_pruning_entry.h).
+//
+// Whichever ids survive are RENUMBERED contiguously (kept id `i`'s new id
+// is its rank among the sorted kept ids), so -- exactly like the Python
+// original -- neither entry point returns a bare `onnx::ModelProto`:
+// `EmbeddingVocabPruningResult::kept_token_ids[i]` is the ORIGINAL id now
+// living at row/column `i` of the pruned model, and it is every caller's
+// own job to remap its input token ids through that mapping (old id ->
+// its index in `kept_token_ids`) before running the pruned model -- a
+// dropped id can never be fed to the pruned model again.
+//
+// Deliberately NARROWER than pruning.py's own three-producer-shape port
+// (plain `Gather`, `com.microsoft::EmbedLayerNormalization`,
+// `com.microsoft::GatherBlockQuantized`) -- consistent with this file's own
+// established "narrower subset of pruning.py, decline rather than guess
+// past what's ported" scope decisions elsewhere (MatMulNBits's own
+// FLOAT32-only scales/zero_points/bias, MoE/QMoE's own restrictions, ...):
+//
+//   * Only the plain `Gather(data, indices, axis=0)` producer shape is
+//     matched here. `EmbedLayerNormalization` (the fused BERT-family
+//     word+position+segment-embedding-plus-LayerNorm node onnxruntime's
+//     own graph optimizer emits) and `GatherBlockQuantized` (the
+//     int2/int4/int8 block-quantized analogue) are both simply never
+//     matched -- declined, not mis-handled -- by this port; see
+//     pruning.py's own section comment for their exact schema/scope if
+//     porting either is ever needed.
+//   * `lm_head` auto-detection only ever recognizes a bare `MatMul` or
+//     vanilla `Gemm` (MatchMatMulLikeRaw) -- not pruning.py's own widened
+//     `_match_matmul_like`, which additionally recognizes
+//     `com.microsoft::FusedGemm`/`GemmFastGelu` -- mirroring
+//     MatchProducer's own identical, already-established restriction
+//     elsewhere in this file (see its own comment, above).
+//   * The embedding table, `lm_head` weight, and `lm_head` bias are all
+//     admitted only as plain FLOAT (float32) tensors -- not also FLOAT16/
+//     BFLOAT16 -- matching ReadFloatTensor/SetFloatTensorData's own
+//     FLOAT32-only support (the same restriction, for the same reason, as
+//     the "Two deliberate, narrower-than-pruning.py scope decisions"
+//     comment above MatMulNBitsValidBlockSizes documents).
+//
+// Every other structural safety check pruning.py's own `_match_embedding_
+// gather`/`_match_tied_lm_head`/`_match_untied_lm_head`/`_match_lm_head_
+// tail` apply is reproduced here exactly: `axis` must be 0; `indices` must
+// be a declared graph input or one `Cast` hop of one; the embedding weight
+// must have exactly one (untied) or two (the second a structurally-
+// confirmed tied `lm_head`) consumers, an unexplained second consumer
+// declining the WHOLE match; an untied `lm_head` candidate is only ever
+// auto-identified when its own weight has exactly one consumer AND its
+// (bias-tail-resolved) output is itself a genuine graph output, with more
+// than one such candidate ambiguous, not evidence; a bias is only ever
+// recognized as a `Gemm`'s own built-in `C` input or a `MatMul`-then-
+// `Add(bias)` tail, anything else declining that whole `lm_head` match.
+// When more than one qualifying `Gather` exists and the caller hasn't
+// named `input_name`, the whole call declines.
+//
+// Subgraph-aware (IterSubgraphs, just above) exactly like every other pass
+// in this file: the one eligible `Gather` this pass requires may live
+// inside a nested If/Loop/Scan/BeamSearch-family subgraph, at any nesting
+// depth, not only the top-level graph -- MatchEmbeddingChainAnyGraph
+// applies the identical "exactly one eligible producer, or decline" rule
+// across the WHOLE model, mirroring pruning.py's own `_match_embedding_
+// chain_any_graph` exactly (confirmed against its own docstring before
+// porting, rather than assumed).
+
+struct EmbeddingLmHeadMatch {
+  // The *final* node whose output is the (pre-rename) [..., vocab_size]
+  // logits tensor -- the matched MatMul/Gemm itself, or, when
+  // MatchLmHeadTail recognized a MatMul-then-Add(bias) tail, the Add (its
+  // output, not the raw MatMul's own, is the tensor whose shape/graph-
+  // output status actually matters downstream).
+  onnx::NodeProto* node = nullptr;
+  // True when the projection's own weight IS the embedding table itself
+  // (already sliced once, as part of the embedding weight's own slice --
+  // `weight_name`/`weight_transposed` are then unused, left nullopt).
+  // False means an independent initializer this match's own caller must
+  // slice separately, using `weight_transposed`.
+  bool tied = false;
+  std::optional<std::string> weight_name;  // untied only
+  std::optional<bool> weight_transposed;   // untied only
+  std::optional<std::string> bias;         // either case, when matched
+  // The interposed Transpose node for the tied "Transpose then MatMul"
+  // sub-shape, else nullptr -- owns no weight of its own to slice, but its
+  // own now-stale output shape still needs invalidating after pruning.
+  onnx::NodeProto* via_transpose = nullptr;
+};
+
+struct EmbeddingChain {
+  onnx::NodeProto* producer = nullptr;  // the matched Gather node
+  std::string weight_name;              // the embedding table's own name
+  std::string indices_name;
+  int64_t vocab_size = 0;
+  int64_t hidden_size = 0;
+  std::optional<EmbeddingLmHeadMatch> lm_head;
+};
+
+// If `node` is a well-formed embedding-table Gather (this section's own
+// comment above has the full matching criteria), returns
+// (weight_name, indices_name, underlying_input_name) -- `indices_name` is
+// `node`'s own literal `indices` operand, `underlying_input_name` is that
+// same tensor with one Cast hop unwrapped when present. Mirrors
+// pruning.py's own `_match_embedding_gather` exactly, minus the
+// `EmbedLayerNormalization`/`GatherBlockQuantized` producer shapes (out of
+// scope for this C++ port -- see this section's own top comment). The
+// Python original also double-checks `node in consumers_of[w_name]`; that
+// is always true here by construction (ConsumersOf indexes every node
+// under every one of its own literal `input()` names, and `w_name` is
+// literally `node.input(0)`), so it is not re-checked.
+std::optional<std::tuple<std::string, std::string, std::string>>
+MatchEmbeddingGatherRaw(
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_input_names,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  if (node.op_type() != "Gather" || node.input_size() != 2) {
+    return std::nullopt;
+  }
+  int64_t axis = 0;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "axis") {
+      axis = attr.i();
+    }
+  }
+  if (axis != 0) {
+    return std::nullopt;
+  }
+  const std::string& w_name = node.input(0);
+  const std::string& indices_name = node.input(1);
+  auto wit = init_map.find(w_name);
+  if (wit == init_map.end() ||
+      wit->second->data_type() != onnx::TensorProto::FLOAT ||
+      wit->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+
+  std::string underlying = indices_name;
+  if (!graph_input_names.count(underlying)) {
+    auto cit = node_by_output.find(underlying);
+    if (cit != node_by_output.end() && cit->second->op_type() == "Cast" &&
+        cit->second->input_size() == 1 &&
+        graph_input_names.count(cit->second->input(0))) {
+      underlying = cit->second->input(0);
+    } else {
+      return std::nullopt;  // not a graph input, nor a Cast of one
+    }
+  }
+
+  auto cons_it = consumers_of.find(w_name);
+  const size_t n_consumers =
+      cons_it == consumers_of.end() ? 0 : cons_it->second.size();
+  if (n_consumers < 1 || n_consumers > 2) {
+    return std::nullopt;  // unexpected consumer count -- decline, don't guess
+  }
+  return std::make_tuple(w_name, indices_name, underlying);
+}
+
+// Resolves `node` (an already-matched MatMul/vanilla-Gemm producing
+// `vocab_size`-wide output) to its own bias, if any, and the node whose
+// *output* is the real, final logits tensor. Mirrors pruning.py's own
+// `_match_lm_head_tail` exactly: returns `std::nullopt` for the
+// `_LM_HEAD_BIAS_INVALID` sentinel case (a bias exists but not in a shape
+// this pass safely handles -- declined, never left silently stale), or a
+// present `(bias_name_or_nullopt, output_node)` pair otherwise.
+std::optional<std::pair<std::optional<std::string>, onnx::NodeProto*>>
+MatchLmHeadTail(onnx::NodeProto* node, const InitMap& init_map,
+                const ConsumerMap& consumers_of, int64_t vocab_size) {
+  auto valid_bias = [&](const std::string& name) {
+    auto it = init_map.find(name);
+    if (it == init_map.end() ||
+        it->second->data_type() != onnx::TensorProto::FLOAT) {
+      return false;
+    }
+    const auto& dims = it->second->dims();
+    if (dims.size() == 1 && dims[0] == vocab_size) {
+      return true;
+    }
+    if (dims.size() == 2 && dims[0] == 1 && dims[1] == vocab_size) {
+      return true;
+    }
+    return false;
+  };
+
+  if (node->op_type() == "Gemm" && node->input_size() == 3 &&
+      !node->input(2).empty()) {
+    const std::string bias_name = node->input(2);
+    if (!valid_bias(bias_name)) {
+      return std::nullopt;
+    }
+    return std::make_pair(std::optional<std::string>(bias_name), node);
+  }
+
+  const std::string& out_name = node->output(0);
+  auto cit = consumers_of.find(out_name);
+  if (cit == consumers_of.end() || cit->second.empty()) {
+    return std::make_pair(std::optional<std::string>(std::nullopt), node);
+  }
+  const std::vector<onnx::NodeProto*>& out_consumers = cit->second;
+  bool any_add = false;
+  for (onnx::NodeProto* c : out_consumers) {
+    if (c->op_type() == "Add") {
+      any_add = true;
+      break;
+    }
+  }
+  if (any_add) {
+    if (out_consumers.size() != 1 || out_consumers[0]->input_size() != 2) {
+      return std::nullopt;  // ambiguous fan-out -- decline
+    }
+    onnx::NodeProto* add_node = out_consumers[0];
+    const std::string other = add_node->input(1) == out_name
+                                  ? add_node->input(0)
+                                  : add_node->input(1);
+    if (!valid_bias(other)) {
+      return std::nullopt;
+    }
+    return std::make_pair(std::optional<std::string>(other), add_node);
+  }
+  return std::make_pair(std::optional<std::string>(std::nullopt),
+                        node);  // output feeds something else -- no bias here
+}
+
+// If the embedding table `weight_name` has a second consumer besides
+// `gather_node`, and that second consumer resolves to one of the two tied
+// `lm_head` sub-shapes this section's own top comment describes (direct
+// `Gemm(transB=1)`, or one `Transpose` then a plain `MatMul`/
+// `Gemm(transB=0)`), returns the matched `EmbeddingLmHeadMatch`
+// (`tied=true`). Returns `std::nullopt` both when there is no second
+// consumer at all (the caller falls back to MatchUntiedLmHead) and when
+// there IS one but it doesn't resolve to either recognized shape (an
+// unexplained second reader -- the caller must then decline the WHOLE
+// chain, not just skip lm_head detection). Mirrors pruning.py's own
+// `_match_tied_lm_head` exactly.
+std::optional<EmbeddingLmHeadMatch> MatchTiedLmHead(
+    const std::string& weight_name, int64_t vocab_size,
+    onnx::NodeProto* gather_node, const ConsumerMap& consumers_of,
+    const InitMap& init_map) {
+  auto cit = consumers_of.find(weight_name);
+  const std::vector<onnx::NodeProto*>& all =
+      cit == consumers_of.end() ? std::vector<onnx::NodeProto*>{} : cit->second;
+  std::vector<onnx::NodeProto*> others;
+  for (onnx::NodeProto* c : all) {
+    if (c != gather_node) {
+      others.push_back(c);
+    }
+  }
+  if (others.size() != 1) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* other = others[0];
+
+  auto match = MatchMatMulLikeRaw(*other);
+  if (match) {
+    if (match->w_name == weight_name && match->weight_transposed) {
+      auto tail = MatchLmHeadTail(other, init_map, consumers_of, vocab_size);
+      if (!tail) {
+        return std::nullopt;
+      }
+      EmbeddingLmHeadMatch result;
+      result.node = tail->second;
+      result.tied = true;
+      result.bias = tail->first;
+      return result;
+    }
+    return std::nullopt;
+  }
+
+  if (other->op_type() == "Transpose" && other->input_size() == 1 &&
+      other->input(0) == weight_name) {
+    std::optional<std::vector<int64_t>> perm;
+    for (const auto& attr : other->attribute()) {
+      if (attr.name() == "perm") {
+        perm.emplace(attr.ints().begin(), attr.ints().end());
+      }
+    }
+    if (perm && !(perm->size() == 2 && (*perm)[0] == 1 && (*perm)[1] == 0)) {
+      return std::nullopt;
+    }
+    const std::string& t_out = other->output(0);
+    auto tcit = consumers_of.find(t_out);
+    if (tcit == consumers_of.end() || tcit->second.size() != 1) {
+      return std::nullopt;
+    }
+    onnx::NodeProto* node2 = tcit->second[0];
+    auto match2 = MatchMatMulLikeRaw(*node2);
+    if (!match2 || match2->w_name != t_out || match2->weight_transposed) {
+      // must consume the transposed [hidden, vocab] tensor untransposed
+      return std::nullopt;
+    }
+    auto tail = MatchLmHeadTail(node2, init_map, consumers_of, vocab_size);
+    if (!tail) {
+      return std::nullopt;
+    }
+    EmbeddingLmHeadMatch result;
+    result.node = tail->second;
+    result.tied = true;
+    result.bias = tail->first;
+    result.via_transpose = other;
+    return result;
+  }
+
+  return std::nullopt;
+}
+
+// Auto-detects a fully independent `lm_head` weight: exactly one
+// MatMul/vanilla-Gemm node in the whole graph whose constant 2-D weight is
+// distinct from `embedding_weight_name`, has exactly one consumer,
+// produces `vocab_size`-wide output, and -- the one structural signal that
+// reliably distinguishes "the" vocab-logits projection from some unrelated
+// layer of the same output width -- whose final (MatchLmHeadTail-resolved)
+// output is itself a genuine graph output. Zero or more than one such
+// candidate is declined, not guessed at; only ever called when
+// MatchTiedLmHead already found no tied lm_head to prefer. Mirrors
+// pruning.py's own `_match_untied_lm_head` exactly.
+std::optional<EmbeddingLmHeadMatch> MatchUntiedLmHead(
+    onnx::GraphProto* graph, const std::string& embedding_weight_name,
+    int64_t vocab_size, const ConsumerMap& consumers_of,
+    const InitMap& init_map,
+    const std::unordered_set<std::string>& graph_outputs) {
+  struct Candidate {
+    std::string w_name;
+    bool weight_transposed;
+    std::optional<std::string> bias;
+    onnx::NodeProto* output_node;
+  };
+  std::vector<Candidate> candidates;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto match = MatchMatMulLikeRaw(*node);
+    if (!match) {
+      continue;
+    }
+    if (match->w_name == embedding_weight_name) {
+      continue;  // handled by the tied path, not here
+    }
+    auto wit = init_map.find(match->w_name);
+    if (wit == init_map.end() ||
+        wit->second->data_type() != onnx::TensorProto::FLOAT ||
+        wit->second->dims_size() != 2) {
+      continue;
+    }
+    const int64_t n_channels =
+        match->weight_transposed ? wit->second->dims(0) : wit->second->dims(1);
+    auto cit = consumers_of.find(match->w_name);
+    const size_t n_consumers =
+        cit == consumers_of.end() ? 0 : cit->second.size();
+    if (n_channels != vocab_size || n_consumers != 1) {
+      continue;
+    }
+    auto tail = MatchLmHeadTail(node, init_map, consumers_of, vocab_size);
+    if (!tail) {
+      continue;  // not a confident candidate -- skip, don't guess
+    }
+    if (!graph_outputs.count(tail->second->output(0))) {
+      continue;
+    }
+    candidates.push_back(
+        {match->w_name, match->weight_transposed, tail->first, tail->second});
+  }
+  if (candidates.size() != 1) {
+    return std::nullopt;
+  }
+  EmbeddingLmHeadMatch result;
+  result.node = candidates[0].output_node;
+  result.tied = false;
+  result.weight_name = candidates[0].w_name;
+  result.weight_transposed = candidates[0].weight_transposed;
+  result.bias = candidates[0].bias;
+  return result;
+}
+
+// Finds the one token-embedding Gather this pass should act on in `graph`
+// alone, plus its tied/untied `lm_head`, if any. When `input_name` is
+// given, only a Gather whose token-id operand resolves to that exact graph
+// input is considered, and -- when `strict_input_name` -- it is an error
+// (`std::invalid_argument`, a caller mistake) if none does;
+// `strict_input_name=false` (only ever passed by
+// MatchEmbeddingChainAnyGraph) instead treats that same outcome as an
+// ordinary decline (`std::nullopt`, no exception), since `graph` here is
+// only one of possibly several graphs a whole-model search is trying in
+// turn. When `input_name` is omitted, exactly one qualifying Gather must
+// exist in the whole graph -- zero or more than one declines the whole
+// call. Mirrors pruning.py's own `_match_embedding_chain` exactly (minus
+// the `EmbedLayerNormalization`/`GatherBlockQuantized` producer shapes --
+// see this section's own top comment).
+std::optional<EmbeddingChain> MatchEmbeddingChain(
+    onnx::GraphProto* graph, const std::optional<std::string>& input_name,
+    bool strict_input_name) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    for (const auto& out : node->output()) {
+      if (!out.empty()) {
+        node_by_output[out] = node;
+      }
+    }
+  }
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  std::unordered_set<std::string> graph_input_names;
+  for (const auto& in : graph->input()) {
+    graph_input_names.insert(in.name());
+  }
+
+  struct RawMatch {
+    onnx::NodeProto* node;
+    std::string w_name;
+    std::string indices_name;
+  };
+  std::vector<RawMatch> matches;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto m = MatchEmbeddingGatherRaw(*node, init_map, consumers_of,
+                                     graph_input_names, node_by_output);
+    if (!m) {
+      continue;
+    }
+    const std::string& w_name = std::get<0>(*m);
+    const std::string& indices_name = std::get<1>(*m);
+    const std::string& underlying = std::get<2>(*m);
+    if (input_name && *input_name != indices_name &&
+        *input_name != underlying) {
+      continue;
+    }
+    matches.push_back({node, w_name, indices_name});
+  }
+
+  if (input_name && matches.empty()) {
+    if (!strict_input_name) {
+      return std::nullopt;
+    }
+    throw std::invalid_argument(
+        "MatchEmbeddingChain: no embedding Gather found reading graph "
+        "input '" +
+        *input_name + "'");
+  }
+  if (matches.size() != 1) {
+    return std::nullopt;  // zero, or ambiguous with no input_name to
+                          // disambiguate
+  }
+
+  onnx::NodeProto* producer_node = matches[0].node;
+  const std::string& w_name = matches[0].w_name;
+  const onnx::TensorProto* w_init = init_map.at(w_name);
+  const int64_t vocab_size = w_init->dims(0);
+  const int64_t hidden_size = w_init->dims(1);
+
+  auto cit = consumers_of.find(w_name);
+  const size_t n_consumers = cit == consumers_of.end() ? 0 : cit->second.size();
+  std::optional<EmbeddingLmHeadMatch> lm_head;
+  if (n_consumers == 2) {
+    lm_head = MatchTiedLmHead(w_name, vocab_size, producer_node, consumers_of,
+                              init_map);
+    if (!lm_head) {
+      return std::nullopt;  // unexplained second consumer -- decline, don't
+                            // guess
+    }
+  } else {
+    lm_head = MatchUntiedLmHead(graph, w_name, vocab_size, consumers_of,
+                                init_map, graph_outputs);
+  }
+
+  EmbeddingChain chain;
+  chain.producer = producer_node;
+  chain.weight_name = w_name;
+  chain.indices_name = matches[0].indices_name;
+  chain.vocab_size = vocab_size;
+  chain.hidden_size = hidden_size;
+  chain.lm_head = lm_head;
+  return chain;
+}
+
+// Subgraph-aware wrapper around MatchEmbeddingChain: tries every graph
+// IterSubgraphs(model_graph) returns -- `model_graph` itself first, then
+// every nested If/Loop/Scan/BeamSearch-family subgraph, at any nesting
+// depth -- independently (`strict_input_name=false`), and applies the
+// IDENTICAL "exactly one qualifying match, or decline" rule *across the
+// whole model* rather than one single graph. `std::invalid_argument` for
+// an unmatched `input_name` is thrown here instead, exactly once, only
+// after every graph has been tried and NONE contained a producer reading
+// it. Returns the `(graph, chain)` pair when exactly one match was found
+// -- `graph` is the same GraphProto* IterSubgraphs returned it as (never
+// copied), reachable from `out.mutable_graph()`, so the caller can mutate
+// it in place -- or `(nullptr, std::nullopt)` when the call should be
+// declined. Mirrors pruning.py's own `_match_embedding_chain_any_graph`
+// exactly.
+std::pair<onnx::GraphProto*, std::optional<EmbeddingChain>>
+MatchEmbeddingChainAnyGraph(onnx::GraphProto* model_graph,
+                            const std::optional<std::string>& input_name) {
+  onnx::GraphProto* found_graph = nullptr;
+  std::optional<EmbeddingChain> found_chain;
+  int n_found = 0;
+  for (onnx::GraphProto* graph : IterSubgraphs(model_graph)) {
+    auto chain =
+        MatchEmbeddingChain(graph, input_name, /*strict_input_name=*/false);
+    if (chain) {
+      ++n_found;
+      found_graph = graph;
+      found_chain = std::move(chain);
+    }
+  }
+  if (input_name && n_found == 0) {
+    throw std::invalid_argument(
+        "MatchEmbeddingChainAnyGraph: no embedding Gather found reading "
+        "graph input '" +
+        *input_name + "'");
+  }
+  if (n_found != 1) {
+    return {nullptr, std::nullopt};  // zero, or ambiguous across graphs
+  }
+  return {found_graph, std::move(found_chain)};
+}
+
+// If `name` is a declared graph output with a fixed (`dim_value`) last
+// shape dimension equal to `old_v`, updates it to `new_v` in place and
+// returns true. A symbolic (`dim_param`) or altogether absent last
+// dimension is left alone. Mirrors pruning.py's own
+// `_update_vocab_output_shape` exactly -- see this section's own top
+// comment for why this pass, unlike every chain family above, must
+// actively correct a stale graph OUTPUT shape rather than only ever drop
+// an internal value_info entry.
+bool UpdateVocabOutputShape(onnx::GraphProto* graph, const std::string& name,
+                            int64_t old_v, int64_t new_v) {
+  for (onnx::ValueInfoProto& o : *graph->mutable_output()) {
+    if (o.name() != name) {
+      continue;
+    }
+    auto* dims =
+        o.mutable_type()->mutable_tensor_type()->mutable_shape()->mutable_dim();
+    if (dims->size() >= 1) {
+      auto* last = dims->Mutable(dims->size() - 1);
+      if (last->has_dim_value() && last->dim_value() == old_v) {
+        last->set_dim_value(new_v);
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+// Performs the actual slicing, IN PLACE on `graph`, for an already-decided
+// (ascending) `keep_ids` set: the embedding table's own vocab_size axis
+// (always axis 0 -- MatchEmbeddingGatherRaw's own `axis == 0` requirement),
+// and, for an untied `lm_head`, its own independent weight/bias. A tied
+// `lm_head`'s weight needs no separate slicing call: it IS the embedding
+// table (the exact same initializer), already fully accounted for by the
+// one slice below. `graph` must be whichever graph `chain` was actually
+// matched in (MatchEmbeddingChainAnyGraph's own returned `graph`), so this
+// mutates that graph's own initializer/output/value_info in place, never a
+// different graph's. Mirrors pruning.py's own `_apply_embedding_vocab_
+// prune`/`_finalize_embedding_shapes` exactly.
+void ApplyEmbeddingVocabPrune(onnx::GraphProto* graph,
+                              const EmbeddingChain& chain,
+                              const std::vector<int64_t>& keep_ids) {
+  MutInitMap init_map = BuildMutInitMap(graph);
+  const int64_t new_v = static_cast<int64_t>(keep_ids.size());
+
+  // The embedding table is [vocab_size, hidden_size] with vocab_size as
+  // axis 0 -- exactly SliceProducerWeight's own `weight_transposed=true`
+  // ("output channel is axis 0") branch, reused verbatim rather than
+  // duplicating an axis-0 row-slice helper.
+  SliceProducerWeight(init_map.at(chain.weight_name),
+                      /*weight_transposed=*/true, keep_ids, /*is_conv=*/false);
+
+  if (chain.lm_head && !chain.lm_head->tied) {
+    SliceProducerWeight(init_map.at(*chain.lm_head->weight_name),
+                        *chain.lm_head->weight_transposed, keep_ids,
+                        /*is_conv=*/false);
+  }
+  if (chain.lm_head && chain.lm_head->bias) {
+    SliceLastAxis(init_map.at(*chain.lm_head->bias), keep_ids);
+  }
+
+  // Finalize shapes: chain.producer's own output shape never needs
+  // touching (a plain Gather's output carries hidden_size only, unaffected
+  // by an axis=0 gather) -- only an lm_head's own (and, for the tied
+  // via-transpose sub-shape, the Transpose's own) output width changes.
+  if (chain.lm_head) {
+    std::unordered_set<std::string> stale;
+    const std::string& out_name = chain.lm_head->node->output(0);
+    if (!UpdateVocabOutputShape(graph, out_name, chain.vocab_size, new_v)) {
+      stale.insert(out_name);
+    }
+    if (chain.lm_head->via_transpose) {
+      const std::string& t_out = chain.lm_head->via_transpose->output(0);
+      if (!UpdateVocabOutputShape(graph, t_out, chain.vocab_size, new_v)) {
+        stale.insert(t_out);
+      }
+    }
+    if (!stale.empty()) {
+      google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
+      for (const auto& vi : graph->value_info()) {
+        if (!stale.count(vi.name())) {
+          *kept.Add() = vi;
+        }
+      }
+      graph->mutable_value_info()->Swap(&kept);
+    }
+  }
+}
+
+// The per-row (vocab-axis) L2-norm importance vector shared by
+// ApplyEmbeddingVocabMagnitudePruning: the matched embedding table's own
+// row norm, combined (root-sum-square) with a matched untied `lm_head`'s
+// own row norm when one exists (the tied case needs no such combination --
+// the embedding table's own row norm already IS the tied `lm_head`'s row
+// norm). Mirrors pruning.py's own `_embedding_vocab_importance` exactly,
+// minus the `GatherBlockQuantized`-dequantization branch (out of scope for
+// this C++ port -- see this section's own top comment).
+std::vector<double> EmbeddingVocabImportance(const EmbeddingChain& chain,
+                                             const InitMap& init_map) {
+  std::vector<double> importance(static_cast<size_t>(chain.vocab_size), 0.0);
+  {
+    const std::vector<float> emb =
+        ReadFloatTensor(*init_map.at(chain.weight_name));
+    for (int64_t v = 0; v < chain.vocab_size; ++v) {
+      double sum = 0.0;
+      for (int64_t h = 0; h < chain.hidden_size; ++h) {
+        const double x = emb[static_cast<size_t>(v * chain.hidden_size + h)];
+        sum += x * x;
+      }
+      importance[static_cast<size_t>(v)] = sum;
+    }
+  }
+  if (chain.lm_head && !chain.lm_head->tied && chain.lm_head->weight_name) {
+    const onnx::TensorProto* lw = init_map.at(*chain.lm_head->weight_name);
+    const std::vector<float> lwd = ReadFloatTensor(*lw);
+    if (*chain.lm_head->weight_transposed) {
+      // [vocab_size, K] -- row v is contiguous, direct read.
+      const int64_t k = lw->dims(1);
+      for (int64_t v = 0; v < chain.vocab_size; ++v) {
+        double sum = 0.0;
+        for (int64_t j = 0; j < k; ++j) {
+          const double x = lwd[static_cast<size_t>(v * k + j)];
+          sum += x * x;
+        }
+        importance[static_cast<size_t>(v)] += sum;
+      }
+    } else {
+      // [K, vocab_size] -- row v is column v, strided read.
+      const int64_t k = lw->dims(0);
+      const int64_t vsz = lw->dims(1);
+      for (int64_t v = 0; v < chain.vocab_size; ++v) {
+        double sum = 0.0;
+        for (int64_t j = 0; j < k; ++j) {
+          const double x = lwd[static_cast<size_t>(j * vsz + v)];
+          sum += x * x;
+        }
+        importance[static_cast<size_t>(v)] += sum;
+      }
+    }
+  }
+  for (double& x : importance) {
+    x = std::sqrt(x);
+  }
+  return importance;
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
@@ -13177,6 +15039,10 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
     std::vector<QdqGatedChain> qdq_gated_chains = FindQdqGatedChains(graph);
     std::vector<MatMulBnb4Chain> matmul_bnb4_chains =
         FindMatMulBnb4Chains(graph);
+    std::vector<Fp8Chain> fp8_block_quantized_chains =
+        FindFp8BlockQuantizedChains(graph);
+    std::vector<Fp4Chain> fp4_block_quantized_chains =
+        FindFp4BlockQuantizedChains(graph);
 
     TouchedState touched;
     if (!chains.empty()) {
@@ -13226,15 +15092,31 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
       ApplyQdqChains(graph, qdq_chains, qdq_gated_chains, sparsity, touched);
     }
     if (!matmul_bnb4_chains.empty()) {
-      // The sixth and final application pass over this graph -- see this
-      // file's own "MatMulBnb4 (bitsandbytes FP4/NF4 block-quantized
-      // weight) structured pruning" section comment. Shares `touched` with
-      // every call above for the same "one shared conflict ledger per
-      // graph" reason ApplyMatMulNBitsChains/ApplyQdqChains both do: a
-      // plain-float consumer weight this pass matches can never be
+      // See this file's own "MatMulBnb4 (bitsandbytes FP4/NF4
+      // block-quantized weight) structured pruning" section comment. Shares
+      // `touched` with every call above for the same "one shared conflict
+      // ledger per graph" reason ApplyMatMulNBitsChains/ApplyQdqChains both
+      // do: a plain-float consumer weight this pass matches can never be
       // double-resized by, or double-resize, an ordinary chain/MatMulNBits/
       // QDQ chain that already touched it.
       ApplyMatMulBnb4Chains(graph, matmul_bnb4_chains, sparsity, touched);
+    }
+    if (!fp8_block_quantized_chains.empty()) {
+      // See this file's own "MatMulBlockQuantizedFp4Weight/MatMulBlock
+      // QuantizedFp8Weight (NVFP4/FP8 block-quantized weight) structured
+      // pruning" section comment. Shares `touched` with every call above
+      // for the same "one shared conflict ledger per graph" reason every
+      // other quantized-weight pass here does.
+      ApplyFp8BlockQuantizedChains(graph, fp8_block_quantized_chains, sparsity,
+                                   touched);
+    }
+    if (!fp4_block_quantized_chains.empty()) {
+      // The ninth and final application pass over this graph -- `Fp8Weight`/
+      // `Fp4Weight` are never mixed with each other (see that section's own
+      // top comment), so this is always a genuinely separate match, still
+      // sharing `touched` with every call above for the same reason.
+      ApplyFp4BlockQuantizedChains(graph, fp4_block_quantized_chains, sparsity,
+                                   touched);
     }
     if (!touched.stale_value_info.empty()) {
       google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
@@ -13376,4 +15258,151 @@ onnx::ModelProto ApplyQMoEExpertChannelPruning(const onnx::ModelProto& model,
     }
   }
   return out;
+}
+
+EmbeddingVocabPruningResult ApplyEmbeddingVocabPruning(
+    const onnx::ModelProto& model,
+    const std::optional<std::vector<int64_t>>& keep_token_ids,
+    const std::optional<std::vector<int64_t>>& drop_token_ids,
+    const std::optional<std::string>& input_name) {
+  if (keep_token_ids.has_value() == drop_token_ids.has_value()) {
+    throw std::invalid_argument(
+        "ApplyEmbeddingVocabPruning: give exactly one of keep_token_ids or "
+        "drop_token_ids, not both/neither");
+  }
+  onnx::ModelProto out = model;
+
+  // Subgraph-aware (IterSubgraphs, see this file's own "Subgraph
+  // recursion" section comment above): the one eligible embedding Gather
+  // this function requires may live inside a nested If/Loop/Scan/
+  // BeamSearch-family subgraph, at any nesting depth -- see
+  // MatchEmbeddingChainAnyGraph's own comment for exactly how the
+  // "exactly one eligible producer, or decline" rule is applied across the
+  // whole model. Mirrors pruning.py's own `apply_embedding_vocab_pruning`.
+  auto [graph, chain] =
+      MatchEmbeddingChainAnyGraph(out.mutable_graph(), input_name);
+  if (!chain) {
+    return EmbeddingVocabPruningResult{std::move(out), false, {}, false};
+  }
+
+  const int64_t vocab_size = chain->vocab_size;
+  std::set<int64_t> keep_set;
+  if (keep_token_ids) {
+    keep_set.insert(keep_token_ids->begin(), keep_token_ids->end());
+  } else {
+    std::set<int64_t> drop_set(drop_token_ids->begin(), drop_token_ids->end());
+    std::vector<int64_t> bad_drop;
+    for (int64_t d : drop_set) {
+      if (!(d >= 0 && d < vocab_size)) {
+        bad_drop.push_back(d);
+      }
+    }
+    if (!bad_drop.empty()) {
+      throw std::invalid_argument(
+          "ApplyEmbeddingVocabPruning: drop_token_ids out of range [0, " +
+          std::to_string(vocab_size) + "), first offender " +
+          std::to_string(bad_drop.front()));
+    }
+    for (int64_t i = 0; i < vocab_size; ++i) {
+      if (!drop_set.count(i)) {
+        keep_set.insert(i);
+      }
+    }
+  }
+  for (int64_t k : keep_set) {
+    if (!(k >= 0 && k < vocab_size)) {
+      throw std::invalid_argument(
+          "ApplyEmbeddingVocabPruning: keep_token_ids out of range [0, " +
+          std::to_string(vocab_size) + "), first offender " +
+          std::to_string(k));
+    }
+  }
+  if (keep_set.empty()) {
+    throw std::invalid_argument(
+        "ApplyEmbeddingVocabPruning: keep_token_ids resolves to an empty "
+        "vocabulary");
+  }
+  const std::vector<int64_t> keep_ids(keep_set.begin(), keep_set.end());
+
+  ApplyEmbeddingVocabPrune(graph, *chain, keep_ids);
+  return EmbeddingVocabPruningResult{std::move(out), true, keep_ids,
+                                     chain->lm_head.has_value()};
+}
+
+EmbeddingVocabPruningResult ApplyEmbeddingVocabMagnitudePruning(
+    const onnx::ModelProto& model, double sparsity,
+    const std::optional<std::vector<int64_t>>& protect_token_ids,
+    const std::optional<std::string>& input_name) {
+  if (!(sparsity >= 0.0 && sparsity < 1.0)) {
+    throw std::invalid_argument(
+        "ApplyEmbeddingVocabMagnitudePruning: sparsity must be in [0, 1), "
+        "got " +
+        std::to_string(sparsity));
+  }
+  onnx::ModelProto out = model;
+
+  // Subgraph-aware exactly like ApplyEmbeddingVocabPruning above -- see
+  // MatchEmbeddingChainAnyGraph's own comment. Mirrors pruning.py's own
+  // `apply_embedding_vocab_magnitude_pruning`.
+  auto [graph, chain] =
+      MatchEmbeddingChainAnyGraph(out.mutable_graph(), input_name);
+  if (!chain) {
+    return EmbeddingVocabPruningResult{std::move(out), false, {}, false};
+  }
+
+  const int64_t vocab_size = chain->vocab_size;
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  const std::vector<double> importance =
+      EmbeddingVocabImportance(*chain, init_map);
+
+  std::set<int64_t> protect;
+  if (protect_token_ids) {
+    protect.insert(protect_token_ids->begin(), protect_token_ids->end());
+  }
+  for (int64_t p : protect) {
+    if (!(p >= 0 && p < vocab_size)) {
+      throw std::invalid_argument(
+          "ApplyEmbeddingVocabMagnitudePruning: protect_token_ids out of "
+          "range [0, " +
+          std::to_string(vocab_size) + "), first offender " +
+          std::to_string(p));
+    }
+  }
+
+  int64_t keep_count = std::max<int64_t>(
+      1, std::min<int64_t>(vocab_size, static_cast<int64_t>(std::llround(
+                                           static_cast<double>(vocab_size) *
+                                           (1.0 - sparsity)))));
+  keep_count =
+      std::max<int64_t>(keep_count, static_cast<int64_t>(protect.size()));
+
+  // Descending-importance order, all `vocab_size` indices (not just the top
+  // `keep_count` -- `protect` ids can sit anywhere in the ranking and must
+  // still be found so the fill loop below can skip re-adding them). Ties
+  // broken by ascending original index (std::stable_sort) -- may differ
+  // from numpy's own default (unstable) argsort tie-breaking, the same
+  // caveat TopKIndicesAscending's own comment already documents elsewhere
+  // in this file.
+  std::vector<int64_t> order(static_cast<size_t>(vocab_size));
+  std::iota(order.begin(), order.end(), int64_t{0});
+  std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+    return importance[static_cast<size_t>(a)] >
+           importance[static_cast<size_t>(b)];
+  });
+
+  std::set<int64_t> keep_set(protect.begin(), protect.end());
+  for (int64_t idx : order) {
+    if (static_cast<int64_t>(keep_set.size()) >= keep_count) {
+      break;
+    }
+    keep_set.insert(idx);
+  }
+  const std::vector<int64_t> keep_ids(keep_set.begin(), keep_set.end());
+
+  ApplyEmbeddingVocabPrune(graph, *chain, keep_ids);
+  return EmbeddingVocabPruningResult{std::move(out), true, keep_ids,
+                                     chain->lm_head.has_value()};
 }
