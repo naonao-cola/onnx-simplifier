@@ -59,6 +59,7 @@
 #include "passes/quantize_fp8.h"
 #include "passes/quarot.h"
 #include "passes/rewrite_arg_reduce_select_last_index.h"
+#include "passes/rewrite_bool_where.h"
 #include "passes/rewrite_gridsample_to_gather.h"
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_int16_conv.h"
@@ -151,6 +152,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::QuantizeFp8Pass>(registry);
     RegisterOrReplace<p::Quarot>(registry);
     RegisterOrReplace<p::RewriteArgReduceSelectLastIndex>(registry);
+    RegisterOrReplace<p::RewriteBoolWhere>(registry);
     RegisterOrReplace<p::RewriteGridSampleToGather>(registry);
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16Conv>(registry);

@@ -1492,11 +1492,9 @@ def apply_attention_head_pruning_cpp(
     neither kernel has a way to keep a KV head alive for some, but not all,
     of the query heads that shared it.
 
-    Unlike the pure-Python :func:`onnxsim.apply_attention_head_pruning`,
-    this port does not include the calibration-driven Wanda variant
-    (:func:`onnxsim.apply_attention_head_wanda_pruning`) -- data-free/
-    magnitude importance only, matching this codebase's C++-port scope
-    decision.
+    The calibration-driven Wanda upgrade of this same matching/ranking
+    (mirroring the pure-Python :func:`onnxsim.apply_attention_head_wanda_pruning`)
+    is :func:`onnxsim.apply_attention_head_wanda_pruning_cpp`.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
@@ -1519,6 +1517,221 @@ def apply_attention_head_pruning_cpp(
         model = onnx.load(model, load_external_data=False)
     return onnx.load_from_string(
         C.apply_attention_head_pruning(model.SerializeToString(), sparsity)
+    )
+
+
+def apply_attention_head_wanda_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    epsilon: float = 1e-8,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_attention_head_wanda_pruning`:
+    the calibrated upgrade of :func:`onnxsim.apply_attention_head_pruning_cpp`,
+    exactly as :func:`onnxsim.apply_structured_wanda_pruning_cpp` is to
+    :func:`onnxsim.apply_structured_pruning_cpp` -- same real
+    :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed calibration
+    machinery (see that function's own docstring for the general pattern),
+    applied to attention-head pruning instead of plain structured pruning.
+
+    Same real head (or, for ``GroupQueryAttention``/plain ``ai.onnx::Attention``,
+    whole-KV-group) removal and topology matching as
+    :func:`onnxsim.apply_attention_head_pruning_cpp` (a matched
+    ``com.microsoft::Attention``, ``com.microsoft::GroupQueryAttention``, or
+    plain ``ai.onnx::Attention`` block whose output feeds, optionally through
+    a single shape-preserving ``Reshape``, exactly one downstream
+    MatMul/vanilla-Gemm's reduction dimension -- see that function's own
+    docstring for the full topology and per-block-kind removal details), but
+    each unit's importance is ``||W||_F * ||X||_2`` -- the plain
+    Frobenius-norm weight score times the combined (root-sum-square)
+    activation norm of that unit's own slice of the *output projection's*
+    input, captured over calibration data -- instead of weight magnitude
+    alone. For a plain ``com.microsoft::Attention`` block this is per head,
+    exactly as before; for a ``GroupQueryAttention``/plain
+    ``ai.onnx::Attention`` block the activation norm is combined
+    (root-sum-square) over every query head a KV group owns, mirroring how
+    the plain weight importance is already combined across that group's own
+    Q+K+V producers.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to measure each
+            block's output-projection-side activation norm on. Each batch
+            is a ``{input_name: np.ndarray}`` dict matching ``model``'s
+            graph inputs -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: target fraction of each matched block's heads (or, for
+            GroupQueryAttention/plain ai.onnx Attention, KV groups) to
+            remove (at least one is always kept); must be in ``[0, 1)``
+    :param epsilon: floor applied to the accumulated per-unit activation
+            norm, avoiding every unit of an all-zero activation tying at
+            exactly the weight-only importance
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations (passed to the shared
+            :func:`onnxsim.onnx_simplifier._get_model_executor` process-wide
+            executor, the same one :func:`onnxsim.simplify` itself uses)
+    :returns: ``model`` with every matched block's tensors resized in place;
+            anything not matching that exact topology falls back to
+            :func:`onnxsim.apply_attention_head_pruning_cpp`'s own plain
+            Frobenius-norm ranking if no matching activation was ever
+            observed for that block's consumer (including whenever
+            ``calibration_data`` is empty)
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_structured_wanda_pruning_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_attention_head_wanda_pruning(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            sparsity,
+            epsilon,
+        )
+    )
+
+
+def apply_sparsegpt_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    n: Optional[int] = None,
+    m: Optional[int] = None,
+    percdamp: float = 0.01,
+    proc_block_size: int = 128,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_sparsegpt_pruning`: SparseGPT
+    (Frantar & Alistarh, 2023, "SparseGPT: Massive Language Models Can Be
+    Accurately Pruned in One-Shot", https://arxiv.org/abs/2301.00774) --
+    zeros the least-important entries of every matched layer's constant 2-D
+    weight to an unstructured or N:M sparsity pattern, using a sequential,
+    Hessian-error-compensating algorithm ported from GPTQ (same authors,
+    same Cholesky-factored inverse Hessian reformulation) rather than
+    magnitude/Wanda's one-shot static importance score -- every *kept*
+    entry may also change value, having accumulated compensation for every
+    entry pruned before it. Same real
+    :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed calibration
+    machinery as :func:`onnxsim.apply_structured_wanda_pruning_cpp` (see
+    that function's own docstring for the general pattern), but -- unlike
+    every other ``*_cpp`` pruning entry point in this module -- this NEVER
+    changes any tensor's shape: only individual weight entries are
+    rewritten in place, and every matched layer is processed completely
+    independently, with no producer/consumer chain-walking at all.
+
+    Matches every plain ``MatMul``/vanilla-``Gemm`` node with a constant 2-D
+    FLOAT32 weight (this already includes ``com.microsoft::
+    GroupQueryAttention``'s own separate Q/K/V projections -- ordinary
+    MatMul/Gemm nodes feeding it, not a weight the op itself owns), plus
+    every ``com.microsoft::Attention`` node's constant 2-D FLOAT32 merged
+    QKV weight. Deliberately narrower than the pure-Python
+    :func:`onnxsim.apply_sparsegpt_pruning` in two ways, both mirroring this
+    module's own established narrower-than-pruning.py C++-port scope
+    decisions elsewhere (e.g. :func:`onnxsim.apply_moe_expert_channel_pruning_cpp`'s
+    own FLOAT32-only restriction):
+
+    - FLOAT32 only, not also FLOAT16/BFLOAT16.
+    - 2-D ``Conv`` (ordinary/depthwise/general-grouped) is **not** matched
+      at all here -- the pure-Python original's own Conv support needs an
+      entirely new, from-first-principles im2col cross-covariance Hessian
+      (``H = patches.T @ patches``, plus a genuinely per-group Hessian and
+      column-processing split for grouped/depthwise Conv) that its own
+      module docstring documents at length as having no correct upstream
+      reference to port from at all -- reaching that bar is materially
+      bigger than the rest of this pass and is out of scope for this C++
+      port. A Conv node is left completely untouched here, never guessed
+      at, exactly as if it were any other unmatched node type -- use the
+      pure-Python :func:`onnxsim.apply_sparsegpt_pruning` if Conv coverage
+      is required.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to compute each
+            layer's Hessian from. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching ``model``'s graph
+            inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: target fraction of entries to zero (shared per
+            ``proc_block_size``-wide column block, not per row -- the one
+            deliberate departure from every other unstructured-pruning
+            function this port faithfully reproduces, matching the
+            reference SparseGPT implementation's own behavior), ignored
+            when ``n``/``m`` are given
+    :param n: keep the ``n`` highest-importance entries per group of ``m``
+            (semi-structured N:M pruning, e.g. NVIDIA's 2:4, per-row).
+            Must be given together with ``m``.
+    :param m: group size for N:M pruning; see ``n``
+    :param percdamp: Hessian damping factor (fraction of the mean diagonal
+            added to every diagonal entry before inversion), matching
+            :func:`onnxsim.apply_sparsegpt_pruning`'s own default
+    :param proc_block_size: column-processing block size -- both the
+            lazy-update granularity (how many columns' errors accumulate
+            locally before a full cross-block update) and, for
+            unstructured sparsity only, the width each shared per-block
+            threshold is computed over
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations (passed to the shared
+            :func:`onnxsim.onnx_simplifier._get_model_executor` process-wide
+            executor, the same one :func:`onnxsim.simplify` itself uses)
+    :returns: ``model`` with every matched layer's weight rewritten in
+            place to the target pattern; a layer with no observed 2-D
+            calibration activation (dead input, an otherwise-empty
+            ``calibration_data``, or every batch's activation isn't
+            FLOAT32) is left completely untouched -- there is no data-free
+            fallback for SparseGPT
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_structured_wanda_pruning_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_sparsegpt_pruning(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            sparsity,
+            n,
+            m,
+            percdamp,
+            proc_block_size,
+        )
     )
 
 
@@ -1561,11 +1774,8 @@ def apply_moe_expert_channel_pruning_cpp(
     pruning.py C++-port scope decision elsewhere (e.g.
     :func:`onnxsim.apply_structured_pruning_cpp`'s own ``MatMulNBits``
     ``scales``/``zero_points``/``bias`` restriction). Whole-expert pruning
-    (shrinking ``num_experts`` itself -- :func:`onnxsim.apply_moe_whole_expert_
-    pruning`, which needs runtime calibration data via an
-    ``onnxruntime.InferenceSession`` observing router activations) is a
-    deliberately separate, NOT-ported feature: this C++ port has no ONNX
-    Runtime linked into it at all.
+    (shrinking ``num_experts`` itself, calibration-driven) is a deliberately
+    separate entry point, :func:`onnxsim.apply_moe_whole_expert_pruning_cpp`.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
@@ -1630,11 +1840,9 @@ def apply_qmoe_expert_channel_pruning_cpp(
     Unlike :func:`onnxsim.apply_qmoe_expert_channel_pruning`, this port only
     admits FLOAT32 (not FLOAT16/BFLOAT16) ``fc1``/``fc2`` scales and bias,
     matching this codebase's C++-port scope decision for
-    :func:`onnxsim.apply_structured_pruning_matmul_nbits` above; and does
-    not include the complementary whole-expert-removal pass
-    (:func:`onnxsim.apply_qmoe_whole_expert_pruning`), which needs runtime
-    calibration data (an ONNX Runtime inference session observing router
-    activations) this C++ port has no ONNX Runtime linked into at all.
+    :func:`onnxsim.apply_structured_pruning_matmul_nbits` above. The
+    complementary whole-expert-removal pass is a separate entry point,
+    :func:`onnxsim.apply_qmoe_whole_expert_pruning_cpp`.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
@@ -1652,6 +1860,304 @@ def apply_qmoe_expert_channel_pruning_cpp(
         model = onnx.load(model, load_external_data=False)
     return onnx.load_from_string(
         C.apply_qmoe_expert_channel_pruning(model.SerializeToString(), sparsity)
+    )
+
+
+def apply_moe_whole_expert_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_moe_whole_expert_pruning`: the
+    calibration-driven complementary technique to
+    :func:`onnxsim.apply_moe_expert_channel_pruning_cpp`'s own `inter_size`
+    pruning -- drops whole experts (shrinks the `num_experts` leading axis)
+    from a matched ``com.microsoft::MoE`` node and its upstream router
+    projection at once, exactly like :func:`onnxsim.apply_structured_wanda_
+    pruning_cpp` is this onnxsim's first calibration-driven MoE C++ pruning
+    entry point: the executor actually runs `model` over `calibration_data`
+    to capture real router activations (via
+    :func:`onnxsim.onnx_simplifier._get_model_executor`, the same
+    process-wide executor :func:`onnxsim.simplify` itself uses).
+
+    For each matched ``MoE`` node whose upstream router is a single, untied,
+    constant-weight MatMul/vanilla-Gemm feeding `router_probs` (and nothing
+    else): ranks every expert by its mean router *gate weight* --
+    ``softmax(router_probs)`` averaged over every calibration token, NOT raw
+    logit magnitude (no shared scale across experts) and NOT exact top-k
+    selection frequency (would require re-deriving onnxruntime's own top-k +
+    renormalization semantics) -- drops the lowest-``sparsity``-fraction of
+    experts, with `num_experts_to_keep` silently FLOORED at the node's own
+    `k` attribute (`k` itself is never modified -- pruning below `k` experts
+    remaining is a hard onnxruntime execution failure, confirmed
+    empirically, not merely suboptimal). Every dropped expert's own
+    `fc1_experts_weights`/`fc2_experts_weights` (and `fc1_experts_bias`, if
+    present) row, and the router projection's own matching output column
+    (weight and bias, if present), are removed together. A chain whose
+    `router_probs` was never observed during calibration (e.g.
+    ``calibration_data=[]``, or a chain matched only inside a nested
+    subgraph -- see below) falls back to each expert's own combined
+    `fc1`/`fc2`(+bias) L2 weight norm, the same "no matching activation
+    observed" fallback :func:`onnxsim.apply_structured_wanda_pruning_cpp`
+    already uses.
+
+    A node with `fc3_experts_weights` present, a `swiglu`/unrecognized
+    `activation_type`, `use_sparse_mixer=1`, a non-constant or tied/shared
+    weight anywhere in the chain (including the router projection), a
+    `router_probs` with more than one consumer, or any other shape this
+    pass doesn't recognize is left completely untouched.
+
+    Subgraph-aware (matching/slicing) for every matched ``MoE`` node, at any
+    ``If``/``Loop``/``Scan``/``BeamSearch``-family nesting depth -- but the
+    calibration-based *ranking* only ever runs over chains matched in the
+    TOP-LEVEL graph (the probe-output injection this relies on can only
+    ever append to the top-level graph's own outputs), so a chain matched
+    only inside a nested subgraph always falls back to the weight-norm
+    ranking above -- still correctly pruned, never silently skipped.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to rank experts by
+            mean router gate weight on. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching ``model``'s graph
+            inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: target fraction of each matched node's `num_experts` to
+            remove (floored at the node's own `k`, so fewer may actually be
+            removed -- never more); must be in ``[0, 1)``
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration router activations (passed to the
+            shared :func:`onnxsim.onnx_simplifier._get_model_executor`
+            process-wide executor)
+    :returns: ``model`` with every matched ``MoE`` node's `fc1`/`fc2`(/`fc1`
+            bias) and its router projection's weight(/bias) resized in
+            place; anything not matching that exact topology is left
+            completely untouched
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing as
+    # apply_structured_wanda_pruning_cpp -- see that wrapper's own comment;
+    # the name -> positional reordering happens entirely on the C++ side
+    # (MoeRouterGateCalibrationStats in structured_pruning_entry.cpp).
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_moe_whole_expert_pruning(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            sparsity,
+        )
+    )
+
+
+def apply_qmoe_whole_expert_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_qmoe_whole_expert_pruning`: the
+    quantized-weight counterpart of
+    :func:`onnxsim.apply_moe_whole_expert_pruning_cpp` -- drops whole
+    experts from a matched ``com.microsoft::QMoE`` node and its upstream
+    router projection, ranked by the exact same calibration-based mean
+    router gate weight (`router_probs` is `QMoE`'s own second input too,
+    upstream of and oblivious to its quantized `fc1`/`fc2`, so this needs no
+    `QMoE`-specific calibration logic at all -- the same shared
+    ``MoeRouterGateCalibrationStats`` C++ helper is reused unchanged), and
+    the identical `k`-floor safety property.
+
+    Unlike :func:`onnxsim.apply_qmoe_expert_channel_pruning_cpp`'s own
+    `inter_size` slice (which needs the full packed-axis unpack/select/
+    repack machinery, since `inter_size` sometimes falls on a
+    sub-byte-packed axis), whole-expert pruning needs no such handling at
+    all: `num_experts` is every per-expert QMoE tensor's own LEADING axis
+    (`fc1`/`fc2` weights, scales, biases, zero_points, and -- for
+    `quant_type='nvfp4'` -- their own `global_scale`) regardless of
+    `quant_type`/`block_size`, so every one is a plain raw-element axis-0
+    index-select, plus the router projection's own weight/bias slice.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to rank experts by
+            mean router gate weight on. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching ``model``'s graph
+            inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: target fraction of each matched node's `num_experts` to
+            remove (floored at the node's own `k`); must be in ``[0, 1)``
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration router activations
+    :returns: ``model`` with every matched ``QMoE`` node's `fc1`/`fc2`
+            tensors (and their own `scales`/`bias`/`zero_points`/
+            `global_scale`, where present) and its router projection's
+            weight(/bias) resized in place; anything not matching that
+            exact topology is left completely untouched
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_qmoe_whole_expert_pruning(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            sparsity,
+        )
+    )
+
+
+def apply_transformer_block_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.25,
+    num_blocks_to_drop: Optional[int] = None,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_transformer_block_pruning`:
+    depth/block-level pruning that drops whole redundant pre-norm
+    transformer residual sub-blocks (``x = x + SelfAttn(LN(x))`` or
+    ``x = x + MLP(LN(x))``) wholesale, rather than shrinking every block a
+    little the way every other ``apply_*_cpp`` entry point does. A
+    GENUINELY DIFFERENT KIND of pass from every other C++-backed pruning
+    entry point in this module: it deletes whole graph nodes and rewires
+    their consumers straight through to the dropped block's own input
+    (real graph surgery, changing the graph's own topology), not tensors
+    resized in place. Same executor-as-first-argument shape as
+    :func:`onnxsim.apply_moe_whole_expert_pruning_cpp` -- the executor
+    actually runs `model` over `calibration_data` (via
+    :func:`onnxsim.onnx_simplifier._get_model_executor`, the same
+    process-wide executor :func:`onnxsim.simplify` itself uses) to capture
+    each candidate block's own input/output activations.
+
+    See :func:`onnxsim.apply_transformer_block_pruning`'s own docstring
+    (the pure-Python reference this ports) and
+    ``onnxsim/structured_pruning_entry.cpp``'s own "Transformer block
+    (depth) pruning" section comment for the exact matched pattern: a
+    pre-norm residual sub-block whose merge is a bare ``Add`` (never a
+    fused ``SkipLayerNormalization``-family node in that role) and whose
+    entry norm is either a plain, unfused ``LayerNormalization``/
+    ``RMSNormalization``/``SimplifiedLayerNormalization`` node, or a fused
+    ``SkipLayerNormalization``/``SkipSimplifiedLayerNormalization`` node's
+    own optional fourth output standing in for the block's own raw input
+    -- so a model already run through onnxruntime's own transformer
+    optimizer is matched too. Attention and MLP/FFN blocks are matched and
+    dropped fully independently, never only as a paired "whole layer". A
+    KV-cache-bearing attention block needs no dedicated detection to
+    always decline safely on its own (its own ``present_key``/
+    ``present_value`` graph outputs trip the same generic "no
+    block-internal output may leak outside the block" check every
+    candidate is held to).
+
+    Every candidate is confirmed shape-safe (using real
+    ``onnx::shape_inference`` output, not just whatever ``value_info``
+    `model` already happened to carry) before ranking ever runs. Candidates
+    are ranked by mean cosine similarity between their own input/output
+    over `calibration_data` -- the literature-standard ("Block Influence"/
+    ShortGPT-style) redundancy signal -- and the highest-similarity ones
+    are dropped first, up to the target count, skipping (not failing) any
+    candidate whose own interior overlaps an already-committed one's.
+
+    Subgraph-aware (matching/selection/committing) exactly like
+    :func:`onnxsim.apply_transformer_block_pruning`'s own docstring: the
+    calibration-based ranking only ever runs over candidates matched in
+    the TOP-LEVEL graph (the probe-output injection this relies on can
+    only ever append to the top-level graph's own outputs), so a candidate
+    matched only inside a nested subgraph is conservatively ranked last
+    (never preferentially dropped) but is still genuinely droppable if
+    `target` calls for it; `sparsity`/`num_blocks_to_drop` are pooled
+    ACROSS THE WHOLE MODEL, not computed independently per graph.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to measure each
+            candidate block's own input/output similarity on. Each batch
+            is a ``{input_name: np.ndarray}`` dict matching ``model``'s
+            graph inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: fraction of *matched candidate* blocks to drop
+            (rounded to the nearest whole block), ignored when
+            ``num_blocks_to_drop`` is given
+    :param num_blocks_to_drop: an explicit number of blocks to drop
+            instead of a fraction, silently capped at however many
+            candidates were actually matched
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations (passed to the shared
+            :func:`onnxsim.onnx_simplifier._get_model_executor` process-wide
+            executor)
+    :returns: ``model`` with the target number of matched candidate blocks
+            -- whichever ones ranked most redundant -- deleted and their
+            own consumers rewired to read straight through to their own
+            block's own input; unchanged (a byte-for-byte copy) if no
+            candidate was matched, ``sparsity``/``num_blocks_to_drop``
+            rounds to zero blocks, or ``calibration_data`` never gives any
+            candidate a valid (non-degenerate) token to rank on
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing as
+    # apply_structured_wanda_pruning_cpp -- see that wrapper's own comment;
+    # the name -> positional reordering happens entirely on the C++ side
+    # (TransformerBlockSimilarity in structured_pruning_entry.cpp).
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_transformer_block_pruning(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            sparsity,
+            num_blocks_to_drop,
+        )
     )
 
 
