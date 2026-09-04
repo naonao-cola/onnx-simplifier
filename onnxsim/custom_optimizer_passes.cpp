@@ -16,6 +16,7 @@
 #include "passes/dynamic_quantize_matmul.h"
 #include "passes/dynamic_quantize_matmul_integer_to_float.h"
 #include "passes/dynamic_quantize_ternary_matmul.h"
+#include "passes/eliminate_consecutive_idempotent_ops.h"
 #include "passes/eliminate_loop_with_const_trip_count.h"
 #include "passes/eliminate_nop_dropout.h"
 #include "passes/eliminate_optional_get_element.h"
@@ -165,6 +166,7 @@ void RegisterCustomOptimizerPasses() {
     // names, so onnxsim's fixes/extensions (ConvTranspose fusions, no-op
     // opset-12 Dropout, zero-padding MaxPool, ...) apply while the fork itself
     // tracks upstream onnxoptimizer.
+    RegisterOrReplace<p::EliminateConsecutiveIdempotentOps>(registry);
     RegisterOrReplace<p::EliminateNopDropout>(registry);
     RegisterOrReplace<p::FuseAddBiasIntoConv>(registry);
     RegisterOrReplace<p::FuseBNIntoConv>(registry);
