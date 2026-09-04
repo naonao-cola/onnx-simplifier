@@ -82,6 +82,9 @@ DEFAULT_IMAGE = "pulsar2:6.0-lite"
 
 _MAX_CYCLE_RE = re.compile(r"max_cycle\s*=\s*([\d,]+)")
 _FUSE_RE = re.compile(r"fuse (\d+) subgraph\(s\)")
+_LATENCY_RE = re.compile(
+    r"min\s*=\s*([\d.]+)\s*ms\s*max\s*=\s*([\d.]+)\s*ms\s*avg\s*=\s*([\d.]+)\s*ms"
+)
 
 
 def docker_image_available(image: str = DEFAULT_IMAGE) -> bool:
@@ -614,10 +617,7 @@ def run_on_device(
     except subprocess.TimeoutExpired:
         return {"min_ms": None, "max_ms": None, "avg_ms": None, "error": "timeout"}
     log = proc.stdout + proc.stderr
-    m = re.search(
-        r"min\s*=\s*([\d.]+)\s*ms\s*max\s*=\s*([\d.]+)\s*ms\s*avg\s*=\s*([\d.]+)\s*ms",
-        log,
-    )
+    m = _LATENCY_RE.search(log)
     if not m:
         return {"min_ms": None, "max_ms": None, "avg_ms": None, "error": log[-500:]}
     return {
@@ -628,26 +628,60 @@ def run_on_device(
     }
 
 
+def _parse_latency(log: str) -> Dict[str, Optional[float]]:
+    m = _LATENCY_RE.search(log)
+    if not m:
+        return {"min_ms": None, "max_ms": None, "avg_ms": None}
+    return {
+        "min_ms": float(m.group(1)),
+        "max_ms": float(m.group(2)),
+        "avg_ms": float(m.group(3)),
+    }
+
+
+@dataclass
+class DeviceRunResult:
+    outputs: Optional[List[bytes]] = None
+    min_ms: Optional[float] = None
+    max_ms: Optional[float] = None
+    avg_ms: Optional[float] = None
+    error: Optional[str] = None
+
+
 def run_on_device_with_inputs(
     axmodel_path: str,
     inputs: Dict[str, bytes],
     *,
+    repeat: int = 1,
+    warmup: int = 0,
     binary: str = "/usr/bin/axcl/axcl_run_model",
     timeout: int = 120,
-) -> Optional[List[bytes]]:
+) -> DeviceRunResult:
     """Feed exactly `inputs` (`{tensor_name: raw_bytes}`, one entry per
     graph input -- e.g. a real reconstructed LLM graph's `input_ids` *and*
     `position_ids`, see `demo_hf_llm.py`) to a real device and return the
-    raw output tensor bytes (one per output, model's declared order). Uses
-    the confirmed real `-i/-o/-l` folder layout: `<in>/0/<tensor_name>.bin`
-    per input, `list.txt` containing `0`, outputs land at `<out>/0/
-    <output_name>.bin`. **Each input filename must exactly match its tensor
-    name** -- confirmed by trial: `axcl_run_model` errors with "Stimulus
-    file ... is not exist" naming the *tensor's* name specifically, not an
-    arbitrary/first-found file.
+    raw output tensor bytes (one per output, model's declared order) plus
+    latency stats (from `repeat`/`warmup`, same as `run_on_device()`; left
+    `None` at the default `repeat=1, warmup=0`, since `axcl_run_model`
+    doesn't report a min/max/avg line for a single, non-benchmark run).
+    Uses the confirmed real `-i/-o/-l` folder layout: `<in>/0/
+    <tensor_name>.bin` per input, `list.txt` containing `0`, outputs land
+    at `<out>/0/<output_name>.bin`. **Each input filename must exactly
+    match its tensor name** -- confirmed by trial: `axcl_run_model` errors
+    with "Stimulus file ... is not exist" naming the *tensor's* name
+    specifically, not an arbitrary/first-found file.
+
+    **Prefer this over `run_on_device()` for benchmarking any model with a
+    bounded-range input** (e.g. an embedding lookup's token ids): confirmed
+    real crash, `run_on_device()` lets `axcl_run_model` fill inputs with
+    unconstrained random bytes, and an out-of-range "token id" against a
+    real reconstructed LLM graph's `Gather` over its embedding table faults
+    the NPU (`[ERROR] Run model failed{0x8030070C}`) instead of just
+    producing garbage output the way an out-of-range float would for a CNN.
+    Real, valid (in-range) input data sidesteps this entirely.
     """
     if not axcl_available(binary):
-        return None
+        return DeviceRunResult(error="axcl_run_model not found")
     with tempfile.TemporaryDirectory() as td:
         in_dir = os.path.join(td, "in", "0")
         out_dir = os.path.join(td, "out")
@@ -660,7 +694,7 @@ def run_on_device_with_inputs(
         with open(list_path, "w") as f:
             f.write("0\n")
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 [
                     binary,
                     "-m",
@@ -672,21 +706,24 @@ def run_on_device_with_inputs(
                     "-l",
                     list_path,
                     "-r",
-                    "1",
+                    str(repeat),
                     "-w",
-                    "0",
+                    str(warmup),
                 ],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:
-            return None
+            return DeviceRunResult(error="timeout")
+        log = proc.stdout + proc.stderr
         outputs = []
         for p in sorted(glob.glob(os.path.join(out_dir, "0", "*.bin"))):
             with open(p, "rb") as f:
                 outputs.append(f.read())
-        return outputs or None
+        if not outputs:
+            return DeviceRunResult(error=log[-2000:])
+        return DeviceRunResult(outputs=outputs, **_parse_latency(log))
 
 
 def run_on_device_with_input(
@@ -698,7 +735,10 @@ def run_on_device_with_input(
     timeout: int = 120,
 ) -> Optional[List[bytes]]:
     """Single-input convenience wrapper over `run_on_device_with_inputs()`,
-    for the (still common) single-image-input-classifier case."""
+    for the (still common) single-image-input-classifier case. Returns just
+    the raw output bytes (or `None` on failure) -- use
+    `run_on_device_with_inputs()` directly for latency stats or an error
+    message."""
     return run_on_device_with_inputs(
         axmodel_path, {input_tensor_name: input_bytes}, binary=binary, timeout=timeout
-    )
+    ).outputs

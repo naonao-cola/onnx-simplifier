@@ -112,15 +112,6 @@ def main() -> int:
         print("no AXCL device found -- skipping on-device run")
         return 0
 
-    stats = pulsar2_docker.run_on_device(result.axmodel_path)
-    if stats["error"] is not None:
-        print(f"on-device benchmark failed: {stats['error']}", file=sys.stderr)
-    else:
-        print(
-            f"on-device latency: min={stats['min_ms']}ms "
-            f"max={stats['max_ms']}ms avg={stats['avg_ms']}ms"
-        )
-
     config = _read_config(args.hf_dir)
     vocab_size = int(config.get("vocab_size", 32000))
 
@@ -151,18 +142,29 @@ def main() -> int:
         d.dim_value for d in compiled.graph.output[0].type.tensor_type.shape.dim
     )
 
-    outputs = pulsar2_docker.run_on_device_with_inputs(
+    # repeat=5, warmup=2: also benchmarks, with real in-range input data --
+    # see run_on_device_with_inputs()'s docstring for why run_on_device()'s
+    # own random-fill benchmarking mode is unsafe for a model with a
+    # bounded-range input like a token id feeding an embedding Gather.
+    run = pulsar2_docker.run_on_device_with_inputs(
         result.axmodel_path,
         {
             "input_ids": _pack_int32(input_ids),
             "position_ids": _pack_int32(position_ids),
         },
+        repeat=5,
+        warmup=2,
     )
-    if outputs is None:
-        print("on-device run with real input failed", file=sys.stderr)
+    if run.outputs is None:
+        print(f"on-device run with real input failed: {run.error}", file=sys.stderr)
         return 1
+    if run.avg_ms is not None:
+        print(
+            f"on-device latency: min={run.min_ms}ms max={run.max_ms}ms "
+            f"avg={run.avg_ms}ms"
+        )
 
-    logits = np.frombuffer(outputs[0], dtype="<f4").reshape(output_shape)
+    logits = np.frombuffer(run.outputs[0], dtype="<f4").reshape(output_shape)
     next_token_logits = logits[0, -1]
     top5 = np.argsort(next_token_logits)[::-1][:5]
     print(f"output tensor: {output_name}, shape {output_shape}")
