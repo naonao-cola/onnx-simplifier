@@ -54,6 +54,63 @@ onnx::ModelProto ApplyMoeExpertChannelPruning(const onnx::ModelProto& model,
 onnx::ModelProto ApplyQMoEExpertChannelPruning(const onnx::ModelProto& model,
                                                double sparsity);
 
+// Removes whole experts (shrinks the `num_experts` leading axis) from a
+// matched `com.microsoft::MoE` node and its upstream router projection at
+// once -- the complementary technique to ApplyMoeExpertChannelPruning's own
+// `inter_size` pruning. The C++ port of pruning.py's own
+// `apply_moe_whole_expert_pruning`: experts are ranked by their mean router
+// *gate weight* (`softmax(router_probs)` averaged over every calibration
+// token, via the shared MoeRouterGateCalibrationStats helper in
+// structured_pruning_entry.cpp -- see that function's own comment, and
+// pruning.py's own `_moe_router_gate_calibration_stats`, for the full
+// safety argument for why Softmax-then-mean, not raw logit magnitude or
+// exact top-k frequency), falling back to each expert's own combined
+// `fc1`/`fc2`(+`fc1_experts_bias`) L2 weight norm when a chain's
+// `router_probs` was never observed during calibration (including
+// `calibration_data=[]`, or a chain matched only inside a nested subgraph --
+// see structured_pruning_entry.cpp's own "MoE whole-expert pruning" section
+// comment). `num_experts_to_keep` is silently floored at the matched node's
+// own `k` attribute (`k` itself is NEVER modified) -- pruning below `k`
+// experts remaining is a hard onnxruntime execution failure, not merely
+// suboptimal.
+//
+// Subgraph-aware (IterSubgraphs) for matching/slicing, exactly like
+// ApplyMoeExpertChannelPruning -- but the calibration-based *ranking* only
+// ever runs over chains matched in the TOP-LEVEL graph (mirrors
+// pruning.py's own scope decision: `_add_probe_outputs` only ever appends
+// to the top-level graph's own `output` list), so a chain matched only
+// inside a nested If/Loop/Scan/BeamSearch-family subgraph always falls back
+// to the weight-norm-only ranking above -- still correctly pruned, never
+// silently skipped.
+//
+// Same calibration_data contract as ApplyStructuredWandaPruning: a batch
+// missing one of `model`'s own graph inputs throws `std::invalid_argument`.
+onnx::ModelProto ApplyMoeWholeExpertPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity);
+
+// The quantized-weight (`com.microsoft::QMoE`) counterpart of
+// ApplyMoeWholeExpertPruning -- the C++ port of pruning.py's own
+// `apply_qmoe_whole_expert_pruning`. Reuses the exact same
+// MoeRouterGateCalibrationStats helper unchanged (`router_probs` is QMoE's
+// own second input too, upstream of and oblivious to its quantized
+// `fc1`/`fc2`), and the exact same `k`-floor safety property. Unlike
+// ApplyQMoEExpertChannelPruning's own `inter_size` slicing, whole-expert
+// pruning needs no packed-axis unpack/re-pack anywhere: `num_experts` is
+// every per-expert QMoE tensor's own LEADING axis regardless of
+// `quant_type`/`block_size` (packing always lives on a later axis), so
+// every `fc1`/`fc2` weight/scale/bias/zero_point (and, for
+// `quant_type='nvfp4'`, `fc1`/`fc2`'s own `global_scale`) is a plain
+// raw-element axis-0 index-select -- see structured_pruning_entry.cpp's own
+// "QMoE whole-expert pruning" section comment.
+onnx::ModelProto ApplyQMoEWholeExpertPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity);
+
 // Return type of ApplyEmbeddingVocabPruning/ApplyEmbeddingVocabMagnitude
 // Pruning -- the C++ mirror of pruning.py's own `EmbeddingPruningResult`
 // dataclass (see structured_pruning_entry.cpp's own "Embedding vocabulary

@@ -735,6 +735,59 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "sparsity"_a);
 
+  // MoE whole-expert pruning: the calibration-driven complementary
+  // technique to apply_moe_expert_channel_pruning above -- drops whole
+  // experts (shrinks `num_experts`) ranked by mean router gate weight over
+  // `calibration_data`, same executor-as-first-argument shape as
+  // apply_structured_wanda_pruning (this is likewise NOT purely
+  // data-free -- it runs `model_bytes` over `calibration_data` to capture
+  // router activations). See ApplyMoeWholeExpertPruning in
+  // structured_pruning_entry.h.
+  m.def(
+      "apply_moe_whole_expert_pruning",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double sparsity) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyMoeWholeExpertPruning(
+            model, *executor, calibration_data, sparsity);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a);
+
+  // QMoE whole-expert pruning: the quantized-weight counterpart of
+  // apply_moe_whole_expert_pruning above -- same calibration-driven
+  // ranking (mean router gate weight, the exact same
+  // MoeRouterGateCalibrationStats helper -- `router_probs` is QMoE's own
+  // second input too, upstream of and oblivious to its quantized
+  // fc1/fc2), same executor-as-first-argument shape. See
+  // ApplyQMoEWholeExpertPruning in structured_pruning_entry.h.
+  m.def(
+      "apply_qmoe_whole_expert_pruning",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double sparsity) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyQMoEWholeExpertPruning(
+            model, *executor, calibration_data, sparsity);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a);
+
   // Embedding vocabulary pruning: shrinks a matched token-embedding
   // table's vocabulary axis (plus, where a tied/untied lm_head exists, its
   // own vocab-logits projection too) down to a caller-supplied explicit
