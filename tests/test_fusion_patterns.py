@@ -420,6 +420,84 @@ def test_fuse_consecutive_reduce_unsqueeze():
     assert ops["ReduceSum"] == 1
 
 
+def test_fuse_consecutive_reduce():
+    # Two consecutive ReduceSum nodes collapse into one over the union of
+    # their axes. The second reduction's axis (1) is expressed relative to
+    # the already-reduced (rank-3) tensor, where it refers to original axis 2
+    # -- exercising the index remapping through the dropped axis 1, not just
+    # a trailing/no-shift axis.
+    model = _model(
+        """
+        g (float[2,3,4,5] X) => (float[2,5] Z)
+        <int64[1] ax0 = {1}, int64[1] ax1 = {1}>
+        {
+          y = ReduceSum<keepdims = 0>(X, ax0)
+          Z = ReduceSum<keepdims = 0>(y, ax1)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["ReduceSum"] == 1
+
+
+def test_fuse_consecutive_reduce_through_reshape():
+    # ReduceSum(keepdims=0) -> Reshape (re-adding the reduced axis as size 1,
+    # equivalent to keepdims=1) -> ReduceSum(keepdims=0) collapses into a
+    # single ReduceSum, eliminating the Reshape as well.
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[2,3] Z)
+        <int64[1] ax = {2}, int64[3] shp = {2,3,1}>
+        {
+          y = ReduceSum<keepdims = 0>(X, ax)
+          r = Reshape(y, shp)
+          Z = ReduceSum<keepdims = 0>(r, ax)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["Reshape"] == 0
+    assert ops["ReduceSum"] == 1
+
+
+def test_fuse_consecutive_reduce_declines_different_kind():
+    # ReduceSum followed by ReduceMax must not fuse -- the two ops don't
+    # combine associatively across a shared axis group.
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[2,3] Z)
+        <int64[1] ax = {2}>
+        {
+          y = ReduceSum<keepdims = 0>(X, ax)
+          Z = ReduceMax<keepdims = 0>(y, ax)
+        }
+        """,
+        opset=18,
+    )
+    _, ops = _simplify(model)
+    assert ops["ReduceSum"] == 1
+    assert ops["ReduceMax"] == 1
+
+
+def test_fuse_consecutive_reduce_declines_sum_square():
+    # ReduceSumSquare does not have the fold-into-one-application property
+    # ((sum(x^2))^2 != sum(x^4)), so consecutive ReduceSumSquare nodes must
+    # be left alone.
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[2,3] Z)
+        <int64[1] ax = {2}>
+        {
+          y = ReduceSumSquare<keepdims = 0>(X, ax)
+          Z = ReduceSumSquare<keepdims = 0>(y, ax)
+        }
+        """,
+        opset=18,
+    )
+    _, ops = _simplify(model)
+    assert ops["ReduceSumSquare"] == 2
+
+
 def test_fuse_rms_norm():
     # x.pow(2).mean(-1, keepdim=True) -> x * rsqrt(variance + eps) -> weight *
     # (...): the textbook RMSNorm forward used by LLaMA/Mistral/Qwen-family
