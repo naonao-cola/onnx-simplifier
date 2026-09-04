@@ -17,10 +17,12 @@ plus a couple of tests confirming unmatched topologies are left untouched
 
 import os
 
+import ml_dtypes
 import numpy as np
 import onnx
 import onnx.helper
 import onnx.numpy_helper
+import onnx.reference
 import pytest
 from onnx import parser
 
@@ -5840,3 +5842,851 @@ def test_cpp_structured_pruning_matmul_nbits_matches_python_reference_output():
     (y_py,) = _run(pruned_py, {"A": x})
     (y_cpp,) = _run(pruned_cpp, {"A": x})
     np.testing.assert_allclose(y_py, y_cpp, rtol=1e-5, atol=1e-5)
+
+
+# --- QDQ (quantized-weight) structured pruning -----------------------------
+#
+# Mirrors ``tests/test_pruning.py``'s own "apply_structured_pruning_qdq"
+# coverage for ``onnxsim.apply_structured_pruning_cpp`` -- the C++ port also
+# runs the QDQ-quantized chain families (see
+# ``onnxsim/structured_pruning_entry.cpp``'s own "QDQ (quantized-weight)
+# structured pruning" section comment), wired into the SAME entry point as
+# the plain-float chains above (unlike ``onnxsim.pruning``, which keeps
+# ``apply_structured_pruning_qdq`` a separate top-level function). Numeric-
+# oracle tests below run the pruned QDQ graph through onnxruntime with graph
+# optimizations disabled (``_run_unfused``), not the default-optimization
+# ``_run`` every other test in this file uses -- confirmed empirically (see
+# ``test_pruning.py``'s own identical comment): with default optimizations,
+# onnxruntime's own QDQ-aware graph optimizer fuses the
+# DequantizeLinear->MatMul/Conv pattern into an internal integer kernel whose
+# accumulation order differs from naive float dequantize-then-matmul,
+# changing the result by more than float32 rounding -- an onnxruntime
+# *optimization* artifact orthogonal to this pass's own correctness.
+
+
+def _i8(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.int8), name)
+
+
+def _int4(array, name):
+    return onnx.numpy_helper.from_array(
+        array.astype(np.int8).astype(ml_dtypes.int4), name
+    )
+
+
+def _uint4(array, name):
+    return onnx.numpy_helper.from_array(
+        array.astype(np.uint8).astype(ml_dtypes.uint4), name
+    )
+
+
+def _run_unfused(model, feeds):
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    sess = ort.InferenceSession(
+        model.SerializeToString(), sess_options=so, providers=["CPUExecutionProvider"]
+    )
+    return sess.run(None, feeds)
+
+
+def _qdq_dequant(q, scale, zero_point, axis):
+    # Independent reference dequantization -- mirrors the ONNX
+    # DequantizeLinear formula `y = (x - x_zero_point) * x_scale` directly,
+    # not anything from onnxsim itself.
+    q = q.astype(np.float64)
+    scale = scale.astype(np.float64)
+    if scale.ndim == 1:
+        shape = [1] * q.ndim
+        shape[axis] = -1
+        scale = scale.reshape(shape)
+    if zero_point is not None:
+        zp = zero_point.astype(np.float64)
+        if zp.ndim == 1:
+            shape = [1] * q.ndim
+            shape[axis] = -1
+            zp = zp.reshape(shape)
+        q = q - zp
+    return q * scale
+
+
+def _qdq_block_dequant(q, scale, zero_point, axis, block_size):
+    # Independent reference for BLOCKWISE dequantization -- mirrors opset
+    # 21's own `DequantizeLinear` formula with a `block_size` attribute.
+    q = q.astype(np.float64)
+    scale = np.repeat(scale.astype(np.float64), block_size, axis=axis)
+    slicer = [slice(None)] * q.ndim
+    slicer[axis] = slice(0, q.shape[axis])
+    scale = scale[tuple(slicer)]
+    if zero_point is not None:
+        zp = np.repeat(zero_point.astype(np.float64), block_size, axis=axis)
+        zp = zp[tuple(slicer)]
+        q = q - zp
+    return q * scale
+
+
+def _requantize_symmetric_int8_per_channel(w_float):
+    # An independent "dequantize-then-prune-then-REQUANTIZE-from-scratch"
+    # oracle -- NOT what this pass does (it slices the ORIGINAL codes/scale
+    # unchanged, see this file's own section comment above), used only to
+    # positively confirm "slice, don't recompute": a fresh symmetric
+    # per-output-channel INT8 quantization fit to the pruned float
+    # submatrix's own max-abs generally derives a numerically DIFFERENT
+    # scale than the original tensor's own (unrelated) scale values, so if
+    # the pass's own pruned scale matched THIS oracle instead of
+    # `Wscale[keep]`, that would be conclusive evidence of a
+    # dequant-requant bug rather than a direct slice.
+    amax = np.max(np.abs(w_float), axis=0)
+    scale = np.where(amax > 0, amax / 127.0, 1.0).astype(np.float32)
+    codes = np.clip(np.round(w_float / scale), -127, 127).astype(np.int8)
+    return codes, scale
+
+
+def _matmul_qdq_producer_model(K=8, H=16, Out=4, seed=0, zero_point=False):
+    rng = np.random.default_rng(seed)
+    Wq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    W2 = rng.standard_normal((H, Out)).astype(np.float32)
+    initializer = [_i8(Wq, "Wq"), _f32(Wscale, "Wscale"), _f32(W2, "W2")]
+    zp_input = ""
+    Wzp = None
+    if zero_point:
+        Wzp = rng.integers(-20, 20, size=H).astype(np.int8)
+        initializer.append(_i8(Wzp, "Wzp"))
+        zp_input = ", Wzp"
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wdq = DequantizeLinear<axis=1>(Wq, Wscale{zp_input})
+          h = MatMul(X, Wdq)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, Wq, Wscale, Wzp, W2
+
+
+def test_cpp_qdq_structured_pruning_matmul_producer_per_channel_matches_oracle():
+    # Per-channel INT8 QDQ MatMul producer feeding a plain float MatMul
+    # consumer -- co-sliced Wq/Wscale, verified end to end AND confirmed to
+    # be a genuine slice rather than a dequant-prune-requantize round trip
+    # (per this task's own verification bar).
+    K, H, Out = 8, 16, 4
+    model, Wq, Wscale, _Wzp, W2 = _matmul_qdq_producer_model(K, H, Out, seed=0)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H // 2]
+    assert list(inits["Wscale"].dims) == [H // 2]
+    assert list(inits["W2"].dims) == [H // 2, Out]
+
+    w_dequant = _qdq_dequant(Wq, Wscale, None, axis=1)
+    keep = _oracle_keep_indices(w_dequant, H // 2)
+
+    rng = np.random.default_rng(9)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    h = x @ w_dequant[:, keep]
+    y_oracle = h @ W2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+    # "Slice, don't recompute": the pruned Wq/Wscale are BIT-IDENTICAL to
+    # the original tensors at the surviving indices, never anything derived
+    # from a fresh quantization of the pruned float weight.
+    wq_pruned = onnx.numpy_helper.to_array(inits["Wq"])
+    wscale_pruned = onnx.numpy_helper.to_array(inits["Wscale"])
+    np.testing.assert_array_equal(wq_pruned, Wq[:, keep])
+    np.testing.assert_allclose(wscale_pruned, Wscale[keep])
+
+    # Oracle cross-check: an independent dequantize-prune-REQUANTIZE pass
+    # over the SAME pruned float submatrix derives a scale that generally
+    # differs from the pass's own (original, sliced) scale -- confirming
+    # the equality above is a genuine "slice, don't recompute" result, not
+    # a coincidence of a requantization oracle landing on the same values.
+    _requant_codes, requant_scale = _requantize_symmetric_int8_per_channel(
+        w_dequant[:, keep]
+    )
+    assert not np.allclose(wscale_pruned, requant_scale)
+
+
+def test_cpp_qdq_structured_pruning_matmul_producer_asymmetric_zero_point_matches_oracle():
+    K, H, Out = 8, 16, 4
+    model, Wq, Wscale, Wzp, W2 = _matmul_qdq_producer_model(
+        K, H, Out, seed=1, zero_point=True
+    )
+    onnx.checker.check_model(model)
+    assert Wzp is not None
+    assert np.any(Wzp != 0)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wzp"].dims) == [H // 2]
+
+    w_dequant = _qdq_dequant(Wq, Wscale, Wzp, axis=1)
+    keep = _oracle_keep_indices(w_dequant, H // 2)
+
+    rng = np.random.default_rng(10)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    h = x @ w_dequant[:, keep]
+    y_oracle = h @ W2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+    wzp_pruned = onnx.numpy_helper.to_array(inits["Wzp"])
+    np.testing.assert_array_equal(wzp_pruned, Wzp[keep])
+
+
+def test_cpp_qdq_structured_pruning_matmul_consumer_matches_oracle_and_leaves_scale_untouched():
+    # Plain float producer (W1) feeding a QDQ (per-channel) MatMul consumer
+    # -- only Wq's own input/reduction axis is sliced; Wscale (indexed by
+    # the consumer's own OUTPUT channel) must come out byte-identical.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(4)
+    W1 = rng.standard_normal((K, H)).astype(np.float32)
+    Wq = rng.integers(-100, 100, size=(H, Out)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal(Out)).astype(np.float32) * 0.03 + 0.001
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          Wdq = DequantizeLinear<axis=1>(Wq, Wscale)
+          Y = MatMul(h, Wdq)
+        }}
+        """,
+        initializer=[_f32(W1, "W1"), _i8(Wq, "Wq"), _f32(Wscale, "Wscale")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [H // 2, Out]
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["Wscale"]), Wscale)
+
+    keep = _oracle_keep_indices(W1, H // 2)
+    w_dequant = _qdq_dequant(Wq, Wscale, None, axis=1)
+
+    rng2 = np.random.default_rng(5)
+    x = rng2.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    h = x @ W1[:, keep]
+    y_oracle = h @ w_dequant[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_cpp_qdq_structured_pruning_per_tensor_scale_left_untouched():
+    # Per-tensor (scalar) QDQ weight on the producer side: only Wq is
+    # sliced -- the scalar Wscale is byte-identical regardless of channel
+    # count.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(6)
+    Wq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wscale = np.array(0.05, dtype=np.float32)
+    W2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wdq = DequantizeLinear(Wq, Wscale)
+          h = MatMul(X, Wdq)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_i8(Wq, "Wq"), _f32(Wscale, "Wscale"), _f32(W2, "W2")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H // 2]
+    assert onnx.numpy_helper.to_array(inits["Wscale"]) == pytest.approx(0.05)
+
+    w_dequant = Wq.astype(np.float64) * 0.05
+    keep = _oracle_keep_indices(w_dequant, H // 2)
+    rng2 = np.random.default_rng(7)
+    x = rng2.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    y_oracle = (x @ w_dequant[:, keep]) @ W2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_cpp_qdq_structured_pruning_conv_both_sides_qdq_matches_oracle():
+    Cin, Cmid, Cout = 4, 8, 4
+    rng = np.random.default_rng(8)
+    Wq1 = rng.integers(-100, 100, size=(Cmid, Cin, 1, 1)).astype(np.int8)
+    Wscale1 = np.abs(rng.standard_normal(Cmid)).astype(np.float32) * 0.02 + 0.001
+    Wq2 = rng.integers(-100, 100, size=(Cout, Cmid, 1, 1)).astype(np.int8)
+    Wscale2 = np.abs(rng.standard_normal(Cout)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[1,{Cin},4,4] X) => (float[1,{Cout},4,4] Y)
+        {{
+          W1dq = DequantizeLinear<axis=0>(Wq1, Wscale1)
+          h = Conv(X, W1dq)
+          W2dq = DequantizeLinear<axis=0>(Wq2, Wscale2)
+          Y = Conv(h, W2dq)
+        }}
+        """,
+        initializer=[
+            _i8(Wq1, "Wq1"),
+            _f32(Wscale1, "Wscale1"),
+            _i8(Wq2, "Wq2"),
+            _f32(Wscale2, "Wscale2"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq1"].dims) == [Cmid // 2, Cin, 1, 1]
+    assert list(inits["Wscale1"].dims) == [Cmid // 2]
+    assert list(inits["Wq2"].dims) == [Cout, Cmid // 2, 1, 1]
+    assert list(inits["Wscale2"].dims) == [Cout]  # consumer's own scale untouched
+
+    w1_dequant = _qdq_dequant(Wq1, Wscale1, None, axis=0)
+    w2_dequant = _qdq_dequant(Wq2, Wscale2, None, axis=0)
+    w1_nk = w1_dequant.reshape(Cmid, -1)
+    keep = _oracle_keep_indices(w1_nk.T, Cmid // 2)
+
+    rng2 = np.random.default_rng(11)
+    x = rng2.standard_normal((1, Cin, 4, 4)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    ref_model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Conv", ["X", "W1"], ["h"]),
+                onnx.helper.make_node("Conv", ["h", "W2"], ["Y"]),
+            ],
+            "oracle",
+            [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, None)],
+            [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, None)],
+            initializer=[
+                onnx.numpy_helper.from_array(
+                    w1_dequant[keep].astype(np.float32), name="W1"
+                ),
+                onnx.numpy_helper.from_array(
+                    w2_dequant[:, keep].astype(np.float32), name="W2"
+                ),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 21)],
+        ir_version=10,
+    )
+    (y_oracle,) = onnx.reference.ReferenceEvaluator(ref_model).run(None, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_cpp_qdq_structured_pruning_declines_grouped_conv():
+    # A general grouped/depthwise QDQ Conv is out of scope -- see this
+    # file's own section comment above; must be left completely untouched.
+    Cin, Cout, group = 8, 8, 4
+    rng = np.random.default_rng(13)
+    Wq = rng.integers(-100, 100, size=(Cout, Cin // group, 1, 1)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal(Cout)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[1,{Cin},2,2] X) => (float[1,{Cout},2,2] Y)
+        {{
+          Wdq = DequantizeLinear<axis=0>(Wq, Wscale)
+          Y = Conv<group={group}>(X, Wdq)
+        }}
+        """,
+        initializer=[_i8(Wq, "Wq"), _f32(Wscale, "Wscale")],
+    )
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == list(Wq.shape)
+
+
+def test_cpp_qdq_structured_pruning_declines_shared_quantized_weight():
+    # The same int8 initializer feeding two independent DequantizeLinear
+    # consumers -- slicing it for one chain would silently corrupt the
+    # other's own use of the identical tensor, so it must be declined.
+    K, H, Out = 8, 16, 4
+    model, Wq, _Wscale, _Wzp, _W2 = _matmul_qdq_producer_model(K, H, Out, seed=14)
+    extra_dq = onnx.helper.make_node(
+        "DequantizeLinear", ["Wq", "Wscale"], ["Wdq2"], axis=1
+    )
+    extra_identity = onnx.helper.make_node("Identity", ["Wdq2"], ["Wdq2_out"])
+    model.graph.node.extend([extra_dq, extra_identity])
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("Wdq2_out", onnx.TensorProto.FLOAT, [K, H])
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H]  # untouched -- Wq is shared
+
+
+def test_cpp_qdq_structured_pruning_both_sides_float_is_a_no_op():
+    # A plain float/float chain never touches the QDQ pass's own matchers --
+    # already exercised by ApplyChains above, confirmed here for the same
+    # single combined entry point.
+    model = _mlp_model(K=8, H=16, Out=4)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [8, 8]  # halved by the plain-float pass
+
+
+# --- QDQ: opset 21+ blockwise INT4/UINT4 ------------------------------------
+
+
+def _matmul_qdq_blockwise_producer_model(
+    K=8, H=16, Out=4, block_size=4, seed=0, zero_point=False, uint4=False
+):
+    rng = np.random.default_rng(seed)
+    k_blocks = K // block_size
+    lo, hi = (0, 16) if uint4 else (-8, 8)
+    pack = _uint4 if uint4 else _int4
+    Wq = rng.integers(lo, hi, size=(K, H)).astype(np.int8)
+    Wscale = (
+        np.abs(rng.standard_normal((k_blocks, H))).astype(np.float32) * 0.02 + 0.001
+    )
+    W2 = rng.standard_normal((H, Out)).astype(np.float32)
+    initializer = [pack(Wq, "Wq"), _f32(Wscale, "Wscale"), _f32(W2, "W2")]
+    zp_input = ""
+    Wzp = None
+    if zero_point:
+        Wzp = rng.integers(lo, hi, size=(k_blocks, H)).astype(np.int8)
+        initializer.append(pack(Wzp, "Wzp"))
+        zp_input = ", Wzp"
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wdq = DequantizeLinear<axis=0, block_size={block_size}>(Wq, Wscale{zp_input})
+          h = MatMul(X, Wdq)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, Wq, Wscale, Wzp, W2
+
+
+def test_cpp_qdq_blockwise_int4_producer_matches_oracle():
+    K, H, Out, block_size = 8, 16, 4, 4
+    model, Wq, Wscale, _Wzp, W2 = _matmul_qdq_blockwise_producer_model(
+        K, H, Out, block_size, seed=100
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H // 2]
+    assert list(inits["Wscale"].dims) == [K // block_size, H // 2]
+    assert list(inits["W2"].dims) == [H // 2, Out]
+
+    w_dequant = _qdq_block_dequant(Wq, Wscale, None, axis=0, block_size=block_size)
+    keep = _oracle_keep_indices(w_dequant, H // 2)
+
+    rng = np.random.default_rng(101)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    h = x @ w_dequant[:, keep]
+    y_oracle = h @ W2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+    wq_pruned = onnx.numpy_helper.to_array(inits["Wq"]).astype(np.int8)
+    wscale_pruned = onnx.numpy_helper.to_array(inits["Wscale"])
+    np.testing.assert_array_equal(wq_pruned, Wq[:, keep])
+    np.testing.assert_allclose(wscale_pruned, Wscale[:, keep])
+
+
+def test_cpp_qdq_blockwise_uint4_producer_with_zero_point_matches_oracle():
+    K, H, Out, block_size = 8, 16, 4, 4
+    model, Wq, Wscale, Wzp, W2 = _matmul_qdq_blockwise_producer_model(
+        K, H, Out, block_size, seed=102, zero_point=True, uint4=True
+    )
+    onnx.checker.check_model(model)
+    assert Wzp is not None
+    assert np.any(Wzp != 0)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wzp"].dims) == [K // block_size, H // 2]
+
+    w_dequant = _qdq_block_dequant(Wq, Wscale, Wzp, axis=0, block_size=block_size)
+    keep = _oracle_keep_indices(w_dequant, H // 2)
+
+    rng = np.random.default_rng(103)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    h = x @ w_dequant[:, keep]
+    y_oracle = h @ W2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+    wzp_pruned = onnx.numpy_helper.to_array(inits["Wzp"]).astype(np.uint8)
+    np.testing.assert_array_equal(wzp_pruned, Wzp[:, keep])
+
+
+def _block_grouped_column_weight(
+    rng, rows, n_blocks, block_size, high_block_idx, lo=1.0, hi=6.0
+):
+    # A float weight whose column magnitude is constant WITHIN each
+    # `block_size`-sized group of columns (large for every block index in
+    # `high_block_idx`, small otherwise) -- so the top-L2-norm importance
+    # ranking always drops/keeps whole blocks together, making a "consumer
+    # block-aligned" test deterministic rather than relying on chance
+    # alignment.
+    cols = n_blocks * block_size
+    base = rng.standard_normal((rows, cols)).astype(np.float64) * 0.1
+    for b in range(n_blocks):
+        mag = hi if b in high_block_idx else lo
+        base[:, b * block_size : (b + 1) * block_size] += mag * np.sign(
+            rng.standard_normal((rows, block_size))
+        )
+    return base.astype(np.float32)
+
+
+def _matmul_qdq_blockwise_consumer_model(
+    K, H, Out, block_size, seed=0, zero_point=False, uint4=False, W1=None
+):
+    rng = np.random.default_rng(seed)
+    h_blocks = H // block_size
+    lo, hi = (0, 16) if uint4 else (-8, 8)
+    pack = _uint4 if uint4 else _int4
+    if W1 is None:
+        W1 = rng.standard_normal((K, H)).astype(np.float32)
+    Wq = rng.integers(lo, hi, size=(H, Out)).astype(np.int8)
+    Wscale = (
+        np.abs(rng.standard_normal((h_blocks, Out))).astype(np.float32) * 0.02 + 0.001
+    )
+    initializer = [_f32(W1, "W1"), pack(Wq, "Wq"), _f32(Wscale, "Wscale")]
+    zp_input = ""
+    Wzp = None
+    if zero_point:
+        Wzp = rng.integers(lo, hi, size=(h_blocks, Out)).astype(np.int8)
+        initializer.append(pack(Wzp, "Wzp"))
+        zp_input = ", Wzp"
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          Wdq = DequantizeLinear<axis=0, block_size={block_size}>(Wq, Wscale{zp_input})
+          Y = MatMul(h, Wdq)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, W1, Wq, Wscale, Wzp
+
+
+def test_cpp_qdq_blockwise_consumer_block_aligned_matches_oracle():
+    K, H, Out, block_size = 4, 16, 4, 4
+    n_blocks = H // block_size
+    rng = np.random.default_rng(104)
+    W1 = _block_grouped_column_weight(
+        rng, K, n_blocks, block_size, high_block_idx={0, 2}
+    )
+    model, W1, Wq, Wscale, _Wzp = _matmul_qdq_blockwise_consumer_model(
+        K, H, Out, block_size, seed=105, W1=W1
+    )
+    onnx.checker.check_model(model)
+
+    keep = _oracle_keep_indices(W1, H // 2)
+    keep_blocks = sorted({int(k) // block_size for k in keep})
+    assert keep_blocks == [0, 2]  # engineered, genuinely block-aligned
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [H // 2, Out]
+    assert list(inits["Wscale"].dims) == [n_blocks // 2, Out]
+
+    w_dequant = _qdq_block_dequant(Wq, Wscale, None, axis=0, block_size=block_size)
+    rng2 = np.random.default_rng(106)
+    x = rng2.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    h = x @ W1[:, keep]
+    y_oracle = h @ w_dequant[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+    # Scale sliced by BLOCK index, not element -- confirms co-slicing
+    # against the correct (coarser) axis.
+    wscale_pruned = onnx.numpy_helper.to_array(inits["Wscale"])
+    np.testing.assert_array_equal(wscale_pruned, Wscale[keep_blocks, :])
+
+
+def test_cpp_qdq_blockwise_consumer_non_block_aligned_declines():
+    # keep_count (6) is not a multiple of block_size (4) -- no whole-block
+    # partition of a 16-element axis can ever produce exactly 6 kept
+    # elements, so this chain's consumer is unconditionally non-block-
+    # aligned; the real call must decline the whole chain.
+    K, H, Out, block_size = 4, 16, 4, 4
+    model, W1, Wq, _Wscale, _Wzp = _matmul_qdq_blockwise_consumer_model(
+        K, H, Out, block_size, seed=107
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.625)  # keep 6 of 16
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, H]  # left completely untouched
+    assert list(inits["Wq"].dims) == [H, Out]
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["W1"]), W1)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wq"]).astype(np.int8), Wq
+    )
+
+
+def test_cpp_qdq_blockwise_conv_producer_matches_oracle():
+    # Blockwise INT4 quantization on a Conv weight: axis=1 blocks the
+    # in_channels axis, exercised as the producer's own reduction axis
+    # while its OUTPUT channels (axis=0) are what gets pruned.
+    Cin, Cmid, Cout, block_size = 8, 8, 4, 4
+    cin_blocks = Cin // block_size
+    rng = np.random.default_rng(112)
+    Wq1 = rng.integers(-8, 8, size=(Cmid, Cin, 1, 1)).astype(np.int8)
+    Wscale1 = (
+        np.abs(rng.standard_normal((Cmid, cin_blocks, 1, 1))).astype(np.float32) * 0.02
+        + 0.001
+    )
+    Wq2 = rng.integers(-100, 100, size=(Cout, Cmid, 1, 1)).astype(np.int8)
+    Wscale2 = np.abs(rng.standard_normal(Cout)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[1,{Cin},4,4] X) => (float[1,{Cout},4,4] Y)
+        {{
+          W1dq = DequantizeLinear<axis=1, block_size={block_size}>(W1q, W1s)
+          h = Conv(X, W1dq)
+          W2dq = DequantizeLinear<axis=0>(W2q, W2s)
+          Y = Conv(h, W2dq)
+        }}
+        """,
+        initializer=[
+            _int4(Wq1, "W1q"),
+            _f32(Wscale1, "W1s"),
+            _i8(Wq2, "W2q"),
+            _f32(Wscale2, "W2s"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1q"].dims) == [Cmid // 2, Cin, 1, 1]
+    assert list(inits["W1s"].dims) == [Cmid // 2, cin_blocks, 1, 1]
+    assert list(inits["W2q"].dims) == [Cout, Cmid // 2, 1, 1]
+
+    w1_dequant = _qdq_block_dequant(Wq1, Wscale1, None, axis=1, block_size=block_size)
+    w2_dequant = _qdq_dequant(Wq2, Wscale2, None, axis=0)
+    w1_nk = w1_dequant.reshape(Cmid, -1)
+    keep = _oracle_keep_indices(w1_nk.T, Cmid // 2)
+
+    rng2 = np.random.default_rng(113)
+    x = rng2.standard_normal((1, Cin, 4, 4)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    ref_model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Conv", ["X", "W1"], ["h"]),
+                onnx.helper.make_node("Conv", ["h", "W2"], ["Y"]),
+            ],
+            "oracle",
+            [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, None)],
+            [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, None)],
+            initializer=[
+                onnx.numpy_helper.from_array(
+                    w1_dequant[keep].astype(np.float32), name="W1"
+                ),
+                onnx.numpy_helper.from_array(
+                    w2_dequant[:, keep].astype(np.float32), name="W2"
+                ),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 21)],
+        ir_version=10,
+    )
+    (y_oracle,) = onnx.reference.ReferenceEvaluator(ref_model).run(None, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_cpp_qdq_blockwise_declines_non_exact_multiple_block_dim():
+    # A reduction-axis dim that isn't an exact multiple of block_size (a
+    # padded/partial final block) is out of scope -- declined by the
+    # matcher itself, not just by the block-alignment check.
+    K, H, Out, block_size = 6, 8, 4, 4  # K=6 not a multiple of block_size=4
+    rng = np.random.default_rng(114)
+    Wq = rng.integers(-8, 8, size=(K, H)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal((2, H))).astype(np.float32) * 0.02 + 0.001
+    # 2 blocks is wrong for K=6/block_size=4 (ceil is 2, but 6 % 4 != 0) --
+    # deliberately mismatched/declined regardless of the scale shape chosen.
+    W2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wdq = DequantizeLinear<axis=0, block_size={block_size}>(Wq, Wscale)
+          h = MatMul(X, Wdq)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_int4(Wq, "Wq"), _f32(Wscale, "Wscale"), _f32(W2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H]  # left completely untouched
+
+
+# --- QDQ: gated (SwiGLU/GeGLU) pair ------------------------------------------
+
+
+def _qdq_gated_mlp_model(K=8, H=16, Out=4, gate_activation="Sigmoid", seed=0):
+    rng = np.random.default_rng(seed)
+    Wgq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wgscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    Wuq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wuscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    Wd = rng.standard_normal((H, Out)).astype(np.float32)
+    initializer = [
+        _i8(Wgq, "Wgq"),
+        _f32(Wgscale, "Wgscale"),
+        _i8(Wuq, "Wuq"),
+        _f32(Wuscale, "Wuscale"),
+        _f32(Wd, "Wd"),
+    ]
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wgdq = DequantizeLinear<axis=1>(Wgq, Wgscale)
+          gate = MatMul(X, Wgdq)
+          gate_act = {gate_activation}(gate)
+          Wudq = DequantizeLinear<axis=1>(Wuq, Wuscale)
+          up = MatMul(X, Wudq)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, Wgq, Wgscale, Wuq, Wuscale, Wd
+
+
+def test_cpp_qdq_structured_pruning_gated_ffn_matches_oracle():
+    K, H, Out = 8, 16, 4
+    model, Wgq, Wgscale, Wuq, Wuscale, Wd = _qdq_gated_mlp_model(K, H, Out, seed=21)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wgq"].dims) == [K, H // 2]
+    assert list(inits["Wgscale"].dims) == [H // 2]
+    assert list(inits["Wuq"].dims) == [K, H // 2]
+    assert list(inits["Wuscale"].dims) == [H // 2]
+    assert list(inits["Wd"].dims) == [H // 2, Out]
+
+    wg_dequant = _qdq_dequant(Wgq, Wgscale, None, axis=1)
+    wu_dequant = _qdq_dequant(Wuq, Wuscale, None, axis=1)
+    keep = _combined_keep_indices(wg_dequant, wu_dequant, H // 2)
+
+    # Exact co-slice: both producers' own int8 codes AND scales sliced by
+    # the identical `keep` set, never independently re-derived.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wgq"]), Wgq[:, keep]
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["Wgscale"]), Wgscale[keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wuq"]), Wuq[:, keep]
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["Wuscale"]), Wuscale[keep]
+    )
+
+    rng = np.random.default_rng(22)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    gate = 1.0 / (1.0 + np.exp(-(x @ wg_dequant[:, keep])))
+    up = x @ wu_dequant[:, keep]
+    y_oracle = (gate * up) @ Wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_cpp_qdq_structured_pruning_gated_ffn_prunes_both_branches_to_same_channels():
+    K, H, Out = 8, 20, 4
+    model, Wgq, Wgscale, Wuq, Wuscale, _Wd = _qdq_gated_mlp_model(K, H, Out, seed=23)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.3)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    wg_dequant = _qdq_dequant(Wgq, Wgscale, None, axis=1)
+    wu_dequant = _qdq_dequant(Wuq, Wuscale, None, axis=1)
+    keep = _combined_keep_indices(wg_dequant, wu_dequant, H - round(H * 0.3))
+
+    np.testing.assert_array_equal(inits["Wgq"], Wgq[:, keep])
+    np.testing.assert_array_equal(inits["Wuq"], Wuq[:, keep])
+
+
+def test_cpp_qdq_structured_pruning_gelu_gated_ffn_matches_oracle():
+    # GeGLU: the gate activation is Gelu (tanh approximation) rather than
+    # Sigmoid -- exercises FindQdqGatedChains's own reuse of the plain-float
+    # gated matcher's unary-activation set.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(24)
+    Wgq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wgscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    Wuq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wuscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    Wd = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wgdq = DequantizeLinear<axis=1>(Wgq, Wgscale)
+          gate = MatMul(X, Wgdq)
+          gate_act = Gelu<approximate = "tanh">(gate)
+          Wudq = DequantizeLinear<axis=1>(Wuq, Wuscale)
+          up = MatMul(X, Wudq)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[
+            _i8(Wgq, "Wgq"),
+            _f32(Wgscale, "Wgscale"),
+            _i8(Wuq, "Wuq"),
+            _f32(Wuscale, "Wuscale"),
+            _f32(Wd, "Wd"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    wg_dequant = _qdq_dequant(Wgq, Wgscale, None, axis=1)
+    wu_dequant = _qdq_dequant(Wuq, Wuscale, None, axis=1)
+    keep = _combined_keep_indices(wg_dequant, wu_dequant, H // 2)
+
+    rng2 = np.random.default_rng(25)
+    x = rng2.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    def gelu_tanh(v):
+        return 0.5 * v * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (v + 0.044715 * v**3)))
+
+    gate = gelu_tanh(x @ wg_dequant[:, keep])
+    up = x @ wu_dequant[:, keep]
+    y_oracle = (gate * up) @ Wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-3, atol=1e-3)

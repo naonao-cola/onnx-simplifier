@@ -8122,6 +8122,1697 @@ void ApplyMatMulNBitsChains(onnx::GraphProto* graph,
   }
 }
 
+// --- QDQ (quantized-weight) structured pruning, mirroring pruning.py's own
+// "QDQ (quantized-weight) structured pruning" section (_QDQWeight through
+// apply_structured_pruning_qdq) -------------------------------------------
+//
+// A Conv/ConvTranspose (group=1) or MatMul/vanilla-Gemm weight statically
+// quantized in the QDQ pattern -- a constant int8/uint8 (per-tensor or
+// per-channel) or int4/uint4 (opset 21+ blockwise) initializer fed through a
+// single-consumer `DequantizeLinear` node -- can be structurally pruned the
+// same way this file's plain-float chains already are, as long as the
+// int8/int4 CODES are sliced directly and their own scale/zero-point are
+// either co-sliced in lockstep (when they are indexed by the axis being cut)
+// or left completely untouched (when they are not) -- NEVER dequantized,
+// pruned as a float array, and requantized from scratch. That last approach
+// would silently change every kept value's own quantization error (a fresh
+// round-trip through a different candidate weight distribution), which is
+// exactly what this pass must not do: the whole point of pruning a model
+// that is already QDQ-quantized, rather than quantizing an already-pruned
+// float model, is to preserve the original quantization exactly for every
+// channel that survives. So: **slice the codes, don't recompute them** --
+// the single most important correctness property of everything below, the
+// direct analogue of this file's own FP16/BFloat16 "slice, don't recompute"
+// precedent for a *quantization* metadata pair instead of a *dtype* one.
+//
+// Which of `Wq`'s own scale/zero-point get touched splits cleanly by role:
+//   * Producer role (this weight's own OUTPUT channels are being cut): a
+//     per-channel `Ws`/`Wzp` (each `[out_channels]`) is indexed by the exact
+//     axis being cut, so it is co-sliced by the same `keep` set, in lockstep
+//     with `Wq`. A per-tensor (scalar) `Ws`/`Wzp` isn't shaped by channel
+//     count at all, so only `Wq` is sliced.
+//   * Consumer role (this weight's own INPUT/reduction channels are being
+//     cut): `Ws`/`Wzp` are indexed by the OUTPUT-channel axis, never the
+//     input axis being cut here, so they are always left completely
+//     untouched -- only `Wq` is sliced, along its reduction axis.
+//   * Blockwise (opset 21+ INT4/UINT4, `block_size` on the reduction axis)
+//     reverses which role is "simple": the producer's own output-channel
+//     axis is never blocked, so `Wq`/`Ws`/`Wzp` co-slice exactly like the
+//     per-channel producer case above, no alignment concern. The consumer's
+//     own input axis IS the blocked axis, so an individual input channel
+//     can't be dropped without re-quantizing its whole block -- out of
+//     scope, this pass never invents new quantized values. Instead, the
+//     candidate `keep` set (computed once per chain, shared with the
+//     producer) is checked for block alignment (QdqBlockAlignedKeepBlocks):
+//     every `block_size`-sized block of the consumer's own reduction axis
+//     either wholly survives or wholly drops. When aligned, `Wq` is sliced
+//     element-wise by `keep` (blocks stay contiguous by construction) and
+//     `Ws`/`Wzp` are sliced by BLOCK index; when not aligned, the WHOLE
+//     chain (producer and consumer alike) is left completely untouched
+//     rather than forcing a partial-block re-quantization or a disagreeing
+//     keep-set between producer and consumer.
+//
+// A `ConvTranspose` weight's own reversed layout (`[in_channels,
+// out_channels/group, ...]`, `out_channels` on axis 1 rather than 0) needs
+// only a different `expected_axis` threaded through the exact same
+// MatchDequantizeLinearWeight[Blockwise]/slicing machinery Conv already
+// uses -- see QdqWeightAxis. Every Conv/ConvTranspose/MatMul/Gemm match here
+// is restricted to `group == 1` on both sides (a general grouped/depthwise
+// QDQ Conv is out of scope -- already a materially bigger project for the
+// plain-float case, before QDQ's extra scale/zero-point bookkeeping enters
+// at all), and the forward walk (WalkToConsumerQdq) only ever crosses zero
+// or more shape-preserving UNARY activations with no per-channel Add/Mul
+// bias/scale hop -- narrower than the plain-float chain walk above, by
+// design, for this section's own deliberately narrow first cut. A gated
+// (SwiGLU/GeGLU) MatMul/Gemm pair IS matched (FindQdqGatedChains), with
+// either or both producers and/or the consumer independently QDQ or plain
+// float -- Conv/ConvTranspose never take part in a gated pair, mirroring
+// FindGatedChains's own restriction.
+//
+// Only INT8/UINT8 (per-tensor or per-channel, via MatchDequantizeLinearWeight)
+// and INT4/UINT4 blockwise-on-the-reduction-axis (via
+// MatchDequantizeLinearWeightBlockwise) are matched; FLOAT8 codes, a
+// non-default `output_dtype`, blocked quantization on the output-channel
+// axis or with INT8/UINT8 codes, a non-exact-multiple block dimension, or
+// any `x`/`x_scale`/`x_zero_point` read by more than one node (a shared/tied
+// quantized tensor whose slicing here would silently corrupt whatever else
+// reads it) are all declined outright by the matchers, never guessed at --
+// the same conservative bar every matcher elsewhere in this file holds
+// itself to. Unlike the plain-float MatMul/Gemm producer, this port matches
+// only `"MatMul"`/`"Gemm"` (not `"FusedGemm"`/`"GemmFastGelu"`) and only
+// `"Conv"` (not `"FusedConv"`) -- mirroring MatchMatMulLikeRaw/
+// MatchConvProducer's own established scope in this file (which does not
+// support those op types anywhere either), a narrower surface than
+// pruning.py's own QDQ section but consistent with the rest of this port.
+// Only a plain FLOAT (not FLOAT16/BFLOAT16) direct initializer is resolved
+// on the non-QDQ side of a mixed chain, for the identical reason: this
+// port's plain-float chains never support FLOAT16/BFLOAT16 either.
+//
+// This entire section is additive: FindQdqChains/FindQdqGatedChains only
+// ever match a chain where at least one side is QDQ-quantized (a plain
+// float/float pair is FindChains/FindGatedChains's own job, never
+// duplicated here), so ApplyQdqChains below can never double-slice a tensor
+// FindChains/FindGatedChains/FindConvChains already claimed -- but it still
+// shares this graph's own single `TouchedState` with every other Apply*
+// call in ApplyStructuredPruning, for the same "one shared conflict ledger
+// per graph" reason those calls already share it with each other.
+
+// --- Tensor <-> flat int64 code buffer, mirroring onnx.numpy_helper's own
+// transparent INT8/UINT8/INT4/UINT4 (ml_dtypes) round-trip -----------------
+
+int64_t TensorNumEl(const onnx::TensorProto& t) {
+  int64_t n = 1;
+  for (int64_t d : t.dims()) {
+    n *= d;
+  }
+  return n;
+}
+
+bool DimsEqual(const google::protobuf::RepeatedField<int64_t>& a,
+               const google::protobuf::RepeatedField<int64_t>& b) {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  for (int i = 0; i < a.size(); ++i) {
+    if (a.Get(i) != b.Get(i)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Returns `nbytes` raw bytes for `t`'s own codes, from `raw_data` when
+// present or, for a hand-built (onnx.helper.make_tensor-style) tensor
+// instead, from `int32_data` -- which ONNX's own wire format also uses to
+// carry one *packed* byte per entry for INT4/UINT4 (mirroring `raw_data`'s
+// own packing exactly, just one byte per `int32_data` slot instead of
+// concatenated), so this one path handles every constant-tensor
+// construction style uniformly for INT8/UINT8/INT4/UINT4 alike.
+std::vector<uint8_t> RawOrPackedBytes(const onnx::TensorProto& t,
+                                      int64_t nbytes) {
+  std::vector<uint8_t> bytes(static_cast<size_t>(nbytes));
+  if (t.has_raw_data()) {
+    std::memcpy(bytes.data(), t.raw_data().data(), static_cast<size_t>(nbytes));
+  } else {
+    for (int64_t i = 0; i < nbytes; ++i) {
+      bytes[static_cast<size_t>(i)] =
+          static_cast<uint8_t>(t.int32_data(static_cast<int>(i)));
+    }
+  }
+  return bytes;
+}
+
+// Unpacks an INT8/UINT8/INT4/UINT4 TensorProto's own codes into a flat,
+// row-major (matching `t.dims()`) int64 buffer -- INT4/UINT4 two codes per
+// byte, low nibble first (`byte = code[2i] | (code[2i+1] << 4)`), matching
+// onnx.numpy_helper's own `_pack_4bitx2`/`_unpack_4bit` convention exactly
+// (confirmed empirically -- see this section's own top comment).
+std::vector<int64_t> ReadQuantCodes(const onnx::TensorProto& t) {
+  const int64_t numel = TensorNumEl(t);
+  const bool is4bit = t.data_type() == onnx::TensorProto::INT4 ||
+                      t.data_type() == onnx::TensorProto::UINT4;
+  const bool is_signed = t.data_type() == onnx::TensorProto::INT8 ||
+                         t.data_type() == onnx::TensorProto::INT4;
+  const int64_t nbytes = is4bit ? (numel + 1) / 2 : numel;
+  const std::vector<uint8_t> bytes = RawOrPackedBytes(t, nbytes);
+  std::vector<int64_t> out(static_cast<size_t>(numel));
+  for (int64_t i = 0; i < numel; ++i) {
+    int64_t val;
+    if (is4bit) {
+      const uint8_t byte = bytes[static_cast<size_t>(i / 2)];
+      val = (i % 2 == 0) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+      if (is_signed && val >= 8) {
+        val -= 16;
+      }
+    } else {
+      const uint8_t byte = bytes[static_cast<size_t>(i)];
+      val = is_signed ? static_cast<int64_t>(static_cast<int8_t>(byte))
+                      : static_cast<int64_t>(byte);
+    }
+    out[static_cast<size_t>(i)] = val;
+  }
+  return out;
+}
+
+// Overwrites `t` in place with a fresh INT8/UINT8/INT4/UINT4 tensor of
+// `dims`/`codes` (`codes` already the target dtype's own two's-complement
+// representation, e.g. -2 for INT8/INT4 alike), keeping its existing name --
+// mirrors SetFloatTensorData's own "replace, don't mutate a live view"
+// convention. Always writes `raw_data` (matching onnx.numpy_helper.
+// from_array's own convention), regardless of how `t` was originally
+// encoded.
+void SetQuantCodes(onnx::TensorProto* t, int32_t dtype,
+                   const std::vector<int64_t>& dims,
+                   const std::vector<int64_t>& codes) {
+  const bool is4bit =
+      dtype == onnx::TensorProto::INT4 || dtype == onnx::TensorProto::UINT4;
+  const int64_t numel = static_cast<int64_t>(codes.size());
+  const std::string name = t->name();
+  t->Clear();
+  t->set_name(name);
+  t->set_data_type(static_cast<onnx::TensorProto::DataType>(dtype));
+  for (int64_t d : dims) {
+    t->add_dims(d);
+  }
+  if (is4bit) {
+    std::string raw(static_cast<size_t>((numel + 1) / 2), '\0');
+    for (int64_t i = 0; i < numel; ++i) {
+      const uint8_t nibble =
+          static_cast<uint8_t>(codes[static_cast<size_t>(i)]) & 0x0F;
+      uint8_t& byte =
+          reinterpret_cast<uint8_t&>(raw[static_cast<size_t>(i / 2)]);
+      if (i % 2 == 0) {
+        byte = nibble;
+      } else {
+        byte = static_cast<uint8_t>(byte | (nibble << 4));
+      }
+    }
+    t->set_raw_data(std::move(raw));
+  } else {
+    std::string raw(static_cast<size_t>(numel), '\0');
+    for (int64_t i = 0; i < numel; ++i) {
+      raw[static_cast<size_t>(i)] = static_cast<char>(
+          static_cast<uint8_t>(codes[static_cast<size_t>(i)]));
+    }
+    t->set_raw_data(std::move(raw));
+  }
+}
+
+std::vector<int64_t> RowMajorStrides(const std::vector<int64_t>& dims) {
+  std::vector<int64_t> strides(dims.size());
+  int64_t acc = 1;
+  for (int64_t i = static_cast<int64_t>(dims.size()) - 1; i >= 0; --i) {
+    strides[static_cast<size_t>(i)] = acc;
+    acc *= dims[static_cast<size_t>(i)];
+  }
+  return strides;
+}
+
+// Gathers `keep` (ascending indices) along `axis` of a row-major `dims`-
+// shaped flat buffer -- the generic building block every QDQ slicer below
+// uses, for both int64 codes and float32 scale/zero-point alike, at
+// whichever axis/rank the specific role (producer/consumer, per-channel/
+// blockwise) needs. Exactly `numpy`'s own `np.take(data, keep, axis=axis)`.
+template <typename T>
+std::vector<T> SliceAlongAxis(const std::vector<T>& data,
+                              const std::vector<int64_t>& dims, int64_t axis,
+                              const std::vector<int64_t>& keep) {
+  int64_t outer = 1;
+  for (int64_t i = 0; i < axis; ++i) {
+    outer *= dims[static_cast<size_t>(i)];
+  }
+  const int64_t axis_dim = dims[static_cast<size_t>(axis)];
+  int64_t inner = 1;
+  for (size_t i = static_cast<size_t>(axis) + 1; i < dims.size(); ++i) {
+    inner *= dims[i];
+  }
+  std::vector<T> out(static_cast<size_t>(outer) * keep.size() *
+                     static_cast<size_t>(inner));
+  for (int64_t o = 0; o < outer; ++o) {
+    for (size_t k = 0; k < keep.size(); ++k) {
+      const T* src = data.data() +
+                     (static_cast<size_t>(o) * static_cast<size_t>(axis_dim) +
+                      static_cast<size_t>(keep[k])) *
+                         static_cast<size_t>(inner);
+      T* dst = out.data() + (static_cast<size_t>(o) * keep.size() + k) *
+                                static_cast<size_t>(inner);
+      std::copy(src, src + inner, dst);
+    }
+  }
+  return out;
+}
+
+// --- Dequantization for IMPORTANCE RANKING ONLY -- never written back to the
+// graph. The actual mutation always slices the int8/int4 codes/scale/
+// zero-point directly (see this section's own top comment); these two
+// helpers exist purely so a QDQ producer's output channels can be ranked by
+// the same L2-norm-of-dequantized-row criterion a plain float producer's
+// already are (QdqChannelImportanceL2), without the ranking caring which
+// quantization scheme the weight came from. -------------------------------
+
+std::vector<double> PerChannelDequantFlat(const std::vector<int64_t>& codes,
+                                          const std::vector<int64_t>& dims,
+                                          const std::vector<float>& scale,
+                                          const std::vector<int64_t>& zp,
+                                          bool per_channel, int64_t axis) {
+  const int64_t numel = static_cast<int64_t>(codes.size());
+  std::vector<double> out(static_cast<size_t>(numel));
+  if (!per_channel) {
+    const double s = static_cast<double>(scale[0]);
+    const double zpv = zp.empty() ? 0.0 : static_cast<double>(zp[0]);
+    for (int64_t i = 0; i < numel; ++i) {
+      out[static_cast<size_t>(i)] =
+          (static_cast<double>(codes[static_cast<size_t>(i)]) - zpv) * s;
+    }
+    return out;
+  }
+  const std::vector<int64_t> strides = RowMajorStrides(dims);
+  const int64_t axis_dim = dims[static_cast<size_t>(axis)];
+  const int64_t axis_stride = strides[static_cast<size_t>(axis)];
+  for (int64_t i = 0; i < numel; ++i) {
+    const int64_t a = (i / axis_stride) % axis_dim;
+    const double zpv =
+        zp.empty() ? 0.0 : static_cast<double>(zp[static_cast<size_t>(a)]);
+    out[static_cast<size_t>(i)] =
+        (static_cast<double>(codes[static_cast<size_t>(i)]) - zpv) *
+        static_cast<double>(scale[static_cast<size_t>(a)]);
+  }
+  return out;
+}
+
+// The blockwise analogue: `scale`/`zp` are full-rank (same rank as `dims`),
+// full-size on every axis except `block_axis`, where their own size is
+// `num_blocks` -- each block's own scalar broadcasts to every element of its
+// own `block_size`-sized span along `block_axis`.
+std::vector<double> BlockwiseDequantFlat(const std::vector<int64_t>& codes,
+                                         const std::vector<int64_t>& dims,
+                                         const std::vector<float>& scale,
+                                         const std::vector<int64_t>& zp,
+                                         int64_t block_axis, int64_t block_size,
+                                         int64_t num_blocks) {
+  std::vector<int64_t> scale_dims = dims;
+  scale_dims[static_cast<size_t>(block_axis)] = num_blocks;
+  const std::vector<int64_t> strides = RowMajorStrides(dims);
+  const std::vector<int64_t> scale_strides = RowMajorStrides(scale_dims);
+  const int64_t numel = static_cast<int64_t>(codes.size());
+  std::vector<double> out(static_cast<size_t>(numel));
+  std::vector<int64_t> multi(dims.size());
+  for (int64_t idx = 0; idx < numel; ++idx) {
+    int64_t rem = idx;
+    for (size_t d = 0; d < dims.size(); ++d) {
+      multi[d] = rem / strides[d];
+      rem %= strides[d];
+    }
+    int64_t sidx = 0;
+    for (size_t d = 0; d < dims.size(); ++d) {
+      const int64_t sd = (static_cast<int64_t>(d) == block_axis)
+                             ? multi[d] / block_size
+                             : multi[d];
+      sidx += sd * scale_strides[d];
+    }
+    const double zpv =
+        zp.empty() ? 0.0 : static_cast<double>(zp[static_cast<size_t>(sidx)]);
+    out[static_cast<size_t>(idx)] =
+        (static_cast<double>(codes[static_cast<size_t>(idx)]) - zpv) *
+        static_cast<double>(scale[static_cast<size_t>(sidx)]);
+  }
+  return out;
+}
+
+// `[out_channels, in_channels, kH, kW]` -> `[N, K]` for a Conv weight (or
+// its ConvTranspose analogue, `[in_channels, out_channels, kH, kW]`, moved
+// to output-channel-first before the same flatten), or a plain 2-D
+// MatMul/Gemm weight transposed to `[N, K]` when it isn't already -- the
+// double-precision analogue of this file's own (float) TransposeFlat, for
+// the exact same "the ranking machinery works over one directly comparable
+// [N, K] layout" reason. Mirrors pruning.py's own `_weight_to_nk`.
+std::vector<double> QdqWeightToNk(const std::vector<double>& data,
+                                  const std::vector<int64_t>& dims,
+                                  bool weight_transposed, bool is_conv,
+                                  bool is_conv_transpose) {
+  if (is_conv) {
+    if (!is_conv_transpose) {
+      return data;  // Already [Cout, rest] flattened row-major.
+    }
+    const int64_t cin = dims[0], cout = dims[1];
+    const int64_t inner = dims[2] * dims[3];
+    std::vector<double> out(data.size());
+    for (int64_t ci = 0; ci < cin; ++ci) {
+      for (int64_t co = 0; co < cout; ++co) {
+        const double* src = data.data() + (ci * cout + co) * inner;
+        double* dst = out.data() + (co * cin + ci) * inner;
+        std::copy(src, src + inner, dst);
+      }
+    }
+    return out;
+  }
+  const int64_t dim0 = dims[0], dim1 = dims[1];
+  if (weight_transposed) {
+    return data;  // Already [N, K].
+  }
+  std::vector<double> out(data.size());
+  for (int64_t i = 0; i < dim0; ++i) {
+    for (int64_t j = 0; j < dim1; ++j) {
+      out[static_cast<size_t>(j * dim0 + i)] =
+          data[static_cast<size_t>(i * dim1 + j)];
+    }
+  }
+  return out;
+}
+
+// L2 norm of each output channel's own (dequantized) weight row -- the
+// single-producer QDQ analogue of ApplyChains's own inline importance
+// computation. Only L2 is supported (this port, unlike pruning.py's own
+// wider `importance_norm` parameter, has no L1 option anywhere -- neither
+// does ApplyStructuredPruning's own plain-float path, so this is a
+// consistent, not a novel, scope narrowing).
+std::vector<double> QdqChannelImportanceL2(const std::vector<double>& w_nk,
+                                           int64_t n, int64_t k) {
+  std::vector<double> importance(static_cast<size_t>(n), 0.0);
+  for (int64_t c = 0; c < n; ++c) {
+    double sq = 0.0;
+    for (int64_t j = 0; j < k; ++j) {
+      const double v = w_nk[static_cast<size_t>(c * k + j)];
+      sq += v * v;
+    }
+    importance[static_cast<size_t>(c)] = std::sqrt(sq);
+  }
+  return importance;
+}
+
+// The STABLE analogue of this file's own TopKIndicesAscending
+// (std::partial_sort there is not stable for ties) -- mirrors pruning.py's
+// own `np.argsort(-importance, kind="stable")[:keep_count]` exactly. Matters
+// specifically here (unlike most other ranking call sites in this file):
+// with exactly-tied importances, an unstable tie-break can select a keep set
+// that no longer aligns to a blockwise consumer's own block boundaries
+// (QdqBlockAlignedKeepBlocks), flipping a would-have-been-aligned chain to
+// "declined" nondeterministically. A stable sort preserves ascending
+// channel-index order among ties, matching this port's own test oracles
+// (and pruning.py's own reference behavior) deterministically.
+std::vector<int64_t> StableTopKIndicesAscending(
+    const std::vector<double>& importance, int64_t keep_count) {
+  const int64_t n = static_cast<int64_t>(importance.size());
+  std::vector<int64_t> idx(static_cast<size_t>(n));
+  std::iota(idx.begin(), idx.end(), int64_t{0});
+  std::stable_sort(idx.begin(), idx.end(), [&](int64_t a, int64_t b) {
+    return importance[static_cast<size_t>(a)] >
+           importance[static_cast<size_t>(b)];
+  });
+  idx.resize(static_cast<size_t>(keep_count));
+  std::sort(idx.begin(), idx.end());
+  return idx;
+}
+
+// --- Matching: per-tensor/per-channel and blockwise DequantizeLinear-fed
+// weights, mirroring _match_dequantize_linear_weight/
+// _match_dequantize_linear_weight_blockwise/_resolve_weight_ref ------------
+
+using DqMap = std::unordered_map<std::string, onnx::NodeProto*>;
+
+struct QdqWeightMatch {
+  onnx::NodeProto* dq_node;
+  std::string q_name;
+  std::string scale_name;
+  std::optional<std::string> zp_name;
+  int64_t axis;  // This weight's own output-channel axis.
+  bool per_channel;
+  std::vector<int64_t> dims;
+};
+
+// If `weight_name` is fed by a `DequantizeLinear` node from a constant
+// int8/uint8 initializer, with a constant FLOAT scale that is either a
+// scalar (per-tensor) or a 1-D vector of length `dims[expected_axis]`
+// (per-channel, on exactly `expected_axis`) with a matching `axis`
+// attribute, returns the match. `rank` is the expected weight rank (4 for
+// Conv/ConvTranspose, 2 for MatMul/Gemm). Declines (nullopt) whenever
+// anything is ambiguous -- see this section's own top comment.
+std::optional<QdqWeightMatch> MatchDequantizeLinearWeight(
+    const std::string& weight_name, int64_t rank, int64_t expected_axis,
+    const InitMap& init_map, const DqMap& dq_of,
+    const ConsumerMap& consumers_of) {
+  auto dit = dq_of.find(weight_name);
+  if (dit == dq_of.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* dq = dit->second;
+  if (dq->op_type() != "DequantizeLinear" || dq->output_size() != 1) {
+    return std::nullopt;
+  }
+  if (ConsumerCount(consumers_of, weight_name) != 1) {
+    return std::nullopt;  // DQ output must feed only this one weight use.
+  }
+  if (dq->input_size() != 2 && dq->input_size() != 3) {
+    return std::nullopt;
+  }
+  const std::string& q_name = dq->input(0);
+  const std::string& scale_name = dq->input(1);
+  std::optional<std::string> zp_name;
+  if (dq->input_size() == 3 && !dq->input(2).empty()) {
+    zp_name = dq->input(2);
+  }
+  if (q_name.empty() || scale_name.empty()) {
+    return std::nullopt;
+  }
+
+  auto qit = init_map.find(q_name);
+  auto sit = init_map.find(scale_name);
+  if (qit == init_map.end() || sit == init_map.end()) {
+    return std::nullopt;  // Non-constant q/scale -- can't safely slice it.
+  }
+  const onnx::TensorProto* q_init = qit->second;
+  const onnx::TensorProto* scale_init = sit->second;
+  if (q_init->data_type() != onnx::TensorProto::INT8 &&
+      q_init->data_type() != onnx::TensorProto::UINT8) {
+    return std::nullopt;
+  }
+  if (scale_init->data_type() != onnx::TensorProto::FLOAT) {
+    return std::nullopt;
+  }
+  if (q_init->dims_size() != rank) {
+    return std::nullopt;
+  }
+
+  if (zp_name) {
+    auto zit = init_map.find(*zp_name);
+    if (zit == init_map.end()) {
+      return std::nullopt;
+    }
+    const onnx::TensorProto* zp_init = zit->second;
+    if (zp_init->data_type() != q_init->data_type()) {
+      return std::nullopt;
+    }
+    if (!DimsEqual(zp_init->dims(), scale_init->dims())) {
+      return std::nullopt;
+    }
+  }
+
+  if (ConsumerCount(consumers_of, q_name) != 1 ||
+      ConsumerCount(consumers_of, scale_name) != 1 ||
+      (zp_name && ConsumerCount(consumers_of, *zp_name) != 1)) {
+    return std::nullopt;  // Shared/tied quantized tensor.
+  }
+
+  for (const auto& attr : dq->attribute()) {
+    if (attr.name() == "block_size" && attr.i() != 0) {
+      return std::nullopt;  // Blocked quantization --
+                            // MatchDequantizeLinearWeightBlockwise's own job.
+    }
+    if (attr.name() == "output_dtype" && attr.i() != 0) {
+      return std::nullopt;
+    }
+  }
+
+  int64_t axis = 1;  // DequantizeLinear's own schema default.
+  for (const auto& attr : dq->attribute()) {
+    if (attr.name() == "axis") {
+      axis = attr.i();
+      break;
+    }
+  }
+  if (axis < 0) {
+    axis += rank;
+  }
+
+  const std::vector<int64_t> q_dims(q_init->dims().begin(),
+                                    q_init->dims().end());
+  std::vector<int64_t> scale_dims(scale_init->dims().begin(),
+                                  scale_init->dims().end());
+  int64_t numel = 1;
+  for (int64_t d : scale_dims) {
+    numel *= d;
+  }
+  bool per_channel;
+  if (numel == 1) {
+    per_channel = false;
+  } else if (scale_dims.size() == 1) {
+    if (axis != expected_axis ||
+        scale_dims[0] != q_dims[static_cast<size_t>(expected_axis)]) {
+      return std::nullopt;
+    }
+    per_channel = true;
+  } else {
+    return std::nullopt;
+  }
+
+  return QdqWeightMatch{dq,          q_name, scale_name, zp_name, expected_axis,
+                        per_channel, q_dims};
+}
+
+struct QdqBlockwiseWeightMatch {
+  onnx::NodeProto* dq_node;
+  std::string q_name;
+  std::string scale_name;
+  std::optional<std::string> zp_name;
+  int64_t out_axis;
+  int64_t block_axis;
+  int64_t block_size;
+  int64_t num_blocks;
+  std::vector<int64_t> dims;
+};
+
+// The blockwise INT4/UINT4 analogue of MatchDequantizeLinearWeight -- see
+// this section's own top comment. `block_axis` is always `1 - expected_axis`
+// (this weight's own reduction axis, never its output-channel one).
+std::optional<QdqBlockwiseWeightMatch> MatchDequantizeLinearWeightBlockwise(
+    const std::string& weight_name, int64_t rank, int64_t expected_axis,
+    const InitMap& init_map, const DqMap& dq_of,
+    const ConsumerMap& consumers_of) {
+  auto dit = dq_of.find(weight_name);
+  if (dit == dq_of.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* dq = dit->second;
+  if (dq->op_type() != "DequantizeLinear" || dq->output_size() != 1) {
+    return std::nullopt;
+  }
+  if (ConsumerCount(consumers_of, weight_name) != 1) {
+    return std::nullopt;
+  }
+  if (dq->input_size() != 2 && dq->input_size() != 3) {
+    return std::nullopt;
+  }
+  const std::string& q_name = dq->input(0);
+  const std::string& scale_name = dq->input(1);
+  std::optional<std::string> zp_name;
+  if (dq->input_size() == 3 && !dq->input(2).empty()) {
+    zp_name = dq->input(2);
+  }
+  if (q_name.empty() || scale_name.empty()) {
+    return std::nullopt;
+  }
+
+  auto qit = init_map.find(q_name);
+  auto sit = init_map.find(scale_name);
+  if (qit == init_map.end() || sit == init_map.end()) {
+    return std::nullopt;
+  }
+  const onnx::TensorProto* q_init = qit->second;
+  const onnx::TensorProto* scale_init = sit->second;
+  if (q_init->data_type() != onnx::TensorProto::INT4 &&
+      q_init->data_type() != onnx::TensorProto::UINT4) {
+    return std::nullopt;
+  }
+  if (scale_init->data_type() != onnx::TensorProto::FLOAT) {
+    return std::nullopt;
+  }
+  if (q_init->dims_size() != rank) {
+    return std::nullopt;
+  }
+
+  if (zp_name) {
+    auto zit = init_map.find(*zp_name);
+    if (zit == init_map.end()) {
+      return std::nullopt;
+    }
+    const onnx::TensorProto* zp_init = zit->second;
+    if (zp_init->data_type() != q_init->data_type()) {
+      return std::nullopt;
+    }
+    if (!DimsEqual(zp_init->dims(), scale_init->dims())) {
+      return std::nullopt;
+    }
+  }
+
+  if (ConsumerCount(consumers_of, q_name) != 1 ||
+      ConsumerCount(consumers_of, scale_name) != 1 ||
+      (zp_name && ConsumerCount(consumers_of, *zp_name) != 1)) {
+    return std::nullopt;
+  }
+
+  int64_t block_size = 0, output_dtype = 0;
+  for (const auto& attr : dq->attribute()) {
+    if (attr.name() == "block_size") {
+      block_size = attr.i();
+    } else if (attr.name() == "output_dtype") {
+      output_dtype = attr.i();
+    }
+  }
+  if (block_size <= 0) {
+    return std::nullopt;  // Not blockwise -- MatchDequantizeLinearWeight's own
+                          // job.
+  }
+  if (output_dtype != 0) {
+    return std::nullopt;
+  }
+
+  int64_t axis = 1;
+  for (const auto& attr : dq->attribute()) {
+    if (attr.name() == "axis") {
+      axis = attr.i();
+      break;
+    }
+  }
+  if (axis < 0) {
+    axis += rank;
+  }
+
+  const int64_t block_axis = 1 - expected_axis;
+  if (axis != block_axis) {
+    return std::nullopt;
+  }
+
+  const std::vector<int64_t> dims(q_init->dims().begin(), q_init->dims().end());
+  const int64_t block_dim = dims[static_cast<size_t>(block_axis)];
+  if (block_dim % block_size != 0) {
+    return std::nullopt;  // Padded/partial final block -- declined.
+  }
+  const int64_t num_blocks = block_dim / block_size;
+
+  std::vector<int64_t> expected_scale_dims = dims;
+  expected_scale_dims[static_cast<size_t>(block_axis)] = num_blocks;
+  const std::vector<int64_t> scale_dims(scale_init->dims().begin(),
+                                        scale_init->dims().end());
+  if (scale_dims != expected_scale_dims) {
+    return std::nullopt;
+  }
+
+  return QdqBlockwiseWeightMatch{dq,         q_name,        scale_name,
+                                 zp_name,    expected_axis, block_axis,
+                                 block_size, num_blocks,    dims};
+}
+
+// A Conv/ConvTranspose/MatMul/Gemm weight resolved from one of three
+// sources -- a direct FLOAT initializer, a per-tensor/per-channel QDQ one,
+// or a blockwise INT4/UINT4 QDQ one -- mirroring pruning.py's own
+// `_WeightRef`/`_resolve_weight_ref`. Exactly one of `float_name`/`qdq`/
+// `qdq_block` is set; `dims` is always populated regardless of which.
+struct WeightRefMatch {
+  std::optional<std::string> float_name;
+  std::optional<QdqWeightMatch> qdq;
+  std::optional<QdqBlockwiseWeightMatch> qdq_block;
+  std::vector<int64_t> dims;
+
+  bool is_qdq() const { return qdq.has_value() || qdq_block.has_value(); }
+
+  // A name uniquely identifying the underlying tensor this resolves to --
+  // the int8/int4 `q_init`'s own name for a QDQ weight (per-tensor/
+  // per-channel or blockwise alike), or the float initializer's own name
+  // otherwise. Used to detect a shared/tied weight playing the same role in
+  // more than one chain -- mirrors pruning.py's own `_weight_ref_key`.
+  std::string key() const {
+    if (qdq) {
+      return qdq->q_name;
+    }
+    if (qdq_block) {
+      return qdq_block->q_name;
+    }
+    return *float_name;
+  }
+};
+
+std::optional<WeightRefMatch> ResolveWeightRef(
+    const std::string& weight_name, int64_t rank, int64_t expected_axis,
+    const InitMap& init_map, const DqMap& dq_of,
+    const ConsumerMap& consumers_of) {
+  auto it = init_map.find(weight_name);
+  if (it != init_map.end()) {
+    const onnx::TensorProto* w = it->second;
+    if (w->data_type() == onnx::TensorProto::FLOAT && w->dims_size() == rank) {
+      WeightRefMatch ref;
+      ref.float_name = weight_name;
+      ref.dims.assign(w->dims().begin(), w->dims().end());
+      return ref;
+    }
+    return std::nullopt;
+  }
+  auto qdq = MatchDequantizeLinearWeight(weight_name, rank, expected_axis,
+                                         init_map, dq_of, consumers_of);
+  if (qdq) {
+    WeightRefMatch ref;
+    ref.dims = qdq->dims;
+    ref.qdq = std::move(qdq);
+    return ref;
+  }
+  auto qdq_block = MatchDequantizeLinearWeightBlockwise(
+      weight_name, rank, expected_axis, init_map, dq_of, consumers_of);
+  if (qdq_block) {
+    WeightRefMatch ref;
+    ref.dims = qdq_block->dims;
+    ref.qdq_block = std::move(qdq_block);
+    return ref;
+  }
+  return std::nullopt;
+}
+
+// --- Per-op-family matchers built on ResolveWeightRef, mirroring
+// _match_conv_qdq/_match_conv_transpose_qdq/_match_matmul_qdq --------------
+
+struct QdqConvMatch {
+  WeightRefMatch ref;
+  std::optional<std::string> bias;
+  int64_t out_channels;
+  int64_t in_channels;
+};
+
+std::optional<QdqConvMatch> MatchConvQdq(const onnx::NodeProto& node,
+                                         const InitMap& init_map,
+                                         const DqMap& dq_of,
+                                         const ConsumerMap& consumers_of) {
+  if (node.op_type() != "Conv" || node.input_size() < 2) {
+    return std::nullopt;
+  }
+  if (ConvGroupAttr(node) != 1) {
+    return std::nullopt;  // Grouped/depthwise QDQ Conv -- out of scope.
+  }
+  auto ref =
+      ResolveWeightRef(node.input(1), 4, 0, init_map, dq_of, consumers_of);
+  if (!ref) {
+    return std::nullopt;
+  }
+  const int64_t out_channels = ref->dims[0];
+  const int64_t in_channels = ref->dims[1];
+  std::optional<std::string> bias;
+  if (node.input_size() == 3 && !node.input(2).empty()) {
+    bias = node.input(2);
+    auto bit = init_map.find(*bias);
+    if (bit == init_map.end() ||
+        bit->second->data_type() != onnx::TensorProto::FLOAT) {
+      return std::nullopt;  // Non-constant bias -- can't safely slice it.
+    }
+  }
+  return QdqConvMatch{*ref, bias, out_channels, in_channels};
+}
+
+struct QdqConvTransposeMatch {
+  WeightRefMatch ref;
+  std::optional<std::string> bias;
+  int64_t out_channels;
+  int64_t in_channels;
+};
+
+// The ConvTranspose analogue of MatchConvQdq -- see this section's own top
+// comment for the reversed-layout ([in_channels, out_channels, kH, kW])
+// reasoning. `expected_axis=1` is the ONE difference from MatchConvQdq.
+std::optional<QdqConvTransposeMatch> MatchConvTransposeQdq(
+    const onnx::NodeProto& node, const InitMap& init_map, const DqMap& dq_of,
+    const ConsumerMap& consumers_of) {
+  if (node.op_type() != "ConvTranspose" || node.input_size() < 2) {
+    return std::nullopt;
+  }
+  if (ConvGroupAttr(node) != 1) {
+    return std::nullopt;
+  }
+  auto ref =
+      ResolveWeightRef(node.input(1), 4, 1, init_map, dq_of, consumers_of);
+  if (!ref) {
+    return std::nullopt;
+  }
+  const int64_t in_channels = ref->dims[0];
+  const int64_t out_channels = ref->dims[1];
+  std::optional<std::string> bias;
+  if (node.input_size() == 3 && !node.input(2).empty()) {
+    bias = node.input(2);
+    auto bit = init_map.find(*bias);
+    if (bit == init_map.end() ||
+        bit->second->data_type() != onnx::TensorProto::FLOAT) {
+      return std::nullopt;
+    }
+  }
+  return QdqConvTransposeMatch{*ref, bias, out_channels, in_channels};
+}
+
+struct QdqMatmulMatch {
+  std::string x_name;
+  WeightRefMatch ref;
+  bool weight_transposed;
+  std::optional<std::string> bias;
+  int64_t out_channels;
+  int64_t in_channels;
+};
+
+std::optional<QdqMatmulMatch> MatchMatmulQdq(const onnx::NodeProto& node,
+                                             const InitMap& init_map,
+                                             const DqMap& dq_of,
+                                             const ConsumerMap& consumers_of) {
+  auto m = MatchMatMulLikeRaw(node);
+  if (!m) {
+    return std::nullopt;
+  }
+  const int64_t axis = m->weight_transposed ? 0 : 1;
+  auto ref =
+      ResolveWeightRef(m->w_name, 2, axis, init_map, dq_of, consumers_of);
+  if (!ref) {
+    return std::nullopt;
+  }
+  const int64_t out_channels = ref->dims[static_cast<size_t>(axis)];
+  const int64_t in_channels = ref->dims[static_cast<size_t>(1 - axis)];
+  std::optional<std::string> bias;
+  if (node.op_type() == "Gemm" && node.input_size() == 3 &&
+      !node.input(2).empty()) {
+    bias = node.input(2);
+    auto bit = init_map.find(*bias);
+    if (bit == init_map.end() ||
+        bit->second->data_type() != onnx::TensorProto::FLOAT) {
+      return std::nullopt;
+    }
+  }
+  return QdqMatmulMatch{m->x_name, *ref,         m->weight_transposed,
+                        bias,      out_channels, in_channels};
+}
+
+// --- Chain data model + plain-chain walker/finder, mirroring _QDQProducer/
+// _QDQConsumer/_QDQChain/_QDQGatedChain and _walk_to_consumer_qdq/
+// _find_qdq_chains ----------------------------------------------------------
+
+struct QdqProducer {
+  onnx::NodeProto* node;
+  WeightRefMatch ref;
+  std::optional<std::string> bias;
+  bool weight_transposed;
+  bool is_conv;
+  bool is_conv_transpose;
+  // Activation nodes between this producer's raw output and the point it
+  // combines with another producer -- a gated pair only, see
+  // FindQdqGatedChains; empty for a plain single-producer chain.
+  std::vector<onnx::NodeProto*> pre_ops;
+};
+
+struct QdqConsumerMatch {
+  onnx::NodeProto* node;
+  WeightRefMatch ref;
+  bool weight_transposed;
+  bool is_conv;
+  bool is_conv_transpose = false;
+};
+
+struct QdqChain {
+  QdqProducer producer;
+  std::vector<onnx::NodeProto*> chain_ops;
+  QdqConsumerMatch consumer;
+  int64_t n_channels;
+};
+
+struct QdqGatedChain {
+  QdqProducer producer_a;
+  QdqProducer producer_b;
+  std::vector<onnx::NodeProto*> chain_ops;
+  QdqConsumerMatch consumer;
+  int64_t n_channels;
+};
+
+// From tensor `start`, walks forward through shape-preserving unary
+// activations (UnaryPassThroughOps) with no other consumer anywhere along
+// the way, until a same-family (Conv/ConvTranspose-only or MatMul/Gemm-only,
+// matching `is_conv`) consumer is found whose input-channel count matches
+// `n_channels`. No per-channel Add/Mul bias/scale hop, no depthwise Conv
+// pass-through, no branch -- narrower than WalkToConsumer by design, see
+// this section's own top comment. Mirrors pruning.py's own
+// `_walk_to_consumer_qdq` exactly, including trying a Conv consumer before a
+// ConvTranspose one regardless of which family the producer itself was.
+std::pair<std::optional<QdqConsumerMatch>, std::vector<onnx::NodeProto*>>
+WalkToConsumerQdq(const std::string& start, bool is_conv,
+                  const InitMap& init_map, const DqMap& dq_of,
+                  const ConsumerMap& consumers_of,
+                  const std::unordered_set<std::string>& graph_outputs,
+                  int64_t n_channels, int max_hops) {
+  std::vector<onnx::NodeProto*> chain_ops;
+  std::string cur = start;
+  for (int hop = 0; hop < max_hops; ++hop) {
+    auto cit = consumers_of.find(cur);
+    if (cit == consumers_of.end() || cit->second.size() != 1) {
+      return {std::nullopt, chain_ops};
+    }
+    onnx::NodeProto* nxt = cit->second[0];
+
+    if (is_conv) {
+      if (nxt->op_type() == "Conv" && nxt->input_size() > 0 &&
+          nxt->input(0) == cur) {
+        auto m = MatchConvQdq(*nxt, init_map, dq_of, consumers_of);
+        if (!m || m->in_channels != n_channels) {
+          return {std::nullopt, chain_ops};
+        }
+        return {QdqConsumerMatch{nxt, m->ref, false, true, false}, chain_ops};
+      }
+      if (nxt->op_type() == "ConvTranspose" && nxt->input_size() > 0 &&
+          nxt->input(0) == cur) {
+        auto m = MatchConvTransposeQdq(*nxt, init_map, dq_of, consumers_of);
+        if (!m || m->in_channels != n_channels) {
+          return {std::nullopt, chain_ops};
+        }
+        return {QdqConsumerMatch{nxt, m->ref, false, true, true}, chain_ops};
+      }
+    } else {
+      auto mm = MatchMatmulQdq(*nxt, init_map, dq_of, consumers_of);
+      if (mm && mm->x_name == cur) {
+        if (mm->in_channels != n_channels) {
+          return {std::nullopt, chain_ops};
+        }
+        return {
+            QdqConsumerMatch{nxt, mm->ref, mm->weight_transposed, false, false},
+            chain_ops};
+      }
+    }
+
+    const bool is_unary = UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
+                          nxt->input_size() == 1 && nxt->input(0) == cur &&
+                          nxt->output_size() == 1;
+    if (!is_unary) {
+      return {std::nullopt, chain_ops};
+    }
+    const std::string& out2 = nxt->output(0);
+    auto oit = consumers_of.find(out2);
+    if (oit == consumers_of.end() || oit->second.size() != 1 ||
+        graph_outputs.count(out2)) {
+      return {std::nullopt, chain_ops};
+    }
+    chain_ops.push_back(nxt);
+    cur = out2;
+  }
+  return {std::nullopt, chain_ops};
+}
+
+std::vector<QdqChain> FindQdqChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  DqMap dq_of;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* n = graph->mutable_node(i);
+    if (n->op_type() == "DequantizeLinear" && n->output_size() == 1) {
+      dq_of[n->output(0)] = n;
+    }
+  }
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  auto is_internal = [&](const std::string& name) {
+    auto it = consumers_of.find(name);
+    return it != consumers_of.end() && it->second.size() == 1 &&
+           !graph_outputs.count(name);
+  };
+
+  std::vector<QdqChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    bool is_conv_transpose = false;
+    std::optional<WeightRefMatch> ref;
+    std::optional<std::string> bias_name;
+    int64_t out_channels = 0;
+    bool weight_transposed = false;
+    bool is_conv;
+
+    if (node->op_type() == "Conv") {
+      auto m = MatchConvQdq(*node, init_map, dq_of, consumers_of);
+      if (!m) {
+        continue;
+      }
+      ref = m->ref;
+      bias_name = m->bias;
+      out_channels = m->out_channels;
+      is_conv = true;
+    } else if (node->op_type() == "ConvTranspose") {
+      auto m = MatchConvTransposeQdq(*node, init_map, dq_of, consumers_of);
+      if (!m) {
+        continue;
+      }
+      ref = m->ref;
+      bias_name = m->bias;
+      out_channels = m->out_channels;
+      is_conv = true;
+      is_conv_transpose = true;
+    } else {
+      auto mm = MatchMatmulQdq(*node, init_map, dq_of, consumers_of);
+      if (!mm) {
+        continue;
+      }
+      ref = mm->ref;
+      bias_name = mm->bias;
+      out_channels = mm->out_channels;
+      weight_transposed = mm->weight_transposed;
+      is_conv = false;
+    }
+
+    const std::string& out_name = node->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    auto [consumer, chain_ops] =
+        WalkToConsumerQdq(out_name, is_conv, init_map, dq_of, consumers_of,
+                          graph_outputs, out_channels, kMaxChainHops);
+    if (!consumer) {
+      continue;
+    }
+    if (!(ref->is_qdq() || consumer->ref.is_qdq())) {
+      continue;  // Both plain float -- FindChains's own job.
+    }
+
+    QdqChain chain;
+    chain.producer = QdqProducer{
+        node, *ref, bias_name, weight_transposed, is_conv, is_conv_transpose,
+        {}};
+    chain.chain_ops = std::move(chain_ops);
+    chain.consumer = *consumer;
+    chain.n_channels = out_channels;
+    chains.push_back(std::move(chain));
+  }
+  return chains;
+}
+
+// --- Gated (SwiGLU/GeGLU) chains, mirroring _trace_gate_producer_backward_qdq/
+// _qdq_gated_channel_importance/_find_qdq_gated_chains ----------------------
+
+struct QdqFullProducerMatch {
+  onnx::NodeProto* node;
+  WeightRefMatch ref;
+  bool weight_transposed;
+  std::optional<std::string> bias;
+  int64_t n_channels;
+};
+
+// Walks backward from `tensor_name` through unary activation ops until it
+// resolves to a QDQ-or-plain-float MatMul/vanilla-Gemm producer's raw
+// output. Mirrors TraceGateProducerBackward's own float-only walk, kept
+// separate (rather than shared) since `producer_infos` here holds a
+// resolved WeightRefMatch rather than a bare weight name -- the same
+// "duplicated for a structurally different producer_infos" choice
+// pruning.py's own comment gives for its identical Python split.
+std::optional<std::pair<QdqFullProducerMatch, std::vector<onnx::NodeProto*>>>
+TraceGateProducerBackwardQdq(
+    const std::string& tensor_name,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const std::unordered_map<std::string, QdqFullProducerMatch>& producer_infos,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs, int max_hops) {
+  std::vector<onnx::NodeProto*> pre_ops;
+  std::string cur = tensor_name;
+  for (int hop = 0; hop < max_hops; ++hop) {
+    if (ConsumerCount(consumers_of, cur) != 1 || graph_outputs.count(cur)) {
+      return std::nullopt;
+    }
+    auto pit = producer_infos.find(cur);
+    if (pit != producer_infos.end()) {
+      std::reverse(pre_ops.begin(), pre_ops.end());
+      return std::make_pair(pit->second, std::move(pre_ops));
+    }
+    auto nit = node_by_output.find(cur);
+    if (nit == node_by_output.end()) {
+      return std::nullopt;
+    }
+    onnx::NodeProto* producer_node = nit->second;
+    if (!(UnaryPassThroughOps().count(producer_node->op_type()) != 0 &&
+          producer_node->input_size() == 1 &&
+          producer_node->output_size() == 1)) {
+      return std::nullopt;
+    }
+    pre_ops.push_back(producer_node);
+    cur = producer_node->input(0);
+  }
+  return std::nullopt;
+}
+
+std::vector<QdqGatedChain> FindQdqGatedChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  DqMap dq_of;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* n = graph->mutable_node(i);
+    if (n->op_type() == "DequantizeLinear" && n->output_size() == 1) {
+      dq_of[n->output(0)] = n;
+    }
+  }
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  auto is_internal = [&](const std::string& name) {
+    auto it = consumers_of.find(name);
+    return it != consumers_of.end() && it->second.size() == 1 &&
+           !graph_outputs.count(name);
+  };
+
+  std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
+  std::unordered_map<std::string, QdqFullProducerMatch> producer_infos;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    for (const auto& out : node->output()) {
+      node_by_output[out] = node;
+    }
+    auto mm = MatchMatmulQdq(*node, init_map, dq_of, consumers_of);
+    if (mm) {
+      producer_infos[node->output(0)] = QdqFullProducerMatch{
+          node, mm->ref, mm->weight_transposed, mm->bias, mm->out_channels};
+    }
+  }
+
+  std::vector<QdqGatedChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    std::optional<QdqFullProducerMatch> info_a, info_b;
+    std::vector<onnx::NodeProto*> pre_a, pre_b;
+
+    if (node->op_type() == "Mul" && node->input_size() == 2 &&
+        node->output_size() == 1) {
+      const std::string& a_name = node->input(0);
+      const std::string& b_name = node->input(1);
+      if (a_name == b_name || init_map.count(a_name) ||
+          init_map.count(b_name)) {
+        continue;
+      }
+      auto trace_a = TraceGateProducerBackwardQdq(a_name, node_by_output,
+                                                  producer_infos, consumers_of,
+                                                  graph_outputs, kMaxChainHops);
+      auto trace_b = TraceGateProducerBackwardQdq(b_name, node_by_output,
+                                                  producer_infos, consumers_of,
+                                                  graph_outputs, kMaxChainHops);
+      if (!trace_a || !trace_b) {
+        continue;
+      }
+      info_a = trace_a->first;
+      pre_a = std::move(trace_a->second);
+      info_b = trace_b->first;
+      pre_b = std::move(trace_b->second);
+    } else if (node->op_type() == "SwiGLU" && node->input_size() == 2 &&
+               node->output_size() == 1) {
+      const std::string& a_name = node->input(0);
+      const std::string& b_name = node->input(1);
+      if (init_map.count(a_name) || init_map.count(b_name)) {
+        continue;
+      }
+      if (!(is_internal(a_name) && is_internal(b_name))) {
+        continue;
+      }
+      auto ait = producer_infos.find(a_name);
+      auto bit = producer_infos.find(b_name);
+      if (ait == producer_infos.end() || bit == producer_infos.end()) {
+        continue;
+      }
+      info_a = ait->second;
+      info_b = bit->second;
+    } else {
+      continue;
+    }
+
+    if (info_a->node == info_b->node ||
+        info_a->n_channels != info_b->n_channels) {
+      continue;
+    }
+
+    const std::string& out_name = node->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    auto [consumer, chain_ops] =
+        WalkToConsumerQdq(out_name, false, init_map, dq_of, consumers_of,
+                          graph_outputs, info_a->n_channels, kMaxChainHops);
+    if (!consumer) {
+      continue;
+    }
+
+    QdqProducer pa{info_a->node,      info_a->ref,
+                   info_a->bias,      info_a->weight_transposed,
+                   false /*is_conv*/, false,
+                   std::move(pre_a)};
+    QdqProducer pb{info_b->node,      info_b->ref,
+                   info_b->bias,      info_b->weight_transposed,
+                   false /*is_conv*/, false,
+                   std::move(pre_b)};
+    if (!(pa.ref.is_qdq() || pb.ref.is_qdq() || consumer->ref.is_qdq())) {
+      continue;  // All plain float -- FindGatedChains's own job.
+    }
+
+    QdqGatedChain chain;
+    chain.producer_a = std::move(pa);
+    chain.producer_b = std::move(pb);
+    chain.chain_ops = std::move(chain_ops);
+    chain.consumer = *consumer;
+    chain.n_channels = info_a->n_channels;
+    chains.push_back(std::move(chain));
+  }
+  return chains;
+}
+
+// --- Apply: slicing, mirroring _slice_producer_weight_qdq[_block]/
+// _slice_consumer_weight_qdq[_block]/_qdq_block_aligned_keep_blocks/
+// apply_structured_pruning_qdq ----------------------------------------------
+
+using MutInitMap = std::unordered_map<std::string, onnx::TensorProto*>;
+
+MutInitMap BuildMutInitMap(onnx::GraphProto* graph) {
+  MutInitMap m;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    m[t->name()] = t;
+  }
+  return m;
+}
+
+struct DequantResult {
+  std::vector<double> data;
+  std::vector<int64_t> dims;
+};
+
+// The full float64 array `ref` refers to, for IMPORTANCE RANKING ONLY -- see
+// this section's own top comment. Never written back to the graph.
+DequantResult DequantizeWeightRefForRanking(const WeightRefMatch& ref,
+                                            const MutInitMap& init_map) {
+  if (ref.float_name) {
+    const onnx::TensorProto* t = init_map.at(*ref.float_name);
+    const std::vector<float> f = ReadFloatTensor(*t);
+    return {std::vector<double>(f.begin(), f.end()), ref.dims};
+  }
+  if (ref.qdq) {
+    const QdqWeightMatch& q = *ref.qdq;
+    const onnx::TensorProto* qt = init_map.at(q.q_name);
+    const onnx::TensorProto* st = init_map.at(q.scale_name);
+    const std::vector<int64_t> codes = ReadQuantCodes(*qt);
+    const std::vector<float> scale = ReadFloatTensor(*st);
+    std::vector<int64_t> zp;
+    if (q.zp_name) {
+      zp = ReadQuantCodes(*init_map.at(*q.zp_name));
+    }
+    return {
+        PerChannelDequantFlat(codes, q.dims, scale, zp, q.per_channel, q.axis),
+        q.dims};
+  }
+  const QdqBlockwiseWeightMatch& qb = *ref.qdq_block;
+  const onnx::TensorProto* qt = init_map.at(qb.q_name);
+  const onnx::TensorProto* st = init_map.at(qb.scale_name);
+  const std::vector<int64_t> codes = ReadQuantCodes(*qt);
+  const std::vector<float> scale = ReadFloatTensor(*st);
+  std::vector<int64_t> zp;
+  if (qb.zp_name) {
+    zp = ReadQuantCodes(*init_map.at(*qb.zp_name));
+  }
+  return {BlockwiseDequantFlat(codes, qb.dims, scale, zp, qb.block_axis,
+                               qb.block_size, qb.num_blocks),
+          qb.dims};
+}
+
+// This weight's own output-channel axis (`producer_role`) or input/reduction
+// axis (consumer role), within its OWN `q_init`/float initializer's dims --
+// mirrors pruning.py's own identical branching in `_slice_producer_weight_qdq`/
+// `_slice_consumer_weight_qdq`.
+int64_t QdqWeightAxis(bool producer_role, bool weight_transposed, bool is_conv,
+                      bool is_conv_transpose) {
+  if (is_conv) {
+    if (producer_role) {
+      return is_conv_transpose ? 1 : 0;
+    }
+    return is_conv_transpose ? 0 : 1;
+  }
+  if (producer_role) {
+    return weight_transposed ? 0 : 1;
+  }
+  return weight_transposed ? 1 : 0;
+}
+
+// Slices `ref`'s own output channels to `keep` (ascending indices) -- the
+// producer role. See this section's own top comment for exactly which of
+// Wq/Ws/Wzp get co-sliced for each of the three WeightRefMatch sources.
+void SliceProducerWeightQdq(const WeightRefMatch& ref, bool weight_transposed,
+                            const std::vector<int64_t>& keep, bool is_conv,
+                            bool is_conv_transpose, MutInitMap& init_map) {
+  if (ref.float_name) {
+    onnx::TensorProto* wt = init_map.at(*ref.float_name);
+    if (!is_conv_transpose) {
+      SliceProducerWeight(wt, weight_transposed, keep, is_conv);
+      return;
+    }
+    // ConvTranspose float producer: [Cin, Cout, kH, kW], axis 1.
+    const std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
+    const std::vector<float> data = ReadFloatTensor(*wt);
+    int64_t inner = 1;
+    for (size_t i = 2; i < dims.size(); ++i) {
+      inner *= dims[i];
+    }
+    const std::vector<float> out =
+        SliceAxis1(data, dims[0], dims[1], inner, keep);
+    std::vector<int64_t> new_dims = dims;
+    new_dims[1] = static_cast<int64_t>(keep.size());
+    SetFloatTensorData(wt, new_dims, out);
+    return;
+  }
+
+  const int64_t axis =
+      QdqWeightAxis(true, weight_transposed, is_conv, is_conv_transpose);
+  if (ref.qdq) {
+    const QdqWeightMatch& q = *ref.qdq;
+    onnx::TensorProto* qt = init_map.at(q.q_name);
+    const std::vector<int64_t> codes = ReadQuantCodes(*qt);
+    const std::vector<int64_t> new_codes =
+        SliceAlongAxis(codes, q.dims, axis, keep);
+    std::vector<int64_t> new_dims = q.dims;
+    new_dims[static_cast<size_t>(axis)] = static_cast<int64_t>(keep.size());
+    SetQuantCodes(qt, qt->data_type(), new_dims, new_codes);
+
+    if (q.per_channel) {
+      SliceLastAxis(init_map.at(q.scale_name), keep);
+      if (q.zp_name) {
+        onnx::TensorProto* zt = init_map.at(*q.zp_name);
+        const std::vector<int64_t> zdims(zt->dims().begin(), zt->dims().end());
+        const std::vector<int64_t> zcodes = ReadQuantCodes(*zt);
+        const std::vector<int64_t> new_z =
+            SliceAlongAxis(zcodes, zdims, 0, keep);
+        std::vector<int64_t> new_zdims = zdims;
+        new_zdims[0] = static_cast<int64_t>(keep.size());
+        SetQuantCodes(zt, zt->data_type(), new_zdims, new_z);
+      }
+    }
+    return;
+  }
+
+  // Blockwise: out_axis never blocked, so codes/scale/zero_point co-slice by
+  // `keep` in lockstep, no alignment concern (see this section's own top
+  // comment).
+  const QdqBlockwiseWeightMatch& qb = *ref.qdq_block;
+  onnx::TensorProto* qt = init_map.at(qb.q_name);
+  const std::vector<int64_t> codes = ReadQuantCodes(*qt);
+  const std::vector<int64_t> new_codes =
+      SliceAlongAxis(codes, qb.dims, qb.out_axis, keep);
+  std::vector<int64_t> new_dims = qb.dims;
+  new_dims[static_cast<size_t>(qb.out_axis)] =
+      static_cast<int64_t>(keep.size());
+  SetQuantCodes(qt, qt->data_type(), new_dims, new_codes);
+
+  onnx::TensorProto* st = init_map.at(qb.scale_name);
+  const std::vector<int64_t> sdims(st->dims().begin(), st->dims().end());
+  const std::vector<float> scale = ReadFloatTensor(*st);
+  const std::vector<float> new_scale =
+      SliceAlongAxis(scale, sdims, qb.out_axis, keep);
+  std::vector<int64_t> new_sdims = sdims;
+  new_sdims[static_cast<size_t>(qb.out_axis)] =
+      static_cast<int64_t>(keep.size());
+  SetFloatTensorData(st, new_sdims, new_scale);
+
+  if (qb.zp_name) {
+    onnx::TensorProto* zt = init_map.at(*qb.zp_name);
+    const std::vector<int64_t> zdims(zt->dims().begin(), zt->dims().end());
+    const std::vector<int64_t> zcodes = ReadQuantCodes(*zt);
+    const std::vector<int64_t> new_z =
+        SliceAlongAxis(zcodes, zdims, qb.out_axis, keep);
+    std::vector<int64_t> new_zdims = zdims;
+    new_zdims[static_cast<size_t>(qb.out_axis)] =
+        static_cast<int64_t>(keep.size());
+    SetQuantCodes(zt, zt->data_type(), new_zdims, new_z);
+  }
+}
+
+// Slices `ref`'s own input (reduction) channels to `keep` -- the consumer
+// role for a plain float or per-tensor/per-channel QDQ weight only (never a
+// blockwise one -- see SliceConsumerWeightQdqBlock below). Never touches
+// scale/zero_point: they are indexed by the OUTPUT channel axis (or are a
+// scalar), never by the input axis sliced here.
+void SliceConsumerWeightQdq(const WeightRefMatch& ref, bool weight_transposed,
+                            const std::vector<int64_t>& keep, bool is_conv,
+                            bool is_conv_transpose, MutInitMap& init_map) {
+  if (ref.float_name) {
+    onnx::TensorProto* wt = init_map.at(*ref.float_name);
+    if (!is_conv_transpose) {
+      SliceConsumerWeight(wt, weight_transposed, keep, is_conv);
+      return;
+    }
+    // ConvTranspose float consumer: [Cin, Cout, kH, kW], axis 0, flat (any
+    // group).
+    const std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
+    const std::vector<float> data = ReadFloatTensor(*wt);
+    int64_t inner = 1;
+    for (size_t i = 1; i < dims.size(); ++i) {
+      inner *= dims[i];
+    }
+    const std::vector<float> out = SliceAxis0(data, dims[0], inner, keep);
+    std::vector<int64_t> new_dims = dims;
+    new_dims[0] = static_cast<int64_t>(keep.size());
+    SetFloatTensorData(wt, new_dims, out);
+    return;
+  }
+  const QdqWeightMatch& q = *ref.qdq;
+  const int64_t axis =
+      QdqWeightAxis(false, weight_transposed, is_conv, is_conv_transpose);
+  onnx::TensorProto* qt = init_map.at(q.q_name);
+  const std::vector<int64_t> codes = ReadQuantCodes(*qt);
+  const std::vector<int64_t> new_codes =
+      SliceAlongAxis(codes, q.dims, axis, keep);
+  std::vector<int64_t> new_dims = q.dims;
+  new_dims[static_cast<size_t>(axis)] = static_cast<int64_t>(keep.size());
+  SetQuantCodes(qt, qt->data_type(), new_dims, new_codes);
+}
+
+// Returns the ascending block indices `keep` corresponds to when every
+// `block_size`-sized block of a `block_dim`-length axis is either wholly
+// present in `keep` or wholly absent -- or nullopt when some block is only
+// partially kept (this chain's consumer cannot be safely pruned to this
+// exact `keep` set). Mirrors pruning.py's own `_qdq_block_aligned_keep_blocks`.
+std::optional<std::vector<int64_t>> QdqBlockAlignedKeepBlocks(
+    const std::vector<int64_t>& keep, int64_t block_dim, int64_t block_size) {
+  const std::unordered_set<int64_t> keep_set(keep.begin(), keep.end());
+  const int64_t num_blocks = block_dim / block_size;
+  std::vector<int64_t> keep_blocks;
+  for (int64_t b = 0; b < num_blocks; ++b) {
+    const int64_t lo = b * block_size;
+    bool all = true, any = false;
+    for (int64_t p = lo; p < lo + block_size; ++p) {
+      const bool in = keep_set.count(p) != 0;
+      all = all && in;
+      any = any || in;
+    }
+    if (all) {
+      keep_blocks.push_back(b);
+    } else if (any) {
+      return std::nullopt;
+    }
+  }
+  return keep_blocks;
+}
+
+// Slices `qb`'s own input/reduction (`block_axis`) axis -- the consumer role
+// for a blockwise-quantized weight. Never called with a non-block-aligned
+// `keep`; `keep_blocks` (QdqBlockAlignedKeepBlocks) is validated by the
+// caller first. `q_init` is sliced element-wise by `keep`; `scale`/
+// `zero_point` are indexed by BLOCK, so sliced by `keep_blocks` instead,
+// along the same `block_axis`.
+void SliceConsumerWeightQdqBlock(const QdqBlockwiseWeightMatch& qb,
+                                 const std::vector<int64_t>& keep,
+                                 const std::vector<int64_t>& keep_blocks,
+                                 MutInitMap& init_map) {
+  onnx::TensorProto* qt = init_map.at(qb.q_name);
+  const std::vector<int64_t> codes = ReadQuantCodes(*qt);
+  const std::vector<int64_t> new_codes =
+      SliceAlongAxis(codes, qb.dims, qb.block_axis, keep);
+  std::vector<int64_t> new_dims = qb.dims;
+  new_dims[static_cast<size_t>(qb.block_axis)] =
+      static_cast<int64_t>(keep.size());
+  SetQuantCodes(qt, qt->data_type(), new_dims, new_codes);
+
+  onnx::TensorProto* st = init_map.at(qb.scale_name);
+  const std::vector<int64_t> sdims(st->dims().begin(), st->dims().end());
+  const std::vector<float> scale = ReadFloatTensor(*st);
+  const std::vector<float> new_scale =
+      SliceAlongAxis(scale, sdims, qb.block_axis, keep_blocks);
+  std::vector<int64_t> new_sdims = sdims;
+  new_sdims[static_cast<size_t>(qb.block_axis)] =
+      static_cast<int64_t>(keep_blocks.size());
+  SetFloatTensorData(st, new_sdims, new_scale);
+
+  if (qb.zp_name) {
+    onnx::TensorProto* zt = init_map.at(*qb.zp_name);
+    const std::vector<int64_t> zdims(zt->dims().begin(), zt->dims().end());
+    const std::vector<int64_t> zcodes = ReadQuantCodes(*zt);
+    const std::vector<int64_t> new_z =
+        SliceAlongAxis(zcodes, zdims, qb.block_axis, keep_blocks);
+    std::vector<int64_t> new_zdims = zdims;
+    new_zdims[static_cast<size_t>(qb.block_axis)] =
+        static_cast<int64_t>(keep_blocks.size());
+    SetQuantCodes(zt, zt->data_type(), new_zdims, new_z);
+  }
+}
+
+// The shared apply body for both plain and gated QDQ chains, mirroring
+// `apply_structured_pruning_qdq`'s own main loop over
+// `_find_qdq_chains`/`_find_qdq_gated_chains` -- see this section's own top
+// comment for the producer/consumer co-slicing rules this enforces.
+void ApplyQdqChains(onnx::GraphProto* graph, std::vector<QdqChain>& chains,
+                    std::vector<QdqGatedChain>& gated_chains, double sparsity,
+                    TouchedState& touched) {
+  MutInitMap init_map = BuildMutInitMap(graph);
+  auto& producer_touched = touched.producer;
+  auto& consumer_touched = touched.consumer;
+  auto& stale_value_info = touched.stale_value_info;
+
+  auto mark_dq_stale = [&](const WeightRefMatch& ref) {
+    if (ref.qdq) {
+      stale_value_info.insert(ref.qdq->dq_node->output(0));
+    } else if (ref.qdq_block) {
+      stale_value_info.insert(ref.qdq_block->dq_node->output(0));
+    }
+  };
+
+  for (const auto& chain : chains) {
+    const QdqProducer& p = chain.producer;
+    const QdqConsumerMatch& c = chain.consumer;
+    const std::string p_key = p.ref.key();
+    const std::string c_key = c.ref.key();
+    if (p_key == c_key) {
+      continue;  // Degenerate (the same weight in both roles).
+    }
+    if (producer_touched.count(p_key) || consumer_touched.count(c_key)) {
+      continue;  // A shared/tied weight another chain already resized.
+    }
+
+    const int64_t n = chain.n_channels;
+    const int64_t keep_count = std::max<int64_t>(
+        1, n - std::llround(static_cast<double>(n) * sparsity));
+    if (keep_count >= n) {
+      continue;  // Rounds down to nothing for this layer -- no-op.
+    }
+
+    const DequantResult w = DequantizeWeightRefForRanking(p.ref, init_map);
+    const std::vector<double> w_nk = QdqWeightToNk(
+        w.data, w.dims, p.weight_transposed, p.is_conv, p.is_conv_transpose);
+    const int64_t k = static_cast<int64_t>(w_nk.size()) / n;
+    const std::vector<double> importance = QdqChannelImportanceL2(w_nk, n, k);
+    // Stable tie-break matters here specifically -- see
+    // StableTopKIndicesAscending's own comment: an unstable tie-break can
+    // flip a would-have-been block-aligned consumer to "declined"
+    // nondeterministically.
+    const std::vector<int64_t> keep =
+        StableTopKIndicesAscending(importance, keep_count);
+
+    std::optional<std::vector<int64_t>> keep_blocks;
+    if (c.ref.qdq_block) {
+      keep_blocks =
+          QdqBlockAlignedKeepBlocks(keep, n, c.ref.qdq_block->block_size);
+      if (!keep_blocks) {
+        continue;  // Non-block-aligned keep set -- decline the whole chain.
+      }
+    }
+
+    SliceProducerWeightQdq(p.ref, p.weight_transposed, keep, p.is_conv,
+                           p.is_conv_transpose, init_map);
+    if (p.bias) {
+      SliceLastAxis(init_map.at(*p.bias), keep);
+    }
+    if (keep_blocks) {
+      SliceConsumerWeightQdqBlock(*c.ref.qdq_block, keep, *keep_blocks,
+                                  init_map);
+    } else {
+      SliceConsumerWeightQdq(c.ref, c.weight_transposed, keep, c.is_conv,
+                             c.is_conv_transpose, init_map);
+    }
+
+    producer_touched.insert(p_key);
+    consumer_touched.insert(c_key);
+    stale_value_info.insert(p.node->output(0));
+    for (onnx::NodeProto* op : chain.chain_ops) {
+      stale_value_info.insert(op->output(0));
+    }
+    mark_dq_stale(p.ref);
+    mark_dq_stale(c.ref);
+  }
+
+  for (const auto& gchain : gated_chains) {
+    const QdqProducer& pa = gchain.producer_a;
+    const QdqProducer& pb = gchain.producer_b;
+    const QdqConsumerMatch& c = gchain.consumer;
+    const std::string pa_key = pa.ref.key();
+    const std::string pb_key = pb.ref.key();
+    const std::string c_key = c.ref.key();
+    if (pa_key == pb_key || pa_key == c_key || pb_key == c_key) {
+      continue;  // Degenerate (a weight tied across two roles).
+    }
+    if (producer_touched.count(pa_key) || producer_touched.count(pb_key) ||
+        consumer_touched.count(c_key)) {
+      continue;
+    }
+
+    const int64_t n = gchain.n_channels;
+    const int64_t keep_count = std::max<int64_t>(
+        1, n - std::llround(static_cast<double>(n) * sparsity));
+    if (keep_count >= n) {
+      continue;
+    }
+
+    const DequantResult wa = DequantizeWeightRefForRanking(pa.ref, init_map);
+    const DequantResult wb = DequantizeWeightRefForRanking(pb.ref, init_map);
+    const std::vector<double> wa_nk =
+        QdqWeightToNk(wa.data, wa.dims, pa.weight_transposed, false, false);
+    const std::vector<double> wb_nk =
+        QdqWeightToNk(wb.data, wb.dims, pb.weight_transposed, false, false);
+    const int64_t k = static_cast<int64_t>(wa_nk.size()) / n;
+    const std::vector<double> imp_a = QdqChannelImportanceL2(wa_nk, n, k);
+    const std::vector<double> imp_b = QdqChannelImportanceL2(wb_nk, n, k);
+    std::vector<double> importance(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+      importance[static_cast<size_t>(i)] = std::sqrt(
+          imp_a[static_cast<size_t>(i)] * imp_a[static_cast<size_t>(i)] +
+          imp_b[static_cast<size_t>(i)] * imp_b[static_cast<size_t>(i)]);
+    }
+    const std::vector<int64_t> keep =
+        StableTopKIndicesAscending(importance, keep_count);
+
+    std::optional<std::vector<int64_t>> keep_blocks;
+    if (c.ref.qdq_block) {
+      keep_blocks =
+          QdqBlockAlignedKeepBlocks(keep, n, c.ref.qdq_block->block_size);
+      if (!keep_blocks) {
+        continue;
+      }
+    }
+
+    SliceProducerWeightQdq(pa.ref, pa.weight_transposed, keep, false, false,
+                           init_map);
+    if (pa.bias) {
+      SliceLastAxis(init_map.at(*pa.bias), keep);
+    }
+    SliceProducerWeightQdq(pb.ref, pb.weight_transposed, keep, false, false,
+                           init_map);
+    if (pb.bias) {
+      SliceLastAxis(init_map.at(*pb.bias), keep);
+    }
+    if (keep_blocks) {
+      SliceConsumerWeightQdqBlock(*c.ref.qdq_block, keep, *keep_blocks,
+                                  init_map);
+    } else {
+      SliceConsumerWeightQdq(c.ref, c.weight_transposed, keep, false, false,
+                             init_map);
+    }
+
+    producer_touched.insert(pa_key);
+    producer_touched.insert(pb_key);
+    consumer_touched.insert(c_key);
+    stale_value_info.insert(pa.node->output(0));
+    for (onnx::NodeProto* op : pa.pre_ops) {
+      stale_value_info.insert(op->output(0));
+    }
+    stale_value_info.insert(pb.node->output(0));
+    for (onnx::NodeProto* op : pb.pre_ops) {
+      stale_value_info.insert(op->output(0));
+    }
+    for (onnx::NodeProto* op : gchain.chain_ops) {
+      stale_value_info.insert(op->output(0));
+    }
+    mark_dq_stale(pa.ref);
+    mark_dq_stale(pb.ref);
+    mark_dq_stale(c.ref);
+  }
+}
+
 // --- Subgraph recursion ------------------------------------------------
 //
 // Mirrors pruning.py's own `_iter_subgraphs` and the "Subgraph recursion"
@@ -8260,6 +9951,8 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
         FindMatMulNBitsChains(graph);
     std::vector<MatMulNBitsGatedChain> matmul_nbits_gated_chains =
         FindMatMulNBitsGatedChains(graph);
+    std::vector<QdqChain> qdq_chains = FindQdqChains(graph);
+    std::vector<QdqGatedChain> qdq_gated_chains = FindQdqGatedChains(graph);
 
     TouchedState touched;
     if (!chains.empty()) {
@@ -8287,6 +9980,16 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
       // already touched it.
       ApplyMatMulNBitsChains(graph, matmul_nbits_chains,
                              matmul_nbits_gated_chains, sparsity, touched);
+    }
+    if (!qdq_chains.empty() || !qdq_gated_chains.empty()) {
+      // QDQ-quantized chains -- see this file's own "QDQ (quantized-weight)
+      // structured pruning" section comment. Additive and (per
+      // FindQdqChains/FindQdqGatedChains's own "at least one side QDQ"
+      // requirement) never targets a tensor any plain-float pass above could
+      // also match, but still shares `touched` with them for the same
+      // "one shared conflict ledger per graph" reason ApplySplitGatedChains
+      // does.
+      ApplyQdqChains(graph, qdq_chains, qdq_gated_chains, sparsity, touched);
     }
     if (!touched.stale_value_info.empty()) {
       google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
