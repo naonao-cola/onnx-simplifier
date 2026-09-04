@@ -81,6 +81,7 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -13122,6 +13123,693 @@ std::vector<onnx::GraphProto*> IterSubgraphs(onnx::GraphProto* graph) {
   return graphs;
 }
 
+// --- Embedding vocabulary pruning, mirroring pruning.py's own "Embedding /
+// lm_head vocabulary pruning" section (search that name in pruning.py) -----
+//
+// A GENUINELY DIFFERENT shape of pass from every chain family above: those
+// all prune a FEATURE/CHANNEL axis shared symmetrically by a producer and
+// its consumer(s). This prunes the VOCABULARY axis of a token-embedding
+// table -- axis 0 of a plain `Gather(data=[vocab_size, hidden_size],
+// indices=input_ids)`, the export shape of `torch.nn.Embedding` -- and,
+// where a tied or auto-identified untied `lm_head` (the output vocab-logits
+// projection) exists, its own matching axis too. `hidden_size` is never
+// touched, and (unlike every pass above) the pruned axis routinely reaches
+// a genuine graph OUTPUT (the `lm_head`'s own logits) -- so this is also
+// the first pass in this file that must actively correct a stale graph
+// OUTPUT shape (UpdateVocabOutputShape), not just drop an internal
+// value_info entry the way every chain family above's `stale_value_info`
+// handling does.
+//
+// Because which vocabulary rows are safe to keep is a question this pass
+// cannot answer from the graph alone (unlike a channel's activation
+// magnitude, calibration data can show a token id *was* used, never that it
+// is safe to drop), the primary entry point below
+// (ApplyEmbeddingVocabPruning) takes an explicit, caller-supplied keep/drop
+// set; ApplyEmbeddingVocabMagnitudePruning is a second, explicitly weaker
+// entry point ranking by embedding-row L2 norm -- mirroring pruning.py's
+// own two-entry-point split and its own safety caveats (see each
+// function's own doc comment in structured_pruning_entry.h).
+//
+// Whichever ids survive are RENUMBERED contiguously (kept id `i`'s new id
+// is its rank among the sorted kept ids), so -- exactly like the Python
+// original -- neither entry point returns a bare `onnx::ModelProto`:
+// `EmbeddingVocabPruningResult::kept_token_ids[i]` is the ORIGINAL id now
+// living at row/column `i` of the pruned model, and it is every caller's
+// own job to remap its input token ids through that mapping (old id ->
+// its index in `kept_token_ids`) before running the pruned model -- a
+// dropped id can never be fed to the pruned model again.
+//
+// Deliberately NARROWER than pruning.py's own three-producer-shape port
+// (plain `Gather`, `com.microsoft::EmbedLayerNormalization`,
+// `com.microsoft::GatherBlockQuantized`) -- consistent with this file's own
+// established "narrower subset of pruning.py, decline rather than guess
+// past what's ported" scope decisions elsewhere (MatMulNBits's own
+// FLOAT32-only scales/zero_points/bias, MoE/QMoE's own restrictions, ...):
+//
+//   * Only the plain `Gather(data, indices, axis=0)` producer shape is
+//     matched here. `EmbedLayerNormalization` (the fused BERT-family
+//     word+position+segment-embedding-plus-LayerNorm node onnxruntime's
+//     own graph optimizer emits) and `GatherBlockQuantized` (the
+//     int2/int4/int8 block-quantized analogue) are both simply never
+//     matched -- declined, not mis-handled -- by this port; see
+//     pruning.py's own section comment for their exact schema/scope if
+//     porting either is ever needed.
+//   * `lm_head` auto-detection only ever recognizes a bare `MatMul` or
+//     vanilla `Gemm` (MatchMatMulLikeRaw) -- not pruning.py's own widened
+//     `_match_matmul_like`, which additionally recognizes
+//     `com.microsoft::FusedGemm`/`GemmFastGelu` -- mirroring
+//     MatchProducer's own identical, already-established restriction
+//     elsewhere in this file (see its own comment, above).
+//   * The embedding table, `lm_head` weight, and `lm_head` bias are all
+//     admitted only as plain FLOAT (float32) tensors -- not also FLOAT16/
+//     BFLOAT16 -- matching ReadFloatTensor/SetFloatTensorData's own
+//     FLOAT32-only support (the same restriction, for the same reason, as
+//     the "Two deliberate, narrower-than-pruning.py scope decisions"
+//     comment above MatMulNBitsValidBlockSizes documents).
+//
+// Every other structural safety check pruning.py's own `_match_embedding_
+// gather`/`_match_tied_lm_head`/`_match_untied_lm_head`/`_match_lm_head_
+// tail` apply is reproduced here exactly: `axis` must be 0; `indices` must
+// be a declared graph input or one `Cast` hop of one; the embedding weight
+// must have exactly one (untied) or two (the second a structurally-
+// confirmed tied `lm_head`) consumers, an unexplained second consumer
+// declining the WHOLE match; an untied `lm_head` candidate is only ever
+// auto-identified when its own weight has exactly one consumer AND its
+// (bias-tail-resolved) output is itself a genuine graph output, with more
+// than one such candidate ambiguous, not evidence; a bias is only ever
+// recognized as a `Gemm`'s own built-in `C` input or a `MatMul`-then-
+// `Add(bias)` tail, anything else declining that whole `lm_head` match.
+// When more than one qualifying `Gather` exists and the caller hasn't
+// named `input_name`, the whole call declines.
+//
+// Subgraph-aware (IterSubgraphs, just above) exactly like every other pass
+// in this file: the one eligible `Gather` this pass requires may live
+// inside a nested If/Loop/Scan/BeamSearch-family subgraph, at any nesting
+// depth, not only the top-level graph -- MatchEmbeddingChainAnyGraph
+// applies the identical "exactly one eligible producer, or decline" rule
+// across the WHOLE model, mirroring pruning.py's own `_match_embedding_
+// chain_any_graph` exactly (confirmed against its own docstring before
+// porting, rather than assumed).
+
+struct EmbeddingLmHeadMatch {
+  // The *final* node whose output is the (pre-rename) [..., vocab_size]
+  // logits tensor -- the matched MatMul/Gemm itself, or, when
+  // MatchLmHeadTail recognized a MatMul-then-Add(bias) tail, the Add (its
+  // output, not the raw MatMul's own, is the tensor whose shape/graph-
+  // output status actually matters downstream).
+  onnx::NodeProto* node = nullptr;
+  // True when the projection's own weight IS the embedding table itself
+  // (already sliced once, as part of the embedding weight's own slice --
+  // `weight_name`/`weight_transposed` are then unused, left nullopt).
+  // False means an independent initializer this match's own caller must
+  // slice separately, using `weight_transposed`.
+  bool tied = false;
+  std::optional<std::string> weight_name;  // untied only
+  std::optional<bool> weight_transposed;   // untied only
+  std::optional<std::string> bias;         // either case, when matched
+  // The interposed Transpose node for the tied "Transpose then MatMul"
+  // sub-shape, else nullptr -- owns no weight of its own to slice, but its
+  // own now-stale output shape still needs invalidating after pruning.
+  onnx::NodeProto* via_transpose = nullptr;
+};
+
+struct EmbeddingChain {
+  onnx::NodeProto* producer = nullptr;  // the matched Gather node
+  std::string weight_name;              // the embedding table's own name
+  std::string indices_name;
+  int64_t vocab_size = 0;
+  int64_t hidden_size = 0;
+  std::optional<EmbeddingLmHeadMatch> lm_head;
+};
+
+// If `node` is a well-formed embedding-table Gather (this section's own
+// comment above has the full matching criteria), returns
+// (weight_name, indices_name, underlying_input_name) -- `indices_name` is
+// `node`'s own literal `indices` operand, `underlying_input_name` is that
+// same tensor with one Cast hop unwrapped when present. Mirrors
+// pruning.py's own `_match_embedding_gather` exactly, minus the
+// `EmbedLayerNormalization`/`GatherBlockQuantized` producer shapes (out of
+// scope for this C++ port -- see this section's own top comment). The
+// Python original also double-checks `node in consumers_of[w_name]`; that
+// is always true here by construction (ConsumersOf indexes every node
+// under every one of its own literal `input()` names, and `w_name` is
+// literally `node.input(0)`), so it is not re-checked.
+std::optional<std::tuple<std::string, std::string, std::string>>
+MatchEmbeddingGatherRaw(
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_input_names,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  if (node.op_type() != "Gather" || node.input_size() != 2) {
+    return std::nullopt;
+  }
+  int64_t axis = 0;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "axis") {
+      axis = attr.i();
+    }
+  }
+  if (axis != 0) {
+    return std::nullopt;
+  }
+  const std::string& w_name = node.input(0);
+  const std::string& indices_name = node.input(1);
+  auto wit = init_map.find(w_name);
+  if (wit == init_map.end() ||
+      wit->second->data_type() != onnx::TensorProto::FLOAT ||
+      wit->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+
+  std::string underlying = indices_name;
+  if (!graph_input_names.count(underlying)) {
+    auto cit = node_by_output.find(underlying);
+    if (cit != node_by_output.end() && cit->second->op_type() == "Cast" &&
+        cit->second->input_size() == 1 &&
+        graph_input_names.count(cit->second->input(0))) {
+      underlying = cit->second->input(0);
+    } else {
+      return std::nullopt;  // not a graph input, nor a Cast of one
+    }
+  }
+
+  auto cons_it = consumers_of.find(w_name);
+  const size_t n_consumers =
+      cons_it == consumers_of.end() ? 0 : cons_it->second.size();
+  if (n_consumers < 1 || n_consumers > 2) {
+    return std::nullopt;  // unexpected consumer count -- decline, don't guess
+  }
+  return std::make_tuple(w_name, indices_name, underlying);
+}
+
+// Resolves `node` (an already-matched MatMul/vanilla-Gemm producing
+// `vocab_size`-wide output) to its own bias, if any, and the node whose
+// *output* is the real, final logits tensor. Mirrors pruning.py's own
+// `_match_lm_head_tail` exactly: returns `std::nullopt` for the
+// `_LM_HEAD_BIAS_INVALID` sentinel case (a bias exists but not in a shape
+// this pass safely handles -- declined, never left silently stale), or a
+// present `(bias_name_or_nullopt, output_node)` pair otherwise.
+std::optional<std::pair<std::optional<std::string>, onnx::NodeProto*>>
+MatchLmHeadTail(onnx::NodeProto* node, const InitMap& init_map,
+                const ConsumerMap& consumers_of, int64_t vocab_size) {
+  auto valid_bias = [&](const std::string& name) {
+    auto it = init_map.find(name);
+    if (it == init_map.end() ||
+        it->second->data_type() != onnx::TensorProto::FLOAT) {
+      return false;
+    }
+    const auto& dims = it->second->dims();
+    if (dims.size() == 1 && dims[0] == vocab_size) {
+      return true;
+    }
+    if (dims.size() == 2 && dims[0] == 1 && dims[1] == vocab_size) {
+      return true;
+    }
+    return false;
+  };
+
+  if (node->op_type() == "Gemm" && node->input_size() == 3 &&
+      !node->input(2).empty()) {
+    const std::string bias_name = node->input(2);
+    if (!valid_bias(bias_name)) {
+      return std::nullopt;
+    }
+    return std::make_pair(std::optional<std::string>(bias_name), node);
+  }
+
+  const std::string& out_name = node->output(0);
+  auto cit = consumers_of.find(out_name);
+  if (cit == consumers_of.end() || cit->second.empty()) {
+    return std::make_pair(std::optional<std::string>(std::nullopt), node);
+  }
+  const std::vector<onnx::NodeProto*>& out_consumers = cit->second;
+  bool any_add = false;
+  for (onnx::NodeProto* c : out_consumers) {
+    if (c->op_type() == "Add") {
+      any_add = true;
+      break;
+    }
+  }
+  if (any_add) {
+    if (out_consumers.size() != 1 || out_consumers[0]->input_size() != 2) {
+      return std::nullopt;  // ambiguous fan-out -- decline
+    }
+    onnx::NodeProto* add_node = out_consumers[0];
+    const std::string other = add_node->input(1) == out_name
+                                  ? add_node->input(0)
+                                  : add_node->input(1);
+    if (!valid_bias(other)) {
+      return std::nullopt;
+    }
+    return std::make_pair(std::optional<std::string>(other), add_node);
+  }
+  return std::make_pair(std::optional<std::string>(std::nullopt),
+                        node);  // output feeds something else -- no bias here
+}
+
+// If the embedding table `weight_name` has a second consumer besides
+// `gather_node`, and that second consumer resolves to one of the two tied
+// `lm_head` sub-shapes this section's own top comment describes (direct
+// `Gemm(transB=1)`, or one `Transpose` then a plain `MatMul`/
+// `Gemm(transB=0)`), returns the matched `EmbeddingLmHeadMatch`
+// (`tied=true`). Returns `std::nullopt` both when there is no second
+// consumer at all (the caller falls back to MatchUntiedLmHead) and when
+// there IS one but it doesn't resolve to either recognized shape (an
+// unexplained second reader -- the caller must then decline the WHOLE
+// chain, not just skip lm_head detection). Mirrors pruning.py's own
+// `_match_tied_lm_head` exactly.
+std::optional<EmbeddingLmHeadMatch> MatchTiedLmHead(
+    const std::string& weight_name, int64_t vocab_size,
+    onnx::NodeProto* gather_node, const ConsumerMap& consumers_of,
+    const InitMap& init_map) {
+  auto cit = consumers_of.find(weight_name);
+  const std::vector<onnx::NodeProto*>& all =
+      cit == consumers_of.end() ? std::vector<onnx::NodeProto*>{} : cit->second;
+  std::vector<onnx::NodeProto*> others;
+  for (onnx::NodeProto* c : all) {
+    if (c != gather_node) {
+      others.push_back(c);
+    }
+  }
+  if (others.size() != 1) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* other = others[0];
+
+  auto match = MatchMatMulLikeRaw(*other);
+  if (match) {
+    if (match->w_name == weight_name && match->weight_transposed) {
+      auto tail = MatchLmHeadTail(other, init_map, consumers_of, vocab_size);
+      if (!tail) {
+        return std::nullopt;
+      }
+      EmbeddingLmHeadMatch result;
+      result.node = tail->second;
+      result.tied = true;
+      result.bias = tail->first;
+      return result;
+    }
+    return std::nullopt;
+  }
+
+  if (other->op_type() == "Transpose" && other->input_size() == 1 &&
+      other->input(0) == weight_name) {
+    std::optional<std::vector<int64_t>> perm;
+    for (const auto& attr : other->attribute()) {
+      if (attr.name() == "perm") {
+        perm.emplace(attr.ints().begin(), attr.ints().end());
+      }
+    }
+    if (perm && !(perm->size() == 2 && (*perm)[0] == 1 && (*perm)[1] == 0)) {
+      return std::nullopt;
+    }
+    const std::string& t_out = other->output(0);
+    auto tcit = consumers_of.find(t_out);
+    if (tcit == consumers_of.end() || tcit->second.size() != 1) {
+      return std::nullopt;
+    }
+    onnx::NodeProto* node2 = tcit->second[0];
+    auto match2 = MatchMatMulLikeRaw(*node2);
+    if (!match2 || match2->w_name != t_out || match2->weight_transposed) {
+      // must consume the transposed [hidden, vocab] tensor untransposed
+      return std::nullopt;
+    }
+    auto tail = MatchLmHeadTail(node2, init_map, consumers_of, vocab_size);
+    if (!tail) {
+      return std::nullopt;
+    }
+    EmbeddingLmHeadMatch result;
+    result.node = tail->second;
+    result.tied = true;
+    result.bias = tail->first;
+    result.via_transpose = other;
+    return result;
+  }
+
+  return std::nullopt;
+}
+
+// Auto-detects a fully independent `lm_head` weight: exactly one
+// MatMul/vanilla-Gemm node in the whole graph whose constant 2-D weight is
+// distinct from `embedding_weight_name`, has exactly one consumer,
+// produces `vocab_size`-wide output, and -- the one structural signal that
+// reliably distinguishes "the" vocab-logits projection from some unrelated
+// layer of the same output width -- whose final (MatchLmHeadTail-resolved)
+// output is itself a genuine graph output. Zero or more than one such
+// candidate is declined, not guessed at; only ever called when
+// MatchTiedLmHead already found no tied lm_head to prefer. Mirrors
+// pruning.py's own `_match_untied_lm_head` exactly.
+std::optional<EmbeddingLmHeadMatch> MatchUntiedLmHead(
+    onnx::GraphProto* graph, const std::string& embedding_weight_name,
+    int64_t vocab_size, const ConsumerMap& consumers_of,
+    const InitMap& init_map,
+    const std::unordered_set<std::string>& graph_outputs) {
+  struct Candidate {
+    std::string w_name;
+    bool weight_transposed;
+    std::optional<std::string> bias;
+    onnx::NodeProto* output_node;
+  };
+  std::vector<Candidate> candidates;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto match = MatchMatMulLikeRaw(*node);
+    if (!match) {
+      continue;
+    }
+    if (match->w_name == embedding_weight_name) {
+      continue;  // handled by the tied path, not here
+    }
+    auto wit = init_map.find(match->w_name);
+    if (wit == init_map.end() ||
+        wit->second->data_type() != onnx::TensorProto::FLOAT ||
+        wit->second->dims_size() != 2) {
+      continue;
+    }
+    const int64_t n_channels =
+        match->weight_transposed ? wit->second->dims(0) : wit->second->dims(1);
+    auto cit = consumers_of.find(match->w_name);
+    const size_t n_consumers =
+        cit == consumers_of.end() ? 0 : cit->second.size();
+    if (n_channels != vocab_size || n_consumers != 1) {
+      continue;
+    }
+    auto tail = MatchLmHeadTail(node, init_map, consumers_of, vocab_size);
+    if (!tail) {
+      continue;  // not a confident candidate -- skip, don't guess
+    }
+    if (!graph_outputs.count(tail->second->output(0))) {
+      continue;
+    }
+    candidates.push_back(
+        {match->w_name, match->weight_transposed, tail->first, tail->second});
+  }
+  if (candidates.size() != 1) {
+    return std::nullopt;
+  }
+  EmbeddingLmHeadMatch result;
+  result.node = candidates[0].output_node;
+  result.tied = false;
+  result.weight_name = candidates[0].w_name;
+  result.weight_transposed = candidates[0].weight_transposed;
+  result.bias = candidates[0].bias;
+  return result;
+}
+
+// Finds the one token-embedding Gather this pass should act on in `graph`
+// alone, plus its tied/untied `lm_head`, if any. When `input_name` is
+// given, only a Gather whose token-id operand resolves to that exact graph
+// input is considered, and -- when `strict_input_name` -- it is an error
+// (`std::invalid_argument`, a caller mistake) if none does;
+// `strict_input_name=false` (only ever passed by
+// MatchEmbeddingChainAnyGraph) instead treats that same outcome as an
+// ordinary decline (`std::nullopt`, no exception), since `graph` here is
+// only one of possibly several graphs a whole-model search is trying in
+// turn. When `input_name` is omitted, exactly one qualifying Gather must
+// exist in the whole graph -- zero or more than one declines the whole
+// call. Mirrors pruning.py's own `_match_embedding_chain` exactly (minus
+// the `EmbedLayerNormalization`/`GatherBlockQuantized` producer shapes --
+// see this section's own top comment).
+std::optional<EmbeddingChain> MatchEmbeddingChain(
+    onnx::GraphProto* graph, const std::optional<std::string>& input_name,
+    bool strict_input_name) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    for (const auto& out : node->output()) {
+      if (!out.empty()) {
+        node_by_output[out] = node;
+      }
+    }
+  }
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  std::unordered_set<std::string> graph_input_names;
+  for (const auto& in : graph->input()) {
+    graph_input_names.insert(in.name());
+  }
+
+  struct RawMatch {
+    onnx::NodeProto* node;
+    std::string w_name;
+    std::string indices_name;
+  };
+  std::vector<RawMatch> matches;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto m = MatchEmbeddingGatherRaw(*node, init_map, consumers_of,
+                                     graph_input_names, node_by_output);
+    if (!m) {
+      continue;
+    }
+    const std::string& w_name = std::get<0>(*m);
+    const std::string& indices_name = std::get<1>(*m);
+    const std::string& underlying = std::get<2>(*m);
+    if (input_name && *input_name != indices_name &&
+        *input_name != underlying) {
+      continue;
+    }
+    matches.push_back({node, w_name, indices_name});
+  }
+
+  if (input_name && matches.empty()) {
+    if (!strict_input_name) {
+      return std::nullopt;
+    }
+    throw std::invalid_argument(
+        "MatchEmbeddingChain: no embedding Gather found reading graph "
+        "input '" +
+        *input_name + "'");
+  }
+  if (matches.size() != 1) {
+    return std::nullopt;  // zero, or ambiguous with no input_name to
+                          // disambiguate
+  }
+
+  onnx::NodeProto* producer_node = matches[0].node;
+  const std::string& w_name = matches[0].w_name;
+  const onnx::TensorProto* w_init = init_map.at(w_name);
+  const int64_t vocab_size = w_init->dims(0);
+  const int64_t hidden_size = w_init->dims(1);
+
+  auto cit = consumers_of.find(w_name);
+  const size_t n_consumers = cit == consumers_of.end() ? 0 : cit->second.size();
+  std::optional<EmbeddingLmHeadMatch> lm_head;
+  if (n_consumers == 2) {
+    lm_head = MatchTiedLmHead(w_name, vocab_size, producer_node, consumers_of,
+                              init_map);
+    if (!lm_head) {
+      return std::nullopt;  // unexplained second consumer -- decline, don't
+                            // guess
+    }
+  } else {
+    lm_head = MatchUntiedLmHead(graph, w_name, vocab_size, consumers_of,
+                                init_map, graph_outputs);
+  }
+
+  EmbeddingChain chain;
+  chain.producer = producer_node;
+  chain.weight_name = w_name;
+  chain.indices_name = matches[0].indices_name;
+  chain.vocab_size = vocab_size;
+  chain.hidden_size = hidden_size;
+  chain.lm_head = lm_head;
+  return chain;
+}
+
+// Subgraph-aware wrapper around MatchEmbeddingChain: tries every graph
+// IterSubgraphs(model_graph) returns -- `model_graph` itself first, then
+// every nested If/Loop/Scan/BeamSearch-family subgraph, at any nesting
+// depth -- independently (`strict_input_name=false`), and applies the
+// IDENTICAL "exactly one qualifying match, or decline" rule *across the
+// whole model* rather than one single graph. `std::invalid_argument` for
+// an unmatched `input_name` is thrown here instead, exactly once, only
+// after every graph has been tried and NONE contained a producer reading
+// it. Returns the `(graph, chain)` pair when exactly one match was found
+// -- `graph` is the same GraphProto* IterSubgraphs returned it as (never
+// copied), reachable from `out.mutable_graph()`, so the caller can mutate
+// it in place -- or `(nullptr, std::nullopt)` when the call should be
+// declined. Mirrors pruning.py's own `_match_embedding_chain_any_graph`
+// exactly.
+std::pair<onnx::GraphProto*, std::optional<EmbeddingChain>>
+MatchEmbeddingChainAnyGraph(onnx::GraphProto* model_graph,
+                            const std::optional<std::string>& input_name) {
+  onnx::GraphProto* found_graph = nullptr;
+  std::optional<EmbeddingChain> found_chain;
+  int n_found = 0;
+  for (onnx::GraphProto* graph : IterSubgraphs(model_graph)) {
+    auto chain =
+        MatchEmbeddingChain(graph, input_name, /*strict_input_name=*/false);
+    if (chain) {
+      ++n_found;
+      found_graph = graph;
+      found_chain = std::move(chain);
+    }
+  }
+  if (input_name && n_found == 0) {
+    throw std::invalid_argument(
+        "MatchEmbeddingChainAnyGraph: no embedding Gather found reading "
+        "graph input '" +
+        *input_name + "'");
+  }
+  if (n_found != 1) {
+    return {nullptr, std::nullopt};  // zero, or ambiguous across graphs
+  }
+  return {found_graph, std::move(found_chain)};
+}
+
+// If `name` is a declared graph output with a fixed (`dim_value`) last
+// shape dimension equal to `old_v`, updates it to `new_v` in place and
+// returns true. A symbolic (`dim_param`) or altogether absent last
+// dimension is left alone. Mirrors pruning.py's own
+// `_update_vocab_output_shape` exactly -- see this section's own top
+// comment for why this pass, unlike every chain family above, must
+// actively correct a stale graph OUTPUT shape rather than only ever drop
+// an internal value_info entry.
+bool UpdateVocabOutputShape(onnx::GraphProto* graph, const std::string& name,
+                            int64_t old_v, int64_t new_v) {
+  for (onnx::ValueInfoProto& o : *graph->mutable_output()) {
+    if (o.name() != name) {
+      continue;
+    }
+    auto* dims =
+        o.mutable_type()->mutable_tensor_type()->mutable_shape()->mutable_dim();
+    if (dims->size() >= 1) {
+      auto* last = dims->Mutable(dims->size() - 1);
+      if (last->has_dim_value() && last->dim_value() == old_v) {
+        last->set_dim_value(new_v);
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+// Performs the actual slicing, IN PLACE on `graph`, for an already-decided
+// (ascending) `keep_ids` set: the embedding table's own vocab_size axis
+// (always axis 0 -- MatchEmbeddingGatherRaw's own `axis == 0` requirement),
+// and, for an untied `lm_head`, its own independent weight/bias. A tied
+// `lm_head`'s weight needs no separate slicing call: it IS the embedding
+// table (the exact same initializer), already fully accounted for by the
+// one slice below. `graph` must be whichever graph `chain` was actually
+// matched in (MatchEmbeddingChainAnyGraph's own returned `graph`), so this
+// mutates that graph's own initializer/output/value_info in place, never a
+// different graph's. Mirrors pruning.py's own `_apply_embedding_vocab_
+// prune`/`_finalize_embedding_shapes` exactly.
+void ApplyEmbeddingVocabPrune(onnx::GraphProto* graph,
+                              const EmbeddingChain& chain,
+                              const std::vector<int64_t>& keep_ids) {
+  MutInitMap init_map = BuildMutInitMap(graph);
+  const int64_t new_v = static_cast<int64_t>(keep_ids.size());
+
+  // The embedding table is [vocab_size, hidden_size] with vocab_size as
+  // axis 0 -- exactly SliceProducerWeight's own `weight_transposed=true`
+  // ("output channel is axis 0") branch, reused verbatim rather than
+  // duplicating an axis-0 row-slice helper.
+  SliceProducerWeight(init_map.at(chain.weight_name),
+                      /*weight_transposed=*/true, keep_ids, /*is_conv=*/false);
+
+  if (chain.lm_head && !chain.lm_head->tied) {
+    SliceProducerWeight(init_map.at(*chain.lm_head->weight_name),
+                        *chain.lm_head->weight_transposed, keep_ids,
+                        /*is_conv=*/false);
+  }
+  if (chain.lm_head && chain.lm_head->bias) {
+    SliceLastAxis(init_map.at(*chain.lm_head->bias), keep_ids);
+  }
+
+  // Finalize shapes: chain.producer's own output shape never needs
+  // touching (a plain Gather's output carries hidden_size only, unaffected
+  // by an axis=0 gather) -- only an lm_head's own (and, for the tied
+  // via-transpose sub-shape, the Transpose's own) output width changes.
+  if (chain.lm_head) {
+    std::unordered_set<std::string> stale;
+    const std::string& out_name = chain.lm_head->node->output(0);
+    if (!UpdateVocabOutputShape(graph, out_name, chain.vocab_size, new_v)) {
+      stale.insert(out_name);
+    }
+    if (chain.lm_head->via_transpose) {
+      const std::string& t_out = chain.lm_head->via_transpose->output(0);
+      if (!UpdateVocabOutputShape(graph, t_out, chain.vocab_size, new_v)) {
+        stale.insert(t_out);
+      }
+    }
+    if (!stale.empty()) {
+      google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
+      for (const auto& vi : graph->value_info()) {
+        if (!stale.count(vi.name())) {
+          *kept.Add() = vi;
+        }
+      }
+      graph->mutable_value_info()->Swap(&kept);
+    }
+  }
+}
+
+// The per-row (vocab-axis) L2-norm importance vector shared by
+// ApplyEmbeddingVocabMagnitudePruning: the matched embedding table's own
+// row norm, combined (root-sum-square) with a matched untied `lm_head`'s
+// own row norm when one exists (the tied case needs no such combination --
+// the embedding table's own row norm already IS the tied `lm_head`'s row
+// norm). Mirrors pruning.py's own `_embedding_vocab_importance` exactly,
+// minus the `GatherBlockQuantized`-dequantization branch (out of scope for
+// this C++ port -- see this section's own top comment).
+std::vector<double> EmbeddingVocabImportance(const EmbeddingChain& chain,
+                                             const InitMap& init_map) {
+  std::vector<double> importance(static_cast<size_t>(chain.vocab_size), 0.0);
+  {
+    const std::vector<float> emb =
+        ReadFloatTensor(*init_map.at(chain.weight_name));
+    for (int64_t v = 0; v < chain.vocab_size; ++v) {
+      double sum = 0.0;
+      for (int64_t h = 0; h < chain.hidden_size; ++h) {
+        const double x = emb[static_cast<size_t>(v * chain.hidden_size + h)];
+        sum += x * x;
+      }
+      importance[static_cast<size_t>(v)] = sum;
+    }
+  }
+  if (chain.lm_head && !chain.lm_head->tied && chain.lm_head->weight_name) {
+    const onnx::TensorProto* lw = init_map.at(*chain.lm_head->weight_name);
+    const std::vector<float> lwd = ReadFloatTensor(*lw);
+    if (*chain.lm_head->weight_transposed) {
+      // [vocab_size, K] -- row v is contiguous, direct read.
+      const int64_t k = lw->dims(1);
+      for (int64_t v = 0; v < chain.vocab_size; ++v) {
+        double sum = 0.0;
+        for (int64_t j = 0; j < k; ++j) {
+          const double x = lwd[static_cast<size_t>(v * k + j)];
+          sum += x * x;
+        }
+        importance[static_cast<size_t>(v)] += sum;
+      }
+    } else {
+      // [K, vocab_size] -- row v is column v, strided read.
+      const int64_t k = lw->dims(0);
+      const int64_t vsz = lw->dims(1);
+      for (int64_t v = 0; v < chain.vocab_size; ++v) {
+        double sum = 0.0;
+        for (int64_t j = 0; j < k; ++j) {
+          const double x = lwd[static_cast<size_t>(j * vsz + v)];
+          sum += x * x;
+        }
+        importance[static_cast<size_t>(v)] += sum;
+      }
+    }
+  }
+  for (double& x : importance) {
+    x = std::sqrt(x);
+  }
+  return importance;
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
@@ -13376,4 +14064,151 @@ onnx::ModelProto ApplyQMoEExpertChannelPruning(const onnx::ModelProto& model,
     }
   }
   return out;
+}
+
+EmbeddingVocabPruningResult ApplyEmbeddingVocabPruning(
+    const onnx::ModelProto& model,
+    const std::optional<std::vector<int64_t>>& keep_token_ids,
+    const std::optional<std::vector<int64_t>>& drop_token_ids,
+    const std::optional<std::string>& input_name) {
+  if (keep_token_ids.has_value() == drop_token_ids.has_value()) {
+    throw std::invalid_argument(
+        "ApplyEmbeddingVocabPruning: give exactly one of keep_token_ids or "
+        "drop_token_ids, not both/neither");
+  }
+  onnx::ModelProto out = model;
+
+  // Subgraph-aware (IterSubgraphs, see this file's own "Subgraph
+  // recursion" section comment above): the one eligible embedding Gather
+  // this function requires may live inside a nested If/Loop/Scan/
+  // BeamSearch-family subgraph, at any nesting depth -- see
+  // MatchEmbeddingChainAnyGraph's own comment for exactly how the
+  // "exactly one eligible producer, or decline" rule is applied across the
+  // whole model. Mirrors pruning.py's own `apply_embedding_vocab_pruning`.
+  auto [graph, chain] =
+      MatchEmbeddingChainAnyGraph(out.mutable_graph(), input_name);
+  if (!chain) {
+    return EmbeddingVocabPruningResult{std::move(out), false, {}, false};
+  }
+
+  const int64_t vocab_size = chain->vocab_size;
+  std::set<int64_t> keep_set;
+  if (keep_token_ids) {
+    keep_set.insert(keep_token_ids->begin(), keep_token_ids->end());
+  } else {
+    std::set<int64_t> drop_set(drop_token_ids->begin(), drop_token_ids->end());
+    std::vector<int64_t> bad_drop;
+    for (int64_t d : drop_set) {
+      if (!(d >= 0 && d < vocab_size)) {
+        bad_drop.push_back(d);
+      }
+    }
+    if (!bad_drop.empty()) {
+      throw std::invalid_argument(
+          "ApplyEmbeddingVocabPruning: drop_token_ids out of range [0, " +
+          std::to_string(vocab_size) + "), first offender " +
+          std::to_string(bad_drop.front()));
+    }
+    for (int64_t i = 0; i < vocab_size; ++i) {
+      if (!drop_set.count(i)) {
+        keep_set.insert(i);
+      }
+    }
+  }
+  for (int64_t k : keep_set) {
+    if (!(k >= 0 && k < vocab_size)) {
+      throw std::invalid_argument(
+          "ApplyEmbeddingVocabPruning: keep_token_ids out of range [0, " +
+          std::to_string(vocab_size) + "), first offender " +
+          std::to_string(k));
+    }
+  }
+  if (keep_set.empty()) {
+    throw std::invalid_argument(
+        "ApplyEmbeddingVocabPruning: keep_token_ids resolves to an empty "
+        "vocabulary");
+  }
+  const std::vector<int64_t> keep_ids(keep_set.begin(), keep_set.end());
+
+  ApplyEmbeddingVocabPrune(graph, *chain, keep_ids);
+  return EmbeddingVocabPruningResult{std::move(out), true, keep_ids,
+                                     chain->lm_head.has_value()};
+}
+
+EmbeddingVocabPruningResult ApplyEmbeddingVocabMagnitudePruning(
+    const onnx::ModelProto& model, double sparsity,
+    const std::optional<std::vector<int64_t>>& protect_token_ids,
+    const std::optional<std::string>& input_name) {
+  if (!(sparsity >= 0.0 && sparsity < 1.0)) {
+    throw std::invalid_argument(
+        "ApplyEmbeddingVocabMagnitudePruning: sparsity must be in [0, 1), "
+        "got " +
+        std::to_string(sparsity));
+  }
+  onnx::ModelProto out = model;
+
+  // Subgraph-aware exactly like ApplyEmbeddingVocabPruning above -- see
+  // MatchEmbeddingChainAnyGraph's own comment. Mirrors pruning.py's own
+  // `apply_embedding_vocab_magnitude_pruning`.
+  auto [graph, chain] =
+      MatchEmbeddingChainAnyGraph(out.mutable_graph(), input_name);
+  if (!chain) {
+    return EmbeddingVocabPruningResult{std::move(out), false, {}, false};
+  }
+
+  const int64_t vocab_size = chain->vocab_size;
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  const std::vector<double> importance =
+      EmbeddingVocabImportance(*chain, init_map);
+
+  std::set<int64_t> protect;
+  if (protect_token_ids) {
+    protect.insert(protect_token_ids->begin(), protect_token_ids->end());
+  }
+  for (int64_t p : protect) {
+    if (!(p >= 0 && p < vocab_size)) {
+      throw std::invalid_argument(
+          "ApplyEmbeddingVocabMagnitudePruning: protect_token_ids out of "
+          "range [0, " +
+          std::to_string(vocab_size) + "), first offender " +
+          std::to_string(p));
+    }
+  }
+
+  int64_t keep_count = std::max<int64_t>(
+      1, std::min<int64_t>(vocab_size, static_cast<int64_t>(std::llround(
+                                           static_cast<double>(vocab_size) *
+                                           (1.0 - sparsity)))));
+  keep_count =
+      std::max<int64_t>(keep_count, static_cast<int64_t>(protect.size()));
+
+  // Descending-importance order, all `vocab_size` indices (not just the top
+  // `keep_count` -- `protect` ids can sit anywhere in the ranking and must
+  // still be found so the fill loop below can skip re-adding them). Ties
+  // broken by ascending original index (std::stable_sort) -- may differ
+  // from numpy's own default (unstable) argsort tie-breaking, the same
+  // caveat TopKIndicesAscending's own comment already documents elsewhere
+  // in this file.
+  std::vector<int64_t> order(static_cast<size_t>(vocab_size));
+  std::iota(order.begin(), order.end(), int64_t{0});
+  std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+    return importance[static_cast<size_t>(a)] >
+           importance[static_cast<size_t>(b)];
+  });
+
+  std::set<int64_t> keep_set(protect.begin(), protect.end());
+  for (int64_t idx : order) {
+    if (static_cast<int64_t>(keep_set.size()) >= keep_count) {
+      break;
+    }
+    keep_set.insert(idx);
+  }
+  const std::vector<int64_t> keep_ids(keep_set.begin(), keep_set.end());
+
+  ApplyEmbeddingVocabPrune(graph, *chain, keep_ids);
+  return EmbeddingVocabPruningResult{std::move(out), true, keep_ids,
+                                     chain->lm_head.has_value()};
 }
