@@ -125,6 +125,7 @@ from onnxsim.pruning import (
 )
 from onnxsim.quarot import apply_quarot
 from onnxsim.quip_sharp import apply_quip_sharp
+from onnxsim.rptq import apply_rptq_reorder
 from onnxsim.smoothquant import apply_smoothquant
 from onnxsim.spinquant import apply_spinquant
 from onnxsim.spqr import quantize_weight_only_spqr
@@ -155,6 +156,7 @@ __all__ = [
     "apply_attention_quantization",
     "apply_gptq",
     "apply_smoothquant",
+    "apply_rptq_reorder",
     "apply_llm_int8",
     "apply_low_rank_compensation",
     "apply_mixed_precision_quantization",
