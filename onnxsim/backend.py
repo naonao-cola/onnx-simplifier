@@ -8,7 +8,7 @@ sometimes harmful, see https://github.com/onnxsim/onnxsim/issues/441).
 
 import os
 from collections import OrderedDict
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
 import onnx
@@ -210,6 +210,87 @@ def _run_with_onnxruntime(
     return OrderedDict(zip(output_names, outputs))
 
 
+def _has_subgraphs(graph: onnx.GraphProto) -> bool:
+    """Whether any node in ``graph`` carries a control-flow subgraph (If /
+    Loop / Scan), recursing into nested subgraphs. Such a subgraph's body can
+    reference an enclosing value by name at any point during its own
+    execution (`OpRun.need_context`), so :func:`_run_reference_pruned`'s
+    liveness analysis -- which only tracks *direct* top-level consumption --
+    cannot safely drop anything early once one of these exists anywhere in
+    the model; the caller falls back to the plain, always-correct
+    ``ReferenceEvaluator.run``.
+    """
+    for node in graph.node:
+        for attr in node.attribute:
+            if attr.HasField("g"):
+                return True
+            if len(attr.graphs) > 0:
+                return True
+    return False
+
+
+def _last_use_indices(graph: onnx.GraphProto) -> Dict[str, int]:
+    """The index of the last top-level node that consumes each value name, as
+    an input. A value with no entry is either never consumed (e.g. a graph
+    output nothing downstream reads) or not produced by a node at all.
+    """
+    last_use: Dict[str, int] = {}
+    for i, node in enumerate(graph.node):
+        for name in node.input:
+            if name:
+                last_use[name] = i
+    return last_use
+
+
+def _run_reference_pruned(
+    sess: Any,  # onnx.reference.ReferenceEvaluator, imported lazily by the caller
+    graph: onnx.GraphProto,
+    output_names: List[str],
+    feed_inputs: Dict[str, np.ndarray],
+) -> List[np.ndarray]:
+    """Drive ``sess`` the same way ``ReferenceEvaluator.run`` does, but drop a
+    value from the live-results dict as soon as the last top-level node that
+    needs it has run, instead of keeping every intermediate (and every
+    initializer) alive for the whole graph -- ``ReferenceEvaluator.run``'s own
+    ``results`` dict never frees anything until the call returns, so its peak
+    memory is the *naive*, no-reuse total :func:`onnxsim.plan_activation_memory`
+    reports as ``naive_bytes``. This gets closer to that call's
+    ``arena_bytes`` bound without computing an actual offset plan: dropping a
+    Python reference early just lets it get garbage-collected, no shapes or
+    byte sizes needed, so this works even on models with dynamic shapes that
+    :func:`onnxsim.plan_activation_memory` itself could not fully plan.
+
+    Only called when :func:`_has_subgraphs` is False for the whole model --
+    see its docstring for why a control-flow subgraph makes this unsafe.
+    Mirrors the internals ``ReferenceEvaluator.run`` itself uses
+    (``rt_nodes_``, ``rt_inits_``, ``need_context``,
+    ``has_linked_attribute``), so it stays exact if a value is ever consumed
+    outside the ways this scans for.
+    """
+    last_use = _last_use_indices(graph)
+    keep = set(output_names)  # requested outputs must survive to the end
+
+    results: Dict[str, Any] = {"": None}
+    results.update(sess.rt_inits_)
+    results.update(feed_inputs)
+    for i, node in enumerate(sess.rt_nodes_):
+        node_inputs = [results[name] for name in node.input]
+        linked_attributes: Dict[str, Any] = {}
+        if getattr(node, "has_linked_attribute", False):
+            linked_attributes["linked_attributes"] = {}
+        if node.need_context():
+            node_outputs = node.run(*node_inputs, context=results, **linked_attributes)
+        else:
+            node_outputs = node.run(*node_inputs, **linked_attributes)
+        for name, value in zip(node.output, node_outputs):
+            results[name] = value
+        for name in node.input:
+            if name and name not in keep and last_use.get(name) == i:
+                results.pop(name, None)
+
+    return [results[name] for name in output_names]
+
+
 def _run_with_reference(
     model: Union[str, bytes, onnx.ModelProto],
     inputs: Dict[str, np.ndarray],
@@ -233,7 +314,15 @@ def _run_with_reference(
     sess = ReferenceEvaluator(model)
     if output_names is None:
         output_names = list(sess.output_names)
-    outputs = sess.run(list(output_names), inputs)
+    output_names = list(output_names)
+    # `model` is always a ModelProto here (the str/bytes branches above
+    # normalize it), so its graph is always available for the liveness scan.
+    if not _has_subgraphs(model.graph):
+        outputs = _run_reference_pruned(sess, model.graph, output_names, inputs)
+    else:
+        # intermediate defaults to False, so this is always a list -- ReferenceEvaluator.run's
+        # declared return type is the wider dict-or-list Union covering both.
+        outputs = cast(List[np.ndarray], sess.run(output_names, inputs))
     return OrderedDict(zip(output_names, outputs))
 
 
