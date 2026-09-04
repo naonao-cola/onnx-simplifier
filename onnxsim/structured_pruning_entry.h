@@ -299,3 +299,153 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
         calibration_data,
     double sparsity, double epsilon = 1e-8);
+
+// Depth/block-level pruning: drops whole redundant pre-norm transformer
+// residual sub-blocks (``x = x + SelfAttn(LN(x))`` or ``x = x + MLP(LN(x))``)
+// wholesale, rather than shrinking every block a little the way every
+// other entry point in this header does. The C++ port of pruning.py's own
+// `apply_transformer_block_pruning` -- a GENUINELY DIFFERENT KIND of pass
+// from every other entry point above: it deletes whole nodes and rewires
+// their consumers (graph surgery, changing the graph's own topology), not
+// just tensors resized in place. See structured_pruning_entry.cpp's own
+// "Transformer block (depth) pruning" section comment (IsEntryLnNode
+// through CommitTransformerBlockDrops, and ApplyTransformerBlockPruning's
+// own comment right above its definition) for:
+//   - the exact matched pattern (a bare-Add merge; a plain, unfused entry
+//     norm -- LayerNormalization/RMSNormalization/
+//     SimplifiedLayerNormalization -- OR a fused SkipLayerNormalization/
+//     SkipSimplifiedLayerNormalization node's own optional fourth output,
+//     standing in for x_in, so a model already run through onnxruntime's
+//     own transformer optimizer is matched too);
+//   - why attention and MLP/FFN blocks are matched and dropped fully
+//     independently, never only as a paired "whole layer";
+//   - why a KV-cache-bearing attention block needs no dedicated handling
+//     to always decline safely on its own;
+//   - the calibration-driven ranking (mean cosine similarity between each
+//     candidate's own x_in/x_out over `calibration_data` -- the
+//     literature-standard "Block Influence"/ShortGPT-style depth-pruning
+//     signal -- via TransformerBlockSimilarity, reusing
+//     WandaCalibrationStats' own probe-injection/batch-iteration pattern
+//     with its own dedicated accumulator), which drops the HIGHEST-
+//     similarity (most redundant) candidates first, up to the target
+//     count, SKIPPING (never failing the whole call on) any candidate
+//     whose own interior overlaps an already-committed one's;
+//   - the subgraph-aware pooled-selection-but-per-graph-commit scope
+//     (mirrors pruning.py's own docstring exactly: `sparsity`/
+//     `num_blocks_to_drop` are pooled ACROSS THE WHOLE MODEL, but the
+//     calibration-based ranking only ever runs over TOP-LEVEL-graph
+//     candidates, exactly like ApplyMoeWholeExpertPruning's own scope
+//     note above).
+//
+// `num_blocks_to_drop`, when given, is an explicit block count (silently
+// capped at however many candidates were actually matched); otherwise
+// `sparsity` is interpreted as a FRACTION OF MATCHED CANDIDATES (rounded
+// to the nearest whole block), not of the model's total layer count --
+// the same "fraction of what was actually found eligible" meaning
+// ApplyMoeWholeExpertPruning's own `sparsity` already has for experts.
+//
+// Same `calibration_data` contract, and the same batch-missing-a-required-
+// graph-input `std::invalid_argument`, as ApplyStructuredWandaPruning.
+onnx::ModelProto ApplyTransformerBlockPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity, std::optional<int64_t> num_blocks_to_drop);
+
+// SparseGPT (Frantar & Alistarh, 2023, "SparseGPT: Massive Language Models
+// Can Be Accurately Pruned in One-Shot", https://arxiv.org/abs/2301.00774):
+// zeros the least-important entries of every matched layer's constant 2-D
+// FLOAT32 weight to an unstructured or N:M sparsity pattern, using a
+// sequential, Hessian-error-compensating algorithm ported from GPTQ (same
+// authors) rather than magnitude/Wanda's one-shot static importance score
+// -- see structured_pruning_entry.cpp's own "SparseGPT (unstructured / N:M)
+// pruning" section comment for the full technique, and pruning.py's own
+// module-level docstring / `apply_sparsegpt_pruning` docstring for the
+// Python reference this ports. Unlike every other pass in this file, this
+// NEVER changes any tensor's shape: it only rewrites individual weight
+// entries in place (zeroed when pruned, Hessian-compensated -- so
+// possibly changed even when KEPT -- otherwise), and every matched layer
+// is processed completely independently, with no producer/consumer
+// chain-walking at all.
+//
+// Matches exactly: every plain `MatMul`/vanilla-`Gemm` node (MatchMatMulLikeRaw
+// -- NOT pruning.py's own widened `_match_matmul_like`, which also
+// recognizes `com.microsoft::FusedGemm`/`GemmFastGelu`; this already covers
+// `com.microsoft::GroupQueryAttention`'s own separate Q/K/V projections,
+// which are ordinary MatMul/Gemm nodes feeding it, not a weight the op
+// itself owns) with a constant 2-D FLOAT32 weight, plus every
+// `com.microsoft::Attention` node's constant 2-D FLOAT32 merged QKV weight
+// (MatchAttentionProducer). Deliberately narrower than pruning.py's own
+// `apply_sparsegpt_pruning` in two ways, both mirroring this file's own
+// already-established C++-port scope decisions elsewhere (e.g.
+// ApplyMoeExpertChannelPruning's own FLOAT32-only restriction):
+//   - FLOAT32 only, not also FLOAT16/BFLOAT16.
+//   - 2-D `Conv` (ordinary/depthwise/general-grouped) is NOT matched at
+//     all -- pruning.py's own Conv support needs an entirely new, from-
+//     first-principles im2col cross-covariance Hessian (`H = patches.T @
+//     patches`, plus a genuinely per-group Hessian/column-processing split
+//     for grouped/depthwise Conv) that pruning.py's own module docstring
+//     documents at length as having no correct upstream reference to port
+//     from at all (the original SparseGPT repository's own `add_batch`
+//     never actually exercises a Conv layer). Reaching that bar is
+//     materially bigger than the rest of this pass and was deliberately
+//     left out of scope for this port -- a Conv node here is left
+//     completely untouched (never guessed at, never crashes), exactly as
+//     if it were any other unmatched node type.
+//
+// Same real numerical linear algebra pruning.py's own `apply_sparsegpt_
+// pruning`/:mod:`onnxsim.gptq` needs, hand-written here rather than reused
+// from any external BLAS/LAPACK dependency (structured_pruning_entry.cpp's
+// own CholeskyLower/InvertLowerTriangular/InverseHessianCholesky): a dense
+// Cholesky decomposition and triangular solve are used to turn each
+// matched layer's own calibration Hessian into the "one Cholesky-factored
+// inverse Hessian, reused via slicing for every column and block" GPTQ's
+// own reformulation both this and :mod:`onnxsim.gptq` key their whole
+// efficiency argument on.
+//
+// `n`/`m` (both std::nullopt, or both given: N:M semi-structured pruning,
+// keep the `n` highest-importance entries per group of `m`, `0 < n <= m`)
+// and `sparsity` (target unstructured-sparsity fraction, ignored when
+// `n`/`m` are given, `[0, 1)`) mirror pruning.py's own identical
+// parameters and validation (`_validate_pattern`) exactly, including the
+// ONE deliberate departure from every other unstructured-pruning function
+// in pruning.py that function's own docstring calls out: for unstructured
+// sparsity, the pruning threshold is shared across every output row
+// within each `proc_block_size`-wide column block (the reference
+// implementation's own behavior), not chosen per row -- faithfully
+// reproduced here (see structured_pruning_entry.cpp's own
+// SparseGptPruneColumns) rather than "corrected" to match every other
+// pass, since the whole point of this port is to reproduce SparseGPT
+// specifically. `percdamp` (Hessian damping fraction) and
+// `proc_block_size` (column-processing block size -- both the lazy-update
+// granularity and, for unstructured sparsity only, the width each shared
+// per-block threshold is computed over) mirror pruning.py's own identical
+// parameters and defaults.
+//
+// Same executor-as-first-argument, `calibration_data` (one
+// `{graph input name: TensorProto}` map per batch) shape as every other
+// calibration-driven pass in this file (ApplyStructuredWandaPruning and
+// friends) -- see that function's own declaration comment and
+// structured_pruning_entry.cpp's own "Wanda calibration" section comment
+// for the full calibration-crossing design this reuses. A `calibration_data`
+// batch missing one of `model`'s own graph inputs throws
+// `std::invalid_argument`. NOT subgraph-aware (mirrors pruning.py's own
+// `apply_sparsegpt_pruning`, which likewise never calls `_iter_subgraphs`)
+// -- same reasoning as ApplyStructuredWandaPruning's own declaration
+// comment: calibration_data batches are keyed to the top-level graph's own
+// inputs, and a nested If/Loop/Scan/BeamSearch-family subgraph body has no
+// standalone way to be Run at all.
+//
+// A matched layer with no observed 2-D-or-higher-rank-with-a-trailing-
+// feature-axis calibration activation for its own input (dead input, an
+// otherwise-empty `calibration_data`, or every batch's own activation
+// isn't FLOAT32) is left completely untouched -- unlike Wanda, there is no
+// data-free fallback for a technique whose entire mechanism is the
+// Hessian.
+onnx::ModelProto ApplySparseGptPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity, const std::optional<int64_t>& n,
+    const std::optional<int64_t>& m, double percdamp = 0.01,
+    int64_t proc_block_size = 128);

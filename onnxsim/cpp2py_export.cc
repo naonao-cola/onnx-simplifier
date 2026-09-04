@@ -698,6 +698,45 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
       "epsilon"_a = 1e-8);
 
+  // SparseGPT (Frantar & Alistarh, 2023) unstructured/N:M pruning: zeros
+  // the least-important entries of every matched MatMul/vanilla-Gemm/
+  // com.microsoft::Attention merged-QKV-weight layer's constant 2-D
+  // FLOAT32 weight, using a sequential, Hessian-error-compensating
+  // algorithm (GPTQ's own Cholesky-factored inverse Hessian reformulation)
+  // rather than a one-shot static importance score -- unlike every pass
+  // above, this never changes any tensor's shape, only individual weight
+  // entries' own values. Same executor-as-first-argument,
+  // `calibration_data` (List[Dict[str, onnx.TensorProto]]) crossing
+  // convention as apply_structured_wanda_pruning's own binding above (see
+  // that binding's own comment for the full calibration-crossing design).
+  // `n`/`m` are `None` (unstructured, ranked by `sparsity`) or both given
+  // together (N:M semi-structured). See ApplySparseGptPruning in
+  // structured_pruning_entry.h for the full scope (in particular: FLOAT32-
+  // only, and 2-D Conv is NOT matched -- a deliberate, documented
+  // narrower-than-pruning.py scope decision).
+  m.def(
+      "apply_sparsegpt_pruning",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double sparsity, std::optional<int64_t> n, std::optional<int64_t> m,
+         double percdamp, int64_t proc_block_size) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplySparseGptPruning(model, *executor, calibration_data, sparsity,
+                                  n, m, percdamp, proc_block_size);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
+      "n"_a.none(), "m"_a.none(), "percdamp"_a = 0.01,
+      "proc_block_size"_a = 128);
+
   // MoE expert-intermediate-channel pruning: removes intermediate
   // (`inter_size`) channels from every expert of a matched
   // `com.microsoft::MoE` node at once -- real structural pruning, data-free.
@@ -787,6 +826,40 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a);
+
+  // Transformer block (depth) pruning: drops whole redundant pre-norm
+  // transformer residual sub-blocks wholesale -- a GENUINELY DIFFERENT
+  // KIND of pass from every calibration-driven binding above (graph
+  // surgery: nodes deleted and consumers rewired, not tensors resized in
+  // place). Same executor-as-first-argument shape and `calibration_data`
+  // (List[Dict[str, onnx.TensorProto]]) crossing convention as
+  // apply_structured_wanda_pruning/apply_moe_whole_expert_pruning above.
+  // `num_blocks_to_drop` (Optional[int], via nanobind's std::optional
+  // caster -- same crossing already used for e.g. GQA head/kv-head
+  // overrides elsewhere in this file) takes priority over `sparsity` when
+  // given, mirroring pruning.py's own `apply_transformer_block_pruning`
+  // keyword-argument precedence exactly. See ApplyTransformerBlockPruning
+  // in structured_pruning_entry.h.
+  m.def(
+      "apply_transformer_block_pruning",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double sparsity,
+         std::optional<int64_t> num_blocks_to_drop) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyTransformerBlockPruning(
+            model, *executor, calibration_data, sparsity, num_blocks_to_drop);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
+      "num_blocks_to_drop"_a = std::nullopt);
 
   // Embedding vocabulary pruning: shrinks a matched token-embedding
   // table's vocabulary axis (plus, where a tied/untied lm_head exists, its
