@@ -40,6 +40,7 @@
 #include "passes/fuse_pad_into_pool.h"
 #include "passes/fuse_preceding_mul_into_conv.h"
 #include "passes/fuse_qkv.h"
+#include "passes/fuse_reshape_family.h"
 #include "passes/fuse_rms_norm.h"
 #include "passes/fuse_rope.h"
 #include "passes/magnitude_pruning.h"
@@ -128,6 +129,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseMatMulIntoConv>(registry);
     RegisterOrReplace<p::FuseMulIntoConv>(registry);
     RegisterOrReplace<p::FusePrecedingMulIntoConv>(registry);
+    RegisterOrReplace<p::FuseReshapeFamily>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::FuseRope>(registry);
     RegisterOrReplace<p::MagnitudePruningConv>(registry);
