@@ -635,6 +635,60 @@ def test_fuse_concat_into_reshape():
     assert ops["Reshape"] == 1
 
 
+def test_fuse_consecutive_reshapes():
+    # Only the final target shape matters -- Reshape(Reshape(X, s1), s2)
+    # collapses to Reshape(X, s2) (fuse_consecutive_reshapes).
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[3,8] Y)
+        <int64[2] s1 = {6,4}, int64[2] s2 = {3,8}>
+        {
+          y = Reshape(X, s1)
+          Y = Reshape(y, s2)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["Reshape"] == 1
+
+
+def test_fuse_consecutive_reshapes_chain():
+    # A longer chain collapses all the way down to the final reshape.
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[3,8] Y)
+        <int64[2] s1 = {4,6}, int64[2] s2 = {2,12}, int64[2] s3 = {3,8}>
+        {
+          y1 = Reshape(X, s1)
+          y2 = Reshape(y1, s2)
+          Y = Reshape(y2, s3)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["Reshape"] == 1
+
+
+def test_fuse_consecutive_reshapes_declines_ambiguous_zero_copy():
+    # The outer reshape's `0` (under the default allowzero=0) means "copy
+    # this dim from the node's own input", i.e. from the inner reshape's
+    # output shape [2,3,4] (dim0=2) -- not from X's shape [6,4] (dim0=6).
+    # Fusing the two would silently change which shape the `0` copies from,
+    # so the pass must leave this chain alone.
+    model = _model(
+        """
+        g (float[6,4] X) => (float[2,12] Y)
+        <int64[3] s1 = {2,3,4}, int64[2] s2 = {0,-1}>
+        {
+          y = Reshape(X, s1)
+          Y = Reshape(y, s2)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["Reshape"] == 2
+
+
 # --------------------------------------------------------------------------- #
 # Dead-node / no-op elimination
 # --------------------------------------------------------------------------- #
