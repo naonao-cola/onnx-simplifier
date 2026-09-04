@@ -2,10 +2,7 @@
 
 Every model is built via ``onnx.parser.parse_model`` (the ONNX text format).
 The chain-reuse expectations mirror ``onnxsim/memory_planning_test.cpp``'s
-``TestChainReuse``, worked out by hand there: with four equally-sized tensors
-in a linear chain, only immediate neighbors are simultaneously live, so a
-greedy best-fit allocator (processed largest-first, ties broken by name) can
-pack the whole chain into half the naive (no-reuse) size.
+corresponding C++ tests, worked out by hand there.
 """
 
 import numpy as np
@@ -44,10 +41,12 @@ def _metadata(proto):
 
 
 def test_chain_reuse():
-    # x -> a -> b -> y, each [25] float32 = 100 bytes; only immediate
-    # neighbors overlap in liveness, so half the tensors can share offsets
-    # with a non-adjacent one -- see memory_planning_test.cpp's TestChainReuse
-    # for the interval math.
+    # x -> a -> b -> y, each [25] float32 = 100 bytes. Relu is in-place-safe
+    # (see IsInPlaceSafeOp), and a/b are each the sole input of the next
+    # Relu, so a, b and y union into one group; x stays separate (a graph
+    # input is never aliased away) -- see memory_planning_test.cpp's
+    # TestChainReuse for the derivation. Net effect: 2x compression as
+    # before, now via one shared slot for {a, b, y} plus x's own slot.
     body = """
     g (float[25] x) => (float[25] y)
     {
@@ -64,10 +63,57 @@ def test_chain_reuse():
     assert plan.compression_ratio == 0.5
 
     off = plan.tensor_offsets
-    assert off["a"][0] == off["y"][0]  # a and y share a freed slot
-    assert off["b"][0] == off["x"][0]  # b and x share a freed slot
-    assert off["a"][0] != off["b"][0]  # but adjacent (overlapping) pairs differ
+    assert off["a"] == off["b"] == off["y"]  # literally one group now
+    assert off["x"][0] != off["a"][0]  # still can't share with x
     assert off["x"][1] == off["a"][1] == off["b"][1] == off["y"][1] == 100
+
+
+def test_in_place_aliasing_collapses_whole_chain():
+    # A pure elementwise chain with no graph-input/output boundary in the
+    # middle: x -> Relu -> a -> Sigmoid -> b -> Tanh -> c -> Neg -> d ->
+    # Identity -> out. Every internal tensor is the sole consumer of the
+    # previous one, so a/b/c/d/out all union into a single group; only x (a
+    # graph input) stays separate. The arena is 2 slots regardless of chain
+    # length, while naive_bytes keeps growing -- see
+    # memory_planning_test.cpp's TestInPlaceAliasingCollapsesWholeChain.
+    body = """
+    g (float[25] x) => (float[25] out)
+    {
+      a = Relu(x)
+      b = Sigmoid(a)
+      c = Tanh(b)
+      d = Neg(c)
+      out = Identity(d)
+    }
+    """
+    plan = plan_activation_memory(_model(body))
+
+    assert plan.unplanned == []
+    assert plan.naive_bytes == 600  # 6 tensors x 100 bytes
+    assert plan.arena_bytes == 200  # x's slot + one shared slot
+
+    off = plan.tensor_offsets
+    assert off["x"][0] != off["a"][0]
+    assert off["a"] == off["b"] == off["c"] == off["d"] == off["out"]
+
+
+def test_in_place_aliasing_blocked_by_multiple_consumers():
+    # `a` feeds two separate in-place-eligible ops (Neg -> y1, Sigmoid ->
+    # y2). Without the "sole consumer" guard, both would try to alias `a`
+    # away, incorrectly merging y1 and y2 -- which are both graph outputs,
+    # both live simultaneously -- into the same slot.
+    body = """
+    g (float[4] x) => (float[4] y1, float[4] y2)
+    {
+      a = Relu(x)
+      y1 = Neg(a)
+      y2 = Sigmoid(a)
+    }
+    """
+    plan = plan_activation_memory(_model(body))
+
+    assert plan.unplanned == []
+    assert plan.tensor_offsets["y1"][0] != plan.tensor_offsets["y2"][0]
 
 
 def test_weights_excluded_and_no_reuse_when_overlapping():

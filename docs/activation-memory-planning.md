@@ -53,8 +53,36 @@ Two intervals are only ever placed at overlapping offsets when they are
 **not** simultaneously live — and the overlap check is conservative at
 interval boundaries: a tensor whose last use is node `i` and one produced by
 node `i` itself still count as overlapping, since a node's own output isn't
-generally safe to alias with its inputs' storage (only true in-place ops
-allow that, and this allocator has no notion of which ops are in-place-safe).
+generally safe to alias with its inputs' storage in general. That's exactly
+the exception the next pass carves out, explicitly, for the ops it's actually
+safe for.
+
+## In-place aliasing
+
+Before the two passes above run, a separate pass unions a safe elementwise
+op's input with its output whenever overwriting the input in place is
+provably correct:
+
+- the op is on a curated allowlist of shape-/dtype-preserving elementwise ops
+  (`Relu`, `Sigmoid`, `Tanh`, `Neg`, `Identity`, `Clip`, ... — see
+  `IsInPlaceSafeOp` in `onnxsim/memory_planning.cpp` for the exact list);
+- the input isn't a weight, a graph input, or a declared graph output (an
+  externally-owned buffer, or one the caller only reads after the whole
+  graph finishes — overwriting either mid-run would be observed as
+  corruption, not reused space);
+- the input is consumed exactly once, by this node — the only read of the
+  original value, so overwriting it can't corrupt some other node's read.
+
+A chain of such ops (`Relu -> Sigmoid -> Tanh -> ...`) unions transitively
+into one group that needs a single slot for its *entire* span, rather than
+one slot per node — so a long elementwise chain's arena stays roughly
+constant instead of growing with its length, even though `naive_bytes` still
+grows with every tensor in it. Aliased tensors report the **identical**
+`(offset, size)` in `tensor_offsets` on purpose: unlike two disjoint-interval
+tensors (which merely may reuse each other's freed space), they're the same
+logical storage. Honoring that part of the plan means actually running that
+node's kernel in place — writing its output over the input's own buffer —
+not just treating a repeated offset as "safe to reuse afterward."
 
 ## What's in `MemoryPlan`
 
