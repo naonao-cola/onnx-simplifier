@@ -6690,3 +6690,239 @@ def test_cpp_qdq_structured_pruning_gelu_gated_ffn_matches_oracle():
     up = x @ wu_dequant[:, keep]
     y_oracle = (gate * up) @ Wd[keep, :]
     np.testing.assert_allclose(y, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+# --- MatMulBnb4 (bitsandbytes FP4/NF4 block-quantized weight) structured ---
+# --- pruning ---------------------------------------------------------------
+#
+# Tests for the MatMulBnb4 producer-only chain family
+# (onnxsim/structured_pruning_entry.cpp's own "MatMulBnb4" section), mirroring
+# tests/test_pruning.py's own MatMulBnb4 coverage (see that file's own
+# `_bnb4_*` helpers, independently re-implemented here rather than imported --
+# this file's own established "no cross-import between test files" precedent,
+# same as the MatMulNBits section above). Fixture weights are quantized via
+# the REAL ``onnxruntime.quantization.matmul_bnb4_quantizer.MatMulBnb4
+# Quantizer``'s own ``bnb4_block_quant`` -- never a hand-rolled
+# reimplementation of the packing scheme -- so every packed ``B``/``absmax``
+# pair a test builds is genuine quantizer output, per CLAUDE.md's own
+# guidance for a numpy-computed "large/packed" tensor. Models are built via
+# onnx.parser (per CLAUDE.md's convention); the packed ``B``/``absmax``
+# initializers are attached programmatically via onnx.numpy_helper.from_array
+# afterward (CLAUDE.md's documented exception -- these must be byte-exact,
+# not spelled out as text literals).
+
+
+def _bnb4_quantize(w, quant_type, block_size):
+    """Quantizes a real ``[K, N]`` float weight (ordinary ONNX MatMul weight
+    convention: ``Y = A @ W``) via the actual onnxruntime quantizer code
+    path -- returns ``(packed uint8 [(N*K+1)//2], absmax float32
+    [(N*K+block_size-1)//block_size])``, byte-for-byte what a real
+    ``MatMulBnb4Quantizer.process()`` call would emit for this weight.
+    """
+    from onnxruntime.quantization.matmul_bnb4_quantizer import MatMulBnb4Quantizer
+
+    q = MatMulBnb4Quantizer.__new__(MatMulBnb4Quantizer)
+    q.quant_type = quant_type
+    q.block_size = block_size
+    packed, absmax = q.bnb4_block_quant(w)
+    return packed, absmax.astype(np.float32)
+
+
+def _bnb4_model(K, N1, N2, block_size, quant_type, B1, absmax1, W2, activation="Relu"):
+    """Builds ``A -> MatMulBnb4(mm1) -> activation -> MatMul(mm2) -> Y``, a
+    real, bit-packed FP4/NF4-quantized ``com.microsoft::MatMulBnb4`` node
+    feeding a plain-float ``MatMul`` consumer.
+    """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        g (float[3,{K}] A) => (float[3,{N2}] Y)
+        {{
+          h1 = com.microsoft.MatMulBnb4 <K={K}, N={N1}, block_size={block_size}, quant_type={quant_type}> (A, B1, absmax1)
+          h1_act = {activation}(h1)
+          Y = MatMul(h1_act, W2)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(B1, name="B1"),
+            onnx.numpy_helper.from_array(absmax1, name="absmax1"),
+            _f32(W2, "W2"),
+        ]
+    )
+    return model
+
+
+def _bnb4_chain_model(K, N1, N2, block_size, quant_type, W1, W2, activation="Relu"):
+    """Like :func:`_bnb4_model`, but takes W1 as a plain ``[K, N1]`` float
+    weight and quantizes it itself (:func:`_bnb4_quantize`).
+    """
+    B1, absmax1 = _bnb4_quantize(W1, quant_type, block_size)
+    return _bnb4_model(K, N1, N2, block_size, quant_type, B1, absmax1, W2, activation)
+
+
+@pytest.mark.parametrize("quant_type", [0, 1])  # 0 = FP4, 1 = NF4
+def test_cpp_structured_pruning_matmul_bnb4_plain_chain_matches_oracle(quant_type):
+    # The core "slice, don't recompute" correctness invariant: the pruned
+    # graph's own packed B/absmax tensors must equal a HAND-SLICE of the
+    # ORIGINAL quantizer's own output -- byte-identical, not merely close --
+    # confirmed both directly on the tensors and via a real InferenceSession
+    # run against an independently-requantized-subset reference model
+    # (mirrors tests/test_pruning.py's own
+    # test_matmul_bnb4_pruning_producer_matches_independently_requantized_subset
+    # and test_matmul_bnb4_pruning_producer_bytes_are_byte_identical_to_
+    # requantized_subset).
+    K, N1, N2, block_size = 64, 32, 8, 16
+    rng = np.random.default_rng(31024)
+    W1 = rng.uniform(-1, 1, size=(K, N1)).astype(np.float32)
+    # Column-scale W1 so the top-16-by-L2-norm keep-set is unambiguous
+    # (well separated from the dropped half) regardless of the random draw.
+    W1 = W1 * np.linspace(0.1, 3.0, N1, dtype=np.float32)[None, :]
+    W2 = rng.uniform(-1, 1, size=(N1, N2)).astype(np.float32)
+
+    model = _bnb4_chain_model(K, N1, N2, block_size, quant_type, W1, W2)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    mm1 = next(n for n in pruned.graph.node if n.op_type == "MatMulBnb4")
+    assert {a.name: a.i for a in mm1.attribute}["N"] == 16
+
+    col_norms = np.linalg.norm(W1, axis=0)
+    keep = np.sort(np.argsort(-col_norms, kind="stable")[:16])
+
+    pruned_inits = {t.name: t for t in pruned.graph.initializer}
+    B1_pruned = onnx.numpy_helper.to_array(pruned_inits[mm1.input[1]])
+    absmax1_pruned = onnx.numpy_helper.to_array(pruned_inits[mm1.input[2]])
+    B1_ref, absmax1_ref = _bnb4_quantize(W1[:, keep], quant_type, block_size)
+    np.testing.assert_array_equal(B1_pruned, B1_ref)
+    np.testing.assert_array_equal(absmax1_pruned, absmax1_ref)
+
+    ref_model = _bnb4_chain_model(
+        K, len(keep), N2, block_size, quant_type, W1[:, keep], W2[keep, :]
+    )
+    A = rng.uniform(-1, 1, size=(3, K)).astype(np.float32)
+    (pruned_out,) = _run(pruned, {"A": A})
+    (ref_out,) = _run(ref_model, {"A": A})
+    # A bnb4 producer-row-slice is a plain byte-range copy of the original
+    # quantizer's own output (every row's own packed bytes/absmax blocks
+    # depend only on that row's own K values, never on which other rows
+    # exist or how many there are) -- so this is an exact equality check,
+    # not a float-tolerance one.
+    np.testing.assert_array_equal(pruned_out, ref_out)
+
+
+def test_cpp_structured_pruning_matmul_bnb4_declines_k_not_multiple_of_block_size():
+    # K=24, block_size=16: 24 % 16 != 0, so block 1 ([16, 32) in the
+    # flattened [N, K] array) straddles the row-0/row-1 boundary -- the whole
+    # chain (producer and consumer) must be left byte-unchanged. Mirrors
+    # tests/test_pruning.py's own
+    # test_matmul_bnb4_pruning_declines_k_not_multiple_of_block_size.
+    K, N1, N2, block_size = 24, 16, 8, 16
+    rng = np.random.default_rng(31009)
+    W1 = rng.uniform(-1, 1, size=(K, N1)).astype(np.float32)
+    W2 = rng.uniform(-1, 1, size=(N1, N2)).astype(np.float32)
+    model = _bnb4_chain_model(K, N1, N2, block_size, 1, W1, W2)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_structured_pruning_matmul_bnb4_declines_transb_false():
+    # transB=0 ("backward pass" orientation) is unverified semantics --
+    # always declined, model left untouched.
+    K, N1, N2, block_size = 64, 32, 8, 16
+    rng = np.random.default_rng(31003)
+    W1 = rng.uniform(-1, 1, size=(K, N1)).astype(np.float32)
+    B1, absmax1 = _bnb4_quantize(W1, 1, block_size)
+    W2 = rng.uniform(-1, 1, size=(N1, N2)).astype(np.float32)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 21, "com.microsoft": 1]
+        >
+        g (float[3,{K}] A) => (float[3,{N2}] Y)
+        {{
+          h1 = com.microsoft.MatMulBnb4 <K={K}, N={N1}, block_size={block_size}, quant_type=1, transB=0> (A, B1, absmax1)
+          Y = MatMul(h1, W2)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(B1, name="B1"),
+            onnx.numpy_helper.from_array(absmax1, name="absmax1"),
+            _f32(W2, "W2"),
+        ]
+    )
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_structured_pruning_matmul_bnb4_declines_shared_weight():
+    # The same B tensor read by two different MatMulBnb4 nodes -- slicing it
+    # for one chain would silently corrupt the other reader.
+    K, N1, N2, block_size = 64, 32, 8, 16
+    rng = np.random.default_rng(31014)
+    W1 = rng.uniform(-1, 1, size=(K, N1)).astype(np.float32)
+    W2 = rng.uniform(-1, 1, size=(N1, N2)).astype(np.float32)
+    model = _bnb4_chain_model(K, N1, N2, block_size, 1, W1, W2)
+
+    extra = onnx.helper.make_node(
+        "MatMulBnb4",
+        inputs=["A", "B1", "absmax1"],
+        outputs=["Y2"],
+        domain="com.microsoft",
+        name="mm_extra",
+        K=K,
+        N=N1,
+        block_size=block_size,
+        quant_type=1,
+    )
+    model.graph.node.append(extra)
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("Y2", onnx.TensorProto.FLOAT, [3, N1])
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_structured_pruning_matmul_bnb4_zero_sparsity_is_a_no_op():
+    K, N1, N2, block_size = 64, 32, 8, 16
+    rng = np.random.default_rng(31005)
+    W1 = rng.uniform(-1, 1, size=(K, N1)).astype(np.float32)
+    W2 = rng.uniform(-1, 1, size=(N1, N2)).astype(np.float32)
+    model = _bnb4_chain_model(K, N1, N2, block_size, 1, W1, W2)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.0)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_structured_pruning_matmul_bnb4_matches_python_reference_output():
+    K, N1, N2, block_size = 64, 32, 8, 16
+    rng = np.random.default_rng(31060)
+    W1 = rng.uniform(-1, 1, size=(K, N1)).astype(np.float32)
+    W1 = W1 * np.linspace(0.1, 3.0, N1, dtype=np.float32)[None, :]
+    W2 = rng.uniform(-1, 1, size=(N1, N2)).astype(np.float32)
+    model = _bnb4_chain_model(K, N1, N2, block_size, 1, W1, W2)
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_structured_pruning_matmul_bnb4(model, sparsity=0.5)
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+
+    rng2 = np.random.default_rng(31061)
+    A = rng2.uniform(-1, 1, size=(3, K)).astype(np.float32)
+    (y_py,) = _run(pruned_py, {"A": A})
+    (y_cpp,) = _run(pruned_cpp, {"A": A})
+    np.testing.assert_array_equal(y_py, y_cpp)
