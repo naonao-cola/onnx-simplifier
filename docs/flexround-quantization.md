@@ -122,6 +122,11 @@ round-to-nearest depends on the calibration data being representative.
 `tests/test_flexround.py` runs this simplify -> quantize -> optimize ->
 deploy sequence end-to-end through `onnxruntime.InferenceSession`, and
 confirms FlexRound measurably reduces reconstruction error over plain
-round-to-nearest on a calibration set with heterogeneous within-block
-weight magnitudes -- the scenario its own per-element multiplicative
-divisor is best positioned to help with.
+round-to-nearest on a calibration set with real cross-element structure --
+like AdaRound, FlexRound only ever changes *which* integer an element
+rounds to at an already-fixed block scale, so it cannot rescue a block
+whose scale is itself dominated by a single outlier (no per-element
+divisor correction changes which integer a value many orders of magnitude
+below the block's own scale rounds to); the gain instead comes from
+exploiting genuine cross-element correlation in the calibration batch, the
+same source AdaRound's own reconstruction-error test relies on.

@@ -66,12 +66,14 @@ additive perturbation does.
   positive-multiplicative learned quantity, and, as a useful side effect,
   algebraically simplifies the gradient (``d(S)/d(v2) == S`` and
   ``d(S)/d(v3) == S``; see ``_optimize_divisor`` below).
-- FlexRound's own forward pass applies ``round()`` directly every
-  iteration (not a soft relaxation annealed toward a hard decision, the
-  way AdaRound's rectified-sigmoid ``delta`` is), so, unlike
-  :mod:`onnxsim.adaround`, no regularization/annealing schedule is needed
-  here -- every iteration already optimizes the actual (straight-through)
-  rounding decision.
+- The paper's own forward pass applies ``round()`` every iteration
+  (straight-through for the backward pass). This module instead keeps the
+  *continuous* relaxation ``clip(W / S, n_min, n_max)`` throughout
+  optimization and rounds once at the very end -- the same structure
+  :mod:`onnxsim.adaround` uses for its own relaxation. Unlike AdaRound,
+  no regularization/annealing schedule pulls this relaxation toward a hard
+  decision (the paper's own formulation doesn't have one either): the
+  reconstruction loss alone shapes ``S2``/``s3`` from start to finish.
 - The paper also explores W4A4 / activation-quantization variants (jointly
   reparametrizing the activation's own quantizer) and block-wise
   reconstruction for large language models; this module only implements
@@ -126,6 +128,21 @@ def _optimize_divisor(
     very first forward pass is exactly round-to-nearest at ``scale_nk``,
     the paper's own stated initialization).
 
+    The paper's own forward pass applies ``round()`` every iteration
+    (straight-through for the backward pass). This implementation instead
+    keeps the *continuous* relaxation ``clip(ratio, n_min, n_max)`` (no
+    ``round()``) throughout the optimization loop, and only rounds once at
+    the very end to produce integer codes -- the same structure
+    :func:`onnxsim.adaround._optimize_rounding` uses for its own relaxation
+    (optimize a smooth surrogate throughout, discretize once at the end).
+    Empirically, re-rounding every iteration makes the loss surface a step
+    function of ``v2``/``v3``, which destabilizes Adam's per-parameter
+    second-moment estimate for no benefit here (there's no annealed
+    regularizer, unlike AdaRound's, pulling values toward a hard decision
+    mid-optimization that would need it); the continuous-throughout version
+    below is mathematically the direct straight-through gradient of the
+    quantity it actually optimizes, verified against finite differences.
+
     Gradients use a straight-through estimator through ``round()``
     (``codes ~= ratio`` for backward purposes, zeroed wherever clamping to
     ``[n_min, n_max]`` already saturated -- the same "active" masking
@@ -152,9 +169,8 @@ def _optimize_divisor(
         s = scale_nk * s2 * s3  # [N, K], effective (element-wise) divisor
 
         ratio = w_nk / s
-        codes_raw = np.round(ratio)
-        active = (codes_raw > n_min) & (codes_raw < n_max)
-        codes = np.clip(codes_raw, n_min, n_max)
+        active = (ratio > n_min) & (ratio < n_max)
+        codes = np.clip(ratio, n_min, n_max)  # continuous surrogate this loop optimizes
         w_hat = codes * scale_nk  # deployed dequant always uses scale_nk, not s
 
         y_hat = x @ w_hat.T
@@ -194,7 +210,7 @@ def apply_flexround(
     num_samples: int = 8,
     seed: int = 0,
     num_iterations: int = 300,
-    learning_rate: float = 0.1,
+    learning_rate: float = 0.05,
     log_clip: float = 4.0,
     providers: Optional[Sequence[str]] = None,
 ) -> onnx.ModelProto:
@@ -228,7 +244,13 @@ def apply_flexround(
             ``calibration_data`` is supplied)
     :param num_iterations: Adam steps to run per layer
     :param learning_rate: Adam learning rate for the log-space element-wise
-            (``S2``) and per-output-channel (``s3``) divisor corrections
+            (``S2``) and per-output-channel (``s3``) divisor corrections.
+            The paper's own hyperparameter tables tune this per model/layer
+            (values from ``1e-6`` to ``1e-1`` appear across its
+            experiments) -- this reparametrization's own sensitivity to
+            learning rate, not just a quirk of this port; too high
+            overshoots past round-to-nearest's own optimum, too low never
+            leaves it within a practical iteration budget
     :param log_clip: clamps ``log(S2)``/``log(s3)`` to
             ``[-log_clip, log_clip]`` after every step -- a numerical
             safety bound (not part of the paper's own formulation) keeping
