@@ -53,13 +53,12 @@ struct FuseConsecutiveReshapes final : public PredicateBasedPass {
                     NodeDestroyType& destroy_current) override {
     destroy_current = NodeDestroyType::DestroyZero;
 
-    const bool allowzero = n->hasAttribute(Symbol("allowzero")) &&
-                           n->i(Symbol("allowzero")) == 1;
+    const bool allowzero =
+        n->hasAttribute(Symbol("allowzero")) && n->i(Symbol("allowzero")) == 1;
     if (!allowzero) {
       const Tensor* new_shape_tensor = FetchConstantTensor(n->inputs()[1]);
-      if (!new_shape_tensor ||
-          new_shape_tensor->elem_type() !=
-              ONNX_NAMESPACE::TensorProto_DataType_INT64) {
+      if (!new_shape_tensor || new_shape_tensor->elem_type() !=
+                                   ONNX_NAMESPACE::TensorProto_DataType_INT64) {
         // Can't rule out a copy-from-input `0` entry -- leave the chain
         // alone.
         return false;
