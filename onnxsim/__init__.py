@@ -60,6 +60,7 @@ from onnxsim.mixed_precision import apply_mixed_precision_quantization
 from onnxsim.mlir_export import export_mlir
 from onnxsim.mx_quantization import MXFP4_CODEBOOK, quantize_weight_only_mxfp4
 from onnxsim.nf4 import NF4_CODEBOOK, quantize_weight_only_nf4
+from onnxsim.olive import quantize_weight_only_olive
 from onnxsim.omniquant import apply_omniquant
 from onnxsim.onnx_simplifier import (
     apply_attention_head_pruning_cpp,
@@ -251,6 +252,7 @@ __all__ = [
     "quantize_weight_only_aqlm",
     "quantize_weight_only_gptvq",
     "quantize_weight_only_spqr",
+    "quantize_weight_only_olive",
     "apply_double_quantization",
     "apply_double_quantization_cpp",
     "quantize_kv_cache",
