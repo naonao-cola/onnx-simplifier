@@ -21,6 +21,10 @@ pattern: [`scripts/apple`](../apple) (Core ML), [`scripts/intel`](../intel)
 runner, since unlike the other three it has no CPU fallback or emulator, so
 its workflow is dormant until one is provisioned). NVIDIA (CUDA/TensorRT)
 needs real GPU hardware too and isn't covered by a harness yet.
+[`scripts/axera`](../axera) (Pulsar2/AXCL NPU) is the odd one out: Pulsar2 has
+no pip package or execution provider at all, so that check is a static
+op-support heuristic rather than a real compiler invocation -- see its README
+for why.
 
 ## What it checks
 
