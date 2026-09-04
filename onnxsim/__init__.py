@@ -139,6 +139,7 @@ from onnxsim.spqr import quantize_weight_only_spqr
 from onnxsim.squeezellm import quantize_weight_only_squeezellm
 from onnxsim.tensorrt_sparsity import convert_matmul_to_gemm
 from onnxsim.transformers_export import export_transformers_model
+from onnxsim.zeroquant import apply_zeroquant
 
 from .version import version as __version__
 
@@ -177,6 +178,7 @@ __all__ = [
     "apply_quarot",
     "apply_quarot_cpp",
     "apply_duquant",
+    "apply_zeroquant",
     "apply_spinquant",
     "apply_omniquant",
     "apply_magnitude_pruning",
