@@ -468,7 +468,7 @@ def test_fuse_consecutive_reduce_declines_different_kind():
         g (float[2,3,4] X) => (float[2,3] Z)
         <int64[1] ax = {2}>
         {
-          y = ReduceSum<keepdims = 0>(X, ax)
+          y = ReduceSum<keepdims = 1>(X, ax)
           Z = ReduceMax<keepdims = 0>(y, ax)
         }
         """,
@@ -488,7 +488,7 @@ def test_fuse_consecutive_reduce_declines_sum_square():
         g (float[2,3,4] X) => (float[2,3] Z)
         <int64[1] ax = {2}>
         {
-          y = ReduceSumSquare<keepdims = 0>(X, ax)
+          y = ReduceSumSquare<keepdims = 1>(X, ax)
           Z = ReduceSumSquare<keepdims = 0>(y, ax)
         }
         """,
