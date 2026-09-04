@@ -3368,6 +3368,332 @@ def test_structured_pruning_decomposed_layer_norm_after_bias_add_matches_oracle(
     np.testing.assert_allclose(y, y_correct, rtol=1e-4, atol=1e-4)
 
 
+# --- apply_structured_pruning: *decomposed* (not-yet-fused) RMSNorm ---------
+#
+# `RMSNormalization`'s own schema is only opset 23+ (confirmed live:
+# `onnx.defs.get_schema("RMSNormalization").since_version == 23`), so a raw
+# export at any earlier/default opset has no fused op to lower `nn.RMSNorm`/a
+# hand-rolled RMSNorm module to at all. Unlike `nn.LayerNorm`, PyTorch's own
+# default/legacy (TorchScript-based) exporter has *no* decomposition path for
+# `nn.RMSNorm` at all -- confirmed live,
+# `torch.onnx.export(nn.RMSNorm(C), ..., dynamo=False)` fails outright
+# (`UnsupportedOperatorError: Exporting the operator 'aten::rms_norm' ...`),
+# regardless of opset. In practice this doesn't matter: essentially every real
+# HuggingFace Llama/Mistral/Qwen2/Gemma-family model hand-rolls its own
+# RMSNorm module rather than using `nn.RMSNorm` (precisely because the
+# built-in module doesn't export via the legacy path), and that hand-rolled
+# module's own textbook RMSNorm math -- `variance = x.pow(2).mean(-1,
+# keepdim=True); x = x * torch.rsqrt(variance + eps); return weight * x` --
+# exports (confirmed live, `torch.onnx.export(..., dynamo=False,
+# opset_version=17)`) to exactly the 7-node sequence below, `x` read twice (by
+# `Pow` and by `scaled`'s own `Mul`, RMSNorm having no mean-centering step to
+# read `x` a third way the way LayerNorm's own `Sub` does): `torch.rsqrt`
+# lowers to `Div(1.0, Sqrt(...))` here -- the "Div" variant below. A second,
+# structurally identical variant -- confirmed live via
+# `torch.onnx.export(nn.RMSNorm(C), ..., dynamo=True, opset_version=<23)`,
+# PyTorch's newer `torch.export`-based exporter, which *does* have a
+# decomposition for `aten::rms_norm` -- lowers `torch.rsqrt` to
+# `Reciprocal(std)` instead. `_match_decomposed_rms_norm_pass_through`
+# recognizes both as one more `_walk_to_consumer` hop; before this pass gained
+# it, this exact "MatMul -> decomposed RMSNorm -> MatMul" chain went
+# completely unpruned (confirmed independently against this task's own base
+# commit before this feature existed), while the identical chain built with
+# the *fused* `RMSNormalization` node instead pruned correctly.
+
+
+def _decomposed_rms_norm_model(
+    w1, weight, w2, variant="div", axis=-1, opset=17, pow_exp=2.0
+):
+    K, C = w1.shape
+    Out = w2.shape[1]
+    initializer = [
+        _f32(w1, "W1"),
+        onnx.numpy_helper.from_array(np.array(pow_exp, dtype=np.float32), "Two"),
+        onnx.numpy_helper.from_array(np.array(1e-5, dtype=np.float32), "Eps"),
+        _f32(weight, "Weight"),
+        _f32(w2, "W2"),
+    ]
+    if variant == "div":
+        initializer.append(
+            onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), "One")
+        )
+        inv_std_line = "invstd = Div(One, std)"
+    elif variant == "reciprocal":
+        inv_std_line = "invstd = Reciprocal(std)"
+    else:
+        raise ValueError(variant)
+    return _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          x = MatMul(X, W1)
+          variance = Pow(x, Two)
+          meanvar = ReduceMean<axes=[{axis}]>(variance)
+          vareps = Add(meanvar, Eps)
+          std = Sqrt(vareps)
+          {inv_std_line}
+          scaled = Mul(x, invstd)
+          h = Mul(scaled, Weight)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=opset,
+    )
+
+
+def _rms_norm_oracle(v, w, eps=1e-5):
+    rms = np.sqrt(np.mean(np.square(v), axis=-1, keepdims=True) + eps)
+    return (v / rms) * w
+
+
+def test_structured_pruning_decomposed_rms_norm_div_variant_shrinks_matched_layers():
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(340)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    weight = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _decomposed_rms_norm_model(w1, weight, w2, variant="div")
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, C // 2]
+    assert list(inits["Weight"].dims) == [C // 2]
+    assert list(inits["W2"].dims) == [C // 2, Out]
+    # Every decomposition node itself is untouched (still the same 7 nodes,
+    # same op types/wiring) -- only Weight and the two MatMul weights shrink.
+    assert [n.op_type for n in pruned.graph.node] == [
+        "MatMul",
+        "Pow",
+        "ReduceMean",
+        "Add",
+        "Sqrt",
+        "Div",
+        "Mul",
+        "Mul",
+        "MatMul",
+    ]
+
+
+def test_structured_pruning_decomposed_rms_norm_div_variant_matches_oracle_adversarially():
+    # Mirrors test_structured_pruning_decomposed_layer_norm_pass_through_matches_oracle_adversarially
+    # for the decomposed RMSNorm shape: W1 engineered so the surviving `keep`
+    # set is deliberately not the first C//2 channels, Weight spanning three
+    # orders of magnitude, strictly increasing by channel index -- a
+    # positional (rather than index-set) slice of Weight would misapply a
+    # wildly-wrong-magnitude affine term to a kept channel, detectably wrong
+    # by orders of magnitude. The reference is built from scratch (never a
+    # post-hoc slice of the full unpruned model's own output), run through
+    # real onnxruntime.
+    K, C, Out = 4, 8, 2
+    rng = np.random.default_rng(341)
+    col_scale = np.linspace(0.1, 2.0, C).astype(np.float32)
+    w1 = (rng.standard_normal((K, C)) * col_scale).astype(np.float32)
+    weight = (np.arange(1, C + 1, dtype=np.float64) * 0.001).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _decomposed_rms_norm_model(w1, weight, w2, variant="div")
+    onnx.checker.check_model(model)
+
+    keep_count = C // 2
+    keep = _oracle_keep_indices(w1, keep_count)
+    assert not np.array_equal(keep, np.arange(keep_count))  # confirm adversarial
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    h_correct = _rms_norm_oracle(x @ w1[:, keep], weight[keep])
+    y_correct = h_correct @ w2[keep, :]
+    np.testing.assert_allclose(y, y_correct, rtol=1e-4, atol=1e-4)
+
+    wrong_weight = weight[:keep_count]
+    h_wrong = _rms_norm_oracle(x @ w1[:, keep], wrong_weight)
+    y_wrong = h_wrong @ w2[keep, :]
+    assert np.max(np.abs(y - y_wrong)) > 1e-2 * max(1.0, np.max(np.abs(y_correct)))
+
+
+def test_structured_pruning_decomposed_rms_norm_reciprocal_variant_matches_oracle():
+    # The `torch.export`-based (dynamo=True) exporter's own decomposition of
+    # `nn.RMSNorm` at opset < 23 lowers `torch.rsqrt` to `Reciprocal(std)`
+    # rather than `Div(1.0, std)` -- structurally identical otherwise, and
+    # held to the identical bar.
+    K, C, Out = 6, 12, 3
+    rng = np.random.default_rng(342)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    weight = (rng.standard_normal((C,)).astype(np.float32)) * 2.0 + 1.0
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _decomposed_rms_norm_model(w1, weight, w2, variant="reciprocal")
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    keep_count = C // 2
+    assert list(inits["Weight"].dims) == [keep_count]
+    assert [n.op_type for n in pruned.graph.node].count("Reciprocal") == 1
+
+    keep = _oracle_keep_indices(w1, keep_count)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    h_correct = _rms_norm_oracle(x @ w1[:, keep], weight[keep])
+    y_correct = h_correct @ w2[keep, :]
+    np.testing.assert_allclose(y, y_correct, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_decomposed_rms_norm_pow_exponent_not_two_is_declined():
+    # Pow's own exponent must be confirmed a genuine constant scalar 2 (the
+    # variance term RMSNorm's own math actually computes) -- any other
+    # exponent is declined outright, never guessed at.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(343)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    weight = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _decomposed_rms_norm_model(w1, weight, w2, variant="div", pow_exp=3.0)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_structured_pruning_decomposed_rms_norm_wrong_div_numerator_is_declined():
+    # Div's own first operand must be confirmed a genuine constant scalar 1.0
+    # (`Div`'s own schema is non-commutative, `X / Y` -- inv_std = 1.0 / std)
+    # -- any other numerator (here 2.0) computes a different value than
+    # RMSNorm's own reciprocal-std, and is declined the same conservative way.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(344)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    weight = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    initializer = [
+        _f32(w1, "W1"),
+        onnx.numpy_helper.from_array(np.array(2.0, dtype=np.float32), "Two"),
+        onnx.numpy_helper.from_array(np.array(1e-5, dtype=np.float32), "Eps"),
+        onnx.numpy_helper.from_array(np.array(2.0, dtype=np.float32), "NotOne"),
+        _f32(weight, "Weight"),
+        _f32(w2, "W2"),
+    ]
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          x = MatMul(X, W1)
+          variance = Pow(x, Two)
+          meanvar = ReduceMean<axes=[-1]>(variance)
+          vareps = Add(meanvar, Eps)
+          std = Sqrt(vareps)
+          invstd = Div(NotOne, std)
+          scaled = Mul(x, invstd)
+          h = Mul(scaled, Weight)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_structured_pruning_decomposed_rms_norm_non_constant_weight_is_declined():
+    # The final Mul's own `weight` operand must be a genuine constant
+    # per-channel initializer -- a runtime-computed (graph-input-fed) operand
+    # is declined the same conservative way as a missing/non-constant
+    # `gamma`/`beta` on the LayerNorm decomposition.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(345)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    initializer = [
+        _f32(w1, "W1"),
+        onnx.numpy_helper.from_array(np.array(2.0, dtype=np.float32), "Two"),
+        onnx.numpy_helper.from_array(np.array(1e-5, dtype=np.float32), "Eps"),
+        onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), "One"),
+        _f32(w2, "W2"),
+    ]
+    model = _model(
+        f"""
+        g (float[batch,{K}] X, float[{C}] Weight) => (float[batch,{Out}] Y)
+        {{
+          x = MatMul(X, W1)
+          variance = Pow(x, Two)
+          meanvar = ReduceMean<axes=[-1]>(variance)
+          vareps = Add(meanvar, Eps)
+          std = Sqrt(vareps)
+          invstd = Div(One, std)
+          scaled = Mul(x, invstd)
+          h = Mul(scaled, Weight)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_structured_pruning_decomposed_rms_norm_inv_std_and_x_feed_different_muls_is_declined():
+    # `x` (the decomposition's own root) must be read by exactly one `Pow`
+    # and one `Mul`, and `inv_std` must feed *that exact same* `Mul` node --
+    # here `x`'s own second reader (`combine`) multiplies it by an unrelated
+    # constant instead of `invstd`, while `invstd` itself feeds a *different*
+    # Mul (`stray`, kept alive via a second graph output) -- not the shape
+    # this hop recognizes, so the chain must be left completely untouched,
+    # never partially matched.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(346)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    weight = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    other = rng.standard_normal((C,)).astype(np.float32)
+    other2 = rng.standard_normal((C,)).astype(np.float32)
+    initializer = [
+        _f32(w1, "W1"),
+        onnx.numpy_helper.from_array(np.array(2.0, dtype=np.float32), "Two"),
+        onnx.numpy_helper.from_array(np.array(1e-5, dtype=np.float32), "Eps"),
+        onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), "One"),
+        _f32(weight, "Weight"),
+        _f32(other, "Other"),
+        _f32(other2, "Other2"),
+        _f32(w2, "W2"),
+    ]
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y, float[batch,{C}] Extra)
+        {{
+          x = MatMul(X, W1)
+          variance = Pow(x, Two)
+          meanvar = ReduceMean<axes=[-1]>(variance)
+          vareps = Add(meanvar, Eps)
+          std = Sqrt(vareps)
+          invstd = Div(One, std)
+          combine = Mul(x, Other)
+          stray = Mul(invstd, Other2)
+          Extra = Identity(stray)
+          h = Mul(combine, Weight)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
 def test_structured_pruning_gated_ffn_layer_norm_pass_through_matches_oracle():
     # Composition check: a gated (SwiGLU-style) combine feeding a plain
     # LayerNormalization before the down-projection -- confirms the hop

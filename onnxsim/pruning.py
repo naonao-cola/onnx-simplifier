@@ -348,6 +348,78 @@ projection or an attention block's own output projection, with no LayerNorm
 in between at all -- see that function's own section comment) and never a
 Conv-chain concept, for the identical reason the fused case already isn't.
 
+RMSNorm has its own decomposed shape too, structurally distinct from
+LayerNorm's own above (no mean-centering `Sub` step at all -- RMSNorm's own
+`variance` is `mean(x ** 2)`, never `mean((x - mean(x)) ** 2)`, so `x` itself,
+not a centered intermediate, is what both the squaring `Pow` and the final
+combining `Mul` read directly), and reached by two different real export
+paths rather than one: `RMSNormalization`'s own schema is likewise a late
+opset (23+, confirmed live the same way as `LayerNormalization`'s own
+opset-17 floor above), but PyTorch's own default/legacy (TorchScript-based)
+exporter has *no* decomposition path for `nn.RMSNorm` at all, at any opset --
+confirmed live, `torch.onnx.export(nn.RMSNorm(C), ..., dynamo=False)` fails
+outright (`UnsupportedOperatorError: Exporting the operator 'aten::rms_norm'
+...`) -- unlike `nn.LayerNorm`, which always has *some* decomposition
+available through that same exporter regardless of opset. This isn't a dead
+end in practice, though: essentially every real HuggingFace Llama/Mistral/
+Qwen2/Gemma-family model hand-rolls its own RMSNorm module (an `nn.Module`
+subclass computing the same math directly, `LlamaRMSNorm` and its many
+by-name copies throughout the `transformers` codebase) rather than using
+`nn.RMSNorm` -- precisely *because* the built-in module doesn't export via
+the legacy path -- so the legacy exporter's own decomposition of that
+hand-rolled module's textbook math (confirmed live,
+`torch.onnx.export(..., dynamo=False, opset_version=17)` on a module
+computing `variance = x.pow(2).mean(-1, keepdim=True); x = x *
+torch.rsqrt(variance + eps); return weight * x`, matching real HuggingFace
+`modeling_*.py` source) is, if anything, *more* common in real exported LLMs
+than the fused op itself -- the same "real gap this module already closed for
+LayerNorm" shape its own paragraph above describes. Confirmed live to be
+exactly: ``variance = Pow(x, 2.0); mean_var = ReduceMean(variance,
+axes=[-1]); var_eps = Add(mean_var, eps); std = Sqrt(var_eps); inv_std =
+Div(1.0, std); scaled = Mul(x, inv_std); out = Mul(scaled, weight)`` -- `x`
+read twice (by `Pow` and by `scaled`'s own `Mul`), every other intermediate
+tensor read once; `torch.rsqrt` lowers to `Div(1.0, std)` via this exporter.
+A second, structurally identical variant -- confirmed live via
+``torch.onnx.export(nn.RMSNorm(C), ..., dynamo=True, opset_version=<23)``,
+PyTorch's newer `torch.export`-based exporter, which *does* have a
+decomposition for `aten::rms_norm` unlike the legacy path above -- lowers
+`torch.rsqrt` to `Reciprocal(std)` instead of `Div(1.0, std)`; at
+`opset_version=23`+ the same call instead emits the *fused* `RMSNormalization`
+node directly (confirmed live), so this decomposition and the fused-node hop
+above are additive, never overlapping, for the same module, mirroring
+decomposed LayerNorm's own opset<=16-vs-17+ split.
+:func:`_match_decomposed_rms_norm_pass_through` recognizes *both* variants as
+one more `_walk_to_consumer` hop (tried at the identical two call sites as
+:func:`_match_decomposed_layer_norm_pass_through`, for the identical
+twice-read-root reason, and already covered by
+:func:`_matmul_walk_root_ok`'s own existing relaxation with no further change
+needed there -- see that function's own docstring), folding all 7 nodes into
+`chain_ops` in one hop -- only the final `Mul`'s own `weight` operand has
+anything sliced (`_flat_channel_const`/`dims[-1] == n_channels`, the same bar
+as decomposed LayerNorm's own `gamma`/`beta`); the `Pow` exponent, `eps`, and
+the `Div`'s own `1.0` numerator are all scalars, never sliced at all
+(:func:`_flat_scalar_float_const_equals`, factored out of what was originally
+:func:`_decomposed_layer_norm_pow_exponent_is_two`'s own `2.0`-specific check
+so both this hop's `2.0` exponent check and its own `1.0`-numerator check
+share the identical scalar-constant bar). `Reciprocal` is deliberately *not*
+added to `_UNARY_PASS_THROUGH` for this -- unlike `QuickGelu`/`Swish`/`Erf`
+there, which are unconditionally shape-preserving wherever they appear,
+`Reciprocal(std)` only means anything channel-pruning-safe in this one fixed
+position (immediately after this sequence's own `Sqrt`, feeding this
+sequence's own combining `Mul`); it is instead checked only inline, exactly
+where this hop's own fixed shape expects it. Declines outright, never
+partially matched, on any deviation from this exact 7-node shape (either
+variant): an extra reader of `x` beyond the `Pow`/`Mul` pair it expects, any
+other intermediate tensor read more than once or itself a graph output, a
+`Pow` exponent that isn't confirmed a constant scalar `2.0`, `ReduceMean`'s
+own `axes` not resolving to exactly the tensor's last axis, a `Div` whose
+numerator isn't confirmed a constant scalar `1.0` or whose operand order is
+swapped, `inv_std` and `x` feeding two *different* `Mul` nodes rather than the
+same one, or a non-constant/wrongly-shaped `weight` -- the same conservative
+bar every other hop in this module already holds itself to. Like decomposed
+LayerNorm, this is a MatMul/Gemm-chain-only hop, never a Conv-chain concept,
+for the identical reason.
+
 That same raw, not-yet-optimizer-fused export has one more gap the
 `BiasGelu`/`FastGelu`/`QuickGelu` fusions above don't close: the fused
 `Gelu`/`com.microsoft::Gelu` op itself needs a late opset (native `Gelu`
@@ -4436,21 +4508,23 @@ def _reduce_mean_axis_is_last(
     return _axis_resolves_to_last(axes_attr[0], input_name, value_info_by_name)
 
 
-def _decomposed_layer_norm_pow_exponent_is_two(
-    name: str, initializer_map: Dict[str, onnx.TensorProto]
+def _flat_scalar_float_const_equals(
+    name: str, initializer_map: Dict[str, onnx.TensorProto], value: float
 ) -> bool:
     """True iff `name` names a constant float *scalar* initializer (`dims`
     exactly ``[]``/``[1]``, mirroring :func:`_match_clip_channel_pass_through`'s
-    own `min`/`max` scalar bar) whose value is exactly ``2.0``. ``Pow``'s own
-    schema (``X, Y -> X ** Y``, a fixed operand order, never commutative)
-    makes `name` its second input; per
-    :func:`_match_decomposed_layer_norm_pass_through`'s own docstring, this
-    confirms the node genuinely computes ``(x - mean) ** 2`` -- LayerNorm's
-    own variance term -- rather than some other exponent this pass has no
-    basis for treating as channel-pruning-safe (it never inspects a
-    surviving weight's own numeric *values* to justify a hop shape the way
-    it does here). Declines (``False``) on a non-constant, non-float,
-    non-scalar, or not-exactly-``2.0`` value -- never guessed at.
+    own `min`/`max` scalar bar) whose value is exactly `value`. Factored out
+    of what was originally :func:`_decomposed_layer_norm_pow_exponent_is_two`
+    (now simply this, called with ``2.0``) so
+    :func:`_match_decomposed_rms_norm_pass_through`'s own ``Div``-numerator
+    check (a genuine ``1.0``, per that function's own docstring) can reuse the
+    identical scalar-constant bar rather than duplicating it -- same schema
+    fact (a fixed, non-per-channel operand whose own numeric value this pass
+    *does* need to inspect, unlike an operand like `eps` whose value never
+    matters, see :func:`_flat_scalar_float_const`), same check, regardless of
+    which node or which expected value. Declines (``False``) on a
+    non-constant, non-float, non-scalar, or not-exactly-`value` value --
+    never guessed at.
     """
     init = initializer_map.get(name)
     if (
@@ -4460,7 +4534,26 @@ def _decomposed_layer_norm_pow_exponent_is_two(
     ):
         return False
     values = onnx.numpy_helper.to_array(init).reshape(-1).tolist()
-    return len(values) == 1 and float(values[0]) == 2.0
+    return len(values) == 1 and float(values[0]) == value
+
+
+def _decomposed_layer_norm_pow_exponent_is_two(
+    name: str, initializer_map: Dict[str, onnx.TensorProto]
+) -> bool:
+    """True iff `name` names a constant float scalar initializer
+    (:func:`_flat_scalar_float_const_equals`) whose value is exactly ``2.0``.
+    ``Pow``'s own schema (``X, Y -> X ** Y``, a fixed operand order, never
+    commutative) makes `name` its second input; per
+    :func:`_match_decomposed_layer_norm_pass_through`'s own docstring (and,
+    identically, :func:`_match_decomposed_rms_norm_pass_through`'s -- RMSNorm's
+    own decomposition squares its input the same way), this confirms the node
+    genuinely computes ``(x - mean) ** 2``/``x ** 2`` -- LayerNorm's/RMSNorm's
+    own variance term -- rather than some other exponent this pass has no
+    basis for treating as channel-pruning-safe (it never inspects a surviving
+    weight's own numeric *values* to justify a hop shape the way it does
+    here).
+    """
+    return _flat_scalar_float_const_equals(name, initializer_map, 2.0)
 
 
 def _flat_scalar_float_const(
@@ -4750,37 +4843,366 @@ def _match_decomposed_layer_norm_pass_through(
     return out_name, chain_ops
 
 
+# Decomposed (not-yet-fused) RMSNorm -- the RMSNorm-own analogue of decomposed
+# LayerNorm just above, recognized by
+# :func:`_match_decomposed_rms_norm_pass_through` as a *third* multi-node
+# `_walk_to_consumer` hop alongside `_NORM_PASS_THROUGH_OPS`'s single-node one
+# and the decomposed-LayerNorm 9-node one. `RMSNormalization`'s own schema is
+# only opset 23+ (confirmed live: `_NORM_PASS_THROUGH_OPS`'s own comment), so
+# a raw `torch.onnx.export` at any earlier/default opset has no fused op to
+# lower `nn.RMSNorm`/a hand-rolled RMSNorm module to at all -- but unlike
+# `nn.LayerNorm`, which always has *some* decomposition available regardless
+# of opset, `nn.RMSNorm` specifically has no decomposition path through
+# PyTorch's own default/legacy (TorchScript-based) exporter at all: confirmed
+# live, `torch.onnx.export(nn.RMSNorm(C), ..., dynamo=False)` fails outright
+# (`UnsupportedOperatorError: Exporting the operator 'aten::rms_norm' ...`),
+# regardless of opset -- there is no legacy-exporter decomposition for this
+# module the way LayerNorm's own always-available textbook decomposition
+# exists. This is *not* a dead end in practice, though: essentially every real
+# HuggingFace Llama/Mistral/Qwen2/Gemma-family model hand-rolls its own
+# RMSNorm module (`nn.Module` subclass computing the same math directly,
+# `LlamaRMSNorm` and its many by-name copies throughout the `transformers`
+# codebase) rather than using `nn.RMSNorm` -- precisely *because* the built-in
+# module doesn't export via the legacy path -- so the legacy exporter's own
+# *textbook* RMSNorm decomposition (below) is, if anything, more common in
+# real exported LLMs than the fused op itself, the same "real gap this module
+# already closed for LayerNorm" shape as its own section comment describes.
+#
+# Two concrete shapes, both confirmed live (not assumed from the math) and
+# both structurally different from decomposed LayerNorm's own 9-node shape in
+# one respect: RMSNorm has no mean-centering `Sub` step at all (`variance` is
+# `mean(x**2)`, never `mean((x - mean(x))**2)`), so `x` itself -- not a
+# centered intermediate -- is what both the `Pow` and the final combining
+# `Mul` read directly:
+#
+# 1. A literal `LlamaRMSNorm`-equivalent hand-rolled module (`variance =
+#    x.pow(2).mean(-1, keepdim=True); x = x * torch.rsqrt(variance + eps);
+#    return weight * x`, matching real HuggingFace `modeling_*.py` source,
+#    minus the dtype-upcast/downcast `Cast` pair some real model families add
+#    around it -- immaterial to this shape, see below), exported via
+#    `torch.onnx.export(..., dynamo=False, opset_version=17)`, lowers
+#    `torch.rsqrt` to `Div(1.0, Sqrt(...))` -- confirmed live to produce
+#    exactly:
+#
+#      variance = Pow(x, 2.0); mean_var = ReduceMean(variance, axes=[-1]);
+#      var_eps = Add(mean_var, eps); std = Sqrt(var_eps);
+#      inv_std = Div(1.0, std); scaled = Mul(x, inv_std);
+#      out = Mul(scaled, weight)
+#
+#    `x` read twice (by `Pow` and by `scaled`'s own `Mul`), every other
+#    intermediate tensor read exactly once. This is the shape that matters
+#    most in practice -- it's what a real, unmodified HuggingFace Llama/
+#    Mistral/Qwen2/Gemma-family export actually contains.
+# 2. `torch.onnx.export(nn.RMSNorm(C), ..., dynamo=True, opset_version=<23)`
+#    -- PyTorch's newer `torch.export`-based exporter, which *does* have a
+#    decomposition for `aten::rms_norm` (unlike the legacy path above) --
+#    confirmed live to produce the identical topology, just
+#    `Reciprocal(std)` in place of `Div(1.0, std)` (`torch.rsqrt` lowered
+#    differently by this exporter): `... ; inv_std = Reciprocal(std); ...`.
+#    At `opset_version=23`+, the same call instead emits the *fused*
+#    `RMSNormalization` node directly (confirmed live), so -- exactly like
+#    decomposed LayerNorm's own opset<=16-vs-17+ split -- this decomposition
+#    and the fused-node hop above are additive, never overlapping, for the
+#    same module.
+#
+# Optional dtype-upcast/downcast `Cast` nodes some real model families wrap
+# this in (`hidden_states.to(torch.float32)` before, `.to(input_dtype)`
+# after -- confirmed live to appear when a hand-rolled module includes that
+# explicit cast dance, absent from the minimal module above) are *not* part
+# of this hop's own fixed shape -- they don't need to be: `Cast` is already in
+# `_UNARY_PASS_THROUGH`, so a leading one is walked through by
+# :func:`_walk_to_consumer`'s own ordinary per-iteration dispatch before ever
+# reaching this hop (`x_name` becomes the leading `Cast`'s own output), and a
+# trailing one sitting between `scaled` and the final weight `Mul` simply
+# means this hop's own fixed-adjacency bar (`scaled` read by *exactly* the
+# weight `Mul` -- see below) declines that specific chain, the same
+# conservative way it declines anything else not matching the exact shape;
+# the ordinary dispatch never gets a second chance to pick up the trailing
+# `Cast` + weight-`Mul` on its own once this hop has already committed to
+# `x_name`'s own two-consumer root, since `_walk_to_consumer` never re-enters
+# ordinary dispatch mid-multi-node-hop. This composes exactly like decomposed
+# LayerNorm's own -- fine in practice, since none of the concrete shapes
+# above (nor a raw, unmodified `nn.RMSNorm`/hand-rolled-module export at any
+# opset this hop targets) include such a `Cast`.
+#
+# `Reciprocal` (unlike `Div`) is *not* added to `_UNARY_PASS_THROUGH` for this
+# -- unlike `QuickGelu`/`Swish`/`Erf` above, which are unconditionally
+# shape-preserving wherever they appear, `Reciprocal(std)` only means
+# anything channel-pruning-safe in this one fixed position (immediately after
+# this sequence's own `Sqrt`, feeding this sequence's own combining `Mul`);
+# adding it to that set would make it a transparent hop *everywhere* a
+# MatMul/Gemm or Conv chain crosses one, a strictly wider and unverified claim
+# this section has no basis for. It is instead checked only inline, exactly
+# where this hop's own fixed shape expects it -- the same "recognize this
+# exact topology, decline everything else" discipline
+# :func:`_match_fused_bias_gelu`'s own two fused ops and every other
+# multi-node hop in this module already holds itself to.
+#
+# Before this hop existed, a `MatMul -> {either decomposition above} ->
+# MatMul` chain went completely unpruned end to end (confirmed independently
+# against this task's own base commit), while the identical chain built with
+# the *fused* `RMSNormalization` node instead pruned correctly -- isolating
+# the gap to the decomposition specifically, the same way every other
+# decomposition gap in this module was confirmed before its own fix.
+
+
+def _match_decomposed_rms_norm_pass_through(
+    x_name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+    n_channels: int,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]],
+) -> Optional[Tuple[str, Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]]:
+    """If `x_name` is the root of exactly the fixed 7-node decomposed-RMSNorm
+    sequence documented in this section's own comment above -- confirmed live
+    via both a hand-rolled `LlamaRMSNorm`-equivalent module's own
+    `torch.onnx.export(..., dynamo=False, opset_version=17)` (the `Div(1.0,
+    std)` variant) and `torch.onnx.export(nn.RMSNorm(C), ..., dynamo=True,
+    opset_version=<23)` (the `Reciprocal(std)` variant) -- returns
+    ``(out_name, chain_ops)``: `out_name` the sequence's own true final output
+    (the tensor :func:`_walk_to_consumer` should continue walking from),
+    `chain_ops` all 7 nodes in walk order as ``(node, const_name_or_None)``
+    pairs ready to fold directly into a :class:`_Chain`'s own `chain_ops`
+    field -- only the final `Mul`'s own weight operand has anything to slice;
+    every other node's own entry carries ``None`` (the `Pow` exponent and
+    variance-``Add``'s own `eps`, like decomposed LayerNorm's identical two
+    operands, are scalars, never sliced at all, and the `Div`'s own numerator
+    is likewise a scalar never sliced -- see
+    :func:`_decomposed_layer_norm_pow_exponent_is_two`'s/
+    :func:`_flat_scalar_float_const`'s/:func:`_flat_scalar_float_const_equals`'s
+    own comments).
+
+    Mirrors :func:`_match_decomposed_layer_norm_pass_through` in every
+    structural respect but the shape itself: `x_name` itself (not just some
+    node's `.input[0]`) is the thing being matched, called by
+    :func:`_walk_to_consumer` at the identical two points (before its own
+    ordinary "exactly one consumer" dispatch, and again as a fallback
+    wherever an *ordinary* hop's own output would otherwise fail that
+    dispatch's single-consumer bar) for the identical reason (`x_name` is read
+    *twice* by design -- here, by the sequence's own `Pow` and by the final
+    combining `Mul`, RMSNorm having no centering step to read `x_name` a
+    *third* way the way LayerNorm's `Sub` does). Every other tensor inside the
+    sequence is held to the same "no stray fan-out" bar every other hop in
+    this module already applies -- exactly one consumer, and not itself a
+    graph output (`graph_outputs`). Declines (``None``, never partially
+    matched) on:
+
+    - `x_name` read by anything other than exactly one ``Pow`` and one
+      ``Mul`` (in particular, a *third* reader of any kind).
+    - `Pow`'s own inputs not exactly ``(x_name, <scalar 2.0>)``
+      (:func:`_decomposed_layer_norm_pow_exponent_is_two`) in that fixed,
+      schema-mandated order.
+    - The ``ReduceMean`` reading `Pow`'s own output not confirmed to reduce
+      exactly that tensor's own last axis (:func:`_reduce_mean_axis_is_last`)
+      -- the axis this pass is actually pruning.
+    - The variance ``Add`` not exactly ``Add(var, eps)`` (either operand
+      order -- `Add` is commutative) with `eps` a genuine scalar constant
+      (:func:`_flat_scalar_float_const`) distinct from `var`.
+    - ``Sqrt``'s own input not exactly the variance ``Add``'s own output.
+    - `std` (``Sqrt``'s output) not read by *exactly* one node, and that node
+      not exactly either ``Div(<scalar 1.0>, std)`` (in that fixed,
+      schema-mandated order -- `Div` is never commutative;
+      :func:`_flat_scalar_float_const_equals` confirms the numerator is
+      genuinely `1.0`, not merely a scalar) or ``Reciprocal(std)`` (its own
+      single input).
+    - `inv_std` (the `Div`/`Reciprocal`'s own output) not read by *the exact
+      same* `Mul` node already identified above as `x_name`'s own second
+      reader -- ruling out a graph that merely happens to have *a* `Mul` node
+      consuming `inv_std`, a different one from the one consuming `x_name`
+      (mirrors decomposed LayerNorm's own identical `std`-must-feed-the-same-
+      `Div` check).
+    - That `Mul`'s own inputs not exactly ``(x_name, inv_std)`` (either
+      operand order -- `Mul` is commutative).
+    - `scaled` (that `Mul`'s own output) not read by *exactly* one further
+      `Mul` node.
+    - That final `Mul`'s own inputs not exactly ``(scaled, weight)`` (either
+      operand order) with `weight` a genuine constant float flat per-channel
+      vector (:func:`_flat_channel_const`, the same bar
+      :func:`_match_decomposed_layer_norm_pass_through`'s own `gamma`/`beta`
+      already use) whose `dims[-1]` matches `n_channels` -- the real
+      channel-count check every hop in this module ultimately applies to its
+      own per-channel operand, distinct from `scaled`.
+    - Any intermediate tensor along the way (`variance`, `mean_var`,
+      `var_eps`, `std`, `inv_std`, `scaled`) itself a graph output, or read by
+      anything other than the one node this sequence's own fixed shape
+      expects.
+
+    The sequence's own true final output (the final `Mul`'s own output) is
+    *not* itself checked against `graph_outputs`/single-consumer here --
+    exactly like decomposed LayerNorm's own trailing `Add`, that check is the
+    caller's (:func:`_walk_to_consumer`'s own per-iteration "cur" check),
+    applied uniformly whether `cur` arrived via an ordinary hop or this one.
+    """
+    x_consumers = consumers_of.get(x_name, [])
+    if len(x_consumers) != 2:
+        return None
+    pow_node: Optional[onnx.NodeProto] = None
+    mul_node: Optional[onnx.NodeProto] = None
+    for cand in x_consumers:
+        if cand.op_type == "Pow" and pow_node is None:
+            pow_node = cand
+        elif cand.op_type == "Mul" and mul_node is None:
+            mul_node = cand
+    if pow_node is None or mul_node is None or pow_node is mul_node:
+        return None
+
+    if (
+        pow_node.domain != ""
+        or len(pow_node.input) != 2
+        or pow_node.input[0] != x_name
+        or len(pow_node.output) != 1
+        or not pow_node.output[0]
+        or not _decomposed_layer_norm_pow_exponent_is_two(
+            pow_node.input[1], initializer_map
+        )
+    ):
+        return None
+    sq_name = pow_node.output[0]
+    if sq_name in graph_outputs or len(consumers_of.get(sq_name, [])) != 1:
+        return None
+
+    reduce_mean = consumers_of[sq_name][0]
+    if len(reduce_mean.output) != 1 or not reduce_mean.output[0]:
+        return None
+    if not _reduce_mean_axis_is_last(reduce_mean, sq_name, value_info_by_name):
+        return None
+    var_name = reduce_mean.output[0]
+    if var_name in graph_outputs or len(consumers_of.get(var_name, [])) != 1:
+        return None
+
+    add_eps = consumers_of[var_name][0]
+    if (
+        add_eps.op_type != "Add"
+        or add_eps.domain != ""
+        or len(add_eps.input) != 2
+        or var_name not in add_eps.input
+        or len(add_eps.output) != 1
+        or not add_eps.output[0]
+    ):
+        return None
+    eps_name = add_eps.input[1] if add_eps.input[0] == var_name else add_eps.input[0]
+    if eps_name == var_name or not _flat_scalar_float_const(eps_name, initializer_map):
+        return None
+    var_eps_name = add_eps.output[0]
+    if var_eps_name in graph_outputs or len(consumers_of.get(var_eps_name, [])) != 1:
+        return None
+
+    sqrt_node = consumers_of[var_eps_name][0]
+    if (
+        sqrt_node.op_type != "Sqrt"
+        or sqrt_node.domain != ""
+        or list(sqrt_node.input) != [var_eps_name]
+        or len(sqrt_node.output) != 1
+        or not sqrt_node.output[0]
+    ):
+        return None
+    std_name = sqrt_node.output[0]
+    if std_name in graph_outputs or len(consumers_of.get(std_name, [])) != 1:
+        return None
+
+    inv_node = consumers_of[std_name][0]
+    if inv_node.domain != "" or len(inv_node.output) != 1 or not inv_node.output[0]:
+        return None
+    if inv_node.op_type == "Div":
+        if len(inv_node.input) != 2 or inv_node.input[1] != std_name:
+            return None
+        if not _flat_scalar_float_const_equals(inv_node.input[0], initializer_map, 1.0):
+            return None
+    elif inv_node.op_type == "Reciprocal":
+        if list(inv_node.input) != [std_name]:
+            return None
+    else:
+        return None
+    inv_std_name = inv_node.output[0]
+    if inv_std_name in graph_outputs or len(consumers_of.get(inv_std_name, [])) != 1:
+        return None
+    if consumers_of[inv_std_name][0] is not mul_node:
+        return None  # inv_std must feed the *same* Mul node x_name forked to
+
+    if (
+        mul_node.domain != ""
+        or len(mul_node.input) != 2
+        or x_name not in mul_node.input
+        or len(mul_node.output) != 1
+        or not mul_node.output[0]
+    ):
+        return None
+    scaled_name = mul_node.output[0]
+    if scaled_name in graph_outputs or len(consumers_of.get(scaled_name, [])) != 1:
+        return None
+
+    final_mul = consumers_of[scaled_name][0]
+    if (
+        final_mul.op_type != "Mul"
+        or final_mul.domain != ""
+        or len(final_mul.input) != 2
+        or scaled_name not in final_mul.input
+        or len(final_mul.output) != 1
+        or not final_mul.output[0]
+    ):
+        return None
+    weight_name = (
+        final_mul.input[1] if final_mul.input[0] == scaled_name else final_mul.input[0]
+    )
+    if (
+        weight_name == scaled_name
+        or not _flat_channel_const(weight_name, initializer_map)
+        or initializer_map[weight_name].dims[-1] != n_channels
+    ):
+        return None
+
+    out_name = final_mul.output[0]
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...] = (
+        (pow_node, None),
+        (reduce_mean, None),
+        (add_eps, None),
+        (sqrt_node, None),
+        (inv_node, None),
+        (mul_node, None),
+        (final_mul, weight_name),
+    )
+    return out_name, chain_ops
+
+
 def _matmul_walk_root_ok(name: str, graph_outputs: Set[str]) -> bool:
     """True unless `name` is itself a graph output -- the one condition
     :func:`_walk_to_consumer` can never itself recover from once called (a
     caller-observed tensor's own shape must never silently change out from
     under it). Every *other* "is this safe to walk forward from" question --
-    an ordinary single consumer, or the decomposed-LayerNorm-root
-    *two*-consumer shape :func:`_match_decomposed_layer_norm_pass_through`
-    recognizes -- is left entirely to :func:`_walk_to_consumer`'s own hop-0
-    dispatch, which declines (returns no consumer, `(None, ())`) exactly the
-    same way skipping the call here already did for every case this module
-    supported before that hop existed: a tensor with zero consumers, or two
-    or more that don't happen to match the decomposed-LayerNorm shape,
-    still makes the very first hop's own dispatch fail immediately, with no
-    wasted walking.
+    an ordinary single consumer, or either of the two decomposed-norm-root
+    *two*-consumer shapes :func:`_match_decomposed_layer_norm_pass_through`/
+    :func:`_match_decomposed_rms_norm_pass_through` recognize -- is left
+    entirely to :func:`_walk_to_consumer`'s own hop-0 dispatch, which declines
+    (returns no consumer, `(None, ())`) exactly the same way skipping the
+    call here already did for every case this module supported before either
+    hop existed: a tensor with zero consumers, or two or more that don't
+    happen to match either decomposed-norm shape, still makes the very first
+    hop's own dispatch fail immediately, with no wasted walking. Confirmed by
+    construction, not merely asserted: this function's own body needs no
+    RMSNorm-specific change at all to already cover
+    :func:`_match_decomposed_rms_norm_pass_through`'s own two-consumer root
+    for free -- it was already agnostic to *which* shape a non-graph-output,
+    multi-consumer tensor might turn out to match, deferring that entirely to
+    the caller, the same way it was already agnostic to decomposed
+    LayerNorm's own specific shape.
 
     Used, in place of a plain `_is_internal(out_name)` single-consumer gate,
     by every :func:`_find_chains`/:func:`_find_gated_chains`/
     :func:`_find_split_gated_chains`/:func:`_find_matmul_concat_chains` call
     site that hands `_walk_to_consumer` a producer's, a gated combine's, or
     a `Concat`'s own raw output as `start` -- the shape a decomposed
-    LayerNorm sitting *directly* on that root (no ordinary hop first) needs,
-    since its own root tensor is read twice by design and a strict
-    single-consumer gate would otherwise always reject it before the walk
-    ever got a chance to try (mirroring the identical fallback
+    LayerNorm/RMSNorm sequence sitting *directly* on that root (no ordinary
+    hop first) needs, since its own root tensor is read twice by design and a
+    strict single-consumer gate would otherwise always reject it before the
+    walk ever got a chance to try (mirroring the identical fallback
     :func:`_walk_to_consumer` itself already needs for an *ordinary* hop's
     own output landing on such a root -- see its own top-of-loop and `out2`
     comments). Never used ahead of a `forced_first_hop` call
     (:func:`_resolve_matmul_fanout_branches`'s own extra-branch resolution):
-    `forced_first_hop` always takes hop 0's own dispatch directly, so this
-    hop can never be reached there regardless -- that composition is
-    deliberately out of this hop's scope, see
+    `forced_first_hop` always takes hop 0's own dispatch directly, so neither
+    hop can ever be reached there regardless -- that composition is
+    deliberately out of both hops' scope, see
     :func:`_match_decomposed_layer_norm_pass_through`'s own docstring.
     """
     return name not in graph_outputs
@@ -5264,11 +5686,14 @@ def _walk_to_consumer(
     :func:`_match_fused_bias_gelu` -- a plain `_NORM_PASS_THROUGH_OPS`
     node whose own ``axis`` normalizes exactly `cur`'s last axis -- see that
     constant's own comment, :func:`_norm_axis_is_last`, and
-    :func:`_norm_pass_through_const_names` -- or the *decomposed*, not-yet-
-    fused LayerNorm sequence a raw opset <= 16 export emits instead of a
-    fused `_NORM_PASS_THROUGH_OPS` node (see the section comment above
-    `_ConsumerMatch` and :func:`_match_decomposed_layer_norm_pass_through`)
-    -- a ``PRelu`` node (see :func:`_match_prelu_pass_through_matmul`): a
+    :func:`_norm_pass_through_const_names` -- or either of two *decomposed*,
+    not-yet-fused norm sequences a raw export emits instead of a fused
+    `_NORM_PASS_THROUGH_OPS` node: LayerNorm's own opset <= 16 canonical
+    decomposition (see the section comment above `_ConsumerMatch` and
+    :func:`_match_decomposed_layer_norm_pass_through`) or RMSNorm's own
+    (see the section comment above :func:`_match_decomposed_rms_norm_pass_through`
+    and that function's own docstring -- either its `Div(1.0, std)` or
+    `Reciprocal(std)` variant) -- a ``PRelu`` node (see :func:`_match_prelu_pass_through_matmul`): a
     *scalar* or single-shared-parameter `slope` (every dimension size 1)
     needs no operand of its own sliced, the same shape a plain unary
     activation hop already gets; a *per-channel* `slope` (flat,
@@ -5324,7 +5749,17 @@ def _walk_to_consumer(
             # attempted alongside `forced_first_hop` (`_hop == 0` there
             # always takes the branch above instead) -- see
             # :func:`_match_decomposed_layer_norm_pass_through`'s own
-            # docstring; that composition is out of this hop's scope.
+            # docstring; that composition is out of this hop's scope. The
+            # decomposed-RMSNorm shape (:func:`_match_decomposed_rms_norm_pass_through`,
+            # see its own section comment) is tried right alongside it, for
+            # the identical reason -- its own root is read twice too (by its
+            # `Pow` and its own combining `Mul`, not LayerNorm's `Sub`), so it
+            # needs the identical two call sites; the two shapes never
+            # overlap (LayerNorm's root is read by a `ReduceMean` and a
+            # `Sub`, RMSNorm's by a `Pow` and a `Mul` -- no graph matches both
+            # matchers' own node-type requirements at once), so trying both
+            # here costs nothing beyond one more declining call whenever
+            # neither shape is actually present.
             ln_match = _match_decomposed_layer_norm_pass_through(
                 cur,
                 consumers_of,
@@ -5333,6 +5768,15 @@ def _walk_to_consumer(
                 n_channels,
                 value_info_by_name,
             )
+            if ln_match is None:
+                ln_match = _match_decomposed_rms_norm_pass_through(
+                    cur,
+                    consumers_of,
+                    initializer_map,
+                    graph_outputs,
+                    n_channels,
+                    value_info_by_name,
+                )
             if ln_match is not None:
                 ln_out_name, ln_chain_ops = ln_match
                 chain_ops.extend(ln_chain_ops)
@@ -5479,7 +5923,9 @@ def _walk_to_consumer(
         # *after* a hop already committed to advancing past it. Trying the
         # same matcher here first, before the ordinary single-consumer bar,
         # closes that gap: every other multi-consumer `out2` still declines
-        # exactly as before.
+        # exactly as before. Tries the decomposed-RMSNorm shape too, the same
+        # way and for the same reason as this function's own hop-0 dispatch
+        # above.
         ln_match = None
         if len(consumers_of.get(out2, [])) != 1:
             ln_match = _match_decomposed_layer_norm_pass_through(
@@ -5490,6 +5936,15 @@ def _walk_to_consumer(
                 n_channels,
                 value_info_by_name,
             )
+            if ln_match is None:
+                ln_match = _match_decomposed_rms_norm_pass_through(
+                    out2,
+                    consumers_of,
+                    initializer_map,
+                    graph_outputs,
+                    n_channels,
+                    value_info_by_name,
+                )
             if ln_match is None:
                 break
         chain_ops.append((nxt, const_name))
