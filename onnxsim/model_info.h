@@ -60,6 +60,15 @@ struct ModelInfo {
 ModelInfo GetModelInfo(const onnx::ModelProto& model,
                        bool run_shape_inference = true);
 
+// Reduce `model`'s top-level graph to the ``GraphView`` model_metrics.h (and
+// its dependents, e.g. memory_planning.h) operate on: node connectivity plus
+// every fully-known tensor shape/dtype. Shares the exact same shape-inference
+// step ``GetModelInfo`` uses for its own metrics (best-effort: falls back to
+// `model`'s existing value_info if inference throws), so a caller building a
+// GraphView-based report sees the same shapes ``GetModelInfo`` would.
+onnxsim::GraphView GetGraphView(const onnx::ModelProto& model,
+                                bool run_shape_inference = true);
+
 // Write onnxsim's model-info metrics into ``model``'s ``metadata_props`` in
 // place, mirroring the Python ``model_info.annotate_metadata`` so downstream
 // tools (e.g. the browser inference panel) can read them back:

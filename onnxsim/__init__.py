@@ -59,6 +59,12 @@ from onnxsim.kv_cache_quantization import quantize_kv_cache
 from onnxsim.llm_fp4 import FP4_FORMATS, quantize_weight_only_llm_fp4
 from onnxsim.llm_int8 import apply_llm_int8
 from onnxsim.low_rank_compensation import apply_low_rank_compensation
+from onnxsim.memory_planning import (
+    MemoryPlan,
+    annotate_memory_plan,
+    plan_activation_memory,
+    print_memory_plan,
+)
 from onnxsim.mixed_precision import apply_mixed_precision_quantization
 from onnxsim.mlir_export import export_mlir
 from onnxsim.mx_quantization import MXFP4_CODEBOOK, quantize_weight_only_mxfp4
@@ -204,6 +210,10 @@ __all__ = [
     "apply_dac",
     "apply_llm_int8",
     "apply_low_rank_compensation",
+    "MemoryPlan",
+    "plan_activation_memory",
+    "print_memory_plan",
+    "annotate_memory_plan",
     "apply_mixed_precision_quantization",
     "apply_slim_llm",
     "apply_quip_sharp",

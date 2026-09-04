@@ -169,7 +169,7 @@ set(ONNXSIM_BLAKE3_COMPILE_DEFS
     BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
     BLAKE3_USE_NEON=0)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/cross_layer_equalization_entry.cpp onnxsim/pruning_entry.cpp onnxsim/structured_pruning_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/precision_estimator.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp ${ONNXSIM_BLAKE3_SOURCES})
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/cross_layer_equalization_entry.cpp onnxsim/pruning_entry.cpp onnxsim/structured_pruning_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/precision_estimator.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp ${ONNXSIM_BLAKE3_SOURCES})
 target_compile_definitions(onnxsim PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
 if (ONNXSIM_BUILTIN_ORT)
   # Both ways of obtaining ONNX Runtime ship/install headers flat under this
@@ -509,6 +509,14 @@ if (ONNXSIM_TESTS)
                                     onnxsim/model_metrics.cpp onnxsim/sym_expr.cpp)
   target_include_directories(model_metrics_test PRIVATE onnxsim)
   add_test(NAME model_metrics_test COMMAND model_metrics_test)
+
+  # memory_planning builds on model_metrics' GraphView/liveness core, so it is
+  # likewise ONNX-free and tests standalone the same way.
+  add_executable(memory_planning_test onnxsim/memory_planning_test.cpp
+                                      onnxsim/memory_planning.cpp
+                                      onnxsim/model_metrics.cpp onnxsim/sym_expr.cpp)
+  target_include_directories(memory_planning_test PRIVATE onnxsim)
+  add_test(NAME memory_planning_test COMMAND memory_planning_test)
 
   # The M1 symbolic value evaluator (issue #532) is likewise dependency-free
   # (only SymExpr), so it builds and runs standalone -- including under
