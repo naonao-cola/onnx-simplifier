@@ -473,8 +473,7 @@ struct PreluMatch {
 // otherwise-malformed slope, the same conservative bar every other hop here
 // holds its own constant operand to.
 std::optional<PreluMatch> MatchPreluPassThroughMatmul(
-    const onnx::NodeProto& node, const InitMap& init_map,
-    int64_t n_channels) {
+    const onnx::NodeProto& node, const InitMap& init_map, int64_t n_channels) {
   if (node.op_type() != "PRelu" || node.domain() != "") {
     return std::nullopt;
   }
@@ -731,12 +730,13 @@ std::pair<std::optional<ConsumerMatch>, std::vector<ChainOp>> WalkToConsumer(
       const_name = fused->bias_name;
     } else if (nxt->op_type() == "PRelu" && nxt->domain() == "" &&
                nxt->input_size() > 0 && nxt->input(0) == cur) {
-      auto prelu_match = MatchPreluPassThroughMatmul(*nxt, init_map, n_channels);
+      auto prelu_match =
+          MatchPreluPassThroughMatmul(*nxt, init_map, n_channels);
       if (!prelu_match) {
         break;
       }
-      const_name = prelu_match->is_per_channel ? prelu_match->slope_name
-                                               : std::nullopt;
+      const_name =
+          prelu_match->is_per_channel ? prelu_match->slope_name : std::nullopt;
     } else if (nxt->op_type() == "Clip" && nxt->domain() == "" &&
                nxt->input_size() > 0 && nxt->input(0) == cur &&
                nxt->output_size() == 1 &&
@@ -1367,7 +1367,7 @@ std::optional<DepthwiseMatch> MatchConvPassThroughSelf(
 // re-validation a depthwise hop already gets, keyed only on `hop.weight`'s
 // own `dims(0)`, needing no PRelu-specific case of its own).
 std::optional<PreluMatch> MatchPreluPassThroughSelf(const onnx::NodeProto& node,
-                                                     const InitMap& init_map) {
+                                                    const InitMap& init_map) {
   if (node.op_type() != "PRelu" || node.domain() != "" ||
       node.input_size() != 2) {
     return std::nullopt;
@@ -2136,8 +2136,8 @@ MatMulBackwardEdge WalkMatmulProducerBackward(
         node->input_size() == 2) {
       auto prelu_self = MatchPreluPassThroughMatmulSelf(*node, init_map);
       if (prelu_self) {
-        chain_ops.push_back(ChainOp{
-            node, prelu_self->is_per_channel ? prelu_self->slope_name
+        chain_ops.push_back(ChainOp{node, prelu_self->is_per_channel
+                                              ? prelu_self->slope_name
                                               : std::nullopt});
         edges.push_back({node->input(0), node});
         cur = node->input(0);
@@ -4783,14 +4783,15 @@ struct SplitSizesResult {
 // IS present but is not a resolvable constant INT64 initializer. Mirrors
 // pruning.py's own _split_explicit_sizes exactly.
 std::optional<SplitSizesResult> SplitExplicitSizes(const onnx::NodeProto& node,
-                                                    const InitMap& init_map) {
+                                                   const InitMap& init_map) {
   if (node.input_size() >= 2 && !node.input(1).empty()) {
     auto it = init_map.find(node.input(1));
     if (it == init_map.end() ||
         it->second->data_type() != onnx::TensorProto::INT64) {
       return std::nullopt;
     }
-    return SplitSizesResult{ReadInt64Tensor(*it->second), SplitSizesKind::kInput};
+    return SplitSizesResult{ReadInt64Tensor(*it->second),
+                            SplitSizesKind::kInput};
   }
   for (const auto& attr : node.attribute()) {
     if (attr.name() == "split") {
@@ -4964,9 +4965,9 @@ std::vector<SplitGatedChain> FindSplitGatedChains(onnx::GraphProto* graph) {
     if (!(is_internal(node->output(0)) && is_internal(node->output(1)))) {
       continue;
     }
-    split_matches[node] = SplitMatch{pinfo.node, pinfo.weight,
-                                     pinfo.weight_transposed, pinfo.bias, h,
-                                     sizes_result->kind};
+    split_matches[node] = SplitMatch{
+        pinfo.node, pinfo.weight,      pinfo.weight_transposed, pinfo.bias,
+        h,          sizes_result->kind};
     split_half_of[node->output(0)] = SplitHalfOf{node, 0};
     split_half_of[node->output(1)] = SplitHalfOf{node, 1};
   }
@@ -4987,12 +4988,12 @@ std::vector<SplitGatedChain> FindSplitGatedChains(onnx::GraphProto* graph) {
           init_map.count(b_name)) {
         continue;
       }
-      auto trace_a = TraceSplitHalfBackward(a_name, node_by_output,
-                                            split_half_of, consumers_of,
-                                            graph_outputs, kMaxChainHops);
-      auto trace_b = TraceSplitHalfBackward(b_name, node_by_output,
-                                            split_half_of, consumers_of,
-                                            graph_outputs, kMaxChainHops);
+      auto trace_a =
+          TraceSplitHalfBackward(a_name, node_by_output, split_half_of,
+                                 consumers_of, graph_outputs, kMaxChainHops);
+      auto trace_b =
+          TraceSplitHalfBackward(b_name, node_by_output, split_half_of,
+                                 consumers_of, graph_outputs, kMaxChainHops);
       if (!trace_a || !trace_b) {
         continue;
       }
@@ -5110,7 +5111,8 @@ void ApplySplitGatedChains(onnx::GraphProto* graph,
     if (chain.split_sizes_kind == SplitSizesKind::kInput) {
       size_init_name = chain.split_node->input(1);
       if (touched_split_size_inits.count(*size_init_name)) {
-        continue;  // A shared split-sizes constant another chain already rewrote.
+        continue;  // A shared split-sizes constant another chain already
+                   // rewrote.
       }
     }
 
@@ -5147,7 +5149,8 @@ void ApplySplitGatedChains(onnx::GraphProto* graph,
       }
       importance[static_cast<size_t>(c)] = std::sqrt(sq_gate + sq_up);
     }
-    const std::vector<int64_t> keep = TopKIndicesAscending(importance, keep_count);
+    const std::vector<int64_t> keep =
+        TopKIndicesAscending(importance, keep_count);
     // `keep` (< h) and `keep + h` (>= h) are disjoint ranges, each already
     // ascending -- their concatenation is therefore already ascending
     // overall too, same `keep`-is-ascending invariant every other chain
