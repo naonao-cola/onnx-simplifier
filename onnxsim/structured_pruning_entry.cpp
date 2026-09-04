@@ -4556,12 +4556,16 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
 // _match_attention_producer/_walk_to_attention_consumer/
 // _find_attention_chains, _match_gqa_producer/_match_onnx_attention_producer/
 // _find_separate_qkv_chains, and _apply_one_plain_attention_chain/
-// _apply_one_gqa_chain/_apply_attention_chains. Data-free (magnitude/
-// Frobenius-norm) only -- pruning.py's own calibration-driven
-// apply_attention_head_wanda_pruning is not ported, matching this codebase's
-// established C++-port scope decision (data-free/closed-form techniques
-// only). Three fused self-attention ops are matched, each at the
-// granularity its own kernel contract allows -- see pruning.py's own
+// _apply_one_gqa_chain/_apply_attention_chains. The plain (data-free,
+// magnitude/Frobenius-norm) ranking below is shared, via
+// ApplyOnePlainAttentionChain/ApplyOneGqaChain's own optional trailing
+// `act_norm`/`epsilon` parameters, with the calibration-driven Wanda
+// upgrade (ApplyAttentionHeadWandaPruning, see this file's own "Wanda
+// calibration" section and structured_pruning_entry.h's own declaration
+// comment) -- mirroring pruning.py's own apply_attention_head_wanda_pruning,
+// the calibrated upgrade of apply_attention_head_pruning below it. Three
+// fused self-attention ops are matched, each at the granularity its own
+// kernel contract allows -- see pruning.py's own
 // "Attention-head pruning" section comment for the full rationale (packed-
 // QKV vs. separate-Q/K/V weight layout, individual-head vs. whole-KV-group
 // pruning unit, and why the plain ai.onnx::Attention op reuses the
@@ -5063,12 +5067,27 @@ struct AppliedAttn {
 };
 
 // Applies whole-head pruning to one matched com.microsoft::Attention block
-// in place -- mirrors pruning.py's own _apply_one_plain_attention_chain
-// (data-free/magnitude importance only; the Wanda variant's importance
-// callback indirection is not ported, see this section's own scope note).
+// in place -- mirrors pruning.py's own _apply_one_plain_attention_chain.
+// `act_norm`/`epsilon` mirror ApplyChains' own trailing parameters of the
+// same name exactly (see that function's own doc comment): when `act_norm`
+// is non-null and holds an entry for `chain.consumer_node->input(0)` (the
+// output projection's own input -- the same probe point
+// ApplyAttentionHeadWandaPruning's own `probe_axis` map uses) whose length
+// matches `chain.nv` (the merged QKV weight's own V-width, i.e. this
+// activation's own channel count), each head's plain Frobenius-norm weight
+// importance is multiplied by that head's own combined (root-sum-square)
+// activation norm -- mirrors pruning.py's own
+// `_wanda_attention_head_importance` exactly, including its fallback to
+// plain `base` (left untouched) whenever no matching activation was
+// observed. `nullptr` (the default, and every plain ApplyAttentionChains
+// call site's own unchanged argument count) keeps this identically the
+// plain ``||W||_F``-only ranking it always was.
 std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
     std::unordered_map<std::string, onnx::TensorProto*>& init_map,
-    AttnChain& chain, double sparsity) {
+    AttnChain& chain, double sparsity,
+    const std::unordered_map<std::string, std::vector<double>>* act_norm =
+        nullptr,
+    double epsilon = 1e-8) {
   const int64_t h = chain.num_heads;
   const int64_t keep_count =
       std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
@@ -5101,6 +5120,26 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
       }
     }
     importance[static_cast<size_t>(hh)] = std::sqrt(sq);
+  }
+
+  // Wanda upgrade: multiply each head's plain ||W||_F by its own combined
+  // (root-sum-square) V-width-wide slice of the calibrated output-
+  // projection input activation -- mirrors pruning.py's own
+  // `_wanda_attention_head_importance` exactly (see this function's own
+  // doc comment above).
+  if (act_norm != nullptr) {
+    auto it = act_norm->find(chain.consumer_node->input(0));
+    if (it != act_norm->end() &&
+        it->second.size() == static_cast<size_t>(chain.nv)) {
+      for (int64_t hh = 0; hh < h; ++hh) {
+        double sq = 0.0;
+        for (int64_t c = hh * dv; c < (hh + 1) * dv; ++c) {
+          const double v = it->second[static_cast<size_t>(c)];
+          sq += v * v;
+        }
+        importance[static_cast<size_t>(hh)] *= std::max(std::sqrt(sq), epsilon);
+      }
+    }
   }
 
   std::vector<int64_t> keep_heads =
@@ -5170,10 +5209,30 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
 
 // Applies whole-KV-group pruning to one matched GroupQueryAttention or
 // plain ai.onnx::Attention block in place -- mirrors pruning.py's own
-// _apply_one_gqa_chain (data-free/magnitude importance only).
+// _apply_one_gqa_chain. `act_norm`/`epsilon` mirror
+// ApplyOnePlainAttentionChain's own trailing parameters of the same name
+// exactly (see that function's own doc comment): when `act_norm` is
+// non-null and holds an entry for `chain.consumer_node->input(0)` whose
+// length matches `chain.num_heads * chain.head_size` (this C++ port's
+// Q/K/V-uniform-head_size scope, see AttnChain's own `head_size` field --
+// the output projection's own input width, laid out per *query* head),
+// each KV group's plain Frobenius-norm weight importance is multiplied by
+// that group's own combined (root-sum-square) activation norm, summed
+// over every query head the group owns -- mirrors pruning.py's own
+// `_wanda_gqa_group_importance` exactly (there keyed by `chain.v_head_size`,
+// which pruning.py's own separate Q/K vs. V head-size support can genuinely
+// differ from `chain.head_size`; this port declines that shape entirely,
+// see FindGqaChains'/FindOnnxAttentionChains' own uniform-head_size
+// requirement, so `chain.head_size` alone is exact here), including its
+// fallback to plain `base` (left untouched) whenever no matching activation
+// was observed. `nullptr` (the default) keeps this identically the plain
+// ``||W||_F``-only ranking it always was.
 std::optional<AppliedAttn> ApplyOneGqaChain(
     std::unordered_map<std::string, onnx::TensorProto*>& init_map,
-    AttnChain& chain, double sparsity) {
+    AttnChain& chain, double sparsity,
+    const std::unordered_map<std::string, std::vector<double>>* act_norm =
+        nullptr,
+    double epsilon = 1e-8) {
   const int64_t h = chain.kv_num_heads;
   const int64_t keep_count =
       std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
@@ -5236,6 +5295,27 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
     importance[static_cast<size_t>(kv)] = std::sqrt(sq);
   }
 
+  // Wanda upgrade: multiply each KV group's plain ||W||_F by its own
+  // combined (root-sum-square) slice of the calibrated output-projection
+  // input activation, summed over every query head the group owns --
+  // mirrors pruning.py's own `_wanda_gqa_group_importance` exactly (see
+  // this function's own doc comment above).
+  if (act_norm != nullptr) {
+    auto it = act_norm->find(chain.consumer_node->input(0));
+    if (it != act_norm->end() &&
+        it->second.size() == static_cast<size_t>(chain.num_heads * d)) {
+      for (int64_t kv = 0; kv < chain.kv_num_heads; ++kv) {
+        double sq = 0.0;
+        for (int64_t c = kv * group_size * d; c < (kv + 1) * group_size * d;
+             ++c) {
+          const double v = it->second[static_cast<size_t>(c)];
+          sq += v * v;
+        }
+        importance[static_cast<size_t>(kv)] *= std::max(std::sqrt(sq), epsilon);
+      }
+    }
+  }
+
   std::vector<int64_t> keep_groups =
       TopKIndicesAscending(importance, keep_count);
   std::vector<int64_t> keep_q_heads;
@@ -5293,8 +5373,15 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
 // Shared body dispatching each chain to ApplyOnePlainAttentionChain or
 // ApplyOneGqaChain, mirroring pruning.py's own _apply_attention_chains
 // (cross-chain touched-role bookkeeping, stale value_info cleanup).
-void ApplyAttentionChains(onnx::GraphProto* graph,
-                          std::vector<AttnChain>& chains, double sparsity) {
+// `act_norm`/`epsilon`, defaulted to nullptr/1e-8 so every plain
+// ApplyAttentionHeadPruning call site is unchanged, are threaded straight
+// through to both -- see either's own doc comment for what they do; this
+// dispatcher itself has no importance computation of its own to touch.
+void ApplyAttentionChains(
+    onnx::GraphProto* graph, std::vector<AttnChain>& chains, double sparsity,
+    const std::unordered_map<std::string, std::vector<double>>* act_norm =
+        nullptr,
+    double epsilon = 1e-8) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
@@ -5322,8 +5409,9 @@ void ApplyAttentionChains(onnx::GraphProto* graph,
 
     std::optional<AppliedAttn> applied =
         chain.kind == AttnChainKind::kGqaLike
-            ? ApplyOneGqaChain(init_map, chain, sparsity)
-            : ApplyOnePlainAttentionChain(init_map, chain, sparsity);
+            ? ApplyOneGqaChain(init_map, chain, sparsity, act_norm, epsilon)
+            : ApplyOnePlainAttentionChain(init_map, chain, sparsity, act_norm,
+                                          epsilon);
     if (!applied) {
       continue;
     }
@@ -17135,6 +17223,71 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
       ApplyMatMulNBitsQkvChains(graph, matmul_nbits_qkv_chains, sparsity);
     }
   }
+  return out;
+}
+
+// The calibration-driven (Wanda-style) upgrade of ApplyAttentionHeadPruning
+// -- see structured_pruning_entry.h's own ApplyAttentionHeadWandaPruning
+// declaration comment for the full design (chain-finding scope, the
+// calibration-crossing convention shared with ApplyStructuredWandaPruning,
+// and how the resulting `act_norm` map threads into
+// ApplyOnePlainAttentionChain/ApplyOneGqaChain's own existing importance
+// computation). Mirrors pruning.py's own apply_attention_head_wanda_pruning.
+onnx::ModelProto ApplyAttentionHeadWandaPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity, double epsilon) {
+  if (!(sparsity >= 0.0 && sparsity < 1.0)) {
+    throw std::invalid_argument(
+        "ApplyAttentionHeadWandaPruning: sparsity must be in [0, 1), got " +
+        std::to_string(sparsity));
+  }
+  onnx::ModelProto out = model;
+
+  // NOT subgraph-aware -- mirrors pruning.py's own
+  // apply_attention_head_wanda_pruning, which likewise only ever matches
+  // and prunes `out.graph` directly, never `_iter_subgraphs` (see
+  // structured_pruning_entry.h's own declaration comment, and
+  // ApplyStructuredWandaPruning's own identical scope decision above, for
+  // why: calibration_data batches are keyed to the top-level graph's own
+  // inputs).
+  onnx::GraphProto* graph = out.mutable_graph();
+
+  // Same chain-finding as ApplyAttentionHeadPruning's own three matched
+  // families -- deliberately excluding the fused `MatMulNBitsQkv` variant
+  // that function additionally handles, since pruning.py's own
+  // apply_attention_head_wanda_pruning has no quantized-weight counterpart
+  // either (see structured_pruning_entry.h's own declaration comment).
+  std::vector<AttnChain> chains = FindAttentionChains(graph);
+  std::vector<AttnChain> gqa_chains = FindGqaChains(graph);
+  std::vector<AttnChain> onnx_attn_chains = FindOnnxAttentionChains(graph);
+  chains.insert(chains.end(), std::make_move_iterator(gqa_chains.begin()),
+                std::make_move_iterator(gqa_chains.end()));
+  chains.insert(chains.end(), std::make_move_iterator(onnx_attn_chains.begin()),
+                std::make_move_iterator(onnx_attn_chains.end()));
+
+  if (chains.empty()) {
+    return out;  // Mirrors pruning.py's own early return.
+  }
+
+  // Every chain's own output-projection probe point -- always axis -1
+  // (never a Conv channel axis 1, unlike ApplyStructuredWandaPruning's own
+  // `probe_axis`): WalkToAttentionConsumer only ever matches a
+  // MatMul/vanilla-Gemm consumer (MatchMatMulLikeRaw), never a Conv, for
+  // every one of the three attention chain families above. Mirrors
+  // pruning.py's own `probe_names = {chain.consumer_node.input[0] for
+  // chain in chains}` in `_wanda_attention_calibration_stats` (there
+  // implicitly axis -1 too, via `reduce_axes = range(x.ndim - 1)`).
+  std::unordered_map<std::string, int64_t> probe_axis;
+  for (const auto& chain : chains) {
+    probe_axis[chain.consumer_node->input(0)] = -1;
+  }
+
+  const std::unordered_map<std::string, std::vector<double>> act_norm =
+      WandaCalibrationStats(executor, out, probe_axis, calibration_data);
+
+  ApplyAttentionChains(graph, chains, sparsity, &act_norm, epsilon);
   return out;
 }
 

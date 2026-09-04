@@ -191,3 +191,54 @@ onnx::ModelProto ApplyStructuredWandaPruning(
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
         calibration_data,
     double sparsity, double epsilon = 1e-8);
+
+// The calibration-driven (Wanda-style) upgrade of ApplyAttentionHeadPruning
+// -- same relationship, and same reused pattern, as
+// ApplyStructuredWandaPruning is to ApplyStructuredPruning above. Mirrors
+// pruning.py's own apply_attention_head_wanda_pruning: same chain finding
+// as ApplyAttentionHeadPruning's own three matched families
+// (FindAttentionChains/FindGqaChains/FindOnnxAttentionChains) --
+// deliberately NOT the fused `com.microsoft::MatMulNBitsQkv` variant
+// ApplyAttentionHeadPruning additionally handles (via
+// FindMatMulNBitsQkvChains/ApplyMatMulNBitsQkvChains), since pruning.py's
+// own apply_attention_head_wanda_pruning has no quantized-weight
+// counterpart either -- but each matched block's head (or, for
+// GroupQueryAttention/plain ai.onnx::Attention, whole-KV-group) importance
+// is ``||W||_F * ||X||_2`` -- the existing plain Frobenius-norm weight
+// score times the combined (root-sum-square) L2 norm of that unit's own
+// slice of the *calibrated* output-projection input activation -- rather
+// than weight magnitude alone. See structured_pruning_entry.cpp's own
+// "Wanda calibration" section comment (WandaCalibrationStats, reused
+// as-is here: the attention output-projection's own input, at probe axis
+// -1, is exactly the same "probe name -> per-channel activation L2 norm"
+// shape that helper already produces for ApplyStructuredWandaPruning) for:
+//   - the calibration-crossing design (unchanged from
+//     ApplyStructuredWandaPruning -- same `calibration_data` shape, same
+//     name -> ModelExecutor::Run-positional reordering), and
+//   - how the resulting per-channel activation-norm map threads into
+//     ApplyOnePlainAttentionChain/ApplyOneGqaChain's existing per-head/
+//     per-group importance computation (new optional trailing parameters
+//     on each, and on the ApplyAttentionChains dispatcher between them,
+//     defaulted to nullptr so every ApplyAttentionHeadPruning call site is
+//     unchanged) rather than duplicating the ranking/top-k/slicing logic.
+//
+// Unlike ApplyAttentionHeadPruning, this is NOT subgraph-aware (mirrors
+// pruning.py's own apply_attention_head_wanda_pruning, which likewise
+// never calls `_iter_subgraphs` and only ever prunes `model.graph`
+// directly) -- same reasoning as ApplyStructuredWandaPruning's own
+// declaration comment above: calibration_data batches are keyed to the
+// top-level graph's own inputs, and a nested subgraph body has no
+// standalone way to be Run at all.
+//
+// A `calibration_data` batch missing one of `model`'s own graph inputs
+// throws `std::invalid_argument` (see ApplyStructuredWandaPruning's own
+// declaration comment). An otherwise-empty `calibration_data` (or one
+// where every batch's probed activation never resolves) makes every
+// matched block fall back to ApplyAttentionHeadPruning's own plain
+// ``||W||_F`` ranking, exactly mirroring pruning.py's own per-block "no
+// matching activation observed" fallback.
+onnx::ModelProto ApplyAttentionHeadWandaPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity, double epsilon = 1e-8);

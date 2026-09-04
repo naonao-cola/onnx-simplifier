@@ -671,6 +671,33 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "sparsity"_a);
 
+  // The calibration-driven (Wanda-style) upgrade of
+  // apply_attention_head_pruning above -- same executor-as-first-argument
+  // shape, and the same `calibration_data` (List[Dict[str,
+  // onnx.TensorProto]]) crossing convention, as apply_structured_wanda_
+  // pruning's own binding above (see that binding's own comment for the
+  // full calibration-crossing design). See ApplyAttentionHeadWandaPruning
+  // in structured_pruning_entry.h.
+  m.def(
+      "apply_attention_head_wanda_pruning",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double sparsity, double epsilon) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyAttentionHeadWandaPruning(
+            model, *executor, calibration_data, sparsity, epsilon);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
+      "epsilon"_a = 1e-8);
+
   // MoE expert-intermediate-channel pruning: removes intermediate
   // (`inter_size`) channels from every expert of a matched
   // `com.microsoft::MoE` node at once -- real structural pruning, data-free.

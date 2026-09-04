@@ -1492,11 +1492,9 @@ def apply_attention_head_pruning_cpp(
     neither kernel has a way to keep a KV head alive for some, but not all,
     of the query heads that shared it.
 
-    Unlike the pure-Python :func:`onnxsim.apply_attention_head_pruning`,
-    this port does not include the calibration-driven Wanda variant
-    (:func:`onnxsim.apply_attention_head_wanda_pruning`) -- data-free/
-    magnitude importance only, matching this codebase's C++-port scope
-    decision.
+    The calibration-driven Wanda upgrade of this same matching/ranking
+    (mirroring the pure-Python :func:`onnxsim.apply_attention_head_wanda_pruning`)
+    is :func:`onnxsim.apply_attention_head_wanda_pruning_cpp`.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
@@ -1519,6 +1517,97 @@ def apply_attention_head_pruning_cpp(
         model = onnx.load(model, load_external_data=False)
     return onnx.load_from_string(
         C.apply_attention_head_pruning(model.SerializeToString(), sparsity)
+    )
+
+
+def apply_attention_head_wanda_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    epsilon: float = 1e-8,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_attention_head_wanda_pruning`:
+    the calibrated upgrade of :func:`onnxsim.apply_attention_head_pruning_cpp`,
+    exactly as :func:`onnxsim.apply_structured_wanda_pruning_cpp` is to
+    :func:`onnxsim.apply_structured_pruning_cpp` -- same real
+    :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed calibration
+    machinery (see that function's own docstring for the general pattern),
+    applied to attention-head pruning instead of plain structured pruning.
+
+    Same real head (or, for ``GroupQueryAttention``/plain ``ai.onnx::Attention``,
+    whole-KV-group) removal and topology matching as
+    :func:`onnxsim.apply_attention_head_pruning_cpp` (a matched
+    ``com.microsoft::Attention``, ``com.microsoft::GroupQueryAttention``, or
+    plain ``ai.onnx::Attention`` block whose output feeds, optionally through
+    a single shape-preserving ``Reshape``, exactly one downstream
+    MatMul/vanilla-Gemm's reduction dimension -- see that function's own
+    docstring for the full topology and per-block-kind removal details), but
+    each unit's importance is ``||W||_F * ||X||_2`` -- the plain
+    Frobenius-norm weight score times the combined (root-sum-square)
+    activation norm of that unit's own slice of the *output projection's*
+    input, captured over calibration data -- instead of weight magnitude
+    alone. For a plain ``com.microsoft::Attention`` block this is per head,
+    exactly as before; for a ``GroupQueryAttention``/plain
+    ``ai.onnx::Attention`` block the activation norm is combined
+    (root-sum-square) over every query head a KV group owns, mirroring how
+    the plain weight importance is already combined across that group's own
+    Q+K+V producers.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to measure each
+            block's output-projection-side activation norm on. Each batch
+            is a ``{input_name: np.ndarray}`` dict matching ``model``'s
+            graph inputs -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: target fraction of each matched block's heads (or, for
+            GroupQueryAttention/plain ai.onnx Attention, KV groups) to
+            remove (at least one is always kept); must be in ``[0, 1)``
+    :param epsilon: floor applied to the accumulated per-unit activation
+            norm, avoiding every unit of an all-zero activation tying at
+            exactly the weight-only importance
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations (passed to the shared
+            :func:`onnxsim.onnx_simplifier._get_model_executor` process-wide
+            executor, the same one :func:`onnxsim.simplify` itself uses)
+    :returns: ``model`` with every matched block's tensors resized in place;
+            anything not matching that exact topology falls back to
+            :func:`onnxsim.apply_attention_head_pruning_cpp`'s own plain
+            Frobenius-norm ranking if no matching activation was ever
+            observed for that block's consumer (including whenever
+            ``calibration_data`` is empty)
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_structured_wanda_pruning_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_attention_head_wanda_pruning(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            sparsity,
+            epsilon,
+        )
     )
 
 

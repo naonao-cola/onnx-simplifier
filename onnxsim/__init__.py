@@ -63,6 +63,7 @@ from onnxsim.nf4 import NF4_CODEBOOK, quantize_weight_only_nf4
 from onnxsim.omniquant import apply_omniquant
 from onnxsim.onnx_simplifier import (
     apply_attention_head_pruning_cpp,
+    apply_attention_head_wanda_pruning_cpp,
     apply_double_quantization_cpp,
     apply_embedding_vocab_magnitude_pruning_cpp,
     apply_embedding_vocab_pruning_cpp,
@@ -215,6 +216,7 @@ __all__ = [
     "apply_attention_head_pruning",
     "apply_attention_head_pruning_cpp",
     "apply_attention_head_wanda_pruning",
+    "apply_attention_head_wanda_pruning_cpp",
     "apply_moe_expert_channel_pruning",
     "apply_moe_expert_channel_pruning_cpp",
     "apply_moe_whole_expert_pruning",
