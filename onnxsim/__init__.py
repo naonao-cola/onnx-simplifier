@@ -93,6 +93,7 @@ from onnxsim.optimize_pipeline import (
     apply_optimization_pipeline,
 )
 from onnxsim.ort_matmul_nbits_workaround import workaround_ort_matmul_nbits_axis0_bug
+from onnxsim.outlier_suppression import apply_outlier_suppression
 from onnxsim.outlier_suppression_plus import apply_outlier_suppression_plus
 from onnxsim.owq import apply_owq
 from onnxsim.precision_estimator import (
@@ -168,6 +169,7 @@ __all__ = [
     "apply_smoothquant",
     "apply_rptq_reorder",
     "apply_outlier_suppression_plus",
+    "apply_outlier_suppression",
     "apply_llm_int8",
     "apply_low_rank_compensation",
     "apply_mixed_precision_quantization",
