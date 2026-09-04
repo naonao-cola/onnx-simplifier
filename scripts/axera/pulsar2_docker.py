@@ -27,6 +27,42 @@ build then writes a standard Chrome Trace Event Format `trace.json` under
 optimized quantized graph to `<output_dir>/frontend/
 optimized_quant_axmodel.onnx` (open in Netron) so trace task labels can be
 matched back to op names. See `README.md`'s "Real NPU profiling" section.
+
+**`llm_build()`**: wraps `pulsar2 llm_build`, confirmed real end-to-end
+against `Qwen/Qwen3-0.6B` (a real HF checkpoint) on this same toolchain +
+AX650N. Unlike `build()`, this does **not** take an ONNX model at all --
+`--input_path` is a raw HuggingFace checkpoint directory (`*.safetensors` or
+`pytorch_model.bin` + `config.json`), and there is no ONNX step anywhere in
+the pipeline: the public `ax-llm-build` project
+(https://github.com/AXERA-TECH/ax-llm-build) that Pulsar2's own docs point
+to for this workflow contains no model-tracing/export code at all, only
+per-architecture config JSONs and small pre/post-processing shell/Python
+helpers around the actual (closed-source) `pulsar2 llm_build` call. So
+**onnxsim has no direct integration point in this ingestion path** -- there
+is no ONNX graph to simplify or quantize before Pulsar2 ever sees it.
+
+Also note the CLI surface differs from Pulsar2's own V7.0 docs, which
+document a `llm_build2` subcommand with `--max_context`/
+`--prefill_step_size`/`--decode_step_size`: the `pulsar2:6.0-lite` image
+this was verified against only has `llm_build` (no "2"), with
+`--kv_cache_len` instead of those three flags -- `llm_build()`'s defaults
+match this confirmed real v6.0 surface, not the newer docs.
+
+Confirmed real output shape (`Qwen3-0.6B`, `--chip AX650 --prefill_len 512`):
+one `<name>_p<prefill_len>_l<N>_together.axmodel` per transformer layer (28
+for this model) plus one `<name>_post.axmodel` (the LM head). Each per-layer
+file is **two** `neu mode` nodes in one graph, not one -- `subgraph_npu_0`
+(decode, batch-1 shapes) and `subgraph_npu_1` (prefill, `prefill_len`-batch
+shapes), both sharing the same `npu_params` initializer and each with
+explicit `K_cache`/`V_cache` graph inputs *and* `K_cache_out`/`V_cache_out`
+outputs -- the KV cache is passed as ordinary graph tensors the host runtime
+(`ax-llm`/`axllm`) persists between calls, not hidden inside the compiled
+blob. `pulsar2_ops.has_out_of_band_npu_data()`/`missing_npu_data()` (see
+that module's docstring) already generalize correctly to this two-node
+shape with no changes needed -- verified: `onnxsim.simplify()` corrupts a
+real per-layer `.axmodel` the same way it does the CNN case (3 initializers
+-> 0). Both a decode-shaped layer and the post model ran successfully on the
+real AX650N via `axcl_run_model` (~1.5ms and ~9ms respectively).
 """
 
 from __future__ import annotations
@@ -39,7 +75,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
 DEFAULT_IMAGE = "pulsar2:6.0-lite"
@@ -289,6 +325,105 @@ def build(
         fused_subgraphs=int(fuse_match.group(1)) if fuse_match else None,
         trace_path=trace_path,
         frontend_graph_path=frontend_graph_path,
+        stdout_tail=log[-2000:],
+    )
+
+
+@dataclass
+class LLMBuildResult:
+    success: bool
+    output_dir: Optional[str] = None
+    layer_axmodels: List[str] = field(default_factory=list)
+    embed_files: List[str] = field(default_factory=list)
+    post_axmodel: Optional[str] = None
+    error: Optional[str] = None
+    stdout_tail: str = ""
+
+
+def llm_build(
+    work_dir: str,
+    hf_checkpoint_rel_path: str,
+    output_rel_dir: str,
+    *,
+    hidden_state_type: str = "bf16",
+    weight_type: str = "s8",
+    prefill_len: int = 512,
+    kv_cache_len: int = 1023,
+    chip: str = "AX650",
+    parallel: int = 8,
+    image: str = DEFAULT_IMAGE,
+    timeout: int = 3600,
+) -> LLMBuildResult:
+    """Run a real `pulsar2 llm_build` in Docker on a HuggingFace checkpoint.
+
+    See this module's docstring for the confirmed real facts this wraps:
+    `hf_checkpoint_rel_path` (relative to `work_dir`, mounted at `/data`) is
+    a raw HF checkpoint directory, not an ONNX model or a `pulsar2 build`
+    config -- there is no config.json equivalent here, Pulsar2 reads the
+    checkpoint's own `config.json` directly. `weight_type="s8"` matches
+    Pulsar2's own default (its built-in quantization, not
+    `pulsar2_quantizer.py` -- onnxsim has no role in this path).
+
+    Confirmed real timing: ~7-8 minutes for a 0.6B model with `parallel=8`
+    on a 32-core host.
+    """
+    if not docker_image_available(image):
+        return LLMBuildResult(success=False, error=f"docker image not loaded: {image}")
+
+    output_abs_dir = os.path.join(work_dir, output_rel_dir)
+    if os.path.exists(output_abs_dir):
+        force_rmtree(output_abs_dir, work_dir, image)
+
+    cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{work_dir}:/data",
+        image,
+        "pulsar2",
+        "llm_build",
+        "--input_path",
+        hf_checkpoint_rel_path,
+        "--output_path",
+        output_rel_dir,
+        "--hidden_state_type",
+        hidden_state_type,
+        "--weight_type",
+        weight_type,
+        "--prefill_len",
+        str(prefill_len),
+        "--kv_cache_len",
+        str(kv_cache_len),
+        "--chip",
+        chip,
+        "--parallel",
+        str(parallel),
+    ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return LLMBuildResult(
+            success=False, error=f"pulsar2 llm_build timed out after {timeout}s"
+        )
+
+    log = proc.stdout + proc.stderr
+    if proc.returncode != 0:
+        return LLMBuildResult(success=False, error=log[-2000:], stdout_tail=log[-2000:])
+
+    layer_axmodels = sorted(
+        glob.glob(os.path.join(output_abs_dir, "*_l*_together.axmodel"))
+    )
+    post_hits = glob.glob(os.path.join(output_abs_dir, "*_post.axmodel"))
+    embed_files = sorted(glob.glob(os.path.join(output_abs_dir, "*embed_tokens*")))
+
+    return LLMBuildResult(
+        success=bool(layer_axmodels) and bool(post_hits),
+        output_dir=output_abs_dir,
+        layer_axmodels=layer_axmodels,
+        embed_files=embed_files,
+        post_axmodel=post_hits[0] if post_hits else None,
         stdout_tail=log[-2000:],
     )
 

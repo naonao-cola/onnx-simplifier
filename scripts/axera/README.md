@@ -190,6 +190,54 @@ latency). **Automated**: `convert_onnxmodelzoo.py --profile` passes this
 through automatically (see below); see Pulsar2's own docs
 (`other_tools/profiling.html`) for the full trace-UI reference.
 
+## LLMs: a separate pipeline onnxsim has no hook into
+
+**Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
+checkpoint + the real AX650N): Axera compiles LLMs through a **completely
+different** subcommand, `pulsar2 llm_build` (Pulsar2's newer docs call it
+`llm_build2` with a slightly different flag set -- v6.0 only has
+`llm_build`; see `pulsar2_docker.llm_build()`'s docstring for the exact
+confirmed flags). This is *not* a variant of `pulsar2 build` with an LLM
+config -- **`--input_path` is a raw HuggingFace checkpoint directory**
+(`*.safetensors`/`pytorch_model.bin` + `config.json`), not an ONNX model.
+There is no ONNX step anywhere in this pipeline: the public `ax-llm-build`
+project (github.com/AXERA-TECH/ax-llm-build) that Pulsar2's own docs point
+to for this workflow contains no model-tracing/export code at all, only
+per-architecture config JSONs and small pre/post-processing helper scripts
+around the actual (closed-source) `pulsar2 llm_build` call.
+
+**So onnxsim has no direct integration point in Axera's LLM ingestion
+path** -- there is no ONNX graph for `onnxsim.simplify()` or any of
+onnxsim's GPTQ/AWQ/NF4/`auto_quantize_int4`-family quantizers to act on
+before Pulsar2 ever sees the model. `pulsar2 llm_build`'s own
+`--weight_type` (`s8` by default, `s4` available) is Pulsar2's own built-in
+weight quantization -- unrelated to, and not replaceable by,
+`pulsar2_quantizer.py`.
+
+What *is* confirmed and now supported by this harness:
+
+- `pulsar2_docker.llm_build()` wraps the real command. Verified against
+  `Qwen/Qwen3-0.6B`: ~7-8 minutes end to end on a 32-core host with
+  `--parallel 8`, producing one `<name>_p<prefill_len>_l<N>_together.axmodel`
+  per transformer layer (28 for this model) plus one `<name>_post.axmodel`
+  (the LM head) -- confirming the original handoff notes' guess that LLMs
+  compile to "a directory of small, structurally similar single-block
+  graphs," not one big graph.
+- Each per-layer file has **two** `neu mode` nodes, not one: a decode
+  subgraph (batch-1 shapes) and a prefill subgraph (`prefill_len`-batch
+  shapes), sharing one `npu_params` initializer, each with explicit
+  `K_cache`/`V_cache` graph inputs *and* `*_out` outputs -- the KV cache is
+  ordinary graph tensors the host runtime (`ax-llm`/`axllm`) persists
+  between calls, not something hidden inside the compiled blob.
+- `pulsar2_ops.py`'s corruption detectors (`has_out_of_band_npu_data()`/
+  `missing_npu_data()`) already handle multiple NPU nodes per graph
+  correctly with no changes needed. Verified: `onnxsim.simplify()` corrupts
+  a real per-layer LLM `.axmodel` the exact same way as the CNN case (3
+  initializers -> 0). `models.axera_llm_layer_leaf()` reproduces this shape
+  in CI without needing hardware or a real LLM download.
+- A per-layer file and the post model both ran successfully on the real
+  AX650N via `axcl_run_model` (~1.5ms and ~9ms respectively).
+
 ## Real Docker + device conversion driver
 
 `pulsar2_docker.py` and `convert_onnxmodelzoo.py` turn the manual
@@ -242,13 +290,13 @@ the tensor). `pulsar2_docker.run_on_device_with_input()` already does this.
 | `pulsar2_ops.py` | the heuristics and confirmed data: `AX650_SUPPORTED_OPS`/`AX650_MIN_OPSET` (the real, docs-scraped AX650 op list), `CPU_ONLY_OPS` (generic cross-vendor guess), the confirmed `AXERA_NPU_OP_TYPE = "neu mode"` marker, `referenced_const_data_keys()`/`missing_npu_data()`/`has_out_of_band_npu_data()` (the corruption detector), and non-standard-`domain` detection as a fallback for vendor blobs that don't follow Axera's exact convention. |
 | `pulsar2_backend.py` | thin wrapper around `pulsar2_ops.py`: `coverage()`, `new_blocking_op_types()`, `stripped_npu_data()`, `unsafe_for_simplify()`, `ax650_build_risks()`. Shaped like the sibling `*_backend.py` modules for interface symmetry (`PULSAR2_AVAILABLE` is always `True` -- there's no external dependency to be missing). |
 | `inspect_axmodel.py` | standalone CLI for a **real** `.axmodel` file: loads it with `onnx.load()`, then reports non-standard-domain nodes, op types outside the model's declared opset, and suspiciously large raw attributes -- what originally found the `neu mode` node in the real YOLOv8 file. |
-| `models.py` | the shared `scripts/common/synthetic_models.py` suite plus `axera_npu_compiled_leaf`, a synthetic reproduction of the real `neu mode` node shape (no real device needed to exercise the corruption check in CI). |
+| `models.py` | the shared `scripts/common/synthetic_models.py` suite plus `axera_npu_compiled_leaf` (real CNN `neu mode` node shape) and `axera_llm_layer_leaf` (real per-layer LLM shape: two `neu mode` nodes sharing one initializer) -- no real device needed to exercise the corruption check in CI. |
 | `pulsar2_quantizer.py` | `quantize_like_pulsar2()`: a thin wrapper over `onnxsim.quantize_static(method="minmax")`, which already matches Pulsar2's real numeric convention (U8 asymmetric activations, S8 per-channel weights, MinMax calibration). `PULSAR2_QUANTIZER_AVAILABLE` reflects `onnxruntime`'s availability (onnxsim's quantizer needs it internally, imported lazily). |
 | `pulsar2_simulator.py` | `partition()`/`coverage()` (real `AX650_SUPPORTED_OPS` membership, no dependency beyond `onnx`) and `simulate()` (fp32-vs-INT8 estimate via `pulsar2_quantizer.py` + onnxruntime's CPU EP). Validated against real hardware -- see above. |
 | `worker.py` | runs the check for one model in an isolated subprocess, printing one `__RESULT__<json>` line. |
 | `run_pulsar2_compat.py` | drives the suite, writes a CSV, and exits non-zero on any regression. No `--require-*` flag or `skipped` status -- unlike the EP harnesses, this needs no vendor package or device, so it always runs. Entry point for `axera-integration.yml`'s `pulsar2-compat` job (stock runner, no Docker/device). |
 | `screen_onnxmodelzoo.py` | fast, static, Docker/device-free screening of `onnxmodelzoo` models via `pulsar2_simulator`/`pulsar2_backend.ax650_build_risks()` -- run this first. |
-| `pulsar2_docker.py` | real `pulsar2 build` (Docker) + `axcl_run_model` (device) wrapper: `build()` (with `profile=` for `trace.json`), `run_on_device()`, `run_on_device_with_input()`, `force_rmtree()`. Manual/local-only -- needs a loaded Docker image. |
+| `pulsar2_docker.py` | real `pulsar2 build` (Docker) + `axcl_run_model` (device) wrapper: `build()` (with `profile=` for `trace.json`), `llm_build()` (the separate, ONNX-free `pulsar2 llm_build` LLM path -- see above), `run_on_device()`, `run_on_device_with_input()`, `force_rmtree()`. Manual/local-only -- needs a loaded Docker image. |
 | `convert_onnxmodelzoo.py` | batch driver over `pulsar2_docker.py`: fetch -> onnxsim -> real `pulsar2 build` (orig + simplified, `--profile` optional) -> optional on-device bit-exact diff -> CSV. Entry point for `axera-integration.yml`'s `pulsar2-docker-convert` job -- like `amd-integration.yml`'s MIGraphX check, that job is `workflow_dispatch`-only and targets a `[self-hosted, axcl]` runner this repository doesn't provision, so it's dormant until one exists. |
 
 ## Running locally

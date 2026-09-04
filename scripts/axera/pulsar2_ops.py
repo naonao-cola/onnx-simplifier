@@ -84,6 +84,46 @@ toolchain + a real AX650N, converting two real `onnxmodelzoo` models:
   CPU/NPU partitioning happened. So an op outside `AX650_SUPPORTED_OPS` is
   not just "less NPU-friendly," it can make `pulsar2 build` refuse the model
   outright -- confirmed for `LRN`, not verified for every other absent op.
+
+**Update: LLMs, resolving the handoff notes' §3.** `pulsar2 build` (this
+module's focus so far) is not how Axera compiles LLMs at all -- that's a
+completely separate subcommand, `pulsar2 llm_build` (the real `pulsar2:
+6.0-lite` toolchain's name; Pulsar2's own newer docs describe a
+`llm_build2` with a slightly different flag set, e.g.
+`--max_context`/`--prefill_step_size` instead of `--kv_cache_len` -- v6.0
+only has `llm_build`). Confirmed by actually running it, on a real
+`Qwen/Qwen3-0.6B` checkpoint through the real toolchain, then on the real
+AX650N (see `pulsar2_docker.llm_build()`'s docstring for the full
+command/timing):
+
+- **`--input_path` is a raw HuggingFace checkpoint directory**
+  (`*.safetensors`/`pytorch_model.bin` + `config.json`) -- there is no ONNX
+  step anywhere in this pipeline. The public `ax-llm-build` project Pulsar2's
+  docs point to for this workflow (github.com/AXERA-TECH/ax-llm-build)
+  contains no model-tracing/export code at all, only per-architecture config
+  JSONs and small helper scripts around the actual (closed-source)
+  `pulsar2 llm_build` call. **onnxsim has no direct integration point in
+  this ingestion path** -- there is no ONNX graph for it to simplify or
+  quantize before Pulsar2 ever sees the model. `-w`/`--weight_type` (default
+  `s8`) is Pulsar2's *own* built-in weight quantization, entirely separate
+  from `pulsar2_quantizer.py`.
+- Output is **one compiled `.axmodel` per transformer layer** (28 for this
+  0.6B model) plus one `_post.axmodel` (the LM head) -- confirming the
+  handoff notes' guess that LLMs are "a directory of small, structurally
+  similar single-block graphs," not one big graph.
+- Each per-layer file has **two** `AXERA_NPU_OP_TYPE` nodes, not one: a
+  decode subgraph (batch-1 shapes) and a prefill subgraph
+  (`prefill_len`-batch shapes), both sharing one `npu_params` initializer.
+  Both also carry explicit `K_cache`/`V_cache` graph inputs *and*
+  `K_cache_out`/`V_cache_out` outputs -- the KV cache is ordinary graph
+  tensors the host runtime persists between calls, not something opaque
+  inside the compiled blob. `npu_subgraph_nodes()`/`has_out_of_band_npu_data()`/
+  `missing_npu_data()` below already handle multiple NPU nodes per graph
+  correctly with no changes needed -- verified: `onnxsim.simplify()`
+  corrupts a real per-layer `.axmodel` the same way as the CNN case (3
+  initializers -> 0).
+- Both a per-layer file and the post model ran successfully on the real
+  AX650N via `axcl_run_model` (~1.5ms and ~9ms respectively).
 """
 
 from __future__ import annotations
