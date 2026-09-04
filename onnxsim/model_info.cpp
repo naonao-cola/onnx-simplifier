@@ -389,6 +389,16 @@ ModelInfo GetModelInfo(const onnx::ModelProto& model,
   info.model_size = static_cast<int64_t>(model.graph().ByteSizeLong()) +
                     ExternalDataSize(model.graph());
 
+  const GraphView view = GetGraphView(model, run_shape_inference);
+  const Metrics metrics = onnxsim::ComputeMetrics(view);
+  info.macs = metrics.macs;
+  info.mem_access = metrics.mem_access;
+  info.memory_footprint = onnxsim::PeakMemoryFootprint(view);
+  return info;
+}
+
+onnxsim::GraphView GetGraphView(const onnx::ModelProto& model,
+                                bool run_shape_inference) {
   // The compute/memory metrics need tensor shapes. By default run shape
   // inference on a copy (it mutates in place). Best-effort: if it throws (e.g.
   // models > 2GB), fall back to whatever value_info the model already carries
@@ -405,12 +415,7 @@ ModelInfo GetModelInfo(const onnx::ModelProto& model,
     }
     graph = &inferred.graph();
   }
-  const GraphView view = BuildGraphView(*graph, ShapeMap{}, DTypeMap{});
-  const Metrics metrics = onnxsim::ComputeMetrics(view);
-  info.macs = metrics.macs;
-  info.mem_access = metrics.mem_access;
-  info.memory_footprint = onnxsim::PeakMemoryFootprint(view);
-  return info;
+  return BuildGraphView(*graph, ShapeMap{}, DTypeMap{});
 }
 
 std::string FormatSimplifyingInfo(const onnx::ModelProto& model_ori,

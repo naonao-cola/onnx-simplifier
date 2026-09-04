@@ -27,6 +27,7 @@
 #include "custom_optimizer_passes.h"
 #include "dlpack_bridge.h"
 #include "function_rewriter.h"
+#include "memory_planning.h"
 #include "model_info.h"
 #include "onnx/defs/schema.h"
 #include "onnx/defs/shape_inference.h"
@@ -360,6 +361,28 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return std::make_tuple(info.op_nums, info.model_size,
                                to_poly(info.macs), to_poly(info.mem_access),
                                to_poly(info.memory_footprint));
+      },
+      "model_bytes"_a, "run_shape_inference"_a = true);
+
+  // Compute a static activation-memory plan (see memory_planning.h): a byte
+  // offset for every tensor whose size is concretely known, packed into one
+  // shared arena by reusing space from tensors whose liveness has ended.
+  // Returned as (offsets, arena_bytes, naive_bytes, unplanned) so the Python
+  // ``memory_planning`` module can wrap it in a ``MemoryPlan`` dataclass,
+  // mirroring how ``_model_metrics`` hands its polynomials back to
+  // ``model_info`` for the sympy rebuild.
+  m.def(
+      "_memory_plan",
+      [](const py::bytes& model_bytes, bool run_shape_inference) {
+        onnx::ModelProto model;
+        onnx::ParseProtoFromBytes(&model, model_bytes.c_str(),
+                                  model_bytes.size());
+        const onnxsim::GraphView view =
+            GetGraphView(model, run_shape_inference);
+        const onnxsim::MemoryPlan plan =
+            onnxsim::ComputeActivationMemoryPlan(view);
+        return std::make_tuple(plan.offsets, plan.arena_bytes,
+                               plan.naive_bytes, plan.unplanned);
       },
       "model_bytes"_a, "run_shape_inference"_a = true);
 
