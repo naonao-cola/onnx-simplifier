@@ -14143,6 +14143,73 @@ def apply_structured_pruning_matmul_bnb4(
 # have no `attention_bias`/`attn_mask`-equivalent input on their own
 # schemas at all (see their own matcher docstrings above), so neither is
 # touched by any of this.
+#
+# `com.microsoft::PackedAttention`/`com.microsoft::PackedMultiHeadAttention`
+# -- ONNX Runtime's own "packing mode" fusion
+# (`onnxruntime.transformers.convert_to_packing_mode`, read directly from the
+# installed `onnxruntime` wheel, not merely a survey of its docs) for
+# padding-removal in BERT/encoder-style serving: real sequences of differing
+# length in one batch are compacted into one padding-free tensor (via a
+# `RemovePadding` node upstream, restored via `RestorePadding` downstream),
+# with `token_offset`/`cumulative_sequence_length` replacing the batch/
+# sequence-length shape convention plain `Attention`/`MultiHeadAttention`
+# rely on. Both were a real, confirmed gap (zero references anywhere in this
+# module before this addition; a hand-built `PackedAttention`/
+# `PackedMultiHeadAttention` repro run through `apply_attention_head_pruning`
+# left its weights completely untouched, byte-identical before/after).
+#
+# `PackedAttention` is built by ONNX Runtime's own
+# `PackingAttention._replace_attention_with_packing_attention` from an
+# `Attention` node's own `input`/`weights`/`bias` (indices 0/1/2, copied
+# verbatim -- never resliced or reshaped) plus two new inputs at indices 3/4
+# (`token_offset`/`cumulative_sequence_length`, replacing `Attention`'s own
+# `mask_index`/`past` at those same two positions), with `attention_bias`
+# keeping `Attention`'s own index, 5 -- confirmed directly off the live
+# schema dump (`onnxruntime.capi.onnxruntime_pybind11_state
+# .get_all_operator_schema()`), not merely inferred from the tool source.
+# Every input/attribute this module actually touches sits at the identical
+# position/name `Attention` already uses, so this is folded straight into
+# :func:`_match_attention_producer`'s existing op_type check -- a minimal,
+# "free" extension in the same spirit as `QuickGelu` joining
+# `_UNARY_PASS_THROUGH`, not new machinery -- rather than a dedicated matcher
+# function.
+#
+# `PackedMultiHeadAttention` is built the same way from a
+# `MultiHeadAttention` node's own `query`/`key`/`value`/`bias` (indices
+# 0/1/2/3, copied verbatim) plus `token_offset`/`cumulative_sequence_length`
+# at indices 4/5. Here the weight-relevant inputs line up with
+# `MultiHeadAttention`'s own identically (same `combined_bias_input_index`,
+# 3), but `attention_bias` genuinely does **not** keep its `MultiHeadAttention`
+# index: it moves from 5 to **6**, since `MultiHeadAttention`'s single
+# `key_padding_mask` input (index 4) is replaced by *two* inputs here, not
+# one -- confirmed both off the live schema dump and off
+# `PackingMultiHeadAttention._replace_attention_with_packing_attention`'s own
+# literal ``inputs=[...]`` list. This is exactly the same shape of genuine
+# positional divergence that already earns `DecoderMaskedMultiHeadAttention`
+# its own dedicated matcher function (see that function's own docstring) --
+# so `PackedMultiHeadAttention` gets one too
+# (:func:`_match_packed_multi_head_attention_producer`/
+# :func:`_find_packed_mha_chains`) rather than widening
+# :func:`_match_multi_head_attention_producer`'s own op_type check, and
+# `_apply_one_gqa_chain`'s own `mask_idx`/`past_kv_indices` dispatch tables
+# gained a fourth/fifth branch (`is_packed_mha`) alongside `is_mha`/
+# `is_dmmha`. This op's own schema has no `past_key`/`past_value` pair at
+# all (packing mode is a padding-removal serving optimization for
+# encoder-style, non-incremental-decode attention -- there is no KV cache to
+# speak of), so `past_kv_indices` is empty for it, the same "nothing here"
+# treatment `PagedAttention`/`LinearAttention` already get.
+#
+# Neither op has a CPU kernel in this environment (confirmed via a real
+# `onnxruntime.InferenceSession` load for each: `NOT_IMPLEMENTED`, the same
+# outcome `DecoderMaskedSelfAttention` already gets here) and no CUDA
+# execution provider is available either (`onnxruntime.get_available_providers()`
+# lists only `CPUExecutionProvider`/`AzureExecutionProvider`), so neither can
+# be correctness-checked end to end the way this module's kernel-backed op
+# families are -- `tests/test_pruning.py`'s own "PackedAttention"/
+# "PackedMultiHeadAttention" subsections fall back to shape assertions plus a
+# manual-head-deletion numpy oracle instead, the same fallback
+# `DecoderMaskedSelfAttention`'s own tests already use for the identical
+# reason.
 _ATTENTION_DOMAIN = "com.microsoft"
 
 # The three quantized-cache dtypes `GroupQueryAttention`'s own `T_CACHE` type
@@ -14389,10 +14456,41 @@ def _match_attention_producer(
       graph-level `RotaryEmbedding`) was confirmed. `do_rotary=0` (the
       schema default, and the only value ever actually exercised here)
       matches unconditionally, same as `Attention` itself.
+
+    ``com.microsoft::PackedAttention`` (schema confirmed live the same way,
+    ``since_version`` 1) is ONNX Runtime's own packing-mode fusion target for
+    `Attention` -- the real, shipped
+    `onnxruntime.transformers.convert_to_packing_mode.PackingAttention
+    ._replace_attention_with_packing_attention` rewrite (source read directly
+    from the installed `onnxruntime` wheel) builds it from an `Attention`
+    node's own `input`/`weights`/`bias` (indices 0/1/2, copied verbatim, no
+    reslicing of any kind) plus two new inputs, `token_offset`/
+    `cumulative_sequence_length` (indices 3/4 -- replacing `Attention`'s own
+    `mask_index`/`past` at those same two positions), and copies over exactly
+    `Attention`'s own `num_heads`/`qkv_hidden_sizes`/`scale` attributes
+    unchanged. `attention_bias` keeps `Attention`'s own index, 5 -- confirmed
+    directly off the live schema dump, not assumed from the op's shared
+    ancestry -- so this function degenerates to the exact same code path
+    `Attention` itself already takes: `is_dmsa` is `False` for it (it has no
+    `past`/`do_rotary`/schema-absent-`qkv_hidden_sizes` quirks of its own --
+    those are `DecoderMaskedSelfAttention`-only), so indices 3/4
+    (`token_offset`/`cumulative_sequence_length` for this op, `mask_index`/
+    `past` for plain `Attention`) are, exactly as for plain `Attention`,
+    never inspected by this function at all -- both are, per this op's own
+    schema doc, packing-mode bookkeeping tensors (`token_offset` shaped
+    `(batch_size, sequence_length)`, `cumulative_sequence_length` shaped
+    `(batch_size + 1)`) with no `num_heads`-sized axis anywhere, so pruning
+    correctly leaves them completely untouched. No CPU kernel exists for this
+    op in this environment (confirmed via a real
+    `onnxruntime.InferenceSession` load: `NOT_IMPLEMENTED`), so its
+    correctness here is established by shape + a manual-head-deletion oracle
+    rather than an end-to-end execution comparison -- see
+    ``tests/test_pruning.py``'s own "PackedAttention" subsection.
     """
     if node.domain != _ATTENTION_DOMAIN or node.op_type not in (
         "Attention",
         "DecoderMaskedSelfAttention",
+        "PackedAttention",
     ):
         return None
     is_dmsa = node.op_type == "DecoderMaskedSelfAttention"
@@ -15021,6 +15119,92 @@ def _match_multi_head_attention_producer(
 
     if not _past_kv_constants_are_sliceable(node, initializer_map, (6, 7), num_heads):
         return None
+
+    return num_heads, num_heads
+
+
+def _match_packed_multi_head_attention_producer(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    value_info_by_name: Dict[str, onnx.ValueInfoProto],
+) -> Optional[Tuple[int, int]]:
+    """If `node` is a ``com.microsoft::PackedMultiHeadAttention`` node this
+    module can safely act on, returns ``(num_heads, num_heads)`` -- the same
+    shape :func:`_match_multi_head_attention_producer` returns for
+    `MultiHeadAttention`: this op's own schema (confirmed live the same way,
+    ``since_version`` 1) has exactly one head-count attribute, `num_heads`,
+    no separate `kv_num_heads`.
+
+    This is ONNX Runtime's own packing-mode fusion target for
+    `MultiHeadAttention` -- the real, shipped
+    `onnxruntime.transformers.convert_to_packing_mode.PackingMultiHeadAttention
+    ._replace_attention_with_packing_attention` rewrite (source read directly
+    from the installed `onnxruntime` wheel) builds it from a
+    `MultiHeadAttention` node's own `query`/`key`/`value`/`bias` (indices
+    0/1/2/3, copied verbatim) plus two new inputs, `token_offset`/
+    `cumulative_sequence_length` (indices 4/5), and copies over exactly
+    `MultiHeadAttention`'s own `num_heads`/`mask_filter_value`/`scale`
+    attributes unchanged.
+
+    Unlike `PackedAttention` (whose own `attention_bias` keeps `Attention`'s
+    identical index 5 -- see :func:`_match_attention_producer`'s own
+    docstring), `attention_bias` genuinely moves here: index **6**, not
+    `MultiHeadAttention`'s own 5 (confirmed directly off the live schema
+    dump, and independently off `_replace_attention_with_packing_attention`'s
+    own literal ``inputs=[...]`` list, which builds exactly this layout by
+    hand) -- `MultiHeadAttention`'s single `key_padding_mask` input (index 4)
+    is replaced by *two* inputs here (`token_offset`/
+    `cumulative_sequence_length`), pushing every input after it one position
+    later. This is exactly the same shape of genuine positional difference
+    :func:`_match_decoder_masked_multi_head_attention_producer`'s own
+    docstring gives for why it, too, gets its own dedicated matcher function
+    rather than widening :func:`_match_multi_head_attention_producer`'s own
+    op_type check the way :func:`_match_attention_producer` does for
+    `PackedAttention`/`DecoderMaskedSelfAttention` (whose own input positions
+    genuinely do coincide).
+
+    This op's own schema has no `past_key`/`past_value`/`present_key`/
+    `present_value` inputs or outputs at all (confirmed off the same live
+    schema dump) -- packing mode is a padding-removal serving optimization
+    for encoder-style (non-incremental-decode) attention, so there is no
+    KV-cache pair here for :func:`_past_kv_constants_are_sliceable` to guard,
+    unlike `MultiHeadAttention` itself.
+
+    `key`/`value` (indices 1/2) are required non-empty here, excluding this
+    op's own alternate "packed qkv" calling convention (`query` alone
+    carrying a packed, rank-4 ``(token_count, num_heads, 3, head_size)``
+    tensor, per this op's own schema doc) -- the identical exclusion
+    :func:`_match_multi_head_attention_producer`'s own docstring gives for
+    `MultiHeadAttention`'s analogous alternate convention, for the same
+    reason: a different tensor layout this function doesn't attempt to
+    slice.
+
+    No CPU kernel exists for this op in this environment (confirmed via a
+    real `onnxruntime.InferenceSession` load: `NOT_IMPLEMENTED`), so its
+    correctness here is established by shape + a manual-head-deletion oracle
+    rather than an end-to-end execution comparison -- see
+    ``tests/test_pruning.py``'s own "PackedMultiHeadAttention" subsection.
+    :func:`_apply_one_gqa_chain` performs the actual slice(s) of both
+    `attention_bias` and every producer/consumer weight once a match
+    succeeds.
+    """
+    if node.domain != _ATTENTION_DOMAIN or node.op_type != "PackedMultiHeadAttention":
+        return None
+    if len(node.input) < 3 or not (node.input[0] and node.input[1] and node.input[2]):
+        return None
+
+    num_heads = None
+    for attr in node.attribute:
+        if attr.name == "num_heads":
+            num_heads = attr.i
+    if not num_heads or num_heads <= 0:
+        return None
+
+    if len(node.input) > 6 and node.input[6]:  # attention_bias
+        if not _head_bias_input_is_safe(
+            node, 6, initializer_map, value_info_by_name, num_heads
+        ):
+            return None  # doesn't statically resolve -- decline rather than guess
 
     return num_heads, num_heads
 
@@ -16972,12 +17156,14 @@ def _find_separate_qkv_chains(
     allow it; see :class:`_GQAChain`'s own `v_head_size` field), whether the
     matched node itself owns one combined ``[nq + nk + nv]``-shaped Q+K+V
     bias on one of its own inputs (`combined_bias_input_index` -- ``None``,
-    the default, for every op but `MultiHeadAttention`, whose own `bias`
-    input's index, 3, :func:`_find_mha_chains` passes -- see
-    :class:`_GQAChain`'s own `mha_bias` field and this module's "Attention-head
-    pruning" section comment for why this is a genuinely different shape
-    from every other bias this function already threads through
-    `producer_infos` below), and whether the matched node owns a paired
+    the default, for every op but `MultiHeadAttention`/
+    `PackedMultiHeadAttention`, whose own `bias` input sits at the identical
+    index, 3, for both (:func:`_find_mha_chains`/:func:`_find_packed_mha_chains`
+    each pass it) -- see :class:`_GQAChain`'s own `mha_bias` field and this
+    module's "Attention-head pruning" section comment for why this is a
+    genuinely different shape from every other bias this function already
+    threads through `producer_infos` below), and whether the matched node
+    owns a paired
     `q_norm_weight`/`k_norm_weight` input pair requiring a deferred
     exact-``(head_size,)``-shape check once `head_size` is known
     (`qk_norm_weight_indices` -- ``None`` for every op but `PagedAttention`,
@@ -17001,7 +17187,8 @@ def _find_separate_qkv_chains(
     matcher whose own op owns a per-head `attention_bias`/`attn_mask` input
     (`_match_gqa_producer`/`_match_onnx_attention_producer`/
     `_match_multi_head_attention_producer`/
-    `_match_decoder_masked_multi_head_attention_producer`) can classify a
+    `_match_decoder_masked_multi_head_attention_producer`/
+    `_match_packed_multi_head_attention_producer`) can classify a
     *dynamic* one's declared shape (:func:`_head_bias_input_is_safe`);
     `_match_paged_attention_producer`/`_match_linear_attention_producer`
     accept and ignore it (neither op has such an input at all). Defaults to
@@ -17332,6 +17519,41 @@ def _find_mha_chains(
     return _find_separate_qkv_chains(
         graph,
         _match_multi_head_attention_producer,
+        "num_heads",
+        value_info_by_name,
+        allow_differing_v_head_size=True,
+        combined_bias_input_index=3,
+    )
+
+
+def _find_packed_mha_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_GQAChain]:
+    """The ``com.microsoft::PackedMultiHeadAttention`` analogue of
+    :func:`_find_mha_chains` -- see :func:`_find_separate_qkv_chains` (the
+    shared body) and :func:`_match_packed_multi_head_attention_producer`
+    (what's matched and why it's declined otherwise, including the full
+    empirical schema/tool-source investigation this whole function was built
+    from). Passes ``allow_differing_v_head_size=True``, mirroring
+    `MultiHeadAttention`'s own (empirically confirmed) value -- this op's own
+    schema doc gives `value` an independent `v_hidden_size`, the identical
+    wording `MultiHeadAttention`'s own schema uses, and every other input this
+    op owns is `MultiHeadAttention`'s own verbatim (see that function's own
+    docstring) -- but unlike `MultiHeadAttention`'s own confirmation, this one
+    is *not* independently execution-verified: no CPU kernel exists for this
+    op in this environment (confirmed via a real
+    `onnxruntime.InferenceSession` load), so there is no way to run the
+    differing-V-head-size repro this module's other matchers use to confirm
+    their own analogous choice. ``combined_bias_input_index=3`` -- this op's
+    own `bias` input, the same index `MultiHeadAttention`'s own bias sits at
+    (unlike `attention_bias`, `bias` does *not* move -- see
+    :func:`_match_packed_multi_head_attention_producer`'s own docstring for
+    exactly which inputs shift and which don't).
+    """
+    return _find_separate_qkv_chains(
+        graph,
+        _match_packed_multi_head_attention_producer,
         "num_heads",
         value_info_by_name,
         allow_differing_v_head_size=True,
@@ -17965,6 +18187,18 @@ def _apply_one_gqa_chain(
         chain.node.domain == _ATTENTION_DOMAIN
         and chain.node.op_type == "DecoderMaskedMultiHeadAttention"
     )
+    # `PackedMultiHeadAttention`'s own schema has no `past_key`/`past_value`
+    # inputs (or `present_key`/`present_value` outputs) at all -- packing
+    # mode is a padding-removal serving optimization for encoder-style,
+    # non-incremental-decode attention, so there is no KV cache here the way
+    # `MultiHeadAttention` itself has (see
+    # :func:`_match_packed_multi_head_attention_producer`'s own docstring) --
+    # `past_kv_indices` is simply empty for it, same reasoning as
+    # `PagedAttention`/`LinearAttention` below.
+    is_packed_mha = (
+        chain.node.domain == _ATTENTION_DOMAIN
+        and chain.node.op_type == "PackedMultiHeadAttention"
+    )
     # `PagedAttention`'s own `key_cache`/`value_cache` (indices 3/4) are
     # never sliced at all -- already confirmed, at match time, to always be
     # dynamic whenever this op matches in the first place (a constant one
@@ -17995,7 +18229,7 @@ def _apply_one_gqa_chain(
         else (5, 6)
         if is_dmmha
         else ()
-        if is_paged or is_linear_attention
+        if is_paged or is_linear_attention or is_packed_mha
         else (4, 5)
     )
     for idx in past_kv_indices:
@@ -18085,10 +18319,12 @@ def _apply_one_gqa_chain(
 
     # `attention_bias`/`attn_mask` (index 10 for `GroupQueryAttention`, 3
     # for the plain ai.onnx op, 5 for `MultiHeadAttention`, 4 for
-    # `DecoderMaskedMultiHeadAttention` -- see `_match_gqa_producer`'s,
-    # `_match_onnx_attention_producer`'s, `_match_multi_head_attention_producer`'s,
-    # and :func:`_match_decoder_masked_multi_head_attention_producer`'s own
-    # docstrings) is handled by :func:`_slice_or_gather_head_bias` along its
+    # `DecoderMaskedMultiHeadAttention`, 6 for `PackedMultiHeadAttention` --
+    # see `_match_gqa_producer`'s, `_match_onnx_attention_producer`'s,
+    # `_match_multi_head_attention_producer`'s,
+    # :func:`_match_decoder_masked_multi_head_attention_producer`'s, and
+    # :func:`_match_packed_multi_head_attention_producer`'s own docstrings)
+    # is handled by :func:`_slice_or_gather_head_bias` along its
     # own head axis by `keep_q_heads` -- *query*-head granularity, not
     # `keep_groups`'s kv-group one -- whenever `_head_bias_axis`/
     # :func:`_dynamic_head_bias_axis` resolves it to a genuine per-head
@@ -18114,6 +18350,8 @@ def _apply_one_gqa_chain(
         if is_mha
         else 4
         if is_dmmha
+        else 6
+        if is_packed_mha
         else None
         if is_paged or is_linear_attention or is_sparse_attention
         else 3
@@ -18426,6 +18664,7 @@ def apply_attention_head_pruning(
         *_find_gqa_chains(graph, value_info_by_name),
         *_find_onnx_attention_chains(graph, value_info_by_name),
         *_find_mha_chains(graph, value_info_by_name),
+        *_find_packed_mha_chains(graph, value_info_by_name),
         *_find_decoder_masked_mha_chains(graph, value_info_by_name),
         *_find_paged_attention_chains(graph, value_info_by_name),
         *_find_linear_attention_chains(graph, value_info_by_name),
@@ -18582,6 +18821,7 @@ def apply_attention_head_wanda_pruning(
         *_find_gqa_chains(graph, value_info_by_name),
         *_find_onnx_attention_chains(graph, value_info_by_name),
         *_find_mha_chains(graph, value_info_by_name),
+        *_find_packed_mha_chains(graph, value_info_by_name),
         *_find_decoder_masked_mha_chains(graph, value_info_by_name),
         *_find_paged_attention_chains(graph, value_info_by_name),
         *_find_linear_attention_chains(graph, value_info_by_name),
@@ -28394,6 +28634,8 @@ def _attention_not_eligible(
                     "PagedAttention",
                     "DecoderMaskedSelfAttention",
                     "DecoderMaskedMultiHeadAttention",
+                    "PackedAttention",
+                    "PackedMultiHeadAttention",
                     "SparseAttention",
                 )
                 and node.domain == _ATTENTION_DOMAIN
@@ -28452,18 +28694,20 @@ def _analyze_attention_chains(
             # `GroupQueryAttention` itself supports, so it gets its own
             # `"_group"`-suffixed family string rather than sharing
             # `MultiHeadAttention`'s own `"_head"` one.
-            # `DecoderMaskedMultiHeadAttention` is ONNX Runtime's own
-            # in-place decode-time rewrite target for `MultiHeadAttention`
-            # (see this module's own "Attention-head pruning" section
-            # comment) -- same one-head-per-group granularity
-            # (`chain.kv_num_heads == chain.num_heads` always for it too,
-            # confirmed off its own schema the same way), so it shares
-            # `MultiHeadAttention`'s own family string rather than getting a
-            # distinct one: the reporting granularity is genuinely
-            # identical, not merely similarly named.
+            # `DecoderMaskedMultiHeadAttention`/`PackedMultiHeadAttention` are
+            # ONNX Runtime's own in-place decode-time rewrite / packing-mode
+            # fusion targets for `MultiHeadAttention` (see this module's own
+            # "Attention-head pruning" section comment) -- same
+            # one-head-per-group granularity (`chain.kv_num_heads ==
+            # chain.num_heads` always for both too, confirmed off their own
+            # schemas the same way), so both share `MultiHeadAttention`'s own
+            # family string rather than getting a distinct one: the
+            # reporting granularity is genuinely identical, not merely
+            # similarly named.
             if chain.node.op_type in (
                 "MultiHeadAttention",
                 "DecoderMaskedMultiHeadAttention",
+                "PackedMultiHeadAttention",
             ):
                 family = "attention_mha_head"
             elif chain.node.op_type == "PagedAttention":
@@ -28608,6 +28852,7 @@ def _analyze_attention_head_pruning(
         *_find_gqa_chains(graph, value_info_by_name),
         *_find_onnx_attention_chains(graph, value_info_by_name),
         *_find_mha_chains(graph, value_info_by_name),
+        *_find_packed_mha_chains(graph, value_info_by_name),
         *_find_decoder_masked_mha_chains(graph, value_info_by_name),
         *_find_paged_attention_chains(graph, value_info_by_name),
         *_find_linear_attention_chains(graph, value_info_by_name),
@@ -28669,6 +28914,7 @@ def _analyze_attention_head_wanda_pruning(
         *_find_gqa_chains(graph, value_info_by_name),
         *_find_onnx_attention_chains(graph, value_info_by_name),
         *_find_mha_chains(graph, value_info_by_name),
+        *_find_packed_mha_chains(graph, value_info_by_name),
         *_find_decoder_masked_mha_chains(graph, value_info_by_name),
         *_find_paged_attention_chains(graph, value_info_by_name),
         *_find_linear_attention_chains(graph, value_info_by_name),
