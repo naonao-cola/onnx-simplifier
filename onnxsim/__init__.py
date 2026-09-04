@@ -9,6 +9,7 @@ from onnxsim.accuracy import (
     quantize_auto,
     recommend_quantization,
 )
+from onnxsim.adaquant import apply_adaquant
 from onnxsim.adaround import apply_adaround
 from onnxsim.aqlm import quantize_weight_only_aqlm
 from onnxsim.attention_quantization import apply_attention_quantization
@@ -146,6 +147,7 @@ __all__ = [
     "cross_layer_equalize",
     "correct_bias",
     "apply_adaround",
+    "apply_adaquant",
     "apply_pruning_finetune",
     "apply_autoround",
     "auto_quantize_int4",
