@@ -1315,6 +1315,24 @@ def apply_structured_pruning_cpp(
     self-attention op boundary, declines the *entire* group, never partially
     pruned.
 
+    Also prunes ``com.microsoft::MatMulNBits`` (block-quantized, weight-only
+    int4/int8) chains -- the plain (producer -> consumer) and gated
+    (SwiGLU/GeGLU) families only, a C++-port subset of
+    :func:`onnxsim.apply_structured_pruning_matmul_nbits` (its fused
+    ``MatMulNBitsMlp``/``MatMulNBitsQkv`` variants and ``MatMulBnb4`` are not
+    ported here). Either side of a matched chain may independently be a
+    ``MatMulNBits`` node or a plain-float MatMul/vanilla-Gemm peer (at least
+    one side must be ``MatMulNBits``); the producer's output channels are
+    ranked by L2 norm of their own DEQUANTIZED weight row (never written
+    back -- the actual rewrite always row/column-slices the existing packed
+    ``B``/``scales``/``zero_points`` codes in place, re-packing a nibble-
+    packed axis rather than ever re-quantizing a sliced float weight from
+    scratch), and -- only when the consumer is itself ``MatMulNBits`` --
+    that keep-set must land on whole ``block_size``-sized blocks of the
+    consumer's own quantized ``K`` axis, or the whole chain is left
+    untouched (an individual K-column can't be dropped without
+    re-quantizing its block, out of scope).
+
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
 
