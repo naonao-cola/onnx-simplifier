@@ -788,6 +788,40 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a);
 
+  // Transformer block (depth) pruning: drops whole redundant pre-norm
+  // transformer residual sub-blocks wholesale -- a GENUINELY DIFFERENT
+  // KIND of pass from every calibration-driven binding above (graph
+  // surgery: nodes deleted and consumers rewired, not tensors resized in
+  // place). Same executor-as-first-argument shape and `calibration_data`
+  // (List[Dict[str, onnx.TensorProto]]) crossing convention as
+  // apply_structured_wanda_pruning/apply_moe_whole_expert_pruning above.
+  // `num_blocks_to_drop` (Optional[int], via nanobind's std::optional
+  // caster -- same crossing already used for e.g. GQA head/kv-head
+  // overrides elsewhere in this file) takes priority over `sparsity` when
+  // given, mirroring pruning.py's own `apply_transformer_block_pruning`
+  // keyword-argument precedence exactly. See ApplyTransformerBlockPruning
+  // in structured_pruning_entry.h.
+  m.def(
+      "apply_transformer_block_pruning",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double sparsity,
+         std::optional<int64_t> num_blocks_to_drop) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyTransformerBlockPruning(
+            model, *executor, calibration_data, sparsity, num_blocks_to_drop);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
+      "num_blocks_to_drop"_a = std::nullopt);
+
   // Embedding vocabulary pruning: shrinks a matched token-embedding
   // table's vocabulary axis (plus, where a tied/untied lm_head exists, its
   // own vocab-logits projection too) down to a caller-supplied explicit

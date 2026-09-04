@@ -99,6 +99,14 @@
 // WandaCalibrationStats below is the one place in this file that actually
 // calls executor.Run().
 #include "onnxsim.h"
+// _InferShapes -- ApplyTransformerBlockPruning's own real onnx::shape_
+// inference pass, mirroring pruning.py's own `onnx.shape_inference.
+// infer_shapes(out, strict_mode=False)` call (see that function's own
+// docstring and TransformerBlockShapesMatch below for why this matters:
+// _shapes_match's correctness depends on the graph's own DECLARED
+// value_info being backed by real inference, not just whatever the input
+// model happened to carry).
+#include "partial_shape_eval.h"
 
 namespace {
 
@@ -17786,6 +17794,678 @@ MoeRouterGateCalibrationStats(
   return result;
 }
 
+// --- Transformer block (depth) pruning, mirroring pruning.py's own
+// "Transformer block (depth) pruning" section (search that name in
+// pruning.py) -----------------------------------------------------------
+//
+// A GENUINELY DIFFERENT KIND of pass from every chain family above (and
+// from WandaCalibrationStats/MoeRouterGateCalibrationStats immediately
+// above, which -- like this pass's own TransformerBlockSimilarity below --
+// only ever RANK candidates found by machinery that resizes tensors in
+// place): this one deletes whole NODES and rewires their consumers, i.e.
+// it changes the graph's own topology, not just a weight/activation
+// tensor's shape. See pruning.py's own section comment (immediately above
+// `_ENTRY_LN_OPS`) for the full, carefully-reasoned scope this mirrors
+// exactly:
+//   - the merge point is only ever a bare `Add` (IsEligibleAddMerge,
+//     reused unchanged -- never a fused SkipLayerNormalization-family node
+//     in that role, since such a node's own primary output is always the
+//     *normalized* sum, never a tensor that could stand in for x_out);
+//   - the entry norm accepts either a plain, unfused
+//     LayerNormalization/RMSNormalization/SimplifiedLayerNormalization
+//     node applied directly to x_in (IsEntryLnNode), OR a fused
+//     SkipLayerNormalization/SkipSimplifiedLayerNormalization node reached
+//     via its own primary output, whose optional FOURTH output
+//     (`input_skip_bias_sum`) equals x_in (IsFusedEntryLnNode) -- so a
+//     model already run through onnxruntime's own transformer optimizer
+//     (which fuses the *previous* block's own residual Add into the
+//     *next* block's own entry LayerNormalization) is matched too,
+//     provided THIS block's own merge is still a bare Add. Unlike a plain
+//     LN node (deleted -- its own input, x_in, is produced entirely
+//     outside the block), a matched fused entry-norm node is NEVER
+//     deleted: its own fourth output *is* x_in, and every rewired x_out
+//     consumer needs to keep reading it -- only its own primary
+//     (normalized) output loses its sole consumer and goes unread, which
+//     is harmless (a later simplification pass may notice and remove it;
+//     this pass has no need to);
+//   - attention and MLP/FFN blocks are matched and dropped fully
+//     independently of each other, never only as a paired "whole
+//     transformer layer" -- nothing in the graph structure requires
+//     pairing, and the backward walk below never needs to know or care
+//     what `F` (the sub-network between the entry norm and the merge) is;
+//   - a KV-cache-bearing attention block needs NO dedicated detection: it
+//     declines itself for free via the exact same generic "no
+//     block-internal node's own output may be read outside the block, or
+//     be a graph output" check every candidate is already held to (a real
+//     past_key/past_value-consuming attention op invariably exposes its
+//     own present_key/present_value as a SECOND graph output on the very
+//     node that reads LN(x_in), tripping that check outright).
+//
+// Selection reuses this file's own established calibration-probe
+// plumbing (WandaCalibrationStats/MoeRouterGateCalibrationStats' own
+// probe-injection/batch-iteration pattern -- append one bare graph output
+// per probe point, reorder each batch's own {name: TensorProto} map into
+// ModelExecutor::Run's positional contract), but accumulates a GENUINELY
+// DIFFERENT statistic of its own (TransformerBlockSimilarity, below): mean
+// cosine similarity between a candidate's own x_in and x_out, over every
+// token of every calibration batch -- the literature-standard
+// ("Block Influence"/ShortGPT-style) depth-pruning signal. A block whose
+// own output is already nearly identical to its input, over data the
+// model is meant to actually run on, contributes almost nothing beyond
+// the identity function and is the safest to drop first -- so the
+// HIGHEST-similarity candidates are the ones ApplyTransformerBlockPruning
+// drops first.
+
+// True if `node` is one of `LayerNormalization`/`RMSNormalization`/
+// `SimplifiedLayerNormalization` (all three confirmed, empirically -- see
+// pruning.py's own section comment -- to run under the default/empty ONNX
+// domain, not `com.microsoft`) applied directly to `x_in` -- exactly the
+// `LN(x_in)` boundary TryResolveDroppableBlock's own backward walk stops
+// at. Mirrors pruning.py's own `_is_entry_ln_node` exactly.
+bool IsEntryLnNode(const onnx::NodeProto& node, const std::string& x_in) {
+  if (node.domain() != "" || node.input_size() < 1 || node.input(0) != x_in) {
+    return false;
+  }
+  return node.op_type() == "LayerNormalization" ||
+         node.op_type() == "RMSNormalization" ||
+         node.op_type() == "SimplifiedLayerNormalization";
+}
+
+// True if `node` is a `com.microsoft::SkipLayerNormalization`/
+// `SkipSimplifiedLayerNormalization` node (IsSkipLayerNormOp, above)
+// reached, during the backward walk, via its own PRIMARY output `t` --
+// i.e. `t == node.output(0)`, the normalized value `F` actually reads --
+// and whose own optional FOURTH output, `input_skip_bias_sum` (present --
+// onnxruntime only ever materializes it when something downstream still
+// needs it -- and textually equal to `x_in`). Mirrors pruning.py's own
+// `_is_fused_entry_ln_node` exactly -- see that function's own docstring
+// (and this section's own comment above) for why the fourth output is the
+// correct `x_in` stand-in, and why `t == node.output(0)` specifically
+// (rather than a match reached via `mean`/`inv_std_var`, the op's other
+// two, in-practice-never-wired, optional outputs) is required.
+bool IsFusedEntryLnNode(const onnx::NodeProto& node, const std::string& x_in,
+                        const std::string& t) {
+  return IsSkipLayerNormOp(node) && node.output_size() >= 1 &&
+         node.output(0) == t && node.output_size() > 3 &&
+         !node.output(3).empty() && node.output(3) == x_in;
+}
+
+// One droppable-block candidate: `merge_node`'s own primary output is
+// `x_out`; every node strictly between `x_in` and `x_out` -- the entry
+// LN (unless it's a fused boundary node, see IsFusedEntryLnNode's own
+// comment above), every one of `F`'s own internal nodes, and `merge_node`
+// itself -- is `block_nodes`, already confirmed (by
+// TryResolveDroppableBlock) to have no consumer outside this set. Mirrors
+// pruning.py's own `_DroppableBlock` dataclass. `block_nodes` holds
+// pointers into the ORIGINAL, not-yet-mutated graph -- valid for as long
+// as no node is deleted from that graph (protobuf's RepeatedPtrField<
+// Message> individually heap-allocates each element, so appending further
+// nodes, e.g. CommitTransformerBlockDrops' own rewiring Identity nodes,
+// never invalidates a previously-taken NodeProto* into the same field;
+// only an actual deletion/Swap of the field itself does, which is why
+// deletion is always the LAST step, after every commit's own rewiring is
+// done -- see CommitTransformerBlockDrops below).
+struct DroppableBlock {
+  onnx::NodeProto* merge_node;
+  std::string x_in;
+  std::string x_out;
+  std::vector<onnx::NodeProto*> block_nodes;
+};
+
+// Attempts to resolve `merge_node` (an eligible Add, IsEligibleAddMerge)
+// as a droppable block boundary with `x_in` as its own identity/entry
+// operand and `other` (`merge_node`'s own *other* operand) as `F`'s own
+// final output. `nullopt` if any check fails -- this module's own
+// "decline outright, never guess" bar. Mirrors pruning.py's own
+// `_try_resolve_droppable_block` exactly -- see that function's own
+// docstring for the full reasoning behind each check (particularly why a
+// KV-cache-bearing attention block declines itself for free via the
+// generic "no leaked block-internal output" check below, with no
+// KV-cache-specific detection anywhere in this file).
+std::optional<DroppableBlock> TryResolveDroppableBlock(
+    onnx::NodeProto* merge_node, const std::string& x_in,
+    const std::string& other,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs) {
+  std::unordered_set<const onnx::NodeProto*> block_node_ids{merge_node};
+  std::vector<onnx::NodeProto*> block_nodes{merge_node};
+  // Fused entry-norm nodes matched via IsFusedEntryLnNode: kept out of
+  // block_node_ids/block_nodes (never deleted -- see this section's own
+  // comment above and IsFusedEntryLnNode's own docstring). Tracked
+  // separately so a second visit to the same node, via one of its other
+  // outputs, can neither re-add it to block_nodes nor be silently
+  // accepted as some other, contradictory role.
+  std::unordered_set<const onnx::NodeProto*> fused_boundary_ids;
+  bool found_entry_ln = false;
+  std::unordered_set<std::string> visited;
+  std::vector<std::string> frontier{other};
+  while (!frontier.empty()) {
+    std::string t = std::move(frontier.back());
+    frontier.pop_back();
+    if (visited.count(t)) {
+      continue;
+    }
+    visited.insert(t);
+    if (t == x_in) {
+      return std::nullopt;  // F reads x_in raw, bypassing every LN boundary.
+    }
+    auto node_it = node_by_output.find(t);
+    if (node_it == node_by_output.end()) {
+      continue;  // Graph input or initializer -- a leaf, not a problem.
+    }
+    onnx::NodeProto* node = node_it->second;
+    if (fused_boundary_ids.count(node)) {
+      continue;  // Already resolved as this block's own fused boundary.
+    }
+    if (IsEntryLnNode(*node, x_in)) {
+      found_entry_ln = true;
+      if (!block_node_ids.count(node)) {
+        block_node_ids.insert(node);
+        block_nodes.push_back(node);
+      }
+      continue;  // Boundary -- LN's own input (x_in) is not recursed into.
+    }
+    if (IsFusedEntryLnNode(*node, x_in, t)) {
+      if (block_node_ids.count(node)) {
+        // Already collected as ordinary block interior via one of this
+        // same node's OTHER outputs, before this visit discovered it's
+        // actually this block's own fused boundary -- irreconcilable (its
+        // own x_in-bearing output can't be both deleted and preserved),
+        // so decline rather than guess which role is right.
+        return std::nullopt;
+      }
+      found_entry_ln = true;
+      fused_boundary_ids.insert(node);
+      continue;  // Boundary -- preserved, not deleted, not recursed into.
+    }
+    if (!block_node_ids.count(node)) {
+      block_node_ids.insert(node);
+      block_nodes.push_back(node);
+    }
+    for (const auto& inp : node->input()) {
+      if (!inp.empty()) {
+        frontier.push_back(inp);
+      }
+    }
+  }
+  if (!found_entry_ln) {
+    return std::nullopt;
+  }
+
+  const std::string x_out = merge_node->output(0);
+  for (onnx::NodeProto* node : block_nodes) {
+    for (const auto& out_name : node->output()) {
+      if (out_name.empty()) {
+        continue;
+      }
+      if (node == merge_node && out_name == x_out) {
+        continue;  // x_out itself -- every consumer gets rewired below.
+      }
+      if (graph_outputs.count(out_name)) {
+        return std::nullopt;
+      }
+      auto cit = consumers_of.find(out_name);
+      if (cit != consumers_of.end()) {
+        for (onnx::NodeProto* c : cit->second) {
+          if (!block_node_ids.count(c)) {
+            return std::nullopt;
+          }
+        }
+      }
+    }
+  }
+
+  return DroppableBlock{merge_node, x_in, x_out, std::move(block_nodes)};
+}
+
+// One dimension of a tensor's own fully-known shape -- either a concrete
+// `dim_value` or a named `dim_param`, tagged so a `dim_value` of (say) 5
+// never spuriously compares equal to a `dim_param` literally named "5"
+// (mirrors pruning.py's own `Union[int, str]` per-dimension tuple entries,
+// where `5 == "5"` is already False in Python without any special-casing
+// needed).
+struct ShapeDimEntry {
+  bool has_param;
+  int64_t value = 0;
+  std::string param;
+  bool operator==(const ShapeDimEntry& o) const {
+    if (has_param != o.has_param) {
+      return false;
+    }
+    return has_param ? param == o.param : value == o.value;
+  }
+};
+
+// Every `ValueInfoProto` `graph` carries for its own tensors -- `input`,
+// `output`, and interior `value_info` -- keyed by tensor name. Mirrors
+// pruning.py's own `_value_info_by_name` exactly (see that function's own
+// docstring for why TransformerBlockShapesMatch's own correctness depends
+// on this being backed by REAL shape inference for the top-level graph --
+// see ApplyTransformerBlockPruning below).
+std::unordered_map<std::string, const onnx::TypeProto*>
+TransformerBlockValueInfoByName(const onnx::GraphProto& graph) {
+  std::unordered_map<std::string, const onnx::TypeProto*> type_map;
+  auto add = [&type_map](const onnx::ValueInfoProto& vi) {
+    if (vi.has_type()) {
+      type_map[vi.name()] = &vi.type();
+    }
+  };
+  for (const auto& vi : graph.value_info()) {
+    add(vi);
+  }
+  for (const auto& vi : graph.input()) {
+    add(vi);
+  }
+  for (const auto& vi : graph.output()) {
+    add(vi);
+  }
+  return type_map;
+}
+
+// The tensor's own fully-known shape -- one entry per dimension -- or
+// `nullopt` if the graph's own annotations don't state every dimension
+// (rank not statically known, or any one dimension neither a fixed value
+// nor a named symbolic one). Mirrors pruning.py's own
+// `_tensor_shape_dims` exactly.
+std::optional<std::vector<ShapeDimEntry>> TransformerBlockTensorShapeDims(
+    const std::string& name,
+    const std::unordered_map<std::string, const onnx::TypeProto*>& type_map) {
+  auto it = type_map.find(name);
+  if (it == type_map.end() || !it->second->has_tensor_type()) {
+    return std::nullopt;
+  }
+  const auto& tensor_type = it->second->tensor_type();
+  if (!tensor_type.has_shape()) {
+    return std::nullopt;
+  }
+  std::vector<ShapeDimEntry> dims;
+  for (const auto& d : tensor_type.shape().dim()) {
+    if (d.has_dim_value()) {
+      dims.push_back(ShapeDimEntry{false, d.dim_value(), ""});
+    } else if (d.has_dim_param() && !d.dim_param().empty()) {
+      dims.push_back(ShapeDimEntry{true, 0, d.dim_param()});
+    } else {
+      return std::nullopt;
+    }
+  }
+  return dims;
+}
+
+// True only when both `a` and `b` have a fully-known shape and the two
+// are identical, dimension for dimension -- what actually guards against
+// `merge_node`'s own Add having silently broadcast `x_in` up to a wider
+// `x_out`. An unknown shape on either side declines rather than assumes
+// equality. Mirrors pruning.py's own `_shapes_match` exactly.
+bool TransformerBlockShapesMatch(
+    const std::string& a, const std::string& b,
+    const std::unordered_map<std::string, const onnx::TypeProto*>& type_map) {
+  auto dims_a = TransformerBlockTensorShapeDims(a, type_map);
+  if (!dims_a.has_value()) {
+    return false;
+  }
+  auto dims_b = TransformerBlockTensorShapeDims(b, type_map);
+  return dims_a == dims_b;
+}
+
+// Every droppable-block candidate in `graph`: one per eligible Add merge
+// that TryResolveDroppableBlock confirms for exactly one operand ordering
+// (a DAG can never confirm both), and whose x_in/x_out shapes
+// TransformerBlockShapesMatch independently confirms identical. Mirrors
+// pruning.py's own `_find_transformer_block_candidates` exactly.
+std::vector<DroppableBlock> FindTransformerBlockCandidates(
+    onnx::GraphProto* graph,
+    const std::unordered_map<std::string, const onnx::TypeProto*>& type_map) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
+  for (auto& node : *graph->mutable_node()) {
+    for (const auto& out_name : node.output()) {
+      if (!out_name.empty()) {
+        node_by_output[out_name] = &node;
+      }
+    }
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+
+  std::vector<DroppableBlock> candidates;
+  for (auto& node : *graph->mutable_node()) {
+    if (!IsEligibleAddMerge(node, init_map)) {
+      continue;
+    }
+    const std::string p = node.input(0);
+    const std::string q = node.input(1);
+    const std::pair<std::string, std::string> orderings[2] = {{p, q}, {q, p}};
+    for (const auto& [x_in, other] : orderings) {
+      std::optional<DroppableBlock> block = TryResolveDroppableBlock(
+          &node, x_in, other, node_by_output, consumers_of, graph_outputs);
+      if (block.has_value()) {
+        if (TransformerBlockShapesMatch(block->x_in, block->x_out, type_map)) {
+          candidates.push_back(std::move(*block));
+        }
+        break;
+      }
+    }
+  }
+  return candidates;
+}
+
+// Mean cosine similarity between each candidate's own x_in and x_out,
+// over every token of every calibration batch -- the ranking signal
+// ApplyTransformerBlockPruning drops the HIGHEST-scoring (most redundant)
+// candidates by. Mirrors pruning.py's own `_transformer_block_similarity`
+// exactly: both tensors are probed in one shared executor pass (reusing
+// WandaCalibrationStats' own probe-injection/batch-iteration pattern --
+// see this section's own top comment -- NOT its per-channel-norm
+// accumulator, which this needs a genuinely different statistic from),
+// reshaped to `[-1, hidden]` so this works regardless of the model's own
+// batch/sequence-axis layout, cast to float64 the same way every
+// calibration statistic in this file already is. A token whose own x_in
+// or x_out norm is (numerically) zero is skipped for that token rather
+// than dividing by (near-)zero; a candidate with no valid token across
+// all of `calibration_data` gets `-infinity` (never the most-redundant
+// pick -- there is no evidence either way, so it is conservatively kept
+// rather than guessed to be droppable). Returns one similarity per
+// `candidates` entry, positionally.
+std::vector<double> TransformerBlockSimilarity(
+    const ModelExecutor& executor, const onnx::ModelProto& model,
+    const std::vector<DroppableBlock>& candidates,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data) {
+  std::vector<double> result(candidates.size(),
+                             -std::numeric_limits<double>::infinity());
+  if (candidates.empty()) {
+    return result;
+  }
+
+  std::set<std::string> probe_names;
+  for (const auto& c : candidates) {
+    probe_names.insert(c.x_in);
+    probe_names.insert(c.x_out);
+  }
+
+  onnx::ModelProto probe_model = model;
+  std::unordered_set<std::string> existing_outputs;
+  for (const auto& o : probe_model.graph().output()) {
+    existing_outputs.insert(o.name());
+  }
+  for (const auto& name : probe_names) {
+    if (existing_outputs.insert(name).second) {
+      probe_model.mutable_graph()->add_output()->set_name(name);
+    }
+  }
+  std::unordered_map<std::string, size_t> output_index;
+  for (int i = 0; i < probe_model.graph().output_size(); ++i) {
+    output_index.emplace(probe_model.graph().output(i).name(),
+                         static_cast<size_t>(i));
+  }
+  const auto& graph_inputs = probe_model.graph().input();
+
+  std::vector<double> sim_sum(candidates.size(), 0.0);
+  std::vector<int64_t> sim_count(candidates.size(), 0);
+
+  for (const auto& batch : calibration_data) {
+    // Reorder this batch's own {name: TensorProto} map into
+    // ModelExecutor::Run's positional contract -- see WandaCalibrationStats'
+    // own top comment, design decision (2).
+    std::vector<DLManagedTensorPtr> input_dls;
+    std::vector<const DLManagedTensor*> input_ptrs;
+    input_dls.reserve(static_cast<size_t>(graph_inputs.size()));
+    input_ptrs.reserve(static_cast<size_t>(graph_inputs.size()));
+    for (const auto& gi : graph_inputs) {
+      auto it = batch.find(gi.name());
+      if (it == batch.end()) {
+        throw std::invalid_argument(
+            "ApplyTransformerBlockPruning: calibration batch is missing "
+            "required graph input '" +
+            gi.name() + "'");
+      }
+      input_dls.emplace_back(
+          onnxsim::dlpack::FromTensorProtoBorrowing(it->second));
+      input_ptrs.push_back(input_dls.back().get());
+    }
+
+    std::vector<DLManagedTensorPtr> outputs =
+        executor.Run(probe_model, input_ptrs);
+
+    // Fetch every probe point's own tensor once per batch (shared between
+    // however many candidates each probe name feeds as either their own
+    // x_in or x_out).
+    std::unordered_map<std::string, onnx::TensorProto> probe_values;
+    for (const auto& name : probe_names) {
+      auto oit = output_index.find(name);
+      if (oit == output_index.end() || oit->second >= outputs.size()) {
+        continue;  // Defensive -- every probe name was added as an output
+                   // above.
+      }
+      const DLTensor& dl = outputs[oit->second]->dl_tensor;
+      onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
+      if (tp.data_type() != onnx::TensorProto::FLOAT) {
+        continue;  // Scope decision mirroring WandaCalibrationStats' own --
+                   // every chain this pass matches is itself FLOAT32-only
+                   // whenever the executor runs the real graph ops
+                   // faithfully.
+      }
+      probe_values.emplace(name, std::move(tp));
+    }
+
+    for (size_t idx = 0; idx < candidates.size(); ++idx) {
+      const DroppableBlock& c = candidates[idx];
+      auto ia = probe_values.find(c.x_in);
+      auto ib = probe_values.find(c.x_out);
+      if (ia == probe_values.end() || ib == probe_values.end()) {
+        continue;
+      }
+      const onnx::TensorProto& ta = ia->second;
+      const onnx::TensorProto& tb = ib->second;
+      const std::vector<int64_t> dims_a(ta.dims().begin(), ta.dims().end());
+      const std::vector<int64_t> dims_b(tb.dims().begin(), tb.dims().end());
+      if (dims_a != dims_b || dims_a.empty()) {
+        continue;  // Mirrors pruning.py's own `x_in.shape != x_out.shape
+                   // or x_in.ndim == 0`.
+      }
+      const int64_t hidden = dims_a.back();
+      if (hidden == 0) {
+        continue;
+      }
+      int64_t rows = 1;
+      for (size_t d = 0; d + 1 < dims_a.size(); ++d) {
+        rows *= dims_a[d];
+      }
+
+      const std::vector<float> a = ReadFloatTensor(ta);
+      const std::vector<float> b = ReadFloatTensor(tb);
+      if (static_cast<int64_t>(a.size()) != rows * hidden ||
+          static_cast<int64_t>(b.size()) != rows * hidden) {
+        continue;  // Defensive -- shouldn't happen for a real FLOAT tensor
+                   // whose own dims already agree with its element count.
+      }
+
+      for (int64_t r = 0; r < rows; ++r) {
+        const float* ra = a.data() + r * hidden;
+        const float* rb = b.data() + r * hidden;
+        double norm_a_sq = 0.0, norm_b_sq = 0.0, dot = 0.0;
+        for (int64_t k = 0; k < hidden; ++k) {
+          const double va = static_cast<double>(ra[k]);
+          const double vb = static_cast<double>(rb[k]);
+          norm_a_sq += va * va;
+          norm_b_sq += vb * vb;
+          dot += va * vb;
+        }
+        const double denom = std::sqrt(norm_a_sq) * std::sqrt(norm_b_sq);
+        if (!(denom > 1e-12)) {
+          continue;  // (Near-)zero norm -- skip rather than divide by it,
+                     // mirrors pruning.py's own `denom > 1e-12` mask.
+        }
+        sim_sum[idx] += dot / denom;
+        sim_count[idx] += 1;
+      }
+    }
+  }
+
+  for (size_t idx = 0; idx < candidates.size(); ++idx) {
+    if (sim_count[idx] > 0) {
+      result[idx] = sim_sum[idx] / static_cast<double>(sim_count[idx]);
+    }
+  }
+  return result;
+}
+
+// Greedily selects from `ranked` (already sorted most- to
+// least-redundant) in order, skipping any candidate whose own
+// `block_nodes` overlaps an already-selected one's (a candidate whose own
+// backward walk happened to reach into another candidate's own interior
+// -- unusual, but not impossible in principle, e.g. two Add merges whose
+// own backward walks both terminate inside a shared upstream sub-network
+// neither one's own entry norm actually gates -- can only ever have ONE
+// of the two safely dropped: dropping both would rewire the same node's
+// own output twice, or delete a node the other block's own rewiring still
+// needs to read through). Until `target` blocks are selected or `ranked`
+// is exhausted. Returns the selected blocks, in `ranked` order. Mirrors
+// pruning.py's own `_select_droppable_blocks` exactly.
+std::vector<const DroppableBlock*> SelectDroppableBlocks(
+    const std::vector<const DroppableBlock*>& ranked, int64_t target) {
+  std::vector<const DroppableBlock*> committed;
+  std::unordered_set<const onnx::NodeProto*> committed_ids;
+  for (const DroppableBlock* block : ranked) {
+    if (static_cast<int64_t>(committed.size()) >= target) {
+      break;
+    }
+    bool overlap = false;
+    for (const onnx::NodeProto* n : block->block_nodes) {
+      if (committed_ids.count(n)) {
+        overlap = true;
+        break;
+      }
+    }
+    if (overlap) {
+      continue;
+    }
+    committed.push_back(block);
+    for (const onnx::NodeProto* n : block->block_nodes) {
+      committed_ids.insert(n);
+    }
+  }
+  return committed;
+}
+
+// Applies an already-decided `committed` selection (e.g. from
+// SelectDroppableBlocks) to `graph` -- the actual rewrite/deletion
+// mechanics. Every `committed` block must belong to `graph` (every one of
+// its own `block_nodes` reachable from `graph->node()`) -- a caller with
+// candidates from more than one graph must group `committed` by graph
+// itself (see ApplyTransformerBlockPruning below) and call this once per
+// graph, each time with only that graph's own share. Mirrors pruning.py's
+// own `_commit_transformer_block_drops` exactly:
+//
+// Each commit rewrites every current reference to its own x_out -- every
+// node's own input, in place, plus (via a small inserted Identity node,
+// so the model's own declared output name never changes) any graph
+// output -- to its own x_in, RESOLVED through every earlier commit's own
+// alias first (`resolve`, below): a chain of two directly-adjacent
+// committed blocks (the second's own x_in being the first's own x_out)
+// needs this regardless of commit order -- committing the UPSTREAM block
+// first leaves the downstream block's own recorded x_in referring to a
+// name nothing produces anymore (the upstream block's own now-deleted
+// merge node's output), so its own rewrite target has to be resolved
+// through the upstream commit's own alias rather than used as recorded;
+// committing the DOWNSTREAM block first instead leaves a stale reference
+// (its own inserted Identity, or its own entry LN, if the block itself
+// doesn't survive to deletion first) for the upstream commit's own plain
+// graph-wide node-input rewrite to catch and correct directly, no
+// resolution needed for that direction. `resolve` handles both by
+// construction, with no dependency on which order `committed` happens to
+// process them in.
+//
+// Every one of a committed block's own `block_nodes` is then deleted in
+// ONE final pass (after every commit's own rewiring above, so
+// TryResolveDroppableBlock's own DroppableBlock::block_nodes pointers,
+// captured back at match time, are guaranteed to still be valid
+// throughout every rewrite step -- see that struct's own comment),
+// preserving every surviving node's own relative order -- already
+// topologically valid before deletion, and deleting nodes (never
+// reordering or inserting anything ahead of what it depends on) can't
+// break that.
+void CommitTransformerBlockDrops(
+    onnx::GraphProto* graph,
+    const std::vector<const DroppableBlock*>& committed) {
+  std::unordered_set<const onnx::NodeProto*> committed_ids;
+  for (const DroppableBlock* block : committed) {
+    for (const onnx::NodeProto* n : block->block_nodes) {
+      committed_ids.insert(n);
+    }
+  }
+
+  std::unordered_map<std::string, std::string> alias;
+  auto resolve = [&alias](std::string name) -> std::string {
+    std::unordered_set<std::string> seen;
+    while (true) {
+      auto it = alias.find(name);
+      if (it == alias.end() || seen.count(name)) {
+        break;
+      }
+      seen.insert(name);
+      name = it->second;
+    }
+    return name;
+  };
+
+  for (const DroppableBlock* block : committed) {
+    const std::string target_name = resolve(block->x_in);
+    for (auto& node : *graph->mutable_node()) {
+      for (auto& inp : *node.mutable_input()) {
+        if (inp == block->x_out) {
+          inp = target_name;
+        }
+      }
+    }
+    for (const auto& output : graph->output()) {
+      if (output.name() == block->x_out) {
+        onnx::NodeProto* id_node = graph->add_node();
+        id_node->set_op_type("Identity");
+        id_node->add_input(target_name);
+        id_node->add_output(block->x_out);
+        id_node->set_name(block->x_out + "/transformer_block_pruning_identity");
+      }
+    }
+    alias[block->x_out] = target_name;
+  }
+
+  if (!committed_ids.empty()) {
+    google::protobuf::RepeatedPtrField<onnx::NodeProto> kept_nodes;
+    for (const auto& node : graph->node()) {
+      if (!committed_ids.count(&node)) {
+        *kept_nodes.Add() = node;
+      }
+    }
+    graph->mutable_node()->Swap(&kept_nodes);
+
+    std::unordered_set<std::string> removed_names;
+    for (const DroppableBlock* block : committed) {
+      for (const onnx::NodeProto* n : block->block_nodes) {
+        for (const auto& out_name : n->output()) {
+          if (!out_name.empty()) {
+            removed_names.insert(out_name);
+          }
+        }
+      }
+    }
+    google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept_vi;
+    for (const auto& vi : graph->value_info()) {
+      if (!removed_names.count(vi.name())) {
+        *kept_vi.Add() = vi;
+      }
+    }
+    graph->mutable_value_info()->Swap(&kept_vi);
+  }
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
@@ -18405,6 +19085,177 @@ onnx::ModelProto ApplyQMoEWholeExpertPruning(
       graph->mutable_value_info()->Swap(&kept);
     }
   }
+  return out;
+}
+
+// Depth/block-level pruning: drops whole redundant pre-norm transformer
+// residual sub-blocks (``x = x + SelfAttn(LN(x))`` or ``x = x + MLP(LN(x))``)
+// wholesale -- the C++ port of pruning.py's own
+// `apply_transformer_block_pruning`. See this file's own "Transformer
+// block (depth) pruning" section comment (IsEntryLnNode through
+// CommitTransformerBlockDrops, just above) for the exact matched pattern,
+// the two scope decisions (bare-Add merges and a plain-or-fused entry norm
+// only), and why a KV-cache-bearing attention block needs no dedicated
+// handling to always decline safely on its own. `num_blocks_to_drop`, when
+// given, is an explicit block count (silently capped at however many
+// candidates were actually matched); otherwise `sparsity` is a FRACTION OF
+// MATCHED CANDIDATES (rounded to the nearest whole block, half-to-even via
+// std::llround), mirroring pruning.py's own `round(sparsity * len(pooled))`.
+//
+// Subgraph-aware (IterSubgraphs) for MATCHING, SELECTION, and COMMITTING
+// alike, mirroring pruning.py's own docstring exactly:
+//   - `sparsity`/`num_blocks_to_drop` are pooled ACROSS THE WHOLE MODEL,
+//     not computed independently per graph -- `target` is derived from the
+//     TOTAL candidate count across every graph combined, and
+//     SelectDroppableBlocks is called exactly once over one ranked list
+//     spanning every graph's own candidates together;
+//   - committing (CommitTransformerBlockDrops) is always done separately
+//     per graph, since a block's own node deletions/rewires can only ever
+//     touch the one graph its own nodes actually live in;
+//   - the calibration-based RANKING itself only ever runs over candidates
+//     matched in the TOP-LEVEL graph (TransformerBlockSimilarity, which --
+//     like WandaCalibrationStats/MoeRouterGateCalibrationStats before it --
+//     only ever appends probe outputs to the top-level graph's own
+//     `output` list); a candidate matched inside a nested subgraph gets
+//     this function's own existing "no evidence" score (`-infinity`, the
+//     same score a top-level candidate with no valid calibration token
+//     already falls back to) -- conservatively ranked LAST, never
+//     preferentially dropped, but still genuinely droppable (and
+//     correctly committed) once `target` calls for more blocks than the
+//     top-level graph alone has real evidence for;
+//   - MATCHING itself has one further narrowing for a nested subgraph:
+//     TransformerBlockShapesMatch only ever consults that subgraph's own
+//     AS-DECLARED value_info/input/output -- no onnx::shape_inference pass
+//     reaches into a nested subgraph for this pass (mirrors pruning.py's
+//     own `value_info_by_name` note), so a candidate whose shape is only
+//     *derivable*, never already declared outright, inside a nested
+//     subgraph is conservatively declined there even though the
+//     equivalent top-level-graph case would be handled.
+//
+// A `calibration_data` batch missing one of `model`'s own graph inputs
+// throws `std::invalid_argument` (see WandaCalibrationStats' own
+// declaration comment for why there is no meaningful partial-batch
+// fallback). An otherwise-empty `calibration_data` (or one where no
+// candidate's own probe pair ever resolves to a valid token) ranks every
+// top-level-graph candidate `-infinity` too -- ties broken by
+// std::stable_sort's own original-order preservation, mirroring Python's
+// own stable `sorted(..., reverse=True)`.
+onnx::ModelProto ApplyTransformerBlockPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity, std::optional<int64_t> num_blocks_to_drop) {
+  if (num_blocks_to_drop.has_value()) {
+    if (*num_blocks_to_drop < 0) {
+      throw std::invalid_argument(
+          "ApplyTransformerBlockPruning: num_blocks_to_drop must be >= 0, "
+          "got " +
+          std::to_string(*num_blocks_to_drop));
+    }
+  } else if (!(sparsity >= 0.0 && sparsity <= 1.0)) {
+    throw std::invalid_argument(
+        "ApplyTransformerBlockPruning: sparsity must be in [0, 1], got " +
+        std::to_string(sparsity));
+  }
+
+  onnx::ModelProto out = model;
+  onnx::GraphProto* top_level_graph = out.mutable_graph();
+
+  // Real onnx::shape_inference over a COPY of `out`, exactly mirroring
+  // pruning.py's own `onnx.shape_inference.infer_shapes(out,
+  // strict_mode=False)` try/except fallback -- TransformerBlockShapesMatch's
+  // own correctness (whether replacing x_out with x_in is shape-safe at
+  // all) depends on this being right, not merely whatever value_info
+  // `model` already happened to carry. `inferred_holder` is kept alive for
+  // this whole function (not just the try block) since `top_type_map`
+  // below holds TypeProto* pointers into it.
+  onnx::ModelProto inferred_holder = out;
+  bool have_inferred = true;
+  try {
+    _InferShapes(inferred_holder);
+  } catch (...) {
+    have_inferred = false;
+  }
+  const std::unordered_map<std::string, const onnx::TypeProto*> top_type_map =
+      TransformerBlockValueInfoByName(have_inferred ? inferred_holder.graph()
+                                                    : out.graph());
+
+  // (graph, candidate) pairs for every graph's own candidates, pooled
+  // together -- see this function's own comment above for why selection
+  // is pooled across the whole model while committing stays strictly per
+  // graph. `pooled_similarity[i]` is `pooled[i]`'s own ranking score.
+  std::vector<std::pair<onnx::GraphProto*, DroppableBlock>> pooled;
+  std::vector<double> pooled_similarity;
+  for (onnx::GraphProto* graph : IterSubgraphs(top_level_graph)) {
+    const bool is_top = graph == top_level_graph;
+    std::unordered_map<std::string, const onnx::TypeProto*> nested_type_map;
+    if (!is_top) {
+      nested_type_map = TransformerBlockValueInfoByName(*graph);
+    }
+    const std::unordered_map<std::string, const onnx::TypeProto*>& type_map =
+        is_top ? top_type_map : nested_type_map;
+    std::vector<DroppableBlock> candidates =
+        FindTransformerBlockCandidates(graph, type_map);
+    if (candidates.empty()) {
+      continue;
+    }
+    std::vector<double> sims =
+        is_top ? TransformerBlockSimilarity(executor, out, candidates,
+                                            calibration_data)
+               : std::vector<double>(candidates.size(),
+                                     -std::numeric_limits<double>::infinity());
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      pooled.emplace_back(graph, std::move(candidates[i]));
+      pooled_similarity.push_back(sims[i]);
+    }
+  }
+
+  if (pooled.empty()) {
+    return out;
+  }
+
+  int64_t target;
+  if (num_blocks_to_drop.has_value()) {
+    target = std::min<int64_t>(*num_blocks_to_drop,
+                               static_cast<int64_t>(pooled.size()));
+  } else {
+    target = std::llround(sparsity * static_cast<double>(pooled.size()));
+  }
+  if (target <= 0) {
+    return out;
+  }
+
+  // Stable sort descending by similarity -- ties broken by original
+  // (graph-then-match) order, mirroring Python's own `sorted(...,
+  // reverse=True)` (Python's `sorted` is stable).
+  std::vector<size_t> order(pooled.size());
+  std::iota(order.begin(), order.end(), size_t{0});
+  std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return pooled_similarity[a] > pooled_similarity[b];
+  });
+
+  std::vector<const DroppableBlock*> ranked;
+  ranked.reserve(order.size());
+  for (size_t idx : order) {
+    ranked.push_back(&pooled[idx].second);
+  }
+
+  const std::vector<const DroppableBlock*> committed =
+      SelectDroppableBlocks(ranked, target);
+
+  std::unordered_map<const DroppableBlock*, onnx::GraphProto*> block_to_graph;
+  for (const auto& [g, blk] : pooled) {
+    block_to_graph.emplace(&blk, g);
+  }
+  std::unordered_map<onnx::GraphProto*, std::vector<const DroppableBlock*>>
+      committed_by_graph;
+  for (const DroppableBlock* block : committed) {
+    committed_by_graph[block_to_graph.at(block)].push_back(block);
+  }
+  for (auto& [g, blocks] : committed_by_graph) {
+    CommitTransformerBlockDrops(g, blocks);
+  }
+
   return out;
 }
 

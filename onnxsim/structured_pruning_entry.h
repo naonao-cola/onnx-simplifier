@@ -299,3 +299,55 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
         calibration_data,
     double sparsity, double epsilon = 1e-8);
+
+// Depth/block-level pruning: drops whole redundant pre-norm transformer
+// residual sub-blocks (``x = x + SelfAttn(LN(x))`` or ``x = x + MLP(LN(x))``)
+// wholesale, rather than shrinking every block a little the way every
+// other entry point in this header does. The C++ port of pruning.py's own
+// `apply_transformer_block_pruning` -- a GENUINELY DIFFERENT KIND of pass
+// from every other entry point above: it deletes whole nodes and rewires
+// their consumers (graph surgery, changing the graph's own topology), not
+// just tensors resized in place. See structured_pruning_entry.cpp's own
+// "Transformer block (depth) pruning" section comment (IsEntryLnNode
+// through CommitTransformerBlockDrops, and ApplyTransformerBlockPruning's
+// own comment right above its definition) for:
+//   - the exact matched pattern (a bare-Add merge; a plain, unfused entry
+//     norm -- LayerNormalization/RMSNormalization/
+//     SimplifiedLayerNormalization -- OR a fused SkipLayerNormalization/
+//     SkipSimplifiedLayerNormalization node's own optional fourth output,
+//     standing in for x_in, so a model already run through onnxruntime's
+//     own transformer optimizer is matched too);
+//   - why attention and MLP/FFN blocks are matched and dropped fully
+//     independently, never only as a paired "whole layer";
+//   - why a KV-cache-bearing attention block needs no dedicated handling
+//     to always decline safely on its own;
+//   - the calibration-driven ranking (mean cosine similarity between each
+//     candidate's own x_in/x_out over `calibration_data` -- the
+//     literature-standard "Block Influence"/ShortGPT-style depth-pruning
+//     signal -- via TransformerBlockSimilarity, reusing
+//     WandaCalibrationStats' own probe-injection/batch-iteration pattern
+//     with its own dedicated accumulator), which drops the HIGHEST-
+//     similarity (most redundant) candidates first, up to the target
+//     count, SKIPPING (never failing the whole call on) any candidate
+//     whose own interior overlaps an already-committed one's;
+//   - the subgraph-aware pooled-selection-but-per-graph-commit scope
+//     (mirrors pruning.py's own docstring exactly: `sparsity`/
+//     `num_blocks_to_drop` are pooled ACROSS THE WHOLE MODEL, but the
+//     calibration-based ranking only ever runs over TOP-LEVEL-graph
+//     candidates, exactly like ApplyMoeWholeExpertPruning's own scope
+//     note above).
+//
+// `num_blocks_to_drop`, when given, is an explicit block count (silently
+// capped at however many candidates were actually matched); otherwise
+// `sparsity` is interpreted as a FRACTION OF MATCHED CANDIDATES (rounded
+// to the nearest whole block), not of the model's total layer count --
+// the same "fraction of what was actually found eligible" meaning
+// ApplyMoeWholeExpertPruning's own `sparsity` already has for experts.
+//
+// Same `calibration_data` contract, and the same batch-missing-a-required-
+// graph-input `std::invalid_argument`, as ApplyStructuredWandaPruning.
+onnx::ModelProto ApplyTransformerBlockPruning(
+    const onnx::ModelProto& model, const ModelExecutor& executor,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data,
+    double sparsity, std::optional<int64_t> num_blocks_to_drop);
