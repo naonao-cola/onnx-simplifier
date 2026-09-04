@@ -14708,6 +14708,741 @@ def test_attention_head_pruning_handles_all_three_attention_op_types_in_one_mode
     assert y3.shape == (batch, seq, Out3)
 
 
+# --- apply_attention_head_pruning / _wanda_pruning -- PackedAttention -----
+#
+# ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+# against this environment's installed onnxruntime 1.29.0 confirms:
+# `com.microsoft::PackedAttention` -- ONNX Runtime's own "packing mode"
+# fusion target for `com.microsoft::Attention`
+# (`onnxruntime.transformers.convert_to_packing_mode
+# .PackingAttention._replace_attention_with_packing_attention`, read
+# directly from the installed `onnxruntime` wheel) -- has `input`/`weights`/
+# `bias` at the identical indices 0/1/2 `Attention` itself uses, two new
+# inputs `token_offset`/`cumulative_sequence_length` at 3/4 (replacing
+# `Attention`'s own `mask_index`/`past` there), and `attention_bias` keeping
+# `Attention`'s own index, 5. See onnxsim/pruning.py's own "Attention-head
+# pruning" section comment for the full empirical investigation.
+#
+# **No CPU kernel exists for this op in this environment's onnxruntime at
+# all** (confirmed empirically: a minimal, `onnx.checker`-valid
+# `PackedAttention` node fails `onnxruntime.InferenceSession` construction
+# outright with ``NOT_IMPLEMENTED : ... Could not find an implementation for
+# PackedAttention``) -- so, following `DecoderMaskedSelfAttention`'s own
+# precedent (see that section's own comment above), every correctness test
+# below decomposes a pruned node's own sliced `weights`/`bias` into an
+# equivalent, genuinely executable plain `com.microsoft::Attention` node
+# (same merged-QKV layout) and runs *that* through a real CPU-kernel
+# `InferenceSession`, compared against a numpy-oracle-equivalent
+# independently-built smaller `Attention` model using only the
+# correctly-selected kept heads' own original (pre-pruning) weight columns
+# -- never a comparison against the full, unpruned model's own output.
+
+
+def _packed_attention_model(
+    K=8,
+    H=4,
+    D=4,
+    Out=6,
+    seed=0,
+    tok=5,
+    bias=True,
+    wqkv=None,
+    bqkv=None,
+    wout=None,
+    num_heads=None,
+    attention_bias=None,  # constant attention_bias array, or None (unconnected)
+    attention_bias_dynamic_shape=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq = Nk = Nv = H * D
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + Nk + Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+    if bias and bqkv is None:
+        bqkv = rng.standard_normal((Nq + Nk + Nv,)).astype(np.float32)
+    heads = H if num_heads is None else num_heads
+
+    # No padding in this single-sequence repro: `token_offset` is the
+    # identity mapping (`(1, tok)`, batch_size=1) and
+    # `cumulative_sequence_length` is `[0, tok]` -- constant initializers
+    # (not graph inputs) purely so their own byte content can be compared
+    # before/after pruning directly.
+    token_offset = np.arange(tok, dtype=np.int32).reshape(1, tok)
+    cum_seq_len = np.array([0, tok], dtype=np.int32)
+
+    initializer = [
+        _f32(wqkv, "Wqkv"),
+        _f32(wout, "Wout"),
+        onnx.numpy_helper.from_array(token_offset, "TokenOffset"),
+        onnx.numpy_helper.from_array(cum_seq_len, "CumSeqLen"),
+    ]
+    operands = ["X", "Wqkv"]
+    if bias:
+        initializer.append(_f32(bqkv, "Bqkv"))
+        operands.append("Bqkv")
+    else:
+        operands.append("")
+    operands += ["TokenOffset", "CumSeqLen"]
+
+    extra_graph_inputs = ""
+    if attention_bias is not None:
+        initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
+        operands.append("AttentionBias")
+    elif attention_bias_dynamic_shape is not None:
+        shape_text = ",".join(str(d) for d in attention_bias_dynamic_shape)
+        extra_graph_inputs = f", float[{shape_text}] AttentionBias"
+        operands.append("AttentionBias")
+
+    while operands and operands[-1] == "":
+        operands.pop()
+    qkv_inputs = ", ".join(operands)
+
+    body = f"""
+        g (float[{tok},{K}] X{extra_graph_inputs}) => (float[{tok},{Out}] Y)
+        {{
+          ctx = com.microsoft.PackedAttention <num_heads={heads}, qkv_hidden_sizes=[{Nq},{Nk},{Nv}]> ({qkv_inputs})
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+        wqkv=wqkv,
+        bqkv=bqkv,
+        wout=wout,
+        tok=tok,
+        token_offset=token_offset,
+        cum_seq_len=cum_seq_len,
+    )
+
+
+def _packed_attention_node(model):
+    return next(n for n in model.graph.node if n.op_type == "PackedAttention")
+
+
+def _packed_attention_num_heads(node):
+    return next(a.i for a in node.attribute if a.name == "num_heads")
+
+
+def test_packed_attention_pruning_shrinks_matched_block():
+    model, cfg = _packed_attention_model(K=8, H=4, D=4, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _packed_attention_node(pruned)
+    assert _packed_attention_num_heads(node) == 2  # max(1, 4 - round(4*0.5))
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wqkv"].dims) == [8, 24]  # keep_count(2) * 3 * D(4)
+    assert list(inits["Bqkv"].dims) == [24]
+    assert list(inits["Wout"].dims) == [8, 6]
+
+
+def test_packed_attention_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _packed_attention_model(K=8, H=4, D=4, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    node = _packed_attention_node(pruned)
+    assert _packed_attention_num_heads(node) == cfg["H"]  # left completely untouched
+
+
+def test_packed_attention_pruning_matches_oracle_via_attention_proxy():
+    model, cfg = _packed_attention_model(K=8, H=8, D=4, Out=6, seed=1, tok=5)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _packed_attention_node(pruned)
+    num_heads = _packed_attention_num_heads(node)
+    assert num_heads == 4  # max(1, 8 - round(8*0.5))
+
+    d = cfg["D"]
+    keep_heads = _oracle_keep_heads(
+        cfg["wqkv"], cfg["Nq"], cfg["Nk"], cfg["Nv"], cfg["H"], num_heads
+    )
+    idx = _head_idx(keep_heads, d)
+    q_idx = idx
+    k_idx = idx + cfg["Nq"]
+    v_idx = idx + cfg["Nq"] + cfg["Nk"]
+    all_idx = np.concatenate([q_idx, k_idx, v_idx])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wqkv"], cfg["wqkv"][:, all_idx])
+
+    # Decompose the pruned node's own sliced tensors into a genuinely
+    # executable plain `Attention` proxy (see this section's own comment
+    # above for why) and compare against an independently-built smaller
+    # `Attention` oracle sliced straight from the *original* (pre-pruning)
+    # weights -- never against the full unpruned model's own output.
+    proxy, _ = _attention_model(
+        K=cfg["K"],
+        H=num_heads,
+        D=d,
+        Out=cfg["Out"],
+        wqkv=inits["Wqkv"],
+        bqkv=inits["Bqkv"],
+        wout=inits["Wout"],
+    )
+    oracle, _ = _attention_model(
+        K=cfg["K"],
+        H=num_heads,
+        D=d,
+        Out=cfg["Out"],
+        wqkv=cfg["wqkv"][:, all_idx],
+        bqkv=cfg["bqkv"][all_idx],
+        wout=cfg["wout"][idx, :],
+    )
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((1, cfg["tok"], cfg["K"])).astype(np.float32)
+    (y_proxy,) = _run(proxy, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_proxy, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_packed_attention_pruning_leaves_token_offset_and_cumulative_sequence_length_untouched():
+    # `token_offset`/`cumulative_sequence_length` are packing-mode
+    # bookkeeping tensors (`(batch_size, sequence_length)`/`(batch_size +
+    # 1)`-shaped per this op's own schema doc, no `num_heads`-sized axis
+    # anywhere) -- pruning must never touch them, byte-identical before and
+    # after.
+    model, cfg = _packed_attention_model(K=8, H=4, D=4, Out=6, tok=6)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    before = {t.name: t for t in model.graph.initializer}
+    after = {t.name: t for t in pruned.graph.initializer}
+    assert after["TokenOffset"].raw_data == before["TokenOffset"].raw_data
+    assert after["CumSeqLen"].raw_data == before["CumSeqLen"].raw_data
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(after["TokenOffset"]), cfg["token_offset"]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(after["CumSeqLen"]), cfg["cum_seq_len"]
+    )
+
+
+def test_packed_attention_pruning_attention_bias_is_sliced_and_matches_oracle():
+    H, D = 4, 4
+    tok = 5
+    rng = np.random.default_rng(20)
+    attention_bias = rng.standard_normal((1, H, tok, tok)).astype(np.float32)
+    model, cfg = _packed_attention_model(
+        K=8, H=H, D=D, Out=6, seed=20, tok=tok, attention_bias=attention_bias
+    )
+    node_before = _packed_attention_node(model)
+    assert list(node_before.input)[5] == "AttentionBias"
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _packed_attention_node(pruned)
+    num_heads = _packed_attention_num_heads(node)
+    keep_heads = _oracle_keep_heads(
+        cfg["wqkv"], cfg["Nq"], cfg["Nk"], cfg["Nv"], H, num_heads
+    )
+    idx = _head_idx(keep_heads, D)
+    q_idx = idx
+    k_idx = idx + cfg["Nq"]
+    v_idx = idx + cfg["Nq"] + cfg["Nk"]
+    all_idx = np.concatenate([q_idx, k_idx, v_idx])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["AttentionBias"], attention_bias[:, keep_heads])
+
+    proxy, _ = _attention_model(
+        K=cfg["K"],
+        H=num_heads,
+        D=D,
+        Out=cfg["Out"],
+        wqkv=inits["Wqkv"],
+        bqkv=inits["Bqkv"],
+        wout=inits["Wout"],
+        attention_bias=inits["AttentionBias"],
+    )
+    oracle, _ = _attention_model(
+        K=cfg["K"],
+        H=num_heads,
+        D=D,
+        Out=cfg["Out"],
+        wqkv=cfg["wqkv"][:, all_idx],
+        bqkv=cfg["bqkv"][all_idx],
+        wout=cfg["wout"][idx, :],
+        attention_bias=attention_bias[:, keep_heads],
+    )
+    rng2 = np.random.default_rng(21)
+    x = rng2.standard_normal((1, tok, cfg["K"])).astype(np.float32)
+    (y_proxy,) = _run(proxy, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_proxy, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_packed_attention_pruning_declines_dynamic_weight():
+    # A non-constant `weights` input (an ordinary graph input, not an
+    # initializer) can't be sliced -- the whole match is declined outright,
+    # reported by name in `not_eligible`, exactly like every other declined
+    # op-type in this module.
+    K, H, D, Out, tok = 8, 4, 4, 6, 5
+    Nq = Nk = Nv = H * D
+    token_offset = np.arange(tok, dtype=np.int32).reshape(1, tok)
+    cum_seq_len = np.array([0, tok], dtype=np.int32)
+    body = f"""
+        g (float[{tok},{K}] X, float[{K},{Nq + Nk + Nv}] Wqkv) => (float[{tok},{Out}] Y)
+        {{
+          ctx = com.microsoft.PackedAttention <num_heads={H}, qkv_hidden_sizes=[{Nq},{Nk},{Nv}]> (X, Wqkv, , TokenOffset, CumSeqLen)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    rng = np.random.default_rng(22)
+    wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+    model.graph.initializer.extend(
+        [
+            _f32(wout, "Wout"),
+            onnx.numpy_helper.from_array(token_offset, "TokenOffset"),
+            onnx.numpy_helper.from_array(cum_seq_len, "CumSeqLen"),
+        ]
+    )
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert report.not_eligible == ["PackedAttention 'ctx'"]
+    assert report.layers == []
+
+
+def test_packed_attention_pruning_dry_run_matches_real_call():
+    model, cfg = _packed_attention_model(K=8, H=8, D=4, Out=6, seed=6)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_head"
+    assert layer.total == 8
+    assert layer.would_drop == 4  # round(8*0.5)
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _packed_attention_node(pruned)
+    assert cfg["H"] - _packed_attention_num_heads(node) == layer.would_drop
+
+
+# --- apply_attention_head_pruning / _wanda_pruning -- PackedMultiHeadAttention --
+#
+# ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+# against this environment's installed onnxruntime 1.29.0 confirms:
+# `com.microsoft::PackedMultiHeadAttention` -- ONNX Runtime's own "packing
+# mode" fusion target for `com.microsoft::MultiHeadAttention`
+# (`onnxruntime.transformers.convert_to_packing_mode
+# .PackingMultiHeadAttention._replace_attention_with_packing_attention`,
+# read directly from the installed `onnxruntime` wheel) -- has `query`/
+# `key`/`value`/`bias` at the identical indices 0/1/2/3 `MultiHeadAttention`
+# itself uses, and two new inputs `token_offset`/`cumulative_sequence_length`
+# at 4/5 (replacing `MultiHeadAttention`'s own single `key_padding_mask` at
+# 4). `attention_bias` does **not** keep `MultiHeadAttention`'s own index --
+# it moves from 5 to **6**, since one input (`key_padding_mask`) was replaced
+# by two. See onnxsim/pruning.py's own "Attention-head pruning" section
+# comment for the full empirical investigation.
+#
+# **No CPU kernel exists for this op in this environment's onnxruntime at
+# all** (confirmed empirically: a minimal, `onnx.checker`-valid
+# `PackedMultiHeadAttention` node fails `onnxruntime.InferenceSession`
+# construction outright with ``NOT_IMPLEMENTED : ... Could not find an
+# implementation for PackedMultiHeadAttention``) -- so, following
+# `DecoderMaskedSelfAttention`'s own precedent, every correctness test below
+# decomposes a pruned node's own sliced Q/K/V weights and combined bias into
+# an equivalent, genuinely executable `com.microsoft::MultiHeadAttention`
+# node and runs *that* through a real CPU-kernel `InferenceSession`, compared
+# against a numpy-oracle-equivalent independently-built smaller
+# `MultiHeadAttention` model using only the correctly-selected kept heads'
+# own original (pre-pruning) weight columns -- never a comparison against
+# the full unpruned model's own output.
+
+
+def _packed_mha_model(
+    K=8,
+    H=4,
+    D=4,
+    Out=6,
+    seed=0,
+    tok=5,
+    combined_bias=False,
+    wq=None,
+    wk=None,
+    wv=None,
+    bq=None,
+    bk=None,
+    bv=None,
+    wout=None,
+    attention_bias=None,  # constant attention_bias array, or None (unconnected)
+    attention_bias_dynamic_shape=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nk, Nv = H * D, H * D, H * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+
+    token_offset = np.arange(tok, dtype=np.int32).reshape(1, tok)
+    cum_seq_len = np.array([0, tok], dtype=np.int32)
+
+    initializer = [
+        _f32(wq, "Wq"),
+        _f32(wk, "Wk"),
+        _f32(wv, "Wv"),
+        _f32(wout, "Wout"),
+        onnx.numpy_helper.from_array(token_offset, "TokenOffset"),
+        onnx.numpy_helper.from_array(cum_seq_len, "CumSeqLen"),
+    ]
+    operands = ["q", "k", "v"]
+    if combined_bias:
+        if bq is None:
+            bq = rng.standard_normal((Nq,)).astype(np.float32)
+        if bk is None:
+            bk = rng.standard_normal((Nk,)).astype(np.float32)
+        if bv is None:
+            bv = rng.standard_normal((Nv,)).astype(np.float32)
+        combined = np.concatenate([bq, bk, bv]).astype(np.float32)
+        initializer.append(_f32(combined, "Bias"))
+        operands.append("Bias")
+    else:
+        operands.append("")
+    operands += ["TokenOffset", "CumSeqLen"]
+
+    extra_graph_inputs = ""
+    if attention_bias is not None:
+        initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
+        operands.append("AttentionBias")
+    elif attention_bias_dynamic_shape is not None:
+        shape_text = ",".join(str(d) for d in attention_bias_dynamic_shape)
+        extra_graph_inputs = f", float[{shape_text}] AttentionBias"
+        operands.append("AttentionBias")
+
+    while operands and operands[-1] == "":
+        operands.pop()
+    qkv_inputs = ", ".join(operands)
+
+    body = f"""
+        g (float[{tok},{K}] X{extra_graph_inputs}) => (float[{tok},{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx = com.microsoft.PackedMultiHeadAttention <num_heads={H}> ({qkv_inputs})
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        bq=bq,
+        bk=bk,
+        bv=bv,
+        wout=wout,
+        tok=tok,
+        token_offset=token_offset,
+        cum_seq_len=cum_seq_len,
+    )
+
+
+def _packed_mha_node(model):
+    return next(n for n in model.graph.node if n.op_type == "PackedMultiHeadAttention")
+
+
+def _packed_mha_num_heads(node):
+    return next(a.i for a in node.attribute if a.name == "num_heads")
+
+
+def test_packed_mha_pruning_shrinks_matched_block():
+    model, cfg = _packed_mha_model(K=8, H=4, D=4, Out=6, combined_bias=True)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _packed_mha_node(pruned)
+    assert _packed_mha_num_heads(node) == 2  # max(1, 4 - round(4*0.5))
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [8, 8]
+    assert list(inits["Wk"].dims) == [8, 8]
+    assert list(inits["Wv"].dims) == [8, 8]
+    assert list(inits["Bias"].dims) == [24]
+    assert list(inits["Wout"].dims) == [8, 6]
+
+
+def test_packed_mha_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _packed_mha_model(K=8, H=4, D=4, Out=6, combined_bias=True)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    node = _packed_mha_node(pruned)
+    assert _packed_mha_num_heads(node) == cfg["H"]  # left completely untouched
+
+
+def test_packed_mha_pruning_matches_oracle_via_mha_proxy():
+    model, cfg = _packed_mha_model(
+        K=8, H=8, D=4, Out=6, seed=1, tok=5, combined_bias=True
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _packed_mha_node(pruned)
+    num_heads = _packed_mha_num_heads(node)
+    assert num_heads == 4  # max(1, 8 - round(8*0.5))
+
+    d = cfg["D"]
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["H"], d, num_heads
+    )
+    idx = _head_idx(keep_heads, d)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"][:, idx])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"][:, idx])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"][:, idx])
+
+    oracle_bq = cfg["bq"][idx]
+    oracle_bk = cfg["bk"][idx]
+    oracle_bv = cfg["bv"][idx]
+
+    # Decompose the pruned node's own sliced tensors into a genuinely
+    # executable `MultiHeadAttention` proxy (see this section's own comment
+    # above for why) and compare against an independently-built smaller
+    # `MultiHeadAttention` oracle sliced straight from the *original*
+    # (pre-pruning) weights -- never against the full unpruned model's own
+    # output.
+    proxy, _ = _mha_model(
+        K=cfg["K"],
+        H=num_heads,
+        D=d,
+        Out=cfg["Out"],
+        seed=1,
+        combined_bias=True,
+        wq=inits["Wq"],
+        wk=inits["Wk"],
+        wv=inits["Wv"],
+        bq=oracle_bq,
+        bk=oracle_bk,
+        bv=oracle_bv,
+        wout=inits["Wout"],
+        batch=1,
+        seq=cfg["tok"],
+    )
+    oracle, _ = _mha_model(
+        K=cfg["K"],
+        H=num_heads,
+        D=d,
+        Out=cfg["Out"],
+        seed=1,
+        combined_bias=True,
+        wq=cfg["wq"][:, idx],
+        wk=cfg["wk"][:, idx],
+        wv=cfg["wv"][:, idx],
+        bq=oracle_bq,
+        bk=oracle_bk,
+        bv=oracle_bv,
+        wout=cfg["wout"][idx, :],
+        batch=1,
+        seq=cfg["tok"],
+    )
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((1, cfg["tok"], cfg["K"])).astype(np.float32)
+    (y_proxy,) = _run(proxy, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_proxy, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_packed_mha_pruning_leaves_token_offset_and_cumulative_sequence_length_untouched():
+    model, cfg = _packed_mha_model(K=8, H=4, D=4, Out=6, tok=6, combined_bias=True)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    before = {t.name: t for t in model.graph.initializer}
+    after = {t.name: t for t in pruned.graph.initializer}
+    assert after["TokenOffset"].raw_data == before["TokenOffset"].raw_data
+    assert after["CumSeqLen"].raw_data == before["CumSeqLen"].raw_data
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(after["TokenOffset"]), cfg["token_offset"]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(after["CumSeqLen"]), cfg["cum_seq_len"]
+    )
+
+
+def test_packed_mha_pruning_attention_bias_is_sliced_and_matches_oracle():
+    H, D = 4, 4
+    tok = 5
+    rng = np.random.default_rng(30)
+    attention_bias = rng.standard_normal((1, H, tok, tok)).astype(np.float32)
+    model, cfg = _packed_mha_model(
+        K=8,
+        H=H,
+        D=D,
+        Out=6,
+        seed=30,
+        tok=tok,
+        combined_bias=True,
+        attention_bias=attention_bias,
+    )
+    node_before = _packed_mha_node(model)
+    # `attention_bias` sits at index 6 here, NOT `MultiHeadAttention`'s own
+    # index 5 -- see this section's own comment above for why.
+    assert list(node_before.input)[6] == "AttentionBias"
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _packed_mha_node(pruned)
+    num_heads = _packed_mha_num_heads(node)
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], H, H, D, num_heads
+    )
+    idx = _head_idx(keep_heads, D)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["AttentionBias"], attention_bias[:, keep_heads])
+
+    oracle_bq = cfg["bq"][idx]
+    oracle_bk = cfg["bk"][idx]
+    oracle_bv = cfg["bv"][idx]
+
+    proxy, _ = _mha_model(
+        K=cfg["K"],
+        H=num_heads,
+        D=D,
+        Out=cfg["Out"],
+        seed=30,
+        combined_bias=True,
+        wq=inits["Wq"],
+        wk=inits["Wk"],
+        wv=inits["Wv"],
+        bq=oracle_bq,
+        bk=oracle_bk,
+        bv=oracle_bv,
+        wout=inits["Wout"],
+        batch=1,
+        seq=tok,
+        attention_bias=inits["AttentionBias"],
+    )
+    oracle, _ = _mha_model(
+        K=cfg["K"],
+        H=num_heads,
+        D=D,
+        Out=cfg["Out"],
+        seed=30,
+        combined_bias=True,
+        wq=cfg["wq"][:, idx],
+        wk=cfg["wk"][:, idx],
+        wv=cfg["wv"][:, idx],
+        bq=oracle_bq,
+        bk=oracle_bk,
+        bv=oracle_bv,
+        wout=cfg["wout"][idx, :],
+        batch=1,
+        seq=tok,
+        attention_bias=attention_bias[:, keep_heads],
+    )
+    rng2 = np.random.default_rng(31)
+    x = rng2.standard_normal((1, tok, cfg["K"])).astype(np.float32)
+    (y_proxy,) = _run(proxy, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_proxy, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_packed_mha_pruning_declines_packed_qkv_alt_convention():
+    # `query` alone carrying a packed, rank-4 `(token_count, num_heads, 3,
+    # head_size)` tensor -- `key`/`value` empty -- is a different tensor
+    # layout this pass doesn't attempt to slice (mirrors
+    # `test_mha_pruning_packed_qkv_query_input_is_declined`'s own
+    # `MultiHeadAttention` precedent).
+    H, D, tok = 4, 4, 5
+    token_offset = np.arange(tok, dtype=np.int32).reshape(1, tok)
+    cum_seq_len = np.array([0, tok], dtype=np.int32)
+    body = f"""
+        g (float[{tok},{H},3,{D}] Qpacked) => (float[{tok},{H * D}] Y)
+        {{
+          ctx = com.microsoft.PackedMultiHeadAttention <num_heads={H}> (Qpacked, , , , TokenOffset, CumSeqLen)
+          Y = Identity(ctx)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(token_offset, "TokenOffset"),
+            onnx.numpy_helper.from_array(cum_seq_len, "CumSeqLen"),
+        ]
+    )
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert report.not_eligible == ["PackedMultiHeadAttention 'ctx'"]
+    assert report.layers == []
+
+
+def test_packed_mha_pruning_dry_run_matches_real_call():
+    model, cfg = _packed_mha_model(K=8, H=8, D=4, Out=6, seed=6, combined_bias=True)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_mha_head"
+    assert layer.total == 8
+    assert layer.would_drop == 4  # round(8*0.5)
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _packed_mha_node(pruned)
+    assert cfg["H"] - _packed_mha_num_heads(node) == layer.would_drop
+
+
 # --- importance_norm ("l1" vs "l2") ---------------------------------------
 #
 # Every importance ranking above defaults to Li et al.'s L2-norm criterion,
