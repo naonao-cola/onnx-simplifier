@@ -143,6 +143,7 @@ from onnxsim.spinquant import apply_spinquant
 from onnxsim.spqr import quantize_weight_only_spqr
 from onnxsim.squeezellm import quantize_weight_only_squeezellm
 from onnxsim.tensorrt_sparsity import convert_matmul_to_gemm
+from onnxsim.tesseraq import apply_tesseraq
 from onnxsim.transformers_export import export_transformers_model
 from onnxsim.zeroquant import apply_zeroquant
 
@@ -160,6 +161,7 @@ __all__ = [
     "correct_bias",
     "apply_adaround",
     "apply_adaquant",
+    "apply_tesseraq",
     "apply_pruning_finetune",
     "apply_autoround",
     "auto_quantize_int4",
