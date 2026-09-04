@@ -16,6 +16,7 @@ plus a couple of tests confirming unmatched topologies are left untouched
 """
 
 import os
+import tempfile
 
 import ml_dtypes
 import numpy as np
@@ -8465,6 +8466,312 @@ def test_cpp_qoperator_matches_python_reference():
     onnx.checker.check_model(model)
 
     pruned_py = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
+
+    py_bytes = {t.name: t.SerializeToString() for t in pruned_py.graph.initializer}
+    cpp_bytes = {t.name: t.SerializeToString() for t in pruned_cpp.graph.initializer}
+    assert py_bytes == cpp_bytes
+
+
+# --- DynamicQuantizeMatMul / MatMulIntegerToFloat (ORT dynamic-quantization
+# --- fusion) structured pruning ---------------------------------------------
+#
+# Mirrors ``tests/test_pruning.py``'s own "DynamicQuantizeMatMul /
+# MatMulIntegerToFloat" coverage for ``onnxsim.apply_structured_pruning_cpp``
+# -- the C++ port also runs this chain family (see
+# ``onnxsim/structured_pruning_entry.cpp``'s own "DynamicQuantizeMatMul /
+# MatMulIntegerToFloat" section comment), wired into the SAME entry point as
+# every other chain family above (unlike ``onnxsim.pruning``, which keeps
+# ``apply_structured_pruning_dynamic_quantize_matmul`` a separate top-level
+# function). Fixture weights are quantized via the REAL
+# ``onnxruntime.quantization.quantize_dynamic`` tool -- never a hand-rolled
+# re-implementation of the quantization scheme -- by wrapping each weight in
+# a minimal ``Y = MatMul(X, W)`` model, running the real tool on it, and
+# reading back its own emitted ``W_quantized``/``W_scale``/``W_zero_point``
+# initializers, mirroring ``test_pruning.py``'s own identical
+# ``_quantize_dynamic_weight`` helper. Unlike the QDQ section above, these
+# oracle tests run the pruned graph through onnxruntime with DEFAULT graph
+# optimizations (plain ``_run``, not ``_run_unfused``): `DynamicQuantizeMatMul`
+# is already the fully-fused kernel itself -- there is no
+# `DequantizeLinear -> MatMul` pattern left for onnxruntime's own optimizer to
+# additionally re-fuse, so the "unfused vs. optimized accumulation order"
+# concern the QDQ section's own top comment describes does not apply here.
+# `DynamicQuantizeMatMul`'s own `A`-side quantization is computed FRESH from
+# the actual runtime input on every run (no calibration data, no rewriting
+# needed) -- since pruning only removes some of the PRODUCER's own output
+# columns (leaving `A`, and every surviving column's own int8 codes/scale/
+# zero-point, byte-for-byte unchanged -- "slice, don't recompute"), a kept
+# output column's value is mathematically identical whether or not its
+# sibling columns were dropped, so the oracle checks below hold to plain
+# float32 rounding tolerance.
+
+
+def _quantize_dynamic_weight(W, per_channel=True):
+    """Runs the REAL ``onnxruntime.quantization.quantize_dynamic`` tool on a
+    minimal ``Y = MatMul(X, W)`` wrapper model and returns the genuine
+    quantized ``(W_int8[K,N], W_scale, W_zero_point)`` triple it emits for
+    `W` -- never a hand-rolled re-implementation of the quantization scheme.
+    Mirrors ``test_pruning.py``'s own identical helper.
+    """
+    from onnxruntime.quantization import QuantType, quantize_dynamic
+
+    K, N = W.shape
+    src = _model(
+        f"""
+        g (float[1,{K}] X) => (float[1,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(W, "W")],
+        opset=21,
+    )
+    with tempfile.TemporaryDirectory() as d:
+        src_path = os.path.join(d, "src.onnx")
+        dst_path = os.path.join(d, "dst.onnx")
+        onnx.save(src, src_path)
+        quantize_dynamic(
+            src_path, dst_path, per_channel=per_channel, weight_type=QuantType.QInt8
+        )
+        q = onnx.load(dst_path)
+    inits = {t.name: t for t in q.graph.initializer}
+    Wq = onnx.numpy_helper.to_array(inits["W_quantized"]).copy()
+    Wscale = onnx.numpy_helper.to_array(inits["W_scale"]).copy()
+    Wzp = onnx.numpy_helper.to_array(inits["W_zero_point"]).copy()
+    return Wq, Wscale, Wzp
+
+
+def _dqmm_chain_model(
+    K, N1, N2, per_channel=True, activation="Relu", bias1=False, seed=0
+):
+    """Builds ``DynamicQuantizeMatMul(mm1) -> activation ->
+    DynamicQuantizeMatMul(mm2)`` -- a same-family chain -- from random float
+    weights, quantized via the real tool (:func:`_quantize_dynamic_weight`).
+    Returns ``(model, info)`` where `info` carries every float/quantized
+    array needed to hand-build an "already pruned" oracle.
+    """
+    rng = np.random.default_rng(seed)
+    W1f = (rng.standard_normal((K, N1)) * 0.3).astype(np.float32)
+    W2f = (rng.standard_normal((N1, N2)) * 0.3).astype(np.float32)
+    B1f = (rng.standard_normal(N1) * 0.05).astype(np.float32) if bias1 else None
+    W1q, W1s, W1zp = _quantize_dynamic_weight(W1f, per_channel)
+    W2q, W2s, W2zp = _quantize_dynamic_weight(W2f, per_channel)
+
+    bias_arg = ", B1" if B1f is not None else ""
+    body = f"""
+    g (float[1,{K}] X) => (float[1,{N2}] Y)
+    {{
+      h1 = com.microsoft.DynamicQuantizeMatMul(X, W1, W1_scale, W1_zero_point{bias_arg})
+      h1a = {activation}(h1)
+      Y = com.microsoft.DynamicQuantizeMatMul(h1a, W2, W2_scale, W2_zero_point)
+    }}
+    """
+    inits = [
+        onnx.numpy_helper.from_array(W1q, "W1"),
+        onnx.numpy_helper.from_array(W1s, "W1_scale"),
+        onnx.numpy_helper.from_array(W1zp, "W1_zero_point"),
+        onnx.numpy_helper.from_array(W2q, "W2"),
+        onnx.numpy_helper.from_array(W2s, "W2_scale"),
+        onnx.numpy_helper.from_array(W2zp, "W2_zero_point"),
+    ]
+    if B1f is not None:
+        inits.append(_f32(B1f, "B1"))
+    model = _nbits_model(body, initializer=inits, opset=21)
+    return model, {
+        "W1f": W1f,
+        "W2f": W2f,
+        "B1f": B1f,
+        "W1q": W1q,
+        "W1s": W1s,
+        "W1zp": W1zp,
+        "W2q": W2q,
+        "W2s": W2s,
+        "W2zp": W2zp,
+    }
+
+
+def _dqmm_importance_keep(W_q, W_s, W_zp, keep_count):
+    w_dequant = (
+        W_q.astype(np.float64) - W_zp.astype(np.float64)[None, :]
+    ) * W_s.astype(np.float64)[None, :]
+    importance = np.linalg.norm(w_dequant, axis=0)  # per output channel
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def test_cpp_dynamic_quantize_matmul_chain_matches_independently_requantized_oracle():
+    # The core correctness invariant this project's earlier rounds
+    # established, adapted from ``test_pruning.py``'s own
+    # ``test_dynamic_quantize_matmul_producer_matches_independently_
+    # requantized_subset``: a pruned model's output must match a reference
+    # built by quantizing the already-column-subset weight directly via the
+    # REAL quantizer -- NOT the full unpruned model's own output. Also
+    # confirms the `DynamicQuantizeMatMul` nodes themselves need no
+    # rewriting at all: both nodes survive pruning with their op_type/domain/
+    # input count completely unchanged, and the SECOND node (whose own `A`
+    # input is the first node's smaller, pruned output) still computes a
+    # correct result -- proof that its own internal dynamic quantization of
+    # the activation recomputes correctly against the smaller downstream
+    # weight with no help from this pass at all.
+    K, N1, N2 = 16, 24, 12
+    model, info = _dqmm_chain_model(K, N1, N2, per_channel=True, seed=2)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+
+    dq_nodes = [n for n in pruned.graph.node if n.op_type == "DynamicQuantizeMatMul"]
+    assert len(dq_nodes) == 2  # neither node was removed, replaced, or split
+    assert {n.domain for n in dq_nodes} == {"com.microsoft"}
+
+    keep = _dqmm_importance_keep(info["W1q"], info["W1s"], info["W1zp"], N1 // 2)
+    assert list(inits["W1"].dims) == [K, N1 // 2]
+    assert list(inits["W1_scale"].dims) == [N1 // 2]
+    assert list(inits["W1_zero_point"].dims) == [N1 // 2]
+    assert list(inits["W2"].dims) == [N1 // 2, N2]
+
+    # "Slice, don't recompute": the pruned graph's own quantized codes/
+    # scale/zero_point are EXACTLY a hand-slice of the original ones.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1"]), info["W1q"][:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1_scale"]), info["W1s"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1_zero_point"]), info["W1zp"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W2"]), info["W2q"][keep, :]
+    )
+
+    # Independently reconstructed "already pruned" reference model: the
+    # PRODUCER's kept-column weight is quantized FRESH via the real
+    # quantizer (per-channel quantization is column-independent, so this is
+    # byte-identical to the slice above). The CONSUMER's own weight is NEVER
+    # requantized -- its quantized CODES are sliced directly and its scale/
+    # zero-point copied UNCHANGED from the original, exactly what the
+    # consumer role itself does.
+    ref_model, _ = _dqmm_chain_model(K, len(keep), N2, per_channel=True, seed=987654)
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    # Overwrite the reference's own randomly-seeded producer weight with the
+    # REAL subset requantization of the ORIGINAL W1f -- not unrelated random
+    # data.
+    W1q_sub, W1s_sub, W1zp_sub = _quantize_dynamic_weight(
+        info["W1f"][:, keep], per_channel=True
+    )
+    ref_inits["W1"].CopyFrom(onnx.numpy_helper.from_array(W1q_sub, "W1"))
+    ref_inits["W1_scale"].CopyFrom(onnx.numpy_helper.from_array(W1s_sub, "W1_scale"))
+    ref_inits["W1_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(W1zp_sub, "W1_zero_point")
+    )
+    ref_inits["W2"].CopyFrom(onnx.numpy_helper.from_array(info["W2q"][keep, :], "W2"))
+    ref_inits["W2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2s"], "W2_scale")
+    )
+    ref_inits["W2_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2zp"], "W2_zero_point")
+    )
+
+    rng = np.random.default_rng(11)
+    x = rng.standard_normal((1, K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_ref,) = _run(ref_model, {"X": x})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_cpp_dynamic_quantize_matmul_per_tensor_scale_left_untouched():
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_chain_model(K, N1, N2, per_channel=False, seed=3)
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    # Per-tensor (scalar) scale/zero-point are never sliced, regardless of
+    # channel count -- byte-identical to the original.
+    assert list(inits["W1_scale"].dims) == []
+    assert list(inits["W1_zero_point"].dims) == []
+    assert list(inits["W1"].dims) == [K, N1 // 2]
+
+    rng = np.random.default_rng(12)
+    x = rng.standard_normal((1, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    assert y.shape == (1, N2)
+    assert np.all(np.isfinite(y))
+
+
+def test_cpp_dynamic_quantize_matmul_bias_is_sliced_as_plain_float():
+    K, N1, N2 = 16, 24, 12
+    model, info = _dqmm_chain_model(K, N1, N2, per_channel=True, bias1=True, seed=8)
+    onnx.checker.check_model(model)
+    keep = _dqmm_importance_keep(info["W1q"], info["W1s"], info["W1zp"], N1 // 2)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert inits["B1"].data_type == onnx.TensorProto.FLOAT
+    assert list(inits["B1"].dims) == [N1 // 2]
+    # Bias values are UNCHANGED (plain float, never quantized/rescaled) --
+    # unlike QGemm/QLinearConv's own quantized int32 bias.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["B1"]), info["B1f"][keep]
+    )
+
+
+def test_cpp_dynamic_quantize_matmul_tied_weight_is_declined():
+    # A second, unrelated node also reads W1 -- shared/tied, can't be sliced
+    # -- mirrors ``test_pruning.py``'s own
+    # ``test_dynamic_quantize_matmul_tied_weight_is_declined``.
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_chain_model(K, N1, N2, per_channel=True, seed=6)
+    extra = onnx.helper.make_node("Identity", ["W1"], ["W1_alias"], name="alias")
+    model.graph.node.append(extra)
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("W1_alias", onnx.TensorProto.INT8, [K, N1])
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    # Left completely untouched -- W1 is shared, so this chain is declined.
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_dynamic_quantize_matmul_missing_zero_point_is_declined():
+    # `b_zero_point` is schema-optional, but never confirmed empirically to
+    # be omitted by any real fixture -- declined outright (see this file's
+    # own section comment above ApplyDynQuantChains in
+    # ``structured_pruning_entry.cpp``), mirroring ``test_pruning.py``'s own
+    # ``test_dynamic_quantize_matmul_missing_zero_point_is_declined``.
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_chain_model(K, N1, N2, per_channel=True, seed=5)
+    for node in model.graph.node:
+        if node.output and node.output[0] == "h1":
+            node.input[3] = ""  # blank b_zero_point
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_dynamic_quantize_matmul_zero_sparsity_is_a_no_op():
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_chain_model(K, N1, N2, per_channel=True, seed=13)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.0)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_cpp_dynamic_quantize_matmul_matches_python_reference():
+    K, N1, N2 = 16, 24, 12
+    model, _info = _dqmm_chain_model(K, N1, N2, per_channel=True, seed=42)
+    onnx.checker.check_model(model)
+
+    pruned_py = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
     pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
     onnx.checker.check_model(pruned_py)
     onnx.checker.check_model(pruned_cpp)
