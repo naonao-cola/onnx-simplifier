@@ -93,6 +93,7 @@ from onnxsim.optimize_pipeline import (
 )
 from onnxsim.ort_matmul_nbits_workaround import workaround_ort_matmul_nbits_axis0_bug
 from onnxsim.outlier_suppression_plus import apply_outlier_suppression_plus
+from onnxsim.owq import apply_owq
 from onnxsim.precision_estimator import (
     ModelQuantizationEstimate,
     estimate_model_quantization_drop,
@@ -162,6 +163,7 @@ __all__ = [
     "apply_gptq",
     "apply_quantease",
     "apply_flexround",
+    "apply_owq",
     "apply_smoothquant",
     "apply_rptq_reorder",
     "apply_outlier_suppression_plus",
