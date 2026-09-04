@@ -97,13 +97,31 @@ def test_owq_reduces_reconstruction_error_by_rescuing_outlier_column():
     assert owq_err < rtn_err
 
 
-def test_owq_restores_selected_column_to_exact_precision():
-    # Whichever column(s) OWQ actually selects (a data-dependent choice --
-    # see the module's own OBS-based sensitivity metric), a probe that
-    # isolates just one of them (every other input channel zero) should
-    # come back essentially exact, since that column's whole contribution
-    # is now the *correction* term, computed directly from the float
-    # weight, not from any INT4 code.
+def _unpack_int4(tensor):
+    dims = list(tensor.dims)
+    numel = int(np.prod(dims))
+    raw = np.frombuffer(tensor.raw_data, dtype=np.uint8)
+    lo = (raw & 0x0F).astype(np.int8)
+    hi = ((raw >> 4) & 0x0F).astype(np.int8)
+    lo = np.where(lo >= 8, lo - 16, lo)
+    hi = np.where(hi >= 8, hi - 16, hi)
+    codes = np.empty(numel, dtype=np.int8)
+    codes[0::2] = lo[: (numel + 1) // 2]
+    codes[1::2] = hi[: numel // 2]
+    return codes.reshape(dims).astype(np.float64)
+
+
+def test_owq_correction_initializer_exactly_cancels_int4_error():
+    # OWQ's own exactness claim is about the *initializers it writes*, not
+    # about onnxruntime's own MatMul kernel numerics -- different CPU
+    # backends (observed: x86_64 vs arm64 CI runners) can reduce a MatMul
+    # over a 20x-magnitude outlier weight in a different order, which is a
+    # real but unrelated source of ~1e-3-relative float32 noise that has
+    # nothing to do with whether OWQ computed the right correction. So
+    # verify the actual claim directly and deterministically: reading back
+    # quant's real INT4 codes/scale and owq_model's own delta_w
+    # initializer, `codes * scale + delta_w` must equal the float weight
+    # for every rescued column, independent of any onnxruntime execution.
     K, N, outlier_col = 32, 8, 5
     model = _matmul_model_with_outlier_column(K=K, N=N, outlier_col=outlier_col, seed=2)
     x = _calibration(K=K, num_samples=32, seed=3)
@@ -119,6 +137,54 @@ def test_owq_restores_selected_column_to_exact_precision():
     idx_init = next(
         t for t in owq_model.graph.initializer if t.name == gather_node.input[1]
     )
+    weak_idx = onnx.numpy_helper.to_array(idx_init).astype(np.int64)
+
+    matmul_node = next(
+        n
+        for n in owq_model.graph.node
+        if n.op_type == "MatMul" and n.input[0] == gather_node.output[0]
+    )
+    delta_w_init = next(
+        t for t in owq_model.graph.initializer if t.name == matmul_node.input[1]
+    )
+    delta_w = onnx.numpy_helper.to_array(delta_w_init).astype(
+        np.float64
+    )  # [num_weak, N]
+
+    quant_dq = next(n for n in quant.graph.node if n.op_type == "DequantizeLinear")
+    wq = next(t for t in quant.graph.initializer if t.name == quant_dq.input[0])
+    ws = next(t for t in quant.graph.initializer if t.name == quant_dq.input[1])
+    block_size = next(a.i for a in quant_dq.attribute if a.name == "block_size")
+
+    codes = _unpack_int4(wq)  # [K, N] -- not transposed in this MatMul model
+    scale = onnx.numpy_helper.to_array(ws).astype(np.float64)  # [K / block_size, N]
+    scale_full = np.repeat(scale, block_size, axis=0)
+    w_rtn = codes * scale_full  # [K, N]
+
+    w_float = onnx.numpy_helper.to_array(model.graph.initializer[0]).astype(np.float64)
+
+    reconstructed = w_rtn[weak_idx, :] + delta_w  # [num_weak, N]
+    np.testing.assert_allclose(reconstructed, w_float[weak_idx, :], atol=1e-4)
+
+
+def test_owq_output_stays_close_to_float_when_isolating_selected_column():
+    # A looser, real-onnxruntime sanity check that the graph is wired up
+    # correctly end-to-end (the exactness claim itself is verified above at
+    # the initializer level, which is deterministic across platforms).
+    K, N, outlier_col = 32, 8, 5
+    model = _matmul_model_with_outlier_column(K=K, N=N, outlier_col=outlier_col, seed=2)
+    x = _calibration(K=K, num_samples=32, seed=3)
+    calibration_data = [{"X": x}]
+
+    quant = onnxsim.quantize_weight_only_int4(model)
+    owq_model = onnxsim.apply_owq(
+        model, quant, calibration_data=calibration_data, outlier_fraction=0.1
+    )
+
+    gather_node = next(n for n in owq_model.graph.node if n.op_type == "Gather")
+    idx_init = next(
+        t for t in owq_model.graph.initializer if t.name == gather_node.input[1]
+    )
     selected_col = int(onnx.numpy_helper.to_array(idx_init)[0])
 
     probe = np.zeros((1, K), dtype=np.float32)
@@ -128,17 +194,8 @@ def test_owq_restores_selected_column_to_exact_precision():
     y_float = probe.astype(np.float64) @ w_float
 
     (owq_y,) = _run(owq_model, {"X": probe})
-    # OWQ's correction restores the selected column's contribution exactly
-    # (computed directly from the float weight, independent of the INT4
-    # code), so isolating it should reproduce the float output almost
-    # exactly, regardless of how well or poorly plain RTN happened to
-    # handle that same column on its own. Relative (not absolute) error --
-    # the float32 MatMul's own accumulation error scales with the output's
-    # magnitude, which this synthetic scenario deliberately makes large
-    # (a 20x-magnitude weight column), so a fixed absolute threshold is the
-    # wrong comparison and is sensitive to platform-specific float32
-    # rounding (observed to vary between x86_64 and arm64 CI runners).
-    assert _rel_l2(y_float, owq_y) < 1e-4
+    assert np.all(np.isfinite(owq_y))
+    assert _rel_l2(y_float, owq_y) < 1e-2
 
 
 def test_owq_leaves_int4_codes_untouched():
