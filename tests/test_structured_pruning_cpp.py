@@ -1956,6 +1956,460 @@ def test_cpp_structured_pruning_skip_layer_norm_residual_declines_on_consumed_su
     assert pruned.SerializeToString() == model.SerializeToString()
 
 
+# --- PRelu/Clip channel pass-through hops ------------------------------------
+#
+# Two "channel pass-through hop" features ported from pruning.py's own
+# reference: a PRelu whose `slope` is either a scalar/single shared
+# parameter (left untouched) or a genuine per-channel constant (sliced by
+# the chain's own `keep` set, like a depthwise Conv hop's own weight), and a
+# Clip (the `torch.nn.ReLU6` shape MobileNet/EfficientNet-Lite exports)
+# crossed transparently whenever its `min`/`max` are each either omitted or
+# a constant scalar. See _match_prelu_pass_through(_self,_matmul,
+# _matmul_self) and _match_clip_channel_pass_through in pruning.py.
+
+
+def test_cpp_structured_pruning_prelu_per_channel_pass_through_conv_matches_oracle():
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(200)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    slope = rng.uniform(0.05, 0.3, size=(C1, 1, 1)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+
+    def _mk(w1, b1, slope, w2):
+        return _model(
+            f"""
+            g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+            {{
+              h = Conv<kernel_shape=[3,3]>(X, W1, B1)
+              a = PRelu(h, Slope)
+              Y = Conv<kernel_shape=[3,3]>(a, W2)
+            }}
+            """,
+            initializer=[
+                _f32(w1, "W1"),
+                _f32(b1, "B1"),
+                _f32(slope, "Slope"),
+                _f32(w2, "W2"),
+            ],
+        )
+
+    model = _mk(w1, b1, slope, w2)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    assert inits["Slope"].shape == (C1 // 2, 1, 1)
+    # The per-channel-slope hop reuses ConvPassThrough (same as a depthwise
+    # Conv hop), but PRelu has no `group` attribute of its own -- confirm the
+    # port doesn't erroneously bolt one on.
+    prelu_node = next(n for n in pruned.graph.node if n.op_type == "PRelu")
+    assert len(prelu_node.attribute) == 0
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _mk(w1[keep], b1[keep], slope[keep], w2[:, keep])
+
+    rng_x = np.random.default_rng(201)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_prelu_scalar_slope_left_untouched_on_conv_chain():
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(202)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    slope = np.array([0.2], dtype=np.float32)  # single shared parameter.
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+
+    def _mk(w1, slope, w2):
+        return _model(
+            f"""
+            g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+            {{
+              h = Conv<kernel_shape=[3,3]>(X, W1)
+              a = PRelu(h, Slope)
+              Y = Conv<kernel_shape=[3,3]>(a, W2)
+            }}
+            """,
+            initializer=[_f32(w1, "W1"), _f32(slope, "Slope"), _f32(w2, "W2")],
+        )
+
+    model = _mk(w1, slope, w2)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    # Scalar slope: same value multiplies every channel, so it's left
+    # completely untouched -- no "nothing of its own to slice" hop needed.
+    np.testing.assert_array_equal(inits["Slope"], slope)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _mk(w1[keep], slope, w2[:, keep])
+
+    rng_x = np.random.default_rng(203)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_clip_relu6_pass_through_conv_matches_oracle():
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(204)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    min_c = np.array(0.0, dtype=np.float32)
+    max_c = np.array(6.0, dtype=np.float32)
+
+    def _mk(w1, w2):
+        return _model(
+            f"""
+            g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+            {{
+              h = Conv<kernel_shape=[3,3]>(X, W1)
+              a = Clip(h, Min, Max)
+              Y = Conv<kernel_shape=[3,3]>(a, W2)
+            }}
+            """,
+            initializer=[
+                _f32(w1, "W1"),
+                _f32(min_c, "Min"),
+                _f32(max_c, "Max"),
+                _f32(w2, "W2"),
+            ],
+        )
+
+    model = _mk(w1, w2)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _mk(w1[keep], w2[:, keep])
+
+    rng_x = np.random.default_rng(205)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_prelu_bare_rank1_slope_declines_on_conv_chain():
+    # A bare [C] slope is deliberately *not* treated as per-channel on a Conv
+    # chain (unlike a MatMul/Gemm chain's own last-axis convention): ONNX's
+    # unidirectional broadcasting would align it against the *trailing* (W)
+    # axis, not axis 1 -- declined, never guessed at.
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(206)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    slope = rng.uniform(0.05, 0.3, size=(C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          a = PRelu(h, Slope)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(slope, "Slope"), _f32(w2, "W2")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["Slope"], slope)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_cpp_structured_pruning_prelu_nonconstant_slope_declines():
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(207)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X, float[{C1},1,1] Slope) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          a = PRelu(h, Slope)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_cpp_structured_pruning_clip_nonconstant_bound_declines():
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(208)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    min_c = np.array(0.0, dtype=np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X, float Max) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          a = Clip(h, Min, Max)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(min_c, "Min"), _f32(w2, "W2")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_cpp_structured_pruning_prelu_per_channel_pass_through_matmul_matches_oracle():
+    K, H, Out = 8, 32, 4
+    rng = np.random.default_rng(209)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    b1 = rng.standard_normal((H,)).astype(np.float32)
+    slope = rng.uniform(0.05, 0.3, size=(H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+
+    def _mk(w1, b1, slope, w2):
+        return _model(
+            f"""
+            g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+            {{
+              h = Gemm(X, W1, B1)
+              a = PRelu(h, Slope)
+              Y = MatMul(a, W2)
+            }}
+            """,
+            initializer=[
+                _f32(w1, "W1"),
+                _f32(b1, "B1"),
+                _f32(slope, "Slope"),
+                _f32(w2, "W2"),
+            ],
+        )
+
+    model = _mk(w1, b1, slope, w2)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    assert inits["Slope"].shape == (H // 2,)
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    oracle = _mk(w1[:, keep], b1[keep], slope[keep], w2[keep, :])
+
+    rng_x = np.random.default_rng(210)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_prelu_scalar_slope_left_untouched_on_matmul_chain():
+    K, H, Out = 8, 32, 4
+    rng = np.random.default_rng(211)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    # Single shared parameter, shape [1] -- mirrors _match_prelu_pass_through*'s
+    # own `if not dims: return None` bar, which (like the Conv-chain matcher)
+    # declines a true rank-0 slope; [1]/[1,1,1] is the shape real exporters
+    # (and this matcher) actually treat as "scalar".
+    slope = np.array([0.25], dtype=np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+
+    def _mk(w1, slope, w2):
+        return _model(
+            f"""
+            g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+            {{
+              h = MatMul(X, W1)
+              a = PRelu(h, Slope)
+              Y = MatMul(a, W2)
+            }}
+            """,
+            initializer=[_f32(w1, "W1"), _f32(slope, "Slope"), _f32(w2, "W2")],
+        )
+
+    model = _mk(w1, slope, w2)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Slope"], slope)
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    oracle = _mk(w1[:, keep], slope, w2[keep, :])
+
+    rng_x = np.random.default_rng(212)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_clip_relu6_pass_through_matmul_matches_oracle():
+    K, H, Out = 8, 32, 4
+    rng = np.random.default_rng(213)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    min_c = np.array(0.0, dtype=np.float32)
+    max_c = np.array([6.0], dtype=np.float32)  # single-element shape [1].
+
+    def _mk(w1, w2):
+        return _model(
+            f"""
+            g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+            {{
+              h = MatMul(X, W1)
+              a = Clip(h, Min, Max)
+              Y = MatMul(a, W2)
+            }}
+            """,
+            initializer=[
+                _f32(w1, "W1"),
+                _f32(min_c, "Min"),
+                _f32(max_c, "Max"),
+                _f32(w2, "W2"),
+            ],
+        )
+
+    model = _mk(w1, w2)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, H // 2]
+    assert list(inits["W2"].dims) == [H // 2, Out]
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    oracle = _mk(w1[:, keep], w2[keep, :])
+
+    rng_x = np.random.default_rng(214)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_conv_residual_prelu_pass_through_hop_matches_oracle():
+    # A PRelu per-channel hop crossed by the *backward* walk
+    # (WalkConvProducerBackward/MatchPreluPassThroughSelf), not just the
+    # forward one -- exercises the residual-chain insertion point and the
+    # ApplyChains "group" attribute guard (PRelu must not get one).
+    Cin, C, Cout = 3, 16, 8
+    rng = np.random.default_rng(215)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    slope = rng.uniform(0.05, 0.3, size=(C, 1, 1)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+
+    def _mk(w_f, slope, w_s, w_out):
+        return _model(
+            f"""
+            g (float[N,{Cin},10,10] X) => (float[N,{Cout},6,6] Y)
+            {{
+              f0 = Conv<kernel_shape=[3,3]>(X, WF)
+              f = PRelu(f0, Slope)
+              s = Conv<kernel_shape=[3,3]>(X, WS)
+              addr = Add(f, s)
+              r = Relu(addr)
+              Y = Conv<kernel_shape=[3,3]>(r, WOUT)
+            }}
+            """,
+            initializer=[
+                _f32(w_f, "WF"),
+                _f32(slope, "Slope"),
+                _f32(w_s, "WS"),
+                _f32(w_out, "WOUT"),
+            ],
+        )
+
+    model = _mk(w_f, slope, w_s, w_out)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    assert inits["Slope"].shape == (C // 2, 1, 1)
+    prelu_node = next(n for n in pruned.graph.node if n.op_type == "PRelu")
+    assert len(prelu_node.attribute) == 0
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    oracle = _mk(w_f[keep], slope[keep], w_s[keep], w_out[:, keep])
+
+    rng_x = np.random.default_rng(216)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_matmul_residual_clip_pass_through_hop_matches_oracle():
+    # A Clip crossed by the *backward* MatMul/Gemm walk
+    # (WalkMatmulProducerBackward) -- exercises that insertion point too.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(217)
+    w_f = rng.standard_normal((K, C)).astype(np.float32)
+    w_s = rng.standard_normal((K, C)).astype(np.float32)
+    w_out = rng.standard_normal((C, Out)).astype(np.float32)
+    min_c = np.array(0.0, dtype=np.float32)
+    max_c = np.array(6.0, dtype=np.float32)
+
+    def _mk(w_f, w_s, w_out):
+        return _model(
+            f"""
+            g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+            {{
+              f0 = MatMul(X, WF)
+              f = Clip(f0, Min, Max)
+              s = MatMul(X, WS)
+              addr = Add(f, s)
+              r = Relu(addr)
+              Y = MatMul(r, WOUT)
+            }}
+            """,
+            initializer=[
+                _f32(w_f, "WF"),
+                _f32(min_c, "Min"),
+                _f32(max_c, "Max"),
+                _f32(w_s, "WS"),
+                _f32(w_out, "WOUT"),
+            ],
+        )
+
+    model = _mk(w_f, w_s, w_out)
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f.T.astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s.T.astype(np.float64), axis=1))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    oracle = _mk(w_f[:, keep], w_s[:, keep], w_out[keep, :])
+
+    rng_x = np.random.default_rng(218)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 # --- Concat-merged (skip-connection) chains ----------------------------------
 
 
