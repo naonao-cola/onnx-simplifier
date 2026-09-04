@@ -198,3 +198,7 @@ node_modules/
 /npm/onnxsim/onnxsim.cjs
 /npm/onnxsim/onnxsim.wasm
 /npm/onnxsim/ort_executor.mjs
+
+# Claude Code local session/tooling state (e.g. background-agent worktree
+# checkouts under .claude/worktrees/) -- never part of the repo itself.
+/.claude/

@@ -268,6 +268,31 @@ void SetInt64TensorLastDim(onnx::TensorProto* t, int64_t new_last) {
   t->set_raw_data(std::move(raw));
 }
 
+// The INT64 analogue of SetFloatTensorData -- overwrites `t` in place with a
+// fresh INT64 tensor of `dims`/`data`, keeping its existing name. Used only
+// by ApplySplitGatedChains's own `split` *input* rewrite (mirrors
+// pruning.py's own `size_init.CopyFrom(onnx.numpy_helper.from_array(...))`
+// for that same rewrite), which -- unlike SetInt64TensorLastDim's single-
+// element Reshape-target-shape rewrite -- replaces every element of a
+// 2-element `[keep_count, keep_count]` sizes tensor.
+void SetInt64TensorData(onnx::TensorProto* t, const std::vector<int64_t>& dims,
+                        const std::vector<int64_t>& data) {
+  const std::string name = t->name();
+  t->Clear();
+  t->set_name(name);
+  t->set_data_type(onnx::TensorProto::INT64);
+  for (int64_t d : dims) {
+    t->add_dims(d);
+  }
+  std::string raw(data.size() * sizeof(int64_t), '\0');
+  std::memcpy(raw.data(), data.data(), raw.size());
+  if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+    onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(raw.data()),
+                                      raw.size(), sizeof(int64_t));
+  }
+  t->set_raw_data(std::move(raw));
+}
+
 int64_t ConvGroupAttr(const onnx::NodeProto& node) {
   for (const auto& attr : node.attribute()) {
     if (attr.name() == "group") {
@@ -366,6 +391,155 @@ size_t ConsumerCount(const ConsumerMap& consumers_of, const std::string& name) {
   return it == consumers_of.end() ? 0 : it->second.size();
 }
 
+// True iff `node` (already confirmed by the caller to be a plain
+// (default-domain) `Clip`, `node.input(0)` the tensor being walked through)
+// is a pure elementwise clamp with zero channel dependence, so it is safe to
+// cross transparently -- mirrors pruning.py's own
+// _match_clip_channel_pass_through exactly (see that function's own
+// docstring for the full reasoning: this is the `torch.nn.ReLU6` shape
+// ubiquitous in MobileNetV2/V3, EfficientNet-Lite, and QAT exports). Unlike
+// a Resize/Pad hop, Clip's own `min`/`max` operands are never axis-indexed
+// at all -- per Clip's own schema each must already be a scalar (empty or
+// single-element shape), broadcasting uniformly over every element
+// regardless of axis, so no axis reasoning is needed and the identical check
+// works unchanged for a Conv chain's own axis-1 channel convention and a
+// MatMul/Gemm chain's own last-axis convention alike -- shared by
+// WalkToConvConsumer/WalkConvProducerBackward and
+// WalkToConsumer/WalkMatmulProducerBackward below. Declines (false), never
+// guesses, whenever a present `min`/`max` (each optional -- a present but
+// empty-string input counts as *not* present) is missing from the
+// initializer map (a runtime-computed bound) or not single-element shaped.
+// Neither bound's own *value* is ever inspected -- clamping is a pure
+// elementwise op, so slicing which channels survive first and clamping
+// after computes exactly the same result as clamping first and slicing
+// after, for any min/max value.
+bool MatchClipChannelPassThrough(const onnx::NodeProto& node,
+                                 const InitMap& init_map) {
+  if (node.op_type() != "Clip" || node.domain() != "") {
+    return false;
+  }
+  if (node.input_size() == 0 || node.input(0).empty()) {
+    return false;
+  }
+  for (int idx : {1, 2}) {  // min, max -- both optional, opset 11+ input-based.
+    if (node.input_size() <= idx) {
+      continue;
+    }
+    const std::string& name = node.input(idx);
+    if (name.empty()) {
+      continue;  // Omitted optional input (empty-string placeholder).
+    }
+    auto it = init_map.find(name);
+    if (it == init_map.end()) {
+      return false;  // Non-constant -- declined, never guessed at.
+    }
+    const auto& dims = it->second->dims();
+    const bool is_scalar =
+        dims.size() == 0 || (dims.size() == 1 && dims.Get(0) == 1);
+    if (!is_scalar) {
+      return false;  // Not a scalar -- declined, never guessed at.
+    }
+  }
+  return true;
+}
+
+// One PRelu pass-through hop match: `is_per_channel` tells the caller
+// whether `slope_name` (present only when `is_per_channel`) needs its own
+// axis-0 (Conv chain)/last-axis (MatMul chain) slice, or -- for a scalar/
+// single shared parameter slope -- needs no slicing at all, the same
+// "nothing of its own to touch" shape a plain unary activation hop already
+// gets. Mirrors pruning.py's own `Optional[Tuple[bool, Optional[str]]]`
+// return convention for _match_prelu_pass_through and its three siblings
+// below.
+struct PreluMatch {
+  bool is_per_channel;
+  std::optional<std::string> slope_name;
+};
+
+// The MatMul/Gemm-chain PRelu pass-through matcher used by WalkToConsumer,
+// mirroring pruning.py's own _match_prelu_pass_through_matmul: since a
+// MatMul/Gemm chain's own channel axis is the tensor's *last* axis (not
+// axis 1, as for a Conv chain), `slope`'s per-channel shape here is the same
+// flat, last-axis-is-channel vector every other MatMul/Gemm hop's own
+// constant operand already is held to (prod(dims) == dims[-1]) -- e.g. a
+// bare `[C]`, safe here in a way it is *not* for a Conv chain's own
+// `[C, 1, 1]` convention (there is no trailing spatial axis for a rank-1
+// `[C]` to spuriously align against instead). Returns
+// `(is_per_channel, slope_name_or_none)`: scalar (`prod(dims) == 1`) is left
+// completely untouched; per-channel (`dims[-1] == n_channels`) is folded
+// into the caller's own chain_ops as an ordinary (node, slope_name) entry --
+// no dedicated hop type needed here the way the Conv walk's axis-0 slice
+// needs ConvPassThrough. Declines (nullopt) for a missing/non-constant/
+// otherwise-malformed slope, the same conservative bar every other hop here
+// holds its own constant operand to.
+std::optional<PreluMatch> MatchPreluPassThroughMatmul(
+    const onnx::NodeProto& node, const InitMap& init_map, int64_t n_channels) {
+  if (node.op_type() != "PRelu" || node.domain() != "") {
+    return std::nullopt;
+  }
+  if (node.input_size() != 2 || node.input(0).empty() ||
+      node.input(1).empty()) {
+    return std::nullopt;
+  }
+  if (node.output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& slope_name = node.input(1);
+  auto it = init_map.find(slope_name);
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT) {
+    return std::nullopt;
+  }
+  const onnx::TensorProto* s = it->second;
+  if (s->dims_size() == 0) {
+    return std::nullopt;
+  }
+  int64_t prod = 1;
+  for (int64_t d : s->dims()) {
+    prod *= d;
+  }
+  if (prod == 1) {
+    return PreluMatch{false, std::nullopt};  // Scalar -- untouched.
+  }
+  if (prod == s->dims(s->dims_size() - 1) &&
+      s->dims(s->dims_size() - 1) == n_channels) {
+    return PreluMatch{true, slope_name};
+  }
+  return std::nullopt;
+}
+
+// The backward-walk (WalkMatmulProducerBackward) counterpart of
+// MatchPreluPassThroughMatmul, mirroring pruning.py's own
+// _match_prelu_pass_through_matmul_self: the backward residual walk doesn't
+// know its group's real shared channel count yet at the point it first
+// crosses a PRelu hop, so this checks `slope`'s own shape is
+// self-consistent by calling that same matcher with `slope`'s own
+// `dims[-1]` as the "expected" channel count -- trivially satisfying the
+// per-channel case's own `dims[-1] == n_channels` check (never even
+// consulted by the scalar case). FindMatmulResidualChains/
+// ResolveMatmulResidualGroupForConcat already re-validate every chain_ops
+// constant this walk returns against the group's real channel count once
+// resolved, so no PRelu-specific re-validation is needed here.
+std::optional<PreluMatch> MatchPreluPassThroughMatmulSelf(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.op_type() != "PRelu" || node.domain() != "" ||
+      node.input_size() != 2) {
+    return std::nullopt;
+  }
+  const std::string& slope_name = node.input(1);
+  if (slope_name.empty()) {
+    return std::nullopt;
+  }
+  auto it = init_map.find(slope_name);
+  if (it == init_map.end()) {
+    return std::nullopt;
+  }
+  const int64_t expected = it->second->dims_size() > 0
+                               ? it->second->dims(it->second->dims_size() - 1)
+                               : 1;
+  return MatchPreluPassThroughMatmul(node, init_map, expected);
+}
+
 // True for an `Add` node the residual-chain finders below may treat as a
 // merge point: exactly two distinct, non-constant operands. Mirrors
 // pruning.py's own _is_eligible_add_merge exactly -- not Conv- or
@@ -404,6 +578,34 @@ struct ChainOp {
   std::optional<std::string> const_name;
 };
 
+// One mid-chain `GroupNormalization` node WalkToConvConsumer crossed
+// transparently -- the Conv/spatial-path analogue of ConvPassThrough's
+// depthwise-Conv hop, for group-normalization statistics rather than a
+// channel-mixing-free Conv. Unlike ConvPassThrough, this needs BOTH its own
+// `scale` and `bias` sliced (both required by the op's own schema) -- via
+// SliceLastAxis, not ConvPassThrough's own axis-0 SliceProducerWeight: a
+// GroupNormalization `scale`/`bias` is only ever admitted here when
+// FlatChannelConst's `prod(dims) == dims[-1]` bar holds (mirroring
+// pruning.py's own `_flat_channel_const`), a looser bar than strictly
+// rank-1 that a naive axis-0 slice would get wrong for (e.g. a `[1, 1, C]`
+// shape), so this deliberately does NOT reuse ConvPassThrough the way a
+// per-channel PRelu `slope` (always exactly `[C, 1, ..., 1]`) safely does --
+// see MatchGroupNormPassThrough. Also unlike ConvPassThrough, this hop is
+// its own dedicated (at-most-one-per-chain) `Chain::group_norm` field rather
+// than living in a vector: its `num_groups` constrains ChainGroup()'s own
+// per-block `keep` selection exactly like a general grouped Conv's own
+// `group` does (see ChainGroup, MatchGroupNormPassThrough), a whole-chain
+// property no other conv_pass_through hop carries. `num_groups` itself is
+// never rewritten -- staying valid (the post-prune channel count still
+// divides it evenly) without changing it is the entire point of the
+// uniform-per-`num_groups`-block scope this hop is held to.
+struct GroupNormPassThrough {
+  onnx::NodeProto* node;
+  std::string scale;
+  std::string bias;
+  int64_t num_groups;
+};
+
 // One extra, independent forward-consumer branch a residual/merge group's
 // own fan-out resolves to -- mirroring pruning.py's own _ConsumerBranch --
 // fed by the exact same shared `keep` set as a Chain's own primary
@@ -432,6 +634,12 @@ struct Chain {
   // fan-out resolved -- see pruning.py's own _Chain.extra_consumers. Always
   // empty for every chain kind except a Conv/MatMul residual/merge group.
   std::vector<ConsumerBranch> extra_consumers;
+  // A single mid-chain `GroupNormalization` hop the chain walk crossed
+  // transparently -- FindConvChains only, for now (see WalkToConvConsumer's
+  // own `recognize_group_norm` parameter; always nullopt for every other
+  // chain kind -- residual/merge chains, Concat-merged chains, and every
+  // MatMul/Gemm chain -- mirroring pruning.py's own `_Chain.group_norm`).
+  std::optional<GroupNormPassThrough> group_norm;
 };
 
 // --- MatMul/Gemm plain chains, mirroring _match_producer/_walk_to_consumer/
@@ -554,6 +762,20 @@ std::pair<std::optional<ConsumerMatch>, std::vector<ChainOp>> WalkToConsumer(
         }
       }
       const_name = fused->bias_name;
+    } else if (nxt->op_type() == "PRelu" && nxt->domain() == "" &&
+               nxt->input_size() > 0 && nxt->input(0) == cur) {
+      auto prelu_match =
+          MatchPreluPassThroughMatmul(*nxt, init_map, n_channels);
+      if (!prelu_match) {
+        break;
+      }
+      const_name =
+          prelu_match->is_per_channel ? prelu_match->slope_name : std::nullopt;
+    } else if (nxt->op_type() == "Clip" && nxt->domain() == "" &&
+               nxt->input_size() > 0 && nxt->input(0) == cur &&
+               nxt->output_size() == 1 &&
+               MatchClipChannelPassThrough(*nxt, init_map)) {
+      // Channel-agnostic -- no const of its own to slice.
     } else {
       break;
     }
@@ -878,6 +1100,314 @@ std::optional<DepthwiseMatch> MatchDepthwiseConvPassThrough(
   return DepthwiseMatch{node.input(1), bias};
 }
 
+// True if `name` names a constant FLOAT initializer shaped like a flat
+// per-channel vector (`prod(dims) == dims[-1]`) -- mirrors pruning.py's own
+// `_flat_channel_const` exactly: the self-consistency bar every per-channel
+// affine/bias/scale hop in this module checks before ever accepting a
+// tensor as a slice target. The real `dims[-1] == n_channels` check, once
+// the chain's real channel count is known, is left to the caller
+// (MatchGroupNormPassThrough).
+bool FlatChannelConst(const std::string& name, const InitMap& init_map) {
+  auto it = init_map.find(name);
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT) {
+    return false;
+  }
+  const auto& dims = it->second->dims();
+  if (dims.size() == 0) {
+    return false;
+  }
+  int64_t prod = 1;
+  for (int64_t d : dims) {
+    prod *= d;
+  }
+  return prod == dims.Get(dims.size() - 1);
+}
+
+struct GroupNormMatch {
+  std::string scale;
+  std::string bias;
+  int64_t num_groups;
+};
+
+// The Conv-chain GroupNormalization pass-through matcher used by
+// WalkToConvConsumer, mirroring pruning.py's own
+// _match_group_norm_pass_through: if `node` is a plain (default-domain)
+// `GroupNormalization` node whose own `num_groups` attribute evenly divides
+// `n_channels`, with constant, per-channel-shaped (FlatChannelConst,
+// `dims[-1] == n_channels` -- this alone already excludes the deprecated
+// opset-18 per-*group*-shaped schema whenever `num_groups < n_channels`)
+// `scale` (input 1) and `bias` (input 2) -- both required by the op's own
+// schema -- returns `{scale_name, bias_name, num_groups}`. Declines
+// (nullopt) on a missing/non-constant/wrongly-shaped `scale`/`bias`,
+// `num_groups < 1`, `n_channels % num_groups != 0`, or `scale`/`bias`
+// naming the same tensor (double-slicing it in ApplyChains's own per-hop
+// loop would corrupt it) -- none of these is guessed at. The real "does
+// this hop's own `num_groups` agree with a same-chain grouped Conv
+// producer's/consumer's own `group`" check is left to the caller
+// (FindConvChains), which has visibility into both.
+std::optional<GroupNormMatch> MatchGroupNormPassThrough(
+    const onnx::NodeProto& node, const InitMap& init_map, int64_t n_channels) {
+  if (node.op_type() != "GroupNormalization" || node.domain() != "") {
+    return std::nullopt;
+  }
+  if (node.input_size() != 3 || node.input(1).empty() ||
+      node.input(2).empty()) {
+    return std::nullopt;
+  }
+  int64_t num_groups = 0;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "num_groups") {
+      num_groups = attr.i();
+    }
+  }
+  if (num_groups < 1 || n_channels % num_groups != 0) {
+    return std::nullopt;
+  }
+  const std::string& scale_name = node.input(1);
+  const std::string& bias_name = node.input(2);
+  if (scale_name == bias_name) {
+    return std::nullopt;  // Tied scale/bias -- double-slicing would corrupt it.
+  }
+  if (!FlatChannelConst(scale_name, init_map) ||
+      !FlatChannelConst(bias_name, init_map)) {
+    return std::nullopt;
+  }
+  const auto& sdims = init_map.at(scale_name)->dims();
+  const auto& bdims = init_map.at(bias_name)->dims();
+  if (sdims.Get(sdims.size() - 1) != n_channels ||
+      bdims.Get(bdims.size() - 1) != n_channels) {
+    return std::nullopt;
+  }
+  return GroupNormMatch{scale_name, bias_name, num_groups};
+}
+
+// True iff `node` (already confirmed by the caller to be a plain
+// (default-domain) `Resize`, `node.input(0)` the tensor being walked
+// through) provably leaves axis 1 -- the NCHW channel axis this module's
+// Conv-chain machinery assumes throughout -- unresized, so it is safe to
+// cross transparently. Declines (false) rather than guesses whenever it
+// cannot statically prove that -- mirrors pruning.py's own
+// _match_resize_channel_pass_through exactly (see that function's own
+// docstring for the full reasoning, including the empirically-confirmed
+// commutativity argument and why a `sizes`-driven Resize is declined
+// outright rather than guessed at):
+//
+// - Needs a length-3-or-4 `node.input` (`X, roi, scales[, sizes]`, the
+//   opset 11+ signature) so `scales` lands at a known, fixed position.
+// - Only a `scales` (tensor(float))-driven Resize is ever recognized -- a
+//   `sizes`-driven one is declined outright, always, never guessed at.
+// - `scales` must be a constant FLOAT initializer -- a runtime-computed
+//   value means this pass cannot know which axis is affected.
+// - The (opset 18+) `axes` attribute, when present, restricts which input
+//   axes `scales` actually describes. A negative `axes` entry declines the
+//   whole hop (can't resolve without a known rank); axis 1 simply not being
+//   named in `axes` at all means it is by definition not resized.
+bool MatchResizeChannelPassThrough(const onnx::NodeProto& node,
+                                   const InitMap& init_map) {
+  if (node.op_type() != "Resize" || node.domain() != "") {
+    return false;
+  }
+  if ((node.input_size() != 3 && node.input_size() != 4) ||
+      node.input(0).empty()) {
+    return false;
+  }
+  const std::string& scales_name = node.input(2);
+  if (scales_name.empty()) {
+    return false;  // Only a `scales`-driven Resize is ever recognized.
+  }
+  auto it = init_map.find(scales_name);
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT) {
+    return false;
+  }
+  std::vector<float> values = ReadFloatTensor(*it->second);
+
+  std::optional<std::vector<int64_t>> axes_attr;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "axes") {
+      axes_attr = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    }
+  }
+
+  float channel_value;
+  if (!axes_attr) {
+    if (values.size() < 2) {
+      return false;  // No axis-1 slot in a `scales` this short.
+    }
+    channel_value = values[1];
+  } else {
+    for (int64_t a : *axes_attr) {
+      if (a < 0) {
+        return false;  // Can't resolve a negative axis without a known rank.
+      }
+    }
+    if (values.size() != axes_attr->size()) {
+      return false;  // Malformed -- schema requires equal length.
+    }
+    auto pos = std::find(axes_attr->begin(), axes_attr->end(), int64_t{1});
+    if (pos == axes_attr->end()) {
+      return true;  // Axis 1 isn't named -- definitely not resized.
+    }
+    channel_value = values[static_cast<size_t>(pos - axes_attr->begin())];
+  }
+  return channel_value == 1.0f;
+}
+
+// True iff `node` (already confirmed by the caller to be a plain
+// (default-domain) `Pad`, `node.input(0)` the tensor being walked through)
+// provably pads *nothing* on axis 1 -- the NCHW channel axis -- so it is
+// safe to cross transparently, whatever its `mode`. Declines (false) rather
+// than guesses whenever it cannot statically prove that -- mirrors
+// pruning.py's own _match_pad_channel_pass_through exactly (see that
+// function's own docstring for the full reasoning):
+//
+// - Needs a `pads` *input* at `node.input(1)` (opset 11+'s signature) that
+//   is a constant INT64 initializer -- opset < 11's older attribute-based
+//   `pads` is declined outright, mirroring MatchResizeChannelPassThrough's
+//   own "statically-known-constant-only" bar.
+// - The (opset 18+) `axes` *input* (`node.input(3)`), when present, must
+//   likewise be a constant INT64 initializer, and restricts which axes
+//   `pads` describes (`len(pads) == 2 * len(axes)`). A negative `axes`
+//   entry declines the whole hop; axis 1 not named in `axes` at all means
+//   it is by definition not padded.
+// - When `axes` is omitted, `pads` spans every input axis in order
+//   (`len(pads) == 2 * rank`), so `rank = len(pads) / 2` is recovered
+//   directly from `pads`'s own length, and axis 1's begin/end pads sit at
+//   `pads[1]`/`pads[rank + 1]`.
+bool MatchPadChannelPassThrough(const onnx::NodeProto& node,
+                                const InitMap& init_map) {
+  if (node.op_type() != "Pad" || node.domain() != "") {
+    return false;
+  }
+  if (node.input_size() < 2 || node.input(0).empty() || node.input(1).empty()) {
+    return false;
+  }
+  auto pit = init_map.find(node.input(1));
+  if (pit == init_map.end() ||
+      pit->second->data_type() != onnx::TensorProto::INT64) {
+    return false;
+  }
+  std::vector<int64_t> pads = ReadInt64Tensor(*pit->second);
+  std::string axes_name = node.input_size() > 3 ? node.input(3) : "";
+
+  int64_t begin, end;
+  if (!axes_name.empty()) {
+    auto ait = init_map.find(axes_name);
+    if (ait == init_map.end() ||
+        ait->second->data_type() != onnx::TensorProto::INT64) {
+      return false;
+    }
+    std::vector<int64_t> axes = ReadInt64Tensor(*ait->second);
+    for (int64_t a : axes) {
+      if (a < 0) {
+        return false;  // Can't resolve a negative axis without a known rank.
+      }
+    }
+    if (pads.size() != 2 * axes.size()) {
+      return false;  // Malformed -- schema requires equal length.
+    }
+    auto pos = std::find(axes.begin(), axes.end(), int64_t{1});
+    if (pos == axes.end()) {
+      return true;  // Axis 1 isn't named -- definitely not padded.
+    }
+    const size_t idx = static_cast<size_t>(pos - axes.begin());
+    begin = pads[idx];
+    end = pads[axes.size() + idx];
+  } else {
+    if (pads.size() % 2 != 0) {
+      return false;  // Malformed -- schema requires an even length.
+    }
+    const int64_t rank = static_cast<int64_t>(pads.size()) / 2;
+    if (rank < 2) {
+      return false;  // No axis-1 slot in a `pads` this short.
+    }
+    begin = pads[1];
+    end = pads[static_cast<size_t>(rank) + 1];
+  }
+  return begin == 0 && end == 0;
+}
+
+// The Conv-chain PRelu pass-through matcher used by WalkToConvConsumer,
+// mirroring pruning.py's own _match_prelu_pass_through: if `node` is a plain
+// (default-domain) PRelu whose own `slope` (input 1) is a constant float
+// initializer cleanly falling into one of two shapes real exporters
+// produce, returns `(is_per_channel, slope_name_or_none)`:
+//
+// - scalar/single shared parameter (every dimension size 1 -- e.g. a bare
+//   scalar, `[1]`, or the `[1, 1, 1]` a real `torch.onnx.export` of
+//   `nn.PReLU(1)` emits) -- `(false, nullopt)`: the same value multiplies
+//   every channel, so pruning some away changes nothing about it -- left
+//   completely untouched, the same "no operand of its own to slice" shape a
+//   unary activation hop already gets.
+// - per-channel (`dims[0] == n_channels`, every other dimension size 1 --
+//   e.g. the `[C, 1, 1]` a real `torch.onnx.export` of `nn.PReLU(C)` emits
+//   for a 2-D Conv) -- `(true, slope_name)`: one independent value per
+//   channel, co-sliced by the chain's own `keep` index set exactly like a
+//   depthwise Conv hop's own weight already is -- this reuses ConvPassThrough
+//   for exactly that reason (`slope`'s own `[C, 1, ..., 1]` layout needs the
+//   identical axis-0, any-trailing-rank slice a depthwise Conv's own weight
+//   already gets, and PRelu has no `group` attribute for the caller's own
+//   conv-groupedness dispatch to (correctly) leave untouched -- see
+//   ApplyChains/ApplyConcatChains's own `op_type() == "Conv"` guard around
+//   `SetOrAddIntAttr(..., "group", ...)`).
+//
+// A bare rank-1 `[C]` slope is deliberately *not* treated as per-channel
+// here, unlike a MatMul/Gemm chain's own last-axis-is-channel convention
+// (MatchPreluPassThroughMatmul above) -- this module's Conv-chain machinery
+// assumes NCHW's axis-1-is-channel convention throughout, and ONNX's
+// unidirectional broadcasting aligns a slope's own dimensions against `X`'s
+// *trailing* ones: a `[C]` slope padded against a rank-4 NCHW tensor lands
+// on axis 3 (W), not axis 1, unless C happens to equal W by coincidence.
+// Requiring at least one trailing size-1 dimension (`dims_size() >= 2`) is
+// what rules a bare `[C]` out here. Declines (nullopt) whenever `node` isn't
+// a plain PRelu, `slope` is missing/non-constant, or its shape doesn't
+// cleanly fall into either shape above -- never guessed at.
+std::optional<PreluMatch> MatchPreluPassThrough(const onnx::NodeProto& node,
+                                                const InitMap& init_map,
+                                                int64_t n_channels) {
+  if (node.op_type() != "PRelu" || node.domain() != "") {
+    return std::nullopt;
+  }
+  if (node.input_size() != 2 || node.input(0).empty() ||
+      node.input(1).empty()) {
+    return std::nullopt;
+  }
+  if (node.output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string& slope_name = node.input(1);
+  auto it = init_map.find(slope_name);
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT) {
+    return std::nullopt;
+  }
+  const onnx::TensorProto* s = it->second;
+  if (s->dims_size() == 0) {
+    return std::nullopt;
+  }
+  int64_t prod = 1;
+  for (int64_t d : s->dims()) {
+    prod *= d;
+  }
+  if (prod == 1) {
+    return PreluMatch{false, std::nullopt};  // Scalar -- untouched.
+  }
+  if (s->dims_size() >= 2 && s->dims(0) == n_channels) {
+    bool trailing_ones = true;
+    for (int i = 1; i < s->dims_size(); ++i) {
+      if (s->dims(i) != 1) {
+        trailing_ones = false;
+        break;
+      }
+    }
+    if (trailing_ones) {
+      return PreluMatch{true, slope_name};
+    }
+  }
+  return std::nullopt;
+}
+
 struct ConvConsumerResult {
   onnx::NodeProto* node;
   std::string weight;
@@ -885,15 +1415,21 @@ struct ConvConsumerResult {
 };
 
 std::tuple<std::optional<ConvConsumerResult>, std::vector<ChainOp>,
-           std::vector<ConvPassThrough>>
+           std::vector<ConvPassThrough>, std::optional<GroupNormPassThrough>>
 WalkToConvConsumer(const std::string& start, const InitMap& init_map,
                    const ConsumerMap& consumers_of,
                    const std::unordered_set<std::string>& graph_outputs,
                    int64_t n_channels, int max_hops,
-                   onnx::NodeProto* forced_first_hop = nullptr) {
+                   onnx::NodeProto* forced_first_hop = nullptr,
+                   bool recognize_group_norm = false) {
   std::vector<ChainOp> chain_ops;
   std::vector<ConvPassThrough> pass_through;
   std::optional<ConvConsumerResult> consumer;
+  // At most one mid-chain GroupNormalization hop per chain -- mirrors
+  // pruning.py's own `group_norm is None` gate on _walk_to_conv_consumer's
+  // own matching `if`. Only ever recognized when `recognize_group_norm`
+  // (FindConvChains only, today -- see Chain::group_norm's own comment).
+  std::optional<GroupNormPassThrough> group_norm;
   std::string cur = start;
   for (int hop = 0; hop < max_hops; ++hop) {
     onnx::NodeProto* nxt;
@@ -928,6 +1464,82 @@ WalkToConvConsumer(const std::string& start, const InitMap& init_map,
       break;
     }
 
+    if (recognize_group_norm && !group_norm &&
+        nxt->op_type() == "GroupNormalization" && nxt->domain() == "" &&
+        nxt->input_size() > 0 && nxt->input(0) == cur) {
+      auto gn_match = MatchGroupNormPassThrough(*nxt, init_map, n_channels);
+      if (!gn_match) {
+        break;
+      }
+      const std::string& out2 = nxt->output(0);
+      if (ConsumerCount(consumers_of, out2) != 1 || graph_outputs.count(out2)) {
+        break;
+      }
+      group_norm = GroupNormPassThrough{nxt, gn_match->scale, gn_match->bias,
+                                        gn_match->num_groups};
+      cur = out2;
+      continue;
+    }
+
+    if (nxt->op_type() == "Resize" && nxt->domain() == "" &&
+        nxt->input_size() > 0 && nxt->input(0) == cur &&
+        nxt->output_size() == 1 &&
+        MatchResizeChannelPassThrough(*nxt, init_map)) {
+      const std::string& out2 = nxt->output(0);
+      if (ConsumerCount(consumers_of, out2) != 1 || graph_outputs.count(out2)) {
+        break;
+      }
+      chain_ops.push_back(ChainOp{nxt, std::nullopt});
+      cur = out2;
+      continue;
+    }
+
+    if (nxt->op_type() == "Pad" && nxt->domain() == "" &&
+        nxt->input_size() > 0 && nxt->input(0) == cur &&
+        nxt->output_size() == 1 && MatchPadChannelPassThrough(*nxt, init_map)) {
+      const std::string& out2 = nxt->output(0);
+      if (ConsumerCount(consumers_of, out2) != 1 || graph_outputs.count(out2)) {
+        break;
+      }
+      chain_ops.push_back(ChainOp{nxt, std::nullopt});
+      cur = out2;
+      continue;
+    }
+
+    if (nxt->op_type() == "PRelu" && nxt->domain() == "" &&
+        nxt->input_size() > 0 && nxt->input(0) == cur &&
+        nxt->output_size() == 1) {
+      auto prelu_match = MatchPreluPassThrough(*nxt, init_map, n_channels);
+      if (!prelu_match) {
+        break;
+      }
+      const std::string& out2 = nxt->output(0);
+      if (ConsumerCount(consumers_of, out2) != 1 || graph_outputs.count(out2)) {
+        break;
+      }
+      if (prelu_match->is_per_channel) {
+        pass_through.push_back(
+            ConvPassThrough{nxt, *prelu_match->slope_name, std::nullopt});
+      } else {
+        chain_ops.push_back(ChainOp{nxt, std::nullopt});
+      }
+      cur = out2;
+      continue;
+    }
+
+    if (nxt->op_type() == "Clip" && nxt->domain() == "" &&
+        nxt->input_size() > 0 && nxt->input(0) == cur &&
+        nxt->output_size() == 1 &&
+        MatchClipChannelPassThrough(*nxt, init_map)) {
+      const std::string& out2 = nxt->output(0);
+      if (ConsumerCount(consumers_of, out2) != 1 || graph_outputs.count(out2)) {
+        break;
+      }
+      chain_ops.push_back(ChainOp{nxt, std::nullopt});
+      cur = out2;
+      continue;
+    }
+
     if (!(UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
           nxt->input_size() == 1 && nxt->input(0) == cur &&
           nxt->output_size() == 1)) {
@@ -940,7 +1552,7 @@ WalkToConvConsumer(const std::string& start, const InitMap& init_map,
     chain_ops.push_back(ChainOp{nxt, std::nullopt});
     cur = out2;
   }
-  return {consumer, chain_ops, pass_through};
+  return {consumer, chain_ops, pass_through, group_norm};
 }
 
 std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
@@ -968,15 +1580,27 @@ std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
     if (!is_internal(out_name)) {
       continue;
     }
-    auto [consumer, chain_ops, pass_through] =
-        WalkToConvConsumer(out_name, init_map, consumers_of, graph_outputs,
-                           info->out_channels, kMaxChainHops);
+    auto [consumer, chain_ops, pass_through, group_norm] = WalkToConvConsumer(
+        out_name, init_map, consumers_of, graph_outputs, info->out_channels,
+        kMaxChainHops, /*forced_first_hop=*/nullptr,
+        /*recognize_group_norm=*/true);
     if (!consumer) {
       continue;
     }
     if (info->group > 1 && consumer->group > 1 &&
         info->group != consumer->group) {
       continue;  // Both sides grouped with mismatched group counts: declined.
+    }
+    if (group_norm &&
+        ((info->group > 1 && info->group != group_norm->num_groups) ||
+         (consumer->group > 1 && consumer->group != group_norm->num_groups))) {
+      // The mid-chain GroupNorm hop's own `num_groups` disagrees with a
+      // general grouped Conv producer's or consumer's own `group` -- the
+      // two partitions' own block boundaries wouldn't generally align,
+      // exactly the same "declined outright" bar the producer/consumer
+      // group mismatch above already gets. Mirrors pruning.py's own
+      // identical reconciliation check in _find_conv_chains.
+      continue;
     }
 
     Chain chain;
@@ -990,6 +1614,7 @@ std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
     chain.consumer_is_conv = true;
     chain.conv_pass_through = std::move(pass_through);
     chain.consumer_group = consumer->group;
+    chain.group_norm = std::move(group_norm);
     chains.push_back(std::move(chain));
   }
   return chains;
@@ -1049,6 +1674,40 @@ std::optional<DepthwiseMatch> MatchConvPassThroughSelf(
   return MatchDepthwiseConvPassThrough(node, init_map, it->second->dims(0));
 }
 
+// The backward-walk (WalkConvProducerBackward) counterpart of
+// MatchPreluPassThrough, mirroring pruning.py's own
+// _match_prelu_pass_through_self and MatchConvPassThroughSelf's own
+// identical trick: the backward residual walk doesn't know its group's
+// shared channel count yet at the point it first crosses a PRelu hop, so
+// this checks the node's own `slope` is self-consistently shaped by calling
+// that same matcher with `slope`'s own `dims(0)` as the "expected" channel
+// count -- trivially satisfying the per-channel case's own
+// `dims(0) == n_channels` check and leaving every other one (including the
+// scalar case, which never even looks at n_channels) intact.
+// FindConvResidualChains/ResolveConvResidualGroupForConcat re-validate every
+// per-channel hop this returns against the group's real, established
+// channel count once resolved (the same generic `pass_through`
+// re-validation a depthwise hop already gets, keyed only on `hop.weight`'s
+// own `dims(0)`, needing no PRelu-specific case of its own).
+std::optional<PreluMatch> MatchPreluPassThroughSelf(const onnx::NodeProto& node,
+                                                    const InitMap& init_map) {
+  if (node.op_type() != "PRelu" || node.domain() != "" ||
+      node.input_size() != 2) {
+    return std::nullopt;
+  }
+  const std::string& slope_name = node.input(1);
+  if (slope_name.empty()) {
+    return std::nullopt;
+  }
+  auto it = init_map.find(slope_name);
+  if (it == init_map.end()) {
+    return std::nullopt;
+  }
+  const int64_t expected =
+      it->second->dims_size() > 0 ? it->second->dims(0) : 1;
+  return MatchPreluPassThrough(node, init_map, expected);
+}
+
 // Walks backward from tensor `start` through unary pass-through activations
 // and self-consistently-depthwise Conv hops, declining (only) whenever a
 // tensor crossed -- `start` itself included -- is a graph output. Unlike the
@@ -1097,6 +1756,43 @@ ConvBackwardEdge WalkConvProducerBackward(
     auto dw = MatchConvPassThroughSelf(*node, init_map);
     if (dw) {
       pass_through.push_back(ConvPassThrough{node, dw->weight, dw->bias});
+      edges.push_back({node->input(0), node});
+      cur = node->input(0);
+      continue;
+    }
+
+    if (node->op_type() == "Resize" &&
+        MatchResizeChannelPassThrough(*node, init_map)) {
+      unary_ops.push_back(node);
+      edges.push_back({node->input(0), node});
+      cur = node->input(0);
+      continue;
+    }
+
+    if (node->op_type() == "Pad" &&
+        MatchPadChannelPassThrough(*node, init_map)) {
+      unary_ops.push_back(node);
+      edges.push_back({node->input(0), node});
+      cur = node->input(0);
+      continue;
+    }
+
+    auto prelu_self = MatchPreluPassThroughSelf(*node, init_map);
+    if (prelu_self) {
+      if (prelu_self->is_per_channel) {
+        pass_through.push_back(
+            ConvPassThrough{node, *prelu_self->slope_name, std::nullopt});
+      } else {
+        unary_ops.push_back(node);
+      }
+      edges.push_back({node->input(0), node});
+      cur = node->input(0);
+      continue;
+    }
+
+    if (node->op_type() == "Clip" &&
+        MatchClipChannelPassThrough(*node, init_map)) {
+      unary_ops.push_back(node);
       edges.push_back({node->input(0), node});
       cur = node->input(0);
       continue;
@@ -1167,9 +1863,15 @@ std::optional<std::vector<ConsumerBranch>> ResolveConvFanoutBranches(
       if (acc_it != accounted.end() && acc_it->second.count(consumer_node)) {
         continue;  // Already part of the group's own established wiring.
       }
-      auto [resolved, br_chain_ops, br_pass_through] =
+      // `recognize_group_norm` stays at its default (false) here -- a
+      // fan-out branch's own forward re-walk never recognizes a mid-chain
+      // GroupNorm hop, mirroring pruning.py's own _resolve_conv_fanout_branches
+      // (which never passes `recognize_group_norm=True` to its own
+      // _walk_to_conv_consumer call either).
+      auto [resolved, br_chain_ops, br_pass_through, br_group_norm] =
           WalkToConvConsumer(tensor, init_map, consumers_of, graph_outputs,
                              n_channels, kMaxChainHops, consumer_node);
+      (void)br_group_norm;  // Always nullopt -- see comment above.
       if (!resolved) {
         return std::nullopt;
       }
@@ -1775,6 +2477,28 @@ MatMulBackwardEdge WalkMatmulProducerBackward(
       return MatMulBackwardEdge{};
     }
 
+    if (node->op_type() == "PRelu" && node->domain() == "" &&
+        node->input_size() == 2) {
+      auto prelu_self = MatchPreluPassThroughMatmulSelf(*node, init_map);
+      if (prelu_self) {
+        chain_ops.push_back(ChainOp{node, prelu_self->is_per_channel
+                                              ? prelu_self->slope_name
+                                              : std::nullopt});
+        edges.push_back({node->input(0), node});
+        cur = node->input(0);
+        continue;
+      }
+      return MatMulBackwardEdge{};
+    }
+
+    if (node->op_type() == "Clip" &&
+        MatchClipChannelPassThrough(*node, init_map)) {
+      chain_ops.push_back(ChainOp{node, std::nullopt});
+      edges.push_back({node->input(0), node});
+      cur = node->input(0);
+      continue;
+    }
+
     if (MatchResidualMerge(node, init_map, consumers_of, graph_outputs)) {
       MatMulBackwardEdge edge;
       edge.kind = BackwardEdgeKind::kAdd;
@@ -2095,12 +2819,25 @@ std::vector<Chain> FindMatmulResidualChains(onnx::GraphProto* graph) {
 }
 
 int64_t ChainGroup(const Chain& chain) {
+  int64_t group = chain.consumer_group;
   for (const auto& p : chain.producers) {
     if (p.group > 1) {
-      return p.group;
+      group = p.group;
+      break;
     }
   }
-  return chain.consumer_group;
+  // A mid-chain GroupNormalization hop's own `num_groups` takes priority
+  // over the plain producer/consumer `group` fields above -- FindConvChains
+  // already declined the chain outright if `num_groups` disagreed with a
+  // non-1 producer/consumer `group` (see its own reconciliation check), so
+  // whenever both are present they already agree, and returning
+  // `num_groups` unconditionally is equivalent to returning either. This is
+  // what makes GroupNorm's own per-group statistics stay valid after
+  // pruning -- mirrors pruning.py's own _chain_group exactly.
+  if (chain.group_norm) {
+    group = chain.group_norm->num_groups;
+  }
+  return group;
 }
 
 // --- Slicing, mirroring _slice_producer_weight/_slice_consumer_weight/
@@ -2388,6 +3125,14 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
         }
       }
     }
+    // A mid-chain GroupNorm hop's own `scale`/`bias` get exactly the same
+    // shared/tied-initializer conflict protection every other chain-op
+    // constant already does -- mirrors pruning.py's own
+    // `consts.update(_chain_group_norm_consts(chain))`.
+    if (chain.group_norm) {
+      consts.insert(chain.group_norm->scale);
+      consts.insert(chain.group_norm->bias);
+    }
 
     bool conflict = false;
     for (const auto& w : consumer_weights) {
@@ -2493,7 +3238,23 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
       if (hop.bias) {
         SliceLastAxis(init_map.at(*hop.bias), keep);
       }
-      SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
+      // A PRelu per-channel-slope hop reuses ConvPassThrough for its own
+      // slicing (see MatchPreluPassThrough's own comment) but, unlike a
+      // depthwise Conv hop, has no `group` attribute of its own to update --
+      // mirrors pruning.py's own _apply_conv_pass_through_hop, which only
+      // ever touches `group` when the hop node is actually a Conv.
+      if (hop.node->op_type() == "Conv") {
+        SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
+      }
+    }
+    if (chain.group_norm) {
+      // Same `keep` index set as the real producer -- `num_groups` itself is
+      // left untouched (see GroupNormPassThrough's own comment for why it
+      // stays valid without changing it). Sliced via SliceLastAxis, not
+      // ConvPassThrough's own axis-0 SliceProducerWeight -- see
+      // GroupNormPassThrough's own comment for why.
+      SliceLastAxis(init_map.at(chain.group_norm->scale), keep);
+      SliceLastAxis(init_map.at(chain.group_norm->bias), keep);
     }
     if (chain.consumer_is_conv && chain.consumer_group > 1) {
       SliceGroupedConsumerConvWeight(init_map.at(chain.consumer_weight), keep,
@@ -2522,7 +3283,9 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
         if (hop.bias) {
           SliceLastAxis(init_map.at(*hop.bias), keep);
         }
-        SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
+        if (hop.node->op_type() == "Conv") {
+          SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
+        }
       }
       if (b->consumer_is_conv && b->consumer_group > 1) {
         SliceGroupedConsumerConvWeight(init_map.at(b->consumer_weight), keep,
@@ -2557,6 +3320,9 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
     }
     for (const auto& hop : chain.conv_pass_through) {
       stale_value_info.insert(hop.node->output(0));
+    }
+    if (chain.group_norm) {
+      stale_value_info.insert(chain.group_norm->node->output(0));
     }
     for (const auto* b : extra_ptrs) {
       for (const auto& co : b->chain_ops) {
@@ -4058,9 +4824,15 @@ std::vector<ConcatChain> FindConvConcatChains(onnx::GraphProto* graph) {
       continue;
     }
     const int64_t total_n = offset;
-    auto [consumer, fwd_chain_ops, fwd_pass_through] =
+    // `recognize_group_norm` stays at its default (false) here too -- a
+    // Concat-merged chain's own forward consumer walk never recognizes a
+    // mid-chain GroupNorm hop either, mirroring pruning.py's own
+    // FindConvConcatChains-equivalent walk (GroupNorm pass-through is
+    // FindConvChains-only, see Chain::group_norm's own comment).
+    auto [consumer, fwd_chain_ops, fwd_pass_through, fwd_group_norm] =
         WalkToConvConsumer(out_name, init_map, consumers_of, graph_outputs,
                            total_n, kMaxChainHops);
+    (void)fwd_group_norm;  // Always nullopt -- see comment above.
     if (!consumer) {
       continue;
     }
@@ -4236,7 +5008,9 @@ void ApplyConcatChains(onnx::GraphProto* graph,
         if (hop.bias) {
           SliceLastAxis(init_map.at(*hop.bias), keep);
         }
-        SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
+        if (hop.node->op_type() == "Conv") {
+          SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
+        }
       }
     }
 
@@ -4257,8 +5031,10 @@ void ApplyConcatChains(onnx::GraphProto* graph,
       if (hop.bias) {
         SliceLastAxis(init_map.at(*hop.bias), global_keep);
       }
-      SetOrAddIntAttr(hop.node, "group",
-                      static_cast<int64_t>(global_keep.size()));
+      if (hop.node->op_type() == "Conv") {
+        SetOrAddIntAttr(hop.node, "group",
+                        static_cast<int64_t>(global_keep.size()));
+      }
     }
 
     SliceConsumerWeight(init_map.at(chain.consumer_weight),
@@ -4296,6 +5072,626 @@ void ApplyConcatChains(onnx::GraphProto* graph,
   }
 }
 
+// --- Split-merged (fused gate_up_proj) gated FFN chains, mirroring
+// pruning.py's own "Split-merged (fused gate_up_proj) gated FFN chains"
+// section -- _SplitGatedChain/_split_axis/_split_axis_is_last/
+// _split_explicit_sizes/_trace_split_half_backward/_find_split_gated_chains/
+// _apply_split_gated_chains -----------------------------------------------
+//
+// FindGatedChains above only recognizes the TWO-SEPARATE-PRODUCER shape:
+// Mul(gate_proj(x), up_proj(x)) with two distinct MatMul/Gemm weight
+// tensors. Real, currently-shipped Phi-3/Phi-3.5 (onnxruntime-genai) exports
+// use a different, equally common shape instead: ONE gate_up_proj MatMul/
+// Gemm producer (2*H output columns) -> Split(axis=-1, two equal H-wide
+// outputs) -> (gate, up) -> act(gate) * up (or native SwiGLU) -> down_proj.
+// Unlike the two-producer case, gate and up are two HALVES of the SAME
+// physical weight: columns [0, H) are gate, columns [H, 2H) are up (Split's
+// own output-order guarantee). "Neuron" i of the intermediate dimension is
+// therefore represented by BOTH column i and column H + i of the one
+// producer weight -- they must always be kept or dropped TOGETHER, so a
+// single `keep` set is chosen once over `h` (not `2h`) candidates and
+// applied at both fixed offsets of that one tensor -- see pruning.py's own
+// section comment for the full shape derivation, the exact supported/
+// declined boundary (MatMul/Gemm only, no quantized producer/consumer, the
+// producer's raw output must feed Split directly with no bias-Add hop in
+// between, `global_sparsity` mode excludes this family the same way an
+// ordinary gated pair already is), and the worked InferenceSession-verified
+// correctness argument -- this port covers the identical scope, kept
+// deliberately narrower only where the rest of this file already is (no
+// recursion into `If` subgraphs, matching every other finder here).
+//
+// Kept as its own struct (SplitGatedChain) rather than reusing Chain: the
+// shape genuinely differs from every other family this file matches --
+// exactly one physical producer tensor split by a dedicated Split node, one
+// `h`-wide keep set applied at two fixed offsets of that one tensor, plus
+// the Split node's own size bookkeeping -- none of which fits Chain's
+// "N independent producers, each pruned to the same, un-offset keep set"
+// shape. Applied by its own ApplySplitGatedChains, mirroring pruning.py's
+// own deliberate `_apply_chains`/`_apply_split_gated_chains` split (called
+// from ApplyStructuredPruning alongside, not instead of, ApplyChains) for
+// the identical reason: ApplyChains' shared per-chain body (one keep set,
+// applied unmodified to every producer/consumer weight it holds) has no
+// hook for "the same tensor, sliced at two different offsets" or for a
+// Split node's own attribute/input rewrite, and retrofitting one would
+// complicate every other chain family's own straight-line path for a
+// single caller.
+
+enum class SplitSizesKind { kAuto, kAttr, kInput };
+
+// node.attribute("axis"), Split's own schema default (0) -- unlike Concat's
+// *required* attribute, so an un-annotated Split still has a real axis to
+// check against (never itself grounds for decline). Mirrors pruning.py's
+// own _split_axis.
+int64_t SplitAxis(const onnx::NodeProto& node) {
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "axis") {
+      return attr.i();
+    }
+  }
+  return 0;
+}
+
+// The Split-node analogue of ConcatAxisIsLast, with a single operand
+// (Split has exactly one data input) rather than Concat's several --
+// axis == -1 outright, or a positive axis only when node.input(0)'s own
+// rank is known via value_info and agrees; declined (never guessed at)
+// when that rank isn't known at all. Mirrors pruning.py's own
+// _split_axis_is_last.
+bool SplitAxisIsLast(
+    const onnx::NodeProto& node,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name) {
+  const int64_t axis = SplitAxis(node);
+  if (axis < 0) {
+    return axis == -1;
+  }
+  auto rank = TensorRank(node.input(0), value_info_by_name);
+  if (!rank) {
+    return false;  // Rank unknown -- decline rather than guess.
+  }
+  return axis == *rank - 1;
+}
+
+struct SplitSizesResult {
+  // Absent for "auto" (no explicit sizes anywhere -- a fully automatic even
+  // split, driven purely by the actual output count).
+  std::optional<std::vector<int64_t>> sizes;
+  SplitSizesKind kind;
+};
+
+// Describes how `node` (assumed already confirmed to be a Split) spells out
+// its own two output sizes: opsets before 13 spell explicit sizes as an
+// integer-list `split` *attribute*; opset 13+ moved that to an optional
+// `split` *input* instead (still accepting no sizes at all, for an even
+// split). Returns std::nullopt outright -- decline -- when a `split` input
+// IS present but is not a resolvable constant INT64 initializer. Mirrors
+// pruning.py's own _split_explicit_sizes exactly.
+std::optional<SplitSizesResult> SplitExplicitSizes(const onnx::NodeProto& node,
+                                                   const InitMap& init_map) {
+  if (node.input_size() >= 2 && !node.input(1).empty()) {
+    auto it = init_map.find(node.input(1));
+    if (it == init_map.end() ||
+        it->second->data_type() != onnx::TensorProto::INT64) {
+      return std::nullopt;
+    }
+    return SplitSizesResult{ReadInt64Tensor(*it->second),
+                            SplitSizesKind::kInput};
+  }
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "split") {
+      return SplitSizesResult{
+          std::vector<int64_t>(attr.ints().begin(), attr.ints().end()),
+          SplitSizesKind::kAttr};
+    }
+  }
+  return SplitSizesResult{std::nullopt, SplitSizesKind::kAuto};
+}
+
+// One of a matched gate_up-style Split node's own two outputs.
+struct SplitHalfOf {
+  onnx::NodeProto* split_node;
+  int half_index;  // 0 or 1, node.output's own index.
+};
+
+// The split-half analogue of TraceGateProducerBackward: walks backward from
+// `tensor_name` through unary activation ops until it resolves to one
+// output of an already-matched gate_up Split node (a key of `split_half_of`)
+// instead of a real MatMul/Gemm producer's own raw output. Mirrors
+// pruning.py's own _trace_split_half_backward.
+std::optional<std::tuple<onnx::NodeProto*, int, std::vector<onnx::NodeProto*>>>
+TraceSplitHalfBackward(
+    const std::string& tensor_name,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const std::unordered_map<std::string, SplitHalfOf>& split_half_of,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs, int max_hops) {
+  std::vector<onnx::NodeProto*> pre_ops;  // Backward order; reversed on return.
+  std::string cur = tensor_name;
+  for (int hop = 0; hop < max_hops; ++hop) {
+    if (ConsumerCount(consumers_of, cur) != 1 || graph_outputs.count(cur)) {
+      return std::nullopt;
+    }
+    auto sit = split_half_of.find(cur);
+    if (sit != split_half_of.end()) {
+      std::reverse(pre_ops.begin(), pre_ops.end());
+      return std::make_tuple(sit->second.split_node, sit->second.half_index,
+                             std::move(pre_ops));
+    }
+    auto nit = node_by_output.find(cur);
+    if (nit == node_by_output.end()) {
+      return std::nullopt;
+    }
+    onnx::NodeProto* producer_node = nit->second;
+    if (!(UnaryPassThroughOps().count(producer_node->op_type()) != 0 &&
+          producer_node->input_size() == 1 &&
+          producer_node->output_size() == 1)) {
+      return std::nullopt;
+    }
+    pre_ops.push_back(producer_node);
+    cur = producer_node->input(0);
+  }
+  return std::nullopt;
+}
+
+// One matched fused-gate_up_proj gated FFN block -- see this section's own
+// comment. `weight`/`bias` are the ONE physical producer tensor shared by
+// both the gate and up halves (columns [0, h) and [h, 2h) respectively).
+struct SplitGatedChain {
+  onnx::NodeProto* split_node;
+  onnx::NodeProto* producer_node;
+  std::string weight;
+  bool weight_transposed;
+  std::optional<std::string> bias;
+  int64_t h;  // Width of EACH half; the combined producer output is 2*h wide.
+  SplitSizesKind split_sizes_kind;
+  // Unary activation hops crossed between split_node.output(0)/(1) and the
+  // combine node -- purely for value_info staleness bookkeeping, mirroring
+  // Producer::pre_ops's own comment; nothing here ever needs its own
+  // slicing, being pure single-input/single-output activations.
+  std::vector<onnx::NodeProto*> half0_pre_ops;
+  std::vector<onnx::NodeProto*> half1_pre_ops;
+  onnx::NodeProto* combine_node;
+  std::vector<ChainOp> chain_ops;
+  onnx::NodeProto* consumer_node;
+  std::string consumer_weight;
+  bool consumer_weight_transposed;
+};
+
+// Finds fused-gate_up_proj gated FFN blocks -- see this section's own
+// comment for the full shape, the co-selection semantics, and exactly
+// what's supported/declined and why. Mirrors pruning.py's own
+// _find_split_gated_chains.
+std::vector<SplitGatedChain> FindSplitGatedChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    for (const auto& out : node->output()) {
+      node_by_output[out] = node;
+    }
+  }
+  auto value_info_by_name = ValueInfoByName(*graph);
+  auto is_internal = [&](const std::string& name) {
+    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
+  };
+
+  std::unordered_map<std::string, FullProducerMatch> producer_infos;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto info = MatchProducer(*node, init_map);
+    if (info) {
+      producer_infos[node->output(0)] =
+          FullProducerMatch{node, info->weight, info->weight_transposed,
+                            info->bias, info->n_channels};
+    }
+  }
+
+  // Every gate_up-style Split matched, up front -- keyed by the node's own
+  // pointer identity (mirroring pruning.py's own id(node) key) for the
+  // per-chain lookup below, and by each of its own two output tensor names
+  // for TraceSplitHalfBackward's own bottom-out check.
+  struct SplitMatch {
+    onnx::NodeProto* producer_node;
+    std::string weight;
+    bool weight_transposed;
+    std::optional<std::string> bias;
+    int64_t h;
+    SplitSizesKind kind;
+  };
+  std::unordered_map<onnx::NodeProto*, SplitMatch> split_matches;
+  std::unordered_map<std::string, SplitHalfOf> split_half_of;
+
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    if (node->op_type() != "Split" || node->output_size() != 2) {
+      continue;
+    }
+    if (node->input_size() == 0 || node->input(0).empty()) {
+      continue;
+    }
+    if (node->output(0) == node->output(1)) {
+      continue;  // Degenerate -- same tensor name twice.
+    }
+    const std::string& in_name = node->input(0);
+    if (!is_internal(in_name)) {
+      continue;
+    }
+    auto pit = producer_infos.find(in_name);
+    if (pit == producer_infos.end()) {
+      continue;
+    }
+    const FullProducerMatch& pinfo = pit->second;
+    if (pinfo.n_channels % 2 != 0) {
+      continue;
+    }
+    const int64_t h = pinfo.n_channels / 2;
+    if (!SplitAxisIsLast(*node, value_info_by_name)) {
+      continue;
+    }
+    auto sizes_result = SplitExplicitSizes(*node, init_map);
+    if (!sizes_result) {
+      continue;  // A dynamic (non-constant) split-sizes input -- decline.
+    }
+    if (sizes_result->kind != SplitSizesKind::kAuto) {
+      const auto& sizes = *sizes_result->sizes;
+      if (sizes.size() != 2 || sizes[0] != h || sizes[1] != h) {
+        continue;  // Not an equal two-way split of the producer's own output.
+      }
+    }
+    if (!(is_internal(node->output(0)) && is_internal(node->output(1)))) {
+      continue;
+    }
+    split_matches[node] = SplitMatch{
+        pinfo.node, pinfo.weight,      pinfo.weight_transposed, pinfo.bias,
+        h,          sizes_result->kind};
+    split_half_of[node->output(0)] = SplitHalfOf{node, 0};
+    split_half_of[node->output(1)] = SplitHalfOf{node, 1};
+  }
+
+  std::vector<SplitGatedChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    onnx::NodeProto* split_a = nullptr;
+    onnx::NodeProto* split_b = nullptr;
+    int half_a = -1, half_b = -1;
+    std::vector<onnx::NodeProto*> pre_a, pre_b;
+
+    if (node->op_type() == "Mul" && node->input_size() == 2 &&
+        node->output_size() == 1) {
+      const std::string& a_name = node->input(0);
+      const std::string& b_name = node->input(1);
+      if (a_name == b_name || init_map.count(a_name) ||
+          init_map.count(b_name)) {
+        continue;
+      }
+      auto trace_a =
+          TraceSplitHalfBackward(a_name, node_by_output, split_half_of,
+                                 consumers_of, graph_outputs, kMaxChainHops);
+      auto trace_b =
+          TraceSplitHalfBackward(b_name, node_by_output, split_half_of,
+                                 consumers_of, graph_outputs, kMaxChainHops);
+      if (!trace_a || !trace_b) {
+        continue;
+      }
+      split_a = std::get<0>(*trace_a);
+      half_a = std::get<1>(*trace_a);
+      pre_a = std::move(std::get<2>(*trace_a));
+      split_b = std::get<0>(*trace_b);
+      half_b = std::get<1>(*trace_b);
+      pre_b = std::move(std::get<2>(*trace_b));
+    } else if (node->op_type() == "SwiGLU" && node->input_size() == 2 &&
+               node->output_size() == 1) {
+      const std::string& a_name = node->input(0);
+      const std::string& b_name = node->input(1);
+      if (init_map.count(a_name) || init_map.count(b_name)) {
+        continue;
+      }
+      if (!(is_internal(a_name) && is_internal(b_name))) {
+        continue;
+      }
+      auto ait = split_half_of.find(a_name);
+      auto bit = split_half_of.find(b_name);
+      if (ait == split_half_of.end() || bit == split_half_of.end()) {
+        continue;
+      }
+      split_a = ait->second.split_node;
+      half_a = ait->second.half_index;
+      split_b = bit->second.split_node;
+      half_b = bit->second.half_index;
+      // pre_a/pre_b stay empty -- SwiGLU's swish lives entirely inside the
+      // op, so there's nowhere to hang a pre-op.
+    } else {
+      continue;
+    }
+
+    if (split_a != split_b || half_a == half_b) {
+      continue;  // Not both halves of the very same Split.
+    }
+    const SplitMatch& sm = split_matches.at(split_a);
+
+    const std::string& out_name = node->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    auto [consumer, chain_ops] = WalkToConsumer(
+        out_name, init_map, consumers_of, graph_outputs, sm.h, kMaxChainHops);
+    if (!consumer) {
+      continue;
+    }
+    if (consumer->weight == sm.weight) {
+      continue;  // Degenerate -- consumer tied to the combined producer weight.
+    }
+
+    SplitGatedChain chain;
+    chain.split_node = split_a;
+    chain.producer_node = sm.producer_node;
+    chain.weight = sm.weight;
+    chain.weight_transposed = sm.weight_transposed;
+    chain.bias = sm.bias;
+    chain.h = sm.h;
+    chain.split_sizes_kind = sm.kind;
+    chain.half0_pre_ops = (half_a == 0) ? std::move(pre_a) : std::move(pre_b);
+    chain.half1_pre_ops = (half_a == 0) ? std::move(pre_b) : std::move(pre_a);
+    chain.combine_node = node;
+    chain.chain_ops = std::move(chain_ops);
+    chain.consumer_node = consumer->node;
+    chain.consumer_weight = consumer->weight;
+    chain.consumer_weight_transposed = consumer->weight_transposed;
+    chains.push_back(std::move(chain));
+  }
+  return chains;
+}
+
+// Applies every matched SplitGatedChain -- the fused gate_up_proj analogue
+// of ApplyChains' own gated-pair handling, deliberately a separate function
+// (like ApplyConcatChains) rather than folding into ApplyChains -- see this
+// section's own comment for why. `w_arrays_nk`-style combined
+// (root-sum-square) importance is computed directly over the two halves of
+// the one producer tensor: a channel whose gate-half weight is large but
+// whose up-half is negligible (or vice versa) ranks by their *combined*, not
+// independently-considered, importance -- mirroring
+// _plain_branch_importance's own combining formula, the same one an ordinary
+// two-producer gated pair's two producers already get combined by.
+//
+// A Split node's own explicit output-size spelling (if any), when present,
+// is rewritten to the new, still-EVEN [len(keep), len(keep)] once pruning
+// finishes -- "still even" is the entire point of co-selection: both halves
+// are always pruned by the exact same `keep` set, so they always stay the
+// same width as each other post-prune, same as pre-prune. A Split
+// `input`-spelled size that happens to be a *shared* constant initializer
+// (reused across more than one distinct Split node whose own `h` values
+// might disagree) is protected against a silent double-rewrite conflict by
+// `touched_split_size_inits` below, local to this one call -- a second
+// chain that would need to rewrite an already-rewritten shared initializer
+// to a *different* value is declined outright rather than corrupting the
+// first chain's own already-applied rewrite. Mirrors pruning.py's own
+// _apply_split_gated_chains.
+void ApplySplitGatedChains(onnx::GraphProto* graph,
+                           std::vector<SplitGatedChain>& chains,
+                           double sparsity, TouchedState& touched) {
+  std::unordered_map<std::string, onnx::TensorProto*> init_map;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    init_map[t->name()] = t;
+  }
+  std::unordered_set<std::string> touched_split_size_inits;
+
+  for (auto& chain : chains) {
+    if (touched.producer.count(chain.weight) ||
+        touched.consumer.count(chain.consumer_weight) ||
+        (chain.bias && touched.const_names.count(*chain.bias))) {
+      continue;  // A shared/tied initializer another chain already resized.
+    }
+
+    std::optional<std::string> size_init_name;
+    if (chain.split_sizes_kind == SplitSizesKind::kInput) {
+      size_init_name = chain.split_node->input(1);
+      if (touched_split_size_inits.count(*size_init_name)) {
+        continue;  // A shared split-sizes constant another chain already
+                   // rewrote.
+      }
+    }
+
+    const int64_t h = chain.h;
+    const int64_t keep_count = std::max<int64_t>(
+        1, h - std::llround(static_cast<double>(h) * sparsity));
+    if (keep_count >= h) {
+      continue;  // Rounds down to a no-op for this layer.
+    }
+
+    onnx::TensorProto* wt = init_map.at(chain.weight);
+    std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
+    std::vector<float> data = ReadFloatTensor(*wt);
+    // w_nk: [2h, k] row-major, regardless of the tensor's own on-disk
+    // orientation -- mirrors ApplyChains' own w_arrays_nk construction.
+    std::vector<float> w_nk;
+    int64_t k;
+    if (chain.weight_transposed) {  // Already [2h, k].
+      w_nk = std::move(data);
+      k = dims[1];
+    } else {  // [k, 2h] -> [2h, k].
+      w_nk = TransposeFlat(data, dims[0], dims[1]);
+      k = dims[0];
+    }
+
+    std::vector<double> importance(static_cast<size_t>(h), 0.0);
+    for (int64_t c = 0; c < h; ++c) {
+      double sq_gate = 0.0, sq_up = 0.0;
+      for (int64_t j = 0; j < k; ++j) {
+        const double vg = w_nk[static_cast<size_t>(c * k + j)];
+        sq_gate += vg * vg;
+        const double vu = w_nk[static_cast<size_t>((h + c) * k + j)];
+        sq_up += vu * vu;
+      }
+      importance[static_cast<size_t>(c)] = std::sqrt(sq_gate + sq_up);
+    }
+    const std::vector<int64_t> keep =
+        TopKIndicesAscending(importance, keep_count);
+    // `keep` (< h) and `keep + h` (>= h) are disjoint ranges, each already
+    // ascending -- their concatenation is therefore already ascending
+    // overall too, same `keep`-is-ascending invariant every other chain
+    // family in this file maintains, so no re-sort is needed here.
+    std::vector<int64_t> global_keep;
+    global_keep.reserve(keep.size() * 2);
+    global_keep.insert(global_keep.end(), keep.begin(), keep.end());
+    for (int64_t c : keep) {
+      global_keep.push_back(c + h);
+    }
+
+    SliceProducerWeight(wt, chain.weight_transposed, global_keep, false);
+    if (chain.bias) {
+      SliceLastAxis(init_map.at(*chain.bias), global_keep);
+    }
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        SliceLastAxis(init_map.at(*co.const_name), keep);
+      }
+    }
+    SliceConsumerWeight(init_map.at(chain.consumer_weight),
+                        chain.consumer_weight_transposed, keep, false);
+
+    if (chain.split_sizes_kind == SplitSizesKind::kAttr) {
+      for (auto& attr : *chain.split_node->mutable_attribute()) {
+        if (attr.name() == "split") {
+          attr.clear_ints();
+          attr.add_ints(keep_count);
+          attr.add_ints(keep_count);
+          break;
+        }
+      }
+    } else if (chain.split_sizes_kind == SplitSizesKind::kInput) {
+      onnx::TensorProto* size_init = init_map.at(*size_init_name);
+      SetInt64TensorData(size_init, {2}, {keep_count, keep_count});
+      touched_split_size_inits.insert(*size_init_name);
+    }
+    // "auto": no explicit sizes anywhere -- the even split stays automatic
+    // at the new width, nothing to rewrite.
+
+    touched.producer.insert(chain.weight);
+    touched.consumer.insert(chain.consumer_weight);
+    if (chain.bias) {
+      touched.const_names.insert(*chain.bias);
+    }
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        touched.const_names.insert(*co.const_name);
+      }
+    }
+
+    touched.stale_value_info.insert(chain.producer_node->output(0));
+    for (const auto& out : chain.split_node->output()) {
+      touched.stale_value_info.insert(out);
+    }
+    for (auto* op : chain.half0_pre_ops) {
+      touched.stale_value_info.insert(op->output(0));
+    }
+    for (auto* op : chain.half1_pre_ops) {
+      touched.stale_value_info.insert(op->output(0));
+    }
+    touched.stale_value_info.insert(chain.combine_node->output(0));
+    for (const auto& co : chain.chain_ops) {
+      touched.stale_value_info.insert(co.node->output(0));
+    }
+  }
+}
+
+// --- Subgraph recursion ------------------------------------------------
+//
+// Mirrors pruning.py's own `_iter_subgraphs` and the "Subgraph recursion"
+// section comment just above its definition there -- read that comment
+// block first if you're touching this; it's the design rationale for
+// everything below, not just for the Python side.
+//
+// A plain `If` node's `then_branch`/`else_branch`, a `Loop`/`Scan` node's
+// `body`, or (per pruning.py's own confirmation against onnxruntime's
+// contrib-op schema registry) a `com.microsoft::BeamSearch`/`GreedySearch`/
+// `Sampling`/`WhisperBeamSearch` node's own `decoder`/`encoder`/
+// `init_decoder` attribute is itself a full GraphProto that can carry
+// arbitrary weight-bearing nodes -- for a whole-model-generation export
+// (e.g. produced by `onnxruntime.transformers.models.{t5,gpt2,whisper}
+// .convert_generation`), essentially 100% of the actual prunable weight
+// lives inside one of these, not in the top-level graph at all. Without
+// this, the C++ port would silently prune nothing on such a model while
+// pruning.py's own `apply_structured_pruning`/`apply_attention_head_
+// pruning` (which this file is a behavior-identical port of) would prune
+// everything inside the subgraph -- a correctness gap, not just a missed
+// optimization.
+//
+// IterSubgraphs is the one shared primitive both public entry points below
+// build on: it walks `graph`'s own `node()` list and recursively every
+// nested GraphProto reachable from any node's GRAPH-/GRAPHS-typed
+// AttributeProto (genuinely recursive -- a subgraph's own nodes can
+// themselves carry further-nested subgraphs, e.g. an `If` inside a `Loop`
+// body), matched purely by `AttributeProto::type()` rather than a
+// per-op-name allowlist, so -- exactly like the Python original -- it
+// needs no update when some future op adds another graph-typed attribute.
+//
+// Every GraphProto* this returns is handed, completely independently, to
+// the existing per-graph Find*/Apply* functions below UNCHANGED -- never
+// merged with any sibling or ancestor graph's own state. This is what
+// makes the same two correctness properties pruning.py's own comment block
+// documents hold here too, with no extra bookkeeping:
+//
+// - Implicit-capture scoping: ONNX lets a subgraph's own node reference a
+//   name defined in an ENCLOSING graph's scope rather than its own
+//   node()/initializer() list (e.g. an `If` branch reading a weight that
+//   actually lives in the top-level graph's initializer list). Every
+//   Find*Chains function below resolves a weight/value strictly via an
+//   `init_map`/consumer map built from the one `graph` argument it was
+//   given -- never a caller's own enclosing scope -- so a node whose input
+//   only resolves in an outer scope simply fails to match and that chain
+//   is declined, the same "decline rather than mis-slice" behavior this
+//   file already applies to every other unresolvable topology. No
+//   subgraph is ever treated as if it could see outward.
+// - No double-counting across scopes: since every Apply*Chains function
+//   below only ever mutates a tensor found in the CURRENT graph's own
+//   mutable_initializer() list (never a parent's), and a parent-scope
+//   initializer an inner graph merely *reads* by implicit capture is --
+//   by the point above -- never even matched as prunable from inside that
+//   inner graph, there is no path by which processing a subgraph could
+//   reach into, and corrupt, a tensor that actually belongs to (and is
+//   separately, safely processed as part of) an ancestor or sibling
+//   graph's own pass. Each subgraph also gets its own fresh TouchedState
+//   (see ApplyStructuredPruning below) for the same reason pruning.py
+//   resets its own `_TouchedState` per graph: a name is only ever a
+//   "shared/tied initializer" conflict against another chain matched
+//   *within that same graph*, never across graphs -- ONNX names are
+//   scoped per-graph-tree-position and this file never merges two graphs'
+//   own initializer/consumer maps together.
+//
+// Depth-first, `graph.node()` then `node.attribute()` declaration order,
+// recursing into a found subgraph's own nested subgraphs before moving on
+// to the next node -- byte-for-byte the same traversal order as the
+// Python original, so a global_sparsity-style pooled ranking computed
+// per-graph (were the C++ port ever extended to that mode) would visit
+// graphs in the same order pruning.py does.
+std::vector<onnx::GraphProto*> IterSubgraphs(onnx::GraphProto* graph) {
+  std::vector<onnx::GraphProto*> graphs;
+  graphs.push_back(graph);
+  for (onnx::NodeProto& node : *graph->mutable_node()) {
+    for (onnx::AttributeProto& attr : *node.mutable_attribute()) {
+      if (attr.type() == onnx::AttributeProto::GRAPH) {
+        std::vector<onnx::GraphProto*> nested = IterSubgraphs(attr.mutable_g());
+        graphs.insert(graphs.end(), nested.begin(), nested.end());
+      } else if (attr.type() == onnx::AttributeProto::GRAPHS) {
+        for (onnx::GraphProto& g : *attr.mutable_graphs()) {
+          std::vector<onnx::GraphProto*> nested = IterSubgraphs(&g);
+          graphs.insert(graphs.end(), nested.begin(), nested.end());
+        }
+      }
+    }
+  }
+  return graphs;
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
@@ -4306,44 +5702,67 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
         std::to_string(sparsity));
   }
   onnx::ModelProto out = model;
-  onnx::GraphProto* graph = out.mutable_graph();
 
-  std::vector<Chain> chains = FindChains(graph);
-  std::vector<Chain> gated_chains = FindGatedChains(graph);
-  std::vector<Chain> conv_chains = FindConvChains(graph);
-  std::vector<Chain> conv_residual_chains = FindConvResidualChains(graph);
-  std::vector<Chain> matmul_residual_chains = FindMatmulResidualChains(graph);
-  chains.insert(chains.end(), std::make_move_iterator(gated_chains.begin()),
-                std::make_move_iterator(gated_chains.end()));
-  chains.insert(chains.end(), std::make_move_iterator(conv_chains.begin()),
-                std::make_move_iterator(conv_chains.end()));
-  chains.insert(chains.end(),
-                std::make_move_iterator(conv_residual_chains.begin()),
-                std::make_move_iterator(conv_residual_chains.end()));
-  chains.insert(chains.end(),
-                std::make_move_iterator(matmul_residual_chains.begin()),
-                std::make_move_iterator(matmul_residual_chains.end()));
-  std::vector<ConcatChain> concat_chains = FindMatmulConcatChains(graph);
-  std::vector<ConcatChain> conv_concat_chains = FindConvConcatChains(graph);
-  concat_chains.insert(concat_chains.end(),
-                       std::make_move_iterator(conv_concat_chains.begin()),
-                       std::make_move_iterator(conv_concat_chains.end()));
+  // Subgraph-aware (IterSubgraphs, see this file's own "Subgraph
+  // recursion" section comment above): every chain family below is
+  // matched and pruned inside a nested If/Loop/Scan/BeamSearch-family
+  // subgraph, at any nesting depth, exactly as if that subgraph were its
+  // own top-level graph -- each returned GraphProto* gets its own fresh
+  // TouchedState, so a "shared/tied initializer" conflict is only ever
+  // detected against another chain matched *within that same graph*,
+  // mirroring pruning.py's own apply_structured_pruning loop over
+  // `_iter_subgraphs(out.graph)` exactly (including resetting `touched`,
+  // and flushing `stale_value_info` into that same graph's own
+  // `value_info`, once per graph rather than once for the whole model).
+  for (onnx::GraphProto* graph : IterSubgraphs(out.mutable_graph())) {
+    std::vector<Chain> chains = FindChains(graph);
+    std::vector<Chain> gated_chains = FindGatedChains(graph);
+    std::vector<Chain> conv_chains = FindConvChains(graph);
+    std::vector<Chain> conv_residual_chains = FindConvResidualChains(graph);
+    std::vector<Chain> matmul_residual_chains = FindMatmulResidualChains(graph);
+    chains.insert(chains.end(), std::make_move_iterator(gated_chains.begin()),
+                  std::make_move_iterator(gated_chains.end()));
+    chains.insert(chains.end(), std::make_move_iterator(conv_chains.begin()),
+                  std::make_move_iterator(conv_chains.end()));
+    chains.insert(chains.end(),
+                  std::make_move_iterator(conv_residual_chains.begin()),
+                  std::make_move_iterator(conv_residual_chains.end()));
+    chains.insert(chains.end(),
+                  std::make_move_iterator(matmul_residual_chains.begin()),
+                  std::make_move_iterator(matmul_residual_chains.end()));
+    std::vector<ConcatChain> concat_chains = FindMatmulConcatChains(graph);
+    std::vector<ConcatChain> conv_concat_chains = FindConvConcatChains(graph);
+    concat_chains.insert(concat_chains.end(),
+                         std::make_move_iterator(conv_concat_chains.begin()),
+                         std::make_move_iterator(conv_concat_chains.end()));
+    std::vector<SplitGatedChain> split_gated_chains =
+        FindSplitGatedChains(graph);
 
-  TouchedState touched;
-  if (!chains.empty()) {
-    ApplyChains(graph, chains, sparsity, touched);
-  }
-  if (!concat_chains.empty()) {
-    ApplyConcatChains(graph, concat_chains, sparsity, touched);
-  }
-  if (!touched.stale_value_info.empty()) {
-    google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
-    for (const auto& vi : graph->value_info()) {
-      if (!touched.stale_value_info.count(vi.name())) {
-        *kept.Add() = vi;
-      }
+    TouchedState touched;
+    if (!chains.empty()) {
+      ApplyChains(graph, chains, sparsity, touched);
     }
-    graph->mutable_value_info()->Swap(&kept);
+    if (!concat_chains.empty()) {
+      ApplyConcatChains(graph, concat_chains, sparsity, touched);
+    }
+    if (!split_gated_chains.empty()) {
+      // A genuinely separate application pass, not folded into ApplyChains
+      // -- see FindSplitGatedChains/ApplySplitGatedChains's own section
+      // comment for why. Shares `touched` with the calls above so a weight
+      // this pass resizes can never be double-resized by (or
+      // double-resize) an ordinary chain/Concat-chain that happens to
+      // touch the same initializer -- still scoped to this one graph only.
+      ApplySplitGatedChains(graph, split_gated_chains, sparsity, touched);
+    }
+    if (!touched.stale_value_info.empty()) {
+      google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
+      for (const auto& vi : graph->value_info()) {
+        if (!touched.stale_value_info.count(vi.name())) {
+          *kept.Add() = vi;
+        }
+      }
+      graph->mutable_value_info()->Swap(&kept);
+    }
   }
   return out;
 }
@@ -4356,17 +5775,31 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
         std::to_string(sparsity));
   }
   onnx::ModelProto out = model;
-  onnx::GraphProto* graph = out.mutable_graph();
 
-  std::vector<AttnChain> chains = FindAttentionChains(graph);
-  std::vector<AttnChain> gqa_chains = FindGqaChains(graph);
-  std::vector<AttnChain> onnx_attn_chains = FindOnnxAttentionChains(graph);
-  chains.insert(chains.end(), std::make_move_iterator(gqa_chains.begin()),
-                std::make_move_iterator(gqa_chains.end()));
-  chains.insert(chains.end(), std::make_move_iterator(onnx_attn_chains.begin()),
-                std::make_move_iterator(onnx_attn_chains.end()));
-  if (!chains.empty()) {
-    ApplyAttentionChains(graph, chains, sparsity);
+  // Subgraph-aware (IterSubgraphs, see this file's own "Subgraph
+  // recursion" section comment above): every chain family below is
+  // matched and pruned inside a nested If/Loop/Scan/BeamSearch-family
+  // subgraph, at any nesting depth, exactly as if that subgraph were its
+  // own top-level graph -- each Find*Chains call below is given one
+  // GraphProto* (top-level or nested) at a time, so a chain that would
+  // need to reach a producer/consumer only resolvable via an
+  // implicitly-captured name from an enclosing scope is declined (never
+  // matched) rather than mis-resolved, and ApplyAttentionChains only ever
+  // slices an initializer out of the one graph it was actually found in.
+  // Mirrors pruning.py's own apply_attention_head_pruning loop over
+  // `_iter_subgraphs(out.graph)`.
+  for (onnx::GraphProto* graph : IterSubgraphs(out.mutable_graph())) {
+    std::vector<AttnChain> chains = FindAttentionChains(graph);
+    std::vector<AttnChain> gqa_chains = FindGqaChains(graph);
+    std::vector<AttnChain> onnx_attn_chains = FindOnnxAttentionChains(graph);
+    chains.insert(chains.end(), std::make_move_iterator(gqa_chains.begin()),
+                  std::make_move_iterator(gqa_chains.end()));
+    chains.insert(chains.end(),
+                  std::make_move_iterator(onnx_attn_chains.begin()),
+                  std::make_move_iterator(onnx_attn_chains.end()));
+    if (!chains.empty()) {
+      ApplyAttentionChains(graph, chains, sparsity);
+    }
   }
   return out;
 }
