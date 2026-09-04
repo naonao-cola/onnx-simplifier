@@ -95,10 +95,11 @@ print(sys.byteorder, \"endian | python\", sys.version.split()[0],
 # above, only tests/ and pyproject.toml are copied into the chroot, so none of
 # those imports resolve there regardless of what's pip-installed. Same story
 # for test_check_decode_parity.py, which imports scripts/apple/check_decode_parity
-# at module scope, and test_compute_retention.py, which imports
-# scripts/apple/compute_retention the same way. test_rtdetrv4.py imports
-# onnxruntime directly at module scope for the same "no s390x build" reason
-# as test_qnn_compat.py and friends above.
+# at module scope, and test_compute_retention.py, test_run_quality_eval.py and
+# test_aggregate_quality_trend.py, which import scripts/apple/compute_retention,
+# scripts/apple/run_quality_eval and scripts/apple/aggregate_quality_trend the
+# same way. test_rtdetrv4.py imports onnxruntime directly at module scope for
+# the same "no s390x build" reason as test_qnn_compat.py and friends above.
 #
 # The three deselected BN-fusion tests fail onnxsim's own check_n equivalence
 # check whenever onnxruntime is absent and the reference evaluator is used
@@ -129,6 +130,7 @@ chroot "${SYSROOT}" /bin/sh -c "cd /work && GITHUB_STEP_SUMMARY=${CHROOT_SUMMARY
   --ignore=tests/test_coreml_compat.py --ignore=tests/test_migraphx_compat.py \
   --ignore=tests/test_openvino_compat.py --ignore=tests/test_check_decode_parity.py \
   --ignore=tests/test_compute_retention.py --ignore=tests/test_rtdetrv4.py \
+  --ignore=tests/test_run_quality_eval.py --ignore=tests/test_aggregate_quality_trend.py \
   --deselect tests/test_fusion_patterns.py::test_fuse_conv_bn_into_conv \
   --deselect tests/test_fusion_patterns.py::test_fuse_convtranspose_bn \
   --deselect tests/test_fusion_patterns.py::test_fuse_conv_with_bias_bn_into_conv ${PYTEST_ARGS:-}"
