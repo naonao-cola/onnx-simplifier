@@ -1055,10 +1055,34 @@ def _match_matmul_like(node: onnx.NodeProto):
     ``C`` and ``alpha``/``beta``/``transA``/``transB`` are ``Gemm``'s own,
     byte-identical, verbatim -- only two *extra* attributes,
     ``activation``/``activation_alpha``/``activation_beta``/
-    ``activation_gamma``, are added on top). Every caller in this module
-    that reaches a weight-bearing MatMul/Gemm through this matcher --
-    producer, K-axis consumer, QDQ, ``MatMulNBits``-peer, ``lm_head`` -- so
-    gains FusedGemm recognition for free, with no per-call-site change.
+    ``activation_gamma``, are added on top) -- and ``com.microsoft::
+    GemmFastGelu`` -- ORT's separate ``FusionGemmFastGelu`` result (a plain
+    ``MatMul`` whose consumer ``FastGelu``'s own ``bias`` input is folded
+    in, collapsed into one node: ``GemmFastGelu(X, W, bias?) =
+    FastGelu(X @ W [+ bias])``). Confirmed live the same way: schema
+    (``get_all_operator_schema()``) is ``GemmFastGelu(X, W, bias?) -> Y``,
+    domain ``com.microsoft``, *no* attributes at all -- no ``transA``/
+    ``transB``/``alpha``/``beta`` equivalent, unlike ``Gemm``/``FusedGemm``
+    -- and the real fusion source shipped in the installed ``onnxruntime``
+    package (``onnxruntime/transformers/fusion_gemmfastgelu.py``,
+    ``FusionGemmFastGelu.fuse``) matches a plain ``MatMul`` feeding a
+    ``FastGelu`` and re-emits ``matmul.input[1 - weight_index]`` (the non-
+    weight operand) and ``matmul.input[weight_index]`` (``W``) verbatim,
+    unrepacked, as ``GemmFastGelu``'s own first two inputs -- so, exactly
+    like plain ``MatMul``, ``W`` is stored **not** transposed (``weight_
+    transposed=False``): a ``[K, N]`` weight consumed as ``X @ W``, never
+    Gemm's own optional ``transB``-flagged ``[N, K]`` layout. There is
+    correspondingly no ``weight_transposed`` ambiguity to resolve via any
+    attribute the way ``FusedGemm``'s own ``transB`` needs above -- it is
+    unconditionally ``False``. Every caller in this module that reaches a
+    weight-bearing MatMul/Gemm through this matcher -- producer, K-axis
+    consumer, QDQ, ``MatMulNBits``-peer, ``lm_head`` -- so gains FusedGemm
+    *and* GemmFastGelu recognition for free, with no per-call-site change
+    (beyond the small number of sites that special-case bias handling by a
+    literal ``op_type in ("Gemm", "FusedGemm")`` membership check, which
+    need their own, separate widening to include ``"GemmFastGelu"`` -- this
+    matcher only ever returns the ``(X, W)`` pair, never the bias, exactly
+    like it already does for plain ``MatMul``).
 
     This override is deliberately local to :mod:`onnxsim.pruning` rather
     than made to the shared :mod:`onnxsim.smoothquant` copy itself: that
@@ -1074,22 +1098,31 @@ def _match_matmul_like(node: onnx.NodeProto):
     wrapper, not the original) keeps the widening scoped to exactly this
     module's own matchers, as directed.
 
-    The baked-in ``activation`` (and its params) never needs reading here:
-    pruning a Gemm's output/input channels only ever removes/reindexes rows
-    or columns of ``A``/``B``/``C`` before the (elementwise, per-output-
-    channel) activation is applied -- an activation function's own value
-    depends only on its own channel's pre-activation scalar, never on any
-    other channel, so slicing commutes with it regardless of which
-    activation (or none) is baked in. This is why FusedGemm needs no
-    separate "walk past a fused activation" handling at all, unlike a
-    *plain* Gemm followed by a *separate* activation node (`_UNARY_PASS_
-    THROUGH`) -- there is no separate node to walk past here; the
-    activation is already "inside" this one node, invisible to every hop of
-    chain-topology matching, confirmed end-to-end (a hand-built
-    FusedGemm->FusedGemm chain, and a real Gemm->Relu->Gemm model put
-    through ORT's own optimizer to get a genuine FusedGemm, both pruned and
-    re-run through a real ``InferenceSession`` -- see this module's own
-    tests).
+    The baked-in activation (``FusedGemm``'s own ``activation`` attribute,
+    or ``GemmFastGelu``'s always-tanh-approximation Gelu) never needs
+    reading here: pruning a Gemm/MatMul's output/input channels only ever
+    removes/reindexes rows or columns of ``A``/``B``/``C`` before the
+    (elementwise, per-output-channel) activation is applied -- an
+    activation function's own value depends only on its own channel's
+    pre-activation scalar, never on any other channel, so slicing commutes
+    with it regardless of which activation (or none) is baked in. This is
+    why neither FusedGemm nor GemmFastGelu needs any separate "walk past a
+    fused activation" handling at all, unlike a *plain* Gemm/MatMul
+    followed by a *separate* activation node (`_UNARY_PASS_THROUGH`) --
+    there is no separate node to walk past here; the activation is already
+    "inside" this one node, invisible to every hop of chain-topology
+    matching, confirmed end-to-end (a hand-built FusedGemm->FusedGemm
+    chain, a real Gemm->Relu->Gemm model put through ORT's own optimizer to
+    get a genuine FusedGemm, and a hand-built GemmFastGelu producer/chain,
+    each pruned and re-run through a real ``InferenceSession`` -- see this
+    module's own tests; GemmFastGelu itself has no CPU kernel in this
+    environment's onnxruntime build -- confirmed via
+    ``get_all_operator_schema()`` registering only its schema, not a CPU
+    kernel, and a direct ``InferenceSession`` load raising ``NOT_IMPLEMENTED``
+    -- so its own tests execute the byte-identical, ``FusionGemmFastGelu``-
+    confirmed-equivalent unfused ``MatMul``+``FastGelu`` decomposition of
+    the (already-pruned) node's own sliced weight/bias to get a real,
+    runnable oracle, rather than running the fused node type itself).
     """
     if node.op_type == "FusedGemm":
         attrs = {a.name: a for a in node.attribute}
@@ -1109,6 +1142,10 @@ def _match_matmul_like(node: onnx.NodeProto):
         trans_b = attrs.get("transB")
         weight_transposed = bool(trans_b is not None and trans_b.i)
         return node.input[0], node.input[1], weight_transposed
+    if node.op_type == "GemmFastGelu" and node.domain == _FUSED_BIAS_GELU_DOMAIN:
+        if len(node.input) not in (2, 3):
+            return None
+        return node.input[0], node.input[1], False
     return _match_matmul_like_base(node)
 
 
@@ -3622,8 +3659,9 @@ def _match_producer(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> Optional[Tuple[str, bool, Optional[str], int]]:
     """If `node` is a MatMul/vanilla-Gemm with a constant 2-D float32
-    weight (and, for Gemm, either no bias or a constant one), returns
-    ``(weight_name, weight_transposed, bias_name_or_None, n_channels)``.
+    weight (and, for Gemm/FusedGemm/GemmFastGelu, either no bias or a
+    constant one), returns ``(weight_name, weight_transposed,
+    bias_name_or_None, n_channels)``.
     """
     match = _match_matmul_like(node)
     if match is None:
@@ -3637,7 +3675,7 @@ def _match_producer(
     ):
         return None
     bias_name = None
-    if node.op_type in ("Gemm", "FusedGemm") and len(node.input) == 3:
+    if node.op_type in ("Gemm", "FusedGemm", "GemmFastGelu") and len(node.input) == 3:
         bias_name = node.input[2]
         if bias_name not in initializer_map:
             return None  # non-constant bias -- can't safely prune it
@@ -11655,7 +11693,11 @@ def _match_matmul_qdq(
     dims = _weight_ref_dims(ref)
     out_channels, in_channels = dims[axis], dims[1 - axis]
     bias_name = None
-    if node.op_type in ("Gemm", "FusedGemm") and len(node.input) == 3 and node.input[2]:
+    if (
+        node.op_type in ("Gemm", "FusedGemm", "GemmFastGelu")
+        and len(node.input) == 3
+        and node.input[2]
+    ):
         bias_name = node.input[2]
         b_init = initializer_map.get(bias_name)
         if b_init is None or not _is_supported_float_dtype(b_init.data_type):
@@ -13155,7 +13197,11 @@ def _match_plain_matmul_nbits_peer(
 
     bias_init = None
     bias_name = None
-    if node.op_type in ("Gemm", "FusedGemm") and len(node.input) == 3 and node.input[2]:
+    if (
+        node.op_type in ("Gemm", "FusedGemm", "GemmFastGelu")
+        and len(node.input) == 3
+        and node.input[2]
+    ):
         bias_name = node.input[2]
         bias_init = initializer_map.get(bias_name)
         if bias_init is None or not _is_supported_float_dtype(bias_init.data_type):
@@ -27377,7 +27423,11 @@ def _match_lm_head_tail(
             and list(b_init.dims) in ([vocab_size], [1, vocab_size])
         )
 
-    if node.op_type in ("Gemm", "FusedGemm") and len(node.input) == 3 and node.input[2]:
+    if (
+        node.op_type in ("Gemm", "FusedGemm", "GemmFastGelu")
+        and len(node.input) == 3
+        and node.input[2]
+    ):
         bias_name = node.input[2]
         if not _valid_bias(bias_name):
             return _LM_HEAD_BIAS_INVALID
@@ -29412,6 +29462,7 @@ def _unstructured_not_eligible(graph: onnx.GraphProto, candidates: List) -> List
                 "MatMul",
                 "Gemm",
                 "FusedGemm",
+                "GemmFastGelu",
             )
             and not is_attn
         ):
@@ -29693,7 +29744,14 @@ def _structured_not_eligible(
                 matched_ids.update(id(h.node) for h in b.conv_pass_through)
     not_eligible = []
     for node in graph.node:
-        if node.op_type not in ("Conv", "FusedConv", "MatMul", "Gemm", "FusedGemm"):
+        if node.op_type not in (
+            "Conv",
+            "FusedConv",
+            "MatMul",
+            "Gemm",
+            "FusedGemm",
+            "GemmFastGelu",
+        ):
             continue
         if id(node) in matched_ids:
             continue
@@ -30023,6 +30081,7 @@ def _qdq_not_eligible(
             "MatMul",
             "Gemm",
             "FusedGemm",
+            "GemmFastGelu",
         ):
             continue
         if id(node) in matched_ids:
