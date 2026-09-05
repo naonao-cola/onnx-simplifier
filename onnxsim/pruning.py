@@ -15640,6 +15640,20 @@ def _walk_to_consumer_qdq(
     known rank (:func:`_norm_axis_is_last`), mirroring
     :func:`_walk_to_consumer`'s own identical parameter. Left ``None``, only
     the unambiguous ``axis == -1`` case of that hop is still recognized.
+
+    Within the `is_conv` family only, a `GlobalAveragePool` node hit mid-walk
+    is additionally checked for the ``-> Flatten(axis=1) -> {MatMul, vanilla
+    Gemm}`` classifier-head shape :func:`_match_gap_flatten_matmul_consumer`
+    describes -- mirroring the plain-float Conv chain's own
+    `recognize_gap_flatten_matmul_consumer` hop (see
+    :func:`_walk_to_conv_consumer`'s own docstring), reused verbatim here
+    since that matcher is domain/quantization-agnostic. A match ends the
+    walk there with a `_QDQConsumer` wrapping a plain (never QDQ-quantized)
+    `_WeightRef` -- `is_conv=False`, since the matched consumer has no
+    Conv/ConvTranspose-vs-MatMul/Gemm concept of its own beyond that. Never
+    tried in the MatMul/Gemm (`not is_conv`) family -- `GlobalAveragePool`
+    itself requires a Conv-shaped 4-D producer upstream, so there is no
+    equivalent shape to recognize there at all.
     """
     chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
     cur = start
@@ -15693,6 +15707,55 @@ def _walk_to_consumer_qdq(
                     return None
                 ref, _bias, _out, _in = m
                 return _QDQConsumer(nxt, ref, False, True, True), tuple(chain_ops)
+            if (
+                nxt.op_type == "GlobalAveragePool"
+                and nxt.domain == ""
+                and list(nxt.input) == [cur]
+                and len(nxt.output) == 1
+            ):
+                # Mirrors the plain-float Conv chain's own
+                # `recognize_gap_flatten_matmul_consumer` hop (see
+                # :func:`_walk_to_conv_consumer`'s own docstring) -- the
+                # narrowly-scoped classifier-head shape
+                # :func:`_match_gap_flatten_matmul_consumer` describes,
+                # reused verbatim (it is domain/quantization-agnostic).
+                # Only tried on the `is_conv` (Conv/ConvTranspose-producer)
+                # side, never the MatMul/Gemm one -- `GlobalAveragePool`
+                # itself requires a Conv-shaped 4-D producer upstream, so
+                # there is no equivalent shape to recognize there at all,
+                # mirroring how the plain-float hop is scoped to
+                # :func:`_find_conv_chains` only. The matched consumer is
+                # always a plain, constant float weight (never QDQ-quantized
+                # -- the matcher only ever matches a plain float
+                # initializer), so it is wrapped in a plain `_WeightRef`
+                # (`ref.is_qdq` False), sliced by the ordinary
+                # :func:`_slice_consumer_weight` inside
+                # :func:`_slice_consumer_weight_qdq`'s own `ref.float_init`
+                # branch, exactly like any other plain-float QDQ-chain
+                # consumer.
+                gap_flatten_match = _match_gap_flatten_matmul_consumer(
+                    nxt.output[0],
+                    consumers_of,
+                    initializer_map,
+                    graph_outputs,
+                    n_channels,
+                )
+                if gap_flatten_match is not None:
+                    flatten_node, mm_node, mm_weight, mm_weight_transposed = (
+                        gap_flatten_match
+                    )
+                    mm_ref = _WeightRef(float_init=initializer_map[mm_weight])
+                    chain_ops.append((nxt, None))
+                    chain_ops.append((flatten_node, None))
+                    return (
+                        _QDQConsumer(mm_node, mm_ref, mm_weight_transposed, False),
+                        tuple(chain_ops),
+                    )
+                # No recognized Flatten(axis=1) -> {MatMul, vanilla Gemm}
+                # right after this GlobalAveragePool -- falls through to the
+                # ordinary handling below, exactly as if this check didn't
+                # exist (declines, since GlobalAveragePool isn't itself a
+                # recognized unary/norm hop for this walker).
         else:
             mm = _match_matmul_qdq(nxt, initializer_map, dq_of, consumers_of)
             if mm is not None and mm[0] == cur:
@@ -16170,6 +16233,20 @@ def apply_structured_pruning_qdq(
     keep-set between the two, mirroring
     :func:`apply_structured_pruning_matmul_nbits`'s own identical
     precedent.
+
+    One narrow exception on the Conv/``ConvTranspose`` producer side: a
+    producer whose logical output feeds ``GlobalAveragePool ->
+    Flatten(axis=1) -> {MatMul, vanilla Gemm}`` directly (the canonical
+    classifier head this shape's own docstring,
+    :func:`_match_gap_flatten_matmul_consumer`, proves is a trivial 1:1
+    channel relabeling) is also matched even though that consumer is never
+    itself QDQ-quantized -- mirroring the plain-float Conv chain's own
+    identical `recognize_gap_flatten_matmul_consumer` hop (see
+    :func:`_walk_to_conv_consumer`'s own docstring). Only reached via a
+    Conv/``ConvTranspose`` producer (:func:`_walk_to_consumer_qdq`'s own
+    `is_conv` family) -- a MatMul/Gemm producer has no equivalent shape to
+    recognize, since `GlobalAveragePool` itself requires a Conv-shaped 4-D
+    tensor upstream.
 
     Also handles the gated (SwiGLU/GeGLU) FFN pair
     (:func:`_find_qdq_gated_chains`, the QDQ analogue of
@@ -35052,13 +35129,26 @@ def _slice_conv_integer_consumer(w: _ConvIntegerConv, keep: np.ndarray) -> None:
 class _ConvIntegerChain:
     producer: _ConvIntegerConv
     chain_ops: Tuple[onnx.NodeProto, ...]
-    consumer: _ConvIntegerConv
+    # Exactly one of `consumer`/`matmul_consumer` is ever set. `consumer` is
+    # the ordinary same-family (`ConvInteger`-based) consumer role; a
+    # non-``None`` `matmul_consumer` instead means the walk terminated at the
+    # narrowly-scoped ``GlobalAveragePool -> Flatten(axis=1) -> {MatMul,
+    # vanilla Gemm}`` classifier-head shape (see
+    # :func:`_match_gap_flatten_matmul_consumer`'s own docstring and this
+    # module's plain-float :func:`_walk_to_conv_consumer`'s identical
+    # `recognize_gap_flatten_matmul_consumer` hop, which this one mirrors) --
+    # that consumer is always plain float (the matcher only ever matches a
+    # constant, plain-float weight), never a `_ConvIntegerConv`, so it is
+    # sliced via the ordinary :func:`_slice_consumer_weight`, not this
+    # section's own int8-aware consumer slicer.
+    consumer: Optional[_ConvIntegerConv]
     n_channels: int
     # Depthwise ConvInteger hops the chain walk crossed transparently between
     # the real producer and the real consumer (see
     # :class:`_ConvIntegerPassThrough`); empty for the common case of no
     # depthwise mid-chain hop.
     conv_pass_through: Tuple[_ConvIntegerPassThrough, ...] = ()
+    matmul_consumer: Optional[_ConsumerMatch] = None
 
 
 def _walk_to_conv_integer_consumer(
@@ -35071,9 +35161,10 @@ def _walk_to_conv_integer_consumer(
     max_hops: int,
 ) -> Optional[
     Tuple[
-        _ConvIntegerConv,
+        Optional[_ConvIntegerConv],
         Tuple[onnx.NodeProto, ...],
         Tuple[_ConvIntegerPassThrough, ...],
+        Optional[_ConsumerMatch],
     ]
 ]:
     """From tensor `start` (a matched ``ConvInteger`` Conv layer's own
@@ -35095,9 +35186,29 @@ def _walk_to_conv_integer_consumer(
     ``QLinearConv``-only walk, DELIBERATELY narrower than
     :func:`_walk_to_dynquant_consumer`'s own quantized-or-plain-float union
     (see this section's own top comment for why the plain-float-Conv-peer
-    case is a deliberate scope narrowing, not attempted here). Returns
-    ``None`` if the walk runs out of hops, hits a branch, or never reaches
-    such a consumer.
+    case is a deliberate scope narrowing, not attempted here).
+
+    As one narrow exception to that same-family-only restriction -- mirroring
+    the plain-float Conv chain walk's own `recognize_gap_flatten_matmul_consumer`
+    hop (see :func:`_walk_to_conv_consumer`'s own docstring) -- a
+    `GlobalAveragePool` node hit mid-walk is additionally checked for the
+    ``-> Flatten(axis=1) -> {MatMul, vanilla Gemm}`` shape
+    :func:`_match_gap_flatten_matmul_consumer` describes (reused here
+    verbatim: it is domain/quantization-agnostic, and by this point in the
+    walk `cur` is always already a plain float tensor -- `ConvInteger`'s own
+    rescale ``Mul``/``Cast`` pair, matched by :func:`_match_conv_integer`
+    before this walk's own `start` is even chosen, already produced a plain
+    float logical output). A match ends the walk there, returned as this
+    function's own 4th value (`_ConsumerMatch`-shaped: ``(node, weight,
+    weight_transposed)``) instead of the ordinary `_ConvIntegerConv`
+    consumer -- mutually exclusive with it, exactly like the plain-float
+    walk's own `matmul_consumer`. A `GlobalAveragePool` feeding anything else
+    (no recognized `Flatten`/matmul-consumer right after it) simply ends the
+    walk undeclined -- this walker has no other, unconditional use for a
+    pooling hop the way the plain-float Conv-chain walker does.
+
+    Returns ``None`` if the walk runs out of hops, hits a branch, or never
+    reaches either kind of consumer.
     """
     chain_ops: List[onnx.NodeProto] = []
     conv_pass_through: List[_ConvIntegerPassThrough] = []
@@ -35121,7 +35232,7 @@ def _walk_to_conv_integer_consumer(
                     ci_node, initializer_map, consumers_of, producers_of
                 )
                 if m is not None and m.dq_node is nxt and m.K == n_channels:
-                    return m, tuple(chain_ops), tuple(conv_pass_through)
+                    return m, tuple(chain_ops), tuple(conv_pass_through), None
                 depthwise = _match_conv_integer_depthwise_pass_through(
                     ci_node,
                     initializer_map,
@@ -35157,6 +35268,34 @@ def _walk_to_conv_integer_consumer(
             cur = out2
             continue
 
+        if (
+            nxt.op_type == "GlobalAveragePool"
+            and nxt.domain == ""
+            and list(nxt.input) == [cur]
+            and len(nxt.output) == 1
+        ):
+            gap_flatten_match = _match_gap_flatten_matmul_consumer(
+                nxt.output[0], consumers_of, initializer_map, graph_outputs, n_channels
+            )
+            if gap_flatten_match is not None:
+                flatten_node, mm_node, mm_weight, mm_weight_transposed = (
+                    gap_flatten_match
+                )
+                chain_ops.append(nxt)
+                chain_ops.append(flatten_node)
+                return (
+                    None,
+                    tuple(chain_ops),
+                    tuple(conv_pass_through),
+                    (mm_node, mm_weight, mm_weight_transposed),
+                )
+            # No recognized Flatten(axis=1) -> {MatMul, vanilla Gemm} right
+            # after this GlobalAveragePool -- this walker has no other,
+            # unconditional use for a pooling hop (unlike the plain-float
+            # Conv-chain walker's own `_CONV_POOL_PASS_THROUGH` membership),
+            # so decline outright, same as any other unmatched topology.
+            return None
+
         if not (
             nxt.op_type in _UNARY_PASS_THROUGH
             and list(nxt.input) == [cur]
@@ -35175,8 +35314,12 @@ def _find_conv_integer_chains(graph: onnx.GraphProto) -> List[_ConvIntegerChain]
     """Every ``ConvInteger``-based producer/consumer pair connected by
     :func:`_walk_to_conv_integer_consumer` -- both sides always
     ``ConvInteger``-based here (see this section's own top comment for why,
-    unlike :func:`_find_dynquant_chains`, there is no plain-float-peer union
-    to consider at all).
+    unlike :func:`_find_dynquant_chains`, there is no general plain-float-peer
+    union to consider), with one narrow exception: a producer whose logical
+    output reaches the classifier-head ``GlobalAveragePool -> Flatten(axis=1)
+    -> {MatMul, vanilla Gemm}`` shape instead surfaces as `matmul_consumer`
+    on the returned :class:`_ConvIntegerChain` (see
+    :func:`_walk_to_conv_integer_consumer`'s own docstring).
     """
     initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
@@ -35208,10 +35351,15 @@ def _find_conv_integer_chains(graph: onnx.GraphProto) -> List[_ConvIntegerChain]
         )
         if found is None:
             continue
-        consumer, chain_ops, conv_pass_through = found
+        consumer, chain_ops, conv_pass_through, matmul_consumer = found
         chains.append(
             _ConvIntegerChain(
-                m, chain_ops, consumer, m.N, conv_pass_through=conv_pass_through
+                m,
+                chain_ops,
+                consumer,
+                m.N,
+                conv_pass_through=conv_pass_through,
+                matmul_consumer=matmul_consumer,
             )
         )
     return chains
@@ -35270,6 +35418,20 @@ def apply_structured_pruning_dynamic_quantize_conv(
     merge, or ``Concat``-merged branch group is matched either -- only the
     plain single-producer/single-consumer topology above.
 
+    One narrow exception to the same-family-only consumer rule: a producer
+    whose logical output feeds ``GlobalAveragePool -> Flatten(axis=1) ->
+    {MatMul, vanilla Gemm}`` directly (the canonical dynamically-quantized
+    classifier head this shape's own docstring, :func:`_match_gap_flatten_matmul_consumer`,
+    proves is a trivial 1:1 channel relabeling) is also matched, pruning the
+    producer's output channels together with the matching input channels of
+    that plain-float MatMul/Gemm consumer's weight -- mirroring the
+    plain-float Conv chain's own identical `recognize_gap_flatten_matmul_consumer`
+    hop (see :func:`_walk_to_conv_consumer`'s own docstring). That consumer
+    is never itself quantized (the matcher only ever matches a constant,
+    plain-float weight), so it is sliced by the ordinary
+    :func:`_slice_consumer_weight`, not this section's own int8-aware
+    consumer slicer.
+
     :param model: onnx ModelProto object or file path
     :param sparsity: fraction of each eligible producer's output channels to
             drop (rounded, at least one channel is always kept)
@@ -35297,14 +35459,22 @@ def apply_structured_pruning_dynamic_quantize_conv(
         if not chains:
             continue
 
+        initializer_map = _constant_map(graph)
         producer_touched: Set[str] = set()
         consumer_touched: Set[str] = set()
         stale_value_info: Set[str] = set()
 
         for chain in chains:
             p, c = chain.producer, chain.consumer
+            mm = chain.matmul_consumer
             p_key = p.w_init.name
-            c_key = c.w_init.name
+            # Exactly one of `c`/`mm` is ever set -- see
+            # :class:`_ConvIntegerChain`'s own docstring.
+            if c is not None:
+                c_key = c.w_init.name
+            else:
+                assert mm is not None
+                c_key = mm[1]  # the matched MatMul/Gemm consumer's weight name
             if p_key == c_key:
                 continue  # degenerate (the same weight in both roles)
             if p_key in producer_touched or c_key in consumer_touched:
@@ -35322,7 +35492,23 @@ def apply_structured_pruning_dynamic_quantize_conv(
             keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
             _slice_conv_integer_producer(p, keep)
-            _slice_conv_integer_consumer(c, keep)
+            if c is not None:
+                _slice_conv_integer_consumer(c, keep)
+            else:
+                # The classifier-head hop's matched consumer is always a
+                # plain float MatMul/vanilla-Gemm (never a `ConvInteger`) --
+                # see :class:`_ConvIntegerChain`'s own `matmul_consumer`
+                # comment -- sliced by the ordinary
+                # :func:`_slice_consumer_weight`, not this section's own
+                # int8-aware `_slice_conv_integer_consumer`.
+                assert mm is not None
+                _, mm_weight, mm_weight_transposed = mm
+                _slice_consumer_weight(
+                    initializer_map[mm_weight],
+                    weight_transposed=mm_weight_transposed,
+                    keep=keep,
+                    is_conv=False,
+                )
 
             for hop in chain.conv_pass_through:
                 # Mirrors _apply_conv_pass_through_hop's identical
@@ -41540,7 +41726,14 @@ def _conv_integer_not_eligible(
     matched_ids: Set[int] = set()
     for chain in chains:
         matched_ids.add(id(chain.producer.node))
-        matched_ids.add(id(chain.consumer.node))
+        # `chain.consumer` is only ever `None` for the classifier-head hop
+        # (`chain.matmul_consumer` set instead -- see
+        # :class:`_ConvIntegerChain`'s own docstring), whose consumer is a
+        # plain MatMul/Gemm, never itself a `ConvInteger` -- so it could
+        # never appear in the `graph.node` filter below anyway, and needs
+        # no entry here.
+        if chain.consumer is not None:
+            matched_ids.add(id(chain.consumer.node))
     not_eligible = []
     for node in graph.node:
         if node.op_type != "ConvInteger":
@@ -41602,8 +41795,15 @@ def _analyze_structured_pruning_dynamic_quantize_conv(
 
         for chain in chains:
             p, c = chain.producer, chain.consumer
+            mm = chain.matmul_consumer
             p_key = p.w_init.name
-            c_key = c.w_init.name
+            # Exactly one of `c`/`mm` is ever set -- see
+            # :class:`_ConvIntegerChain`'s own docstring.
+            if c is not None:
+                c_key = c.w_init.name
+            else:
+                assert mm is not None
+                c_key = mm[1]
             if p_key == c_key:
                 continue  # degenerate (the same weight in both roles) -- no report row
 

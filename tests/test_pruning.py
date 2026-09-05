@@ -30210,6 +30210,234 @@ def test_qdq_structured_pruning_conv_both_sides_qdq_matches_oracle():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
 
 
+def _quantize_static_conv_weight(W, spatial=8):
+    """Runs the REAL ``onnxsim.quantize_static`` tool on a minimal
+    ``Y = Conv(X, W)`` wrapper model and returns the genuine per-channel
+    symmetric int8 ``(Wq[M,C,kH,kW], Wscale[M])`` pair it emits for `W` --
+    never a hand-rolled re-implementation. ``zero_point`` is never emitted
+    for a QDQ weight by this repo's own ``quantize_static`` (always
+    symmetric -- see this module's own "QDQ" section top comment), so this
+    returns only the two-tuple. Mirrors
+    `_quantize_dynamic_conv_weight` (this file's own ConvInteger-section
+    analogue) exactly, just against the static tool.
+    """
+    m, c, kh, kw = W.shape
+    pad_h, pad_w = (kh - 1) // 2, (kw - 1) // 2
+    src = _model(
+        f"""
+        g (float[1,{c},{spatial},{spatial}] X) => (float[1,{m},{spatial},{spatial}] Y)
+        {{
+          Y = Conv<kernel_shape=[{kh},{kw}], pads=[{pad_h},{pad_w},{pad_h},{pad_w}]>(X, W)
+        }}
+        """,
+        initializer=[_f32(W, "W")],
+    )
+    src = onnx.shape_inference.infer_shapes(src)
+    q = onnxsim.quantize_static(src)
+    conv_node = next(n for n in q.graph.node if n.op_type == "Conv")
+    w_name = conv_node.input[1]
+    dq = next(
+        n
+        for n in q.graph.node
+        if n.op_type == "DequantizeLinear" and n.output[0] == w_name
+    )
+    assert len(dq.input) == 2  # symmetric -- no zero_point, see above
+    inits = {t.name: t for t in q.graph.initializer}
+    Wq = onnx.numpy_helper.to_array(inits[dq.input[0]]).copy()
+    Wscale = onnx.numpy_helper.to_array(inits[dq.input[1]]).copy()
+    return Wq, Wscale
+
+
+def test_qdq_structured_pruning_conv_global_average_pool_flatten_gemm_pass_through_matches_oracle():
+    # The classifier-head hop `_walk_to_consumer_qdq`'s own `is_conv` branch
+    # gained, mirroring the plain-float walker's own
+    # `recognize_gap_flatten_matmul_consumer`: a QDQ Conv's own logical
+    # output feeding `GlobalAveragePool -> Flatten(axis=1) -> Gemm` directly
+    # is matched and pruned, with the matched Gemm consumer (plain,
+    # constant float, never itself quantized) sliced via the ordinary
+    # `_slice_consumer_weight`. Both Conv layers' weights are quantized via
+    # the REAL ``onnxsim.quantize_static`` tool (`_quantize_static_conv_weight`,
+    # never a hand-rolled re-implementation) -- per this repo's own
+    # CLAUDE.md convention, only the fixture weights come from the real
+    # tool, while the surrounding graph structure is assembled via
+    # `onnx.parser`.
+    #
+    # This model matches BOTH chains at once, exactly like
+    # `test_qdq_structured_pruning_conv_both_sides_qdq_matches_oracle`'s own
+    # topology extended with the classifier head: the ordinary same-family
+    # Conv->Conv chain (w1 producer / w2 consumer) AND the new
+    # classifier-head chain (w2 producer / Gemm consumer) -- w2 legitimately
+    # plays both roles, its own underlying `q_init` mutated in place by
+    # chain 1's consumer-role slice before chain 2's producer-role
+    # importance is ranked from it.
+    Cin, C1, C2, Out = 4, 6, 5, 3
+    rng = np.random.default_rng(60)
+    w1f = (rng.standard_normal((C1, Cin, 3, 3)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((C2, C1, 3, 3)) * 0.3).astype(np.float32)
+    w3f = (rng.standard_normal((Out, C2)) * 0.3).astype(np.float32)
+    w1q, w1s = _quantize_static_conv_weight(w1f)
+    w2q, w2s = _quantize_static_conv_weight(w2f)
+
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Out}] Y)
+        {{
+          Wq1dq = DequantizeLinear<axis=0>(Wq1, Wscale1)
+          h0 = Conv<kernel_shape=[3,3]>(X, Wq1dq)
+          h0a = Relu(h0)
+          Wq2dq = DequantizeLinear<axis=0>(Wq2, Wscale2)
+          h1 = Conv<kernel_shape=[3,3]>(h0a, Wq2dq)
+          p = GlobalAveragePool(h1)
+          f = Flatten<axis=1>(p)
+          Y = Gemm<transB=1>(f, W3)
+        }}
+        """,
+        initializer=[
+            _i8(w1q, "Wq1"),
+            _f32(w1s, "Wscale1"),
+            _i8(w2q, "Wq2"),
+            _f32(w2s, "Wscale2"),
+            _f32(w3f, "W3"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_qdq_chains(model.graph)
+    assert len(chains) == 2
+    gap_chain = next(ch for ch in chains if not ch.consumer.is_conv)
+    assert gap_chain.consumer.node.op_type == "Gemm"
+    assert not gap_chain.consumer.ref.is_qdq  # plain float, never quantized
+    assert gap_chain.n_channels == C2
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    keep_count1 = C1 - round(C1 * 0.5)
+    keep_count2 = C2 - round(C2 * 0.5)
+    assert list(inits["Wq1"].dims) == [keep_count1, Cin, 3, 3]
+    assert list(inits["Wq2"].dims) == [keep_count2, keep_count1, 3, 3]
+    assert list(inits["Wscale2"].dims) == [keep_count2]
+    assert list(inits["W3"].dims) == [Out, keep_count2]
+
+    w1_dequant = _qdq_dequant(w1q, w1s, None, axis=0)
+    keep1 = _oracle_keep_indices_conv(w1_dequant, keep_count1)
+    # w2's own consumer-role (input-axis) slice by `keep1` happens before
+    # its producer-role importance is ranked -- see this test's own comment
+    # above.
+    w2_dequant_after_consumer_slice = _qdq_dequant(w2q, w2s, None, axis=0)[:, keep1]
+    keep2 = _oracle_keep_indices_conv(w2_dequant_after_consumer_slice, keep_count2)
+
+    rng2 = np.random.default_rng(61)
+    x = rng2.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    oracle = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Out}] Y)
+        {{
+          h0 = Conv<kernel_shape=[3,3]>(X, W1)
+          h0a = Relu(h0)
+          h1 = Conv<kernel_shape=[3,3]>(h0a, W2)
+          p = GlobalAveragePool(h1)
+          f = Flatten<axis=1>(p)
+          Y = Gemm<transB=1>(f, W3)
+        }}
+        """,
+        initializer=[
+            onnx.numpy_helper.from_array(
+                w1_dequant[keep1].astype(np.float32), name="W1"
+            ),
+            onnx.numpy_helper.from_array(
+                w2_dequant_after_consumer_slice[keep2].astype(np.float32), name="W2"
+            ),
+            _f32(w3f[:, keep2], "W3"),
+        ],
+    )
+    (y_oracle,) = onnx.reference.ReferenceEvaluator(oracle).run(None, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_structured_pruning_conv_global_average_pool_flatten_gemm_real_quantize_static_pipeline_end_to_end():
+    # The full end-to-end pipeline counterpart: runs the REAL, whole-model
+    # ``onnxsim.quantize_static`` (real calibration + QDQ insertion) on a
+    # plain float `Conv -> Relu -> Conv -> GlobalAveragePool ->
+    # Flatten(axis=1) -> Gemm` model. `quantize_static` quantizes every
+    # Conv/MatMul/Gemm whose weight is constant (see its own docstring), so
+    # the classifier `Gemm` is deliberately given a NON-constant weight (a
+    # plain graph input) here -- keeping it out of `quantize_static`'s own
+    # scope, matching the shape this hop targets (a classifier head
+    # deliberately kept in float, common in real mixed-precision
+    # deployments) -- then that weight is supplied as a genuine constant
+    # AFTER quantization, the one piece `quantize_static` itself never
+    # touches. Confirmed empirically (this round's own investigation) that
+    # `quantize_static` wraps EVERY quantized node's own activation input in
+    # its own QuantizeLinear/DequantizeLinear pair -- so a constant-weight
+    # Gemm here would ALSO get its own Flatten-output activation wrapped,
+    # breaking this hop's own exact-adjacency requirement; leaving it
+    # non-constant during quantization (never touched by the quantizer,
+    # then genuinely populated) is the correct, not merely convenient, way
+    # to reproduce this scope with the real tool on a full model.
+    Cin, C1, C2, Out = 4, 6, 5, 3
+    rng = np.random.default_rng(62)
+    w1f = (rng.standard_normal((C1, Cin, 3, 3)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((C2, C1, 3, 3)) * 0.3).astype(np.float32)
+    w3f = (rng.standard_normal((Out, C2)) * 0.3).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X, float[{Out},{C2}] W3) => (float[N,{Out}] Y)
+        {{
+          h0 = Conv<kernel_shape=[3,3]>(X, W1)
+          h0a = Relu(h0)
+          h1 = Conv<kernel_shape=[3,3]>(h0a, W2)
+          p = GlobalAveragePool(h1)
+          f = Flatten<axis=1>(p)
+          Y = Gemm<transB=1>(f, W3)
+        }}
+        """,
+        initializer=[_f32(w1f, "W1"), _f32(w2f, "W2")],
+    )
+    model = onnx.shape_inference.infer_shapes(model)
+    quantized = onnxsim.quantize_static(model)
+
+    # Post-hoc: the classifier Gemm's own weight was deliberately kept a
+    # graph input above (see this test's own comment) -- swap it for a
+    # genuine constant now, after quantization.
+    quantized.graph.initializer.append(_f32(w3f, "W3"))
+    remaining_inputs = [i for i in quantized.graph.input if i.name != "W3"]
+    del quantized.graph.input[:]
+    quantized.graph.input.extend(remaining_inputs)
+    onnx.checker.check_model(quantized)
+
+    op_types = [n.op_type for n in quantized.graph.node]
+    assert op_types.count("Conv") == 2
+    assert op_types.count("Gemm") == 1
+    # The classifier Gemm's own activation input (Flatten's output) is
+    # never wrapped in its own QuantizeLinear/DequantizeLinear pair, since
+    # its weight was never constant at quantization time -- confirming the
+    # exact-adjacency shape this hop needs really is present.
+    gemm_node = next(n for n in quantized.graph.node if n.op_type == "Gemm")
+    flatten_node = next(n for n in quantized.graph.node if n.op_type == "Flatten")
+    assert gemm_node.input[0] == flatten_node.output[0]
+
+    chains = onnxsim.pruning._find_qdq_chains(quantized.graph)
+    gap_chains = [ch for ch in chains if not ch.consumer.is_conv]
+    assert len(gap_chains) == 1
+    assert gap_chains[0].consumer.node.op_type == "Gemm"
+    assert gap_chains[0].n_channels == C2
+
+    pruned = onnxsim.apply_structured_pruning_qdq(quantized, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: list(t.dims) for t in pruned.graph.initializer}
+    keep_count2 = C2 - round(C2 * 0.5)
+    assert inits["W3"][1] == keep_count2
+
+    x = rng.standard_normal((1, Cin, 10, 10)).astype(np.float32)
+    (y_pruned,) = _run_unfused(pruned, {"X": x})
+    assert y_pruned.shape == (1, Out)
+    assert np.all(np.isfinite(y_pruned))
+
+
 # --- QDQ ConvTranspose -------------------------------------------------
 #
 # Mirrors tests/test_pruning.py's own plain-float
@@ -46222,6 +46450,91 @@ def _dqconv_model_from_weights(
     }
 
 
+def _dqconv_gap_flatten_gemm_model_from_weights(
+    c, m1, m2, out, w1f, w2f, w3f, b1f=None, spatial=8, activation="Relu", seed=0
+):
+    """The `_dqconv_model_from_weights` analogue exercising the classifier-
+    head hop `_walk_to_conv_integer_consumer` gained: ``ConvInteger ->
+    {activation} -> ConvInteger -> GlobalAveragePool -> Flatten(axis=1) ->
+    Gemm`` -- the SECOND ``ConvInteger``'s own logical output feeds
+    `GlobalAveragePool` directly (no activation in between, the canonical
+    classifier-head shape), with a plain, constant-float ``Gemm``
+    (``transB=1``) as the matched matmul consumer -- never itself
+    quantized, exactly like the plain-float walker's own identical hop (see
+    `_match_gap_flatten_matmul_consumer`'s own docstring). `w3f` is the
+    Gemm's own ``[out, m2]`` float weight. Returns ``(model, info)`` like
+    `_dqconv_model_from_weights`, with `W3f` added.
+    """
+    w1q, w1s, w1zp = _quantize_dynamic_conv_weight(w1f, spatial=spatial)
+    w2q, w2s, w2zp = _quantize_dynamic_conv_weight(w2f, spatial=spatial)
+
+    kh1, kw1 = w1f.shape[2], w1f.shape[3]
+    kh2, kw2 = w2f.shape[2], w2f.shape[3]
+    ph1, pw1 = (kh1 - 1) // 2, (kw1 - 1) // 2
+    ph2, pw2 = (kh2 - 1) // 2, (kw2 - 1) // 2
+
+    if b1f is not None:
+        bias_ops = """
+          b1r = Reshape(b1, b1_shape)
+          c1 = Add(c1s, b1r)
+        """
+        c1_out = "c1"
+    else:
+        bias_ops = ""
+        c1_out = "c1s"
+
+    body = f"""
+    g (float[1,{c},{spatial},{spatial}] x) => (float[1,{out}] y)
+    {{
+      xq, x_scale, x_zero_point = DynamicQuantizeLinear(x)
+      combined_scale1 = Mul(x_scale, w1_scale)
+      c1i = ConvInteger<kernel_shape=[{kh1},{kw1}], pads=[{ph1},{pw1},{ph1},{pw1}]>(xq, w1_quantized, x_zero_point, w1_zero_point)
+      c1f = Cast<to=1>(c1i)
+      c1s = Mul(c1f, combined_scale1)
+      {bias_ops}
+      h1 = {activation}({c1_out})
+      rq, r_scale, r_zero_point = DynamicQuantizeLinear(h1)
+      combined_scale2 = Mul(r_scale, w2_scale)
+      c2i = ConvInteger<kernel_shape=[{kh2},{kw2}], pads=[{ph2},{pw2},{ph2},{pw2}]>(rq, w2_quantized, r_zero_point, w2_zero_point)
+      c2f = Cast<to=1>(c2i)
+      h2 = Mul(c2f, combined_scale2)
+      p = GlobalAveragePool(h2)
+      f = Flatten<axis=1>(p)
+      y = Gemm<transB=1>(f, w3)
+    }}
+    """
+    inits = [
+        onnx.numpy_helper.from_array(w1q, "w1_quantized"),
+        onnx.numpy_helper.from_array(w1s, "w1_scale"),
+        onnx.numpy_helper.from_array(w1zp, "w1_zero_point"),
+        onnx.numpy_helper.from_array(w2q, "w2_quantized"),
+        onnx.numpy_helper.from_array(w2s, "w2_scale"),
+        onnx.numpy_helper.from_array(w2zp, "w2_zero_point"),
+        _f32(w3f, "w3"),
+    ]
+    if b1f is not None:
+        inits.append(_f32(b1f, "b1"))
+        inits.append(
+            onnx.numpy_helper.from_array(
+                np.array([1, -1, 1, 1], dtype=np.int64), "b1_shape"
+            )
+        )
+    model = _model(body, initializer=inits, opset=21)
+    return model, {
+        "W1f": w1f,
+        "W2f": w2f,
+        "W3f": w3f,
+        "B1f": b1f,
+        "W1q": w1q,
+        "W1s": w1s,
+        "W1zp": w1zp,
+        "W2q": w2q,
+        "W2s": w2s,
+        "W2zp": w2zp,
+        "spatial": spatial,
+    }
+
+
 def _dqconv_clip_model_from_weights(
     c, m1, m2, w1f, w2f, b1f=None, spatial=8, min_val=0.0, max_val=6.0, seed=0
 ):
@@ -47023,6 +47336,202 @@ def test_dynamic_quantize_conv_real_quantize_dynamic_pipeline_end_to_end():
     x = rng.standard_normal((1, c, spatial, spatial)).astype(np.float32)
     (y_pruned,) = _run(pruned, {"x": x})
     assert y_pruned.shape == (1, m2, spatial, spatial)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_dynamic_quantize_conv_global_average_pool_flatten_gemm_pass_through_matches_oracle():
+    # The classifier-head hop `_walk_to_conv_integer_consumer` gained,
+    # mirroring the plain-float walker's own `recognize_gap_flatten_matmul_consumer`:
+    # a `ConvInteger`'s own logical output feeding `GlobalAveragePool ->
+    # Flatten(axis=1) -> Gemm` directly is matched and pruned, with the
+    # matched Gemm consumer (plain, constant float, never quantized) sliced
+    # via the ordinary `_slice_consumer_weight`. Both `ConvInteger` layers'
+    # weights are quantized via the REAL `onnxruntime.quantization
+    # .quantize_dynamic` tool (`_quantize_dynamic_conv_weight`, never a
+    # hand-rolled re-implementation) -- per this repo's own CLAUDE.md
+    # convention, only the fixture weights come from the real tool, while
+    # the surrounding graph structure is assembled via `onnx.parser`.
+    #
+    # This model matches BOTH chains at once: the ordinary same-family
+    # ConvInteger->ConvInteger chain (w1 producer / w2 consumer) AND the new
+    # classifier-head chain (w2 producer / Gemm consumer) -- w2 legitimately
+    # plays both roles across the two chains, exactly like a middle MLP
+    # layer already does in the plain-float sections (see `_apply_chains`'s
+    # own comment). The independent oracle below replicates that same
+    # sequential "w2's consumer-role (input-axis) slice happens before its
+    # own producer-role (output-axis) importance is ranked" order, since
+    # `apply_structured_pruning_dynamic_quantize_conv` mutates `w2` in place
+    # while processing chains in `graph.node` order.
+    c, m1, m2, out = 4, 6, 5, 3
+    rng = np.random.default_rng(50)
+    w1f = (rng.standard_normal((m1, c, 3, 3)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((m2, m1, 3, 3)) * 0.3).astype(np.float32)
+    w3f = (rng.standard_normal((out, m2)) * 0.3).astype(np.float32)
+    model, info = _dqconv_gap_flatten_gemm_model_from_weights(
+        c, m1, m2, out, w1f, w2f, w3f, seed=50
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_conv_integer_chains(model.graph)
+    assert len(chains) == 2
+    gap_chain = next(ch for ch in chains if ch.matmul_consumer is not None)
+    assert gap_chain.consumer is None
+    assert gap_chain.matmul_consumer[1] == "w3"
+    assert gap_chain.n_channels == m2
+
+    keep_count1 = m1 - round(m1 * 0.5)
+    keep_count2 = m2 - round(m2 * 0.5)
+    keep1 = _dqconv_importance_keep(info["W1q"], info["W1s"], info["W1zp"], keep_count1)
+    # w2's own consumer-role (input-axis) slice by `keep1` is applied before
+    # its producer-role importance is ranked -- see this test's own comment
+    # above.
+    w2q_after_consumer_slice = info["W2q"][:, keep1, :, :]
+    keep2 = _dqconv_importance_keep(
+        w2q_after_consumer_slice, info["W2s"], info["W2zp"], keep_count2
+    )
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_conv(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["w1_quantized"].dims) == [keep_count1, c, 3, 3]
+    assert list(inits["w2_quantized"].dims) == [keep_count2, keep_count1, 3, 3]
+    assert list(inits["w2_scale"].dims) == []  # always per-tensor, untouched
+    assert list(inits["w3"].dims) == [out, keep_count2]
+
+    w2q_final = info["W2q"][keep2][:, keep1, :, :]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["w1_quantized"]), info["W1q"][keep1]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["w2_quantized"]), w2q_final
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["w3"]), w3f[:, keep2]
+    )
+
+    # Independently reconstructed "already pruned" reference model: the
+    # SAME model-builder helper, called with pre-sliced float weights (for
+    # the correct, already-reduced graph shapes) and then patched with the
+    # exact pre-sliced quantized codes (never a fresh re-quantization of the
+    # sliced float weight, which could calibrate a different scale) --
+    # mirrors `test_dynamic_quantize_conv_producer_matches_independent_oracle_via_real_inference_session`'s
+    # own identical pattern.
+    ref_model, _ = _dqconv_gap_flatten_gemm_model_from_weights(
+        c,
+        keep_count1,
+        keep_count2,
+        out,
+        info["W1f"][keep1],
+        info["W2f"][keep2][:, keep1],
+        w3f[:, keep2],
+        seed=987654,
+    )
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    ref_inits["w1_quantized"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1q"][keep1], "w1_quantized")
+    )
+    ref_inits["w1_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1s"], "w1_scale")
+    )
+    ref_inits["w1_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1zp"], "w1_zero_point")
+    )
+    ref_inits["w2_quantized"].CopyFrom(
+        onnx.numpy_helper.from_array(w2q_final, "w2_quantized")
+    )
+    ref_inits["w2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2s"], "w2_scale")
+    )
+    ref_inits["w2_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2zp"], "w2_zero_point")
+    )
+
+    rng2 = np.random.default_rng(51)
+    x = rng2.standard_normal((1, c, info["spatial"], info["spatial"])).astype(
+        np.float32
+    )
+    (y_pruned,) = _run(pruned, {"x": x})
+    (y_ref,) = _run(ref_model, {"x": x})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_dynamic_quantize_conv_global_average_pool_flatten_gemm_real_quantize_dynamic_pipeline_end_to_end():
+    # The full end-to-end pipeline counterpart to
+    # `test_dynamic_quantize_conv_real_quantize_dynamic_pipeline_end_to_end`,
+    # extended with the classifier head: runs the REAL `quantize_dynamic`
+    # tool on a plain float `Conv -> Relu -> Conv -> GlobalAveragePool ->
+    # Flatten(axis=1) -> Gemm` model (only `Conv` requested for
+    # quantization, so the classifier `Gemm`'s own weight is never touched
+    # by the quantizer, exactly the shape this hop targets) and a real
+    # `InferenceSession`'s default graph optimization on the result, then
+    # confirms the LAST `ConvInteger` (feeding the classifier head) is
+    # matched and prunable -- the exact gap this round's task fixes.
+    from onnxruntime.quantization import quantize_dynamic
+
+    c, m1, m2, out = 4, 6, 5, 3
+    spatial = 8
+    rng = np.random.default_rng(15)
+    w0 = (rng.standard_normal((m1, c, 3, 3)) * 0.3).astype(np.float32)
+    w1 = (rng.standard_normal((m2, m1, 3, 3)) * 0.3).astype(np.float32)
+    w2 = (rng.standard_normal((out, m2)) * 0.3).astype(np.float32)
+    float_model = _model(
+        f"""
+        g (float[1,{c},{spatial},{spatial}] x) => (float[1,{out}] y)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(x, W0)
+          h0a = Relu(h0)
+          h1 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(h0a, W1)
+          p = GlobalAveragePool(h1)
+          f = Flatten<axis=1>(p)
+          y = Gemm<transB=1>(f, W2)
+        }}
+        """,
+        initializer=[_f32(w0, "W0"), _f32(w1, "W1"), _f32(w2, "W2")],
+        opset=21,
+    )
+
+    with tempfile.TemporaryDirectory() as d:
+        src_path = os.path.join(d, "src.onnx")
+        quant_path = os.path.join(d, "quant.onnx")
+        opt_path = os.path.join(d, "opt.onnx")
+        onnx.save(float_model, src_path)
+        quantize_dynamic(src_path, quant_path, op_types_to_quantize=["Conv"])
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.optimized_model_filepath = opt_path
+        ort.InferenceSession(
+            quant_path, sess_options=so, providers=["CPUExecutionProvider"]
+        )
+        fused = onnx.load(opt_path)
+
+    op_types = [n.op_type for n in fused.graph.node]
+    assert op_types.count("ConvInteger") == 2  # both Conv layers quantized
+    assert op_types.count("Gemm") + op_types.count("MatMul") == 1  # Gemm/MatMul
+    # left completely untouched -- only "Conv" was requested for
+    # quantization.
+
+    chains = onnxsim.pruning._find_conv_integer_chains(fused.graph)
+    assert len(chains) == 2
+    gap_chain = next(ch for ch in chains if ch.matmul_consumer is not None)
+    assert gap_chain.consumer is None
+    assert gap_chain.n_channels == m2
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_conv(fused, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    pruned_inits = {t.name: list(t.dims) for t in pruned.graph.initializer}
+    # The LAST ConvInteger's own weight (feeding the classifier head) has
+    # its output-channel axis pruned.
+    ci_nodes = [n for n in pruned.graph.node if n.op_type == "ConvInteger"]
+    last_ci_weight = ci_nodes[-1].input[1]
+    assert pruned_inits[last_ci_weight][0] == m2 - round(m2 * 0.5)
+    gemm_weight = next(
+        n.input[1] for n in pruned.graph.node if n.op_type in ("Gemm", "MatMul")
+    )
+    assert pruned_inits[gemm_weight][1] == m2 - round(m2 * 0.5)
+
+    x = rng.standard_normal((1, c, spatial, spatial)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"x": x})
+    assert y_pruned.shape == (1, out)
     assert np.all(np.isfinite(y_pruned))
 
 
