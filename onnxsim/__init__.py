@@ -121,6 +121,7 @@ from onnxsim.ort_matmul_nbits_workaround import workaround_ort_matmul_nbits_axis
 from onnxsim.outlier_suppression import apply_outlier_suppression
 from onnxsim.outlier_suppression_plus import apply_outlier_suppression_plus
 from onnxsim.owq import apply_owq
+from onnxsim.paroquant import apply_paroquant
 from onnxsim.pb_llm import quantize_weight_only_pb_llm
 from onnxsim.ppq_integration import quantize_with_ppq
 from onnxsim.precision_estimator import (
@@ -224,6 +225,7 @@ __all__ = [
     "apply_duquant",
     "apply_zeroquant",
     "apply_spinquant",
+    "apply_paroquant",
     "apply_rotatekv",
     "apply_omniquant",
     "apply_affinequant",
