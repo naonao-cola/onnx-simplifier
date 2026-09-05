@@ -101,6 +101,13 @@ constant folding until the model stops changing. Around that it offers:
   `onnxsim.export_coreml`), via a built-in ONNX-to-MIL translator and
   [coremltools](https://github.com/apple/coremltools)' MIL-to-Core-ML backend.
   coremltools is optional.
+- **[TensorFlow Lite export](#exporting-to-tensorflow-lite).** Convert the
+  simplified model to a `.tflite` flatbuffer with `--emit-tflite` (Python:
+  `onnxsim.export_tflite`), via a built-in ONNX-to-TensorFlow translator and
+  `tf.lite.TFLiteConverter`. TensorFlow is optional; pass `--tflite-backend
+  onnx2tf` to route through
+  [onnx2tf](https://github.com/PINTO0309/onnx2tf) instead for far broader op
+  coverage.
 - **Large-model handling.** Guard against blow-up from ops like `Tile`/
   `ConstantOfShape` (`--no-large-tensor`), read and write external-data models,
   and eliminate unused outputs (`--unused-output`).
@@ -404,6 +411,114 @@ the default, or the legacy `"neuralnetwork"`), `compute_units` (which devices
 the model may run on, e.g. `"CPU_ONLY"`), `compute_precision`,
 `minimum_deployment_target` (e.g. `"iOS16"`), and `skip_model_load` (see
 above). See `onnxsim/coreml_export.py` for the full signature.
+
+## Exporting to TensorFlow Lite
+
+Mobile/embedded runtimes built on TensorFlow want the graph as a `.tflite`
+flatbuffer instead of ONNX or Core ML. `onnx-tensorflow`/`onnx-tf` (the
+project that used to fill this gap) has been unmaintained for years and only
+tracks very old opsets, so -- same situation as Core ML after coremltools
+dropped its own ONNX frontend -- onnxsim ships its own ONNX-to-TensorFlow
+translator: it builds the equivalent computation with plain TensorFlow ops
+inside a `tf.function`, traces it into a concrete function, and hands that to
+`tf.lite.TFLiteConverter` to produce the actual `.tflite` model. It covers a
+practical subset of ops (conv/pooling/normalization, matmul/gemm, elementwise
+math, reshapes, reductions, and more -- see
+`tflite_export.SUPPORTED_ONNX_OPS`); a node whose op isn't supported raises a
+clear error naming the op, rather than silently producing a wrong model.
+Feeding in a *simplified* model is the point, same as with the other export
+backends: onnxsim's constant folding turns more of the graph's
+shape-manipulation subgraphs into plain initializers, which this translator
+needs at conversion time for things like a `Reshape`'s target shape or a
+`Slice`'s bounds.
+
+TensorFlow is **optional**, just like onnxruntime for constant folding and
+coremltools for Core ML export: it isn't imported unless you actually export
+to TFLite.
+
+```
+pip install tensorflow
+```
+
+TensorFlow Lite's own op kernels are NHWC-only, while ONNX's conv/pool ops
+are NCHW; this translator keeps the graph's public tensors in ONNX's NCHW
+layout and transposes to/from NHWC only around the ops that need it, so no
+manual layout conversion is required on your part. Graph inputs must have
+fully static shapes (dynamic axes aren't supported) -- pin them first with
+`--overwrite-input-shape`/`--test-input-shape` if needed.
+
+From the CLI, add `--emit-tflite`. Passed without a path it writes the model
+next to the output model with a `.tflite` extension; pass a path to choose
+the location:
+
+```
+# writes simplified.onnx and simplified.tflite
+onnxsim input.onnx simplified.onnx --emit-tflite
+
+# choose the path explicitly, and enable TFLite's default post-training
+# (dynamic-range) quantization
+onnxsim input.onnx simplified.onnx --emit-tflite model.tflite --tflite-optimize
+```
+
+From Python, `onnxsim.export_tflite` converts a model (typically the output
+of `simplify`) and returns the serialized `.tflite` flatbuffer (`bytes`),
+optionally writing it to a file:
+
+```python
+import onnx
+import onnxsim
+
+model = onnx.load("input.onnx")
+model_simp, ok = onnxsim.simplify(model)
+assert ok
+
+# Return the flatbuffer bytes...
+tflite_model = onnxsim.export_tflite(model_simp)
+# ...and/or write it to a file.
+onnxsim.export_tflite(model_simp, "model.tflite")
+```
+
+`export_tflite` accepts an `optimizations` keyword argument, forwarded to
+`tf.lite.TFLiteConverter.optimizations` (e.g. `["DEFAULT"]`, what
+`--tflite-optimize` sets, to enable post-training dynamic-range
+quantization). See `onnxsim/tflite_export.py` for the full signature.
+
+### A broader-coverage backend: onnx2tf
+
+The built-in translator above covers a practical op subset. For a model that
+hits an unsupported op, pass `backend="onnx2tf"` (CLI: `--tflite-backend
+onnx2tf`) to route the conversion through
+[onnx2tf](https://github.com/PINTO0309/onnx2tf) instead -- a separate,
+actively maintained project with far broader op coverage (~200 ops) and years
+of production hardening across real-world model zoos.
+
+```
+pip install onnx2tf
+```
+
+onnx2tf is a much heavier dependency than the builtin backend needs (it pulls
+its own TensorFlow, onnxruntime, onnx-graphsurgeon, and a couple dozen small
+`*4onnx` helper packages), and it changes the model's public input/output
+tensor layout to channel-last by default -- it converts *every* tensor of
+rank >= 3 to that convention, not just 4-D image tensors, unlike the builtin
+backend which always keeps ONNX's own declared shapes. Pass onnx2tf's own
+`keep_ncw_or_nchw_or_ncdhw_input_names` (a list of input names to keep in
+their original ONNX layout) as an extra keyword argument if you need specific
+inputs to keep their original layout.
+
+```
+onnxsim input.onnx simplified.onnx --emit-tflite --tflite-backend onnx2tf
+```
+
+```python
+tflite_model = onnxsim.export_tflite(model_simp, backend="onnx2tf")
+```
+
+`--tflite-optimize`/`optimizations` only applies to the builtin backend; use
+onnx2tf's own quantization options (forwarded as extra keyword arguments,
+e.g. `output_integer_quantized_tflite=True`) instead. See
+`onnxsim/onnx2tf_export.py` for the full signature and onnx2tf's own
+documentation for its option list.
 
 ## Constant folding on the GPU (CUDA execution provider)
 
