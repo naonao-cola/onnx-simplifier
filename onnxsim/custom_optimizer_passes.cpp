@@ -138,7 +138,9 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseReshapeFamily>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::FuseRope>(registry);
+    RegisterOrReplace<p::MagnitudePruningAttention>(registry);
     RegisterOrReplace<p::MagnitudePruningConv>(registry);
+    RegisterOrReplace<p::MagnitudePruningGlobal>(registry);
     RegisterOrReplace<p::MagnitudePruningMatMul>(registry);
     RegisterOrReplace<p::QOperatorQuantizeActivation>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConcat>(registry);

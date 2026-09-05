@@ -2613,49 +2613,27 @@ def apply_magnitude_pruning(
     -- consistent with "global" meaning the whole model, not just its
     top-level graph -- so `sparsity`'s fraction is chosen from, and applied
     to, that combined pool.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.prune_magnitude_cpp` (``onnxsim/passes/magnitude_pruning.h``'s
+    own ``MagnitudePruningMatMul``/``MagnitudePruningConv``/
+    ``MagnitudePruningAttention``/``MagnitudePruningGlobal``), forwarding
+    every argument unchanged. Imported lazily (inside the function body, not
+    at module scope) to avoid a circular import: ``onnxsim.onnx_simplifier``
+    already imports from this module (:class:`EmbeddingPruningResult`), so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
-    _validate_pattern(sparsity, n, m)
-    if global_sparsity and n is not None:
-        raise ValueError(
-            "global_sparsity is not supported together with N:M pruning "
-            "(n/m) -- see apply_magnitude_pruning's own docstring"
-        )
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
+    from onnxsim.onnx_simplifier import prune_magnitude_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-
-    if global_sparsity:
-        entries = []
-        for graph in _iter_subgraphs(out.graph):
-            initializer_map = _constant_map(graph)
-            for _, _, w_name, weight_transposed, is_conv in _candidates(graph):
-                w_init = initializer_map[w_name]
-                w = _to_f64(w_init)
-                w_nk = _weight_to_nk(w, weight_transposed, is_conv)
-                entries.append(
-                    (w_init, weight_transposed, is_conv, w.shape, w_nk, np.abs(w_nk))
-                )
-        _apply_global_unstructured_pruning(entries, sparsity)
-        return out
-
-    for graph in _iter_subgraphs(out.graph):
-        initializer_map = _constant_map(graph)
-        for _, _, w_name, weight_transposed, is_conv in _candidates(graph):
-            w_init = initializer_map[w_name]
-
-            def importance_of_nk(w_nk, n=n, m=m, sparsity=sparsity):
-                importance = np.abs(w_nk)
-                return (
-                    _nm_mask(importance, n, m)
-                    if n is not None
-                    else _sparsity_mask(importance, sparsity)
-                )
-
-            _prune_weight(w_init, weight_transposed, importance_of_nk, is_conv=is_conv)
-
-    return out
+    return prune_magnitude_cpp(
+        model,
+        sparsity=sparsity,
+        n=n,
+        m=m,
+        global_sparsity=global_sparsity,
+    )
 
 
 def _wanda_norm_for_candidate(
@@ -35916,51 +35894,26 @@ def apply_embedding_vocab_pruning(
     :func:`_match_embedding_chain_any_graph`'s own docstring for exactly
     how the "exactly one eligible producer, or decline" rule is applied
     *across the whole model* now, not just one single graph.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port (including both of ``com.microsoft::
+    GatherBlockQuantized``'s own sub-8-bit packing conventions -- see
+    ``onnxsim/structured_pruning_entry.cpp``'s own "Embedding vocabulary
+    pruning" section comment) -- this is now a thin alias for
+    :func:`onnxsim.apply_embedding_vocab_pruning_cpp`, forwarding every
+    argument unchanged. Imported lazily (inside the function body, not at
+    module scope) to avoid a circular import: ``onnxsim.onnx_simplifier``
+    already imports from this module (:class:`EmbeddingPruningResult`), so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
-    if (keep_token_ids is None) == (drop_token_ids is None):
-        raise ValueError(
-            "give exactly one of keep_token_ids or drop_token_ids, not both/neither"
-        )
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
+    from onnxsim.onnx_simplifier import apply_embedding_vocab_pruning_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-
-    graph, chain = _match_embedding_chain_any_graph(out.graph, input_name)
-    if chain is None:
-        return EmbeddingPruningResult(model=out, matched=False)
-    assert graph is not None
-
-    vocab_size = chain.vocab_size
-    if keep_token_ids is not None:
-        keep_set = {int(i) for i in keep_token_ids}
-    else:
-        assert drop_token_ids is not None
-        drop_set = {int(i) for i in drop_token_ids}
-        bad_drop = sorted(i for i in drop_set if not (0 <= i < vocab_size))
-        if bad_drop:
-            raise ValueError(
-                f"drop_token_ids out of range [0, {vocab_size}): {bad_drop[:5]}"
-            )
-        keep_set = set(range(vocab_size)) - drop_set
-    bad_keep = sorted(i for i in keep_set if not (0 <= i < vocab_size))
-    if bad_keep:
-        raise ValueError(
-            f"keep_token_ids out of range [0, {vocab_size}): {bad_keep[:5]}"
-        )
-    if not keep_set:
-        raise ValueError("keep_token_ids resolves to an empty vocabulary")
-    keep_ids = sorted(keep_set)
-
-    _apply_embedding_vocab_prune(graph, chain, keep_ids)
-    id_map = {old: new for new, old in enumerate(keep_ids)}
-    return EmbeddingPruningResult(
-        model=out,
-        matched=True,
-        kept_token_ids=keep_ids,
-        id_map=id_map,
-        lm_head_pruned=chain.lm_head is not None,
+    return apply_embedding_vocab_pruning_cpp(
+        model,
+        keep_token_ids=keep_token_ids,
+        drop_token_ids=drop_token_ids,
+        input_name=input_name,
     )
 
 
@@ -36094,49 +36047,26 @@ def apply_embedding_vocab_magnitude_pruning(
     "Subgraph recursion" section comment) exactly the same way
     :func:`apply_embedding_vocab_pruning` is -- see
     :func:`_match_embedding_chain_any_graph`'s own docstring.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port (including both of ``com.microsoft::
+    GatherBlockQuantized``'s own sub-8-bit packing conventions -- see
+    ``onnxsim/structured_pruning_entry.cpp``'s own "Embedding vocabulary
+    pruning" section comment) -- this is now a thin alias for
+    :func:`onnxsim.apply_embedding_vocab_magnitude_pruning_cpp`, forwarding
+    every argument unchanged. Imported lazily (inside the function body, not
+    at module scope) to avoid a circular import: ``onnxsim.onnx_simplifier``
+    already imports from this module (:class:`EmbeddingPruningResult`), so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
-    if not (0.0 <= sparsity < 1.0):
-        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
+    from onnxsim.onnx_simplifier import apply_embedding_vocab_magnitude_pruning_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-
-    graph, chain = _match_embedding_chain_any_graph(out.graph, input_name)
-    if chain is None:
-        return EmbeddingPruningResult(model=out, matched=False)
-    assert graph is not None
-
-    vocab_size = chain.vocab_size
-    initializer_map = _constant_map(graph)
-    importance = _embedding_vocab_importance(chain, initializer_map)
-
-    protect = {int(i) for i in (protect_token_ids or ())}
-    bad_protect = sorted(i for i in protect if not (0 <= i < vocab_size))
-    if bad_protect:
-        raise ValueError(
-            f"protect_token_ids out of range [0, {vocab_size}): {bad_protect[:5]}"
-        )
-
-    keep_count = max(1, min(vocab_size, round(vocab_size * (1.0 - sparsity))))
-    keep_count = max(keep_count, len(protect))
-    order = np.argsort(-importance)
-    keep_set = set(protect)
-    for idx in order:
-        if len(keep_set) >= keep_count:
-            break
-        keep_set.add(int(idx))
-    keep_ids = sorted(keep_set)
-
-    _apply_embedding_vocab_prune(graph, chain, keep_ids)
-    id_map = {old: new for new, old in enumerate(keep_ids)}
-    return EmbeddingPruningResult(
-        model=out,
-        matched=True,
-        kept_token_ids=keep_ids,
-        id_map=id_map,
-        lm_head_pruned=chain.lm_head is not None,
+    return apply_embedding_vocab_magnitude_pruning_cpp(
+        model,
+        sparsity=sparsity,
+        protect_token_ids=protect_token_ids,
+        input_name=input_name,
     )
 
 

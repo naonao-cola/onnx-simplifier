@@ -4009,6 +4009,45 @@ int64_t ChainGroup(const Chain& chain) {
   return group;
 }
 
+// Whether `chain` may take part in ApplyStructuredPruning/
+// ApplyStructuredWandaPruning's own `global_sparsity` mode
+// (ApplyChainsGlobal below) -- an ordinary, single-producer chain with no
+// extra fan-out consumer branch and no general grouped Conv on either side.
+// Mirrors pruning.py's own _chain_is_global_sparsity_eligible exactly -- see
+// apply_structured_pruning's own `global_sparsity` docstring for the full
+// reasoning (a gated pair, a residual/merge group, and any general grouped
+// Conv chain all fail this and are left completely untouched by
+// global_sparsity mode instead of folded into the pool or pruned locally
+// alongside it).
+bool ChainIsGlobalSparsityEligible(const Chain& chain) {
+  return chain.producers.size() == 1 && chain.extra_consumers.empty() &&
+         ChainGroup(chain) == 1;
+}
+
+// Selects L1 (sum of absolute weight magnitude) or L2 (Li et al.'s original
+// root-sum-square) importance ranking -- mirrors pruning.py's own
+// `_ImportanceNorm`/`_validate_importance_norm`. Kept as a tiny internal
+// enum (parsed once at each public entry point via ParseImportanceNorm)
+// rather than threading a raw `std::string` through every chain-application
+// helper below, exactly the same "parse the string once at the boundary"
+// convention QuantizeFp8 (quantize_entry.cpp) already establishes for its
+// own `format` string parameter -- see that function's own body.
+enum class ImportanceNorm { kL2, kL1 };
+
+ImportanceNorm ParseImportanceNorm(const std::string& importance_norm,
+                                   const char* caller) {
+  if (importance_norm == "l2") {
+    return ImportanceNorm::kL2;
+  }
+  if (importance_norm == "l1") {
+    return ImportanceNorm::kL1;
+  }
+  throw std::invalid_argument(
+      std::string(caller) +
+      ": importance_norm must be \"l1\" or \"l2\", got \"" + importance_norm +
+      "\"");
+}
+
 // --- Slicing, mirroring _slice_producer_weight/_slice_consumer_weight/
 // _slice_grouped_consumer_conv_weight/_slice_last_axis ----------------------
 
@@ -4206,6 +4245,148 @@ struct TouchedState {
   std::unordered_set<std::string> stale_value_info;
 };
 
+// Performs the actual channel-removal slicing for one already-decided
+// (ascending) `keep` index set -- every producer's weight/bias, every
+// chain-op constant, every depthwise pass-through hop, the (possibly
+// grouped) consumer, and every extra fan-out consumer branch. Factored out
+// of ApplyChains so ApplyChainsGlobal (ApplyStructuredPruning's own
+// `global_sparsity` mode) can reuse the identical slicing mechanics without
+// duplicating it -- mirrors pruning.py's own _slice_chain_channels exactly,
+// including that touched-role bookkeeping is deliberately NOT part of this
+// function (the two callers mark touched roles at different points relative
+// to slicing -- ApplyChains as it goes, ApplyChainsGlobal eagerly during
+// admission, before any chain's final `keep` is even decided -- see that
+// function's own comment).
+void SliceChainChannels(
+    std::unordered_map<std::string, onnx::TensorProto*>& init_map, Chain& chain,
+    const std::vector<int64_t>& keep,
+    std::unordered_set<std::string>& stale_value_info) {
+  const int64_t n = chain.n_channels;
+  std::vector<const ConsumerBranch*> extra_ptrs;
+  extra_ptrs.reserve(chain.extra_consumers.size());
+  for (const auto& b : chain.extra_consumers) {
+    extra_ptrs.push_back(&b);
+  }
+
+  for (const auto& p : chain.producers) {
+    SliceProducerWeight(init_map.at(p.weight), p.weight_transposed, keep,
+                        p.is_conv);
+    if (p.bias) {
+      SliceLastAxis(init_map.at(*p.bias), keep);
+    }
+  }
+  for (const auto& co : chain.chain_ops) {
+    if (co.const_name) {
+      SliceLastAxis(init_map.at(*co.const_name), keep);
+    }
+  }
+  for (const auto& hop : chain.conv_pass_through) {
+    SliceProducerWeight(init_map.at(hop.weight), false, keep, true);
+    if (hop.bias) {
+      SliceLastAxis(init_map.at(*hop.bias), keep);
+    }
+    if (hop.past_state) {
+      // A CausalConvWithState hop's own constant `past_state` -- rank-3
+      // `(batch, channels, k-1)`, channel axis 1 -- reuses
+      // SliceConsumerWeight's own `is_conv` branch (SliceAxis1 over
+      // dims(0)/dims(1) with `inner = prod(dims[2:])`), which slices
+      // exactly that axis; mirrors pruning.py's own _slice_axis1 call in
+      // _apply_conv_pass_through_hop.
+      SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
+    }
+    // A PRelu per-channel-slope hop reuses ConvPassThrough for its own
+    // slicing (see MatchPreluPassThrough's own comment) but, unlike a
+    // depthwise Conv hop, has no `group` attribute of its own to update --
+    // mirrors pruning.py's own _apply_conv_pass_through_hop, which only
+    // ever touches `group` when the hop node is actually a Conv.
+    if (hop.node->op_type() == "Conv") {
+      SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
+    }
+  }
+  if (chain.group_norm) {
+    // Same `keep` index set as the real producer -- `num_groups` itself is
+    // left untouched (see GroupNormPassThrough's own comment for why it
+    // stays valid without changing it). Sliced via SliceLastAxis, not
+    // ConvPassThrough's own axis-0 SliceProducerWeight -- see
+    // GroupNormPassThrough's own comment for why.
+    SliceLastAxis(init_map.at(chain.group_norm->scale), keep);
+    SliceLastAxis(init_map.at(chain.group_norm->bias), keep);
+  }
+  if (chain.consumer_is_conv && chain.consumer_group > 1) {
+    SliceGroupedConsumerConvWeight(init_map.at(chain.consumer_weight), keep,
+                                   chain.consumer_group, n);
+  } else {
+    SliceConsumerWeight(init_map.at(chain.consumer_weight),
+                        chain.consumer_weight_transposed, keep,
+                        chain.consumer_is_conv);
+  }
+  // Extra fan-out branches: each is either an ordinary (group == 1)
+  // consumer, or, for a Conv residual/merge chain, a general grouped Conv
+  // consumer whose own group was already confirmed (in
+  // FindConvResidualChains) to agree with `group` above --
+  // ResolveMatmulFanoutBranches never resolves a grouped one, so
+  // consumer_group stays at its default 1 there. Either way, fed by the
+  // exact same `keep` just computed for the group's shared producers above.
+  for (const auto* b : extra_ptrs) {
+    for (const auto& co : b->chain_ops) {
+      if (co.const_name) {
+        SliceLastAxis(init_map.at(*co.const_name), keep);
+      }
+    }
+    for (const auto& hop : b->conv_pass_through) {
+      SliceProducerWeight(init_map.at(hop.weight), false, keep, true);
+      if (hop.bias) {
+        SliceLastAxis(init_map.at(*hop.bias), keep);
+      }
+      if (hop.past_state) {
+        SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
+      }
+      if (hop.node->op_type() == "Conv") {
+        SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
+      }
+    }
+    if (b->consumer_is_conv && b->consumer_group > 1) {
+      SliceGroupedConsumerConvWeight(init_map.at(b->consumer_weight), keep,
+                                     b->consumer_group, n);
+    } else {
+      SliceConsumerWeight(init_map.at(b->consumer_weight),
+                          b->consumer_weight_transposed, keep,
+                          b->consumer_is_conv);
+    }
+  }
+
+  for (const auto& p : chain.producers) {
+    stale_value_info.insert(p.node->output(0));
+    for (const auto* pre_op : p.pre_ops) {
+      stale_value_info.insert(pre_op->output(0));
+    }
+  }
+  for (const auto& co : chain.chain_ops) {
+    stale_value_info.insert(co.node->output(0));
+  }
+  // Every output, not just [0] -- a hop node can have more than one (e.g.
+  // `CausalConvWithState`'s own `present_state`); see ConvPassThrough's own
+  // docstring.
+  for (const auto& hop : chain.conv_pass_through) {
+    for (const auto& out : hop.node->output()) {
+      stale_value_info.insert(out);
+    }
+  }
+  if (chain.group_norm) {
+    stale_value_info.insert(chain.group_norm->node->output(0));
+  }
+  for (const auto* b : extra_ptrs) {
+    for (const auto& co : b->chain_ops) {
+      stale_value_info.insert(co.node->output(0));
+    }
+    for (const auto& hop : b->conv_pass_through) {
+      for (const auto& out : hop.node->output()) {
+        stale_value_info.insert(out);
+      }
+    }
+  }
+}
+
 // `act_norm`, when non-null, is a probe-name -> per-channel calibrated
 // activation-L2-norm map (see WandaCalibrationStats below), keyed by
 // `chain.consumer_node->input(0)` -- the same probe point
@@ -4216,19 +4397,26 @@ struct TouchedState {
 // mirrored by *any* mismatch here too -- an absent probe name, or a
 // present one whose length no longer lines up with this chain because a
 // sibling chain already resliced the shared tensor first), each channel's
-// plain ``||W_row||_2`` importance is multiplied by
-// ``max(act_norm[c], epsilon)`` -- Wanda's own metric. `nullptr` (the
-// default, and every ApplyStructuredPruning call site's own unchanged
-// argument count) keeps this identically the plain L2-only ranking it
-// always was; this is the one shared importance-computation point both
-// ApplyStructuredPruning and ApplyStructuredWandaPruning go through, so
-// the two never duplicate the ranking/top-k/slicing logic below -- only
-// the *importance vector feeding into it* differs.
+// plain importance is multiplied by ``max(act_norm[c], epsilon)`` -- Wanda's
+// own metric. `nullptr` (the default, and every ApplyStructuredPruning call
+// site's own unchanged argument count) keeps this identically the plain
+// weight-only ranking it always was; this is the one shared
+// importance-computation point both ApplyStructuredPruning and
+// ApplyStructuredWandaPruning go through, so the two never duplicate the
+// ranking/top-k/slicing logic below -- only the *importance vector feeding
+// into it* differs. `importance_norm` selects L1 vs. L2 weight-magnitude
+// ranking (see ImportanceNorm above) -- defaulted to kL2 so every
+// pre-existing call site is completely unaffected; applies identically
+// whether or not `act_norm` is given, mirroring pruning.py's own
+// `_plain_structured_importance`/`_wanda_structured_importance` split
+// exactly (the activation-norm multiplier always stays L2, only the
+// `||W_row||` term itself switches).
 void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
                  double sparsity, TouchedState& touched,
                  const std::unordered_map<std::string, std::vector<double>>*
                      act_norm = nullptr,
-                 double epsilon = 1e-8) {
+                 double epsilon = 1e-8,
+                 ImportanceNorm importance_norm = ImportanceNorm::kL2) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
@@ -4394,23 +4582,33 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
     for (const auto& w_nk : w_arrays_nk) {
       const int64_t k = static_cast<int64_t>(w_nk.size()) / n;
       for (int64_t c = 0; c < n; ++c) {
-        double sq = 0.0;
+        double acc = 0.0;
         for (int64_t j = 0; j < k; ++j) {
           const double v = w_nk[static_cast<size_t>(c * k + j)];
-          sq += v * v;
+          acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
         }
-        importance[static_cast<size_t>(c)] += sq;
+        importance[static_cast<size_t>(c)] += acc;
       }
     }
-    for (double& v : importance) {
-      v = std::sqrt(v);
+    // For L2 this is the root-sum-square combine across producers (Li et
+    // al.'s own criterion); for L1 the analogous combine is a plain sum with
+    // no square/sqrt anywhere -- mirrors pruning.py's own
+    // `_plain_structured_importance` exactly (see that function's own
+    // comment for the ``||concat(a, b)||`` identities behind each).
+    if (importance_norm != ImportanceNorm::kL1) {
+      for (double& v : importance) {
+        v = std::sqrt(v);
+      }
     }
 
-    // Wanda upgrade: multiply each channel's plain ||W_row||_2 by its own
-    // calibrated activation L2 norm -- mirrors pruning.py's own
-    // `_wanda_structured_importance` exactly, including the fallback to
-    // plain `importance` (left untouched) when no matching activation was
-    // observed for this chain's own probe point.
+    // Wanda upgrade: multiply each channel's plain weight-magnitude
+    // importance by its own calibrated activation L2 norm -- mirrors
+    // pruning.py's own `_wanda_structured_importance` exactly, including the
+    // fallback to plain `importance` (left untouched) when no matching
+    // activation was observed for this chain's own probe point. The
+    // activation-norm term itself always stays L2, per Wanda's own
+    // definition -- only `importance` above (the ``||W_row||`` term) ever
+    // switches with `importance_norm`.
     if (act_norm != nullptr) {
       auto it = act_norm->find(chain.consumer_node->input(0));
       if (it != act_norm->end() &&
@@ -4436,93 +4634,7 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
       keep = TopKIndicesAscending(importance, keep_count);
     }
 
-    for (const auto& p : chain.producers) {
-      SliceProducerWeight(init_map.at(p.weight), p.weight_transposed, keep,
-                          p.is_conv);
-      if (p.bias) {
-        SliceLastAxis(init_map.at(*p.bias), keep);
-      }
-    }
-    for (const auto& co : chain.chain_ops) {
-      if (co.const_name) {
-        SliceLastAxis(init_map.at(*co.const_name), keep);
-      }
-    }
-    for (const auto& hop : chain.conv_pass_through) {
-      SliceProducerWeight(init_map.at(hop.weight), false, keep, true);
-      if (hop.bias) {
-        SliceLastAxis(init_map.at(*hop.bias), keep);
-      }
-      if (hop.past_state) {
-        // A CausalConvWithState hop's own constant `past_state` -- rank-3
-        // `(batch, channels, k-1)`, channel axis 1 -- reuses
-        // SliceConsumerWeight's own `is_conv` branch (SliceAxis1 over
-        // dims(0)/dims(1) with `inner = prod(dims[2:])`), which slices
-        // exactly that axis; mirrors pruning.py's own _slice_axis1 call in
-        // _apply_conv_pass_through_hop.
-        SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
-      }
-      // A PRelu per-channel-slope hop reuses ConvPassThrough for its own
-      // slicing (see MatchPreluPassThrough's own comment) but, unlike a
-      // depthwise Conv hop, has no `group` attribute of its own to update --
-      // mirrors pruning.py's own _apply_conv_pass_through_hop, which only
-      // ever touches `group` when the hop node is actually a Conv.
-      if (hop.node->op_type() == "Conv") {
-        SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
-      }
-    }
-    if (chain.group_norm) {
-      // Same `keep` index set as the real producer -- `num_groups` itself is
-      // left untouched (see GroupNormPassThrough's own comment for why it
-      // stays valid without changing it). Sliced via SliceLastAxis, not
-      // ConvPassThrough's own axis-0 SliceProducerWeight -- see
-      // GroupNormPassThrough's own comment for why.
-      SliceLastAxis(init_map.at(chain.group_norm->scale), keep);
-      SliceLastAxis(init_map.at(chain.group_norm->bias), keep);
-    }
-    if (chain.consumer_is_conv && chain.consumer_group > 1) {
-      SliceGroupedConsumerConvWeight(init_map.at(chain.consumer_weight), keep,
-                                     chain.consumer_group, n);
-    } else {
-      SliceConsumerWeight(init_map.at(chain.consumer_weight),
-                          chain.consumer_weight_transposed, keep,
-                          chain.consumer_is_conv);
-    }
-    // Extra fan-out branches: each is either an ordinary (group == 1)
-    // consumer, or, for a Conv residual/merge chain, a general grouped Conv
-    // consumer whose own group was already confirmed (in
-    // FindConvResidualChains) to agree with `group` above --
-    // ResolveMatmulFanoutBranches never resolves a grouped one, so
-    // consumer_group stays at its default 1 there. Either way, fed by the
-    // exact same `keep` just computed for the group's shared producers
-    // above.
-    for (const auto* b : extra_ptrs) {
-      for (const auto& co : b->chain_ops) {
-        if (co.const_name) {
-          SliceLastAxis(init_map.at(*co.const_name), keep);
-        }
-      }
-      for (const auto& hop : b->conv_pass_through) {
-        SliceProducerWeight(init_map.at(hop.weight), false, keep, true);
-        if (hop.bias) {
-          SliceLastAxis(init_map.at(*hop.bias), keep);
-        }
-        if (hop.past_state) {
-          SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
-        }
-        if (hop.node->op_type() == "Conv") {
-          SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
-        }
-      }
-      if (b->consumer_is_conv && b->consumer_group > 1) {
-        SliceGroupedConsumerConvWeight(init_map.at(b->consumer_weight), keep,
-                                       b->consumer_group, n);
-      } else {
-        SliceConsumerWeight(init_map.at(b->consumer_weight),
-                            b->consumer_weight_transposed, keep,
-                            b->consumer_is_conv);
-      }
-    }
+    SliceChainChannels(init_map, chain, keep, stale_value_info);
 
     for (const auto& w : producer_weights) {
       producer_touched.insert(w);
@@ -4536,36 +4648,251 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
     for (const auto& w : conv_hop_weights) {
       conv_hop_touched.insert(w);
     }
+  }
+}
+
+// Global-sparsity companion to ApplyChains, used by
+// ApplyStructuredPruning/ApplyStructuredWandaPruning's own `global_sparsity`
+// mode. Mirrors pruning.py's own _apply_chains_global exactly, including its
+// own doc comment's full reasoning -- summarized here:
+//
+// The caller is required to have already filtered `chains` down to ones
+// with exactly one producer, no extra fan-out consumer branch, and
+// ChainGroup == 1 (ChainIsGlobalSparsityEligible above) -- this function
+// itself assumes that filtering already happened and doesn't re-check it.
+//
+// Two passes rather than ApplyChains' one: every admitted chain's own
+// channel importance must be known before any single chain's `keep` can be
+// decided, since global sparsity's whole point is one shared cutoff picked
+// from every admitted chain's pooled importance. Admission -- the same
+// tied-weight conflict/degenerate checks ApplyChains already performs, in
+// the same list order -- still happens greedily, chain by chain, in one
+// first pass, and an admitted chain's own weights are marked touched
+// immediately, *before* its own final `keep_count` is known (unlike
+// ApplyChains, where a chain whose `keep_count` rounds up to a no-op is
+// left completely unmarked) -- whether a chain's own `keep_count` will
+// round to a no-op can't be known until every admitted chain's importance
+// has been pooled and the one shared global cutoff is picked, so admission
+// can't be deferred that way without circularity.
+//
+// Each admitted chain keeps at least one channel -- the same floor
+// ApplyChains already enforces per chain -- pulled back out of the global
+// drop set after the fact whenever the global cutoff would otherwise reduce
+// a chain to zero channels (mirrors pruning.py's own per-chain floor
+// exactly, just resolved globally rather than locally).
+void ApplyChainsGlobal(
+    onnx::GraphProto* graph, std::vector<Chain>& chains, double sparsity,
+    TouchedState& touched,
+    const std::unordered_map<std::string, std::vector<double>>* act_norm =
+        nullptr,
+    double epsilon = 1e-8,
+    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
+  std::unordered_map<std::string, onnx::TensorProto*> init_map;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    init_map[t->name()] = t;
+  }
+  std::unordered_set<std::string>& producer_touched = touched.producer;
+  std::unordered_set<std::string>& consumer_touched = touched.consumer;
+  std::unordered_set<std::string>& const_touched = touched.const_names;
+  std::unordered_set<std::string>& conv_hop_touched = touched.conv_hop;
+  std::unordered_set<std::string>& stale_value_info = touched.stale_value_info;
+
+  struct Admitted {
+    Chain* chain;
+    std::vector<double> importance;
+  };
+  std::vector<Admitted> admitted;
+
+  for (auto& chain : chains) {
+    std::unordered_set<std::string> producer_weights;
+    bool degenerate = false;
     for (const auto& p : chain.producers) {
-      stale_value_info.insert(p.node->output(0));
-      for (const auto* pre_op : p.pre_ops) {
-        stale_value_info.insert(pre_op->output(0));
+      if (!producer_weights.insert(p.weight).second) {
+        degenerate = true;
+        break;
+      }
+    }
+    if (degenerate) {
+      continue;  // Degenerate -- shouldn't happen for a single-producer chain.
+    }
+
+    std::unordered_set<std::string> consumer_weights{chain.consumer_weight};
+
+    std::unordered_set<std::string> conv_hop_weights;
+    for (const auto& h : chain.conv_pass_through) {
+      conv_hop_weights.insert(h.weight);
+    }
+    if (conv_hop_weights.size() != chain.conv_pass_through.size()) {
+      continue;  // Degenerate -- the same depthwise weight named twice.
+    }
+
+    std::unordered_set<std::string> consts;
+    for (const auto& p : chain.producers) {
+      if (p.bias) {
+        consts.insert(*p.bias);
       }
     }
     for (const auto& co : chain.chain_ops) {
-      stale_value_info.insert(co.node->output(0));
-    }
-    // Every output, not just [0] -- a hop node can have more than one (e.g.
-    // `CausalConvWithState`'s own `present_state`); see ConvPassThrough's
-    // own docstring.
-    for (const auto& hop : chain.conv_pass_through) {
-      for (const auto& out : hop.node->output()) {
-        stale_value_info.insert(out);
+      if (co.const_name) {
+        consts.insert(*co.const_name);
       }
     }
     if (chain.group_norm) {
-      stale_value_info.insert(chain.group_norm->node->output(0));
+      consts.insert(chain.group_norm->scale);
+      consts.insert(chain.group_norm->bias);
     }
-    for (const auto* b : extra_ptrs) {
-      for (const auto& co : b->chain_ops) {
-        stale_value_info.insert(co.node->output(0));
+
+    bool conflict = false;
+    for (const auto& w : consumer_weights) {
+      if (consumer_touched.count(w)) {
+        conflict = true;
       }
-      for (const auto& hop : b->conv_pass_through) {
-        for (const auto& out : hop.node->output()) {
-          stale_value_info.insert(out);
+    }
+    for (const auto& w : producer_weights) {
+      if (producer_touched.count(w)) {
+        conflict = true;
+      }
+    }
+    for (const auto& c : consts) {
+      if (const_touched.count(c)) {
+        conflict = true;
+      }
+    }
+    for (const auto& w : conv_hop_weights) {
+      if (conv_hop_touched.count(w)) {
+        conflict = true;
+      }
+    }
+    if (conflict) {
+      continue;  // A shared/tied initializer another chain already resized.
+    }
+
+    const int64_t n = chain.n_channels;
+    std::vector<std::vector<float>> w_arrays_nk;
+    for (const auto& p : chain.producers) {
+      onnx::TensorProto* wt = init_map.at(p.weight);
+      std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
+      std::vector<float> data = ReadFloatTensor(*wt);
+      if (p.is_conv) {
+        w_arrays_nk.push_back(std::move(data));
+      } else if (p.weight_transposed) {
+        w_arrays_nk.push_back(std::move(data));
+      } else {
+        w_arrays_nk.push_back(TransposeFlat(data, dims[0], dims[1]));
+      }
+    }
+
+    std::vector<double> importance(static_cast<size_t>(n), 0.0);
+    for (const auto& w_nk : w_arrays_nk) {
+      const int64_t k = static_cast<int64_t>(w_nk.size()) / n;
+      for (int64_t c = 0; c < n; ++c) {
+        double acc = 0.0;
+        for (int64_t j = 0; j < k; ++j) {
+          const double v = w_nk[static_cast<size_t>(c * k + j)];
+          acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
+        }
+        importance[static_cast<size_t>(c)] += acc;
+      }
+    }
+    if (importance_norm != ImportanceNorm::kL1) {
+      for (double& v : importance) {
+        v = std::sqrt(v);
+      }
+    }
+    if (act_norm != nullptr) {
+      auto it = act_norm->find(chain.consumer_node->input(0));
+      if (it != act_norm->end() &&
+          it->second.size() == static_cast<size_t>(n)) {
+        for (int64_t c = 0; c < n; ++c) {
+          importance[static_cast<size_t>(c)] *=
+              std::max(it->second[static_cast<size_t>(c)], epsilon);
         }
       }
     }
+
+    admitted.push_back({&chain, std::move(importance)});
+    for (const auto& w : producer_weights) {
+      producer_touched.insert(w);
+    }
+    for (const auto& w : consumer_weights) {
+      consumer_touched.insert(w);
+    }
+    for (const auto& c : consts) {
+      const_touched.insert(c);
+    }
+    for (const auto& w : conv_hop_weights) {
+      conv_hop_touched.insert(w);
+    }
+  }
+
+  if (admitted.empty()) {
+    return;
+  }
+
+  int64_t total_n = 0;
+  for (const auto& a : admitted) {
+    total_n += a.chain->n_channels;
+  }
+  const int64_t keep_count_total = std::min(
+      std::max<int64_t>(
+          std::llround(static_cast<double>(total_n) * (1.0 - sparsity)),
+          int64_t{0}),
+      total_n);
+  const int64_t drop_count_total = total_n - keep_count_total;
+
+  std::vector<double> pooled;
+  pooled.reserve(static_cast<size_t>(total_n));
+  for (const auto& a : admitted) {
+    pooled.insert(pooled.end(), a.importance.begin(), a.importance.end());
+  }
+
+  // Ascending-importance order, stable (mirrors np.argsort(pooled,
+  // kind="stable")) -- the lowest `drop_count_total` entries are dropped.
+  std::vector<int64_t> order(static_cast<size_t>(total_n));
+  std::iota(order.begin(), order.end(), int64_t{0});
+  std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+    return pooled[static_cast<size_t>(a)] < pooled[static_cast<size_t>(b)];
+  });
+  std::vector<bool> drop_flat(static_cast<size_t>(total_n), false);
+  for (int64_t i = 0; i < drop_count_total; ++i) {
+    drop_flat[static_cast<size_t>(order[static_cast<size_t>(i)])] = true;
+  }
+
+  int64_t offset = 0;
+  for (auto& a : admitted) {
+    Chain& chain = *a.chain;
+    const int64_t n = chain.n_channels;
+    bool all_dropped = true;
+    for (int64_t i = 0; i < n; ++i) {
+      if (!drop_flat[static_cast<size_t>(offset + i)]) {
+        all_dropped = false;
+        break;
+      }
+    }
+    if (all_dropped) {
+      // Per-chain floor: never drop every channel of an admitted chain --
+      // keep its own single highest-importance channel instead.
+      int64_t best = 0;
+      for (int64_t i = 1; i < n; ++i) {
+        if (a.importance[static_cast<size_t>(i)] >
+            a.importance[static_cast<size_t>(best)]) {
+          best = i;
+        }
+      }
+      drop_flat[static_cast<size_t>(offset + best)] = false;
+    }
+    std::vector<int64_t> keep;
+    for (int64_t i = 0; i < n; ++i) {
+      if (!drop_flat[static_cast<size_t>(offset + i)]) {
+        keep.push_back(i);
+      }
+    }
+    offset += n;
+    if (static_cast<int64_t>(keep.size()) >= n) {
+      continue;  // Every channel survived -- no-op, nothing to slice.
+    }
+    SliceChainChannels(init_map, chain, keep, stale_value_info);
   }
 }
 
@@ -5104,7 +5431,8 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
     AttnChain& chain, double sparsity,
     const std::unordered_map<std::string, std::vector<double>>* act_norm =
         nullptr,
-    double epsilon = 1e-8) {
+    double epsilon = 1e-8,
+    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
   const int64_t h = chain.num_heads;
   const int64_t keep_count =
       std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
@@ -5118,25 +5446,31 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
   const int64_t total_n = w_init->dims(1);
   std::vector<float> w = ReadFloatTensor(*w_init);  // [K, total_n] row-major.
 
+  // Combined importance of each head's full Q+K+V weight block -- for L2
+  // that's the block's own Frobenius norm (sqrt of the sum of every entry
+  // squared); for L1 the sum of every entry's own absolute value instead,
+  // with no square/sqrt anywhere -- mirrors pruning.py's own
+  // `_plain_attention_head_importance` exactly.
   std::vector<double> importance(static_cast<size_t>(h), 0.0);
   for (int64_t hh = 0; hh < h; ++hh) {
-    double sq = 0.0;
+    double acc = 0.0;
     for (int64_t r = 0; r < K; ++r) {
       for (int64_t c = hh * dq; c < (hh + 1) * dq; ++c) {
         const double v = w[static_cast<size_t>(r * total_n + c)];
-        sq += v * v;
+        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
       }
       for (int64_t c = chain.nq + hh * dk; c < chain.nq + (hh + 1) * dk; ++c) {
         const double v = w[static_cast<size_t>(r * total_n + c)];
-        sq += v * v;
+        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
       }
       for (int64_t c = chain.nq + chain.nk + hh * dv;
            c < chain.nq + chain.nk + (hh + 1) * dv; ++c) {
         const double v = w[static_cast<size_t>(r * total_n + c)];
-        sq += v * v;
+        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
       }
     }
-    importance[static_cast<size_t>(hh)] = std::sqrt(sq);
+    importance[static_cast<size_t>(hh)] =
+        importance_norm == ImportanceNorm::kL1 ? acc : std::sqrt(acc);
   }
 
   // Wanda upgrade: multiply each head's plain ||W||_F by its own combined
@@ -5249,7 +5583,8 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
     AttnChain& chain, double sparsity,
     const std::unordered_map<std::string, std::vector<double>>* act_norm =
         nullptr,
-    double epsilon = 1e-8) {
+    double epsilon = 1e-8,
+    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
   const int64_t h = chain.kv_num_heads;
   const int64_t keep_count =
       std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
@@ -5290,26 +5625,34 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
                                  ? TransposeFlat(wv, wv_dims[0], wv_dims[1])
                                  : wv;
 
+  // Combined importance of each KV group's own Q+K+V weight block -- for L2
+  // that's the block's own Frobenius norm; for L1 the sum of every entry's
+  // own absolute value instead, with no square/sqrt anywhere -- mirrors
+  // pruning.py's own `_gqa_group_importance` exactly (see that function's
+  // own comment for why summing every entry, rather than concatenating, is
+  // used -- it stays well-defined even when Q's own row count differs from
+  // K/V's, the cross-attention shape this port also matches).
   std::vector<double> importance(static_cast<size_t>(chain.kv_num_heads), 0.0);
   for (int64_t kv = 0; kv < chain.kv_num_heads; ++kv) {
-    double sq = 0.0;
+    double acc = 0.0;
     for (int64_t r = 0; r < K; ++r) {
       for (int64_t g = kv * group_size; g < (kv + 1) * group_size; ++g) {
         for (int64_t c = g * d; c < (g + 1) * d; ++c) {
           const double v = wq_kn[static_cast<size_t>(r * Nq + c)];
-          sq += v * v;
+          acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
         }
       }
       for (int64_t c = kv * d; c < (kv + 1) * d; ++c) {
         const double v = wk_kn[static_cast<size_t>(r * Nk + c)];
-        sq += v * v;
+        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
       }
       for (int64_t c = kv * d; c < (kv + 1) * d; ++c) {
         const double v = wv_kn[static_cast<size_t>(r * Nv + c)];
-        sq += v * v;
+        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
       }
     }
-    importance[static_cast<size_t>(kv)] = std::sqrt(sq);
+    importance[static_cast<size_t>(kv)] =
+        importance_norm == ImportanceNorm::kL1 ? acc : std::sqrt(acc);
   }
 
   // Wanda upgrade: multiply each KV group's plain ||W||_F by its own
@@ -5398,7 +5741,8 @@ void ApplyAttentionChains(
     onnx::GraphProto* graph, std::vector<AttnChain>& chains, double sparsity,
     const std::unordered_map<std::string, std::vector<double>>* act_norm =
         nullptr,
-    double epsilon = 1e-8) {
+    double epsilon = 1e-8,
+    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
@@ -5426,9 +5770,10 @@ void ApplyAttentionChains(
 
     std::optional<AppliedAttn> applied =
         chain.kind == AttnChainKind::kGqaLike
-            ? ApplyOneGqaChain(init_map, chain, sparsity, act_norm, epsilon)
+            ? ApplyOneGqaChain(init_map, chain, sparsity, act_norm, epsilon,
+                               importance_norm)
             : ApplyOnePlainAttentionChain(init_map, chain, sparsity, act_norm,
-                                          epsilon);
+                                          epsilon, importance_norm);
     if (!applied) {
       continue;
     }
@@ -6196,7 +6541,8 @@ void ApplyConcatChains(
     TouchedState& touched,
     const std::unordered_map<std::string, std::vector<double>>* act_norm =
         nullptr,
-    double epsilon = 1e-8) {
+    double epsilon = 1e-8,
+    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
@@ -6299,16 +6645,18 @@ void ApplyConcatChains(
       for (const auto& w_nk : w_arrays_nk) {
         const int64_t k = static_cast<int64_t>(w_nk.size()) / n;
         for (int64_t c = 0; c < n; ++c) {
-          double sq = 0.0;
+          double acc = 0.0;
           for (int64_t j = 0; j < k; ++j) {
             const double v = w_nk[static_cast<size_t>(c * k + j)];
-            sq += v * v;
+            acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
           }
-          importance[static_cast<size_t>(c)] += sq;
+          importance[static_cast<size_t>(c)] += acc;
         }
       }
-      for (double& v : importance) {
-        v = std::sqrt(v);
+      if (importance_norm != ImportanceNorm::kL1) {
+        for (double& v : importance) {
+          v = std::sqrt(v);
+        }
       }
       // Wanda upgrade -- see ApplyChains' own identical comment. Keyed by
       // this branch's own probe point (`b.operand_name`) rather than a
@@ -6836,9 +7184,10 @@ std::vector<SplitGatedChain> FindSplitGatedChains(onnx::GraphProto* graph) {
 // to a *different* value is declined outright rather than corrupting the
 // first chain's own already-applied rewrite. Mirrors pruning.py's own
 // _apply_split_gated_chains.
-void ApplySplitGatedChains(onnx::GraphProto* graph,
-                           std::vector<SplitGatedChain>& chains,
-                           double sparsity, TouchedState& touched) {
+void ApplySplitGatedChains(
+    onnx::GraphProto* graph, std::vector<SplitGatedChain>& chains,
+    double sparsity, TouchedState& touched,
+    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
@@ -6884,16 +7233,26 @@ void ApplySplitGatedChains(onnx::GraphProto* graph,
       k = dims[0];
     }
 
+    // Combined (gate half + up half) importance -- for L2 that's
+    // sqrt(||gate_row||_2^2 + ||up_row||_2^2) (root-sum-square, Li et al.'s
+    // own criterion); for L1 the analogous combine is a plain sum of each
+    // half's own L1 norm, no square/sqrt anywhere -- mirrors pruning.py's
+    // own `_plain_branch_importance([gate_half, up_half], importance_norm)`
+    // exactly (see this function's own doc comment above).
     std::vector<double> importance(static_cast<size_t>(h), 0.0);
     for (int64_t c = 0; c < h; ++c) {
-      double sq_gate = 0.0, sq_up = 0.0;
+      double acc_gate = 0.0, acc_up = 0.0;
       for (int64_t j = 0; j < k; ++j) {
         const double vg = w_nk[static_cast<size_t>(c * k + j)];
-        sq_gate += vg * vg;
+        acc_gate +=
+            importance_norm == ImportanceNorm::kL1 ? std::abs(vg) : vg * vg;
         const double vu = w_nk[static_cast<size_t>((h + c) * k + j)];
-        sq_up += vu * vu;
+        acc_up +=
+            importance_norm == ImportanceNorm::kL1 ? std::abs(vu) : vu * vu;
       }
-      importance[static_cast<size_t>(c)] = std::sqrt(sq_gate + sq_up);
+      importance[static_cast<size_t>(c)] =
+          importance_norm == ImportanceNorm::kL1 ? acc_gate + acc_up
+                                                 : std::sqrt(acc_gate + acc_up);
     }
     const std::vector<int64_t> keep =
         TopKIndicesAscending(importance, keep_count);
@@ -17139,51 +17498,78 @@ std::vector<onnx::GraphProto*> IterSubgraphs(onnx::GraphProto* graph) {
 // its index in `kept_token_ids`) before running the pruned model -- a
 // dropped id can never be fed to the pruned model again.
 //
-// Two of pruning.py's own three producer shapes are matched here -- plain
-// `Gather` (MatchEmbeddingGatherRaw) and `com.microsoft::
-// EmbedLayerNormalization` (MatchEmbedLayerNormProducer, added alongside it
-// -- see that function's own doc comment for the schema/scope this mirrors
-// from pruning.py's `_match_embed_layer_norm_producer`). `lm_head`
-// auto-detection also now recognizes `com.microsoft::FusedGemm`/
-// `GemmFastGelu` in addition to a bare `MatMul`/vanilla `Gemm`
-// (MatchMatMulLikeWidenedRaw, this section's own local mirror of
-// pruning.py's module-scoped `_match_matmul_like` override -- kept local to
-// this section, not merged into the shared MatchMatMulLikeRaw, for the
-// identical reason pruning.py's own override is kept local to
-// `onnxsim.pruning` rather than made to the shared `smoothquant.py` copy:
-// widening the shared matcher would silently change every OTHER pass in
-// this file that calls it too). The embedding table, `lm_head` weight, and
-// `lm_head` bias are now all admitted as FLOAT, FLOAT16, OR BFLOAT16
-// (IsSupportedFloatDtype, ReadFloatTensorAnyDtype/
+// All THREE of pruning.py's own producer shapes are matched here -- plain
+// `Gather` (MatchEmbeddingGatherRaw), `com.microsoft::
+// EmbedLayerNormalization` (MatchEmbedLayerNormProducer -- see that
+// function's own doc comment for the schema/scope this mirrors from
+// pruning.py's `_match_embed_layer_norm_producer`), and `com.microsoft::
+// GatherBlockQuantized` (MatchGatherBlockQuantizedProducer -- the
+// block-quantized, int2/int4/int8 analogue of a plain-float embedding
+// `Gather`; see that function's own doc comment, and pruning.py's own
+// section-top comment directly above `_match_gather_block_quantized_
+// producer`, for the full empirical schema/packing/real-exporter-evidence
+// this depends on). `lm_head` auto-detection also recognizes
+// `com.microsoft::FusedGemm`/`GemmFastGelu` in addition to a bare `MatMul`/
+// vanilla `Gemm` (MatchMatMulLikeWidenedRaw, this section's own local
+// mirror of pruning.py's module-scoped `_match_matmul_like` override --
+// kept local to this section, not merged into the shared
+// MatchMatMulLikeRaw, for the identical reason pruning.py's own override is
+// kept local to `onnxsim.pruning` rather than made to the shared
+// `smoothquant.py` copy: widening the shared matcher would silently change
+// every OTHER pass in this file that calls it too). The embedding table,
+// `lm_head` weight, and `lm_head` bias are all admitted as FLOAT, FLOAT16,
+// OR BFLOAT16 (IsSupportedFloatDtype, ReadFloatTensorAnyDtype/
 // SetFloatTensorDataPreservingDtype -- this section's own local upcast-to-
 // float32/downcast-to-original-dtype helpers, mirroring pruning.py's own
 // `_to_f64`/`_from_f64` convention; this file's shared ReadFloatTensor/
 // SetFloatTensorData stay FLOAT32-only and untouched, used elsewhere in
 // this file exactly as before).
 //
-// Deliberately still NARROWER than pruning.py's own three-producer-shape
-// port in exactly one remaining respect:
+// `GatherBlockQuantized`'s own `data`/`zero_points` operands use one of TWO
+// genuinely different sub-8-bit packing conventions, dispatched purely off
+// the operand's own dtype (never off the node's `bits` attribute) --
+// ReadPackedBytesAnyStorage/Unpack4BitFlat/Pack4BitFlat/
+// GatherBlockQuantizedTensorAsDouble/SliceGatherBlockQuantizedRows's own
+// top comment has the full empirical detail, independently re-confirmed
+// (not merely read off pruning.py's own comment) against a live
+// `onnx.numpy_helper`/`InferenceSession` round trip before this port was
+// written: ONNX-native sub-byte `tensor(uint4)`/`tensor(int4)` (a flat,
+// whole-tensor, 2-values-per-byte pack that can cross a row boundary) needs
+// a genuine unpack/row-select/repack; plain `tensor(uint8)` (regardless of
+// `bits` -- 2, 4, or 8) needs none at all -- each row's own declared
+// `dims(1)` bytes are already the atomic per-row storage unit, packed (when
+// `bits < 8`) independently per row, never across a row boundary. Both
+// conventions' default `zero_points` (0 for UINT4/INT4, `2**(bits-1)` for
+// UINT8, when the optional input is absent) and the dequantization-for-
+// ranking-only helper (GatherBlockQuantizedDequantized, used only by
+// EmbeddingVocabImportance for `ApplyEmbeddingVocabMagnitudePruning`'s own
+// ranking -- the actual slicing above never dequantizes-then-requantizes,
+// mirroring this file's own "slice the packed codes directly" invariant
+// used throughout its other quantized-pruning ports, e.g. MatMulNBits/QMoE)
+// are ported mirroring pruning.py's own `_gather_block_quantized_
+// dequantized` bit-for-bit -- INCLUDING that function's own pre-existing
+// dtype-dispatched (non-)unpacking asymmetry for the plain-UINT8 convention
+// (see GatherBlockQuantizedTensorAsDouble's own top comment): for that one
+// dtype+`bits<8` combination, the ranking formula operates over the PACKED
+// byte grid, not the true (pre-padding) post-unpack hidden positions -- a
+// property of the pure-Python reference this section mirrors exactly, not
+// a new gap this port introduces. A tied `lm_head` sharing the packed
+// `data` tensor itself is always declined for this shape specifically (see
+// MatchGatherBlockQuantizedProducer's own doc comment for why); an untied
+// `lm_head` is still auto-detected exactly as for the other two shapes.
 //
-//   * `com.microsoft::GatherBlockQuantized` (the int2/int4/int8
-//     block-quantized analogue of a plain-float embedding `Gather`) is
-//     simply never matched -- declined, not mis-handled -- by this port.
-//     Unlike the two gaps closed above, this one is deliberately left
-//     open: pruning.py's own section comment documents two genuinely
-//     different packing conventions (ONNX-native sub-byte `tensor(uint4)`/
-//     `tensor(int4)` vs. manually-packed `tensor(uint8)`, each with its own
-//     default-`zero_points` formula), a `scales`/`zero_points` pair that
-//     must be sliced in lockstep with `data`, and a dequantization-for-
-//     ranking-only helper -- real, verified-correct scope, but large enough
-//     that porting it hastily risks a subtle packing/slicing bug for a
-//     currently-narrow real-exporter surface (see that comment's own "Real
-//     exporter evidence" paragraph). Left as a clearly separate,
-//     independent follow-up rather than attempted here. Because this is a
-//     genuine remaining producer-shape gap (not just a narrower dtype/
-//     lm_head-node-type restriction), `apply_embedding_vocab_pruning`/
-//     `apply_embedding_vocab_magnitude_pruning` in pruning.py are NOT
-//     aliased to these C++ ports -- see this round's own summary for why
-//     "two of three producer shapes" does not clear this module's own
-//     "verified TRUE full parity, or don't alias" bar.
+// Verified TRUE full parity across both packing conventions before
+// `apply_embedding_vocab_pruning`/`apply_embedding_vocab_magnitude_pruning`
+// in pruning.py were aliased to these C++ ports (see pruning.py's own
+// doc comments on those two functions): native UINT4/INT4 and manually-
+// packed UINT8 (`bits` in {2, 4, 8}), each with and without an explicit
+// `zero_points`, an intentionally-adversarial odd hidden size (crossing a
+// nibble's own byte boundary for the native convention, forcing a padding
+// element for the packed-uint8 convention), FLOAT/FLOAT16/BFLOAT16 scales,
+// combined with an auto-detected untied `lm_head`, and cross-checked both
+// against a real `InferenceSession` run and against the (then still live)
+// pure-Python reference -- see tests/test_embedding_vocab_pruning_cpp.py's
+// own `GatherBlockQuantized` section for the frozen coverage.
 //
 // Every other structural safety check pruning.py's own `_match_embedding_
 // gather`/`_match_tied_lm_head`/`_match_untied_lm_head`/`_match_lm_head_
@@ -17197,11 +17583,12 @@ std::vector<onnx::GraphProto*> IterSubgraphs(onnx::GraphProto* graph) {
 // than one such candidate ambiguous, not evidence; a bias is only ever
 // recognized as a `Gemm`'s own built-in `C` input or a `MatMul`-then-
 // `Add(bias)` tail, anything else declining that whole `lm_head` match.
-// When more than one qualifying `Gather` exists and the caller hasn't
-// named `input_name`, the whole call declines.
+// When more than one qualifying producer -- any of the three shapes,
+// counted together -- exists and the caller hasn't named `input_name`, the
+// whole call declines.
 //
 // Subgraph-aware (IterSubgraphs, just above) exactly like every other pass
-// in this file: the one eligible `Gather` this pass requires may live
+// in this file: the one eligible producer this pass requires may live
 // inside a nested If/Loop/Scan/BeamSearch-family subgraph, at any nesting
 // depth, not only the top-level graph -- MatchEmbeddingChainAnyGraph
 // applies the identical "exactly one eligible producer, or decline" rule
@@ -17231,6 +17618,26 @@ struct EmbeddingLmHeadMatch {
   onnx::NodeProto* via_transpose = nullptr;
 };
 
+// Extra operands/attributes present only when EmbeddingChain::quantized is
+// set -- the embedding-table producer was matched as a `com.microsoft::
+// GatherBlockQuantized` node (MatchGatherBlockQuantizedProducer, below).
+// Mirrors pruning.py's own `_GatherBlockQuantizedInfo` exactly.
+// `EmbeddingChain::weight_name` continues to mean the node's own `data`
+// input (the packed/quantized embedding table itself) for this shape too --
+// only `scales_name`/`zero_points_name` are new. `gather_axis` is always 0
+// (the only value MatchGatherBlockQuantizedProducer ever admits -- see its
+// own doc comment), kept here rather than hard-coded at every call site so
+// ApplyEmbeddingVocabPrune/GatherBlockQuantizedDequantized read it off the
+// match itself, the same way every other field on this chain is read off
+// the match rather than re-derived.
+struct GatherBlockQuantizedInfo {
+  std::string scales_name;
+  std::optional<std::string> zero_points_name;
+  int64_t bits = 4;
+  int64_t block_size = 128;
+  int64_t gather_axis = 0;
+};
+
 struct EmbeddingChain {
   onnx::NodeProto* producer = nullptr;  // the matched Gather node
   std::string weight_name;              // the embedding table's own name
@@ -17238,6 +17645,10 @@ struct EmbeddingChain {
   int64_t vocab_size = 0;
   int64_t hidden_size = 0;
   std::optional<EmbeddingLmHeadMatch> lm_head;
+  // Non-nullopt only when `producer` is a `com.microsoft::
+  // GatherBlockQuantized` node -- nullopt for the two plain-float producer
+  // shapes (a plain `Gather` or `EmbedLayerNormalization`).
+  std::optional<GatherBlockQuantizedInfo> quantized;
 };
 
 // True for FLOAT, FLOAT16, and BFLOAT16 -- every element dtype this
@@ -17453,6 +17864,357 @@ void SetFloatTensorDataPreservingDtype(onnx::TensorProto* t,
                                       raw.size(), sizeof(uint16_t));
   }
   t->set_raw_data(std::move(raw));
+}
+
+// --- GatherBlockQuantized packed-byte helpers ---------------------------
+//
+// `com.microsoft::GatherBlockQuantized`'s own `data`/`zero_points` operands
+// use one of TWO genuinely different sub-8-bit packing conventions,
+// dispatched purely off the tensor's own declared dtype -- never off
+// `bits` -- exactly mirroring pruning.py's own top-of-section comment
+// (directly above `_match_gather_block_quantized_producer` there) and its
+// own `_slice_axis`/`onnx.numpy_helper.to_array`/`from_array` round trip:
+//
+//   * dtype UINT4/INT4 (ONNX's own native sub-byte tensor types): packed
+//     PER `onnx.numpy_helper`'s own `_pack_4bitx2`/`_unpack_4bit` -- a FLAT,
+//     WHOLE-TENSOR, row-major pack, 2 values per byte (byte `i` holds
+//     element `2i` in its low nibble, element `2i+1` in its high nibble),
+//     which can cross a row boundary when the trailing dimension count is
+//     odd. `TensorProto.dims` stores the LOGICAL (unpacked) shape for this
+//     dtype -- confirmed directly against a live `onnx.numpy_helper.
+//     from_array`/`to_array` round trip (this file's own scratch
+//     verification, not assumed): a `(5, 17)` logical shape's own
+//     `raw_data` is `ceil(5*17/2) = 43` bytes, and `to_array` returns it
+//     unpacked back to `(5, 17)`.
+//   * dtype plain UINT8 (regardless of `bits` -- 2, 4, OR 8): ONNX's own
+//     tensor-type system has no notion of this op's own per-row nibble/
+//     2-bit packing at all (that convention is invented by this op alone,
+//     never reflected in `TensorProto`'s own dtype), so `onnx.numpy_helper.
+//     to_array` does NOT unpack a plain UINT8 tensor -- it returns the raw
+//     per-element BYTE values verbatim, shape == `dims` exactly (confirmed
+//     directly: a `(2, 2)`-dims UINT8 tensor round-trips through
+//     `to_array` as the literal packed byte values, untouched). This
+//     matters for pruning.py's own ranking-only dequant helper (mirrored by
+//     GatherBlockQuantizedDequantized, below) -- for a genuinely packed
+//     (bits < 8) UINT8 tensor, that dequant formula is computed over the
+//     PACKED byte grid, not the true post-unpack hidden positions (this is
+//     a pre-existing property of the pure-Python reference this section
+//     mirrors bit-for-bit, not a new gap introduced by this port -- see
+//     that function's own doc comment for why this still self-consistently
+//     produces *some* per-row ranking signal, just not a numerically "real"
+//     dequantized value, for that one dtype+bits combination). It does NOT
+//     matter for actual SLICING correctness at all: this section's own top
+//     comment (pruning.py's `_match_gather_block_quantized_producer`
+//     comment) confirms the manually-packed convention's own packing is
+//     independent PER ROW (never crosses a row boundary), so each row's own
+//     `dims[1]` bytes are already the atomic per-row storage unit under
+//     this convention, regardless of what "true" (pre-padding) hidden
+//     width they represent -- a plain contiguous byte-per-row copy is
+//     always exactly right for GATHER-AXIS (row) slicing.
+//
+// Because `gather_axis` (the only axis this pass ever slices) is never
+// `quantize_axis` (the only axis either packing convention ever packs
+// along -- enforced by MatchGatherBlockQuantizedProducer's own degenerate-
+// case decline), neither convention's own row-slicing below ever needs to
+// touch a packed axis boundary.
+
+// Reads a tensor's raw byte payload as a flat `vector<uint8_t>` of exactly
+// `n_bytes` bytes, handling both `raw_data` and (ONNX's own wire convention
+// for sub-32-bit dtypes) zero-extended per-BYTE `int32_data` storage --
+// mirrors ReadFloatTensorAnyDtype's own already-established convention,
+// just at 1-byte-per-storage-unit granularity (a full byte for UINT8, one
+// PACKED byte -- not one logical sub-4-bit element -- for UINT4/INT4, per
+// `onnx.numpy_helper`'s own `int32_data` fallback path for those dtypes).
+// No endian-swap is ever needed here (unlike ReadFloatTensorAnyDtype's own
+// 2-byte-wide FLOAT16/BFLOAT16 codes): a single byte has no byte order.
+std::vector<uint8_t> ReadPackedBytesAnyStorage(const onnx::TensorProto& t,
+                                               size_t n_bytes) {
+  std::vector<uint8_t> bytes(n_bytes);
+  if (t.has_raw_data()) {
+    std::memcpy(bytes.data(), t.raw_data().data(), n_bytes);
+  } else {
+    for (size_t i = 0; i < n_bytes; ++i) {
+      bytes[i] = static_cast<uint8_t>(t.int32_data(static_cast<int>(i)));
+    }
+  }
+  return bytes;
+}
+
+// Unpacks ONNX's own native flat, whole-tensor, 2-values-per-byte sub-4-bit
+// packing (`onnx.numpy_helper`'s own `_unpack_4bit` convention -- see this
+// subsection's own top comment) into one 4-bit CODE per element (its raw
+// bit pattern, 0-15, never sign-extended -- this pass only ever relocates a
+// code via a row-select-then-repack, never interprets its numeric value,
+// so treating a UINT4 and INT4 code identically here is always safe).
+// `numel` is the tensor's own total logical element count (`dims`
+// product); a single trailing PADDING nibble (present only when `numel` is
+// odd) is simply never read.
+std::vector<uint8_t> Unpack4BitFlat(const uint8_t* raw, int64_t numel) {
+  std::vector<uint8_t> out(static_cast<size_t>(numel));
+  for (int64_t i = 0; i < numel; ++i) {
+    const uint8_t byte = raw[static_cast<size_t>(i / 2)];
+    out[static_cast<size_t>(i)] =
+        (i % 2 == 0) ? (byte & 0x0Fu) : ((byte >> 4) & 0x0Fu);
+  }
+  return out;
+}
+
+// Inverse of Unpack4BitFlat: packs `codes` (one 4-bit code per element,
+// only its own low nibble read) back into ONNX's own flat 2-per-byte
+// convention -- `codes[2i]` in byte `i`'s low nibble, `codes[2i+1]` in its
+// high nibble, with a final zero-filled high nibble when `codes.size()` is
+// odd (matching `_pack_4bitx2`'s own zero-padding).
+std::string Pack4BitFlat(const std::vector<uint8_t>& codes) {
+  const size_t n = codes.size();
+  std::string out((n + 1) / 2, '\0');
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t nibble = codes[i] & 0x0Fu;
+    uint8_t byte_val = static_cast<uint8_t>(out[i / 2]);
+    if (i % 2 == 0) {
+      byte_val = static_cast<uint8_t>((byte_val & 0xF0u) | nibble);
+    } else {
+      byte_val = static_cast<uint8_t>((byte_val & 0x0Fu) |
+                                      static_cast<uint8_t>(nibble << 4));
+    }
+    out[i / 2] = static_cast<char>(byte_val);
+  }
+  return out;
+}
+
+// Row-slices (axis 0, the vocab/`gather_axis`) `t` -- `data`, or (when
+// present and dtype-matching `data`) `zero_points` -- IN PLACE, byte-exact,
+// regardless of GatherBlockQuantized's own two distinct packing conventions
+// (this subsection's own top comment), dispatched purely off `t`'s own
+// dtype, mirroring pruning.py's own `_slice_axis` exactly: UINT4/INT4 needs
+// a genuine flat unpack/row-select/repack (Unpack4BitFlat/Pack4BitFlat);
+// plain UINT8 needs no unpack/repack at all -- each row's own `dims(1)`
+// bytes are already the atomic per-row storage unit under that convention,
+// so a row is a plain contiguous byte copy.
+void SliceGatherBlockQuantizedRows(onnx::TensorProto* t,
+                                   const std::vector<int64_t>& keep) {
+  const int64_t d0 = t->dims(0);
+  const int64_t d1 = t->dims(1);
+  const int64_t kc = static_cast<int64_t>(keep.size());
+  const int32_t dtype = t->data_type();
+  const std::string name = t->name();
+
+  std::string new_raw;
+  if (dtype == onnx::TensorProto::UINT8) {
+    const size_t row_bytes = static_cast<size_t>(d1);
+    const std::vector<uint8_t> bytes =
+        ReadPackedBytesAnyStorage(*t, static_cast<size_t>(d0) * row_bytes);
+    new_raw.resize(static_cast<size_t>(kc) * row_bytes);
+    for (int64_t i = 0; i < kc; ++i) {
+      const size_t src =
+          static_cast<size_t>(keep[static_cast<size_t>(i)]) * row_bytes;
+      std::memcpy(&new_raw[static_cast<size_t>(i) * row_bytes], &bytes[src],
+                  row_bytes);
+    }
+  } else {
+    // UINT4 / INT4: ONNX-native flat whole-tensor packing.
+    const int64_t numel = d0 * d1;
+    const size_t n_bytes = static_cast<size_t>((numel + 1) / 2);
+    const std::vector<uint8_t> raw = ReadPackedBytesAnyStorage(*t, n_bytes);
+    const std::vector<uint8_t> codes = Unpack4BitFlat(raw.data(), numel);
+    std::vector<uint8_t> new_codes(static_cast<size_t>(kc) *
+                                   static_cast<size_t>(d1));
+    for (int64_t i = 0; i < kc; ++i) {
+      const int64_t src_row = keep[static_cast<size_t>(i)];
+      std::memcpy(
+          &new_codes[static_cast<size_t>(i) * static_cast<size_t>(d1)],
+          &codes[static_cast<size_t>(src_row) * static_cast<size_t>(d1)],
+          static_cast<size_t>(d1));
+    }
+    new_raw = Pack4BitFlat(new_codes);
+  }
+
+  t->Clear();
+  t->set_name(name);
+  t->set_data_type(static_cast<onnx::TensorProto_DataType>(dtype));
+  t->add_dims(kc);
+  t->add_dims(d1);
+  t->set_raw_data(std::move(new_raw));
+}
+
+// Reads `data`'s (or `zero_points`'s) own logical `(dims(0), dims(1))`
+// values as `double`, mirroring `onnx.numpy_helper.to_array(...).astype(
+// np.float64)`'s own per-dtype behavior EXACTLY -- including its own
+// dtype-dispatched (non-)unpacking asymmetry (this subsection's own top
+// comment): UINT4 unpacks to unsigned codes 0-15; INT4 unpacks to SIGNED
+// 4-bit codes (twos-complement: raw codes 8-15 represent -8..-1); plain
+// UINT8 is read as-is, NO unpacking, regardless of `bits` -- the packed
+// byte value itself, 0-255, is what `to_array` (and therefore this
+// function) returns.
+std::vector<double> GatherBlockQuantizedTensorAsDouble(
+    const onnx::TensorProto& t) {
+  const int64_t d0 = t.dims(0);
+  const int64_t d1 = t.dims(1);
+  const int64_t numel = d0 * d1;
+  const int32_t dtype = t.data_type();
+  std::vector<double> out(static_cast<size_t>(numel));
+  if (dtype == onnx::TensorProto::UINT8) {
+    const std::vector<uint8_t> bytes =
+        ReadPackedBytesAnyStorage(t, static_cast<size_t>(numel));
+    for (int64_t i = 0; i < numel; ++i) {
+      out[static_cast<size_t>(i)] =
+          static_cast<double>(bytes[static_cast<size_t>(i)]);
+    }
+  } else {
+    const size_t n_bytes = static_cast<size_t>((numel + 1) / 2);
+    const std::vector<uint8_t> raw = ReadPackedBytesAnyStorage(t, n_bytes);
+    const std::vector<uint8_t> codes = Unpack4BitFlat(raw.data(), numel);
+    const bool is_signed = dtype == onnx::TensorProto::INT4;
+    for (int64_t i = 0; i < numel; ++i) {
+      const uint8_t c = codes[static_cast<size_t>(i)];
+      out[static_cast<size_t>(i)] =
+          (is_signed && c >= 8) ? static_cast<double>(static_cast<int>(c) - 16)
+                                : static_cast<double>(c);
+    }
+  }
+  return out;
+}
+
+// True for UINT4, INT4, and plain UINT8 -- every element dtype
+// MatchGatherBlockQuantizedProducer accepts for `data`/`zero_points`.
+// Mirrors pruning.py's own `_GATHER_BLOCK_QUANTIZED_DATA_TYPES` set
+// exactly.
+bool IsGatherBlockQuantizedDataDtype(int32_t data_type) {
+  return data_type == onnx::TensorProto::UINT4 ||
+         data_type == onnx::TensorProto::INT4 ||
+         data_type == onnx::TensorProto::UINT8;
+}
+
+// `com.microsoft::GatherBlockQuantized` -- a third producer shape, the
+// block-quantized (int2/int4/int8) analogue of a plain-float embedding
+// `Gather`, matched alongside MatchEmbeddingGatherRaw/
+// MatchEmbedLayerNormProducer by MatchEmbeddingChain's own dispatch loop.
+// Mirrors pruning.py's own `_match_gather_block_quantized_producer`
+// exactly -- see that function's own section-top comment (directly above
+// it in pruning.py) for the full empirical schema/packing/real-exporter-
+// evidence this depends on. None of the packing-convention/default-
+// `zero_points` subtlety matters for MATCHING itself (only for the actual
+// slicing/dequant-for-ranking helpers elsewhere in this section) -- this
+// function only checks shape/dtype/consumer-count structure, exactly
+// mirroring the Python matcher's own scope.
+//
+// Matching bar: `node` must be `com.microsoft::GatherBlockQuantized` with 3
+// or 4 inputs (`zero_points` optional); `bits` in {2, 4, 8}; `gather_axis`
+// (default 0) and `quantize_axis` (default 1), each normalized for a
+// negative value, must resolve to exactly 0 and 1 respectively -- for the
+// rank-2 `data` this matcher requires, this alone already makes the
+// degenerate `gather_axis == quantize_axis` case structurally impossible,
+// so no separate check is needed; `data` a constant rank-2 initializer of
+// dtype UINT4/INT4/UINT8; `indices` a declared graph input, or one bounded
+// `Cast` hop from one (identical rule to the other two producer shapes);
+// `scales` a constant, rank-2, IsSupportedFloatDtype initializer whose own
+// axis-0 size matches `data`'s; `zero_points`, when present, a constant,
+// rank-2, SAME-dtype-as-`data` initializer whose own axis-0 size also
+// matches `data`'s (the schema's own "data and zero_points have the same
+// type"); `data` itself must have exactly one consumer (this node) -- a
+// tied `lm_head` sharing the packed `data` tensor is always declined for
+// this shape (see pruning.py's own docstring for why: composing two
+// different ops' quantization conventions across a tied boundary is out of
+// scope).
+std::optional<
+    std::tuple<std::string, std::string, std::string, GatherBlockQuantizedInfo>>
+MatchGatherBlockQuantizedProducer(
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_input_names,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  if (node.op_type() != "GatherBlockQuantized" ||
+      node.domain() != kComMicrosoftDomain) {
+    return std::nullopt;
+  }
+  if (node.input_size() != 3 && node.input_size() != 4) {
+    return std::nullopt;
+  }
+
+  int64_t bits = 4, block_size = 128, quantize_axis = 1, gather_axis = 0;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "bits") {
+      bits = attr.i();
+    } else if (attr.name() == "block_size") {
+      block_size = attr.i();
+    } else if (attr.name() == "quantize_axis") {
+      quantize_axis = attr.i();
+    } else if (attr.name() == "gather_axis") {
+      gather_axis = attr.i();
+    }
+  }
+  if (bits != 2 && bits != 4 && bits != 8) {
+    return std::nullopt;
+  }
+
+  const std::string& data_name = node.input(0);
+  const std::string& indices_name = node.input(1);
+  const std::string& scales_name = node.input(2);
+  std::optional<std::string> zero_points_name;
+  if (node.input_size() == 4 && !node.input(3).empty()) {
+    zero_points_name = node.input(3);
+  }
+
+  auto dit = init_map.find(data_name);
+  if (dit == init_map.end() ||
+      !IsGatherBlockQuantizedDataDtype(dit->second->data_type()) ||
+      dit->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+  const int64_t rank = dit->second->dims_size();
+  if (gather_axis < 0) {
+    gather_axis += rank;
+  }
+  if (quantize_axis < 0) {
+    quantize_axis += rank;
+  }
+  if (gather_axis != 0 || quantize_axis != 1) {
+    return std::nullopt;  // only the plain (vocab_size, hidden_size) layout
+  }
+
+  auto sit = init_map.find(scales_name);
+  if (sit == init_map.end() ||
+      !IsSupportedFloatDtype(sit->second->data_type()) ||
+      sit->second->dims_size() != 2 ||
+      sit->second->dims(gather_axis) != dit->second->dims(gather_axis)) {
+    return std::nullopt;
+  }
+
+  if (zero_points_name) {
+    auto zit = init_map.find(*zero_points_name);
+    if (zit == init_map.end() ||
+        zit->second->data_type() != dit->second->data_type() ||
+        zit->second->dims_size() != 2 ||
+        zit->second->dims(gather_axis) != dit->second->dims(gather_axis)) {
+      return std::nullopt;
+    }
+  }
+
+  std::string underlying = indices_name;
+  if (!graph_input_names.count(underlying)) {
+    auto cit = node_by_output.find(underlying);
+    if (cit != node_by_output.end() && cit->second->op_type() == "Cast" &&
+        cit->second->input_size() == 1 &&
+        graph_input_names.count(cit->second->input(0))) {
+      underlying = cit->second->input(0);
+    } else {
+      return std::nullopt;  // not a graph input, nor a Cast of one
+    }
+  }
+
+  auto cit2 = consumers_of.find(data_name);
+  const size_t n_data_consumers =
+      cit2 == consumers_of.end() ? 0 : cit2->second.size();
+  if (n_data_consumers != 1) {
+    return std::nullopt;  // any other/extra consumer -- always declined
+  }
+
+  GatherBlockQuantizedInfo info;
+  info.scales_name = scales_name;
+  info.zero_points_name = zero_points_name;
+  info.bits = bits;
+  info.block_size = block_size;
+  info.gather_axis = gather_axis;
+  return std::make_tuple(data_name, indices_name, underlying, info);
 }
 
 // This section's own local mirror of pruning.py's module-scoped
@@ -17910,17 +18672,29 @@ std::optional<EmbeddingChain> MatchEmbeddingChain(
     onnx::NodeProto* node;
     std::string w_name;
     std::string indices_name;
+    std::optional<GatherBlockQuantizedInfo> quantized;
   };
   std::vector<RawMatch> matches;
   for (int i = 0; i < graph->node_size(); ++i) {
     onnx::NodeProto* node = graph->mutable_node(i);
-    // Try both producer shapes -- a node is at most one of them (disjoint
-    // op_type/domain checks), so there is never a double-count here.
+    // Try all three producer shapes -- a node is at most one of them
+    // (disjoint op_type/domain checks), so there is never a double-count
+    // here.
     auto m = MatchEmbeddingGatherRaw(*node, init_map, consumers_of,
                                      graph_input_names, node_by_output);
     if (!m) {
       m = MatchEmbedLayerNormProducer(*node, init_map, consumers_of,
                                       graph_input_names, node_by_output);
+    }
+    std::optional<GatherBlockQuantizedInfo> quantized;
+    if (!m) {
+      auto m_q = MatchGatherBlockQuantizedProducer(
+          *node, init_map, consumers_of, graph_input_names, node_by_output);
+      if (m_q) {
+        m = std::make_tuple(std::get<0>(*m_q), std::get<1>(*m_q),
+                            std::get<2>(*m_q));
+        quantized = std::get<3>(*m_q);
+      }
     }
     if (!m) {
       continue;
@@ -17932,7 +18706,7 @@ std::optional<EmbeddingChain> MatchEmbeddingChain(
         *input_name != underlying) {
       continue;
     }
-    matches.push_back({node, w_name, indices_name});
+    matches.push_back({node, w_name, indices_name, quantized});
   }
 
   if (input_name && matches.empty()) {
@@ -17951,14 +18725,30 @@ std::optional<EmbeddingChain> MatchEmbeddingChain(
 
   onnx::NodeProto* producer_node = matches[0].node;
   const std::string& w_name = matches[0].w_name;
+  const std::optional<GatherBlockQuantizedInfo>& quantized =
+      matches[0].quantized;
   const onnx::TensorProto* w_init = init_map.at(w_name);
-  const int64_t vocab_size = w_init->dims(0);
-  const int64_t hidden_size = w_init->dims(1);
+  int64_t vocab_size, hidden_size;
+  if (quantized) {
+    vocab_size = w_init->dims(quantized->gather_axis);
+    hidden_size = w_init->dims(1 - quantized->gather_axis);
+  } else {
+    vocab_size = w_init->dims(0);
+    hidden_size = w_init->dims(1);
+  }
 
   auto cit = consumers_of.find(w_name);
   const size_t n_consumers = cit == consumers_of.end() ? 0 : cit->second.size();
   std::optional<EmbeddingLmHeadMatch> lm_head;
-  if (n_consumers == 2) {
+  if (quantized) {
+    // A tied lm_head sharing the packed/quantized `data` tensor is always
+    // declined -- MatchGatherBlockQuantizedProducer's own single-consumer
+    // requirement already guarantees `n_consumers == 1` here, so only the
+    // untied auto-detection path is ever attempted. Mirrors pruning.py's
+    // own `_match_embedding_chain` exactly.
+    lm_head = MatchUntiedLmHead(graph, w_name, vocab_size, consumers_of,
+                                init_map, graph_outputs);
+  } else if (n_consumers == 2) {
     lm_head = MatchTiedLmHead(w_name, vocab_size, producer_node, consumers_of,
                               init_map);
     if (!lm_head) {
@@ -17977,6 +18767,7 @@ std::optional<EmbeddingChain> MatchEmbeddingChain(
   chain.vocab_size = vocab_size;
   chain.hidden_size = hidden_size;
   chain.lm_head = lm_head;
+  chain.quantized = quantized;
   return chain;
 }
 
@@ -18116,9 +18907,28 @@ void ApplyEmbeddingVocabPrune(onnx::GraphProto* graph,
 
   // The embedding table is [vocab_size, hidden_size] with vocab_size as
   // axis 0 -- exactly SliceEmbeddingWeightAnyDtype's own
-  // `weight_transposed=true` ("output channel is axis 0") branch.
-  SliceEmbeddingWeightAnyDtype(init_map.at(chain.weight_name),
-                               /*weight_transposed=*/true, keep_ids);
+  // `weight_transposed=true` ("output channel is axis 0") branch. The
+  // `GatherBlockQuantized` shape's own packed `data` tensor is NOT a
+  // FLOAT/FLOAT16/BFLOAT16 tensor (it is UINT4/INT4/UINT8), so it takes the
+  // dtype-dispatched packed-byte row-slice (SliceGatherBlockQuantizedRows)
+  // instead -- `scales` stays FLOAT-family (SliceEmbeddingWeightAnyDtype
+  // applies unchanged, its own `(vocab_size, n_blocks)` shape matching that
+  // helper's `(dim0, dim1)` contract exactly), and `zero_points`, when
+  // present, shares `data`'s own dtype so it takes the same packed-byte
+  // slice too. Mirrors pruning.py's own `_apply_embedding_vocab_prune`
+  // exactly (`_slice_axis` applied to `data`/`scales`/`zero_points` alike).
+  if (chain.quantized) {
+    SliceGatherBlockQuantizedRows(init_map.at(chain.weight_name), keep_ids);
+    SliceEmbeddingWeightAnyDtype(init_map.at(chain.quantized->scales_name),
+                                 /*weight_transposed=*/true, keep_ids);
+    if (chain.quantized->zero_points_name) {
+      SliceGatherBlockQuantizedRows(
+          init_map.at(*chain.quantized->zero_points_name), keep_ids);
+    }
+  } else {
+    SliceEmbeddingWeightAnyDtype(init_map.at(chain.weight_name),
+                                 /*weight_transposed=*/true, keep_ids);
+  }
 
   if (chain.lm_head && !chain.lm_head->tied) {
     SliceEmbeddingWeightAnyDtype(init_map.at(*chain.lm_head->weight_name),
@@ -18156,18 +18966,92 @@ void ApplyEmbeddingVocabPrune(onnx::GraphProto* graph,
   }
 }
 
+// The full `(vocab_size, data.dims(1))` dequantized embedding table
+// `chain`'s own `com.microsoft::GatherBlockQuantized` producer refers to,
+// for IMPORTANCE RANKING ONLY -- never written back to the graph (this
+// module's own "slice, don't recompute" principle, exactly as
+// MatMulNBitsDequantized). Requires `chain.quantized` is set. Mirrors
+// pruning.py's own `_gather_block_quantized_dequantized` EXACTLY,
+// including its own dtype-dispatched (non-)unpacking asymmetry for `data`/
+// `zero_points` (GatherBlockQuantizedTensorAsDouble's own top comment) --
+// formula: `dequantized[v, h] = (data[v, h] - zero_point[v, h //
+// block_size]) * scale[v, h // block_size]`, `h` ranging over `data`'s own
+// logical `dims(1)` (== `chain.hidden_size`) -- for the plain-UINT8 packed
+// convention this is the PACKED width, not necessarily the true (pre-
+// padding) hidden size; a pre-existing property of the pure-Python
+// reference this mirrors bit-for-bit, not a new gap introduced by this
+// port (see that subsection's own top comment for the full explanation).
+std::vector<double> GatherBlockQuantizedDequantized(const EmbeddingChain& chain,
+                                                    const InitMap& init_map) {
+  const GatherBlockQuantizedInfo& q = *chain.quantized;
+  const onnx::TensorProto* data_init = init_map.at(chain.weight_name);
+  const std::vector<double> data =
+      GatherBlockQuantizedTensorAsDouble(*data_init);
+  const onnx::TensorProto* scales_init = init_map.at(q.scales_name);
+  const std::vector<float> scales_f = ReadFloatTensorAnyDtype(*scales_init);
+  const std::vector<double> scales(scales_f.begin(), scales_f.end());
+  const int64_t vocab = data_init->dims(0);
+  const int64_t d1 = data_init->dims(1);
+  const int64_t n_blocks = scales_init->dims(1);
+
+  std::vector<double> zp;
+  int64_t zp_cols = n_blocks;
+  if (q.zero_points_name) {
+    const onnx::TensorProto* zp_init = init_map.at(*q.zero_points_name);
+    zp = GatherBlockQuantizedTensorAsDouble(*zp_init);
+    // May legitimately differ from `n_blocks` for the packed-uint8
+    // convention (see this section's own top comment) -- mirrors
+    // pruning.py's own `zp[:, col_block]` indexing exactly, including its
+    // own out-of-range-index behavior for that edge case.
+    zp_cols = zp_init->dims(1);
+  } else {
+    const double default_zp =
+        (data_init->data_type() == onnx::TensorProto::UINT4 ||
+         data_init->data_type() == onnx::TensorProto::INT4)
+            ? 0.0
+            : static_cast<double>(int64_t{1} << (q.bits - 1));
+    zp.assign(static_cast<size_t>(vocab * n_blocks), default_zp);
+  }
+
+  std::vector<double> out(static_cast<size_t>(vocab * d1));
+  for (int64_t v = 0; v < vocab; ++v) {
+    for (int64_t h = 0; h < d1; ++h) {
+      int64_t col_block = h / q.block_size;
+      if (col_block > n_blocks - 1) {
+        col_block = n_blocks - 1;
+      }
+      const double s = scales[static_cast<size_t>(v * n_blocks + col_block)];
+      const double z = zp[static_cast<size_t>(v * zp_cols + col_block)];
+      out[static_cast<size_t>(v * d1 + h)] =
+          (data[static_cast<size_t>(v * d1 + h)] - z) * s;
+    }
+  }
+  return out;
+}
+
 // The per-row (vocab-axis) L2-norm importance vector shared by
 // ApplyEmbeddingVocabMagnitudePruning: the matched embedding table's own
 // row norm, combined (root-sum-square) with a matched untied `lm_head`'s
 // own row norm when one exists (the tied case needs no such combination --
 // the embedding table's own row norm already IS the tied `lm_head`'s row
 // norm). Mirrors pruning.py's own `_embedding_vocab_importance` exactly,
-// minus the `GatherBlockQuantized`-dequantization branch (out of scope for
-// this C++ port -- see this section's own top comment).
+// including its `GatherBlockQuantizedDequantized` dequantize-for-ranking
+// branch for the `GatherBlockQuantized` shape.
 std::vector<double> EmbeddingVocabImportance(const EmbeddingChain& chain,
                                              const InitMap& init_map) {
   std::vector<double> importance(static_cast<size_t>(chain.vocab_size), 0.0);
-  {
+  if (chain.quantized) {
+    const std::vector<double> emb =
+        GatherBlockQuantizedDequantized(chain, init_map);
+    for (int64_t v = 0; v < chain.vocab_size; ++v) {
+      double sum = 0.0;
+      for (int64_t h = 0; h < chain.hidden_size; ++h) {
+        const double x = emb[static_cast<size_t>(v * chain.hidden_size + h)];
+        sum += x * x;
+      }
+      importance[static_cast<size_t>(v)] = sum;
+    }
+  } else {
     const std::vector<float> emb =
         ReadFloatTensorAnyDtype(*init_map.at(chain.weight_name));
     for (int64_t v = 0; v < chain.vocab_size; ++v) {
@@ -18360,19 +19244,27 @@ std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
                    // above.
       }
       const DLTensor& dl = outputs[oit->second]->dl_tensor;
-      // Scope decision, mirroring this file's own FLOAT32-only chain
-      // matching everywhere else (every producer/consumer weight this file
-      // matches is FLOAT32-only -- see e.g. MatchProducer): a probe
-      // activation of any other runtime dtype is simply skipped for this
-      // batch (never observed for this probe name), so the affected
-      // chain(s) fall back to plain weight-only importance -- never
-      // guessed at via an implicit upcast. In practice every chain this
-      // pass matches is itself FLOAT32-only, so its own probe activation is
-      // FLOAT32 too whenever the executor runs the *real* graph ops
-      // faithfully; this only guards against an executor that (legitimately
-      // per the ModelExecutor contract) returns some other dtype.
+      // Accepts FLOAT/FLOAT16/BFLOAT16 (IsSupportedFloatDtype), mirroring
+      // pruning.py's own unconditional `np.asarray(..., dtype=np.float64)`
+      // here -- ApplyWandaPruning's own candidate matching (this file's own
+      // "Wanda unstructured (element-wise) pruning" section) now widens its
+      // own weight-dtype gates to match, per that section's own top
+      // comment, so a FLOAT16/BFLOAT16 model's probe activation needs to be
+      // observed here too rather than silently falling back to plain
+      // weight-only importance the way an unobserved-dtype probe still does
+      // below. Strictly additive for every OTHER caller of this shared
+      // function (ApplyStructuredWandaPruning/ApplyAttentionHeadWandaPruning
+      // above/below, still FLOAT32-only candidate matchers of their own):
+      // it only lets this function observe MORE activation dtypes, never
+      // fewer, so their own FLOAT32-only candidates' own probe activations
+      // (already FLOAT32 whenever the executor runs the real graph
+      // faithfully) are unaffected. A probe activation of any other runtime
+      // dtype the executor might legitimately return is simply skipped for
+      // this batch (never observed for this probe name), so the affected
+      // chain(s) fall back to plain weight-only importance -- never guessed
+      // at via an implicit upcast.
       onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
-      if (tp.data_type() != onnx::TensorProto::FLOAT) {
+      if (!IsSupportedFloatDtype(tp.data_type())) {
         continue;
       }
       const int64_t ndim = tp.dims_size();
@@ -18399,7 +19291,11 @@ std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
       }
       const int64_t channel_stride = strides[static_cast<size_t>(axis)];
 
-      std::vector<float> data = ReadFloatTensor(tp);
+      // ReadTensorAsF64 (FLOAT/FLOAT16/BFLOAT16 -> double, exact upcast --
+      // see its own declaration comment) rather than ReadFloatTensor: `tp`
+      // may now be FLOAT16/BFLOAT16, per this function's own widened dtype
+      // gate above.
+      std::vector<double> data = ReadTensorAsF64(tp);
       auto& acc = sq_sum[name];
       if (acc.empty()) {
         acc.assign(static_cast<size_t>(channel_dim), 0.0);
@@ -18412,7 +19308,7 @@ std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
       // channel_dim` for a row-major contiguous layout).
       for (int64_t flat = 0; flat < total; ++flat) {
         const int64_t c = (flat / channel_stride) % channel_dim;
-        const double v = static_cast<double>(data[static_cast<size_t>(flat)]);
+        const double v = data[static_cast<size_t>(flat)];
         acc[static_cast<size_t>(c)] += v * v;
       }
       count[name] += total / channel_dim;
@@ -19283,9 +20179,10 @@ void CommitTransformerBlockDrops(
 // C++ port of pruning.py's own apply_sparsegpt_pruning / _sparsegpt_prune_
 // columns / onnxsim.gptq._inverse_hessian_cholesky. See structured_pruning_
 // entry.h's own ApplySparseGptPruning declaration comment for the full
-// scope decision (FLOAT32-only weights, MatMul/vanilla-Gemm/`com.microsoft
-// ::Attention` merged-QKV weight only -- 2-D Conv is NOT ported here, see
-// that comment for why) and pruning.py's own module-level docstring /
+// scope decision (FLOAT32/FLOAT16/BFLOAT16 weights, MatMul/vanilla-Gemm/
+// `com.microsoft::Attention` merged-QKV weight only -- 2-D Conv is NOT
+// ported here, see that comment for why) and pruning.py's own module-level
+// docstring /
 // gptq.py's own module-level docstring for the algorithm itself. Three
 // genuinely new pieces this pass needs that no earlier pass in this file
 // does:
@@ -19664,10 +20561,15 @@ struct SparseGptHessian {
 // Reuses WandaCalibrationStats' own probe-injection/batch-iteration/
 // executor-call plumbing verbatim (see that function's own top comment for
 // the full calibration-crossing design every calibration-driven pass in
-// this file shares) -- same FLOAT32-only, `ndim >= 2` scope decision for a
-// probed activation (reshaped to `[-1, dims.back()]`, mirroring
-// pruning.py's own `x.reshape(-1, x.shape[-1])`). Unlike pruning.py's own
-// `np.concatenate`, which would raise if two batches' own activations for
+// this file shares) -- but, unlike WandaCalibrationStats itself (still
+// FLOAT32-only), this accepts a FLOAT/FLOAT16/BFLOAT16 probed activation
+// (IsSupportedFloatDtype, read via ReadTensorAsF64 rather than
+// ReadFloatTensor), matching ApplySparseGptPruning's own weight-side
+// FLOAT16/BFLOAT16 support below and pruning.py's own
+// `_is_supported_float_dtype`; `ndim >= 2` scope decision for a probed
+// activation is otherwise unchanged (reshaped to `[-1, dims.back()]`,
+// mirroring pruning.py's own `x.reshape(-1, x.shape[-1])`). Unlike pruning.py's
+// own `np.concatenate`, which would raise if two batches' own activations for
 // the same probe name disagreed on `dims.back()` (never happens for a
 // well-formed model -- that last dim is a fixed layer property, not a
 // per-batch one), a later batch that DOES disagree with the first batch's
@@ -19734,8 +20636,11 @@ std::unordered_map<std::string, SparseGptHessian> SparseGptHessianStats(
       }
       const DLTensor& dl = outputs[oit->second]->dl_tensor;
       onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
-      if (tp.data_type() != onnx::TensorProto::FLOAT) {
-        continue;  // Scope decision mirroring WandaCalibrationStats' own.
+      if (!IsSupportedFloatDtype(tp.data_type())) {
+        continue;  // FLOAT/FLOAT16/BFLOAT16 -- widened from this function's
+                   // earlier FLOAT32-only scope decision (mirrors
+                   // pruning.py's own `_is_supported_float_dtype` gate on
+                   // the probed activation; see IsSupportedFloatDtype).
       }
       const int64_t ndim = tp.dims_size();
       if (ndim < 2) {
@@ -19763,21 +20668,26 @@ std::unordered_map<std::string, SparseGptHessian> SparseGptHessianStats(
         continue;  // See this function's own top comment.
       }
 
-      const std::vector<float> data = ReadFloatTensor(tp);
+      // ReadTensorAsF64 (not ReadFloatTensor) -- handles FLOAT/FLOAT16/
+      // BFLOAT16 alike, upcasting FLOAT16/BFLOAT16 to double the same way
+      // this function's own weight read/write already does (see
+      // ApplySparseGptPruning below), mirroring pruning.py's own
+      // `np.asarray(result[name], dtype=np.float64)`.
+      const std::vector<double> data = ReadTensorAsF64(tp);
       // H += X.T @ X, accumulated over the upper triangle only (H is
       // symmetric by construction) then mirrored into the lower triangle
       // once, after every batch, below.
       for (int64_t r = 0; r < rows; ++r) {
-        const float* row = data.data() + r * kk;
+        const double* row = data.data() + r * kk;
         double* hbase = acc.h.data();
         for (int64_t i = 0; i < kk; ++i) {
-          const double xi = static_cast<double>(row[i]);
+          const double xi = row[i];
           if (xi == 0.0) {
             continue;
           }
           double* hrow = hbase + i * kk;
           for (int64_t j = i; j < kk; ++j) {
-            hrow[j] += xi * static_cast<double>(row[j]);
+            hrow[j] += xi * row[j];
           }
         }
       }
@@ -19804,12 +20714,16 @@ std::unordered_map<std::string, SparseGptHessian> SparseGptHessianStats(
 }  // namespace
 
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
-                                        double sparsity) {
+                                        double sparsity,
+                                        const std::string& importance_norm,
+                                        bool global_sparsity) {
   if (!(sparsity >= 0.0 && sparsity < 1.0)) {
     throw std::invalid_argument(
         "ApplyStructuredPruning: sparsity must be in [0, 1), got " +
         std::to_string(sparsity));
   }
+  const ImportanceNorm norm =
+      ParseImportanceNorm(importance_norm, "ApplyStructuredPruning");
   onnx::ModelProto out = model;
 
   // Subgraph-aware (IterSubgraphs, see this file's own "Subgraph
@@ -19864,20 +20778,57 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
     std::vector<DynQuantChain> dynquant_chains = FindDynQuantChains(graph);
 
     TouchedState touched;
-    if (!chains.empty()) {
-      ApplyChains(graph, chains, sparsity, touched);
-    }
-    if (!concat_chains.empty()) {
-      ApplyConcatChains(graph, concat_chains, sparsity, touched);
-    }
-    if (!split_gated_chains.empty()) {
-      // A genuinely separate application pass, not folded into ApplyChains
-      // -- see FindSplitGatedChains/ApplySplitGatedChains's own section
-      // comment for why. Shares `touched` with the calls above so a weight
-      // this pass resizes can never be double-resized by (or
-      // double-resize) an ordinary chain/Concat-chain that happens to
-      // touch the same initializer -- still scoped to this one graph only.
-      ApplySplitGatedChains(graph, split_gated_chains, sparsity, touched);
+    // `global_sparsity` mirrors pruning.py's own apply_structured_pruning
+    // scope EXACTLY: only the plain chain family (`chains` -- FindChains/
+    // FindGatedChains/FindConvChains/FindConvResidualChains/
+    // FindMatmulResidualChains) ever takes part in the pooled ranking, via
+    // ApplyChainsGlobal restricted to ChainIsGlobalSparsityEligible members
+    // -- a gated pair, a residual/merge group, and any general grouped Conv
+    // chain are left completely untouched in this mode (see that
+    // function's own doc comment). `concat_chains`/`split_gated_chains` are
+    // Python's own `apply_structured_pruning`'s remaining two families and
+    // are likewise simply NOT applied in global_sparsity mode there (its
+    // own `if global_sparsity: ... else: ...` body only ever calls
+    // `_apply_concat_chains`/`_apply_split_gated_chains` from the `else`
+    // branch) -- mirrored here the same way. The quantized-weight families
+    // below (MatMulNBits/QDQ/Bnb4/Fp8/Fp4/QOperator/DynamicQuantizeMatMul)
+    // are additional scope this one C++ entry point consolidates from
+    // several separate pure-Python top-level functions
+    // (apply_structured_pruning_qdq and friends), NONE of which have a
+    // `global_sparsity` parameter of their own in pruning.py at all -- so
+    // `global_sparsity` has no defined meaning for them and they are always
+    // applied with their own local per-chain sparsity, completely
+    // unaffected by this flag either way.
+    if (global_sparsity) {
+      std::vector<Chain> global_chains;
+      for (const auto& c : chains) {
+        if (ChainIsGlobalSparsityEligible(c)) {
+          global_chains.push_back(c);
+        }
+      }
+      if (!global_chains.empty()) {
+        ApplyChainsGlobal(graph, global_chains, sparsity, touched, nullptr,
+                          1e-8, norm);
+      }
+    } else {
+      if (!chains.empty()) {
+        ApplyChains(graph, chains, sparsity, touched, nullptr, 1e-8, norm);
+      }
+      if (!concat_chains.empty()) {
+        ApplyConcatChains(graph, concat_chains, sparsity, touched, nullptr,
+                          1e-8, norm);
+      }
+      if (!split_gated_chains.empty()) {
+        // A genuinely separate application pass, not folded into
+        // ApplyChains -- see FindSplitGatedChains/ApplySplitGatedChains's
+        // own section comment for why. Shares `touched` with the calls
+        // above so a weight this pass resizes can never be double-resized
+        // by (or double-resize) an ordinary chain/Concat-chain that
+        // happens to touch the same initializer -- still scoped to this
+        // one graph only.
+        ApplySplitGatedChains(graph, split_gated_chains, sparsity, touched,
+                              norm);
+      }
     }
     if (!matmul_nbits_chains.empty() || !matmul_nbits_gated_chains.empty()) {
       // Another separate application pass -- see the "MatMulNBits
@@ -19976,12 +20927,15 @@ onnx::ModelProto ApplyStructuredWandaPruning(
     const onnx::ModelProto& model, const ModelExecutor& executor,
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
         calibration_data,
-    double sparsity, double epsilon) {
+    double sparsity, double epsilon, const std::string& importance_norm,
+    bool global_sparsity) {
   if (!(sparsity >= 0.0 && sparsity < 1.0)) {
     throw std::invalid_argument(
         "ApplyStructuredWandaPruning: sparsity must be in [0, 1), got " +
         std::to_string(sparsity));
   }
+  const ImportanceNorm norm =
+      ParseImportanceNorm(importance_norm, "ApplyStructuredWandaPruning");
   onnx::ModelProto out = model;
 
   // NOT subgraph-aware -- see this function's own declaration comment in
@@ -20047,19 +21001,38 @@ onnx::ModelProto ApplyStructuredWandaPruning(
       WandaCalibrationStats(executor, out, probe_axis, calibration_data);
 
   TouchedState touched;
-  if (!chains.empty()) {
-    ApplyChains(graph, chains, sparsity, touched, &act_norm, epsilon);
-  }
-  if (!concat_chains.empty()) {
-    ApplyConcatChains(graph, concat_chains, sparsity, touched, &act_norm,
-                      epsilon);
-  }
-  if (!split_gated_chains.empty()) {
-    // Plain weight-magnitude importance only, unchanged -- see this
-    // function's own comment above on `probe_axis` for why: reused
-    // completely as-is, exactly like ApplyStructuredPruning's own call to
-    // it, no `act_norm`/`epsilon` parameters to thread through at all.
-    ApplySplitGatedChains(graph, split_gated_chains, sparsity, touched);
+  // `global_sparsity` mirrors pruning.py's own apply_structured_wanda_pruning
+  // scope exactly -- see ApplyStructuredPruning's own identical comment
+  // above for the full reasoning (only the plain chain family pools into
+  // ApplyChainsGlobal; concat_chains/split_gated_chains are simply not
+  // applied in this mode, mirroring the Python `if global_sparsity: ...
+  // else: ...` split exactly).
+  if (global_sparsity) {
+    std::vector<Chain> global_chains;
+    for (const auto& c : chains) {
+      if (ChainIsGlobalSparsityEligible(c)) {
+        global_chains.push_back(c);
+      }
+    }
+    if (!global_chains.empty()) {
+      ApplyChainsGlobal(graph, global_chains, sparsity, touched, &act_norm,
+                        epsilon, norm);
+    }
+  } else {
+    if (!chains.empty()) {
+      ApplyChains(graph, chains, sparsity, touched, &act_norm, epsilon, norm);
+    }
+    if (!concat_chains.empty()) {
+      ApplyConcatChains(graph, concat_chains, sparsity, touched, &act_norm,
+                        epsilon, norm);
+    }
+    if (!split_gated_chains.empty()) {
+      // Plain weight-magnitude importance only (no calibrated activation
+      // norm -- see this function's own comment above on `probe_axis` for
+      // why), but `importance_norm` still applies -- mirrors pruning.py's
+      // own `_split_gated_wanda_importance` exactly.
+      ApplySplitGatedChains(graph, split_gated_chains, sparsity, touched, norm);
+    }
   }
   if (!touched.stale_value_info.empty()) {
     google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
@@ -20074,12 +21047,15 @@ onnx::ModelProto ApplyStructuredWandaPruning(
 }
 
 onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
-                                           double sparsity) {
+                                           double sparsity,
+                                           const std::string& importance_norm) {
   if (!(sparsity >= 0.0 && sparsity < 1.0)) {
     throw std::invalid_argument(
         "ApplyAttentionHeadPruning: sparsity must be in [0, 1), got " +
         std::to_string(sparsity));
   }
+  const ImportanceNorm norm =
+      ParseImportanceNorm(importance_norm, "ApplyAttentionHeadPruning");
   onnx::ModelProto out = model;
 
   // Subgraph-aware (IterSubgraphs, see this file's own "Subgraph
@@ -20104,7 +21080,7 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
                   std::make_move_iterator(onnx_attn_chains.begin()),
                   std::make_move_iterator(onnx_attn_chains.end()));
     if (!chains.empty()) {
-      ApplyAttentionChains(graph, chains, sparsity);
+      ApplyAttentionChains(graph, chains, sparsity, nullptr, 1e-8, norm);
     }
     // The fused `com.microsoft::MatMulNBitsQkv` variant -- see the
     // "MatMulNBitsMlp/MatMulNBitsQkv (fused block-quantized weight)
@@ -20140,12 +21116,14 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
     const onnx::ModelProto& model, const ModelExecutor& executor,
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
         calibration_data,
-    double sparsity, double epsilon) {
+    double sparsity, double epsilon, const std::string& importance_norm) {
   if (!(sparsity >= 0.0 && sparsity < 1.0)) {
     throw std::invalid_argument(
         "ApplyAttentionHeadWandaPruning: sparsity must be in [0, 1), got " +
         std::to_string(sparsity));
   }
+  const ImportanceNorm norm =
+      ParseImportanceNorm(importance_norm, "ApplyAttentionHeadWandaPruning");
   onnx::ModelProto out = model;
 
   // NOT subgraph-aware -- mirrors pruning.py's own
@@ -20190,7 +21168,7 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
   const std::unordered_map<std::string, std::vector<double>> act_norm =
       WandaCalibrationStats(executor, out, probe_axis, calibration_data);
 
-  ApplyAttentionChains(graph, chains, sparsity, &act_norm, epsilon);
+  ApplyAttentionChains(graph, chains, sparsity, &act_norm, epsilon, norm);
   return out;
 }
 
@@ -20594,6 +21572,94 @@ onnx::ModelProto ApplyTransformerBlockPruning(
   return out;
 }
 
+// Attention QKV-weight matcher for ApplySparseGptPruning ONLY -- mirrors
+// MatchAttentionProducer (this file's "Attention-head pruning" section)
+// exactly, but widened to accept FLOAT16/BFLOAT16 in addition to FLOAT32 for
+// both the weight and (if present) bias, mirroring pruning.py's own
+// `_match_attention_producer`, which is itself already
+// `_is_supported_float_dtype`-widened (`_match_attention_weight_only` just
+// reuses it in full, dtype widening included). Deliberately a narrow, LOCAL
+// duplicate rather than a change to the shared MatchAttentionProducer
+// itself -- exactly the same reasoning as this file's own
+// MatchMoeRouterProducer (MoE/QMoE whole-expert pruning section, see that
+// function's own comment): MatchAttentionProducer also backs this file's
+// OWN structural Attention-head pruning (FindAttentionChains /
+// ApplyOnePlainAttentionChain), which has not been independently
+// re-verified against a real FLOAT16/BFLOAT16 export and stays FLOAT32-only
+// -- its own downstream weight/bias rewriting is still ReadFloatTensor/
+// SetFloatTensorData-based (FLOAT32 only), so widening the shared matcher
+// in place would silently let a FLOAT16/BFLOAT16 node through to code that
+// cannot correctly handle it. SparseGPT never touches bias, only the
+// weight, but bias dtype/shape is still validated here (mirroring
+// `_match_attention_producer`'s own checks, reused in full by
+// `_match_attention_weight_only` even though nothing there reads bias
+// either) so a node this file's own structural head-pruning would decline
+// as malformed is declined the same way here.
+std::optional<AttentionProducerMatch> MatchAttentionProducerAnyFloat(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.domain() != kComMicrosoftDomain || node.op_type() != "Attention") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 2) {
+    return std::nullopt;
+  }
+  const std::string& w_name = node.input(1);
+  auto wit = init_map.find(w_name);
+  if (wit == init_map.end() ||
+      !IsSupportedFloatDtype(wit->second->data_type()) ||
+      wit->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+  const int64_t total_n = wit->second->dims(1);
+
+  std::optional<std::string> bias_name;
+  if (node.input_size() >= 3 && !node.input(2).empty()) {
+    bias_name = node.input(2);
+    auto bit = init_map.find(*bias_name);
+    if (bit == init_map.end() ||
+        !IsSupportedFloatDtype(bit->second->data_type()) ||
+        bit->second->dims_size() != 1 || bit->second->dims(0) != total_n) {
+      return std::nullopt;
+    }
+  }
+
+  int64_t num_heads = 0;
+  bool has_num_heads = false;
+  std::optional<std::vector<int64_t>> qkv_hidden_sizes;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "num_heads") {
+      num_heads = attr.i();
+      has_num_heads = true;
+    } else if (attr.name() == "qkv_hidden_sizes") {
+      qkv_hidden_sizes =
+          std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    }
+  }
+  if (!has_num_heads || num_heads <= 0) {
+    return std::nullopt;
+  }
+
+  int64_t nq, nk, nv;
+  if (qkv_hidden_sizes) {
+    if (qkv_hidden_sizes->size() != 3) {
+      return std::nullopt;
+    }
+    nq = (*qkv_hidden_sizes)[0];
+    nk = (*qkv_hidden_sizes)[1];
+    nv = (*qkv_hidden_sizes)[2];
+  } else {  // Schema default: Q/K/V evenly split the merged width.
+    if (total_n % 3 != 0) {
+      return std::nullopt;
+    }
+    nq = nk = nv = total_n / 3;
+  }
+  if (nq <= 0 || nk <= 0 || nv <= 0 || nq + nk + nv != total_n ||
+      nq % num_heads != 0 || nk % num_heads != 0 || nv % num_heads != 0) {
+    return std::nullopt;
+  }
+  return AttentionProducerMatch{w_name, bias_name, num_heads, nq, nk, nv};
+}
+
 // SparseGPT (Frantar & Alistarh, 2023) unstructured/N:M pruning. The C++
 // port of pruning.py's own apply_sparsegpt_pruning -- see this file's own
 // "SparseGPT (unstructured / N:M) pruning" section comment above
@@ -20656,20 +21722,23 @@ onnx::ModelProto ApplySparseGptPruning(
   // file's own established, already-documented narrower C++-port scope
   // decision everywhere else MatchMatMulLikeRaw is reused, e.g.
   // MatchProducer/WalkToAttentionConsumer above) with a constant 2-D
-  // FLOAT32 weight (NOT also FLOAT16/BFLOAT16, unlike pruning.py's own
-  // _is_supported_float_dtype -- mirrors this file's own established
-  // FLOAT32-only C++-port scope decision, e.g.
-  // ApplyMoeExpertChannelPruning's own doc comment), plus every matched
-  // `com.microsoft::Attention` node's constant 2-D FLOAT32 merged QKV
-  // weight (MatchAttentionProducer, already FLOAT32-2-D-only itself --
-  // reused verbatim, exactly mirroring pruning.py's own
-  // _match_attention_weight_only, which reuses _match_attention_producer's
-  // own identical validation, minus its bias handling: SparseGPT never
-  // touches bias, only weight). `com.microsoft::GroupQueryAttention`'s
-  // separate Q/K/V projections need no special-casing at all -- they are
-  // ordinary MatMul/vanilla-Gemm nodes, already matched by the first case
-  // above (see pruning.py's own module docstring for the full reasoning on
-  // why this is correct, not an oversight, for both).
+  // FLOAT/FLOAT16/BFLOAT16 weight (IsSupportedFloatDtype -- matches
+  // pruning.py's own _is_supported_float_dtype; read/written via
+  // ReadTensorAsF64/WriteF64TensorAs below, preserving the weight's own
+  // original dtype, exactly like the MoE/QMoE FP16/BFLOAT16 widening this
+  // mirrors), plus every matched `com.microsoft::Attention` node's constant
+  // 2-D FLOAT/FLOAT16/BFLOAT16 merged QKV weight
+  // (MatchAttentionProducerAnyFloat -- a narrow local dtype-widened
+  // duplicate of MatchAttentionProducer, see that function's own comment
+  // for why MatchAttentionProducer itself is left untouched -- exactly
+  // mirroring pruning.py's own _match_attention_weight_only, which reuses
+  // _match_attention_producer's own identical (already dtype-widened)
+  // validation, minus its bias handling: SparseGPT never touches bias, only
+  // weight). `com.microsoft::GroupQueryAttention`'s separate Q/K/V
+  // projections need no special-casing at all -- they are ordinary
+  // MatMul/vanilla-Gemm nodes, already matched by the first case above (see
+  // pruning.py's own module docstring for the full reasoning on why this is
+  // correct, not an oversight, for both).
   //
   // 2-D Conv (ordinary/depthwise/general-grouped) is declined outright,
   // NOT ported here -- see structured_pruning_entry.h's own
@@ -20678,7 +21747,11 @@ onnx::ModelProto ApplySparseGptPruning(
   // pruning.py's own module docstring documents at length, materially
   // bigger than the rest of this pass, with no correct upstream reference
   // to port from at all) -- a Conv node here simply never matches either
-  // case below and is left completely untouched, never guessed at.
+  // case below and is left completely untouched, never guessed at. This
+  // remains the one open scope gap versus pruning.py's own
+  // apply_sparsegpt_pruning after this port's FLOAT16/BFLOAT16 widening --
+  // see this function's own declaration comment in
+  // structured_pruning_entry.h.
   struct Candidate {
     std::string x_name;
     std::string w_name;
@@ -20690,13 +21763,13 @@ onnx::ModelProto ApplySparseGptPruning(
     if (mm) {
       auto wit = init_map.find(mm->w_name);
       if (wit != init_map.end() &&
-          wit->second->data_type() == onnx::TensorProto::FLOAT &&
+          IsSupportedFloatDtype(wit->second->data_type()) &&
           wit->second->dims_size() == 2) {
         candidates.push_back({mm->x_name, mm->w_name, mm->weight_transposed});
       }
       continue;
     }
-    auto am = MatchAttentionProducer(node, init_map);
+    auto am = MatchAttentionProducerAnyFloat(node, init_map);
     if (am) {
       // The merged QKV weight has no transpose attribute of its own -- it
       // is already [K, N]-shaped by construction (see
@@ -20730,8 +21803,19 @@ onnx::ModelProto ApplySparseGptPruning(
     onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
     const int64_t dim0 = w_init->dims(0);
     const int64_t dim1 = w_init->dims(1);
-    const std::vector<float> w_flat = ReadFloatTensor(*w_init);
-    const std::vector<double> w_f64(w_flat.begin(), w_flat.end());
+    const int32_t w_dtype = w_init->data_type();
+    // ReadTensorAsF64 (not ReadFloatTensor) -- FLOAT/FLOAT16/BFLOAT16 alike,
+    // upcast to double, mirroring pruning.py's own `_to_f64`; written back
+    // down to `w_dtype` (this weight's own original dtype) via
+    // WriteF64TensorAs below, mirroring pruning.py's own `_from_f64`. As
+    // pruning.py's own apply_sparsegpt_pruning docstring notes, SparseGPT's
+    // Hessian-compensated update recomputes every KEPT entry's own value
+    // too, so a FLOAT16/BFLOAT16 weight's surviving entries do not
+    // reproduce their pre-pruning bit pattern the way plain-masking passes'
+    // FLOAT16/BFLOAT16 widening does -- the float64 accumulation this
+    // function already used for numerical stability is unchanged either
+    // way.
+    const std::vector<double> w_f64 = ReadTensorAsF64(*w_init);
 
     // w_nk: [n_rows, kk], output-channel-first -- w as-is when already
     // weight_transposed ([N, K] = [dim0, dim1]), else w's own transpose
@@ -20762,20 +21846,18 @@ onnx::ModelProto ApplySparseGptPruning(
 
     // Inverse of the w -> w_nk reshape/transpose above, mirroring
     // pruning.py's own _nk_to_weight (non-Conv branch).
-    std::vector<float> w_new(static_cast<size_t>(dim0 * dim1));
+    std::vector<double> w_new(static_cast<size_t>(dim0 * dim1));
     if (c.weight_transposed) {
-      for (size_t i = 0; i < w_new.size(); ++i) {
-        w_new[i] = static_cast<float>(w_pruned_nk[i]);
-      }
+      w_new = w_pruned_nk;
     } else {
       for (int64_t nx = 0; nx < dim1; ++nx) {
         for (int64_t kx = 0; kx < dim0; ++kx) {
-          w_new[static_cast<size_t>(kx * dim1 + nx)] = static_cast<float>(
-              w_pruned_nk[static_cast<size_t>(nx * kk + kx)]);
+          w_new[static_cast<size_t>(kx * dim1 + nx)] =
+              w_pruned_nk[static_cast<size_t>(nx * kk + kx)];
         }
       }
     }
-    SetFloatTensorData(w_init, {dim0, dim1}, w_new);
+    WriteF64TensorAs(w_init, w_dtype, {dim0, dim1}, w_new);
   }
 
   return out;
@@ -20786,13 +21868,32 @@ onnx::ModelProto ApplySparseGptPruning(
 // C++ port of pruning.py's own `apply_wanda_pruning` -- see
 // structured_pruning_entry.h's own ApplyWandaPruning declaration comment
 // for the full scope (candidate set identical to ApplySparseGptPruning
-// immediately above; FLOAT32-only, Conv out of scope) and the
-// per-layer/`global_sparsity` masking contract this implements. Reuses
-// WandaCalibrationStats verbatim for the calibration statistic (same shape
-// ApplyStructuredWandaPruning/ApplyAttentionHeadWandaPruning already
-// consume), and MatchMatMulLikeRaw/MatchAttentionProducer verbatim for
-// candidate matching (same as ApplySparseGptPruning) -- the only genuinely
-// new machinery here is the plain one-shot importance score
+// immediately above except widened to FLOAT32/FLOAT16/BFLOAT16; Conv out of
+// scope) and the per-layer/`global_sparsity` masking contract this
+// implements. Reuses WandaCalibrationStats for the calibration statistic
+// (same shape ApplyStructuredWandaPruning/ApplyAttentionHeadWandaPruning
+// already consume -- its own activation-dtype gate was widened from
+// FLOAT-only to IsSupportedFloatDtype/ReadTensorAsF64 as part of this same
+// change, see its own top comment; a strict widening that only lets it
+// observe MORE activations, so it changes nothing for those two other
+// callers' own FLOAT32-only candidate sets), MatchMatMulLikeRaw verbatim for
+// the MatMul/Gemm candidate case (its own weight-dtype gate lives at this
+// function's OWN call site below, not inside the shared matcher, so
+// widening it here is a strictly local change -- unlike Attention, see
+// immediately below), and a LOCAL, dtype-widened copy of
+// MatchAttentionProducer (MatchAttentionProducerWideDtype below) for the
+// Attention candidate case -- MatchAttentionProducer's own dtype gate is
+// baked INSIDE the shared matcher itself (unlike MatchMatMulLikeRaw's), and
+// that matcher is also reused by FindAttentionChains (structured
+// Attention-head pruning) and ApplySparseGptPruning immediately above, both
+// deliberately FLOAT32-only per their own declaration comments -- widening
+// it in place would silently widen candidate matching for those two
+// unrelated, independently-verified-only-for-FLOAT32 passes too. Hence the
+// narrow, local duplicate instead, exactly the same "narrow, local
+// duplicate instead of a shared-code change" precedent this file's own
+// MoE/QMoE section top comment already established for the analogous
+// FLOAT32-only-elsewhere situation. The only genuinely new machinery here
+// (beyond the dtype widening) is the plain one-shot importance score
 // (`|W_ij| * ||X_j||_2`, WandaImportance below, no Hessian/Cholesky at all)
 // and its element-wise masking (WandaSparsityMaskNK/WandaNmMaskNK/the
 // `global_sparsity` pooling loop inside ApplyWandaPruning itself), mirroring
@@ -20832,21 +21933,23 @@ WandaNK ToWandaNK(const std::vector<double>& w_f64, int64_t dim0, int64_t dim1,
 // Inverse of ToWandaNK -- mirrors pruning.py's own `_nk_to_weight`
 // (non-Conv branch). `w_pruned_nk` is row-major `[n_rows, kk]`; the
 // returned buffer is row-major `[dim0, dim1]`, ready for
-// SetFloatTensorData.
-std::vector<float> FromWandaNK(const std::vector<double>& w_pruned_nk,
-                               int64_t dim0, int64_t dim1,
-                               bool weight_transposed) {
-  std::vector<float> w_new(static_cast<size_t>(dim0 * dim1));
+// WriteF64TensorAs (kept as `double` throughout, rather than narrowing to
+// `float` here, so a FLOAT16/BFLOAT16 weight's own downcast happens exactly
+// once, inside WriteF64TensorAs itself -- narrowing to float32 first and
+// then to half/bfloat16 would double-round, same reasoning as this file's
+// own DoubleToFloat16Bits comment).
+std::vector<double> FromWandaNK(const std::vector<double>& w_pruned_nk,
+                                int64_t dim0, int64_t dim1,
+                                bool weight_transposed) {
+  std::vector<double> w_new(static_cast<size_t>(dim0 * dim1));
   if (weight_transposed) {
-    for (size_t i = 0; i < w_new.size(); ++i) {
-      w_new[i] = static_cast<float>(w_pruned_nk[i]);
-    }
+    w_new = w_pruned_nk;
   } else {
     const int64_t kk = dim0;
     for (int64_t nx = 0; nx < dim1; ++nx) {
       for (int64_t kx = 0; kx < dim0; ++kx) {
         w_new[static_cast<size_t>(kx * dim1 + nx)] =
-            static_cast<float>(w_pruned_nk[static_cast<size_t>(nx * kk + kx)]);
+            w_pruned_nk[static_cast<size_t>(nx * kk + kx)];
       }
     }
   }
@@ -20958,6 +22061,92 @@ std::vector<uint8_t> WandaNmMaskNK(const std::vector<double>& importance,
   return mask;
 }
 
+// Local, dtype-widened copy of MatchAttentionProducer (structural logic
+// verbatim identical -- domain/op_type, weight/bias shape and dtype,
+// num_heads/qkv_hidden_sizes consistency), scoped to ApplyWandaPruning
+// alone: accepts FLOAT/FLOAT16/BFLOAT16 (IsSupportedFloatDtype) for both
+// the merged QKV weight and (if present) its merged bias, mirroring
+// pruning.py's own `_match_attention_producer`'s `_is_supported_float_dtype`
+// checks exactly (unlike MatchAttentionProducer's own hardcoded `==
+// onnx::TensorProto::FLOAT`). A genuinely separate copy rather than an
+// in-place widening of the shared MatchAttentionProducer -- see this file's
+// own "Wanda unstructured (element-wise) pruning" section top comment for
+// why: that function is also reused by FindAttentionChains (structured
+// Attention-head pruning) and ApplySparseGptPruning immediately above, both
+// deliberately FLOAT32-only per their own declaration comments, so widening
+// its dtype gate in place would silently widen candidate matching for those
+// two unrelated, independently-verified-only-for-FLOAT32 passes too --
+// exactly the MoE/QMoE section's own already-established "narrow, local
+// duplicate instead of a shared-code change" precedent. Bias dtype is
+// checked (though ApplyWandaPruning itself never reads bias) purely to
+// decline the same malformed-node shapes MatchAttentionProducer already
+// would, matching pruning.py's own `_match_attention_weight_only`'s full
+// reuse of `_match_attention_producer` (including its bias check) exactly.
+std::optional<AttentionProducerMatch> MatchAttentionProducerWideDtype(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.domain() != kComMicrosoftDomain || node.op_type() != "Attention") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 2) {
+    return std::nullopt;
+  }
+  const std::string& w_name = node.input(1);
+  auto wit = init_map.find(w_name);
+  if (wit == init_map.end() ||
+      !IsSupportedFloatDtype(wit->second->data_type()) ||
+      wit->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+  const int64_t total_n = wit->second->dims(1);
+
+  std::optional<std::string> bias_name;
+  if (node.input_size() >= 3 && !node.input(2).empty()) {
+    bias_name = node.input(2);
+    auto bit = init_map.find(*bias_name);
+    if (bit == init_map.end() ||
+        !IsSupportedFloatDtype(bit->second->data_type()) ||
+        bit->second->dims_size() != 1 || bit->second->dims(0) != total_n) {
+      return std::nullopt;
+    }
+  }
+
+  int64_t num_heads = 0;
+  bool has_num_heads = false;
+  std::optional<std::vector<int64_t>> qkv_hidden_sizes;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "num_heads") {
+      num_heads = attr.i();
+      has_num_heads = true;
+    } else if (attr.name() == "qkv_hidden_sizes") {
+      qkv_hidden_sizes =
+          std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    }
+  }
+  if (!has_num_heads || num_heads <= 0) {
+    return std::nullopt;
+  }
+
+  int64_t nq, nk, nv;
+  if (qkv_hidden_sizes) {
+    if (qkv_hidden_sizes->size() != 3) {
+      return std::nullopt;
+    }
+    nq = (*qkv_hidden_sizes)[0];
+    nk = (*qkv_hidden_sizes)[1];
+    nv = (*qkv_hidden_sizes)[2];
+  } else {  // Schema default: Q/K/V evenly split the merged width.
+    if (total_n % 3 != 0) {
+      return std::nullopt;
+    }
+    nq = nk = nv = total_n / 3;
+  }
+  if (nq <= 0 || nk <= 0 || nv <= 0 || nq + nk + nv != total_n ||
+      nq % num_heads != 0 || nk % num_heads != 0 || nv % num_heads != 0) {
+    return std::nullopt;
+  }
+  return AttentionProducerMatch{w_name, bias_name, num_heads, nq, nk, nv};
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyWandaPruning(
@@ -21004,14 +22193,19 @@ onnx::ModelProto ApplyWandaPruning(
     init_map[t.name()] = &t;
   }
 
-  // Exactly ApplySparseGptPruning's own candidate matching -- see this
-  // file's own ApplyWandaPruning declaration comment (structured_pruning_
-  // entry.h) for why the scope is identical: every matched MatMul/vanilla-
-  // Gemm layer (MatchMatMulLikeRaw) with a constant 2-D FLOAT32 weight,
-  // plus every matched com.microsoft::Attention node's constant 2-D
-  // FLOAT32 merged QKV weight (MatchAttentionProducer). 2-D Conv is
-  // declined outright -- never matched by either case below, left
-  // completely untouched.
+  // Like ApplySparseGptPruning's own candidate matching immediately above,
+  // widened to FLOAT32/FLOAT16/BFLOAT16 -- see this file's own
+  // ApplyWandaPruning declaration comment (structured_pruning_entry.h) and
+  // this file's own "Wanda unstructured (element-wise) pruning" section top
+  // comment for the two different widening mechanisms: every matched
+  // MatMul/vanilla-Gemm layer (MatchMatMulLikeRaw) with a constant 2-D
+  // FLOAT/FLOAT16/BFLOAT16 weight (IsSupportedFloatDtype, checked right
+  // here at the call site -- MatchMatMulLikeRaw itself has no dtype gate of
+  // its own), plus every matched com.microsoft::Attention node's constant
+  // 2-D FLOAT/FLOAT16/BFLOAT16 merged QKV weight
+  // (MatchAttentionProducerWideDtype, this pass' own local dtype-widened
+  // copy of MatchAttentionProducer). 2-D Conv is declined outright -- never
+  // matched by either case below, left completely untouched.
   struct Candidate {
     std::string x_name;
     std::string w_name;
@@ -21023,13 +22217,13 @@ onnx::ModelProto ApplyWandaPruning(
     if (mm) {
       auto wit = init_map.find(mm->w_name);
       if (wit != init_map.end() &&
-          wit->second->data_type() == onnx::TensorProto::FLOAT &&
+          IsSupportedFloatDtype(wit->second->data_type()) &&
           wit->second->dims_size() == 2) {
         candidates.push_back({mm->x_name, mm->w_name, mm->weight_transposed});
       }
       continue;
     }
-    auto am = MatchAttentionProducer(node, init_map);
+    auto am = MatchAttentionProducerWideDtype(node, init_map);
     if (am) {
       // The merged QKV weight has no transpose attribute of its own -- it
       // is already [K, N]-shaped by construction (see
@@ -21071,6 +22265,7 @@ onnx::ModelProto ApplyWandaPruning(
     // entirely zeroed), same as the Python original.
     struct Entry {
       onnx::TensorProto* w_init;
+      int32_t dtype = onnx::TensorProto::FLOAT;
       int64_t dim0 = 0;
       int64_t dim1 = 0;
       bool weight_transposed = false;
@@ -21081,10 +22276,12 @@ onnx::ModelProto ApplyWandaPruning(
     entries.reserve(candidates.size());
     for (const auto& c : candidates) {
       onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
+      const int32_t dtype = w_init->data_type();
       const int64_t dim0 = w_init->dims(0);
       const int64_t dim1 = w_init->dims(1);
-      const std::vector<float> w_flat = ReadFloatTensor(*w_init);
-      const std::vector<double> w_f64(w_flat.begin(), w_flat.end());
+      // ReadTensorAsF64 (FLOAT/FLOAT16/BFLOAT16 -> double, exact upcast) --
+      // mirrors pruning.py's own `_to_f64`.
+      const std::vector<double> w_f64 = ReadTensorAsF64(*w_init);
       WandaNK nk = ToWandaNK(w_f64, dim0, dim1, c.weight_transposed);
 
       const std::vector<double>* norm = nullptr;
@@ -21094,7 +22291,7 @@ onnx::ModelProto ApplyWandaPruning(
       }
       std::vector<double> importance =
           WandaImportance(nk.w_nk, nk.n_rows, nk.kk, norm, epsilon);
-      entries.push_back({w_init, dim0, dim1, c.weight_transposed,
+      entries.push_back({w_init, dtype, dim0, dim1, c.weight_transposed,
                          std::move(nk.w_nk), std::move(importance)});
     }
 
@@ -21139,19 +22336,21 @@ onnx::ModelProto ApplyWandaPruning(
         pruned_nk[i] = drop_flat[offset + i] ? 0.0 : e.w_nk[i];
       }
       offset += size;
-      const std::vector<float> w_new =
+      const std::vector<double> w_new =
           FromWandaNK(pruned_nk, e.dim0, e.dim1, e.weight_transposed);
-      SetFloatTensorData(e.w_init, {e.dim0, e.dim1}, w_new);
+      WriteF64TensorAs(e.w_init, e.dtype, {e.dim0, e.dim1}, w_new);
     }
     return out;
   }
 
   for (const auto& c : candidates) {
     onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
+    const int32_t dtype = w_init->data_type();
     const int64_t dim0 = w_init->dims(0);
     const int64_t dim1 = w_init->dims(1);
-    const std::vector<float> w_flat = ReadFloatTensor(*w_init);
-    const std::vector<double> w_f64(w_flat.begin(), w_flat.end());
+    // ReadTensorAsF64 (FLOAT/FLOAT16/BFLOAT16 -> double, exact upcast) --
+    // mirrors pruning.py's own `_to_f64`.
+    const std::vector<double> w_f64 = ReadTensorAsF64(*w_init);
     WandaNK nk = ToWandaNK(w_f64, dim0, dim1, c.weight_transposed);
 
     const std::vector<double>* norm = nullptr;
@@ -21171,9 +22370,9 @@ onnx::ModelProto ApplyWandaPruning(
     for (size_t i = 0; i < pruned_nk.size(); ++i) {
       pruned_nk[i] = mask[i] ? nk.w_nk[i] : 0.0;
     }
-    const std::vector<float> w_new =
+    const std::vector<double> w_new =
         FromWandaNK(pruned_nk, dim0, dim1, c.weight_transposed);
-    SetFloatTensorData(w_init, {dim0, dim1}, w_new);
+    WriteF64TensorAs(w_init, dtype, {dim0, dim1}, w_new);
   }
 
   return out;

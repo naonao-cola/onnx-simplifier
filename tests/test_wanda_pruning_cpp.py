@@ -17,15 +17,20 @@ recomputed).
 
 Scope: this port matches plain ``MatMul``/vanilla-``Gemm`` (not
 ``com.microsoft::FusedGemm``/``GemmFastGelu``) and ``com.microsoft::
-Attention``'s merged QKV weight, FLOAT32 only (not also FLOAT16/BFLOAT16),
-and does NOT match ``Conv`` at all -- see ``structured_pruning_entry.h``'s
-own ``ApplyWandaPruning`` declaration comment for the full scope decision
-and rationale (mirroring ``ApplySparseGptPruning``'s own identical
-decision). The Conv-declined and FLOAT16-declined tests below confirm those
-are handled by leaving the layer alone, not by crashing or by silently
-mishandling the tensor.
+Attention``'s merged QKV weight, each with a constant 2-D (1-D merged bias,
+for Attention) FLOAT32/FLOAT16/BFLOAT16 weight -- TRUE parity with the
+pure-Python ``onnxsim.apply_wanda_pruning`` on this axis -- and does NOT
+match ``Conv`` at all -- see ``structured_pruning_entry.h``'s own
+``ApplyWandaPruning`` declaration comment for the full scope decision and
+rationale (mirroring ``ApplySparseGptPruning``'s own identical Conv
+decision). The Conv-declined test below confirms that gap is handled by
+leaving the layer alone, not by crashing or by silently mishandling the
+tensor; the FLOAT16/BFLOAT16 tests below confirm those dtypes are matched,
+pruned, and written back with their own exact original bit pattern
+preserved for every surviving entry -- not merely "not crashed on".
 """
 
+import ml_dtypes
 import numpy as np
 import onnx
 import onnx.checker
@@ -57,6 +62,14 @@ def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
 
 
+def _f16(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.float16), name)
+
+
+def _bf16(array, name):
+    return onnx.numpy_helper.from_array(array.astype(ml_dtypes.bfloat16), name)
+
+
 def _matmul_model(K=32, N=8, seed=0):
     rng = np.random.default_rng(seed)
     weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
@@ -76,6 +89,21 @@ def _matmul_model(K=32, N=8, seed=0):
 
 def _weight(model, index=0):
     return onnx.numpy_helper.to_array(model.graph.initializer[index])
+
+
+def _magnitude_weight(model, node_index=0, input_index=1):
+    # `onnxsim.apply_magnitude_pruning` is now a thin alias for the C++-backed
+    # `onnxsim.prune_magnitude_cpp`, which leaves the original initializer
+    # dangling and appends a new, anonymously-named one for the pruned
+    # weight (see `tests/test_pruning_cpp.py`'s own `_weight` helper) --
+    # unlike `_weight` above (position-based, still correct for
+    # `apply_wanda_pruning_cpp`'s own in-place-mutating pure-Python
+    # reference), a magnitude-pruning result must be resolved via the
+    # node's CURRENT weight input.
+    node = model.graph.node[node_index]
+    w_name = node.input[input_index]
+    init = next(t for t in model.graph.initializer if t.name == w_name)
+    return onnx.numpy_helper.to_array(init)
 
 
 def _assert_bytewise_close(actual, expected, rtol=1e-5, atol=1e-6):
@@ -313,7 +341,7 @@ def test_wanda_pruning_cpp_no_calibration_batches_falls_back_to_plain_magnitude(
 
     pruned = onnxsim.apply_wanda_pruning_cpp(model, calibration_data=[], sparsity=0.5)
     magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
-    np.testing.assert_array_equal(_weight(pruned), _weight(magnitude_pruned))
+    np.testing.assert_array_equal(_weight(pruned), _magnitude_weight(magnitude_pruned))
     # Actually pruned, not a no-op.
     assert not np.array_equal(_weight(pruned), w)
 
@@ -388,7 +416,7 @@ def test_wanda_pruning_cpp_activation_weighting_differs_from_plain_magnitude():
     magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
 
     w_wanda = _weight(wanda_pruned)
-    w_magnitude = _weight(magnitude_pruned)
+    w_magnitude = _magnitude_weight(magnitude_pruned)
     assert not np.array_equal(w_wanda, w_magnitude)
     # Plain magnitude drops the whole salient_k row (its own tied-smallest
     # entries); Wanda keeps at least one of them thanks to the activation
@@ -426,14 +454,20 @@ def test_wanda_pruning_cpp_conv_is_left_completely_untouched():
     np.testing.assert_array_equal(_weight(pruned), w)
 
 
-def test_wanda_pruning_cpp_fp16_weight_is_left_completely_untouched():
-    # FLOAT16/BFLOAT16 weights are explicitly out of scope for this C++
-    # port (unlike the pure-Python original) -- confirm a FLOAT16 MatMul
-    # weight is declined (left byte-identical), not crashed on or
-    # incorrectly reinterpreted.
+# --- FLOAT16/BFLOAT16 weight support: matches the pure-Python reference ----
+#
+# Unlike the Conv gap above, FLOAT16/BFLOAT16 is now TRUE parity with
+# pruning.py's own `apply_wanda_pruning` -- reads out upcast to float64 via
+# ReadTensorAsF64, importance/masking computed identically to the FLOAT32
+# path, written back down via WriteF64TensorAs, exactly mirroring
+# pruning.py's own `_to_f64`/`_from_f64` round trip (see
+# structured_pruning_entry.h's own ApplyWandaPruning declaration comment).
+
+
+def test_wanda_pruning_cpp_matmul_float16_matches_python_reference():
     K, N = 16, 4
     rng = np.random.default_rng(61)
-    w = (rng.standard_normal((K, N)).astype(np.float32) * 0.5).astype(np.float16)
+    w = (rng.standard_normal((K, N)) * 0.5).astype(np.float16)
     model = _model(
         f"""
         g (float16[batch,{K}] X) => (float16[batch,{N}] Y)
@@ -441,12 +475,108 @@ def test_wanda_pruning_cpp_fp16_weight_is_left_completely_untouched():
           Y = MatMul(X, W)
         }}
         """,
-        initializer=[onnx.numpy_helper.from_array(w, "W")],
+        initializer=[_f16(w, "W")],
     )
+    onnx.checker.check_model(model)
     rng2 = np.random.default_rng(161)
     x_cal = rng2.standard_normal((16, K)).astype(np.float16)
-    pruned = onnxsim.apply_wanda_pruning_cpp(
+
+    expected = onnxsim.apply_wanda_pruning(
         model, calibration_data=[{"X": x_cal}], sparsity=0.5
     )
-    onnx.checker.check_model(pruned)
-    np.testing.assert_array_equal(_weight(pruned), w)
+    actual = onnxsim.apply_wanda_pruning_cpp(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(actual)
+    assert actual.graph.initializer[0].data_type == onnx.TensorProto.FLOAT16
+    # Exact bit-pattern match against the Python reference (not
+    # assert_allclose): both round-trip through float64 and mask, never
+    # recompute, a surviving entry's own value.
+    np.testing.assert_array_equal(
+        _weight(actual).view(np.uint16), _weight(expected).view(np.uint16)
+    )
+    assert not np.array_equal(_weight(actual).view(np.uint16), w.view(np.uint16))
+    assert onnxsim.weight_sparsity(actual) == pytest.approx(0.5, abs=0.1)
+
+
+def test_wanda_pruning_cpp_matmul_bfloat16_matches_python_reference():
+    # onnxruntime has no BFLOAT16 CPU execution support in this environment
+    # (confirmed separately: a plain BFLOAT16 MatMul session raises
+    # NOT_IMPLEMENTED at session-creation time -- see this repo's own
+    # test_magnitude_pruning_bfloat16_preserves_dtype_and_matches_array_
+    # oracle for the same note) -- so calibration_data is deliberately `[]`
+    # (not merely omitted -- omitting it triggers random calibration data
+    # generation, still a real session) rather than a real batch: both
+    # apply_wanda_pruning and apply_wanda_pruning_cpp skip calling the
+    # executor entirely for zero calibration batches (see
+    # WandaCalibrationStats' own top comment) and fall back to plain
+    # per-layer magnitude importance, which is exactly what this test cross-
+    # checks -- the BFLOAT16 candidate-matching/read-upcast/write-downcast
+    # round trip, not the (here environment-unsupported) real activation
+    # capture.
+    K, N = 16, 4
+    rng = np.random.default_rng(62)
+    w = (rng.standard_normal((K, N)) * 0.5).astype(ml_dtypes.bfloat16)
+    model = _model(
+        f"""
+        g (bfloat16[batch,{K}] X) => (bfloat16[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_bf16(w, "W")],
+    )
+    onnx.checker.check_model(model)
+
+    expected = onnxsim.apply_wanda_pruning(model, calibration_data=[], sparsity=0.5)
+    actual = onnxsim.apply_wanda_pruning_cpp(model, calibration_data=[], sparsity=0.5)
+    onnx.checker.check_model(actual)
+    assert actual.graph.initializer[0].data_type == onnx.TensorProto.BFLOAT16
+    np.testing.assert_array_equal(
+        _weight(actual).view(np.uint16), _weight(expected).view(np.uint16)
+    )
+    assert not np.array_equal(_weight(actual).view(np.uint16), w.view(np.uint16))
+    assert onnxsim.weight_sparsity(actual) == pytest.approx(0.5, abs=0.1)
+
+
+def test_wanda_pruning_cpp_attention_merged_qkv_float16_matches_python_reference():
+    # FLOAT16 analogue of test_wanda_pruning_cpp_attention_merged_qkv_
+    # matches_python_reference -- exercises MatchAttentionProducerWideDtype
+    # (this pass' own local, dtype-widened copy of MatchAttentionProducer),
+    # not just the MatMul/Gemm candidate path.
+    hidden = 16
+    nq = nk = nv = 8
+    total_n = nq + nk + nv
+    num_heads = 2
+    rng = np.random.default_rng(63)
+    w_qkv = (rng.standard_normal((hidden, total_n)) * 0.3).astype(np.float16)
+    bias = (rng.standard_normal((total_n,)) * 0.05).astype(np.float16)
+    model = _model(
+        f"""
+        g (float16[batch,seq,{hidden}] X) => (float16[batch,seq,{nv}] Y)
+        {{
+          Y, present = com.microsoft.Attention <num_heads={num_heads}>(X, Wqkv, Bqkv)
+        }}
+        """,
+        initializer=[_f16(w_qkv, "Wqkv"), _f16(bias, "Bqkv")],
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    onnx.checker.check_model(model)
+    rng2 = np.random.default_rng(163)
+    x_cal = rng2.standard_normal((3, 5, hidden)).astype(np.float16)
+
+    expected = onnxsim.apply_wanda_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    actual = onnxsim.apply_wanda_pruning_cpp(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(actual)
+    assert actual.graph.initializer[0].data_type == onnx.TensorProto.FLOAT16
+    np.testing.assert_array_equal(
+        _weight(actual).view(np.uint16), _weight(expected).view(np.uint16)
+    )
+    assert not np.array_equal(_weight(actual).view(np.uint16), w_qkv.view(np.uint16))
+    # Bias is never touched by unstructured/N:M pruning -- byte-identical.
+    np.testing.assert_array_equal(_weight(actual, index=1), bias)
+    assert onnxsim.weight_sparsity(actual) == pytest.approx(0.5, abs=0.1)

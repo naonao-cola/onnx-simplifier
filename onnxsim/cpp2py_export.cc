@@ -628,38 +628,55 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "model_bytes"_a);
 
   // Magnitude pruning (Han et al., 2015): zeros the least-magnitude entries
-  // of every MatMul/vanilla-Gemm/Conv layer's constant weight, independently
-  // per output row/filter. Data-free. See PruneMagnitude in onnxsim.h.
+  // of every MatMul/vanilla-Gemm/Conv/com.microsoft::Attention layer's
+  // constant weight, independently per output row/filter. Data-free.
+  // `n`/`m` are `None` (unstructured, ranked by `sparsity`) or both given
+  // together (N:M semi-structured). `global_sparsity` pools every matched
+  // layer's importance into one whole-model ranking; incompatible with
+  // `n`/`m`. Same `n`/`m`/`global_sparsity` shape as apply_wanda_pruning's
+  // own binding above. See PruneMagnitude in onnxsim.h.
   m.def(
       "prune_magnitude",
-      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+      [](const py::bytes& model_proto_bytes, double sparsity,
+         std::optional<int64_t> n, std::optional<int64_t> m,
+         bool global_sparsity) -> py::bytes {
         InitEnv();
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
-        const auto result = PruneMagnitude(model, sparsity);
+        const auto result =
+            PruneMagnitude(model, sparsity, n, m, global_sparsity);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
       },
-      "model_bytes"_a, "sparsity"_a);
+      "model_bytes"_a, "sparsity"_a, "n"_a.none(), "m"_a.none(),
+      "global_sparsity"_a = false);
 
   // Structured (channel) pruning: removes whole output channels from
   // MatMul/vanilla-Gemm and Conv layers -- real structural pruning, not
-  // just value-only zeroing. See ApplyStructuredPruning in onnxsim.h.
+  // just value-only zeroing. See ApplyStructuredPruning in
+  // structured_pruning_entry.h. `importance_norm` ("l1"/"l2") and
+  // `global_sparsity` mirror pruning.py's own `apply_structured_pruning`
+  // parameters of the same names exactly -- see that function's own
+  // declaration comment.
   m.def(
       "apply_structured_pruning",
-      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+      [](const py::bytes& model_proto_bytes, double sparsity,
+         const std::string& importance_norm,
+         bool global_sparsity) -> py::bytes {
         InitEnv();
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
-        const auto result = ApplyStructuredPruning(model, sparsity);
+        const auto result = ApplyStructuredPruning(
+            model, sparsity, importance_norm, global_sparsity);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
       },
-      "model_bytes"_a, "sparsity"_a);
+      "model_bytes"_a, "sparsity"_a, "importance_norm"_a = "l2",
+      "global_sparsity"_a = false);
 
   // The calibration-driven (Wanda-style) upgrade of apply_structured_pruning
   // above -- same executor-as-first-argument shape as `simplify`'s own
@@ -682,36 +699,41 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
          const py::bytes& model_proto_bytes,
          std::vector<std::unordered_map<std::string, onnx::TensorProto>>
              calibration_data,
-         double sparsity, double epsilon) -> py::bytes {
+         double sparsity, double epsilon, const std::string& importance_norm,
+         bool global_sparsity) -> py::bytes {
         InitEnv();
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
         const auto result = ApplyStructuredWandaPruning(
-            model, *executor, calibration_data, sparsity, epsilon);
+            model, *executor, calibration_data, sparsity, epsilon,
+            importance_norm, global_sparsity);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
-      "epsilon"_a = 1e-8);
+      "epsilon"_a = 1e-8, "importance_norm"_a = "l2",
+      "global_sparsity"_a = false);
 
   // Attention-head pruning: removes whole attention heads (or, for
   // grouped-query attention, whole KV groups) from every matched fused
   // self-attention block. See ApplyAttentionHeadPruning in onnxsim.h.
   m.def(
       "apply_attention_head_pruning",
-      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+      [](const py::bytes& model_proto_bytes, double sparsity,
+         const std::string& importance_norm) -> py::bytes {
         InitEnv();
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
-        const auto result = ApplyAttentionHeadPruning(model, sparsity);
+        const auto result =
+            ApplyAttentionHeadPruning(model, sparsity, importance_norm);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
       },
-      "model_bytes"_a, "sparsity"_a);
+      "model_bytes"_a, "sparsity"_a, "importance_norm"_a = "l2");
 
   // The calibration-driven (Wanda-style) upgrade of
   // apply_attention_head_pruning above -- same executor-as-first-argument
@@ -726,36 +748,38 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
          const py::bytes& model_proto_bytes,
          std::vector<std::unordered_map<std::string, onnx::TensorProto>>
              calibration_data,
-         double sparsity, double epsilon) -> py::bytes {
+         double sparsity, double epsilon,
+         const std::string& importance_norm) -> py::bytes {
         InitEnv();
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
-        const auto result = ApplyAttentionHeadWandaPruning(
-            model, *executor, calibration_data, sparsity, epsilon);
+        const auto result =
+            ApplyAttentionHeadWandaPruning(model, *executor, calibration_data,
+                                           sparsity, epsilon, importance_norm);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
-      "epsilon"_a = 1e-8);
+      "epsilon"_a = 1e-8, "importance_norm"_a = "l2");
 
   // SparseGPT (Frantar & Alistarh, 2023) unstructured/N:M pruning: zeros
   // the least-important entries of every matched MatMul/vanilla-Gemm/
   // com.microsoft::Attention merged-QKV-weight layer's constant 2-D
-  // FLOAT32 weight, using a sequential, Hessian-error-compensating
-  // algorithm (GPTQ's own Cholesky-factored inverse Hessian reformulation)
-  // rather than a one-shot static importance score -- unlike every pass
-  // above, this never changes any tensor's shape, only individual weight
-  // entries' own values. Same executor-as-first-argument,
+  // FLOAT32/FLOAT16/BFLOAT16 weight, using a sequential, Hessian-error-
+  // compensating algorithm (GPTQ's own Cholesky-factored inverse Hessian
+  // reformulation) rather than a one-shot static importance score --
+  // unlike every pass above, this never changes any tensor's shape, only
+  // individual weight entries' own values. Same executor-as-first-argument,
   // `calibration_data` (List[Dict[str, onnx.TensorProto]]) crossing
   // convention as apply_structured_wanda_pruning's own binding above (see
   // that binding's own comment for the full calibration-crossing design).
   // `n`/`m` are `None` (unstructured, ranked by `sparsity`) or both given
   // together (N:M semi-structured). See ApplySparseGptPruning in
-  // structured_pruning_entry.h for the full scope (in particular: FLOAT32-
-  // only, and 2-D Conv is NOT matched -- a deliberate, documented
-  // narrower-than-pruning.py scope decision).
+  // structured_pruning_entry.h for the full scope (in particular: 2-D Conv
+  // is NOT matched -- a deliberate, documented narrower-than-pruning.py
+  // scope decision, and the only remaining one).
   m.def(
       "apply_sparsegpt_pruning",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -781,21 +805,22 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
 
   // Wanda pruning (Sun et al., 2023): the calibration-driven upgrade of
   // magnitude pruning's data-free baseline, zeroing the least-important
-  // entries of every matched layer's constant 2-D FLOAT32 weight to an
-  // unstructured or N:M sparsity pattern using ``|W_ij| * ||X_j||_2``
-  // (weight magnitude times its reduction-dimension entry's calibrated
-  // activation L2-norm) as the importance metric -- a one-shot static
-  // score, unlike apply_sparsegpt_pruning's own sequential Hessian-error-
-  // compensating algorithm. Same candidate set/scope (FLOAT32-only, no
-  // Conv) and same executor-as-first-argument, `calibration_data`
-  // (List[Dict[str, onnx.TensorProto]]) crossing convention as
-  // apply_sparsegpt_pruning's own binding above. See ApplyWandaPruning in
-  // structured_pruning_entry.h for the full scope and the data-free
-  // magnitude fallback an unobserved layer gets (unlike SparseGPT, which
-  // has none). `global_sparsity` pools every matched layer's importance
-  // into one whole-model ranking, mirroring apply_structured_wanda_
-  // pruning's own `sparsity`-only mode's structural analogue; incompatible
-  // with `n`/`m`.
+  // entries of every matched layer's constant 2-D FLOAT32/FLOAT16/BFLOAT16
+  // weight to an unstructured or N:M sparsity pattern using
+  // ``|W_ij| * ||X_j||_2`` (weight magnitude times its reduction-dimension
+  // entry's calibrated activation L2-norm) as the importance metric -- a
+  // one-shot static score, unlike apply_sparsegpt_pruning's own sequential
+  // Hessian-error-compensating algorithm. Same candidate set as
+  // apply_sparsegpt_pruning's own binding above except widened to
+  // FLOAT32/FLOAT16/BFLOAT16 (still no Conv -- the one remaining gap vs.
+  // pruning.py's own apply_wanda_pruning), and same executor-as-first-
+  // argument, `calibration_data` (List[Dict[str, onnx.TensorProto]])
+  // crossing convention. See ApplyWandaPruning in structured_pruning_
+  // entry.h for the full scope and the data-free magnitude fallback an
+  // unobserved layer gets (unlike SparseGPT, which has none).
+  // `global_sparsity` pools every matched layer's importance into one
+  // whole-model ranking, mirroring apply_structured_wanda_pruning's own
+  // `sparsity`-only mode's structural analogue; incompatible with `n`/`m`.
   m.def(
       "apply_wanda_pruning",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1008,17 +1033,18 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // onnxsim.h.
   m.def(
       "apply_quarot",
-      [](const py::bytes& model_proto_bytes, uint64_t seed) -> py::bytes {
+      [](const py::bytes& model_proto_bytes, uint64_t seed, int64_t block_size,
+         float epsilon) -> py::bytes {
         InitEnv();
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
-        const auto result = ApplyQuarot(model, seed);
+        const auto result = ApplyQuarot(model, seed, block_size, epsilon);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
       },
-      "model_bytes"_a, "seed"_a);
+      "model_bytes"_a, "seed"_a, "block_size"_a = 32, "epsilon"_a = 1e-12f);
 
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.

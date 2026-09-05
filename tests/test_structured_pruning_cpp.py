@@ -8779,3 +8779,188 @@ def test_cpp_dynamic_quantize_matmul_matches_python_reference():
     py_bytes = {t.name: t.SerializeToString() for t in pruned_py.graph.initializer}
     cpp_bytes = {t.name: t.SerializeToString() for t in pruned_cpp.graph.initializer}
     assert py_bytes == cpp_bytes
+
+
+# --- importance_norm ("l1" vs "l2") and global_sparsity ---------------------
+#
+# Adapted from test_pruning.py's own `test_structured_pruning_l1_norm_favors_
+# total_magnitude_single_producer` and `test_structured_pruning_global_
+# sparsity_redistributes_across_chains_and_matches_oracle`: adversarial
+# weight layouts/scales engineered so the new parameter provably changes
+# which channels survive, cross-checked byte-for-byte against the verified
+# pure-Python reference.
+
+
+def test_cpp_structured_pruning_importance_norm_l1_matches_python_reference_and_differs_from_l2():
+    # Column "concentrated": one entry of magnitude 8, rest zero -- L2 == L1
+    # == 8. Column "spread": all 16 entries == 1 -- L2 = 4, L1 = 16. L2 ranks
+    # "concentrated" above "spread"; L1 ranks "spread" above "concentrated" --
+    # a genuine disagreement a correct L1 port must reproduce, not merely
+    # score differently. "filler_high"/"filler_low" pin the other surviving
+    # slot under either norm.
+    K, H, Out = 16, 4, 3
+    w1 = np.zeros((K, H), dtype=np.float32)
+    w1[0, 0] = 8.0  # "concentrated"
+    w1[:, 1] = 1.0  # "spread"
+    w1[2, 2] = 1000.0  # "filler_high"
+    w1[3, 3] = 0.001  # "filler_low"
+    rng = np.random.default_rng(90)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          a = Relu(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    onnx.checker.check_model(model)
+
+    for norm in ("l2", "l1"):
+        pruned_cpp = onnxsim.apply_structured_pruning_cpp(
+            model, sparsity=0.5, importance_norm=norm
+        )
+        pruned_py = onnxsim.apply_structured_pruning(
+            model, sparsity=0.5, importance_norm=norm
+        )
+        onnx.checker.check_model(pruned_cpp)
+        assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    kept_l2 = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    kept_l1 = onnxsim.apply_structured_pruning_cpp(
+        model, sparsity=0.5, importance_norm="l1"
+    )
+    # "l2" keeps {concentrated, filler_high}, "l1" keeps {spread,
+    # filler_high} -- a real flip in which column survives, not just score.
+    assert kept_l2.SerializeToString() != kept_l1.SerializeToString()
+
+
+def _two_scale_mlp_model(K=8, H=16, Out=4, big_scale=50.0, small_scale=1.0, seed=0):
+    # Two independent, ordinary (single-producer, group=1) MLP chains
+    # sharing one input, at very different weight-magnitude scales -- the
+    # adversarial case `global_sparsity` exists for: the default per-chain
+    # mode cuts both to the same channel *count* regardless of scale, while
+    # `global_sparsity` redistributes toward the uniformly-smaller chain.
+    rng = np.random.default_rng(seed)
+    w1_big = (rng.standard_normal((K, H)) * big_scale).astype(np.float32)
+    w2_big = rng.standard_normal((H, Out)).astype(np.float32)
+    w1_small = (rng.standard_normal((K, H)) * small_scale).astype(np.float32)
+    w2_small = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Ybig, float[batch,{Out}] Ysmall)
+        {{
+          hbig = MatMul(X, W1big)
+          abig = Relu(hbig)
+          Ybig = MatMul(abig, W2big)
+          hsmall = MatMul(X, W1small)
+          asmall = Relu(hsmall)
+          Ysmall = MatMul(asmall, W2small)
+        }}
+        """,
+        initializer=[
+            _f32(w1_big, "W1big"),
+            _f32(w2_big, "W2big"),
+            _f32(w1_small, "W1small"),
+            _f32(w2_small, "W2small"),
+        ],
+    )
+    return model
+
+
+def test_cpp_structured_pruning_global_sparsity_matches_python_reference_and_redistributes():
+    K, H, Out = 8, 16, 4
+    sparsity = 0.5
+    model = _two_scale_mlp_model(
+        K=K, H=H, Out=Out, big_scale=50.0, small_scale=0.5, seed=7
+    )
+    onnx.checker.check_model(model)
+
+    local_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=sparsity)
+    global_cpp = onnxsim.apply_structured_pruning_cpp(
+        model, sparsity=sparsity, global_sparsity=True
+    )
+    global_py = onnxsim.apply_structured_pruning(
+        model, sparsity=sparsity, global_sparsity=True
+    )
+    onnx.checker.check_model(global_cpp)
+    assert global_cpp.SerializeToString() == global_py.SerializeToString()
+
+    inits_local = {t.name: t for t in local_cpp.graph.initializer}
+    inits_global = {t.name: t for t in global_cpp.graph.initializer}
+
+    # Per-chain-uniform (default) mode: both chains cut to the same count.
+    assert inits_local["W1big"].dims[1] == H // 2
+    assert inits_local["W1small"].dims[1] == H // 2
+    # global_sparsity mode: the uniformly-larger chain keeps strictly more
+    # channels than the uniformly-smaller one -- provably different from the
+    # local, non-global default above.
+    big_kept = inits_global["W1big"].dims[1]
+    small_kept = inits_global["W1small"].dims[1]
+    assert big_kept > H // 2 > small_kept
+
+
+def test_cpp_structured_pruning_global_sparsity_and_importance_norm_l1_together_matches_python_reference():
+    # Both new parameters at once -- global_sparsity's pooled ranking must
+    # itself be computed with the requested importance_norm (see
+    # ApplyChainsGlobal's own `importance_norm` threading), not silently
+    # fall back to L2.
+    K, H, Out = 8, 16, 4
+    sparsity = 0.5
+    model = _two_scale_mlp_model(
+        K=K, H=H, Out=Out, big_scale=50.0, small_scale=0.5, seed=11
+    )
+    onnx.checker.check_model(model)
+
+    for norm in ("l2", "l1"):
+        pruned_cpp = onnxsim.apply_structured_pruning_cpp(
+            model, sparsity=sparsity, importance_norm=norm, global_sparsity=True
+        )
+        pruned_py = onnxsim.apply_structured_pruning(
+            model, sparsity=sparsity, importance_norm=norm, global_sparsity=True
+        )
+        onnx.checker.check_model(pruned_cpp)
+        assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_structured_pruning_global_sparsity_leaves_gated_ffn_chain_untouched():
+    # A gated (SwiGLU) pair's two producers must agree on one shared `keep`
+    # set already -- ineligible for global_sparsity's own pooled ranking
+    # (see ChainIsGlobalSparsityEligible), so the whole chain is left
+    # completely untouched in this mode, exactly like any other topology
+    # this pass can't prove safe to pool.
+    h, inter, out_dim = 8, 6, 4
+    rng = np.random.default_rng(12)
+    w_gate = rng.standard_normal((h, inter)).astype(np.float32)
+    w_up = rng.standard_normal((h, inter)).astype(np.float32)
+    w_down = rng.standard_normal((inter, out_dim)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{h}] X) => (float[batch,{out_dim}] Y)
+        {{
+          gate = MatMul(X, Wgate)
+          act = Sigmoid(gate)
+          up = MatMul(X, Wup)
+          prod = Mul(act, up)
+          Y = MatMul(prod, Wdown)
+        }}
+        """,
+        initializer=[
+            _f32(w_gate, "Wgate"),
+            _f32(w_up, "Wup"),
+            _f32(w_down, "Wdown"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(
+        model, sparsity=0.5, global_sparsity=True
+    )
+    pruned_py = onnxsim.apply_structured_pruning(
+        model, sparsity=0.5, global_sparsity=True
+    )
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
+    assert pruned_py.SerializeToString() == model.SerializeToString()

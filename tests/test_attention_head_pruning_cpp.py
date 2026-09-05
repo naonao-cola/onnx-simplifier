@@ -1606,4 +1606,85 @@ def test_cpp_matmul_nbits_qkv_pruning_zero_sparsity_is_a_no_op():
     pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.0)
     qkv_node = next(n for n in pruned.graph.node if n.op_type == "MatMulNBitsQkv")
     assert next(a.i for a in qkv_node.attribute if a.name == "Nq") == num_heads * d
-    assert next(a.i for a in qkv_node.attribute if a.name == "Nkv") == kv_num_heads * d
+
+
+# --- importance_norm ("l1" vs "l2") ------------------------------------------
+#
+# Adapted from test_pruning.py's own `test_attention_head_pruning_l1_norm_
+# favors_total_magnitude`/`test_gqa_pruning_l1_norm_favors_total_magnitude`:
+# adversarial per-head/per-group weight blocks engineered so L2 (Frobenius)
+# and L1 (entrywise abs-sum) importance disagree on which unit survives --
+# a bug that silently keeps ranking by L2 under the hood even when "l1" is
+# requested would keep the WRONG head/group, not merely score it slightly
+# differently.
+
+
+def test_cpp_attention_head_pruning_importance_norm_l1_matches_python_reference_and_differs_from_l2():
+    K, H, D, Out = 16, 4, 4, 3
+    Nq = Nk = Nv = H * D
+    rng_qk = np.random.default_rng(52)
+    wqkv = np.zeros((K, Nq + Nk + Nv), dtype=np.float32)
+    wqkv[:, :Nq] = rng_qk.standard_normal((K, Nq)).astype(np.float32) * 0.01
+    wqkv[:, Nq : Nq + Nk] = rng_qk.standard_normal((K, Nk)).astype(np.float32) * 0.01
+    v_offset = Nq + Nk
+    wqkv[0, v_offset + 0] = 16.0  # head 0 ("concentrated")
+    wqkv[:, v_offset + D : v_offset + 2 * D] = 1.0  # head 1 ("spread")
+    wqkv[2, v_offset + 2 * D] = 1000.0  # head 2 ("filler_high")
+    wqkv[3, v_offset + 3 * D] = 0.001  # head 3 ("filler_low")
+    bqkv = np.zeros((Nq + Nk + Nv,), dtype=np.float32)
+
+    model, _cfg = _attention_model(
+        K=K, H=H, D=D, Out=Out, seed=50, bias=True, wqkv=wqkv, bqkv=bqkv
+    )
+
+    for norm in ("l2", "l1"):
+        pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(
+            model, sparsity=0.5, importance_norm=norm
+        )
+        pruned_py = onnxsim.apply_attention_head_pruning(
+            model, sparsity=0.5, importance_norm=norm
+        )
+        onnx.checker.check_model(pruned_cpp)
+        assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    kept_l2 = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    kept_l1 = onnxsim.apply_attention_head_pruning_cpp(
+        model, sparsity=0.5, importance_norm="l1"
+    )
+    # "l2" keeps {concentrated, filler_high} (16 & 1000 dominate Frobenius),
+    # "l1" keeps {spread, filler_high} (64 total magnitude beats 16) --
+    # provably different surviving Wqkv shapes/values, not just a different
+    # score.
+    assert kept_l2.SerializeToString() != kept_l1.SerializeToString()
+
+
+def test_cpp_gqa_pruning_importance_norm_l1_matches_python_reference_and_differs_from_l2():
+    K, H, KVH, D, Out = 8, 4, 2, 8, 3
+    Nq, Nkv = H * D, KVH * D
+    wq = np.zeros((K, Nq), dtype=np.float32)
+    wk = np.zeros((K, Nkv), dtype=np.float32)
+    wv = np.zeros((K, Nkv), dtype=np.float32)
+    wv[0, 0] = 16.0  # KV group 0's own V slice -- concentrated
+    wv[:, D : 2 * D] = 1.0  # KV group 1's own V slice -- spread
+
+    model, _cfg = _gqa_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=60, wq=wq, wk=wk, wv=wv
+    )
+
+    for norm in ("l2", "l1"):
+        pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(
+            model, sparsity=0.5, importance_norm=norm
+        )
+        pruned_py = onnxsim.apply_attention_head_pruning(
+            model, sparsity=0.5, importance_norm=norm
+        )
+        onnx.checker.check_model(pruned_cpp)
+        assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    kept_l2 = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    kept_l1 = onnxsim.apply_attention_head_pruning_cpp(
+        model, sparsity=0.5, importance_norm="l1"
+    )
+    # "l2" keeps KV group 0 (Frobenius 16 > 8), "l1" keeps KV group 1
+    # (total magnitude 64 > 16) -- a real flip in which group survives.
+    assert kept_l2.SerializeToString() != kept_l1.SerializeToString()

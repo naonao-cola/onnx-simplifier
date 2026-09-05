@@ -21,7 +21,7 @@ import onnxsim.onnxsim_cpp2py_export as C
 
 from . import backend, model_checking, model_info, profile_merge, version
 from .calibration import Tensors, generate_random_calibration_data
-from .pruning import EmbeddingPruningResult
+from .pruning import EmbeddingPruningResult, _ImportanceNorm
 
 TensorShape = List[int]
 TensorShapes = Dict[str, TensorShape]
@@ -1216,41 +1216,60 @@ def apply_double_quantization_cpp(
 def prune_magnitude_cpp(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
+    n: Optional[int] = None,
+    m: Optional[int] = None,
+    global_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """
     C++-backed port of :func:`onnxsim.apply_magnitude_pruning`: zeros the
     least-magnitude entries of every MatMul/vanilla-Gemm layer's constant
-    2-D float32 weight, and every Conv layer's constant 4-D float32 weight
-    (ordinary, depthwise, and general grouped Conv alike) -- the data-free
-    unstructured pruning baseline (Han et al., 2015).
+    2-D FLOAT/FLOAT16/BFLOAT16 weight, every Conv layer's constant 4-D
+    FLOAT/FLOAT16/BFLOAT16 weight (ordinary, depthwise, and general grouped
+    Conv alike), and every ``com.microsoft::Attention`` node's constant 2-D
+    FLOAT/FLOAT16/BFLOAT16 merged QKV weight -- the data-free unstructured
+    pruning baseline (Han et al., 2015). Full parity with the pure-Python
+    :func:`onnxsim.apply_magnitude_pruning`.
 
     Within each output row (or, for Conv, each output filter), keeps the
     ``max(1, round(cols * (1 - sparsity)))`` highest-magnitude entries and
     zeros the rest, so a layer with row-dependent weight scale doesn't get
     some rows pruned to nothing and others left untouched.
 
-    Unlike the pure-Python :func:`onnxsim.apply_magnitude_pruning`, this
-    does not match ``com.microsoft::Attention``'s merged QKV weight, and
-    offers only the sparsity-ratio mode (no N:M semi-structured pruning).
-
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
-    Layers with a non-constant, non-2-D (MatMul/Gemm), or non-4-D (Conv)
-    weight are left untouched.
+    Layers with a non-constant, non-2-D (MatMul/Gemm/Attention), or non-4-D
+    (Conv) weight are left untouched.
 
     :param model: onnx ModelProto object or file path
-    :param sparsity: target fraction of each row's entries to zero; must be
-            in ``[0, 1)``
+    :param sparsity: target fraction of each row's (or, for Conv, each
+            output filter's) entries to zero, ignored when ``n``/``m`` are
+            given -- or, when `global_sparsity`, target fraction of every
+            matched layer's entries *combined*
+    :param n: keep the ``n`` highest-magnitude entries per group of ``m``
+            (semi-structured N:M pruning, e.g. NVIDIA's 2:4). Must be given
+            together with ``m``; incompatible with `global_sparsity`.
+    :param m: group size for N:M pruning; see ``n``
+    :param global_sparsity: the classic "global magnitude pruning" variant
+            (Han et al., 2015): pools every matched layer's ``|W|`` entries
+            into one ranking across the whole model and zeros exactly
+            `sparsity`'s fraction of that pooled total, wherever it lands
+            (no per-row/per-layer floor -- see
+            :func:`onnxsim.apply_magnitude_pruning`'s own docstring).
+            Incompatible with ``n``/``m``.
     :returns: ``model`` with every matched layer's weight pruned in place
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    return onnx.load_from_string(C.prune_magnitude(model.SerializeToString(), sparsity))
+    return onnx.load_from_string(
+        C.prune_magnitude(model.SerializeToString(), sparsity, n, m, global_sparsity)
+    )
 
 
 def apply_structured_pruning_cpp(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+    global_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """
     C++-backed port of :func:`onnxsim.apply_structured_pruning`: removes
@@ -1340,8 +1359,30 @@ def apply_structured_pruning_cpp(
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched producer's output
-            channels to remove (at least one channel is always kept); must
-            be in ``[0, 1)``
+            channels to remove (at least one channel is always kept) -- or,
+            when ``global_sparsity``, target fraction of every eligible
+            chain's channels *combined*; must be in ``[0, 1)``
+    :param importance_norm: ``"l2"`` (default, unchanged from before this
+            parameter existed) ranks by Li et al.'s own root-sum-square L2
+            criterion; ``"l1"`` ranks by NNI's alternative L1 criterion
+            (sum of absolute weight magnitude) instead -- mirrors the
+            pure-Python :func:`onnxsim.apply_structured_pruning`'s own
+            ``importance_norm`` parameter exactly. Applies identically
+            whether or not ``global_sparsity`` is set.
+    :param global_sparsity: pools every *eligible* matched chain's own
+            per-channel importance into one ranking across the whole model
+            and picks a single keep-count from ``sparsity``'s fraction of
+            that pooled total, instead of every chain being cut by the same
+            fraction independently -- mirrors the pure-Python
+            :func:`onnxsim.apply_structured_pruning`'s own
+            ``global_sparsity`` mode exactly, including which chains are
+            "eligible" (an ordinary, single-producer chain with no extra
+            fan-out consumer branch and no general grouped Conv on either
+            side -- a gated pair, a residual/merge group, a
+            ``Concat``-merged branch, and any general grouped Conv chain
+            are all left completely untouched in this mode instead) and the
+            per-chain floor of at least one surviving channel. Default
+            ``False`` -- every pre-existing caller's behavior is unchanged.
     :returns: ``model`` with every matched chain's tensors resized in place;
             anything not matching the exact topology above (branching, a
             non-constant bias, a consumer whose reduction dimension doesn't
@@ -1350,7 +1391,9 @@ def apply_structured_pruning_cpp(
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
     return onnx.load_from_string(
-        C.apply_structured_pruning(model.SerializeToString(), sparsity)
+        C.apply_structured_pruning(
+            model.SerializeToString(), sparsity, importance_norm, global_sparsity
+        )
     )
 
 
@@ -1360,8 +1403,10 @@ def apply_structured_wanda_pruning_cpp(
     num_samples: int = 8,
     seed: int = 0,
     sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
     epsilon: float = 1e-8,
     providers: Optional[Sequence[backend.Provider]] = None,
+    global_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """
     C++-backed port of :func:`onnxsim.apply_structured_wanda_pruning`: the
@@ -1408,8 +1453,15 @@ def apply_structured_wanda_pruning_cpp(
     :param seed: seed for the random calibration data (ignored if
             ``calibration_data`` is supplied)
     :param sparsity: target fraction of each matched chain's output
-            channels to remove (at least one channel is always kept); must
-            be in ``[0, 1)``
+            channels to remove (at least one channel is always kept) -- or,
+            when ``global_sparsity``, target fraction of every eligible
+            chain's channels *combined*; must be in ``[0, 1)``
+    :param importance_norm: ``"l2"`` (default) or ``"l1"`` -- selects the
+            *weight*-magnitude term ``||W_row||`` only, exactly as it does
+            for :func:`onnxsim.apply_structured_pruning_cpp`; the
+            *activation*-norm term ``||X||_2`` stays L2 unconditionally
+            either way, per Wanda's own ``|W_ij| * ||X_j||_2`` definition.
+            Applies identically whether or not ``global_sparsity`` is set.
     :param epsilon: floor applied to the accumulated per-channel activation
             norm, avoiding every channel of an all-zero activation tying at
             exactly the weight-only importance
@@ -1417,12 +1469,20 @@ def apply_structured_wanda_pruning_cpp(
             when capturing calibration activations (passed to the shared
             :func:`onnxsim.onnx_simplifier._get_model_executor` process-wide
             executor, the same one :func:`onnxsim.simplify` itself uses)
+    :param global_sparsity: the structural analogue of
+            :func:`onnxsim.apply_structured_pruning_cpp`'s own
+            ``global_sparsity`` mode, applied to this function's own
+            ``||W_row||_2 * ||X||_2`` metric -- see that function's own
+            docstring for the full mechanism, the per-chain floor, and
+            exactly which chains are "eligible" to take part in the pool.
+            Default ``False`` -- every pre-existing caller's behavior is
+            unchanged.
     :returns: ``model`` with every matched chain's tensors resized in place;
             anything not matching that exact topology falls back to
             :func:`onnxsim.apply_structured_pruning_cpp`'s own plain
-            L2-norm ranking if no matching activation was ever observed for
-            that chain's consumer (including whenever ``calibration_data``
-            is empty)
+            weight-magnitude ranking if no matching activation was ever
+            observed for that chain's consumer (including whenever
+            ``calibration_data`` is empty)
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -1451,6 +1511,8 @@ def apply_structured_wanda_pruning_cpp(
             calibration_data_pb,
             sparsity,
             epsilon,
+            importance_norm,
+            global_sparsity,
         )
     )
 
@@ -1458,6 +1520,7 @@ def apply_structured_wanda_pruning_cpp(
 def apply_attention_head_pruning_cpp(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
 ) -> onnx.ModelProto:
     """
     C++-backed port of :func:`onnxsim.apply_attention_head_pruning`: removes
@@ -1503,6 +1566,12 @@ def apply_attention_head_pruning_cpp(
     :param sparsity: target fraction of each matched block's heads (or, for
             GroupQueryAttention/plain ai.onnx Attention, KV groups) to
             remove (at least one is always kept); must be in ``[0, 1)``
+    :param importance_norm: ``"l2"`` (default, unchanged from before this
+            parameter existed) ranks by the combined Frobenius (L2) norm of
+            each head's/KV group's own weight block, mirroring the
+            pure-Python :func:`onnxsim.apply_attention_head_pruning`'s own
+            default; ``"l1"`` ranks by the sum of absolute weight magnitude
+            across that same block instead.
     :returns: ``model`` with every matched block's tensors resized in
             place; anything not matching that exact topology (a
             non-constant weight, a packed-QKV GroupQueryAttention node, a
@@ -1516,7 +1585,9 @@ def apply_attention_head_pruning_cpp(
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
     return onnx.load_from_string(
-        C.apply_attention_head_pruning(model.SerializeToString(), sparsity)
+        C.apply_attention_head_pruning(
+            model.SerializeToString(), sparsity, importance_norm
+        )
     )
 
 
@@ -1526,6 +1597,7 @@ def apply_attention_head_wanda_pruning_cpp(
     num_samples: int = 8,
     seed: int = 0,
     sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
     epsilon: float = 1e-8,
     providers: Optional[Sequence[backend.Provider]] = None,
 ) -> onnx.ModelProto:
@@ -1571,6 +1643,10 @@ def apply_attention_head_wanda_pruning_cpp(
     :param sparsity: target fraction of each matched block's heads (or, for
             GroupQueryAttention/plain ai.onnx Attention, KV groups) to
             remove (at least one is always kept); must be in ``[0, 1)``
+    :param importance_norm: ``"l2"`` (default) or ``"l1"`` -- selects the
+            *weight*-magnitude term only, exactly as it does for
+            :func:`onnxsim.apply_attention_head_pruning_cpp`; the
+            *activation*-norm term stays L2 unconditionally either way.
     :param epsilon: floor applied to the accumulated per-unit activation
             norm, avoiding every unit of an all-zero activation tying at
             exactly the weight-only importance
@@ -1607,6 +1683,7 @@ def apply_attention_head_wanda_pruning_cpp(
             calibration_data_pb,
             sparsity,
             epsilon,
+            importance_norm,
         )
     )
 
@@ -1643,17 +1720,22 @@ def apply_sparsegpt_pruning_cpp(
     independently, with no producer/consumer chain-walking at all.
 
     Matches every plain ``MatMul``/vanilla-``Gemm`` node with a constant 2-D
-    FLOAT32 weight (this already includes ``com.microsoft::
+    FLOAT32/FLOAT16/BFLOAT16 weight (this already includes ``com.microsoft::
     GroupQueryAttention``'s own separate Q/K/V projections -- ordinary
     MatMul/Gemm nodes feeding it, not a weight the op itself owns), plus
-    every ``com.microsoft::Attention`` node's constant 2-D FLOAT32 merged
-    QKV weight. Deliberately narrower than the pure-Python
-    :func:`onnxsim.apply_sparsegpt_pruning` in two ways, both mirroring this
-    module's own established narrower-than-pruning.py C++-port scope
-    decisions elsewhere (e.g. the ``MatMulNBits`` C++ section's own
-    FLOAT32-only restriction on its own scales/zero_points/bias tensors):
+    every ``com.microsoft::Attention`` node's constant 2-D FLOAT32/FLOAT16/
+    BFLOAT16 merged QKV weight -- read upcast to float64, written back down
+    to each weight's own original dtype, exactly like
+    :func:`onnxsim.apply_sparsegpt_pruning`'s own ``_to_f64``/``_from_f64``
+    convention (though note SparseGPT's Hessian-compensated update, unlike
+    plain masking, *recomputes* every kept entry's own value, so a fp16/bf16
+    weight's surviving entries do not reproduce their pre-pruning bit
+    pattern the way a plain-masking C++ port's FLOAT16/BFLOAT16 support
+    does). Deliberately narrower than the pure-Python
+    :func:`onnxsim.apply_sparsegpt_pruning` in one remaining way (mirroring
+    this module's own established narrower-than-pruning.py C++-port scope
+    decisions elsewhere):
 
-    - FLOAT32 only, not also FLOAT16/BFLOAT16.
     - 2-D ``Conv`` (ordinary/depthwise/general-grouped) is **not** matched
       at all here -- the pure-Python original's own Conv support needs an
       entirely new, from-first-principles im2col cross-covariance Hessian
@@ -1665,7 +1747,12 @@ def apply_sparsegpt_pruning_cpp(
       port. A Conv node is left completely untouched here, never guessed
       at, exactly as if it were any other unmatched node type -- use the
       pure-Python :func:`onnxsim.apply_sparsegpt_pruning` if Conv coverage
-      is required.
+      is required. This is the only remaining scope gap versus the
+      pure-Python original, so :func:`onnxsim.apply_sparsegpt_pruning`
+      itself is NOT an alias of this function (unlike, e.g.,
+      :func:`onnxsim.apply_transformer_block_pruning`, which IS an alias of
+      its own verified-full-parity C++ port) -- a Conv-bearing model would
+      otherwise silently get a different (Conv-less) result here.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to compute each
@@ -1703,8 +1790,8 @@ def apply_sparsegpt_pruning_cpp(
             place to the target pattern; a layer with no observed 2-D
             calibration activation (dead input, an otherwise-empty
             ``calibration_data``, or every batch's activation isn't
-            FLOAT32) is left completely untouched -- there is no data-free
-            fallback for SparseGPT
+            FLOAT32/FLOAT16/BFLOAT16) is left completely untouched -- there
+            is no data-free fallback for SparseGPT
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -1767,37 +1854,42 @@ def apply_wanda_pruning_cpp(
     docstring for the general pattern).
 
     Matches every plain ``MatMul``/vanilla-``Gemm`` node with a constant 2-D
-    FLOAT32 weight (this already includes ``com.microsoft::
-    GroupQueryAttention``'s own separate Q/K/V projections -- ordinary
-    MatMul/Gemm nodes feeding it, not a weight the op itself owns), plus
-    every ``com.microsoft::Attention`` node's constant 2-D FLOAT32 merged
-    QKV weight -- EXACTLY the same candidate set as
-    :func:`onnxsim.apply_sparsegpt_pruning_cpp`. Deliberately narrower than
-    the pure-Python :func:`onnxsim.apply_wanda_pruning` in the same two ways
-    that function's own C++-port sibling already establishes (mirroring
-    this module's own established narrower-than-pruning.py C++-port scope
-    decisions elsewhere, e.g. the ``MatMulNBits`` C++ section's own
-    FLOAT32-only restriction on its own scales/zero_points/bias tensors):
+    FLOAT32/FLOAT16/BFLOAT16 weight (this already includes
+    ``com.microsoft::GroupQueryAttention``'s own separate Q/K/V projections
+    -- ordinary MatMul/Gemm nodes feeding it, not a weight the op itself
+    owns), plus every ``com.microsoft::Attention`` node's constant 2-D
+    FLOAT32/FLOAT16/BFLOAT16 merged QKV weight -- the same candidate set
+    :func:`onnxsim.apply_sparsegpt_pruning_cpp` matches, both widened to
+    FLOAT32/FLOAT16/BFLOAT16 this round (read out upcast to float64, written
+    back down to the original dtype, exactly mirroring the pure-Python
+    :func:`onnxsim.apply_wanda_pruning`'s own ``_to_f64``/``_from_f64``
+    round trip -- masking never recomputes a surviving entry's own value, so
+    this reproduces its exact original bit pattern). Only remaining
+    deliberate gap vs. the pure-Python :func:`onnxsim.apply_wanda_pruning`:
 
-    - FLOAT32 only, not also FLOAT16/BFLOAT16.
     - 2-D ``Conv`` (ordinary/depthwise/general-grouped) is **not** matched
       at all here -- the pure-Python original's own Conv support needs an
       entirely new, from-first-principles im2col per-receptive-field-offset
       activation norm (``_conv_patch_sq_sum``/``_conv_group_relative_norm``)
       that :func:`onnxsim.apply_sparsegpt_pruning_cpp`'s own docstring
       explains is out of scope here too, for the analogous Hessian case --
-      reaching that bar is materially bigger than the rest of this pass and
-      is out of scope for this C++ port. A Conv node is left completely
-      untouched here, never guessed at, exactly as if it were any other
-      unmatched node type -- use the pure-Python
-      :func:`onnxsim.apply_wanda_pruning` if Conv coverage is required.
+      reaching that bar is materially bigger than the rest of this pass
+      (a brand-new im2col activation-collection engine this C++ port has
+      nowhere else, plus the grouped/depthwise group-relative norm
+      expansion, with real numeric-correctness risk if gotten subtly wrong)
+      and is deliberately left to the pure-Python implementation rather than
+      risked this round. A Conv node is left completely untouched here,
+      never guessed at, exactly as if it were any other unmatched node type
+      -- use the pure-Python :func:`onnxsim.apply_wanda_pruning` if Conv
+      coverage is required. Because of this one remaining gap,
+      :func:`onnxsim.apply_wanda_pruning` is NOT an alias of this function.
 
     Unlike :func:`onnxsim.apply_sparsegpt_pruning_cpp` (which has no data-
     free fallback at all -- its entire mechanism IS the Hessian), a matched
     layer with NO observed calibration activation for its own input (dead
     input, an otherwise-empty ``calibration_data``, or every batch's
-    activation isn't FLOAT32) still gets pruned here, just to PLAIN
-    MAGNITUDE importance (``|W_ij|`` alone) instead -- mirrors the
+    activation isn't FLOAT32/FLOAT16/BFLOAT16) still gets pruned here, just
+    to PLAIN MAGNITUDE importance (``|W_ij|`` alone) instead -- mirrors the
     pure-Python :func:`onnxsim.apply_wanda_pruning`'s own per-layer
     fallback exactly.
 
@@ -2345,17 +2437,19 @@ def apply_embedding_vocab_pruning_cpp(
     :class:`onnxsim.pruning.EmbeddingPruningResult`'s own docstring for the
     full return-value contract.
 
-    Unlike :func:`onnxsim.apply_embedding_vocab_pruning`, this C++ port
-    still only ever matches a plain ``Gather`` or ``com.microsoft::
-    EmbedLayerNormalization`` producer -- not ``com.microsoft::
-    GatherBlockQuantized`` (the block-quantized embedding shape -- out of
-    scope for this port; see ``onnxsim/structured_pruning_entry.cpp``'s own
-    "Embedding vocabulary pruning" section comment for exactly why). Its
-    ``lm_head`` auto-detection recognizes ``MatMul``/vanilla ``Gemm``/
-    ``com.microsoft::FusedGemm``/``GemmFastGelu``, and the embedding
-    table/``lm_head`` weight/bias may be FLOAT, FLOAT16, OR BFLOAT16 -- both
-    match the pure-Python original's own scope now. See that same section
-    comment for the exact matched topology.
+    Matches all three producer shapes the pure-Python original recognizes:
+    a plain ``Gather``, ``com.microsoft::EmbedLayerNormalization``, or
+    ``com.microsoft::GatherBlockQuantized`` (the block-quantized embedding
+    shape -- verified TRUE full parity across both of its own sub-8-bit
+    packing conventions, native ``tensor(uint4)``/``tensor(int4)`` and
+    manually-packed ``tensor(uint8)``; see ``onnxsim/structured_pruning_
+    entry.cpp``'s own "Embedding vocabulary pruning" section comment for the
+    full empirical detail). Its ``lm_head`` auto-detection recognizes
+    ``MatMul``/vanilla ``Gemm``/``com.microsoft::FusedGemm``/
+    ``GemmFastGelu``, and the embedding table/``lm_head`` weight/bias may be
+    FLOAT, FLOAT16, OR BFLOAT16 -- all matching the pure-Python original's
+    own scope exactly. See that same section comment for the exact matched
+    topology.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
@@ -2418,10 +2512,14 @@ def apply_embedding_vocab_magnitude_pruning_cpp(
     -- see its own docstring and
     :class:`onnxsim.pruning.EmbeddingPruningResult`'s.
 
-    Same C++-port scope restrictions as
-    :func:`onnxsim.apply_embedding_vocab_pruning_cpp` (``GatherBlockQuantized``
-    still out of scope; every other producer/``lm_head``-node-type/dtype
-    shape matched) -- see that function's own docstring.
+    Same matched topology as
+    :func:`onnxsim.apply_embedding_vocab_pruning_cpp` (all three producer
+    shapes, including ``GatherBlockQuantized``, plus every ``lm_head``-node-
+    type/dtype shape) -- see that function's own docstring. For
+    ``GatherBlockQuantized``, the per-row L2 norm this ranks by is computed
+    from the dequantized-for-ranking-only embedding table (never written
+    back) -- see ``onnxsim/structured_pruning_entry.cpp``'s own
+    ``GatherBlockQuantizedDequantized``.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
@@ -2451,6 +2549,8 @@ def apply_embedding_vocab_magnitude_pruning_cpp(
 def apply_quarot_cpp(
     model: Union[str, onnx.ModelProto],
     seed: int = 0,
+    block_size: int = 32,
+    epsilon: float = 1e-12,
 ) -> onnx.ModelProto:
     """
     C++-backed port of :func:`onnxsim.apply_quarot`: applies QuaRot-style
@@ -2458,7 +2558,7 @@ def apply_quarot_cpp(
     Outlier-Free 4-Bit Inference in Rotated LLMs") plus INT4
     round-to-nearest quantization of *both* the weight and the activation to
     every MatMul/vanilla-Gemm layer with a constant 2-D float32 weight whose
-    reduction dimension ``K`` is divisible by 32.
+    reduction dimension ``K`` is divisible by ``block_size``.
 
     Rotating the whole residual stream by a random orthogonal matrix removes
     activation outliers the same way block quantization already tolerates
@@ -2473,17 +2573,24 @@ def apply_quarot_cpp(
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
     Layers with a non-constant, non-2-D weight, or a reduction dimension not
-    divisible by 32, are left untouched. Consider calling :func:`simplify`
-    before and/or after to clean up the graph.
+    divisible by ``block_size``, are left untouched. Consider calling
+    :func:`simplify` before and/or after to clean up the graph.
 
     :param model: the original (unquantized) onnx ModelProto or file path
     :param seed: seed for the per-layer random rotation matrices
+    :param block_size: elements per weight quantization block along ``K``,
+            matching :func:`onnxsim.quantize_weight_only_int4`'s own default
+    :param epsilon: floor applied to a token's own max-abs rotated-activation
+            value before using it as a scale, avoiding a divide-by-zero on
+            an all-zero token
     :returns: the rotated-and-quantized onnx ModelProto; a model with no
             matching layer, or an opset older than 21, is returned unchanged
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    return onnx.load_from_string(C.apply_quarot(model.SerializeToString(), seed))
+    return onnx.load_from_string(
+        C.apply_quarot(model.SerializeToString(), seed, block_size, epsilon)
+    )
 
 
 def quantize_fp16(

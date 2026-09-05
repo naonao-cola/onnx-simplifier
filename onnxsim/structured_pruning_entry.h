@@ -32,11 +32,34 @@
 // for the definition, where ``executor.Run(...)`` is actually called.
 struct ModelExecutor;
 
-onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
-                                        double sparsity);
+// `importance_norm` ("l1" or "l2", case-sensitive; anything else throws
+// std::invalid_argument) selects L1 (sum of absolute weight magnitude) or
+// L2 (Li et al.'s original root-sum-square, the pre-existing default)
+// channel-importance ranking -- mirrors pruning.py's own
+// `_ImportanceNorm`/`_validate_importance_norm`/`importance_norm` parameter
+// exactly. `global_sparsity` pools every *eligible* matched chain's own
+// per-channel importance into one ranking across the whole model and picks
+// a single keep-count from `sparsity`'s fraction of that pooled total,
+// instead of every chain being cut by the same fraction independently --
+// mirrors pruning.py's own `apply_structured_pruning`/`global_sparsity`
+// parameter exactly, including which chains are "eligible" (an ordinary,
+// single-producer chain with no extra fan-out consumer branch and no
+// general grouped Conv on either side -- see structured_pruning_entry.cpp's
+// own ChainIsGlobalSparsityEligible) and the per-chain floor of at least
+// one surviving channel. See structured_pruning_entry.cpp's own
+// ApplyChainsGlobal for the full mechanism.
+onnx::ModelProto ApplyStructuredPruning(
+    const onnx::ModelProto& model, double sparsity,
+    const std::string& importance_norm = "l2", bool global_sparsity = false);
 
-onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
-                                           double sparsity);
+// `importance_norm` mirrors ApplyStructuredPruning's own parameter of the
+// same name exactly (pruning.py's own `apply_attention_head_pruning`
+// `importance_norm`) -- L1 vs. L2 ranking of each matched head's/KV group's
+// own combined weight-block norm. No `global_sparsity` counterpart here --
+// pruning.py's own `apply_attention_head_pruning` has none either.
+onnx::ModelProto ApplyAttentionHeadPruning(
+    const onnx::ModelProto& model, double sparsity,
+    const std::string& importance_norm = "l2");
 
 // Removes intermediate (`inter_size`) channels from every expert of a
 // matched `com.microsoft::MoE` node at once -- real structural pruning
@@ -165,17 +188,16 @@ struct EmbeddingVocabPruningResult {
 // If/Loop/Scan/BeamSearch-family subgraphs, at any depth -- see
 // `IterSubgraphs`).
 //
-// Unlike pruning.py's own version, this port still only ever matches a
-// plain `Gather` or `com.microsoft::EmbedLayerNormalization` producer --
-// not `com.microsoft::GatherBlockQuantized` (the block-quantized embedding
-// shape -- a genuine remaining scope gap, deliberately left open; see
-// structured_pruning_entry.cpp's own section comment for exactly why).
-// `lm_head` auto-detection recognizes `MatMul`/vanilla `Gemm`/
-// `com.microsoft::FusedGemm`/`GemmFastGelu`, and the embedding table/
-// `lm_head` weight/bias may be FLOAT, FLOAT16, OR BFLOAT16 -- both now
-// match pruning.py's own scope exactly. See structured_pruning_entry.cpp's
-// own section comment for the full matched topology and the one remaining
-// out-of-scope shape.
+// Matches all three of pruning.py's own producer shapes -- a plain
+// `Gather`, `com.microsoft::EmbedLayerNormalization`, or `com.microsoft::
+// GatherBlockQuantized` (the block-quantized embedding shape -- verified
+// TRUE full parity across both of its own sub-8-bit packing conventions;
+// see structured_pruning_entry.cpp's own section comment for the full
+// empirical detail). `lm_head` auto-detection recognizes `MatMul`/vanilla
+// `Gemm`/`com.microsoft::FusedGemm`/`GemmFastGelu`, and the embedding
+// table/`lm_head` weight/bias may be FLOAT, FLOAT16, OR BFLOAT16 -- all
+// matching pruning.py's own scope exactly. See structured_pruning_entry.cpp's
+// own section comment for the full matched topology.
 EmbeddingVocabPruningResult ApplyEmbeddingVocabPruning(
     const onnx::ModelProto& model,
     const std::optional<std::vector<int64_t>>& keep_token_ids,
@@ -244,11 +266,20 @@ EmbeddingVocabPruningResult ApplyEmbeddingVocabMagnitudePruning(
 // ``||W_row||_2`` ranking, exactly mirroring pruning.py's own per-chain "no
 // matching activation observed" fallback, just triggered for every chain at
 // once instead of one at a time.
+// `importance_norm`/`global_sparsity` mirror ApplyStructuredPruning's own
+// parameters of the same names exactly (pruning.py's own
+// `apply_structured_wanda_pruning` `importance_norm`/`global_sparsity`) --
+// the *weight*-magnitude term only; the activation-norm term stays L2
+// unconditionally either way, per Wanda's own ``|W_ij| * ||X_j||_2``
+// definition. `global_sparsity` mode applies to this function's own
+// ``||W_row|| * ||X||_2`` metric, same eligible-chain scope and per-chain
+// floor as ApplyStructuredPruning's own `global_sparsity`.
 onnx::ModelProto ApplyStructuredWandaPruning(
     const onnx::ModelProto& model, const ModelExecutor& executor,
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
         calibration_data,
-    double sparsity, double epsilon = 1e-8);
+    double sparsity, double epsilon = 1e-8,
+    const std::string& importance_norm = "l2", bool global_sparsity = false);
 
 // The calibration-driven (Wanda-style) upgrade of ApplyAttentionHeadPruning
 // -- same relationship, and same reused pattern, as
@@ -295,11 +326,18 @@ onnx::ModelProto ApplyStructuredWandaPruning(
 // matched block fall back to ApplyAttentionHeadPruning's own plain
 // ``||W||_F`` ranking, exactly mirroring pruning.py's own per-block "no
 // matching activation observed" fallback.
+// `importance_norm` mirrors ApplyAttentionHeadPruning's own parameter of the
+// same name exactly (pruning.py's own `apply_attention_head_wanda_pruning`
+// `importance_norm`) -- the *weight*-magnitude term only; the
+// activation-norm term stays L2 unconditionally either way. No
+// `global_sparsity` counterpart here either, mirroring
+// ApplyAttentionHeadPruning's own declaration comment above.
 onnx::ModelProto ApplyAttentionHeadWandaPruning(
     const onnx::ModelProto& model, const ModelExecutor& executor,
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
         calibration_data,
-    double sparsity, double epsilon = 1e-8);
+    double sparsity, double epsilon = 1e-8,
+    const std::string& importance_norm = "l2");
 
 // Depth/block-level pruning: drops whole redundant pre-norm transformer
 // residual sub-blocks (``x = x + SelfAttn(LN(x))`` or ``x = x + MLP(LN(x))``)
@@ -356,32 +394,39 @@ onnx::ModelProto ApplyTransformerBlockPruning(
 // SparseGPT (Frantar & Alistarh, 2023, "SparseGPT: Massive Language Models
 // Can Be Accurately Pruned in One-Shot", https://arxiv.org/abs/2301.00774):
 // zeros the least-important entries of every matched layer's constant 2-D
-// FLOAT32 weight to an unstructured or N:M sparsity pattern, using a
-// sequential, Hessian-error-compensating algorithm ported from GPTQ (same
-// authors) rather than magnitude/Wanda's one-shot static importance score
-// -- see structured_pruning_entry.cpp's own "SparseGPT (unstructured / N:M)
-// pruning" section comment for the full technique, and pruning.py's own
-// module-level docstring / `apply_sparsegpt_pruning` docstring for the
-// Python reference this ports. Unlike every other pass in this file, this
-// NEVER changes any tensor's shape: it only rewrites individual weight
-// entries in place (zeroed when pruned, Hessian-compensated -- so
-// possibly changed even when KEPT -- otherwise), and every matched layer
-// is processed completely independently, with no producer/consumer
-// chain-walking at all.
+// FLOAT32/FLOAT16/BFLOAT16 weight to an unstructured or N:M sparsity
+// pattern, using a sequential, Hessian-error-compensating algorithm ported
+// from GPTQ (same authors) rather than magnitude/Wanda's one-shot static
+// importance score -- see structured_pruning_entry.cpp's own "SparseGPT
+// (unstructured / N:M) pruning" section comment for the full technique, and
+// pruning.py's own module-level docstring / `apply_sparsegpt_pruning`
+// docstring for the Python reference this ports. Unlike every other pass in
+// this file, this NEVER changes any tensor's shape: it only rewrites
+// individual weight entries in place (zeroed when pruned, Hessian-
+// compensated -- so possibly changed even when KEPT -- otherwise), and
+// every matched layer is processed completely independently, with no
+// producer/consumer chain-walking at all.
 //
 // Matches exactly: every plain `MatMul`/vanilla-`Gemm` node (MatchMatMulLikeRaw
 // -- NOT pruning.py's own widened `_match_matmul_like`, which also
 // recognizes `com.microsoft::FusedGemm`/`GemmFastGelu`; this already covers
 // `com.microsoft::GroupQueryAttention`'s own separate Q/K/V projections,
 // which are ordinary MatMul/Gemm nodes feeding it, not a weight the op
-// itself owns) with a constant 2-D FLOAT32 weight, plus every
-// `com.microsoft::Attention` node's constant 2-D FLOAT32 merged QKV weight
-// (MatchAttentionProducer). Deliberately narrower than pruning.py's own
-// `apply_sparsegpt_pruning` in two ways, both mirroring this file's own
-// already-established C++-port scope decisions elsewhere (e.g. the
-// "MatMulNBits" section's own FLOAT32-only restriction on its scales/
-// zero_points/bias tensors):
-//   - FLOAT32 only, not also FLOAT16/BFLOAT16.
+// itself owns) with a constant 2-D FLOAT/FLOAT16/BFLOAT16 weight
+// (IsSupportedFloatDtype -- matches pruning.py's own
+// `_is_supported_float_dtype`; read/written via ReadTensorAsF64/
+// WriteF64TensorAs, preserving each weight's own original dtype, exactly
+// mirroring pruning.py's own `_to_f64`/`_from_f64` convention), plus every
+// `com.microsoft::Attention` node's constant 2-D FLOAT/FLOAT16/BFLOAT16
+// merged QKV weight (MatchAttentionProducerAnyFloat -- a narrow, SparseGPT-
+// local dtype-widened duplicate of the shared, still-FLOAT32-only
+// MatchAttentionProducer, which also backs this file's own structural
+// Attention-head pruning and was deliberately left untouched -- see that
+// function's own comment in structured_pruning_entry.cpp). Deliberately
+// narrower than pruning.py's own `apply_sparsegpt_pruning` in one remaining
+// way (previously two -- FLOAT16/BFLOAT16 support was closed in the same
+// round that added this comment, following this file's own established
+// MoE/QMoE FP16/BFLOAT16-widening precedent):
 //   - 2-D `Conv` (ordinary/depthwise/general-grouped) is NOT matched at
 //     all -- pruning.py's own Conv support needs an entirely new, from-
 //     first-principles im2col cross-covariance Hessian (`H = patches.T @
@@ -393,7 +438,12 @@ onnx::ModelProto ApplyTransformerBlockPruning(
 //     materially bigger than the rest of this pass and was deliberately
 //     left out of scope for this port -- a Conv node here is left
 //     completely untouched (never guessed at, never crashes), exactly as
-//     if it were any other unmatched node type.
+//     if it were any other unmatched node type. THIS IS THE ONLY REMAINING
+//     SCOPE GAP versus pruning.py's own `apply_sparsegpt_pruning` -- until
+//     it closes, `apply_sparsegpt_pruning` itself must stay pure Python
+//     (not aliased to this port), since a Conv-bearing model would
+//     otherwise silently get a different (Conv-less) result from the two
+//     implementations.
 //
 // Same real numerical linear algebra pruning.py's own `apply_sparsegpt_
 // pruning`/:mod:`onnxsim.gptq` needs, hand-written here rather than reused
@@ -440,10 +490,10 @@ onnx::ModelProto ApplyTransformerBlockPruning(
 //
 // A matched layer with no observed 2-D-or-higher-rank-with-a-trailing-
 // feature-axis calibration activation for its own input (dead input, an
-// otherwise-empty `calibration_data`, or every batch's own activation
-// isn't FLOAT32) is left completely untouched -- unlike Wanda, there is no
-// data-free fallback for a technique whose entire mechanism is the
-// Hessian.
+// otherwise-empty `calibration_data`, or every batch's own activation isn't
+// FLOAT/FLOAT16/BFLOAT16) is left completely untouched -- unlike Wanda,
+// there is no data-free fallback for a technique whose entire mechanism is
+// the Hessian.
 onnx::ModelProto ApplySparseGptPruning(
     const onnx::ModelProto& model, const ModelExecutor& executor,
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
@@ -467,24 +517,43 @@ onnx::ModelProto ApplySparseGptPruning(
 // any tensor's shape -- only individual weight entries are zeroed in place.
 //
 // Matches EXACTLY the same candidate set as ApplySparseGptPruning, via the
-// same matchers (MatchMatMulLikeRaw, MatchAttentionProducer): every plain
-// `MatMul`/vanilla-`Gemm` node with a constant 2-D FLOAT32 weight (already
-// covering `com.microsoft::GroupQueryAttention`'s own separate Q/K/V
-// projections -- ordinary MatMul/Gemm nodes feeding it, not a weight the op
-// itself owns), plus every `com.microsoft::Attention` node's constant 2-D
-// FLOAT32 merged QKV weight. Deliberately narrower than pruning.py's own
-// `apply_wanda_pruning` in the same two ways ApplySparseGptPruning's own
-// declaration comment above already documents and justifies at length:
-//   - FLOAT32 only, not also FLOAT16/BFLOAT16.
+// same MatchMatMulLikeRaw matcher for the MatMul/Gemm case, PLUS a local,
+// dtype-widened copy of MatchAttentionProducer for the Attention case (see
+// structured_pruning_entry.cpp's own "Wanda unstructured (element-wise)
+// pruning" section comment, MatchAttentionProducerWideDtype, for why this
+// needs its own copy rather than reusing MatchAttentionProducer directly):
+// every plain `MatMul`/vanilla-`Gemm` node with a constant 2-D FLOAT32/
+// FLOAT16/BFLOAT16 weight (already covering
+// `com.microsoft::GroupQueryAttention`'s own separate Q/K/V projections --
+// ordinary MatMul/Gemm nodes feeding it, not a weight the op itself owns),
+// plus every `com.microsoft::Attention` node's constant 2-D FLOAT32/FLOAT16/
+// BFLOAT16 merged QKV weight -- mirrors pruning.py's own
+// `_is_supported_float_dtype` widening of `_match_attention_producer`
+// exactly. Like ApplySparseGptPruning immediately above (also widened this
+// same round), FLOAT16/BFLOAT16 support is now at TRUE parity with
+// pruning.py's own `apply_wanda_pruning` (read out upcast to float64 via
+// ReadTensorAsF64, written back down via WriteF64TensorAs -- this file's own
+// MoE/QMoE-established conversion trio, see IsSupportedFloatDtype's own
+// declaration comment -- exactly mirroring pruning.py's own `_to_f64`/
+// `_from_f64` round trip; masking never changes a surviving entry's own
+// value, only zeros dropped ones, so this reproduces every kept entry's
+// exact original bit pattern). Only remaining, deliberate gap vs.
+// pruning.py's own `apply_wanda_pruning`:
 //   - 2-D `Conv` (ordinary/depthwise/general-grouped) is NOT matched at
 //     all -- pruning.py's own Conv support for THIS function needs the same
 //     from-first-principles im2col per-receptive-field-offset activation
 //     norm (`_conv_patch_sq_sum`, `_conv_group_relative_norm`) that
 //     ApplySparseGptPruning's own declaration comment explains is out of
 //     scope here for the analogous Hessian case -- materially bigger than
-//     the rest of this pass, and deliberately left to the pure-Python
-//     implementation. A Conv node here simply never matches either
+//     the rest of this pass (a brand-new im2col activation-collection engine
+//     this file has nowhere else, plus the grouped/depthwise group-relative
+//     norm expansion, with real numeric-correctness risk if gotten subtly
+//     wrong), and deliberately left to the pure-Python implementation rather
+//     than risked this round. A Conv node here simply never matches either
 //     candidate case and is left completely untouched, never guessed at.
+//     Because of this ONE remaining gap, `apply_wanda_pruning` is NOT
+//     aliased to this port in pruning.py -- see that function's own
+//     docstring there.
 //
 // Wanda's own calibration statistic -- one shared per-reduction-channel
 // activation L2-norm per matched layer's own input, reduced over every
@@ -518,8 +587,9 @@ onnx::ModelProto ApplySparseGptPruning(
 //
 // A matched layer with NO observed calibration activation for its own
 // input (dead input, an otherwise-empty `calibration_data`, every batch's
-// own activation isn't FLOAT32, or an observed width mismatched with the
-// weight's own reduction dimension) falls back to PLAIN MAGNITUDE
+// own activation isn't FLOAT32/FLOAT16/BFLOAT16, or an observed width
+// mismatched with the weight's own reduction dimension) falls back to PLAIN
+// MAGNITUDE
 // importance (``|W_ij|`` alone) for that one layer -- mirrors pruning.py's
 // own per-layer `_wanda_importance` fallback exactly. This is the one
 // meaningful behavioral difference from ApplySparseGptPruning's own

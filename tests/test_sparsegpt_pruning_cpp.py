@@ -22,12 +22,18 @@ essentially at) floating-point precision, not merely a loose tolerance.
 
 Scope: this port matches plain ``MatMul``/vanilla-``Gemm`` (not
 ``com.microsoft::FusedGemm``/``GemmFastGelu``) and ``com.microsoft::
-Attention``'s merged QKV weight, FLOAT32 only (not also FLOAT16/BFLOAT16),
-and does NOT match ``Conv`` at all -- see ``structured_pruning_entry.h``'s
-own ``ApplySparseGptPruning`` declaration comment for the full scope
-decision and rationale. The Conv-declined and FLOAT16-declined tests below
-confirm those are handled by leaving the layer alone, not by crashing or by
-silently mishandling the tensor.
+Attention``'s merged QKV weight, FLOAT32/FLOAT16/BFLOAT16 (widened from an
+earlier FLOAT32-only scope -- see ``IsSupportedFloatDtype``/
+``ReadTensorAsF64``/``WriteF64TensorAs`` and, for the Attention QKV weight
+specifically, the SparseGPT-local ``MatchAttentionProducerAnyFloat``), and
+does NOT match ``Conv`` at all -- see ``structured_pruning_entry.h``'s own
+``ApplySparseGptPruning`` declaration comment for the full scope decision
+and rationale (Conv remains the one open gap, so
+``onnxsim.apply_sparsegpt_pruning`` itself is NOT aliased to this port). The
+Conv-declined test below confirms that gap is handled by leaving the layer
+alone, not by crashing or by silently mishandling the tensor; the
+FLOAT16/BFLOAT16 section further down confirms the newly-closed dtype gap
+matches the pure-Python reference exactly.
 """
 
 import numpy as np
@@ -379,11 +385,31 @@ def test_sparsegpt_pruning_cpp_conv_is_left_completely_untouched():
     np.testing.assert_array_equal(_weight(pruned), w)
 
 
-def test_sparsegpt_pruning_cpp_fp16_weight_is_left_completely_untouched():
-    # FLOAT16/BFLOAT16 weights are explicitly out of scope for this C++
-    # port (unlike the pure-Python original) -- confirm a FLOAT16 MatMul
-    # weight is declined (left byte-identical), not crashed on or
-    # incorrectly reinterpreted.
+# --- FLOAT16/BFLOAT16 weight matching ---------------------------------------
+#
+# FLOAT16/BFLOAT16 weights (both for the plain MatMul/vanilla-Gemm candidate
+# path and for com.microsoft::Attention's own merged QKV weight, via the
+# SparseGPT-local MatchAttentionProducerAnyFloat matcher) are IN scope for
+# this C++ port -- IsSupportedFloatDtype/ReadTensorAsF64/WriteF64TensorAs,
+# the same widening this file's own module docstring's "Scope" paragraph
+# above already documents. 2-D Conv remains the one open gap (see the
+# previous test).
+#
+# BFLOAT16 gets no analogous real-onnxruntime-execution test here: this
+# environment's onnxruntime has no CPU kernel for ANY op on a BFLOAT16
+# tensor at all (confirmed the same way test_pruning.py's own "BFLOAT16 has
+# no onnxruntime CPU execution support" section comment documents for the
+# pure-Python reference -- a plain BFLOAT16 MatMul model raises
+# NOT_IMPLEMENTED the moment a session is created), and this test file's own
+# module docstring requires a real onnxruntime-backed executor throughout
+# (never a fake/mock one) -- so a BFLOAT16 calibration run would fail on
+# this environment's onnxruntime limitation alone, before this port's own
+# widened matching/reading/writing code ever runs. There is accordingly no
+# environment in which this file could exercise BFLOAT16 end to end; FLOAT16
+# (which onnxruntime CAN execute) is tested below instead.
+
+
+def test_sparsegpt_pruning_cpp_fp16_matmul_matches_python_reference():
     K, N = 16, 4
     rng = np.random.default_rng(61)
     w = (rng.standard_normal((K, N)).astype(np.float32) * 0.5).astype(np.float16)
@@ -397,12 +423,69 @@ def test_sparsegpt_pruning_cpp_fp16_weight_is_left_completely_untouched():
         initializer=[onnx.numpy_helper.from_array(w, "W")],
     )
     rng2 = np.random.default_rng(161)
-    x_cal = rng2.standard_normal((16, K)).astype(np.float16)
-    pruned = onnxsim.apply_sparsegpt_pruning_cpp(
+    x_cal = rng2.standard_normal((32, K)).astype(np.float16)
+
+    expected = onnxsim.apply_sparsegpt_pruning(
         model, calibration_data=[{"X": x_cal}], sparsity=0.5
     )
-    onnx.checker.check_model(pruned)
-    np.testing.assert_array_equal(_weight(pruned), w)
+    actual = onnxsim.apply_sparsegpt_pruning_cpp(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(actual)
+    w_expected = _weight(expected)
+    w_actual = _weight(actual)
+    assert w_actual.dtype == np.float16
+    assert w_expected.dtype == np.float16
+    _assert_bytewise_close(w_actual, w_expected)
+    # Real recomputation happened, not a same-shape no-op.
+    assert not np.array_equal(w_actual, w)
+
+
+def test_sparsegpt_pruning_cpp_fp16_attention_merged_qkv_matches_python_reference():
+    # Exercises MatchAttentionProducerAnyFloat specifically -- the
+    # SparseGPT-local, dtype-widened duplicate of the shared (still
+    # FLOAT32-only) MatchAttentionProducer used elsewhere in this file.
+    hidden = 16
+    nq = nk = nv = 8
+    total_n = nq + nk + nv
+    num_heads = 2
+    rng = np.random.default_rng(62)
+    w_qkv = (rng.standard_normal((hidden, total_n)).astype(np.float32) * 0.3).astype(
+        np.float16
+    )
+    bias = (rng.standard_normal((total_n,)).astype(np.float32) * 0.05).astype(
+        np.float16
+    )
+    model = _model(
+        f"""
+        g (float16[batch,seq,{hidden}] X) => (float16[batch,seq,{nv}] Y)
+        {{
+          Y, present = com.microsoft.Attention <num_heads={num_heads}>(X, Wqkv, Bqkv)
+        }}
+        """,
+        initializer=[
+            onnx.numpy_helper.from_array(w_qkv, "Wqkv"),
+            onnx.numpy_helper.from_array(bias, "Bqkv"),
+        ],
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    rng2 = np.random.default_rng(162)
+    x_cal = rng2.standard_normal((3, 5, hidden)).astype(np.float16)
+
+    expected = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    actual = onnxsim.apply_sparsegpt_pruning_cpp(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(actual)
+    w_expected = _weight(expected)
+    w_actual = _weight(actual)
+    assert w_actual.dtype == np.float16
+    _assert_bytewise_close(w_actual, w_expected)
+    assert not np.array_equal(w_actual, w_qkv)
+    # Bias (never touched by SparseGPT) is untouched, dtype included.
+    np.testing.assert_array_equal(_weight(actual, index=1), bias)
 
 
 # --- End-to-end reconstruction quality --------------------------------------

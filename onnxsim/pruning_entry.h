@@ -10,4 +10,9 @@
 
 #include <onnx/onnx_pb.h>
 
-onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity);
+#include <optional>
+
+onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity,
+                                const std::optional<int64_t>& n = std::nullopt,
+                                const std::optional<int64_t>& m = std::nullopt,
+                                bool global_sparsity = false);

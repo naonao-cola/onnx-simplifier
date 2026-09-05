@@ -496,23 +496,39 @@ onnx::ModelProto ApplyDoubleQuantization(const onnx::ModelProto& model);
 
 // Magnitude pruning (Han et al., 2015) -- the data-free unstructured
 // pruning baseline. Zeros the least-magnitude entries of every
-// MatMul/vanilla-Gemm layer's constant 2-D float32 weight, and every Conv
-// layer's constant 4-D float32 weight (ordinary, depthwise, and general
-// grouped Conv alike), independently per output row/filter: within each
-// row, keeps the max(1, round(cols * (1 - sparsity))) highest-magnitude
-// entries and zeros the rest. Unlike the pure-Python
-// ``apply_magnitude_pruning``, this does not match
-// ``com.microsoft::Attention``'s merged QKV weight, and offers only the
-// sparsity-ratio mode (no N:M semi-structured pruning) -- see
-// ``passes/magnitude_pruning.h`` for the exact rewrite and this scope note.
+// MatMul/vanilla-Gemm layer's constant 2-D FLOAT/FLOAT16/BFLOAT16 weight,
+// every Conv layer's constant 4-D FLOAT/FLOAT16/BFLOAT16 weight (ordinary,
+// depthwise, and general grouped Conv alike), and every
+// ``com.microsoft::Attention`` node's constant 2-D FLOAT/FLOAT16/BFLOAT16
+// merged QKV weight, independently per output row/filter: within each row,
+// keeps the max(1, round(cols * (1 - sparsity))) highest-magnitude entries
+// and zeros the rest. Full parity with the pure-Python
+// ``apply_magnitude_pruning`` -- see ``passes/magnitude_pruning.h`` for the
+// exact rewrite.
+//
+// ``n``/``m`` (both ``std::nullopt``, or both given together: N:M
+// semi-structured pruning, ``0 < n <= m``) mirror pruning.py's own identical
+// parameters and validation (``_validate_pattern``) exactly: keeps the ``n``
+// highest-magnitude entries per group of ``m`` columns instead of using
+// ``sparsity``. ``global_sparsity`` pools every matched layer's own ``|W|``
+// entries into one ranking across the WHOLE model (every graph, including
+// nested If/Loop/Scan/BeamSearch-family subgraphs) and picks a single
+// keep-count from ``sparsity``'s fraction of that pooled total -- mirrors
+// pruning.py's own ``apply_magnitude_pruning`` ``global_sparsity`` mode
+// exactly (including its "no per-row floor" property). Incompatible with
+// ``n``/``m``: throws ``std::invalid_argument`` when both are given.
 //
 // Unlike ``Simplify``, this does not run shape inference, constant folding or
 // any other simplification pass -- it applies exactly this rewrite, to every
 // matching layer, to a copy of ``model`` (which is left untouched) and
-// returns the result. ``sparsity`` must be in [0, 1); throws
-// ``std::invalid_argument`` otherwise. A layer with a non-constant,
-// non-2-D (MatMul/Gemm), or non-4-D (Conv) weight is left untouched.
-onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity);
+// returns the result. ``sparsity`` must be in [0, 1) when ``n``/``m`` are not
+// given; throws ``std::invalid_argument`` otherwise. A layer with a
+// non-constant, non-2-D (MatMul/Gemm/Attention), or non-4-D (Conv) weight is
+// left untouched.
+onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity,
+                                const std::optional<int64_t>& n = std::nullopt,
+                                const std::optional<int64_t>& m = std::nullopt,
+                                bool global_sparsity = false);
 
 // QuaRot (Ashkboos et al., 2024) rotation preprocessing plus INT4
 // round-to-nearest quantization of *both* the weight and the activation of
@@ -529,10 +545,16 @@ onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity);
 // any other simplification pass -- it applies exactly this rewrite, to every
 // matching layer, to a copy of ``model`` (which is left untouched) and
 // returns the result. A layer with a non-constant, non-2-D weight, or a
-// reduction dimension not divisible by 32, is left untouched; a model with
-// no matching layer, or an opset older than 21, is returned unchanged.
-// ``seed`` derives a fresh, deterministic random rotation per matched layer.
-onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed);
+// reduction dimension not divisible by ``block_size``, is left untouched; a
+// model with no matching layer, or an opset older than 21, is returned
+// unchanged. ``seed`` derives a fresh, deterministic random rotation per
+// matched layer. ``block_size`` is the number of reduction-dimension (K)
+// elements sharing one weight quantization scale, matching
+// ``quantize_weight_only_int4``'s own default. ``epsilon`` floors a token's
+// own max-abs rotated-activation value before it is used as a quantization
+// scale, avoiding a divide-by-zero on an all-zero token.
+onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
+                             int64_t block_size, float epsilon);
 
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller

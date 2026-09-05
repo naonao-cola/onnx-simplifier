@@ -86,6 +86,59 @@ def _weight(model):
     return onnx.numpy_helper.to_array(model.graph.initializer[0])
 
 
+def _magnitude_weight(model, node_index=0, input_index=1):
+    # `onnxsim.apply_magnitude_pruning` is now a thin alias for the C++-backed
+    # `onnxsim.prune_magnitude_cpp` (see pruning.py's own "Magnitude pruning"
+    # section comment): unlike the retired pure-Python implementation (which
+    # mutated the existing initializer in place via `w_init.CopyFrom`, so
+    # `_weight`'s own `graph.initializer[0]`/by-original-name lookup still
+    # found the pruned values), the C++ port leaves the original initializer
+    # dangling and appends a *new*, anonymously-named one for the pruned
+    # weight, rewiring the consuming node's own weight input to it --
+    # matching every other onnxsim rewrite's "replace, don't mutate"
+    # convention for constants (see `tests/test_pruning_cpp.py`'s own
+    # `_weight` helper, which this mirrors). So every test that reads a
+    # magnitude-pruning result's weight must resolve it via the node's
+    # CURRENT weight input name, not assume it is still named "W"/"W1"/... or
+    # still `initializer[0]`.
+    node = model.graph.node[node_index]
+    w_name = node.input[input_index]
+    init = next(t for t in model.graph.initializer if t.name == w_name)
+    return onnx.numpy_helper.to_array(init)
+
+
+def _magnitude_weight_by_original_name(model, pruned, original_name, input_index=1):
+    # Same rationale as `_magnitude_weight`, for a multi-node model (e.g.
+    # GQA's separate Wq/Wk/Wv-producing MatMul nodes) where the weight to
+    # inspect isn't simply "node 0" -- finds the matching node by its
+    # ORIGINAL (pre-pruning) weight name, then resolves the pruned weight
+    # via that same node's CURRENT weight input in `pruned` (node order/
+    # count is unchanged by this pass -- only weight inputs are rewired).
+    node_index = next(
+        i
+        for i, n in enumerate(model.graph.node)
+        if len(n.input) > input_index and n.input[input_index] == original_name
+    )
+    return _magnitude_weight(pruned, node_index=node_index, input_index=input_index)
+
+
+def _magnitude_weight_in_graph(orig_graph, pruned_graph, original_name, input_index=1):
+    # Same rationale as `_magnitude_weight_by_original_name`, generalized to
+    # an arbitrary (sub)graph pair -- `orig_graph`/`pruned_graph` need not be
+    # `model.graph`/`pruned.graph` themselves, e.g. a nested If branch's own
+    # `GraphProto` (node order/count within that one graph is unchanged by
+    # this pass, same as at the top level).
+    node_index = next(
+        i
+        for i, n in enumerate(orig_graph.node)
+        if len(n.input) > input_index and n.input[input_index] == original_name
+    )
+    pruned_node = pruned_graph.node[node_index]
+    w_name = pruned_node.input[input_index]
+    init = next(t for t in pruned_graph.initializer if t.name == w_name)
+    return onnx.numpy_helper.to_array(init)
+
+
 def test_magnitude_pruning_reaches_target_sparsity():
     model = _matmul_model(K=64, N=16)
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
@@ -99,7 +152,7 @@ def test_magnitude_pruning_keeps_the_largest_entries_per_row():
     model = _matmul_model(K=64, N=16)
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.75)
     w = _weight(model).astype(np.float64)  # [K, N]
-    w_pruned = _weight(pruned).astype(np.float64)
+    w_pruned = _magnitude_weight(pruned).astype(np.float64)
     # Per output column (row of W^T), the surviving entries must be exactly
     # the top-(1 - sparsity) fraction by magnitude.
     for col in range(w.shape[1]):
@@ -119,7 +172,7 @@ def test_magnitude_pruning_zero_sparsity_is_a_no_op():
 def test_magnitude_pruning_nm_pattern():
     model = _matmul_model(K=64, N=16)
     pruned = onnxsim.apply_magnitude_pruning(model, n=2, m=4)
-    w_pruned = _weight(pruned).T  # [N, K], row-major per output channel
+    w_pruned = _magnitude_weight(pruned).T  # [N, K], row-major per output channel
     assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=1e-9)
     for row in w_pruned:
         for start in range(0, len(row), 4):
@@ -167,7 +220,7 @@ def test_wanda_pruning_protects_high_activation_channels():
     onnx.checker.check_model(wanda_pruned)
     assert onnxsim.weight_sparsity(wanda_pruned) == pytest.approx(0.5, abs=1e-9)
 
-    w_magnitude = _weight(magnitude_pruned)
+    w_magnitude = _magnitude_weight(magnitude_pruned)
     w_wanda = _weight(wanda_pruned)
     # Wanda must keep strictly more of the salient rows' entries than plain
     # magnitude pruning -- otherwise this is just re-testing magnitude
@@ -207,7 +260,9 @@ def test_wanda_pruning_falls_back_to_magnitude_without_matching_activation():
         model, calibration_data=[{"X": x}], sparsity=0.5
     )
     onnx.checker.check_model(wanda_pruned)
-    np.testing.assert_array_equal(_weight(wanda_pruned), _weight(magnitude_pruned))
+    np.testing.assert_array_equal(
+        _weight(wanda_pruned), _magnitude_weight(magnitude_pruned)
+    )
 
 
 def test_weight_sparsity_of_unpruned_model_is_zero():
@@ -263,23 +318,20 @@ def test_magnitude_pruning_global_sparsity_redistributes_toward_small_magnitude_
     )
     onnx.checker.check_model(global_pruned)
 
-    inits_local = {t.name: t for t in local_pruned.graph.initializer}
-    inits_global = {t.name: t for t in global_pruned.graph.initializer}
-
-    def sparsity_of(inits, name):
-        return float(np.mean(onnx.numpy_helper.to_array(inits[name]) == 0))
+    def sparsity_of(pruned, node_index):
+        return float(np.mean(_magnitude_weight(pruned, node_index=node_index) == 0))
 
     # Per-layer-uniform (default) mode: both layers cut to exactly the same
     # fraction, regardless of scale.
-    assert sparsity_of(inits_local, "Wbig") == pytest.approx(0.5, abs=1e-9)
-    assert sparsity_of(inits_local, "Wsmall") == pytest.approx(0.5, abs=1e-9)
+    assert sparsity_of(local_pruned, 0) == pytest.approx(0.5, abs=1e-9)  # Wbig
+    assert sparsity_of(local_pruned, 1) == pytest.approx(0.5, abs=1e-9)  # Wsmall
 
     # global_sparsity mode: the uniformly-100x-larger layer must be pruned
     # markedly less than the uniformly-small one -- the whole point of
     # pooling importance across layers instead of treating each layer's own
     # distribution in isolation.
-    big_sparsity = sparsity_of(inits_global, "Wbig")
-    small_sparsity = sparsity_of(inits_global, "Wsmall")
+    big_sparsity = sparsity_of(global_pruned, 0)  # Wbig
+    small_sparsity = sparsity_of(global_pruned, 1)  # Wsmall
     assert big_sparsity < 0.5 < small_sparsity
 
     # Aggregate sparsity across both matched layers still hits the
@@ -299,7 +351,6 @@ def test_magnitude_pruning_global_sparsity_matches_pooled_threshold_oracle():
     pruned = onnxsim.apply_magnitude_pruning(
         model, sparsity=sparsity, global_sparsity=True
     )
-    inits = {t.name: t for t in pruned.graph.initializer}
 
     # Hand-built oracle: pool |W| across both layers' own [N, K]
     # (output-channel-first) entries, in the same node order `_candidates`
@@ -324,11 +375,9 @@ def test_magnitude_pruning_global_sparsity_matches_pooled_threshold_oracle():
     expected_big = np.where(big_drop, 0.0, w_big_nk).T.astype(np.float32)
     expected_small = np.where(small_drop, 0.0, w_small_nk).T.astype(np.float32)
 
+    np.testing.assert_array_equal(_magnitude_weight(pruned, node_index=0), expected_big)
     np.testing.assert_array_equal(
-        onnx.numpy_helper.to_array(inits["Wbig"]), expected_big
-    )
-    np.testing.assert_array_equal(
-        onnx.numpy_helper.to_array(inits["Wsmall"]), expected_small
+        _magnitude_weight(pruned, node_index=1), expected_small
     )
 
 
@@ -486,7 +535,7 @@ def test_magnitude_pruning_conv_keeps_the_largest_entries_per_filter():
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.75)
     K = Cin * 3 * 3
     w_flat = w.astype(np.float64).reshape(Cout, K)
-    w_pruned_flat = _conv_weight(pruned).astype(np.float64).reshape(Cout, K)
+    w_pruned_flat = _magnitude_weight(pruned).astype(np.float64).reshape(Cout, K)
     keep_count = round(K * 0.25)
     for row in range(Cout):
         kept = np.flatnonzero(w_pruned_flat[row] != 0)
@@ -504,7 +553,7 @@ def test_magnitude_pruning_conv_nm_pattern():
 
     pruned = onnxsim.apply_magnitude_pruning(model, n=2, m=4)
     K = Cin * 3 * 3
-    w_flat = _conv_weight(pruned).reshape(Cout, K)
+    w_flat = _magnitude_weight(pruned).reshape(Cout, K)
     assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=1e-9)
     for row in w_flat:
         for start in range(0, len(row), 4):
@@ -529,7 +578,7 @@ def test_magnitude_pruning_conv_depthwise_reaches_target_sparsity_and_matches_or
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
     onnx.checker.check_model(pruned)
     assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=1e-9)
-    w_pruned = _conv_weight(pruned)
+    w_pruned = _magnitude_weight(pruned)
     assert w_pruned.shape == w.shape
     # group/kernel_shape attributes (and hence output shape) are untouched
     # -- this is a value-only rewrite.
@@ -567,7 +616,7 @@ def test_magnitude_pruning_conv_general_grouped_reaches_target_sparsity_and_matc
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
     onnx.checker.check_model(pruned)
     assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=1e-9)
-    w_pruned = _conv_weight(pruned)
+    w_pruned = _magnitude_weight(pruned)
     assert w_pruned.shape == w.shape
     conv_node = pruned.graph.node[0]
     assert next(a.i for a in conv_node.attribute if a.name == "group") == group
@@ -755,7 +804,7 @@ def test_wanda_pruning_conv_protects_high_activation_channel():
     )
     onnx.checker.check_model(wanda_pruned)
 
-    w_magnitude = _conv_weight(magnitude_pruned)
+    w_magnitude = _magnitude_weight(magnitude_pruned)
     w_wanda = _conv_weight(wanda_pruned)
     salient_kept_magnitude = np.count_nonzero(w_magnitude[:, salient_channel, :, :])
     salient_kept_wanda = np.count_nonzero(w_wanda[:, salient_channel, :, :])
@@ -12767,6 +12816,20 @@ def _attention_node(model):
     return next(n for n in model.graph.node if n.op_type == "Attention")
 
 
+def _attention_weight(model):
+    # See `_magnitude_weight`'s own doc comment: `onnxsim.apply_magnitude_pruning`
+    # is now a thin alias for the C++-backed `onnxsim.prune_magnitude_cpp`,
+    # which leaves the original "Wqkv" initializer dangling and appends a
+    # new, anonymously-named one -- so the pruned merged QKV weight must be
+    # resolved via the Attention node's own current weight input (index 1),
+    # not assumed to still be named "Wqkv".
+    node = _attention_node(model)
+    w_name = node.input[1]
+    return onnx.numpy_helper.to_array(
+        next(t for t in model.graph.initializer if t.name == w_name)
+    )
+
+
 def _attention_attrs(node):
     num_heads = next(a.i for a in node.attribute if a.name == "num_heads")
     qkv = next(list(a.ints) for a in node.attribute if a.name == "qkv_hidden_sizes")
@@ -15186,15 +15249,20 @@ def test_magnitude_pruning_attention_merged_weight_reaches_target_sparsity():
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
     onnx.checker.check_model(pruned)
 
-    inits = {t.name: t for t in pruned.graph.initializer}
-    wqkv_pruned = onnx.numpy_helper.to_array(inits["Wqkv"])
+    wqkv_pruned = _attention_weight(pruned)
     assert wqkv_pruned.shape == cfg["wqkv"].shape
     zeros = np.count_nonzero(wqkv_pruned == 0)
     assert zeros / wqkv_pruned.size == pytest.approx(0.5, abs=1e-9)
 
     # Bias is never touched by this pass -- only the matched weight is.
+    # (Bias' own input index (2) and name ("Bqkv") are untouched -- only the
+    # weight input is ever rewired.)
+    bias_name = _attention_node(pruned).input[2]
     np.testing.assert_array_equal(
-        onnx.numpy_helper.to_array(inits["Bqkv"]), cfg["bqkv"]
+        onnx.numpy_helper.to_array(
+            next(t for t in pruned.graph.initializer if t.name == bias_name)
+        ),
+        cfg["bqkv"],
     )
 
     # num_heads/qkv_hidden_sizes describe the merged weight's *column
@@ -15203,7 +15271,19 @@ def test_magnitude_pruning_attention_merged_weight_reaches_target_sparsity():
     # just these two attributes) must come out byte-identical.
     node_before = _attention_node(model)
     node_after = _attention_node(pruned)
-    assert node_after.SerializeToString() == node_before.SerializeToString()
+    # Only the weight input (index 1) is rewired to a new initializer name
+    # (see `_attention_weight`'s own doc comment) -- num_heads/
+    # qkv_hidden_sizes and every other input describe the merged weight's
+    # own column layout, not any zeroed-vs-nonzero split within it, so the
+    # rest of the node (not just these two attributes) must still come out
+    # byte-identical.
+    node_after_same_weight_name = onnx.NodeProto()
+    node_after_same_weight_name.CopyFrom(node_after)
+    node_after_same_weight_name.input[1] = node_before.input[1]
+    assert (
+        node_after_same_weight_name.SerializeToString()
+        == node_before.SerializeToString()
+    )
     num_heads, qkv = _attention_attrs(node_after)
     assert num_heads == cfg["H"]
     assert qkv == [cfg["Nq"], cfg["Nk"], cfg["Nv"]]
@@ -15213,9 +15293,8 @@ def test_magnitude_pruning_attention_merged_weight_keeps_the_largest_entries_per
     model, cfg = _attention_model(K=8, H=4, D=4, Out=6, seed=21)
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.75)
 
-    inits = {t.name: t for t in pruned.graph.initializer}
     w = cfg["wqkv"].astype(np.float64)  # [K, N]
-    w_pruned = onnx.numpy_helper.to_array(inits["Wqkv"]).astype(np.float64)
+    w_pruned = _attention_weight(pruned).astype(np.float64)
     keep_count = round(cfg["K"] * 0.25)
     for col in range(w.shape[1]):
         kept = np.flatnonzero(w_pruned[:, col] != 0)
@@ -15230,8 +15309,7 @@ def test_magnitude_pruning_attention_merged_weight_nm_pattern():
     pruned = onnxsim.apply_magnitude_pruning(model, n=2, m=4)
     onnx.checker.check_model(pruned)
 
-    inits = {t.name: t for t in pruned.graph.initializer}
-    w_pruned = onnx.numpy_helper.to_array(inits["Wqkv"]).T  # [N, K]
+    w_pruned = _attention_weight(pruned).T  # [N, K]
     for row in w_pruned:
         for start in range(0, len(row), 4):
             group = row[start : start + 4]
@@ -15266,10 +15344,8 @@ def test_wanda_pruning_attention_merged_weight_uses_calibrated_activation_norm()
     )
     onnx.checker.check_model(wanda_pruned)
 
-    inits_m = {t.name: t for t in magnitude_pruned.graph.initializer}
-    inits_w = {t.name: t for t in wanda_pruned.graph.initializer}
-    w_magnitude = onnx.numpy_helper.to_array(inits_m["Wqkv"])  # [K, N]
-    w_wanda = onnx.numpy_helper.to_array(inits_w["Wqkv"])
+    w_magnitude = _attention_weight(magnitude_pruned)  # [K, N]
+    w_wanda = _attention_weight(wanda_pruned)
 
     # The calibration signal must actually be used, not just tolerated
     # without error -- Wanda's result must differ from plain magnitude
@@ -15352,9 +15428,8 @@ def test_magnitude_pruning_gqa_qkv_weights_already_matched():
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
     onnx.checker.check_model(pruned)
 
-    inits = {t.name: t for t in pruned.graph.initializer}
     for name, original in (("Wq", cfg["wq"]), ("Wk", cfg["wk"]), ("Wv", cfg["wv"])):
-        w = onnx.numpy_helper.to_array(inits[name])
+        w = _magnitude_weight_by_original_name(model, pruned, name)
         assert w.shape == original.shape
         zeros = np.count_nonzero(w == 0)
         assert zeros / w.size == pytest.approx(0.5, abs=1e-9)
@@ -15362,7 +15437,10 @@ def test_magnitude_pruning_gqa_qkv_weights_already_matched():
 
     # num_heads/kv_num_heads are untouched -- this is a value-only rewrite
     # of Wq/Wk/Wv/Wout, not the structural head-pruning this file's own
-    # `apply_attention_head_pruning` performs on the same node type.
+    # `apply_attention_head_pruning` performs on the same node type -- the
+    # GQA node itself never has its own weight input rewired (Wq/Wk/Wv are
+    # plain upstream MatMul producers' own weights, not an input GQA itself
+    # owns), so it must still come out byte-identical.
     node_before = _gqa_node(model)
     node_after = _gqa_node(pruned)
     assert node_after.SerializeToString() == node_before.SerializeToString()
@@ -25224,7 +25302,8 @@ def test_magnitude_pruning_fp16_matches_ort_execution_and_preserves_exact_bits()
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
     onnx.checker.check_model(pruned)
 
-    w_init = pruned.graph.initializer[0]
+    w_name = pruned.graph.node[0].input[1]
+    w_init = next(t for t in pruned.graph.initializer if t.name == w_name)
     assert w_init.data_type == onnx.TensorProto.FLOAT16  # dtype preserved, not upcast
     w_pruned = onnx.numpy_helper.to_array(w_init)
     assert w_pruned.dtype == np.float16
@@ -25304,7 +25383,7 @@ def test_magnitude_pruning_fp16_uses_genuine_decode_not_raw_float32_reinterpreta
     )
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
     onnx.checker.check_model(pruned)
-    w_pruned = onnx.numpy_helper.to_array(pruned.graph.initializer[0])
+    w_pruned = _magnitude_weight(pruned)
     assert w_pruned.dtype == np.float16
 
     # Correct fp16 decode keeps rows 0/1 (values 8, 4) entirely nonzero and
@@ -25354,7 +25433,7 @@ def test_wanda_pruning_fp16_protects_high_activation_channels_matches_ort():
     assert wanda_pruned.graph.initializer[0].data_type == onnx.TensorProto.FLOAT16
     assert onnxsim.weight_sparsity(wanda_pruned) == pytest.approx(0.5, abs=1e-9)
 
-    w_magnitude = onnx.numpy_helper.to_array(magnitude_pruned.graph.initializer[0])
+    w_magnitude = _magnitude_weight(magnitude_pruned)
     w_wanda = onnx.numpy_helper.to_array(wanda_pruned.graph.initializer[0])
     salient_kept_magnitude = np.count_nonzero(w_magnitude[list(salient), :])
     salient_kept_wanda = np.count_nonzero(w_wanda[list(salient), :])
@@ -25645,7 +25724,8 @@ def test_magnitude_pruning_bfloat16_preserves_dtype_and_matches_array_oracle():
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
     onnx.checker.check_model(pruned)
 
-    w_init = pruned.graph.initializer[0]
+    w_name = pruned.graph.node[0].input[1]
+    w_init = next(t for t in pruned.graph.initializer if t.name == w_name)
     assert w_init.data_type == onnx.TensorProto.BFLOAT16
     w_pruned = onnx.numpy_helper.to_array(w_init)
     assert w_pruned.dtype == ml_dtypes.bfloat16
@@ -25860,7 +25940,7 @@ def test_analyze_magnitude_pruning_matches_real_call():
     assert report.not_eligible == []
 
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
-    w = onnx.numpy_helper.to_array(pruned.graph.initializer[0])
+    w = _magnitude_weight(pruned)
     assert layer.would_drop == int((w == 0).sum())
     assert layer.would_drop == pytest.approx(K * N * 0.5, abs=N)  # per-row rounding
 
@@ -25872,7 +25952,7 @@ def test_analyze_magnitude_pruning_nm_pattern_matches_real_call():
         model, onnxsim.apply_magnitude_pruning, n=2, m=4
     )
     pruned = onnxsim.apply_magnitude_pruning(model, n=2, m=4)
-    w = onnx.numpy_helper.to_array(pruned.graph.initializer[0])
+    w = _magnitude_weight(pruned)
     assert report.layers[0].would_drop == int((w == 0).sum())
     assert report.layers[0].would_drop == K * N // 2  # exactly half for 2:4
 
@@ -25886,17 +25966,19 @@ def test_analyze_magnitude_pruning_global_sparsity_matches_real_call():
         global_sparsity=True,
     )
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5, global_sparsity=True)
-    inits = {t.name: t for t in pruned.graph.initializer}
     # `report.layers`' own `label` is each producer node's own output name
-    # (MatMul nodes here are unnamed in the parsed text) -- "Y1"/"Y2" --
-    # not the weight initializer's own name ("Wbig"/"Wsmall"); map between
-    # them via each node's own single weight input.
-    weight_by_output = {node.output[0]: node.input[1] for node in model.graph.node}
-    by_weight = {weight_by_output[layer.label]: layer for layer in report.layers}
-    assert set(by_weight) == set(inits)
-    for name, init in inits.items():
-        w = onnx.numpy_helper.to_array(init)
-        assert by_weight[name].would_drop == int((w == 0).sum())
+    # (MatMul nodes here are unnamed in the parsed text) -- "Y1"/"Y2" -- map
+    # each to that SAME node's position, then resolve the pruned weight via
+    # its current weight input in `pruned` (no longer named "Wbig"/"Wsmall"
+    # -- see `_magnitude_weight`'s own doc comment).
+    output_to_node_index = {
+        node.output[0]: i for i, node in enumerate(model.graph.node)
+    }
+    by_label = {layer.label: layer for layer in report.layers}
+    assert set(by_label) == set(output_to_node_index)
+    for output_name, node_index in output_to_node_index.items():
+        w = _magnitude_weight(pruned, node_index=node_index)
+        assert by_label[output_name].would_drop == int((w == 0).sum())
 
 
 def test_analyze_wanda_pruning_matches_real_call():
@@ -40386,15 +40468,13 @@ def test_magnitude_pruning_masks_subgraph_weights():
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
     onnx.checker.check_model(pruned)
 
-    top_inits = {t.name: t for t in pruned.graph.initializer}
-    w1t = onnx.numpy_helper.to_array(top_inits["W1t"])
+    w1t = _magnitude_weight_in_graph(model.graph, pruned.graph, "W1t")
     assert np.mean(w1t == 0) == pytest.approx(0.5, abs=0.05)
 
+    then_g_orig, else_g_orig = _then_else_graphs(model)
     then_g, else_g = _then_else_graphs(pruned)
-    then_inits = {t.name: t for t in then_g.initializer}
-    else_inits = {t.name: t for t in else_g.initializer}
-    then_w1 = onnx.numpy_helper.to_array(then_inits["then_W1"])
-    else_w1 = onnx.numpy_helper.to_array(else_inits["else_W1"])
+    then_w1 = _magnitude_weight_in_graph(then_g_orig, then_g, "then_W1")
+    else_w1 = _magnitude_weight_in_graph(else_g_orig, else_g, "else_W1")
     assert np.mean(then_w1 == 0) == pytest.approx(0.5, abs=0.05)
     assert np.mean(else_w1 == 0) == pytest.approx(0.5, abs=0.05)
 
@@ -40404,20 +40484,18 @@ def test_magnitude_pruning_global_sparsity_pools_across_top_level_and_subgraphs(
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.3, global_sparsity=True)
     onnx.checker.check_model(pruned)
 
-    top_inits = {t.name: t for t in pruned.graph.initializer}
+    then_g_orig, else_g_orig = _then_else_graphs(model)
     then_g, else_g = _then_else_graphs(pruned)
-    then_inits = {t.name: t for t in then_g.initializer}
-    else_inits = {t.name: t for t in else_g.initializer}
 
     total = 0
     zeros = 0
-    for name_map, names in [
-        (top_inits, ["W1t", "W2t"]),
-        (then_inits, ["then_W1", "then_W2"]),
-        (else_inits, ["else_W1", "else_W2"]),
+    for orig_graph, pruned_graph, names in [
+        (model.graph, pruned.graph, ["W1t", "W2t"]),
+        (then_g_orig, then_g, ["then_W1", "then_W2"]),
+        (else_g_orig, else_g, ["else_W1", "else_W2"]),
     ]:
         for name in names:
-            arr = onnx.numpy_helper.to_array(name_map[name])
+            arr = _magnitude_weight_in_graph(orig_graph, pruned_graph, name)
             total += arr.size
             zeros += int(np.count_nonzero(arr == 0))
 
@@ -40597,7 +40675,7 @@ def test_analyze_magnitude_pruning_no_subgraphs_matches_pre_existing_behavior():
     assert report.not_eligible == []
 
     pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
-    w = onnx.numpy_helper.to_array(pruned.graph.initializer[0])
+    w = _magnitude_weight(pruned)
     assert layer.would_drop == int((w == 0).sum())
 
 
