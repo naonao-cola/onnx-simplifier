@@ -3787,7 +3787,19 @@ def main():
         "--tflite-optimize",
         action="store_true",
         help="Enable TFLite's default post-training (dynamic-range) quantization "
-        "when converting with --emit-tflite.",
+        "when converting with --emit-tflite. Only applies to --tflite-backend "
+        "builtin.",
+    )
+    parser.add_argument(
+        "--tflite-backend",
+        choices=["builtin", "onnx2tf"],
+        default="builtin",
+        help="Which ONNX-to-TensorFlow translator --emit-tflite uses: 'builtin' "
+        "(default, covers a practical op subset, keeps the model's NCHW I/O "
+        "layout) or 'onnx2tf' (via https://github.com/PINTO0309/onnx2tf; pip "
+        "install onnx2tf -- far broader op coverage, but a much heavier "
+        "dependency and a default channel-last I/O layout). Reach for onnx2tf "
+        "when a model hits an unsupported op with the builtin translator.",
     )
     parser.add_argument(
         "--node-reduction-plot",
@@ -4684,12 +4696,23 @@ def main():
     if args.emit_tflite is not None:
         from onnxsim import tflite_export
 
+        if args.tflite_optimize and args.tflite_backend != "builtin":
+            print(
+                Text(
+                    "--tflite-optimize only applies to --tflite-backend builtin.",
+                    style="bold red",
+                )
+            )
+            sys.exit(1)
         if args.emit_tflite:
             tflite_path = args.emit_tflite
         else:
             tflite_path = os.path.splitext(args.output_model)[0] + ".tflite"
-        print(f"Converting to TensorFlow Lite at {tflite_path} ...")
-        tflite_kwargs = {}
+        print(
+            f"Converting to TensorFlow Lite (backend: {args.tflite_backend}) at "
+            f"{tflite_path} ..."
+        )
+        tflite_kwargs = {"backend": args.tflite_backend}
         if args.tflite_optimize:
             tflite_kwargs["optimizations"] = ["DEFAULT"]
         try:

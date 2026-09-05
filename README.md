@@ -104,7 +104,10 @@ constant folding until the model stops changing. Around that it offers:
 - **[TensorFlow Lite export](#exporting-to-tensorflow-lite).** Convert the
   simplified model to a `.tflite` flatbuffer with `--emit-tflite` (Python:
   `onnxsim.export_tflite`), via a built-in ONNX-to-TensorFlow translator and
-  `tf.lite.TFLiteConverter`. TensorFlow is optional.
+  `tf.lite.TFLiteConverter`. TensorFlow is optional; pass `--tflite-backend
+  onnx2tf` to route through
+  [onnx2tf](https://github.com/PINTO0309/onnx2tf) instead for far broader op
+  coverage.
 - **Large-model handling.** Guard against blow-up from ops like `Tile`/
   `ConstantOfShape` (`--no-large-tensor`), read and write external-data models,
   and eliminate unused outputs (`--unused-output`).
@@ -479,6 +482,43 @@ onnxsim.export_tflite(model_simp, "model.tflite")
 `tf.lite.TFLiteConverter.optimizations` (e.g. `["DEFAULT"]`, what
 `--tflite-optimize` sets, to enable post-training dynamic-range
 quantization). See `onnxsim/tflite_export.py` for the full signature.
+
+### A broader-coverage backend: onnx2tf
+
+The built-in translator above covers a practical op subset. For a model that
+hits an unsupported op, pass `backend="onnx2tf"` (CLI: `--tflite-backend
+onnx2tf`) to route the conversion through
+[onnx2tf](https://github.com/PINTO0309/onnx2tf) instead -- a separate,
+actively maintained project with far broader op coverage (~200 ops) and years
+of production hardening across real-world model zoos.
+
+```
+pip install onnx2tf
+```
+
+onnx2tf is a much heavier dependency than the builtin backend needs (it pulls
+its own TensorFlow, onnxruntime, onnx-graphsurgeon, and a couple dozen small
+`*4onnx` helper packages), and it changes the model's public input/output
+tensor layout to channel-last by default -- it converts *every* tensor of
+rank >= 3 to that convention, not just 4-D image tensors, unlike the builtin
+backend which always keeps ONNX's own declared shapes. Pass onnx2tf's own
+`keep_ncw_or_nchw_or_ncdhw_input_names` (a list of input names to keep in
+their original ONNX layout) as an extra keyword argument if you need specific
+inputs to keep their original layout.
+
+```
+onnxsim input.onnx simplified.onnx --emit-tflite --tflite-backend onnx2tf
+```
+
+```python
+tflite_model = onnxsim.export_tflite(model_simp, backend="onnx2tf")
+```
+
+`--tflite-optimize`/`optimizations` only applies to the builtin backend; use
+onnx2tf's own quantization options (forwarded as extra keyword arguments,
+e.g. `output_integer_quantized_tflite=True`) instead. See
+`onnxsim/onnx2tf_export.py` for the full signature and onnx2tf's own
+documentation for its option list.
 
 ## Constant folding on the GPU (CUDA execution provider)
 

@@ -345,3 +345,21 @@ def test_uneven_split_matches_onnxruntime():
     )
     onnx.checker.check_model(model)
     _assert_matches_onnxruntime(model, {"x": x})
+
+
+# ---------------------------------------------------------------------------
+# backend= dispatch (the "onnx2tf" backend itself is covered by
+# test_onnx2tf_export.py, skipped when onnx2tf isn't installed)
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_backend_raises():
+    with pytest.raises(ValueError, match="Unknown backend"):
+        onnxsim.export_tflite(_relu_model(), backend="bogus")
+
+
+def test_builtin_backend_rejects_backend_specific_kwargs():
+    with pytest.raises(TypeError, match="unexpected keyword arguments"):
+        onnxsim.export_tflite(
+            _relu_model(), keep_ncw_or_nchw_or_ncdhw_input_names=["x"]
+        )

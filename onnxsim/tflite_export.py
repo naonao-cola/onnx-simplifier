@@ -32,6 +32,14 @@ first with onnxsim's own ``--overwrite-input-shape``/``--test-input-shape`` if n
 TensorFlow Lite's own op kernels are NHWC-only, while ONNX's conv/pool ops are NCHW;
 this translator keeps the graph's public tensors in ONNX's NCHW layout and transposes
 to/from NHWC only around the ops (``Conv``/``MaxPool``/``AveragePool``) that need it.
+
+A model whose op set goes beyond ``SUPPORTED_ONNX_OPS`` can instead be routed through
+`onnx2tf <https://github.com/PINTO0309/onnx2tf>`_, an actively maintained third-party
+project with far broader op coverage, via ``backend="onnx2tf"`` on
+:func:`convert_to_tflite`/:func:`export_tflite` (CLI: ``--tflite-backend onnx2tf``).
+See ``onnx2tf_export.py`` for what that trades off in return (a much heavier
+dependency, and a default channel-last I/O layout unlike this module's NCHW-preserving
+translator).
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -889,7 +897,9 @@ def _build_concrete_function(model: onnx.ModelProto, tf):
 def convert_to_tflite(
     model: onnx.ModelProto,
     *,
+    backend: str = "builtin",
     optimizations: Optional[List[Any]] = None,
+    **backend_kwargs: Any,
 ):
     """Convert an ONNX model to an in-memory TFLite flatbuffer (``bytes``).
 
@@ -897,13 +907,25 @@ def convert_to_tflite(
     ----------
     model:
         The ONNX model to convert. Typically the output of :func:`onnxsim.simplify`.
-        Every graph input dimension must be static; every node's op must be one of
-        ``SUPPORTED_ONNX_OPS``.
+    backend:
+        Which ONNX-to-TensorFlow translator to use: ``"builtin"`` (default, this
+        module's own hand-written translator -- every graph input dimension must
+        be static and every node's op must be one of ``SUPPORTED_ONNX_OPS``) or
+        ``"onnx2tf"`` (delegates to `onnx2tf <https://github.com/PINTO0309/onnx2tf>`_,
+        which covers far more ops at the cost of a much heavier dependency and
+        changing the model's public input/output tensor layout to channel-last by
+        default -- see ``onnxsim/onnx2tf_export.py``). Reach for ``"onnx2tf"`` when
+        a model hits an unsupported op with the builtin translator.
     optimizations:
-        Optional list forwarded to ``tf.lite.TFLiteConverter.optimizations``, e.g.
-        ``["DEFAULT"]`` (string names of ``tf.lite.Optimize`` members are accepted, as
-        well as the enum members themselves) to enable TFLite's post-training
-        (dynamic-range) quantization.
+        ``backend="builtin"`` only. Optional list forwarded to
+        ``tf.lite.TFLiteConverter.optimizations``, e.g. ``["DEFAULT"]`` (string
+        names of ``tf.lite.Optimize`` members are accepted, as well as the enum
+        members themselves) to enable TFLite's post-training (dynamic-range)
+        quantization.
+    **backend_kwargs:
+        ``backend="onnx2tf"`` only. Forwarded to
+        :func:`onnxsim.onnx2tf_export.convert_to_tflite_via_onnx2tf` (and from there
+        to ``onnx2tf.convert()``).
 
     Returns
     -------
@@ -913,10 +935,24 @@ def convert_to_tflite(
     Raises
     ------
     RuntimeError
-        If TensorFlow is not installed, an input has a non-static dimension, the
-        graph uses an ONNX op/feature this translator does not support, or
-        conversion itself fails.
+        If the selected backend's dependency is not installed, or conversion
+        fails -- for ``"builtin"``, an input has a non-static dimension or the
+        graph uses an ONNX op/feature the translator does not support.
     """
+    if backend == "onnx2tf":
+        from onnxsim import onnx2tf_export
+
+        return onnx2tf_export.convert_to_tflite_via_onnx2tf(model, **backend_kwargs)
+    if backend != "builtin":
+        raise ValueError(
+            f"Unknown backend {backend!r}; expected 'builtin' or 'onnx2tf'"
+        )
+    if backend_kwargs:
+        raise TypeError(
+            f"convert_to_tflite() with backend='builtin' got unexpected keyword "
+            f"arguments: {sorted(backend_kwargs)}"
+        )
+
     tf = _import_tensorflow()
     concrete = _build_concrete_function(model, tf)
     converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete])
@@ -950,7 +986,8 @@ def export_tflite(
         If given, the ``.tflite`` flatbuffer is written here. If ``None``, the model
         is only returned.
 
-    Other keyword arguments are forwarded to :func:`convert_to_tflite`.
+    Other keyword arguments (including ``backend``) are forwarded to
+    :func:`convert_to_tflite`.
 
     Returns
     -------
