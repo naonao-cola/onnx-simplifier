@@ -27270,21 +27270,22 @@ def apply_moe_expert_channel_pruning(
     :func:`_apply_moe_chains`, so an `MoE` node's own tensors are never
     confused with a same-named-by-coincidence node in a sibling or
     ancestor graph.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_moe_expert_channel_pruning_cpp`
+    (``onnxsim/structured_pruning_entry.cpp``'s own
+    ``ApplyMoeExpertChannelPruning``, including its own FLOAT16/BFLOAT16
+    weight support, matching this function's own above), forwarding every
+    argument unchanged. Imported lazily (inside the function body, not at
+    module scope) to avoid a circular import: ``onnxsim.onnx_simplifier``
+    already imports from this module (:class:`EmbeddingPruningResult`), so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
-    if not (0.0 <= sparsity < 1.0):
-        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
+    from onnxsim.onnx_simplifier import apply_moe_expert_channel_pruning_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-
-    for graph in _iter_subgraphs(out.graph):
-        chains = _find_moe_chains(graph)
-        if chains:
-            _apply_moe_chains(graph, chains, sparsity, _moe_importance)
-
-    return out
+    return apply_moe_expert_channel_pruning_cpp(model, sparsity=sparsity)
 
 
 # --- MoE whole-expert pruning ------------------------------------------------
@@ -27747,50 +27748,30 @@ def apply_moe_whole_expert_pruning(
     `calibration_data`) -- so a nested-subgraph `MoE` node is still
     correctly pruned, just by weight norm rather than measured router
     usage, never silently skipped.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_moe_whole_expert_pruning_cpp`
+    (``onnxsim/structured_pruning_entry.cpp``'s own
+    ``ApplyMoeWholeExpertPruning``, including its own FLOAT16/BFLOAT16
+    `fc1`/`fc2`/bias AND router-projection weight/bias support, plus a
+    dtype-agnostic router-gate calibration capture matching this
+    function's own above), forwarding every argument unchanged. Imported
+    lazily (inside the function body, not at module scope) to avoid a
+    circular import: ``onnxsim.onnx_simplifier`` already imports from this
+    module (:class:`EmbeddingPruningResult`), so importing it back at
+    module load time here would deadlock the import machinery.
     """
-    if not (0.0 <= sparsity < 1.0):
-        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_moe_whole_expert_pruning_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-
-    top_chains = _find_moe_whole_expert_chains(out.graph)
-    mean_gate_weight = (
-        _moe_router_gate_calibration_stats(out, top_chains, calibration_data, providers)
-        if top_chains
-        else {}
+    return apply_moe_whole_expert_pruning_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        sparsity=sparsity,
+        providers=providers,
     )
-
-    def _importance(
-        chain: _MoEExpertChain, initializer_map: Dict[str, onnx.TensorProto]
-    ) -> np.ndarray:
-        gate = mean_gate_weight.get(chain.router_probs)
-        if gate is None or gate.shape[0] != chain.num_experts:
-            return _moe_expert_weight_importance(chain, initializer_map)
-        return gate
-
-    for graph in _iter_subgraphs(out.graph):
-        chains = (
-            top_chains if graph is out.graph else _find_moe_whole_expert_chains(graph)
-        )
-        if not chains:
-            continue
-
-        stale_value_info = _apply_moe_whole_expert_chains(
-            graph, chains, sparsity, _importance
-        )
-        if stale_value_info:
-            kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
-            del graph.value_info[:]
-            graph.value_info.extend(kept)
-
-    return out
 
 
 # --- QMoE (quantized-weight MoE) pruning -------------------------------------
@@ -29145,23 +29126,23 @@ def apply_qmoe_expert_channel_pruning(
     were its own top-level graph -- each graph gets its own
     :func:`_find_qmoe_chains` call and its own touched-role state inside
     :func:`_apply_qmoe_channel_chains`.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_qmoe_expert_channel_pruning_cpp`
+    (``onnxsim/structured_pruning_entry.cpp``'s own
+    ``ApplyQMoEExpertChannelPruning``, including its own FLOAT16/BFLOAT16
+    `fc1`/`fc2_scales`/bias support, matching this function's own
+    :func:`_is_supported_float_dtype` above), forwarding every argument
+    unchanged. Imported lazily (inside the function body, not at module
+    scope) to avoid a circular import: ``onnxsim.onnx_simplifier`` already
+    imports from this module (:class:`EmbeddingPruningResult`), so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
-    if not (0.0 <= sparsity < 1.0):
-        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
+    from onnxsim.onnx_simplifier import apply_qmoe_expert_channel_pruning_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-
-    for graph in _iter_subgraphs(out.graph):
-        chains = _find_qmoe_chains(graph)
-        if chains:
-            _apply_qmoe_channel_chains(
-                graph, chains, sparsity, _qmoe_channel_importance
-            )
-
-    return out
+    return apply_qmoe_expert_channel_pruning_cpp(model, sparsity=sparsity)
 
 
 @dataclass(frozen=True)
@@ -29467,50 +29448,31 @@ def apply_qmoe_whole_expert_pruning(
     always falls back to :func:`_qmoe_expert_weight_importance` instead,
     so it is still correctly pruned, just by weight norm rather than
     measured router usage.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_qmoe_whole_expert_pruning_cpp`
+    (``onnxsim/structured_pruning_entry.cpp``'s own
+    ``ApplyQMoEWholeExpertPruning``, including its own FLOAT16/BFLOAT16
+    `fc1`/`fc2_scales`/bias AND router-projection weight/bias support, plus
+    a dtype-agnostic router-gate calibration capture matching
+    :func:`apply_moe_whole_expert_pruning`'s own identical retirement),
+    forwarding every argument unchanged. Imported lazily (inside the
+    function body, not at module scope) to avoid a circular import:
+    ``onnxsim.onnx_simplifier`` already imports from this module
+    (:class:`EmbeddingPruningResult`), so importing it back at module load
+    time here would deadlock the import machinery.
     """
-    if not (0.0 <= sparsity < 1.0):
-        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_qmoe_whole_expert_pruning_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-
-    top_chains = _find_qmoe_whole_expert_chains(out.graph)
-    mean_gate_weight = (
-        _moe_router_gate_calibration_stats(out, top_chains, calibration_data, providers)
-        if top_chains
-        else {}
+    return apply_qmoe_whole_expert_pruning_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        sparsity=sparsity,
+        providers=providers,
     )
-
-    def _importance(
-        chain: _QMoEExpertChain, initializer_map: Dict[str, onnx.TensorProto]
-    ) -> np.ndarray:
-        gate = mean_gate_weight.get(chain.router_probs)
-        if gate is None or gate.shape[0] != chain.num_experts:
-            return _qmoe_expert_weight_importance(chain, initializer_map)
-        return gate
-
-    for graph in _iter_subgraphs(out.graph):
-        chains = (
-            top_chains if graph is out.graph else _find_qmoe_whole_expert_chains(graph)
-        )
-        if not chains:
-            continue
-
-        stale_value_info = _apply_qmoe_whole_expert_chains(
-            graph, chains, sparsity, _importance
-        )
-        if stale_value_info:
-            kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
-            del graph.value_info[:]
-            graph.value_info.extend(kept)
-
-    return out
 
 
 # --- MatMulBlockQuantizedFp4Weight/MatMulBlockQuantizedFp8Weight

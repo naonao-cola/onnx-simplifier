@@ -378,8 +378,9 @@ onnx::ModelProto ApplyTransformerBlockPruning(
 // `com.microsoft::Attention` node's constant 2-D FLOAT32 merged QKV weight
 // (MatchAttentionProducer). Deliberately narrower than pruning.py's own
 // `apply_sparsegpt_pruning` in two ways, both mirroring this file's own
-// already-established C++-port scope decisions elsewhere (e.g.
-// ApplyMoeExpertChannelPruning's own FLOAT32-only restriction):
+// already-established C++-port scope decisions elsewhere (e.g. the
+// "MatMulNBits" section's own FLOAT32-only restriction on its scales/
+// zero_points/bias tensors):
 //   - FLOAT32 only, not also FLOAT16/BFLOAT16.
 //   - 2-D `Conv` (ordinary/depthwise/general-grouped) is NOT matched at
 //     all -- pruning.py's own Conv support needs an entirely new, from-

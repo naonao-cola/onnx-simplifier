@@ -16,8 +16,24 @@ that actually prunes something runs the result through a real onnxruntime
 CPU session, exactly like the Python-side tests do: confirmed, empirically,
 to be the one real oracle available for ``com.microsoft::MoE`` in this
 environment.
+
+``onnxsim.apply_moe_expert_channel_pruning`` (the pure-Python name) is now
+itself a thin alias for :func:`onnxsim.apply_moe_expert_channel_pruning_cpp`
+(full parity verified, including FLOAT16/BFLOAT16 weights -- see
+pruning.py's own "MoE expert-intermediate-channel pruning" section
+comment), so the one test below that used to call BOTH entry points and
+compare their live outputs would be tautological (literally the same code
+path twice) if left as-is -- it now instead compares the C++ port's output
+against a golden fixture captured from the real pure-Python implementation
+*before* it was deleted (see ``_GOLDEN_*`` below, base64-encoded serialized
+``ModelProto`` bytes, inlined directly per this repo's own established
+convention -- see ``tests/test_transformer_block_pruning_cpp.py``'s own
+identical precedent/module-docstring for the full rationale).
 """
 
+import base64
+
+import ml_dtypes
 import numpy as np
 import onnx
 import onnx.helper
@@ -28,6 +44,41 @@ from onnx import parser
 import onnxsim
 
 ort = pytest.importorskip("onnxruntime")
+
+
+def _golden(b64):
+    return onnx.load_from_string(base64.b64decode(b64))
+
+
+# Frozen from onnxsim.apply_moe_expert_channel_pruning's own real pure-Python
+# implementation, on the exact model + seed
+# test_moe_expert_channel_pruning_cpp_matches_python_port builds, before
+# that implementation was deleted in favor of the C++ port (see this file's
+# own module docstring).
+_GOLDEN_MOE_EXPERT_CHANNEL_MATCHES_PYTHON_PORT = (
+    "CAo6qQkKbQoBWAoBUgoERkMxVwoERkMxQgoERkMyVwoAEgFZIgNNb0UqCAoBaxgCoAECKhoKD2Fj"
+    "dGl2YXRpb25fdHlwZSIEcmVsdaABAyoUCg1zd2lnbHVfZnVzaW9uGACgAQI6DWNvbS5taWNyb3Nv"
+    "ZnQSAWcq0QMIBAgECAcQAUIERkMxV0rAA5QdML/aq6g/2tsEv+b3Xb/aCok/c3p1v4mni79qccg/"
+    "wlsMP0PY3r7H8Qm/Sjixv3WokT/S8JA+gcImv0W7uDwU7uM/os7FvwkMHMCNPCK+zVVcP36w0b7e"
+    "yxrAdMpmv6urZr8R6/K/yoooPzTAkj6qi9u9m0lOv4zuaz6z0pe98L1DPjJDcr7hr+w+oPKavSsE"
+    "9b/39iE/bp6pPi79O78btnY/cnfpPuUwEb4o1PA+QuiHP84iTT86rqI/LgRqvyUg1b9e5BG/xAS+"
+    "v0I8uj4oOxw/AMD3PxPAcr+qwRm/MhpmP201Qz9yFQ0/TJ7QvjXLmr+6XTg/2kU9P7x2L727O+e+"
+    "COAiPrYzKj73m8G/vSHvvvp8FT8KOOK+3U48Pk9i9r5QOlq/7/1HwHM/Bb9QBES/kYBCv8ELc7+P"
+    "foG/WlPGPxX0Cz/8f5w+RfxyPxSeiD4FgNs/TeGFPlKTJ79FzTU/R641v2uihz/6E7c/LpbZPW6G"
+    "wL976SHAh8KUP1Ae8j7hw+s+ojzrvPwNlb45cMs/MeauP2sjiD4eivQ/aa3dPhfiDT+DoB8/ObzX"
+    "vhcXJz++Rhc/PeFevxIC3L8q0QMIBAgHCAQQAUIERkMyV0rAAwdW0T30Soo/dhLcvxozSD/PFbk/"
+    "ShG4v0RcnL+bu88/iMyfvmH+ZT9Ly+k/RRiGP25pHT/OfAO+XtGnP0uxPD6tVAo+6ZcDP3s6sz59"
+    "Agq/4R9RvxsOwb58872/zvmOvhCveb+IxII9sfJ0vmZPqr6t1P0/vxmDPjQ4DUCFvWC+du2ev8C2"
+    "dL/154S/Bq23PyqDIz98n1a/cee5vz3AHz/HZvY+SQpJv3MQzb0vWsQ/p7jnv0vFiD9w8mY+ZIoX"
+    "P43vmj9ASBc+WkzkvsMlJT/BgmI/cX8SP6mYnD3NuDK/qOAIQLn/cr9cRKk+kqZgv8h4K78gDO4/"
+    "8g3Pvl2Ugz/v2aO/sOylPVmpPz6BJbq+oxdFPlg3rz2LgGS/g5oIP3XDTj/k7K6+aawkv3B/8T4o"
+    "WcQ+b9D4vinHDECruBm+b2lLvxshe7/hcWc//cg/vasnBECo6Pk+VmPCPkvjZz5Zme0+Ozihv76r"
+    "bT8p872/9B4PPqJJ/z6mV7e+Iw1VP91aob+P4fK8WR16P3zYgD46nam/XoJtP8U8TL/pWta/j866"
+    "vzigFMCCHck9eXLcP81cH79iSos/gVlQP7hQgb4qTggECAQQAUIERkMxQkpA1aqNP7Kh7r69uOi+"
+    "DS6yvka8ET/VSt6+5QO/vmRaNb5dIoO/0WefP9THsr/LLpo/H02AP2ZcGr/7/ii/D7thv1oTCgFY"
+    "Eg4KDAgBEggKAggGCgIIB1oTCgFSEg4KDAgBEggKAggGCgIIBGITCgFZEg4KDAgBEggKAggGCgII"
+    "B0IECgAQEkIRCg1jb20ubWljcm9zb2Z0EAE="
+)
 
 
 def _model(body, initializer=(), opset=21):
@@ -49,6 +100,14 @@ def _model(body, initializer=(), opset=21):
 
 def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
+
+
+def _f16(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.float16), name)
+
+
+def _bf16(array, name):
+    return onnx.numpy_helper.from_array(array.astype(ml_dtypes.bfloat16), name)
 
 
 def _run(model, feeds):
@@ -413,6 +472,12 @@ def test_moe_expert_channel_pruning_cpp_matches_python_port():
     # test_attention_head_pruning_cpp.py's own cross-check test -- which
     # compares execution OUTPUT, not raw tensors, for exactly this reason --
     # already document), which is not a bug in either port.
+    #
+    # ``apply_moe_expert_channel_pruning`` is now itself an alias for the
+    # C++ port (see this file's own module docstring), so this compares
+    # against a golden fixture frozen from the real pure-Python
+    # implementation instead of calling it live (which would make this
+    # tautological).
     E, hidden, inter = 4, 7, 8
     rng = np.random.default_rng(59)
     fc1_w = rng.standard_normal((E, inter, hidden)).astype(np.float32)
@@ -420,13 +485,13 @@ def test_moe_expert_channel_pruning_cpp_matches_python_port():
     fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
     model = _moe_model(fc1_w, fc2_w, fc1_b=fc1_b)
 
-    pruned_py = onnxsim.apply_moe_expert_channel_pruning(model, sparsity=0.5)
+    golden = _golden(_GOLDEN_MOE_EXPERT_CHANNEL_MATCHES_PYTHON_PORT)
     pruned_cpp = onnxsim.apply_moe_expert_channel_pruning_cpp(model, sparsity=0.5)
-    inits_py = _moe_inits(pruned_py)
+    inits_golden = _moe_inits(golden)
     inits_cpp = _moe_inits(pruned_cpp)
-    np.testing.assert_array_equal(inits_py["FC1W"], inits_cpp["FC1W"])
-    np.testing.assert_array_equal(inits_py["FC2W"], inits_cpp["FC2W"])
-    np.testing.assert_array_equal(inits_py["FC1B"], inits_cpp["FC1B"])
+    np.testing.assert_array_equal(inits_golden["FC1W"], inits_cpp["FC1W"])
+    np.testing.assert_array_equal(inits_golden["FC2W"], inits_cpp["FC2W"])
+    np.testing.assert_array_equal(inits_golden["FC1B"], inits_cpp["FC1B"])
 
 
 def test_moe_expert_channel_pruning_cpp_prunes_inside_if_subgraph():
@@ -511,3 +576,152 @@ def test_moe_expert_channel_pruning_cpp_prunes_inside_if_subgraph():
         next(t for t in then_attr.g.initializer if t.name == "FC1W")
     )
     assert fc1w_pruned.shape == (E, 3, hidden)
+
+
+# --- FP16/BFloat16 weight support -------------------------------------------
+#
+# MatchMoeProducer (structured_pruning_entry.cpp) used to hard-require
+# ``onnx.TensorProto.FLOAT`` for ``fc1_experts_weights``/
+# ``fc2_experts_weights``/``fc1_experts_bias``, silently declining any MoE
+# node whose weights were stored as FLOAT16 or BFLOAT16 -- narrower than
+# ``onnxsim.apply_moe_expert_channel_pruning``'s own ``_is_supported_float_
+# dtype`` (see that module's own "FP16/BFloat16 weight support" section
+# comment). Now widened via IsSupportedFloatDtype/ReadTensorAsF64/
+# WriteF64TensorAs (see structured_pruning_entry.cpp's own "MoE
+# expert-intermediate-channel pruning" section top comment) -- these two
+# tests mirror tests/test_pruning.py's own
+# ``test_moe_expert_channel_pruning_fp16_matches_ort_masking_oracle``/
+# BFLOAT16 array-oracle tests, against the C++-backed entry point.
+#
+# FLOAT16: onnxruntime's CPU MoE kernel genuinely executes FLOAT16 (confirmed
+# separately, same as the pure-Python test suite), so this runs a real
+# session. BFLOAT16 has no onnxruntime CPU execution support in this
+# environment at all (a plain BFLOAT16 MatMul session raises NOT_IMPLEMENTED
+# at session-creation time) -- so that test checks correctness at the array
+# level (dtype preservation, exact per-element bfloat16 decode) instead.
+
+
+def test_moe_expert_channel_pruning_cpp_fp16_matches_ort_masking_oracle():
+    E, hidden, inter, tokens, k = 5, 10, 12, 6, 2
+    rng = np.random.default_rng(1009)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float16)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float16)
+
+    model = _model(
+        f"""
+        g (float16[{tokens},{hidden}] X, float16[{tokens},{E}] R) => (float16[{tokens},{hidden}] Y)
+        {{
+          Y = com.microsoft.MoE <k={k}, activation_type="relu"> (X, R, FC1W, , FC2W)
+        }}
+        """,
+        initializer=[_f16(fc1_w, "FC1W"), _f16(fc2_w, "FC2W")],
+        opset=18,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_moe_expert_channel_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert inits["FC1W"].data_type == onnx.TensorProto.FLOAT16
+    assert list(inits["FC1W"].dims) == [E, 6, hidden]
+
+    fc1_w64 = fc1_w.astype(np.float64)
+    fc2_w64 = fc2_w.astype(np.float64)
+    sq = np.sum(fc1_w64**2, axis=(0, 2)) + np.sum(fc2_w64**2, axis=(0, 1))
+    keep = np.sort(np.argsort(-np.sqrt(sq))[:6])
+
+    fc1_w_pruned = onnx.numpy_helper.to_array(inits["FC1W"])
+    fc2_w_pruned = onnx.numpy_helper.to_array(inits["FC2W"])
+    # Exact bit-pattern match (not assert_allclose) -- this pass only ever
+    # slices/reorders existing rows/columns, never recomputes a surviving
+    # value, so the round trip through float64 must reproduce the original
+    # fp16 bits exactly.
+    np.testing.assert_array_equal(
+        fc1_w_pruned.view(np.uint16), fc1_w[:, keep, :].view(np.uint16)
+    )
+    np.testing.assert_array_equal(
+        fc2_w_pruned.view(np.uint16), fc2_w[:, :, keep].view(np.uint16)
+    )
+
+    rng2 = np.random.default_rng(1010)
+    x = rng2.standard_normal((tokens, hidden)).astype(np.float16)
+    r = rng2.standard_normal((tokens, E)).astype(np.float16)
+    (y_pruned,) = _run(pruned, {"X": x, "R": r})
+    assert y_pruned.dtype == np.float16
+
+    drop = np.setdiff1d(np.arange(inter), keep)
+    fc1_masked = fc1_w64.copy()
+    fc1_masked[:, drop, :] = 0.0
+    fc2_masked = fc2_w64.copy()
+    fc2_masked[:, :, drop] = 0.0
+    masked_model = _model(
+        f"""
+        g (float16[{tokens},{hidden}] X, float16[{tokens},{E}] R) => (float16[{tokens},{hidden}] Y)
+        {{
+          Y = com.microsoft.MoE <k={k}, activation_type="relu"> (X, R, FC1W, , FC2W)
+        }}
+        """,
+        initializer=[
+            _f16(fc1_masked.astype(np.float32), "FC1W"),
+            _f16(fc2_masked.astype(np.float32), "FC2W"),
+        ],
+        opset=18,
+    )
+    masked_model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    (y_masked,) = _run(masked_model, {"X": x, "R": r})
+    np.testing.assert_allclose(
+        y_pruned.astype(np.float64), y_masked.astype(np.float64), rtol=5e-2, atol=5e-2
+    )
+
+
+def test_moe_expert_channel_pruning_cpp_bfloat16_preserves_dtype_and_matches_array_oracle():
+    E, hidden, inter = 5, 10, 12
+    rng = np.random.default_rng(1011)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(ml_dtypes.bfloat16)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(ml_dtypes.bfloat16)
+    fc1_b = rng.standard_normal((E, inter)).astype(ml_dtypes.bfloat16)
+
+    model = _model(
+        f"""
+        g (bfloat16[batch,{hidden}] X, bfloat16[batch,{E}] R) => (bfloat16[batch,{hidden}] Y)
+        {{
+          Y = com.microsoft.MoE <k=2, activation_type="relu"> (X, R, FC1W, FC1B, FC2W)
+        }}
+        """,
+        initializer=[_bf16(fc1_w, "FC1W"), _bf16(fc1_b, "FC1B"), _bf16(fc2_w, "FC2W")],
+        opset=18,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_moe_expert_channel_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert inits["FC1W"].data_type == onnx.TensorProto.BFLOAT16
+    assert inits["FC2W"].data_type == onnx.TensorProto.BFLOAT16
+    assert inits["FC1B"].data_type == onnx.TensorProto.BFLOAT16
+
+    fc1_w64 = fc1_w.astype(np.float64)
+    fc2_w64 = fc2_w.astype(np.float64)
+    fc1_b64 = fc1_b.astype(np.float64)
+    sq = (
+        np.sum(fc1_w64**2, axis=(0, 2))
+        + np.sum(fc2_w64**2, axis=(0, 1))
+        + np.sum(fc1_b64**2, axis=0)
+    )
+    keep = np.sort(np.argsort(-np.sqrt(sq))[:6])
+
+    fc1_w_pruned = onnx.numpy_helper.to_array(inits["FC1W"])
+    fc2_w_pruned = onnx.numpy_helper.to_array(inits["FC2W"])
+    fc1_b_pruned = onnx.numpy_helper.to_array(inits["FC1B"])
+    assert fc1_w_pruned.dtype == ml_dtypes.bfloat16
+    np.testing.assert_array_equal(
+        fc1_w_pruned.view(np.uint16), fc1_w[:, keep, :].view(np.uint16)
+    )
+    np.testing.assert_array_equal(
+        fc2_w_pruned.view(np.uint16), fc2_w[:, :, keep].view(np.uint16)
+    )
+    np.testing.assert_array_equal(
+        fc1_b_pruned.view(np.uint16), fc1_b[:, keep].view(np.uint16)
+    )
