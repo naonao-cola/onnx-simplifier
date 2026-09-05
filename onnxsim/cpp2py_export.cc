@@ -782,20 +782,21 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
 
   // SparseGPT (Frantar & Alistarh, 2023) unstructured/N:M pruning: zeros
   // the least-important entries of every matched MatMul/vanilla-Gemm/
-  // com.microsoft::Attention merged-QKV-weight layer's constant 2-D
-  // FLOAT32/FLOAT16/BFLOAT16 weight, using a sequential, Hessian-error-
-  // compensating algorithm (GPTQ's own Cholesky-factored inverse Hessian
-  // reformulation) rather than a one-shot static importance score --
-  // unlike every pass above, this never changes any tensor's shape, only
-  // individual weight entries' own values. Same executor-as-first-argument,
-  // `calibration_data` (List[Dict[str, onnx.TensorProto]]) crossing
-  // convention as apply_structured_wanda_pruning's own binding above (see
-  // that binding's own comment for the full calibration-crossing design).
-  // `n`/`m` are `None` (unstructured, ranked by `sparsity`) or both given
-  // together (N:M semi-structured). See ApplySparseGptPruning in
-  // structured_pruning_entry.h for the full scope (in particular: 2-D Conv
-  // is NOT matched -- a deliberate, documented narrower-than-pruning.py
-  // scope decision, and the only remaining one).
+  // com.microsoft::Attention merged-QKV-weight/2-D Conv (ordinary/
+  // depthwise/general-grouped) layer's constant FLOAT32/FLOAT16/BFLOAT16
+  // weight, using a sequential, Hessian-error-compensating algorithm
+  // (GPTQ's own Cholesky-factored inverse Hessian reformulation) rather
+  // than a one-shot static importance score -- unlike every pass above,
+  // this never changes any tensor's shape, only individual weight entries'
+  // own values. Same executor-as-first-argument, `calibration_data`
+  // (List[Dict[str, onnx.TensorProto]]) crossing convention as
+  // apply_structured_wanda_pruning's own binding above (see that binding's
+  // own comment for the full calibration-crossing design). `n`/`m` are
+  // `None` (unstructured, ranked by `sparsity`) or both given together
+  // (N:M semi-structured). See ApplySparseGptPruning in
+  // structured_pruning_entry.h for the full scope, now at full parity with
+  // pruning.py's own `apply_sparsegpt_pruning` (itself now a thin alias for
+  // this port), Conv included.
   m.def(
       "apply_sparsegpt_pruning",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -828,12 +829,18 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // one-shot static score, unlike apply_sparsegpt_pruning's own sequential
   // Hessian-error-compensating algorithm. Same candidate set as
   // apply_sparsegpt_pruning's own binding above except widened to
-  // FLOAT32/FLOAT16/BFLOAT16 (still no Conv -- the one remaining gap vs.
-  // pruning.py's own apply_wanda_pruning), and same executor-as-first-
-  // argument, `calibration_data` (List[Dict[str, onnx.TensorProto]])
-  // crossing convention. See ApplyWandaPruning in structured_pruning_
-  // entry.h for the full scope and the data-free magnitude fallback an
-  // unobserved layer gets (unlike SparseGPT, which has none).
+  // FLOAT32/FLOAT16/BFLOAT16, PLUS every 2-D Conv node's constant 4-D
+  // weight (ordinary/depthwise/general-grouped alike) -- TRUE parity with
+  // pruning.py's own apply_wanda_pruning on every one of those candidate
+  // families (deliberately NOT aliased to that function despite the Conv
+  // parity, though -- a separate, pre-existing MatMul-family calibration
+  // rank-handling gap unrelated to Conv blocks it; see ApplyWandaPruning's
+  // own declaration comment in structured_pruning_entry.h for the full
+  // writeup). Same executor-as-first-argument, `calibration_data`
+  // (List[Dict[str, onnx.TensorProto]]) crossing convention. See
+  // ApplyWandaPruning in structured_pruning_entry.h for the full scope and
+  // the data-free magnitude fallback an unobserved layer gets (unlike
+  // SparseGPT, which has none).
   // `global_sparsity` pools every matched layer's importance into one
   // whole-model ranking, mirroring apply_structured_wanda_pruning's own
   // `sparsity`-only mode's structural analogue; incompatible with `n`/`m`.

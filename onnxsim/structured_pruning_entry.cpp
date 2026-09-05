@@ -624,6 +624,16 @@ struct Producer {
   // FindGatedChains; empty for a plain single-producer chain), in forward
   // order (raw output -> ... -> the tensor that feeds the combine op).
   std::vector<onnx::NodeProto*> pre_ops;
+  // True for a ConvTranspose producer (meaningless unless `is_conv`) -- see
+  // MatchConvTransposeProducer's own comment: a ConvTranspose weight's own
+  // output-channel axis is axis 1, not axis 0 (the reverse of Conv's), so
+  // every place that slices/reshapes this producer's own weight by its
+  // output-channel axis (SliceProducerWeight, the ApplyChains(Global) own
+  // `w_arrays_nk` builders) branches on this flag. Appended last, defaulted
+  // `false`, so every pre-existing positional `Producer{...}` initializer
+  // (never a real Conv/ConvTranspose choice before this field existed) is
+  // unaffected. Always `false` for a MatMul/Gemm producer.
+  bool is_conv_transpose = false;
 };
 
 struct ConvPassThrough {
@@ -712,6 +722,18 @@ struct Chain {
   // chain kind -- residual/merge chains, Concat-merged chains, and every
   // MatMul/Gemm chain -- mirroring pruning.py's own `_Chain.group_norm`).
   std::optional<GroupNormPassThrough> group_norm;
+  // True for a ConvTranspose consumer (meaningless unless `consumer_is_conv`)
+  // -- see MatchConvTransposeConsumer's own comment: a ConvTranspose
+  // weight's own input-channel axis is axis 0, flat/global for any `group`
+  // (the mirror image of Conv's grouped consumer axis 1), so
+  // SliceChainChannels routes a grouped ConvTranspose consumer through the
+  // plain SliceConsumerWeight branch rather than SliceGroupedConsumerConv
+  // Weight. Only FindConvChains ever sets this `true` -- ConvTranspose stays
+  // out of scope for a residual/merge chain's or a Concat-merged chain's own
+  // consumer for now (see WalkToConvConsumer's own
+  // `allow_conv_transpose_consumer` parameter), so it is always `false`
+  // there. Mirrors pruning.py's own `_Chain.consumer_is_conv_transpose`.
+  bool consumer_is_conv_transpose = false;
 };
 
 // --- MatMul/Gemm plain chains, mirroring _match_producer/_walk_to_consumer/
@@ -1938,6 +1960,98 @@ std::optional<ConvConsumerMatch> MatchConvConsumer(const onnx::NodeProto& node,
   return ConvConsumerMatch{node.input(1), in_channels, group};
 }
 
+struct ConvTransposeProducerMatch {
+  std::string weight;
+  std::optional<std::string> bias;
+  int64_t out_channels;
+  int64_t group;
+};
+
+// The ConvTranspose analogue of MatchConvProducer -- mirrors pruning.py's own
+// _match_conv_transpose_producer exactly. ConvTranspose's own weight layout
+// is the schema-documented [C, M/group, k1, ..., kn] -- the *reverse* of
+// Conv's [M, C/group, ...]: this node's own output channels (M, what
+// "producer" means here) live on axis 1, not axis 0. Every caller that
+// slices/reshapes this producer's weight by its own output-channel axis is
+// told this via the returned Producer's own `is_conv_transpose=true` flag
+// (set by FindConvChains, the only caller of this function), and uses axis 1
+// instead of axis 0 (see SliceProducerWeight/the ApplyChains(Global) own
+// `w_arrays_nk` builders).
+//
+// Deliberately restricted to `group == 1` -- declined (nullopt) otherwise --
+// unlike MatchConvProducer's support for a *general* grouped Conv: a grouped
+// ConvTranspose producer's own output-channel axis (1) *is*
+// per-group-relative, needing the axis-1 analogue of
+// SliceGroupedConsumerConvWeight this port does not implement. A scope
+// decision, not an oversight -- see pruning.py's own
+// _match_conv_transpose_producer docstring for the full reasoning.
+std::optional<ConvTransposeProducerMatch> MatchConvTransposeProducer(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.op_type() != "ConvTranspose" || node.input_size() < 2) {
+    return std::nullopt;
+  }
+  auto it = init_map.find(node.input(1));
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT ||
+      it->second->dims_size() < 3) {
+    return std::nullopt;
+  }
+  const onnx::TensorProto* w = it->second;
+  const int64_t group = ConvGroupAttr(node);
+  if (group != 1) {
+    return std::nullopt;  // Grouped ConvTranspose producer -- declined above.
+  }
+  const int64_t out_channels = w->dims(1);
+  std::optional<std::string> bias;
+  if (node.input_size() == 3 && !node.input(2).empty()) {
+    bias = node.input(2);
+    if (!init_map.count(*bias)) {
+      return std::nullopt;
+    }
+  }
+  return ConvTransposeProducerMatch{node.input(1), bias, out_channels, group};
+}
+
+struct ConvTransposeConsumerMatch {
+  std::string weight;
+  int64_t in_channels;
+  int64_t group;
+};
+
+// The ConvTranspose analogue of MatchConvConsumer -- mirrors pruning.py's own
+// _match_conv_transpose_consumer exactly. Unlike
+// MatchConvTransposeProducer's `group == 1` restriction, any `group >= 1` is
+// matched here: this node's own input-channel axis (axis 0 of its
+// [C, M/group, ...] weight) already spans the FULL, global C regardless of
+// `group` -- grouping only ever splits axis 1 (the output side) for
+// ConvTranspose, the mirror image of Conv (whose grouping only ever splits
+// axis 1, the input side). Pruning it is therefore a plain, flat
+// `w[keep, ...]` for any `group` -- no per-group block-relative index
+// translation needed the way SliceGroupedConsumerConvWeight provides for a
+// grouped Conv consumer.
+std::optional<ConvTransposeConsumerMatch> MatchConvTransposeConsumer(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.op_type() != "ConvTranspose" || node.input_size() < 2) {
+    return std::nullopt;
+  }
+  auto it = init_map.find(node.input(1));
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT ||
+      it->second->dims_size() < 3) {
+    return std::nullopt;
+  }
+  const onnx::TensorProto* w = it->second;
+  const int64_t group = ConvGroupAttr(node);
+  if (group < 1) {
+    return std::nullopt;
+  }
+  const int64_t in_channels = w->dims(0);
+  if (group > 1 && in_channels % group != 0) {
+    return std::nullopt;  // Groups must stay equal-sized.
+  }
+  return ConvTransposeConsumerMatch{node.input(1), in_channels, group};
+}
+
 struct DepthwiseMatch {
   std::string weight;
   std::optional<std::string> bias;
@@ -2391,8 +2505,21 @@ struct ConvConsumerResult {
   onnx::NodeProto* node;
   std::string weight;
   int64_t group;
+  // True for a matched ConvTranspose consumer (see
+  // MatchConvTransposeConsumer's own comment) -- always `false` for a plain
+  // Conv match. Appended last, defaulted `false`, so every pre-existing
+  // positional `ConvConsumerResult{...}` initializer is unaffected.
+  bool is_conv_transpose = false;
 };
 
+// `allow_conv_transpose_consumer` defaults `false` -- only FindConvChains,
+// the plain single-producer/single-consumer chain finder ConvTranspose
+// support was scoped to, passes `true`; every other caller (the
+// residual/merge fan-out branch resolution, and the Concat-branch-merge
+// consumer walk) leaves it at the default, deliberately excluding
+// ConvTranspose from those more elaborate topologies for now -- a scope
+// decision, not an oversight, mirroring pruning.py's own
+// `_walk_to_conv_consumer` exactly.
 std::tuple<std::optional<ConvConsumerResult>, std::vector<ChainOp>,
            std::vector<ConvPassThrough>, std::optional<GroupNormPassThrough>>
 WalkToConvConsumer(const std::string& start, const InitMap& init_map,
@@ -2400,7 +2527,8 @@ WalkToConvConsumer(const std::string& start, const InitMap& init_map,
                    const std::unordered_set<std::string>& graph_outputs,
                    int64_t n_channels, int max_hops,
                    onnx::NodeProto* forced_first_hop = nullptr,
-                   bool recognize_group_norm = false) {
+                   bool recognize_group_norm = false,
+                   bool allow_conv_transpose_consumer = false) {
   std::vector<ChainOp> chain_ops;
   std::vector<ConvPassThrough> pass_through;
   std::optional<ConvConsumerResult> consumer;
@@ -2465,6 +2593,21 @@ WalkToConvConsumer(const std::string& start, const InitMap& init_map,
       auto match = MatchConvConsumer(*nxt, init_map);
       if (match && match->in_channels == n_channels) {
         consumer = ConvConsumerResult{nxt, match->weight, match->group};
+      }
+      break;
+    }
+
+    if (allow_conv_transpose_consumer && nxt->op_type() == "ConvTranspose" &&
+        nxt->input(0) == cur) {
+      // A ConvTranspose node hit mid-walk simply ends the walk with no
+      // consumer found when `allow_conv_transpose_consumer` is left at its
+      // default -- exactly like any other unmatched topology, not an error
+      // -- see this function's own `allow_conv_transpose_consumer` comment
+      // above (mirrors pruning.py's own `_walk_to_conv_consumer`).
+      auto ct_match = MatchConvTransposeConsumer(*nxt, init_map);
+      if (ct_match && ct_match->in_channels == n_channels) {
+        consumer =
+            ConvConsumerResult{nxt, ct_match->weight, ct_match->group, true};
       }
       break;
     }
@@ -2626,8 +2769,29 @@ std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
   std::vector<Chain> chains;
   for (int i = 0; i < graph->node_size(); ++i) {
     onnx::NodeProto* node = graph->mutable_node(i);
-    auto info = MatchConvProducer(*node, init_map);
-    if (!info) {
+    // Try an ordinary/grouped Conv producer first, then (only if that
+    // declines -- the two matchers' own op_type checks are mutually
+    // exclusive, so this is never ambiguous) a ConvTranspose producer
+    // (group == 1 only -- see MatchConvTransposeProducer's own comment for
+    // why grouped ConvTranspose stays out of scope). Mirrors pruning.py's
+    // own _find_conv_chains exactly.
+    std::string w_name;
+    std::optional<std::string> bias_name;
+    int64_t out_channels;
+    int64_t producer_group;
+    bool is_producer_conv_transpose = false;
+    if (auto info = MatchConvProducer(*node, init_map)) {
+      w_name = info->weight;
+      bias_name = info->bias;
+      out_channels = info->out_channels;
+      producer_group = info->group;
+    } else if (auto ct_info = MatchConvTransposeProducer(*node, init_map)) {
+      w_name = ct_info->weight;
+      bias_name = ct_info->bias;
+      out_channels = ct_info->out_channels;
+      producer_group = ct_info->group;
+      is_producer_conv_transpose = true;
+    } else {
       continue;
     }
     const std::string& out_name = node->output(0);
@@ -2647,18 +2811,19 @@ std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
       continue;
     }
     auto [consumer, chain_ops, pass_through, group_norm] = WalkToConvConsumer(
-        out_name, init_map, consumers_of, graph_outputs, info->out_channels,
+        out_name, init_map, consumers_of, graph_outputs, out_channels,
         kMaxChainHops, /*forced_first_hop=*/nullptr,
-        /*recognize_group_norm=*/true);
+        /*recognize_group_norm=*/true,
+        /*allow_conv_transpose_consumer=*/true);
     if (!consumer) {
       continue;
     }
-    if (info->group > 1 && consumer->group > 1 &&
-        info->group != consumer->group) {
+    if (producer_group > 1 && consumer->group > 1 &&
+        producer_group != consumer->group) {
       continue;  // Both sides grouped with mismatched group counts: declined.
     }
     if (group_norm &&
-        ((info->group > 1 && info->group != group_norm->num_groups) ||
+        ((producer_group > 1 && producer_group != group_norm->num_groups) ||
          (consumer->group > 1 && consumer->group != group_norm->num_groups))) {
       // The mid-chain GroupNorm hop's own `num_groups` disagrees with a
       // general grouped Conv producer's or consumer's own `group` -- the
@@ -2670,17 +2835,24 @@ std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
     }
 
     Chain chain;
-    chain.producers.push_back(
-        Producer{node, info->weight, false, info->bias, true, info->group});
+    chain.producers.push_back(Producer{node,
+                                       w_name,
+                                       false,
+                                       bias_name,
+                                       true,
+                                       producer_group,
+                                       {},
+                                       is_producer_conv_transpose});
     chain.chain_ops = std::move(chain_ops);
     chain.consumer_node = consumer->node;
     chain.consumer_weight = consumer->weight;
     chain.consumer_weight_transposed = false;
-    chain.n_channels = info->out_channels;
+    chain.n_channels = out_channels;
     chain.consumer_is_conv = true;
     chain.conv_pass_through = std::move(pass_through);
     chain.consumer_group = consumer->group;
     chain.group_norm = std::move(group_norm);
+    chain.consumer_is_conv_transpose = consumer->is_conv_transpose;
     chains.push_back(std::move(chain));
   }
   return chains;
@@ -4089,21 +4261,39 @@ std::vector<T> SliceAxis1(const std::vector<T>& data, int64_t dim0,
   return out;
 }
 
+// `is_conv_transpose` (meaningless unless `is_conv`) is this weight's own
+// ConvTranspose-vs-Conv distinction: a ConvTranspose weight's own
+// output-channel axis is axis 1 -- the reverse of Conv's axis 0 -- so the
+// slice below cuts axis 1 instead (only ever called here for a group == 1
+// ConvTranspose, per MatchConvTransposeProducer's own comment, so this is a
+// plain, ungrouped axis-1 slice). Mirrors pruning.py's own
+// `_slice_producer_weight` exactly.
 void SliceProducerWeight(onnx::TensorProto* wt, bool weight_transposed,
-                         const std::vector<int64_t>& keep, bool is_conv) {
+                         const std::vector<int64_t>& keep, bool is_conv,
+                         bool is_conv_transpose = false) {
   std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
   std::vector<float> data = ReadFloatTensor(*wt);
   std::vector<float> out;
   std::vector<int64_t> new_dims;
   const int64_t kc = static_cast<int64_t>(keep.size());
   if (is_conv) {
-    int64_t inner = 1;
-    for (size_t i = 1; i < dims.size(); ++i) {
-      inner *= dims[i];
+    if (is_conv_transpose) {
+      int64_t inner = 1;
+      for (size_t i = 2; i < dims.size(); ++i) {
+        inner *= dims[i];
+      }
+      out = SliceAxis1(data, dims[0], dims[1], inner, keep);
+      new_dims = dims;
+      new_dims[1] = kc;
+    } else {
+      int64_t inner = 1;
+      for (size_t i = 1; i < dims.size(); ++i) {
+        inner *= dims[i];
+      }
+      out = SliceAxis0(data, dims[0], inner, keep);
+      new_dims = dims;
+      new_dims[0] = kc;
     }
-    out = SliceAxis0(data, dims[0], inner, keep);
-    new_dims = dims;
-    new_dims[0] = kc;
   } else {
     const int64_t dim0 = dims[0], dim1 = dims[1];
     if (weight_transposed) {  // [N, K] -- output channel is axis 0.
@@ -4117,21 +4307,39 @@ void SliceProducerWeight(onnx::TensorProto* wt, bool weight_transposed,
   SetFloatTensorData(wt, new_dims, out);
 }
 
+// `is_conv_transpose` (meaningless unless `is_conv`) is this weight's own
+// ConvTranspose-vs-Conv distinction: a ConvTranspose weight's own
+// input-channel axis is axis 0, and (unlike Conv's grouped consumer axis 1)
+// spans the FULL in_channels regardless of `group`, so a plain, flat
+// axis-0 slice is correct for any `group` here -- see
+// MatchConvTransposeConsumer's own comment. Mirrors pruning.py's own
+// `_slice_consumer_weight` exactly.
 void SliceConsumerWeight(onnx::TensorProto* wt, bool weight_transposed,
-                         const std::vector<int64_t>& keep, bool is_conv) {
+                         const std::vector<int64_t>& keep, bool is_conv,
+                         bool is_conv_transpose = false) {
   std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
   std::vector<float> data = ReadFloatTensor(*wt);
   std::vector<float> out;
   std::vector<int64_t> new_dims;
   const int64_t kc = static_cast<int64_t>(keep.size());
   if (is_conv) {
-    int64_t inner = 1;
-    for (size_t i = 2; i < dims.size(); ++i) {
-      inner *= dims[i];
+    if (is_conv_transpose) {
+      int64_t inner = 1;
+      for (size_t i = 1; i < dims.size(); ++i) {
+        inner *= dims[i];
+      }
+      out = SliceAxis0(data, dims[0], inner, keep);
+      new_dims = dims;
+      new_dims[0] = kc;
+    } else {
+      int64_t inner = 1;
+      for (size_t i = 2; i < dims.size(); ++i) {
+        inner *= dims[i];
+      }
+      out = SliceAxis1(data, dims[0], dims[1], inner, keep);
+      new_dims = dims;
+      new_dims[1] = kc;
     }
-    out = SliceAxis1(data, dims[0], dims[1], inner, keep);
-    new_dims = dims;
-    new_dims[1] = kc;
   } else {
     const int64_t dim0 = dims[0], dim1 = dims[1];
     if (weight_transposed) {  // [N, K] -- reduction dim is axis 1.
@@ -4230,6 +4438,27 @@ std::vector<float> TransposeFlat(const std::vector<float>& data, int64_t dim0,
   return out;
 }
 
+// [dim1, dim0 * inner] row-major view of a [dim0, dim1, ...inner] row-major
+// tensor with axes 0 and 1 swapped -- the ConvTranspose-producer analogue of
+// TransposeFlat's plain 2-D transpose (`inner == 1` reduces to it exactly),
+// needed because a ConvTranspose weight's own output-channel axis is axis 1,
+// not axis 0 (see MatchConvTransposeProducer's own comment): row `m` of the
+// result is that output channel's own full weight, gathered across every
+// input channel and spatial position. Mirrors pruning.py's own
+// `_producer_weight_nk`'s `np.moveaxis(w, 1, 0).reshape(w.shape[1], -1)`.
+std::vector<float> MoveAxis1To0Flat(const std::vector<float>& data,
+                                    int64_t dim0, int64_t dim1, int64_t inner) {
+  std::vector<float> out(data.size());
+  for (int64_t i = 0; i < dim0; ++i) {
+    for (int64_t j = 0; j < dim1; ++j) {
+      std::memcpy(out.data() + static_cast<size_t>(j * dim0 + i) * inner,
+                  data.data() + static_cast<size_t>(i * dim1 + j) * inner,
+                  static_cast<size_t>(inner) * sizeof(float));
+    }
+  }
+  return out;
+}
+
 // --- Shared apply body, mirroring _apply_chains -----------------------------
 
 // Every touched initializer role and stale value_info name, shared by a
@@ -4270,7 +4499,7 @@ void SliceChainChannels(
 
   for (const auto& p : chain.producers) {
     SliceProducerWeight(init_map.at(p.weight), p.weight_transposed, keep,
-                        p.is_conv);
+                        p.is_conv, p.is_conv_transpose);
     if (p.bias) {
       SliceLastAxis(init_map.at(*p.bias), keep);
     }
@@ -4312,13 +4541,19 @@ void SliceChainChannels(
     SliceLastAxis(init_map.at(chain.group_norm->scale), keep);
     SliceLastAxis(init_map.at(chain.group_norm->bias), keep);
   }
-  if (chain.consumer_is_conv && chain.consumer_group > 1) {
+  if (chain.consumer_is_conv && !chain.consumer_is_conv_transpose &&
+      chain.consumer_group > 1) {
     SliceGroupedConsumerConvWeight(init_map.at(chain.consumer_weight), keep,
                                    chain.consumer_group, n);
   } else {
-    SliceConsumerWeight(init_map.at(chain.consumer_weight),
-                        chain.consumer_weight_transposed, keep,
-                        chain.consumer_is_conv);
+    // A grouped ConvTranspose consumer (consumer_is_conv_transpose,
+    // consumer_group > 1) also lands here, not in the branch above -- its
+    // own input-channel axis (0) is flat/global regardless of group, so the
+    // plain slice below is already correct; see
+    // MatchConvTransposeConsumer's own comment.
+    SliceConsumerWeight(
+        init_map.at(chain.consumer_weight), chain.consumer_weight_transposed,
+        keep, chain.consumer_is_conv, chain.consumer_is_conv_transpose);
   }
   // Extra fan-out branches: each is either an ordinary (group == 1)
   // consumer, or, for a Conv residual/merge chain, a general grouped Conv
@@ -4568,8 +4803,20 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
       std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
       std::vector<float> data = ReadFloatTensor(*wt);
       if (p.is_conv) {
-        w_arrays_nk.push_back(
-            std::move(data));  // Already [Cout, rest] flattened.
+        if (p.is_conv_transpose) {
+          // ConvTranspose's own output-channel axis is axis 1, not axis 0
+          // -- move it to the front before flattening (see
+          // MoveAxis1To0Flat's own comment).
+          int64_t inner = 1;
+          for (size_t i = 2; i < dims.size(); ++i) {
+            inner *= dims[i];
+          }
+          w_arrays_nk.push_back(
+              MoveAxis1To0Flat(data, dims[0], dims[1], inner));
+        } else {
+          w_arrays_nk.push_back(
+              std::move(data));  // Already [Cout, rest] flattened.
+        }
       } else if (p.weight_transposed) {
         w_arrays_nk.push_back(std::move(data));  // Already [N, K].
       } else {
@@ -4775,7 +5022,17 @@ void ApplyChainsGlobal(
       std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
       std::vector<float> data = ReadFloatTensor(*wt);
       if (p.is_conv) {
-        w_arrays_nk.push_back(std::move(data));
+        if (p.is_conv_transpose) {
+          // See ApplyChains' own identical ConvTranspose branch/comment.
+          int64_t inner = 1;
+          for (size_t i = 2; i < dims.size(); ++i) {
+            inner *= dims[i];
+          }
+          w_arrays_nk.push_back(
+              MoveAxis1To0Flat(data, dims[0], dims[1], inner));
+        } else {
+          w_arrays_nk.push_back(std::move(data));
+        }
       } else if (p.weight_transposed) {
         w_arrays_nk.push_back(std::move(data));
       } else {
@@ -5111,6 +5368,15 @@ struct AttnChain {
   int64_t kv_num_heads = 0;
   int64_t head_size = 0;
   std::string num_heads_attr = "num_heads";
+  // Set only for a matched `MultiHeadAttention`/`PackedMultiHeadAttention`/
+  // `DecoderMaskedMultiHeadAttention` node whose own combined `bias` input
+  // (a single `[nq + nk + nv]`-shaped tensor concatenating Q's/K's/V's own
+  // three biases end to end -- a different shape from `.q_bias`/`.k_bias`/
+  // `.v_bias` above, each an independent per-*producer* bias) is a
+  // non-empty constant of that exact shape -- mirrors pruning.py's own
+  // `_GQAChain.mha_bias` field. `None`/`nullopt` for every other matched op,
+  // and for a matched node whose own combined bias input is absent.
+  std::optional<std::string> mha_bias;
   // Shared:
   std::vector<AttnChainOp> chain_ops;
   onnx::NodeProto* consumer_node = nullptr;
@@ -5268,16 +5534,389 @@ std::optional<HeadCountsMatch> MatchOnnxAttentionProducer(
   return HeadCountsMatch{q_num_heads, kv_num_heads};
 }
 
-// Shared body for FindGqaChains/FindOnnxAttentionChains: both match a fused
-// attention node fed by three separate, un-merged Q/K/V MatMul/vanilla-Gemm
-// projections and prune it at whole-KV-group granularity, differing only in
-// `match_producer` and which attribute holds the query head count
-// (`num_heads_attr`). Mirrors pruning.py's own _find_separate_qkv_chains.
+// Generic safety gate reused by every new "separate Q/K/V" matcher below
+// (MultiHeadAttention/PackedMultiHeadAttention/
+// DecoderMaskedMultiHeadAttention/SparseAttention): declines the whole match
+// when any of `indices` resolves to a non-empty constant tensor -- mirrors
+// the identical "would need slicing, not attempted here" pattern
+// MatchGqaProducer/MatchOnnxAttentionProducer already use above for their
+// own past_key/past_value (and, for the latter, attn_mask) checks. An
+// absent, empty-string, or dynamic (unresolvable-to-constant) input at any
+// of `indices` is left completely alone -- nothing here ever slices any of
+// them either way, so a genuinely dynamic one is safe to leave connected
+// regardless of its real runtime shape (the same "caller's own runtime
+// data" reasoning every analogous pruning.py check already relies on).
+bool NoNonEmptyConstantAt(const onnx::NodeProto& node, const InitMap& init_map,
+                          std::initializer_list<int> indices) {
+  for (int idx : indices) {
+    if (node.input_size() <= idx || node.input(idx).empty()) {
+      continue;
+    }
+    auto it = init_map.find(node.input(idx));
+    if (it != init_map.end()) {
+      int64_t prod = 1;
+      for (int64_t d : it->second->dims()) {
+        prod *= d;
+      }
+      if (prod > 0) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// If `node` is a com.microsoft::MultiHeadAttention node this pass can
+// safely act on, returns (num_heads, num_heads) -- kv_num_heads always
+// equals num_heads for this op (a single head-count attribute, no GQA/MQA
+// support at all -- mirrors pruning.py's own
+// _match_multi_head_attention_producer). `key`/`value` (indices 1/2) must
+// both be present, excluding this op's own alternate packed-QKV calling
+// convention (`query` alone carrying a packed rank-5 tensor) -- the same
+// exclusion pruning.py's own matcher gives.
+//
+// Deliberately narrower than pruning.py's own matcher in one way, consistent
+// with this file's own pre-existing, already-accepted scope gap (see this
+// section's own top comment and the MatMulNBitsQkv section's own comment on
+// ApplyOneGqaChain's identical gap for the already-shipped GQA/OnnxAttention
+// families): this port has no analogue of pruning.py's own
+// `_head_bias_input_is_safe`/`_slice_or_gather_head_bias` dynamic-bias
+// machinery at all, so rather than reproduce that same silent-corruption
+// risk for a brand new op family, `attention_bias` (index 5) declines the
+// whole match outright whenever it resolves to a non-empty constant (the
+// same `NoNonEmptyConstantAt` gate `past_key`/`past_value`, indices 6/7,
+// already get -- this port doesn't slice either past_kv tensor for this op
+// either, the same gap GQA/OnnxAttention already have).
+std::optional<HeadCountsMatch> MatchMultiHeadAttentionProducer(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.domain() != kComMicrosoftDomain ||
+      node.op_type() != "MultiHeadAttention") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 3 || node.input(0).empty() || node.input(1).empty() ||
+      node.input(2).empty()) {
+    return std::nullopt;
+  }
+  int64_t num_heads = 0;
+  bool has_nh = false;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "num_heads") {
+      num_heads = attr.i();
+      has_nh = true;
+    }
+  }
+  if (!has_nh || num_heads <= 0) {
+    return std::nullopt;
+  }
+  if (!NoNonEmptyConstantAt(node, init_map, {5, 6, 7})) {
+    return std::nullopt;  // attention_bias, past_key, past_value
+  }
+  return HeadCountsMatch{num_heads, num_heads};
+}
+
+// The com.microsoft::PackedMultiHeadAttention analogue of
+// MatchMultiHeadAttentionProducer -- mirrors pruning.py's own
+// _match_packed_multi_head_attention_producer. Same single `num_heads`
+// attribute (kv_num_heads == num_heads always), `key`/`value` (1/2) both
+// required non-empty (excludes this op's own alternate packed-qkv
+// convention), and `attention_bias` genuinely moves to index **6** here (not
+// 5 -- `key_padding_mask` is replaced by two new inputs,
+// `token_offset`/`cumulative_sequence_length`, shifting everything after it
+// one position later, confirmed directly off ONNX Runtime's own
+// `_replace_attention_with_packing_attention` rewrite -- see pruning.py's
+// own docstring). This op's own schema has no `past_key`/`past_value` at
+// all (packing mode is an encoder-only, non-incremental-decode
+// optimization), so there is no KV-cache pair to gate here.
+std::optional<HeadCountsMatch> MatchPackedMultiHeadAttentionProducer(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.domain() != kComMicrosoftDomain ||
+      node.op_type() != "PackedMultiHeadAttention") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 3 || node.input(0).empty() || node.input(1).empty() ||
+      node.input(2).empty()) {
+    return std::nullopt;
+  }
+  int64_t num_heads = 0;
+  bool has_nh = false;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "num_heads") {
+      num_heads = attr.i();
+      has_nh = true;
+    }
+  }
+  if (!has_nh || num_heads <= 0) {
+    return std::nullopt;
+  }
+  if (!NoNonEmptyConstantAt(node, init_map, {6})) {
+    return std::nullopt;  // attention_bias
+  }
+  return HeadCountsMatch{num_heads, num_heads};
+}
+
+// The com.microsoft::DecoderMaskedMultiHeadAttention analogue of
+// MatchMultiHeadAttentionProducer -- mirrors pruning.py's own
+// _match_decoder_masked_multi_head_attention_producer. Single `num_heads`
+// attribute (kv_num_heads == num_heads always); `attention_bias` at index
+// **4** (not 5), `past_key`/`past_value` at **5/6** (not 6/7) -- genuinely
+// different positions from MultiHeadAttention's own, confirmed off both the
+// live schema dump and ONNX Runtime's own `replace_mha_with_dmmha` rewrite
+// (see pruning.py's own docstring) -- gated the same
+// decline-if-non-empty-constant way as MultiHeadAttention's own analogous
+// inputs, for the identical reason (no slicing machinery ported for either).
+// This op's own combined `bias` moves to index **10**, the last input (see
+// FindDecoderMaskedMhaChains below).
+std::optional<HeadCountsMatch> MatchDecoderMaskedMultiHeadAttentionProducer(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.domain() != kComMicrosoftDomain ||
+      node.op_type() != "DecoderMaskedMultiHeadAttention") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 3 || node.input(0).empty() || node.input(1).empty() ||
+      node.input(2).empty()) {
+    return std::nullopt;
+  }
+  int64_t num_heads = 0;
+  bool has_nh = false;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "num_heads") {
+      num_heads = attr.i();
+      has_nh = true;
+    }
+  }
+  if (!has_nh || num_heads <= 0) {
+    return std::nullopt;
+  }
+  if (!NoNonEmptyConstantAt(node, init_map, {4, 5, 6})) {
+    return std::nullopt;  // attention_bias, past_key, past_value
+  }
+  return HeadCountsMatch{num_heads, num_heads};
+}
+
+// If `node` is a com.microsoft::PagedAttention node (kv_cache_layout ==
+// "SEPARATE", the only layout matched -- "LATENT", absorbed
+// Multi-head-Latent-Attention, is a structurally different shape none of
+// this family's machinery supports) this pass can safely act on, returns
+// (num_heads, kv_num_heads). Mirrors pruning.py's own
+// _match_paged_attention_producer's own core shape requirements: `query`/
+// `key`/`value` (0/1/2) required non-empty (excludes the op's own packed-QKV
+// convention); `key_cache`/`cumulative_sequence_length`/`past_seqlens`/
+// `block_table` (3/5/6/7) required present; `value_cache` (4) required
+// present under `SEPARATE` layout; `key_cache`/`value_cache` themselves
+// declined outright whenever either resolves to a constant (this op's own
+// cache is "updated in place" by a real continuous-batching serving
+// harness -- a constant one is not a real export this pass has any
+// execution-verified story for, per pruning.py's own docstring).
+//
+// Narrower than pruning.py's own matcher in one deliberate way: `head_sink`
+// (11), `q_norm_weight`/`k_norm_weight` (12/13), and `k_scale`/`v_scale`
+// (14/15) are none of them ever sliced by this port (no analogue of
+// pruning.py's own deferred-shape-check/slicing machinery for any of the
+// three), so a match here requires every one of them absent, rather than
+// risk a present-and-genuinely-per-head/per-KV-group one silently going
+// unsliced after `num_heads`/`kv_num_heads` shrink underneath it.
+std::optional<HeadCountsMatch> MatchPagedAttentionProducer(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.domain() != kComMicrosoftDomain ||
+      node.op_type() != "PagedAttention") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 8) {
+    return std::nullopt;
+  }
+  if (node.input(0).empty() || node.input(1).empty() || node.input(2).empty()) {
+    return std::nullopt;  // excludes this op's own packed-QKV convention
+  }
+  if (node.input(3).empty() || node.input(5).empty() || node.input(6).empty() ||
+      node.input(7).empty()) {
+    return std::nullopt;  // key_cache/cumulative_sequence_length/
+                          // past_seqlens/block_table
+  }
+  int64_t num_heads = 0, kv_num_heads = 0;
+  bool has_nh = false, has_kv = false;
+  std::string kv_cache_layout = "SEPARATE";
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "num_heads") {
+      num_heads = attr.i();
+      has_nh = true;
+    } else if (attr.name() == "kv_num_heads") {
+      kv_num_heads = attr.i();
+      has_kv = true;
+    } else if (attr.name() == "kv_cache_layout" && !attr.s().empty()) {
+      kv_cache_layout = attr.s();
+    }
+  }
+  if (!has_nh || !has_kv || num_heads <= 0 || kv_num_heads <= 0) {
+    return std::nullopt;
+  }
+  if (num_heads % kv_num_heads != 0) {
+    return std::nullopt;
+  }
+  if (kv_cache_layout != "SEPARATE") {
+    return std::nullopt;  // "LATENT" (absorbed MLA) -- out of scope
+  }
+  if (node.input(4).empty()) {
+    return std::nullopt;  // value_cache required whenever SEPARATE
+  }
+  if (init_map.count(node.input(3)) || init_map.count(node.input(4))) {
+    return std::nullopt;  // constant key_cache/value_cache -- out of scope
+  }
+  for (int idx : {11, 12, 13, 14, 15}) {  // head_sink, qk_norm, k/v_scale
+    if (node.input_size() > idx && !node.input(idx).empty()) {
+      return std::nullopt;
+    }
+  }
+  return HeadCountsMatch{num_heads, kv_num_heads};
+}
+
+// If `node` is a plain ai.onnx::LinearAttention node (domain "", opset 27+)
+// this pass can safely act on, returns (q_num_heads, kv_num_heads). Mirrors
+// pruning.py's own _match_linear_attention_producer's core shape
+// requirements: `query`/`key`/`value` (0/1/2) required non-empty
+// already-projected activations, `q_num_heads`/`kv_num_heads` both required
+// attributes with `q_num_heads` a positive multiple of `kv_num_heads`.
+//
+// Deliberately narrower than pruning.py's own matcher: `past_state`/`decay`/
+// `beta` (3/4/5) must all be absent here. This port only ever prunes the
+// stateless "linear" `update_rule` shape that needs none of the three --
+// pruning.py's own comment for this op already narrows its *real-world*
+// scope to almost exactly this (a genuinely dynamic `decay`/`beta` declines
+// the whole match there too; a *constant* one is called out as "a
+// degenerate shape no real dynamic-decode export produces" -- see this
+// file's own "Attention-head pruning" section comment, the `LinearAttention`
+// bullet), so requiring all three absent here -- rather than porting the
+// deferred decay/beta shape-classification logic pruning.py's own
+// matcher/finder pair uses -- gives up essentially nothing over the
+// realistic export shape while avoiding new, unverified slicing machinery.
+std::optional<HeadCountsMatch> MatchLinearAttentionProducer(
+    const onnx::NodeProto& node, const InitMap& /*init_map*/) {
+  if (!node.domain().empty() || node.op_type() != "LinearAttention") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 3 || node.input(0).empty() || node.input(1).empty() ||
+      node.input(2).empty()) {
+    return std::nullopt;
+  }
+  int64_t q_num_heads = 0, kv_num_heads = 0;
+  bool has_q = false, has_kv = false;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "q_num_heads") {
+      q_num_heads = attr.i();
+      has_q = true;
+    } else if (attr.name() == "kv_num_heads") {
+      kv_num_heads = attr.i();
+      has_kv = true;
+    }
+  }
+  if (!has_q || !has_kv || q_num_heads <= 0 || kv_num_heads <= 0) {
+    return std::nullopt;
+  }
+  if (q_num_heads % kv_num_heads != 0) {
+    return std::nullopt;
+  }
+  for (int idx : {3, 4, 5}) {  // past_state, decay, beta
+    if (node.input_size() > idx && !node.input(idx).empty()) {
+      return std::nullopt;
+    }
+  }
+  return HeadCountsMatch{q_num_heads, kv_num_heads};
+}
+
+// If `node` is a com.microsoft::SparseAttention node this pass can safely
+// act on, returns (num_heads, kv_num_heads). Mirrors pruning.py's own
+// _match_sparse_attention_producer: `query`/`key`/`value` (0/1/2) required
+// non-empty (excludes this op's own packed-QKV convention); `past_key`/
+// `past_value` (3/4, the *same* positions GroupQueryAttention's own occupy)
+// required present (this op's own schema makes them mandatory, not optional
+// the way GroupQueryAttention's own are) and gated the same
+// decline-if-non-empty-constant way MatchGqaProducer's own analogous inputs
+// already are (no slicing machinery ported for this op's past_kv either);
+// `block_row_indices`/`block_col_indices` (5/6) required constant, sharing a
+// common leading `num_layout` dimension that must already divide `num_heads`
+// pre-pruning (this op's own documented invariant, re-verified against the
+// *post*-pruning head count at apply time -- see ApplyOneGqaChain's own
+// `is_sparse_attention` branch); `total_sequence_length`/
+// `key_total_sequence_lengths` (7/8) required present (pure bookkeeping,
+// checked only for presence -- a genuinely incomplete node otherwise).
+std::optional<HeadCountsMatch> MatchSparseAttentionProducer(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.domain() != kComMicrosoftDomain ||
+      node.op_type() != "SparseAttention") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 9) {
+    return std::nullopt;
+  }
+  if (node.input(0).empty() || node.input(1).empty() || node.input(2).empty()) {
+    return std::nullopt;  // excludes this op's own packed-QKV convention
+  }
+  if (node.input(3).empty() || node.input(4).empty()) {
+    return std::nullopt;  // past_key/past_value -- required (Single)
+  }
+  if (node.input(5).empty() || node.input(6).empty() || node.input(7).empty() ||
+      node.input(8).empty()) {
+    return std::nullopt;  // block_row/col_indices, seq-len bookkeeping
+  }
+  int64_t num_heads = 0, kv_num_heads = 0;
+  bool has_nh = false, has_kv = false;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "num_heads") {
+      num_heads = attr.i();
+      has_nh = true;
+    } else if (attr.name() == "kv_num_heads") {
+      kv_num_heads = attr.i();
+      has_kv = true;
+    }
+  }
+  if (!has_nh || !has_kv || num_heads <= 0 || kv_num_heads <= 0) {
+    return std::nullopt;
+  }
+  if (num_heads % kv_num_heads != 0) {
+    return std::nullopt;
+  }
+  if (!NoNonEmptyConstantAt(node, init_map, {3, 4})) {
+    return std::nullopt;  // constant past_key/past_value -- not sliced here
+  }
+  auto row_it = init_map.find(node.input(5));
+  auto col_it = init_map.find(node.input(6));
+  if (row_it == init_map.end() || col_it == init_map.end()) {
+    return std::nullopt;  // dynamic block mask -- not a real export
+  }
+  if (row_it->second->dims_size() == 0 || col_it->second->dims_size() == 0 ||
+      row_it->second->dims(0) != col_it->second->dims(0) ||
+      row_it->second->dims(0) <= 0) {
+    return std::nullopt;
+  }
+  const int64_t num_layout = row_it->second->dims(0);
+  if (num_heads % num_layout != 0) {
+    return std::nullopt;  // violates this op's own documented invariant
+                          // already, before this pass even touches anything
+  }
+  return HeadCountsMatch{num_heads, kv_num_heads};
+}
+
+// Shared body for FindGqaChains/FindOnnxAttentionChains/FindMhaChains/
+// FindPackedMhaChains/FindDecoderMaskedMhaChains/FindPagedAttentionChains/
+// FindLinearAttentionChains/FindSparseAttentionChains: all eight match a
+// fused attention node fed by three separate, un-merged Q/K/V
+// MatMul/vanilla-Gemm projections and prune it at whole-KV-group
+// granularity, differing only in `match_producer`, which attribute holds
+// the query head count (`num_heads_attr`), and -- MultiHeadAttention/
+// PackedMultiHeadAttention/DecoderMaskedMultiHeadAttention only --
+// `combined_bias_input_index`, the input index of a single combined
+// `[nq + nk + nv]`-shaped Q+K+V bias (see AttnChain's own `mha_bias` field).
+// Mirrors pruning.py's own _find_separate_qkv_chains -- narrower in one
+// deliberate, already-established way (see FindGqaChains'/
+// FindOnnxAttentionChains' own comment below): V's own head_size is always
+// required equal to Q's/K's shared one, never pruning.py's own
+// `allow_differing_v_head_size=True` composition for the plain ai.onnx op/
+// MultiHeadAttention/PackedMultiHeadAttention/LinearAttention.
 std::vector<AttnChain> FindSeparateQkvChains(
     onnx::GraphProto* graph,
     const std::function<std::optional<HeadCountsMatch>(
         const onnx::NodeProto&, const InitMap&)>& match_producer,
-    const std::string& num_heads_attr) {
+    const std::string& num_heads_attr,
+    std::optional<int> combined_bias_input_index = std::nullopt) {
   InitMap init_map;
   for (const auto& t : graph->initializer()) {
     init_map[t.name()] = &t;
@@ -5344,6 +5983,32 @@ std::vector<AttnChain> FindSeparateQkvChains(
       continue;
     }
 
+    // MultiHeadAttention/PackedMultiHeadAttention/
+    // DecoderMaskedMultiHeadAttention-only: a combined `[nq + nk + nv]`
+    // Q+K+V bias sitting on the matched node's own input at
+    // `combined_bias_input_index` -- validated here (rather than in
+    // `match_producer`, which runs before `nq`/`nk`/`nv` are known) against
+    // the exact shape ONNX Runtime's own transformer fusion code actually
+    // produces. Present but non-constant or wrong-shaped declines the whole
+    // chain outright -- a bias this pass can't prove safe to leave
+    // untouched, unlike an absent one, which needs no touching at all.
+    std::optional<std::string> mha_bias;
+    if (combined_bias_input_index) {
+      const int idx = *combined_bias_input_index;
+      if (node->input_size() > idx && !node->input(idx).empty()) {
+        const std::string& bias_name = node->input(idx);
+        auto bit = init_map.find(bias_name);
+        if (bit == init_map.end() ||
+            bit->second->data_type() != onnx::TensorProto::FLOAT ||
+            bit->second->dims_size() != 1 ||
+            bit->second->dims(0) !=
+                pq->n_channels + pk->n_channels + pv->n_channels) {
+          continue;
+        }
+        mha_bias = bias_name;
+      }
+    }
+
     const std::string& out_name = node->output(0);
     if (!is_internal(out_name)) {
       continue;
@@ -5376,6 +6041,7 @@ std::vector<AttnChain> FindSeparateQkvChains(
     chain.consumer_weight = consumer->weight;
     chain.consumer_weight_transposed = consumer->weight_transposed;
     chain.num_heads_attr = num_heads_attr;
+    chain.mha_bias = mha_bias;
     chains.push_back(std::move(chain));
   }
   return chains;
@@ -5388,6 +6054,59 @@ std::vector<AttnChain> FindGqaChains(onnx::GraphProto* graph) {
 std::vector<AttnChain> FindOnnxAttentionChains(onnx::GraphProto* graph) {
   return FindSeparateQkvChains(graph, MatchOnnxAttentionProducer,
                                "q_num_heads");
+}
+
+// The com.microsoft::MultiHeadAttention analogue of FindGqaChains -- see
+// MatchMultiHeadAttentionProducer's own comment. `combined_bias_input_index
+// = 3`: this op's own `bias` input, the combined-Q/K/V-bias shape AttnChain's
+// own `mha_bias` field documents.
+std::vector<AttnChain> FindMhaChains(onnx::GraphProto* graph) {
+  return FindSeparateQkvChains(graph, MatchMultiHeadAttentionProducer,
+                               "num_heads", /*combined_bias_input_index=*/3);
+}
+
+// The com.microsoft::PackedMultiHeadAttention analogue of FindMhaChains --
+// see MatchPackedMultiHeadAttentionProducer's own comment.
+// `combined_bias_input_index = 3`: this op's own `bias` input sits at the
+// same index MultiHeadAttention's own does (unlike `attention_bias`, which
+// moves to 6).
+std::vector<AttnChain> FindPackedMhaChains(onnx::GraphProto* graph) {
+  return FindSeparateQkvChains(graph, MatchPackedMultiHeadAttentionProducer,
+                               "num_heads", /*combined_bias_input_index=*/3);
+}
+
+// The com.microsoft::DecoderMaskedMultiHeadAttention analogue of
+// FindMhaChains -- see MatchDecoderMaskedMultiHeadAttentionProducer's own
+// comment. `combined_bias_input_index = 10`: this op's own `bias` input,
+// moved to the *last* position (not index 3, MultiHeadAttention's own).
+std::vector<AttnChain> FindDecoderMaskedMhaChains(onnx::GraphProto* graph) {
+  return FindSeparateQkvChains(graph,
+                               MatchDecoderMaskedMultiHeadAttentionProducer,
+                               "num_heads", /*combined_bias_input_index=*/10);
+}
+
+// The com.microsoft::PagedAttention analogue of FindGqaChains -- see
+// MatchPagedAttentionProducer's own comment. No combined bias input on this
+// op's own schema.
+std::vector<AttnChain> FindPagedAttentionChains(onnx::GraphProto* graph) {
+  return FindSeparateQkvChains(graph, MatchPagedAttentionProducer, "num_heads");
+}
+
+// The plain ai.onnx::LinearAttention analogue of FindGqaChains -- see
+// MatchLinearAttentionProducer's own comment. Its own query head-count
+// attribute is named `q_num_heads` (same as the plain ai.onnx `Attention`
+// op's own), no combined bias input.
+std::vector<AttnChain> FindLinearAttentionChains(onnx::GraphProto* graph) {
+  return FindSeparateQkvChains(graph, MatchLinearAttentionProducer,
+                               "q_num_heads");
+}
+
+// The com.microsoft::SparseAttention analogue of FindGqaChains -- see
+// MatchSparseAttentionProducer's own comment. No combined bias input on this
+// op's own schema either.
+std::vector<AttnChain> FindSparseAttentionChains(onnx::GraphProto* graph) {
+  return FindSeparateQkvChains(graph, MatchSparseAttentionProducer,
+                               "num_heads");
 }
 
 // Column indices of every kept head's own head_size-wide block, in
@@ -5595,6 +6314,35 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   const int64_t d = chain.head_size;
   const int64_t group_size = chain.num_heads / chain.kv_num_heads;
 
+  // SparseAttention-only (see MatchSparseAttentionProducer's own comment):
+  // its own `block_row_indices` (index 5), already confirmed at match time
+  // to be a constant whose leading dimension is `num_layout`, must still
+  // divide the *post*-pruning query head count -- pruning `num_heads` down
+  // can break this op's own "num_heads is divisible by num_layout"
+  // invariant even though it held before pruning. Checked here, before
+  // anything is mutated, so a violation declines this block's pruning
+  // outright (the same "sparsity rounds to no groups dropped" no-op outcome
+  // the `keep_count >= h` check above already gives the caller) rather than
+  // emitting an invalid node. Mirrors pruning.py's own `_apply_one_gqa_chain`
+  // `is_sparse_attention` branch -- this port has no MQA (kv_num_heads == 1)
+  // fast path (a pre-existing, already-accepted scope gap: `keep_count >= h`
+  // above already turns that case into a no-op for every chain kind), so
+  // `new_num_heads` here is always exactly `keep_count * group_size`, never
+  // pruning.py's own `q_keep_count` MQA-path alternative.
+  const bool is_sparse_attention =
+      chain.node->domain() == kComMicrosoftDomain &&
+      chain.node->op_type() == "SparseAttention";
+  if (is_sparse_attention) {
+    auto row_it = init_map.find(chain.node->input(5));
+    if (row_it != init_map.end() && row_it->second->dims_size() > 0) {
+      const int64_t num_layout = row_it->second->dims(0);
+      const int64_t new_q_heads = keep_count * group_size;
+      if (num_layout != 0 && new_q_heads % num_layout != 0) {
+        return std::nullopt;
+      }
+    }
+  }
+
   onnx::TensorProto* wq_init = init_map.at(chain.q_weight);
   onnx::TensorProto* wk_init = init_map.at(chain.k_weight);
   onnx::TensorProto* wv_init = init_map.at(chain.v_weight);
@@ -5699,6 +6447,33 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
   }
   if (chain.v_bias) {
     SliceLastAxis(init_map.at(*chain.v_bias), kv_idx);
+  }
+
+  // MultiHeadAttention/PackedMultiHeadAttention/
+  // DecoderMaskedMultiHeadAttention-only: their own combined `bias` input
+  // (AttnChain's own `mha_bias` field) is one single `[nq + nk + nv]`-shaped
+  // tensor holding Q's, K's, and V's three biases concatenated end to end --
+  // sliced in the same three head-aligned ranges (Q's own kept columns, then
+  // K's shifted by the *original* pre-pruning `nq_orig = num_heads * d`,
+  // then V's shifted by `nq_orig + nk_orig`) mirrors pruning.py's own
+  // `_apply_one_gqa_chain` handling of `chain.mha_bias` exactly. This port's
+  // shared `FindSeparateQkvChains` body always requires V's own head_size
+  // equal to `d` (see that function's own comment), so `kv_idx` (already
+  // built at `d`-width) is the correct index set for V's own range here too,
+  // not merely Q's/K's.
+  if (chain.mha_bias) {
+    const int64_t nq_orig = chain.num_heads * d;
+    const int64_t nk_orig = chain.kv_num_heads * d;
+    std::vector<int64_t> full_bias_idx;
+    full_bias_idx.reserve(q_idx.size() + 2 * kv_idx.size());
+    full_bias_idx.insert(full_bias_idx.end(), q_idx.begin(), q_idx.end());
+    for (int64_t x : kv_idx) {
+      full_bias_idx.push_back(x + nq_orig);
+    }
+    for (int64_t x : kv_idx) {
+      full_bias_idx.push_back(x + nq_orig + nk_orig);
+    }
+    SliceLastAxis(init_map.at(*chain.mha_bias), full_bias_idx);
   }
 
   const int64_t new_kv_num_heads = keep_count;
@@ -5924,6 +6699,18 @@ struct ConcatChain {
   // Depthwise Conv hops crossed between the Concat node and the real
   // consumer (Conv chains only).
   std::vector<ConvPassThrough> conv_pass_through;
+  // 1 for an ordinary consumer (always, for a MatMul/Gemm chain -- MatMul/
+  // Gemm has no grouping concept at all) or a Conv consumer this module
+  // declines to admit as grouped; > 1 for a general grouped (`group > 1`)
+  // Conv consumer admitted per ConcatBranchesAlignToConsumerGroup -- see
+  // that function's own comment and FindConvConcatChains for exactly which
+  // grouped consumers are safe to admit and why. Mirrors pruning.py's own
+  // `_ConcatChain.consumer_group`, but unlike Chain::consumer_group this one
+  // is *not* found by inspecting `branches` first: a Concat branch's own
+  // producer is never itself grouped (see FindConvConcatChains' own
+  // comment), so the consumer's own `group` is always the one that governs
+  // here.
+  int64_t consumer_group = 1;
 };
 
 // True if any tensor a Concat branch's own backward walk crossed -- `start`
@@ -6355,12 +7142,65 @@ std::vector<ConcatChain> FindMatmulConcatChains(onnx::GraphProto* graph) {
   return chains;
 }
 
+// True if a grouped (`group > 1`) Conv consumer's own `group` equal-sized
+// input-channel blocks (`block = n_channels / group`, the same partition
+// SliceGroupedConsumerConvWeight slices against) line up exactly with this
+// Concat merge's own branch boundaries -- every branch's fixed `offset` a
+// multiple of `block` -- so every one of the consumer's `group` blocks is
+// owned by exactly one branch, never split across two. Always `true` for
+// `group <= 1` (an ordinary consumer has no block partition to line up with
+// at all).
+//
+// This is precisely the boundary this composition is safe at, and no wider:
+// a Concat branch is pruned *independently*, by its own top-k over its own
+// disjoint slice, with no visibility into any other branch's ranking or how
+// many channels it plans to keep. When every branch boundary is
+// block-aligned, each of the consumer's `group` blocks falls entirely
+// within one branch's own slice, so that branch alone can satisfy the
+// block's own uniform-survivor-count requirement -- an independent per-block
+// top-k, keeping `per_group_keep` channels from each (the *same* count
+// every other block anywhere in this merge keeps, since `per_group_keep`
+// depends only on the consumer's own `group` and the merge's total
+// `n_channels`, never on which branch a channel happens to fall in). No
+// cross-branch agreement is ever needed, because no block ever has more
+// than one branch to agree between.
+//
+// When a block instead straddles two (or more) branches, satisfying that
+// block's own uniform-count requirement would need the counts each of those
+// branches independently contributes from that one shared block to sum to
+// exactly `per_group_keep` -- a branch's own top-k, ranked with no
+// knowledge of any sibling branch's importance or planned keep count, has
+// no general way to land on a matching split. Reconciling it would need
+// exactly the cross-branch importance comparison Concat support was built
+// to avoid, so this case is declined outright (checked by
+// FindConvConcatChains before a chain with `group > 1` is ever produced).
+// Mirrors pruning.py's own _concat_branches_align_to_consumer_group exactly
+// (see that function's own docstring for the full safety argument and a
+// concrete straddling-block counter-example).
+bool ConcatBranchesAlignToConsumerGroup(
+    const std::vector<ConcatBranch>& branches, int64_t n_channels,
+    int64_t group) {
+  if (group <= 1) {
+    return true;
+  }
+  const int64_t block = n_channels / group;
+  for (const auto& b : branches) {
+    if (b.offset % block != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // The Conv analogue of FindMatmulConcatChains: every operand of a
 // channel-axis Concat (axis in {1, -3}) is resolved backward via
 // WalkConvProducerBackward to either a real group=1 Conv producer
 // (kProducer) or an eligible Add merge's whole group (kAdd, composed via
-// ResolveConvResidualGroupForConcat). The consumer must itself be an
-// ordinary (group=1) Conv. Mirrors pruning.py's own
+// ResolveConvResidualGroupForConcat). The consumer may be an ordinary
+// (`group=1`) Conv, or a general grouped (`group > 1`) Conv whose own block
+// boundaries line up exactly with every branch's own fixed offset -- see
+// ConcatBranchesAlignToConsumerGroup's own comment for exactly which
+// grouped consumers are safe to admit and why. Mirrors pruning.py's own
 // _find_conv_concat_chains.
 std::vector<ConcatChain> FindConvConcatChains(onnx::GraphProto* graph) {
   InitMap init_map;
@@ -6505,8 +7345,9 @@ std::vector<ConcatChain> FindConvConcatChains(onnx::GraphProto* graph) {
     if (!consumer) {
       continue;
     }
-    if (consumer->group != 1) {
-      continue;  // See this section's own comment -- grouped consumer declined.
+    if (!ConcatBranchesAlignToConsumerGroup(branches, total_n,
+                                            consumer->group)) {
+      continue;  // See ConcatBranchesAlignToConsumerGroup's own comment.
     }
 
     ConcatChain chain;
@@ -6519,6 +7360,7 @@ std::vector<ConcatChain> FindConvConcatChains(onnx::GraphProto* graph) {
     chain.consumer_is_conv = true;
     chain.n_channels = total_n;
     chain.conv_pass_through = std::move(fwd_pass_through);
+    chain.consumer_group = consumer->group;
     chains.push_back(std::move(chain));
   }
   return chains;
@@ -6616,13 +7458,43 @@ void ApplyConcatChains(
       continue;  // A shared/tied initializer another chain already resized.
     }
 
+    // When `chain.consumer_group` (Conv chains only -- always 1 for a
+    // MatMul/Gemm chain) is greater than 1, each branch's own independent
+    // `keep` is still chosen with no cross-branch coordination -- only *how*
+    // it's chosen within one branch changes: rather than one plain top-k of
+    // that branch's own `n_channels`, it's chosen as one independent top-k
+    // per `block`-sized block the branch contains (the exact same global
+    // block size and `per_group_keep` target used everywhere else in this
+    // merge), exactly mirroring ApplyChains' own per-block mechanism for a
+    // single grouped producer/consumer -- safe here specifically because
+    // ConcatBranchesAlignToConsumerGroup already confirmed every such block
+    // falls entirely inside one branch before this chain was ever produced,
+    // so a branch's own `n_channels / block` is always a whole number.
+    // Mirrors pruning.py's own _apply_concat_chains exactly.
+    const int64_t group = chain.consumer_group;
+    int64_t block = 0, per_group_keep = 0;
+    if (group > 1) {
+      block = chain.n_channels / group;
+      per_group_keep = std::max<int64_t>(
+          1, std::llround(static_cast<double>(block) * (1.0 - sparsity)));
+    }
+
     std::vector<std::vector<int64_t>> branch_keeps;
     branch_keeps.reserve(chain.branches.size());
     bool any_pruned = false;
     for (const auto& b : chain.branches) {
       const int64_t n = b.n_channels;
-      const int64_t keep_count = std::max<int64_t>(
-          1, n - std::llround(static_cast<double>(n) * sparsity));
+      int64_t local_blocks = 0;
+      int64_t keep_count;
+      if (group > 1) {
+        // Whole number by construction -- see ConcatBranchesAlignToConsumer
+        // Group's own comment and this function's own comment above.
+        local_blocks = n / block;
+        keep_count = per_group_keep * local_blocks;
+      } else {
+        keep_count = std::max<int64_t>(
+            1, n - std::llround(static_cast<double>(n) * sparsity));
+      }
       if (keep_count >= n) {
         std::vector<int64_t> full(static_cast<size_t>(n));
         std::iota(full.begin(), full.end(), int64_t{0});
@@ -6672,7 +7544,22 @@ void ApplyConcatChains(
           }
         }
       }
-      branch_keeps.push_back(TopKIndicesAscending(importance, keep_count));
+      if (group > 1) {
+        // One independent top-k per block contained in this branch -- see
+        // this function's own comment above.
+        std::vector<int64_t> keep;
+        keep.reserve(static_cast<size_t>(keep_count));
+        for (int64_t gi = 0; gi < local_blocks; ++gi) {
+          std::vector<double> block_imp(importance.begin() + gi * block,
+                                        importance.begin() + (gi + 1) * block);
+          for (int64_t li : TopKIndicesAscending(block_imp, per_group_keep)) {
+            keep.push_back(li + gi * block);
+          }
+        }
+        branch_keeps.push_back(std::move(keep));
+      } else {
+        branch_keeps.push_back(TopKIndicesAscending(importance, keep_count));
+      }
     }
 
     if (!any_pruned) {
@@ -6738,9 +7625,18 @@ void ApplyConcatChains(
       }
     }
 
-    SliceConsumerWeight(init_map.at(chain.consumer_weight),
-                        chain.consumer_weight_transposed, global_keep,
-                        chain.consumer_is_conv);
+    // The final consumer slice is, correspondingly,
+    // SliceGroupedConsumerConvWeight rather than SliceConsumerWeight
+    // whenever `consumer_group > 1` -- mirrors pruning.py's own
+    // _apply_concat_chains exactly.
+    if (chain.consumer_is_conv && group > 1) {
+      SliceGroupedConsumerConvWeight(init_map.at(chain.consumer_weight),
+                                     global_keep, group, chain.n_channels);
+    } else {
+      SliceConsumerWeight(init_map.at(chain.consumer_weight),
+                          chain.consumer_weight_transposed, global_keep,
+                          chain.consumer_is_conv);
+    }
 
     for (const auto& w : producer_weights) {
       touched.producer.insert(w);
@@ -21074,11 +21970,46 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
     std::vector<AttnChain> chains = FindAttentionChains(graph);
     std::vector<AttnChain> gqa_chains = FindGqaChains(graph);
     std::vector<AttnChain> onnx_attn_chains = FindOnnxAttentionChains(graph);
+    // MultiHeadAttention/PackedMultiHeadAttention/
+    // DecoderMaskedMultiHeadAttention/PagedAttention/LinearAttention/
+    // SparseAttention -- six more matched families sharing the identical
+    // FindSeparateQkvChains/ApplyOneGqaChain machinery GQA/OnnxAttention
+    // already use above (see each Find*Chains function's own comment for
+    // what's matched and this port's deliberate, narrower-than-pruning.py
+    // scope decisions). The fully decomposed (un-fused, "eager SDPA export")
+    // shape pruning.py's own `_find_decomposed_gqa_chains` additionally
+    // matches has no C++ port yet -- a topology-based match rewriting
+    // multiple Reshape/Expand shape constants in lock-step, genuinely more
+    // novel than any of the six fused-op families here, deliberately left
+    // unmatched (a decline, not a crash) rather than guessed at.
+    std::vector<AttnChain> mha_chains = FindMhaChains(graph);
+    std::vector<AttnChain> packed_mha_chains = FindPackedMhaChains(graph);
+    std::vector<AttnChain> dmmha_chains = FindDecoderMaskedMhaChains(graph);
+    std::vector<AttnChain> paged_chains = FindPagedAttentionChains(graph);
+    std::vector<AttnChain> linear_attn_chains =
+        FindLinearAttentionChains(graph);
+    std::vector<AttnChain> sparse_attn_chains =
+        FindSparseAttentionChains(graph);
     chains.insert(chains.end(), std::make_move_iterator(gqa_chains.begin()),
                   std::make_move_iterator(gqa_chains.end()));
     chains.insert(chains.end(),
                   std::make_move_iterator(onnx_attn_chains.begin()),
                   std::make_move_iterator(onnx_attn_chains.end()));
+    chains.insert(chains.end(), std::make_move_iterator(mha_chains.begin()),
+                  std::make_move_iterator(mha_chains.end()));
+    chains.insert(chains.end(),
+                  std::make_move_iterator(packed_mha_chains.begin()),
+                  std::make_move_iterator(packed_mha_chains.end()));
+    chains.insert(chains.end(), std::make_move_iterator(dmmha_chains.begin()),
+                  std::make_move_iterator(dmmha_chains.end()));
+    chains.insert(chains.end(), std::make_move_iterator(paged_chains.begin()),
+                  std::make_move_iterator(paged_chains.end()));
+    chains.insert(chains.end(),
+                  std::make_move_iterator(linear_attn_chains.begin()),
+                  std::make_move_iterator(linear_attn_chains.end()));
+    chains.insert(chains.end(),
+                  std::make_move_iterator(sparse_attn_chains.begin()),
+                  std::make_move_iterator(sparse_attn_chains.end()));
     if (!chains.empty()) {
       ApplyAttentionChains(graph, chains, sparsity, nullptr, 1e-8, norm);
     }
@@ -21135,7 +22066,7 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
   // inputs).
   onnx::GraphProto* graph = out.mutable_graph();
 
-  // Same chain-finding as ApplyAttentionHeadPruning's own three matched
+  // Same chain-finding as ApplyAttentionHeadPruning's own nine matched
   // families -- deliberately excluding the fused `MatMulNBitsQkv` variant
   // that function additionally handles, since pruning.py's own
   // apply_attention_head_wanda_pruning has no quantized-weight counterpart
@@ -21143,10 +22074,31 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
   std::vector<AttnChain> chains = FindAttentionChains(graph);
   std::vector<AttnChain> gqa_chains = FindGqaChains(graph);
   std::vector<AttnChain> onnx_attn_chains = FindOnnxAttentionChains(graph);
+  std::vector<AttnChain> mha_chains = FindMhaChains(graph);
+  std::vector<AttnChain> packed_mha_chains = FindPackedMhaChains(graph);
+  std::vector<AttnChain> dmmha_chains = FindDecoderMaskedMhaChains(graph);
+  std::vector<AttnChain> paged_chains = FindPagedAttentionChains(graph);
+  std::vector<AttnChain> linear_attn_chains = FindLinearAttentionChains(graph);
+  std::vector<AttnChain> sparse_attn_chains = FindSparseAttentionChains(graph);
   chains.insert(chains.end(), std::make_move_iterator(gqa_chains.begin()),
                 std::make_move_iterator(gqa_chains.end()));
   chains.insert(chains.end(), std::make_move_iterator(onnx_attn_chains.begin()),
                 std::make_move_iterator(onnx_attn_chains.end()));
+  chains.insert(chains.end(), std::make_move_iterator(mha_chains.begin()),
+                std::make_move_iterator(mha_chains.end()));
+  chains.insert(chains.end(),
+                std::make_move_iterator(packed_mha_chains.begin()),
+                std::make_move_iterator(packed_mha_chains.end()));
+  chains.insert(chains.end(), std::make_move_iterator(dmmha_chains.begin()),
+                std::make_move_iterator(dmmha_chains.end()));
+  chains.insert(chains.end(), std::make_move_iterator(paged_chains.begin()),
+                std::make_move_iterator(paged_chains.end()));
+  chains.insert(chains.end(),
+                std::make_move_iterator(linear_attn_chains.begin()),
+                std::make_move_iterator(linear_attn_chains.end()));
+  chains.insert(chains.end(),
+                std::make_move_iterator(sparse_attn_chains.begin()),
+                std::make_move_iterator(sparse_attn_chains.end()));
 
   if (chains.empty()) {
     return out;  // Mirrors pruning.py's own early return.
@@ -21660,6 +22612,452 @@ std::optional<AttentionProducerMatch> MatchAttentionProducerAnyFloat(
   return AttentionProducerMatch{w_name, bias_name, num_heads, nq, nk, nv};
 }
 
+// --- SparseGPT Conv support (im2col cross-covariance Hessian) -----------
+//
+// C++ port of pruning.py's own `_ConvSpatialAttrs`/`_conv_spatial_attrs`/
+// `_resolve_conv_pads`/`_conv_im2col_patches`, the machinery
+// `apply_sparsegpt_pruning`'s own Conv branch needs that no MatMul/Gemm/
+// Attention candidate does: a full `[K, K]` im2col cross-covariance Hessian
+// (`H = patches.T @ patches`, `K = Cin/group * kh * kw`) rather than the
+// plain `H = X.T @ X` a MatMul/Gemm layer's own already-2-D activation
+// gives for free. See pruning.py's own module-level docstring for why this
+// needed genuinely new, from-first-principles machinery (no correct
+// upstream SparseGPT reference implementation ever exercises a Conv layer)
+// and how it was verified (an independent nested-loop oracle, an
+// independent second `fasterprune` transliteration fed independently-built
+// per-group patches, and an end-to-end onnxruntime reconstruction-error
+// property, for ordinary/depthwise/general-grouped Conv alike) -- that
+// verification bar is exactly what this port is checked against (see
+// tests/test_sparsegpt_pruning_cpp.py's own Conv section), the Python
+// implementation being trustworthy ground truth despite having no upstream
+// reference of its own.
+struct ConvSpatialAttrs {
+  int64_t kh = 0;
+  int64_t kw = 0;
+  int64_t pad_top = 0;
+  int64_t pad_left = 0;
+  int64_t pad_bottom = 0;
+  int64_t pad_right = 0;
+  int64_t stride_h = 1;
+  int64_t stride_w = 1;
+  int64_t dilation_h = 1;
+  int64_t dilation_w = 1;
+  // "NOTSET"/"": pad_top/pad_left/pad_bottom/pad_right above are used as-is,
+  // fixed per node. "SAME_UPPER"/"SAME_LOWER"/"VALID": those four fields are
+  // unused placeholders -- the real padding is resolved fresh per
+  // calibration batch by ResolveConvPads, from that batch's own input
+  // spatial size, mirroring pruning.py's own _ConvSpatialAttrs/
+  // _resolve_conv_pads split exactly.
+  std::string auto_pad = "NOTSET";
+};
+
+// C++ port of pruning.py's own _conv_spatial_attrs: extracts the
+// padding/stride/dilation a Conv node's calibration input needs to be
+// correctly im2col-unfolded, from `node`'s own attributes and `w_init`'s
+// own `[out_channels, in_channels/group, kh, kw]` shape. Returns
+// std::nullopt on the same "don't guess at a malformed node" conditions the
+// Python original declines on: a `kernel_shape` disagreeing with `w_init`'s
+// own shape, an unrecognized `auto_pad` string, non-positive
+// `strides`/`dilations`, or a malformed explicit `pads` (wrong length, or
+// negative) -- a declined node is left completely untouched by this pass's
+// caller, exactly like a layer with no observed calibration activation.
+std::optional<ConvSpatialAttrs> ResolveConvSpatialAttrs(
+    const onnx::NodeProto& node, const onnx::TensorProto& w_init) {
+  if (w_init.dims_size() != 4) {
+    return std::nullopt;
+  }
+  const int64_t kh = w_init.dims(2);
+  const int64_t kw = w_init.dims(3);
+
+  std::string auto_pad = "NOTSET";
+  std::optional<std::vector<int64_t>> pads;
+  std::optional<std::vector<int64_t>> strides;
+  std::optional<std::vector<int64_t>> dilations;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "auto_pad") {
+      auto_pad = attr.s();
+    } else if (attr.name() == "pads") {
+      pads = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    } else if (attr.name() == "strides") {
+      strides = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    } else if (attr.name() == "dilations") {
+      dilations = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    } else if (attr.name() == "kernel_shape") {
+      const std::vector<int64_t> ks(attr.ints().begin(), attr.ints().end());
+      if (ks.size() != 2 || ks[0] != kh || ks[1] != kw) {
+        return std::nullopt;  // weight/attribute mismatch -- don't guess
+      }
+    }
+  }
+  if (auto_pad != "NOTSET" && !auto_pad.empty() && auto_pad != "SAME_UPPER" &&
+      auto_pad != "SAME_LOWER" && auto_pad != "VALID") {
+    return std::nullopt;  // unrecognized -- don't guess
+  }
+
+  const std::vector<int64_t> s = strides.value_or(std::vector<int64_t>{1, 1});
+  if (s.size() != 2 || s[0] <= 0 || s[1] <= 0) {
+    return std::nullopt;
+  }
+  const std::vector<int64_t> d = dilations.value_or(std::vector<int64_t>{1, 1});
+  if (d.size() != 2 || d[0] <= 0 || d[1] <= 0) {
+    return std::nullopt;
+  }
+
+  ConvSpatialAttrs result;
+  result.kh = kh;
+  result.kw = kw;
+  result.stride_h = s[0];
+  result.stride_w = s[1];
+  result.dilation_h = d[0];
+  result.dilation_w = d[1];
+  result.auto_pad = auto_pad;
+
+  if (auto_pad == "NOTSET" || auto_pad.empty()) {
+    const std::vector<int64_t> p =
+        pads.value_or(std::vector<int64_t>{0, 0, 0, 0});
+    if (p.size() != 4 || p[0] < 0 || p[1] < 0 || p[2] < 0 || p[3] < 0) {
+      return std::nullopt;
+    }
+    result.pad_top = p[0];
+    result.pad_left = p[1];
+    result.pad_bottom = p[2];
+    result.pad_right = p[3];
+  }
+  return result;
+}
+
+// C++ port of pruning.py's own _resolve_conv_pads: resolves one Conv node's
+// actual (pad_top, pad_left, pad_bottom, pad_right) for one calibration
+// batch's own [N, Cin, in_h, in_w] input, per the ONNX Conv operator's own
+// `auto_pad` formula (https://onnx.ai/onnx/operators/onnx__Conv.html).
+// "NOTSET"/"" is already a fixed, per-node quantity, returned unchanged;
+// "VALID" is always zero padding; "SAME_UPPER"/"SAME_LOWER" are the only
+// genuinely input-size-dependent cases, resolved fresh here (never cached
+// on `attrs` itself) since a dynamic-input-shape model's own in_h/in_w can
+// legitimately differ calibration batch to batch. Every division below is
+// over strictly positive operands (kh/kw/strides/dilations already
+// validated positive by ResolveConvSpatialAttrs), so plain truncating
+// integer division already computes the same ceiling pruning.py's own
+// `-(-a // b)` trick gets from Python's floor-division semantics.
+std::array<int64_t, 4> ResolveConvPads(const ConvSpatialAttrs& attrs,
+                                       int64_t in_h, int64_t in_w) {
+  if (attrs.auto_pad == "NOTSET" || attrs.auto_pad.empty()) {
+    return {attrs.pad_top, attrs.pad_left, attrs.pad_bottom, attrs.pad_right};
+  }
+  if (attrs.auto_pad == "VALID") {
+    return {0, 0, 0, 0};
+  }
+  const int64_t eff_kh = (attrs.kh - 1) * attrs.dilation_h + 1;
+  const int64_t eff_kw = (attrs.kw - 1) * attrs.dilation_w + 1;
+  const int64_t out_h = (in_h + attrs.stride_h - 1) / attrs.stride_h;
+  const int64_t out_w = (in_w + attrs.stride_w - 1) / attrs.stride_w;
+  const int64_t pad_h =
+      std::max<int64_t>(0, (out_h - 1) * attrs.stride_h + eff_kh - in_h);
+  const int64_t pad_w =
+      std::max<int64_t>(0, (out_w - 1) * attrs.stride_w + eff_kw - in_w);
+  int64_t pad_top, pad_left;
+  if (attrs.auto_pad == "SAME_UPPER") {
+    pad_top = pad_h / 2;
+    pad_left = pad_w / 2;
+  } else {  // SAME_LOWER
+    pad_top = pad_h - pad_h / 2;
+    pad_left = pad_w - pad_w / 2;
+  }
+  return {pad_top, pad_left, pad_h - pad_top, pad_w - pad_left};
+}
+
+// Returns (h_out, w_out) for a Conv's own effective kernel/stride/dilation
+// over `[in_h, in_w]`, once padded per `attrs`'s own auto_pad/pads --
+// std::nullopt if the padded input is too small for the (dilated) kernel
+// (mirrors pruning.py's own _conv_im2col_patches "too small once padded"
+// decline). Resolves padding fresh (ResolveConvPads), since auto_pad's own
+// padding amount can be input-size-dependent.
+std::optional<std::pair<int64_t, int64_t>> ConvOutputSpatialSize(
+    const ConvSpatialAttrs& attrs, int64_t in_h, int64_t in_w) {
+  const std::array<int64_t, 4> pads = ResolveConvPads(attrs, in_h, in_w);
+  const int64_t eff_kh = (attrs.kh - 1) * attrs.dilation_h + 1;
+  const int64_t eff_kw = (attrs.kw - 1) * attrs.dilation_w + 1;
+  const int64_t padded_h = in_h + pads[0] + pads[2];
+  const int64_t padded_w = in_w + pads[1] + pads[3];
+  if (padded_h < eff_kh || padded_w < eff_kw) {
+    return std::nullopt;
+  }
+  const int64_t h_out = (padded_h - eff_kh) / attrs.stride_h + 1;
+  const int64_t w_out = (padded_w - eff_kw) / attrs.stride_w + 1;
+  if (h_out <= 0 || w_out <= 0) {
+    return std::nullopt;
+  }
+  return std::make_pair(h_out, w_out);
+}
+
+// C++ port of pruning.py's own _conv_im2col_patches, reorganized to
+// accumulate `H += patches.T @ patches` directly, one output position's own
+// receptive-field patch row at a time, rather than ever materializing the
+// full `[n_positions, k]` patch matrix the Python original returns
+// (mathematically identical: `H == sum over positions of outer(patch,
+// patch)`) -- avoids holding a potentially large patch matrix in memory at
+// all, an even smaller footprint than pruning.py's own module docstring
+// already gets from never concatenating multiple BATCHES' own patches.
+// Reads only the `[cin_offset, cin_offset + cin_slice)` channel slice of
+// `x` (one calibration batch's own raw `[n, cin_total, in_h, in_w]`
+// activation, already read via ReadTensorAsF64) -- the caller
+// (ConvSparseGptHessianStats) passes a grouped/depthwise Conv's own
+// group-g global input-channel range here, or the full `[0, cin_total)`
+// range for group == 1, exactly mirroring pruning.py's own per-group
+// `x[:, g*cin_per_group:(g+1)*cin_per_group, :, :]` slicing -- this
+// function itself carries no notion of `group` at all, needing none (see
+// pruning.py's own module docstring for why that is the correct per-group
+// Hessian, not an approximation). `h_out`/`w_out` (from
+// ConvOutputSpatialSize, already confirmed usable by the caller) and `pads`
+// are passed in rather than recomputed, since the caller already needs
+// ConvOutputSpatialSize's own result to decide whether to allocate `h` at
+// all. Accumulates into `h`'s UPPER triangle only (`k * k`, `k == cin_slice
+// * attrs.kh * attrs.kw`) -- mirrored into the lower triangle once, after
+// every batch, by the caller, exactly like SparseGptHessianStats' own
+// accumulation.
+void ConvIm2ColAccumulateHessian(const std::vector<double>& x, int64_t n,
+                                 int64_t cin_total, int64_t in_h, int64_t in_w,
+                                 int64_t cin_offset, int64_t cin_slice,
+                                 const ConvSpatialAttrs& attrs,
+                                 const std::array<int64_t, 4>& pads,
+                                 int64_t h_out, int64_t w_out,
+                                 std::vector<double>& h) {
+  const int64_t pad_top = pads[0];
+  const int64_t pad_left = pads[1];
+  const int64_t k = cin_slice * attrs.kh * attrs.kw;
+  // One output position's own flattened (in_channel, kh, kw) patch row --
+  // row-major in that order, matching pruning.py's own
+  // w.reshape(n, cin*kh*kw) column order exactly.
+  std::vector<double> row(static_cast<size_t>(k));
+  for (int64_t ni = 0; ni < n; ++ni) {
+    for (int64_t oh = 0; oh < h_out; ++oh) {
+      const int64_t h_base = oh * attrs.stride_h - pad_top;
+      for (int64_t ow = 0; ow < w_out; ++ow) {
+        const int64_t w_base = ow * attrs.stride_w - pad_left;
+        int64_t col = 0;
+        for (int64_t ci = 0; ci < cin_slice; ++ci) {
+          const int64_t c = cin_offset + ci;
+          for (int64_t i = 0; i < attrs.kh; ++i) {
+            const int64_t hh = h_base + i * attrs.dilation_h;
+            for (int64_t j = 0; j < attrs.kw; ++j) {
+              const int64_t ww = w_base + j * attrs.dilation_w;
+              double v = 0.0;
+              if (hh >= 0 && hh < in_h && ww >= 0 && ww < in_w) {
+                v = x[static_cast<size_t>(
+                    ((ni * cin_total + c) * in_h + hh) * in_w + ww)];
+              }
+              row[static_cast<size_t>(col++)] = v;
+            }
+          }
+        }
+        // h += outer(row, row), upper triangle only -- mirrors
+        // SparseGptHessianStats' own per-row accumulation loop exactly.
+        for (int64_t i = 0; i < k; ++i) {
+          const double ri = row[static_cast<size_t>(i)];
+          if (ri == 0.0) {
+            continue;
+          }
+          double* hrow = h.data() + i * k;
+          const double* rowp = row.data();
+          for (int64_t j = i; j < k; ++j) {
+            hrow[j] += ri * rowp[j];
+          }
+        }
+      }
+    }
+  }
+}
+
+// One 2-D Conv (ordinary/depthwise/general-grouped) SparseGPT candidate --
+// mirrors pruning.py's own `_match_conv_weight_only`'s
+// `(x_name, w_name)` plus the `group`/`cin_per_group`/`attrs` triple
+// `apply_sparsegpt_pruning`'s own `conv_group_info`/`conv_attrs` dicts key
+// by `w_name` separately.
+struct SparseGptConvCandidate {
+  std::string x_name;
+  std::string w_name;
+  int64_t group;
+  int64_t cin_per_group;
+  ConvSpatialAttrs attrs;
+};
+
+// One matched Conv layer's own per-group accumulated Hessians -- `h[g]` is
+// empty (unobserved -- mirrors pruning.py's own `h_accum[g] is None`
+// sentinel) until group `g`'s own Hessian has been observed on at least one
+// usable calibration batch, then always a dense, exactly symmetric `k * k`
+// row-major matrix (`k == cin_per_group * kh * kw`).
+struct ConvSparseGptHessian {
+  int64_t k = 0;
+  std::vector<std::vector<double>> h;
+};
+
+// The Conv analogue of SparseGptHessianStats above: accumulates each
+// matched Conv candidate's own per-group `H = patches.T @ patches`
+// (ConvIm2ColAccumulateHessian) incrementally, one calibration batch at a
+// time, rather than ever holding every batch's own unfolded patches at
+// once -- mirrors pruning.py's own `conv_h` accumulation exactly (see
+// `apply_sparsegpt_pruning`'s own body comment there). Keyed by each
+// candidate's own WEIGHT name (unlike SparseGptHessianStats, keyed by
+// activation name) -- mirrors pruning.py's own `conv_attrs`/`conv_h`
+// dicts: two Conv nodes can share one activation tensor with different
+// kernels/attributes, so the accumulated Hessian is a per-node, not a
+// per-activation, quantity.
+//
+// A separate probe-injection/batch-iteration/executor-call pass from
+// SparseGptHessianStats' own (reusing its established design, not its
+// code) -- ApplySparseGptPruning below calls this only when at least one
+// Conv candidate exists, at the cost of one extra full calibration pass
+// over `model` in that case (pruning.py's own single probe model covers
+// both statistics in one pass; this file's own established convention,
+// already followed by WandaCalibrationStats/SparseGptHessianStats
+// themselves, is one dedicated stats function per statistic kind, each
+// running its own pass -- a bounded, documented efficiency trade-off, not
+// a correctness concern).
+std::unordered_map<std::string, ConvSparseGptHessian> ConvSparseGptHessianStats(
+    const ModelExecutor& executor, const onnx::ModelProto& model,
+    const std::vector<SparseGptConvCandidate>& conv_candidates,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data) {
+  std::unordered_map<std::string, ConvSparseGptHessian> result;
+  if (conv_candidates.empty()) {
+    return result;
+  }
+
+  std::set<std::string> uniq_probe_names;
+  for (const auto& c : conv_candidates) {
+    uniq_probe_names.insert(c.x_name);
+  }
+  const std::vector<std::string> probe_names(uniq_probe_names.begin(),
+                                             uniq_probe_names.end());
+
+  onnx::ModelProto probe_model = model;
+  std::unordered_set<std::string> existing_outputs;
+  for (const auto& o : probe_model.graph().output()) {
+    existing_outputs.insert(o.name());
+  }
+  for (const auto& name : probe_names) {
+    if (existing_outputs.insert(name).second) {
+      probe_model.mutable_graph()->add_output()->set_name(name);
+    }
+  }
+
+  std::unordered_map<std::string, size_t> output_index;
+  for (int i = 0; i < probe_model.graph().output_size(); ++i) {
+    output_index.emplace(probe_model.graph().output(i).name(),
+                         static_cast<size_t>(i));
+  }
+  const auto& graph_inputs = probe_model.graph().input();
+
+  // Pre-size every candidate's own per-group Hessian slot list -- mirrors
+  // pruning.py's own `conv_h.setdefault(w_name, [None] * group)`, done once
+  // up front here since every candidate's own `group`/`k` is already known
+  // (unlike pruning.py's own lazy setdefault-on-first-batch, no functional
+  // difference either way).
+  for (const auto& c : conv_candidates) {
+    auto& acc = result[c.w_name];
+    acc.k = c.cin_per_group * c.attrs.kh * c.attrs.kw;
+    if (acc.h.empty()) {
+      acc.h.assign(static_cast<size_t>(c.group), std::vector<double>());
+    }
+  }
+
+  for (const auto& batch : calibration_data) {
+    std::vector<DLManagedTensorPtr> input_dls;
+    std::vector<const DLManagedTensor*> input_ptrs;
+    input_dls.reserve(static_cast<size_t>(graph_inputs.size()));
+    input_ptrs.reserve(static_cast<size_t>(graph_inputs.size()));
+    for (const auto& gi : graph_inputs) {
+      auto it = batch.find(gi.name());
+      if (it == batch.end()) {
+        throw std::invalid_argument(
+            "ApplySparseGptPruning: calibration batch is missing required "
+            "graph input '" +
+            gi.name() + "'");
+      }
+      input_dls.emplace_back(
+          onnxsim::dlpack::FromTensorProtoBorrowing(it->second));
+      input_ptrs.push_back(input_dls.back().get());
+    }
+
+    std::vector<DLManagedTensorPtr> outputs =
+        executor.Run(probe_model, input_ptrs);
+
+    // Cache each distinct probe name's own read-as-f64 activation + dims
+    // for this batch once -- multiple Conv candidates can share one
+    // x_name, mirroring pruning.py's own single `result[x_name]` read
+    // reused across every candidate that shares it.
+    std::unordered_map<std::string,
+                       std::pair<std::vector<double>, std::vector<int64_t>>>
+        batch_x;
+    for (const auto& name : probe_names) {
+      auto oit = output_index.find(name);
+      if (oit == output_index.end() || oit->second >= outputs.size()) {
+        continue;
+      }
+      const DLTensor& dl = outputs[oit->second]->dl_tensor;
+      onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
+      if (!IsSupportedFloatDtype(tp.data_type()) || tp.dims_size() != 4) {
+        continue;  // Mirrors pruning.py's own `if x_conv.ndim != 4: continue`.
+      }
+      std::vector<int64_t> dims(tp.dims().begin(), tp.dims().end());
+      batch_x.emplace(name,
+                      std::make_pair(ReadTensorAsF64(tp), std::move(dims)));
+    }
+
+    for (const auto& c : conv_candidates) {
+      auto xit = batch_x.find(c.x_name);
+      if (xit == batch_x.end()) {
+        continue;
+      }
+      const std::vector<double>& x = xit->second.first;
+      const std::vector<int64_t>& dims = xit->second.second;
+      const int64_t nn = dims[0];
+      const int64_t cin_total = dims[1];
+      const int64_t in_h = dims[2];
+      const int64_t in_w = dims[3];
+      if (cin_total != c.cin_per_group * c.group) {
+        continue;  // Not this node's own input -- mirrors pruning.py's own
+                   // `x_conv.shape[1] != cin_per_group * group` check.
+      }
+      const auto out_size = ConvOutputSpatialSize(c.attrs, in_h, in_w);
+      if (!out_size) {
+        continue;  // Mirrors pruning.py's own `if patches is None: continue`.
+      }
+      const std::array<int64_t, 4> pads = ResolveConvPads(c.attrs, in_h, in_w);
+      auto& acc = result.at(c.w_name);
+      for (int64_t g = 0; g < c.group; ++g) {
+        std::vector<double>& hg = acc.h[static_cast<size_t>(g)];
+        if (hg.empty()) {
+          hg.assign(static_cast<size_t>(acc.k * acc.k), 0.0);
+        }
+        ConvIm2ColAccumulateHessian(
+            x, nn, cin_total, in_h, in_w, g * c.cin_per_group, c.cin_per_group,
+            c.attrs, pads, out_size->first, out_size->second, hg);
+      }
+    }
+  }
+
+  // Mirror the accumulated upper triangle (including the diagonal) into the
+  // lower triangle, per group, so each `h[g]` is a fully-populated,
+  // exactly-symmetric dense matrix -- exactly like SparseGptHessianStats'
+  // own post-processing.
+  for (auto& [w_name, acc] : result) {
+    for (auto& hg : acc.h) {
+      if (hg.empty()) {
+        continue;
+      }
+      for (int64_t i = 0; i < acc.k; ++i) {
+        for (int64_t j = i + 1; j < acc.k; ++j) {
+          hg[static_cast<size_t>(j * acc.k + i)] =
+              hg[static_cast<size_t>(i * acc.k + j)];
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
 // SparseGPT (Frantar & Alistarh, 2023) unstructured/N:M pruning. The C++
 // port of pruning.py's own apply_sparsegpt_pruning -- see this file's own
 // "SparseGPT (unstructured / N:M) pruning" section comment above
@@ -21740,24 +23138,31 @@ onnx::ModelProto ApplySparseGptPruning(
   // pruning.py's own module docstring for the full reasoning on why this is
   // correct, not an oversight, for both).
   //
-  // 2-D Conv (ordinary/depthwise/general-grouped) is declined outright,
-  // NOT ported here -- see structured_pruning_entry.h's own
-  // ApplySparseGptPruning declaration comment for why (it needs an
-  // entirely new, from-first-principles im2col cross-covariance Hessian
-  // pruning.py's own module docstring documents at length, materially
-  // bigger than the rest of this pass, with no correct upstream reference
-  // to port from at all) -- a Conv node here simply never matches either
-  // case below and is left completely untouched, never guessed at. This
-  // remains the one open scope gap versus pruning.py's own
-  // apply_sparsegpt_pruning after this port's FLOAT16/BFLOAT16 widening --
-  // see this function's own declaration comment in
-  // structured_pruning_entry.h.
+  // 2-D Conv (ordinary/depthwise/general-grouped) is matched too, via
+  // _match_conv_weight_only's own criteria (op_type "Conv"/"FusedConv", no
+  // domain check -- mirrors pruning.py's own matcher exactly): a constant
+  // 4-D FLOAT/FLOAT16/BFLOAT16 [out_channels, in_channels/group, kh, kw]
+  // weight, `group >= 1`, and (when `group > 1`) `out_channels % group ==
+  // 0`. A node whose Conv attributes ResolveConvSpatialAttrs itself
+  // declines (a malformed `kernel_shape`, unrecognized `auto_pad`,
+  // non-positive `strides`/`dilations`, or a malformed explicit `pads`) is
+  // simply never added as a candidate at all -- left completely untouched,
+  // exactly the same end result pruning.py's own `conv_attrs[w_name] is
+  // None` check produces for a node that DOES enter its own candidate list
+  // but is then never given a Hessian (see this module's own docstring for
+  // Conv's own im2col cross-covariance Hessian and the per-group Hessian/
+  // column-processing split a grouped/depthwise Conv needs, and this
+  // file's own "SparseGPT Conv support" section comment immediately above
+  // for the C++ machinery: ResolveConvSpatialAttrs/ResolveConvPads/
+  // ConvOutputSpatialSize/ConvIm2ColAccumulateHessian/
+  // ConvSparseGptHessianStats).
   struct Candidate {
     std::string x_name;
     std::string w_name;
     bool weight_transposed;
   };
   std::vector<Candidate> candidates;
+  std::vector<SparseGptConvCandidate> conv_candidates;
   for (const auto& node : graph->node()) {
     auto mm = MatchMatMulLikeRaw(node);
     if (mm) {
@@ -21776,9 +23181,26 @@ onnx::ModelProto ApplySparseGptPruning(
       // MatchAttentionProducer's own comment), so it is matched exactly
       // like a non-transposed MatMul weight.
       candidates.push_back({node.input(0), am->weight, false});
+      continue;
+    }
+    if ((node.op_type() == "Conv" || node.op_type() == "FusedConv") &&
+        node.input_size() >= 2) {
+      auto wit = init_map.find(node.input(1));
+      if (wit != init_map.end() &&
+          IsSupportedFloatDtype(wit->second->data_type()) &&
+          wit->second->dims_size() == 4) {
+        const int64_t group = ConvGroupAttr(node);
+        if (group >= 1 && (group == 1 || wit->second->dims(0) % group == 0)) {
+          auto attrs = ResolveConvSpatialAttrs(node, *wit->second);
+          if (attrs) {
+            conv_candidates.push_back({node.input(0), node.input(1), group,
+                                       wit->second->dims(1), *attrs});
+          }
+        }
+      }
     }
   }
-  if (candidates.empty()) {
+  if (candidates.empty() && conv_candidates.empty()) {
     return out;
   }
 
@@ -21790,8 +23212,72 @@ onnx::ModelProto ApplySparseGptPruning(
                                              uniq_probe_names.end());
   const std::unordered_map<std::string, SparseGptHessian> hessians =
       SparseGptHessianStats(executor, out, probe_names, calibration_data);
+  const std::unordered_map<std::string, ConvSparseGptHessian> conv_hessians =
+      ConvSparseGptHessianStats(executor, out, conv_candidates,
+                                calibration_data);
 
   MutInitMap mut_init_map = BuildMutInitMap(graph);
+  for (const auto& c : conv_candidates) {
+    auto hit = conv_hessians.find(c.w_name);
+    if (hit == conv_hessians.end()) {
+      continue;
+    }
+    // Every group's own H must have been observed -- a layer with no
+    // usable calibration signal for any one group is left completely
+    // untouched, same as the non-Conv `hit == hessians.end()` check below
+    // (there is no data-free fallback, and no meaningful way to prune some
+    // groups' filters but not others). Mirrors pruning.py's own
+    // `if h_list is None or any(h is None for h in h_list): continue`.
+    bool any_group_unobserved = false;
+    for (const auto& hg : hit->second.h) {
+      if (hg.empty()) {
+        any_group_unobserved = true;
+        break;
+      }
+    }
+    if (any_group_unobserved) {
+      continue;
+    }
+
+    onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
+    const int64_t cout = w_init->dims(0);
+    const int64_t cin_per_group = w_init->dims(1);
+    const int64_t kh = w_init->dims(2);
+    const int64_t kw = w_init->dims(3);
+    const int32_t w_dtype = w_init->data_type();
+    // w's own [cout, cin_per_group, kh, kw] row-major layout is ALREADY
+    // exactly [cout, cin_per_group*kh*kw] once flattened -- unlike the
+    // MatMul/Attention path above, a Conv weight's output channel already
+    // lives on axis 0, so no transpose is needed either way (mirrors
+    // pruning.py's own unconditional `w.reshape(cout, cin_per_group*kh*kw)`
+    // Conv branch).
+    const std::vector<double> w_f64 = ReadTensorAsF64(*w_init);
+    const int64_t k = cin_per_group * kh * kw;
+    const int64_t filters_per_group = cout / c.group;
+
+    std::vector<double> w_new(static_cast<size_t>(cout * k));
+    for (int64_t g = 0; g < c.group; ++g) {
+      // Group g's own [filters_per_group, k] weight sub-block (rows
+      // [g*filters_per_group, (g+1)*filters_per_group)) is pruned
+      // independently against its own group's H -- mirrors pruning.py's
+      // own per-group `_sparsegpt_prune_columns` call exactly (see this
+      // module's own docstring for why a column-masking decision and its
+      // downstream error compensation only make sense within one group's
+      // own consistent Hessian/weight coordinate system).
+      const auto row_begin = w_f64.begin() + static_cast<std::ptrdiff_t>(
+                                                 g * filters_per_group * k);
+      const std::vector<double> w_sub(
+          row_begin,
+          row_begin + static_cast<std::ptrdiff_t>(filters_per_group * k));
+      const std::vector<double> pruned_sub = SparseGptPruneColumns(
+          w_sub, filters_per_group, k, hit->second.h[static_cast<size_t>(g)],
+          sparsity, n, m, percdamp, proc_block_size);
+      std::copy(pruned_sub.begin(), pruned_sub.end(),
+                w_new.begin() +
+                    static_cast<std::ptrdiff_t>(g * filters_per_group * k));
+    }
+    WriteF64TensorAs(w_init, w_dtype, {cout, cin_per_group, kh, kw}, w_new);
+  }
   for (const auto& c : candidates) {
     auto hit = hessians.find(c.x_name);
     if (hit == hessians.end()) {
@@ -21957,29 +23443,200 @@ std::vector<double> FromWandaNK(const std::vector<double>& w_pruned_nk,
 }
 
 // Wanda's own ``|W_ij| * ||X_j||_2`` importance for an already-`[n_rows,
-// kk]`-shaped weight, given its own optional per-`kk`-column calibrated
-// activation norm -- mirrors pruning.py's own `_wanda_importance` exactly,
-// including its fallback: `norm` absent, or its width not matching `kk`
-// (no calibration activation was ever observed for this layer, or it was
-// observed at a mismatched width), falls back to plain magnitude
-// (`std::fabs(w)` alone).
+// kk]`-shaped weight, given its own optional calibrated activation norm --
+// mirrors pruning.py's own `_wanda_importance` exactly, including its
+// fallback: `norm` absent, or its size matching neither `kk` (a single
+// shared row, broadcast to every output row -- the MatMul/Gemm/Attention
+// case) nor `n_rows * kk` (a genuinely per-row norm, one full `[n_rows, kk]`
+// array of its own -- the grouped/depthwise-Conv case, where
+// ConvGroupRelativeNorm has already expanded each output filter's own
+// group-relative norm into its own row before this function ever sees it;
+// see this function's own Conv caller for why one shared row would be
+// wrong there), falls back to plain magnitude (`std::fabs(w)` alone). Both
+// size checks collapse to the exact same result when `n_rows == 1` (the
+// only case where `kk == n_rows * kk`), so there is no genuine ambiguity
+// between the two.
 std::vector<double> WandaImportance(const std::vector<double>& w_nk,
                                     int64_t n_rows, int64_t kk,
                                     const std::vector<double>* norm,
                                     double epsilon) {
-  const bool use_norm =
+  const bool broadcast_norm =
       norm != nullptr && static_cast<int64_t>(norm->size()) == kk;
+  const bool full_norm =
+      norm != nullptr && static_cast<int64_t>(norm->size()) == n_rows * kk;
   std::vector<double> importance(w_nk.size());
   for (int64_t r = 0; r < n_rows; ++r) {
     for (int64_t c = 0; c < kk; ++c) {
       const size_t i = static_cast<size_t>(r * kk + c);
       const double mag = std::fabs(w_nk[i]);
-      importance[i] =
-          use_norm ? mag * std::max((*norm)[static_cast<size_t>(c)], epsilon)
-                   : mag;
+      double norm_val = 0.0;
+      bool use_norm = false;
+      if (full_norm) {
+        norm_val = (*norm)[i];
+        use_norm = true;
+      } else if (broadcast_norm) {
+        norm_val = (*norm)[static_cast<size_t>(c)];
+        use_norm = true;
+      }
+      importance[i] = use_norm ? mag * std::max(norm_val, epsilon) : mag;
     }
   }
   return importance;
+}
+
+// --- Conv im2col-unfolded activation statistics (Wanda only) ------------
+//
+// C++ mirror of pruning.py's own "Conv im2col-unfolded activation
+// statistics (Wanda only)" section -- `_conv_patch_sq_sum`/
+// `_conv_group_relative_norm` -- the one piece of genuinely new machinery
+// this port needed to close the "2-D Conv" gap noted in this file's own
+// declaration comment history: Wanda's ``X_j`` for a Conv column is not
+// "input feature `j`" (a MatMul/Gemm column) but "receptive-field offset
+// `j`" -- one `(in_channel, kh, kw)` tap of the sliding kernel -- so its
+// activation statistic is the norm of the *im2col-unfolded* input patch
+// value at that specific offset, over every output spatial position and
+// calibration sample. Reuses `ConvSpatialAttrs`/`ResolveConvSpatialAttrs`/
+// `ResolveConvPads` verbatim from the SparseGPT Conv section above (this
+// file's first port to need Conv attribute resolution at all) -- both
+// mirror the identical `_ConvSpatialAttrs`/`_conv_spatial_attrs`/
+// `_resolve_conv_pads` pruning.py helpers, so there is nothing Wanda-specific
+// to add here.
+
+// One calibration batch's accumulated im2col patch statistic for one Conv
+// node -- mirrors pruning.py's own `_conv_patch_sq_sum` return value
+// exactly: `sq_sum` is row-major `[Cin, kh, kw]` (flattening it in that
+// order matches the Conv weight's own on-disk `[out_channels, Cin, kh,
+// kw]` layout, already the `_weight_to_nk` reshape convention with no
+// transpose needed), `count` is `N * h_out * w_out`.
+struct ConvPatchStat {
+  std::vector<double> sq_sum;
+  int64_t count = 0;
+};
+
+// Mirrors pruning.py's own `_conv_patch_sq_sum` exactly: `x` is one
+// calibration batch's raw `[N, Cin, in_h, in_w]` Conv input, row-major
+// contiguous (`dims` gives its shape). Returns `std::nullopt` if `x` isn't
+// a plausible 4-D NCHW activation for this Conv's own kernel once padded
+// (too small, or not rank-4 at all).
+//
+// Zero-pads `x` into an explicit `[N, Cin, padded_h, padded_w]` buffer (the
+// direct analogue of `np.pad`), then, for each of the `kh*kw`
+// receptive-field taps, accumulates the sum of squares of every padded
+// value that tap reads across every batch sample and output spatial
+// position -- `tap (i, j)`'s own values live at padded row `i*dilation_h +
+// ho*stride_h`, column `j*dilation_w + wo*stride_w`, for `ho` in
+// `[0, h_out)`, `wo` in `[0, w_out)` -- accounting for non-unit dilation
+// exactly the way pruning.py's own per-tap strided slice does.
+std::optional<ConvPatchStat> ConvPatchSqSum(const std::vector<double>& x,
+                                            const std::vector<int64_t>& dims,
+                                            const ConvSpatialAttrs& attrs) {
+  if (dims.size() != 4) {
+    return std::nullopt;
+  }
+  const int64_t n = dims[0];
+  const int64_t cin = dims[1];
+  const int64_t in_h = dims[2];
+  const int64_t in_w = dims[3];
+  const auto [pad_top, pad_left, pad_bottom, pad_right] =
+      ResolveConvPads(attrs, in_h, in_w);
+  const int64_t padded_h = in_h + pad_top + pad_bottom;
+  const int64_t padded_w = in_w + pad_left + pad_right;
+  const int64_t eff_kh = (attrs.kh - 1) * attrs.dilation_h + 1;
+  const int64_t eff_kw = (attrs.kw - 1) * attrs.dilation_w + 1;
+  if (padded_h < eff_kh || padded_w < eff_kw) {
+    return std::nullopt;
+  }
+  const int64_t h_out = (padded_h - eff_kh) / attrs.stride_h + 1;
+  const int64_t w_out = (padded_w - eff_kw) / attrs.stride_w + 1;
+  const int64_t count = n * h_out * w_out;
+  if (count == 0) {
+    return std::nullopt;
+  }
+
+  std::vector<double> xp(static_cast<size_t>(n * cin * padded_h * padded_w),
+                         0.0);
+  for (int64_t bi = 0; bi < n; ++bi) {
+    for (int64_t c = 0; c < cin; ++c) {
+      for (int64_t h = 0; h < in_h; ++h) {
+        const double* src_row =
+            x.data() + static_cast<size_t>(((bi * cin + c) * in_h + h) * in_w);
+        double* dst_row =
+            xp.data() +
+            static_cast<size_t>(((bi * cin + c) * padded_h + (h + pad_top)) *
+                                    padded_w +
+                                pad_left);
+        std::memcpy(dst_row, src_row,
+                    sizeof(double) * static_cast<size_t>(in_w));
+      }
+    }
+  }
+
+  std::vector<double> sq_sum(static_cast<size_t>(cin * attrs.kh * attrs.kw),
+                             0.0);
+  for (int64_t i = 0; i < attrs.kh; ++i) {
+    const int64_t h_start = i * attrs.dilation_h;
+    for (int64_t j = 0; j < attrs.kw; ++j) {
+      const int64_t w_start = j * attrs.dilation_w;
+      for (int64_t bi = 0; bi < n; ++bi) {
+        for (int64_t c = 0; c < cin; ++c) {
+          double acc = 0.0;
+          for (int64_t ho = 0; ho < h_out; ++ho) {
+            const int64_t hp = h_start + ho * attrs.stride_h;
+            for (int64_t wo = 0; wo < w_out; ++wo) {
+              const int64_t wp = w_start + wo * attrs.stride_w;
+              const double v = xp[static_cast<size_t>(
+                  ((bi * cin + c) * padded_h + hp) * padded_w + wp)];
+              acc += v * v;
+            }
+          }
+          sq_sum[static_cast<size_t>((c * attrs.kh + i) * attrs.kw + j)] += acc;
+        }
+      }
+    }
+  }
+  return ConvPatchStat{std::move(sq_sum), count};
+}
+
+// Mirrors pruning.py's own `_conv_group_relative_norm` exactly: expands a
+// Conv layer's flat per-`(in_channel, kh, kw)`-offset activation norm
+// (`norm_flat`, row-major `[Cin_full, kh, kw]` flattened, `Cin_full` being
+// the raw full input-channel count `ConvPatchSqSum` unfolds from, i.e.
+// `cin_per_group * group`) into a row-major `[out_channels, cin_per_group *
+// kh * kw]` array -- one row per output filter, each already carrying its
+// OWN group's own channel-relative slice of `norm_flat` (output filter `i`
+// belongs to group `i / (out_channels / group)`, ONNX's own grouped-Conv
+// weight layout), ready to feed WandaImportance's own per-row (`full_norm`)
+// case directly. Collapses to one shared row broadcast to every filter
+// exactly when `group == 1`. Returns `std::nullopt` if `norm_flat`'s length
+// doesn't match `cin_per_group * group * kh * kw` -- the "no usable
+// calibration signal" case, same as this file's other norm-shape checks.
+std::optional<std::vector<double>> ConvGroupRelativeNorm(
+    const std::vector<double>& norm_flat, int64_t cout, int64_t cin_per_group,
+    int64_t kh, int64_t kw, int64_t group) {
+  const int64_t cin_full = cin_per_group * group;
+  if (static_cast<int64_t>(norm_flat.size()) != cin_full * kh * kw) {
+    return std::nullopt;
+  }
+  if (group <= 0 || cout % group != 0) {
+    return std::nullopt;  // defensive -- caller's own matcher already
+                          // requires this
+  }
+  const int64_t filters_per_group = cout / group;
+  const int64_t row_width = cin_per_group * kh * kw;
+  std::vector<double> rows(static_cast<size_t>(cout * row_width));
+  for (int64_t g = 0; g < group; ++g) {
+    // norm_flat's own [Cin_full, kh, kw] row-major layout means group g's
+    // own channel block ([g*cin_per_group, (g+1)*cin_per_group) along the
+    // channel axis) is already one contiguous run of `row_width` doubles
+    // starting at `g * row_width` -- no separate reshape/slice needed.
+    const double* block = norm_flat.data() + static_cast<size_t>(g * row_width);
+    for (int64_t f = 0; f < filters_per_group; ++f) {
+      const int64_t row = g * filters_per_group + f;
+      std::memcpy(rows.data() + static_cast<size_t>(row * row_width), block,
+                  sizeof(double) * static_cast<size_t>(row_width));
+    }
+  }
+  return rows;
 }
 
 // Row-wise unstructured sparsity mask over a row-major `[n_rows, kk]`
@@ -22147,6 +23804,179 @@ std::optional<AttentionProducerMatch> MatchAttentionProducerWideDtype(
   return AttentionProducerMatch{w_name, bias_name, num_heads, nq, nk, nv};
 }
 
+// If `node` is a 2-D `Conv` (or `FusedConv`) with a constant 4-D
+// FLOAT/FLOAT16/BFLOAT16 `[out_channels, in_channels/group, kH, kW]`
+// weight, returns `(x_name, weight_name, group)` -- mirrors pruning.py's
+// own `_match_conv_weight_only` (`allow_grouped=True`, the default every
+// caller there uses) exactly: ordinary (`group=1`), depthwise, and general
+// grouped Conv are all matched identically (unstructured/N:M pruning never
+// changes any shape or needs any cross-layer index agreement, unlike this
+// file's own structural MatchConvProducer/MatchConvConsumer above, which
+// restrict to `group=1` for a completely different, shape-coupling reason
+// -- see pruning.py's own module docstring). `out_channels % group` must
+// be zero when `group > 1` -- the standard grouped-Conv well-formedness
+// requirement ConvGroupRelativeNorm also relies on. Domain is not checked
+// (mirrors pruning.py's own matcher, which checks `op_type` alone).
+struct ConvWeightOnlyMatch {
+  std::string x_name;
+  std::string w_name;
+  int64_t group;
+};
+
+std::optional<ConvWeightOnlyMatch> MatchConvWeightOnly(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if ((node.op_type() != "Conv" && node.op_type() != "FusedConv") ||
+      node.input_size() < 2) {
+    return std::nullopt;
+  }
+  const std::string& w_name = node.input(1);
+  auto it = init_map.find(w_name);
+  if (it == init_map.end() || !IsSupportedFloatDtype(it->second->data_type()) ||
+      it->second->dims_size() != 4) {
+    return std::nullopt;
+  }
+  const int64_t group = ConvGroupAttr(node);
+  if (group < 1) {
+    return std::nullopt;
+  }
+  if (group > 1 && it->second->dims(0) % group != 0) {
+    return std::nullopt;
+  }
+  return ConvWeightOnlyMatch{node.input(0), w_name, group};
+}
+
+// One matched Conv candidate's own probe input/weight-node pairing, ready
+// for ConvWandaCalibrationStats below -- `attrs` already resolved
+// (ResolveConvSpatialAttrs) at candidate-matching time, once per node,
+// mirroring pruning.py's own `conv_attrs` dict (keyed by `w_name`, built
+// once before the calibration loop runs).
+struct ConvCalibCandidate {
+  std::string x_name;
+  std::string w_name;
+  ConvSpatialAttrs attrs;
+};
+
+// Conv-specific companion to WandaCalibrationStats above, for exactly the
+// reason this file's own "Wanda unstructured (element-wise) pruning"
+// section top comment already established for MatchAttentionProducerWideDtype
+// ("narrow, local duplicate instead of a shared-code change"): Conv's own
+// activation statistic (the im2col-unfolded per-`(in_channel, kh, kw)`-tap
+// norm, ConvPatchSqSum) is a GENUINELY DIFFERENT reduction than
+// WandaCalibrationStats' own "sum of squares over every axis but one
+// declared channel axis" -- not a special case of it -- so this reuses only
+// WandaCalibrationStats' own probe-injection/batch-iteration/DLPack-input-
+// feeding plumbing (mirroring pruning.py's own `_add_probe_outputs`, plus
+// the same batch-to-`ModelExecutor::Run`-position reordering
+// WandaCalibrationStats' own top comment documents design decision (2) for)
+// rather than its accumulator. Mirrors pruning.py's own
+// `_wanda_unstructured_calibration_stats`' own `conv_sq_sum`/`conv_count`
+// accumulation and final `np.sqrt(s / max(count, 1)).reshape(-1)` exactly,
+// keyed by `w_name` (not `x_name`, since two Conv nodes can share an input
+// tensor with different kernels -- same reasoning as pruning.py's own
+// per-node `conv_attrs` dict). This DOES mean a second, separate
+// `executor.Run` per calibration batch beyond WandaCalibrationStats' own
+// (rather than one shared run computing both statistics at once, the way
+// pruning.py's single `_add_probe_outputs` call does for every candidate
+// together) whenever a model has both Conv and MatMul/Gemm/Attention
+// candidates -- a real, deliberate efficiency/simplicity trade-off, not an
+// oversight: it keeps this function a pure, independently-reviewable
+// addition with no risk of perturbing WandaCalibrationStats' own already-
+// verified behavior for its other two callers (ApplyStructuredWandaPruning/
+// ApplyAttentionHeadWandaPruning).
+std::unordered_map<std::string, std::vector<double>> ConvWandaCalibrationStats(
+    const ModelExecutor& executor, const onnx::ModelProto& model,
+    const std::vector<ConvCalibCandidate>& conv_candidates,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data) {
+  std::unordered_map<std::string, std::vector<double>> result;
+  if (conv_candidates.empty()) {
+    return result;
+  }
+
+  onnx::ModelProto probe_model = model;
+  std::unordered_set<std::string> existing_outputs;
+  for (const auto& o : probe_model.graph().output()) {
+    existing_outputs.insert(o.name());
+  }
+  for (const auto& c : conv_candidates) {
+    if (existing_outputs.insert(c.x_name).second) {
+      probe_model.mutable_graph()->add_output()->set_name(c.x_name);
+    }
+  }
+
+  std::unordered_map<std::string, size_t> output_index;
+  for (int i = 0; i < probe_model.graph().output_size(); ++i) {
+    output_index.emplace(probe_model.graph().output(i).name(),
+                         static_cast<size_t>(i));
+  }
+  const auto& graph_inputs = probe_model.graph().input();
+
+  std::unordered_map<std::string, std::vector<double>> sq_sum;
+  std::unordered_map<std::string, int64_t> count;
+
+  for (const auto& batch : calibration_data) {
+    // Reorder this batch's own {name: TensorProto} map into
+    // ModelExecutor::Run's positional contract -- see WandaCalibrationStats'
+    // own top comment, design decision (2).
+    std::vector<DLManagedTensorPtr> input_dls;
+    std::vector<const DLManagedTensor*> input_ptrs;
+    input_dls.reserve(static_cast<size_t>(graph_inputs.size()));
+    input_ptrs.reserve(static_cast<size_t>(graph_inputs.size()));
+    for (const auto& gi : graph_inputs) {
+      auto it = batch.find(gi.name());
+      if (it == batch.end()) {
+        throw std::invalid_argument(
+            "ApplyWandaPruning: calibration batch is missing required "
+            "graph input '" +
+            gi.name() + "'");
+      }
+      input_dls.emplace_back(
+          onnxsim::dlpack::FromTensorProtoBorrowing(it->second));
+      input_ptrs.push_back(input_dls.back().get());
+    }
+
+    std::vector<DLManagedTensorPtr> outputs =
+        executor.Run(probe_model, input_ptrs);
+
+    for (const auto& c : conv_candidates) {
+      auto oit = output_index.find(c.x_name);
+      if (oit == output_index.end() || oit->second >= outputs.size()) {
+        continue;  // Defensive -- every x_name was added as an output above.
+      }
+      const DLTensor& dl = outputs[oit->second]->dl_tensor;
+      onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
+      if (!IsSupportedFloatDtype(tp.data_type())) {
+        continue;
+      }
+      const std::vector<int64_t> dims(tp.dims().begin(), tp.dims().end());
+      const std::vector<double> data = ReadTensorAsF64(tp);
+      const std::optional<ConvPatchStat> stat =
+          ConvPatchSqSum(data, dims, c.attrs);
+      if (!stat) {
+        continue;
+      }
+      auto& acc = sq_sum[c.w_name];
+      if (acc.empty()) {
+        acc.assign(stat->sq_sum.size(), 0.0);
+      }
+      for (size_t i = 0; i < acc.size(); ++i) {
+        acc[i] += stat->sq_sum[i];
+      }
+      count[c.w_name] += stat->count;
+    }
+  }
+
+  result.reserve(sq_sum.size());
+  for (auto& [name, acc] : sq_sum) {
+    const int64_t cnt = std::max<int64_t>(count[name], 1);
+    for (double& v : acc) {
+      v = std::sqrt(v / static_cast<double>(cnt));
+    }
+    result.emplace(name, std::move(acc));
+  }
+  return result;
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyWandaPruning(
@@ -22194,24 +24024,39 @@ onnx::ModelProto ApplyWandaPruning(
   }
 
   // Like ApplySparseGptPruning's own candidate matching immediately above,
-  // widened to FLOAT32/FLOAT16/BFLOAT16 -- see this file's own
-  // ApplyWandaPruning declaration comment (structured_pruning_entry.h) and
-  // this file's own "Wanda unstructured (element-wise) pruning" section top
-  // comment for the two different widening mechanisms: every matched
-  // MatMul/vanilla-Gemm layer (MatchMatMulLikeRaw) with a constant 2-D
-  // FLOAT/FLOAT16/BFLOAT16 weight (IsSupportedFloatDtype, checked right
-  // here at the call site -- MatchMatMulLikeRaw itself has no dtype gate of
-  // its own), plus every matched com.microsoft::Attention node's constant
-  // 2-D FLOAT/FLOAT16/BFLOAT16 merged QKV weight
+  // widened to FLOAT32/FLOAT16/BFLOAT16, PLUS every 2-D `Conv`
+  // (ordinary/depthwise/general-grouped alike, MatchConvWeightOnly) -- see
+  // this file's own ApplyWandaPruning declaration comment
+  // (structured_pruning_entry.h) and this file's own "Wanda unstructured
+  // (element-wise) pruning" section top comment for the widening
+  // mechanisms: every matched MatMul/vanilla-Gemm layer (MatchMatMulLikeRaw)
+  // with a constant 2-D FLOAT/FLOAT16/BFLOAT16 weight (IsSupportedFloatDtype,
+  // checked right here at the call site -- MatchMatMulLikeRaw itself has no
+  // dtype gate of its own), every matched com.microsoft::Attention node's
+  // constant 2-D FLOAT/FLOAT16/BFLOAT16 merged QKV weight
   // (MatchAttentionProducerWideDtype, this pass' own local dtype-widened
-  // copy of MatchAttentionProducer). 2-D Conv is declined outright -- never
-  // matched by either case below, left completely untouched.
+  // copy of MatchAttentionProducer), and every matched 2-D Conv node's
+  // constant 4-D FLOAT/FLOAT16/BFLOAT16 weight (MatchConvWeightOnly). A Conv
+  // node is still matched here even when ResolveConvSpatialAttrs declines
+  // its own attributes (a malformed `kernel_shape`/`auto_pad`/`pads`/
+  // `strides`/`dilations`) -- `conv_attrs` below is then absent for it, so
+  // it never gets an entry in `conv_act_norm`, and WandaImportance's own
+  // `norm == nullptr` fallback prunes it by plain magnitude instead, exactly
+  // mirroring pruning.py's own `_wanda_norm_for_candidate`/`_wanda_importance`
+  // fallback chain for this same case.
   struct Candidate {
     std::string x_name;
     std::string w_name;
     bool weight_transposed;
+    bool is_conv;
+    int64_t conv_group = 1;  // only meaningful when is_conv
   };
   std::vector<Candidate> candidates;
+  // Conv attributes are per-node (two Convs can share an input tensor with
+  // different kernels/strides), so this is keyed by the Conv's own weight
+  // name, not its (possibly shared) input name -- mirrors pruning.py's own
+  // `conv_attrs` dict exactly.
+  std::unordered_map<std::string, ConvSpatialAttrs> conv_attrs;
   for (const auto& node : graph->node()) {
     auto mm = MatchMatMulLikeRaw(node);
     if (mm) {
@@ -22219,8 +24064,18 @@ onnx::ModelProto ApplyWandaPruning(
       if (wit != init_map.end() &&
           IsSupportedFloatDtype(wit->second->data_type()) &&
           wit->second->dims_size() == 2) {
-        candidates.push_back({mm->x_name, mm->w_name, mm->weight_transposed});
+        candidates.push_back(
+            {mm->x_name, mm->w_name, mm->weight_transposed, false});
       }
+      continue;
+    }
+    auto cm = MatchConvWeightOnly(node, init_map);
+    if (cm) {
+      auto wit = init_map.find(cm->w_name);
+      if (auto attrs = ResolveConvSpatialAttrs(node, *wit->second)) {
+        conv_attrs.emplace(cm->w_name, *attrs);
+      }
+      candidates.push_back({cm->x_name, cm->w_name, false, true, cm->group});
       continue;
     }
     auto am = MatchAttentionProducerWideDtype(node, init_map);
@@ -22229,30 +24084,76 @@ onnx::ModelProto ApplyWandaPruning(
       // is already [K, N]-shaped by construction (see
       // MatchAttentionProducer's own comment), so it is matched exactly
       // like a non-transposed MatMul weight.
-      candidates.push_back({node.input(0), am->weight, false});
+      candidates.push_back({node.input(0), am->weight, false, false});
     }
   }
   if (candidates.empty()) {
     return out;
   }
 
-  // Wanda's own calibration statistic -- reuses WandaCalibrationStats
-  // verbatim, probe axis -1 (last axis) for every candidate, keyed by its
-  // own activation tensor name (see this file's own ApplyWandaPruning
-  // declaration comment for why keying by `x_name` rather than by weight
-  // name, unlike pruning.py's own `attn_act_norm`, is a safe, already-
-  // established simplification). A rank-3 Attention activation is reduced
-  // over every leading axis by WandaCalibrationStats' own "every axis but
-  // the channel one" reduction, exactly mirroring pruning.py's own
+  // Wanda's own calibration statistic for the MatMul/Gemm/Attention
+  // candidates -- reuses WandaCalibrationStats verbatim, probe axis -1
+  // (last axis) for every non-Conv candidate, keyed by its own activation
+  // tensor name (see this file's own ApplyWandaPruning declaration comment
+  // for why keying by `x_name` rather than by weight name, unlike
+  // pruning.py's own `attn_act_norm`, is a safe, already-established
+  // simplification). A rank-3 Attention activation is reduced over every
+  // leading axis by WandaCalibrationStats' own "every axis but the channel
+  // one" reduction, exactly mirroring pruning.py's own
   // `x.reshape(-1, x.shape[-1])`.
   std::unordered_map<std::string, int64_t> probe_axis;
   for (const auto& c : candidates) {
-    probe_axis[c.x_name] = -1;
+    if (!c.is_conv) {
+      probe_axis[c.x_name] = -1;
+    }
   }
   const std::unordered_map<std::string, std::vector<double>> act_norm =
       WandaCalibrationStats(executor, out, probe_axis, calibration_data);
 
+  // Conv's own im2col-unfolded per-(in_channel, kh, kw)-tap calibration
+  // statistic -- a genuinely different reduction than WandaCalibrationStats'
+  // own, see ConvWandaCalibrationStats' own top comment. Only Conv
+  // candidates with a usable ResolveConvSpatialAttrs result are probed;
+  // every other Conv candidate is left for WandaImportance's own
+  // no-calibration-observed fallback.
+  std::vector<ConvCalibCandidate> conv_calib_candidates;
+  for (const auto& c : candidates) {
+    if (!c.is_conv) {
+      continue;
+    }
+    auto ait = conv_attrs.find(c.w_name);
+    if (ait != conv_attrs.end()) {
+      conv_calib_candidates.push_back({c.x_name, c.w_name, ait->second});
+    }
+  }
+  const std::unordered_map<std::string, std::vector<double>> conv_act_norm =
+      ConvWandaCalibrationStats(executor, out, conv_calib_candidates,
+                                calibration_data);
+
   MutInitMap mut_init_map = BuildMutInitMap(graph);
+
+  // Returns the Conv-specific broadcastable norm array for candidate `c`
+  // (row-major `[cout, cin_per_group * kh * kw]`, already expanded per
+  // output filter's own group by ConvGroupRelativeNorm), or `std::nullopt`
+  // if no usable calibration activation was ever observed for it -- mirrors
+  // pruning.py's own `_wanda_norm_for_candidate`'s own `is_conv` branch.
+  // Declared here (rather than as a free function) so it can capture
+  // `conv_act_norm` and `mut_init_map` by reference, matching this
+  // function's other per-call-site closures.
+  auto conv_norm_for =
+      [&](const Candidate& c) -> std::optional<std::vector<double>> {
+    auto nit = conv_act_norm.find(c.w_name);
+    if (nit == conv_act_norm.end()) {
+      return std::nullopt;
+    }
+    const onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
+    const int64_t cout = w_init->dims(0);
+    const int64_t cin_per_group = w_init->dims(1);
+    const int64_t kh = w_init->dims(2);
+    const int64_t kw = w_init->dims(3);
+    return ConvGroupRelativeNorm(nit->second, cout, cin_per_group, kh, kw,
+                                 c.conv_group);
+  };
 
   if (global_sparsity) {
     // Global-sparsity companion to the per-layer loop below, mirroring
@@ -22263,12 +24164,19 @@ onnx::ModelProto ApplyWandaPruning(
     // the lowest-scoring `total - keep_count` pooled entries wherever they
     // land -- no per-row/per-layer floor enforced (a layer can end up
     // entirely zeroed), same as the Python original.
+    // `dims` is the tensor's own on-disk shape (`[dim0, dim1]` for
+    // MatMul/Gemm/Attention, `[cout, cin_per_group, kh, kw]` for Conv);
+    // `w_nk` is already row-major `[n_rows, kk]` either way -- for Conv this
+    // is `ReadTensorAsF64`'s own flat result reinterpreted with no
+    // transpose at all (mirrors pruning.py's own `_weight_to_nk`'s Conv
+    // branch, a pure reshape), so `pruned_nk` can be written back via
+    // WriteF64TensorAs directly using `dims`.
     struct Entry {
       onnx::TensorProto* w_init;
       int32_t dtype = onnx::TensorProto::FLOAT;
-      int64_t dim0 = 0;
-      int64_t dim1 = 0;
+      std::vector<int64_t> dims;
       bool weight_transposed = false;
+      bool is_conv = false;
       std::vector<double> w_nk;
       std::vector<double> importance;
     };
@@ -22277,11 +24185,26 @@ onnx::ModelProto ApplyWandaPruning(
     for (const auto& c : candidates) {
       onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
       const int32_t dtype = w_init->data_type();
-      const int64_t dim0 = w_init->dims(0);
-      const int64_t dim1 = w_init->dims(1);
       // ReadTensorAsF64 (FLOAT/FLOAT16/BFLOAT16 -> double, exact upcast) --
       // mirrors pruning.py's own `_to_f64`.
       const std::vector<double> w_f64 = ReadTensorAsF64(*w_init);
+
+      if (c.is_conv) {
+        const int64_t cout = w_init->dims(0);
+        const int64_t kk = w_init->dims(1) * w_init->dims(2) * w_init->dims(3);
+        const std::optional<std::vector<double>> group_norm = conv_norm_for(c);
+        const std::vector<double>* norm = group_norm ? &*group_norm : nullptr;
+        std::vector<double> importance =
+            WandaImportance(w_f64, cout, kk, norm, epsilon);
+        entries.push_back(
+            {w_init, dtype,
+             std::vector<int64_t>(w_init->dims().begin(), w_init->dims().end()),
+             false, true, w_f64, std::move(importance)});
+        continue;
+      }
+
+      const int64_t dim0 = w_init->dims(0);
+      const int64_t dim1 = w_init->dims(1);
       WandaNK nk = ToWandaNK(w_f64, dim0, dim1, c.weight_transposed);
 
       const std::vector<double>* norm = nullptr;
@@ -22291,8 +24214,13 @@ onnx::ModelProto ApplyWandaPruning(
       }
       std::vector<double> importance =
           WandaImportance(nk.w_nk, nk.n_rows, nk.kk, norm, epsilon);
-      entries.push_back({w_init, dtype, dim0, dim1, c.weight_transposed,
-                         std::move(nk.w_nk), std::move(importance)});
+      entries.push_back({w_init,
+                         dtype,
+                         {dim0, dim1},
+                         c.weight_transposed,
+                         false,
+                         std::move(nk.w_nk),
+                         std::move(importance)});
     }
 
     size_t total = 0;
@@ -22337,8 +24265,10 @@ onnx::ModelProto ApplyWandaPruning(
       }
       offset += size;
       const std::vector<double> w_new =
-          FromWandaNK(pruned_nk, e.dim0, e.dim1, e.weight_transposed);
-      WriteF64TensorAs(e.w_init, e.dtype, {e.dim0, e.dim1}, w_new);
+          e.is_conv ? std::move(pruned_nk)
+                    : FromWandaNK(pruned_nk, e.dims[0], e.dims[1],
+                                  e.weight_transposed);
+      WriteF64TensorAs(e.w_init, e.dtype, e.dims, w_new);
     }
     return out;
   }
@@ -22346,11 +24276,32 @@ onnx::ModelProto ApplyWandaPruning(
   for (const auto& c : candidates) {
     onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
     const int32_t dtype = w_init->data_type();
-    const int64_t dim0 = w_init->dims(0);
-    const int64_t dim1 = w_init->dims(1);
     // ReadTensorAsF64 (FLOAT/FLOAT16/BFLOAT16 -> double, exact upcast) --
     // mirrors pruning.py's own `_to_f64`.
     const std::vector<double> w_f64 = ReadTensorAsF64(*w_init);
+
+    if (c.is_conv) {
+      const std::vector<int64_t> dims(w_init->dims().begin(),
+                                      w_init->dims().end());
+      const int64_t cout = dims[0];
+      const int64_t kk = dims[1] * dims[2] * dims[3];
+      const std::optional<std::vector<double>> group_norm = conv_norm_for(c);
+      const std::vector<double>* norm = group_norm ? &*group_norm : nullptr;
+      const std::vector<double> importance =
+          WandaImportance(w_f64, cout, kk, norm, epsilon);
+      const std::vector<uint8_t> mask =
+          n.has_value() ? WandaNmMaskNK(importance, cout, kk, *n, *m)
+                        : WandaSparsityMaskNK(importance, cout, kk, sparsity);
+      std::vector<double> pruned_nk(w_f64.size());
+      for (size_t i = 0; i < pruned_nk.size(); ++i) {
+        pruned_nk[i] = mask[i] ? w_f64[i] : 0.0;
+      }
+      WriteF64TensorAs(w_init, dtype, dims, pruned_nk);
+      continue;
+    }
+
+    const int64_t dim0 = w_init->dims(0);
+    const int64_t dim1 = w_init->dims(1);
     WandaNK nk = ToWandaNK(w_f64, dim0, dim1, c.weight_transposed);
 
     const std::vector<double>* norm = nullptr;

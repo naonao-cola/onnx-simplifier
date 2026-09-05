@@ -1337,11 +1337,15 @@ def apply_structured_pruning_cpp(
     pruned.
 
     Also prunes ``com.microsoft::MatMulNBits`` (block-quantized, weight-only
-    int4/int8) chains -- the plain (producer -> consumer) and gated
-    (SwiGLU/GeGLU) families only, a C++-port subset of
-    :func:`onnxsim.apply_structured_pruning_matmul_nbits` (its fused
-    ``MatMulNBitsMlp``/``MatMulNBitsQkv`` variants and ``MatMulBnb4`` are not
-    ported here). Either side of a matched chain may independently be a
+    int4/int8) chains -- the plain (producer -> consumer), gated
+    (SwiGLU/GeGLU), and fused-``gate_up_proj`` (``MatMulNBitsMlp``) families,
+    a C++-port subset of
+    :func:`onnxsim.apply_structured_pruning_matmul_nbits` (its
+    ``MatMulNBitsQkv`` variant is deliberately NOT ported here -- pruning a
+    whole KV group needs the head-count-matching machinery
+    :func:`onnxsim.apply_attention_head_pruning_cpp` already owns, so that
+    one variant is wired into that entry point instead). Either side of a
+    matched (non-``MatMulNBitsMlp``) chain may independently be a
     ``MatMulNBits`` node or a plain-float MatMul/vanilla-Gemm peer (at least
     one side must be ``MatMulNBits``); the producer's output channels are
     ranked by L2 norm of their own DEQUANTIZED weight row (never written
@@ -1353,6 +1357,45 @@ def apply_structured_pruning_cpp(
     consumer's own quantized ``K`` axis, or the whole chain is left
     untouched (an individual K-column can't be dropped without
     re-quantizing its block, out of scope).
+
+    Several more quantized-weight chain families this C++ entry point
+    additionally consolidates from their own SEPARATE pure-Python top-level
+    functions (each still exists independently -- see this module's own
+    "structured pruning" section comments in ``pruning.py`` for why each was
+    kept a standalone function there rather than folded into the pure-Python
+    :func:`onnxsim.apply_structured_pruning` itself: retrofitting a
+    quantized-weight representation into machinery already extensively
+    tested against float32/float16/bfloat16 weights only was judged not
+    worth the regression risk, for a representation that never aliases a
+    plain float weight anyway):
+
+    * QDQ (a ``DequantizeLinear``-fed int8/uint8 weight, per-tensor,
+      per-channel, or opset-21+ blockwise) -- plain and gated families, the
+      C++ counterpart of :func:`onnxsim.apply_structured_pruning_qdq`.
+    * ``com.microsoft::MatMulBnb4`` (bitsandbytes FP4/NF4 block-quantized
+      weight) -- :func:`onnxsim.apply_structured_pruning_matmul_bnb4`'s C++
+      counterpart.
+    * ``MatMulBlockQuantizedFp8Weight``/``MatMulBlockQuantizedFp4Weight``
+      (NVFP4/FP8 block-quantized weight) --
+      :func:`onnxsim.apply_structured_pruning_matmul_block_quantized_fp8`/
+      :func:`onnxsim.apply_structured_pruning_matmul_block_quantized_fp4`'s
+      C++ counterparts.
+    * QOperator static quantization (``QLinearConv``/``QLinearMatMul``/
+      ``QGemm``) -- :func:`onnxsim.apply_structured_pruning_qoperator`'s C++
+      counterpart.
+    * ``com.microsoft::DynamicQuantizeMatMul``/``MatMulIntegerToFloat``
+      (ORT's dynamic-quantization fusion) --
+      :func:`onnxsim.apply_structured_pruning_dynamic_quantize_matmul`'s C++
+      counterpart.
+
+    None of the pure-Python per-format functions above have a
+    ``global_sparsity`` parameter of their own, so ``global_sparsity`` below
+    has no defined meaning for any quantized-weight family here either --
+    every one of them is always applied with its own local per-chain
+    sparsity, unaffected by that flag. ``com.microsoft::ConvInteger``-based
+    dynamic quantization
+    (:func:`onnxsim.apply_structured_pruning_dynamic_quantize_conv`) has no
+    C++ port at all yet and is NOT matched here.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
@@ -1722,37 +1765,36 @@ def apply_sparsegpt_pruning_cpp(
     Matches every plain ``MatMul``/vanilla-``Gemm`` node with a constant 2-D
     FLOAT32/FLOAT16/BFLOAT16 weight (this already includes ``com.microsoft::
     GroupQueryAttention``'s own separate Q/K/V projections -- ordinary
-    MatMul/Gemm nodes feeding it, not a weight the op itself owns), plus
-    every ``com.microsoft::Attention`` node's constant 2-D FLOAT32/FLOAT16/
-    BFLOAT16 merged QKV weight -- read upcast to float64, written back down
-    to each weight's own original dtype, exactly like
+    MatMul/Gemm nodes feeding it, not a weight the op itself owns), every
+    ``com.microsoft::Attention`` node's constant 2-D FLOAT32/FLOAT16/
+    BFLOAT16 merged QKV weight, and every 2-D ``Conv``/``FusedConv`` node
+    (ordinary/depthwise/general-grouped alike) with a constant 4-D
+    FLOAT32/FLOAT16/BFLOAT16 ``[out_channels, in_channels/group, kh, kw]``
+    weight -- read upcast to float64, written back down to each weight's
+    own original dtype, exactly like
     :func:`onnxsim.apply_sparsegpt_pruning`'s own ``_to_f64``/``_from_f64``
     convention (though note SparseGPT's Hessian-compensated update, unlike
     plain masking, *recomputes* every kept entry's own value, so a fp16/bf16
     weight's surviving entries do not reproduce their pre-pruning bit
     pattern the way a plain-masking C++ port's FLOAT16/BFLOAT16 support
-    does). Deliberately narrower than the pure-Python
-    :func:`onnxsim.apply_sparsegpt_pruning` in one remaining way (mirroring
-    this module's own established narrower-than-pruning.py C++-port scope
-    decisions elsewhere):
-
-    - 2-D ``Conv`` (ordinary/depthwise/general-grouped) is **not** matched
-      at all here -- the pure-Python original's own Conv support needs an
-      entirely new, from-first-principles im2col cross-covariance Hessian
-      (``H = patches.T @ patches``, plus a genuinely per-group Hessian and
-      column-processing split for grouped/depthwise Conv) that its own
-      module docstring documents at length as having no correct upstream
-      reference to port from at all -- reaching that bar is materially
-      bigger than the rest of this pass and is out of scope for this C++
-      port. A Conv node is left completely untouched here, never guessed
-      at, exactly as if it were any other unmatched node type -- use the
-      pure-Python :func:`onnxsim.apply_sparsegpt_pruning` if Conv coverage
-      is required. This is the only remaining scope gap versus the
-      pure-Python original, so :func:`onnxsim.apply_sparsegpt_pruning`
-      itself is NOT an alias of this function (unlike, e.g.,
-      :func:`onnxsim.apply_transformer_block_pruning`, which IS an alias of
-      its own verified-full-parity C++ port) -- a Conv-bearing model would
-      otherwise silently get a different (Conv-less) result here.
+    does). Now at full, verified parity with the pure-Python
+    :func:`onnxsim.apply_sparsegpt_pruning`, which is itself a thin alias
+    for this function (see that function's own docstring) -- Conv's own
+    im2col cross-covariance Hessian (``H = patches.T @ patches``, with a
+    genuinely per-group Hessian and column-processing split for grouped/
+    depthwise Conv) was verified numerically against the pure-Python
+    original across ordinary/depthwise/general-grouped Conv, unstructured
+    and N:M sparsity, ``auto_pad``, and dilation (see
+    ``tests/test_sparsegpt_pruning_cpp.py``'s own Conv section), despite
+    that Python original having no correct upstream SparseGPT reference of
+    its own to port from (see its own module docstring for the three
+    independent verification legs that make it trustworthy ground truth
+    regardless). A Conv node whose spatial attributes are malformed (a
+    ``kernel_shape`` disagreeing with the weight's own shape, an
+    unrecognized ``auto_pad``, non-positive ``strides``/``dilations``, or a
+    malformed explicit ``pads``) is left completely untouched, never
+    guessed at, exactly like a layer with no observed calibration
+    activation.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to compute each
@@ -1787,11 +1829,14 @@ def apply_sparsegpt_pruning_cpp(
             :func:`onnxsim.onnx_simplifier._get_model_executor` process-wide
             executor, the same one :func:`onnxsim.simplify` itself uses)
     :returns: ``model`` with every matched layer's weight rewritten in
-            place to the target pattern; a layer with no observed 2-D
-            calibration activation (dead input, an otherwise-empty
-            ``calibration_data``, or every batch's activation isn't
-            FLOAT32/FLOAT16/BFLOAT16) is left completely untouched -- there
-            is no data-free fallback for SparseGPT
+            place to the target pattern; a MatMul/Gemm/Attention layer with
+            no observed 2-D calibration activation (dead input, an
+            otherwise-empty ``calibration_data``, or every batch's
+            activation isn't FLOAT32/FLOAT16/BFLOAT16), or a Conv layer
+            with malformed spatial attributes or no observed usable 4-D
+            activation for any one of its groups (a grouped/depthwise Conv
+            is never partially pruned), is left completely untouched --
+            there is no data-free fallback for SparseGPT
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -1857,32 +1902,42 @@ def apply_wanda_pruning_cpp(
     FLOAT32/FLOAT16/BFLOAT16 weight (this already includes
     ``com.microsoft::GroupQueryAttention``'s own separate Q/K/V projections
     -- ordinary MatMul/Gemm nodes feeding it, not a weight the op itself
-    owns), plus every ``com.microsoft::Attention`` node's constant 2-D
-    FLOAT32/FLOAT16/BFLOAT16 merged QKV weight -- the same candidate set
-    :func:`onnxsim.apply_sparsegpt_pruning_cpp` matches, both widened to
-    FLOAT32/FLOAT16/BFLOAT16 this round (read out upcast to float64, written
-    back down to the original dtype, exactly mirroring the pure-Python
+    owns), every ``com.microsoft::Attention`` node's constant 2-D
+    FLOAT32/FLOAT16/BFLOAT16 merged QKV weight, and every 2-D ``Conv``
+    node's constant 4-D FLOAT32/FLOAT16/BFLOAT16 weight -- ordinary
+    (``group=1``), fully depthwise (``group == in_channels ==
+    out_channels``), and general grouped (``1 < group < in_channels``)
+    alike (read out upcast to float64, written back down to the original
+    dtype, exactly mirroring the pure-Python
     :func:`onnxsim.apply_wanda_pruning`'s own ``_to_f64``/``_from_f64``
     round trip -- masking never recomputes a surviving entry's own value, so
-    this reproduces its exact original bit pattern). Only remaining
-    deliberate gap vs. the pure-Python :func:`onnxsim.apply_wanda_pruning`:
+    this reproduces its exact original bit pattern). TRUE parity with the
+    pure-Python :func:`onnxsim.apply_wanda_pruning` on every one of these
+    candidate families, including Conv's own from-scratch im2col
+    per-receptive-field-offset activation norm (``_conv_patch_sq_sum``'s C++
+    mirror, ``ConvPatchSqSum``) and grouped/depthwise group-relative norm
+    expansion (``_conv_group_relative_norm``'s C++ mirror,
+    ``ConvGroupRelativeNorm`` -- see ``structured_pruning_entry.h``'s own
+    ``ApplyWandaPruning`` declaration comment for the full mechanism).
 
-    - 2-D ``Conv`` (ordinary/depthwise/general-grouped) is **not** matched
-      at all here -- the pure-Python original's own Conv support needs an
-      entirely new, from-first-principles im2col per-receptive-field-offset
-      activation norm (``_conv_patch_sq_sum``/``_conv_group_relative_norm``)
-      that :func:`onnxsim.apply_sparsegpt_pruning_cpp`'s own docstring
-      explains is out of scope here too, for the analogous Hessian case --
-      reaching that bar is materially bigger than the rest of this pass
-      (a brand-new im2col activation-collection engine this C++ port has
-      nowhere else, plus the grouped/depthwise group-relative norm
-      expansion, with real numeric-correctness risk if gotten subtly wrong)
-      and is deliberately left to the pure-Python implementation rather than
-      risked this round. A Conv node is left completely untouched here,
-      never guessed at, exactly as if it were any other unmatched node type
-      -- use the pure-Python :func:`onnxsim.apply_wanda_pruning` if Conv
-      coverage is required. Because of this one remaining gap,
-      :func:`onnxsim.apply_wanda_pruning` is NOT an alias of this function.
+    Despite that Conv parity, :func:`onnxsim.apply_wanda_pruning` (the
+    pure-Python name) is DELIBERATELY NOT an alias of this function: a
+    full-regression check (every existing MatMul/Gemm/Attention candidate's
+    live output against the pure-Python reference, not just the new Conv
+    coverage) surfaced a genuine, pre-existing divergence unrelated to
+    Conv -- this port's own calibration statistic (``WandaCalibrationStats``,
+    shared with :func:`onnxsim.apply_structured_wanda_pruning_cpp`/
+    ``ApplyAttentionHeadWandaPruning``) computes a real per-channel-axis
+    activation norm for a MatMul/Gemm candidate's activation at ANY rank,
+    whereas the pure-Python reference requires exactly rank 2 for that same
+    statistic and falls back to plain magnitude for anything else (e.g. a
+    rank-3, batched/sequence activation feeding a plain 2-D MatMul weight).
+    See ``structured_pruning_entry.h``'s own ``ApplyWandaPruning``
+    declaration comment for the full writeup of this separate, out-of-scope
+    gap (it touches calibration infrastructure two other, independently-
+    verified passes also depend on) and
+    ``tests/test_wanda_pruning_cpp.py``'s own module docstring for the
+    regression test that caught it.
 
     Unlike :func:`onnxsim.apply_sparsegpt_pruning_cpp` (which has no data-
     free fallback at all -- its entire mechanism IS the Hessian), a matched

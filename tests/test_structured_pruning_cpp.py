@@ -3868,7 +3868,19 @@ def test_cpp_structured_pruning_matmul_concat_declines_on_fan_out_branch():
     np.testing.assert_array_equal(inits["WOUT"], wout)
 
 
-def test_cpp_structured_pruning_conv_concat_declines_on_grouped_consumer():
+def test_cpp_structured_pruning_conv_concat_admits_block_aligned_grouped_conv_consumer():
+    # Each branch here is exactly one `group`-sized block wide (block =
+    # (C1 + C2) // group = 8, matching both C1 and C2), so every one of the
+    # grouped consumer's own blocks falls entirely within one branch --
+    # ConcatBranchesAlignToConsumerGroup admits this rather than declining
+    # it outright (this test used to assert the opposite -- a narrower-
+    # than-Python C++-port gap, now closed; the pure-Python
+    # apply_structured_pruning has always pruned this exact shape -- see
+    # ConcatBranchesAlignToConsumerGroup's own comment for the full
+    # block-alignment safety argument). See
+    # test_cpp_structured_pruning_conv_concat_declines_on_non_block_aligned_grouped_consumer
+    # below for the genuinely-unsafe (straddling-block) case, which still
+    # declines.
     Cin, C1, C2, Cout, group = 3, 8, 8, 8, 2
     rng = np.random.default_rng(120)
     w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
@@ -3886,8 +3898,56 @@ def test_cpp_structured_pruning_conv_concat_declines_on_grouped_consumer():
         """,
         initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(wout, "WOUT")],
     )
-    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
-    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    keep_a = _oracle_keep_indices_conv(w1, C1 - round(C1 * 0.5))
+    keep_b = _oracle_keep_indices_conv(w2, C2 - round(C2 * 0.5))
+    global_keep = np.concatenate([keep_a, keep_b + C1])
+    wout_sliced = _oracle_slice_grouped_consumer_conv(wout, global_keep, group, C1 + C2)
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    np.testing.assert_array_equal(inits["W1"], w1[keep_a])
+    np.testing.assert_array_equal(inits["W2"], w2[keep_b])
+    np.testing.assert_array_equal(inits["WOUT"], wout_sliced)
+
+
+def test_cpp_structured_pruning_conv_concat_declines_on_non_block_aligned_grouped_consumer():
+    # C1 (5) doesn't divide evenly into the consumer's own block size
+    # (block = (C1 + C2) // group = 8), so branch B's own fixed offset (5)
+    # falls in the interior of the first block rather than at its edge --
+    # ConcatBranchesAlignToConsumerGroup declines this outright rather than
+    # guessing how the block's own uniform-survivor-count budget should
+    # split between the two branches (see that function's own comment for
+    # the full straddling-block counter-example) -- the chain is left
+    # completely untouched, matching the pure-Python apply_structured_pruning
+    # exactly.
+    Cin, C1, C2, Cout, group = 3, 5, 11, 8, 2
+    rng = np.random.default_rng(121)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, Cin, 3, 3)).astype(np.float32)
+    wout = rng.standard_normal((Cout, (C1 + C2) // group, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          a = Conv<kernel_shape=[3,3]>(X, W1)
+          b = Conv<kernel_shape=[3,3]>(X, W2)
+          m = Concat<axis = 1>(a, b)
+          Y = Conv<kernel_shape=[1,1],group={group}>(m, WOUT)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(wout, "WOUT")],
+    )
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
     np.testing.assert_array_equal(inits["W1"], w1)
     np.testing.assert_array_equal(inits["W2"], w2)
     np.testing.assert_array_equal(inits["WOUT"], wout)

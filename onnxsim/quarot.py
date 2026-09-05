@@ -141,6 +141,43 @@ def apply_quarot(
             with no matching layer, or an opset older than 21 (INT4's
             tensor type and ``DequantizeLinear``'s ``block_size``
             attribute both need opset 21), is returned unchanged
+
+    **Accepted, permanent divergence from the C++ port
+    (``apply_quarot_cpp``).** The same ``seed`` does NOT produce the same
+    rotation matrix, or therefore the same quantized output, on both sides
+    -- and this is intentional, not an open gap. Two independent reasons,
+    neither a correctness bug:
+
+    1. Different orthogonalization algorithm. This function (via
+       :func:`onnxsim.quip_sharp._random_orthogonal_matrix`) QR-decomposes
+       a random Gaussian matrix with ``numpy.linalg.qr`` and then corrects
+       ``Q``'s sign using ``R``'s own diagonal, because LAPACK's Householder
+       QR picks each reflector's sign for numerical stability rather than
+       at random, which biases ``Q`` without the fix. The C++ port
+       (``passes/random_orthogonal.h``) instead uses Gram-Schmidt, whose
+       natural diagonal (each row's Euclidean norm) is already nonnegative
+       by construction -- so it needs no analogous correction and is
+       already Haar-uniform on its own. A Monte Carlo check (K=5, 300k
+       draws) found the two constructions' first-entry distributions
+       statistically indistinguishable (max CDF gap ~0.0016, versus ~0.5
+       against an *uncorrected* QR, which is visibly biased) -- i.e. both
+       are valid, independent constructions of the same target
+       distribution, not "the same algorithm, one right and one wrong."
+    2. Different RNG derivation. This function sequences a single
+       ``numpy.random.Generator`` across every matched layer in graph node
+       order; the C++ port reseeds a fresh ``std::mt19937_64`` per matched
+       node from a hash of the seed and that node's own unique id.
+
+    Reconciling either difference for true bit-for-bit parity would mean
+    reimplementing numpy's PCG64 bit generator and its ziggurat-based
+    ``standard_normal`` sampler in C++ (not just swapping in a QR routine)
+    -- disproportionate for a rotation whose only actual requirement, per
+    the QuaRot/QuIP# papers themselves, is being *some* uniformly random
+    orthogonal matrix, not a bit-specific one. ``apply_quarot`` and
+    ``apply_quarot_cpp`` remain two independently-correct,
+    non-interchangeable entry points; see ``passes/random_orthogonal.h``
+    and ``passes/quarot.h`` for the full investigation this note
+    summarizes.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
