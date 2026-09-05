@@ -1337,11 +1337,15 @@ def apply_structured_pruning_cpp(
     pruned.
 
     Also prunes ``com.microsoft::MatMulNBits`` (block-quantized, weight-only
-    int4/int8) chains -- the plain (producer -> consumer) and gated
-    (SwiGLU/GeGLU) families only, a C++-port subset of
-    :func:`onnxsim.apply_structured_pruning_matmul_nbits` (its fused
-    ``MatMulNBitsMlp``/``MatMulNBitsQkv`` variants and ``MatMulBnb4`` are not
-    ported here). Either side of a matched chain may independently be a
+    int4/int8) chains -- the plain (producer -> consumer), gated
+    (SwiGLU/GeGLU), and fused-``gate_up_proj`` (``MatMulNBitsMlp``) families,
+    a C++-port subset of
+    :func:`onnxsim.apply_structured_pruning_matmul_nbits` (its
+    ``MatMulNBitsQkv`` variant is deliberately NOT ported here -- pruning a
+    whole KV group needs the head-count-matching machinery
+    :func:`onnxsim.apply_attention_head_pruning_cpp` already owns, so that
+    one variant is wired into that entry point instead). Either side of a
+    matched (non-``MatMulNBitsMlp``) chain may independently be a
     ``MatMulNBits`` node or a plain-float MatMul/vanilla-Gemm peer (at least
     one side must be ``MatMulNBits``); the producer's output channels are
     ranked by L2 norm of their own DEQUANTIZED weight row (never written
@@ -1353,6 +1357,45 @@ def apply_structured_pruning_cpp(
     consumer's own quantized ``K`` axis, or the whole chain is left
     untouched (an individual K-column can't be dropped without
     re-quantizing its block, out of scope).
+
+    Several more quantized-weight chain families this C++ entry point
+    additionally consolidates from their own SEPARATE pure-Python top-level
+    functions (each still exists independently -- see this module's own
+    "structured pruning" section comments in ``pruning.py`` for why each was
+    kept a standalone function there rather than folded into the pure-Python
+    :func:`onnxsim.apply_structured_pruning` itself: retrofitting a
+    quantized-weight representation into machinery already extensively
+    tested against float32/float16/bfloat16 weights only was judged not
+    worth the regression risk, for a representation that never aliases a
+    plain float weight anyway):
+
+    * QDQ (a ``DequantizeLinear``-fed int8/uint8 weight, per-tensor,
+      per-channel, or opset-21+ blockwise) -- plain and gated families, the
+      C++ counterpart of :func:`onnxsim.apply_structured_pruning_qdq`.
+    * ``com.microsoft::MatMulBnb4`` (bitsandbytes FP4/NF4 block-quantized
+      weight) -- :func:`onnxsim.apply_structured_pruning_matmul_bnb4`'s C++
+      counterpart.
+    * ``MatMulBlockQuantizedFp8Weight``/``MatMulBlockQuantizedFp4Weight``
+      (NVFP4/FP8 block-quantized weight) --
+      :func:`onnxsim.apply_structured_pruning_matmul_block_quantized_fp8`/
+      :func:`onnxsim.apply_structured_pruning_matmul_block_quantized_fp4`'s
+      C++ counterparts.
+    * QOperator static quantization (``QLinearConv``/``QLinearMatMul``/
+      ``QGemm``) -- :func:`onnxsim.apply_structured_pruning_qoperator`'s C++
+      counterpart.
+    * ``com.microsoft::DynamicQuantizeMatMul``/``MatMulIntegerToFloat``
+      (ORT's dynamic-quantization fusion) --
+      :func:`onnxsim.apply_structured_pruning_dynamic_quantize_matmul`'s C++
+      counterpart.
+
+    None of the pure-Python per-format functions above have a
+    ``global_sparsity`` parameter of their own, so ``global_sparsity`` below
+    has no defined meaning for any quantized-weight family here either --
+    every one of them is always applied with its own local per-chain
+    sparsity, unaffected by that flag. ``com.microsoft::ConvInteger``-based
+    dynamic quantization
+    (:func:`onnxsim.apply_structured_pruning_dynamic_quantize_conv`) has no
+    C++ port at all yet and is NOT matched here.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
