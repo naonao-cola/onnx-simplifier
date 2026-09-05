@@ -176,6 +176,114 @@ def test_in_place_aliasing_blocked_by_multiple_consumers():
     assert plan.tensor_offsets["y1"][0] != plan.tensor_offsets["y2"][0]
 
 
+def test_binary_in_place_aliasing_donates_operand():
+    # x -> Relu -> a, then y = Add(a, w) with w a weight. `a` is the sole
+    # consumer feeding Add, so it donates into y (see IsInPlaceSafeBinaryOp);
+    # w is a weight and never planned at all. See memory_planning_test.cpp's
+    # TestBinaryInPlaceAliasingDonatesOperand for the byte-offset derivation:
+    # arena is 2 slots (x's own, plus one shared {a, y} slot) rather than 3.
+    body = """
+    g (float[25] x) => (float[25] y)
+    {
+      a = Relu(x)
+      y = Add(a, w)
+    }
+    """
+    plan = plan_activation_memory(_model(body, [_weight([25], "w")]))
+
+    assert plan.unplanned == []
+    assert "w" not in plan.tensor_offsets
+    assert plan.naive_bytes == 300  # x + a + y, 100 bytes each
+    assert plan.arena_bytes == 200
+
+    off = plan.tensor_offsets
+    assert off["a"] == off["y"]
+    assert off["x"][0] != off["a"][0]
+
+
+def test_binary_in_place_aliasing_other_operand_still_tracked():
+    # Both operands of Add are otherwise alias-eligible (each the sole
+    # consumer of its own Relu), but at most one is donated: input[0] (`a`)
+    # is tried first and succeeds, so `b` stays an ordinary, independently
+    # tracked tensor. See memory_planning_test.cpp's
+    # TestBinaryInPlaceAliasingOtherOperandStillTracked for the full
+    # byte-offset derivation.
+    body = """
+    g (float[25] x1, float[25] x2) => (float[25] y)
+    {
+      a = Relu(x1)
+      b = Relu(x2)
+      y = Add(a, b)
+    }
+    """
+    plan = plan_activation_memory(_model(body))
+
+    assert plan.unplanned == []
+    assert plan.naive_bytes == 500  # x1, x2, a, b, y, 100 bytes each
+    assert plan.arena_bytes == 300
+
+    off = plan.tensor_offsets
+    assert off["a"] == off["y"]  # a donated into y's group
+    assert off["b"] != off["a"]  # b is its own, separate group
+    assert off["b"] != off["y"]
+
+
+def test_binary_in_place_aliasing_skips_broadcast_operand():
+    # `scale` ([1], 4 bytes) broadcasts up to the output's shape ([25], 100
+    # bytes), so its byte size never matches the output's -- it must never be
+    # aliased no matter how eligible it otherwise looks. `a` ([25], 100
+    # bytes) is the exact-shape operand and is still eligible, exercising the
+    # "input[0] doesn't qualify -> fall back to input[1]" order since `scale`
+    # is input[0] here. See memory_planning_test.cpp's
+    # TestBinaryInPlaceAliasingSkipsBroadcastOperand for the derivation.
+    body = """
+    g (float[1] s0, float[25] x) => (float[25] y)
+    {
+      scale = Relu(s0)
+      a = Relu(x)
+      y = Add(scale, a)
+    }
+    """
+    plan = plan_activation_memory(_model(body))
+
+    assert plan.unplanned == []
+    assert plan.naive_bytes == 308  # 4 + 100 + 4 + 100 + 100
+    assert plan.arena_bytes == 204
+
+    off = plan.tensor_offsets
+    assert off["a"] == off["y"]  # a still donated (input[1])
+    assert off["scale"] != off["y"]  # broadcast operand never aliased
+    assert off["scale"][1] == 4
+    assert off["y"][1] == 100
+
+
+def test_binary_in_place_aliasing_blocked_by_multiple_consumers():
+    # `a` is consumed by Neg(a) -> y1 and Add(a, a) -> y2, the latter using
+    # the same tensor as both operands. The consumer-count guard counts
+    # (node, input-slot) pairs, so Add(a, a) alone contributes two consumer
+    # events -- well past the "consumed exactly once" bar -- so neither the
+    # unary nor the binary aliasing pass ever touches `a`, and y1/y2 (both
+    # simultaneously live graph outputs) are never incorrectly merged.
+    body = """
+    g (float[25] x) => (float[25] y1, float[25] y2)
+    {
+      a = Relu(x)
+      y1 = Neg(a)
+      y2 = Add(a, a)
+    }
+    """
+    plan = plan_activation_memory(_model(body))
+
+    assert plan.unplanned == []
+    assert plan.naive_bytes == 400
+    assert plan.arena_bytes == 300  # no donation possible anywhere
+
+    off = plan.tensor_offsets
+    assert off["a"] != off["y1"]
+    assert off["a"] != off["y2"]
+    assert off["y1"] != off["y2"]
+
+
 def test_weights_excluded_and_no_reuse_when_overlapping():
     # A single Conv reads x while producing y, so under the allocator's
     # conservative same-node-boundary rule they can never share space: the
@@ -219,6 +327,114 @@ def test_returned_from_top_level_package():
     assert onnxsim.plan_activation_memory is plan_activation_memory
     assert onnxsim.print_memory_plan is print_memory_plan
     assert onnxsim.MemoryPlan is MemoryPlan
+
+
+# --------------------------------------------------------------------------- #
+# control-flow subgraph planning (If/Loop/Scan)
+# --------------------------------------------------------------------------- #
+def _if_model_body():
+    # then_branch: x -> Relu -> a -> Relu -> b -> Relu -> then_out, an
+    # in-place-safe chain (see memory_planning_test.cpp's
+    # TestInPlaceAliasingCollapsesWholeChain) that collapses to one 100-byte
+    # group; else_branch: x -> Sigmoid -> c -> Tanh -> else_out, likewise one
+    # 100-byte group. Neither branch's own `x` is the outer graph's `x` --
+    # If's branches implicitly capture the outer scope's `x` by name, same
+    # tensor -- but nothing in either branch is a graph output or otherwise
+    # blocked, so this also exercises the ordinary in-place-aliasing pass
+    # running unmodified *inside* a subgraph body.
+    return """
+    g (float[25] x, bool cond) => (float[25] y)
+    {
+      y = If(cond) <
+        then_branch = then_g () => (float[25] then_out) {
+          a = Relu(x)
+          b = Relu(a)
+          then_out = Relu(b)
+        },
+        else_branch = else_g () => (float[25] else_out) {
+          c = Sigmoid(x)
+          else_out = Tanh(c)
+        }
+      >
+    }
+    """
+
+
+def test_if_node_subgraphs_planned_independently_and_reserved():
+    plan = plan_activation_memory(_model(_if_model_body()))
+
+    assert set(plan.subgraph_plans) == {"y#0", "y#1"}
+    then_plan = plan.subgraph_plans["y#0"]
+    else_plan = plan.subgraph_plans["y#1"]
+
+    assert then_plan.arena_bytes == 100
+    assert then_plan.naive_bytes == 300  # a, b, then_out -- no reuse credit
+    assert (
+        then_plan.tensor_offsets["a"]
+        == then_plan.tensor_offsets["b"]
+        == then_plan.tensor_offsets["then_out"]
+    )
+
+    assert else_plan.arena_bytes == 100
+    assert else_plan.naive_bytes == 200  # c, else_out
+    assert else_plan.tensor_offsets["c"] == else_plan.tensor_offsets["else_out"]
+
+    # Both branches count towards the reservation -- every subgraph of a node
+    # is summed, mirroring PeakMemoryFootprint, even though only one branch
+    # of an If actually runs: 100 + 100.
+    assert plan.subgraph_reserved_bytes == 200
+    # The outer graph's own naive_bytes only counts its own tensors (x, y);
+    # the reservation is overhead a naive "one slot per tensor" baseline
+    # never had to pay, which is why arena_bytes can end up bigger than
+    # naive_bytes once subgraphs are involved.
+    assert plan.naive_bytes == 200
+    assert plan.arena_bytes == plan.subgraph_reserved_bytes + plan.naive_bytes
+
+
+def test_print_memory_plan_recurses_into_subgraphs(capsys):
+    plan = plan_activation_memory(_model(_if_model_body()))
+    print_memory_plan(plan)
+    captured = capsys.readouterr()
+    assert "Reserved for control-flow subgraphs" in captured.out
+    assert "Subgraph 'y#0'" in captured.out
+    assert "Subgraph 'y#1'" in captured.out
+
+
+def test_annotate_memory_plan_recurses_into_subgraphs():
+    model = _model(_if_model_body())
+    plan = plan_activation_memory(model)
+    annotated = annotate_memory_plan(model)
+
+    branches = {
+        attr.g.name: attr.g
+        for node in annotated.graph.node
+        for attr in node.attribute
+        if attr.HasField("g")
+    }
+    then_g = branches["then_g"]
+    else_g = branches["else_g"]
+
+    then_meta = _metadata(then_g)
+    assert then_meta[METADATA_PREFIX + "memory_plan_arena_bytes"] == str(
+        plan.subgraph_plans["y#0"].arena_bytes
+    )
+    assert then_meta[METADATA_PREFIX + "memory_plan_naive_bytes"] == str(
+        plan.subgraph_plans["y#0"].naive_bytes
+    )
+
+    then_values = {
+        vi.name: vi
+        for vi in list(then_g.input) + list(then_g.output) + list(then_g.value_info)
+    }
+    for name, (offset, size) in plan.subgraph_plans["y#0"].tensor_offsets.items():
+        meta = _metadata(then_values[name])
+        assert meta[METADATA_PREFIX + "mem_offset"] == str(offset)
+        assert meta[METADATA_PREFIX + "mem_size"] == str(size)
+
+    else_meta = _metadata(else_g)
+    assert else_meta[METADATA_PREFIX + "memory_plan_arena_bytes"] == str(
+        plan.subgraph_plans["y#1"].arena_bytes
+    )
 
 
 def test_print_memory_plan_does_not_raise(capsys):

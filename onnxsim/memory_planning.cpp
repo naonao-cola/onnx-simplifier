@@ -69,6 +69,22 @@ bool IsViewOp(const std::string& op_type) {
   return kViewOps.count(op_type) > 0;
 }
 
+// Elementwise *binary* ops whose ONNX semantics compute output[i] purely from
+// (input0[i], input1[i]) -- so, absent broadcasting (checked separately: the
+// candidate operand's byte size must equal the output's), an executor can
+// compute the output by overwriting either operand's own storage in place,
+// same as IsInPlaceSafeOp's unary allowlist but with two candidate operands
+// instead of one. A curated allowlist for the same reason as the unary one:
+// nothing here parses attributes or checks broadcast shapes itself, so it
+// only lists ops that are unconditionally elementwise-safe when the shapes
+// already match.
+bool IsInPlaceSafeBinaryOp(const std::string& op_type) {
+  static const std::set<std::string> kSafeBinaryOps = {
+      "Add", "Sub", "Mul", "Div", "Max", "Min", "And", "Or", "Xor", "Mod",
+  };
+  return kSafeBinaryOps.count(op_type) > 0;
+}
+
 // Union-find (disjoint-set) over tensor names, path-compressed, used to
 // coalesce a chain of in-place-eligible ops (e.g. Relu -> Sigmoid -> Tanh)
 // into one placement group that needs a single slot for its whole span
@@ -150,18 +166,45 @@ MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph) {
     }
   }
 
-  // In-place aliasing: union a safe unary/view op's input[0] with its
-  // output[0] (see IsInPlaceSafeOp and IsViewOp) whenever doing so is
-  // provably safe --
+  // Shared eligibility check for a candidate operand `cand` to be aliased
+  // (unioned) with a node's output `out0` -- used by both the unary pass
+  // (IsInPlaceSafeOp / IsViewOp, one candidate: input[0]) and the binary
+  // pass below (IsInPlaceSafeBinaryOp, up to two candidates):
   //   * not a weight, a graph input, or a declared graph output (an
   //     externally-owned buffer, or one the caller reads only after the
   //     whole graph finishes, so overwriting it mid-run would be observed
   //     as corruption rather than reused space);
   //   * consumed exactly once, by this node -- the only read of the
   //     original value;
-  //   * input and output agree on size (always true for these ops on a
-  //     well-formed model; checked anyway as a defensive belt-and-braces).
-  // A chain of such ops unions transitively into one group -- Find() on any
+  //   * `cand` and `out0` agree on byte size -- always true for the unary
+  //     pass's ops on a well-formed model (checked anyway as a defensive
+  //     belt-and-braces); for the binary pass below, this is also exactly
+  //     what rules out a *broadcast* operand (a smaller operand ONNX would
+  //     broadcast up to the output's shape never matches the output's byte
+  //     size, so it is correctly rejected here rather than aliased).
+  // Shared by both the unary and binary in-place-aliasing passes.
+  const auto is_alias_eligible = [&](const std::string& cand,
+                                     const std::string& out0) {
+    if (cand.empty() || out0.empty()) return false;
+    if (weights.count(cand) || graph_inputs.count(cand) ||
+        graph_outputs.count(cand)) {
+      return false;
+    }
+    const auto cit = consumer_count.find(cand);
+    if (cit == consumer_count.end() || cit->second != 1) return false;
+
+    const auto cand_bytes = TensorBytes(cand, graph.shapes, graph.dtypes);
+    const auto out_bytes = TensorBytes(out0, graph.shapes, graph.dtypes);
+    if (!cand_bytes || !out_bytes || cand_bytes->is_symbolic() ||
+        out_bytes->is_symbolic()) {
+      return false;
+    }
+    return cand_bytes->to_int() == out_bytes->to_int();
+  };
+
+  // In-place aliasing: union a safe unary op's input[0] with its output[0]
+  // (see IsInPlaceSafeOp) whenever `is_alias_eligible` says it's safe. A
+  // chain of such ops unions transitively into one group -- Find() on any
   // member returns the same root -- that needs only a single slot for its
   // entire span, rather than one slot per node. The chain may freely mix
   // both categories (e.g. Reshape -> Relu -> Flatten): the eligibility
@@ -172,23 +215,34 @@ MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph) {
     if (node.inputs.empty() || node.outputs.size() != 1) continue;
     const std::string& in0 = node.inputs[0];
     const std::string& out0 = node.outputs[0];
-    if (in0.empty() || out0.empty()) continue;
-    if (weights.count(in0) || graph_inputs.count(in0) ||
-        graph_outputs.count(in0)) {
-      continue;
-    }
-    const auto cit = consumer_count.find(in0);
-    if (cit == consumer_count.end() || cit->second != 1) continue;
-
-    const auto in_bytes = TensorBytes(in0, graph.shapes, graph.dtypes);
-    const auto out_bytes = TensorBytes(out0, graph.shapes, graph.dtypes);
-    if (!in_bytes || !out_bytes || in_bytes->is_symbolic() ||
-        out_bytes->is_symbolic()) {
-      continue;
-    }
-    if (in_bytes->to_int() != out_bytes->to_int()) continue;
+    if (!is_alias_eligible(in0, out0)) continue;
 
     uf.Union(in0, out0);
+  }
+
+  // Binary in-place aliasing / operand donation: for a safe elementwise
+  // binary op (see IsInPlaceSafeBinaryOp) with exactly two inputs and one
+  // output, union its output with *at most one* of its two operands -- try
+  // input[0] first, then input[1] only if input[0] didn't qualify. The other
+  // operand (donated or not) is left as an ordinary, separately-tracked
+  // tensor; the existing liveness pass already places it correctly on its
+  // own. Reuses the exact same `is_alias_eligible` conditions as the unary
+  // pass above, so a broadcast operand (byte size differs from the output's)
+  // or a multiply-consumed one is never aliased, and this coalesces into the
+  // same UnionFind, so a value can be donated through a chain mixing unary
+  // and binary in-place-safe ops (e.g. Relu -> Add -> Sigmoid).
+  for (const NodeView& node : graph.nodes) {
+    if (!IsInPlaceSafeBinaryOp(node.op_type)) continue;
+    if (node.inputs.size() != 2 || node.outputs.size() != 1) continue;
+    const std::string& in0 = node.inputs[0];
+    const std::string& in1 = node.inputs[1];
+    const std::string& out0 = node.outputs[0];
+
+    if (is_alias_eligible(in0, out0)) {
+      uf.Union(in0, out0);
+    } else if (is_alias_eligible(in1, out0)) {
+      uf.Union(in1, out0);
+    }
   }
 
   // Pass 1: one Interval per plannable *group* -- a group is a single
@@ -231,6 +285,45 @@ MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph) {
   intervals.reserve(groups.size());
   for (const auto& [root, g] : groups) {
     intervals.push_back({root, g.size, g.start, g.end});
+  }
+
+  // Control-flow subgraphs (If/Loop/Scan bodies): each is planned
+  // independently, in its own arena starting at offset 0 (see the header's
+  // `subgraph_plans` doc), and the owning graph reserves room for it in its
+  // *own* arena for the span the owning node executes -- a synthetic
+  // interval, [i, i], sized to the sum of that node's subgraphs' arena_bytes
+  // (every subgraph counted, mirroring PeakMemoryFootprint's conservative
+  // "add every subgraph's peak" convention even though e.g. only one of an
+  // If's two branches actually runs). This interval participates in Pass 2
+  // placement exactly like any tensor's would -- Disjoint() already treats
+  // "produced at i" / "last used at i" as overlapping a [i, i] span, so it
+  // correctly avoids everything live while node i runs -- but it is not a
+  // real tensor: not part of `groups`, never eligible for aliasing, and
+  // never given an entry in `plan.offsets`.
+  for (int i = 0; i < end; ++i) {
+    const NodeView& node = graph.nodes[i];
+    if (node.subgraphs.empty()) continue;
+
+    std::string key_base;
+    for (const std::string& out : node.outputs) {
+      if (!out.empty()) {
+        key_base = out;
+        break;
+      }
+    }
+    if (key_base.empty()) key_base = "#node" + std::to_string(i);
+
+    int64_t reserved = 0;
+    for (std::size_t s = 0; s < node.subgraphs.size(); ++s) {
+      MemoryPlan sub_plan = ComputeActivationMemoryPlan(node.subgraphs[s]);
+      reserved += sub_plan.arena_bytes;
+      plan.subgraph_plans[key_base + "#" + std::to_string(s)] =
+          std::move(sub_plan);
+    }
+    if (reserved <= 0) continue;
+
+    plan.subgraph_reserved_bytes += reserved;
+    intervals.push_back({key_base + "#reserved", reserved, i, i});
   }
 
   // Pass 2: greedy best-fit placement, largest group first (ties broken by

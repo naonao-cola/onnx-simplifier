@@ -27,30 +27,37 @@ poisoned ``sys.modules["models"]``, and axera's own `models.build(...)` and
 silently ran against a different vendor's module instead.
 
 :func:`fresh` forces a real import from a specific directory regardless of
-what is already cached under that bare name.
+what is already cached under that bare name -- and regardless of ``sys.path``
+order. An earlier version of this function re-imported by bare name
+(``importlib.import_module(name)``) after evicting a wrong cache entry, which
+is not enough on its own once more than one vendor directory needs to be on
+``sys.path`` at the same time (e.g. every caller of :func:`fresh` also needs
+this module's own directory on ``sys.path`` to reach ``_local_import``
+itself): ``import_module`` still resolves the bare name against ``sys.path``
+in order and can land back on a *different* directory's same-named file,
+independent of which ``directory`` was actually asked for. Loading directly
+from ``directory`` by file path removes that ambiguity entirely.
 """
 
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import os
 import sys
 from types import ModuleType
 
 
 def fresh(name: str, directory: str) -> ModuleType:
-    """Import ``name`` from ``directory``, ignoring a same-named module
-    already cached in ``sys.modules`` from a different directory.
-
-    ``directory`` must already be on ``sys.path`` (callers here always
-    prepend their own ``HERE`` before calling this).
+    """Import ``<directory>/<name>.py`` as module ``name``, bypassing both
+    ``sys.modules`` caching and ``sys.path`` search-order ambiguity -- the
+    result is always the file at that exact path, never a same-named module
+    some other directory on ``sys.path`` happens to also provide.
     """
-    cached = sys.modules.get(name)
-    if cached is not None:
-        cached_file = getattr(cached, "__file__", None)
-        if (
-            cached_file is None
-            or os.path.dirname(os.path.abspath(cached_file)) != directory
-        ):
-            del sys.modules[name]
-    return importlib.import_module(name)
+    path = os.path.join(directory, f"{name}.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {name!r} from {path!r}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module

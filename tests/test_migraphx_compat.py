@@ -25,10 +25,23 @@ _AMD_DIR = os.path.join(
 )
 if _AMD_DIR not in sys.path:
     sys.path.insert(0, _AMD_DIR)
+_AXERA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "axera"
+)
+if _AXERA_DIR not in sys.path:
+    sys.path.insert(0, _AXERA_DIR)
 
 import migraphx_backend as migraphx  # noqa: E402
-import models  # noqa: E402
-from worker import check  # noqa: E402
+
+# fresh(), not a bare `import models`/`from worker import check`: every
+# scripts/<vendor>/ directory has its own models.py (and most have their own
+# worker.py too), all imported by the same bare name -- see
+# scripts/axera/_local_import.py's docstring for why a plain import here can
+# silently resolve to a *different* vendor's module in the full test suite.
+from _local_import import fresh  # noqa: E402
+
+models = fresh("models", _AMD_DIR)
+check = fresh("worker", _AMD_DIR).check
 
 pytestmark = pytest.mark.skipif(
     not migraphx.MIGRAPHX_AVAILABLE,

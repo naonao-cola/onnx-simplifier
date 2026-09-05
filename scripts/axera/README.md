@@ -287,6 +287,130 @@ instruction stream from that dataflow graph -- real quantization, tiling,
 scheduling, and codegen into an undocumented ISA -- still requires
 Pulsar2's own (obfuscated) compiler backend.
 
+### What's op-specific vs. boilerplate, across real Conv/MatMul variants
+
+The single-model dig above raises an obvious question: how much of that
+FlatBuffers offset table and instruction stream is generic wrapper vs.
+op-specific? Answered by compiling 9 small, hand-built ONNX graphs (plain
+`MatMul`, `Gemm` with bias, dense `Conv` 3x3, 1x1 pointwise, depthwise
+(`group=C`), grouped (`group=2`), stride-2, dilation-2, and a batched
+(rank-3) `MatMul`) through the same real `pulsar2 build --compiler.npu_perf`
+and inspecting each result the same way:
+
+- **The FlatBuffers field-name table is identical across every one of the
+  9 models**: always exactly `params`, `<input>_offset`, `<output>_offset`,
+  `_ocm_base`, and the graph name -- regardless of kernel size, stride,
+  dilation, groups, or op family. **No op parameter ever shows up as a
+  named field.** Conv's stride/padding/dilation/group and Gemm's alpha/
+  beta/transpose flags are entirely opaque, baked into the unlabeled
+  instruction bytes -- this table is pure I/O bookkeeping, not a
+  semantically rich IR.
+- **`ddr_swap` is a real, conditional field**, not a fixed part of the
+  schema: present in the earlier 28-layer LLM build (something spilled to
+  DRAM), absent from all 9 of these small models (everything fit in OCM).
+- **Exactly two compute "primitive families" appear**, cleanly split by op
+  family: every `Conv` variant -- dense, 1x1, depthwise, grouped, strided,
+  dilated, no exceptions -- lowers to `Pre_AxTranspose` -> `AxQuantizedConv`
+  (x6 tiles) -> `Post_AxTranspose` (almost certainly a NCHW<->NHWC layout
+  swap around a channel-last-native conv engine); `MatMul` lowers to
+  `onnx.FullyConnected` instead. Op parameters change *within* those
+  primitives (invisibly) but never *which* primitive gets picked.
+- Trace event **naming isn't fully consistent**: `matmul2d`'s compute
+  events are labeled `op_1:onnx.FullyConnected_<tile>_<tile>` (primitive
+  name visible), but `gemm_bias`'s and the batched `matmul_batched3d`'s are
+  labeled directly after their own output tensor (`y_0_0`, `y_1_2`, ...) --
+  the same underlying compute, differently named depending on some
+  internal fusion/naming decision, not a reliable way to detect op type
+  from the trace alone.
+- **Cycle cost and weight-blob size don't scale the way FLOP count would
+  predict, at this tiny (16x16, 4-8 channel) test size.** 1x1 pointwise
+  conv costs nearly as many cycles as full dense 3x3 (2052 vs. 2096) --
+  fixed per-tile overhead dominates raw MAC count here. Most strikingly,
+  **dilated conv's stored weight blob is 2.6x larger than a plain conv with
+  the identical (8,4,3,3) kernel shape** (3.66KB vs. ~1.4KB) despite having
+  the same number of logical weight values -- strong evidence the compiler
+  materializes a real, zero-expanded ("atrous") kernel footprint for
+  dilation rather than an actually-sparse dilated MAC pattern, and it's
+  also the most expensive op tested by cycle count (2228).
+- Every model tiles into a small, similar instruction count regardless of
+  large parameter differences at this scale: all 6 `Conv` variants compile
+  to exactly 6 `AxQuantizedConv` sub-tiles each; `matmul2d` to 6
+  `FullyConnected` sub-tiles; the batched matmul to 7. Tiling granularity
+  here looks governed by fixed hardware tile-size constants more than by
+  the specific op's shape/parameters -- this may well change at larger,
+  more realistic tensor sizes where tiling actually has to split work up.
+
+### External corroboration: a real hardware teardown
+
+An independent third-party writeup --
+[jas-hacks.blogspot.com's AX650N/Sipeed M4N teardown](https://jas-hacks.blogspot.com/2024/09/ax650n-sipeed-maix-iv-axerapi-pro-npu.html)
+(not Axera's own documentation; treat specific numbers as one outside
+source's reporting, and any interpretive claims -- explicitly flagged
+below -- as that author's own inference, not confirmed fact) -- gives real
+names and numbers for the hardware this repo's own trace.json digging
+above only inferred generically:
+
+- The NPU ("Neutron") is described as 13 execution units + 3 SDMA units:
+  3 Convolution Units (handling depthwise/grouped conv, dilation, and
+  ConvTranspose), 3 Computer Vision Units (image normalize/resize/clip/
+  warp), 3 Tensor Units (activation, pooling, elementwise, reduction), and
+  a single Matrix Arithmetic Unit (int8/int16 in, fp16/fp32 out). This
+  lines up with this repo's own trace.json engine names in outline --
+  `conv0`/`conv1` for the Convolution Units, `sdma4` for an SDMA unit --
+  but not exactly: our own LLM trace's `cv3` engine ran RMSNorm/RoPE
+  elementwise math, which reads as "Tensor Unit" work by this source's own
+  description, not "Computer Vision Unit" work, and we never observed a
+  distinct engine for the single Matrix Arithmetic Unit despite compiling
+  real `MatMul`/`Gemm` graphs above (both engine-name schemes may not be
+  directly comparable, or the compiler may route elementwise math onto
+  whichever engine family has spare capacity rather than a fixed
+  CV-vs-tensor split). Reported, not reconciled -- a real open question
+  for anyone digging further.
+- **On-chip memory (OCM): reported as 11.5MB, address space ending at
+  `0xAFFFFF`.** `0xAFFFFF + 1 = 0xB00000 = 11,534,336` bytes = exactly
+  11MiB by that address range -- close to but not exactly the "11.5MB"
+  figure quoted; direct, checkable confirmation that `ocm_base`'s byte
+  offsets seen in this repo's own trace.json digging above (all under
+  ~3.2MB in our tiny test models) sit well inside a real, multi-megabyte
+  on-chip SRAM, not some other memory space.
+- 8GB total SoC RAM, split 4GB Linux / 4GB "CMM" (Contiguous Memory Model)
+  for peripherals -- CMM is almost certainly what this repo's own findings
+  call `params`/DRAM-resident weight storage and `ddr_swap` staging.
+- Claimed performance: 72 TOPS mixed precision (18.0 TOPS@INT8, 43.2
+  TOPS@INT4 and 10.8 TOPS@INT8 "from NPU alone" per Axera's own SDK docs,
+  per that source). **The author's own interpretation** (not a measured
+  fact): a single Matrix Arithmetic Unit instance may bottleneck LLM
+  inference, since every `MatMul`/`Gemm` in a transformer routes through
+  it. That's a plausible complementary explanation for *why* LLM inference
+  is slow on this hardware, alongside (not instead of) the very different,
+  independently-confirmed bottleneck this repo's own `demo_hf_llm_chat.py`
+  measured: `axcl_run_model`'s ~700ms-per-invocation process/model-reload
+  overhead, which has nothing to do with the NPU's own compute engines at
+  all and would dominate regardless of how many Matrix Arithmetic Units
+  existed.
+- Real production reference point (**not comparable to
+  `demo_hf_llm_chat.py`'s own measured tokens/sec** -- different
+  measurement entirely: real `ax-llm` + KV-cache decode via Pulsar2's own
+  `llm_build()` path, not this repo's re-run-the-whole-model-per-token
+  `build_from_hf_checkpoint()` path, and no per-call CLI-reload overhead
+  since it's a persistent server): Phi-3 Mini reported at ~4.4 tokens/sec
+  on the AX650N, vs. ~6.46 tokens/sec on an RK3588 for comparison.
+- Confirms real ONNX-level `.axmodel` structure from an outside source
+  independently: "axmodel files contain a mix of ONNX data and an internal
+  graph representation" sent to the NPU kernel driver -- matching this
+  repo's own finding of an ordinary ONNX container wrapping an opaque,
+  FlatBuffers-framed internal representation.
+- **Confirmed, and more specific than reported**: `gemm_bias` above used
+  default `alpha=1.0, beta=1.0` and compiled fine; a `Gemm` with
+  non-default values (`alpha=2.0, beta=0.5`) **fails outright**, not
+  merely "restricted" -- a real `pulsar2 build` on that graph throws
+  `KeyError: 'dont support AxQuantizedGemm opr in AXOPS/ONNXOPS/
+  CUSTOM_OPS'` before quantization even runs. Default-alpha/beta `Gemm`
+  apparently lowers to the same path as a plain `MatMul` + bias-add (hence
+  `gemm_bias` succeeding above); any other `alpha`/`beta` maps to a
+  distinct, entirely unimplemented `AxQuantizedGemm` op. Confirms the
+  blog's suspicion with a precise, reproducible mechanism.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
@@ -412,6 +536,96 @@ Also note `axcl_run_model -i/-o/-l`'s exact contract, confirmed by trial:
 -- an arbitrary filename fails with "Stimulus file ... is not exist" naming
 the tensor). `pulsar2_docker.run_on_device_with_input()` already does this.
 
+## Conv/MatMul variants: what the static heuristic can and can't tell you
+
+Prompted by "how does the axmodel format actually treat different kinds of
+Conv/MatMul" -- with no Docker image or AX650N in *this* environment (unlike
+the sessions that produced the real-hardware findings above), the honest
+thing to check is what the checked-in **static heuristic**
+(`pulsar2_ops.AX650_SUPPORTED_OPS` + `pulsar2_simulator.partition()`) can and
+can't distinguish, since that heuristic is all a Docker/device-free
+environment has to go on. `tests/test_axera_conv_matmul_coverage.py` builds
+~16 Conv/MatMul variants via `onnx.parser` and checks them against it:
+
+- **Standard, grouped, depthwise, dilated, strided, `auto_pad`-using, 1-D,
+  3-D Conv, and `ConvTranspose`** all read as identical, full NPU coverage.
+  So do plain `MatMul`, broadcasting/batched `MatMul`, and `Gemm` under every
+  combination of `alpha`/`beta`/`transA`/`transB`. This isn't a bug in the
+  test -- it's `partition()`'s own documented design: it classifies purely by
+  `node.op_type` membership in `AX650_SUPPORTED_OPS`, the same list
+  `inspect_axmodel.py`/`pulsar2_ops.py` scraped from Pulsar2's docs, which
+  says nothing about attributes. The docs page itself has per-op
+  attribute-level limits (e.g. Conv's `auto_pad` must be `NOTSET`) that
+  neither this list nor `partition()` encode -- confirmed absent, not
+  confirmed present, since there's no compiler here to check it against.
+  Extending `pulsar2_ops.py` with real attribute limits needs a source of
+  truth this environment doesn't have (the docs page or a real `pulsar2
+  build` failure); making that gap up would be exactly the kind of
+  unconfirmed guess this harness otherwise avoids.
+- **What *is* checkable without any of that**: none of ONNX's own quantized
+  conv/matmul ops (`QLinearConv`, `ConvInteger`, `QLinearMatMul`,
+  `MatMulInteger`) are in `AX650_SUPPORTED_OPS` at all, so `partition()`/
+  `ax650_build_risks()` flag them as an AX650 build risk regardless of shape.
+  This lines up with `pulsar2_quantizer.py`'s separately-confirmed finding
+  that Pulsar2's own real PTQ output uses proprietary `AxQuantizedConv`-family
+  ops, not standard ONNX quantized operators -- so a graph already quantized
+  with ONNX's own vocabulary (e.g. via `onnxsim.quantize_dynamic`, unlike
+  `pulsar2_quantizer.quantize_like_pulsar2()`, which stays in QDQ form) is
+  something Pulsar2's real frontend has never been confirmed to accept, and
+  this heuristic's answer (flag it) is at least consistent with that.
+- This also surfaced (and fixed) a real bug in the "no Docker/no-device
+  simulator" pitch above: `pulsar2_simulator.py`'s docstring and this
+  README both claim `partition()`/`coverage()` "need only `onnx` and work
+  regardless" -- but `pulsar2_simulator.py` unconditionally imported
+  `pulsar2_quantizer.py`, which unconditionally did `import onnxsim` at
+  module scope, so on a checkout where `onnxsim`'s own compiled extension
+  isn't built yet (this analysis' own environment, notably -- no real
+  `.axmodel`, Docker image, or device either), just importing
+  `pulsar2_simulator` for its `onnx`-only `partition()`/`coverage()` raised
+  `ModuleNotFoundError` before either function ever ran. Fixed by moving the
+  `import onnxsim` inside `pulsar2_quantizer.py`'s existing
+  `PULSAR2_QUANTIZER_AVAILABLE` try/except (alongside the `onnxruntime`
+  import already there), so a missing/unbuilt `onnxsim` degrades the same
+  way a missing `onnxruntime` already did, instead of taking the whole
+  import down.
+
+### Confirmed on real hardware: which of these actually build
+
+A later session with real Docker/AX650N access compiled every variant the
+static-heuristic analysis above flagged as unverified, through a real
+`pulsar2 build`. Results (see
+`tests/test_axera_conv_matmul_coverage_hardware.py`):
+
+**Compile successfully, confirming the doc-scraped list under-claims
+nothing for these cases**: `Conv` with `auto_pad="SAME_UPPER"` (despite the
+docs page reportedly requiring `NOTSET` -- either that limit doesn't hold in
+practice for this case, or Pulsar2 silently resolves `auto_pad` to explicit
+`pads` before its own limit would apply), 1-D `Conv`, 3-D `Conv`, broadcasting
+`MatMul` (rank-3 `A` against a rank-2 `B`), and `Gemm` with `transB=1`.
+
+**Fail outright, with the same "not on `AX650_SUPPORTED_OPS`" mechanism the
+static heuristic already predicted**: `ConvInteger`, `QLinearConv`,
+`MatMulInteger`, `QLinearMatMul` -- all four real `pulsar2 build` runs threw
+the exact `KeyError('dont support <OpType> opr in AXOPS/ONNXOPS/CUSTOM_OPS')`
+pattern this repo has seen before (`LRN`, `AxQuantizedGemm` -- see above),
+confirming these standard ONNX quantized ops are genuinely unimplemented on
+this real toolchain, not merely absent from a possibly-incomplete
+docs-scraped list.
+
+**Fails, but with a real, different failure mode neither analysis
+predicted**: `ConvTranspose` -- despite being confirmed present in
+`AX650_SUPPORTED_OPS` (and passing `partition()`'s coverage check, correctly,
+since the op type genuinely is on the list) -- a plain `ConvTranspose`
+(kernel 3x3, default strides/padding, upsampling 8x8 -> 10x10) fails during
+real quantization with `RuntimeError("Op Execution Error: Y(TargetPlatform.
+UNSPECIFIED) - inputs:['X', 'W'], outputs:['Y']")`, not the "dont support"
+pattern above. This is exactly the failure mode the static heuristic
+structurally cannot see (op-type presence alone says nothing about it) and
+is a genuine confirmed gap in `AX650_SUPPORTED_OPS`'s "supported" claim for
+at least this shape/parameter combination -- root cause (a missing required
+attribute this minimal graph didn't set, a PTQ-engine limitation specific to
+transposed conv, or something else) not further diagnosed here.
+
 ## Files
 
 | file | purpose |
@@ -420,7 +634,7 @@ the tensor). `pulsar2_docker.run_on_device_with_input()` already does this.
 | `pulsar2_backend.py` | thin wrapper around `pulsar2_ops.py`: `coverage()`, `new_blocking_op_types()`, `stripped_npu_data()`, `unsafe_for_simplify()`, `ax650_build_risks()`. Shaped like the sibling `*_backend.py` modules for interface symmetry (`PULSAR2_AVAILABLE` is always `True` -- there's no external dependency to be missing). |
 | `inspect_axmodel.py` | standalone CLI for a **real** `.axmodel` file: loads it with `onnx.load()`, then reports non-standard-domain nodes, op types outside the model's declared opset, and suspiciously large raw attributes -- what originally found the `neu mode` node in the real YOLOv8 file. |
 | `models.py` | the shared `scripts/common/synthetic_models.py` suite plus `axera_npu_compiled_leaf` (real CNN `neu mode` node shape) and `axera_llm_layer_leaf` (real per-layer LLM shape: two `neu mode` nodes sharing one initializer) -- no real device needed to exercise the corruption check in CI. |
-| `pulsar2_quantizer.py` | `quantize_like_pulsar2()`: a thin wrapper over `onnxsim.quantize_static(method="minmax")`, which already matches Pulsar2's real numeric convention (U8 asymmetric activations, S8 per-channel weights, MinMax calibration). `PULSAR2_QUANTIZER_AVAILABLE` reflects `onnxruntime`'s availability (onnxsim's quantizer needs it internally, imported lazily). |
+| `pulsar2_quantizer.py` | `quantize_like_pulsar2()`: a thin wrapper over `onnxsim.quantize_static(method="minmax")`, which already matches Pulsar2's real numeric convention (U8 asymmetric activations, S8 per-channel weights, MinMax calibration). `PULSAR2_QUANTIZER_AVAILABLE` reflects both `onnxruntime`'s availability and `onnxsim` itself actually being importable (a checkout with `onnxsim`'s compiled extension not yet built fails `import onnxsim`, not just the lazy `onnxruntime` import inside it -- both are caught the same way so this degrades gracefully instead of taking `pulsar2_simulator.py`'s `import` down with it). |
 | `pulsar2_simulator.py` | `partition()`/`coverage()` (real `AX650_SUPPORTED_OPS` membership, no dependency beyond `onnx`) and `simulate()` (fp32-vs-INT8 estimate via `pulsar2_quantizer.py` + onnxruntime's CPU EP). Validated against real hardware -- see above. |
 | `worker.py` | runs the check for one model in an isolated subprocess, printing one `__RESULT__<json>` line. |
 | `run_pulsar2_compat.py` | drives the suite, writes a CSV, and exits non-zero on any regression. No `--require-*` flag or `skipped` status -- unlike the EP harnesses, this needs no vendor package or device, so it always runs. Entry point for `axera-integration.yml`'s `pulsar2-compat` job (stock runner, no Docker/device). |
@@ -453,6 +667,8 @@ skip-guarded like the EP compat tests, since there's no external dependency
 to be missing). `tests/test_pulsar2_simulator.py` covers the simulator +
 quantizer; its `partition()`/`coverage()` tests are likewise unguarded, but
 `simulate()`/`quantize_like_pulsar2()` need `onnxruntime` and skip without it.
+`tests/test_axera_conv_matmul_coverage.py` is the Conv/MatMul-variant
+heuristic analysis above -- also unguarded, needing only `onnx`.
 
 To get a fast partition/coverage read or a quantization-noise estimate for a
 model, with no Docker or device:

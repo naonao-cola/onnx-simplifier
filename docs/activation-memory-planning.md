@@ -94,6 +94,68 @@ freely mix both allowlists — e.g. `Reshape -> Relu -> Flatten` all collapse
 into one group — since the eligibility conditions and the resulting
 placement are identical either way.
 
+A third, independent category extends this to **binary operand donation**:
+an elementwise binary op (`Add`, `Sub`, `Mul`, `Div`, `Max`, `Min`, `And`,
+`Or`, `Xor`, `Mod` — see `IsInPlaceSafeBinaryOp`) can compute its output by
+overwriting *one* of its two operands, the same way real NN memory planners
+(MXNet, XLA) donate an operand's buffer to a binary kernel's output. The
+candidate operand must clear the exact same bar as the unary pass's input —
+not a weight/graph input/graph output, consumed exactly once, and matching
+the output's byte size — checked against **each** operand in turn (`input[0]`
+then `input[1]`), aliasing **at most one** of them. Matching the output's byte
+size is what rules out a *broadcast* operand: ONNX broadcasts a smaller
+operand up to the output's shape, so a genuinely broadcast operand's byte
+size never equals the output's, and it is correctly left un-aliased no
+matter how eligible it otherwise looks. The operand that isn't donated (if
+any) is simply left for the ordinary liveness pass to place, same as any
+other tensor. Because this unions into the very same `UnionFind` as the
+other two categories, a chain mixing any of them (e.g.
+`Reshape -> Relu -> Add -> Sigmoid`) still collapses into one group end to end.
+
+## Control-flow subgraphs (If/Loop/Scan)
+
+A node's control-flow subgraph bodies are each planned independently, in
+their own arena starting at offset 0 -- entirely separate address space from
+the owning graph's, and from a sibling subgraph's. The owning graph reserves
+room for a subgraph's peak requirement inside *its own* arena for the span
+the owning node executes, the same "subgraph peak added on top of the live
+set at that node" convention `PeakMemoryFootprint` already uses for its own
+number. When a node owns more than one subgraph (an `If`'s `then_branch` and
+`else_branch`), every one of them counts towards the reservation, even
+though only one branch actually runs -- the same conservative
+"sum every subgraph" rule `PeakMemoryFootprint` applies.
+
+```python
+plan = onnxsim.plan_activation_memory(model)
+plan.subgraph_reserved_bytes  # extra bytes reserved in this arena for subgraphs
+plan.subgraph_plans           # {"<key>": MemoryPlan, ...} -- one per subgraph
+```
+
+Each nested plan is keyed by `"<node's first non-empty output name>#<subgraph
+index>"` -- an `If` node producing output `y` keys its `then_branch` as
+`"y#0"` and `else_branch` as `"y#1"`; a `Loop`/`Scan` node's single body keys
+as `"y#0"`. `print_memory_plan` prints each nested plan under its own
+"Subgraph '\<key\>'" heading after the top-level table.
+
+This is a genuinely *joint* plan in the sense that nothing is left
+unaccounted for -- every tensor anywhere in the model, subgraph bodies
+included, gets a real offset in some arena, and the owning arena is sized to
+actually hold every subgraph concurrently live with it -- but it is not a
+*shared* one: a subgraph's tensors can never alias something live in the
+outer scope (or in a sibling subgraph), even when their liveness would
+otherwise allow it. That is a materially bigger allocator problem this
+doesn't take on.
+
+One consequence worth calling out: `naive_bytes` only ever counts a graph's
+*own* tensors (the "one permanent slot per tensor, no reuse" baseline it has
+always meant), never subgraph reservations -- so a model whose memory is
+dominated by a large control-flow subgraph can end up with `arena_bytes`
+*larger* than `naive_bytes`, and therefore a negative `compression_ratio`.
+That is not a bug: it means the subgraph reservation is overhead a
+naive top-level-only allocation never had to pay, not that this plan is
+worse than the naive baseline at placing the tensors it actually reasons
+about.
+
 ## What's in `MemoryPlan`
 
 - **`tensor_offsets`** — `{name: (offset, size)}` for every planned tensor.
@@ -107,6 +169,9 @@ placement are identical either way.
   `tensor_offsets` and `naive_bytes`. A plan with a non-empty `unplanned` is
   a partial lower bound, not a complete one — check it before trusting
   `arena_bytes` as the true requirement.
+- **`subgraph_reserved_bytes`** / **`subgraph_plans`** — see
+  [Control-flow subgraphs](#control-flow-subgraphs-ifloopscan) above; 0 and
+  `{}` for a model with no `If`/`Loop`/`Scan` nodes.
 
 ## Annotating a model with the plan (`annotate_memory_plan`)
 
@@ -133,6 +198,13 @@ onnx.save(annotated, "model.annotated.onnx")
   `onnxsim.mem_offset` and `onnxsim.mem_size`. A tensor that
   `plan_activation_memory` couldn't plan is simply left unannotated, the same
   way `annotate_metadata` leaves an unknown-shape tensor's `bytes` unset.
+- **Control-flow subgraph body** (an `If`/`Loop`/`Scan` node's
+  `then_branch`/`else_branch`/`body` `GraphProto`, recursively): the same
+  value-level `mem_offset`/`mem_size` pairs from that subgraph's own nested
+  `MemoryPlan`, plus its own `memory_plan_arena_bytes`/`naive_bytes`/
+  `compression_ratio`/`unplanned_count`/`unplanned` written directly onto the
+  subgraph `GraphProto` itself — there's no model-level object a subgraph
+  body could otherwise attach totals to.
 
 The input model is never mutated; `annotate_memory_plan` returns a shape-
 inferred copy, since the per-value metadata needs a matching `value_info`
@@ -145,12 +217,13 @@ entry to attach to (a `NodeProto` doesn't get its own offset — a node's
   no fixed byte size to place, so it's reported in `unplanned` rather than
   guessed. Run `--overwrite-input-shape` / `overwrite_input_shape=` (see the
   main README) to pin a dynamic model's shapes before planning it.
-- **Top-level graph only.** Tensors inside `If`/`Loop`/`Scan` subgraph bodies
-  are not visited or planned at all — a possible follow-up is a joint
-  cross-subgraph plan the way `PeakMemoryFootprint` adds a subgraph's own
-  peak on top of its owning node's live set, but sharing offset space
-  *across* graph scopes is a materially bigger allocator problem than this
-  first version takes on.
+- **Subgraphs are planned, but not jointly.** Every `If`/`Loop`/`Scan`
+  subgraph body is visited and gets its own complete, independent plan (see
+  [Control-flow subgraphs](#control-flow-subgraphs-ifloopscan)) — but always
+  in its own separate arena, never one *shared* address space spanning graph
+  scopes. A subgraph's tensors can never alias something live in the outer
+  scope even when their liveness would otherwise allow it; a genuinely joint
+  plan is a materially bigger allocator problem this still doesn't take on.
 - **A plan, not a runtime.** Nothing in onnxsim executes against this arena;
   it's up to whatever deployment target consumes the plan (or a future
   onnxsim pass) to actually allocate `arena_bytes` and place each tensor at

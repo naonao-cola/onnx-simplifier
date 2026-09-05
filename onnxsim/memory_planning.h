@@ -43,19 +43,29 @@
 // running that node's kernel in place (writing its output over the input's own
 // buffer, or for a view op simply treating input and output as the same buffer
 // under different shape metadata), not merely by treating same-offset as "safe
-// to reuse after the fact" the way two disjoint-interval tensors are.
+// to reuse after the fact" the way two disjoint-interval tensors are. A third,
+// independent category (see IsInPlaceSafeBinaryOp) extends this to binary
+// elementwise ops -- Add, Mul, and the like -- which may instead union their
+// output with *one* of their two operands ("operand donation"), the candidate
+// operand held to the exact same bar as above (checked against each operand
+// in turn, aliasing at most one; a broadcast operand's byte size never
+// matches the output's, so it is never a candidate).
 //
 // v1 scope, deliberately:
 //   * Concrete shapes only. A tensor whose size cannot be resolved to a
 //     concrete (non-symbolic) byte count -- unknown shape/dtype, or a
 //     dynamic dim_param -- is left out of the plan and listed in
 //     `unplanned`, rather than guessed.
-//   * Top-level graph only. Control-flow subgraph (If/Loop/Scan) bodies are
-//     not visited or planned; a follow-up could extend this to a joint
-//     cross-subgraph plan the way PeakMemoryFootprint adds a subgraph's own
-//     peak on top of its owning node's live set, but a *shared offset space*
-//     across graph scopes is a materially bigger allocator problem than
-//     this v1 takes on.
+//   * Control-flow subgraphs (If/Loop/Scan bodies) are planned independently,
+//     each in its own arena starting at offset 0 (see `subgraph_plans`
+//     below) -- not jointly with the owning graph's. The owning graph
+//     reserves room in *its own* arena for a subgraph's peak requirement for
+//     the span its owning node executes (`subgraph_reserved_bytes`),
+//     mirroring PeakMemoryFootprint's "subgraph peak added on top of the
+//     live set at that node." A genuinely joint plan -- one *shared* offset
+//     space spanning graph scopes, so a subgraph's tensors could in
+//     principle also alias something live in the outer scope -- is a
+//     materially bigger allocator problem this still doesn't take on.
 //   * Weights (initializers) are excluded: they stay resident for the whole
 //     graph and are not part of an activation arena.
 namespace onnxsim {
@@ -80,6 +90,26 @@ struct MemoryPlan {
   // `naive_bytes` above. A plan with a non-empty `unplanned` should be
   // treated as a partial lower bound, not as evidence of a small arena.
   std::vector<std::string> unplanned;
+
+  // Extra bytes reserved within *this* arena (already folded into
+  // `arena_bytes` above) for control-flow subgraphs owned by nodes in this
+  // graph -- one reservation per node that owns any subgraphs, sized to the
+  // sum of that node's subgraphs' own `arena_bytes` (both an `If`'s
+  // then_branch and else_branch count, even though only one runs -- the
+  // same conservative "add every subgraph" convention PeakMemoryFootprint
+  // uses) and live only for the span that node executes. 0 when this graph
+  // has no control-flow nodes.
+  int64_t subgraph_reserved_bytes = 0;
+  // One independently-computed plan per control-flow subgraph body owned by
+  // a node in this graph, keyed by "<node's first non-empty output
+  // name>#<subgraph index>" -- e.g. an `If` node producing output "y" keys
+  // its then_branch as "y#0" and else_branch as "y#1"; a `Loop`/`Scan`
+  // node's single body keys as "y#0". Each nested plan is entirely
+  // self-contained: its `offsets` start at 0 in its *own* arena, never
+  // overlapping this plan's `offsets` or another subgraph's -- see
+  // `subgraph_reserved_bytes` above for how the owning graph accounts for
+  // the space instead.
+  std::map<std::string, MemoryPlan> subgraph_plans;
 };
 
 // Compute a memory plan for `graph`'s top-level activation tensors (graph

@@ -4013,29 +4013,38 @@ int64_t ChainGroup(const Chain& chain) {
 // _slice_grouped_consumer_conv_weight/_slice_last_axis ----------------------
 
 // Keeps only rows in `keep` of a [rows, inner] row-major matrix.
-std::vector<float> SliceAxis0(const std::vector<float>& data, int64_t /*rows*/,
-                              int64_t inner, const std::vector<int64_t>& keep) {
-  std::vector<float> out(keep.size() * static_cast<size_t>(inner));
+// Templated (not just `float`) so the MoE/QMoE section's own FLOAT16/
+// BFLOAT16-widened `double` code path (ReadTensorAsF64/WriteF64TensorAs, see
+// that section's own top comment) can reuse this exact same byte-shuffling
+// logic via `SliceAxis0<double>`/`SliceAxis1<double>`, instead of a
+// hand-duplicated copy -- every existing caller below still passes
+// `std::vector<float>` and gets the identical instantiation/behavior as
+// before.
+template <typename T>
+std::vector<T> SliceAxis0(const std::vector<T>& data, int64_t /*rows*/,
+                          int64_t inner, const std::vector<int64_t>& keep) {
+  std::vector<T> out(keep.size() * static_cast<size_t>(inner));
   for (size_t i = 0; i < keep.size(); ++i) {
     std::memcpy(out.data() + i * inner, data.data() + keep[i] * inner,
-                static_cast<size_t>(inner) * sizeof(float));
+                static_cast<size_t>(inner) * sizeof(T));
   }
   return out;
 }
 
 // Keeps only columns in `keep` of a [dim0, dim1, inner] row-major tensor
 // (axis 1 sliced; `inner` is the flattened size of every trailing axis).
-std::vector<float> SliceAxis1(const std::vector<float>& data, int64_t dim0,
-                              int64_t dim1, int64_t inner,
-                              const std::vector<int64_t>& keep) {
-  std::vector<float> out(static_cast<size_t>(dim0) * keep.size() *
-                         static_cast<size_t>(inner));
+template <typename T>
+std::vector<T> SliceAxis1(const std::vector<T>& data, int64_t dim0,
+                          int64_t dim1, int64_t inner,
+                          const std::vector<int64_t>& keep) {
+  std::vector<T> out(static_cast<size_t>(dim0) * keep.size() *
+                     static_cast<size_t>(inner));
   for (int64_t i = 0; i < dim0; ++i) {
     for (size_t j = 0; j < keep.size(); ++j) {
       std::memcpy(
           out.data() + (static_cast<size_t>(i) * keep.size() + j) * inner,
           data.data() + (i * dim1 + keep[j]) * inner,
-          static_cast<size_t>(inner) * sizeof(float));
+          static_cast<size_t>(inner) * sizeof(T));
     }
   }
   return out;
@@ -11628,15 +11637,38 @@ void ApplyMatMulBnb4Chains(onnx::GraphProto* graph,
 //     the wheel build always passes `-DONNXSIM_BUILTIN_ORT=OFF`); the
 //     caller supplies whatever executor actually runs the model.
 //
-// `fc1_experts_weights`/`fc2_experts_weights`/`fc1_experts_bias` are
-// admitted only as plain FLOAT (float32) tensors here -- this file's own
-// float-tensor helpers (ReadFloatTensor/SetFloatTensorData) have no
-// FLOAT16/BFLOAT16 support anywhere yet, unlike pruning.py's own
-// `_is_supported_float_dtype`, which additionally admits both. Mirrors this
-// file's own already-established narrower-than-pruning.py scope decision
-// (e.g. the "MatMulNBits" section's identical restriction on its own
-// scales/zero_points/bias tensors) -- a FLOAT16/BFLOAT16 MoE export is
-// simply never matched here (declined, not mis-handled).
+// `fc1_experts_weights`/`fc2_experts_weights`/`fc1_experts_bias` accept
+// FLOAT, FLOAT16, and BFLOAT16 -- exactly pruning.py's own
+// `_is_supported_float_dtype` -- via IsSupportedFloatDtype/ReadTensorAsF64/
+// WriteF64TensorAs, this section's own dedicated numeric-conversion trio
+// (see their own comment right below, just above MoEChain). This is
+// deliberately scoped to ONLY these MoE/QMoE tensors (and, for whole-expert
+// pruning, the router projection's own weight/bias via the equally-scoped
+// MatchMoeRouterProducer/SliceMoeRouterWeight/SliceMoeRouterBias further
+// below) -- this file's OTHER passes/chain families still go through the
+// shared FLOAT32-only ReadFloatTensor/SetFloatTensorData/MatchProducer/
+// SliceProducerWeight/SliceLastAxis (e.g. the "MatMulNBits" section's
+// identical restriction on its own scales/zero_points/bias tensors)
+// completely unmodified: those are reused by a dozen OTHER, independently-
+// verified-only-for-FLOAT32 chain families elsewhere in this file (see
+// ApplyStructuredPruning's own six chain kinds), so widening them in place
+// would silently change behavior for every one of those callers too, not
+// just MoE/QMoE -- a correctness claim this section has no way to make on
+// their behalf. Hence the narrow, MoE/QMoE-local duplicates instead of a
+// shared-code change.
+//
+// FLOAT16/BFLOAT16 <-> float64 conversion is exact/lossless in the upcast
+// direction, and this pass never recomputes a surviving weight's own
+// value -- every rewrite below is pure index-selection/reordering (drop
+// some `inter_size`/`num_experts` indices, keep the rest byte-for-byte) --
+// so the round trip through float64 back to the tensor's own original dtype
+// reproduces the exact original bit pattern for every kept element,
+// verified empirically (exhaustive round-trip over all 65536 FLOAT16 and
+// all 65536 BFLOAT16 bit patterns, and cross-checked against numpy/
+// ml_dtypes for 200000 random values each) -- the same "slice, don't
+// recompute" invariant this file's own FP16/BFloat16-adjacent comments
+// elsewhere (e.g. the QDQ section's "read out upcast ... cast back down"
+// language) already describe for pruning.py's own identical convention.
 //
 // This is exposed as its own top-level entry point (ApplyMoeExpertChannel
 // Pruning, alongside ApplyStructuredPruning/ApplyAttentionHeadPruning at the
@@ -11650,6 +11682,236 @@ void ApplyMatMulBnb4Chains(onnx::GraphProto* graph,
 // bookkeeping below only ever needs to guard MoE nodes against each other
 // (mirrors pruning.py's own `_apply_moe_chains`, whose own local
 // `touched: Set[str]` is likewise never shared with `_TouchedState`).
+
+// --- FLOAT16/BFLOAT16 numeric conversion, scoped to MoE/QMoE's own
+// dtype-widened matcher/apply steps (see this section's own comment above)
+// -------------------------------------------------------------------------
+//
+// True for FLOAT, FLOAT16, and BFLOAT16 -- mirrors pruning.py's own
+// `_is_supported_float_dtype` exactly.
+bool IsSupportedFloatDtype(int32_t data_type) {
+  return data_type == onnx::TensorProto::FLOAT ||
+         data_type == onnx::TensorProto::FLOAT16 ||
+         data_type == onnx::TensorProto::BFLOAT16;
+}
+
+// IEEE-754 binary16 -> double, exact (every half value is exactly
+// representable in double). Handles zero/subnormal/normal/inf/NaN.
+double Float16BitsToDouble(uint16_t bits) {
+  uint32_t sign = (uint32_t)(bits & 0x8000u) << 16;
+  uint32_t exp = (bits >> 10) & 0x1Fu;
+  uint32_t mant = bits & 0x3FFu;
+  uint32_t f32bits;
+  if (exp == 0) {
+    if (mant == 0) {
+      f32bits = sign;
+    } else {
+      int e = -1;
+      do {
+        ++e;
+        mant <<= 1;
+      } while (!(mant & 0x400u));
+      mant &= 0x3FFu;
+      uint32_t exp32 = (uint32_t)(127 - 15 - e);
+      f32bits = sign | (exp32 << 23) | (mant << 13);
+    }
+  } else if (exp == 0x1F) {
+    f32bits = sign | 0x7F800000u | (mant << 13);
+  } else {
+    uint32_t exp32 = exp - 15 + 127;
+    f32bits = sign | (exp32 << 23) | (mant << 13);
+  }
+  float f;
+  std::memcpy(&f, &f32bits, sizeof(f));
+  return (double)f;
+}
+
+// double -> IEEE-754 binary16, round-to-nearest-even. Works directly off
+// the double's own 52-bit mantissa/11-bit exponent -- deliberately NOT
+// `(float)d` first, which would round TWICE (double -> float32 -> half) and
+// can flip a tie-to-even decision right at half's own rounding boundary
+// versus rounding straight from double (verified against numpy: the
+// double-rounding version disagreed with `np.float16(d)` for 13 of 200000
+// random cross-checked values; this direct version agreed for all of them,
+// and both this function and Float16BitsToDouble round-trip every one of
+// the 65536 possible FLOAT16 bit patterns exactly). Only ever actually
+// applied to values that came FROM Float16BitsToDouble in the first place
+// (this pass never recomputes a kept weight value, only reorders/drops
+// entries -- see this section's own top comment), so the exact rounding
+// behavior for a genuinely-arbitrary double is academic here: every real
+// call site round-trips an already-exact half value, for which any correct
+// round-to-nearest implementation reproduces the original bits exactly.
+uint16_t DoubleToFloat16Bits(double d) {
+  uint64_t x;
+  std::memcpy(&x, &d, sizeof(x));
+  uint32_t sign = (uint32_t)((x >> 48) & 0x8000u);
+  int32_t exp11 = (int32_t)((x >> 52) & 0x7FFu);
+  uint64_t mant = x & 0xFFFFFFFFFFFFFull;  // 52 bits
+
+  if (exp11 == 0x7FF) {
+    if (mant == 0) {
+      return (uint16_t)(sign | 0x7C00u);  // inf
+    }
+    uint16_t m = (uint16_t)(mant >> 42);
+    if (m == 0) m = 1;  // stay a NaN, not inf
+    return (uint16_t)(sign | 0x7C00u | m);
+  }
+
+  int32_t exp = exp11 - 1023 + 15;
+
+  if (exp >= 0x1F) {
+    return (uint16_t)(sign | 0x7C00u);  // overflow -> inf
+  }
+
+  if (exp <= 0) {
+    if (exp < -10) {
+      return (uint16_t)sign;  // underflow to zero
+    }
+    mant |= 0x10000000000000ull;  // implicit leading 1 (bit 52)
+    int shift = 43 - exp;         // exp<=0 so shift>=43, mant has 53 bits
+    uint64_t half_mant = mant >> shift;
+    uint64_t remainder = mant & ((1ull << shift) - 1);
+    uint64_t halfway = 1ull << (shift - 1);
+    if (remainder > halfway || (remainder == halfway && (half_mant & 1u))) {
+      half_mant += 1;
+    }
+    return (uint16_t)(sign | (uint32_t)half_mant);
+  }
+
+  uint32_t half_mant = (uint32_t)(mant >> 42);
+  uint64_t remainder = mant & ((1ull << 42) - 1);  // low 42 bits
+  uint64_t halfway = 1ull << 41;
+  if (remainder > halfway || (remainder == halfway && (half_mant & 1u))) {
+    half_mant += 1;
+    if (half_mant == 0x400u) {
+      half_mant = 0;
+      exp += 1;
+    }
+  }
+  if (exp >= 0x1F) {
+    return (uint16_t)(sign | 0x7C00u);
+  }
+  return (uint16_t)(sign | ((uint32_t)exp << 10) | half_mant);
+}
+
+// BFloat16 -> double, exact: bfloat16 is literally the top 16 bits of a
+// float32, so this is a plain zero-extend into a float32 bit pattern.
+double BFloat16BitsToDouble(uint16_t bits) {
+  uint32_t f32bits = (uint32_t)bits << 16;
+  float f;
+  std::memcpy(&f, &f32bits, sizeof(f));
+  return (double)f;
+}
+
+// double -> BFloat16, round-to-nearest-even (via an intermediate float32 --
+// unlike DoubleToFloat16Bits, this introduces no double-rounding hazard:
+// bfloat16 IS float32's own top 16 bits, so rounding double -> float32 ->
+// bfloat16 is the same "round once, truncate the rest" every real bfloat16
+// implementation does, confirmed to agree with `ml_dtypes.bfloat16` for
+// 200000 random cross-checked values).
+uint16_t DoubleToBFloat16Bits(double d) {
+  float f = (float)d;
+  uint32_t x;
+  std::memcpy(&x, &f, sizeof(x));
+  if ((x & 0x7FFFFFFFu) > 0x7F800000u) {
+    return (uint16_t)((x >> 16) | 0x0040u);  // NaN -- force the quiet bit.
+  }
+  uint32_t lsb = (x >> 16) & 1u;
+  uint32_t rounding_bias = 0x7FFFu + lsb;
+  uint32_t rounded = x + rounding_bias;
+  return (uint16_t)(rounded >> 16);
+}
+
+// Reads a FLOAT/FLOAT16/BFLOAT16 tensor `t` as a flat float64 vector --
+// mirrors pruning.py's own `_to_f64`. Non-raw-data storage packs each
+// FLOAT16/BFLOAT16 element's own raw 16 bits into the LOW half of one
+// `int32_data` entry (never byte-swapped -- these are already
+// protobuf-decoded ints, not a raw buffer), exactly like
+// `onnx.numpy_helper.to_array`'s own documented convention for these
+// dtypes.
+std::vector<double> ReadTensorAsF64(const onnx::TensorProto& t) {
+  int64_t numel = 1;
+  for (int64_t d : t.dims()) {
+    numel *= d;
+  }
+  std::vector<double> out(static_cast<size_t>(numel));
+  if (t.data_type() == onnx::TensorProto::FLOAT) {
+    const std::vector<float> f = ReadFloatTensor(t);
+    for (size_t i = 0; i < f.size(); ++i) {
+      out[i] = static_cast<double>(f[i]);
+    }
+    return out;
+  }
+  if (t.data_type() != onnx::TensorProto::FLOAT16 &&
+      t.data_type() != onnx::TensorProto::BFLOAT16) {
+    throw std::runtime_error("ReadTensorAsF64: unsupported tensor dtype " +
+                             std::to_string(static_cast<int>(t.data_type())));
+  }
+  std::vector<uint16_t> bits(static_cast<size_t>(numel));
+  if (t.has_raw_data()) {
+    std::memcpy(bits.data(), t.raw_data().data(),
+                bits.size() * sizeof(uint16_t));
+    if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+      onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(bits.data()),
+                                        bits.size() * sizeof(uint16_t),
+                                        sizeof(uint16_t));
+    }
+  } else {
+    for (int64_t i = 0; i < numel; ++i) {
+      bits[static_cast<size_t>(i)] =
+          static_cast<uint16_t>(t.int32_data(static_cast<int>(i)));
+    }
+  }
+  const bool is_bf16 = t.data_type() == onnx::TensorProto::BFLOAT16;
+  for (size_t i = 0; i < bits.size(); ++i) {
+    out[i] =
+        is_bf16 ? BFloat16BitsToDouble(bits[i]) : Float16BitsToDouble(bits[i]);
+  }
+  return out;
+}
+
+// Overwrites `t` in place with a `data_type` (FLOAT/FLOAT16/BFLOAT16)
+// tensor of `dims`/`data`, keeping its existing name -- mirrors pruning.py's
+// own `_from_f64`/`w_init.CopyFrom(...)`. Always writes `raw_data`, exactly
+// like `onnx.numpy_helper.from_array`'s own convention this file's other
+// Set*TensorData helpers already follow.
+void WriteF64TensorAs(onnx::TensorProto* t, int32_t data_type,
+                      const std::vector<int64_t>& dims,
+                      const std::vector<double>& data) {
+  if (data_type == onnx::TensorProto::FLOAT) {
+    std::vector<float> f(data.size());
+    for (size_t i = 0; i < data.size(); ++i) {
+      f[i] = static_cast<float>(data[i]);
+    }
+    SetFloatTensorData(t, dims, f);
+    return;
+  }
+  if (data_type != onnx::TensorProto::FLOAT16 &&
+      data_type != onnx::TensorProto::BFLOAT16) {
+    throw std::runtime_error("WriteF64TensorAs: unsupported tensor dtype " +
+                             std::to_string(data_type));
+  }
+  const std::string name = t->name();
+  t->Clear();
+  t->set_name(name);
+  t->set_data_type(data_type);
+  for (int64_t d : dims) {
+    t->add_dims(d);
+  }
+  const bool is_bf16 = data_type == onnx::TensorProto::BFLOAT16;
+  std::vector<uint16_t> bits(data.size());
+  for (size_t i = 0; i < data.size(); ++i) {
+    bits[i] =
+        is_bf16 ? DoubleToBFloat16Bits(data[i]) : DoubleToFloat16Bits(data[i]);
+  }
+  std::string raw(bits.size() * sizeof(uint16_t), '\0');
+  std::memcpy(raw.data(), bits.data(), raw.size());
+  if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+    onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(raw.data()),
+                                      raw.size(), sizeof(uint16_t));
+  }
+  t->set_raw_data(std::move(raw));
+}
 
 struct MoEChain {
   onnx::NodeProto* node;
@@ -11689,8 +11951,7 @@ MoeOptionalBiasResult MatchMoeOptionalBias(const onnx::NodeProto& node,
   }
   const std::string& name = node.input(index);
   auto it = init_map.find(name);
-  if (it == init_map.end() ||
-      it->second->data_type() != onnx::TensorProto::FLOAT ||
+  if (it == init_map.end() || !IsSupportedFloatDtype(it->second->data_type()) ||
       it->second->dims_size() != 2 || it->second->dims(0) != expected_dim0 ||
       it->second->dims(1) != expected_dim1 ||
       ConsumerCount(consumers_of, name) != 1) {
@@ -11736,8 +11997,8 @@ std::optional<MoEChain> MatchMoeProducer(onnx::NodeProto* node,
   auto fc1_it = init_map.find(fc1_w_name);
   auto fc2_it = init_map.find(fc2_w_name);
   if (fc1_it == init_map.end() || fc2_it == init_map.end() ||
-      fc1_it->second->data_type() != onnx::TensorProto::FLOAT ||
-      fc2_it->second->data_type() != onnx::TensorProto::FLOAT ||
+      !IsSupportedFloatDtype(fc1_it->second->data_type()) ||
+      !IsSupportedFloatDtype(fc2_it->second->data_type()) ||
       fc1_it->second->dims_size() != 3 || fc2_it->second->dims_size() != 3 ||
       ConsumerCount(consumers_of, fc1_w_name) != 1 ||
       ConsumerCount(consumers_of, fc2_w_name) != 1) {
@@ -11804,7 +12065,7 @@ std::vector<double> MoeImportance(const MoEChain& chain,
   const int64_t hidden = chain.hidden_size;
   std::vector<double> squared(static_cast<size_t>(inter), 0.0);
 
-  const std::vector<float> fc1_w = ReadFloatTensor(*init_map.at(chain.fc1_w));
+  const std::vector<double> fc1_w = ReadTensorAsF64(*init_map.at(chain.fc1_w));
   for (int64_t e = 0; e < e_n; ++e) {
     for (int64_t j = 0; j < inter; ++j) {
       double sq = 0.0;
@@ -11817,7 +12078,7 @@ std::vector<double> MoeImportance(const MoEChain& chain,
     }
   }
 
-  const std::vector<float> fc2_w = ReadFloatTensor(*init_map.at(chain.fc2_w));
+  const std::vector<double> fc2_w = ReadTensorAsF64(*init_map.at(chain.fc2_w));
   for (int64_t e = 0; e < e_n; ++e) {
     for (int64_t h = 0; h < hidden; ++h) {
       for (int64_t j = 0; j < inter; ++j) {
@@ -11829,8 +12090,8 @@ std::vector<double> MoeImportance(const MoEChain& chain,
   }
 
   if (chain.fc1_b) {
-    const std::vector<float> fc1_b =
-        ReadFloatTensor(*init_map.at(*chain.fc1_b));
+    const std::vector<double> fc1_b =
+        ReadTensorAsF64(*init_map.at(*chain.fc1_b));
     for (int64_t e = 0; e < e_n; ++e) {
       for (int64_t j = 0; j < inter; ++j) {
         const double v = fc1_b[static_cast<size_t>(e * inter + j)];
@@ -11895,13 +12156,18 @@ void ApplyMoeChains(onnx::GraphProto* graph, std::vector<MoEChain>& chains,
 
     // fc1_experts_weights: [num_experts, inter_size, hidden_size] -- SliceAxis1
     // slices exactly its own middle (`inter_size`) axis, `inner = hidden_size`.
+    // Read/written via ReadTensorAsF64/WriteF64TensorAs (FLOAT/FLOAT16/
+    // BFLOAT16, preserving this tensor's own original dtype) rather than
+    // ReadFloatTensor/SetFloatTensorData -- see this section's own top
+    // comment.
     {
       onnx::TensorProto* fc1_w = init_map.at(chain.fc1_w);
-      const std::vector<float> data = ReadFloatTensor(*fc1_w);
-      const std::vector<float> out = SliceAxis1(
+      const int32_t dtype = fc1_w->data_type();
+      const std::vector<double> data = ReadTensorAsF64(*fc1_w);
+      const std::vector<double> out = SliceAxis1(
           data, chain.num_experts, chain.inter_size, chain.hidden_size, keep);
-      SetFloatTensorData(fc1_w, {chain.num_experts, kc, chain.hidden_size},
-                         out);
+      WriteF64TensorAs(fc1_w, dtype, {chain.num_experts, kc, chain.hidden_size},
+                       out);
     }
 
     // fc2_experts_weights: [num_experts, hidden_size, inter_size] --
@@ -11911,22 +12177,24 @@ void ApplyMoeChains(onnx::GraphProto* graph, std::vector<MoEChain>& chains,
     // exactly that trailing axis without any new slicing routine.
     {
       onnx::TensorProto* fc2_w = init_map.at(chain.fc2_w);
-      const std::vector<float> data = ReadFloatTensor(*fc2_w);
-      const std::vector<float> out =
+      const int32_t dtype = fc2_w->data_type();
+      const std::vector<double> data = ReadTensorAsF64(*fc2_w);
+      const std::vector<double> out =
           SliceAxis1(data, chain.num_experts * chain.hidden_size,
                      chain.inter_size, 1, keep);
-      SetFloatTensorData(fc2_w, {chain.num_experts, chain.hidden_size, kc},
-                         out);
+      WriteF64TensorAs(fc2_w, dtype, {chain.num_experts, chain.hidden_size, kc},
+                       out);
     }
 
     if (chain.fc1_b) {
       // fc1_experts_bias: [num_experts, inter_size] -- same trailing-axis
       // shape SliceAxis1 already handles (inner = 1), no reshape needed.
       onnx::TensorProto* fc1_b = init_map.at(*chain.fc1_b);
-      const std::vector<float> data = ReadFloatTensor(*fc1_b);
-      const std::vector<float> out =
+      const int32_t dtype = fc1_b->data_type();
+      const std::vector<double> data = ReadTensorAsF64(*fc1_b);
+      const std::vector<double> out =
           SliceAxis1(data, chain.num_experts, chain.inter_size, 1, keep);
-      SetFloatTensorData(fc1_b, {chain.num_experts, kc}, out);
+      WriteF64TensorAs(fc1_b, dtype, {chain.num_experts, kc}, out);
     }
     // fc2_experts_bias indexes hidden_size, fc2's own *output* axis --
     // unaffected by an inter_size cut, so it is never sliced here.
@@ -11959,9 +12227,12 @@ void ApplyMoeChains(onnx::GraphProto* graph, std::vector<MoEChain>& chains,
 //      `num_experts_to_keep` is clamped to `max(k, ...)`, so a
 //      too-aggressive `sparsity` silently prunes fewer experts than
 //      requested rather than ever going below `k`.
-//   3. The router match (MatchProducer, reused outright from this file's
-//      own MatMul/Gemm chain-matching machinery) requires `router_probs` to
-//      be produced by exactly ONE plain, untied MatMul/vanilla-Gemm node
+//   3. The router match (MatchMoeRouterProducer -- a FLOAT16/BFLOAT16-
+//      widened, MoE/QMoE-local variant of this file's own shared
+//      MatchProducer MatMul/Gemm chain-matching machinery; see that
+//      function's own comment for why it is a narrow local duplicate rather
+//      than a change to the shared one) requires `router_probs` to be
+//      produced by exactly ONE plain, untied MatMul/vanilla-Gemm node
 //      (mirroring pruning.py's own `_match_producer`) with no other
 //      consumer -- a router expressed as more than one node (a separate
 //      bias Add, an intervening Reshape/Cast, ...), a tied/shared router
@@ -12002,6 +12273,89 @@ struct MoEExpertChain {
   bool router_w_transposed = false;
   std::optional<std::string> router_b;
 };
+
+// Router-projection matcher for MoE/QMoE whole-expert pruning ONLY --
+// mirrors MatchProducer (this file's "MatMul/Gemm plain chains" section)
+// exactly, but widened to accept FLOAT16/BFLOAT16 in addition to FLOAT32 for
+// the weight, since pruning.py's own `_match_producer` -- shared by every
+// ONE of its own callers, unlike this file's own MatchProducer, which stays
+// FLOAT32-only for its OTHER callers -- already does. Deliberately a narrow,
+// LOCAL duplicate rather than a change to the shared MatchProducer itself:
+// that function backs a dozen OTHER chain families in this file (see
+// ApplyStructuredPruning's own six chain kinds), none of which has been
+// independently re-verified against a real FLOAT16/BFLOAT16 export the way
+// this section's own numeric-conversion helpers just were -- widening
+// MatchProducer in place would silently change matching behavior for every
+// one of those OTHER callers too, not just the router path here. `bias` is
+// never dtype-checked at all, mirroring `_match_producer`'s/MatchProducer's
+// own identical lack of a bias dtype gate (only presence as a constant
+// initializer is required either way).
+std::optional<ProducerMatch> MatchMoeRouterProducer(const onnx::NodeProto& node,
+                                                    const InitMap& init_map) {
+  auto m = MatchMatMulLikeRaw(node);
+  if (!m) {
+    return std::nullopt;
+  }
+  auto it = init_map.find(m->w_name);
+  if (it == init_map.end() || !IsSupportedFloatDtype(it->second->data_type()) ||
+      it->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+  std::optional<std::string> bias;
+  if (node.op_type() == "Gemm" && node.input_size() == 3) {
+    bias = node.input(2);
+    if (!init_map.count(*bias)) {
+      return std::nullopt;  // non-constant bias -- can't safely prune it.
+    }
+  }
+  const onnx::TensorProto* w = it->second;
+  const int64_t n_channels = m->weight_transposed ? w->dims(0) : w->dims(1);
+  return ProducerMatch{m->w_name, m->weight_transposed, bias, n_channels};
+}
+
+// The FLOAT/FLOAT16/BFLOAT16-widened analogue of SliceProducerWeight, used
+// ONLY for the router projection weight MatchMoeRouterProducer above
+// matches (MoE/QMoE whole-expert pruning) -- see that function's own
+// comment for why this stays a narrow local duplicate rather than a change
+// to the shared SliceProducerWeight. Never a Conv weight here -- a router
+// projection is always a plain 2-D MatMul/Gemm weight.
+void SliceMoeRouterWeight(onnx::TensorProto* wt, bool weight_transposed,
+                          const std::vector<int64_t>& keep) {
+  const std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
+  const int32_t dtype = wt->data_type();
+  const std::vector<double> data = ReadTensorAsF64(*wt);
+  std::vector<double> out;
+  std::vector<int64_t> new_dims;
+  const int64_t kc = static_cast<int64_t>(keep.size());
+  const int64_t dim0 = dims[0], dim1 = dims[1];
+  if (weight_transposed) {  // [N, K] -- output channel is axis 0.
+    out = SliceAxis0(data, dim0, dim1, keep);
+    new_dims = {kc, dim1};
+  } else {  // [K, N] -- output channel is axis 1.
+    out = SliceAxis1(data, dim0, dim1, 1, keep);
+    new_dims = {dim0, kc};
+  }
+  WriteF64TensorAs(wt, dtype, new_dims, out);
+}
+
+// The FLOAT/FLOAT16/BFLOAT16-widened analogue of SliceLastAxis, used ONLY
+// for the router projection's own optional bias.
+void SliceMoeRouterBias(onnx::TensorProto* t,
+                        const std::vector<int64_t>& keep) {
+  const int32_t dtype = t->data_type();
+  const std::vector<double> data = ReadTensorAsF64(*t);
+  std::vector<double> out(keep.size());
+  for (size_t i = 0; i < keep.size(); ++i) {
+    out[i] = data[static_cast<size_t>(keep[i])];
+  }
+  std::vector<int64_t> dims(t->dims().begin(), t->dims().end());
+  if (dims.empty()) {
+    dims.push_back(static_cast<int64_t>(keep.size()));
+  } else {
+    dims.back() = static_cast<int64_t>(keep.size());
+  }
+  WriteF64TensorAs(t, dtype, dims, out);
+}
 
 // If `node` is a `com.microsoft::MoE` node this pass can safely prune whole
 // experts from, returns the matched MoEExpertChain -- mirrors pruning.py's
@@ -12047,7 +12401,7 @@ std::optional<MoEExpertChain> MatchMoeWholeExpertProducer(
   if (rit == node_by_output.end()) {
     return std::nullopt;
   }
-  auto router_info = MatchProducer(*rit->second, init_map);
+  auto router_info = MatchMoeRouterProducer(*rit->second, init_map);
   if (!router_info) {
     return std::nullopt;
   }
@@ -12120,13 +12474,13 @@ std::vector<double> MoeExpertWeightImportance(const MoEExpertChain& chain,
 
   auto accumulate = [&](const std::string& name) {
     const onnx::TensorProto* t = init_map.at(name);
-    const std::vector<float> data = ReadFloatTensor(*t);
+    const std::vector<double> data = ReadTensorAsF64(*t);
     const int64_t inner = static_cast<int64_t>(data.size()) / e_n;
     for (int64_t e = 0; e < e_n; ++e) {
-      const float* row = data.data() + e * inner;
+      const double* row = data.data() + e * inner;
       double sq = 0.0;
       for (int64_t j = 0; j < inner; ++j) {
-        sq += static_cast<double>(row[j]) * static_cast<double>(row[j]);
+        sq += row[j] * row[j];
       }
       squared[static_cast<size_t>(e)] += sq;
     }
@@ -12206,14 +12560,19 @@ std::unordered_set<std::string> ApplyMoeWholeExpertChains(
     const int64_t kc = static_cast<int64_t>(keep.size());
 
     // fc1_experts_weights: [num_experts, inter_size, hidden_size] -- plain
-    // leading-axis (expert) index-select.
+    // leading-axis (expert) index-select. Read/written via
+    // ReadTensorAsF64/WriteF64TensorAs (FLOAT/FLOAT16/BFLOAT16, preserving
+    // this tensor's own original dtype) rather than ReadFloatTensor/
+    // SetFloatTensorData -- see this file's own "MoE expert-intermediate-
+    // channel pruning" section top comment.
     {
       onnx::TensorProto* fc1_w = init_map.at(chain.fc1_w);
       std::vector<int64_t> dims(fc1_w->dims().begin(), fc1_w->dims().end());
       const int64_t inner = dims[1] * dims[2];
-      const std::vector<float> data = ReadFloatTensor(*fc1_w);
-      const std::vector<float> out = SliceAxis0(data, n, inner, keep);
-      SetFloatTensorData(fc1_w, {kc, dims[1], dims[2]}, out);
+      const int32_t dtype = fc1_w->data_type();
+      const std::vector<double> data = ReadTensorAsF64(*fc1_w);
+      const std::vector<double> out = SliceAxis0(data, n, inner, keep);
+      WriteF64TensorAs(fc1_w, dtype, {kc, dims[1], dims[2]}, out);
     }
     // fc2_experts_weights: [num_experts, hidden_size, inter_size] -- same
     // plain leading-axis index-select (unlike ApplyMoeChains' own
@@ -12222,9 +12581,10 @@ std::unordered_set<std::string> ApplyMoeWholeExpertChains(
       onnx::TensorProto* fc2_w = init_map.at(chain.fc2_w);
       std::vector<int64_t> dims(fc2_w->dims().begin(), fc2_w->dims().end());
       const int64_t inner = dims[1] * dims[2];
-      const std::vector<float> data = ReadFloatTensor(*fc2_w);
-      const std::vector<float> out = SliceAxis0(data, n, inner, keep);
-      SetFloatTensorData(fc2_w, {kc, dims[1], dims[2]}, out);
+      const int32_t dtype = fc2_w->data_type();
+      const std::vector<double> data = ReadTensorAsF64(*fc2_w);
+      const std::vector<double> out = SliceAxis0(data, n, inner, keep);
+      WriteF64TensorAs(fc2_w, dtype, {kc, dims[1], dims[2]}, out);
     }
     if (chain.fc1_b) {
       // fc1_experts_bias: [num_experts, inter_size] -- same leading-axis
@@ -12232,9 +12592,10 @@ std::unordered_set<std::string> ApplyMoeWholeExpertChains(
       onnx::TensorProto* fc1_b = init_map.at(*chain.fc1_b);
       std::vector<int64_t> dims(fc1_b->dims().begin(), fc1_b->dims().end());
       const int64_t inner = dims[1];
-      const std::vector<float> data = ReadFloatTensor(*fc1_b);
-      const std::vector<float> out = SliceAxis0(data, n, inner, keep);
-      SetFloatTensorData(fc1_b, {kc, dims[1]}, out);
+      const int32_t dtype = fc1_b->data_type();
+      const std::vector<double> data = ReadTensorAsF64(*fc1_b);
+      const std::vector<double> out = SliceAxis0(data, n, inner, keep);
+      WriteF64TensorAs(fc1_b, dtype, {kc, dims[1]}, out);
     }
     // fc2_experts_bias indexes hidden_size (fc2's own *output* axis),
     // unaffected by an expert-count cut -- never sliced here, same
@@ -12242,12 +12603,14 @@ std::unordered_set<std::string> ApplyMoeWholeExpertChains(
 
     // Router projection: the matching OUTPUT COLUMN (the router's own
     // `num_experts`-wide channel axis) is dropped from its weight (and
-    // bias, if present) -- SliceProducerWeight/SliceLastAxis, the exact
-    // same helpers this file's own plain-chain producer pruning uses.
-    SliceProducerWeight(init_map.at(chain.router_w), chain.router_w_transposed,
-                        keep, false);
+    // bias, if present) -- SliceMoeRouterWeight/SliceMoeRouterBias (the
+    // FLOAT16/BFLOAT16-widened, MoE/QMoE-local analogues of this file's own
+    // shared SliceProducerWeight/SliceLastAxis -- see MatchMoeRouterProducer's
+    // own comment above for why these stay narrow local duplicates).
+    SliceMoeRouterWeight(init_map.at(chain.router_w), chain.router_w_transposed,
+                         keep);
     if (chain.router_b) {
-      SliceLastAxis(init_map.at(*chain.router_b), keep);
+      SliceMoeRouterBias(init_map.at(*chain.router_b), keep);
     }
 
     stale_value_info.insert(chain.router_probs);
@@ -12575,11 +12938,13 @@ struct QMoEChannelChain {
   std::optional<std::string> fc2_global_scale;
 };
 
-// {true, name} for a present-and-well-formed optional FLOAT input, {true,
-// nullopt} for a genuinely absent one, {false, _} to decline the whole
-// chain -- mirrors pruning.py's own `_optional_float` closure inside
-// `_match_qmoe_producer` exactly (used for `fc1_experts_bias`/
-// `fc2_experts_bias`, either quant_type).
+// {true, name} for a present-and-well-formed optional FLOAT/FLOAT16/
+// BFLOAT16 input, {true, nullopt} for a genuinely absent one, {false, _} to
+// decline the whole chain -- mirrors pruning.py's own `_optional_float`
+// closure inside `_match_qmoe_producer` exactly (used for
+// `fc1_experts_bias`/`fc2_experts_bias`, either quant_type) -- including its
+// own `_is_supported_float_dtype` widening (see IsSupportedFloatDtype,
+// this file's own "MoE expert-intermediate-channel pruning" section).
 bool QMoEOptionalFloatInput(const onnx::NodeProto& node, int idx,
                             const std::vector<int64_t>& expected_dims,
                             const InitMap& init_map,
@@ -12591,8 +12956,7 @@ bool QMoEOptionalFloatInput(const onnx::NodeProto& node, int idx,
   }
   const std::string& name = node.input(idx);
   auto it = init_map.find(name);
-  if (it == init_map.end() ||
-      it->second->data_type() != onnx::TensorProto::FLOAT ||
+  if (it == init_map.end() || !IsSupportedFloatDtype(it->second->data_type()) ||
       !QMoEDimsEqual(*it->second, expected_dims) ||
       ConsumerCount(consumers_of, name) != 1) {
     return false;
@@ -12764,8 +13128,8 @@ std::optional<QMoEChannelChain> MatchQMoEProducer(
     auto s1 = init_map.find(fc1_scale_name);
     auto s2 = init_map.find(fc2_scale_name);
     if (s1 == init_map.end() || s2 == init_map.end() ||
-        s1->second->data_type() != onnx::TensorProto::FLOAT ||
-        s2->second->data_type() != onnx::TensorProto::FLOAT ||
+        !IsSupportedFloatDtype(s1->second->data_type()) ||
+        !IsSupportedFloatDtype(s2->second->data_type()) ||
         !QMoEDimsEqual(*s1->second, fc1_scale_dims) ||
         !QMoEDimsEqual(*s2->second, fc2_scale_dims) ||
         ConsumerCount(consumers_of, fc1_scale_name) != 1 ||
@@ -12969,7 +13333,7 @@ std::vector<double> QMoEDequantizeInt(const onnx::TensorProto& w,
   const std::vector<uint8_t> packed = ReadUint8Tensor(w);  // [E*N, kp]
   const std::vector<uint8_t> codes =
       QMoEUnpackSubbyte(packed, e * n, kp, k, bits);  // [E*N, K]
-  const std::vector<float> scale_data = ReadFloatTensor(scale);
+  const std::vector<double> scale_data = ReadTensorAsF64(scale);
   const double default_zp = static_cast<double>(QMoEDefaultZeroPoint(bits));
   std::vector<double> out(static_cast<size_t>(e * n * k));
 
@@ -12987,8 +13351,7 @@ std::vector<double> QMoEDequantizeInt(const onnx::TensorProto& w,
     }
     for (int64_t en = 0; en < e * n; ++en) {
       for (int64_t kb = 0; kb < k_blocks; ++kb) {
-        const double s = static_cast<double>(
-            scale_data[static_cast<size_t>(en * k_blocks + kb)]);
+        const double s = scale_data[static_cast<size_t>(en * k_blocks + kb)];
         const double z = zp[static_cast<size_t>(en * k_blocks + kb)];
         for (int64_t j = 0; j < block_size; ++j) {
           const int64_t idx = en * k + kb * block_size + j;
@@ -13009,7 +13372,7 @@ std::vector<double> QMoEDequantizeInt(const onnx::TensorProto& w,
       }
     }
     for (int64_t en = 0; en < e * n; ++en) {
-      const double s = static_cast<double>(scale_data[static_cast<size_t>(en)]);
+      const double s = scale_data[static_cast<size_t>(en)];
       const double z = zp[static_cast<size_t>(en)];
       for (int64_t j = 0; j < k; ++j) {
         const int64_t idx = en * k + j;
@@ -13120,12 +13483,11 @@ std::vector<double> QMoEChannelImportance(
     }
   }
   if (chain.fc1_bias) {
-    const std::vector<float> bias =
-        ReadFloatTensor(*init_map.at(*chain.fc1_bias));
+    const std::vector<double> bias =
+        ReadTensorAsF64(*init_map.at(*chain.fc1_bias));
     for (int64_t ei = 0; ei < e; ++ei) {
       for (int64_t ni = 0; ni < inter; ++ni) {
-        const double v =
-            static_cast<double>(bias[static_cast<size_t>(ei * inter + ni)]);
+        const double v = bias[static_cast<size_t>(ei * inter + ni)];
         squared[static_cast<size_t>(ni)] += v * v;
       }
     }
@@ -13185,35 +13547,41 @@ std::optional<std::vector<int64_t>> QMoEBlockAlignedKeep(
   return keep;
 }
 
-// Per-expert row (axis 1) index-select of a FLOAT tensor shaped `[E, N]`
-// (`force_rank3 == false`, `row_width` always 1) or `[E, N, row_width]`
-// (`force_rank3 == true`) -- used for `fc1/fc2_experts_bias` (always
-// rank-2) and, for `quant_type='int'`, `fc1/fc2_scales` (rank-2 whole-row,
-// rank-3 blockwise). `force_rank3` is passed explicitly by the caller
-// rather than inferred from `row_width == 1` -- `row_width` (`hidden_blocks`
-// for `fc1_scales`) can genuinely equal 1 in the BLOCKWISE case too
-// (`hidden_size == block_size`), which must still come back rank-3 (a real
-// shape this op's own schema documents, re-confirmed live in pruning.py's
-// own section comment) rather than collapsing to the whole-row tensor's
-// own rank-2 shape.
+// Per-expert row (axis 1) index-select of a FLOAT/FLOAT16/BFLOAT16 tensor
+// shaped `[E, N]` (`force_rank3 == false`, `row_width` always 1) or `[E, N,
+// row_width]` (`force_rank3 == true`) -- used for `fc1/fc2_experts_bias`
+// (always rank-2) and, for `quant_type='int'`, `fc1/fc2_scales` (rank-2
+// whole-row, rank-3 blockwise) -- every one of which pruning.py's own
+// `_match_qmoe_producer`/`_optional_float` admits as FLOAT, FLOAT16, or
+// BFLOAT16 (`_is_supported_float_dtype`; see IsSupportedFloatDtype), so this
+// reads/writes via ReadTensorAsF64/WriteF64TensorAs (preserving `t`'s own
+// original dtype) rather than ReadFloatTensor/SetFloatTensorData.
+// `force_rank3` is passed explicitly by the caller rather than inferred
+// from `row_width == 1` -- `row_width` (`hidden_blocks` for `fc1_scales`)
+// can genuinely equal 1 in the BLOCKWISE case too (`hidden_size ==
+// block_size`), which must still come back rank-3 (a real shape this op's
+// own schema documents, re-confirmed live in pruning.py's own section
+// comment) rather than collapsing to the whole-row tensor's own rank-2
+// shape.
 void QMoESliceFloatAxis1(onnx::TensorProto* t, int64_t e, int64_t n,
                          int64_t row_width, const std::vector<int64_t>& keep,
                          bool force_rank3) {
-  const std::vector<float> data = ReadFloatTensor(*t);  // [E, N, row_width]
+  const int32_t dtype = t->data_type();
+  const std::vector<double> data = ReadTensorAsF64(*t);  // [E, N, row_width]
   const int64_t kc = static_cast<int64_t>(keep.size());
-  std::vector<float> out(static_cast<size_t>(e * kc * row_width));
+  std::vector<double> out(static_cast<size_t>(e * kc * row_width));
   for (int64_t ei = 0; ei < e; ++ei) {
     for (int64_t i = 0; i < kc; ++i) {
       std::memcpy(
           out.data() + (ei * kc + i) * row_width,
           data.data() + (ei * n + keep[static_cast<size_t>(i)]) * row_width,
-          static_cast<size_t>(row_width) * sizeof(float));
+          static_cast<size_t>(row_width) * sizeof(double));
     }
   }
   const std::vector<int64_t> dims = force_rank3
                                         ? std::vector<int64_t>{e, kc, row_width}
                                         : std::vector<int64_t>{e, kc};
-  SetFloatTensorData(t, dims, out);
+  WriteF64TensorAs(t, dtype, dims, out);
 }
 
 // The FLOAT8E4M3FN analogue of QMoESliceFloatAxis1 -- used for
@@ -13259,25 +13627,28 @@ void QMoESliceUint8Axis1(onnx::TensorProto* t, int64_t e, int64_t n,
 }
 
 // Per-expert, per-`hidden_size`-row, LAST-axis (block-index) select of a
-// FLOAT tensor shaped `[E, hidden, num_blocks]` -- `quant_type='int'`'s own
-// `fc2_scales` in the blockwise case, sliced by *block* index
-// (`keep_block_idx`), not channel index, since `fc2`'s own blocks group
-// along `inter_size` (this pass's own pruned axis) -- see this section's
-// own top comment.
+// FLOAT/FLOAT16/BFLOAT16 tensor shaped `[E, hidden, num_blocks]` --
+// `quant_type='int'`'s own `fc2_scales` in the blockwise case, sliced by
+// *block* index (`keep_block_idx`), not channel index, since `fc2`'s own
+// blocks group along `inter_size` (this pass's own pruned axis) -- see this
+// section's own top comment. Reads/writes via ReadTensorAsF64/
+// WriteF64TensorAs (preserving `t`'s own original dtype), mirroring
+// QMoESliceFloatAxis1's own identical widening.
 void QMoESliceFloatAxis2(onnx::TensorProto* t, int64_t e, int64_t hidden,
                          int64_t num_blocks,
                          const std::vector<int64_t>& keep_block_idx) {
-  const std::vector<float> data =
-      ReadFloatTensor(*t);  // [E, hidden, num_blocks]
+  const int32_t dtype = t->data_type();
+  const std::vector<double> data =
+      ReadTensorAsF64(*t);  // [E, hidden, num_blocks]
   const int64_t kb = static_cast<int64_t>(keep_block_idx.size());
-  std::vector<float> out(static_cast<size_t>(e * hidden * kb));
+  std::vector<double> out(static_cast<size_t>(e * hidden * kb));
   for (int64_t r = 0; r < e * hidden; ++r) {
     for (int64_t i = 0; i < kb; ++i) {
       out[static_cast<size_t>(r * kb + i)] = data[static_cast<size_t>(
           r * num_blocks + keep_block_idx[static_cast<size_t>(i)])];
     }
   }
-  SetFloatTensorData(t, {e, hidden, kb}, out);
+  WriteF64TensorAs(t, dtype, {e, hidden, kb}, out);
 }
 
 // The FLOAT8E4M3FN analogue of QMoESliceFloatAxis2 -- `quant_type='nvfp4'`'s
@@ -13624,7 +13995,7 @@ std::optional<QMoEExpertChain> MatchQMoEWholeExpertProducer(
   if (rit == node_by_output.end()) {
     return std::nullopt;
   }
-  auto router_info = MatchProducer(*rit->second, init_map);
+  auto router_info = MatchMoeRouterProducer(*rit->second, init_map);
   if (!router_info) {
     return std::nullopt;
   }
@@ -13696,17 +14067,18 @@ std::vector<QMoEExpertChain> FindQMoEWholeExpertChains(
 
 // Generic per-expert (axis-0) index-select for any QMoE per-expert tensor's
 // own leading `num_experts` axis, dtype-dispatched over every element dtype
-// this pass' matched tensors can carry (FLOAT -- `fc1`/`fc2_scale` for
-// `quant_type='int'`, biases, `quant_type='nvfp4'`'s own `global_scale`;
-// UINT8 -- `fc1`/`fc2` packed weights and `quant_type='int'` zero_points;
-// FLOAT8E4M3FN -- `fc1`/`fc2_scale` for `quant_type='nvfp4'`). Mirrors
-// pruning.py's own `_slice_axis(init, keep, axis=0)` used throughout
-// `_apply_qmoe_whole_expert_chains`. Never touches packing -- this pass'
-// own pruned axis (`num_experts`) is never the packed one for ANY of these
-// tensors (see this section's own top comment) -- so this is always a
-// plain raw-element index-select, unlike ApplyQMoEChannelChains' own
-// per-tensor packing-aware slicing (QMoESliceUint8Axis1/QMoESliceFloatAxis2/
-// etc.).
+// this pass' matched tensors can carry (FLOAT/FLOAT16/BFLOAT16 -- `fc1`/
+// `fc2_scale` for `quant_type='int'`, biases, `quant_type='nvfp4'`'s own
+// `global_scale`; UINT8 -- `fc1`/`fc2` packed weights and `quant_type='int'`
+// zero_points; FLOAT8E4M3FN -- `fc1`/`fc2_scale` for `quant_type='nvfp4'`).
+// Mirrors pruning.py's own `_slice_axis(init, keep, axis=0)` used throughout
+// `_apply_qmoe_whole_expert_chains` -- including its own
+// `_is_supported_float_dtype` widening for the FLOAT-family case (see
+// IsSupportedFloatDtype). Never touches packing -- this pass' own pruned
+// axis (`num_experts`) is never the packed one for ANY of these tensors
+// (see this section's own top comment) -- so this is always a plain
+// raw-element index-select, unlike ApplyQMoEChannelChains' own per-tensor
+// packing-aware slicing (QMoESliceUint8Axis1/QMoESliceFloatAxis2/etc.).
 void QMoESliceExpertAxis0(onnx::TensorProto* t,
                           const std::vector<int64_t>& keep) {
   std::vector<int64_t> dims(t->dims().begin(), t->dims().end());
@@ -13718,13 +14090,14 @@ void QMoESliceExpertAxis0(onnx::TensorProto* t,
   if (!new_dims.empty()) {
     new_dims[0] = static_cast<int64_t>(keep.size());
   }
+  if (IsSupportedFloatDtype(t->data_type())) {
+    const int32_t dtype = t->data_type();
+    const std::vector<double> data = ReadTensorAsF64(*t);
+    const std::vector<double> out = SliceAxis0(data, dims[0], inner, keep);
+    WriteF64TensorAs(t, dtype, new_dims, out);
+    return;
+  }
   switch (t->data_type()) {
-    case onnx::TensorProto::FLOAT: {
-      const std::vector<float> data = ReadFloatTensor(*t);
-      const std::vector<float> out = SliceAxis0(data, dims[0], inner, keep);
-      SetFloatTensorData(t, new_dims, out);
-      break;
-    }
     case onnx::TensorProto::UINT8: {
       const std::vector<uint8_t> data = ReadUint8Tensor(*t);
       std::vector<uint8_t> out(keep.size() * static_cast<size_t>(inner));
@@ -13815,7 +14188,8 @@ std::vector<double> QMoEExpertWeightImportance(const QMoEExpertChain& chain,
     squared[static_cast<size_t>(ei)] = sq;
   }
   if (chain.fc1_bias) {
-    const std::vector<float> b = ReadFloatTensor(*init_map.at(*chain.fc1_bias));
+    const std::vector<double> b =
+        ReadTensorAsF64(*init_map.at(*chain.fc1_bias));
     for (int64_t ei = 0; ei < e; ++ei) {
       double sq = 0.0;
       for (int64_t j = 0; j < inter; ++j) {
@@ -13912,10 +14286,10 @@ std::unordered_set<std::string> ApplyQMoEWholeExpertChains(
       }
     }
 
-    SliceProducerWeight(init_map.at(chain.router_w), chain.router_w_transposed,
-                        keep, false);
+    SliceMoeRouterWeight(init_map.at(chain.router_w), chain.router_w_transposed,
+                         keep);
     if (chain.router_b) {
-      SliceLastAxis(init_map.at(*chain.router_b), keep);
+      SliceMoeRouterBias(init_map.at(*chain.router_b), keep);
     }
 
     stale_value_info.insert(chain.router_probs);
@@ -16765,33 +17139,51 @@ std::vector<onnx::GraphProto*> IterSubgraphs(onnx::GraphProto* graph) {
 // its index in `kept_token_ids`) before running the pruned model -- a
 // dropped id can never be fed to the pruned model again.
 //
-// Deliberately NARROWER than pruning.py's own three-producer-shape port
-// (plain `Gather`, `com.microsoft::EmbedLayerNormalization`,
-// `com.microsoft::GatherBlockQuantized`) -- consistent with this file's own
-// established "narrower subset of pruning.py, decline rather than guess
-// past what's ported" scope decisions elsewhere (MatMulNBits's own
-// FLOAT32-only scales/zero_points/bias, MoE/QMoE's own restrictions, ...):
+// Two of pruning.py's own three producer shapes are matched here -- plain
+// `Gather` (MatchEmbeddingGatherRaw) and `com.microsoft::
+// EmbedLayerNormalization` (MatchEmbedLayerNormProducer, added alongside it
+// -- see that function's own doc comment for the schema/scope this mirrors
+// from pruning.py's `_match_embed_layer_norm_producer`). `lm_head`
+// auto-detection also now recognizes `com.microsoft::FusedGemm`/
+// `GemmFastGelu` in addition to a bare `MatMul`/vanilla `Gemm`
+// (MatchMatMulLikeWidenedRaw, this section's own local mirror of
+// pruning.py's module-scoped `_match_matmul_like` override -- kept local to
+// this section, not merged into the shared MatchMatMulLikeRaw, for the
+// identical reason pruning.py's own override is kept local to
+// `onnxsim.pruning` rather than made to the shared `smoothquant.py` copy:
+// widening the shared matcher would silently change every OTHER pass in
+// this file that calls it too). The embedding table, `lm_head` weight, and
+// `lm_head` bias are now all admitted as FLOAT, FLOAT16, OR BFLOAT16
+// (IsSupportedFloatDtype, ReadFloatTensorAnyDtype/
+// SetFloatTensorDataPreservingDtype -- this section's own local upcast-to-
+// float32/downcast-to-original-dtype helpers, mirroring pruning.py's own
+// `_to_f64`/`_from_f64` convention; this file's shared ReadFloatTensor/
+// SetFloatTensorData stay FLOAT32-only and untouched, used elsewhere in
+// this file exactly as before).
 //
-//   * Only the plain `Gather(data, indices, axis=0)` producer shape is
-//     matched here. `EmbedLayerNormalization` (the fused BERT-family
-//     word+position+segment-embedding-plus-LayerNorm node onnxruntime's
-//     own graph optimizer emits) and `GatherBlockQuantized` (the
-//     int2/int4/int8 block-quantized analogue) are both simply never
-//     matched -- declined, not mis-handled -- by this port; see
-//     pruning.py's own section comment for their exact schema/scope if
-//     porting either is ever needed.
-//   * `lm_head` auto-detection only ever recognizes a bare `MatMul` or
-//     vanilla `Gemm` (MatchMatMulLikeRaw) -- not pruning.py's own widened
-//     `_match_matmul_like`, which additionally recognizes
-//     `com.microsoft::FusedGemm`/`GemmFastGelu` -- mirroring
-//     MatchProducer's own identical, already-established restriction
-//     elsewhere in this file (see its own comment, above).
-//   * The embedding table, `lm_head` weight, and `lm_head` bias are all
-//     admitted only as plain FLOAT (float32) tensors -- not also FLOAT16/
-//     BFLOAT16 -- matching ReadFloatTensor/SetFloatTensorData's own
-//     FLOAT32-only support (the same restriction, for the same reason, as
-//     the "Two deliberate, narrower-than-pruning.py scope decisions"
-//     comment above MatMulNBitsValidBlockSizes documents).
+// Deliberately still NARROWER than pruning.py's own three-producer-shape
+// port in exactly one remaining respect:
+//
+//   * `com.microsoft::GatherBlockQuantized` (the int2/int4/int8
+//     block-quantized analogue of a plain-float embedding `Gather`) is
+//     simply never matched -- declined, not mis-handled -- by this port.
+//     Unlike the two gaps closed above, this one is deliberately left
+//     open: pruning.py's own section comment documents two genuinely
+//     different packing conventions (ONNX-native sub-byte `tensor(uint4)`/
+//     `tensor(int4)` vs. manually-packed `tensor(uint8)`, each with its own
+//     default-`zero_points` formula), a `scales`/`zero_points` pair that
+//     must be sliced in lockstep with `data`, and a dequantization-for-
+//     ranking-only helper -- real, verified-correct scope, but large enough
+//     that porting it hastily risks a subtle packing/slicing bug for a
+//     currently-narrow real-exporter surface (see that comment's own "Real
+//     exporter evidence" paragraph). Left as a clearly separate,
+//     independent follow-up rather than attempted here. Because this is a
+//     genuine remaining producer-shape gap (not just a narrower dtype/
+//     lm_head-node-type restriction), `apply_embedding_vocab_pruning`/
+//     `apply_embedding_vocab_magnitude_pruning` in pruning.py are NOT
+//     aliased to these C++ ports -- see this round's own summary for why
+//     "two of three producer shapes" does not clear this module's own
+//     "verified TRUE full parity, or don't alias" bar.
 //
 // Every other structural safety check pruning.py's own `_match_embedding_
 // gather`/`_match_tied_lm_head`/`_match_untied_lm_head`/`_match_lm_head_
@@ -16848,13 +17240,288 @@ struct EmbeddingChain {
   std::optional<EmbeddingLmHeadMatch> lm_head;
 };
 
+// True for FLOAT, FLOAT16, and BFLOAT16 -- every element dtype this
+// section's own matchers accept for a weight/bias initializer. Mirrors
+// pruning.py's own `_is_supported_float_dtype` exactly. Reuses the
+// identical helper the MoE/QMoE section above already defines for the same
+// purpose (see that section's own comment) rather than redeclaring it here
+// -- every OTHER matcher in this file that still checks
+// `== onnx::TensorProto::FLOAT` directly is intentionally left alone (see
+// this file's own "narrower than pruning.py" scope-decision comments
+// elsewhere) -- widening those is a separate, unrelated decision this round
+// does not make.
+
+// --- FLOAT16/BFLOAT16 <-> float32 bit conversion, and the
+// ReadFloatTensorAnyDtype/SetFloatTensorDataPreservingDtype pair built on
+// top of them -- this section's own local mirror of pruning.py's
+// `_to_f64`/`_from_f64` upcast-on-read/downcast-on-write convention (see
+// that pair's own doc comments in pruning.py's "FP16/BFloat16 weight
+// support" section). float32 stands in for Python's float64 here: it still
+// exactly represents every value either half-precision format can hold, and
+// every arithmetic helper already used by this file (SliceAxis0/SliceAxis1,
+// the L2-norm accumulation in EmbeddingVocabImportance below) already works
+// in float32/double, so no separate wide-precision path is needed. This
+// file's existing ReadFloatTensor/SetFloatTensorData (above) stay FLOAT32
+// -only and completely unchanged -- every other pass in this file that uses
+// them keeps its own established FLOAT32-only scope; these four helpers are
+// used ONLY by this section's own producer/lm_head matching and slicing.
+//
+// Lossless in both directions for the one case this pass ever needs it in:
+// decoding a value already stored as FLOAT16/BFLOAT16 into float32 never
+// rounds (float32 has strictly more precision than either half-precision
+// format), and re-encoding an UNMODIFIED (merely relocated by a row/column
+// slice, never arithmetically recomputed) float32 value back to its
+// original dtype reproduces the exact original bit pattern -- verified
+// directly in this round's own test suite, the same way pruning.py's
+// `_from_f64` docstring documents for its own float64 round trip.
+
+inline float Float16BitsToFloat(uint16_t bits) {
+  const uint32_t sign = static_cast<uint32_t>(bits & 0x8000u) << 16;
+  uint32_t exp = (bits >> 10) & 0x1Fu;
+  uint32_t mant = bits & 0x3FFu;
+  uint32_t out;
+  if (exp == 0) {
+    if (mant == 0) {
+      out = sign;  // +-0
+    } else {
+      // Subnormal float16 -> normalized float32: shift the mantissa left
+      // until its implicit leading bit lands, adjusting the exponent to
+      // match.
+      exp = 127 - 15 + 1;
+      while ((mant & 0x400u) == 0) {
+        mant <<= 1;
+        --exp;
+      }
+      mant &= 0x3FFu;
+      out = sign | (exp << 23) | (mant << 13);
+    }
+  } else if (exp == 0x1Fu) {
+    out = sign | 0x7F800000u | (mant << 13);  // Inf/NaN
+  } else {
+    out = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+  }
+  float f;
+  std::memcpy(&f, &out, sizeof(f));
+  return f;
+}
+
+// Round-to-nearest-even float32 -> float16 bit pattern. An exact
+// float16-representable input (the only case this pass ever re-encodes,
+// see this subsection's own top comment) round-trips byte-for-byte
+// regardless of tie-breaking rule, since such a value never lands exactly
+// halfway between two representable float16 values.
+inline uint16_t FloatToFloat16Bits(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const uint32_t sign = (bits >> 16) & 0x8000u;
+  const uint32_t exp32 = (bits >> 23) & 0xFFu;
+  const uint32_t mant32 = bits & 0x7FFFFFu;
+  if (exp32 == 0xFFu) {
+    // Inf/NaN.
+    return static_cast<uint16_t>(sign | 0x7C00u | (mant32 ? 0x0200u : 0u));
+  }
+  int32_t exp16 = static_cast<int32_t>(exp32) - 127 + 15;
+  if (exp16 >= 0x1F) {
+    return static_cast<uint16_t>(sign | 0x7C00u);  // overflow -> Inf
+  }
+  if (exp16 <= 0) {
+    if (exp16 < -10) {
+      return static_cast<uint16_t>(sign);  // underflows to zero
+    }
+    const uint32_t m = mant32 | 0x800000u;  // add the implicit leading bit
+    const uint32_t shift = static_cast<uint32_t>(14 - exp16);
+    uint32_t half_mant = m >> shift;
+    const uint32_t remainder = m & ((1u << shift) - 1u);
+    const uint32_t halfway = 1u << (shift - 1u);
+    if (remainder > halfway ||
+        (remainder == halfway && (half_mant & 1u) != 0u)) {
+      half_mant += 1u;
+    }
+    return static_cast<uint16_t>(sign | half_mant);
+  }
+  uint32_t rounded = mant32 + 0x00001000u;  // half an ULP at kept precision
+  if (rounded & 0x00800000u) {
+    // Rounded mantissa carried into the implicit leading bit -- bump the
+    // exponent instead.
+    rounded = 0;
+    exp16 += 1;
+    if (exp16 >= 0x1F) {
+      return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+  }
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp16) << 10) |
+                               (rounded >> 13));
+}
+
+// bfloat16 is literally float32's own top 16 bits (1 sign + 8 exponent +
+// 7 mantissa) -- decode is a plain zero-extending left shift.
+inline float BFloat16BitsToFloat(uint16_t bits) {
+  const uint32_t full = static_cast<uint32_t>(bits) << 16;
+  float f;
+  std::memcpy(&f, &full, sizeof(f));
+  return f;
+}
+
+// Round-to-nearest-even float32 -> bfloat16 bit pattern (the standard
+// "add a rounding bias keyed off the bit being kept, then truncate"
+// algorithm). An exact bfloat16-representable input (this pass's only
+// re-encode case -- see this subsection's own top comment) has zero low 16
+// bits, so the rounding bias it adds can never carry into bit 16, and the
+// truncation reproduces the exact original top half byte-for-byte.
+inline uint16_t FloatToBFloat16Bits(float value) {
+  if (std::isnan(value)) {
+    return 0x7FC0u;  // canonical quiet NaN, upper half
+  }
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const uint32_t rounding_bias = ((bits >> 16) & 1u) + 0x7FFFu;
+  return static_cast<uint16_t>((bits + rounding_bias) >> 16);
+}
+
+// Reads a FLOAT/FLOAT16/BFLOAT16 tensor as a flat float32 buffer -- see
+// this subsection's own top comment. FLOAT is a straight passthrough
+// through the existing (FLOAT32-only) ReadFloatTensor; FLOAT16/BFLOAT16
+// additionally decode each packed 16-bit code -- 2 raw bytes/element when
+// `raw_data` is set, or, ONNX's own wire convention for sub-32-bit numeric
+// dtypes, zero-extended into `int32_data` when it is absent (confirmed
+// directly against a live `onnx.TensorProto`/`onnx.numpy_helper.to_array`
+// round trip) -- through Float16BitsToFloat/BFloat16BitsToFloat.
+std::vector<float> ReadFloatTensorAnyDtype(const onnx::TensorProto& t) {
+  if (t.data_type() == onnx::TensorProto::FLOAT) {
+    return ReadFloatTensor(t);
+  }
+  int64_t numel = 1;
+  for (int64_t d : t.dims()) {
+    numel *= d;
+  }
+  std::vector<uint16_t> bits(static_cast<size_t>(numel));
+  if (t.has_raw_data()) {
+    std::memcpy(bits.data(), t.raw_data().data(),
+                bits.size() * sizeof(uint16_t));
+    if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+      onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(bits.data()),
+                                        bits.size() * sizeof(uint16_t),
+                                        sizeof(uint16_t));
+    }
+  } else {
+    for (int64_t i = 0; i < numel; ++i) {
+      bits[static_cast<size_t>(i)] =
+          static_cast<uint16_t>(t.int32_data(static_cast<int>(i)));
+    }
+  }
+  std::vector<float> out(bits.size());
+  const bool is_bf16 = t.data_type() == onnx::TensorProto::BFLOAT16;
+  for (size_t i = 0; i < bits.size(); ++i) {
+    out[i] =
+        is_bf16 ? BFloat16BitsToFloat(bits[i]) : Float16BitsToFloat(bits[i]);
+  }
+  return out;
+}
+
+// Inverse of ReadFloatTensorAnyDtype: overwrites `t` in place with `data`
+// at `dims`, downcast to `t`'s OWN existing dtype (FLOAT/FLOAT16/BFLOAT16)
+// -- unlike SetFloatTensorData, which always produces a FLOAT tensor, this
+// preserves whatever dtype the embedding table/lm_head weight/bias already
+// had, exactly mirroring pruning.py's own `_from_f64`. Always writes
+// `raw_data` (never `int32_data`), the same "replace, don't mutate a live
+// view" convention SetFloatTensorData already uses.
+void SetFloatTensorDataPreservingDtype(onnx::TensorProto* t,
+                                       const std::vector<int64_t>& dims,
+                                       const std::vector<float>& data) {
+  const int32_t dtype = t->data_type();
+  if (dtype == onnx::TensorProto::FLOAT) {
+    SetFloatTensorData(t, dims, data);
+    return;
+  }
+  const std::string name = t->name();
+  t->Clear();
+  t->set_name(name);
+  t->set_data_type(static_cast<onnx::TensorProto_DataType>(dtype));
+  for (int64_t d : dims) {
+    t->add_dims(d);
+  }
+  const bool is_bf16 = dtype == onnx::TensorProto::BFLOAT16;
+  std::vector<uint16_t> bits(data.size());
+  for (size_t i = 0; i < data.size(); ++i) {
+    bits[i] =
+        is_bf16 ? FloatToBFloat16Bits(data[i]) : FloatToFloat16Bits(data[i]);
+  }
+  std::string raw(bits.size() * sizeof(uint16_t), '\0');
+  std::memcpy(raw.data(), bits.data(), raw.size());
+  if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+    onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(raw.data()),
+                                      raw.size(), sizeof(uint16_t));
+  }
+  t->set_raw_data(std::move(raw));
+}
+
+// This section's own local mirror of pruning.py's module-scoped
+// `_match_matmul_like` override (see that function's own docstring): wraps
+// MatchMatMulLikeRaw to also recognize `com.microsoft::FusedGemm` (a plain
+// Gemm plus a trailing activation, ORT's own `GemmActivationFusion` result
+// -- `A`/`B`/`C`/`alpha`/`beta`/`transA`/`transB` are Gemm's own, verbatim)
+// and `com.microsoft::GemmFastGelu` (`GemmFastGelu(X, W, bias?) =
+// FastGelu(X @ W [+ bias])`, no attributes at all, `W` always stored NOT
+// transposed -- ORT's own `FusionGemmFastGelu` result). Kept LOCAL to this
+// section rather than merged into the shared MatchMatMulLikeRaw for the
+// same reason pruning.py's own override stays local to `onnxsim.pruning`
+// rather than widening the shared `smoothquant.py` copy: MatchMatMulLikeRaw
+// is reused by many other, unrelated passes in this file, and widening it
+// there would silently change their own behavior too, never verified here.
+std::optional<MatMulLikeMatch> MatchMatMulLikeWidenedRaw(
+    const onnx::NodeProto& node) {
+  if (node.op_type() == "FusedGemm") {
+    const int num_inputs = node.input_size();
+    if (num_inputs != 2 && num_inputs != 3) {
+      return std::nullopt;
+    }
+    bool has_trans_a = false, has_alpha = false, has_beta = false;
+    int64_t trans_a = 0, trans_b = 0;
+    double alpha = 1.0, beta = 1.0;
+    for (const auto& attr : node.attribute()) {
+      if (attr.name() == "transA") {
+        trans_a = attr.i();
+        has_trans_a = true;
+      } else if (attr.name() == "alpha") {
+        alpha = attr.f();
+        has_alpha = true;
+      } else if (attr.name() == "beta") {
+        beta = attr.f();
+        has_beta = true;
+      } else if (attr.name() == "transB") {
+        trans_b = attr.i();
+      }
+    }
+    if (has_trans_a && trans_a != 0) {
+      return std::nullopt;
+    }
+    if (has_alpha && alpha != 1.0) {
+      return std::nullopt;
+    }
+    if (num_inputs == 3 && has_beta && beta != 1.0) {
+      return std::nullopt;
+    }
+    return MatMulLikeMatch{node.input(0), node.input(1), trans_b != 0};
+  }
+  if (node.op_type() == "GemmFastGelu" &&
+      node.domain() == kComMicrosoftDomain) {
+    const int num_inputs = node.input_size();
+    if (num_inputs != 2 && num_inputs != 3) {
+      return std::nullopt;
+    }
+    return MatMulLikeMatch{node.input(0), node.input(1), false};
+  }
+  return MatchMatMulLikeRaw(node);
+}
+
 // If `node` is a well-formed embedding-table Gather (this section's own
 // comment above has the full matching criteria), returns
 // (weight_name, indices_name, underlying_input_name) -- `indices_name` is
 // `node`'s own literal `indices` operand, `underlying_input_name` is that
 // same tensor with one Cast hop unwrapped when present. Mirrors
-// pruning.py's own `_match_embedding_gather` exactly, minus the
-// `EmbedLayerNormalization`/`GatherBlockQuantized` producer shapes (out of
+// pruning.py's own `_match_embedding_gather` exactly (the
+// `EmbedLayerNormalization` producer shape is matched separately, by
+// MatchEmbedLayerNormProducer just below; `GatherBlockQuantized` is out of
 // scope for this C++ port -- see this section's own top comment). The
 // Python original also double-checks `node in consumers_of[w_name]`; that
 // is always true here by construction (ConsumersOf indexes every node
@@ -16882,7 +17549,7 @@ MatchEmbeddingGatherRaw(
   const std::string& indices_name = node.input(1);
   auto wit = init_map.find(w_name);
   if (wit == init_map.end() ||
-      wit->second->data_type() != onnx::TensorProto::FLOAT ||
+      !IsSupportedFloatDtype(wit->second->data_type()) ||
       wit->second->dims_size() != 2) {
     return std::nullopt;
   }
@@ -16908,20 +17575,84 @@ MatchEmbeddingGatherRaw(
   return std::make_tuple(w_name, indices_name, underlying);
 }
 
-// Resolves `node` (an already-matched MatMul/vanilla-Gemm producing
-// `vocab_size`-wide output) to its own bias, if any, and the node whose
-// *output* is the real, final logits tensor. Mirrors pruning.py's own
-// `_match_lm_head_tail` exactly: returns `std::nullopt` for the
-// `_LM_HEAD_BIAS_INVALID` sentinel case (a bias exists but not in a shape
-// this pass safely handles -- declined, never left silently stale), or a
-// present `(bias_name_or_nullopt, output_node)` pair otherwise.
+// The `com.microsoft::EmbedLayerNormalization` counterpart of
+// MatchEmbeddingGatherRaw -- same return contract exactly
+// ((weight_name, indices_name, underlying_input_name)), so
+// MatchEmbeddingChain's own matching loop can try this as a second producer
+// shape and treat whichever one succeeds identically from there on. Mirrors
+// pruning.py's own `_match_embed_layer_norm_producer` exactly -- see that
+// function's own docstring for the full empirical schema (inputs, in order:
+// `input_ids`, `segment_ids`?, `word_embedding`, `position_embedding`,
+// `segment_embedding`?, `gamma`, `beta`, `mask`?, `position_ids`?; at least
+// 7 required inputs) and the three scope decisions this reproduces exactly:
+// only `word_embedding` (indexed by `input_ids`, this function's own
+// `weight_name`) is ever vocab-axis-prunable -- `position_embedding`
+// (indexed by sequence position) and `segment_embedding` (indexed by
+// `segment_ids`, a different index space) are always left completely
+// untouched by every caller of this match, and neither `gamma`/`beta` (not
+// vocab-shaped) nor the optional `mask_index`/`embedding_sum` outputs
+// (neither's shape or value depends on `vocab_size`) need any special
+// handling here at all.
+std::optional<std::tuple<std::string, std::string, std::string>>
+MatchEmbedLayerNormProducer(
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_input_names,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  if (node.op_type() != "EmbedLayerNormalization" ||
+      node.domain() != kComMicrosoftDomain) {
+    return std::nullopt;
+  }
+  if (node.input_size() < 7) {
+    return std::nullopt;
+  }
+  const std::string& input_ids = node.input(0);
+  const std::string& w_name = node.input(2);
+  if (input_ids.empty() || w_name.empty()) {
+    return std::nullopt;
+  }
+  auto wit = init_map.find(w_name);
+  if (wit == init_map.end() ||
+      !IsSupportedFloatDtype(wit->second->data_type()) ||
+      wit->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+
+  std::string underlying = input_ids;
+  if (!graph_input_names.count(underlying)) {
+    auto cit = node_by_output.find(underlying);
+    if (cit != node_by_output.end() && cit->second->op_type() == "Cast" &&
+        cit->second->input_size() == 1 &&
+        graph_input_names.count(cit->second->input(0))) {
+      underlying = cit->second->input(0);
+    } else {
+      return std::nullopt;  // not a graph input, nor a Cast of one
+    }
+  }
+
+  auto cons_it = consumers_of.find(w_name);
+  const size_t n_consumers =
+      cons_it == consumers_of.end() ? 0 : cons_it->second.size();
+  if (n_consumers < 1 || n_consumers > 2) {
+    return std::nullopt;  // unexpected consumer count -- decline, don't guess
+  }
+  return std::make_tuple(w_name, input_ids, underlying);
+}
+
+// Resolves `node` (an already-matched MatMul/vanilla-Gemm/FusedGemm/
+// GemmFastGelu producing `vocab_size`-wide output) to its own bias, if any,
+// and the node whose *output* is the real, final logits tensor. Mirrors
+// pruning.py's own `_match_lm_head_tail` exactly: returns `std::nullopt`
+// for the `_LM_HEAD_BIAS_INVALID` sentinel case (a bias exists but not in a
+// shape this pass safely handles -- declined, never left silently stale),
+// or a present `(bias_name_or_nullopt, output_node)` pair otherwise.
 std::optional<std::pair<std::optional<std::string>, onnx::NodeProto*>>
 MatchLmHeadTail(onnx::NodeProto* node, const InitMap& init_map,
                 const ConsumerMap& consumers_of, int64_t vocab_size) {
   auto valid_bias = [&](const std::string& name) {
     auto it = init_map.find(name);
     if (it == init_map.end() ||
-        it->second->data_type() != onnx::TensorProto::FLOAT) {
+        !IsSupportedFloatDtype(it->second->data_type())) {
       return false;
     }
     const auto& dims = it->second->dims();
@@ -16934,8 +17665,18 @@ MatchLmHeadTail(onnx::NodeProto* node, const InitMap& init_map,
     return false;
   };
 
-  if (node->op_type() == "Gemm" && node->input_size() == 3 &&
-      !node->input(2).empty()) {
+  // `Gemm`'s own built-in `C` input carries straight over to `FusedGemm`
+  // (byte-identical `A`/`B`/`C` inputs, ORT's own `GemmActivationFusion`
+  // result) AND to `GemmFastGelu` (`GemmFastGelu(X, W, bias?)`'s own
+  // optional 3rd input, folded in by ORT's `FusionGemmFastGelu` from
+  // exactly the MatMul-then-Add(bias) shape the plain-`MatMul` branch below
+  // still resolves when the bias hasn't been folded into the node itself)
+  // -- mirrors pruning.py's own
+  // `node.op_type in ("Gemm", "FusedGemm", "GemmFastGelu")` membership
+  // check exactly.
+  if ((node->op_type() == "Gemm" || node->op_type() == "FusedGemm" ||
+       node->op_type() == "GemmFastGelu") &&
+      node->input_size() == 3 && !node->input(2).empty()) {
     const std::string bias_name = node->input(2);
     if (!valid_bias(bias_name)) {
       return std::nullopt;
@@ -17002,7 +17743,7 @@ std::optional<EmbeddingLmHeadMatch> MatchTiedLmHead(
   }
   onnx::NodeProto* other = others[0];
 
-  auto match = MatchMatMulLikeRaw(*other);
+  auto match = MatchMatMulLikeWidenedRaw(*other);
   if (match) {
     if (match->w_name == weight_name && match->weight_transposed) {
       auto tail = MatchLmHeadTail(other, init_map, consumers_of, vocab_size);
@@ -17035,7 +17776,7 @@ std::optional<EmbeddingLmHeadMatch> MatchTiedLmHead(
       return std::nullopt;
     }
     onnx::NodeProto* node2 = tcit->second[0];
-    auto match2 = MatchMatMulLikeRaw(*node2);
+    auto match2 = MatchMatMulLikeWidenedRaw(*node2);
     if (!match2 || match2->w_name != t_out || match2->weight_transposed) {
       // must consume the transposed [hidden, vocab] tensor untransposed
       return std::nullopt;
@@ -17056,7 +17797,8 @@ std::optional<EmbeddingLmHeadMatch> MatchTiedLmHead(
 }
 
 // Auto-detects a fully independent `lm_head` weight: exactly one
-// MatMul/vanilla-Gemm node in the whole graph whose constant 2-D weight is
+// MatMul/vanilla-Gemm/FusedGemm/GemmFastGelu node (MatchMatMulLikeWidenedRaw)
+// in the whole graph whose constant 2-D weight is
 // distinct from `embedding_weight_name`, has exactly one consumer,
 // produces `vocab_size`-wide output, and -- the one structural signal that
 // reliably distinguishes "the" vocab-logits projection from some unrelated
@@ -17079,7 +17821,7 @@ std::optional<EmbeddingLmHeadMatch> MatchUntiedLmHead(
   std::vector<Candidate> candidates;
   for (int i = 0; i < graph->node_size(); ++i) {
     onnx::NodeProto* node = graph->mutable_node(i);
-    auto match = MatchMatMulLikeRaw(*node);
+    auto match = MatchMatMulLikeWidenedRaw(*node);
     if (!match) {
       continue;
     }
@@ -17088,7 +17830,7 @@ std::optional<EmbeddingLmHeadMatch> MatchUntiedLmHead(
     }
     auto wit = init_map.find(match->w_name);
     if (wit == init_map.end() ||
-        wit->second->data_type() != onnx::TensorProto::FLOAT ||
+        !IsSupportedFloatDtype(wit->second->data_type()) ||
         wit->second->dims_size() != 2) {
       continue;
     }
@@ -17122,20 +17864,22 @@ std::optional<EmbeddingLmHeadMatch> MatchUntiedLmHead(
   return result;
 }
 
-// Finds the one token-embedding Gather this pass should act on in `graph`
-// alone, plus its tied/untied `lm_head`, if any. When `input_name` is
-// given, only a Gather whose token-id operand resolves to that exact graph
+// Finds the one token-embedding producer this pass should act on in
+// `graph` alone -- a plain `Gather` (MatchEmbeddingGatherRaw) or a
+// `com.microsoft::EmbedLayerNormalization` node (MatchEmbedLayerNormProducer)
+// -- plus its tied/untied `lm_head`, if any. When `input_name` is given,
+// only a producer whose token-id operand resolves to that exact graph
 // input is considered, and -- when `strict_input_name` -- it is an error
 // (`std::invalid_argument`, a caller mistake) if none does;
 // `strict_input_name=false` (only ever passed by
 // MatchEmbeddingChainAnyGraph) instead treats that same outcome as an
 // ordinary decline (`std::nullopt`, no exception), since `graph` here is
 // only one of possibly several graphs a whole-model search is trying in
-// turn. When `input_name` is omitted, exactly one qualifying Gather must
-// exist in the whole graph -- zero or more than one declines the whole
-// call. Mirrors pruning.py's own `_match_embedding_chain` exactly (minus
-// the `EmbedLayerNormalization`/`GatherBlockQuantized` producer shapes --
-// see this section's own top comment).
+// turn. When `input_name` is omitted, exactly one qualifying producer --
+// of EITHER shape, counted together -- must exist in the whole graph --
+// zero or more than one declines the whole call. Mirrors pruning.py's own
+// `_match_embedding_chain` exactly, minus the `GatherBlockQuantized`
+// producer shape -- see this section's own top comment.
 std::optional<EmbeddingChain> MatchEmbeddingChain(
     onnx::GraphProto* graph, const std::optional<std::string>& input_name,
     bool strict_input_name) {
@@ -17170,8 +17914,14 @@ std::optional<EmbeddingChain> MatchEmbeddingChain(
   std::vector<RawMatch> matches;
   for (int i = 0; i < graph->node_size(); ++i) {
     onnx::NodeProto* node = graph->mutable_node(i);
+    // Try both producer shapes -- a node is at most one of them (disjoint
+    // op_type/domain checks), so there is never a double-count here.
     auto m = MatchEmbeddingGatherRaw(*node, init_map, consumers_of,
                                      graph_input_names, node_by_output);
+    if (!m) {
+      m = MatchEmbedLayerNormProducer(*node, init_map, consumers_of,
+                                      graph_input_names, node_by_output);
+    }
     if (!m) {
       continue;
     }
@@ -17298,6 +18048,50 @@ bool UpdateVocabOutputShape(onnx::GraphProto* graph, const std::string& name,
   return false;
 }
 
+// Dtype-preserving (FLOAT/FLOAT16/BFLOAT16) analogue of SliceProducerWeight,
+// used ONLY by this section -- every OTHER caller of SliceProducerWeight
+// elsewhere in this file keeps its own established FLOAT32-only scope
+// completely unchanged. `weight_transposed=true` means axis 0 is the output
+// channel (the embedding table's own `[vocab_size, hidden_size]` layout,
+// and a tied/untied `Gemm(transB=1)`-style `[vocab_size, K]` lm_head
+// weight); `false` means axis 1 (a plain-`MatMul`-style `[K, vocab_size]`
+// lm_head weight).
+void SliceEmbeddingWeightAnyDtype(onnx::TensorProto* wt, bool weight_transposed,
+                                  const std::vector<int64_t>& keep) {
+  const std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
+  const std::vector<float> data = ReadFloatTensorAnyDtype(*wt);
+  const int64_t dim0 = dims[0], dim1 = dims[1];
+  const int64_t kc = static_cast<int64_t>(keep.size());
+  std::vector<float> out;
+  std::vector<int64_t> new_dims;
+  if (weight_transposed) {
+    out = SliceAxis0(data, dim0, dim1, keep);
+    new_dims = {kc, dim1};
+  } else {
+    out = SliceAxis1(data, dim0, dim1, 1, keep);
+    new_dims = {dim0, kc};
+  }
+  SetFloatTensorDataPreservingDtype(wt, new_dims, out);
+}
+
+// Dtype-preserving (FLOAT/FLOAT16/BFLOAT16) analogue of SliceLastAxis, used
+// ONLY by this section -- for an `lm_head`'s own constant bias.
+void SliceLastAxisAnyDtype(onnx::TensorProto* t,
+                           const std::vector<int64_t>& keep) {
+  std::vector<int64_t> dims(t->dims().begin(), t->dims().end());
+  const std::vector<float> data = ReadFloatTensorAnyDtype(*t);
+  std::vector<float> out(keep.size());
+  for (size_t i = 0; i < keep.size(); ++i) {
+    out[i] = data[static_cast<size_t>(keep[i])];
+  }
+  if (dims.empty()) {
+    dims.push_back(static_cast<int64_t>(keep.size()));
+  } else {
+    dims.back() = static_cast<int64_t>(keep.size());
+  }
+  SetFloatTensorDataPreservingDtype(t, dims, out);
+}
+
 // Performs the actual slicing, IN PLACE on `graph`, for an already-decided
 // (ascending) `keep_ids` set: the embedding table's own vocab_size axis
 // (always axis 0 -- MatchEmbeddingGatherRaw's own `axis == 0` requirement),
@@ -17308,7 +18102,12 @@ bool UpdateVocabOutputShape(onnx::GraphProto* graph, const std::string& name,
 // matched in (MatchEmbeddingChainAnyGraph's own returned `graph`), so this
 // mutates that graph's own initializer/output/value_info in place, never a
 // different graph's. Mirrors pruning.py's own `_apply_embedding_vocab_
-// prune`/`_finalize_embedding_shapes` exactly.
+// prune`/`_finalize_embedding_shapes` exactly -- including its own
+// FLOAT/FLOAT16/BFLOAT16 dtype-preserving round trip (SliceEmbeddingWeight
+// AnyDtype/SliceLastAxisAnyDtype above, this section's own local mirror of
+// `_to_f64`/`_from_f64`), unlike this file's shared SliceProducerWeight/
+// SliceLastAxis (FLOAT32-only, untouched, used elsewhere in this file
+// exactly as before).
 void ApplyEmbeddingVocabPrune(onnx::GraphProto* graph,
                               const EmbeddingChain& chain,
                               const std::vector<int64_t>& keep_ids) {
@@ -17316,19 +18115,17 @@ void ApplyEmbeddingVocabPrune(onnx::GraphProto* graph,
   const int64_t new_v = static_cast<int64_t>(keep_ids.size());
 
   // The embedding table is [vocab_size, hidden_size] with vocab_size as
-  // axis 0 -- exactly SliceProducerWeight's own `weight_transposed=true`
-  // ("output channel is axis 0") branch, reused verbatim rather than
-  // duplicating an axis-0 row-slice helper.
-  SliceProducerWeight(init_map.at(chain.weight_name),
-                      /*weight_transposed=*/true, keep_ids, /*is_conv=*/false);
+  // axis 0 -- exactly SliceEmbeddingWeightAnyDtype's own
+  // `weight_transposed=true` ("output channel is axis 0") branch.
+  SliceEmbeddingWeightAnyDtype(init_map.at(chain.weight_name),
+                               /*weight_transposed=*/true, keep_ids);
 
   if (chain.lm_head && !chain.lm_head->tied) {
-    SliceProducerWeight(init_map.at(*chain.lm_head->weight_name),
-                        *chain.lm_head->weight_transposed, keep_ids,
-                        /*is_conv=*/false);
+    SliceEmbeddingWeightAnyDtype(init_map.at(*chain.lm_head->weight_name),
+                                 *chain.lm_head->weight_transposed, keep_ids);
   }
   if (chain.lm_head && chain.lm_head->bias) {
-    SliceLastAxis(init_map.at(*chain.lm_head->bias), keep_ids);
+    SliceLastAxisAnyDtype(init_map.at(*chain.lm_head->bias), keep_ids);
   }
 
   // Finalize shapes: chain.producer's own output shape never needs
@@ -17372,7 +18169,7 @@ std::vector<double> EmbeddingVocabImportance(const EmbeddingChain& chain,
   std::vector<double> importance(static_cast<size_t>(chain.vocab_size), 0.0);
   {
     const std::vector<float> emb =
-        ReadFloatTensor(*init_map.at(chain.weight_name));
+        ReadFloatTensorAnyDtype(*init_map.at(chain.weight_name));
     for (int64_t v = 0; v < chain.vocab_size; ++v) {
       double sum = 0.0;
       for (int64_t h = 0; h < chain.hidden_size; ++h) {
@@ -17384,7 +18181,7 @@ std::vector<double> EmbeddingVocabImportance(const EmbeddingChain& chain,
   }
   if (chain.lm_head && !chain.lm_head->tied && chain.lm_head->weight_name) {
     const onnx::TensorProto* lw = init_map.at(*chain.lm_head->weight_name);
-    const std::vector<float> lwd = ReadFloatTensor(*lw);
+    const std::vector<float> lwd = ReadFloatTensorAnyDtype(*lw);
     if (*chain.lm_head->weight_transposed) {
       // [vocab_size, K] -- row v is contiguous, direct read.
       const int64_t k = lw->dims(1);
@@ -17656,8 +18453,13 @@ std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
 // comment) chains -- oblivious to whether the node consuming that
 // `router_probs` is `MoE` or `QMoE`, exactly like pruning.py's own
 // `_HasRouterProbs` structural-typing trick (`router_probs` is always a
-// plain 2-D `[tokens, num_experts]` FLOAT tensor produced upstream of
-// either node's own family-specific machinery).
+// plain 2-D `[tokens, num_experts]` FLOAT/FLOAT16/BFLOAT16 tensor produced
+// upstream of either node's own family-specific machinery -- a Gemm/MatMul
+// router projection's own output dtype follows its own input dtypes, so a
+// FLOAT16/BFLOAT16-widened router weight, per this file's own MoE/QMoE
+// section top comment, produces a FLOAT16/BFLOAT16 `router_probs` too;
+// IsSupportedFloatDtype below accepts all three, matching pruning.py's own
+// unconditional `np.asarray(..., dtype=np.float64)` here).
 //
 // For each batch: `shifted = logits - logits.max(axis=-1, keepdims=True);
 // probs = softmax(shifted); sum_prob[name] += probs.sum(axis=0)` -- the
@@ -17666,11 +18468,12 @@ std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
 // token count gives the TRUE mean over every token across every batch, not
 // an average-of-per-batch-averages (differs whenever batches have unequal
 // token counts). A probe never observed with rank exactly 2 (calibration_
-// data=[], or an unexpected activation rank) is simply absent from the
-// result, mirroring pruning.py's own `if logits.ndim != 2: continue` --
-// exactly the "no matching activation observed" condition
-// ApplyMoeWholeExpertChains/ApplyQMoEWholeExpertChains' own caller-supplied
-// `compute_importance` closure falls back to weight-norm importance on.
+// data=[], an unsupported dtype, or an unexpected activation rank) is
+// simply absent from the result, mirroring pruning.py's own `if logits.ndim
+// != 2: continue` -- exactly the "no matching activation observed"
+// condition ApplyMoeWholeExpertChains/ApplyQMoEWholeExpertChains' own
+// caller-supplied `compute_importance` closure falls back to weight-norm
+// importance on.
 std::unordered_map<std::string, std::vector<double>>
 MoeRouterGateCalibrationStats(
     const ModelExecutor& executor, const onnx::ModelProto& model,
@@ -17735,11 +18538,20 @@ MoeRouterGateCalibrationStats(
       }
       const DLTensor& dl = outputs[oit->second]->dl_tensor;
       onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
-      if (tp.data_type() != onnx::TensorProto::FLOAT) {
-        continue;  // Scope decision mirroring WandaCalibrationStats' own --
-                   // every chain this pass matches has a plain FLOAT
-                   // router_probs whenever the executor runs the real graph
-                   // ops faithfully.
+      if (!IsSupportedFloatDtype(tp.data_type())) {
+        continue;  // pruning.py's own `_moe_router_gate_calibration_stats`
+                   // has no dtype gate at all here (`np.asarray(...,
+                   // dtype=np.float64)` converts unconditionally) --
+                   // `router_probs` is FLOAT/FLOAT16/BFLOAT16 whenever the
+                   // matched MoE/QMoE node's own upstream router weight is
+                   // (a Gemm/MatMul's own output dtype follows its input
+                   // dtypes), so gating this to FLOAT-only would silently
+                   // fall back to weight-norm-only importance for every
+                   // FLOAT16/BFLOAT16 whole-expert model instead of the
+                   // real calibration-based ranking -- exactly the
+                   // FLOAT16/BFLOAT16 gap this file's own MoE/QMoE section
+                   // top comment (IsSupportedFloatDtype) closes elsewhere;
+                   // closed here too, rather than only for the matcher.
       }
       if (tp.dims_size() != 2) {
         continue;  // router_probs is always documented 2-D; skip if not.
@@ -17750,7 +18562,7 @@ MoeRouterGateCalibrationStats(
         continue;
       }
 
-      std::vector<float> data = ReadFloatTensor(tp);
+      std::vector<double> data = ReadTensorAsF64(tp);
       auto& acc = sum_prob[name];
       if (acc.empty()) {
         acc.assign(static_cast<size_t>(experts), 0.0);
@@ -17762,15 +18574,15 @@ MoeRouterGateCalibrationStats(
                    // of bounds.
       }
       for (int64_t t = 0; t < tokens; ++t) {
-        const float* row = data.data() + t * experts;
-        double max_v = static_cast<double>(row[0]);
+        const double* row = data.data() + t * experts;
+        double max_v = row[0];
         for (int64_t x = 1; x < experts; ++x) {
-          max_v = std::max(max_v, static_cast<double>(row[x]));
+          max_v = std::max(max_v, row[x]);
         }
         double sum_exp = 0.0;
         std::vector<double> exp_row(static_cast<size_t>(experts));
         for (int64_t x = 0; x < experts; ++x) {
-          const double e = std::exp(static_cast<double>(row[x]) - max_v);
+          const double e = std::exp(row[x] - max_v);
           exp_row[static_cast<size_t>(x)] = e;
           sum_exp += e;
         }

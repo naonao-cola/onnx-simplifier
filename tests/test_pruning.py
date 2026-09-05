@@ -35002,6 +35002,645 @@ def test_matmul_nbits_qkv_pruning_declines_non_block_aligned_consumer():
     assert attrs_before == attrs_after
 
 
+def _qk_norm_rope_nodes_helper(
+    prefix,
+    raw_name,
+    gamma_name,
+    reshape1_shape_name,
+    reshape2_shape_name,
+    with_rope,
+    cos_name="CosCache",
+    sin_name="SinCache",
+    pos_name="PosIds",
+    interleaved=0,
+    rotary_embedding_dim=0,
+    rotary_num_heads=None,
+):
+    """`onnx.helper`-node analogue of `_qk_norm_rope_body` above (this
+    file's own text-fragment version, used by the plain-float
+    `_gqa_qk_norm_rope_model`) -- returns `(nodes, final_name)` instead of a
+    text fragment, since `_matmul_nbits_qkv_qk_norm_rope_model` below builds
+    its whole graph via `onnx.helper` (mirroring `_matmul_nbits_qkv_model`'s
+    own established reason: `MatMulNBitsQkv`'s many optional inputs
+    interleaved with present ones don't fit the text format cleanly). The
+    per-head `Reshape -> SimplifiedLayerNormalization -> Reshape` sandwich
+    is always emitted (unlike `_qk_norm_rope_body`'s own toggle-able
+    `with_norm`) -- every test using this helper wants the norm crossed, the
+    Qwen3/Gemma2-style shape this section's own top comment motivates.
+    """
+    nodes = []
+    r1 = f"{prefix}_r1"
+    nodes.append(
+        onnx.helper.make_node("Reshape", [raw_name, reshape1_shape_name], [r1])
+    )
+    ln = f"{prefix}_ln"
+    nodes.append(
+        onnx.helper.make_node(
+            "SimplifiedLayerNormalization",
+            [r1, gamma_name],
+            [ln],
+            axis=-1,
+            epsilon=1e-6,
+        )
+    )
+    normed = f"{prefix}_normed"
+    nodes.append(onnx.helper.make_node("Reshape", [ln, reshape2_shape_name], [normed]))
+    cur = normed
+    if with_rope:
+        nh = rotary_num_heads if rotary_num_heads is not None else 0
+        rot = f"{prefix}_rot"
+        nodes.append(
+            onnx.helper.make_node(
+                "RotaryEmbedding",
+                [cur, pos_name, cos_name, sin_name],
+                [rot],
+                domain="com.microsoft",
+                num_heads=nh,
+                interleaved=interleaved,
+                rotary_embedding_dim=rotary_embedding_dim,
+            )
+        )
+        cur = rot
+    return nodes, cur
+
+
+def _matmul_nbits_qkv_qk_norm_rope_model(
+    num_heads,
+    kv_num_heads,
+    d,
+    K,
+    block_size,
+    N2,
+    W_q,
+    W_k,
+    W_v,
+    norm_scale,
+    seed,
+    batch=2,
+    seq=5,
+    with_rope=True,
+    interleaved=0,
+    rotary_embedding_dim=0,
+    q_rotary_num_heads=None,
+    k_rotary_num_heads=None,
+):
+    """Builds ``A -> MatMulNBitsQkv(qkv) -> (q_raw, k_raw, v) -> [per-head
+    Reshape -> SimplifiedLayerNormalization -> Reshape -> optional
+    RotaryEmbedding, via :func:`_qk_norm_rope_nodes_helper`] on each of Q's/
+    K's own branch -> GroupQueryAttention(attn) -> MatMul(down) -> Z``: the
+    ``MatMulNBitsQkv`` analogue of :func:`_gqa_qk_norm_rope_model`'s own
+    ``packed=True`` case, exercising the new Q/K-norm + RoPE pass-through
+    hop this section's own top comment documents. Every producer bias is
+    fixed at zero (unlike :func:`_matmul_nbits_qkv_model`'s own random
+    ones) purely so the independent oracle each test below compares
+    against -- built via ``_gqa_qk_norm_rope_model(packed=False, ...)``,
+    whose own plain-float producer never adds a bias -- can be compared
+    exactly; bias slicing itself is already covered by the no-hop
+    ``MatMulNBitsQkv`` tests above, unaffected by this change.
+
+    Returns ``(model, info)`` with every independently-computed
+    quantization artifact needed to hand-build a decomposed, real-kernel-
+    executable proxy for the pruned model (mirroring
+    ``test_matmul_nbits_qkv_pruning_matches_decomposed_oracle``'s own
+    methodology) and an oracle built from the same pre-pruning tensors.
+    """
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = num_heads * d, kv_num_heads * d
+    qcodes_q, scales_q, kb = _nbits_quantize_default_zp(W_q, block_size)
+    qcodes_k, scales_k, _ = _nbits_quantize_default_zp(W_k, block_size)
+    qcodes_v, scales_v, _ = _nbits_quantize_default_zp(W_v, block_size)
+    q_B = _nbits_pack_B(qcodes_q, Nq, kb, block_size)
+    k_B = _nbits_pack_B(qcodes_k, Nkv, kb, block_size)
+    v_B = _nbits_pack_B(qcodes_v, Nkv, kb, block_size)
+    bias_q = np.zeros(Nq, dtype=np.float32)
+    bias_k = np.zeros(Nkv, dtype=np.float32)
+    bias_v = np.zeros(Nkv, dtype=np.float32)
+
+    qkv_node = onnx.helper.make_node(
+        "MatMulNBitsQkv",
+        inputs=[
+            "A",
+            "",
+            "norm_scale",
+            "q_B",
+            "q_scales",
+            "q_bias",
+            "k_B",
+            "k_scales",
+            "k_bias",
+            "v_B",
+            "v_scales",
+            "v_bias",
+        ],
+        outputs=["q_raw", "k_raw", "v"],
+        domain="com.microsoft",
+        name="qkv",
+        block_size=block_size,
+        bits=4,
+        Nq=Nq,
+        Nkv=Nkv,
+        K=K,
+        epsilon=1e-5,
+    )
+
+    half = d // 2
+    cos = rng.standard_normal((32, half)).astype(np.float32)
+    sin = rng.standard_normal((32, half)).astype(np.float32)
+    position_ids = np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+    q_gamma = rng.standard_normal((d,)).astype(np.float32)
+    k_gamma = rng.standard_normal((d,)).astype(np.float32)
+
+    rope_kwargs = dict(
+        interleaved=interleaved, rotary_embedding_dim=rotary_embedding_dim
+    )
+    q_hop_nodes, q_body = _qk_norm_rope_nodes_helper(
+        "q",
+        "q_raw",
+        "QGamma",
+        "QReshape1Shape",
+        "QReshape2Shape",
+        with_rope,
+        rotary_num_heads=q_rotary_num_heads,
+        **rope_kwargs,
+    )
+    k_hop_nodes, k_body = _qk_norm_rope_nodes_helper(
+        "k",
+        "k_raw",
+        "KGamma",
+        "KReshape1Shape",
+        "KReshape2Shape",
+        with_rope,
+        rotary_num_heads=k_rotary_num_heads,
+        **rope_kwargs,
+    )
+
+    attn_node = onnx.helper.make_node(
+        "GroupQueryAttention",
+        inputs=[q_body, k_body, "v", "", "", "SeqLensK", "TotalSeq"],
+        outputs=["attn_out"],
+        domain="com.microsoft",
+        name="attn",
+        num_heads=num_heads,
+        kv_num_heads=kv_num_heads,
+    )
+    raw_out_width = num_heads * d
+    down_w = (rng.standard_normal((raw_out_width, N2)) * 0.3).astype(np.float32)
+    down_node = onnx.helper.make_node(
+        "MatMul", ["attn_out", "down_w"], ["Z"], name="down"
+    )
+
+    initializer = [
+        onnx.numpy_helper.from_array(q_B, name="q_B"),
+        onnx.numpy_helper.from_array(scales_q, name="q_scales"),
+        onnx.numpy_helper.from_array(bias_q, name="q_bias"),
+        onnx.numpy_helper.from_array(k_B, name="k_B"),
+        onnx.numpy_helper.from_array(scales_k, name="k_scales"),
+        onnx.numpy_helper.from_array(bias_k, name="k_bias"),
+        onnx.numpy_helper.from_array(v_B, name="v_B"),
+        onnx.numpy_helper.from_array(scales_v, name="v_scales"),
+        onnx.numpy_helper.from_array(bias_v, name="v_bias"),
+        onnx.numpy_helper.from_array(norm_scale, name="norm_scale"),
+        _f32(q_gamma, "QGamma"),
+        _f32(k_gamma, "KGamma"),
+        _f32(cos, "CosCache"),
+        _f32(sin, "SinCache"),
+        onnx.numpy_helper.from_array(position_ids, "PosIds"),
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, d], dtype=np.int64), "QReshape1Shape"
+        ),
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, Nq], dtype=np.int64), "QReshape2Shape"
+        ),
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, d], dtype=np.int64), "KReshape1Shape"
+        ),
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, Nkv], dtype=np.int64), "KReshape2Shape"
+        ),
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        ),
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq"),
+        onnx.numpy_helper.from_array(down_w, name="down_w"),
+    ]
+
+    graph = onnx.helper.make_graph(
+        [qkv_node] + q_hop_nodes + k_hop_nodes + [attn_node, down_node],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info(
+                "A", onnx.TensorProto.FLOAT, [batch, seq, K]
+            )
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info(
+                "Z", onnx.TensorProto.FLOAT, [batch, seq, N2]
+            )
+        ],
+        initializer=initializer,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    info = dict(
+        qcodes_q=qcodes_q,
+        scales_q=scales_q,
+        qcodes_k=qcodes_k,
+        scales_k=scales_k,
+        qcodes_v=qcodes_v,
+        scales_v=scales_v,
+        kb=kb,
+        Nq=Nq,
+        Nkv=Nkv,
+        down_w=down_w,
+        q_gamma=q_gamma,
+        k_gamma=k_gamma,
+        cos=cos,
+        sin=sin,
+        position_ids=position_ids,
+        batch=batch,
+        seq=seq,
+    )
+    return model, info
+
+
+def _matmul_nbits_qkv_qk_norm_rope_oracle_and_pruned(
+    num_heads,
+    kv_num_heads,
+    d,
+    K,
+    block_size,
+    N2,
+    seed,
+    sparsity,
+    **extra,
+):
+    # Shared body for the two oracle-comparison tests below -- builds the
+    # engineered (one KV group LARGE, the other SMALL, exactly
+    # ``test_matmul_nbits_qkv_pruning_matches_decomposed_oracle``'s own
+    # pattern) ``MatMulNBitsQkv`` + Q/K-norm + RoPE model, prunes it, then
+    # cross-checks it TWO independent ways: (1) byte-identity of the pruned
+    # packed tensors against a hand-slice of the ORIGINAL quantized codes
+    # (this section's own "never re-quantizes" guarantee), and (2) a real
+    # end-to-end numeric comparison between a DECOMPOSED-BUT-EXECUTABLE
+    # proxy for the pruned model (the fused ``MatMulNBitsQkv`` node swapped
+    # for a real ``SimplifiedLayerNormalization`` + three real
+    # ``MatMulNBits`` nodes reading the SAME pruned tensors, feeding the
+    # PRUNED model's own -- already rewritten -- hop nodes verbatim) and an
+    # INDEPENDENTLY built oracle (``_gqa_qk_norm_rope_model(packed=False,
+    # ...)``, fed the pre-projection-normalized activation computed by
+    # hand via ``_rmsnorm``, since that helper's own plain-float producer
+    # has no such norm baked in) -- the same two-independent-strategies
+    # methodology this section's own top comment documents, combined with
+    # the plain-float section's own "independent oracle model" idiom for
+    # the norm/RoPE hop itself.
+    rng = np.random.default_rng(seed)
+    W_q = (rng.standard_normal((num_heads * d, K)) * 0.3).astype(np.float32)
+    W_k = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    W_v = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    group_size = num_heads // kv_num_heads
+    # Engineer KV group 0 LARGE, every other group SMALL -- deterministic
+    # keep/drop regardless of quantization rounding noise, exactly
+    # ``test_matmul_nbits_qkv_pruning_matches_decomposed_oracle``'s own
+    # pattern.
+    W_q[: group_size * d] *= 8.0
+    W_q[group_size * d :] *= 0.05
+    W_k[:d] *= 8.0
+    W_k[d:] *= 0.05
+    W_v[:d] *= 8.0
+    W_v[d:] *= 0.05
+    norm_scale = (1.0 + rng.standard_normal(K) * 0.1).astype(np.float32)
+
+    model, info = _matmul_nbits_qkv_qk_norm_rope_model(
+        num_heads,
+        kv_num_heads,
+        d,
+        K,
+        block_size,
+        N2,
+        W_q,
+        W_k,
+        W_v,
+        norm_scale,
+        seed=seed,
+        **extra,
+    )
+    # Unlike this section's own no-hop tests above, `onnx.checker.check_model`
+    # is never called on this model (or the pruned/decomposed ones below) --
+    # this environment's standalone `onnx` package has no schema registered
+    # for `SimplifiedLayerNormalization` at all (confirmed via
+    # `onnx.defs.get_schema`, in either domain), the same reason the
+    # plain-float `_qk_norm_rope_oracle_and_pruned` above never calls it
+    # either; `onnxruntime`'s own (separate) schema registry, which the
+    # real `_run` calls below go through, does know this op.
+    assert len(onnxsim.pruning._find_matmul_nbits_qkv_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=sparsity)
+
+    keep_count = max(1, kv_num_heads - round(kv_num_heads * sparsity))
+    keep_groups = np.arange(keep_count)  # group 0 (and onward) is the LARGE one(s)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    qkv_node = next(n for n in pruned.graph.node if n.name == "qkv")
+    assert next(a.i for a in qkv_node.attribute if a.name == "Nq") == len(q_idx)
+    assert next(a.i for a in qkv_node.attribute if a.name == "Nkv") == len(kv_idx)
+    attn_node = next(n for n in pruned.graph.node if n.name == "attn")
+    assert next(a.i for a in attn_node.attribute if a.name == "num_heads") == len(
+        keep_q_heads
+    )
+    assert next(a.i for a in attn_node.attribute if a.name == "kv_num_heads") == len(
+        keep_groups
+    )
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    q_B_expected = _nbits_pack_B(
+        info["qcodes_q"][q_idx], len(q_idx), info["kb"], block_size
+    )
+    k_B_expected = _nbits_pack_B(
+        info["qcodes_k"][kv_idx], len(kv_idx), info["kb"], block_size
+    )
+    v_B_expected = _nbits_pack_B(
+        info["qcodes_v"][kv_idx], len(kv_idx), info["kb"], block_size
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["q_B"]), q_B_expected
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["k_B"]), k_B_expected
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["v_B"]), v_B_expected
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["down_w"]), info["down_w"][q_idx, :]
+    )
+
+    # Decomposed-but-executable proxy for the pruned model: swap the
+    # (unrunnable-here) fused `MatMulNBitsQkv` node for a real
+    # `SimplifiedLayerNormalization` + three real `MatMulNBits` nodes,
+    # reusing every OTHER node in the pruned graph (the hop nodes, already
+    # rewritten by the pass under test, plus `attn`/`down`) verbatim.
+    decomposed_producer = [
+        onnx.helper.make_node(
+            "SimplifiedLayerNormalization",
+            ["A", "norm_scale"],
+            ["A_norm"],
+            axis=-1,
+            epsilon=1e-5,
+        ),
+        _nbits_node(
+            "mm_q",
+            "A_norm",
+            "q_raw",
+            "q_B",
+            "q_scales",
+            None,
+            "q_bias",
+            len(q_idx),
+            K,
+            block_size,
+        ),
+        _nbits_node(
+            "mm_k",
+            "A_norm",
+            "k_raw",
+            "k_B",
+            "k_scales",
+            None,
+            "k_bias",
+            len(kv_idx),
+            K,
+            block_size,
+        ),
+        _nbits_node(
+            "mm_v",
+            "A_norm",
+            "v",
+            "v_B",
+            "v_scales",
+            None,
+            "v_bias",
+            len(kv_idx),
+            K,
+            block_size,
+        ),
+    ]
+    rest_nodes = [n for n in pruned.graph.node if n.name != "qkv"]
+    decomposed_graph = onnx.helper.make_graph(
+        decomposed_producer + rest_nodes,
+        "g_decomposed",
+        inputs=[
+            onnx.helper.make_tensor_value_info(
+                "A", onnx.TensorProto.FLOAT, [info["batch"], info["seq"], K]
+            )
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info(
+                "Z", onnx.TensorProto.FLOAT, [info["batch"], info["seq"], N2]
+            )
+        ],
+        initializer=list(pruned.graph.initializer),
+    )
+    decomposed_model = onnx.helper.make_model(
+        decomposed_graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    decomposed_model.ir_version = 10
+
+    rng2 = np.random.default_rng(seed + 1000)
+    x = rng2.standard_normal((info["batch"], info["seq"], K)).astype(np.float32)
+    (z_decomposed,) = _run(decomposed_model, {"A": x})
+
+    def _rmsnorm(a, scale, eps):
+        rms = np.sqrt(np.mean(a.astype(np.float64) ** 2, axis=-1, keepdims=True) + eps)
+        return ((a.astype(np.float64) / rms) * scale.astype(np.float64)).astype(
+            np.float32
+        )
+
+    x_norm = _rmsnorm(x, norm_scale, 1e-5)
+    w_q_dequant = _nbits_dequant(info["qcodes_q"], info["scales_q"], None, block_size)
+    w_k_dequant = _nbits_dequant(info["qcodes_k"], info["scales_k"], None, block_size)
+    w_v_dequant = _nbits_dequant(info["qcodes_v"], info["scales_v"], None, block_size)
+
+    oracle_extra = dict(extra)
+    q_rotary_num_heads = oracle_extra.pop("q_rotary_num_heads", None)
+    k_rotary_num_heads = oracle_extra.pop("k_rotary_num_heads", None)
+    with_rope = oracle_extra.pop("with_rope", True)
+    oracle, _ = _gqa_qk_norm_rope_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=d,
+        Out=N2,
+        seed=seed,
+        packed=False,
+        with_norm=True,
+        with_rope=with_rope,
+        wq=w_q_dequant[q_idx].T.astype(np.float32),
+        wk=w_k_dequant[kv_idx].T.astype(np.float32),
+        wv=w_v_dequant[kv_idx].T.astype(np.float32),
+        wout=info["down_w"][q_idx, :],
+        q_gamma=info["q_gamma"],
+        k_gamma=info["k_gamma"],
+        cos=info["cos"],
+        sin=info["sin"],
+        position_ids=info["position_ids"],
+        batch=info["batch"],
+        seq=info["seq"],
+        q_rotary_num_heads=(
+            None
+            if q_rotary_num_heads is None or q_rotary_num_heads == 0
+            else len(keep_q_heads)
+        ),
+        k_rotary_num_heads=(
+            None
+            if k_rotary_num_heads is None or k_rotary_num_heads == 0
+            else len(keep_groups)
+        ),
+        **oracle_extra,
+    )
+    (z_oracle,) = _run(oracle, {"X": x_norm})
+
+    return pruned, decomposed_model, z_decomposed, z_oracle, keep_groups, keep_q_heads
+
+
+def test_matmul_nbits_qkv_qk_norm_rope_pruning_matches_oracle_exactly():
+    # The common export shape (see this section's own top comment): both
+    # Q's and K's own branch get a per-head `SimplifiedLayerNorm` sandwich
+    # *and* `RotaryEmbedding`, `RotaryEmbedding`'s own `num_heads` left at
+    # the schema's `0` ("infer from shape") -- confirmed, for the
+    # plain-float producer above, to self-adjust to the new post-pruning
+    # head count with no attribute rewrite needed; this test confirms the
+    # identical fact holds for the `MatMulNBitsQkv`-fused producer too.
+    # `d=8` (unlike this section's own no-hop tests' `d=2`): the real
+    # `GroupQueryAttention` CPU kernel this test runs end to end requires
+    # `head_size` be a multiple of 8 (confirmed empirically) -- the no-hop
+    # tests never execute `GroupQueryAttention` itself (only Q's/K's/V's own
+    # decomposed projection), so they never hit this floor.
+    num_heads, kv_num_heads, d, K, block_size, N2 = 4, 2, 8, 32, 32, 6
+    pruned, decomposed, z_decomposed, z_oracle, keep_groups, keep_q_heads = (
+        _matmul_nbits_qkv_qk_norm_rope_oracle_and_pruned(
+            num_heads, kv_num_heads, d, K, block_size, N2, seed=700, sparsity=0.5
+        )
+    )
+    assert len(keep_groups) == 1
+    assert len(keep_q_heads) == 2
+
+    rotary_nodes = [n for n in pruned.graph.node if n.op_type == "RotaryEmbedding"]
+    assert len(rotary_nodes) == 2
+    for n in rotary_nodes:
+        nh = next(a.i for a in n.attribute if a.name == "num_heads")
+        assert nh == 0  # left at the self-adjusting schema default, unchanged
+
+    np.testing.assert_allclose(z_decomposed, z_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_matmul_nbits_qkv_qk_norm_rope_pruning_updates_explicit_rotary_num_heads():
+    # The partial-rotary case (`onnxruntime_genai`'s own
+    # `make_rotary_embedding`: "num_heads=0 if partial_rotary_factor == 1.0
+    # else num_heads") leaves `RotaryEmbedding`'s own `num_heads` attribute
+    # *non*-zero -- the one crossed-hop constant that genuinely does need
+    # rewriting post-pruning -- exercised here together with a partial
+    # `rotary_embedding_dim` (half of `head_size`), mirroring this section's
+    # own plain-float precedent
+    # (`test_gqa_packed_qkv_qk_norm_rope_pruning_updates_explicit_rotary_num_heads`).
+    num_heads, kv_num_heads, d, K, block_size, N2 = 4, 2, 8, 32, 32, 6
+    pruned, decomposed, z_decomposed, z_oracle, keep_groups, keep_q_heads = (
+        _matmul_nbits_qkv_qk_norm_rope_oracle_and_pruned(
+            num_heads,
+            kv_num_heads,
+            d,
+            K,
+            block_size,
+            N2,
+            seed=701,
+            sparsity=0.5,
+            rotary_embedding_dim=d // 2,
+            q_rotary_num_heads=num_heads,
+            k_rotary_num_heads=kv_num_heads,
+        )
+    )
+    q_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "RotaryEmbedding" and n.input[0].startswith("q_")
+    )
+    k_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "RotaryEmbedding" and n.input[0].startswith("k_")
+    )
+    assert next(a.i for a in q_rot.attribute if a.name == "num_heads") == len(
+        keep_q_heads
+    )
+    assert next(a.i for a in k_rot.attribute if a.name == "num_heads") == len(
+        keep_groups
+    )
+
+    np.testing.assert_allclose(z_decomposed, z_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_matmul_nbits_qkv_direct_wiring_pruning_still_matches_decomposed_oracle():
+    # Regression guard: the pre-existing "Q/K/V feed the attention op
+    # directly, no norm/RoPE hop" shape (this section's own original
+    # coverage, before this hop existed) must still match and prune
+    # identically -- the hop is purely additive/optional, never a behavior
+    # change for a graph that already matched. This re-runs
+    # ``test_matmul_nbits_qkv_pruning_matches_decomposed_oracle``'s own
+    # scenario through the (now hop-aware) matcher/apply pair.
+    num_heads, kv_num_heads, d, K, block_size, N2 = 4, 2, 2, 32, 32, 5
+    rng = np.random.default_rng(702)
+    W_q = (rng.standard_normal((num_heads * d, K)) * 0.3).astype(np.float32)
+    W_k = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    W_v = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    W_q[:4] *= 8.0
+    W_q[4:] *= 0.05
+    W_k[:2] *= 8.0
+    W_k[2:] *= 0.05
+    W_v[:2] *= 8.0
+    W_v[2:] *= 0.05
+    bias_q = (rng.standard_normal(num_heads * d) * 0.05).astype(np.float32)
+    bias_k = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    bias_v = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    norm_scale = (1.0 + rng.standard_normal(K) * 0.1).astype(np.float32)
+
+    model, info = _matmul_nbits_qkv_model(
+        num_heads,
+        kv_num_heads,
+        d,
+        K,
+        block_size,
+        N2,
+        W_q,
+        W_k,
+        W_v,
+        bias_q,
+        bias_k,
+        bias_v,
+        norm_scale,
+    )
+    assert len(onnxsim.pruning._find_matmul_nbits_qkv_chains(model.graph)) == 1
+    chain = onnxsim.pruning._find_matmul_nbits_qkv_chains(model.graph)[0]
+    assert chain.q_norm_rope is None
+    assert chain.k_norm_rope is None
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    qkv_node = next(n for n in pruned.graph.node if n.name == "qkv")
+    assert next(a.i for a in qkv_node.attribute if a.name == "Nq") == 4
+    assert next(a.i for a in qkv_node.attribute if a.name == "Nkv") == 2
+
+
 def test_matmul_nbits_mlp_qkv_pruning_dry_run_matches_real_call():
     N, K, N2, block_size = 8, 32, 5, 32
     rng = np.random.default_rng(500)
