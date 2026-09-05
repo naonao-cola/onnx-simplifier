@@ -47,6 +47,7 @@ from onnxsim.embedding_quantization import (
 from onnxsim.finetune import apply_pruning_finetune
 from onnxsim.flexround import apply_flexround
 from onnxsim.fptq import apply_fptq
+from onnxsim.gear import apply_gear
 from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
@@ -297,6 +298,7 @@ __all__ = [
     "apply_double_quantization",
     "apply_double_quantization_cpp",
     "quantize_kv_cache",
+    "apply_gear",
     "quantize_embedding_binary",
     "quantize_embedding_int8",
     "quantize_weight_only_matmul_nbits",
