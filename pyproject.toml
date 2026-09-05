@@ -49,6 +49,12 @@ plot = ["matplotlib"]
 # into ONNX before simplifying it. Heavy and unrelated to onnxsim's own
 # ONNX-to-ONNX pipeline, so kept out of the base dependencies.
 transformers = ["torch", "transformers", "optimum[exporters]", "optimum-onnx"]
+# Needed by onnxsim.export_diffusion_model(), which calls
+# optimum.exporters.onnx.main_export to turn a Hugging Face diffusers
+# pipeline (Stable Diffusion, SDXL, ...) into ONNX before simplifying it.
+# Heavy and unrelated to onnxsim's own ONNX-to-ONNX pipeline, so kept out of
+# the base dependencies.
+diffusion = ["torch", "diffusers", "optimum[exporters]", "optimum-onnx"]
 
 [project.urls]
 Homepage = "https://github.com/onnxsim/onnxsim"
