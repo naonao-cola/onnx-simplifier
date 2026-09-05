@@ -313,7 +313,21 @@ def test_bf16_weight_matches_float32_reference_after_cast(tmp_path):
     name = "model.layers.0.input_layernorm.weight"
     f32 = weights[name].astype("<f4")
     bf16_bits = (f32.view("<u4") >> 16).astype("<u2")
-    weights[name] = (bf16_bits.astype("<u4") << 16).view("<f4")
+    # NumPy's binary operators (here, `<< 16`) return a *native*-byte-order
+    # result even when their operand is explicitly little-endian-tagged (the
+    # `.astype("<u2")` two lines up survives this because `.astype()` itself
+    # is byte-order-aware and re-encodes; a bare arithmetic op is not) -- so
+    # on a big-endian host, `(bf16_bits.astype("<u4") << 16)` is a *native*
+    # (big-endian) uint32 holding the correct bit pattern, and a bare
+    # `.view("<f4")` on top of that reinterprets those big-endian bytes as
+    # little-endian, producing a denormal near-zero garbage value instead of
+    # the intended widened float. Confirmed on real s390x hardware (this test
+    # passes on little-endian, where native and "<u4" already coincide, which
+    # is why it went unnoticed there). The extra `.astype("<u4")` re-encodes
+    # the value into genuinely little-endian bytes before the final `.view()`
+    # reinterprets them -- a no-op copy on a little-endian host, a real
+    # byte-order fix on a big-endian one.
+    weights[name] = (bf16_bits.astype("<u4") << 16).astype("<u4").view("<f4")
 
     header = {}
     offset = 0
