@@ -33322,7 +33322,13 @@ def apply_structured_pruning_dynamic_quantize_matmul(
 # shape-preserving unary hops, ``_UNARY_PASS_THROUGH``, plus a
 # channel-agnostic ``Clip`` -- :func:`_match_clip_channel_pass_through`, the
 # same helper :func:`_walk_to_conv_consumer` already uses for the identical
-# ReLU6 shape on a plain-float Conv chain) is matched -- a plain float
+# ReLU6 shape on a plain-float Conv chain -- plus a depthwise ``ConvInteger``
+# mid-chain hop, reached through its own dedicated ``DynamicQuantizeLinear``
+# producer (see :func:`_match_conv_integer_depthwise_pass_through`/
+# :class:`_ConvIntegerPassThrough`): the canonical MobileNetV1/V2/V3
+# ``pointwise -> depthwise -> pointwise`` unit, mirroring exactly how this
+# module's plain-float Conv family already treats a depthwise ``Conv`` hop
+# (:func:`_match_depthwise_conv_pass_through`) -- is matched -- a plain float
 # ``Conv`` peer on either side is declined outright, not attempted.
 # This is a real, deliberate scope narrowing (see this module's own
 # docstring on drawing scope where it was actually verified, not where it
@@ -33350,9 +33356,13 @@ def apply_structured_pruning_dynamic_quantize_matmul(
 #     so an absent one is simply outside what was empirically confirmed
 #     safe, the same bar the ``DynamicQuantizeMatMul`` section's own top
 #     comment already applies to an absent `b_zero_point`.
-#   * A general grouped or depthwise ``ConvInteger`` (`group != 1`), or a
-#     weight of rank other than 4 (2-D spatial Conv only) -- mirrors the
-#     QOperator/QDQ sections' own identical restrictions for ``QLinearConv``.
+#   * A general grouped or depthwise ``ConvInteger`` (`group != 1`) reached
+#     as a chain's own producer or consumer ENDPOINT, or a weight of rank
+#     other than 4 (2-D spatial Conv only) -- mirrors the QOperator/QDQ
+#     sections' own identical restrictions for ``QLinearConv``. (A depthwise
+#     ``ConvInteger`` reached MID-CHAIN, between two ordinary `group == 1`
+#     endpoints, *is* matched -- see :func:`_match_conv_integer_depthwise_pass_through`
+#     above.)
 #   * A ``Cast`` rescaling to anything other than plain ``FLOAT`` -- never
 #     confirmed for a `FLOAT16`/`BFLOAT16` Conv output, so declined outright
 #     rather than guessed at.
@@ -33608,6 +33618,245 @@ def _match_conv_integer(
     )
 
 
+@dataclass(frozen=True)
+class _ConvIntegerPassThrough:
+    """A depthwise ``ConvInteger`` node (``group == in_channels ==
+    out_channels == n_channels``, weight shape ``[n_channels, 1, kH, kW]``)
+    sitting MID-CHAIN between two ordinary (``group == 1``) ``ConvInteger``-
+    based Conv layers -- the canonical MobileNetV1/V2/V3 depthwise-separable-
+    conv unit (``pointwise -> depthwise -> pointwise``) after real dynamic
+    quantization. This is the quantized analogue of :class:`_ConvPassThrough`'s
+    own depthwise plain-``Conv`` hop (see :func:`_match_depthwise_conv_pass_through`):
+    a depthwise Conv mixes no channels at all -- output channel ``i``
+    depends only on input channel ``i`` -- so it needs no independent
+    importance ranking of its own, and is carried on the matched
+    :class:`_ConvIntegerChain` purely so
+    :func:`apply_structured_pruning_dynamic_quantize_conv` can slice its own
+    int8 ``[n_channels, 1, kH, kW]`` weight (axis 0) and, if present, plain
+    float ``[n_channels]`` bias by the *same* `keep` index set the chain's
+    real producer/consumer already use, then shrink its own ``group``
+    attribute to the new channel count via :func:`_set_conv_group_attr` --
+    mirrors :func:`_apply_conv_pass_through_hop`'s identical depthwise-Conv
+    treatment exactly, just against an int8 weight instead of a float one.
+
+    `w_scale`/`w_zero_point` are always per-tensor scalar here (the identical
+    empirically-confirmed fact this section's own top comment already
+    documents for a terminal ``ConvInteger`` -- ORT's ``ConvInteger``
+    quantizer never emits a per-channel scale/zero-point for a depthwise
+    node either), so neither is ever sliced -- only `w_init`/`bias_init` are
+    kept here at all. `node` is the depthwise ``ConvInteger`` itself;
+    `cast_node`/`rescale_mul_node`/`bias_add_node` are kept only so
+    :func:`apply_structured_pruning_dynamic_quantize_conv` can mark their own
+    (now-stale-shaped) outputs for `value_info` cleanup, exactly like the
+    chain's real producer already does for its own identical trio -- their
+    own tensors are never written to (this hop's `group`/weight/bias update
+    is the only rewrite it needs; the always-per-tensor `scale` and the
+    `Reshape`'s shape initializer need no adjustment at all, mirroring
+    :func:`_slice_conv_integer_producer`'s own identical bias treatment).
+    See :func:`_match_conv_integer_depthwise_pass_through`.
+    """
+
+    node: onnx.NodeProto
+    cast_node: onnx.NodeProto
+    rescale_mul_node: onnx.NodeProto
+    bias_add_node: Optional[onnx.NodeProto]
+    w_init: onnx.TensorProto
+    bias_init: Optional[onnx.TensorProto]
+
+
+def _match_conv_integer_depthwise_pass_through(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    producers_of: Dict[str, onnx.NodeProto],
+    n_channels: int,
+    expected_dq_node: onnx.NodeProto,
+) -> Optional[Tuple[_ConvIntegerPassThrough, str]]:
+    """If `node` is a depthwise ``ConvInteger`` (``group == in_channels ==
+    out_channels == n_channels``, weight shape ``[n_channels, 1, kH, kW]``,
+    scalar `w_scale`/`w_zero_point` -- the same per-tensor bar
+    :func:`_match_conv_integer` already holds a terminal ``ConvInteger`` to)
+    reached via `expected_dq_node` (its own dedicated
+    ``DynamicQuantizeLinear`` producer, already resolved by the caller,
+    :func:`_walk_to_conv_integer_consumer`, as the sole consumer of the
+    walk's current tensor), followed by the same ``Cast`` -> rescale ``Mul``
+    -> optional bias ``Reshape``/``Add`` neighborhood a terminal
+    ``ConvInteger`` has (see this section's own top comment) -- returns the
+    matched :class:`_ConvIntegerPassThrough` together with the tensor name
+    this depthwise unit's own logical output is (the bias ``Add``'s output
+    when a bias was matched, the rescale ``Mul``'s output otherwise), for
+    the caller to continue walking forward from. Mirrors
+    :func:`_match_depthwise_conv_pass_through`'s identical shape check for
+    the plain-float case. ``None`` whenever anything is ambiguous,
+    non-constant, shared, or otherwise out of the empirically-verified
+    scope, never guessed at.
+    """
+    if node.op_type != "ConvInteger" or node.domain != "":
+        return None
+    if len(node.input) != 4 or len(node.output) != 1:
+        return None
+    x_name, w_name, x_zp_name, w_zp_name = node.input
+    if not (x_name and w_name and x_zp_name and w_zp_name):
+        return None
+
+    group = _matmul_nbits_int_attr(node, "group", 1)
+    if group != n_channels:
+        return None  # not this chain's own depthwise hop (an ordinary
+        # group == 1 node is handled by _match_conv_integer instead; any
+        # other group is a general grouped ConvInteger, out of scope, see
+        # this section's own top comment)
+
+    w_init = initializer_map.get(w_name)
+    if w_init is None or w_init.data_type not in (
+        onnx.TensorProto.INT8,
+        onnx.TensorProto.UINT8,
+    ):
+        return None  # non-constant, or wrong-dtype, w
+    dims = list(w_init.dims)
+    if len(dims) != 4 or dims[0] != n_channels or dims[1] != 1:
+        return None  # not the depthwise [n_channels, 1, kH, kW] shape
+    if len(consumers_of.get(w_name, [])) != 1:
+        return None  # shared/tied weight -- another node reads it too
+
+    w_zp_init = initializer_map.get(w_zp_name)
+    if w_zp_init is None or w_zp_init.data_type != w_init.data_type:
+        return None  # non-constant, or dtype-mismatched, w_zero_point
+    if list(w_zp_init.dims) not in ([], [1]):
+        return None  # non-scalar w_zero_point -- never confirmed
+        # empirically (see this section's own top comment), declined
+
+    dq_node = producers_of.get(x_name)
+    if (
+        dq_node is None
+        or dq_node is not expected_dq_node
+        or dq_node.op_type != "DynamicQuantizeLinear"
+        or dq_node.domain != ""
+        or len(dq_node.input) != 1
+        or len(dq_node.output) != 3
+        or dq_node.output[0] != x_name
+        or dq_node.output[2] != x_zp_name
+    ):
+        return None  # x/x_zero_point don't resolve to the expected shared
+        # DynamicQuantizeLinear producer
+
+    x_scale_name = dq_node.output[1]
+    scale_consumers = consumers_of.get(x_scale_name, [])
+    if len(scale_consumers) != 1:
+        return None
+    scales_mul_node = scale_consumers[0]
+    if scales_mul_node.op_type != "Mul" or len(scales_mul_node.input) != 2:
+        return None
+    sm_in0, sm_in1 = scales_mul_node.input
+    if sm_in0 == x_scale_name:
+        w_scale_name = sm_in1
+    elif sm_in1 == x_scale_name:
+        w_scale_name = sm_in0
+    else:
+        return None  # scale-combining Mul doesn't actually read x_scale
+
+    w_scale_init = initializer_map.get(w_scale_name)
+    if (
+        w_scale_init is None
+        or w_scale_init.data_type != onnx.TensorProto.FLOAT
+        or list(w_scale_init.dims) not in ([], [1])
+    ):
+        return None  # non-constant, wrong-dtype, or non-scalar w_scale
+    if len(scales_mul_node.output) != 1:
+        return None
+    combined_scale_name = scales_mul_node.output[0]
+
+    ci_out = node.output[0]
+    ci_consumers = consumers_of.get(ci_out, [])
+    if len(ci_consumers) != 1:
+        return None
+    cast_node = ci_consumers[0]
+    if (
+        cast_node.op_type != "Cast"
+        or list(cast_node.input) != [ci_out]
+        or len(cast_node.output) != 1
+    ):
+        return None
+    to_attr = next((a.i for a in cast_node.attribute if a.name == "to"), None)
+    if to_attr != onnx.TensorProto.FLOAT:
+        return None  # never confirmed for a FLOAT16/BFLOAT16 rescale target
+
+    cast_out = cast_node.output[0]
+    cast_consumers = consumers_of.get(cast_out, [])
+    if len(cast_consumers) != 1:
+        return None
+    rescale_mul_node = cast_consumers[0]
+    if (
+        rescale_mul_node.op_type != "Mul"
+        or len(rescale_mul_node.input) != 2
+        or len(rescale_mul_node.output) != 1
+    ):
+        return None
+    if {rescale_mul_node.input[0], rescale_mul_node.input[1]} != {
+        cast_out,
+        combined_scale_name,
+    }:
+        return None  # rescale Mul doesn't actually combine the cast Conv
+        # output with the scale-combining Mul's own output
+
+    rescale_out = rescale_mul_node.output[0]
+    bias_add_node: Optional[onnx.NodeProto] = None
+    bias_init: Optional[onnx.TensorProto] = None
+    final_out = rescale_out
+    rescale_consumers = consumers_of.get(rescale_out, [])
+    if len(rescale_consumers) == 1:
+        candidate_add = rescale_consumers[0]
+        if (
+            candidate_add.op_type == "Add"
+            and len(candidate_add.input) == 2
+            and len(candidate_add.output) == 1
+        ):
+            add_in0, add_in1 = candidate_add.input
+            other = None
+            if add_in0 == rescale_out:
+                other = add_in1
+            elif add_in1 == rescale_out:
+                other = add_in0
+            if other is not None:
+                reshape_candidate = producers_of.get(other)
+                if (
+                    reshape_candidate is not None
+                    and reshape_candidate.op_type == "Reshape"
+                    and len(reshape_candidate.input) == 2
+                    and len(reshape_candidate.output) == 1
+                    and reshape_candidate.output[0] == other
+                    and len(consumers_of.get(other, [])) == 1
+                ):
+                    bias_name, shape_name = reshape_candidate.input
+                    cand_bias = initializer_map.get(bias_name)
+                    shape_init = initializer_map.get(shape_name)
+                    if (
+                        cand_bias is not None
+                        and shape_init is not None
+                        and _is_supported_float_dtype(cand_bias.data_type)
+                        and list(cand_bias.dims) == [n_channels]
+                        and len(consumers_of.get(bias_name, [])) == 1
+                    ):
+                        bias_add_node = candidate_add
+                        bias_init = cand_bias
+                        final_out = candidate_add.output[0]
+                    # else: doesn't match the confirmed bias shape -- treated
+                    # as bias-absent below, not an error (mirrors
+                    # _match_conv_integer's own identical "best-effort, else
+                    # no bias" bar)
+
+    return (
+        _ConvIntegerPassThrough(
+            node=node,
+            cast_node=cast_node,
+            rescale_mul_node=rescale_mul_node,
+            bias_add_node=bias_add_node,
+            w_init=w_init,
+            bias_init=bias_init,
+        ),
+        final_out,
+    )
+
+
 def _conv_integer_dequantized_nk(w: _ConvIntegerConv) -> np.ndarray:
     """The full float64 ``(N, C*kH*kW)`` dequantized weight matrix `w`
     refers to, for IMPORTANCE RANKING ONLY -- never written back to the
@@ -33653,6 +33902,11 @@ class _ConvIntegerChain:
     chain_ops: Tuple[onnx.NodeProto, ...]
     consumer: _ConvIntegerConv
     n_channels: int
+    # Depthwise ConvInteger hops the chain walk crossed transparently between
+    # the real producer and the real consumer (see
+    # :class:`_ConvIntegerPassThrough`); empty for the common case of no
+    # depthwise mid-chain hop.
+    conv_pass_through: Tuple[_ConvIntegerPassThrough, ...] = ()
 
 
 def _walk_to_conv_integer_consumer(
@@ -33663,7 +33917,13 @@ def _walk_to_conv_integer_consumer(
     graph_outputs: Set[str],
     n_channels: int,
     max_hops: int,
-) -> Optional[Tuple[_ConvIntegerConv, Tuple[onnx.NodeProto, ...]]]:
+) -> Optional[
+    Tuple[
+        _ConvIntegerConv,
+        Tuple[onnx.NodeProto, ...],
+        Tuple[_ConvIntegerPassThrough, ...],
+    ]
+]:
     """From tensor `start` (a matched ``ConvInteger`` Conv layer's own
     logical output, :func:`_conv_integer_final_output`), walks forward
     through shape-preserving unary activations (`_UNARY_PASS_THROUGH`) --
@@ -33671,9 +33931,13 @@ def _walk_to_conv_integer_consumer(
     the same helper :func:`_walk_to_conv_consumer` already uses for the
     identical ReLU6 shape on a plain-float Conv chain -- MobileNet/
     EfficientNet-Lite's `Conv -> Clip(0, 6) -> ConvInteger` dynamically-
-    quantized topology needs the exact same transparent hop) -- with
-    no other consumer anywhere along the way, until a same-family
-    ``ConvInteger``-based consumer (reached through its own
+    quantized topology needs the exact same transparent hop) -- plus a
+    depthwise ``ConvInteger`` mid-chain hop, reached through its own
+    dedicated ``DynamicQuantizeLinear`` producer (see
+    :func:`_match_conv_integer_depthwise_pass_through` -- the canonical
+    MobileNetV1/V2/V3 `pointwise -> depthwise -> pointwise` unit) -- with
+    no other consumer anywhere along the way, until a same-family, ordinary
+    (`group == 1`) ``ConvInteger``-based consumer (reached through its own
     ``DynamicQuantizeLinear`` producer) is found whose own `K` matches
     `n_channels` -- mirrors :func:`_walk_to_qop_consumer`'s own
     ``QLinearConv``-only walk, DELIBERATELY narrower than
@@ -33684,6 +33948,7 @@ def _walk_to_conv_integer_consumer(
     such a consumer.
     """
     chain_ops: List[onnx.NodeProto] = []
+    conv_pass_through: List[_ConvIntegerPassThrough] = []
     cur = start
     for _hop in range(max_hops):
         candidates = consumers_of.get(cur, [])
@@ -33699,11 +33964,30 @@ def _walk_to_conv_integer_consumer(
             y_name = nxt.output[0]
             y_consumers = consumers_of.get(y_name, [])
             if len(y_consumers) == 1 and y_consumers[0].op_type == "ConvInteger":
+                ci_node = y_consumers[0]
                 m = _match_conv_integer(
-                    y_consumers[0], initializer_map, consumers_of, producers_of
+                    ci_node, initializer_map, consumers_of, producers_of
                 )
                 if m is not None and m.dq_node is nxt and m.K == n_channels:
-                    return m, tuple(chain_ops)
+                    return m, tuple(chain_ops), tuple(conv_pass_through)
+                depthwise = _match_conv_integer_depthwise_pass_through(
+                    ci_node,
+                    initializer_map,
+                    consumers_of,
+                    producers_of,
+                    n_channels,
+                    nxt,
+                )
+                if depthwise is not None:
+                    hop, final_out = depthwise
+                    if (
+                        len(consumers_of.get(final_out, [])) != 1
+                        or final_out in graph_outputs
+                    ):
+                        return None
+                    conv_pass_through.append(hop)
+                    cur = final_out
+                    continue
             return None
 
         if (
@@ -33772,8 +34056,12 @@ def _find_conv_integer_chains(graph: onnx.GraphProto) -> List[_ConvIntegerChain]
         )
         if found is None:
             continue
-        consumer, chain_ops = found
-        chains.append(_ConvIntegerChain(m, chain_ops, consumer, m.N))
+        consumer, chain_ops, conv_pass_through = found
+        chains.append(
+            _ConvIntegerChain(
+                m, chain_ops, consumer, m.N, conv_pass_through=conv_pass_through
+            )
+        )
     return chains
 
 
@@ -33807,6 +34095,20 @@ def apply_structured_pruning_dynamic_quantize_conv(
     input channels of the consumer's own weight. The producer's own PLAIN
     FLOAT bias (never quantized) is sliced directly, with no rescale step
     at all.
+
+    A depthwise ``ConvInteger`` (``group == in_channels == out_channels``)
+    sitting MID-CHAIN between the producer and the consumer -- the canonical
+    MobileNetV1/V2/V3 ``pointwise -> depthwise -> pointwise`` unit -- is
+    recognized transparently (see :class:`_ConvIntegerPassThrough`/
+    :func:`_match_conv_integer_depthwise_pass_through`) and has its own int8
+    weight (axis 0) and plain-float bias (if present) sliced by the *same*
+    `keep` index set, with its own ``group`` attribute shrunk to match --
+    mirroring exactly how this module's plain-float Conv family already
+    handles a depthwise ``Conv`` hop (see :func:`_apply_conv_pass_through_hop`).
+    A depthwise ``ConvInteger`` reached as the chain's own producer or
+    consumer ENDPOINT (rather than a mid-chain hop) is still declined, as
+    before -- only a general ``group == 1`` ``ConvInteger`` is ever matched
+    in that role.
 
     Unlike :func:`apply_structured_pruning_dynamic_quantize_matmul`, a
     plain-float ``Conv`` peer on either side of a chain is never matched --
@@ -33869,6 +34171,24 @@ def apply_structured_pruning_dynamic_quantize_conv(
 
             _slice_conv_integer_producer(p, keep)
             _slice_conv_integer_consumer(c, keep)
+
+            for hop in chain.conv_pass_through:
+                # Mirrors _apply_conv_pass_through_hop's identical
+                # depthwise-Conv treatment: axis-0 weight slice, bias slice
+                # (if present), group shrunk to the new channel count.
+                # w_scale/w_zero_point are always per-tensor scalar (see
+                # _ConvIntegerPassThrough's own docstring), so never touched.
+                _slice_producer_weight(
+                    hop.w_init, weight_transposed=False, keep=keep, is_conv=True
+                )
+                if hop.bias_init is not None:
+                    _slice_last_axis(hop.bias_init, keep)
+                _set_conv_group_attr(hop.node, keep_count)
+                stale_value_info.add(hop.node.output[0])
+                stale_value_info.add(hop.cast_node.output[0])
+                stale_value_info.add(hop.rescale_mul_node.output[0])
+                if hop.bias_add_node is not None:
+                    stale_value_info.add(hop.bias_add_node.output[0])
 
             producer_touched.add(p_key)
             consumer_touched.add(c_key)

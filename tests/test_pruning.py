@@ -45119,6 +45119,312 @@ def test_dynamic_quantize_conv_clip_relu6_pass_through_matches_and_prunes():
     np.testing.assert_array_equal(y_pruned, y_ref)
 
 
+def _dqconv_depthwise_chain_model_from_weights(
+    c,
+    m1,
+    m2,
+    w1f,
+    wdf,
+    w2f,
+    b1f=None,
+    bdf=None,
+    spatial=8,
+    activation="Relu",
+):
+    """The `_dqconv_model_from_weights` analogue for a full ``pointwise
+    ConvInteger -> depthwise ConvInteger -> pointwise ConvInteger`` chain --
+    the canonical MobileNetV1/V2/V3 depthwise-separable-conv unit -- after
+    real dynamic quantization. `w1f`/`w2f` are ordinary (`group == 1`)
+    pointwise (``1x1``) Conv weights; `wdf` is the depthwise stage's own
+    ``[m1, 1, khd, kwd]`` weight (`group == m1`). Every weight is quantized
+    via the REAL ``onnxruntime.quantization.quantize_dynamic`` tool
+    (`_quantize_dynamic_conv_weight`, reused as-is for `wdf` too -- the
+    quantizer only ever sees a plain tensor to quantize, never the source
+    ``Conv``'s own `group` semantics, so the genuine int8 codes/scale/
+    zero-point it emits for that shape are identical regardless of which
+    Conv the wrapper model around it declares). Returns ``(model, info)``
+    mirroring `_dqconv_model_from_weights`'s own convention, `info`
+    additionally carrying the depthwise stage's own float/quantized arrays
+    (`Wdf`/`Wdq`/`Wds`/`Wdzp`/`Bdf`).
+    """
+    w1q, w1s, w1zp = _quantize_dynamic_conv_weight(w1f, spatial=spatial)
+    wdq, wds, wdzp = _quantize_dynamic_conv_weight(wdf, spatial=spatial)
+    w2q, w2s, w2zp = _quantize_dynamic_conv_weight(w2f, spatial=spatial)
+
+    khd, kwd = wdf.shape[2], wdf.shape[3]
+    phd, pwd = (khd - 1) // 2, (kwd - 1) // 2
+
+    if b1f is not None:
+        bias1_ops = """
+          b1r = Reshape(b1, b1_shape)
+          c1 = Add(c1s, b1r)
+        """
+        c1_out = "c1"
+    else:
+        bias1_ops = ""
+        c1_out = "c1s"
+
+    if bdf is not None:
+        biasd_ops = """
+          bdr = Reshape(bd, bd_shape)
+          cd = Add(cds, bdr)
+        """
+        cd_out = "cd"
+    else:
+        biasd_ops = ""
+        cd_out = "cds"
+
+    body = f"""
+    g (float[1,{c},{spatial},{spatial}] x) => (float[1,{m2},{spatial},{spatial}] y)
+    {{
+      xq, x_scale, x_zero_point = DynamicQuantizeLinear(x)
+      combined_scale1 = Mul(x_scale, w1_scale)
+      c1i = ConvInteger<kernel_shape=[1,1]>(xq, w1_quantized, x_zero_point, w1_zero_point)
+      c1f = Cast<to=1>(c1i)
+      c1s = Mul(c1f, combined_scale1)
+      {bias1_ops}
+      h1 = {activation}({c1_out})
+      rq, r_scale, r_zero_point = DynamicQuantizeLinear(h1)
+      combined_scaled = Mul(r_scale, wd_scale)
+      cdi = ConvInteger<kernel_shape=[{khd},{kwd}], pads=[{phd},{pwd},{phd},{pwd}], group={m1}>(rq, wd_quantized, r_zero_point, wd_zero_point)
+      cdf = Cast<to=1>(cdi)
+      cds = Mul(cdf, combined_scaled)
+      {biasd_ops}
+      hd = {activation}({cd_out})
+      rq2, r_scale2, r_zero_point2 = DynamicQuantizeLinear(hd)
+      combined_scale2 = Mul(r_scale2, w2_scale)
+      c2i = ConvInteger<kernel_shape=[1,1]>(rq2, w2_quantized, r_zero_point2, w2_zero_point)
+      c2f = Cast<to=1>(c2i)
+      y = Mul(c2f, combined_scale2)
+    }}
+    """
+    inits = [
+        onnx.numpy_helper.from_array(w1q, "w1_quantized"),
+        onnx.numpy_helper.from_array(w1s, "w1_scale"),
+        onnx.numpy_helper.from_array(w1zp, "w1_zero_point"),
+        onnx.numpy_helper.from_array(wdq, "wd_quantized"),
+        onnx.numpy_helper.from_array(wds, "wd_scale"),
+        onnx.numpy_helper.from_array(wdzp, "wd_zero_point"),
+        onnx.numpy_helper.from_array(w2q, "w2_quantized"),
+        onnx.numpy_helper.from_array(w2s, "w2_scale"),
+        onnx.numpy_helper.from_array(w2zp, "w2_zero_point"),
+    ]
+    if b1f is not None:
+        inits.append(_f32(b1f, "b1"))
+        inits.append(
+            onnx.numpy_helper.from_array(
+                np.array([1, -1, 1, 1], dtype=np.int64), "b1_shape"
+            )
+        )
+    if bdf is not None:
+        inits.append(_f32(bdf, "bd"))
+        inits.append(
+            onnx.numpy_helper.from_array(
+                np.array([1, -1, 1, 1], dtype=np.int64), "bd_shape"
+            )
+        )
+    model = _model(body, initializer=inits, opset=21)
+    return model, {
+        "W1f": w1f,
+        "Wdf": wdf,
+        "W2f": w2f,
+        "B1f": b1f,
+        "Bdf": bdf,
+        "W1q": w1q,
+        "W1s": w1s,
+        "W1zp": w1zp,
+        "Wdq": wdq,
+        "Wds": wds,
+        "Wdzp": wdzp,
+        "W2q": w2q,
+        "W2s": w2s,
+        "W2zp": w2zp,
+        "spatial": spatial,
+    }
+
+
+def _dqconv_depthwise_chain_model(
+    c, m1, m2, khd=3, kwd=3, bias1=False, biasd=False, spatial=8, seed=0
+):
+    rng = np.random.default_rng(seed)
+    w1f = (rng.standard_normal((m1, c, 1, 1)) * 0.3).astype(np.float32)
+    wdf = (rng.standard_normal((m1, 1, khd, kwd)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((m2, m1, 1, 1)) * 0.3).astype(np.float32)
+    b1f = (rng.standard_normal(m1) * 0.05).astype(np.float32) if bias1 else None
+    bdf = (rng.standard_normal(m1) * 0.05).astype(np.float32) if biasd else None
+    return _dqconv_depthwise_chain_model_from_weights(
+        c, m1, m2, w1f, wdf, w2f, b1f=b1f, bdf=bdf, spatial=spatial
+    )
+
+
+def test_dynamic_quantize_conv_depthwise_mid_chain_is_matched_and_prunes():
+    # The canonical MobileNetV1/V2/V3 `pointwise -> depthwise -> pointwise`
+    # unit, after real dynamic quantization: `_walk_to_conv_integer_consumer`
+    # must recognize the depthwise ConvInteger as a transparent mid-chain
+    # hop (via `_match_conv_integer_depthwise_pass_through`) rather than
+    # ending the walk there, and the whole three-layer chain must be pruned
+    # end to end -- the regression this task targets.
+    c, m1, m2 = 4, 6, 5
+    model, info = _dqconv_depthwise_chain_model(
+        c, m1, m2, bias1=True, biasd=True, seed=30
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_conv_integer_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == m1
+    assert len(chains[0].conv_pass_through) == 1
+    hop = chains[0].conv_pass_through[0]
+    assert hop.node.op_type == "ConvInteger"
+    assert hop.node.input[1] == "wd_quantized"
+    assert onnxsim.pruning._matmul_nbits_int_attr(hop.node, "group", 1) == m1
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_conv(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    keep_count = m1 // 2
+
+    # The producer, the depthwise mid-chain hop, and the consumer all track
+    # the SAME keep-index set -- a depthwise conv's own channel count is
+    # fixed by definition, so it must shrink in lockstep with its neighbors.
+    assert list(inits["w1_quantized"].dims) == [keep_count, c, 1, 1]
+    assert list(inits["wd_quantized"].dims) == [keep_count, 1, 3, 3]
+    assert list(inits["w2_quantized"].dims) == [m2, keep_count, 1, 1]
+    assert list(inits["wd_scale"].dims) == []  # always per-tensor, untouched
+    assert list(inits["wd_zero_point"].dims) == []
+    assert list(inits["bd"].dims) == [keep_count]
+    assert list(inits["b1"].dims) == [keep_count]
+
+    depthwise_node = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "ConvInteger" and n.input[1] == "wd_quantized"
+    )
+    assert (
+        onnxsim.pruning._matmul_nbits_int_attr(depthwise_node, "group", 1) == keep_count
+    )
+
+    rng = np.random.default_rng(31)
+    spatial = info["spatial"]
+    x = rng.standard_normal((1, c, spatial, spatial)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"x": x})
+    assert y_pruned.shape == (1, m2, spatial, spatial)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_dynamic_quantize_conv_depthwise_mid_chain_matches_independent_oracle_via_real_inference_session():
+    # This project's established quantized-section correctness bar (see
+    # `test_dynamic_quantize_conv_producer_matches_independent_oracle_via_
+    # real_inference_session`'s own identical structure): a pruned model's
+    # output must match a reference built from an INDEPENDENTLY
+    # reconstructed "already pruned" model, both run through a real
+    # onnxruntime InferenceSession.
+    c, m1, m2 = 4, 6, 5
+    model, info = _dqconv_depthwise_chain_model(
+        c, m1, m2, bias1=True, biasd=True, seed=32
+    )
+    onnx.checker.check_model(model)
+    keep = _dqconv_importance_keep(info["W1q"], info["W1s"], info["W1zp"], m1 // 2)
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_conv(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+
+    # "slice, don't recompute": the pruned graph's own quantized codes/bias
+    # (producer, depthwise hop, and consumer alike) are EXACTLY a hand-slice
+    # of the original ones; the always-per-tensor scale/zero-point are
+    # copied UNCHANGED (never resampled).
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["w1_quantized"]), info["W1q"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["wd_quantized"]), info["Wdq"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["w2_quantized"]), info["W2q"][:, keep]
+    )
+    assert onnx.numpy_helper.to_array(inits["wd_scale"]) == pytest.approx(
+        float(info["Wds"])
+    )
+    assert onnx.numpy_helper.to_array(inits["wd_zero_point"]) == float(info["Wdzp"])
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["bd"]), info["Bdf"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["b1"]), info["B1f"][keep]
+    )
+
+    ref_model, _ = _dqconv_depthwise_chain_model_from_weights(
+        c,
+        len(keep),
+        m2,
+        info["W1f"][keep],
+        info["Wdf"][keep],
+        info["W2f"][:, keep],
+        b1f=info["B1f"][keep],
+        bdf=info["Bdf"][keep],
+        spatial=info["spatial"],
+    )
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    ref_inits["w1_quantized"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1q"][keep], "w1_quantized")
+    )
+    ref_inits["w1_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1s"], "w1_scale")
+    )
+    ref_inits["w1_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1zp"], "w1_zero_point")
+    )
+    ref_inits["wd_quantized"].CopyFrom(
+        onnx.numpy_helper.from_array(info["Wdq"][keep], "wd_quantized")
+    )
+    ref_inits["wd_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["Wds"], "wd_scale")
+    )
+    ref_inits["wd_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["Wdzp"], "wd_zero_point")
+    )
+    ref_inits["w2_quantized"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2q"][:, keep], "w2_quantized")
+    )
+    ref_inits["w2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2s"], "w2_scale")
+    )
+    ref_inits["w2_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2zp"], "w2_zero_point")
+    )
+    onnx.checker.check_model(ref_model)
+
+    rng = np.random.default_rng(33)
+    spatial = info["spatial"]
+    x = rng.standard_normal((1, c, spatial, spatial)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"x": x})
+    (y_ref,) = _run(ref_model, {"x": x})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_dynamic_quantize_conv_depthwise_endpoint_still_declined():
+    # `test_dynamic_quantize_conv_grouped_is_declined`'s own coverage (a
+    # general grouped ConvInteger reached as the chain's own producer/
+    # consumer ENDPOINT) must keep declining -- only a depthwise ConvInteger
+    # reached MID-CHAIN, between two ordinary endpoints, is ever matched
+    # (see `_match_conv_integer_depthwise_pass_through`). Here the chain's
+    # own FIRST ConvInteger (the producer role) is itself made depthwise
+    # (`group == m1 == out_channels`, weight `[m1, 1, kh, kw]`) with no
+    # preceding pointwise stage at all -- a fundamentally different shape
+    # from the mid-chain case the new hop targets, and still out of scope.
+    c, m1, m2 = 6, 6, 5
+    rng = np.random.default_rng(34)
+    w1f = (rng.standard_normal((m1, 1, 3, 3)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((m2, m1, 1, 1)) * 0.3).astype(np.float32)
+    model, _info = _dqconv_model_from_weights(c, m1, m2, w1f, w2f, seed=35)
+    for node in model.graph.node:
+        if node.op_type == "ConvInteger" and node.output[0] == "c1i":
+            node.attribute.append(onnx.helper.make_attribute("group", m1))
+    chains = onnxsim.pruning._find_conv_integer_chains(model.graph)
+    assert chains == []
+
+
 def test_dynamic_quantize_conv_clip_nonscalar_min_declines():
     # A `Clip` with a per-channel-shaped (`[m1]`) `min` between two
     # `ConvInteger` chains must be declined, never guessed at -- mirrors
