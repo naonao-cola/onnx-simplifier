@@ -25,6 +25,21 @@
 // <= `naive_bytes` (every tensor given its own permanent slot, i.e. no reuse
 // at all -- the baseline "compression ratio" is measured against).
 //
+// On top of that liveness-only reuse, an in-place-aliasing pass (see
+// IsInPlaceSafeOp in memory_planning.cpp) unions a safe elementwise op's
+// input with its output whenever overwriting the input in place is provably
+// correct -- the input is not a weight/graph input/graph output, and this
+// node is its only consumer. A chain of such ops (e.g. Relu -> Sigmoid ->
+// Tanh) all collapse into one placement group needing a single slot for the
+// whole chain's span, rather than one slot per node, so the arena for a long
+// elementwise chain stays roughly constant instead of growing with its
+// length; TestInPlaceAliasingCollapsesWholeChain in memory_planning_test.cpp
+// demonstrates this directly. Aliased tensors report the identical
+// (offset, size) in `offsets` -- a downstream consumer honours the plan by
+// actually running that node's kernel in place (writing its output over the
+// input's own buffer), not merely by treating same-offset as "safe to reuse
+// after the fact" the way two disjoint-interval tensors are.
+//
 // v1 scope, deliberately:
 //   * Concrete shapes only. A tensor whose size cannot be resolved to a
 //     concrete (non-symbolic) byte count -- unknown shape/dtype, or a
@@ -44,7 +59,10 @@ struct MemoryPlan {
   // name -> (offset, size in bytes) within the shared arena, one entry per
   // planned tensor (graph inputs, node outputs, graph outputs with a
   // concrete size). Two entries' [offset, offset + size) ranges only overlap
-  // when their liveness intervals do not.
+  // when their liveness intervals do not -- except a set of tensors the
+  // in-place-aliasing pass unioned together (see the module comment above),
+  // which report the identical (offset, size) on purpose: they are the same
+  // logical storage, not merely two tensors sharing recycled space.
   std::map<std::string, std::pair<int64_t, int64_t>> offsets;
   // Size of the arena this plan requires: the high-water mark of every
   // offset + size above. 0 when there is nothing to plan.

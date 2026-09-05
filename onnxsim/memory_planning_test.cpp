@@ -53,14 +53,16 @@ void TestSingleNodeNoReuse() {
 }
 
 // A 3-node Relu chain x -> a -> b -> y (graph output), all tensors the same
-// size S=100 bytes. Every tensor overlaps only its immediate neighbor in the
-// chain (produced by the node that consumes the previous one), so
-// non-adjacent tensors (x/b, x/y, a/y) are free to share offsets while
-// adjacent ones (x/a, a/b, b/y) may not -- worked out by hand in the PR
-// description: greedy best-fit (processed in name order a, b, x, y, since
-// all four are the same size) lands on arena_bytes == 200 (half of the 400
-// a naive "one slot per tensor" allocation would need), with a and y sharing
-// offset 0 and b and x sharing offset 100.
+// size S=100 bytes. Relu is in-place-safe (see IsInPlaceSafeOp), so a and b
+// are each the sole input of the next Relu and neither is a weight/graph
+// input/graph output -- they union into one group with y (Relu(b) -> y
+// unions b into y too). x stays its own group: it is a graph input, which
+// the aliasing pass never overwrites. The two groups still overlap at the
+// x/a boundary under the same-node-boundary conservative rule, so they still
+// need separate slots -- arena_bytes is unchanged at 200 (half of the 400 a
+// naive "one slot per tensor" allocation would need) -- but now via one
+// slot for x and one *shared* slot for {a, b, y}, rather than the
+// non-aliased packing's two independently-reused slots.
 void TestChainReuse() {
   GraphView g;
   for (const char* n : {"x", "a", "b", "y"}) {
@@ -83,19 +85,92 @@ void TestChainReuse() {
   const MemoryPlan plan = ComputeActivationMemoryPlan(g);
   assert(plan.unplanned.empty());
   assert(plan.naive_bytes == 400);
-  assert(plan.arena_bytes == 200);  // 2x compression from reuse
+  assert(plan.arena_bytes == 200);  // 2x compression, now via aliasing
 
   const auto& off = plan.offsets;
-  assert(off.at("a").first == 0);
-  assert(off.at("y").first == 0);  // shares a's freed slot
-  assert(off.at("b").first == 100);
-  assert(off.at("x").first == 100);  // shares b's (later-claimed) slot
+  assert(off.at("x").first != off.at("a").first);  // still can't share with x
+  assert(off.at("a") == off.at("b"));  // a, b, y are literally one group now
+  assert(off.at("b") == off.at("y"));
+}
 
-  // No two simultaneously-live tensors may share an offset range: check the
-  // three adjacent (overlapping) pairs landed at different offsets.
+// A pure elementwise chain with no graph-input/output boundary in the
+// middle -- x -> Relu -> a -> Sigmoid -> b -> Tanh -> c -> Neg -> d ->
+// Identity -> out -- unions a, b, c, d and out into a single group (each is
+// the sole consumer of the previous value, and none is a weight/graph
+// input/graph output), leaving only x (a graph input, never aliased) in a
+// group of its own. So the arena is exactly 2 slots regardless of how long
+// the chain is, while naive_bytes keeps growing with every tensor -- the
+// asymptotic case aliasing is for, versus TestChainReuse's short chain where
+// disjoint-interval reuse alone already got to the same arena size.
+void TestInPlaceAliasingCollapsesWholeChain() {
+  GraphView g;
+  for (const char* n : {"x", "a", "b", "c", "d", "out"}) {
+    g.shapes[n] = {SymExpr(25)};
+    g.dtypes[n] = 4;  // 100 bytes each
+  }
+  g.inputs = {"x"};
+  g.outputs = {"out"};
+
+  NodeView relu, sigmoid, tanh, neg, identity;
+  relu.op_type = "Relu";
+  relu.inputs = {"x"};
+  relu.outputs = {"a"};
+  sigmoid.op_type = "Sigmoid";
+  sigmoid.inputs = {"a"};
+  sigmoid.outputs = {"b"};
+  tanh.op_type = "Tanh";
+  tanh.inputs = {"b"};
+  tanh.outputs = {"c"};
+  neg.op_type = "Neg";
+  neg.inputs = {"c"};
+  neg.outputs = {"d"};
+  identity.op_type = "Identity";
+  identity.inputs = {"d"};
+  identity.outputs = {"out"};
+  g.nodes = {relu, sigmoid, tanh, neg, identity};
+
+  const MemoryPlan plan = ComputeActivationMemoryPlan(g);
+  assert(plan.unplanned.empty());
+  assert(plan.naive_bytes == 600);  // 6 tensors x 100 bytes, no reuse credit
+  assert(plan.arena_bytes == 200);  // just x's slot + one shared slot
+
+  const auto& off = plan.offsets;
   assert(off.at("x").first != off.at("a").first);
-  assert(off.at("a").first != off.at("b").first);
-  assert(off.at("b").first != off.at("y").first);
+  assert(off.at("a") == off.at("b"));
+  assert(off.at("b") == off.at("c"));
+  assert(off.at("c") == off.at("d"));
+  assert(off.at("d") == off.at("out"));
+}
+
+// `a` feeds two separate in-place-eligible ops (Neg -> y1, Sigmoid -> y2).
+// Without the "sole consumer" guard in the aliasing pass, both would try to
+// alias `a` away, incorrectly merging y1 and y2 into the same slot despite
+// both being live simultaneously (both are graph outputs, live through the
+// end) -- corrupting whichever one a real executor computed second.
+void TestInPlaceAliasingBlockedByMultipleConsumers() {
+  GraphView g;
+  for (const char* n : {"x", "a", "y1", "y2"}) {
+    g.shapes[n] = {SymExpr(4)};
+    g.dtypes[n] = 4;  // 16 bytes each
+  }
+  g.inputs = {"x"};
+  g.outputs = {"y1", "y2"};
+
+  NodeView relu, neg, sigmoid;
+  relu.op_type = "Relu";
+  relu.inputs = {"x"};
+  relu.outputs = {"a"};
+  neg.op_type = "Neg";
+  neg.inputs = {"a"};
+  neg.outputs = {"y1"};
+  sigmoid.op_type = "Sigmoid";
+  sigmoid.inputs = {"a"};
+  sigmoid.outputs = {"y2"};
+  g.nodes = {relu, neg, sigmoid};
+
+  const MemoryPlan plan = ComputeActivationMemoryPlan(g);
+  assert(plan.unplanned.empty());
+  assert(plan.offsets.at("y1").first != plan.offsets.at("y2").first);
 }
 
 // A tensor with a symbolic (dynamic) dimension has no concrete byte size, so
@@ -126,6 +201,8 @@ void TestSymbolicShapeUnplanned() {
 int main() {
   TestSingleNodeNoReuse();
   TestChainReuse();
+  TestInPlaceAliasingCollapsesWholeChain();
+  TestInPlaceAliasingBlockedByMultipleConsumers();
   TestSymbolicShapeUnplanned();
   std::cout << "all memory_planning tests passed\n";
   return 0;
