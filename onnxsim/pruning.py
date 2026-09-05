@@ -33185,8 +33185,11 @@ def apply_structured_pruning_dynamic_quantize_matmul(
 # closely, DELIBERATELY narrower than the ``DynamicQuantizeMatMul`` section's
 # own quantized-or-plain-float union: only a ``ConvInteger``-shaped producer
 # feeding a ``ConvInteger``-shaped consumer (through zero or more
-# shape-preserving unary hops, ``_UNARY_PASS_THROUGH``) is matched -- a plain
-# float ``Conv`` peer on either side is declined outright, not attempted.
+# shape-preserving unary hops, ``_UNARY_PASS_THROUGH``, plus a
+# channel-agnostic ``Clip`` -- :func:`_match_clip_channel_pass_through`, the
+# same helper :func:`_walk_to_conv_consumer` already uses for the identical
+# ReLU6 shape on a plain-float Conv chain) is matched -- a plain float
+# ``Conv`` peer on either side is declined outright, not attempted.
 # This is a real, deliberate scope narrowing (see this module's own
 # docstring on drawing scope where it was actually verified, not where it
 # looked plausible): matching a plain ``Conv`` peer here would mean reusing
@@ -33529,7 +33532,12 @@ def _walk_to_conv_integer_consumer(
 ) -> Optional[Tuple[_ConvIntegerConv, Tuple[onnx.NodeProto, ...]]]:
     """From tensor `start` (a matched ``ConvInteger`` Conv layer's own
     logical output, :func:`_conv_integer_final_output`), walks forward
-    through shape-preserving unary activations (`_UNARY_PASS_THROUGH`) with
+    through shape-preserving unary activations (`_UNARY_PASS_THROUGH`) --
+    plus a channel-agnostic ``Clip`` (see :func:`_match_clip_channel_pass_through`,
+    the same helper :func:`_walk_to_conv_consumer` already uses for the
+    identical ReLU6 shape on a plain-float Conv chain -- MobileNet/
+    EfficientNet-Lite's `Conv -> Clip(0, 6) -> ConvInteger` dynamically-
+    quantized topology needs the exact same transparent hop) -- with
     no other consumer anywhere along the way, until a same-family
     ``ConvInteger``-based consumer (reached through its own
     ``DynamicQuantizeLinear`` producer) is found whose own `K` matches
@@ -33563,6 +33571,21 @@ def _walk_to_conv_integer_consumer(
                 if m is not None and m.dq_node is nxt and m.K == n_channels:
                     return m, tuple(chain_ops)
             return None
+
+        if (
+            nxt.op_type == "Clip"
+            and nxt.domain == ""
+            and nxt.input
+            and nxt.input[0] == cur
+            and len(nxt.output) == 1
+            and _match_clip_channel_pass_through(nxt, initializer_map)
+        ):
+            out2 = nxt.output[0]
+            if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+                return None
+            chain_ops.append(nxt)
+            cur = out2
+            continue
 
         if not (
             nxt.op_type in _UNARY_PASS_THROUGH

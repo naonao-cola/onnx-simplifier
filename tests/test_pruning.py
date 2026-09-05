@@ -44525,7 +44525,17 @@ def _quantize_dynamic_conv_weight(W, spatial=8, per_channel=False):
 
 
 def _dqconv_model_from_weights(
-    c, m1, m2, w1f, w2f, b1f=None, spatial=8, activation="Relu", seed=0
+    c,
+    m1,
+    m2,
+    w1f,
+    w2f,
+    b1f=None,
+    spatial=8,
+    activation="Relu",
+    seed=0,
+    activation_node=None,
+    extra_initializer=(),
 ):
     """Builds ``DynamicQuantizeLinear -> ConvInteger -> Cast -> Mul
     [-> Reshape -> Add] -> activation -> DynamicQuantizeLinear ->
@@ -44534,6 +44544,12 @@ def _dqconv_model_from_weights(
     (:func:`_quantize_dynamic_conv_weight`). Returns ``(model, info)`` where
     `info` carries every float/quantized array needed to hand-build an
     "already pruned" oracle.
+
+    `activation_node`, when given, is a complete ONNX-text node line
+    overriding the plain ``h1 = {activation}(...)`` node below -- e.g. a
+    ``Clip`` with explicit Min/Max operands (see
+    `_dqconv_clip_model_from_weights`) -- with `extra_initializer` carrying
+    whatever constant tensors that text line references.
     """
     w1q, w1s, w1zp = _quantize_dynamic_conv_weight(w1f, spatial=spatial)
     w2q, w2s, w2zp = _quantize_dynamic_conv_weight(w2f, spatial=spatial)
@@ -44553,6 +44569,12 @@ def _dqconv_model_from_weights(
         bias_ops = ""
         c1_out = "c1s"
 
+    activation_ops = (
+        activation_node
+        if activation_node is not None
+        else f"h1 = {activation}({c1_out})"
+    )
+
     body = f"""
     g (float[1,{c},{spatial},{spatial}] x) => (float[1,{m2},{spatial},{spatial}] y)
     {{
@@ -44562,7 +44584,7 @@ def _dqconv_model_from_weights(
       c1f = Cast<to=1>(c1i)
       c1s = Mul(c1f, combined_scale1)
       {bias_ops}
-      h1 = {activation}({c1_out})
+      {activation_ops}
       rq, r_scale, r_zero_point = DynamicQuantizeLinear(h1)
       combined_scale2 = Mul(r_scale, w2_scale)
       c2i = ConvInteger<kernel_shape=[{kh2},{kw2}], pads=[{ph2},{pw2},{ph2},{pw2}]>(rq, w2_quantized, r_zero_point, w2_zero_point)
@@ -44577,6 +44599,7 @@ def _dqconv_model_from_weights(
         onnx.numpy_helper.from_array(w2q, "w2_quantized"),
         onnx.numpy_helper.from_array(w2s, "w2_scale"),
         onnx.numpy_helper.from_array(w2zp, "w2_zero_point"),
+        *extra_initializer,
     ]
     if b1f is not None:
         inits.append(_f32(b1f, "b1"))
@@ -44598,6 +44621,71 @@ def _dqconv_model_from_weights(
         "W2zp": w2zp,
         "spatial": spatial,
     }
+
+
+def _dqconv_clip_model_from_weights(
+    c, m1, m2, w1f, w2f, b1f=None, spatial=8, min_val=0.0, max_val=6.0, seed=0
+):
+    """The `_dqconv_model_from_weights` analogue exercising
+    `_walk_to_conv_integer_consumer`'s own ``Clip`` pass-through hop (the
+    ReLU6 shape MobileNetV2/V3 and EfficientNet-Lite Conv chains use) in
+    place of a plain unary activation between the two ``ConvInteger``
+    chains -- `min_val`/`max_val` (each `None` or a Python float) become
+    scalar float32 `Min`/`Max` initializers, mirroring
+    `_clip_conv_pair_model`'s own identical convention for the plain-float
+    Conv walker's Clip hop.
+    """
+    extra_initializer = []
+    if min_val is not None:
+        extra_initializer.append(
+            onnx.numpy_helper.from_array(np.array(min_val, dtype=np.float32), "ClipMin")
+        )
+    if max_val is not None:
+        extra_initializer.append(
+            onnx.numpy_helper.from_array(np.array(max_val, dtype=np.float32), "ClipMax")
+        )
+    c1_out = "c1" if b1f is not None else "c1s"
+    if min_val is not None and max_val is not None:
+        clip_node = f"h1 = Clip({c1_out}, ClipMin, ClipMax)"
+    elif min_val is not None:
+        clip_node = f"h1 = Clip({c1_out}, ClipMin)"
+    elif max_val is not None:
+        clip_node = f"h1 = Clip({c1_out}, , ClipMax)"
+    else:
+        clip_node = f"h1 = Clip({c1_out})"
+    return _dqconv_model_from_weights(
+        c,
+        m1,
+        m2,
+        w1f,
+        w2f,
+        b1f=b1f,
+        spatial=spatial,
+        seed=seed,
+        activation_node=clip_node,
+        extra_initializer=extra_initializer,
+    )
+
+
+def _dqconv_clip_chain_model(
+    c, m1, m2, kh=3, kw=3, bias1=False, spatial=8, seed=0, min_val=0.0, max_val=6.0
+):
+    rng = np.random.default_rng(seed)
+    w1f = (rng.standard_normal((m1, c, kh, kw)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((m2, m1, kh, kw)) * 0.3).astype(np.float32)
+    b1f = (rng.standard_normal(m1) * 0.05).astype(np.float32) if bias1 else None
+    return _dqconv_clip_model_from_weights(
+        c,
+        m1,
+        m2,
+        w1f,
+        w2f,
+        b1f=b1f,
+        spatial=spatial,
+        min_val=min_val,
+        max_val=max_val,
+        seed=seed,
+    )
 
 
 def _dqconv_chain_model(c, m1, m2, kh=3, kw=3, bias1=False, spatial=8, seed=0):
@@ -44730,6 +44818,117 @@ def test_dynamic_quantize_conv_no_bias_chain_is_matched_and_prunes():
     (y_pruned,) = _run(pruned, {"x": x})
     assert y_pruned.shape == (1, m2, 8, 8)
     assert np.all(np.isfinite(y_pruned))
+
+
+def test_dynamic_quantize_conv_clip_relu6_pass_through_matches_and_prunes():
+    # Conv -> Clip(0, 6) -> Conv (ReLU6, the standard MobileNetV2/V3 and
+    # EfficientNet-Lite activation) -- after a real `quantize_dynamic` +
+    # `ORT_ENABLE_EXTENDED` graph-optimization round trip this produces the
+    # identical dynamically-quantized `ConvInteger` topology as the Relu
+    # case, just with `Clip` standing in for `Relu` between the two
+    # `ConvInteger` chains. Confirms `_walk_to_conv_integer_consumer` now
+    # crosses it transparently (reusing `_match_clip_channel_pass_through`,
+    # the same helper `_walk_to_conv_consumer` already uses for the
+    # identical plain-float-Conv shape) and that the chain is matched and
+    # pruned end-to-end.
+    c, m1, m2 = 4, 6, 5
+    model, info = _dqconv_clip_chain_model(c, m1, m2, bias1=True, seed=20)
+    onnx.checker.check_model(model)
+    chains = onnxsim.pruning._find_conv_integer_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == m1
+    # The Clip hop is folded into the chain exactly like a plain unary
+    # pass-through activation would be (`chain_ops`), not treated specially.
+    assert [op.op_type for op in chains[0].chain_ops] == ["Clip"]
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_conv(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["w1_quantized"].dims) == [m1 // 2, c, 3, 3]
+    assert list(inits["w2_quantized"].dims) == [m2, m1 // 2, 3, 3]
+
+    # The Clip node itself is untouched -- still a plain scalar Min/Max --
+    # and needs no dedicated "carry it through the rewrite" logic at all:
+    # the existing chain_ops stale-value-info bookkeeping already covers it
+    # (see `apply_structured_pruning_dynamic_quantize_conv`'s own loop).
+    pruned_clip = next(n for n in pruned.graph.node if n.op_type == "Clip")
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits[pruned_clip.input[1]]), np.float32(0.0)
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits[pruned_clip.input[2]]), np.float32(6.0)
+    )
+
+    # Numeric correctness against an INDEPENDENTLY reconstructed "already
+    # pruned" oracle (this project's established quantized-section bar --
+    # see `test_dynamic_quantize_conv_producer_matches_independent_oracle_
+    # via_real_inference_session`'s own identical structure), not a
+    # post-hoc slice of the unpruned model's own output.
+    keep = _dqconv_importance_keep(info["W1q"], info["W1s"], info["W1zp"], m1 // 2)
+    ref_model, _ = _dqconv_clip_model_from_weights(
+        c,
+        len(keep),
+        m2,
+        info["W1f"][keep],
+        info["W2f"][:, keep],
+        b1f=info["B1f"][keep],
+        spatial=info["spatial"],
+        seed=987654,
+    )
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    ref_inits["w1_quantized"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1q"][keep], "w1_quantized")
+    )
+    ref_inits["w1_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1s"], "w1_scale")
+    )
+    ref_inits["w1_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1zp"], "w1_zero_point")
+    )
+    ref_inits["w2_quantized"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2q"][:, keep], "w2_quantized")
+    )
+    ref_inits["w2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2s"], "w2_scale")
+    )
+    ref_inits["w2_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2zp"], "w2_zero_point")
+    )
+
+    rng = np.random.default_rng(21)
+    spatial = info["spatial"]
+    x = rng.standard_normal((1, c, spatial, spatial)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"x": x})
+    (y_ref,) = _run(ref_model, {"x": x})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_dynamic_quantize_conv_clip_nonscalar_min_declines():
+    # A `Clip` with a per-channel-shaped (`[m1]`) `min` between two
+    # `ConvInteger` chains must be declined, never guessed at -- mirrors
+    # `test_structured_pruning_clip_nonscalar_min_declines`'s own identical
+    # bar for the plain-float Conv walker (`_match_clip_channel_pass_through`
+    # is shared by both, see that function's own docstring: trusted by
+    # confirmed shape, never by the schema's word alone).
+    c, m1, m2 = 4, 6, 5
+    rng = np.random.default_rng(23)
+    w1f = (rng.standard_normal((m1, c, 3, 3)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((m2, m1, 3, 3)) * 0.3).astype(np.float32)
+    min_per_channel = onnx.numpy_helper.from_array(
+        np.zeros((m1,), dtype=np.float32), "ClipMinPerChannel"
+    )
+    model, _info = _dqconv_model_from_weights(
+        c,
+        m1,
+        m2,
+        w1f,
+        w2f,
+        activation_node="h1 = Clip(c1s, ClipMinPerChannel)",
+        extra_initializer=[min_per_channel],
+        seed=24,
+    )
+    chains = onnxsim.pruning._find_conv_integer_chains(model.graph)
+    assert chains == []
 
 
 def test_dynamic_quantize_conv_scale_always_per_tensor():
