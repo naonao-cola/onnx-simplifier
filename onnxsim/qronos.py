@@ -33,25 +33,48 @@ deployment: ``||W @ X_float - Wq @ X_quant||^2`` -- the float network's ideal
 output (clean input, clean weight) versus the deployed network's actual
 output (corrupted input, quantized weight).
 
-Writing ``Y = W @ X_float`` (this layer's own ideal target, from the float
-model) and ``H = X_quant^T @ X_quant`` (the Hessian of the *real* input this
-layer receives), ordinary least squares gives the unconstrained optimum
-``W_opt = Y @ X_quant @ H^{-1}`` -- the float-equivalent weight that would
-exactly cancel the upstream error *if* it could be represented exactly. Basic
-OLS orthogonality (the residual ``Y - W_opt @ X_quant`` is orthogonal to
-``X_quant``'s column space) means minimizing the original objective over
-quantized ``Wq`` is then *exactly* equivalent to minimizing
+Let ``dX = X_quant - X_float`` -- the upstream error itself, a genuinely
+*small*, bounded quantity (it is nothing but earlier layers' own INT4
+rounding noise), as opposed to ``X_float``/``X_quant`` themselves, which can
+be arbitrarily large or ill-conditioned. Writing ``H = X_quant^T @ X_quant``
+(the Hessian of the *real* input this layer receives) and reusing
+:func:`onnxsim.gptq._inverse_hessian_cholesky` for its damped-Cholesky-of-
+``H^{-1}`` reformulation, define
+
+    ``W_opt = W - W @ dX @ X_quant^T @ H^{-1}``
+
+-- ``W``'s own value, shifted by a Hessian-weighted correction driven only
+by ``dX``. By construction ``W_opt @ X_quant`` recovers ``W @ X_float``
+whenever ``H^{-1}`` exactly inverts ``H`` (substitute ``X_quant = X_float +
+dX`` and expand), so ``W_opt`` is a least-squares solution for matching
+``W``'s own ideal (clean-input) target using the *real*, corrupted input.
+Basic OLS orthogonality then means minimizing the original objective over
+quantized ``Wq`` is *exactly* equivalent to minimizing
 ``||(W_opt - Wq) @ X_quant||^2`` -- precisely GPTQ's own per-column greedy
 objective, unchanged, with ``W_opt`` standing in for the float weight and
 ``H`` (from ``X_quant``, not ``X_float``) standing in for GPTQ's Hessian.
 That is this module's whole implementation: compute ``W_opt`` and ``H`` as
-above (reusing :func:`onnxsim.gptq._inverse_hessian_cholesky` for the
-damped-Cholesky-of-``H^{-1}`` reformulation), then hand them unchanged to
+above, then hand them unchanged to
 :func:`onnxsim.gptq._gptq_quantize_columns` -- the same Cholesky-based
 least-squares machinery GPTQ itself uses, reused rather than reimplemented.
-When ``X_quant == X_float`` (nothing upstream was quantized, e.g. the very
-first layer), ``W_opt == W`` exactly and this reduces to plain GPTQ -- Qronos
-is a strict generalization, not a different algorithm bolted on.
+
+Deriving ``W_opt`` as a shift proportional to ``dX`` (rather than
+reconstructing it from scratch via ``Y @ X_quant @ H^{-1}`` for some
+separately-computed ideal target ``Y`` -- algebraically identical when
+``H^{-1}`` is exact, but numerically very different) matters in practice:
+GPTQ's own damping deliberately makes ``H^{-1}`` an *inexact* inverse of
+``H`` along near-singular directions (the correlated-calibration-channel
+scenario :mod:`onnxsim.gptq`'s own docstring motivates), and reconstructing
+``W_opt`` from scratch amplifies that inexactness by ``W``'s own
+(unrelated, potentially large) magnitude. Shifting *from* ``W`` by an amount
+proportional to ``dX`` instead keeps that same inexactness scaled by ``dX``
+-- small by construction -- and makes the reduction to plain GPTQ exact
+(bit-for-bit, not just approximately) whenever ``dX`` is exactly zero:
+``W_opt == W`` and :func:`_gptq_quantize_columns` is called with the
+identical arguments :func:`onnxsim.gptq.apply_gptq` itself would use. This
+is always the case for a layer with no already-quantized upstream layer
+feeding it (e.g. the very first layer) -- Qronos is a strict generalization
+of GPTQ, not a different algorithm bolted on.
 
 The paper frames this per-column update as alternating between an "error
 correction" step (undoing the input's own already-baked-in error, this
@@ -201,11 +224,16 @@ def apply_qronos(
         if x_float.shape[1] != w_nk.shape[1] or x_quant.shape[1] != w_nk.shape[1]:
             continue  # activation's feature dim doesn't match K; skip
 
-        y_target = x_float @ w_nk.T  # [samples, N], this layer's own ideal output
+        dx = x_quant - x_float  # [samples, K], the upstream error itself
         h = x_quant.T @ x_quant  # Hessian of the *real* (corrupted) input
         u = _inverse_hessian_cholesky(h, percdamp)
         h_inv = u.T @ u
-        w_opt_nk = y_target.T @ x_quant @ h_inv  # [N, K], upstream-error-corrected
+        # W_opt = W - W @ dX @ X_quant^T @ H^{-1} -- see this module's own
+        # docstring for why shifting *from* w_nk by a dX-proportional amount
+        # (rather than reconstructing the target from scratch) is what makes
+        # this numerically well-behaved and an exact GPTQ reduction when
+        # dX == 0.
+        w_opt_nk = w_nk - w_nk @ dx.T @ x_quant @ h_inv
 
         codes_nk = _gptq_quantize_columns(
             w_opt_nk, scale_blocks, c.block_size, h, percdamp, proc_block_size

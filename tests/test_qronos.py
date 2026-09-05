@@ -62,10 +62,14 @@ def _matmul_model(K=64, N=16, seed=0):
 
 
 def _two_layer_model(K1=64, N1=32, N2=16, seed=0):
+    # quantize_weight_only_int4 only quantizes a MatMul whose activation
+    # input has a statically-known float32 type -- true automatically for a
+    # graph input/output, but an intermediate tensor like Y1 needs its own
+    # explicit value_info entry (the parser text form alone doesn't add one).
     rng = np.random.default_rng(seed)
     w1 = rng.standard_normal((K1, N1)).astype(np.float32) * 0.5
     w2 = rng.standard_normal((N1, N2)).astype(np.float32) * 0.5
-    return _model(
+    model = _model(
         f"""
         g (float[batch,{K1}] X) => (float[batch,{N2}] Y2)
         {{
@@ -75,6 +79,10 @@ def _two_layer_model(K1=64, N1=32, N2=16, seed=0):
         """,
         [_f32(w1, "W1"), _f32(w2, "W2")],
     )
+    model.graph.value_info.append(
+        onnx.helper.make_tensor_value_info("Y1", onnx.TensorProto.FLOAT, ["batch", N1])
+    )
+    return model
 
 
 def _correlated_calibration(K=64, num_samples=64, rank=6, seed=1):
@@ -89,11 +97,12 @@ def _correlated_calibration(K=64, num_samples=64, rank=6, seed=1):
     return x
 
 
-def _dequantize_int4(model, output_name):
+def _dequantize_int4(model, matmul_output_name):
+    matmul = next(n for n in model.graph.node if n.output[0] == matmul_output_name)
     dq_node = next(
         n
         for n in model.graph.node
-        if n.op_type == "DequantizeLinear" and n.output[0] == output_name
+        if n.op_type == "DequantizeLinear" and n.output[0] == matmul.input[1]
     )
     # Fetch Wq/Ws by the DequantizeLinear node's own input names, not by
     # scanning for "some tensor of this dtype": quantize_weight_only_int4
