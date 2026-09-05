@@ -38,6 +38,7 @@ from onnxsim.calibration import (
 )
 from onnxsim.coreml_export import export_coreml
 from onnxsim.d2quant import apply_dac, apply_dsq
+from onnxsim.diffusion_export import export_diffusion_model
 from onnxsim.double_quantization import apply_double_quantization
 from onnxsim.duquant import apply_duquant
 from onnxsim.embedding_quantization import (
@@ -351,6 +352,7 @@ __all__ = [
     "read_hf_config",
     "UnsupportedArchitectureError",
     "export_transformers_model",
+    "export_diffusion_model",
     "export_mlir",
     "export_coreml",
     "export_tflite",

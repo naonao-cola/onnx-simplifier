@@ -89,6 +89,10 @@ constant folding until the model stops changing. Around that it offers:
 - **[Transformers export](#transformers-export).** Export a Hugging Face
   `transformers` model straight to a simplified ONNX deployment directory with
   `onnxsim.export_transformers_model()`.
+- **[Diffusion model export](#diffusion-model-export).** Export a Hugging
+  Face `diffusers` pipeline (Stable Diffusion, SDXL, ...) straight to a
+  simplified ONNX deployment directory with
+  `onnxsim.export_diffusion_model()`.
 - **Subgraph simplification.** Simplify `If`/`Loop`/`Scan` subgraph bodies too
   with `--include-subgraph`.
 - **[MLIR export](#exporting-to-mlir-torch-mlir--onnx-mlir).** Hand the simplified
@@ -1128,6 +1132,62 @@ onnxsim.export_transformers_model(
     "hf-internal-testing/tiny-random-t5",
     "exported_and_simplified",
     task="text2text-generation-with-past",
+    save_as_external_data=False,
+)
+```
+
+## Diffusion model export
+
+A Hugging Face `diffusers` pipeline (Stable Diffusion, SDXL, ...) isn't one
+model but several — typically a text encoder, a UNet (or transformer)
+denoiser, and a VAE encoder/decoder, each its own graph — driven by a
+`model_index.json` plus per-component subdirectories rather than a single
+`config.json`. As with a plain `transformers` model, onnxsim has no PyTorch
+tracing code of its own to turn that into ONNX graphs, and does not need any:
+[`optimum`](https://github.com/huggingface/optimum)'s own
+`optimum.exporters.onnx.main_export` (the same call `optimum-cli export onnx`
+makes) already detects a diffusers pipeline and exports every sub-model into
+its own `<component>/model.onnx` — `text_encoder/model.onnx`,
+`unet/model.onnx`, `vae_encoder/model.onnx`, `vae_decoder/model.onnx`, plus
+e.g. `text_encoder_2/model.onnx` for SDXL. That export is plain, un-fused
+ONNX, so there is real simplification left for onnxsim to find, exactly as
+for a transformers export.
+
+`onnxsim.export_diffusion_model()` wraps the export-with-optimum,
+simplify-every-graph-in-place recipe as one call — the diffusion counterpart
+of `onnxsim.export_transformers_model()`:
+
+```python
+import onnxsim
+
+results = onnxsim.export_diffusion_model(
+    "hf-internal-testing/tiny-stable-diffusion-torch",
+    "exported_and_simplified",
+)
+# {"text_encoder/model.onnx": True, "unet/model.onnx": True,
+#  "vae_encoder/model.onnx": True, "vae_decoder/model.onnx": True}
+```
+
+`output_dir` ends up holding the same layout a plain `optimum` export would
+(`model_index.json`, `scheduler/`, `tokenizer/`, each component's
+`config.json`, ...), except every `<component>/model.onnx` has been
+simplified in place — so the directory is still deployable exactly as-is,
+e.g. via `optimum.onnxruntime.ORTStableDiffusionPipeline.from_pretrained`.
+Needs the optional `torch`/`diffusers`/`optimum` (with the `optimum-onnx`
+distribution) packages: `pip install onnxsim[diffusion]`.
+
+Like `export_transformers_model`, every simplified graph is saved with its
+weights in a companion `.data` file by default (`save_as_external_data=True`)
+rather than inline — a real (non-tiny) diffusion export's UNet routinely
+exceeds `onnx.save`'s 2GB inline limit on its own, and every pass in
+onnxsim's own optimization pipeline that touches a graph copies its inline
+bytes along with it. Pass `save_as_external_data=False` to keep a small/toy
+pipeline as self-contained `.onnx` files instead:
+
+```python
+onnxsim.export_diffusion_model(
+    "hf-internal-testing/tiny-stable-diffusion-torch",
+    "exported_and_simplified",
     save_as_external_data=False,
 )
 ```
