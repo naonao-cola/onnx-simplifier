@@ -46,6 +46,7 @@ from onnxsim.drop_by_drop import (
     select_drop_by_drop_prefix,
 )
 from onnxsim.duquant import apply_duquant
+from onnxsim.easyquant import apply_easyquant
 from onnxsim.embedding_quantization import (
     quantize_embedding_binary,
     quantize_embedding_int8,
@@ -251,6 +252,7 @@ __all__ = [
     "apply_quarot",
     "apply_quarot_cpp",
     "apply_duquant",
+    "apply_easyquant",
     "apply_zeroquant",
     "apply_spinquant",
     "apply_paroquant",
