@@ -13688,6 +13688,43 @@ def apply_structured_pruning(
     upgrade of this same technique, exactly as :func:`apply_wanda_pruning`
     is to :func:`apply_magnitude_pruning`.
 
+    Scope note -- this function stays plain-float/plain-Gemm/Conv-only,
+    DELIBERATELY, even though its C++ port
+    (:func:`onnxsim.apply_structured_pruning_cpp`) is a wider dispatcher
+    that ALSO matches and prunes several quantized-weight chain families
+    (QDQ, ``com.microsoft::MatMulNBits`` and its fused ``MatMulNBitsMlp``
+    variant, ``MatMulBnb4``, ``MatMulBlockQuantizedFp8Weight``/
+    ``MatMulBlockQuantizedFp4Weight``, QOperator
+    (``QLinearConv``/``QLinearMatMul``/``QGemm``), and
+    ``DynamicQuantizeMatMul``/``MatMulIntegerToFloat``) that this function
+    never touches. This is intentional, verified, and NOT a gap awaiting a
+    fix here: this module already implements every one of those formats,
+    correctly, as its own SEPARATE top-level function
+    (:func:`apply_structured_pruning_qdq`,
+    :func:`apply_structured_pruning_matmul_nbits`,
+    :func:`apply_structured_pruning_matmul_bnb4`,
+    :func:`apply_structured_pruning_matmul_block_quantized_fp8`/
+    :func:`apply_structured_pruning_matmul_block_quantized_fp4`,
+    :func:`apply_structured_pruning_qoperator`,
+    :func:`apply_structured_pruning_dynamic_quantize_matmul` -- plus
+    :func:`apply_structured_pruning_dynamic_quantize_conv`, which has no C++
+    port at all yet) -- each one's own section comment gives the same reason
+    for staying a standalone function rather than being folded into this
+    one: every matcher this function itself calls
+    (:func:`_find_chains` and friends) is already extensively tested against
+    float32/float16/bfloat16 weights only, and retrofitting a quantized
+    representation into their shared slicing/touched-role bookkeeping would
+    risk regressing that surface for no compensating benefit, since a
+    quantized weight never aliases a plain float one anyway. The C++ port
+    consolidating all of them into one dispatcher is a property of THAT
+    entry point, not evidence this function is missing something -- widening
+    this function into a dispatcher too was considered and rejected for the
+    same reason each individual quantized-format function was kept separate
+    from this one in the first place. A caller who wants a specific
+    quantized format pruned should call that format's own function directly
+    (or use :func:`onnxsim.apply_structured_pruning_cpp` for the
+    all-formats-at-once C++ behavior).
+
     For every MatMul/vanilla-Gemm node (the "producer") whose output feeds,
     through zero or more shape-preserving elementwise ops (an activation,
     or an Add/Mul against a constant per-channel bias/scale) with no other
