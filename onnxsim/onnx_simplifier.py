@@ -1643,17 +1643,22 @@ def apply_sparsegpt_pruning_cpp(
     independently, with no producer/consumer chain-walking at all.
 
     Matches every plain ``MatMul``/vanilla-``Gemm`` node with a constant 2-D
-    FLOAT32 weight (this already includes ``com.microsoft::
+    FLOAT32/FLOAT16/BFLOAT16 weight (this already includes ``com.microsoft::
     GroupQueryAttention``'s own separate Q/K/V projections -- ordinary
     MatMul/Gemm nodes feeding it, not a weight the op itself owns), plus
-    every ``com.microsoft::Attention`` node's constant 2-D FLOAT32 merged
-    QKV weight. Deliberately narrower than the pure-Python
-    :func:`onnxsim.apply_sparsegpt_pruning` in two ways, both mirroring this
-    module's own established narrower-than-pruning.py C++-port scope
-    decisions elsewhere (e.g. the ``MatMulNBits`` C++ section's own
-    FLOAT32-only restriction on its own scales/zero_points/bias tensors):
+    every ``com.microsoft::Attention`` node's constant 2-D FLOAT32/FLOAT16/
+    BFLOAT16 merged QKV weight -- read upcast to float64, written back down
+    to each weight's own original dtype, exactly like
+    :func:`onnxsim.apply_sparsegpt_pruning`'s own ``_to_f64``/``_from_f64``
+    convention (though note SparseGPT's Hessian-compensated update, unlike
+    plain masking, *recomputes* every kept entry's own value, so a fp16/bf16
+    weight's surviving entries do not reproduce their pre-pruning bit
+    pattern the way a plain-masking C++ port's FLOAT16/BFLOAT16 support
+    does). Deliberately narrower than the pure-Python
+    :func:`onnxsim.apply_sparsegpt_pruning` in one remaining way (mirroring
+    this module's own established narrower-than-pruning.py C++-port scope
+    decisions elsewhere):
 
-    - FLOAT32 only, not also FLOAT16/BFLOAT16.
     - 2-D ``Conv`` (ordinary/depthwise/general-grouped) is **not** matched
       at all here -- the pure-Python original's own Conv support needs an
       entirely new, from-first-principles im2col cross-covariance Hessian
@@ -1665,7 +1670,12 @@ def apply_sparsegpt_pruning_cpp(
       port. A Conv node is left completely untouched here, never guessed
       at, exactly as if it were any other unmatched node type -- use the
       pure-Python :func:`onnxsim.apply_sparsegpt_pruning` if Conv coverage
-      is required.
+      is required. This is the only remaining scope gap versus the
+      pure-Python original, so :func:`onnxsim.apply_sparsegpt_pruning`
+      itself is NOT an alias of this function (unlike, e.g.,
+      :func:`onnxsim.apply_transformer_block_pruning`, which IS an alias of
+      its own verified-full-parity C++ port) -- a Conv-bearing model would
+      otherwise silently get a different (Conv-less) result here.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to compute each
@@ -1703,8 +1713,8 @@ def apply_sparsegpt_pruning_cpp(
             place to the target pattern; a layer with no observed 2-D
             calibration activation (dead input, an otherwise-empty
             ``calibration_data``, or every batch's activation isn't
-            FLOAT32) is left completely untouched -- there is no data-free
-            fallback for SparseGPT
+            FLOAT32/FLOAT16/BFLOAT16) is left completely untouched -- there
+            is no data-free fallback for SparseGPT
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -1771,13 +1781,18 @@ def apply_wanda_pruning_cpp(
     GroupQueryAttention``'s own separate Q/K/V projections -- ordinary
     MatMul/Gemm nodes feeding it, not a weight the op itself owns), plus
     every ``com.microsoft::Attention`` node's constant 2-D FLOAT32 merged
-    QKV weight -- EXACTLY the same candidate set as
-    :func:`onnxsim.apply_sparsegpt_pruning_cpp`. Deliberately narrower than
-    the pure-Python :func:`onnxsim.apply_wanda_pruning` in the same two ways
-    that function's own C++-port sibling already establishes (mirroring
-    this module's own established narrower-than-pruning.py C++-port scope
-    decisions elsewhere, e.g. the ``MatMulNBits`` C++ section's own
-    FLOAT32-only restriction on its own scales/zero_points/bias tensors):
+    QKV weight -- the same candidate set
+    :func:`onnxsim.apply_sparsegpt_pruning_cpp` used to match before ITS OWN
+    FLOAT16/BFLOAT16 widening (this function has not been independently
+    re-verified against a real FLOAT16/BFLOAT16 export and remains
+    FLOAT32-only, so the two candidate sets are no longer identical).
+    Deliberately narrower than the pure-Python
+    :func:`onnxsim.apply_wanda_pruning` in the same two ways
+    that function's own C++-port sibling already established before its own
+    widening (mirroring this module's own established narrower-than-
+    pruning.py C++-port scope decisions elsewhere, e.g. the ``MatMulNBits``
+    C++ section's own FLOAT32-only restriction on its own scales/
+    zero_points/bias tensors):
 
     - FLOAT32 only, not also FLOAT16/BFLOAT16.
     - 2-D ``Conv`` (ordinary/depthwise/general-grouped) is **not** matched
