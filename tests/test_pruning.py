@@ -6117,29 +6117,33 @@ def test_structured_pruning_skips_mismatched_grouped_producer_and_consumer():
 
 
 def test_structured_pruning_conv_into_non_pass_through_op_is_left_untouched():
-    # An ordinary CNN classifier tail: Conv -> GlobalAveragePool -> Flatten
-    # -> MatMul head. `GlobalAveragePool` itself *is* now a recognized
-    # pass-through hop (see `_CONV_POOL_PASS_THROUGH`), but `Flatten` isn't
-    # a shape-preserving op the chain walk recognizes -- deliberately: a
-    # flattened Gemm/MatMul's input columns would need to be re-derived
-    # through `Flatten`'s exact memory layout, a fundamentally different,
-    # harder problem than the plain axis slice every hop here performs (see
-    # this module's own docstring and `_CONV_POOL_PASS_THROUGH`'s own
-    # comment for exactly why this stays out of scope). So the walk still
-    # stops one hop later than it used to, at `Flatten`, and the Conv
-    # producer is still left completely untouched rather than matched to the
+    # A `Flatten` reading off a plain Conv's own output, with real spatial
+    # extent still present (a 3x3-kernel Conv over a 10x10 input leaves an
+    # 8x8 feature map, not collapsed to 1x1 the way `GlobalAveragePool`'s own
+    # output always is) -- the *general* `Flatten` shape this module's own
+    # docstring and `_CONV_POOL_PASS_THROUGH`'s own comment call out as
+    # deliberately excluded: a flattened MatMul's input columns would need to
+    # be re-derived through `Flatten`'s exact memory layout, a fundamentally
+    # different, harder problem than the plain axis slice every hop here
+    # performs, since a flattened column mixes multiple spatial positions of
+    # one channel together, not a clean per-channel block. (See
+    # `test_structured_pruning_global_average_pool_flatten_gemm_pass_through_matches_oracle_exactly`
+    # below for the one narrow case that *is* handled: `Flatten(axis=1)`
+    # reading directly off `GlobalAveragePool`'s own output, where every
+    # spatial position is already collapsed to size 1 and there is nothing
+    # left to re-derive.) So the walk still stops at this `Flatten`, and the
+    # Conv producer is left completely untouched rather than matched to the
     # MatMul by coincidence of a downstream reduction dimension.
     Cin, C1, Out = 3, 8, 4
     rng = np.random.default_rng(36)
     w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
-    w2 = rng.standard_normal((C1, Out)).astype(np.float32)
+    w2 = rng.standard_normal((C1 * 8 * 8, Out)).astype(np.float32)
     model = _model(
         f"""
         g (float[N,{Cin},10,10] X) => (float[N,{Out}] Y)
         {{
           h = Conv<kernel_shape=[3,3]>(X, W1)
-          p = GlobalAveragePool(h)
-          f = Flatten<axis=1>(p)
+          f = Flatten<axis=1>(h)
           Y = MatMul(f, W2)
         }}
         """,
@@ -7083,11 +7087,14 @@ def test_structured_pruning_global_average_pool_pass_through_matches_oracle_exac
     # at all is a 1x1 kernel (verified live -- a 3x3 kernel over a 1x1
     # spatial input fails ONNX's own checker). In practice
     # `GlobalAveragePool` almost always feeds `Flatten`/a Gemm classifier
-    # head instead (deliberately NOT reached -- see
-    # `_CONV_POOL_PASS_THROUGH`'s own comment on why that composition is a
-    # fundamentally different, harder problem), so this exercises the hop
-    # for genuine correctness (it must still slice cleanly and match a real
-    # onnxruntime oracle) without claiming it's the common case.
+    # head instead -- see
+    # `test_structured_pruning_global_average_pool_flatten_gemm_pass_through_matches_oracle_exactly`
+    # below for that shape (the narrow `Flatten(axis=1)` case *is* reached;
+    # see `_CONV_POOL_PASS_THROUGH`'s own comment and
+    # `_match_gap_flatten_matmul_consumer`'s own docstring) -- so this
+    # exercises the plain-pass-through hop for genuine correctness (it must
+    # still slice cleanly and match a real onnxruntime oracle) without
+    # claiming it's the common case.
     Cin, C1, C2 = 3, 16, 8
     rng = np.random.default_rng(64)
     w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
@@ -7111,6 +7118,155 @@ def test_structured_pruning_global_average_pool_pass_through_matches_oracle_exac
     (y,) = _run(pruned, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def _gap_flatten_matmul_model(
+    w1,
+    w2,
+    b1=None,
+    b2=None,
+    weight_transposed=False,
+    activation="Relu",
+    spatial=10,
+):
+    """``Conv -> {activation} -> GlobalAveragePool -> Flatten(axis=1) ->
+    {MatMul, vanilla Gemm}`` -- the canonical ResNet/MobileNet/EfficientNet
+    image-classifier head: global-average-pool the final feature map,
+    flatten to ``[N, C]``, feed a Gemm/MatMul classifier. Per
+    `_match_gap_flatten_matmul_consumer`'s own docstring, this `Flatten` is
+    a provably trivial 1:1 relabeling of `GlobalAveragePool`'s own
+    ``[N, C, 1, 1]`` output, unlike the *general* `Flatten` case (see
+    `test_structured_pruning_conv_into_non_pass_through_op_is_left_untouched`),
+    so the Conv producer *is* pruned end to end here.
+
+    `weight_transposed` selects which of :func:`_match_matmul_like`'s own
+    two branches `w2` takes: ``False`` for a plain `MatMul` (``[C1, Out]``
+    weight, the reduction dimension on axis 0), ``True`` for a `transB=1`
+    vanilla `Gemm` (``[Out, C1]`` weight, reduction dimension on axis 1 --
+    the layout a real ``torch.onnx.export(nn.Linear(...))`` classifier head
+    emits). `b2`, when given, is only valid alongside `weight_transposed`
+    (plain `MatMul` has no bias input of its own to add).
+    """
+    Cin = w1.shape[1]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    if weight_transposed:
+        Out = w2.shape[0]
+        if b2 is not None:
+            gemm = "Y = Gemm<transB=1>(f, W2, B2)"
+            initializer.append(_f32(b2, "B2"))
+        else:
+            gemm = "Y = Gemm<transB=1>(f, W2)"
+    else:
+        assert b2 is None
+        Out = w2.shape[1]
+        gemm = "Y = MatMul(f, W2)"
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Out}] Y)
+        {{
+          {conv1}
+          a = {activation}(h)
+          p = GlobalAveragePool(a)
+          f = Flatten<axis=1>(p)
+          {gemm}
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_global_average_pool_flatten_gemm_pass_through_matches_oracle_exactly():
+    # THE key correctness bar for the new `GlobalAveragePool -> Flatten
+    # -> Gemm` hop, same as every other Conv-chain hop's own oracle test:
+    # exact equivalence (float32 noise only) to an independently,
+    # already-pruned reference model. `transB=1` (`W2` stored `[Out, C1]`)
+    # mirrors a real `torch.onnx.export(nn.Linear(...))` classifier head.
+    Cin, C1, Out = 3, 16, 5
+    rng = np.random.default_rng(70)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((Out, C1)).astype(np.float32)
+    b2 = rng.standard_normal((Out,)).astype(np.float32)
+    model = _gap_flatten_matmul_model(w1, w2, b1=b1, b2=b2, weight_transposed=True)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2  # the Conv IS pruned end to end
+    assert dims_after["W2"][1] == C1 // 2  # Gemm's own transB=1 reduction axis
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _gap_flatten_matmul_model(
+        w1[keep], w2[:, keep], b1=b1[keep], b2=b2, weight_transposed=True
+    )
+
+    rng_x = np.random.default_rng(71)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_global_average_pool_flatten_matmul_pass_through_matches_oracle_exactly():
+    # The plain `MatMul` (``[K, N]`` weight, `weight_transposed=False`)
+    # branch of the identical hop, exercised separately from the `Gemm`
+    # case above since :func:`_match_gap_flatten_matmul_consumer` reuses
+    # :func:`_match_matmul_like`'s own `weight_transposed` dispatch and
+    # `_slice_consumer_weight` slices a different axis for each.
+    Cin, C1, Out = 3, 16, 5
+    rng = np.random.default_rng(72)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C1, Out)).astype(np.float32)
+    model = _gap_flatten_matmul_model(w1, w2, weight_transposed=False)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["W2"][0] == C1 // 2
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _gap_flatten_matmul_model(w1[keep], w2[keep], weight_transposed=False)
+
+    rng_x = np.random.default_rng(73)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_global_average_pool_flatten_wrong_axis_declines():
+    # `Flatten` with a non-default `axis` (here `0`, merging the batch axis
+    # into the flattened one rather than keeping it separate) is declined
+    # outright: only `axis == 1` is a provably trivial 1:1 relabeling of
+    # `GlobalAveragePool`'s own `[N, C, 1, ..., 1]` output -- see
+    # `_match_gap_flatten_matmul_consumer`'s own docstring. The whole chain
+    # stays completely unpruned, not guessed at.
+    Cin, C1, Out = 3, 16, 5
+    rng = np.random.default_rng(74)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C1, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[?] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          p = GlobalAveragePool(h)
+          f = Flatten<axis=0>(p)
+          Y = MatMul(f, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
 
 
 def test_analyze_structured_pruning_maxpool_pass_through_matches_real_call():

@@ -962,13 +962,21 @@ addition, recognized the identical way by the MatMul/Gemm-chain walkers
 MatMul/Gemm chain's own last-channel-axis convention), ``Clip``'s complete
 axis-agnosticism means the identical matcher and reasoning already apply
 unchanged to a QAT-style activation-clipping-after-Linear shape too. Deliberately left
-out of scope, and not attempted: a
-``GlobalAveragePool -> Flatten -> Gemm`` classifier head, where a Conv's
-surviving channel set would need to be re-derived through `Flatten`'s exact
-memory layout into the Gemm weight's own input columns -- a fundamentally
-different, harder problem than the plain axis slice every hop in this
-section performs, not a bigger version of the same one (see
-`_CONV_POOL_PASS_THROUGH`'s own comment for the precise boundary).
+out of scope, and not attempted, in general: a
+``GlobalAveragePool -> Flatten -> Gemm`` classifier head where real spatial
+extent is still present at the ``Flatten``, where a Conv's surviving channel
+set would need to be re-derived through `Flatten`'s exact memory layout into
+the Gemm weight's own input columns -- a fundamentally different, harder
+problem than the plain axis slice every hop in this section performs, not a
+bigger version of the same one (see `_CONV_POOL_PASS_THROUGH`'s own comment
+for the precise boundary). The one narrow exception -- a `Flatten(axis=1)`
+whose input is itself `GlobalAveragePool`'s own output, so every trailing
+spatial axis is already collapsed to size 1 and the "flattened layout"
+question has only one possible answer -- *is* handled (see
+:func:`_match_gap_flatten_matmul_consumer`'s own docstring for the
+axis-correspondence proof), precisely because it needs no re-derivation at
+all: a provably trivial 1:1 relabeling, not a harder instance of the general
+case just excluded.
 
 A Conv chain also crosses a mid-chain ``PRelu`` -- the
 ``Conv -> PRelu -> Conv`` shape a real MobileFaceNet/ResNet-style
@@ -3600,16 +3608,35 @@ _MAX_CHAIN_HOPS = 8
 #
 # `GlobalAveragePool -> Flatten -> Gemm` -- the classifier-head shape a CNN
 # backbone typically ends in -- is deliberately NOT reached by adding
-# `GlobalAveragePool` here: that pattern needs the *consumer* side (a
-# flattened Gemm's input columns) to recognize `Flatten` as a hop of its own
-# and re-derive which of its columns correspond to which surviving channel,
-# a fundamentally different, harder problem than a simple axis slice (the
-# flattened layout is `channel`-major only when every spatial position is
-# accounted for identically per channel, which the Gemm weight's own columns
-# encode implicitly, not via any axis metadata this pass could re-slice).
-# `GlobalAveragePool` becomes a hop only when it feeds *another* Conv-chain
-# consumer directly (rare in practice -- most real graphs go straight to
-# `Flatten`/`Gemm` after it -- but not disallowed), never through `Flatten`.
+# `GlobalAveragePool` here: that pattern, *in general*, needs the *consumer*
+# side (a flattened Gemm's input columns) to recognize `Flatten` as a hop of
+# its own and re-derive which of its columns correspond to which surviving
+# channel, a fundamentally different, harder problem than a simple axis
+# slice (the flattened layout is `channel`-major only when every spatial
+# position is accounted for identically per channel, which the Gemm
+# weight's own columns encode implicitly, not via any axis metadata this
+# pass could re-slice). Via this set alone, `GlobalAveragePool` becomes a
+# hop only when it feeds *another* Conv-chain consumer directly (rare in
+# practice -- most real graphs go straight to `Flatten`/`Gemm` after it --
+# but not disallowed), never through `Flatten`.
+#
+# The classifier-head shape itself *is* reached, but not via this set, and
+# not in general: :func:`_walk_to_conv_consumer` separately recognizes the
+# one narrow case where `Flatten`'s exact memory layout needs no
+# re-derivation at all -- `Flatten(axis=1)` reading *directly* off a matched
+# `GlobalAveragePool`'s own output. `GlobalAveragePool` always collapses
+# every trailing spatial axis to size 1 per channel (confirmed against its
+# own ONNX schema), so such a `Flatten`'s flattened column `j` is provably
+# just channel `j` relabeled, for every `j` -- the "which spatial position"
+# question the paragraph above raises has only one possible answer (the
+# lone remaining index, `0`) once every spatial axis is already size 1, so
+# there is nothing left to re-derive. See
+# :func:`_match_gap_flatten_matmul_consumer`'s own docstring for the full
+# proof and exactly what's matched (only `axis == 1`, only a `MatMul`/
+# vanilla-`Gemm` consumer immediately after the `Flatten`, only for
+# :func:`_find_conv_chains`'s own plain single-producer/single-consumer
+# chains) -- a narrower, *easier* case than the general one this paragraph
+# excludes, not a wider version of it.
 _CONV_POOL_PASS_THROUGH = {"MaxPool", "AveragePool", "GlobalAveragePool"}
 
 # com.microsoft's fused bias-add + Gelu-family activation nodes -- the FFN
@@ -6808,6 +6835,109 @@ def _match_conv_transpose_consumer(
     return w_name, in_channels, group
 
 
+def _match_gap_flatten_matmul_consumer(
+    gap_out: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+    n_channels: int,
+) -> Optional[Tuple[onnx.NodeProto, onnx.NodeProto, str, bool]]:
+    """The narrowly-scoped ``GlobalAveragePool -> Flatten(axis=1) ->
+    {MatMul, vanilla Gemm}`` consumer match -- deliberately *not* the general
+    ``Flatten`` case this module's own docstring and `_CONV_POOL_PASS_THROUGH`'s
+    own comment call out as excluded (a `Flatten` after real, un-pooled
+    spatial extent, where a flattened column mixes *multiple* channels'
+    values together with no single channel to attribute it to). This one is
+    provably a *trivial* 1:1 relabeling instead, verified against both ops'
+    own ONNX schemas, not assumed:
+
+    `GlobalAveragePool`'s own schema (``onnx.defs.get_schema
+    ("GlobalAveragePool")``) takes a single input and reduces *every*
+    trailing spatial axis to size 1, per channel, independently -- so
+    `gap_out` (always `GlobalAveragePool`'s own output tensor here) has
+    shape ``[N, C, 1, ..., 1]`` (one or more trailing size-1 axes; batch `N`
+    and channel `C` unchanged from its input). `Flatten`'s own schema
+    (``onnx.defs.get_schema("Flatten")``) reshapes an input of shape
+    ``[d_0, d_1, ..., d_n]``, given ``axis`` (default ``1``, the only value
+    this function ever matches -- see below), to
+    ``[d_0 * ... * d_{axis-1}, d_axis * ... * d_n]``: with ``axis == 1``,
+    axis 0 (batch) stays a separate, untouched axis, and *every* later axis
+    is merged, in row-major order, into one. Applied to
+    ``gap_out``'s own ``[N, C, 1, ..., 1]`` shape, that merged axis has size
+    ``C * 1 * ... * 1 == C``, and its row-major flattened index for source
+    position ``(c, 0, ..., 0)`` (every trailing index can only ever be ``0``
+    -- a size-1 axis has exactly one valid index) is
+    ``c * (1 * ... * 1) + 0 * (...) + ... + 0 == c``: every later term's own
+    stride multiplies a fixed ``0``, contributing nothing, regardless of how
+    many trailing spatial axes there are (including zero, the degenerate
+    rank-2 ``[N, C]`` case). So flattened column ``j`` of `Flatten`'s own
+    2-D output is *exactly* channel ``j`` of `gap_out`, for every ``j`` --
+    not an approximation, and not dependent on `n_channels`'s own value --
+    which is exactly what lets the matched consumer's weight be sliced by
+    the *same* channel-index ``keep`` set already used for `gap_out`'s own
+    producer chain, with no re-derivation through any memory layout needed
+    at all (unlike the general ``Flatten`` case).
+
+    Only ``axis == 1`` is ever matched -- a non-default ``axis`` (`Flatten`
+    also gained the ability, at a later opset, to take a negative `axis`;
+    this function funnels every other value, positive or negative, to the
+    same decline) leaves more than one non-batch axis unflattened, or
+    flattens part of the batch axis into the channel one, either of which is
+    the *general*, harder Flatten problem this function's own callers still
+    exclude, not this trivial one. Returns
+    ``(flatten_node, matmul_node, weight_name, weight_transposed)`` --
+    :func:`_match_matmul_like`'s own return shape, with the ``Flatten`` node
+    prepended -- or ``None`` if `gap_out` doesn't have exactly one consumer,
+    that consumer isn't a plain, single-output ``Flatten`` with
+    ``axis == 1`` reading only `gap_out`, its own single output doesn't feed
+    exactly one MatMul/vanilla-Gemm-family consumer (see
+    :func:`_match_matmul_like`), or that consumer's own weight isn't a
+    constant, 2-D, supported-float-dtype tensor whose reduction dimension
+    equals `n_channels`.
+    """
+    if gap_out in graph_outputs:
+        return None
+    gap_consumers = consumers_of.get(gap_out, [])
+    if len(gap_consumers) != 1:
+        return None
+    flatten = gap_consumers[0]
+    if (
+        flatten.op_type != "Flatten"
+        or flatten.domain != ""
+        or list(flatten.input) != [gap_out]
+        or len(flatten.output) != 1
+    ):
+        return None
+    axis = 1  # Flatten's own schema-documented default
+    for attr in flatten.attribute:
+        if attr.name == "axis":
+            axis = attr.i
+    if axis != 1:
+        return None
+    flatten_out = flatten.output[0]
+    if flatten_out in graph_outputs:
+        return None
+    flatten_consumers = consumers_of.get(flatten_out, [])
+    if len(flatten_consumers) != 1:
+        return None
+    mm_node = flatten_consumers[0]
+    cm = _match_matmul_like(mm_node)
+    if cm is None or cm[0] != flatten_out:
+        return None
+    _, weight_name, weight_transposed = cm
+    w_init = initializer_map.get(weight_name)
+    if (
+        w_init is None
+        or not _is_supported_float_dtype(w_init.data_type)
+        or len(w_init.dims) != 2
+    ):
+        return None
+    k = w_init.dims[1] if weight_transposed else w_init.dims[0]
+    if k != n_channels:
+        return None
+    return flatten, mm_node, weight_name, weight_transposed
+
+
 def _match_depthwise_conv_pass_through(
     node: onnx.NodeProto,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -7821,12 +7951,14 @@ def _walk_to_conv_consumer(
     allow_conv_transpose_consumer: bool = False,
     recognize_group_norm: bool = False,
     recognize_decomposed_group_norm: bool = False,
+    recognize_gap_flatten_matmul_consumer: bool = False,
 ) -> Tuple[
     Optional[Tuple[onnx.NodeProto, str, int, bool]],
     Tuple[Tuple[onnx.NodeProto, None], ...],
     Tuple[_ConvPassThrough, ...],
     Optional[_GroupNormPassThrough],
     Optional[int],
+    Optional[_ConsumerMatch],
 ]:
     """The Conv analogue of :func:`_walk_to_consumer`: from tensor `start`,
     walks forward through unary shape-preserving activations (see
@@ -7961,12 +8093,42 @@ def _walk_to_conv_consumer(
     this one branch through -- every hop *after* the first still enforces
     the ordinary single-consumer bar unchanged, so a branch that itself
     forks further is still declined exactly as it always was.
+
+    `recognize_gap_flatten_matmul_consumer` defaults ``False`` for the same
+    reason `recognize_group_norm` does -- only :func:`_find_conv_chains`
+    passes ``True``. When set, a matched `GlobalAveragePool` node (reached
+    exactly as it always is -- unconditionally, the same
+    `_CONV_POOL_PASS_THROUGH` membership check as any other pooling hop) is
+    additionally checked, *before* it is folded into `chain_ops` the
+    ordinary pass-through way, for the narrowly-scoped
+    ``-> Flatten(axis=1) -> {MatMul, vanilla Gemm}`` shape :func:`_match_gap_flatten_matmul_consumer`
+    describes (its own docstring has the full axis-correspondence proof,
+    verified against both ops' own ONNX schemas). A match ends the walk
+    there, with both the `GlobalAveragePool` and the `Flatten` folded into
+    `chain_ops` (`Flatten`, like `GlobalAveragePool`, needs no weight of its
+    own sliced -- it is a trivial 1:1 relabeling here, never a real
+    memory-layout re-derivation), and the matched MatMul/Gemm returned as
+    this walk's own 6th value (`_ConsumerMatch`-shaped: ``(node, weight,
+    weight_transposed)``, mirroring :func:`_walk_to_consumer`'s own
+    consumer shape rather than this function's ordinary ``(node, weight,
+    group, is_conv_transpose)`` Conv-consumer shape, since a MatMul/Gemm
+    consumer has no `group`/`is_conv_transpose` concept at all) -- always
+    ``None`` when this parameter is left at its default, or whenever this
+    exact shape isn't found (the walk then falls through to the ordinary,
+    unconditional pooling-hop handling below, exactly as if this parameter
+    didn't exist -- a `GlobalAveragePool` feeding anything else, including a
+    plain `Flatten` with no recognized consumer after it, or another
+    Conv-chain consumer directly, is handled completely unchanged). Mutually
+    exclusive with the ordinary Conv/``ConvTranspose`` `consumer` return
+    value -- at most one of the two is ever set, since the walk always
+    terminates (`break`s or runs out of hops) the moment either is decided.
     """
     chain_ops: List[Tuple[onnx.NodeProto, None]] = []
     conv_pass_through: List[_ConvPassThrough] = []
     group_norm: Optional[_GroupNormPassThrough] = None
     decomposed_group_norm_num_groups: Optional[int] = None
     consumer: Optional[Tuple[onnx.NodeProto, str, int, bool]] = None
+    matmul_consumer: Optional[_ConsumerMatch] = None
     cur = start
     for _hop in range(max_hops):
         if _hop == 0 and forced_first_hop is not None:
@@ -8206,6 +8368,32 @@ def _walk_to_conv_consumer(
             cur = out2
             continue
 
+        if (
+            recognize_gap_flatten_matmul_consumer
+            and nxt.op_type == "GlobalAveragePool"
+            and nxt.domain == ""
+            and list(nxt.input) == [cur]
+            and len(nxt.output) == 1
+        ):
+            gap_flatten_match = _match_gap_flatten_matmul_consumer(
+                nxt.output[0], consumers_of, initializer_map, graph_outputs, n_channels
+            )
+            if gap_flatten_match is not None:
+                flatten_node, mm_node, mm_weight, mm_weight_transposed = (
+                    gap_flatten_match
+                )
+                chain_ops.append((nxt, None))
+                chain_ops.append((flatten_node, None))
+                matmul_consumer = (mm_node, mm_weight, mm_weight_transposed)
+                break
+            # No `Flatten(axis=1) -> {MatMul, vanilla Gemm}` right after this
+            # `GlobalAveragePool` -- fall through to the ordinary,
+            # unconditional pooling pass-through handling just below,
+            # exactly as if this whole check didn't exist (this
+            # `GlobalAveragePool` may still be a plain hop feeding another
+            # Conv-chain consumer directly, its only recognized role before
+            # this narrower case existed).
+
         if not (
             (
                 nxt.op_type in _UNARY_PASS_THROUGH
@@ -8228,6 +8416,7 @@ def _walk_to_conv_consumer(
         tuple(conv_pass_through),
         group_norm,
         decomposed_group_norm_num_groups,
+        matmul_consumer,
     )
 
 
@@ -8278,6 +8467,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             conv_pass_through,
             group_norm,
             decomposed_group_norm_num_groups,
+            matmul_consumer,
         ) = _walk_to_conv_consumer(
             out_name,
             initializer_map,
@@ -8288,9 +8478,70 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             allow_conv_transpose_consumer=True,
             recognize_group_norm=True,
             recognize_decomposed_group_norm=True,
+            recognize_gap_flatten_matmul_consumer=True,
         )
-        if consumer is None:
+        if consumer is None and matmul_consumer is None:
             continue
+
+        if matmul_consumer is not None:
+            # `GlobalAveragePool -> Flatten(axis=1) -> {MatMul, vanilla
+            # Gemm}` -- see :func:`_match_gap_flatten_matmul_consumer`'s own
+            # docstring for the axis-correspondence proof this relies on.
+            # Mutually exclusive with `consumer` (the walk always terminates
+            # -- `break`s or runs out of hops -- the moment either is
+            # decided, see :func:`_walk_to_conv_consumer`'s own docstring),
+            # and, unlike an ordinary Conv/ConvTranspose consumer, this one
+            # has no `group`/`is_conv_transpose` concept at all -- a plain
+            # MatMul/vanilla-Gemm consumer, sliced exactly the way
+            # :func:`_find_chains` already slices a MatMul/Gemm chain's own
+            # consumer (`consumer_is_conv=False`, dispatching
+            # :func:`_slice_consumer_weight`'s ``weight_transposed``-aware
+            # branch rather than its Conv-style axis-0/1 one).
+            effective_num_groups = (
+                group_norm.num_groups
+                if group_norm is not None
+                else decomposed_group_norm_num_groups
+            )
+            if (
+                effective_num_groups is not None
+                and producer_group > 1
+                and producer_group != effective_num_groups
+            ):
+                # Same "declined outright, never guessed at" bar as the
+                # ordinary Conv/ConvTranspose consumer path below -- a
+                # general grouped Conv producer's own block boundaries must
+                # still agree with a mid-chain GroupNorm-family hop's own
+                # `num_groups`, even though this consumer itself has no
+                # `group` of its own to reconcile against.
+                continue
+            mm_node, mm_weight, mm_weight_transposed = matmul_consumer
+            chains.append(
+                _Chain(
+                    producers=(
+                        _Producer(
+                            node,
+                            w_name,
+                            False,
+                            bias_name,
+                            is_conv=True,
+                            group=producer_group,
+                            is_conv_transpose=is_producer_conv_transpose,
+                        ),
+                    ),
+                    chain_ops=chain_ops,
+                    consumer_node=mm_node,
+                    consumer_weight=mm_weight,
+                    consumer_weight_transposed=mm_weight_transposed,
+                    n_channels=n_channels,
+                    consumer_is_conv=False,
+                    conv_pass_through=conv_pass_through,
+                    group_norm=group_norm,
+                    decomposed_group_norm_num_groups=decomposed_group_norm_num_groups,
+                )
+            )
+            continue
+
+        assert consumer is not None
         consumer_node, consumer_weight, consumer_group, consumer_is_conv_transpose = (
             consumer
         )
@@ -8824,6 +9075,7 @@ def _resolve_conv_fanout_branches(
                 br_pass_through,
                 _br_group_norm,
                 _br_decomposed_group_norm,
+                _br_matmul_consumer,
             ) = _walk_to_conv_consumer(
                 tensor,
                 initializer_map,
@@ -8841,6 +9093,12 @@ def _resolve_conv_fanout_branches(
             # pass-through (native or decomposed) is deliberately out of
             # scope for a residual/merge group's own fan-out branches for now
             # (see _walk_to_conv_consumer's own docstring).
+            # `recognize_gap_flatten_matmul_consumer` was left at its default
+            # (False) above, so `_br_matmul_consumer` is always `None` -- the
+            # `GlobalAveragePool -> Flatten -> {MatMul, Gemm}` consumer shape
+            # is deliberately out of scope for a residual/merge group's own
+            # fan-out branches for now (see _walk_to_conv_consumer's own
+            # docstring), the same way ConvTranspose/GroupNorm already are.
             # `allow_conv_transpose_consumer` was left at its default
             # (False) above, so `_` here is always False -- ConvTranspose
             # is deliberately out of scope for a residual/merge group's own
@@ -11992,6 +12250,7 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
             fwd_pass_through,
             _fwd_group_norm,
             _fwd_decomposed_group_norm,
+            _fwd_matmul_consumer,
         ) = _walk_to_conv_consumer(
             out_name,
             initializer_map,
@@ -12000,6 +12259,12 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
             total_n,
             _MAX_CHAIN_HOPS,
         )
+        # `recognize_gap_flatten_matmul_consumer` was left at its default
+        # (False) above, so `_fwd_matmul_consumer` is always `None` -- the
+        # `GlobalAveragePool -> Flatten -> {MatMul, Gemm}` consumer shape is
+        # deliberately out of scope for a Concat-branch-merge chain's own
+        # consumer for now (see _walk_to_conv_consumer's own docstring), the
+        # same way ConvTranspose/GroupNorm already are.
         # `recognize_group_norm`/`recognize_decomposed_group_norm` were left
         # at their defaults (False) above, so `_fwd_group_norm`/
         # `_fwd_decomposed_group_norm` are always `None` -- GroupNorm
