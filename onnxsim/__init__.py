@@ -177,6 +177,7 @@ from onnxsim.pruning import (
     apply_wanda_pruning,
     weight_sparsity,
 )
+from onnxsim.ptq4vit import apply_ptq4vit_quantization
 from onnxsim.qoq import apply_smooth_attention, quantize_weight_only_qoq
 from onnxsim.qronos import apply_qronos
 from onnxsim.quantease import apply_quantease
@@ -221,6 +222,7 @@ __all__ = [
     "apply_awq",
     "apply_attention_quantization",
     "apply_gptq",
+    "apply_ptq4vit_quantization",
     "apply_qronos",
     "quantize_weight_only_qoq",
     "apply_smooth_attention",
