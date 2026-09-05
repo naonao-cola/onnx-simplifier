@@ -33,9 +33,10 @@ bool Disjoint(const Interval& a, const Interval& b) {
 // place, with no numerical difference from writing to a separate buffer.
 // This is a curated allowlist, not a schema query (nothing here parses
 // attributes or checks the actual input/output types), so it deliberately
-// excludes anything with an exception -- e.g. not "Reshape", which changes
-// rank/strides even though its byte size matches, and whose output some
-// executors treat as view metadata rather than a copy.
+// excludes anything with an exception -- e.g. not "Transpose", whose output
+// (unless the permutation happens to be the identity, which nothing here
+// checks) physically reorders elements rather than computing the same
+// index in place.
 bool IsInPlaceSafeOp(const std::string& op_type) {
   static const std::set<std::string> kSafeOps = {
       "Relu",     "Sigmoid",  "Tanh",        "LeakyRelu",  "Elu",      "Selu",
@@ -44,6 +45,28 @@ bool IsInPlaceSafeOp(const std::string& op_type) {
       "Celu",     "Round",    "Ceil",        "Floor",      "Sign",
   };
   return kSafeOps.count(op_type) > 0;
+}
+
+// Ops that reinterpret their first input's element sequence under a
+// different shape without moving any bytes -- ONNX requires row-major/
+// C-contiguous tensor layout, and none of these ops permute element order
+// (they only regroup, split, or insert/remove size-1 dimensions), so their
+// output is byte-for-byte identical to their input whenever the sizes
+// TensorBytes() reports actually agree (checked the same as every other
+// candidate, at the call site). This is a *stronger* guarantee than
+// IsInPlaceSafeOp's "safe to compute in place" -- these ops need no
+// computation at all, the output is a pure view -- but it is folded into
+// the same union-find aliasing pass since the resulting placement is
+// identical: one shared slot for input and output alike. Not "Transpose"
+// (see IsInPlaceSafeOp) or "Expand"/"Tile" (which do move/duplicate bytes).
+bool IsViewOp(const std::string& op_type) {
+  static const std::set<std::string> kViewOps = {
+      "Reshape",
+      "Flatten",
+      "Squeeze",
+      "Unsqueeze",
+  };
+  return kViewOps.count(op_type) > 0;
 }
 
 // Union-find (disjoint-set) over tensor names, path-compressed, used to
@@ -127,8 +150,9 @@ MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph) {
     }
   }
 
-  // In-place aliasing: union a safe unary op's input[0] with its output[0]
-  // (see IsInPlaceSafeOp) whenever doing so is provably safe --
+  // In-place aliasing: union a safe unary/view op's input[0] with its
+  // output[0] (see IsInPlaceSafeOp and IsViewOp) whenever doing so is
+  // provably safe --
   //   * not a weight, a graph input, or a declared graph output (an
   //     externally-owned buffer, or one the caller reads only after the
   //     whole graph finishes, so overwriting it mid-run would be observed
@@ -139,10 +163,12 @@ MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph) {
   //     well-formed model; checked anyway as a defensive belt-and-braces).
   // A chain of such ops unions transitively into one group -- Find() on any
   // member returns the same root -- that needs only a single slot for its
-  // entire span, rather than one slot per node.
+  // entire span, rather than one slot per node. The chain may freely mix
+  // both categories (e.g. Reshape -> Relu -> Flatten): the eligibility
+  // conditions and the resulting placement are identical either way.
   UnionFind uf;
   for (const NodeView& node : graph.nodes) {
-    if (!IsInPlaceSafeOp(node.op_type)) continue;
+    if (!IsInPlaceSafeOp(node.op_type) && !IsViewOp(node.op_type)) continue;
     if (node.inputs.empty() || node.outputs.size() != 1) continue;
     const std::string& in0 = node.inputs[0];
     const std::string& out0 = node.outputs[0];

@@ -84,6 +84,16 @@ logical storage. Honoring that part of the plan means actually running that
 node's kernel in place — writing its output over the input's own buffer —
 not just treating a repeated offset as "safe to reuse afterward."
 
+A second, separate allowlist (`IsViewOp`) covers pure view ops — `Reshape`,
+`Flatten`, `Squeeze`, `Unsqueeze` — that reinterpret the same bytes under a
+different shape with no computation at all: ONNX requires row-major/
+contiguous tensor layout, and none of these ops permute element order, so
+their output is byte-for-byte identical to their input whenever the sizes
+actually agree (checked the same way as every other candidate). A chain may
+freely mix both allowlists — e.g. `Reshape -> Relu -> Flatten` all collapse
+into one group — since the eligibility conditions and the resulting
+placement are identical either way.
+
 ## What's in `MemoryPlan`
 
 - **`tensor_offsets`** — `{name: (offset, size)}` for every planned tensor.
