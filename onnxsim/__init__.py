@@ -57,6 +57,7 @@ from onnxsim.gptq import apply_gptq
 from onnxsim.gptvq import quantize_weight_only_gptvq
 from onnxsim.hf_reconstruct import read_hf_config, reconstruct_hf_graph
 from onnxsim.hqq import quantize_weight_only_int4_hqq
+from onnxsim.ibert_gelu import apply_ibert_gelu
 from onnxsim.icquant import icquant_metadata_bits, quantize_weight_only_icquant
 from onnxsim.if4_quantization import quantize_weight_only_if4
 from onnxsim.kmeans_quantization import quantize_weight_only_kmeans
@@ -291,6 +292,7 @@ __all__ = [
     "quantize_weight_only_billm",
     "quantize_weight_only_pb_llm",
     "quantize_weight_only_int4_hqq",
+    "apply_ibert_gelu",
     "quantize_weight_only_icquant",
     "icquant_metadata_bits",
     "quantize_weight_only_kmeans",
