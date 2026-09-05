@@ -709,6 +709,89 @@ record format itself can assume: byte-position stability across even
 trivially-different graphs cannot be relied on outside the fixed
 header/footer.
 
+### The 32-byte mcode unit holds under shape variation too, and Wbt reveals real channel-tiling structure
+
+The op-count sweep above varies *how many* identical ops there are; this
+sweep instead holds op-count at 1 and varies *shape* -- output channels,
+input channels, and kernel size, each independently, for a single `Conv` --
+to separate "cost per op" from "cost per unit of tensor data."
+
+**The 32-byte mcode finding generalizes**: every single-`Conv` shape change
+tested still moves mcode's size by an exact multiple of 32 bytes -- cout
+`{4,8,16,32,64}` gives deltas `{512, 32, 0, 64}`; cin `{4,8,16,32,64}` gives
+`{192, 32, 0, 32}`; kernel size `{1,3,5,7}` gives `{-224, 928, 352}`
+(k=1->3 is negative -- a smaller kernel with a *larger* mcode, see below).
+19 independent measurements now, across two completely different kinds of
+model variation (repeating an op vs. reshaping one), zero exceptions: mcode
+appears to always serialize in exact 32-byte increments, a real structural
+property of the format rather than an artifact specific to adding ops.
+
+**Wbt's cost is *not* proportional to channel count -- it's flat across a
+range, then jumps**, consistent with output-channel tiling:
+
+```
+cout:    4     8    16    32    64
+Wbt:  1320  1448  1448  1448  2856
+```
+
+`Wbt` is identical across `cout` 8, 16, and *32* (1448 bytes each), then
+roughly doubles at 64 -- consistent with an output-channel tile width of 32
+(any count up to one tile's worth costs the same; a second tile is only
+needed past it). It cleanly decomposes at the two largest sizes: `Wbt -
+(cout * cin * k^2 [int8 weight] + cout * 4 [f32 per-channel scale] + cout *
+4 [f32 per-channel bias])` equals **exactly 40 bytes** for both cout=32
+(1448 - 1408 = 40) and cout=64 (2856 - 2816 = 40) -- a small, constant,
+plausibly-a-tensor-header overhead once tiling effects are past. Below the
+32-channel tile boundary (cout 4, 8, 16), that same subtraction gives 1144,
+1096, and 744 respectively -- real, shrinking, but not yet explained by any
+formula tried; `cout=4` is *smaller* than `cout=8`/`cout=16` even though
+they're otherwise byte-identical to each other, an unexplained outlier at
+the smallest size tested (the op-count sweep above hit the same kind of
+"smallest case is different" edge, for what it's worth).
+
+**Input channels show a similar flat-then-jump shape, but no clean floor
+was found**:
+
+```
+cin:    4     8    16    32    64
+Wbt: 1320  1256  1256  2408  4712
+```
+
+Flat across `cin` 8-16, roughly doubling at 32 and again at 64 (consistent
+with an input-channel tile width of 16 -- half `cout`'s apparent 32,
+plausible for a real MAC array with different input/output parallelism).
+Padding `cin` up to the nearest multiple of 16 before applying the same
+subtraction formula above gives a *matching* 648-byte residual for both
+cin=8 and cin=16 (real, clean), but the residual keeps growing at cin=32/64
+(1224, 2376) rather than settling to a constant the way `cout`'s did --
+genuinely not resolved here; per-input-channel data (e.g. a real hardware
+design can need per-input-channel handling that a purely per-output-channel
+model like the `cout` case doesn't) is a plausible reason, not confirmed.
+
+**Kernel size is the most surprising: not monotonic, and not `k^2`-scaled**:
+
+```
+k:      1     3     5     7
+Wbt: 1448  1320  2472  4776
+```
+
+`k=1` costs *more* than `k=3` despite having 1/9th the raw weight data --
+plausibly a real, different internal handling for 1x1 convolutions (closer
+to a MatMul in some NPU designs) rather than the general conv path. `k=3`
+to `k=5` to `k=7` grow much faster than raw element count would predict
+(a `k^2` model predicts a 2.78x jump from 3 to 5; the real jump is 1.87x),
+consistent with the kernel being broken into fixed-size sub-tiles (e.g. 3x3
+blocks) with each additional tile costing a full tile's worth regardless of
+how much of it the real kernel uses -- plausible, not confirmed with only
+four data points.
+
+**Bottom line**: the 32-byte mcode-serialization-unit finding is now solid
+across two independent kinds of experiment. The Wbt tiling-granularity
+story is real and reproducible (flat regions, clean doublings, an exact
+40-byte per-tensor floor once large enough) but only partially explained --
+a genuine, well-scoped target for further differential analysis, not a
+closed question.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`

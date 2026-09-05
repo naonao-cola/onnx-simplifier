@@ -61,14 +61,31 @@ def _n_conv_model(n):
     return model
 
 
-def _build_and_get_blob_sizes(tmp_path, n):
-    work_dir = os.path.join(str(tmp_path), f"conv{n}")
+def _single_conv_model(cin, cout, k):
+    """One `Conv(cin -> cout, kxk)` -- for shape-sweep experiments, unlike
+    `_n_conv_model`'s op-count sweep."""
+    rng = np.random.RandomState(0)
+    w = (rng.randn(cout, cin, k, k) * 0.1).astype(np.float32)
+    pad = k // 2
+    graph = helper.make_graph(
+        [helper.make_node("Conv", ["x", "w"], ["y"], pads=[pad, pad, pad, pad])],
+        f"g_cin{cin}_cout{cout}_k{k}",
+        [helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, cin, 16, 16])],
+        [helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, cout, 16, 16])],
+        initializer=[numpy_helper.from_array(w, name="w")],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
+
+
+def _build_and_get_blob_sizes_for_model(work_dir, model, input_name, input_shape):
     os.makedirs(work_dir, exist_ok=True)
-    onnx.save(_n_conv_model(n), os.path.join(work_dir, "model.onnx"))
+    onnx.save(model, os.path.join(work_dir, "model.onnx"))
 
     rng = np.random.RandomState(0)
     os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
-    samples = [rng.randn(1, 4, 16, 16).astype(np.float32) for _ in range(4)]
+    samples = [rng.randn(*input_shape).astype(np.float32) for _ in range(4)]
     pulsar2_docker.make_numpy_calibration_tar(
         os.path.join(work_dir, "dataset", "calib_x.tar"), samples
     )
@@ -78,7 +95,7 @@ def _build_and_get_blob_sizes(tmp_path, n):
         "quant": {
             "input_configs": [
                 {
-                    "tensor_name": "x",
+                    "tensor_name": input_name,
                     "calibration_dataset": "./dataset/calib_x.tar",
                     "calibration_format": "Numpy",
                     "calibration_size": 4,
@@ -111,6 +128,12 @@ def _build_and_get_blob_sizes(tmp_path, n):
     return len(inits[wbt_key].raw_data), len(inits[mcode_key].raw_data)
 
 
+def _build_and_get_blob_sizes(tmp_path, n):
+    return _build_and_get_blob_sizes_for_model(
+        os.path.join(str(tmp_path), f"conv{n}"), _n_conv_model(n), "x", (1, 4, 16, 16)
+    )
+
+
 def test_wbt_and_mcode_scale_differently_with_identical_ops(tmp_path):
     """Confirmed real (see the README's full 1-10 layer sweep): Axera's
     "Wbt" (Weight Table, the `npu_params` blob) grows by an *exact* constant
@@ -133,3 +156,34 @@ def test_wbt_and_mcode_scale_differently_with_identical_ops(tmp_path):
     mcode_delta_2 = mcode[4] - mcode[3]
     assert mcode_delta_1 % 32 == 0, (mcode, "mcode delta should be a multiple of 32")
     assert mcode_delta_2 % 32 == 0, (mcode, "mcode delta should be a multiple of 32")
+
+
+def test_mcode_32_byte_unit_holds_under_shape_variation_too(tmp_path):
+    """Confirmed real (see the README's cout/cin/kernel-size sweeps): the
+    32-byte mcode-serialization-unit finding above isn't specific to
+    *repeating* an op -- it holds just as well when a single Conv's *shape*
+    changes instead. Also locks in a real, reproducible surprise: Wbt is
+    NOT proportional to output-channel count -- it's identical for cout=8
+    and cout=16 (same output-channel tile), confirming a real tiling
+    granularity rather than a naive per-channel cost.
+    """
+    sizes = {
+        cout: _build_and_get_blob_sizes_for_model(
+            os.path.join(str(tmp_path), f"cout{cout}"),
+            _single_conv_model(4, cout, 3),
+            "x",
+            (1, 4, 16, 16),
+        )
+        for cout in (8, 16)
+    }
+    wbt = {cout: s[0] for cout, s in sizes.items()}
+    mcode = {cout: s[1] for cout, s in sizes.items()}
+
+    assert wbt[8] == wbt[16], (
+        wbt,
+        "Wbt should be identical within one output-channel tile",
+    )
+    assert (mcode[16] - mcode[8]) % 32 == 0, (
+        mcode,
+        "mcode delta should be a multiple of 32",
+    )
