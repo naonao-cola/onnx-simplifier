@@ -472,6 +472,137 @@ void TestSymbolicShapeUnplanned() {
   assert(plan.unplanned.size() == 2);  // both x and y are symbolically sized
 }
 
+// A node with two control-flow subgraphs (modeling an `If`'s then_branch /
+// else_branch) between a graph input `x` and graph output `y`. Each
+// subgraph is a handful of unconsumed graph inputs with no nodes at all --
+// the simplest way to pin down an exact, contrived arena size for this test
+// (each input gets its own slot: nothing consumes it, so under the "last
+// used through end" fallback for an unconsumed intermediate, every one of
+// them is simultaneously live) -- branch0 needs 3*100=300 bytes, branch1
+// needs 5*100=500. Both count towards the reservation (see
+// IsInPlaceSafeBinaryOp's sibling doc comment on the reservation loop:
+// every subgraph of a node is summed, mirroring PeakMemoryFootprint, even
+// though only one of an If's two branches actually runs).
+void TestSubgraphsPlannedIndependentlyAndReserved() {
+  GraphView branch0;
+  for (const char* n : {"p0", "p1", "p2"}) {
+    branch0.shapes[n] = {SymExpr(25)};
+    branch0.dtypes[n] = 4;  // 100 bytes each
+    branch0.inputs.push_back(n);
+  }
+
+  GraphView branch1;
+  for (const char* n : {"q0", "q1", "q2", "q3", "q4"}) {
+    branch1.shapes[n] = {SymExpr(25)};
+    branch1.dtypes[n] = 4;  // 100 bytes each
+    branch1.inputs.push_back(n);
+  }
+
+  GraphView g;
+  g.shapes["x"] = {SymExpr(25)};
+  g.shapes["y"] = {SymExpr(25)};
+  g.dtypes["x"] = g.dtypes["y"] = 4;  // 100 bytes each
+  g.inputs = {"x"};
+  g.outputs = {"y"};
+
+  NodeView if_node;
+  if_node.op_type = "If";
+  if_node.inputs = {"x"};
+  if_node.outputs = {"y"};
+  if_node.subgraphs = {branch0, branch1};
+  g.nodes = {if_node};
+
+  const MemoryPlan plan = ComputeActivationMemoryPlan(g);
+  assert(plan.unplanned.empty());
+  assert(plan.naive_bytes ==
+         200);  // only x and y count -- the top-level graph's tensors
+  assert(plan.subgraph_reserved_bytes == 800);  // 300 (branch0) + 500 (branch1)
+  // x and y both overlap the reservation (live while the If node runs) and
+  // each other (same-node-boundary rule), so all three need separate slots:
+  // 800 (reservation) + 100 (x) + 100 (y).
+  assert(plan.arena_bytes == 1000);
+
+  // The reservation is not a real tensor: it never appears in `offsets`.
+  assert(plan.offsets.count("y#reserved") == 0);
+  assert(plan.offsets.size() == 2);  // just x and y
+
+  assert(plan.subgraph_plans.size() == 2);
+  const MemoryPlan& sub0 = plan.subgraph_plans.at("y#0");
+  const MemoryPlan& sub1 = plan.subgraph_plans.at("y#1");
+  assert(sub0.arena_bytes == 300);
+  assert(sub0.naive_bytes == 300);
+  assert(sub0.offsets.size() == 3);
+  assert(sub1.arena_bytes == 500);
+  assert(sub1.naive_bytes == 500);
+  assert(sub1.offsets.size() == 5);
+  // Each subgraph's offsets start fresh at/near 0 in its own arena --
+  // entirely independent address space from the parent's.
+  assert(sub0.offsets.at("p0").first == 0);
+  assert(sub1.offsets.at("q0").first == 0);
+}
+
+// A single-subgraph node (modeling a `Loop`/`Scan` body) reuses the same
+// tensor name ("x") inside the subgraph as the outer graph does -- proving
+// the two scopes' offsets are independent: the same name means two entirely
+// different tensors that happen to share a name, not the same storage.
+void TestSingleSubgraphNodeReservation() {
+  GraphView body;
+  body.shapes["x"] = {SymExpr(10)};
+  body.dtypes["x"] = 4;  // 40 bytes, unrelated to the outer graph's "x"
+  body.inputs = {"x"};
+
+  GraphView g;
+  g.shapes["x"] = {SymExpr(25)};
+  g.shapes["y"] = {SymExpr(25)};
+  g.dtypes["x"] = g.dtypes["y"] = 4;  // 100 bytes each
+  g.inputs = {"x"};
+  g.outputs = {"y"};
+
+  NodeView loop;
+  loop.op_type = "Loop";
+  loop.inputs = {"x"};
+  loop.outputs = {"y"};
+  loop.subgraphs = {body};
+  g.nodes = {loop};
+
+  const MemoryPlan plan = ComputeActivationMemoryPlan(g);
+  assert(plan.subgraph_reserved_bytes == 40);
+  assert(plan.subgraph_plans.size() == 1);
+  const MemoryPlan& sub = plan.subgraph_plans.at("y#0");
+  assert(sub.arena_bytes == 40);
+  assert(sub.offsets.at("x").second == 40);
+  // The outer "x" is unaffected -- still its own 100-byte tensor, at its own
+  // offset in the outer arena.
+  assert(plan.offsets.at("x").second == 100);
+}
+
+// A node with a subgraph but no non-empty output name at all falls back to
+// a synthetic "#node<i>" key rather than crashing or colliding.
+void TestSubgraphNodeWithoutOutputNameFallsBackToSyntheticKey() {
+  GraphView body;
+  body.shapes["z"] = {SymExpr(1)};
+  body.dtypes["z"] = 4;
+  body.inputs = {"z"};
+
+  GraphView g;
+  g.shapes["x"] = {SymExpr(1)};
+  g.dtypes["x"] = 4;
+  g.inputs = {"x"};
+  g.outputs = {};
+
+  NodeView weird;
+  weird.op_type = "If";
+  weird.inputs = {"x"};
+  weird.outputs = {""};  // no real output name
+  weird.subgraphs = {body};
+  g.nodes = {weird};
+
+  const MemoryPlan plan = ComputeActivationMemoryPlan(g);
+  assert(plan.subgraph_plans.count("#node0#0") == 1);
+  assert(plan.subgraph_reserved_bytes ==
+         plan.subgraph_plans.at("#node0#0").arena_bytes);
+}
+
 }  // namespace
 
 int main() {
@@ -486,6 +617,9 @@ int main() {
   TestBinaryInPlaceAliasingSkipsBroadcastOperand();
   TestBinaryInPlaceAliasingBlockedByMultipleConsumers();
   TestSymbolicShapeUnplanned();
+  TestSubgraphsPlannedIndependentlyAndReserved();
+  TestSingleSubgraphNodeReservation();
+  TestSubgraphNodeWithoutOutputNameFallsBackToSyntheticKey();
   std::cout << "all memory_planning tests passed\n";
   return 0;
 }

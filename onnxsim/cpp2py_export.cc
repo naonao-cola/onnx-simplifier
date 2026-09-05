@@ -113,6 +113,23 @@ using PyAttribute =
 using PyTypeConstraint =
     std::tuple<std::string, std::vector<std::string>, std::string>;
 
+// Recursively marshal a MemoryPlan (see memory_planning.h) into the same
+// (offsets, arena_bytes, naive_bytes, unplanned, subgraph_reserved_bytes,
+// subgraph_plans) tuple shape at every level, so the Python
+// ``memory_planning`` module can rebuild nested ``MemoryPlan`` dataclasses
+// without any special-casing for depth. ``subgraph_plans`` -- a
+// ``py::dict`` rather than a plain ``std::map`` -- is itself a Python dict
+// mapping each subgraph's key to its own recursively-marshalled tuple.
+py::object MemoryPlanToPyTuple(const onnxsim::MemoryPlan& plan) {
+  py::dict subgraphs;
+  for (const auto& [key, sub] : plan.subgraph_plans) {
+    subgraphs[key.c_str()] = MemoryPlanToPyTuple(sub);
+  }
+  return py::cast(std::make_tuple(plan.offsets, plan.arena_bytes,
+                                  plan.naive_bytes, plan.unplanned,
+                                  plan.subgraph_reserved_bytes, subgraphs));
+}
+
 // Ensure ``domain`` exists in the schema registry's domain-to-version range and
 // that ``version`` falls inside it, so a schema with that since_version can be
 // registered. The default ONNX domain ("") is always present; custom domains
@@ -366,11 +383,14 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
 
   // Compute a static activation-memory plan (see memory_planning.h): a byte
   // offset for every tensor whose size is concretely known, packed into one
-  // shared arena by reusing space from tensors whose liveness has ended.
-  // Returned as (offsets, arena_bytes, naive_bytes, unplanned) so the Python
-  // ``memory_planning`` module can wrap it in a ``MemoryPlan`` dataclass,
-  // mirroring how ``_model_metrics`` hands its polynomials back to
-  // ``model_info`` for the sympy rebuild.
+  // shared arena by reusing space from tensors whose liveness has ended,
+  // plus one independently-computed nested plan per control-flow (If/Loop/
+  // Scan) subgraph body. Returned via MemoryPlanToPyTuple's recursive
+  // (offsets, arena_bytes, naive_bytes, unplanned, subgraph_reserved_bytes,
+  // subgraph_plans) tuple shape so the Python ``memory_planning`` module can
+  // rebuild a nested ``MemoryPlan`` dataclass tree, mirroring how
+  // ``_model_metrics`` hands its polynomials back to ``model_info`` for the
+  // sympy rebuild.
   m.def(
       "_memory_plan",
       [](const py::bytes& model_bytes, bool run_shape_inference) {
@@ -381,8 +401,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
             GetGraphView(model, run_shape_inference);
         const onnxsim::MemoryPlan plan =
             onnxsim::ComputeActivationMemoryPlan(view);
-        return std::make_tuple(plan.offsets, plan.arena_bytes, plan.naive_bytes,
-                               plan.unplanned);
+        return MemoryPlanToPyTuple(plan);
       },
       "model_bytes"_a, "run_shape_inference"_a = true);
 

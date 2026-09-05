@@ -329,6 +329,114 @@ def test_returned_from_top_level_package():
     assert onnxsim.MemoryPlan is MemoryPlan
 
 
+# --------------------------------------------------------------------------- #
+# control-flow subgraph planning (If/Loop/Scan)
+# --------------------------------------------------------------------------- #
+def _if_model_body():
+    # then_branch: x -> Relu -> a -> Relu -> b -> Relu -> then_out, an
+    # in-place-safe chain (see memory_planning_test.cpp's
+    # TestInPlaceAliasingCollapsesWholeChain) that collapses to one 100-byte
+    # group; else_branch: x -> Sigmoid -> c -> Tanh -> else_out, likewise one
+    # 100-byte group. Neither branch's own `x` is the outer graph's `x` --
+    # If's branches implicitly capture the outer scope's `x` by name, same
+    # tensor -- but nothing in either branch is a graph output or otherwise
+    # blocked, so this also exercises the ordinary in-place-aliasing pass
+    # running unmodified *inside* a subgraph body.
+    return """
+    g (float[25] x, bool cond) => (float[25] y)
+    {
+      y = If(cond) <
+        then_branch = then_g () => (float[25] then_out) {
+          a = Relu(x)
+          b = Relu(a)
+          then_out = Relu(b)
+        },
+        else_branch = else_g () => (float[25] else_out) {
+          c = Sigmoid(x)
+          else_out = Tanh(c)
+        }
+      >
+    }
+    """
+
+
+def test_if_node_subgraphs_planned_independently_and_reserved():
+    plan = plan_activation_memory(_model(_if_model_body()))
+
+    assert set(plan.subgraph_plans) == {"y#0", "y#1"}
+    then_plan = plan.subgraph_plans["y#0"]
+    else_plan = plan.subgraph_plans["y#1"]
+
+    assert then_plan.arena_bytes == 100
+    assert then_plan.naive_bytes == 300  # a, b, then_out -- no reuse credit
+    assert (
+        then_plan.tensor_offsets["a"]
+        == then_plan.tensor_offsets["b"]
+        == then_plan.tensor_offsets["then_out"]
+    )
+
+    assert else_plan.arena_bytes == 100
+    assert else_plan.naive_bytes == 200  # c, else_out
+    assert else_plan.tensor_offsets["c"] == else_plan.tensor_offsets["else_out"]
+
+    # Both branches count towards the reservation -- every subgraph of a node
+    # is summed, mirroring PeakMemoryFootprint, even though only one branch
+    # of an If actually runs: 100 + 100.
+    assert plan.subgraph_reserved_bytes == 200
+    # The outer graph's own naive_bytes only counts its own tensors (x, y);
+    # the reservation is overhead a naive "one slot per tensor" baseline
+    # never had to pay, which is why arena_bytes can end up bigger than
+    # naive_bytes once subgraphs are involved.
+    assert plan.naive_bytes == 200
+    assert plan.arena_bytes == plan.subgraph_reserved_bytes + plan.naive_bytes
+
+
+def test_print_memory_plan_recurses_into_subgraphs(capsys):
+    plan = plan_activation_memory(_model(_if_model_body()))
+    print_memory_plan(plan)
+    captured = capsys.readouterr()
+    assert "Reserved for control-flow subgraphs" in captured.out
+    assert "Subgraph 'y#0'" in captured.out
+    assert "Subgraph 'y#1'" in captured.out
+
+
+def test_annotate_memory_plan_recurses_into_subgraphs():
+    model = _model(_if_model_body())
+    plan = plan_activation_memory(model)
+    annotated = annotate_memory_plan(model)
+
+    branches = {
+        attr.g.name: attr.g
+        for node in annotated.graph.node
+        for attr in node.attribute
+        if attr.HasField("g")
+    }
+    then_g = branches["then_g"]
+    else_g = branches["else_g"]
+
+    then_meta = _metadata(then_g)
+    assert then_meta[METADATA_PREFIX + "memory_plan_arena_bytes"] == str(
+        plan.subgraph_plans["y#0"].arena_bytes
+    )
+    assert then_meta[METADATA_PREFIX + "memory_plan_naive_bytes"] == str(
+        plan.subgraph_plans["y#0"].naive_bytes
+    )
+
+    then_values = {
+        vi.name: vi
+        for vi in list(then_g.input) + list(then_g.output) + list(then_g.value_info)
+    }
+    for name, (offset, size) in plan.subgraph_plans["y#0"].tensor_offsets.items():
+        meta = _metadata(then_values[name])
+        assert meta[METADATA_PREFIX + "mem_offset"] == str(offset)
+        assert meta[METADATA_PREFIX + "mem_size"] == str(size)
+
+    else_meta = _metadata(else_g)
+    assert else_meta[METADATA_PREFIX + "memory_plan_arena_bytes"] == str(
+        plan.subgraph_plans["y#1"].arena_bytes
+    )
+
+
 def test_print_memory_plan_does_not_raise(capsys):
     body = """
     g (float[25] x) => (float[25] y)

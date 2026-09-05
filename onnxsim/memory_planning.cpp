@@ -287,6 +287,45 @@ MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph) {
     intervals.push_back({root, g.size, g.start, g.end});
   }
 
+  // Control-flow subgraphs (If/Loop/Scan bodies): each is planned
+  // independently, in its own arena starting at offset 0 (see the header's
+  // `subgraph_plans` doc), and the owning graph reserves room for it in its
+  // *own* arena for the span the owning node executes -- a synthetic
+  // interval, [i, i], sized to the sum of that node's subgraphs' arena_bytes
+  // (every subgraph counted, mirroring PeakMemoryFootprint's conservative
+  // "add every subgraph's peak" convention even though e.g. only one of an
+  // If's two branches actually runs). This interval participates in Pass 2
+  // placement exactly like any tensor's would -- Disjoint() already treats
+  // "produced at i" / "last used at i" as overlapping a [i, i] span, so it
+  // correctly avoids everything live while node i runs -- but it is not a
+  // real tensor: not part of `groups`, never eligible for aliasing, and
+  // never given an entry in `plan.offsets`.
+  for (int i = 0; i < end; ++i) {
+    const NodeView& node = graph.nodes[i];
+    if (node.subgraphs.empty()) continue;
+
+    std::string key_base;
+    for (const std::string& out : node.outputs) {
+      if (!out.empty()) {
+        key_base = out;
+        break;
+      }
+    }
+    if (key_base.empty()) key_base = "#node" + std::to_string(i);
+
+    int64_t reserved = 0;
+    for (std::size_t s = 0; s < node.subgraphs.size(); ++s) {
+      MemoryPlan sub_plan = ComputeActivationMemoryPlan(node.subgraphs[s]);
+      reserved += sub_plan.arena_bytes;
+      plan.subgraph_plans[key_base + "#" + std::to_string(s)] =
+          std::move(sub_plan);
+    }
+    if (reserved <= 0) continue;
+
+    plan.subgraph_reserved_bytes += reserved;
+    intervals.push_back({key_base + "#reserved", reserved, i, i});
+  }
+
   // Pass 2: greedy best-fit placement, largest group first (ties broken by
   // root name for determinism) -- the standard linear-scan/greedy-by-size
   // register allocation heuristic, which is what makes this
