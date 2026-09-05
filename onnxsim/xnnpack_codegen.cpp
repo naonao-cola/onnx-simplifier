@@ -63,6 +63,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "passes/endian_read.h"
+
 namespace onnxsim {
 namespace xnnpack_backend {
 
@@ -369,11 +371,17 @@ class Emitter {
     return *it->second;
   }
 
-  // Raw fp32 data of a constant initializer; throws if it is not fp32 or its
-  // element count does not match `shape`.
-  const float* RequireFp32Data(const onnx::TensorProto& tp,
-                               const std::vector<int64_t>& shape,
-                               const std::string& context) {
+  // Host-order fp32 data of a constant initializer; throws if it is not
+  // fp32 or its element count does not match `shape`. ONNX's raw_data wire
+  // format is fixed little-endian regardless of host byte order (see
+  // passes/endian_read.h's module comment), so the raw_data branch must
+  // byte-swap on a big-endian host -- a plain reinterpret_cast<const
+  // float*> over those bytes would silently read garbage there. float_data
+  // needs no such swap: protobuf decodes typed fields into host-order
+  // scalars itself.
+  std::vector<float> RequireFp32Data(const onnx::TensorProto& tp,
+                                     const std::vector<int64_t>& shape,
+                                     const std::string& context) {
     if (tp.data_type() != onnx::TensorProto::FLOAT) {
       throw std::runtime_error("xnnpack codegen: " + context + " '" +
                                tp.name() +
@@ -386,14 +394,16 @@ class Emitter {
                                  tp.name() +
                                  "': raw_data size does not match its shape");
       }
-      return reinterpret_cast<const float*>(tp.raw_data().data());
+      return ONNX_NAMESPACE::optimization::onnxsim_passes::ReadRawDataHostOrder<
+          float>(reinterpret_cast<const float*>(tp.raw_data().data()),
+                 NumElements(shape));
     }
     if (tp.float_data_size() != NumElements(shape)) {
       throw std::runtime_error("xnnpack codegen: " + context + " '" +
                                tp.name() +
                                "': float_data size does not match its shape");
     }
-    return tp.float_data().data();
+    return std::vector<float>(tp.float_data().begin(), tp.float_data().end());
   }
 
   // Defines a graph input/output Value at a fixed, externally-reserved id.
@@ -430,7 +440,7 @@ class Emitter {
 
     const auto& shape = RequireShape(name, context);
     const auto& tp = RequireInitializer(name, context);
-    const float* data = RequireFp32Data(tp, shape, context);
+    const std::vector<float> data = RequireFp32Data(tp, shape, context);
     // A rank-4 constant is just as much an NCHW/NHWC tensor as any
     // activation (e.g. a per-channel bias reshaped to [1, C, 1, 1], meant to
     // broadcast against an NHWC-permuted activation in an Add/Mul) -- it
@@ -443,8 +453,7 @@ class Emitter {
     const std::vector<int64_t> xnn_shape =
         is_4d ? PermuteShape(shape, kNCHWToNHWC) : shape;
     const std::vector<float> data_vec =
-        is_4d ? PermuteData(data, shape, kNCHWToNHWC)
-              : std::vector<float>(data, data + NumElements(shape));
+        is_4d ? PermuteData(data.data(), shape, kNCHWToNHWC) : data;
 
     TensorInfo info;
     info.id_var = MakeUniqueIdent("id_" + name);
@@ -479,8 +488,8 @@ class Emitter {
                                "' must be a 4-D filter");
     }
     const auto& tp = RequireInitializer(name, context);
-    const float* data = RequireFp32Data(tp, shape, context);
-    const std::vector<float> permuted = PermuteData(data, shape, perm);
+    const std::vector<float> data = RequireFp32Data(tp, shape, context);
+    const std::vector<float> permuted = PermuteData(data.data(), shape, perm);
     const std::vector<int64_t> xnn_shape = PermuteShape(shape, perm);
 
     TensorInfo info;
