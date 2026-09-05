@@ -186,6 +186,7 @@ from onnxsim.smoothquant import apply_smoothquant
 from onnxsim.spinquant import apply_spinquant
 from onnxsim.spqr import quantize_weight_only_spqr
 from onnxsim.squeezellm import quantize_weight_only_squeezellm
+from onnxsim.svdquant import apply_svdquant
 from onnxsim.tensorrt_sparsity import convert_matmul_to_gemm
 from onnxsim.tesseraq import apply_tesseraq
 from onnxsim.tflite_export import export_tflite
@@ -235,6 +236,7 @@ __all__ = [
     "apply_dac",
     "apply_llm_int8",
     "apply_low_rank_compensation",
+    "apply_svdquant",
     "apply_norm_tweaking",
     "MemoryPlan",
     "plan_activation_memory",
