@@ -13032,6 +13032,8 @@ def _gqa_model(
     # initializer (mutually exclusive with `attention_bias`) -- a str entry
     # becomes a named symbolic dim_param (e.g. "H"), an int a concrete one.
     head_sink=None,  # constant head_sink array (shape (H,)), or None (unconnected)
+    q_norm_weight=None,  # constant q_norm_weight array (shape (D,)), or None (unconnected)
+    k_norm_weight=None,  # constant k_norm_weight array (shape (D,)), or None (unconnected)
 ):
     # Real ONNX Runtime CPU kernels for GroupQueryAttention require
     # head_size to be a multiple of 8 (verified empirically -- a smaller
@@ -13126,19 +13128,21 @@ def _gqa_model(
         operands += ["", ""]
     operands += ["SeqLensK", "TotalSeq"]
 
-    # `attention_bias`/`head_sink`/`k_scale`/`v_scale` (GQA input indices
-    # 10/11/12/13) sit behind three other optional inputs
-    # (cos_cache/sin_cache/position_ids, indices 7-9, always left
-    # unconnected here -- none of this module's own matching/slicing
-    # touches them) that must be threaded through as empty positional
-    # placeholders for the text format's positional-input convention to
-    # reach index 10 at all.
+    # `attention_bias`/`head_sink`/`k_scale`/`v_scale`/`q_norm_weight`/
+    # `k_norm_weight` (GQA input indices 10/11/12/13/14/15) sit behind three
+    # other optional inputs (cos_cache/sin_cache/position_ids, indices 7-9,
+    # always left unconnected here -- none of this module's own
+    # matching/slicing touches them) that must be threaded through as empty
+    # positional placeholders for the text format's positional-input
+    # convention to reach index 10 at all.
     if (
         attention_bias is not None
         or attention_bias_dynamic_shape is not None
         or head_sink is not None
         or k_scale is not None
         or v_scale is not None
+        or q_norm_weight is not None
+        or k_norm_weight is not None
     ):
         operands += [""] * 3  # cos_cache, sin_cache, position_ids
         if attention_bias is not None:
@@ -13163,6 +13167,16 @@ def _gqa_model(
         if v_scale is not None:
             initializer.append(_f32(np.asarray(v_scale), "VScale"))
             operands.append("VScale")
+        else:
+            operands.append("")
+        if q_norm_weight is not None:
+            initializer.append(_f32(np.asarray(q_norm_weight), "QNorm"))
+            operands.append("QNorm")
+        else:
+            operands.append("")
+        if k_norm_weight is not None:
+            initializer.append(_f32(np.asarray(k_norm_weight), "KNorm"))
+            operands.append("KNorm")
         else:
             operands.append("")
 
@@ -13225,6 +13239,8 @@ def _gqa_model(
         v_scale=v_scale,
         attention_bias=attention_bias,
         head_sink=head_sink,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
     )
 
 
@@ -14267,6 +14283,103 @@ def test_gqa_pruning_malformed_head_sink_shape_is_declined():
     }
     for name in inits_before:
         np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_gqa_pruning_qk_norm_weight_paired_presence_required():
+    # `GroupQueryAttention`'s own `q_norm_weight`/`k_norm_weight` (indices
+    # 14/15) share the identical "must be provided together" schema rule
+    # `PagedAttention`'s own analogous pair already gets (see
+    # `test_paged_attention_pruning_qk_norm_weight_paired_presence_required`)
+    # -- `k_norm_weight` deliberately omitted here declines the whole match,
+    # leaving the node entirely untouched.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    q_norm = np.ones(D, dtype=np.float32)
+    model, cfg = _gqa_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=67, q_norm_weight=q_norm
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert (num_heads, kv_num_heads) == (H, KVH)  # left untouched
+
+
+def test_gqa_pruning_qk_norm_weight_wrong_shape_is_declined():
+    # A connected `q_norm_weight`/`k_norm_weight` pair not exactly
+    # `(head_size,)`-shaped is a real, previously-unvalidated correctness
+    # risk this fix closes: before `_find_gqa_chains` passed
+    # `qk_norm_weight_indices=(14, 15)` to `_find_separate_qkv_chains`, a
+    # `GroupQueryAttention` node like this one would have been silently
+    # pruned without ever checking whether the norm weight's own shape was
+    # even head-count-invariant. Now the whole match is declined instead,
+    # the node left completely untouched.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _gqa_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=68,
+        q_norm_weight=np.ones(D + 1, dtype=np.float32),
+        k_norm_weight=np.ones(D + 1, dtype=np.float32),
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert (num_heads, kv_num_heads) == (H, KVH)  # left untouched
+
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_gqa_pruning_qk_norm_weight_both_present_matches_oracle():
+    # `q_norm_weight`/`k_norm_weight` are `(head_size,)`-shaped -- constant
+    # across heads -- so they never need slicing under whole-head/KV-group
+    # pruning: this confirms a real match/prune still happens (the positive,
+    # pre-existing-behavior-preserving case this fix must not regress),
+    # Wq/Wk/Wv genuinely shrink, and QNorm/KNorm stay byte-identical.
+    # `GroupQueryAttention`'s own CPU kernel rejects a node with either
+    # input connected at all ("q_norm_weight / k_norm_weight inputs are not
+    # supported... implemented only on the CUDA and WebGPU EPs", confirmed
+    # empirically against this environment's installed onnxruntime), so
+    # unlike the plain attention_bias/head_sink tests above, this is checked
+    # structurally rather than by running the pruned model through a real
+    # `InferenceSession` -- the same CPU-kernel-unavailable fallback
+    # `test_paged_attention_pruning_qk_norm_weight_both_present_left_unsliced`
+    # already uses for its own analogous pair.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    q_norm = np.arange(D, dtype=np.float32)
+    k_norm = np.arange(D, dtype=np.float32) * 2.0
+    model, cfg = _gqa_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=69,
+        q_norm_weight=q_norm,
+        k_norm_weight=k_norm,
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert (num_heads, kv_num_heads) != (H, KVH)  # a real match/prune happened
+    assert kv_num_heads == 1
+    assert num_heads == 2
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["QNorm"], q_norm)
+    np.testing.assert_array_equal(inits["KNorm"], k_norm)
+    assert inits["Wq"].shape == (K, num_heads * D)
+    assert inits["Wk"].shape == (K, kv_num_heads * D)
+    assert inits["Wv"].shape == (K, kv_num_heads * D)
 
 
 def test_gqa_wanda_pruning_matches_oracle_exactly():
