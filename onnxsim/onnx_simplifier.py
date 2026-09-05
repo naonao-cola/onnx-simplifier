@@ -2451,6 +2451,8 @@ def apply_embedding_vocab_magnitude_pruning_cpp(
 def apply_quarot_cpp(
     model: Union[str, onnx.ModelProto],
     seed: int = 0,
+    block_size: int = 32,
+    epsilon: float = 1e-12,
 ) -> onnx.ModelProto:
     """
     C++-backed port of :func:`onnxsim.apply_quarot`: applies QuaRot-style
@@ -2458,7 +2460,7 @@ def apply_quarot_cpp(
     Outlier-Free 4-Bit Inference in Rotated LLMs") plus INT4
     round-to-nearest quantization of *both* the weight and the activation to
     every MatMul/vanilla-Gemm layer with a constant 2-D float32 weight whose
-    reduction dimension ``K`` is divisible by 32.
+    reduction dimension ``K`` is divisible by ``block_size``.
 
     Rotating the whole residual stream by a random orthogonal matrix removes
     activation outliers the same way block quantization already tolerates
@@ -2473,17 +2475,24 @@ def apply_quarot_cpp(
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
     Layers with a non-constant, non-2-D weight, or a reduction dimension not
-    divisible by 32, are left untouched. Consider calling :func:`simplify`
-    before and/or after to clean up the graph.
+    divisible by ``block_size``, are left untouched. Consider calling
+    :func:`simplify` before and/or after to clean up the graph.
 
     :param model: the original (unquantized) onnx ModelProto or file path
     :param seed: seed for the per-layer random rotation matrices
+    :param block_size: elements per weight quantization block along ``K``,
+            matching :func:`onnxsim.quantize_weight_only_int4`'s own default
+    :param epsilon: floor applied to a token's own max-abs rotated-activation
+            value before using it as a scale, avoiding a divide-by-zero on
+            an all-zero token
     :returns: the rotated-and-quantized onnx ModelProto; a model with no
             matching layer, or an opset older than 21, is returned unchanged
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    return onnx.load_from_string(C.apply_quarot(model.SerializeToString(), seed))
+    return onnx.load_from_string(
+        C.apply_quarot(model.SerializeToString(), seed, block_size, epsilon)
+    )
 
 
 def quantize_fp16(

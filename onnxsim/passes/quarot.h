@@ -28,8 +28,9 @@
 // changes too. Only the common, unambiguous shape is handled: a MatMul, or
 // a Gemm with transA=0, alpha=1 and beta=1, whose weight (input 1) is a
 // constant 2-D float32 tensor whose reduction dimension K is divisible by
-// kBlockSize, on an opset >= 21 model (INT4 tensors and DequantizeLinear's
-// block_size attribute both need it). Everything else is left alone.
+// the configured block size (QuarotBlockSize(), 32 by default), on an
+// opset >= 21 model (INT4 tensors and DequantizeLinear's block_size
+// attribute both need it). Everything else is left alone.
 //
 // Scope note: this reuses a fresh Haar-random rotation per matched layer
 // (random_orthogonal.h), matching quarot.py's/spinquant.py's own scope --
@@ -74,10 +75,27 @@ inline uint64_t& QuarotSeed() {
   return seed;
 }
 
-struct Quarot final : public PredicateBasedPass {
-  static constexpr int64_t kBlockSize = 32;
-  static constexpr float kEpsilon = 1e-12f;
+// Weight quantization block size along K (elements per quantization block
+// sharing one scale) -- read/written the same way QuarotSeed() is, and for
+// the same reason: OptimizeFixed's pass-name-list interface has no other way
+// to carry a parameter into this singleton pass. Set by ApplyQuarot
+// (quantize_entry.cpp) immediately before calling OptimizeFixed. Mirrors
+// quarot.py's own ``block_size`` parameter.
+inline int64_t& QuarotBlockSize() {
+  static int64_t block_size = 32;
+  return block_size;
+}
 
+// Floor applied to a token's own max-abs rotated-activation value before
+// using it as a quantization scale, avoiding a divide-by-zero on an
+// all-zero token. Read/written the same way QuarotSeed() is. Mirrors
+// quarot.py's own ``epsilon`` parameter.
+inline float& QuarotEpsilon() {
+  static float epsilon = 1e-12f;
+  return epsilon;
+}
+
+struct Quarot final : public PredicateBasedPass {
   explicit Quarot()
       : PredicateBasedPass(PassType::Other, PassEfficiency::Complete,
                            PassOptimizationType::Compute) {}
@@ -102,7 +120,7 @@ struct Quarot final : public PredicateBasedPass {
     }
     const int64_t channel_axis = info.weight_transposed ? 0 : 1;
     const int64_t K = w_t->sizes()[1 - channel_axis];
-    return K % kBlockSize == 0;
+    return K % QuarotBlockSize() == 0;
   }
 
   bool runTransform(Node* n, Graph& graph,
@@ -125,10 +143,12 @@ struct Quarot final : public PredicateBasedPass {
         info.weight_transposed ? w_t->sizes()[0] : w_t->sizes()[1];
     const int64_t K =
         info.weight_transposed ? w_t->sizes()[1] : w_t->sizes()[0];
-    if (K % kBlockSize != 0) {
+    const int64_t block_size = QuarotBlockSize();
+    const float epsilon = QuarotEpsilon();
+    if (K % block_size != 0) {
       return false;
     }
-    const int64_t num_blocks = K / kBlockSize;
+    const int64_t num_blocks = K / block_size;
 
     // w_nk: [N, K], output channel first.
     const std::vector<float> w_nk = ReadWeightNK(*w_t, info.weight_transposed);
@@ -161,8 +181,8 @@ struct Quarot final : public PredicateBasedPass {
     for (int64_t r = 0; r < N; ++r) {
       for (int64_t blk = 0; blk < num_blocks; ++blk) {
         float max_abs = 0.0f;
-        for (int64_t j = 0; j < kBlockSize; ++j) {
-          const int64_t c = blk * kBlockSize + j;
+        for (int64_t j = 0; j < block_size; ++j) {
+          const int64_t c = blk * block_size + j;
           max_abs = std::max(max_abs,
                              static_cast<float>(std::fabs(
                                  w_tilde_nk[static_cast<size_t>(r * K + c)])));
@@ -174,7 +194,7 @@ struct Quarot final : public PredicateBasedPass {
     std::vector<int8_t> codes_kn(static_cast<size_t>(K * N));
     for (int64_t r = 0; r < N; ++r) {
       for (int64_t c = 0; c < K; ++c) {
-        const int64_t blk = c / kBlockSize;
+        const int64_t blk = c / block_size;
         const float s = scale_kn[static_cast<size_t>(blk * N + r)];
         const float q = std::round(
             static_cast<float>(w_tilde_nk[static_cast<size_t>(r * K + c)]) / s);
@@ -182,10 +202,12 @@ struct Quarot final : public PredicateBasedPass {
             static_cast<int8_t>(std::clamp(q, -7.0f, 7.0f));
       }
     }
-    // Pack two int4 codes per byte, low nibble first (K * N is always even:
-    // K is a multiple of kBlockSize=32) -- see
+    // Pack two int4 codes per byte, low nibble first -- see
     // TryQuantizeWeightBlockwiseInt4InPlace's identical packing for why this
-    // bypasses the typed int32_data field.
+    // bypasses the typed int32_data field. ``(numel + 1) / 2`` rounds up so
+    // this stays correct even for an odd ``block_size`` that leaves K * N
+    // odd, unlike quarot.py's own ``_pack_int4`` (adaround.py), which
+    // assumes an even count.
     const int64_t numel = K * N;
     std::string packed(static_cast<size_t>((numel + 1) / 2), '\0');
     for (int64_t i = 0; i < numel; ++i) {
@@ -220,7 +242,7 @@ struct Quarot final : public PredicateBasedPass {
 
     Tensor eps_t;
     eps_t.elem_type() = TensorProto_DataType_FLOAT;
-    eps_t.floats() = {kEpsilon};
+    eps_t.floats() = {epsilon};
     Value* eps_v = graph.addInitializerAndCreateValue(eps_t);
 
     Tensor seven_t;
@@ -291,7 +313,7 @@ struct Quarot final : public PredicateBasedPass {
     w_dequant->addInput(codes_v);
     w_dequant->addInput(scale_v);
     w_dequant->i_(kaxis, 0);
-    w_dequant->i_(Symbol("block_size"), kBlockSize);
+    w_dequant->i_(Symbol("block_size"), block_size);
     w_dequant->insertBefore(n);
     w_dequant->output()->setElemType(TensorProto_DataType_FLOAT);
     w_dequant->output()->setSizes({Dimension(K), Dimension(N)});

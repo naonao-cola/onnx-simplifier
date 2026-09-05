@@ -989,17 +989,18 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // onnxsim.h.
   m.def(
       "apply_quarot",
-      [](const py::bytes& model_proto_bytes, uint64_t seed) -> py::bytes {
+      [](const py::bytes& model_proto_bytes, uint64_t seed, int64_t block_size,
+         float epsilon) -> py::bytes {
         InitEnv();
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
-        const auto result = ApplyQuarot(model, seed);
+        const auto result = ApplyQuarot(model, seed, block_size, epsilon);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
       },
-      "model_bytes"_a, "seed"_a);
+      "model_bytes"_a, "seed"_a, "block_size"_a = 32, "epsilon"_a = 1e-12f);
 
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
