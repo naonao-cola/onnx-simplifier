@@ -679,6 +679,86 @@ before, plus a real accuracy caveat:
   build --config` currently applies -- `llm_build()` (above), Pulsar2's
   own dedicated LLM path, presumably has one; this generic path doesn't.
 
+### Mitigation attempts: none reproduce `llm_build()`'s accuracy via the generic path
+
+Given the depth-compounding diagnosis above, every quantization knob this
+harness has real access to was tried against the real `SmolLM2-135M` build
+to see if any of them close the gap to `llm_build()`'s weight-only accuracy.
+**None do.** In order tried:
+
+- **`quant.enable_smooth_quant`** (with default and explicit
+  threshold/strength): no measurable effect on output.
+- **`quant.highest_mix_precision`**: real `TileFailException` -- the
+  attention path's promoted-precision matmul tile doesn't fit the NPU's
+  memory budget, a hard failure rather than a partial improvement.
+- **`quant.layer_configs` with an FP32 override on `ReduceMean`/`Sqrt`**
+  (RMSNorm's own ops, the intuitive place to protect precision): confirmed
+  **silent no-op**, byte-identical compiled output with and without it.
+  Root-caused this session by fetching Pulsar2's own config schema docs
+  (`user_guides_advanced/advanced_build_guides.html`): `layer_configs`'
+  `data_type: "FP32"` is only valid for a specific, documented op list --
+  `LeakyRelu, Sigmoid, Relu, Add, Mul, Div, Sub, Concat, Softmax` -- and
+  silently does nothing for anything else, including `ReduceMean`/`Sqrt`.
+  Not a bug in this harness; an invalid config value that Pulsar2 doesn't
+  validate or warn about.
+- **`quant.layer_configs` retried with only doc-valid op types**
+  (`Softmax`, `Add`, `Mul`, `Div`, `Sub`, all set to `data_type: "FP32"`,
+  stacked incrementally): confirmed **real** this time -- `Add`/`Mul`/
+  `Div`/`Sub` overrides each produce a measurably different compiled
+  `quant_axmodel.onnx` and different real on-device output (different
+  bytes, different per-prompt cosine similarity) than the baseline.
+  `Softmax` alone is the one exception: it changes a few bytes of the
+  intermediate quantized IR (Pulsar2's own `AxSoftmax` op, not literally
+  `Softmax` by then) but produces **bit-identical** on-device output across
+  every test prompt -- Softmax's [0, 1]-bounded output is apparently
+  already well represented at whatever precision Pulsar2 was already using
+  for it. Stacking all four working overrides together does **not**
+  recover accuracy -- average cosine similarity across 5 real prompts got
+  *worse* (~-0.33 vs baseline's ~-0.20), still 0/5 top-1 matches. Protecting
+  a handful of elementwise nonlinearities can't compensate for the
+  dominant cost -- MatMul/Conv activations, which `layer_configs` cannot
+  set to FP32 at all (`data_type: "FP32"` isn't accepted for `MatMul` or
+  `Conv`; `Conv` only accepts a separate `output_data_type: "FP32"`).
+- **`quant.enable_adaround`**: never completed -- still running after 30
+  minutes on this model, abandoned as impractical for this investigation.
+- **Feeding a pre-quantized ONNX graph via `model_type: "QuantONNX"`**,
+  to bypass Pulsar2's own PTQ entirely and substitute onnxsim's own
+  quantizers instead (`onnxsim.quantize_weight_only()`, matching
+  `llm_build()`'s real weight-only S8 scheme exactly, and
+  `onnxsim.quantize_static()`, already confirmed elsewhere in this file to
+  match AX650's real U8-activation/S8-weight convention). `QuantONNX` is
+  confirmed to be a real, distinct ingestion path (`pulsar2 build` prints
+  `"... is a QuantONNX model, disable concat align config"` and skips
+  requesting calibration ranges for tensors that already carry
+  `QuantizeLinear`/`DequantizeLinear`) -- but it hits a real, reproducible
+  **Pulsar2-internal bug**: any `MatMul` whose weight input comes through a
+  `DequantizeLinear` (the standard ONNX QDQ per-channel weight-quantization
+  pattern -- exactly what both onnxsim quantizers above emit) crashes
+  Pulsar2's own PPQ-based `ax_quant_graph_optimize` pass with
+  `ValueError: Can not feed value to operation <node>, expects exact 2
+  inputs, however 1 was given` -- one of `MatMul`'s two inputs is silently
+  dropped during Pulsar2's own graph optimization, before either onnxsim
+  quantizer's choices could matter. **Isolated to a minimal, 2-node,
+  104-byte repro** (`MatMul(x, DequantizeLinear(wq, scale, zp))`, no LLM
+  structure involved at all) -- confirms this is a general `QuantONNX` +
+  quantized-`MatMul` limitation in Pulsar2 itself, not something specific
+  to `reconstruct_hf_graph()`'s output or a fixable onnxsim-side encoding
+  choice. Reproduced identically whether the activation side is also
+  quantized (`quantize_static()`'s full QDQ output) or left plain float
+  (`quantize_weight_only()`'s output) -- ruling out any interaction with
+  activation quantization specifically; the crash is purely about `MatMul`
+  plus a `DequantizeLinear`'d weight.
+
+**Verdict, after 7 distinct techniques**: the generic `pulsar2 build`
+(ONNX) ingestion path cannot currently reproduce `llm_build()`'s real,
+usable LLM accuracy on AX650, regardless of which quantization strategy is
+applied from the ONNX side -- Pulsar2's own exposed PTQ knobs don't fix the
+depth-compounding problem, and substituting a pre-quantized graph runs into
+a real toolchain bug for exactly the QDQ pattern that would reproduce
+`llm_build()`'s weight-only scheme. `llm_build()`'s separate, closed-source,
+non-ONNX ingestion (above) remains the only confirmed-accurate path to a
+real LLM `.axmodel` today.
+
 ## Real Docker + device conversion driver
 
 `pulsar2_docker.py` and `convert_onnxmodelzoo.py` turn the manual
