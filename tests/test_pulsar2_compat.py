@@ -192,3 +192,35 @@ def test_ax650_build_risks_matches_real_conversions():
     risks = pulsar2.ax650_build_risks(old_model)
     assert any("LRN" in r for r in risks)
     assert any("opset 9" in r for r in risks)
+
+
+def test_ax650_build_risks_flags_confirmed_broken_listed_ops():
+    """`Xor` is in AX650_SUPPORTED_OPS (Axera's own docs list it) but a real
+    single-node-per-op hardware sweep confirmed it hard-fails a real build
+    anyway (``KeyError('dont support Xor opr ...')``) -- see
+    ``pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS``. `ax650_build_risks()` must
+    flag this even though `Xor` would pass the plain docs-list check.
+    """
+    import onnx
+    from onnx import TensorProto, helper
+
+    xor_node = helper.make_node("Xor", ["x", "y"], ["z"])
+    graph = helper.make_graph(
+        [xor_node],
+        "confirmed_broken_xor",
+        [
+            helper.make_tensor_value_info("x", TensorProto.BOOL, [1, 4]),
+            helper.make_tensor_value_info("y", TensorProto.BOOL, [1, 4]),
+        ],
+        [helper.make_tensor_value_info("z", TensorProto.BOOL, [1, 4])],
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10
+    )
+    onnx.checker.check_model(model)
+
+    # Not flagged by the plain docs-list check: Xor IS in AX650_SUPPORTED_OPS.
+    assert not pulsar2.unsupported_on_ax650(model)
+
+    risks = pulsar2.ax650_build_risks(model)
+    assert any("Xor" in r and "confirmed to hard-fail" in r for r in risks)

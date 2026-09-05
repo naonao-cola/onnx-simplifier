@@ -814,6 +814,82 @@ at least this shape/parameter combination -- root cause (a missing required
 attribute this minimal graph didn't set, a PTQ-engine limitation specific to
 transposed conv, or something else) not further diagnosed here.
 
+## Systematic op coverage: from 29% to 99% of `AX650_SUPPORTED_OPS`
+
+The findings above cover Conv/MatMul-family ops specifically. Widening out
+to the *entire* 92-op `AX650_SUPPORTED_OPS` list: cross-referencing every
+op type actually exercised by a real `pulsar2 build` anywhere in this
+investigation (the LLM reconstruction graph, the Conv/MatMul/arith
+batteries above, and earlier CNN builds) against the full list started at
+27/92 (~29%) confirmed one way or the other. A single-node-per-op battery
+(one real `pulsar2 build` per op, small isolated graphs) brought that to
+**91/92 (~99%)** -- only `SpatialTransformer` remains genuinely
+inconclusive (see below), and every other op in the list now has a real,
+confirmed working-or-failing verdict.
+
+**84 confirmed working**, including some genuinely useful discoveries for
+future onnxsim work:
+
+- **`RMSNormalization` (native, opset 23) compiles successfully as a single
+  op.** `reconstruct_hf_graph()` currently hand-decomposes RMSNorm into
+  `ReduceMean`/`Add`/`Sqrt`/`Div`/`Mul` (reused from `gguf_reconstruct.py`,
+  written before this op existed in the ONNX opset) -- emitting the native
+  op instead would be a smaller, more legible graph, worth a follow-up if
+  onnxsim ever bumps its target opset that high.
+- **`Silu` compiles even though it isn't a real ONNX operator schema at
+  all** -- confirmed by constructing a raw `NodeProto` with `op_type=
+  "Silu"` directly (`onnx.checker` has no schema for it and was skipped;
+  Pulsar2 doesn't care). It's one of Axera's own extension op names, and a
+  real, working one -- though onnxsim should keep emitting the standard
+  `Sigmoid`+`Mul` decomposition regardless, for `onnxruntime` compatibility.
+- **A real, generalizable gotcha**: `Elu`, `LeakyRelu`, and `TopK` all
+  failed on the first attempt with confusing internal errors (`RuntimeError
+  ("... convert error: 'alpha'")`, `RuntimeError("... get opr failed")`) --
+  not because the ops are unsupported, but because their optional
+  attributes (`alpha` for the first two, `largest`/`sorted` for `TopK`)
+  were left unset to fall back to the ONNX schema's own documented default.
+  Pulsar2's frontend doesn't resolve that default -- it reads the missing
+  attribute as `None` and chokes. Setting the exact same default value
+  *explicitly* on the node made all three compile without any other
+  change. Worth remembering for any ONNX graph -- onnxsim-generated or
+  not -- headed for a real `pulsar2 build`: never rely on an attribute's
+  schema default being applied for you.
+
+**7 confirmed failing despite being listed in `AX650_SUPPORTED_OPS`**
+(beyond `ConvTranspose`, already covered above):
+
+- `Xor`: genuinely unimplemented (`KeyError('dont support Xor opr...')`).
+- `Squeeze`: a real internal compiler bug, not a "not supported" error --
+  `ZeroDivisionError('division by zero')` inside the NPU backend scheduler
+  for the specific shape tested (`(1,4)` squeezed to `(4,)`); other shapes
+  may not trigger it.
+- `LpNormalization`: fails deep in quantization with an internal exception
+  on a U8-quantized intermediate tensor.
+- `RotaryEmbedding` (native, opset 23): fails even after applying the
+  same "set attributes explicitly" fix confirmed above for `Elu`/
+  `LeakyRelu`/`TopK` (`interleaved=0, rotary_embedding_dim=0` explicit) --
+  genuinely unimplemented, not an attribute-defaulting issue this time.
+  `reconstruct_hf_graph()`'s hand-decomposed RoPE (`Sin`/`Cos`/`Mul`/
+  `Concat`/`Neg`/`Slice`) remains the only working path.
+- `Swish`: a real ONNX op since opset 24 (distinct from the working
+  `HardSwish`/`Silu`), but genuinely unimplemented here (`"Swish, {'alpha':
+  1.0} get opr failed"` even with `alpha` explicit).
+- `InverseSigmoid`: not a real ONNX operator schema (like `Silu`, likely
+  an Axera extension name) -- but unlike `Silu`, fails
+  (`"InverseSigmoid, pyrun failed"`).
+
+**`SpatialTransformer` -- inconclusive, not simply untested.** Also not a
+real ONNX schema. The first attempt (passing `theta` as a graph input
+tensor) failed with a very specific, informative internal error naming
+six *scalar attributes* it expected instead: `theta_1_1` through
+`theta_2_3` (a 2x3 affine matrix baked into the node as six named floats,
+not a runtime tensor -- confirming this op is designed for a compile-time-
+constant spatial transform). Rebuilding with those six attributes set gets
+past that error, but then fails differently (`IndexError('list index out
+of range')`) -- a second real, distinct internal issue, not chased further
+here since this is an exotic, rarely-relevant op for this project's
+CNN/LLM focus.
+
 ## Files
 
 | file | purpose |

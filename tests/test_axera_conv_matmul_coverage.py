@@ -189,11 +189,31 @@ def test_conv_variants_are_indistinguishable_to_the_heuristic():
     """`partition()` reports full NPU coverage for every plain-float Conv
     shape, regardless of group/dilation/stride/auto_pad/rank -- it only looks
     at `node.op_type`. This is the exact "does not model attribute-level
-    limits" gap `pulsar2_simulator.py`'s own docstring already calls out."""
+    limits" gap `pulsar2_simulator.py`'s own docstring already calls out.
+
+    `conv_transpose` is excluded: `ConvTranspose` is one of the 7 ops
+    confirmed via real hardware to hard-fail despite being listed in
+    `AX650_SUPPORTED_OPS` (`pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS`), so the
+    heuristic now correctly distinguishes it -- see the dedicated test below.
+    """
     for name in _CONV_VARIANTS:
+        if name == "conv_transpose":
+            continue
         model = _build(name)
         assert sim.coverage(model) == "full", name
         assert backend.ax650_build_risks(model) == [], name
+
+
+def test_conv_transpose_is_flagged_as_confirmed_broken():
+    """Unlike the other Conv variants above, `ConvTranspose` IS distinguished
+    by the heuristic now: it's listed in `AX650_SUPPORTED_OPS` but confirmed
+    via real hardware to hard-fail a real build anyway (real
+    `RuntimeError("Op Execution Error...")` during quantization -- see
+    `pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS`)."""
+    model = _build("conv_transpose")
+    assert sim.coverage(model) == "none"
+    risks = backend.ax650_build_risks(model)
+    assert any("ConvTranspose" in r and "confirmed to hard-fail" in r for r in risks)
 
 
 def test_matmul_variants_are_indistinguishable_to_the_heuristic():

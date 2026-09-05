@@ -22,9 +22,18 @@ execution provider, this wraps two things that only need `onnx` + `onnxruntime`:
   friends, confirmed proprietary and non-ONNX-Runtime-executable -- see
   `pulsar2_quantizer.py`) or its exact fusion/rounding behavior.
 - Partitioning here is purely per-node op-type membership in
-  `AX650_SUPPORTED_OPS`; it does not model attribute-level limits (e.g.
-  Conv's `auto_pad` must be `NOTSET`) or how Pulsar2 actually groups/merges
-  eligible nodes into subgraphs.
+  `AX650_SUPPORTED_OPS` (minus `AX650_CONFIRMED_BROKEN_OPS`, see below); it
+  does not model attribute-level limits (e.g. Conv's `auto_pad` must be
+  `NOTSET`) or how Pulsar2 actually groups/merges eligible nodes into
+  subgraphs.
+
+**Update, from the 91/92-op real-hardware coverage sweep:** 7 ops listed in
+`AX650_SUPPORTED_OPS` (`ConvTranspose`, `Xor`, `Squeeze`, `LpNormalization`,
+`RotaryEmbedding`, `Swish`, `InverseSigmoid`) are confirmed via real
+`pulsar2 build` to hard-fail anyway -- see
+`pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS`. `partition()` now places these on
+the CPU side (tracked in `Partition.confirmed_broken_op_types`) instead of
+treating docs-list membership alone as NPU-eligible.
 
 Use it to get a fast first read (does this graph look NPU-friendly? is
 onnxsim's simplification likely to change that? roughly how much does INT8
@@ -63,8 +72,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from pulsar2_ops import AX650_SUPPORTED_OPS, AXERA_NPU_OP_TYPE  # noqa: E402
 import pulsar2_quantizer  # noqa: E402
+from pulsar2_ops import (  # noqa: E402
+    AX650_CONFIRMED_BROKEN_OPS,
+    AX650_SUPPORTED_OPS,
+    AXERA_NPU_OP_TYPE,
+)
 
 _SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Only keep scripts/ on sys.path for the duration of this import: scripts/
@@ -99,6 +112,14 @@ class Partition:
     npu_nodes: List[str]
     cpu_nodes: List[str]
     cpu_op_types: Dict[str, int] = field(default_factory=dict)
+    # Subset of `cpu_op_types` that ARE in AX650_SUPPORTED_OPS but were
+    # placed on the CPU side anyway because a real single-node-per-op
+    # hardware sweep confirmed they hard-fail a real build -- see
+    # `pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS`. Surfaced separately from the
+    # rest of `cpu_op_types` (ops never claimed to be supported at all)
+    # since these represent a confirmed gap in the docs-scraped list, not
+    # just an ordinary CPU-fallback op.
+    confirmed_broken_op_types: Dict[str, int] = field(default_factory=dict)
 
     @property
     def npu_node_fraction(self) -> float:
@@ -112,18 +133,32 @@ def partition(model: onnx.ModelProto) -> Partition:
     A node whose op_type is `AXERA_NPU_OP_TYPE` (an already-compiled `neu
     mode` node, e.g. from re-loading a real `.axmodel`) counts as NPU, not
     CPU -- it's already placed, not something left over for the partitioner.
+
+    An op type in `AX650_CONFIRMED_BROKEN_OPS` is placed on the CPU side
+    even though it's also in `AX650_SUPPORTED_OPS`: a real hardware sweep
+    confirmed these hard-fail a real build despite being docs-listed as
+    supported (see `pulsar2_ops.py`'s docstring). Tracked separately in
+    `Partition.confirmed_broken_op_types` so callers can distinguish "not
+    docs-supported" from "docs-supported but confirmed broken."
     """
     npu: List[str] = []
     cpu: List[str] = []
     cpu_types: Dict[str, int] = {}
+    broken_types: Dict[str, int] = {}
     for node in model.graph.node:
         label = node.name or f"<{node.op_type}>"
-        if node.op_type == AXERA_NPU_OP_TYPE or node.op_type in AX650_SUPPORTED_OPS:
+        if node.op_type == AXERA_NPU_OP_TYPE:
+            npu.append(label)
+        elif node.op_type in AX650_CONFIRMED_BROKEN_OPS:
+            cpu.append(label)
+            cpu_types[node.op_type] = cpu_types.get(node.op_type, 0) + 1
+            broken_types[node.op_type] = broken_types.get(node.op_type, 0) + 1
+        elif node.op_type in AX650_SUPPORTED_OPS:
             npu.append(label)
         else:
             cpu.append(label)
             cpu_types[node.op_type] = cpu_types.get(node.op_type, 0) + 1
-    return Partition(npu, cpu, cpu_types)
+    return Partition(npu, cpu, cpu_types, broken_types)
 
 
 def coverage(model: onnx.ModelProto) -> str:
