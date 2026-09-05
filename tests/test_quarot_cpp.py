@@ -307,3 +307,36 @@ def test_cpp_quarot_block_size_and_epsilon_defaults_match_python():
     sig = inspect.signature(onnxsim.apply_quarot_cpp)
     assert sig.parameters["block_size"].default == 32
     assert sig.parameters["epsilon"].default == 1e-12
+
+
+def test_cpp_quarot_rotation_intentionally_diverges_from_python_for_same_seed():
+    # Locks in a documented, permanent divergence (see this pass's own
+    # docstrings in onnxsim/quarot.py, onnxsim/passes/quarot.h and
+    # onnxsim/passes/random_orthogonal.h): apply_quarot_cpp builds its
+    # random rotation via Gram-Schmidt with a per-node RNG derivation,
+    # while apply_quarot (quarot.py) uses a sign-corrected QR decomposition
+    # sequenced through a single numpy.random.Generator. Both are
+    # independently Haar-uniform, but NOT expected to ever alias for the
+    # same seed -- if this test starts failing because the two rotations
+    # now match, that's a signal the algorithms were unintentionally
+    # aligned (or this test needs updating alongside a deliberate,
+    # documented decision to pursue bit-for-bit parity), not a bug fix.
+    model = _matmul_model(K=32, N=8, seed=20)
+    py_q = onnxsim.apply_quarot(model, seed=123)
+    cpp_q = onnxsim.apply_quarot_cpp(model, seed=123)
+
+    def _rotation(m):
+        return next(
+            onnx.numpy_helper.to_array(t)
+            for t in m.graph.initializer
+            if list(t.dims) == [32, 32]
+        )
+
+    u_py = _rotation(py_q)
+    u_cpp = _rotation(cpp_q)
+    # Both individually orthogonal (Haar-random, just differently
+    # constructed)...
+    assert np.allclose(u_py @ u_py.T, np.eye(32), atol=1e-4)
+    assert np.allclose(u_cpp @ u_cpp.T, np.eye(32), atol=1e-4)
+    # ...but not the same matrix for the same seed.
+    assert not np.allclose(u_py, u_cpp)

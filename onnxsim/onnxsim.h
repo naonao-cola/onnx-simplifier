@@ -553,6 +553,18 @@ onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity,
 // ``quantize_weight_only_int4``'s own default. ``epsilon`` floors a token's
 // own max-abs rotated-activation value before it is used as a quantization
 // scale, avoiding a divide-by-zero on an all-zero token.
+//
+// ACCEPTED, PERMANENT DIVERGENCE from the pure-Python ``apply_quarot``
+// (``quarot.py``): the same ``seed`` does NOT produce the same rotation (or
+// output) on both sides. This C++ port builds its random orthogonal
+// rotation via Gram-Schmidt with an independent per-node RNG derivation;
+// the Python port uses a sign-corrected QR decomposition sequenced through
+// a single ``numpy.random.Generator``. Both constructions are independently
+// Haar-uniform (mathematically valid, just different) -- see
+// ``passes/random_orthogonal.h`` and ``passes/quarot.h`` for the full
+// investigation and evidence. This is intentional and will not be changed;
+// ``ApplyQuarot``/``apply_quarot_cpp`` and ``apply_quarot`` are two
+// independently-correct, non-interchangeable entry points, not aliases.
 onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
                              int64_t block_size, float epsilon);
 
