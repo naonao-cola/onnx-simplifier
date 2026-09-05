@@ -114,8 +114,14 @@ print(sys.byteorder, \"endian | python\", sys.version.split()[0],
 # check whenever onnxruntime is absent and the reference evaluator is used
 # instead -- identically on x86_64, so this is not a byte-order problem and
 # deselecting them here does not weaken the endianness coverage. Tracked
-# separately; see docs/big-endian.md. Everything else must pass, so a genuine
-# big-endian regression still turns this red.
+# separately; see docs/big-endian.md. The six deselected test_ppq_compat.py
+# tests are the same "onnxruntime has no s390x build" gap, just at
+# call-time rather than collection-time: onnxsim/calibration.py imports
+# onnxruntime lazily inside the function these tests actually exercise
+# (real PPQ calibration/quantization), unlike test_ppq_compat.py's other,
+# still-collected tests, which only exercise its argument-validation and
+# platform-name plumbing and never reach that import. Everything else must
+# pass, so a genuine big-endian regression still turns this red.
 
 # tests/conftest.py mirrors the slowest-test table into $GITHUB_STEP_SUMMARY,
 # opening it unconditionally once the variable is set. In CI that path is on the
@@ -148,7 +154,13 @@ chroot "${SYSROOT}" /bin/sh -c "cd /work && GITHUB_STEP_SUMMARY=${CHROOT_SUMMARY
   --ignore=tests/test_tflite_export_torchvision.py \
   --deselect tests/test_fusion_patterns.py::test_fuse_conv_bn_into_conv \
   --deselect tests/test_fusion_patterns.py::test_fuse_convtranspose_bn \
-  --deselect tests/test_fusion_patterns.py::test_fuse_conv_with_bias_bn_into_conv ${PYTEST_ARGS:-}"
+  --deselect tests/test_fusion_patterns.py::test_fuse_conv_with_bias_bn_into_conv \
+  --deselect tests/test_ppq_compat.py::test_quantize_onnx_model_with_dict_batches \
+  --deselect tests/test_ppq_compat.py::test_quantize_onnx_model_with_raw_array_batches_single_input \
+  --deselect tests/test_ppq_compat.py::test_quantize_onnx_model_with_tuple_batches_multi_input \
+  --deselect tests/test_ppq_compat.py::test_collate_fn_is_applied \
+  --deselect tests/test_ppq_compat.py::test_calib_steps_limits_batches_consumed \
+  --deselect tests/test_ppq_compat.py::test_setting_calib_algorithm_entropy_is_accepted ${PYTEST_ARGS:-}"
 pytest_status=$?
 set -e
 
