@@ -16765,33 +16765,51 @@ std::vector<onnx::GraphProto*> IterSubgraphs(onnx::GraphProto* graph) {
 // its index in `kept_token_ids`) before running the pruned model -- a
 // dropped id can never be fed to the pruned model again.
 //
-// Deliberately NARROWER than pruning.py's own three-producer-shape port
-// (plain `Gather`, `com.microsoft::EmbedLayerNormalization`,
-// `com.microsoft::GatherBlockQuantized`) -- consistent with this file's own
-// established "narrower subset of pruning.py, decline rather than guess
-// past what's ported" scope decisions elsewhere (MatMulNBits's own
-// FLOAT32-only scales/zero_points/bias, MoE/QMoE's own restrictions, ...):
+// Two of pruning.py's own three producer shapes are matched here -- plain
+// `Gather` (MatchEmbeddingGatherRaw) and `com.microsoft::
+// EmbedLayerNormalization` (MatchEmbedLayerNormProducer, added alongside it
+// -- see that function's own doc comment for the schema/scope this mirrors
+// from pruning.py's `_match_embed_layer_norm_producer`). `lm_head`
+// auto-detection also now recognizes `com.microsoft::FusedGemm`/
+// `GemmFastGelu` in addition to a bare `MatMul`/vanilla `Gemm`
+// (MatchMatMulLikeWidenedRaw, this section's own local mirror of
+// pruning.py's module-scoped `_match_matmul_like` override -- kept local to
+// this section, not merged into the shared MatchMatMulLikeRaw, for the
+// identical reason pruning.py's own override is kept local to
+// `onnxsim.pruning` rather than made to the shared `smoothquant.py` copy:
+// widening the shared matcher would silently change every OTHER pass in
+// this file that calls it too). The embedding table, `lm_head` weight, and
+// `lm_head` bias are now all admitted as FLOAT, FLOAT16, OR BFLOAT16
+// (IsSupportedFloatDtype, ReadFloatTensorAnyDtype/
+// SetFloatTensorDataPreservingDtype -- this section's own local upcast-to-
+// float32/downcast-to-original-dtype helpers, mirroring pruning.py's own
+// `_to_f64`/`_from_f64` convention; this file's shared ReadFloatTensor/
+// SetFloatTensorData stay FLOAT32-only and untouched, used elsewhere in
+// this file exactly as before).
 //
-//   * Only the plain `Gather(data, indices, axis=0)` producer shape is
-//     matched here. `EmbedLayerNormalization` (the fused BERT-family
-//     word+position+segment-embedding-plus-LayerNorm node onnxruntime's
-//     own graph optimizer emits) and `GatherBlockQuantized` (the
-//     int2/int4/int8 block-quantized analogue) are both simply never
-//     matched -- declined, not mis-handled -- by this port; see
-//     pruning.py's own section comment for their exact schema/scope if
-//     porting either is ever needed.
-//   * `lm_head` auto-detection only ever recognizes a bare `MatMul` or
-//     vanilla `Gemm` (MatchMatMulLikeRaw) -- not pruning.py's own widened
-//     `_match_matmul_like`, which additionally recognizes
-//     `com.microsoft::FusedGemm`/`GemmFastGelu` -- mirroring
-//     MatchProducer's own identical, already-established restriction
-//     elsewhere in this file (see its own comment, above).
-//   * The embedding table, `lm_head` weight, and `lm_head` bias are all
-//     admitted only as plain FLOAT (float32) tensors -- not also FLOAT16/
-//     BFLOAT16 -- matching ReadFloatTensor/SetFloatTensorData's own
-//     FLOAT32-only support (the same restriction, for the same reason, as
-//     the "Two deliberate, narrower-than-pruning.py scope decisions"
-//     comment above MatMulNBitsValidBlockSizes documents).
+// Deliberately still NARROWER than pruning.py's own three-producer-shape
+// port in exactly one remaining respect:
+//
+//   * `com.microsoft::GatherBlockQuantized` (the int2/int4/int8
+//     block-quantized analogue of a plain-float embedding `Gather`) is
+//     simply never matched -- declined, not mis-handled -- by this port.
+//     Unlike the two gaps closed above, this one is deliberately left
+//     open: pruning.py's own section comment documents two genuinely
+//     different packing conventions (ONNX-native sub-byte `tensor(uint4)`/
+//     `tensor(int4)` vs. manually-packed `tensor(uint8)`, each with its own
+//     default-`zero_points` formula), a `scales`/`zero_points` pair that
+//     must be sliced in lockstep with `data`, and a dequantization-for-
+//     ranking-only helper -- real, verified-correct scope, but large enough
+//     that porting it hastily risks a subtle packing/slicing bug for a
+//     currently-narrow real-exporter surface (see that comment's own "Real
+//     exporter evidence" paragraph). Left as a clearly separate,
+//     independent follow-up rather than attempted here. Because this is a
+//     genuine remaining producer-shape gap (not just a narrower dtype/
+//     lm_head-node-type restriction), `apply_embedding_vocab_pruning`/
+//     `apply_embedding_vocab_magnitude_pruning` in pruning.py are NOT
+//     aliased to these C++ ports -- see this round's own summary for why
+//     "two of three producer shapes" does not clear this module's own
+//     "verified TRUE full parity, or don't alias" bar.
 //
 // Every other structural safety check pruning.py's own `_match_embedding_
 // gather`/`_match_tied_lm_head`/`_match_untied_lm_head`/`_match_lm_head_
@@ -16848,13 +16866,291 @@ struct EmbeddingChain {
   std::optional<EmbeddingLmHeadMatch> lm_head;
 };
 
+// True for FLOAT, FLOAT16, and BFLOAT16 -- every element dtype this
+// section's own matchers accept for a weight/bias initializer. Mirrors
+// pruning.py's own `_is_supported_float_dtype` exactly. Local to this
+// section: every OTHER matcher in this file that still checks
+// `== onnx::TensorProto::FLOAT` directly is intentionally left alone (see
+// this file's own "narrower than pruning.py" scope-decision comments
+// elsewhere) -- widening those is a separate, unrelated decision this round
+// does not make.
+bool IsSupportedFloatDtype(int32_t data_type) {
+  return data_type == onnx::TensorProto::FLOAT ||
+         data_type == onnx::TensorProto::FLOAT16 ||
+         data_type == onnx::TensorProto::BFLOAT16;
+}
+
+// --- FLOAT16/BFLOAT16 <-> float32 bit conversion, and the
+// ReadFloatTensorAnyDtype/SetFloatTensorDataPreservingDtype pair built on
+// top of them -- this section's own local mirror of pruning.py's
+// `_to_f64`/`_from_f64` upcast-on-read/downcast-on-write convention (see
+// that pair's own doc comments in pruning.py's "FP16/BFloat16 weight
+// support" section). float32 stands in for Python's float64 here: it still
+// exactly represents every value either half-precision format can hold, and
+// every arithmetic helper already used by this file (SliceAxis0/SliceAxis1,
+// the L2-norm accumulation in EmbeddingVocabImportance below) already works
+// in float32/double, so no separate wide-precision path is needed. This
+// file's existing ReadFloatTensor/SetFloatTensorData (above) stay FLOAT32
+// -only and completely unchanged -- every other pass in this file that uses
+// them keeps its own established FLOAT32-only scope; these four helpers are
+// used ONLY by this section's own producer/lm_head matching and slicing.
+//
+// Lossless in both directions for the one case this pass ever needs it in:
+// decoding a value already stored as FLOAT16/BFLOAT16 into float32 never
+// rounds (float32 has strictly more precision than either half-precision
+// format), and re-encoding an UNMODIFIED (merely relocated by a row/column
+// slice, never arithmetically recomputed) float32 value back to its
+// original dtype reproduces the exact original bit pattern -- verified
+// directly in this round's own test suite, the same way pruning.py's
+// `_from_f64` docstring documents for its own float64 round trip.
+
+inline float Float16BitsToFloat(uint16_t bits) {
+  const uint32_t sign = static_cast<uint32_t>(bits & 0x8000u) << 16;
+  uint32_t exp = (bits >> 10) & 0x1Fu;
+  uint32_t mant = bits & 0x3FFu;
+  uint32_t out;
+  if (exp == 0) {
+    if (mant == 0) {
+      out = sign;  // +-0
+    } else {
+      // Subnormal float16 -> normalized float32: shift the mantissa left
+      // until its implicit leading bit lands, adjusting the exponent to
+      // match.
+      exp = 127 - 15 + 1;
+      while ((mant & 0x400u) == 0) {
+        mant <<= 1;
+        --exp;
+      }
+      mant &= 0x3FFu;
+      out = sign | (exp << 23) | (mant << 13);
+    }
+  } else if (exp == 0x1Fu) {
+    out = sign | 0x7F800000u | (mant << 13);  // Inf/NaN
+  } else {
+    out = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+  }
+  float f;
+  std::memcpy(&f, &out, sizeof(f));
+  return f;
+}
+
+// Round-to-nearest-even float32 -> float16 bit pattern. An exact
+// float16-representable input (the only case this pass ever re-encodes,
+// see this subsection's own top comment) round-trips byte-for-byte
+// regardless of tie-breaking rule, since such a value never lands exactly
+// halfway between two representable float16 values.
+inline uint16_t FloatToFloat16Bits(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const uint32_t sign = (bits >> 16) & 0x8000u;
+  const uint32_t exp32 = (bits >> 23) & 0xFFu;
+  const uint32_t mant32 = bits & 0x7FFFFFu;
+  if (exp32 == 0xFFu) {
+    // Inf/NaN.
+    return static_cast<uint16_t>(sign | 0x7C00u | (mant32 ? 0x0200u : 0u));
+  }
+  int32_t exp16 = static_cast<int32_t>(exp32) - 127 + 15;
+  if (exp16 >= 0x1F) {
+    return static_cast<uint16_t>(sign | 0x7C00u);  // overflow -> Inf
+  }
+  if (exp16 <= 0) {
+    if (exp16 < -10) {
+      return static_cast<uint16_t>(sign);  // underflows to zero
+    }
+    const uint32_t m = mant32 | 0x800000u;  // add the implicit leading bit
+    const uint32_t shift = static_cast<uint32_t>(14 - exp16);
+    uint32_t half_mant = m >> shift;
+    const uint32_t remainder = m & ((1u << shift) - 1u);
+    const uint32_t halfway = 1u << (shift - 1u);
+    if (remainder > halfway ||
+        (remainder == halfway && (half_mant & 1u) != 0u)) {
+      half_mant += 1u;
+    }
+    return static_cast<uint16_t>(sign | half_mant);
+  }
+  uint32_t rounded = mant32 + 0x00001000u;  // half an ULP at kept precision
+  if (rounded & 0x00800000u) {
+    // Rounded mantissa carried into the implicit leading bit -- bump the
+    // exponent instead.
+    rounded = 0;
+    exp16 += 1;
+    if (exp16 >= 0x1F) {
+      return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+  }
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp16) << 10) |
+                               (rounded >> 13));
+}
+
+// bfloat16 is literally float32's own top 16 bits (1 sign + 8 exponent +
+// 7 mantissa) -- decode is a plain zero-extending left shift.
+inline float BFloat16BitsToFloat(uint16_t bits) {
+  const uint32_t full = static_cast<uint32_t>(bits) << 16;
+  float f;
+  std::memcpy(&f, &full, sizeof(f));
+  return f;
+}
+
+// Round-to-nearest-even float32 -> bfloat16 bit pattern (the standard
+// "add a rounding bias keyed off the bit being kept, then truncate"
+// algorithm). An exact bfloat16-representable input (this pass's only
+// re-encode case -- see this subsection's own top comment) has zero low 16
+// bits, so the rounding bias it adds can never carry into bit 16, and the
+// truncation reproduces the exact original top half byte-for-byte.
+inline uint16_t FloatToBFloat16Bits(float value) {
+  if (std::isnan(value)) {
+    return 0x7FC0u;  // canonical quiet NaN, upper half
+  }
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const uint32_t rounding_bias = ((bits >> 16) & 1u) + 0x7FFFu;
+  return static_cast<uint16_t>((bits + rounding_bias) >> 16);
+}
+
+// Reads a FLOAT/FLOAT16/BFLOAT16 tensor as a flat float32 buffer -- see
+// this subsection's own top comment. FLOAT is a straight passthrough
+// through the existing (FLOAT32-only) ReadFloatTensor; FLOAT16/BFLOAT16
+// additionally decode each packed 16-bit code -- 2 raw bytes/element when
+// `raw_data` is set, or, ONNX's own wire convention for sub-32-bit numeric
+// dtypes, zero-extended into `int32_data` when it is absent (confirmed
+// directly against a live `onnx.TensorProto`/`onnx.numpy_helper.to_array`
+// round trip) -- through Float16BitsToFloat/BFloat16BitsToFloat.
+std::vector<float> ReadFloatTensorAnyDtype(const onnx::TensorProto& t) {
+  if (t.data_type() == onnx::TensorProto::FLOAT) {
+    return ReadFloatTensor(t);
+  }
+  int64_t numel = 1;
+  for (int64_t d : t.dims()) {
+    numel *= d;
+  }
+  std::vector<uint16_t> bits(static_cast<size_t>(numel));
+  if (t.has_raw_data()) {
+    std::memcpy(bits.data(), t.raw_data().data(),
+                bits.size() * sizeof(uint16_t));
+    if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+      onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(bits.data()),
+                                        bits.size() * sizeof(uint16_t),
+                                        sizeof(uint16_t));
+    }
+  } else {
+    for (int64_t i = 0; i < numel; ++i) {
+      bits[static_cast<size_t>(i)] =
+          static_cast<uint16_t>(t.int32_data(static_cast<int>(i)));
+    }
+  }
+  std::vector<float> out(bits.size());
+  const bool is_bf16 = t.data_type() == onnx::TensorProto::BFLOAT16;
+  for (size_t i = 0; i < bits.size(); ++i) {
+    out[i] =
+        is_bf16 ? BFloat16BitsToFloat(bits[i]) : Float16BitsToFloat(bits[i]);
+  }
+  return out;
+}
+
+// Inverse of ReadFloatTensorAnyDtype: overwrites `t` in place with `data`
+// at `dims`, downcast to `t`'s OWN existing dtype (FLOAT/FLOAT16/BFLOAT16)
+// -- unlike SetFloatTensorData, which always produces a FLOAT tensor, this
+// preserves whatever dtype the embedding table/lm_head weight/bias already
+// had, exactly mirroring pruning.py's own `_from_f64`. Always writes
+// `raw_data` (never `int32_data`), the same "replace, don't mutate a live
+// view" convention SetFloatTensorData already uses.
+void SetFloatTensorDataPreservingDtype(onnx::TensorProto* t,
+                                       const std::vector<int64_t>& dims,
+                                       const std::vector<float>& data) {
+  const int32_t dtype = t->data_type();
+  if (dtype == onnx::TensorProto::FLOAT) {
+    SetFloatTensorData(t, dims, data);
+    return;
+  }
+  const std::string name = t->name();
+  t->Clear();
+  t->set_name(name);
+  t->set_data_type(static_cast<onnx::TensorProto_DataType>(dtype));
+  for (int64_t d : dims) {
+    t->add_dims(d);
+  }
+  const bool is_bf16 = dtype == onnx::TensorProto::BFLOAT16;
+  std::vector<uint16_t> bits(data.size());
+  for (size_t i = 0; i < data.size(); ++i) {
+    bits[i] =
+        is_bf16 ? FloatToBFloat16Bits(data[i]) : FloatToFloat16Bits(data[i]);
+  }
+  std::string raw(bits.size() * sizeof(uint16_t), '\0');
+  std::memcpy(raw.data(), bits.data(), raw.size());
+  if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+    onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(raw.data()),
+                                      raw.size(), sizeof(uint16_t));
+  }
+  t->set_raw_data(std::move(raw));
+}
+
+// This section's own local mirror of pruning.py's module-scoped
+// `_match_matmul_like` override (see that function's own docstring): wraps
+// MatchMatMulLikeRaw to also recognize `com.microsoft::FusedGemm` (a plain
+// Gemm plus a trailing activation, ORT's own `GemmActivationFusion` result
+// -- `A`/`B`/`C`/`alpha`/`beta`/`transA`/`transB` are Gemm's own, verbatim)
+// and `com.microsoft::GemmFastGelu` (`GemmFastGelu(X, W, bias?) =
+// FastGelu(X @ W [+ bias])`, no attributes at all, `W` always stored NOT
+// transposed -- ORT's own `FusionGemmFastGelu` result). Kept LOCAL to this
+// section rather than merged into the shared MatchMatMulLikeRaw for the
+// same reason pruning.py's own override stays local to `onnxsim.pruning`
+// rather than widening the shared `smoothquant.py` copy: MatchMatMulLikeRaw
+// is reused by many other, unrelated passes in this file, and widening it
+// there would silently change their own behavior too, never verified here.
+std::optional<MatMulLikeMatch> MatchMatMulLikeWidenedRaw(
+    const onnx::NodeProto& node) {
+  if (node.op_type() == "FusedGemm") {
+    const int num_inputs = node.input_size();
+    if (num_inputs != 2 && num_inputs != 3) {
+      return std::nullopt;
+    }
+    bool has_trans_a = false, has_alpha = false, has_beta = false;
+    int64_t trans_a = 0, trans_b = 0;
+    double alpha = 1.0, beta = 1.0;
+    for (const auto& attr : node.attribute()) {
+      if (attr.name() == "transA") {
+        trans_a = attr.i();
+        has_trans_a = true;
+      } else if (attr.name() == "alpha") {
+        alpha = attr.f();
+        has_alpha = true;
+      } else if (attr.name() == "beta") {
+        beta = attr.f();
+        has_beta = true;
+      } else if (attr.name() == "transB") {
+        trans_b = attr.i();
+      }
+    }
+    if (has_trans_a && trans_a != 0) {
+      return std::nullopt;
+    }
+    if (has_alpha && alpha != 1.0) {
+      return std::nullopt;
+    }
+    if (num_inputs == 3 && has_beta && beta != 1.0) {
+      return std::nullopt;
+    }
+    return MatMulLikeMatch{node.input(0), node.input(1), trans_b != 0};
+  }
+  if (node.op_type() == "GemmFastGelu" &&
+      node.domain() == kComMicrosoftDomain) {
+    const int num_inputs = node.input_size();
+    if (num_inputs != 2 && num_inputs != 3) {
+      return std::nullopt;
+    }
+    return MatMulLikeMatch{node.input(0), node.input(1), false};
+  }
+  return MatchMatMulLikeRaw(node);
+}
+
 // If `node` is a well-formed embedding-table Gather (this section's own
 // comment above has the full matching criteria), returns
 // (weight_name, indices_name, underlying_input_name) -- `indices_name` is
 // `node`'s own literal `indices` operand, `underlying_input_name` is that
 // same tensor with one Cast hop unwrapped when present. Mirrors
-// pruning.py's own `_match_embedding_gather` exactly, minus the
-// `EmbedLayerNormalization`/`GatherBlockQuantized` producer shapes (out of
+// pruning.py's own `_match_embedding_gather` exactly (the
+// `EmbedLayerNormalization` producer shape is matched separately, by
+// MatchEmbedLayerNormProducer just below; `GatherBlockQuantized` is out of
 // scope for this C++ port -- see this section's own top comment). The
 // Python original also double-checks `node in consumers_of[w_name]`; that
 // is always true here by construction (ConsumersOf indexes every node
@@ -16882,7 +17178,7 @@ MatchEmbeddingGatherRaw(
   const std::string& indices_name = node.input(1);
   auto wit = init_map.find(w_name);
   if (wit == init_map.end() ||
-      wit->second->data_type() != onnx::TensorProto::FLOAT ||
+      !IsSupportedFloatDtype(wit->second->data_type()) ||
       wit->second->dims_size() != 2) {
     return std::nullopt;
   }
@@ -16908,20 +17204,84 @@ MatchEmbeddingGatherRaw(
   return std::make_tuple(w_name, indices_name, underlying);
 }
 
-// Resolves `node` (an already-matched MatMul/vanilla-Gemm producing
-// `vocab_size`-wide output) to its own bias, if any, and the node whose
-// *output* is the real, final logits tensor. Mirrors pruning.py's own
-// `_match_lm_head_tail` exactly: returns `std::nullopt` for the
-// `_LM_HEAD_BIAS_INVALID` sentinel case (a bias exists but not in a shape
-// this pass safely handles -- declined, never left silently stale), or a
-// present `(bias_name_or_nullopt, output_node)` pair otherwise.
+// The `com.microsoft::EmbedLayerNormalization` counterpart of
+// MatchEmbeddingGatherRaw -- same return contract exactly
+// ((weight_name, indices_name, underlying_input_name)), so
+// MatchEmbeddingChain's own matching loop can try this as a second producer
+// shape and treat whichever one succeeds identically from there on. Mirrors
+// pruning.py's own `_match_embed_layer_norm_producer` exactly -- see that
+// function's own docstring for the full empirical schema (inputs, in order:
+// `input_ids`, `segment_ids`?, `word_embedding`, `position_embedding`,
+// `segment_embedding`?, `gamma`, `beta`, `mask`?, `position_ids`?; at least
+// 7 required inputs) and the three scope decisions this reproduces exactly:
+// only `word_embedding` (indexed by `input_ids`, this function's own
+// `weight_name`) is ever vocab-axis-prunable -- `position_embedding`
+// (indexed by sequence position) and `segment_embedding` (indexed by
+// `segment_ids`, a different index space) are always left completely
+// untouched by every caller of this match, and neither `gamma`/`beta` (not
+// vocab-shaped) nor the optional `mask_index`/`embedding_sum` outputs
+// (neither's shape or value depends on `vocab_size`) need any special
+// handling here at all.
+std::optional<std::tuple<std::string, std::string, std::string>>
+MatchEmbedLayerNormProducer(
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_input_names,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  if (node.op_type() != "EmbedLayerNormalization" ||
+      node.domain() != kComMicrosoftDomain) {
+    return std::nullopt;
+  }
+  if (node.input_size() < 7) {
+    return std::nullopt;
+  }
+  const std::string& input_ids = node.input(0);
+  const std::string& w_name = node.input(2);
+  if (input_ids.empty() || w_name.empty()) {
+    return std::nullopt;
+  }
+  auto wit = init_map.find(w_name);
+  if (wit == init_map.end() ||
+      !IsSupportedFloatDtype(wit->second->data_type()) ||
+      wit->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+
+  std::string underlying = input_ids;
+  if (!graph_input_names.count(underlying)) {
+    auto cit = node_by_output.find(underlying);
+    if (cit != node_by_output.end() && cit->second->op_type() == "Cast" &&
+        cit->second->input_size() == 1 &&
+        graph_input_names.count(cit->second->input(0))) {
+      underlying = cit->second->input(0);
+    } else {
+      return std::nullopt;  // not a graph input, nor a Cast of one
+    }
+  }
+
+  auto cons_it = consumers_of.find(w_name);
+  const size_t n_consumers =
+      cons_it == consumers_of.end() ? 0 : cons_it->second.size();
+  if (n_consumers < 1 || n_consumers > 2) {
+    return std::nullopt;  // unexpected consumer count -- decline, don't guess
+  }
+  return std::make_tuple(w_name, input_ids, underlying);
+}
+
+// Resolves `node` (an already-matched MatMul/vanilla-Gemm/FusedGemm/
+// GemmFastGelu producing `vocab_size`-wide output) to its own bias, if any,
+// and the node whose *output* is the real, final logits tensor. Mirrors
+// pruning.py's own `_match_lm_head_tail` exactly: returns `std::nullopt`
+// for the `_LM_HEAD_BIAS_INVALID` sentinel case (a bias exists but not in a
+// shape this pass safely handles -- declined, never left silently stale),
+// or a present `(bias_name_or_nullopt, output_node)` pair otherwise.
 std::optional<std::pair<std::optional<std::string>, onnx::NodeProto*>>
 MatchLmHeadTail(onnx::NodeProto* node, const InitMap& init_map,
                 const ConsumerMap& consumers_of, int64_t vocab_size) {
   auto valid_bias = [&](const std::string& name) {
     auto it = init_map.find(name);
     if (it == init_map.end() ||
-        it->second->data_type() != onnx::TensorProto::FLOAT) {
+        !IsSupportedFloatDtype(it->second->data_type())) {
       return false;
     }
     const auto& dims = it->second->dims();
@@ -16934,8 +17294,18 @@ MatchLmHeadTail(onnx::NodeProto* node, const InitMap& init_map,
     return false;
   };
 
-  if (node->op_type() == "Gemm" && node->input_size() == 3 &&
-      !node->input(2).empty()) {
+  // `Gemm`'s own built-in `C` input carries straight over to `FusedGemm`
+  // (byte-identical `A`/`B`/`C` inputs, ORT's own `GemmActivationFusion`
+  // result) AND to `GemmFastGelu` (`GemmFastGelu(X, W, bias?)`'s own
+  // optional 3rd input, folded in by ORT's `FusionGemmFastGelu` from
+  // exactly the MatMul-then-Add(bias) shape the plain-`MatMul` branch below
+  // still resolves when the bias hasn't been folded into the node itself)
+  // -- mirrors pruning.py's own
+  // `node.op_type in ("Gemm", "FusedGemm", "GemmFastGelu")` membership
+  // check exactly.
+  if ((node->op_type() == "Gemm" || node->op_type() == "FusedGemm" ||
+       node->op_type() == "GemmFastGelu") &&
+      node->input_size() == 3 && !node->input(2).empty()) {
     const std::string bias_name = node->input(2);
     if (!valid_bias(bias_name)) {
       return std::nullopt;
@@ -17002,7 +17372,7 @@ std::optional<EmbeddingLmHeadMatch> MatchTiedLmHead(
   }
   onnx::NodeProto* other = others[0];
 
-  auto match = MatchMatMulLikeRaw(*other);
+  auto match = MatchMatMulLikeWidenedRaw(*other);
   if (match) {
     if (match->w_name == weight_name && match->weight_transposed) {
       auto tail = MatchLmHeadTail(other, init_map, consumers_of, vocab_size);
@@ -17035,7 +17405,7 @@ std::optional<EmbeddingLmHeadMatch> MatchTiedLmHead(
       return std::nullopt;
     }
     onnx::NodeProto* node2 = tcit->second[0];
-    auto match2 = MatchMatMulLikeRaw(*node2);
+    auto match2 = MatchMatMulLikeWidenedRaw(*node2);
     if (!match2 || match2->w_name != t_out || match2->weight_transposed) {
       // must consume the transposed [hidden, vocab] tensor untransposed
       return std::nullopt;
@@ -17056,7 +17426,8 @@ std::optional<EmbeddingLmHeadMatch> MatchTiedLmHead(
 }
 
 // Auto-detects a fully independent `lm_head` weight: exactly one
-// MatMul/vanilla-Gemm node in the whole graph whose constant 2-D weight is
+// MatMul/vanilla-Gemm/FusedGemm/GemmFastGelu node (MatchMatMulLikeWidenedRaw)
+// in the whole graph whose constant 2-D weight is
 // distinct from `embedding_weight_name`, has exactly one consumer,
 // produces `vocab_size`-wide output, and -- the one structural signal that
 // reliably distinguishes "the" vocab-logits projection from some unrelated
@@ -17079,7 +17450,7 @@ std::optional<EmbeddingLmHeadMatch> MatchUntiedLmHead(
   std::vector<Candidate> candidates;
   for (int i = 0; i < graph->node_size(); ++i) {
     onnx::NodeProto* node = graph->mutable_node(i);
-    auto match = MatchMatMulLikeRaw(*node);
+    auto match = MatchMatMulLikeWidenedRaw(*node);
     if (!match) {
       continue;
     }
@@ -17088,7 +17459,7 @@ std::optional<EmbeddingLmHeadMatch> MatchUntiedLmHead(
     }
     auto wit = init_map.find(match->w_name);
     if (wit == init_map.end() ||
-        wit->second->data_type() != onnx::TensorProto::FLOAT ||
+        !IsSupportedFloatDtype(wit->second->data_type()) ||
         wit->second->dims_size() != 2) {
       continue;
     }
@@ -17122,20 +17493,22 @@ std::optional<EmbeddingLmHeadMatch> MatchUntiedLmHead(
   return result;
 }
 
-// Finds the one token-embedding Gather this pass should act on in `graph`
-// alone, plus its tied/untied `lm_head`, if any. When `input_name` is
-// given, only a Gather whose token-id operand resolves to that exact graph
+// Finds the one token-embedding producer this pass should act on in
+// `graph` alone -- a plain `Gather` (MatchEmbeddingGatherRaw) or a
+// `com.microsoft::EmbedLayerNormalization` node (MatchEmbedLayerNormProducer)
+// -- plus its tied/untied `lm_head`, if any. When `input_name` is given,
+// only a producer whose token-id operand resolves to that exact graph
 // input is considered, and -- when `strict_input_name` -- it is an error
 // (`std::invalid_argument`, a caller mistake) if none does;
 // `strict_input_name=false` (only ever passed by
 // MatchEmbeddingChainAnyGraph) instead treats that same outcome as an
 // ordinary decline (`std::nullopt`, no exception), since `graph` here is
 // only one of possibly several graphs a whole-model search is trying in
-// turn. When `input_name` is omitted, exactly one qualifying Gather must
-// exist in the whole graph -- zero or more than one declines the whole
-// call. Mirrors pruning.py's own `_match_embedding_chain` exactly (minus
-// the `EmbedLayerNormalization`/`GatherBlockQuantized` producer shapes --
-// see this section's own top comment).
+// turn. When `input_name` is omitted, exactly one qualifying producer --
+// of EITHER shape, counted together -- must exist in the whole graph --
+// zero or more than one declines the whole call. Mirrors pruning.py's own
+// `_match_embedding_chain` exactly, minus the `GatherBlockQuantized`
+// producer shape -- see this section's own top comment.
 std::optional<EmbeddingChain> MatchEmbeddingChain(
     onnx::GraphProto* graph, const std::optional<std::string>& input_name,
     bool strict_input_name) {
@@ -17170,8 +17543,14 @@ std::optional<EmbeddingChain> MatchEmbeddingChain(
   std::vector<RawMatch> matches;
   for (int i = 0; i < graph->node_size(); ++i) {
     onnx::NodeProto* node = graph->mutable_node(i);
+    // Try both producer shapes -- a node is at most one of them (disjoint
+    // op_type/domain checks), so there is never a double-count here.
     auto m = MatchEmbeddingGatherRaw(*node, init_map, consumers_of,
                                      graph_input_names, node_by_output);
+    if (!m) {
+      m = MatchEmbedLayerNormProducer(*node, init_map, consumers_of,
+                                      graph_input_names, node_by_output);
+    }
     if (!m) {
       continue;
     }
@@ -17298,6 +17677,50 @@ bool UpdateVocabOutputShape(onnx::GraphProto* graph, const std::string& name,
   return false;
 }
 
+// Dtype-preserving (FLOAT/FLOAT16/BFLOAT16) analogue of SliceProducerWeight,
+// used ONLY by this section -- every OTHER caller of SliceProducerWeight
+// elsewhere in this file keeps its own established FLOAT32-only scope
+// completely unchanged. `weight_transposed=true` means axis 0 is the output
+// channel (the embedding table's own `[vocab_size, hidden_size]` layout,
+// and a tied/untied `Gemm(transB=1)`-style `[vocab_size, K]` lm_head
+// weight); `false` means axis 1 (a plain-`MatMul`-style `[K, vocab_size]`
+// lm_head weight).
+void SliceEmbeddingWeightAnyDtype(onnx::TensorProto* wt, bool weight_transposed,
+                                  const std::vector<int64_t>& keep) {
+  const std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
+  const std::vector<float> data = ReadFloatTensorAnyDtype(*wt);
+  const int64_t dim0 = dims[0], dim1 = dims[1];
+  const int64_t kc = static_cast<int64_t>(keep.size());
+  std::vector<float> out;
+  std::vector<int64_t> new_dims;
+  if (weight_transposed) {
+    out = SliceAxis0(data, dim0, dim1, keep);
+    new_dims = {kc, dim1};
+  } else {
+    out = SliceAxis1(data, dim0, dim1, 1, keep);
+    new_dims = {dim0, kc};
+  }
+  SetFloatTensorDataPreservingDtype(wt, new_dims, out);
+}
+
+// Dtype-preserving (FLOAT/FLOAT16/BFLOAT16) analogue of SliceLastAxis, used
+// ONLY by this section -- for an `lm_head`'s own constant bias.
+void SliceLastAxisAnyDtype(onnx::TensorProto* t,
+                           const std::vector<int64_t>& keep) {
+  std::vector<int64_t> dims(t->dims().begin(), t->dims().end());
+  const std::vector<float> data = ReadFloatTensorAnyDtype(*t);
+  std::vector<float> out(keep.size());
+  for (size_t i = 0; i < keep.size(); ++i) {
+    out[i] = data[static_cast<size_t>(keep[i])];
+  }
+  if (dims.empty()) {
+    dims.push_back(static_cast<int64_t>(keep.size()));
+  } else {
+    dims.back() = static_cast<int64_t>(keep.size());
+  }
+  SetFloatTensorDataPreservingDtype(t, dims, out);
+}
+
 // Performs the actual slicing, IN PLACE on `graph`, for an already-decided
 // (ascending) `keep_ids` set: the embedding table's own vocab_size axis
 // (always axis 0 -- MatchEmbeddingGatherRaw's own `axis == 0` requirement),
@@ -17308,7 +17731,12 @@ bool UpdateVocabOutputShape(onnx::GraphProto* graph, const std::string& name,
 // matched in (MatchEmbeddingChainAnyGraph's own returned `graph`), so this
 // mutates that graph's own initializer/output/value_info in place, never a
 // different graph's. Mirrors pruning.py's own `_apply_embedding_vocab_
-// prune`/`_finalize_embedding_shapes` exactly.
+// prune`/`_finalize_embedding_shapes` exactly -- including its own
+// FLOAT/FLOAT16/BFLOAT16 dtype-preserving round trip (SliceEmbeddingWeight
+// AnyDtype/SliceLastAxisAnyDtype above, this section's own local mirror of
+// `_to_f64`/`_from_f64`), unlike this file's shared SliceProducerWeight/
+// SliceLastAxis (FLOAT32-only, untouched, used elsewhere in this file
+// exactly as before).
 void ApplyEmbeddingVocabPrune(onnx::GraphProto* graph,
                               const EmbeddingChain& chain,
                               const std::vector<int64_t>& keep_ids) {
@@ -17316,19 +17744,17 @@ void ApplyEmbeddingVocabPrune(onnx::GraphProto* graph,
   const int64_t new_v = static_cast<int64_t>(keep_ids.size());
 
   // The embedding table is [vocab_size, hidden_size] with vocab_size as
-  // axis 0 -- exactly SliceProducerWeight's own `weight_transposed=true`
-  // ("output channel is axis 0") branch, reused verbatim rather than
-  // duplicating an axis-0 row-slice helper.
-  SliceProducerWeight(init_map.at(chain.weight_name),
-                      /*weight_transposed=*/true, keep_ids, /*is_conv=*/false);
+  // axis 0 -- exactly SliceEmbeddingWeightAnyDtype's own
+  // `weight_transposed=true` ("output channel is axis 0") branch.
+  SliceEmbeddingWeightAnyDtype(init_map.at(chain.weight_name),
+                               /*weight_transposed=*/true, keep_ids);
 
   if (chain.lm_head && !chain.lm_head->tied) {
-    SliceProducerWeight(init_map.at(*chain.lm_head->weight_name),
-                        *chain.lm_head->weight_transposed, keep_ids,
-                        /*is_conv=*/false);
+    SliceEmbeddingWeightAnyDtype(init_map.at(*chain.lm_head->weight_name),
+                                 *chain.lm_head->weight_transposed, keep_ids);
   }
   if (chain.lm_head && chain.lm_head->bias) {
-    SliceLastAxis(init_map.at(*chain.lm_head->bias), keep_ids);
+    SliceLastAxisAnyDtype(init_map.at(*chain.lm_head->bias), keep_ids);
   }
 
   // Finalize shapes: chain.producer's own output shape never needs
@@ -17372,7 +17798,7 @@ std::vector<double> EmbeddingVocabImportance(const EmbeddingChain& chain,
   std::vector<double> importance(static_cast<size_t>(chain.vocab_size), 0.0);
   {
     const std::vector<float> emb =
-        ReadFloatTensor(*init_map.at(chain.weight_name));
+        ReadFloatTensorAnyDtype(*init_map.at(chain.weight_name));
     for (int64_t v = 0; v < chain.vocab_size; ++v) {
       double sum = 0.0;
       for (int64_t h = 0; h < chain.hidden_size; ++h) {
@@ -17384,7 +17810,7 @@ std::vector<double> EmbeddingVocabImportance(const EmbeddingChain& chain,
   }
   if (chain.lm_head && !chain.lm_head->tied && chain.lm_head->weight_name) {
     const onnx::TensorProto* lw = init_map.at(*chain.lm_head->weight_name);
-    const std::vector<float> lwd = ReadFloatTensor(*lw);
+    const std::vector<float> lwd = ReadFloatTensorAnyDtype(*lw);
     if (*chain.lm_head->weight_transposed) {
       // [vocab_size, K] -- row v is contiguous, direct read.
       const int64_t k = lw->dims(1);
