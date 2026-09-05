@@ -1052,7 +1052,7 @@ def test_gbq_native_uint4_no_zero_points_matches_oracle():
     rng = np.random.default_rng(300)
     data_vals = rng.integers(0, 16, size=(V, H), dtype=np.int64).astype(np.uint8)
     data_tt = onnx.numpy_helper.from_array(data_vals.astype(ml_dtypes.uint4), "data")
-    scales_vals = (rng.random((V, n_blocks)).astype(np.float32) + 0.1)
+    scales_vals = rng.random((V, n_blocks)).astype(np.float32) + 0.1
     scales_tt = _f32(scales_vals, "scales")
 
     model = _gbq_model(data_tt, scales_tt, None, bits, block_size, H)
@@ -1062,7 +1062,9 @@ def test_gbq_native_uint4_no_zero_points_matches_oracle():
     orig_out = _run(model, {"indices": idx_full})[0]
 
     keep_token_ids = [0, 2, 5, 3]
-    result = onnxsim.apply_embedding_vocab_pruning_cpp(model, keep_token_ids=keep_token_ids)
+    result = onnxsim.apply_embedding_vocab_pruning_cpp(
+        model, keep_token_ids=keep_token_ids
+    )
     onnx.checker.check_model(result.model)
     assert result.matched
     assert not result.lm_head_pruned
@@ -1085,7 +1087,7 @@ def test_gbq_native_uint4_with_zero_points_matches_oracle():
     rng = np.random.default_rng(301)
     data_vals = rng.integers(0, 16, size=(V, H), dtype=np.int64).astype(np.uint8)
     data_tt = onnx.numpy_helper.from_array(data_vals.astype(ml_dtypes.uint4), "data")
-    scales_vals = (rng.random((V, n_blocks)).astype(np.float32) + 0.1)
+    scales_vals = rng.random((V, n_blocks)).astype(np.float32) + 0.1
     scales_tt = _f32(scales_vals, "scales")
     zp_vals = rng.integers(0, 16, size=(V, n_blocks), dtype=np.int64).astype(np.uint8)
     zp_tt = onnx.numpy_helper.from_array(zp_vals.astype(ml_dtypes.uint4), "zero_points")
@@ -1118,7 +1120,7 @@ def test_gbq_native_int4_matches_oracle():
     rng = np.random.default_rng(302)
     data_vals = rng.integers(-8, 8, size=(V, H), dtype=np.int64).astype(np.int8)
     data_tt = onnx.numpy_helper.from_array(data_vals.astype(ml_dtypes.int4), "data")
-    scales_vals = (rng.random((V, n_blocks)).astype(np.float32) + 0.1)
+    scales_vals = rng.random((V, n_blocks)).astype(np.float32) + 0.1
     scales_tt = _f32(scales_vals, "scales")
 
     model = _gbq_model(data_tt, scales_tt, None, bits, block_size, H)
@@ -1128,7 +1130,9 @@ def test_gbq_native_int4_matches_oracle():
     orig_out = _run(model, {"indices": idx_full})[0]
 
     keep_token_ids = [6, 4, 1, 0]
-    result = onnxsim.apply_embedding_vocab_pruning_cpp(model, keep_token_ids=keep_token_ids)
+    result = onnxsim.apply_embedding_vocab_pruning_cpp(
+        model, keep_token_ids=keep_token_ids
+    )
     onnx.checker.check_model(result.model)
     assert result.matched
     assert result.kept_token_ids == sorted(keep_token_ids)
@@ -1155,7 +1159,7 @@ def test_gbq_packed_uint8_bits4_with_zero_points_matches_oracle():
     packed = _pack_uint8_bits(data_vals, bits)
     data_tt = onnx.numpy_helper.from_array(packed, "data")
     real_width = packed.shape[1] * (8 // bits)
-    scales_vals = (rng.random((V, n_blocks)).astype(np.float32) + 0.1)
+    scales_vals = rng.random((V, n_blocks)).astype(np.float32) + 0.1
     scales_tt = _f32(scales_vals, "scales")
     zp_vals = rng.integers(0, maxval + 1, size=(V, n_blocks), dtype=np.int64)
     zp_tt = onnx.numpy_helper.from_array(_pack_uint8_bits(zp_vals, bits), "zero_points")
@@ -1167,7 +1171,9 @@ def test_gbq_packed_uint8_bits4_with_zero_points_matches_oracle():
     orig_out = _run(model, {"indices": idx_full})[0]
 
     keep_token_ids = [0, 2, 4, 1]
-    result = onnxsim.apply_embedding_vocab_pruning_cpp(model, keep_token_ids=keep_token_ids)
+    result = onnxsim.apply_embedding_vocab_pruning_cpp(
+        model, keep_token_ids=keep_token_ids
+    )
     onnx.checker.check_model(result.model)
     assert result.matched
     assert result.kept_token_ids == sorted(keep_token_ids)
@@ -1196,7 +1202,7 @@ def test_gbq_packed_uint8_bits2_no_zero_points_matches_oracle():
     packed = _pack_uint8_bits(data_vals, bits)
     data_tt = onnx.numpy_helper.from_array(packed, "data")
     real_width = packed.shape[1] * (8 // bits)
-    scales_vals = (rng.random((V, n_blocks)).astype(np.float32) + 0.1)
+    scales_vals = rng.random((V, n_blocks)).astype(np.float32) + 0.1
     scales_tt = _f32(scales_vals, "scales")
 
     model = _gbq_model(data_tt, scales_tt, None, bits, block_size, real_width)
@@ -1229,7 +1235,7 @@ def test_gbq_plain_uint8_bits8_matches_oracle():
     rng = np.random.default_rng(305)
     data_vals = rng.integers(0, 256, size=(V, H), dtype=np.int64).astype(np.uint8)
     data_tt = onnx.numpy_helper.from_array(data_vals, "data")
-    scales_vals = (rng.random((V, n_blocks)).astype(np.float32) + 0.1)
+    scales_vals = rng.random((V, n_blocks)).astype(np.float32) + 0.1
     scales_tt = _f32(scales_vals, "scales")
 
     model = _gbq_model(data_tt, scales_tt, None, bits, block_size, H)
@@ -1239,7 +1245,9 @@ def test_gbq_plain_uint8_bits8_matches_oracle():
     orig_out = _run(model, {"indices": idx_full})[0]
 
     keep_token_ids = [5, 3, 0, 1]
-    result = onnxsim.apply_embedding_vocab_pruning_cpp(model, keep_token_ids=keep_token_ids)
+    result = onnxsim.apply_embedding_vocab_pruning_cpp(
+        model, keep_token_ids=keep_token_ids
+    )
     onnx.checker.check_model(result.model)
     assert result.matched
     assert result.kept_token_ids == sorted(keep_token_ids)
@@ -1257,7 +1265,7 @@ def test_gbq_untied_lm_head_auto_detected_and_matches_oracle():
     rng = np.random.default_rng(306)
     data_vals = rng.integers(0, 16, size=(V, H), dtype=np.int64).astype(np.uint8)
     data_tt = onnx.numpy_helper.from_array(data_vals.astype(ml_dtypes.uint4), "data")
-    scales_vals = (rng.random((V, n_blocks)).astype(np.float32) + 0.1)
+    scales_vals = rng.random((V, n_blocks)).astype(np.float32) + 0.1
     scales_tt = _f32(scales_vals, "scales")
     w_lm = rng.standard_normal((H, V)).astype(np.float32)
 
@@ -1272,8 +1280,12 @@ def test_gbq_untied_lm_head_auto_detected_and_matches_oracle():
         quantize_axis=1,
     )
     mm_node = onnx.helper.make_node("MatMul", ["hidden", "W_lm"], ["logits"])
-    indices_vi = onnx.helper.make_tensor_value_info("indices", onnx.TensorProto.INT64, ["N"])
-    logits_vi = onnx.helper.make_tensor_value_info("logits", onnx.TensorProto.FLOAT, ["N", V])
+    indices_vi = onnx.helper.make_tensor_value_info(
+        "indices", onnx.TensorProto.INT64, ["N"]
+    )
+    logits_vi = onnx.helper.make_tensor_value_info(
+        "logits", onnx.TensorProto.FLOAT, ["N", V]
+    )
     graph = onnx.helper.make_graph(
         [gbq_node, mm_node],
         "g",
@@ -1295,7 +1307,9 @@ def test_gbq_untied_lm_head_auto_detected_and_matches_oracle():
     orig_out = _run(model, {"indices": idx_full})[0]
 
     keep_token_ids = [0, 1, 3, 5]
-    result = onnxsim.apply_embedding_vocab_pruning_cpp(model, keep_token_ids=keep_token_ids)
+    result = onnxsim.apply_embedding_vocab_pruning_cpp(
+        model, keep_token_ids=keep_token_ids
+    )
     onnx.checker.check_model(result.model)
     assert result.matched
     assert result.lm_head_pruned
@@ -1325,21 +1339,42 @@ def test_gbq_tied_lm_head_declined_ambiguous_two_producers():
     scales_tt = _f32(rng.random((V, 1)).astype(np.float32) + 0.1, "scales")
 
     node1 = onnx.helper.make_node(
-        "GatherBlockQuantized", ["data", "indices1", "scales"], ["out1"],
-        domain="com.microsoft", bits=bits, block_size=block_size,
-        gather_axis=0, quantize_axis=1,
+        "GatherBlockQuantized",
+        ["data", "indices1", "scales"],
+        ["out1"],
+        domain="com.microsoft",
+        bits=bits,
+        block_size=block_size,
+        gather_axis=0,
+        quantize_axis=1,
     )
     node2 = onnx.helper.make_node(
-        "GatherBlockQuantized", ["data", "indices2", "scales"], ["out2"],
-        domain="com.microsoft", bits=bits, block_size=block_size,
-        gather_axis=0, quantize_axis=1,
+        "GatherBlockQuantized",
+        ["data", "indices2", "scales"],
+        ["out2"],
+        domain="com.microsoft",
+        bits=bits,
+        block_size=block_size,
+        gather_axis=0,
+        quantize_axis=1,
     )
-    ids1_vi = onnx.helper.make_tensor_value_info("indices1", onnx.TensorProto.INT64, ["N"])
-    ids2_vi = onnx.helper.make_tensor_value_info("indices2", onnx.TensorProto.INT64, ["M"])
-    out1_vi = onnx.helper.make_tensor_value_info("out1", onnx.TensorProto.FLOAT, ["N", H])
-    out2_vi = onnx.helper.make_tensor_value_info("out2", onnx.TensorProto.FLOAT, ["M", H])
+    ids1_vi = onnx.helper.make_tensor_value_info(
+        "indices1", onnx.TensorProto.INT64, ["N"]
+    )
+    ids2_vi = onnx.helper.make_tensor_value_info(
+        "indices2", onnx.TensorProto.INT64, ["M"]
+    )
+    out1_vi = onnx.helper.make_tensor_value_info(
+        "out1", onnx.TensorProto.FLOAT, ["N", H]
+    )
+    out2_vi = onnx.helper.make_tensor_value_info(
+        "out2", onnx.TensorProto.FLOAT, ["M", H]
+    )
     graph = onnx.helper.make_graph(
-        [node1, node2], "g", [ids1_vi, ids2_vi], [out1_vi, out2_vi],
+        [node1, node2],
+        "g",
+        [ids1_vi, ids2_vi],
+        [out1_vi, out2_vi],
         initializer=[data_tt, scales_tt],
     )
     model = onnx.helper.make_model(
@@ -1370,21 +1405,42 @@ def test_gbq_input_name_disambiguates_two_producers():
     a_data, a_scales = mk(V1, "a")
     b_data, b_scales = mk(V2, "b")
     node_a = onnx.helper.make_node(
-        "GatherBlockQuantized", ["a_data", "ids_a", "a_scales"], ["out_a"],
-        domain="com.microsoft", bits=bits, block_size=block_size,
-        gather_axis=0, quantize_axis=1,
+        "GatherBlockQuantized",
+        ["a_data", "ids_a", "a_scales"],
+        ["out_a"],
+        domain="com.microsoft",
+        bits=bits,
+        block_size=block_size,
+        gather_axis=0,
+        quantize_axis=1,
     )
     node_b = onnx.helper.make_node(
-        "GatherBlockQuantized", ["b_data", "ids_b", "b_scales"], ["out_b"],
-        domain="com.microsoft", bits=bits, block_size=block_size,
-        gather_axis=0, quantize_axis=1,
+        "GatherBlockQuantized",
+        ["b_data", "ids_b", "b_scales"],
+        ["out_b"],
+        domain="com.microsoft",
+        bits=bits,
+        block_size=block_size,
+        gather_axis=0,
+        quantize_axis=1,
     )
-    ids_a_vi = onnx.helper.make_tensor_value_info("ids_a", onnx.TensorProto.INT64, ["N"])
-    ids_b_vi = onnx.helper.make_tensor_value_info("ids_b", onnx.TensorProto.INT64, ["M"])
-    out_a_vi = onnx.helper.make_tensor_value_info("out_a", onnx.TensorProto.FLOAT, ["N", H])
-    out_b_vi = onnx.helper.make_tensor_value_info("out_b", onnx.TensorProto.FLOAT, ["M", H])
+    ids_a_vi = onnx.helper.make_tensor_value_info(
+        "ids_a", onnx.TensorProto.INT64, ["N"]
+    )
+    ids_b_vi = onnx.helper.make_tensor_value_info(
+        "ids_b", onnx.TensorProto.INT64, ["M"]
+    )
+    out_a_vi = onnx.helper.make_tensor_value_info(
+        "out_a", onnx.TensorProto.FLOAT, ["N", H]
+    )
+    out_b_vi = onnx.helper.make_tensor_value_info(
+        "out_b", onnx.TensorProto.FLOAT, ["M", H]
+    )
     graph = onnx.helper.make_graph(
-        [node_a, node_b], "g", [ids_a_vi, ids_b_vi], [out_a_vi, out_b_vi],
+        [node_a, node_b],
+        "g",
+        [ids_a_vi, ids_b_vi],
+        [out_a_vi, out_b_vi],
         initializer=[a_data, a_scales, b_data, b_scales],
     )
     model = onnx.helper.make_model(

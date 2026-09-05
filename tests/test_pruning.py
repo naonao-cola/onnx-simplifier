@@ -260,7 +260,9 @@ def test_wanda_pruning_falls_back_to_magnitude_without_matching_activation():
         model, calibration_data=[{"X": x}], sparsity=0.5
     )
     onnx.checker.check_model(wanda_pruned)
-    np.testing.assert_array_equal(_weight(wanda_pruned), _magnitude_weight(magnitude_pruned))
+    np.testing.assert_array_equal(
+        _weight(wanda_pruned), _magnitude_weight(magnitude_pruned)
+    )
 
 
 def test_weight_sparsity_of_unpruned_model_is_zero():
@@ -15122,7 +15124,10 @@ def test_magnitude_pruning_attention_merged_weight_reaches_target_sparsity():
     node_after_same_weight_name = onnx.NodeProto()
     node_after_same_weight_name.CopyFrom(node_after)
     node_after_same_weight_name.input[1] = node_before.input[1]
-    assert node_after_same_weight_name.SerializeToString() == node_before.SerializeToString()
+    assert (
+        node_after_same_weight_name.SerializeToString()
+        == node_before.SerializeToString()
+    )
     num_heads, qkv = _attention_attrs(node_after)
     assert num_heads == cfg["H"]
     assert qkv == [cfg["Nq"], cfg["Nk"], cfg["Nv"]]

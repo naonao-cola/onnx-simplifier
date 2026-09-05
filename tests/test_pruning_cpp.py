@@ -353,8 +353,12 @@ def test_cpp_magnitude_pruning_global_sparsity_matches_frozen_python_golden():
     )
     pruned = onnxsim.prune_magnitude_cpp(model, sparsity=0.6, global_sparsity=True)
     onnx.checker.check_model(pruned)
-    assert _golden_weight_bytes(pruned, _GOLDEN_GLOBAL_SPARSITY_MIXED_MATMUL, node_index=0)
-    assert _golden_weight_bytes(pruned, _GOLDEN_GLOBAL_SPARSITY_MIXED_CONV, node_index=1)
+    assert _golden_weight_bytes(
+        pruned, _GOLDEN_GLOBAL_SPARSITY_MIXED_MATMUL, node_index=0
+    )
+    assert _golden_weight_bytes(
+        pruned, _GOLDEN_GLOBAL_SPARSITY_MIXED_CONV, node_index=1
+    )
 
 
 def test_cpp_magnitude_pruning_global_sparsity_pools_across_layers():
@@ -379,9 +383,9 @@ def test_cpp_magnitude_pruning_global_sparsity_pools_across_layers():
     w_small_pruned = _weight(pruned, node_index=0)
     w_large_pruned = _weight(pruned, node_index=1)
     total = w_small.size + w_large.size
-    assert np.count_nonzero(w_small_pruned) + np.count_nonzero(
-        w_large_pruned
-    ) == round(total * 0.5)
+    assert np.count_nonzero(w_small_pruned) + np.count_nonzero(w_large_pruned) == round(
+        total * 0.5
+    )
     # The small-magnitude layer absorbs (much) more of the pruning than the
     # large-magnitude one -- no per-layer floor, unlike the default mode.
     assert np.count_nonzero(w_small_pruned) < np.count_nonzero(w_large_pruned)
@@ -430,9 +434,9 @@ def test_cpp_magnitude_pruning_global_sparsity_subgraph_aware():
         raise AssertionError(branch_name)
 
     total = w_then.size + w_else.size
-    zeroed = np.count_nonzero(_sub_weight(pruned, "then_branch") == 0) + np.count_nonzero(
-        _sub_weight(pruned, "else_branch") == 0
-    )
+    zeroed = np.count_nonzero(
+        _sub_weight(pruned, "then_branch") == 0
+    ) + np.count_nonzero(_sub_weight(pruned, "else_branch") == 0)
     # Pooled across BOTH subgraphs combined -- not independently per branch.
     assert zeroed == round(total * 0.5)
 
@@ -504,7 +508,9 @@ def test_cpp_magnitude_pruning_float16_preserves_kept_bit_patterns():
     pruned = onnxsim.prune_magnitude_cpp(model, sparsity=0.5)
     w_pruned = _weight(pruned)
     kept = w_pruned != 0
-    np.testing.assert_array_equal(w_pruned[kept].view(np.uint16), w[kept].view(np.uint16))
+    np.testing.assert_array_equal(
+        w_pruned[kept].view(np.uint16), w[kept].view(np.uint16)
+    )
 
 
 # --- com.microsoft Attention-family merged-QKV-weight matching ------------
