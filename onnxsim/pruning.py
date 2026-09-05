@@ -4376,6 +4376,23 @@ def _consumers_of(graph: onnx.GraphProto) -> Dict[str, List[onnx.NodeProto]]:
     return consumers
 
 
+def _producers_of(graph: onnx.GraphProto) -> Dict[str, onnx.NodeProto]:
+    """The single-owner counterpart of :func:`_consumers_of`: every tensor
+    name in `graph` mapped to the ONE node that produces it (a valid graph
+    never has two nodes emitting the same output name). Used by the
+    "DynamicQuantizeConv" section below to walk BACKWARD from a
+    ``ConvInteger``'s own ``x`` input to the ``DynamicQuantizeLinear`` node
+    that must produce it -- something :func:`_consumers_of` alone (a
+    forward-only, one-to-many map) can't answer.
+    """
+    producers: Dict[str, onnx.NodeProto] = {}
+    for node in graph.node:
+        for out in node.output:
+            if out:
+                producers[out] = node
+    return producers
+
+
 def _match_producer(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> Optional[Tuple[str, bool, Optional[str], int]]:
@@ -32943,6 +32960,663 @@ def apply_structured_pruning_dynamic_quantize_matmul(
     return out
 
 
+# --- DynamicQuantizeConv (ConvInteger, ORT dynamic-quantization Conv
+#     pattern) structured pruning ------------------------------------------
+#
+# ``ConvInteger`` was this module's other genuine blind spot before this
+# section: ``grep -c "ConvInteger" onnxsim/pruning.py`` returned 0 on the
+# commit this section was added from. It is the Conv analogue of
+# ``MatMulInteger`` -- the plain, standard-ONNX (``ai.onnx``, domain ``""``,
+# confirmed live via ``onnx.defs.get_schema("ConvInteger")``) op ORT's own
+# ``onnxruntime.quantization.quantize_dynamic()`` emits for a dynamically
+# quantized Conv layer -- but, UNLIKE ``MatMulInteger``, it has no fused
+# ``com.microsoft`` counterpart the way ``MatMulInteger`` gets collapsed
+# into ``DynamicQuantizeMatMul``/``MatMulIntegerToFloat`` by ORT's own
+# graph optimizer (see this module's own "DynamicQuantizeMatMul /
+# MatMulIntegerToFloat" section comment just above). Confirmed directly, not
+# assumed: a real ``Conv -> Relu -> Conv`` float model, run through
+# ``quantize_dynamic(..., op_types_to_quantize=["Conv"])`` and then a real
+# ``InferenceSession`` (default ``GraphOptimizationLevel.ORT_ENABLE_ALL``,
+# ``sess_options.optimized_model_filepath`` capturing the optimized graph),
+# leaves the exact same node sequence behind -- no fusion collapses it, with
+# or without ``per_channel=True``. So this section matches the RAW, unfused
+# multi-node pattern directly, unlike the ``DynamicQuantizeMatMul`` section's
+# own single-node match.
+#
+# The exact node sequence (confirmed via the live round trip above, and by
+# reading ``onnxruntime.quantization.operators.conv.ConvInteger.quantize()``'s
+# own source directly -- not inferred from the abstract schema alone), per
+# quantized Conv layer::
+#
+#   Xq, x_scale, x_zero_point = DynamicQuantizeLinear(X)
+#   combined_scale             = Mul(x_scale, W_scale)
+#   Yi                         = ConvInteger(Xq, Wq, x_zero_point, W_zero_point)
+#   Yf                         = Cast(Yi, to=FLOAT)
+#   Yscaled                    = Mul(Yf, combined_scale)
+#   Y                          = Add(Yscaled, Reshape(B, [1, -1, 1, ..., 1]))  # bias, if any
+#
+# (`Y` above is `Yscaled` directly when the source ``Conv`` had no bias --
+# confirmed via the same quantizer source: the ``Reshape``+``Add`` pair is
+# only ever emitted when ``len(node.input) == 3``.) `Wq`/`W_scale`/
+# `W_zero_point` are constant initializers (the weight is quantized AHEAD OF
+# TIME, from its own static values -- no calibration data needed, exactly
+# like ``MatMulInteger``'s own `B`); `x_scale`/`x_zero_point` are NEVER
+# constant -- they are ``DynamicQuantizeLinear``'s own live outputs, computed
+# from each run's actual input range, the identical convention
+# ``DynamicQuantizeMatMul``'s own `A` side already established.
+#
+# ``Wq`` (``ConvInteger``'s own `w` input) is INT8/UINT8, shaped
+# ``(out_channels, in_channels/group, kH, kW)`` -- axis 0 is the output-
+# channel axis, EXACTLY the same layout plain ``Conv``'s own weight and
+# ``QLinearConv``'s own `w` already use (see the QOperator section's own top
+# comment) -- confirmed via the live round trip above, reshaped/sliced
+# identically via the SAME :func:`_slice_producer_weight`/
+# :func:`_slice_consumer_weight` helpers (``is_conv=True``), no new slicing
+# machinery needed at all.
+#
+# `W_scale`/`W_zero_point` are ALWAYS scalar (per-tensor) here -- a REAL,
+# confirmed constraint, not an unconfirmed-and-declined possibility the way
+# the QOperator/``DynamicQuantizeMatMul`` sections' own per-channel branches
+# are genuinely supported alternatives: reading
+# ``onnxruntime.quantization.operators.conv.ConvInteger.quantize()`` directly
+# shows it ALWAYS calls ``self.quantizer.quantize_weight(node, [1], ...)``
+# (the per-TENSOR path) for this op, never ``quantize_weight_per_channel``
+# (the path ``QLinearConv``'s OWN quantizer -- a different class in the same
+# module -- does call when per-channel is requested) -- regardless of
+# whatever `per_channel` argument ``quantize_dynamic`` itself was given.
+# Confirmed empirically too: the exact same round trip above with
+# ``per_channel=True`` still emits a scalar ``W_scale``/``W_zero_point``. So
+# there is no per-channel case to support here at all -- `W_scale`/
+# `W_zero_point` are simply never touched by either role (the same
+# "per-tensor broadcast left alone" treatment this module already gives a
+# per-tensor QOperator/QDQ scale), and this section declines (rather than
+# silently mis-handling) any hand-built graph that gives either of them a
+# non-scalar shape, the same "not empirically confirmed, so not guessed at"
+# bar this module's every other quantized section already holds.
+#
+# `x_scale` feeds a small ``Mul(x_scale, W_scale)`` node computing a
+# COMBINED scale ahead of the main rescale -- this is genuinely new
+# structure ``DynamicQuantizeMatMul`` doesn't have (that fused op computes
+# its own internal scale product in the kernel, never exposing it as a
+# separate node), so this section's own matcher (:func:`_match_conv_integer`)
+# has to walk this small multi-node neighborhood explicitly: BACKWARD from
+# ``ConvInteger``'s own `x` input to find the ``DynamicQuantizeLinear`` that
+# must produce it (:func:`_producers_of`, a new small graph-utility this
+# section adds alongside the module's existing :func:`_consumers_of`), then
+# to the scale-combining ``Mul``, and FORWARD from ``ConvInteger``'s own
+# output through ``Cast`` -> the rescale ``Mul`` -> an optional bias
+# ``Reshape``/``Add`` pair. Every one of these six-to-eight nodes is folded
+# into ONE :class:`_ConvIntegerConv` match object -- the multi-node analogue
+# of :class:`_DynQuantMatMulWeight` -- so everything downstream (chain
+# finding, slicing, importance ranking) treats a matched
+# ``ConvInteger``-based Conv layer as a single logical producer/consumer unit
+# exactly the way a fused ``DynamicQuantizeMatMul`` node already is.
+#
+# `B` (bias), when present, is PLAIN, UNQUANTIZED float, shape
+# ``(out_channels,)`` -- confirmed directly off the quantizer source's own
+# ``add_bias`` method, which reshapes and adds the ORIGINAL ``Conv`` node's
+# own bias tensor completely unchanged, with no rescale step at all. This is
+# the identical convention ``DynamicQuantizeMatMul``'s own `bias` already
+# established (a real, material difference from `QGemm`/`QLinearConv`'s own
+# INT32, per-channel-scaled bias -- see that section's own top comment), so
+# it is sliced the same way: directly, via :func:`_slice_last_axis`, no
+# rescale-recompute step. The ``Reshape``'s own shape initializer
+# (``[1, -1, 1, ..., 1]``, one entry per weight rank) needs no adjustment at
+# all when the bias is sliced -- its ``-1`` entry auto-infers the new
+# (smaller) bias length from the actual (already-sliced) bias tensor at
+# runtime, so it is left completely untouched, matched but never written to.
+#
+# Chain-finding (:func:`_find_conv_integer_chains`/
+# :func:`_walk_to_conv_integer_consumer`) mirrors the QOperator section's own
+# ``QLinearConv``-only, same-family-only walk (:func:`_walk_to_qop_consumer`)
+# closely, DELIBERATELY narrower than the ``DynamicQuantizeMatMul`` section's
+# own quantized-or-plain-float union: only a ``ConvInteger``-shaped producer
+# feeding a ``ConvInteger``-shaped consumer (through zero or more
+# shape-preserving unary hops, ``_UNARY_PASS_THROUGH``) is matched -- a plain
+# float ``Conv`` peer on either side is declined outright, not attempted.
+# This is a real, deliberate scope narrowing (see this module's own
+# docstring on drawing scope where it was actually verified, not where it
+# looked plausible): matching a plain ``Conv`` peer here would mean reusing
+# :func:`_match_conv_producer`/:func:`_match_conv_consumer` from this
+# module's own main structured-pruning family and reconciling THAT family's
+# own general-grouped-Conv support against this section's own ``group == 1``-
+# only bar -- a real, tractable-looking follow-up deliberately left out of
+# scope rather than risk an incorrectly-reconciled interaction between two
+# families that were never designed together.
+#
+# What's declined, deliberately, rather than guessed at (mirroring this
+# module's own conservative "decline anything ambiguous" bar everywhere
+# else):
+#
+#   * Any non-constant `Wq`/`W_scale`/`W_zero_point`/bias, or any of those
+#     (plus the weight itself) read by more than one node (a shared/tied
+#     tensor).
+#   * A non-scalar `W_scale`/`W_zero_point` -- never confirmed to occur (see
+#     above): ORT's own ``ConvInteger`` dynamic-quantization emitter never
+#     produces one, regardless of `per_channel`.
+#   * `x_zero_point`/`W_zero_point` absent entirely (both schema-legal,
+#     since ``ConvInteger``'s formal parameters mark them optional) -- every
+#     real fixture this investigation produced always emits both explicitly,
+#     so an absent one is simply outside what was empirically confirmed
+#     safe, the same bar the ``DynamicQuantizeMatMul`` section's own top
+#     comment already applies to an absent `b_zero_point`.
+#   * A general grouped or depthwise ``ConvInteger`` (`group != 1`), or a
+#     weight of rank other than 4 (2-D spatial Conv only) -- mirrors the
+#     QOperator/QDQ sections' own identical restrictions for ``QLinearConv``.
+#   * A ``Cast`` rescaling to anything other than plain ``FLOAT`` -- never
+#     confirmed for a `FLOAT16`/`BFLOAT16` Conv output, so declined outright
+#     rather than guessed at.
+#   * Any residual/skip-connection merge, `Concat`-merged branch group, or
+#     gated (SwiGLU/GeGLU) pair -- only the plain single-producer/single-
+#     consumer/unary-hops-only topology above is matched, mirroring every
+#     other quantized-weight section in this module.
+#   * Mixing a ``ConvInteger``-based node with a QDQ-, QOperator-, or plain-
+#     float-fed node on EITHER side of a chain -- a genuinely different
+#     quantization scheme (or none at all) this investigation did not
+#     confirm composes safely (see above for why the plain-float-peer case
+#     specifically is a deliberate scope narrowing, not an oversight).
+#
+# Sensitivity-report family string: ``"dynamic_quantize_conv"`` -- a single
+# family, mirroring the ``DynamicQuantizeMatMul`` section's own single-family
+# choice (there is no Conv/MatMul split to make here at all, since this
+# section covers Conv exclusively).
+
+
+@dataclass(frozen=True)
+class _ConvIntegerConv:
+    """A matched ``ConvInteger``-based dynamically-quantized Conv layer's own
+    sliceable operands and the full multi-node neighborhood
+    :func:`_match_conv_integer` resolved it from -- see this section's own
+    top comment for the schema/quantizer-source facts this depends on
+    (empirically confirmed, not assumed). `node` is the ``ConvInteger``
+    itself; `dq_node` is the ``DynamicQuantizeLinear`` producing its own `x`/
+    `x_zero_point` inputs; `scales_mul_node` combines `x_scale` with
+    `w_scale_init`; `cast_node`/`rescale_mul_node` cast-then-rescale
+    ``ConvInteger``'s own int32 output back to float; `bias_reshape_node`/
+    `bias_add_node` are the optional bias pair (``None``/``None`` together
+    whenever the source ``Conv`` had no bias). `w_init` is always INT8/
+    UINT8, stored ``(out_channels, in_channels/group, kH, kW)`` -- `group`
+    is always 1 here (see this section's own top comment), so axis 1 spans
+    the FULL input-channel count. `w_scale_init`/`w_zero_point_init` are
+    always scalar (never per-channel -- see this section's own top
+    comment for why that's a confirmed fact, not an unconfirmed
+    possibility). `bias_init` is the optional plain-float bias, shape
+    ``(N,)``, or ``None`` when genuinely absent. `N`/`K` are `w_init`'s own
+    output-channel/input-channel sizes.
+    """
+
+    node: onnx.NodeProto
+    dq_node: onnx.NodeProto
+    scales_mul_node: onnx.NodeProto
+    cast_node: onnx.NodeProto
+    rescale_mul_node: onnx.NodeProto
+    bias_reshape_node: Optional[onnx.NodeProto]
+    bias_add_node: Optional[onnx.NodeProto]
+    w_init: onnx.TensorProto
+    w_scale_init: onnx.TensorProto
+    w_zero_point_init: onnx.TensorProto
+    bias_init: Optional[onnx.TensorProto]
+    N: int
+    K: int
+
+
+def _conv_integer_final_output(w: _ConvIntegerConv) -> str:
+    """The tensor name this matched Conv layer's own logical output is --
+    the bias ``Add``'s own output when a bias was matched, or the rescale
+    ``Mul``'s own output otherwise (mirrors ``DynamicQuantizeMatMul``'s own
+    optional-`bias` output convention, just spread here across two
+    physical nodes instead of one fused op's own single output).
+    """
+    if w.bias_add_node is not None:
+        return w.bias_add_node.output[0]
+    return w.rescale_mul_node.output[0]
+
+
+def _match_conv_integer(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    producers_of: Dict[str, onnx.NodeProto],
+) -> Optional[_ConvIntegerConv]:
+    """If `node` is a ``ConvInteger`` at the center of the full
+    dynamically-quantized Conv neighborhood this section's own top comment
+    describes, matching every scope boundary documented there, returns the
+    match. ``None`` whenever anything is ambiguous, non-constant, shared,
+    or otherwise out of the empirically-verified scope, rather than
+    guessing.
+    """
+    if node.op_type != "ConvInteger" or node.domain != "":
+        return None
+    if len(node.input) != 4 or len(node.output) != 1:
+        return None
+    x_name, w_name, x_zp_name, w_zp_name = node.input
+    if not (x_name and w_name and x_zp_name and w_zp_name):
+        return None
+
+    group = _matmul_nbits_int_attr(node, "group", 1)
+    if group != 1:
+        return None  # grouped/depthwise ConvInteger -- out of scope, see
+        # this section's own top comment
+
+    w_init = initializer_map.get(w_name)
+    if w_init is None or w_init.data_type not in (
+        onnx.TensorProto.INT8,
+        onnx.TensorProto.UINT8,
+    ):
+        return None  # non-constant, or wrong-dtype, w
+    dims = list(w_init.dims)
+    if len(dims) != 4:
+        return None  # 2-D spatial Conv only -- see this section's own top
+        # comment for why this mirrors the QOperator/QDQ sections' own
+        # identical rank bar
+    n, k = dims[0], dims[1]
+    if n <= 0 or k <= 0:
+        return None
+    if len(consumers_of.get(w_name, [])) != 1:
+        return None  # shared/tied weight -- another node reads it too
+
+    w_zp_init = initializer_map.get(w_zp_name)
+    if w_zp_init is None or w_zp_init.data_type != w_init.data_type:
+        return None  # non-constant, or dtype-mismatched (schema: w and
+        # w_zero_point share one type), w_zero_point
+    if list(w_zp_init.dims) not in ([], [1]):
+        return None  # non-scalar w_zero_point -- never confirmed empirically
+        # (see this section's own top comment), declined
+
+    dq_node = producers_of.get(x_name)
+    if (
+        dq_node is None
+        or dq_node.op_type != "DynamicQuantizeLinear"
+        or dq_node.domain != ""
+        or len(dq_node.input) != 1
+        or len(dq_node.output) != 3
+        or dq_node.output[0] != x_name
+        or dq_node.output[2] != x_zp_name
+    ):
+        return None  # x/x_zero_point don't resolve to one shared
+        # DynamicQuantizeLinear producer
+
+    x_scale_name = dq_node.output[1]
+    scale_consumers = consumers_of.get(x_scale_name, [])
+    if len(scale_consumers) != 1:
+        return None
+    scales_mul_node = scale_consumers[0]
+    if scales_mul_node.op_type != "Mul" or len(scales_mul_node.input) != 2:
+        return None
+    sm_in0, sm_in1 = scales_mul_node.input
+    if sm_in0 == x_scale_name:
+        w_scale_name = sm_in1
+    elif sm_in1 == x_scale_name:
+        w_scale_name = sm_in0
+    else:
+        return None  # scale-combining Mul doesn't actually read x_scale
+
+    w_scale_init = initializer_map.get(w_scale_name)
+    if (
+        w_scale_init is None
+        or w_scale_init.data_type != onnx.TensorProto.FLOAT
+        or list(w_scale_init.dims) not in ([], [1])
+    ):
+        return None  # non-constant, wrong-dtype, or non-scalar w_scale
+    if len(scales_mul_node.output) != 1:
+        return None
+    combined_scale_name = scales_mul_node.output[0]
+
+    ci_out = node.output[0]
+    ci_consumers = consumers_of.get(ci_out, [])
+    if len(ci_consumers) != 1:
+        return None
+    cast_node = ci_consumers[0]
+    if (
+        cast_node.op_type != "Cast"
+        or list(cast_node.input) != [ci_out]
+        or len(cast_node.output) != 1
+    ):
+        return None
+    to_attr = next((a.i for a in cast_node.attribute if a.name == "to"), None)
+    if to_attr != onnx.TensorProto.FLOAT:
+        return None  # never confirmed for a FLOAT16/BFLOAT16 rescale target
+        # -- declined, see this section's own top comment
+
+    cast_out = cast_node.output[0]
+    cast_consumers = consumers_of.get(cast_out, [])
+    if len(cast_consumers) != 1:
+        return None
+    rescale_mul_node = cast_consumers[0]
+    if (
+        rescale_mul_node.op_type != "Mul"
+        or len(rescale_mul_node.input) != 2
+        or len(rescale_mul_node.output) != 1
+    ):
+        return None
+    if {rescale_mul_node.input[0], rescale_mul_node.input[1]} != {
+        cast_out,
+        combined_scale_name,
+    }:
+        return None  # rescale Mul doesn't actually combine the cast Conv
+        # output with the scale-combining Mul's own output
+
+    rescale_out = rescale_mul_node.output[0]
+    bias_reshape_node: Optional[onnx.NodeProto] = None
+    bias_add_node: Optional[onnx.NodeProto] = None
+    bias_init: Optional[onnx.TensorProto] = None
+    rescale_consumers = consumers_of.get(rescale_out, [])
+    if len(rescale_consumers) == 1:
+        candidate_add = rescale_consumers[0]
+        if (
+            candidate_add.op_type == "Add"
+            and len(candidate_add.input) == 2
+            and len(candidate_add.output) == 1
+        ):
+            add_in0, add_in1 = candidate_add.input
+            other = None
+            if add_in0 == rescale_out:
+                other = add_in1
+            elif add_in1 == rescale_out:
+                other = add_in0
+            if other is not None:
+                reshape_candidate = producers_of.get(other)
+                if (
+                    reshape_candidate is not None
+                    and reshape_candidate.op_type == "Reshape"
+                    and len(reshape_candidate.input) == 2
+                    and len(reshape_candidate.output) == 1
+                    and reshape_candidate.output[0] == other
+                    and len(consumers_of.get(other, [])) == 1
+                ):
+                    bias_name, shape_name = reshape_candidate.input
+                    cand_bias = initializer_map.get(bias_name)
+                    shape_init = initializer_map.get(shape_name)
+                    if (
+                        cand_bias is not None
+                        and shape_init is not None
+                        and _is_supported_float_dtype(cand_bias.data_type)
+                        and list(cand_bias.dims) == [n]
+                        and len(consumers_of.get(bias_name, [])) == 1
+                    ):
+                        bias_reshape_node = reshape_candidate
+                        bias_add_node = candidate_add
+                        bias_init = cand_bias
+                    # else: doesn't match the confirmed bias shape -- treated
+                    # as bias-absent below, not an error (mirrors every
+                    # other section's own "best-effort, else no bias" bar)
+
+    return _ConvIntegerConv(
+        node=node,
+        dq_node=dq_node,
+        scales_mul_node=scales_mul_node,
+        cast_node=cast_node,
+        rescale_mul_node=rescale_mul_node,
+        bias_reshape_node=bias_reshape_node,
+        bias_add_node=bias_add_node,
+        w_init=w_init,
+        w_scale_init=w_scale_init,
+        w_zero_point_init=w_zp_init,
+        bias_init=bias_init,
+        N=n,
+        K=k,
+    )
+
+
+def _conv_integer_dequantized_nk(w: _ConvIntegerConv) -> np.ndarray:
+    """The full float64 ``(N, C*kH*kW)`` dequantized weight matrix `w`
+    refers to, for IMPORTANCE RANKING ONLY -- never written back to the
+    graph (this module's own "slice, don't recompute" principle). Mirrors
+    :func:`_qop_dequantized_nk`'s own identical Conv-to-2D reshape; `scale`/
+    `zero_point` are always scalar here (see this section's own top
+    comment), so unlike that function there is no per-channel
+    reshape-to-column branch to consider at all.
+    """
+    arr = onnx.numpy_helper.to_array(w.w_init).astype(np.float64)
+    arr = arr.reshape(arr.shape[0], -1)  # (N, C*kH*kW)
+    zp = onnx.numpy_helper.to_array(w.w_zero_point_init).astype(np.float64)
+    scale = onnx.numpy_helper.to_array(w.w_scale_init).astype(np.float64)
+    return (arr - zp) * scale
+
+
+def _slice_conv_integer_producer(w: _ConvIntegerConv, keep: np.ndarray) -> None:
+    """Slices `w`'s own `N` (output-channel) axis to `keep` (ascending
+    indices) -- the producer role. `w_scale`/`w_zero_point` are always
+    per-tensor scalar here (see this section's own top comment), so --
+    unlike the QOperator/``DynamicQuantizeMatMul`` sections' own per-channel
+    branches -- neither is ever sliced. The plain-float `bias` (never
+    quantized) is sliced exactly like a plain float Conv's own bias, via
+    the same :func:`_slice_last_axis` every other section in this module
+    already uses for a plain-float bias.
+    """
+    _slice_producer_weight(w.w_init, weight_transposed=False, keep=keep, is_conv=True)
+    if w.bias_init is not None:
+        _slice_last_axis(w.bias_init, keep)
+
+
+def _slice_conv_integer_consumer(w: _ConvIntegerConv, keep: np.ndarray) -> None:
+    """Slices `w`'s own `K` (input-channel) axis to `keep` -- the consumer
+    role. Never touches `w_scale`/`w_zero_point`/bias -- none of them are
+    indexed by `K` (see this section's own top comment).
+    """
+    _slice_consumer_weight(w.w_init, weight_transposed=False, keep=keep, is_conv=True)
+
+
+@dataclass(frozen=True)
+class _ConvIntegerChain:
+    producer: _ConvIntegerConv
+    chain_ops: Tuple[onnx.NodeProto, ...]
+    consumer: _ConvIntegerConv
+    n_channels: int
+
+
+def _walk_to_conv_integer_consumer(
+    start: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    producers_of: Dict[str, onnx.NodeProto],
+    graph_outputs: Set[str],
+    n_channels: int,
+    max_hops: int,
+) -> Optional[Tuple[_ConvIntegerConv, Tuple[onnx.NodeProto, ...]]]:
+    """From tensor `start` (a matched ``ConvInteger`` Conv layer's own
+    logical output, :func:`_conv_integer_final_output`), walks forward
+    through shape-preserving unary activations (`_UNARY_PASS_THROUGH`) with
+    no other consumer anywhere along the way, until a same-family
+    ``ConvInteger``-based consumer (reached through its own
+    ``DynamicQuantizeLinear`` producer) is found whose own `K` matches
+    `n_channels` -- mirrors :func:`_walk_to_qop_consumer`'s own
+    ``QLinearConv``-only walk, DELIBERATELY narrower than
+    :func:`_walk_to_dynquant_consumer`'s own quantized-or-plain-float union
+    (see this section's own top comment for why the plain-float-Conv-peer
+    case is a deliberate scope narrowing, not attempted here). Returns
+    ``None`` if the walk runs out of hops, hits a branch, or never reaches
+    such a consumer.
+    """
+    chain_ops: List[onnx.NodeProto] = []
+    cur = start
+    for _hop in range(max_hops):
+        candidates = consumers_of.get(cur, [])
+        if len(candidates) != 1:
+            return None
+        nxt = candidates[0]
+
+        if (
+            nxt.op_type == "DynamicQuantizeLinear"
+            and list(nxt.input) == [cur]
+            and len(nxt.output) == 3
+        ):
+            y_name = nxt.output[0]
+            y_consumers = consumers_of.get(y_name, [])
+            if len(y_consumers) == 1 and y_consumers[0].op_type == "ConvInteger":
+                m = _match_conv_integer(
+                    y_consumers[0], initializer_map, consumers_of, producers_of
+                )
+                if m is not None and m.dq_node is nxt and m.K == n_channels:
+                    return m, tuple(chain_ops)
+            return None
+
+        if not (
+            nxt.op_type in _UNARY_PASS_THROUGH
+            and list(nxt.input) == [cur]
+            and len(nxt.output) == 1
+        ):
+            return None
+        out2 = nxt.output[0]
+        if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+            return None
+        chain_ops.append(nxt)
+        cur = out2
+    return None
+
+
+def _find_conv_integer_chains(graph: onnx.GraphProto) -> List[_ConvIntegerChain]:
+    """Every ``ConvInteger``-based producer/consumer pair connected by
+    :func:`_walk_to_conv_integer_consumer` -- both sides always
+    ``ConvInteger``-based here (see this section's own top comment for why,
+    unlike :func:`_find_dynquant_chains`, there is no plain-float-peer union
+    to consider at all).
+    """
+    initializer_map = _constant_map(graph)
+    consumers_of = _consumers_of(graph)
+    producers_of = _producers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains: List[_ConvIntegerChain] = []
+    for node in graph.node:
+        if node.op_type != "ConvInteger":
+            continue
+        m = _match_conv_integer(node, initializer_map, consumers_of, producers_of)
+        if m is None:
+            continue
+
+        final_out = _conv_integer_final_output(m)
+        if not _is_internal(final_out):
+            continue
+        found = _walk_to_conv_integer_consumer(
+            final_out,
+            initializer_map,
+            consumers_of,
+            producers_of,
+            graph_outputs,
+            m.N,
+            _MAX_CHAIN_HOPS,
+        )
+        if found is None:
+            continue
+        consumer, chain_ops = found
+        chains.append(_ConvIntegerChain(m, chain_ops, consumer, m.N))
+    return chains
+
+
+def apply_structured_pruning_dynamic_quantize_conv(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> onnx.ModelProto:
+    """Removes whole output channels from a ``ConvInteger``-based
+    dynamically-quantized Conv layer -- ONNX Runtime's own dynamic-
+    quantization pattern for Conv (``DynamicQuantizeLinear -> ConvInteger ->
+    Cast -> Mul``, plus an optional bias ``Reshape``/``Add``)
+    ``onnxruntime.quantization.quantize_dynamic()`` emits, left completely
+    UNFUSED by a real ``InferenceSession``'s default graph optimization
+    (unlike the analogous ``MatMulInteger`` pattern, which DOES get fused --
+    see this module's own "DynamicQuantizeConv (ConvInteger, ...)" section
+    comment for the full empirical investigation: exact schema facts, the
+    real node sequences reproduced, and why every scope boundary below is
+    drawn where it is).
+
+    For every ``ConvInteger``-based Conv layer (a "producer") whose own
+    logical output feeds, through zero or more shape-preserving unary
+    activations (`_UNARY_PASS_THROUGH`) with no other consumer anywhere
+    along that path, into exactly one downstream ``ConvInteger``-based
+    consumer whose own input-channel count matches: ranks the producer's
+    output channels by L1/L2 norm of their own dequantized weight row, drops
+    the lowest-``sparsity``-fraction of them, and slices the producer's
+    quantized weight (its always-per-tensor `scale`/`zero_point` are left
+    untouched -- see this section's own top comment for why that's a
+    confirmed fact, not a declined possibility) together with the matching
+    input channels of the consumer's own weight. The producer's own PLAIN
+    FLOAT bias (never quantized) is sliced directly, with no rescale step
+    at all.
+
+    Unlike :func:`apply_structured_pruning_dynamic_quantize_matmul`, a
+    plain-float ``Conv`` peer on either side of a chain is never matched --
+    only a same-family ``ConvInteger``-to-``ConvInteger`` chain (see this
+    module's own section comment for why this is a deliberate scope
+    narrowing). No gated (SwiGLU/GeGLU) pair, residual/skip-connection
+    merge, or ``Concat``-merged branch group is matched either -- only the
+    plain single-producer/single-consumer topology above.
+
+    :param model: onnx ModelProto object or file path
+    :param sparsity: fraction of each eligible producer's output channels to
+            drop (rounded, at least one channel is always kept)
+    :param importance_norm: ``"l2"`` (default, Li et al.'s original
+            filter-pruning criterion) or ``"l1"``
+    :returns: the pruned onnx ModelProto
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment): matched and pruned inside a
+    nested ``If``/``Loop``/``Scan``/``BeamSearch``-family subgraph, at any
+    nesting depth, exactly as if that subgraph were its own top-level
+    graph; `producer_touched`/`consumer_touched`/`stale_value_info` are all
+    reset per graph.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+
+    for graph in _iter_subgraphs(out.graph):
+        chains = _find_conv_integer_chains(graph)
+        if not chains:
+            continue
+
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
+        stale_value_info: Set[str] = set()
+
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = p.w_init.name
+            c_key = c.w_init.name
+            if p_key == c_key:
+                continue  # degenerate (the same weight in both roles)
+            if p_key in producer_touched or c_key in consumer_touched:
+                continue  # a shared/tied weight another chain already resized
+
+            n = chain.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                continue  # rounds down to nothing for this layer -- no-op
+
+            w_nk = _conv_integer_dequantized_nk(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            # `kind="stable"` for the identical determinism reason this
+            # module's own established sections use it.
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+            _slice_conv_integer_producer(p, keep)
+            _slice_conv_integer_consumer(c, keep)
+
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
+            stale_value_info.add(p.node.output[0])
+            stale_value_info.add(p.cast_node.output[0])
+            stale_value_info.add(p.rescale_mul_node.output[0])
+            if p.bias_add_node is not None:
+                stale_value_info.add(p.bias_add_node.output[0])
+            stale_value_info.update(op.output[0] for op in chain.chain_ops)
+
+        if stale_value_info:
+            kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+            del graph.value_info[:]
+            graph.value_info.extend(kept)
+
+    return out
+
+
 # --- Embedding / lm_head vocabulary pruning --------------------------------
 #
 # Every other pass in this module changes a graph's *internal* channel/
@@ -39081,6 +39755,139 @@ def _analyze_structured_pruning_dynamic_quantize_matmul(
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
 
+# --- DynamicQuantizeConv (ConvInteger) family -------------------------------
+
+
+def _conv_integer_not_eligible(
+    graph: onnx.GraphProto, chains: List[_ConvIntegerChain]
+) -> List[str]:
+    matched_ids: Set[int] = set()
+    for chain in chains:
+        matched_ids.add(id(chain.producer.node))
+        matched_ids.add(id(chain.consumer.node))
+    not_eligible = []
+    for node in graph.node:
+        if node.op_type != "ConvInteger":
+            continue
+        if id(node) in matched_ids:
+            continue
+        not_eligible.append(f"{node.op_type} '{_node_label(node)}'")
+    return not_eligible
+
+
+def _analyze_structured_pruning_dynamic_quantize_conv(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> PruningSensitivityReport:
+    """Dry-run mirror of
+    :func:`apply_structured_pruning_dynamic_quantize_conv` -- same matching
+    (:func:`_find_conv_integer_chains`), touched-role bookkeeping (a chain
+    sharing a weight -- on either side -- with an earlier one in
+    `_find_conv_integer_chains`'s own return order is reported
+    `would_drop=0`/`margin=None`, exactly the "left completely untouched"
+    outcome the real call gives it too), keep-count, and importance
+    (:func:`_conv_integer_dequantized_nk` + :func:`_qdq_channel_importance`,
+    the exact same helper the real call itself calls, never for the actual
+    rewrite) logic, reused directly, but `model` is never mutated. `family`
+    is always ``"dynamic_quantize_conv"`` -- a single family, mirroring the
+    ``DynamicQuantizeMatMul`` family's own single-family choice (see this
+    module's own "DynamicQuantizeConv (ConvInteger, ...)" section comment
+    for why).
+
+    A degenerate chain naming the exact same weight in both the producer
+    and consumer role gets no report row at all, mirroring
+    :func:`_analyze_structured_pruning_dynamic_quantize_matmul`'s own
+    identical treatment.
+
+    Subgraph-aware (:func:`_iter_subgraphs`, see this module's own
+    "Subgraph recursion" section comment), the dry-run mirror of
+    :func:`apply_structured_pruning_dynamic_quantize_conv`'s own subgraph
+    awareness: `layers`/`not_eligible` are aggregated across every graph,
+    and `producer_touched`/`consumer_touched` are reset per graph.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+
+    layers: List[PruningLayerSensitivity] = []
+    not_eligible: List[str] = []
+
+    for graph in _iter_subgraphs(model.graph):
+        chains = _find_conv_integer_chains(graph)
+        not_eligible.extend(_conv_integer_not_eligible(graph, chains))
+        if not chains:
+            continue
+
+        producer_touched: Set[str] = set()
+        consumer_touched: Set[str] = set()
+
+        for chain in chains:
+            p, c = chain.producer, chain.consumer
+            p_key = p.w_init.name
+            c_key = c.w_init.name
+            if p_key == c_key:
+                continue  # degenerate (the same weight in both roles) -- no report row
+
+            label = _node_label(p.node)
+            family = "dynamic_quantize_conv"
+            n = chain.n_channels
+
+            if p_key in producer_touched or c_key in consumer_touched:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # a shared/tied weight another chain already claimed
+
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # rounds down to nothing for this chain -- no-op
+
+            w_nk = _conv_integer_dequantized_nk(p)
+            importance = _qdq_channel_importance(w_nk, importance_norm)
+            keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[keep] = True
+
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=int(n - keep_count),
+                    margin=_normalized_margin(importance, keep_mask),
+                    importance_min=float(importance.min()),
+                    importance_max=float(importance.max()),
+                )
+            )
+
+            producer_touched.add(p_key)
+            consumer_touched.add(c_key)
+
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
+
+
 # --- Embedding / lm_head vocabulary family ----------------------------------
 #
 # Only :func:`apply_embedding_vocab_magnitude_pruning` gets a `_analyze_*`
@@ -39470,6 +40277,9 @@ _SENSITIVITY_ANALYZERS: Dict[
     apply_structured_pruning_dynamic_quantize_matmul: (
         _analyze_structured_pruning_dynamic_quantize_matmul
     ),
+    apply_structured_pruning_dynamic_quantize_conv: (
+        _analyze_structured_pruning_dynamic_quantize_conv
+    ),
     apply_attention_head_pruning: _analyze_attention_head_pruning,
     apply_attention_head_wanda_pruning: _analyze_attention_head_wanda_pruning,
     apply_moe_expert_channel_pruning: _analyze_moe_expert_channel_pruning,
@@ -39499,7 +40309,7 @@ def analyze_pruning_sensitivity(
     measurement this module already had (actual zero-fraction of an
     already-pruned model); this is the *before* half that was missing.
 
-    `apply_fn` must be one of the nineteen functions this module itself
+    `apply_fn` must be one of the twenty functions this module itself
     exports: :func:`apply_magnitude_pruning`, :func:`apply_wanda_pruning`,
     :func:`apply_structured_pruning`, :func:`apply_structured_wanda_pruning`,
     :func:`apply_structured_pruning_qdq`,
@@ -39509,6 +40319,7 @@ def analyze_pruning_sensitivity(
     :func:`apply_structured_pruning_matmul_block_quantized_fp8`,
     :func:`apply_structured_pruning_matmul_block_quantized_fp4`,
     :func:`apply_structured_pruning_dynamic_quantize_matmul`,
+    :func:`apply_structured_pruning_dynamic_quantize_conv`,
     :func:`apply_attention_head_pruning`,
     :func:`apply_attention_head_wanda_pruning`,
     :func:`apply_moe_expert_channel_pruning`,
@@ -39526,7 +40337,7 @@ def analyze_pruning_sensitivity(
     same way the mutating call itself would compute them, up to (but never
     actually calling) the final slice/zero/delete step. :func:`apply_sparsegpt_pruning`
     is not supported, and neither is :func:`apply_embedding_vocab_pruning`
-    (a `ValueError` naming the nineteen functions that are supported); nor is
+    (a `ValueError` naming the twenty functions that are supported); nor is
     `apply_structured_pruning`/`apply_structured_wanda_pruning`'s own
     `global_sparsity=True` mode or a model containing any `Concat`-merged
     skip-connection chain or fused-`gate_up_proj` split-gated FFN chain
