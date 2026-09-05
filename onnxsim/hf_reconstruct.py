@@ -52,30 +52,44 @@ not dynamic axes, and there is no KV-cache-aware incremental-decode graph
 here -- a single-shape prefill-style forward pass only.
 
 Precision note, confirmed for real against `Qwen/Qwen3-0.6B` (stored as
-BF16 end to end, ~1.5GB): every non-FLOAT32-dtype weight gets an explicit
-``Cast`` to FLOAT32 in the graph, right after being declared (see
-``declare()``). This was tried two ways, in order:
+BF16 end to end, ~1.5GB) and `HuggingFaceTB/SmolLM2-135M` (BF16, real
+30-layer/49152-vocab checkpoint): **BF16 weights are upcast to FLOAT32 in
+the stored initializer bytes themselves**, not via a graph-level ``Cast``
+node. This went through three iterations, in order, each ruled out by a
+real, confirmed failure -- not a style preference:
 
-1. Upcast the *stored initializer bytes* themselves (BF16 -> FLOAT32) on
-   read, keeping every op's input already FLOAT32 with no extra node. This
-   is what GGUF's own raw-dtype path does *not* need, but was tried here
-   first for symmetry with it -- and confirmed necessary regardless: the
-   op-building helpers reused from ``gguf_reconstruct`` (``_rmsnorm``,
-   ``_apply_rope``, the causal mask/``inv_sqrt_d`` constants, ...) build
-   every constant as FLOAT32, so a *preserved*-BF16 weight reaching one of
-   those ops is a mixed-dtype node onnxruntime rejects outright (``Type
-   Error: ... (Add) bound to different types (tensor(bfloat16) and
-   tensor(float))``).
+1. Upcast the *stored initializer bytes* (BF16 -> FLOAT32) on read, no
+   extra graph node. Necessary at all: the op-building helpers reused from
+   ``gguf_reconstruct`` (``_rmsnorm``, ``_apply_rope``, the causal
+   mask/``inv_sqrt_d`` constants, ...) build every constant as FLOAT32, so
+   a *preserved*-BF16 weight reaching one of those ops is a mixed-dtype
+   node onnxruntime rejects outright (``Type Error: ... (Add) bound to
+   different types (tensor(bfloat16) and tensor(float))``).
 2. But upcasting the stored bytes roughly doubles the model's total size --
-   confirmed to matter, not just in principle: `Qwen/Qwen3-0.6B`'s real
-   ~1.5GB BF16 checkpoint upcasts to ~3.0GB, over protobuf's ~2.1GB
-   (``2**31 - 1``) single-message serialization limit, and
-   ``onnx.checker.check_model``/``model.SerializeToString()`` failed
-   outright (``EncodeError: Failed to serialize proto``) on the resulting
-   model. So the *initializer* stays the checkpoint's own compact dtype
-   (BF16 stays BF16-sized), and a graph-level ``Cast`` node upcasts the
-   *value* to FLOAT32 at first use instead -- same fix for the mixed-dtype
-   problem, none of the size blowup.
+   confirmed to matter: `Qwen/Qwen3-0.6B`'s real ~1.5GB BF16 checkpoint
+   upcasts to ~3.0GB, over protobuf's ~2.1GB (``2**31 - 1``)
+   single-message serialization limit, and ``onnx.checker.check_model``/
+   ``model.SerializeToString()`` failed outright (``EncodeError: Failed to
+   serialize proto``). So this was switched to keeping the initializer at
+   the checkpoint's own compact BF16 size and inserting a graph-level
+   ``Cast`` node to FLOAT32 at first use instead -- same fix for the
+   mixed-dtype problem, none of the size blowup.
+3. **That Cast-node approach was never actually exercised against a real
+   `pulsar2 build` until `build_from_hf_checkpoint()` existed to do so --
+   and it turns out to be fundamentally broken there, at any size**:
+   confirmed by isolating a bare ``Cast<to=FLOAT>`` on a BFLOAT16
+   initializer down to a standalone 4-element graph -- a real
+   `pulsar2 build` still crashes during its own frontend constant-folding
+   pass (``Exception: op name: ..., Cast, pyrun failed.``), regardless of
+   tensor size (bisected 4 through 49152 rows, all fail identically). So
+   the initializer-byte upcast from step 1 is back, accepting the size
+   cost -- confirmed safe in practice for real small/edge-sized checkpoints
+   (`SmolLM2-135M`'s ~269MB BF16 upcasts to ~538MB, well under the
+   protobuf limit); a checkpoint large enough that upcasting alone would
+   still exceed ~2.1GB (there is no longer a smaller alternative -- the
+   Cast-node path is not an option) needs external-data ONNX storage
+   (``onnx.save(..., save_as_external_data=True)``) from the caller, not
+   handled inside this module.
 """
 
 from __future__ import annotations
@@ -110,9 +124,11 @@ _SAFETENSORS_DTYPE_TO_ONNX: Dict[str, Tuple[int, np.dtype]] = {
     "I8": (onnx.TensorProto.INT8, np.dtype("i1")),
     "U8": (onnx.TensorProto.UINT8, np.dtype("u1")),
     "BOOL": (onnx.TensorProto.BOOL, np.dtype("?")),
-    # BF16 has no native numpy dtype and is upcast to FLOAT32 on read
-    # instead (a confirmed-necessary special case, not an oversight) --
-    # see _read_tensor.
+    # BF16 has no native numpy dtype, and (confirmed real, see this
+    # module's docstring) a graph-level Cast from BF16 crashes real
+    # pulsar2 build regardless of tensor size -- so it's upcast to
+    # FLOAT32 directly in the stored bytes on read instead. See
+    # _read_tensor.
 }
 
 _SUPPORTED_MODEL_TYPES = frozenset({"llama", "mistral", "qwen2", "qwen3"})
@@ -186,19 +202,24 @@ def _index_safetensors_checkpoint(hf_dir: str) -> Dict[str, _SafetensorsEntry]:
 
 
 def _read_tensor(entry: _SafetensorsEntry, name: str) -> onnx.TensorProto:
-    """Read one tensor's raw bytes and wrap them as an ONNX initializer,
-    preserving the checkpoint's own dtype (e.g. real BF16 weights stay
-    BF16-sized in the initializer -- see ``declare()``'s own docstring for
-    why the *graph*, not the stored bytes, is where this gets upcast to
-    FLOAT32 for actual computation).
+    """Read one tensor's raw bytes and wrap them as an ONNX initializer.
+
+    BF16 is upcast to FLOAT32 directly in the returned initializer's bytes
+    (not preserved at its native size with a graph-level Cast) -- see this
+    module's docstring for why: a real `pulsar2 build` cannot execute a
+    BF16->FLOAT32 Cast at all, confirmed regardless of tensor size, so
+    there is no smaller alternative left for that consumer. Every other
+    supported dtype keeps its own size (already FLOAT32, or a dtype
+    ``declare()`` casts via a normal graph node that real hardware
+    compiles fine).
     """
     with open(entry.file_path, "rb") as f:
         f.seek(entry.start)
         raw = f.read(entry.end - entry.start)
     if entry.dtype == "BF16":
-        return onnx.helper.make_tensor(
-            name, onnx.TensorProto.BFLOAT16, entry.shape, vals=raw, raw=True
-        )
+        u16 = np.frombuffer(raw, dtype="<u2").reshape(entry.shape)
+        arr = (u16.astype(np.uint32) << 16).view(np.float32)
+        return onnx.numpy_helper.from_array(arr, name=name)
     if entry.dtype not in _SAFETENSORS_DTYPE_TO_ONNX:
         raise UnsupportedArchitectureError(
             f"tensor {name!r} has safetensors dtype {entry.dtype!r}, which "
@@ -273,10 +294,9 @@ def _reconstruct_llama_family_hf(
 
     def declare(name: str) -> str:
         """Declare weight `name` as an initializer and return the name to
-        actually *use* as a graph value -- which is a `Cast`-to-FLOAT32
-        node's output, not the initializer itself, whenever the checkpoint's
-        own dtype isn't already FLOAT32. See this module's docstring for
-        why the cast lives in the graph rather than in the stored bytes.
+        actually *use* as a graph value. BF16 is already upcast to FLOAT32
+        in the initializer itself (see `_read_tensor`); any other
+        non-FLOAT32 dtype instead gets a `Cast`-to-FLOAT32 node here.
         """
         entry = entries.get(name)
         if entry is None:
@@ -285,7 +305,7 @@ def _reconstruct_llama_family_hf(
                 f"model_type={model_type!r}"
             )
         b.initializers.append(_read_tensor(entry, name))
-        if entry.dtype == "F32":
+        if entry.dtype in ("F32", "BF16"):
             return name
         return b.op("Cast", [name], f"{name}.f32", to=onnx.TensorProto.FLOAT)
 

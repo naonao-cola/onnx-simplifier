@@ -583,6 +583,75 @@ two-input quant config Pulsar2 needs (`calibration_format: Numpy` per
 `build_config.proto`), and calls `build()`. See
 `tests/test_pulsar2_hf_to_axmodel.py` for the full working example.
 
+### Confirmed against a real, full-size model: `HuggingFaceTB/SmolLM2-135M`
+
+Everything above was verified against tiny synthetic or near-random-weight
+checkpoints. Compiling a real, genuinely-trained 135M-parameter checkpoint
+(30 layers, GQA, 49152-token vocabulary, real BF16 weights) through this
+same path surfaced a real bug this repo's own BF16 handling had never hit
+before, plus a real accuracy caveat:
+
+- **The `Cast`-in-graph BF16 design was never actually exercised against a
+  real `pulsar2 build` until now, and it's fundamentally broken there,
+  at any size.** `reconstruct_hf_graph()` (confirmed against the real
+  ~1.5GB `Qwen/Qwen3-0.6B` checkpoint, see above) always used a
+  graph-level `Cast` node for BF16 weights specifically to keep the
+  initializer small and avoid protobuf's ~2.1GB serialization limit -- but
+  that Cast node had only ever been run through `onnxruntime`, never a
+  real Pulsar2 compile. Compiling `SmolLM2-135M` for real hit
+  `Exception: op name: model.embed_tokens.weight.f32.1, Cast, pyrun
+  failed.` inside Pulsar2's own frontend constant-folding pass. Isolated
+  to a standalone, minimal repro: a bare `Cast<to=FLOAT>` on a BFLOAT16
+  initializer fails identically at *every* size tested, from a trivial
+  4-element tensor up through the real 49152x576 embedding table --
+  ruling out "too large" and confirming it's simply unimplemented for
+  this dtype pair in Pulsar2's frontend, full stop.
+- **Fixed**: `reconstruct_hf_graph()` now upcasts BF16 weights to FLOAT32
+  directly in the stored initializer bytes (`_read_tensor()`), the same
+  as the *first* approach that Qwen3-0.6B's size had ruled out -- except
+  there is no longer a smaller alternative for real hardware, so the size
+  cost is accepted. Confirmed safe in practice for a real small/edge-sized
+  checkpoint: `SmolLM2-135M`'s ~269MB BF16 checkpoint upcasts to a
+  ~251MB *compiled* `.axmodel` (weights end up INT8-quantized on
+  Pulsar2's own side, well under the protobuf limit regardless).
+  A checkpoint large enough that the FLOAT32 upcast alone would exceed
+  ~2.1GB has no working path through `build_from_hf_checkpoint()` today --
+  that's what `llm_build()` (above) is for.
+- **Compiled successfully**: ~105s wall time (`pulsar2_build` phase; see
+  `BuildResult.phase_timings`), `max_cycle=7,334,676` -- and ran
+  successfully on the real AX650N with a real tokenized prompt.
+- **Real accuracy is bad, and it's a depth-compounding problem, not a
+  calibration problem** -- corrected after actually comparing on-device
+  output against the real FP32 reference (an earlier pass here just
+  eyeballed logit plausibility and wrongly called it fixed). Across 5 real
+  prompts, comparing the compiled model's on-device logits against
+  `onnxruntime` running the same `reconstruct_hf_graph()` output: **0/5
+  top-1 matches, 0/5 top-5 overlap, average cosine similarity ~0.13** --
+  the FP32 reference gets every prompt right (" the" for "The capital of
+  France is", " dog" for "...the lazy", " oxygen" for "hydrogen and", ...,
+  confirming the reconstruction itself is correct), the on-device output
+  is close to random. Two follow-ups ruled out calibration as the cause
+  rather than confirming it: real, representative English-sentence
+  calibration data (32 real sentences, not random token ids) made it
+  *worse* (avg cosine ~0.04), and switching `calibration_method` from
+  `MinMax` to `MSE` made it worse again (~-0.12). **The real cause,
+  isolated by depth**: the identical reconstruction+quantization approach
+  gets 0.999 average cosine similarity and 4/5 top-1 matches on a
+  synthetic **1-layer** checkpoint (`distilabel-internal-testing/
+  tiny-random-mistral`, same pipeline, same code) -- so per-tensor MinMax/
+  MSE INT8 post-training quantization, applied uniformly to every weight
+  and activation with no smoothing or outlier handling, works fine at
+  shallow depth and compounds into essentially-random output somewhere
+  between 1 and 30 sequential transformer layers. This is a well-
+  documented, expected limitation of naive full-network INT8 PTQ on deep
+  transformers in general (it's exactly why techniques like SmoothQuant/
+  AWQ/GPTQ exist), not a bug in `reconstruct_hf_graph()`,
+  `build_from_hf_checkpoint()`, or its calibration data. Getting real
+  accuracy out of a real-depth LLM through this generic ingestion path
+  would need a smarter quantization strategy than what a plain `pulsar2
+  build --config` currently applies -- `llm_build()` (above), Pulsar2's
+  own dedicated LLM path, presumably has one; this generic path doesn't.
+
 ## Real Docker + device conversion driver
 
 `pulsar2_docker.py` and `convert_onnxmodelzoo.py` turn the manual

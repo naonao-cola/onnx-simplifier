@@ -36,7 +36,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _write_tiny_llama_checkpoint(hf_dir):
+def _write_tiny_llama_checkpoint(hf_dir, bf16=False):
     rng = np.random.default_rng(0)
     n_embd, n_head, n_layer, n_ff, vocab = 16, 2, 2, 32, 32
 
@@ -77,14 +77,22 @@ def _write_tiny_llama_checkpoint(hf_dir):
     offset = 0
     blobs = []
     for name, arr in weights.items():
-        nbytes = arr.nbytes
+        if bf16:
+            # truncate to the top 16 bits of each float32 (exact bf16 cast)
+            u16 = (arr.view("<u4") >> 16).astype("<u2")
+            data = u16.tobytes()
+            dtype = "BF16"
+        else:
+            data = arr.tobytes()
+            dtype = "F32"
+        nbytes = len(data)
         header[name] = {
-            "dtype": "F32",
+            "dtype": dtype,
             "shape": list(arr.shape),
             "data_offsets": [offset, offset + nbytes],
         }
         offset += nbytes
-        blobs.append(arr.tobytes())
+        blobs.append(data)
     header_bytes = json.dumps(header).encode("utf-8")
     with open(os.path.join(hf_dir, "model.safetensors"), "wb") as f:
         f.write(struct.pack("<Q", len(header_bytes)))
@@ -132,6 +140,41 @@ def test_hf_checkpoint_reconstructed_onnx_compiles_to_a_real_axmodel(tmp_path):
     op_types = {n.op_type for n in compiled.graph.node}
     assert pulsar2_ops.AXERA_NPU_OP_TYPE in op_types
     assert pulsar2_ops.has_out_of_band_npu_data(compiled)
+
+
+def test_bf16_checkpoint_compiles_to_a_real_axmodel(tmp_path):
+    """Confirmed real, previously-broken case: a bare graph-level Cast from
+    BFLOAT16 to FLOAT32 crashes a real pulsar2 build outright during its
+    own frontend constant-folding pass (confirmed down to a standalone
+    4-element tensor, independent of model size) -- see
+    onnxsim/hf_reconstruct.py's module docstring. reconstruct_hf_graph()
+    now upcasts BF16 weights to FLOAT32 in the stored initializer bytes
+    instead of via a Cast node, specifically so this compiles. Found via a
+    real HuggingFaceTB/SmolLM2-135M (135M params, 30 layers, real BF16
+    checkpoint) build, reproduced here with a small synthetic BF16
+    checkpoint so it doesn't need a real download."""
+    hf_dir = tmp_path / "tiny_llama_bf16"
+    hf_dir.mkdir()
+    _write_tiny_llama_checkpoint(str(hf_dir), bf16=True)
+
+    model = onnxsim.reconstruct_hf_graph(str(hf_dir), batch_size=1, seq_len=8)
+    onnx.checker.check_model(model)
+    # No initializer should be BFLOAT16 -- every weight is upcast to
+    # FLOAT32 in the stored bytes, not via a graph-level Cast.
+    assert not any(
+        init.data_type == onnx.TensorProto.BFLOAT16 for init in model.graph.initializer
+    )
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    result = pulsar2_docker.build_from_hf_checkpoint(
+        str(hf_dir), str(work_dir), "output"
+    )
+
+    assert result.success, result.error
+    assert result.axmodel_path is not None
+    assert os.path.exists(result.axmodel_path)
 
 
 def test_compiled_axmodel_runs_on_real_device_when_available(tmp_path):
