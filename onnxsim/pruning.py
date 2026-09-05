@@ -2910,99 +2910,59 @@ def apply_wanda_pruning(
     :returns: ``model`` with every matched layer's weight zeroed in place
             to the target pattern; a MatMul/Gemm layer with a non-constant
             or non-2-D weight, a Conv layer with a non-4-D weight, or any
-            matched layer whose activation input isn't usable (not a plain
-            2-D tensor for MatMul/Gemm; not a rank-2+ tensor for Attention
+            matched layer whose activation input isn't usable (EXACTLY a
+            2-D tensor for MatMul/Gemm -- a rank-3+ batched/sequence
+            activation is treated as "no activation observed" for this
+            layer, not reduced down to 2-D; a rank-2+ tensor for Attention
             (its own ``X`` input is always rank-3 in practice, reduced over
-            every leading axis); not a 4-D NCHW tensor, or a malformed Conv
-            attribute combination :func:`_conv_spatial_attrs` declines --
-            e.g. a `kernel_shape` disagreeing with the weight's own shape --
-            for Conv; `auto_pad`/non-unit `dilations` are handled, not
-            declined) falls back to plain magnitude pruning (no activation
-            norm was ever observed)
+            every leading axis -- no such rank-2-only restriction here);
+            not a 4-D NCHW tensor, or a malformed Conv attribute combination
+            :func:`_conv_spatial_attrs` declines -- e.g. a `kernel_shape`
+            disagreeing with the weight's own shape -- for Conv;
+            `auto_pad`/non-unit `dilations` are handled, not declined)
+            falls back to plain magnitude pruning (no activation norm was
+            ever observed)
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_wanda_pruning_cpp`
+    (``onnxsim/structured_pruning_entry.cpp``'s own ``ApplyWandaPruning``),
+    forwarding every argument unchanged. The rank-2-only restriction the
+    ``:returns:`` paragraph above describes for MatMul/Gemm (but not
+    Attention) was, for a time, a genuine scope gap between this function
+    and that C++ port -- ``WandaCalibrationStats`` (shared with
+    :func:`apply_structured_wanda_pruning`/
+    :func:`apply_attention_head_wanda_pruning`'s own C++ ports, neither of
+    which has any such restriction in its own Python reference) used to
+    observe a MatMul/Gemm candidate's activation at any rank, not just rank
+    2 -- now closed via that function's own ``require_rank2`` parameter,
+    populated only with this pass' own plain MatMul/Gemm candidates' `x_name`s
+    (never Attention's) -- see ``structured_pruning_entry.h``'s own
+    ``ApplyWandaPruning`` declaration comment for the full writeup, and
+    :func:`_wanda_unstructured_calibration_stats`/:func:`_wanda_norm_for_candidate`/
+    :func:`_wanda_importance` above (kept, unlike this function's own former
+    mutating body, since :func:`_analyze_wanda_pruning`'s dry-run report
+    still reuses them directly) for this rank-2-only restriction's own
+    pure-Python reference. Imported lazily (inside the function body, not at
+    module scope) to avoid a circular import: ``onnxsim.onnx_simplifier``
+    already imports from this module (:class:`EmbeddingPruningResult`), so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
-    _validate_pattern(sparsity, n, m)
-    if global_sparsity and n is not None:
-        raise ValueError(
-            "global_sparsity is not supported together with N:M pruning "
-            "(n/m) -- see apply_wanda_pruning's own docstring"
-        )
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_wanda_pruning_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = _constant_map(graph)
-
-    candidates = _candidates(graph)
-    if not candidates:
-        return out
-
-    act_norm, conv_act_norm, attn_act_norm = _wanda_unstructured_calibration_stats(
-        out, candidates, calibration_data, providers
+    return apply_wanda_pruning_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        sparsity=sparsity,
+        n=n,
+        m=m,
+        epsilon=epsilon,
+        global_sparsity=global_sparsity,
+        providers=providers,
     )
-
-    if global_sparsity:
-        entries = []
-        for node, x_name, w_name, weight_transposed, is_conv in candidates:
-            w_init = initializer_map[w_name]
-            w = _to_f64(w_init)
-            w_nk = _weight_to_nk(w, weight_transposed, is_conv)
-            norm = _wanda_norm_for_candidate(
-                node,
-                x_name,
-                w_name,
-                is_conv,
-                w_init,
-                act_norm,
-                conv_act_norm,
-                attn_act_norm,
-            )
-            importance = _wanda_importance(w_nk, norm, epsilon)
-            entries.append(
-                (w_init, weight_transposed, is_conv, w.shape, w_nk, importance)
-            )
-        _apply_global_unstructured_pruning(entries, sparsity)
-        return out
-
-    for node, x_name, w_name, weight_transposed, is_conv in candidates:
-        w_init = initializer_map[w_name]
-        # `norm` is always kept 2-D here, broadcastable elementwise against
-        # `w_nk` ([out_channels, K]) inside importance_of_nk below: shape
-        # (1, K) for a MatMul/Gemm layer (one shared norm row for every
-        # output channel, the same broadcast the plain
-        # ``norm[np.newaxis, :]`` used to do directly), or -- for Conv --
-        # shape (out_channels, K), already expanded per output filter's own
-        # group by :func:`_conv_group_relative_norm` (trivially identical
-        # across every row when ``group=1``, genuinely different per group
-        # otherwise -- see that function's own docstring for why a single
-        # shared row would be wrong for a grouped/depthwise Conv).
-        norm = _wanda_norm_for_candidate(
-            node,
-            x_name,
-            w_name,
-            is_conv,
-            w_init,
-            act_norm,
-            conv_act_norm,
-            attn_act_norm,
-        )
-
-        def importance_of_nk(w_nk, norm=norm, n=n, m=m, sparsity=sparsity):
-            importance = _wanda_importance(w_nk, norm, epsilon)
-            return (
-                _nm_mask(importance, n, m)
-                if n is not None
-                else _sparsity_mask(importance, sparsity)
-            )
-
-        _prune_weight(w_init, weight_transposed, importance_of_nk, is_conv=is_conv)
-
-    return out
 
 
 def weight_sparsity(model: Union[str, onnx.ModelProto]) -> float:
