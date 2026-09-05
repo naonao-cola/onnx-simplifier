@@ -969,14 +969,15 @@ set would need to be re-derived through `Flatten`'s exact memory layout into
 the Gemm weight's own input columns -- a fundamentally different, harder
 problem than the plain axis slice every hop in this section performs, not a
 bigger version of the same one (see `_CONV_POOL_PASS_THROUGH`'s own comment
-for the precise boundary). The one narrow exception -- a `Flatten(axis=1)`
-whose input is itself `GlobalAveragePool`'s own output, so every trailing
-spatial axis is already collapsed to size 1 and the "flattened layout"
-question has only one possible answer -- *is* handled (see
-:func:`_match_gap_flatten_matmul_consumer`'s own docstring for the
-axis-correspondence proof), precisely because it needs no re-derivation at
-all: a provably trivial 1:1 relabeling, not a harder instance of the general
-case just excluded.
+for the precise boundary). The narrow exceptions -- a `Flatten(axis=1)`, a
+`Reshape` to a constant `[batch, -1]` target, or a chain of `Squeeze` nodes
+squeezing only trailing axes, each reading directly off `GlobalAveragePool`'s
+own output, so every trailing spatial axis is already collapsed to size 1
+and the "flattened layout" question has only one possible answer -- *are*
+handled (see :func:`_match_gap_flatten_matmul_consumer`'s own docstring for
+the axis-correspondence proof), precisely because none of them needs any
+re-derivation at all: a provably trivial 1:1 relabeling, not a harder
+instance of the general case just excluded.
 
 A Conv chain also crosses a mid-chain ``PRelu`` -- the
 ``Conv -> PRelu -> Conv`` shape a real MobileFaceNet/ResNet-style
@@ -3600,21 +3601,26 @@ _MAX_CHAIN_HOPS = 8
 #
 # The classifier-head shape itself *is* reached, but not via this set, and
 # not in general: :func:`_walk_to_conv_consumer` separately recognizes the
-# one narrow case where `Flatten`'s exact memory layout needs no
-# re-derivation at all -- `Flatten(axis=1)` reading *directly* off a matched
-# `GlobalAveragePool`'s own output. `GlobalAveragePool` always collapses
-# every trailing spatial axis to size 1 per channel (confirmed against its
-# own ONNX schema), so such a `Flatten`'s flattened column `j` is provably
-# just channel `j` relabeled, for every `j` -- the "which spatial position"
-# question the paragraph above raises has only one possible answer (the
-# lone remaining index, `0`) once every spatial axis is already size 1, so
-# there is nothing left to re-derive. See
+# few narrow cases where the reshape's exact memory layout needs no
+# re-derivation at all -- a `Flatten(axis=1)`, a `Reshape` to a constant
+# `[batch, -1]` target, or a chain of `Squeeze` nodes squeezing only trailing
+# axes, each reading *directly* off a matched `GlobalAveragePool`'s own
+# output (real `torch.onnx.export`d code commonly emits the latter two in
+# place of an explicit `nn.Flatten()`, via `x.view(x.size(0), -1)` or
+# `x.squeeze(-1).squeeze(-1)`). `GlobalAveragePool` always collapses every
+# trailing spatial axis to size 1 per channel (confirmed against its own
+# ONNX schema), so each such reshape's flattened column `j` is provably just
+# channel `j` relabeled, for every `j` -- the "which spatial position"
+# question the paragraph above raises has only one possible answer (the lone
+# remaining index, `0`) once every spatial axis is already size 1, so there
+# is nothing left to re-derive. See
 # :func:`_match_gap_flatten_matmul_consumer`'s own docstring for the full
-# proof and exactly what's matched (only `axis == 1`, only a `MatMul`/
-# vanilla-`Gemm` consumer immediately after the `Flatten`, only for
-# :func:`_find_conv_chains`'s own plain single-producer/single-consumer
-# chains) -- a narrower, *easier* case than the general one this paragraph
-# excludes, not a wider version of it.
+# proof and exactly what's matched (only `axis == 1` for `Flatten`, only a
+# constant, 2-element `[batch, -1]` target for `Reshape`, only trailing
+# (`>= 2`) axes for `Squeeze`, only a `MatMul`/vanilla-`Gemm` consumer
+# immediately after, only for :func:`_find_conv_chains`'s own plain
+# single-producer/single-consumer chains) -- a narrower, *easier* case than
+# the general one this paragraph excludes, not a wider version of it.
 _CONV_POOL_PASS_THROUGH = {"MaxPool", "AveragePool", "GlobalAveragePool"}
 
 # com.microsoft's fused bias-add + Gelu-family activation nodes -- the FFN
@@ -6813,94 +6819,329 @@ def _match_conv_transpose_consumer(
     return w_name, in_channels, group
 
 
+def _match_flatten_axis1_pass_through(node: onnx.NodeProto, gap_out: str) -> bool:
+    """True iff `node` is a plain, single-output ``Flatten`` with
+    ``axis == 1`` reading only `gap_out` -- the original, narrowest shape
+    :func:`_match_gap_flatten_matmul_consumer` matches. See that function's
+    own docstring for the full axis-correspondence proof this relies on
+    (`GlobalAveragePool`'s ``[N, C, 1, ..., 1]`` output shape makes
+    `Flatten`'s own ``axis == 1`` merge of every trailing axis into one a
+    *trivial* 1:1 channel relabeling, not a real memory-layout
+    re-derivation). Only ``axis == 1`` is ever matched -- a non-default
+    ``axis`` (`Flatten` also gained the ability, at a later opset, to take a
+    negative `axis`; this function funnels every other value, positive or
+    negative, to the same decline) leaves more than one non-batch axis
+    unflattened, or flattens part of the batch axis into the channel one,
+    either of which is the *general*, harder Flatten problem this module's
+    own docstring and `_CONV_POOL_PASS_THROUGH`'s own comment call out as
+    excluded, not this trivial one.
+    """
+    if (
+        node.op_type != "Flatten"
+        or node.domain != ""
+        or list(node.input) != [gap_out]
+        or len(node.output) != 1
+    ):
+        return False
+    axis = 1  # Flatten's own schema-documented default
+    for attr in node.attribute:
+        if attr.name == "axis":
+            axis = attr.i
+    return axis == 1
+
+
+def _match_reshape_batch_neg1_pass_through(
+    node: onnx.NodeProto,
+    gap_out: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    producers_of: Optional[Dict[str, onnx.NodeProto]],
+) -> bool:
+    """True iff `node` is a plain, single-output ``Reshape`` reading
+    `gap_out` as its ``data`` input, whose ``shape`` input is provably a
+    2-element ``[batch, -1]`` target -- the ``x.view(x.size(0), -1))``/
+    ``x.reshape(x.shape[0], -1)`` shape a real ``torch.onnx.export`` emits in
+    place of an explicit ``nn.Flatten()`` after global average pooling.
+    Needs no shape-initializer/constant-input mutation at all when pruned --
+    exactly like :func:`_match_flatten_axis1_pass_through`'s own ``Flatten``
+    case -- because a trailing ``-1`` in a `Reshape`'s own target shape means
+    "infer this dimension from the input's actual (already-pruned) total
+    size", per `Reshape`'s own ONNX schema: it automatically produces the
+    correct post-pruning column count with zero edits, the same trivial-1:1
+    argument :func:`_match_gap_flatten_matmul_consumer`'s own docstring
+    proves for `Flatten`, applied to a *computed* rather than *literal*
+    target shape.
+
+    Two ways the ``shape`` input resolves to a constant ``[batch, -1]``
+    are recognized:
+
+    - The whole `shape` input is itself a constant, 1-D, 2-element
+      ``INT64`` initializer whose last element is ``-1`` -- a static-batch
+      export's own literal target shape.
+    - `shape` is produced by a ``Concat`` with exactly two inputs: an
+      unvalidated first segment (the dynamic batch-size computation a real
+      export emits, typically ``Shape(x) -> Gather(indices=[0]) ->
+      Unsqueeze`` -- not inspected in any detail here, since whatever it
+      computes only ever feeds the *batch* position, never the channel one),
+      and a constant, 1-D, single-element ``INT64`` second segment equal to
+      ``-1``. `producers_of`, when given, resolves `shape`'s own producer
+      node this way; left ``None`` (a caller with no cheap producer map
+      handy), only the first, whole-constant-initializer shape is matched.
+
+    A `Reshape` to any other target -- more than 2 elements, a last element
+    other than ``-1``, or a non-constant/unresolvable `shape` -- is the
+    *general*, harder Reshape problem this module's own docstring calls out
+    as excluded (a literal, non-``-1`` channel count baked into the target
+    shape would need a real edit, not just a pass-through), and is declined
+    here, never guessed at.
+    """
+    if (
+        node.op_type != "Reshape"
+        or node.domain != ""
+        or len(node.input) < 2
+        or node.input[0] != gap_out
+        or len(node.output) != 1
+    ):
+        return False
+    shape_name = node.input[1]
+    shape_init = initializer_map.get(shape_name)
+    if shape_init is not None:
+        if shape_init.data_type != onnx.TensorProto.INT64:
+            return False
+        vals = onnx.numpy_helper.to_array(shape_init).reshape(-1).tolist()
+        return len(vals) == 2 and int(vals[-1]) == -1
+    if producers_of is None:
+        return False
+    concat_node = producers_of.get(shape_name)
+    if (
+        concat_node is None
+        or concat_node.op_type != "Concat"
+        or concat_node.domain != ""
+        or len(concat_node.output) != 1
+        or len(concat_node.input) != 2
+    ):
+        return False
+    tail_init = initializer_map.get(concat_node.input[1])
+    if tail_init is None or tail_init.data_type != onnx.TensorProto.INT64:
+        return False
+    tail_vals = onnx.numpy_helper.to_array(tail_init).reshape(-1).tolist()
+    return len(tail_vals) == 1 and int(tail_vals[0]) == -1
+
+
+def _gap_squeeze_axes(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[List[int]]:
+    """Returns a plain, single-output ``Squeeze`` `node`'s own resolved
+    ``axes`` list -- from the opset>=13 constant second input, or the
+    opset<13 ``axes`` attribute -- or ``None`` if `node` isn't such a
+    ``Squeeze``, or its ``axes`` isn't resolvable this way (including the
+    opset>=13 "no `axes` input at all" shape, which squeezes *every*
+    size-1 dimension and needs full shape knowledge to validate -- declined,
+    never guessed at, same as any other unresolvable case here).
+    """
+    if node.op_type != "Squeeze" or node.domain != "" or len(node.output) != 1:
+        return None
+    if len(node.input) >= 2 and node.input[1]:
+        axes_init = initializer_map.get(node.input[1])
+        if axes_init is None or axes_init.data_type != onnx.TensorProto.INT64:
+            return None
+        return [
+            int(v) for v in onnx.numpy_helper.to_array(axes_init).reshape(-1).tolist()
+        ]
+    for attr in node.attribute:
+        if attr.name == "axes":
+            return list(attr.ints)
+    return None
+
+
+def _squeeze_axis_is_trailing_spatial(axis: int, n_channels: int) -> bool:
+    """True iff `axis` (one entry of a mid-chain ``Squeeze``'s own resolved
+    `axes`, see :func:`_gap_squeeze_axes`) is confirmed to select one of
+    `GlobalAveragePool`'s own guaranteed-size-1 TRAILING axes (index ``>= 2``
+    in the ``[N, C, ...]`` layout) -- never the batch (``0``) or channel
+    (``1``) axis. A non-negative `axis` is checked directly, no rank needed:
+    ``axis >= 2``. A negative `axis` is accepted only for the single
+    unambiguous case ``axis == -1`` -- ONNX's own "counts from the end"
+    convention means this always addresses whatever the CURRENT last axis
+    is, which, starting from `GlobalAveragePool`'s own ``[N, C, 1, ..., 1]``
+    output (at least one trailing size-1 axis by construction) and walking
+    through zero or more already-accepted ``axis == -1`` hops before this
+    one, can only ever be one of those guaranteed-size-1 trailing axes --
+    UNLESS every one of them has *already* been squeezed away, leaving
+    ``[N, C]``, whose own last axis (index 1) is the channel one. Reaching
+    *that* would require this `Squeeze`'s target dim to have static size
+    exactly ``1`` (ONNX's own `Squeeze` schema requirement), which is ruled
+    out here by requiring `n_channels != 1` -- a classifier head's channel
+    count feeding a MatMul/Gemm is never `1` in any model this section has
+    been verified against, so a valid graph could never have a real
+    ``axis == -1`` squeeze legally reach the channel axis this way; ruling
+    out reaching the channel axis this way in turn rules out ever reaching
+    the batch axis (index 0) too, since that would need the channel axis
+    gone first. Any other negative axis (``-2`` and beyond) would need the
+    tensor's own rank to resolve unambiguously and is declined here, never
+    guessed at -- mirroring :func:`_axis_resolves_to_last`'s identical
+    "decline rather than guess" bar for an unknown rank.
+    """
+    if axis >= 0:
+        return axis >= 2
+    return axis == -1 and n_channels != 1
+
+
 def _match_gap_flatten_matmul_consumer(
     gap_out: str,
     consumers_of: Dict[str, List[onnx.NodeProto]],
     initializer_map: Dict[str, onnx.TensorProto],
     graph_outputs: Set[str],
     n_channels: int,
-) -> Optional[Tuple[onnx.NodeProto, onnx.NodeProto, str, bool]]:
-    """The narrowly-scoped ``GlobalAveragePool -> Flatten(axis=1) ->
-    {MatMul, vanilla Gemm}`` consumer match -- deliberately *not* the general
-    ``Flatten`` case this module's own docstring and `_CONV_POOL_PASS_THROUGH`'s
-    own comment call out as excluded (a `Flatten` after real, un-pooled
-    spatial extent, where a flattened column mixes *multiple* channels'
-    values together with no single channel to attribute it to). This one is
-    provably a *trivial* 1:1 relabeling instead, verified against both ops'
-    own ONNX schemas, not assumed:
+    producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], onnx.NodeProto, str, bool]]:
+    """The narrowly-scoped ``GlobalAveragePool -> {Flatten(axis=1), Reshape
+    to [batch, -1], Squeeze-of-trailing-axes} -> {MatMul, vanilla Gemm}``
+    consumer match -- deliberately *not* the general ``Flatten``/``Reshape``
+    case this module's own docstring and `_CONV_POOL_PASS_THROUGH`'s own
+    comment call out as excluded (a reshape after real, un-pooled spatial
+    extent, where a flattened/reshaped column mixes *multiple* channels'
+    values together with no single channel to attribute it to, or a target
+    shape that bakes in a literal, non-``-1`` channel count needing a real
+    re-derivation). Every shape matched here is instead provably a *trivial*
+    1:1 relabeling, verified against each op's own ONNX schema, not assumed:
 
     `GlobalAveragePool`'s own schema (``onnx.defs.get_schema
     ("GlobalAveragePool")``) takes a single input and reduces *every*
     trailing spatial axis to size 1, per channel, independently -- so
     `gap_out` (always `GlobalAveragePool`'s own output tensor here) has
     shape ``[N, C, 1, ..., 1]`` (one or more trailing size-1 axes; batch `N`
-    and channel `C` unchanged from its input). `Flatten`'s own schema
-    (``onnx.defs.get_schema("Flatten")``) reshapes an input of shape
-    ``[d_0, d_1, ..., d_n]``, given ``axis`` (default ``1``, the only value
-    this function ever matches -- see below), to
-    ``[d_0 * ... * d_{axis-1}, d_axis * ... * d_n]``: with ``axis == 1``,
-    axis 0 (batch) stays a separate, untouched axis, and *every* later axis
-    is merged, in row-major order, into one. Applied to
-    ``gap_out``'s own ``[N, C, 1, ..., 1]`` shape, that merged axis has size
-    ``C * 1 * ... * 1 == C``, and its row-major flattened index for source
-    position ``(c, 0, ..., 0)`` (every trailing index can only ever be ``0``
-    -- a size-1 axis has exactly one valid index) is
-    ``c * (1 * ... * 1) + 0 * (...) + ... + 0 == c``: every later term's own
-    stride multiplies a fixed ``0``, contributing nothing, regardless of how
-    many trailing spatial axes there are (including zero, the degenerate
-    rank-2 ``[N, C]`` case). So flattened column ``j`` of `Flatten`'s own
-    2-D output is *exactly* channel ``j`` of `gap_out`, for every ``j`` --
-    not an approximation, and not dependent on `n_channels`'s own value --
-    which is exactly what lets the matched consumer's weight be sliced by
-    the *same* channel-index ``keep`` set already used for `gap_out`'s own
-    producer chain, with no re-derivation through any memory layout needed
-    at all (unlike the general ``Flatten`` case).
+    and channel `C` unchanged from its input). Three single-consumer shapes
+    reading `gap_out` directly are tried, in order, each producing a 2-D
+    ``[N, C]`` tensor whose column ``j`` is *exactly* channel ``j`` of
+    `gap_out`, for every ``j`` -- not an approximation, and not dependent on
+    `n_channels`'s own value:
 
-    Only ``axis == 1`` is ever matched -- a non-default ``axis`` (`Flatten`
-    also gained the ability, at a later opset, to take a negative `axis`;
-    this function funnels every other value, positive or negative, to the
-    same decline) leaves more than one non-batch axis unflattened, or
-    flattens part of the batch axis into the channel one, either of which is
-    the *general*, harder Flatten problem this function's own callers still
-    exclude, not this trivial one. Returns
-    ``(flatten_node, matmul_node, weight_name, weight_transposed)`` --
-    :func:`_match_matmul_like`'s own return shape, with the ``Flatten`` node
-    prepended -- or ``None`` if `gap_out` doesn't have exactly one consumer,
-    that consumer isn't a plain, single-output ``Flatten`` with
-    ``axis == 1`` reading only `gap_out`, its own single output doesn't feed
-    exactly one MatMul/vanilla-Gemm-family consumer (see
-    :func:`_match_matmul_like`), or that consumer's own weight isn't a
-    constant, 2-D, supported-float-dtype tensor whose reduction dimension
-    equals `n_channels`.
+    - :func:`_match_flatten_axis1_pass_through` -- a plain
+      ``Flatten(axis=1)``; see that function's own docstring for the
+      row-major flattened-index proof.
+    - :func:`_match_reshape_batch_neg1_pass_through` -- a ``Reshape`` to a
+      constant, 2-element ``[batch, -1]`` target shape; see that function's
+      own docstring for the two ways the target shape is recognized as
+      constant.
+    - A chain of one or more ``Squeeze`` nodes, each squeezing only
+      TRAILING axes (:func:`_squeeze_axis_is_trailing_spatial`) -- the
+      ``x.squeeze(-1).squeeze(-1)`` shape a real export emits at least as
+      often as an explicit ``nn.Flatten()``. Squeeze changes rank/shape
+      metadata only, never touches which value corresponds to which
+      channel, so this needs no data mutation either, exactly like the
+      other two shapes.
+
+    Whichever shape matches, its own final 2-D output is what lets the
+    matched consumer's weight be sliced by the *same* channel-index ``keep``
+    set already used for `gap_out`'s own producer chain, with no
+    re-derivation through any memory layout needed at all. Returns
+    ``(reshape_chain, matmul_node, weight_name, weight_transposed)`` --
+    :func:`_match_matmul_like`'s own return shape, with the one-or-more
+    matched reshape/squeeze nodes prepended as a tuple (in walk order; a
+    single-element tuple for the ``Flatten``/``Reshape`` cases, one-or-more
+    for the ``Squeeze`` case) -- or ``None`` if `gap_out` doesn't have
+    exactly one consumer, none of the three shapes above matches starting
+    there, the final 2-D tensor doesn't have exactly one consumer or is
+    itself a graph output, that consumer isn't a MatMul/vanilla-Gemm-family
+    node reading it (see :func:`_match_matmul_like`), or that consumer's own
+    weight isn't a constant, 2-D, supported-float-dtype tensor whose
+    reduction dimension equals `n_channels`.
+
+    `producers_of`, when given, is threaded straight through to
+    :func:`_match_reshape_batch_neg1_pass_through` to resolve a
+    ``Concat``-produced ``Reshape`` shape; left ``None``, only that
+    function's whole-constant-initializer shape is matched (never a
+    hard failure -- simply a narrower match, exactly as if the
+    ``Concat``-produced case didn't exist).
     """
     if gap_out in graph_outputs:
         return None
     gap_consumers = consumers_of.get(gap_out, [])
-    if len(gap_consumers) != 1:
+    first: onnx.NodeProto
+    if len(gap_consumers) == 1:
+        first = gap_consumers[0]
+    elif len(gap_consumers) == 2:
+        # The `x.view(x.size(0), -1)`/`x.reshape(x.shape[0], -1)` shape's
+        # own root tensor is read TWICE -- once by the `Reshape` that
+        # actually consumes it as data, once by a `Shape` node feeding the
+        # dynamic batch-size computation (see
+        # :func:`_match_reshape_batch_neg1_pass_through`'s own docstring) --
+        # the identical "root tensor read twice by design" shape this
+        # module's own decomposed-GroupNorm/LayerNorm/RMSNorm hops already
+        # special-case (see e.g. :func:`_match_decomposed_group_norm_pass_through`'s
+        # own docstring). Declined unless *exactly* one of the two readers is
+        # a ``Reshape`` and the other is a plain ``Shape`` -- any other pair
+        # (in particular, two ``Reshape``s, or a ``Shape`` paired with
+        # anything but a ``Reshape``) is a shape this function doesn't
+        # attempt, not guessed at. The ``Shape`` node itself is never
+        # inspected further (not even confirmed to actually feed this
+        # ``Reshape``'s own shape input) -- exactly the "don't validate the
+        # batch computation in detail" bar
+        # :func:`_match_reshape_batch_neg1_pass_through`'s own docstring
+        # already sets, since the safety proof rests entirely on the
+        # ``Reshape``'s own resolved target shape, independent of where the
+        # ``Shape`` node's output goes; it also needs no `chain_ops` entry of
+        # its own -- it sits on a shape-only side branch, never on the main
+        # data path this function's own `reshape_chain` return tracks.
+        reshape_candidates = [c for c in gap_consumers if c.op_type == "Reshape"]
+        shape_candidates = [
+            c for c in gap_consumers if c.op_type == "Shape" and c.domain == ""
+        ]
+        if len(reshape_candidates) != 1 or len(shape_candidates) != 1:
+            return None
+        first = reshape_candidates[0]
+    else:
         return None
-    flatten = gap_consumers[0]
-    if (
-        flatten.op_type != "Flatten"
-        or flatten.domain != ""
-        or list(flatten.input) != [gap_out]
-        or len(flatten.output) != 1
+
+    reshape_chain: Tuple[onnx.NodeProto, ...]
+    final_out: str
+
+    if _match_flatten_axis1_pass_through(first, gap_out):
+        reshape_chain = (first,)
+        final_out = first.output[0]
+    elif _match_reshape_batch_neg1_pass_through(
+        first, gap_out, initializer_map, producers_of
     ):
+        reshape_chain = (first,)
+        final_out = first.output[0]
+    else:
+        squeeze_chain: List[onnx.NodeProto] = []
+        cand: Optional[onnx.NodeProto] = first
+        cur = gap_out
+        while cand is not None:
+            if (
+                cand.op_type != "Squeeze"
+                or cand.domain != ""
+                or not cand.input
+                or cand.input[0] != cur
+                or len(cand.output) != 1
+            ):
+                break
+            axes = _gap_squeeze_axes(cand, initializer_map)
+            if not axes or not all(
+                _squeeze_axis_is_trailing_spatial(a, n_channels) for a in axes
+            ):
+                break
+            out2 = cand.output[0]
+            if out2 in graph_outputs:
+                break
+            squeeze_chain.append(cand)
+            cur = out2
+            next_consumers = consumers_of.get(cur, [])
+            cand = next_consumers[0] if len(next_consumers) == 1 else None
+        if not squeeze_chain:
+            return None
+        reshape_chain = tuple(squeeze_chain)
+        final_out = cur
+
+    if final_out in graph_outputs:
         return None
-    axis = 1  # Flatten's own schema-documented default
-    for attr in flatten.attribute:
-        if attr.name == "axis":
-            axis = attr.i
-    if axis != 1:
+    final_consumers = consumers_of.get(final_out, [])
+    if len(final_consumers) != 1:
         return None
-    flatten_out = flatten.output[0]
-    if flatten_out in graph_outputs:
-        return None
-    flatten_consumers = consumers_of.get(flatten_out, [])
-    if len(flatten_consumers) != 1:
-        return None
-    mm_node = flatten_consumers[0]
+    mm_node = final_consumers[0]
     cm = _match_matmul_like(mm_node)
-    if cm is None or cm[0] != flatten_out:
+    if cm is None or cm[0] != final_out:
         return None
     _, weight_name, weight_transposed = cm
     w_init = initializer_map.get(weight_name)
@@ -6913,7 +7154,7 @@ def _match_gap_flatten_matmul_consumer(
     k = w_init.dims[1] if weight_transposed else w_init.dims[0]
     if k != n_channels:
         return None
-    return flatten, mm_node, weight_name, weight_transposed
+    return reshape_chain, mm_node, weight_name, weight_transposed
 
 
 def _match_depthwise_conv_pass_through(
@@ -7930,6 +8171,7 @@ def _walk_to_conv_consumer(
     recognize_group_norm: bool = False,
     recognize_decomposed_group_norm: bool = False,
     recognize_gap_flatten_matmul_consumer: bool = False,
+    producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
 ) -> Tuple[
     Optional[Tuple[onnx.NodeProto, str, int, bool]],
     Tuple[Tuple[onnx.NodeProto, None], ...],
@@ -8079,27 +8321,36 @@ def _walk_to_conv_consumer(
     `_CONV_POOL_PASS_THROUGH` membership check as any other pooling hop) is
     additionally checked, *before* it is folded into `chain_ops` the
     ordinary pass-through way, for the narrowly-scoped
-    ``-> Flatten(axis=1) -> {MatMul, vanilla Gemm}`` shape :func:`_match_gap_flatten_matmul_consumer`
+    ``-> {Flatten(axis=1), Reshape to [batch, -1], Squeeze-of-trailing-axes}
+    -> {MatMul, vanilla Gemm}`` shape :func:`_match_gap_flatten_matmul_consumer`
     describes (its own docstring has the full axis-correspondence proof,
-    verified against both ops' own ONNX schemas). A match ends the walk
-    there, with both the `GlobalAveragePool` and the `Flatten` folded into
-    `chain_ops` (`Flatten`, like `GlobalAveragePool`, needs no weight of its
-    own sliced -- it is a trivial 1:1 relabeling here, never a real
+    verified against each op's own ONNX schema). A match ends the walk
+    there, with the `GlobalAveragePool` and every matched reshape/squeeze
+    node folded into `chain_ops` (none of them needs a weight of its own
+    sliced -- each is a trivial 1:1 relabeling here, never a real
     memory-layout re-derivation), and the matched MatMul/Gemm returned as
     this walk's own 6th value (`_ConsumerMatch`-shaped: ``(node, weight,
     weight_transposed)``, mirroring :func:`_walk_to_consumer`'s own
     consumer shape rather than this function's ordinary ``(node, weight,
     group, is_conv_transpose)`` Conv-consumer shape, since a MatMul/Gemm
     consumer has no `group`/`is_conv_transpose` concept at all) -- always
-    ``None`` when this parameter is left at its default, or whenever this
-    exact shape isn't found (the walk then falls through to the ordinary,
+    ``None`` when this parameter is left at its default, or whenever none of
+    the three shapes is found (the walk then falls through to the ordinary,
     unconditional pooling-hop handling below, exactly as if this parameter
     didn't exist -- a `GlobalAveragePool` feeding anything else, including a
-    plain `Flatten` with no recognized consumer after it, or another
-    Conv-chain consumer directly, is handled completely unchanged). Mutually
-    exclusive with the ordinary Conv/``ConvTranspose`` `consumer` return
-    value -- at most one of the two is ever set, since the walk always
-    terminates (`break`s or runs out of hops) the moment either is decided.
+    plain `Flatten`/`Reshape`/`Squeeze` with no recognized consumer after it,
+    or another Conv-chain consumer directly, is handled completely
+    unchanged). Mutually exclusive with the ordinary Conv/``ConvTranspose``
+    `consumer` return value -- at most one of the two is ever set, since the
+    walk always terminates (`break`s or runs out of hops) the moment either
+    is decided.
+
+    `producers_of`, when given, is threaded straight through to
+    :func:`_match_gap_flatten_matmul_consumer` (only used when
+    `recognize_gap_flatten_matmul_consumer` is set) to resolve a
+    ``Concat``-produced ``Reshape`` shape's own producer node; left
+    ``None``, only that function's whole-constant-initializer ``Reshape``
+    shape is matched, same as if this parameter didn't exist.
     """
     chain_ops: List[Tuple[onnx.NodeProto, None]] = []
     conv_pass_through: List[_ConvPassThrough] = []
@@ -8354,23 +8605,29 @@ def _walk_to_conv_consumer(
             and len(nxt.output) == 1
         ):
             gap_flatten_match = _match_gap_flatten_matmul_consumer(
-                nxt.output[0], consumers_of, initializer_map, graph_outputs, n_channels
+                nxt.output[0],
+                consumers_of,
+                initializer_map,
+                graph_outputs,
+                n_channels,
+                producers_of,
             )
             if gap_flatten_match is not None:
-                flatten_node, mm_node, mm_weight, mm_weight_transposed = (
+                reshape_nodes, mm_node, mm_weight, mm_weight_transposed = (
                     gap_flatten_match
                 )
                 chain_ops.append((nxt, None))
-                chain_ops.append((flatten_node, None))
+                for reshape_node in reshape_nodes:
+                    chain_ops.append((reshape_node, None))
                 matmul_consumer = (mm_node, mm_weight, mm_weight_transposed)
                 break
-            # No `Flatten(axis=1) -> {MatMul, vanilla Gemm}` right after this
-            # `GlobalAveragePool` -- fall through to the ordinary,
-            # unconditional pooling pass-through handling just below,
-            # exactly as if this whole check didn't exist (this
-            # `GlobalAveragePool` may still be a plain hop feeding another
-            # Conv-chain consumer directly, its only recognized role before
-            # this narrower case existed).
+            # No recognized Flatten(axis=1)/Reshape([batch,-1])/Squeeze ->
+            # {MatMul, vanilla Gemm} right after this `GlobalAveragePool` --
+            # fall through to the ordinary, unconditional pooling
+            # pass-through handling just below, exactly as if this whole
+            # check didn't exist (this `GlobalAveragePool` may still be a
+            # plain hop feeding another Conv-chain consumer directly, its
+            # only recognized role before this narrower case existed).
 
         if not (
             (
@@ -8401,6 +8658,12 @@ def _walk_to_conv_consumer(
 def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
     initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
+    # Only needed by the `GlobalAveragePool -> Reshape([batch, -1])` shape's
+    # own `Concat`-produced-shape recognition (see
+    # :func:`_match_reshape_batch_neg1_pass_through`'s own docstring); built
+    # unconditionally since it's cheap and every chain here passes
+    # `recognize_gap_flatten_matmul_consumer=True` anyway.
+    producers_of = _producers_of(graph)
     graph_outputs = {o.name for o in graph.output}
 
     chains = []
@@ -8457,12 +8720,14 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             recognize_group_norm=True,
             recognize_decomposed_group_norm=True,
             recognize_gap_flatten_matmul_consumer=True,
+            producers_of=producers_of,
         )
         if consumer is None and matmul_consumer is None:
             continue
 
         if matmul_consumer is not None:
-            # `GlobalAveragePool -> Flatten(axis=1) -> {MatMul, vanilla
+            # `GlobalAveragePool -> {Flatten(axis=1), Reshape to
+            # [batch, -1], Squeeze-of-trailing-axes} -> {MatMul, vanilla
             # Gemm}` -- see :func:`_match_gap_flatten_matmul_consumer`'s own
             # docstring for the axis-correspondence proof this relies on.
             # Mutually exclusive with `consumer` (the walk always terminates
@@ -15601,6 +15866,7 @@ def _walk_to_consumer_qdq(
     n_channels: int,
     max_hops: int,
     value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+    producers_of: Optional[Dict[str, onnx.NodeProto]] = None,
 ) -> Optional[Tuple[_QDQConsumer, Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]]:
     """From tensor `start`, walks forward through shape-preserving unary
     activations (`_UNARY_PASS_THROUGH`), and -- MatMul/Gemm family only
@@ -15642,8 +15908,9 @@ def _walk_to_consumer_qdq(
     the unambiguous ``axis == -1`` case of that hop is still recognized.
 
     Within the `is_conv` family only, a `GlobalAveragePool` node hit mid-walk
-    is additionally checked for the ``-> Flatten(axis=1) -> {MatMul, vanilla
-    Gemm}`` classifier-head shape :func:`_match_gap_flatten_matmul_consumer`
+    is additionally checked for the ``-> {Flatten(axis=1), Reshape to
+    [batch, -1], Squeeze-of-trailing-axes} -> {MatMul, vanilla Gemm}``
+    classifier-head shape :func:`_match_gap_flatten_matmul_consumer`
     describes -- mirroring the plain-float Conv chain's own
     `recognize_gap_flatten_matmul_consumer` hop (see
     :func:`_walk_to_conv_consumer`'s own docstring), reused verbatim here
@@ -15653,7 +15920,10 @@ def _walk_to_consumer_qdq(
     Conv/ConvTranspose-vs-MatMul/Gemm concept of its own beyond that. Never
     tried in the MatMul/Gemm (`not is_conv`) family -- `GlobalAveragePool`
     itself requires a Conv-shaped 4-D producer upstream, so there is no
-    equivalent shape to recognize there at all.
+    equivalent shape to recognize there at all. `producers_of`, when given,
+    is threaded straight through to :func:`_match_gap_flatten_matmul_consumer`
+    to resolve a ``Concat``-produced ``Reshape`` shape; left ``None``, only
+    that function's whole-constant-initializer ``Reshape`` shape is matched.
     """
     chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
     cur = start
@@ -15739,22 +16009,25 @@ def _walk_to_consumer_qdq(
                     initializer_map,
                     graph_outputs,
                     n_channels,
+                    producers_of,
                 )
                 if gap_flatten_match is not None:
-                    flatten_node, mm_node, mm_weight, mm_weight_transposed = (
+                    reshape_nodes, mm_node, mm_weight, mm_weight_transposed = (
                         gap_flatten_match
                     )
                     mm_ref = _WeightRef(float_init=initializer_map[mm_weight])
                     chain_ops.append((nxt, None))
-                    chain_ops.append((flatten_node, None))
+                    for reshape_node in reshape_nodes:
+                        chain_ops.append((reshape_node, None))
                     return (
                         _QDQConsumer(mm_node, mm_ref, mm_weight_transposed, False),
                         tuple(chain_ops),
                     )
-                # No recognized Flatten(axis=1) -> {MatMul, vanilla Gemm}
-                # right after this GlobalAveragePool -- falls through to the
-                # ordinary handling below, exactly as if this check didn't
-                # exist (declines, since GlobalAveragePool isn't itself a
+                # No recognized Flatten(axis=1)/Reshape([batch,-1])/Squeeze
+                # -> {MatMul, vanilla Gemm} right after this
+                # GlobalAveragePool -- falls through to the ordinary
+                # handling below, exactly as if this check didn't exist
+                # (declines, since GlobalAveragePool isn't itself a
                 # recognized unary/norm hop for this walker).
         else:
             mm = _match_matmul_qdq(nxt, initializer_map, dq_of, consumers_of)
@@ -15867,6 +16140,10 @@ def _find_qdq_chains(
     """
     initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
+    # Only needed by the GAP hop's own `Concat`-produced-``Reshape``-shape
+    # recognition (see :func:`_match_reshape_batch_neg1_pass_through`'s own
+    # docstring) -- cheap to build unconditionally.
+    producers_of = _producers_of(graph)
     dq_of = {
         n.output[0]: n
         for n in graph.node
@@ -15916,6 +16193,7 @@ def _find_qdq_chains(
             out_channels,
             _MAX_CHAIN_HOPS,
             value_info_by_name,
+            producers_of,
         )
         if found is None:
             continue
@@ -16235,9 +16513,10 @@ def apply_structured_pruning_qdq(
     precedent.
 
     One narrow exception on the Conv/``ConvTranspose`` producer side: a
-    producer whose logical output feeds ``GlobalAveragePool ->
-    Flatten(axis=1) -> {MatMul, vanilla Gemm}`` directly (the canonical
-    classifier head this shape's own docstring,
+    producer whose logical output feeds ``GlobalAveragePool -> {Flatten
+    (axis=1), Reshape to [batch, -1], Squeeze-of-trailing-axes} -> {MatMul,
+    vanilla Gemm}`` directly (the canonical classifier head this shape's own
+    docstring,
     :func:`_match_gap_flatten_matmul_consumer`, proves is a trivial 1:1
     channel relabeling) is also matched even though that consumer is never
     itself QDQ-quantized -- mirroring the plain-float Conv chain's own
@@ -35231,8 +35510,9 @@ class _ConvIntegerChain:
     # Exactly one of `consumer`/`matmul_consumer` is ever set. `consumer` is
     # the ordinary same-family (`ConvInteger`-based) consumer role; a
     # non-``None`` `matmul_consumer` instead means the walk terminated at the
-    # narrowly-scoped ``GlobalAveragePool -> Flatten(axis=1) -> {MatMul,
-    # vanilla Gemm}`` classifier-head shape (see
+    # narrowly-scoped ``GlobalAveragePool -> {Flatten(axis=1), Reshape to
+    # [batch, -1], Squeeze-of-trailing-axes} -> {MatMul, vanilla Gemm}``
+    # classifier-head shape (see
     # :func:`_match_gap_flatten_matmul_consumer`'s own docstring and this
     # module's plain-float :func:`_walk_to_conv_consumer`'s identical
     # `recognize_gap_flatten_matmul_consumer` hop, which this one mirrors) --
@@ -35291,20 +35571,25 @@ def _walk_to_conv_integer_consumer(
     the plain-float Conv chain walk's own `recognize_gap_flatten_matmul_consumer`
     hop (see :func:`_walk_to_conv_consumer`'s own docstring) -- a
     `GlobalAveragePool` node hit mid-walk is additionally checked for the
-    ``-> Flatten(axis=1) -> {MatMul, vanilla Gemm}`` shape
-    :func:`_match_gap_flatten_matmul_consumer` describes (reused here
-    verbatim: it is domain/quantization-agnostic, and by this point in the
-    walk `cur` is always already a plain float tensor -- `ConvInteger`'s own
-    rescale ``Mul``/``Cast`` pair, matched by :func:`_match_conv_integer`
-    before this walk's own `start` is even chosen, already produced a plain
-    float logical output). A match ends the walk there, returned as this
-    function's own 4th value (`_ConsumerMatch`-shaped: ``(node, weight,
-    weight_transposed)``) instead of the ordinary `_ConvIntegerConv`
-    consumer -- mutually exclusive with it, exactly like the plain-float
-    walk's own `matmul_consumer`. A `GlobalAveragePool` feeding anything else
-    (no recognized `Flatten`/matmul-consumer right after it) simply ends the
-    walk undeclined -- this walker has no other, unconditional use for a
-    pooling hop the way the plain-float Conv-chain walker does.
+    ``-> {Flatten(axis=1), Reshape to [batch, -1], Squeeze-of-trailing-axes}
+    -> {MatMul, vanilla Gemm}`` shape :func:`_match_gap_flatten_matmul_consumer`
+    describes (reused here verbatim: it is domain/quantization-agnostic, and
+    by this point in the walk `cur` is always already a plain float tensor --
+    `ConvInteger`'s own rescale ``Mul``/``Cast`` pair, matched by
+    :func:`_match_conv_integer` before this walk's own `start` is even
+    chosen, already produced a plain float logical output). A match ends the
+    walk there, returned as this function's own 4th value
+    (`_ConsumerMatch`-shaped: ``(node, weight, weight_transposed)``) instead
+    of the ordinary `_ConvIntegerConv` consumer -- mutually exclusive with
+    it, exactly like the plain-float walk's own `matmul_consumer`. A
+    `GlobalAveragePool` feeding anything else (no recognized
+    `Flatten`/`Reshape`/`Squeeze`-then-matmul-consumer right after it) simply
+    ends the walk undeclined -- this walker has no other, unconditional use
+    for a pooling hop the way the plain-float Conv-chain walker does.
+    `producers_of` (already a required parameter of this function, unlike
+    the other two walkers' own optional one) is threaded straight through to
+    :func:`_match_gap_flatten_matmul_consumer` to resolve a
+    ``Concat``-produced ``Reshape`` shape.
 
     Returns ``None`` if the walk runs out of hops, hits a branch, or never
     reaches either kind of consumer.
@@ -35374,22 +35659,28 @@ def _walk_to_conv_integer_consumer(
             and len(nxt.output) == 1
         ):
             gap_flatten_match = _match_gap_flatten_matmul_consumer(
-                nxt.output[0], consumers_of, initializer_map, graph_outputs, n_channels
+                nxt.output[0],
+                consumers_of,
+                initializer_map,
+                graph_outputs,
+                n_channels,
+                producers_of,
             )
             if gap_flatten_match is not None:
-                flatten_node, mm_node, mm_weight, mm_weight_transposed = (
+                reshape_nodes, mm_node, mm_weight, mm_weight_transposed = (
                     gap_flatten_match
                 )
                 chain_ops.append(nxt)
-                chain_ops.append(flatten_node)
+                chain_ops.extend(reshape_nodes)
                 return (
                     None,
                     tuple(chain_ops),
                     tuple(conv_pass_through),
                     (mm_node, mm_weight, mm_weight_transposed),
                 )
-            # No recognized Flatten(axis=1) -> {MatMul, vanilla Gemm} right
-            # after this GlobalAveragePool -- this walker has no other,
+            # No recognized Flatten(axis=1)/Reshape([batch,-1])/Squeeze ->
+            # {MatMul, vanilla Gemm} right after this GlobalAveragePool --
+            # this walker has no other,
             # unconditional use for a pooling hop (unlike the plain-float
             # Conv-chain walker's own `_CONV_POOL_PASS_THROUGH` membership),
             # so decline outright, same as any other unmatched topology.
@@ -35415,9 +35706,10 @@ def _find_conv_integer_chains(graph: onnx.GraphProto) -> List[_ConvIntegerChain]
     ``ConvInteger``-based here (see this section's own top comment for why,
     unlike :func:`_find_dynquant_chains`, there is no general plain-float-peer
     union to consider), with one narrow exception: a producer whose logical
-    output reaches the classifier-head ``GlobalAveragePool -> Flatten(axis=1)
-    -> {MatMul, vanilla Gemm}`` shape instead surfaces as `matmul_consumer`
-    on the returned :class:`_ConvIntegerChain` (see
+    output reaches the classifier-head ``GlobalAveragePool -> {Flatten
+    (axis=1), Reshape to [batch, -1], Squeeze-of-trailing-axes} -> {MatMul,
+    vanilla Gemm}`` shape instead surfaces as `matmul_consumer` on the
+    returned :class:`_ConvIntegerChain` (see
     :func:`_walk_to_conv_integer_consumer`'s own docstring).
     """
     initializer_map = _constant_map(graph)
@@ -35518,9 +35810,10 @@ def apply_structured_pruning_dynamic_quantize_conv(
     plain single-producer/single-consumer topology above.
 
     One narrow exception to the same-family-only consumer rule: a producer
-    whose logical output feeds ``GlobalAveragePool -> Flatten(axis=1) ->
-    {MatMul, vanilla Gemm}`` directly (the canonical dynamically-quantized
-    classifier head this shape's own docstring, :func:`_match_gap_flatten_matmul_consumer`,
+    whose logical output feeds ``GlobalAveragePool -> {Flatten(axis=1),
+    Reshape to [batch, -1], Squeeze-of-trailing-axes} -> {MatMul, vanilla
+    Gemm}`` directly (the canonical dynamically-quantized classifier head
+    this shape's own docstring, :func:`_match_gap_flatten_matmul_consumer`,
     proves is a trivial 1:1 channel relabeling) is also matched, pruning the
     producer's output channels together with the matching input channels of
     that plain-float MatMul/Gemm consumer's weight -- mirroring the
