@@ -2605,49 +2605,27 @@ def apply_magnitude_pruning(
     -- consistent with "global" meaning the whole model, not just its
     top-level graph -- so `sparsity`'s fraction is chosen from, and applied
     to, that combined pool.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.prune_magnitude_cpp` (``onnxsim/passes/magnitude_pruning.h``'s
+    own ``MagnitudePruningMatMul``/``MagnitudePruningConv``/
+    ``MagnitudePruningAttention``/``MagnitudePruningGlobal``), forwarding
+    every argument unchanged. Imported lazily (inside the function body, not
+    at module scope) to avoid a circular import: ``onnxsim.onnx_simplifier``
+    already imports from this module (:class:`EmbeddingPruningResult`), so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
-    _validate_pattern(sparsity, n, m)
-    if global_sparsity and n is not None:
-        raise ValueError(
-            "global_sparsity is not supported together with N:M pruning "
-            "(n/m) -- see apply_magnitude_pruning's own docstring"
-        )
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
+    from onnxsim.onnx_simplifier import prune_magnitude_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-
-    if global_sparsity:
-        entries = []
-        for graph in _iter_subgraphs(out.graph):
-            initializer_map = _constant_map(graph)
-            for _, _, w_name, weight_transposed, is_conv in _candidates(graph):
-                w_init = initializer_map[w_name]
-                w = _to_f64(w_init)
-                w_nk = _weight_to_nk(w, weight_transposed, is_conv)
-                entries.append(
-                    (w_init, weight_transposed, is_conv, w.shape, w_nk, np.abs(w_nk))
-                )
-        _apply_global_unstructured_pruning(entries, sparsity)
-        return out
-
-    for graph in _iter_subgraphs(out.graph):
-        initializer_map = _constant_map(graph)
-        for _, _, w_name, weight_transposed, is_conv in _candidates(graph):
-            w_init = initializer_map[w_name]
-
-            def importance_of_nk(w_nk, n=n, m=m, sparsity=sparsity):
-                importance = np.abs(w_nk)
-                return (
-                    _nm_mask(importance, n, m)
-                    if n is not None
-                    else _sparsity_mask(importance, sparsity)
-                )
-
-            _prune_weight(w_init, weight_transposed, importance_of_nk, is_conv=is_conv)
-
-    return out
+    return prune_magnitude_cpp(
+        model,
+        sparsity=sparsity,
+        n=n,
+        m=m,
+        global_sparsity=global_sparsity,
+    )
 
 
 def _wanda_norm_for_candidate(
