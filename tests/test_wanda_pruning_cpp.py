@@ -78,6 +78,21 @@ def _weight(model, index=0):
     return onnx.numpy_helper.to_array(model.graph.initializer[index])
 
 
+def _magnitude_weight(model, node_index=0, input_index=1):
+    # `onnxsim.apply_magnitude_pruning` is now a thin alias for the C++-backed
+    # `onnxsim.prune_magnitude_cpp`, which leaves the original initializer
+    # dangling and appends a new, anonymously-named one for the pruned
+    # weight (see `tests/test_pruning_cpp.py`'s own `_weight` helper) --
+    # unlike `_weight` above (position-based, still correct for
+    # `apply_wanda_pruning_cpp`'s own in-place-mutating pure-Python
+    # reference), a magnitude-pruning result must be resolved via the
+    # node's CURRENT weight input.
+    node = model.graph.node[node_index]
+    w_name = node.input[input_index]
+    init = next(t for t in model.graph.initializer if t.name == w_name)
+    return onnx.numpy_helper.to_array(init)
+
+
 def _assert_bytewise_close(actual, expected, rtol=1e-5, atol=1e-6):
     np.testing.assert_allclose(
         actual.astype(np.float64), expected.astype(np.float64), rtol=rtol, atol=atol
@@ -313,7 +328,7 @@ def test_wanda_pruning_cpp_no_calibration_batches_falls_back_to_plain_magnitude(
 
     pruned = onnxsim.apply_wanda_pruning_cpp(model, calibration_data=[], sparsity=0.5)
     magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
-    np.testing.assert_array_equal(_weight(pruned), _weight(magnitude_pruned))
+    np.testing.assert_array_equal(_weight(pruned), _magnitude_weight(magnitude_pruned))
     # Actually pruned, not a no-op.
     assert not np.array_equal(_weight(pruned), w)
 
@@ -388,7 +403,7 @@ def test_wanda_pruning_cpp_activation_weighting_differs_from_plain_magnitude():
     magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
 
     w_wanda = _weight(wanda_pruned)
-    w_magnitude = _weight(magnitude_pruned)
+    w_magnitude = _magnitude_weight(magnitude_pruned)
     assert not np.array_equal(w_wanda, w_magnitude)
     # Plain magnitude drops the whole salient_k row (its own tied-smallest
     # entries); Wanda keeps at least one of them thanks to the activation
