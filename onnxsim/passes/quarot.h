@@ -38,6 +38,32 @@
 // stack (see quarot.py's own docstring for why: fusing one global rotation
 // needs a model-level residual-stream graph walk this port does not
 // attempt).
+//
+// ACCEPTED, PERMANENT DIVERGENCE FROM quarot.py: apply_quarot_cpp(model,
+// seed=N) and quarot.py's apply_quarot(model, seed=N) do NOT produce the
+// same rotation (or therefore the same quantized weights) for the same
+// seed, for two independent, both-deliberate reasons -- neither is a bug,
+// and reconciling either is disproportionate to the benefit (see
+// random_orthogonal.h's own top-of-file comment for the full investigation
+// and Monte Carlo evidence this note summarizes):
+//   1. Different orthogonalization algorithm: this file's
+//      RandomOrthogonalMatrix() (random_orthogonal.h) uses Gram-Schmidt;
+//      quarot.py uses numpy.linalg.qr with an explicit sign correction.
+//      Both are independently Haar-uniform (Gram-Schmidt needs no
+//      analogous correction -- its natural diagonal is already
+//      nonnegative, unlike LAPACK's Householder QR); they are simply
+//      different valid constructions of the same target distribution.
+//   2. Different RNG derivation: QuarotSeed() below reseeds a fresh
+//      std::mt19937_64 per matched node from a hash of the seed and the
+//      node's own unique id, rather than sequencing a single generator
+//      across matches in graph node order the way quarot.py's
+//      numpy.random.Generator does.
+// True bit-for-bit parity would need reimplementing numpy's PCG64 bit
+// generator and ziggurat-based standard_normal sampler in C++ on top of
+// matching the QR algorithm -- out of proportion for a rotation whose only
+// actual requirement is being SOME uniformly random orthogonal matrix, not
+// a bit-specific one. apply_quarot and apply_quarot_cpp are intentionally
+// two independently-correct, non-interchangeable entry points.
 
 #pragma once
 
