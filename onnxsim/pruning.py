@@ -5763,6 +5763,456 @@ def _match_self_gated_activation_backward(
     return diamond_nodes, origin, gate_node
 
 
+# --- Decomposed tanh-approximate GELU pass-through --------------------------
+#
+# `nn.GELU(approximate="tanh")` (PyTorch's "tanh-approximate"/"new GELU" --
+# GPT-2's, BERT's `gelu_new`, and any `approximate="tanh"` config) computes
+# ``0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x**3)))``, structurally
+# distinct from both shapes the self-gated activation decomposition above
+# recognizes: `x` itself is read *four* times (not the self-gated shape's
+# two), by the cubing branch's own squaring step, its cubing step, the
+# ``x + 0.044715 * x**3`` combining `Add`, and the final gating `Mul`, none of
+# which is a strict linear "gate branch, then one combining `Mul`" chain the
+# way SiLU's/erf-GELU's own shape is -- so neither `_walk_gate_branch` nor
+# :func:`_match_self_gated_activation` itself can reach it; before this
+# section existed, a chain hitting this decomposition just stopped dead,
+# completely unpruned end to end.
+#
+# Confirmed live (not assumed from the textbook formula), via
+# `torch.onnx.export(nn.Linear(...) -> nn.GELU(approximate="tanh"), ...,
+# opset_version=17, dynamo=False)`, to lower to exactly this fixed 8-node
+# sequence (elementwise, so a preceding `Conv` produces the identical
+# topology):
+#
+#   x2 = Mul(x, x);            x3 = Mul(x, x2);
+#   m2 = Mul(0.044715, x3);    inner = Add(x, m2);
+#   arg = Mul(sqrt(2/pi), inner); t = Tanh(arg);
+#   one_plus_t = Add(1.0, t);  gated = Mul(x, one_plus_t);
+#   out = Mul(0.5, gated)
+#
+# `sqrt(2/pi)` and `0.044715` (and, less interestingly, `1.0`/`0.5`) are
+# emitted as plain `Constant` nodes, not initializers -- exactly the gap
+# :func:`_constant_map` (this module's own "constant-fed scalar operand" fix,
+# see that function's own docstring) already closes, so every caller here
+# threads an `initializer_map` built via that helper, the same as every
+# sibling hop already does. `x`'s own four direct reads surface in
+# `consumers_of` as *five* entries, not four -- `x2 = Mul(x, x)` reads `x`
+# twice over, once per input slot of that one node, since :func:`_consumers_of`
+# records one entry per `node.input` occurrence, not one per distinct
+# consumer node -- so this hop's own dispatch keys on `len(candidates) == 5`
+# (forward) wherever the self-gated activation decomposition's own dispatch
+# keys on `== 2`, and :func:`_walk_gelu_tanh_from_root` below de-duplicates
+# that one doubly-counted squaring node itself rather than leaving that
+# quirk to ripple through every caller.
+#
+# Recognized the same "fixed exact topology, decline everything else" way
+# every other multi-node hop in this module already is (mirrors
+# :func:`_match_decomposed_rms_norm_pass_through` most closely: a single
+# straight-line node-by-node walk from the root, no bounded generic search
+# the way :func:`_walk_gate_branch` needs) -- declines (never guesses) on any
+# deviation: `x` read by anything other than exactly these four nodes in
+# these four roles, any intermediate tensor (`x2`, `x3`, `m2`, `inner`,
+# `arg`, `t`, `one_plus_t`, and the gate `Mul`'s own output before an optional
+# trailing scale) read by more than one consumer or itself a graph output,
+# any of the four scalar operands (`0.044715`, `sqrt(2/pi)`, `1.0`, and,
+# for the trailing scale, `0.5`) not a genuine scalar constant (see
+# :func:`_gate_branch_scalar_const`, reused unchanged -- none of these is
+# ever per-channel either), or any node's own op type/domain/input-output
+# arity off the exact shape above. On a full match every node crossed folds
+# into the chain the identical "nothing to slice" way the self-gated
+# activation decomposition's own diamond does -- none of `Mul`/`Add`/`Tanh`
+# here has a per-channel *parameter*, only the running tensor's own *value*
+# changes as channels are removed -- so every matched node becomes one more
+# `(node, None)` `chain_ops` entry, and the walk continues from the sequence's
+# own true output tensor: the gate `Mul`'s own output (`gated`) if no
+# trailing scalar-scale `Mul` follows it, or that trailing `Mul`'s own output
+# otherwise -- the identical "gate `Mul`, then an optional trailing scalar
+# `Mul`" shape :func:`_match_self_gated_activation`'s own erf-GELU case
+# already folds in, reused via the identical inline check (not
+# :func:`_walk_gate_branch` -- that helper is scoped to a single linear
+# branch, not this shape's own internal fork).
+#
+# Wired into the identical four call sites :func:`_match_self_gated_activation`/
+# :func:`_match_self_gated_activation_backward` are (:func:`_walk_to_consumer`,
+# :func:`_walk_to_conv_consumer`, :func:`_walk_matmul_producer_backward`,
+# :func:`_walk_conv_producer_backward`), tried right alongside that shape at
+# each -- the two shapes never overlap (one keys on exactly two consumers,
+# this one on exactly five), so trying both costs nothing beyond one more
+# declining call whenever neither is actually present. The two Conv-chain
+# finders' own root-admission checks (:func:`_find_conv_chains`'s "ordinarily
+# exactly one consumer, but also admit exactly two" gate, and
+# :func:`_find_conv_residual_chains`'s own fan-out `accounted` bookkeeping)
+# need the identical treatment `_matmul_walk_root_ok` already gives the
+# MatMul/Gemm side for free (that function only ever rules out a graph
+# output, deferring every consumer-count question to the walker's own hop-0
+# dispatch) -- see :func:`_find_conv_chains`'s own comment at its call site
+# for the one-line change this needed.
+
+
+def _walk_gelu_tanh_from_root(
+    x_name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], onnx.NodeProto, str]]:
+    """The shared core both :func:`_match_gelu_tanh_pass_through` (forward)
+    and :func:`_match_gelu_tanh_pass_through_backward` (backward, which
+    re-derives a candidate `x_name` from a gate `Mul`'s own two operands and
+    calls this the same way) use: if `x_name` is the root of exactly the
+    fixed decomposed tanh-GELU shape this section's own comment above
+    documents (everything up to, but not including, the optional trailing
+    scalar-scale `Mul`), returns ``(structural_nodes, gate_node, gated_name)``
+    -- `structural_nodes` the seven nodes strictly before the gate `Mul`
+    itself, in forward (execution) order (``x2 = Mul(x, x)``, ``x3 = Mul(x,
+    x2)``, ``m2 = Mul(<0.044715>, x3)``, ``inner = Add(x, m2)``, ``arg =
+    Mul(<sqrt(2/pi)>, inner)``, ``Tanh(arg)``, ``one_plus_t = Add(<1.0>,
+    t)``), `gate_node` the final ``gated = Mul(x, one_plus_t)`` kept separate
+    (not folded into `structural_nodes`) so a backward caller can compare it
+    by identity against the `Mul` node it already resolved `cur` from
+    without re-deriving which element of a combined tuple is which, and
+    `gated_name` that `Mul`'s own output name. Declines (``None``) on any
+    deviation from the exact shape -- see this section's own comment above
+    for the full list.
+    """
+    x_consumers = consumers_of.get(x_name, [])
+    if len(x_consumers) != 5:
+        return None
+
+    # `x_name`'s four *distinct* direct consumer nodes -- the squaring `Mul`
+    # appears twice in `x_consumers` (both its own inputs are `x_name`); see
+    # this section's own comment above for why.
+    occurrences: Dict[int, int] = {}
+    first_seen: List[onnx.NodeProto] = []
+    for c in x_consumers:
+        key = id(c)
+        occurrences[key] = occurrences.get(key, 0) + 1
+        if occurrences[key] == 1:
+            first_seen.append(c)
+    if len(first_seen) != 4:
+        return None  # not four distinct consumer nodes -- declined
+
+    square_node: Optional[onnx.NodeProto] = None
+    singles: List[onnx.NodeProto] = []
+    for node in first_seen:
+        cnt = occurrences[id(node)]
+        if cnt == 2:
+            if square_node is not None:
+                return None  # more than one doubly-read consumer -- ambiguous
+            square_node = node
+        elif cnt == 1:
+            singles.append(node)
+        else:
+            return None
+    if square_node is None or len(singles) != 3:
+        return None
+
+    if (
+        square_node.op_type != "Mul"
+        or square_node.domain != ""
+        or list(square_node.input) != [x_name, x_name]
+        or len(square_node.output) != 1
+        or not square_node.output[0]
+    ):
+        return None
+    x2_name = square_node.output[0]
+    if x2_name in graph_outputs or len(consumers_of.get(x2_name, [])) != 1:
+        return None
+
+    cube_node = consumers_of[x2_name][0]
+    if not any(cube_node is n for n in singles):
+        return None  # the cube step must also be one of x_name's own reads
+    if (
+        cube_node.op_type != "Mul"
+        or cube_node.domain != ""
+        or len(cube_node.input) != 2
+        or x_name not in cube_node.input
+        or x2_name not in cube_node.input
+        or len(cube_node.output) != 1
+        or not cube_node.output[0]
+    ):
+        return None
+    x3_name = cube_node.output[0]
+    if x3_name in graph_outputs or len(consumers_of.get(x3_name, [])) != 1:
+        return None
+
+    scale_cube_node = consumers_of[x3_name][0]
+    if (
+        scale_cube_node.op_type != "Mul"
+        or scale_cube_node.domain != ""
+        or len(scale_cube_node.input) != 2
+        or x3_name not in scale_cube_node.input
+        or len(scale_cube_node.output) != 1
+        or not scale_cube_node.output[0]
+    ):
+        return None
+    cube_coeff_name = (
+        scale_cube_node.input[1]
+        if scale_cube_node.input[0] == x3_name
+        else scale_cube_node.input[0]
+    )
+    if cube_coeff_name == x3_name or not _gate_branch_scalar_const(
+        cube_coeff_name, initializer_map
+    ):
+        return None
+    m2_name = scale_cube_node.output[0]
+    if m2_name in graph_outputs or len(consumers_of.get(m2_name, [])) != 1:
+        return None
+
+    remaining = [n for n in singles if n is not cube_node]
+    if len(remaining) != 2:
+        return None
+    add_node: Optional[onnx.NodeProto] = None
+    gate_node: Optional[onnx.NodeProto] = None
+    for n in remaining:
+        if n.op_type == "Add" and n.domain == "" and add_node is None:
+            add_node = n
+        elif n.op_type == "Mul" and n.domain == "" and gate_node is None:
+            gate_node = n
+        else:
+            return None
+    if add_node is None or gate_node is None:
+        return None
+
+    if consumers_of[m2_name][0] is not add_node:
+        return None  # scaled cube must feed the *same* Add x_name forked to
+    if (
+        len(add_node.input) != 2
+        or x_name not in add_node.input
+        or m2_name not in add_node.input
+        or len(add_node.output) != 1
+        or not add_node.output[0]
+    ):
+        return None
+    inner_name = add_node.output[0]
+    if inner_name in graph_outputs or len(consumers_of.get(inner_name, [])) != 1:
+        return None
+
+    arg_scale_node = consumers_of[inner_name][0]
+    if (
+        arg_scale_node.op_type != "Mul"
+        or arg_scale_node.domain != ""
+        or len(arg_scale_node.input) != 2
+        or inner_name not in arg_scale_node.input
+        or len(arg_scale_node.output) != 1
+        or not arg_scale_node.output[0]
+    ):
+        return None
+    sqrt_2_over_pi_name = (
+        arg_scale_node.input[1]
+        if arg_scale_node.input[0] == inner_name
+        else arg_scale_node.input[0]
+    )
+    if sqrt_2_over_pi_name == inner_name or not _gate_branch_scalar_const(
+        sqrt_2_over_pi_name, initializer_map
+    ):
+        return None
+    arg_name = arg_scale_node.output[0]
+    if arg_name in graph_outputs or len(consumers_of.get(arg_name, [])) != 1:
+        return None
+
+    tanh_node = consumers_of[arg_name][0]
+    if (
+        tanh_node.op_type != "Tanh"
+        or tanh_node.domain != ""
+        or list(tanh_node.input) != [arg_name]
+        or len(tanh_node.output) != 1
+        or not tanh_node.output[0]
+    ):
+        return None
+    t_name = tanh_node.output[0]
+    if t_name in graph_outputs or len(consumers_of.get(t_name, [])) != 1:
+        return None
+
+    one_plus_node = consumers_of[t_name][0]
+    if (
+        one_plus_node.op_type != "Add"
+        or one_plus_node.domain != ""
+        or len(one_plus_node.input) != 2
+        or t_name not in one_plus_node.input
+        or len(one_plus_node.output) != 1
+        or not one_plus_node.output[0]
+    ):
+        return None
+    one_name = (
+        one_plus_node.input[1]
+        if one_plus_node.input[0] == t_name
+        else one_plus_node.input[0]
+    )
+    if one_name == t_name or not _gate_branch_scalar_const(one_name, initializer_map):
+        return None
+    one_plus_t_name = one_plus_node.output[0]
+    if (
+        one_plus_t_name in graph_outputs
+        or len(consumers_of.get(one_plus_t_name, [])) != 1
+    ):
+        return None
+    if consumers_of[one_plus_t_name][0] is not gate_node:
+        return None  # one_plus_t must feed the *same* Mul x_name forked to
+
+    if (
+        len(gate_node.input) != 2
+        or x_name not in gate_node.input
+        or one_plus_t_name not in gate_node.input
+        or len(gate_node.output) != 1
+        or not gate_node.output[0]
+    ):
+        return None
+
+    structural_nodes: Tuple[onnx.NodeProto, ...] = (
+        square_node,
+        cube_node,
+        scale_cube_node,
+        add_node,
+        arg_scale_node,
+        tanh_node,
+        one_plus_node,
+    )
+    return structural_nodes, gate_node, gate_node.output[0]
+
+
+def _match_gelu_tanh_pass_through(
+    x_name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str]]:
+    """If `x_name` (a tensor with *exactly* five `consumers_of` entries --
+    four distinct consumer nodes, one of them read twice, see this section's
+    own comment above) is the root of the fixed decomposed tanh-GELU shape,
+    returns ``(diamond_nodes, final_out)`` -- the same shape
+    :func:`_match_self_gated_activation` returns, and used the identical way
+    by :func:`_walk_to_consumer`/:func:`_walk_to_conv_consumer` as a walk's
+    very first hop only. `diamond_nodes` is every node the sequence spans, in
+    forward order (:func:`_walk_gelu_tanh_from_root`'s own seven
+    `structural_nodes`, then the gate `Mul`, then -- if present -- one
+    trailing scalar-scale `Mul`, mirroring erf-GELU's own optional final
+    ``* 0.5`` in :func:`_match_self_gated_activation`); `final_out` is
+    whichever of those two is the sequence's own true output.
+    """
+    core = _walk_gelu_tanh_from_root(
+        x_name, consumers_of, initializer_map, graph_outputs
+    )
+    if core is None:
+        return None
+    structural_nodes, gate_node, gated_name = core
+
+    diamond_nodes: Tuple[onnx.NodeProto, ...] = structural_nodes + (gate_node,)
+    final_out = gated_name
+
+    if gated_name not in graph_outputs and len(consumers_of.get(gated_name, [])) == 1:
+        trailing = consumers_of[gated_name][0]
+        if (
+            trailing.op_type == "Mul"
+            and trailing.domain == ""
+            and len(trailing.input) == 2
+            and gated_name in trailing.input
+            and len(trailing.output) == 1
+        ):
+            scale = (
+                trailing.input[1]
+                if trailing.input[0] == gated_name
+                else trailing.input[0]
+            )
+            if scale != gated_name and _gate_branch_scalar_const(
+                scale, initializer_map
+            ):
+                diamond_nodes = diamond_nodes + (trailing,)
+                final_out = trailing.output[0]
+
+    return diamond_nodes, final_out
+
+
+def _match_gelu_tanh_pass_through_backward(
+    cur: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[onnx.NodeProto, ...], str, onnx.NodeProto]]:
+    """The backward-walk (:func:`_walk_matmul_producer_backward`/
+    :func:`_walk_conv_producer_backward`) counterpart of
+    :func:`_match_gelu_tanh_pass_through`, mirroring
+    :func:`_match_self_gated_activation_backward` in every structural
+    respect but the shape itself: `cur` is the sequence's own candidate
+    *output* tensor (`node_by_output[cur]` either the gate `Mul` itself, or
+    the optional trailing scalar-scale `Mul` wrapping it), resolved back to
+    the sequence's own true *origin* tensor. Returns ``(diamond_nodes,
+    origin, gate_node)`` in the identical shape/order
+    :func:`_match_self_gated_activation_backward` does.
+
+    Since the gate `Mul`'s own two operands (`x_name` and `one_plus_t`) are
+    unordered, both candidate origins are tried via
+    :func:`_walk_gelu_tanh_from_root` (the same core function the forward
+    direction uses); a match is accepted only when *exactly one* candidate
+    both resolves the fixed shape at all *and* resolves back to this exact
+    `gate_node` (checked by identity, not merely "resolves to *some* gate
+    `Mul`") -- declined on ambiguity, the same bar every sibling hop in this
+    module already holds itself to.
+    """
+    node = node_by_output.get(cur)
+    if (
+        node is None
+        or node.op_type != "Mul"
+        or node.domain != ""
+        or len(node.input) != 2
+        or len(node.output) != 1
+        or node.output[0] != cur
+    ):
+        return None
+
+    gate_node = node
+    trailing_node: Optional[onnx.NodeProto] = None
+    a_name, b_name = node.input
+    a_const = a_name in initializer_map
+    b_const = b_name in initializer_map
+    if a_const != b_const:
+        # A candidate trailing scalar-scale `Mul` (the final `* 0.5`) -- its
+        # own non-constant operand must itself be a plain `Mul` (the real
+        # gate `Mul`) with no other consumer.
+        const_name, gate_out = (a_name, b_name) if a_const else (b_name, a_name)
+        if not _gate_branch_scalar_const(const_name, initializer_map):
+            return None
+        if len(consumers_of.get(gate_out, [])) != 1:
+            return None
+        gate_candidate = node_by_output.get(gate_out)
+        if (
+            gate_candidate is None
+            or gate_candidate.op_type != "Mul"
+            or gate_candidate.domain != ""
+            or len(gate_candidate.input) != 2
+            or len(gate_candidate.output) != 1
+            or gate_candidate.output[0] != gate_out
+        ):
+            return None
+        trailing_node = node
+        gate_node = gate_candidate
+        a_name, b_name = gate_node.input
+        a_const = a_name in initializer_map
+        b_const = b_name in initializer_map
+
+    if a_const or b_const or a_name == b_name:
+        return None  # not a genuine two-non-constant-operand gate `Mul`
+
+    matches: List[Tuple[Tuple[onnx.NodeProto, ...], str]] = []
+    for x_candidate in (a_name, b_name):
+        core = _walk_gelu_tanh_from_root(
+            x_candidate, consumers_of, initializer_map, graph_outputs
+        )
+        if core is None:
+            continue
+        structural_nodes, found_gate, _gated_name = core
+        if found_gate is gate_node:
+            matches.append((structural_nodes, x_candidate))
+    if len(matches) != 1:
+        return None  # no resolvable ordering, or an ambiguous second one
+    structural_nodes, origin = matches[0]
+
+    diamond_nodes: Tuple[onnx.NodeProto, ...] = structural_nodes + (gate_node,)
+    if trailing_node is not None:
+        diamond_nodes = diamond_nodes + (trailing_node,)
+    return diamond_nodes, origin, gate_node
+
+
 def _walk_to_consumer(
     start: str,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -5893,6 +6343,24 @@ def _walk_to_consumer(
                     cur = diamond_out
                     continue
                 break  # two consumers but not this shape -- declined, as before
+            if len(candidates) == 5:
+                # The decomposed tanh-GELU shape's own root -- see this
+                # module's own "Decomposed tanh-approximate GELU pass-through"
+                # section comment and :func:`_match_gelu_tanh_pass_through`.
+                gelu_diamond = _match_gelu_tanh_pass_through(
+                    cur, consumers_of, initializer_map, graph_outputs
+                )
+                if gelu_diamond is not None:
+                    diamond_nodes, diamond_out = gelu_diamond
+                    if (
+                        len(consumers_of.get(diamond_out, [])) != 1
+                        or diamond_out in graph_outputs
+                    ):
+                        break
+                    chain_ops.extend((n, None) for n in diamond_nodes)
+                    cur = diamond_out
+                    continue
+                break  # five consumers but not this shape -- declined, as before
             if len(candidates) != 1:
                 break
             nxt = candidates[0]
@@ -7526,6 +7994,24 @@ def _walk_to_conv_consumer(
                     cur = diamond_out
                     continue
                 break  # two consumers but not this shape -- declined, as before
+            if len(candidates) == 5:
+                # The decomposed tanh-GELU shape's own root -- see this
+                # module's own "Decomposed tanh-approximate GELU pass-through"
+                # section comment and :func:`_match_gelu_tanh_pass_through`.
+                gelu_diamond = _match_gelu_tanh_pass_through(
+                    cur, consumers_of, initializer_map, graph_outputs
+                )
+                if gelu_diamond is not None:
+                    diamond_nodes, diamond_out = gelu_diamond
+                    if (
+                        len(consumers_of.get(diamond_out, [])) != 1
+                        or diamond_out in graph_outputs
+                    ):
+                        break
+                    chain_ops.extend((n, None) for n in diamond_nodes)
+                    cur = diamond_out
+                    continue
+                break  # five consumers but not this shape -- declined, as before
             if len(candidates) != 1:
                 break
             nxt = candidates[0]
@@ -7750,15 +8236,22 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         w_name, bias_name, n_channels, producer_group = info
 
         out_name = node.output[0]
-        # Ordinarily exactly one consumer -- but also admit exactly two, the
+        # Ordinarily exactly one consumer -- but also admit exactly two (the
         # shape a self-gated activation decomposition's own origin tensor
-        # takes (see :func:`_find_chains`'s own identical comment and this
+        # takes -- see :func:`_find_chains`'s own identical comment and this
         # module's own "Self-gated activation decomposition" section
-        # comment); :func:`_walk_to_conv_consumer` decides, at its own first
-        # hop, whether those two consumers actually form that shape.
+        # comment) or exactly five (the decomposed tanh-GELU shape's own
+        # origin tensor -- see this module's own "Decomposed tanh-approximate
+        # GELU pass-through" section comment; `consumers_of` counts one entry
+        # per `node.input` occurrence, and that shape's own squaring `Mul`
+        # reads its root twice over, so its four distinct direct consumers
+        # surface as five entries there, not four).
+        # :func:`_walk_to_conv_consumer` decides, at its own first hop,
+        # whether those consumers actually form either shape.
         if out_name in graph_outputs or len(consumers_of.get(out_name, [])) not in (
             1,
             2,
+            5,
         ):
             continue
 
@@ -8209,6 +8702,28 @@ def _walk_conv_producer_backward(
                 diamond_nodes, origin, gate_node = diamond
                 unary_ops.extend(reversed(diamond_nodes))
                 edges.append((origin, diamond_nodes[0]))
+                edges.append((origin, gate_node))
+                cur = origin
+                continue
+
+            # The decomposed tanh-GELU shape's own gate `Mul` -- see this
+            # module's own "Decomposed tanh-approximate GELU pass-through"
+            # section comment and :func:`_match_gelu_tanh_pass_through_backward`.
+            # `origin`'s own *four* real in-group consumers (the squaring
+            # `Mul`, the cubing `Mul`, the `x + 0.044715 * x**3` `Add`, and the
+            # gate `Mul` itself) all become `edges` entries, the identical
+            # "more than one in-group consumer of the same tensor" shape the
+            # self-gated activation decomposition's own two-entries case
+            # already tolerates, just with four instead of two.
+            gelu_diamond = _match_gelu_tanh_pass_through_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if gelu_diamond is not None:
+                diamond_nodes, origin, gate_node = gelu_diamond
+                unary_ops.extend(reversed(diamond_nodes))
+                edges.append((origin, diamond_nodes[0]))  # squaring Mul
+                edges.append((origin, diamond_nodes[1]))  # cubing Mul
+                edges.append((origin, diamond_nodes[3]))  # x + 0.044715*x**3
                 edges.append((origin, gate_node))
                 cur = origin
                 continue
@@ -9129,6 +9644,28 @@ def _walk_matmul_producer_backward(
                 # recorded so neither is later mistaken for a stray extra
                 # consumer needing its own separate resolution.
                 edges.append((origin, diamond_nodes[0]))
+                edges.append((origin, gate_node))
+                cur = origin
+                continue
+
+            # The decomposed tanh-GELU shape's own gate `Mul` -- see this
+            # module's own "Decomposed tanh-approximate GELU pass-through"
+            # section comment and :func:`_match_gelu_tanh_pass_through_backward`.
+            # `origin` has *four* real in-group consumers here (the squaring
+            # `Mul`, the cubing `Mul`, the `x + 0.044715 * x**3` `Add`, and
+            # the gate `Mul` itself), the identical "more than one in-group
+            # consumer of the same tensor" shape the self-gated activation
+            # decomposition's own two-entries case above already tolerates,
+            # just with four instead of two.
+            gelu_diamond = _match_gelu_tanh_pass_through_backward(
+                cur, node_by_output, consumers_of, initializer_map, graph_outputs
+            )
+            if gelu_diamond is not None:
+                diamond_nodes, origin, gate_node = gelu_diamond
+                chain_ops.extend((n, None) for n in reversed(diamond_nodes))
+                edges.append((origin, diamond_nodes[0]))  # squaring Mul
+                edges.append((origin, diamond_nodes[1]))  # cubing Mul
+                edges.append((origin, diamond_nodes[3]))  # x + 0.044715*x**3
                 edges.append((origin, gate_node))
                 cur = origin
                 continue
@@ -18533,7 +19070,38 @@ class _GQAChain:
 # it is a *third* matched node type, not a third dataclass, since its
 # separate-Q/K/V-producer shape and whole-KV-group pruning unit are
 # identical to `GroupQueryAttention`'s own.
-_AttnLikeChain = Union[_AttentionChain, _GQAChain]
+#
+# A *third* matched shape, :class:`_DecomposedGQAChain` (see this module's
+# own "Decomposed (un-fused) attention head pruning" section comment,
+# further down), is folded into this alias -- used by every "Attention-head
+# pruning" entry point, real (:func:`_apply_attention_chains`/
+# :func:`apply_attention_head_pruning`/
+# :func:`apply_attention_head_wanda_pruning`) and dry-run
+# (:func:`_attention_not_eligible`/:func:`_analyze_attention_chains`, the
+# family behind :func:`analyze_pruning_sensitivity`'s own "Attention-head
+# family" section) alike, all of which dispatch on it -- via a plain string
+# forward reference: that class is defined much later in the file (after
+# every fused-node matcher it partially mirrors), and `_AttnLikeChain`
+# itself is a runtime `Union[...]` assignment, evaluated at import time, not
+# merely a type annotation -- unlike this module's usual `from __future__
+# import annotations`-deferred annotations, a bare string element inside
+# `Union[]` is never resolved at runtime at all (only by a static type
+# checker, which resolves it against the whole module regardless of
+# definition order), so this is safe regardless of where
+# :class:`_DecomposedGQAChain` itself ends up defined.
+#
+# :class:`_DecomposedGQAChain` shares every `_GQAChain`-side field
+# (`.q_weight`/`.k_weight`/`.v_weight`/`.kv_num_heads`/`.head_size`/
+# `.v_head_size`/`.consumer_weight`/`.consumer_node`) every dispatch site
+# below reads for it, but has no `.node` field at all (its matched shape has
+# no single fused node) -- every dispatch site that would otherwise read
+# `.node` (`_attention_not_eligible`'s own `matched_ids` set,
+# `_analyze_attention_chains`'s own `label`) special-cases
+# `isinstance(chain, _DecomposedGQAChain)` first, using `.softmax_node` (the
+# chain's own defining anchor node) in `_analyze_attention_chains`'s case,
+# or excluding it from a fused-op-only `id()` set in
+# `_attention_not_eligible`'s.
+_AttnLikeChain = Union[_AttentionChain, _GQAChain, "_DecomposedGQAChain"]
 
 
 def _match_attention_producer(
@@ -21928,6 +22496,1884 @@ def _find_sparse_attention_chains(
     )
 
 
+# ---------------------------------------------------------------------------
+# Decomposed (un-fused) attention head pruning
+# ---------------------------------------------------------------------------
+# Every matcher above this point (`_match_gqa_producer`,
+# `_match_onnx_attention_producer`, `_match_multi_head_attention_producer`,
+# `_find_separate_qkv_chains` and friends) keys off a *fused* attention node
+# -- `com.microsoft::GroupQueryAttention`/`Attention`/`MultiHeadAttention`/
+# `PagedAttention`/`SparseAttention`, or plain `ai.onnx::Attention` --
+# something onnxsim's own `fuse_attention.h`/`fuse_gqa.h` optimizer passes
+# (or ONNX Runtime's own transformer graph optimizer) produce. A plain
+# `torch.onnx.export()` of an eager/manual-SDPA attention module, run
+# through `onnxsim.simplify()` but with NO further ORT transformer-fusion
+# pass, does *not* always end up in that fused shape:
+#
+# - `fuse_attention.h`'s own doc comment requires "no attention mask" before
+#   it will fuse a non-GQA block into plain `ai.onnx::Attention` at all --
+#   confirmed by reading that requirement directly off the file. A causal
+#   decoder's own additive mask (the overwhelmingly common real-world case)
+#   means this pass simply never fires, fused or not.
+# - `fuse_gqa.h`'s own doc comment additionally requires the mask be a
+#   *provable constant* matching the exact causal pattern (never a
+#   `position_ids`-derived runtime mask, which is what a real decoder
+#   actually exports) before it will fuse a GQA/MQA block into
+#   `com.microsoft::GroupQueryAttention` -- confirmed the same way.
+#
+# So a real GQA (or masked MHA) export -- confirmed empirically via an
+# actual hand-written eager-attention `nn.Module` mirroring HuggingFace's own
+# `eager_attention_forward` shape, `torch.onnx.export(..., opset_version=17,
+# dynamo=False)`, run through this module's own `onnxsim.simplify()` -- stays
+# fully decomposed: `Linear(Q/K/V) -> Reshape(to heads) -> Transpose(to
+# BHSD) -> [repeat_kv: Unsqueeze -> Expand -> Reshape, GQA/MQA only] ->
+# MatMul(Q, K^T) -> [scale] -> [+mask] -> Softmax -> MatMul(., V) ->
+# Transpose(back) -> Reshape(back to hidden) -> Linear(O)`. None of the
+# matchers above ever recognizes this -- and, since Q's/K's/V's own raw
+# projection output feeds a `Reshape` (never a hop
+# :func:`_walk_to_consumer`/:func:`_walk_matmul_producer_backward` know
+# about) rather than a weight-bearing MatMul/Gemm directly, even
+# :func:`apply_structured_pruning`'s own plain (non-head-aware) channel
+# pruning can't reach it either: Q's/K's/V's own output never feeds a
+# *weight* consumer at all (it feeds `MatMul(Q, K^T)`/`MatMul(., V)`, whose
+# other operand is never a constant weight), so this pass is the *only* way
+# any of the three ever gets pruned for this shape. So these projections get
+# ZERO pruning of any kind on this common export path -- the gap this
+# section closes.
+#
+# :func:`_find_decomposed_gqa_chains` matches this decomposed shape and
+# reuses :class:`_GQAChain`'s own whole-KV-group pruning unit/ranking
+# (:func:`_gqa_group_importance`, widened to accept either chain type -- see
+# `_HeadGroupChain`) and per-tensor slicing primitives
+# (:func:`_slice_producer_weight`/:func:`_slice_consumer_weight`/
+# :func:`_slice_last_axis`/:func:`_head_column_indices`) verbatim: a KV
+# group's pruning unit and importance ranking are topology-independent of
+# whether Q/K/V feed a fused node or this decomposed sequence. What genuinely
+# differs, and needs its own :class:`_DecomposedGQAChain`/
+# :func:`_apply_one_decomposed_gqa_chain` rather than reusing
+# :class:`_GQAChain`/:func:`_apply_one_gqa_chain` outright, is that there is
+# no single fused node whose `num_heads`/`kv_num_heads` *attribute* records
+# the head count -- it is instead baked, redundantly, into up to seven
+# different `Reshape`/`Expand` target-shape `Constant` tensors (Q's/K's/V's
+# own head-split `Reshape`, K's/V's own `repeat_kv` `Expand`/merge-`Reshape`
+# pair, and the final combine-back `Reshape`), every one of which must be
+# rewritten in lock-step, and several of which are legitimately -- and, per
+# this pass's own "never partially mutate, never corrupt a shared constant"
+# invariant, *safely* -- the exact same shared `Constant` (K's and V's own
+# head-split `Reshape` routinely collapse to one shared shape constant once
+# onnxsim's own common-subexpression elimination merges two textually
+# identical literals -- confirmed empirically, not a hypothetical -- correct
+# to edit in place since both branches always need the identical new value).
+# A shape constant this pass intends to edit can, in general, ALSO be read
+# by something entirely unrelated (a different attention layer's own
+# identical-valued constant, deduplicated onto the same tensor the same
+# CSE way -- also confirmed empirically: `torch.onnx.export`'s own "flatten
+# batch*seq before a Gemm" reshape and this pass's own combine-back reshape
+# can land on byte-identical target shapes too), which editing in place
+# would silently corrupt -- :func:`_apply_one_decomposed_gqa_chain`'s own
+# `_rewrite_shape_dim` local helper handles this not by declining but by
+# cloning: whenever a shape constant's real reader set (recomputed fresh at
+# apply time, since an earlier chain in the same pass may already have
+# rewired some of it away) is a strict superset of the specific node(s)
+# *this* chain owns, a brand-new tensor holding the *current* value is
+# minted, only this chain's own owning node(s) are rewired to read from it,
+# and only THAT new tensor is edited -- the original is left completely
+# untouched for whatever else still reads it. When the reader set is
+# exactly this chain's own owned node(s) (the common case), the constant is
+# simply edited in place, same as every other hop in this module already
+# does.
+#
+# Scope, deliberately narrower than the fused-node family above:
+#
+# - Head-split `Reshape` target shape must be a resolvable, literal
+#   `[batch, seq, num_heads, head_size]` (rank-4) `Constant`/initializer --
+#   never guessed at from a dynamic/partially-resolved shape.
+# - `repeat_kv`, when present, must be the exact HuggingFace
+#   `Unsqueeze(axis=[2]) -> Expand(literal 5-D target) -> Reshape(literal
+#   4-D target)` shape with a fully constant-folded `Expand` target -- true
+#   for a statically-shaped export, and for the common batch-dynamic-only
+#   export once onnxsim's own constant folding has resolved the
+#   `ConstantOfShape`/`Equal`/`Where` boilerplate PyTorch's own
+#   `aten::expand` symbolic always emits (confirmed empirically); a
+#   genuinely dynamic (never resolved) `Expand` target declines here rather
+#   than guessed at.
+# - K's own dot-product transpose is recognized in *either* of the two real
+#   shapes `torch.onnx.export` emits: the ordinary, separate
+#   `Transpose(perm=[0,2,1,3])` (head-split) followed later by its own
+#   `Transpose(perm=[0,1,3,2])` (the QK^T "swap"), OR -- confirmed
+#   empirically for the no-`repeat_kv` case, where the two transposes sit
+#   immediately adjacent with nothing in between -- the *single*,
+#   pre-composed `Transpose(perm=[0,2,3,1])` PyTorch's own ONNX exporter
+#   peephole optimization (`fuseConsecutiveTransposes`) collapses them into.
+#   `repeat_kv` (when present) always sits between the two, breaking that
+#   adjacency, so only the separate-transpose shape is ever tried once
+#   `repeat_kv` has matched.
+# - The additive mask (if any), applied *before* `Softmax` and *after* the
+#   optional scale (HF's own fixed `scores = (q @ k.T) * scale; scores =
+#   scores + mask` order -- the reverse order is never tried) is handled by
+#   the identical :func:`_head_bias_input_is_safe`/
+#   :func:`_slice_or_gather_head_bias` machinery the fused-node family
+#   already uses for `attention_bias`/`attn_mask`: a broadcast (or absent)
+#   mask needs no action, a genuine per-query-head one (constant or
+#   dynamic) is sliced/gathered in lock-step, and anything this pass can't
+#   classify declines the whole chain.
+# - The scale (if any) must be a scalar `Mul` or `Div`-by-constant -- never
+#   inspected/touched beyond that (a global scalar has no per-head axis).
+# - Wired into every entry point in this module's own "Attention-head
+#   pruning" family: :func:`apply_attention_head_pruning` (plain L1/L2),
+#   :func:`apply_attention_head_wanda_pruning` (the Wanda-calibrated
+#   variant), and the dry-run sensitivity-report family
+#   (:func:`_analyze_attention_head_pruning`/
+#   :func:`_analyze_attention_head_wanda_pruning`, via
+#   :func:`_analyze_attention_chains` -- reported under its own
+#   ``"attention_decomposed_group"`` family string). All three route matched
+#   :class:`_DecomposedGQAChain` chains through the exact same
+#   :func:`_gqa_group_importance`-based ranking (plain or Wanda-wrapped) and
+#   :func:`_apply_one_decomposed_gqa_chain` slicing this section already
+#   built for the plain variant -- pure wiring, no matching/slicing logic
+#   specific to either the calibrated or dry-run path.
+# - Packed-QKV (:func:`_match_packed_qkv_split`'s own shape -- one shared
+#   MatMul/vanilla-Gemm projection feeding a `Split` into Q-then-K-then-V
+#   column ranges, each of which then independently feeds this section's
+#   own `Reshape -> Transpose -> [repeat_kv]` head-split chain, the common
+#   GPT-2/GPT-J/GPT-NeoX/BLOOM/Falcon-style `c_attn`-family projection) IS
+#   recognized here -- see :class:`_DecomposedGQAChain`'s own
+#   `packed_split_sizes` field and :func:`_apply_one_decomposed_gqa_chain`'s
+#   own packed branch, which mirror :class:`_GQAChain`'s/
+#   :func:`_apply_one_gqa_chain`'s own analogous fused-node handling of this
+#   exact shape verbatim: a KV group's pruning removes that group's own Q/K/V
+#   column ranges from the *one* shared packed weight (and packed bias, if
+#   any) in a single combined slice, and shrinks the `Split` node's own
+#   split-sizes constant to match. Both the equal-split (plain MHA, e.g.
+#   GPT-2's `c_attn`) and unequal-split (GQA/MQA, e.g. Falcon's packed
+#   `query_key_value`) cases are handled -- `_match_packed_qkv_split` itself
+#   makes no MHA/GQA distinction, and this section's own combined-index-set
+#   slicing generalizes to any `nq`/`nk`/`nv` the same way the fused-node
+#   packed branch already does.
+# - Decomposed RoPE pass-through IS recognized here (see
+#   :func:`_match_decomposed_rope_pass_through`/
+#   :func:`_walk_back_through_decomposed_rope` and this module's own comment
+#   directly above :class:`_DecomposedRopePassThrough` for the confirmed
+#   topology): a real `torch.onnx.export()` of a Llama/Mistral/Qwen/Gemma-
+#   style eager-attention module applies HuggingFace's own
+#   `apply_rotary_pos_emb`/`rotate_half` -- genuinely decomposed math here,
+#   no fused rotary op at all -- to Q and to K independently, between each
+#   branch's own head-split `Transpose` and (for Q) the QK^T `MatMul`'s own
+#   Q input or (for K) wherever K's own dot-product transpose resolution
+#   expects its input (before `repeat_kv`, when both are present). Recognized
+#   and passed through untouched -- no tensor this hop owns is ever sliced
+#   or rewritten, since neither `cos`/`sin` nor `rotate_half`'s own `Slice`
+#   bounds ever carry a `num_heads`/`kv_num_heads`-sized axis (see
+#   :class:`_DecomposedRopePassThrough`'s own docstring) -- matched
+#   independently for Q and K (a chain with RoPE on only one of the two
+#   still matches; every real export applies it to both, but nothing here
+#   requires that). **Q/K-norm pass-through is deliberately NOT recognized
+#   here** -- a real, separate shape (only Qwen3/Gemma2-style architectures
+#   apply one, ahead of RoPE) left for a future, dedicated pass rather than
+#   bundled into this one, per this feature's own scope note; a graph
+#   combining a per-head Q/K-norm with this section's own decomposed shape
+#   (packed-producer or not, RoPE or not) simply declines the match (never
+#   guessed at), same as any other unrecognized topology.
+#   Cross-attention (Q's own source tensor distinct from K's/V's, including
+#   a genuinely different `seq_len` between the two) *is* recognized here,
+#   despite an earlier draft of this comment claiming otherwise: neither
+#   :func:`_find_decomposed_gqa_chains` nor :func:`_gqa_group_importance`
+#   ever ties Q's own producer weight (or its row count/source tensor) to
+#   K's/V's own -- confirmed empirically with a hand-built decomposed graph
+#   whose Q branch reads one input tensor and whose K/V branches read a
+#   second, differently-shaped one (see
+#   `test_decomposed_attention_cross_attention_matches_oracle_exactly` in
+#   `tests/test_pruning.py`), which matches and prunes correctly with zero
+#   code changes needed.
+
+
+@dataclass(frozen=True)
+class _RepeatKVBranch:
+    """One matched HuggingFace ``repeat_kv`` broadcast
+    (``Unsqueeze(axis=[2]) -> Expand -> Reshape``) on K's or V's own branch
+    -- see :func:`_match_decomposed_repeat_kv`. `expand_shape`/
+    `merge_reshape_shape` are the two target-shape constants
+    :func:`_apply_one_decomposed_gqa_chain` rewrites post-pruning (index 1
+    of each, to the new `kv_num_heads`/`num_heads` respectively);
+    `unsqueeze`'s own `axes` input (always literal ``[2]``) never changes
+    under head pruning and so is never touched, kept here purely for stale-
+    ``value_info`` bookkeeping.
+    """
+
+    unsqueeze: onnx.NodeProto
+    expand: onnx.NodeProto
+    expand_shape: str
+    merge_reshape: onnx.NodeProto
+    merge_reshape_shape: str
+
+
+@dataclass(frozen=True)
+class _DecomposedGQAChain:
+    """One matched decomposed (un-fused) GQA/MQA/plain-MHA attention block
+    -- see this module's own "Decomposed (un-fused) attention head pruning"
+    section comment for the full shape and scope this represents, and
+    :func:`_find_decomposed_gqa_chains` for how one is built. Shares
+    `head_size`/`v_head_size`/`num_heads`/`kv_num_heads` field names and
+    meaning with :class:`_GQAChain` (see that class's own docstring for
+    `v_head_size` in particular) purely so :func:`_gqa_group_importance` can
+    rank either chain type through the shared `_HeadGroupChain` alias with
+    no code duplicated; every other field here is specific to this chain's
+    own multi-`Reshape`/`Expand` shape-plumbing, which
+    :func:`_apply_one_gqa_chain` (built for a single fused node's own
+    `num_heads`/`kv_num_heads` *attribute*) has no equivalent of at all.
+
+    `k_headsplit_transpose` is ``None`` exactly when K's own dot-product
+    transpose is the single pre-composed ``perm=[0,2,3,1])`` shape (see this
+    module's own section comment above) -- there is then no separate
+    head-split `Transpose` node to track for stale-`value_info` purposes
+    beyond `k_transpose` itself. `k_repeat_kv`/`v_repeat_kv` are
+    independently ``None``/set (both always agree on `kv_num_heads`, already
+    enforced at match time, but are two distinct matched node groups on two
+    distinct branches).
+
+    `mask_node`/`mask_idx` are both ``None`` when no additive mask was
+    matched; otherwise `mask_idx` is the index within `mask_node.input` of
+    the mask operand itself (the *other* index resolves back toward the
+    QK^T `MatMul`) -- the exact `(node, idx)` shape
+    :func:`_slice_or_gather_head_bias` already expects. `scale_node` is
+    ``None`` when no scale hop was matched; never itself touched either way
+    (see this module's own section comment above).
+    """
+
+    q_weight: str
+    q_bias: Optional[str]
+    q_weight_transposed: bool
+    k_weight: str
+    k_bias: Optional[str]
+    k_weight_transposed: bool
+    v_weight: str
+    v_bias: Optional[str]
+    v_weight_transposed: bool
+    num_heads: int
+    kv_num_heads: int
+    head_size: int
+    v_head_size: int
+    q_transpose: onnx.NodeProto
+    q_reshape: onnx.NodeProto
+    q_reshape_shape: str
+    k_transpose: onnx.NodeProto
+    k_headsplit_transpose: Optional[onnx.NodeProto]
+    k_reshape: onnx.NodeProto
+    k_reshape_shape: str
+    k_repeat_kv: Optional[_RepeatKVBranch]
+    v_transpose: onnx.NodeProto
+    v_reshape: onnx.NodeProto
+    v_reshape_shape: str
+    v_repeat_kv: Optional[_RepeatKVBranch]
+    qk_matmul: onnx.NodeProto
+    scale_node: Optional[onnx.NodeProto]
+    mask_node: Optional[onnx.NodeProto]
+    mask_idx: Optional[int]
+    softmax_node: onnx.NodeProto
+    av_matmul: onnx.NodeProto
+    out_transpose: onnx.NodeProto
+    out_reshape: onnx.NodeProto
+    out_reshape_shape: Optional[str]
+    consumer_node: onnx.NodeProto
+    consumer_weight: str
+    consumer_weight_transposed: bool
+    packed_split_sizes: Optional[str] = None
+    # Set exactly when Q's/K's/V's own raw projection output all trace back
+    # to the *same* packed-QKV-then-``Split`` producer (see
+    # :func:`_match_packed_qkv_split`) rather than three independent
+    # MatMul/Gemm producers -- the decomposed-shape analogue of
+    # :class:`_GQAChain`'s own field of the same name (see that class's own
+    # field for the fused-node case this mirrors). When set, `q_weight`,
+    # `k_weight`, and `v_weight` all name the identical shared packed
+    # tensor (and `q_bias`/`k_bias`/`v_bias`, if not all ``None``, the
+    # identical shared packed bias) -- a column-range *view* into one
+    # ``[K, Nq+Nk+Nv]``-or-``[Nq+Nk+Nv, K]`` tensor rather than three
+    # separately-stored arrays -- and this field itself names the upstream
+    # ``Split`` node's own ``[nq, nk, nv]`` split-sizes initializer,
+    # rewritten post-pruning to the new column widths in
+    # :func:`_apply_one_decomposed_gqa_chain`'s own packed branch, mirroring
+    # :func:`_apply_one_gqa_chain`'s own `chain.packed_split_sizes` branch
+    # verbatim (see that function's own docstring for the exact combined-
+    # column-index-set construction both share).
+    packed_flatten_reshape: Optional[onnx.NodeProto] = None
+    packed_flatten_reshape_shape: Optional[str] = None
+    # Both set together, and only alongside `packed_split_sizes`, when the
+    # packed producer's own raw output is reshaped back to its original
+    # rank (`torch.onnx.export`'s own "flatten batch*seq before a Gemm"
+    # artifact -- see :func:`_match_decomposed_packed_qkv_producer`'s own
+    # docstring for the confirmed real export shape) before feeding the
+    # `Split` node -- `None`/`None` when the packed producer feeds `Split`
+    # directly (the onnxruntime-genai-model-builder shape
+    # :func:`_match_packed_qkv_split` was originally confirmed against).
+    # `packed_flatten_reshape_shape` names this `Reshape`'s own
+    # shape-constant input, whose LAST entry (the packed weight's own
+    # `nq + nk + nv` real output width) :func:`_apply_one_decomposed_gqa_chain`
+    # rewrites post-pruning via the same `_rewrite_shape_dim` clone-safety
+    # helper every other shape constant this chain owns already uses.
+    q_rope: Optional["_DecomposedRopePassThrough"] = None
+    k_rope: Optional["_DecomposedRopePassThrough"] = None
+    # Set exactly when :func:`_walk_back_through_decomposed_rope` crossed a
+    # decomposed RoPE application on Q's/K's own branch, between that
+    # branch's own head-split `Transpose` output and (for Q) the QK^T
+    # `MatMul`'s own Q input or (for K) wherever K's own dot-product
+    # transpose resolution expects its input -- see this module's own
+    # comment above :class:`_DecomposedRopePassThrough` for the exact
+    # topology and why it needs no slicing of any kind, unlike every other
+    # field this class names. Matched independently for Q and K (never
+    # required together) -- both are always present in a real RoPE-using
+    # export, but nothing here ties one branch's match to the other's, the
+    # same "independently None/set" treatment `k_repeat_kv`/`v_repeat_kv`
+    # already get. `k_rope` is always `None` when `k_headsplit_transpose`
+    # is (the combined-`perm=[0, 2, 3, 1]` shape) -- RoPE's own nodes
+    # always break the `Transpose`-`Transpose` adjacency that combined
+    # shape requires (see :func:`_find_decomposed_gqa_chains`'s own comment
+    # at its `k_perm` dispatch).
+
+
+# Either kind of matched whole-KV-group-pruned chain -- :func:`_gqa_group_importance`'s
+# own parameter type, widened from the bare `_GQAChain` it was written
+# against, with no logic change (it only ever reads the four int fields both
+# classes share).
+_HeadGroupChain = Union[_GQAChain, _DecomposedGQAChain]
+
+
+def _match_decomposed_head_split(
+    name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    perm: Sequence[int],
+) -> Optional[Tuple[onnx.NodeProto, onnx.NodeProto, int, int, str, str]]:
+    """Resolves `name` (already confirmed by the caller to be internal --
+    exactly one consumer, not a graph output) backward through the fixed
+    2-node ``Reshape -> Transpose`` head-split sequence a decomposed
+    attention export emits for one of Q's/K's/V's own projection outputs:
+
+        name = Transpose(Reshape(proj_out, [batch, seq, H, Dh]), perm=perm)
+
+    `perm` is either ``[0, 2, 1, 3]`` (the ordinary head-split, to BHSD --
+    used for Q always, and for K/V whenever K's own dot-product "swap" is a
+    separate node) or ``[0, 2, 3, 1]`` (K's own pre-composed head-split +
+    dot-product-swap in one node -- see this module's own section comment
+    above for why/when the ONNX exporter emits this instead). Either way
+    `H`/`Dh` live at the same target-shape indices (2/3) -- the RESHAPE's
+    own target shape is always ``[batch, seq, H, Dh]`` regardless of which
+    permutation is applied to it afterward.
+
+    Returns ``(transpose_node, reshape_node, H, Dh, reshape_shape_name,
+    proj_out_name)`` on a match, ``None`` otherwise. Deliberately close to
+    :func:`_match_bnsh_reshape` (same node topology, `perm=[0, 2, 1, 3]`
+    case) but NOT a call to it: that function also requires its own
+    `Reshape`'s shape-constant input have exactly one consumer, which is the
+    wrong bar here -- K's and V's own head-split `Reshape` routinely share
+    one literal ``[batch, seq, kv_num_heads, head_size]`` shape constant
+    once onnxsim's own common-subexpression elimination merges two
+    textually identical `Constant`s (confirmed empirically). This function
+    does not itself decide whether that sharing is safe to edit in place or
+    needs cloning first -- it just reports the shape constant's own name;
+    :func:`_apply_one_decomposed_gqa_chain`'s own `_rewrite_shape_dim` local
+    helper makes that call at apply time, once every branch's own owning
+    node(s) are known (see this module's own section comment above). The
+    reshaped tensor between the two nodes, and `proj_out_name` itself, still
+    get the ordinary single-consumer/not-a-graph-output bar every hop in
+    this module already holds -- only the shape *constant*'s own fan-out is
+    deferred.
+    """
+    transpose = node_by_output.get(name)
+    if (
+        transpose is None
+        or transpose.domain != ""
+        or transpose.op_type != "Transpose"
+        or len(transpose.input) != 1
+        or not transpose.input[0]
+        or len(transpose.output) != 1
+        or transpose.output[0] != name
+    ):
+        return None
+    found_perm: Optional[List[int]] = None
+    for attr in transpose.attribute:
+        if attr.name == "perm":
+            found_perm = list(attr.ints)
+    if found_perm != list(perm):
+        return None
+
+    reshaped_name = transpose.input[0]
+    if reshaped_name in graph_outputs or len(consumers_of.get(reshaped_name, [])) != 1:
+        return None
+    reshape = node_by_output.get(reshaped_name)
+    if (
+        reshape is None
+        or reshape.domain != ""
+        or reshape.op_type != "Reshape"
+        or len(reshape.input) != 2
+        or not reshape.input[0]
+        or not reshape.input[1]
+        or len(reshape.output) != 1
+        or reshape.output[0] != reshaped_name
+    ):
+        return None
+    shape_init = initializer_map.get(reshape.input[1])
+    if shape_init is None or shape_init.data_type != onnx.TensorProto.INT64:
+        return None
+    dims = onnx.numpy_helper.to_array(shape_init)
+    if dims.shape != (4,):
+        return None
+    num_heads, head_size = int(dims[2]), int(dims[3])
+    if num_heads <= 0 or head_size <= 0:
+        return None
+
+    proj_out = reshape.input[0]
+    if proj_out in graph_outputs or len(consumers_of.get(proj_out, [])) != 1:
+        return None
+
+    return transpose, reshape, num_heads, head_size, reshape.input[1], proj_out
+
+
+def _match_decomposed_repeat_kv(
+    name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> Optional[Tuple[_RepeatKVBranch, str, int, int]]:
+    """Resolves `name` (already confirmed by the caller to be internal)
+    backward through the standard HuggingFace ``repeat_kv`` broadcast --
+    ``Unsqueeze(axis=[2]) -> Expand -> Reshape`` -- onto its own
+    pre-broadcast ``[batch, kv_num_heads, seq, head_size]`` root (the
+    caller's own K's/V's own :func:`_match_decomposed_head_split` output).
+
+    Returns ``(branch, raw_name, kv_num_heads, n_rep)`` -- `raw_name` for
+    the caller to resolve backward through the ordinary head-split next,
+    `kv_num_heads`/`n_rep` read directly off the `Expand`'s own literal
+    target shape -- or ``None`` if `name` isn't produced by exactly this
+    shape, INCLUDING simply not being produced by a ``Reshape`` at all (the
+    common case for a non-GQA/non-MQA chain with no `repeat_kv` -- the
+    caller falls back to treating `name` itself as the raw head-split
+    output when this declines).
+
+    Every constant shape here (`Expand`'s own broadcast target and the
+    merge `Reshape`'s own target) must already be a fully resolved literal
+    ``TensorProto`` -- true for a statically-shaped export, and for the
+    common batch-dynamic-only export once onnxsim's own constant folding
+    has resolved the ``ConstantOfShape``/``Equal``/``Where`` boilerplate
+    PyTorch's own ``aten::expand`` symbolic always emits (confirmed
+    empirically -- see this module's own section comment above) -- a
+    genuinely unresolved dynamic shape declines here rather than guessed
+    at.
+    """
+    reshape = node_by_output.get(name)
+    if (
+        reshape is None
+        or reshape.domain != ""
+        or reshape.op_type != "Reshape"
+        or len(reshape.input) != 2
+        or not reshape.input[0]
+        or not reshape.input[1]
+        or len(reshape.output) != 1
+        or reshape.output[0] != name
+    ):
+        return None
+    merge_shape_init = initializer_map.get(reshape.input[1])
+    if merge_shape_init is None or merge_shape_init.data_type != onnx.TensorProto.INT64:
+        return None
+    merge_dims = onnx.numpy_helper.to_array(merge_shape_init)
+    if merge_dims.shape != (4,):
+        return None
+    merged_heads = int(merge_dims[1])
+    if merged_heads <= 0:
+        return None
+
+    expand_out = reshape.input[0]
+    if expand_out in graph_outputs or len(consumers_of.get(expand_out, [])) != 1:
+        return None
+    expand = node_by_output.get(expand_out)
+    if (
+        expand is None
+        or expand.domain != ""
+        or expand.op_type != "Expand"
+        or len(expand.input) != 2
+        or not expand.input[0]
+        or not expand.input[1]
+        or len(expand.output) != 1
+        or expand.output[0] != expand_out
+    ):
+        return None
+    expand_shape_init = initializer_map.get(expand.input[1])
+    if (
+        expand_shape_init is None
+        or expand_shape_init.data_type != onnx.TensorProto.INT64
+    ):
+        return None
+    expand_dims = onnx.numpy_helper.to_array(expand_shape_init)
+    if expand_dims.shape != (5,):
+        return None
+    kv_num_heads, n_rep = int(expand_dims[1]), int(expand_dims[2])
+    if kv_num_heads <= 0 or n_rep <= 0 or kv_num_heads * n_rep != merged_heads:
+        return None
+
+    unsqueeze_out = expand.input[0]
+    if unsqueeze_out in graph_outputs or len(consumers_of.get(unsqueeze_out, [])) != 1:
+        return None
+    unsqueeze = node_by_output.get(unsqueeze_out)
+    if (
+        unsqueeze is None
+        or unsqueeze.domain != ""
+        or unsqueeze.op_type != "Unsqueeze"
+        or len(unsqueeze.input) != 2
+        or not unsqueeze.input[0]
+        or not unsqueeze.input[1]
+        or len(unsqueeze.output) != 1
+        or unsqueeze.output[0] != unsqueeze_out
+    ):
+        return None
+    axes_init = initializer_map.get(unsqueeze.input[1])
+    if axes_init is None or axes_init.data_type != onnx.TensorProto.INT64:
+        return None
+    axes = onnx.numpy_helper.to_array(axes_init)
+    if axes.shape != (1,) or int(axes[0]) != 2:
+        return None
+
+    raw_name = unsqueeze.input[0]
+    if raw_name in graph_outputs or len(consumers_of.get(raw_name, [])) != 1:
+        return None
+
+    branch = _RepeatKVBranch(
+        unsqueeze=unsqueeze,
+        expand=expand,
+        expand_shape=expand.input[1],
+        merge_reshape=reshape,
+        merge_reshape_shape=reshape.input[1],
+    )
+    return branch, raw_name, kv_num_heads, n_rep
+
+
+def _match_decomposed_packed_qkv_producer(
+    split_node: onnx.NodeProto,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> Optional[
+    Tuple[
+        str,
+        bool,
+        Optional[str],
+        int,
+        int,
+        int,
+        str,
+        Optional[onnx.NodeProto],
+        Optional[str],
+    ]
+]:
+    """Resolves `split_node` -- already confirmed by the caller to be the
+    single shared producer of Q's/K's/V's own raw (pre-reshape) projection
+    outputs -- as this module's own packed-QKV producer
+    (:func:`_match_packed_qkv_split`'s own shape), optionally through one
+    intervening pass-through ``Reshape`` sitting directly between the
+    packed MatMul/Gemm projection and this `Split` node.
+
+    That extra ``Reshape`` -- absent from :func:`_match_packed_qkv_split`'s
+    own confirmed onnxruntime-genai-model-builder export (which wires the
+    packed projection's raw output into `Split` directly) -- is a
+    genuinely different, ALSO real artifact: onnxsim's own
+    `fuse_matmul_add_bias_into_gemm` optimizer pass flattens a packed
+    projection's rank-3 `MatMul`/`Add` into a rank-2 `Gemm` (mirroring
+    every other producer this module's "Decomposed (un-fused) attention
+    head pruning" section already handles -- see this module's own section
+    comment above :func:`_match_decomposed_head_split`), then reshapes that
+    `Gemm`'s own raw 2-D output back to the original rank-3 shape whenever
+    its immediate real consumer isn't itself a plain `Reshape` the pass can
+    trivially absorb into one combined target -- true for a `Split`
+    (confirmed empirically via a real `torch.onnx.export` of a GPT-2-style
+    packed `c_attn` `Linear` run through `onnxsim.simplify()`, not merely
+    hypothesized -- see `tests/test_pruning.py`'s own
+    `test_decomposed_packed_qkv_real_torch_export_pipeline`). This function
+    handles both: when `split_node.input[0]` is produced directly by a
+    `_match_producer`-accepted node, it behaves identically to
+    :func:`_match_packed_qkv_split` (a plain delegating call, no behavior
+    change for that already-working shape); when it is instead produced by
+    exactly this pass-through `Reshape`, it resolves one hop further back
+    before delegating, and additionally confirms the `Reshape`'s own target
+    shape is a fully resolved literal whose last entry equals the packed
+    weight's own real output width (`nq + nk + nv`) -- never guessed at
+    otherwise.
+
+    Returns :func:`_match_packed_qkv_split`'s own 7-tuple plus two more
+    entries, `(flatten_reshape, flatten_reshape_shape)` -- both ``None``
+    when no such `Reshape` was crossed (the direct case), otherwise the
+    crossed node and the name of its own shape-constant input for
+    :func:`_apply_one_decomposed_gqa_chain`'s own post-pruning rewrite (its
+    own real output width shrinks in lock-step with the packed weight's
+    own, so this constant's last entry must be rewritten too, via the
+    identical `_rewrite_shape_dim` clone-safety mechanism every other shape
+    constant this chain owns already uses) -- or ``None`` if neither shape
+    matches.
+    """
+    if split_node.op_type != "Split" or not split_node.input or not split_node.input[0]:
+        return None
+    data_name = split_node.input[0]
+
+    direct = _match_packed_qkv_split(
+        split_node, initializer_map, consumers_of, node_by_output
+    )
+    if direct is not None:
+        return direct + (None, None)
+
+    # Not a direct MatMul/Gemm-to-Split producer -- try resolving one
+    # pass-through `Reshape` hop first (see this function's own docstring).
+    # `data_name`'s own "exactly one consumer" bar (the ordinary
+    # single-consumer/not-a-graph-output invariant every hop in this
+    # module already holds) is checked here explicitly, since the
+    # delegating call below checks that same bar against the *reshape's*
+    # own input, not `data_name` itself.
+    if data_name in graph_outputs or len(consumers_of.get(data_name, [])) != 1:
+        return None
+    reshape = node_by_output.get(data_name)
+    if (
+        reshape is None
+        or reshape.domain != ""
+        or reshape.op_type != "Reshape"
+        or len(reshape.input) != 2
+        or not reshape.input[0]
+        or not reshape.input[1]
+        or len(reshape.output) != 1
+        or reshape.output[0] != data_name
+    ):
+        return None
+
+    synthetic = onnx.NodeProto()
+    synthetic.CopyFrom(split_node)
+    synthetic.input[0] = reshape.input[0]
+    resolved = _match_packed_qkv_split(
+        synthetic, initializer_map, consumers_of, node_by_output
+    )
+    if resolved is None:
+        return None
+    _, _, _, nq, nk, nv, _ = resolved
+
+    shape_init = initializer_map.get(reshape.input[1])
+    if shape_init is None or shape_init.data_type != onnx.TensorProto.INT64:
+        return None
+    dims = onnx.numpy_helper.to_array(shape_init)
+    if dims.size == 0 or int(dims[-1]) != nq + nk + nv:
+        return None
+
+    return resolved + (reshape, reshape.input[1])
+
+
+def _resolve_decomposed_qk_root(
+    smax_input: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> Optional[
+    Tuple[
+        onnx.NodeProto,
+        Optional[onnx.NodeProto],
+        Optional[str],
+        Optional[onnx.NodeProto],
+    ]
+]:
+    """Resolves a ``Softmax``'s own input (`smax_input`) backward through the
+    fixed, optional ``[Add(mask) ->] [Mul/Div(scale) ->] MatMul`` prefix a
+    decomposed attention score computation uses -- HF's own
+    ``eager_attention_forward``: ``scores = (q @ k.T) * scaling``, then, only
+    if a mask is given, ``scores = scores + causal_mask``, in that fixed
+    order (never tried the other way around -- a graph applying the two in
+    reverse order is declined here, not guessed at) -- to the QK^T ``MatMul``
+    node itself.
+
+    Returns ``(qk_matmul, mask_node, mask_operand_name, scale_node)`` -- the
+    latter two/one ``None`` when absent -- or ``None`` if `smax_input` isn't
+    produced by any of the three recognized shapes (bare ``MatMul``,
+    ``[Mul/Div ->] MatMul``, or ``Add -> [Mul/Div ->] MatMul``). The scale
+    operand, when present, must be a scalar constant (``prod(dims) == 1``,
+    for either operand of a ``Mul`` or the divisor of a ``Div``) -- a global
+    scale has no per-head axis, so it is matched but never itself sliced.
+    """
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    def _is_scalar_const(name: str) -> bool:
+        init = initializer_map.get(name)
+        return init is not None and int(np.prod(init.dims)) == 1
+
+    cur = smax_input
+    mask_node: Optional[onnx.NodeProto] = None
+    mask_operand: Optional[str] = None
+    if _is_internal(cur):
+        cand = node_by_output.get(cur)
+        if (
+            cand is not None
+            and cand.op_type == "Add"
+            and cand.domain == ""
+            and len(cand.input) == 2
+            and cand.output[0] == cur
+        ):
+            a, b = cand.input
+            for root_name, other_name in ((a, b), (b, a)):
+                if not root_name or not other_name or root_name == other_name:
+                    continue
+                if not _is_internal(root_name):
+                    continue
+                probe = node_by_output.get(root_name)
+                if (
+                    probe is not None
+                    and probe.domain == ""
+                    and probe.op_type
+                    in (
+                        "MatMul",
+                        "Mul",
+                        "Div",
+                    )
+                ):
+                    mask_node, mask_operand, cur = cand, other_name, root_name
+                    break
+            if mask_node is None:
+                return None  # an Add here that isn't our mask -- decline
+
+    scale_node: Optional[onnx.NodeProto] = None
+    if _is_internal(cur):
+        probe = node_by_output.get(cur)
+        if (
+            probe is not None
+            and probe.op_type in ("Mul", "Div")
+            and probe.domain == ""
+            and len(probe.input) == 2
+            and probe.output[0] == cur
+        ):
+            a, b = probe.input
+            if a != b and _is_scalar_const(b):
+                scale_node, cur = probe, a
+            elif a != b and probe.op_type == "Mul" and _is_scalar_const(a):
+                scale_node, cur = probe, b
+
+    if not _is_internal(cur):
+        return None
+    qk_matmul = node_by_output.get(cur)
+    if (
+        qk_matmul is None
+        or qk_matmul.op_type != "MatMul"
+        or qk_matmul.domain != ""
+        or len(qk_matmul.input) != 2
+        or qk_matmul.output[0] != cur
+    ):
+        return None
+    return qk_matmul, mask_node, mask_operand, scale_node
+
+
+# Decomposed (un-fused) RoPE pass-through -- the decomposed-shape analogue of
+# :func:`_walk_back_through_qk_norm_rope`'s own `RotaryEmbedding`/
+# `MRotaryEmbedding` hop, for the genuinely different topology a plain
+# `torch.onnx.export()` of a Llama/Mistral/Qwen/Gemma-style eager-attention
+# module emits: there is no fused rotary op at all here, only HuggingFace's
+# own `apply_rotary_pos_emb`/`rotate_half` helpers decomposed into ordinary
+# ai.onnx nodes. Confirmed empirically (a hand-built module mirroring
+# `transformers.models.llama.modeling_llama`'s own `apply_rotary_pos_emb`/
+# `rotate_half`, `torch.onnx.export(..., opset_version=17, dynamo=False)`,
+# run through this module's own `onnxsim.simplify()` -- both a GQA/repeat_kv
+# case and a plain-MHA, no-repeat_kv case, since repeat_kv's presence turned
+# out not to affect this hop's own shape at all) to be the fixed, 7-node
+# sequence, applied identically and independently to Q and to K, each rooted
+# at that branch's own head-split `Transpose`'s output (`x`, the BHSD
+# tensor):
+#
+#     direct  = Mul(x, cos_operand)
+#     x1      = Slice(x, starts=[0],    ends=[half],      axes=[3], steps=[1])
+#     x2      = Slice(x, starts=[half], ends=[>= half],   axes=[3], steps=[1])
+#     neg     = Neg(x2)
+#     rotated_x = Concat(neg, x1, axis=-1_or_3)   # rotate_half(x) = cat(-x2, x1)
+#     rotated = Mul(rotated_x, sin_operand)
+#     result  = Add(direct, rotated)   # order confirmed: direct first, rotated second
+#
+# -- landing exactly on `result = x * cos + rotate_half(x) * sin`, HuggingFace's
+# own fixed formula, with `rotate_half`'s own `Slice` bounds resolving to a
+# clean, contiguous, non-overlapping split of the trailing (`head_size`) axis
+# into two equal halves (`half * 2 == head_size`, confirmed once `head_size`
+# itself is known -- see :func:`_decomposed_rope_hop_is_consistent`, the
+# deferred check this hop shares the idiom of with
+# :func:`_qk_norm_rope_hop_is_consistent`). `cos_operand`/`sin_operand` are
+# never inspected further -- confirmed to be, in different real exports,
+# either a graph input, a `Constant`, or fed by further upstream ops (e.g. a
+# `position_ids`-derived `Gather`); every one of those is safely treated as
+# one opaque per-position/per-half-head-dim operand this pass never needs to
+# resolve, since neither ever carries a `num_heads`/`kv_num_heads`-sized axis
+# to slice (broadcast over heads, sliced only along `head_size`, which whole-
+# head/KV-group pruning never touches). `cos_operand`/`sin_operand` are also
+# routinely the exact same shared tensor for Q's and K's own hop (confirmed
+# empirically -- both branches read `cos`/`sin` identically) -- harmless,
+# since neither is ever read by more than this fan-out, and neither is ever
+# written to.
+#
+# `x` itself (this branch's own pre-RoPE head-split `Transpose` output) is
+# read by exactly three consumers once RoPE is present -- the `direct` `Mul`
+# and both `Slice`s -- one more than the ordinary "single consumer" bar every
+# other hop in this section holds its own root to; checked explicitly here
+# (never guessed at) since fan-out any different from exactly this shape
+# means something this pass doesn't understand is also reading `x`.
+#
+# Q's and K's own matched node groups never share a single node with each
+# other (confirmed empirically -- distinct `Mul`/`Slice`/`Neg`/`Concat`/`Add`
+# nodes for each, operating on each branch's own distinct tensor), so no
+# `extra_stale_outputs`-style bookkeeping (:class:`_QKNormRopePassThrough`'s
+# own field for the *fused* family's analogous `GemmaRotaryEmbedding` sharing
+# case) is ever needed here.
+#
+# Unlike every hop :class:`_QKNormRopePassThrough` names, NOTHING here is a
+# shape constant carrying a literal head count: `cos_operand`/`sin_operand`
+# are per-position/per-half-head-dim (never per-head), and the `Slice` bounds
+# are fixed in terms of `head_size` alone, which whole-head/KV-group pruning
+# never changes -- only `num_heads`/`kv_num_heads` do. So this hop needs zero
+# rewriting of any kind post-pruning; :class:`_DecomposedRopePassThrough`
+# exists purely to name the matched nodes for stale-`value_info` bookkeeping,
+# the same purpose :class:`_QKNormRopePassThrough`'s own `nodes` field serves.
+@dataclass(frozen=True)
+class _DecomposedRopePassThrough:
+    """One matched Q- or K-branch decomposed RoPE application -- see this
+    module's own comment directly above for the exact topology and the
+    empirical confirmation behind it. `nodes` lists every node crossed (the
+    `Add`, both `Mul`s, the `Concat`/`Neg`/both `Slice`s of `rotate_half`, in
+    that order), purely for :func:`_apply_one_decomposed_gqa_chain`'s own
+    stale-`value_info` bookkeeping -- none of them ever need editing (see
+    this module's own comment above for why). `half` is the confirmed
+    `rotate_half` split point (`x1`'s own `Slice`'s `ends[0]`), threaded
+    through purely for :func:`_decomposed_rope_hop_is_consistent`'s own
+    deferred `half * 2 == head_size` check, run once `head_size` itself is
+    known (see that function's own docstring for why this can't be checked
+    any earlier -- the same deferred idiom :func:`_qk_norm_rope_hop_is_consistent`
+    already uses for the *fused* family's own analogous hop).
+    """
+
+    nodes: Tuple[onnx.NodeProto, ...]
+    half: int
+
+
+def _match_decomposed_rotate_half_slice(
+    name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> Optional[
+    Tuple[onnx.NodeProto, onnx.NodeProto, onnx.NodeProto, onnx.NodeProto, str, int]
+]:
+    """Resolves `name` (already confirmed by the caller to be internal)
+    backward through the textbook HuggingFace ``rotate_half`` -- ``Concat(Neg(Slice(x,
+    second_half)), Slice(x, first_half), axis=-1)`` -- see this module's own
+    comment above :class:`_DecomposedRopePassThrough` for the exact
+    confirmed shape. Both ``Slice``s must share the identical root `x` and
+    resolve to a contiguous, non-overlapping, ``axes=[3]``-or-``[-1]``,
+    ``steps=[1]`` split (first half starting at 0, second half starting
+    exactly where the first ends and reaching at least that same point) --
+    the actual ``half * 2 == head_size`` cleanliness check is deferred to
+    :func:`_decomposed_rope_hop_is_consistent`, the same idiom
+    :func:`_match_decomposed_head_split` already defers its own shape
+    constant's fan-out safety to the caller for.
+
+    Returns ``(concat, neg, slice_first_half, slice_second_half, root_name,
+    half)`` on a match, ``None`` otherwise -- including whenever `name` isn't
+    produced by exactly this shape (a `Split`-based half, like
+    :func:`_match_rotate_half` matches for `GemmaRotaryEmbedding`'s own
+    output side, is a genuinely different topology and is not matched here).
+    """
+
+    def _is_internal(n: str) -> bool:
+        return len(consumers_of.get(n, [])) == 1 and n not in graph_outputs
+
+    concat = node_by_output.get(name)
+    if (
+        concat is None
+        or concat.domain != ""
+        or concat.op_type != "Concat"
+        or len(concat.input) != 2
+        or not concat.input[0]
+        or not concat.input[1]
+        or len(concat.output) != 1
+        or concat.output[0] != name
+    ):
+        return None
+    concat_axis = None
+    for attr in concat.attribute:
+        if attr.name == "axis":
+            concat_axis = attr.i
+    if concat_axis not in (-1, 3):
+        return None
+
+    neg_out, x1_out = concat.input
+    if neg_out == x1_out or not _is_internal(neg_out):
+        return None
+    neg = node_by_output.get(neg_out)
+    if (
+        neg is None
+        or neg.domain != ""
+        or neg.op_type != "Neg"
+        or len(neg.input) != 1
+        or not neg.input[0]
+        or len(neg.output) != 1
+        or neg.output[0] != neg_out
+    ):
+        return None
+    x2_out = neg.input[0]
+    if not x2_out or not _is_internal(x2_out):
+        return None
+
+    def _match_half_slice(
+        out_name: str,
+    ) -> Optional[Tuple[onnx.NodeProto, str, int, int]]:
+        s = node_by_output.get(out_name)
+        if (
+            s is None
+            or s.domain != ""
+            or s.op_type != "Slice"
+            or len(s.input) != 5
+            or not all(s.input)
+            or len(s.output) != 1
+            or s.output[0] != out_name
+        ):
+            return None
+        data_name, starts_n, ends_n, axes_n, steps_n = s.input
+        if not data_name:
+            return None
+        consts = [initializer_map.get(n) for n in (starts_n, ends_n, axes_n, steps_n)]
+        if any(c is None or c.data_type != onnx.TensorProto.INT64 for c in consts):
+            return None
+        starts, ends, axes, steps = (onnx.numpy_helper.to_array(c) for c in consts)
+        if (
+            starts.shape != (1,)
+            or ends.shape != (1,)
+            or axes.shape != (1,)
+            or steps.shape != (1,)
+        ):
+            return None
+        if int(axes[0]) not in (-1, 3) or int(steps[0]) != 1:
+            return None
+        return s, data_name, int(starts[0]), int(ends[0])
+
+    slice1 = _match_half_slice(x1_out)  # expected: x[..., :half]
+    if slice1 is None:
+        return None
+    slice1_node, root1, start1, end1 = slice1
+    slice2 = _match_half_slice(x2_out)  # expected: x[..., half:]
+    if slice2 is None:
+        return None
+    slice2_node, root2, start2, end2 = slice2
+
+    if root1 != root2 or root1 in graph_outputs:
+        return None
+    if start1 != 0 or end1 <= 0 or start2 != end1 or end2 < end1:
+        return None
+
+    return concat, neg, slice1_node, slice2_node, root1, end1
+
+
+def _match_decomposed_rope_pass_through(
+    name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> Optional[Tuple[_DecomposedRopePassThrough, str]]:
+    """Resolves `name` (already confirmed by the caller to be internal --
+    exactly one consumer, not a graph output) backward through the fixed
+    7-node decomposed-RoPE shape :class:`_DecomposedRopePassThrough`'s own
+    docstring (and this module's own comment directly above it) describes.
+
+    Returns ``(hop, root_name)`` -- `root_name` the tensor immediately
+    upstream of every node crossed (expected, by the caller, to be this
+    branch's own head-split `Transpose` output) -- or ``None`` if `name`
+    isn't produced by exactly this shape, INCLUDING simply not being
+    produced by an ``Add`` at all (the common case for a chain with no RoPE
+    -- the caller falls back to treating `name` itself as the pre-RoPE root
+    when this declines, mirroring :func:`_match_decomposed_repeat_kv`'s own
+    "not this shape at all" fallback convention).
+    """
+
+    def _is_internal(n: str) -> bool:
+        return len(consumers_of.get(n, [])) == 1 and n not in graph_outputs
+
+    add = node_by_output.get(name)
+    if (
+        add is None
+        or add.domain != ""
+        or add.op_type != "Add"
+        or len(add.input) != 2
+        or not add.input[0]
+        or not add.input[1]
+        or len(add.output) != 1
+        or add.output[0] != name
+    ):
+        return None
+    a_name, b_name = add.input
+    if a_name == b_name:
+        return None
+
+    def _try_order(
+        direct_name: str, rotated_name: str
+    ) -> Optional[Tuple[_DecomposedRopePassThrough, str]]:
+        if not _is_internal(direct_name) or not _is_internal(rotated_name):
+            return None
+        mul_direct = node_by_output.get(direct_name)
+        mul_rotated = node_by_output.get(rotated_name)
+        for mul in (mul_direct, mul_rotated):
+            if (
+                mul is None
+                or mul.domain != ""
+                or mul.op_type != "Mul"
+                or len(mul.input) != 2
+                or not mul.input[0]
+                or not mul.input[1]
+                or len(mul.output) != 1
+            ):
+                return None
+        assert mul_direct is not None and mul_rotated is not None
+        if mul_direct.output[0] != direct_name or mul_rotated.output[0] != rotated_name:
+            return None
+
+        rot_a, rot_b = mul_rotated.input
+        for concat_name, sin_operand in ((rot_a, rot_b), (rot_b, rot_a)):
+            if concat_name == sin_operand or not _is_internal(concat_name):
+                continue
+            rotate_half = _match_decomposed_rotate_half_slice(
+                concat_name,
+                consumers_of,
+                graph_outputs,
+                node_by_output,
+                initializer_map,
+            )
+            if rotate_half is None:
+                continue
+            concat, neg, slice1, slice2, root_name, half = rotate_half
+
+            d_a, d_b = mul_direct.input
+            for root_cand, cos_operand in ((d_a, d_b), (d_b, d_a)):
+                if root_cand != root_name or root_cand == cos_operand:
+                    continue
+                # `root_name` must be read by exactly the three consumers
+                # this hop itself accounts for (the direct `Mul` plus both
+                # `Slice`s) -- see this module's own comment above
+                # :class:`_DecomposedRopePassThrough` for why this, unlike
+                # every other root this section's matchers resolve, is
+                # deliberately checked against 3 rather than 1.
+                if len(consumers_of.get(root_name, [])) != 3:
+                    continue
+                return (
+                    _DecomposedRopePassThrough(
+                        (add, mul_direct, mul_rotated, concat, neg, slice1, slice2),
+                        half,
+                    ),
+                    root_name,
+                )
+        return None
+
+    return _try_order(a_name, b_name) or _try_order(b_name, a_name)
+
+
+def _walk_back_through_decomposed_rope(
+    name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> Tuple[str, Optional[_DecomposedRopePassThrough]]:
+    """Thin wrapper around :func:`_match_decomposed_rope_pass_through`
+    mirroring :func:`_walk_back_through_qk_norm_rope`'s own ``(root_name,
+    hop)`` return convention -- ``(name, None)`` when no RoPE hop was
+    crossed, so the caller can call :func:`_match_decomposed_head_split` on
+    the result uniformly regardless of whether RoPE was present.
+    """
+    matched = _match_decomposed_rope_pass_through(
+        name, consumers_of, graph_outputs, node_by_output, initializer_map
+    )
+    if matched is None:
+        return name, None
+    hop, root_name = matched
+    return root_name, hop
+
+
+def _decomposed_rope_hop_is_consistent(
+    hop: Optional[_DecomposedRopePassThrough], head_size: int
+) -> bool:
+    """Deferred correctness check for a
+    :func:`_walk_back_through_decomposed_rope` result, run only once
+    `head_size` (this branch's own, resolved by the caller's own
+    :func:`_match_decomposed_head_split` call on the returned root) is
+    itself known -- the same deferred idiom
+    :func:`_qk_norm_rope_hop_is_consistent` already uses for the *fused*
+    family's own analogous hop. `True` (nothing to check) when `hop` is
+    ``None``. Otherwise requires the matched ``rotate_half``'s own split
+    point to be an exact, clean half of `head_size` (``hop.half * 2 ==
+    head_size``) -- declined (``False``), never guessed at, on any
+    mismatch (e.g. a `Slice` that isn't actually splitting `head_size` in
+    half at all).
+    """
+    if hop is None:
+        return True
+    return hop.half * 2 == head_size
+
+
+def _find_decomposed_gqa_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_DecomposedGQAChain]:
+    """Matches this module's own decomposed (un-fused) attention shape --
+    see this module's own "Decomposed (un-fused) attention head pruning"
+    section comment for the full shape/scope. Anchored on each ``Softmax``
+    node in `graph` (rather than scanning every MatMul/Gemm the way an
+    ordinary producer-first finder does) since a plain ``axis=-1`` Softmax
+    is a far rarer, more specific anchor than a MatMul/Gemm -- most of which
+    are ordinary Linear layers with nothing to do with attention at all.
+
+    `value_info_by_name` -- built the same way every other "Attention-head
+    pruning" family entry point builds one (see
+    :func:`apply_attention_head_pruning`) -- feeds
+    :func:`_head_bias_input_is_safe`'s own dynamic-mask classification,
+    exactly as the fused-node family's own `attention_bias`/`attn_mask`
+    handling already does. Defaults to ``{}`` -- a real dynamic mask simply
+    declines the whole chain then, same as an unresolvable one always does.
+    """
+    if value_info_by_name is None:
+        value_info_by_name = {}
+    initializer_map = _constant_map(graph)
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+    node_by_output = {out: node for node in graph.node for out in node.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains: List[_DecomposedGQAChain] = []
+
+    for node in graph.node:
+        if node.op_type != "Softmax" or node.domain != "":
+            continue
+        axis = -1
+        for attr in node.attribute:
+            if attr.name == "axis":
+                axis = attr.i
+        if axis != -1:
+            continue
+        if len(node.input) != 1 or not node.input[0] or len(node.output) != 1:
+            continue
+        smax_out = node.output[0]
+        if not _is_internal(smax_out):
+            continue
+
+        root = _resolve_decomposed_qk_root(
+            node.input[0], consumers_of, graph_outputs, node_by_output, initializer_map
+        )
+        if root is None:
+            continue
+        qk_matmul, mask_node, mask_operand, scale_node = root
+
+        q_bhsd_name, k_operand = qk_matmul.input
+        if not _is_internal(q_bhsd_name) or not _is_internal(k_operand):
+            continue
+
+        # ---- K's own dot-product transpose: combined or separate form ----
+        k_transpose = node_by_output.get(k_operand)
+        if (
+            k_transpose is None
+            or k_transpose.domain != ""
+            or k_transpose.op_type != "Transpose"
+        ):
+            continue
+        k_perm: Optional[List[int]] = None
+        for attr in k_transpose.attribute:
+            if attr.name == "perm":
+                k_perm = list(attr.ints)
+
+        k_headsplit_transpose: Optional[onnx.NodeProto]
+        k_repeat_kv: Optional[_RepeatKVBranch] = None
+        # RoPE, when present on K's own branch, always forces the separate-
+        # transpose form below: its own `Slice`/`Mul`/`Add` nodes sit
+        # between the head-split `Transpose` and the dot-product "swap"
+        # `Transpose`, breaking the node-adjacency PyTorch's own
+        # `fuseConsecutiveTransposes` peephole requires to collapse the two
+        # into this combined `perm=[0, 2, 3, 1]` shape (confirmed
+        # empirically -- see this module's own comment above
+        # :class:`_DecomposedRopePassThrough`) -- so this branch never
+        # crosses RoPE at all, `k_rope` stays `None` for it unconditionally.
+        k_rope: Optional[_DecomposedRopePassThrough] = None
+        if k_perm == [0, 2, 3, 1]:
+            k_split = _match_decomposed_head_split(
+                k_operand,
+                consumers_of,
+                graph_outputs,
+                node_by_output,
+                initializer_map,
+                (0, 2, 3, 1),
+            )
+            if k_split is None:
+                continue
+            _, k_reshape, kv_num_heads, head_size_k, k_reshape_shape, k_proj_out = (
+                k_split
+            )
+            k_headsplit_transpose = None
+        elif k_perm == [0, 1, 3, 2]:
+            k_bhsd_name = k_transpose.input[0] if len(k_transpose.input) == 1 else None
+            if not k_bhsd_name or not _is_internal(k_bhsd_name):
+                continue
+            repeat = _match_decomposed_repeat_kv(
+                k_bhsd_name,
+                consumers_of,
+                graph_outputs,
+                node_by_output,
+                initializer_map,
+            )
+            if repeat is not None:
+                k_repeat_kv, k_raw_name, kv_num_heads, _n_rep = repeat
+                if not _is_internal(k_raw_name):
+                    continue
+            else:
+                k_raw_name, kv_num_heads = (
+                    k_bhsd_name,
+                    None,
+                )  # resolved via head-split below
+            k_rope_root, k_rope = _walk_back_through_decomposed_rope(
+                k_raw_name, consumers_of, graph_outputs, node_by_output, initializer_map
+            )
+            k_split = _match_decomposed_head_split(
+                k_rope_root,
+                consumers_of,
+                graph_outputs,
+                node_by_output,
+                initializer_map,
+                (0, 2, 1, 3),
+            )
+            if k_split is None:
+                continue
+            (
+                k_headsplit_transpose,
+                k_reshape,
+                resolved_kv_heads,
+                head_size_k,
+                k_reshape_shape,
+                k_proj_out,
+            ) = k_split
+            if not _decomposed_rope_hop_is_consistent(k_rope, head_size_k):
+                continue
+            if kv_num_heads is None:
+                kv_num_heads = resolved_kv_heads
+            elif kv_num_heads != resolved_kv_heads:
+                continue
+        else:
+            continue
+        # Always a definite int by this point -- either unpacked directly
+        # from `k_split` (the combined-perm branch), from `repeat` (the
+        # repeat_kv branch), or resolved from `resolved_kv_heads` just above
+        # (the no-repeat_kv, separate-perm branch) -- every path that could
+        # leave it `None` already `continue`d instead. Spelled out for the
+        # type checker, which can't otherwise connect the nested
+        # `if kv_num_heads is None: kv_num_heads = ...` reassignment above
+        # across the enclosing `if`/`elif`.
+        assert kv_num_heads is not None
+
+        # ---- Q's own branch: plain head-split, never repeat_kv ----
+        q_rope_root, q_rope = _walk_back_through_decomposed_rope(
+            q_bhsd_name, consumers_of, graph_outputs, node_by_output, initializer_map
+        )
+        q_split = _match_decomposed_head_split(
+            q_rope_root,
+            consumers_of,
+            graph_outputs,
+            node_by_output,
+            initializer_map,
+            (0, 2, 1, 3),
+        )
+        if q_split is None:
+            continue
+        q_transpose, q_reshape, num_heads, head_size, q_reshape_shape, q_proj_out = (
+            q_split
+        )
+        if not _decomposed_rope_hop_is_consistent(q_rope, head_size):
+            continue
+        if head_size != head_size_k or num_heads <= 0 or kv_num_heads <= 0:
+            continue
+        if num_heads % kv_num_heads != 0:
+            continue
+
+        # ---- forward: AV MatMul, output Transpose, combine-back Reshape ----
+        av_matmul = consumers_of[smax_out][0]
+        if (
+            av_matmul.op_type != "MatMul"
+            or av_matmul.domain != ""
+            or len(av_matmul.input) != 2
+            or smax_out not in av_matmul.input
+            or len(av_matmul.output) != 1
+        ):
+            continue
+        v_bhsd_name = (
+            av_matmul.input[1] if av_matmul.input[0] == smax_out else av_matmul.input[0]
+        )
+        if v_bhsd_name == smax_out or not _is_internal(v_bhsd_name):
+            continue
+        av_out = av_matmul.output[0]
+        if not _is_internal(av_out):
+            continue
+
+        out_transpose = consumers_of[av_out][0]
+        if (
+            out_transpose.op_type != "Transpose"
+            or out_transpose.domain != ""
+            or len(out_transpose.input) != 1
+        ):
+            continue
+        out_perm = None
+        for attr in out_transpose.attribute:
+            if attr.name == "perm":
+                out_perm = list(attr.ints)
+        if out_perm != [0, 2, 1, 3]:
+            continue
+        out_t_name = out_transpose.output[0]
+        if not _is_internal(out_t_name):
+            continue
+
+        out_reshape = consumers_of[out_t_name][0]
+        if (
+            out_reshape.op_type != "Reshape"
+            or out_reshape.domain != ""
+            or len(out_reshape.input) != 2
+            or out_reshape.input[0] != out_t_name
+            or len(out_reshape.output) != 1
+        ):
+            continue
+        out_shape_init = initializer_map.get(out_reshape.input[1])
+        if out_shape_init is None or out_shape_init.data_type != onnx.TensorProto.INT64:
+            continue
+        out_dims = onnx.numpy_helper.to_array(out_shape_init)
+        if out_dims.size == 0:
+            continue
+        out_last = int(out_dims[-1])
+        out_reshape_out = out_reshape.output[0]
+        if not _is_internal(out_reshape_out):
+            continue
+
+        consumer_node = consumers_of[out_reshape_out][0]
+        cm = _match_matmul_like(consumer_node)
+        if cm is None or cm[0] != out_reshape_out:
+            continue
+        _, cw_name, cw_transposed = cm
+        cw_init = initializer_map.get(cw_name)
+        if (
+            cw_init is None
+            or not _is_supported_float_dtype(cw_init.data_type)
+            or len(cw_init.dims) != 2
+        ):
+            continue
+
+        # ---- V's own branch: optional repeat_kv, then plain head-split ----
+        v_repeat = _match_decomposed_repeat_kv(
+            v_bhsd_name, consumers_of, graph_outputs, node_by_output, initializer_map
+        )
+        v_repeat_kv: Optional[_RepeatKVBranch]
+        if v_repeat is not None:
+            v_repeat_kv, v_raw_name, v_kv_num_heads, _v_n_rep = v_repeat
+            if not _is_internal(v_raw_name):
+                continue
+        else:
+            v_repeat_kv, v_raw_name, v_kv_num_heads = None, v_bhsd_name, None
+        v_split = _match_decomposed_head_split(
+            v_raw_name,
+            consumers_of,
+            graph_outputs,
+            node_by_output,
+            initializer_map,
+            (0, 2, 1, 3),
+        )
+        if v_split is None:
+            continue
+        (
+            v_transpose,
+            v_reshape,
+            resolved_v_kv_heads,
+            v_head_size,
+            v_reshape_shape,
+            v_proj_out,
+        ) = v_split
+        if v_kv_num_heads is None:
+            v_kv_num_heads = resolved_v_kv_heads
+        elif v_kv_num_heads != resolved_v_kv_heads:
+            continue
+        if v_kv_num_heads != kv_num_heads or v_head_size <= 0:
+            continue
+
+        raw_out_width = num_heads * v_head_size
+        if out_last > 0 and out_last != raw_out_width:
+            continue
+        k_dim = cw_init.dims[1] if cw_transposed else cw_init.dims[0]
+        if k_dim != raw_out_width:
+            continue
+
+        # ---- Q/K/V's own real Linear producers ----
+        q_prod_node = node_by_output.get(q_proj_out)
+        k_prod_node = node_by_output.get(k_proj_out)
+        v_prod_node = node_by_output.get(v_proj_out)
+        if q_prod_node is None or k_prod_node is None or v_prod_node is None:
+            continue
+        packed_split_sizes: Optional[str] = None
+        packed_flatten_reshape: Optional[onnx.NodeProto] = None
+        packed_flatten_reshape_shape: Optional[str] = None
+        if q_prod_node is k_prod_node and q_prod_node is v_prod_node:
+            # All three raw projection outputs trace back to the exact
+            # same node -- either the packed-QKV-then-`Split` shape
+            # :func:`_match_decomposed_packed_qkv_producer` recognizes (see
+            # this module's own "Decomposed (un-fused) attention head
+            # pruning" section comment and :class:`_DecomposedGQAChain`'s
+            # own `packed_split_sizes` field docstring), or a genuinely
+            # degenerate share (three reshape/transpose chains all reading
+            # one tensor that ISN'T such a `Split`) this pass still can't
+            # independently slice.
+            packed = (
+                _match_decomposed_packed_qkv_producer(
+                    q_prod_node,
+                    consumers_of,
+                    graph_outputs,
+                    node_by_output,
+                    initializer_map,
+                )
+                if q_prod_node.op_type == "Split"
+                else None
+            )
+            if packed is None or list(q_prod_node.output) != [
+                q_proj_out,
+                k_proj_out,
+                v_proj_out,
+            ]:
+                # Either not the packed-QKV shape at all, or its three
+                # outputs aren't Q-then-K-then-V in that exact order --
+                # required here since the packed weight's own column
+                # offsets (`nq`-then-`nk`-then-`nv`, see
+                # :func:`_apply_one_decomposed_gqa_chain`) are only valid
+                # for that order; never guessed at otherwise.
+                continue
+            (
+                w_name,
+                w_transposed,
+                bias_name,
+                nq,
+                nk,
+                nv,
+                packed_split_sizes,
+                packed_flatten_reshape,
+                packed_flatten_reshape_shape,
+            ) = packed
+            wq = wk = wv = w_name
+            wq_t = wk_t = wv_t = w_transposed
+            bq = bk = bv = bias_name
+        elif (
+            q_prod_node is k_prod_node
+            or q_prod_node is v_prod_node
+            or k_prod_node is v_prod_node
+        ):
+            continue  # degenerate -- shared producer, can't independently slice
+        else:
+            q_info = _match_producer(q_prod_node, initializer_map)
+            k_info = _match_producer(k_prod_node, initializer_map)
+            v_info = _match_producer(v_prod_node, initializer_map)
+            if q_info is None or k_info is None or v_info is None:
+                continue
+            wq, wq_t, bq, nq = q_info
+            wk, wk_t, bk, nk = k_info
+            wv, wv_t, bv, nv = v_info
+            if wq == wk or wq == wv or wk == wv:
+                continue  # degenerate -- shared producer weight
+        if nq != num_heads * head_size or nk != kv_num_heads * head_size:
+            continue
+        if nv != kv_num_heads * v_head_size:
+            continue
+
+        # ---- mask safety (constant or dynamic), match-time only ----
+        mask_idx: Optional[int] = None
+        if mask_node is not None and mask_operand is not None:
+            mask_idx = list(mask_node.input).index(mask_operand)
+            if not _head_bias_input_is_safe(
+                mask_node, mask_idx, initializer_map, value_info_by_name, num_heads
+            ):
+                continue
+
+        # `out_reshape_shape` is `None` exactly when the combine-back
+        # `Reshape`'s own target shape's last entry is already a wildcard
+        # (`-1`/`0`) -- no edit is ever needed there post-pruning (`Reshape`
+        # auto-infers it), so, unlike every other shape constant this chain
+        # touches, it is never a *candidate* for the shared-constant
+        # cloning :func:`_apply_one_decomposed_gqa_chain` performs (see that
+        # function's own docstring) -- sharing it with anything else is
+        # always completely harmless since it is never written to.
+        out_reshape_shape: Optional[str] = (
+            out_reshape.input[1] if out_last > 0 else None
+        )
+
+        chains.append(
+            _DecomposedGQAChain(
+                q_weight=wq,
+                q_bias=bq,
+                q_weight_transposed=wq_t,
+                k_weight=wk,
+                k_bias=bk,
+                k_weight_transposed=wk_t,
+                v_weight=wv,
+                v_bias=bv,
+                v_weight_transposed=wv_t,
+                num_heads=num_heads,
+                kv_num_heads=kv_num_heads,
+                head_size=head_size,
+                v_head_size=v_head_size,
+                q_transpose=q_transpose,
+                q_reshape=q_reshape,
+                q_reshape_shape=q_reshape_shape,
+                k_transpose=k_transpose,
+                k_headsplit_transpose=k_headsplit_transpose,
+                k_reshape=k_reshape,
+                k_reshape_shape=k_reshape_shape,
+                k_repeat_kv=k_repeat_kv,
+                v_transpose=v_transpose,
+                v_reshape=v_reshape,
+                v_reshape_shape=v_reshape_shape,
+                v_repeat_kv=v_repeat_kv,
+                qk_matmul=qk_matmul,
+                scale_node=scale_node,
+                mask_node=mask_node,
+                mask_idx=mask_idx,
+                softmax_node=node,
+                av_matmul=av_matmul,
+                out_transpose=out_transpose,
+                out_reshape=out_reshape,
+                out_reshape_shape=out_reshape_shape,
+                consumer_node=consumer_node,
+                consumer_weight=cw_name,
+                consumer_weight_transposed=cw_transposed,
+                packed_split_sizes=packed_split_sizes,
+                packed_flatten_reshape=packed_flatten_reshape,
+                packed_flatten_reshape_shape=packed_flatten_reshape_shape,
+                q_rope=q_rope,
+                k_rope=k_rope,
+            )
+        )
+    return chains
+
+
+def _apply_one_decomposed_gqa_chain(
+    initializer_map: Dict[str, onnx.TensorProto],
+    chain: _DecomposedGQAChain,
+    sparsity: float,
+    compute_group_importance,
+    bias_ctx: _DynamicHeadBiasContext,
+) -> Optional[Tuple[Set[str], str, Set[str]]]:
+    """Applies whole-KV-group pruning to one matched decomposed attention
+    block -- the decomposed-shape analogue of :func:`_apply_one_gqa_chain`
+    (see that function's own docstring for the shared ranking/slicing
+    machinery both reuse: :func:`_gqa_group_importance`,
+    :func:`_slice_producer_weight`/:func:`_slice_consumer_weight`/
+    :func:`_slice_last_axis`/:func:`_head_column_indices`). What genuinely
+    differs: there is no single fused node's `num_heads`/`kv_num_heads`
+    *attribute* to rewrite -- instead, every `Reshape`/`Expand` target-shape
+    constant :func:`_find_decomposed_gqa_chains` already resolved is
+    rewritten to the new post-pruning head count, at the fixed index that
+    function established each represents, via this function's own
+    `_rewrite_shape_dim` local helper -- which edits the constant in place
+    when its only readers are the specific node(s) *this* chain owns for it
+    (the common case, including when K's and V's own branches legitimately
+    share one such constant), or, when a genuinely unrelated extra reader
+    exists (recomputed fresh here via `bias_ctx.graph`, since an earlier
+    chain processed in this same pass may already have rewired some of a
+    shared constant's readers away), clones a fresh tensor holding the
+    current value, rewires only this chain's own owning node(s) to it, and
+    edits *that* instead -- see this module's own "Decomposed (un-fused)
+    attention head pruning" section comment for the full reasoning and the
+    real, empirically-confirmed export shape (`torch.onnx.export`'s own
+    "flatten batch*seq before a Gemm" reshape landing on the same literal
+    target shape as this pass's own combine-back reshape) this protects
+    against.
+
+    When `chain.packed_split_sizes` is set (a packed-QKV-then-`Split`
+    producer feeding all three of Q's/K's/V's own reshape/transpose
+    head-split chains -- see :class:`_DecomposedGQAChain`'s own field
+    docstring and :func:`_match_packed_qkv_split`), Q's/K's/V's "own
+    separate weight" below is the *same* single packed tensor for all
+    three, sliced exactly once by a combined column-index set (Q's own
+    kept columns, then K's shifted by the pre-pruning `nq_orig`, then V's
+    shifted by `nq_orig + nk_orig`) instead of three independent
+    :func:`_slice_producer_weight` calls, and the upstream `Split` node's
+    own split-sizes constant is rewritten to the three new (post-pruning)
+    column widths in the same Q-then-K-then-V order -- mirroring
+    :func:`_apply_one_gqa_chain`'s own `chain.packed_split_sizes` branch
+    verbatim (the fused-node analogue of this exact shape).
+
+    Returns ``(producer_weight_names, consumer_weight_name,
+    stale_output_names)`` on success, or ``None`` if `sparsity` rounds to no
+    groups dropped for this block (a no-op, left for the caller to skip).
+    """
+    h = chain.kv_num_heads
+    keep_count = max(1, h - round(h * sparsity))
+    if keep_count >= h:
+        return None
+
+    d = chain.head_size
+    dv = chain.v_head_size
+    group_size = chain.num_heads // chain.kv_num_heads
+
+    # Pre-pruning flat widths of Q's/K's own producer weight -- needed by
+    # the packed-QKV branch below (a column-range view into, and later a
+    # combined-index slice of, one shared tensor) whenever
+    # `chain.packed_split_sizes` is set.
+    nq_orig = chain.num_heads * d
+    nk_orig = chain.kv_num_heads * d
+
+    wq_init = initializer_map[chain.q_weight]
+    wk_init = initializer_map[chain.k_weight]
+    wv_init = initializer_map[chain.v_weight]
+    if chain.packed_split_sizes is not None:
+        # `.q_weight`, `.k_weight`, and `.v_weight` all name the *same*
+        # underlying packed tensor (`wq_init is wk_init is wv_init`), one
+        # contiguous `[K, Nq+Nk+Nv]` (or `[Nq+Nk+Nv, K]`, if
+        # `.q_weight_transposed`) storage split Q-then-K-then-V by column
+        # -- so `wq_kn`/`wk_kn`/`wv_kn` are column-range *views* into that
+        # one ``[K, N]`` array, computed from the chain's own original
+        # (before this call's own pruning) head counts, rather than three
+        # independently-stored arrays.
+        w_kn = _to_f64(wq_init)
+        if chain.q_weight_transposed:
+            w_kn = w_kn.T  # [K, Nq+Nk+Nv]
+        wq_kn = w_kn[:, :nq_orig]
+        wk_kn = w_kn[:, nq_orig : nq_orig + nk_orig]
+        wv_kn = w_kn[:, nq_orig + nk_orig :]
+    else:
+        wq_kn = _to_f64(wq_init)
+        wk_kn = _to_f64(wk_init)
+        wv_kn = _to_f64(wv_init)
+        if chain.q_weight_transposed:
+            wq_kn = wq_kn.T
+        if chain.k_weight_transposed:
+            wk_kn = wk_kn.T
+        if chain.v_weight_transposed:
+            wv_kn = wv_kn.T
+
+    importance = compute_group_importance(chain, wq_kn, wk_kn, wv_kn)
+    keep_groups = np.sort(np.argsort(-importance)[:keep_count])
+    keep_q_heads = np.concatenate(
+        [np.arange(g * group_size, (g + 1) * group_size) for g in keep_groups]
+    )
+    q_idx = _head_column_indices(keep_q_heads, d)
+    k_idx = _head_column_indices(keep_groups, d)
+    v_idx = _head_column_indices(keep_groups, dv)
+    y_idx = _head_column_indices(keep_q_heads, dv)
+
+    if chain.packed_split_sizes is not None:
+        # One shared tensor: a single combined-column slice (Q's own
+        # range, then K's shifted by the *original* `nq_orig`, then V's
+        # shifted by `nq_orig + nk_orig`) rather than three independent
+        # `_slice_producer_weight` calls, which would each invalidate the
+        # column offsets the other two still need to read from the same
+        # underlying storage.
+        full_idx = np.concatenate([q_idx, k_idx + nq_orig, v_idx + nq_orig + nk_orig])
+        _slice_producer_weight(wq_init, chain.q_weight_transposed, full_idx)
+        if chain.q_bias is not None:
+            _slice_last_axis(initializer_map[chain.q_bias], full_idx)
+        sizes_init = initializer_map[chain.packed_split_sizes]
+        sizes_init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.array([len(q_idx), len(k_idx), len(v_idx)], dtype=np.int64),
+                name=sizes_init.name,
+            )
+        )
+    else:
+        _slice_producer_weight(wq_init, chain.q_weight_transposed, q_idx)
+        _slice_producer_weight(wk_init, chain.k_weight_transposed, k_idx)
+        _slice_producer_weight(wv_init, chain.v_weight_transposed, v_idx)
+        if chain.q_bias is not None:
+            _slice_last_axis(initializer_map[chain.q_bias], q_idx)
+        if chain.k_bias is not None:
+            _slice_last_axis(initializer_map[chain.k_bias], k_idx)
+        if chain.v_bias is not None:
+            _slice_last_axis(initializer_map[chain.v_bias], v_idx)
+
+    _slice_consumer_weight(
+        initializer_map[chain.consumer_weight], chain.consumer_weight_transposed, y_idx
+    )
+
+    new_num_heads = keep_count * group_size
+    new_kv_num_heads = keep_count
+
+    graph = bias_ctx.graph
+    used_names = bias_ctx.used_names
+    consumers_of = _consumers_of(graph)
+
+    def _rewrite_shape_dim(
+        shape_name: str, owner_nodes: Sequence[onnx.NodeProto], index: int, value: int
+    ) -> None:
+        shape_init = initializer_map[shape_name]
+        dims = onnx.numpy_helper.to_array(shape_init).copy()
+        owner_ids = {id(n) for n in owner_nodes}
+        foreign = [
+            c for c in consumers_of.get(shape_name, []) if id(c) not in owner_ids
+        ]
+        if foreign:
+            # Some reader of this constant isn't part of this chain at all
+            # (see this function's own docstring) -- clone it instead of
+            # mutating the shared original.
+            new_name = _mint_unique_name(f"{shape_name}_pruned", used_names)
+            new_dims = dims.copy()
+            new_dims[index] = value
+            new_init = onnx.numpy_helper.from_array(new_dims, name=new_name)
+            graph.initializer.append(new_init)
+            initializer_map[new_name] = new_init
+            for owner in owner_nodes:
+                for i, inp in enumerate(owner.input):
+                    if inp == shape_name:
+                        owner.input[i] = new_name
+        else:
+            dims[index] = value
+            shape_init.CopyFrom(
+                onnx.numpy_helper.from_array(dims, name=shape_init.name)
+            )
+
+    if (
+        chain.packed_flatten_reshape is not None
+        and chain.packed_flatten_reshape_shape is not None
+    ):
+        # The packed producer's own pass-through `Reshape` (see
+        # :func:`_match_decomposed_packed_qkv_producer`'s own docstring) --
+        # its own real output width shrinks from `nq_orig + nk_orig +
+        # (total width - nq_orig - nk_orig)` to the new post-pruning total
+        # in lock-step with the packed weight's own combined slice above.
+        _rewrite_shape_dim(
+            chain.packed_flatten_reshape_shape,
+            (chain.packed_flatten_reshape,),
+            -1,
+            len(q_idx) + len(k_idx) + len(v_idx),
+        )
+
+    _rewrite_shape_dim(chain.q_reshape_shape, (chain.q_reshape,), 2, new_num_heads)
+    if chain.k_reshape_shape == chain.v_reshape_shape:
+        _rewrite_shape_dim(
+            chain.k_reshape_shape,
+            (chain.k_reshape, chain.v_reshape),
+            2,
+            new_kv_num_heads,
+        )
+    else:
+        _rewrite_shape_dim(
+            chain.k_reshape_shape, (chain.k_reshape,), 2, new_kv_num_heads
+        )
+        _rewrite_shape_dim(
+            chain.v_reshape_shape, (chain.v_reshape,), 2, new_kv_num_heads
+        )
+    if (
+        chain.k_repeat_kv is not None
+        and chain.v_repeat_kv is not None
+        and (chain.k_repeat_kv.expand_shape == chain.v_repeat_kv.expand_shape)
+    ):
+        _rewrite_shape_dim(
+            chain.k_repeat_kv.expand_shape,
+            (chain.k_repeat_kv.expand, chain.v_repeat_kv.expand),
+            1,
+            new_kv_num_heads,
+        )
+    else:
+        if chain.k_repeat_kv is not None:
+            _rewrite_shape_dim(
+                chain.k_repeat_kv.expand_shape,
+                (chain.k_repeat_kv.expand,),
+                1,
+                new_kv_num_heads,
+            )
+        if chain.v_repeat_kv is not None:
+            _rewrite_shape_dim(
+                chain.v_repeat_kv.expand_shape,
+                (chain.v_repeat_kv.expand,),
+                1,
+                new_kv_num_heads,
+            )
+    if (
+        chain.k_repeat_kv is not None
+        and chain.v_repeat_kv is not None
+        and (
+            chain.k_repeat_kv.merge_reshape_shape
+            == chain.v_repeat_kv.merge_reshape_shape
+        )
+    ):
+        _rewrite_shape_dim(
+            chain.k_repeat_kv.merge_reshape_shape,
+            (chain.k_repeat_kv.merge_reshape, chain.v_repeat_kv.merge_reshape),
+            1,
+            new_num_heads,
+        )
+    else:
+        if chain.k_repeat_kv is not None:
+            _rewrite_shape_dim(
+                chain.k_repeat_kv.merge_reshape_shape,
+                (chain.k_repeat_kv.merge_reshape,),
+                1,
+                new_num_heads,
+            )
+        if chain.v_repeat_kv is not None:
+            _rewrite_shape_dim(
+                chain.v_repeat_kv.merge_reshape_shape,
+                (chain.v_repeat_kv.merge_reshape,),
+                1,
+                new_num_heads,
+            )
+    if chain.out_reshape_shape is not None:
+        _rewrite_shape_dim(
+            chain.out_reshape_shape, (chain.out_reshape,), -1, new_num_heads * dv
+        )
+
+    if chain.mask_node is not None and chain.mask_idx is not None:
+        _slice_or_gather_head_bias(
+            chain.mask_node,
+            chain.mask_idx,
+            initializer_map,
+            chain.num_heads,
+            keep_q_heads,
+            bias_ctx,
+        )
+
+    stale: Set[str] = set()
+    for maybe_node in (
+        chain.packed_flatten_reshape,
+        chain.q_transpose,
+        chain.q_reshape,
+        chain.k_transpose,
+        chain.k_headsplit_transpose,
+        chain.k_reshape,
+        chain.v_transpose,
+        chain.v_reshape,
+        chain.qk_matmul,
+        chain.scale_node,
+        chain.mask_node,
+        chain.softmax_node,
+        chain.av_matmul,
+        chain.out_transpose,
+        chain.out_reshape,
+    ):
+        if maybe_node is not None:
+            stale.update(maybe_node.output)
+    for branch in (chain.k_repeat_kv, chain.v_repeat_kv):
+        if branch is not None:
+            stale.update(branch.unsqueeze.output)
+            stale.update(branch.expand.output)
+            stale.update(branch.merge_reshape.output)
+    # Q's/K's own decomposed RoPE pass-through, if either branch crossed one
+    # -- see this module's own comment above :class:`_DecomposedRopePassThrough`
+    # for why none of its own nodes ever need editing, only marking stale
+    # (every one of their own outputs is narrower after pruning, the same
+    # "nothing to rewrite, still stale" treatment `k_repeat_kv`/`v_repeat_kv`
+    # get for their own `unsqueeze`'s `axes` input).
+    for hop in (chain.q_rope, chain.k_rope):
+        if hop is not None:
+            stale.update(n.output[0] for n in hop.nodes if n.output and n.output[0])
+
+    return (
+        {chain.q_weight, chain.k_weight, chain.v_weight},
+        chain.consumer_weight,
+        stale,
+    )
+
+
 def _plain_attention_head_importance(
     chain: _AttentionChain,
     wq: np.ndarray,
@@ -21973,12 +24419,19 @@ def _head_column_indices(keep_heads: np.ndarray, head_size: int) -> np.ndarray:
 
 
 def _gqa_group_importance(
-    chain: _GQAChain,
+    chain: "_HeadGroupChain",
     wq: np.ndarray,
     wk: np.ndarray,
     wv: np.ndarray,
     importance_norm: str = "l2",
 ) -> np.ndarray:
+    # `chain` is `_HeadGroupChain` (`_GQAChain` or `_DecomposedGQAChain`),
+    # not bare `_GQAChain`, purely so :func:`_find_decomposed_gqa_chains`'s
+    # own decomposed-shape match can reuse this exact ranking unchanged --
+    # only `.head_size`/`.v_head_size`/`.num_heads`/`.kv_num_heads` are ever
+    # read below, and both classes share those four fields' names and
+    # meaning verbatim (see :class:`_DecomposedGQAChain`'s own docstring).
+    #
     # Combined (Frobenius-norm) importance of each *KV group's* whole
     # block: the group's own K/V head columns plus every query head mapped
     # to it -- the GQA analogue of :func:`_plain_attention_head_importance`,
@@ -22692,15 +25145,23 @@ def _apply_attention_chains(
     :func:`_apply_chains`'s own shape (cross-chain touched-role
     bookkeeping, stale ``value_info`` cleanup) but dispatching each chain to
     :func:`_apply_one_plain_attention_chain` (a matched merged-QKV
-    ``Attention`` block) or :func:`_apply_one_gqa_chain` (a matched
+    ``Attention`` block), :func:`_apply_one_gqa_chain` (a matched
     ``GroupQueryAttention``, plain ``ai.onnx::Attention``, or
     `MultiHeadAttention` block -- all three share the one :class:`_GQAChain`
-    shape, so all three dispatch here identically) for the actual per-chain
-    slicing, since the merged-QKV op's weight layout (one merged QKV tensor)
-    versus the other three's (separate Q/K/V producers) and pruning unit
-    (individual head vs. whole KV group -- one query head wide, for
-    `MultiHeadAttention`) are different enough that sharing that part
-    wouldn't simplify either.
+    shape, so all three dispatch here identically), or
+    :func:`_apply_one_decomposed_gqa_chain` (a matched *decomposed*,
+    not-yet-fused attention block -- see this module's own "Decomposed
+    (un-fused) attention head pruning" section comment -- checked first
+    since :class:`_DecomposedGQAChain` is a separate dataclass, not a
+    `_GQAChain` subclass) for the actual per-chain slicing, since the
+    merged-QKV op's weight layout (one merged QKV tensor) versus the other
+    three's (separate Q/K/V producers) and pruning unit (individual head vs.
+    whole KV group -- one query head wide, for `MultiHeadAttention`) are
+    different enough that sharing that part wouldn't simplify either.
+    :func:`apply_attention_head_wanda_pruning` itself never actually passes
+    a :class:`_DecomposedGQAChain` in `chains` today (see this module's own
+    section comment above for why that variant isn't wired up yet), but
+    this dispatch handles it uniformly regardless, rather than assuming.
 
     `value_info_by_name` (the same shape-inference-seeded map every
     "Attention-head pruning" entry point builds -- see
@@ -22724,7 +25185,7 @@ def _apply_attention_chains(
     )
 
     for chain in chains:
-        if isinstance(chain, _GQAChain):
+        if isinstance(chain, (_GQAChain, _DecomposedGQAChain)):
             producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
         else:
             producer_names = {chain.weight}
@@ -22735,7 +25196,11 @@ def _apply_attention_chains(
             continue
 
         applied: Optional[Tuple[Set[str], str, Set[str]]]
-        if isinstance(chain, _GQAChain):
+        if isinstance(chain, _DecomposedGQAChain):
+            applied = _apply_one_decomposed_gqa_chain(
+                initializer_map, chain, sparsity, compute_group_importance, bias_ctx
+            )
+        elif isinstance(chain, _GQAChain):
             applied = _apply_one_gqa_chain(
                 initializer_map, chain, sparsity, compute_group_importance, bias_ctx
             )
@@ -22825,6 +25290,23 @@ def apply_attention_head_pruning(
     own (a shape both ops' schemas allow but `GroupQueryAttention` never
     produces) and is sliced correctly at its own width -- see
     :class:`_GQAChain`'s own `v_head_size` field.
+
+    Also matches -- and prunes at the identical whole-KV-group granularity,
+    ranked and sliced the same way -- a *decomposed* (not-yet-fused)
+    attention block: the plain ``Linear -> Reshape -> Transpose -> [repeat_kv]
+    -> MatMul -> [scale] -> [+mask] -> Softmax -> MatMul -> Transpose ->
+    Reshape -> Linear`` sequence a raw ``torch.onnx.export`` of an eager/
+    manual-SDPA attention module emits when it was never post-processed by
+    ONNX Runtime's own transformer-fusion pass (and, for a masked or GQA/MQA
+    block, even onnxsim's own ``fuse_attention``/``fuse_gqa`` optimizer
+    passes decline to fuse it either -- see this module's own "Decomposed
+    (un-fused) attention head pruning" section comment for the full scope,
+    empirical shape, and why this is a common, not merely hypothetical,
+    real-world export path). Also matched by
+    :func:`apply_attention_head_wanda_pruning`'s own calibrated variant and
+    by :func:`analyze_pruning_sensitivity`'s own dry-run report (family
+    string ``"attention_decomposed_group"``) -- see that same section
+    comment.
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched block's heads (or, for
@@ -22919,6 +25401,7 @@ def apply_attention_head_pruning(
             *_find_paged_attention_chains(graph, value_info_by_name),
             *_find_linear_attention_chains(graph, value_info_by_name),
             *_find_sparse_attention_chains(graph, value_info_by_name),
+            *_find_decomposed_gqa_chains(graph, value_info_by_name),
         ]
         if chains:
             _apply_attention_chains(
@@ -22939,7 +25422,17 @@ def apply_attention_head_pruning(
 
 def _wanda_attention_calibration_stats(
     out: onnx.ModelProto,
-    chains: List[_AttnLikeChain],
+    # `Sequence`, not `List` -- read-only here (only ever iterated, never
+    # mutated). Both real callers (`apply_attention_head_wanda_pruning` and
+    # `_analyze_attention_head_wanda_pruning`) now pass a
+    # `List[_AttnLikeChain]` (all four chain kinds, since both were widened
+    # to also collect `_DecomposedGQAChain` via
+    # `_find_decomposed_gqa_chains`) -- `Sequence` here is `List[...]`'s own
+    # read-only supertype, kept rather than `List[_AttnLikeChain]` outright
+    # purely to signal that intent, not to paper over an actual type
+    # mismatch between the two call sites. Every chain kind this function is
+    # ever handed shares the one field it actually reads (`.consumer_node`).
+    chains: Sequence[_AttnLikeChain],
     calibration_data: Sequence[Tensors],
     providers: Optional[Sequence[str]],
 ) -> Dict[str, np.ndarray]:
@@ -23011,7 +25504,12 @@ def apply_attention_head_wanda_pruning(
     how :func:`_gqa_group_importance` combines that same group's weight norm
     across Q+K+V -- all three matched separate-Q/K/V-producer ops share that
     one importance function (and this one calibrated wrapper around it)
-    unmodified.
+    unmodified. Also matches the *decomposed* (not-yet-fused) attention
+    block :func:`apply_attention_head_pruning`'s own docstring describes --
+    see this module's own "Decomposed (un-fused) attention head pruning"
+    section comment -- at the identical whole-KV-group granularity, ranked
+    by the same calibrated importance, since :class:`_DecomposedGQAChain`
+    shares every field :func:`_gqa_group_importance` and this wrapper read.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to measure each
@@ -23076,6 +25574,7 @@ def apply_attention_head_wanda_pruning(
         *_find_paged_attention_chains(graph, value_info_by_name),
         *_find_linear_attention_chains(graph, value_info_by_name),
         *_find_sparse_attention_chains(graph, value_info_by_name),
+        *_find_decomposed_gqa_chains(graph, value_info_by_name),
     ]
     if not chains:
         return out
@@ -32349,11 +34848,16 @@ class PruningLayerSensitivity:
             group granularity -- it genuinely supports `kv_num_heads !=
             num_heads`, the same real GQA-style grouping
             `GroupQueryAttention` itself supports, unlike
-            `MultiHeadAttention`) for attention pruning (shared by
-            :func:`apply_attention_head_pruning` and its Wanda-calibrated
-            counterpart :func:`apply_attention_head_wanda_pruning` alike --
-            `family` names the topology a unit was matched by, not the
-            calibration method used to rank it, exactly as unstructured/
+            `MultiHeadAttention`)/``"attention_decomposed_group"`` (a
+            *decomposed*, not-yet-fused attention block -- see this module's
+            own "Decomposed (un-fused) attention head pruning" section
+            comment -- whole-KV-group granularity, identical to
+            ``"attention_gqa_group"``'s own but reported under its own
+            string since no single fused node backs it) for attention
+            pruning (shared by :func:`apply_attention_head_pruning` and its
+            Wanda-calibrated counterpart :func:`apply_attention_head_wanda_pruning`
+            alike -- `family` names the topology a unit was matched by, not
+            the calibration method used to rank it, exactly as unstructured/
             structured pruning's own plain-vs-Wanda variants already share
             their family strings above); ``"moe_expert_channel"`` for
             :func:`apply_moe_expert_channel_pruning`; ``"moe_whole_expert"``
@@ -33960,7 +36464,13 @@ def _analyze_structured_pruning_matmul_bnb4(
 def _attention_not_eligible(
     graph: onnx.GraphProto, chains: List[_AttnLikeChain]
 ) -> List[str]:
-    matched_ids = {id(c.node) for c in chains}
+    # `_DecomposedGQAChain` has no `.node` field at all (see this module's
+    # own comment above `_AttnLikeChain`'s definition) -- excluded here, not
+    # just skipped over, since its own anchor node is a plain `Softmax`,
+    # never one of the fused op types `is_attn_like` below checks for, so it
+    # could never have appeared in `matched_ids` for a real fused node
+    # anyway.
+    matched_ids = {id(c.node) for c in chains if not isinstance(c, _DecomposedGQAChain)}
     not_eligible = []
     for node in graph.node:
         is_attn_like = (
@@ -34008,6 +36518,16 @@ def _analyze_attention_chains(
     :func:`_gqa_group_importance` (optionally wrapped, as
     :func:`_analyze_attention_head_wanda_pruning` does, to fold in a
     calibrated activation norm) unmodified.
+
+    `chains` also carries :class:`_DecomposedGQAChain` (see this module's
+    own "Decomposed (un-fused) attention head pruning" section comment),
+    reported under its own ``"attention_decomposed_group"`` family string:
+    it shares every `_GQAChain`-side field this function reads
+    (`.q_weight`/`.k_weight`/`.v_weight`/`.kv_num_heads`/`.head_size`/
+    `.v_head_size`/`.consumer_weight`) but has no `.node` field at all (its
+    matched shape has no single fused node), so `label` is taken from
+    `.softmax_node` -- the chain's own defining anchor node,
+    :func:`_find_decomposed_gqa_chains`'s own match point -- instead.
     """
     initializer_map = _constant_map(graph)
     producer_touched: Set[str] = set()
@@ -34015,8 +36535,17 @@ def _analyze_attention_chains(
     layers: List[PruningLayerSensitivity] = []
 
     for chain in chains:
-        label = _node_label(chain.node)
-        if isinstance(chain, _GQAChain):
+        if isinstance(chain, _DecomposedGQAChain):
+            # No `.node` field at all (its matched shape has no single
+            # fused node) -- `.softmax_node`, the chain's own defining
+            # anchor node, stands in for it here, same as
+            # :func:`_find_decomposed_gqa_chains`'s own match point.
+            label = _node_label(chain.softmax_node)
+            producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
+            h = chain.kv_num_heads
+            family = "attention_decomposed_group"
+        elif isinstance(chain, _GQAChain):
+            label = _node_label(chain.node)
             producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
             h = chain.kv_num_heads
             # `MultiHeadAttention` has no separate `kv_num_heads` at all
@@ -34070,6 +36599,7 @@ def _analyze_attention_chains(
             else:
                 family = "attention_gqa_group"
         else:
+            label = _node_label(chain.node)
             producer_names = {chain.weight}
             h = chain.num_heads
             family = "attention_head"
@@ -34106,12 +36636,20 @@ def _analyze_attention_chains(
             )
             continue
 
-        if isinstance(chain, _GQAChain):
+        if isinstance(chain, (_GQAChain, _DecomposedGQAChain)):
             d = chain.head_size
             wq_init = initializer_map[chain.q_weight]
             wk_init = initializer_map[chain.k_weight]
             wv_init = initializer_map[chain.v_weight]
-            if chain.packed_split_sizes is not None:
+            # `_DecomposedGQAChain` has no `packed_split_sizes` field at all
+            # (that packed-QKV shape is a `_GQAChain`-only match -- see this
+            # module's own "Decomposed (un-fused) attention head pruning"
+            # section comment, the packed-QKV scope bullet) -- only checked
+            # for an actual `_GQAChain`.
+            packed_split_sizes = (
+                chain.packed_split_sizes if isinstance(chain, _GQAChain) else None
+            )
+            if packed_split_sizes is not None:
                 nq_orig = chain.num_heads * d
                 nk_orig = chain.kv_num_heads * d
                 w_kn = onnx.numpy_helper.to_array(wq_init).astype(np.float64)
@@ -34220,6 +36758,7 @@ def _analyze_attention_head_pruning(
             *_find_paged_attention_chains(graph, value_info_by_name),
             *_find_linear_attention_chains(graph, value_info_by_name),
             *_find_sparse_attention_chains(graph, value_info_by_name),
+            *_find_decomposed_gqa_chains(graph, value_info_by_name),
         ]
         layers.extend(
             _analyze_attention_chains(
@@ -34283,6 +36822,7 @@ def _analyze_attention_head_wanda_pruning(
         *_find_paged_attention_chains(graph, value_info_by_name),
         *_find_linear_attention_chains(graph, value_info_by_name),
         *_find_sparse_attention_chains(graph, value_info_by_name),
+        *_find_decomposed_gqa_chains(graph, value_info_by_name),
     ]
     if not chains:
         return PruningSensitivityReport(
