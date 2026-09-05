@@ -38,13 +38,13 @@ from __future__ import annotations
 from typing import List
 
 import onnx
-
 from pulsar2_ops import (
     AX650_MIN_OPSET,
     BlockingOp,
     below_ax650_min_opset,
     blocking_op_types,
     blocking_ops,
+    confirmed_broken_on_ax650,
     has_out_of_band_npu_data,
     missing_npu_data,
     opset_version,
@@ -107,6 +107,10 @@ def ax650_build_risks(model: onnx.ModelProto) -> List[str]:
 
     - an op type outside `pulsar2_ops.AX650_SUPPORTED_OPS` (confirmed for
       `LRN`: a hard frontend parse failure, not a graceful CPU fallback);
+    - an op type confirmed broken *despite* being listed in
+      `pulsar2_ops.AX650_SUPPORTED_OPS` (`pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS`
+      -- 7 ops confirmed via a real single-node-per-op hardware sweep, see
+      that module's docstring);
     - an opset below `pulsar2_ops.AX650_MIN_OPSET` (11), which Pulsar2's own
       docs state as a hard requirement.
 
@@ -125,6 +129,12 @@ def ax650_build_risks(model: onnx.ModelProto) -> List[str]:
         )
         risks.append(
             f"op type(s) not on the confirmed AX650 op list: {unsupported}{note}"
+        )
+    broken = confirmed_broken_on_ax650(model)
+    for op_type, reason in sorted(broken.items()):
+        risks.append(
+            f"op type {op_type!r} is listed in AX650_SUPPORTED_OPS but "
+            f"confirmed to hard-fail a real build: {reason}"
         )
     if below_ax650_min_opset(model):
         risks.append(
