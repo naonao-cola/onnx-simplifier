@@ -41475,6 +41475,616 @@ def test_decomposed_attention_real_torch_export_pipeline():
     np.testing.assert_allclose(ort_out, oracle_out, rtol=1e-3, atol=1e-3)
 
 
+def test_decomposed_attention_einsum_real_torch_export_pipeline():
+    """The `torch.einsum` analogue of
+    `test_decomposed_attention_real_torch_export_pipeline`: identical GQA +
+    causal-mask `nn.Module`, except BOTH the QK^T product and the AV
+    product are written as literal `torch.einsum` calls (the style real
+    reimplementations like `x-transformers`/`vit-pytorch`/
+    `performer-pytorch` commonly use instead of `torch.matmul`) --
+    confirming empirically, via a real `torch.onnx.export`, that PyTorch's
+    exporter emits a literal `Einsum` node for each (never decomposing it
+    into `Transpose`+`MatMul`), that `onnxsim.simplify()` leaves both
+    intact, and that `apply_attention_head_pruning` genuinely prunes both
+    products' own Q/K/V producers through the new `Einsum`-recognition
+    path this module adds -- not just declining silently the way it did
+    before. The pruned model's output is checked against an
+    independently-computed numpy oracle built from the pruned model's own
+    (already-sliced) tensors, run through a real
+    `onnxruntime.InferenceSession`, exactly mirroring the `MatMul` sibling
+    test's own verification shape.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("onnxruntime")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, num_kv_heads, head_dim, seq, batch = 32, 8, 2, 8, 4, 1
+
+    class EinsumGQA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_heads = num_heads
+            self.num_kv_heads = num_kv_heads
+            self.head_dim = head_dim
+            self.q_proj = nn.Linear(hidden, num_heads * head_dim, bias=True)
+            self.k_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.v_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.o_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.scaling = head_dim**-0.5
+
+        def _repeat_kv(self, x, n_rep):
+            if n_rep == 1:
+                return x
+            b, kvh, s, d = x.shape
+            x = x[:, :, None, :, :].expand(b, kvh, n_rep, s, d)
+            return x.reshape(b, kvh * n_rep, s, d)
+
+        def forward(self, hidden_states, attn_mask):
+            b, s, _ = hidden_states.shape
+            q = (
+                self.q_proj(hidden_states)
+                .view(b, s, self.num_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            k = (
+                self.k_proj(hidden_states)
+                .view(b, s, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            v = (
+                self.v_proj(hidden_states)
+                .view(b, s, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            n_rep = self.num_heads // self.num_kv_heads
+            k = self._repeat_kv(k, n_rep)
+            v = self._repeat_kv(v, n_rep)
+            # `x-transformers`-style: both products written via
+            # `torch.einsum` rather than `torch.matmul`/`Tensor.transpose`.
+            attn_weights = torch.einsum("bhid,bhjd->bhij", q, k) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.einsum("bhij,bhjd->bhid", attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.o_proj(attn_output)
+
+    m = EinsumGQA()
+    m.eval()
+    x = torch.randn(batch, seq, hidden)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+
+    buf = io.BytesIO()
+    torch.onnx.export(
+        m,
+        (x, mask),
+        buf,
+        input_names=["hidden_states", "attn_mask"],
+        output_names=["output"],
+        opset_version=17,
+        dynamo=False,
+    )
+    raw = onnx.load_from_string(buf.getvalue())
+    # Empirical confirmation (see onnxsim/pruning.py's own section comment):
+    # PyTorch's exporter emits `Einsum` directly here, never `MatMul`.
+    assert any(n.op_type == "Einsum" for n in raw.graph.node)
+
+    simplified, ok = onnxsim.onnx_simplifier.simplify(raw)
+    assert ok
+
+    einsum_nodes = [n for n in simplified.graph.node if n.op_type == "Einsum"]
+    assert len(einsum_nodes) == 2
+    equations = set()
+    for n in einsum_nodes:
+        for a in n.attribute:
+            if a.name == "equation":
+                equations.add(a.s.decode())
+    assert equations == {"bhid,bhjd->bhij", "bhij,bhjd->bhid"}
+    assert not any(
+        n.op_type
+        in ("Attention", "GroupQueryAttention", "MultiHeadAttention", "PagedAttention")
+        for n in simplified.graph.node
+    )
+
+    pruned = onnxsim.apply_attention_head_pruning(simplified, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    def _find_gemm(model, bias_substr):
+        for n in model.graph.node:
+            if n.op_type == "Gemm" and len(n.input) == 3 and bias_substr in n.input[2]:
+                return n
+        raise AssertionError(f"no Gemm found for {bias_substr!r}")
+
+    def _init(model, name):
+        for t in model.graph.initializer:
+            if t.name == name:
+                return onnx.numpy_helper.to_array(t)
+        for n in model.graph.node:
+            if n.op_type == "Constant" and n.output[0] == name:
+                for a in n.attribute:
+                    if a.name == "value":
+                        return onnx.numpy_helper.to_array(a.t)
+        raise AssertionError(f"no initializer/Constant found for {name!r}")
+
+    q_gemm = _find_gemm(pruned, "q_proj.bias")
+    k_gemm = _find_gemm(pruned, "k_proj.bias")
+    v_gemm = _find_gemm(pruned, "v_proj.bias")
+    o_gemm = _find_gemm(pruned, "o_proj.bias")
+    wq, bq = _init(pruned, q_gemm.input[1]), _init(pruned, q_gemm.input[2])
+    wk, bk = _init(pruned, k_gemm.input[1]), _init(pruned, k_gemm.input[2])
+    wv, bv = _init(pruned, v_gemm.input[1]), _init(pruned, v_gemm.input[2])
+    wo, bo = _init(pruned, o_gemm.input[1]), _init(pruned, o_gemm.input[2])
+
+    new_num_heads = wq.shape[1] // head_dim
+    new_kv_num_heads = wk.shape[1] // head_dim
+    new_v_head_dim = wv.shape[1] // new_kv_num_heads
+    # Pruning must have actually fired through the new `Einsum` path --
+    # the whole point of this test (before this module's change, both
+    # `Einsum` products would decline the chain outright, leaving these
+    # shapes unchanged).
+    assert new_num_heads < num_heads
+    assert new_kv_num_heads < num_kv_heads
+    assert new_num_heads // new_kv_num_heads == num_heads // num_kv_heads
+
+    rng = np.random.default_rng(0)
+    hidden_states = rng.standard_normal((batch, seq, hidden)).astype(np.float32)
+    mask_np = mask.numpy().astype(np.float32)
+
+    sess = ort.InferenceSession(
+        pruned.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (ort_out,) = sess.run(None, {"hidden_states": hidden_states, "attn_mask": mask_np})
+
+    def linear(x, w, b):
+        return x @ w + b
+
+    q = (
+        linear(hidden_states, wq, bq)
+        .reshape(batch, seq, new_num_heads, head_dim)
+        .transpose(0, 2, 1, 3)
+    )
+    k = (
+        linear(hidden_states, wk, bk)
+        .reshape(batch, seq, new_kv_num_heads, head_dim)
+        .transpose(0, 2, 1, 3)
+    )
+    v = (
+        linear(hidden_states, wv, bv)
+        .reshape(batch, seq, new_kv_num_heads, new_v_head_dim)
+        .transpose(0, 2, 1, 3)
+    )
+    n_rep = new_num_heads // new_kv_num_heads
+    if n_rep > 1:
+        k = np.repeat(k, n_rep, axis=1)
+        v = np.repeat(v, n_rep, axis=1)
+    scale = head_dim**-0.5
+    scores = np.matmul(q, k.transpose(0, 1, 3, 2)) * scale
+    scores = scores + mask_np
+    scores = scores - scores.max(axis=-1, keepdims=True)
+    exp = np.exp(scores)
+    attn = exp / exp.sum(axis=-1, keepdims=True)
+    ctx = np.matmul(attn, v)
+    ctx = ctx.transpose(0, 2, 1, 3).reshape(batch, seq, new_num_heads * new_v_head_dim)
+    oracle_out = linear(ctx, wo, bo)
+
+    np.testing.assert_allclose(ort_out, oracle_out, rtol=1e-3, atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Decomposed (un-fused) attention -- QK^T/AV product as a literal `Einsum`
+# node (instead of `MatMul`)
+# ---------------------------------------------------------------------------
+# See onnxsim/pruning.py's own "Decomposed (un-fused) attention head
+# pruning" section comment and `_einsum_equation_is_batched_matmul`'s own
+# docstring for the full empirical background. The hand-built-model tests
+# below mirror `test_decomposed_gqa_pruning_matches_oracle_exactly`'s own
+# oracle-rebuild shape exactly, just against `_decomposed_gqa_model_einsum`
+# instead of `_decomposed_gqa_model` -- confirmed against a REAL
+# `torch.onnx.export` pipeline first, immediately above
+# (`test_decomposed_attention_einsum_real_torch_export_pipeline`), so these
+# hand-built fixtures target already-confirmed ground truth.
+
+
+def _decomposed_gqa_model_einsum(
+    K=16,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=16,
+    batch=1,
+    seq=4,
+    seed=0,
+    qk_via_einsum=True,
+    av_via_einsum=True,
+    qk_equation="bhid,bhjd->bhij",
+    av_equation="bhij,bhjd->bhid",
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+    bq=None,
+    bk=None,
+    bv=None,
+    bout=None,
+):
+    """The `torch.einsum`-written analogue of `_decomposed_gqa_model`:
+    identical `Linear(Q/K/V) -> Reshape(to heads) -> Transpose(to BHSD) ->
+    [repeat_kv, GQA only]` producer branches and `Transpose(back) ->
+    Reshape(back to hidden) -> Linear(O)` consumer tail, but the QK^T
+    product and/or the AV product is a literal `Einsum` node instead of
+    `MatMul`, toggled independently via `qk_via_einsum`/`av_via_einsum`
+    (each `True` by default, matching the real `torch.einsum`-written
+    attention block this closes a pruning gap for).
+
+    When `qk_via_einsum` is set, K's own separate dot-product `Transpose`
+    is never built at all -- the `Einsum`'s own `equation` contracts K's
+    raw, un-transposed head-split output directly, exactly what a real
+    `torch.einsum("bhid,bhjd->bhij", q, k)` export produces (see this
+    module's own section comment above `_decomposed_gqa_model` for why
+    `MatMul` always needs that extra `Transpose` and `Einsum` never does).
+    `qk_equation`/`av_equation` let a caller substitute a non-equivalent
+    equation to build a decline-path fixture (see
+    `test_decomposed_gqa_pruning_qk_einsum_wrong_axis_order_declines`
+    below) -- the graph is still perfectly valid ONNX either way since
+    `seq_q == seq_k == seq` here (self-attention), so a swapped-order
+    equation changes no tensor's *shape*, only whether the *pruning pass*
+    can prove it's a real matmul.
+
+    V's own branch is IDENTICAL regardless of `av_via_einsum` (V is never
+    transposed for either op -- same section comment) -- only the AV
+    product node itself differs.
+    """
+    rng = np.random.default_rng(seed)
+    Nq, Nk, Nv = H * D, KVH * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((H * D, Out)).astype(np.float32)
+    if bq is None:
+        bq = rng.standard_normal((Nq,)).astype(np.float32)
+    if bk is None:
+        bk = rng.standard_normal((Nk,)).astype(np.float32)
+    if bv is None:
+        bv = rng.standard_normal((Nv,)).astype(np.float32)
+    if bout is None:
+        bout = rng.standard_normal((Out,)).astype(np.float32)
+
+    def _i64(arr, name):
+        return onnx.numpy_helper.from_array(np.array(arr, dtype=np.int64), name)
+
+    initializer = [
+        _f32(wq, "Wq"),
+        _f32(wk, "Wk"),
+        _f32(wv, "Wv"),
+        _f32(wout, "Wout"),
+        _f32(bq, "Bq"),
+        _f32(bk, "Bk"),
+        _f32(bv, "Bv"),
+        _f32(bout, "Bout"),
+        _i64([batch * seq, K], "XFlatShape"),
+        _i64([batch, seq, H, D], "Sq"),
+        _i64([batch, seq, KVH, D], "Skv"),
+    ]
+    lines = [
+        "xf = Reshape(X, XFlatShape)",
+        "q0 = Gemm(xf, Wq, Bq)",
+        "k0 = Gemm(xf, Wk, Bk)",
+        "v0 = Gemm(xf, Wv, Bv)",
+        "qr = Reshape(q0, Sq)",
+        "qt = Transpose<perm=[0,2,1,3]>(qr)",
+        "kr = Reshape(k0, Skv)",
+        "vr = Reshape(v0, Skv)",
+        "kbh = Transpose<perm=[0,2,1,3]>(kr)",
+        "vbh = Transpose<perm=[0,2,1,3]>(vr)",
+    ]
+    k_for_qk, v_for_av = "kbh", "vbh"
+
+    if KVH < H:
+        assert H % KVH == 0
+        n_rep = H // KVH
+        initializer += [
+            _i64([2], "Ax2"),
+            _i64([batch, KVH, n_rep, seq, D], "ExpandShape"),
+            _i64([batch, H, seq, D], "MergeShape"),
+        ]
+        lines += [
+            "ku = Unsqueeze(kbh, Ax2)",
+            "ke = Expand(ku, ExpandShape)",
+            "krep = Reshape(ke, MergeShape)",
+            "vu = Unsqueeze(vbh, Ax2)",
+            "ve = Expand(vu, ExpandShape)",
+            "vrep = Reshape(ve, MergeShape)",
+        ]
+        k_for_qk, v_for_av = "krep", "vrep"
+
+    if qk_via_einsum:
+        lines.append(f'qk = Einsum<equation="{qk_equation}">(qt, {k_for_qk})')
+    else:
+        lines.append(f"ktT = Transpose<perm=[0,1,3,2]>({k_for_qk})")
+        lines.append("qk = MatMul(qt, ktT)")
+
+    initializer.append(_f32(np.array(D**-0.5, dtype=np.float32), "Scale"))
+    lines.append("scaled = Mul(qk, Scale)")
+    lines.append("attn = Softmax<axis=-1>(scaled)")
+
+    if av_via_einsum:
+        lines.append(f'ctx0 = Einsum<equation="{av_equation}">(attn, {v_for_av})')
+    else:
+        lines.append(f"ctx0 = MatMul(attn, {v_for_av})")
+
+    initializer += [
+        _i64([batch * seq, H * D], "OutShape"),
+        _i64([batch, seq, Out], "YShape"),
+    ]
+    lines += [
+        "ctx1 = Transpose<perm=[0,2,1,3]>(ctx0)",
+        "ctx2 = Reshape(ctx1, OutShape)",
+        "y0 = Gemm(ctx2, Wout, Bout)",
+        "Y = Reshape(y0, YShape)",
+    ]
+
+    body_lines = "\n          ".join(lines)
+    model = _model(
+        f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          {body_lines}
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        batch=batch,
+        seq=seq,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        bq=bq,
+        bk=bk,
+        bv=bv,
+        bout=bout,
+    )
+
+
+def _assert_decomposed_einsum_pruning_matches_oracle(
+    *, qk_via_einsum, av_via_einsum, seed
+):
+    model, cfg = _decomposed_gqa_model_einsum(
+        K=16,
+        H=8,
+        KVH=2,
+        D=8,
+        Out=16,
+        seed=seed,
+        qk_via_einsum=qk_via_einsum,
+        av_via_einsum=av_via_einsum,
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned)
+    group_size = cfg["H"] // cfg["KVH"]
+    new_kv = cfg["KVH"] - round(cfg["KVH"] * 0.5)
+    # Pruning must have actually fired -- the whole point of these tests
+    # (before this module's change, an `Einsum` QK^T/AV product declined
+    # the chain outright, leaving these shapes unchanged).
+    assert wk_new.shape[1] == new_kv * cfg["D"]
+    assert wq_new.shape[1] == new_kv * group_size * cfg["D"]
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], new_kv
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _decomposed_gqa_model_einsum(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=new_kv,
+        D=d,
+        Out=cfg["Out"],
+        seed=seed,
+        qk_via_einsum=qk_via_einsum,
+        av_via_einsum=av_via_einsum,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        bq=cfg["bq"][q_idx],
+        bk=cfg["bk"][kv_idx],
+        bv=cfg["bv"][kv_idx],
+        bout=cfg["bout"],
+    )
+
+    rng = np.random.default_rng(seed + 1)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_decomposed_gqa_pruning_qk_einsum_matches_oracle_exactly():
+    # QK^T via `Einsum` (`"bhid,bhjd->bhij"`), AV via plain `MatMul` --
+    # confirms the QK^T `Einsum` recognition path alone, independent of
+    # the AV one.
+    _assert_decomposed_einsum_pruning_matches_oracle(
+        qk_via_einsum=True, av_via_einsum=False, seed=201
+    )
+
+
+def test_decomposed_gqa_pruning_av_einsum_matches_oracle_exactly():
+    # AV via `Einsum` (`"bhij,bhjd->bhid"`), QK^T via plain `MatMul` --
+    # confirms the AV `Einsum` recognition path alone, independent of the
+    # QK^T one.
+    _assert_decomposed_einsum_pruning_matches_oracle(
+        qk_via_einsum=False, av_via_einsum=True, seed=202
+    )
+
+
+def test_decomposed_gqa_pruning_both_products_einsum_matches_oracle_exactly():
+    # Both products via `Einsum` -- the real `torch.einsum`-written
+    # attention block shape confirmed by
+    # `test_decomposed_attention_einsum_real_torch_export_pipeline` above.
+    _assert_decomposed_einsum_pruning_matches_oracle(
+        qk_via_einsum=True, av_via_einsum=True, seed=203
+    )
+
+
+def test_decomposed_gqa_pruning_qk_einsum_wrong_axis_order_declines():
+    # `"bhid,bhjd->bhji"` -- K's own free axis (`j`, `seq_k`) and Q's own
+    # free axis (`i`, `seq_q`) land in the OUTPUT in the wrong order
+    # relative to the operands' own positions (swapped from the correct
+    # `"...->bhij"`). Since this fixture's `seq_q == seq_k` (plain
+    # self-attention), the graph is still perfectly valid ONNX -- no
+    # shape actually changes -- but the equation is NOT provably
+    # equivalent to a batched matmul with axis roles preserved (it would
+    # actually compute K @ Q^T, transposed relative to what this chain's
+    # own downstream `Softmax`/AV-product expects), so
+    # `_einsum_equation_is_batched_matmul` must decline it, and the whole
+    # chain -- Q's/K's/V's own producer weights included -- must be left
+    # completely untouched rather than mis-sliced.
+    model, cfg = _decomposed_gqa_model_einsum(
+        K=16,
+        H=4,
+        KVH=4,
+        D=8,
+        Out=16,
+        seed=204,
+        qk_via_einsum=True,
+        av_via_einsum=False,
+        qk_equation="bhid,bhjd->bhji",
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned)
+    assert wq_new.shape == cfg["wq"].shape
+    assert wk_new.shape == cfg["wk"].shape
+    assert wv_new.shape == cfg["wv"].shape
+    assert wo_new.shape == cfg["wout"].shape
+
+
+def test_decomposed_gqa_pruning_av_einsum_repeated_output_subscript_declines():
+    # `"bhij,bhjd->bhijd"` -- the output term is rank 5 (a repeated/extra
+    # axis relative to the rank-4 operands), which this function already
+    # declines via its own rank check before any label-role reasoning --
+    # included here as the integration-level analogue of this module's
+    # own "repeated output subscript" unit-test case (see
+    # `test_einsum_equation_is_batched_matmul_declines_on_bad_equations`
+    # below for the direct, equation-string-only version of this check).
+    model, cfg = _decomposed_gqa_model_einsum(
+        K=16,
+        H=4,
+        KVH=4,
+        D=8,
+        Out=16,
+        seed=205,
+        qk_via_einsum=False,
+        av_via_einsum=True,
+        av_equation="bhij,bhjd->bhijd",
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned)
+    assert wq_new.shape == cfg["wq"].shape
+    assert wk_new.shape == cfg["wk"].shape
+    assert wv_new.shape == cfg["wv"].shape
+    assert wo_new.shape == cfg["wout"].shape
+
+
+def test_einsum_equation_is_batched_matmul_accepts_qk_and_av_shapes():
+    from onnxsim.pruning import _einsum_equation_is_batched_matmul as _check
+
+    # The two literal equations confirmed via a real `torch.onnx.export`
+    # (see `test_decomposed_attention_einsum_real_torch_export_pipeline`).
+    assert _check("bhid,bhjd->bhij", transposed_second_operand=True) is True
+    assert _check("bhij,bhjd->bhid", transposed_second_operand=False) is True
+    # A batch+head-merged 3-D variant (confirmed empirically too -- code
+    # that flattens batch/head into one axis before the einsum, e.g. some
+    # `x-transformers`-style call sites).
+    assert _check("bid,bjd->bij", transposed_second_operand=True) is True
+    assert _check("bij,bjd->bid", transposed_second_operand=False) is True
+    # A valid-but-differently-lettered equivalent equation -- the ONNX
+    # schema places no constraint on which letters are used (confirmed via
+    # `onnx.defs.get_schema("Einsum").doc`), so a real export using a
+    # different subscript alphabet must be accepted identically.
+    assert _check("xyzw,xyvw->xyzv", transposed_second_operand=True) is True
+    assert _check("xyzw,xywv->xyzv", transposed_second_operand=False) is True
+    # Spaces are cosmetic per the ONNX spec's own doc string -- stripped
+    # before parsing, so formatting alone never changes the verdict.
+    assert _check("bhid, bhjd -> bhij", transposed_second_operand=True) is True
+    # `first_operand_index=1` -- the AV product's own attention-weights
+    # operand landing in the SECOND `Einsum` input slot (V first) is
+    # mathematically identical to swapping the equation's own two LHS
+    # terms (einsum is symmetric in operand order).
+    assert (
+        _check(
+            "bhjd,bhij->bhid", transposed_second_operand=False, first_operand_index=1
+        )
+        is True
+    )
+
+
+def test_einsum_equation_is_batched_matmul_declines_on_bad_equations():
+    from onnxsim.pruning import _einsum_equation_is_batched_matmul as _check
+
+    # Batch-mismatched axis order: K's own leading two labels ("hb") are
+    # in the opposite order from Q's/the output's own ("bh") -- not
+    # actually the same batch axes passed straight through.
+    assert _check("bhid,hbjd->bhij", transposed_second_operand=True) is False
+    # Repeated output subscript: `i` appears twice in the output term.
+    assert _check("bhid,bhjd->bhii", transposed_second_operand=True) is False
+    # Contracting the wrong axis: swaps the QK^T product's own output
+    # axis order (`"...->bhji"` instead of `"...->bhij"`) -- a real
+    # `MatMul`-equivalent QK^T never has K's own free axis land before
+    # Q's own in the output.
+    assert _check("bhid,bhjd->bhji", transposed_second_operand=True) is False
+    # Zero contracted axes -- an elementwise/broadcast product (every
+    # label of both operands reappears in the output), not a matmul at
+    # all.
+    assert _check("bhid,bhid->bhid", transposed_second_operand=True) is False
+    assert _check("bhid,bhid->bhid", transposed_second_operand=False) is False
+    # No explicit "->" -- implicit-output-order einsum, declined rather
+    # than re-implementing that inference.
+    assert _check("bhid,bhjd", transposed_second_operand=True) is False
+    # An ellipsis -- broadcasting semantics this function never reasons
+    # about.
+    assert _check("...id,...jd->...ij", transposed_second_operand=True) is False
+    # Not exactly two comma-separated operand terms.
+    assert _check("bhid,bhjd,bhkd->bhij", transposed_second_operand=True) is False
+    assert _check("bhid->bhid", transposed_second_operand=True) is False
+    # A non-lowercase-letter character (schema's own alphabet is lower-case
+    # letters, comma, arrow, space only).
+    assert _check("bhiD,bhjd->bhij", transposed_second_operand=True) is False
+    assert _check("bhi1,bhjd->bhij", transposed_second_operand=True) is False
+    # Wrong rank (not 3 or 4).
+    assert _check("id,jd->ij", transposed_second_operand=True) is False
+    assert _check("abhid,abhjd->abhij", transposed_second_operand=True) is False
+    # The two operand terms' own ranks disagreeing.
+    assert _check("bhid,bhjde->bhij", transposed_second_operand=True) is False
+    # A repeated label within one operand's own term (diagonal extraction).
+    assert _check("bhii,bhjd->bhij", transposed_second_operand=True) is False
+    # An operand's own free axis colliding with the other operand's own
+    # label (an accidental alias, not a genuine per-operand free axis).
+    assert _check("bhid,bhjd->bhii", transposed_second_operand=True) is False
+    assert _check("bhid,bhid->bhii", transposed_second_operand=True) is False
+    # The AV-shape check (`transposed_second_operand=False`) rejects a
+    # QK^T-shape equation, and vice versa -- neither flag guesses past a
+    # equation that's actually the OTHER shape.
+    assert _check("bhid,bhjd->bhij", transposed_second_operand=False) is False
+    assert _check("bhij,bhjd->bhid", transposed_second_operand=True) is False
+
+
 # ---------------------------------------------------------------------------
 # Decomposed (un-fused) attention -- RoPE pass-through
 # ---------------------------------------------------------------------------
