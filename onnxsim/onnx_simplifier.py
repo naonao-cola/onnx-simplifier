@@ -21,7 +21,7 @@ import onnxsim.onnxsim_cpp2py_export as C
 
 from . import backend, model_checking, model_info, profile_merge, version
 from .calibration import Tensors, generate_random_calibration_data
-from .pruning import EmbeddingPruningResult
+from .pruning import EmbeddingPruningResult, _ImportanceNorm
 
 TensorShape = List[int]
 TensorShapes = Dict[str, TensorShape]
@@ -1268,6 +1268,8 @@ def prune_magnitude_cpp(
 def apply_structured_pruning_cpp(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+    global_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """
     C++-backed port of :func:`onnxsim.apply_structured_pruning`: removes
@@ -1357,8 +1359,30 @@ def apply_structured_pruning_cpp(
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched producer's output
-            channels to remove (at least one channel is always kept); must
-            be in ``[0, 1)``
+            channels to remove (at least one channel is always kept) -- or,
+            when ``global_sparsity``, target fraction of every eligible
+            chain's channels *combined*; must be in ``[0, 1)``
+    :param importance_norm: ``"l2"`` (default, unchanged from before this
+            parameter existed) ranks by Li et al.'s own root-sum-square L2
+            criterion; ``"l1"`` ranks by NNI's alternative L1 criterion
+            (sum of absolute weight magnitude) instead -- mirrors the
+            pure-Python :func:`onnxsim.apply_structured_pruning`'s own
+            ``importance_norm`` parameter exactly. Applies identically
+            whether or not ``global_sparsity`` is set.
+    :param global_sparsity: pools every *eligible* matched chain's own
+            per-channel importance into one ranking across the whole model
+            and picks a single keep-count from ``sparsity``'s fraction of
+            that pooled total, instead of every chain being cut by the same
+            fraction independently -- mirrors the pure-Python
+            :func:`onnxsim.apply_structured_pruning`'s own
+            ``global_sparsity`` mode exactly, including which chains are
+            "eligible" (an ordinary, single-producer chain with no extra
+            fan-out consumer branch and no general grouped Conv on either
+            side -- a gated pair, a residual/merge group, a
+            ``Concat``-merged branch, and any general grouped Conv chain
+            are all left completely untouched in this mode instead) and the
+            per-chain floor of at least one surviving channel. Default
+            ``False`` -- every pre-existing caller's behavior is unchanged.
     :returns: ``model`` with every matched chain's tensors resized in place;
             anything not matching the exact topology above (branching, a
             non-constant bias, a consumer whose reduction dimension doesn't
@@ -1367,7 +1391,9 @@ def apply_structured_pruning_cpp(
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
     return onnx.load_from_string(
-        C.apply_structured_pruning(model.SerializeToString(), sparsity)
+        C.apply_structured_pruning(
+            model.SerializeToString(), sparsity, importance_norm, global_sparsity
+        )
     )
 
 
@@ -1377,8 +1403,10 @@ def apply_structured_wanda_pruning_cpp(
     num_samples: int = 8,
     seed: int = 0,
     sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
     epsilon: float = 1e-8,
     providers: Optional[Sequence[backend.Provider]] = None,
+    global_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """
     C++-backed port of :func:`onnxsim.apply_structured_wanda_pruning`: the
@@ -1425,8 +1453,15 @@ def apply_structured_wanda_pruning_cpp(
     :param seed: seed for the random calibration data (ignored if
             ``calibration_data`` is supplied)
     :param sparsity: target fraction of each matched chain's output
-            channels to remove (at least one channel is always kept); must
-            be in ``[0, 1)``
+            channels to remove (at least one channel is always kept) -- or,
+            when ``global_sparsity``, target fraction of every eligible
+            chain's channels *combined*; must be in ``[0, 1)``
+    :param importance_norm: ``"l2"`` (default) or ``"l1"`` -- selects the
+            *weight*-magnitude term ``||W_row||`` only, exactly as it does
+            for :func:`onnxsim.apply_structured_pruning_cpp`; the
+            *activation*-norm term ``||X||_2`` stays L2 unconditionally
+            either way, per Wanda's own ``|W_ij| * ||X_j||_2`` definition.
+            Applies identically whether or not ``global_sparsity`` is set.
     :param epsilon: floor applied to the accumulated per-channel activation
             norm, avoiding every channel of an all-zero activation tying at
             exactly the weight-only importance
@@ -1434,12 +1469,20 @@ def apply_structured_wanda_pruning_cpp(
             when capturing calibration activations (passed to the shared
             :func:`onnxsim.onnx_simplifier._get_model_executor` process-wide
             executor, the same one :func:`onnxsim.simplify` itself uses)
+    :param global_sparsity: the structural analogue of
+            :func:`onnxsim.apply_structured_pruning_cpp`'s own
+            ``global_sparsity`` mode, applied to this function's own
+            ``||W_row||_2 * ||X||_2`` metric -- see that function's own
+            docstring for the full mechanism, the per-chain floor, and
+            exactly which chains are "eligible" to take part in the pool.
+            Default ``False`` -- every pre-existing caller's behavior is
+            unchanged.
     :returns: ``model`` with every matched chain's tensors resized in place;
             anything not matching that exact topology falls back to
             :func:`onnxsim.apply_structured_pruning_cpp`'s own plain
-            L2-norm ranking if no matching activation was ever observed for
-            that chain's consumer (including whenever ``calibration_data``
-            is empty)
+            weight-magnitude ranking if no matching activation was ever
+            observed for that chain's consumer (including whenever
+            ``calibration_data`` is empty)
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -1468,6 +1511,8 @@ def apply_structured_wanda_pruning_cpp(
             calibration_data_pb,
             sparsity,
             epsilon,
+            importance_norm,
+            global_sparsity,
         )
     )
 
@@ -1475,6 +1520,7 @@ def apply_structured_wanda_pruning_cpp(
 def apply_attention_head_pruning_cpp(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
 ) -> onnx.ModelProto:
     """
     C++-backed port of :func:`onnxsim.apply_attention_head_pruning`: removes
@@ -1520,6 +1566,12 @@ def apply_attention_head_pruning_cpp(
     :param sparsity: target fraction of each matched block's heads (or, for
             GroupQueryAttention/plain ai.onnx Attention, KV groups) to
             remove (at least one is always kept); must be in ``[0, 1)``
+    :param importance_norm: ``"l2"`` (default, unchanged from before this
+            parameter existed) ranks by the combined Frobenius (L2) norm of
+            each head's/KV group's own weight block, mirroring the
+            pure-Python :func:`onnxsim.apply_attention_head_pruning`'s own
+            default; ``"l1"`` ranks by the sum of absolute weight magnitude
+            across that same block instead.
     :returns: ``model`` with every matched block's tensors resized in
             place; anything not matching that exact topology (a
             non-constant weight, a packed-QKV GroupQueryAttention node, a
@@ -1533,7 +1585,9 @@ def apply_attention_head_pruning_cpp(
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
     return onnx.load_from_string(
-        C.apply_attention_head_pruning(model.SerializeToString(), sparsity)
+        C.apply_attention_head_pruning(
+            model.SerializeToString(), sparsity, importance_norm
+        )
     )
 
 
@@ -1543,6 +1597,7 @@ def apply_attention_head_wanda_pruning_cpp(
     num_samples: int = 8,
     seed: int = 0,
     sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
     epsilon: float = 1e-8,
     providers: Optional[Sequence[backend.Provider]] = None,
 ) -> onnx.ModelProto:
@@ -1588,6 +1643,10 @@ def apply_attention_head_wanda_pruning_cpp(
     :param sparsity: target fraction of each matched block's heads (or, for
             GroupQueryAttention/plain ai.onnx Attention, KV groups) to
             remove (at least one is always kept); must be in ``[0, 1)``
+    :param importance_norm: ``"l2"`` (default) or ``"l1"`` -- selects the
+            *weight*-magnitude term only, exactly as it does for
+            :func:`onnxsim.apply_attention_head_pruning_cpp`; the
+            *activation*-norm term stays L2 unconditionally either way.
     :param epsilon: floor applied to the accumulated per-unit activation
             norm, avoiding every unit of an all-zero activation tying at
             exactly the weight-only importance
@@ -1624,6 +1683,7 @@ def apply_attention_head_wanda_pruning_cpp(
             calibration_data_pb,
             sparsity,
             epsilon,
+            importance_norm,
         )
     )
 

@@ -4009,6 +4009,45 @@ int64_t ChainGroup(const Chain& chain) {
   return group;
 }
 
+// Whether `chain` may take part in ApplyStructuredPruning/
+// ApplyStructuredWandaPruning's own `global_sparsity` mode
+// (ApplyChainsGlobal below) -- an ordinary, single-producer chain with no
+// extra fan-out consumer branch and no general grouped Conv on either side.
+// Mirrors pruning.py's own _chain_is_global_sparsity_eligible exactly -- see
+// apply_structured_pruning's own `global_sparsity` docstring for the full
+// reasoning (a gated pair, a residual/merge group, and any general grouped
+// Conv chain all fail this and are left completely untouched by
+// global_sparsity mode instead of folded into the pool or pruned locally
+// alongside it).
+bool ChainIsGlobalSparsityEligible(const Chain& chain) {
+  return chain.producers.size() == 1 && chain.extra_consumers.empty() &&
+         ChainGroup(chain) == 1;
+}
+
+// Selects L1 (sum of absolute weight magnitude) or L2 (Li et al.'s original
+// root-sum-square) importance ranking -- mirrors pruning.py's own
+// `_ImportanceNorm`/`_validate_importance_norm`. Kept as a tiny internal
+// enum (parsed once at each public entry point via ParseImportanceNorm)
+// rather than threading a raw `std::string` through every chain-application
+// helper below, exactly the same "parse the string once at the boundary"
+// convention QuantizeFp8 (quantize_entry.cpp) already establishes for its
+// own `format` string parameter -- see that function's own body.
+enum class ImportanceNorm { kL2, kL1 };
+
+ImportanceNorm ParseImportanceNorm(const std::string& importance_norm,
+                                   const char* caller) {
+  if (importance_norm == "l2") {
+    return ImportanceNorm::kL2;
+  }
+  if (importance_norm == "l1") {
+    return ImportanceNorm::kL1;
+  }
+  throw std::invalid_argument(
+      std::string(caller) +
+      ": importance_norm must be \"l1\" or \"l2\", got \"" + importance_norm +
+      "\"");
+}
+
 // --- Slicing, mirroring _slice_producer_weight/_slice_consumer_weight/
 // _slice_grouped_consumer_conv_weight/_slice_last_axis ----------------------
 
@@ -4206,6 +4245,148 @@ struct TouchedState {
   std::unordered_set<std::string> stale_value_info;
 };
 
+// Performs the actual channel-removal slicing for one already-decided
+// (ascending) `keep` index set -- every producer's weight/bias, every
+// chain-op constant, every depthwise pass-through hop, the (possibly
+// grouped) consumer, and every extra fan-out consumer branch. Factored out
+// of ApplyChains so ApplyChainsGlobal (ApplyStructuredPruning's own
+// `global_sparsity` mode) can reuse the identical slicing mechanics without
+// duplicating it -- mirrors pruning.py's own _slice_chain_channels exactly,
+// including that touched-role bookkeeping is deliberately NOT part of this
+// function (the two callers mark touched roles at different points relative
+// to slicing -- ApplyChains as it goes, ApplyChainsGlobal eagerly during
+// admission, before any chain's final `keep` is even decided -- see that
+// function's own comment).
+void SliceChainChannels(
+    std::unordered_map<std::string, onnx::TensorProto*>& init_map, Chain& chain,
+    const std::vector<int64_t>& keep,
+    std::unordered_set<std::string>& stale_value_info) {
+  const int64_t n = chain.n_channels;
+  std::vector<const ConsumerBranch*> extra_ptrs;
+  extra_ptrs.reserve(chain.extra_consumers.size());
+  for (const auto& b : chain.extra_consumers) {
+    extra_ptrs.push_back(&b);
+  }
+
+  for (const auto& p : chain.producers) {
+    SliceProducerWeight(init_map.at(p.weight), p.weight_transposed, keep,
+                        p.is_conv);
+    if (p.bias) {
+      SliceLastAxis(init_map.at(*p.bias), keep);
+    }
+  }
+  for (const auto& co : chain.chain_ops) {
+    if (co.const_name) {
+      SliceLastAxis(init_map.at(*co.const_name), keep);
+    }
+  }
+  for (const auto& hop : chain.conv_pass_through) {
+    SliceProducerWeight(init_map.at(hop.weight), false, keep, true);
+    if (hop.bias) {
+      SliceLastAxis(init_map.at(*hop.bias), keep);
+    }
+    if (hop.past_state) {
+      // A CausalConvWithState hop's own constant `past_state` -- rank-3
+      // `(batch, channels, k-1)`, channel axis 1 -- reuses
+      // SliceConsumerWeight's own `is_conv` branch (SliceAxis1 over
+      // dims(0)/dims(1) with `inner = prod(dims[2:])`), which slices
+      // exactly that axis; mirrors pruning.py's own _slice_axis1 call in
+      // _apply_conv_pass_through_hop.
+      SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
+    }
+    // A PRelu per-channel-slope hop reuses ConvPassThrough for its own
+    // slicing (see MatchPreluPassThrough's own comment) but, unlike a
+    // depthwise Conv hop, has no `group` attribute of its own to update --
+    // mirrors pruning.py's own _apply_conv_pass_through_hop, which only
+    // ever touches `group` when the hop node is actually a Conv.
+    if (hop.node->op_type() == "Conv") {
+      SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
+    }
+  }
+  if (chain.group_norm) {
+    // Same `keep` index set as the real producer -- `num_groups` itself is
+    // left untouched (see GroupNormPassThrough's own comment for why it
+    // stays valid without changing it). Sliced via SliceLastAxis, not
+    // ConvPassThrough's own axis-0 SliceProducerWeight -- see
+    // GroupNormPassThrough's own comment for why.
+    SliceLastAxis(init_map.at(chain.group_norm->scale), keep);
+    SliceLastAxis(init_map.at(chain.group_norm->bias), keep);
+  }
+  if (chain.consumer_is_conv && chain.consumer_group > 1) {
+    SliceGroupedConsumerConvWeight(init_map.at(chain.consumer_weight), keep,
+                                   chain.consumer_group, n);
+  } else {
+    SliceConsumerWeight(init_map.at(chain.consumer_weight),
+                        chain.consumer_weight_transposed, keep,
+                        chain.consumer_is_conv);
+  }
+  // Extra fan-out branches: each is either an ordinary (group == 1)
+  // consumer, or, for a Conv residual/merge chain, a general grouped Conv
+  // consumer whose own group was already confirmed (in
+  // FindConvResidualChains) to agree with `group` above --
+  // ResolveMatmulFanoutBranches never resolves a grouped one, so
+  // consumer_group stays at its default 1 there. Either way, fed by the
+  // exact same `keep` just computed for the group's shared producers above.
+  for (const auto* b : extra_ptrs) {
+    for (const auto& co : b->chain_ops) {
+      if (co.const_name) {
+        SliceLastAxis(init_map.at(*co.const_name), keep);
+      }
+    }
+    for (const auto& hop : b->conv_pass_through) {
+      SliceProducerWeight(init_map.at(hop.weight), false, keep, true);
+      if (hop.bias) {
+        SliceLastAxis(init_map.at(*hop.bias), keep);
+      }
+      if (hop.past_state) {
+        SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
+      }
+      if (hop.node->op_type() == "Conv") {
+        SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
+      }
+    }
+    if (b->consumer_is_conv && b->consumer_group > 1) {
+      SliceGroupedConsumerConvWeight(init_map.at(b->consumer_weight), keep,
+                                     b->consumer_group, n);
+    } else {
+      SliceConsumerWeight(init_map.at(b->consumer_weight),
+                          b->consumer_weight_transposed, keep,
+                          b->consumer_is_conv);
+    }
+  }
+
+  for (const auto& p : chain.producers) {
+    stale_value_info.insert(p.node->output(0));
+    for (const auto* pre_op : p.pre_ops) {
+      stale_value_info.insert(pre_op->output(0));
+    }
+  }
+  for (const auto& co : chain.chain_ops) {
+    stale_value_info.insert(co.node->output(0));
+  }
+  // Every output, not just [0] -- a hop node can have more than one (e.g.
+  // `CausalConvWithState`'s own `present_state`); see ConvPassThrough's own
+  // docstring.
+  for (const auto& hop : chain.conv_pass_through) {
+    for (const auto& out : hop.node->output()) {
+      stale_value_info.insert(out);
+    }
+  }
+  if (chain.group_norm) {
+    stale_value_info.insert(chain.group_norm->node->output(0));
+  }
+  for (const auto* b : extra_ptrs) {
+    for (const auto& co : b->chain_ops) {
+      stale_value_info.insert(co.node->output(0));
+    }
+    for (const auto& hop : b->conv_pass_through) {
+      for (const auto& out : hop.node->output()) {
+        stale_value_info.insert(out);
+      }
+    }
+  }
+}
+
 // `act_norm`, when non-null, is a probe-name -> per-channel calibrated
 // activation-L2-norm map (see WandaCalibrationStats below), keyed by
 // `chain.consumer_node->input(0)` -- the same probe point
@@ -4216,19 +4397,26 @@ struct TouchedState {
 // mirrored by *any* mismatch here too -- an absent probe name, or a
 // present one whose length no longer lines up with this chain because a
 // sibling chain already resliced the shared tensor first), each channel's
-// plain ``||W_row||_2`` importance is multiplied by
-// ``max(act_norm[c], epsilon)`` -- Wanda's own metric. `nullptr` (the
-// default, and every ApplyStructuredPruning call site's own unchanged
-// argument count) keeps this identically the plain L2-only ranking it
-// always was; this is the one shared importance-computation point both
-// ApplyStructuredPruning and ApplyStructuredWandaPruning go through, so
-// the two never duplicate the ranking/top-k/slicing logic below -- only
-// the *importance vector feeding into it* differs.
+// plain importance is multiplied by ``max(act_norm[c], epsilon)`` -- Wanda's
+// own metric. `nullptr` (the default, and every ApplyStructuredPruning call
+// site's own unchanged argument count) keeps this identically the plain
+// weight-only ranking it always was; this is the one shared
+// importance-computation point both ApplyStructuredPruning and
+// ApplyStructuredWandaPruning go through, so the two never duplicate the
+// ranking/top-k/slicing logic below -- only the *importance vector feeding
+// into it* differs. `importance_norm` selects L1 vs. L2 weight-magnitude
+// ranking (see ImportanceNorm above) -- defaulted to kL2 so every
+// pre-existing call site is completely unaffected; applies identically
+// whether or not `act_norm` is given, mirroring pruning.py's own
+// `_plain_structured_importance`/`_wanda_structured_importance` split
+// exactly (the activation-norm multiplier always stays L2, only the
+// `||W_row||` term itself switches).
 void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
                  double sparsity, TouchedState& touched,
                  const std::unordered_map<std::string, std::vector<double>>*
                      act_norm = nullptr,
-                 double epsilon = 1e-8) {
+                 double epsilon = 1e-8,
+                 ImportanceNorm importance_norm = ImportanceNorm::kL2) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
@@ -4394,23 +4582,33 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
     for (const auto& w_nk : w_arrays_nk) {
       const int64_t k = static_cast<int64_t>(w_nk.size()) / n;
       for (int64_t c = 0; c < n; ++c) {
-        double sq = 0.0;
+        double acc = 0.0;
         for (int64_t j = 0; j < k; ++j) {
           const double v = w_nk[static_cast<size_t>(c * k + j)];
-          sq += v * v;
+          acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
         }
-        importance[static_cast<size_t>(c)] += sq;
+        importance[static_cast<size_t>(c)] += acc;
       }
     }
-    for (double& v : importance) {
-      v = std::sqrt(v);
+    // For L2 this is the root-sum-square combine across producers (Li et
+    // al.'s own criterion); for L1 the analogous combine is a plain sum with
+    // no square/sqrt anywhere -- mirrors pruning.py's own
+    // `_plain_structured_importance` exactly (see that function's own
+    // comment for the ``||concat(a, b)||`` identities behind each).
+    if (importance_norm != ImportanceNorm::kL1) {
+      for (double& v : importance) {
+        v = std::sqrt(v);
+      }
     }
 
-    // Wanda upgrade: multiply each channel's plain ||W_row||_2 by its own
-    // calibrated activation L2 norm -- mirrors pruning.py's own
-    // `_wanda_structured_importance` exactly, including the fallback to
-    // plain `importance` (left untouched) when no matching activation was
-    // observed for this chain's own probe point.
+    // Wanda upgrade: multiply each channel's plain weight-magnitude
+    // importance by its own calibrated activation L2 norm -- mirrors
+    // pruning.py's own `_wanda_structured_importance` exactly, including the
+    // fallback to plain `importance` (left untouched) when no matching
+    // activation was observed for this chain's own probe point. The
+    // activation-norm term itself always stays L2, per Wanda's own
+    // definition -- only `importance` above (the ``||W_row||`` term) ever
+    // switches with `importance_norm`.
     if (act_norm != nullptr) {
       auto it = act_norm->find(chain.consumer_node->input(0));
       if (it != act_norm->end() &&
@@ -4436,93 +4634,7 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
       keep = TopKIndicesAscending(importance, keep_count);
     }
 
-    for (const auto& p : chain.producers) {
-      SliceProducerWeight(init_map.at(p.weight), p.weight_transposed, keep,
-                          p.is_conv);
-      if (p.bias) {
-        SliceLastAxis(init_map.at(*p.bias), keep);
-      }
-    }
-    for (const auto& co : chain.chain_ops) {
-      if (co.const_name) {
-        SliceLastAxis(init_map.at(*co.const_name), keep);
-      }
-    }
-    for (const auto& hop : chain.conv_pass_through) {
-      SliceProducerWeight(init_map.at(hop.weight), false, keep, true);
-      if (hop.bias) {
-        SliceLastAxis(init_map.at(*hop.bias), keep);
-      }
-      if (hop.past_state) {
-        // A CausalConvWithState hop's own constant `past_state` -- rank-3
-        // `(batch, channels, k-1)`, channel axis 1 -- reuses
-        // SliceConsumerWeight's own `is_conv` branch (SliceAxis1 over
-        // dims(0)/dims(1) with `inner = prod(dims[2:])`), which slices
-        // exactly that axis; mirrors pruning.py's own _slice_axis1 call in
-        // _apply_conv_pass_through_hop.
-        SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
-      }
-      // A PRelu per-channel-slope hop reuses ConvPassThrough for its own
-      // slicing (see MatchPreluPassThrough's own comment) but, unlike a
-      // depthwise Conv hop, has no `group` attribute of its own to update --
-      // mirrors pruning.py's own _apply_conv_pass_through_hop, which only
-      // ever touches `group` when the hop node is actually a Conv.
-      if (hop.node->op_type() == "Conv") {
-        SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
-      }
-    }
-    if (chain.group_norm) {
-      // Same `keep` index set as the real producer -- `num_groups` itself is
-      // left untouched (see GroupNormPassThrough's own comment for why it
-      // stays valid without changing it). Sliced via SliceLastAxis, not
-      // ConvPassThrough's own axis-0 SliceProducerWeight -- see
-      // GroupNormPassThrough's own comment for why.
-      SliceLastAxis(init_map.at(chain.group_norm->scale), keep);
-      SliceLastAxis(init_map.at(chain.group_norm->bias), keep);
-    }
-    if (chain.consumer_is_conv && chain.consumer_group > 1) {
-      SliceGroupedConsumerConvWeight(init_map.at(chain.consumer_weight), keep,
-                                     chain.consumer_group, n);
-    } else {
-      SliceConsumerWeight(init_map.at(chain.consumer_weight),
-                          chain.consumer_weight_transposed, keep,
-                          chain.consumer_is_conv);
-    }
-    // Extra fan-out branches: each is either an ordinary (group == 1)
-    // consumer, or, for a Conv residual/merge chain, a general grouped Conv
-    // consumer whose own group was already confirmed (in
-    // FindConvResidualChains) to agree with `group` above --
-    // ResolveMatmulFanoutBranches never resolves a grouped one, so
-    // consumer_group stays at its default 1 there. Either way, fed by the
-    // exact same `keep` just computed for the group's shared producers
-    // above.
-    for (const auto* b : extra_ptrs) {
-      for (const auto& co : b->chain_ops) {
-        if (co.const_name) {
-          SliceLastAxis(init_map.at(*co.const_name), keep);
-        }
-      }
-      for (const auto& hop : b->conv_pass_through) {
-        SliceProducerWeight(init_map.at(hop.weight), false, keep, true);
-        if (hop.bias) {
-          SliceLastAxis(init_map.at(*hop.bias), keep);
-        }
-        if (hop.past_state) {
-          SliceConsumerWeight(init_map.at(*hop.past_state), false, keep, true);
-        }
-        if (hop.node->op_type() == "Conv") {
-          SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
-        }
-      }
-      if (b->consumer_is_conv && b->consumer_group > 1) {
-        SliceGroupedConsumerConvWeight(init_map.at(b->consumer_weight), keep,
-                                       b->consumer_group, n);
-      } else {
-        SliceConsumerWeight(init_map.at(b->consumer_weight),
-                            b->consumer_weight_transposed, keep,
-                            b->consumer_is_conv);
-      }
-    }
+    SliceChainChannels(init_map, chain, keep, stale_value_info);
 
     for (const auto& w : producer_weights) {
       producer_touched.insert(w);
@@ -4536,36 +4648,251 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
     for (const auto& w : conv_hop_weights) {
       conv_hop_touched.insert(w);
     }
+  }
+}
+
+// Global-sparsity companion to ApplyChains, used by
+// ApplyStructuredPruning/ApplyStructuredWandaPruning's own `global_sparsity`
+// mode. Mirrors pruning.py's own _apply_chains_global exactly, including its
+// own doc comment's full reasoning -- summarized here:
+//
+// The caller is required to have already filtered `chains` down to ones
+// with exactly one producer, no extra fan-out consumer branch, and
+// ChainGroup == 1 (ChainIsGlobalSparsityEligible above) -- this function
+// itself assumes that filtering already happened and doesn't re-check it.
+//
+// Two passes rather than ApplyChains' one: every admitted chain's own
+// channel importance must be known before any single chain's `keep` can be
+// decided, since global sparsity's whole point is one shared cutoff picked
+// from every admitted chain's pooled importance. Admission -- the same
+// tied-weight conflict/degenerate checks ApplyChains already performs, in
+// the same list order -- still happens greedily, chain by chain, in one
+// first pass, and an admitted chain's own weights are marked touched
+// immediately, *before* its own final `keep_count` is known (unlike
+// ApplyChains, where a chain whose `keep_count` rounds up to a no-op is
+// left completely unmarked) -- whether a chain's own `keep_count` will
+// round to a no-op can't be known until every admitted chain's importance
+// has been pooled and the one shared global cutoff is picked, so admission
+// can't be deferred that way without circularity.
+//
+// Each admitted chain keeps at least one channel -- the same floor
+// ApplyChains already enforces per chain -- pulled back out of the global
+// drop set after the fact whenever the global cutoff would otherwise reduce
+// a chain to zero channels (mirrors pruning.py's own per-chain floor
+// exactly, just resolved globally rather than locally).
+void ApplyChainsGlobal(
+    onnx::GraphProto* graph, std::vector<Chain>& chains, double sparsity,
+    TouchedState& touched,
+    const std::unordered_map<std::string, std::vector<double>>* act_norm =
+        nullptr,
+    double epsilon = 1e-8,
+    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
+  std::unordered_map<std::string, onnx::TensorProto*> init_map;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    init_map[t->name()] = t;
+  }
+  std::unordered_set<std::string>& producer_touched = touched.producer;
+  std::unordered_set<std::string>& consumer_touched = touched.consumer;
+  std::unordered_set<std::string>& const_touched = touched.const_names;
+  std::unordered_set<std::string>& conv_hop_touched = touched.conv_hop;
+  std::unordered_set<std::string>& stale_value_info = touched.stale_value_info;
+
+  struct Admitted {
+    Chain* chain;
+    std::vector<double> importance;
+  };
+  std::vector<Admitted> admitted;
+
+  for (auto& chain : chains) {
+    std::unordered_set<std::string> producer_weights;
+    bool degenerate = false;
     for (const auto& p : chain.producers) {
-      stale_value_info.insert(p.node->output(0));
-      for (const auto* pre_op : p.pre_ops) {
-        stale_value_info.insert(pre_op->output(0));
+      if (!producer_weights.insert(p.weight).second) {
+        degenerate = true;
+        break;
+      }
+    }
+    if (degenerate) {
+      continue;  // Degenerate -- shouldn't happen for a single-producer chain.
+    }
+
+    std::unordered_set<std::string> consumer_weights{chain.consumer_weight};
+
+    std::unordered_set<std::string> conv_hop_weights;
+    for (const auto& h : chain.conv_pass_through) {
+      conv_hop_weights.insert(h.weight);
+    }
+    if (conv_hop_weights.size() != chain.conv_pass_through.size()) {
+      continue;  // Degenerate -- the same depthwise weight named twice.
+    }
+
+    std::unordered_set<std::string> consts;
+    for (const auto& p : chain.producers) {
+      if (p.bias) {
+        consts.insert(*p.bias);
       }
     }
     for (const auto& co : chain.chain_ops) {
-      stale_value_info.insert(co.node->output(0));
-    }
-    // Every output, not just [0] -- a hop node can have more than one (e.g.
-    // `CausalConvWithState`'s own `present_state`); see ConvPassThrough's
-    // own docstring.
-    for (const auto& hop : chain.conv_pass_through) {
-      for (const auto& out : hop.node->output()) {
-        stale_value_info.insert(out);
+      if (co.const_name) {
+        consts.insert(*co.const_name);
       }
     }
     if (chain.group_norm) {
-      stale_value_info.insert(chain.group_norm->node->output(0));
+      consts.insert(chain.group_norm->scale);
+      consts.insert(chain.group_norm->bias);
     }
-    for (const auto* b : extra_ptrs) {
-      for (const auto& co : b->chain_ops) {
-        stale_value_info.insert(co.node->output(0));
+
+    bool conflict = false;
+    for (const auto& w : consumer_weights) {
+      if (consumer_touched.count(w)) {
+        conflict = true;
       }
-      for (const auto& hop : b->conv_pass_through) {
-        for (const auto& out : hop.node->output()) {
-          stale_value_info.insert(out);
+    }
+    for (const auto& w : producer_weights) {
+      if (producer_touched.count(w)) {
+        conflict = true;
+      }
+    }
+    for (const auto& c : consts) {
+      if (const_touched.count(c)) {
+        conflict = true;
+      }
+    }
+    for (const auto& w : conv_hop_weights) {
+      if (conv_hop_touched.count(w)) {
+        conflict = true;
+      }
+    }
+    if (conflict) {
+      continue;  // A shared/tied initializer another chain already resized.
+    }
+
+    const int64_t n = chain.n_channels;
+    std::vector<std::vector<float>> w_arrays_nk;
+    for (const auto& p : chain.producers) {
+      onnx::TensorProto* wt = init_map.at(p.weight);
+      std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
+      std::vector<float> data = ReadFloatTensor(*wt);
+      if (p.is_conv) {
+        w_arrays_nk.push_back(std::move(data));
+      } else if (p.weight_transposed) {
+        w_arrays_nk.push_back(std::move(data));
+      } else {
+        w_arrays_nk.push_back(TransposeFlat(data, dims[0], dims[1]));
+      }
+    }
+
+    std::vector<double> importance(static_cast<size_t>(n), 0.0);
+    for (const auto& w_nk : w_arrays_nk) {
+      const int64_t k = static_cast<int64_t>(w_nk.size()) / n;
+      for (int64_t c = 0; c < n; ++c) {
+        double acc = 0.0;
+        for (int64_t j = 0; j < k; ++j) {
+          const double v = w_nk[static_cast<size_t>(c * k + j)];
+          acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
+        }
+        importance[static_cast<size_t>(c)] += acc;
+      }
+    }
+    if (importance_norm != ImportanceNorm::kL1) {
+      for (double& v : importance) {
+        v = std::sqrt(v);
+      }
+    }
+    if (act_norm != nullptr) {
+      auto it = act_norm->find(chain.consumer_node->input(0));
+      if (it != act_norm->end() &&
+          it->second.size() == static_cast<size_t>(n)) {
+        for (int64_t c = 0; c < n; ++c) {
+          importance[static_cast<size_t>(c)] *=
+              std::max(it->second[static_cast<size_t>(c)], epsilon);
         }
       }
     }
+
+    admitted.push_back({&chain, std::move(importance)});
+    for (const auto& w : producer_weights) {
+      producer_touched.insert(w);
+    }
+    for (const auto& w : consumer_weights) {
+      consumer_touched.insert(w);
+    }
+    for (const auto& c : consts) {
+      const_touched.insert(c);
+    }
+    for (const auto& w : conv_hop_weights) {
+      conv_hop_touched.insert(w);
+    }
+  }
+
+  if (admitted.empty()) {
+    return;
+  }
+
+  int64_t total_n = 0;
+  for (const auto& a : admitted) {
+    total_n += a.chain->n_channels;
+  }
+  const int64_t keep_count_total = std::min(
+      std::max<int64_t>(
+          std::llround(static_cast<double>(total_n) * (1.0 - sparsity)),
+          int64_t{0}),
+      total_n);
+  const int64_t drop_count_total = total_n - keep_count_total;
+
+  std::vector<double> pooled;
+  pooled.reserve(static_cast<size_t>(total_n));
+  for (const auto& a : admitted) {
+    pooled.insert(pooled.end(), a.importance.begin(), a.importance.end());
+  }
+
+  // Ascending-importance order, stable (mirrors np.argsort(pooled,
+  // kind="stable")) -- the lowest `drop_count_total` entries are dropped.
+  std::vector<int64_t> order(static_cast<size_t>(total_n));
+  std::iota(order.begin(), order.end(), int64_t{0});
+  std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+    return pooled[static_cast<size_t>(a)] < pooled[static_cast<size_t>(b)];
+  });
+  std::vector<bool> drop_flat(static_cast<size_t>(total_n), false);
+  for (int64_t i = 0; i < drop_count_total; ++i) {
+    drop_flat[static_cast<size_t>(order[static_cast<size_t>(i)])] = true;
+  }
+
+  int64_t offset = 0;
+  for (auto& a : admitted) {
+    Chain& chain = *a.chain;
+    const int64_t n = chain.n_channels;
+    bool all_dropped = true;
+    for (int64_t i = 0; i < n; ++i) {
+      if (!drop_flat[static_cast<size_t>(offset + i)]) {
+        all_dropped = false;
+        break;
+      }
+    }
+    if (all_dropped) {
+      // Per-chain floor: never drop every channel of an admitted chain --
+      // keep its own single highest-importance channel instead.
+      int64_t best = 0;
+      for (int64_t i = 1; i < n; ++i) {
+        if (a.importance[static_cast<size_t>(i)] >
+            a.importance[static_cast<size_t>(best)]) {
+          best = i;
+        }
+      }
+      drop_flat[static_cast<size_t>(offset + best)] = false;
+    }
+    std::vector<int64_t> keep;
+    for (int64_t i = 0; i < n; ++i) {
+      if (!drop_flat[static_cast<size_t>(offset + i)]) {
+        keep.push_back(i);
+      }
+    }
+    offset += n;
+    if (static_cast<int64_t>(keep.size()) >= n) {
+      continue;  // Every channel survived -- no-op, nothing to slice.
+    }
+    SliceChainChannels(init_map, chain, keep, stale_value_info);
   }
 }
 
@@ -5104,7 +5431,8 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
     AttnChain& chain, double sparsity,
     const std::unordered_map<std::string, std::vector<double>>* act_norm =
         nullptr,
-    double epsilon = 1e-8) {
+    double epsilon = 1e-8,
+    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
   const int64_t h = chain.num_heads;
   const int64_t keep_count =
       std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
@@ -5118,25 +5446,31 @@ std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
   const int64_t total_n = w_init->dims(1);
   std::vector<float> w = ReadFloatTensor(*w_init);  // [K, total_n] row-major.
 
+  // Combined importance of each head's full Q+K+V weight block -- for L2
+  // that's the block's own Frobenius norm (sqrt of the sum of every entry
+  // squared); for L1 the sum of every entry's own absolute value instead,
+  // with no square/sqrt anywhere -- mirrors pruning.py's own
+  // `_plain_attention_head_importance` exactly.
   std::vector<double> importance(static_cast<size_t>(h), 0.0);
   for (int64_t hh = 0; hh < h; ++hh) {
-    double sq = 0.0;
+    double acc = 0.0;
     for (int64_t r = 0; r < K; ++r) {
       for (int64_t c = hh * dq; c < (hh + 1) * dq; ++c) {
         const double v = w[static_cast<size_t>(r * total_n + c)];
-        sq += v * v;
+        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
       }
       for (int64_t c = chain.nq + hh * dk; c < chain.nq + (hh + 1) * dk; ++c) {
         const double v = w[static_cast<size_t>(r * total_n + c)];
-        sq += v * v;
+        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
       }
       for (int64_t c = chain.nq + chain.nk + hh * dv;
            c < chain.nq + chain.nk + (hh + 1) * dv; ++c) {
         const double v = w[static_cast<size_t>(r * total_n + c)];
-        sq += v * v;
+        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
       }
     }
-    importance[static_cast<size_t>(hh)] = std::sqrt(sq);
+    importance[static_cast<size_t>(hh)] =
+        importance_norm == ImportanceNorm::kL1 ? acc : std::sqrt(acc);
   }
 
   // Wanda upgrade: multiply each head's plain ||W||_F by its own combined
@@ -5249,7 +5583,8 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
     AttnChain& chain, double sparsity,
     const std::unordered_map<std::string, std::vector<double>>* act_norm =
         nullptr,
-    double epsilon = 1e-8) {
+    double epsilon = 1e-8,
+    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
   const int64_t h = chain.kv_num_heads;
   const int64_t keep_count =
       std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
@@ -5290,26 +5625,34 @@ std::optional<AppliedAttn> ApplyOneGqaChain(
                                  ? TransposeFlat(wv, wv_dims[0], wv_dims[1])
                                  : wv;
 
+  // Combined importance of each KV group's own Q+K+V weight block -- for L2
+  // that's the block's own Frobenius norm; for L1 the sum of every entry's
+  // own absolute value instead, with no square/sqrt anywhere -- mirrors
+  // pruning.py's own `_gqa_group_importance` exactly (see that function's
+  // own comment for why summing every entry, rather than concatenating, is
+  // used -- it stays well-defined even when Q's own row count differs from
+  // K/V's, the cross-attention shape this port also matches).
   std::vector<double> importance(static_cast<size_t>(chain.kv_num_heads), 0.0);
   for (int64_t kv = 0; kv < chain.kv_num_heads; ++kv) {
-    double sq = 0.0;
+    double acc = 0.0;
     for (int64_t r = 0; r < K; ++r) {
       for (int64_t g = kv * group_size; g < (kv + 1) * group_size; ++g) {
         for (int64_t c = g * d; c < (g + 1) * d; ++c) {
           const double v = wq_kn[static_cast<size_t>(r * Nq + c)];
-          sq += v * v;
+          acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
         }
       }
       for (int64_t c = kv * d; c < (kv + 1) * d; ++c) {
         const double v = wk_kn[static_cast<size_t>(r * Nk + c)];
-        sq += v * v;
+        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
       }
       for (int64_t c = kv * d; c < (kv + 1) * d; ++c) {
         const double v = wv_kn[static_cast<size_t>(r * Nv + c)];
-        sq += v * v;
+        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
       }
     }
-    importance[static_cast<size_t>(kv)] = std::sqrt(sq);
+    importance[static_cast<size_t>(kv)] =
+        importance_norm == ImportanceNorm::kL1 ? acc : std::sqrt(acc);
   }
 
   // Wanda upgrade: multiply each KV group's plain ||W||_F by its own
@@ -5398,7 +5741,8 @@ void ApplyAttentionChains(
     onnx::GraphProto* graph, std::vector<AttnChain>& chains, double sparsity,
     const std::unordered_map<std::string, std::vector<double>>* act_norm =
         nullptr,
-    double epsilon = 1e-8) {
+    double epsilon = 1e-8,
+    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
@@ -5426,9 +5770,10 @@ void ApplyAttentionChains(
 
     std::optional<AppliedAttn> applied =
         chain.kind == AttnChainKind::kGqaLike
-            ? ApplyOneGqaChain(init_map, chain, sparsity, act_norm, epsilon)
+            ? ApplyOneGqaChain(init_map, chain, sparsity, act_norm, epsilon,
+                               importance_norm)
             : ApplyOnePlainAttentionChain(init_map, chain, sparsity, act_norm,
-                                          epsilon);
+                                          epsilon, importance_norm);
     if (!applied) {
       continue;
     }
@@ -6196,7 +6541,8 @@ void ApplyConcatChains(
     TouchedState& touched,
     const std::unordered_map<std::string, std::vector<double>>* act_norm =
         nullptr,
-    double epsilon = 1e-8) {
+    double epsilon = 1e-8,
+    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
@@ -6299,16 +6645,18 @@ void ApplyConcatChains(
       for (const auto& w_nk : w_arrays_nk) {
         const int64_t k = static_cast<int64_t>(w_nk.size()) / n;
         for (int64_t c = 0; c < n; ++c) {
-          double sq = 0.0;
+          double acc = 0.0;
           for (int64_t j = 0; j < k; ++j) {
             const double v = w_nk[static_cast<size_t>(c * k + j)];
-            sq += v * v;
+            acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
           }
-          importance[static_cast<size_t>(c)] += sq;
+          importance[static_cast<size_t>(c)] += acc;
         }
       }
-      for (double& v : importance) {
-        v = std::sqrt(v);
+      if (importance_norm != ImportanceNorm::kL1) {
+        for (double& v : importance) {
+          v = std::sqrt(v);
+        }
       }
       // Wanda upgrade -- see ApplyChains' own identical comment. Keyed by
       // this branch's own probe point (`b.operand_name`) rather than a
@@ -6836,9 +7184,10 @@ std::vector<SplitGatedChain> FindSplitGatedChains(onnx::GraphProto* graph) {
 // to a *different* value is declined outright rather than corrupting the
 // first chain's own already-applied rewrite. Mirrors pruning.py's own
 // _apply_split_gated_chains.
-void ApplySplitGatedChains(onnx::GraphProto* graph,
-                           std::vector<SplitGatedChain>& chains,
-                           double sparsity, TouchedState& touched) {
+void ApplySplitGatedChains(
+    onnx::GraphProto* graph, std::vector<SplitGatedChain>& chains,
+    double sparsity, TouchedState& touched,
+    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
@@ -6884,16 +7233,26 @@ void ApplySplitGatedChains(onnx::GraphProto* graph,
       k = dims[0];
     }
 
+    // Combined (gate half + up half) importance -- for L2 that's
+    // sqrt(||gate_row||_2^2 + ||up_row||_2^2) (root-sum-square, Li et al.'s
+    // own criterion); for L1 the analogous combine is a plain sum of each
+    // half's own L1 norm, no square/sqrt anywhere -- mirrors pruning.py's
+    // own `_plain_branch_importance([gate_half, up_half], importance_norm)`
+    // exactly (see this function's own doc comment above).
     std::vector<double> importance(static_cast<size_t>(h), 0.0);
     for (int64_t c = 0; c < h; ++c) {
-      double sq_gate = 0.0, sq_up = 0.0;
+      double acc_gate = 0.0, acc_up = 0.0;
       for (int64_t j = 0; j < k; ++j) {
         const double vg = w_nk[static_cast<size_t>(c * k + j)];
-        sq_gate += vg * vg;
+        acc_gate +=
+            importance_norm == ImportanceNorm::kL1 ? std::abs(vg) : vg * vg;
         const double vu = w_nk[static_cast<size_t>((h + c) * k + j)];
-        sq_up += vu * vu;
+        acc_up +=
+            importance_norm == ImportanceNorm::kL1 ? std::abs(vu) : vu * vu;
       }
-      importance[static_cast<size_t>(c)] = std::sqrt(sq_gate + sq_up);
+      importance[static_cast<size_t>(c)] =
+          importance_norm == ImportanceNorm::kL1 ? acc_gate + acc_up
+                                                 : std::sqrt(acc_gate + acc_up);
     }
     const std::vector<int64_t> keep =
         TopKIndicesAscending(importance, keep_count);
@@ -20355,12 +20714,16 @@ std::unordered_map<std::string, SparseGptHessian> SparseGptHessianStats(
 }  // namespace
 
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
-                                        double sparsity) {
+                                        double sparsity,
+                                        const std::string& importance_norm,
+                                        bool global_sparsity) {
   if (!(sparsity >= 0.0 && sparsity < 1.0)) {
     throw std::invalid_argument(
         "ApplyStructuredPruning: sparsity must be in [0, 1), got " +
         std::to_string(sparsity));
   }
+  const ImportanceNorm norm =
+      ParseImportanceNorm(importance_norm, "ApplyStructuredPruning");
   onnx::ModelProto out = model;
 
   // Subgraph-aware (IterSubgraphs, see this file's own "Subgraph
@@ -20415,20 +20778,57 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
     std::vector<DynQuantChain> dynquant_chains = FindDynQuantChains(graph);
 
     TouchedState touched;
-    if (!chains.empty()) {
-      ApplyChains(graph, chains, sparsity, touched);
-    }
-    if (!concat_chains.empty()) {
-      ApplyConcatChains(graph, concat_chains, sparsity, touched);
-    }
-    if (!split_gated_chains.empty()) {
-      // A genuinely separate application pass, not folded into ApplyChains
-      // -- see FindSplitGatedChains/ApplySplitGatedChains's own section
-      // comment for why. Shares `touched` with the calls above so a weight
-      // this pass resizes can never be double-resized by (or
-      // double-resize) an ordinary chain/Concat-chain that happens to
-      // touch the same initializer -- still scoped to this one graph only.
-      ApplySplitGatedChains(graph, split_gated_chains, sparsity, touched);
+    // `global_sparsity` mirrors pruning.py's own apply_structured_pruning
+    // scope EXACTLY: only the plain chain family (`chains` -- FindChains/
+    // FindGatedChains/FindConvChains/FindConvResidualChains/
+    // FindMatmulResidualChains) ever takes part in the pooled ranking, via
+    // ApplyChainsGlobal restricted to ChainIsGlobalSparsityEligible members
+    // -- a gated pair, a residual/merge group, and any general grouped Conv
+    // chain are left completely untouched in this mode (see that
+    // function's own doc comment). `concat_chains`/`split_gated_chains` are
+    // Python's own `apply_structured_pruning`'s remaining two families and
+    // are likewise simply NOT applied in global_sparsity mode there (its
+    // own `if global_sparsity: ... else: ...` body only ever calls
+    // `_apply_concat_chains`/`_apply_split_gated_chains` from the `else`
+    // branch) -- mirrored here the same way. The quantized-weight families
+    // below (MatMulNBits/QDQ/Bnb4/Fp8/Fp4/QOperator/DynamicQuantizeMatMul)
+    // are additional scope this one C++ entry point consolidates from
+    // several separate pure-Python top-level functions
+    // (apply_structured_pruning_qdq and friends), NONE of which have a
+    // `global_sparsity` parameter of their own in pruning.py at all -- so
+    // `global_sparsity` has no defined meaning for them and they are always
+    // applied with their own local per-chain sparsity, completely
+    // unaffected by this flag either way.
+    if (global_sparsity) {
+      std::vector<Chain> global_chains;
+      for (const auto& c : chains) {
+        if (ChainIsGlobalSparsityEligible(c)) {
+          global_chains.push_back(c);
+        }
+      }
+      if (!global_chains.empty()) {
+        ApplyChainsGlobal(graph, global_chains, sparsity, touched, nullptr,
+                          1e-8, norm);
+      }
+    } else {
+      if (!chains.empty()) {
+        ApplyChains(graph, chains, sparsity, touched, nullptr, 1e-8, norm);
+      }
+      if (!concat_chains.empty()) {
+        ApplyConcatChains(graph, concat_chains, sparsity, touched, nullptr,
+                          1e-8, norm);
+      }
+      if (!split_gated_chains.empty()) {
+        // A genuinely separate application pass, not folded into
+        // ApplyChains -- see FindSplitGatedChains/ApplySplitGatedChains's
+        // own section comment for why. Shares `touched` with the calls
+        // above so a weight this pass resizes can never be double-resized
+        // by (or double-resize) an ordinary chain/Concat-chain that
+        // happens to touch the same initializer -- still scoped to this
+        // one graph only.
+        ApplySplitGatedChains(graph, split_gated_chains, sparsity, touched,
+                              norm);
+      }
     }
     if (!matmul_nbits_chains.empty() || !matmul_nbits_gated_chains.empty()) {
       // Another separate application pass -- see the "MatMulNBits
@@ -20527,12 +20927,15 @@ onnx::ModelProto ApplyStructuredWandaPruning(
     const onnx::ModelProto& model, const ModelExecutor& executor,
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
         calibration_data,
-    double sparsity, double epsilon) {
+    double sparsity, double epsilon, const std::string& importance_norm,
+    bool global_sparsity) {
   if (!(sparsity >= 0.0 && sparsity < 1.0)) {
     throw std::invalid_argument(
         "ApplyStructuredWandaPruning: sparsity must be in [0, 1), got " +
         std::to_string(sparsity));
   }
+  const ImportanceNorm norm =
+      ParseImportanceNorm(importance_norm, "ApplyStructuredWandaPruning");
   onnx::ModelProto out = model;
 
   // NOT subgraph-aware -- see this function's own declaration comment in
@@ -20598,19 +21001,38 @@ onnx::ModelProto ApplyStructuredWandaPruning(
       WandaCalibrationStats(executor, out, probe_axis, calibration_data);
 
   TouchedState touched;
-  if (!chains.empty()) {
-    ApplyChains(graph, chains, sparsity, touched, &act_norm, epsilon);
-  }
-  if (!concat_chains.empty()) {
-    ApplyConcatChains(graph, concat_chains, sparsity, touched, &act_norm,
-                      epsilon);
-  }
-  if (!split_gated_chains.empty()) {
-    // Plain weight-magnitude importance only, unchanged -- see this
-    // function's own comment above on `probe_axis` for why: reused
-    // completely as-is, exactly like ApplyStructuredPruning's own call to
-    // it, no `act_norm`/`epsilon` parameters to thread through at all.
-    ApplySplitGatedChains(graph, split_gated_chains, sparsity, touched);
+  // `global_sparsity` mirrors pruning.py's own apply_structured_wanda_pruning
+  // scope exactly -- see ApplyStructuredPruning's own identical comment
+  // above for the full reasoning (only the plain chain family pools into
+  // ApplyChainsGlobal; concat_chains/split_gated_chains are simply not
+  // applied in this mode, mirroring the Python `if global_sparsity: ...
+  // else: ...` split exactly).
+  if (global_sparsity) {
+    std::vector<Chain> global_chains;
+    for (const auto& c : chains) {
+      if (ChainIsGlobalSparsityEligible(c)) {
+        global_chains.push_back(c);
+      }
+    }
+    if (!global_chains.empty()) {
+      ApplyChainsGlobal(graph, global_chains, sparsity, touched, &act_norm,
+                        epsilon, norm);
+    }
+  } else {
+    if (!chains.empty()) {
+      ApplyChains(graph, chains, sparsity, touched, &act_norm, epsilon, norm);
+    }
+    if (!concat_chains.empty()) {
+      ApplyConcatChains(graph, concat_chains, sparsity, touched, &act_norm,
+                        epsilon, norm);
+    }
+    if (!split_gated_chains.empty()) {
+      // Plain weight-magnitude importance only (no calibrated activation
+      // norm -- see this function's own comment above on `probe_axis` for
+      // why), but `importance_norm` still applies -- mirrors pruning.py's
+      // own `_split_gated_wanda_importance` exactly.
+      ApplySplitGatedChains(graph, split_gated_chains, sparsity, touched, norm);
+    }
   }
   if (!touched.stale_value_info.empty()) {
     google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
@@ -20625,12 +21047,15 @@ onnx::ModelProto ApplyStructuredWandaPruning(
 }
 
 onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
-                                           double sparsity) {
+                                           double sparsity,
+                                           const std::string& importance_norm) {
   if (!(sparsity >= 0.0 && sparsity < 1.0)) {
     throw std::invalid_argument(
         "ApplyAttentionHeadPruning: sparsity must be in [0, 1), got " +
         std::to_string(sparsity));
   }
+  const ImportanceNorm norm =
+      ParseImportanceNorm(importance_norm, "ApplyAttentionHeadPruning");
   onnx::ModelProto out = model;
 
   // Subgraph-aware (IterSubgraphs, see this file's own "Subgraph
@@ -20655,7 +21080,7 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
                   std::make_move_iterator(onnx_attn_chains.begin()),
                   std::make_move_iterator(onnx_attn_chains.end()));
     if (!chains.empty()) {
-      ApplyAttentionChains(graph, chains, sparsity);
+      ApplyAttentionChains(graph, chains, sparsity, nullptr, 1e-8, norm);
     }
     // The fused `com.microsoft::MatMulNBitsQkv` variant -- see the
     // "MatMulNBitsMlp/MatMulNBitsQkv (fused block-quantized weight)
@@ -20691,12 +21116,14 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
     const onnx::ModelProto& model, const ModelExecutor& executor,
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
         calibration_data,
-    double sparsity, double epsilon) {
+    double sparsity, double epsilon, const std::string& importance_norm) {
   if (!(sparsity >= 0.0 && sparsity < 1.0)) {
     throw std::invalid_argument(
         "ApplyAttentionHeadWandaPruning: sparsity must be in [0, 1), got " +
         std::to_string(sparsity));
   }
+  const ImportanceNorm norm =
+      ParseImportanceNorm(importance_norm, "ApplyAttentionHeadWandaPruning");
   onnx::ModelProto out = model;
 
   // NOT subgraph-aware -- mirrors pruning.py's own
@@ -20741,7 +21168,7 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
   const std::unordered_map<std::string, std::vector<double>> act_norm =
       WandaCalibrationStats(executor, out, probe_axis, calibration_data);
 
-  ApplyAttentionChains(graph, chains, sparsity, &act_norm, epsilon);
+  ApplyAttentionChains(graph, chains, sparsity, &act_norm, epsilon, norm);
   return out;
 }
 

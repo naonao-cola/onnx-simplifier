@@ -32,11 +32,34 @@
 // for the definition, where ``executor.Run(...)`` is actually called.
 struct ModelExecutor;
 
-onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
-                                        double sparsity);
+// `importance_norm` ("l1" or "l2", case-sensitive; anything else throws
+// std::invalid_argument) selects L1 (sum of absolute weight magnitude) or
+// L2 (Li et al.'s original root-sum-square, the pre-existing default)
+// channel-importance ranking -- mirrors pruning.py's own
+// `_ImportanceNorm`/`_validate_importance_norm`/`importance_norm` parameter
+// exactly. `global_sparsity` pools every *eligible* matched chain's own
+// per-channel importance into one ranking across the whole model and picks
+// a single keep-count from `sparsity`'s fraction of that pooled total,
+// instead of every chain being cut by the same fraction independently --
+// mirrors pruning.py's own `apply_structured_pruning`/`global_sparsity`
+// parameter exactly, including which chains are "eligible" (an ordinary,
+// single-producer chain with no extra fan-out consumer branch and no
+// general grouped Conv on either side -- see structured_pruning_entry.cpp's
+// own ChainIsGlobalSparsityEligible) and the per-chain floor of at least
+// one surviving channel. See structured_pruning_entry.cpp's own
+// ApplyChainsGlobal for the full mechanism.
+onnx::ModelProto ApplyStructuredPruning(
+    const onnx::ModelProto& model, double sparsity,
+    const std::string& importance_norm = "l2", bool global_sparsity = false);
 
-onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
-                                           double sparsity);
+// `importance_norm` mirrors ApplyStructuredPruning's own parameter of the
+// same name exactly (pruning.py's own `apply_attention_head_pruning`
+// `importance_norm`) -- L1 vs. L2 ranking of each matched head's/KV group's
+// own combined weight-block norm. No `global_sparsity` counterpart here --
+// pruning.py's own `apply_attention_head_pruning` has none either.
+onnx::ModelProto ApplyAttentionHeadPruning(
+    const onnx::ModelProto& model, double sparsity,
+    const std::string& importance_norm = "l2");
 
 // Removes intermediate (`inter_size`) channels from every expert of a
 // matched `com.microsoft::MoE` node at once -- real structural pruning
@@ -243,11 +266,20 @@ EmbeddingVocabPruningResult ApplyEmbeddingVocabMagnitudePruning(
 // ``||W_row||_2`` ranking, exactly mirroring pruning.py's own per-chain "no
 // matching activation observed" fallback, just triggered for every chain at
 // once instead of one at a time.
+// `importance_norm`/`global_sparsity` mirror ApplyStructuredPruning's own
+// parameters of the same names exactly (pruning.py's own
+// `apply_structured_wanda_pruning` `importance_norm`/`global_sparsity`) --
+// the *weight*-magnitude term only; the activation-norm term stays L2
+// unconditionally either way, per Wanda's own ``|W_ij| * ||X_j||_2``
+// definition. `global_sparsity` mode applies to this function's own
+// ``||W_row|| * ||X||_2`` metric, same eligible-chain scope and per-chain
+// floor as ApplyStructuredPruning's own `global_sparsity`.
 onnx::ModelProto ApplyStructuredWandaPruning(
     const onnx::ModelProto& model, const ModelExecutor& executor,
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
         calibration_data,
-    double sparsity, double epsilon = 1e-8);
+    double sparsity, double epsilon = 1e-8,
+    const std::string& importance_norm = "l2", bool global_sparsity = false);
 
 // The calibration-driven (Wanda-style) upgrade of ApplyAttentionHeadPruning
 // -- same relationship, and same reused pattern, as
@@ -294,11 +326,18 @@ onnx::ModelProto ApplyStructuredWandaPruning(
 // matched block fall back to ApplyAttentionHeadPruning's own plain
 // ``||W||_F`` ranking, exactly mirroring pruning.py's own per-block "no
 // matching activation observed" fallback.
+// `importance_norm` mirrors ApplyAttentionHeadPruning's own parameter of the
+// same name exactly (pruning.py's own `apply_attention_head_wanda_pruning`
+// `importance_norm`) -- the *weight*-magnitude term only; the
+// activation-norm term stays L2 unconditionally either way. No
+// `global_sparsity` counterpart here either, mirroring
+// ApplyAttentionHeadPruning's own declaration comment above.
 onnx::ModelProto ApplyAttentionHeadWandaPruning(
     const onnx::ModelProto& model, const ModelExecutor& executor,
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
         calibration_data,
-    double sparsity, double epsilon = 1e-8);
+    double sparsity, double epsilon = 1e-8,
+    const std::string& importance_norm = "l2");
 
 // Depth/block-level pruning: drops whole redundant pre-norm transformer
 // residual sub-blocks (``x = x + SelfAttn(LN(x))`` or ``x = x + MLP(LN(x))``)

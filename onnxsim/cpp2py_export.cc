@@ -655,20 +655,28 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
 
   // Structured (channel) pruning: removes whole output channels from
   // MatMul/vanilla-Gemm and Conv layers -- real structural pruning, not
-  // just value-only zeroing. See ApplyStructuredPruning in onnxsim.h.
+  // just value-only zeroing. See ApplyStructuredPruning in
+  // structured_pruning_entry.h. `importance_norm` ("l1"/"l2") and
+  // `global_sparsity` mirror pruning.py's own `apply_structured_pruning`
+  // parameters of the same names exactly -- see that function's own
+  // declaration comment.
   m.def(
       "apply_structured_pruning",
-      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+      [](const py::bytes& model_proto_bytes, double sparsity,
+         const std::string& importance_norm,
+         bool global_sparsity) -> py::bytes {
         InitEnv();
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
-        const auto result = ApplyStructuredPruning(model, sparsity);
+        const auto result = ApplyStructuredPruning(
+            model, sparsity, importance_norm, global_sparsity);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
       },
-      "model_bytes"_a, "sparsity"_a);
+      "model_bytes"_a, "sparsity"_a, "importance_norm"_a = "l2",
+      "global_sparsity"_a = false);
 
   // The calibration-driven (Wanda-style) upgrade of apply_structured_pruning
   // above -- same executor-as-first-argument shape as `simplify`'s own
@@ -691,36 +699,41 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
          const py::bytes& model_proto_bytes,
          std::vector<std::unordered_map<std::string, onnx::TensorProto>>
              calibration_data,
-         double sparsity, double epsilon) -> py::bytes {
+         double sparsity, double epsilon, const std::string& importance_norm,
+         bool global_sparsity) -> py::bytes {
         InitEnv();
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
         const auto result = ApplyStructuredWandaPruning(
-            model, *executor, calibration_data, sparsity, epsilon);
+            model, *executor, calibration_data, sparsity, epsilon,
+            importance_norm, global_sparsity);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
-      "epsilon"_a = 1e-8);
+      "epsilon"_a = 1e-8, "importance_norm"_a = "l2",
+      "global_sparsity"_a = false);
 
   // Attention-head pruning: removes whole attention heads (or, for
   // grouped-query attention, whole KV groups) from every matched fused
   // self-attention block. See ApplyAttentionHeadPruning in onnxsim.h.
   m.def(
       "apply_attention_head_pruning",
-      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+      [](const py::bytes& model_proto_bytes, double sparsity,
+         const std::string& importance_norm) -> py::bytes {
         InitEnv();
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
-        const auto result = ApplyAttentionHeadPruning(model, sparsity);
+        const auto result =
+            ApplyAttentionHeadPruning(model, sparsity, importance_norm);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
       },
-      "model_bytes"_a, "sparsity"_a);
+      "model_bytes"_a, "sparsity"_a, "importance_norm"_a = "l2");
 
   // The calibration-driven (Wanda-style) upgrade of
   // apply_attention_head_pruning above -- same executor-as-first-argument
@@ -735,19 +748,21 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
          const py::bytes& model_proto_bytes,
          std::vector<std::unordered_map<std::string, onnx::TensorProto>>
              calibration_data,
-         double sparsity, double epsilon) -> py::bytes {
+         double sparsity, double epsilon,
+         const std::string& importance_norm) -> py::bytes {
         InitEnv();
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
-        const auto result = ApplyAttentionHeadWandaPruning(
-            model, *executor, calibration_data, sparsity, epsilon);
+        const auto result =
+            ApplyAttentionHeadWandaPruning(model, *executor, calibration_data,
+                                           sparsity, epsilon, importance_norm);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
-      "epsilon"_a = 1e-8);
+      "epsilon"_a = 1e-8, "importance_norm"_a = "l2");
 
   // SparseGPT (Frantar & Alistarh, 2023) unstructured/N:M pruning: zeros
   // the least-important entries of every matched MatMul/vanilla-Gemm/
