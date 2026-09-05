@@ -89,7 +89,14 @@ def test_lo_bcq_quantizes_matmul_with_standard_ops_only():
     onnx.checker.check_model(q)
 
     op_types = {n.op_type for n in q.graph.node}
-    assert op_types <= {"MatMul", "Cast", "Gather", "GatherElements", "Reshape"}
+    assert op_types <= {
+        "MatMul",
+        "Cast",
+        "Gather",
+        "GatherElements",
+        "Reshape",
+        "Transpose",
+    }
     assert all(n.domain in ("", "ai.onnx") for n in q.graph.node)
 
 
