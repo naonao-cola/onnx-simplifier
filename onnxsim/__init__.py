@@ -40,6 +40,10 @@ from onnxsim.coreml_export import export_coreml
 from onnxsim.d2quant import apply_dac, apply_dsq
 from onnxsim.diffusion_export import export_diffusion_model
 from onnxsim.double_quantization import apply_double_quantization
+from onnxsim.drop_by_drop import (
+    quantize_weight_only_drop_by_drop,
+    select_drop_by_drop_prefix,
+)
 from onnxsim.duquant import apply_duquant
 from onnxsim.embedding_quantization import (
     quantize_embedding_binary,
@@ -309,6 +313,8 @@ __all__ = [
     "FP4_FORMATS",
     "quantize_weight_only_squeezellm",
     "quantize_weight_only_aqlm",
+    "quantize_weight_only_drop_by_drop",
+    "select_drop_by_drop_prefix",
     "quantize_weight_only_gptvq",
     "quantize_weight_only_spqr",
     "quantize_weight_only_adpq",
