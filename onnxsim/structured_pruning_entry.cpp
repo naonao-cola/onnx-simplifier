@@ -20059,11 +20059,32 @@ std::vector<double> EmbeddingVocabImportance(const EmbeddingChain& chain,
 // declared axis) is simply absent from the result, which is exactly the
 // "no matching activation observed" condition ApplyChains/ApplyConcatChains
 // fall back to plain weight-only importance on.
+//
+// `require_rank2` (default empty -- every pre-existing caller
+// (ApplyStructuredWandaPruning/ApplyAttentionHeadWandaPruning) is completely
+// unaffected, since neither's own Python reference
+// (`_wanda_structured_calibration_stats`/`_wanda_attention_calibration_stats`)
+// has any rank restriction at all) names the subset of probe names that
+// must be observed at EXACTLY rank 2 to count for a given batch, mirroring
+// pruning.py's own `_wanda_unstructured_calibration_stats`'s plain
+// (non-Attention, non-Conv) MatMul/Gemm probe: `if x.ndim != 2: continue`.
+// Unlike this function's own generic "sum of squares over every axis but
+// the channel one" reduction (correct at any rank, and what every OTHER
+// probe name still gets), a batch where a `require_rank2` probe's own
+// activation isn't rank-2 contributes NOTHING to that probe's accumulator
+// for that batch -- checked before the axis/dtype bookkeeping below, same
+// as pruning.py's own early-continue. ApplyWandaPruning is the only caller
+// that ever passes a non-empty set here, and only for its plain MatMul/Gemm
+// candidates' own `x_name`s -- never its `com.microsoft::Attention`
+// candidates' (pruning.py's own `attn_act_norm` allows any rank >= 2 there)
+// nor Conv's (a wholly separate function, ConvWandaCalibrationStats) -- see
+// ApplyWandaPruning's own call site comment for how that set is built.
 std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     const std::unordered_map<std::string, int64_t>& probe_axis,
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
-        calibration_data) {
+        calibration_data,
+    const std::unordered_set<std::string>& require_rank2 = {}) {
   std::unordered_map<std::string, std::vector<double>> result;
   if (probe_axis.empty()) {
     // Nothing to probe (e.g. only split_gated_chains matched -- never
@@ -20164,6 +20185,12 @@ std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
         continue;
       }
       const int64_t ndim = tp.dims_size();
+      if (require_rank2.count(name) != 0 && ndim != 2) {
+        continue;  // Mirrors pruning.py's own
+                   // `_wanda_unstructured_calibration_stats`'s plain
+                   // MatMul/Gemm probe: `if x.ndim != 2: continue` -- see
+                   // this function's own `require_rank2` doc comment above.
+      }
       int64_t axis = axis_raw;
       if (axis < 0) {
         axis += ndim;
@@ -21942,6 +21969,1190 @@ onnx::ModelProto ApplyStructuredWandaPruning(
   return out;
 }
 
+// --- Decomposed (un-fused) GQA/MQA/plain-MHA attention head pruning,
+// mirroring pruning.py's own "Decomposed (un-fused) attention head pruning"
+// section (_find_decomposed_gqa_chains/_apply_one_decomposed_gqa_chain) --
+// -------------------------------------------------------------------------
+//
+// Matches the eager/un-fused attention shape a plain torch.onnx.export()
+// (no ONNX Runtime transformer-fusion pass, no com.microsoft::GroupQuery
+// Attention emitted) produces: separate Q/K/V MatMul/vanilla-Gemm
+// projections, each reshaped+transposed into its own [batch, H, seq,
+// head_size] head-split, K's/V's own optional HuggingFace `repeat_kv`
+// broadcast (Unsqueeze(axis=[2]) -> Expand -> Reshape) for GQA/MQA, a plain
+// MatMul QK^T product, Softmax, a plain MatMul AV product, and a final
+// Transpose+Reshape combining the head axis back into the hidden dimension
+// before the output projection.
+//
+// DELIBERATELY NARROWER than pruning.py's own matcher, the same kind of
+// documented, accepted scope gap this port already carries for the fused-op
+// families above (see e.g. MatchMultiHeadAttentionProducer's own comment on
+// declining rather than reproducing pruning.py's own dynamic-bias slicing,
+// and ApplyOneGqaChain's own comment on having no MQA fast path at all):
+//
+//   - No additive mask (`attn_mask`/causal bias) of any kind is recognized
+//     here -- pruning.py's own `_resolve_decomposed_qk_root` matches an
+//     optional `Add(mask) -> [Mul/Div(scale) ->] MatMul` prefix; this port's
+//     `ResolveDecomposedQkRoot` only ever matches `[Mul/Div(scale) ->]
+//     MatMul`, so a graph with a real mask `Add` node between the QK^T
+//     product and Softmax simply fails to match at all here (the `Add`
+//     node's own op_type is never `Mul`/`Div`/`MatMul`) -- a decline, never
+//     a mis-slice.
+//   - No decomposed RoPE (`_DecomposedRopePassThrough`) or decomposed
+//     Q/K-norm (`_DecomposedQKNormPassThrough`) pass-through is recognized
+//     between a branch's own head-split `Reshape`/`Transpose` and the QK^T
+//     product -- either one sitting there breaks this port's own fixed
+//     `Reshape -> Transpose` adjacency check, so the whole chain simply
+//     fails to match (declines), the same safe fallback.
+//   - No `Einsum`-based QK^T/AV product (`_einsum_equation_is_batched_
+//     matmul`) -- `MatMul` only, mirroring this port's existing
+//     Attention-family scope everywhere else.
+//   - No packed-QKV-then-`Split` producer (`_match_decomposed_packed_qkv_
+//     producer`) -- Q's, K's, and V's own raw projection outputs must come
+//     from three independent MatMul/Gemm nodes; a shared producer declines
+//     the whole chain (the same "degenerate -- can't independently slice"
+//     decline pruning.py's own matcher gives a shape it can't resolve
+//     either way).
+//   - No true-MQA (`kv_num_heads == 1`) fast path -- mirrors ApplyOneGqaChain's
+//     own identical, already-accepted gap for the fused-op families: with
+//     only one KV group, `keep_count >= h` is always true, so this is a
+//     permanent no-op for that block (never mis-slices, just never prunes
+//     it), exactly like every other chain kind here already does for MQA.
+//   - Consumer (output-projection) weight dtype is plain FLOAT32 only,
+//     mirroring WalkToAttentionConsumer's own identical restriction for
+//     every other chain kind in this file (not pruning.py's own broader
+//     `_is_supported_float_dtype`, which additionally allows FLOAT16/
+//     BFLOAT16).
+//
+// What IS matched, closing the real gap this section exists for: both of
+// K's own real dot-product-transpose shapes (the combined
+// `Transpose(perm=[0,2,3,1])` PyTorch's own `fuseConsecutiveTransposes`
+// peephole emits when nothing sits between the head-split and the QK^T
+// "swap", and the ordinary separate-`Transpose` shape otherwise), K's/V's
+// own optional `repeat_kv` GQA/MQA broadcast, an optional global scalar
+// scale (`Mul`/`Div` by a constant), and -- the genuinely novel part this
+// family was deferred for -- rewriting every `Reshape`/`Expand` shape
+// constant this chain owns to its new post-pruning head count, safely: in
+// place when every one of that constant's real (freshly recomputed at apply
+// time) readers is owned by this chain, or, when a genuinely unrelated
+// extra reader exists (this pass's own onnxsim CSE routinely merges two
+// textually identical shape constants from different chains/layers onto one
+// shared tensor), by cloning a fresh tensor holding the current value and
+// rewiring only this chain's own owning node(s) onto it -- see
+// RewriteDecomposedShapeDim's own comment below for the exact mechanism,
+// mirroring pruning.py's own `_rewrite_shape_dim` local helper.
+
+struct DecomposedGqaChain {
+  struct RepeatKv {
+    onnx::NodeProto* unsqueeze = nullptr;
+    onnx::NodeProto* expand = nullptr;
+    std::string expand_shape;
+    onnx::NodeProto* merge_reshape = nullptr;
+    std::string merge_reshape_shape;
+  };
+
+  std::string q_weight, k_weight, v_weight;
+  bool q_weight_transposed = false;
+  bool k_weight_transposed = false;
+  bool v_weight_transposed = false;
+  std::optional<std::string> q_bias, k_bias, v_bias;
+  int64_t num_heads = 0;
+  int64_t kv_num_heads = 0;
+  int64_t head_size = 0;
+  int64_t v_head_size = 0;
+
+  onnx::NodeProto* q_transpose = nullptr;
+  onnx::NodeProto* q_reshape = nullptr;
+  std::string q_reshape_shape;
+
+  // K's own dot-product-transpose node -- either the combined
+  // perm=[0,2,3,1] head-split+swap (k_headsplit_transpose is then nullptr)
+  // or the separate perm=[0,1,3,2] swap alone (k_headsplit_transpose then
+  // names K's own actual head-split Transpose, a distinct node).
+  onnx::NodeProto* k_transpose = nullptr;
+  onnx::NodeProto* k_headsplit_transpose = nullptr;
+  onnx::NodeProto* k_reshape = nullptr;
+  std::string k_reshape_shape;
+  std::optional<RepeatKv> k_repeat_kv;
+
+  onnx::NodeProto* v_transpose = nullptr;
+  onnx::NodeProto* v_reshape = nullptr;
+  std::string v_reshape_shape;
+  std::optional<RepeatKv> v_repeat_kv;
+
+  onnx::NodeProto* qk_matmul = nullptr;
+  onnx::NodeProto* scale_node = nullptr;
+  onnx::NodeProto* softmax_node = nullptr;
+  onnx::NodeProto* av_matmul = nullptr;
+  onnx::NodeProto* out_transpose = nullptr;
+  onnx::NodeProto* out_reshape = nullptr;
+  // nullopt exactly when the combine-back Reshape's own target shape's last
+  // entry is already a wildcard (-1/0) -- never a rewrite candidate then,
+  // mirrors pruning.py's own identical `out_reshape_shape` field.
+  std::optional<std::string> out_reshape_shape;
+
+  onnx::NodeProto* consumer_node = nullptr;
+  std::string consumer_weight;
+  bool consumer_weight_transposed = false;
+};
+
+// Resolves `name` (already confirmed internal by the caller) backward
+// through the fixed 2-node `Reshape -> Transpose(perm)` head-split sequence
+// -- mirrors pruning.py's own `_match_decomposed_head_split` (this port's
+// scope: no `allow_qk_norm` hop -- see this section's own top comment).
+struct HeadSplitMatch {
+  onnx::NodeProto* transpose;
+  onnx::NodeProto* reshape;
+  int64_t num_heads;
+  int64_t head_size;
+  std::string reshape_shape;
+  std::string proj_out;
+};
+
+std::optional<HeadSplitMatch> MatchDecomposedHeadSplit(
+    const std::string& name, const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const InitMap& init_map, const std::vector<int64_t>& perm) {
+  auto is_internal = [&](const std::string& n) {
+    return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
+  };
+  auto tit = node_by_output.find(name);
+  if (tit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* transpose = tit->second;
+  if (transpose->domain() != "" || transpose->op_type() != "Transpose" ||
+      transpose->input_size() != 1 || transpose->input(0).empty() ||
+      transpose->output_size() != 1 || transpose->output(0) != name) {
+    return std::nullopt;
+  }
+  std::vector<int64_t> found_perm;
+  bool has_perm = false;
+  for (const auto& attr : transpose->attribute()) {
+    if (attr.name() == "perm") {
+      found_perm.assign(attr.ints().begin(), attr.ints().end());
+      has_perm = true;
+    }
+  }
+  if (!has_perm || found_perm != perm) {
+    return std::nullopt;
+  }
+
+  const std::string reshaped_name = transpose->input(0);
+  if (!is_internal(reshaped_name)) {
+    return std::nullopt;
+  }
+  auto rit = node_by_output.find(reshaped_name);
+  if (rit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* reshape = rit->second;
+  if (reshape->domain() != "" || reshape->op_type() != "Reshape" ||
+      reshape->input_size() != 2 || reshape->input(0).empty() ||
+      reshape->input(1).empty() || reshape->output_size() != 1 ||
+      reshape->output(0) != reshaped_name) {
+    return std::nullopt;
+  }
+  auto sit = init_map.find(reshape->input(1));
+  if (sit == init_map.end() ||
+      sit->second->data_type() != onnx::TensorProto::INT64 ||
+      sit->second->dims_size() != 1 || sit->second->dims(0) != 4) {
+    return std::nullopt;
+  }
+  std::vector<int64_t> dims = ReadInt64Tensor(*sit->second);
+  if (dims.size() != 4) {
+    return std::nullopt;
+  }
+  const int64_t num_heads = dims[2];
+  const int64_t head_size = dims[3];
+  if (num_heads <= 0 || head_size <= 0) {
+    return std::nullopt;
+  }
+
+  const std::string proj_out = reshape->input(0);
+  if (!is_internal(proj_out)) {
+    return std::nullopt;
+  }
+
+  return HeadSplitMatch{transpose, reshape,           num_heads,
+                        head_size, reshape->input(1), proj_out};
+}
+
+// Resolves `name` (already confirmed internal by the caller) backward
+// through the standard HuggingFace `repeat_kv` broadcast -- `Unsqueeze
+// (axis=[2]) -> Expand -> Reshape` -- mirrors pruning.py's own
+// `_match_decomposed_repeat_kv` exactly.
+struct RepeatKvMatch {
+  DecomposedGqaChain::RepeatKv branch;
+  std::string raw_name;
+  int64_t kv_num_heads;
+  int64_t n_rep;
+};
+
+std::optional<RepeatKvMatch> MatchDecomposedRepeatKv(
+    const std::string& name, const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const InitMap& init_map) {
+  auto is_internal = [&](const std::string& n) {
+    return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
+  };
+  auto rit = node_by_output.find(name);
+  if (rit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* reshape = rit->second;
+  if (reshape->domain() != "" || reshape->op_type() != "Reshape" ||
+      reshape->input_size() != 2 || reshape->input(0).empty() ||
+      reshape->input(1).empty() || reshape->output_size() != 1 ||
+      reshape->output(0) != name) {
+    return std::nullopt;
+  }
+  auto mit = init_map.find(reshape->input(1));
+  if (mit == init_map.end() ||
+      mit->second->data_type() != onnx::TensorProto::INT64 ||
+      mit->second->dims_size() != 1 || mit->second->dims(0) != 4) {
+    return std::nullopt;
+  }
+  std::vector<int64_t> merge_dims = ReadInt64Tensor(*mit->second);
+  if (merge_dims.size() != 4) {
+    return std::nullopt;
+  }
+  const int64_t merged_heads = merge_dims[1];
+  if (merged_heads <= 0) {
+    return std::nullopt;
+  }
+
+  const std::string expand_out = reshape->input(0);
+  if (!is_internal(expand_out)) {
+    return std::nullopt;
+  }
+  auto eit = node_by_output.find(expand_out);
+  if (eit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* expand = eit->second;
+  if (expand->domain() != "" || expand->op_type() != "Expand" ||
+      expand->input_size() != 2 || expand->input(0).empty() ||
+      expand->input(1).empty() || expand->output_size() != 1 ||
+      expand->output(0) != expand_out) {
+    return std::nullopt;
+  }
+  auto exit_ = init_map.find(expand->input(1));
+  if (exit_ == init_map.end() ||
+      exit_->second->data_type() != onnx::TensorProto::INT64 ||
+      exit_->second->dims_size() != 1 || exit_->second->dims(0) != 5) {
+    return std::nullopt;
+  }
+  std::vector<int64_t> expand_dims = ReadInt64Tensor(*exit_->second);
+  if (expand_dims.size() != 5) {
+    return std::nullopt;
+  }
+  const int64_t kv_num_heads = expand_dims[1];
+  const int64_t n_rep = expand_dims[2];
+  if (kv_num_heads <= 0 || n_rep <= 0 || kv_num_heads * n_rep != merged_heads) {
+    return std::nullopt;
+  }
+
+  const std::string unsqueeze_out = expand->input(0);
+  if (!is_internal(unsqueeze_out)) {
+    return std::nullopt;
+  }
+  auto uit = node_by_output.find(unsqueeze_out);
+  if (uit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* unsqueeze = uit->second;
+  if (unsqueeze->domain() != "" || unsqueeze->op_type() != "Unsqueeze" ||
+      unsqueeze->input_size() != 2 || unsqueeze->input(0).empty() ||
+      unsqueeze->input(1).empty() || unsqueeze->output_size() != 1 ||
+      unsqueeze->output(0) != unsqueeze_out) {
+    return std::nullopt;
+  }
+  auto axit = init_map.find(unsqueeze->input(1));
+  if (axit == init_map.end() ||
+      axit->second->data_type() != onnx::TensorProto::INT64 ||
+      axit->second->dims_size() != 1 || axit->second->dims(0) != 1) {
+    return std::nullopt;
+  }
+  std::vector<int64_t> axes = ReadInt64Tensor(*axit->second);
+  if (axes.size() != 1 || axes[0] != 2) {
+    return std::nullopt;
+  }
+
+  const std::string raw_name = unsqueeze->input(0);
+  if (!is_internal(raw_name)) {
+    return std::nullopt;
+  }
+
+  RepeatKvMatch m;
+  m.branch.unsqueeze = unsqueeze;
+  m.branch.expand = expand;
+  m.branch.expand_shape = expand->input(1);
+  m.branch.merge_reshape = reshape;
+  m.branch.merge_reshape_shape = reshape->input(1);
+  m.raw_name = raw_name;
+  m.kv_num_heads = kv_num_heads;
+  m.n_rep = n_rep;
+  return m;
+}
+
+// Resolves a Softmax's own input backward through the optional
+// `[Mul/Div(scalar scale) ->] MatMul` prefix -- mirrors pruning.py's own
+// `_resolve_decomposed_qk_root`, narrowed to this port's own scope (no mask
+// `Add`, no `Einsum` -- see this section's own top comment).
+struct QkRootMatch {
+  onnx::NodeProto* qk_matmul;
+  onnx::NodeProto* scale_node;  // nullptr when absent.
+};
+
+std::optional<QkRootMatch> ResolveDecomposedQkRoot(
+    const std::string& smax_input, const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const InitMap& init_map) {
+  auto is_internal = [&](const std::string& n) {
+    return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
+  };
+  auto is_scalar_const = [&](const std::string& n) {
+    auto it = init_map.find(n);
+    if (it == init_map.end()) {
+      return false;
+    }
+    int64_t prod = 1;
+    for (int64_t d : it->second->dims()) {
+      prod *= d;
+    }
+    return prod == 1;
+  };
+
+  std::string cur = smax_input;
+  onnx::NodeProto* scale_node = nullptr;
+  if (is_internal(cur)) {
+    auto pit = node_by_output.find(cur);
+    if (pit != node_by_output.end()) {
+      onnx::NodeProto* probe = pit->second;
+      if ((probe->op_type() == "Mul" || probe->op_type() == "Div") &&
+          probe->domain() == "" && probe->input_size() == 2 &&
+          !probe->input(0).empty() && !probe->input(1).empty() &&
+          probe->output_size() == 1 && probe->output(0) == cur) {
+        const std::string& a = probe->input(0);
+        const std::string& b = probe->input(1);
+        if (a != b && is_scalar_const(b)) {
+          scale_node = probe;
+          cur = a;
+        } else if (a != b && probe->op_type() == "Mul" && is_scalar_const(a)) {
+          scale_node = probe;
+          cur = b;
+        }
+      }
+    }
+  }
+
+  if (!is_internal(cur)) {
+    return std::nullopt;
+  }
+  auto qit = node_by_output.find(cur);
+  if (qit == node_by_output.end()) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* qk_matmul = qit->second;
+  if (qk_matmul->domain() != "" || qk_matmul->op_type() != "MatMul" ||
+      qk_matmul->input_size() != 2 || qk_matmul->output_size() != 1 ||
+      qk_matmul->output(0) != cur) {
+    return std::nullopt;
+  }
+  return QkRootMatch{qk_matmul, scale_node};
+}
+
+// Every tensor/node name already live in `graph` -- mirrors pruning.py's own
+// `_existing_graph_names`, the seed set MintUniqueName grows from so a
+// freshly cloned shape constant (RewriteDecomposedShapeDim's own "foreign
+// reader" branch) can never collide with anything already in the graph.
+std::unordered_set<std::string> ExistingGraphNames(
+    const onnx::GraphProto& graph) {
+  std::unordered_set<std::string> names;
+  for (const auto& vi : graph.input()) {
+    names.insert(vi.name());
+  }
+  for (const auto& vi : graph.output()) {
+    names.insert(vi.name());
+  }
+  for (const auto& vi : graph.value_info()) {
+    names.insert(vi.name());
+  }
+  for (const auto& t : graph.initializer()) {
+    names.insert(t.name());
+  }
+  for (const auto& node : graph.node()) {
+    if (!node.name().empty()) {
+      names.insert(node.name());
+    }
+    for (const auto& n : node.input()) {
+      if (!n.empty()) {
+        names.insert(n);
+      }
+    }
+    for (const auto& n : node.output()) {
+      if (!n.empty()) {
+        names.insert(n);
+      }
+    }
+  }
+  return names;
+}
+
+// `base`, or `base` with a numeric suffix appended until it no longer
+// collides with anything in `used` -- and reserves the result before
+// returning it. Mirrors pruning.py's own `_mint_unique_name`.
+std::string MintUniqueName(const std::string& base,
+                           std::unordered_set<std::string>& used) {
+  std::string name = base;
+  int suffix = 0;
+  while (used.count(name)) {
+    ++suffix;
+    name = base + "_" + std::to_string(suffix);
+  }
+  used.insert(name);
+  return name;
+}
+
+// Anchored on each plain (default-domain) `Softmax(axis=-1)` node in `graph`
+// -- a far rarer, more specific anchor than a MatMul/Gemm -- mirrors
+// pruning.py's own `_find_decomposed_gqa_chains` (this port's own narrower
+// scope: see this section's own top comment).
+std::vector<DecomposedGqaChain> FindDecomposedGqaChains(
+    onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    for (const auto& out : node->output()) {
+      if (!out.empty()) {
+        node_by_output[out] = node;
+      }
+    }
+  }
+  auto is_internal = [&](const std::string& n) {
+    return ConsumerCount(consumers_of, n) == 1 && !graph_outputs.count(n);
+  };
+
+  const std::vector<int64_t> kPermBhsd{0, 2, 1, 3};      // ordinary head-split
+  const std::vector<int64_t> kPermCombined{0, 2, 3, 1};  // K's fused swap
+  const std::vector<int64_t> kPermSwap{0, 1, 3, 2};      // K's separate swap
+  const std::vector<int64_t> kPermOut{0, 2, 1, 3};       // combine-back
+
+  std::vector<DecomposedGqaChain> chains;
+  for (int ni = 0; ni < graph->node_size(); ++ni) {
+    onnx::NodeProto* node = graph->mutable_node(ni);
+    if (node->domain() != "" || node->op_type() != "Softmax") {
+      continue;
+    }
+    int64_t axis = -1;
+    for (const auto& attr : node->attribute()) {
+      if (attr.name() == "axis") {
+        axis = attr.i();
+      }
+    }
+    if (axis != -1) {
+      continue;
+    }
+    if (node->input_size() != 1 || node->input(0).empty() ||
+        node->output_size() != 1) {
+      continue;
+    }
+    const std::string& smax_out = node->output(0);
+    if (!is_internal(smax_out)) {
+      continue;
+    }
+
+    auto root = ResolveDecomposedQkRoot(
+        node->input(0), consumers_of, graph_outputs, node_by_output, init_map);
+    if (!root) {
+      continue;
+    }
+    onnx::NodeProto* qk_matmul = root->qk_matmul;
+    onnx::NodeProto* scale_node = root->scale_node;
+
+    const std::string q_bhsd_name = qk_matmul->input(0);
+    const std::string k_operand = qk_matmul->input(1);
+    if (!is_internal(q_bhsd_name) || !is_internal(k_operand)) {
+      continue;
+    }
+
+    // ---- K's own dot-product transpose: combined or separate form ----
+    onnx::NodeProto* k_transpose = nullptr;
+    onnx::NodeProto* k_headsplit_transpose = nullptr;
+    onnx::NodeProto* k_reshape = nullptr;
+    std::string k_reshape_shape;
+    std::string k_proj_out;
+    std::optional<DecomposedGqaChain::RepeatKv> k_repeat_kv;
+    int64_t kv_num_heads = -1;
+    int64_t head_size_k = -1;
+
+    auto kt_it = node_by_output.find(k_operand);
+    if (kt_it == node_by_output.end()) {
+      continue;
+    }
+    k_transpose = kt_it->second;
+    if (k_transpose->domain() != "" || k_transpose->op_type() != "Transpose") {
+      continue;
+    }
+    std::vector<int64_t> k_perm;
+    bool k_has_perm = false;
+    for (const auto& attr : k_transpose->attribute()) {
+      if (attr.name() == "perm") {
+        k_perm.assign(attr.ints().begin(), attr.ints().end());
+        k_has_perm = true;
+      }
+    }
+    if (!k_has_perm) {
+      continue;
+    }
+
+    if (k_perm == kPermCombined) {
+      auto k_split =
+          MatchDecomposedHeadSplit(k_operand, consumers_of, graph_outputs,
+                                   node_by_output, init_map, kPermCombined);
+      if (!k_split) {
+        continue;
+      }
+      k_reshape = k_split->reshape;
+      kv_num_heads = k_split->num_heads;
+      head_size_k = k_split->head_size;
+      k_reshape_shape = k_split->reshape_shape;
+      k_proj_out = k_split->proj_out;
+      k_headsplit_transpose = nullptr;
+    } else if (k_perm == kPermSwap) {
+      if (k_transpose->input_size() != 1 || k_transpose->input(0).empty()) {
+        continue;
+      }
+      const std::string k_bhsd_name = k_transpose->input(0);
+      if (!is_internal(k_bhsd_name)) {
+        continue;
+      }
+      std::string k_raw_name = k_bhsd_name;
+      auto repeat = MatchDecomposedRepeatKv(
+          k_bhsd_name, consumers_of, graph_outputs, node_by_output, init_map);
+      if (repeat) {
+        k_repeat_kv = repeat->branch;
+        k_raw_name = repeat->raw_name;
+        kv_num_heads = repeat->kv_num_heads;
+      }
+      auto k_split =
+          MatchDecomposedHeadSplit(k_raw_name, consumers_of, graph_outputs,
+                                   node_by_output, init_map, kPermBhsd);
+      if (!k_split) {
+        continue;
+      }
+      k_headsplit_transpose = k_split->transpose;
+      k_reshape = k_split->reshape;
+      const int64_t resolved_kv_heads = k_split->num_heads;
+      head_size_k = k_split->head_size;
+      k_reshape_shape = k_split->reshape_shape;
+      k_proj_out = k_split->proj_out;
+      if (kv_num_heads < 0) {
+        kv_num_heads = resolved_kv_heads;
+      } else if (kv_num_heads != resolved_kv_heads) {
+        continue;
+      }
+    } else {
+      continue;
+    }
+
+    // ---- Q's own branch: plain head-split, never repeat_kv ----
+    auto q_split =
+        MatchDecomposedHeadSplit(q_bhsd_name, consumers_of, graph_outputs,
+                                 node_by_output, init_map, kPermBhsd);
+    if (!q_split) {
+      continue;
+    }
+    onnx::NodeProto* q_transpose = q_split->transpose;
+    onnx::NodeProto* q_reshape = q_split->reshape;
+    const int64_t num_heads = q_split->num_heads;
+    const int64_t head_size = q_split->head_size;
+    const std::string q_reshape_shape = q_split->reshape_shape;
+    const std::string q_proj_out = q_split->proj_out;
+    if (head_size != head_size_k || num_heads <= 0 || kv_num_heads <= 0) {
+      continue;
+    }
+    if (num_heads % kv_num_heads != 0) {
+      continue;
+    }
+
+    // ---- forward: AV MatMul, output Transpose, combine-back Reshape ----
+    auto avit = consumers_of.find(smax_out);
+    if (avit == consumers_of.end() || avit->second.size() != 1) {
+      continue;
+    }
+    onnx::NodeProto* av_matmul = avit->second[0];
+    if (av_matmul->domain() != "" || av_matmul->op_type() != "MatMul" ||
+        av_matmul->input_size() != 2 || av_matmul->output_size() != 1) {
+      continue;
+    }
+    const bool attn_is_first = av_matmul->input(0) == smax_out;
+    if (!attn_is_first && av_matmul->input(1) != smax_out) {
+      continue;
+    }
+    const std::string v_bhsd_name =
+        attn_is_first ? av_matmul->input(1) : av_matmul->input(0);
+    if (v_bhsd_name == smax_out || !is_internal(v_bhsd_name)) {
+      continue;
+    }
+    const std::string av_out = av_matmul->output(0);
+    if (!is_internal(av_out)) {
+      continue;
+    }
+
+    auto otit = consumers_of.find(av_out);
+    if (otit == consumers_of.end() || otit->second.size() != 1) {
+      continue;
+    }
+    onnx::NodeProto* out_transpose = otit->second[0];
+    if (out_transpose->op_type() != "Transpose" ||
+        out_transpose->domain() != "" || out_transpose->input_size() != 1) {
+      continue;
+    }
+    std::vector<int64_t> out_perm;
+    bool out_has_perm = false;
+    for (const auto& attr : out_transpose->attribute()) {
+      if (attr.name() == "perm") {
+        out_perm.assign(attr.ints().begin(), attr.ints().end());
+        out_has_perm = true;
+      }
+    }
+    if (!out_has_perm || out_perm != kPermOut) {
+      continue;
+    }
+    const std::string out_t_name = out_transpose->output(0);
+    if (!is_internal(out_t_name)) {
+      continue;
+    }
+
+    auto orit = consumers_of.find(out_t_name);
+    if (orit == consumers_of.end() || orit->second.size() != 1) {
+      continue;
+    }
+    onnx::NodeProto* out_reshape = orit->second[0];
+    if (out_reshape->op_type() != "Reshape" || out_reshape->domain() != "" ||
+        out_reshape->input_size() != 2 || out_reshape->input(0) != out_t_name ||
+        out_reshape->output_size() != 1) {
+      continue;
+    }
+    auto osit = init_map.find(out_reshape->input(1));
+    if (osit == init_map.end() ||
+        osit->second->data_type() != onnx::TensorProto::INT64 ||
+        osit->second->dims_size() != 1) {
+      continue;
+    }
+    std::vector<int64_t> out_dims = ReadInt64Tensor(*osit->second);
+    if (out_dims.empty()) {
+      continue;
+    }
+    const int64_t out_last = out_dims.back();
+    const std::string out_reshape_out = out_reshape->output(0);
+    if (!is_internal(out_reshape_out)) {
+      continue;
+    }
+
+    auto cnit = consumers_of.find(out_reshape_out);
+    if (cnit == consumers_of.end() || cnit->second.size() != 1) {
+      continue;
+    }
+    onnx::NodeProto* consumer_node = cnit->second[0];
+    auto cm = MatchMatMulLikeRaw(*consumer_node);
+    if (!cm || cm->x_name != out_reshape_out) {
+      continue;
+    }
+    auto cwit = init_map.find(cm->w_name);
+    if (cwit == init_map.end() ||
+        cwit->second->data_type() != onnx::TensorProto::FLOAT ||
+        cwit->second->dims_size() != 2) {
+      continue;
+    }
+    const onnx::TensorProto* cw_init = cwit->second;
+
+    // ---- V's own branch: optional repeat_kv, then plain head-split ----
+    std::string v_raw_name = v_bhsd_name;
+    std::optional<DecomposedGqaChain::RepeatKv> v_repeat_kv;
+    int64_t v_kv_num_heads = -1;
+    auto v_repeat = MatchDecomposedRepeatKv(
+        v_bhsd_name, consumers_of, graph_outputs, node_by_output, init_map);
+    if (v_repeat) {
+      v_repeat_kv = v_repeat->branch;
+      v_raw_name = v_repeat->raw_name;
+      v_kv_num_heads = v_repeat->kv_num_heads;
+    }
+    auto v_split =
+        MatchDecomposedHeadSplit(v_raw_name, consumers_of, graph_outputs,
+                                 node_by_output, init_map, kPermBhsd);
+    if (!v_split) {
+      continue;
+    }
+    onnx::NodeProto* v_transpose = v_split->transpose;
+    onnx::NodeProto* v_reshape = v_split->reshape;
+    const int64_t resolved_v_kv_heads = v_split->num_heads;
+    const int64_t v_head_size = v_split->head_size;
+    const std::string v_reshape_shape = v_split->reshape_shape;
+    const std::string v_proj_out = v_split->proj_out;
+    if (v_kv_num_heads < 0) {
+      v_kv_num_heads = resolved_v_kv_heads;
+    } else if (v_kv_num_heads != resolved_v_kv_heads) {
+      continue;
+    }
+    if (v_kv_num_heads != kv_num_heads || v_head_size <= 0) {
+      continue;
+    }
+
+    const int64_t raw_out_width = num_heads * v_head_size;
+    if (out_last > 0 && out_last != raw_out_width) {
+      continue;
+    }
+    const int64_t k_dim =
+        cm->weight_transposed ? cw_init->dims(1) : cw_init->dims(0);
+    if (k_dim != raw_out_width) {
+      continue;
+    }
+
+    // ---- Q/K/V's own real Linear producers -- three independent
+    // MatMul/Gemm nodes only, no packed-QKV-then-Split (this port's own
+    // scope, see this section's own top comment) ----
+    auto qpit = node_by_output.find(q_proj_out);
+    auto kpit = node_by_output.find(k_proj_out);
+    auto vpit = node_by_output.find(v_proj_out);
+    if (qpit == node_by_output.end() || kpit == node_by_output.end() ||
+        vpit == node_by_output.end()) {
+      continue;
+    }
+    onnx::NodeProto* q_prod_node = qpit->second;
+    onnx::NodeProto* k_prod_node = kpit->second;
+    onnx::NodeProto* v_prod_node = vpit->second;
+    if (q_prod_node == k_prod_node || q_prod_node == v_prod_node ||
+        k_prod_node == v_prod_node) {
+      continue;  // Shared producer -- declined (no packed-QKV support here).
+    }
+    auto q_info = MatchProducer(*q_prod_node, init_map);
+    auto k_info = MatchProducer(*k_prod_node, init_map);
+    auto v_info = MatchProducer(*v_prod_node, init_map);
+    if (!q_info || !k_info || !v_info) {
+      continue;
+    }
+    if (q_info->weight == k_info->weight || q_info->weight == v_info->weight ||
+        k_info->weight == v_info->weight) {
+      continue;
+    }
+    if (q_info->n_channels != num_heads * head_size ||
+        k_info->n_channels != kv_num_heads * head_size ||
+        v_info->n_channels != kv_num_heads * v_head_size) {
+      continue;
+    }
+
+    const std::optional<std::string> out_reshape_shape_opt =
+        out_last > 0 ? std::optional<std::string>(out_reshape->input(1))
+                     : std::nullopt;
+
+    DecomposedGqaChain chain;
+    chain.q_weight = q_info->weight;
+    chain.q_bias = q_info->bias;
+    chain.q_weight_transposed = q_info->weight_transposed;
+    chain.k_weight = k_info->weight;
+    chain.k_bias = k_info->bias;
+    chain.k_weight_transposed = k_info->weight_transposed;
+    chain.v_weight = v_info->weight;
+    chain.v_bias = v_info->bias;
+    chain.v_weight_transposed = v_info->weight_transposed;
+    chain.num_heads = num_heads;
+    chain.kv_num_heads = kv_num_heads;
+    chain.head_size = head_size;
+    chain.v_head_size = v_head_size;
+    chain.q_transpose = q_transpose;
+    chain.q_reshape = q_reshape;
+    chain.q_reshape_shape = q_reshape_shape;
+    chain.k_transpose = k_transpose;
+    chain.k_headsplit_transpose = k_headsplit_transpose;
+    chain.k_reshape = k_reshape;
+    chain.k_reshape_shape = k_reshape_shape;
+    chain.k_repeat_kv = k_repeat_kv;
+    chain.v_transpose = v_transpose;
+    chain.v_reshape = v_reshape;
+    chain.v_reshape_shape = v_reshape_shape;
+    chain.v_repeat_kv = v_repeat_kv;
+    chain.qk_matmul = qk_matmul;
+    chain.scale_node = scale_node;
+    chain.softmax_node = node;
+    chain.av_matmul = av_matmul;
+    chain.out_transpose = out_transpose;
+    chain.out_reshape = out_reshape;
+    chain.out_reshape_shape = out_reshape_shape_opt;
+    chain.consumer_node = consumer_node;
+    chain.consumer_weight = cm->w_name;
+    chain.consumer_weight_transposed = cm->weight_transposed;
+    chains.push_back(std::move(chain));
+  }
+  return chains;
+}
+
+struct AppliedDecomposedGqa {
+  std::unordered_set<std::string> producer_weights;
+  std::string consumer_weight;
+  std::unordered_set<std::string> stale;
+};
+
+// Applies whole-KV-group pruning to one matched decomposed attention block
+// in place -- mirrors pruning.py's own `_apply_one_decomposed_gqa_chain`
+// (this port's own scope: no MQA fast path, no packed-QKV branch, no mask
+// rewrite -- see this section's own top comment). `graph`/`init_map`/
+// `used_names` are mutated directly: `init_map` gains an entry for every
+// freshly cloned shape constant, `used_names` for every freshly minted name.
+std::optional<AppliedDecomposedGqa> ApplyOneDecomposedGqaChain(
+    onnx::GraphProto* graph,
+    std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    std::unordered_set<std::string>& used_names, DecomposedGqaChain& chain,
+    double sparsity,
+    const std::unordered_map<std::string, std::vector<double>>* act_norm,
+    double epsilon, ImportanceNorm importance_norm) {
+  const int64_t h = chain.kv_num_heads;
+  const int64_t keep_count =
+      std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
+  if (keep_count >= h) {
+    return std::nullopt;  // Also the permanent no-op outcome for true MQA
+                          // (h == 1) -- mirrors ApplyOneGqaChain's own
+                          // identical, already-accepted gap.
+  }
+
+  const int64_t d = chain.head_size;
+  const int64_t dv = chain.v_head_size;
+  const int64_t group_size = chain.num_heads / chain.kv_num_heads;
+
+  onnx::TensorProto* wq_init = init_map.at(chain.q_weight);
+  onnx::TensorProto* wk_init = init_map.at(chain.k_weight);
+  onnx::TensorProto* wv_init = init_map.at(chain.v_weight);
+  const std::vector<int64_t> wq_dims(wq_init->dims().begin(),
+                                     wq_init->dims().end());
+  const std::vector<int64_t> wk_dims(wk_init->dims().begin(),
+                                     wk_init->dims().end());
+  const std::vector<int64_t> wv_dims(wv_init->dims().begin(),
+                                     wv_init->dims().end());
+  std::vector<float> wq = ReadFloatTensor(*wq_init);
+  std::vector<float> wk = ReadFloatTensor(*wk_init);
+  std::vector<float> wv = ReadFloatTensor(*wv_init);
+
+  const int64_t Nq = wq_dims[chain.q_weight_transposed ? 0 : 1];
+  const int64_t Nk = wk_dims[chain.k_weight_transposed ? 0 : 1];
+  const int64_t Nv = wv_dims[chain.v_weight_transposed ? 0 : 1];
+  std::vector<float> wq_kn = chain.q_weight_transposed
+                                 ? TransposeFlat(wq, wq_dims[0], wq_dims[1])
+                                 : wq;
+  std::vector<float> wk_kn = chain.k_weight_transposed
+                                 ? TransposeFlat(wk, wk_dims[0], wk_dims[1])
+                                 : wk;
+  std::vector<float> wv_kn = chain.v_weight_transposed
+                                 ? TransposeFlat(wv, wv_dims[0], wv_dims[1])
+                                 : wv;
+  const int64_t Kq = chain.q_weight_transposed ? wq_dims[1] : wq_dims[0];
+  const int64_t Kk = chain.k_weight_transposed ? wk_dims[1] : wk_dims[0];
+  const int64_t Kv = chain.v_weight_transposed ? wv_dims[1] : wv_dims[0];
+
+  // Combined importance of each KV group's own Q+K+V weight block -- mirrors
+  // pruning.py's own `_gqa_group_importance` exactly, including its own
+  // "sum of per-block squared Frobenius norms" form (rather than
+  // concatenation) that stays well-defined even when Q's own row count
+  // (`Kq`) differs from K's/V's own (cross-attention).
+  std::vector<double> importance(static_cast<size_t>(chain.kv_num_heads), 0.0);
+  for (int64_t kv = 0; kv < chain.kv_num_heads; ++kv) {
+    double acc = 0.0;
+    for (int64_t r = 0; r < Kq; ++r) {
+      for (int64_t g = kv * group_size; g < (kv + 1) * group_size; ++g) {
+        for (int64_t c = g * d; c < (g + 1) * d; ++c) {
+          const double v = wq_kn[static_cast<size_t>(r * Nq + c)];
+          acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
+        }
+      }
+    }
+    for (int64_t r = 0; r < Kk; ++r) {
+      for (int64_t c = kv * d; c < (kv + 1) * d; ++c) {
+        const double v = wk_kn[static_cast<size_t>(r * Nk + c)];
+        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
+      }
+    }
+    for (int64_t r = 0; r < Kv; ++r) {
+      for (int64_t c = kv * dv; c < (kv + 1) * dv; ++c) {
+        const double v = wv_kn[static_cast<size_t>(r * Nv + c)];
+        acc += importance_norm == ImportanceNorm::kL1 ? std::abs(v) : v * v;
+      }
+    }
+    importance[static_cast<size_t>(kv)] =
+        importance_norm == ImportanceNorm::kL1 ? acc : std::sqrt(acc);
+  }
+
+  if (act_norm != nullptr) {
+    auto it = act_norm->find(chain.consumer_node->input(0));
+    if (it != act_norm->end() &&
+        it->second.size() == static_cast<size_t>(chain.num_heads * dv)) {
+      for (int64_t kv = 0; kv < chain.kv_num_heads; ++kv) {
+        double sq = 0.0;
+        for (int64_t c = kv * group_size * dv; c < (kv + 1) * group_size * dv;
+             ++c) {
+          const double v = it->second[static_cast<size_t>(c)];
+          sq += v * v;
+        }
+        importance[static_cast<size_t>(kv)] *= std::max(std::sqrt(sq), epsilon);
+      }
+    }
+  }
+
+  std::vector<int64_t> keep_groups =
+      TopKIndicesAscending(importance, keep_count);
+  std::vector<int64_t> keep_q_heads;
+  keep_q_heads.reserve(keep_groups.size() * static_cast<size_t>(group_size));
+  for (int64_t g : keep_groups) {
+    for (int64_t hh = g * group_size; hh < (g + 1) * group_size; ++hh) {
+      keep_q_heads.push_back(hh);
+    }
+  }
+  std::vector<int64_t> q_idx = HeadColumnIndices(keep_q_heads, d);
+  std::vector<int64_t> k_idx = HeadColumnIndices(keep_groups, d);
+  std::vector<int64_t> v_idx = HeadColumnIndices(keep_groups, dv);
+  std::vector<int64_t> y_idx = HeadColumnIndices(keep_q_heads, dv);
+
+  SliceProducerWeight(wq_init, chain.q_weight_transposed, q_idx, false);
+  SliceProducerWeight(wk_init, chain.k_weight_transposed, k_idx, false);
+  SliceProducerWeight(wv_init, chain.v_weight_transposed, v_idx, false);
+  if (chain.q_bias) {
+    SliceLastAxis(init_map.at(*chain.q_bias), q_idx);
+  }
+  if (chain.k_bias) {
+    SliceLastAxis(init_map.at(*chain.k_bias), k_idx);
+  }
+  if (chain.v_bias) {
+    SliceLastAxis(init_map.at(*chain.v_bias), v_idx);
+  }
+  SliceConsumerWeight(init_map.at(chain.consumer_weight),
+                      chain.consumer_weight_transposed, y_idx, false);
+
+  const int64_t new_num_heads = static_cast<int64_t>(keep_q_heads.size());
+  const int64_t new_kv_num_heads = keep_count;
+
+  // Every `Reshape`/`Expand` target-shape constant this chain owns is
+  // rewritten to its new post-pruning head count -- recomputing consumers
+  // fresh HERE (not once per whole pass) since an earlier chain applied in
+  // this same pass may already have rewired some of a shared constant's
+  // readers away. Mirrors pruning.py's own `_rewrite_shape_dim` local
+  // helper exactly: in place when every remaining reader is one of THIS
+  // chain's own owning node(s) (including when K's and V's own branches
+  // legitimately share one constant), or, when a genuinely unrelated extra
+  // reader exists (onnxsim's own CSE routinely merges two textually
+  // identical shape constants from different chains/layers onto one shared
+  // tensor), by cloning a fresh tensor holding the current value and
+  // rewiring only this chain's own owning node(s) onto it -- the original is
+  // left byte-for-byte untouched for whatever else still reads it.
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  auto rewrite_shape_dim =
+      [&](const std::string& shape_name,
+          const std::vector<onnx::NodeProto*>& owner_nodes,
+          const std::vector<std::pair<int64_t, int64_t>>& edits) {
+        onnx::TensorProto* shape_init = init_map.at(shape_name);
+        std::vector<int64_t> dims = ReadInt64Tensor(*shape_init);
+        std::unordered_set<onnx::NodeProto*> owner_set(owner_nodes.begin(),
+                                                       owner_nodes.end());
+        bool foreign = false;
+        auto cit = consumers_of.find(shape_name);
+        if (cit != consumers_of.end()) {
+          for (onnx::NodeProto* c : cit->second) {
+            if (!owner_set.count(c)) {
+              foreign = true;
+              break;
+            }
+          }
+        }
+        auto apply_edits = [&](std::vector<int64_t>& d) {
+          for (const auto& [index, value] : edits) {
+            const int64_t idx =
+                index < 0 ? static_cast<int64_t>(d.size()) + index : index;
+            d[static_cast<size_t>(idx)] = value;
+          }
+        };
+        if (foreign) {
+          const std::string new_name =
+              MintUniqueName(shape_name + "_pruned", used_names);
+          std::vector<int64_t> new_dims = dims;
+          apply_edits(new_dims);
+          onnx::TensorProto* new_init = graph->add_initializer();
+          new_init->set_name(new_name);
+          SetInt64TensorData(new_init, {static_cast<int64_t>(new_dims.size())},
+                             new_dims);
+          init_map[new_name] = new_init;
+          for (onnx::NodeProto* owner : owner_nodes) {
+            for (int i = 0; i < owner->input_size(); ++i) {
+              if (owner->input(i) == shape_name) {
+                owner->set_input(i, new_name);
+              }
+            }
+          }
+        } else {
+          apply_edits(dims);
+          SetInt64TensorData(shape_init, {static_cast<int64_t>(dims.size())},
+                             dims);
+        }
+      };
+
+  rewrite_shape_dim(chain.q_reshape_shape, {chain.q_reshape},
+                    {{2, new_num_heads}});
+  if (chain.k_reshape_shape == chain.v_reshape_shape) {
+    rewrite_shape_dim(chain.k_reshape_shape, {chain.k_reshape, chain.v_reshape},
+                      {{2, new_kv_num_heads}});
+  } else {
+    rewrite_shape_dim(chain.k_reshape_shape, {chain.k_reshape},
+                      {{2, new_kv_num_heads}});
+    rewrite_shape_dim(chain.v_reshape_shape, {chain.v_reshape},
+                      {{2, new_kv_num_heads}});
+  }
+  const std::vector<std::pair<int64_t, int64_t>> expand_edits{
+      {1, new_kv_num_heads}};
+  if (chain.k_repeat_kv && chain.v_repeat_kv &&
+      chain.k_repeat_kv->expand_shape == chain.v_repeat_kv->expand_shape) {
+    rewrite_shape_dim(chain.k_repeat_kv->expand_shape,
+                      {chain.k_repeat_kv->expand, chain.v_repeat_kv->expand},
+                      expand_edits);
+  } else {
+    if (chain.k_repeat_kv) {
+      rewrite_shape_dim(chain.k_repeat_kv->expand_shape,
+                        {chain.k_repeat_kv->expand}, expand_edits);
+    }
+    if (chain.v_repeat_kv) {
+      rewrite_shape_dim(chain.v_repeat_kv->expand_shape,
+                        {chain.v_repeat_kv->expand}, expand_edits);
+    }
+  }
+  if (chain.k_repeat_kv && chain.v_repeat_kv &&
+      chain.k_repeat_kv->merge_reshape_shape ==
+          chain.v_repeat_kv->merge_reshape_shape) {
+    rewrite_shape_dim(
+        chain.k_repeat_kv->merge_reshape_shape,
+        {chain.k_repeat_kv->merge_reshape, chain.v_repeat_kv->merge_reshape},
+        {{1, new_num_heads}});
+  } else {
+    if (chain.k_repeat_kv) {
+      rewrite_shape_dim(chain.k_repeat_kv->merge_reshape_shape,
+                        {chain.k_repeat_kv->merge_reshape},
+                        {{1, new_num_heads}});
+    }
+    if (chain.v_repeat_kv) {
+      rewrite_shape_dim(chain.v_repeat_kv->merge_reshape_shape,
+                        {chain.v_repeat_kv->merge_reshape},
+                        {{1, new_num_heads}});
+    }
+  }
+  if (chain.out_reshape_shape) {
+    rewrite_shape_dim(*chain.out_reshape_shape, {chain.out_reshape},
+                      {{-1, new_num_heads * dv}});
+  }
+
+  AppliedDecomposedGqa out;
+  out.producer_weights = {chain.q_weight, chain.k_weight, chain.v_weight};
+  out.consumer_weight = chain.consumer_weight;
+  for (onnx::NodeProto* n :
+       {chain.q_transpose, chain.q_reshape, chain.k_transpose,
+        chain.k_headsplit_transpose, chain.k_reshape, chain.v_transpose,
+        chain.v_reshape, chain.qk_matmul, chain.scale_node, chain.softmax_node,
+        chain.av_matmul, chain.out_transpose, chain.out_reshape}) {
+    if (n != nullptr) {
+      for (const auto& o : n->output()) {
+        out.stale.insert(o);
+      }
+    }
+  }
+  for (const auto& branch : {chain.k_repeat_kv, chain.v_repeat_kv}) {
+    if (branch) {
+      for (const auto& o : branch->unsqueeze->output()) {
+        out.stale.insert(o);
+      }
+      for (const auto& o : branch->expand->output()) {
+        out.stale.insert(o);
+      }
+      for (const auto& o : branch->merge_reshape->output()) {
+        out.stale.insert(o);
+      }
+    }
+  }
+  return out;
+}
+
+// Shared body dispatching every matched decomposed-GQA chain -- mirrors
+// ApplyAttentionChains' own cross-chain touched-role bookkeeping and stale
+// value_info cleanup, but with its own dedicated producer/consumer-touched
+// namespace, never shared with ApplyAttentionChains's own: a decomposed
+// chain's Q/K/V producer weight is always resolved via MatchProducer on a
+// plain MatMul/Gemm node feeding a Reshape (never a fused Attention/GQA/
+// MultiHeadAttention-family node's own input), so it can never collide with
+// a fused-op chain's own separately-matched producer weight -- the same
+// "structurally different node/weight shapes, always safe" reasoning this
+// file's own MatMulNBitsQkv section already documents for its identical
+// choice.
+void ApplyDecomposedGqaChains(
+    onnx::GraphProto* graph, std::vector<DecomposedGqaChain>& chains,
+    double sparsity,
+    const std::unordered_map<std::string, std::vector<double>>* act_norm =
+        nullptr,
+    double epsilon = 1e-8,
+    ImportanceNorm importance_norm = ImportanceNorm::kL2) {
+  std::unordered_map<std::string, onnx::TensorProto*> init_map;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    init_map[t->name()] = t;
+  }
+  std::unordered_set<std::string> used_names = ExistingGraphNames(*graph);
+  std::unordered_set<std::string> producer_touched, consumer_touched,
+      stale_value_info;
+
+  for (auto& chain : chains) {
+    bool conflict = consumer_touched.count(chain.consumer_weight) != 0;
+    for (const std::string& w :
+         {chain.q_weight, chain.k_weight, chain.v_weight}) {
+      if (producer_touched.count(w)) {
+        conflict = true;
+      }
+    }
+    if (conflict) {
+      continue;
+    }
+
+    std::optional<AppliedDecomposedGqa> applied =
+        ApplyOneDecomposedGqaChain(graph, init_map, used_names, chain, sparsity,
+                                   act_norm, epsilon, importance_norm);
+    if (!applied) {
+      continue;
+    }
+
+    for (const auto& w : applied->producer_weights) {
+      producer_touched.insert(w);
+    }
+    consumer_touched.insert(applied->consumer_weight);
+    for (const auto& s : applied->stale) {
+      stale_value_info.insert(s);
+    }
+  }
+
+  if (!stale_value_info.empty()) {
+    google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
+    for (const auto& vi : graph->value_info()) {
+      if (!stale_value_info.count(vi.name())) {
+        *kept.Add() = vi;
+      }
+    }
+    graph->mutable_value_info()->Swap(&kept);
+  }
+}
+
 onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
                                            double sparsity,
                                            const std::string& importance_norm) {
@@ -21976,12 +23187,7 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
     // FindSeparateQkvChains/ApplyOneGqaChain machinery GQA/OnnxAttention
     // already use above (see each Find*Chains function's own comment for
     // what's matched and this port's deliberate, narrower-than-pruning.py
-    // scope decisions). The fully decomposed (un-fused, "eager SDPA export")
-    // shape pruning.py's own `_find_decomposed_gqa_chains` additionally
-    // matches has no C++ port yet -- a topology-based match rewriting
-    // multiple Reshape/Expand shape constants in lock-step, genuinely more
-    // novel than any of the six fused-op families here, deliberately left
-    // unmatched (a decline, not a crash) rather than guessed at.
+    // scope decisions).
     std::vector<AttnChain> mha_chains = FindMhaChains(graph);
     std::vector<AttnChain> packed_mha_chains = FindPackedMhaChains(graph);
     std::vector<AttnChain> dmmha_chains = FindDecoderMaskedMhaChains(graph);
@@ -22012,6 +23218,25 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
                   std::make_move_iterator(sparse_attn_chains.end()));
     if (!chains.empty()) {
       ApplyAttentionChains(graph, chains, sparsity, nullptr, 1e-8, norm);
+    }
+    // The fully decomposed (un-fused, "eager SDPA export") shape
+    // pruning.py's own `_find_decomposed_gqa_chains` additionally matches --
+    // see the "Decomposed (un-fused) GQA/MQA/plain-MHA attention head
+    // pruning" section comment above FindDecomposedGqaChains for this port's
+    // own scope (deliberately narrower than pruning.py's: no mask/RoPE/
+    // Q-K-norm/Einsum/packed-QKV/MQA-fast-path support yet -- every one of
+    // those shapes declines to match here, rather than being mis-sliced,
+    // and is still pruned by pruning.py's own pure-Python
+    // apply_attention_head_pruning). Its own dedicated producer/consumer-
+    // touched bookkeeping (inside ApplyDecomposedGqaChains) is never shared
+    // with ApplyAttentionChains's own above, the same "structurally
+    // different node/weight shapes, always safe" reasoning this section's
+    // own MatMulNBitsQkv handling below already documents.
+    std::vector<DecomposedGqaChain> decomposed_gqa_chains =
+        FindDecomposedGqaChains(graph);
+    if (!decomposed_gqa_chains.empty()) {
+      ApplyDecomposedGqaChains(graph, decomposed_gqa_chains, sparsity, nullptr,
+                               1e-8, norm);
     }
     // The fused `com.microsoft::MatMulNBitsQkv` variant -- see the
     // "MatMulNBitsMlp/MatMulNBitsQkv (fused block-quantized weight)
@@ -22100,7 +23325,18 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
                 std::make_move_iterator(sparse_attn_chains.begin()),
                 std::make_move_iterator(sparse_attn_chains.end()));
 
-  if (chains.empty()) {
+  // The fully decomposed (un-fused, "eager SDPA export") shape -- see the
+  // "Decomposed (un-fused) GQA/MQA/plain-MHA attention head pruning" section
+  // comment above FindDecomposedGqaChains for this port's own scope. Kept in
+  // its own vector (never merged into `chains`, an `AttnChain` list) since
+  // its own DecomposedGqaChain struct has no relation to AttnChain at all --
+  // ranked/sliced/probed entirely separately below, mirroring pruning.py's
+  // own `chains: List[_AttnLikeChain]` union, which this port instead keeps
+  // as two differently-typed collections threaded through in parallel.
+  std::vector<DecomposedGqaChain> decomposed_gqa_chains =
+      FindDecomposedGqaChains(graph);
+
+  if (chains.empty() && decomposed_gqa_chains.empty()) {
     return out;  // Mirrors pruning.py's own early return.
   }
 
@@ -22108,19 +23344,32 @@ onnx::ModelProto ApplyAttentionHeadWandaPruning(
   // (never a Conv channel axis 1, unlike ApplyStructuredWandaPruning's own
   // `probe_axis`): WalkToAttentionConsumer only ever matches a
   // MatMul/vanilla-Gemm consumer (MatchMatMulLikeRaw), never a Conv, for
-  // every one of the three attention chain families above. Mirrors
-  // pruning.py's own `probe_names = {chain.consumer_node.input[0] for
-  // chain in chains}` in `_wanda_attention_calibration_stats` (there
-  // implicitly axis -1 too, via `reduce_axes = range(x.ndim - 1)`).
+  // every one of the three attention chain families above -- and
+  // FindDecomposedGqaChains' own consumer_node is resolved via the
+  // identical MatchMatMulLikeRaw check, so it shares this exact probe-point
+  // convention too. Mirrors pruning.py's own `probe_names = {chain.
+  // consumer_node.input[0] for chain in chains}` in
+  // `_wanda_attention_calibration_stats` (there implicitly axis -1 too, via
+  // `reduce_axes = range(x.ndim - 1)`), where `chains` already includes
+  // `_DecomposedGQAChain` entries from the same shared list.
   std::unordered_map<std::string, int64_t> probe_axis;
   for (const auto& chain : chains) {
+    probe_axis[chain.consumer_node->input(0)] = -1;
+  }
+  for (const auto& chain : decomposed_gqa_chains) {
     probe_axis[chain.consumer_node->input(0)] = -1;
   }
 
   const std::unordered_map<std::string, std::vector<double>> act_norm =
       WandaCalibrationStats(executor, out, probe_axis, calibration_data);
 
-  ApplyAttentionChains(graph, chains, sparsity, &act_norm, epsilon, norm);
+  if (!chains.empty()) {
+    ApplyAttentionChains(graph, chains, sparsity, &act_norm, epsilon, norm);
+  }
+  if (!decomposed_gqa_chains.empty()) {
+    ApplyDecomposedGqaChains(graph, decomposed_gqa_chains, sparsity, &act_norm,
+                             epsilon, norm);
+  }
   return out;
 }
 
@@ -24050,6 +25299,16 @@ onnx::ModelProto ApplyWandaPruning(
     bool weight_transposed;
     bool is_conv;
     int64_t conv_group = 1;  // only meaningful when is_conv
+    // `com.microsoft::Attention`'s merged QKV weight, as opposed to a plain
+    // MatMul/Gemm candidate -- only meaningful when `!is_conv`. Distinguishes
+    // the two `x_name`-keyed, probe-axis -1 candidate families below so the
+    // rank-2-only restriction pruning.py's own `_wanda_unstructured_
+    // calibration_stats` applies to its plain MatMul/Gemm probe (`act_norm`)
+    // -- but NOT to its separately-accumulated Attention probe
+    // (`attn_act_norm`, any rank >= 2) -- can be reproduced here too. See the
+    // `require_rank2` set built right before the WandaCalibrationStats call
+    // below.
+    bool is_attention = false;
   };
   std::vector<Candidate> candidates;
   // Conv attributes are per-node (two Convs can share an input tensor with
@@ -24084,7 +25343,7 @@ onnx::ModelProto ApplyWandaPruning(
       // is already [K, N]-shaped by construction (see
       // MatchAttentionProducer's own comment), so it is matched exactly
       // like a non-transposed MatMul weight.
-      candidates.push_back({node.input(0), am->weight, false, false});
+      candidates.push_back({node.input(0), am->weight, false, false, 1, true});
     }
   }
   if (candidates.empty()) {
@@ -24101,14 +25360,40 @@ onnx::ModelProto ApplyWandaPruning(
   // leading axis by WandaCalibrationStats' own "every axis but the channel
   // one" reduction, exactly mirroring pruning.py's own
   // `x.reshape(-1, x.shape[-1])`.
+  //
+  // `require_rank2`: mirrors pruning.py's own
+  // `_wanda_unstructured_calibration_stats`'s split between its plain
+  // MatMul/Gemm probe (`act_norm`, `x.ndim != 2: continue` -- exactly rank
+  // 2 required) and its separate Attention probe (`attn_act_norm`,
+  // `x.ndim < 2: continue` -- any rank >= 2 accepted, since that candidate's
+  // own activation is rank-3 `[batch, seq, hidden]` by construction). Built
+  // from every MatMul/Gemm (`!is_conv && !is_attention`) candidate's own
+  // `x_name`, MINUS any name also used by an Attention candidate -- the
+  // same "two candidate families sharing one activation tensor name is a
+  // purely theoretical edge case, not worth distinguishing further" call
+  // this file's own keyed-by-`x_name` simplification (just above) already
+  // makes: in that edge case, staying unrestricted (as before this fix)
+  // rather than newly restricting the shared name is the conservative
+  // choice.
   std::unordered_map<std::string, int64_t> probe_axis;
+  std::unordered_set<std::string> matmul_x_names;
+  std::unordered_set<std::string> attention_x_names;
   for (const auto& c : candidates) {
-    if (!c.is_conv) {
-      probe_axis[c.x_name] = -1;
+    if (c.is_conv) {
+      continue;
+    }
+    probe_axis[c.x_name] = -1;
+    (c.is_attention ? attention_x_names : matmul_x_names).insert(c.x_name);
+  }
+  std::unordered_set<std::string> require_rank2;
+  for (const auto& name : matmul_x_names) {
+    if (attention_x_names.find(name) == attention_x_names.end()) {
+      require_rank2.insert(name);
     }
   }
   const std::unordered_map<std::string, std::vector<double>> act_norm =
-      WandaCalibrationStats(executor, out, probe_axis, calibration_data);
+      WandaCalibrationStats(executor, out, probe_axis, calibration_data,
+                            require_rank2);
 
   // Conv's own im2col-unfolded per-(in_channel, kh, kw)-tap calibration
   // statistic -- a genuinely different reduction than WandaCalibrationStats'

@@ -1920,24 +1920,27 @@ def apply_wanda_pruning_cpp(
     ``ConvGroupRelativeNorm`` -- see ``structured_pruning_entry.h``'s own
     ``ApplyWandaPruning`` declaration comment for the full mechanism).
 
-    Despite that Conv parity, :func:`onnxsim.apply_wanda_pruning` (the
-    pure-Python name) is DELIBERATELY NOT an alias of this function: a
+    TRUE parity now also covers a prior gap unrelated to Conv: a
     full-regression check (every existing MatMul/Gemm/Attention candidate's
-    live output against the pure-Python reference, not just the new Conv
-    coverage) surfaced a genuine, pre-existing divergence unrelated to
-    Conv -- this port's own calibration statistic (``WandaCalibrationStats``,
-    shared with :func:`onnxsim.apply_structured_wanda_pruning_cpp`/
-    ``ApplyAttentionHeadWandaPruning``) computes a real per-channel-axis
-    activation norm for a MatMul/Gemm candidate's activation at ANY rank,
-    whereas the pure-Python reference requires exactly rank 2 for that same
-    statistic and falls back to plain magnitude for anything else (e.g. a
-    rank-3, batched/sequence activation feeding a plain 2-D MatMul weight).
-    See ``structured_pruning_entry.h``'s own ``ApplyWandaPruning``
-    declaration comment for the full writeup of this separate, out-of-scope
-    gap (it touches calibration infrastructure two other, independently-
-    verified passes also depend on) and
+    live output against the pure-Python reference, not just Conv coverage)
+    once surfaced a genuine, pre-existing divergence -- this port's own
+    calibration statistic (``WandaCalibrationStats``, shared with
+    :func:`onnxsim.apply_structured_wanda_pruning_cpp`/
+    ``ApplyAttentionHeadWandaPruning``) used to compute a real
+    per-channel-axis activation norm for a MatMul/Gemm candidate's
+    activation at ANY rank, whereas the pure-Python reference requires
+    exactly rank 2 for that same statistic and falls back to plain
+    magnitude for anything else (e.g. a rank-3, batched/sequence activation
+    feeding a plain 2-D MatMul weight). That gap is now closed --
+    ``WandaCalibrationStats`` takes a ``require_rank2`` set (this pass'
+    plain MatMul/Gemm candidates only; its Attention candidates keep the
+    any-rank->=2 treatment the pure-Python reference's own separate
+    ``attn_act_norm`` statistic always gave them, and the other two callers
+    above pass no such set at all, matching their own Python references'
+    complete lack of a rank restriction) -- see ``structured_pruning_entry.h``'s
+    own ``ApplyWandaPruning`` declaration comment for the full writeup and
     ``tests/test_wanda_pruning_cpp.py``'s own module docstring for the
-    regression test that caught it.
+    regression test that caught the original gap.
 
     Unlike :func:`onnxsim.apply_sparsegpt_pruning_cpp` (which has no data-
     free fallback at all -- its entire mechanism IS the Hessian), a matched

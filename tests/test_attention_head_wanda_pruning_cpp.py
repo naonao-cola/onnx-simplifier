@@ -18,15 +18,21 @@ the plain ``ai.onnx::Attention`` op, ``com.microsoft::MultiHeadAttention``,
 ``com.microsoft::PackedMultiHeadAttention``,
 ``com.microsoft::DecoderMaskedMultiHeadAttention``,
 ``com.microsoft::PagedAttention``, the plain ``ai.onnx::LinearAttention`` op,
-and ``com.microsoft::SparseAttention``), minus the fused
+``com.microsoft::SparseAttention``, and the tenth, decomposed (un-fused,
+"eager SDPA export") shape -- ``FindDecomposedGqaChains``/
+``ApplyOneDecomposedGqaChain``, threaded through with a real calibrated
+``act_norm`` map here exactly like every other family), minus the fused
 ``com.microsoft::MatMulNBitsQkv`` variant that port also matches -- this
 Wanda port has no quantized-weight counterpart, mirroring the pure-Python
 ``onnxsim.apply_attention_head_wanda_pruning`` exactly (see
 ``structured_pruning_entry.h``'s own ``ApplyAttentionHeadWandaPruning``
 declaration comment). See ``test_attention_head_pruning_cpp.py``'s own
 docstring for this port's shared narrower-than-pruning.py scope decisions
-across the six newer families (no dynamic-attention-bias-Gather-insertion
-machinery), and for the tenth, still-unported decomposed-GQA family.
+across the six newer fused-op families (no dynamic-attention-bias-Gather-
+insertion machinery) and across the decomposed-GQA family (no mask/RoPE/
+Q-K-norm/Einsum/packed-QKV, no true-MQA fast path) -- every one of those
+narrowings means ``apply_attention_head_wanda_pruning`` is NOT yet aliased
+to this port either.
 """
 
 import os
@@ -1324,3 +1330,352 @@ def test_cpp_sparse_attention_wanda_pruning_empty_calibration_data_matches_pytho
     assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
     plain = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
     assert pruned_cpp.SerializeToString() == plain.SerializeToString()
+
+
+# --- Decomposed (un-fused) GQA/MQA/plain-MHA attention head pruning --------
+#
+# `apply_attention_head_wanda_pruning_cpp` now also matches this shape, via
+# the same genuinely new, dedicated FindDecomposedGqaChains/
+# ApplyOneDecomposedGqaChain machinery `apply_attention_head_pruning_cpp`
+# uses (threaded through with a real calibrated `act_norm` map, exactly like
+# every other family here) -- see
+# ``test_attention_head_pruning_cpp.py``'s own "Decomposed (un-fused)
+# GQA/MQA/plain-MHA attention head pruning" section comment for the exact
+# scope this port matches (deliberately narrower than pruning.py's own
+# ``_find_decomposed_gqa_chains``: no mask/RoPE/Q-K-norm/Einsum/packed-QKV,
+# no true-MQA fast path) -- so this tenth family is NOT yet aliased either.
+
+
+def _decomposed_gqa_model(
+    K=32,
+    H=4,
+    KVH=2,
+    D=8,
+    Dv=None,
+    Out=16,
+    batch=1,
+    seq=4,
+    seed=0,
+    bias=True,
+    masked=False,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+    bq=None,
+    bk=None,
+    bv=None,
+    bout=None,
+    share_kv_reshape_shape=True,
+    extra_foreign_q_reshape_consumer=False,
+):
+    """Builds the decomposed-attention graph FindDecomposedGqaChains matches
+    -- mirrors ``test_attention_head_pruning_cpp.py``'s own
+    ``_decomposed_gqa_model`` (trimmed further: no ``out_reshape_wildcard``/
+    ``extra_foreign_repeat_kv_consumer`` params, not needed by this file's
+    own coverage -- see that copy's own docstring for the full shape and
+    every other parameter's meaning)."""
+    if Dv is None:
+        Dv = D
+    rng = np.random.default_rng(seed)
+    Nq, Nk, Nv = H * D, KVH * D, KVH * Dv
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((H * Dv, Out)).astype(np.float32)
+
+    def _i64(arr, name):
+        return onnx.numpy_helper.from_array(np.array(arr, dtype=np.int64), name)
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+
+    initializer.append(_i64([batch * seq, K], "XFlatShape"))
+    lines = ["xf = Reshape(X, XFlatShape)"]
+    q_op, k_op, v_op, o_op = (
+        "MatMul(xf, Wq)",
+        "MatMul(xf, Wk)",
+        "MatMul(xf, Wv)",
+        "MatMul(ctx2, Wout)",
+    )
+    if bias:
+        if bq is None:
+            bq = rng.standard_normal((Nq,)).astype(np.float32)
+        if bk is None:
+            bk = rng.standard_normal((Nk,)).astype(np.float32)
+        if bv is None:
+            bv = rng.standard_normal((Nv,)).astype(np.float32)
+        if bout is None:
+            bout = rng.standard_normal((Out,)).astype(np.float32)
+        initializer += [
+            _f32(bq, "Bq"),
+            _f32(bk, "Bk"),
+            _f32(bv, "Bv"),
+            _f32(bout, "Bout"),
+        ]
+        q_op, k_op, v_op = "Gemm(xf, Wq, Bq)", "Gemm(xf, Wk, Bk)", "Gemm(xf, Wv, Bv)"
+        o_op = "Gemm(ctx2, Wout, Bout)"
+
+    initializer.append(_i64([batch, seq, H, D], "Sq"))
+    lines += [
+        "q0 = " + q_op,
+        "qr = Reshape(q0, Sq)",
+        "qt = Transpose<perm=[0,2,1,3]>(qr)",
+    ]
+
+    if extra_foreign_q_reshape_consumer:
+        lines.append("foreign_out = Reshape(xf, Sq)")
+
+    kv_shape_name = "Skv" if share_kv_reshape_shape and Dv == D else None
+    if kv_shape_name:
+        initializer.append(_i64([batch, seq, KVH, D], kv_shape_name))
+        sk_name = sv_name = kv_shape_name
+    else:
+        initializer.append(_i64([batch, seq, KVH, D], "Sk"))
+        initializer.append(_i64([batch, seq, KVH, Dv], "Sv"))
+        sk_name, sv_name = "Sk", "Sv"
+
+    lines += ["k0 = " + k_op, f"kr = Reshape(k0, {sk_name})"]
+    lines += ["v0 = " + v_op, f"vr = Reshape(v0, {sv_name})"]
+
+    n_rep = H // KVH
+    needs_repeat_kv = KVH < H
+    if needs_repeat_kv:
+        assert H % KVH == 0
+        initializer.append(_i64([2], "Ax2"))
+        initializer.append(_i64([batch, KVH, n_rep, seq, D], "KExpandShape"))
+        initializer.append(_i64([batch, H, seq, D], "KMergeShape"))
+        initializer.append(_i64([batch, KVH, n_rep, seq, Dv], "VExpandShape"))
+        initializer.append(_i64([batch, H, seq, Dv], "VMergeShape"))
+        lines.append("kt0 = Transpose<perm=[0,2,1,3]>(kr)")
+        lines += [
+            "ku = Unsqueeze(kt0, Ax2)",
+            "ke = Expand(ku, KExpandShape)",
+            "kre = Reshape(ke, KMergeShape)",
+            "kt = Transpose<perm=[0,1,3,2]>(kre)",
+            "vt0 = Transpose<perm=[0,2,1,3]>(vr)",
+            "vu = Unsqueeze(vt0, Ax2)",
+            "ve = Expand(vu, VExpandShape)",
+            "vt = Reshape(ve, VMergeShape)",
+        ]
+    else:
+        lines.append("kt = Transpose<perm=[0,2,3,1]>(kr)")
+        lines.append("vt = Transpose<perm=[0,2,1,3]>(vr)")
+
+    initializer.append(_f32(np.array(D**-0.5, dtype=np.float32), "Scale"))
+    lines += ["qk = MatMul(qt, kt)", "scaled = Mul(qk, Scale)"]
+
+    if masked:
+        mask = np.triu(np.full((seq, seq), -1e4, dtype=np.float32), k=1)[
+            None, None, :, :
+        ]
+        initializer.append(_f32(mask, "Mask"))
+        lines.append("premask = Add(scaled, Mask)")
+        smax_in = "premask"
+    else:
+        smax_in = "scaled"
+    lines.append(f"attn = Softmax<axis=-1>({smax_in})")
+    lines.append("ctx0 = MatMul(attn, vt)")
+    lines.append("ctx1 = Transpose<perm=[0,2,1,3]>(ctx0)")
+
+    initializer.append(_i64([batch * seq, H * Dv], "OutShape"))
+    initializer.append(_i64([batch, seq, Out], "YShape"))
+    lines.append("ctx2 = Reshape(ctx1, OutShape)")
+    lines.append("y0 = " + o_op)
+    lines.append("Y = Reshape(y0, YShape)")
+
+    body_lines = "\n          ".join(lines)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17]
+        >
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          {body_lines}
+        }}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Dv=Dv,
+        Out=Out,
+        batch=batch,
+        seq=seq,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        bq=bq,
+        bk=bk,
+        bv=bv,
+        bout=bout,
+    )
+
+
+def _decomposed_weight_shapes(model):
+    inits = {t.name: t for t in model.graph.initializer}
+    return (
+        onnx.numpy_helper.to_array(inits["Wq"]),
+        onnx.numpy_helper.to_array(inits["Wk"]),
+        onnx.numpy_helper.to_array(inits["Wv"]),
+        onnx.numpy_helper.to_array(inits["Wout"]),
+    )
+
+
+def test_cpp_decomposed_gqa_wanda_pruning_matches_oracle_exactly():
+    model, cfg = _decomposed_gqa_model(K=32, H=8, KVH=2, D=8, Out=16, seed=101)
+    rng = np.random.default_rng(102)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    act_norm = _probe_act_norm(model, "ctx2", {"X": x_cal})
+    new_kv = 1  # KVH=2, sparsity=0.5 -> keep_count = max(1, 2 - round(1)) == 1
+    keep_groups = _wanda_gqa_keep_groups(
+        cfg["wq"],
+        cfg["wk"],
+        cfg["wv"],
+        cfg["H"],
+        cfg["KVH"],
+        cfg["D"],
+        act_norm,
+        new_kv,
+    )
+    group_size = cfg["H"] // cfg["KVH"]
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned)
+    np.testing.assert_array_equal(wq_new, cfg["wq"][:, q_idx])
+    np.testing.assert_array_equal(wk_new, cfg["wk"][:, kv_idx])
+    np.testing.assert_array_equal(wv_new, cfg["wv"][:, kv_idx])
+    np.testing.assert_array_equal(wo_new, cfg["wout"][q_idx, :])
+
+
+def test_cpp_decomposed_gqa_wanda_pruning_matches_python_reference_exactly():
+    model, cfg = _decomposed_gqa_model(K=32, H=8, KVH=2, D=8, Out=16, seed=103)
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+
+    rng = np.random.default_rng(104)
+    calibration_data = [
+        {
+            "X": rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(
+                np.float32
+            )
+        }
+        for _ in range(3)
+    ]
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model_for_py, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_decomposed_gqa_wanda_pruning_clones_shape_constant_shared_with_foreign_reader():
+    model, cfg = _decomposed_gqa_model(
+        K=64,  # == H * D, so `foreign_out`'s own Reshape(xf, Sq) is valid.
+        H=8,
+        KVH=2,
+        D=8,
+        Out=16,
+        seed=105,
+        extra_foreign_q_reshape_consumer=True,
+    )
+    model_for_py = onnx.ModelProto()
+    model_for_py.CopyFrom(model)
+
+    rng = np.random.default_rng(106)
+    calibration_data = [
+        {
+            "X": rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(
+                np.float32
+            )
+        }
+    ]
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model_for_py, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_cpp.graph.initializer
+    }
+    np.testing.assert_array_equal(
+        inits["Sq"], [cfg["batch"], cfg["seq"], cfg["H"], cfg["D"]]
+    )
+    assert "Sq_pruned" in inits
+
+
+def test_cpp_decomposed_gqa_wanda_pruning_with_constant_mask_is_declined_but_python_still_prunes():
+    # Mirrors test_attention_head_pruning_cpp.py's own identical (data-free)
+    # test -- this C++ port never recognizes an additive mask at all, so the
+    # whole chain declines to match here regardless of whether calibration
+    # data is supplied, while pruning.py's own pure-Python
+    # apply_attention_head_wanda_pruning still prunes it.
+    model, cfg = _decomposed_gqa_model(
+        K=32, H=8, KVH=2, D=8, Out=16, seed=107, masked=True
+    )
+    rng = np.random.default_rng(108)
+    calibration_data = [
+        {
+            "X": rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(
+                np.float32
+            )
+        }
+    ]
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
+    assert pruned_py.SerializeToString() != model.SerializeToString()
+
+
+def test_cpp_decomposed_mqa_wanda_pruning_is_a_permanent_no_op_unlike_python():
+    model, cfg = _decomposed_gqa_model(K=32, H=8, KVH=1, D=8, Out=16, seed=109)
+    rng = np.random.default_rng(110)
+    calibration_data = [
+        {
+            "X": rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(
+                np.float32
+            )
+        }
+    ]
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    onnx.checker.check_model(pruned_py)
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
+    assert pruned_py.SerializeToString() != model.SerializeToString()

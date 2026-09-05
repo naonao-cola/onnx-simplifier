@@ -584,34 +584,31 @@ onnx::ModelProto ApplySparseGptPruning(
 // and general grouped (`1 < group < in_channels`) Conv alike, with real
 // calibration data.
 //
-// Despite that Conv parity, `apply_wanda_pruning` in pruning.py is
-// DELIBERATELY NOT an alias of this function -- a full-regression check
-// (every existing MatMul/Gemm/Attention candidate's live output against the
-// pure-Python reference, not just the new Conv coverage) surfaced a
-// genuine, PRE-EXISTING divergence unrelated to Conv: WandaCalibrationStats
-// below computes a per-channel-axis activation norm for a MatMul/Gemm
-// candidate's own activation at ANY rank >= 1 (probe axis -1, the same
-// "reduce over every leading axis" treatment it gives a rank-3 Attention
-// activation), whereas pruning.py's own
-// `_wanda_unstructured_calibration_stats` explicitly requires `x.ndim == 2`
-// for that same (non-Attention, non-Conv) statistic and falls back to
-// plain magnitude importance for anything else -- e.g. a rank-3 activation
-// feeding a plain 2-D MatMul weight, exactly the shape a batched/sequence
-// MatMul input takes in practice. So this port gives such a layer a REAL
-// (but, per the Python reference's own narrower scope, not-yet-earned)
-// activation-weighted importance instead of the Python reference's
-// plain-magnitude fallback. This predates this round's Conv work entirely
-// (in code this round never touched) and was only exposed once
-// `apply_wanda_pruning` was tentatively aliased here to verify that Conv
-// work; fixing WandaCalibrationStats' own rank handling touches shared,
-// independently-verified infrastructure ApplyStructuredWandaPruning/
-// ApplyAttentionHeadWandaPruning also depend on, so it is deliberately left
-// undone and undocumented-as-fixed here -- the conservative choice over a
-// subtly-wrong alias. See tests/test_wanda_pruning_cpp.py's own module
-// docstring for the full writeup and
-// tests/test_pruning.py's own
-// test_wanda_pruning_falls_back_to_magnitude_without_matching_activation
-// for the regression that caught it.
+// A prior round's full-regression check (every existing MatMul/Gemm/
+// Attention candidate's live output against the pure-Python reference, not
+// just this function's own Conv coverage) surfaced a genuine, PRE-EXISTING
+// divergence unrelated to Conv: WandaCalibrationStats below used to compute
+// a per-channel-axis activation norm for a MatMul/Gemm candidate's own
+// activation at ANY rank >= 1 (probe axis -1, the same "reduce over every
+// leading axis" treatment it gives a rank-3 Attention activation), whereas
+// pruning.py's own `_wanda_unstructured_calibration_stats` explicitly
+// requires `x.ndim == 2` for that same (non-Attention, non-Conv) statistic
+// and falls back to plain magnitude importance for anything else -- e.g. a
+// rank-3 activation feeding a plain 2-D MatMul weight, exactly the shape a
+// batched/sequence MatMul input takes in practice. That gap blocked
+// aliasing `apply_wanda_pruning` in pruning.py to this function for a time
+// (see tests/test_pruning.py's own
+// test_wanda_pruning_falls_back_to_magnitude_without_matching_activation,
+// which caught it). It is now closed: WandaCalibrationStats below takes an
+// additional `require_rank2` set (default empty, so
+// ApplyStructuredWandaPruning/ApplyAttentionHeadWandaPruning below -- whose
+// own Python references have no rank restriction at all -- are completely
+// unaffected), and this function passes it the `x_name` of every matched
+// plain MatMul/Gemm candidate (never an Attention candidate's, which keeps
+// the same any-rank->=2 treatment as before, matching pruning.py's own
+// `attn_act_norm`) -- see WandaCalibrationStats' own `require_rank2` doc
+// comment and this function's own call site comment for the exact rule.
+// `apply_wanda_pruning` in pruning.py is now a thin alias of this function.
 //
 // Conv's own im2col per-receptive-field-offset activation norm --
 // `X_j` for a Conv column is not "input feature `j`" but "receptive-field
@@ -650,18 +647,26 @@ onnx::ModelProto ApplySparseGptPruning(
 // Wanda's own calibration statistic for the MatMul/Gemm/Attention candidate
 // families -- one shared per-reduction-channel activation L2-norm per
 // matched layer's own input, reduced over every leading axis (so a rank-3
-// `com.microsoft::Attention` input is handled exactly like a rank-2
-// MatMul/Gemm one, mirroring pruning.py's own `x.reshape(-1,
-// x.shape[-1])`) -- is exactly WandaCalibrationStats' own output shape,
-// reused verbatim: probe axis -1 for every non-Conv candidate, keyed by
-// each candidate's own activation tensor name (`x_name`) rather than by
-// weight name the way pruning.py's own `attn_act_norm` is keyed for
-// Attention -- mirroring ApplyAttentionHeadWandaPruning's own already-
-// established simplification of that same distinction (two distinct
-// Attention nodes sharing one activation tensor name is a purely
-// theoretical edge case neither C++ port bothers distinguishing). See
-// structured_pruning_entry.cpp's own "Wanda unstructured (element-wise)
-// pruning" section comment for the masking mechanics.
+// `com.microsoft::Attention` input's own leading axes are reduced away
+// exactly as pruning.py's own `x.reshape(-1, x.shape[-1])` does for its
+// separate `attn_act_norm` statistic) -- is exactly WandaCalibrationStats'
+// own output shape, reused verbatim: probe axis -1 for every non-Conv
+// candidate, keyed by each candidate's own activation tensor name (`x_name`)
+// rather than by weight name the way pruning.py's own `attn_act_norm` is
+// keyed for Attention -- mirroring ApplyAttentionHeadWandaPruning's own
+// already-established simplification of that same distinction (two
+// distinct Attention nodes sharing one activation tensor name is a purely
+// theoretical edge case neither C++ port bothers distinguishing). Unlike
+// Attention, a plain MatMul/Gemm candidate's own activation must be
+// EXACTLY rank 2 to be observed at all here -- mirroring pruning.py's own
+// `act_norm` (as opposed to `attn_act_norm`) probe -- via
+// WandaCalibrationStats' own `require_rank2` parameter, passed the `x_name`
+// of every MatMul/Gemm (never Attention) candidate here (see that
+// function's own doc comment and this file's own call site comment in
+// structured_pruning_entry.cpp for the exact set-construction rule,
+// including its handling of the theoretical shared-`x_name` edge case just
+// mentioned). See structured_pruning_entry.cpp's own "Wanda unstructured
+// (element-wise) pruning" section comment for the masking mechanics.
 //
 // `n`/`m` (both std::nullopt, or both given together: N:M semi-structured
 // pruning, `0 < n <= m`) and `sparsity` (target unstructured-sparsity
