@@ -589,6 +589,43 @@ environment has to go on. `tests/test_axera_conv_matmul_coverage.py` builds
   way a missing `onnxruntime` already did, instead of taking the whole
   import down.
 
+### Confirmed on real hardware: which of these actually build
+
+A later session with real Docker/AX650N access compiled every variant the
+static-heuristic analysis above flagged as unverified, through a real
+`pulsar2 build`. Results (see
+`tests/test_axera_conv_matmul_coverage_hardware.py`):
+
+**Compile successfully, confirming the doc-scraped list under-claims
+nothing for these cases**: `Conv` with `auto_pad="SAME_UPPER"` (despite the
+docs page reportedly requiring `NOTSET` -- either that limit doesn't hold in
+practice for this case, or Pulsar2 silently resolves `auto_pad` to explicit
+`pads` before its own limit would apply), 1-D `Conv`, 3-D `Conv`, broadcasting
+`MatMul` (rank-3 `A` against a rank-2 `B`), and `Gemm` with `transB=1`.
+
+**Fail outright, with the same "not on `AX650_SUPPORTED_OPS`" mechanism the
+static heuristic already predicted**: `ConvInteger`, `QLinearConv`,
+`MatMulInteger`, `QLinearMatMul` -- all four real `pulsar2 build` runs threw
+the exact `KeyError('dont support <OpType> opr in AXOPS/ONNXOPS/CUSTOM_OPS')`
+pattern this repo has seen before (`LRN`, `AxQuantizedGemm` -- see above),
+confirming these standard ONNX quantized ops are genuinely unimplemented on
+this real toolchain, not merely absent from a possibly-incomplete
+docs-scraped list.
+
+**Fails, but with a real, different failure mode neither analysis
+predicted**: `ConvTranspose` -- despite being confirmed present in
+`AX650_SUPPORTED_OPS` (and passing `partition()`'s coverage check, correctly,
+since the op type genuinely is on the list) -- a plain `ConvTranspose`
+(kernel 3x3, default strides/padding, upsampling 8x8 -> 10x10) fails during
+real quantization with `RuntimeError("Op Execution Error: Y(TargetPlatform.
+UNSPECIFIED) - inputs:['X', 'W'], outputs:['Y']")`, not the "dont support"
+pattern above. This is exactly the failure mode the static heuristic
+structurally cannot see (op-type presence alone says nothing about it) and
+is a genuine confirmed gap in `AX650_SUPPORTED_OPS`'s "supported" claim for
+at least this shape/parameter combination -- root cause (a missing required
+attribute this minimal graph didn't set, a PTQ-engine limitation specific to
+transposed conv, or something else) not further diagnosed here.
+
 ## Files
 
 | file | purpose |
