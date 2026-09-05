@@ -1650,8 +1650,8 @@ def apply_sparsegpt_pruning_cpp(
     QKV weight. Deliberately narrower than the pure-Python
     :func:`onnxsim.apply_sparsegpt_pruning` in two ways, both mirroring this
     module's own established narrower-than-pruning.py C++-port scope
-    decisions elsewhere (e.g. :func:`onnxsim.apply_moe_expert_channel_pruning_cpp`'s
-    own FLOAT32-only restriction):
+    decisions elsewhere (e.g. the ``MatMulNBits`` C++ section's own
+    FLOAT32-only restriction on its own scales/zero_points/bias tensors):
 
     - FLOAT32 only, not also FLOAT16/BFLOAT16.
     - 2-D ``Conv`` (ordinary/depthwise/general-grouped) is **not** matched
@@ -1776,8 +1776,8 @@ def apply_wanda_pruning_cpp(
     the pure-Python :func:`onnxsim.apply_wanda_pruning` in the same two ways
     that function's own C++-port sibling already establishes (mirroring
     this module's own established narrower-than-pruning.py C++-port scope
-    decisions elsewhere, e.g. :func:`onnxsim.apply_moe_expert_channel_pruning_cpp`'s
-    own FLOAT32-only restriction):
+    decisions elsewhere, e.g. the ``MatMulNBits`` C++ section's own
+    FLOAT32-only restriction on its own scales/zero_points/bias tensors):
 
     - FLOAT32 only, not also FLOAT16/BFLOAT16.
     - 2-D ``Conv`` (ordinary/depthwise/general-grouped) is **not** matched
@@ -1898,15 +1898,17 @@ def apply_moe_expert_channel_pruning_cpp(
     untouched -- the same conservative "decline rather than mis-slice" bar
     every other chain-matcher in this codebase holds.
 
-    Unlike the pure-Python :func:`onnxsim.apply_moe_expert_channel_pruning`,
-    ``fc1_experts_weights``/``fc2_experts_weights``/``fc1_experts_bias`` are
-    admitted only as plain FLOAT (float32) tensors here, not also FLOAT16/
-    BFLOAT16 -- matching this codebase's own established narrower-than-
-    pruning.py C++-port scope decision elsewhere (e.g.
-    :func:`onnxsim.apply_structured_pruning_cpp`'s own ``MatMulNBits``
-    ``scales``/``zero_points``/``bias`` restriction). Whole-expert pruning
-    (shrinking ``num_experts`` itself, calibration-driven) is a deliberately
-    separate entry point, :func:`onnxsim.apply_moe_whole_expert_pruning_cpp`.
+    ``fc1_experts_weights``/``fc2_experts_weights``/``fc1_experts_bias`` may
+    be FLOAT, FLOAT16, or BFLOAT16 -- full parity with the pure-Python
+    :func:`onnxsim.apply_moe_expert_channel_pruning` (itself now a thin
+    alias for this function; see IsSupportedFloatDtype/ReadTensorAsF64/
+    WriteF64TensorAs in ``onnxsim/structured_pruning_entry.cpp``'s own "MoE
+    expert-intermediate-channel pruning" section for the read-upcast/
+    write-downcast mechanics -- a surviving weight's own value is only ever
+    reordered/dropped, never recomputed, so this round-trips every
+    FLOAT16/BFLOAT16 bit pattern exactly). Whole-expert pruning (shrinking
+    ``num_experts`` itself, calibration-driven) is a deliberately separate
+    entry point, :func:`onnxsim.apply_moe_whole_expert_pruning_cpp`.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
@@ -1968,12 +1970,13 @@ def apply_qmoe_expert_channel_pruning_cpp(
     zero_points too), identically across every expert. ``num_experts``, `k`,
     and every node attribute are untouched.
 
-    Unlike :func:`onnxsim.apply_qmoe_expert_channel_pruning`, this port only
-    admits FLOAT32 (not FLOAT16/BFLOAT16) ``fc1``/``fc2`` scales and bias,
-    matching this codebase's C++-port scope decision for
-    :func:`onnxsim.apply_structured_pruning_matmul_nbits` above. The
-    complementary whole-expert-removal pass is a separate entry point,
-    :func:`onnxsim.apply_qmoe_whole_expert_pruning_cpp`.
+    ``fc1``/``fc2`` scales and bias may be FLOAT, FLOAT16, or BFLOAT16 --
+    full parity with the pure-Python :func:`onnxsim.apply_qmoe_expert_
+    channel_pruning` (itself now a thin alias for this function; the packed
+    ``uint8`` `fc1`/`fc2` weights themselves, and `zero_points`, are
+    unaffected either way -- always UINT8 regardless of the *activation*/
+    scale dtype). The complementary whole-expert-removal pass is a separate
+    entry point, :func:`onnxsim.apply_qmoe_whole_expert_pruning_cpp`.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
@@ -2350,9 +2353,9 @@ def apply_embedding_vocab_pruning_cpp(
     ``GemmFastGelu`` -- and only ever admits a plain FLOAT (float32)
     embedding table/``lm_head`` weight/bias, not also FLOAT16/BFLOAT16,
     matching this codebase's own established narrower-than-pruning.py
-    C++-port scope decision elsewhere (e.g.
-    :func:`onnxsim.apply_moe_expert_channel_pruning_cpp`'s own FLOAT32-only
-    restriction). See ``onnxsim/structured_pruning_entry.cpp``'s own
+    C++-port scope decision elsewhere (e.g. the ``MatMulNBits`` C++
+    section's own FLOAT32-only restriction on its own scales/zero_points/
+    bias tensors). See ``onnxsim/structured_pruning_entry.cpp``'s own
     "Embedding vocabulary pruning" section comment for the exact matched
     topology.
 
