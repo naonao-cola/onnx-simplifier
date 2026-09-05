@@ -1722,37 +1722,36 @@ def apply_sparsegpt_pruning_cpp(
     Matches every plain ``MatMul``/vanilla-``Gemm`` node with a constant 2-D
     FLOAT32/FLOAT16/BFLOAT16 weight (this already includes ``com.microsoft::
     GroupQueryAttention``'s own separate Q/K/V projections -- ordinary
-    MatMul/Gemm nodes feeding it, not a weight the op itself owns), plus
-    every ``com.microsoft::Attention`` node's constant 2-D FLOAT32/FLOAT16/
-    BFLOAT16 merged QKV weight -- read upcast to float64, written back down
-    to each weight's own original dtype, exactly like
+    MatMul/Gemm nodes feeding it, not a weight the op itself owns), every
+    ``com.microsoft::Attention`` node's constant 2-D FLOAT32/FLOAT16/
+    BFLOAT16 merged QKV weight, and every 2-D ``Conv``/``FusedConv`` node
+    (ordinary/depthwise/general-grouped alike) with a constant 4-D
+    FLOAT32/FLOAT16/BFLOAT16 ``[out_channels, in_channels/group, kh, kw]``
+    weight -- read upcast to float64, written back down to each weight's
+    own original dtype, exactly like
     :func:`onnxsim.apply_sparsegpt_pruning`'s own ``_to_f64``/``_from_f64``
     convention (though note SparseGPT's Hessian-compensated update, unlike
     plain masking, *recomputes* every kept entry's own value, so a fp16/bf16
     weight's surviving entries do not reproduce their pre-pruning bit
     pattern the way a plain-masking C++ port's FLOAT16/BFLOAT16 support
-    does). Deliberately narrower than the pure-Python
-    :func:`onnxsim.apply_sparsegpt_pruning` in one remaining way (mirroring
-    this module's own established narrower-than-pruning.py C++-port scope
-    decisions elsewhere):
-
-    - 2-D ``Conv`` (ordinary/depthwise/general-grouped) is **not** matched
-      at all here -- the pure-Python original's own Conv support needs an
-      entirely new, from-first-principles im2col cross-covariance Hessian
-      (``H = patches.T @ patches``, plus a genuinely per-group Hessian and
-      column-processing split for grouped/depthwise Conv) that its own
-      module docstring documents at length as having no correct upstream
-      reference to port from at all -- reaching that bar is materially
-      bigger than the rest of this pass and is out of scope for this C++
-      port. A Conv node is left completely untouched here, never guessed
-      at, exactly as if it were any other unmatched node type -- use the
-      pure-Python :func:`onnxsim.apply_sparsegpt_pruning` if Conv coverage
-      is required. This is the only remaining scope gap versus the
-      pure-Python original, so :func:`onnxsim.apply_sparsegpt_pruning`
-      itself is NOT an alias of this function (unlike, e.g.,
-      :func:`onnxsim.apply_transformer_block_pruning`, which IS an alias of
-      its own verified-full-parity C++ port) -- a Conv-bearing model would
-      otherwise silently get a different (Conv-less) result here.
+    does). Now at full, verified parity with the pure-Python
+    :func:`onnxsim.apply_sparsegpt_pruning`, which is itself a thin alias
+    for this function (see that function's own docstring) -- Conv's own
+    im2col cross-covariance Hessian (``H = patches.T @ patches``, with a
+    genuinely per-group Hessian and column-processing split for grouped/
+    depthwise Conv) was verified numerically against the pure-Python
+    original across ordinary/depthwise/general-grouped Conv, unstructured
+    and N:M sparsity, ``auto_pad``, and dilation (see
+    ``tests/test_sparsegpt_pruning_cpp.py``'s own Conv section), despite
+    that Python original having no correct upstream SparseGPT reference of
+    its own to port from (see its own module docstring for the three
+    independent verification legs that make it trustworthy ground truth
+    regardless). A Conv node whose spatial attributes are malformed (a
+    ``kernel_shape`` disagreeing with the weight's own shape, an
+    unrecognized ``auto_pad``, non-positive ``strides``/``dilations``, or a
+    malformed explicit ``pads``) is left completely untouched, never
+    guessed at, exactly like a layer with no observed calibration
+    activation.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to compute each
@@ -1787,11 +1786,14 @@ def apply_sparsegpt_pruning_cpp(
             :func:`onnxsim.onnx_simplifier._get_model_executor` process-wide
             executor, the same one :func:`onnxsim.simplify` itself uses)
     :returns: ``model`` with every matched layer's weight rewritten in
-            place to the target pattern; a layer with no observed 2-D
-            calibration activation (dead input, an otherwise-empty
-            ``calibration_data``, or every batch's activation isn't
-            FLOAT32/FLOAT16/BFLOAT16) is left completely untouched -- there
-            is no data-free fallback for SparseGPT
+            place to the target pattern; a MatMul/Gemm/Attention layer with
+            no observed 2-D calibration activation (dead input, an
+            otherwise-empty ``calibration_data``, or every batch's
+            activation isn't FLOAT32/FLOAT16/BFLOAT16), or a Conv layer
+            with malformed spatial attributes or no observed usable 4-D
+            activation for any one of its groups (a grouped/depthwise Conv
+            is never partially pruned), is left completely untouched --
+            there is no data-free fallback for SparseGPT
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)

@@ -3322,165 +3322,43 @@ def apply_sparsegpt_pruning(
             Hessian was never observed), is left completely untouched --
             unlike Wanda, there is no data-free fallback for a technique
             whose entire mechanism is the Hessian
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_sparsegpt_pruning_cpp`
+    (``onnxsim/structured_pruning_entry.cpp``'s own ``ApplySparseGptPruning``),
+    forwarding every argument unchanged. Conv (ordinary/depthwise/general-
+    grouped) parity was the one remaining gap before this round -- verified
+    numerically against this function's own pre-alias Conv implementation
+    (exact agreement, essentially to floating-point precision, across every
+    `group` shape, unstructured and N:M sparsity, `auto_pad`, and dilation --
+    see structured_pruning_entry.h's own ApplySparseGptPruning declaration
+    comment and tests/test_sparsegpt_pruning_cpp.py's own Conv section)
+    before this alias was made, despite this module's own docstring
+    documenting that Conv Hessian as having no correct upstream SparseGPT
+    reference of its own to port from or check against -- pruning.py's own
+    independent nested-loop-oracle and reference-transliteration test
+    coverage (see this module's own docstring) was trustworthy ground
+    truth to verify the C++ port against regardless. Imported lazily
+    (inside the function body, not at module scope) to avoid a circular
+    import: ``onnxsim.onnx_simplifier`` already imports from this module
+    (:class:`EmbeddingPruningResult`), so importing it back at module load
+    time here would deadlock the import machinery.
     """
-    _validate_pattern(sparsity, n, m)
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_sparsegpt_pruning_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = _constant_map(graph)
-
-    # Unlike an earlier version of this function, grouped/depthwise Conv is
-    # matched too (_candidates' own allow_grouped_conv default, True) -- see
-    # this function's own docstring and this module's own docstring for the
-    # per-group Hessian/column-processing-loop partitioning that makes this
-    # correct now.
-    candidates = _candidates(graph)
-    if not candidates:
-        return out
-
-    probe_names = sorted({x_name for _, x_name, _, _, _ in candidates})
-    probe_model = _add_probe_outputs(out, probe_names)
-
-    # Conv attributes are per-node (two Convs can share an input tensor
-    # with different kernels/strides), so the Conv Hessian below is keyed
-    # by its own weight name, mirroring apply_wanda_pruning's own
-    # conv_attrs/conv_act_norm.
-    conv_attrs: Dict[str, Optional[_ConvSpatialAttrs]] = {
-        w_name: _conv_spatial_attrs(node, initializer_map[w_name])
-        for node, _, w_name, _, is_conv in candidates
-        if is_conv
-    }
-    # `group`/`in_channels_per_group` are fixed per node (read once, not
-    # recomputed per batch) -- `cin_per_group` is exactly the weight's own
-    # axis-1 extent, ONNX's grouped-Conv convention (see this module's own
-    # docstring).
-    conv_group_info: Dict[str, Tuple[int, int]] = {
-        w_name: (_conv_group(node), int(initializer_map[w_name].dims[1]))
-        for node, _, w_name, _, is_conv in candidates
-        if is_conv
-    }
-
-    activations: Dict[str, List[np.ndarray]] = {
-        x_name: [] for _, x_name, _, _, is_conv in candidates if not is_conv
-    }
-    # Unlike the MatMul/Gemm activations above (each layer's whole
-    # calibration set concatenated once, below -- small enough per layer
-    # to keep entirely in memory), each Conv layer's H accumulates
-    # incrementally, one calibration batch's own im2col-unfolded patch
-    # matrix at a time: a full [n_positions, K] patch matrix can be large,
-    # so no batch's patches outlive the H += they fold into. See this
-    # module's own docstring.
-    #
-    # conv_h[w_name] is a list of length `group`, one independently
-    # accumulated H per group -- filter row i (belonging to group
-    # i // (out_channels/group), ONNX's own grouped-Conv weight layout)
-    # only ever reads its own group's global input-channel slice
-    # [g*cin_per_group, (g+1)*cin_per_group), so group g's own H is built
-    # by feeding exactly that channel-sliced sub-tensor through the same
-    # per-group-agnostic _conv_im2col_patches used for the group=1 case --
-    # no dedicated grouped-Hessian machinery needed, since im2col-unfolding
-    # a channel slice is exactly what im2col-unfolding a narrower "whole"
-    # input already does. For group=1 this is a length-1 list whose single
-    # entry is built from the full (unsliced) input, identical to this
-    # function's previous group=1-only behavior. Total unfolding work
-    # across every group's own slice equals one full-input unfold (the
-    # slices partition the channel axis), so this costs no more overall
-    # than the group=1 case did.
-    conv_h: Dict[str, List[Optional[np.ndarray]]] = {}
-
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in activations:
-            x = np.asarray(result[name], dtype=np.float64)
-            if x.ndim < 2:
-                continue
-            activations[name].append(x.reshape(-1, x.shape[-1]))
-        for _, x_name, w_name, _, is_conv in candidates:
-            if not is_conv:
-                continue
-            attrs = conv_attrs[w_name]
-            if attrs is None:
-                continue
-            group, cin_per_group = conv_group_info[w_name]
-            x_conv = np.asarray(result[x_name], dtype=np.float64)
-            if x_conv.ndim != 4 or x_conv.shape[1] != cin_per_group * group:
-                continue  # not this node's own [N, Cin, H, W] input -- skip
-            h_accum = conv_h.setdefault(w_name, [None] * group)
-            for g in range(group):
-                x_group = x_conv[:, g * cin_per_group : (g + 1) * cin_per_group, :, :]
-                patches = _conv_im2col_patches(x_group, attrs)
-                if patches is None:
-                    continue
-                h_batch = patches.T @ patches
-                h_accum[g] = h_batch if h_accum[g] is None else h_accum[g] + h_batch
-
-    for _, x_name, w_name, weight_transposed, is_conv in candidates:
-        w_init = initializer_map[w_name]
-        w = _to_f64(w_init)
-
-        if is_conv:
-            cout, cin_per_group, kh, kw = w.shape
-            group, _ = conv_group_info[w_name]
-            h_list = conv_h.get(w_name)
-            # Every group's own H must have been observed -- a layer with
-            # no usable calibration signal for any one group is left
-            # completely untouched, same as the group=1 case's `h is None`
-            # check (there is no data-free fallback, and no meaningful way
-            # to prune some groups' filters but not others.
-            if h_list is None or any(h is None for h in h_list):
-                continue
-            filters_per_group = cout // group
-            w_nk = w.reshape(cout, cin_per_group * kh * kw)
-            # Each group's own [filters_per_group, K] weight sub-block is
-            # pruned independently against its own group's H -- a column-
-            # masking decision and its downstream error compensation only
-            # make sense within one group's own consistent Hessian/weight
-            # coordinate system (see this module's own docstring), so
-            # _sparsegpt_prune_columns (already correct for one full,
-            # ungrouped weight/Hessian pair) is simply called once per
-            # group rather than needing any grouped-specific version of its
-            # own sequential column-processing/error-compensation loop.
-            pruned_groups = [
-                _sparsegpt_prune_columns(
-                    w_nk[g * filters_per_group : (g + 1) * filters_per_group],
-                    h_list[g],
-                    sparsity,
-                    n,
-                    m,
-                    percdamp,
-                    proc_block_size,
-                )
-                for g in range(group)
-            ]
-            w_pruned_nk = np.concatenate(pruned_groups, axis=0)
-            w_new = w_pruned_nk.reshape(cout, cin_per_group, kh, kw)
-        else:
-            acts = activations[x_name]
-            if not acts:
-                continue
-            x = np.concatenate(acts, axis=0)
-            dim0, dim1 = w.shape
-            w_nk = w if weight_transposed else w.T  # [N, K]
-            if x.shape[1] != w_nk.shape[1]:
-                continue
-
-            h = x.T @ x
-            w_pruned_nk = _sparsegpt_prune_columns(
-                w_nk, h, sparsity, n, m, percdamp, proc_block_size
-            )
-            w_new = w_pruned_nk if weight_transposed else w_pruned_nk.T
-            w_new = w_new.reshape(dim0, dim1)
-
-        w_init.CopyFrom(_from_f64(w_new, w_init.data_type, w_init.name))
-
-    return out
+    return apply_sparsegpt_pruning_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        sparsity=sparsity,
+        n=n,
+        m=m,
+        percdamp=percdamp,
+        proc_block_size=proc_block_size,
+        providers=providers,
+    )
 
 
 # --- Structured (channel) pruning -------------------------------------------

@@ -21660,6 +21660,452 @@ std::optional<AttentionProducerMatch> MatchAttentionProducerAnyFloat(
   return AttentionProducerMatch{w_name, bias_name, num_heads, nq, nk, nv};
 }
 
+// --- SparseGPT Conv support (im2col cross-covariance Hessian) -----------
+//
+// C++ port of pruning.py's own `_ConvSpatialAttrs`/`_conv_spatial_attrs`/
+// `_resolve_conv_pads`/`_conv_im2col_patches`, the machinery
+// `apply_sparsegpt_pruning`'s own Conv branch needs that no MatMul/Gemm/
+// Attention candidate does: a full `[K, K]` im2col cross-covariance Hessian
+// (`H = patches.T @ patches`, `K = Cin/group * kh * kw`) rather than the
+// plain `H = X.T @ X` a MatMul/Gemm layer's own already-2-D activation
+// gives for free. See pruning.py's own module-level docstring for why this
+// needed genuinely new, from-first-principles machinery (no correct
+// upstream SparseGPT reference implementation ever exercises a Conv layer)
+// and how it was verified (an independent nested-loop oracle, an
+// independent second `fasterprune` transliteration fed independently-built
+// per-group patches, and an end-to-end onnxruntime reconstruction-error
+// property, for ordinary/depthwise/general-grouped Conv alike) -- that
+// verification bar is exactly what this port is checked against (see
+// tests/test_sparsegpt_pruning_cpp.py's own Conv section), the Python
+// implementation being trustworthy ground truth despite having no upstream
+// reference of its own.
+struct ConvSpatialAttrs {
+  int64_t kh = 0;
+  int64_t kw = 0;
+  int64_t pad_top = 0;
+  int64_t pad_left = 0;
+  int64_t pad_bottom = 0;
+  int64_t pad_right = 0;
+  int64_t stride_h = 1;
+  int64_t stride_w = 1;
+  int64_t dilation_h = 1;
+  int64_t dilation_w = 1;
+  // "NOTSET"/"": pad_top/pad_left/pad_bottom/pad_right above are used as-is,
+  // fixed per node. "SAME_UPPER"/"SAME_LOWER"/"VALID": those four fields are
+  // unused placeholders -- the real padding is resolved fresh per
+  // calibration batch by ResolveConvPads, from that batch's own input
+  // spatial size, mirroring pruning.py's own _ConvSpatialAttrs/
+  // _resolve_conv_pads split exactly.
+  std::string auto_pad = "NOTSET";
+};
+
+// C++ port of pruning.py's own _conv_spatial_attrs: extracts the
+// padding/stride/dilation a Conv node's calibration input needs to be
+// correctly im2col-unfolded, from `node`'s own attributes and `w_init`'s
+// own `[out_channels, in_channels/group, kh, kw]` shape. Returns
+// std::nullopt on the same "don't guess at a malformed node" conditions the
+// Python original declines on: a `kernel_shape` disagreeing with `w_init`'s
+// own shape, an unrecognized `auto_pad` string, non-positive
+// `strides`/`dilations`, or a malformed explicit `pads` (wrong length, or
+// negative) -- a declined node is left completely untouched by this pass's
+// caller, exactly like a layer with no observed calibration activation.
+std::optional<ConvSpatialAttrs> ResolveConvSpatialAttrs(
+    const onnx::NodeProto& node, const onnx::TensorProto& w_init) {
+  if (w_init.dims_size() != 4) {
+    return std::nullopt;
+  }
+  const int64_t kh = w_init.dims(2);
+  const int64_t kw = w_init.dims(3);
+
+  std::string auto_pad = "NOTSET";
+  std::optional<std::vector<int64_t>> pads;
+  std::optional<std::vector<int64_t>> strides;
+  std::optional<std::vector<int64_t>> dilations;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "auto_pad") {
+      auto_pad = attr.s();
+    } else if (attr.name() == "pads") {
+      pads = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    } else if (attr.name() == "strides") {
+      strides = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    } else if (attr.name() == "dilations") {
+      dilations = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    } else if (attr.name() == "kernel_shape") {
+      const std::vector<int64_t> ks(attr.ints().begin(), attr.ints().end());
+      if (ks.size() != 2 || ks[0] != kh || ks[1] != kw) {
+        return std::nullopt;  // weight/attribute mismatch -- don't guess
+      }
+    }
+  }
+  if (auto_pad != "NOTSET" && !auto_pad.empty() && auto_pad != "SAME_UPPER" &&
+      auto_pad != "SAME_LOWER" && auto_pad != "VALID") {
+    return std::nullopt;  // unrecognized -- don't guess
+  }
+
+  const std::vector<int64_t> s = strides.value_or(std::vector<int64_t>{1, 1});
+  if (s.size() != 2 || s[0] <= 0 || s[1] <= 0) {
+    return std::nullopt;
+  }
+  const std::vector<int64_t> d = dilations.value_or(std::vector<int64_t>{1, 1});
+  if (d.size() != 2 || d[0] <= 0 || d[1] <= 0) {
+    return std::nullopt;
+  }
+
+  ConvSpatialAttrs result;
+  result.kh = kh;
+  result.kw = kw;
+  result.stride_h = s[0];
+  result.stride_w = s[1];
+  result.dilation_h = d[0];
+  result.dilation_w = d[1];
+  result.auto_pad = auto_pad;
+
+  if (auto_pad == "NOTSET" || auto_pad.empty()) {
+    const std::vector<int64_t> p =
+        pads.value_or(std::vector<int64_t>{0, 0, 0, 0});
+    if (p.size() != 4 || p[0] < 0 || p[1] < 0 || p[2] < 0 || p[3] < 0) {
+      return std::nullopt;
+    }
+    result.pad_top = p[0];
+    result.pad_left = p[1];
+    result.pad_bottom = p[2];
+    result.pad_right = p[3];
+  }
+  return result;
+}
+
+// C++ port of pruning.py's own _resolve_conv_pads: resolves one Conv node's
+// actual (pad_top, pad_left, pad_bottom, pad_right) for one calibration
+// batch's own [N, Cin, in_h, in_w] input, per the ONNX Conv operator's own
+// `auto_pad` formula (https://onnx.ai/onnx/operators/onnx__Conv.html).
+// "NOTSET"/"" is already a fixed, per-node quantity, returned unchanged;
+// "VALID" is always zero padding; "SAME_UPPER"/"SAME_LOWER" are the only
+// genuinely input-size-dependent cases, resolved fresh here (never cached
+// on `attrs` itself) since a dynamic-input-shape model's own in_h/in_w can
+// legitimately differ calibration batch to batch. Every division below is
+// over strictly positive operands (kh/kw/strides/dilations already
+// validated positive by ResolveConvSpatialAttrs), so plain truncating
+// integer division already computes the same ceiling pruning.py's own
+// `-(-a // b)` trick gets from Python's floor-division semantics.
+std::array<int64_t, 4> ResolveConvPads(const ConvSpatialAttrs& attrs,
+                                       int64_t in_h, int64_t in_w) {
+  if (attrs.auto_pad == "NOTSET" || attrs.auto_pad.empty()) {
+    return {attrs.pad_top, attrs.pad_left, attrs.pad_bottom, attrs.pad_right};
+  }
+  if (attrs.auto_pad == "VALID") {
+    return {0, 0, 0, 0};
+  }
+  const int64_t eff_kh = (attrs.kh - 1) * attrs.dilation_h + 1;
+  const int64_t eff_kw = (attrs.kw - 1) * attrs.dilation_w + 1;
+  const int64_t out_h = (in_h + attrs.stride_h - 1) / attrs.stride_h;
+  const int64_t out_w = (in_w + attrs.stride_w - 1) / attrs.stride_w;
+  const int64_t pad_h =
+      std::max<int64_t>(0, (out_h - 1) * attrs.stride_h + eff_kh - in_h);
+  const int64_t pad_w =
+      std::max<int64_t>(0, (out_w - 1) * attrs.stride_w + eff_kw - in_w);
+  int64_t pad_top, pad_left;
+  if (attrs.auto_pad == "SAME_UPPER") {
+    pad_top = pad_h / 2;
+    pad_left = pad_w / 2;
+  } else {  // SAME_LOWER
+    pad_top = pad_h - pad_h / 2;
+    pad_left = pad_w - pad_w / 2;
+  }
+  return {pad_top, pad_left, pad_h - pad_top, pad_w - pad_left};
+}
+
+// Returns (h_out, w_out) for a Conv's own effective kernel/stride/dilation
+// over `[in_h, in_w]`, once padded per `attrs`'s own auto_pad/pads --
+// std::nullopt if the padded input is too small for the (dilated) kernel
+// (mirrors pruning.py's own _conv_im2col_patches "too small once padded"
+// decline). Resolves padding fresh (ResolveConvPads), since auto_pad's own
+// padding amount can be input-size-dependent.
+std::optional<std::pair<int64_t, int64_t>> ConvOutputSpatialSize(
+    const ConvSpatialAttrs& attrs, int64_t in_h, int64_t in_w) {
+  const std::array<int64_t, 4> pads = ResolveConvPads(attrs, in_h, in_w);
+  const int64_t eff_kh = (attrs.kh - 1) * attrs.dilation_h + 1;
+  const int64_t eff_kw = (attrs.kw - 1) * attrs.dilation_w + 1;
+  const int64_t padded_h = in_h + pads[0] + pads[2];
+  const int64_t padded_w = in_w + pads[1] + pads[3];
+  if (padded_h < eff_kh || padded_w < eff_kw) {
+    return std::nullopt;
+  }
+  const int64_t h_out = (padded_h - eff_kh) / attrs.stride_h + 1;
+  const int64_t w_out = (padded_w - eff_kw) / attrs.stride_w + 1;
+  if (h_out <= 0 || w_out <= 0) {
+    return std::nullopt;
+  }
+  return std::make_pair(h_out, w_out);
+}
+
+// C++ port of pruning.py's own _conv_im2col_patches, reorganized to
+// accumulate `H += patches.T @ patches` directly, one output position's own
+// receptive-field patch row at a time, rather than ever materializing the
+// full `[n_positions, k]` patch matrix the Python original returns
+// (mathematically identical: `H == sum over positions of outer(patch,
+// patch)`) -- avoids holding a potentially large patch matrix in memory at
+// all, an even smaller footprint than pruning.py's own module docstring
+// already gets from never concatenating multiple BATCHES' own patches.
+// Reads only the `[cin_offset, cin_offset + cin_slice)` channel slice of
+// `x` (one calibration batch's own raw `[n, cin_total, in_h, in_w]`
+// activation, already read via ReadTensorAsF64) -- the caller
+// (ConvSparseGptHessianStats) passes a grouped/depthwise Conv's own
+// group-g global input-channel range here, or the full `[0, cin_total)`
+// range for group == 1, exactly mirroring pruning.py's own per-group
+// `x[:, g*cin_per_group:(g+1)*cin_per_group, :, :]` slicing -- this
+// function itself carries no notion of `group` at all, needing none (see
+// pruning.py's own module docstring for why that is the correct per-group
+// Hessian, not an approximation). `h_out`/`w_out` (from
+// ConvOutputSpatialSize, already confirmed usable by the caller) and `pads`
+// are passed in rather than recomputed, since the caller already needs
+// ConvOutputSpatialSize's own result to decide whether to allocate `h` at
+// all. Accumulates into `h`'s UPPER triangle only (`k * k`, `k == cin_slice
+// * attrs.kh * attrs.kw`) -- mirrored into the lower triangle once, after
+// every batch, by the caller, exactly like SparseGptHessianStats' own
+// accumulation.
+void ConvIm2ColAccumulateHessian(const std::vector<double>& x, int64_t n,
+                                 int64_t cin_total, int64_t in_h, int64_t in_w,
+                                 int64_t cin_offset, int64_t cin_slice,
+                                 const ConvSpatialAttrs& attrs,
+                                 const std::array<int64_t, 4>& pads,
+                                 int64_t h_out, int64_t w_out,
+                                 std::vector<double>& h) {
+  const int64_t pad_top = pads[0];
+  const int64_t pad_left = pads[1];
+  const int64_t k = cin_slice * attrs.kh * attrs.kw;
+  // One output position's own flattened (in_channel, kh, kw) patch row --
+  // row-major in that order, matching pruning.py's own
+  // w.reshape(n, cin*kh*kw) column order exactly.
+  std::vector<double> row(static_cast<size_t>(k));
+  for (int64_t ni = 0; ni < n; ++ni) {
+    for (int64_t oh = 0; oh < h_out; ++oh) {
+      const int64_t h_base = oh * attrs.stride_h - pad_top;
+      for (int64_t ow = 0; ow < w_out; ++ow) {
+        const int64_t w_base = ow * attrs.stride_w - pad_left;
+        int64_t col = 0;
+        for (int64_t ci = 0; ci < cin_slice; ++ci) {
+          const int64_t c = cin_offset + ci;
+          for (int64_t i = 0; i < attrs.kh; ++i) {
+            const int64_t hh = h_base + i * attrs.dilation_h;
+            for (int64_t j = 0; j < attrs.kw; ++j) {
+              const int64_t ww = w_base + j * attrs.dilation_w;
+              double v = 0.0;
+              if (hh >= 0 && hh < in_h && ww >= 0 && ww < in_w) {
+                v = x[static_cast<size_t>(
+                    ((ni * cin_total + c) * in_h + hh) * in_w + ww)];
+              }
+              row[static_cast<size_t>(col++)] = v;
+            }
+          }
+        }
+        // h += outer(row, row), upper triangle only -- mirrors
+        // SparseGptHessianStats' own per-row accumulation loop exactly.
+        for (int64_t i = 0; i < k; ++i) {
+          const double ri = row[static_cast<size_t>(i)];
+          if (ri == 0.0) {
+            continue;
+          }
+          double* hrow = h.data() + i * k;
+          const double* rowp = row.data();
+          for (int64_t j = i; j < k; ++j) {
+            hrow[j] += ri * rowp[j];
+          }
+        }
+      }
+    }
+  }
+}
+
+// One 2-D Conv (ordinary/depthwise/general-grouped) SparseGPT candidate --
+// mirrors pruning.py's own `_match_conv_weight_only`'s
+// `(x_name, w_name)` plus the `group`/`cin_per_group`/`attrs` triple
+// `apply_sparsegpt_pruning`'s own `conv_group_info`/`conv_attrs` dicts key
+// by `w_name` separately.
+struct SparseGptConvCandidate {
+  std::string x_name;
+  std::string w_name;
+  int64_t group;
+  int64_t cin_per_group;
+  ConvSpatialAttrs attrs;
+};
+
+// One matched Conv layer's own per-group accumulated Hessians -- `h[g]` is
+// empty (unobserved -- mirrors pruning.py's own `h_accum[g] is None`
+// sentinel) until group `g`'s own Hessian has been observed on at least one
+// usable calibration batch, then always a dense, exactly symmetric `k * k`
+// row-major matrix (`k == cin_per_group * kh * kw`).
+struct ConvSparseGptHessian {
+  int64_t k = 0;
+  std::vector<std::vector<double>> h;
+};
+
+// The Conv analogue of SparseGptHessianStats above: accumulates each
+// matched Conv candidate's own per-group `H = patches.T @ patches`
+// (ConvIm2ColAccumulateHessian) incrementally, one calibration batch at a
+// time, rather than ever holding every batch's own unfolded patches at
+// once -- mirrors pruning.py's own `conv_h` accumulation exactly (see
+// `apply_sparsegpt_pruning`'s own body comment there). Keyed by each
+// candidate's own WEIGHT name (unlike SparseGptHessianStats, keyed by
+// activation name) -- mirrors pruning.py's own `conv_attrs`/`conv_h`
+// dicts: two Conv nodes can share one activation tensor with different
+// kernels/attributes, so the accumulated Hessian is a per-node, not a
+// per-activation, quantity.
+//
+// A separate probe-injection/batch-iteration/executor-call pass from
+// SparseGptHessianStats' own (reusing its established design, not its
+// code) -- ApplySparseGptPruning below calls this only when at least one
+// Conv candidate exists, at the cost of one extra full calibration pass
+// over `model` in that case (pruning.py's own single probe model covers
+// both statistics in one pass; this file's own established convention,
+// already followed by WandaCalibrationStats/SparseGptHessianStats
+// themselves, is one dedicated stats function per statistic kind, each
+// running its own pass -- a bounded, documented efficiency trade-off, not
+// a correctness concern).
+std::unordered_map<std::string, ConvSparseGptHessian> ConvSparseGptHessianStats(
+    const ModelExecutor& executor, const onnx::ModelProto& model,
+    const std::vector<SparseGptConvCandidate>& conv_candidates,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data) {
+  std::unordered_map<std::string, ConvSparseGptHessian> result;
+  if (conv_candidates.empty()) {
+    return result;
+  }
+
+  std::set<std::string> uniq_probe_names;
+  for (const auto& c : conv_candidates) {
+    uniq_probe_names.insert(c.x_name);
+  }
+  const std::vector<std::string> probe_names(uniq_probe_names.begin(),
+                                             uniq_probe_names.end());
+
+  onnx::ModelProto probe_model = model;
+  std::unordered_set<std::string> existing_outputs;
+  for (const auto& o : probe_model.graph().output()) {
+    existing_outputs.insert(o.name());
+  }
+  for (const auto& name : probe_names) {
+    if (existing_outputs.insert(name).second) {
+      probe_model.mutable_graph()->add_output()->set_name(name);
+    }
+  }
+
+  std::unordered_map<std::string, size_t> output_index;
+  for (int i = 0; i < probe_model.graph().output_size(); ++i) {
+    output_index.emplace(probe_model.graph().output(i).name(),
+                         static_cast<size_t>(i));
+  }
+  const auto& graph_inputs = probe_model.graph().input();
+
+  // Pre-size every candidate's own per-group Hessian slot list -- mirrors
+  // pruning.py's own `conv_h.setdefault(w_name, [None] * group)`, done once
+  // up front here since every candidate's own `group`/`k` is already known
+  // (unlike pruning.py's own lazy setdefault-on-first-batch, no functional
+  // difference either way).
+  for (const auto& c : conv_candidates) {
+    auto& acc = result[c.w_name];
+    acc.k = c.cin_per_group * c.attrs.kh * c.attrs.kw;
+    if (acc.h.empty()) {
+      acc.h.assign(static_cast<size_t>(c.group), std::vector<double>());
+    }
+  }
+
+  for (const auto& batch : calibration_data) {
+    std::vector<DLManagedTensorPtr> input_dls;
+    std::vector<const DLManagedTensor*> input_ptrs;
+    input_dls.reserve(static_cast<size_t>(graph_inputs.size()));
+    input_ptrs.reserve(static_cast<size_t>(graph_inputs.size()));
+    for (const auto& gi : graph_inputs) {
+      auto it = batch.find(gi.name());
+      if (it == batch.end()) {
+        throw std::invalid_argument(
+            "ApplySparseGptPruning: calibration batch is missing required "
+            "graph input '" +
+            gi.name() + "'");
+      }
+      input_dls.emplace_back(
+          onnxsim::dlpack::FromTensorProtoBorrowing(it->second));
+      input_ptrs.push_back(input_dls.back().get());
+    }
+
+    std::vector<DLManagedTensorPtr> outputs =
+        executor.Run(probe_model, input_ptrs);
+
+    // Cache each distinct probe name's own read-as-f64 activation + dims
+    // for this batch once -- multiple Conv candidates can share one
+    // x_name, mirroring pruning.py's own single `result[x_name]` read
+    // reused across every candidate that shares it.
+    std::unordered_map<std::string,
+                       std::pair<std::vector<double>, std::vector<int64_t>>>
+        batch_x;
+    for (const auto& name : probe_names) {
+      auto oit = output_index.find(name);
+      if (oit == output_index.end() || oit->second >= outputs.size()) {
+        continue;
+      }
+      const DLTensor& dl = outputs[oit->second]->dl_tensor;
+      onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
+      if (!IsSupportedFloatDtype(tp.data_type()) || tp.dims_size() != 4) {
+        continue;  // Mirrors pruning.py's own `if x_conv.ndim != 4: continue`.
+      }
+      std::vector<int64_t> dims(tp.dims().begin(), tp.dims().end());
+      batch_x.emplace(name,
+                      std::make_pair(ReadTensorAsF64(tp), std::move(dims)));
+    }
+
+    for (const auto& c : conv_candidates) {
+      auto xit = batch_x.find(c.x_name);
+      if (xit == batch_x.end()) {
+        continue;
+      }
+      const std::vector<double>& x = xit->second.first;
+      const std::vector<int64_t>& dims = xit->second.second;
+      const int64_t nn = dims[0];
+      const int64_t cin_total = dims[1];
+      const int64_t in_h = dims[2];
+      const int64_t in_w = dims[3];
+      if (cin_total != c.cin_per_group * c.group) {
+        continue;  // Not this node's own input -- mirrors pruning.py's own
+                   // `x_conv.shape[1] != cin_per_group * group` check.
+      }
+      const auto out_size = ConvOutputSpatialSize(c.attrs, in_h, in_w);
+      if (!out_size) {
+        continue;  // Mirrors pruning.py's own `if patches is None: continue`.
+      }
+      const std::array<int64_t, 4> pads = ResolveConvPads(c.attrs, in_h, in_w);
+      auto& acc = result.at(c.w_name);
+      for (int64_t g = 0; g < c.group; ++g) {
+        std::vector<double>& hg = acc.h[static_cast<size_t>(g)];
+        if (hg.empty()) {
+          hg.assign(static_cast<size_t>(acc.k * acc.k), 0.0);
+        }
+        ConvIm2ColAccumulateHessian(
+            x, nn, cin_total, in_h, in_w, g * c.cin_per_group, c.cin_per_group,
+            c.attrs, pads, out_size->first, out_size->second, hg);
+      }
+    }
+  }
+
+  // Mirror the accumulated upper triangle (including the diagonal) into the
+  // lower triangle, per group, so each `h[g]` is a fully-populated,
+  // exactly-symmetric dense matrix -- exactly like SparseGptHessianStats'
+  // own post-processing.
+  for (auto& [w_name, acc] : result) {
+    for (auto& hg : acc.h) {
+      if (hg.empty()) {
+        continue;
+      }
+      for (int64_t i = 0; i < acc.k; ++i) {
+        for (int64_t j = i + 1; j < acc.k; ++j) {
+          hg[static_cast<size_t>(j * acc.k + i)] =
+              hg[static_cast<size_t>(i * acc.k + j)];
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
 // SparseGPT (Frantar & Alistarh, 2023) unstructured/N:M pruning. The C++
 // port of pruning.py's own apply_sparsegpt_pruning -- see this file's own
 // "SparseGPT (unstructured / N:M) pruning" section comment above
@@ -21740,24 +22186,31 @@ onnx::ModelProto ApplySparseGptPruning(
   // pruning.py's own module docstring for the full reasoning on why this is
   // correct, not an oversight, for both).
   //
-  // 2-D Conv (ordinary/depthwise/general-grouped) is declined outright,
-  // NOT ported here -- see structured_pruning_entry.h's own
-  // ApplySparseGptPruning declaration comment for why (it needs an
-  // entirely new, from-first-principles im2col cross-covariance Hessian
-  // pruning.py's own module docstring documents at length, materially
-  // bigger than the rest of this pass, with no correct upstream reference
-  // to port from at all) -- a Conv node here simply never matches either
-  // case below and is left completely untouched, never guessed at. This
-  // remains the one open scope gap versus pruning.py's own
-  // apply_sparsegpt_pruning after this port's FLOAT16/BFLOAT16 widening --
-  // see this function's own declaration comment in
-  // structured_pruning_entry.h.
+  // 2-D Conv (ordinary/depthwise/general-grouped) is matched too, via
+  // _match_conv_weight_only's own criteria (op_type "Conv"/"FusedConv", no
+  // domain check -- mirrors pruning.py's own matcher exactly): a constant
+  // 4-D FLOAT/FLOAT16/BFLOAT16 [out_channels, in_channels/group, kh, kw]
+  // weight, `group >= 1`, and (when `group > 1`) `out_channels % group ==
+  // 0`. A node whose Conv attributes ResolveConvSpatialAttrs itself
+  // declines (a malformed `kernel_shape`, unrecognized `auto_pad`,
+  // non-positive `strides`/`dilations`, or a malformed explicit `pads`) is
+  // simply never added as a candidate at all -- left completely untouched,
+  // exactly the same end result pruning.py's own `conv_attrs[w_name] is
+  // None` check produces for a node that DOES enter its own candidate list
+  // but is then never given a Hessian (see this module's own docstring for
+  // Conv's own im2col cross-covariance Hessian and the per-group Hessian/
+  // column-processing split a grouped/depthwise Conv needs, and this
+  // file's own "SparseGPT Conv support" section comment immediately above
+  // for the C++ machinery: ResolveConvSpatialAttrs/ResolveConvPads/
+  // ConvOutputSpatialSize/ConvIm2ColAccumulateHessian/
+  // ConvSparseGptHessianStats).
   struct Candidate {
     std::string x_name;
     std::string w_name;
     bool weight_transposed;
   };
   std::vector<Candidate> candidates;
+  std::vector<SparseGptConvCandidate> conv_candidates;
   for (const auto& node : graph->node()) {
     auto mm = MatchMatMulLikeRaw(node);
     if (mm) {
@@ -21776,9 +22229,26 @@ onnx::ModelProto ApplySparseGptPruning(
       // MatchAttentionProducer's own comment), so it is matched exactly
       // like a non-transposed MatMul weight.
       candidates.push_back({node.input(0), am->weight, false});
+      continue;
+    }
+    if ((node.op_type() == "Conv" || node.op_type() == "FusedConv") &&
+        node.input_size() >= 2) {
+      auto wit = init_map.find(node.input(1));
+      if (wit != init_map.end() &&
+          IsSupportedFloatDtype(wit->second->data_type()) &&
+          wit->second->dims_size() == 4) {
+        const int64_t group = ConvGroupAttr(node);
+        if (group >= 1 && (group == 1 || wit->second->dims(0) % group == 0)) {
+          auto attrs = ResolveConvSpatialAttrs(node, *wit->second);
+          if (attrs) {
+            conv_candidates.push_back({node.input(0), node.input(1), group,
+                                       wit->second->dims(1), *attrs});
+          }
+        }
+      }
     }
   }
-  if (candidates.empty()) {
+  if (candidates.empty() && conv_candidates.empty()) {
     return out;
   }
 
@@ -21790,8 +22260,72 @@ onnx::ModelProto ApplySparseGptPruning(
                                              uniq_probe_names.end());
   const std::unordered_map<std::string, SparseGptHessian> hessians =
       SparseGptHessianStats(executor, out, probe_names, calibration_data);
+  const std::unordered_map<std::string, ConvSparseGptHessian> conv_hessians =
+      ConvSparseGptHessianStats(executor, out, conv_candidates,
+                                calibration_data);
 
   MutInitMap mut_init_map = BuildMutInitMap(graph);
+  for (const auto& c : conv_candidates) {
+    auto hit = conv_hessians.find(c.w_name);
+    if (hit == conv_hessians.end()) {
+      continue;
+    }
+    // Every group's own H must have been observed -- a layer with no
+    // usable calibration signal for any one group is left completely
+    // untouched, same as the non-Conv `hit == hessians.end()` check below
+    // (there is no data-free fallback, and no meaningful way to prune some
+    // groups' filters but not others). Mirrors pruning.py's own
+    // `if h_list is None or any(h is None for h in h_list): continue`.
+    bool any_group_unobserved = false;
+    for (const auto& hg : hit->second.h) {
+      if (hg.empty()) {
+        any_group_unobserved = true;
+        break;
+      }
+    }
+    if (any_group_unobserved) {
+      continue;
+    }
+
+    onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
+    const int64_t cout = w_init->dims(0);
+    const int64_t cin_per_group = w_init->dims(1);
+    const int64_t kh = w_init->dims(2);
+    const int64_t kw = w_init->dims(3);
+    const int32_t w_dtype = w_init->data_type();
+    // w's own [cout, cin_per_group, kh, kw] row-major layout is ALREADY
+    // exactly [cout, cin_per_group*kh*kw] once flattened -- unlike the
+    // MatMul/Attention path above, a Conv weight's output channel already
+    // lives on axis 0, so no transpose is needed either way (mirrors
+    // pruning.py's own unconditional `w.reshape(cout, cin_per_group*kh*kw)`
+    // Conv branch).
+    const std::vector<double> w_f64 = ReadTensorAsF64(*w_init);
+    const int64_t k = cin_per_group * kh * kw;
+    const int64_t filters_per_group = cout / c.group;
+
+    std::vector<double> w_new(static_cast<size_t>(cout * k));
+    for (int64_t g = 0; g < c.group; ++g) {
+      // Group g's own [filters_per_group, k] weight sub-block (rows
+      // [g*filters_per_group, (g+1)*filters_per_group)) is pruned
+      // independently against its own group's H -- mirrors pruning.py's
+      // own per-group `_sparsegpt_prune_columns` call exactly (see this
+      // module's own docstring for why a column-masking decision and its
+      // downstream error compensation only make sense within one group's
+      // own consistent Hessian/weight coordinate system).
+      const auto row_begin = w_f64.begin() + static_cast<std::ptrdiff_t>(
+                                                 g * filters_per_group * k);
+      const std::vector<double> w_sub(
+          row_begin,
+          row_begin + static_cast<std::ptrdiff_t>(filters_per_group * k));
+      const std::vector<double> pruned_sub = SparseGptPruneColumns(
+          w_sub, filters_per_group, k, hit->second.h[static_cast<size_t>(g)],
+          sparsity, n, m, percdamp, proc_block_size);
+      std::copy(pruned_sub.begin(), pruned_sub.end(),
+                w_new.begin() +
+                    static_cast<std::ptrdiff_t>(g * filters_per_group * k));
+    }
+    WriteF64TensorAs(w_init, w_dtype, {cout, cin_per_group, kh, kw}, w_new);
+  }
   for (const auto& c : candidates) {
     auto hit = hessians.find(c.x_name);
     if (hit == hessians.end()) {

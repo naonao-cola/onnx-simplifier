@@ -422,28 +422,54 @@ onnx::ModelProto ApplyTransformerBlockPruning(
 // local dtype-widened duplicate of the shared, still-FLOAT32-only
 // MatchAttentionProducer, which also backs this file's own structural
 // Attention-head pruning and was deliberately left untouched -- see that
-// function's own comment in structured_pruning_entry.cpp). Deliberately
-// narrower than pruning.py's own `apply_sparsegpt_pruning` in one remaining
-// way (previously two -- FLOAT16/BFLOAT16 support was closed in the same
-// round that added this comment, following this file's own established
-// MoE/QMoE FP16/BFLOAT16-widening precedent):
-//   - 2-D `Conv` (ordinary/depthwise/general-grouped) is NOT matched at
-//     all -- pruning.py's own Conv support needs an entirely new, from-
-//     first-principles im2col cross-covariance Hessian (`H = patches.T @
-//     patches`, plus a genuinely per-group Hessian/column-processing split
-//     for grouped/depthwise Conv) that pruning.py's own module docstring
-//     documents at length as having no correct upstream reference to port
-//     from at all (the original SparseGPT repository's own `add_batch`
-//     never actually exercises a Conv layer). Reaching that bar is
-//     materially bigger than the rest of this pass and was deliberately
-//     left out of scope for this port -- a Conv node here is left
-//     completely untouched (never guessed at, never crashes), exactly as
-//     if it were any other unmatched node type. THIS IS THE ONLY REMAINING
-//     SCOPE GAP versus pruning.py's own `apply_sparsegpt_pruning` -- until
-//     it closes, `apply_sparsegpt_pruning` itself must stay pure Python
-//     (not aliased to this port), since a Conv-bearing model would
-//     otherwise silently get a different (Conv-less) result from the two
-//     implementations.
+// function's own comment in structured_pruning_entry.cpp), PLUS every 2-D
+// `Conv`/`FusedConv` node (ordinary/depthwise/general-grouped alike) with a
+// constant 4-D FLOAT/FLOAT16/BFLOAT16 `[out_channels, in_channels/group,
+// kh, kw]` weight (`_match_conv_weight_only`'s own criteria: `group >= 1`,
+// and `out_channels % group == 0` when `group > 1` -- no domain check, same
+// as the Python original). Round-15's investigation concluded Conv support
+// was likely not safely portable, since pruning.py's own Conv Hessian
+// (`H = patches.T @ patches`, plus a genuinely per-group Hessian/column-
+// processing split for grouped/depthwise Conv) has no correct upstream
+// SparseGPT reference to port from or cross-check against at all (the
+// original repository's own `add_batch` never actually exercises a Conv
+// layer). Round 16 re-verified that conclusion from first principles by
+// actually reading pruning.py's own Conv implementation and its test
+// coverage end to end, and found the "no upstream reference" premise true
+// but NOT synonymous with "untestable": pruning.py's own module docstring
+// documents, and tests/test_pruning.py's own SparseGPT-Conv section
+// actually exercises, three independent verification legs -- (1) a brute-
+// force nested-loop oracle for the im2col Hessian itself, built a
+// completely different way (an explicit outer-product-per-output-position
+// triple loop, not any vectorized unfolding), for both the `group == 1`
+// and grouped/depthwise cases (the latter with deliberately different
+// per-group calibration statistics specifically so a bug sharing one
+// Hessian across groups, or mixing up which group's slice feeds which
+// filter rows, cannot accidentally pass on symmetric data); (2) a second,
+// independent transliteration of the reference implementation's own
+// `fasterprune` (`_reference_sparsegpt`, written fresh from
+// https://github.com/IST-DASLab/sparsegpt, not copied from pruning.py),
+// fed an independently-built (not `_conv_im2col_patches`) nested-loop
+// im2col unfold, confirmed to match pruning.py's own actual output exactly
+// for ordinary/grouped/depthwise Conv, both unstructured and N:M
+// sparsity, plus `auto_pad`/dilated variants; and (3) an end-to-end
+// onnxruntime reconstruction-error property (beats a same-mask, no-
+// compensation baseline) for both the `group == 1` and grouped cases. That
+// bar makes pruning.py's own Conv implementation trustworthy ground truth
+// to port and verify against numerically, the same way any other gap in
+// this file is closed, DESPITE having no upstream reference of its own --
+// so this port's own Conv machinery (ResolveConvSpatialAttrs/
+// ResolveConvPads/ConvOutputSpatialSize/ConvIm2ColAccumulateHessian/
+// ConvSparseGptHessianStats, structured_pruning_entry.cpp's own "SparseGPT
+// Conv support" section) was implemented and verified numerically against
+// `apply_sparsegpt_pruning` (exact agreement, essentially to floating-
+// point precision, across ordinary/depthwise/general-grouped Conv, both
+// unstructured and N:M sparsity, `auto_pad`, dilation, multiple Conv nodes
+// sharing one activation with different kernels, and `FusedConv` -- see
+// tests/test_sparsegpt_pruning_cpp.py's own Conv section) rather than left
+// out of scope. `apply_sparsegpt_pruning` itself is now a thin alias for
+// this port (see pruning.py's own docstring there) -- Conv is no longer a
+// remaining scope gap.
 //
 // Same real numerical linear algebra pruning.py's own `apply_sparsegpt_
 // pruning`/:mod:`onnxsim.gptq` needs, hand-written here rather than reused
@@ -488,12 +514,19 @@ onnx::ModelProto ApplyTransformerBlockPruning(
 // inputs, and a nested If/Loop/Scan/BeamSearch-family subgraph body has no
 // standalone way to be Run at all.
 //
-// A matched layer with no observed 2-D-or-higher-rank-with-a-trailing-
-// feature-axis calibration activation for its own input (dead input, an
-// otherwise-empty `calibration_data`, or every batch's own activation isn't
-// FLOAT/FLOAT16/BFLOAT16) is left completely untouched -- unlike Wanda,
-// there is no data-free fallback for a technique whose entire mechanism is
-// the Hessian.
+// A matched MatMul/Gemm/Attention layer with no observed 2-D-or-higher-
+// rank-with-a-trailing-feature-axis calibration activation for its own
+// input (dead input, an otherwise-empty `calibration_data`, or every
+// batch's own activation isn't FLOAT/FLOAT16/BFLOAT16) is left completely
+// untouched -- unlike Wanda, there is no data-free fallback for a
+// technique whose entire mechanism is the Hessian. A Conv node is
+// similarly left completely untouched if `ResolveConvSpatialAttrs` itself
+// declines it (a malformed `kernel_shape` disagreeing with the weight's
+// own shape, an unrecognized `auto_pad`, non-positive `strides`/
+// `dilations`, or a malformed explicit `pads`), or if even one of its
+// `group` groups never observes a usable 4-D activation of its own once
+// padded for that group's own kernel (a grouped/depthwise Conv is never
+// partially pruned).
 onnx::ModelProto ApplySparseGptPruning(
     const onnx::ModelProto& model, const ModelExecutor& executor,
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
