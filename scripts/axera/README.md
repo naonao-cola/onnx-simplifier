@@ -947,6 +947,63 @@ non-header/footer region of `AxQuantizedConv`'s own command at all,
 against a real production-scale finding (4-way spatial tiling) rather than
 a synthetic-model artifact.
 
+### Does this transfer to `resnet18d` itself? A negative result, and a bigger positive one
+
+The natural next question: does the periodic-field finding above, found on
+a tiny single-`Conv` synthetic model, actually show up inside a real,
+22-`Conv` model's mcode? Tested directly: edited `resnet18d_Opset18`'s own
+ONNX graph in place, changing exactly one real layer's
+(`/layer1/layer1.0/conv1/Conv`) `dilations` from `[1,1]` to `[2,2]`
+(padding adjusted to `[2,2,2,2]` to keep output shape, and therefore every
+downstream layer, identical), and rebuilt for real -- weights untouched, a
+purely structural edit. It compiled successfully (`max_cycle` 1,318,764 ->
+1,327,463, a plausible small increase for one costlier layer).
+
+**Negative result: the same-total-length trick that made the synthetic
+diff clean does not carry over.** Unlike the tiny model (where a careful
+padding choice reliably produced an identical total mcode length), editing
+one internal layer of a real 22-layer network changed the *whole* blob's
+length -- 49,080 -> 49,912 bytes. A second attempt (`dilation=3`, `pad=3`
+on the same layer) gave a third, still-different length (50,808). Neither
+of the two edited variants matches the baseline or each other, so the
+clean "diff the whole blob" technique that worked on the synthetic model
+doesn't directly apply here -- a single internal attribute change cascades
+into a differently-sized whole program in a way that (at least on the two
+tries attempted) doesn't coincidentally realign. This is itself a real,
+useful negative result: it bounds how far the synthetic-model technique
+generalizes on its own, without a smarter localization method or a lot of
+brute-force retrying.
+
+**A different technique gives a much bigger, and arguably more useful,
+positive result.** Since diffing two *different* builds didn't work
+cleanly, look for self-similarity *within* the one real, unmodified
+`resnet18d` mcode blob instead -- no second build needed. Scanning it for
+exact-duplicate byte windows (any substring that occurs more than once)
+turns up an amount of internal repetition that is astronomically
+impossible by chance: 1,225 distinct duplicated 32-byte windows (4,138
+total window instances, out of only ~49,000 possible positions -- for
+context, a truly random 49KB blob would have a vanishingly small chance of
+containing even one repeated 32-byte sequence, let alone thousands, since
+there are `256^32` possible values). Extending every matching seed to its
+maximal exact-duplicate run and merging overlaps gives a precise, real
+number: **21,289 of the blob's 49,080 bytes (43.4%) are byte-for-byte
+identical to some other span elsewhere in the same file**, including one
+exactly-matching run of 177 bytes (at offsets 278 and 10,994) and dozens
+more in the 40-90 byte range.
+
+This is real, direct, large-scale confirmation of the shared-command-
+template hypothesis the tiny synthetic model first suggested (the 94-byte/
+60-byte blocks repeated exactly twice, one guess being "once per compute
+engine") -- just demonstrated a different way, and at a scale (43% of a
+real model's mcode) that makes clear most of a real compiled program's
+bytes are copies of other bytes in the same file, not each independently
+carrying unique information. It does **not** mean 43% of mcode is
+*understood* -- none of these repeated templates have been decoded either,
+this only establishes that they repeat -- but it substantially shrinks the
+amount of genuinely distinct content anyone would need to decode to cover
+the rest: on this evidence, well under 49,080 bytes' worth of *distinct*
+templates, not 49,080 bytes of independent unique data.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
