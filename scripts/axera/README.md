@@ -650,6 +650,65 @@ headers are the *host API* around dot-neu, not dot-neu's own internal
 format), but it resolves what several previously-separate, only-inferred
 pieces of terminology actually mean and how they relate to each other.
 
+### Applying the new vocabulary to a real `.axmodel`, and a real mcode-size finding
+
+With "dot-neu / mcode / Wbt / ringbuffer" now understood as real terms (not
+this project's own labels), re-examining a freshly-built real `.axmodel`
+confirms the mapping directly: the `<neu_key>`-named `graph.initializer`
+blob this README has been calling "the compiled program" **is mcode**, and
+`npu_params` **is the Wbt** (Weight Table). `AX_ENGINE_CMM_INFO`/
+`AX_JOINT_MODEL_CMM_INFO` (the AX650-era public structs, checked directly
+against this host's real `axcl_npu_type.h`) only expose a single aggregate
+`nCMMSize` -- the older SDK's four-way mcode/CvPreProcessMcode/Wbt/Ringbuffer
+breakdown isn't in the public host API for this generation, so the mapping
+below comes from directly instrumenting real builds, not a queryable API.
+(`axcl_ut_npu`'s own `Case12_AXCL_ENGINE_GetCMMUsage` test exists and passes
+against a real device, confirming the call works at all, but reveals nothing
+about the finer split without writing a custom harness -- not attempted,
+low expected value for real device-state risk.)
+
+**Wbt scales exactly linearly, 1280 bytes per identical op**: compiling ten
+otherwise-identical single-input-single-output graphs with 1 through 10
+sequential `Conv` layers (same shape throughout, `pads=[1,1,1,1]` to keep
+every intermediate the same size) gives `npu_params` sizes of 1320, 2600,
+3880, 5160, 6440, ... -- **every consecutive delta is exactly 1280 bytes**.
+Confirms Wbt really is what its name says: a flat, uncompressed,
+one-record-per-op concatenation of quantized weight (+ scale/bias) data,
+not a smarter const-data store.
+
+**mcode does *not* scale linearly -- but every delta is an exact multiple of
+32 bytes**: the same ten builds' mcode (`<neu_key>` blob) sizes are 2984,
+3248, 3408, 3440, 3568, 3600, 3728, 3792, 3888, 3920. Deltas from the second
+step onward: 160, 32, 128, 32, 128, 64, 96, 32 -- every single one is `32 *
+{1,2,3,4,5}`, never an in-between value, across 8 independent
+measurements. (The very first delta, 2984 -> 3248 = 264, breaks the
+pattern -- plausibly a one-time structural cost specific to a trivial
+single-op graph, not re-tested further.) This is real, repeatable
+structure: **mcode's command queue appears to allocate in 32-byte-aligned
+units, with a variable (not fixed) number of units assigned per identical
+op** -- consistent with `cmdq_write_instruct` emitting a different number
+of queue entries per instance of the same op depending on scheduling
+context (buffer/sync setup needs), rather than one fixed-size record per
+op the way Wbt's constant stride would suggest.
+
+**The growing region is not a simple append, even though the graph only
+grows by appending one more `Conv`**: diffing consecutive builds' mcode
+byte-for-byte finds only a **36-byte common prefix** (matches this
+README's own already-decoded FlatBuffers root-table + vtable header) and a
+**158-byte common suffix** (the tail string table, consistent with
+FlatBuffers' bottom-up construction convention already documented above) --
+identical across every pair tested. Everything in between differs
+completely, even for the *unchanged* first N-1 conv layers' commands, not
+just the newly-added one. Pulsar2's compiler re-serializes/re-addresses
+essentially the whole command stream on any topology change (consistent
+with cmdq entries containing absolute buffer addresses, job IDs, or
+OCM-residency decisions that legitimately do shift when one more op is
+added anywhere in the graph) rather than treating mcode as an append-only
+log. This bounds what future differential analysis targeting the cmdq
+record format itself can assume: byte-position stability across even
+trivially-different graphs cannot be relied on outside the fixed
+header/footer.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
