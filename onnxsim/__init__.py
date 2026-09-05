@@ -83,6 +83,7 @@ from onnxsim.mlir_export import export_mlir
 from onnxsim.moequant import apply_moequant
 from onnxsim.mx_quantization import MXFP4_CODEBOOK, quantize_weight_only_mxfp4
 from onnxsim.nf4 import NF4_CODEBOOK, quantize_weight_only_nf4
+from onnxsim.norm_tweaking import apply_norm_tweaking
 from onnxsim.olive import quantize_weight_only_olive
 from onnxsim.omniquant import apply_omniquant
 from onnxsim.onnx_simplifier import (
@@ -233,6 +234,7 @@ __all__ = [
     "apply_dac",
     "apply_llm_int8",
     "apply_low_rank_compensation",
+    "apply_norm_tweaking",
     "MemoryPlan",
     "plan_activation_memory",
     "print_memory_plan",
