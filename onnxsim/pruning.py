@@ -22650,10 +22650,30 @@ def _find_sparse_attention_chains(
 #   makes no MHA/GQA distinction, and this section's own combined-index-set
 #   slicing generalizes to any `nq`/`nk`/`nv` the same way the fused-node
 #   packed branch already does.
-# - Q/K-norm+RoPE pass-through is not recognized here -- a real, separate
-#   shape this section does not attempt; a graph combining it with this
-#   section's own decomposed shape (packed-producer or not) simply declines
-#   the match (never guessed at), same as any other unrecognized topology.
+# - Decomposed RoPE pass-through IS recognized here (see
+#   :func:`_match_decomposed_rope_pass_through`/
+#   :func:`_walk_back_through_decomposed_rope` and this module's own comment
+#   directly above :class:`_DecomposedRopePassThrough` for the confirmed
+#   topology): a real `torch.onnx.export()` of a Llama/Mistral/Qwen/Gemma-
+#   style eager-attention module applies HuggingFace's own
+#   `apply_rotary_pos_emb`/`rotate_half` -- genuinely decomposed math here,
+#   no fused rotary op at all -- to Q and to K independently, between each
+#   branch's own head-split `Transpose` and (for Q) the QK^T `MatMul`'s own
+#   Q input or (for K) wherever K's own dot-product transpose resolution
+#   expects its input (before `repeat_kv`, when both are present). Recognized
+#   and passed through untouched -- no tensor this hop owns is ever sliced
+#   or rewritten, since neither `cos`/`sin` nor `rotate_half`'s own `Slice`
+#   bounds ever carry a `num_heads`/`kv_num_heads`-sized axis (see
+#   :class:`_DecomposedRopePassThrough`'s own docstring) -- matched
+#   independently for Q and K (a chain with RoPE on only one of the two
+#   still matches; every real export applies it to both, but nothing here
+#   requires that). **Q/K-norm pass-through is deliberately NOT recognized
+#   here** -- a real, separate shape (only Qwen3/Gemma2-style architectures
+#   apply one, ahead of RoPE) left for a future, dedicated pass rather than
+#   bundled into this one, per this feature's own scope note; a graph
+#   combining a per-head Q/K-norm with this section's own decomposed shape
+#   (packed-producer or not, RoPE or not) simply declines the match (never
+#   guessed at), same as any other unrecognized topology.
 #   Cross-attention (Q's own source tensor distinct from K's/V's, including
 #   a genuinely different `seq_len` between the two) *is* recognized here,
 #   despite an earlier draft of this comment claiming otherwise: neither
@@ -22790,6 +22810,24 @@ class _DecomposedGQAChain:
     # `nq + nk + nv` real output width) :func:`_apply_one_decomposed_gqa_chain`
     # rewrites post-pruning via the same `_rewrite_shape_dim` clone-safety
     # helper every other shape constant this chain owns already uses.
+    q_rope: Optional["_DecomposedRopePassThrough"] = None
+    k_rope: Optional["_DecomposedRopePassThrough"] = None
+    # Set exactly when :func:`_walk_back_through_decomposed_rope` crossed a
+    # decomposed RoPE application on Q's/K's own branch, between that
+    # branch's own head-split `Transpose` output and (for Q) the QK^T
+    # `MatMul`'s own Q input or (for K) wherever K's own dot-product
+    # transpose resolution expects its input -- see this module's own
+    # comment above :class:`_DecomposedRopePassThrough` for the exact
+    # topology and why it needs no slicing of any kind, unlike every other
+    # field this class names. Matched independently for Q and K (never
+    # required together) -- both are always present in a real RoPE-using
+    # export, but nothing here ties one branch's match to the other's, the
+    # same "independently None/set" treatment `k_repeat_kv`/`v_repeat_kv`
+    # already get. `k_rope` is always `None` when `k_headsplit_transpose`
+    # is (the combined-`perm=[0, 2, 3, 1]` shape) -- RoPE's own nodes
+    # always break the `Transpose`-`Transpose` adjacency that combined
+    # shape requires (see :func:`_find_decomposed_gqa_chains`'s own comment
+    # at its `k_perm` dispatch).
 
 
 # Either kind of matched whole-KV-group-pruned chain -- :func:`_gqa_group_importance`'s
@@ -23228,6 +23266,355 @@ def _resolve_decomposed_qk_root(
     return qk_matmul, mask_node, mask_operand, scale_node
 
 
+# Decomposed (un-fused) RoPE pass-through -- the decomposed-shape analogue of
+# :func:`_walk_back_through_qk_norm_rope`'s own `RotaryEmbedding`/
+# `MRotaryEmbedding` hop, for the genuinely different topology a plain
+# `torch.onnx.export()` of a Llama/Mistral/Qwen/Gemma-style eager-attention
+# module emits: there is no fused rotary op at all here, only HuggingFace's
+# own `apply_rotary_pos_emb`/`rotate_half` helpers decomposed into ordinary
+# ai.onnx nodes. Confirmed empirically (a hand-built module mirroring
+# `transformers.models.llama.modeling_llama`'s own `apply_rotary_pos_emb`/
+# `rotate_half`, `torch.onnx.export(..., opset_version=17, dynamo=False)`,
+# run through this module's own `onnxsim.simplify()` -- both a GQA/repeat_kv
+# case and a plain-MHA, no-repeat_kv case, since repeat_kv's presence turned
+# out not to affect this hop's own shape at all) to be the fixed, 7-node
+# sequence, applied identically and independently to Q and to K, each rooted
+# at that branch's own head-split `Transpose`'s output (`x`, the BHSD
+# tensor):
+#
+#     direct  = Mul(x, cos_operand)
+#     x1      = Slice(x, starts=[0],    ends=[half],      axes=[3], steps=[1])
+#     x2      = Slice(x, starts=[half], ends=[>= half],   axes=[3], steps=[1])
+#     neg     = Neg(x2)
+#     rotated_x = Concat(neg, x1, axis=-1_or_3)   # rotate_half(x) = cat(-x2, x1)
+#     rotated = Mul(rotated_x, sin_operand)
+#     result  = Add(direct, rotated)   # order confirmed: direct first, rotated second
+#
+# -- landing exactly on `result = x * cos + rotate_half(x) * sin`, HuggingFace's
+# own fixed formula, with `rotate_half`'s own `Slice` bounds resolving to a
+# clean, contiguous, non-overlapping split of the trailing (`head_size`) axis
+# into two equal halves (`half * 2 == head_size`, confirmed once `head_size`
+# itself is known -- see :func:`_decomposed_rope_hop_is_consistent`, the
+# deferred check this hop shares the idiom of with
+# :func:`_qk_norm_rope_hop_is_consistent`). `cos_operand`/`sin_operand` are
+# never inspected further -- confirmed to be, in different real exports,
+# either a graph input, a `Constant`, or fed by further upstream ops (e.g. a
+# `position_ids`-derived `Gather`); every one of those is safely treated as
+# one opaque per-position/per-half-head-dim operand this pass never needs to
+# resolve, since neither ever carries a `num_heads`/`kv_num_heads`-sized axis
+# to slice (broadcast over heads, sliced only along `head_size`, which whole-
+# head/KV-group pruning never touches). `cos_operand`/`sin_operand` are also
+# routinely the exact same shared tensor for Q's and K's own hop (confirmed
+# empirically -- both branches read `cos`/`sin` identically) -- harmless,
+# since neither is ever read by more than this fan-out, and neither is ever
+# written to.
+#
+# `x` itself (this branch's own pre-RoPE head-split `Transpose` output) is
+# read by exactly three consumers once RoPE is present -- the `direct` `Mul`
+# and both `Slice`s -- one more than the ordinary "single consumer" bar every
+# other hop in this section holds its own root to; checked explicitly here
+# (never guessed at) since fan-out any different from exactly this shape
+# means something this pass doesn't understand is also reading `x`.
+#
+# Q's and K's own matched node groups never share a single node with each
+# other (confirmed empirically -- distinct `Mul`/`Slice`/`Neg`/`Concat`/`Add`
+# nodes for each, operating on each branch's own distinct tensor), so no
+# `extra_stale_outputs`-style bookkeeping (:class:`_QKNormRopePassThrough`'s
+# own field for the *fused* family's analogous `GemmaRotaryEmbedding` sharing
+# case) is ever needed here.
+#
+# Unlike every hop :class:`_QKNormRopePassThrough` names, NOTHING here is a
+# shape constant carrying a literal head count: `cos_operand`/`sin_operand`
+# are per-position/per-half-head-dim (never per-head), and the `Slice` bounds
+# are fixed in terms of `head_size` alone, which whole-head/KV-group pruning
+# never changes -- only `num_heads`/`kv_num_heads` do. So this hop needs zero
+# rewriting of any kind post-pruning; :class:`_DecomposedRopePassThrough`
+# exists purely to name the matched nodes for stale-`value_info` bookkeeping,
+# the same purpose :class:`_QKNormRopePassThrough`'s own `nodes` field serves.
+@dataclass(frozen=True)
+class _DecomposedRopePassThrough:
+    """One matched Q- or K-branch decomposed RoPE application -- see this
+    module's own comment directly above for the exact topology and the
+    empirical confirmation behind it. `nodes` lists every node crossed (the
+    `Add`, both `Mul`s, the `Concat`/`Neg`/both `Slice`s of `rotate_half`, in
+    that order), purely for :func:`_apply_one_decomposed_gqa_chain`'s own
+    stale-`value_info` bookkeeping -- none of them ever need editing (see
+    this module's own comment above for why). `half` is the confirmed
+    `rotate_half` split point (`x1`'s own `Slice`'s `ends[0]`), threaded
+    through purely for :func:`_decomposed_rope_hop_is_consistent`'s own
+    deferred `half * 2 == head_size` check, run once `head_size` itself is
+    known (see that function's own docstring for why this can't be checked
+    any earlier -- the same deferred idiom :func:`_qk_norm_rope_hop_is_consistent`
+    already uses for the *fused* family's own analogous hop).
+    """
+
+    nodes: Tuple[onnx.NodeProto, ...]
+    half: int
+
+
+def _match_decomposed_rotate_half_slice(
+    name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> Optional[
+    Tuple[onnx.NodeProto, onnx.NodeProto, onnx.NodeProto, onnx.NodeProto, str, int]
+]:
+    """Resolves `name` (already confirmed by the caller to be internal)
+    backward through the textbook HuggingFace ``rotate_half`` -- ``Concat(Neg(Slice(x,
+    second_half)), Slice(x, first_half), axis=-1)`` -- see this module's own
+    comment above :class:`_DecomposedRopePassThrough` for the exact
+    confirmed shape. Both ``Slice``s must share the identical root `x` and
+    resolve to a contiguous, non-overlapping, ``axes=[3]``-or-``[-1]``,
+    ``steps=[1]`` split (first half starting at 0, second half starting
+    exactly where the first ends and reaching at least that same point) --
+    the actual ``half * 2 == head_size`` cleanliness check is deferred to
+    :func:`_decomposed_rope_hop_is_consistent`, the same idiom
+    :func:`_match_decomposed_head_split` already defers its own shape
+    constant's fan-out safety to the caller for.
+
+    Returns ``(concat, neg, slice_first_half, slice_second_half, root_name,
+    half)`` on a match, ``None`` otherwise -- including whenever `name` isn't
+    produced by exactly this shape (a `Split`-based half, like
+    :func:`_match_rotate_half` matches for `GemmaRotaryEmbedding`'s own
+    output side, is a genuinely different topology and is not matched here).
+    """
+
+    def _is_internal(n: str) -> bool:
+        return len(consumers_of.get(n, [])) == 1 and n not in graph_outputs
+
+    concat = node_by_output.get(name)
+    if (
+        concat is None
+        or concat.domain != ""
+        or concat.op_type != "Concat"
+        or len(concat.input) != 2
+        or not concat.input[0]
+        or not concat.input[1]
+        or len(concat.output) != 1
+        or concat.output[0] != name
+    ):
+        return None
+    concat_axis = None
+    for attr in concat.attribute:
+        if attr.name == "axis":
+            concat_axis = attr.i
+    if concat_axis not in (-1, 3):
+        return None
+
+    neg_out, x1_out = concat.input
+    if neg_out == x1_out or not _is_internal(neg_out):
+        return None
+    neg = node_by_output.get(neg_out)
+    if (
+        neg is None
+        or neg.domain != ""
+        or neg.op_type != "Neg"
+        or len(neg.input) != 1
+        or not neg.input[0]
+        or len(neg.output) != 1
+        or neg.output[0] != neg_out
+    ):
+        return None
+    x2_out = neg.input[0]
+    if not x2_out or not _is_internal(x2_out):
+        return None
+
+    def _match_half_slice(
+        out_name: str,
+    ) -> Optional[Tuple[onnx.NodeProto, str, int, int]]:
+        s = node_by_output.get(out_name)
+        if (
+            s is None
+            or s.domain != ""
+            or s.op_type != "Slice"
+            or len(s.input) != 5
+            or not all(s.input)
+            or len(s.output) != 1
+            or s.output[0] != out_name
+        ):
+            return None
+        data_name, starts_n, ends_n, axes_n, steps_n = s.input
+        if not data_name:
+            return None
+        consts = [initializer_map.get(n) for n in (starts_n, ends_n, axes_n, steps_n)]
+        if any(c is None or c.data_type != onnx.TensorProto.INT64 for c in consts):
+            return None
+        starts, ends, axes, steps = (onnx.numpy_helper.to_array(c) for c in consts)
+        if (
+            starts.shape != (1,)
+            or ends.shape != (1,)
+            or axes.shape != (1,)
+            or steps.shape != (1,)
+        ):
+            return None
+        if int(axes[0]) not in (-1, 3) or int(steps[0]) != 1:
+            return None
+        return s, data_name, int(starts[0]), int(ends[0])
+
+    slice1 = _match_half_slice(x1_out)  # expected: x[..., :half]
+    if slice1 is None:
+        return None
+    slice1_node, root1, start1, end1 = slice1
+    slice2 = _match_half_slice(x2_out)  # expected: x[..., half:]
+    if slice2 is None:
+        return None
+    slice2_node, root2, start2, end2 = slice2
+
+    if root1 != root2 or root1 in graph_outputs:
+        return None
+    if start1 != 0 or end1 <= 0 or start2 != end1 or end2 < end1:
+        return None
+
+    return concat, neg, slice1_node, slice2_node, root1, end1
+
+
+def _match_decomposed_rope_pass_through(
+    name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> Optional[Tuple[_DecomposedRopePassThrough, str]]:
+    """Resolves `name` (already confirmed by the caller to be internal --
+    exactly one consumer, not a graph output) backward through the fixed
+    7-node decomposed-RoPE shape :class:`_DecomposedRopePassThrough`'s own
+    docstring (and this module's own comment directly above it) describes.
+
+    Returns ``(hop, root_name)`` -- `root_name` the tensor immediately
+    upstream of every node crossed (expected, by the caller, to be this
+    branch's own head-split `Transpose` output) -- or ``None`` if `name`
+    isn't produced by exactly this shape, INCLUDING simply not being
+    produced by an ``Add`` at all (the common case for a chain with no RoPE
+    -- the caller falls back to treating `name` itself as the pre-RoPE root
+    when this declines, mirroring :func:`_match_decomposed_repeat_kv`'s own
+    "not this shape at all" fallback convention).
+    """
+
+    def _is_internal(n: str) -> bool:
+        return len(consumers_of.get(n, [])) == 1 and n not in graph_outputs
+
+    add = node_by_output.get(name)
+    if (
+        add is None
+        or add.domain != ""
+        or add.op_type != "Add"
+        or len(add.input) != 2
+        or not add.input[0]
+        or not add.input[1]
+        or len(add.output) != 1
+        or add.output[0] != name
+    ):
+        return None
+    a_name, b_name = add.input
+    if a_name == b_name:
+        return None
+
+    def _try_order(
+        direct_name: str, rotated_name: str
+    ) -> Optional[Tuple[_DecomposedRopePassThrough, str]]:
+        if not _is_internal(direct_name) or not _is_internal(rotated_name):
+            return None
+        mul_direct = node_by_output.get(direct_name)
+        mul_rotated = node_by_output.get(rotated_name)
+        for mul in (mul_direct, mul_rotated):
+            if (
+                mul is None
+                or mul.domain != ""
+                or mul.op_type != "Mul"
+                or len(mul.input) != 2
+                or not mul.input[0]
+                or not mul.input[1]
+                or len(mul.output) != 1
+            ):
+                return None
+        assert mul_direct is not None and mul_rotated is not None
+        if mul_direct.output[0] != direct_name or mul_rotated.output[0] != rotated_name:
+            return None
+
+        rot_a, rot_b = mul_rotated.input
+        for concat_name, sin_operand in ((rot_a, rot_b), (rot_b, rot_a)):
+            if concat_name == sin_operand or not _is_internal(concat_name):
+                continue
+            rotate_half = _match_decomposed_rotate_half_slice(
+                concat_name,
+                consumers_of,
+                graph_outputs,
+                node_by_output,
+                initializer_map,
+            )
+            if rotate_half is None:
+                continue
+            concat, neg, slice1, slice2, root_name, half = rotate_half
+
+            d_a, d_b = mul_direct.input
+            for root_cand, cos_operand in ((d_a, d_b), (d_b, d_a)):
+                if root_cand != root_name or root_cand == cos_operand:
+                    continue
+                # `root_name` must be read by exactly the three consumers
+                # this hop itself accounts for (the direct `Mul` plus both
+                # `Slice`s) -- see this module's own comment above
+                # :class:`_DecomposedRopePassThrough` for why this, unlike
+                # every other root this section's matchers resolve, is
+                # deliberately checked against 3 rather than 1.
+                if len(consumers_of.get(root_name, [])) != 3:
+                    continue
+                return (
+                    _DecomposedRopePassThrough(
+                        (add, mul_direct, mul_rotated, concat, neg, slice1, slice2),
+                        half,
+                    ),
+                    root_name,
+                )
+        return None
+
+    return _try_order(a_name, b_name) or _try_order(b_name, a_name)
+
+
+def _walk_back_through_decomposed_rope(
+    name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> Tuple[str, Optional[_DecomposedRopePassThrough]]:
+    """Thin wrapper around :func:`_match_decomposed_rope_pass_through`
+    mirroring :func:`_walk_back_through_qk_norm_rope`'s own ``(root_name,
+    hop)`` return convention -- ``(name, None)`` when no RoPE hop was
+    crossed, so the caller can call :func:`_match_decomposed_head_split` on
+    the result uniformly regardless of whether RoPE was present.
+    """
+    matched = _match_decomposed_rope_pass_through(
+        name, consumers_of, graph_outputs, node_by_output, initializer_map
+    )
+    if matched is None:
+        return name, None
+    hop, root_name = matched
+    return root_name, hop
+
+
+def _decomposed_rope_hop_is_consistent(
+    hop: Optional[_DecomposedRopePassThrough], head_size: int
+) -> bool:
+    """Deferred correctness check for a
+    :func:`_walk_back_through_decomposed_rope` result, run only once
+    `head_size` (this branch's own, resolved by the caller's own
+    :func:`_match_decomposed_head_split` call on the returned root) is
+    itself known -- the same deferred idiom
+    :func:`_qk_norm_rope_hop_is_consistent` already uses for the *fused*
+    family's own analogous hop. `True` (nothing to check) when `hop` is
+    ``None``. Otherwise requires the matched ``rotate_half``'s own split
+    point to be an exact, clean half of `head_size` (``hop.half * 2 ==
+    head_size``) -- declined (``False``), never guessed at, on any
+    mismatch (e.g. a `Slice` that isn't actually splitting `head_size` in
+    half at all).
+    """
+    if hop is None:
+        return True
+    return hop.half * 2 == head_size
+
+
 def _find_decomposed_gqa_chains(
     graph: onnx.GraphProto,
     value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
@@ -23301,6 +23688,16 @@ def _find_decomposed_gqa_chains(
 
         k_headsplit_transpose: Optional[onnx.NodeProto]
         k_repeat_kv: Optional[_RepeatKVBranch] = None
+        # RoPE, when present on K's own branch, always forces the separate-
+        # transpose form below: its own `Slice`/`Mul`/`Add` nodes sit
+        # between the head-split `Transpose` and the dot-product "swap"
+        # `Transpose`, breaking the node-adjacency PyTorch's own
+        # `fuseConsecutiveTransposes` peephole requires to collapse the two
+        # into this combined `perm=[0, 2, 3, 1]` shape (confirmed
+        # empirically -- see this module's own comment above
+        # :class:`_DecomposedRopePassThrough`) -- so this branch never
+        # crosses RoPE at all, `k_rope` stays `None` for it unconditionally.
+        k_rope: Optional[_DecomposedRopePassThrough] = None
         if k_perm == [0, 2, 3, 1]:
             k_split = _match_decomposed_head_split(
                 k_operand,
@@ -23336,8 +23733,11 @@ def _find_decomposed_gqa_chains(
                     k_bhsd_name,
                     None,
                 )  # resolved via head-split below
+            k_rope_root, k_rope = _walk_back_through_decomposed_rope(
+                k_raw_name, consumers_of, graph_outputs, node_by_output, initializer_map
+            )
             k_split = _match_decomposed_head_split(
-                k_raw_name,
+                k_rope_root,
                 consumers_of,
                 graph_outputs,
                 node_by_output,
@@ -23354,6 +23754,8 @@ def _find_decomposed_gqa_chains(
                 k_reshape_shape,
                 k_proj_out,
             ) = k_split
+            if not _decomposed_rope_hop_is_consistent(k_rope, head_size_k):
+                continue
             if kv_num_heads is None:
                 kv_num_heads = resolved_kv_heads
             elif kv_num_heads != resolved_kv_heads:
@@ -23371,8 +23773,11 @@ def _find_decomposed_gqa_chains(
         assert kv_num_heads is not None
 
         # ---- Q's own branch: plain head-split, never repeat_kv ----
+        q_rope_root, q_rope = _walk_back_through_decomposed_rope(
+            q_bhsd_name, consumers_of, graph_outputs, node_by_output, initializer_map
+        )
         q_split = _match_decomposed_head_split(
-            q_bhsd_name,
+            q_rope_root,
             consumers_of,
             graph_outputs,
             node_by_output,
@@ -23384,6 +23789,8 @@ def _find_decomposed_gqa_chains(
         q_transpose, q_reshape, num_heads, head_size, q_reshape_shape, q_proj_out = (
             q_split
         )
+        if not _decomposed_rope_hop_is_consistent(q_rope, head_size):
+            continue
         if head_size != head_size_k or num_heads <= 0 or kv_num_heads <= 0:
             continue
         if num_heads % kv_num_heads != 0:
@@ -23642,6 +24049,8 @@ def _find_decomposed_gqa_chains(
                 packed_split_sizes=packed_split_sizes,
                 packed_flatten_reshape=packed_flatten_reshape,
                 packed_flatten_reshape_shape=packed_flatten_reshape_shape,
+                q_rope=q_rope,
+                k_rope=k_rope,
             )
         )
     return chains
@@ -23948,6 +24357,15 @@ def _apply_one_decomposed_gqa_chain(
             stale.update(branch.unsqueeze.output)
             stale.update(branch.expand.output)
             stale.update(branch.merge_reshape.output)
+    # Q's/K's own decomposed RoPE pass-through, if either branch crossed one
+    # -- see this module's own comment above :class:`_DecomposedRopePassThrough`
+    # for why none of its own nodes ever need editing, only marking stale
+    # (every one of their own outputs is narrower after pruning, the same
+    # "nothing to rewrite, still stale" treatment `k_repeat_kv`/`v_repeat_kv`
+    # get for their own `unsqueeze`'s `axes` input).
+    for hop in (chain.q_rope, chain.k_rope):
+        if hop is not None:
+            stale.update(n.output[0] for n in hop.nodes if n.output and n.output[0])
 
     return (
         {chain.q_weight, chain.k_weight, chain.v_weight},
