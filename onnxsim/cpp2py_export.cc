@@ -782,20 +782,21 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
 
   // SparseGPT (Frantar & Alistarh, 2023) unstructured/N:M pruning: zeros
   // the least-important entries of every matched MatMul/vanilla-Gemm/
-  // com.microsoft::Attention merged-QKV-weight layer's constant 2-D
-  // FLOAT32/FLOAT16/BFLOAT16 weight, using a sequential, Hessian-error-
-  // compensating algorithm (GPTQ's own Cholesky-factored inverse Hessian
-  // reformulation) rather than a one-shot static importance score --
-  // unlike every pass above, this never changes any tensor's shape, only
-  // individual weight entries' own values. Same executor-as-first-argument,
-  // `calibration_data` (List[Dict[str, onnx.TensorProto]]) crossing
-  // convention as apply_structured_wanda_pruning's own binding above (see
-  // that binding's own comment for the full calibration-crossing design).
-  // `n`/`m` are `None` (unstructured, ranked by `sparsity`) or both given
-  // together (N:M semi-structured). See ApplySparseGptPruning in
-  // structured_pruning_entry.h for the full scope (in particular: 2-D Conv
-  // is NOT matched -- a deliberate, documented narrower-than-pruning.py
-  // scope decision, and the only remaining one).
+  // com.microsoft::Attention merged-QKV-weight/2-D Conv (ordinary/
+  // depthwise/general-grouped) layer's constant FLOAT32/FLOAT16/BFLOAT16
+  // weight, using a sequential, Hessian-error-compensating algorithm
+  // (GPTQ's own Cholesky-factored inverse Hessian reformulation) rather
+  // than a one-shot static importance score -- unlike every pass above,
+  // this never changes any tensor's shape, only individual weight entries'
+  // own values. Same executor-as-first-argument, `calibration_data`
+  // (List[Dict[str, onnx.TensorProto]]) crossing convention as
+  // apply_structured_wanda_pruning's own binding above (see that binding's
+  // own comment for the full calibration-crossing design). `n`/`m` are
+  // `None` (unstructured, ranked by `sparsity`) or both given together
+  // (N:M semi-structured). See ApplySparseGptPruning in
+  // structured_pruning_entry.h for the full scope, now at full parity with
+  // pruning.py's own `apply_sparsegpt_pruning` (itself now a thin alias for
+  // this port), Conv included.
   m.def(
       "apply_sparsegpt_pruning",
       [](std::shared_ptr<PyModelExecutor> executor,
