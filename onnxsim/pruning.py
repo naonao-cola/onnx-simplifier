@@ -17178,7 +17178,7 @@ def _slice_matmul_nbits_chain_consumer(
 @dataclass(frozen=True)
 class _MatMulNBitsChain:
     producer: _MatMulNBitsChainSide
-    chain_ops: Tuple[onnx.NodeProto, ...]
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
     consumer: _MatMulNBitsChainSide
     n_channels: int
 
@@ -17204,7 +17204,7 @@ class _MatMulNBitsGatedChain:
     producer_a_pre_ops: Tuple[onnx.NodeProto, ...]
     producer_b: _MatMulNBitsChainSide
     producer_b_pre_ops: Tuple[onnx.NodeProto, ...]
-    chain_ops: Tuple[onnx.NodeProto, ...]
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
     consumer: _MatMulNBitsChainSide
     n_channels: int
 
@@ -17216,25 +17216,75 @@ def _walk_to_matmul_nbits_consumer(
     graph_outputs: Set[str],
     n_channels: int,
     max_hops: int,
-) -> Optional[Tuple[_MatMulNBitsChainSide, Tuple[onnx.NodeProto, ...]]]:
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> Optional[
+    Tuple[_MatMulNBitsChainSide, Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]
+]:
     """From tensor `start` (a ``MatMulNBits`` OR plain-float MatMul/Gemm
     producer's own output), walks forward through shape-preserving unary
-    activations (`_UNARY_PASS_THROUGH`) with no other consumer anywhere
-    along the way, until EITHER a ``MatMulNBits`` consumer OR a plain-float
-    MatMul/vanilla-Gemm consumer (:func:`_match_plain_matmul_nbits_peer`)
-    is found whose input-channel count matches `n_channels` -- the
-    ``MatMulNBits``/plain-float union this section's own top comment
-    describes, the analogue of :func:`_walk_to_consumer_qdq`'s own float/
-    QDQ union but restricted to ``MatMulNBits``/plain-float (never QDQ).
-    No gated pair, no branch. Returns ``None`` if the walk runs out of
-    hops, hits a branch, or never reaches such a consumer. The caller
+    activations (`_UNARY_PASS_THROUGH`), a plain `_NORM_PASS_THROUGH_OPS`
+    node whose own `axis` normalizes exactly `cur`'s last axis (see that
+    constant's own comment, :func:`_norm_axis_is_last`, and
+    :func:`_norm_pass_through_const_names` -- mirrors
+    :func:`_walk_to_consumer`'s own identical single-node norm hop), or
+    either of the two *decomposed*, not-yet-fused norm sequences a raw
+    export emits instead of a fused `_NORM_PASS_THROUGH_OPS` node
+    (:func:`_match_decomposed_layer_norm_pass_through`/
+    :func:`_match_decomposed_rms_norm_pass_through`, reused verbatim, the
+    identical two matchers :func:`_walk_to_consumer` tries) -- with no other
+    consumer anywhere along the way, until EITHER a ``MatMulNBits`` consumer
+    OR a plain-float MatMul/vanilla-Gemm consumer
+    (:func:`_match_plain_matmul_nbits_peer`) is found whose input-channel
+    count matches `n_channels` -- the ``MatMulNBits``/plain-float union this
+    section's own top comment describes, the analogue of
+    :func:`_walk_to_consumer_qdq`'s own float/QDQ union but restricted to
+    ``MatMulNBits``/plain-float (never QDQ). No gated pair (self-gated
+    activation/tanh-GELU), no branch, no ``PRelu``/``Clip``/fused-bias-GELU
+    hop -- unlike :func:`_walk_to_consumer`, only the norm hop above is
+    added here. Returns ``None`` if the walk runs out of hops, hits a
+    branch, or never reaches such a consumer. The caller
     (:func:`_find_matmul_nbits_chains`) is responsible for discarding a
     plain-float-to-plain-float result -- that pairing is
     :func:`apply_structured_pruning`'s own job, not duplicated here.
+
+    `value_info_by_name`, when given, lets a positive-`axis`
+    `_NORM_PASS_THROUGH_OPS` hop confirm that axis against the tensor's own
+    known rank (:func:`_norm_axis_is_last`), mirroring
+    :func:`_walk_to_consumer`'s own identical parameter. Left ``None``, only
+    the unambiguous ``axis == -1`` case of that hop is still recognized.
     """
-    chain_ops: List[onnx.NodeProto] = []
+    chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
     cur = start
     for _hop in range(max_hops):
+        # Tried before the ordinary "exactly one consumer" dispatch below,
+        # since a decomposed LayerNorm/RMSNorm's own root tensor is read
+        # *twice* -- see :func:`_walk_to_consumer`'s own identical hop-0
+        # dispatch for why. Declines instantly (returns ``None`` from both
+        # matchers) whenever `cur` doesn't have exactly two consumers, so
+        # this costs an ordinary hop nothing.
+        ln_match = _match_decomposed_layer_norm_pass_through(
+            cur,
+            consumers_of,
+            initializer_map,
+            graph_outputs,
+            n_channels,
+            value_info_by_name,
+        )
+        if ln_match is None:
+            ln_match = _match_decomposed_rms_norm_pass_through(
+                cur,
+                consumers_of,
+                initializer_map,
+                graph_outputs,
+                n_channels,
+                value_info_by_name,
+            )
+        if ln_match is not None:
+            ln_out_name, ln_chain_ops = ln_match
+            chain_ops.extend(ln_chain_ops)
+            cur = ln_out_name
+            continue
+
         candidates = consumers_of.get(cur, [])
         if len(candidates) != 1:
             return None
@@ -17253,27 +17303,98 @@ def _walk_to_matmul_nbits_consumer(
                 return None
             return peer, tuple(chain_ops)
 
-        if not (
+        const_name: Optional[str] = None
+        extra_const_name: Optional[str] = None
+        if (
             nxt.op_type in _UNARY_PASS_THROUGH
             and list(nxt.input) == [cur]
             and len(nxt.output) == 1
         ):
+            pass
+        elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
+            if not nxt.input or nxt.input[0] != cur:
+                return None
+            if not _norm_axis_is_last(nxt, cur, value_info_by_name):
+                return None
+            names = _norm_pass_through_const_names(nxt, initializer_map)
+            if names is None:
+                return None
+            scale_name, bias_name = names
+            if initializer_map[scale_name].dims[-1] != n_channels:
+                return None
+            if (
+                bias_name is not None
+                and initializer_map[bias_name].dims[-1] != n_channels
+            ):
+                return None
+            # Training-only secondary outputs -- see
+            # :func:`_walk_to_consumer`'s own identical check on this same
+            # hop for why a consumed one is declined here.
+            if any(
+                nxt.output[i]
+                and (consumers_of.get(nxt.output[i]) or nxt.output[i] in graph_outputs)
+                for i in range(1, len(nxt.output))
+            ):
+                return None
+            const_name = scale_name
+            extra_const_name = bias_name
+        else:
             return None
+
         out2 = nxt.output[0]
-        if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+        if out2 in graph_outputs:
             return None
-        chain_ops.append(nxt)
-        cur = out2
+        # See :func:`_walk_to_consumer`'s own identical re-check: `out2`
+        # might itself be a decomposed LayerNorm/RMSNorm sequence's own root
+        # (read twice), which the ordinary single-consumer bar below would
+        # otherwise reject before the top-of-loop dispatch ever sees it.
+        ln_match = None
+        if len(consumers_of.get(out2, [])) != 1:
+            ln_match = _match_decomposed_layer_norm_pass_through(
+                out2,
+                consumers_of,
+                initializer_map,
+                graph_outputs,
+                n_channels,
+                value_info_by_name,
+            )
+            if ln_match is None:
+                ln_match = _match_decomposed_rms_norm_pass_through(
+                    out2,
+                    consumers_of,
+                    initializer_map,
+                    graph_outputs,
+                    n_channels,
+                    value_info_by_name,
+                )
+            if ln_match is None:
+                return None
+        chain_ops.append((nxt, const_name))
+        if extra_const_name is not None:
+            chain_ops.append((nxt, extra_const_name))
+        if ln_match is not None:
+            ln_out_name, ln_chain_ops = ln_match
+            chain_ops.extend(ln_chain_ops)
+            cur = ln_out_name
+        else:
+            cur = out2
     return None
 
 
-def _find_matmul_nbits_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsChain]:
+def _find_matmul_nbits_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_MatMulNBitsChain]:
     """The ``MatMulNBits`` analogue of :func:`_find_qdq_chains`: every
     producer/consumer pair connected by :func:`_walk_to_matmul_nbits_consumer`
     where AT LEAST ONE side is a ``MatMulNBits`` node (a plain-float-to-
     plain-float pair is :func:`apply_structured_pruning`'s own job, not
     duplicated here -- mirrors :func:`_find_qdq_chains`'s identical
     at-least-one-quantized filter).
+
+    `value_info_by_name`, when given, is threaded straight through to
+    :func:`_walk_to_matmul_nbits_consumer` -- see its own identical
+    parameter.
     """
     initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
@@ -17307,6 +17428,7 @@ def _find_matmul_nbits_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsChain]
             graph_outputs,
             n_channels,
             _MAX_CHAIN_HOPS,
+            value_info_by_name,
         )
         if found is None:
             continue
@@ -17382,6 +17504,7 @@ def _matmul_nbits_gated_channel_importance(
 
 def _find_matmul_nbits_gated_chains(
     graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
 ) -> List[_MatMulNBitsGatedChain]:
     """The ``MatMulNBits`` analogue of :func:`_find_qdq_gated_chains` (and,
     ultimately, of :func:`_find_gated_chains` itself): recognizes the same
@@ -17398,6 +17521,10 @@ def _find_matmul_nbits_gated_chains(
     single-producer case uses), requiring at least one of the three to
     actually be ``MatMulNBits`` (an all-plain-float triple is
     :func:`_find_gated_chains`'s own job, not duplicated here).
+
+    `value_info_by_name`, when given, is threaded straight through to
+    :func:`_walk_to_matmul_nbits_consumer` -- see its own identical
+    parameter.
     """
     initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
@@ -17475,7 +17602,13 @@ def _find_matmul_nbits_gated_chains(
             continue
 
         found = _walk_to_matmul_nbits_consumer(
-            out_name, initializer_map, consumers_of, graph_outputs, n_a, _MAX_CHAIN_HOPS
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_a,
+            _MAX_CHAIN_HOPS,
+            value_info_by_name,
         )
         if found is None:
             continue
@@ -17663,24 +17796,35 @@ def apply_structured_pruning_matmul_nbits(
         value_info_by_name = (
             top_value_info_by_name if graph is out.graph else _value_info_by_name(graph)
         )
-        chains = _find_matmul_nbits_chains(graph)
-        mlp_chains = _find_matmul_nbits_mlp_chains(graph)
+        initializer_map = _constant_map(graph)
+        chains = _find_matmul_nbits_chains(graph, value_info_by_name)
+        mlp_chains = _find_matmul_nbits_mlp_chains(graph, value_info_by_name)
         qkv_chains = _find_matmul_nbits_qkv_chains(graph, value_info_by_name)
-        gated_chains = _find_matmul_nbits_gated_chains(graph)
+        gated_chains = _find_matmul_nbits_gated_chains(graph, value_info_by_name)
         if not chains and not mlp_chains and not qkv_chains and not gated_chains:
             continue
 
         producer_touched: Set[str] = set()
         consumer_touched: Set[str] = set()
+        const_touched: Set[str] = set()
         stale_value_info: Set[str] = set()
 
         for chain in chains:
             p, c = chain.producer, chain.consumer
             p_key = _matmul_nbits_chain_side_key(p)
             c_key = _matmul_nbits_chain_side_key(c)
+            consts = {
+                const_name
+                for _, const_name in chain.chain_ops
+                if const_name is not None
+            }
             if p_key == c_key:
                 continue  # degenerate (the same weight in both roles)
-            if p_key in producer_touched or c_key in consumer_touched:
+            if (
+                p_key in producer_touched
+                or c_key in consumer_touched
+                or (consts & const_touched)
+            ):
                 continue  # a shared/tied weight another chain already resized
 
             n = chain.n_channels
@@ -17719,23 +17863,33 @@ def apply_structured_pruning_matmul_nbits(
 
             _slice_matmul_nbits_chain_producer(p, keep)
             _slice_matmul_nbits_chain_consumer(c, consumer_keep)
+            for _, const_name in chain.chain_ops:
+                if const_name is not None:
+                    _slice_last_axis(initializer_map[const_name], keep)
 
             producer_touched.add(p_key)
             consumer_touched.add(c_key)
+            const_touched.update(consts)
             stale_value_info.add(p.node.output[0])
-            stale_value_info.update(op.output[0] for op in chain.chain_ops)
+            stale_value_info.update(op.output[0] for op, _ in chain.chain_ops)
 
         for gchain in gated_chains:
             pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
             pa_key = _matmul_nbits_chain_side_key(pa)
             pb_key = _matmul_nbits_chain_side_key(pb)
             c_key = _matmul_nbits_chain_side_key(c)
+            gconsts = {
+                const_name
+                for _, const_name in gchain.chain_ops
+                if const_name is not None
+            }
             if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
                 continue  # degenerate (a weight tied across two roles)
             if (
                 pa_key in producer_touched
                 or pb_key in producer_touched
                 or c_key in consumer_touched
+                or (gconsts & const_touched)
             ):
                 continue  # a shared/tied weight another chain already resized
 
@@ -17768,15 +17922,19 @@ def apply_structured_pruning_matmul_nbits(
             _slice_matmul_nbits_chain_producer(pa, keep)
             _slice_matmul_nbits_chain_producer(pb, keep)
             _slice_matmul_nbits_chain_consumer(c, consumer_keep)
+            for _, const_name in gchain.chain_ops:
+                if const_name is not None:
+                    _slice_last_axis(initializer_map[const_name], keep)
 
             producer_touched.add(pa_key)
             producer_touched.add(pb_key)
             consumer_touched.add(c_key)
+            const_touched.update(gconsts)
             stale_value_info.add(pa.node.output[0])
             stale_value_info.update(op.output[0] for op in gchain.producer_a_pre_ops)
             stale_value_info.add(pb.node.output[0])
             stale_value_info.update(op.output[0] for op in gchain.producer_b_pre_ops)
-            stale_value_info.update(op.output[0] for op in gchain.chain_ops)
+            stale_value_info.update(op.output[0] for op, _ in gchain.chain_ops)
 
         _apply_matmul_nbits_mlp_chains(
             graph,
@@ -17785,7 +17943,9 @@ def apply_structured_pruning_matmul_nbits(
             importance_norm,
             producer_touched,
             consumer_touched,
+            const_touched,
             stale_value_info,
+            initializer_map,
         )
         _apply_matmul_nbits_qkv_chains(
             graph,
@@ -27178,12 +27338,15 @@ def _matmul_nbits_mlp_gated_importance(
 @dataclass(frozen=True)
 class _MatMulNBitsMlpChain:
     producer: _MatMulNBitsMlpWeight
-    chain_ops: Tuple[onnx.NodeProto, ...]
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
     consumer: _MatMulNBitsChainSide
     n_channels: int
 
 
-def _find_matmul_nbits_mlp_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsMlpChain]:
+def _find_matmul_nbits_mlp_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_MatMulNBitsMlpChain]:
     """The ``MatMulNBitsMlp`` analogue of :func:`_find_matmul_nbits_chains`:
     every matched fused-gated-MLP node whose `Y` output feeds, through zero
     or more shape-preserving unary activations with no other consumer along
@@ -27191,7 +27354,14 @@ def _find_matmul_nbits_mlp_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsMl
     reusing :func:`_walk_to_matmul_nbits_consumer` verbatim, the exact same
     walk an ordinary single-``MatMulNBits``-producer chain uses (this fused
     node's own `Y` is no different a producer, from the consumer's own
-    point of view, than a plain ``MatMulNBits`` node's output).
+    point of view, than a plain ``MatMulNBits`` node's output) -- so this
+    automatically also gets that walk's own norm-hop recognition (a fused
+    `_NORM_PASS_THROUGH_OPS` node or either decomposed LayerNorm/RMSNorm
+    sequence) with no separate wiring of its own needed.
+
+    `value_info_by_name`, when given, is threaded straight through to
+    :func:`_walk_to_matmul_nbits_consumer` -- see its own identical
+    parameter.
     """
     initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
@@ -27209,7 +27379,13 @@ def _find_matmul_nbits_mlp_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsMl
         if not _is_internal(out_name):
             continue
         found = _walk_to_matmul_nbits_consumer(
-            out_name, initializer_map, consumers_of, graph_outputs, w.N, _MAX_CHAIN_HOPS
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            w.N,
+            _MAX_CHAIN_HOPS,
+            value_info_by_name,
         )
         if found is None:
             continue
@@ -27225,7 +27401,9 @@ def _apply_matmul_nbits_mlp_chains(
     importance_norm: str,
     producer_touched: Set[str],
     consumer_touched: Set[str],
+    const_touched: Set[str],
     stale_value_info: Set[str],
+    initializer_map: Dict[str, onnx.TensorProto],
 ) -> None:
     """Applies whole-output-channel pruning to every matched
     ``MatMulNBitsMlp`` chain in place -- co-slicing `gate`'s and `up`'s own
@@ -27235,18 +27413,28 @@ def _apply_matmul_nbits_mlp_chains(
     :func:`apply_structured_pruning_matmul_nbits`'s own per-chain loop
     exactly (block-alignment decline for a ``MatMulNBits`` consumer, direct
     application for a plain-float one). `producer_touched`/
-    `consumer_touched`/`stale_value_info` are the caller's own running sets,
-    shared across every ``MatMulNBits``-family chain kind so a tensor
-    played as one role by an earlier chain (of ANY of the three kinds) is
-    never resized twice.
+    `consumer_touched`/`const_touched`/`stale_value_info` are the caller's
+    own running sets, shared across every ``MatMulNBits``-family chain kind
+    so a tensor played as one role by an earlier chain (of ANY of the three
+    kinds) is never resized twice. `initializer_map` slices any norm
+    `scale`/`bias` a mid-chain hop carries (:func:`_slice_last_axis`), the
+    same way :func:`apply_structured_pruning_matmul_nbits`'s own per-chain
+    loop already does for its `chain_ops`.
     """
     for chain in chains:
         p, c = chain.producer, chain.consumer
         p_keys = {p.gate_b.name, p.up_b.name}
         c_key = _matmul_nbits_chain_side_key(c)
+        consts = {
+            const_name for _, const_name in chain.chain_ops if const_name is not None
+        }
         if c_key in p_keys:
             continue  # degenerate (the same weight in both roles)
-        if p_keys & producer_touched or c_key in consumer_touched:
+        if (
+            p_keys & producer_touched
+            or c_key in consumer_touched
+            or (consts & const_touched)
+        ):
             continue  # a shared/tied weight another chain already resized
 
         n = chain.n_channels
@@ -27277,11 +27465,15 @@ def _apply_matmul_nbits_mlp_chains(
         _slice_matmul_nbits_rows_no_zp(p.up_b, p.up_scales, p.up_bias, keep)
         _set_matmul_nbits_int_attr(p.node, "N", len(keep))
         _slice_matmul_nbits_chain_consumer(c, consumer_keep)
+        for _, const_name in chain.chain_ops:
+            if const_name is not None:
+                _slice_last_axis(initializer_map[const_name], keep)
 
         producer_touched.update(p_keys)
         consumer_touched.add(c_key)
+        const_touched.update(consts)
         stale_value_info.add(p.node.output[0])
-        stale_value_info.update(op.output[0] for op in chain.chain_ops)
+        stale_value_info.update(op.output[0] for op, _ in chain.chain_ops)
 
 
 def _walk_to_matmul_nbits_attention_consumer(
@@ -33217,7 +33409,7 @@ def _slice_dynquant_chain_consumer(
 @dataclass(frozen=True)
 class _DynQuantMatMulChain:
     producer: _DynQuantMatMulChainSide
-    chain_ops: Tuple[onnx.NodeProto, ...]
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
     consumer: _DynQuantMatMulChainSide
     n_channels: int
 
@@ -33229,24 +33421,74 @@ def _walk_to_dynquant_consumer(
     graph_outputs: Set[str],
     n_channels: int,
     max_hops: int,
-) -> Optional[Tuple[_DynQuantMatMulChainSide, Tuple[onnx.NodeProto, ...]]]:
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> Optional[
+    Tuple[_DynQuantMatMulChainSide, Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]
+]:
     """From tensor `start` (a `DynamicQuantizeMatMul`/`MatMulIntegerToFloat`
     OR plain-float MatMul/Gemm producer's own output), walks forward
-    through shape-preserving unary activations (`_UNARY_PASS_THROUGH`) with
-    no other consumer anywhere along the way, until EITHER a
-    `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` consumer OR a plain-float
-    MatMul/vanilla-Gemm consumer (:func:`_match_plain_matmul_nbits_peer`) is
-    found whose input-channel count matches `n_channels` -- mirrors
+    through shape-preserving unary activations (`_UNARY_PASS_THROUGH`), a
+    plain `_NORM_PASS_THROUGH_OPS` node whose own `axis` normalizes exactly
+    `cur`'s last axis (see that constant's own comment,
+    :func:`_norm_axis_is_last`, and :func:`_norm_pass_through_const_names`
+    -- mirrors :func:`_walk_to_consumer`'s own identical single-node norm
+    hop), or either of the two *decomposed*, not-yet-fused norm sequences a
+    raw export emits instead of a fused `_NORM_PASS_THROUGH_OPS` node
+    (:func:`_match_decomposed_layer_norm_pass_through`/
+    :func:`_match_decomposed_rms_norm_pass_through`, reused verbatim -- the
+    identical two matchers :func:`_walk_to_consumer`/
+    :func:`_walk_to_matmul_nbits_consumer` try), with no other consumer
+    anywhere along the way, until EITHER a `DynamicQuantizeMatMul`/
+    `MatMulIntegerToFloat` consumer OR a plain-float MatMul/vanilla-Gemm
+    consumer (:func:`_match_plain_matmul_nbits_peer`) is found whose
+    input-channel count matches `n_channels` -- mirrors
     :func:`_walk_to_matmul_nbits_consumer` closely (the identical
-    quantized-or-plain-float union), see this section's own top comment for
-    why. No gated pair, no branch. Returns ``None`` if the walk runs out of
-    hops, hits a branch, or never reaches such a consumer. The caller
-    (:func:`_find_dynquant_chains`) is responsible for discarding a plain-
-    float-to-plain-float result.
+    quantized-or-plain-float union, and now the identical norm hop too),
+    see this section's own top comment for why. No gated pair, no branch,
+    no ``PRelu``/``Clip``/fused-bias-GELU hop -- unlike
+    :func:`_walk_to_consumer`, only the norm hop above is added here.
+    Returns ``None`` if the walk runs out of hops, hits a branch, or never
+    reaches such a consumer. The caller (:func:`_find_dynquant_chains`) is
+    responsible for discarding a plain-float-to-plain-float result.
+
+    `value_info_by_name`, when given, lets a positive-`axis`
+    `_NORM_PASS_THROUGH_OPS` hop confirm that axis against the tensor's own
+    known rank (:func:`_norm_axis_is_last`), mirroring
+    :func:`_walk_to_matmul_nbits_consumer`'s own identical parameter. Left
+    ``None``, only the unambiguous ``axis == -1`` case of that hop is still
+    recognized.
     """
-    chain_ops: List[onnx.NodeProto] = []
+    chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
     cur = start
     for _hop in range(max_hops):
+        # Tried before the ordinary "exactly one consumer" dispatch below --
+        # see :func:`_walk_to_matmul_nbits_consumer`'s own identical hop-0
+        # dispatch for why (a decomposed LayerNorm/RMSNorm's own root tensor
+        # is read *twice*). Declines instantly whenever `cur` doesn't have
+        # exactly two consumers, so this costs an ordinary hop nothing.
+        ln_match = _match_decomposed_layer_norm_pass_through(
+            cur,
+            consumers_of,
+            initializer_map,
+            graph_outputs,
+            n_channels,
+            value_info_by_name,
+        )
+        if ln_match is None:
+            ln_match = _match_decomposed_rms_norm_pass_through(
+                cur,
+                consumers_of,
+                initializer_map,
+                graph_outputs,
+                n_channels,
+                value_info_by_name,
+            )
+        if ln_match is not None:
+            ln_out_name, ln_chain_ops = ln_match
+            chain_ops.extend(ln_chain_ops)
+            cur = ln_out_name
+            continue
+
         candidates = consumers_of.get(cur, [])
         if len(candidates) != 1:
             return None
@@ -33269,27 +33511,98 @@ def _walk_to_dynquant_consumer(
                 return None
             return peer, tuple(chain_ops)
 
-        if not (
+        const_name: Optional[str] = None
+        extra_const_name: Optional[str] = None
+        if (
             nxt.op_type in _UNARY_PASS_THROUGH
             and list(nxt.input) == [cur]
             and len(nxt.output) == 1
         ):
+            pass
+        elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
+            if not nxt.input or nxt.input[0] != cur:
+                return None
+            if not _norm_axis_is_last(nxt, cur, value_info_by_name):
+                return None
+            names = _norm_pass_through_const_names(nxt, initializer_map)
+            if names is None:
+                return None
+            scale_name, bias_name = names
+            if initializer_map[scale_name].dims[-1] != n_channels:
+                return None
+            if (
+                bias_name is not None
+                and initializer_map[bias_name].dims[-1] != n_channels
+            ):
+                return None
+            # Training-only secondary outputs -- see
+            # :func:`_walk_to_consumer`'s own identical check on this same
+            # hop for why a consumed one is declined here.
+            if any(
+                nxt.output[i]
+                and (consumers_of.get(nxt.output[i]) or nxt.output[i] in graph_outputs)
+                for i in range(1, len(nxt.output))
+            ):
+                return None
+            const_name = scale_name
+            extra_const_name = bias_name
+        else:
             return None
+
         out2 = nxt.output[0]
-        if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+        if out2 in graph_outputs:
             return None
-        chain_ops.append(nxt)
-        cur = out2
+        # See :func:`_walk_to_matmul_nbits_consumer`'s own identical
+        # re-check: `out2` might itself be a decomposed LayerNorm/RMSNorm
+        # sequence's own root (read twice), which the ordinary
+        # single-consumer bar below would otherwise reject before the
+        # top-of-loop dispatch ever sees it.
+        ln_match = None
+        if len(consumers_of.get(out2, [])) != 1:
+            ln_match = _match_decomposed_layer_norm_pass_through(
+                out2,
+                consumers_of,
+                initializer_map,
+                graph_outputs,
+                n_channels,
+                value_info_by_name,
+            )
+            if ln_match is None:
+                ln_match = _match_decomposed_rms_norm_pass_through(
+                    out2,
+                    consumers_of,
+                    initializer_map,
+                    graph_outputs,
+                    n_channels,
+                    value_info_by_name,
+                )
+            if ln_match is None:
+                return None
+        chain_ops.append((nxt, const_name))
+        if extra_const_name is not None:
+            chain_ops.append((nxt, extra_const_name))
+        if ln_match is not None:
+            ln_out_name, ln_chain_ops = ln_match
+            chain_ops.extend(ln_chain_ops)
+            cur = ln_out_name
+        else:
+            cur = out2
     return None
 
 
-def _find_dynquant_chains(graph: onnx.GraphProto) -> List[_DynQuantMatMulChain]:
+def _find_dynquant_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_DynQuantMatMulChain]:
     """Every producer/consumer pair connected by
     :func:`_walk_to_dynquant_consumer` where AT LEAST ONE side is a
     `DynamicQuantizeMatMul`/`MatMulIntegerToFloat` node (a plain-float-to-
     plain-float pair is :func:`apply_structured_pruning`'s own job, not
     duplicated here -- mirrors :func:`_find_matmul_nbits_chains`'s identical
     at-least-one-quantized filter).
+
+    `value_info_by_name`, when given, is threaded straight through to
+    :func:`_walk_to_dynquant_consumer` -- see its own identical parameter.
     """
     initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
@@ -33323,6 +33636,7 @@ def _find_dynquant_chains(graph: onnx.GraphProto) -> List[_DynQuantMatMulChain]:
             graph_outputs,
             n_channels,
             _MAX_CHAIN_HOPS,
+            value_info_by_name,
         )
         if found is None:
             continue
@@ -33402,23 +33716,38 @@ def apply_structured_pruning_dynamic_quantize_matmul(
         model = onnx.load(model, load_external_data=False)
     out = onnx.ModelProto()
     out.CopyFrom(model)
+    top_value_info_by_name = _shape_inferred_value_info_by_name(out)
 
     for graph in _iter_subgraphs(out.graph):
-        chains = _find_dynquant_chains(graph)
+        value_info_by_name = (
+            top_value_info_by_name if graph is out.graph else _value_info_by_name(graph)
+        )
+        initializer_map = _constant_map(graph)
+        chains = _find_dynquant_chains(graph, value_info_by_name)
         if not chains:
             continue
 
         producer_touched: Set[str] = set()
         consumer_touched: Set[str] = set()
+        const_touched: Set[str] = set()
         stale_value_info: Set[str] = set()
 
         for chain in chains:
             p, c = chain.producer, chain.consumer
             p_key = _dynquant_chain_side_key(p)
             c_key = _dynquant_chain_side_key(c)
+            consts = {
+                const_name
+                for _, const_name in chain.chain_ops
+                if const_name is not None
+            }
             if p_key == c_key:
                 continue  # degenerate (the same weight in both roles)
-            if p_key in producer_touched or c_key in consumer_touched:
+            if (
+                p_key in producer_touched
+                or c_key in consumer_touched
+                or (consts & const_touched)
+            ):
                 continue  # a shared/tied weight another chain already resized
 
             n = chain.n_channels
@@ -33436,11 +33765,15 @@ def apply_structured_pruning_dynamic_quantize_matmul(
 
             _slice_dynquant_chain_producer(p, keep)
             _slice_dynquant_chain_consumer(c, keep)
+            for _, const_name in chain.chain_ops:
+                if const_name is not None:
+                    _slice_last_axis(initializer_map[const_name], keep)
 
             producer_touched.add(p_key)
             consumer_touched.add(c_key)
+            const_touched.update(consts)
             stale_value_info.add(p.node.output[0])
-            stale_value_info.update(op.output[0] for op in chain.chain_ops)
+            stale_value_info.update(op.output[0] for op, _ in chain.chain_ops)
 
         if stale_value_info:
             kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
@@ -38356,10 +38689,10 @@ def _analyze_structured_pruning_matmul_nbits(
             if graph is model.graph
             else _value_info_by_name(graph)
         )
-        chains = _find_matmul_nbits_chains(graph)
-        mlp_chains = _find_matmul_nbits_mlp_chains(graph)
+        chains = _find_matmul_nbits_chains(graph, value_info_by_name)
+        mlp_chains = _find_matmul_nbits_mlp_chains(graph, value_info_by_name)
         qkv_chains = _find_matmul_nbits_qkv_chains(graph, value_info_by_name)
-        gated_chains = _find_matmul_nbits_gated_chains(graph)
+        gated_chains = _find_matmul_nbits_gated_chains(graph, value_info_by_name)
         not_eligible.extend(
             _matmul_nbits_not_eligible(
                 graph, chains, mlp_chains, qkv_chains, gated_chains
@@ -40516,11 +40849,17 @@ def _analyze_structured_pruning_dynamic_quantize_matmul(
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
 
+    top_value_info_by_name = _shape_inferred_value_info_by_name(model)
     layers: List[PruningLayerSensitivity] = []
     not_eligible: List[str] = []
 
     for graph in _iter_subgraphs(model.graph):
-        chains = _find_dynquant_chains(graph)
+        value_info_by_name = (
+            top_value_info_by_name
+            if graph is model.graph
+            else _value_info_by_name(graph)
+        )
+        chains = _find_dynquant_chains(graph, value_info_by_name)
         not_eligible.extend(_dynquant_not_eligible(graph, chains))
         if not chains:
             continue

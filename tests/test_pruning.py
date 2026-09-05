@@ -32110,6 +32110,208 @@ def test_matmul_nbits_pruning_producer_and_consumer_match_independent_reference_
     np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
 
 
+# --- MatMulNBits: mid-chain LayerNorm/RMSNorm pass-through -----------------
+#
+# Regression coverage mirroring the DynamicQuantizeMatMul section's own
+# identical addition (see its own top comment): `_walk_to_matmul_nbits_consumer`
+# previously recognized only `_UNARY_PASS_THROUGH` activations as a
+# mid-chain hop, never a `_NORM_PASS_THROUGH_OPS` node, so a real
+# ``MatMulNBits(mm1) -> LayerNormalization -> MatMulNBits(mm2)`` block was
+# silently left completely unpruned. Uses `onnx.helper`
+# (`_nbits_chain_norm_model`, mirroring `_nbits_chain_model` above) rather
+# than `onnx.parser` -- this section's own established pattern, since the
+# packed int4 ``B``/``scales``/``zero_points`` tensors need real array data
+# a parser text literal can't spell out (see this file's own top-of-section
+# comment for `_nbits_chain_model`).
+
+
+def _nbits_chain_norm_model(N1, K1, N2, block_size, W1, W2, norm_op, gamma, beta=None):
+    """Builds ``A -> MatMulNBits(mm1) -> norm_op(Gamma[, Beta]) ->
+    MatMulNBits(mm2) -> Y`` -- the norm-pass-through chain shape, both
+    MatMul nodes real, bit-packed int4-quantized ``com.microsoft::
+    MatMulNBits`` nodes. Mirrors :func:`_nbits_chain_model` exactly
+    (bits=4, packed zero_points), just with a mid-chain norm node standing
+    in for the plain activation. Returns ``(model, info)`` the same shape
+    :func:`_nbits_chain_model` does.
+    """
+    bits = 4
+    K2 = N1
+    assert K2 % block_size == 0
+    qcodes1, scales1, zp1, kb1 = _nbits_quantize_block(W1, block_size, bits)
+    qcodes2, scales2, zp2, kb2 = _nbits_quantize_block(W2, block_size, bits)
+    B1 = _nbits_pack_B(qcodes1, N1, kb1, block_size, bits)
+    B2 = _nbits_pack_B(qcodes2, N2, kb2, block_size, bits)
+
+    initializer = [
+        onnx.numpy_helper.from_array(B1, name="B1"),
+        onnx.numpy_helper.from_array(scales1, name="scales1"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp1, bits), name="zp1"),
+        onnx.numpy_helper.from_array(B2, name="B2"),
+        onnx.numpy_helper.from_array(scales2, name="scales2"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp2, bits), name="zp2"),
+        onnx.numpy_helper.from_array(gamma, name="Gamma"),
+    ]
+    norm_inputs = ["h1", "Gamma"]
+    if beta is not None:
+        initializer.append(onnx.numpy_helper.from_array(beta, name="Beta"))
+        norm_inputs.append("Beta")
+
+    node1 = _nbits_node(
+        "mm1", "A", "h1", "B1", "scales1", "zp1", None, N1, K1, block_size, bits
+    )
+    norm_node = onnx.helper.make_node(norm_op, norm_inputs, ["h1n"], axis=-1)
+    node2 = _nbits_node(
+        "mm2", "h1n", "Y", "B2", "scales2", "zp2", None, N2, K2, block_size, bits
+    )
+
+    M = 3
+    graph = onnx.helper.make_graph(
+        [node1, norm_node, node2],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [M, K1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [M, N2])
+        ],
+        initializer=initializer,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model, dict(
+        qcodes1=qcodes1,
+        scales1=scales1,
+        zp1=zp1,
+        kb1=kb1,
+        qcodes2=qcodes2,
+        scales2=scales2,
+        zp2=zp2,
+        kb2=kb2,
+        K2=K2,
+    )
+
+
+def test_matmul_nbits_layer_norm_pass_through_is_matched_and_prunes():
+    # N1=32 output channels, block_size=16 -- rows 0-15 engineered
+    # large-magnitude (kept), 16-31 small (dropped), so the L2-importance
+    # keep-set lands on exactly block 0, the same block-aligned setup
+    # `test_matmul_nbits_pruning_producer_and_consumer_match_independent_reference_oracle`
+    # above uses.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(300)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    gamma = (rng.standard_normal(N1) * 0.5 + 1.0).astype(np.float32)
+    beta = (rng.standard_normal(N1) * 0.1).astype(np.float32)
+
+    model, info = _nbits_chain_norm_model(
+        N1, K1, N2, block_size, W1, W2, "LayerNormalization", gamma, beta
+    )
+    onnx.checker.check_model(model)
+
+    # Before this section's own fix, this returned 0 chains.
+    chains = onnxsim.pruning._find_matmul_nbits_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == N1
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)  # expected keep-set: rows 0-15 (block 0)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["B1"].dims) == [16, info["kb1"], block_size * 4 // 8]
+    assert list(inits["Gamma"].dims) == [16]
+    assert list(inits["Beta"].dims) == [16]
+    assert list(inits["B2"].dims) == [N2, 1, block_size * 4 // 8]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Gamma"]), gamma[keep]
+    )
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["Beta"]), beta[keep])
+
+    # Independently-constructed, ALREADY-PRUNED reference model, mirroring
+    # this section's own oracle test above: re-quantizes W1[keep]/W2[:, keep]
+    # from float, a genuinely independent construction from the pass's own
+    # slice-of-existing-codes.
+    ref_model, _ = _nbits_chain_norm_model(
+        16,
+        K1,
+        N2,
+        block_size,
+        W1[keep],
+        W2[:, keep],
+        "LayerNormalization",
+        gamma[keep],
+        beta[keep],
+    )
+    onnx.checker.check_model(ref_model)
+
+    rng2 = np.random.default_rng(301)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"A": x})
+    (y_ref,) = _run(ref_model, {"A": x})
+    np.testing.assert_allclose(y_pruned, y_ref, rtol=1e-2, atol=1e-2)
+
+
+def test_matmul_nbits_rms_norm_pass_through_is_matched_and_prunes():
+    # `SimplifiedLayerNormalization` -- no `beta`/`Beta` input at all, unlike
+    # `LayerNormalization` above. `onnx.checker`'s own schema database
+    # doesn't know this op under the default domain at all (an
+    # onnxruntime-only registration, not a plain-ONNX one -- see
+    # `test_structured_pruning_simplified_layer_norm_pass_through_matches_oracle`'s
+    # own identical note), so `onnx.checker.check_model` is skipped here;
+    # onnxruntime itself still runs it fine, which the oracle comparison
+    # below actually exercises.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(302)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    gamma = (rng.standard_normal(N1) * 0.5 + 1.0).astype(np.float32)
+
+    model, info = _nbits_chain_norm_model(
+        N1, K1, N2, block_size, W1, W2, "SimplifiedLayerNormalization", gamma
+    )
+
+    chains = onnxsim.pruning._find_matmul_nbits_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == N1
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+
+    keep = np.arange(16)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["B1"].dims) == [16, info["kb1"], block_size * 4 // 8]
+    assert list(inits["Gamma"].dims) == [16]
+    assert list(inits["B2"].dims) == [N2, 1, block_size * 4 // 8]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Gamma"]), gamma[keep]
+    )
+
+    ref_model, _ = _nbits_chain_norm_model(
+        16,
+        K1,
+        N2,
+        block_size,
+        W1[keep],
+        W2[:, keep],
+        "SimplifiedLayerNormalization",
+        gamma[keep],
+    )
+
+    rng2 = np.random.default_rng(303)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"A": x})
+    (y_ref,) = _run(ref_model, {"A": x})
+    np.testing.assert_allclose(y_pruned, y_ref, rtol=1e-2, atol=1e-2)
+
+
 def test_matmul_nbits_pruning_producer_odd_kept_row_count_zero_points_has_no_repack_hazard():
     # This directly tests :func:`onnxsim.pruning._slice_matmul_nbits_producer_rows`
     # (rather than the public ``apply_structured_pruning_matmul_nbits``,
@@ -34991,6 +35193,73 @@ def test_matmul_nbits_mlp_pruning_matches_decomposed_oracle():
     y_ref = np.maximum(gate_ref, 0) * up_ref
 
     np.testing.assert_allclose(y_actual, y_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_mlp_norm_pass_through_is_matched_and_prunes():
+    # Confirms `_MatMulNBitsMlpChain` automatically inherits the norm-hop
+    # fix above with NO separate wiring of its own:
+    # `_find_matmul_nbits_mlp_chains` reuses `_walk_to_matmul_nbits_consumer`
+    # verbatim (see its own docstring), so a `LayerNormalization` node
+    # standing between `MatMulNBitsMlp`'s own `Y` and a downstream plain
+    # ``MatMul`` is recognized exactly like the plain single-producer chain
+    # case above, with no code change needed in this fused-op section at
+    # all.
+    N, K, N2, block_size = 8, 32, 5, 32
+    rng = np.random.default_rng(9101)
+    W_gate = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    W_up = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    W_gate[:4] *= 8.0
+    W_up[:4] *= 8.0
+    W_gate[4:] *= 0.05
+    W_up[4:] *= 0.05
+    bias_gate = (rng.standard_normal(N) * 0.05).astype(np.float32)
+    bias_up = (rng.standard_normal(N) * 0.05).astype(np.float32)
+    gamma = (rng.standard_normal(N) * 0.5 + 1.0).astype(np.float32)
+    beta = (rng.standard_normal(N) * 0.1).astype(np.float32)
+
+    model, info = _matmul_nbits_mlp_model(
+        N, K, N2, block_size, W_gate, W_up, bias_gate, bias_up
+    )
+    # Splice a `LayerNormalization(Gamma, Beta)` node between the fused
+    # MLP's own `Y` output and the downstream plain `MatMul(down)` --
+    # everything else about the model is identical to
+    # `_matmul_nbits_mlp_model`'s own construction.
+    down_node = next(n for n in model.graph.node if n.name == "down")
+    down_node.input[0] = "Yn"
+    norm_node = onnx.helper.make_node(
+        "LayerNormalization", ["Y", "Gamma", "Beta"], ["Yn"], axis=-1
+    )
+    model.graph.node.insert(1, norm_node)
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(gamma, name="Gamma"),
+            onnx.numpy_helper.from_array(beta, name="Beta"),
+        ]
+    )
+    onnx.checker.check_model(model)
+
+    # Before this section's own fix (via `_walk_to_matmul_nbits_consumer`),
+    # this returned 0 chains -- the norm node defeated the walk entirely.
+    mlp_chains = onnxsim.pruning._find_matmul_nbits_mlp_chains(model.graph)
+    assert len(mlp_chains) == 1
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.array([0, 1, 2, 3])
+    inits = {t.name: t for t in pruned.graph.initializer}
+    mlp_node = next(n for n in pruned.graph.node if n.name == "mlp")
+    assert next(a.i for a in mlp_node.attribute if a.name == "N") == 4
+    assert list(inits["Gamma"].dims) == [4]
+    assert list(inits["Beta"].dims) == [4]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Gamma"]), gamma[keep]
+    )
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["Beta"]), beta[keep])
+    assert list(inits["down_w"].dims) == [4, N2]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["down_w"]), info["down_w"][keep]
+    )
 
 
 def _matmul_nbits_qkv_model(
@@ -38854,6 +39123,218 @@ def test_dynamic_quantize_matmul_producer_matches_independently_requantized_subs
 
     rng = np.random.default_rng(11)
     x = rng.standard_normal((1, K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_ref,) = _run(ref_model, {"X": x})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+# --- DynamicQuantizeMatMul: mid-chain LayerNorm/RMSNorm pass-through -------
+#
+# Regression coverage for the gap the task that added this section closed:
+# `_walk_to_dynquant_consumer` previously recognized only
+# `_UNARY_PASS_THROUGH` activations as a mid-chain hop, never a
+# `_NORM_PASS_THROUGH_OPS` node -- so a real
+# ``DynamicQuantizeMatMul(W1) -> LayerNormalization -> DynamicQuantizeMatMul(W2)``
+# block (the single most common pre-LN transformer sub-block shape, now
+# quantized) was silently left completely unpruned: `_find_dynquant_chains`
+# returned zero chains for it. Mirrors `_walk_to_consumer`'s own established
+# norm-hop tests (see this file's own "mid-chain LayerNorm/RMSNorm
+# pass-through" section far above) but through a genuinely quantized
+# producer/consumer pair, weights quantized via the real `quantize_dynamic`
+# tool exactly like every other test in this section.
+
+
+def _dqmm_norm_model_from_weights(
+    K, N1, N2, W1f, W2f, norm_op, gamma, beta=None, per_channel=True, axis=-1
+):
+    """Builds ``DynamicQuantizeMatMul(mm1) -> norm_op(Gamma[, Beta]) ->
+    DynamicQuantizeMatMul(mm2)`` -- the norm-pass-through chain shape --
+    from explicit float weights, quantized via the real tool
+    (:func:`_quantize_dynamic_weight`). Mirrors
+    :func:`_dqmm_model_from_weights` exactly, just with a mid-chain norm
+    node (`LayerNormalization`/`SimplifiedLayerNormalization`) standing in
+    for the plain activation.
+    """
+    W1q, W1s, W1zp = _quantize_dynamic_weight(W1f, per_channel)
+    W2q, W2s, W2zp = _quantize_dynamic_weight(W2f, per_channel)
+
+    if beta is None:
+        norm_call = f"{norm_op}<axis={axis}>(h1, Gamma)"
+        norm_inits = [_f32(gamma, "Gamma")]
+    else:
+        norm_call = f"{norm_op}<axis={axis}>(h1, Gamma, Beta)"
+        norm_inits = [_f32(gamma, "Gamma"), _f32(beta, "Beta")]
+
+    body = f"""
+    g (float[1,{K}] X) => (float[1,{N2}] Y)
+    {{
+      h1 = com.microsoft.DynamicQuantizeMatMul(X, W1, W1_scale, W1_zero_point)
+      h1n = {norm_call}
+      Y = com.microsoft.DynamicQuantizeMatMul(h1n, W2, W2_scale, W2_zero_point)
+    }}
+    """
+    inits = [
+        onnx.numpy_helper.from_array(W1q, "W1"),
+        onnx.numpy_helper.from_array(W1s, "W1_scale"),
+        onnx.numpy_helper.from_array(W1zp, "W1_zero_point"),
+        *norm_inits,
+        onnx.numpy_helper.from_array(W2q, "W2"),
+        onnx.numpy_helper.from_array(W2s, "W2_scale"),
+        onnx.numpy_helper.from_array(W2zp, "W2_zero_point"),
+    ]
+    model = _model(body, initializer=inits, opset=21)
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    return model, {
+        "W1f": W1f,
+        "W2f": W2f,
+        "gamma": gamma,
+        "beta": beta,
+        "W1q": W1q,
+        "W1s": W1s,
+        "W1zp": W1zp,
+        "W2q": W2q,
+        "W2s": W2s,
+        "W2zp": W2zp,
+    }
+
+
+def test_dynamic_quantize_matmul_layer_norm_pass_through_is_matched_and_prunes():
+    K, N1, N2 = 16, 24, 12
+    rng = np.random.default_rng(41)
+    W1f = (rng.standard_normal((K, N1)) * 0.3).astype(np.float32)
+    W2f = (rng.standard_normal((N1, N2)) * 0.3).astype(np.float32)
+    gamma = (rng.standard_normal(N1) * 0.5 + 1.0).astype(np.float32)
+    beta = (rng.standard_normal(N1) * 0.1).astype(np.float32)
+    model, info = _dqmm_norm_model_from_weights(
+        K, N1, N2, W1f, W2f, "LayerNormalization", gamma, beta, per_channel=True
+    )
+    onnx.checker.check_model(model)
+
+    # Before this section's own fix, this returned 0 chains (the confirmed
+    # bug this task closes) -- a norm node mid-chain silently defeated the
+    # walk entirely.
+    chains = onnxsim.pruning._find_dynquant_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == N1
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    keep_count = N1 - round(N1 * 0.5)
+    keep = _dqmm_importance_keep(info["W1q"], info["W1s"], info["W1zp"], keep_count)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, keep_count]
+    assert list(inits["Gamma"].dims) == [keep_count]
+    assert list(inits["Beta"].dims) == [keep_count]
+    assert list(inits["W2"].dims) == [keep_count, N2]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Gamma"]), gamma[keep]
+    )
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["Beta"]), beta[keep])
+
+    # Independently reconstructed "already pruned" reference model, the same
+    # pattern this section's own oracle test above uses: the producer's
+    # kept-column weight is quantized FRESH via the real quantizer
+    # (per-channel quantization is column-independent, so this is
+    # byte-identical to slicing); the consumer's own codes are sliced
+    # directly and its scale/zero-point copied UNCHANGED.
+    ref_model, _ = _dqmm_norm_model_from_weights(
+        K,
+        keep_count,
+        N2,
+        W1f[:, keep],
+        W2f[keep, :],  # shape placeholder only -- overwritten below
+        "LayerNormalization",
+        gamma[keep],
+        beta[keep],
+        per_channel=True,
+    )
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    ref_inits["W2"].CopyFrom(onnx.numpy_helper.from_array(info["W2q"][keep, :], "W2"))
+    ref_inits["W2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2s"], "W2_scale")
+    )
+    ref_inits["W2_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2zp"], "W2_zero_point")
+    )
+
+    rng2 = np.random.default_rng(42)
+    x = rng2.standard_normal((1, K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_ref,) = _run(ref_model, {"X": x})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_dynamic_quantize_matmul_rms_norm_pass_through_is_matched_and_prunes():
+    # `SimplifiedLayerNormalization` -- onnxruntime's own RMSNorm-equivalent
+    # fused op, registered under the *default* ONNX domain (see this file's
+    # own "mid-chain LayerNorm/RMSNorm pass-through" section comment far
+    # above) -- has no `bias`/`Beta` input at all, unlike `LayerNormalization`.
+    # `onnx.checker`'s own schema database doesn't know this op under the
+    # default domain at all (an onnxruntime-only registration, not a plain-
+    # ONNX one -- see `test_structured_pruning_simplified_layer_norm_pass_through_matches_oracle`'s
+    # own identical note), so `onnx.checker.check_model` is skipped here;
+    # onnxruntime itself still runs it fine, which the oracle comparison
+    # below actually exercises.
+    K, N1, N2 = 16, 24, 12
+    rng = np.random.default_rng(43)
+    W1f = (rng.standard_normal((K, N1)) * 0.3).astype(np.float32)
+    W2f = (rng.standard_normal((N1, N2)) * 0.3).astype(np.float32)
+    gamma = (rng.standard_normal(N1) * 0.5 + 1.0).astype(np.float32)
+    model, info = _dqmm_norm_model_from_weights(
+        K,
+        N1,
+        N2,
+        W1f,
+        W2f,
+        "SimplifiedLayerNormalization",
+        gamma,
+        beta=None,
+        per_channel=True,
+    )
+
+    chains = onnxsim.pruning._find_dynquant_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == N1
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_matmul(
+        model, sparsity=0.5
+    )
+    keep_count = N1 - round(N1 * 0.5)
+    keep = _dqmm_importance_keep(info["W1q"], info["W1s"], info["W1zp"], keep_count)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, keep_count]
+    assert list(inits["Gamma"].dims) == [keep_count]
+    assert list(inits["W2"].dims) == [keep_count, N2]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Gamma"]), gamma[keep]
+    )
+
+    ref_model, _ = _dqmm_norm_model_from_weights(
+        K,
+        keep_count,
+        N2,
+        W1f[:, keep],
+        W2f[keep, :],  # shape placeholder only -- overwritten below
+        "SimplifiedLayerNormalization",
+        gamma[keep],
+        beta=None,
+        per_channel=True,
+    )
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    ref_inits["W2"].CopyFrom(onnx.numpy_helper.from_array(info["W2q"][keep, :], "W2"))
+    ref_inits["W2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2s"], "W2_scale")
+    )
+    ref_inits["W2_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2zp"], "W2_zero_point")
+    )
+
+    rng2 = np.random.default_rng(44)
+    x = rng2.standard_normal((1, K)).astype(np.float32)
     (y_pruned,) = _run(pruned, {"X": x})
     (y_ref,) = _run(ref_model, {"X": x})
     np.testing.assert_array_equal(y_pruned, y_ref)
