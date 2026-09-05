@@ -182,6 +182,7 @@ from onnxsim.tensorrt_sparsity import convert_matmul_to_gemm
 from onnxsim.tesseraq import apply_tesseraq
 from onnxsim.tflite_export import export_tflite
 from onnxsim.transformers_export import export_transformers_model
+from onnxsim.xnnpack_codegen import export_xnnpack_c, generate_xnnpack_c
 from onnxsim.zeroquant import apply_zeroquant
 
 from .version import version as __version__
@@ -362,5 +363,7 @@ __all__ = [
     "export_mlir",
     "export_coreml",
     "export_tflite",
+    "generate_xnnpack_c",
+    "export_xnnpack_c",
     "__version__",
 ]

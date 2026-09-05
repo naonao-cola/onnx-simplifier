@@ -38,6 +38,7 @@
 #include "tensor_pool.h"
 #include "tensor_pool_bridge.h"
 #include "tensor_pool_gguf_bridge.h"
+#include "xnnpack_codegen.h"
 
 namespace py = nanobind;
 using namespace nanobind::literals;
@@ -404,6 +405,21 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return MemoryPlanToPyTuple(plan);
       },
       "model_bytes"_a, "run_shape_inference"_a = true);
+
+  // Emit a standalone C source file reconstructing `model` as an XNNPACK
+  // Subgraph (see xnnpack_codegen.h for scope/layout convention). Unlike
+  // _memory_plan, this needs no shape-inference flag: GenerateXnnpackC always
+  // runs it internally, since generated code must bake in concrete shapes.
+  m.def(
+      "_generate_xnnpack_c",
+      [](const py::bytes& model_bytes, const std::string& function_prefix) {
+        onnx::ModelProto model;
+        onnx::ParseProtoFromBytes(&model, model_bytes.c_str(),
+                                  model_bytes.size());
+        return onnxsim::xnnpack_backend::GenerateXnnpackC(model,
+                                                          function_prefix);
+      },
+      "model_bytes"_a, "function_prefix"_a);
 
   // Data-free Cross-Layer Equalization preprocessing (not itself a
   // quantization scheme) -- see CrossLayerEqualize in onnxsim.h. Pure graph
