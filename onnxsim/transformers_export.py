@@ -29,11 +29,13 @@ onnxsim entry point.
 
 import glob
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 import onnx
 from google.protobuf.message import EncodeError
+from onnx.external_data_helper import ExternalDataInfo, uses_external_data
 
+from onnxsim.model_info import _iter_graph_tensors
 from onnxsim.onnx_simplifier import simplify
 
 
@@ -134,10 +136,43 @@ def export_transformers_model(
     return results
 
 
+def _referenced_external_data_files(path: str) -> Set[str]:
+    """Every external-data file the on-disk model at ``path`` currently points
+    to, as absolute paths -- without loading the tensor data itself.
+
+    Used by :func:`_save` to find files that become orphaned once it
+    overwrites ``path``: the export this wraps (``optimum``/PyTorch's own
+    ONNX exporter) picks its own external-data filenames (e.g. a UNet's
+    multi-gigabyte weights land next to it as ``model.onnx_data``), which
+    don't match the ``<filename>.data`` convention :func:`_save` writes under.
+    Left alone, every simplified graph would carry its old, now-unreferenced
+    weights file forward as dead weight -- for a real (non-tiny) model,
+    gigabytes of it per graph.
+    """
+    try:
+        raw = onnx.load(path, load_external_data=False)
+    except Exception:
+        return set()
+    base_dir = os.path.dirname(path)
+    files = set()
+    for tensor in _iter_graph_tensors(raw.graph):
+        if uses_external_data(tensor):
+            location = ExternalDataInfo(tensor).location
+            if location:
+                files.add(os.path.normpath(os.path.join(base_dir, location)))
+    return files
+
+
 def _save(model: onnx.ModelProto, path: str, force_external_data: bool) -> None:
+    # Snapshot what the pre-simplification file on disk at `path` points to
+    # *before* overwriting it, so any of those files no longer referenced
+    # afterwards can be cleaned up as stale rather than left behind.
+    stale_candidates = _referenced_external_data_files(path)
+
     if not force_external_data:
         try:
             onnx.save(model, path)
+            _cleanup_stale_external_data(path, stale_candidates)
             return
         except (ValueError, EncodeError):
             # Real transformers models routinely exceed onnx.save's 2GB inline
@@ -162,3 +197,10 @@ def _save(model: onnx.ModelProto, path: str, force_external_data: bool) -> None:
         # tensor moves out, so drop the threshold to 0 only in that case.
         size_threshold=0 if force_external_data else 1024,
     )
+    _cleanup_stale_external_data(path, stale_candidates)
+
+
+def _cleanup_stale_external_data(path: str, stale_candidates: Set[str]) -> None:
+    for stale in stale_candidates - _referenced_external_data_files(path):
+        if os.path.exists(stale):
+            os.remove(stale)

@@ -105,3 +105,42 @@ def test_save_roundtrips_regardless_of_mode(tmp_path, force_external_data):
 
     reloaded, _pool = onnxsim.load_model(path)
     onnx.checker.check_model(reloaded, full_check=True)
+
+
+def _write_with_old_style_external_data(model, path):
+    # PyTorch's own ONNX exporter (what optimum's main_export delegates to)
+    # names its external-data file "<model>.onnx_data" -- no dot before
+    # "data" -- unlike _save's own "<model>.onnx.data" convention. Simulates
+    # the on-disk state export_transformers_model/export_diffusion_model
+    # hand to _save: a freshly exported file whose weights already live
+    # externally, under that different name.
+    onnx.save(
+        model,
+        path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=os.path.basename(path) + "_data",
+        size_threshold=0,
+    )
+
+
+@pytest.mark.parametrize("force_external_data", [False, True])
+def test_save_removes_stale_external_data_from_a_previous_naming_convention(
+    tmp_path, force_external_data
+):
+    # Regression test: _save is handed a path whose *pre-existing* on-disk
+    # file already carries external data, under a filename _save itself
+    # would never produce. Overwriting path with a new model (as
+    # export_transformers_model/export_diffusion_model do, in place, after
+    # simplifying) must not leave that old weights file behind -- for a real
+    # (non-tiny) model this orphans gigabytes of dead weight per graph.
+    path = str(tmp_path / "model.onnx")
+    old_external_path = path + "_data"
+    _write_with_old_style_external_data(_tiny_model(), path)
+    assert os.path.exists(old_external_path)
+
+    _save(_tiny_model(), path, force_external_data=force_external_data)
+
+    assert not os.path.exists(old_external_path)
+    reloaded, _pool = onnxsim.load_model(path)
+    onnx.checker.check_model(reloaded, full_check=True)
