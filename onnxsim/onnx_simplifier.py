@@ -1216,36 +1216,53 @@ def apply_double_quantization_cpp(
 def prune_magnitude_cpp(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
+    n: Optional[int] = None,
+    m: Optional[int] = None,
+    global_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """
     C++-backed port of :func:`onnxsim.apply_magnitude_pruning`: zeros the
     least-magnitude entries of every MatMul/vanilla-Gemm layer's constant
-    2-D float32 weight, and every Conv layer's constant 4-D float32 weight
-    (ordinary, depthwise, and general grouped Conv alike) -- the data-free
-    unstructured pruning baseline (Han et al., 2015).
+    2-D FLOAT/FLOAT16/BFLOAT16 weight, every Conv layer's constant 4-D
+    FLOAT/FLOAT16/BFLOAT16 weight (ordinary, depthwise, and general grouped
+    Conv alike), and every ``com.microsoft::Attention`` node's constant 2-D
+    FLOAT/FLOAT16/BFLOAT16 merged QKV weight -- the data-free unstructured
+    pruning baseline (Han et al., 2015). Full parity with the pure-Python
+    :func:`onnxsim.apply_magnitude_pruning`.
 
     Within each output row (or, for Conv, each output filter), keeps the
     ``max(1, round(cols * (1 - sparsity)))`` highest-magnitude entries and
     zeros the rest, so a layer with row-dependent weight scale doesn't get
     some rows pruned to nothing and others left untouched.
 
-    Unlike the pure-Python :func:`onnxsim.apply_magnitude_pruning`, this
-    does not match ``com.microsoft::Attention``'s merged QKV weight, and
-    offers only the sparsity-ratio mode (no N:M semi-structured pruning).
-
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
-    Layers with a non-constant, non-2-D (MatMul/Gemm), or non-4-D (Conv)
-    weight are left untouched.
+    Layers with a non-constant, non-2-D (MatMul/Gemm/Attention), or non-4-D
+    (Conv) weight are left untouched.
 
     :param model: onnx ModelProto object or file path
-    :param sparsity: target fraction of each row's entries to zero; must be
-            in ``[0, 1)``
+    :param sparsity: target fraction of each row's (or, for Conv, each
+            output filter's) entries to zero, ignored when ``n``/``m`` are
+            given -- or, when `global_sparsity`, target fraction of every
+            matched layer's entries *combined*
+    :param n: keep the ``n`` highest-magnitude entries per group of ``m``
+            (semi-structured N:M pruning, e.g. NVIDIA's 2:4). Must be given
+            together with ``m``; incompatible with `global_sparsity`.
+    :param m: group size for N:M pruning; see ``n``
+    :param global_sparsity: the classic "global magnitude pruning" variant
+            (Han et al., 2015): pools every matched layer's ``|W|`` entries
+            into one ranking across the whole model and zeros exactly
+            `sparsity`'s fraction of that pooled total, wherever it lands
+            (no per-row/per-layer floor -- see
+            :func:`onnxsim.apply_magnitude_pruning`'s own docstring).
+            Incompatible with ``n``/``m``.
     :returns: ``model`` with every matched layer's weight pruned in place
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    return onnx.load_from_string(C.prune_magnitude(model.SerializeToString(), sparsity))
+    return onnx.load_from_string(
+        C.prune_magnitude(model.SerializeToString(), sparsity, n, m, global_sparsity)
+    )
 
 
 def apply_structured_pruning_cpp(

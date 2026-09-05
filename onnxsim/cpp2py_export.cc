@@ -628,21 +628,30 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "model_bytes"_a);
 
   // Magnitude pruning (Han et al., 2015): zeros the least-magnitude entries
-  // of every MatMul/vanilla-Gemm/Conv layer's constant weight, independently
-  // per output row/filter. Data-free. See PruneMagnitude in onnxsim.h.
+  // of every MatMul/vanilla-Gemm/Conv/com.microsoft::Attention layer's
+  // constant weight, independently per output row/filter. Data-free.
+  // `n`/`m` are `None` (unstructured, ranked by `sparsity`) or both given
+  // together (N:M semi-structured). `global_sparsity` pools every matched
+  // layer's importance into one whole-model ranking; incompatible with
+  // `n`/`m`. Same `n`/`m`/`global_sparsity` shape as apply_wanda_pruning's
+  // own binding above. See PruneMagnitude in onnxsim.h.
   m.def(
       "prune_magnitude",
-      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+      [](const py::bytes& model_proto_bytes, double sparsity,
+         std::optional<int64_t> n, std::optional<int64_t> m,
+         bool global_sparsity) -> py::bytes {
         InitEnv();
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
-        const auto result = PruneMagnitude(model, sparsity);
+        const auto result =
+            PruneMagnitude(model, sparsity, n, m, global_sparsity);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
       },
-      "model_bytes"_a, "sparsity"_a);
+      "model_bytes"_a, "sparsity"_a, "n"_a.none(), "m"_a.none(),
+      "global_sparsity"_a = false);
 
   // Structured (channel) pruning: removes whole output channels from
   // MatMul/vanilla-Gemm and Conv layers -- real structural pruning, not
