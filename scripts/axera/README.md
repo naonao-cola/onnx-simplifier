@@ -620,20 +620,37 @@ before, plus a real accuracy caveat:
 - **Compiled successfully**: ~105s wall time (`pulsar2_build` phase; see
   `BuildResult.phase_timings`), `max_cycle=7,334,676` -- and ran
   successfully on the real AX650N with a real tokenized prompt.
-- **A real calibration-quality caveat, not a correctness bug**: with
-  `build_from_hf_checkpoint()`'s default `calibration_size=4` *random*
-  token ids, the compiled model's real-prompt output logits were visibly
-  degenerate (every one of the top-5 predicted tokens shared the exact
-  same saturated logit value) -- a classic INT8 output-quantization
-  clipping symptom, not a bug in the reconstruction or compilation. Raising
-  `calibration_size` to 32 (still random token ids, no real representative
-  text) alone fixed it: 136 distinct logit values near the top, plausible
-  (if not perfectly coherent) function-word continuations for "The capital
-  of France is". Real accuracy on a real model needs either more
-  calibration samples or actually-representative calibration text (this
-  entry point only supports random token ids -- see its own docstring for
-  how to plug in real data via `onnxsim.reconstruct_hf_graph()` +
-  `build(config_path=...)` directly).
+- **Real accuracy is bad, and it's a depth-compounding problem, not a
+  calibration problem** -- corrected after actually comparing on-device
+  output against the real FP32 reference (an earlier pass here just
+  eyeballed logit plausibility and wrongly called it fixed). Across 5 real
+  prompts, comparing the compiled model's on-device logits against
+  `onnxruntime` running the same `reconstruct_hf_graph()` output: **0/5
+  top-1 matches, 0/5 top-5 overlap, average cosine similarity ~0.13** --
+  the FP32 reference gets every prompt right (" the" for "The capital of
+  France is", " dog" for "...the lazy", " oxygen" for "hydrogen and", ...,
+  confirming the reconstruction itself is correct), the on-device output
+  is close to random. Two follow-ups ruled out calibration as the cause
+  rather than confirming it: real, representative English-sentence
+  calibration data (32 real sentences, not random token ids) made it
+  *worse* (avg cosine ~0.04), and switching `calibration_method` from
+  `MinMax` to `MSE` made it worse again (~-0.12). **The real cause,
+  isolated by depth**: the identical reconstruction+quantization approach
+  gets 0.999 average cosine similarity and 4/5 top-1 matches on a
+  synthetic **1-layer** checkpoint (`distilabel-internal-testing/
+  tiny-random-mistral`, same pipeline, same code) -- so per-tensor MinMax/
+  MSE INT8 post-training quantization, applied uniformly to every weight
+  and activation with no smoothing or outlier handling, works fine at
+  shallow depth and compounds into essentially-random output somewhere
+  between 1 and 30 sequential transformer layers. This is a well-
+  documented, expected limitation of naive full-network INT8 PTQ on deep
+  transformers in general (it's exactly why techniques like SmoothQuant/
+  AWQ/GPTQ exist), not a bug in `reconstruct_hf_graph()`,
+  `build_from_hf_checkpoint()`, or its calibration data. Getting real
+  accuracy out of a real-depth LLM through this generic ingestion path
+  would need a smarter quantization strategy than what a plain `pulsar2
+  build --config` currently applies -- `llm_build()` (above), Pulsar2's
+  own dedicated LLM path, presumably has one; this generic path doesn't.
 
 ## Real Docker + device conversion driver
 
