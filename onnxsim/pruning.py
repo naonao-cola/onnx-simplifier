@@ -14298,100 +14298,43 @@ def apply_structured_wanda_pruning(
     calibration activations are captured via a real ``onnxruntime`` run and
     cast to float64 on read regardless of the graph's own declared dtype,
     so they need no separate handling here either.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-full-parity C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_structured_wanda_pruning_cpp`
+    (``onnxsim/structured_pruning_entry.cpp``'s own
+    ``ApplyStructuredWandaPruning``), forwarding every argument unchanged.
+    Two real scope gaps blocked this alias for a time -- (1) the C++ port's
+    shared ``FindConvChains``/``MatchConvProducer`` matched only a plain
+    ``Conv`` node, never ``ConvTranspose`` (now closed by
+    ``MatchConvTransposeProducer``/``MatchConvTransposeConsumer`` and
+    ``WalkToConvConsumer``'s own ``allow_conv_transpose_consumer``
+    parameter, mirroring this module's own ``_match_conv_transpose_producer``/
+    ``_match_conv_transpose_consumer`` exactly); and (2) a ``Concat``-merged
+    branch feeding a *grouped* Conv consumer was declined outright rather
+    than admitted when block-aligned (now closed by
+    ``ConcatBranchesAlignToConsumerGroup``, mirroring this module's own
+    ``_concat_branches_align_to_consumer_group``/``_apply_concat_chains``
+    exactly) -- both verified against the FULL ``tests/test_pruning.py``
+    suite, not just this port's own hand-picked cases, before this alias was
+    made. Imported lazily (inside the function body, not at module scope) to
+    avoid a circular import: ``onnxsim.onnx_simplifier`` already imports
+    from this module (:class:`EmbeddingPruningResult`), so importing it back
+    at module load time here would deadlock the import machinery.
     """
-    if not (0.0 <= sparsity < 1.0):
-        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
-    _validate_importance_norm(importance_norm)
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_structured_wanda_pruning_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-
-    chains = (
-        _find_chains(graph)
-        + _find_gated_chains(graph)
-        + _find_conv_chains(graph)
-        + _find_conv_residual_chains(graph)
-        + _find_matmul_residual_chains(graph)
+    return apply_structured_wanda_pruning_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        sparsity=sparsity,
+        importance_norm=importance_norm,
+        epsilon=epsilon,
+        providers=providers,
+        global_sparsity=global_sparsity,
     )
-    concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(graph)
-    split_gated_chains = _find_split_gated_chains(graph)
-    if not chains and not concat_chains and not split_gated_chains:
-        return out
-
-    act_norm = _wanda_structured_calibration_stats(
-        out, chains, concat_chains, calibration_data, providers
-    )
-
-    def _wanda_structured_importance(
-        chain: _Chain, w_arrays_nk: List[np.ndarray]
-    ) -> np.ndarray:
-        base = _plain_structured_importance(chain, w_arrays_nk, importance_norm)
-        norm = act_norm.get(chain.consumer_node.input[0])
-        if norm is None or norm.shape[0] != chain.n_channels:
-            return base  # no matching activation observed -- fall back to |W|
-        return base * np.maximum(norm, epsilon)
-
-    def _wanda_branch_importance(
-        operand_name: str, w_arrays_nk: List[np.ndarray]
-    ) -> np.ndarray:
-        base = _plain_branch_importance(w_arrays_nk, importance_norm)
-        norm = act_norm.get(operand_name)
-        if norm is None or norm.shape[0] != base.shape[0]:
-            return base  # no matching activation observed -- fall back to |W|
-        return base * np.maximum(norm, epsilon)
-
-    # split_gated_chains' own probe point (its consumer's own input, exactly
-    # like an ordinary chain's) is deliberately never added to
-    # `_wanda_structured_calibration_stats`'s own probe set above -- ranked
-    # by plain weight-magnitude importance only, the same "no matching
-    # activation observed" fallback `_wanda_structured_importance` already
-    # falls back to, always taken here rather than sometimes -- see this
-    # module's own "Split-merged (fused gate_up_proj) gated FFN chains"
-    # section comment for why a dedicated calibrated ranking for this
-    # family was left out of scope for this round.
-    def _split_gated_wanda_importance(
-        _chain: _SplitGatedChain, w_arrays_nk: List[np.ndarray]
-    ) -> np.ndarray:
-        return _plain_branch_importance(w_arrays_nk, importance_norm)
-
-    touched = _TouchedState()
-    if global_sparsity:
-        global_chains = [c for c in chains if _chain_is_global_sparsity_eligible(c)]
-        if global_chains:
-            _apply_chains_global(
-                graph, global_chains, sparsity, _wanda_structured_importance, touched
-            )
-    else:
-        if chains:
-            _apply_chains(
-                graph, chains, sparsity, _wanda_structured_importance, touched
-            )
-        if concat_chains:
-            _apply_concat_chains(
-                graph, concat_chains, sparsity, _wanda_branch_importance, touched
-            )
-        if split_gated_chains:
-            _apply_split_gated_chains(
-                graph,
-                split_gated_chains,
-                sparsity,
-                _split_gated_wanda_importance,
-                touched,
-            )
-    if touched.stale_value_info:
-        kept = [
-            vi for vi in graph.value_info if vi.name not in touched.stale_value_info
-        ]
-        del graph.value_info[:]
-        graph.value_info.extend(kept)
-    return out
 
 
 # --- QDQ (quantized-weight) structured pruning ------------------------------

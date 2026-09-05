@@ -624,6 +624,16 @@ struct Producer {
   // FindGatedChains; empty for a plain single-producer chain), in forward
   // order (raw output -> ... -> the tensor that feeds the combine op).
   std::vector<onnx::NodeProto*> pre_ops;
+  // True for a ConvTranspose producer (meaningless unless `is_conv`) -- see
+  // MatchConvTransposeProducer's own comment: a ConvTranspose weight's own
+  // output-channel axis is axis 1, not axis 0 (the reverse of Conv's), so
+  // every place that slices/reshapes this producer's own weight by its
+  // output-channel axis (SliceProducerWeight, the ApplyChains(Global) own
+  // `w_arrays_nk` builders) branches on this flag. Appended last, defaulted
+  // `false`, so every pre-existing positional `Producer{...}` initializer
+  // (never a real Conv/ConvTranspose choice before this field existed) is
+  // unaffected. Always `false` for a MatMul/Gemm producer.
+  bool is_conv_transpose = false;
 };
 
 struct ConvPassThrough {
@@ -712,6 +722,18 @@ struct Chain {
   // chain kind -- residual/merge chains, Concat-merged chains, and every
   // MatMul/Gemm chain -- mirroring pruning.py's own `_Chain.group_norm`).
   std::optional<GroupNormPassThrough> group_norm;
+  // True for a ConvTranspose consumer (meaningless unless `consumer_is_conv`)
+  // -- see MatchConvTransposeConsumer's own comment: a ConvTranspose
+  // weight's own input-channel axis is axis 0, flat/global for any `group`
+  // (the mirror image of Conv's grouped consumer axis 1), so
+  // SliceChainChannels routes a grouped ConvTranspose consumer through the
+  // plain SliceConsumerWeight branch rather than SliceGroupedConsumerConv
+  // Weight. Only FindConvChains ever sets this `true` -- ConvTranspose stays
+  // out of scope for a residual/merge chain's or a Concat-merged chain's own
+  // consumer for now (see WalkToConvConsumer's own
+  // `allow_conv_transpose_consumer` parameter), so it is always `false`
+  // there. Mirrors pruning.py's own `_Chain.consumer_is_conv_transpose`.
+  bool consumer_is_conv_transpose = false;
 };
 
 // --- MatMul/Gemm plain chains, mirroring _match_producer/_walk_to_consumer/
@@ -1938,6 +1960,98 @@ std::optional<ConvConsumerMatch> MatchConvConsumer(const onnx::NodeProto& node,
   return ConvConsumerMatch{node.input(1), in_channels, group};
 }
 
+struct ConvTransposeProducerMatch {
+  std::string weight;
+  std::optional<std::string> bias;
+  int64_t out_channels;
+  int64_t group;
+};
+
+// The ConvTranspose analogue of MatchConvProducer -- mirrors pruning.py's own
+// _match_conv_transpose_producer exactly. ConvTranspose's own weight layout
+// is the schema-documented [C, M/group, k1, ..., kn] -- the *reverse* of
+// Conv's [M, C/group, ...]: this node's own output channels (M, what
+// "producer" means here) live on axis 1, not axis 0. Every caller that
+// slices/reshapes this producer's weight by its own output-channel axis is
+// told this via the returned Producer's own `is_conv_transpose=true` flag
+// (set by FindConvChains, the only caller of this function), and uses axis 1
+// instead of axis 0 (see SliceProducerWeight/the ApplyChains(Global) own
+// `w_arrays_nk` builders).
+//
+// Deliberately restricted to `group == 1` -- declined (nullopt) otherwise --
+// unlike MatchConvProducer's support for a *general* grouped Conv: a grouped
+// ConvTranspose producer's own output-channel axis (1) *is*
+// per-group-relative, needing the axis-1 analogue of
+// SliceGroupedConsumerConvWeight this port does not implement. A scope
+// decision, not an oversight -- see pruning.py's own
+// _match_conv_transpose_producer docstring for the full reasoning.
+std::optional<ConvTransposeProducerMatch> MatchConvTransposeProducer(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.op_type() != "ConvTranspose" || node.input_size() < 2) {
+    return std::nullopt;
+  }
+  auto it = init_map.find(node.input(1));
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT ||
+      it->second->dims_size() < 3) {
+    return std::nullopt;
+  }
+  const onnx::TensorProto* w = it->second;
+  const int64_t group = ConvGroupAttr(node);
+  if (group != 1) {
+    return std::nullopt;  // Grouped ConvTranspose producer -- declined above.
+  }
+  const int64_t out_channels = w->dims(1);
+  std::optional<std::string> bias;
+  if (node.input_size() == 3 && !node.input(2).empty()) {
+    bias = node.input(2);
+    if (!init_map.count(*bias)) {
+      return std::nullopt;
+    }
+  }
+  return ConvTransposeProducerMatch{node.input(1), bias, out_channels, group};
+}
+
+struct ConvTransposeConsumerMatch {
+  std::string weight;
+  int64_t in_channels;
+  int64_t group;
+};
+
+// The ConvTranspose analogue of MatchConvConsumer -- mirrors pruning.py's own
+// _match_conv_transpose_consumer exactly. Unlike
+// MatchConvTransposeProducer's `group == 1` restriction, any `group >= 1` is
+// matched here: this node's own input-channel axis (axis 0 of its
+// [C, M/group, ...] weight) already spans the FULL, global C regardless of
+// `group` -- grouping only ever splits axis 1 (the output side) for
+// ConvTranspose, the mirror image of Conv (whose grouping only ever splits
+// axis 1, the input side). Pruning it is therefore a plain, flat
+// `w[keep, ...]` for any `group` -- no per-group block-relative index
+// translation needed the way SliceGroupedConsumerConvWeight provides for a
+// grouped Conv consumer.
+std::optional<ConvTransposeConsumerMatch> MatchConvTransposeConsumer(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.op_type() != "ConvTranspose" || node.input_size() < 2) {
+    return std::nullopt;
+  }
+  auto it = init_map.find(node.input(1));
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT ||
+      it->second->dims_size() < 3) {
+    return std::nullopt;
+  }
+  const onnx::TensorProto* w = it->second;
+  const int64_t group = ConvGroupAttr(node);
+  if (group < 1) {
+    return std::nullopt;
+  }
+  const int64_t in_channels = w->dims(0);
+  if (group > 1 && in_channels % group != 0) {
+    return std::nullopt;  // Groups must stay equal-sized.
+  }
+  return ConvTransposeConsumerMatch{node.input(1), in_channels, group};
+}
+
 struct DepthwiseMatch {
   std::string weight;
   std::optional<std::string> bias;
@@ -2391,8 +2505,21 @@ struct ConvConsumerResult {
   onnx::NodeProto* node;
   std::string weight;
   int64_t group;
+  // True for a matched ConvTranspose consumer (see
+  // MatchConvTransposeConsumer's own comment) -- always `false` for a plain
+  // Conv match. Appended last, defaulted `false`, so every pre-existing
+  // positional `ConvConsumerResult{...}` initializer is unaffected.
+  bool is_conv_transpose = false;
 };
 
+// `allow_conv_transpose_consumer` defaults `false` -- only FindConvChains,
+// the plain single-producer/single-consumer chain finder ConvTranspose
+// support was scoped to, passes `true`; every other caller (the
+// residual/merge fan-out branch resolution, and the Concat-branch-merge
+// consumer walk) leaves it at the default, deliberately excluding
+// ConvTranspose from those more elaborate topologies for now -- a scope
+// decision, not an oversight, mirroring pruning.py's own
+// `_walk_to_conv_consumer` exactly.
 std::tuple<std::optional<ConvConsumerResult>, std::vector<ChainOp>,
            std::vector<ConvPassThrough>, std::optional<GroupNormPassThrough>>
 WalkToConvConsumer(const std::string& start, const InitMap& init_map,
@@ -2400,7 +2527,8 @@ WalkToConvConsumer(const std::string& start, const InitMap& init_map,
                    const std::unordered_set<std::string>& graph_outputs,
                    int64_t n_channels, int max_hops,
                    onnx::NodeProto* forced_first_hop = nullptr,
-                   bool recognize_group_norm = false) {
+                   bool recognize_group_norm = false,
+                   bool allow_conv_transpose_consumer = false) {
   std::vector<ChainOp> chain_ops;
   std::vector<ConvPassThrough> pass_through;
   std::optional<ConvConsumerResult> consumer;
@@ -2465,6 +2593,21 @@ WalkToConvConsumer(const std::string& start, const InitMap& init_map,
       auto match = MatchConvConsumer(*nxt, init_map);
       if (match && match->in_channels == n_channels) {
         consumer = ConvConsumerResult{nxt, match->weight, match->group};
+      }
+      break;
+    }
+
+    if (allow_conv_transpose_consumer && nxt->op_type() == "ConvTranspose" &&
+        nxt->input(0) == cur) {
+      // A ConvTranspose node hit mid-walk simply ends the walk with no
+      // consumer found when `allow_conv_transpose_consumer` is left at its
+      // default -- exactly like any other unmatched topology, not an error
+      // -- see this function's own `allow_conv_transpose_consumer` comment
+      // above (mirrors pruning.py's own `_walk_to_conv_consumer`).
+      auto ct_match = MatchConvTransposeConsumer(*nxt, init_map);
+      if (ct_match && ct_match->in_channels == n_channels) {
+        consumer =
+            ConvConsumerResult{nxt, ct_match->weight, ct_match->group, true};
       }
       break;
     }
@@ -2626,8 +2769,29 @@ std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
   std::vector<Chain> chains;
   for (int i = 0; i < graph->node_size(); ++i) {
     onnx::NodeProto* node = graph->mutable_node(i);
-    auto info = MatchConvProducer(*node, init_map);
-    if (!info) {
+    // Try an ordinary/grouped Conv producer first, then (only if that
+    // declines -- the two matchers' own op_type checks are mutually
+    // exclusive, so this is never ambiguous) a ConvTranspose producer
+    // (group == 1 only -- see MatchConvTransposeProducer's own comment for
+    // why grouped ConvTranspose stays out of scope). Mirrors pruning.py's
+    // own _find_conv_chains exactly.
+    std::string w_name;
+    std::optional<std::string> bias_name;
+    int64_t out_channels;
+    int64_t producer_group;
+    bool is_producer_conv_transpose = false;
+    if (auto info = MatchConvProducer(*node, init_map)) {
+      w_name = info->weight;
+      bias_name = info->bias;
+      out_channels = info->out_channels;
+      producer_group = info->group;
+    } else if (auto ct_info = MatchConvTransposeProducer(*node, init_map)) {
+      w_name = ct_info->weight;
+      bias_name = ct_info->bias;
+      out_channels = ct_info->out_channels;
+      producer_group = ct_info->group;
+      is_producer_conv_transpose = true;
+    } else {
       continue;
     }
     const std::string& out_name = node->output(0);
@@ -2647,18 +2811,19 @@ std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
       continue;
     }
     auto [consumer, chain_ops, pass_through, group_norm] = WalkToConvConsumer(
-        out_name, init_map, consumers_of, graph_outputs, info->out_channels,
+        out_name, init_map, consumers_of, graph_outputs, out_channels,
         kMaxChainHops, /*forced_first_hop=*/nullptr,
-        /*recognize_group_norm=*/true);
+        /*recognize_group_norm=*/true,
+        /*allow_conv_transpose_consumer=*/true);
     if (!consumer) {
       continue;
     }
-    if (info->group > 1 && consumer->group > 1 &&
-        info->group != consumer->group) {
+    if (producer_group > 1 && consumer->group > 1 &&
+        producer_group != consumer->group) {
       continue;  // Both sides grouped with mismatched group counts: declined.
     }
     if (group_norm &&
-        ((info->group > 1 && info->group != group_norm->num_groups) ||
+        ((producer_group > 1 && producer_group != group_norm->num_groups) ||
          (consumer->group > 1 && consumer->group != group_norm->num_groups))) {
       // The mid-chain GroupNorm hop's own `num_groups` disagrees with a
       // general grouped Conv producer's or consumer's own `group` -- the
@@ -2670,17 +2835,24 @@ std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
     }
 
     Chain chain;
-    chain.producers.push_back(
-        Producer{node, info->weight, false, info->bias, true, info->group});
+    chain.producers.push_back(Producer{node,
+                                       w_name,
+                                       false,
+                                       bias_name,
+                                       true,
+                                       producer_group,
+                                       {},
+                                       is_producer_conv_transpose});
     chain.chain_ops = std::move(chain_ops);
     chain.consumer_node = consumer->node;
     chain.consumer_weight = consumer->weight;
     chain.consumer_weight_transposed = false;
-    chain.n_channels = info->out_channels;
+    chain.n_channels = out_channels;
     chain.consumer_is_conv = true;
     chain.conv_pass_through = std::move(pass_through);
     chain.consumer_group = consumer->group;
     chain.group_norm = std::move(group_norm);
+    chain.consumer_is_conv_transpose = consumer->is_conv_transpose;
     chains.push_back(std::move(chain));
   }
   return chains;
@@ -4089,21 +4261,39 @@ std::vector<T> SliceAxis1(const std::vector<T>& data, int64_t dim0,
   return out;
 }
 
+// `is_conv_transpose` (meaningless unless `is_conv`) is this weight's own
+// ConvTranspose-vs-Conv distinction: a ConvTranspose weight's own
+// output-channel axis is axis 1 -- the reverse of Conv's axis 0 -- so the
+// slice below cuts axis 1 instead (only ever called here for a group == 1
+// ConvTranspose, per MatchConvTransposeProducer's own comment, so this is a
+// plain, ungrouped axis-1 slice). Mirrors pruning.py's own
+// `_slice_producer_weight` exactly.
 void SliceProducerWeight(onnx::TensorProto* wt, bool weight_transposed,
-                         const std::vector<int64_t>& keep, bool is_conv) {
+                         const std::vector<int64_t>& keep, bool is_conv,
+                         bool is_conv_transpose = false) {
   std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
   std::vector<float> data = ReadFloatTensor(*wt);
   std::vector<float> out;
   std::vector<int64_t> new_dims;
   const int64_t kc = static_cast<int64_t>(keep.size());
   if (is_conv) {
-    int64_t inner = 1;
-    for (size_t i = 1; i < dims.size(); ++i) {
-      inner *= dims[i];
+    if (is_conv_transpose) {
+      int64_t inner = 1;
+      for (size_t i = 2; i < dims.size(); ++i) {
+        inner *= dims[i];
+      }
+      out = SliceAxis1(data, dims[0], dims[1], inner, keep);
+      new_dims = dims;
+      new_dims[1] = kc;
+    } else {
+      int64_t inner = 1;
+      for (size_t i = 1; i < dims.size(); ++i) {
+        inner *= dims[i];
+      }
+      out = SliceAxis0(data, dims[0], inner, keep);
+      new_dims = dims;
+      new_dims[0] = kc;
     }
-    out = SliceAxis0(data, dims[0], inner, keep);
-    new_dims = dims;
-    new_dims[0] = kc;
   } else {
     const int64_t dim0 = dims[0], dim1 = dims[1];
     if (weight_transposed) {  // [N, K] -- output channel is axis 0.
@@ -4117,21 +4307,39 @@ void SliceProducerWeight(onnx::TensorProto* wt, bool weight_transposed,
   SetFloatTensorData(wt, new_dims, out);
 }
 
+// `is_conv_transpose` (meaningless unless `is_conv`) is this weight's own
+// ConvTranspose-vs-Conv distinction: a ConvTranspose weight's own
+// input-channel axis is axis 0, and (unlike Conv's grouped consumer axis 1)
+// spans the FULL in_channels regardless of `group`, so a plain, flat
+// axis-0 slice is correct for any `group` here -- see
+// MatchConvTransposeConsumer's own comment. Mirrors pruning.py's own
+// `_slice_consumer_weight` exactly.
 void SliceConsumerWeight(onnx::TensorProto* wt, bool weight_transposed,
-                         const std::vector<int64_t>& keep, bool is_conv) {
+                         const std::vector<int64_t>& keep, bool is_conv,
+                         bool is_conv_transpose = false) {
   std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
   std::vector<float> data = ReadFloatTensor(*wt);
   std::vector<float> out;
   std::vector<int64_t> new_dims;
   const int64_t kc = static_cast<int64_t>(keep.size());
   if (is_conv) {
-    int64_t inner = 1;
-    for (size_t i = 2; i < dims.size(); ++i) {
-      inner *= dims[i];
+    if (is_conv_transpose) {
+      int64_t inner = 1;
+      for (size_t i = 1; i < dims.size(); ++i) {
+        inner *= dims[i];
+      }
+      out = SliceAxis0(data, dims[0], inner, keep);
+      new_dims = dims;
+      new_dims[0] = kc;
+    } else {
+      int64_t inner = 1;
+      for (size_t i = 2; i < dims.size(); ++i) {
+        inner *= dims[i];
+      }
+      out = SliceAxis1(data, dims[0], dims[1], inner, keep);
+      new_dims = dims;
+      new_dims[1] = kc;
     }
-    out = SliceAxis1(data, dims[0], dims[1], inner, keep);
-    new_dims = dims;
-    new_dims[1] = kc;
   } else {
     const int64_t dim0 = dims[0], dim1 = dims[1];
     if (weight_transposed) {  // [N, K] -- reduction dim is axis 1.
@@ -4230,6 +4438,27 @@ std::vector<float> TransposeFlat(const std::vector<float>& data, int64_t dim0,
   return out;
 }
 
+// [dim1, dim0 * inner] row-major view of a [dim0, dim1, ...inner] row-major
+// tensor with axes 0 and 1 swapped -- the ConvTranspose-producer analogue of
+// TransposeFlat's plain 2-D transpose (`inner == 1` reduces to it exactly),
+// needed because a ConvTranspose weight's own output-channel axis is axis 1,
+// not axis 0 (see MatchConvTransposeProducer's own comment): row `m` of the
+// result is that output channel's own full weight, gathered across every
+// input channel and spatial position. Mirrors pruning.py's own
+// `_producer_weight_nk`'s `np.moveaxis(w, 1, 0).reshape(w.shape[1], -1)`.
+std::vector<float> MoveAxis1To0Flat(const std::vector<float>& data,
+                                    int64_t dim0, int64_t dim1, int64_t inner) {
+  std::vector<float> out(data.size());
+  for (int64_t i = 0; i < dim0; ++i) {
+    for (int64_t j = 0; j < dim1; ++j) {
+      std::memcpy(out.data() + static_cast<size_t>(j * dim0 + i) * inner,
+                  data.data() + static_cast<size_t>(i * dim1 + j) * inner,
+                  static_cast<size_t>(inner) * sizeof(float));
+    }
+  }
+  return out;
+}
+
 // --- Shared apply body, mirroring _apply_chains -----------------------------
 
 // Every touched initializer role and stale value_info name, shared by a
@@ -4270,7 +4499,7 @@ void SliceChainChannels(
 
   for (const auto& p : chain.producers) {
     SliceProducerWeight(init_map.at(p.weight), p.weight_transposed, keep,
-                        p.is_conv);
+                        p.is_conv, p.is_conv_transpose);
     if (p.bias) {
       SliceLastAxis(init_map.at(*p.bias), keep);
     }
@@ -4312,13 +4541,19 @@ void SliceChainChannels(
     SliceLastAxis(init_map.at(chain.group_norm->scale), keep);
     SliceLastAxis(init_map.at(chain.group_norm->bias), keep);
   }
-  if (chain.consumer_is_conv && chain.consumer_group > 1) {
+  if (chain.consumer_is_conv && !chain.consumer_is_conv_transpose &&
+      chain.consumer_group > 1) {
     SliceGroupedConsumerConvWeight(init_map.at(chain.consumer_weight), keep,
                                    chain.consumer_group, n);
   } else {
-    SliceConsumerWeight(init_map.at(chain.consumer_weight),
-                        chain.consumer_weight_transposed, keep,
-                        chain.consumer_is_conv);
+    // A grouped ConvTranspose consumer (consumer_is_conv_transpose,
+    // consumer_group > 1) also lands here, not in the branch above -- its
+    // own input-channel axis (0) is flat/global regardless of group, so the
+    // plain slice below is already correct; see
+    // MatchConvTransposeConsumer's own comment.
+    SliceConsumerWeight(
+        init_map.at(chain.consumer_weight), chain.consumer_weight_transposed,
+        keep, chain.consumer_is_conv, chain.consumer_is_conv_transpose);
   }
   // Extra fan-out branches: each is either an ordinary (group == 1)
   // consumer, or, for a Conv residual/merge chain, a general grouped Conv
@@ -4568,8 +4803,20 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
       std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
       std::vector<float> data = ReadFloatTensor(*wt);
       if (p.is_conv) {
-        w_arrays_nk.push_back(
-            std::move(data));  // Already [Cout, rest] flattened.
+        if (p.is_conv_transpose) {
+          // ConvTranspose's own output-channel axis is axis 1, not axis 0
+          // -- move it to the front before flattening (see
+          // MoveAxis1To0Flat's own comment).
+          int64_t inner = 1;
+          for (size_t i = 2; i < dims.size(); ++i) {
+            inner *= dims[i];
+          }
+          w_arrays_nk.push_back(
+              MoveAxis1To0Flat(data, dims[0], dims[1], inner));
+        } else {
+          w_arrays_nk.push_back(
+              std::move(data));  // Already [Cout, rest] flattened.
+        }
       } else if (p.weight_transposed) {
         w_arrays_nk.push_back(std::move(data));  // Already [N, K].
       } else {
@@ -4775,7 +5022,17 @@ void ApplyChainsGlobal(
       std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
       std::vector<float> data = ReadFloatTensor(*wt);
       if (p.is_conv) {
-        w_arrays_nk.push_back(std::move(data));
+        if (p.is_conv_transpose) {
+          // See ApplyChains' own identical ConvTranspose branch/comment.
+          int64_t inner = 1;
+          for (size_t i = 2; i < dims.size(); ++i) {
+            inner *= dims[i];
+          }
+          w_arrays_nk.push_back(
+              MoveAxis1To0Flat(data, dims[0], dims[1], inner));
+        } else {
+          w_arrays_nk.push_back(std::move(data));
+        }
       } else if (p.weight_transposed) {
         w_arrays_nk.push_back(std::move(data));
       } else {
@@ -6442,6 +6699,18 @@ struct ConcatChain {
   // Depthwise Conv hops crossed between the Concat node and the real
   // consumer (Conv chains only).
   std::vector<ConvPassThrough> conv_pass_through;
+  // 1 for an ordinary consumer (always, for a MatMul/Gemm chain -- MatMul/
+  // Gemm has no grouping concept at all) or a Conv consumer this module
+  // declines to admit as grouped; > 1 for a general grouped (`group > 1`)
+  // Conv consumer admitted per ConcatBranchesAlignToConsumerGroup -- see
+  // that function's own comment and FindConvConcatChains for exactly which
+  // grouped consumers are safe to admit and why. Mirrors pruning.py's own
+  // `_ConcatChain.consumer_group`, but unlike Chain::consumer_group this one
+  // is *not* found by inspecting `branches` first: a Concat branch's own
+  // producer is never itself grouped (see FindConvConcatChains' own
+  // comment), so the consumer's own `group` is always the one that governs
+  // here.
+  int64_t consumer_group = 1;
 };
 
 // True if any tensor a Concat branch's own backward walk crossed -- `start`
@@ -6873,12 +7142,65 @@ std::vector<ConcatChain> FindMatmulConcatChains(onnx::GraphProto* graph) {
   return chains;
 }
 
+// True if a grouped (`group > 1`) Conv consumer's own `group` equal-sized
+// input-channel blocks (`block = n_channels / group`, the same partition
+// SliceGroupedConsumerConvWeight slices against) line up exactly with this
+// Concat merge's own branch boundaries -- every branch's fixed `offset` a
+// multiple of `block` -- so every one of the consumer's `group` blocks is
+// owned by exactly one branch, never split across two. Always `true` for
+// `group <= 1` (an ordinary consumer has no block partition to line up with
+// at all).
+//
+// This is precisely the boundary this composition is safe at, and no wider:
+// a Concat branch is pruned *independently*, by its own top-k over its own
+// disjoint slice, with no visibility into any other branch's ranking or how
+// many channels it plans to keep. When every branch boundary is
+// block-aligned, each of the consumer's `group` blocks falls entirely
+// within one branch's own slice, so that branch alone can satisfy the
+// block's own uniform-survivor-count requirement -- an independent per-block
+// top-k, keeping `per_group_keep` channels from each (the *same* count
+// every other block anywhere in this merge keeps, since `per_group_keep`
+// depends only on the consumer's own `group` and the merge's total
+// `n_channels`, never on which branch a channel happens to fall in). No
+// cross-branch agreement is ever needed, because no block ever has more
+// than one branch to agree between.
+//
+// When a block instead straddles two (or more) branches, satisfying that
+// block's own uniform-count requirement would need the counts each of those
+// branches independently contributes from that one shared block to sum to
+// exactly `per_group_keep` -- a branch's own top-k, ranked with no
+// knowledge of any sibling branch's importance or planned keep count, has
+// no general way to land on a matching split. Reconciling it would need
+// exactly the cross-branch importance comparison Concat support was built
+// to avoid, so this case is declined outright (checked by
+// FindConvConcatChains before a chain with `group > 1` is ever produced).
+// Mirrors pruning.py's own _concat_branches_align_to_consumer_group exactly
+// (see that function's own docstring for the full safety argument and a
+// concrete straddling-block counter-example).
+bool ConcatBranchesAlignToConsumerGroup(
+    const std::vector<ConcatBranch>& branches, int64_t n_channels,
+    int64_t group) {
+  if (group <= 1) {
+    return true;
+  }
+  const int64_t block = n_channels / group;
+  for (const auto& b : branches) {
+    if (b.offset % block != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // The Conv analogue of FindMatmulConcatChains: every operand of a
 // channel-axis Concat (axis in {1, -3}) is resolved backward via
 // WalkConvProducerBackward to either a real group=1 Conv producer
 // (kProducer) or an eligible Add merge's whole group (kAdd, composed via
-// ResolveConvResidualGroupForConcat). The consumer must itself be an
-// ordinary (group=1) Conv. Mirrors pruning.py's own
+// ResolveConvResidualGroupForConcat). The consumer may be an ordinary
+// (`group=1`) Conv, or a general grouped (`group > 1`) Conv whose own block
+// boundaries line up exactly with every branch's own fixed offset -- see
+// ConcatBranchesAlignToConsumerGroup's own comment for exactly which
+// grouped consumers are safe to admit and why. Mirrors pruning.py's own
 // _find_conv_concat_chains.
 std::vector<ConcatChain> FindConvConcatChains(onnx::GraphProto* graph) {
   InitMap init_map;
@@ -7023,8 +7345,9 @@ std::vector<ConcatChain> FindConvConcatChains(onnx::GraphProto* graph) {
     if (!consumer) {
       continue;
     }
-    if (consumer->group != 1) {
-      continue;  // See this section's own comment -- grouped consumer declined.
+    if (!ConcatBranchesAlignToConsumerGroup(branches, total_n,
+                                            consumer->group)) {
+      continue;  // See ConcatBranchesAlignToConsumerGroup's own comment.
     }
 
     ConcatChain chain;
@@ -7037,6 +7360,7 @@ std::vector<ConcatChain> FindConvConcatChains(onnx::GraphProto* graph) {
     chain.consumer_is_conv = true;
     chain.n_channels = total_n;
     chain.conv_pass_through = std::move(fwd_pass_through);
+    chain.consumer_group = consumer->group;
     chains.push_back(std::move(chain));
   }
   return chains;
@@ -7134,13 +7458,43 @@ void ApplyConcatChains(
       continue;  // A shared/tied initializer another chain already resized.
     }
 
+    // When `chain.consumer_group` (Conv chains only -- always 1 for a
+    // MatMul/Gemm chain) is greater than 1, each branch's own independent
+    // `keep` is still chosen with no cross-branch coordination -- only *how*
+    // it's chosen within one branch changes: rather than one plain top-k of
+    // that branch's own `n_channels`, it's chosen as one independent top-k
+    // per `block`-sized block the branch contains (the exact same global
+    // block size and `per_group_keep` target used everywhere else in this
+    // merge), exactly mirroring ApplyChains' own per-block mechanism for a
+    // single grouped producer/consumer -- safe here specifically because
+    // ConcatBranchesAlignToConsumerGroup already confirmed every such block
+    // falls entirely inside one branch before this chain was ever produced,
+    // so a branch's own `n_channels / block` is always a whole number.
+    // Mirrors pruning.py's own _apply_concat_chains exactly.
+    const int64_t group = chain.consumer_group;
+    int64_t block = 0, per_group_keep = 0;
+    if (group > 1) {
+      block = chain.n_channels / group;
+      per_group_keep = std::max<int64_t>(
+          1, std::llround(static_cast<double>(block) * (1.0 - sparsity)));
+    }
+
     std::vector<std::vector<int64_t>> branch_keeps;
     branch_keeps.reserve(chain.branches.size());
     bool any_pruned = false;
     for (const auto& b : chain.branches) {
       const int64_t n = b.n_channels;
-      const int64_t keep_count = std::max<int64_t>(
-          1, n - std::llround(static_cast<double>(n) * sparsity));
+      int64_t local_blocks = 0;
+      int64_t keep_count;
+      if (group > 1) {
+        // Whole number by construction -- see ConcatBranchesAlignToConsumer
+        // Group's own comment and this function's own comment above.
+        local_blocks = n / block;
+        keep_count = per_group_keep * local_blocks;
+      } else {
+        keep_count = std::max<int64_t>(
+            1, n - std::llround(static_cast<double>(n) * sparsity));
+      }
       if (keep_count >= n) {
         std::vector<int64_t> full(static_cast<size_t>(n));
         std::iota(full.begin(), full.end(), int64_t{0});
@@ -7190,7 +7544,22 @@ void ApplyConcatChains(
           }
         }
       }
-      branch_keeps.push_back(TopKIndicesAscending(importance, keep_count));
+      if (group > 1) {
+        // One independent top-k per block contained in this branch -- see
+        // this function's own comment above.
+        std::vector<int64_t> keep;
+        keep.reserve(static_cast<size_t>(keep_count));
+        for (int64_t gi = 0; gi < local_blocks; ++gi) {
+          std::vector<double> block_imp(importance.begin() + gi * block,
+                                        importance.begin() + (gi + 1) * block);
+          for (int64_t li : TopKIndicesAscending(block_imp, per_group_keep)) {
+            keep.push_back(li + gi * block);
+          }
+        }
+        branch_keeps.push_back(std::move(keep));
+      } else {
+        branch_keeps.push_back(TopKIndicesAscending(importance, keep_count));
+      }
     }
 
     if (!any_pruned) {
@@ -7256,9 +7625,18 @@ void ApplyConcatChains(
       }
     }
 
-    SliceConsumerWeight(init_map.at(chain.consumer_weight),
-                        chain.consumer_weight_transposed, global_keep,
-                        chain.consumer_is_conv);
+    // The final consumer slice is, correspondingly,
+    // SliceGroupedConsumerConvWeight rather than SliceConsumerWeight
+    // whenever `consumer_group > 1` -- mirrors pruning.py's own
+    // _apply_concat_chains exactly.
+    if (chain.consumer_is_conv && group > 1) {
+      SliceGroupedConsumerConvWeight(init_map.at(chain.consumer_weight),
+                                     global_keep, group, chain.n_channels);
+    } else {
+      SliceConsumerWeight(init_map.at(chain.consumer_weight),
+                          chain.consumer_weight_transposed, global_keep,
+                          chain.consumer_is_conv);
+    }
 
     for (const auto& w : producer_weights) {
       touched.producer.insert(w);
