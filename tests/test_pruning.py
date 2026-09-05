@@ -40585,6 +40585,7 @@ def _decomposed_gqa_model(
     out_reshape_wildcard=False,
     share_kv_reshape_shape=True,
     extra_foreign_q_reshape_consumer=False,
+    rope=False,
 ):
     """Builds the decomposed-attention graph:
     ``Linear(Q/K/V) -> Reshape(to heads) -> Transpose(to BHSD) ->
@@ -40611,6 +40612,20 @@ def _decomposed_gqa_model(
     adds a second, wholly unrelated `Reshape` reading Q's own head-split
     shape constant (simulating cross-layer CSE) to exercise the *cloning*
     path instead -- see that function's own docstring.
+
+    `rope` (default `False`) additionally applies the decomposed Llama/HF-
+    style RoPE hop :func:`_match_decomposed_rope_pass_through` recognizes
+    (see onnxsim/pruning.py's own comment above
+    :class:`_DecomposedRopePassThrough` for the confirmed shape) to Q's and
+    K's own branch, each independently, right after that branch's own
+    head-split `Transpose` and before (for K) `repeat_kv`/the dot-product
+    "swap" transpose -- two new graph inputs, `Cos`/`Sin` (`[batch, seq,
+    D]`), feed both hops identically (`Unsqueeze`d once, shared, exactly as
+    a real export's own common-subexpression elimination does). Forces K's
+    own dot-product transpose into the separate (never combined
+    `perm=[0, 2, 3, 1]`) form even when `KVH == H` -- RoPE's own nodes
+    always break the head-split/swap-transpose adjacency that combined form
+    requires, confirmed empirically (see that same section comment).
     """
     if Dv is None:
         Dv = D
@@ -40628,7 +40643,35 @@ def _decomposed_gqa_model(
     def _i64(arr, name):
         return onnx.numpy_helper.from_array(np.array(arr, dtype=np.int64), name)
 
+    def _rope_lines(prefix, src, out_name, d):
+        # `x * cos + rotate_half(x) * sin`, HuggingFace's own fixed formula
+        # -- see onnxsim/pruning.py's own comment above
+        # :class:`_DecomposedRopePassThrough` for the exact confirmed shape
+        # this mirrors, node for node.
+        return [
+            f"{prefix}direct = Mul({src}, CosU)",
+            f"{prefix}x1 = Slice({src}, SliceStart0, SliceHalf, SliceAxis3, SliceStep1)",
+            f"{prefix}x2 = Slice({src}, SliceHalf, SliceEnd, SliceAxis3, SliceStep1)",
+            f"{prefix}neg = Neg({prefix}x2)",
+            f"{prefix}rot = Concat<axis=-1>({prefix}neg, {prefix}x1)",
+            f"{prefix}rotated = Mul({prefix}rot, SinU)",
+            f"{out_name} = Add({prefix}direct, {prefix}rotated)",
+        ]
+
     initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    extra_inputs = ""
+
+    if rope:
+        assert D % 2 == 0
+        initializer += [
+            _i64([0], "SliceStart0"),
+            _i64([D // 2], "SliceHalf"),
+            _i64([D], "SliceEnd"),
+            _i64([3], "SliceAxis3"),
+            _i64([1], "SliceStep1"),
+            _i64([1], "Ax1"),
+        ]
+        extra_inputs += f", float[{batch},{seq},{D}] Cos, float[{batch},{seq},{D}] Sin"
 
     # Gemm requires a rank-2 input (unlike MatMul, which happily broadcasts
     # over the leading batch/seq axes) -- flattening `X` to `[batch*seq, K]`
@@ -40640,6 +40683,8 @@ def _decomposed_gqa_model(
     # regardless of `bias`, with no separate code path for either case.
     initializer.append(_i64([batch * seq, K], "XFlatShape"))
     lines = ["xf = Reshape(X, XFlatShape)"]
+    if rope:
+        lines += ["CosU = Unsqueeze(Cos, Ax1)", "SinU = Unsqueeze(Sin, Ax1)"]
     q_op, k_op, v_op, o_op = (
         "MatMul(xf, Wq)",
         "MatMul(xf, Wk)",
@@ -40668,8 +40713,10 @@ def _decomposed_gqa_model(
     lines += [
         "q0 = " + q_op,
         "qr = Reshape(q0, Sq)",
-        "qt = Transpose<perm=[0,2,1,3]>(qr)",
+        ("qt0" if rope else "qt") + " = Transpose<perm=[0,2,1,3]>(qr)",
     ]
+    if rope:
+        lines += _rope_lines("q", "qt0", "qt", D)
 
     if extra_foreign_q_reshape_consumer:
         # A second, wholly unrelated Reshape reading the SAME shape
@@ -40696,39 +40743,59 @@ def _decomposed_gqa_model(
     lines += ["v0 = " + v_op, f"vr = Reshape(v0, {sv_name})"]
 
     n_rep = H // KVH
-    if KVH == H:
-        lines.append("kt = Transpose<perm=[0,2,3,1]>(kr)")
-        lines.append("vt = Transpose<perm=[0,2,1,3]>(vr)")
-    else:
+    needs_repeat_kv = KVH < H
+    # RoPE, when present, always forces the separate head-split-then-swap
+    # form for K's own dot-product transpose -- its own nodes sit between
+    # the two, breaking the adjacency the combined `perm=[0, 2, 3, 1]` form
+    # requires -- even when `KVH == H` leaves no genuine `repeat_kv` to also
+    # force it (see this function's own docstring).
+    needs_separate_k_transpose = needs_repeat_kv or rope
+    if needs_repeat_kv:
         assert H % KVH == 0
         initializer.append(_i64([2], "Ax2"))
         initializer.append(_i64([batch, KVH, n_rep, seq, D], "KExpandShape"))
         initializer.append(_i64([batch, H, seq, D], "KMergeShape"))
         initializer.append(_i64([batch, KVH, n_rep, seq, Dv], "VExpandShape"))
         initializer.append(_i64([batch, H, seq, Dv], "VMergeShape"))
+
+    if needs_separate_k_transpose:
+        lines.append("kt0 = Transpose<perm=[0,2,1,3]>(kr)")
+        k_src = "kt0"
+        if rope:
+            lines += _rope_lines("k", "kt0", "krope", D)
+            k_src = "krope"
+        if needs_repeat_kv:
+            lines += [
+                f"ku = Unsqueeze({k_src}, Ax2)",
+                "ke = Expand(ku, KExpandShape)",
+                "kre = Reshape(ke, KMergeShape)",
+                "kt = Transpose<perm=[0,1,3,2]>(kre)",
+            ]
+        else:
+            lines.append(f"kt = Transpose<perm=[0,1,3,2]>({k_src})")
+    else:
+        lines.append("kt = Transpose<perm=[0,2,3,1]>(kr)")
+
+    if needs_repeat_kv:
         lines += [
-            "kt0 = Transpose<perm=[0,2,1,3]>(kr)",
-            "ku = Unsqueeze(kt0, Ax2)",
-            "ke = Expand(ku, KExpandShape)",
-            "kre = Reshape(ke, KMergeShape)",
-            "kt = Transpose<perm=[0,1,3,2]>(kre)",
             "vt0 = Transpose<perm=[0,2,1,3]>(vr)",
             "vu = Unsqueeze(vt0, Ax2)",
             "ve = Expand(vu, VExpandShape)",
             "vt = Reshape(ve, VMergeShape)",
         ]
+    else:
+        lines.append("vt = Transpose<perm=[0,2,1,3]>(vr)")
 
     initializer.append(_f32(np.array(D**-0.5, dtype=np.float32), "Scale"))
     lines += ["qk = MatMul(qt, kt)", "scaled = Mul(qk, Scale)"]
 
-    extra_inputs = ""
     if masked:
         if mask is None:
             mask = np.triu(np.full((seq, seq), -1e4, dtype=np.float32), k=1)[
                 None, None, :, :
             ]
         if mask_dynamic:
-            extra_inputs = f", float[1,1,{seq},{seq}] Mask"
+            extra_inputs += f", float[1,1,{seq},{seq}] Mask"
         else:
             initializer.append(_f32(np.asarray(mask), "Mask"))
         lines.append("premask = Add(scaled, Mask)")
@@ -41406,6 +41473,332 @@ def test_decomposed_attention_real_torch_export_pipeline():
     oracle_out = linear(ctx, wo, bo)
 
     np.testing.assert_allclose(ort_out, oracle_out, rtol=1e-3, atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Decomposed (un-fused) attention -- RoPE pass-through
+# ---------------------------------------------------------------------------
+# `_find_decomposed_gqa_chains` now also recognizes the decomposed Llama/HF-
+# style RoPE hop (`x * cos + rotate_half(x) * sin`) sitting between each
+# branch's own head-split `Transpose` and the QK^T `MatMul` (Q) or K's own
+# dot-product-transpose resolution (K) -- see onnxsim/pruning.py's own
+# comment above `_DecomposedGQAChain` and `class _DecomposedRopePassThrough`.
+
+
+def test_decomposed_attention_rope_real_torch_export_pipeline():
+    """The real end-to-end pipeline this feature targets, RoPE included:
+    ``torch.onnx.export -> onnxsim.simplify() -> apply_attention_head_pruning``
+    on an actual hand-written eager-attention `nn.Module` applying
+    HuggingFace's own `apply_rotary_pos_emb`/`rotate_half` to Q and K
+    between the head-split and the QK^T MatMul (GQA + a causal mask, the
+    common real-world Llama/Mistral/Qwen shape) -- confirming the RoPE
+    pass-through genuinely fires on a real export (not just a hand-built
+    fixture) and the pruned model's output matches an independently-computed
+    numpy oracle built directly from the PRUNED model's own (already-sliced)
+    tensors, run through a real `onnxruntime.InferenceSession`. Mirrors
+    `test_decomposed_attention_real_torch_export_pipeline` exactly, with
+    RoPE added to both Q's and K's own branch.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("onnxruntime")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, num_kv_heads, head_dim, seq, batch = 32, 8, 2, 8, 4, 1
+
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(q, k, cos, sin):
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    class EagerGQARope(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_heads = num_heads
+            self.num_kv_heads = num_kv_heads
+            self.head_dim = head_dim
+            self.q_proj = nn.Linear(hidden, num_heads * head_dim, bias=True)
+            self.k_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.v_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.o_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.scaling = head_dim**-0.5
+
+        def _repeat_kv(self, x, n_rep):
+            if n_rep == 1:
+                return x
+            b, kvh, s, d = x.shape
+            x = x[:, :, None, :, :].expand(b, kvh, n_rep, s, d)
+            return x.reshape(b, kvh * n_rep, s, d)
+
+        def forward(self, hidden_states, cos, sin, attn_mask):
+            b, s, _ = hidden_states.shape
+            q = (
+                self.q_proj(hidden_states)
+                .view(b, s, self.num_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            k = (
+                self.k_proj(hidden_states)
+                .view(b, s, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            v = (
+                self.v_proj(hidden_states)
+                .view(b, s, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            n_rep = self.num_heads // self.num_kv_heads
+            k = self._repeat_kv(k, n_rep)
+            v = self._repeat_kv(v, n_rep)
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.o_proj(attn_output)
+
+    m = EagerGQARope()
+    m.eval()
+    x = torch.randn(batch, seq, hidden)
+    cos = torch.randn(batch, seq, head_dim)
+    sin = torch.randn(batch, seq, head_dim)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+
+    buf = io.BytesIO()
+    torch.onnx.export(
+        m,
+        (x, cos, sin, mask),
+        buf,
+        input_names=["hidden_states", "cos", "sin", "attn_mask"],
+        output_names=["output"],
+        opset_version=17,
+        dynamo=False,
+    )
+    raw = onnx.load_from_string(buf.getvalue())
+
+    simplified, ok = onnxsim.onnx_simplifier.simplify(raw)
+    assert ok
+
+    assert not any(
+        n.op_type
+        in ("Attention", "GroupQueryAttention", "MultiHeadAttention", "PagedAttention")
+        for n in simplified.graph.node
+    )
+
+    from onnxsim.pruning import (
+        _find_decomposed_gqa_chains,
+        _shape_inferred_value_info_by_name,
+    )
+
+    chains = _find_decomposed_gqa_chains(
+        simplified.graph, _shape_inferred_value_info_by_name(simplified)
+    )
+    assert len(chains) == 1
+    assert chains[0].q_rope is not None
+    assert chains[0].k_rope is not None
+
+    pruned = onnxsim.apply_attention_head_pruning(simplified, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    def _find_gemm(model, bias_substr):
+        for n in model.graph.node:
+            if n.op_type == "Gemm" and len(n.input) == 3 and bias_substr in n.input[2]:
+                return n
+        raise AssertionError(f"no Gemm found for {bias_substr!r}")
+
+    def _init(model, name):
+        for t in model.graph.initializer:
+            if t.name == name:
+                return onnx.numpy_helper.to_array(t)
+        for n in model.graph.node:
+            if n.op_type == "Constant" and n.output[0] == name:
+                for a in n.attribute:
+                    if a.name == "value":
+                        return onnx.numpy_helper.to_array(a.t)
+        raise AssertionError(f"no initializer/Constant found for {name!r}")
+
+    q_gemm = _find_gemm(pruned, "q_proj.bias")
+    k_gemm = _find_gemm(pruned, "k_proj.bias")
+    v_gemm = _find_gemm(pruned, "v_proj.bias")
+    o_gemm = _find_gemm(pruned, "o_proj.bias")
+    wq, bq = _init(pruned, q_gemm.input[1]), _init(pruned, q_gemm.input[2])
+    wk, bk = _init(pruned, k_gemm.input[1]), _init(pruned, k_gemm.input[2])
+    wv, bv = _init(pruned, v_gemm.input[1]), _init(pruned, v_gemm.input[2])
+    wo, bo = _init(pruned, o_gemm.input[1]), _init(pruned, o_gemm.input[2])
+
+    new_num_heads = wq.shape[1] // head_dim
+    new_kv_num_heads = wk.shape[1] // head_dim
+    new_v_head_dim = wv.shape[1] // new_kv_num_heads
+    assert new_num_heads < num_heads
+    assert new_kv_num_heads < num_kv_heads
+    assert new_num_heads // new_kv_num_heads == num_heads // num_kv_heads
+
+    rng = np.random.default_rng(0)
+    hidden_states = rng.standard_normal((batch, seq, hidden)).astype(np.float32)
+    cos_np = rng.standard_normal((batch, seq, head_dim)).astype(np.float32)
+    sin_np = rng.standard_normal((batch, seq, head_dim)).astype(np.float32)
+    mask_np = mask.numpy().astype(np.float32)
+
+    sess = ort.InferenceSession(
+        pruned.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (ort_out,) = sess.run(
+        None,
+        {
+            "hidden_states": hidden_states,
+            "cos": cos_np,
+            "sin": sin_np,
+            "attn_mask": mask_np,
+        },
+    )
+
+    def linear(x, w, b):
+        return x @ w + b
+
+    def np_rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return np.concatenate([-x2, x1], axis=-1)
+
+    def np_apply_rope(q, k, cos, sin):
+        cos_ = cos[:, None, :, :]
+        sin_ = sin[:, None, :, :]
+        return (
+            q * cos_ + np_rotate_half(q) * sin_,
+            k * cos_ + np_rotate_half(k) * sin_,
+        )
+
+    q = (
+        linear(hidden_states, wq, bq)
+        .reshape(batch, seq, new_num_heads, head_dim)
+        .transpose(0, 2, 1, 3)
+    )
+    k = (
+        linear(hidden_states, wk, bk)
+        .reshape(batch, seq, new_kv_num_heads, head_dim)
+        .transpose(0, 2, 1, 3)
+    )
+    v = (
+        linear(hidden_states, wv, bv)
+        .reshape(batch, seq, new_kv_num_heads, new_v_head_dim)
+        .transpose(0, 2, 1, 3)
+    )
+    q, k = np_apply_rope(q, k, cos_np, sin_np)
+    n_rep = new_num_heads // new_kv_num_heads
+    if n_rep > 1:
+        k = np.repeat(k, n_rep, axis=1)
+        v = np.repeat(v, n_rep, axis=1)
+    scale = head_dim**-0.5
+    scores = np.matmul(q, k.transpose(0, 1, 3, 2)) * scale
+    scores = scores + mask_np
+    scores = scores - scores.max(axis=-1, keepdims=True)
+    exp = np.exp(scores)
+    attn = exp / exp.sum(axis=-1, keepdims=True)
+    ctx = np.matmul(attn, v)
+    ctx = ctx.transpose(0, 2, 1, 3).reshape(batch, seq, new_num_heads * new_v_head_dim)
+    oracle_out = linear(ctx, wo, bo)
+
+    np.testing.assert_allclose(ort_out, oracle_out, rtol=1e-3, atol=1e-3)
+
+
+def test_decomposed_gqa_rope_pruning_matches_oracle_exactly():
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=2, D=8, Out=16, seed=1, rope=True)
+    rng = np.random.default_rng(7)
+    cos = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["D"])).astype(np.float32)
+    sin = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["D"])).astype(np.float32)
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned)
+    group_size = cfg["H"] // cfg["KVH"]
+    new_kv = cfg["KVH"] - round(cfg["KVH"] * 0.5)
+    assert wk_new.shape[1] == new_kv * cfg["D"]
+    assert wq_new.shape[1] == new_kv * group_size * cfg["D"]
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], new_kv
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _decomposed_gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=new_kv,
+        D=d,
+        Out=cfg["Out"],
+        seed=1,
+        rope=True,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        bq=cfg["bq"][q_idx],
+        bk=cfg["bk"][kv_idx],
+        bv=cfg["bv"][kv_idx],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng2 = np.random.default_rng(2)
+    x = rng2.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    feed = {"X": x, "Cos": cos, "Sin": sin}
+    (y_pruned,) = _run(pruned, feed)
+    (y_oracle,) = _run(oracle, feed)
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_decomposed_gqa_rope_pruning_declines_on_unclean_half_split():
+    # `rotate_half`'s own `Slice` bounds must resolve to a clean, exact half
+    # of `head_size` (see `_decomposed_rope_hop_is_consistent`) -- shifting
+    # the shared split point off-center must decline the whole chain, never
+    # guessed at.
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=2, D=8, Out=16, seed=1, rope=True)
+    for t in model.graph.initializer:
+        if t.name == "SliceHalf":
+            t.CopyFrom(
+                onnx.numpy_helper.from_array(
+                    np.array([cfg["D"] // 2 + 1], dtype=np.int64), "SliceHalf"
+                )
+            )
+    before = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in model.graph.initializer
+    }
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    after = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in pruned.graph.initializer
+    }
+    assert before == after
+
+
+def test_decomposed_gqa_rope_pruning_declines_on_slice_root_mismatch():
+    # Both of `rotate_half`'s own `Slice`s must read the SAME root tensor --
+    # rewiring one to a different, unrelated tensor must decline the whole
+    # chain, never guessed at.
+    model, _ = _decomposed_gqa_model(K=16, H=8, KVH=2, D=8, Out=16, seed=1, rope=True)
+    for n in model.graph.node:
+        if n.output and n.output[0] == "qx2":
+            n.input[0] = "xf"  # unrelated tensor, not Q's own head-split output
+    before = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in model.graph.initializer
+    }
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    after = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in pruned.graph.initializer
+    }
+    assert before == after
 
 
 # ---------------------------------------------------------------------------
