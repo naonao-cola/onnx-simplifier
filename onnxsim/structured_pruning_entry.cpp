@@ -19295,9 +19295,10 @@ void CommitTransformerBlockDrops(
 // C++ port of pruning.py's own apply_sparsegpt_pruning / _sparsegpt_prune_
 // columns / onnxsim.gptq._inverse_hessian_cholesky. See structured_pruning_
 // entry.h's own ApplySparseGptPruning declaration comment for the full
-// scope decision (FLOAT32-only weights, MatMul/vanilla-Gemm/`com.microsoft
-// ::Attention` merged-QKV weight only -- 2-D Conv is NOT ported here, see
-// that comment for why) and pruning.py's own module-level docstring /
+// scope decision (FLOAT32/FLOAT16/BFLOAT16 weights, MatMul/vanilla-Gemm/
+// `com.microsoft::Attention` merged-QKV weight only -- 2-D Conv is NOT
+// ported here, see that comment for why) and pruning.py's own module-level
+// docstring /
 // gptq.py's own module-level docstring for the algorithm itself. Three
 // genuinely new pieces this pass needs that no earlier pass in this file
 // does:
@@ -19676,10 +19677,15 @@ struct SparseGptHessian {
 // Reuses WandaCalibrationStats' own probe-injection/batch-iteration/
 // executor-call plumbing verbatim (see that function's own top comment for
 // the full calibration-crossing design every calibration-driven pass in
-// this file shares) -- same FLOAT32-only, `ndim >= 2` scope decision for a
-// probed activation (reshaped to `[-1, dims.back()]`, mirroring
-// pruning.py's own `x.reshape(-1, x.shape[-1])`). Unlike pruning.py's own
-// `np.concatenate`, which would raise if two batches' own activations for
+// this file shares) -- but, unlike WandaCalibrationStats itself (still
+// FLOAT32-only), this accepts a FLOAT/FLOAT16/BFLOAT16 probed activation
+// (IsSupportedFloatDtype, read via ReadTensorAsF64 rather than
+// ReadFloatTensor), matching ApplySparseGptPruning's own weight-side
+// FLOAT16/BFLOAT16 support below and pruning.py's own
+// `_is_supported_float_dtype`; `ndim >= 2` scope decision for a probed
+// activation is otherwise unchanged (reshaped to `[-1, dims.back()]`,
+// mirroring pruning.py's own `x.reshape(-1, x.shape[-1])`). Unlike pruning.py's
+// own `np.concatenate`, which would raise if two batches' own activations for
 // the same probe name disagreed on `dims.back()` (never happens for a
 // well-formed model -- that last dim is a fixed layer property, not a
 // per-batch one), a later batch that DOES disagree with the first batch's
@@ -19746,8 +19752,11 @@ std::unordered_map<std::string, SparseGptHessian> SparseGptHessianStats(
       }
       const DLTensor& dl = outputs[oit->second]->dl_tensor;
       onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
-      if (tp.data_type() != onnx::TensorProto::FLOAT) {
-        continue;  // Scope decision mirroring WandaCalibrationStats' own.
+      if (!IsSupportedFloatDtype(tp.data_type())) {
+        continue;  // FLOAT/FLOAT16/BFLOAT16 -- widened from this function's
+                   // earlier FLOAT32-only scope decision (mirrors
+                   // pruning.py's own `_is_supported_float_dtype` gate on
+                   // the probed activation; see IsSupportedFloatDtype).
       }
       const int64_t ndim = tp.dims_size();
       if (ndim < 2) {
@@ -19775,21 +19784,26 @@ std::unordered_map<std::string, SparseGptHessian> SparseGptHessianStats(
         continue;  // See this function's own top comment.
       }
 
-      const std::vector<float> data = ReadFloatTensor(tp);
+      // ReadTensorAsF64 (not ReadFloatTensor) -- handles FLOAT/FLOAT16/
+      // BFLOAT16 alike, upcasting FLOAT16/BFLOAT16 to double the same way
+      // this function's own weight read/write already does (see
+      // ApplySparseGptPruning below), mirroring pruning.py's own
+      // `np.asarray(result[name], dtype=np.float64)`.
+      const std::vector<double> data = ReadTensorAsF64(tp);
       // H += X.T @ X, accumulated over the upper triangle only (H is
       // symmetric by construction) then mirrored into the lower triangle
       // once, after every batch, below.
       for (int64_t r = 0; r < rows; ++r) {
-        const float* row = data.data() + r * kk;
+        const double* row = data.data() + r * kk;
         double* hbase = acc.h.data();
         for (int64_t i = 0; i < kk; ++i) {
-          const double xi = static_cast<double>(row[i]);
+          const double xi = row[i];
           if (xi == 0.0) {
             continue;
           }
           double* hrow = hbase + i * kk;
           for (int64_t j = i; j < kk; ++j) {
-            hrow[j] += xi * static_cast<double>(row[j]);
+            hrow[j] += xi * row[j];
           }
         }
       }
@@ -20606,6 +20620,94 @@ onnx::ModelProto ApplyTransformerBlockPruning(
   return out;
 }
 
+// Attention QKV-weight matcher for ApplySparseGptPruning ONLY -- mirrors
+// MatchAttentionProducer (this file's "Attention-head pruning" section)
+// exactly, but widened to accept FLOAT16/BFLOAT16 in addition to FLOAT32 for
+// both the weight and (if present) bias, mirroring pruning.py's own
+// `_match_attention_producer`, which is itself already
+// `_is_supported_float_dtype`-widened (`_match_attention_weight_only` just
+// reuses it in full, dtype widening included). Deliberately a narrow, LOCAL
+// duplicate rather than a change to the shared MatchAttentionProducer
+// itself -- exactly the same reasoning as this file's own
+// MatchMoeRouterProducer (MoE/QMoE whole-expert pruning section, see that
+// function's own comment): MatchAttentionProducer also backs this file's
+// OWN structural Attention-head pruning (FindAttentionChains /
+// ApplyOnePlainAttentionChain), which has not been independently
+// re-verified against a real FLOAT16/BFLOAT16 export and stays FLOAT32-only
+// -- its own downstream weight/bias rewriting is still ReadFloatTensor/
+// SetFloatTensorData-based (FLOAT32 only), so widening the shared matcher
+// in place would silently let a FLOAT16/BFLOAT16 node through to code that
+// cannot correctly handle it. SparseGPT never touches bias, only the
+// weight, but bias dtype/shape is still validated here (mirroring
+// `_match_attention_producer`'s own checks, reused in full by
+// `_match_attention_weight_only` even though nothing there reads bias
+// either) so a node this file's own structural head-pruning would decline
+// as malformed is declined the same way here.
+std::optional<AttentionProducerMatch> MatchAttentionProducerAnyFloat(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.domain() != kComMicrosoftDomain || node.op_type() != "Attention") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 2) {
+    return std::nullopt;
+  }
+  const std::string& w_name = node.input(1);
+  auto wit = init_map.find(w_name);
+  if (wit == init_map.end() ||
+      !IsSupportedFloatDtype(wit->second->data_type()) ||
+      wit->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+  const int64_t total_n = wit->second->dims(1);
+
+  std::optional<std::string> bias_name;
+  if (node.input_size() >= 3 && !node.input(2).empty()) {
+    bias_name = node.input(2);
+    auto bit = init_map.find(*bias_name);
+    if (bit == init_map.end() ||
+        !IsSupportedFloatDtype(bit->second->data_type()) ||
+        bit->second->dims_size() != 1 || bit->second->dims(0) != total_n) {
+      return std::nullopt;
+    }
+  }
+
+  int64_t num_heads = 0;
+  bool has_num_heads = false;
+  std::optional<std::vector<int64_t>> qkv_hidden_sizes;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "num_heads") {
+      num_heads = attr.i();
+      has_num_heads = true;
+    } else if (attr.name() == "qkv_hidden_sizes") {
+      qkv_hidden_sizes =
+          std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    }
+  }
+  if (!has_num_heads || num_heads <= 0) {
+    return std::nullopt;
+  }
+
+  int64_t nq, nk, nv;
+  if (qkv_hidden_sizes) {
+    if (qkv_hidden_sizes->size() != 3) {
+      return std::nullopt;
+    }
+    nq = (*qkv_hidden_sizes)[0];
+    nk = (*qkv_hidden_sizes)[1];
+    nv = (*qkv_hidden_sizes)[2];
+  } else {  // Schema default: Q/K/V evenly split the merged width.
+    if (total_n % 3 != 0) {
+      return std::nullopt;
+    }
+    nq = nk = nv = total_n / 3;
+  }
+  if (nq <= 0 || nk <= 0 || nv <= 0 || nq + nk + nv != total_n ||
+      nq % num_heads != 0 || nk % num_heads != 0 || nv % num_heads != 0) {
+    return std::nullopt;
+  }
+  return AttentionProducerMatch{w_name, bias_name, num_heads, nq, nk, nv};
+}
+
 // SparseGPT (Frantar & Alistarh, 2023) unstructured/N:M pruning. The C++
 // port of pruning.py's own apply_sparsegpt_pruning -- see this file's own
 // "SparseGPT (unstructured / N:M) pruning" section comment above
@@ -20668,20 +20770,23 @@ onnx::ModelProto ApplySparseGptPruning(
   // file's own established, already-documented narrower C++-port scope
   // decision everywhere else MatchMatMulLikeRaw is reused, e.g.
   // MatchProducer/WalkToAttentionConsumer above) with a constant 2-D
-  // FLOAT32 weight (NOT also FLOAT16/BFLOAT16, unlike pruning.py's own
-  // _is_supported_float_dtype -- mirrors this file's own established
-  // FLOAT32-only C++-port scope decision, e.g.
-  // ApplyMoeExpertChannelPruning's own doc comment), plus every matched
-  // `com.microsoft::Attention` node's constant 2-D FLOAT32 merged QKV
-  // weight (MatchAttentionProducer, already FLOAT32-2-D-only itself --
-  // reused verbatim, exactly mirroring pruning.py's own
-  // _match_attention_weight_only, which reuses _match_attention_producer's
-  // own identical validation, minus its bias handling: SparseGPT never
-  // touches bias, only weight). `com.microsoft::GroupQueryAttention`'s
-  // separate Q/K/V projections need no special-casing at all -- they are
-  // ordinary MatMul/vanilla-Gemm nodes, already matched by the first case
-  // above (see pruning.py's own module docstring for the full reasoning on
-  // why this is correct, not an oversight, for both).
+  // FLOAT/FLOAT16/BFLOAT16 weight (IsSupportedFloatDtype -- matches
+  // pruning.py's own _is_supported_float_dtype; read/written via
+  // ReadTensorAsF64/WriteF64TensorAs below, preserving the weight's own
+  // original dtype, exactly like the MoE/QMoE FP16/BFLOAT16 widening this
+  // mirrors), plus every matched `com.microsoft::Attention` node's constant
+  // 2-D FLOAT/FLOAT16/BFLOAT16 merged QKV weight
+  // (MatchAttentionProducerAnyFloat -- a narrow local dtype-widened
+  // duplicate of MatchAttentionProducer, see that function's own comment
+  // for why MatchAttentionProducer itself is left untouched -- exactly
+  // mirroring pruning.py's own _match_attention_weight_only, which reuses
+  // _match_attention_producer's own identical (already dtype-widened)
+  // validation, minus its bias handling: SparseGPT never touches bias, only
+  // weight). `com.microsoft::GroupQueryAttention`'s separate Q/K/V
+  // projections need no special-casing at all -- they are ordinary
+  // MatMul/vanilla-Gemm nodes, already matched by the first case above (see
+  // pruning.py's own module docstring for the full reasoning on why this is
+  // correct, not an oversight, for both).
   //
   // 2-D Conv (ordinary/depthwise/general-grouped) is declined outright,
   // NOT ported here -- see structured_pruning_entry.h's own
@@ -20690,7 +20795,11 @@ onnx::ModelProto ApplySparseGptPruning(
   // pruning.py's own module docstring documents at length, materially
   // bigger than the rest of this pass, with no correct upstream reference
   // to port from at all) -- a Conv node here simply never matches either
-  // case below and is left completely untouched, never guessed at.
+  // case below and is left completely untouched, never guessed at. This
+  // remains the one open scope gap versus pruning.py's own
+  // apply_sparsegpt_pruning after this port's FLOAT16/BFLOAT16 widening --
+  // see this function's own declaration comment in
+  // structured_pruning_entry.h.
   struct Candidate {
     std::string x_name;
     std::string w_name;
@@ -20702,13 +20811,13 @@ onnx::ModelProto ApplySparseGptPruning(
     if (mm) {
       auto wit = init_map.find(mm->w_name);
       if (wit != init_map.end() &&
-          wit->second->data_type() == onnx::TensorProto::FLOAT &&
+          IsSupportedFloatDtype(wit->second->data_type()) &&
           wit->second->dims_size() == 2) {
         candidates.push_back({mm->x_name, mm->w_name, mm->weight_transposed});
       }
       continue;
     }
-    auto am = MatchAttentionProducer(node, init_map);
+    auto am = MatchAttentionProducerAnyFloat(node, init_map);
     if (am) {
       // The merged QKV weight has no transpose attribute of its own -- it
       // is already [K, N]-shaped by construction (see
@@ -20742,8 +20851,19 @@ onnx::ModelProto ApplySparseGptPruning(
     onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
     const int64_t dim0 = w_init->dims(0);
     const int64_t dim1 = w_init->dims(1);
-    const std::vector<float> w_flat = ReadFloatTensor(*w_init);
-    const std::vector<double> w_f64(w_flat.begin(), w_flat.end());
+    const int32_t w_dtype = w_init->data_type();
+    // ReadTensorAsF64 (not ReadFloatTensor) -- FLOAT/FLOAT16/BFLOAT16 alike,
+    // upcast to double, mirroring pruning.py's own `_to_f64`; written back
+    // down to `w_dtype` (this weight's own original dtype) via
+    // WriteF64TensorAs below, mirroring pruning.py's own `_from_f64`. As
+    // pruning.py's own apply_sparsegpt_pruning docstring notes, SparseGPT's
+    // Hessian-compensated update recomputes every KEPT entry's own value
+    // too, so a FLOAT16/BFLOAT16 weight's surviving entries do not
+    // reproduce their pre-pruning bit pattern the way plain-masking passes'
+    // FLOAT16/BFLOAT16 widening does -- the float64 accumulation this
+    // function already used for numerical stability is unchanged either
+    // way.
+    const std::vector<double> w_f64 = ReadTensorAsF64(*w_init);
 
     // w_nk: [n_rows, kk], output-channel-first -- w as-is when already
     // weight_transposed ([N, K] = [dim0, dim1]), else w's own transpose
@@ -20774,20 +20894,18 @@ onnx::ModelProto ApplySparseGptPruning(
 
     // Inverse of the w -> w_nk reshape/transpose above, mirroring
     // pruning.py's own _nk_to_weight (non-Conv branch).
-    std::vector<float> w_new(static_cast<size_t>(dim0 * dim1));
+    std::vector<double> w_new(static_cast<size_t>(dim0 * dim1));
     if (c.weight_transposed) {
-      for (size_t i = 0; i < w_new.size(); ++i) {
-        w_new[i] = static_cast<float>(w_pruned_nk[i]);
-      }
+      w_new = w_pruned_nk;
     } else {
       for (int64_t nx = 0; nx < dim1; ++nx) {
         for (int64_t kx = 0; kx < dim0; ++kx) {
-          w_new[static_cast<size_t>(kx * dim1 + nx)] = static_cast<float>(
-              w_pruned_nk[static_cast<size_t>(nx * kk + kx)]);
+          w_new[static_cast<size_t>(kx * dim1 + nx)] =
+              w_pruned_nk[static_cast<size_t>(nx * kk + kx)];
         }
       }
     }
-    SetFloatTensorData(w_init, {dim0, dim1}, w_new);
+    WriteF64TensorAs(w_init, w_dtype, {dim0, dim1}, w_new);
   }
 
   return out;
