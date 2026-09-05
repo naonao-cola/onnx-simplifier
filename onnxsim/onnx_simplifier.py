@@ -2377,17 +2377,19 @@ def apply_embedding_vocab_pruning_cpp(
     :class:`onnxsim.pruning.EmbeddingPruningResult`'s own docstring for the
     full return-value contract.
 
-    Unlike :func:`onnxsim.apply_embedding_vocab_pruning`, this C++ port
-    still only ever matches a plain ``Gather`` or ``com.microsoft::
-    EmbedLayerNormalization`` producer -- not ``com.microsoft::
-    GatherBlockQuantized`` (the block-quantized embedding shape -- out of
-    scope for this port; see ``onnxsim/structured_pruning_entry.cpp``'s own
-    "Embedding vocabulary pruning" section comment for exactly why). Its
-    ``lm_head`` auto-detection recognizes ``MatMul``/vanilla ``Gemm``/
-    ``com.microsoft::FusedGemm``/``GemmFastGelu``, and the embedding
-    table/``lm_head`` weight/bias may be FLOAT, FLOAT16, OR BFLOAT16 -- both
-    match the pure-Python original's own scope now. See that same section
-    comment for the exact matched topology.
+    Matches all three producer shapes the pure-Python original recognizes:
+    a plain ``Gather``, ``com.microsoft::EmbedLayerNormalization``, or
+    ``com.microsoft::GatherBlockQuantized`` (the block-quantized embedding
+    shape -- verified TRUE full parity across both of its own sub-8-bit
+    packing conventions, native ``tensor(uint4)``/``tensor(int4)`` and
+    manually-packed ``tensor(uint8)``; see ``onnxsim/structured_pruning_
+    entry.cpp``'s own "Embedding vocabulary pruning" section comment for the
+    full empirical detail). Its ``lm_head`` auto-detection recognizes
+    ``MatMul``/vanilla ``Gemm``/``com.microsoft::FusedGemm``/
+    ``GemmFastGelu``, and the embedding table/``lm_head`` weight/bias may be
+    FLOAT, FLOAT16, OR BFLOAT16 -- all matching the pure-Python original's
+    own scope exactly. See that same section comment for the exact matched
+    topology.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
@@ -2450,10 +2452,14 @@ def apply_embedding_vocab_magnitude_pruning_cpp(
     -- see its own docstring and
     :class:`onnxsim.pruning.EmbeddingPruningResult`'s.
 
-    Same C++-port scope restrictions as
-    :func:`onnxsim.apply_embedding_vocab_pruning_cpp` (``GatherBlockQuantized``
-    still out of scope; every other producer/``lm_head``-node-type/dtype
-    shape matched) -- see that function's own docstring.
+    Same matched topology as
+    :func:`onnxsim.apply_embedding_vocab_pruning_cpp` (all three producer
+    shapes, including ``GatherBlockQuantized``, plus every ``lm_head``-node-
+    type/dtype shape) -- see that function's own docstring. For
+    ``GatherBlockQuantized``, the per-row L2 norm this ranks by is computed
+    from the dequantized-for-ranking-only embedding table (never written
+    back) -- see ``onnxsim/structured_pruning_entry.cpp``'s own
+    ``GatherBlockQuantizedDequantized``.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.

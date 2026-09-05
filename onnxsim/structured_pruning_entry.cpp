@@ -17139,51 +17139,78 @@ std::vector<onnx::GraphProto*> IterSubgraphs(onnx::GraphProto* graph) {
 // its index in `kept_token_ids`) before running the pruned model -- a
 // dropped id can never be fed to the pruned model again.
 //
-// Two of pruning.py's own three producer shapes are matched here -- plain
-// `Gather` (MatchEmbeddingGatherRaw) and `com.microsoft::
-// EmbedLayerNormalization` (MatchEmbedLayerNormProducer, added alongside it
-// -- see that function's own doc comment for the schema/scope this mirrors
-// from pruning.py's `_match_embed_layer_norm_producer`). `lm_head`
-// auto-detection also now recognizes `com.microsoft::FusedGemm`/
-// `GemmFastGelu` in addition to a bare `MatMul`/vanilla `Gemm`
-// (MatchMatMulLikeWidenedRaw, this section's own local mirror of
-// pruning.py's module-scoped `_match_matmul_like` override -- kept local to
-// this section, not merged into the shared MatchMatMulLikeRaw, for the
-// identical reason pruning.py's own override is kept local to
-// `onnxsim.pruning` rather than made to the shared `smoothquant.py` copy:
-// widening the shared matcher would silently change every OTHER pass in
-// this file that calls it too). The embedding table, `lm_head` weight, and
-// `lm_head` bias are now all admitted as FLOAT, FLOAT16, OR BFLOAT16
-// (IsSupportedFloatDtype, ReadFloatTensorAnyDtype/
+// All THREE of pruning.py's own producer shapes are matched here -- plain
+// `Gather` (MatchEmbeddingGatherRaw), `com.microsoft::
+// EmbedLayerNormalization` (MatchEmbedLayerNormProducer -- see that
+// function's own doc comment for the schema/scope this mirrors from
+// pruning.py's `_match_embed_layer_norm_producer`), and `com.microsoft::
+// GatherBlockQuantized` (MatchGatherBlockQuantizedProducer -- the
+// block-quantized, int2/int4/int8 analogue of a plain-float embedding
+// `Gather`; see that function's own doc comment, and pruning.py's own
+// section-top comment directly above `_match_gather_block_quantized_
+// producer`, for the full empirical schema/packing/real-exporter-evidence
+// this depends on). `lm_head` auto-detection also recognizes
+// `com.microsoft::FusedGemm`/`GemmFastGelu` in addition to a bare `MatMul`/
+// vanilla `Gemm` (MatchMatMulLikeWidenedRaw, this section's own local
+// mirror of pruning.py's module-scoped `_match_matmul_like` override --
+// kept local to this section, not merged into the shared
+// MatchMatMulLikeRaw, for the identical reason pruning.py's own override is
+// kept local to `onnxsim.pruning` rather than made to the shared
+// `smoothquant.py` copy: widening the shared matcher would silently change
+// every OTHER pass in this file that calls it too). The embedding table,
+// `lm_head` weight, and `lm_head` bias are all admitted as FLOAT, FLOAT16,
+// OR BFLOAT16 (IsSupportedFloatDtype, ReadFloatTensorAnyDtype/
 // SetFloatTensorDataPreservingDtype -- this section's own local upcast-to-
 // float32/downcast-to-original-dtype helpers, mirroring pruning.py's own
 // `_to_f64`/`_from_f64` convention; this file's shared ReadFloatTensor/
 // SetFloatTensorData stay FLOAT32-only and untouched, used elsewhere in
 // this file exactly as before).
 //
-// Deliberately still NARROWER than pruning.py's own three-producer-shape
-// port in exactly one remaining respect:
+// `GatherBlockQuantized`'s own `data`/`zero_points` operands use one of TWO
+// genuinely different sub-8-bit packing conventions, dispatched purely off
+// the operand's own dtype (never off the node's `bits` attribute) --
+// ReadPackedBytesAnyStorage/Unpack4BitFlat/Pack4BitFlat/
+// GatherBlockQuantizedTensorAsDouble/SliceGatherBlockQuantizedRows's own
+// top comment has the full empirical detail, independently re-confirmed
+// (not merely read off pruning.py's own comment) against a live
+// `onnx.numpy_helper`/`InferenceSession` round trip before this port was
+// written: ONNX-native sub-byte `tensor(uint4)`/`tensor(int4)` (a flat,
+// whole-tensor, 2-values-per-byte pack that can cross a row boundary) needs
+// a genuine unpack/row-select/repack; plain `tensor(uint8)` (regardless of
+// `bits` -- 2, 4, or 8) needs none at all -- each row's own declared
+// `dims(1)` bytes are already the atomic per-row storage unit, packed (when
+// `bits < 8`) independently per row, never across a row boundary. Both
+// conventions' default `zero_points` (0 for UINT4/INT4, `2**(bits-1)` for
+// UINT8, when the optional input is absent) and the dequantization-for-
+// ranking-only helper (GatherBlockQuantizedDequantized, used only by
+// EmbeddingVocabImportance for `ApplyEmbeddingVocabMagnitudePruning`'s own
+// ranking -- the actual slicing above never dequantizes-then-requantizes,
+// mirroring this file's own "slice the packed codes directly" invariant
+// used throughout its other quantized-pruning ports, e.g. MatMulNBits/QMoE)
+// are ported mirroring pruning.py's own `_gather_block_quantized_
+// dequantized` bit-for-bit -- INCLUDING that function's own pre-existing
+// dtype-dispatched (non-)unpacking asymmetry for the plain-UINT8 convention
+// (see GatherBlockQuantizedTensorAsDouble's own top comment): for that one
+// dtype+`bits<8` combination, the ranking formula operates over the PACKED
+// byte grid, not the true (pre-padding) post-unpack hidden positions -- a
+// property of the pure-Python reference this section mirrors exactly, not
+// a new gap this port introduces. A tied `lm_head` sharing the packed
+// `data` tensor itself is always declined for this shape specifically (see
+// MatchGatherBlockQuantizedProducer's own doc comment for why); an untied
+// `lm_head` is still auto-detected exactly as for the other two shapes.
 //
-//   * `com.microsoft::GatherBlockQuantized` (the int2/int4/int8
-//     block-quantized analogue of a plain-float embedding `Gather`) is
-//     simply never matched -- declined, not mis-handled -- by this port.
-//     Unlike the two gaps closed above, this one is deliberately left
-//     open: pruning.py's own section comment documents two genuinely
-//     different packing conventions (ONNX-native sub-byte `tensor(uint4)`/
-//     `tensor(int4)` vs. manually-packed `tensor(uint8)`, each with its own
-//     default-`zero_points` formula), a `scales`/`zero_points` pair that
-//     must be sliced in lockstep with `data`, and a dequantization-for-
-//     ranking-only helper -- real, verified-correct scope, but large enough
-//     that porting it hastily risks a subtle packing/slicing bug for a
-//     currently-narrow real-exporter surface (see that comment's own "Real
-//     exporter evidence" paragraph). Left as a clearly separate,
-//     independent follow-up rather than attempted here. Because this is a
-//     genuine remaining producer-shape gap (not just a narrower dtype/
-//     lm_head-node-type restriction), `apply_embedding_vocab_pruning`/
-//     `apply_embedding_vocab_magnitude_pruning` in pruning.py are NOT
-//     aliased to these C++ ports -- see this round's own summary for why
-//     "two of three producer shapes" does not clear this module's own
-//     "verified TRUE full parity, or don't alias" bar.
+// Verified TRUE full parity across both packing conventions before
+// `apply_embedding_vocab_pruning`/`apply_embedding_vocab_magnitude_pruning`
+// in pruning.py were aliased to these C++ ports (see pruning.py's own
+// doc comments on those two functions): native UINT4/INT4 and manually-
+// packed UINT8 (`bits` in {2, 4, 8}), each with and without an explicit
+// `zero_points`, an intentionally-adversarial odd hidden size (crossing a
+// nibble's own byte boundary for the native convention, forcing a padding
+// element for the packed-uint8 convention), FLOAT/FLOAT16/BFLOAT16 scales,
+// combined with an auto-detected untied `lm_head`, and cross-checked both
+// against a real `InferenceSession` run and against the (then still live)
+// pure-Python reference -- see tests/test_embedding_vocab_pruning_cpp.py's
+// own `GatherBlockQuantized` section for the frozen coverage.
 //
 // Every other structural safety check pruning.py's own `_match_embedding_
 // gather`/`_match_tied_lm_head`/`_match_untied_lm_head`/`_match_lm_head_
@@ -17197,11 +17224,12 @@ std::vector<onnx::GraphProto*> IterSubgraphs(onnx::GraphProto* graph) {
 // than one such candidate ambiguous, not evidence; a bias is only ever
 // recognized as a `Gemm`'s own built-in `C` input or a `MatMul`-then-
 // `Add(bias)` tail, anything else declining that whole `lm_head` match.
-// When more than one qualifying `Gather` exists and the caller hasn't
-// named `input_name`, the whole call declines.
+// When more than one qualifying producer -- any of the three shapes,
+// counted together -- exists and the caller hasn't named `input_name`, the
+// whole call declines.
 //
 // Subgraph-aware (IterSubgraphs, just above) exactly like every other pass
-// in this file: the one eligible `Gather` this pass requires may live
+// in this file: the one eligible producer this pass requires may live
 // inside a nested If/Loop/Scan/BeamSearch-family subgraph, at any nesting
 // depth, not only the top-level graph -- MatchEmbeddingChainAnyGraph
 // applies the identical "exactly one eligible producer, or decline" rule
@@ -17231,6 +17259,26 @@ struct EmbeddingLmHeadMatch {
   onnx::NodeProto* via_transpose = nullptr;
 };
 
+// Extra operands/attributes present only when EmbeddingChain::quantized is
+// set -- the embedding-table producer was matched as a `com.microsoft::
+// GatherBlockQuantized` node (MatchGatherBlockQuantizedProducer, below).
+// Mirrors pruning.py's own `_GatherBlockQuantizedInfo` exactly.
+// `EmbeddingChain::weight_name` continues to mean the node's own `data`
+// input (the packed/quantized embedding table itself) for this shape too --
+// only `scales_name`/`zero_points_name` are new. `gather_axis` is always 0
+// (the only value MatchGatherBlockQuantizedProducer ever admits -- see its
+// own doc comment), kept here rather than hard-coded at every call site so
+// ApplyEmbeddingVocabPrune/GatherBlockQuantizedDequantized read it off the
+// match itself, the same way every other field on this chain is read off
+// the match rather than re-derived.
+struct GatherBlockQuantizedInfo {
+  std::string scales_name;
+  std::optional<std::string> zero_points_name;
+  int64_t bits = 4;
+  int64_t block_size = 128;
+  int64_t gather_axis = 0;
+};
+
 struct EmbeddingChain {
   onnx::NodeProto* producer = nullptr;  // the matched Gather node
   std::string weight_name;              // the embedding table's own name
@@ -17238,6 +17286,10 @@ struct EmbeddingChain {
   int64_t vocab_size = 0;
   int64_t hidden_size = 0;
   std::optional<EmbeddingLmHeadMatch> lm_head;
+  // Non-nullopt only when `producer` is a `com.microsoft::
+  // GatherBlockQuantized` node -- nullopt for the two plain-float producer
+  // shapes (a plain `Gather` or `EmbedLayerNormalization`).
+  std::optional<GatherBlockQuantizedInfo> quantized;
 };
 
 // True for FLOAT, FLOAT16, and BFLOAT16 -- every element dtype this
@@ -17453,6 +17505,357 @@ void SetFloatTensorDataPreservingDtype(onnx::TensorProto* t,
                                       raw.size(), sizeof(uint16_t));
   }
   t->set_raw_data(std::move(raw));
+}
+
+// --- GatherBlockQuantized packed-byte helpers ---------------------------
+//
+// `com.microsoft::GatherBlockQuantized`'s own `data`/`zero_points` operands
+// use one of TWO genuinely different sub-8-bit packing conventions,
+// dispatched purely off the tensor's own declared dtype -- never off
+// `bits` -- exactly mirroring pruning.py's own top-of-section comment
+// (directly above `_match_gather_block_quantized_producer` there) and its
+// own `_slice_axis`/`onnx.numpy_helper.to_array`/`from_array` round trip:
+//
+//   * dtype UINT4/INT4 (ONNX's own native sub-byte tensor types): packed
+//     PER `onnx.numpy_helper`'s own `_pack_4bitx2`/`_unpack_4bit` -- a FLAT,
+//     WHOLE-TENSOR, row-major pack, 2 values per byte (byte `i` holds
+//     element `2i` in its low nibble, element `2i+1` in its high nibble),
+//     which can cross a row boundary when the trailing dimension count is
+//     odd. `TensorProto.dims` stores the LOGICAL (unpacked) shape for this
+//     dtype -- confirmed directly against a live `onnx.numpy_helper.
+//     from_array`/`to_array` round trip (this file's own scratch
+//     verification, not assumed): a `(5, 17)` logical shape's own
+//     `raw_data` is `ceil(5*17/2) = 43` bytes, and `to_array` returns it
+//     unpacked back to `(5, 17)`.
+//   * dtype plain UINT8 (regardless of `bits` -- 2, 4, OR 8): ONNX's own
+//     tensor-type system has no notion of this op's own per-row nibble/
+//     2-bit packing at all (that convention is invented by this op alone,
+//     never reflected in `TensorProto`'s own dtype), so `onnx.numpy_helper.
+//     to_array` does NOT unpack a plain UINT8 tensor -- it returns the raw
+//     per-element BYTE values verbatim, shape == `dims` exactly (confirmed
+//     directly: a `(2, 2)`-dims UINT8 tensor round-trips through
+//     `to_array` as the literal packed byte values, untouched). This
+//     matters for pruning.py's own ranking-only dequant helper (mirrored by
+//     GatherBlockQuantizedDequantized, below) -- for a genuinely packed
+//     (bits < 8) UINT8 tensor, that dequant formula is computed over the
+//     PACKED byte grid, not the true post-unpack hidden positions (this is
+//     a pre-existing property of the pure-Python reference this section
+//     mirrors bit-for-bit, not a new gap introduced by this port -- see
+//     that function's own doc comment for why this still self-consistently
+//     produces *some* per-row ranking signal, just not a numerically "real"
+//     dequantized value, for that one dtype+bits combination). It does NOT
+//     matter for actual SLICING correctness at all: this section's own top
+//     comment (pruning.py's `_match_gather_block_quantized_producer`
+//     comment) confirms the manually-packed convention's own packing is
+//     independent PER ROW (never crosses a row boundary), so each row's own
+//     `dims[1]` bytes are already the atomic per-row storage unit under
+//     this convention, regardless of what "true" (pre-padding) hidden
+//     width they represent -- a plain contiguous byte-per-row copy is
+//     always exactly right for GATHER-AXIS (row) slicing.
+//
+// Because `gather_axis` (the only axis this pass ever slices) is never
+// `quantize_axis` (the only axis either packing convention ever packs
+// along -- enforced by MatchGatherBlockQuantizedProducer's own degenerate-
+// case decline), neither convention's own row-slicing below ever needs to
+// touch a packed axis boundary.
+
+// Reads a tensor's raw byte payload as a flat `vector<uint8_t>` of exactly
+// `n_bytes` bytes, handling both `raw_data` and (ONNX's own wire convention
+// for sub-32-bit dtypes) zero-extended per-BYTE `int32_data` storage --
+// mirrors ReadFloatTensorAnyDtype's own already-established convention,
+// just at 1-byte-per-storage-unit granularity (a full byte for UINT8, one
+// PACKED byte -- not one logical sub-4-bit element -- for UINT4/INT4, per
+// `onnx.numpy_helper`'s own `int32_data` fallback path for those dtypes).
+// No endian-swap is ever needed here (unlike ReadFloatTensorAnyDtype's own
+// 2-byte-wide FLOAT16/BFLOAT16 codes): a single byte has no byte order.
+std::vector<uint8_t> ReadPackedBytesAnyStorage(const onnx::TensorProto& t,
+                                               size_t n_bytes) {
+  std::vector<uint8_t> bytes(n_bytes);
+  if (t.has_raw_data()) {
+    std::memcpy(bytes.data(), t.raw_data().data(), n_bytes);
+  } else {
+    for (size_t i = 0; i < n_bytes; ++i) {
+      bytes[i] = static_cast<uint8_t>(t.int32_data(static_cast<int>(i)));
+    }
+  }
+  return bytes;
+}
+
+// Unpacks ONNX's own native flat, whole-tensor, 2-values-per-byte sub-4-bit
+// packing (`onnx.numpy_helper`'s own `_unpack_4bit` convention -- see this
+// subsection's own top comment) into one 4-bit CODE per element (its raw
+// bit pattern, 0-15, never sign-extended -- this pass only ever relocates a
+// code via a row-select-then-repack, never interprets its numeric value,
+// so treating a UINT4 and INT4 code identically here is always safe).
+// `numel` is the tensor's own total logical element count (`dims`
+// product); a single trailing PADDING nibble (present only when `numel` is
+// odd) is simply never read.
+std::vector<uint8_t> Unpack4BitFlat(const uint8_t* raw, int64_t numel) {
+  std::vector<uint8_t> out(static_cast<size_t>(numel));
+  for (int64_t i = 0; i < numel; ++i) {
+    const uint8_t byte = raw[static_cast<size_t>(i / 2)];
+    out[static_cast<size_t>(i)] =
+        (i % 2 == 0) ? (byte & 0x0Fu) : ((byte >> 4) & 0x0Fu);
+  }
+  return out;
+}
+
+// Inverse of Unpack4BitFlat: packs `codes` (one 4-bit code per element,
+// only its own low nibble read) back into ONNX's own flat 2-per-byte
+// convention -- `codes[2i]` in byte `i`'s low nibble, `codes[2i+1]` in its
+// high nibble, with a final zero-filled high nibble when `codes.size()` is
+// odd (matching `_pack_4bitx2`'s own zero-padding).
+std::string Pack4BitFlat(const std::vector<uint8_t>& codes) {
+  const size_t n = codes.size();
+  std::string out((n + 1) / 2, '\0');
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t nibble = codes[i] & 0x0Fu;
+    uint8_t byte_val = static_cast<uint8_t>(out[i / 2]);
+    if (i % 2 == 0) {
+      byte_val = static_cast<uint8_t>((byte_val & 0xF0u) | nibble);
+    } else {
+      byte_val = static_cast<uint8_t>((byte_val & 0x0Fu) |
+                                      static_cast<uint8_t>(nibble << 4));
+    }
+    out[i / 2] = static_cast<char>(byte_val);
+  }
+  return out;
+}
+
+// Row-slices (axis 0, the vocab/`gather_axis`) `t` -- `data`, or (when
+// present and dtype-matching `data`) `zero_points` -- IN PLACE, byte-exact,
+// regardless of GatherBlockQuantized's own two distinct packing conventions
+// (this subsection's own top comment), dispatched purely off `t`'s own
+// dtype, mirroring pruning.py's own `_slice_axis` exactly: UINT4/INT4 needs
+// a genuine flat unpack/row-select/repack (Unpack4BitFlat/Pack4BitFlat);
+// plain UINT8 needs no unpack/repack at all -- each row's own `dims(1)`
+// bytes are already the atomic per-row storage unit under that convention,
+// so a row is a plain contiguous byte copy.
+void SliceGatherBlockQuantizedRows(onnx::TensorProto* t,
+                                   const std::vector<int64_t>& keep) {
+  const int64_t d0 = t->dims(0);
+  const int64_t d1 = t->dims(1);
+  const int64_t kc = static_cast<int64_t>(keep.size());
+  const int32_t dtype = t->data_type();
+  const std::string name = t->name();
+
+  std::string new_raw;
+  if (dtype == onnx::TensorProto::UINT8) {
+    const size_t row_bytes = static_cast<size_t>(d1);
+    const std::vector<uint8_t> bytes =
+        ReadPackedBytesAnyStorage(*t, static_cast<size_t>(d0) * row_bytes);
+    new_raw.resize(static_cast<size_t>(kc) * row_bytes);
+    for (int64_t i = 0; i < kc; ++i) {
+      const size_t src =
+          static_cast<size_t>(keep[static_cast<size_t>(i)]) * row_bytes;
+      std::memcpy(&new_raw[static_cast<size_t>(i) * row_bytes], &bytes[src],
+                  row_bytes);
+    }
+  } else {
+    // UINT4 / INT4: ONNX-native flat whole-tensor packing.
+    const int64_t numel = d0 * d1;
+    const size_t n_bytes = static_cast<size_t>((numel + 1) / 2);
+    const std::vector<uint8_t> raw = ReadPackedBytesAnyStorage(*t, n_bytes);
+    const std::vector<uint8_t> codes = Unpack4BitFlat(raw.data(), numel);
+    std::vector<uint8_t> new_codes(static_cast<size_t>(kc) *
+                                   static_cast<size_t>(d1));
+    for (int64_t i = 0; i < kc; ++i) {
+      const int64_t src_row = keep[static_cast<size_t>(i)];
+      std::memcpy(
+          &new_codes[static_cast<size_t>(i) * static_cast<size_t>(d1)],
+          &codes[static_cast<size_t>(src_row) * static_cast<size_t>(d1)],
+          static_cast<size_t>(d1));
+    }
+    new_raw = Pack4BitFlat(new_codes);
+  }
+
+  t->Clear();
+  t->set_name(name);
+  t->set_data_type(static_cast<onnx::TensorProto_DataType>(dtype));
+  t->add_dims(kc);
+  t->add_dims(d1);
+  t->set_raw_data(std::move(new_raw));
+}
+
+// Reads `data`'s (or `zero_points`'s) own logical `(dims(0), dims(1))`
+// values as `double`, mirroring `onnx.numpy_helper.to_array(...).astype(
+// np.float64)`'s own per-dtype behavior EXACTLY -- including its own
+// dtype-dispatched (non-)unpacking asymmetry (this subsection's own top
+// comment): UINT4 unpacks to unsigned codes 0-15; INT4 unpacks to SIGNED
+// 4-bit codes (twos-complement: raw codes 8-15 represent -8..-1); plain
+// UINT8 is read as-is, NO unpacking, regardless of `bits` -- the packed
+// byte value itself, 0-255, is what `to_array` (and therefore this
+// function) returns.
+std::vector<double> GatherBlockQuantizedTensorAsDouble(
+    const onnx::TensorProto& t) {
+  const int64_t d0 = t.dims(0);
+  const int64_t d1 = t.dims(1);
+  const int64_t numel = d0 * d1;
+  const int32_t dtype = t.data_type();
+  std::vector<double> out(static_cast<size_t>(numel));
+  if (dtype == onnx::TensorProto::UINT8) {
+    const std::vector<uint8_t> bytes =
+        ReadPackedBytesAnyStorage(t, static_cast<size_t>(numel));
+    for (int64_t i = 0; i < numel; ++i) {
+      out[static_cast<size_t>(i)] =
+          static_cast<double>(bytes[static_cast<size_t>(i)]);
+    }
+  } else {
+    const size_t n_bytes = static_cast<size_t>((numel + 1) / 2);
+    const std::vector<uint8_t> raw = ReadPackedBytesAnyStorage(t, n_bytes);
+    const std::vector<uint8_t> codes = Unpack4BitFlat(raw.data(), numel);
+    const bool is_signed = dtype == onnx::TensorProto::INT4;
+    for (int64_t i = 0; i < numel; ++i) {
+      const uint8_t c = codes[static_cast<size_t>(i)];
+      out[static_cast<size_t>(i)] =
+          (is_signed && c >= 8) ? static_cast<double>(static_cast<int>(c) - 16)
+                                : static_cast<double>(c);
+    }
+  }
+  return out;
+}
+
+// True for UINT4, INT4, and plain UINT8 -- every element dtype
+// MatchGatherBlockQuantizedProducer accepts for `data`/`zero_points`.
+// Mirrors pruning.py's own `_GATHER_BLOCK_QUANTIZED_DATA_TYPES` set
+// exactly.
+bool IsGatherBlockQuantizedDataDtype(int32_t data_type) {
+  return data_type == onnx::TensorProto::UINT4 ||
+         data_type == onnx::TensorProto::INT4 ||
+         data_type == onnx::TensorProto::UINT8;
+}
+
+// `com.microsoft::GatherBlockQuantized` -- a third producer shape, the
+// block-quantized (int2/int4/int8) analogue of a plain-float embedding
+// `Gather`, matched alongside MatchEmbeddingGatherRaw/
+// MatchEmbedLayerNormProducer by MatchEmbeddingChain's own dispatch loop.
+// Mirrors pruning.py's own `_match_gather_block_quantized_producer`
+// exactly -- see that function's own section-top comment (directly above
+// it in pruning.py) for the full empirical schema/packing/real-exporter-
+// evidence this depends on. None of the packing-convention/default-
+// `zero_points` subtlety matters for MATCHING itself (only for the actual
+// slicing/dequant-for-ranking helpers elsewhere in this section) -- this
+// function only checks shape/dtype/consumer-count structure, exactly
+// mirroring the Python matcher's own scope.
+//
+// Matching bar: `node` must be `com.microsoft::GatherBlockQuantized` with 3
+// or 4 inputs (`zero_points` optional); `bits` in {2, 4, 8}; `gather_axis`
+// (default 0) and `quantize_axis` (default 1), each normalized for a
+// negative value, must resolve to exactly 0 and 1 respectively -- for the
+// rank-2 `data` this matcher requires, this alone already makes the
+// degenerate `gather_axis == quantize_axis` case structurally impossible,
+// so no separate check is needed; `data` a constant rank-2 initializer of
+// dtype UINT4/INT4/UINT8; `indices` a declared graph input, or one bounded
+// `Cast` hop from one (identical rule to the other two producer shapes);
+// `scales` a constant, rank-2, IsSupportedFloatDtype initializer whose own
+// axis-0 size matches `data`'s; `zero_points`, when present, a constant,
+// rank-2, SAME-dtype-as-`data` initializer whose own axis-0 size also
+// matches `data`'s (the schema's own "data and zero_points have the same
+// type"); `data` itself must have exactly one consumer (this node) -- a
+// tied `lm_head` sharing the packed `data` tensor is always declined for
+// this shape (see pruning.py's own docstring for why: composing two
+// different ops' quantization conventions across a tied boundary is out of
+// scope).
+std::optional<
+    std::tuple<std::string, std::string, std::string, GatherBlockQuantizedInfo>>
+MatchGatherBlockQuantizedProducer(
+    const onnx::NodeProto& node, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_input_names,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output) {
+  if (node.op_type() != "GatherBlockQuantized" ||
+      node.domain() != kComMicrosoftDomain) {
+    return std::nullopt;
+  }
+  if (node.input_size() != 3 && node.input_size() != 4) {
+    return std::nullopt;
+  }
+
+  int64_t bits = 4, block_size = 128, quantize_axis = 1, gather_axis = 0;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "bits") {
+      bits = attr.i();
+    } else if (attr.name() == "block_size") {
+      block_size = attr.i();
+    } else if (attr.name() == "quantize_axis") {
+      quantize_axis = attr.i();
+    } else if (attr.name() == "gather_axis") {
+      gather_axis = attr.i();
+    }
+  }
+  if (bits != 2 && bits != 4 && bits != 8) {
+    return std::nullopt;
+  }
+
+  const std::string& data_name = node.input(0);
+  const std::string& indices_name = node.input(1);
+  const std::string& scales_name = node.input(2);
+  std::optional<std::string> zero_points_name;
+  if (node.input_size() == 4 && !node.input(3).empty()) {
+    zero_points_name = node.input(3);
+  }
+
+  auto dit = init_map.find(data_name);
+  if (dit == init_map.end() ||
+      !IsGatherBlockQuantizedDataDtype(dit->second->data_type()) ||
+      dit->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+  const int64_t rank = dit->second->dims_size();
+  if (gather_axis < 0) {
+    gather_axis += rank;
+  }
+  if (quantize_axis < 0) {
+    quantize_axis += rank;
+  }
+  if (gather_axis != 0 || quantize_axis != 1) {
+    return std::nullopt;  // only the plain (vocab_size, hidden_size) layout
+  }
+
+  auto sit = init_map.find(scales_name);
+  if (sit == init_map.end() ||
+      !IsSupportedFloatDtype(sit->second->data_type()) ||
+      sit->second->dims_size() != 2 ||
+      sit->second->dims(gather_axis) != dit->second->dims(gather_axis)) {
+    return std::nullopt;
+  }
+
+  if (zero_points_name) {
+    auto zit = init_map.find(*zero_points_name);
+    if (zit == init_map.end() ||
+        zit->second->data_type() != dit->second->data_type() ||
+        zit->second->dims_size() != 2 ||
+        zit->second->dims(gather_axis) != dit->second->dims(gather_axis)) {
+      return std::nullopt;
+    }
+  }
+
+  std::string underlying = indices_name;
+  if (!graph_input_names.count(underlying)) {
+    auto cit = node_by_output.find(underlying);
+    if (cit != node_by_output.end() && cit->second->op_type() == "Cast" &&
+        cit->second->input_size() == 1 &&
+        graph_input_names.count(cit->second->input(0))) {
+      underlying = cit->second->input(0);
+    } else {
+      return std::nullopt;  // not a graph input, nor a Cast of one
+    }
+  }
+
+  auto cit2 = consumers_of.find(data_name);
+  const size_t n_data_consumers =
+      cit2 == consumers_of.end() ? 0 : cit2->second.size();
+  if (n_data_consumers != 1) {
+    return std::nullopt;  // any other/extra consumer -- always declined
+  }
+
+  GatherBlockQuantizedInfo info;
+  info.scales_name = scales_name;
+  info.zero_points_name = zero_points_name;
+  info.bits = bits;
+  info.block_size = block_size;
+  info.gather_axis = gather_axis;
+  return std::make_tuple(data_name, indices_name, underlying, info);
 }
 
 // This section's own local mirror of pruning.py's module-scoped
@@ -17910,17 +18313,29 @@ std::optional<EmbeddingChain> MatchEmbeddingChain(
     onnx::NodeProto* node;
     std::string w_name;
     std::string indices_name;
+    std::optional<GatherBlockQuantizedInfo> quantized;
   };
   std::vector<RawMatch> matches;
   for (int i = 0; i < graph->node_size(); ++i) {
     onnx::NodeProto* node = graph->mutable_node(i);
-    // Try both producer shapes -- a node is at most one of them (disjoint
-    // op_type/domain checks), so there is never a double-count here.
+    // Try all three producer shapes -- a node is at most one of them
+    // (disjoint op_type/domain checks), so there is never a double-count
+    // here.
     auto m = MatchEmbeddingGatherRaw(*node, init_map, consumers_of,
                                      graph_input_names, node_by_output);
     if (!m) {
       m = MatchEmbedLayerNormProducer(*node, init_map, consumers_of,
                                       graph_input_names, node_by_output);
+    }
+    std::optional<GatherBlockQuantizedInfo> quantized;
+    if (!m) {
+      auto m_q = MatchGatherBlockQuantizedProducer(
+          *node, init_map, consumers_of, graph_input_names, node_by_output);
+      if (m_q) {
+        m = std::make_tuple(std::get<0>(*m_q), std::get<1>(*m_q),
+                            std::get<2>(*m_q));
+        quantized = std::get<3>(*m_q);
+      }
     }
     if (!m) {
       continue;
@@ -17932,7 +18347,7 @@ std::optional<EmbeddingChain> MatchEmbeddingChain(
         *input_name != underlying) {
       continue;
     }
-    matches.push_back({node, w_name, indices_name});
+    matches.push_back({node, w_name, indices_name, quantized});
   }
 
   if (input_name && matches.empty()) {
@@ -17951,14 +18366,30 @@ std::optional<EmbeddingChain> MatchEmbeddingChain(
 
   onnx::NodeProto* producer_node = matches[0].node;
   const std::string& w_name = matches[0].w_name;
+  const std::optional<GatherBlockQuantizedInfo>& quantized =
+      matches[0].quantized;
   const onnx::TensorProto* w_init = init_map.at(w_name);
-  const int64_t vocab_size = w_init->dims(0);
-  const int64_t hidden_size = w_init->dims(1);
+  int64_t vocab_size, hidden_size;
+  if (quantized) {
+    vocab_size = w_init->dims(quantized->gather_axis);
+    hidden_size = w_init->dims(1 - quantized->gather_axis);
+  } else {
+    vocab_size = w_init->dims(0);
+    hidden_size = w_init->dims(1);
+  }
 
   auto cit = consumers_of.find(w_name);
   const size_t n_consumers = cit == consumers_of.end() ? 0 : cit->second.size();
   std::optional<EmbeddingLmHeadMatch> lm_head;
-  if (n_consumers == 2) {
+  if (quantized) {
+    // A tied lm_head sharing the packed/quantized `data` tensor is always
+    // declined -- MatchGatherBlockQuantizedProducer's own single-consumer
+    // requirement already guarantees `n_consumers == 1` here, so only the
+    // untied auto-detection path is ever attempted. Mirrors pruning.py's
+    // own `_match_embedding_chain` exactly.
+    lm_head = MatchUntiedLmHead(graph, w_name, vocab_size, consumers_of,
+                                init_map, graph_outputs);
+  } else if (n_consumers == 2) {
     lm_head = MatchTiedLmHead(w_name, vocab_size, producer_node, consumers_of,
                               init_map);
     if (!lm_head) {
@@ -17977,6 +18408,7 @@ std::optional<EmbeddingChain> MatchEmbeddingChain(
   chain.vocab_size = vocab_size;
   chain.hidden_size = hidden_size;
   chain.lm_head = lm_head;
+  chain.quantized = quantized;
   return chain;
 }
 
@@ -18116,9 +18548,28 @@ void ApplyEmbeddingVocabPrune(onnx::GraphProto* graph,
 
   // The embedding table is [vocab_size, hidden_size] with vocab_size as
   // axis 0 -- exactly SliceEmbeddingWeightAnyDtype's own
-  // `weight_transposed=true` ("output channel is axis 0") branch.
-  SliceEmbeddingWeightAnyDtype(init_map.at(chain.weight_name),
-                               /*weight_transposed=*/true, keep_ids);
+  // `weight_transposed=true` ("output channel is axis 0") branch. The
+  // `GatherBlockQuantized` shape's own packed `data` tensor is NOT a
+  // FLOAT/FLOAT16/BFLOAT16 tensor (it is UINT4/INT4/UINT8), so it takes the
+  // dtype-dispatched packed-byte row-slice (SliceGatherBlockQuantizedRows)
+  // instead -- `scales` stays FLOAT-family (SliceEmbeddingWeightAnyDtype
+  // applies unchanged, its own `(vocab_size, n_blocks)` shape matching that
+  // helper's `(dim0, dim1)` contract exactly), and `zero_points`, when
+  // present, shares `data`'s own dtype so it takes the same packed-byte
+  // slice too. Mirrors pruning.py's own `_apply_embedding_vocab_prune`
+  // exactly (`_slice_axis` applied to `data`/`scales`/`zero_points` alike).
+  if (chain.quantized) {
+    SliceGatherBlockQuantizedRows(init_map.at(chain.weight_name), keep_ids);
+    SliceEmbeddingWeightAnyDtype(init_map.at(chain.quantized->scales_name),
+                                 /*weight_transposed=*/true, keep_ids);
+    if (chain.quantized->zero_points_name) {
+      SliceGatherBlockQuantizedRows(
+          init_map.at(*chain.quantized->zero_points_name), keep_ids);
+    }
+  } else {
+    SliceEmbeddingWeightAnyDtype(init_map.at(chain.weight_name),
+                                 /*weight_transposed=*/true, keep_ids);
+  }
 
   if (chain.lm_head && !chain.lm_head->tied) {
     SliceEmbeddingWeightAnyDtype(init_map.at(*chain.lm_head->weight_name),
@@ -18156,18 +18607,92 @@ void ApplyEmbeddingVocabPrune(onnx::GraphProto* graph,
   }
 }
 
+// The full `(vocab_size, data.dims(1))` dequantized embedding table
+// `chain`'s own `com.microsoft::GatherBlockQuantized` producer refers to,
+// for IMPORTANCE RANKING ONLY -- never written back to the graph (this
+// module's own "slice, don't recompute" principle, exactly as
+// MatMulNBitsDequantized). Requires `chain.quantized` is set. Mirrors
+// pruning.py's own `_gather_block_quantized_dequantized` EXACTLY,
+// including its own dtype-dispatched (non-)unpacking asymmetry for `data`/
+// `zero_points` (GatherBlockQuantizedTensorAsDouble's own top comment) --
+// formula: `dequantized[v, h] = (data[v, h] - zero_point[v, h //
+// block_size]) * scale[v, h // block_size]`, `h` ranging over `data`'s own
+// logical `dims(1)` (== `chain.hidden_size`) -- for the plain-UINT8 packed
+// convention this is the PACKED width, not necessarily the true (pre-
+// padding) hidden size; a pre-existing property of the pure-Python
+// reference this mirrors bit-for-bit, not a new gap introduced by this
+// port (see that subsection's own top comment for the full explanation).
+std::vector<double> GatherBlockQuantizedDequantized(const EmbeddingChain& chain,
+                                                    const InitMap& init_map) {
+  const GatherBlockQuantizedInfo& q = *chain.quantized;
+  const onnx::TensorProto* data_init = init_map.at(chain.weight_name);
+  const std::vector<double> data =
+      GatherBlockQuantizedTensorAsDouble(*data_init);
+  const onnx::TensorProto* scales_init = init_map.at(q.scales_name);
+  const std::vector<float> scales_f = ReadFloatTensorAnyDtype(*scales_init);
+  const std::vector<double> scales(scales_f.begin(), scales_f.end());
+  const int64_t vocab = data_init->dims(0);
+  const int64_t d1 = data_init->dims(1);
+  const int64_t n_blocks = scales_init->dims(1);
+
+  std::vector<double> zp;
+  int64_t zp_cols = n_blocks;
+  if (q.zero_points_name) {
+    const onnx::TensorProto* zp_init = init_map.at(*q.zero_points_name);
+    zp = GatherBlockQuantizedTensorAsDouble(*zp_init);
+    // May legitimately differ from `n_blocks` for the packed-uint8
+    // convention (see this section's own top comment) -- mirrors
+    // pruning.py's own `zp[:, col_block]` indexing exactly, including its
+    // own out-of-range-index behavior for that edge case.
+    zp_cols = zp_init->dims(1);
+  } else {
+    const double default_zp =
+        (data_init->data_type() == onnx::TensorProto::UINT4 ||
+         data_init->data_type() == onnx::TensorProto::INT4)
+            ? 0.0
+            : static_cast<double>(int64_t{1} << (q.bits - 1));
+    zp.assign(static_cast<size_t>(vocab * n_blocks), default_zp);
+  }
+
+  std::vector<double> out(static_cast<size_t>(vocab * d1));
+  for (int64_t v = 0; v < vocab; ++v) {
+    for (int64_t h = 0; h < d1; ++h) {
+      int64_t col_block = h / q.block_size;
+      if (col_block > n_blocks - 1) {
+        col_block = n_blocks - 1;
+      }
+      const double s = scales[static_cast<size_t>(v * n_blocks + col_block)];
+      const double z = zp[static_cast<size_t>(v * zp_cols + col_block)];
+      out[static_cast<size_t>(v * d1 + h)] =
+          (data[static_cast<size_t>(v * d1 + h)] - z) * s;
+    }
+  }
+  return out;
+}
+
 // The per-row (vocab-axis) L2-norm importance vector shared by
 // ApplyEmbeddingVocabMagnitudePruning: the matched embedding table's own
 // row norm, combined (root-sum-square) with a matched untied `lm_head`'s
 // own row norm when one exists (the tied case needs no such combination --
 // the embedding table's own row norm already IS the tied `lm_head`'s row
 // norm). Mirrors pruning.py's own `_embedding_vocab_importance` exactly,
-// minus the `GatherBlockQuantized`-dequantization branch (out of scope for
-// this C++ port -- see this section's own top comment).
+// including its `GatherBlockQuantizedDequantized` dequantize-for-ranking
+// branch for the `GatherBlockQuantized` shape.
 std::vector<double> EmbeddingVocabImportance(const EmbeddingChain& chain,
                                              const InitMap& init_map) {
   std::vector<double> importance(static_cast<size_t>(chain.vocab_size), 0.0);
-  {
+  if (chain.quantized) {
+    const std::vector<double> emb =
+        GatherBlockQuantizedDequantized(chain, init_map);
+    for (int64_t v = 0; v < chain.vocab_size; ++v) {
+      double sum = 0.0;
+      for (int64_t h = 0; h < chain.hidden_size; ++h) {
+        const double x = emb[static_cast<size_t>(v * chain.hidden_size + h)];
+        sum += x * x;
+      }
+      importance[static_cast<size_t>(v)] = sum;
+    }
+  } else {
     const std::vector<float> emb =
         ReadFloatTensorAnyDtype(*init_map.at(chain.weight_name));
     for (int64_t v = 0; v < chain.vocab_size; ++v) {
