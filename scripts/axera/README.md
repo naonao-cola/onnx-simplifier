@@ -550,6 +550,33 @@ What *is* confirmed and now supported by this harness:
   in CI without needing hardware or a real LLM download.
 - A per-layer file and the post model both ran successfully on the real
   AX650N via `axcl_run_model` (~1.5ms and ~9ms respectively).
+- **Confirmed real, directly from a compiled layer's own declared I/O
+  dtypes (a real `HuggingFaceTB/SmolLM2-135M` build, `--help`'s
+  `hidden_state_type`/`weight_type` defaults of `bf16`/`s8`): this is
+  genuine weight-only quantization, not the full weight+activation INT8
+  PTQ the generic path below applies.** Every graph input/output on both
+  `neu mode` nodes -- `K_cache`, `V_cache`, the hidden state, and the
+  attention `mask` -- is declared `BFLOAT16`; activations never get
+  quantized at all. Only `npu_params` shrinks: 3,712,328 bytes for a
+  576-hidden-size layer whose real weight element count (q/k/v/o/gate/up/
+  down projections + 2 RMSNorm weights) is ~3.54M -- ~1 byte/element,
+  confirming S8 weights, not the ~2 bytes/element BF16 would need. This is
+  the confirmed, direct explanation for the real accuracy gap found
+  below ("Confirmed against a real, full-size model"): the generic
+  `pulsar2 build --config` path quantizes *both* weights and activations
+  uniformly to INT8 with no smoothing, which compounds into near-random
+  output by 30 layers deep; `llm_build()` never quantizes the residual
+  stream/KV-cache/attention path at all, only the static weights.
+- **`model_type` support is narrower here than the generic path's**:
+  `llm_build --input_path` on a real `mistral`-architecture checkpoint
+  (`distilabel-internal-testing/tiny-random-mistral`, same one used
+  elsewhere in this README) fails outright with `AssertionError:
+  model_type error mistral` -- confirming its per-architecture allowlist
+  (`yasched/llm_builder/{llama,qwen3,gemma,...}_test.py`, all
+  Pyarmor-obfuscated, see above) has no `mistral` entry, unlike
+  `reconstruct_hf_graph()`, which treats `mistral` as llama-family-
+  compatible. `llama` (confirmed via `SmolLM2-135M`) and `qwen3`
+  (confirmed via `Qwen3-0.6B`) both work.
 
 ## An alternative LLM path that *does* give onnxsim a hook
 
