@@ -20059,11 +20059,32 @@ std::vector<double> EmbeddingVocabImportance(const EmbeddingChain& chain,
 // declared axis) is simply absent from the result, which is exactly the
 // "no matching activation observed" condition ApplyChains/ApplyConcatChains
 // fall back to plain weight-only importance on.
+//
+// `require_rank2` (default empty -- every pre-existing caller
+// (ApplyStructuredWandaPruning/ApplyAttentionHeadWandaPruning) is completely
+// unaffected, since neither's own Python reference
+// (`_wanda_structured_calibration_stats`/`_wanda_attention_calibration_stats`)
+// has any rank restriction at all) names the subset of probe names that
+// must be observed at EXACTLY rank 2 to count for a given batch, mirroring
+// pruning.py's own `_wanda_unstructured_calibration_stats`'s plain
+// (non-Attention, non-Conv) MatMul/Gemm probe: `if x.ndim != 2: continue`.
+// Unlike this function's own generic "sum of squares over every axis but
+// the channel one" reduction (correct at any rank, and what every OTHER
+// probe name still gets), a batch where a `require_rank2` probe's own
+// activation isn't rank-2 contributes NOTHING to that probe's accumulator
+// for that batch -- checked before the axis/dtype bookkeeping below, same
+// as pruning.py's own early-continue. ApplyWandaPruning is the only caller
+// that ever passes a non-empty set here, and only for its plain MatMul/Gemm
+// candidates' own `x_name`s -- never its `com.microsoft::Attention`
+// candidates' (pruning.py's own `attn_act_norm` allows any rank >= 2 there)
+// nor Conv's (a wholly separate function, ConvWandaCalibrationStats) -- see
+// ApplyWandaPruning's own call site comment for how that set is built.
 std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     const std::unordered_map<std::string, int64_t>& probe_axis,
     const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
-        calibration_data) {
+        calibration_data,
+    const std::unordered_set<std::string>& require_rank2 = {}) {
   std::unordered_map<std::string, std::vector<double>> result;
   if (probe_axis.empty()) {
     // Nothing to probe (e.g. only split_gated_chains matched -- never
@@ -20164,6 +20185,12 @@ std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
         continue;
       }
       const int64_t ndim = tp.dims_size();
+      if (require_rank2.count(name) != 0 && ndim != 2) {
+        continue;  // Mirrors pruning.py's own
+                   // `_wanda_unstructured_calibration_stats`'s plain
+                   // MatMul/Gemm probe: `if x.ndim != 2: continue` -- see
+                   // this function's own `require_rank2` doc comment above.
+      }
       int64_t axis = axis_raw;
       if (axis < 0) {
         axis += ndim;
@@ -24050,6 +24077,16 @@ onnx::ModelProto ApplyWandaPruning(
     bool weight_transposed;
     bool is_conv;
     int64_t conv_group = 1;  // only meaningful when is_conv
+    // `com.microsoft::Attention`'s merged QKV weight, as opposed to a plain
+    // MatMul/Gemm candidate -- only meaningful when `!is_conv`. Distinguishes
+    // the two `x_name`-keyed, probe-axis -1 candidate families below so the
+    // rank-2-only restriction pruning.py's own `_wanda_unstructured_
+    // calibration_stats` applies to its plain MatMul/Gemm probe (`act_norm`)
+    // -- but NOT to its separately-accumulated Attention probe
+    // (`attn_act_norm`, any rank >= 2) -- can be reproduced here too. See the
+    // `require_rank2` set built right before the WandaCalibrationStats call
+    // below.
+    bool is_attention = false;
   };
   std::vector<Candidate> candidates;
   // Conv attributes are per-node (two Convs can share an input tensor with
@@ -24084,7 +24121,7 @@ onnx::ModelProto ApplyWandaPruning(
       // is already [K, N]-shaped by construction (see
       // MatchAttentionProducer's own comment), so it is matched exactly
       // like a non-transposed MatMul weight.
-      candidates.push_back({node.input(0), am->weight, false, false});
+      candidates.push_back({node.input(0), am->weight, false, false, 1, true});
     }
   }
   if (candidates.empty()) {
@@ -24101,14 +24138,40 @@ onnx::ModelProto ApplyWandaPruning(
   // leading axis by WandaCalibrationStats' own "every axis but the channel
   // one" reduction, exactly mirroring pruning.py's own
   // `x.reshape(-1, x.shape[-1])`.
+  //
+  // `require_rank2`: mirrors pruning.py's own
+  // `_wanda_unstructured_calibration_stats`'s split between its plain
+  // MatMul/Gemm probe (`act_norm`, `x.ndim != 2: continue` -- exactly rank
+  // 2 required) and its separate Attention probe (`attn_act_norm`,
+  // `x.ndim < 2: continue` -- any rank >= 2 accepted, since that candidate's
+  // own activation is rank-3 `[batch, seq, hidden]` by construction). Built
+  // from every MatMul/Gemm (`!is_conv && !is_attention`) candidate's own
+  // `x_name`, MINUS any name also used by an Attention candidate -- the
+  // same "two candidate families sharing one activation tensor name is a
+  // purely theoretical edge case, not worth distinguishing further" call
+  // this file's own keyed-by-`x_name` simplification (just above) already
+  // makes: in that edge case, staying unrestricted (as before this fix)
+  // rather than newly restricting the shared name is the conservative
+  // choice.
   std::unordered_map<std::string, int64_t> probe_axis;
+  std::unordered_set<std::string> matmul_x_names;
+  std::unordered_set<std::string> attention_x_names;
   for (const auto& c : candidates) {
-    if (!c.is_conv) {
-      probe_axis[c.x_name] = -1;
+    if (c.is_conv) {
+      continue;
+    }
+    probe_axis[c.x_name] = -1;
+    (c.is_attention ? attention_x_names : matmul_x_names).insert(c.x_name);
+  }
+  std::unordered_set<std::string> require_rank2;
+  for (const auto& name : matmul_x_names) {
+    if (attention_x_names.find(name) == attention_x_names.end()) {
+      require_rank2.insert(name);
     }
   }
   const std::unordered_map<std::string, std::vector<double>> act_norm =
-      WandaCalibrationStats(executor, out, probe_axis, calibration_data);
+      WandaCalibrationStats(executor, out, probe_axis, calibration_data,
+                            require_rank2);
 
   // Conv's own im2col-unfolded per-(in_channel, kh, kw)-tap calibration
   // statistic -- a genuinely different reduction than WandaCalibrationStats'
