@@ -26561,13 +26561,24 @@ def apply_attention_head_wanda_pruning(
 #     per-head ``SimplifiedLayerNorm``(+ optional ``RotaryEmbedding``)
 #     ``_find_separate_qkv_chains`` already recognizes between a plain-float
 #     packed-QKV-then-``Split`` producer and its own GQA consumer (see
-#     :func:`_walk_back_through_qk_norm_rope`) -- is NOT matched here: this
-#     node's own `Q`/`K` outputs must feed the attention consumer's own
-#     query/key inputs DIRECTLY (single consumer, no intervening node at
-#     all). A real export relying on that hop between a fused
-#     ``MatMulNBitsQkv`` node and its own attention consumer is declined
-#     here rather than mis-sliced -- a genuine, deliberate scope boundary
-#     this comment flags honestly rather than silently under-implementing.
+#     :func:`_walk_back_through_qk_norm_rope`) -- IS also matched here, the
+#     same way and via the exact same helper: a real int4/int8-quantized
+#     Qwen3/Gemma2-style export (Q/K-norm + RoPE applied to a fused
+#     packed-QKV projection's own output -- a realistic on-device/edge
+#     deployment shape) no longer silently declines pruning outright just
+#     because its producer happens to be this fused op rather than a plain
+#     ``Split``. This node's own `V` output still must feed the attention
+#     consumer's own value input DIRECTLY (no hop -- neither
+#     `make_qk_norm` nor `make_rotary_embedding_op`, in onnxruntime-genai's
+#     own model builder, ever touches V's own branch, mirroring
+#     :func:`_find_separate_qkv_chains`'s own identical restriction), and
+#     the JOINT, single-node ``GemmaRotaryEmbedding``-PAIR hop
+#     (:func:`_walk_back_through_gemma_rope_pair`, which
+#     :func:`_find_separate_qkv_chains` also supports) is deliberately NOT
+#     tried here -- a genuinely separate, more involved extension left for
+#     a future round, not silently mis-handled -- only the single-tensor-
+#     per-branch ``RotaryEmbedding``/``MRotaryEmbedding`` hop
+#     :func:`_walk_back_through_qk_norm_rope` itself recognizes is matched.
 #   * The downstream output-projection consumer, for BOTH fused ops, is
 #     matched via the exact same ``MatMulNBits``-or-plain-float union the
 #     plain single-producer chain above already supports
@@ -27183,6 +27194,18 @@ class _MatMulNBitsQkvChain:
     num_heads_attr: str
     chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
     consumer: _MatMulNBitsChainSide
+    # Set whenever a per-head Q/K-norm + RoPE pass-through
+    # (:func:`_walk_back_through_qk_norm_rope`) was crossed walking back
+    # from `.attn_node`'s own Q (`.q_norm_rope`) or K (`.k_norm_rope`) input
+    # to this chain's own `.producer` node's `Q`/`K` output -- the exact
+    # same field pair, populated the exact same way, as :class:`_GQAChain`'s
+    # own `q_norm_rope`/`k_norm_rope` (see this section's own top comment
+    # for why this fused-producer variant now matches this hop too). `None`
+    # for either branch when that branch's own hop wasn't crossed (the
+    # pre-existing "feeds the attention op directly" shape, still supported
+    # unchanged).
+    q_norm_rope: Optional["_QKNormRopePassThrough"] = None
+    k_norm_rope: Optional["_QKNormRopePassThrough"] = None
 
 
 def _find_matmul_nbits_qkv_chains(
@@ -27190,25 +27213,31 @@ def _find_matmul_nbits_qkv_chains(
     value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
 ) -> List[_MatMulNBitsQkvChain]:
     """Matches a ``MatMulNBitsQkv`` node whose `Q`/`K`/`V` outputs each feed
-    -- directly, single-consumer, no intermediate hop -- into the
-    respective query/key/value inputs of one shared downstream
-    ``GroupQueryAttention`` (:func:`_match_gqa_producer`) or plain
-    ``ai.onnx::Attention`` (:func:`_match_onnx_attention_producer`) node,
-    reused verbatim (both already validate `num_heads`/`kv_num_heads` and
-    every optional per-head `past_key`/`past_value`/`k_scale`/`v_scale`/
-    `attention_bias`/`head_sink` operand's own safety, including -- as of
-    this module's own dynamic-`attention_bias` fix -- a genuinely dynamic
-    one's own declared shape, via `value_info_by_name`), and whose own
-    output in turn reaches a ``MatMulNBits``-or-plain-float output
-    projection (:func:`_walk_to_matmul_nbits_attention_consumer`).
+    -- optionally through the same per-head Q/K-norm + RoPE pass-through hop
+    :func:`_find_separate_qkv_chains` already recognizes (see below), V
+    always DIRECTLY, single-consumer -- into the respective query/key/value
+    inputs of one shared downstream ``GroupQueryAttention``
+    (:func:`_match_gqa_producer`) or plain ``ai.onnx::Attention``
+    (:func:`_match_onnx_attention_producer`) node, reused verbatim (both
+    already validate `num_heads`/`kv_num_heads` and every optional per-head
+    `past_key`/`past_value`/`k_scale`/`v_scale`/`attention_bias`/`head_sink`
+    operand's own safety, including -- as of this module's own dynamic-
+    `attention_bias` fix -- a genuinely dynamic one's own declared shape,
+    via `value_info_by_name`), and whose own output in turn reaches a
+    ``MatMulNBits``-or-plain-float output projection
+    (:func:`_walk_to_matmul_nbits_attention_consumer`).
 
-    Unlike :func:`_find_separate_qkv_chains` (this module's own plain-float
-    separate-Q/K/V-producer precedent), NO per-head Q/K-norm + RoPE
-    pass-through hop (:func:`_walk_back_through_qk_norm_rope`) is matched
-    between this fused node's own `Q`/`K` outputs and the attention
-    consumer -- a real, deliberate, documented scope boundary (see this
-    section's own top comment), not an oversight: a model relying on that
-    hop is declined here rather than mis-sliced. `value_info_by_name`
+    Like :func:`_find_separate_qkv_chains` (this module's own plain-float
+    separate-Q/K/V-producer precedent), an optional per-head Q/K-norm +
+    RoPE pass-through hop (:func:`_walk_back_through_qk_norm_rope`) is
+    matched between this fused node's own `Q`/`K` outputs and the attention
+    consumer -- see this section's own top comment for why this closes a
+    real gap for a realistic int4/int8-quantized Qwen3/Gemma2-style export.
+    The walk (and the deferred :func:`_qk_norm_rope_hop_is_consistent`
+    shape check once `head_size` is known) is reused UNCHANGED from that
+    function; only the joint ``GemmaRotaryEmbedding``-pair hop
+    (:func:`_walk_back_through_gemma_rope_pair`) is deliberately not tried
+    here (see this section's own top comment). `value_info_by_name`
     defaults to ``{}`` -- see :func:`_find_attention_chains`'s own
     docstring for why.
     """
@@ -27217,27 +27246,13 @@ def _find_matmul_nbits_qkv_chains(
     initializer_map = _constant_map(graph)
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
+    node_by_output = {out: node for node in graph.node for out in node.output}
 
     def _is_internal(name: str) -> bool:
         return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
 
     chains: List[_MatMulNBitsQkvChain] = []
-    for node in graph.node:
-        w = _match_matmul_nbits_qkv(node, initializer_map, consumers_of)
-        if w is None:
-            continue
-
-        q_out, k_out, v_out = node.output[0], node.output[1], node.output[2]
-        if not (_is_internal(q_out) and _is_internal(k_out) and _is_internal(v_out)):
-            continue
-        attn = consumers_of[q_out][0]
-        if consumers_of[k_out][0] is not attn or consumers_of[v_out][0] is not attn:
-            continue  # Q/K/V must feed the exact same downstream node
-        if len(attn.input) < 3:
-            continue
-        if attn.input[0] != q_out or attn.input[1] != k_out or attn.input[2] != v_out:
-            continue  # must land on the consumer's own query/key/value inputs
-
+    for attn in graph.node:
         num_heads_attr = "num_heads"
         info: Optional[Tuple[int, int]]
         if attn.domain == _ATTENTION_DOMAIN and attn.op_type == "GroupQueryAttention":
@@ -27252,10 +27267,80 @@ def _find_matmul_nbits_qkv_chains(
         if info is None:
             continue
         num_heads, kv_num_heads = info
+
+        if len(attn.input) < 3:
+            continue
+        q_name, k_name, v_name = attn.input[0], attn.input[1], attn.input[2]
+        if q_name == k_name or q_name == v_name or k_name == v_name:
+            continue  # degenerate -- can't independently slice a shared producer
+
+        # `root_q`/`root_k` walk *backward* from the attention op's own Q/K
+        # input through the optional per-head norm + RoPE pass-through (see
+        # :func:`_walk_back_through_qk_norm_rope` and
+        # :func:`_find_separate_qkv_chains`'s own identical use of it) --
+        # `q_name`/`k_name` unchanged (and `q_hop`/`k_hop` both `None`)
+        # whenever neither hop is present, so this is a strict superset of
+        # the pre-existing "Q/K/V feed the attention op directly" check, not
+        # a behavior change for any graph that already matched. V never
+        # gets this treatment (see this function's own docstring), so
+        # `v_name` is compared against the producer's own third output
+        # verbatim, exactly as before.
+        root_q, q_hop = (
+            _walk_back_through_qk_norm_rope(
+                q_name, initializer_map, consumers_of, graph_outputs, node_by_output
+            )
+            if _is_internal(q_name)
+            else (q_name, None)
+        )
+        root_k, k_hop = (
+            _walk_back_through_qk_norm_rope(
+                k_name, initializer_map, consumers_of, graph_outputs, node_by_output
+            )
+            if _is_internal(k_name)
+            else (k_name, None)
+        )
+
+        prod_q = node_by_output.get(root_q) if _is_internal(root_q) else None
+        prod_k = node_by_output.get(root_k) if _is_internal(root_k) else None
+        prod_v = node_by_output.get(v_name) if _is_internal(v_name) else None
+        if prod_q is None or prod_q is not prod_k or prod_q is not prod_v:
+            continue  # Q/K/V must feed the exact same producer node
+        # Must be this node's own Q/K/V outputs, in that exact order -- only
+        # the first three output slots are compared (not the whole output
+        # list) since ``MatMulNBitsQkv`` may additionally carry an optional
+        # 4th ``input_skip_bias_sum`` output this section never touches.
+        if (
+            len(prod_q.output) < 3
+            or prod_q.output[0] != root_q
+            or prod_q.output[1] != root_k
+            or prod_q.output[2] != v_name
+        ):
+            continue
+
+        w = _match_matmul_nbits_qkv(prod_q, initializer_map, consumers_of)
+        if w is None:
+            continue
+
         if w.Nq % num_heads or w.Nkv % kv_num_heads:
             continue
         head_size = w.Nq // num_heads
         if head_size <= 0 or w.Nkv // kv_num_heads != head_size:
+            continue
+
+        # Deferred correctness check for any Q/K-norm + RoPE pass-through
+        # crossed above (see :func:`_qk_norm_rope_hop_is_consistent`'s own
+        # docstring for why this can't run any earlier): a crossed norm's
+        # own `scale` must genuinely be `[head_size]`-wide, and a crossed
+        # post-norm `Reshape`'s own target width must genuinely be this
+        # branch's own pre-pruning flat width -- anything else means this
+        # walk crossed a shape it only structurally resembles, and the
+        # whole match is declined here rather than mis-slicing it.
+        if not (
+            _qk_norm_rope_hop_is_consistent(q_hop, initializer_map, w.Nq, head_size)
+            and _qk_norm_rope_hop_is_consistent(
+                k_hop, initializer_map, w.Nkv, head_size
+            )
+        ):
             continue
 
         out_name = attn.output[0]
@@ -27278,6 +27363,8 @@ def _find_matmul_nbits_qkv_chains(
                 num_heads_attr=num_heads_attr,
                 chain_ops=chain_ops,
                 consumer=consumer,
+                q_norm_rope=q_hop,
+                k_norm_rope=k_hop,
             )
         )
     return chains
@@ -27303,7 +27390,17 @@ def _apply_matmul_nbits_qkv_chains(
     since that node itself owns no weight of its own to slice here -- only
     `q`'s/`k`'s/`v`'s own producer weights (this function's own job) and the
     downstream output-projection consumer
-    (:func:`_slice_matmul_nbits_chain_consumer`, reused verbatim).
+    (:func:`_slice_matmul_nbits_chain_consumer`, reused verbatim). When
+    `chain.q_norm_rope`/`chain.k_norm_rope` are set (a crossed per-head
+    Q/K-norm + RoPE pass-through -- see :func:`_walk_back_through_qk_norm_rope`,
+    :class:`_QKNormRopePassThrough`), each crossed hop's own `RotaryEmbedding`
+    `num_heads` attribute (when nonzero) and post-norm `Reshape` target-width
+    constant are rewritten to that branch's new post-pruning head count/flat
+    width, mirroring :func:`_apply_one_gqa_chain`'s own identical rewrite for
+    the plain-float case -- neither hop's own weight needs slicing (a crossed
+    norm's own `scale` and a crossed `RotaryEmbedding`'s `cos_cache`/
+    `sin_cache` are both confirmed head-independent, see this module's own
+    "Attention-head pruning" section comment), only these two constants.
     """
     initializer_map = _constant_map(graph)
     bias_ctx = _DynamicHeadBiasContext(
@@ -27415,6 +27512,54 @@ def _apply_matmul_nbits_qkv_chains(
                     onnx.numpy_helper.from_array(dims, name=shape_init.name)
                 )
 
+        # Q's/K's own per-head norm + RoPE pass-through, if either branch
+        # crossed one -- the exact same rewrite :func:`_apply_one_gqa_chain`
+        # already applies for the identical hop in the plain-float case
+        # (see :class:`_QKNormRopePassThrough`'s own docstring for why
+        # neither a crossed norm's own `scale` nor a crossed
+        # `RotaryEmbedding`'s `cos_cache`/`sin_cache` ever needs touching --
+        # only these constants do): `new_num_heads`/`new_num_heads * d` are
+        # Q's own post-pruning head count/flat width for `.q_norm_rope`;
+        # `keep_count`/`keep_count * d` are K's own (K's own head_size
+        # equals Q's/K's shared `d`, already confirmed at match time) for
+        # `.k_norm_rope`. `bnsh_reshape_shape`/`output_reshape_shape` are
+        # only ever populated by :func:`_walk_back_through_gemma_rope_pair`,
+        # which this chain kind never crosses (see this section's own top
+        # comment) -- handled here anyway, unchanged from
+        # :func:`_apply_one_gqa_chain`'s own code, purely so this stays a
+        # faithful mirror rather than a silently narrower copy.
+        for hop, new_branch_heads, new_branch_width in (
+            (chain.q_norm_rope, new_num_heads, new_num_heads * d),
+            (chain.k_norm_rope, keep_count, keep_count * d),
+        ):
+            if hop is None:
+                continue
+            if hop.rotary_node is not None:
+                for attr in hop.rotary_node.attribute:
+                    if attr.name == "num_heads" and attr.i != 0:
+                        attr.i = new_branch_heads
+            if hop.reshape_shape is not None:
+                shape_init = initializer_map[hop.reshape_shape]
+                dims = onnx.numpy_helper.to_array(shape_init).copy()
+                dims[-1] = new_branch_width
+                shape_init.CopyFrom(
+                    onnx.numpy_helper.from_array(dims, name=shape_init.name)
+                )
+            if hop.bnsh_reshape_shape is not None:
+                shape_init = initializer_map[hop.bnsh_reshape_shape]
+                dims = onnx.numpy_helper.to_array(shape_init).copy()
+                dims[-2] = new_branch_heads
+                shape_init.CopyFrom(
+                    onnx.numpy_helper.from_array(dims, name=shape_init.name)
+                )
+            if hop.output_reshape_shape is not None:
+                shape_init = initializer_map[hop.output_reshape_shape]
+                dims = onnx.numpy_helper.to_array(shape_init).copy()
+                dims[-1] = new_branch_width
+                shape_init.CopyFrom(
+                    onnx.numpy_helper.from_array(dims, name=shape_init.name)
+                )
+
         producer_touched.update(p_keys)
         consumer_touched.add(c_key)
         stale_value_info.add(p.node.output[0])
@@ -27422,6 +27567,12 @@ def _apply_matmul_nbits_qkv_chains(
         stale_value_info.add(p.node.output[2])
         stale_value_info.add(chain.attn_node.output[0])
         stale_value_info.update(op.output[0] for op, _ in chain.chain_ops)
+        for hop in (chain.q_norm_rope, chain.k_norm_rope):
+            if hop is not None:
+                stale_value_info.update(
+                    n.output[0] for n in hop.nodes if n.output and n.output[0]
+                )
+                stale_value_info.update(hop.extra_stale_outputs)
 
 
 # --- MoE expert-intermediate-channel pruning --------------------------------
