@@ -75,6 +75,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
@@ -82,12 +83,22 @@ DEFAULT_IMAGE = "pulsar2:6.0-lite"
 
 _MAX_CYCLE_RE = re.compile(r"max_cycle\s*=\s*([\d,]+)")
 _FUSE_RE = re.compile(r"fuse (\d+) subgraph\(s\)")
+_LATENCY_RE = re.compile(
+    r"min\s*=\s*([\d.]+)\s*ms\s*max\s*=\s*([\d.]+)\s*ms\s*avg\s*=\s*([\d.]+)\s*ms"
+)
 
 
 def docker_image_available(image: str = DEFAULT_IMAGE) -> bool:
-    proc = subprocess.run(
-        ["docker", "image", "inspect", image], capture_output=True, text=True
-    )
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", image], capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        # No `docker` binary at all (confirmed real: macOS CI wheel-test
+        # runners don't have one) -- distinct from "docker installed but no
+        # image loaded" (returncode != 0, handled below); both mean the
+        # same thing to a caller, so both resolve to False, not a crash.
+        return False
     return proc.returncode == 0
 
 
@@ -133,6 +144,11 @@ class BuildResult:
     fused_subgraphs: Optional[int] = None
     trace_path: Optional[str] = None
     frontend_graph_path: Optional[str] = None
+    # Wall-clock seconds per pipeline stage -- only populated by
+    # `build_from_hf_checkpoint()` (see its docstring); empty for a plain
+    # `build()` call, which is already just the one Docker invocation this
+    # dict's own "pulsar2_build" entry measures.
+    phase_timings: Dict[str, float] = field(default_factory=dict)
     error: Optional[str] = None
     stdout_tail: str = ""
 
@@ -329,6 +345,195 @@ def build(
     )
 
 
+def make_numpy_calibration_tar(out_path: str, samples: Sequence) -> str:
+    """A tar of `samples` (one ``.npy`` file each), for Pulsar2's
+    ``calibration_format: Numpy`` -- the non-image counterpart to
+    `make_synthetic_calibration_tar`, confirmed real (see
+    `build_from_hf_checkpoint`'s docstring) against Pulsar2's own
+    `InputQuantConfig.calibration_format` options (`Image` (default),
+    `Numpy`, `Binary`, `NumpyObject` -- confirmed from the Docker image's
+    own ``/opt/pulsar2/yamain/config/build_config.proto``).
+    """
+    import numpy as np
+
+    with tempfile.TemporaryDirectory() as td:
+        paths = []
+        for i, arr in enumerate(samples):
+            p = os.path.join(td, f"{i}.npy")
+            np.save(p, arr)
+            paths.append(p)
+        with tarfile.open(out_path, "w") as tf:
+            for p in paths:
+                tf.add(p, arcname=os.path.basename(p))
+    return out_path
+
+
+def _llm_quant_config(
+    input_calibration_datasets: Dict[str, str], calibration_size: int
+) -> dict:
+    return {
+        "model_type": "ONNX",
+        "npu_mode": "NPU1",
+        "quant": {
+            "input_configs": [
+                {
+                    "tensor_name": tensor_name,
+                    "calibration_dataset": calibration_dataset,
+                    "calibration_format": "Numpy",
+                    "calibration_size": calibration_size,
+                }
+                for tensor_name, calibration_dataset in input_calibration_datasets.items()
+            ],
+            "calibration_method": "MinMax",
+            "precision_analysis": False,
+        },
+        "compiler": {"check": 0},
+    }
+
+
+def build_from_hf_checkpoint(
+    hf_dir: str,
+    work_dir: str,
+    output_rel_dir: str,
+    *,
+    batch_size: int = 1,
+    seq_len: int = 8,
+    calibration_size: int = 4,
+    target_hardware: str = "AX650",
+    image: str = DEFAULT_IMAGE,
+    profile: bool = False,
+    timeout: int = 900,
+) -> BuildResult:
+    """The hf-config+safetensors -> onnx -> axmodel path: uses onnxsim's own
+    `onnxsim.reconstruct_hf_graph()` to build the ONNX graph from a real HF
+    checkpoint directory, then feeds it through the ordinary CNN/vision
+    `pulsar2 build` ingestion (`build()`, above) like any other ONNX model
+    -- distinct from `llm_build()` above, which hands Pulsar2's own
+    closed-source LLM ingestion the raw HF checkpoint directly, with no
+    ONNX step (and no onnxsim integration point) at all.
+
+    **Confirmed real end to end**: a synthetic tiny Llama-shaped checkpoint
+    built cleanly through `reconstruct_hf_graph()`, `pulsar2 build`
+    compiled it to a single-``neu mode``-node `compiled.axmodel`
+    (`pulsar2_ops.has_out_of_band_npu_data()` correctly flags it), and that
+    file ran successfully on a real AX650N via `run_on_device()`
+    (~0.19ms avg). Also confirmed: doc-scraped
+    `pulsar2_ops.AX650_SUPPORTED_OPS` flags `Neg` (used by RoPE's
+    rotate-half) as unsupported, but the real build compiled it without
+    complaint regardless -- the scraped op-support table is a fast
+    pre-screen, not a guaranteed predictor, for a fused pattern like this
+    one.
+
+    Only `reconstruct_hf_graph`'s two graph inputs, `input_ids` and
+    `position_ids` (both ``int64[batch_size, seq_len]``), are supported --
+    calibration data is generated automatically (random token ids in
+    ``[0, vocab_size)``, read from the checkpoint's own `config.json`, for
+    `input_ids`; `arange(seq_len)` broadcast over the batch for
+    `position_ids`). There is no way to plug in real calibration data
+    through this entry point -- call `onnxsim.reconstruct_hf_graph()` and
+    `build(config_path=...)` directly instead if you need that. A
+    checkpoint whose architecture `reconstruct_hf_graph` doesn't support
+    raises `onnxsim.UnsupportedArchitectureError` before Docker is ever
+    invoked.
+
+    The returned `BuildResult.phase_timings` breaks the wall-clock time
+    down into `"docker_check"` (confirming the image is loaded),
+    `"import_onnxsim"` (importing `onnxsim` -- confirmed real: its
+    `__init__.py` eagerly imports dozens of quantization submodules, easily
+    over a second the *first* time in a process; `sys.modules`-cached to
+    ~0s on any later call in the same process), `"reconstruct_onnx"`
+    (onnxsim graph construction + `onnx.save`), `"calibration_data"`
+    (generating + tarring the calibration samples), `"pulsar2_build"` (the
+    real Docker `pulsar2 build` call -- itself container startup + quant +
+    NPU compile as one number; pass `profile=True` and load the resulting
+    `trace.json` at chrome://tracing for a breakdown *within* this stage),
+    and `"total"` -- the non-`"total"` entries always sum to it (modulo
+    float rounding).
+    """
+    total_start = time.perf_counter()
+    phase_timings: Dict[str, float] = {}
+
+    stage_start = time.perf_counter()
+    docker_ok = docker_image_available(image)
+    phase_timings["docker_check"] = time.perf_counter() - stage_start
+    if not docker_ok:
+        phase_timings["total"] = time.perf_counter() - total_start
+        return BuildResult(
+            success=False,
+            error=f"docker image not loaded: {image}",
+            phase_timings=phase_timings,
+        )
+
+    stage_start = time.perf_counter()
+    import numpy as np
+    import onnx
+
+    import onnxsim
+
+    phase_timings["import_onnxsim"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    hf_config = onnxsim.read_hf_config(hf_dir)
+    vocab_size = int(hf_config.get("vocab_size", 32000))
+
+    model = onnxsim.reconstruct_hf_graph(hf_dir, batch_size=batch_size, seq_len=seq_len)
+    onnx_rel_path = "model.onnx"
+    onnx.save(model, os.path.join(work_dir, onnx_rel_path))
+    phase_timings["reconstruct_onnx"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    rng = np.random.default_rng(0)
+    dataset_dir = os.path.join(work_dir, "dataset")
+    os.makedirs(dataset_dir, exist_ok=True)
+
+    input_ids_samples = [
+        rng.integers(0, vocab_size, size=(batch_size, seq_len)).astype(np.int64)
+        for _ in range(calibration_size)
+    ]
+    position_ids_samples = [
+        np.arange(seq_len, dtype=np.int64)[None, :].repeat(batch_size, axis=0)
+        for _ in range(calibration_size)
+    ]
+    make_numpy_calibration_tar(
+        os.path.join(dataset_dir, "calib_input_ids.tar"), input_ids_samples
+    )
+    make_numpy_calibration_tar(
+        os.path.join(dataset_dir, "calib_position_ids.tar"), position_ids_samples
+    )
+
+    config_dir = os.path.join(work_dir, "config")
+    os.makedirs(config_dir, exist_ok=True)
+    config_rel_path = f"config/_auto_{os.path.basename(output_rel_dir)}.json"
+    with open(os.path.join(work_dir, config_rel_path), "w") as f:
+        json.dump(
+            _llm_quant_config(
+                {
+                    "input_ids": "./dataset/calib_input_ids.tar",
+                    "position_ids": "./dataset/calib_position_ids.tar",
+                },
+                calibration_size,
+            ),
+            f,
+        )
+    phase_timings["calibration_data"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    result = build(
+        work_dir,
+        onnx_rel_path,
+        output_rel_dir,
+        config_path=config_rel_path,
+        target_hardware=target_hardware,
+        image=image,
+        profile=profile,
+        timeout=timeout,
+    )
+    phase_timings["pulsar2_build"] = time.perf_counter() - stage_start
+    phase_timings["total"] = time.perf_counter() - total_start
+    result.phase_timings = phase_timings
+    return result
+
+
 @dataclass
 class LLMBuildResult:
     success: bool
@@ -462,10 +667,7 @@ def run_on_device(
     except subprocess.TimeoutExpired:
         return {"min_ms": None, "max_ms": None, "avg_ms": None, "error": "timeout"}
     log = proc.stdout + proc.stderr
-    m = re.search(
-        r"min\s*=\s*([\d.]+)\s*ms\s*max\s*=\s*([\d.]+)\s*ms\s*avg\s*=\s*([\d.]+)\s*ms",
-        log,
-    )
+    m = _LATENCY_RE.search(log)
     if not m:
         return {"min_ms": None, "max_ms": None, "avg_ms": None, "error": log[-500:]}
     return {
@@ -476,37 +678,73 @@ def run_on_device(
     }
 
 
-def run_on_device_with_input(
+def _parse_latency(log: str) -> Dict[str, Optional[float]]:
+    m = _LATENCY_RE.search(log)
+    if not m:
+        return {"min_ms": None, "max_ms": None, "avg_ms": None}
+    return {
+        "min_ms": float(m.group(1)),
+        "max_ms": float(m.group(2)),
+        "avg_ms": float(m.group(3)),
+    }
+
+
+@dataclass
+class DeviceRunResult:
+    outputs: Optional[List[bytes]] = None
+    min_ms: Optional[float] = None
+    max_ms: Optional[float] = None
+    avg_ms: Optional[float] = None
+    error: Optional[str] = None
+
+
+def run_on_device_with_inputs(
     axmodel_path: str,
-    input_tensor_name: str,
-    input_bytes: bytes,
+    inputs: Dict[str, bytes],
     *,
+    repeat: int = 1,
+    warmup: int = 0,
     binary: str = "/usr/bin/axcl/axcl_run_model",
     timeout: int = 120,
-) -> Optional[List[bytes]]:
-    """Feed exactly `input_bytes` to `input_tensor_name` on a real device and
-    return the raw output tensor bytes (one per output, model's declared
-    order). Uses the confirmed real `-i/-o/-l` folder layout: `<in>/0/
-    <tensor_name>.bin`, `list.txt` containing `0`, outputs land at `<out>/0/
-    <output_name>.bin`. **The input filename must exactly match the tensor
-    name** -- confirmed by trial: `axcl_run_model` errors with "Stimulus
-    file ... is not exist" naming the *tensor's* name specifically, not an
-    arbitrary/first-found file.
+) -> DeviceRunResult:
+    """Feed exactly `inputs` (`{tensor_name: raw_bytes}`, one entry per
+    graph input -- e.g. a real reconstructed LLM graph's `input_ids` *and*
+    `position_ids`, see `demo_hf_llm.py`) to a real device and return the
+    raw output tensor bytes (one per output, model's declared order) plus
+    latency stats (from `repeat`/`warmup`, same as `run_on_device()`; left
+    `None` at the default `repeat=1, warmup=0`, since `axcl_run_model`
+    doesn't report a min/max/avg line for a single, non-benchmark run).
+    Uses the confirmed real `-i/-o/-l` folder layout: `<in>/0/
+    <tensor_name>.bin` per input, `list.txt` containing `0`, outputs land
+    at `<out>/0/<output_name>.bin`. **Each input filename must exactly
+    match its tensor name** -- confirmed by trial: `axcl_run_model` errors
+    with "Stimulus file ... is not exist" naming the *tensor's* name
+    specifically, not an arbitrary/first-found file.
+
+    **Prefer this over `run_on_device()` for benchmarking any model with a
+    bounded-range input** (e.g. an embedding lookup's token ids): confirmed
+    real crash, `run_on_device()` lets `axcl_run_model` fill inputs with
+    unconstrained random bytes, and an out-of-range "token id" against a
+    real reconstructed LLM graph's `Gather` over its embedding table faults
+    the NPU (`[ERROR] Run model failed{0x8030070C}`) instead of just
+    producing garbage output the way an out-of-range float would for a CNN.
+    Real, valid (in-range) input data sidesteps this entirely.
     """
     if not axcl_available(binary):
-        return None
+        return DeviceRunResult(error="axcl_run_model not found")
     with tempfile.TemporaryDirectory() as td:
         in_dir = os.path.join(td, "in", "0")
         out_dir = os.path.join(td, "out")
         os.makedirs(in_dir)
         os.makedirs(out_dir)
-        with open(os.path.join(in_dir, f"{input_tensor_name}.bin"), "wb") as f:
-            f.write(input_bytes)
+        for tensor_name, tensor_bytes in inputs.items():
+            with open(os.path.join(in_dir, f"{tensor_name}.bin"), "wb") as f:
+                f.write(tensor_bytes)
         list_path = os.path.join(td, "list.txt")
         with open(list_path, "w") as f:
             f.write("0\n")
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 [
                     binary,
                     "-m",
@@ -518,18 +756,39 @@ def run_on_device_with_input(
                     "-l",
                     list_path,
                     "-r",
-                    "1",
+                    str(repeat),
                     "-w",
-                    "0",
+                    str(warmup),
                 ],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:
-            return None
+            return DeviceRunResult(error="timeout")
+        log = proc.stdout + proc.stderr
         outputs = []
         for p in sorted(glob.glob(os.path.join(out_dir, "0", "*.bin"))):
             with open(p, "rb") as f:
                 outputs.append(f.read())
-        return outputs or None
+        if not outputs:
+            return DeviceRunResult(error=log[-2000:])
+        return DeviceRunResult(outputs=outputs, **_parse_latency(log))
+
+
+def run_on_device_with_input(
+    axmodel_path: str,
+    input_tensor_name: str,
+    input_bytes: bytes,
+    *,
+    binary: str = "/usr/bin/axcl/axcl_run_model",
+    timeout: int = 120,
+) -> Optional[List[bytes]]:
+    """Single-input convenience wrapper over `run_on_device_with_inputs()`,
+    for the (still common) single-image-input-classifier case. Returns just
+    the raw output bytes (or `None` on failure) -- use
+    `run_on_device_with_inputs()` directly for latency stats or an error
+    message."""
+    return run_on_device_with_inputs(
+        axmodel_path, {input_tensor_name: input_bytes}, binary=binary, timeout=timeout
+    ).outputs

@@ -238,6 +238,38 @@ What *is* confirmed and now supported by this harness:
 - A per-layer file and the post model both ran successfully on the real
   AX650N via `axcl_run_model` (~1.5ms and ~9ms respectively).
 
+## An alternative LLM path that *does* give onnxsim a hook
+
+The section above is about Pulsar2's own, closed-source `pulsar2 llm_build`
+ingestion path, which never touches ONNX. Separately, onnxsim has its own
+`onnxsim.reconstruct_hf_graph()` (see `onnxsim/hf_reconstruct.py`) --
+builds a runnable ONNX graph directly from a HF checkpoint directory
+(`config.json` + safetensors; llama/mistral/qwen2/qwen3 today). Feeding
+*that* ONNX graph through the ordinary `pulsar2 build` (the same
+CNN/vision ingestion `convert_onnxmodelzoo.py` uses, not `llm_build`) is a
+second, independent LLM path with a real onnxsim integration point --
+`onnxsim.simplify()`/quantizers can act on the graph before Pulsar2 ever
+sees it, unlike the `llm_build` path above.
+
+**Confirmed real, end to end**: a synthetic tiny (2-layer) Llama-shaped
+checkpoint, run through `reconstruct_hf_graph()` then a real `pulsar2
+build --target_hardware AX650`, compiled cleanly to a single-`neu
+mode`-node `compiled.axmodel`, which then ran successfully on a real
+AX650N via `axcl_run_model`. Notably, `pulsar2_ops.AX650_SUPPORTED_OPS`
+(the doc-scraped op list) flags `Neg` (used by RoPE's rotate-half) as
+unsupported, but the real build compiled it without complaint regardless
+-- a reminder that the scraped table is a fast pre-screen, not a
+guaranteed predictor, once fused patterns are involved.
+
+`pulsar2_docker.build_from_hf_checkpoint()` wraps this whole path:
+reconstructs the ONNX graph, auto-generates `Numpy`-format calibration
+tars for `reconstruct_hf_graph`'s two inputs (`input_ids`, random token
+ids in `[0, vocab_size)`; `position_ids`, `arange(seq_len)`), writes the
+two-input quant config Pulsar2 needs (`calibration_format: Numpy` per
+`InputQuantConfig`, confirmed from the Docker image's own
+`build_config.proto`), and calls `build()`. See
+`tests/test_pulsar2_hf_to_axmodel.py` for the full working example.
+
 ## Real Docker + device conversion driver
 
 `pulsar2_docker.py` and `convert_onnxmodelzoo.py` turn the manual
@@ -296,7 +328,7 @@ the tensor). `pulsar2_docker.run_on_device_with_input()` already does this.
 | `worker.py` | runs the check for one model in an isolated subprocess, printing one `__RESULT__<json>` line. |
 | `run_pulsar2_compat.py` | drives the suite, writes a CSV, and exits non-zero on any regression. No `--require-*` flag or `skipped` status -- unlike the EP harnesses, this needs no vendor package or device, so it always runs. Entry point for `axera-integration.yml`'s `pulsar2-compat` job (stock runner, no Docker/device). |
 | `screen_onnxmodelzoo.py` | fast, static, Docker/device-free screening of `onnxmodelzoo` models via `pulsar2_simulator`/`pulsar2_backend.ax650_build_risks()` -- run this first. |
-| `pulsar2_docker.py` | real `pulsar2 build` (Docker) + `axcl_run_model` (device) wrapper: `build()` (with `profile=` for `trace.json`), `llm_build()` (the separate, ONNX-free `pulsar2 llm_build` LLM path -- see above), `run_on_device()`, `run_on_device_with_input()`, `force_rmtree()`. Manual/local-only -- needs a loaded Docker image. |
+| `pulsar2_docker.py` | real `pulsar2 build` (Docker) + `axcl_run_model` (device) wrapper: `build()` (with `profile=` for `trace.json`), `llm_build()` (the separate, ONNX-free `pulsar2 llm_build` LLM path -- see above), `build_from_hf_checkpoint()` (the hf-config+safetensors -> `onnxsim.reconstruct_hf_graph()` -> `build()` path -- see "An alternative LLM path" above), `run_on_device()`, `run_on_device_with_input()`, `force_rmtree()`. Manual/local-only -- needs a loaded Docker image. |
 | `convert_onnxmodelzoo.py` | batch driver over `pulsar2_docker.py`: fetch -> onnxsim -> real `pulsar2 build` (orig + simplified, `--profile` optional) -> optional on-device bit-exact diff -> CSV. Entry point for `axera-integration.yml`'s `pulsar2-docker-convert` job -- like `amd-integration.yml`'s MIGraphX check, that job is `workflow_dispatch`-only and targets a `[self-hosted, axcl]` runner this repository doesn't provision, so it's dormant until one exists. |
 
 ## Running locally
