@@ -94,6 +94,24 @@ freely mix both allowlists — e.g. `Reshape -> Relu -> Flatten` all collapse
 into one group — since the eligibility conditions and the resulting
 placement are identical either way.
 
+A third, independent category extends this to **binary operand donation**:
+an elementwise binary op (`Add`, `Sub`, `Mul`, `Div`, `Max`, `Min`, `And`,
+`Or`, `Xor`, `Mod` — see `IsInPlaceSafeBinaryOp`) can compute its output by
+overwriting *one* of its two operands, the same way real NN memory planners
+(MXNet, XLA) donate an operand's buffer to a binary kernel's output. The
+candidate operand must clear the exact same bar as the unary pass's input —
+not a weight/graph input/graph output, consumed exactly once, and matching
+the output's byte size — checked against **each** operand in turn (`input[0]`
+then `input[1]`), aliasing **at most one** of them. Matching the output's byte
+size is what rules out a *broadcast* operand: ONNX broadcasts a smaller
+operand up to the output's shape, so a genuinely broadcast operand's byte
+size never equals the output's, and it is correctly left un-aliased no
+matter how eligible it otherwise looks. The operand that isn't donated (if
+any) is simply left for the ordinary liveness pass to place, same as any
+other tensor. Because this unions into the very same `UnionFind` as the
+other two categories, a chain mixing any of them (e.g.
+`Reshape -> Relu -> Add -> Sigmoid`) still collapses into one group end to end.
+
 ## What's in `MemoryPlan`
 
 - **`tensor_offsets`** — `{name: (offset, size)}` for every planned tensor.

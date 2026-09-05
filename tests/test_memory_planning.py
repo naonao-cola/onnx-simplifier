@@ -176,6 +176,114 @@ def test_in_place_aliasing_blocked_by_multiple_consumers():
     assert plan.tensor_offsets["y1"][0] != plan.tensor_offsets["y2"][0]
 
 
+def test_binary_in_place_aliasing_donates_operand():
+    # x -> Relu -> a, then y = Add(a, w) with w a weight. `a` is the sole
+    # consumer feeding Add, so it donates into y (see IsInPlaceSafeBinaryOp);
+    # w is a weight and never planned at all. See memory_planning_test.cpp's
+    # TestBinaryInPlaceAliasingDonatesOperand for the byte-offset derivation:
+    # arena is 2 slots (x's own, plus one shared {a, y} slot) rather than 3.
+    body = """
+    g (float[25] x) => (float[25] y)
+    {
+      a = Relu(x)
+      y = Add(a, w)
+    }
+    """
+    plan = plan_activation_memory(_model(body, [_weight([25], "w")]))
+
+    assert plan.unplanned == []
+    assert "w" not in plan.tensor_offsets
+    assert plan.naive_bytes == 300  # x + a + y, 100 bytes each
+    assert plan.arena_bytes == 200
+
+    off = plan.tensor_offsets
+    assert off["a"] == off["y"]
+    assert off["x"][0] != off["a"][0]
+
+
+def test_binary_in_place_aliasing_other_operand_still_tracked():
+    # Both operands of Add are otherwise alias-eligible (each the sole
+    # consumer of its own Relu), but at most one is donated: input[0] (`a`)
+    # is tried first and succeeds, so `b` stays an ordinary, independently
+    # tracked tensor. See memory_planning_test.cpp's
+    # TestBinaryInPlaceAliasingOtherOperandStillTracked for the full
+    # byte-offset derivation.
+    body = """
+    g (float[25] x1, float[25] x2) => (float[25] y)
+    {
+      a = Relu(x1)
+      b = Relu(x2)
+      y = Add(a, b)
+    }
+    """
+    plan = plan_activation_memory(_model(body))
+
+    assert plan.unplanned == []
+    assert plan.naive_bytes == 500  # x1, x2, a, b, y, 100 bytes each
+    assert plan.arena_bytes == 300
+
+    off = plan.tensor_offsets
+    assert off["a"] == off["y"]  # a donated into y's group
+    assert off["b"] != off["a"]  # b is its own, separate group
+    assert off["b"] != off["y"]
+
+
+def test_binary_in_place_aliasing_skips_broadcast_operand():
+    # `scale` ([1], 4 bytes) broadcasts up to the output's shape ([25], 100
+    # bytes), so its byte size never matches the output's -- it must never be
+    # aliased no matter how eligible it otherwise looks. `a` ([25], 100
+    # bytes) is the exact-shape operand and is still eligible, exercising the
+    # "input[0] doesn't qualify -> fall back to input[1]" order since `scale`
+    # is input[0] here. See memory_planning_test.cpp's
+    # TestBinaryInPlaceAliasingSkipsBroadcastOperand for the derivation.
+    body = """
+    g (float[1] s0, float[25] x) => (float[25] y)
+    {
+      scale = Relu(s0)
+      a = Relu(x)
+      y = Add(scale, a)
+    }
+    """
+    plan = plan_activation_memory(_model(body))
+
+    assert plan.unplanned == []
+    assert plan.naive_bytes == 308  # 4 + 100 + 4 + 100 + 100
+    assert plan.arena_bytes == 204
+
+    off = plan.tensor_offsets
+    assert off["a"] == off["y"]  # a still donated (input[1])
+    assert off["scale"] != off["y"]  # broadcast operand never aliased
+    assert off["scale"][1] == 4
+    assert off["y"][1] == 100
+
+
+def test_binary_in_place_aliasing_blocked_by_multiple_consumers():
+    # `a` is consumed by Neg(a) -> y1 and Add(a, a) -> y2, the latter using
+    # the same tensor as both operands. The consumer-count guard counts
+    # (node, input-slot) pairs, so Add(a, a) alone contributes two consumer
+    # events -- well past the "consumed exactly once" bar -- so neither the
+    # unary nor the binary aliasing pass ever touches `a`, and y1/y2 (both
+    # simultaneously live graph outputs) are never incorrectly merged.
+    body = """
+    g (float[25] x) => (float[25] y1, float[25] y2)
+    {
+      a = Relu(x)
+      y1 = Neg(a)
+      y2 = Add(a, a)
+    }
+    """
+    plan = plan_activation_memory(_model(body))
+
+    assert plan.unplanned == []
+    assert plan.naive_bytes == 400
+    assert plan.arena_bytes == 300  # no donation possible anywhere
+
+    off = plan.tensor_offsets
+    assert off["a"] != off["y1"]
+    assert off["a"] != off["y2"]
+    assert off["y1"] != off["y2"]
+
+
 def test_weights_excluded_and_no_reuse_when_overlapping():
     # A single Conv reads x while producing y, so under the allocator's
     # conservative same-node-boundary rule they can never share space: the
