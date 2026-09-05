@@ -172,9 +172,10 @@ struct EmbeddingVocabPruningResult {
 // `GemmFastGelu` -- and only ever admits a plain FLOAT (float32) embedding
 // table/lm_head weight/bias, not also FLOAT16/BFLOAT16, matching this
 // file's own established narrower-than-pruning.py C++-port scope decision
-// elsewhere (e.g. `ApplyMoeExpertChannelPruning`'s own FLOAT32-only
-// restriction). See structured_pruning_entry.cpp's own section comment for
-// the full list of deliberately out-of-scope shapes and why.
+// elsewhere (e.g. the "MatMulNBits" section's own FLOAT32-only restriction
+// on its scales/zero_points/bias tensors). See structured_pruning_entry.cpp's
+// own section comment for the full list of deliberately out-of-scope shapes
+// and why.
 EmbeddingVocabPruningResult ApplyEmbeddingVocabPruning(
     const onnx::ModelProto& model,
     const std::optional<std::vector<int64_t>>& keep_token_ids,
@@ -377,8 +378,9 @@ onnx::ModelProto ApplyTransformerBlockPruning(
 // `com.microsoft::Attention` node's constant 2-D FLOAT32 merged QKV weight
 // (MatchAttentionProducer). Deliberately narrower than pruning.py's own
 // `apply_sparsegpt_pruning` in two ways, both mirroring this file's own
-// already-established C++-port scope decisions elsewhere (e.g.
-// ApplyMoeExpertChannelPruning's own FLOAT32-only restriction):
+// already-established C++-port scope decisions elsewhere (e.g. the
+// "MatMulNBits" section's own FLOAT32-only restriction on its scales/
+// zero_points/bias tensors):
 //   - FLOAT32 only, not also FLOAT16/BFLOAT16.
 //   - 2-D `Conv` (ordinary/depthwise/general-grouped) is NOT matched at
 //     all -- pruning.py's own Conv support needs an entirely new, from-
