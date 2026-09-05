@@ -18435,13 +18435,16 @@ def apply_structured_pruning_matmul_bnb4(
 #     in-op `q_norm_weight`/`k_norm_weight` pair (indices 14/15) -- distinct
 #     from the external `Reshape` -> `SimplifiedLayerNormalization` ->
 #     `Reshape` "per-head norm" sandwich :func:`_walk_back_through_qk_norm_rope`
-#     already matches -- that this module's own `GroupQueryAttention`
-#     matching does *not* yet read at all. That gap is genuinely out of
-#     scope for this `PagedAttention`-focused pass (fixing it doesn't change
-#     anything about what's matched or sliced here, since -- by the same
-#     reasoning above -- the fix would be "validate paired presence and
-#     shape, slice nothing," not a new slicing rule) and is left for a
-#     future pass to close on `GroupQueryAttention` directly.
+#     already matches. That gap was genuinely out of scope for this
+#     `PagedAttention`-focused pass (fixing it doesn't change anything about
+#     what's matched or sliced here, since -- by the same reasoning above --
+#     the fix is "validate paired presence and shape, slice nothing," not a
+#     new slicing rule) and has since been closed on `GroupQueryAttention`
+#     directly: :func:`_match_gqa_producer` now validates the same
+#     paired-presence rule at indices 14/15, and :func:`_find_gqa_chains`
+#     passes `qk_norm_weight_indices=(14, 15)` to
+#     :func:`_find_separate_qkv_chains` for the deferred exact-shape check,
+#     mirroring this section's own `PagedAttention` wiring exactly.
 #   * `k_scale`/`v_scale` (indices 14/15 -- a different pair of positions
 #     from `GroupQueryAttention`'s own 12/13) share the identical
 #     PER_TENSOR/PER_CHANNEL treatment, but this op's own doc gives
@@ -19654,6 +19657,26 @@ def _match_gqa_producer(
     (declined otherwise, rather than guessed at), a dynamic one left alone
     as always. :func:`_apply_one_gqa_chain` performs the actual slice(s) of
     both once a match succeeds.
+
+    `q_norm_weight`/`k_norm_weight` (indices 14/15), documented shape
+    ``(head_size,)`` and required by the schema to "be provided together" --
+    an RMSNorm gain applied identically to every head before rotary
+    embedding, confirmed live off this environment's installed onnxruntime
+    schema (``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``)
+    to be a genuine, independent in-op pair distinct from the external
+    `Reshape` -> `SimplifiedLayerNormalization` -> `Reshape` "per-head norm"
+    sandwich :func:`_walk_back_through_qk_norm_rope` already matches. Since
+    `head_size` never changes under this module's own whole-head/KV-group
+    pruning, neither tensor ever needs slicing once connected -- this
+    function only validates the schema's own paired-presence rule here
+    (declining a match where exactly one is connected), the same check
+    :func:`_match_paged_attention_producer` already performs for its own
+    analogous pair; :func:`_find_gqa_chains` passes
+    `qk_norm_weight_indices=(14, 15)` to :func:`_find_separate_qkv_chains`,
+    which performs the deferred exact-``(head_size,)``-shape check once
+    `head_size` itself is known, declining the whole match otherwise (the
+    same "don't guess" idiom `PagedAttention`'s own analogous pair already
+    gets).
     """
     if node.domain != _ATTENTION_DOMAIN or node.op_type != "GroupQueryAttention":
         return None
@@ -19686,6 +19709,11 @@ def _match_gqa_producer(
         sink_init = initializer_map.get(node.input[11])
         if sink_init is not None and list(sink_init.dims) != [num_heads]:
             return None  # not the schema's own (num_heads,) shape
+
+    q_norm_name = node.input[14] if len(node.input) > 14 else ""
+    k_norm_name = node.input[15] if len(node.input) > 15 else ""
+    if bool(q_norm_name) != bool(k_norm_name):
+        return None  # schema: "must be provided together"
 
     return num_heads, kv_num_heads
 
@@ -20438,9 +20466,11 @@ def _match_paged_attention_producer(
 #   `dt_bias`/`decay_scale` per-head weights by `keep_groups`, mirroring how
 #   `_walk_back_through_qk_norm_rope` already recognizes a per-head Q/K-norm
 #   sandwich) would close this gap, but is genuinely new machinery beyond
-#   this feature's own scope -- left for a future pass, exactly like
-#   `GroupQueryAttention`'s own in-op `q_norm_weight`/`k_norm_weight` gap
-#   this module's own comment already names as future work.
+#   this feature's own scope -- left for a future pass, the same kind of
+#   scoped-out future work `GroupQueryAttention`'s own in-op
+#   `q_norm_weight`/`k_norm_weight` gap once was, before this module's
+#   `_match_gqa_producer`/`_find_gqa_chains` closed it (see this module's
+#   "Attention-head pruning" section comment for that wiring).
 # - `scale` (float, default 0.0 -- "derives d_k... and uses 1/sqrt(d_k)")
 #   and `chunk_size` (int, "tuning hint; does not affect output correctness")
 #   are both entirely head-count-independent -- neither is ever read or
@@ -22259,8 +22289,23 @@ def _find_gqa_chains(
     graph: onnx.GraphProto,
     value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
 ) -> List[_GQAChain]:
+    """See :func:`_find_separate_qkv_chains` (the shared body) and
+    :func:`_match_gqa_producer` (what's matched and why it's declined
+    otherwise). Passes ``qk_norm_weight_indices=(14, 15)`` --
+    `GroupQueryAttention`'s own `q_norm_weight`/`k_norm_weight` input
+    indices (confirmed live off this environment's installed onnxruntime
+    schema), the same deferred exact-``(head_size,)``-shape check
+    :func:`_find_paged_attention_chains` already wires up for
+    `PagedAttention`'s own analogous pair at indices 12/13 -- see
+    :class:`_GQAChain`'s own docstring for why neither is ever sliced
+    despite this deferred check.
+    """
     return _find_separate_qkv_chains(
-        graph, _match_gqa_producer, "num_heads", value_info_by_name
+        graph,
+        _match_gqa_producer,
+        "num_heads",
+        value_info_by_name,
+        qk_norm_weight_indices=(14, 15),
     )
 
 

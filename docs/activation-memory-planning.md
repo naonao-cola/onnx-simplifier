@@ -84,7 +84,17 @@ logical storage. Honoring that part of the plan means actually running that
 node's kernel in place — writing its output over the input's own buffer —
 not just treating a repeated offset as "safe to reuse afterward."
 
-A second, independent category extends this to **binary operand donation**:
+A second, separate allowlist (`IsViewOp`) covers pure view ops — `Reshape`,
+`Flatten`, `Squeeze`, `Unsqueeze` — that reinterpret the same bytes under a
+different shape with no computation at all: ONNX requires row-major/
+contiguous tensor layout, and none of these ops permute element order, so
+their output is byte-for-byte identical to their input whenever the sizes
+actually agree (checked the same way as every other candidate). A chain may
+freely mix both allowlists — e.g. `Reshape -> Relu -> Flatten` all collapse
+into one group — since the eligibility conditions and the resulting
+placement are identical either way.
+
+A third, independent category extends this to **binary operand donation**:
 an elementwise binary op (`Add`, `Sub`, `Mul`, `Div`, `Max`, `Min`, `And`,
 `Or`, `Xor`, `Mod` — see `IsInPlaceSafeBinaryOp`) can compute its output by
 overwriting *one* of its two operands, the same way real NN memory planners
@@ -99,8 +109,8 @@ size never equals the output's, and it is correctly left un-aliased no
 matter how eligible it otherwise looks. The operand that isn't donated (if
 any) is simply left for the ordinary liveness pass to place, same as any
 other tensor. Because this unions into the very same `UnionFind` as the
-unary pass, a chain mixing unary and binary in-place-safe ops (e.g.
-`Relu -> Add -> Sigmoid`) still collapses into one group end to end.
+other two categories, a chain mixing any of them (e.g.
+`Reshape -> Relu -> Add -> Sigmoid`) still collapses into one group end to end.
 
 ## What's in `MemoryPlan`
 
