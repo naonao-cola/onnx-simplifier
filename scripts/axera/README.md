@@ -650,6 +650,360 @@ headers are the *host API* around dot-neu, not dot-neu's own internal
 format), but it resolves what several previously-separate, only-inferred
 pieces of terminology actually mean and how they relate to each other.
 
+### Applying the new vocabulary to a real `.axmodel`, and a real mcode-size finding
+
+With "dot-neu / mcode / Wbt / ringbuffer" now understood as real terms (not
+this project's own labels), re-examining a freshly-built real `.axmodel`
+confirms the mapping directly: the `<neu_key>`-named `graph.initializer`
+blob this README has been calling "the compiled program" **is mcode**, and
+`npu_params` **is the Wbt** (Weight Table). `AX_ENGINE_CMM_INFO`/
+`AX_JOINT_MODEL_CMM_INFO` (the AX650-era public structs, checked directly
+against this host's real `axcl_npu_type.h`) only expose a single aggregate
+`nCMMSize` -- the older SDK's four-way mcode/CvPreProcessMcode/Wbt/Ringbuffer
+breakdown isn't in the public host API for this generation, so the mapping
+below comes from directly instrumenting real builds, not a queryable API.
+(`axcl_ut_npu`'s own `Case12_AXCL_ENGINE_GetCMMUsage` test exists and passes
+against a real device, confirming the call works at all, but reveals nothing
+about the finer split without writing a custom harness -- not attempted,
+low expected value for real device-state risk.)
+
+**Wbt scales exactly linearly, 1280 bytes per identical op**: compiling ten
+otherwise-identical single-input-single-output graphs with 1 through 10
+sequential `Conv` layers (same shape throughout, `pads=[1,1,1,1]` to keep
+every intermediate the same size) gives `npu_params` sizes of 1320, 2600,
+3880, 5160, 6440, ... -- **every consecutive delta is exactly 1280 bytes**.
+Confirms Wbt really is what its name says: a flat, uncompressed,
+one-record-per-op concatenation of quantized weight (+ scale/bias) data,
+not a smarter const-data store.
+
+**mcode does *not* scale linearly -- but every delta is an exact multiple of
+32 bytes**: the same ten builds' mcode (`<neu_key>` blob) sizes are 2984,
+3248, 3408, 3440, 3568, 3600, 3728, 3792, 3888, 3920. Deltas from the second
+step onward: 160, 32, 128, 32, 128, 64, 96, 32 -- every single one is `32 *
+{1,2,3,4,5}`, never an in-between value, across 8 independent
+measurements. (The very first delta, 2984 -> 3248 = 264, breaks the
+pattern -- plausibly a one-time structural cost specific to a trivial
+single-op graph, not re-tested further.) This is real, repeatable
+structure: **mcode's command queue appears to allocate in 32-byte-aligned
+units, with a variable (not fixed) number of units assigned per identical
+op** -- consistent with `cmdq_write_instruct` emitting a different number
+of queue entries per instance of the same op depending on scheduling
+context (buffer/sync setup needs), rather than one fixed-size record per
+op the way Wbt's constant stride would suggest.
+
+**The growing region is not a simple append, even though the graph only
+grows by appending one more `Conv`**: diffing consecutive builds' mcode
+byte-for-byte finds only a **36-byte common prefix** (matches this
+README's own already-decoded FlatBuffers root-table + vtable header) and a
+**158-byte common suffix** (the tail string table, consistent with
+FlatBuffers' bottom-up construction convention already documented above) --
+identical across every pair tested. Everything in between differs
+completely, even for the *unchanged* first N-1 conv layers' commands, not
+just the newly-added one. Pulsar2's compiler re-serializes/re-addresses
+essentially the whole command stream on any topology change (consistent
+with cmdq entries containing absolute buffer addresses, job IDs, or
+OCM-residency decisions that legitimately do shift when one more op is
+added anywhere in the graph) rather than treating mcode as an append-only
+log. This bounds what future differential analysis targeting the cmdq
+record format itself can assume: byte-position stability across even
+trivially-different graphs cannot be relied on outside the fixed
+header/footer.
+
+### The 32-byte mcode unit holds under shape variation too, and Wbt reveals real channel-tiling structure
+
+The op-count sweep above varies *how many* identical ops there are; this
+sweep instead holds op-count at 1 and varies *shape* -- output channels,
+input channels, and kernel size, each independently, for a single `Conv` --
+to separate "cost per op" from "cost per unit of tensor data."
+
+**The 32-byte mcode finding generalizes**: every single-`Conv` shape change
+tested still moves mcode's size by an exact multiple of 32 bytes -- cout
+`{4,8,16,32,64}` gives deltas `{512, 32, 0, 64}`; cin `{4,8,16,32,64}` gives
+`{192, 32, 0, 32}`; kernel size `{1,3,5,7}` gives `{-224, 928, 352}`
+(k=1->3 is negative -- a smaller kernel with a *larger* mcode, see below).
+19 independent measurements now, across two completely different kinds of
+model variation (repeating an op vs. reshaping one), zero exceptions: mcode
+appears to always serialize in exact 32-byte increments, a real structural
+property of the format rather than an artifact specific to adding ops.
+
+**Wbt's cost is *not* proportional to channel count -- it's flat across a
+range, then jumps**, consistent with output-channel tiling:
+
+```
+cout:    4     8    16    32    64
+Wbt:  1320  1448  1448  1448  2856
+```
+
+`Wbt` is identical across `cout` 8, 16, and *32* (1448 bytes each), then
+roughly doubles at 64 -- consistent with an output-channel tile width of 32
+(any count up to one tile's worth costs the same; a second tile is only
+needed past it). It cleanly decomposes at the two largest sizes: `Wbt -
+(cout * cin * k^2 [int8 weight] + cout * 4 [f32 per-channel scale] + cout *
+4 [f32 per-channel bias])` equals **exactly 40 bytes** for both cout=32
+(1448 - 1408 = 40) and cout=64 (2856 - 2816 = 40) -- a small, constant,
+plausibly-a-tensor-header overhead once tiling effects are past. Below the
+32-channel tile boundary (cout 4, 8, 16), that same subtraction gives 1144,
+1096, and 744 respectively -- real, shrinking, but not yet explained by any
+formula tried; `cout=4` is *smaller* than `cout=8`/`cout=16` even though
+they're otherwise byte-identical to each other, an unexplained outlier at
+the smallest size tested (the op-count sweep above hit the same kind of
+"smallest case is different" edge, for what it's worth).
+
+**Input channels show a similar flat-then-jump shape, but no clean floor
+was found**:
+
+```
+cin:    4     8    16    32    64
+Wbt: 1320  1256  1256  2408  4712
+```
+
+Flat across `cin` 8-16, roughly doubling at 32 and again at 64 (consistent
+with an input-channel tile width of 16 -- half `cout`'s apparent 32,
+plausible for a real MAC array with different input/output parallelism).
+Padding `cin` up to the nearest multiple of 16 before applying the same
+subtraction formula above gives a *matching* 648-byte residual for both
+cin=8 and cin=16 (real, clean), but the residual keeps growing at cin=32/64
+(1224, 2376) rather than settling to a constant the way `cout`'s did --
+genuinely not resolved here; per-input-channel data (e.g. a real hardware
+design can need per-input-channel handling that a purely per-output-channel
+model like the `cout` case doesn't) is a plausible reason, not confirmed.
+
+**Kernel size is the most surprising: not monotonic, and not `k^2`-scaled**:
+
+```
+k:      1     3     5     7
+Wbt: 1448  1320  2472  4776
+```
+
+`k=1` costs *more* than `k=3` despite having 1/9th the raw weight data --
+plausibly a real, different internal handling for 1x1 convolutions (closer
+to a MatMul in some NPU designs) rather than the general conv path. `k=3`
+to `k=5` to `k=7` grow much faster than raw element count would predict
+(a `k^2` model predicts a 2.78x jump from 3 to 5; the real jump is 1.87x),
+consistent with the kernel being broken into fixed-size sub-tiles (e.g. 3x3
+blocks) with each additional tile costing a full tile's worth regardless of
+how much of it the real kernel uses -- plausible, not confirmed with only
+four data points.
+
+**Bottom line**: the 32-byte mcode-serialization-unit finding is now solid
+across two independent kinds of experiment. The Wbt tiling-granularity
+story is real and reproducible (flat regions, clean doublings, an exact
+40-byte per-tensor floor once large enough) but only partially explained --
+a genuine, well-scoped target for further differential analysis, not a
+closed question.
+
+### How much of mcode do we actually understand, for a real model?
+
+Everything above characterizes tiny, single-purpose synthetic graphs.
+Applying it to a real, full-size, production model --
+`resnet18d_Opset18` (56 nodes, 8 distinct ONNX op types: `Conv` x22,
+`Relu` x19, `Add` x8, `AveragePool` x3, `MaxPool`, `GlobalAveragePool`,
+`Flatten`, `Gemm`) -- gives a real, quantified, honestly small answer.
+
+**Byte-level: roughly 1%.** This model's real compiled mcode blob is
+49,080 bytes. Scanning it for the known FlatBuffers structure (the header,
+vtable, and the tensor-name/`_offset` string table this README already
+decoded, duplicated near the start and end per FlatBuffers' bottom-up
+convention) accounts for only ~505 of those bytes -- the front copy spans
+byte 0 to ~253, the back copy spans ~48,828 to the end. **The remaining
+~48,575 bytes (>99%) are completely uninterpreted** beyond the general
+"changes happen in 32-byte units" behavioral finding above, which says
+nothing about what any specific byte in that region means. A blind scan
+of that whole opaque region for embedded ASCII strings (the same technique
+that found the tensor-name table) turns up nothing but statistical noise
+(~20 spurious 3-4-byte "printable" runs, exactly what you'd expect by
+chance in ~48KB of dense binary data) -- confirming there's no other
+human-readable structure hiding in there for this technique to find.
+
+**Primitive/op-level: about 1 of 7, and even that one is partial.**
+Rebuilding the same model with `--profile` and inspecting the real
+`trace.json` (see the profiling section above) shows the *dataflow* is
+well understood -- but that's a different, much coarser layer than mcode's
+actual byte encoding. The 1433 real scheduled events resolve to:
+
+```
+AxQuantizedConv          996  (69.5%)  -- Conv, with Relu fused in (see below)
+LOAD_XXH128_DEDUP        343  (23.9%)  -- content-addressed weight DMA loads
+"/fc/Gemm_*"              48  ( 3.3%)  -- the final FC layer, kept its ONNX name
+AxQuantizedAdd            22  ( 1.5%)  -- the residual Add
+AxMaxPool                   8  ( 0.6%)  (4 spatial-split sub-events x2)
+AxQuantizedAvgPool           6  ( 0.4%)
+AxQuantizedNormalize          4  ( 0.3%)  -- see below, not an ONNX op at all
+AxQuantizedGlobAvgPool         2  ( 0.1%)
+RTV_IO_EVENT                    2  ( 0.1%)  -- see below
+Post_AxTranspose, final DequantizeLinear -- 1 event each
+```
+
+Of these 7 real distinct *compute* primitive families (`AxQuantizedConv`,
+the FC `Gemm`, `AxQuantizedAdd`, `AxMaxPool`, `AxQuantizedAvgPool`,
+`AxQuantizedNormalize`, `AxQuantizedGlobAvgPool` -- separate from the
+housekeeping categories: weight-load dedup, RTV I/O, transpose, final
+dequant), this whole investigation has only ever differentially decoded
+**one narrow field of one of them**: `AxQuantizedConv`'s per-channel bias
+array (two float32 arrays, one identified as a real requantization
+multiplier -- see the differential-analysis section above). The dominant
+primitive by far (`AxQuantizedConv`'s actual weight/compute encoding, 69.5%
+of all scheduled
+work) is not decoded at all, and `AxQuantizedAdd`, `AvgPool`, `MaxPool`,
+`GlobalAvgPool`, `Normalize`, and the FC `Gemm` path have had zero
+differential analysis directed at them specifically. (The earlier Add/Sub
+differential analysis tested `Add`/`Sub` against a *constant* operand, not
+`AxQuantizedAdd`'s real use here -- a residual add of two activations --
+so it doesn't actually transfer to this real usage.)
+
+**Real findings along the way, not previously documented**, even though
+the underlying bytes remain opaque:
+
+- **`Relu` produces no separate primitive or scheduled event at all** --
+  it's fused directly into the preceding `AxQuantizedConv`, at zero
+  additional schedule cost. Real, free activation fusion.
+- **`Flatten` likewise produces nothing** -- a pure reshape, no compute or
+  DMA needed.
+- **Image normalization (the `calibration_mean`/`calibration_std` from
+  `input_processors`, not part of the original ONNX graph at all) compiles
+  to its own explicit primitive, `AxQuantizedNormalize`** -- confirming
+  Pulsar2's input pre-processing pipeline is baked into mcode as a real,
+  first-class compiled op, not a host-side step.
+- **RTV events are real and present even for a plain CNN's ordinary
+  tensor I/O** (`__rtv_x`, `__rtv_212`, one per graph input/output) --
+  independent, real-model confirmation that the Runtime Variable mechanism
+  from the public prior-generation SDK research above is still live in the
+  current stack, and not restricted to ISP/CV use cases the way the public
+  header's RTV enum values (mostly `WARP_*`/`HAAR_*`/`YDRC_*`) might
+  suggest on their own.
+- **Nearly a quarter of the entire real execution schedule (23.9%, 343 of
+  1433 events) is weight-loading DMA, deduplicated by content hash**
+  (`ld:xxh128:<hash>`) -- a real, previously-undocumented systems
+  optimization: identical weight blocks (plausible for a residual network
+  with repeated block structure) get loaded once and reused via
+  content-addressing, rather than re-transferred per use.
+
+**Bottom line**: this investigation understands the *container* (FlatBuffers)
+and, separately, the real *dataflow schedule* (via `trace.json`) well. It
+does not understand mcode's actual instruction/command encoding in any
+usable sense for a real model -- at best a single narrow field of the
+single most common primitive. Wbt is in better shape: its gross
+composition (weight + per-channel scale + per-channel bias + a tiling
+floor) is characterized, even though the bias array's own bit-level
+quantization format was never independently re-derived either. Turning
+"~1% of mcode's bytes explained" into real coverage would need the same
+byte-diffing technique demonstrated for Conv's bias, scaled up to cover
+`AxQuantizedAdd`/`AvgPool`/`MaxPool`/`GlobalAvgPool`/`Normalize`/`Gemm`,
+and critically, `AxQuantizedConv`'s dominant weight/compute payload itself
+-- each a real, well-scoped, but separately time-consuming target.
+
+### A first real crack at `AxQuantizedConv`'s command encoding
+
+Taking up that target directly: since Conv's actual *weight values* live
+in Wbt (already reasonably well understood), what's left opaque in mcode
+for `AxQuantizedConv` is the *command* that invokes it -- stride, padding,
+dilation, groups, and whatever addressing/scheduling those imply. Sweeping
+each independently (single `Conv`, shape otherwise fixed) confirmed the
+now-familiar problem: most pairs differ in total mcode length (a stride or
+padding change usually changes the output tensor's declared shape too),
+which triggers the wholesale re-serialization this README already
+documented -- diffing two differently-sized blobs mostly shows *that*
+effect, not the parameter's own encoding.
+
+**The fix: pick pairs that happen to serialize to the *same total length*.**
+`dilation=2` vs `dilation=3` (padding adjusted to keep output shape
+identical, so *only* dilation differs) both compiled to exactly 3528
+bytes; `groups=2` vs `groups=4` both compiled to exactly 3176 bytes. With
+length held constant, a full byte-level diff (not just common-prefix/
+suffix) is meaningful, and both pairs show real, tight, structured
+differences instead of a wholesale rewrite:
+
+- Two **byte-identical 94-byte and 60-byte blocks**, each appearing twice
+  in the blob (at a fixed +608-byte separation for the dilation pair),
+  containing a handful of scattered single-byte differences -- plausibly
+  one shared command template instantiated once per major compute engine
+  (`conv0`/`conv1` split evenly in this README's own `resnet18d` profiling
+  above), each copy separately patched with a few dilation/groups-sensitive
+  bytes.
+- **A real, precisely-located periodic field**: exactly **4 repeats of a
+  3-byte value, each occurring every 7 bytes**, changing identically with
+  both dilation (`1a3b80`->`4b186f`, repeated at offsets 2561/2568/2575/
+  2582) and groups (`924e5c`->`af9636`, repeated 7 bytes apart). The exact
+  same 4x/7-byte-stride shape in two independent experiments is real
+  structure, not noise.
+- **A control experiment rules out the obvious explanation**: re-running
+  the dilation pair with `cout=8` instead of 4 still shows *exactly 4*
+  repeats (at the same 7-byte stride) -- so this field is not
+  "one entry per output channel." It's much more likely one entry per
+  **spatial tile**: this README's own `resnet18d` profiling above already
+  found real primitives split into named `_s0`/`_s1`/`_s2`/`_s3`
+  sub-events (`AxMaxPool`, `AxQuantizedNormalize`) -- independent evidence
+  for a fixed 4-way spatial tiling convention in this compiler, which this
+  new byte-level finding now corroborates from a completely different
+  angle.
+
+**Still not decoded**: the exact bit-level meaning of that 3-byte
+per-tile field, or of the scattered single-byte differences inside the
+94-byte/60-byte shared blocks. This is a real, precise *location* (mcode
+byte offsets 2561-2601 in this specific build, always 4 entries at a
+7-byte stride) for future work to target, not a solved encoding -- but
+it's the first time this investigation has isolated a small, structured,
+non-header/footer region of `AxQuantizedConv`'s own command at all,
+against a real production-scale finding (4-way spatial tiling) rather than
+a synthetic-model artifact.
+
+### Does this transfer to `resnet18d` itself? A negative result, and a bigger positive one
+
+The natural next question: does the periodic-field finding above, found on
+a tiny single-`Conv` synthetic model, actually show up inside a real,
+22-`Conv` model's mcode? Tested directly: edited `resnet18d_Opset18`'s own
+ONNX graph in place, changing exactly one real layer's
+(`/layer1/layer1.0/conv1/Conv`) `dilations` from `[1,1]` to `[2,2]`
+(padding adjusted to `[2,2,2,2]` to keep output shape, and therefore every
+downstream layer, identical), and rebuilt for real -- weights untouched, a
+purely structural edit. It compiled successfully (`max_cycle` 1,318,764 ->
+1,327,463, a plausible small increase for one costlier layer).
+
+**Negative result: the same-total-length trick that made the synthetic
+diff clean does not carry over.** Unlike the tiny model (where a careful
+padding choice reliably produced an identical total mcode length), editing
+one internal layer of a real 22-layer network changed the *whole* blob's
+length -- 49,080 -> 49,912 bytes. A second attempt (`dilation=3`, `pad=3`
+on the same layer) gave a third, still-different length (50,808). Neither
+of the two edited variants matches the baseline or each other, so the
+clean "diff the whole blob" technique that worked on the synthetic model
+doesn't directly apply here -- a single internal attribute change cascades
+into a differently-sized whole program in a way that (at least on the two
+tries attempted) doesn't coincidentally realign. This is itself a real,
+useful negative result: it bounds how far the synthetic-model technique
+generalizes on its own, without a smarter localization method or a lot of
+brute-force retrying.
+
+**A different technique gives a much bigger, and arguably more useful,
+positive result.** Since diffing two *different* builds didn't work
+cleanly, look for self-similarity *within* the one real, unmodified
+`resnet18d` mcode blob instead -- no second build needed. Scanning it for
+exact-duplicate byte windows (any substring that occurs more than once)
+turns up an amount of internal repetition that is astronomically
+impossible by chance: 1,225 distinct duplicated 32-byte windows (4,138
+total window instances, out of only ~49,000 possible positions -- for
+context, a truly random 49KB blob would have a vanishingly small chance of
+containing even one repeated 32-byte sequence, let alone thousands, since
+there are `256^32` possible values). Extending every matching seed to its
+maximal exact-duplicate run and merging overlaps gives a precise, real
+number: **21,289 of the blob's 49,080 bytes (43.4%) are byte-for-byte
+identical to some other span elsewhere in the same file**, including one
+exactly-matching run of 177 bytes (at offsets 278 and 10,994) and dozens
+more in the 40-90 byte range.
+
+This is real, direct, large-scale confirmation of the shared-command-
+template hypothesis the tiny synthetic model first suggested (the 94-byte/
+60-byte blocks repeated exactly twice, one guess being "once per compute
+engine") -- just demonstrated a different way, and at a scale (43% of a
+real model's mcode) that makes clear most of a real compiled program's
+bytes are copies of other bytes in the same file, not each independently
+carrying unique information. It does **not** mean 43% of mcode is
+*understood* -- none of these repeated templates have been decoded either,
+this only establishes that they repeat -- but it substantially shrinks the
+amount of genuinely distinct content anyone would need to decode to cover
+the rest: on this evidence, well under 49,080 bytes' worth of *distinct*
+templates, not 49,080 bytes of independent unique data.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
