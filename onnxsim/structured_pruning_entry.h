@@ -467,24 +467,42 @@ onnx::ModelProto ApplySparseGptPruning(
 // any tensor's shape -- only individual weight entries are zeroed in place.
 //
 // Matches EXACTLY the same candidate set as ApplySparseGptPruning, via the
-// same matchers (MatchMatMulLikeRaw, MatchAttentionProducer): every plain
-// `MatMul`/vanilla-`Gemm` node with a constant 2-D FLOAT32 weight (already
-// covering `com.microsoft::GroupQueryAttention`'s own separate Q/K/V
-// projections -- ordinary MatMul/Gemm nodes feeding it, not a weight the op
-// itself owns), plus every `com.microsoft::Attention` node's constant 2-D
-// FLOAT32 merged QKV weight. Deliberately narrower than pruning.py's own
-// `apply_wanda_pruning` in the same two ways ApplySparseGptPruning's own
-// declaration comment above already documents and justifies at length:
-//   - FLOAT32 only, not also FLOAT16/BFLOAT16.
+// same MatchMatMulLikeRaw matcher for the MatMul/Gemm case, PLUS a local,
+// dtype-widened copy of MatchAttentionProducer for the Attention case (see
+// structured_pruning_entry.cpp's own "Wanda unstructured (element-wise)
+// pruning" section comment, MatchAttentionProducerWideDtype, for why this
+// needs its own copy rather than reusing MatchAttentionProducer directly):
+// every plain `MatMul`/vanilla-`Gemm` node with a constant 2-D FLOAT32/
+// FLOAT16/BFLOAT16 weight (already covering
+// `com.microsoft::GroupQueryAttention`'s own separate Q/K/V projections --
+// ordinary MatMul/Gemm nodes feeding it, not a weight the op itself owns),
+// plus every `com.microsoft::Attention` node's constant 2-D FLOAT32/FLOAT16/
+// BFLOAT16 merged QKV weight -- mirrors pruning.py's own
+// `_is_supported_float_dtype` widening of `_match_attention_producer`
+// exactly. Unlike ApplySparseGptPruning immediately above, FLOAT16/BFLOAT16
+// support is now at TRUE parity with pruning.py's own `apply_wanda_pruning`
+// (read out upcast to float64 via ReadTensorAsF64, written back down via
+// WriteF64TensorAs -- this file's own MoE/QMoE-established conversion trio,
+// see IsSupportedFloatDtype's own declaration comment -- exactly mirroring
+// pruning.py's own `_to_f64`/`_from_f64` round trip; masking never changes a
+// surviving entry's own value, only zeros dropped ones, so this reproduces
+// every kept entry's exact original bit pattern). Only remaining,
+// deliberate gap vs. pruning.py's own `apply_wanda_pruning`:
 //   - 2-D `Conv` (ordinary/depthwise/general-grouped) is NOT matched at
 //     all -- pruning.py's own Conv support for THIS function needs the same
 //     from-first-principles im2col per-receptive-field-offset activation
 //     norm (`_conv_patch_sq_sum`, `_conv_group_relative_norm`) that
 //     ApplySparseGptPruning's own declaration comment explains is out of
 //     scope here for the analogous Hessian case -- materially bigger than
-//     the rest of this pass, and deliberately left to the pure-Python
-//     implementation. A Conv node here simply never matches either
+//     the rest of this pass (a brand-new im2col activation-collection engine
+//     this file has nowhere else, plus the grouped/depthwise group-relative
+//     norm expansion, with real numeric-correctness risk if gotten subtly
+//     wrong), and deliberately left to the pure-Python implementation rather
+//     than risked this round. A Conv node here simply never matches either
 //     candidate case and is left completely untouched, never guessed at.
+//     Because of this ONE remaining gap, `apply_wanda_pruning` is NOT
+//     aliased to this port in pruning.py -- see that function's own
+//     docstring there.
 //
 // Wanda's own calibration statistic -- one shared per-reduction-channel
 // activation L2-norm per matched layer's own input, reduced over every
@@ -518,8 +536,9 @@ onnx::ModelProto ApplySparseGptPruning(
 //
 // A matched layer with NO observed calibration activation for its own
 // input (dead input, an otherwise-empty `calibration_data`, every batch's
-// own activation isn't FLOAT32, or an observed width mismatched with the
-// weight's own reduction dimension) falls back to PLAIN MAGNITUDE
+// own activation isn't FLOAT32/FLOAT16/BFLOAT16, or an observed width
+// mismatched with the weight's own reduction dimension) falls back to PLAIN
+// MAGNITUDE
 // importance (``|W_ij|`` alone) for that one layer -- mirrors pruning.py's
 // own per-layer `_wanda_importance` fallback exactly. This is the one
 // meaningful behavioral difference from ApplySparseGptPruning's own

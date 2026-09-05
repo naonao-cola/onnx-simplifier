@@ -762,21 +762,22 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
 
   // Wanda pruning (Sun et al., 2023): the calibration-driven upgrade of
   // magnitude pruning's data-free baseline, zeroing the least-important
-  // entries of every matched layer's constant 2-D FLOAT32 weight to an
-  // unstructured or N:M sparsity pattern using ``|W_ij| * ||X_j||_2``
-  // (weight magnitude times its reduction-dimension entry's calibrated
-  // activation L2-norm) as the importance metric -- a one-shot static
-  // score, unlike apply_sparsegpt_pruning's own sequential Hessian-error-
-  // compensating algorithm. Same candidate set/scope (FLOAT32-only, no
-  // Conv) and same executor-as-first-argument, `calibration_data`
-  // (List[Dict[str, onnx.TensorProto]]) crossing convention as
-  // apply_sparsegpt_pruning's own binding above. See ApplyWandaPruning in
-  // structured_pruning_entry.h for the full scope and the data-free
-  // magnitude fallback an unobserved layer gets (unlike SparseGPT, which
-  // has none). `global_sparsity` pools every matched layer's importance
-  // into one whole-model ranking, mirroring apply_structured_wanda_
-  // pruning's own `sparsity`-only mode's structural analogue; incompatible
-  // with `n`/`m`.
+  // entries of every matched layer's constant 2-D FLOAT32/FLOAT16/BFLOAT16
+  // weight to an unstructured or N:M sparsity pattern using
+  // ``|W_ij| * ||X_j||_2`` (weight magnitude times its reduction-dimension
+  // entry's calibrated activation L2-norm) as the importance metric -- a
+  // one-shot static score, unlike apply_sparsegpt_pruning's own sequential
+  // Hessian-error-compensating algorithm. Same candidate set as
+  // apply_sparsegpt_pruning's own binding above except widened to
+  // FLOAT32/FLOAT16/BFLOAT16 (still no Conv -- the one remaining gap vs.
+  // pruning.py's own apply_wanda_pruning), and same executor-as-first-
+  // argument, `calibration_data` (List[Dict[str, onnx.TensorProto]])
+  // crossing convention. See ApplyWandaPruning in structured_pruning_
+  // entry.h for the full scope and the data-free magnitude fallback an
+  // unobserved layer gets (unlike SparseGPT, which has none).
+  // `global_sparsity` pools every matched layer's importance into one
+  // whole-model ranking, mirroring apply_structured_wanda_pruning's own
+  // `sparsity`-only mode's structural analogue; incompatible with `n`/`m`.
   m.def(
       "apply_wanda_pruning",
       [](std::shared_ptr<PyModelExecutor> executor,

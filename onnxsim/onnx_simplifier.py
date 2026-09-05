@@ -1767,37 +1767,42 @@ def apply_wanda_pruning_cpp(
     docstring for the general pattern).
 
     Matches every plain ``MatMul``/vanilla-``Gemm`` node with a constant 2-D
-    FLOAT32 weight (this already includes ``com.microsoft::
-    GroupQueryAttention``'s own separate Q/K/V projections -- ordinary
-    MatMul/Gemm nodes feeding it, not a weight the op itself owns), plus
-    every ``com.microsoft::Attention`` node's constant 2-D FLOAT32 merged
-    QKV weight -- EXACTLY the same candidate set as
-    :func:`onnxsim.apply_sparsegpt_pruning_cpp`. Deliberately narrower than
-    the pure-Python :func:`onnxsim.apply_wanda_pruning` in the same two ways
-    that function's own C++-port sibling already establishes (mirroring
-    this module's own established narrower-than-pruning.py C++-port scope
-    decisions elsewhere, e.g. the ``MatMulNBits`` C++ section's own
-    FLOAT32-only restriction on its own scales/zero_points/bias tensors):
+    FLOAT32/FLOAT16/BFLOAT16 weight (this already includes
+    ``com.microsoft::GroupQueryAttention``'s own separate Q/K/V projections
+    -- ordinary MatMul/Gemm nodes feeding it, not a weight the op itself
+    owns), plus every ``com.microsoft::Attention`` node's constant 2-D
+    FLOAT32/FLOAT16/BFLOAT16 merged QKV weight -- widened to
+    FLOAT32/FLOAT16/BFLOAT16 vs. :func:`onnxsim.apply_sparsegpt_pruning_cpp`'s
+    own still-FLOAT32-only candidate set (read out upcast to float64, written
+    back down to the original dtype, exactly mirroring the pure-Python
+    :func:`onnxsim.apply_wanda_pruning`'s own ``_to_f64``/``_from_f64``
+    round trip -- masking never recomputes a surviving entry's own value, so
+    this reproduces its exact original bit pattern). Only remaining
+    deliberate gap vs. the pure-Python :func:`onnxsim.apply_wanda_pruning`:
 
-    - FLOAT32 only, not also FLOAT16/BFLOAT16.
     - 2-D ``Conv`` (ordinary/depthwise/general-grouped) is **not** matched
       at all here -- the pure-Python original's own Conv support needs an
       entirely new, from-first-principles im2col per-receptive-field-offset
       activation norm (``_conv_patch_sq_sum``/``_conv_group_relative_norm``)
       that :func:`onnxsim.apply_sparsegpt_pruning_cpp`'s own docstring
       explains is out of scope here too, for the analogous Hessian case --
-      reaching that bar is materially bigger than the rest of this pass and
-      is out of scope for this C++ port. A Conv node is left completely
-      untouched here, never guessed at, exactly as if it were any other
-      unmatched node type -- use the pure-Python
-      :func:`onnxsim.apply_wanda_pruning` if Conv coverage is required.
+      reaching that bar is materially bigger than the rest of this pass
+      (a brand-new im2col activation-collection engine this C++ port has
+      nowhere else, plus the grouped/depthwise group-relative norm
+      expansion, with real numeric-correctness risk if gotten subtly wrong)
+      and is deliberately left to the pure-Python implementation rather than
+      risked this round. A Conv node is left completely untouched here,
+      never guessed at, exactly as if it were any other unmatched node type
+      -- use the pure-Python :func:`onnxsim.apply_wanda_pruning` if Conv
+      coverage is required. Because of this one remaining gap,
+      :func:`onnxsim.apply_wanda_pruning` is NOT an alias of this function.
 
     Unlike :func:`onnxsim.apply_sparsegpt_pruning_cpp` (which has no data-
     free fallback at all -- its entire mechanism IS the Hessian), a matched
     layer with NO observed calibration activation for its own input (dead
     input, an otherwise-empty ``calibration_data``, or every batch's
-    activation isn't FLOAT32) still gets pruned here, just to PLAIN
-    MAGNITUDE importance (``|W_ij|`` alone) instead -- mirrors the
+    activation isn't FLOAT32/FLOAT16/BFLOAT16) still gets pruned here, just
+    to PLAIN MAGNITUDE importance (``|W_ij|`` alone) instead -- mirrors the
     pure-Python :func:`onnxsim.apply_wanda_pruning`'s own per-layer
     fallback exactly.
 

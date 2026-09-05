@@ -18360,19 +18360,27 @@ std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
                    // above.
       }
       const DLTensor& dl = outputs[oit->second]->dl_tensor;
-      // Scope decision, mirroring this file's own FLOAT32-only chain
-      // matching everywhere else (every producer/consumer weight this file
-      // matches is FLOAT32-only -- see e.g. MatchProducer): a probe
-      // activation of any other runtime dtype is simply skipped for this
-      // batch (never observed for this probe name), so the affected
-      // chain(s) fall back to plain weight-only importance -- never
-      // guessed at via an implicit upcast. In practice every chain this
-      // pass matches is itself FLOAT32-only, so its own probe activation is
-      // FLOAT32 too whenever the executor runs the *real* graph ops
-      // faithfully; this only guards against an executor that (legitimately
-      // per the ModelExecutor contract) returns some other dtype.
+      // Accepts FLOAT/FLOAT16/BFLOAT16 (IsSupportedFloatDtype), mirroring
+      // pruning.py's own unconditional `np.asarray(..., dtype=np.float64)`
+      // here -- ApplyWandaPruning's own candidate matching (this file's own
+      // "Wanda unstructured (element-wise) pruning" section) now widens its
+      // own weight-dtype gates to match, per that section's own top
+      // comment, so a FLOAT16/BFLOAT16 model's probe activation needs to be
+      // observed here too rather than silently falling back to plain
+      // weight-only importance the way an unobserved-dtype probe still does
+      // below. Strictly additive for every OTHER caller of this shared
+      // function (ApplyStructuredWandaPruning/ApplyAttentionHeadWandaPruning
+      // above/below, still FLOAT32-only candidate matchers of their own):
+      // it only lets this function observe MORE activation dtypes, never
+      // fewer, so their own FLOAT32-only candidates' own probe activations
+      // (already FLOAT32 whenever the executor runs the real graph
+      // faithfully) are unaffected. A probe activation of any other runtime
+      // dtype the executor might legitimately return is simply skipped for
+      // this batch (never observed for this probe name), so the affected
+      // chain(s) fall back to plain weight-only importance -- never guessed
+      // at via an implicit upcast.
       onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
-      if (tp.data_type() != onnx::TensorProto::FLOAT) {
+      if (!IsSupportedFloatDtype(tp.data_type())) {
         continue;
       }
       const int64_t ndim = tp.dims_size();
@@ -18399,7 +18407,11 @@ std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
       }
       const int64_t channel_stride = strides[static_cast<size_t>(axis)];
 
-      std::vector<float> data = ReadFloatTensor(tp);
+      // ReadTensorAsF64 (FLOAT/FLOAT16/BFLOAT16 -> double, exact upcast --
+      // see its own declaration comment) rather than ReadFloatTensor: `tp`
+      // may now be FLOAT16/BFLOAT16, per this function's own widened dtype
+      // gate above.
+      std::vector<double> data = ReadTensorAsF64(tp);
       auto& acc = sq_sum[name];
       if (acc.empty()) {
         acc.assign(static_cast<size_t>(channel_dim), 0.0);
@@ -18412,7 +18424,7 @@ std::unordered_map<std::string, std::vector<double>> WandaCalibrationStats(
       // channel_dim` for a row-major contiguous layout).
       for (int64_t flat = 0; flat < total; ++flat) {
         const int64_t c = (flat / channel_stride) % channel_dim;
-        const double v = static_cast<double>(data[static_cast<size_t>(flat)]);
+        const double v = data[static_cast<size_t>(flat)];
         acc[static_cast<size_t>(c)] += v * v;
       }
       count[name] += total / channel_dim;
@@ -20786,13 +20798,32 @@ onnx::ModelProto ApplySparseGptPruning(
 // C++ port of pruning.py's own `apply_wanda_pruning` -- see
 // structured_pruning_entry.h's own ApplyWandaPruning declaration comment
 // for the full scope (candidate set identical to ApplySparseGptPruning
-// immediately above; FLOAT32-only, Conv out of scope) and the
-// per-layer/`global_sparsity` masking contract this implements. Reuses
-// WandaCalibrationStats verbatim for the calibration statistic (same shape
-// ApplyStructuredWandaPruning/ApplyAttentionHeadWandaPruning already
-// consume), and MatchMatMulLikeRaw/MatchAttentionProducer verbatim for
-// candidate matching (same as ApplySparseGptPruning) -- the only genuinely
-// new machinery here is the plain one-shot importance score
+// immediately above except widened to FLOAT32/FLOAT16/BFLOAT16; Conv out of
+// scope) and the per-layer/`global_sparsity` masking contract this
+// implements. Reuses WandaCalibrationStats for the calibration statistic
+// (same shape ApplyStructuredWandaPruning/ApplyAttentionHeadWandaPruning
+// already consume -- its own activation-dtype gate was widened from
+// FLOAT-only to IsSupportedFloatDtype/ReadTensorAsF64 as part of this same
+// change, see its own top comment; a strict widening that only lets it
+// observe MORE activations, so it changes nothing for those two other
+// callers' own FLOAT32-only candidate sets), MatchMatMulLikeRaw verbatim for
+// the MatMul/Gemm candidate case (its own weight-dtype gate lives at this
+// function's OWN call site below, not inside the shared matcher, so
+// widening it here is a strictly local change -- unlike Attention, see
+// immediately below), and a LOCAL, dtype-widened copy of
+// MatchAttentionProducer (MatchAttentionProducerWideDtype below) for the
+// Attention candidate case -- MatchAttentionProducer's own dtype gate is
+// baked INSIDE the shared matcher itself (unlike MatchMatMulLikeRaw's), and
+// that matcher is also reused by FindAttentionChains (structured
+// Attention-head pruning) and ApplySparseGptPruning immediately above, both
+// deliberately FLOAT32-only per their own declaration comments -- widening
+// it in place would silently widen candidate matching for those two
+// unrelated, independently-verified-only-for-FLOAT32 passes too. Hence the
+// narrow, local duplicate instead, exactly the same "narrow, local
+// duplicate instead of a shared-code change" precedent this file's own
+// MoE/QMoE section top comment already established for the analogous
+// FLOAT32-only-elsewhere situation. The only genuinely new machinery here
+// (beyond the dtype widening) is the plain one-shot importance score
 // (`|W_ij| * ||X_j||_2`, WandaImportance below, no Hessian/Cholesky at all)
 // and its element-wise masking (WandaSparsityMaskNK/WandaNmMaskNK/the
 // `global_sparsity` pooling loop inside ApplyWandaPruning itself), mirroring
@@ -20832,21 +20863,23 @@ WandaNK ToWandaNK(const std::vector<double>& w_f64, int64_t dim0, int64_t dim1,
 // Inverse of ToWandaNK -- mirrors pruning.py's own `_nk_to_weight`
 // (non-Conv branch). `w_pruned_nk` is row-major `[n_rows, kk]`; the
 // returned buffer is row-major `[dim0, dim1]`, ready for
-// SetFloatTensorData.
-std::vector<float> FromWandaNK(const std::vector<double>& w_pruned_nk,
-                               int64_t dim0, int64_t dim1,
-                               bool weight_transposed) {
-  std::vector<float> w_new(static_cast<size_t>(dim0 * dim1));
+// WriteF64TensorAs (kept as `double` throughout, rather than narrowing to
+// `float` here, so a FLOAT16/BFLOAT16 weight's own downcast happens exactly
+// once, inside WriteF64TensorAs itself -- narrowing to float32 first and
+// then to half/bfloat16 would double-round, same reasoning as this file's
+// own DoubleToFloat16Bits comment).
+std::vector<double> FromWandaNK(const std::vector<double>& w_pruned_nk,
+                                int64_t dim0, int64_t dim1,
+                                bool weight_transposed) {
+  std::vector<double> w_new(static_cast<size_t>(dim0 * dim1));
   if (weight_transposed) {
-    for (size_t i = 0; i < w_new.size(); ++i) {
-      w_new[i] = static_cast<float>(w_pruned_nk[i]);
-    }
+    w_new = w_pruned_nk;
   } else {
     const int64_t kk = dim0;
     for (int64_t nx = 0; nx < dim1; ++nx) {
       for (int64_t kx = 0; kx < dim0; ++kx) {
         w_new[static_cast<size_t>(kx * dim1 + nx)] =
-            static_cast<float>(w_pruned_nk[static_cast<size_t>(nx * kk + kx)]);
+            w_pruned_nk[static_cast<size_t>(nx * kk + kx)];
       }
     }
   }
@@ -20958,6 +20991,92 @@ std::vector<uint8_t> WandaNmMaskNK(const std::vector<double>& importance,
   return mask;
 }
 
+// Local, dtype-widened copy of MatchAttentionProducer (structural logic
+// verbatim identical -- domain/op_type, weight/bias shape and dtype,
+// num_heads/qkv_hidden_sizes consistency), scoped to ApplyWandaPruning
+// alone: accepts FLOAT/FLOAT16/BFLOAT16 (IsSupportedFloatDtype) for both
+// the merged QKV weight and (if present) its merged bias, mirroring
+// pruning.py's own `_match_attention_producer`'s `_is_supported_float_dtype`
+// checks exactly (unlike MatchAttentionProducer's own hardcoded `==
+// onnx::TensorProto::FLOAT`). A genuinely separate copy rather than an
+// in-place widening of the shared MatchAttentionProducer -- see this file's
+// own "Wanda unstructured (element-wise) pruning" section top comment for
+// why: that function is also reused by FindAttentionChains (structured
+// Attention-head pruning) and ApplySparseGptPruning immediately above, both
+// deliberately FLOAT32-only per their own declaration comments, so widening
+// its dtype gate in place would silently widen candidate matching for those
+// two unrelated, independently-verified-only-for-FLOAT32 passes too --
+// exactly the MoE/QMoE section's own already-established "narrow, local
+// duplicate instead of a shared-code change" precedent. Bias dtype is
+// checked (though ApplyWandaPruning itself never reads bias) purely to
+// decline the same malformed-node shapes MatchAttentionProducer already
+// would, matching pruning.py's own `_match_attention_weight_only`'s full
+// reuse of `_match_attention_producer` (including its bias check) exactly.
+std::optional<AttentionProducerMatch> MatchAttentionProducerWideDtype(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.domain() != kComMicrosoftDomain || node.op_type() != "Attention") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 2) {
+    return std::nullopt;
+  }
+  const std::string& w_name = node.input(1);
+  auto wit = init_map.find(w_name);
+  if (wit == init_map.end() ||
+      !IsSupportedFloatDtype(wit->second->data_type()) ||
+      wit->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+  const int64_t total_n = wit->second->dims(1);
+
+  std::optional<std::string> bias_name;
+  if (node.input_size() >= 3 && !node.input(2).empty()) {
+    bias_name = node.input(2);
+    auto bit = init_map.find(*bias_name);
+    if (bit == init_map.end() ||
+        !IsSupportedFloatDtype(bit->second->data_type()) ||
+        bit->second->dims_size() != 1 || bit->second->dims(0) != total_n) {
+      return std::nullopt;
+    }
+  }
+
+  int64_t num_heads = 0;
+  bool has_num_heads = false;
+  std::optional<std::vector<int64_t>> qkv_hidden_sizes;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "num_heads") {
+      num_heads = attr.i();
+      has_num_heads = true;
+    } else if (attr.name() == "qkv_hidden_sizes") {
+      qkv_hidden_sizes =
+          std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    }
+  }
+  if (!has_num_heads || num_heads <= 0) {
+    return std::nullopt;
+  }
+
+  int64_t nq, nk, nv;
+  if (qkv_hidden_sizes) {
+    if (qkv_hidden_sizes->size() != 3) {
+      return std::nullopt;
+    }
+    nq = (*qkv_hidden_sizes)[0];
+    nk = (*qkv_hidden_sizes)[1];
+    nv = (*qkv_hidden_sizes)[2];
+  } else {  // Schema default: Q/K/V evenly split the merged width.
+    if (total_n % 3 != 0) {
+      return std::nullopt;
+    }
+    nq = nk = nv = total_n / 3;
+  }
+  if (nq <= 0 || nk <= 0 || nv <= 0 || nq + nk + nv != total_n ||
+      nq % num_heads != 0 || nk % num_heads != 0 || nv % num_heads != 0) {
+    return std::nullopt;
+  }
+  return AttentionProducerMatch{w_name, bias_name, num_heads, nq, nk, nv};
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyWandaPruning(
@@ -21004,14 +21123,19 @@ onnx::ModelProto ApplyWandaPruning(
     init_map[t.name()] = &t;
   }
 
-  // Exactly ApplySparseGptPruning's own candidate matching -- see this
-  // file's own ApplyWandaPruning declaration comment (structured_pruning_
-  // entry.h) for why the scope is identical: every matched MatMul/vanilla-
-  // Gemm layer (MatchMatMulLikeRaw) with a constant 2-D FLOAT32 weight,
-  // plus every matched com.microsoft::Attention node's constant 2-D
-  // FLOAT32 merged QKV weight (MatchAttentionProducer). 2-D Conv is
-  // declined outright -- never matched by either case below, left
-  // completely untouched.
+  // Like ApplySparseGptPruning's own candidate matching immediately above,
+  // widened to FLOAT32/FLOAT16/BFLOAT16 -- see this file's own
+  // ApplyWandaPruning declaration comment (structured_pruning_entry.h) and
+  // this file's own "Wanda unstructured (element-wise) pruning" section top
+  // comment for the two different widening mechanisms: every matched
+  // MatMul/vanilla-Gemm layer (MatchMatMulLikeRaw) with a constant 2-D
+  // FLOAT/FLOAT16/BFLOAT16 weight (IsSupportedFloatDtype, checked right
+  // here at the call site -- MatchMatMulLikeRaw itself has no dtype gate of
+  // its own), plus every matched com.microsoft::Attention node's constant
+  // 2-D FLOAT/FLOAT16/BFLOAT16 merged QKV weight
+  // (MatchAttentionProducerWideDtype, this pass' own local dtype-widened
+  // copy of MatchAttentionProducer). 2-D Conv is declined outright -- never
+  // matched by either case below, left completely untouched.
   struct Candidate {
     std::string x_name;
     std::string w_name;
@@ -21023,13 +21147,13 @@ onnx::ModelProto ApplyWandaPruning(
     if (mm) {
       auto wit = init_map.find(mm->w_name);
       if (wit != init_map.end() &&
-          wit->second->data_type() == onnx::TensorProto::FLOAT &&
+          IsSupportedFloatDtype(wit->second->data_type()) &&
           wit->second->dims_size() == 2) {
         candidates.push_back({mm->x_name, mm->w_name, mm->weight_transposed});
       }
       continue;
     }
-    auto am = MatchAttentionProducer(node, init_map);
+    auto am = MatchAttentionProducerWideDtype(node, init_map);
     if (am) {
       // The merged QKV weight has no transpose attribute of its own -- it
       // is already [K, N]-shaped by construction (see
@@ -21071,6 +21195,7 @@ onnx::ModelProto ApplyWandaPruning(
     // entirely zeroed), same as the Python original.
     struct Entry {
       onnx::TensorProto* w_init;
+      int32_t dtype = onnx::TensorProto::FLOAT;
       int64_t dim0 = 0;
       int64_t dim1 = 0;
       bool weight_transposed = false;
@@ -21081,10 +21206,12 @@ onnx::ModelProto ApplyWandaPruning(
     entries.reserve(candidates.size());
     for (const auto& c : candidates) {
       onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
+      const int32_t dtype = w_init->data_type();
       const int64_t dim0 = w_init->dims(0);
       const int64_t dim1 = w_init->dims(1);
-      const std::vector<float> w_flat = ReadFloatTensor(*w_init);
-      const std::vector<double> w_f64(w_flat.begin(), w_flat.end());
+      // ReadTensorAsF64 (FLOAT/FLOAT16/BFLOAT16 -> double, exact upcast) --
+      // mirrors pruning.py's own `_to_f64`.
+      const std::vector<double> w_f64 = ReadTensorAsF64(*w_init);
       WandaNK nk = ToWandaNK(w_f64, dim0, dim1, c.weight_transposed);
 
       const std::vector<double>* norm = nullptr;
@@ -21094,7 +21221,7 @@ onnx::ModelProto ApplyWandaPruning(
       }
       std::vector<double> importance =
           WandaImportance(nk.w_nk, nk.n_rows, nk.kk, norm, epsilon);
-      entries.push_back({w_init, dim0, dim1, c.weight_transposed,
+      entries.push_back({w_init, dtype, dim0, dim1, c.weight_transposed,
                          std::move(nk.w_nk), std::move(importance)});
     }
 
@@ -21139,19 +21266,21 @@ onnx::ModelProto ApplyWandaPruning(
         pruned_nk[i] = drop_flat[offset + i] ? 0.0 : e.w_nk[i];
       }
       offset += size;
-      const std::vector<float> w_new =
+      const std::vector<double> w_new =
           FromWandaNK(pruned_nk, e.dim0, e.dim1, e.weight_transposed);
-      SetFloatTensorData(e.w_init, {e.dim0, e.dim1}, w_new);
+      WriteF64TensorAs(e.w_init, e.dtype, {e.dim0, e.dim1}, w_new);
     }
     return out;
   }
 
   for (const auto& c : candidates) {
     onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
+    const int32_t dtype = w_init->data_type();
     const int64_t dim0 = w_init->dims(0);
     const int64_t dim1 = w_init->dims(1);
-    const std::vector<float> w_flat = ReadFloatTensor(*w_init);
-    const std::vector<double> w_f64(w_flat.begin(), w_flat.end());
+    // ReadTensorAsF64 (FLOAT/FLOAT16/BFLOAT16 -> double, exact upcast) --
+    // mirrors pruning.py's own `_to_f64`.
+    const std::vector<double> w_f64 = ReadTensorAsF64(*w_init);
     WandaNK nk = ToWandaNK(w_f64, dim0, dim1, c.weight_transposed);
 
     const std::vector<double>* norm = nullptr;
@@ -21171,9 +21300,9 @@ onnx::ModelProto ApplyWandaPruning(
     for (size_t i = 0; i < pruned_nk.size(); ++i) {
       pruned_nk[i] = mask[i] ? nk.w_nk[i] : 0.0;
     }
-    const std::vector<float> w_new =
+    const std::vector<double> w_new =
         FromWandaNK(pruned_nk, dim0, dim1, c.weight_transposed);
-    SetFloatTensorData(w_init, {dim0, dim1}, w_new);
+    WriteF64TensorAs(w_init, dtype, {dim0, dim1}, w_new);
   }
 
   return out;
