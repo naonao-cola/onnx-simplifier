@@ -315,6 +315,59 @@ Also note `axcl_run_model -i/-o/-l`'s exact contract, confirmed by trial:
 -- an arbitrary filename fails with "Stimulus file ... is not exist" naming
 the tensor). `pulsar2_docker.run_on_device_with_input()` already does this.
 
+## Conv/MatMul variants: what the static heuristic can and can't tell you
+
+Prompted by "how does the axmodel format actually treat different kinds of
+Conv/MatMul" -- with no Docker image or AX650N in *this* environment (unlike
+the sessions that produced the real-hardware findings above), the honest
+thing to check is what the checked-in **static heuristic**
+(`pulsar2_ops.AX650_SUPPORTED_OPS` + `pulsar2_simulator.partition()`) can and
+can't distinguish, since that heuristic is all a Docker/device-free
+environment has to go on. `tests/test_axera_conv_matmul_coverage.py` builds
+~16 Conv/MatMul variants via `onnx.parser` and checks them against it:
+
+- **Standard, grouped, depthwise, dilated, strided, `auto_pad`-using, 1-D,
+  3-D Conv, and `ConvTranspose`** all read as identical, full NPU coverage.
+  So do plain `MatMul`, broadcasting/batched `MatMul`, and `Gemm` under every
+  combination of `alpha`/`beta`/`transA`/`transB`. This isn't a bug in the
+  test -- it's `partition()`'s own documented design: it classifies purely by
+  `node.op_type` membership in `AX650_SUPPORTED_OPS`, the same list
+  `inspect_axmodel.py`/`pulsar2_ops.py` scraped from Pulsar2's docs, which
+  says nothing about attributes. The docs page itself has per-op
+  attribute-level limits (e.g. Conv's `auto_pad` must be `NOTSET`) that
+  neither this list nor `partition()` encode -- confirmed absent, not
+  confirmed present, since there's no compiler here to check it against.
+  Extending `pulsar2_ops.py` with real attribute limits needs a source of
+  truth this environment doesn't have (the docs page or a real `pulsar2
+  build` failure); making that gap up would be exactly the kind of
+  unconfirmed guess this harness otherwise avoids.
+- **What *is* checkable without any of that**: none of ONNX's own quantized
+  conv/matmul ops (`QLinearConv`, `ConvInteger`, `QLinearMatMul`,
+  `MatMulInteger`) are in `AX650_SUPPORTED_OPS` at all, so `partition()`/
+  `ax650_build_risks()` flag them as an AX650 build risk regardless of shape.
+  This lines up with `pulsar2_quantizer.py`'s separately-confirmed finding
+  that Pulsar2's own real PTQ output uses proprietary `AxQuantizedConv`-family
+  ops, not standard ONNX quantized operators -- so a graph already quantized
+  with ONNX's own vocabulary (e.g. via `onnxsim.quantize_dynamic`, unlike
+  `pulsar2_quantizer.quantize_like_pulsar2()`, which stays in QDQ form) is
+  something Pulsar2's real frontend has never been confirmed to accept, and
+  this heuristic's answer (flag it) is at least consistent with that.
+- This also surfaced (and fixed) a real bug in the "no Docker/no-device
+  simulator" pitch above: `pulsar2_simulator.py`'s docstring and this
+  README both claim `partition()`/`coverage()` "need only `onnx` and work
+  regardless" -- but `pulsar2_simulator.py` unconditionally imported
+  `pulsar2_quantizer.py`, which unconditionally did `import onnxsim` at
+  module scope, so on a checkout where `onnxsim`'s own compiled extension
+  isn't built yet (this analysis' own environment, notably -- no real
+  `.axmodel`, Docker image, or device either), just importing
+  `pulsar2_simulator` for its `onnx`-only `partition()`/`coverage()` raised
+  `ModuleNotFoundError` before either function ever ran. Fixed by moving the
+  `import onnxsim` inside `pulsar2_quantizer.py`'s existing
+  `PULSAR2_QUANTIZER_AVAILABLE` try/except (alongside the `onnxruntime`
+  import already there), so a missing/unbuilt `onnxsim` degrades the same
+  way a missing `onnxruntime` already did, instead of taking the whole
+  import down.
+
 ## Files
 
 | file | purpose |
@@ -323,7 +376,7 @@ the tensor). `pulsar2_docker.run_on_device_with_input()` already does this.
 | `pulsar2_backend.py` | thin wrapper around `pulsar2_ops.py`: `coverage()`, `new_blocking_op_types()`, `stripped_npu_data()`, `unsafe_for_simplify()`, `ax650_build_risks()`. Shaped like the sibling `*_backend.py` modules for interface symmetry (`PULSAR2_AVAILABLE` is always `True` -- there's no external dependency to be missing). |
 | `inspect_axmodel.py` | standalone CLI for a **real** `.axmodel` file: loads it with `onnx.load()`, then reports non-standard-domain nodes, op types outside the model's declared opset, and suspiciously large raw attributes -- what originally found the `neu mode` node in the real YOLOv8 file. |
 | `models.py` | the shared `scripts/common/synthetic_models.py` suite plus `axera_npu_compiled_leaf` (real CNN `neu mode` node shape) and `axera_llm_layer_leaf` (real per-layer LLM shape: two `neu mode` nodes sharing one initializer) -- no real device needed to exercise the corruption check in CI. |
-| `pulsar2_quantizer.py` | `quantize_like_pulsar2()`: a thin wrapper over `onnxsim.quantize_static(method="minmax")`, which already matches Pulsar2's real numeric convention (U8 asymmetric activations, S8 per-channel weights, MinMax calibration). `PULSAR2_QUANTIZER_AVAILABLE` reflects `onnxruntime`'s availability (onnxsim's quantizer needs it internally, imported lazily). |
+| `pulsar2_quantizer.py` | `quantize_like_pulsar2()`: a thin wrapper over `onnxsim.quantize_static(method="minmax")`, which already matches Pulsar2's real numeric convention (U8 asymmetric activations, S8 per-channel weights, MinMax calibration). `PULSAR2_QUANTIZER_AVAILABLE` reflects both `onnxruntime`'s availability and `onnxsim` itself actually being importable (a checkout with `onnxsim`'s compiled extension not yet built fails `import onnxsim`, not just the lazy `onnxruntime` import inside it -- both are caught the same way so this degrades gracefully instead of taking `pulsar2_simulator.py`'s `import` down with it). |
 | `pulsar2_simulator.py` | `partition()`/`coverage()` (real `AX650_SUPPORTED_OPS` membership, no dependency beyond `onnx`) and `simulate()` (fp32-vs-INT8 estimate via `pulsar2_quantizer.py` + onnxruntime's CPU EP). Validated against real hardware -- see above. |
 | `worker.py` | runs the check for one model in an isolated subprocess, printing one `__RESULT__<json>` line. |
 | `run_pulsar2_compat.py` | drives the suite, writes a CSV, and exits non-zero on any regression. No `--require-*` flag or `skipped` status -- unlike the EP harnesses, this needs no vendor package or device, so it always runs. Entry point for `axera-integration.yml`'s `pulsar2-compat` job (stock runner, no Docker/device). |
@@ -354,6 +407,8 @@ skip-guarded like the EP compat tests, since there's no external dependency
 to be missing). `tests/test_pulsar2_simulator.py` covers the simulator +
 quantizer; its `partition()`/`coverage()` tests are likewise unguarded, but
 `simulate()`/`quantize_like_pulsar2()` need `onnxruntime` and skip without it.
+`tests/test_axera_conv_matmul_coverage.py` is the Conv/MatMul-variant
+heuristic analysis above -- also unguarded, needing only `onnx`.
 
 To get a fast partition/coverage read or a quantization-noise estimate for a
 model, with no Docker or device:

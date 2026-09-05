@@ -50,19 +50,25 @@ from __future__ import annotations
 from typing import Dict, Iterable, Optional
 
 import onnx
-import onnxsim
 
 PULSAR2_QUANTIZER_AVAILABLE = False
 _UNAVAILABLE_REASON: Optional[str] = None
 
 try:
+    # `onnxsim` itself is imported here too, not just `onnxruntime`: a
+    # checkout that hasn't built onnxsim's compiled extension yet (e.g. this
+    # repo before `pip install .`/`setup.py build_ext`) fails `import
+    # onnxsim` outright, same failure mode as a missing `onnxruntime` --
+    # both must be caught here so callers only relying on
+    # `PULSAR2_QUANTIZER_AVAILABLE` (and, transitively, `pulsar2_simulator`'s
+    # `partition()`/`coverage()`, which are documented to need only `onnx`)
+    # degrade gracefully instead of failing to import at all.
     import onnxruntime  # noqa: F401
+
+    import onnxsim
 
     PULSAR2_QUANTIZER_AVAILABLE = True
 except Exception as exc:  # pragma: no cover - depends on the host
-    # onnxsim.quantize_static imports onnxruntime lazily (inside
-    # onnxsim.calibration.calibrate()), so onnxsim itself always imports
-    # fine without it -- check for the real dependency here instead.
     _UNAVAILABLE_REASON = f"{type(exc).__name__}: {exc}"
 
 
