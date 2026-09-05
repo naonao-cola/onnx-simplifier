@@ -14,13 +14,22 @@ never a fake/mock executor.
 
 Same chain-finding scope as ``onnxsim.apply_attention_head_pruning_cpp``
 (plain ``com.microsoft::Attention``, ``com.microsoft::GroupQueryAttention``,
-and the plain ``ai.onnx::Attention`` op), minus the fused
+the plain ``ai.onnx::Attention`` op, ``com.microsoft::MultiHeadAttention``,
+``com.microsoft::PackedMultiHeadAttention``,
+``com.microsoft::DecoderMaskedMultiHeadAttention``,
+``com.microsoft::PagedAttention``, the plain ``ai.onnx::LinearAttention`` op,
+and ``com.microsoft::SparseAttention``), minus the fused
 ``com.microsoft::MatMulNBitsQkv`` variant that port also matches -- this
 Wanda port has no quantized-weight counterpart, mirroring the pure-Python
 ``onnxsim.apply_attention_head_wanda_pruning`` exactly (see
 ``structured_pruning_entry.h``'s own ``ApplyAttentionHeadWandaPruning``
-declaration comment).
+declaration comment). See ``test_attention_head_pruning_cpp.py``'s own
+docstring for this port's shared narrower-than-pruning.py scope decisions
+across the six newer families (no dynamic-attention-bias-Gather-insertion
+machinery), and for the tenth, still-unported decomposed-GQA family.
 """
+
+import os
 
 import numpy as np
 import onnx
@@ -679,3 +688,639 @@ def test_cpp_gqa_wanda_pruning_importance_norm_l1_matches_python_reference_and_d
         model, calibration_data=[], sparsity=0.5, importance_norm="l1"
     )
     assert kept_l2.SerializeToString() != kept_l1.SerializeToString()
+
+
+# ============================================================================
+# Six more matched families -- see test_attention_head_pruning_cpp.py's own
+# identical section for the model builders' full rationale and this port's
+# deliberate, narrower-than-pruning.py scope decisions (no dynamic-
+# attention-bias-Gather-insertion machinery, so every new matcher declines
+# outright whenever such an optional input resolves to a non-empty
+# constant). Every "matches python reference" test below cross-checks
+# against ``onnxsim.apply_attention_head_wanda_pruning`` (the pure-Python
+# reference) run with the SAME real calibration data through the SAME
+# ``onnxruntime``-backed executor, so a difference here would mean the two
+# ports' calibration-crossing/importance-ranking logic genuinely disagree,
+# not merely "both produce a valid model".
+
+
+def _mha_model(
+    K=8, H=4, D=4, Out=6, seed=0, batch=2, seq=5, wq=None, wk=None, wv=None, wout=None
+):
+    rng = np.random.default_rng(seed)
+    Nq = Nk = Nv = H * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx = com.microsoft.MultiHeadAttention <num_heads={H}> (q, k, v)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def _mha_node(model):
+    return next(n for n in model.graph.node if n.op_type == "MultiHeadAttention")
+
+
+def _mha_num_heads(node):
+    return next(a.i for a in node.attribute if a.name == "num_heads")
+
+
+def _plain_gqa_importance(wq, wk, wv, num_heads, kv_num_heads, head_size):
+    group_size = num_heads // kv_num_heads
+    importance = np.zeros(kv_num_heads)
+    for kv in range(kv_num_heads):
+        q_block = np.concatenate(
+            [
+                wq[:, h * head_size : (h + 1) * head_size]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = wk[:, kv * head_size : (kv + 1) * head_size]
+        v_block = wv[:, kv * head_size : (kv + 1) * head_size]
+        importance[kv] = np.linalg.norm(
+            np.concatenate([q_block, k_block, v_block], axis=1)
+        )
+    return importance
+
+
+def _wanda_gqa_keep_groups(
+    wq, wk, wv, num_heads, kv_num_heads, head_size, act_norm, keep_count
+):
+    group_size = num_heads // kv_num_heads
+    base = _plain_gqa_importance(wq, wk, wv, num_heads, kv_num_heads, head_size)
+    act_group = np.array(
+        [
+            np.linalg.norm(
+                act_norm[
+                    kv * group_size * head_size : (kv + 1) * group_size * head_size
+                ]
+            )
+            for kv in range(kv_num_heads)
+        ]
+    )
+    importance = base * np.maximum(act_group, 1e-8)
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def test_cpp_mha_wanda_pruning_matches_oracle_exactly():
+    model, cfg = _mha_model(K=8, H=8, D=4, Out=6, seed=200)
+    rng = np.random.default_rng(201)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    act_norm = _probe_act_norm(model, "ctx", {"X": x_cal})
+    keep_heads = _wanda_gqa_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["H"], cfg["D"], act_norm, 4
+    )
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    node = _mha_node(pruned)
+    assert _mha_num_heads(node) == len(keep_heads)
+
+    d = cfg["D"]
+    idx = _head_idx(keep_heads, d)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"][:, idx])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"][:, idx])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"][:, idx])
+    np.testing.assert_array_equal(inits["Wout"], cfg["wout"][idx, :])
+
+
+def test_cpp_mha_wanda_pruning_matches_python_reference():
+    model, cfg = _mha_model(K=8, H=8, D=4, Out=6, seed=202)
+    rng = np.random.default_rng(203)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+# --- com.microsoft::PackedMultiHeadAttention --------------------------------
+
+
+def _packed_mha_model(
+    K=8, H=4, D=4, Out=6, seed=0, tok=5, wq=None, wk=None, wv=None, wout=None
+):
+    rng = np.random.default_rng(seed)
+    Nq = Nk = Nv = H * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+    token_offset = np.arange(tok, dtype=np.int32).reshape(1, tok)
+    cum_seq_len = np.array([0, tok], dtype=np.int32)
+    initializer = [
+        _f32(wq, "Wq"),
+        _f32(wk, "Wk"),
+        _f32(wv, "Wv"),
+        _f32(wout, "Wout"),
+        onnx.numpy_helper.from_array(token_offset, "TokenOffset"),
+        onnx.numpy_helper.from_array(cum_seq_len, "CumSeqLen"),
+    ]
+    body = f"""
+        g (float[{tok},{K}] X) => (float[{tok},{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx = com.microsoft.PackedMultiHeadAttention <num_heads={H}> (q, k, v, , TokenOffset, CumSeqLen)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        tok=tok,
+    )
+
+
+def _packed_mha_node(model):
+    return next(n for n in model.graph.node if n.op_type == "PackedMultiHeadAttention")
+
+
+def test_cpp_packed_mha_wanda_pruning_empty_calibration_data_matches_python_reference():
+    # No CPU kernel exists for `PackedMultiHeadAttention` in this environment
+    # (confirmed via a real `onnxruntime.InferenceSession` load -- see
+    # `_match_packed_multi_head_attention_producer`'s own docstring and this
+    # file's sibling `test_attention_head_pruning_cpp.py`'s own note on the
+    # same op) -- so a *real* calibration run (which must actually execute
+    # the graph) can never succeed for this op on any input, Python or C++
+    # port alike. `calibration_data=[]` exercises the real Wanda entry point
+    # end to end without ever executing the graph (falls back to plain
+    # `||W||_F` ranking, the same "no observed activation" fallback every
+    # other family's own analogous empty-calibration-data test already
+    # relies on), while still cross-checking this port's own combined-bias/
+    # importance-ranking logic against the Python reference exactly.
+    model, _ = _packed_mha_model(K=8, H=8, D=4, Out=6, seed=210)
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=[], sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    plain = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == plain.SerializeToString()
+
+
+# --- com.microsoft::DecoderMaskedMultiHeadAttention -------------------------
+
+
+def _dmmha_model(
+    K=8, H=4, D=4, Out=6, seed=0, batch=2, wq=None, wk=None, wv=None, wout=None
+):
+    rng = np.random.default_rng(seed)
+    Nq = Nk = Nv = H * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    body = f"""
+        g (float[{batch},1,{K}] X) => (float[{batch},1,{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx = com.microsoft.DecoderMaskedMultiHeadAttention <num_heads={H}> (q, k, v)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        batch=batch,
+    )
+
+
+def _dmmha_node(model):
+    return next(
+        n for n in model.graph.node if n.op_type == "DecoderMaskedMultiHeadAttention"
+    )
+
+
+def test_cpp_dmmha_wanda_pruning_matches_python_reference():
+    model, cfg = _dmmha_model(K=8, H=8, D=4, Out=6, seed=220)
+    rng = np.random.default_rng(221)
+    x_cal = rng.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+# --- com.microsoft::PagedAttention -------------------------------------------
+#
+# See test_attention_head_pruning_cpp.py's own identical section for why
+# this deliberately builds a float32 (not the real schema's float16-only)
+# model -- the shared Q/K/V-producer-matching machinery this whole "Attention
+# -head pruning" C++ section uses is FLOAT32-only, a pre-existing restriction
+# shared by every family, GQA/OnnxAttention included.
+
+
+def _paged_attention_model(
+    K=8,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    num_tokens=3,
+    num_blocks=2,
+    block_size=4,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32) * 0.5
+    if wk is None:
+        wk = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.5
+    if wv is None:
+        wv = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.5
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32) * 0.5
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, num_tokens], dtype=np.int32), "CumSeqLen"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.zeros((1,), dtype=np.int32), "PastSeqLens")
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.zeros((1, 1), dtype=np.int32), "BlockTable")
+    )
+    extra_inputs = (
+        f", float[{num_blocks},{block_size},{KVH},{D}] KeyCache"
+        f", float[{num_blocks},{block_size},{KVH},{D}] ValueCache"
+    )
+    operands = [
+        "q",
+        "k",
+        "v",
+        "KeyCache",
+        "ValueCache",
+        "CumSeqLen",
+        "PastSeqLens",
+        "BlockTable",
+    ]
+    body = f"""
+        g (float[{num_tokens},{K}] X{extra_inputs}) => (float[{num_tokens},{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx, key_cache_out, value_cache_out = com.microsoft.PagedAttention <num_heads={H}, kv_num_heads={KVH}> ({", ".join(operands)})
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        num_tokens=num_tokens,
+        num_blocks=num_blocks,
+        block_size=block_size,
+    )
+
+
+def _paged_node(model):
+    return next(n for n in model.graph.node if n.op_type == "PagedAttention")
+
+
+def test_cpp_paged_attention_wanda_pruning_empty_calibration_data_matches_python_reference():
+    # This op's real onnxruntime schema requires `query`/`key`/`value` be
+    # float16/bfloat16 (see this file's sibling
+    # `test_attention_head_pruning_cpp.py`'s own note on this op) -- so a
+    # float32 model, the only kind this port's shared FLOAT32-only Q/K/V-
+    # producer-matching machinery can match at all, fails outright at
+    # `InferenceSession` graph-load time ("Type Error: Type 'tensor(float)'
+    # ... is invalid"), confirmed empirically. A *real* calibration run
+    # (which must actually execute the graph) can therefore never succeed
+    # for this port's own matched shape -- `calibration_data=[]` exercises
+    # the real Wanda entry point end to end without ever executing the
+    # graph (falls back to plain `||W||_F` ranking), still cross-checking
+    # this port's own importance-ranking/slicing logic against the Python
+    # reference exactly.
+    model, _ = _paged_attention_model(K=8, H=8, KVH=4, D=8, Out=6, seed=230)
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=[], sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    plain = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == plain.SerializeToString()
+
+
+# --- Plain ai.onnx::LinearAttention (opset 27+, "linear" update_rule only) --
+
+
+def _linear_attention_model(
+    Hq=4, Hkv=2, D=4, K=16, seed=0, wq=None, wk=None, wv=None, wo=None
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = Hq * D, Hkv * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32) * 0.3
+    if wk is None:
+        wk = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.3
+    if wv is None:
+        wv = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.3
+    if wo is None:
+        wo = rng.standard_normal((Nq, K)).astype(np.float32) * 0.3
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wo, "Wo")]
+    body = f"""
+        g (float[1,3,{K}] X) => (float[1,3,{K}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          attn_out, ps = LinearAttention<q_num_heads={Hq}, kv_num_heads={Hkv}, update_rule="linear">(q, k, v)
+          Y = MatMul(attn_out, Wo)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 27]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(Hq=Hq, Hkv=Hkv, D=D, K=K, wq=wq, wk=wk, wv=wv, wo=wo)
+
+
+def _linear_attention_node(model):
+    return next(n for n in model.graph.node if n.op_type == "LinearAttention")
+
+
+def test_cpp_linear_attention_wanda_pruning_matches_python_reference():
+    # `LinearAttention` is plain ai.onnx opset 27, which this environment's
+    # onnxruntime treats as "under development" and refuses to load by
+    # default (`ValidateOpsetForDomain`) -- a real calibration run must
+    # actually execute the graph, so this relaxes that load-time check the
+    # same way `test_pruning.py`'s own `_run27` helper does (see that
+    # helper's own comment); it does not stub out or change this op's own
+    # real CPU kernel.
+    os.environ["ALLOW_RELEASED_ONNX_OPSET_ONLY"] = "0"
+    model, cfg = _linear_attention_model(Hq=8, Hkv=4, D=4, K=16, seed=240)
+    rng = np.random.default_rng(241)
+    x_cal = rng.standard_normal((1, 3, cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+# --- com.microsoft::SparseAttention ------------------------------------------
+
+
+def _sparse_attention_model(
+    K=8,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=1,
+    seq=16,
+    sparse_block_size=16,
+    num_layout=1,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32) * 0.1
+    if wk is None:
+        wk = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.1
+    if wv is None:
+        wv = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.1
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32) * 0.1
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    row_indices = np.tile(np.array([0, 1], dtype=np.int32), (num_layout, 1))
+    col_indices = np.tile(np.array([0], dtype=np.int32), (num_layout, 1))
+    initializer.append(onnx.numpy_helper.from_array(row_indices, "RowIdx"))
+    initializer.append(onnx.numpy_helper.from_array(col_indices, "ColIdx"))
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq, dtype=np.int32), "KeyTotalSeq"
+        )
+    )
+    extra_inputs = (
+        f", float[{batch},{KVH},{seq},{D}] PastKey"
+        f", float[{batch},{KVH},{seq},{D}] PastValue"
+    )
+    body = f"""
+        g (float[{batch},{seq},{K}] X{extra_inputs}) => (float[{batch},{seq},{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          attn, PresentKey, PresentValue = com.microsoft.SparseAttention <num_heads={H}, kv_num_heads={KVH}, sparse_block_size={sparse_block_size}> (q, k, v, PastKey, PastValue, RowIdx, ColIdx, TotalSeq, KeyTotalSeq)
+          Y = MatMul(attn, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 18, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def _sparse_attention_node(model):
+    return next(n for n in model.graph.node if n.op_type == "SparseAttention")
+
+
+def _sparse_attention_attrs(node):
+    num_heads = next(a.i for a in node.attribute if a.name == "num_heads")
+    kv_num_heads = next(a.i for a in node.attribute if a.name == "kv_num_heads")
+    return num_heads, kv_num_heads
+
+
+def test_cpp_sparse_attention_wanda_pruning_empty_calibration_data_matches_python_reference():
+    # The real onnxruntime CPU kernel for `SparseAttention` requires
+    # `past_key`/`past_value` be bound to the EXACT SAME buffer as
+    # `present_key`/`present_value` (`past_key->DataRaw() ==
+    # present_key->DataRaw()`, confirmed empirically -- see this file's
+    # sibling `test_pruning.py`'s own `_run_sparse_attention` helper, which
+    # exists specifically to satisfy this via `onnxruntime`'s IOBinding
+    # API). Plain `sess.run()` -- what this port's (and pruning.py's own)
+    # Wanda calibration machinery uses to probe activations -- can never
+    # satisfy that in-place-update requirement, so a *real* calibration run
+    # can never succeed for this op regardless of pruning correctness.
+    # `calibration_data=[]` exercises the real Wanda entry point end to end
+    # without ever executing the graph (falls back to plain `||W||_F`
+    # ranking), still cross-checking this port's own num_layout-divisibility/
+    # importance-ranking/slicing logic against the Python reference exactly.
+    model, _ = _sparse_attention_model(K=8, H=8, KVH=4, D=8, Out=6, seed=250)
+    pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=[], sparsity=0.5
+    )
+    pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    plain = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    assert pruned_cpp.SerializeToString() == plain.SerializeToString()

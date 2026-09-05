@@ -2,12 +2,36 @@
 port of ``onnxsim.apply_attention_head_pruning`` (see
 ``onnxsim/structured_pruning_entry.cpp``'s "Attention-head pruning" section).
 Data-free (magnitude/Frobenius-norm) only -- the calibration-driven Wanda
-variant (``onnxsim.apply_attention_head_wanda_pruning``) is not ported,
-matching this codebase's established C++-port scope decision. Tests here are
-adapted from ``test_pruning.py``'s own ``apply_attention_head_pruning``
-coverage for all three matched op families: plain ``com.microsoft::Attention``
-(merged QKV weight), ``com.microsoft::GroupQueryAttention``, and the plain
-``ai.onnx::Attention`` op (opset 24+).
+variant (``onnxsim.apply_attention_head_wanda_pruning``) is not fully ported
+(see ``test_attention_head_wanda_pruning_cpp.py``'s own docstring for exactly
+which families it does cover). Tests here are adapted from
+``test_pruning.py``'s own ``apply_attention_head_pruning`` coverage for nine
+of pruning.py's own ten matched op families: plain ``com.microsoft::Attention``
+(merged QKV weight), ``com.microsoft::GroupQueryAttention``, the plain
+``ai.onnx::Attention`` op (opset 24+), ``com.microsoft::MultiHeadAttention``,
+``com.microsoft::PackedMultiHeadAttention``,
+``com.microsoft::DecoderMaskedMultiHeadAttention``,
+``com.microsoft::PagedAttention``, the plain ``ai.onnx::LinearAttention`` op
+(opset 27+, "linear" update_rule only), and ``com.microsoft::SparseAttention``.
+The tenth family, the fully decomposed (un-fused, "eager SDPA export") shape
+pruning.py's own ``_find_decomposed_gqa_chains`` matches, has no C++ port at
+all yet -- a topology-based match rewriting multiple Reshape/Expand shape
+constants in lock-step, deliberately left unmatched (a decline, not a crash)
+as genuinely more novel than any of the nine fused-op families above; see
+``structured_pruning_entry.cpp``'s own comment at
+``ApplyAttentionHeadPruning``'s chain-finding call sites. The six newer
+families (everything past plain ``Attention``/``GroupQueryAttention``/the
+plain ``ai.onnx::Attention`` op) share one deliberate, narrower-than-
+pruning.py scope choice throughout: this port has no analogue of pruning.py's
+own dynamic-attention-bias-Gather-insertion machinery
+(``_head_bias_input_is_safe``/``_slice_or_gather_head_bias``) at all -- a
+pre-existing, already-accepted gap for the three original families too -- so
+every new matcher declines the whole chain outright whenever an optional
+per-head bias/mask/sink/norm/scale input resolves to a non-empty constant,
+rather than risk leaving one silently stale after ``num_heads``/
+``kv_num_heads`` shrink underneath it. See each new family's own model
+builder/test section below, and each ``Match*Producer`` function's own
+comment in ``structured_pruning_entry.cpp``, for the exact narrowing.
 """
 
 import numpy as np
@@ -1688,3 +1712,964 @@ def test_cpp_gqa_pruning_importance_norm_l1_matches_python_reference_and_differs
     # "l2" keeps KV group 0 (Frobenius 16 > 8), "l1" keeps KV group 1
     # (total magnitude 64 > 16) -- a real flip in which group survives.
     assert kept_l2.SerializeToString() != kept_l1.SerializeToString()
+
+
+# ============================================================================
+# Six more matched families, sharing the identical FindSeparateQkvChains/
+# ApplyOneGqaChain machinery GroupQueryAttention/plain ai.onnx::Attention
+# already exercise above -- see structured_pruning_entry.cpp's own
+# "Attention-head pruning" section comment for each Find*Chains function's
+# exact scope, and this file's own module docstring update. Every "matches
+# python reference" test below is the strongest verification this module
+# uses: a direct byte-for-byte ``SerializeToString()`` comparison against
+# ``onnxsim.apply_attention_head_pruning`` (the pure-Python reference) run on
+# the IDENTICAL input model -- not merely "both produce a valid model", but
+# the same keep-set and the same sliced values.
+#
+# One deliberate, narrower-than-pruning.py scope choice threads through all
+# six (see MatchMultiHeadAttentionProducer's own comment in
+# structured_pruning_entry.cpp for the full reasoning): this port has no
+# analogue of pruning.py's own dynamic-attention-bias-Gather-insertion
+# machinery (`_head_bias_input_is_safe`/`_slice_or_gather_head_bias`) at
+# all -- a pre-existing, already-accepted gap for the GQA/OnnxAttention
+# families above too -- so every new matcher here declines the whole chain
+# outright whenever an optional per-head bias/mask/sink/norm/scale input
+# resolves to a non-empty constant, rather than risk leaving one silently
+# stale after `num_heads`/`kv_num_heads` shrink underneath it.
+
+
+# --- com.microsoft::MultiHeadAttention (separate Q/K/V producers, no --------
+# --- independent kv_num_heads) ----------------------------------------------
+
+
+def _mha_model(
+    K=8,
+    H=4,
+    D=4,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    combined_bias=False,
+    attention_bias=None,  # constant attention_bias array, or None (unconnected)
+    wq=None,
+    wk=None,
+    wv=None,
+    bq=None,
+    bk=None,
+    bv=None,
+    wout=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq = Nk = Nv = H * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    operands = ["q", "k", "v"]
+    if combined_bias:
+        if bq is None:
+            bq = rng.standard_normal((Nq,)).astype(np.float32)
+        if bk is None:
+            bk = rng.standard_normal((Nk,)).astype(np.float32)
+        if bv is None:
+            bv = rng.standard_normal((Nv,)).astype(np.float32)
+        combined = np.concatenate([bq, bk, bv]).astype(np.float32)
+        initializer.append(_f32(combined, "Bias"))
+        operands.append("Bias")
+    else:
+        operands.append("")
+
+    if attention_bias is not None:
+        operands.append("")  # key_padding_mask -- never touched by this pass
+        initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
+        operands.append("AttentionBias")
+
+    while operands and operands[-1] == "":
+        operands.pop()
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx = com.microsoft.MultiHeadAttention <num_heads={H}> ({", ".join(operands)})
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        bq=bq,
+        bk=bk,
+        bv=bv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def _mha_node(model):
+    return next(n for n in model.graph.node if n.op_type == "MultiHeadAttention")
+
+
+def _mha_num_heads(node):
+    return next(a.i for a in node.attribute if a.name == "num_heads")
+
+
+def test_cpp_mha_pruning_shrinks_matched_block():
+    model, cfg = _mha_model(K=8, H=4, D=8, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _mha_node(pruned)
+    assert _mha_num_heads(node) == 2
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [8, 16]
+    assert list(inits["Wk"].dims) == [8, 16]
+    assert list(inits["Wv"].dims) == [8, 16]
+    assert list(inits["Wout"].dims) == [16, 6]
+
+
+def test_cpp_mha_pruning_matches_python_reference():
+    model, _ = _mha_model(K=8, H=8, D=4, Out=6, seed=21)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_mha_pruning_matches_oracle_exactly():
+    model, cfg = _mha_model(K=8, H=8, D=4, Out=6, seed=22)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _mha_node(pruned)
+    num_heads = _mha_num_heads(node)
+    assert num_heads == 4
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["H"], cfg["D"], num_heads
+    )
+    d = cfg["D"]
+    idx = _head_idx(keep_heads, d)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"][:, idx])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"][:, idx])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"][:, idx])
+    np.testing.assert_array_equal(inits["Wout"], cfg["wout"][idx, :])
+
+
+def test_cpp_mha_pruning_slices_combined_bias_matches_python_reference():
+    model, _ = _mha_model(K=8, H=8, D=4, Out=6, seed=23, combined_bias=True)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    # (nq+nk+nv) at new_num_heads=4, D=4 -- 3 equal-width segments since
+    # kv_num_heads == num_heads always for this op.
+    assert list(inits["Bias"].dims) == [4 * 4 * 3]
+
+
+def test_cpp_mha_pruning_nonempty_attention_bias_constant_is_left_untouched():
+    model, _ = _mha_model(
+        K=8,
+        H=4,
+        D=4,
+        Out=6,
+        seed=24,
+        attention_bias=np.zeros((2, 4, 5, 5), dtype=np.float32),
+    )
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+# --- com.microsoft::PackedMultiHeadAttention --------------------------------
+
+
+def _packed_mha_model(
+    K=8,
+    H=4,
+    D=4,
+    Out=6,
+    seed=0,
+    tok=5,
+    combined_bias=False,
+    attention_bias=None,
+    wq=None,
+    wk=None,
+    wv=None,
+    bq=None,
+    bk=None,
+    bv=None,
+    wout=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq = Nk = Nv = H * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+
+    token_offset = np.arange(tok, dtype=np.int32).reshape(1, tok)
+    cum_seq_len = np.array([0, tok], dtype=np.int32)
+    initializer = [
+        _f32(wq, "Wq"),
+        _f32(wk, "Wk"),
+        _f32(wv, "Wv"),
+        _f32(wout, "Wout"),
+        onnx.numpy_helper.from_array(token_offset, "TokenOffset"),
+        onnx.numpy_helper.from_array(cum_seq_len, "CumSeqLen"),
+    ]
+    operands = ["q", "k", "v"]
+    if combined_bias:
+        if bq is None:
+            bq = rng.standard_normal((Nq,)).astype(np.float32)
+        if bk is None:
+            bk = rng.standard_normal((Nk,)).astype(np.float32)
+        if bv is None:
+            bv = rng.standard_normal((Nv,)).astype(np.float32)
+        combined = np.concatenate([bq, bk, bv]).astype(np.float32)
+        initializer.append(_f32(combined, "Bias"))
+        operands.append("Bias")
+    else:
+        operands.append("")
+    operands += ["TokenOffset", "CumSeqLen"]
+    if attention_bias is not None:
+        initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
+        operands.append("AttentionBias")
+
+    while operands and operands[-1] == "":
+        operands.pop()
+    qkv_inputs = ", ".join(operands)
+
+    body = f"""
+        g (float[{tok},{K}] X) => (float[{tok},{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx = com.microsoft.PackedMultiHeadAttention <num_heads={H}> ({qkv_inputs})
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        bq=bq,
+        bk=bk,
+        bv=bv,
+        wout=wout,
+        tok=tok,
+    )
+
+
+def _packed_mha_node(model):
+    return next(n for n in model.graph.node if n.op_type == "PackedMultiHeadAttention")
+
+
+def test_cpp_packed_mha_pruning_shrinks_matched_block():
+    model, cfg = _packed_mha_model(K=8, H=4, D=8, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    node = _packed_mha_node(pruned)
+    assert _mha_num_heads(node) == 2
+
+
+def test_cpp_packed_mha_pruning_matches_python_reference():
+    model, _ = _packed_mha_model(K=8, H=8, D=4, Out=6, seed=31)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_packed_mha_pruning_slices_combined_bias_matches_python_reference():
+    model, _ = _packed_mha_model(K=8, H=8, D=4, Out=6, seed=32, combined_bias=True)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_packed_mha_pruning_nonempty_attention_bias_constant_is_left_untouched():
+    model, cfg = _packed_mha_model(
+        K=8,
+        H=4,
+        D=4,
+        Out=6,
+        seed=33,
+        tok=5,
+        attention_bias=np.zeros((1, 4, 5, 5), dtype=np.float32),
+    )
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+# --- com.microsoft::DecoderMaskedMultiHeadAttention -------------------------
+
+
+def _dmmha_model(
+    K=8,
+    H=4,
+    D=4,
+    Out=6,
+    seed=0,
+    batch=2,
+    combined_bias=False,
+    wq=None,
+    wk=None,
+    wv=None,
+    bq=None,
+    bk=None,
+    bv=None,
+    wout=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq = Nk = Nv = H * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    # Fixed-index layout: query, key, value, mask_index, attention_bias,
+    # past_key, past_value, past_sequence_length, beam_width,
+    # cache_indirection, bias -- see MatchDecoderMaskedMultiHeadAttentionProducer's
+    # own comment for why this differs from MultiHeadAttention's own layout.
+    operands = ["q", "k", "v", "", "", "", "", "", "", "", ""]
+    if combined_bias:
+        if bq is None:
+            bq = rng.standard_normal((Nq,)).astype(np.float32)
+        if bk is None:
+            bk = rng.standard_normal((Nk,)).astype(np.float32)
+        if bv is None:
+            bv = rng.standard_normal((Nv,)).astype(np.float32)
+        combined = np.concatenate([bq, bk, bv]).astype(np.float32)
+        initializer.append(_f32(combined, "Bias"))
+        operands[10] = "Bias"
+    while operands and operands[-1] == "":
+        operands.pop()
+
+    body = f"""
+        g (float[{batch},1,{K}] X) => (float[{batch},1,{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx = com.microsoft.DecoderMaskedMultiHeadAttention <num_heads={H}> ({", ".join(operands)})
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        bq=bq,
+        bk=bk,
+        bv=bv,
+        wout=wout,
+        batch=batch,
+    )
+
+
+def _dmmha_node(model):
+    return next(
+        n for n in model.graph.node if n.op_type == "DecoderMaskedMultiHeadAttention"
+    )
+
+
+def test_cpp_dmmha_pruning_shrinks_matched_block():
+    model, cfg = _dmmha_model(K=8, H=4, D=8, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    node = _dmmha_node(pruned)
+    assert _mha_num_heads(node) == 2
+
+
+def test_cpp_dmmha_pruning_matches_python_reference():
+    model, _ = _dmmha_model(K=8, H=8, D=4, Out=6, seed=41)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_dmmha_pruning_slices_combined_bias_matches_python_reference():
+    model, _ = _dmmha_model(K=8, H=8, D=4, Out=6, seed=42, combined_bias=True)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+# --- com.microsoft::PagedAttention -------------------------------------------
+#
+# NOTE: this op's real onnxruntime schema constrains `query`/`key`/`value` to
+# float16/bfloat16 only (no plain-float32 member at all -- see
+# MatchPagedAttentionProducer's own comment in structured_pruning_entry.cpp)
+# -- but this whole "Attention-head pruning" C++ section's shared Q/K/V-
+# producer-matching machinery (MatchProducer/ReadFloatTensor/
+# SetFloatTensorData) is FLOAT32-only, a pre-existing restriction shared by
+# every family in this file, GQA/OnnxAttention included, not something new to
+# this one. So -- exactly like every other test in this file -- these tests
+# build a float32 model: a real onnxruntime-executable PagedAttention export
+# always uses float16, so in practice this matcher only ever fires on a
+# synthetic/float32 graph, never a genuine PagedAttention export; the
+# matching/slicing logic itself is still verified correct here, and pruning.py
+# itself has no dtype gate to decline the same float32 case (`_match_producer`
+# also accepts plain FLOAT), so this is a byte-for-byte cross-check against a
+# real code path in the pure-Python reference, not a fabricated comparison.
+
+
+def _paged_attention_model(
+    K=8,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    num_tokens=3,
+    num_blocks=2,
+    block_size=4,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32) * 0.5
+    if wk is None:
+        wk = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.5
+    if wv is None:
+        wv = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.5
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32) * 0.5
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, num_tokens], dtype=np.int32), "CumSeqLen"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.zeros((1,), dtype=np.int32), "PastSeqLens")
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.zeros((1, 1), dtype=np.int32), "BlockTable")
+    )
+
+    extra_inputs = (
+        f", float[{num_blocks},{block_size},{KVH},{D}] KeyCache"
+        f", float[{num_blocks},{block_size},{KVH},{D}] ValueCache"
+    )
+    operands = [
+        "q",
+        "k",
+        "v",
+        "KeyCache",
+        "ValueCache",
+        "CumSeqLen",
+        "PastSeqLens",
+        "BlockTable",
+    ]
+
+    body = f"""
+        g (float[{num_tokens},{K}] X{extra_inputs}) => (float[{num_tokens},{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx, key_cache_out, value_cache_out = com.microsoft.PagedAttention <num_heads={H}, kv_num_heads={KVH}> ({", ".join(operands)})
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        num_tokens=num_tokens,
+    )
+
+
+def _paged_node(model):
+    return next(n for n in model.graph.node if n.op_type == "PagedAttention")
+
+
+def _paged_attrs(node):
+    num_heads = next(a.i for a in node.attribute if a.name == "num_heads")
+    kv_num_heads = next(a.i for a in node.attribute if a.name == "kv_num_heads")
+    return num_heads, kv_num_heads
+
+
+def test_cpp_paged_attention_pruning_shrinks_matched_block():
+    model, cfg = _paged_attention_model(K=8, H=4, KVH=4, D=8, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    assert num_heads == 2
+    assert kv_num_heads == 2
+
+
+def test_cpp_paged_attention_pruning_matches_python_reference():
+    model, _ = _paged_attention_model(K=8, H=8, KVH=4, D=8, Out=6, seed=51)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_paged_attention_pruning_matches_oracle_exactly():
+    model, cfg = _paged_attention_model(K=8, H=8, KVH=2, D=8, Out=6, seed=52)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1
+    assert num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"][:, q_idx])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"][:, kv_idx])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"][:, kv_idx])
+    np.testing.assert_array_equal(inits["Wout"], cfg["wout"][q_idx, :])
+
+
+# --- Plain ai.onnx::LinearAttention (opset 27+) -----------------------------
+#
+# This port only ever matches this op's stateless "linear" update_rule shape
+# (no `past_state`/`decay`/`beta` connected at all) -- see
+# MatchLinearAttentionProducer's own comment for why this narrower-than-
+# pruning.py scope gives up essentially nothing over the realistic export
+# shape pruning.py's own docstring already narrows *its* real-world scope to.
+
+
+def _linear_attention_model(
+    Hq=4,
+    Hkv=2,
+    D=4,
+    K=16,
+    seed=0,
+    wq=None,
+    wk=None,
+    wv=None,
+    wo=None,
+    decay=None,  # constant array, or None (unconnected) -- forces a decline
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = Hq * D, Hkv * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32) * 0.3
+    if wk is None:
+        wk = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.3
+    if wv is None:
+        wv = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.3
+    if wo is None:
+        wo = rng.standard_normal((Nq, K)).astype(np.float32) * 0.3
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wo, "Wo")]
+    operands = ["q", "k", "v"]
+    if decay is not None:
+        operands.append("")  # past_state -- unconnected
+        initializer.append(_f32(np.asarray(decay), "Decay"))
+        operands.append("Decay")
+
+    body = f"""
+        g (float[1,3,{K}] X) => (float[1,3,{K}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          attn_out, ps = LinearAttention<q_num_heads={Hq}, kv_num_heads={Hkv}, update_rule="{"gated" if decay is not None else "linear"}">({", ".join(operands)})
+          Y = MatMul(attn_out, Wo)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 27]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(Hq=Hq, Hkv=Hkv, D=D, K=K, wq=wq, wk=wk, wv=wv, wo=wo)
+
+
+def _linear_attention_node(model):
+    return next(n for n in model.graph.node if n.op_type == "LinearAttention")
+
+
+def _linear_attention_attrs(node):
+    q_num_heads = next(a.i for a in node.attribute if a.name == "q_num_heads")
+    kv_num_heads = next(a.i for a in node.attribute if a.name == "kv_num_heads")
+    return q_num_heads, kv_num_heads
+
+
+def test_cpp_linear_attention_pruning_shrinks_matched_block():
+    model, cfg = _linear_attention_model(Hq=4, Hkv=4, D=4, K=16)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    node = _linear_attention_node(pruned)
+    q_num_heads, kv_num_heads = _linear_attention_attrs(node)
+    assert q_num_heads == 2
+    assert kv_num_heads == 2
+
+
+def test_cpp_linear_attention_pruning_matches_python_reference():
+    model, _ = _linear_attention_model(Hq=8, Hkv=4, D=4, K=16, seed=61)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_linear_attention_pruning_matches_oracle_exactly():
+    model, cfg = _linear_attention_model(Hq=8, Hkv=2, D=4, K=16, seed=62)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _linear_attention_node(pruned)
+    q_num_heads, kv_num_heads = _linear_attention_attrs(node)
+    group_size = cfg["Hq"] // cfg["Hkv"]
+    assert kv_num_heads == 1
+    assert q_num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["Hq"], cfg["Hkv"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"][:, q_idx])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"][:, kv_idx])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"][:, kv_idx])
+    np.testing.assert_array_equal(inits["Wo"], cfg["wo"][q_idx, :])
+
+
+def test_cpp_linear_attention_pruning_gated_mode_decay_present_is_left_untouched():
+    model, cfg = _linear_attention_model(
+        Hq=4, Hkv=4, D=4, K=16, seed=63, decay=np.zeros((1, 3, 4), dtype=np.float32)
+    )
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+# --- com.microsoft::SparseAttention ------------------------------------------
+
+
+def _sparse_attention_model(
+    K=8,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=1,
+    seq=16,
+    sparse_block_size=16,
+    num_layout=1,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+    past_kv="dynamic",  # "dynamic" (graph input only, matched) | "nonempty" (constant, declined)
+    row_indices=None,
+    col_indices=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32) * 0.1
+    if wk is None:
+        wk = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.1
+    if wv is None:
+        wv = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.1
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32) * 0.1
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+
+    extra_inputs = ""
+    if past_kv == "nonempty":
+        past_key = rng.standard_normal((batch, KVH, seq, D)).astype(np.float32) * 0.1
+        past_value = rng.standard_normal((batch, KVH, seq, D)).astype(np.float32) * 0.1
+        initializer += [
+            onnx.numpy_helper.from_array(past_key, "PastKey"),
+            onnx.numpy_helper.from_array(past_value, "PastValue"),
+        ]
+    else:
+        extra_inputs = (
+            f", float[{batch},{KVH},{seq},{D}] PastKey"
+            f", float[{batch},{KVH},{seq},{D}] PastValue"
+        )
+
+    if row_indices is None:
+        row_indices = np.tile(np.array([0, 1], dtype=np.int32), (num_layout, 1))
+    if col_indices is None:
+        col_indices = np.tile(np.array([0], dtype=np.int32), (num_layout, 1))
+    initializer.append(onnx.numpy_helper.from_array(row_indices, "RowIdx"))
+    initializer.append(onnx.numpy_helper.from_array(col_indices, "ColIdx"))
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq, dtype=np.int32), "KeyTotalSeq"
+        )
+    )
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X{extra_inputs}) => (float[{batch},{seq},{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          attn, PresentKey, PresentValue = com.microsoft.SparseAttention <num_heads={H}, kv_num_heads={KVH}, sparse_block_size={sparse_block_size}> (q, k, v, PastKey, PastValue, RowIdx, ColIdx, TotalSeq, KeyTotalSeq)
+          Y = MatMul(attn, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 18, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+        num_layout=num_layout,
+    )
+
+
+def _sparse_attention_node(model):
+    return next(n for n in model.graph.node if n.op_type == "SparseAttention")
+
+
+def _sparse_attention_attrs(node):
+    num_heads = next(a.i for a in node.attribute if a.name == "num_heads")
+    kv_num_heads = next(a.i for a in node.attribute if a.name == "kv_num_heads")
+    return num_heads, kv_num_heads
+
+
+def test_cpp_sparse_attention_pruning_shrinks_matched_block():
+    model, cfg = _sparse_attention_model(K=8, H=4, KVH=4, D=8, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    node = _sparse_attention_node(pruned)
+    num_heads, kv_num_heads = _sparse_attention_attrs(node)
+    assert num_heads == 2
+    assert kv_num_heads == 2
+
+
+def test_cpp_sparse_attention_pruning_matches_python_reference():
+    model, _ = _sparse_attention_model(K=8, H=8, KVH=4, D=8, Out=6, seed=71)
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+
+def test_cpp_sparse_attention_pruning_matches_oracle_exactly():
+    model, cfg = _sparse_attention_model(K=8, H=8, KVH=2, D=8, Out=6, seed=72)
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _sparse_attention_node(pruned)
+    num_heads, kv_num_heads = _sparse_attention_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1
+    assert num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"][:, q_idx])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"][:, kv_idx])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"][:, kv_idx])
+    np.testing.assert_array_equal(inits["Wout"], cfg["wout"][q_idx, :])
+
+
+def test_cpp_sparse_attention_pruning_nonempty_past_kv_constant_is_left_untouched():
+    # This port's `past_key`/`past_value` gate (like GroupQueryAttention's own
+    # -- a pre-existing, already-accepted scope choice) declines the whole
+    # match outright whenever either resolves to a non-empty CONSTANT, unlike
+    # pruning.py's own matcher, which slices a schema-conforming BNSH-shaped
+    # constant in place -- so this test intentionally does NOT compare
+    # against the Python reference (the two genuinely diverge here); it only
+    # confirms this port declines gracefully (a no-op, not a crash or a
+    # silently mis-sliced graph).
+    model, _ = _sparse_attention_model(
+        K=8, H=8, KVH=2, D=8, Out=6, seed=73, past_kv="nonempty"
+    )
+    pruned = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.5)
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_cpp_sparse_attention_pruning_num_layout_divisibility_declined_matches_python_reference():
+    # H=4, KVH=4 (group_size=1, ordinary per-head groups), num_layout=2:
+    # matches fine at match time (4 % 2 == 0), but at sparsity=0.75,
+    # keep_count == max(1, 4 - round(4*0.75)) == 1 -- the post-pruning query
+    # head count would be 1, not divisible by num_layout == 2, which would
+    # silently break this op's own "num_heads is divisible by num_layout"
+    # invariant even though it held before pruning. Exercises
+    # ApplyOneGqaChain's own `is_sparse_attention` APPLY-TIME branch (not
+    # merely MatchSparseAttentionProducer's own match-time check already
+    # covered by `test_cpp_sparse_attention_pruning_matches_python_reference`
+    # and friends) -- declined as a no-op for this block, mirroring
+    # pruning.py's own `test_sparse_attention_pruning_num_layout_divisibility_
+    # declined` exactly: both ports agree byte-for-byte.
+    model, _ = _sparse_attention_model(
+        K=8, H=4, KVH=4, D=8, Out=6, seed=74, num_layout=2
+    )
+    pruned_cpp = onnxsim.apply_attention_head_pruning_cpp(model, sparsity=0.75)
+    pruned_py = onnxsim.apply_attention_head_pruning(model, sparsity=0.75)
+    onnx.checker.check_model(pruned_cpp)
+    assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+    assert pruned_cpp.SerializeToString() == model.SerializeToString()
