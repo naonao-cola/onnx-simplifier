@@ -167,6 +167,7 @@ from onnxsim.pruning import (
     weight_sparsity,
 )
 from onnxsim.qoq import apply_smooth_attention, quantize_weight_only_qoq
+from onnxsim.qronos import apply_qronos
 from onnxsim.quantease import apply_quantease
 from onnxsim.quarot import apply_quarot
 from onnxsim.quip_sharp import apply_quip_sharp
@@ -207,6 +208,7 @@ __all__ = [
     "apply_awq",
     "apply_attention_quantization",
     "apply_gptq",
+    "apply_qronos",
     "quantize_weight_only_qoq",
     "apply_smooth_attention",
     "apply_quantease",
