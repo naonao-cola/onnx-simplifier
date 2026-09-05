@@ -503,6 +503,92 @@ bias term but wasn't independently re-derived from scratch. Real,
 recognizable structure here, in clear contrast to `Add`/`Sub`'s still-
 opaque field above.
 
+### The AX650N card's own firmware: real terminology, one real dead end
+
+Prompted by "could you analyze firmware loaded to AX650N?" -- the AXCL host
+package ships the actual firmware pushed to the card over PCIe at
+`/lib/firmware/axcl/ax650_card.pac` (155MB). It's a real, parseable
+container, not an opaque blob: a fixed header (magic, board name
+`AX650_card`, firmware version `V2.25.0`) followed by 5 fixed-size (464
+byte) partition-table entries, each holding a name/type/filename plus an
+`(offset, size)` pair (`<Q Q` little-endian) into the file. Confirmed by
+parsing it and checking the last partition's `offset + size` matches the
+file's exact total size:
+
+```
+UBOOT  (u-boot.bin)        offset=2448        size=1,069,223
+DTB    (AX650_card.dtb)    offset=1,071,671   size=192,178
+ATF    (atf_bl31.img)      offset=1,263,849   size=28,736
+KERNEL (Image)             offset=1,292,585   size=20,285,448
+ROOTFS (rootfs.ext4)       offset=21,578,033  size=134,217,728
+```
+
+**The card runs a full, independent embedded Linux system** (u-boot -> ARM
+Trusted Firmware -> a real Linux `Image` -> an ext4 root filesystem) that
+mediates PCIe register/DMA access for the host-side `axcl` API -- not a
+single-purpose NPU firmware blob. `rootfs.ext4` is browsable read-only with
+`debugfs` (no mount/root needed) and its `/soc/ko/ax_npu.ko` -- the actual
+NPU kernel driver -- is **not stripped**, so its full symbol table is
+directly readable with `nm`. That symbol table resolves several things this
+README had only inferred from outside:
+
+- **The compiled instruction blob is internally called "mcode"**, not just
+  this project's "neu mode blob" label -- confirmed by real log format
+  strings (`"mcode[%u] size is %u"`, `"mcode error"`) and functions
+  (`dump_mcode_with_handle`, `modify_mcode_crc`, `npu_cv_outer_update_mcode`,
+  `is_npu_debug_dumpmcode_enalbe`). It's CRC-protected
+  (`npu_get_cmd_crc_state`/`npu_get_data_crc_state`, a `crc_table`/
+  `crc_update`), consistent with the FlatBuffers dig above finding no
+  further structure in >95% of the blob -- it may simply be checksum-opaque
+  binary, not additionally obfuscated.
+- **Execution is a command queue (`cmdq`), not a fetch-decode-execute CPU
+  loop**: `cmdq_write_instruct`, `cmdq_set_eu_idle`, `cmdq_set_wait_cycle`,
+  `cmdq_set_clear_job_id`, `cmdq_connect_use_jump` (a queue-to-queue jump
+  primitive), `cmdq_update_sync`, backed by `sync_manager_*` functions
+  (job IDs, interrupt-clear, wait-bypass, timer thresholds). This reframes
+  what to look for in "mcode": fixed-format command/DMA descriptors with
+  sync primitives, not a general-purpose instruction set -- a materially
+  different (and more tractable) reverse-engineering target than "unknown
+  CPU ISA".
+- **"EU" (execution unit) and 5 queue types are named directly**:
+  `npu_eu_mask_2_sub_id`/`get_eu_class_mask` alongside five identically-
+  compiled (`.isra.0`, i.e. the same source macro instantiated per name)
+  queue setters -- `npu_dma_set_queue`, `npu_mau_set_queue`,
+  `npu_potato_set_queue`, `npu_sdma_set_queue`, `npu_warp_set_queue`. `MAU`
+  (Matrix Arithmetic Unit) independently corroborates the earlier
+  jas-hacks.blogspot.com teardown's "1 Matrix Arithmetic Unit" claim;
+  `sdma` matches the real trace.json engine name (`sdma4`) exactly.
+- **OCM terminology matches exactly**: `get_vnpu_ocm_base`/
+  `get_vnpu_ocm_size`/`print_vnpu_ocm_1k_contents`, consistent with the
+  FlatBuffers offset table's `_ocm_base` field and the blog's independently
+  measured 11.5MB OCM region.
+- `libax_interpreter.so` (also on the card, `/opt/lib`) turned out to be a
+  **misleading name for this investigation**: despite being 22KB and
+  plausibly containing a bytecode interpreter, every one of its imported
+  symbols is a lifecycle call into `ax_npu.ko`'s own userspace API
+  (`AX_NPU_Create_task`, `AX_NPU_Run_task`, ...) -- it's a thin client, not
+  an mcode interpreter. Combined with `cmdq`/`sync_manager` being the only
+  execution-adjacent code in the driver itself, this confirms **there is no
+  software interpreter for mcode anywhere in the accessible stack** -- the
+  NPU's execution units decode it directly in hardware. The only place mcode
+  gets *decoded in software* at all is Pulsar2's own verification tooling.
+
+**A real dead end, reported for completeness rather than pursued further**:
+Pulsar2's own backend simulators (`/opt/pulsar2/backend/ax650npu/
+ax650npu_cmodel.so` inside the Docker image, one per target chip) export a
+genuine, undocumented-elsewhere **mcode assembler and disassembler** as
+plain C symbols -- `mcode_new`, `mcode_dump`, `mcode_size`,
+`mcode_disassemble`, `assembler_eu`, `assembler_ctrl`, `disassembler_eu` --
+exactly the tool that would turn this whole investigation's differential
+byte-diffing into direct disassembly. **It's commercially licensed**: even
+just `dlopen()`-ing the library (via `ctypes.CDLL`, before calling any
+function) fails with `Sentinel LDK Protection System: Sentinel key not
+found (H0007)` -- a hardware/software dongle-gated check from a real
+third-party licensing product (Thales Sentinel LDK), fired from the
+library's own load-time constructor. Not pursued further: this is a
+legitimate commercial licensing control on Axera's own tooling, not a
+technical obstacle to route around.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
