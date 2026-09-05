@@ -67,6 +67,26 @@ def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
 
 
+def _f16(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.float16), name)
+
+
+def _bf16(array, name):
+    return onnx.numpy_helper.from_array(array.astype(ml_dtypes.bfloat16), name)
+
+
+# Maps a numpy dtype (as passed to _qmoe_model's own `float_dtype`) to the
+# matching (ONNX enum, tensor-builder) pair -- lets _qmoe_model build an
+# activation-dtype-FLOAT16/BFLOAT16 QMoE model for the FP16/BFloat16 weight
+# support tests below, while every existing FLOAT32 call site (the default)
+# is completely unaffected.
+_FLOAT_DTYPE_INFO = {
+    np.dtype(np.float32): (onnx.TensorProto.FLOAT, _f32),
+    np.dtype(np.float16): (onnx.TensorProto.FLOAT16, _f16),
+    np.dtype(ml_dtypes.bfloat16): (onnx.TensorProto.BFLOAT16, _bf16),
+}
+
+
 def _u8(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.uint8), name)
 
@@ -236,44 +256,45 @@ def _qmoe_model(
     tied_fc1_weight_elsewhere=False,
     extra_nodes=(),
     extra_outputs=(),
+    float_dtype=np.float32,
 ):
     # A router-logit input R feeds a real com.microsoft::QMoE node -- see
     # this file's own top comment for why the onnx.parser text format
-    # can't express QMoE's packed uint8 operands.
+    # can't express QMoE's packed uint8 operands. `float_dtype` (FLOAT32 by
+    # default, every existing call site's own behavior unchanged) controls
+    # X/R/Y's own activation dtype and every FLOAT-family operand's own
+    # storage dtype (fc1/fc2 scale and bias) -- see the "FP16/BFloat16
+    # weight support" section below, which passes FLOAT16/BFLOAT16 here to
+    # build the widened-matcher test models. `fc1_q`/`fc2_q`/zero_points
+    # always stay UINT8 regardless -- quantized weight codes have no
+    # separate float-family storage to widen.
+    onnx_dtype, float_tensor = _FLOAT_DTYPE_INFO[np.dtype(float_dtype)]
     num_experts, inter, hidden_packed = fc1_q.shape
     hidden = hidden_packed * (8 // bits)
     inputs = [
-        onnx.helper.make_tensor_value_info(
-            "X", onnx.TensorProto.FLOAT, [tokens, hidden]
-        ),
-        onnx.helper.make_tensor_value_info(
-            "R", onnx.TensorProto.FLOAT, [tokens, num_experts]
-        ),
+        onnx.helper.make_tensor_value_info("X", onnx_dtype, [tokens, hidden]),
+        onnx.helper.make_tensor_value_info("R", onnx_dtype, [tokens, num_experts]),
     ]
-    outputs = [
-        onnx.helper.make_tensor_value_info(
-            "Y", onnx.TensorProto.FLOAT, [tokens, hidden]
-        )
-    ]
+    outputs = [onnx.helper.make_tensor_value_info("Y", onnx_dtype, [tokens, hidden])]
     inits = [
         _u8(fc1_q, "FC1Q"),
-        _f32(fc1_scale, "FC1S"),
+        float_tensor(fc1_scale, "FC1S"),
         _u8(fc2_q, "FC2Q"),
-        _f32(fc2_scale, "FC2S"),
+        float_tensor(fc2_scale, "FC2S"),
     ]
     node_inputs = ["X", "R", "FC1Q", "FC1S", "", "FC2Q", "FC2S", ""]
     if fc1_bias is not None:
         node_inputs[4] = "FC1B"
-        inits.append(_f32(fc1_bias, "FC1B"))
+        inits.append(float_tensor(fc1_bias, "FC1B"))
     if fc2_bias is not None:
         node_inputs[7] = "FC2B"
-        inits.append(_f32(fc2_bias, "FC2B"))
+        inits.append(float_tensor(fc2_bias, "FC2B"))
     while len(node_inputs) < 13:
         node_inputs.append("")
     if fc3_q is not None:
         node_inputs[8] = "FC3Q"
         node_inputs[9] = "FC3S"
-        inits += [_u8(fc3_q, "FC3Q"), _f32(fc3_scale, "FC3S")]
+        inits += [_u8(fc3_q, "FC3Q"), float_tensor(fc3_scale, "FC3S")]
     if fc1_zp is not None:
         node_inputs[11] = "FC1ZP"
         inits.append(_u8(fc1_zp, "FC1ZP"))
@@ -1305,3 +1326,182 @@ def test_qmoe_expert_channel_pruning_cpp_prunes_node_inside_if_branch():
         np.testing.assert_array_equal(inits["FC1S"], fc1_s[:, keep])
         np.testing.assert_array_equal(inits["FC1B"], fc1_b[:, keep])
         np.testing.assert_array_equal(inits["FC2Q"], expected_fc2_q)
+
+
+# --- FP16/BFloat16 weight support -------------------------------------------
+#
+# MatchQMoEProducer (structured_pruning_entry.cpp) used to hard-require
+# ``onnx.TensorProto.FLOAT`` for `fc1_scales`/`fc2_scales` (and, via
+# QMoEOptionalFloatInput, `fc1_experts_bias`/`fc2_experts_bias`), silently
+# declining any QMoE node whose scale/bias tensors were stored as FLOAT16 or
+# BFLOAT16 -- narrower than ``onnxsim.apply_qmoe_expert_channel_pruning``'s
+# own ``_is_supported_float_dtype``. `fc1_experts_weights`/
+# `fc2_experts_weights` themselves are unaffected either way -- always
+# packed UINT8 regardless of the *activation*/scale dtype. Now widened via
+# IsSupportedFloatDtype/ReadTensorAsF64/WriteF64TensorAs (see
+# structured_pruning_entry.cpp's own "QMoE (com.microsoft, quantized-weight
+# Mixture-of-Experts) expert-channel structured pruning" section top
+# comment).
+#
+# FLOAT16: confirmed separately that onnxruntime's CPU QMoE kernel executes
+# genuine FLOAT16 activations/scales/bias, so this runs a real session,
+# mirroring test_qmoe_expert_channel_pruning_cpp_matches_hand_built_presliced_
+# reference's own "re-quantize the sliced float weights from scratch,
+# independently" cross-check. BFLOAT16 has no onnxruntime CPU execution
+# support in this environment at all (see
+# tests/test_moe_pruning_cpp.py's own identical note) -- checked at the
+# array level (dtype preservation, exact per-element bfloat16 decode)
+# instead.
+
+
+def test_qmoe_expert_channel_pruning_cpp_fp16_matches_hand_built_presliced_reference():
+    E, hidden, inter, bits, tokens = 4, 8, 12, 4, 6
+    rng = np.random.default_rng(2001)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+
+    fc1_q, fc1_s32, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s32, _ = _qmoe_quantize(fc2_w, bits)
+    # Scale/bias are stored as FLOAT16 in the model -- the importance ranking
+    # below must use the SAME (rounded) FLOAT16 values the C++ port will
+    # actually read back (via ReadTensorAsF64), not the internal FLOAT32
+    # quantizer scale, or a boundary case could rank differently.
+    fc1_s = fc1_s32.astype(np.float16)
+    fc2_s = fc2_s32.astype(np.float16)
+    fc1_b16 = fc1_b.astype(np.float16)
+
+    model = _qmoe_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        fc1_bias=fc1_b16,
+        k=2,
+        tokens=tokens,
+        float_dtype=np.float16,
+    )
+    onnx.checker.check_model(model)
+    inits_before = _qmoe_inits(model)
+    assert inits_before["FC1S"].dtype == np.float16
+    assert inits_before["FC1B"].dtype == np.float16
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = _qmoe_inits(pruned)
+    assert inits["FC1S"].dtype == np.float16
+    assert inits["FC1B"].dtype == np.float16
+    assert inits["FC2S"].dtype == np.float16  # untouched (indexes hidden_size)
+
+    default_zp = 1 << (bits - 1)
+    fc1_dq = (
+        _unpack_vals(fc1_q, bits, hidden).astype(np.float64) - default_zp
+    ) * fc1_s.astype(np.float64)[:, :, None]
+    fc2_dq = (
+        _unpack_vals(fc2_q, bits, inter).astype(np.float64) - default_zp
+    ) * fc2_s.astype(np.float64)[:, :, None]
+    sq = (
+        np.sum(fc1_dq**2, axis=(0, 2))
+        + np.sum(fc2_dq**2, axis=(0, 1))
+        + np.sum(fc1_b16.astype(np.float64) ** 2, axis=0)
+    )
+    keep = np.sort(np.argsort(-np.sqrt(sq))[:6])  # 12 - round(12*0.5) = 6
+
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+    np.testing.assert_array_equal(
+        inits["FC1S"].view(np.uint16), fc1_s[:, keep].view(np.uint16)
+    )
+    np.testing.assert_array_equal(
+        inits["FC1B"].view(np.uint16), fc1_b16[:, keep].view(np.uint16)
+    )
+    expected_fc2_q = _pack_vals(_unpack_vals(fc2_q, bits, inter)[:, :, keep], bits)
+    np.testing.assert_array_equal(inits["FC2Q"], expected_fc2_q)
+
+    # Independent cross-check: re-quantize the *sliced* float32 weights from
+    # scratch (never touching the C++ port's own pruned bytes) and confirm a
+    # real onnxruntime CPU FLOAT16 session agrees, mirroring
+    # test_qmoe_expert_channel_pruning_cpp_matches_hand_built_presliced_
+    # reference's own FLOAT32 cross-check.
+    fc1_q_ref, fc1_s_ref32, _ = _qmoe_quantize(fc1_w[:, keep, :], bits)
+    reference = _qmoe_model(
+        fc1_q_ref,
+        fc1_s_ref32.astype(np.float16),
+        expected_fc2_q,
+        fc2_s,
+        bits,
+        fc1_bias=fc1_b16[:, keep],
+        k=2,
+        tokens=tokens,
+        float_dtype=np.float16,
+    )
+    onnx.checker.check_model(reference)
+
+    feed_rng = np.random.default_rng(2003)
+    feeds = {
+        "X": (feed_rng.standard_normal((tokens, hidden)) * 0.2).astype(np.float16),
+        "R": feed_rng.standard_normal((tokens, E)).astype(np.float16),
+    }
+    (out_pruned,) = _run(pruned, feeds)
+    (out_ref,) = _run(reference, feeds)
+    np.testing.assert_allclose(
+        out_pruned.astype(np.float64), out_ref.astype(np.float64), rtol=5e-2, atol=5e-2
+    )
+
+
+def test_qmoe_expert_channel_pruning_cpp_bfloat16_preserves_dtype_and_matches_array_oracle():
+    E, hidden, inter, bits, tokens = 4, 8, 12, 4, 6
+    rng = np.random.default_rng(2005)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+
+    fc1_q, fc1_s32, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s32, _ = _qmoe_quantize(fc2_w, bits)
+    fc1_s = fc1_s32.astype(ml_dtypes.bfloat16)
+    fc2_s = fc2_s32.astype(ml_dtypes.bfloat16)
+    fc1_b16 = fc1_b.astype(ml_dtypes.bfloat16)
+
+    model = _qmoe_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        fc1_bias=fc1_b16,
+        k=2,
+        tokens=tokens,
+        float_dtype=ml_dtypes.bfloat16,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = _qmoe_inits(pruned)
+    assert inits["FC1S"].dtype == ml_dtypes.bfloat16
+    assert inits["FC1B"].dtype == ml_dtypes.bfloat16
+    assert inits["FC2S"].dtype == ml_dtypes.bfloat16
+
+    default_zp = 1 << (bits - 1)
+    fc1_dq = (
+        _unpack_vals(fc1_q, bits, hidden).astype(np.float64) - default_zp
+    ) * fc1_s.astype(np.float64)[:, :, None]
+    fc2_dq = (
+        _unpack_vals(fc2_q, bits, inter).astype(np.float64) - default_zp
+    ) * fc2_s.astype(np.float64)[:, :, None]
+    sq = (
+        np.sum(fc1_dq**2, axis=(0, 2))
+        + np.sum(fc2_dq**2, axis=(0, 1))
+        + np.sum(fc1_b16.astype(np.float64) ** 2, axis=0)
+    )
+    keep = np.sort(np.argsort(-np.sqrt(sq))[:6])
+
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+    np.testing.assert_array_equal(
+        inits["FC1S"].view(np.uint16), fc1_s[:, keep].view(np.uint16)
+    )
+    np.testing.assert_array_equal(
+        inits["FC1B"].view(np.uint16), fc1_b16[:, keep].view(np.uint16)
+    )
+    expected_fc2_q = _pack_vals(_unpack_vals(fc2_q, bits, inter)[:, :, keep], bits)
+    np.testing.assert_array_equal(inits["FC2Q"], expected_fc2_q)
