@@ -38,7 +38,13 @@
 // (offset, size) in `offsets` -- a downstream consumer honours the plan by
 // actually running that node's kernel in place (writing its output over the
 // input's own buffer), not merely by treating same-offset as "safe to reuse
-// after the fact" the way two disjoint-interval tensors are.
+// after the fact" the way two disjoint-interval tensors are. A second,
+// independent aliasing category (see IsInPlaceSafeBinaryOp) extends this to
+// binary elementwise ops -- Add, Mul, and the like -- which may instead union
+// their output with *one* of their two operands ("operand donation"), the
+// candidate operand held to the exact same bar as above (checked against
+// each operand in turn, aliasing at most one; a broadcast operand's byte
+// size never matches the output's, so it is never a candidate).
 //
 // v1 scope, deliberately:
 //   * Concrete shapes only. A tensor whose size cannot be resolved to a
