@@ -20,6 +20,7 @@ from onnxsim.autoround import apply_autoround
 from onnxsim.awq import apply_awq
 from onnxsim.bias_correction import correct_bias
 from onnxsim.billm import quantize_weight_only_billm
+from onnxsim.brecq import apply_brecq
 from onnxsim.bwa_ptq import apply_bwa_ptq
 from onnxsim.calibration import (
     calibrate,
@@ -225,6 +226,7 @@ __all__ = [
     "apply_quantease",
     "apply_flexround",
     "apply_foem",
+    "apply_brecq",
     "apply_fptq",
     "apply_owq",
     "apply_bwa_ptq",
