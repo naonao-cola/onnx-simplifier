@@ -7318,6 +7318,385 @@ def test_structured_pruning_global_average_pool_flatten_wrong_axis_declines():
     np.testing.assert_array_equal(inits["W2"], w2)
 
 
+def _gap_reshape_neg1_matmul_model(
+    w1,
+    w2,
+    b1=None,
+    b2=None,
+    weight_transposed=False,
+    activation="Relu",
+    spatial=10,
+    via_concat=False,
+):
+    """`_gap_flatten_matmul_model`'s ``Reshape``-based analogue: ``Conv ->
+    {activation} -> GlobalAveragePool -> Reshape([batch, -1]) -> {MatMul,
+    vanilla Gemm}`` -- the ``x.view(x.size(0), -1)``/``x.reshape(x.shape[0],
+    -1)`` shape a real ``torch.onnx.export`` emits at least as often as an
+    explicit ``nn.Flatten()`` after global average pooling (see
+    `_match_reshape_batch_neg1_pass_through`'s own docstring for the proof).
+    `via_concat` selects which of the two constant-shape forms that matcher
+    recognizes: `False` (default) a single whole-constant ``[0, -1]`` shape
+    initializer (`0` -- ONNX `Reshape`'s own "copy this dim from the input"
+    convention -- stands in for the batch dim, valid for any actual batch
+    size); `True` the ``Shape(X) -> Gather(indices=[0]) -> Unsqueeze ->
+    Concat(., [-1])`` dynamic-batch-computation shape a real dynamic-batch
+    export emits instead.
+    """
+    Cin = w1.shape[1]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    if weight_transposed:
+        Out = w2.shape[0]
+        if b2 is not None:
+            gemm = "Y = Gemm<transB=1>(f, W2, B2)"
+            initializer.append(_f32(b2, "B2"))
+        else:
+            gemm = "Y = Gemm<transB=1>(f, W2)"
+    else:
+        assert b2 is None
+        Out = w2.shape[1]
+        gemm = "Y = MatMul(f, W2)"
+
+    if via_concat:
+        reshape_prefix = """
+          bshape = Shape(p)
+          b0 = Gather<axis=0>(bshape, GatherIdx)
+          b0u = Unsqueeze(b0, UnsqAxes)
+          rshape = Concat<axis=0>(b0u, NegOne)
+        """
+        initializer.append(
+            onnx.numpy_helper.from_array(np.array(0, dtype=np.int64), "GatherIdx")
+        )
+        initializer.append(
+            onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), "UnsqAxes")
+        )
+        initializer.append(
+            onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64), "NegOne")
+        )
+    else:
+        reshape_prefix = ""
+        initializer.append(
+            onnx.numpy_helper.from_array(np.array([0, -1], dtype=np.int64), "rshape")
+        )
+
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Out}] Y)
+        {{
+          {conv1}
+          a = {activation}(h)
+          p = GlobalAveragePool(a)
+          {reshape_prefix}
+          f = Reshape(p, rshape)
+          {gemm}
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_global_average_pool_reshape_neg1_gemm_pass_through_matches_oracle_exactly():
+    # The `Reshape` counterpart of the `Flatten(axis=1)` hop above --
+    # `x.view(x.size(0), -1)`'s own exported shape, matched by
+    # `_match_reshape_batch_neg1_pass_through`. The constant `[0, -1]` shape
+    # form (`0` copies the batch dim from the input, valid for any actual
+    # batch size).
+    Cin, C1, Out = 3, 16, 5
+    rng = np.random.default_rng(170)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((Out, C1)).astype(np.float32)
+    b2 = rng.standard_normal((Out,)).astype(np.float32)
+    model = _gap_reshape_neg1_matmul_model(w1, w2, b1=b1, b2=b2, weight_transposed=True)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2  # the Conv IS pruned end to end
+    assert dims_after["W2"][1] == C1 // 2  # Gemm's own transB=1 reduction axis
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _gap_reshape_neg1_matmul_model(
+        w1[keep], w2[:, keep], b1=b1[keep], b2=b2, weight_transposed=True
+    )
+
+    rng_x = np.random.default_rng(171)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_global_average_pool_reshape_neg1_via_concat_batch_gemm_pass_through_matches_oracle_exactly():
+    # The `Concat`-produced shape form: `Shape(X) -> Gather(indices=[0]) ->
+    # Unsqueeze -> Concat(., [-1])` computing the batch dim dynamically --
+    # the shape a real dynamic-batch `torch.onnx.export` emits (see
+    # `_match_reshape_batch_neg1_pass_through`'s own docstring). The
+    # `Shape`/`Gather`/`Unsqueeze` prefix is never inspected in any detail by
+    # the matcher -- only that `Concat`'s own last input is a constant
+    # single-element `[-1]` tensor.
+    Cin, C1, Out = 3, 16, 5
+    rng = np.random.default_rng(172)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C1, Out)).astype(np.float32)
+    model = _gap_reshape_neg1_matmul_model(
+        w1, w2, weight_transposed=False, via_concat=True
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["W2"][0] == C1 // 2
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _gap_reshape_neg1_matmul_model(
+        w1[keep], w2[keep], weight_transposed=False, via_concat=True
+    )
+
+    rng_x = np.random.default_rng(173)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_global_average_pool_reshape_non_neg1_declines():
+    # A `Reshape` target NOT ending in `-1` (here a literal, baked-in
+    # channel count) is the *general*, harder Reshape problem this module's
+    # own docstring calls out as excluded -- declined outright, never
+    # guessed at, the same bar as the `Flatten` wrong-axis decline test
+    # above.
+    Cin, C1, Out = 3, 16, 5
+    rng = np.random.default_rng(180)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C1, Out)).astype(np.float32)
+    shape_init = onnx.numpy_helper.from_array(
+        np.array([0, C1], dtype=np.int64), "rshape"
+    )
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[?] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          p = GlobalAveragePool(h)
+          f = Reshape(p, rshape)
+          Y = MatMul(f, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), shape_init],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def _gap_squeeze_matmul_model(
+    w1,
+    w2,
+    b1=None,
+    b2=None,
+    weight_transposed=False,
+    activation="Relu",
+    spatial=10,
+    chained=True,
+    opset=21,
+):
+    """The `Squeeze` counterpart of `_gap_flatten_matmul_model`: ``Conv ->
+    {activation} -> GlobalAveragePool -> Squeeze(...) -> {MatMul, vanilla
+    Gemm}``. `chained=True` (default): two chained single-axis
+    `Squeeze(axes=[-1])` nodes -- the ``x.squeeze(-1).squeeze(-1)`` shape a
+    real export emits (opset>=13 constant-input form of `axes`; matched via
+    `_squeeze_axis_is_trailing_spatial`'s own `axis == -1` case).
+    `chained=False`: a single `Squeeze` covering both trailing axes at once
+    (``axes=[2, 3]``), using the opset>=13 constant-input form when
+    `opset >= 13` (default) or the opset<13 attribute form otherwise (see
+    `_gap_squeeze_axes`'s own docstring for both forms).
+    """
+    Cin = w1.shape[1]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    if weight_transposed:
+        Out = w2.shape[0]
+        if b2 is not None:
+            gemm = "Y = Gemm<transB=1>(f, W2, B2)"
+            initializer.append(_f32(b2, "B2"))
+        else:
+            gemm = "Y = Gemm<transB=1>(f, W2)"
+    else:
+        assert b2 is None
+        Out = w2.shape[1]
+        gemm = "Y = MatMul(f, W2)"
+
+    if chained:
+        squeeze_ops = """
+          q1 = Squeeze(p, NegOneAxis)
+          f = Squeeze(q1, NegOneAxis)
+        """
+        initializer.append(
+            onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64), "NegOneAxis")
+        )
+    elif opset >= 13:
+        squeeze_ops = "f = Squeeze(p, Axes23)"
+        initializer.append(
+            onnx.numpy_helper.from_array(np.array([2, 3], dtype=np.int64), "Axes23")
+        )
+    else:
+        squeeze_ops = "f = Squeeze<axes=[2,3]>(p)"
+
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Out}] Y)
+        {{
+          {conv1}
+          a = {activation}(h)
+          p = GlobalAveragePool(a)
+          {squeeze_ops}
+          {gemm}
+        }}
+        """,
+        initializer=initializer,
+        opset=opset,
+    )
+
+
+def test_structured_pruning_global_average_pool_squeeze_chained_gemm_pass_through_matches_oracle_exactly():
+    # THE confirmed-by-a-real-export repro: `x.squeeze(-1).squeeze(-1)` in
+    # place of an explicit `nn.Flatten()` -- two chained single-axis
+    # `Squeeze(axes=[-1])` nodes reading `GlobalAveragePool`'s own
+    # `[N, C, 1, 1]` output down to `[N, C]`. See
+    # `_squeeze_axis_is_trailing_spatial`'s own docstring for why `axis ==
+    # -1`, chained, stays provably within GAP's own trailing axes here.
+    Cin, C1, Out = 3, 16, 5
+    rng = np.random.default_rng(174)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((Out, C1)).astype(np.float32)
+    b2 = rng.standard_normal((Out,)).astype(np.float32)
+    model = _gap_squeeze_matmul_model(
+        w1, w2, b1=b1, b2=b2, weight_transposed=True, chained=True
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["W2"][1] == C1 // 2
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _gap_squeeze_matmul_model(
+        w1[keep],
+        w2[:, keep],
+        b1=b1[keep],
+        b2=b2,
+        weight_transposed=True,
+        chained=True,
+    )
+
+    rng_x = np.random.default_rng(175)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_global_average_pool_squeeze_multi_axis_gemm_pass_through_matches_oracle_exactly():
+    # A single `Squeeze` covering both trailing axes at once (`axes=[2,
+    # 3]`), the opset>=13 constant-input form -- real exporters emit this
+    # shape too, not only the chained single-axis one above.
+    Cin, C1, Out = 3, 16, 5
+    rng = np.random.default_rng(176)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C1, Out)).astype(np.float32)
+    model = _gap_squeeze_matmul_model(w1, w2, weight_transposed=False, chained=False)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["W2"][0] == C1 // 2
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _gap_squeeze_matmul_model(
+        w1[keep], w2[keep], weight_transposed=False, chained=False
+    )
+
+    rng_x = np.random.default_rng(177)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_global_average_pool_squeeze_multi_axis_attribute_form_opset_below_13_gemm_pass_through_matches_oracle_exactly():
+    # The opset<13 `axes` *attribute* form -- `Squeeze`'s own schema moved
+    # `axes` from an attribute to a constant input at opset 13 (confirmed
+    # live via `onnx.defs.get_schema("Squeeze", N).inputs`) -- exercised at
+    # opset 12 specifically to hit `_gap_squeeze_axes`'s own
+    # attribute-parsing branch.
+    Cin, C1, Out = 3, 16, 5
+    rng = np.random.default_rng(178)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C1, Out)).astype(np.float32)
+    model = _gap_squeeze_matmul_model(
+        w1, w2, weight_transposed=False, chained=False, opset=12
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][0] == C1 // 2
+    assert dims_after["W2"][0] == C1 // 2
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _gap_squeeze_matmul_model(
+        w1[keep], w2[keep], weight_transposed=False, chained=False, opset=12
+    )
+
+    rng_x = np.random.default_rng(179)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_global_average_pool_squeeze_channel_axis_declines():
+    # A `Squeeze` axis that isn't a trailing spatial one (here `axis=1`, the
+    # channel axis) is declined outright -- see
+    # `_squeeze_axis_is_trailing_spatial`'s own docstring. The whole chain
+    # stays completely unpruned, not guessed at.
+    Cin, C1, Out = 3, 16, 5
+    rng = np.random.default_rng(181)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C1, Out)).astype(np.float32)
+    axes_init = onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "Axes1")
+    model = _model(
+        f"""
+        g (float[1,{Cin},10,10] X) => (float[?] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          p = GlobalAveragePool(h)
+          f = Squeeze(p, Axes1)
+          Y = MatMul(f, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), axes_init],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
 def test_analyze_structured_pruning_maxpool_pass_through_matches_real_call():
     # Dry-run/real-call cross-check for the pooling pass-through hops
     # specifically: `_analyze_chains` shares `_find_conv_chains` (and
@@ -30357,6 +30736,100 @@ def test_qdq_structured_pruning_conv_global_average_pool_flatten_gemm_pass_throu
     np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
 
 
+def test_qdq_structured_pruning_conv_global_average_pool_reshape_neg1_gemm_pass_through_matches_oracle():
+    # The `Reshape([batch, -1])` counterpart of the `Flatten(axis=1)` QDQ
+    # test above -- `_match_gap_flatten_matmul_consumer` is
+    # domain/quantization-agnostic, so the identical constant `[0, -1]`
+    # shape recognized on the plain-float walker (see
+    # `_match_reshape_batch_neg1_pass_through`'s own docstring) is
+    # recognized here too, reused verbatim by `_walk_to_consumer_qdq`'s own
+    # `is_conv` branch.
+    Cin, C1, C2, Out = 4, 6, 5, 3
+    rng = np.random.default_rng(62)
+    w1f = (rng.standard_normal((C1, Cin, 3, 3)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((C2, C1, 3, 3)) * 0.3).astype(np.float32)
+    w3f = (rng.standard_normal((Out, C2)) * 0.3).astype(np.float32)
+    w1q, w1s = _quantize_static_conv_weight(w1f)
+    w2q, w2s = _quantize_static_conv_weight(w2f)
+
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Out}] Y)
+        {{
+          Wq1dq = DequantizeLinear<axis=0>(Wq1, Wscale1)
+          h0 = Conv<kernel_shape=[3,3]>(X, Wq1dq)
+          h0a = Relu(h0)
+          Wq2dq = DequantizeLinear<axis=0>(Wq2, Wscale2)
+          h1 = Conv<kernel_shape=[3,3]>(h0a, Wq2dq)
+          p = GlobalAveragePool(h1)
+          f = Reshape(p, rshape)
+          Y = Gemm<transB=1>(f, W3)
+        }}
+        """,
+        initializer=[
+            _i8(w1q, "Wq1"),
+            _f32(w1s, "Wscale1"),
+            _i8(w2q, "Wq2"),
+            _f32(w2s, "Wscale2"),
+            _f32(w3f, "W3"),
+            onnx.numpy_helper.from_array(np.array([0, -1], dtype=np.int64), "rshape"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_qdq_chains(model.graph)
+    assert len(chains) == 2
+    gap_chain = next(ch for ch in chains if not ch.consumer.is_conv)
+    assert gap_chain.consumer.node.op_type == "Gemm"
+    assert not gap_chain.consumer.ref.is_qdq  # plain float, never quantized
+    assert gap_chain.n_channels == C2
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    keep_count1 = C1 - round(C1 * 0.5)
+    keep_count2 = C2 - round(C2 * 0.5)
+    assert list(inits["Wq1"].dims) == [keep_count1, Cin, 3, 3]
+    assert list(inits["Wq2"].dims) == [keep_count2, keep_count1, 3, 3]
+    assert list(inits["Wscale2"].dims) == [keep_count2]
+    assert list(inits["W3"].dims) == [Out, keep_count2]
+
+    w1_dequant = _qdq_dequant(w1q, w1s, None, axis=0)
+    keep1 = _oracle_keep_indices_conv(w1_dequant, keep_count1)
+    w2_dequant_after_consumer_slice = _qdq_dequant(w2q, w2s, None, axis=0)[:, keep1]
+    keep2 = _oracle_keep_indices_conv(w2_dequant_after_consumer_slice, keep_count2)
+
+    rng2 = np.random.default_rng(63)
+    x = rng2.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    oracle = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Out}] Y)
+        {{
+          h0 = Conv<kernel_shape=[3,3]>(X, W1)
+          h0a = Relu(h0)
+          h1 = Conv<kernel_shape=[3,3]>(h0a, W2)
+          p = GlobalAveragePool(h1)
+          f = Reshape(p, rshape)
+          Y = Gemm<transB=1>(f, W3)
+        }}
+        """,
+        initializer=[
+            onnx.numpy_helper.from_array(
+                w1_dequant[keep1].astype(np.float32), name="W1"
+            ),
+            onnx.numpy_helper.from_array(
+                w2_dequant_after_consumer_slice[keep2].astype(np.float32), name="W2"
+            ),
+            _f32(w3f[:, keep2], "W3"),
+            onnx.numpy_helper.from_array(np.array([0, -1], dtype=np.int64), "rshape"),
+        ],
+    )
+    (y_oracle,) = onnx.reference.ReferenceEvaluator(oracle).run(None, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
 def test_qdq_structured_pruning_conv_global_average_pool_flatten_gemm_real_quantize_static_pipeline_end_to_end():
     # The full end-to-end pipeline counterpart: runs the REAL, whole-model
     # ``onnxsim.quantize_static`` (real calibration + QDQ insertion) on a
@@ -46756,6 +47229,87 @@ def _dqconv_gap_flatten_gemm_model_from_weights(
     }
 
 
+def _dqconv_gap_reshape_neg1_gemm_model_from_weights(
+    c, m1, m2, out, w1f, w2f, w3f, b1f=None, spatial=8, activation="Relu", seed=0
+):
+    """`_dqconv_gap_flatten_gemm_model_from_weights`'s ``Reshape``-based
+    analogue: ``ConvInteger -> {activation} -> ConvInteger ->
+    GlobalAveragePool -> Reshape([0, -1]) -> Gemm`` -- the constant
+    ``[0, -1]`` shape form :func:`_match_reshape_batch_neg1_pass_through`
+    recognizes (see `_gap_reshape_neg1_matmul_model`'s own identical
+    plain-float fixture), reused verbatim by `_walk_to_conv_integer_consumer`.
+    """
+    w1q, w1s, w1zp = _quantize_dynamic_conv_weight(w1f, spatial=spatial)
+    w2q, w2s, w2zp = _quantize_dynamic_conv_weight(w2f, spatial=spatial)
+
+    kh1, kw1 = w1f.shape[2], w1f.shape[3]
+    kh2, kw2 = w2f.shape[2], w2f.shape[3]
+    ph1, pw1 = (kh1 - 1) // 2, (kw1 - 1) // 2
+    ph2, pw2 = (kh2 - 1) // 2, (kw2 - 1) // 2
+
+    if b1f is not None:
+        bias_ops = """
+          b1r = Reshape(b1, b1_shape)
+          c1 = Add(c1s, b1r)
+        """
+        c1_out = "c1"
+    else:
+        bias_ops = ""
+        c1_out = "c1s"
+
+    body = f"""
+    g (float[1,{c},{spatial},{spatial}] x) => (float[1,{out}] y)
+    {{
+      xq, x_scale, x_zero_point = DynamicQuantizeLinear(x)
+      combined_scale1 = Mul(x_scale, w1_scale)
+      c1i = ConvInteger<kernel_shape=[{kh1},{kw1}], pads=[{ph1},{pw1},{ph1},{pw1}]>(xq, w1_quantized, x_zero_point, w1_zero_point)
+      c1f = Cast<to=1>(c1i)
+      c1s = Mul(c1f, combined_scale1)
+      {bias_ops}
+      h1 = {activation}({c1_out})
+      rq, r_scale, r_zero_point = DynamicQuantizeLinear(h1)
+      combined_scale2 = Mul(r_scale, w2_scale)
+      c2i = ConvInteger<kernel_shape=[{kh2},{kw2}], pads=[{ph2},{pw2},{ph2},{pw2}]>(rq, w2_quantized, r_zero_point, w2_zero_point)
+      c2f = Cast<to=1>(c2i)
+      h2 = Mul(c2f, combined_scale2)
+      p = GlobalAveragePool(h2)
+      f = Reshape(p, rshape)
+      y = Gemm<transB=1>(f, w3)
+    }}
+    """
+    inits = [
+        onnx.numpy_helper.from_array(w1q, "w1_quantized"),
+        onnx.numpy_helper.from_array(w1s, "w1_scale"),
+        onnx.numpy_helper.from_array(w1zp, "w1_zero_point"),
+        onnx.numpy_helper.from_array(w2q, "w2_quantized"),
+        onnx.numpy_helper.from_array(w2s, "w2_scale"),
+        onnx.numpy_helper.from_array(w2zp, "w2_zero_point"),
+        _f32(w3f, "w3"),
+        onnx.numpy_helper.from_array(np.array([0, -1], dtype=np.int64), "rshape"),
+    ]
+    if b1f is not None:
+        inits.append(_f32(b1f, "b1"))
+        inits.append(
+            onnx.numpy_helper.from_array(
+                np.array([1, -1, 1, 1], dtype=np.int64), "b1_shape"
+            )
+        )
+    model = _model(body, initializer=inits, opset=21)
+    return model, {
+        "W1f": w1f,
+        "W2f": w2f,
+        "W3f": w3f,
+        "B1f": b1f,
+        "W1q": w1q,
+        "W1s": w1s,
+        "W1zp": w1zp,
+        "W2q": w2q,
+        "W2s": w2s,
+        "W2zp": w2zp,
+        "spatial": spatial,
+    }
+
+
 def _dqconv_clip_model_from_weights(
     c, m1, m2, w1f, w2f, b1f=None, spatial=8, min_val=0.0, max_val=6.0, seed=0
 ):
@@ -47638,6 +48192,97 @@ def test_dynamic_quantize_conv_global_average_pool_flatten_gemm_pass_through_mat
     # mirrors `test_dynamic_quantize_conv_producer_matches_independent_oracle_via_real_inference_session`'s
     # own identical pattern.
     ref_model, _ = _dqconv_gap_flatten_gemm_model_from_weights(
+        c,
+        keep_count1,
+        keep_count2,
+        out,
+        info["W1f"][keep1],
+        info["W2f"][keep2][:, keep1],
+        w3f[:, keep2],
+        seed=987654,
+    )
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    ref_inits["w1_quantized"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1q"][keep1], "w1_quantized")
+    )
+    ref_inits["w1_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1s"], "w1_scale")
+    )
+    ref_inits["w1_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1zp"], "w1_zero_point")
+    )
+    ref_inits["w2_quantized"].CopyFrom(
+        onnx.numpy_helper.from_array(w2q_final, "w2_quantized")
+    )
+    ref_inits["w2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2s"], "w2_scale")
+    )
+    ref_inits["w2_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2zp"], "w2_zero_point")
+    )
+
+    rng2 = np.random.default_rng(51)
+    x = rng2.standard_normal((1, c, info["spatial"], info["spatial"])).astype(
+        np.float32
+    )
+    (y_pruned,) = _run(pruned, {"x": x})
+    (y_ref,) = _run(ref_model, {"x": x})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_dynamic_quantize_conv_global_average_pool_reshape_neg1_gemm_pass_through_matches_oracle():
+    # The `Reshape([0, -1])` counterpart of the `Flatten(axis=1)` test above
+    # -- `_match_gap_flatten_matmul_consumer` is domain/quantization-
+    # agnostic, so the identical constant `[0, -1]` shape recognized on the
+    # plain-float walker (see `_match_reshape_batch_neg1_pass_through`'s own
+    # docstring) is recognized here too, reused verbatim by
+    # `_walk_to_conv_integer_consumer`. Mirrors the `Flatten` test above
+    # exactly, just swapping the model-builder helper.
+    c, m1, m2, out = 4, 6, 5, 3
+    rng = np.random.default_rng(50)
+    w1f = (rng.standard_normal((m1, c, 3, 3)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((m2, m1, 3, 3)) * 0.3).astype(np.float32)
+    w3f = (rng.standard_normal((out, m2)) * 0.3).astype(np.float32)
+    model, info = _dqconv_gap_reshape_neg1_gemm_model_from_weights(
+        c, m1, m2, out, w1f, w2f, w3f, seed=50
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_conv_integer_chains(model.graph)
+    assert len(chains) == 2
+    gap_chain = next(ch for ch in chains if ch.matmul_consumer is not None)
+    assert gap_chain.consumer is None
+    assert gap_chain.matmul_consumer[1] == "w3"
+    assert gap_chain.n_channels == m2
+
+    keep_count1 = m1 - round(m1 * 0.5)
+    keep_count2 = m2 - round(m2 * 0.5)
+    keep1 = _dqconv_importance_keep(info["W1q"], info["W1s"], info["W1zp"], keep_count1)
+    w2q_after_consumer_slice = info["W2q"][:, keep1, :, :]
+    keep2 = _dqconv_importance_keep(
+        w2q_after_consumer_slice, info["W2s"], info["W2zp"], keep_count2
+    )
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_conv(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["w1_quantized"].dims) == [keep_count1, c, 3, 3]
+    assert list(inits["w2_quantized"].dims) == [keep_count2, keep_count1, 3, 3]
+    assert list(inits["w2_scale"].dims) == []  # always per-tensor, untouched
+    assert list(inits["w3"].dims) == [out, keep_count2]
+
+    w2q_final = info["W2q"][keep2][:, keep1, :, :]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["w1_quantized"]), info["W1q"][keep1]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["w2_quantized"]), w2q_final
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["w3"]), w3f[:, keep2]
+    )
+
+    ref_model, _ = _dqconv_gap_reshape_neg1_gemm_model_from_weights(
         c,
         keep_count1,
         keep_count2,
