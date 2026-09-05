@@ -133,6 +133,23 @@ command/timing):
   initializers -> 0).
 - Both a per-layer file and the post model ran successfully on the real
   AX650N via `axcl_run_model` (~1.5ms and ~9ms respectively).
+
+**Update: systematic single-node-per-op coverage sweep, 29% -> 99%
+(91/92).** A single-node-per-op battery run against a real
+`pulsar2:6.0-lite` build took confirmed coverage of `AX650_SUPPORTED_OPS`
+from 27/92 to 91/92. Most confirmed working; a real, generalizable gotcha
+surfaced along the way (an ONNX attribute left unset to take its schema
+default -- e.g. `Elu.alpha`, `LeakyRelu.alpha`, `TopK.largest`/`sorted` --
+is read as `None` by Pulsar2's frontend and crashes with a confusing
+internal error, not a graceful fallback; setting the same value explicitly
+fixes it). Most importantly for this module: **7 ops confirmed to hard-fail
+despite being listed in `AX650_SUPPORTED_OPS`** -- see
+`AX650_CONFIRMED_BROKEN_OPS` and `confirmed_broken_on_ax650()` below, now
+wired into `pulsar2_backend.ax650_build_risks()` and
+`pulsar2_simulator.partition()` so both flag these correctly instead of
+treating "in AX650_SUPPORTED_OPS" as sufficient. See README.md's
+"Systematic op coverage: from 29% to 99% of AX650_SUPPORTED_OPS" section for
+the full sweep.
 """
 
 from __future__ import annotations
@@ -246,6 +263,38 @@ AX650_SUPPORTED_OPS: frozenset = frozenset(
     }
 )
 
+# Op types that ARE in `AX650_SUPPORTED_OPS` above (i.e. Axera's own docs
+# list them as supported) but that a real `pulsar2:6.0-lite` build was
+# confirmed to hard-fail on anyway, via a single-node-per-op battery run
+# against real hardware -- see README.md's "Systematic op coverage: from 29%
+# to 99% of AX650_SUPPORTED_OPS" section for the full sweep (91/92 ops
+# confirmed; these 7 are the confirmed-broken exceptions). This is a
+# *different* source of truth from `AX650_SUPPORTED_OPS` (docs vs. this
+# project's own real-hardware results) -- kept separate rather than removing
+# these from `AX650_SUPPORTED_OPS`, so that dict continues to mean exactly
+# "what Axera's docs claim." Values are the confirmed real failure mode.
+AX650_CONFIRMED_BROKEN_OPS: Dict[str, str] = {
+    "ConvTranspose": ("real RuntimeError('Op Execution Error...') during quantization"),
+    "Xor": "KeyError('dont support Xor opr in AXOPS/ONNXOPS/CUSTOM_OPS')",
+    "Squeeze": (
+        "internal compiler bug: ZeroDivisionError('division by zero') in "
+        "the NPU backend scheduler (confirmed for a (1,4)->(4,) reshape)"
+    ),
+    "LpNormalization": "internal exception on a U8-quantized intermediate tensor",
+    "RotaryEmbedding": (
+        "fails even with explicit interleaved/rotary_embedding_dim attributes "
+        "-- genuinely unimplemented, not the attribute-defaulting issue below"
+    ),
+    "Swish": (
+        "\"Swish, {'alpha': 1.0} get opr failed\" even with alpha explicit "
+        "-- distinct from the working HardSwish"
+    ),
+    "InverseSigmoid": (
+        "not a real ONNX operator schema (like the working Silu extension "
+        'op), but this name fails: "InverseSigmoid, pyrun failed"'
+    ),
+}
+
 # Confirmed (not guessed) against a real compiled `.axmodel` run on an AX650N:
 # the op_type Pulsar2 gives a node whose contents are an opaque, already
 # NPU-compiled subgraph. Domain stays the plain default ("") -- see this
@@ -355,6 +404,21 @@ def unsupported_on_ax650(model: onnx.ModelProto) -> Set[str]:
         node.op_type
         for node in model.graph.node
         if node.op_type not in AX650_SUPPORTED_OPS and node.op_type != AXERA_NPU_OP_TYPE
+    }
+
+
+def confirmed_broken_on_ax650(model: onnx.ModelProto) -> Dict[str, str]:
+    """Op types in `model` that are confirmed, via real hardware, to fail a
+    real `pulsar2 build` despite being listed in `AX650_SUPPORTED_OPS`.
+
+    Maps each present op type to its confirmed real failure mode (see
+    `AX650_CONFIRMED_BROKEN_OPS`). Unlike `unsupported_on_ax650()`, every hit
+    here is a *confirmed* hard failure, not an "untested" one.
+    """
+    return {
+        node.op_type: AX650_CONFIRMED_BROKEN_OPS[node.op_type]
+        for node in model.graph.node
+        if node.op_type in AX650_CONFIRMED_BROKEN_OPS
     }
 
 

@@ -86,6 +86,38 @@ def test_partition_flags_control_flow_as_cpu():
     assert sim.coverage(model) == "none"
 
 
+def test_partition_flags_confirmed_broken_listed_ops_as_cpu():
+    """`Xor` is in AX650_SUPPORTED_OPS but confirmed via real hardware to
+    hard-fail a real build anyway (see `pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS`).
+    `partition()` must place it on the CPU side and report it separately in
+    `confirmed_broken_op_types`, not silently count it as NPU-eligible."""
+    import onnx
+    from onnx import TensorProto, helper
+
+    xor_node = helper.make_node("Xor", ["x", "y"], ["z"])
+    graph = helper.make_graph(
+        [xor_node],
+        "confirmed_broken_xor",
+        [
+            helper.make_tensor_value_info("x", TensorProto.BOOL, [1, 4]),
+            helper.make_tensor_value_info("y", TensorProto.BOOL, [1, 4]),
+        ],
+        [helper.make_tensor_value_info("z", TensorProto.BOOL, [1, 4])],
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10
+    )
+    onnx.checker.check_model(model)
+
+    assert "Xor" in sim.AX650_SUPPORTED_OPS
+
+    p = sim.partition(model)
+    assert p.cpu_op_types == {"Xor": 1}
+    assert p.confirmed_broken_op_types == {"Xor": 1}
+    assert p.npu_node_fraction == 0.0
+    assert sim.coverage(model) == "none"
+
+
 pytestmark_numeric = pytest.mark.skipif(
     not sim.SIMULATOR_AVAILABLE,
     reason=f"pulsar2 simulator's numeric side unavailable: {sim.unavailable_reason()}",
