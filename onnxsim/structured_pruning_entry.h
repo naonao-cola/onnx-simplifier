@@ -165,16 +165,17 @@ struct EmbeddingVocabPruningResult {
 // If/Loop/Scan/BeamSearch-family subgraphs, at any depth -- see
 // `IterSubgraphs`).
 //
-// Unlike pruning.py's own version, this port only ever matches a plain
-// `Gather` producer -- not `com.microsoft::EmbedLayerNormalization` or
-// `com.microsoft::GatherBlockQuantized` -- and only ever matches a bare
-// `MatMul`/vanilla-`Gemm` `lm_head` -- not `com.microsoft::FusedGemm`/
-// `GemmFastGelu` -- and only ever admits a plain FLOAT (float32) embedding
-// table/lm_head weight/bias, not also FLOAT16/BFLOAT16, matching this
-// file's own established narrower-than-pruning.py C++-port scope decision
-// elsewhere (e.g. `ApplyMoeExpertChannelPruning`'s own FLOAT32-only
-// restriction). See structured_pruning_entry.cpp's own section comment for
-// the full list of deliberately out-of-scope shapes and why.
+// Unlike pruning.py's own version, this port still only ever matches a
+// plain `Gather` or `com.microsoft::EmbedLayerNormalization` producer --
+// not `com.microsoft::GatherBlockQuantized` (the block-quantized embedding
+// shape -- a genuine remaining scope gap, deliberately left open; see
+// structured_pruning_entry.cpp's own section comment for exactly why).
+// `lm_head` auto-detection recognizes `MatMul`/vanilla `Gemm`/
+// `com.microsoft::FusedGemm`/`GemmFastGelu`, and the embedding table/
+// `lm_head` weight/bias may be FLOAT, FLOAT16, OR BFLOAT16 -- both now
+// match pruning.py's own scope exactly. See structured_pruning_entry.cpp's
+// own section comment for the full matched topology and the one remaining
+// out-of-scope shape.
 EmbeddingVocabPruningResult ApplyEmbeddingVocabPruning(
     const onnx::ModelProto& model,
     const std::optional<std::vector<int64_t>>& keep_token_ids,

@@ -2343,18 +2343,16 @@ def apply_embedding_vocab_pruning_cpp(
     full return-value contract.
 
     Unlike :func:`onnxsim.apply_embedding_vocab_pruning`, this C++ port
-    only ever matches a plain ``Gather`` producer -- not
-    ``com.microsoft::EmbedLayerNormalization`` or ``com.microsoft::
-    GatherBlockQuantized`` -- only ever auto-detects a bare ``MatMul``/
-    vanilla ``Gemm`` ``lm_head`` -- not ``com.microsoft::FusedGemm``/
-    ``GemmFastGelu`` -- and only ever admits a plain FLOAT (float32)
-    embedding table/``lm_head`` weight/bias, not also FLOAT16/BFLOAT16,
-    matching this codebase's own established narrower-than-pruning.py
-    C++-port scope decision elsewhere (e.g.
-    :func:`onnxsim.apply_moe_expert_channel_pruning_cpp`'s own FLOAT32-only
-    restriction). See ``onnxsim/structured_pruning_entry.cpp``'s own
-    "Embedding vocabulary pruning" section comment for the exact matched
-    topology.
+    still only ever matches a plain ``Gather`` or ``com.microsoft::
+    EmbedLayerNormalization`` producer -- not ``com.microsoft::
+    GatherBlockQuantized`` (the block-quantized embedding shape -- out of
+    scope for this port; see ``onnxsim/structured_pruning_entry.cpp``'s own
+    "Embedding vocabulary pruning" section comment for exactly why). Its
+    ``lm_head`` auto-detection recognizes ``MatMul``/vanilla ``Gemm``/
+    ``com.microsoft::FusedGemm``/``GemmFastGelu``, and the embedding
+    table/``lm_head`` weight/bias may be FLOAT, FLOAT16, OR BFLOAT16 -- both
+    match the pure-Python original's own scope now. See that same section
+    comment for the exact matched topology.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
@@ -2418,9 +2416,9 @@ def apply_embedding_vocab_magnitude_pruning_cpp(
     :class:`onnxsim.pruning.EmbeddingPruningResult`'s.
 
     Same C++-port scope restrictions as
-    :func:`onnxsim.apply_embedding_vocab_pruning_cpp` (plain ``Gather``
-    producer only, plain ``MatMul``/``Gemm`` ``lm_head`` only, FLOAT32-only
-    tensors) -- see that function's own docstring.
+    :func:`onnxsim.apply_embedding_vocab_pruning_cpp` (``GatherBlockQuantized``
+    still out of scope; every other producer/``lm_head``-node-type/dtype
+    shape matched) -- see that function's own docstring.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
