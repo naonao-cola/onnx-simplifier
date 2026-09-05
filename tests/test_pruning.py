@@ -44447,3 +44447,501 @@ def test_decomposed_attention_packed_qkv_real_torch_export_pipeline():
     oracle_out = linear(ctx, wo, bo)
 
     np.testing.assert_allclose(ort_out, oracle_out, rtol=1e-3, atol=1e-3)
+
+
+# --- DynamicQuantizeConv (ConvInteger) ---------------------------------------
+#
+# ``ConvInteger`` is the Conv analogue of ``MatMulInteger`` --
+# ``onnxruntime.quantization.quantize_dynamic()`` emits
+# ``DynamicQuantizeLinear -> ConvInteger -> Cast -> Mul`` (plus a small
+# scale-combining ``Mul`` and an optional bias ``Reshape``/``Add``) for a
+# dynamically quantized Conv layer -- see onnxsim/pruning.py's own
+# "DynamicQuantizeConv (ConvInteger, ...)" section comment for the full
+# empirical investigation (live schema, the real quantizer source read
+# directly, and the real ``quantize_dynamic`` -> ``InferenceSession``-
+# optimize round trip confirming this pattern, UNLIKE ``MatMulInteger``'s
+# own, is never fused into a single contrib op).
+#
+# Fixture weights are quantized via the REAL
+# ``onnxruntime.quantization.quantize_dynamic`` tool (never a hand-rolled
+# re-implementation), by wrapping each weight in a minimal
+# ``Y = Conv(X, W)`` model and reading back its own emitted
+# ``W_quantized``/``W_scale``/``W_zero_point`` initializers
+# (:func:`_quantize_dynamic_conv_weight`). The full multi-node chain under
+# test is then assembled directly via ``onnx.parser.parse_model`` (this
+# file's own ``_model`` helper) with those genuine quantized tensors
+# attached programmatically -- the identical "real quantizer for fixtures,
+# parser for graph structure" pattern this file's own
+# ``DynamicQuantizeMatMul`` section above already established (per this
+# repo's own CLAUDE.md).
+#
+# One test below
+# (`test_dynamic_quantize_conv_real_quantize_dynamic_pipeline_end_to_end`)
+# goes further: it runs the REAL ``quantize_dynamic`` tool on a plain float
+# ``Conv -> Relu -> Conv`` model AND a real ``InferenceSession``'s default
+# graph optimization on the result, confirming directly that ``ConvInteger``
+# survives completely unfused (unlike ``MatMulInteger``) before matching and
+# pruning it.
+
+
+def _quantize_dynamic_conv_weight(W, spatial=8, per_channel=False):
+    """Runs the REAL ``onnxruntime.quantization.quantize_dynamic`` tool on a
+    minimal ``Y = Conv(X, W)`` wrapper model and returns the genuine
+    quantized ``(W_int8[M,C,kH,kW], W_scale, W_zero_point)`` triple it emits
+    for `W` -- never a hand-rolled re-implementation of the quantization
+    scheme.
+    """
+    from onnxruntime.quantization import QuantType, quantize_dynamic
+
+    m, c, kh, kw = W.shape
+    pad_h, pad_w = (kh - 1) // 2, (kw - 1) // 2
+    src = _model(
+        f"""
+        g (float[1,{c},{spatial},{spatial}] X) => (float[1,{m},{spatial},{spatial}] Y)
+        {{
+          Y = Conv<kernel_shape=[{kh},{kw}], pads=[{pad_h},{pad_w},{pad_h},{pad_w}]>(X, W)
+        }}
+        """,
+        initializer=[_f32(W, "W")],
+        opset=21,
+    )
+    with tempfile.TemporaryDirectory() as d:
+        src_path = os.path.join(d, "src.onnx")
+        dst_path = os.path.join(d, "dst.onnx")
+        onnx.save(src, src_path)
+        quantize_dynamic(
+            src_path,
+            dst_path,
+            per_channel=per_channel,
+            weight_type=QuantType.QInt8,
+            op_types_to_quantize=["Conv"],
+        )
+        q = onnx.load(dst_path)
+    inits = {t.name: t for t in q.graph.initializer}
+    Wq = onnx.numpy_helper.to_array(inits["W_quantized"]).copy()
+    Wscale = onnx.numpy_helper.to_array(inits["W_scale"]).copy()
+    Wzp = onnx.numpy_helper.to_array(inits["W_zero_point"]).copy()
+    return Wq, Wscale, Wzp
+
+
+def _dqconv_model_from_weights(
+    c, m1, m2, w1f, w2f, b1f=None, spatial=8, activation="Relu", seed=0
+):
+    """Builds ``DynamicQuantizeLinear -> ConvInteger -> Cast -> Mul
+    [-> Reshape -> Add] -> activation -> DynamicQuantizeLinear ->
+    ConvInteger -> Cast -> Mul`` -- a same-family chain -- from explicit
+    float weights, quantized via the real tool
+    (:func:`_quantize_dynamic_conv_weight`). Returns ``(model, info)`` where
+    `info` carries every float/quantized array needed to hand-build an
+    "already pruned" oracle.
+    """
+    w1q, w1s, w1zp = _quantize_dynamic_conv_weight(w1f, spatial=spatial)
+    w2q, w2s, w2zp = _quantize_dynamic_conv_weight(w2f, spatial=spatial)
+
+    kh1, kw1 = w1f.shape[2], w1f.shape[3]
+    kh2, kw2 = w2f.shape[2], w2f.shape[3]
+    ph1, pw1 = (kh1 - 1) // 2, (kw1 - 1) // 2
+    ph2, pw2 = (kh2 - 1) // 2, (kw2 - 1) // 2
+
+    if b1f is not None:
+        bias_ops = """
+          b1r = Reshape(b1, b1_shape)
+          c1 = Add(c1s, b1r)
+        """
+        c1_out = "c1"
+    else:
+        bias_ops = ""
+        c1_out = "c1s"
+
+    body = f"""
+    g (float[1,{c},{spatial},{spatial}] x) => (float[1,{m2},{spatial},{spatial}] y)
+    {{
+      xq, x_scale, x_zero_point = DynamicQuantizeLinear(x)
+      combined_scale1 = Mul(x_scale, w1_scale)
+      c1i = ConvInteger<kernel_shape=[{kh1},{kw1}], pads=[{ph1},{pw1},{ph1},{pw1}]>(xq, w1_quantized, x_zero_point, w1_zero_point)
+      c1f = Cast<to=1>(c1i)
+      c1s = Mul(c1f, combined_scale1)
+      {bias_ops}
+      h1 = {activation}({c1_out})
+      rq, r_scale, r_zero_point = DynamicQuantizeLinear(h1)
+      combined_scale2 = Mul(r_scale, w2_scale)
+      c2i = ConvInteger<kernel_shape=[{kh2},{kw2}], pads=[{ph2},{pw2},{ph2},{pw2}]>(rq, w2_quantized, r_zero_point, w2_zero_point)
+      c2f = Cast<to=1>(c2i)
+      y = Mul(c2f, combined_scale2)
+    }}
+    """
+    inits = [
+        onnx.numpy_helper.from_array(w1q, "w1_quantized"),
+        onnx.numpy_helper.from_array(w1s, "w1_scale"),
+        onnx.numpy_helper.from_array(w1zp, "w1_zero_point"),
+        onnx.numpy_helper.from_array(w2q, "w2_quantized"),
+        onnx.numpy_helper.from_array(w2s, "w2_scale"),
+        onnx.numpy_helper.from_array(w2zp, "w2_zero_point"),
+    ]
+    if b1f is not None:
+        inits.append(_f32(b1f, "b1"))
+        inits.append(
+            onnx.numpy_helper.from_array(
+                np.array([1, -1, 1, 1], dtype=np.int64), "b1_shape"
+            )
+        )
+    model = _model(body, initializer=inits, opset=21)
+    return model, {
+        "W1f": w1f,
+        "W2f": w2f,
+        "B1f": b1f,
+        "W1q": w1q,
+        "W1s": w1s,
+        "W1zp": w1zp,
+        "W2q": w2q,
+        "W2s": w2s,
+        "W2zp": w2zp,
+        "spatial": spatial,
+    }
+
+
+def _dqconv_chain_model(c, m1, m2, kh=3, kw=3, bias1=False, spatial=8, seed=0):
+    rng = np.random.default_rng(seed)
+    w1f = (rng.standard_normal((m1, c, kh, kw)) * 0.3).astype(np.float32)
+    w2f = (rng.standard_normal((m2, m1, kh, kw)) * 0.3).astype(np.float32)
+    b1f = (rng.standard_normal(m1) * 0.05).astype(np.float32) if bias1 else None
+    return _dqconv_model_from_weights(
+        c, m1, m2, w1f, w2f, b1f=b1f, spatial=spatial, seed=seed
+    )
+
+
+def _dqconv_importance_keep(Wq, Wscale, Wzp, keep_count):
+    w_dequant = (Wq.astype(np.float64) - float(Wzp)) * float(Wscale)
+    w_nk = w_dequant.reshape(w_dequant.shape[0], -1)
+    importance = np.linalg.norm(w_nk, axis=1)
+    return np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+
+def test_dynamic_quantize_conv_chain_is_matched_and_prunes():
+    c, m1, m2 = 4, 6, 5
+    model, _info = _dqconv_chain_model(c, m1, m2, seed=1)
+    onnx.checker.check_model(model)
+    chains = onnxsim.pruning._find_conv_integer_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == m1
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_conv(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["w1_quantized"].dims) == [m1 // 2, c, 3, 3]
+    assert list(inits["w1_scale"].dims) == []  # always per-tensor, untouched
+    assert list(inits["w1_zero_point"].dims) == []
+    assert list(inits["w2_quantized"].dims) == [m2, m1 // 2, 3, 3]
+
+
+def test_dynamic_quantize_conv_producer_matches_independent_oracle_via_real_inference_session():
+    # The core correctness invariant this project's established test
+    # philosophy holds every quantized section to: a pruned model's output
+    # must match a reference built from an INDEPENDENTLY reconstructed
+    # "already pruned" model (its own smaller tensors, not a post-hoc slice
+    # of the unpruned model's own output), both run through a real
+    # onnxruntime InferenceSession.
+    c, m1, m2 = 4, 6, 5
+    model, info = _dqconv_chain_model(c, m1, m2, bias1=True, seed=2)
+    onnx.checker.check_model(model)
+    keep = _dqconv_importance_keep(info["W1q"], info["W1s"], info["W1zp"], m1 // 2)
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_conv(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+
+    # "slice, don't recompute": the pruned graph's own quantized codes/bias
+    # are EXACTLY a hand-slice of the original ones; the always-per-tensor
+    # scale/zero-point are copied UNCHANGED (never resampled).
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["w1_quantized"]), info["W1q"][keep]
+    )
+    assert onnx.numpy_helper.to_array(inits["w1_scale"]) == pytest.approx(
+        float(info["W1s"])
+    )
+    assert onnx.numpy_helper.to_array(inits["w1_zero_point"]) == float(info["W1zp"])
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["b1"]), info["B1f"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["w2_quantized"]), info["W2q"][:, keep]
+    )
+
+    # Independently reconstructed "already pruned" reference model: the
+    # PRODUCER's own kept-output-channel weight/bias are sliced directly
+    # (mirroring what the real call itself does); the CONSUMER's own weight
+    # is likewise sliced directly (never requantized), copying its own
+    # (unchanged) scale/zero-point across -- exactly what the consumer role
+    # itself does (this section's own consumer role never touches
+    # scale/zero-point at all).
+    ref_model, _ = _dqconv_model_from_weights(
+        c,
+        len(keep),
+        m2,
+        info["W1f"][keep],
+        info["W2f"][:, keep],
+        b1f=info["B1f"][keep] if info["B1f"] is not None else None,
+        spatial=info["spatial"],
+        seed=987654,
+    )
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    ref_inits["w1_quantized"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1q"][keep], "w1_quantized")
+    )
+    ref_inits["w1_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1s"], "w1_scale")
+    )
+    ref_inits["w1_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1zp"], "w1_zero_point")
+    )
+    ref_inits["w2_quantized"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2q"][:, keep], "w2_quantized")
+    )
+    ref_inits["w2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2s"], "w2_scale")
+    )
+    ref_inits["w2_zero_point"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2zp"], "w2_zero_point")
+    )
+
+    rng = np.random.default_rng(11)
+    spatial = info["spatial"]
+    x = rng.standard_normal((1, c, spatial, spatial)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"x": x})
+    (y_ref,) = _run(ref_model, {"x": x})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_dynamic_quantize_conv_no_bias_chain_is_matched_and_prunes():
+    c, m1, m2 = 3, 8, 4
+    model, _info = _dqconv_chain_model(c, m1, m2, bias1=False, seed=3)
+    onnx.checker.check_model(model)
+    chains = onnxsim.pruning._find_conv_integer_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].producer.bias_add_node is None
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_conv(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["w1_quantized"].dims) == [m1 // 2, c, 3, 3]
+
+    rng = np.random.default_rng(19)
+    x = rng.standard_normal((1, c, 8, 8)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"x": x})
+    assert y_pruned.shape == (1, m2, 8, 8)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_dynamic_quantize_conv_scale_always_per_tensor():
+    # A real fact, not a declined possibility: ORT's own ConvInteger dynamic
+    # quantizer never emits a per-channel weight scale/zero-point, for any
+    # `per_channel` argument -- see this module's own section comment.
+    # Confirmed here on the real quantizer's own emitted tensors directly.
+    c, m1 = 4, 6
+    _, _, W1zp = _quantize_dynamic_conv_weight(
+        (np.random.default_rng(0).standard_normal((m1, c, 3, 3)) * 0.3).astype(
+            np.float32
+        ),
+        per_channel=True,
+    )
+    assert list(np.asarray(W1zp).shape) == []
+
+
+def test_dynamic_quantize_conv_missing_zero_point_is_declined():
+    c, m1, m2 = 4, 6, 5
+    model, _info = _dqconv_chain_model(c, m1, m2, seed=5)
+    for node in model.graph.node:
+        if node.op_type == "ConvInteger" and node.output[0] == "c1i":
+            node.input[2] = ""  # blank x_zero_point
+    chains = onnxsim.pruning._find_conv_integer_chains(model.graph)
+    assert chains == []
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_dynamic_quantize_conv, sparsity=0.5
+    )
+    assert report.layers == []
+    assert any("ConvInteger" in ne for ne in report.not_eligible)
+
+
+def test_dynamic_quantize_conv_grouped_is_declined():
+    c, m1, m2 = 4, 6, 5
+    model, _info = _dqconv_chain_model(c, m1, m2, seed=6)
+    for node in model.graph.node:
+        if node.op_type == "ConvInteger" and node.output[0] == "c1i":
+            node.attribute.append(onnx.helper.make_attribute("group", 2))
+    chains = onnxsim.pruning._find_conv_integer_chains(model.graph)
+    assert chains == []
+
+
+def test_dynamic_quantize_conv_non_scalar_weight_scale_is_declined():
+    # Never confirmed to occur (see this module's own section comment), so
+    # a hand-built graph giving `w_scale` a per-channel shape is declined
+    # outright rather than silently mishandled.
+    c, m1, m2 = 4, 6, 5
+    model, _info = _dqconv_chain_model(c, m1, m2, seed=7)
+    inits = {t.name: t for t in model.graph.initializer}
+    inits["w1_scale"].CopyFrom(_f32(np.full(m1, 0.01, dtype=np.float32), "w1_scale"))
+    chains = onnxsim.pruning._find_conv_integer_chains(model.graph)
+    assert chains == []
+
+
+def test_dynamic_quantize_conv_tied_weight_is_declined():
+    c, m1, m2 = 4, 6, 5
+    model, _info = _dqconv_chain_model(c, m1, m2, seed=8)
+    # a second, unrelated node also reads w1_quantized -- shared/tied,
+    # can't be sliced
+    extra = onnx.helper.make_node(
+        "Identity", ["w1_quantized"], ["w1_quantized_alias"], name="alias"
+    )
+    model.graph.node.append(extra)
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info(
+            "w1_quantized_alias", onnx.TensorProto.INT8, [m1, c, 3, 3]
+        )
+    )
+    chains = onnxsim.pruning._find_conv_integer_chains(model.graph)
+    assert chains == []
+
+
+def test_dynamic_quantize_conv_plain_float_peer_is_not_matched():
+    # Deliberate scope narrowing (see this module's own section comment): a
+    # plain-float Conv peer is never matched on either side, unlike
+    # `apply_structured_pruning_dynamic_quantize_matmul`'s own quantized-or-
+    # plain-float union.
+    c, m1, m2 = 4, 6, 5
+    w1q, w1s, w1zp = _quantize_dynamic_conv_weight(
+        (np.random.default_rng(9).standard_normal((m1, c, 3, 3)) * 0.3).astype(
+            np.float32
+        )
+    )
+    w2f = (np.random.default_rng(10).standard_normal((m2, m1, 3, 3)) * 0.3).astype(
+        np.float32
+    )
+    body = f"""
+    g (float[1,{c},8,8] x) => (float[1,{m2},8,8] y)
+    {{
+      xq, x_scale, x_zero_point = DynamicQuantizeLinear(x)
+      combined_scale1 = Mul(x_scale, w1_scale)
+      c1i = ConvInteger<kernel_shape=[3,3], pads=[1,1,1,1]>(xq, w1_quantized, x_zero_point, w1_zero_point)
+      c1f = Cast<to=1>(c1i)
+      c1s = Mul(c1f, combined_scale1)
+      h1 = Relu(c1s)
+      y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(h1, w2)
+    }}
+    """
+    inits = [
+        onnx.numpy_helper.from_array(w1q, "w1_quantized"),
+        onnx.numpy_helper.from_array(w1s, "w1_scale"),
+        onnx.numpy_helper.from_array(w1zp, "w1_zero_point"),
+        _f32(w2f, "w2"),
+    ]
+    model = _model(body, initializer=inits, opset=21)
+    onnx.checker.check_model(model)
+    chains = onnxsim.pruning._find_conv_integer_chains(model.graph)
+    assert chains == []  # the plain-float Conv consumer is never matched
+
+
+def test_dynamic_quantize_conv_zero_sparsity_is_a_no_op():
+    c, m1, m2 = 4, 6, 5
+    model, _info = _dqconv_chain_model(c, m1, m2, seed=12)
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_conv(model, sparsity=0.0)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_dynamic_quantize_conv_invalid_sparsity_raises():
+    c, m1, m2 = 4, 6, 5
+    model, _info = _dqconv_chain_model(c, m1, m2, seed=13)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_pruning_dynamic_quantize_conv(model, sparsity=1.0)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_pruning_dynamic_quantize_conv(model, sparsity=-0.1)
+
+
+def test_dynamic_quantize_conv_real_quantize_dynamic_pipeline_end_to_end():
+    # The strongest confirmation available: run the REAL `quantize_dynamic`
+    # tool on a plain float Conv model, then a real `InferenceSession`'s
+    # default graph optimization on the result -- confirming directly that
+    # `ConvInteger`, UNLIKE `MatMulInteger`, survives completely unfused
+    # (see this module's own section comment) -- and confirm this pass
+    # matches and correctly prunes the genuine tool output, not merely a
+    # hand-built approximation of it.
+    from onnxruntime.quantization import quantize_dynamic
+
+    c, m1, m2 = 4, 6, 5
+    spatial = 8
+    rng = np.random.default_rng(14)
+    w0 = (rng.standard_normal((m1, c, 3, 3)) * 0.3).astype(np.float32)
+    w1 = (rng.standard_normal((m2, m1, 3, 3)) * 0.3).astype(np.float32)
+    float_model = _model(
+        f"""
+        g (float[1,{c},{spatial},{spatial}] x) => (float[1,{m2},{spatial},{spatial}] y)
+        {{
+          h0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(x, W0)
+          h0a = Relu(h0)
+          y = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(h0a, W1)
+        }}
+        """,
+        initializer=[_f32(w0, "W0"), _f32(w1, "W1")],
+        opset=21,
+    )
+
+    with tempfile.TemporaryDirectory() as d:
+        src_path = os.path.join(d, "src.onnx")
+        quant_path = os.path.join(d, "quant.onnx")
+        opt_path = os.path.join(d, "opt.onnx")
+        onnx.save(float_model, src_path)
+        quantize_dynamic(src_path, quant_path, op_types_to_quantize=["Conv"])
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.optimized_model_filepath = opt_path
+        ort.InferenceSession(
+            quant_path, sess_options=so, providers=["CPUExecutionProvider"]
+        )
+        fused = onnx.load(opt_path)
+
+    op_types = [n.op_type for n in fused.graph.node]
+    assert op_types.count("ConvInteger") == 2  # confirms both Conv layers
+    # were actually dynamically quantized
+    assert "DynamicQuantizeLinear" in op_types
+    # confirms the pattern really does survive completely UNFUSED (unlike
+    # `MatMulInteger`'s own fusion into `DynamicQuantizeMatMul`) -- no
+    # `com.microsoft` contrib op appears here at all.
+    assert not any(n.domain == "com.microsoft" for n in fused.graph.node)
+
+    chains = onnxsim.pruning._find_conv_integer_chains(fused.graph)
+    assert len(chains) == 1
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_conv(fused, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    pruned_inits = {t.name: list(t.dims) for t in pruned.graph.initializer}
+    w0_name = next(n.input[1] for n in pruned.graph.node if n.op_type == "ConvInteger")
+    assert pruned_inits[w0_name][0] == m1 // 2
+
+    x = rng.standard_normal((1, c, spatial, spatial)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"x": x})
+    assert y_pruned.shape == (1, m2, spatial, spatial)
+    assert np.all(np.isfinite(y_pruned))
+
+
+def test_analyze_structured_pruning_dynamic_quantize_conv_matches_real_call():
+    c, m1, m2 = 4, 6, 5
+    model, _info = _dqconv_chain_model(c, m1, m2, seed=40)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_dynamic_quantize_conv, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "dynamic_quantize_conv"
+    assert layer.total == m1
+    assert layer.would_drop == m1 // 2
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_dynamic_quantize_conv(model, sparsity=0.5)
+    dims_after = {t.name: list(t.dims) for t in pruned.graph.initializer}
+    assert dims_after["w1_quantized"][0] == m1 - layer.would_drop
+
+
+def test_apply_structured_pruning_dynamic_quantize_conv_registered_in_sensitivity_analyzers():
+    assert (
+        onnxsim.apply_structured_pruning_dynamic_quantize_conv
+        in onnxsim.pruning._SENSITIVITY_ANALYZERS
+    )
