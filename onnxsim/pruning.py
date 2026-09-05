@@ -22607,7 +22607,39 @@ def _find_sparse_attention_chains(
 #   peephole optimization (`fuseConsecutiveTransposes`) collapses them into.
 #   `repeat_kv` (when present) always sits between the two, breaking that
 #   adjacency, so only the separate-transpose shape is ever tried once
-#   `repeat_kv` has matched.
+#   `repeat_kv` has matched. This is all `MatMul`-only: neither of these two
+#   `Transpose`-based shapes is even reachable for the QK^T product's own
+#   `Einsum` alternative below, since `Einsum` never needs an explicit
+#   dot-product transpose in the first place (its own `equation` already
+#   contracts K's natural, un-transposed layout directly).
+# - The QK^T product and the AV product are each *independently* allowed to
+#   be a literal `Einsum` node instead of `MatMul` -- confirmed empirically
+#   (via `torch.onnx.export`, see `_einsum_equation_is_batched_matmul`'s own
+#   test suite) to be exactly what PyTorch's ONNX exporter emits for a
+#   `torch.einsum`-written attention block (common in `x-transformers`/
+#   `vit-pytorch`/`performer-pytorch`-style reimplementations, and for
+#   `tf2onnx`-exported `tf.einsum` code), where neither product ever goes
+#   through `MatMul` at all -- e.g. `"bhid,bhjd->bhij"` for the QK^T
+#   product, `"bhij,bhjd->bhid"` for the AV product, and a batch+head-merged
+#   3-D variant, e.g. `"bid,bjd->bij"`, for code that flattens batch/head
+#   into one axis before the einsum. Recognized via
+#   :func:`_einsum_equation_is_batched_matmul` -- a from-scratch equation-
+#   string parse (split on `"->"`, split each side on `","`, validate the
+#   actual index-label roles) that accepts an `Einsum` node here ONLY when
+#   its equation is provably equivalent to the identical batched matmul the
+#   `MatMul` case already requires (batch/head axes passed through
+#   unchanged in position, exactly the one shared axis contracted, no axis
+#   repeated/broadcast/diagonal-extracted in a way plain `MatMul` semantics
+#   wouldn't also do) -- never guessed at from a hardcoded string list, since
+#   real code varies its own subscript letters/axis order freely (the ONNX
+#   schema places no constraint on either, confirmed via
+#   `onnx.defs.get_schema("Einsum").doc`). Purely additive from that point
+#   on: an accepted `Einsum` node is treated identically to a `MatMul` node
+#   by every downstream check (shape/consumer-count/graph-output, mask/scale
+#   resolution, Q's/K's/V's own producer-weight and shape-plumbing
+#   resolution) -- the weight-slicing math a KV-group-pruning chain needs
+#   never touches the QK^T/AV product nodes themselves, only Q's/K's/V's own
+#   producer weights and the reshape/transpose shape-plumbing around them.
 # - The additive mask (if any), applied *before* `Softmax` and *after* the
 #   optional scale (HF's own fixed `scores = (q @ k.T) * scale; scores =
 #   scores + mask` order -- the reverse order is never tried) is handled by
@@ -22702,22 +22734,32 @@ class _DecomposedGQAChain:
     :func:`_apply_one_gqa_chain` (built for a single fused node's own
     `num_heads`/`kv_num_heads` *attribute*) has no equivalent of at all.
 
-    `k_headsplit_transpose` is ``None`` exactly when K's own dot-product
-    transpose is the single pre-composed ``perm=[0,2,3,1])`` shape (see this
-    module's own section comment above) -- there is then no separate
-    head-split `Transpose` node to track for stale-`value_info` purposes
-    beyond `k_transpose` itself. `k_repeat_kv`/`v_repeat_kv` are
-    independently ``None``/set (both always agree on `kv_num_heads`, already
-    enforced at match time, but are two distinct matched node groups on two
-    distinct branches).
+    `k_headsplit_transpose` is ``None`` in either of two cases: K's own
+    dot-product transpose is the single pre-composed ``perm=[0,2,3,1])``
+    shape (see this module's own section comment above) -- there is then no
+    separate head-split `Transpose` node to track for stale-`value_info`
+    purposes beyond `k_transpose` itself -- OR `qk_matmul` is a literal
+    `Einsum` node (see this module's own section comment above), which has
+    no dot-product transpose of any kind at all; `k_transpose` there names
+    K's own (sole) head-split `Transpose` directly, the same repurposing
+    the pre-composed-``perm`` case above already does. `k_repeat_kv`/
+    `v_repeat_kv` are independently ``None``/set (both always agree on
+    `kv_num_heads`, already enforced at match time, but are two distinct
+    matched node groups on two distinct branches).
 
     `mask_node`/`mask_idx` are both ``None`` when no additive mask was
     matched; otherwise `mask_idx` is the index within `mask_node.input` of
     the mask operand itself (the *other* index resolves back toward the
-    QK^T `MatMul`) -- the exact `(node, idx)` shape
+    QK^T product) -- the exact `(node, idx)` shape
     :func:`_slice_or_gather_head_bias` already expects. `scale_node` is
     ``None`` when no scale hop was matched; never itself touched either way
-    (see this module's own section comment above).
+    (see this module's own section comment above). `qk_matmul`/`av_matmul`
+    are each either a plain `MatMul` node or an equation-validated `Einsum`
+    one (see this module's own section comment above,
+    :func:`_einsum_equation_is_batched_matmul`) -- indistinguishable from
+    this point on, since every remaining use of either field (below, and in
+    :func:`_apply_one_decomposed_gqa_chain`) only ever reads `.input`/
+    `.output`, never `.op_type`.
     """
 
     q_weight: str
@@ -23125,6 +23167,142 @@ def _match_decomposed_packed_qkv_producer(
     return resolved + (reshape, reshape.input[1])
 
 
+def _einsum_equation_attr(node: onnx.NodeProto) -> Optional[str]:
+    """Returns an ``Einsum`` node's own required ``equation`` string
+    attribute, or ``None`` if absent/mistyped -- never raises. Values are
+    ASCII-safe by the ONNX schema's own documented alphabet (lower-case
+    letters, comma, ``->``, space -- see ``onnx.defs.get_schema("Einsum")``'s
+    own doc string), so plain ``.decode("ascii")`` with a permissive
+    fallback is enough; anything that fails to decode cleanly is treated
+    the same as absent (declined by the caller, never guessed at).
+    """
+    for attr in node.attribute:
+        if attr.name == "equation" and attr.type == onnx.AttributeProto.STRING:
+            try:
+                return attr.s.decode("ascii")
+            except UnicodeDecodeError:
+                return None
+    return None
+
+
+def _einsum_equation_is_batched_matmul(
+    equation: str,
+    transposed_second_operand: bool,
+    first_operand_index: int = 0,
+) -> bool:
+    """Returns whether `equation` -- an ``Einsum`` node's own ``equation``
+    attribute -- is PROVABLY equivalent to a batched matrix multiplication
+    of its own two operands, contracting exactly one shared axis, with
+    every other axis (zero or more shared leading "batch" axes, plus
+    exactly one "free" axis of its own per operand) passed straight
+    through, unchanged in position, from operand to output. Declines
+    (returns ``False``, never guesses) on anything not provably exactly
+    that shape.
+
+    This is the equation-string half of recognizing a plain
+    ``torch.einsum``/``tf.einsum`` call as either the QK^T product or the
+    AV product a decomposed attention export can use in place of a plain
+    ``MatMul`` for either -- see this module's own "Decomposed (un-fused)
+    attention head pruning" section comment for the full empirical
+    background (the exact equation strings a real ``torch.onnx.export``
+    was confirmed, via this module's own test suite, to emit for each).
+    Everything else about either chain (Q's/K's/V's own producer weights,
+    the ``Reshape``/``Transpose``/``repeat_kv`` shape-plumbing around them,
+    the mask/scale/consumer checks) is untouched by which of ``MatMul``/
+    ``Einsum`` produced the product -- this function only ever answers
+    "is this equation ALSO just a batched matmul", nothing more.
+
+    Two operand terms are compared positionally: `first_operand_index`
+    (0 or 1) selects which of the node's own two ``input`` slots must play
+    the role whose own contracted axis is ALWAYS its own LAST label (Q's
+    role for the QK^T product, always index 0 there since the existing
+    ``MatMul`` path already assumes that fixed order unconditionally;
+    attention-weights' role for the AV product, whichever index
+    ``Softmax``'s own output actually landed in -- callers already resolve
+    that the identical way for a plain ``MatMul`` AV node, since ``MatMul``
+    is exactly as order-flexible here). `transposed_second_operand`
+    selects which of the two batched-matmul shapes the OTHER operand
+    (`1 - first_operand_index`) must be: ``True`` requires its own
+    contracted axis to be its own LAST label too -- the "Q @ K^T" shape,
+    e.g. ``"bhid,bhjd->bhij"`` (PyTorch's own confirmed literal equation
+    for a ``torch.einsum``-written QK^T score: `d`, Q's own `head_size`, is
+    the last label of BOTH operands' own terms -- matching the fact that
+    neither Q's nor K's own raw per-head tensor is transposed before
+    feeding this node, unlike the plain ``MatMul`` shape this module
+    already matches elsewhere, which needs an explicit ``Transpose`` first
+    specifically because ``MatMul`` has no way to contract a non-last axis
+    of its own second operand). ``False`` requires the other operand's own
+    contracted axis to be its own SECOND-TO-LAST label instead -- the
+    plain "A @ B" shape, e.g. ``"bhij,bhjd->bhid"`` (the confirmed literal
+    AV-product equation: `j`, the shared `seq_k`/key-sequence axis, is the
+    first operand's own last label but the second operand's own
+    second-to-last one -- exactly V's own natural ``[..., seq_k,
+    head_size]`` layout, no transpose needed either).
+
+    Declines on any of (see this function's own unit tests for a concrete
+    case of each): no explicit ``"->"`` (an implicit-output-order
+    equation -- well-defined by the ONNX spec even without one, but this
+    function does not attempt that inference); anything other than
+    exactly two comma-separated operand terms; an ellipsis (``"..."``)
+    anywhere; any character besides an ASCII lower-case letter/comma/
+    arrow/space (the ONNX schema's own documented alphabet); the two
+    operand terms' own rank (label count) disagreeing with each other or
+    with the output term's, or not being 3 or 4 (this module only ever
+    matches batch-plus-head-merged 3-D or BHSD 4-D attention tensors); a
+    repeated label within either operand's own term (a diagonal
+    extraction plain ``MatMul`` semantics can't express) or within the
+    output term; the two operands' own leading (batch) labels disagreeing
+    in identity or order, or not reproduced unchanged as the output's own
+    leading labels; either operand's own free axis colliding with the
+    other operand's own labels (an accidental alias, not a genuine
+    per-operand free axis); the contracted label reappearing in the
+    output at all (would mean it isn't actually contracted -- zero
+    contracted axes is an elementwise/broadcast product, plain ``MatMul``
+    semantics can't express that either); or the output's own last two
+    labels not being exactly (first operand's own free label, second
+    operand's own free label) in that order.
+    """
+    eq = equation.replace(" ", "")
+    if "..." in eq or "->" not in eq:
+        return False
+    lhs, _, rhs = eq.partition("->")
+    if "->" in rhs:
+        return False  # more than one "->" -- not a well-formed equation
+    terms = lhs.split(",")
+    if len(terms) != 2:
+        return False
+    t1, t2 = terms
+    if first_operand_index == 1:
+        t1, t2 = t2, t1
+    if not t1 or not t2 or not rhs:
+        return False
+    for term in (t1, t2, rhs):
+        if not all("a" <= ch <= "z" for ch in term):
+            return False
+
+    rank = len(t1)
+    if rank not in (3, 4) or len(t2) != rank or len(rhs) != rank:
+        return False
+    if len(set(t1)) != rank or len(set(t2)) != rank or len(set(rhs)) != rank:
+        return False  # a repeated label within one term -- diagonal, not matmul
+
+    batch = t1[:-2]
+    if t2[:-2] != batch or rhs[:-2] != batch:
+        return False  # batch axes must pass through unchanged, same order
+
+    free1, c1 = t1[-2], t1[-1]
+    if transposed_second_operand:
+        free2, c2 = t2[-2], t2[-1]
+    else:
+        c2, free2 = t2[-2], t2[-1]
+
+    if c1 != c2 or free1 == free2:
+        return False
+    if free1 in t2 or free2 in t1 or c1 in rhs:
+        return False  # contracted label must vanish; free axes must be unique
+    return rhs[-2:] == free1 + free2
+
+
 def _resolve_decomposed_qk_root(
     smax_input: str,
     consumers_of: Dict[str, List[onnx.NodeProto]],
@@ -23219,11 +23397,35 @@ def _resolve_decomposed_qk_root(
     qk_matmul = node_by_output.get(cur)
     if (
         qk_matmul is None
-        or qk_matmul.op_type != "MatMul"
         or qk_matmul.domain != ""
         or len(qk_matmul.input) != 2
         or qk_matmul.output[0] != cur
     ):
+        return None
+    if qk_matmul.op_type == "Einsum":
+        # A literal `Einsum` node is accepted here in place of `MatMul`
+        # ONLY when its own `equation` is provably equivalent to the
+        # identical Q @ K^T batched matmul this function's own `MatMul`
+        # branch already recognizes -- see
+        # :func:`_einsum_equation_is_batched_matmul`'s own docstring for
+        # the exact equivalence this checks and this module's own section
+        # comment for the empirically-confirmed real equation strings
+        # (e.g. `"bhid,bhjd->bhij"`) this closes a real gap for: a plain
+        # `torch.einsum`-written attention block (common in `x-transformers`/
+        # `vit-pytorch`/`performer-pytorch`-style reimplementations, and
+        # `tf2onnx`-exported `tf.einsum` code) never emits the `MatMul`
+        # this module otherwise requires here at all. Q is always input[0]
+        # here (`first_operand_index=0`, the default) -- the same fixed
+        # order this function's own caller already assumes unconditionally
+        # for the `MatMul` case (`q_bhsd_name, k_operand =
+        # qk_matmul.input`, no order-flexibility check at all there
+        # either).
+        equation = _einsum_equation_attr(qk_matmul)
+        if equation is None or not _einsum_equation_is_batched_matmul(
+            equation, transposed_second_operand=True
+        ):
+            return None
+    elif qk_matmul.op_type != "MatMul":
         return None
     return qk_matmul, mask_node, mask_operand, scale_node
 
@@ -23286,42 +23488,25 @@ def _find_decomposed_gqa_chains(
         if not _is_internal(q_bhsd_name) or not _is_internal(k_operand):
             continue
 
-        # ---- K's own dot-product transpose: combined or separate form ----
-        k_transpose = node_by_output.get(k_operand)
-        if (
-            k_transpose is None
-            or k_transpose.domain != ""
-            or k_transpose.op_type != "Transpose"
-        ):
-            continue
-        k_perm: Optional[List[int]] = None
-        for attr in k_transpose.attribute:
-            if attr.name == "perm":
-                k_perm = list(attr.ints)
-
+        # ---- K's own dot-product transpose: combined or separate form
+        # (`MatMul` only) -- or, for `Einsum`, no separate dot-product
+        # transpose at all ----
+        k_transpose: Optional[onnx.NodeProto]
         k_headsplit_transpose: Optional[onnx.NodeProto]
         k_repeat_kv: Optional[_RepeatKVBranch] = None
-        if k_perm == [0, 2, 3, 1]:
-            k_split = _match_decomposed_head_split(
-                k_operand,
-                consumers_of,
-                graph_outputs,
-                node_by_output,
-                initializer_map,
-                (0, 2, 3, 1),
-            )
-            if k_split is None:
-                continue
-            _, k_reshape, kv_num_heads, head_size_k, k_reshape_shape, k_proj_out = (
-                k_split
-            )
-            k_headsplit_transpose = None
-        elif k_perm == [0, 1, 3, 2]:
-            k_bhsd_name = k_transpose.input[0] if len(k_transpose.input) == 1 else None
-            if not k_bhsd_name or not _is_internal(k_bhsd_name):
-                continue
+        if qk_matmul.op_type == "Einsum":
+            # An `Einsum` QK^T product's own `equation` (already confirmed
+            # batched-matmul-equivalent by :func:`_resolve_decomposed_qk_root`)
+            # contracts K's own natural `[..., seq_k, head_size]` layout
+            # directly -- that's the entire reason a real export uses
+            # `Einsum` here instead of `MatMul` in the first place, see
+            # this module's own section comment above. So `k_operand` is
+            # resolved exactly like `q_bhsd_name` is below: optional
+            # `repeat_kv`, then a plain head-split -- never either of the
+            # `MatMul`-only combined-perm/separate-perm dot-product-
+            # transpose cases just below.
             repeat = _match_decomposed_repeat_kv(
-                k_bhsd_name,
+                k_operand,
                 consumers_of,
                 graph_outputs,
                 node_by_output,
@@ -23332,10 +23517,7 @@ def _find_decomposed_gqa_chains(
                 if not _is_internal(k_raw_name):
                     continue
             else:
-                k_raw_name, kv_num_heads = (
-                    k_bhsd_name,
-                    None,
-                )  # resolved via head-split below
+                k_raw_name, kv_num_heads = k_operand, None
             k_split = _match_decomposed_head_split(
                 k_raw_name,
                 consumers_of,
@@ -23347,7 +23529,7 @@ def _find_decomposed_gqa_chains(
             if k_split is None:
                 continue
             (
-                k_headsplit_transpose,
+                k_transpose,
                 k_reshape,
                 resolved_kv_heads,
                 head_size_k,
@@ -23358,8 +23540,81 @@ def _find_decomposed_gqa_chains(
                 kv_num_heads = resolved_kv_heads
             elif kv_num_heads != resolved_kv_heads:
                 continue
+            k_headsplit_transpose = None
         else:
-            continue
+            k_transpose = node_by_output.get(k_operand)
+            if (
+                k_transpose is None
+                or k_transpose.domain != ""
+                or k_transpose.op_type != "Transpose"
+            ):
+                continue
+            k_perm: Optional[List[int]] = None
+            for attr in k_transpose.attribute:
+                if attr.name == "perm":
+                    k_perm = list(attr.ints)
+
+            if k_perm == [0, 2, 3, 1]:
+                k_split = _match_decomposed_head_split(
+                    k_operand,
+                    consumers_of,
+                    graph_outputs,
+                    node_by_output,
+                    initializer_map,
+                    (0, 2, 3, 1),
+                )
+                if k_split is None:
+                    continue
+                _, k_reshape, kv_num_heads, head_size_k, k_reshape_shape, k_proj_out = (
+                    k_split
+                )
+                k_headsplit_transpose = None
+            elif k_perm == [0, 1, 3, 2]:
+                k_bhsd_name = (
+                    k_transpose.input[0] if len(k_transpose.input) == 1 else None
+                )
+                if not k_bhsd_name or not _is_internal(k_bhsd_name):
+                    continue
+                repeat = _match_decomposed_repeat_kv(
+                    k_bhsd_name,
+                    consumers_of,
+                    graph_outputs,
+                    node_by_output,
+                    initializer_map,
+                )
+                if repeat is not None:
+                    k_repeat_kv, k_raw_name, kv_num_heads, _n_rep = repeat
+                    if not _is_internal(k_raw_name):
+                        continue
+                else:
+                    k_raw_name, kv_num_heads = (
+                        k_bhsd_name,
+                        None,
+                    )  # resolved via head-split below
+                k_split = _match_decomposed_head_split(
+                    k_raw_name,
+                    consumers_of,
+                    graph_outputs,
+                    node_by_output,
+                    initializer_map,
+                    (0, 2, 1, 3),
+                )
+                if k_split is None:
+                    continue
+                (
+                    k_headsplit_transpose,
+                    k_reshape,
+                    resolved_kv_heads,
+                    head_size_k,
+                    k_reshape_shape,
+                    k_proj_out,
+                ) = k_split
+                if kv_num_heads is None:
+                    kv_num_heads = resolved_kv_heads
+                elif kv_num_heads != resolved_kv_heads:
+                    continue
+            else:
+                continue
         # Always a definite int by this point -- either unpacked directly
         # from `k_split` (the combined-perm branch), from `repeat` (the
         # repeat_kv branch), or resolved from `resolved_kv_heads` just above
@@ -23389,19 +23644,39 @@ def _find_decomposed_gqa_chains(
         if num_heads % kv_num_heads != 0:
             continue
 
-        # ---- forward: AV MatMul, output Transpose, combine-back Reshape ----
+        # ---- forward: AV MatMul/Einsum, output Transpose, combine-back
+        # Reshape ----
         av_matmul = consumers_of[smax_out][0]
         if (
-            av_matmul.op_type != "MatMul"
-            or av_matmul.domain != ""
+            av_matmul.domain != ""
             or len(av_matmul.input) != 2
             or smax_out not in av_matmul.input
             or len(av_matmul.output) != 1
         ):
             continue
-        v_bhsd_name = (
-            av_matmul.input[1] if av_matmul.input[0] == smax_out else av_matmul.input[0]
-        )
+        attn_is_first = av_matmul.input[0] == smax_out
+        if av_matmul.op_type == "Einsum":
+            # Symmetric to the QK^T `Einsum` case above (see
+            # :func:`_resolve_decomposed_qk_root`'s own comment) -- a real
+            # `torch.einsum`-written AV product (e.g.
+            # `"bhij,bhjd->bhid"`, confirmed empirically) never emits a
+            # `MatMul` either, so this closes the identical gap for the
+            # second product. Unlike the QK^T case, the attention-weights
+            # operand (`smax_out`) may legitimately land in EITHER input
+            # slot -- exactly as flexibly as the `MatMul` case just below
+            # already handles via `attn_is_first` -- so
+            # `first_operand_index` is passed through accordingly rather
+            # than assumed to be 0.
+            equation = _einsum_equation_attr(av_matmul)
+            if equation is None or not _einsum_equation_is_batched_matmul(
+                equation,
+                transposed_second_operand=False,
+                first_operand_index=0 if attn_is_first else 1,
+            ):
+                continue
+        elif av_matmul.op_type != "MatMul":
+            continue
+        v_bhsd_name = av_matmul.input[1] if attn_is_first else av_matmul.input[0]
         if v_bhsd_name == smax_out or not _is_internal(v_bhsd_name):
             continue
         av_out = av_matmul.output[0]
