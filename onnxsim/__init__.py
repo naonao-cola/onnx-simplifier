@@ -60,6 +60,7 @@ from onnxsim.kmeans_quantization import quantize_weight_only_kmeans
 from onnxsim.kv_cache_quantization import quantize_kv_cache
 from onnxsim.llm_fp4 import FP4_FORMATS, quantize_weight_only_llm_fp4
 from onnxsim.llm_int8 import apply_llm_int8
+from onnxsim.lo_bcq import quantize_weight_only_lo_bcq
 from onnxsim.low_rank_compensation import apply_low_rank_compensation
 from onnxsim.memory_planning import (
     MemoryPlan,
@@ -286,6 +287,7 @@ __all__ = [
     "quantize_weight_only_pb_llm",
     "quantize_weight_only_int4_hqq",
     "quantize_weight_only_kmeans",
+    "quantize_weight_only_lo_bcq",
     "quantize_weight_only_nf4",
     "NF4_CODEBOOK",
     "quantize_weight_only_mxfp4",
