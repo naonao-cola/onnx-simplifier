@@ -129,15 +129,18 @@ onnx::ModelProto ApplyDoubleQuantization(const onnx::ModelProto& model) {
       model, std::vector<std::string>{"double_quantization"});
 }
 
-onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed) {
+onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
+                             int64_t block_size, float epsilon) {
   PrepareSchemasForDebug(model);
   // Registers quarot (idempotent) into onnxoptimizer's registry so
   // OptimizeFixed can find it by name below.
   onnxsim::RegisterCustomOptimizerPasses();
-  // quarot reads this the same way quantize_fp16 reads
+  // quarot reads these the same way quantize_fp16 reads
   // QuantizeFp16KeepIoTypes() -- OptimizeFixed's pass-name list has no way
   // to carry a parameter directly.
   onnx::optimization::onnxsim_passes::QuarotSeed() = seed;
+  onnx::optimization::onnxsim_passes::QuarotBlockSize() = block_size;
+  onnx::optimization::onnxsim_passes::QuarotEpsilon() = epsilon;
   return onnx::optimization::OptimizeFixed(model,
                                            std::vector<std::string>{"quarot"});
 }

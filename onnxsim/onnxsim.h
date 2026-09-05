@@ -529,10 +529,16 @@ onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity);
 // any other simplification pass -- it applies exactly this rewrite, to every
 // matching layer, to a copy of ``model`` (which is left untouched) and
 // returns the result. A layer with a non-constant, non-2-D weight, or a
-// reduction dimension not divisible by 32, is left untouched; a model with
-// no matching layer, or an opset older than 21, is returned unchanged.
-// ``seed`` derives a fresh, deterministic random rotation per matched layer.
-onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed);
+// reduction dimension not divisible by ``block_size``, is left untouched; a
+// model with no matching layer, or an opset older than 21, is returned
+// unchanged. ``seed`` derives a fresh, deterministic random rotation per
+// matched layer. ``block_size`` is the number of reduction-dimension (K)
+// elements sharing one weight quantization scale, matching
+// ``quantize_weight_only_int4``'s own default. ``epsilon`` floors a token's
+// own max-abs rotated-activation value before it is used as a quantization
+// scale, avoiding a divide-by-zero on an all-zero token.
+onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
+                             int64_t block_size, float epsilon);
 
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller
