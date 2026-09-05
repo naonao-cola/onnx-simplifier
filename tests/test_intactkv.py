@@ -82,7 +82,9 @@ def test_intactkv_splits_stream_into_pivot_and_rest():
     assert pivot_in.type.tensor_type.shape.dim[2].dim_value == 4
 
     op_types = [n.op_type for n in m.graph.node]
-    assert op_types.count("Identity") == 1
+    # One Identity is the toy model's own new_key = Identity(new_key_raw);
+    # the other is apply_intactkv's own pivot passthrough.
+    assert op_types.count("Identity") == 2
     assert op_types.count("Concat") == 2  # rest stream + reconstruction
 
     reconstruct = next(
