@@ -411,6 +411,98 @@ above only inferred generically:
   distinct, entirely unimplemented `AxQuantizedGemm` op. Confirms the
   blog's suspicion with a precise, reproducible mechanism.
 
+### Differential analysis: how elementwise ops and Conv bias get encoded
+
+The dig above characterizes one model's compiled output; this pushes
+further with **differential analysis** -- compiling many near-identical
+graphs and byte-diffing the results to locate exactly where a specific,
+controlled value ends up. Test graph throughout: `Add`/`Sub`/`Mul`/`Div`
+between a `float[1,4]` input and a uniform-broadcast constant, or a `Conv`
+with a bias term -- varying only the constant/bias value between builds.
+
+**A "trivial" fast-path exists for small uniform constants, scale=1,
+zero_point=0, storing the constant's own integer value as a raw byte** --
+but confirmed real by testing across all four ops, **the trivial *set*
+is op-specific, not a shared threshold**:
+
+- `Add`: exactly the uniform values `{0, 1, 2}` are trivial; `3` and up,
+  any negative value, and any non-integer are not.
+- `Sub`: only `{0, 1}` -- `Sub(x, 2.0)` is *not* trivial, unlike
+  `Add(x, 2.0)`. Not simply "`Sub(x, c)` lowers to `Add(x, -c)`" either:
+  that would predict `Sub(x, 1.0)` (i.e. `Add(x, -1.0)`) to behave like
+  `Add`'s confirmed-non-trivial negative case, but it doesn't -- it's
+  trivial, storing `01 01 01 01` same as `Add(x, 1.0)`.
+  `Mul`: every uniform value tried (`0`, `2`, `3`) was trivial -- no
+  "rich" encoding observed for `Mul` at all.
+- `Div`: triviality depends on **the constant's reciprocal**, not the
+  constant itself -- `Div(x, 0.5)` (reciprocal `2.0`) is trivial, storing
+  `02 02 02 02`, while `Div(x, 2.0)` and `Div(x, 3.0)` (reciprocals `0.5`,
+  `0.333...`, non-integer) saturate every element to `0xff`. Consistent
+  with `Div(x, c)` being compiled as `Mul(x, 1/c)` internally.
+
+**Any non-integer value saturates every element to `0xff` (255)**,
+regardless of magnitude -- confirmed across `Add`/`Sub`/`Div`'s non-integer
+cases (`0.5`, `3.14159`, and `Div`'s non-integer effective reciprocals).
+It's specifically about exact integer-valuedness of whatever value is
+actually being quantized (the reciprocal, for `Div`) -- not "small enough."
+
+**A uniform broadcast is required for the trivial path, even when every
+individual element already qualifies**: `Add` with the mixed constant
+`[1, 1, 2, 2]` (every element in the "trivial" set `{0,1,2}`) still gets
+the non-trivial encoding, because the *tensor* isn't a uniform single-value
+broadcast. Mixed constants still store their exact literal integer values
+per element in the non-trivial path (`[1,2,3,4]` -> `01 02 03 04`), so
+"non-trivial" doesn't mean "imprecise" -- it means "not the degenerate
+single-value fast path."
+
+**Confirmed real, reproducible compiler bug**: `Mul(x, 1.0)` and
+`Div(x, 1.0)` both crash a real `pulsar2 build` with the identical
+`NotImplementedError: Seems config of input(y) doesn't exist`. Multiplying
+or dividing by the identity constant appears to get eliminated by
+Pulsar2's own frontend graph optimizer (`x*1=x`, `x/1=x`) before
+quantization runs, leaving the declared graph output with no producing
+node. `tests/test_axera_neu_format_arith_ops.py::
+test_mul_and_div_by_one_crash_the_real_build` locks this in.
+
+**`Div(x, 0.0)` doesn't error -- it stores literal IEEE-754 `+Infinity`**:
+`00 00 80 7f` (float32 `+inf`) repeated once per element, a third,
+distinct byte-length class from the other two, and the only case found
+where this field holds genuine float32 data instead of an integer code --
+a sensible fallback once the "true" quantized value is undefined.
+
+**A field that resists decoding, isolated but not solved**: `Add`/`Sub`'s
+non-trivial encoding appends 4 extra bytes past the per-element values.
+Ten-plus decodings were tried and rejected (float32, uint32, a `bf16`
+pair, an `fp16` pair, `xxhash32`/`xxhash64` of several byte encodings of
+the constant, a hand-computed asymmetric output-quantization scale/
+zero-point from the real calibration data) -- none matched. What *is*
+confirmed: holding the constant fixed (`c=99`) and varying only the
+input's calibration scale (x1, x100, x0.01) changed these bytes
+completely while the constant's own quantized bytes stayed identical --
+so the field depends on the input/output's calibration range, not the
+constant alone. The two 16-bit halves are also mathematically coupled:
+treating them as `(pair1, pair2)`, `pair2 * scale_y ≈ pair1` held to
+within rounding across all three calibration scales, where `scale_y` is
+the real `(max-min)/255` output range independently computed from the
+actual calibration samples used. A real, non-arbitrary (value,
+value-expressed-in-quantization-units) pair -- just one whose absolute
+unit/format wasn't identified.
+
+**`Conv`'s bias term, by contrast, decodes cleanly**: byte-diffing five
+otherwise-identical `Conv` builds that differ only in bias value locates
+the bias-dependent region precisely, and it holds two 4-element
+(one per output channel) plain `float32` arrays -- not further-obfuscated
+integer codes. One array is small (~0.0026-0.0037) and shrinks
+monotonically as the bias value grows, consistent with a per-channel
+requantization multiplier `M_channel = input_scale * weight_scale_channel
+/ output_scale` (a larger bias widens the calibrated output range, so
+`output_scale` grows and `M_channel` shrinks) -- exactly the standard
+quantized-conv parameterization real edge-inference runtimes use. The
+other array (larger magnitude, ~-159 to 242) plausibly holds a quantized
+bias term but wasn't independently re-derived from scratch. Real,
+recognizable structure here, in clear contrast to `Add`/`Sub`'s still-
+opaque field above.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
