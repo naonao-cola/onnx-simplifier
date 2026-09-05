@@ -16,6 +16,29 @@ chain families it also matches -- this Wanda port has no quantized-weight
 counterpart, mirroring the pure-Python ``onnxsim.apply_structured_wanda_pruning``
 exactly (see ``structured_pruning_entry.h``'s own ``ApplyStructuredWandaPruning``
 declaration comment).
+
+NOT an alias for the pure-Python ``onnxsim.apply_structured_wanda_pruning``,
+despite matching it exactly on every ordinary MatMul/Conv/gated/residual/
+Concat-branch/split-gated case this file's own tests below cover, plus
+``importance_norm``/``global_sparsity`` (see this file's own coverage of
+both): two confirmed, real scope gaps were found running the FULL
+``tests/test_pruning.py`` suite through this port (not merely this file's
+own hand-picked cases) --
+(1) this port's own ``FindConvChains``/``MatchConvProducer`` only ever
+matches a plain ``Conv`` node (``node.op_type() != "Conv"`` outright
+declines), never ``ConvTranspose``, while the pure-Python
+``_match_conv_producer``/``_match_conv_transpose_producer`` matches both;
+and
+(2) a ``Concat``-merged branch feeding a *grouped* Conv consumer, combined
+with a real calibrated (Wanda) activation norm, produces a different keep
+set than the pure-Python reference (``test_structured_wanda_pruning_conv_
+concat_admits_block_aligned_grouped_conv_consumer`` in ``test_pruning.py``
+fails against this port).
+Both are pre-existing, narrower-than-Python C++-port scope decisions (not
+introduced by this round's ``importance_norm``/``global_sparsity`` work),
+so ``onnxsim.apply_structured_wanda_pruning`` stays a genuine, separate
+pure-Python implementation rather than an alias -- see that function's own
+docstring for the same note.
 """
 
 import numpy as np
@@ -379,3 +402,112 @@ def test_structured_wanda_pruning_cpp_default_calibration_data_runs():
     inits = {t.name: t for t in pruned.graph.initializer}
     assert list(inits["W1"].dims) == [8, 8]
     assert list(inits["W2"].dims) == [8, 4]
+
+
+# --- importance_norm ("l1" vs "l2") and global_sparsity ---------------------
+#
+# Driven through the *empty-calibration-data* fallback path (see this file's
+# own module docstring/`test_structured_wanda_pruning_cpp_*` tests above for
+# the "no matching activation -> falls back to plain weight-only ranking"
+# behavior): isolates the *weight*-magnitude term's own L1-vs-L2 switch (and
+# global_sparsity's own pooled ranking) from the activation-norm term, while
+# still exercising the real Wanda entry point/binding end to end.
+
+
+def test_structured_wanda_pruning_cpp_importance_norm_l1_matches_python_reference_and_differs_from_l2():
+    # Same "concentrated" vs. "spread" adversarial column layout as
+    # test_structured_pruning_cpp.py's own importance_norm test.
+    K, H, Out = 16, 4, 3
+    w1 = np.zeros((K, H), dtype=np.float32)
+    w1[0, 0] = 8.0  # "concentrated"
+    w1[:, 1] = 1.0  # "spread"
+    w1[2, 2] = 1000.0  # "filler_high"
+    w1[3, 3] = 0.001  # "filler_low"
+    rng = np.random.default_rng(90)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          a = Relu(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    onnx.checker.check_model(model)
+
+    for norm in ("l2", "l1"):
+        pruned_cpp = onnxsim.apply_structured_wanda_pruning_cpp(
+            model, calibration_data=[], sparsity=0.5, importance_norm=norm
+        )
+        pruned_py = onnxsim.apply_structured_wanda_pruning(
+            model, calibration_data=[], sparsity=0.5, importance_norm=norm
+        )
+        onnx.checker.check_model(pruned_cpp)
+        assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    kept_l2 = onnxsim.apply_structured_wanda_pruning_cpp(
+        model, calibration_data=[], sparsity=0.5
+    )
+    kept_l1 = onnxsim.apply_structured_wanda_pruning_cpp(
+        model, calibration_data=[], sparsity=0.5, importance_norm="l1"
+    )
+    assert kept_l2.SerializeToString() != kept_l1.SerializeToString()
+
+
+def _two_scale_mlp_model(K=8, H=16, Out=4, big_scale=50.0, small_scale=1.0, seed=0):
+    rng = np.random.default_rng(seed)
+    w1_big = (rng.standard_normal((K, H)) * big_scale).astype(np.float32)
+    w2_big = rng.standard_normal((H, Out)).astype(np.float32)
+    w1_small = (rng.standard_normal((K, H)) * small_scale).astype(np.float32)
+    w2_small = rng.standard_normal((H, Out)).astype(np.float32)
+    return _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Ybig, float[batch,{Out}] Ysmall)
+        {{
+          hbig = MatMul(X, W1big)
+          abig = Relu(hbig)
+          Ybig = MatMul(abig, W2big)
+          hsmall = MatMul(X, W1small)
+          asmall = Relu(hsmall)
+          Ysmall = MatMul(asmall, W2small)
+        }}
+        """,
+        initializer=[
+            _f32(w1_big, "W1big"),
+            _f32(w2_big, "W2big"),
+            _f32(w1_small, "W1small"),
+            _f32(w2_small, "W2small"),
+        ],
+    )
+
+
+def test_structured_wanda_pruning_cpp_global_sparsity_matches_python_reference_and_redistributes():
+    K, H, Out = 8, 16, 4
+    sparsity = 0.5
+    model = _two_scale_mlp_model(
+        K=K, H=H, Out=Out, big_scale=50.0, small_scale=0.5, seed=7
+    )
+    onnx.checker.check_model(model)
+
+    local_cpp = onnxsim.apply_structured_wanda_pruning_cpp(
+        model, calibration_data=[], sparsity=sparsity
+    )
+    global_cpp = onnxsim.apply_structured_wanda_pruning_cpp(
+        model, calibration_data=[], sparsity=sparsity, global_sparsity=True
+    )
+    global_py = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=[], sparsity=sparsity, global_sparsity=True
+    )
+    onnx.checker.check_model(global_cpp)
+    assert global_cpp.SerializeToString() == global_py.SerializeToString()
+
+    inits_local = {t.name: t for t in local_cpp.graph.initializer}
+    inits_global = {t.name: t for t in global_cpp.graph.initializer}
+    assert inits_local["W1big"].dims[1] == H // 2
+    assert inits_local["W1small"].dims[1] == H // 2
+    big_kept = inits_global["W1big"].dims[1]
+    small_kept = inits_global["W1small"].dims[1]
+    assert big_kept > H // 2 > small_kept

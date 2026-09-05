@@ -595,3 +595,87 @@ def test_cpp_attention_head_wanda_pruning_default_calibration_data_runs():
     node = _attention_node(pruned)
     num_heads, _ = _attention_attrs(node)
     assert num_heads == 2
+
+
+# --- importance_norm ("l1" vs "l2") ------------------------------------------
+#
+# Same adversarial per-head/per-group weight blocks as
+# test_attention_head_pruning_cpp.py's own importance_norm tests, driven
+# through the *empty-calibration-data* fallback path (mirrors
+# `test_cpp_attention_head_wanda_pruning_empty_calibration_data_matches_plain`/
+# `test_cpp_gqa_wanda_pruning_empty_calibration_data_matches_plain` above):
+# with no observed activation, `_wanda_attention_head_importance`/
+# `_wanda_gqa_group_importance` fall straight back to the plain
+# `||W||`-only ranking, so this isolates the *weight*-magnitude term's own
+# L1-vs-L2 switch from the (always-L2) activation-norm term -- while still
+# exercising the real Wanda entry point/binding end to end, not just the
+# plain one.
+
+
+def test_cpp_attention_head_wanda_pruning_importance_norm_l1_matches_python_reference_and_differs_from_l2():
+    K, H, D, Out = 16, 4, 4, 3
+    Nq = Nk = Nv = H * D
+    rng_qk = np.random.default_rng(52)
+    wqkv = np.zeros((K, Nq + Nk + Nv), dtype=np.float32)
+    wqkv[:, :Nq] = rng_qk.standard_normal((K, Nq)).astype(np.float32) * 0.01
+    wqkv[:, Nq : Nq + Nk] = rng_qk.standard_normal((K, Nk)).astype(np.float32) * 0.01
+    v_offset = Nq + Nk
+    wqkv[0, v_offset + 0] = 16.0  # head 0 ("concentrated")
+    wqkv[:, v_offset + D : v_offset + 2 * D] = 1.0  # head 1 ("spread")
+    wqkv[2, v_offset + 2 * D] = 1000.0  # head 2 ("filler_high")
+    wqkv[3, v_offset + 3 * D] = 0.001  # head 3 ("filler_low")
+    bqkv = np.zeros((Nq + Nk + Nv,), dtype=np.float32)
+
+    model, _cfg = _attention_model(
+        K=K, H=H, D=D, Out=Out, seed=50, bias=True, wqkv=wqkv, bqkv=bqkv
+    )
+
+    for norm in ("l2", "l1"):
+        pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+            model, calibration_data=[], sparsity=0.5, importance_norm=norm
+        )
+        pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+            model, calibration_data=[], sparsity=0.5, importance_norm=norm
+        )
+        onnx.checker.check_model(pruned_cpp)
+        assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    kept_l2 = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=[], sparsity=0.5
+    )
+    kept_l1 = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=[], sparsity=0.5, importance_norm="l1"
+    )
+    assert kept_l2.SerializeToString() != kept_l1.SerializeToString()
+
+
+def test_cpp_gqa_wanda_pruning_importance_norm_l1_matches_python_reference_and_differs_from_l2():
+    K, H, KVH, D, Out = 8, 4, 2, 8, 3
+    Nq, Nkv = H * D, KVH * D
+    wq = np.zeros((K, Nq), dtype=np.float32)
+    wk = np.zeros((K, Nkv), dtype=np.float32)
+    wv = np.zeros((K, Nkv), dtype=np.float32)
+    wv[0, 0] = 16.0  # KV group 0's own V slice -- concentrated
+    wv[:, D : 2 * D] = 1.0  # KV group 1's own V slice -- spread
+
+    model, _cfg = _gqa_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=60, wq=wq, wk=wk, wv=wv
+    )
+
+    for norm in ("l2", "l1"):
+        pruned_cpp = onnxsim.apply_attention_head_wanda_pruning_cpp(
+            model, calibration_data=[], sparsity=0.5, importance_norm=norm
+        )
+        pruned_py = onnxsim.apply_attention_head_wanda_pruning(
+            model, calibration_data=[], sparsity=0.5, importance_norm=norm
+        )
+        onnx.checker.check_model(pruned_cpp)
+        assert pruned_cpp.SerializeToString() == pruned_py.SerializeToString()
+
+    kept_l2 = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=[], sparsity=0.5
+    )
+    kept_l1 = onnxsim.apply_attention_head_wanda_pruning_cpp(
+        model, calibration_data=[], sparsity=0.5, importance_norm="l1"
+    )
+    assert kept_l2.SerializeToString() != kept_l1.SerializeToString()
