@@ -36,6 +36,10 @@ def _weight(shape, name):
     return numpy_helper.from_array(np.zeros(shape, np.float32), name)
 
 
+def _int64(values, name):
+    return numpy_helper.from_array(np.array(values, dtype=np.int64), name)
+
+
 def _metadata(proto):
     return {entry.key: entry.value for entry in proto.metadata_props}
 
@@ -95,6 +99,62 @@ def test_in_place_aliasing_collapses_whole_chain():
     off = plan.tensor_offsets
     assert off["x"][0] != off["a"][0]
     assert off["a"] == off["b"] == off["c"] == off["d"] == off["out"]
+
+
+def test_view_ops_alias_whole_chain():
+    # A chain of pure view ops -- Reshape -> Squeeze -> Unsqueeze -> Flatten
+    # -- reinterprets the same 100 bytes under a different shape at every
+    # step with no computation at all, so they union into one group exactly
+    # like an in-place-safe unary chain; x (a graph input) stays separate.
+    # See memory_planning_test.cpp's TestViewOpsAliasWholeChain.
+    body = """
+    g (float[25] x) => (float[25] out)
+    {
+      a = Reshape(x, s)
+      b = Squeeze(a, axes0)
+      c = Unsqueeze(b, axes0)
+      out = Flatten(c)
+    }
+    """
+    model = _model(
+        body,
+        [_int64([1, 25], "s"), _int64([0], "axes0")],
+    )
+    plan = plan_activation_memory(model)
+
+    assert plan.unplanned == []
+    assert plan.naive_bytes == 500  # 5 tensors x 100 bytes (x, a, b, c, out)
+    assert plan.arena_bytes == 200  # x's slot + one shared slot
+
+    off = plan.tensor_offsets
+    assert off["x"][0] != off["a"][0]
+    assert off["a"] == off["b"] == off["c"] == off["out"]
+
+
+def test_view_and_in_place_ops_share_one_group():
+    # View ops and in-place-safe compute ops freely mix in the same group:
+    # x -> Reshape -> a -> Relu -> b -> Flatten -> out. x (a graph input)
+    # stays separate; a, b and out end up in one group despite two
+    # different op categories producing the edges between them. See
+    # memory_planning_test.cpp's TestViewAndInPlaceOpsShareOneGroup.
+    body = """
+    g (float[25] x) => (float[25] out)
+    {
+      a = Reshape(x, s)
+      b = Relu(a)
+      out = Flatten(b)
+    }
+    """
+    model = _model(body, [_int64([25], "s")])
+    plan = plan_activation_memory(model)
+
+    assert plan.unplanned == []
+    assert plan.naive_bytes == 400  # 4 tensors x 100 bytes
+    assert plan.arena_bytes == 200  # x's slot + one shared slot
+
+    off = plan.tensor_offsets
+    assert off["x"][0] != off["a"][0]
+    assert off["a"] == off["b"] == off["out"]
 
 
 def test_in_place_aliasing_blocked_by_multiple_consumers():
