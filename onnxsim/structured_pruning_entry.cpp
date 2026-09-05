@@ -23487,8 +23487,7 @@ std::vector<double> WandaImportance(const std::vector<double>& w_nk,
 // --- Conv im2col-unfolded activation statistics (Wanda only) ------------
 //
 // C++ mirror of pruning.py's own "Conv im2col-unfolded activation
-// statistics (Wanda only)" section -- `_ConvSpatialAttrs`/
-// `_conv_spatial_attrs`/`_resolve_conv_pads`/`_conv_patch_sq_sum`/
+// statistics (Wanda only)" section -- `_conv_patch_sq_sum`/
 // `_conv_group_relative_norm` -- the one piece of genuinely new machinery
 // this port needed to close the "2-D Conv" gap noted in this file's own
 // declaration comment history: Wanda's ``X_j`` for a Conv column is not
@@ -23496,129 +23495,12 @@ std::vector<double> WandaImportance(const std::vector<double>& w_nk,
 // `j`" -- one `(in_channel, kh, kw)` tap of the sliding kernel -- so its
 // activation statistic is the norm of the *im2col-unfolded* input patch
 // value at that specific offset, over every output spatial position and
-// calibration sample.
-
-// Mirrors pruning.py's own `_ConvSpatialAttrs` dataclass exactly, including
-// its defaults (unit dilation, "NOTSET" auto_pad).
-struct ConvSpatialAttrs {
-  int64_t kh = 0;
-  int64_t kw = 0;
-  int64_t pad_top = 0;
-  int64_t pad_left = 0;
-  int64_t pad_bottom = 0;
-  int64_t pad_right = 0;
-  int64_t stride_h = 1;
-  int64_t stride_w = 1;
-  int64_t dilation_h = 1;
-  int64_t dilation_w = 1;
-  std::string auto_pad = "NOTSET";
-};
-
-// Mirrors pruning.py's own `_conv_spatial_attrs` exactly: extracts the
-// padding/stride/dilation `ConvPatchSqSum` needs from `node`'s own
-// attributes, cross-checked against `w_init`'s own `kh`/`kw` (dims 2/3).
-// Declines (`std::nullopt`, "fall back to plain magnitude" per this
-// function's own caller) on a `kernel_shape` disagreeing with `w_init`'s
-// own shape, an unrecognized `auto_pad`, or a malformed/negative
-// `pads`/non-positive `strides`/`dilations` -- the same "don't guess at a
-// malformed node" bar every other check in this file holds to.
-std::optional<ConvSpatialAttrs> ResolveConvSpatialAttrs(
-    const onnx::NodeProto& node, const onnx::TensorProto& w_init) {
-  const int64_t kh = w_init.dims(2);
-  const int64_t kw = w_init.dims(3);
-  std::string auto_pad = "NOTSET";
-  std::optional<std::vector<int64_t>> pads;
-  std::optional<std::vector<int64_t>> strides;
-  std::optional<std::vector<int64_t>> dilations;
-  for (const auto& attr : node.attribute()) {
-    if (attr.name() == "auto_pad") {
-      auto_pad = attr.s();
-    } else if (attr.name() == "pads") {
-      pads = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
-    } else if (attr.name() == "strides") {
-      strides = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
-    } else if (attr.name() == "dilations") {
-      dilations = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
-    } else if (attr.name() == "kernel_shape") {
-      const std::vector<int64_t> ks(attr.ints().begin(), attr.ints().end());
-      if (ks.size() != 2 || ks[0] != kh || ks[1] != kw) {
-        return std::nullopt;  // weight/attribute mismatch -- don't guess
-      }
-    }
-  }
-  if (auto_pad != "NOTSET" && auto_pad != "" && auto_pad != "SAME_UPPER" &&
-      auto_pad != "SAME_LOWER" && auto_pad != "VALID") {
-    return std::nullopt;  // unrecognized -- don't guess
-  }
-  const std::vector<int64_t> s = strides.value_or(std::vector<int64_t>{1, 1});
-  if (s.size() != 2 || s[0] <= 0 || s[1] <= 0) {
-    return std::nullopt;
-  }
-  const std::vector<int64_t> d = dilations.value_or(std::vector<int64_t>{1, 1});
-  if (d.size() != 2 || d[0] <= 0 || d[1] <= 0) {
-    return std::nullopt;
-  }
-
-  int64_t pad_top = 0, pad_left = 0, pad_bottom = 0, pad_right = 0;
-  if (auto_pad == "NOTSET" || auto_pad.empty()) {
-    const std::vector<int64_t> p =
-        pads.value_or(std::vector<int64_t>{0, 0, 0, 0});
-    if (p.size() != 4 || p[0] < 0 || p[1] < 0 || p[2] < 0 || p[3] < 0) {
-      return std::nullopt;
-    }
-    pad_top = p[0];
-    pad_left = p[1];
-    pad_bottom = p[2];
-    pad_right = p[3];
-  }
-  // Else (SAME_UPPER/SAME_LOWER/VALID): pad_top/left/bottom/right stay
-  // unused placeholders -- the real padding is resolved fresh per
-  // calibration batch by ResolveConvPads, from that batch's own input
-  // spatial size, mirroring pruning.py's own `_ConvSpatialAttrs` comment.
-
-  return ConvSpatialAttrs{kh,   kw,   pad_top, pad_left, pad_bottom, pad_right,
-                          s[0], s[1], d[0],    d[1],     auto_pad};
-}
-
-// Mirrors pruning.py's own `_resolve_conv_pads` exactly (the ONNX Conv
-// operator's own `auto_pad` formula,
-// https://onnx.ai/onnx/operators/onnx__Conv.html): resolves one Conv node's
-// actual `(pad_top, pad_left, pad_bottom, pad_right)` for one calibration
-// batch's own `[N, Cin, in_h, in_w]` input. `NOTSET`/`""` is already a fixed,
-// per-node quantity (`attrs`' own fields, returned unchanged); `VALID` is
-// always zero padding; `SAME_UPPER`/ `SAME_LOWER` are the only genuinely
-// input-size-dependent cases, computed fresh from `in_h`/`in_w` every call.
-// Ceiling division is computed as
-// `(x + stride - 1) / stride` (both operands always positive here), the
-// standard C++ integer-division-safe equivalent of Python's own
-// `-(-x // stride)` floor-division trick (which relies on Python's
-// floor-toward-negative-infinity `//`, not C++'s truncate-toward-zero `/`).
-std::tuple<int64_t, int64_t, int64_t, int64_t> ResolveConvPads(
-    const ConvSpatialAttrs& attrs, int64_t in_h, int64_t in_w) {
-  if (attrs.auto_pad == "NOTSET" || attrs.auto_pad.empty()) {
-    return {attrs.pad_top, attrs.pad_left, attrs.pad_bottom, attrs.pad_right};
-  }
-  if (attrs.auto_pad == "VALID") {
-    return {0, 0, 0, 0};
-  }
-  const int64_t eff_kh = (attrs.kh - 1) * attrs.dilation_h + 1;
-  const int64_t eff_kw = (attrs.kw - 1) * attrs.dilation_w + 1;
-  const int64_t out_h = (in_h + attrs.stride_h - 1) / attrs.stride_h;
-  const int64_t out_w = (in_w + attrs.stride_w - 1) / attrs.stride_w;
-  const int64_t pad_h =
-      std::max<int64_t>(0, (out_h - 1) * attrs.stride_h + eff_kh - in_h);
-  const int64_t pad_w =
-      std::max<int64_t>(0, (out_w - 1) * attrs.stride_w + eff_kw - in_w);
-  int64_t pad_top, pad_left;
-  if (attrs.auto_pad == "SAME_UPPER") {
-    pad_top = pad_h / 2;
-    pad_left = pad_w / 2;
-  } else {  // SAME_LOWER
-    pad_top = pad_h - pad_h / 2;
-    pad_left = pad_w - pad_w / 2;
-  }
-  return {pad_top, pad_left, pad_h - pad_top, pad_w - pad_left};
-}
+// calibration sample. Reuses `ConvSpatialAttrs`/`ResolveConvSpatialAttrs`/
+// `ResolveConvPads` verbatim from the SparseGPT Conv section above (this
+// file's first port to need Conv attribute resolution at all) -- both
+// mirror the identical `_ConvSpatialAttrs`/`_conv_spatial_attrs`/
+// `_resolve_conv_pads` pruning.py helpers, so there is nothing Wanda-specific
+// to add here.
 
 // One calibration batch's accumulated im2col patch statistic for one Conv
 // node -- mirrors pruning.py's own `_conv_patch_sq_sum` return value
