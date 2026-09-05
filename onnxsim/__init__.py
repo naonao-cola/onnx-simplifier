@@ -56,6 +56,7 @@ from onnxsim.gptq import apply_gptq
 from onnxsim.gptvq import quantize_weight_only_gptvq
 from onnxsim.hf_reconstruct import read_hf_config, reconstruct_hf_graph
 from onnxsim.hqq import quantize_weight_only_int4_hqq
+from onnxsim.if4_quantization import quantize_weight_only_if4
 from onnxsim.kmeans_quantization import quantize_weight_only_kmeans
 from onnxsim.kv_cache_quantization import quantize_kv_cache
 from onnxsim.llm_fp4 import FP4_FORMATS, quantize_weight_only_llm_fp4
@@ -291,6 +292,7 @@ __all__ = [
     "quantize_weight_only_nf4",
     "NF4_CODEBOOK",
     "quantize_weight_only_mxfp4",
+    "quantize_weight_only_if4",
     "MXFP4_CODEBOOK",
     "quantize_weight_only_llm_fp4",
     "FP4_FORMATS",
