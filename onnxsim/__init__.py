@@ -66,6 +66,7 @@ from onnxsim.ibert_gelu import apply_ibert_gelu
 from onnxsim.icquant import icquant_metadata_bits, quantize_weight_only_icquant
 from onnxsim.if4_quantization import quantize_weight_only_if4
 from onnxsim.intactkv import apply_intactkv
+from onnxsim.kbvq_moe import apply_kbvq_moe
 from onnxsim.kmeans_quantization import quantize_weight_only_kmeans
 from onnxsim.kv_cache_quantization import quantize_kv_cache
 from onnxsim.llm_fp4 import FP4_FORMATS, quantize_weight_only_llm_fp4
@@ -280,6 +281,7 @@ __all__ = [
     "apply_qmoe_whole_expert_pruning",
     "apply_qmoe_whole_expert_pruning_cpp",
     "apply_moequant",
+    "apply_kbvq_moe",
     "apply_embedding_vocab_pruning",
     "apply_embedding_vocab_pruning_cpp",
     "apply_embedding_vocab_magnitude_pruning",
