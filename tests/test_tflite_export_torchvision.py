@@ -91,18 +91,17 @@ def test_resnet18_matches_onnxruntime_onnx2tf_backend():
     _assert_matches_onnxruntime(sim_model, _random_image_batch(), backend="onnx2tf")
 
 
-@pytest.mark.xfail(
-    reason="Known onnx2tf bug (reproduced with onnx2tf 1.29.24): its own Clip op "
-    "handler raises KeyError('tf_node') on MobileNetV2's Clip-as-ReLU6 nodes "
-    "(onnx_op_name '.../Clip'). File upstream at "
-    "https://github.com/PINTO0309/onnx2tf/issues if this still reproduces on a "
-    "newer onnx2tf. onnxsim's builtin backend handles this model correctly "
-    "(see test_mobilenet_v2_matches_onnxruntime above) -- this test documents the "
-    "gap that motivates keeping both backends rather than only shipping onnx2tf.",
-    raises=RuntimeError,
-    strict=False,
-)
 def test_mobilenet_v2_matches_onnxruntime_onnx2tf_backend():
+    # Regression test for a real onnx2tf bug this project's own recommendation to
+    # "simplify first" happens to work around: onnx2tf 1.29.24's Clip op handler
+    # raises KeyError('tf_node') on the *raw* torch.onnx.export of MobileNetV2 (35
+    # Clip-as-ReLU6 nodes, each preceded by a now-redundant Identity in the raw
+    # graph) -- confirmed by feeding onnx2tf_export.convert_to_tflite_via_onnx2tf
+    # the unsimplified export directly. onnxsim.simplify() removes those Identity
+    # nodes (209 nodes -> 102, dropping all 39 Identitys) as part of ordinary
+    # constant folding/cleanup, and onnx2tf converts the resulting graph without
+    # error -- this test runs the pipeline everyone actually uses
+    # (export -> simplify -> export_tflite) and checks it stays that way.
     pytest.importorskip("onnx2tf", reason="onnx2tf is not installed")
     model = torchvision.models.mobilenet_v2(weights=None)
     sim_model = export_simplify_and_check_by_python_api(
