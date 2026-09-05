@@ -475,7 +475,9 @@ def test_wanda_pruning_cpp_activation_weighting_differs_from_plain_magnitude():
 # compare against a LIVE call to it, exactly like every other test above.
 
 
-def _conv_model(Cin, Cout, group, kh=3, kw=3, pads=(1, 1, 1, 1), strides=(1, 1), seed=0):
+def _conv_model(
+    Cin, Cout, group, kh=3, kw=3, pads=(1, 1, 1, 1), strides=(1, 1), seed=0
+):
     cin_per_group = Cin // group
     rng = np.random.default_rng(seed)
     w = rng.standard_normal((Cout, cin_per_group, kh, kw)).astype(np.float32) * 0.4
@@ -499,7 +501,9 @@ def test_wanda_pruning_cpp_conv_ordinary_group1_matches_python_reference():
     calib = [{"X": b} for b in x_cal]
 
     expected = onnxsim.apply_wanda_pruning(model, calibration_data=calib, sparsity=0.5)
-    actual = onnxsim.apply_wanda_pruning_cpp(model, calibration_data=calib, sparsity=0.5)
+    actual = onnxsim.apply_wanda_pruning_cpp(
+        model, calibration_data=calib, sparsity=0.5
+    )
     onnx.checker.check_model(actual)
     np.testing.assert_array_equal(_weight(actual), _weight(expected))
     assert not np.array_equal(_weight(actual), w)
@@ -514,7 +518,9 @@ def test_wanda_pruning_cpp_conv_fully_depthwise_matches_python_reference():
     calib = [{"X": b} for b in x_cal]
 
     expected = onnxsim.apply_wanda_pruning(model, calibration_data=calib, sparsity=0.5)
-    actual = onnxsim.apply_wanda_pruning_cpp(model, calibration_data=calib, sparsity=0.5)
+    actual = onnxsim.apply_wanda_pruning_cpp(
+        model, calibration_data=calib, sparsity=0.5
+    )
     onnx.checker.check_model(actual)
     np.testing.assert_array_equal(_weight(actual), _weight(expected))
     assert not np.array_equal(_weight(actual), w)
@@ -532,7 +538,9 @@ def test_wanda_pruning_cpp_conv_general_grouped_matches_python_reference():
     calib = [{"X": b} for b in x_cal]
 
     expected = onnxsim.apply_wanda_pruning(model, calibration_data=calib, sparsity=0.5)
-    actual = onnxsim.apply_wanda_pruning_cpp(model, calibration_data=calib, sparsity=0.5)
+    actual = onnxsim.apply_wanda_pruning_cpp(
+        model, calibration_data=calib, sparsity=0.5
+    )
     onnx.checker.check_model(actual)
     np.testing.assert_array_equal(_weight(actual), _weight(expected))
     assert not np.array_equal(_weight(actual), w)
@@ -585,7 +593,9 @@ def test_wanda_pruning_cpp_conv_depthwise_float16_matches_python_reference():
     calib = [{"X": b} for b in x_cal]
 
     expected = onnxsim.apply_wanda_pruning(model, calibration_data=calib, sparsity=0.5)
-    actual = onnxsim.apply_wanda_pruning_cpp(model, calibration_data=calib, sparsity=0.5)
+    actual = onnxsim.apply_wanda_pruning_cpp(
+        model, calibration_data=calib, sparsity=0.5
+    )
     onnx.checker.check_model(actual)
     assert actual.graph.initializer[0].data_type == onnx.TensorProto.FLOAT16
     np.testing.assert_array_equal(
