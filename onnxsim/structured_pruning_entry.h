@@ -285,9 +285,13 @@ onnx::ModelProto ApplyStructuredWandaPruning(
 // -- same relationship, and same reused pattern, as
 // ApplyStructuredWandaPruning is to ApplyStructuredPruning above. Mirrors
 // pruning.py's own apply_attention_head_wanda_pruning: same chain finding
-// as ApplyAttentionHeadPruning's own three matched families
-// (FindAttentionChains/FindGqaChains/FindOnnxAttentionChains) --
-// deliberately NOT the fused `com.microsoft::MatMulNBitsQkv` variant
+// as ApplyAttentionHeadPruning's own nine matched families
+// (FindAttentionChains/FindGqaChains/FindOnnxAttentionChains/FindMhaChains/
+// FindPackedMhaChains/FindDecoderMaskedMhaChains/FindPagedAttentionChains/
+// FindLinearAttentionChains/FindSparseAttentionChains -- the tenth,
+// pruning.py's own decomposed/un-fused `_find_decomposed_gqa_chains` shape,
+// has no C++ port at all yet) -- deliberately NOT the fused
+// `com.microsoft::MatMulNBitsQkv` variant
 // ApplyAttentionHeadPruning additionally handles (via
 // FindMatMulNBitsQkvChains/ApplyMatMulNBitsQkvChains), since pruning.py's
 // own apply_attention_head_wanda_pruning has no quantized-weight
