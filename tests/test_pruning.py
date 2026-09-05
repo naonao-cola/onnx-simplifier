@@ -13386,6 +13386,222 @@ def test_gqa_pruning_matches_oracle_exactly():
     np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
 
 
+# --- True MQA (kv_num_heads == 1) query-head pruning fast path -----------
+#
+# Regression coverage for the bug an earlier survey confirmed empirically:
+# with `kv_num_heads == 1`, the ordinary KV-*group* formula
+# (`max(1, kv_num_heads - round(kv_num_heads * sparsity))`) is always
+# `1 == kv_num_heads` for every `sparsity` in `[0, 1)`, so
+# `apply_attention_head_pruning`/`apply_attention_head_wanda_pruning` used
+# to hit `_apply_one_gqa_chain`'s own "nothing to prune" early exit and
+# leave the whole block byte-for-byte untouched no matter how many query
+# heads (`num_heads`) shared that one KV head -- a complete no-op for every
+# real-world MQA export (Falcon-7B/StarCoder/PaLM-family-style
+# `kv_num_heads=1`). `_apply_one_gqa_chain` now has a dedicated fast path
+# for this case: individual query heads are ranked and dropped directly,
+# leaving the sole KV head -- and both its own K/V producer weights and
+# `kv_num_heads` itself -- completely untouched.
+
+
+def _oracle_keep_query_heads(wq, num_heads, head_size, keep_count):
+    importance = np.zeros(num_heads)
+    for h in range(num_heads):
+        importance[h] = np.linalg.norm(wq[:, h * head_size : (h + 1) * head_size])
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def test_mqa_pruning_shrinks_query_heads_kv_fully_untouched():
+    model, cfg = _gqa_model(K=8, H=8, KVH=1, D=8, Out=6, seed=5)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1  # untouched -- true MQA always has exactly one
+    assert num_heads == 4  # max(1, 8 - round(8*0.5)) query heads dropped directly
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    assert inits["Wq"].shape == (cfg["K"], 4 * cfg["D"])
+    assert inits["Wout"].shape == (4 * cfg["D"], cfg["Out"])
+    # K/V producer weights completely untouched -- same shape AND same
+    # values as the original, unpruned model (the confirmed-fixed bug's own
+    # "byte-identical in/out" no-op signature, but now scoped to just K/V,
+    # not the whole block).
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"])
+
+
+def test_mqa_pruning_is_not_a_complete_no_op():
+    # The confirmed bug itself: before this fix, this call was byte-identical
+    # to `model` for any `sparsity` (since `kv_num_heads == 1` always forced
+    # the group formula's early exit). It must not be anymore.
+    model, cfg = _gqa_model(K=8, H=8, KVH=1, D=8, Out=6, seed=6)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.75)
+    assert pruned.SerializeToString() != model.SerializeToString()
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == 2  # max(1, 8 - round(8*0.75)) < original 8
+
+
+def test_mqa_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _gqa_model(K=8, H=8, KVH=1, D=8, Out=6, seed=7)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert num_heads == cfg["H"]
+    assert kv_num_heads == cfg["KVH"]
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"])
+
+
+def test_mqa_pruning_matches_oracle_exactly():
+    model, cfg = _gqa_model(K=8, H=8, KVH=1, D=8, Out=6, seed=9)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == 4
+
+    d = cfg["D"]
+    keep_q_heads = _oracle_keep_query_heads(cfg["wq"], cfg["H"], d, num_heads)
+    q_idx = _head_idx(keep_q_heads, d)
+
+    oracle, _ = _gqa_model(
+        K=cfg["K"],
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=d,
+        Out=cfg["Out"],
+        seed=9,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"],
+        wv=cfg["wv"],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(10)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_mqa_wanda_pruning_matches_oracle_exactly():
+    # Wanda-calibrated variant of the same fast path -- mirrors
+    # `test_gqa_wanda_pruning_matches_oracle_exactly`'s own oracle
+    # construction, but ranking individual query heads (no KV group to
+    # combine activation norms across) instead.
+    model, cfg = _gqa_model(K=8, H=8, KVH=1, D=8, Out=6, seed=15)
+
+    rng = np.random.default_rng(16)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == 4
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"])
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx"))
+    (_, ctx_cal) = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx_cal.astype(np.float64)), axis=(0, 1)))
+
+    d = cfg["D"]
+    importance = np.zeros(cfg["H"])
+    for h in range(cfg["H"]):
+        base = np.linalg.norm(cfg["wq"][:, h * d : (h + 1) * d])
+        act_head = np.linalg.norm(act_norm[h * d : (h + 1) * d])
+        importance[h] = base * max(act_head, 1e-8)
+    keep_q_heads = np.sort(np.argsort(-importance)[:4])  # max(1, 8-round(8*0.5))
+    q_idx = _head_idx(keep_q_heads, d)
+
+    oracle, _ = _gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=cfg["KVH"],
+        D=d,
+        Out=cfg["Out"],
+        seed=15,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"],
+        wv=cfg["wv"],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_analyze_attention_head_pruning_mqa_reports_query_head_drops():
+    # Dry-run (`analyze_pruning_sensitivity`) vs. real-call parity for the
+    # MQA fast path: the report must predict query-head-granularity drops,
+    # not the permanent zero-drop the ordinary KV-group formula would give
+    # for `kv_num_heads == 1` (see this section's own top comment).
+    model, cfg = _gqa_model(K=8, H=8, KVH=1, D=8, Out=6, seed=17)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_gqa_group"
+    assert layer.total == cfg["H"]  # query-head total, not kv_num_heads(1)
+    assert layer.would_drop == 4  # max(1, 8 - round(8*0.5)) kept -> 4 dropped
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == cfg["H"] - layer.would_drop
+
+
+def test_analyze_attention_head_wanda_pruning_mqa_reports_query_head_drops():
+    model, cfg = _gqa_model(K=8, H=8, KVH=1, D=8, Out=6, seed=18)
+    rng = np.random.default_rng(19)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_attention_head_wanda_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.5,
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.total == cfg["H"]
+    assert layer.would_drop == 4
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == cfg["H"] - layer.would_drop
+
+
 def test_gqa_pruning_slices_bias_when_producer_has_one():
     # Gemm's own ONNX spec requires a rank-2 input, so a bias-carrying Gemm
     # producer can't sit directly ahead of GroupQueryAttention's rank-3

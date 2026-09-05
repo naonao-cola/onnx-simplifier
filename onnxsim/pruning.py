@@ -25313,6 +25313,45 @@ def _gqa_group_importance(
     return importance
 
 
+def _gqa_query_head_importance(
+    chain: _GQAChain,
+    wq: np.ndarray,
+    importance_norm: str = "l2",
+) -> np.ndarray:
+    # Per-*query*-head analogue of :func:`_gqa_group_importance`, used only
+    # by :func:`_apply_one_gqa_chain`'s own true-MQA fast path
+    # (`chain.kv_num_heads == 1`): true MQA has exactly one KV group holding
+    # every query head, so ranking *groups* (:func:`_gqa_group_importance`)
+    # can never distinguish anything -- there is only ever one group, and
+    # `_apply_one_gqa_chain`'s ordinary group-keep-count formula
+    # (``max(1, kv_num_heads - round(kv_num_heads * sparsity))``) always
+    # evaluates to ``1 == kv_num_heads`` for it, making the whole pass a
+    # silent no-op regardless of how many query heads share that one KV
+    # head (see this function's own caller for the full writeup). This
+    # ranks each query head directly instead, by its own Q weight block
+    # alone, letting individual query heads be dropped while the single
+    # shared KV head -- and both its own K/V producer weights -- stay
+    # completely untouched.
+    #
+    # Deliberately omits the shared K/V block :func:`_gqa_group_importance`
+    # folds into its own per-group score: with exactly one KV head shared,
+    # unmodified, by every query head this path ever considers, that block
+    # is a *constant* term identical across every candidate query head, so
+    # it cannot change which heads rank highest -- for L1 the per-block sum
+    # is a mere additive shift by that shared constant, and for L2 the
+    # per-block combination (``sqrt(a**2 + c**2)``) is monotonic increasing
+    # in ``a`` for any fixed ``c >= 0`` -- so folding it back in here would
+    # cost extra compute for the exact same ranking.
+    d = chain.head_size
+    importance = np.zeros(chain.num_heads, dtype=np.float64)
+    for qh in range(chain.num_heads):
+        block = wq[:, qh * d : (qh + 1) * d]
+        importance[qh] = (
+            np.abs(block).sum() if importance_norm == "l1" else np.linalg.norm(block)
+        )
+    return importance
+
+
 def _apply_one_plain_attention_chain(
     initializer_map: Dict[str, onnx.TensorProto],
     chain: _AttentionChain,
@@ -25419,6 +25458,7 @@ def _apply_one_gqa_chain(
     sparsity: float,
     compute_group_importance,
     bias_ctx: _DynamicHeadBiasContext,
+    compute_query_importance=_gqa_query_head_importance,
 ) -> Optional[Tuple[Set[str], str, Set[str]]]:
     """Applies whole-KV-group pruning to one matched ``GroupQueryAttention``,
     plain ``ai.onnx::Attention``, or ``MultiHeadAttention`` block (see
@@ -25498,10 +25538,42 @@ def _apply_one_gqa_chain(
     Returns ``(producer_weight_names, consumer_weight_name,
     stale_output_names)`` on success, or ``None`` if `sparsity` rounds to no
     groups dropped for this block (a no-op, left for the caller to skip).
+
+    True MQA (``chain.kv_num_heads == 1``) is a dedicated fast path, not an
+    instance of the ordinary group-pruning formula above: with exactly one
+    KV group, ``keep_count = max(1, 1 - round(1 * sparsity))`` is `1 ==
+    kv_num_heads` for *every* `sparsity` in ``[0, 1)`` (`round(sparsity)` is
+    always `0` or `1`), so the group-granularity formula can never drop
+    anything, no matter how many query heads (`chain.num_heads`) share that
+    one KV head -- silently turning the whole pass into a no-op for every
+    real MQA export (Falcon-7B/StarCoder/PaLM-family-style
+    ``kv_num_heads=1``) instead of declining just this one already-optimal
+    block the way the formula does for a genuine GQA block with too few KV
+    groups to drop any from. This path instead ranks and drops individual
+    *query* heads directly (`_gqa_query_head_importance`/
+    `compute_query_importance`), leaving the single shared KV head -- and
+    both its own K/V producer weights, `kv_num_heads` itself, and every
+    `kv_num_heads`-shaped cache/scale input -- completely untouched:
+    `keep_groups` stays fixed at the sole surviving group (`[0]`, an
+    identity slice of a size-1 axis), and only `keep_q_heads`/`new_num_heads`
+    (the query-head selection and count the rest of this function already
+    keys every Q-side/consumer/`attention_bias`/`head_sink`/`q_norm_rope`
+    slice off) are computed differently. Scoped to exactly
+    `kv_num_heads == 1`, not the more general "group keep_count is stuck at
+    its floor" case for `kv_num_heads > 1`, where a low-but-nonzero
+    `keep_count >= h` outcome is ordinary coarse-granularity behavior (too
+    little sparsity requested to drop even one whole group), not a bug.
     """
     h = chain.kv_num_heads
     keep_count = max(1, h - round(h * sparsity))
-    if keep_count >= h:
+    is_mqa = h == 1 and chain.num_heads > 1
+    q_keep_count = 0
+    if is_mqa:
+        nq_total = chain.num_heads
+        q_keep_count = max(1, nq_total - round(nq_total * sparsity))
+        if q_keep_count >= nq_total:
+            return None  # no query heads prunable at this sparsity either
+    elif keep_count >= h:
         return None
 
     d = chain.head_size
@@ -25519,7 +25591,11 @@ def _apply_one_gqa_chain(
     # mutated, so a violation declines this block's pruning outright (the
     # same "sparsity rounds to no groups dropped" no-op outcome
     # `keep_count >= h` above already gives the caller) rather than emitting
-    # an invalid node.
+    # an invalid node. Uses `q_keep_count` (the true post-pruning query head
+    # count) rather than `keep_count * group_size` for the MQA fast path --
+    # that formula assumes every surviving group keeps all `group_size`
+    # heads, which no longer holds once individual query heads are pruned
+    # independently of KV groups.
     is_sparse_attention = (
         chain.node.domain == _ATTENTION_DOMAIN
         and chain.node.op_type == "SparseAttention"
@@ -25528,7 +25604,8 @@ def _apply_one_gqa_chain(
         row_init = initializer_map.get(chain.node.input[5])
         if row_init is not None and row_init.dims:
             num_layout = row_init.dims[0]
-            if num_layout and (keep_count * group_size) % num_layout != 0:
+            new_q_heads = q_keep_count if is_mqa else keep_count * group_size
+            if num_layout and new_q_heads % num_layout != 0:
                 return None
 
     # Pre-pruning flat widths of Q's/K's own producer weight -- needed both
@@ -25578,12 +25655,23 @@ def _apply_one_gqa_chain(
         if chain.v_weight_transposed:
             wv_kn = wv_kn.T  # [K, Nkv]
 
-    importance = compute_group_importance(chain, wq_kn, wk_kn, wv_kn)
-    keep_groups = np.sort(np.argsort(-importance)[:keep_count])
-
-    keep_q_heads = np.concatenate(
-        [np.arange(g * group_size, (g + 1) * group_size) for g in keep_groups]
-    )
+    if is_mqa:
+        # Fixed at the sole surviving KV group -- `_head_column_indices`
+        # below turns this into an identity slice of K's/V's own
+        # size-`kv_num_heads * head_size`/`kv_num_heads * v_head_size` axes
+        # (`kv_num_heads == 1`), so K/V stay byte-for-byte untouched; ranked
+        # per query head instead, directly by `compute_query_importance`,
+        # rather than expanding whichever groups `compute_group_importance`
+        # would have kept (meaningless here -- there is only ever one group).
+        keep_groups = np.zeros(1, dtype=np.int64)
+        q_importance = compute_query_importance(chain, wq_kn)
+        keep_q_heads = np.sort(np.argsort(-q_importance)[:q_keep_count])
+    else:
+        importance = compute_group_importance(chain, wq_kn, wk_kn, wv_kn)
+        keep_groups = np.sort(np.argsort(-importance)[:keep_count])
+        keep_q_heads = np.concatenate(
+            [np.arange(g * group_size, (g + 1) * group_size) for g in keep_groups]
+        )
     # `q_idx`/`k_idx` index Q's/K's own producer weight columns (their
     # shared per-head width `d`); `v_idx` indexes V's own producer weight
     # columns at *its* own per-head width `dv`, which can differ. `y_idx`
@@ -25861,7 +25949,13 @@ def _apply_one_gqa_chain(
             _slice_last_axis(sink_init, keep_q_heads)
 
     new_kv_num_heads = keep_count
-    new_num_heads = keep_count * group_size
+    # `len(keep_q_heads)` rather than `keep_count * group_size`: identical
+    # for the ordinary group-pruning path (`keep_q_heads` is built there as
+    # exactly `keep_count` groups of `group_size` heads each), but the only
+    # correct count for the MQA fast path above, where `keep_q_heads` is an
+    # arbitrary top-`q_keep_count` subset of individual query heads with no
+    # group structure to multiply out.
+    new_num_heads = len(keep_q_heads)
     for attr in chain.node.attribute:
         if attr.name == chain.num_heads_attr:
             attr.i = new_num_heads
@@ -25949,6 +26043,7 @@ def _apply_attention_chains(
     compute_importance,
     compute_group_importance,
     value_info_by_name: Dict[str, onnx.ValueInfoProto],
+    compute_query_importance=_gqa_query_head_importance,
 ) -> None:
     """Shared body for :func:`apply_attention_head_pruning` and
     :func:`apply_attention_head_wanda_pruning`, mirroring
@@ -26012,7 +26107,12 @@ def _apply_attention_chains(
             )
         elif isinstance(chain, _GQAChain):
             applied = _apply_one_gqa_chain(
-                initializer_map, chain, sparsity, compute_group_importance, bias_ctx
+                initializer_map,
+                chain,
+                sparsity,
+                compute_group_importance,
+                bias_ctx,
+                compute_query_importance,
             )
         else:
             applied = _apply_one_plain_attention_chain(
@@ -26089,10 +26189,17 @@ def apply_attention_head_pruning(
     ``kv_num_heads`` by the number of groups dropped -- so their ratio
     (query heads per KV head) is unchanged, keeping every surviving KV head
     mapped to exactly the same number of query heads the kernel requires. An
-    individual query head is never dropped on its own from a genuine
-    GQA/MQA block: only a whole group, since neither kernel has a way to
-    keep a KV head alive for some, but not all, of the query heads that
-    shared it. A connected `past_key`/`past_value` that is a constant of the
+    individual query head is never dropped on its own from a genuine GQA
+    block with more than one KV group: only a whole group, since neither
+    kernel has a way to keep a KV head alive for some, but not all, of the
+    query heads that shared it. True MQA (``kv_num_heads == 1``) is the one
+    exception: with exactly one KV group holding every query head, that
+    group can never be dropped by sparsity alone (there is nothing left to
+    reduce it to), so individual query heads are instead ranked and dropped
+    directly, leaving the sole KV head -- and both its own K/V producer
+    weights and `kv_num_heads` itself -- completely untouched; see
+    :func:`_apply_one_gqa_chain`'s own docstring for the full reasoning.
+    A connected `past_key`/`past_value` that is a constant of the
     expected float BNSH shape is sliced along its own `kv_num_heads` axis by
     the same index set (see :func:`_past_kv_constants_are_sliceable`,
     :func:`_apply_one_gqa_chain`); a plain ``ai.onnx::Attention`` or
@@ -26225,6 +26332,9 @@ def apply_attention_head_pruning(
                     chain, wq, wk, wv, importance_norm
                 ),
                 value_info_by_name,
+                lambda chain, wq: _gqa_query_head_importance(
+                    chain, wq, importance_norm
+                ),
             )
 
     return out
@@ -26431,6 +26541,29 @@ def apply_attention_head_wanda_pruning(
         )
         return base * np.maximum(act_group, epsilon)
 
+    def _wanda_gqa_query_head_importance(chain, wq):
+        # MQA fast path's own Wanda variant -- mirrors
+        # `_wanda_attention_head_importance`'s per-head activation term
+        # exactly (each query head's own `dv`-wide slice of the probed
+        # activation, at *its own* head index rather than combined across a
+        # whole KV group's worth of query heads the way
+        # `_wanda_gqa_group_importance` above does), scaling
+        # `_gqa_query_head_importance`'s weight-only score instead of
+        # `_plain_attention_head_importance`'s.
+        base = _gqa_query_head_importance(chain, wq, importance_norm)
+        norm = act_norm.get(chain.consumer_node.input[0])
+        dv = chain.v_head_size
+        width = chain.num_heads * dv
+        if norm is None or norm.shape[0] != width:
+            return base  # no matching activation observed -- fall back to plain
+        act_head = np.array(
+            [
+                np.linalg.norm(norm[qh * dv : (qh + 1) * dv])
+                for qh in range(chain.num_heads)
+            ]
+        )
+        return base * np.maximum(act_head, epsilon)
+
     _apply_attention_chains(
         graph,
         chains,
@@ -26438,6 +26571,7 @@ def apply_attention_head_wanda_pruning(
         _wanda_attention_head_importance,
         _wanda_gqa_group_importance,
         value_info_by_name,
+        _wanda_gqa_query_head_importance,
     )
     return out
 
@@ -38083,6 +38217,7 @@ def _analyze_attention_chains(
     sparsity: float,
     compute_importance: Callable[..., np.ndarray],
     compute_group_importance: Callable[..., np.ndarray],
+    compute_query_importance: Callable[..., np.ndarray] = _gqa_query_head_importance,
 ) -> List[PruningLayerSensitivity]:
     """Dry-run mirror of :func:`_apply_attention_chains`'s own per-chain
     loop -- shared body for :func:`_analyze_attention_head_pruning`/
@@ -38097,7 +38232,15 @@ def _analyze_attention_chains(
     caller can pass :func:`_plain_attention_head_importance`/
     :func:`_gqa_group_importance` (optionally wrapped, as
     :func:`_analyze_attention_head_wanda_pruning` does, to fold in a
-    calibrated activation norm) unmodified.
+    calibrated activation norm) unmodified. `compute_query_importance` takes
+    ``(chain, wq)`` -- the same true-MQA (`chain.kv_num_heads == 1`)
+    query-head-granularity fast path :func:`_apply_one_gqa_chain` itself
+    has (see that function's own docstring): only ever called for a real
+    `_GQAChain` (never `_DecomposedGQAChain`, out of scope for that path)
+    whose `kv_num_heads == 1`, in place of `compute_group_importance`, so
+    this dry-run report predicts the same query-head-level drops a real
+    call would make instead of reporting the ordinary group-granularity
+    formula's permanent no-op for it.
 
     `chains` also carries :class:`_DecomposedGQAChain` (see this module's
     own "Decomposed (un-fused) attention head pruning" section comment),
@@ -38123,11 +38266,26 @@ def _analyze_attention_chains(
             label = _node_label(chain.softmax_node)
             producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
             h = chain.kv_num_heads
+            is_mqa = False
             family = "attention_decomposed_group"
         elif isinstance(chain, _GQAChain):
             label = _node_label(chain.node)
             producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
             h = chain.kv_num_heads
+            # True MQA (`kv_num_heads == 1`) fast path -- mirrors
+            # :func:`_apply_one_gqa_chain`'s own `is_mqa` handling: KV-group
+            # granularity can never drop anything for it (there is only ever
+            # one group), so `h` is swapped here to the query head count and
+            # every downstream keep-count/importance/report computation below
+            # runs at query-head granularity instead, exactly the same
+            # switch :func:`_apply_one_gqa_chain` itself makes -- see that
+            # function's own docstring for the full writeup. Scoped to a real
+            # `_GQAChain` only, never :class:`_DecomposedGQAChain` (out of
+            # scope -- see this module's "Decomposed (un-fused) attention
+            # head pruning" section comment).
+            is_mqa = h == 1 and chain.num_heads > 1
+            if is_mqa:
+                h = chain.num_heads
             # `MultiHeadAttention` has no separate `kv_num_heads` at all
             # (`chain.kv_num_heads == chain.num_heads` always for it -- see
             # :func:`_match_multi_head_attention_producer`'s own docstring),
@@ -38182,6 +38340,7 @@ def _analyze_attention_chains(
             label = _node_label(chain.node)
             producer_names = {chain.weight}
             h = chain.num_heads
+            is_mqa = False
             family = "attention_head"
 
         if (
@@ -38248,7 +38407,11 @@ def _analyze_attention_chains(
                     wk_kn = wk_kn.T
                 if chain.v_weight_transposed:
                     wv_kn = wv_kn.T
-            importance = compute_group_importance(chain, wq_kn, wk_kn, wv_kn)
+            importance = (
+                compute_query_importance(chain, wq_kn)
+                if is_mqa
+                else compute_group_importance(chain, wq_kn, wk_kn, wv_kn)
+            )
         else:
             dq = chain.nq // h
             dk = chain.nk // h
@@ -38351,6 +38514,9 @@ def _analyze_attention_head_pruning(
                 lambda chain, wq, wk, wv: _gqa_group_importance(
                     chain, wq, wk, wv, importance_norm
                 ),
+                lambda chain, wq: _gqa_query_head_importance(
+                    chain, wq, importance_norm
+                ),
             )
         )
         not_eligible.extend(_attention_not_eligible(graph, chains))
@@ -38444,12 +38610,32 @@ def _analyze_attention_head_wanda_pruning(
         )
         return base * np.maximum(act_group, epsilon)
 
+    def _wanda_gqa_query_head_importance(chain, wq):
+        # MQA fast path's own Wanda variant -- see
+        # :func:`apply_attention_head_wanda_pruning`'s own
+        # `_wanda_gqa_query_head_importance` closure, which this mirrors
+        # exactly (dry-run analogue, never actually slicing anything).
+        base = _gqa_query_head_importance(chain, wq, importance_norm)
+        norm = act_norm.get(chain.consumer_node.input[0])
+        dv = chain.v_head_size
+        width = chain.num_heads * dv
+        if norm is None or norm.shape[0] != width:
+            return base  # no matching activation observed -- fall back to plain
+        act_head = np.array(
+            [
+                np.linalg.norm(norm[qh * dv : (qh + 1) * dv])
+                for qh in range(chain.num_heads)
+            ]
+        )
+        return base * np.maximum(act_head, epsilon)
+
     layers = _analyze_attention_chains(
         graph,
         chains,
         sparsity,
         _wanda_attention_head_importance,
         _wanda_gqa_group_importance,
+        _wanda_gqa_query_head_importance,
     )
     return PruningSensitivityReport(
         layers=layers, not_eligible=_attention_not_eligible(graph, chains)
