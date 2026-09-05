@@ -812,12 +812,18 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // one-shot static score, unlike apply_sparsegpt_pruning's own sequential
   // Hessian-error-compensating algorithm. Same candidate set as
   // apply_sparsegpt_pruning's own binding above except widened to
-  // FLOAT32/FLOAT16/BFLOAT16 (still no Conv -- the one remaining gap vs.
-  // pruning.py's own apply_wanda_pruning), and same executor-as-first-
-  // argument, `calibration_data` (List[Dict[str, onnx.TensorProto]])
-  // crossing convention. See ApplyWandaPruning in structured_pruning_
-  // entry.h for the full scope and the data-free magnitude fallback an
-  // unobserved layer gets (unlike SparseGPT, which has none).
+  // FLOAT32/FLOAT16/BFLOAT16, PLUS every 2-D Conv node's constant 4-D
+  // weight (ordinary/depthwise/general-grouped alike) -- TRUE parity with
+  // pruning.py's own apply_wanda_pruning on every one of those candidate
+  // families (deliberately NOT aliased to that function despite the Conv
+  // parity, though -- a separate, pre-existing MatMul-family calibration
+  // rank-handling gap unrelated to Conv blocks it; see ApplyWandaPruning's
+  // own declaration comment in structured_pruning_entry.h for the full
+  // writeup). Same executor-as-first-argument, `calibration_data`
+  // (List[Dict[str, onnx.TensorProto]]) crossing convention. See
+  // ApplyWandaPruning in structured_pruning_entry.h for the full scope and
+  // the data-free magnitude fallback an unobserved layer gets (unlike
+  // SparseGPT, which has none).
   // `global_sparsity` pools every matched layer's importance into one
   // whole-model ranking, mirroring apply_structured_wanda_pruning's own
   // `sparsity`-only mode's structural analogue; incompatible with `n`/`m`.

@@ -21957,29 +21957,318 @@ std::vector<double> FromWandaNK(const std::vector<double>& w_pruned_nk,
 }
 
 // Wanda's own ``|W_ij| * ||X_j||_2`` importance for an already-`[n_rows,
-// kk]`-shaped weight, given its own optional per-`kk`-column calibrated
-// activation norm -- mirrors pruning.py's own `_wanda_importance` exactly,
-// including its fallback: `norm` absent, or its width not matching `kk`
-// (no calibration activation was ever observed for this layer, or it was
-// observed at a mismatched width), falls back to plain magnitude
-// (`std::fabs(w)` alone).
+// kk]`-shaped weight, given its own optional calibrated activation norm --
+// mirrors pruning.py's own `_wanda_importance` exactly, including its
+// fallback: `norm` absent, or its size matching neither `kk` (a single
+// shared row, broadcast to every output row -- the MatMul/Gemm/Attention
+// case) nor `n_rows * kk` (a genuinely per-row norm, one full `[n_rows, kk]`
+// array of its own -- the grouped/depthwise-Conv case, where
+// ConvGroupRelativeNorm has already expanded each output filter's own
+// group-relative norm into its own row before this function ever sees it;
+// see this function's own Conv caller for why one shared row would be
+// wrong there), falls back to plain magnitude (`std::fabs(w)` alone). Both
+// size checks collapse to the exact same result when `n_rows == 1` (the
+// only case where `kk == n_rows * kk`), so there is no genuine ambiguity
+// between the two.
 std::vector<double> WandaImportance(const std::vector<double>& w_nk,
                                     int64_t n_rows, int64_t kk,
                                     const std::vector<double>* norm,
                                     double epsilon) {
-  const bool use_norm =
+  const bool broadcast_norm =
       norm != nullptr && static_cast<int64_t>(norm->size()) == kk;
+  const bool full_norm =
+      norm != nullptr && static_cast<int64_t>(norm->size()) == n_rows * kk;
   std::vector<double> importance(w_nk.size());
   for (int64_t r = 0; r < n_rows; ++r) {
     for (int64_t c = 0; c < kk; ++c) {
       const size_t i = static_cast<size_t>(r * kk + c);
       const double mag = std::fabs(w_nk[i]);
-      importance[i] =
-          use_norm ? mag * std::max((*norm)[static_cast<size_t>(c)], epsilon)
-                   : mag;
+      double norm_val = 0.0;
+      bool use_norm = false;
+      if (full_norm) {
+        norm_val = (*norm)[i];
+        use_norm = true;
+      } else if (broadcast_norm) {
+        norm_val = (*norm)[static_cast<size_t>(c)];
+        use_norm = true;
+      }
+      importance[i] = use_norm ? mag * std::max(norm_val, epsilon) : mag;
     }
   }
   return importance;
+}
+
+// --- Conv im2col-unfolded activation statistics (Wanda only) ------------
+//
+// C++ mirror of pruning.py's own "Conv im2col-unfolded activation
+// statistics (Wanda only)" section -- `_ConvSpatialAttrs`/
+// `_conv_spatial_attrs`/`_resolve_conv_pads`/`_conv_patch_sq_sum`/
+// `_conv_group_relative_norm` -- the one piece of genuinely new machinery
+// this port needed to close the "2-D Conv" gap noted in this file's own
+// declaration comment history: Wanda's ``X_j`` for a Conv column is not
+// "input feature `j`" (a MatMul/Gemm column) but "receptive-field offset
+// `j`" -- one `(in_channel, kh, kw)` tap of the sliding kernel -- so its
+// activation statistic is the norm of the *im2col-unfolded* input patch
+// value at that specific offset, over every output spatial position and
+// calibration sample.
+
+// Mirrors pruning.py's own `_ConvSpatialAttrs` dataclass exactly, including
+// its defaults (unit dilation, "NOTSET" auto_pad).
+struct ConvSpatialAttrs {
+  int64_t kh = 0;
+  int64_t kw = 0;
+  int64_t pad_top = 0;
+  int64_t pad_left = 0;
+  int64_t pad_bottom = 0;
+  int64_t pad_right = 0;
+  int64_t stride_h = 1;
+  int64_t stride_w = 1;
+  int64_t dilation_h = 1;
+  int64_t dilation_w = 1;
+  std::string auto_pad = "NOTSET";
+};
+
+// Mirrors pruning.py's own `_conv_spatial_attrs` exactly: extracts the
+// padding/stride/dilation `ConvPatchSqSum` needs from `node`'s own
+// attributes, cross-checked against `w_init`'s own `kh`/`kw` (dims 2/3).
+// Declines (`std::nullopt`, "fall back to plain magnitude" per this
+// function's own caller) on a `kernel_shape` disagreeing with `w_init`'s
+// own shape, an unrecognized `auto_pad`, or a malformed/negative
+// `pads`/non-positive `strides`/`dilations` -- the same "don't guess at a
+// malformed node" bar every other check in this file holds to.
+std::optional<ConvSpatialAttrs> ResolveConvSpatialAttrs(
+    const onnx::NodeProto& node, const onnx::TensorProto& w_init) {
+  const int64_t kh = w_init.dims(2);
+  const int64_t kw = w_init.dims(3);
+  std::string auto_pad = "NOTSET";
+  std::optional<std::vector<int64_t>> pads;
+  std::optional<std::vector<int64_t>> strides;
+  std::optional<std::vector<int64_t>> dilations;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "auto_pad") {
+      auto_pad = attr.s();
+    } else if (attr.name() == "pads") {
+      pads = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    } else if (attr.name() == "strides") {
+      strides = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    } else if (attr.name() == "dilations") {
+      dilations = std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    } else if (attr.name() == "kernel_shape") {
+      const std::vector<int64_t> ks(attr.ints().begin(), attr.ints().end());
+      if (ks.size() != 2 || ks[0] != kh || ks[1] != kw) {
+        return std::nullopt;  // weight/attribute mismatch -- don't guess
+      }
+    }
+  }
+  if (auto_pad != "NOTSET" && auto_pad != "" && auto_pad != "SAME_UPPER" &&
+      auto_pad != "SAME_LOWER" && auto_pad != "VALID") {
+    return std::nullopt;  // unrecognized -- don't guess
+  }
+  const std::vector<int64_t> s = strides.value_or(std::vector<int64_t>{1, 1});
+  if (s.size() != 2 || s[0] <= 0 || s[1] <= 0) {
+    return std::nullopt;
+  }
+  const std::vector<int64_t> d = dilations.value_or(std::vector<int64_t>{1, 1});
+  if (d.size() != 2 || d[0] <= 0 || d[1] <= 0) {
+    return std::nullopt;
+  }
+
+  int64_t pad_top = 0, pad_left = 0, pad_bottom = 0, pad_right = 0;
+  if (auto_pad == "NOTSET" || auto_pad.empty()) {
+    const std::vector<int64_t> p =
+        pads.value_or(std::vector<int64_t>{0, 0, 0, 0});
+    if (p.size() != 4 || p[0] < 0 || p[1] < 0 || p[2] < 0 || p[3] < 0) {
+      return std::nullopt;
+    }
+    pad_top = p[0];
+    pad_left = p[1];
+    pad_bottom = p[2];
+    pad_right = p[3];
+  }
+  // Else (SAME_UPPER/SAME_LOWER/VALID): pad_top/left/bottom/right stay
+  // unused placeholders -- the real padding is resolved fresh per
+  // calibration batch by ResolveConvPads, from that batch's own input
+  // spatial size, mirroring pruning.py's own `_ConvSpatialAttrs` comment.
+
+  return ConvSpatialAttrs{kh,   kw,   pad_top, pad_left, pad_bottom, pad_right,
+                          s[0], s[1], d[0],    d[1],     auto_pad};
+}
+
+// Mirrors pruning.py's own `_resolve_conv_pads` exactly (the ONNX Conv
+// operator's own `auto_pad` formula,
+// https://onnx.ai/onnx/operators/onnx__Conv.html): resolves one Conv node's
+// actual `(pad_top, pad_left, pad_bottom, pad_right)` for one calibration
+// batch's own `[N, Cin, in_h, in_w]` input. `NOTSET`/`""` is already a fixed,
+// per-node quantity (`attrs`' own fields, returned unchanged); `VALID` is
+// always zero padding; `SAME_UPPER`/ `SAME_LOWER` are the only genuinely
+// input-size-dependent cases, computed fresh from `in_h`/`in_w` every call.
+// Ceiling division is computed as
+// `(x + stride - 1) / stride` (both operands always positive here), the
+// standard C++ integer-division-safe equivalent of Python's own
+// `-(-x // stride)` floor-division trick (which relies on Python's
+// floor-toward-negative-infinity `//`, not C++'s truncate-toward-zero `/`).
+std::tuple<int64_t, int64_t, int64_t, int64_t> ResolveConvPads(
+    const ConvSpatialAttrs& attrs, int64_t in_h, int64_t in_w) {
+  if (attrs.auto_pad == "NOTSET" || attrs.auto_pad.empty()) {
+    return {attrs.pad_top, attrs.pad_left, attrs.pad_bottom, attrs.pad_right};
+  }
+  if (attrs.auto_pad == "VALID") {
+    return {0, 0, 0, 0};
+  }
+  const int64_t eff_kh = (attrs.kh - 1) * attrs.dilation_h + 1;
+  const int64_t eff_kw = (attrs.kw - 1) * attrs.dilation_w + 1;
+  const int64_t out_h = (in_h + attrs.stride_h - 1) / attrs.stride_h;
+  const int64_t out_w = (in_w + attrs.stride_w - 1) / attrs.stride_w;
+  const int64_t pad_h =
+      std::max<int64_t>(0, (out_h - 1) * attrs.stride_h + eff_kh - in_h);
+  const int64_t pad_w =
+      std::max<int64_t>(0, (out_w - 1) * attrs.stride_w + eff_kw - in_w);
+  int64_t pad_top, pad_left;
+  if (attrs.auto_pad == "SAME_UPPER") {
+    pad_top = pad_h / 2;
+    pad_left = pad_w / 2;
+  } else {  // SAME_LOWER
+    pad_top = pad_h - pad_h / 2;
+    pad_left = pad_w - pad_w / 2;
+  }
+  return {pad_top, pad_left, pad_h - pad_top, pad_w - pad_left};
+}
+
+// One calibration batch's accumulated im2col patch statistic for one Conv
+// node -- mirrors pruning.py's own `_conv_patch_sq_sum` return value
+// exactly: `sq_sum` is row-major `[Cin, kh, kw]` (flattening it in that
+// order matches the Conv weight's own on-disk `[out_channels, Cin, kh,
+// kw]` layout, already the `_weight_to_nk` reshape convention with no
+// transpose needed), `count` is `N * h_out * w_out`.
+struct ConvPatchStat {
+  std::vector<double> sq_sum;
+  int64_t count = 0;
+};
+
+// Mirrors pruning.py's own `_conv_patch_sq_sum` exactly: `x` is one
+// calibration batch's raw `[N, Cin, in_h, in_w]` Conv input, row-major
+// contiguous (`dims` gives its shape). Returns `std::nullopt` if `x` isn't
+// a plausible 4-D NCHW activation for this Conv's own kernel once padded
+// (too small, or not rank-4 at all).
+//
+// Zero-pads `x` into an explicit `[N, Cin, padded_h, padded_w]` buffer (the
+// direct analogue of `np.pad`), then, for each of the `kh*kw`
+// receptive-field taps, accumulates the sum of squares of every padded
+// value that tap reads across every batch sample and output spatial
+// position -- `tap (i, j)`'s own values live at padded row `i*dilation_h +
+// ho*stride_h`, column `j*dilation_w + wo*stride_w`, for `ho` in
+// `[0, h_out)`, `wo` in `[0, w_out)` -- accounting for non-unit dilation
+// exactly the way pruning.py's own per-tap strided slice does.
+std::optional<ConvPatchStat> ConvPatchSqSum(const std::vector<double>& x,
+                                            const std::vector<int64_t>& dims,
+                                            const ConvSpatialAttrs& attrs) {
+  if (dims.size() != 4) {
+    return std::nullopt;
+  }
+  const int64_t n = dims[0];
+  const int64_t cin = dims[1];
+  const int64_t in_h = dims[2];
+  const int64_t in_w = dims[3];
+  const auto [pad_top, pad_left, pad_bottom, pad_right] =
+      ResolveConvPads(attrs, in_h, in_w);
+  const int64_t padded_h = in_h + pad_top + pad_bottom;
+  const int64_t padded_w = in_w + pad_left + pad_right;
+  const int64_t eff_kh = (attrs.kh - 1) * attrs.dilation_h + 1;
+  const int64_t eff_kw = (attrs.kw - 1) * attrs.dilation_w + 1;
+  if (padded_h < eff_kh || padded_w < eff_kw) {
+    return std::nullopt;
+  }
+  const int64_t h_out = (padded_h - eff_kh) / attrs.stride_h + 1;
+  const int64_t w_out = (padded_w - eff_kw) / attrs.stride_w + 1;
+  const int64_t count = n * h_out * w_out;
+  if (count == 0) {
+    return std::nullopt;
+  }
+
+  std::vector<double> xp(static_cast<size_t>(n * cin * padded_h * padded_w),
+                         0.0);
+  for (int64_t bi = 0; bi < n; ++bi) {
+    for (int64_t c = 0; c < cin; ++c) {
+      for (int64_t h = 0; h < in_h; ++h) {
+        const double* src_row =
+            x.data() + static_cast<size_t>(((bi * cin + c) * in_h + h) * in_w);
+        double* dst_row =
+            xp.data() +
+            static_cast<size_t>(((bi * cin + c) * padded_h + (h + pad_top)) *
+                                    padded_w +
+                                pad_left);
+        std::memcpy(dst_row, src_row,
+                    sizeof(double) * static_cast<size_t>(in_w));
+      }
+    }
+  }
+
+  std::vector<double> sq_sum(static_cast<size_t>(cin * attrs.kh * attrs.kw),
+                             0.0);
+  for (int64_t i = 0; i < attrs.kh; ++i) {
+    const int64_t h_start = i * attrs.dilation_h;
+    for (int64_t j = 0; j < attrs.kw; ++j) {
+      const int64_t w_start = j * attrs.dilation_w;
+      for (int64_t bi = 0; bi < n; ++bi) {
+        for (int64_t c = 0; c < cin; ++c) {
+          double acc = 0.0;
+          for (int64_t ho = 0; ho < h_out; ++ho) {
+            const int64_t hp = h_start + ho * attrs.stride_h;
+            for (int64_t wo = 0; wo < w_out; ++wo) {
+              const int64_t wp = w_start + wo * attrs.stride_w;
+              const double v = xp[static_cast<size_t>(
+                  ((bi * cin + c) * padded_h + hp) * padded_w + wp)];
+              acc += v * v;
+            }
+          }
+          sq_sum[static_cast<size_t>((c * attrs.kh + i) * attrs.kw + j)] += acc;
+        }
+      }
+    }
+  }
+  return ConvPatchStat{std::move(sq_sum), count};
+}
+
+// Mirrors pruning.py's own `_conv_group_relative_norm` exactly: expands a
+// Conv layer's flat per-`(in_channel, kh, kw)`-offset activation norm
+// (`norm_flat`, row-major `[Cin_full, kh, kw]` flattened, `Cin_full` being
+// the raw full input-channel count `ConvPatchSqSum` unfolds from, i.e.
+// `cin_per_group * group`) into a row-major `[out_channels, cin_per_group *
+// kh * kw]` array -- one row per output filter, each already carrying its
+// OWN group's own channel-relative slice of `norm_flat` (output filter `i`
+// belongs to group `i / (out_channels / group)`, ONNX's own grouped-Conv
+// weight layout), ready to feed WandaImportance's own per-row (`full_norm`)
+// case directly. Collapses to one shared row broadcast to every filter
+// exactly when `group == 1`. Returns `std::nullopt` if `norm_flat`'s length
+// doesn't match `cin_per_group * group * kh * kw` -- the "no usable
+// calibration signal" case, same as this file's other norm-shape checks.
+std::optional<std::vector<double>> ConvGroupRelativeNorm(
+    const std::vector<double>& norm_flat, int64_t cout, int64_t cin_per_group,
+    int64_t kh, int64_t kw, int64_t group) {
+  const int64_t cin_full = cin_per_group * group;
+  if (static_cast<int64_t>(norm_flat.size()) != cin_full * kh * kw) {
+    return std::nullopt;
+  }
+  if (group <= 0 || cout % group != 0) {
+    return std::nullopt;  // defensive -- caller's own matcher already
+                          // requires this
+  }
+  const int64_t filters_per_group = cout / group;
+  const int64_t row_width = cin_per_group * kh * kw;
+  std::vector<double> rows(static_cast<size_t>(cout * row_width));
+  for (int64_t g = 0; g < group; ++g) {
+    // norm_flat's own [Cin_full, kh, kw] row-major layout means group g's
+    // own channel block ([g*cin_per_group, (g+1)*cin_per_group) along the
+    // channel axis) is already one contiguous run of `row_width` doubles
+    // starting at `g * row_width` -- no separate reshape/slice needed.
+    const double* block = norm_flat.data() + static_cast<size_t>(g * row_width);
+    for (int64_t f = 0; f < filters_per_group; ++f) {
+      const int64_t row = g * filters_per_group + f;
+      std::memcpy(rows.data() + static_cast<size_t>(row * row_width), block,
+                  sizeof(double) * static_cast<size_t>(row_width));
+    }
+  }
+  return rows;
 }
 
 // Row-wise unstructured sparsity mask over a row-major `[n_rows, kk]`
@@ -22147,6 +22436,179 @@ std::optional<AttentionProducerMatch> MatchAttentionProducerWideDtype(
   return AttentionProducerMatch{w_name, bias_name, num_heads, nq, nk, nv};
 }
 
+// If `node` is a 2-D `Conv` (or `FusedConv`) with a constant 4-D
+// FLOAT/FLOAT16/BFLOAT16 `[out_channels, in_channels/group, kH, kW]`
+// weight, returns `(x_name, weight_name, group)` -- mirrors pruning.py's
+// own `_match_conv_weight_only` (`allow_grouped=True`, the default every
+// caller there uses) exactly: ordinary (`group=1`), depthwise, and general
+// grouped Conv are all matched identically (unstructured/N:M pruning never
+// changes any shape or needs any cross-layer index agreement, unlike this
+// file's own structural MatchConvProducer/MatchConvConsumer above, which
+// restrict to `group=1` for a completely different, shape-coupling reason
+// -- see pruning.py's own module docstring). `out_channels % group` must
+// be zero when `group > 1` -- the standard grouped-Conv well-formedness
+// requirement ConvGroupRelativeNorm also relies on. Domain is not checked
+// (mirrors pruning.py's own matcher, which checks `op_type` alone).
+struct ConvWeightOnlyMatch {
+  std::string x_name;
+  std::string w_name;
+  int64_t group;
+};
+
+std::optional<ConvWeightOnlyMatch> MatchConvWeightOnly(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if ((node.op_type() != "Conv" && node.op_type() != "FusedConv") ||
+      node.input_size() < 2) {
+    return std::nullopt;
+  }
+  const std::string& w_name = node.input(1);
+  auto it = init_map.find(w_name);
+  if (it == init_map.end() || !IsSupportedFloatDtype(it->second->data_type()) ||
+      it->second->dims_size() != 4) {
+    return std::nullopt;
+  }
+  const int64_t group = ConvGroupAttr(node);
+  if (group < 1) {
+    return std::nullopt;
+  }
+  if (group > 1 && it->second->dims(0) % group != 0) {
+    return std::nullopt;
+  }
+  return ConvWeightOnlyMatch{node.input(0), w_name, group};
+}
+
+// One matched Conv candidate's own probe input/weight-node pairing, ready
+// for ConvWandaCalibrationStats below -- `attrs` already resolved
+// (ResolveConvSpatialAttrs) at candidate-matching time, once per node,
+// mirroring pruning.py's own `conv_attrs` dict (keyed by `w_name`, built
+// once before the calibration loop runs).
+struct ConvCalibCandidate {
+  std::string x_name;
+  std::string w_name;
+  ConvSpatialAttrs attrs;
+};
+
+// Conv-specific companion to WandaCalibrationStats above, for exactly the
+// reason this file's own "Wanda unstructured (element-wise) pruning"
+// section top comment already established for MatchAttentionProducerWideDtype
+// ("narrow, local duplicate instead of a shared-code change"): Conv's own
+// activation statistic (the im2col-unfolded per-`(in_channel, kh, kw)`-tap
+// norm, ConvPatchSqSum) is a GENUINELY DIFFERENT reduction than
+// WandaCalibrationStats' own "sum of squares over every axis but one
+// declared channel axis" -- not a special case of it -- so this reuses only
+// WandaCalibrationStats' own probe-injection/batch-iteration/DLPack-input-
+// feeding plumbing (mirroring pruning.py's own `_add_probe_outputs`, plus
+// the same batch-to-`ModelExecutor::Run`-position reordering
+// WandaCalibrationStats' own top comment documents design decision (2) for)
+// rather than its accumulator. Mirrors pruning.py's own
+// `_wanda_unstructured_calibration_stats`' own `conv_sq_sum`/`conv_count`
+// accumulation and final `np.sqrt(s / max(count, 1)).reshape(-1)` exactly,
+// keyed by `w_name` (not `x_name`, since two Conv nodes can share an input
+// tensor with different kernels -- same reasoning as pruning.py's own
+// per-node `conv_attrs` dict). This DOES mean a second, separate
+// `executor.Run` per calibration batch beyond WandaCalibrationStats' own
+// (rather than one shared run computing both statistics at once, the way
+// pruning.py's single `_add_probe_outputs` call does for every candidate
+// together) whenever a model has both Conv and MatMul/Gemm/Attention
+// candidates -- a real, deliberate efficiency/simplicity trade-off, not an
+// oversight: it keeps this function a pure, independently-reviewable
+// addition with no risk of perturbing WandaCalibrationStats' own already-
+// verified behavior for its other two callers (ApplyStructuredWandaPruning/
+// ApplyAttentionHeadWandaPruning).
+std::unordered_map<std::string, std::vector<double>> ConvWandaCalibrationStats(
+    const ModelExecutor& executor, const onnx::ModelProto& model,
+    const std::vector<ConvCalibCandidate>& conv_candidates,
+    const std::vector<std::unordered_map<std::string, onnx::TensorProto>>&
+        calibration_data) {
+  std::unordered_map<std::string, std::vector<double>> result;
+  if (conv_candidates.empty()) {
+    return result;
+  }
+
+  onnx::ModelProto probe_model = model;
+  std::unordered_set<std::string> existing_outputs;
+  for (const auto& o : probe_model.graph().output()) {
+    existing_outputs.insert(o.name());
+  }
+  for (const auto& c : conv_candidates) {
+    if (existing_outputs.insert(c.x_name).second) {
+      probe_model.mutable_graph()->add_output()->set_name(c.x_name);
+    }
+  }
+
+  std::unordered_map<std::string, size_t> output_index;
+  for (int i = 0; i < probe_model.graph().output_size(); ++i) {
+    output_index.emplace(probe_model.graph().output(i).name(),
+                         static_cast<size_t>(i));
+  }
+  const auto& graph_inputs = probe_model.graph().input();
+
+  std::unordered_map<std::string, std::vector<double>> sq_sum;
+  std::unordered_map<std::string, int64_t> count;
+
+  for (const auto& batch : calibration_data) {
+    // Reorder this batch's own {name: TensorProto} map into
+    // ModelExecutor::Run's positional contract -- see WandaCalibrationStats'
+    // own top comment, design decision (2).
+    std::vector<DLManagedTensorPtr> input_dls;
+    std::vector<const DLManagedTensor*> input_ptrs;
+    input_dls.reserve(static_cast<size_t>(graph_inputs.size()));
+    input_ptrs.reserve(static_cast<size_t>(graph_inputs.size()));
+    for (const auto& gi : graph_inputs) {
+      auto it = batch.find(gi.name());
+      if (it == batch.end()) {
+        throw std::invalid_argument(
+            "ApplyWandaPruning: calibration batch is missing required "
+            "graph input '" +
+            gi.name() + "'");
+      }
+      input_dls.emplace_back(
+          onnxsim::dlpack::FromTensorProtoBorrowing(it->second));
+      input_ptrs.push_back(input_dls.back().get());
+    }
+
+    std::vector<DLManagedTensorPtr> outputs =
+        executor.Run(probe_model, input_ptrs);
+
+    for (const auto& c : conv_candidates) {
+      auto oit = output_index.find(c.x_name);
+      if (oit == output_index.end() || oit->second >= outputs.size()) {
+        continue;  // Defensive -- every x_name was added as an output above.
+      }
+      const DLTensor& dl = outputs[oit->second]->dl_tensor;
+      onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
+      if (!IsSupportedFloatDtype(tp.data_type())) {
+        continue;
+      }
+      const std::vector<int64_t> dims(tp.dims().begin(), tp.dims().end());
+      const std::vector<double> data = ReadTensorAsF64(tp);
+      const std::optional<ConvPatchStat> stat =
+          ConvPatchSqSum(data, dims, c.attrs);
+      if (!stat) {
+        continue;
+      }
+      auto& acc = sq_sum[c.w_name];
+      if (acc.empty()) {
+        acc.assign(stat->sq_sum.size(), 0.0);
+      }
+      for (size_t i = 0; i < acc.size(); ++i) {
+        acc[i] += stat->sq_sum[i];
+      }
+      count[c.w_name] += stat->count;
+    }
+  }
+
+  result.reserve(sq_sum.size());
+  for (auto& [name, acc] : sq_sum) {
+    const int64_t cnt = std::max<int64_t>(count[name], 1);
+    for (double& v : acc) {
+      v = std::sqrt(v / static_cast<double>(cnt));
+    }
+    result.emplace(name, std::move(acc));
+  }
+  return result;
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyWandaPruning(
@@ -22194,24 +22656,39 @@ onnx::ModelProto ApplyWandaPruning(
   }
 
   // Like ApplySparseGptPruning's own candidate matching immediately above,
-  // widened to FLOAT32/FLOAT16/BFLOAT16 -- see this file's own
-  // ApplyWandaPruning declaration comment (structured_pruning_entry.h) and
-  // this file's own "Wanda unstructured (element-wise) pruning" section top
-  // comment for the two different widening mechanisms: every matched
-  // MatMul/vanilla-Gemm layer (MatchMatMulLikeRaw) with a constant 2-D
-  // FLOAT/FLOAT16/BFLOAT16 weight (IsSupportedFloatDtype, checked right
-  // here at the call site -- MatchMatMulLikeRaw itself has no dtype gate of
-  // its own), plus every matched com.microsoft::Attention node's constant
-  // 2-D FLOAT/FLOAT16/BFLOAT16 merged QKV weight
+  // widened to FLOAT32/FLOAT16/BFLOAT16, PLUS every 2-D `Conv`
+  // (ordinary/depthwise/general-grouped alike, MatchConvWeightOnly) -- see
+  // this file's own ApplyWandaPruning declaration comment
+  // (structured_pruning_entry.h) and this file's own "Wanda unstructured
+  // (element-wise) pruning" section top comment for the widening
+  // mechanisms: every matched MatMul/vanilla-Gemm layer (MatchMatMulLikeRaw)
+  // with a constant 2-D FLOAT/FLOAT16/BFLOAT16 weight (IsSupportedFloatDtype,
+  // checked right here at the call site -- MatchMatMulLikeRaw itself has no
+  // dtype gate of its own), every matched com.microsoft::Attention node's
+  // constant 2-D FLOAT/FLOAT16/BFLOAT16 merged QKV weight
   // (MatchAttentionProducerWideDtype, this pass' own local dtype-widened
-  // copy of MatchAttentionProducer). 2-D Conv is declined outright -- never
-  // matched by either case below, left completely untouched.
+  // copy of MatchAttentionProducer), and every matched 2-D Conv node's
+  // constant 4-D FLOAT/FLOAT16/BFLOAT16 weight (MatchConvWeightOnly). A Conv
+  // node is still matched here even when ResolveConvSpatialAttrs declines
+  // its own attributes (a malformed `kernel_shape`/`auto_pad`/`pads`/
+  // `strides`/`dilations`) -- `conv_attrs` below is then absent for it, so
+  // it never gets an entry in `conv_act_norm`, and WandaImportance's own
+  // `norm == nullptr` fallback prunes it by plain magnitude instead, exactly
+  // mirroring pruning.py's own `_wanda_norm_for_candidate`/`_wanda_importance`
+  // fallback chain for this same case.
   struct Candidate {
     std::string x_name;
     std::string w_name;
     bool weight_transposed;
+    bool is_conv;
+    int64_t conv_group = 1;  // only meaningful when is_conv
   };
   std::vector<Candidate> candidates;
+  // Conv attributes are per-node (two Convs can share an input tensor with
+  // different kernels/strides), so this is keyed by the Conv's own weight
+  // name, not its (possibly shared) input name -- mirrors pruning.py's own
+  // `conv_attrs` dict exactly.
+  std::unordered_map<std::string, ConvSpatialAttrs> conv_attrs;
   for (const auto& node : graph->node()) {
     auto mm = MatchMatMulLikeRaw(node);
     if (mm) {
@@ -22219,8 +22696,18 @@ onnx::ModelProto ApplyWandaPruning(
       if (wit != init_map.end() &&
           IsSupportedFloatDtype(wit->second->data_type()) &&
           wit->second->dims_size() == 2) {
-        candidates.push_back({mm->x_name, mm->w_name, mm->weight_transposed});
+        candidates.push_back(
+            {mm->x_name, mm->w_name, mm->weight_transposed, false});
       }
+      continue;
+    }
+    auto cm = MatchConvWeightOnly(node, init_map);
+    if (cm) {
+      auto wit = init_map.find(cm->w_name);
+      if (auto attrs = ResolveConvSpatialAttrs(node, *wit->second)) {
+        conv_attrs.emplace(cm->w_name, *attrs);
+      }
+      candidates.push_back({cm->x_name, cm->w_name, false, true, cm->group});
       continue;
     }
     auto am = MatchAttentionProducerWideDtype(node, init_map);
@@ -22229,30 +22716,76 @@ onnx::ModelProto ApplyWandaPruning(
       // is already [K, N]-shaped by construction (see
       // MatchAttentionProducer's own comment), so it is matched exactly
       // like a non-transposed MatMul weight.
-      candidates.push_back({node.input(0), am->weight, false});
+      candidates.push_back({node.input(0), am->weight, false, false});
     }
   }
   if (candidates.empty()) {
     return out;
   }
 
-  // Wanda's own calibration statistic -- reuses WandaCalibrationStats
-  // verbatim, probe axis -1 (last axis) for every candidate, keyed by its
-  // own activation tensor name (see this file's own ApplyWandaPruning
-  // declaration comment for why keying by `x_name` rather than by weight
-  // name, unlike pruning.py's own `attn_act_norm`, is a safe, already-
-  // established simplification). A rank-3 Attention activation is reduced
-  // over every leading axis by WandaCalibrationStats' own "every axis but
-  // the channel one" reduction, exactly mirroring pruning.py's own
+  // Wanda's own calibration statistic for the MatMul/Gemm/Attention
+  // candidates -- reuses WandaCalibrationStats verbatim, probe axis -1
+  // (last axis) for every non-Conv candidate, keyed by its own activation
+  // tensor name (see this file's own ApplyWandaPruning declaration comment
+  // for why keying by `x_name` rather than by weight name, unlike
+  // pruning.py's own `attn_act_norm`, is a safe, already-established
+  // simplification). A rank-3 Attention activation is reduced over every
+  // leading axis by WandaCalibrationStats' own "every axis but the channel
+  // one" reduction, exactly mirroring pruning.py's own
   // `x.reshape(-1, x.shape[-1])`.
   std::unordered_map<std::string, int64_t> probe_axis;
   for (const auto& c : candidates) {
-    probe_axis[c.x_name] = -1;
+    if (!c.is_conv) {
+      probe_axis[c.x_name] = -1;
+    }
   }
   const std::unordered_map<std::string, std::vector<double>> act_norm =
       WandaCalibrationStats(executor, out, probe_axis, calibration_data);
 
+  // Conv's own im2col-unfolded per-(in_channel, kh, kw)-tap calibration
+  // statistic -- a genuinely different reduction than WandaCalibrationStats'
+  // own, see ConvWandaCalibrationStats' own top comment. Only Conv
+  // candidates with a usable ResolveConvSpatialAttrs result are probed;
+  // every other Conv candidate is left for WandaImportance's own
+  // no-calibration-observed fallback.
+  std::vector<ConvCalibCandidate> conv_calib_candidates;
+  for (const auto& c : candidates) {
+    if (!c.is_conv) {
+      continue;
+    }
+    auto ait = conv_attrs.find(c.w_name);
+    if (ait != conv_attrs.end()) {
+      conv_calib_candidates.push_back({c.x_name, c.w_name, ait->second});
+    }
+  }
+  const std::unordered_map<std::string, std::vector<double>> conv_act_norm =
+      ConvWandaCalibrationStats(executor, out, conv_calib_candidates,
+                                calibration_data);
+
   MutInitMap mut_init_map = BuildMutInitMap(graph);
+
+  // Returns the Conv-specific broadcastable norm array for candidate `c`
+  // (row-major `[cout, cin_per_group * kh * kw]`, already expanded per
+  // output filter's own group by ConvGroupRelativeNorm), or `std::nullopt`
+  // if no usable calibration activation was ever observed for it -- mirrors
+  // pruning.py's own `_wanda_norm_for_candidate`'s own `is_conv` branch.
+  // Declared here (rather than as a free function) so it can capture
+  // `conv_act_norm` and `mut_init_map` by reference, matching this
+  // function's other per-call-site closures.
+  auto conv_norm_for =
+      [&](const Candidate& c) -> std::optional<std::vector<double>> {
+    auto nit = conv_act_norm.find(c.w_name);
+    if (nit == conv_act_norm.end()) {
+      return std::nullopt;
+    }
+    const onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
+    const int64_t cout = w_init->dims(0);
+    const int64_t cin_per_group = w_init->dims(1);
+    const int64_t kh = w_init->dims(2);
+    const int64_t kw = w_init->dims(3);
+    return ConvGroupRelativeNorm(nit->second, cout, cin_per_group, kh, kw,
+                                 c.conv_group);
+  };
 
   if (global_sparsity) {
     // Global-sparsity companion to the per-layer loop below, mirroring
@@ -22263,12 +22796,19 @@ onnx::ModelProto ApplyWandaPruning(
     // the lowest-scoring `total - keep_count` pooled entries wherever they
     // land -- no per-row/per-layer floor enforced (a layer can end up
     // entirely zeroed), same as the Python original.
+    // `dims` is the tensor's own on-disk shape (`[dim0, dim1]` for
+    // MatMul/Gemm/Attention, `[cout, cin_per_group, kh, kw]` for Conv);
+    // `w_nk` is already row-major `[n_rows, kk]` either way -- for Conv this
+    // is `ReadTensorAsF64`'s own flat result reinterpreted with no
+    // transpose at all (mirrors pruning.py's own `_weight_to_nk`'s Conv
+    // branch, a pure reshape), so `pruned_nk` can be written back via
+    // WriteF64TensorAs directly using `dims`.
     struct Entry {
       onnx::TensorProto* w_init;
       int32_t dtype = onnx::TensorProto::FLOAT;
-      int64_t dim0 = 0;
-      int64_t dim1 = 0;
+      std::vector<int64_t> dims;
       bool weight_transposed = false;
+      bool is_conv = false;
       std::vector<double> w_nk;
       std::vector<double> importance;
     };
@@ -22277,11 +22817,26 @@ onnx::ModelProto ApplyWandaPruning(
     for (const auto& c : candidates) {
       onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
       const int32_t dtype = w_init->data_type();
-      const int64_t dim0 = w_init->dims(0);
-      const int64_t dim1 = w_init->dims(1);
       // ReadTensorAsF64 (FLOAT/FLOAT16/BFLOAT16 -> double, exact upcast) --
       // mirrors pruning.py's own `_to_f64`.
       const std::vector<double> w_f64 = ReadTensorAsF64(*w_init);
+
+      if (c.is_conv) {
+        const int64_t cout = w_init->dims(0);
+        const int64_t kk = w_init->dims(1) * w_init->dims(2) * w_init->dims(3);
+        const std::optional<std::vector<double>> group_norm = conv_norm_for(c);
+        const std::vector<double>* norm = group_norm ? &*group_norm : nullptr;
+        std::vector<double> importance =
+            WandaImportance(w_f64, cout, kk, norm, epsilon);
+        entries.push_back(
+            {w_init, dtype,
+             std::vector<int64_t>(w_init->dims().begin(), w_init->dims().end()),
+             false, true, w_f64, std::move(importance)});
+        continue;
+      }
+
+      const int64_t dim0 = w_init->dims(0);
+      const int64_t dim1 = w_init->dims(1);
       WandaNK nk = ToWandaNK(w_f64, dim0, dim1, c.weight_transposed);
 
       const std::vector<double>* norm = nullptr;
@@ -22291,8 +22846,13 @@ onnx::ModelProto ApplyWandaPruning(
       }
       std::vector<double> importance =
           WandaImportance(nk.w_nk, nk.n_rows, nk.kk, norm, epsilon);
-      entries.push_back({w_init, dtype, dim0, dim1, c.weight_transposed,
-                         std::move(nk.w_nk), std::move(importance)});
+      entries.push_back({w_init,
+                         dtype,
+                         {dim0, dim1},
+                         c.weight_transposed,
+                         false,
+                         std::move(nk.w_nk),
+                         std::move(importance)});
     }
 
     size_t total = 0;
@@ -22337,8 +22897,10 @@ onnx::ModelProto ApplyWandaPruning(
       }
       offset += size;
       const std::vector<double> w_new =
-          FromWandaNK(pruned_nk, e.dim0, e.dim1, e.weight_transposed);
-      WriteF64TensorAs(e.w_init, e.dtype, {e.dim0, e.dim1}, w_new);
+          e.is_conv ? std::move(pruned_nk)
+                    : FromWandaNK(pruned_nk, e.dims[0], e.dims[1],
+                                  e.weight_transposed);
+      WriteF64TensorAs(e.w_init, e.dtype, e.dims, w_new);
     }
     return out;
   }
@@ -22346,11 +22908,32 @@ onnx::ModelProto ApplyWandaPruning(
   for (const auto& c : candidates) {
     onnx::TensorProto* w_init = mut_init_map.at(c.w_name);
     const int32_t dtype = w_init->data_type();
-    const int64_t dim0 = w_init->dims(0);
-    const int64_t dim1 = w_init->dims(1);
     // ReadTensorAsF64 (FLOAT/FLOAT16/BFLOAT16 -> double, exact upcast) --
     // mirrors pruning.py's own `_to_f64`.
     const std::vector<double> w_f64 = ReadTensorAsF64(*w_init);
+
+    if (c.is_conv) {
+      const std::vector<int64_t> dims(w_init->dims().begin(),
+                                      w_init->dims().end());
+      const int64_t cout = dims[0];
+      const int64_t kk = dims[1] * dims[2] * dims[3];
+      const std::optional<std::vector<double>> group_norm = conv_norm_for(c);
+      const std::vector<double>* norm = group_norm ? &*group_norm : nullptr;
+      const std::vector<double> importance =
+          WandaImportance(w_f64, cout, kk, norm, epsilon);
+      const std::vector<uint8_t> mask =
+          n.has_value() ? WandaNmMaskNK(importance, cout, kk, *n, *m)
+                        : WandaSparsityMaskNK(importance, cout, kk, sparsity);
+      std::vector<double> pruned_nk(w_f64.size());
+      for (size_t i = 0; i < pruned_nk.size(); ++i) {
+        pruned_nk[i] = mask[i] ? w_f64[i] : 0.0;
+      }
+      WriteF64TensorAs(w_init, dtype, dims, pruned_nk);
+      continue;
+    }
+
+    const int64_t dim0 = w_init->dims(0);
+    const int64_t dim1 = w_init->dims(1);
     WandaNK nk = ToWandaNK(w_f64, dim0, dim1, c.weight_transposed);
 
     const std::vector<double>* norm = nullptr;

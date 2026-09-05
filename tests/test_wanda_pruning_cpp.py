@@ -16,18 +16,54 @@ zeros, and every surviving entry is byte-identical to the original (never
 recomputed).
 
 Scope: this port matches plain ``MatMul``/vanilla-``Gemm`` (not
-``com.microsoft::FusedGemm``/``GemmFastGelu``) and ``com.microsoft::
+``com.microsoft::FusedGemm``/``GemmFastGelu``), ``com.microsoft::
 Attention``'s merged QKV weight, each with a constant 2-D (1-D merged bias,
-for Attention) FLOAT32/FLOAT16/BFLOAT16 weight -- TRUE parity with the
-pure-Python ``onnxsim.apply_wanda_pruning`` on this axis -- and does NOT
-match ``Conv`` at all -- see ``structured_pruning_entry.h``'s own
-``ApplyWandaPruning`` declaration comment for the full scope decision and
-rationale (mirroring ``ApplySparseGptPruning``'s own identical Conv
-decision). The Conv-declined test below confirms that gap is handled by
-leaving the layer alone, not by crashing or by silently mishandling the
-tensor; the FLOAT16/BFLOAT16 tests below confirm those dtypes are matched,
-pruned, and written back with their own exact original bit pattern
-preserved for every surviving entry -- not merely "not crashed on".
+for Attention) FLOAT32/FLOAT16/BFLOAT16 weight, AND (as of this round) every
+2-D ``Conv`` node's constant 4-D FLOAT32/FLOAT16/BFLOAT16 weight -- ordinary
+(``group=1``), fully depthwise (``group == in_channels == out_channels``),
+and general grouped (``1 < group < in_channels``) alike -- via a
+from-scratch im2col per-``(in_channel, kh, kw)``-tap activation norm
+(``ConvPatchSqSum``/``ConvWandaCalibrationStats``) and a grouped/depthwise
+group-relative norm expansion (``ConvGroupRelativeNorm``), mirroring
+pruning.py's own ``_conv_patch_sq_sum``/``_conv_group_relative_norm``
+exactly -- TRUE parity with the pure-Python ``onnxsim.apply_wanda_pruning``
+verified on all three Conv `group` shapes (see the Conv tests below).
+
+Despite that, ``onnxsim.apply_wanda_pruning`` (the pure-Python name) is
+DELIBERATELY NOT aliased to this C++ port -- unlike, e.g.,
+``apply_transformer_block_pruning``/``apply_magnitude_pruning`` -- because
+this round's own full-regression check (comparing every existing candidate
+family's live output against the pure-Python reference, not just the new
+Conv coverage) surfaced a genuine, PRE-EXISTING divergence unrelated to
+Conv: this port's own ``WandaCalibrationStats`` (shared with
+``ApplyStructuredWandaPruning``/``ApplyAttentionHeadWandaPruning``) computes
+a per-channel-axis activation L2-norm for a MatMul/Gemm candidate's
+activation at ANY rank >= 1 (probe axis -1, the same "reduce over every
+leading axis" handling it gives a rank-3 Attention activation), whereas
+pruning.py's own ``_wanda_unstructured_calibration_stats`` explicitly
+requires ``x.ndim == 2`` for its own (non-Attention, non-Conv) activation
+statistic and falls back to plain magnitude importance for anything else
+(e.g. a rank-3 activation feeding a plain 2-D MatMul weight, which is
+exactly the shape a batched/sequence MatMul input takes in practice). So a
+MatMul/Gemm layer fed a rank-3+ activation gets a REAL (but, per the Python
+reference's own narrower scope, not-yet-earned) activation-weighted
+importance from this C++ port instead of the Python reference's plain-
+magnitude fallback -- a real behavioral difference, caught by
+``test_wanda_pruning_falls_back_to_magnitude_without_matching_activation``
+in ``tests/test_pruning.py`` once ``apply_wanda_pruning`` was tentatively
+aliased to this port to verify the Conv work below. This is orthogonal to
+Conv entirely (present before this round's Conv work, in code this round
+never touched) and touches ``WandaCalibrationStats``, shared, independently-
+verified infrastructure two OTHER passes also depend on -- fixing it safely
+is out of scope here; the safe, conservative choice is to leave
+``apply_wanda_pruning`` un-aliased and document this gap rather than risk a
+subtly-wrong alias. The Conv tests below therefore still compare against a
+LIVE call to the pure-Python ``onnxsim.apply_wanda_pruning`` (not a frozen
+golden fixture -- unnecessary since that function keeps its own real
+implementation), exactly like every other test in this file. The
+FLOAT16/BFLOAT16 tests confirm those dtypes are matched, pruned, and
+written back with their own exact original bit pattern preserved for every
+surviving entry -- not merely "not crashed on".
 """
 
 import ml_dtypes
@@ -425,39 +461,144 @@ def test_wanda_pruning_cpp_activation_weighting_differs_from_plain_magnitude():
     assert np.count_nonzero(w_wanda[salient_k, :]) > 0
 
 
-# --- Deliberately out-of-scope inputs: declined, not mishandled ------------
+# --- Conv: ordinary / depthwise / general grouped, all TRUE parity --------
+#
+# 2-D Conv is now matched exactly like pruning.py's own `apply_wanda_pruning`
+# -- ordinary (`group=1`), fully depthwise (`group == in_channels ==
+# out_channels`), and general grouped (`1 < group < in_channels`) alike --
+# via a from-scratch im2col per-`(in_channel, kh, kw)`-tap activation norm
+# (ConvPatchSqSum) and a grouped/depthwise group-relative norm expansion
+# (ConvGroupRelativeNorm), see structured_pruning_entry.h's own
+# ApplyWandaPruning declaration comment. `apply_wanda_pruning` itself is NOT
+# aliased to this port (see this file's own module docstring for the
+# unrelated, pre-existing MatMul-family gap that blocks it), so these still
+# compare against a LIVE call to it, exactly like every other test above.
 
 
-def test_wanda_pruning_cpp_conv_is_left_completely_untouched():
-    # This port does NOT match Conv at all (see structured_pruning_entry.h's
-    # own ApplyWandaPruning declaration comment) -- confirm the weight is
-    # left byte-identical, not crashed on and not silently (incorrectly)
-    # pruned as if it were a plain 2-D MatMul weight.
-    Cin, Cout = 3, 4
-    rng = np.random.default_rng(60)
-    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32) * 0.3
+def _conv_model(Cin, Cout, group, kh=3, kw=3, pads=(1, 1, 1, 1), strides=(1, 1), seed=0):
+    cin_per_group = Cin // group
+    rng = np.random.default_rng(seed)
+    w = rng.standard_normal((Cout, cin_per_group, kh, kw)).astype(np.float32) * 0.4
     model = _model(
         f"""
-        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        g (float[Nb,{Cin},H,W] X) => (float[Nb,{Cout},H2,W2] Y)
         {{
-          Y = Conv<kernel_shape=[3,3]>(X, W)
+          Y = Conv<kernel_shape=[{kh},{kw}], pads=[{pads[0]},{pads[1]},{pads[2]},{pads[3]}], strides=[{strides[0]},{strides[1]}], group={group}>(X, W)
         }}
         """,
         initializer=[_f32(w, "W")],
     )
-    rng2 = np.random.default_rng(160)
-    x_cal = rng2.standard_normal((2, Cin, 10, 10)).astype(np.float32)
-    pruned = onnxsim.apply_wanda_pruning_cpp(
-        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    return model, w
+
+
+def test_wanda_pruning_cpp_conv_ordinary_group1_matches_python_reference():
+    Cin, Cout = 6, 8
+    model, w = _conv_model(Cin=Cin, Cout=Cout, group=1, seed=200)
+    rng = np.random.default_rng(1200)
+    x_cal = [rng.standard_normal((2, Cin, 10, 10)).astype(np.float32) for _ in range(2)]
+    calib = [{"X": b} for b in x_cal]
+
+    expected = onnxsim.apply_wanda_pruning(model, calibration_data=calib, sparsity=0.5)
+    actual = onnxsim.apply_wanda_pruning_cpp(model, calibration_data=calib, sparsity=0.5)
+    onnx.checker.check_model(actual)
+    np.testing.assert_array_equal(_weight(actual), _weight(expected))
+    assert not np.array_equal(_weight(actual), w)
+    assert onnxsim.weight_sparsity(actual) == pytest.approx(0.5, abs=0.1)
+
+
+def test_wanda_pruning_cpp_conv_fully_depthwise_matches_python_reference():
+    Cin = Cout = group = 8
+    model, w = _conv_model(Cin=Cin, Cout=Cout, group=group, seed=201)
+    rng = np.random.default_rng(1201)
+    x_cal = [rng.standard_normal((2, Cin, 10, 10)).astype(np.float32) for _ in range(2)]
+    calib = [{"X": b} for b in x_cal]
+
+    expected = onnxsim.apply_wanda_pruning(model, calibration_data=calib, sparsity=0.5)
+    actual = onnxsim.apply_wanda_pruning_cpp(model, calibration_data=calib, sparsity=0.5)
+    onnx.checker.check_model(actual)
+    np.testing.assert_array_equal(_weight(actual), _weight(expected))
+    assert not np.array_equal(_weight(actual), w)
+    assert onnxsim.weight_sparsity(actual) == pytest.approx(0.5, abs=0.1)
+
+
+def test_wanda_pruning_cpp_conv_general_grouped_matches_python_reference():
+    # 1 < group < in_channels -- exercises ConvGroupRelativeNorm's own
+    # per-group channel-block slicing (not the group=1 or fully-depthwise
+    # degenerate cases above).
+    Cin, Cout, group = 8, 12, 4
+    model, w = _conv_model(Cin=Cin, Cout=Cout, group=group, seed=202)
+    rng = np.random.default_rng(1202)
+    x_cal = [rng.standard_normal((2, Cin, 10, 10)).astype(np.float32) for _ in range(2)]
+    calib = [{"X": b} for b in x_cal]
+
+    expected = onnxsim.apply_wanda_pruning(model, calibration_data=calib, sparsity=0.5)
+    actual = onnxsim.apply_wanda_pruning_cpp(model, calibration_data=calib, sparsity=0.5)
+    onnx.checker.check_model(actual)
+    np.testing.assert_array_equal(_weight(actual), _weight(expected))
+    assert not np.array_equal(_weight(actual), w)
+    assert onnxsim.weight_sparsity(actual) == pytest.approx(0.5, abs=0.1)
+
+
+def test_wanda_pruning_cpp_conv_general_grouped_nm_pattern_matches_python_reference():
+    Cin, Cout, group = 8, 12, 4
+    model, _w = _conv_model(Cin=Cin, Cout=Cout, group=group, seed=203)
+    rng = np.random.default_rng(1203)
+    x_cal = [rng.standard_normal((2, Cin, 10, 10)).astype(np.float32) for _ in range(2)]
+    calib = [{"X": b} for b in x_cal]
+
+    expected = onnxsim.apply_wanda_pruning(model, calibration_data=calib, n=2, m=4)
+    actual = onnxsim.apply_wanda_pruning_cpp(model, calibration_data=calib, n=2, m=4)
+    onnx.checker.check_model(actual)
+    np.testing.assert_array_equal(_weight(actual), _weight(expected))
+
+    # Exactly 2 of every 4 consecutive columns survive, per output filter row
+    # (the reshaped [out_channels, cin_per_group*kh*kw] view).
+    cin_per_group = Cin // group
+    w_nk = _weight(actual).reshape(Cout, cin_per_group * 3 * 3)
+    for row in w_nk:
+        for start in range(0, len(row), 4):
+            group_cols = row[start : start + 4]
+            if len(group_cols) == 4:
+                assert np.count_nonzero(group_cols) == 2
+
+
+def test_wanda_pruning_cpp_conv_depthwise_float16_matches_python_reference():
+    # FLOAT16 analogue of the depthwise test above -- exercises the
+    # ReadTensorAsF64/WriteF64TensorAs round trip for a Conv candidate, not
+    # just the MatMul/Attention ones.
+    Cin = Cout = group = 6
+    rng = np.random.default_rng(204)
+    w = (rng.standard_normal((Cout, 1, 3, 3)) * 0.4).astype(np.float16)
+    model = _model(
+        f"""
+        g (float16[Nb,{Cin},10,10] X) => (float16[Nb,{Cout},10,10] Y)
+        {{
+          Y = Conv<kernel_shape=[3,3], pads=[1,1,1,1], group={group}>(X, W)
+        }}
+        """,
+        initializer=[_f16(w, "W")],
     )
-    onnx.checker.check_model(pruned)
-    np.testing.assert_array_equal(_weight(pruned), w)
+    rng2 = np.random.default_rng(1204)
+    x_cal = [
+        rng2.standard_normal((2, Cin, 10, 10)).astype(np.float16) for _ in range(2)
+    ]
+    calib = [{"X": b} for b in x_cal]
+
+    expected = onnxsim.apply_wanda_pruning(model, calibration_data=calib, sparsity=0.5)
+    actual = onnxsim.apply_wanda_pruning_cpp(model, calibration_data=calib, sparsity=0.5)
+    onnx.checker.check_model(actual)
+    assert actual.graph.initializer[0].data_type == onnx.TensorProto.FLOAT16
+    np.testing.assert_array_equal(
+        _weight(actual).view(np.uint16), _weight(expected).view(np.uint16)
+    )
+    assert not np.array_equal(_weight(actual).view(np.uint16), w.view(np.uint16))
+    assert onnxsim.weight_sparsity(actual) == pytest.approx(0.5, abs=0.1)
 
 
 # --- FLOAT16/BFLOAT16 weight support: matches the pure-Python reference ----
 #
-# Unlike the Conv gap above, FLOAT16/BFLOAT16 is now TRUE parity with
-# pruning.py's own `apply_wanda_pruning` -- reads out upcast to float64 via
+# FLOAT16/BFLOAT16 is TRUE parity with pruning.py's own
+# `apply_wanda_pruning` -- reads out upcast to float64 via
 # ReadTensorAsF64, importance/masking computed identically to the FLOAT32
 # path, written back down via WriteF64TensorAs, exactly mirroring
 # pruning.py's own `_to_f64`/`_from_f64` round trip (see

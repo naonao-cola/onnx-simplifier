@@ -516,52 +516,108 @@ onnx::ModelProto ApplySparseGptPruning(
 // change): like ApplySparseGptPruning immediately above, this NEVER changes
 // any tensor's shape -- only individual weight entries are zeroed in place.
 //
-// Matches EXACTLY the same candidate set as ApplySparseGptPruning, via the
-// same MatchMatMulLikeRaw matcher for the MatMul/Gemm case, PLUS a local,
+// Matches the same candidate set as ApplySparseGptPruning, via the same
+// MatchMatMulLikeRaw matcher for the MatMul/Gemm case, PLUS a local,
 // dtype-widened copy of MatchAttentionProducer for the Attention case (see
 // structured_pruning_entry.cpp's own "Wanda unstructured (element-wise)
 // pruning" section comment, MatchAttentionProducerWideDtype, for why this
-// needs its own copy rather than reusing MatchAttentionProducer directly):
-// every plain `MatMul`/vanilla-`Gemm` node with a constant 2-D FLOAT32/
-// FLOAT16/BFLOAT16 weight (already covering
+// needs its own copy rather than reusing MatchAttentionProducer directly),
+// PLUS every 2-D `Conv` node's constant 4-D FLOAT32/FLOAT16/BFLOAT16 weight
+// (MatchConvWeightOnly, mirroring pruning.py's own `_match_conv_weight_only`
+// -- ordinary (`group=1`), depthwise, and general grouped Conv all matched
+// identically): every plain `MatMul`/vanilla-`Gemm` node with a constant 2-D
+// FLOAT32/FLOAT16/BFLOAT16 weight (already covering
 // `com.microsoft::GroupQueryAttention`'s own separate Q/K/V projections --
 // ordinary MatMul/Gemm nodes feeding it, not a weight the op itself owns),
-// plus every `com.microsoft::Attention` node's constant 2-D FLOAT32/FLOAT16/
-// BFLOAT16 merged QKV weight -- mirrors pruning.py's own
-// `_is_supported_float_dtype` widening of `_match_attention_producer`
-// exactly. Like ApplySparseGptPruning immediately above (also widened this
-// same round), FLOAT16/BFLOAT16 support is now at TRUE parity with
-// pruning.py's own `apply_wanda_pruning` (read out upcast to float64 via
-// ReadTensorAsF64, written back down via WriteF64TensorAs -- this file's own
-// MoE/QMoE-established conversion trio, see IsSupportedFloatDtype's own
-// declaration comment -- exactly mirroring pruning.py's own `_to_f64`/
-// `_from_f64` round trip; masking never changes a surviving entry's own
-// value, only zeros dropped ones, so this reproduces every kept entry's
-// exact original bit pattern). Only remaining, deliberate gap vs.
-// pruning.py's own `apply_wanda_pruning`:
-//   - 2-D `Conv` (ordinary/depthwise/general-grouped) is NOT matched at
-//     all -- pruning.py's own Conv support for THIS function needs the same
-//     from-first-principles im2col per-receptive-field-offset activation
-//     norm (`_conv_patch_sq_sum`, `_conv_group_relative_norm`) that
-//     ApplySparseGptPruning's own declaration comment explains is out of
-//     scope here for the analogous Hessian case -- materially bigger than
-//     the rest of this pass (a brand-new im2col activation-collection engine
-//     this file has nowhere else, plus the grouped/depthwise group-relative
-//     norm expansion, with real numeric-correctness risk if gotten subtly
-//     wrong), and deliberately left to the pure-Python implementation rather
-//     than risked this round. A Conv node here simply never matches either
-//     candidate case and is left completely untouched, never guessed at.
-//     Because of this ONE remaining gap, `apply_wanda_pruning` is NOT
-//     aliased to this port in pruning.py -- see that function's own
-//     docstring there.
+// every `com.microsoft::Attention` node's constant 2-D FLOAT32/FLOAT16/
+// BFLOAT16 merged QKV weight, and every 2-D `Conv` node's constant 4-D
+// FLOAT32/FLOAT16/BFLOAT16 `[out_channels, in_channels/group, kH, kW]`
+// weight -- mirrors pruning.py's own `_is_supported_float_dtype` widening of
+// `_match_attention_producer`/`_match_conv_weight_only` exactly. FLOAT16/
+// BFLOAT16 support is at TRUE parity with pruning.py's own
+// `apply_wanda_pruning` for all three candidate families (read out upcast to
+// float64 via ReadTensorAsF64, written back down via WriteF64TensorAs --
+// this file's own MoE/QMoE-established conversion trio, see
+// IsSupportedFloatDtype's own declaration comment -- exactly mirroring
+// pruning.py's own `_to_f64`/`_from_f64` round trip; masking never changes a
+// surviving entry's own value, only zeros dropped ones, so this reproduces
+// every kept entry's exact original bit pattern). Verified TRUE numerical
+// parity against pruning.py's own `apply_wanda_pruning` on ordinary
+// (`group=1`), fully depthwise (`group == in_channels == out_channels`),
+// and general grouped (`1 < group < in_channels`) Conv alike, with real
+// calibration data.
 //
-// Wanda's own calibration statistic -- one shared per-reduction-channel
-// activation L2-norm per matched layer's own input, reduced over every
-// leading axis (so a rank-3 `com.microsoft::Attention` input is handled
-// exactly like a rank-2 MatMul/Gemm one, mirroring pruning.py's own
-// `x.reshape(-1, x.shape[-1])`) -- is exactly WandaCalibrationStats' own
-// output shape, reused verbatim: probe axis -1 for every candidate, keyed
-// by each candidate's own activation tensor name (`x_name`) rather than by
+// Despite that Conv parity, `apply_wanda_pruning` in pruning.py is
+// DELIBERATELY NOT an alias of this function -- a full-regression check
+// (every existing MatMul/Gemm/Attention candidate's live output against the
+// pure-Python reference, not just the new Conv coverage) surfaced a
+// genuine, PRE-EXISTING divergence unrelated to Conv: WandaCalibrationStats
+// below computes a per-channel-axis activation norm for a MatMul/Gemm
+// candidate's own activation at ANY rank >= 1 (probe axis -1, the same
+// "reduce over every leading axis" treatment it gives a rank-3 Attention
+// activation), whereas pruning.py's own
+// `_wanda_unstructured_calibration_stats` explicitly requires `x.ndim == 2`
+// for that same (non-Attention, non-Conv) statistic and falls back to
+// plain magnitude importance for anything else -- e.g. a rank-3 activation
+// feeding a plain 2-D MatMul weight, exactly the shape a batched/sequence
+// MatMul input takes in practice. So this port gives such a layer a REAL
+// (but, per the Python reference's own narrower scope, not-yet-earned)
+// activation-weighted importance instead of the Python reference's
+// plain-magnitude fallback. This predates this round's Conv work entirely
+// (in code this round never touched) and was only exposed once
+// `apply_wanda_pruning` was tentatively aliased here to verify that Conv
+// work; fixing WandaCalibrationStats' own rank handling touches shared,
+// independently-verified infrastructure ApplyStructuredWandaPruning/
+// ApplyAttentionHeadWandaPruning also depend on, so it is deliberately left
+// undone and undocumented-as-fixed here -- the conservative choice over a
+// subtly-wrong alias. See tests/test_wanda_pruning_cpp.py's own module
+// docstring for the full writeup and
+// tests/test_pruning.py's own
+// test_wanda_pruning_falls_back_to_magnitude_without_matching_activation
+// for the regression that caught it.
+//
+// Conv's own im2col per-receptive-field-offset activation norm --
+// `X_j` for a Conv column is not "input feature `j`" but "receptive-field
+// offset `j`", one `(in_channel, kh, kw)` tap of the sliding kernel -- is
+// computed by ConvPatchSqSum/ConvWandaCalibrationStats
+// (structured_pruning_entry.cpp's own "Conv im2col-unfolded activation
+// statistics (Wanda only)" section), a from-scratch C++ port of pruning.py's
+// own `_conv_patch_sq_sum`: zero-pads each calibration batch's own `[N,
+// Cin, H, W]` input (every `pads`/`auto_pad`/`strides`/`dilations`
+// combination the ONNX Conv schema defines is handled, mirroring
+// `_resolve_conv_pads`/`ResolveConvPads` exactly; only a genuinely malformed
+// node -- a `kernel_shape` disagreeing with the weight's own shape, an
+// unrecognized `auto_pad`, non-positive `strides`/`dilations` --
+// ResolveConvSpatialAttrs declines, falling that one Conv layer back to
+// plain magnitude, same as any other layer whose activation norm was never
+// observed), then accumulates the sum of squares each of the `kh*kw`
+// receptive-field taps reads, over every calibration sample and output
+// spatial position. For a grouped/depthwise Conv, ConvGroupRelativeNorm
+// (mirroring `_conv_group_relative_norm`) keeps that norm relative to each
+// filter's OWN group's channel block, rather than sharing one norm row
+// across every filter -- output filter `i` belongs to group `i /
+// (out_channels/group)` (ONNX's own grouped-Conv weight layout) and only
+// ever reads its own group's input-channel slice, so "local receptive-field
+// offset `j`" names a different global input channel depending on the
+// filter's own group; sharing one row would silently score every filter
+// outside group 0 against the wrong channels' statistics. This is a
+// GENUINELY DIFFERENT reduction than WandaCalibrationStats' own "sum of
+// squares over every axis but one declared channel axis" (not a special
+// case of it), so ConvWandaCalibrationStats is a separate function reusing
+// only WandaCalibrationStats' own probe-injection/batch-iteration/DLPack-
+// input-feeding plumbing, at the cost of one extra `executor.Run` per
+// calibration batch whenever a model has both Conv and MatMul/Gemm/
+// Attention candidates (see ConvWandaCalibrationStats' own comment for why
+// this trade-off was made deliberately).
+//
+// Wanda's own calibration statistic for the MatMul/Gemm/Attention candidate
+// families -- one shared per-reduction-channel activation L2-norm per
+// matched layer's own input, reduced over every leading axis (so a rank-3
+// `com.microsoft::Attention` input is handled exactly like a rank-2
+// MatMul/Gemm one, mirroring pruning.py's own `x.reshape(-1,
+// x.shape[-1])`) -- is exactly WandaCalibrationStats' own output shape,
+// reused verbatim: probe axis -1 for every non-Conv candidate, keyed by
+// each candidate's own activation tensor name (`x_name`) rather than by
 // weight name the way pruning.py's own `attn_act_norm` is keyed for
 // Attention -- mirroring ApplyAttentionHeadWandaPruning's own already-
 // established simplification of that same distinction (two distinct

@@ -1857,32 +1857,42 @@ def apply_wanda_pruning_cpp(
     FLOAT32/FLOAT16/BFLOAT16 weight (this already includes
     ``com.microsoft::GroupQueryAttention``'s own separate Q/K/V projections
     -- ordinary MatMul/Gemm nodes feeding it, not a weight the op itself
-    owns), plus every ``com.microsoft::Attention`` node's constant 2-D
-    FLOAT32/FLOAT16/BFLOAT16 merged QKV weight -- the same candidate set
-    :func:`onnxsim.apply_sparsegpt_pruning_cpp` matches, both widened to
-    FLOAT32/FLOAT16/BFLOAT16 this round (read out upcast to float64, written
-    back down to the original dtype, exactly mirroring the pure-Python
+    owns), every ``com.microsoft::Attention`` node's constant 2-D
+    FLOAT32/FLOAT16/BFLOAT16 merged QKV weight, and every 2-D ``Conv``
+    node's constant 4-D FLOAT32/FLOAT16/BFLOAT16 weight -- ordinary
+    (``group=1``), fully depthwise (``group == in_channels ==
+    out_channels``), and general grouped (``1 < group < in_channels``)
+    alike (read out upcast to float64, written back down to the original
+    dtype, exactly mirroring the pure-Python
     :func:`onnxsim.apply_wanda_pruning`'s own ``_to_f64``/``_from_f64``
     round trip -- masking never recomputes a surviving entry's own value, so
-    this reproduces its exact original bit pattern). Only remaining
-    deliberate gap vs. the pure-Python :func:`onnxsim.apply_wanda_pruning`:
+    this reproduces its exact original bit pattern). TRUE parity with the
+    pure-Python :func:`onnxsim.apply_wanda_pruning` on every one of these
+    candidate families, including Conv's own from-scratch im2col
+    per-receptive-field-offset activation norm (``_conv_patch_sq_sum``'s C++
+    mirror, ``ConvPatchSqSum``) and grouped/depthwise group-relative norm
+    expansion (``_conv_group_relative_norm``'s C++ mirror,
+    ``ConvGroupRelativeNorm`` -- see ``structured_pruning_entry.h``'s own
+    ``ApplyWandaPruning`` declaration comment for the full mechanism).
 
-    - 2-D ``Conv`` (ordinary/depthwise/general-grouped) is **not** matched
-      at all here -- the pure-Python original's own Conv support needs an
-      entirely new, from-first-principles im2col per-receptive-field-offset
-      activation norm (``_conv_patch_sq_sum``/``_conv_group_relative_norm``)
-      that :func:`onnxsim.apply_sparsegpt_pruning_cpp`'s own docstring
-      explains is out of scope here too, for the analogous Hessian case --
-      reaching that bar is materially bigger than the rest of this pass
-      (a brand-new im2col activation-collection engine this C++ port has
-      nowhere else, plus the grouped/depthwise group-relative norm
-      expansion, with real numeric-correctness risk if gotten subtly wrong)
-      and is deliberately left to the pure-Python implementation rather than
-      risked this round. A Conv node is left completely untouched here,
-      never guessed at, exactly as if it were any other unmatched node type
-      -- use the pure-Python :func:`onnxsim.apply_wanda_pruning` if Conv
-      coverage is required. Because of this one remaining gap,
-      :func:`onnxsim.apply_wanda_pruning` is NOT an alias of this function.
+    Despite that Conv parity, :func:`onnxsim.apply_wanda_pruning` (the
+    pure-Python name) is DELIBERATELY NOT an alias of this function: a
+    full-regression check (every existing MatMul/Gemm/Attention candidate's
+    live output against the pure-Python reference, not just the new Conv
+    coverage) surfaced a genuine, pre-existing divergence unrelated to
+    Conv -- this port's own calibration statistic (``WandaCalibrationStats``,
+    shared with :func:`onnxsim.apply_structured_wanda_pruning_cpp`/
+    ``ApplyAttentionHeadWandaPruning``) computes a real per-channel-axis
+    activation norm for a MatMul/Gemm candidate's activation at ANY rank,
+    whereas the pure-Python reference requires exactly rank 2 for that same
+    statistic and falls back to plain magnitude for anything else (e.g. a
+    rank-3, batched/sequence activation feeding a plain 2-D MatMul weight).
+    See ``structured_pruning_entry.h``'s own ``ApplyWandaPruning``
+    declaration comment for the full writeup of this separate, out-of-scope
+    gap (it touches calibration infrastructure two other, independently-
+    verified passes also depend on) and
+    ``tests/test_wanda_pruning_cpp.py``'s own module docstring for the
+    regression test that caught it.
 
     Unlike :func:`onnxsim.apply_sparsegpt_pruning_cpp` (which has no data-
     free fallback at all -- its entire mechanism IS the Hessian), a matched
