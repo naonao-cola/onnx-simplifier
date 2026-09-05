@@ -892,6 +892,61 @@ byte-diffing technique demonstrated for Conv's bias, scaled up to cover
 and critically, `AxQuantizedConv`'s dominant weight/compute payload itself
 -- each a real, well-scoped, but separately time-consuming target.
 
+### A first real crack at `AxQuantizedConv`'s command encoding
+
+Taking up that target directly: since Conv's actual *weight values* live
+in Wbt (already reasonably well understood), what's left opaque in mcode
+for `AxQuantizedConv` is the *command* that invokes it -- stride, padding,
+dilation, groups, and whatever addressing/scheduling those imply. Sweeping
+each independently (single `Conv`, shape otherwise fixed) confirmed the
+now-familiar problem: most pairs differ in total mcode length (a stride or
+padding change usually changes the output tensor's declared shape too),
+which triggers the wholesale re-serialization this README already
+documented -- diffing two differently-sized blobs mostly shows *that*
+effect, not the parameter's own encoding.
+
+**The fix: pick pairs that happen to serialize to the *same total length*.**
+`dilation=2` vs `dilation=3` (padding adjusted to keep output shape
+identical, so *only* dilation differs) both compiled to exactly 3528
+bytes; `groups=2` vs `groups=4` both compiled to exactly 3176 bytes. With
+length held constant, a full byte-level diff (not just common-prefix/
+suffix) is meaningful, and both pairs show real, tight, structured
+differences instead of a wholesale rewrite:
+
+- Two **byte-identical 94-byte and 60-byte blocks**, each appearing twice
+  in the blob (at a fixed +608-byte separation for the dilation pair),
+  containing a handful of scattered single-byte differences -- plausibly
+  one shared command template instantiated once per major compute engine
+  (`conv0`/`conv1` split evenly in this README's own `resnet18d` profiling
+  above), each copy separately patched with a few dilation/groups-sensitive
+  bytes.
+- **A real, precisely-located periodic field**: exactly **4 repeats of a
+  3-byte value, each occurring every 7 bytes**, changing identically with
+  both dilation (`1a3b80`->`4b186f`, repeated at offsets 2561/2568/2575/
+  2582) and groups (`924e5c`->`af9636`, repeated 7 bytes apart). The exact
+  same 4x/7-byte-stride shape in two independent experiments is real
+  structure, not noise.
+- **A control experiment rules out the obvious explanation**: re-running
+  the dilation pair with `cout=8` instead of 4 still shows *exactly 4*
+  repeats (at the same 7-byte stride) -- so this field is not
+  "one entry per output channel." It's much more likely one entry per
+  **spatial tile**: this README's own `resnet18d` profiling above already
+  found real primitives split into named `_s0`/`_s1`/`_s2`/`_s3`
+  sub-events (`AxMaxPool`, `AxQuantizedNormalize`) -- independent evidence
+  for a fixed 4-way spatial tiling convention in this compiler, which this
+  new byte-level finding now corroborates from a completely different
+  angle.
+
+**Still not decoded**: the exact bit-level meaning of that 3-byte
+per-tile field, or of the scattered single-byte differences inside the
+94-byte/60-byte shared blocks. This is a real, precise *location* (mcode
+byte offsets 2561-2601 in this specific build, always 4 entries at a
+7-byte stride) for future work to target, not a solved encoding -- but
+it's the first time this investigation has isolated a small, structured,
+non-header/footer region of `AxQuantizedConv`'s own command at all,
+against a real production-scale finding (4-way spatial tiling) rather than
+a synthetic-model artifact.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
