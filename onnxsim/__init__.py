@@ -172,6 +172,7 @@ from onnxsim.spqr import quantize_weight_only_spqr
 from onnxsim.squeezellm import quantize_weight_only_squeezellm
 from onnxsim.tensorrt_sparsity import convert_matmul_to_gemm
 from onnxsim.tesseraq import apply_tesseraq
+from onnxsim.tflite_export import export_tflite
 from onnxsim.transformers_export import export_transformers_model
 from onnxsim.zeroquant import apply_zeroquant
 
@@ -343,5 +344,6 @@ __all__ = [
     "export_transformers_model",
     "export_mlir",
     "export_coreml",
+    "export_tflite",
     "__version__",
 ]

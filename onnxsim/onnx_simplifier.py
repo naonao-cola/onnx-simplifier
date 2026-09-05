@@ -3773,6 +3773,23 @@ def main():
         "or 'macOS13'. Defaults to coremltools' own default.",
     )
     parser.add_argument(
+        "--emit-tflite",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Also convert the simplified model to TensorFlow Lite (via "
+        "TensorFlow; pip install tensorflow). Requires fully static input shapes. "
+        "Optionally give an output path; when the flag is passed without one, it "
+        "is written next to the output model with a '.tflite' extension.",
+    )
+    parser.add_argument(
+        "--tflite-optimize",
+        action="store_true",
+        help="Enable TFLite's default post-training (dynamic-range) quantization "
+        "when converting with --emit-tflite.",
+    )
+    parser.add_argument(
         "--node-reduction-plot",
         help="After simplifying, plot node count per round for each "
         "simplification fixed-point loop (from the --profile trace's "
@@ -4663,6 +4680,24 @@ def main():
             print(Text(str(e), style="bold red"))
             sys.exit(1)
         print(f"Core ML model written to {coreml_path}")
+
+    if args.emit_tflite is not None:
+        from onnxsim import tflite_export
+
+        if args.emit_tflite:
+            tflite_path = args.emit_tflite
+        else:
+            tflite_path = os.path.splitext(args.output_model)[0] + ".tflite"
+        print(f"Converting to TensorFlow Lite at {tflite_path} ...")
+        tflite_kwargs = {}
+        if args.tflite_optimize:
+            tflite_kwargs["optimizations"] = ["DEFAULT"]
+        try:
+            tflite_export.export_tflite(model_opt, tflite_path, **tflite_kwargs)
+        except RuntimeError as e:
+            print(Text(str(e), style="bold red"))
+            sys.exit(1)
+        print(f"TFLite model written to {tflite_path}")
 
     if check_ok:
         print("Finish! Here is the difference:")
