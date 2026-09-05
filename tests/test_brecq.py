@@ -51,7 +51,8 @@ def _residual_block_model(D=32, seed=0):
     # A ResNet "BasicBlock"-shaped toy: two stacked MatMuls (standing in for
     # two stacked convolutions) plus a residual Add back to the block's own
     # input -- exactly the topology onnxsim.brecq's own docstring documents
-    # discovering.
+    # discovering. D must be a multiple of 32:
+    # onnxsim.quantize_weight_only_int4's own fixed block size.
     rng = np.random.default_rng(seed)
     w1 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
     w2 = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
@@ -66,6 +67,85 @@ def _residual_block_model(D=32, seed=0):
         """,
         [_f32(w1, "W1"), _f32(w2, "W2")],
     )
+
+
+def _quantize_chain_int4(model, weight_names):
+    # onnxsim.quantize_weight_only_int4 only ever quantizes the *first*
+    # MatMul in a chain whose activation input is a graph input -- a MatMul
+    # fed by another node's own output (i.e. every non-first layer of a
+    # chain) is left untouched (verified directly: a plain 2- or 3-MatMul
+    # chain only ever gets its first layer quantized). That is a limitation
+    # of the existing pass this module does not attempt to fix (out of
+    # scope for a new reconstruction module). To build a *fully* quantized
+    # multi-layer chain for these tests, quantize each named weight's own
+    # MatMul in isolation (a tiny standalone one-node model, where it *is*
+    # the first/only layer) via the real production pass, then splice each
+    # resulting DequantizeLinear + Wq/Ws back into the full chain model --
+    # exactly the RTN codes the real pass would have produced for that
+    # layer on its own, just assembled by hand instead of relying on the
+    # pass's own multi-layer traversal.
+    orig_inits = {t.name: t for t in model.graph.initializer}
+    quant = onnx.ModelProto()
+    quant.CopyFrom(model)
+
+    new_nodes = []
+    new_initializers = [
+        t for t in quant.graph.initializer if t.name not in weight_names
+    ]
+    for idx, node in enumerate(quant.graph.node):
+        if node.op_type not in ("MatMul", "Gemm") or node.input[1] not in weight_names:
+            new_nodes.append(node)
+            continue
+        w_name = node.input[1]
+        w_init = orig_inits[w_name]
+        k, n = w_init.dims[0], w_init.dims[1]
+        iso = _model(
+            f"""
+            h (float[batch,{k}] Ain) => (float[batch,{n}] Aout)
+            {{
+              Aout = MatMul(Ain, {w_name})
+            }}
+            """,
+            [w_init],
+        )
+        iso_quant = onnxsim.quantize_weight_only_int4(iso)
+        dq_node = next(
+            n for n in iso_quant.graph.node if n.op_type == "DequantizeLinear"
+        )
+        wq_init = next(
+            t for t in iso_quant.graph.initializer if t.name == dq_node.input[0]
+        )
+        ws_init = next(
+            t for t in iso_quant.graph.initializer if t.name == dq_node.input[1]
+        )
+
+        suffix = f"_{idx}"
+        wq_renamed = onnx.TensorProto()
+        wq_renamed.CopyFrom(wq_init)
+        wq_renamed.name += suffix
+        ws_renamed = onnx.TensorProto()
+        ws_renamed.CopyFrom(ws_init)
+        ws_renamed.name += suffix
+        dq_out_name = f"{w_name}_dq{suffix}"
+
+        new_dq = onnx.NodeProto()
+        new_dq.CopyFrom(dq_node)
+        new_dq.input[0] = wq_renamed.name
+        new_dq.input[1] = ws_renamed.name
+        new_dq.output[0] = dq_out_name
+        new_initializers.extend([wq_renamed, ws_renamed])
+        new_nodes.append(new_dq)
+
+        new_node = onnx.NodeProto()
+        new_node.CopyFrom(node)
+        new_node.input[1] = dq_out_name
+        new_nodes.append(new_node)
+
+    del quant.graph.node[:]
+    quant.graph.node.extend(new_nodes)
+    del quant.graph.initializer[:]
+    quant.graph.initializer.extend(new_initializers)
+    return quant
 
 
 def _correlated_calibration(D=32, num_samples=64, rank=6, seed=1):
@@ -132,7 +212,7 @@ def test_brecq_reduces_block_reconstruction_error_vs_independent_adaround():
     x = _correlated_calibration(D=32, num_samples=64, rank=6, seed=1)
     calibration_data = [{"X": x}]
 
-    quant = onnxsim.quantize_weight_only_int4(model)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
     w1_float = onnx.numpy_helper.to_array(
         next(t for t in model.graph.initializer if t.name == "W1")
     ).astype(np.float64)
@@ -170,7 +250,7 @@ def test_brecq_output_stays_close_to_float_via_onnxruntime():
 
     brecq_model = onnxsim.apply_brecq(
         model,
-        onnxsim.quantize_weight_only_int4(model),
+        _quantize_chain_int4(model, {"W1", "W2"}),
         blocks=[("X", "Yout")],
         calibration_data=calibration_data,
     )
@@ -183,11 +263,11 @@ def test_brecq_output_stays_close_to_float_via_onnxruntime():
 
 
 def test_brecq_preserves_scale_and_shape():
-    model = _residual_block_model(D=16, seed=4)
-    x = _correlated_calibration(D=16, num_samples=16, rank=3, seed=5)
+    model = _residual_block_model(D=32, seed=4)
+    x = _correlated_calibration(D=32, num_samples=16, rank=3, seed=5)
     calibration_data = [{"X": x}]
 
-    quant = onnxsim.quantize_weight_only_int4(model)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
     before_scales = {}
     for name in ("Y1", "Y2"):
         matmul_node = next(n for n in quant.graph.node if n.output[0] == name)
@@ -214,21 +294,23 @@ def test_brecq_preserves_scale_and_shape():
         wq = next(
             t for t in brecq_model.graph.initializer if t.name == dq_node.input[0]
         )
-        assert list(wq.dims) == [16, 16]
+        assert list(wq.dims) == [32, 32]
 
 
 def test_brecq_codes_stay_in_range():
-    model = _residual_block_model(D=16, seed=6)
-    x = _correlated_calibration(D=16, num_samples=16, rank=2, seed=7) * 3
+    model = _residual_block_model(D=32, seed=6)
+    x = _correlated_calibration(D=32, num_samples=16, rank=2, seed=7) * 3
     calibration_data = [{"X": x}]
 
-    quant = onnxsim.quantize_weight_only_int4(model)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
     brecq_model = onnxsim.apply_brecq(
         model, quant, blocks=[("X", "Yout")], calibration_data=calibration_data
     )
+    checked_any = False
     for t in brecq_model.graph.initializer:
         if t.data_type != onnx.TensorProto.INT4:
             continue
+        checked_any = True
         numel = int(np.prod(list(t.dims)))
         raw = np.frombuffer(t.raw_data, dtype=np.uint8)
         lo = (raw & 0x0F).astype(np.int8)
@@ -239,6 +321,7 @@ def test_brecq_codes_stay_in_range():
         codes[0::2] = lo[: (numel + 1) // 2]
         codes[1::2] = hi[: numel // 2]
         assert np.all(codes >= -7) and np.all(codes <= 7)
+    assert checked_any
 
 
 def test_brecq_single_layer_chain_without_residual():
@@ -246,7 +329,7 @@ def test_brecq_single_layer_chain_without_residual():
     # to that layer's own output (no residual Add) -- the degenerate case
     # discovery must still handle.
     rng = np.random.default_rng(9)
-    D = 16
+    D = 32
     w = (rng.standard_normal((D, D)) * 0.3).astype(np.float32)
     model = _model(
         f"""
@@ -296,12 +379,12 @@ def test_brecq_noop_when_block_topology_not_discovered():
 
 
 def test_brecq_noop_when_no_blocks_given():
-    model = _residual_block_model(D=8, seed=11)
-    quant = onnxsim.quantize_weight_only_int4(model)
+    model = _residual_block_model(D=32, seed=11)
+    quant = _quantize_chain_int4(model, {"W1", "W2"})
     result = onnxsim.apply_brecq(
         model,
         quant,
         blocks=[],
-        calibration_data=[{"X": np.zeros((1, 8), dtype=np.float32)}],
+        calibration_data=[{"X": np.zeros((1, 32), dtype=np.float32)}],
     )
     assert result.SerializeToString() == quant.SerializeToString()
