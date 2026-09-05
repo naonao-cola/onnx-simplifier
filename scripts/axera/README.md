@@ -792,6 +792,106 @@ story is real and reproducible (flat regions, clean doublings, an exact
 a genuine, well-scoped target for further differential analysis, not a
 closed question.
 
+### How much of mcode do we actually understand, for a real model?
+
+Everything above characterizes tiny, single-purpose synthetic graphs.
+Applying it to a real, full-size, production model --
+`resnet18d_Opset18` (56 nodes, 8 distinct ONNX op types: `Conv` x22,
+`Relu` x19, `Add` x8, `AveragePool` x3, `MaxPool`, `GlobalAveragePool`,
+`Flatten`, `Gemm`) -- gives a real, quantified, honestly small answer.
+
+**Byte-level: roughly 1%.** This model's real compiled mcode blob is
+49,080 bytes. Scanning it for the known FlatBuffers structure (the header,
+vtable, and the tensor-name/`_offset` string table this README already
+decoded, duplicated near the start and end per FlatBuffers' bottom-up
+convention) accounts for only ~505 of those bytes -- the front copy spans
+byte 0 to ~253, the back copy spans ~48,828 to the end. **The remaining
+~48,575 bytes (>99%) are completely uninterpreted** beyond the general
+"changes happen in 32-byte units" behavioral finding above, which says
+nothing about what any specific byte in that region means. A blind scan
+of that whole opaque region for embedded ASCII strings (the same technique
+that found the tensor-name table) turns up nothing but statistical noise
+(~20 spurious 3-4-byte "printable" runs, exactly what you'd expect by
+chance in ~48KB of dense binary data) -- confirming there's no other
+human-readable structure hiding in there for this technique to find.
+
+**Primitive/op-level: about 1 of 7, and even that one is partial.**
+Rebuilding the same model with `--profile` and inspecting the real
+`trace.json` (see the profiling section above) shows the *dataflow* is
+well understood -- but that's a different, much coarser layer than mcode's
+actual byte encoding. The 1433 real scheduled events resolve to:
+
+```
+AxQuantizedConv          996  (69.5%)  -- Conv, with Relu fused in (see below)
+LOAD_XXH128_DEDUP        343  (23.9%)  -- content-addressed weight DMA loads
+"/fc/Gemm_*"              48  ( 3.3%)  -- the final FC layer, kept its ONNX name
+AxQuantizedAdd            22  ( 1.5%)  -- the residual Add
+AxMaxPool                   8  ( 0.6%)  (4 spatial-split sub-events x2)
+AxQuantizedAvgPool           6  ( 0.4%)
+AxQuantizedNormalize          4  ( 0.3%)  -- see below, not an ONNX op at all
+AxQuantizedGlobAvgPool         2  ( 0.1%)
+RTV_IO_EVENT                    2  ( 0.1%)  -- see below
+Post_AxTranspose, final DequantizeLinear -- 1 event each
+```
+
+Of these 7 real distinct *compute* primitive families (`AxQuantizedConv`,
+the FC `Gemm`, `AxQuantizedAdd`, `AxMaxPool`, `AxQuantizedAvgPool`,
+`AxQuantizedNormalize`, `AxQuantizedGlobAvgPool` -- separate from the
+housekeeping categories: weight-load dedup, RTV I/O, transpose, final
+dequant), this whole investigation has only ever differentially decoded
+**one narrow field of one of them**: `AxQuantizedConv`'s per-channel bias
+array (two float32 arrays, one identified as a real requantization
+multiplier -- see the differential-analysis section above). The dominant
+primitive by far (`AxQuantizedConv`'s actual weight/compute encoding, 69.5%
+of all scheduled
+work) is not decoded at all, and `AxQuantizedAdd`, `AvgPool`, `MaxPool`,
+`GlobalAvgPool`, `Normalize`, and the FC `Gemm` path have had zero
+differential analysis directed at them specifically. (The earlier Add/Sub
+differential analysis tested `Add`/`Sub` against a *constant* operand, not
+`AxQuantizedAdd`'s real use here -- a residual add of two activations --
+so it doesn't actually transfer to this real usage.)
+
+**Real findings along the way, not previously documented**, even though
+the underlying bytes remain opaque:
+
+- **`Relu` produces no separate primitive or scheduled event at all** --
+  it's fused directly into the preceding `AxQuantizedConv`, at zero
+  additional schedule cost. Real, free activation fusion.
+- **`Flatten` likewise produces nothing** -- a pure reshape, no compute or
+  DMA needed.
+- **Image normalization (the `calibration_mean`/`calibration_std` from
+  `input_processors`, not part of the original ONNX graph at all) compiles
+  to its own explicit primitive, `AxQuantizedNormalize`** -- confirming
+  Pulsar2's input pre-processing pipeline is baked into mcode as a real,
+  first-class compiled op, not a host-side step.
+- **RTV events are real and present even for a plain CNN's ordinary
+  tensor I/O** (`__rtv_x`, `__rtv_212`, one per graph input/output) --
+  independent, real-model confirmation that the Runtime Variable mechanism
+  from the public prior-generation SDK research above is still live in the
+  current stack, and not restricted to ISP/CV use cases the way the public
+  header's RTV enum values (mostly `WARP_*`/`HAAR_*`/`YDRC_*`) might
+  suggest on their own.
+- **Nearly a quarter of the entire real execution schedule (23.9%, 343 of
+  1433 events) is weight-loading DMA, deduplicated by content hash**
+  (`ld:xxh128:<hash>`) -- a real, previously-undocumented systems
+  optimization: identical weight blocks (plausible for a residual network
+  with repeated block structure) get loaded once and reused via
+  content-addressing, rather than re-transferred per use.
+
+**Bottom line**: this investigation understands the *container* (FlatBuffers)
+and, separately, the real *dataflow schedule* (via `trace.json`) well. It
+does not understand mcode's actual instruction/command encoding in any
+usable sense for a real model -- at best a single narrow field of the
+single most common primitive. Wbt is in better shape: its gross
+composition (weight + per-channel scale + per-channel bias + a tiling
+floor) is characterized, even though the bias array's own bit-level
+quantization format was never independently re-derived either. Turning
+"~1% of mcode's bytes explained" into real coverage would need the same
+byte-diffing technique demonstrated for Conv's bias, scaled up to cover
+`AxQuantizedAdd`/`AvgPool`/`MaxPool`/`GlobalAvgPool`/`Normalize`/`Gemm`,
+and critically, `AxQuantizedConv`'s dominant weight/compute payload itself
+-- each a real, well-scoped, but separately time-consuming target.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
