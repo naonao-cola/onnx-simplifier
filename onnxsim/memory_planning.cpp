@@ -33,9 +33,10 @@ bool Disjoint(const Interval& a, const Interval& b) {
 // place, with no numerical difference from writing to a separate buffer.
 // This is a curated allowlist, not a schema query (nothing here parses
 // attributes or checks the actual input/output types), so it deliberately
-// excludes anything with an exception -- e.g. not "Reshape", which changes
-// rank/strides even though its byte size matches, and whose output some
-// executors treat as view metadata rather than a copy.
+// excludes anything with an exception -- e.g. not "Transpose", whose output
+// (unless the permutation happens to be the identity, which nothing here
+// checks) physically reorders elements rather than computing the same
+// index in place.
 bool IsInPlaceSafeOp(const std::string& op_type) {
   static const std::set<std::string> kSafeOps = {
       "Relu",     "Sigmoid",  "Tanh",        "LeakyRelu",  "Elu",      "Selu",
@@ -44,6 +45,44 @@ bool IsInPlaceSafeOp(const std::string& op_type) {
       "Celu",     "Round",    "Ceil",        "Floor",      "Sign",
   };
   return kSafeOps.count(op_type) > 0;
+}
+
+// Ops that reinterpret their first input's element sequence under a
+// different shape without moving any bytes -- ONNX requires row-major/
+// C-contiguous tensor layout, and none of these ops permute element order
+// (they only regroup, split, or insert/remove size-1 dimensions), so their
+// output is byte-for-byte identical to their input whenever the sizes
+// TensorBytes() reports actually agree (checked the same as every other
+// candidate, at the call site). This is a *stronger* guarantee than
+// IsInPlaceSafeOp's "safe to compute in place" -- these ops need no
+// computation at all, the output is a pure view -- but it is folded into
+// the same union-find aliasing pass since the resulting placement is
+// identical: one shared slot for input and output alike. Not "Transpose"
+// (see IsInPlaceSafeOp) or "Expand"/"Tile" (which do move/duplicate bytes).
+bool IsViewOp(const std::string& op_type) {
+  static const std::set<std::string> kViewOps = {
+      "Reshape",
+      "Flatten",
+      "Squeeze",
+      "Unsqueeze",
+  };
+  return kViewOps.count(op_type) > 0;
+}
+
+// Elementwise *binary* ops whose ONNX semantics compute output[i] purely from
+// (input0[i], input1[i]) -- so, absent broadcasting (checked separately: the
+// candidate operand's byte size must equal the output's), an executor can
+// compute the output by overwriting either operand's own storage in place,
+// same as IsInPlaceSafeOp's unary allowlist but with two candidate operands
+// instead of one. A curated allowlist for the same reason as the unary one:
+// nothing here parses attributes or checks broadcast shapes itself, so it
+// only lists ops that are unconditionally elementwise-safe when the shapes
+// already match.
+bool IsInPlaceSafeBinaryOp(const std::string& op_type) {
+  static const std::set<std::string> kSafeBinaryOps = {
+      "Add", "Sub", "Mul", "Div", "Max", "Min", "And", "Or", "Xor", "Mod",
+  };
+  return kSafeBinaryOps.count(op_type) > 0;
 }
 
 // Union-find (disjoint-set) over tensor names, path-compressed, used to
@@ -127,42 +166,83 @@ MemoryPlan ComputeActivationMemoryPlan(const GraphView& graph) {
     }
   }
 
-  // In-place aliasing: union a safe unary op's input[0] with its output[0]
-  // (see IsInPlaceSafeOp) whenever doing so is provably safe --
+  // Shared eligibility check for a candidate operand `cand` to be aliased
+  // (unioned) with a node's output `out0` -- used by both the unary pass
+  // (IsInPlaceSafeOp / IsViewOp, one candidate: input[0]) and the binary
+  // pass below (IsInPlaceSafeBinaryOp, up to two candidates):
   //   * not a weight, a graph input, or a declared graph output (an
   //     externally-owned buffer, or one the caller reads only after the
   //     whole graph finishes, so overwriting it mid-run would be observed
   //     as corruption rather than reused space);
   //   * consumed exactly once, by this node -- the only read of the
   //     original value;
-  //   * input and output agree on size (always true for these ops on a
-  //     well-formed model; checked anyway as a defensive belt-and-braces).
-  // A chain of such ops unions transitively into one group -- Find() on any
+  //   * `cand` and `out0` agree on byte size -- always true for the unary
+  //     pass's ops on a well-formed model (checked anyway as a defensive
+  //     belt-and-braces); for the binary pass below, this is also exactly
+  //     what rules out a *broadcast* operand (a smaller operand ONNX would
+  //     broadcast up to the output's shape never matches the output's byte
+  //     size, so it is correctly rejected here rather than aliased).
+  // Shared by both the unary and binary in-place-aliasing passes.
+  const auto is_alias_eligible = [&](const std::string& cand,
+                                     const std::string& out0) {
+    if (cand.empty() || out0.empty()) return false;
+    if (weights.count(cand) || graph_inputs.count(cand) ||
+        graph_outputs.count(cand)) {
+      return false;
+    }
+    const auto cit = consumer_count.find(cand);
+    if (cit == consumer_count.end() || cit->second != 1) return false;
+
+    const auto cand_bytes = TensorBytes(cand, graph.shapes, graph.dtypes);
+    const auto out_bytes = TensorBytes(out0, graph.shapes, graph.dtypes);
+    if (!cand_bytes || !out_bytes || cand_bytes->is_symbolic() ||
+        out_bytes->is_symbolic()) {
+      return false;
+    }
+    return cand_bytes->to_int() == out_bytes->to_int();
+  };
+
+  // In-place aliasing: union a safe unary op's input[0] with its output[0]
+  // (see IsInPlaceSafeOp) whenever `is_alias_eligible` says it's safe. A
+  // chain of such ops unions transitively into one group -- Find() on any
   // member returns the same root -- that needs only a single slot for its
-  // entire span, rather than one slot per node.
+  // entire span, rather than one slot per node. The chain may freely mix
+  // both categories (e.g. Reshape -> Relu -> Flatten): the eligibility
+  // conditions and the resulting placement are identical either way.
   UnionFind uf;
   for (const NodeView& node : graph.nodes) {
-    if (!IsInPlaceSafeOp(node.op_type)) continue;
+    if (!IsInPlaceSafeOp(node.op_type) && !IsViewOp(node.op_type)) continue;
     if (node.inputs.empty() || node.outputs.size() != 1) continue;
     const std::string& in0 = node.inputs[0];
     const std::string& out0 = node.outputs[0];
-    if (in0.empty() || out0.empty()) continue;
-    if (weights.count(in0) || graph_inputs.count(in0) ||
-        graph_outputs.count(in0)) {
-      continue;
-    }
-    const auto cit = consumer_count.find(in0);
-    if (cit == consumer_count.end() || cit->second != 1) continue;
-
-    const auto in_bytes = TensorBytes(in0, graph.shapes, graph.dtypes);
-    const auto out_bytes = TensorBytes(out0, graph.shapes, graph.dtypes);
-    if (!in_bytes || !out_bytes || in_bytes->is_symbolic() ||
-        out_bytes->is_symbolic()) {
-      continue;
-    }
-    if (in_bytes->to_int() != out_bytes->to_int()) continue;
+    if (!is_alias_eligible(in0, out0)) continue;
 
     uf.Union(in0, out0);
+  }
+
+  // Binary in-place aliasing / operand donation: for a safe elementwise
+  // binary op (see IsInPlaceSafeBinaryOp) with exactly two inputs and one
+  // output, union its output with *at most one* of its two operands -- try
+  // input[0] first, then input[1] only if input[0] didn't qualify. The other
+  // operand (donated or not) is left as an ordinary, separately-tracked
+  // tensor; the existing liveness pass already places it correctly on its
+  // own. Reuses the exact same `is_alias_eligible` conditions as the unary
+  // pass above, so a broadcast operand (byte size differs from the output's)
+  // or a multiply-consumed one is never aliased, and this coalesces into the
+  // same UnionFind, so a value can be donated through a chain mixing unary
+  // and binary in-place-safe ops (e.g. Relu -> Add -> Sigmoid).
+  for (const NodeView& node : graph.nodes) {
+    if (!IsInPlaceSafeBinaryOp(node.op_type)) continue;
+    if (node.inputs.size() != 2 || node.outputs.size() != 1) continue;
+    const std::string& in0 = node.inputs[0];
+    const std::string& in1 = node.inputs[1];
+    const std::string& out0 = node.outputs[0];
+
+    if (is_alias_eligible(in0, out0)) {
+      uf.Union(in0, out0);
+    } else if (is_alias_eligible(in1, out0)) {
+      uf.Union(in1, out0);
+    }
   }
 
   // Pass 1: one Interval per plannable *group* -- a group is a single

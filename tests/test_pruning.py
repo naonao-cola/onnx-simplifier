@@ -13032,6 +13032,8 @@ def _gqa_model(
     # initializer (mutually exclusive with `attention_bias`) -- a str entry
     # becomes a named symbolic dim_param (e.g. "H"), an int a concrete one.
     head_sink=None,  # constant head_sink array (shape (H,)), or None (unconnected)
+    q_norm_weight=None,  # constant q_norm_weight array (shape (D,)), or None (unconnected)
+    k_norm_weight=None,  # constant k_norm_weight array (shape (D,)), or None (unconnected)
 ):
     # Real ONNX Runtime CPU kernels for GroupQueryAttention require
     # head_size to be a multiple of 8 (verified empirically -- a smaller
@@ -13126,19 +13128,21 @@ def _gqa_model(
         operands += ["", ""]
     operands += ["SeqLensK", "TotalSeq"]
 
-    # `attention_bias`/`head_sink`/`k_scale`/`v_scale` (GQA input indices
-    # 10/11/12/13) sit behind three other optional inputs
-    # (cos_cache/sin_cache/position_ids, indices 7-9, always left
-    # unconnected here -- none of this module's own matching/slicing
-    # touches them) that must be threaded through as empty positional
-    # placeholders for the text format's positional-input convention to
-    # reach index 10 at all.
+    # `attention_bias`/`head_sink`/`k_scale`/`v_scale`/`q_norm_weight`/
+    # `k_norm_weight` (GQA input indices 10/11/12/13/14/15) sit behind three
+    # other optional inputs (cos_cache/sin_cache/position_ids, indices 7-9,
+    # always left unconnected here -- none of this module's own
+    # matching/slicing touches them) that must be threaded through as empty
+    # positional placeholders for the text format's positional-input
+    # convention to reach index 10 at all.
     if (
         attention_bias is not None
         or attention_bias_dynamic_shape is not None
         or head_sink is not None
         or k_scale is not None
         or v_scale is not None
+        or q_norm_weight is not None
+        or k_norm_weight is not None
     ):
         operands += [""] * 3  # cos_cache, sin_cache, position_ids
         if attention_bias is not None:
@@ -13163,6 +13167,16 @@ def _gqa_model(
         if v_scale is not None:
             initializer.append(_f32(np.asarray(v_scale), "VScale"))
             operands.append("VScale")
+        else:
+            operands.append("")
+        if q_norm_weight is not None:
+            initializer.append(_f32(np.asarray(q_norm_weight), "QNorm"))
+            operands.append("QNorm")
+        else:
+            operands.append("")
+        if k_norm_weight is not None:
+            initializer.append(_f32(np.asarray(k_norm_weight), "KNorm"))
+            operands.append("KNorm")
         else:
             operands.append("")
 
@@ -13225,6 +13239,8 @@ def _gqa_model(
         v_scale=v_scale,
         attention_bias=attention_bias,
         head_sink=head_sink,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
     )
 
 
@@ -14267,6 +14283,103 @@ def test_gqa_pruning_malformed_head_sink_shape_is_declined():
     }
     for name in inits_before:
         np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_gqa_pruning_qk_norm_weight_paired_presence_required():
+    # `GroupQueryAttention`'s own `q_norm_weight`/`k_norm_weight` (indices
+    # 14/15) share the identical "must be provided together" schema rule
+    # `PagedAttention`'s own analogous pair already gets (see
+    # `test_paged_attention_pruning_qk_norm_weight_paired_presence_required`)
+    # -- `k_norm_weight` deliberately omitted here declines the whole match,
+    # leaving the node entirely untouched.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    q_norm = np.ones(D, dtype=np.float32)
+    model, cfg = _gqa_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=67, q_norm_weight=q_norm
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert (num_heads, kv_num_heads) == (H, KVH)  # left untouched
+
+
+def test_gqa_pruning_qk_norm_weight_wrong_shape_is_declined():
+    # A connected `q_norm_weight`/`k_norm_weight` pair not exactly
+    # `(head_size,)`-shaped is a real, previously-unvalidated correctness
+    # risk this fix closes: before `_find_gqa_chains` passed
+    # `qk_norm_weight_indices=(14, 15)` to `_find_separate_qkv_chains`, a
+    # `GroupQueryAttention` node like this one would have been silently
+    # pruned without ever checking whether the norm weight's own shape was
+    # even head-count-invariant. Now the whole match is declined instead,
+    # the node left completely untouched.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _gqa_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=68,
+        q_norm_weight=np.ones(D + 1, dtype=np.float32),
+        k_norm_weight=np.ones(D + 1, dtype=np.float32),
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert (num_heads, kv_num_heads) == (H, KVH)  # left untouched
+
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_gqa_pruning_qk_norm_weight_both_present_matches_oracle():
+    # `q_norm_weight`/`k_norm_weight` are `(head_size,)`-shaped -- constant
+    # across heads -- so they never need slicing under whole-head/KV-group
+    # pruning: this confirms a real match/prune still happens (the positive,
+    # pre-existing-behavior-preserving case this fix must not regress),
+    # Wq/Wk/Wv genuinely shrink, and QNorm/KNorm stay byte-identical.
+    # `GroupQueryAttention`'s own CPU kernel rejects a node with either
+    # input connected at all ("q_norm_weight / k_norm_weight inputs are not
+    # supported... implemented only on the CUDA and WebGPU EPs", confirmed
+    # empirically against this environment's installed onnxruntime), so
+    # unlike the plain attention_bias/head_sink tests above, this is checked
+    # structurally rather than by running the pruned model through a real
+    # `InferenceSession` -- the same CPU-kernel-unavailable fallback
+    # `test_paged_attention_pruning_qk_norm_weight_both_present_left_unsliced`
+    # already uses for its own analogous pair.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    q_norm = np.arange(D, dtype=np.float32)
+    k_norm = np.arange(D, dtype=np.float32) * 2.0
+    model, cfg = _gqa_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=69,
+        q_norm_weight=q_norm,
+        k_norm_weight=k_norm,
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert (num_heads, kv_num_heads) != (H, KVH)  # a real match/prune happened
+    assert kv_num_heads == 1
+    assert num_heads == 2
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["QNorm"], q_norm)
+    np.testing.assert_array_equal(inits["KNorm"], k_norm)
+    assert inits["Wq"].shape == (K, num_heads * D)
+    assert inits["Wk"].shape == (K, kv_num_heads * D)
+    assert inits["Wv"].shape == (K, kv_num_heads * D)
 
 
 def test_gqa_wanda_pruning_matches_oracle_exactly():
@@ -40586,6 +40699,10 @@ def _decomposed_gqa_model(
     share_kv_reshape_shape=True,
     extra_foreign_q_reshape_consumer=False,
     rope=False,
+    qk_norm=False,
+    q_norm_weight=None,
+    k_norm_weight=None,
+    qk_norm_eps=1e-6,
 ):
     """Builds the decomposed-attention graph:
     ``Linear(Q/K/V) -> Reshape(to heads) -> Transpose(to BHSD) ->
@@ -40626,6 +40743,24 @@ def _decomposed_gqa_model(
     `perm=[0, 2, 3, 1]`) form even when `KVH == H` -- RoPE's own nodes
     always break the head-split/swap-transpose adjacency that combined form
     requires, confirmed empirically (see that same section comment).
+
+    `qk_norm` (default `False`) additionally applies the decomposed
+    per-head Q/K-norm hop :func:`_match_decomposed_qk_norm_pass_through`
+    recognizes (see onnxsim/pruning.py's own comment above
+    :class:`_DecomposedQKNormPassThrough` for the confirmed shape --
+    ``weight * (x * rsqrt(mean(x**2, axis=-1) + eps))``) to Q's and K's own
+    branch, each independently, sitting between that branch's own
+    head-split `Reshape` output and its own head-split `Transpose` -- the
+    opposite side of that `Transpose` from where `rope`'s own hop is rooted
+    (real Qwen3/Gemma2-style exports apply both together, norm first). Like
+    `rope`, forces K's own dot-product transpose into the separate form
+    even when `KVH == H` (norm's own nodes, though they sit before the
+    head-split `Transpose` rather than after it, are simply never tried for
+    the combined-perm/`Einsum` branches at all -- see
+    onnxsim/pruning.py's own comments at each). `q_norm_weight`/
+    `k_norm_weight` (each `[D]`, random when left `None`) let a caller (an
+    oracle rebuild) pass the identical pre-pruning weight back in, since
+    this hop's own weight is never sliced.
     """
     if Dv is None:
         Dv = D
@@ -40639,6 +40774,10 @@ def _decomposed_gqa_model(
         wv = rng.standard_normal((K, Nv)).astype(np.float32)
     if wout is None:
         wout = rng.standard_normal((H * Dv, Out)).astype(np.float32)
+    if qk_norm and q_norm_weight is None:
+        q_norm_weight = rng.standard_normal((D,)).astype(np.float32)
+    if qk_norm and k_norm_weight is None:
+        k_norm_weight = rng.standard_normal((D,)).astype(np.float32)
 
     def _i64(arr, name):
         return onnx.numpy_helper.from_array(np.array(arr, dtype=np.int64), name)
@@ -40658,6 +40797,23 @@ def _decomposed_gqa_model(
             f"{out_name} = Add({prefix}direct, {prefix}rotated)",
         ]
 
+    def _qk_norm_lines(prefix, src, out_name, weight_name):
+        # `weight * (x * rsqrt(mean(x**2, axis=-1) + eps))` -- see
+        # onnxsim/pruning.py's own comment above
+        # :class:`_DecomposedQKNormPassThrough` for the exact confirmed
+        # shape this mirrors, node for node (a real export's own
+        # `Div(One, Sqrt(...))` reciprocal, never `Reciprocal` for this
+        # project's own torch/opset combination).
+        return [
+            f"{prefix}sq = Pow({src}, QKNormTwo)",
+            f"{prefix}var = ReduceMean<axes=[-1],keepdims=1>({prefix}sq)",
+            f"{prefix}var_eps = Add({prefix}var, QKNormEps)",
+            f"{prefix}std = Sqrt({prefix}var_eps)",
+            f"{prefix}inv_std = Div(QKNormOne, {prefix}std)",
+            f"{prefix}scaled = Mul({src}, {prefix}inv_std)",
+            f"{out_name} = Mul({weight_name}, {prefix}scaled)",
+        ]
+
     initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
     extra_inputs = ""
 
@@ -40672,6 +40828,15 @@ def _decomposed_gqa_model(
             _i64([1], "Ax1"),
         ]
         extra_inputs += f", float[{batch},{seq},{D}] Cos, float[{batch},{seq},{D}] Sin"
+
+    if qk_norm:
+        initializer += [
+            _f32(np.array(2.0), "QKNormTwo"),
+            _f32(np.array(qk_norm_eps), "QKNormEps"),
+            _f32(np.array(1.0), "QKNormOne"),
+            _f32(q_norm_weight, "QNormWeight"),
+            _f32(k_norm_weight, "KNormWeight"),
+        ]
 
     # Gemm requires a rank-2 input (unlike MatMul, which happily broadcasts
     # over the leading batch/seq axes) -- flattening `X` to `[batch*seq, K]`
@@ -40710,11 +40875,18 @@ def _decomposed_gqa_model(
         o_op = "Gemm(ctx2, Wout, Bout)"
 
     initializer.append(_i64([batch, seq, H, D], "Sq"))
+    q_transpose_src = "qr"
+    if qk_norm:
+        q_transpose_src = "qnout"
     lines += [
         "q0 = " + q_op,
         "qr = Reshape(q0, Sq)",
-        ("qt0" if rope else "qt") + " = Transpose<perm=[0,2,1,3]>(qr)",
     ]
+    if qk_norm:
+        lines += _qk_norm_lines("qn", "qr", "qnout", "QNormWeight")
+    lines.append(
+        ("qt0" if rope else "qt") + f" = Transpose<perm=[0,2,1,3]>({q_transpose_src})"
+    )
     if rope:
         lines += _rope_lines("q", "qt0", "qt", D)
 
@@ -40748,8 +40920,14 @@ def _decomposed_gqa_model(
     # form for K's own dot-product transpose -- its own nodes sit between
     # the two, breaking the adjacency the combined `perm=[0, 2, 3, 1]` form
     # requires -- even when `KVH == H` leaves no genuine `repeat_kv` to also
-    # force it (see this function's own docstring).
-    needs_separate_k_transpose = needs_repeat_kv or rope
+    # force it (see this function's own docstring). `qk_norm` forces the
+    # identical separate form too, even though its own nodes sit on the
+    # OTHER side of the head-split `Transpose` (between `kr` and `kt0`) --
+    # this module's own head-split matcher simply never tries Q/K-norm on
+    # the combined-perm branch at all (see this function's own docstring),
+    # so building it there would just decline the whole match rather than
+    # exercise the hop.
+    needs_separate_k_transpose = needs_repeat_kv or rope or qk_norm
     if needs_repeat_kv:
         assert H % KVH == 0
         initializer.append(_i64([2], "Ax2"))
@@ -40759,7 +40937,11 @@ def _decomposed_gqa_model(
         initializer.append(_i64([batch, H, seq, Dv], "VMergeShape"))
 
     if needs_separate_k_transpose:
-        lines.append("kt0 = Transpose<perm=[0,2,1,3]>(kr)")
+        k_headsplit_src = "kr"
+        if qk_norm:
+            lines += _qk_norm_lines("kn", "kr", "knout", "KNormWeight")
+            k_headsplit_src = "knout"
+        lines.append(f"kt0 = Transpose<perm=[0,2,1,3]>({k_headsplit_src})")
         k_src = "kt0"
         if rope:
             lines += _rope_lines("k", "kt0", "krope", D)
@@ -40852,6 +41034,9 @@ def _decomposed_gqa_model(
         bv=bv,
         bout=bout,
         mask=mask,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
+        qk_norm_eps=qk_norm_eps,
     )
 
 
@@ -42401,6 +42586,385 @@ def test_decomposed_gqa_rope_pruning_declines_on_slice_root_mismatch():
     for n in model.graph.node:
         if n.output and n.output[0] == "qx2":
             n.input[0] = "xf"  # unrelated tensor, not Q's own head-split output
+    before = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in model.graph.initializer
+    }
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    after = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in pruned.graph.initializer
+    }
+    assert before == after
+
+
+# ---------------------------------------------------------------------------
+# Decomposed (un-fused) attention -- Q/K-norm pass-through
+# ---------------------------------------------------------------------------
+# `_find_decomposed_gqa_chains` now also recognizes the decomposed per-head
+# Q/K-norm hop (`weight * (x * rsqrt(mean(x**2, axis=-1) + eps))`) sitting
+# between each branch's own head-split `Reshape` output and the head-split
+# `Transpose` -- see onnxsim/pruning.py's own comment above
+# `_DecomposedGQAChain` and `class _DecomposedQKNormPassThrough`. Real
+# Qwen3/Gemma2-style exports apply this together with RoPE (norm first,
+# closer to the `Reshape`; RoPE second, closer to the QK^T product), so the
+# tests below exercise both hops together, mirroring the RoPE-only tests
+# above almost exactly, just with `qk_norm=True` added.
+
+
+def test_decomposed_attention_qk_norm_rope_real_torch_export_pipeline():
+    """The real end-to-end pipeline this feature targets: a hand-written
+    Qwen3-style eager-attention `nn.Module` -- per-head `q_norm`/`k_norm`
+    (`RMSNorm` over `head_dim`, applied to the pre-transpose `(B, S, H, Dh)`
+    tensor, mirroring `transformers.models.qwen3.modeling_qwen3.Qwen3Attention`'s
+    own `self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1,
+    2)` shape) together with RoPE and GQA/`repeat_kv` -- run through
+    ``torch.onnx.export -> onnxsim.simplify() -> apply_attention_head_pruning``,
+    confirming the Q/K-norm pass-through genuinely fires on a real export
+    (not just a hand-built fixture) and the pruned model's output matches an
+    independently-computed numpy oracle built directly from the PRUNED
+    model's own (already-sliced) tensors, run through a real
+    `onnxruntime.InferenceSession`. Mirrors
+    `test_decomposed_attention_rope_real_torch_export_pipeline` exactly,
+    with `q_norm`/`k_norm` added on top of RoPE.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("onnxruntime")
+    import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+    hidden, num_heads, num_kv_heads, head_dim, seq, batch = 32, 8, 2, 8, 4, 1
+
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(q, k, cos, sin):
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    class RMSNorm(nn.Module):
+        def __init__(self, dim, eps=1e-6):
+            super().__init__()
+            # deliberately non-trivial (not all-ones) so onnxsim's constant
+            # folding doesn't fold the weight-multiply away as an identity.
+            self.weight = nn.Parameter(torch.randn(dim) * 0.1 + 1.0)
+            self.eps = eps
+
+        def forward(self, x):
+            variance = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(variance + self.eps)
+            return self.weight * x
+
+    class Qwen3StyleGQA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_heads = num_heads
+            self.num_kv_heads = num_kv_heads
+            self.head_dim = head_dim
+            self.q_proj = nn.Linear(hidden, num_heads * head_dim, bias=True)
+            self.k_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.v_proj = nn.Linear(hidden, num_kv_heads * head_dim, bias=True)
+            self.o_proj = nn.Linear(num_heads * head_dim, hidden, bias=True)
+            self.q_norm = RMSNorm(head_dim)
+            self.k_norm = RMSNorm(head_dim)
+            self.scaling = head_dim**-0.5
+
+        def _repeat_kv(self, x, n_rep):
+            if n_rep == 1:
+                return x
+            b, kvh, s, d = x.shape
+            x = x[:, :, None, :, :].expand(b, kvh, n_rep, s, d)
+            return x.reshape(b, kvh * n_rep, s, d)
+
+        def forward(self, hidden_states, cos, sin, attn_mask):
+            b, s, _ = hidden_states.shape
+            q = self.q_norm(
+                self.q_proj(hidden_states).view(b, s, self.num_heads, self.head_dim)
+            ).transpose(1, 2)
+            k = self.k_norm(
+                self.k_proj(hidden_states).view(b, s, self.num_kv_heads, self.head_dim)
+            ).transpose(1, 2)
+            v = (
+                self.v_proj(hidden_states)
+                .view(b, s, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            n_rep = self.num_heads // self.num_kv_heads
+            k = self._repeat_kv(k, n_rep)
+            v = self._repeat_kv(v, n_rep)
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+            attn_weights = attn_weights + attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(b, s, -1)
+            return self.o_proj(attn_output)
+
+    m = Qwen3StyleGQA()
+    m.eval()
+    x = torch.randn(batch, seq, hidden)
+    cos = torch.randn(batch, seq, head_dim)
+    sin = torch.randn(batch, seq, head_dim)
+    mask = torch.triu(torch.full((seq, seq), float("-inf")), diagonal=1)[
+        None, None, :, :
+    ]
+
+    buf = io.BytesIO()
+    torch.onnx.export(
+        m,
+        (x, cos, sin, mask),
+        buf,
+        input_names=["hidden_states", "cos", "sin", "attn_mask"],
+        output_names=["output"],
+        opset_version=17,
+        dynamo=False,
+    )
+    raw = onnx.load_from_string(buf.getvalue())
+
+    simplified, ok = onnxsim.onnx_simplifier.simplify(raw)
+    assert ok
+
+    assert not any(
+        n.op_type
+        in ("Attention", "GroupQueryAttention", "MultiHeadAttention", "PagedAttention")
+        for n in simplified.graph.node
+    )
+
+    from onnxsim.pruning import (
+        _find_decomposed_gqa_chains,
+        _shape_inferred_value_info_by_name,
+    )
+
+    chains = _find_decomposed_gqa_chains(
+        simplified.graph, _shape_inferred_value_info_by_name(simplified)
+    )
+    assert len(chains) == 1
+    assert chains[0].q_rope is not None
+    assert chains[0].k_rope is not None
+    assert chains[0].q_norm is not None
+    assert chains[0].k_norm is not None
+
+    pruned = onnxsim.apply_attention_head_pruning(simplified, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    def _find_gemm(model, bias_substr):
+        for n in model.graph.node:
+            if n.op_type == "Gemm" and len(n.input) == 3 and bias_substr in n.input[2]:
+                return n
+        raise AssertionError(f"no Gemm found for {bias_substr!r}")
+
+    def _init(model, name):
+        for t in model.graph.initializer:
+            if t.name == name:
+                return onnx.numpy_helper.to_array(t)
+        for n in model.graph.node:
+            if n.op_type == "Constant" and n.output[0] == name:
+                for a in n.attribute:
+                    if a.name == "value":
+                        return onnx.numpy_helper.to_array(a.t)
+        raise AssertionError(f"no initializer/Constant found for {name!r}")
+
+    q_gemm = _find_gemm(pruned, "q_proj.bias")
+    k_gemm = _find_gemm(pruned, "k_proj.bias")
+    v_gemm = _find_gemm(pruned, "v_proj.bias")
+    o_gemm = _find_gemm(pruned, "o_proj.bias")
+    wq, bq = _init(pruned, q_gemm.input[1]), _init(pruned, q_gemm.input[2])
+    wk, bk = _init(pruned, k_gemm.input[1]), _init(pruned, k_gemm.input[2])
+    wv, bv = _init(pruned, v_gemm.input[1]), _init(pruned, v_gemm.input[2])
+    wo, bo = _init(pruned, o_gemm.input[1]), _init(pruned, o_gemm.input[2])
+    q_norm_w = _init(pruned, "q_norm.weight")
+    k_norm_w = _init(pruned, "k_norm.weight")
+    assert q_norm_w.shape == (head_dim,)  # untouched -- head_size axis, never sliced
+    assert k_norm_w.shape == (head_dim,)
+
+    new_num_heads = wq.shape[1] // head_dim
+    new_kv_num_heads = wk.shape[1] // head_dim
+    new_v_head_dim = wv.shape[1] // new_kv_num_heads
+    assert new_num_heads < num_heads
+    assert new_kv_num_heads < num_kv_heads
+    assert new_num_heads // new_kv_num_heads == num_heads // num_kv_heads
+
+    rng = np.random.default_rng(0)
+    hidden_states = rng.standard_normal((batch, seq, hidden)).astype(np.float32)
+    cos_np = rng.standard_normal((batch, seq, head_dim)).astype(np.float32)
+    sin_np = rng.standard_normal((batch, seq, head_dim)).astype(np.float32)
+    mask_np = mask.numpy().astype(np.float32)
+
+    sess = ort.InferenceSession(
+        pruned.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (ort_out,) = sess.run(
+        None,
+        {
+            "hidden_states": hidden_states,
+            "cos": cos_np,
+            "sin": sin_np,
+            "attn_mask": mask_np,
+        },
+    )
+
+    def linear(x, w, b):
+        return x @ w + b
+
+    def np_rms_norm(x, weight, eps=1e-6):
+        variance = (x**2).mean(axis=-1, keepdims=True)
+        return weight * (x * (1.0 / np.sqrt(variance + eps)))
+
+    def np_rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return np.concatenate([-x2, x1], axis=-1)
+
+    def np_apply_rope(q, k, cos, sin):
+        cos_ = cos[:, None, :, :]
+        sin_ = sin[:, None, :, :]
+        return (
+            q * cos_ + np_rotate_half(q) * sin_,
+            k * cos_ + np_rotate_half(k) * sin_,
+        )
+
+    q = np_rms_norm(
+        linear(hidden_states, wq, bq).reshape(batch, seq, new_num_heads, head_dim),
+        q_norm_w,
+    ).transpose(0, 2, 1, 3)
+    k = np_rms_norm(
+        linear(hidden_states, wk, bk).reshape(batch, seq, new_kv_num_heads, head_dim),
+        k_norm_w,
+    ).transpose(0, 2, 1, 3)
+    v = (
+        linear(hidden_states, wv, bv)
+        .reshape(batch, seq, new_kv_num_heads, new_v_head_dim)
+        .transpose(0, 2, 1, 3)
+    )
+    q, k = np_apply_rope(q, k, cos_np, sin_np)
+    n_rep = new_num_heads // new_kv_num_heads
+    if n_rep > 1:
+        k = np.repeat(k, n_rep, axis=1)
+        v = np.repeat(v, n_rep, axis=1)
+    scale = head_dim**-0.5
+    scores = np.matmul(q, k.transpose(0, 1, 3, 2)) * scale
+    scores = scores + mask_np
+    scores = scores - scores.max(axis=-1, keepdims=True)
+    exp = np.exp(scores)
+    attn = exp / exp.sum(axis=-1, keepdims=True)
+    ctx = np.matmul(attn, v)
+    ctx = ctx.transpose(0, 2, 1, 3).reshape(batch, seq, new_num_heads * new_v_head_dim)
+    oracle_out = linear(ctx, wo, bo)
+
+    np.testing.assert_allclose(ort_out, oracle_out, rtol=1e-3, atol=1e-3)
+
+
+def test_decomposed_gqa_qk_norm_rope_pruning_matches_oracle_exactly():
+    model, cfg = _decomposed_gqa_model(
+        K=16, H=8, KVH=2, D=8, Out=16, seed=1, rope=True, qk_norm=True
+    )
+    rng = np.random.default_rng(7)
+    cos = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["D"])).astype(np.float32)
+    sin = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["D"])).astype(np.float32)
+
+    from onnxsim.pruning import _find_decomposed_gqa_chains
+
+    chains = _find_decomposed_gqa_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].q_norm is not None
+    assert chains[0].k_norm is not None
+    assert chains[0].q_rope is not None
+    assert chains[0].k_rope is not None
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned)
+    group_size = cfg["H"] // cfg["KVH"]
+    new_kv = cfg["KVH"] - round(cfg["KVH"] * 0.5)
+    assert wk_new.shape[1] == new_kv * cfg["D"]
+    assert wq_new.shape[1] == new_kv * group_size * cfg["D"]
+
+    # The norm's own weight -- broadcast identically across every head --
+    # must survive completely untouched (same shape, same values).
+    pruned_inits = {t.name: t for t in pruned.graph.initializer}
+    q_norm_pruned = onnx.numpy_helper.to_array(pruned_inits["QNormWeight"])
+    k_norm_pruned = onnx.numpy_helper.to_array(pruned_inits["KNormWeight"])
+    np.testing.assert_array_equal(q_norm_pruned, cfg["q_norm_weight"])
+    np.testing.assert_array_equal(k_norm_pruned, cfg["k_norm_weight"])
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], new_kv
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _decomposed_gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=new_kv,
+        D=d,
+        Out=cfg["Out"],
+        seed=1,
+        rope=True,
+        qk_norm=True,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        bq=cfg["bq"][q_idx],
+        bk=cfg["bk"][kv_idx],
+        bv=cfg["bv"][kv_idx],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+        q_norm_weight=cfg["q_norm_weight"],  # untouched -- head_size axis
+        k_norm_weight=cfg["k_norm_weight"],
+        qk_norm_eps=cfg["qk_norm_eps"],
+    )
+
+    rng2 = np.random.default_rng(2)
+    x = rng2.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    feed = {"X": x, "Cos": cos, "Sin": sin}
+    (y_pruned,) = _run(pruned, feed)
+    (y_oracle,) = _run(oracle, feed)
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_decomposed_gqa_qk_norm_pruning_declines_on_non_constant_weight():
+    # The norm's own final weighted `Mul` must read a genuine constant
+    # `weight` operand (via `_flat_channel_const`) -- rewiring it to a
+    # non-constant (a real graph input, here) must decline the whole chain,
+    # never guessed at (the weight is never sliced by this pass, so nothing
+    # here could recover from that anyway).
+    model, _ = _decomposed_gqa_model(
+        K=16, H=8, KVH=2, D=8, Out=16, seed=1, rope=True, qk_norm=True
+    )
+    for n in model.graph.node:
+        if n.output and n.output[0] == "qnout":
+            n.input[list(n.input).index("QNormWeight")] = "X"
+    before = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in model.graph.initializer
+    }
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    after = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in pruned.graph.initializer
+    }
+    assert before == after
+
+
+def test_decomposed_gqa_qk_norm_pruning_declines_on_wrong_pow_exponent():
+    # The norm's own `Pow`'s own exponent must be exactly `2.0` -- any other
+    # value means this isn't genuinely `x**2` (RMSNorm's own variance term),
+    # so the whole chain must decline, never guessed at.
+    model, _ = _decomposed_gqa_model(
+        K=16, H=8, KVH=2, D=8, Out=16, seed=1, rope=True, qk_norm=True
+    )
+    for t in model.graph.initializer:
+        if t.name == "QKNormTwo":
+            t.CopyFrom(
+                onnx.numpy_helper.from_array(
+                    np.array(3.0, dtype=np.float32), "QKNormTwo"
+                )
+            )
     before = {
         t.name: onnx.numpy_helper.to_array(t).shape for t in model.graph.initializer
     }

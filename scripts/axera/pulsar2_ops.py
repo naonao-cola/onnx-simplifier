@@ -23,6 +23,15 @@ attribute JSON-describes the outputs' dtype/shape. See `AXERA_NPU_OP_TYPE`,
 `referenced_const_data_keys()` and `missing_npu_data()` below, and
 `inspect_axmodel.py`, which is what produced this.
 
+For what's actually *inside* the `<neu_key>`-named blob (a real, confirmed
+FlatBuffers container -- hand-decoded root table + vtable, matching the
+public spec -- wrapping a tensor I/O offset table around an opaque,
+proprietary NPU instruction stream), plus what a real `--compiler.npu_perf`
+trace.json reveals about the AX650's actual multi-engine execution model
+(5 named parallel engines, on-chip-vs-DRAM memory regions, ONNX-op-to-NPU-
+primitive lowering), see README.md's "Digging into a compiled `.axmodel`'s
+`neu mode` node" section.
+
 This out-of-band reference is exactly the fragility §4(a) of the handoff
 notes worried about, and it is not hypothetical: `missing_npu_data()` exists
 because running plain `onnxsim.simplify()` on this real file reproducibly

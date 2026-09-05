@@ -190,6 +190,227 @@ latency). **Automated**: `convert_onnxmodelzoo.py --profile` passes this
 through automatically (see below); see Pulsar2's own docs
 (`other_tools/profiling.html`) for the full trace-UI reference.
 
+## Digging into a compiled `.axmodel`'s `neu mode` node
+
+Prompted by "could we generate `.axmodel` without Axera tools?" -- short
+answer still no (see below), but here's what direct inspection of a real
+compiled file, plus a real `--compiler.npu_perf` trace, actually shows.
+
+**The node's own attributes** (from a real `pulsar2 build` of a tiny Mistral
+checkpoint via `build_from_hf_checkpoint()`):
+
+```
+neu_name: "subgraph_npu_0"
+npu_graph_info: {"name": "subgraph_npu_0", "dotneus": [{"neu_key":
+                 "subgraph_npu_0_b1_neu", "batch": 1, "extra_inputs":
+                 [{"name": "params", "const_data_key": "npu_params"}]}]}
+outputs_info: {"lm_head.matmul.94": ["FP32", [1, 8, 32000]]}
+version: <int>
+```
+
+`neu_key`/`const_data_key` just name ordinary `graph.initializer` UINT8
+blobs (see `pulsar2_ops.py`'s docstring for why onnxsim's own dead-code
+elimination strips these): `npu_params` (21MB here -- the raw weight
+dump, no header, just concatenated tensor bytes at offsets the other blob
+names), `npu_dyn_params` (0 bytes for a static-shape model), and the
+`<neu_key>`-named blob itself (28KB here) -- the actual compiled program.
+
+**The compiled-program blob is a FlatBuffers container**, confirmed by
+hand-decoding its first 32 bytes against the public FlatBuffers spec: byte
+0 is a valid root-table uoffset (28), which resolves through a
+well-formed vtable (size 24, 7 populated field slots) -- not a coincidence,
+a real, spec-conformant FlatBuffers root table. Scanning the blob for
+embedded strings surfaces the vtable's field names, present twice (once
+right after the header, once duplicated near the very end of the buffer --
+consistent with FlatBuffers' bottom-up buffer-construction convention):
+
+```
+params, ddr_swap, lm_head.matmul.94_offset, lm_head.matmul.94,
+position_ids_offset, position_ids, input_ids_offset, input_ids, _ocm_base
+```
+
+i.e. a **tensor I/O offset table**: a `<name>`/`<name>_offset` pair per
+graph input/output, plus `_ocm_base` (the AX650's on-chip SRAM base
+address) and `ddr_swap` (matches the real, timestamped "add ddr swap..."
+compiler pass -- see the build-phase breakdown two sections up). The
+remaining ~27KB in the middle of the blob (>95% of it) has no further
+embedded strings or hand-decodable structure -- almost certainly the
+actual scheduled NPU instruction stream, in a proprietary, undocumented
+encoding.
+
+**No usable Axera-provided FlatBuffers schema was found.** Searched (inside
+`pulsar2:6.0-lite`): no `*.fbs`/`*.bfbs`/`*_generated.{h,py}` files
+anywhere under the image; no `import flatbuffers`/`from flatbuffers` in any
+plaintext `.py` file under `/opt/pulsar2` (the only such hits anywhere in
+the image are ONNX Runtime's own unrelated `.ort`-format schema, bundled as
+a dependency); no relevant field-name strings (`ddr_swap`, `_ocm_base`,
+`neu_key`, ...) or `flatbuffers`/`.fbs` mentions in any of the five
+`backend/*/*_cmodel.so` libraries (these are almost certainly cycle-accurate
+NPU functional simulators used for verification, not the FlatBuffers
+writer). The `flatbuffers` PyPI package itself **is** installed in the
+image (confirming the container format), but whatever Python code actually
+constructs this schema lives inside the Pyarmor-obfuscated `yamain`/
+`yasched`/`opset` modules (see `pulsar2_ops.py`'s docstring) -- not
+recoverable by inspection.
+
+**A real `trace.json` (see the profiling section above), though, gives away
+almost the entire semantic content of that opaque instruction stream --
+in plain, readable JSON, no reverse engineering needed.** For the same
+tiny Mistral build (`--profile`), the 635 trace events reveal:
+
+- **Five named parallel execution engines** (`tid` values): `conv0`/`conv1`
+  (213/210 events -- the MAC/matmul compute units), `cv3` (78 events -- a
+  vector/elementwise unit: RMSNorm, RoPE rotation, Softmax), `sdma4` (76
+  events -- a system-DMA/prefetch engine), `teng2` (58 events -- handles the
+  embedding gather and I/O staging). A real, confirmed heterogeneous
+  multi-engine architecture, not a single monolithic "NPU core."
+- **Named memory regions**, matching the FlatBuffers offset table above:
+  `ocm_base` (871 references -- the dominant, fast on-chip working memory),
+  `params` (154 -- DRAM-resident weights), `ddr_swap` (2 -- DRAM staging for
+  spilled tensors), plus the three named I/O tensors.
+- **Original ONNX op names are preserved end to end** (e.g.
+  `model.layers.0.q_rope.rot.41`, `model.layers.0.attn_norm.var_eps.18`),
+  each lowered to a small set of NPU primitives: `onnx.FullyConnected`
+  (417/635 events -- every projection and the FFN, all lowered to the same
+  primitive), `AxQuantizedMatMul` (3), `onnx.Silu` (1).
+- **The trace's own time units are NPU cycles** (scaled by 1000, despite
+  the file's `displayTimeUnit: "ns"`): summing every event's `dur` gives a
+  total schedule span of ~287,231, matching this exact build's own reported
+  `max_cycle=287,211` (see `BuildResult.max_cycle`) to within rounding.
+
+Net effect on "could we generate `.axmodel` without Axera tools": no change
+to the answer, but a much better-understood boundary. The *container*
+(FlatBuffers) and the full *dataflow graph* (`trace.json`, when
+`--profile` is used) are both now understood well enough to write a reader
+without Docker. Actually *producing* a correct, hardware-loadable
+instruction stream from that dataflow graph -- real quantization, tiling,
+scheduling, and codegen into an undocumented ISA -- still requires
+Pulsar2's own (obfuscated) compiler backend.
+
+### What's op-specific vs. boilerplate, across real Conv/MatMul variants
+
+The single-model dig above raises an obvious question: how much of that
+FlatBuffers offset table and instruction stream is generic wrapper vs.
+op-specific? Answered by compiling 9 small, hand-built ONNX graphs (plain
+`MatMul`, `Gemm` with bias, dense `Conv` 3x3, 1x1 pointwise, depthwise
+(`group=C`), grouped (`group=2`), stride-2, dilation-2, and a batched
+(rank-3) `MatMul`) through the same real `pulsar2 build --compiler.npu_perf`
+and inspecting each result the same way:
+
+- **The FlatBuffers field-name table is identical across every one of the
+  9 models**: always exactly `params`, `<input>_offset`, `<output>_offset`,
+  `_ocm_base`, and the graph name -- regardless of kernel size, stride,
+  dilation, groups, or op family. **No op parameter ever shows up as a
+  named field.** Conv's stride/padding/dilation/group and Gemm's alpha/
+  beta/transpose flags are entirely opaque, baked into the unlabeled
+  instruction bytes -- this table is pure I/O bookkeeping, not a
+  semantically rich IR.
+- **`ddr_swap` is a real, conditional field**, not a fixed part of the
+  schema: present in the earlier 28-layer LLM build (something spilled to
+  DRAM), absent from all 9 of these small models (everything fit in OCM).
+- **Exactly two compute "primitive families" appear**, cleanly split by op
+  family: every `Conv` variant -- dense, 1x1, depthwise, grouped, strided,
+  dilated, no exceptions -- lowers to `Pre_AxTranspose` -> `AxQuantizedConv`
+  (x6 tiles) -> `Post_AxTranspose` (almost certainly a NCHW<->NHWC layout
+  swap around a channel-last-native conv engine); `MatMul` lowers to
+  `onnx.FullyConnected` instead. Op parameters change *within* those
+  primitives (invisibly) but never *which* primitive gets picked.
+- Trace event **naming isn't fully consistent**: `matmul2d`'s compute
+  events are labeled `op_1:onnx.FullyConnected_<tile>_<tile>` (primitive
+  name visible), but `gemm_bias`'s and the batched `matmul_batched3d`'s are
+  labeled directly after their own output tensor (`y_0_0`, `y_1_2`, ...) --
+  the same underlying compute, differently named depending on some
+  internal fusion/naming decision, not a reliable way to detect op type
+  from the trace alone.
+- **Cycle cost and weight-blob size don't scale the way FLOP count would
+  predict, at this tiny (16x16, 4-8 channel) test size.** 1x1 pointwise
+  conv costs nearly as many cycles as full dense 3x3 (2052 vs. 2096) --
+  fixed per-tile overhead dominates raw MAC count here. Most strikingly,
+  **dilated conv's stored weight blob is 2.6x larger than a plain conv with
+  the identical (8,4,3,3) kernel shape** (3.66KB vs. ~1.4KB) despite having
+  the same number of logical weight values -- strong evidence the compiler
+  materializes a real, zero-expanded ("atrous") kernel footprint for
+  dilation rather than an actually-sparse dilated MAC pattern, and it's
+  also the most expensive op tested by cycle count (2228).
+- Every model tiles into a small, similar instruction count regardless of
+  large parameter differences at this scale: all 6 `Conv` variants compile
+  to exactly 6 `AxQuantizedConv` sub-tiles each; `matmul2d` to 6
+  `FullyConnected` sub-tiles; the batched matmul to 7. Tiling granularity
+  here looks governed by fixed hardware tile-size constants more than by
+  the specific op's shape/parameters -- this may well change at larger,
+  more realistic tensor sizes where tiling actually has to split work up.
+
+### External corroboration: a real hardware teardown
+
+An independent third-party writeup --
+[jas-hacks.blogspot.com's AX650N/Sipeed M4N teardown](https://jas-hacks.blogspot.com/2024/09/ax650n-sipeed-maix-iv-axerapi-pro-npu.html)
+(not Axera's own documentation; treat specific numbers as one outside
+source's reporting, and any interpretive claims -- explicitly flagged
+below -- as that author's own inference, not confirmed fact) -- gives real
+names and numbers for the hardware this repo's own trace.json digging
+above only inferred generically:
+
+- The NPU ("Neutron") is described as 13 execution units + 3 SDMA units:
+  3 Convolution Units (handling depthwise/grouped conv, dilation, and
+  ConvTranspose), 3 Computer Vision Units (image normalize/resize/clip/
+  warp), 3 Tensor Units (activation, pooling, elementwise, reduction), and
+  a single Matrix Arithmetic Unit (int8/int16 in, fp16/fp32 out). This
+  lines up with this repo's own trace.json engine names in outline --
+  `conv0`/`conv1` for the Convolution Units, `sdma4` for an SDMA unit --
+  but not exactly: our own LLM trace's `cv3` engine ran RMSNorm/RoPE
+  elementwise math, which reads as "Tensor Unit" work by this source's own
+  description, not "Computer Vision Unit" work, and we never observed a
+  distinct engine for the single Matrix Arithmetic Unit despite compiling
+  real `MatMul`/`Gemm` graphs above (both engine-name schemes may not be
+  directly comparable, or the compiler may route elementwise math onto
+  whichever engine family has spare capacity rather than a fixed
+  CV-vs-tensor split). Reported, not reconciled -- a real open question
+  for anyone digging further.
+- **On-chip memory (OCM): reported as 11.5MB, address space ending at
+  `0xAFFFFF`.** `0xAFFFFF + 1 = 0xB00000 = 11,534,336` bytes = exactly
+  11MiB by that address range -- close to but not exactly the "11.5MB"
+  figure quoted; direct, checkable confirmation that `ocm_base`'s byte
+  offsets seen in this repo's own trace.json digging above (all under
+  ~3.2MB in our tiny test models) sit well inside a real, multi-megabyte
+  on-chip SRAM, not some other memory space.
+- 8GB total SoC RAM, split 4GB Linux / 4GB "CMM" (Contiguous Memory Model)
+  for peripherals -- CMM is almost certainly what this repo's own findings
+  call `params`/DRAM-resident weight storage and `ddr_swap` staging.
+- Claimed performance: 72 TOPS mixed precision (18.0 TOPS@INT8, 43.2
+  TOPS@INT4 and 10.8 TOPS@INT8 "from NPU alone" per Axera's own SDK docs,
+  per that source). **The author's own interpretation** (not a measured
+  fact): a single Matrix Arithmetic Unit instance may bottleneck LLM
+  inference, since every `MatMul`/`Gemm` in a transformer routes through
+  it. That's a plausible complementary explanation for *why* LLM inference
+  is slow on this hardware, alongside (not instead of) the very different,
+  independently-confirmed bottleneck this repo's own `demo_hf_llm_chat.py`
+  measured: `axcl_run_model`'s ~700ms-per-invocation process/model-reload
+  overhead, which has nothing to do with the NPU's own compute engines at
+  all and would dominate regardless of how many Matrix Arithmetic Units
+  existed.
+- Real production reference point (**not comparable to
+  `demo_hf_llm_chat.py`'s own measured tokens/sec** -- different
+  measurement entirely: real `ax-llm` + KV-cache decode via Pulsar2's own
+  `llm_build()` path, not this repo's re-run-the-whole-model-per-token
+  `build_from_hf_checkpoint()` path, and no per-call CLI-reload overhead
+  since it's a persistent server): Phi-3 Mini reported at ~4.4 tokens/sec
+  on the AX650N, vs. ~6.46 tokens/sec on an RK3588 for comparison.
+- Confirms real ONNX-level `.axmodel` structure from an outside source
+  independently: "axmodel files contain a mix of ONNX data and an internal
+  graph representation" sent to the NPU kernel driver -- matching this
+  repo's own finding of an ordinary ONNX container wrapping an opaque,
+  FlatBuffers-framed internal representation.
+- **Confirmed, and more specific than reported**: `gemm_bias` above used
+  default `alpha=1.0, beta=1.0` and compiled fine; a `Gemm` with
+  non-default values (`alpha=2.0, beta=0.5`) **fails outright**, not
+  merely "restricted" -- a real `pulsar2 build` on that graph throws
+  `KeyError: 'dont support AxQuantizedGemm opr in AXOPS/ONNXOPS/
+  CUSTOM_OPS'` before quantization even runs. Default-alpha/beta `Gemm`
+  apparently lowers to the same path as a plain `MatMul` + bias-add (hence
+  `gemm_bias` succeeding above); any other `alpha`/`beta` maps to a
+  distinct, entirely unimplemented `AxQuantizedGemm` op. Confirms the
+  blog's suspicion with a precise, reproducible mechanism.
+
 ## LLMs: a separate pipeline onnxsim has no hook into
 
 **Confirmed real, end to end** (`pulsar2:6.0-lite` + a real `Qwen/Qwen3-0.6B`
@@ -330,6 +551,8 @@ the tensor). `pulsar2_docker.run_on_device_with_input()` already does this.
 | `screen_onnxmodelzoo.py` | fast, static, Docker/device-free screening of `onnxmodelzoo` models via `pulsar2_simulator`/`pulsar2_backend.ax650_build_risks()` -- run this first. |
 | `pulsar2_docker.py` | real `pulsar2 build` (Docker) + `axcl_run_model` (device) wrapper: `build()` (with `profile=` for `trace.json`), `llm_build()` (the separate, ONNX-free `pulsar2 llm_build` LLM path -- see above), `build_from_hf_checkpoint()` (the hf-config+safetensors -> `onnxsim.reconstruct_hf_graph()` -> `build()` path -- see "An alternative LLM path" above), `run_on_device()`, `run_on_device_with_input()`, `force_rmtree()`. Manual/local-only -- needs a loaded Docker image. |
 | `convert_onnxmodelzoo.py` | batch driver over `pulsar2_docker.py`: fetch -> onnxsim -> real `pulsar2 build` (orig + simplified, `--profile` optional) -> optional on-device bit-exact diff -> CSV. Entry point for `axera-integration.yml`'s `pulsar2-docker-convert` job -- like `amd-integration.yml`'s MIGraphX check, that job is `workflow_dispatch`-only and targets a `[self-hosted, axcl]` runner this repository doesn't provision, so it's dormant until one exists. |
+| `demo_hf_llm.py` | interactive one-shot demo of `build_from_hf_checkpoint()`: compile, print the phase-timing breakdown (and `--profile`'s trace.json/Netron paths), feed one prompt, print top-5 predicted next tokens. |
+| `demo_hf_llm_chat.py` | interactive chat REPL on top of the same compiled `.axmodel`, generating one token at a time and reporting real tokens/sec -- see its own docstring for the confirmed ~700ms-per-step `axcl_run_model` process/model-reload overhead this measures alongside the NPU's actual ~0.6-0.8ms compute latency. |
 
 ## Running locally
 
