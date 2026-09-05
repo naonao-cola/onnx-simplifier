@@ -22699,13 +22699,28 @@ def _find_sparse_attention_chains(
 #   :class:`_DecomposedRopePassThrough`'s own docstring) -- matched
 #   independently for Q and K (a chain with RoPE on only one of the two
 #   still matches; every real export applies it to both, but nothing here
-#   requires that). **Q/K-norm pass-through is deliberately NOT recognized
-#   here** -- a real, separate shape (only Qwen3/Gemma2-style architectures
-#   apply one, ahead of RoPE) left for a future, dedicated pass rather than
-#   bundled into this one, per this feature's own scope note; a graph
-#   combining a per-head Q/K-norm with this section's own decomposed shape
-#   (packed-producer or not, RoPE or not) simply declines the match (never
-#   guessed at), same as any other unrecognized topology.
+#   requires that).
+# - Decomposed Q/K-norm pass-through IS ALSO recognized here now (see
+#   :func:`_match_decomposed_qk_norm_pass_through`/
+#   :func:`_walk_back_through_decomposed_qk_norm` and this module's own
+#   comment directly above :class:`_DecomposedQKNormPassThrough` for the
+#   confirmed topology): a real Qwen3/Gemma2-style eager-attention module
+#   applies a per-head ``RMSNorm`` (over `head_size`) to Q's/K's own
+#   pre-transpose `(B, S, H, Dh)` tensor -- i.e. sitting between the
+#   head-split `Reshape`'s own output and the head-split `Transpose` above,
+#   the opposite side of that `Transpose` from where RoPE's own hop is
+#   rooted -- so, walking backward from the QK^T product, RoPE (if present)
+#   is matched first, then Q/K-norm, then the head-split `Reshape` itself.
+#   Recognized and passed through untouched -- the normalized axis is
+#   `head_size`, which whole-head/KV-group pruning never slices, so the
+#   norm's own per-head `weight` needs no slicing of any kind (see
+#   :class:`_DecomposedQKNormPassThrough`'s own docstring) -- matched
+#   independently for Q and K, only for the separate-transpose `MatMul`
+#   shape (never the combined-`perm=[0, 2, 3, 1]` shape or the
+#   `Einsum`-based QK^T product, both deliberately narrower, unverified
+#   combinations left declined rather than guessed at -- see
+#   :func:`_find_decomposed_gqa_chains`'s own comments at each dispatch
+#   point).
 #   Cross-attention (Q's own source tensor distinct from K's/V's, including
 #   a genuinely different `seq_len` between the two) *is* recognized here,
 #   despite an earlier draft of this comment claiming otherwise: neither
@@ -22870,6 +22885,22 @@ class _DecomposedGQAChain:
     # always break the `Transpose`-`Transpose` adjacency that combined
     # shape requires (see :func:`_find_decomposed_gqa_chains`'s own comment
     # at its `k_perm` dispatch).
+    q_norm: Optional["_DecomposedQKNormPassThrough"] = None
+    k_norm: Optional["_DecomposedQKNormPassThrough"] = None
+    # Set exactly when :func:`_match_decomposed_head_split` (called with
+    # `allow_qk_norm=True` for Q's/K's own branches only, see that
+    # function's own docstring) crossed a decomposed per-head Q/K-norm
+    # sitting between that branch's own head-split `Reshape` output and the
+    # head-split `Transpose` itself -- see this module's own comment above
+    # :class:`_DecomposedQKNormPassThrough` for the exact topology and why
+    # it needs no slicing of any kind, unlike every other field this class
+    # names. Matched independently for Q and K (never required together),
+    # the same "independently None/set" treatment `q_rope`/`k_rope` already
+    # get -- but, unlike `q_rope`/`k_rope`, never matched at all (always
+    # `None`) for K's own combined-`perm=[0, 2, 3, 1]` shape or the
+    # `Einsum`-based QK^T branch, both deliberately narrower than the
+    # separate-transpose `MatMul` shape here (see
+    # :func:`_find_decomposed_gqa_chains`'s own comments at each).
 
 
 # Either kind of matched whole-KV-group-pruned chain -- :func:`_gqa_group_importance`'s
@@ -22879,6 +22910,341 @@ class _DecomposedGQAChain:
 _HeadGroupChain = Union[_GQAChain, _DecomposedGQAChain]
 
 
+# Decomposed (un-fused) Q/K-norm pass-through -- closes this section's own
+# former "Q/K-norm pass-through is deliberately NOT recognized here" gap
+# (see the "Decomposed (un-fused) attention head pruning" section comment
+# above, and git history for that comment's own prior wording), the
+# genuinely different, *decomposed* analogue of
+# :func:`_walk_back_through_qk_norm`'s own per-head-norm hop for the *fused*
+# `GroupQueryAttention`/`Attention`-consumer family. Confirmed empirically
+# (a hand-built Qwen3-style eager-attention `nn.Module` with `q_norm`/
+# `k_norm` -- a per-head ``RMSNorm`` over `head_size`, mirroring
+# `transformers.models.qwen3.modeling_qwen3.Qwen3Attention`'s own
+# `self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1,
+# 2)` shape as closely as possible from memory -- together with RoPE,
+# `torch.onnx.export(..., opset_version=17, dynamo=False)`, run through this
+# module's own `onnxsim.simplify()`) to sit BETWEEN the head-split
+# `Reshape`'s own `[batch, seq, H, Dh]` output and the head-split
+# `Transpose` that :func:`_match_decomposed_head_split` already matches --
+# i.e. exactly where HuggingFace's own Qwen3/Gemma2-family code applies it,
+# to the *pre-transpose* ``(B, S, H, Dh)`` tensor, never the post-transpose
+# ``(B, H, S, Dh)`` one RoPE's own hop (see this module's own comment above
+# :class:`_DecomposedRopePassThrough`) is rooted at. So, walking backward
+# from the QK^T product, the two hops compose in the opposite order they sit
+# relative to the head-split `Transpose`: RoPE (rooted at the `Transpose`'s
+# own OUTPUT, matched first, closest to the QK^T product) then Q/K-norm
+# (sitting between the `Reshape` and the `Transpose`, matched second) then
+# the head-split `Reshape` itself -- never the other way around, and never
+# both hops sharing a single node (confirmed empirically distinct: Q's own
+# matched nodes never overlap K's, the same "independent branches" property
+# RoPE's own hop already has).
+#
+# The fixed, 7-node sequence (landing exactly on HuggingFace's own
+# `weight * (x * rsqrt(mean(x**2, axis=-1) + eps))`, in that value-flow
+# order) is:
+#
+#     sq      = Pow(x, 2.0)
+#     var     = ReduceMean(sq, axes=[-1], keepdims=1)
+#     var_eps = Add(var, eps)
+#     std     = Sqrt(var_eps)
+#     inv_std = Div(1.0, std)          # confirmed: never `Reciprocal` for
+#                                       # this project's own torch/opset
+#                                       # combination, but recognized either
+#                                       # way, mirroring
+#                                       # :func:`_match_decomposed_rms_norm_pass_through`'s
+#                                       # own identical `Div`-or-`Reciprocal`
+#                                       # allowance for the unrelated
+#                                       # channel-pruning case
+#     scaled  = Mul(x, inv_std)        # x itself read exactly twice: once
+#                                       # here, once by `Pow` above
+#     result  = Mul(weight, scaled)    # either operand order -- confirmed
+#                                       # `weight` (a genuine graph
+#                                       # initializer, `q_norm.weight`/
+#                                       # `k_norm.weight`) is never wrapped
+#                                       # in its own `Constant` node the way
+#                                       # every literal scalar operand above
+#                                       # it is
+#
+# -- exactly the shape :func:`_match_decomposed_rms_norm_pass_through`
+# already established for the unrelated *channel*-pruning case (`x` read
+# twice, by `Pow` and by the middle `Mul`; the same `Div`-numerator-is-1.0/
+# `Reciprocal` allowance; the same per-channel-`weight`-broadcast-vector
+# bar, via :func:`_flat_channel_const`) -- structurally close enough that
+# this hop reuses every one of that function's own scalar/channel-constant
+# helpers (:func:`_flat_scalar_float_const`,
+# :func:`_flat_scalar_float_const_equals`,
+# :func:`_decomposed_layer_norm_pow_exponent_is_two`, :func:`_flat_channel_const`,
+# :func:`_reduce_mean_axis_is_last`) verbatim rather than duplicating any of
+# them, differing only in walk *direction* (backward from a known
+# descendant, `_match_decomposed_head_split`'s own candidate `reshaped_name`
+# -- mirroring :func:`_match_decomposed_rope_pass_through`'s own backward
+# walk -- rather than forward from a known root) and in what `weight` itself
+# means: the normalized axis here is `head_size`, which whole-head/KV-group
+# pruning never slices (only `num_heads`/`kv_num_heads` ever are), so
+# `weight` -- broadcast identically across every head/KV-group, unlike
+# :func:`_match_decomposed_rms_norm_pass_through`'s own `weight`, which
+# *is* sliced there since that hop's own normalized axis is the pruned
+# channel axis itself -- needs ZERO slicing of any kind, the same "nothing
+# to rewrite, only mark stale" treatment :class:`_DecomposedRopePassThrough`
+# already gets and for the identical reason (see that class's own comment).
+@dataclass(frozen=True)
+class _DecomposedQKNormPassThrough:
+    """One matched Q- or K-branch decomposed per-head RMSNorm ("Q/K-norm")
+    application, sitting between the head-split `Reshape`'s own output and
+    the head-split `Transpose` -- see this module's own comment directly
+    above for the exact topology and the empirical confirmation behind it.
+    `nodes` lists every node crossed (the final weighted `Mul`, the middle
+    `Mul`, `Div`-or-`Reciprocal`, `Sqrt`, `Add`, `ReduceMean`, `Pow`, in that
+    -- backward walk -- order), purely for
+    :func:`_apply_one_decomposed_gqa_chain`'s own stale-`value_info`
+    bookkeeping -- none of them, including the final `Mul`'s own `weight`
+    operand, ever need editing (see this module's own comment above).
+    `weight_last_dim` is `weight`'s own confirmed
+    (:func:`_flat_channel_const`) `dims[-1]`, threaded through purely for
+    :func:`_decomposed_qk_norm_hop_is_consistent`'s own deferred
+    `weight_last_dim == head_size` check, run once `head_size` itself is
+    known (see that function's own docstring for why this can't be checked
+    any earlier) -- the same deferred idiom
+    :func:`_decomposed_rope_hop_is_consistent` already uses for this
+    section's own analogous RoPE hop's `half` field.
+    """
+
+    nodes: Tuple[onnx.NodeProto, ...]
+    weight_last_dim: int
+
+
+def _match_decomposed_qk_norm_pass_through(
+    name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]],
+) -> Optional[Tuple[_DecomposedQKNormPassThrough, str]]:
+    """Resolves `name` (already confirmed by the caller to be internal --
+    exactly one consumer, not a graph output -- the candidate the caller
+    would otherwise require to be a `Reshape`'s own direct output) backward
+    through the fixed 7-node decomposed Q/K-norm shape
+    :class:`_DecomposedQKNormPassThrough`'s own docstring (and this module's
+    own comment directly above it) describes.
+
+    Returns ``(hop, root_name)`` -- `root_name` the tensor read by both
+    `Pow` and the middle `Mul` (expected, by the caller, to be the
+    head-split `Reshape`'s own output) -- or ``None`` if `name` isn't
+    produced by exactly this shape, INCLUDING simply not being produced by
+    a ``Mul`` at all (the common case for a chain with no Q/K-norm -- the
+    caller falls back to treating `name` itself as the pre-norm root when
+    this declines, mirroring :func:`_match_decomposed_rope_pass_through`'s
+    own "not this shape at all" fallback convention).
+    """
+
+    def _is_internal(n: str) -> bool:
+        return len(consumers_of.get(n, [])) == 1 and n not in graph_outputs
+
+    final_mul = node_by_output.get(name)
+    if (
+        final_mul is None
+        or final_mul.domain != ""
+        or final_mul.op_type != "Mul"
+        or len(final_mul.input) != 2
+        or not final_mul.input[0]
+        or not final_mul.input[1]
+        or len(final_mul.output) != 1
+        or final_mul.output[0] != name
+    ):
+        return None
+
+    fa, fb = final_mul.input
+    for weight_name, scaled_name in ((fa, fb), (fb, fa)):
+        if weight_name == scaled_name or not _is_internal(scaled_name):
+            continue
+        if not _flat_channel_const(weight_name, initializer_map):
+            continue
+        mul_node = node_by_output.get(scaled_name)
+        if (
+            mul_node is None
+            or mul_node.domain != ""
+            or mul_node.op_type != "Mul"
+            or len(mul_node.input) != 2
+            or not mul_node.input[0]
+            or not mul_node.input[1]
+            or len(mul_node.output) != 1
+            or mul_node.output[0] != scaled_name
+        ):
+            continue
+
+        ma, mb = mul_node.input
+        for x_name, inv_std_name in ((ma, mb), (mb, ma)):
+            if x_name == inv_std_name or not _is_internal(inv_std_name):
+                continue
+            inv_node = node_by_output.get(inv_std_name)
+            if (
+                inv_node is None
+                or inv_node.domain != ""
+                or len(inv_node.output) != 1
+                or inv_node.output[0] != inv_std_name
+            ):
+                continue
+            std_name: Optional[str] = None
+            if inv_node.op_type == "Div":
+                if (
+                    len(inv_node.input) != 2
+                    or not inv_node.input[0]
+                    or not inv_node.input[1]
+                ):
+                    continue
+                one_name, cand_std_name = inv_node.input
+                if not _flat_scalar_float_const_equals(one_name, initializer_map, 1.0):
+                    continue
+                std_name = cand_std_name
+            elif inv_node.op_type == "Reciprocal":
+                if len(inv_node.input) != 1 or not inv_node.input[0]:
+                    continue
+                std_name = inv_node.input[0]
+            else:
+                continue
+            if std_name is None or not _is_internal(std_name):
+                continue
+
+            sqrt_node = node_by_output.get(std_name)
+            if (
+                sqrt_node is None
+                or sqrt_node.domain != ""
+                or sqrt_node.op_type != "Sqrt"
+                or len(sqrt_node.input) != 1
+                or not sqrt_node.input[0]
+                or len(sqrt_node.output) != 1
+                or sqrt_node.output[0] != std_name
+            ):
+                continue
+            var_eps_name = sqrt_node.input[0]
+            if not _is_internal(var_eps_name):
+                continue
+
+            add_eps = node_by_output.get(var_eps_name)
+            if (
+                add_eps is None
+                or add_eps.domain != ""
+                or add_eps.op_type != "Add"
+                or len(add_eps.input) != 2
+                or not add_eps.input[0]
+                or not add_eps.input[1]
+                or len(add_eps.output) != 1
+                or add_eps.output[0] != var_eps_name
+            ):
+                continue
+            aa, ab = add_eps.input
+            for var_name, eps_name in ((aa, ab), (ab, aa)):
+                if var_name == eps_name or not _is_internal(var_name):
+                    continue
+                if not _flat_scalar_float_const(eps_name, initializer_map):
+                    continue
+
+                reduce_mean = node_by_output.get(var_name)
+                if (
+                    reduce_mean is None
+                    or reduce_mean.output[0] != var_name
+                    or len(reduce_mean.input) != 1
+                    or not reduce_mean.input[0]
+                ):
+                    continue
+                sq_name = reduce_mean.input[0]
+                if not _reduce_mean_axis_is_last(
+                    reduce_mean, sq_name, value_info_by_name
+                ):
+                    continue
+                if not _is_internal(sq_name):
+                    continue
+
+                pow_node = node_by_output.get(sq_name)
+                if (
+                    pow_node is None
+                    or pow_node.domain != ""
+                    or pow_node.op_type != "Pow"
+                    or len(pow_node.input) != 2
+                    or pow_node.input[0] != x_name
+                    or len(pow_node.output) != 1
+                    or pow_node.output[0] != sq_name
+                    or not _decomposed_layer_norm_pow_exponent_is_two(
+                        pow_node.input[1], initializer_map
+                    )
+                ):
+                    continue
+                # `x_name` itself must be read by *exactly* the two
+                # consumers this hop accounts for (`pow_node` and
+                # `mul_node`) -- mirrors
+                # :func:`_match_decomposed_rms_norm_pass_through`'s own
+                # identical two-consumer root bar.
+                if len(consumers_of.get(x_name, [])) != 2 or x_name in graph_outputs:
+                    continue
+
+                return (
+                    _DecomposedQKNormPassThrough(
+                        (
+                            final_mul,
+                            mul_node,
+                            inv_node,
+                            sqrt_node,
+                            add_eps,
+                            reduce_mean,
+                            pow_node,
+                        ),
+                        int(initializer_map[weight_name].dims[-1]),
+                    ),
+                    x_name,
+                )
+    return None
+
+
+def _walk_back_through_decomposed_qk_norm(
+    name: str,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]],
+) -> Tuple[str, Optional[_DecomposedQKNormPassThrough]]:
+    """Thin wrapper around :func:`_match_decomposed_qk_norm_pass_through`
+    mirroring :func:`_walk_back_through_decomposed_rope`'s own ``(root_name,
+    hop)`` return convention -- ``(name, None)`` when no Q/K-norm hop was
+    crossed, so the caller (:func:`_match_decomposed_head_split`) can
+    resolve the head-split `Reshape` uniformly regardless of whether a
+    Q/K-norm was present.
+    """
+    matched = _match_decomposed_qk_norm_pass_through(
+        name,
+        consumers_of,
+        graph_outputs,
+        node_by_output,
+        initializer_map,
+        value_info_by_name,
+    )
+    if matched is None:
+        return name, None
+    hop, root_name = matched
+    return root_name, hop
+
+
+def _decomposed_qk_norm_hop_is_consistent(
+    hop: Optional[_DecomposedQKNormPassThrough], head_size: int
+) -> bool:
+    """Deferred correctness check for a
+    :func:`_walk_back_through_decomposed_qk_norm` result, run only once
+    `head_size` (this branch's own, resolved by the caller's own head-split
+    `Reshape` match) is itself known -- the same deferred idiom
+    :func:`_decomposed_rope_hop_is_consistent` already uses for this
+    section's own analogous RoPE hop. `True` (nothing to check) when `hop`
+    is ``None``. Otherwise requires the matched norm's own `weight` to be
+    exactly `head_size`-wide (``hop.weight_last_dim == head_size``) --
+    declined (``False``), never guessed at, on any mismatch (e.g. a
+    broadcast scalar `weight`, `dims[-1] == 1`, which
+    :func:`_flat_channel_const` alone doesn't rule out).
+    """
+    if hop is None:
+        return True
+    return hop.weight_last_dim == head_size
+
+
 def _match_decomposed_head_split(
     name: str,
     consumers_of: Dict[str, List[onnx.NodeProto]],
@@ -22886,7 +23252,19 @@ def _match_decomposed_head_split(
     node_by_output: Dict[str, onnx.NodeProto],
     initializer_map: Dict[str, onnx.TensorProto],
     perm: Sequence[int],
-) -> Optional[Tuple[onnx.NodeProto, onnx.NodeProto, int, int, str, str]]:
+    allow_qk_norm: bool = False,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> Optional[
+    Tuple[
+        onnx.NodeProto,
+        onnx.NodeProto,
+        int,
+        int,
+        str,
+        str,
+        Optional[_DecomposedQKNormPassThrough],
+    ]
+]:
     """Resolves `name` (already confirmed by the caller to be internal --
     exactly one consumer, not a graph output) backward through the fixed
     2-node ``Reshape -> Transpose`` head-split sequence a decomposed
@@ -22903,24 +23281,39 @@ def _match_decomposed_head_split(
     own target shape is always ``[batch, seq, H, Dh]`` regardless of which
     permutation is applied to it afterward.
 
+    When `allow_qk_norm` is set (Q's and K's own callers only -- never V's,
+    which has no analogous norm in any real export this module recognizes),
+    the `Reshape`'s own output is allowed to feed the `Transpose` through a
+    decomposed Q/K-norm hop instead of directly (see this module's own
+    comment above :class:`_DecomposedQKNormPassThrough` for the exact
+    topology and why it sits exactly here, between the two nodes this
+    function already matches) -- tried via
+    :func:`_walk_back_through_decomposed_qk_norm` on the ordinary
+    `reshaped_name` candidate first; falls back to the identical unchanged
+    behavior (`reshaped_name` itself required to be the `Reshape`'s own
+    direct output) whenever `allow_qk_norm` is unset or no such hop matches,
+    so every pre-existing caller (and V's own call, always passing the
+    `allow_qk_norm` default) is completely unaffected.
+
     Returns ``(transpose_node, reshape_node, H, Dh, reshape_shape_name,
-    proj_out_name)`` on a match, ``None`` otherwise. Deliberately close to
-    :func:`_match_bnsh_reshape` (same node topology, `perm=[0, 2, 1, 3]`
-    case) but NOT a call to it: that function also requires its own
-    `Reshape`'s shape-constant input have exactly one consumer, which is the
-    wrong bar here -- K's and V's own head-split `Reshape` routinely share
-    one literal ``[batch, seq, kv_num_heads, head_size]`` shape constant
-    once onnxsim's own common-subexpression elimination merges two
-    textually identical `Constant`s (confirmed empirically). This function
-    does not itself decide whether that sharing is safe to edit in place or
-    needs cloning first -- it just reports the shape constant's own name;
-    :func:`_apply_one_decomposed_gqa_chain`'s own `_rewrite_shape_dim` local
-    helper makes that call at apply time, once every branch's own owning
-    node(s) are known (see this module's own section comment above). The
-    reshaped tensor between the two nodes, and `proj_out_name` itself, still
-    get the ordinary single-consumer/not-a-graph-output bar every hop in
-    this module already holds -- only the shape *constant*'s own fan-out is
-    deferred.
+    proj_out_name, qk_norm_hop)`` on a match, ``None`` otherwise (`qk_norm_hop`
+    is ``None`` whenever `allow_qk_norm` is unset or no Q/K-norm was
+    crossed). Deliberately close to :func:`_match_bnsh_reshape` (same node
+    topology, `perm=[0, 2, 1, 3]` case) but NOT a call to it: that function
+    also requires its own `Reshape`'s shape-constant input have exactly one
+    consumer, which is the wrong bar here -- K's and V's own head-split
+    `Reshape` routinely share one literal ``[batch, seq, kv_num_heads,
+    head_size]`` shape constant once onnxsim's own common-subexpression
+    elimination merges two textually identical `Constant`s (confirmed
+    empirically). This function does not itself decide whether that sharing
+    is safe to edit in place or needs cloning first -- it just reports the
+    shape constant's own name; :func:`_apply_one_decomposed_gqa_chain`'s own
+    `_rewrite_shape_dim` local helper makes that call at apply time, once
+    every branch's own owning node(s) are known (see this module's own
+    section comment above). The reshaped tensor between the two nodes, and
+    `proj_out_name` itself, still get the ordinary single-consumer/not-a-
+    graph-output bar every hop in this module already holds -- only the
+    shape *constant*'s own fan-out is deferred.
     """
     transpose = node_by_output.get(name)
     if (
@@ -22943,7 +23336,20 @@ def _match_decomposed_head_split(
     reshaped_name = transpose.input[0]
     if reshaped_name in graph_outputs or len(consumers_of.get(reshaped_name, [])) != 1:
         return None
-    reshape = node_by_output.get(reshaped_name)
+
+    qk_norm_hop: Optional[_DecomposedQKNormPassThrough] = None
+    root_name = reshaped_name
+    if allow_qk_norm:
+        root_name, qk_norm_hop = _walk_back_through_decomposed_qk_norm(
+            reshaped_name,
+            consumers_of,
+            graph_outputs,
+            node_by_output,
+            initializer_map,
+            value_info_by_name,
+        )
+
+    reshape = node_by_output.get(root_name)
     if (
         reshape is None
         or reshape.domain != ""
@@ -22952,7 +23358,7 @@ def _match_decomposed_head_split(
         or not reshape.input[0]
         or not reshape.input[1]
         or len(reshape.output) != 1
-        or reshape.output[0] != reshaped_name
+        or reshape.output[0] != root_name
     ):
         return None
     shape_init = initializer_map.get(reshape.input[1])
@@ -22964,12 +23370,22 @@ def _match_decomposed_head_split(
     num_heads, head_size = int(dims[2]), int(dims[3])
     if num_heads <= 0 or head_size <= 0:
         return None
+    if not _decomposed_qk_norm_hop_is_consistent(qk_norm_hop, head_size):
+        return None
 
     proj_out = reshape.input[0]
     if proj_out in graph_outputs or len(consumers_of.get(proj_out, [])) != 1:
         return None
 
-    return transpose, reshape, num_heads, head_size, reshape.input[1], proj_out
+    return (
+        transpose,
+        reshape,
+        num_heads,
+        head_size,
+        reshape.input[1],
+        proj_out,
+        qk_norm_hop,
+    )
 
 
 def _match_decomposed_repeat_kv(
@@ -23909,6 +24325,10 @@ def _find_decomposed_gqa_chains(
                     continue
             else:
                 k_raw_name, kv_num_heads = k_operand, None
+            # Q/K-norm is not (yet) recognized for the `Einsum`-based QK^T
+            # product -- the identical, deliberate narrowing `k_rope` above
+            # already applies to this branch (see this function's own
+            # comment above), never verified/tested for this combination.
             k_split = _match_decomposed_head_split(
                 k_raw_name,
                 consumers_of,
@@ -23926,6 +24346,7 @@ def _find_decomposed_gqa_chains(
                 head_size_k,
                 k_reshape_shape,
                 k_proj_out,
+                k_norm,
             ) = k_split
             if kv_num_heads is None:
                 kv_num_heads = resolved_kv_heads
@@ -23946,6 +24367,17 @@ def _find_decomposed_gqa_chains(
                     k_perm = list(attr.ints)
 
             if k_perm == [0, 2, 3, 1]:
+                # Q/K-norm is not (yet) recognized here either: this
+                # pre-composed-perm shape only ever arises when K's own
+                # branch has NO RoPE (RoPE's own nodes would otherwise break
+                # the `Transpose`-`Transpose` adjacency `fuseConsecutiveTransposes`
+                # requires -- see this module's own comment above
+                # :class:`_DecomposedRopePassThrough`), an untested
+                # norm-without-RoPE combination no real Qwen3/Gemma2-style
+                # export this pass was verified against ever produces (both
+                # always pair Q/K-norm with RoPE) -- declined the same
+                # conservative way as the `Einsum` branch above rather than
+                # guessed at.
                 k_split = _match_decomposed_head_split(
                     k_operand,
                     consumers_of,
@@ -23956,9 +24388,15 @@ def _find_decomposed_gqa_chains(
                 )
                 if k_split is None:
                     continue
-                _, k_reshape, kv_num_heads, head_size_k, k_reshape_shape, k_proj_out = (
-                    k_split
-                )
+                (
+                    _,
+                    k_reshape,
+                    kv_num_heads,
+                    head_size_k,
+                    k_reshape_shape,
+                    k_proj_out,
+                    k_norm,
+                ) = k_split
                 k_headsplit_transpose = None
             elif k_perm == [0, 1, 3, 2]:
                 # RoPE, when present on K's own branch, always forces this
@@ -24004,6 +24442,8 @@ def _find_decomposed_gqa_chains(
                     node_by_output,
                     initializer_map,
                     (0, 2, 1, 3),
+                    allow_qk_norm=True,
+                    value_info_by_name=value_info_by_name,
                 )
                 if k_split is None:
                     continue
@@ -24014,6 +24454,7 @@ def _find_decomposed_gqa_chains(
                     head_size_k,
                     k_reshape_shape,
                     k_proj_out,
+                    k_norm,
                 ) = k_split
                 if not _decomposed_rope_hop_is_consistent(k_rope, head_size_k):
                     continue
@@ -24044,12 +24485,20 @@ def _find_decomposed_gqa_chains(
             node_by_output,
             initializer_map,
             (0, 2, 1, 3),
+            allow_qk_norm=True,
+            value_info_by_name=value_info_by_name,
         )
         if q_split is None:
             continue
-        q_transpose, q_reshape, num_heads, head_size, q_reshape_shape, q_proj_out = (
-            q_split
-        )
+        (
+            q_transpose,
+            q_reshape,
+            num_heads,
+            head_size,
+            q_reshape_shape,
+            q_proj_out,
+            q_norm,
+        ) = q_split
         if not _decomposed_rope_hop_is_consistent(q_rope, head_size):
             continue
         if head_size != head_size_k or num_heads <= 0 or kv_num_heads <= 0:
@@ -24157,6 +24606,10 @@ def _find_decomposed_gqa_chains(
                 continue
         else:
             v_repeat_kv, v_raw_name, v_kv_num_heads = None, v_bhsd_name, None
+        # V has no analogous norm in any real export this module recognizes
+        # (Qwen3/Gemma2-style architectures only ever apply `q_norm`/
+        # `k_norm`) -- `allow_qk_norm` left at its default (unset) here, the
+        # same as every call site before this feature existed.
         v_split = _match_decomposed_head_split(
             v_raw_name,
             consumers_of,
@@ -24174,6 +24627,7 @@ def _find_decomposed_gqa_chains(
             v_head_size,
             v_reshape_shape,
             v_proj_out,
+            _v_norm,
         ) = v_split
         if v_kv_num_heads is None:
             v_kv_num_heads = resolved_v_kv_heads
@@ -24332,6 +24786,8 @@ def _find_decomposed_gqa_chains(
                 packed_flatten_reshape_shape=packed_flatten_reshape_shape,
                 q_rope=q_rope,
                 k_rope=k_rope,
+                q_norm=q_norm,
+                k_norm=k_norm,
             )
         )
     return chains
@@ -24647,6 +25103,17 @@ def _apply_one_decomposed_gqa_chain(
     for hop in (chain.q_rope, chain.k_rope):
         if hop is not None:
             stale.update(n.output[0] for n in hop.nodes if n.output and n.output[0])
+    # Q's/K's own decomposed Q/K-norm pass-through, if either branch crossed
+    # one -- see this module's own comment above
+    # :class:`_DecomposedQKNormPassThrough` for why none of its own nodes
+    # (including the final `Mul`'s own `weight` operand) ever need editing,
+    # only marking stale, the identical treatment `q_rope`/`k_rope` just
+    # above already get.
+    for norm_hop in (chain.q_norm, chain.k_norm):
+        if norm_hop is not None:
+            stale.update(
+                n.output[0] for n in norm_hop.nodes if n.output and n.output[0]
+            )
 
     return (
         {chain.q_weight, chain.k_weight, chain.v_weight},
