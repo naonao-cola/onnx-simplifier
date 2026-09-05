@@ -23429,7 +23429,19 @@ def _find_sparse_attention_chains(
 #   :func:`_gqa_group_importance`-based ranking (plain or Wanda-wrapped) and
 #   :func:`_apply_one_decomposed_gqa_chain` slicing this section already
 #   built for the plain variant -- pure wiring, no matching/slicing logic
-#   specific to either the calibrated or dry-run path.
+#   specific to either the calibrated or dry-run path. True MQA
+#   (`kv_num_heads == 1`) shares :func:`_apply_one_gqa_chain`'s own dedicated
+#   fast path here too, not just for the fused-node family: KV-group
+#   granularity can never drop anything for it (there is only ever one
+#   group, so the group-keep-count formula is always a no-op), so
+#   individual query heads are ranked and dropped directly instead
+#   (:func:`_gqa_query_head_importance`/`_wanda_gqa_query_head_importance`,
+#   both fully reused, unmodified, since :class:`_DecomposedGQAChain` shares
+#   every field either reads off a chain), leaving the sole shared KV head --
+#   and both its own K/V producer weights and `kv_num_heads` itself --
+#   completely untouched. See :func:`_apply_one_gqa_chain`'s own docstring
+#   for the full reasoning and :func:`_apply_one_decomposed_gqa_chain`'s own
+#   for this family's version of it.
 # - Packed-QKV (:func:`_match_packed_qkv_split`'s own shape -- one shared
 #   MatMul/vanilla-Gemm projection feeding a `Split` into Q-then-K-then-V
 #   column ranges, each of which then independently feeds this section's
@@ -25565,6 +25577,7 @@ def _apply_one_decomposed_gqa_chain(
     sparsity: float,
     compute_group_importance,
     bias_ctx: _DynamicHeadBiasContext,
+    compute_query_importance=None,
 ) -> Optional[Tuple[Set[str], str, Set[str]]]:
     """Applies whole-KV-group pruning to one matched decomposed attention
     block -- the decomposed-shape analogue of :func:`_apply_one_gqa_chain`
@@ -25609,10 +25622,38 @@ def _apply_one_decomposed_gqa_chain(
     Returns ``(producer_weight_names, consumer_weight_name,
     stale_output_names)`` on success, or ``None`` if `sparsity` rounds to no
     groups dropped for this block (a no-op, left for the caller to skip).
+
+    True MQA (``chain.kv_num_heads == 1``) is the same dedicated fast path
+    :func:`_apply_one_gqa_chain` has -- see that function's own docstring
+    for the full reasoning. With exactly one KV group, the ordinary
+    group-granularity formula (``max(1, 1 - round(1 * sparsity))``) is
+    always `1 == kv_num_heads`, so it can never drop anything no matter how
+    many query heads (`chain.num_heads`) share that one KV head. This path
+    instead ranks and drops individual *query* heads directly
+    (`_gqa_query_head_importance`/`compute_query_importance`), leaving the
+    single shared KV head -- and both its own K/V producer weights and
+    `kv_num_heads` itself -- completely untouched: `keep_groups` stays fixed
+    at the sole surviving group (`[0]`, an identity slice of a size-1 axis),
+    and only `keep_q_heads`/`new_num_heads` are computed differently.
     """
+    if compute_query_importance is None:
+        # Default deferred to call time, not the function signature itself
+        # (unlike :func:`_apply_one_gqa_chain`'s own identical-looking
+        # default): `_gqa_query_head_importance` is defined later in this
+        # module than this function, so binding it directly as a parameter
+        # default would evaluate at *module import* time, before that name
+        # exists yet, and fail with a `NameError`.
+        compute_query_importance = _gqa_query_head_importance
     h = chain.kv_num_heads
     keep_count = max(1, h - round(h * sparsity))
-    if keep_count >= h:
+    is_mqa = h == 1 and chain.num_heads > 1
+    q_keep_count = 0
+    if is_mqa:
+        nq_total = chain.num_heads
+        q_keep_count = max(1, nq_total - round(nq_total * sparsity))
+        if q_keep_count >= nq_total:
+            return None  # no query heads prunable at this sparsity either
+    elif keep_count >= h:
         return None
 
     d = chain.head_size
@@ -25655,11 +25696,23 @@ def _apply_one_decomposed_gqa_chain(
         if chain.v_weight_transposed:
             wv_kn = wv_kn.T
 
-    importance = compute_group_importance(chain, wq_kn, wk_kn, wv_kn)
-    keep_groups = np.sort(np.argsort(-importance)[:keep_count])
-    keep_q_heads = np.concatenate(
-        [np.arange(g * group_size, (g + 1) * group_size) for g in keep_groups]
-    )
+    if is_mqa:
+        # Fixed at the sole surviving KV group -- `_head_column_indices`
+        # below turns this into an identity slice of K's/V's own
+        # size-`kv_num_heads * head_size`/`kv_num_heads * v_head_size` axes
+        # (`kv_num_heads == 1`), so K/V stay byte-for-byte untouched; ranked
+        # per query head instead, directly by `compute_query_importance`,
+        # rather than expanding whichever groups `compute_group_importance`
+        # would have kept (meaningless here -- there is only ever one group).
+        keep_groups = np.zeros(1, dtype=np.int64)
+        q_importance = compute_query_importance(chain, wq_kn)
+        keep_q_heads = np.sort(np.argsort(-q_importance)[:q_keep_count])
+    else:
+        importance = compute_group_importance(chain, wq_kn, wk_kn, wv_kn)
+        keep_groups = np.sort(np.argsort(-importance)[:keep_count])
+        keep_q_heads = np.concatenate(
+            [np.arange(g * group_size, (g + 1) * group_size) for g in keep_groups]
+        )
     q_idx = _head_column_indices(keep_q_heads, d)
     k_idx = _head_column_indices(keep_groups, d)
     v_idx = _head_column_indices(keep_groups, dv)
@@ -25698,7 +25751,13 @@ def _apply_one_decomposed_gqa_chain(
         initializer_map[chain.consumer_weight], chain.consumer_weight_transposed, y_idx
     )
 
-    new_num_heads = keep_count * group_size
+    # `len(keep_q_heads)` rather than `keep_count * group_size`: identical
+    # for the ordinary group-pruning path (`keep_q_heads` is built there as
+    # exactly `keep_count` groups of `group_size` heads each), but the only
+    # correct count for the MQA fast path above, where `keep_q_heads` is an
+    # arbitrary top-`q_keep_count` subset of individual query heads with no
+    # group structure to multiply out.
+    new_num_heads = len(keep_q_heads)
     new_kv_num_heads = keep_count
 
     graph = bias_ctx.graph
@@ -25706,8 +25765,26 @@ def _apply_one_decomposed_gqa_chain(
     consumers_of = _consumers_of(graph)
 
     def _rewrite_shape_dim(
-        shape_name: str, owner_nodes: Sequence[onnx.NodeProto], index: int, value: int
+        shape_name: str,
+        owner_nodes: Sequence[onnx.NodeProto],
+        *edits: Tuple[int, int],
     ) -> None:
+        # `*edits` -- one or more `(index, value)` pairs, applied together
+        # in a single clone-or-edit-in-place decision -- rather than a lone
+        # `(index, value)` pair: needed by the MQA fast path's own
+        # `k_repeat_kv`/`v_repeat_kv` `Expand` target shape below, which
+        # must rewrite *two* dimensions of the same shape constant (both
+        # `kv_num_heads`, index 1, and the broadcast repeat count `n_rep`,
+        # index 2 -- see this function's own caller for why `n_rep` only
+        # ever needs touching for that path). Calling this function twice in
+        # a row for the same `shape_name`, once per dimension, would be
+        # unsafe for the "clone" branch below: the first call's clone
+        # rewires `owner_nodes` away from `shape_name` onto a fresh tensor,
+        # so a second call still keyed on the old `shape_name` would find
+        # `owner_nodes` no longer reading it at all (already migrated),
+        # silently losing that second edit -- see this function's own
+        # in-place-vs-clone branch for the mechanism this sidesteps by
+        # applying every edit atomically instead.
         shape_init = initializer_map[shape_name]
         dims = onnx.numpy_helper.to_array(shape_init).copy()
         owner_ids = {id(n) for n in owner_nodes}
@@ -25720,7 +25797,8 @@ def _apply_one_decomposed_gqa_chain(
             # mutating the shared original.
             new_name = _mint_unique_name(f"{shape_name}_pruned", used_names)
             new_dims = dims.copy()
-            new_dims[index] = value
+            for index, value in edits:
+                new_dims[index] = value
             new_init = onnx.numpy_helper.from_array(new_dims, name=new_name)
             graph.initializer.append(new_init)
             initializer_map[new_name] = new_init
@@ -25729,7 +25807,8 @@ def _apply_one_decomposed_gqa_chain(
                     if inp == shape_name:
                         owner.input[i] = new_name
         else:
-            dims[index] = value
+            for index, value in edits:
+                dims[index] = value
             shape_init.CopyFrom(
                 onnx.numpy_helper.from_array(dims, name=shape_init.name)
             )
@@ -25746,25 +25825,41 @@ def _apply_one_decomposed_gqa_chain(
         _rewrite_shape_dim(
             chain.packed_flatten_reshape_shape,
             (chain.packed_flatten_reshape,),
-            -1,
-            len(q_idx) + len(k_idx) + len(v_idx),
+            (-1, len(q_idx) + len(k_idx) + len(v_idx)),
         )
 
-    _rewrite_shape_dim(chain.q_reshape_shape, (chain.q_reshape,), 2, new_num_heads)
+    _rewrite_shape_dim(chain.q_reshape_shape, (chain.q_reshape,), (2, new_num_heads))
     if chain.k_reshape_shape == chain.v_reshape_shape:
         _rewrite_shape_dim(
             chain.k_reshape_shape,
             (chain.k_reshape, chain.v_reshape),
-            2,
-            new_kv_num_heads,
+            (2, new_kv_num_heads),
         )
     else:
         _rewrite_shape_dim(
-            chain.k_reshape_shape, (chain.k_reshape,), 2, new_kv_num_heads
+            chain.k_reshape_shape, (chain.k_reshape,), (2, new_kv_num_heads)
         )
         _rewrite_shape_dim(
-            chain.v_reshape_shape, (chain.v_reshape,), 2, new_kv_num_heads
+            chain.v_reshape_shape, (chain.v_reshape,), (2, new_kv_num_heads)
         )
+    # `expand_edits`: index 1 (`kv_num_heads`) always needs (re)writing --
+    # a no-op value for the MQA fast path, where it is unchanged, but still
+    # safe/cheap to include unconditionally. Index 2 (`n_rep`, the
+    # broadcast repeat count each KV head is tiled to) is invariant for the
+    # ordinary group-pruning path -- dropping a whole KV group never changes
+    # `group_size` for any surviving one, so this dimension needs no edit
+    # there -- but the MQA fast path can shrink `new_num_heads` (unlike
+    # `new_kv_num_heads`, fixed at 1) independently of any group structure,
+    # so `n_rep == new_num_heads / new_kv_num_heads == new_num_heads` must
+    # be rewritten too, or the `Expand`'s own literal target shape goes
+    # stale and the graph becomes unrunnable (a real, confirmed failure
+    # mode, not a hypothetical -- see this module's own decomposed-MQA test
+    # suite). Both edits are applied together, in one `_rewrite_shape_dim`
+    # call, whenever `is_mqa` -- see that function's own docstring for why
+    # two separate calls against the same shape name would be unsafe.
+    expand_edits: List[Tuple[int, int]] = [(1, new_kv_num_heads)]
+    if is_mqa:
+        expand_edits.append((2, new_num_heads))
     if (
         chain.k_repeat_kv is not None
         and chain.v_repeat_kv is not None
@@ -25773,23 +25868,20 @@ def _apply_one_decomposed_gqa_chain(
         _rewrite_shape_dim(
             chain.k_repeat_kv.expand_shape,
             (chain.k_repeat_kv.expand, chain.v_repeat_kv.expand),
-            1,
-            new_kv_num_heads,
+            *expand_edits,
         )
     else:
         if chain.k_repeat_kv is not None:
             _rewrite_shape_dim(
                 chain.k_repeat_kv.expand_shape,
                 (chain.k_repeat_kv.expand,),
-                1,
-                new_kv_num_heads,
+                *expand_edits,
             )
         if chain.v_repeat_kv is not None:
             _rewrite_shape_dim(
                 chain.v_repeat_kv.expand_shape,
                 (chain.v_repeat_kv.expand,),
-                1,
-                new_kv_num_heads,
+                *expand_edits,
             )
     if (
         chain.k_repeat_kv is not None
@@ -25802,27 +25894,24 @@ def _apply_one_decomposed_gqa_chain(
         _rewrite_shape_dim(
             chain.k_repeat_kv.merge_reshape_shape,
             (chain.k_repeat_kv.merge_reshape, chain.v_repeat_kv.merge_reshape),
-            1,
-            new_num_heads,
+            (1, new_num_heads),
         )
     else:
         if chain.k_repeat_kv is not None:
             _rewrite_shape_dim(
                 chain.k_repeat_kv.merge_reshape_shape,
                 (chain.k_repeat_kv.merge_reshape,),
-                1,
-                new_num_heads,
+                (1, new_num_heads),
             )
         if chain.v_repeat_kv is not None:
             _rewrite_shape_dim(
                 chain.v_repeat_kv.merge_reshape_shape,
                 (chain.v_repeat_kv.merge_reshape,),
-                1,
-                new_num_heads,
+                (1, new_num_heads),
             )
     if chain.out_reshape_shape is not None:
         _rewrite_shape_dim(
-            chain.out_reshape_shape, (chain.out_reshape,), -1, new_num_heads * dv
+            chain.out_reshape_shape, (chain.out_reshape,), (-1, new_num_heads * dv)
         )
 
     if chain.mask_node is not None and chain.mask_idx is not None:
@@ -26807,7 +26896,12 @@ def _apply_attention_chains(
         applied: Optional[Tuple[Set[str], str, Set[str]]]
         if isinstance(chain, _DecomposedGQAChain):
             applied = _apply_one_decomposed_gqa_chain(
-                initializer_map, chain, sparsity, compute_group_importance, bias_ctx
+                initializer_map,
+                chain,
+                sparsity,
+                compute_group_importance,
+                bias_ctx,
+                compute_query_importance,
             )
         elif isinstance(chain, _GQAChain):
             applied = _apply_one_gqa_chain(
@@ -27134,6 +27228,11 @@ def apply_attention_head_wanda_pruning(
     section comment -- at the identical whole-KV-group granularity, ranked
     by the same calibrated importance, since :class:`_DecomposedGQAChain`
     shares every field :func:`_gqa_group_importance` and this wrapper read.
+    True MQA (``kv_num_heads == 1``) gets the identical dedicated
+    query-head-granularity fast path for this family too -- see
+    :func:`_apply_one_gqa_chain`'s own docstring for the full reasoning --
+    ranked by `_wanda_gqa_query_head_importance` below, reused unmodified
+    (it too only ever reads fields both chain types share).
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to measure each
@@ -39693,13 +39792,13 @@ def _analyze_attention_chains(
     :func:`_analyze_attention_head_wanda_pruning` does, to fold in a
     calibrated activation norm) unmodified. `compute_query_importance` takes
     ``(chain, wq)`` -- the same true-MQA (`chain.kv_num_heads == 1`)
-    query-head-granularity fast path :func:`_apply_one_gqa_chain` itself
-    has (see that function's own docstring): only ever called for a real
-    `_GQAChain` (never `_DecomposedGQAChain`, out of scope for that path)
-    whose `kv_num_heads == 1`, in place of `compute_group_importance`, so
-    this dry-run report predicts the same query-head-level drops a real
-    call would make instead of reporting the ordinary group-granularity
-    formula's permanent no-op for it.
+    query-head-granularity fast path :func:`_apply_one_gqa_chain` (and its
+    decomposed-shape analogue, :func:`_apply_one_decomposed_gqa_chain`)
+    itself has (see that function's own docstring): called for either a real
+    `_GQAChain` or a `_DecomposedGQAChain` whose `kv_num_heads == 1`, in
+    place of `compute_group_importance`, so this dry-run report predicts the
+    same query-head-level drops a real call would make instead of reporting
+    the ordinary group-granularity formula's permanent no-op for it.
 
     `chains` also carries :class:`_DecomposedGQAChain` (see this module's
     own "Decomposed (un-fused) attention head pruning" section comment),
@@ -39725,7 +39824,18 @@ def _analyze_attention_chains(
             label = _node_label(chain.softmax_node)
             producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
             h = chain.kv_num_heads
-            is_mqa = False
+            # True MQA (`kv_num_heads == 1`) fast path -- mirrors the
+            # `_GQAChain` branch below (and
+            # :func:`_apply_one_decomposed_gqa_chain`'s own `is_mqa`
+            # handling): KV-group granularity can never drop anything for
+            # it (there is only ever one group), so `h` is swapped here to
+            # the query head count and every downstream keep-count/
+            # importance/report computation below runs at query-head
+            # granularity instead, exactly the same switch
+            # :func:`_apply_one_decomposed_gqa_chain` itself makes.
+            is_mqa = h == 1 and chain.num_heads > 1
+            if is_mqa:
+                h = chain.num_heads
             family = "attention_decomposed_group"
         elif isinstance(chain, _GQAChain):
             label = _node_label(chain.node)
@@ -39738,10 +39848,10 @@ def _analyze_attention_chains(
             # every downstream keep-count/importance/report computation below
             # runs at query-head granularity instead, exactly the same
             # switch :func:`_apply_one_gqa_chain` itself makes -- see that
-            # function's own docstring for the full writeup. Scoped to a real
-            # `_GQAChain` only, never :class:`_DecomposedGQAChain` (out of
-            # scope -- see this module's "Decomposed (un-fused) attention
-            # head pruning" section comment).
+            # function's own docstring for the full writeup. The
+            # `_DecomposedGQAChain` branch above computes the identical
+            # `is_mqa`/`h` swap for its own family, mirroring
+            # :func:`_apply_one_decomposed_gqa_chain`'s own fast path.
             is_mqa = h == 1 and chain.num_heads > 1
             if is_mqa:
                 h = chain.num_heads

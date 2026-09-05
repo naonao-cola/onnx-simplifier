@@ -43720,6 +43720,227 @@ def test_decomposed_gqa_pruning_unsupported_transpose_perm_is_declined():
     assert before == after
 
 
+# --- True decomposed MQA (kv_num_heads == 1) query-head pruning fast path --
+#
+# Regression coverage mirroring this module's own fused-op "True MQA
+# (kv_num_heads == 1) query-head pruning fast path" section above, but for
+# `_DecomposedGQAChain`/`_apply_one_decomposed_gqa_chain`: before this fix,
+# `_apply_one_decomposed_gqa_chain` still had the old, unfixed KV-group-only
+# formula (`max(1, h - round(h * sparsity))` with `h = kv_num_heads = 1`,
+# always `1 == h`), making the WHOLE decomposed-attention pruning pass a
+# no-op for every real decomposed-MQA export (Falcon-7B/StarCoder/
+# PaLM-family-style plain `torch.onnx.export`, never post-processed by ONNX
+# Runtime's own transformer-fusion pass) -- confirmed empirically via a real
+# `torch.onnx.export` pipeline. `_apply_one_decomposed_gqa_chain` now has the
+# identical dedicated fast path `_apply_one_gqa_chain` already has: individual
+# query heads are ranked and dropped directly, leaving the sole KV head --
+# and both its own K/V producer weights and `kv_num_heads` itself --
+# completely untouched. `_oracle_keep_query_heads`/`_head_idx` (defined in
+# this module's own fused-MQA section above) are reused verbatim -- both are
+# already chain-shape-agnostic (plain numpy over a `wq` array).
+
+
+def test_decomposed_mqa_pruning_shrinks_query_heads_kv_fully_untouched():
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=1, D=8, Out=16, seed=201)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    wq_new, wk_new, wv_new, wo_new = _decomposed_weight_shapes(pruned)
+    d = cfg["D"]
+    assert wq_new.shape[1] == 4 * d  # max(1, 8 - round(8*0.5)) query heads kept
+    assert wo_new.shape[0] == 4 * d
+    # K/V producer weights completely untouched -- same shape AND same
+    # values as the original, unpruned model (the confirmed-fixed bug's own
+    # "byte-identical in/out" no-op signature, but now scoped to just K/V,
+    # not the whole block).
+    np.testing.assert_array_equal(wk_new, cfg["wk"])
+    np.testing.assert_array_equal(wv_new, cfg["wv"])
+
+
+def test_decomposed_mqa_pruning_is_not_a_complete_no_op():
+    # The confirmed bug itself: before this fix, this call was byte-identical
+    # to `model` for any `sparsity` (since `kv_num_heads == 1` always forced
+    # the group formula's early exit). It must not be anymore.
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=1, D=8, Out=16, seed=202)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.75)
+    assert pruned.SerializeToString() != model.SerializeToString()
+
+    wq_new, _wk_new, _wv_new, _wo_new = _decomposed_weight_shapes(pruned)
+    d = cfg["D"]
+    assert wq_new.shape[1] == 2 * d  # max(1, 8 - round(8*0.75)) < original 8
+
+
+def test_decomposed_mqa_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=1, D=8, Out=16, seed=203)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    before = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in model.graph.initializer
+    }
+    after = {
+        t.name: onnx.numpy_helper.to_array(t).shape for t in pruned.graph.initializer
+    }
+    assert before == after
+    wq_new, wk_new, wv_new, _wo_new = _decomposed_weight_shapes(pruned)
+    np.testing.assert_array_equal(wq_new, cfg["wq"])
+    np.testing.assert_array_equal(wk_new, cfg["wk"])
+    np.testing.assert_array_equal(wv_new, cfg["wv"])
+
+
+def test_decomposed_mqa_pruning_matches_oracle_exactly():
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=1, D=8, Out=16, seed=205)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    d = cfg["D"]
+    new_h = 4  # max(1, 8 - round(8*0.5))
+    keep_q_heads = _oracle_keep_query_heads(cfg["wq"], cfg["H"], d, new_h)
+    q_idx = _head_idx(keep_q_heads, d)
+
+    oracle, _ = _decomposed_gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=cfg["KVH"],
+        D=d,
+        Out=cfg["Out"],
+        seed=205,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"],
+        wv=cfg["wv"],
+        wout=cfg["wout"][q_idx, :],
+        bq=cfg["bq"][q_idx],
+        bk=cfg["bk"],
+        bv=cfg["bv"],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(206)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_decomposed_mqa_wanda_pruning_matches_oracle_exactly():
+    # Wanda-calibrated variant of the same fast path -- mirrors
+    # `test_mqa_wanda_pruning_matches_oracle_exactly`'s own oracle
+    # construction (ranking individual query heads, no KV group to combine
+    # activation norms across) applied to the decomposed shape, the same way
+    # `test_decomposed_gqa_wanda_pruning_matches_oracle_exactly` mirrors
+    # `test_gqa_wanda_pruning_matches_oracle_exactly` for genuine GQA.
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=1, D=8, Out=16, seed=207)
+
+    rng = np.random.default_rng(208)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    _wq_new, wk_new, wv_new, _wo_new = _decomposed_weight_shapes(pruned)
+    np.testing.assert_array_equal(wk_new, cfg["wk"])
+    np.testing.assert_array_equal(wv_new, cfg["wv"])
+
+    # `ctx2` -- the flattened `[batch*seq, H*Dv]` tensor feeding the
+    # O-projection Gemm -- is exactly `chain.consumer_node.input[0]`, the
+    # tensor `_wanda_attention_calibration_stats` probes for every chain
+    # kind uniformly (see that function's own docstring).
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx2"))
+    (_, ctx2_cal) = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx2_cal.astype(np.float64)), axis=0))
+
+    d = cfg["D"]
+    importance = np.zeros(cfg["H"])
+    for h in range(cfg["H"]):
+        base = np.linalg.norm(cfg["wq"][:, h * d : (h + 1) * d])
+        act_head = np.linalg.norm(act_norm[h * d : (h + 1) * d])
+        importance[h] = base * max(act_head, 1e-8)
+    keep_q_heads = np.sort(np.argsort(-importance)[:4])  # max(1, 8-round(8*0.5))
+    q_idx = _head_idx(keep_q_heads, d)
+
+    oracle, _ = _decomposed_gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=cfg["KVH"],
+        D=d,
+        Out=cfg["Out"],
+        seed=207,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"],
+        wv=cfg["wv"],
+        wout=cfg["wout"][q_idx, :],
+        bq=cfg["bq"][q_idx],
+        bk=cfg["bk"],
+        bv=cfg["bv"],
+        bout=cfg["bout"],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_analyze_attention_head_pruning_decomposed_mqa_reports_query_head_drops():
+    # Dry-run (`analyze_pruning_sensitivity`) vs. real-call parity for the
+    # decomposed-shape MQA fast path -- mirrors
+    # `test_analyze_attention_head_pruning_mqa_reports_query_head_drops`'s own
+    # pattern: the report must predict query-head-granularity drops, not the
+    # permanent zero-drop the ordinary KV-group formula would give for
+    # `kv_num_heads == 1` (see this section's own top comment).
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=1, D=8, Out=16, seed=209)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_decomposed_group"
+    assert layer.total == cfg["H"]  # query-head total, not kv_num_heads(1)
+    assert layer.would_drop == 4  # max(1, 8 - round(8*0.5)) kept -> 4 dropped
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    wq_new, wk_new, wv_new, _wo_new = _decomposed_weight_shapes(pruned)
+    d = cfg["D"]
+    assert wq_new.shape[1] == (cfg["H"] - layer.would_drop) * d
+    np.testing.assert_array_equal(wk_new, cfg["wk"])
+    np.testing.assert_array_equal(wv_new, cfg["wv"])
+
+
+def test_analyze_attention_head_wanda_pruning_decomposed_mqa_reports_query_head_drops():
+    model, cfg = _decomposed_gqa_model(K=16, H=8, KVH=1, D=8, Out=16, seed=210)
+    rng = np.random.default_rng(211)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_attention_head_wanda_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.5,
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_decomposed_group"
+    assert layer.total == cfg["H"]
+    assert layer.would_drop == 4
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    wq_new, wk_new, wv_new, _wo_new = _decomposed_weight_shapes(pruned)
+    d = cfg["D"]
+    assert wq_new.shape[1] == (cfg["H"] - layer.would_drop) * d
+    np.testing.assert_array_equal(wk_new, cfg["wk"])
+    np.testing.assert_array_equal(wv_new, cfg["wv"])
+
+
 def test_decomposed_attention_real_torch_export_pipeline():
     """The real end-to-end pipeline this whole feature targets:
     ``torch.onnx.export -> onnxsim.simplify() -> apply_attention_head_pruning``
