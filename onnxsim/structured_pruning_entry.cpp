@@ -17242,17 +17242,14 @@ struct EmbeddingChain {
 
 // True for FLOAT, FLOAT16, and BFLOAT16 -- every element dtype this
 // section's own matchers accept for a weight/bias initializer. Mirrors
-// pruning.py's own `_is_supported_float_dtype` exactly. Local to this
-// section: every OTHER matcher in this file that still checks
+// pruning.py's own `_is_supported_float_dtype` exactly. Reuses the
+// identical helper the MoE/QMoE section above already defines for the same
+// purpose (see that section's own comment) rather than redeclaring it here
+// -- every OTHER matcher in this file that still checks
 // `== onnx::TensorProto::FLOAT` directly is intentionally left alone (see
 // this file's own "narrower than pruning.py" scope-decision comments
 // elsewhere) -- widening those is a separate, unrelated decision this round
 // does not make.
-bool IsSupportedFloatDtype(int32_t data_type) {
-  return data_type == onnx::TensorProto::FLOAT ||
-         data_type == onnx::TensorProto::FLOAT16 ||
-         data_type == onnx::TensorProto::BFLOAT16;
-}
 
 // --- FLOAT16/BFLOAT16 <-> float32 bit conversion, and the
 // ReadFloatTensorAnyDtype/SetFloatTensorDataPreservingDtype pair built on
