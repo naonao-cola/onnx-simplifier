@@ -14,6 +14,15 @@ the *other* runner (`src/onnx_finetune_wasm.cpp`, the Embind wrapper around
 unresolved memory bug, and has no distillation support of its own at all -- for that, use
 `distill_step_graph/` instead.
 
+The step-graph runners (`distill_step_graph/` and `federated_lora/`) default to
+onnxruntime-web's wasm (CPU) execution provider. On a desktop browser with a
+Vulkan driver, pass `{ executionProviders: ["webgpu", "wasm"] }` to
+`StepGraphSession.create` to run the training step graph on WebGPU -- the
+browser's own GPU API, which Chromium serves over that Vulkan driver -- with
+onnxruntime-web falling back to the wasm CPU kernels for any op WebGPU cannot
+run. WebGPU needs a real browser page (`navigator.gpu`), which is why the
+wasm default stays put under plain Node.
+
 Same training loop as `../src/main.cpp` (the native CLI), compiled to
 WebAssembly and exposed to JS via Embind instead of argv, so it can run
 fine-tuning entirely client-side in a browser tab.

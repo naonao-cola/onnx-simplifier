@@ -733,8 +733,8 @@ def compile_torch_training_loop(
     ordinary one -- :func:`onnxsim.compile_training_loop` returns the exact
     same type for a caller who already had an ONNX model. Only *building*
     the loop goes through torch; running it does not need torch installed at
-    all, importable or not. Its ``__call__`` accepts a torch tensor (CPU or
-    CUDA) directly, with no ``.numpy()`` needed and, when onnxruntime is
+    all, importable or not. Its ``__call__`` accepts a torch tensor (CPU,
+    CUDA or ROCm/HIP) directly, with no ``.numpy()`` needed and, when onnxruntime is
     installed, no extra copy either -- see
     :mod:`onnxsim.compile_training`'s own module docstring on the DLPack
     path this goes through.
