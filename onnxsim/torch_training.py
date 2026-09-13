@@ -124,6 +124,17 @@ def _inline_local_functions(model: onnx.ModelProto) -> onnx.ModelProto:
     :func:`onnxsim.compile_training_loop`'s own differentiation see the same
     nodes regardless of which shape this particular export happened to take.
 
+    Deliberately *not* :func:`onnxsim.inline_local_functions`: that also runs
+    a full ``simplify()`` pass immediately, and this call sits ahead of
+    :func:`_expand_dangling_aten_reduce_calls`/:func:`_drop_unused_functions`,
+    both of which pattern-match a *specific* raw, un-simplified shape a stale
+    or partially-inlined export can leave behind (see their own docstrings
+    for the exact, already-observed-in-CI edge cases) -- simplifying here
+    first risks folding away the very shape those two rely on seeing.
+    :func:`_control_flow_survived` below runs the fail-loud check
+    :func:`onnxsim.inline_local_functions` would otherwise give this call,
+    after that whole cleanup sequence finishes instead.
+
     A no-op, returning ``model`` unchanged, when there are no local
     functions to expand at all -- the common case, and the only one
     observed locally in this repository's own dev sandbox.
@@ -362,6 +373,53 @@ def _strip_default_noop_with_empty_axes(model: onnx.ModelProto) -> onnx.ModelPro
     return model
 
 
+#: Ops :mod:`onnxsim.graph_grad` cannot differentiate through and most ONNX
+#: runtimes do not execute -- matches :func:`onnxsim.inline_local_functions`'s
+#: own set (see its docstring); duplicated rather than imported so this
+#: module's own cheap-import path never needs ``onnx_simplifier`` for the
+#: common case of a model with no local functions at all (see
+#: :func:`_inline_local_functions`'s own docstring for why this file inlines
+#: functions itself rather than delegating there).
+_CONTROL_FLOW_OPS = frozenset({"If", "Loop", "Scan"})
+
+
+def _raise_if_control_flow_survived(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Raises ``ValueError`` if inlining left an ``If``/``Loop``/``Scan``
+    node behind; otherwise returns ``model`` unchanged.
+
+    Some of onnxscript's own op lowerings genuinely use ``If`` internally
+    (an optional-input or negative-axis branch, say), and torch's exporter
+    -- unlike :mod:`onnxsim.graph_grad`'s own hand-written functions -- is
+    arbitrary, external input this module does not control. Left alone,
+    such a node reaches :mod:`onnxsim.graph_grad` as a generic
+    ``UnsupportedOpError: no gradient rule for op type 'If'`` -- true, but
+    it does not say why an ``If`` is there in the first place. This runs
+    last in :func:`_export_via_dynamo`'s own cleanup sequence, once
+    :func:`_inline_local_functions` and everything after it have already
+    had their chance to expand or rewrite one away, so a node still here
+    is not a compile-time-constant condition simplification could resolve
+    -- see :func:`onnxsim.inline_local_functions`'s own docstring for that
+    case, which this module does not run into: none of onnxscript's own
+    control-flow lowerings observed so far have been on a statically
+    resolvable condition.
+    """
+    survivors = [
+        f"{node.op_type} {node.name!r}"
+        for node in model.graph.node
+        if node.op_type in _CONTROL_FLOW_OPS
+    ]
+    if survivors:
+        raise ValueError(
+            "onnxsim.torch_training: control flow survived inlining: "
+            + ", ".join(survivors)
+            + ". onnxsim.graph_grad cannot differentiate through If/Loop/"
+            "Scan, and most ONNX runtimes do not execute it either -- this "
+            "usually means one of torch's exported ops lowered to a "
+            "genuinely data-dependent branch rather than plain ops."
+        )
+    return model
+
+
 def _import_torch() -> Any:
     try:
         import torch
@@ -525,7 +583,8 @@ def _export_via_dynamo(
             model = _expand_dangling_aten_reduce_calls(model)
             model = _drop_unused_functions(model)
             model = _fold_full_reduction_squeeze(model)
-            return _strip_default_noop_with_empty_axes(model)
+            model = _strip_default_noop_with_empty_axes(model)
+            return _raise_if_control_flow_survived(model)
     finally:
         module.train(was_training)
 
