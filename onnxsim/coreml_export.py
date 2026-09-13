@@ -436,8 +436,10 @@ def _op_where(lowerer, node, ins, attrs):
     # `Where(mask, const[1], scores[1,heads,S,S])`). Explicitly broadcast the
     # deficient inputs first, using a max-rank input as the shape source.
     shapes = [tuple(v.shape) for v in (cond, a, b)]
-    if not (_mil_shapes_match(shapes[0], shapes[1])
-            and _mil_shapes_match(shapes[0], shapes[2])):
+    if not (
+        _mil_shapes_match(shapes[0], shapes[1])
+        and _mil_shapes_match(shapes[0], shapes[2])
+    ):
         ranked = sorted((cond, a, b), key=lambda v: len(v.shape))
         ref = ranked[-1]
         ref_shape = tuple(ref.shape)

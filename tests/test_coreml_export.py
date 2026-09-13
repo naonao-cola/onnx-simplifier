@@ -422,9 +422,7 @@ def test_where_broadcast_const_select_inputs_share_shape():
     # runs fine -- seen on a transformer decoder's
     # `Where(mask, const[1], scores[1,heads,S,S])`. The translator must
     # broadcast explicitly (scalar fill) first.
-    cond = numpy_helper.from_array(
-        np.zeros((1, 1, 2, 2), dtype=bool), name="cond"
-    )
+    cond = numpy_helper.from_array(np.zeros((1, 1, 2, 2), dtype=bool), name="cond")
     neg = numpy_helper.from_array(np.array([-1000.0], np.float32), name="neg")
     x = numpy_helper.from_array(np.ones((1, 1, 2, 2), np.float32), name="x")
     model = _model(
@@ -439,9 +437,7 @@ def test_where_broadcast_const_select_inputs_share_shape():
     prog, _flexible_inputs = coreml_export._build_mil_program(
         model, *coreml_export._import_mil()
     )
-    selects = [
-        op for op in prog.functions["main"].operations if op.op_type == "select"
-    ]
+    selects = [op for op in prog.functions["main"].operations if op.op_type == "select"]
     assert len(selects) == 1
     shapes = {tuple(v.shape) for v in selects[0].inputs.values()}
     assert shapes == {(1, 1, 2, 2)}, shapes
