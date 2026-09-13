@@ -693,6 +693,52 @@ CPU folding is deterministic) and use the NPU for running the full model --
 correctness checking (`check_n`), `backend.run_model` / `backend.Runner`, or
 the QAT/training loops' `step_providers=`.
 
+#### Quantized models on the NPU
+
+The EP executes INT8 (and, via `config_file`, BF16-compiled) graphs; which
+subgraphs land on the NPU is decided by its own fusion passes. The
+recommended INT8 recipe is AMD Quark's `XINT8` config (`pip install
+amd-quark`, no AMD login needed), then onnxsim's Vitis AI legalizer, then
+the EP with `target=X2` (the backend for Strix/KrackanPoint; no `xclbin`):
+
+```python
+from quark.onnx import ModelQuantizer, QConfig
+
+# 1. Quantize (Quark XINT8: UINT8 activations / INT8 weights, power-of-2 scales).
+quantizer = ModelQuantizer(QConfig.get_default_config("XINT8"))
+quantizer.quantize_model("fp32.onnx", "int8.onnx", calib_reader)
+
+# 2. Legalize for the NPU (fixes what the EP can't take -- see below).
+import onnxsim
+model = onnxsim.legalize_for_vitisai(onnx.load("int8.onnx"))
+print(onnxsim.check_vitisai_support(model))  # [] means NPU-safe
+
+# 3. Run on the NPU (inside the ryzen_ai venv, XRT set up).
+import onnxruntime as ort
+sess = ort.InferenceSession(
+    model.SerializeToString(),
+    providers=[("VitisAIExecutionProvider", {"target": "X2"}),
+               "CPUExecutionProvider"],
+)
+```
+
+Two sharp edges, both measured on Strix Halo / Ryzen AI 1.8:
+
+- **`Conv` without explicit attributes aborts the process.** A `Conv`
+  relying on ONNX defaults (no `strides`/`pads`/`dilations`/`kernel_shape`/
+  `group` -- exactly what stock `onnxruntime` quantization *and* Quark
+  emit) dies in XIR conversion (`conv2d: Attr stride REQUIRED`) instead of
+  falling back. `legalize_for_vitisai` materializes them (resolving the
+  weight through `DequantizeLinear` chains), turning the abort into an NPU
+  offload -- verified bit-exact vs CPU on a quantized conv probe, and on
+  Quark `XINT8`/`A8W8` outputs alike.
+- **The EP rejects bf16-typed graphs** (`INVALID_GRAPH`); BF16 execution
+  means an fp32 graph plus `config_file`, never a bf16 graph. `LSTM` nodes
+  segfault session creation -- keep those on CPU. Standalone
+  activations/norms/softmax and data-movement ops simply fall back to CPU
+  by design; only conv/pool/matmul-centred subgraphs offload
+  (`check_vitisai_support` flags exactly the hard-failure cases above).
+
 ## Profiling the optimization
 
 Simplification alternates a handful of transforms -- shape inference, the
