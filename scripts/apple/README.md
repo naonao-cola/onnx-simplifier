@@ -813,3 +813,36 @@ python prepare_benchmark_models.py --output-dir benchmark_models
 python run_llm_decode_benchmark.py benchmark_models/Qwen_Qwen2_5_1_5B_Instruct/model.mlpackage \
     --prompt "The capital of France is" --max-new-tokens 20
 ```
+
+### Training on ANE (`train_mlp_step_coreml.py`)
+
+Everything above is inference. `train_mlp_step_coreml.py` closes the loop:
+it builds a 2-layer MLP Adam training step as an ONNX graph with onnxsim's
+own training-graph tooling (`graph_grad.build_backward` for the backward
+pass, `qat_graph.adam_update` + `make_step_graph` for the update and the
+state-in/state-out plumbing), converts it with `onnxsim.export_coreml`, and
+runs the loop through `predict()`, feeding updated parameters and Adam
+moments back each step -- the same state-feedback shape as the KV-cache
+decode loop, but for weights. The maderix/ANE project reaches this hardware
+for training through reverse-engineered private APIs instead; this is the
+same question answered through the public Core ML stack.
+
+```bash
+python train_mlp_step_coreml.py --output mlp_step.mlpackage \
+    --steps 15 --compute-units CPU_AND_NE
+```
+
+Two adaptations the Core ML target forces: rank-0 scalar inputs are widened
+to shape-[1] (MIL has no rank-0 Placeholder; broadcast-identical where used),
+and the step uses loss scaling with eps=1e-3, since default fp16 compute
+zeroes Adam's 1e-8 epsilon and underflows small gradients (the same fp16
+backward-underflow class maderix documents).
+
+Measured on real hardware (M4 Mac mini, 1024-2048-1024 MLP, batch 256,
+~4.2M params): the whole step (forward + backward + Adam) places **100% on
+ANE**, and loss falls 0.80 -> 0.37 over 15 steps, tracking the CPU and
+ONNX-Runtime references. Per-step time is 10.3ms on ANE vs. 9.7ms CPU --
+~50MB of weights/moments cross the `predict()` boundary per step, so
+transfers dominate at this size; a resident-weight loop (maderix's IOSurface
+approach) would be needed to chase their throughput rather than just their
+placement.
