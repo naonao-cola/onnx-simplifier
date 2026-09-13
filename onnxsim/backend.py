@@ -134,7 +134,9 @@ def _provider_hint(missing: Sequence[str]) -> str:
     """An install hint for ``missing`` providers, or the generic one when none
     of them names a provider with a known package."""
     hints = [
-        _PROVIDER_INSTALL_HINTS[name] for name in missing if name in _PROVIDER_INSTALL_HINTS
+        _PROVIDER_INSTALL_HINTS[name]
+        for name in missing
+        if name in _PROVIDER_INSTALL_HINTS
     ]
     if hints:
         return " Install hint: " + "; ".join(sorted(set(hints))) + "."
