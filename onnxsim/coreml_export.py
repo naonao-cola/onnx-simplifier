@@ -53,7 +53,7 @@ _NP_DOWNCAST = {
     np.dtype(np.float64): np.float32,
     np.dtype(np.int64): np.int32,
 }
-_SUPPORTED_NP_DTYPES = {np.float32, np.float16, np.int32, np.bool_}
+_SUPPORTED_NP_DTYPES = {np.float32, np.float16, np.int32, np.bool_, np.int8, np.uint8}
 
 
 def has_coremltools() -> bool:
@@ -98,8 +98,9 @@ def _as_mil_array(arr: np.ndarray) -> np.ndarray:
     if arr.dtype.type not in _SUPPORTED_NP_DTYPES:
         raise RuntimeError(
             f"Unsupported tensor dtype {arr.dtype} for Core ML export (supported: "
-            "float16, float32, float64, int32, int64, bool; 64-bit types are "
-            "downcast to their 32-bit equivalent)."
+            "float16, float32, float64, int32, int64, bool, int8, uint8; 64-bit "
+            "types are downcast to their 32-bit equivalent; int8/uint8 are "
+            "constants only, e.g. a quantization zero point)."
         )
     return arr
 
@@ -422,6 +423,87 @@ def _broadcast_to_shape(lowerer, node, x, shape_var, suffix: str):
             x=out, dtype="bool", name=lowerer.fresh_name(node, suffix)
         )
     return out
+
+
+def _qdq_scale_and_zp(lowerer, node, ins, attrs, op_name: str):
+    """Shared (scale, zero_point, axis) handling for the QDQ pair.
+
+    Both MIL `quantize`/`dequantize` need compile-time-constant scale (and
+    zero point); a runtime-computed scale (e.g. re-estimated per step) has no
+    lowering here. Returns `(scale_var, zero_point_var_or_None, axis_or_None)`
+    with the scale dtype-matched to the input exactly the way the dynamic
+    `Expand` path matches its `fill` value (a bare Python/numpy scalar would
+    land on MIL's default dtype instead).
+    """
+    scale = ins[1]
+    if scale.val is None:
+        raise RuntimeError(f"{op_name} needs a compile-time-constant 'scale' input")
+    zp = ins[2] if len(ins) > 2 and ins[2] is not None else None
+    if zp is not None and zp.val is None:
+        raise RuntimeError(
+            f"{op_name} needs a compile-time-constant 'zero_point' input"
+        )
+    axis = int(attrs.get("axis", 1))
+    return scale, zp, axis
+
+
+@_register("QuantizeLinear")
+def _op_quantize_linear(lowerer, node, ins, attrs):
+    x = ins[0]
+    scale, zp, axis = _qdq_scale_and_zp(lowerer, node, ins, attrs, "QuantizeLinear")
+    np_dtype = lowerer.types.nptype_from_builtin(x.dtype)
+    if np.asarray(scale.val).dtype != np_dtype:
+        scale = lowerer.make_const(
+            f"{node.output[0]}_scale",
+            np.asarray(scale.val).astype(np_dtype),
+        )
+    if zp is None:
+        output_dtype = "int8"
+        zp_arg: Dict[str, Any] = {}
+    else:
+        zp_np_dtype = np.asarray(zp.val).dtype
+        if zp_np_dtype == np.dtype(np.int8):
+            output_dtype = "int8"
+        elif zp_np_dtype == np.dtype(np.uint8):
+            output_dtype = "uint8"
+        else:
+            raise RuntimeError(
+                f"QuantizeLinear 'zero_point' must be int8 or uint8 (got {zp_np_dtype})"
+            )
+        zp_arg = {"zero_point": zp}
+    kwargs: Dict[str, Any] = {
+        "input": x,
+        "scale": scale,
+        "output_dtype": output_dtype,
+        "name": lowerer.fresh_name(node),
+    }
+    kwargs.update(zp_arg)
+    if np.asarray(scale.val).ndim > 0:
+        kwargs["axis"] = axis
+    return [lowerer.mb.quantize(**kwargs)]
+
+
+@_register("DequantizeLinear")
+def _op_dequantize_linear(lowerer, node, ins, attrs):
+    x = ins[0]
+    scale, zp, axis = _qdq_scale_and_zp(lowerer, node, ins, attrs, "DequantizeLinear")
+    if zp is not None:
+        zp_np_dtype = np.asarray(zp.val).dtype
+        if zp_np_dtype not in (np.dtype(np.int8), np.dtype(np.uint8)):
+            raise RuntimeError(
+                "DequantizeLinear 'zero_point' must be int8 or uint8 "
+                f"(got {zp_np_dtype})"
+            )
+    kwargs = {
+        "input": x,
+        "scale": scale,
+        "name": lowerer.fresh_name(node),
+    }
+    if zp is not None:
+        kwargs["zero_point"] = zp
+    if np.asarray(scale.val).ndim > 0:
+        kwargs["axis"] = axis
+    return [lowerer.mb.dequantize(**kwargs)]
 
 
 @_register("Where")
@@ -1401,6 +1483,32 @@ def _resolve_io_dtype(ct, io_dtype: Optional[str], convert_to: str, resolved_tar
     return "fp16", resolved_target
 
 
+def _resolve_quantized_target(ct, model: onnx.ModelProto, resolved_target):
+    """Bump the deployment floor to iOS17 when the graph holds QDQ nodes.
+
+    MIL's `quantize`/`dequantize` only exist from the iOS17 op version, so a
+    model using them must both build and convert at that target or newer --
+    same shape as `_resolve_io_dtype`'s iOS16 bump for fp16 I/O: raise the
+    floor silently when the caller didn't pin one, refuse an explicitly older
+    one rather than emitting a model `coremlcompiler` would reject.
+    """
+    if not any(
+        node.op_type in ("QuantizeLinear", "DequantizeLinear")
+        for node in model.graph.node
+    ):
+        return resolved_target
+    floor = ct.target.iOS17
+    if resolved_target is None:
+        return floor
+    if int(resolved_target) < int(floor):
+        raise RuntimeError(
+            "QuantizeLinear/DequantizeLinear need minimum_deployment_target "
+            f"iOS17/macOS14 or newer (got {resolved_target.name}); MIL's "
+            "`quantize`/`dequantize` ops did not exist before then."
+        )
+    return resolved_target
+
+
 def convert_to_coreml(
     model: onnx.ModelProto,
     *,
@@ -1522,6 +1630,7 @@ def convert_to_coreml(
     io_dtype, resolved_target = _resolve_io_dtype(
         ct, io_dtype, convert_to, resolved_target
     )
+    resolved_target = _resolve_quantized_target(ct, model, resolved_target)
 
     prog, flexible_inputs = _build_mil_program(
         model,

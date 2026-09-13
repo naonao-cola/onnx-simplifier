@@ -885,3 +885,36 @@ ONNX-Runtime references. Per-step time is 10.3ms on ANE vs. 9.7ms CPU --
 transfers dominate at this size; a resident-weight loop (maderix's IOSurface
 approach) would be needed to chase their throughput rather than just their
 placement.
+
+### int8 training (`--qat-int8`, QDQ lowering + straight-through gradients)
+
+Post-conversion weight quantization cannot touch a training loop (its
+weights are loop-carried inputs, not constants -- the pass quantizes one
+tiny scalar and nothing else). Real int8 training is quantization-*aware*:
+fake-quantize the MatMul weights in the forward pass
+(`DequantizeLinear(QuantizeLinear(w))`, symmetric int8, scales calibrated
+once from the initial weights) while Adam trains the fp32 masters through
+straight-through estimation. Supporting that took two translator-adjacent
+additions, both covered by unit tests:
+
+- `QuantizeLinear`/`DequantizeLinear` lowering in `onnxsim/coreml_export.py`
+  (MIL-native `quantize`/`dequantize`, iOS17+ -- conversion raises the
+  deployment floor automatically, like fp16 I/O's iOS16 bump), including the
+  previously-rejected int8/uint8 constant initializers they need for scales
+  and zero points.
+- Straight-through gradient rules in `onnxsim/graph_grad.py`'s
+  python-only table (the pair differentiates as the identity and emits no
+  nodes; no C++ mirror needed, same as `Where`).
+
+```bash
+python train_mlp_step_coreml.py --qat-int8 --output mlp_step_qat.mlpackage \
+    --steps 15 --compute-units CPU_AND_NE
+```
+
+Measured on real hardware (same S1 MLP): the QAT step places **114/114 ops
+on ANE, quantize/dequantize pairs included**, and loss falls 0.82 -> 0.37 --
+identical to the fp32-master run -- at 10.4ms/step. The int8 forward costs
+nothing measurable here because the weights still cross the boundary fp32
+every step; the win this unlocks is the one the previous section measured
+for inference (halved weight bytes fitting ANE capacity), now available to
+a training forward pass too.

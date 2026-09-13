@@ -29,6 +29,7 @@ import onnx.inliner
 import onnx.parser
 import onnx.shape_inference
 import pytest
+from onnx import numpy_helper
 from onnx.reference import ReferenceEvaluator
 from onnx.reference.op_run import OpRun
 
@@ -1355,6 +1356,58 @@ def test_a_gradient_seeded_on_an_intermediate_tensor_is_added_in():
     # dL/dH = dh flowing through H = A*A gives 2*A*dh; a sanity anchor on the
     # intermediate seed actually being used at all.
     np.testing.assert_allclose(only_h, 2.0 * a * dh, rtol=1e-5, atol=1e-6)
+
+
+def test_a_quantize_dequantize_sandwich_passes_the_seed_through():
+    """Straight-through estimation for fake quantization: the true gradient
+    of rounding is zero almost everywhere, so QAT convention passes the seed
+    through both `QuantizeLinear` and `DequantizeLinear` unchanged -- the
+    pair differentiates as the identity and emits no nodes at all."""
+    model = _model(
+        """
+        g (float[2,3] A) => (float[2,3] Y) {
+          Q = QuantizeLinear (A, s, zp)
+          Y = DequantizeLinear (Q, s, zp)
+        }
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            numpy_helper.from_array(np.array(0.05, dtype=np.float32), name="s"),
+            numpy_helper.from_array(np.array(0, dtype=np.int8), name="zp"),
+        ]
+    )
+    shapes = _static_shapes(model)
+    b = qat_graph.GraphBuilder("bw_")
+    grads = graph_grad.build_backward(
+        b, list(model.graph.node), shapes, {"Y": "dY"}, ["A"]
+    )
+    # Straight-through: no backward nodes emitted, the gradient is the seed.
+    assert len(b.nodes) == 0
+    nodes = list(model.graph.node)
+    nodes.append(onnx.helper.make_node("Identity", [grads["A"]], ["grad_A"]))
+    graph = onnx.helper.make_graph(
+        nodes,
+        "ste",
+        list(model.graph.input)
+        + [onnx.helper.make_tensor_value_info("dY", onnx.TensorProto.FLOAT, [2, 3])],
+        [onnx.helper.make_tensor_value_info("grad_A", onnx.TensorProto.FLOAT, [2, 3])],
+        initializer=list(model.graph.initializer),
+    )
+    model2 = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model2.ir_version = 8
+    onnx.checker.check_model(model2)
+
+    rng = np.random.default_rng(11)
+    a = rng.standard_normal((2, 3)).astype(np.float32)
+    dy = rng.standard_normal((2, 3)).astype(np.float32)
+    session = ort.InferenceSession(
+        model2.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (got,) = session.run(None, {"A": a, "dY": dy})
+    np.testing.assert_array_equal(got, dy)
 
 
 def test_a_transformer_style_block_end_to_end():

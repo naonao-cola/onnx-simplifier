@@ -326,6 +326,70 @@ def test_neg_fp16_matches_expected():
     np.testing.assert_array_equal(_mil_const_value(model), -x.astype(np.float32))
 
 
+def test_quantize_linear_matches_numpy():
+    # Symmetric int8 quantize folds at build time, including the int8
+    # zero-point initializer the exporter otherwise rejects.
+    x = np.array([-1.0, -0.33, 0.0, 0.5, 1.0], dtype=np.float32)
+    scale = np.array(0.02, dtype=np.float32)
+    zp = np.array(0, dtype=np.int8)
+    model = _model(
+        "q () => (int8[5] qy) { qy = QuantizeLinear (x, s, zp) }",
+        initializer=[
+            numpy_helper.from_array(x, name="x"),
+            numpy_helper.from_array(scale, name="s"),
+            numpy_helper.from_array(zp, name="zp"),
+        ],
+    )
+    np.testing.assert_array_equal(
+        _mil_const_value(model), np.round(x / 0.02).astype(np.int8)
+    )
+
+
+def test_quantize_linear_per_channel_axis():
+    # A vector scale selects the `axis` attribute path (here axis=0 over a
+    # [2,3] input with a 2-element scale).
+    rng = np.random.RandomState(7)
+    x = rng.randn(2, 3).astype(np.float32)
+    scale = np.array([0.1, 0.2], dtype=np.float32)
+    zp = np.array([0, 0], dtype=np.int8)
+    model = _model(
+        "qch () => (int8[2,3] qy) { qy = QuantizeLinear <axis=0> (x, s, zp) }",
+        initializer=[
+            numpy_helper.from_array(x, name="x"),
+            numpy_helper.from_array(scale, name="s"),
+            numpy_helper.from_array(zp, name="zp"),
+        ],
+    )
+    np.testing.assert_array_equal(
+        _mil_const_value(model),
+        np.round(x / scale[:, None]).astype(np.int8),
+    )
+
+
+def test_dequantize_linear_wiring_and_shape():
+    # `dequantize` only folds in a later pipeline pass, so this checks the
+    # wiring MIL-level instead: int8 input, const scale/zp carried through,
+    # fp32 output shape preserved.
+    x = np.array([-50, 0, 25], dtype=np.int8)
+    scale = np.array(0.02, dtype=np.float32)
+    zp = np.array(0, dtype=np.int8)
+    model = _model(
+        "dq () => (float[3] y) { y = DequantizeLinear (x, s, zp) }",
+        initializer=[
+            numpy_helper.from_array(x, name="x"),
+            numpy_helper.from_array(scale, name="s"),
+            numpy_helper.from_array(zp, name="zp"),
+        ],
+    )
+    prog, _ = coreml_export._build_mil_program(model, *coreml_export._import_mil())
+    (dq,) = [
+        op for op in prog.functions["main"].operations if op.op_type == "dequantize"
+    ]
+    assert tuple(dq.inputs["scale"].shape) == ()
+    assert dq.inputs["zero_point"].val is not None
+    assert tuple(prog.functions["main"].outputs[0].shape) == (3,)
+
+
 def test_pad_reflect_matches_onnxruntime():
     x = np.arange(12, dtype=np.float32).reshape(1, 1, 3, 4)
     pads = np.array([0, 0, 1, 1, 0, 0, 1, 1], np.int64)
