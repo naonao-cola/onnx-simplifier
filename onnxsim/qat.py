@@ -46,8 +46,8 @@ backward emitted by :func:`onnxsim.graph_grad.build_backward`, and one
 :func:`onnxsim.qat_graph.adam_update` per trained tensor are a single pure
 ``(constants, state, scalars) -> (next state, loss)`` function, driven by
 :func:`onnxsim.qat_graph.run_step_graph`. So the loop reaches whatever
-execution provider ``step_providers=`` names -- CUDA, an NPU EP, WebGPU in
-the WASM build.
+execution provider ``step_providers=`` names -- CUDA/ROCm (including MIGraphX),
+an NPU EP, WebGPU in the WASM build.
 
 Everything this module *emits* stays inside
 :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS` to make that reach real rather
@@ -2984,7 +2984,8 @@ def apply_qat_all_blocks(
     :param providers: execution providers for the activation captures (both
             the teacher's and, in sequential mode, the student's)
     :param step_providers: execution providers for the optimization itself,
-            as an ONNX step graph -- the path to CUDA, an NPU EP or WebGPU
+            as an ONNX step graph -- the path to CUDA/ROCm (including
+            MIGraphX), an NPU EP or WebGPU
     :param optimizer: which optimizer trains each block's own weight --
             ``"adam"`` (the default) or ``"sgd_momentum"``, applied
             identically to every block in the walk. Scoped to the weight

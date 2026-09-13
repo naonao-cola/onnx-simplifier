@@ -579,6 +579,23 @@ tuned = onnxsim.apply_adaround(
 
 Omitting `step_providers` keeps the existing float64 numpy loop, which is what
 CI runs: it is exact and reproducible, and a non-CPU provider is neither.
+On AMD ROCm hardware the same loop runs through the ROCm providers instead --
+`onnxruntime-rocm` offers `ROCMExecutionProvider`, `onnxruntime-migraphx`
+(or the newer `onnxruntime-ep-migraphx` plugin) offers
+`MIGraphXExecutionProvider`; keep `CPUExecutionProvider` last so ops the
+accelerator cannot run still fall back. `scripts/amd/README.md` covers which
+wheel to install:
+
+```python
+tuned = onnxsim.apply_adaround(
+    float_model,
+    quantized_model,
+    calibration_data=batches,
+    providers=["MIGraphXExecutionProvider", "CPUExecutionProvider"],
+    step_providers=["MIGraphXExecutionProvider", "CPUExecutionProvider"],
+)
+```
+
 `apply_adaquant` and `apply_autoround` take the same argument. In the browser, the Quantize
 panel's **calibration execution provider** picker does the equivalent for
 calibration's own forward passes (WebGPU, or WebNN's GPU/NPU device types).

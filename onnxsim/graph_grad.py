@@ -4,8 +4,8 @@ the gradient itself emitted as ordinary ONNX nodes.
 :mod:`onnxsim.qat_graph` explains why a training step can run on an inference
 runtime at all: a hand-derived backward pass is plain dataflow, so it is
 expressible as an ordinary ONNX graph and therefore runs wherever an ONNX
-model runs -- CUDA, an NPU execution provider, WebGPU in the browser. This
-module removes the "hand-derived" part of that sentence.
+model runs -- CUDA/ROCm (including MIGraphX), an NPU execution provider,
+WebGPU in the browser. This module removes the "hand-derived" part of that sentence.
 
 **Why that matters.** Every gradient in this repo today is written out by
 hand, once per pass, for one fixed expression:

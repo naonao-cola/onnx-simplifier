@@ -57,6 +57,7 @@ not an onnxsim bug.
 | `models.py` | alias for `scripts/common/synthetic_models.py`, the small synthetic-graph suite shared with the other EP harnesses. |
 | `worker.py` | runs the check for one model in an isolated subprocess, printing one `__RESULT__<json>` line. |
 | `run_migraphx_compat.py` | drives the suite, writes a CSV, and exits non-zero on any regression. Entry point for the (dormant) CI workflow. |
+| `run_training_compat.py` | validates on-device *training* (the compiled step-graph loop behind `compile_training_loop` and every `step_providers=` loop) on each GPU provider the host offers (`ROCMExecutionProvider`, `MIGraphXExecutionProvider`): loss must fall, state must stay device-resident. Run it on ROCm hardware by hand; needs no CI wiring. |
 
 ## Running locally
 
@@ -68,6 +69,44 @@ pip install .                      # or install an onnxsim wheel
 
 python scripts/amd/run_migraphx_compat.py --output migraphx-compat.csv
 ```
+
+## Validating on-device training
+
+`run_training_compat.py` exercises the other half of the ROCm story --
+training, not inference. It runs `onnxsim.compile_training_loop`'s compiled
+step graph (the same loop every `step_providers=` argument in `apply_qat`,
+`apply_block_finetune`, `apply_adaround`/`apply_adaquant`/`apply_autoround`
+and `compile_torch_training_loop` runs) on each GPU provider the host offers,
+and reports per provider whether the loss falls, where the trained state
+lives between steps, and whether `IOBinding` binds:
+
+```bash
+python scripts/amd/run_training_compat.py
+python scripts/amd/run_training_compat.py --require-gpu --steps 200 --lr 0.05
+```
+
+A provider with no answering device is `skipped`, never failed; a training
+run whose loss does not fall is `failed`.
+
+## Hardware notes (Strix Halo / gfx1151)
+
+Validated on an AMD Ryzen AI MAX+ 395 (Radeon 8060S, gfx1151) with
+`onnxruntime-rocm`:
+
+- The prebuilt wheel has no gfx1151 kernels: without anything else every
+  device kernel fails with `hipErrorInvalidDeviceFunction`.
+  `HSA_OVERRIDE_GFX_VERSION=11.0.0` (spoof as gfx1100) gets elementwise and
+  session-management kernels running -- enough to prove the training step
+  graph executes on-device -- but rocBLAS-backed ops (`Transpose`, `MatMul`)
+  still fail inside rocBLAS (`HIPBLAS_STATUS_INTERNAL_ERROR`), so a full
+  training loop cannot converge there. On gfx942/gfx950 or RDNA3 discrete
+  GPUs the wheel has native kernels and no spoof is needed.
+- `onnxruntime-migraphx` additionally needs the system `libmigraphx_c`
+  (`apt install migraphx`); without it onnxruntime silently falls back to
+  CPU. The validation script and the provider-gated tests
+  (`tests/test_compile_training.py`, `tests/test_torch_training.py`) check
+  `get_providers()` after the session build so that fallback reads as
+  "unavailable", not as a passing GPU run.
 
 The in-tree smoke test `tests/test_migraphx_compat.py` reuses this harness
 and is skipped automatically when the MIGraphX EP isn't usable (no

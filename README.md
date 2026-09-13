@@ -630,7 +630,20 @@ model_simp, check = onnxsim.simplify(
 ```
 
 The CUDA execution provider requires the GPU build of ONNX Runtime
-(`pip install onnxruntime-gpu`). If you request a provider the installed ONNX
+(`pip install onnxruntime-gpu`). On AMD ROCm hardware the same `providers`
+mechanism reaches `ROCMExecutionProvider` (`pip install onnxruntime-rocm`)
+and `MIGraphXExecutionProvider` (`pip install onnxruntime-migraphx`, or the
+`onnxruntime-ep-migraphx` plugin on newer ROCm stacks -- see
+`scripts/amd/README.md`), for constant folding and -- via `step_providers=` --
+for the QAT/block-finetune/training step graphs as well:
+
+```python
+model_simp, check = onnxsim.simplify(
+    model, providers=["MIGraphXExecutionProvider", "CPUExecutionProvider"]
+)
+```
+
+If you request a provider the installed ONNX
 Runtime does not offer, onnxsim raises a `ValueError` listing the available
 providers instead of silently folding on the CPU. When `providers` is left
 unset (the default), folding runs on the CPU.
