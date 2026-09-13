@@ -359,6 +359,39 @@ quantized, rather than the two costs just adding. Reinforces the same
 conclusion from the solo measurement above: `--matmul-to-conv` isn't worth
 enabling for this pipeline's shapes, combined with int8 or otherwise.
 
+### Static-context export (`--static-context N`)
+
+All the flags above keep the dynamic KV cache (RangeDim `sequence_length` /
+`past_sequence_length`); only the *weights* or *ops* change. This one changes
+the dynamism itself: `--static-context N` pins one decode step at a fixed
+context of N tokens (1 new token against N-1 cached) with fully static
+shapes, instead of the dynamic cache. Pinning happens before `simplify`, so
+constant folding also collapses the shape subgraphs dynamic dims would keep
+alive (7364 -> 1981 nodes vs. 7364 -> 2663 dynamic, same model).
+
+The reason is ANE plan construction, not speed directly. The dynamic model's
+ANE-including plan fails to build on current macOS -- first on broadcast
+`select`s (fixed in `onnxsim/coreml_export.py`'s `Where` lowering, which now
+broadcasts explicitly), then on the inherently dynamic outputs themselves
+(`Invalid blob shape: Data-dependent shapes were disabled`, for the growing
+`present_*` cache). The static model builds cleanly, and the placement split
+is exactly the "dynamic glue on CPU, compute on NPU" shape: `MLComputePlan`
+reports **2055 ops (77.5% of estimated cost) on ANE, 11 on CPU** (shape casts,
+a gather pair, one matmul) for `SmolLM2-135M` at N=512.
+
+```bash
+python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \
+    --max-context-length 512 --static-context 512 --output smollm2-static.mlpackage
+```
+
+Caveats, both measured on real hardware: at 135M/batch-1 the ANE path is
+*slower* than CPU for a decode step (11-14ms vs. ~8ms steady-state) --
+per-op dispatch and CPU/ANE transfers dominate where the ceiling analysis
+says bandwidth should; NPU wins need more compute per step than this shape
+offers. And a baked-in cache size means this is a placement probe and a
+single-step benchmark, not a multi-step decoder: each new context length
+needs its own export.
+
 ### fp16 model interface (`--io-dtype fp16`)
 
 Where `--quantize-weights` cuts the bytes read from DRAM *inside* the model and

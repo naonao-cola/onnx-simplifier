@@ -142,6 +142,40 @@ def _fix_batch_size(model: onnx.ModelProto, batch_size: int) -> None:
                 d.dim_value = batch_size
 
 
+def _pin_sequence_dims(
+    model: onnx.ModelProto, sequence_length: int, past_sequence_length: int
+) -> None:
+    """Pin the three sequence-length dim_params to concrete values, everywhere
+    they appear (inputs, outputs, and intermediate value infos).
+
+    This is the `--static-context` path: one decode step at a fixed context
+    (`sequence_length=1` new token, `past_sequence_length` cached tokens, and
+    their sum as the composite dim). A fully static model lets E5RT build an
+    ANE-including execution plan -- Core ML places the static compute on the
+    Neural Engine and the leftover shape glue on CPU (verified by
+    `coreml_compute_plan_trace.m`: ~78% of estimated cost on ANE for
+    SmolLM2-135M at context 512), while the dynamic model's ANE plan build
+    fails outright on current macOS ("Data-dependent shapes were disabled").
+    Only shapes are touched, never tensor data.
+    """
+    pinned = {
+        "sequence_length": sequence_length,
+        "past_sequence_length": past_sequence_length,
+        "past_sequence_length + sequence_length": sequence_length
+        + past_sequence_length,
+    }
+    for vi in (
+        list(model.graph.input)
+        + list(model.graph.output)
+        + list(model.graph.value_info)
+    ):
+        for d in vi.type.tensor_type.shape.dim:
+            if d.HasField("dim_param") and d.dim_param in pinned:
+                value = pinned[d.dim_param]
+                d.Clear()
+                d.dim_value = value
+
+
 def export_llm_to_coreml(
     model_id: str,
     output_path: str,
@@ -154,6 +188,7 @@ def export_llm_to_coreml(
     matmul_to_conv: bool = False,
     minimum_deployment_target: str | None = None,
     io_dtype: str = "fp32",
+    static_context: int | None = None,
 ) -> None:
     from optimum.exporters.onnx import main_export
 
@@ -196,6 +231,16 @@ def export_llm_to_coreml(
         # directory, untouched external-data files).
         fixed_model = onnx.load(str(onnx_path), load_external_data=False)
         _fix_batch_size(fixed_model, batch_size=1)
+        if static_context is not None:
+            # One decode step at a fixed context: a single new token against
+            # a full cache. Pinning before simplify (not just before
+            # conversion) lets constant folding collapse the shape subgraphs
+            # that dynamic dimensions would keep alive.
+            _pin_sequence_dims(
+                fixed_model,
+                sequence_length=1,
+                past_sequence_length=static_context - 1,
+            )
         onnx.save(fixed_model, str(onnx_path))
         num_nodes_before = len(fixed_model.graph.node)
         del fixed_model
@@ -231,14 +276,15 @@ def export_llm_to_coreml(
         # quantize_weights="none".
         convert_kwargs = {
             "convert_to": convert_to,
-            "dynamic_shapes": {
-                "sequence_length": (1, 1, max_context_length),
-                "past_sequence_length": (0, 0, max_context_length - 1),
-                "past_sequence_length + sequence_length": (1, 1, max_context_length),
-            },
             "matmul_to_conv": matmul_to_conv,
             "io_dtype": io_dtype,
         }
+        if static_context is None:
+            convert_kwargs["dynamic_shapes"] = {
+                "sequence_length": (1, 1, max_context_length),
+                "past_sequence_length": (0, 0, max_context_length - 1),
+                "past_sequence_length + sequence_length": (1, 1, max_context_length),
+            }
         if minimum_deployment_target is not None:
             convert_kwargs["minimum_deployment_target"] = minimum_deployment_target
         elif quantize_weights == "int4":
@@ -366,6 +412,19 @@ def main() -> int:
         "per-operation compute-device/cost APIs, which return no data for models "
         "built below their SDK floor -- see coreml_compute_plan_trace.m.",
     )
+    ap.add_argument(
+        "--static-context",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Export one decode step at a fixed context of N tokens (1 new token "
+        "against N-1 cached) with fully static shapes instead of the dynamic KV "
+        "cache (default: dynamic). A static model lets E5RT build an ANE-including "
+        "plan -- static compute lands on the Neural Engine, leftover shape glue "
+        "on CPU -- while the dynamic model's ANE plan build fails on current "
+        "macOS. For NPU placement probing and single-step benchmarking, not for "
+        "multi-step decode (the cache size is baked in).",
+    )
     args = ap.parse_args()
 
     export_llm_to_coreml(
@@ -379,6 +438,7 @@ def main() -> int:
         matmul_to_conv=args.matmul_to_conv,
         minimum_deployment_target=args.minimum_deployment_target,
         io_dtype=args.io_dtype,
+        static_context=args.static_context,
     )
     return 0
 
