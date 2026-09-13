@@ -368,9 +368,88 @@ for _onnx_op, _mil_op in [
     _OP_HANDLERS[_onnx_op] = _simple_binary(_mil_op)
 
 
+def _mil_dim_equal(da, db) -> bool:
+    """Whether two MIL shape dims are provably the same extent."""
+    if isinstance(da, (int, np.integer)) and isinstance(db, (int, np.integer)):
+        return int(da) == int(db)
+    # Symbolic/dynamic dims: only ever produced from this module's own
+    # `dynamic_shapes` RangeDims, so two non-int dims are treated as the same
+    # extent (spare broadcasts would only add no-op fill/add pairs, but the
+    # leaner graph is easier to read back in a model dump).
+    return not isinstance(da, (int, np.integer)) and not isinstance(
+        db, (int, np.integer)
+    )
+
+
+def _mil_shapes_match(a_shape, b_shape) -> bool:
+    """Whether two MIL shapes are provably identical (same rank, every dim
+    equal per :func:`_mil_dim_equal`)."""
+    return len(a_shape) == len(b_shape) and all(
+        _mil_dim_equal(da, db) for da, db in zip(a_shape, b_shape)
+    )
+
+
+def _broadcast_to_shape(lowerer, node, x, shape_var, suffix: str):
+    """Broadcast MIL var ``x`` up to ``shape_var``'s shape (the 1-D runtime
+    shape vector, e.g. from ``mb.shape``), via the same fill/add idiom the
+    dynamic ``Expand`` path uses: ``fill`` accepts a runtime (non-constant)
+    shape, and adding a same-shaped zero tensor forces ``x`` to broadcast up
+    to it, exactly following numpy/ONNX right-aligned broadcast rules. A
+    1-element constant instead becomes a scalar ``fill`` directly (no add)."""
+    is_bool = x.dtype == lowerer.types.bool
+    if is_bool:
+        x = lowerer.mb.cast(
+            x=x, dtype="int32", name=lowerer.fresh_name(node, suffix + "_boolcast")
+        )
+    np_dtype = lowerer.types.nptype_from_builtin(x.dtype)
+    if x.val is not None and np.asarray(x.val).size == 1:
+        out = lowerer.mb.fill(
+            shape=shape_var,
+            value=np_dtype(np.asarray(x.val).reshape(-1)[0]),
+            name=lowerer.fresh_name(node, suffix + "_fill"),
+        )
+    else:
+        zeros = lowerer.mb.fill(
+            shape=shape_var,
+            value=np_dtype(0),
+            name=lowerer.fresh_name(node, suffix + "_zeros"),
+        )
+        out = lowerer.mb.add(
+            x=x, y=zeros, name=lowerer.fresh_name(node, suffix + "_bcast")
+        )
+    if is_bool:
+        out = lowerer.mb.cast(
+            x=out, dtype="bool", name=lowerer.fresh_name(node, suffix)
+        )
+    return out
+
+
 @_register("Where")
 def _op_where(lowerer, node, ins, attrs):
     cond, a, b = ins
+    # MIL `select` needs all three inputs at the same shape: coremltools
+    # accepts a broadcastable triple at conversion time, but E5RT's ANE shape
+    # propagation rejects it ("Failed to PropagateInputTensorShapes ...
+    # for select: Incompatible Shape"), failing the whole model under
+    # CPU_AND_NE/ALL while CPU_ONLY runs fine (seen on a dynamic-shape
+    # transformer decoder whose attention mask does
+    # `Where(mask, const[1], scores[1,heads,S,S])`). Explicitly broadcast the
+    # deficient inputs first, using a max-rank input as the shape source.
+    shapes = [tuple(v.shape) for v in (cond, a, b)]
+    if not (_mil_shapes_match(shapes[0], shapes[1])
+            and _mil_shapes_match(shapes[0], shapes[2])):
+        ranked = sorted((cond, a, b), key=lambda v: len(v.shape))
+        ref = ranked[-1]
+        ref_shape = tuple(ref.shape)
+        shape_var = lowerer.mb.shape(
+            x=ref, name=lowerer.fresh_name(node, "bcast_shape")
+        )
+        if not _mil_shapes_match(tuple(cond.shape), ref_shape):
+            cond = _broadcast_to_shape(lowerer, node, cond, shape_var, "cond")
+        if not _mil_shapes_match(tuple(a.shape), ref_shape):
+            a = _broadcast_to_shape(lowerer, node, a, shape_var, "a")
+        if not _mil_shapes_match(tuple(b.shape), ref_shape):
+            b = _broadcast_to_shape(lowerer, node, b, shape_var, "b")
     return [lowerer.mb.select(cond=cond, a=a, b=b, name=lowerer.fresh_name(node))]
 
 
