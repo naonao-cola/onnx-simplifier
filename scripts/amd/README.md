@@ -59,9 +59,91 @@ not an onnxsim bug.
 | `run_migraphx_compat.py` | drives the suite, writes a CSV, and exits non-zero on any regression. Entry point for the (dormant) CI workflow. |
 | `run_training_compat.py` | validates on-device *training* (the compiled step-graph loop behind `compile_training_loop` and every `step_providers=` loop) on each GPU provider the host offers (`ROCMExecutionProvider`, `MIGraphXExecutionProvider`): loss must fall, state must stay device-resident. Run it on ROCm hardware by hand; needs no CI wiring. |
 
+## Installing the stack from scratch
+
+A working MIGraphX EP is three layers, each with its own install. The
+execution-provider wheel alone is never enough: onnxruntime ships the EP's
+shared library inside the wheel, but that library loads the system MIGraphX
+runtime at session-creation time, and *that* runtime needs the ROCm driver
+underneath. Missing any layer reads as "unavailable", never as an error --
+onnxruntime logs an `EP Error` and silently falls back to the CPU provider,
+so always verify with a session build (the probe every harness here uses),
+not just `get_available_providers()`.
+
+1. **ROCm** (the driver + userspace). AMD's official path for Ubuntu is the
+   `amdgpu-install` script from the driver download page for your distro and
+   ROCm release (see [Install AMD ROCm](https://rocm.docs.amd.com/en/latest/deploy/linux/install.html)),
+   then:
+
+   ```bash
+   sudo ./amdgpu-install --usecase=rocm
+   sudo reboot
+   ```
+
+   For a GPU the release's prebuilt kernels don't cover -- e.g. Strix Halo
+   (gfx1151) against the `onnxruntime-rocm` wheel's kernel set -- export
+   `HSA_OVERRIDE_GFX_VERSION` before any run (see "Hardware notes" below).
+
+2. **MIGraphX** (the graph compiler itself, system-wide). Once ROCm's apt
+   repository is configured by the step above:
+
+   ```bash
+   sudo apt update && sudo apt install -y migraphx
+   ```
+
+   This is what provides `libmigraphx_c.so.3` -- the exact library onnxruntime
+   looks for and the reason a bare `pip install onnxruntime-migraphx` alone
+   falls back to CPU with `libmigraphx_c.so.3: cannot open shared object
+   file`. A pip-installed MIGraphX (`python -m pip install --index-url
+   https://stable.repo.amd.com/rocm/migraphx/whl-next/ migraphx==2.17.0+rocm10.0.0`)
+   also works, but then the `migraphx_libs` directory must be on
+   `LD_LIBRARY_PATH`.
+
+3. **ONNX Runtime with the MIGraphX EP.** Either the monolithic wheel or, on
+   newer ROCm stacks, the EP plugin:
+
+   ```bash
+   pip install onnxruntime-migraphx          # replaces plain onnxruntime
+   ```
+
+   (or pinned to a ROCm release:
+   `pip3 install onnxruntime-migraphx -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/`).
+
+   Newer ROCm stacks split the EP into a plugin wheel,
+   [`onnxruntime-ep-migraphx`](https://pypi.org/project/onnxruntime-ep-migraphx/),
+   which must be explicitly registered before querying providers:
+
+   ```bash
+   pip install "onnxruntime-ep-migraphx==1.0.0+rocm10.0.0"
+   python -c "import migraphx, onnxruntime as ort, onnxruntime_ep_migraphx as m; \
+   [ort.register_execution_provider_library(n,p) for n,p in zip(m.get_ep_names(), m.get_library_paths())]; \
+   print(ort.get_available_providers())"
+   ```
+
+4. **Verify.** The wheel bundles the EP library regardless of hardware, so
+   presence in `get_available_providers()` is not proof. A trivial session
+   that *keeps* the provider is:
+
+   ```bash
+   python - <<'EOF'
+   import onnxruntime as ort
+   from onnx import parser
+   m = parser.parse_model('<ir_version: 8, opset_import: ["": 17]>\n'
+                          'agraph (float[1] x) => (float[1] y) { y = Identity(x) }')
+   s = ort.InferenceSession(m.SerializeToString(), providers=['MIGraphXExecutionProvider'])
+   print(s.get_providers())   # ['MIGraphXExecutionProvider'] on a working stack
+   EOF
+   ```
+
+   If that prints `['CPUExecutionProvider']` instead, onnxruntime fell back:
+   check for the `EP Error ... Failed to load library` line in the output and
+   that `libmigraphx_c.so.3` is on the linker path. This is the same probe
+   the in-tree tests and `run_training_compat.py` use to decide
+   "unavailable" vs. "GPU present".
+
 ## Running locally
 
-Requires a ROCm-capable AMD GPU with the ROCm stack installed.
+Requires a ROCm-capable AMD GPU with the stack above installed.
 
 ```bash
 pip install onnxruntime-migraphx   # NOT alongside plain onnxruntime
