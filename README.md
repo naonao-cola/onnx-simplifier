@@ -654,6 +654,45 @@ validation) against a real GPU -- open it in Colab and run it by hand
 whenever you want to check these on an actual NVIDIA GPU; it is not wired
 into CI.
 
+### Constant folding with the AMD NPU (Vitis AI execution provider)
+
+The same `providers` mechanism works for AMD's Ryzen AI NPU: its ONNX Runtime
+provider is called `VitisAIExecutionProvider`, and it partitions the graph into
+NPU/CPU subgraphs transparently (unsupported ops fall back to the CPU, so keep
+`CPUExecutionProvider` last exactly as with CUDA):
+
+```python
+model_simp, check = onnxsim.simplify(
+    model,
+    providers=[
+        ("VitisAIExecutionProvider", {"config_file": "vaip_config.json"}),
+        "CPUExecutionProvider",
+    ],
+)
+```
+
+Two differences from CUDA matter. First, the provider never comes from PyPI:
+the stock `onnxruntime` / `onnxruntime-gpu` wheels do not ship it. It comes
+from AMD's Ryzen AI Software bundle (XRT NPU drivers plus the `ryzen_ai` venv,
+which contains the Vitis AI EP build of ONNX Runtime) -- see AMD's
+[Linux install guide](https://ryzenai.docs.amd.com/en/latest/linux.html) and
+the [Vitis AI EP docs](https://onnxruntime.ai/docs/execution-providers/Vitis-AI-ExecutionProvider.html).
+Without that bundle `VitisAIExecutionProvider` is absent from
+`ort.get_available_providers()` and onnxsim raises a `ValueError` pointing at
+the Ryzen AI installer (rather than at `onnxruntime-gpu`). Second, the
+provider *options* (`config_file` for BF16 models, `target`/`xclbin` for INT8,
+`cache_dir`/`cache_key` to reuse a compiled model) need the
+`(name, options)` tuple form above, which only the Python API offers -- the
+CLI's `--providers` takes bare provider names. NPU compilation happens at
+session creation and can take minutes the first time; the cache options avoid
+repaying it.
+
+In practice, prefer to keep constant folding itself on the CPU (fold groups
+are tiny shape/index subgraphs where NPU compile time dwarfs any speedup, and
+CPU folding is deterministic) and use the NPU for running the full model --
+correctness checking (`check_n`), `backend.run_model` / `backend.Runner`, or
+the QAT/training loops' `step_providers=`.
+
 ## Profiling the optimization
 
 Simplification alternates a handful of transforms -- shape inference, the

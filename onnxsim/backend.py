@@ -111,10 +111,13 @@ def _provider_name(provider: Provider) -> str:
     return provider[0] if isinstance(provider, (tuple, list)) else provider
 
 
-# Which pip package provides a given GPU execution provider, for the
-# "requested provider is not available" error below. A provider missing from
-# this table still raises -- it just gets the generic hint instead of a
-# package-specific one.
+# Which pip package provides a given provider, for the "requested provider
+# is not available" error below. A provider missing from this table still
+# raises -- it just gets the generic hint instead of a package-specific one.
+# The NPU entry is the exception that proves the rule:
+# VitisAIExecutionProvider never comes from PyPI at all -- it ships inside
+# AMD's Ryzen AI Software bundle (XRT NPU drivers + the ryzen_ai venv) -- so
+# its hint names that bundle instead of a wheel.
 _PROVIDER_INSTALL_HINTS: Dict[str, str] = {
     "CUDAExecutionProvider": "`pip install onnxruntime-gpu`",
     "TensorrtExecutionProvider": "`pip install onnxruntime-gpu`",
@@ -126,6 +129,12 @@ _PROVIDER_INSTALL_HINTS: Dict[str, str] = {
     "AMDGPUExecutionProvider": (
         "the `onnxruntime-ep-amdgpu` plugin "
         "(`pip install onnxruntime-ep-migraphx` on current ROCm stacks)"
+    ),
+    "VitisAIExecutionProvider": (
+        "AMD's Ryzen AI Software bundle (XRT NPU drivers + the ryzen_ai venv, "
+        "which bundles the Vitis AI EP build of onnxruntime) -- see "
+        "https://ryzenai.docs.amd.com/en/latest/linux.html and "
+        "https://onnxruntime.ai/docs/execution-providers/Vitis-AI-ExecutionProvider.html"
     ),
 }
 
@@ -193,9 +202,10 @@ def validate_providers(providers: Optional[Sequence[Provider]]) -> None:
         raise ValueError(
             "Execution providers other than CPUExecutionProvider require "
             "onnxruntime. Please install it (e.g. `pip install onnxruntime-gpu` "
+            "onnxruntime. Please install it (e.g. `pip install onnxruntime-gpu` "
             "for CUDA, `pip install onnxruntime-rocm` for ROCm, "
-            "`pip install onnxruntime-migraphx` for MIGraphX). "
-            f"Requested providers: {non_cpu}."
+            "`pip install onnxruntime-migraphx` for MIGraphX, AMD's Ryzen AI "
+            "Software bundle for the NPU's VitisAIExecutionProvider). "
         )
 
 
@@ -468,6 +478,10 @@ _PROVIDER_DEVICES: Dict[str, str] = {
     "ROCMExecutionProvider": "cuda",
     "MIGraphXExecutionProvider": "cuda",
     "AMDGPUExecutionProvider": "cuda",
+    # AMD's Ryzen AI NPU provider partitions the graph into NPU/CPU subgraphs
+    # transparently; its session inputs/outputs stay host tensors, so binding
+    # on the CPU is correct (and the safe fallback for any unknown provider).
+    "VitisAIExecutionProvider": "cpu",
     "CANNExecutionProvider": "cann",
     "DmlExecutionProvider": "dml",
     "WebGpuExecutionProvider": "webgpu",
