@@ -29,6 +29,7 @@ Two adaptations the Core ML target forces, both documented where they happen:
 Usage:
     python train_mlp_step_coreml.py --output mlp_step.mlpackage
     python train_mlp_step_coreml.py --steps 15 --compute-units CPU_AND_NE
+    python train_mlp_step_coreml.py --qat-int8 --output mlp_step_qat.mlpackage
 """
 
 from __future__ import annotations
@@ -40,10 +41,30 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import onnx
+from onnx import numpy_helper
 
 from onnxsim import graph_grad, qat_graph
 
 PARAMS = ("w1", "b1", "w2", "b2")
+# Biases stay fp32 (standard QAT practice); only the two MatMul weights are
+# fake-quantized.
+QAT_PARAMS = ("w1", "w2")
+
+
+def fake_quantize_weight(b: qat_graph.GraphBuilder, name: str, scale: float) -> str:
+    """`name` through a symmetric int8 fake-quantization sandwich.
+
+    Scale/zero-point are baked constants (the Core ML translator requires
+    compile-time-constant QDQ parameters): `scale` is calibrated once from
+    the initial weights and goes stale as they train, the standard
+    simplification short of periodic re-estimation.
+    """
+    s = b.const(float(scale), hint=f"{name}_scale")
+    zp_name = f"{name}_zp"
+    b.initializer.append(numpy_helper.from_array(np.int8(0), zp_name))
+    q = b.op("QuantizeLinear", [name, s, zp_name], f"{name}_q")
+    dq = b.op("DequantizeLinear", [q, s, zp_name], f"{name}_dq")
+    return q, dq
 
 
 def build_step(
@@ -53,13 +74,22 @@ def build_step(
     out: int = 1024,
     loss_scale: float = 256.0,
     eps: float = 1e-3,
+    qat_int8: bool = False,
+    scales: dict | None = None,
 ) -> qat_graph.StepGraph:
     """A 2-layer MLP Adam step: sigmoid MLP, MSE loss, Adam on every param."""
+    if qat_int8 and scales is None:
+        raise ValueError("qat_int8 needs per-weight scales (see calibrate_scales)")
     b = qat_graph.GraphBuilder()
-    z1m = b.matmul("x", "w1")
+    q1 = dq1 = "w1"
+    q2 = dq2 = "w2"
+    if qat_int8:
+        q1, dq1 = fake_quantize_weight(b, "w1", scales["w1"])
+        q2, dq2 = fake_quantize_weight(b, "w2", scales["w2"])
+    z1m = b.matmul("x", dq1)
     z1 = b.add(z1m, "b1")
     h = b.sigmoid(z1)
-    y_hatm = b.matmul(h, "w2")
+    y_hatm = b.matmul(h, dq2)
     y_hat = b.add(y_hatm, "b2")
     diff = b.sub(y_hat, "y")
     sq = b.mul(diff, diff)
@@ -73,6 +103,10 @@ def build_step(
         "w2": (hidden, out),
         "b2": (out,),
         "y": (batch, out),
+        q1: (dim, hidden),
+        dq1: (dim, hidden),
+        q2: (hidden, out),
+        dq2: (hidden, out),
         z1m: (batch, hidden),
         z1: (batch, hidden),
         h: (batch, hidden),
@@ -142,6 +176,19 @@ def make_data(batch: int, dim: int, out: int, seed: int = 0):
     w_true = (rng.standard_normal((dim, out)) / np.sqrt(dim)).astype(np.float32)
     y = np.maximum(x @ w_true, 0).astype(np.float32)
     return x, y
+
+
+def calibrate_scales(
+    state: Dict[str, np.ndarray],
+) -> Dict[str, float]:
+    """Per-tensor symmetric int8 scales from initial weights: max|w|/127.
+
+    Calibrated once, from the same initial state the loop starts from (both
+    default to seed 0), and baked in as constants -- scales go stale as
+    weights train, the standard simplification short of periodic
+    re-estimation.
+    """
+    return {p: float(max(np.abs(state[p]).max(), 1e-6)) / 127.0 for p in QAT_PARAMS}
 
 
 def initial_state(
@@ -214,17 +261,17 @@ def main() -> int:
         default="CPU_AND_NE",
         choices=["ALL", "CPU_ONLY", "CPU_AND_GPU", "CPU_AND_NE"],
     )
+    ap.add_argument(
+        "--qat-int8",
+        action="store_true",
+        help="Fake-quantize the MatMul weights to symmetric int8 in the "
+        "forward pass (master fp32 weights train through straight-through "
+        "estimation). Scales are calibrated once from the initial weights. "
+        "Biases stay fp32.",
+    )
     args = ap.parse_args()
 
     import onnxsim
-
-    step = build_step(args.batch, args.dim, args.hidden, args.out)
-    print(
-        f"step graph: {len(step.model.graph.node)} nodes, state: {sorted(step.state)}",
-        flush=True,
-    )
-    onnxsim.export_coreml(step.model, args.output, skip_model_load=True)
-    print(f"Wrote {args.output}", flush=True)
 
     shapes = {
         "w1": (args.dim, args.hidden),
@@ -232,6 +279,22 @@ def main() -> int:
         "w2": (args.hidden, args.out),
         "b2": (args.out,),
     }
+    scales = calibrate_scales(initial_state(shapes)) if args.qat_int8 else None
+    step = build_step(
+        args.batch,
+        args.dim,
+        args.hidden,
+        args.out,
+        scales=scales,
+        qat_int8=args.qat_int8,
+    )
+    print(
+        f"step graph: {len(step.model.graph.node)} nodes, state: {sorted(step.state)}",
+        flush=True,
+    )
+    onnxsim.export_coreml(step.model, args.output, skip_model_load=True)
+    print(f"Wrote {args.output}", flush=True)
+
     x, y = make_data(args.batch, args.dim, args.out)
     losses, ms = run_loop(
         args.output,

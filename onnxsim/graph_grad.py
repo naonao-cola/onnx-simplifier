@@ -2279,6 +2279,7 @@ _RULES: Dict[str, Rule] = {
     "Transpose": _grad_transpose,
 }
 
+
 #: Single-output rules kept out of :data:`_RULES` for the same reason
 #: :data:`_MULTI_OUTPUT_RULES` is its own table (see that table's own
 #: comment): an op registered here has **no C++/WASM mirror** yet, so
@@ -2301,10 +2302,43 @@ _RULES: Dict[str, Rule] = {
 #: its default rule set right alongside :data:`_CUSTOM_RULES`, and
 #: :func:`supported_ops` includes it, so QAT/LoRA block discovery correctly
 #: treats a block containing any of them as differentiable.
+def _grad_quantize_linear(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """Straight-through estimator for ``Y = QuantizeLinear(X, scale, zp)``.
+
+    The true gradient is zero almost everywhere (rounding) and undefined at
+    the step points -- useless for training -- so QAT convention passes the
+    incoming gradient straight through to ``X``, exactly like
+    :func:`_grad_identity`. Scale/zero-point never get gradients (this
+    module's translator contract requires them compile-time-constant
+    anyway). Paired with :func:`_grad_dequantize_linear`'s identical rule,
+    a ``DequantizeLinear(QuantizeLinear(X))`` sandwich differentiates as the
+    identity, which is the standard fake-quantization backward.
+    """
+    return [g] + [None] * (len(node.input) - 1)
+
+
+def _grad_dequantize_linear(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    """Straight-through estimator for ``Y = DequantizeLinear(X, scale, zp)``.
+
+    See :func:`_grad_quantize_linear`: the pair differentiates as the
+    identity. (A lone `DequantizeLinear`'s true gradient would scale by
+    `scale`, but a lone dequantize has no training meaning -- it only ever
+    appears undoing a `QuantizeLinear` -- so the pair convention wins and
+    this emits no nodes at all, like :func:`_grad_identity`.)
+    """
+    return [g] + [None] * (len(node.input) - 1)
+
+
 _PYTHON_ONLY_RULES: Dict[str, Rule] = {
     "Concat": _grad_concat,
+    "DequantizeLinear": _grad_dequantize_linear,
     "DepthToSpace": _grad_depth_to_space,
     "IsNaN": _grad_is_nan,
+    "QuantizeLinear": _grad_quantize_linear,
     "Squeeze": _grad_squeeze_or_unsqueeze,
     "Unsqueeze": _grad_squeeze_or_unsqueeze,
     "Where": _grad_where,
