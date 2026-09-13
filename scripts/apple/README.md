@@ -392,6 +392,45 @@ offers. And a baked-in cache size means this is a placement probe and a
 single-step benchmark, not a multi-step decoder: each new context length
 needs its own export.
 
+#### Static context × int8 weights: unlocking ANE at 1B+ scale
+
+`--static-context` and `--quantize-weights int8` compose (the flags touch
+independent stages: shape pinning before `simplify`, weight quantization
+after conversion), and together they move the placement boundary. fp16
+models at 1.5B+ land 100% on GPU -- E5RT spills the whole graph off ANE
+somewhere between ~1.2GB and ~3.3GB of weights, and the 0.5B model sits
+exactly in the transition (ANE 61% / GPU 37% / CPU 2%). Halving the weight
+bytes with int8 pulls 1B+ models back under ANE capacity:
+
+```bash
+python export_llm_to_coreml.py Qwen/Qwen2.5-1.5B-Instruct \
+    --max-context-length 512 --dtype fp16 --static-context 512 \
+    --quantize-weights int8 --output qwen15-static-int8.mlpackage
+```
+
+Single decode step at context 512, static shapes, M4 Mac mini (placement =
+`MLComputePlan` cost share, latency = mean `predict()` step):
+
+| Model | fp16 placement | fp16 CPU / best | int8 ANE share | int8 CPU / int8+NE |
+|---|---|---|---|---|
+| Qwen2.5-0.5B | ANE 61 / GPU 37 / CPU 2 | 19.2 / 17.4 (GPU) | majority | 20.9 / **13.3 (1.57x)** |
+| Qwen2.5-1.5B | GPU 100 | 55.9 / 42.9 (GPU) | 1918 ops (36%) | 59.1 / **36.2 (fastest overall)** |
+| SmolLM2-1.7B | GPU 100 | 76.4 / 59.5 (GPU) | 1479 ops (43%) | 78.2 / 92.6 (CPU wins) |
+
+So int8 is what engages the NPU at this scale -- the 1.5B int8+NE step is
+the fastest measured configuration anywhere in this section -- but ANE
+placement is not an ANE win by itself: SmolLM2-1.7B keeps 43% on ANE yet
+runs slower than CPU (~1480 dispatches x ~90us floor each eats the compute
+gains), while Qwen's matmul mix converts the same placement into a real
+speedup. Numerics spot-check (1.5B, zeros feed): max abs drift 1.97 against
+a 16.9 reference peak, no blowup; text-level parity needs the dynamic model
+and is out of reach for statics by construction.
+
+One hard warning: int8-quantized models **break the GPU backend**
+(`MPSGraph` MLIR assertion inside `predict`), so a quantized model is an
+NE-or-CPU choice -- `CPU_AND_GPU` is off the table once weights are
+quantized.
+
 ### fp16 model interface (`--io-dtype fp16`)
 
 Where `--quantize-weights` cuts the bytes read from DRAM *inside* the model and
