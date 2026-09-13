@@ -57,7 +57,21 @@ async function trainOneClient(ort, stepGraphBytes, initialStateBytes, manifest, 
     manifest,
     initialStateBytes.buffer.slice(initialStateBytes.byteOffset, initialStateBytes.byteOffset + initialStateBytes.byteLength),
   );
-  const session = await StepGraphSession.create(ort, stepGraphBytes);
+  const session = await StepGraphSession.create(
+    ort,
+    stepGraphBytes,
+    // The wasm provider requested explicitly: WebGPU -- the Vulkan-backed
+    // path -- is unreachable under plain Node (no navigator.gpu;
+    // onnxruntime-web answers "[webgpu] backend not found"), so this
+    // exercises the one EP that exists here while proving the
+    // `executionProviders` option is threaded through to
+    // InferenceSession.create rather than ignored. That plumbing is
+    // exactly what the webgpu path (a real browser's Vulkan driver)
+    // shares; the repo's own real-browser WebGPU training demos
+    // (scripts/convertmodel/test/webgpu_*.test.mjs) prove the same
+    // step-graph op set trains on WebGPU.
+    { executionProviders: ["wasm"] },
+  );
 
   // One fixed local batch/target for the whole local run -- this client's
   // own private data, standing in for whatever it would really train on.

@@ -47,7 +47,6 @@ import numpy as np
 import onnx
 import onnx.checker
 import onnx.helper
-import onnx.inliner
 
 from onnxsim import backend, graph_grad, qat_graph
 
@@ -154,7 +153,19 @@ def build_gradient_step_graph(
     )
     model.ir_version = _IR_VERSION
     if b.functions:
-        model = onnx.inliner.inline_local_functions(model)
+        # Lazy import: this module's own eager imports (graph_grad,
+        # qat_graph) never need onnx_simplifier, so this stays deferred to
+        # the one case that does -- a nodes slice that actually called one
+        # of graph_grad's templated rules. onnxsim.inline_local_functions
+        # over the plain onnx.inliner call this used to make directly: it
+        # additionally raises if an If/Loop/Scan survives inlining, which
+        # graph_grad's own templated rules should never produce but a
+        # future one might, and simplifies the result the same way
+        # qat_graph.make_step_graph already does for every other training
+        # path's own step graph -- this one had neither.
+        from onnxsim.onnx_simplifier import inline_local_functions
+
+        model = inline_local_functions(model)
     onnx.checker.check_model(model)
     return model, grad_names, loss_name
 

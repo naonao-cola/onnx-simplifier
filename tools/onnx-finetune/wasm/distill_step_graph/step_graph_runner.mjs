@@ -4,6 +4,16 @@
 // browser, via the *official* onnxruntime-web package's plain
 // ort.InferenceSession.
 //
+// By default the session runs on the wasm (CPU) execution provider, which is
+// the only one onnxruntime-web offers everywhere. On a desktop browser with a
+// Vulkan driver you can also train on WebGPU -- the browser's own GPU API,
+// which Chromium serves over that driver -- by passing
+// `{ executionProviders: ["webgpu", "wasm"] }` to `StepGraphSession.create`
+// (see its own comment below): the same step graph then runs its GPU-able ops
+// on the GPU and falls back to wasm for the rest. WebGPU needs a real browser
+// page (`navigator.gpu`), so the wasm default is what keeps this module
+// runnable under plain Node (the step_graph_runner.test.mjs path).
+//
 // This deliberately replaces ../src/onnx_finetune_wasm.cpp's whole approach
 // for distillation specifically: that file Embind-wraps a custom Emscripten
 // build of onnxruntime with --enable_training_apis, needed because it runs
@@ -109,9 +119,28 @@ export function adamBiasCorrections(t) {
 }
 
 export class StepGraphSession {
-  static async create(ort, stepGraphBytes) {
+  /**
+   * @param {object} [options]
+   * @param {string[]} [options.executionProviders=["wasm"]] which
+   *   onnxruntime-web execution providers the session runs on, in priority
+   *   order. The default is wasm-only because the wasm EP is the only one
+   *   that exists everywhere (plain Node included); to train on WebGPU --
+   *   which in a desktop browser with a Vulkan driver is that driver, i.e.
+   *   Vulkan-based training -- pass
+   *   `{ executionProviders: ["webgpu", "wasm"] }`, and onnxruntime-web
+   *   keeps every op WebGPU supports on the GPU while falling back to the
+   *   wasm CPU kernels for the rest. The webgpu EP requires a real browser
+   *   (`navigator.gpu`); under plain Node it answers "[webgpu] backend not
+   *   found", so the default must stay wasm. The op set these step graphs
+   *   are built from is the `EP_FRIENDLY_OPS` allowlist
+   *   (`onnxsim/qat_graph.py`), the same allowlist the repo's own real-browser
+   *   WebGPU training demos (`scripts/convertmodel/test/webgpu_*.test.mjs`)
+   *   prove trains on WebGPU.
+   */
+  static async create(ort, stepGraphBytes, options = {}) {
+    const executionProviders = options.executionProviders ?? ["wasm"];
     const session = await ort.InferenceSession.create(stepGraphBytes, {
-      executionProviders: ["wasm"],
+      executionProviders,
     });
     return new StepGraphSession(ort, session);
   }

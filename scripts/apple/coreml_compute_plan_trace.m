@@ -231,7 +231,11 @@ int main(int argc, char *argv[]) {
     configuration.computeUnits = computeUnits;
 
     __block int exitCode = 0;
-    TraceState state = {
+    // __block: the completion handler below runs on another block capture --
+    // without it `state` is copied const into the block, so RecordOperation's
+    // costAvailableCount/weight sums are lost and the stdout summary wrongly
+    // reports "no estimated-cost data" while the JSON has real weights.
+    __block TraceState state = {
         .events = [NSMutableArray array],
         .cursorByLane = [NSMutableDictionary dictionary],
         .opCountByLane = [NSMutableDictionary dictionary],

@@ -32,6 +32,36 @@ _HEADER = '<ir_version: 8, opset_import: ["": 17]>'
 _CUDA_AVAILABLE = "CUDAExecutionProvider" in ort.get_available_providers()
 
 
+def _probe_ep(provider: str) -> bool:
+    """Whether ``provider`` can actually build a session on this host.
+
+    Presence in ``get_available_providers()`` is not proof -- the MIGraphX
+    wheel bundles its provider library regardless of whether a ROCm device
+    answers (see ``scripts/amd/migraphx_backend.py``) -- so a trivial session
+    build is the availability signal, and anything that raises (no device,
+    no driver) means "skip", never "fail". The built session must also list
+    the provider in ``get_providers()``: onnxruntime silently falls back to
+    CPU when a provider's shared library fails to load (seen with
+    ``onnxruntime-migraphx`` where ``libmigraphx_c`` is missing), and a
+    "successful" all-CPU session is not a GPU to train on.
+    """
+    if provider not in ort.get_available_providers():
+        return False
+    try:
+        probe = _model(
+            """
+            agraph (float[1] x) => (float[1] y)
+            {
+                y = Identity(x)
+            }
+            """
+        )
+        sess = ort.InferenceSession(probe.SerializeToString(), providers=[provider])
+        return provider in sess.get_providers()
+    except Exception:  # noqa: BLE001 -- any build failure means unavailable
+        return False
+
+
 def _model(body: str, initializer=()) -> onnx.ModelProto:
     model = parser.parse_model(f"{_HEADER}\n{body}")
     model.graph.initializer.extend(initializer)
@@ -69,6 +99,26 @@ def _linear_model(rows: int = 8, k: int = 3, n: int = 2, seed: int = 0):
     x = rng.standard_normal((rows, k)).astype(np.float32)
     y = x @ w_true.T
     return model, x, y
+
+
+_ROCM_AVAILABLE = _probe_ep("ROCMExecutionProvider")
+_MIGRAPHX_AVAILABLE = _probe_ep("MIGraphXExecutionProvider")
+_WEBGPU_AVAILABLE = _probe_ep("WebGpuExecutionProvider")
+
+#: Non-CUDA GPU providers this host can actually train on, probed above.
+#: Empty on an ordinary CPU-only CI runner, so the AMD training tests below
+#: skip there and run on ROCm hardware -- the same convention the CUDA-gated
+#: tests already follow. Evaluated here, after ``_model`` (which the probe
+#: calls), rather than next to ``_probe_ep`` itself.
+_GPU_TRAINING_PROVIDERS = tuple(
+    name
+    for name, available in (
+        ("ROCMExecutionProvider", _ROCM_AVAILABLE),
+        ("MIGraphXExecutionProvider", _MIGRAPHX_AVAILABLE),
+        ("WebGpuExecutionProvider", _WEBGPU_AVAILABLE),
+    )
+    if available
+)
 
 
 def test_lazy_compile_then_reuse():
@@ -245,6 +295,51 @@ def test_cuda_feeds_and_state_are_genuinely_device_resident():
     loop({"x": x_cuda, "y": y_cuda}, lr=1e-2)
     for value in loop._state.values():
         assert value.device_name() == "cuda"
+
+
+@pytest.mark.skipif(
+    not _GPU_TRAINING_PROVIDERS,
+    reason="requires a ROCM/MIGraphX/WebGPU-capable onnxruntime build + device",
+)
+def test_gpu_training_loop_converges():
+    """The same training loop through a non-CUDA GPU provider: the step graph
+    (forward + ``graph_grad`` backward + Adam, all inside
+    :data:`onnxsim.qat_graph.EP_FRIENDLY_OPS`) compiles and converges there,
+    not just on CUDA/CPU. ``CPUExecutionProvider`` stays last so ops the
+    accelerator cannot run still fall back instead of failing session
+    creation.
+    """
+    for provider in _GPU_TRAINING_PROVIDERS:
+        model, x, y = _linear_model()
+        loop = onnxsim.compile_training_loop(
+            model, "loss", ("w",), providers=[provider, "CPUExecutionProvider"]
+        )
+        losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(200)]
+        assert losses[-1] < 0.2 * losses[0], provider
+
+
+@pytest.mark.skipif(
+    not _GPU_TRAINING_PROVIDERS,
+    reason="requires a ROCM/MIGraphX/WebGPU-capable onnxruntime build + device",
+)
+def test_gpu_training_state_stays_device_resident():
+    """The trained parameter/optimizer-moment state a step returns is a
+    device-resident ``OrtValue`` -- not silently round-tripped through host
+    memory every step -- on non-CUDA GPU providers too, the same claim the
+    CUDA test above makes. Checked as "not CPU" rather than an exact device
+    string so a provider that names its device something other than
+    ``"cuda"`` still passes as long as the state never touches the host.
+    """
+    for provider in _GPU_TRAINING_PROVIDERS:
+        model, x, y = _linear_model()
+        loop = onnxsim.compile_training_loop(
+            model, "loss", ("w",), providers=[provider, "CPUExecutionProvider"]
+        )
+        loop({"x": x, "y": y}, lr=5e-2)
+        assert loop._state
+        for value in loop._state.values():
+            assert hasattr(value, "device_name"), provider
+            assert value.device_name() != "cpu", provider
 
 
 def test_training_loop_reduces_loss():

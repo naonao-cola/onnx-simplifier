@@ -1,6 +1,6 @@
 """One optimizer step, expressed as an ONNX graph, so it can run wherever an
-ONNX model can run -- CPU, CUDA, an NPU execution provider, or WebGPU in a
-browser -- instead of only in host numpy.
+ONNX model can run -- CPU, CUDA/ROCm (including MIGraphX), an NPU execution
+provider, or WebGPU in a browser -- instead of only in host numpy.
 
 Six passes in this repo (:mod:`onnxsim.adaround`, :mod:`onnxsim.adaquant`,
 :mod:`onnxsim.brecq`, :mod:`onnxsim.flexround`, :mod:`onnxsim.autoround`,
@@ -31,8 +31,10 @@ wherever the execution provider says.
 
 **What this buys, concretely.** :class:`onnxsim.backend.Runner` binds the
 graph and a provider list once, so the same builder reaches
-``CUDAExecutionProvider`` or an NPU EP (QNN, Core ML, OpenVINO -- see the
-harnesses under ``scripts/``) from Python, and in the browser the WASM
+``CUDAExecutionProvider``, the ROCm ``ROCMExecutionProvider`` /
+``MIGraphXExecutionProvider`` pair (see ``scripts/amd/README.md``) or an NPU
+EP (QNN, Core ML, OpenVINO -- see the harnesses under ``scripts/``) from
+Python, and in the browser the WASM
 build's model-executor trampoline (``docs/wasm_ort_web.md``) hands the same
 graph to onnxruntime-web, whose provider list already offers ``webgpu`` and
 WebNN's ``gpu``/``npu`` device types (``docs/webnn.md``).

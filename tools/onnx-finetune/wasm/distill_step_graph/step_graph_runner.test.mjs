@@ -78,7 +78,21 @@ test("step graph trains on plain onnxruntime-web (no training API), across varyi
       initialStateBytes.buffer.slice(initialStateBytes.byteOffset, initialStateBytes.byteOffset + initialStateBytes.byteLength),
     );
 
-    const session = await StepGraphSession.create(ort, stepGraphBytes);
+    const session = await StepGraphSession.create(
+      ort,
+      stepGraphBytes,
+      // The wasm provider requested explicitly: WebGPU -- the Vulkan-backed
+      // path -- is unreachable under plain Node (no navigator.gpu;
+      // onnxruntime-web answers "[webgpu] backend not found"), so this
+      // exercises the one EP that exists here while proving the
+      // `executionProviders` option is threaded through to
+      // InferenceSession.create rather than ignored. That plumbing is
+      // exactly what the webgpu path (a real browser's Vulkan driver)
+      // shares; the repo's own real-browser WebGPU training demos
+      // (scripts/convertmodel/test/webgpu_*.test.mjs) prove the same
+      // step-graph op set trains on WebGPU.
+      { executionProviders: ["wasm"] },
+    );
 
     // A frozen, untrained-teacher-esque forward pass would need a second
     // onnxruntime-web session over teacher.onnx; not worth it for this

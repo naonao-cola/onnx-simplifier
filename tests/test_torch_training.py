@@ -25,6 +25,52 @@ _CUDA_AVAILABLE = torch.cuda.is_available() and (
 )
 
 
+def _probe_ep(provider: str) -> bool:
+    """Whether ``provider`` can actually build a session on this host -- same
+    probe as ``tests/test_compile_training.py``'s own (presence in
+    ``get_available_providers()`` is not proof for MIGraphX, whose wheel
+    bundles the provider library with or without a ROCm device answering;
+    and the built session must keep the provider in ``get_providers()``,
+    since onnxruntime silently falls back to CPU when the provider library
+    fails to load).
+    """
+    if provider not in ort.get_available_providers():
+        return False
+    try:
+        import onnx.helper
+        from onnx import TensorProto
+
+        node = onnx.helper.make_node("Identity", ["x"], ["y"])
+        graph = onnx.helper.make_graph(
+            [node],
+            "probe",
+            [onnx.helper.make_tensor_value_info("x", TensorProto.FLOAT, [1])],
+            [onnx.helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])],
+        )
+        probe = onnx.helper.make_model(
+            graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+        )
+        sess = ort.InferenceSession(probe.SerializeToString(), providers=[provider])
+        return provider in sess.get_providers()
+    except Exception:  # noqa: BLE001 -- any build failure means unavailable
+        return False
+
+
+#: Non-CUDA GPU providers this host can actually run a step graph on.
+#: On a ROCm torch build ``torch.cuda.is_available()`` is itself True (HIP
+#: presents as CUDA), so the CUDA test above already covers torch-side feeds
+#: there; what this gates is the torch-*exported* graph training through the
+#: AMD onnxruntime providers with plain numpy feeds.
+_AMD_TRAINING_PROVIDERS = tuple(
+    name
+    for name, available in (
+        ("ROCMExecutionProvider", _probe_ep("ROCMExecutionProvider")),
+        ("MIGraphXExecutionProvider", _probe_ep("MIGraphXExecutionProvider")),
+    )
+    if available
+)
+
+
 class _Regression(torch.nn.Module):
     """``loss = mean((x @ w^T - y) ** 2)``, the same objective
     ``tests/test_compile_training.py``'s own ``_linear_model`` fits, now
@@ -236,6 +282,26 @@ def test_cuda_feeds_and_state_are_genuinely_device_resident():
     loop({"x": x_cuda, "y": y_cuda}, lr=5e-2)
     for value in loop._state.values():
         assert value.device_name() == "cuda"
+
+
+@pytest.mark.skipif(
+    not _AMD_TRAINING_PROVIDERS,
+    reason="requires a ROCM/MIGraphX-capable onnxruntime build + device",
+)
+def test_amd_provider_trains_torch_exported_loop():
+    """A torch-exported training loop converges through the AMD onnxruntime
+    providers. The graph is torch's (via ``torch.export``'s FX pipeline) but
+    the backward pass and optimizer are onnxsim's own, so this is the check
+    that a real ``torch.nn.Module`` trains on ROCm hardware end to end.
+    """
+    for provider in _AMD_TRAINING_PROVIDERS:
+        module = _Regression()
+        example, w_true, x, y = _example_and_batch()
+        loop = torch_training.compile_torch_training_loop(
+            module, example, providers=[provider, "CPUExecutionProvider"]
+        )
+        losses = [loop({"x": x, "y": y}, lr=5e-2) for _ in range(100)]
+        assert losses[-1] < 0.5 * losses[0], provider
 
 
 def test_params_default_to_named_parameters():

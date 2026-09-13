@@ -33,7 +33,7 @@ through numpy between steps: they are kept as ``onnxruntime.OrtValue``
 (:func:`onnxsim.backend.as_ort_value`/:meth:`onnxsim.backend.Runner.run_with_ort_values`)
 and threaded straight from one step's output back in as the next step's
 input. ``feeds`` -- the batch itself -- takes the same path: anything that
-implements the DLPack protocol (a torch tensor, CPU or CUDA; a numpy array
+implements the DLPack protocol (a torch tensor, CPU, CUDA or ROCm/HIP; a numpy array
 new enough to implement it) is bound by reference rather than copied into a
 fresh buffer first. A plain ``numpy.ndarray`` too old for ``__dlpack__``
 still only pays the one copy ``OrtValue.ortvalue_from_numpy`` needs (and on
@@ -42,27 +42,33 @@ automatically when onnxruntime is not installed (the reference-evaluator
 backend has no ``OrtValue``/DLPack concept at all); the numbers this returns
 are identical either way, only the copying differs.
 
-**CUDA.** Genuinely zero-copy end to end: pass
-``providers=["CUDAExecutionProvider", "CPUExecutionProvider"]`` (to
-:func:`compile_training_loop`/``onnxsim.compile_torch_training_loop``) and
-feed CUDA-resident tensors (a ``torch.Tensor`` already on ``"cuda"``, or any
-other object whose ``__dlpack_device__`` reports CUDA) -- ``as_ort_value``
-is device-agnostic, so this needs no CUDA-specific code of its own, only a
-CUDA-capable ``onnxruntime`` build and a session actually configured to run
-on it. There is exactly one unavoidable host round trip: the very first
-call uploads the forward model's own initializers (``TrainingLoop``'s
-initial state), which start out as ordinary host bytes inside the ONNX
-model -- there is no tensor on the caller's side yet to alias for those.
-From the first call's own outputs on, the trained parameters and optimizer
-moments are genuinely device-resident ``OrtValue``\\ s (onnxruntime's CUDA
-kernels produce them there, and nothing here ever calls ``.numpy()`` on
-them), so every call after the first pays no host transfer for the state at
-all -- only ``feeds`` and the tiny per-step scalars (``lr``, Adam's bias
-corrections) cross the bus, and a CUDA-resident ``feeds`` tensor skips even
-that. See ``tests/test_compile_training.py``'s and
+**GPU execution (CUDA / ROCm / MIGraphX).** Genuinely zero-copy end to end:
+pass ``providers=["CUDAExecutionProvider", "CPUExecutionProvider"]`` on NVIDIA
+(or ``["ROCMExecutionProvider", "CPUExecutionProvider"]`` /
+``["MIGraphXExecutionProvider", "CPUExecutionProvider"]`` on AMD ROCm -- see
+``scripts/amd/README.md`` for the wheel to install,
+``onnxruntime-rocm``/``onnxruntime-migraphx``) to
+:func:`compile_training_loop`/``onnxsim.compile_torch_training_loop`` and
+feed device-resident tensors (a ``torch.Tensor`` already on ``"cuda"`` -- which
+is also what a ROCm/HIP torch build reports its device as -- or any other
+object whose ``__dlpack_device__`` reports the matching device) --
+``as_ort_value`` is device-agnostic, so this needs no GPU-vendor-specific code
+of its own, only a matching ``onnxruntime`` build and a session actually
+configured to run on it. There is exactly one unavoidable host round trip: the
+very first call uploads the forward model's own initializers
+(``TrainingLoop``'s initial state), which start out as ordinary host bytes
+inside the ONNX model -- there is no tensor on the caller's side yet to alias
+for those. From the first call's own outputs on, the trained parameters and
+optimizer moments are genuinely device-resident ``OrtValue``\\ s
+(onnxruntime's GPU kernels produce them there, and nothing here ever calls
+``.numpy()`` on them), so every call after the first pays no host transfer
+for the state at all -- only ``feeds`` and the tiny per-step scalars (``lr``,
+Adam's bias corrections) cross the bus, and a device-resident ``feeds``
+tensor skips even that. See ``tests/test_compile_training.py``'s and
 ``tests/test_torch_training.py``'s own CUDA-gated tests (skipped without a
-CUDA-capable ``onnxruntime`` and GPU) for this asserted directly against
-``OrtValue.device_name()``.
+matching ``onnxruntime`` build and GPU) for this asserted directly against
+``OrtValue.device_name()``, plus the ROCm/MIGraphX-gated training tests beside
+them, which assert the same loop converges through those providers.
 
 **MPS / WebGPU.** No zero-copy path exists between a PyTorch MPS tensor
 (Apple's Metal backend) and onnxruntime's WebGPU execution provider today,
@@ -394,10 +400,10 @@ class TrainingLoop:
         the most recent call.
 
         ``feeds``' values are usually ``numpy.ndarray``, but anything
-        implementing the DLPack protocol (a torch tensor, CPU or CUDA) is
-        accepted directly -- see this module's own docstring on why that
-        avoids a copy, and :func:`onnxsim.backend.as_ort_value` for exactly
-        what "implementing DLPack" buys here.
+        implementing the DLPack protocol (a torch tensor -- CPU, CUDA or
+        ROCm/HIP) is accepted directly -- see this module's own docstring on
+        why that avoids a copy, and :func:`onnxsim.backend.as_ort_value` for
+        exactly what "implementing DLPack" buys here.
         """
         if self._runner is None:
             self._compile()

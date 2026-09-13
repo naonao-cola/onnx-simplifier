@@ -144,6 +144,41 @@ def test_unavailable_provider_raises():
         )
 
 
+def test_unavailable_rocm_provider_error_names_rocm_wheel():
+    # The unavailable-provider error points at the right wheel per provider:
+    # CUDA users get onnxruntime-gpu, ROCm users onnxruntime-rocm, MIGraphX
+    # users onnxruntime-migraphx -- not a CUDA-only hint on an AMD machine.
+    if not backend.has_onnxruntime():
+        pytest.skip("requires onnxruntime")
+    import onnxruntime as rt
+
+    if "ROCMExecutionProvider" in rt.get_available_providers():
+        pytest.skip("ROCM provider is available; cannot test the unavailable path")
+    model = _make_foldable_model()
+    with pytest.raises(ValueError, match="onnxruntime-rocm"):
+        backend.run_model(
+            model,
+            {"x": np.zeros((2, 2), np.float32)},
+            providers=["ROCMExecutionProvider"],
+        )
+
+
+def test_unavailable_migraphx_provider_error_names_migraphx_wheel():
+    if not backend.has_onnxruntime():
+        pytest.skip("requires onnxruntime")
+    import onnxruntime as rt
+
+    if "MIGraphXExecutionProvider" in rt.get_available_providers():
+        pytest.skip("MIGraphX provider is available; cannot test the unavailable path")
+    model = _make_foldable_model()
+    with pytest.raises(ValueError, match="onnxruntime-migraphx"):
+        backend.run_model(
+            model,
+            {"x": np.zeros((2, 2), np.float32)},
+            providers=["MIGraphXExecutionProvider"],
+        )
+
+
 def _make_diamond_model() -> onnx.ModelProto:
     """``a`` feeds two consumers (``b`` and ``c``) before they merge into
     ``y`` -- exercises that ``_last_use_indices`` tracks the *last* consumer

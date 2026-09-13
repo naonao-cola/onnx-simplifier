@@ -45,8 +45,8 @@ def as_ort_value(value: Any) -> Any:
     DLPack protocol (``__dlpack__``) when ``value`` implements it, instead of
     copying it into a fresh buffer first.
 
-    A torch tensor (CPU *or* CUDA -- DLPack carries the device along with the
-    data) and, since NumPy 2.0, a plain ``numpy.ndarray`` both implement
+    A torch tensor (CPU, CUDA *or* ROCm/HIP -- DLPack carries the device along
+    with the data) and, since NumPy 2.0, a plain ``numpy.ndarray`` both implement
     ``__dlpack__``, so both take this path: ``OrtValue.from_dlpack`` builds
     the ``OrtValue`` as a view over the exact same memory the caller already
     has, on whichever device it is already on. Pairs with
@@ -111,32 +111,45 @@ def _provider_name(provider: Provider) -> str:
     return provider[0] if isinstance(provider, (tuple, list)) else provider
 
 
-def _provider_install_hint(missing: List[str]) -> str:
-    """An install hint tailored to the missing provider(s).
+# Which pip package provides a given provider, for the "requested provider
+# is not available" error below. A provider missing from this table still
+# raises -- it just gets the generic hint instead of a package-specific one.
+# The NPU entry is the exception that proves the rule:
+# VitisAIExecutionProvider never comes from PyPI at all -- it ships inside
+# AMD's Ryzen AI Software bundle (XRT NPU drivers + the ryzen_ai venv) -- so
+# its hint names that bundle instead of a wheel.
+_PROVIDER_INSTALL_HINTS: Dict[str, str] = {
+    "CUDAExecutionProvider": "`pip install onnxruntime-gpu`",
+    "TensorrtExecutionProvider": "`pip install onnxruntime-gpu`",
+    "ROCMExecutionProvider": "`pip install onnxruntime-rocm`",
+    "MIGraphXExecutionProvider": (
+        "`pip install onnxruntime-migraphx` (or the `onnxruntime-ep-migraphx` "
+        "plugin on newer ROCm stacks -- see scripts/amd/README.md)"
+    ),
+    "AMDGPUExecutionProvider": (
+        "the `onnxruntime-ep-amdgpu` plugin "
+        "(`pip install onnxruntime-ep-migraphx` on current ROCm stacks)"
+    ),
+    "VitisAIExecutionProvider": (
+        "AMD's Ryzen AI Software bundle (XRT NPU drivers + the ryzen_ai venv, "
+        "which bundles the Vitis AI EP build of onnxruntime) -- see "
+        "https://ryzenai.docs.amd.com/en/latest/linux.html and "
+        "https://onnxruntime.ai/docs/execution-providers/Vitis-AI-ExecutionProvider.html"
+    ),
+}
 
-    The stock ``onnxruntime`` wheel on PyPI only ships the CPU provider (plus,
-    in special builds, GPU ones like CUDA/MIGraphX). In particular AMD's NPU
-    provider -- ``VitisAIExecutionProvider`` -- never comes from PyPI: it ships
-    inside AMD's Ryzen AI Software bundle (XRT NPU drivers + ``ryzen_ai``
-    venv), so telling a user who asked for the NPU to ``pip install
-    onnxruntime-gpu`` would send them down the wrong path entirely.
-    """
-    hints = []
-    if any("CUDA" in name for name in missing):
-        hints.append(
-            "For CUDA, install the GPU build with `pip install onnxruntime-gpu`."
-        )
-    if any(name == "VitisAIExecutionProvider" for name in missing):
-        hints.append(
-            "For the AMD NPU (VitisAIExecutionProvider), install AMD's Ryzen AI "
-            "Software (XRT NPU drivers + the ryzen_ai venv, which bundles the "
-            "Vitis AI EP build of onnxruntime) -- see "
-            "https://ryzenai.docs.amd.com/en/latest/linux.html and "
-            "https://onnxruntime.ai/docs/execution-providers/Vitis-AI-ExecutionProvider.html."
-        )
-    if not hints:
-        hints.append("Install an onnxruntime build that ships the requested provider.")
-    return " ".join(hints)
+
+def _provider_hint(missing: Sequence[str]) -> str:
+    """An install hint for ``missing`` providers, or the generic one when none
+    of them names a provider with a known package."""
+    hints = [
+        _PROVIDER_INSTALL_HINTS[name]
+        for name in missing
+        if name in _PROVIDER_INSTALL_HINTS
+    ]
+    if hints:
+        return " Install hint: " + "; ".join(sorted(set(hints))) + "."
+    return ""
 
 
 def _check_providers_available(providers: Sequence[Provider]) -> None:
@@ -156,7 +169,7 @@ def _check_providers_available(providers: Sequence[Provider]) -> None:
         raise ValueError(
             "The following execution provider(s) are not available in the "
             f"installed onnxruntime: {missing}. Available providers: "
-            f"{sorted(available)}. {_provider_install_hint(missing)}"
+            f"{sorted(available)}.{_provider_hint(missing)}"
         )
 
 
@@ -189,9 +202,10 @@ def validate_providers(providers: Optional[Sequence[Provider]]) -> None:
         raise ValueError(
             "Execution providers other than CPUExecutionProvider require "
             "onnxruntime. Please install it (e.g. `pip install onnxruntime-gpu` "
-            "for CUDA; AMD's Ryzen AI Software bundle for the NPU's "
-            "VitisAIExecutionProvider). "
-            f"Requested providers: {non_cpu}."
+            "onnxruntime. Please install it (e.g. `pip install onnxruntime-gpu` "
+            "for CUDA, `pip install onnxruntime-rocm` for ROCm, "
+            "`pip install onnxruntime-migraphx` for MIGraphX, AMD's Ryzen AI "
+            "Software bundle for the NPU's VitisAIExecutionProvider). "
         )
 
 
@@ -453,8 +467,8 @@ def run_model(
 # ``get_ort_device_type`` accepts; a provider missing from this table is bound
 # on the CPU, which is always *correct* -- onnxruntime then inserts the same
 # host-to-device copy the unbound path pays -- just not always the fastest
-# place. The ROCm/MIGraphX entries reuse the CUDA device enum, which is what
-# onnxruntime's ROCm build itself does; if that guess is ever wrong the
+# place. The ROCm/MIGraphX/AMDGPU entries reuse the CUDA device enum, which is
+# what onnxruntime's ROCm build itself does; if that guess is ever wrong the
 # allocation raises and :meth:`Runner.bind_loop` degrades to the unbound path,
 # so it cannot produce a wrong answer.
 _PROVIDER_DEVICES: Dict[str, str] = {
@@ -463,6 +477,7 @@ _PROVIDER_DEVICES: Dict[str, str] = {
     "TensorrtExecutionProvider": "cuda",
     "ROCMExecutionProvider": "cuda",
     "MIGraphXExecutionProvider": "cuda",
+    "AMDGPUExecutionProvider": "cuda",
     # AMD's Ryzen AI NPU provider partitions the graph into NPU/CPU subgraphs
     # transparently; its session inputs/outputs stay host tensors, so binding
     # on the CPU is correct (and the safe fallback for any unknown provider).
@@ -648,7 +663,7 @@ class Runner:
         parameter, an optimizer moment) as the next step's input, neither
         copy has to happen at all: build the inputs once with
         :func:`as_ort_value` (aliasing the source via DLPack where the source
-        supports it, e.g. a torch tensor -- CPU or CUDA), and thread an
+        supports it, e.g. a torch tensor -- CPU, CUDA or ROCm/HIP), and thread an
         ``OrtValue`` output straight back in as the next call's input,
         exactly as :meth:`onnxsim.compile_training.TrainingLoop.__call__`
         does with its own trained-parameter/optimizer state. Only a tensor

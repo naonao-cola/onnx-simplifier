@@ -413,6 +413,39 @@ def test_rope_ops_match_onnxruntime():
     np.testing.assert_allclose(_mil_const_value(model), expected, rtol=1e-5, atol=1e-5)
 
 
+def test_where_broadcast_const_select_inputs_share_shape():
+    # ONNX `Where` broadcasts its inputs; MIL `select` must be handed three
+    # same-shaped inputs instead. coremltools converts a broadcastable triple
+    # without complaint, but E5RT's ANE shape propagation rejects it
+    # ("Failed to PropagateInputTensorShapes ... for select: Incompatible
+    # Shape"), failing the whole model under CPU_AND_NE/ALL while CPU_ONLY
+    # runs fine -- seen on a transformer decoder's
+    # `Where(mask, const[1], scores[1,heads,S,S])`. The translator must
+    # broadcast explicitly (scalar fill) first.
+    cond = numpy_helper.from_array(np.zeros((1, 1, 2, 2), dtype=bool), name="cond")
+    neg = numpy_helper.from_array(np.array([-1000.0], np.float32), name="neg")
+    x = numpy_helper.from_array(np.ones((1, 1, 2, 2), np.float32), name="x")
+    model = _model(
+        """
+        wherebcast () => (float[1,1,2,2] y)
+        {
+            y = Where (cond, neg, x)
+        }
+        """,
+        initializer=[cond, neg, x],
+    )
+    prog, _flexible_inputs = coreml_export._build_mil_program(
+        model, *coreml_export._import_mil()
+    )
+    selects = [op for op in prog.functions["main"].operations if op.op_type == "select"]
+    assert len(selects) == 1
+    shapes = {tuple(v.shape) for v in selects[0].inputs.values()}
+    assert shapes == {(1, 1, 2, 2)}, shapes
+    np.testing.assert_array_equal(
+        _mil_const_value(model), np.ones((1, 1, 2, 2), np.float32)
+    )
+
+
 def test_gather_on_bool_tensor():
     mask = numpy_helper.from_array(
         np.array([True, False, True, False, True]), name="mask"
