@@ -111,6 +111,34 @@ def _provider_name(provider: Provider) -> str:
     return provider[0] if isinstance(provider, (tuple, list)) else provider
 
 
+def _provider_install_hint(missing: List[str]) -> str:
+    """An install hint tailored to the missing provider(s).
+
+    The stock ``onnxruntime`` wheel on PyPI only ships the CPU provider (plus,
+    in special builds, GPU ones like CUDA/MIGraphX). In particular AMD's NPU
+    provider -- ``VitisAIExecutionProvider`` -- never comes from PyPI: it ships
+    inside AMD's Ryzen AI Software bundle (XRT NPU drivers + ``ryzen_ai``
+    venv), so telling a user who asked for the NPU to ``pip install
+    onnxruntime-gpu`` would send them down the wrong path entirely.
+    """
+    hints = []
+    if any("CUDA" in name for name in missing):
+        hints.append(
+            "For CUDA, install the GPU build with `pip install onnxruntime-gpu`."
+        )
+    if any(name == "VitisAIExecutionProvider" for name in missing):
+        hints.append(
+            "For the AMD NPU (VitisAIExecutionProvider), install AMD's Ryzen AI "
+            "Software (XRT NPU drivers + the ryzen_ai venv, which bundles the "
+            "Vitis AI EP build of onnxruntime) -- see "
+            "https://ryzenai.docs.amd.com/en/latest/linux.html and "
+            "https://onnxruntime.ai/docs/execution-providers/Vitis-AI-ExecutionProvider.html."
+        )
+    if not hints:
+        hints.append("Install an onnxruntime build that ships the requested provider.")
+    return " ".join(hints)
+
+
 def _check_providers_available(providers: Sequence[Provider]) -> None:
     """Raise a helpful error if any requested provider is not built into the
     installed onnxruntime.
@@ -128,8 +156,7 @@ def _check_providers_available(providers: Sequence[Provider]) -> None:
         raise ValueError(
             "The following execution provider(s) are not available in the "
             f"installed onnxruntime: {missing}. Available providers: "
-            f"{sorted(available)}. For CUDA, install the GPU build with "
-            "`pip install onnxruntime-gpu`."
+            f"{sorted(available)}. {_provider_install_hint(missing)}"
         )
 
 
@@ -162,7 +189,9 @@ def validate_providers(providers: Optional[Sequence[Provider]]) -> None:
         raise ValueError(
             "Execution providers other than CPUExecutionProvider require "
             "onnxruntime. Please install it (e.g. `pip install onnxruntime-gpu` "
-            f"for CUDA). Requested providers: {non_cpu}."
+            "for CUDA; AMD's Ryzen AI Software bundle for the NPU's "
+            "VitisAIExecutionProvider). "
+            f"Requested providers: {non_cpu}."
         )
 
 
@@ -434,6 +463,10 @@ _PROVIDER_DEVICES: Dict[str, str] = {
     "TensorrtExecutionProvider": "cuda",
     "ROCMExecutionProvider": "cuda",
     "MIGraphXExecutionProvider": "cuda",
+    # AMD's Ryzen AI NPU provider partitions the graph into NPU/CPU subgraphs
+    # transparently; its session inputs/outputs stay host tensors, so binding
+    # on the CPU is correct (and the safe fallback for any unknown provider).
+    "VitisAIExecutionProvider": "cpu",
     "CANNExecutionProvider": "cann",
     "DmlExecutionProvider": "dml",
     "WebGpuExecutionProvider": "webgpu",

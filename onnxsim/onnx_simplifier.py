@@ -3607,9 +3607,15 @@ def simplify(
             ``["CUDAExecutionProvider", "CPUExecutionProvider"]`` to fold on an
             NVIDIA GPU (falling back to CPU for ops CUDA cannot run). An entry may
             also be a ``(name, options)`` tuple as accepted by
-            ``onnxruntime.InferenceSession``. ``None`` (the default) folds on the
+            ``onnxruntime.InferenceSession`` -- e.g. AMD's Ryzen AI NPU via
+            ``[("VitisAIExecutionProvider", {"config_file": "vaip_config.json"}),
+            "CPUExecutionProvider"]`` (the Vitis AI EP ships in AMD's Ryzen AI
+            Software bundle, not in the stock ``onnxruntime`` wheel; keep
+            ``CPUExecutionProvider`` last so unsupported ops fall back to the
+            CPU). ``None`` (the default) folds on the
             CPU. Non-CPU providers require onnxruntime to be installed (the CUDA
-            provider specifically needs the ``onnxruntime-gpu`` build); a
+            provider specifically needs the ``onnxruntime-gpu`` build, the NPU
+            provider AMD's Ryzen AI bundle); a
             requested provider that the installed onnxruntime does not offer
             raises ``ValueError`` instead of silently falling back.
     :param gemm_fusion_backend: Which runtime the ``fuse_matmul_add_bias_into_gemm``
@@ -4523,7 +4529,11 @@ def main():
         "constant folding, in priority order, for example '--providers "
         "CUDAExecutionProvider CPUExecutionProvider' to fold on an NVIDIA GPU "
         "(falling back to CPU for ops CUDA cannot run). Defaults to CPU only. "
-        "The CUDA provider requires the 'onnxruntime-gpu' build.",
+        "The CUDA provider requires the 'onnxruntime-gpu' build; AMD's NPU "
+        "provider ('VitisAIExecutionProvider', from AMD's Ryzen AI Software "
+        "bundle) is accepted the same way, keeping CPUExecutionProvider last "
+        "for fallback. Provider *options* (e.g. the Vitis AI EP's "
+        "'config_file') need the Python API's (name, options) tuple form.",
         type=str,
         nargs="+",
         default=None,

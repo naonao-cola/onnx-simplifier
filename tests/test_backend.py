@@ -257,3 +257,36 @@ def test_reference_evaluator_rejects_non_cpu_provider(monkeypatch):
     x = np.arange(4, dtype=np.float32).reshape(2, 2)
     outputs = backend.run_model(model, {"x": x}, providers=["CPUExecutionProvider"])
     np.testing.assert_allclose(outputs["y"], x + 3.0)
+
+
+@pytest.mark.skipif(
+    not backend.has_onnxruntime(), reason="requires onnxruntime for provider selection"
+)
+def test_unavailable_npu_provider_hint_mentions_ryzen_ai():
+    # The AMD NPU provider ships in AMD's Ryzen AI Software bundle, never in
+    # the stock PyPI wheel -- so when it is missing (the normal state on a
+    # machine without that bundle), the error must point at the Ryzen AI
+    # installer rather than at `onnxruntime-gpu`.
+    import onnxruntime as rt
+
+    if "VitisAIExecutionProvider" in rt.get_available_providers():
+        pytest.skip("Vitis AI provider is available; cannot test the missing path")
+    model = _make_foldable_model()
+    with pytest.raises(ValueError, match="Ryzen AI"):
+        backend.run_model(
+            model,
+            {"x": np.zeros((2, 2), np.float32)},
+            providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
+        )
+
+
+def test_npu_provider_binds_on_cpu():
+    # The Vitis AI EP partitions the graph into NPU/CPU subgraphs
+    # transparently; session tensors stay on the host, so loop binding must
+    # place them on the CPU (the safe fallback for any unknown provider too).
+    assert backend._binding_device(
+        ["VitisAIExecutionProvider", "CPUExecutionProvider"]
+    ) == ("cpu", 0)
+    assert backend._binding_device(
+        [("VitisAIExecutionProvider", {"config_file": "vaip_config.json"})]
+    ) == ("cpu", 0)
