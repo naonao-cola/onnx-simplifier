@@ -5273,6 +5273,45 @@ slots that move between builds hold allocator output. An interpreter that
 produced numbers would be inventing them. `check` answers the question that
 can be answered honestly: could the runtime load and walk this?
 
+### A five-byte form that programs its pair twice
+
+Sixty-eight further real streams from the AX650N -- CNN, transformer and
+recurrent inference compiles plus training-step builds, up to 5.8 MB --
+clustered by their unexplained bytes, turn up a form the walk never had: a
+five-byte `[04][a][b][a][b]` unit whose last two payload bytes repeat the
+middle two. The gaps are genuine, not fallout of a misparse further back:
+all but nine of the sixty-five hundred occurrences sit between clean parses
+on both sides, and the same bytes recur thousands of times (`(ff, 11)`
+1,965; `(ff, 08)` 1,882; `(7f, 05)` 1,707; `(ab, 0b)` 1,644; ...).
+
+Admitting it is pure addition, which is why no stream regresses. `0x04` is
+not a verb and not a tag, so at a quintet's position the only form that
+could otherwise match is a width-rule unit with prefix 4 -- and the quintet
+is checked after that check, so it fires exactly where the walk used to emit
+a raw escape. Its `(a, b)` values never contain a verb byte across the whole
+corpus, so unlike a short unit ending in `a1 00` it cannot split a verb
+beginning where it ends, either. The codec carries it as a `Q` record and
+round-trips it byte-exactly like every other form.
+
+The numbers, measured the way every other form was: 13,070 quintets across
+the 68 streams against 1,616 on their byte-shuffled counterparts, and
+unexplained bytes 511,004 down to 445,778 with the form on -- a eighth of
+the residue gone, no stream worse anywhere, `check` still clean on all of
+them including the four committed fixtures (86 quintets in the vocoder, 76
+in the training step, 8 in the dilated conv, none in the small one).
+
+What `(a, b)` *means* is open. The `b` values stay small (`02`, `05`,
+`08`, `09`, `0b`, `0e`, ...) while `a` roams, which reads like a slot
+programmed twice -- a shadow write in the companion's family -- but that is
+a guess, not a finding. Deliberately not claimed here either: the quintet's
+entangled neighbours -- short units ending in `a1 00` where a verb begins
+(16,161 of them, nearly all followed by unexplained bytes), six-byte
+`02 83 R 83 0e 05` runs, and unanchored companion-shaped
+`05 50 0f <u32>` writes. Each is real by recurrence, and each needs its own
+anchor before it becomes a rule; "fixing" the `a1 00` splits by bluntly
+refusing the short unit was measured and *loses* net coverage, which is what
+a greedy walk does at an overlap it cannot see past.
+
 ## Per-ONNX-op coverage, and what it caught
 
 `op_coverage.py` classifies every operator in the ai.onnx default domain
