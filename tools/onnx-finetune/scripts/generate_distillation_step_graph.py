@@ -94,7 +94,7 @@ refused with a clear error rather than silently mishandled.
 from __future__ import annotations
 
 import argparse
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Sequence, Tuple, Union
 
 import numpy as np
 import onnx
@@ -261,12 +261,22 @@ def _build_forward_loss_and_grads(
     student: onnx.ModelProto,
     temperature: float,
     alpha: float,
+    frozen_prefixes: Sequence[str] = (),
 ) -> _ForwardLossGrads:
     """The differentiable half: the student's own forward nodes, the KD loss
     on top of them, and ``graph_grad.build_backward``'s gradient for every
     trainable weight -- everything in ``b`` up to, but not including, the
     Adam update. Appends nothing an Adam step or a plain gradient-output
     model couldn't equally build on top of.
+
+    Initializers whose name starts with one of ``frozen_prefixes`` stay
+    baked-in constants (frozen): they are not differentiated, get no Adam
+    state, and are not step-graph inputs. Besides subset training, this is
+    what makes a step graph compilable for NPU: Pulsar2's BatchNorm-to-Conv
+    folding needs all four BN parameters as constants, so freezing e.g.
+    ``resnetv15_batchnorm`` (gamma/beta/mean/var stay initializers while
+    conv/dense weights become state) is what lets a ResNet step graph
+    through ``pulsar2 build`` at all.
     """
     if len(student.graph.output) != 1:
         raise ValueError(
@@ -280,6 +290,7 @@ def _build_forward_loss_and_grads(
     trainable = {
         init.name: onnx.numpy_helper.to_array(init).copy()
         for init in dynamic.graph.initializer
+        if not any(init.name.startswith(p) for p in frozen_prefixes)
     }
     if not trainable:
         raise ValueError("student model has no initializers to train")
@@ -297,7 +308,13 @@ def _build_forward_loss_and_grads(
         for name, value in trainable.items()
     ]
     probe_graph = onnx.helper.make_graph(
-        list(dynamic.graph.node), "probe", probe_inputs, list(dynamic.graph.output)
+        list(dynamic.graph.node),
+        "probe",
+        probe_inputs,
+        list(dynamic.graph.output),
+        initializer=[
+            init for init in dynamic.graph.initializer if init.name not in trainable
+        ],
     )
     probe_model = onnx.helper.make_model(
         probe_graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
@@ -327,6 +344,13 @@ def _build_forward_loss_and_grads(
     # weight value on every call -- the same "the block's own weight is an
     # ordinary graph input, not an initializer" move onnxsim.qat's block
     # training already makes.
+    #
+    # Except the frozen ones: initializers matched by `frozen_prefixes` stay
+    # baked-in constants (no state, no Adam moments, no gradients), which is
+    # what keeps e.g. BatchNorm parameters foldable for an NPU compile.
+    b.initializer.extend(
+        init for init in dynamic.graph.initializer if init.name not in trainable
+    )
 
     teacher_logits = "teacher_logits"
     labels_onehot = "labels_onehot"
@@ -426,6 +450,7 @@ def build_distillation_step_graph(
     student: onnx.ModelProto,
     temperature: float = 2.0,
     alpha: float = 0.5,
+    frozen_prefixes: Sequence[str] = (),
 ) -> Tuple[qat_graph.StepGraph, Dict[str, np.ndarray], _ForwardLossGrads]:
     """Returns ``(step, initial_state, fwd)``. ``fwd`` is the same
     :class:`_ForwardLossGrads` :func:`_build_forward_loss_and_grads` returned
@@ -437,19 +462,22 @@ def build_distillation_step_graph(
 
     ``step.model`` trains the whole of ``student`` against a frozen teacher's
     logits and hard labels, for a batch of any size (the batch axis is a
-    ``dim_param``, see this module's own docstring). Its per-step inputs are
+    ``dim_param``, see this module's own docstring). Initializers matching
+    ``frozen_prefixes`` are excluded from training (kept as constants --
+    pass BatchNorm prefixes for an NPU-compilable graph, see
+    :func:`_build_forward_loss_and_grads`). Its per-step inputs are
     ``student``'s own input name, ``"teacher_logits"`` (the frozen teacher's
     output on the same batch, computed by the caller each step),
     ``"labels_onehot"`` (:func:`labels_to_onehot` of the batch's integer
-    labels), and ``"batch_size"`` (the batch's own row count, as a float32
-    scalar) -- plus ``"lr"``/``"m_correction"``/``"v_correction"``, the same
+    labels), and ``"batch_size"`` (the batch's own row count, as a rank-1
+    ``[1]`` float vector -- never rank-0, see the ``per_step`` note below) -- plus ``"lr"``/``"m_correction"``/``"v_correction"``, the same
     three every ``onnxsim.qat_graph`` Adam step graph takes (see
     :func:`onnxsim.qat_graph.adam_bias_corrections`). ``initial_state`` seeds
     every weight from ``student``'s own initializer values and every Adam
     moment at zero, ready to hand straight to
     :func:`onnxsim.qat_graph.run_step_graph`.
     """
-    fwd = _build_forward_loss_and_grads(student, temperature, alpha)
+    fwd = _build_forward_loss_and_grads(student, temperature, alpha, frozen_prefixes)
     b, grads, combined, trainable = fwd.b, fwd.grads, fwd.combined, fwd.trainable
 
     state: Dict[str, Tuple[list, str]] = {}
@@ -564,11 +592,21 @@ def main() -> None:
     )
     p.add_argument("--temperature", type=float, default=2.0)
     p.add_argument("--alpha", type=float, default=0.5)
+    p.add_argument(
+        "--freeze-prefix",
+        action="append",
+        default=[],
+        help="initializer name prefix to freeze (repeatable): matching "
+        "weights stay baked-in constants instead of becoming trainable "
+        "step-graph state. Freeze BatchNorm prefixes for a graph that "
+        "Pulsar2 can compile (its BN-to-Conv folding needs constant BN "
+        "parameters).",
+    )
     args = p.parse_args()
 
     student = onnx.load(args.student)
     step, initial_state, fwd = build_distillation_step_graph(
-        student, args.temperature, args.alpha
+        student, args.temperature, args.alpha, args.freeze_prefix
     )
     onnx.save(step.model, args.output)
 
