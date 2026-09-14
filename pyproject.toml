@@ -87,6 +87,14 @@ detectron2 = ["torch"]
 # onnxsim.export_sam2_model's docstring) -- do not substitute the unrelated,
 # unofficial same-named package that is on PyPI.
 sam2 = ["torch", "samexporter", "hydra-core"]
+# Needed by onnxsim.export_drivetransformer_model(), which traces a
+# DriveTransformer (https://github.com/Thinklab-SJTU/DriveTransformer)
+# end-to-end autonomous-driving model to ONNX before simplifying it. Only
+# pulls in torch: DriveTransformer's own "mmcv"/"mmdet"/"mmdet3d" are its own
+# bundled, merged fork (unrelated to the real PyPI mmcv), so it must be
+# installed separately from source (see
+# onnxsim.export_drivetransformer_model's docstring).
+drivetransformer = ["torch"]
 # Needed by onnxsim.torch_training.compile_torch_training_loop(), which
 # exports a real torch.nn.Module to ONNX via torch.export's FX graph
 # (torch.onnx.export(..., dynamo=True)) and hands the result to

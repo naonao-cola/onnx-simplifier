@@ -101,6 +101,10 @@ constant folding until the model stops changing. Around that it offers:
   [SAM 2](https://github.com/facebookresearch/sam2) image encoder and
   prompt/mask decoder to ONNX and simplify both with
   `onnxsim.export_sam2_model()`.
+- **[DriveTransformer export](#drivetransformer-export).** Trace a
+  [DriveTransformer](https://github.com/Thinklab-SJTU/DriveTransformer)
+  end-to-end autonomous-driving model to ONNX and simplify it with
+  `onnxsim.export_drivetransformer_model()`.
 - **[Deploying to Axelera Metis devices](#deploying-to-axelera-metis-devices-voyager-sdk).**
   Safe to run ahead of [Voyager SDK](https://github.com/axelera-ai-hub/voyager-sdk)'s
   own `deploy.py`: its Focus/space-to-depth and flattened-FC-head detectors,
@@ -1528,6 +1532,47 @@ published to PyPI under its official name -- install it from source:
 A same-named `sam2` package that *is* on PyPI is an unrelated, unofficial
 third-party upload as of this writing, not Meta's code -- don't substitute
 it for this.
+
+## DriveTransformer export
+
+[DriveTransformer](https://github.com/Thinklab-SJTU/DriveTransformer)
+(ICLR 2025) is a camera-only, streaming end-to-end autonomous-driving
+model, built on an `mmdet3d_plugin` config on top of DriveTransformer's own
+bundled, merged `mmcv`/`mmdet`/`mmdet3d` fork (not the real PyPI `mmcv`
+package -- the same UniAD/VAD/BEVFormer-lineage setup). It ships no ONNX
+exporter of its own, and its `forward()` is dict-in/dict-out with Python
+postprocessing (NMS-free top-k decoding, `.cpu()` conversion), so
+`onnxsim.export_drivetransformer_model()` builds its own thin tracing
+wrapper around the model's raw detection/mapping/planning head output --
+the DriveTransformer counterpart of `onnxsim.export_detectron_model()`/
+`onnxsim.export_sam2_model()`, minus an upstream recipe to mirror:
+
+```python
+import onnxsim
+
+onnxsim.export_drivetransformer_model(
+    "DriveTransformer/adzoo/drivetransformer/configs/drivetransformer/drivetransformer_large.py",
+    "drivetransformer_simplified.onnx",
+)
+```
+
+`config_file` is a path to a DriveTransformer `mmdet3d_plugin` config from a
+DriveTransformer checkout. Pass `checkpoint=` a `.pth` checkpoint path to
+trace with real weights -- if omitted (the default), no checkpoint is
+loaded at all, and the model traces with its random initialization instead,
+with no checkpoint or network call needed, e.g. for testing. The trace is a
+single, cold-start frame (no temporal history baked in, matching
+DriveTransformer's own first-frame inference path) built from synthetic
+inputs at the released config's own 6-camera/384x1056 layout -- override
+`num_cams=`/`image_size=` for a different DriveTransformer config.
+
+Needs the optional `torch` package (`pip install onnxsim[drivetransformer]`).
+DriveTransformer's own `mmcv`/`mmdet`/`mmdet3d` are **not** the real PyPI
+packages of those names -- install DriveTransformer itself from source
+(`git clone https://github.com/Thinklab-SJTU/DriveTransformer.git && cd
+DriveTransformer && pip install -v -e .`, see
+[DriveTransformer's install docs](https://github.com/Thinklab-SJTU/DriveTransformer/blob/main/docs/INSTALL.md))
+and run this with that checkout importable.
 
 ## Deploying to Axelera Metis devices (Voyager SDK)
 
