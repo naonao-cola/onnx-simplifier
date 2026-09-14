@@ -111,7 +111,7 @@ def _as_double(model: onnx.ModelProto) -> onnx.ModelProto:
 
 def _grad_and_loss_models(fwd):
     """``(grad_model, loss_model)``: plain ONNX graphs exposing, respectively,
-    every trainable weight's raw gradient and the scalar loss -- shared setup
+    every trainable weight's raw gradient and the ``[1, 1]`` loss -- shared setup
     between the two finite-difference tests below.
 
     Declares every per-step input's shape exactly as ``fwd`` itself declares
@@ -180,7 +180,11 @@ def _grad_and_loss_models(fwd):
     # for why the backward nodes cannot come along for this one.
     loss_model = _finish(
         fwd.forward_and_loss_nodes,
-        [onnx.helper.make_tensor_value_info(fwd.combined, onnx.TensorProto.FLOAT, [])],
+        [
+            onnx.helper.make_tensor_value_info(
+                fwd.combined, onnx.TensorProto.FLOAT, [1, 1]
+            )
+        ],
     )
     return grad_model, loss_model
 
@@ -212,9 +216,9 @@ def _finite_difference_grad(loss_model, feeds, target):
     for i in range(flat.size):
         original = flat[i]
         flat[i] = original + h
-        plus = float(evaluator.run(None, feeds64)[0])
+        plus = float(np.asarray(evaluator.run(None, feeds64)[0]).reshape(-1)[0])
         flat[i] = original - h
-        minus = float(evaluator.run(None, feeds64)[0])
+        minus = float(np.asarray(evaluator.run(None, feeds64)[0]).reshape(-1)[0])
         flat[i] = original
         grad_fd[i] = (plus - minus) / (2.0 * h)
     return grad_fd.reshape(feeds64[target].shape)
@@ -325,7 +329,7 @@ def test_step_graph_trains_on_plain_onnxruntime(toy_models):
         )
 
         out = dict(zip(output_names, step_session.run(output_names, feeds)))
-        loss = float(out[step.loss_name])
+        loss = float(np.asarray(out[step.loss_name]).reshape(-1)[0])
         assert np.isfinite(loss)
         losses.append(loss)
         state = {name: out[out_name] for name, out_name in step.state.items()}
