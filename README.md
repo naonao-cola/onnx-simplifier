@@ -584,6 +584,51 @@ e.g. `output_integer_quantized_tflite=True`) instead. See
 `onnxsim/onnx2tf_export.py` for the full signature and onnx2tf's own
 documentation for its option list.
 
+### Running on the Coral Edge TPU
+
+The Edge TPU only runs fully 8-bit quantized models compiled with
+`edgetpu_compiler`. onnxsim covers that tail of the pipeline (see
+`onnxsim/edgetpu_export.py`):
+
+```
+# 1. full-integer quantization with quantized I/O (TensorFlow required)
+onnxsim input.onnx simplified.onnx --emit-tflite model.tflite \
+  --tflite-int8 --tflite-io-dtype uint8
+
+# 2. compile for the Edge TPU (needs the edgetpu_compiler binary)
+onnxsim input.onnx simplified.onnx --emit-tflite model.tflite --tflite-edgetpu
+```
+
+`--tflite-edgetpu` implies `--tflite-int8` and writes `model_edgetpu.tflite`
+next to the `.tflite` file (pass a path to choose it), printing per-operator
+TPU/CPU statuses from the compiler log. Calibration uses uniform-random data
+(`--tflite-calibration-samples N`, default 100) unless you pass real
+representative inputs via the Python API's `representative_dataset=`.
+`--tflite-edgetpu-check` statically checks the simplified model against the
+Edge TPU requirements (static shapes, supported ops) before converting.
+
+```python
+model_simp, ok = onnxsim.simplify(model)
+assert ok
+
+# Check first (onnx only, no other dependency)...
+report = onnxsim.check_onnx_for_edgetpu(model_simp)
+print(report.summary())
+
+# ...then quantize, compile, and run via LiteRT.
+edgetpu = onnxsim.export_edgetpu(model_simp, "model_edgetpu.tflite")
+print(edgetpu.compile_result.summary())
+
+out = onnxsim.run_litert("model_edgetpu.tflite", {"x": x_uint8}, use_edgetpu=True)
+```
+
+Inference runs on [LiteRT](https://ai.google.dev/edge/litert)
+(`pip install ai-edge-litert`, the successor to `tflite-runtime`);
+`use_edgetpu=True` loads the `libedgetpu` delegate for on-device execution
+(see `onnxsim.edgetpu_setup_hint()` for the runtime/udev setup). Without a
+device, the same call with `use_edgetpu=False` runs the quantized model on
+CPU.
+
 ## Constant folding on the GPU (CUDA execution provider)
 
 onnxsim constant-folds by running the foldable sub-graphs through ONNX Runtime.
