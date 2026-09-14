@@ -607,6 +607,24 @@ representative inputs via the Python API's `representative_dataset=`.
 `--tflite-edgetpu-check` statically checks the simplified model against the
 Edge TPU requirements (static shapes, supported ops) before converting.
 
+### Channel order: `--tflite-layout nhwc` for larger models
+
+By default the builtin translator keeps public tensors in ONNX's NCHW order
+and transposes around each conv/pool. That is free for small models (TF folds
+the interior transposes, leaving just the boundary pair), but the Edge TPU
+compiler refuses the NCHW *entry* transpose above modest activation sizes
+(measured: a 64-channel 32x32 conv fails with `large activation tensors`,
+while the identical channel-last graph maps fully; the exit transpose is
+harmless). `--tflite-edgetpu-check` warns when a model enters that envelope
+(4-D activations with 8+ channels and 65536+ elements, inputs and inferred
+intermediates).
+
+Pass `--tflite-layout nhwc` (Python: `io_layout="nhwc"`) to carry 4-D tensors
+channel-last end to end instead: public 4-D I/O changes dimension order to
+NHWC, but conv/pool/concat emit no transposes at all (verified: the 64ch
+32x32 model compiles with every op mapped). Feed NHWC-ordered inputs at
+inference and when supplying `representative_dataset=`.
+
 ```python
 model_simp, ok = onnxsim.simplify(model)
 assert ok
