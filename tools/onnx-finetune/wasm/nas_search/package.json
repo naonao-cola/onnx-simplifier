@@ -2,9 +2,9 @@
   "name": "onnx-finetune-nas-search",
   "private": true,
   "type": "module",
-  "description": "Trains several candidate architectures' step graphs via the official onnxruntime-web package and ranks them by loss -- a tiny neural-architecture-search loop.",
+  "description": "Trains several candidate architectures' step graphs via the official onnxruntime-web package and ranks them by loss (and, optionally, measured latency) -- a tiny neural-architecture-search loop, plus a DARTS-style differentiable supernet variant.",
   "scripts": {
-    "test": "node --test search.test.mjs"
+    "test": "node --test search.test.mjs darts_supernet.test.mjs"
   },
   "dependencies": {
     "onnxruntime-web": "^1.29.0"

@@ -20,7 +20,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { makeSyntheticBatch, searchArchitectures } from "./search.mjs";
+import { combinedScore, makeSyntheticBatch, searchArchitectures, softmax } from "./search.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPTS = join(HERE, "..", "..", "scripts");
@@ -111,6 +111,15 @@ test(
         result.finalLoss < result.losses[0],
         `${result.name}: loss should decrease over training (${result.losses[0]} -> ${result.finalLoss})`,
       );
+      // Real measured wall-clock latency, not a placeholder -- see
+      // trainCandidate's own comment on why this can be a plain
+      // performance.now() delta rather than a predicted/looked-up latency.
+      assert.ok(Number.isFinite(result.meanStepMs), `${result.name}: meanStepMs ${result.meanStepMs} is not finite`);
+      assert.ok(result.meanStepMs > 0, `${result.name}: meanStepMs should be positive, got ${result.meanStepMs}`);
+      assert.ok(
+        Math.abs(result.totalMs - result.meanStepMs * options.numSteps) < 1e-6,
+        `${result.name}: totalMs should equal meanStepMs * numSteps`,
+      );
     }
 
     // The smallest-capacity candidate ("tiny", hidden width 4 -- see
@@ -140,4 +149,45 @@ test("makeSyntheticBatch is reproducible for a fixed seed", () => {
   assert.deepEqual(Array.from(a.target), Array.from(b.target));
   assert.equal(a.batchInput.length, 4 * 3);
   assert.equal(a.target.length, 4 * 2);
+});
+
+test("makeSyntheticBatch's inputScale/normalizeByDim options apply as documented", () => {
+  const plain = makeSyntheticBatch(4, 3, 2, 7);
+  const scaled = makeSyntheticBatch(4, 3, 2, 7, { inputScale: 5 });
+  for (let i = 0; i < plain.batchInput.length; ++i) {
+    assert.ok(
+      Math.abs(scaled.batchInput[i] - 5 * plain.batchInput[i]) < 1e-4,
+      `entry ${i}: ${scaled.batchInput[i]} should be 5x ${plain.batchInput[i]}`,
+    );
+  }
+  const normalized = makeSyntheticBatch(4, 3, 2, 7);
+  const unnormalized = makeSyntheticBatch(4, 3, 2, 7, { normalizeByDim: false });
+  // Same seed draws the same batchInput either way -- normalizeByDim only
+  // changes the target formula, not which random numbers get drawn.
+  assert.deepEqual(Array.from(normalized.batchInput), Array.from(unnormalized.batchInput));
+  // The two targets differ (by a factor of sqrt(dim) on the linear part,
+  // obscured by an independent noise draw per entry -- not worth an exact
+  // ratio check here, just that turning the flag off actually changes
+  // something).
+  assert.notDeepEqual(Array.from(normalized.target), Array.from(unnormalized.target));
+});
+
+test("combinedScore is loss-only when latencyWeight is 0, and penalizes latency otherwise", () => {
+  const fast = { finalLoss: 1.0, meanStepMs: 1 };
+  const slow = { finalLoss: 0.9, meanStepMs: 100 };
+  assert.equal(combinedScore(fast), 1.0);
+  assert.equal(combinedScore(slow), 0.9);
+  assert.ok(combinedScore(slow, 0) < combinedScore(fast, 0), "with no latency weight, lower loss should still win");
+  assert.ok(
+    combinedScore(fast, 0.1) < combinedScore(slow, 0.1),
+    "with a large enough latency weight, the faster candidate should win despite the higher loss",
+  );
+});
+
+test("softmax sums to 1 and preserves ordering", () => {
+  const weights = softmax([1, 2, 3]);
+  const sum = weights.reduce((a, b) => a + b, 0);
+  assert.ok(Math.abs(sum - 1) < 1e-9, `softmax should sum to 1, got ${sum}`);
+  assert.ok(weights[0] < weights[1] && weights[1] < weights[2], "softmax should preserve input ordering");
+  assert.deepEqual(softmax([5, 5, 5]).map((w) => Math.round(w * 1000) / 1000), [1 / 3, 1 / 3, 1 / 3].map((w) => Math.round(w * 1000) / 1000));
 });
