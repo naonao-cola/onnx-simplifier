@@ -205,7 +205,9 @@ def export_drivetransformer_model(
     cfg = Config.fromfile(config_file)
     _import_plugin(cfg)
 
-    model = build_model(cfg.model, train_cfg=cfg.get("train_cfg"), test_cfg=cfg.get("test_cfg"))
+    model = build_model(
+        cfg.model, train_cfg=cfg.get("train_cfg"), test_cfg=cfg.get("test_cfg")
+    )
     if checkpoint is not None:
         load_checkpoint(model, checkpoint, map_location="cpu")
     model.eval()
@@ -237,7 +239,18 @@ def export_drivetransformer_model(
         }
     ]
 
-    def _call_head(img, lidar2img, cam_intrinsic, ego_pose, ego_pose_inv, timestamp, prev_exists, ego_his_trajs, ego_lcf_feat, ego_fut_cmd):
+    def _call_head(
+        img,
+        lidar2img,
+        cam_intrinsic,
+        ego_pose,
+        ego_pose_inv,
+        timestamp,
+        prev_exists,
+        ego_his_trajs,
+        ego_lcf_feat,
+        ego_fut_cmd,
+    ):
         img_feats = model.extract_img_feat(img=img, img_metas=img_metas)
         img_feats = img_feats[model.position_level][:, 0]
         return model.pts_bbox_head(

@@ -61,9 +61,7 @@ def test_export_drivetransformer_model_returns_check_results(tmp_path):
 def test_export_drivetransformer_model_save_as_external_data(tmp_path):
     out_path = str(tmp_path / "model.onnx")
 
-    onnxsim.export_drivetransformer_model(
-        _CONFIG, out_path, save_as_external_data=True
-    )
+    onnxsim.export_drivetransformer_model(_CONFIG, out_path, save_as_external_data=True)
 
     assert os.path.exists(out_path + ".data")
     model, _pool = onnxsim.load_model(out_path)
