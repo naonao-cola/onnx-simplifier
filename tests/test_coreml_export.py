@@ -405,6 +405,38 @@ def test_concat_drops_inputs_empty_along_its_axis():
     assert tuple(prog.functions["main"].outputs[0].shape) == (1, 2, 4)
 
 
+def test_dynamic_range_converts_despite_ane_plan_build_rejection():
+    # A `Range` with a runtime limit converts fine -- what E5RT's ANE plan
+    # build rejects ("Invalid blob shape: Data-dependent shapes were
+    # disabled") is a deployment fact about value-derived shapes on current
+    # macOS, not a conversion failure, so pin the conversion half here
+    # (Linux-runnable, no Apple hardware needed).
+    zero = numpy_helper.from_array(np.array(0, dtype=np.int64), name="zero")
+    one = numpy_helper.from_array(np.array(1, dtype=np.int64), name="one")
+    ax = numpy_helper.from_array(np.array([0], dtype=np.int64), name="ax")
+    model = _model(
+        "rdyn (int64[1] end) => (float[4] y) "
+        "{ es = Squeeze (end, ax) "
+        "r = Range (zero, es, one) "
+        "m = LessOrEqual (r, r) "
+        "mf = Cast <to=1> (m) "
+        "v = Add (mf, mf) "
+        "y = Reshape (v, shape) }",
+        initializer=[
+            zero,
+            one,
+            ax,
+            numpy_helper.from_array(np.array([4], dtype=np.int64), name="shape"),
+        ],
+    )
+    ops = [
+        t
+        for t, _ in _spec_ops(onnxsim.export_coreml(model, skip_model_load=True))
+        if t != "const"
+    ]
+    assert "range_1d" in ops
+
+
 def test_pad_reflect_matches_onnxruntime():
     x = np.arange(12, dtype=np.float32).reshape(1, 1, 3, 4)
     pads = np.array([0, 0, 1, 1, 0, 0, 1, 1], np.int64)
