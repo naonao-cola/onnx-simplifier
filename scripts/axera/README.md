@@ -5467,6 +5467,23 @@ open. The `0x80`/`0xa0`/`0xc0`/`0xe0` holes in the tag set, probed the same
 way, are real absences: all four occur *below* chance as would-be tags,
 with register parity at the background rate.
 
+### The stuttered pair
+
+Nineteen thousand len-two runs after short units, and 5,502 of them are an
+exact echo of the unit's own tail: a short unit ending in `90 03` followed
+by another unexplained `90 03` (eleven of anything else, combined). The
+preceding unit is overwhelmingly the same shape too -- `00 04 90 03` -- so
+this is one fixed context, not a general stutter rule: the pair is
+written twice, back to back, the second copy stranded because no form opens
+at it (`0x90` needs an even register after it, `0x03` is not a prefix). The
+echo walks as a `Y` record with everything around it parsing exactly as
+before, so it converts only raw escapes: 5,502 takes, zero regressions,
+zero shuffled takes. Whether the doubling is a write-and-confirm on the
+`0x90`/`0x03` slot -- one of the matmul engine's most-programmed addresses
+-- is a card question, and the card work is parked; statically, the codec
+round-trips it and `check` stays clean. The committed fixtures carry no
+stutters, so the test pins the codec synthetically.
+
 ### A second repeat form
 
 The quintet repeats a pair (`[04][a][b][a][b]`); this repeats one byte:

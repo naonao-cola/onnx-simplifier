@@ -602,3 +602,48 @@ def test_repeat_never_regresses_coverage(name):
     covered_plain, _ = mcode.nonzero_coverage(blob, **plain)
     covered_with, _ = mcode.nonzero_coverage(blob)
     assert covered_with >= covered_plain, (name, covered_plain, covered_with)
+
+
+def _synthetic_stutter_stream():
+    """A hand-built stream with a stuttered pair: a short unit ending in
+    `90 03`, its `90 03` echo, and a bare pair."""
+    return bytes.fromhex(
+        "00 04 90 03"  # S
+        "90 03"  # Y
+        "81 96"  # B
+    )
+
+
+def test_stuttered_pair_codec():
+    """A short unit ending in `90 03` followed by another `90 03`: the pair
+    stutters (5,502 of them corpus-wide, eleven of anything else), and no
+    other form can open at the echo. The committed fixtures carry none, so
+    this pins the codec on a synthetic stream; the corpus numbers are in
+    the README's "The stuttered pair" section."""
+    blob = _synthetic_stutter_stream()
+    toks = mcode.tokenize(blob, start=0, end=len(blob), **mcode.FULL_RULE)
+    assert [t[1] for t in toks] == ["S", "Y", "B"], [t[1] for t in toks]
+    records = mcode.decode(blob, start=0, end=len(blob), **mcode.FULL_RULE)
+    assert [r["kind"] for r in records] == ["S", "Y", "B"]
+    assert [(r["a"], r["b"]) for r in records if r["kind"] == "Y"] == [(0x90, 0x03)]
+    assert mcode.encode(records) == blob
+
+    # The flag plumbs through: off means the echo stays raw.
+    plain = dict(mcode.FULL_RULE)
+    plain["stutter"] = False
+    kinds_off = [t[1] for t in mcode.tokenize(blob, start=0, end=len(blob), **plain)]
+    assert kinds_off == ["S", "?", "?", "B"], kinds_off
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_stutter_never_regresses_coverage(name):
+    """The echo converts only raw escapes with everything around it parsing
+    identically, so per-stream coverage with it on is never below it off.
+    (The fixtures carry no stutters, so this pins equality there and guards
+    the plumbing.)"""
+    blob = _blob(name)
+    plain = dict(mcode.FULL_RULE)
+    plain["stutter"] = False
+    covered_plain, _ = mcode.nonzero_coverage(blob, **plain)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    assert covered_with >= covered_plain, (name, covered_plain, covered_with)
