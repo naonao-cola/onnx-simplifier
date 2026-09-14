@@ -15,13 +15,14 @@ time.
 Before (produced by onnxsim.quantize_static):
   Xq  = QuantizeLinear(X, Xs, Xzp)        -- Xs/Xzp: CALIBRATED, fixed
   Xdq = DequantizeLinear(Xq, Xs, Xzp)
-  Wdq = DequantizeLinear(Wq, Ws, axis=<W's output-channel axis>)
+  Wdq = DequantizeLinear(Wq, Ws, Wzp, axis=<W's output-channel axis>)
+                                      -- Wzp: explicit all-zeros INT8
   Y   = MatMul(Xdq, Wdq)                  -- or Gemm
 
 After:
   Xq  = QuantizeLinear(X, Xs', Xzp')      -- Xs'/Xzp': AdaQuant-OPTIMIZED
   Xdq = DequantizeLinear(Xq, Xs', Xzp')
-  Wdq = DequantizeLinear(Wq', Ws, axis=<W's output-channel axis>)
+  Wdq = DequantizeLinear(Wq', Ws, Wzp, axis=<W's output-channel axis>)
   Y   = MatMul(Xdq, Wdq)                  -- or Gemm
 ```
 

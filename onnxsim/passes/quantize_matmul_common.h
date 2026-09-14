@@ -238,6 +238,25 @@ inline void QuantizeWeightPerChannelInPlace(const Tensor& w_t,
   scale_out.floats() = std::move(scale);
 }
 
+// An explicit per-channel INT8 zero-point (all zeros, shape [C]) for a
+// symmetric-quantized weight's DequantizeLinear.
+//
+// The zero_point input is optional per the ONNX spec (and symmetric
+// quantization is always 0), so the static-quantize passes used to omit it --
+// but runtimes that fuse the QDQ pattern into an integer kernel require scale
+// and zero_point to have the same shape: onnxruntime's QGemm fusion rejects
+// the fused MatMul+Add outright ("zero point and scale of input b should have
+// the same shape size"), and the VitisAI EP aborts while partitioning it.
+// Spelling out the zeros keeps the numerics identical and both runtimes happy.
+inline void MakeSymmetricInt8WeightZeroPoint(int64_t channels, Tensor& zp_out) {
+  zp_out.elem_type() = TensorProto_DataType_INT8;
+  zp_out.sizes() = {channels};
+  // raw_data, not int32s() -- see WriteRawDataLittleEndian's doc comment in
+  // endian_read.h for why.
+  zp_out.set_raw_data(WriteRawDataLittleEndian(
+      std::vector<int8_t>(static_cast<size_t>(channels), 0)));
+}
+
 // Same as QuantizeWeightPerChannelInPlace, but INT16 (max(|w[:, j]|) / 32767
 // per channel) instead of INT8 -- used by weight_only_quantize_int16_matmul.h
 // for the outlier-heavy channels INT8's coarser step (1/127 relative) resolves

@@ -422,10 +422,14 @@ std::vector<QuantizedLayer> FindStaticLayers(
       continue;
     }
 
-    // Weight branch: Wdq = DequantizeLinear(Wq, Ws, axis=...), symmetric.
+    // Weight branch: Wdq = DequantizeLinear(Wq, Ws, [Wzp], axis=...),
+    // symmetric. Newer models spell the zero-point out explicitly (all zeros,
+    // same shape as the scale -- see MakeSymmetricInt8WeightZeroPoint, which
+    // runtimes that fuse the QDQ pattern require); models quantized before
+    // that change carry the 2-input form, which stays accepted.
     const onnx::NodeProto* wdq = q_by_output.Get(qn->input(1));
     if (wdq == nullptr || wdq->op_type() != "DequantizeLinear" ||
-        wdq->input_size() != 2) {
+        (wdq->input_size() != 2 && wdq->input_size() != 3)) {
       continue;
     }
     const onnx::TensorProto* wq = Lookup(q_init, wdq->input(0));
@@ -434,6 +438,21 @@ std::vector<QuantizedLayer> FindStaticLayers(
         wq->data_type() != onnx::TensorProto::INT8 ||
         DimsOf(*wq) != DimsOf(*w_float)) {
       continue;
+    }
+    if (wdq->input_size() == 3) {
+      const onnx::TensorProto* wzp = Lookup(q_init, wdq->input(2));
+      if (wzp == nullptr || wzp->data_type() != onnx::TensorProto::INT8 ||
+          DimsOf(*wzp) != DimsOf(*ws)) {
+        continue;
+      }
+      bool all_zero = true;
+      for (double v : TensorValues(*wzp)) {
+        if (v != 0.0) {
+          all_zero = false;
+          break;
+        }
+      }
+      if (!all_zero) continue;
     }
     const int64_t channel_axis = AttrInt(*wdq, "axis", 1);
 

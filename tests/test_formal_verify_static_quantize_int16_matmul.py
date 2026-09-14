@@ -354,7 +354,10 @@ def test_static_quantize_int16_matmul_pass_fires_and_matches_scheme():
 
     wdq_node = _producer(quantized16, wdq_name)
     assert wdq_node.op_type == "DequantizeLinear"
-    assert len(wdq_node.input) == 2  # symmetric: no zero_point input
+    # symmetric, so the zero-point is spelled out explicitly (all zeros, same
+    # shape as the per-channel scale) rather than omitted: runtimes that fuse
+    # the QDQ pattern require scale and zero_point to match.
+    assert len(wdq_node.input) == 3
     assert _node_attr(wdq_node, "axis") == 1  # MatMul, untransposed: axis 1
 
     init16 = {i.name: i for i in quantized16.graph.initializer}
@@ -372,6 +375,10 @@ def test_static_quantize_int16_matmul_pass_fires_and_matches_scheme():
 
     wq16 = numpy_helper.to_array(init16[wdq_node.input[0]])
     ws16 = numpy_helper.to_array(init16[wdq_node.input[1]])
+    wzp16 = numpy_helper.to_array(init16[wdq_node.input[2]])
+    assert wzp16.dtype == np.int8
+    assert wzp16.shape == ws16.shape
+    assert bool((wzp16 == 0).all())
     expected_wq, expected_ws = _quantize_weight_per_channel(weight, channel_axis=1)
     np.testing.assert_array_equal(wq16, expected_wq)
     np.testing.assert_allclose(ws16, expected_ws, rtol=1e-6)

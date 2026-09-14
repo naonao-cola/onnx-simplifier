@@ -12,7 +12,8 @@ Conv node itself untouched and rewiring only its inputs::
 
     Xq  = QuantizeLinear(X, Xs, Xzp)          -- Xs/Xzp: CALIBRATED, fixed, uint16
     Xdq = DequantizeLinear(Xq, Xs, Xzp)
-    Wdq = DequantizeLinear(Wq, Ws, axis=0)    -- symmetric, zp=0, int8
+    Wdq = DequantizeLinear(Wq, Ws, Wzp, axis=0)    -- symmetric, Wzp spelled
+    out explicitly (all zeros, same shape as Ws), int8
     Y   = Conv(Xdq, Wdq)
 
 The ONE structural difference from ``static_quantize_int16_matmul.h`` --
@@ -442,7 +443,10 @@ def test_static_quantize_int16_conv_pass_fires_and_matches_scheme():
 
     wdq_node = producer(quantized, wdq_name)
     assert wdq_node.op_type == "DequantizeLinear"
-    assert len(wdq_node.input) == 2  # symmetric: no zero_point input at all
+    # symmetric, so the zero-point is spelled out explicitly (all zeros, same
+    # shape as the per-channel scale) rather than omitted: runtimes that fuse
+    # the QDQ pattern require scale and zero_point to match.
+    assert len(wdq_node.input) == 3
     assert _axis(wdq_node) == 0  # Conv: axis 0 unconditionally, no transposed case
 
     init = {i.name: i for i in quantized.graph.initializer}
@@ -463,6 +467,10 @@ def test_static_quantize_int16_conv_pass_fires_and_matches_scheme():
 
     wq = numpy_helper.to_array(init[wdq_node.input[0]])
     ws = numpy_helper.to_array(init[wdq_node.input[1]])
+    wzp = numpy_helper.to_array(init[wdq_node.input[2]])
+    assert wzp.dtype == np.int8
+    assert wzp.shape == ws.shape
+    assert bool((wzp == 0).all())
     expected_wq, expected_ws = _quantize_conv_weight_per_output_channel(weight)
     np.testing.assert_array_equal(wq, expected_wq)
     np.testing.assert_allclose(ws, expected_ws, rtol=1e-6)
@@ -513,6 +521,10 @@ def test_static_quantize_int16_conv_bias_is_untouched():
 
     wq = numpy_helper.to_array(init[wdq_node.input[0]])
     ws = numpy_helper.to_array(init[wdq_node.input[1]])
+    wzp = numpy_helper.to_array(init[wdq_node.input[2]])
+    assert wzp.dtype == np.int8
+    assert wzp.shape == ws.shape
+    assert bool((wzp == 0).all())
     expected_wq, expected_ws = _quantize_conv_weight_per_output_channel(weight)
     np.testing.assert_array_equal(wq, expected_wq)
     np.testing.assert_allclose(ws, expected_ws, rtol=1e-6)

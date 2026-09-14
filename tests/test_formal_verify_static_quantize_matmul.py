@@ -10,7 +10,8 @@ MatMul/Gemm node itself untouched and rewiring only its inputs::
 
     Xq  = QuantizeLinear(X, Xs, Xzp)          -- Xs/Xzp: CALIBRATED, fixed
     Xdq = DequantizeLinear(Xq, Xs, Xzp)
-    Wdq = DequantizeLinear(Wq, Ws, axis=<channel_axis>)   -- symmetric, zp=0
+    Wdq = DequantizeLinear(Wq, Ws, Wzp, axis=<channel_axis>)   -- symmetric,
+    Wzp spelled out explicitly (all zeros, same shape as Ws)
     Y   = MatMul(Xdq, Wdq)
 
 ``Wq``/``Ws`` are the same per-output-channel symmetric INT8 weight
@@ -384,7 +385,10 @@ def test_static_quantize_matmul_pass_fires_and_matches_scheme():
 
     wdq_node = producer(quantized, wdq_name)
     assert wdq_node.op_type == "DequantizeLinear"
-    assert len(wdq_node.input) == 2  # symmetric: no zero_point input at all
+    # symmetric, so the zero-point is spelled out explicitly (all zeros, same
+    # shape as the per-channel scale) rather than omitted: runtimes that fuse
+    # the QDQ pattern require scale and zero_point to match.
+    assert len(wdq_node.input) == 3
     assert _node_attr(wdq_node, "axis") == 1  # MatMul, untransposed: axis 1 ([K, N])
 
     init = {i.name: i for i in quantized.graph.initializer}
@@ -398,6 +402,10 @@ def test_static_quantize_matmul_pass_fires_and_matches_scheme():
 
     wq = numpy_helper.to_array(init[wdq_node.input[0]])
     ws = numpy_helper.to_array(init[wdq_node.input[1]])
+    wzp = numpy_helper.to_array(init[wdq_node.input[2]])
+    assert wzp.dtype == np.int8
+    assert wzp.shape == ws.shape
+    assert bool((wzp == 0).all())
     expected_wq, expected_ws = _quantize_weight_per_channel(weight)
     np.testing.assert_array_equal(wq, expected_wq)
     np.testing.assert_allclose(ws, expected_ws, rtol=1e-6)

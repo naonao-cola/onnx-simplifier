@@ -35566,10 +35566,10 @@ def _quantize_static_conv_weight(W, spatial=8):
     """Runs the REAL ``onnxsim.quantize_static`` tool on a minimal
     ``Y = Conv(X, W)`` wrapper model and returns the genuine per-channel
     symmetric int8 ``(Wq[M,C,kH,kW], Wscale[M])`` pair it emits for `W` --
-    never a hand-rolled re-implementation. ``zero_point`` is never emitted
-    for a QDQ weight by this repo's own ``quantize_static`` (always
-    symmetric -- see this module's own "QDQ" section top comment), so this
-    returns only the two-tuple. Mirrors
+    never a hand-rolled re-implementation. The weight's own ``zero_point``
+    (an explicit all-zeros INT8 tensor since the explicit-zp change -- same
+    shape as the scale) is validated but not returned: the QDQ fixtures
+    below only need the codes and the scale, mirroring
     `_quantize_dynamic_conv_weight` (this file's own ConvInteger-section
     analogue) exactly, just against the static tool.
     """
@@ -35593,10 +35593,15 @@ def _quantize_static_conv_weight(W, spatial=8):
         for n in q.graph.node
         if n.op_type == "DequantizeLinear" and n.output[0] == w_name
     )
-    assert len(dq.input) == 2  # symmetric -- no zero_point, see above
+    assert len(dq.input) in (2, 3)  # symmetric: zero_point omitted or explicit zeros
     inits = {t.name: t for t in q.graph.initializer}
     Wq = onnx.numpy_helper.to_array(inits[dq.input[0]]).copy()
     Wscale = onnx.numpy_helper.to_array(inits[dq.input[1]]).copy()
+    if len(dq.input) == 3 and dq.input[2]:
+        Wzp = onnx.numpy_helper.to_array(inits[dq.input[2]])
+        assert Wzp.dtype == np.int8
+        assert Wzp.shape == Wscale.shape
+        assert bool((Wzp == 0).all())
     return Wq, Wscale
 
 
