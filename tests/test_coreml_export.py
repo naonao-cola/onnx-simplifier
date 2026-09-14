@@ -390,6 +390,21 @@ def test_dequantize_linear_wiring_and_shape():
     assert tuple(prog.functions["main"].outputs[0].shape) == (3,)
 
 
+def test_concat_drops_inputs_empty_along_its_axis():
+    # Concatenating an empty input along the concat axis is a no-op --
+    # dropping it is semantics-preserving, and backends have been observed
+    # to miscompile the pattern (Phi-3's full-rotary `[96:96]`-of-96 empty
+    # pass-through slice concatenated back: E5RT/MPS derives a 97-dim input
+    # and fails plan build on an ORT-verified-valid model).
+    model = _model(
+        "ccat (float[1,2,4] x, float[1,0,4] e) => (float[1,2,4] y) "
+        "{ y = Concat <axis=1> (x, e) }",
+    )
+    prog, _ = coreml_export._build_mil_program(model, *coreml_export._import_mil())
+    assert [op.op_type for op in prog.functions["main"].operations] == ["identity"]
+    assert tuple(prog.functions["main"].outputs[0].shape) == (1, 2, 4)
+
+
 def test_pad_reflect_matches_onnxruntime():
     x = np.arange(12, dtype=np.float32).reshape(1, 1, 3, 4)
     pads = np.array([0, 0, 1, 1, 0, 0, 1, 1], np.int64)
