@@ -142,3 +142,65 @@ def test_every_segment_but_the_first_is_marked_by_a7():
         _, segments = mcode.segments(blob)
         for pos, _, _ in segments[1:]:
             assert any(pos + d in at for d in range(-4, 5)), (name, pos)
+
+
+# Quintets per committed stream -- `[04][a][b][a][b]` units, counted with the
+# form admitted (see `test_quintet_programs_its_pair_twice`).
+_Q_COUNTS = {
+    "conv64_k5_d2": 0,
+    "conv128_k7_d12": 8,
+    "piper_vocoder": 86,
+    "w2v2fe_training_step": 76,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_quintet_programs_its_pair_twice(name):
+    """A five-byte `[04][a][b][a][b]` unit: the last two payload bytes repeat
+    the middle two. Found by clustering the unexplained bytes of 68 real
+    streams from an AX650N -- the `05`-led six-byte gaps resolve into clean
+    parses once these are admitted -- and validated the way every other form
+    was: it fires thousands of times on real streams, a handful on shuffled
+    ones, and only where no other form matches, so no stream regresses. See
+    the README's "A five-byte form that programs its pair twice" section."""
+    blob = _blob(name)
+    lo, hi = mcode.stream_bounds(blob)
+    toks = mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    quintets = [t for t in toks if t[1] == "Q"]
+    assert len(quintets) == _Q_COUNTS[name], (name, len(quintets))
+    for o, _, a, b, _ in quintets:
+        assert (blob[o], blob[o + 1], blob[o + 2], blob[o + 3], blob[o + 4]) == (
+            0x04,
+            a,
+            b,
+            a,
+            b,
+        )
+        # Neither slot is a verb byte: a quintet can never split a verb the
+        # way a short unit ending in `a1 00` splits one beginning there.
+        assert a not in mcode.VERBS6 and b not in mcode.VERBS6, (name, o)
+    records = mcode.decode(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    assert [(r["a"], r["b"]) for r in records if r["kind"] == "Q"] == [
+        (a, b) for _, _, a, b, _ in quintets
+    ]
+
+    # Admitting the form buys coverage, and only where it fires.
+    without = dict(mcode.FULL_RULE)
+    without["quintet"] = False
+    covered_without, _ = mcode.nonzero_coverage(blob, **without)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    if _Q_COUNTS[name]:
+        assert covered_with > covered_without, (name, covered_without, covered_with)
+    else:
+        assert covered_with == covered_without, (name, covered_without, covered_with)
+
+    # The shuffle control: far fewer quintets by chance than by structure.
+    bulk = bytearray(blob[lo:hi])
+    random.Random(0).shuffle(bulk)
+    shuffled = bytes(blob[:lo]) + bytes(bulk) + bytes(blob[hi:])
+    null = sum(
+        1
+        for t in mcode.tokenize(shuffled, start=lo, end=hi, **mcode.FULL_RULE)
+        if t[1] == "Q"
+    )
+    assert null <= max(2, len(quintets) // 4), (name, len(quintets), null)

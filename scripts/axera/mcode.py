@@ -57,9 +57,12 @@ FULL_RULE = dict(
     verbs=VERBS6,
     odd_tags={0xC1, 0xE1},
     companion=True,
+    quintet=True,
 )
 """Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
-six verbs -- the README's "The tail is the segment table" section."""
+six verbs -- the README's "The tail is the segment table" section -- plus
+the `[04][a][b][a][b]` quintet ("A five-byte form that programs its pair
+twice")."""
 
 TAIL_VECTOR = bytes.fromhex("05000000200000002c000000500000007400000098000000")
 """The FlatBuffers vector of five table offsets that opens an mcode blob's
@@ -77,6 +80,7 @@ def tokenize(
     verbs=None,
     odd_tags=frozenset(),
     companion=False,
+    quintet=False,
 ):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
@@ -86,7 +90,10 @@ def tokenize(
     sixth correction: tag 0x9f). Returns `(byte_offset, kind, a, b, c)`
     tuples: kind 'V' (a=verb, b=xx, c=yy), 'S' (a=prefix, b=tag, c=first
     payload byte), 'B' (a=tag, b=register), 'W' (a companion write:
-    a=X, b=field, c=bank) or '?' (a=byte). The defaults
+    a=X, b=field, c=bank), 'Q' (a quintet `[04][a][b][a][b]`: a five-byte
+    unit repeating its last two payload bytes -- see the README's "A
+    five-byte form that programs its pair twice" section) or '?' (a=byte).
+    The defaults
     (tags 0x81..0x84, p <= 3, no bare pairs, no extra bytes, stop 252 bytes
     before the end) are the original narrow rule; `tags=ALL_TAGS, pmax=4,
     bare=True, extra_byte_tags={0x9F}` is the corrected one. See the
@@ -131,6 +138,23 @@ def tokenize(
             return p + 4 + (1 if mcode[i + p + 2] in extra_byte_tags else 0)
         return 0
 
+    def quintet_at(i):
+        """A 5-byte `[04][a][b][a][b]` unit -- the last two payload bytes
+        repeat the middle two. It fires only where no other form matches
+        (0x04 is not a verb, a tag, or a valid width prefix with a tag at
+        +6 -- that check runs first), so admitting it can only convert raw
+        escapes, never steal a recognised unit. Across 68 real streams no
+        (a, b) pair contains a verb byte, so it has never split one either.
+        See the README's "A five-byte form that programs its pair twice"
+        section."""
+        return (
+            quintet
+            and i + 4 < len(mcode)
+            and mcode[i] == 0x04
+            and mcode[i + 1] == mcode[i + 3]
+            and mcode[i + 2] == mcode[i + 4]
+        )
+
     out, i = [], start
     while i < end:
         if companion_at(i):
@@ -150,6 +174,9 @@ def tokenize(
         elif short_len(i):
             n = short_len(i)
             out.append((i, "S", mcode[i], mcode[i + n - 2], mcode[i + 1]))
+        elif quintet_at(i):
+            n = 5
+            out.append((i, "Q", mcode[i + 1], mcode[i + 2], 0))
         elif bare and i + 1 < end and mcode[i] in tags and mcode[i + 1] % 2 == 0:
             n = 2 + (1 if mcode[i] in extra_byte_tags else 0)
             out.append((i, "B", mcode[i], mcode[i + 1], 0))
@@ -250,6 +277,7 @@ def decode(mcode, start=None, end=None, **rule):
     * `W`: a companion write (`x`, `field`, `bank`, `operand`)
     * `S`: a width-rule unit (`p`, `payload`, `tag`, `reg`, `extra`)
     * `B`: a bare `[tag][register]` pair (`tag`, `reg`, `extra`)
+    * `Q`: a quintet `[04][a][b][a][b]` (`a`, `b`)
     * `raw`: one byte no form accounts for (`byte`)
 
     Every record also carries `at`, its offset in the original stream, so
@@ -313,6 +341,8 @@ def decode(mcode, start=None, end=None, **rule):
                     "extra": mcode[o + 2 : o + n],
                 }
             )
+        elif kind == "Q":
+            out.append({"at": o, "kind": "Q", "a": t[2], "b": t[3]})
         else:
             out.append({"at": o, "kind": "raw", "byte": t[2]})
     return out
@@ -338,6 +368,8 @@ def encode(records):
             )
         elif kind == "B":
             out += bytes([r["tag"], r["reg"]]) + r["extra"]
+        elif kind == "Q":
+            out += bytes([0x04, r["a"], r["b"], r["a"], r["b"]])
         else:
             out += bytes([r["byte"]])
     return bytes(out)
