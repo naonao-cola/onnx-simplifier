@@ -55,6 +55,8 @@ def test_all_models_build_and_validate():
         "fc-4k",
         "cliff-64x32",
         "pointwise-48",
+        "big3x3-8x128",
+        "big3x3-4x256",
     }
     for name, bm in suite.items():
         onnx.checker.check_model(bm.model)

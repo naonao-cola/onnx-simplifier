@@ -137,7 +137,17 @@ def _pointwise(channels: int, size: int, layers: int, name: str) -> BenchmarkMod
     b = _Builder(seed=0)
     prev = "x"
     for i in range(layers):
-        prev = b.conv(prev, cin=channels, cout=channels, h=size, k=1, tag=f"{name}{i}")
+        prev = b.conv(prev, cin=channels, cout=channels, h=size, k=1, tag=f"{name}_{i}")
+    return b.finish(name, [1, channels, size, size], prev, [1, channels, size, size])
+
+
+def _dense(
+    channels: int, size: int, layers: int, name: str, k: int = 3
+) -> BenchmarkModel:
+    b = _Builder(seed=0)
+    prev = "x"
+    for i in range(layers):
+        prev = b.conv(prev, cin=channels, cout=channels, h=size, k=k, tag=f"{name}_{i}")
     return b.finish(name, [1, channels, size, size], prev, [1, channels, size, size])
 
 
@@ -148,11 +158,18 @@ def pointwise_8() -> BenchmarkModel:
 
 def dense3x3_6() -> BenchmarkModel:
     """6x dense 3x3 128ch/16px (approaches compute-bound on USB3)."""
-    b = _Builder(seed=0)
-    prev = "x"
-    for i in range(6):
-        prev = b.conv(prev, cin=128, cout=128, h=16, k=3, tag=f"d{i}")
-    return b.finish("dense3x3-6", [1, 128, 16, 16], prev, [1, 128, 16, 16])
+    return _dense(128, 16, 6, "dense3x3-6")
+
+
+def big3x3_8x128() -> BenchmarkModel:
+    """8x dense 3x3 128ch/64px (~4.8 GMAC): large-spatial efficiency probe."""
+    return _dense(128, 64, 8, "big3x3-8x128")
+
+
+def big3x3_4x256() -> BenchmarkModel:
+    """4x dense 3x3 256ch/64px (~9.7 GMAC): the peak sustained probe
+    (1.03 TOPS measured at max clocks)."""
+    return _dense(256, 64, 4, "big3x3-4x256")
 
 
 def mbblock_4() -> BenchmarkModel:
@@ -212,7 +229,16 @@ def pointwise_48() -> BenchmarkModel:
 
 
 def all_models() -> Dict[str, BenchmarkModel]:
-    builders = [pointwise_8, dense3x3_6, mbblock_4, fc_4k, cliff_64x32, pointwise_48]
+    builders = [
+        pointwise_8,
+        dense3x3_6,
+        mbblock_4,
+        fc_4k,
+        cliff_64x32,
+        pointwise_48,
+        big3x3_8x128,
+        big3x3_4x256,
+    ]
     return {m.name: m for m in (fn() for fn in builders)}
 
 
