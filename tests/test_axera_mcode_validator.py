@@ -647,3 +647,61 @@ def test_stutter_never_regresses_coverage(name):
     covered_plain, _ = mcode.nonzero_coverage(blob, **plain)
     covered_with, _ = mcode.nonzero_coverage(blob)
     assert covered_with >= covered_plain, (name, covered_plain, covered_with)
+
+
+# N-token counts per committed stream -- six-byte `09 0c 80 fe 01 01`
+# prefixes under `a1 00 d0 0c` verbs (see `test_six_byte_prefix`).
+_N_COUNTS = {
+    "conv64_k5_d2": 0,
+    "conv128_k7_d12": 0,
+    "piper_vocoder": 0,
+    "w2v2fe_training_step": 7,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_six_byte_prefix(name):
+    """A six-byte `09 0c 80 fe 01 01` prefix, always followed by an
+    `a1 00 d0 0c` verb (all 2,741 occurrences corpus-wide, zero shuffled
+    counterparts): a third prefix length alongside the two- and four-byte
+    ones, with the same positional anchor. Its head opens no other form and
+    the anchored verb parses identically after it, so it converts only raw
+    escapes. See the README's "A six-byte prefix" section."""
+    blob = _blob(name)
+    lo, hi = mcode.stream_bounds(blob)
+    toks = mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    takes = [t for t in toks if t[1] == "N"]
+    assert len(takes) == _N_COUNTS[name], (name, len(takes))
+    for o, _, _, _, _ in takes:
+        assert bytes(blob[o : o + 6]) == bytes([0x09, 0x0C, 0x80, 0xFE, 0x01, 0x01]), (
+            name,
+            o,
+        )
+        assert bytes(blob[o + 6 : o + 10]) == bytes([0xA1, 0x00, 0xD0, 0x0C]), (
+            name,
+            o,
+        )
+    records = mcode.decode(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    assert [r["kind"] for r in records if r["kind"] == "N"] == ["N"] * len(takes)
+    assert mcode.encode(records) == blob[lo:hi]
+
+    # Admitting the form buys coverage where it fires, and nowhere else.
+    without = dict(mcode.FULL_RULE)
+    without["nprefix"] = False
+    covered_without, _ = mcode.nonzero_coverage(blob, **without)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    if _N_COUNTS[name]:
+        assert covered_with > covered_without, (name, covered_without, covered_with)
+    else:
+        assert covered_with == covered_without, (name, covered_without, covered_with)
+
+    # The anchored template never occurs by chance.
+    bulk = bytearray(blob[lo:hi])
+    random.Random(0).shuffle(bulk)
+    shuffled = bytes(blob[:lo]) + bytes(bulk) + bytes(blob[hi:])
+    null = sum(
+        1
+        for t in mcode.tokenize(shuffled, start=lo, end=hi, **mcode.FULL_RULE)
+        if t[1] == "N"
+    )
+    assert null == 0, (name, null)

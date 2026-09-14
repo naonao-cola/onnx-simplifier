@@ -67,12 +67,14 @@ FULL_RULE = dict(
     c1five=True,
     repeat=True,
     stutter=True,
+    nprefix=True,
 )
 """Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
 six verbs -- the README's "The tail is the segment table" section -- plus
 the `[04][a][b][a][b]` quintet ("A five-byte form that programs its pair
-twice"), the bookend pairs ("Bookend pairs: a two-byte prefix class"), the
-fixed head with a live tail ("A fixed head with a live tail"), the two
+twice"), the bookend pairs ("Bookend pairs: a two-byte prefix class"), a
+six-byte prefix ("A six-byte prefix"), the fixed head with a live tail
+("A fixed head with a live tail"), the two
 adjudicated templates ("An eight-byte template with a fused tail"), the
 `0xc1` five ("The `0xc1` five"), the second repeat form ("A second
 repeat form") and the stuttered pair ("The stuttered pair").
@@ -106,6 +108,7 @@ def tokenize(
     c1five=False,
     repeat=False,
     stutter=False,
+    nprefix=False,
 ):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
@@ -120,7 +123,8 @@ def tokenize(
     five-byte form that programs its pair twice" section), 'P' (a `0b 91`
     prefix under its anchored verb), 'D' (a raw-on-both-bytes `05 90`
     doublet -- both see the README's "Bookend pairs: a two-byte prefix
-    class" section), 'F' (a fixed `01 a4 00 c1 W` unit: the middle never
+    class" section), 'N' (a six-byte `09 0c 80 fe 01 01` prefix under its
+    anchored verb -- see "A six-byte prefix"), 'F' (a fixed `01 a4 00 c1 W` unit: the middle never
     varies, only the last byte does), 'X' (a four-byte `05 10 e2 0e` verb
     prefix -- both see the README's "A fixed head with a live tail"
     section), 'E' (an octet `04 40 84 18 83 R TT 40`, taken only when the
@@ -287,6 +291,7 @@ def tokenize(
         """A two-byte prefix standing immediately before the unit it
         modifies: `05 90`, always raw on both bytes, or `0b 91`, always raw
         and always followed by an `a1 00 b0 03` verb. Neither byte can open
+        and always followed by an `a1 00 b0 03` verb. Neither byte can open
         any other form (both heads are outside the verb, tag and prefix
         sets), and the guards hold the bytes they absorb to otherwise-raw
         ones -- `05 90` only when no bare pair starts at the `90` (its
@@ -308,6 +313,28 @@ def tokenize(
             and mcode[i + 4] == 0xB0
             and mcode[i + 5] == 0x03
             and not companion_at(i + 1)
+        )
+
+    def nprefix_at(i):
+        """A six-byte `09 0c 80 fe 01 01` prefix, always followed by an
+        `a1 00 d0 0c` verb (all 2,741 occurrences corpus-wide, zero shuffled
+        counterparts). Like the two-byte prefixes, its head opens no other
+        form and the anchored verb parses identically after it, so it
+        converts only raw escapes. See the README's "A six-byte prefix"
+        section."""
+        return (
+            nprefix
+            and i + 11 < len(mcode)
+            and mcode[i] == 0x09
+            and mcode[i + 1] == 0x0C
+            and mcode[i + 2] == 0x80
+            and mcode[i + 3] == 0xFE
+            and mcode[i + 4] == 0x01
+            and mcode[i + 5] == 0x01
+            and mcode[i + 6] == 0xA1
+            and mcode[i + 7] == 0
+            and mcode[i + 8] == 0xD0
+            and mcode[i + 9] == 0x0C
         )
 
     def fixed5_at(i):
@@ -370,6 +397,8 @@ def tokenize(
         if pair_prefix_at(i):
             kind = "P" if mcode[i] == 0x0B else "D"
             return (i, kind, mcode[i], mcode[i + 1], 0), i + 2
+        if nprefix_at(i):
+            return (i, "N", 0, 0, 0), i + 6
         if fixed5_at(i):
             return (i, "F", mcode[i + 4], 0, 0), i + 5
         if vprefix_at(i):
@@ -559,6 +588,8 @@ def decode(mcode, start=None, end=None, **rule):
     * `Q`: a quintet `[04][a][b][a][b]` (`a`, `b`)
     * `P`: a `0b 91` prefix under its anchored verb (`x`, `y`)
     * `D`: a `05 90` doublet, raw on both bytes (`x`, `y`)
+    * `N`: a six-byte `09 0c 80 fe 01 01` prefix under its anchored verb
+      (no payload)
     * `F`: a fixed `01 a4 00 c1 W` unit (`w`: the one live byte)
     * `X`: a `05 10 e2 0e` prefix under its anchored verb (no payload)
     * `E`: an octet `04 40 84 18 83 R TT 40`, taken only by adjudication
@@ -637,6 +668,8 @@ def decode(mcode, start=None, end=None, **rule):
             out.append({"at": o, "kind": "Q", "a": t[2], "b": t[3]})
         elif kind in ("P", "D"):
             out.append({"at": o, "kind": kind, "a": t[2], "b": t[3]})
+        elif kind == "N":
+            out.append({"at": o, "kind": "N"})
         elif kind == "F":
             out.append({"at": o, "kind": "F", "w": t[2]})
         elif kind == "X":
@@ -682,6 +715,8 @@ def encode(records):
             out += bytes([0x04, r["a"], r["b"], r["a"], r["b"]])
         elif kind in ("P", "D"):
             out += bytes([r["a"], r["b"]])
+        elif kind == "N":
+            out += bytes([0x09, 0x0C, 0x80, 0xFE, 0x01, 0x01])
         elif kind == "F":
             out += bytes([0x01, 0xA4, 0x00, 0xC1, r["w"]])
         elif kind == "X":
