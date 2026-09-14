@@ -69,6 +69,7 @@ FULL_RULE = dict(
     stutter=True,
     nprefix=True,
     terminal=True,
+    trailer=True,
 )
 """Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
 six verbs -- the README's "The tail is the segment table" section -- plus
@@ -79,7 +80,8 @@ six-byte prefix ("A six-byte prefix"), the fixed head with a live tail
 adjudicated templates ("An eight-byte template with a fused tail"), the
 `0xc1` five ("The `0xc1` five"), the second repeat form ("A second
 repeat form"), the stuttered pair ("The stuttered pair") and the terminal
-`0b 01` pair ("A terminal pair before the padding").
+`0b 01` pair ("A terminal pair before the padding"), plus the abutting
+trailer single ("Trailer singles abutting the next segment").
 `lookahead` adjudicates the overlaps the greedy walk cannot see past
 ("Adjudicating the overlaps ..."); 64 bytes is where the corpus-wide
 gain converges (32 is slightly worse, 128 no better)."""
@@ -112,6 +114,7 @@ def tokenize(
     stutter=False,
     nprefix=False,
     terminal=False,
+    trailer=False,
 ):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
@@ -140,7 +143,9 @@ def tokenize(
     unit -- see "A second repeat form"),     'Y' (a stuttered `90 03` echo
     after a short unit ending in it -- see "The stuttered pair"), 'L' (a
     terminal `0b 01` pair closing an S-unit rhythm before zero padding --
-    see "A terminal pair before the padding") or '?'
+    see "A terminal pair before the padding"), 'A' (a lone trailer single
+    abutting the next segment's `a7` marker -- see "Trailer singles
+    abutting the next segment") or '?'
     (a=byte).
 
     Where a short unit ending in `a1 00` overlaps a verb beginning there,
@@ -399,6 +404,26 @@ def tokenize(
             and mcode[i + 2 : i + 10] == b"\x00" * 8
         )
 
+    def trailer_single_at(i):
+        """A lone trailer single abutting the next segment's `a7` marker:
+        two zero bytes immediately before it, the `a7 00` marker head
+        immediately after, and a value in the corpus-observed set
+        {0x23, 0x24, 0x26, 0x2B}. Device-mapped (zeroing faults the NPU),
+        36 exact recurrences corpus-wide against zero shuffled
+        counterparts, and its head opens no other form, so it converts
+        only raw escapes. See the README's "Trailer singles abutting the
+        next segment" section."""
+        return (
+            trailer
+            and i >= 2
+            and i + 3 < len(mcode)
+            and mcode[i] in (0x23, 0x24, 0x26, 0x2B)
+            and mcode[i - 2 : i] == b"\x00" * 2
+            and mcode[i + 1] == 0xA7
+            and mcode[i + 2] == 0
+            and mcode[i + 3] % 0x10 == 0
+        )
+
     def _plain_step(i):
         """One greedy step: `(token, next offset)`, no adjudication. With
         `lookahead=0` the walk below is exactly this step repeated, byte for
@@ -425,6 +450,8 @@ def tokenize(
             return (i, kind, mcode[i], mcode[i + 1], 0), i + 2
         if terminal_at(i):
             return (i, "L", 0, 0, 0), i + 2
+        if trailer_single_at(i):
+            return (i, "A", mcode[i], 0, 0), i + 1
         if nprefix_at(i):
             return (i, "N", 0, 0, 0), i + 6
         if fixed5_at(i):
@@ -631,6 +658,8 @@ def decode(mcode, start=None, end=None, **rule):
       (`a`, `b`)
     * `L`: a terminal `0b 01` pair closing an S-unit rhythm before zero
       padding (no payload)
+    * `A`: a lone trailer single abutting the next segment's `a7`
+      marker (`v`: the value byte)
     * `raw`: one byte no form accounts for (`byte`)
 
     Every record also carries `at`, its offset in the original stream, so
@@ -718,6 +747,8 @@ def decode(mcode, start=None, end=None, **rule):
             out.append({"at": o, "kind": "Y", "a": t[2], "b": t[3]})
         elif kind == "L":
             out.append({"at": o, "kind": "L"})
+        elif kind == "A":
+            out.append({"at": o, "kind": "A", "v": t[2]})
         else:
             out.append({"at": o, "kind": "raw", "byte": t[2]})
     return out
@@ -765,6 +796,8 @@ def encode(records):
             out += bytes([r["a"], r["b"]])
         elif kind == "L":
             out += bytes([0x0B, 0x01])
+        elif kind == "A":
+            out += bytes([r["v"]])
         else:
             out += bytes([r["byte"]])
     return bytes(out)

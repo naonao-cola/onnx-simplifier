@@ -5358,11 +5358,24 @@ the `82 08` tail of a complete short unit stands immediately before it
 and eight zero bytes immediately after. It fires on eight of fourteen
 fixtures with zero shuffled counterparts anywhere, converts only raw
 escapes (decode records are byte-identical everywhere else -- pure
-addition, no stream regresses), and round-trips exactly. The two
-sub-floor Reshape streams improve (93.4% to 93.7%, 93.8% to 94.0%)
-with their remaining singles still pinned. The lone `08` stays
-unformed: its acceptance set (`{00,01,08,0a,0b,0f,88}`, rejecting only
-`09`) admits no clean gate, so pinning exact `08` would over-claim.
+addition, no stream regresses), and round-trips exactly. The lone `08`
+stays unformed: its acceptance set (`{00,01,08,0a,0b,0f,88}`,
+rejecting only `09`) admits no clean gate, so pinning exact `08` would
+over-claim.
+
+### Trailer singles abutting the next segment
+
+A census over every non-final segment of 62 streams finds the terminal
+pair has company: 36 lone value bytes in `{0x23, 0x24, 0x26, 0x2B}`,
+each with two zero bytes before it and abutting the next segment's
+`a7` marker head. Zeroing one faults the NPU -- the same live-trailer
+verdict as the `0b 01` pair, at 20× and 8× the two most frequent
+values -- so it is admitted with exactly those guards (zero shuffled
+counterparts, pure addition, exact round-trips), firing 1--4× on all
+fourteen fixtures. The last sub-floor stream but one crosses the floor
+on it; one Reshape stream remains pinned with its leftover singles.
+The `09`-hole and the sibling 0b-led/0b-terminated runs stay open
+work.
 
 ### A five-byte form that programs its pair twice
 
