@@ -284,7 +284,17 @@ AX650_CONFIRMED_BROKEN_OPS: Dict[str, str] = {
     "Xor": "KeyError('dont support Xor opr in AXOPS/ONNXOPS/CUSTOM_OPS')",
     "Squeeze": (
         "internal compiler bug: ZeroDivisionError('division by zero') in "
-        "the NPU backend scheduler (confirmed for a (1,4)->(4,) reshape)"
+        "the NPU backend scheduler (confirmed for a (1,4)->(4,) reshape on "
+        "6.0-lite, and again for a (1,8,1,1)->(1,8) Squeeze and an "
+        "equivalent static Reshape on 7.0-lite) -- but ONLY when the "
+        "reshape-family node is scheduled standalone (graph output, or the "
+        "only node). Consumed by a fusable op it compiles fine: "
+        "Squeeze[1,512,1,1]->[1,512] + Gemm verified numerically on real "
+        "hardware (max|diff| 0.94 on a ~10.5 scale), fusing to FullyConnected, "
+        "and Reshape feeding MatMul/Gather/elementwise-Mul all build and run "
+        "clean. So this entry means 'verify the fusion context', not 'never "
+        "emits Squeeze/Reshape' -- a training step graph's forward Squeeze "
+        "into Gemm is safe; a terminal Reshape is not."
     ),
     "LpNormalization": "internal exception on a U8-quantized intermediate tensor",
     "RotaryEmbedding": (
@@ -425,6 +435,40 @@ def confirmed_broken_on_ax650(model: onnx.ModelProto) -> Dict[str, str]:
         node.op_type: AX650_CONFIRMED_BROKEN_OPS[node.op_type]
         for node in model.graph.node
         if node.op_type in AX650_CONFIRMED_BROKEN_OPS
+    }
+
+
+#: Op types NOT in `AX650_SUPPORTED_OPS` (Axera's docs don't list them) that
+#: this project confirmed working anyway, via a real single-node-per-op
+#: `pulsar2:7.0-lite` build plus a real AX650N run against an ORT-fp32
+#: reference -- the mirror of `AX650_CONFIRMED_BROKEN_OPS` for the
+#: docs-silent direction. Values are the confirmed evidence, kept so the
+#: "confirmed" here stays as auditable as the broken list's failure modes.
+AX650_CONFIRMED_WORKING_OPS: Dict[str, str] = {
+    "Neg": (
+        "single-node battery ([1,8] float): builds, runs, max|diff| 0.24 on "
+        "a ~2.6 scale vs ORT fp32; also exercised in composition inside the "
+        "KD soft-loss head (Softmax/Log/Mul/ReduceSum/Neg) at max|diff| 0.012"
+    ),
+    "Log": (
+        "single-node battery ([1,8] float over [0.5, 2.0)): builds, runs, "
+        "max|diff| 0.004 vs ORT fp32; also exercised in composition inside "
+        "the KD soft-loss head at max|diff| 0.012"
+    ),
+}
+
+
+def confirmed_working_on_ax650(model: onnx.ModelProto) -> Set[str]:
+    """Op types in `model` that are absent from Axera's published
+    `AX650_SUPPORTED_OPS` but confirmed working on real hardware anyway
+    (see `AX650_CONFIRMED_WORKING_OPS`). Used to keep
+    `unsupported_on_ax650()`-based warnings honest: a hit here is verified,
+    not "untested."
+    """
+    return {
+        node.op_type
+        for node in model.graph.node
+        if node.op_type in AX650_CONFIRMED_WORKING_OPS
     }
 
 

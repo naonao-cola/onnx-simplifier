@@ -7124,6 +7124,39 @@ of range')`) -- a second real, distinct internal issue, not chased further
 here since this is an exotic, rarely-relevant op for this project's
 CNN/LLM focus.
 
+## Backward-graph ops: Neg/Log verified, reshape needs a fusable consumer
+
+The distillation training step graph (`tools/onnx-finetune/scripts/
+generate_distillation_step_graph.py` output, the object under test for
+on-device training) is 2312 nodes, of which static coverage flagged only
+`Neg` x22, `Log` x2 and `Squeeze` x1 -- the rest was already eligible.
+A focused single-node-per-op battery plus backward-slice probes
+(`pulsar2:7.0-lite` build, real AX650N run vs ORT fp32) closed the first
+two and refined the third:
+
+- **`Neg`/`Log`: confirmed working** despite being absent from Axera's
+  published list -- recorded in `pulsar2_ops.AX650_CONFIRMED_WORKING_OPS`,
+  which `op_coverage.classify()` treats as eligible and
+  `ax650_build_risks()` no longer warns about. Single-node numerics:
+  Neg max|diff| 0.24 (scale ~2.6), Log 0.004; the full KD soft-loss head
+  (Split/Div/Softmax/Log/Mul/ReduceSum/Neg) at max|diff| 0.012.
+- **Reshape-family (Reshape/Squeeze with shape/axes inputs): compiles
+  only with a consumer.** Standalone (graph output) it hits the same NPU
+  scheduler `ZeroDivisionError` as the documented Squeeze bug, on 7.0 as
+  on 6.0. Consumed, everything builds and runs: Squeeze+Gemm (fuses to
+  FullyConnected, max|diff| 0.94), Reshape+MatMul (0.023),
+  Reshape+Gather (0.005), Reshape+elementwise-Mul (0.005). The step
+  graph's forward Squeeze feeds a Gemm, so it is safe; a terminal
+  Reshape would not be -- the `Squeeze` entry in
+  `AX650_CONFIRMED_BROKEN_OPS` now says exactly this.
+- **Two blockers for compiling a full step graph, both open:** a scalar
+  (rank-0) graph output crashes Pulsar2's quantizer (`zero-dimensional
+  tensor cannot be concatenated` -- the loss would need to stay `[1,1]`),
+  and the Adam update's `Sub` (full-scale weights minus lr-scaled step,
+  ~4400x scale ratio) fails NPU tiling (`TileFailException:
+  AxQuantizedSub`). The latter likely wants a precision-config answer
+  (per-layer float), not a graph rewrite.
+
 ## Files
 
 | file | purpose |

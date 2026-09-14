@@ -45,6 +45,7 @@ from pulsar2_ops import (
     blocking_op_types,
     blocking_ops,
     confirmed_broken_on_ax650,
+    confirmed_working_on_ax650,
     has_out_of_band_npu_data,
     missing_npu_data,
     opset_version,
@@ -106,7 +107,10 @@ def ax650_build_risks(model: onnx.ModelProto) -> List[str]:
     reject `model` outright, confirmed against the real toolchain + device:
 
     - an op type outside `pulsar2_ops.AX650_SUPPORTED_OPS` (confirmed for
-      `LRN`: a hard frontend parse failure, not a graceful CPU fallback);
+      `LRN`: a hard frontend parse failure, not a graceful CPU fallback) --
+      except ops in `pulsar2_ops.AX650_CONFIRMED_WORKING_OPS`, which this
+      project verified on real hardware despite their absence from Axera's
+      list;
     - an op type confirmed broken *despite* being listed in
       `pulsar2_ops.AX650_SUPPORTED_OPS` (`pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS`
       -- 7 ops confirmed via a real single-node-per-op hardware sweep, see
@@ -118,7 +122,9 @@ def ax650_build_risks(model: onnx.ModelProto) -> List[str]:
     found none of the specific risks it currently knows to check for.
     """
     risks = []
-    unsupported = sorted(unsupported_on_ax650(model))
+    unsupported = sorted(
+        set(unsupported_on_ax650(model)) - confirmed_working_on_ax650(model)
+    )
     if unsupported:
         note = (
             " -- LRN specifically is a confirmed hard build failure, not a "
