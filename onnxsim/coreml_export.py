@@ -1387,6 +1387,7 @@ def _build_mil_program(
     matmul_to_conv: bool = False,
     opset_version: Optional[Any] = None,
     io_dtype: Optional[str] = None,
+    state: Optional[Dict[str, str]] = None,
 ):
     graph = model.graph
     initializer_names = {t.name for t in graph.initializer}
@@ -1397,6 +1398,25 @@ def _build_mil_program(
 
     lowerer = _Lowerer(mb=mb, types=types, opset=opset, matmul_to_conv=matmul_to_conv)
 
+    # `{state input name: state output name}` -- graph inputs held resident
+    # on-device across predict() calls (Core ML states) instead of crossing
+    # the boundary every call. The matching outputs are written back into
+    # the states and dropped from the model interface.
+    state = state or {}
+    state_inputs = set(state)
+    state_outputs = set(state.values())
+    graph_inputs = {i.name for i in graph.input} - initializer_names
+    for name in state_inputs:
+        if name not in graph_inputs:
+            raise RuntimeError(
+                f"state input {name!r} is not a graph input (states can only "
+                "wrap model inputs, never initializers or intermediates)."
+            )
+    graph_output_names = {o.name for o in graph.output}
+    for name in state_outputs:
+        if name not in graph_output_names:
+            raise RuntimeError(f"state output {name!r} is not a graph output.")
+
     dynamic_shapes = dynamic_shapes or {}
     range_dims: Dict[str, Any] = {}
     input_specs = {}
@@ -1404,6 +1424,25 @@ def _build_mil_program(
     graph_dtypes: Dict[str, Any] = {}
     for inp in graph.input:
         if inp.name in initializer_names:
+            continue
+        if inp.name in state_inputs:
+            # Resident weight: states only support fp16, so declare fp16 and
+            # cast back to the graph dtype at the boundary -- the same shape
+            # as the io_dtype boundary-cast pattern below. States need fully
+            # static shapes (a state is a fixed on-device buffer).
+            dims = []
+            for d in inp.type.tensor_type.shape.dim:
+                if not d.HasField("dim_value"):
+                    raise RuntimeError(
+                        f"State input '{inp.name}' has a non-static dimension; "
+                        "Core ML states are fixed on-device buffers, so state "
+                        "inputs must be fully static."
+                    )
+                dims.append(int(d.dim_value))
+            input_specs[inp.name] = mb.StateTensorSpec(tuple(dims), dtype=types.fp16)
+            graph_dtypes[inp.name] = _onnx_elem_type_to_mil(
+                inp.type.tensor_type.elem_type, types
+            )
             continue
         spec, ct_input = _make_input_spec(
             inp, mb, types, dynamic_shapes, range_dims, RangeDim, TensorType, io_dtype
@@ -1416,7 +1455,14 @@ def _build_mil_program(
             flexible_inputs.append(ct_input)
 
     with Function(input_specs, opset_version=opset_version) as func:
+        state_vars: Dict[str, Any] = {}
         for name, var in func.inputs.items():
+            if name in state_inputs:
+                state_vars[name] = var
+                var = mb.read_state(
+                    input=var,
+                    name=lowerer.fresh_io_name(name, "read_state"),
+                )
             if var.dtype != graph_dtypes[name]:
                 # `io_dtype="fp16"` declared this input fp16 where the ONNX graph
                 # says fp32. Cast straight back at the boundary so every op below
@@ -1436,8 +1482,27 @@ def _build_mil_program(
             )
         for node in graph.node:
             lowerer.lower_node(node)
+        out_to_state = {v: k for k, v in state.items()}
         outputs = []
         for out in graph.output:
+            if out.name in out_to_state:
+                # Written back into the state instead of returned: the caller
+                # reads it via MLState, never over the predict() boundary.
+                # (The update's return value is deliberately left unconsumed;
+                # routing it into an output would re-send the state every
+                # call, which is exactly the traffic this drops.)
+                src = lowerer.get(out.name)
+                if src.dtype != types.fp16:
+                    src = mb.cast(
+                        x=src,
+                        dtype="fp16",
+                        name=lowerer.fresh_io_name(out.name, "to_state"),
+                    )
+                lowerer.mb.coreml_update_state(
+                    state=state_vars[out_to_state[out.name]],
+                    value=src,
+                )
+                continue
             var = lowerer.get(out.name)
             if io_dtype == "fp16" and var.dtype == types.fp32:
                 # Terminal cast: the Core ML model's declared output dtype is the
@@ -1445,6 +1510,11 @@ def _build_mil_program(
                 outputs.append(mb.cast(x=var, dtype="fp16", name=out.name))
             else:
                 outputs.append(mb.identity(x=var, name=out.name))
+        if not outputs:
+            raise RuntimeError(
+                "state= consumed every model output; at least one "
+                "non-state output (e.g. a loss) is required."
+            )
         func.set_outputs(outputs)
 
     prog = Program()
@@ -1505,6 +1575,26 @@ def _resolve_io_dtype(ct, io_dtype: Optional[str], convert_to: str, resolved_tar
     return "fp16", resolved_target
 
 
+def _resolve_state_target(ct, state, resolved_target):
+    """Bump the deployment floor to iOS18 when states are requested.
+
+    `read_state`/`coreml_update_state` only exist from the iOS18 op version
+    -- same pattern as the iOS16 fp16-I/O bump and the iOS17 QDQ bump.
+    """
+    if not state:
+        return resolved_target
+    floor = ct.target.iOS18
+    if resolved_target is None:
+        return floor
+    if int(resolved_target) < int(floor):
+        raise RuntimeError(
+            f"state= needs minimum_deployment_target iOS18/macOS15 or newer "
+            f"(got {resolved_target.name}); Core ML states did not exist "
+            "before then."
+        )
+    return resolved_target
+
+
 def _resolve_quantized_target(ct, model: onnx.ModelProto, resolved_target):
     """Bump the deployment floor to iOS17 when the graph holds QDQ nodes.
 
@@ -1542,6 +1632,7 @@ def convert_to_coreml(
     dynamic_shapes: Optional[Dict[str, Tuple[int, int, int]]] = None,
     matmul_to_conv: bool = False,
     io_dtype: Optional[str] = None,
+    state: Optional[Dict[str, str]] = None,
 ):
     """Convert an ONNX model to an in-memory Core ML model.
 
@@ -1618,6 +1709,18 @@ def convert_to_coreml(
         single decode step. Integer and bool inputs are unaffected (Core ML has
         no fp16 form for them). Requires ``convert_to="mlprogram"`` and raises
         ``minimum_deployment_target`` to iOS16/macOS13 when one isn't given.
+    state:
+        Hold graph inputs resident on-device across ``predict()`` calls
+        instead of sending them every call: ``{input name: output name}``
+        (the same shape as :class:`onnxsim.qat_graph.StepGraph`'s ``state``
+        mapping). Each named input becomes a Core ML state (fp16, static
+        shape required), each named output is written back into its state via
+        ``coreml_update_state`` and dropped from the model interface -- the
+        caller reads it back with ``MLState.read_state``, never over the
+        ``predict()`` boundary. ``None`` (the default) leaves the interface
+        alone. Requires ``convert_to="mlprogram"`` and raises
+        ``minimum_deployment_target`` to iOS18/macOS15 when one isn't given
+        (states did not exist before then).
 
     Returns
     -------
@@ -1653,6 +1756,7 @@ def convert_to_coreml(
         ct, io_dtype, convert_to, resolved_target
     )
     resolved_target = _resolve_quantized_target(ct, model, resolved_target)
+    resolved_target = _resolve_state_target(ct, state, resolved_target)
 
     prog, flexible_inputs = _build_mil_program(
         model,
@@ -1666,6 +1770,7 @@ def convert_to_coreml(
         matmul_to_conv,
         opset_version=resolved_target,
         io_dtype=io_dtype,
+        state=state,
     )
 
     kwargs: Dict[str, Any] = {}
@@ -1675,6 +1780,22 @@ def convert_to_coreml(
         kwargs["minimum_deployment_target"] = resolved_target
     if flexible_inputs is not None:
         kwargs["inputs"] = flexible_inputs
+    if state:
+        # `common::canonicalize_inplace_pattern` reorders `coreml_update_state`
+        # ops and crashes on clustered trailing updates (KeyError inserting
+        # before an already-removed op -- reproduced with a 12-state training
+        # step while smaller stateful graphs convert fine). The pass only
+        # canonicalizes update placement for memory reuse, so skipping it is
+        # functionally neutral; without it the stateful conversion below
+        # succeeds. Pinned by test (a coremltools rename would surface there,
+        # since `remove_passes` silently no-ops on unknown names).
+        from coremltools.converters.mil.mil.passes.pass_pipeline import (
+            PassPipeline,
+        )
+
+        pipeline = PassPipeline.get_pipeline("default")
+        pipeline.remove_passes({"common::canonicalize_inplace_pattern"})
+        kwargs["pass_pipeline"] = pipeline
 
     return ct.convert(
         prog,

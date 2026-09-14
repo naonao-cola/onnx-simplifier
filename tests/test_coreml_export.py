@@ -405,6 +405,77 @@ def test_concat_drops_inputs_empty_along_its_axis():
     assert tuple(prog.functions["main"].outputs[0].shape) == (1, 2, 4)
 
 
+def _sgd_model():
+    # One SGD step over a single [4] parameter: small enough to assert on
+    # structurally, big enough to carry a state input through.
+    return _model(
+        "sgd (float[4] w, float[4] g, float[1] lr) "
+        "=> (float[4] w_next, float[1] loss) "
+        "{ step = Mul (g, lr) "
+        "w_next = Sub (w, step) "
+        "sq = Mul (g, g) "
+        "loss = ReduceMean <keepdims=0> (sq) }"
+    )
+
+
+def test_stateful_export_reads_and_updates_state():
+    mb, types, Function, Program, RangeDim, TensorType = coreml_export._import_mil()
+    prog, _ = coreml_export._build_mil_program(
+        _sgd_model(),
+        mb,
+        types,
+        Function,
+        Program,
+        RangeDim,
+        TensorType,
+        opset_version=ct.target.iOS18,
+        state={"w": "w_next"},
+    )
+    func = prog.functions["main"]
+    op_types = [op.op_type for op in func.operations]
+    assert "read_state" in op_types
+    assert "coreml_update_state" in op_types
+    # The next-state output is written back, not returned: only the loss
+    # crosses the predict() boundary.
+    assert [o.name for o in func.outputs] == ["loss"]
+    assert set(func.inputs) == {"w", "g", "lr"}
+
+
+def test_stateful_export_rejects_unknown_names():
+    mb, types, Function, Program, RangeDim, TensorType = coreml_export._import_mil()
+    with pytest.raises(RuntimeError, match="not a graph input"):
+        coreml_export._build_mil_program(
+            _sgd_model(),
+            mb,
+            types,
+            Function,
+            Program,
+            RangeDim,
+            TensorType,
+            state={"nope": "w_next"},
+        )
+    with pytest.raises(RuntimeError, match="not a graph output"):
+        coreml_export._build_mil_program(
+            _sgd_model(),
+            mb,
+            types,
+            Function,
+            Program,
+            RangeDim,
+            TensorType,
+            state={"w": "nope"},
+        )
+
+
+def test_stateful_export_raises_deployment_floor_to_ios18():
+    resolve = coreml_export._resolve_state_target
+    assert resolve(ct, {"w": "w_next"}, None) == ct.target.iOS18
+    assert resolve(ct, None, None) is None
+    assert resolve(ct, {}, ct.target.iOS16) == ct.target.iOS16
+    with pytest.raises(RuntimeError, match="iOS18"):
+        resolve(ct, {"w": "w_next"}, ct.target.iOS16)
+
+
 def test_dynamic_range_converts_despite_ane_plan_build_rejection():
     # A `Range` with a runtime limit converts fine -- what E5RT's ANE plan
     # build rejects ("Invalid blob shape: Data-dependent shapes were

@@ -981,3 +981,31 @@ nothing measurable here because the weights still cross the boundary fp32
 every step; the win this unlocks is the one the previous section measured
 for inference (halved weight bytes fitting ANE capacity), now available to
 a training forward pass too.
+
+### Resident weights (`--resident`, Core ML states)
+
+The loop above still shuttles every parameter and moment through
+`predict()` twice per step (~50MB at S1). `export_coreml`'s `state`
+argument (also behind `--resident` here) holds them resident on-device
+instead, in Core ML states: each named input becomes an fp16 state read
+back at the boundary, each named output is written into its state via
+`coreml_update_state` and dropped from the interface, so only the batch,
+the target, the scalars -- and the loss -- cross per step (~2MB here).
+
+```bash
+python train_mlp_step_coreml.py --resident --compute-units CPU_ONLY \
+    --output mlp_step_resident.mlpackage
+```
+
+Measured on real hardware (same S1 MLP): loss 0.82 -> 0.37, tracking the
+shuttling runs, at **5.1ms/step vs. 9.7-10.3ms** -- the traffic win is
+real. Three platform facts came out of validating it: states are fp16-only
+(the weights live one rounding away from the fp32 masters -- convergence
+is unaffected); stateful conversion needs iOS18+ (raised automatically,
+like the other deployment floors); and ANE compilation rejects stateful
+programs on current macOS (`ANECCompile() FAILED`), so resident loops run
+CPU/GPU-side -- the GPU accepts them but slowly (105ms/step here), making
+CPU the best resident backend today. Conversion also drops one coremltools
+pass (`common::canonicalize_inplace_pattern`, which crashes reordering
+clustered trailing updates) -- canonicalization only, functionally
+neutral, pinned by test.

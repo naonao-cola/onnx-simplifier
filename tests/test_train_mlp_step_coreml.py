@@ -134,3 +134,34 @@ def test_qat_int8_step_graph_exports_to_coreml(tmp_path):
     out_path = str(tmp_path / "mlp_step_qat.mlpackage")
     onnxsim.export_coreml(step.model, out_path, skip_model_load=True)
     assert os.path.isdir(out_path)
+
+
+def test_resident_export_holds_state_and_returns_only_loss(tmp_path):
+    # The resident form drops next-state outputs (they persist in MLState)
+    # and only the loss crosses the boundary; needs no Apple hardware to
+    # check, only the MIL program.
+    from onnxsim import coreml_export
+
+    step = build_step(batch=8, dim=16, hidden=32, out=16)
+    out_path = str(tmp_path / "mlp_step_resident.mlpackage")
+    onnxsim.export_coreml(
+        step.model, out_path, skip_model_load=True, state=dict(step.state)
+    )
+    assert os.path.isdir(out_path)
+    mb, types, Function, Program, RangeDim, TensorType = coreml_export._import_mil()
+    prog, _ = coreml_export._build_mil_program(
+        step.model,
+        mb,
+        types,
+        Function,
+        Program,
+        RangeDim,
+        TensorType,
+        opset_version=ct.target.iOS18,
+        state=dict(step.state),
+    )
+    func = prog.functions["main"]
+    op_types = [op.op_type for op in func.operations]
+    assert "read_state" in op_types
+    assert "coreml_update_state" in op_types
+    assert [o.name for o in func.outputs] == [step.loss_name]
