@@ -1,0 +1,88 @@
+name: convertmodel WebGPU custom kernel dispatcher
+
+# Does onnxsim's "run a custom WebGPU kernel straight from the model's own
+# metadata" path actually work against a real WebGPU device?
+#
+#   * test/webgpu_kernel_dispatcher.test.mjs -- REQUIRED. Reads a hand-written
+#     WGSL elementwise-add kernel back out of webgpu_kernel_add.onnx's node
+#     metadata (via onnx_node_metadata.mjs's readWebgpuKernelSpecs, the same
+#     function a real runtime would call), dispatches it via
+#     webgpu_kernel_dispatcher.mjs against real GPU buffers, and checks the
+#     GPU output against a plain-JS a[i]+b[i] reference -- not just that
+#     nothing threw. Runs on a real GPU-backed browser for the same reason
+#     convertmodel-webgpu-demo.yml's jobs do (see that workflow's own
+#     comment): plain/headless Node has no navigator.gpu at all.
+#
+# onnx_node_metadata.test.mjs (the plain-Node half of this same feature,
+# proving the JS protobuf-field reader agrees with what
+# onnxsim/webgpu_kernel_metadata.py actually wrote) needs no browser and no
+# GPU, so it runs as part of `npm run test:all` / test:onnx-node-metadata,
+# not here.
+#
+# This only covers the standalone dispatch primitive -- there is no
+# onnxruntime-web session-splicing runtime yet (see
+# onnxsim/webgpu_kernel_metadata.py's docstring for that boundary), so
+# nothing here touches onnxruntime-web at all.
+#
+# Scheduled + on demand, plus on PRs that touch the files this check depends
+# on, same reasoning as convertmodel-webgpu-demo.yml / convertmodel-ep-placement.yml.
+
+on:
+  schedule:
+    - cron: "0 10 * * 1" # Mondays 10:00 UTC (weekly, offset from the other two WebGPU workflows)
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/convertmodel-webgpu-kernel-dispatcher.yml"
+      - "scripts/convertmodel/test/webgpu_kernel_dispatcher.test.mjs"
+      - "scripts/convertmodel/test/onnx_node_metadata.test.mjs"
+      - "scripts/convertmodel/test/make_webgpu_kernel_fixture.py"
+      - "scripts/convertmodel/test/webgpu_kernel_add.onnx"
+      - "scripts/convertmodel/test/webgpu_kernel_fixture.json"
+      - "scripts/convertmodel/onnx_node_metadata.mjs"
+      - "scripts/convertmodel/webgpu_kernel_dispatcher.mjs"
+      - "scripts/convertmodel/package.json"
+      - "onnxsim/webgpu_kernel_metadata.py"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  onnx-node-metadata:
+    name: ONNX node metadata reader (no browser)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Run the ONNX node metadata reader test
+        working-directory: scripts/convertmodel
+        run: npm run test:onnx-node-metadata
+
+  webgpu-kernel-dispatcher:
+    name: WebGPU custom kernel dispatch (required)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (onnxruntime-web, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the WebGPU custom kernel dispatcher check
+        working-directory: scripts/convertmodel
+        run: npm run test:webgpu-kernel-dispatcher

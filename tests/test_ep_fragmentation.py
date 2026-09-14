@@ -145,6 +145,29 @@ def test_estimate_webgpu_islands_clean_attention_is_one_island():
     assert report.flagged_node_names == []
 
 
+def test_estimate_webgpu_islands_conv3d_fragments_graph():
+    w = onnx.numpy_helper.from_array(
+        np.random.default_rng(0).standard_normal((4, 3, 3, 3, 3)).astype(np.float32),
+        "w",
+    )
+    model = _model(
+        """
+        g (float[1,3,8,8,8] x) => (float[1,4,6,6,6] y)
+        {
+          pre = Identity(x)
+          conv = Conv<kernel_shape = [3, 3, 3]>(pre, w)
+          y = Identity(conv)
+        }
+        """,
+        [w],
+    )
+    report = estimate_webgpu_islands(model)
+    # {pre} and {y} are split apart by the flagged 3-D Conv node.
+    assert report.island_count == 2
+    assert report.boundary_edge_count == 2
+    assert len(report.flagged_node_names) == 1
+
+
 def test_estimate_webnn_islands_non_constant_reshape_fragments_graph():
     model = _model(
         """

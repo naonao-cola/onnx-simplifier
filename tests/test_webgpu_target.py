@@ -115,6 +115,126 @@ def test_check_webgpu_attention_support_accepts_file_path(tmp_path):
     assert "mask_index" in messages[0]
 
 
+def _conv3d_model(op_type="Conv", via_kernel_shape=True, spatial=3):
+    # W has shape (out_channels, in_channels, *kernel_shape); rank - 2 gives
+    # the spatial rank either way (kernel_shape attribute or W's own shape).
+    out_c, in_c, k = 4, 3, 3
+    w_shape = (out_c, in_c) + (k,) * spatial
+    w = onnx.numpy_helper.from_array(
+        np.random.default_rng(0).standard_normal(w_shape).astype(np.float32), "w"
+    )
+    x_shape = [1, in_c] + [8] * spatial
+    y_shape = [1, out_c] + [6] * spatial
+    op = f"{op_type}<kernel_shape = {list((k,) * spatial)}>" if via_kernel_shape else op_type
+    return _model(
+        f"""
+        g (float{x_shape} x) => (float{y_shape} y)
+        {{
+          y = {op}(x, w)
+        }}
+        """,
+        [w],
+    )
+
+
+def test_check_webgpu_conv3d_support_flags_conv3d_via_kernel_shape():
+    model = _conv3d_model("Conv", via_kernel_shape=True)
+    messages = onnxsim.check_webgpu_conv3d_support(model)
+    assert len(messages) == 1
+    assert "Conv" in messages[0] and "spatial rank 3" in messages[0]
+
+
+def test_check_webgpu_conv3d_support_flags_conv3d_via_initializer_shape():
+    # No kernel_shape attribute at all -- rank must come from W's own shape.
+    model = _conv3d_model("Conv", via_kernel_shape=False)
+    messages = onnxsim.check_webgpu_conv3d_support(model)
+    assert len(messages) == 1
+
+
+def test_check_webgpu_conv3d_support_flags_conv_transpose_3d():
+    model = _conv3d_model("ConvTranspose", via_kernel_shape=True)
+    messages = onnxsim.check_webgpu_conv3d_support(model)
+    assert len(messages) == 1
+    assert "ConvTranspose" in messages[0]
+
+
+def test_check_webgpu_conv3d_support_ignores_conv2d():
+    model = _conv3d_model("Conv", via_kernel_shape=True, spatial=2)
+    assert onnxsim.check_webgpu_conv3d_support(model) == []
+
+
+def _resize_model(mode=None, scales=None):
+    op = f'Resize<coordinate_transformation_mode = "{mode}">' if mode else "Resize"
+    scales_input = ""
+    initializer = []
+    if scales is not None:
+        scales_input = "scales"
+        initializer.append(_f32(scales, "scales"))
+    return _model(
+        f"""
+        g (float[1,3,8,8] x) => (float[1,3,4,4] y)
+        {{
+          y = {op}(x, , {scales_input})
+        }}
+        """,
+        initializer,
+        opset=13,
+    )
+
+
+def test_check_webgpu_resize_support_flags_align_corners_downsample():
+    model = _resize_model("align_corners", [1.0, 1.0, 0.5, 0.5])
+    messages = onnxsim.check_webgpu_resize_support(model)
+    assert len(messages) == 1
+    assert "align_corners" in messages[0]
+
+
+def test_check_webgpu_resize_support_ignores_align_corners_upsample():
+    # align_corners is only documented as broken for downsampling.
+    model = _resize_model("align_corners", [1.0, 1.0, 2.0, 2.0])
+    assert onnxsim.check_webgpu_resize_support(model) == []
+
+
+def test_check_webgpu_resize_support_ignores_default_mode_downsample():
+    # half_pixel (the default) isn't the flagged mode, even downsampling.
+    model = _resize_model(None, [1.0, 1.0, 0.5, 0.5])
+    assert onnxsim.check_webgpu_resize_support(model) == []
+
+
+def test_check_webgpu_resize_support_ignores_non_constant_scales():
+    # scales computed at runtime rather than a constant initializer -- this
+    # module doesn't run shape inference, so it can't tell up- from
+    # downsampling here and deliberately leaves it unflagged.
+    model = _model(
+        """
+        g (float[1,3,8,8] x, float[4] dyn_scales) => (float[1,3,4,4] y)
+        {
+          y = Resize<coordinate_transformation_mode = "align_corners">(x, , dyn_scales)
+        }
+        """,
+        opset=13,
+    )
+    assert onnxsim.check_webgpu_resize_support(model) == []
+
+
+def test_check_webgpu_support_aggregates_all_checks():
+    attention_model = _attention_model(mask=True)
+    conv3d_model = _conv3d_model("Conv", via_kernel_shape=True)
+    resize_model = _resize_model("align_corners", [1.0, 1.0, 0.5, 0.5])
+
+    assert len(onnxsim.check_webgpu_support(attention_model)) == 1
+    assert len(onnxsim.check_webgpu_support(conv3d_model)) == 1
+    assert len(onnxsim.check_webgpu_support(resize_model)) == 1
+    assert onnxsim.check_webgpu_support(_model(
+        """
+        g (float[2,3] x, float[3,4] w) => (float[2,4] y)
+        {
+          y = MatMul(x, w)
+        }
+        """
+    )) == []
+
+
 def test_gemm_fusion_backend_webgpu_matches_unrestricted():
     # "webgpu" should fuse a FLOAT16 MatMul+Add into Gemm exactly like
     # "unrestricted" does -- unlike the "ort_cpu" default, which restricts the
