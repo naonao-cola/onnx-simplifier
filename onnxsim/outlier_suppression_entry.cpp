@@ -197,8 +197,7 @@ std::unordered_map<std::string, std::vector<double>> ComputeChannelAbsmax(
       }
       const DLTensor& dl = outputs[oit->second]->dl_tensor;
       onnx::TensorProto tp = onnxsim::dlpack::ToTensorProto(dl);
-      if (tp.data_type() != onnx::TensorProto::FLOAT ||
-          tp.dims_size() < 1) {
+      if (tp.data_type() != onnx::TensorProto::FLOAT || tp.dims_size() < 1) {
         continue;
       }
       const int64_t channels = tp.dims(static_cast<int>(tp.dims_size() - 1));
@@ -454,8 +453,8 @@ onnx::ModelProto ApplyOutlierSuppression(
           // s indexes the reduction (K) axis: j0 for a transposed [N, K]
           // weight, i0 for a plain [K, N] one.
           const int64_t j = cons.weight_transposed ? j0 : i0;
-          const double v = static_cast<double>(
-              flat[static_cast<size_t>(i0 * dim1 + j0)]);
+          const double v =
+              static_cast<double>(flat[static_cast<size_t>(i0 * dim1 + j0)]);
           w_new[static_cast<size_t>(i0 * dim1 + j0)] =
               static_cast<float>(v * s[static_cast<size_t>(j)]);
         }
