@@ -400,6 +400,42 @@ just the sum) and differential privacy are both real requirements for production
 and neither is implemented -- `onnxsim.federated.fedavg` is a plain, visible weighted average. See
 that module's own docstring for the full scope statement.
 
+## A tiny neural-architecture-search (NAS) search loop, in the browser
+
+Train several candidate architectures on the same problem and pick the one that fits best --
+`scripts/generate_nas_step_graphs.py` builds one training-step graph per candidate (a plain
+feedforward MLP of a given depth/width, forward + MSE loss + backward + an Adam step, all via
+`onnxsim.graph_grad`/`onnxsim.qat_graph`, the same "one ordinary ONNX graph, no
+`onnxruntime.training` anywhere" approach the distillation and federated-LoRA step graphs above
+use), and `wasm/nas_search/search.mjs` trains each one for the same handful of steps on the same
+batch and ranks them by final loss. Every candidate reuses `wasm/federated_lora/
+step_graph_runner.mjs`'s `StepGraphSession` unchanged (see that generator's own docstring for why
+its manifest format is deliberately identical to the federated-LoRA one) -- including that
+runner's own `{ executionProviders: ["webgpu", "wasm"] }` option, so the whole search loop trains
+on the browser's own GPU API when one is available, not just wasm's CPU kernels.
+
+```sh
+# 1. A small search space of MLP shapes (see generate_nas_step_graphs.py's own SEARCH_SPACE) --
+#    each candidate gets its own step.onnx/.manifest.txt/.initial_state.bin, plus one
+#    search_space.json listing every candidate this run produced.
+python3 scripts/generate_nas_step_graphs.py -o nas_candidates --batch-size 32 --dim 16 --out 8
+
+# 2. Train every candidate and rank them -- see wasm/nas_search/search.test.mjs for a full worked
+#    example (`npm install && npm test` in wasm/nas_search/), including a synthetic problem
+#    deliberately sized so a low-capacity candidate cannot win no matter how long it trains.
+```
+
+Real (browser-verified) WebGPU training for this search loop -- not just the wasm EP the Node
+test above exercises -- is proven the same way `wasm/federated_lora`'s own real-browser training
+demos are: `scripts/convertmodel/test/webgpu_nas_search.test.mjs` runs the whole search loop in a
+real Chromium page via Playwright, checks every op in a candidate's step graph actually placed on
+WebGPU (`JsExecutionProvider`), and checks WebGPU and wasm agree on which candidate wins.
+
+What this is not: a real NAS algorithm (no evolutionary search, no reinforcement-learning
+controller, no zero-cost proxies) -- just the smallest possible "train several architectures,
+compare them" loop, which is also the part any of those would still need at the bottom of their
+own search: a way to actually train a candidate and read back a score.
+
 ## CLI reference
 
 | flag | required | description |

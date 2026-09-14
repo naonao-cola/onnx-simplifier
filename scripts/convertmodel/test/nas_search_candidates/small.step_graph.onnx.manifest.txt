@@ -1,0 +1,22 @@
+input_name x
+input_shape 32 16
+teacher_name y
+teacher_shape 32 8
+lr_name lr
+loss_name reducemean_8
+state w0 sub_60 16 16
+state m_w0 add_48 16 16
+state v_w0 add_52 16 16
+state w0b sub_74 16
+state m_w0b add_63 16
+state v_w0b add_67 16
+state w1 sub_88 16 8
+state m_w1 add_77 16 8
+state v_w1 add_81 16 8
+state w1b sub_102 8
+state m_w1b add_91 8
+state v_w1b add_95 8
+weight w0 16 16
+weight w0b 16
+weight w1 16 8
+weight w1b 8
