@@ -843,12 +843,12 @@ _GAP_STREAMS = {
     # test_axera_mcode_structure.py). Fails loudly in either direction: a
     # regression adds runs, a future form decoding these removes them.
     "reshape_mul_gap": (
-        "coverage: only 93.4% of non-zero bytes explained "
-        "[(284, 285), (321, 322), (328, 330), (376, 377)]"
+        "coverage: only 93.7% of non-zero bytes explained "
+        "[(284, 285), (321, 322), (376, 377), (465, 468)]"
     ),
     "reshape_matmul_gap": (
-        "coverage: only 93.8% of non-zero bytes explained "
-        "[(280, 281), (321, 322), (328, 330), (344, 345)]"
+        "coverage: only 94.0% of non-zero bytes explained "
+        "[(280, 281), (321, 322), (344, 345), (428, 431)]"
     ),
     "reshape_gather_bwd": (),
 }
@@ -871,3 +871,71 @@ def test_known_gap_streams_hold_status_quo(name):
         assert covered < 0.94, (name, covered)
     else:
         assert 0.94 <= covered < 0.95, (name, covered)
+
+
+# Terminal takes per committed stream -- a `0b 01` pair closing an S-unit
+# rhythm (`82 08` immediately before) ahead of zero padding. Device-mapped:
+# zeroing the pair faults the NPU while zeroing a lone `08` nearby runs
+# bit-identical (see test_splice_gap_bytes_split_inert_vs_fault in
+# test_axera_mcode_structure.py).
+_L_COUNTS = {
+    "conv64_k5_d2": 1,
+    "conv128_k7_d12": 0,
+    "piper_vocoder": 1,
+    "w2v2fe_training_step": 0,
+    "dwconv_g32": 1,
+    "layernorm_last_axis": 1,
+    "attn_qkv_softmax": 0,
+    "toy_training_step": 0,
+    "resnet18_int8": 0,
+    "loss_head_kd": 1,
+    "adam_update_fp32": 1,
+    "reshape_gather_bwd": 1,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_terminal_pair_closes_before_padding(name):
+    """A two-byte `0b 01` unit: the `82 08` tail of a complete short unit
+    immediately before it, eight zero bytes immediately after. Found by
+    clustering the unexplained bytes of training-graph and probe streams
+    from an AX650N, and validated the way every other form was: it fires
+    only where no other form matches (its head opens nothing), so no
+    stream regresses, and zero shuffled counterparts across all fourteen
+    fixtures. See the README's "A terminal pair before the padding"
+    section."""
+    blob = _blob(name)
+    lo, hi = mcode.stream_bounds(blob)
+    toks = mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    takes = [t for t in toks if t[1] == "L"]
+    assert len(takes) == _L_COUNTS[name], (name, len(takes))
+    for o, _, _, _, _ in takes:
+        assert bytes(blob[o : o + 2]) == bytes([0x0B, 0x01]), (name, o)
+        assert bytes(blob[o - 2 : o]) == bytes([0x82, 0x08]), (name, o)
+        assert bytes(blob[o + 2 : o + 10]) == b"\x00" * 8, (name, o)
+        assert 0x0B not in mcode.VERBS6, (name, o)
+    records = mcode.decode(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    assert [r["at"] for r in records if r["kind"] == "L"] == [
+        o for o, _, _, _, _ in takes
+    ]
+
+    # Admitting the form buys coverage, and only where it fires.
+    without = dict(mcode.FULL_RULE)
+    without["terminal"] = False
+    covered_without, _ = mcode.nonzero_coverage(blob, **without)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    if _L_COUNTS[name]:
+        assert covered_with > covered_without, (name, covered_without, covered_with)
+    else:
+        assert covered_with == covered_without, (name, covered_without, covered_with)
+
+    # The shuffle control: no terminal pairs by chance.
+    bulk = bytearray(blob[lo:hi])
+    random.Random(0).shuffle(bulk)
+    shuffled = bytes(blob[:lo]) + bytes(bulk) + bytes(blob[hi:])
+    null = sum(
+        1
+        for t in mcode.tokenize(shuffled, start=lo, end=hi, **mcode.FULL_RULE)
+        if t[1] == "L"
+    )
+    assert null == 0, (name, null)
