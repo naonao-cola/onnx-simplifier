@@ -1185,3 +1185,161 @@ def test_nhwc_public_io_order():
     interp = tf.lite.Interpreter(model_content=nchw_model)
     interp.allocate_tensors()
     assert list(interp.get_input_details()[0]["shape"]) == [1, 3, 4, 5]
+
+
+# ---------------------------------------------------------------------------
+# io_layout="nhwc" coverage for the extended-op set above (transformer/BEV
+# staples): layout-coupled ops run in NCHW islands, axis references remap.
+# ---------------------------------------------------------------------------
+
+
+def test_nhwc_convtranspose_matches_onnxruntime():
+    rng = np.random.RandomState(30)
+    w = numpy_helper.from_array(rng.randn(3, 2, 3, 3).astype(np.float32), name="w")
+    b = numpy_helper.from_array(np.zeros(2, np.float32), name="b")
+    model = _model(
+        """
+        ct (float[1,3,4,4] x) => (float[1,2,7,7] y)
+        {
+            y = ConvTranspose <kernel_shape=[3,3], strides=[2,2], pads=[1,1,1,1]> (x, w, b)
+        }
+        """,
+        initializer=[w, b],
+    )
+    onnx.checker.check_model(model)
+    x = rng.randn(1, 3, 4, 4).astype(np.float32)
+    _assert_nhwc_matches_onnxruntime(model, {"x": x})
+
+
+def test_nhwc_resize_matches_onnxruntime():
+    rng = np.random.RandomState(31)
+    x = rng.randn(1, 1, 2, 2).astype(np.float32)
+    model = _model(
+        """
+        rs (float[1,1,2,2] x) => (float[1,1,4,4] y)
+        <float[0] roi = {}, float[0] scales = {},
+         int64[4] sizes = {1, 1, 4, 4}>
+        {
+            y = Resize <mode="nearest", coordinate_transformation_mode="asymmetric"> (x, roi, scales, sizes)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    _assert_nhwc_matches_onnxruntime(model, {"x": x})
+
+
+def test_nhwc_topk_channel_axis_matches_onnxruntime():
+    # axis=1 (channels) exercises the NHWC axis remap; indices still address
+    # the original axis after the transpose round-trips.
+    rng = np.random.RandomState(32)
+    x = rng.randn(1, 4, 2, 3).astype(np.float32)
+    model = _model(
+        """
+        tk (float[1,4,2,3] x) => (float[1,2,2,3] v, int64[1,2,2,3] i)
+        <int64[1] k = {2}>
+        {
+            v, i = TopK <axis=1> (x, k)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    _assert_nhwc_matches_onnxruntime(model, {"x": x})
+
+
+def test_nhwc_layernorm_matches_onnxruntime():
+    rng = np.random.RandomState(33)
+    s = numpy_helper.from_array(np.ones((4, 2, 2), np.float32), name="s")
+    bb = numpy_helper.from_array(np.zeros((4, 2, 2), np.float32), name="bb")
+    model = _model(
+        """
+        ln (float[1,4,2,2] x) => (float[1,4,2,2] y)
+        {
+            y = LayerNormalization <axis=1> (x, s, bb)
+        }
+        """,
+        initializer=[s, bb],
+    )
+    onnx.checker.check_model(model)
+    x = rng.randn(1, 4, 2, 2).astype(np.float32)
+    _assert_nhwc_matches_onnxruntime(model, {"x": x})
+
+
+def test_nhwc_scatternd_matches_onnxruntime():
+    rng = np.random.RandomState(34)
+    d = rng.randn(1, 2, 2, 2).astype(np.float32)
+    ix = np.array([[[0, 0, 0], [0, 1, 1]]], np.int64)
+    up = rng.randn(1, 2, 2).astype(np.float32)
+    model = _model(
+        """
+        sn (float[1,2,2,2] d, int64[1,2,3] ix, float[1,2,2] up) => (float[1,2,2,2] y)
+        {
+            y = ScatterND (d, ix, up)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    _assert_nhwc_matches_onnxruntime(model, {"d": d, "ix": ix, "up": up})
+
+
+def test_nhwc_expand_matches_onnxruntime():
+    rng = np.random.RandomState(35)
+    x = rng.randn(1, 1, 2, 2).astype(np.float32)
+    model = _model(
+        """
+        ex (float[1,1,2,2] x) => (float[1,2,2,2] y)
+        <int64[4] s = {1, 2, 2, 2}>
+        {
+            y = Expand (x, s)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    _assert_nhwc_matches_onnxruntime(model, {"x": x})
+
+
+def test_nhwc_mod_matches_onnxruntime():
+    model = _model(
+        """
+        mo (int32[1,2,2,2] x, int32[1,2,2,2] y) => (int32[1,2,2,2] z)
+        {
+            z = Mod <fmod=1> (x, y)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    rng = np.random.RandomState(36)
+    _assert_nhwc_matches_onnxruntime(
+        model,
+        {
+            "x": rng.randint(-9, 10, size=(1, 2, 2, 2)).astype(np.int32),
+            "y": rng.randint(1, 6, size=(1, 2, 2, 2)).astype(np.int32)
+            * rng.choice(np.array([-1, 1]), size=(1, 2, 2, 2)).astype(np.int32),
+        },
+    )
+
+
+def test_nhwc_gridsample_matches_onnxruntime():
+    # The grid is coordinates, not activations: X flows channel-last while
+    # the grid keeps ONNX-logical order.
+    model = _model(
+        """
+        gs (float[1,2,4,4] x, float[1,3,3,2] g) => (float[1,2,3,3] y)
+        {
+            y = GridSample <mode="bilinear", padding_mode="zeros", align_corners=0> (x, g)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    rng = np.random.RandomState(37)
+    x = rng.randn(1, 2, 4, 4).astype(np.float32)
+    g = rng.random((1, 3, 3, 2)).astype(np.float32) * 2 - 1
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (expected,) = sess.run(None, {"x": x, "g": g})
+    blob = onnxsim.export_tflite(model, io_layout="nhwc")
+    actual = _run_tflite(blob, {"x": np.transpose(x, (0, 2, 3, 1)).copy(), "g": g})
+    (a,) = actual
+    np.testing.assert_allclose(
+        expected, np.transpose(a, (0, 3, 1, 2)), rtol=1e-4, atol=1e-4
+    )
