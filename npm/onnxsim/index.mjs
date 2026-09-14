@@ -490,6 +490,23 @@ export async function applyImatrixQuantization(
   ]);
 }
 
+/**
+ * Outlier Suppression Gamma Migration (lossless pre-conditioning ahead
+ * of a W8A8 quantizer): folds the migration scale into matched
+ * LayerNormalization gamma/bias and compensates downstream MatMul/Gemm
+ * weights. Adds zero nodes. Returns a float model.
+ */
+export async function applyOutlierSuppression(
+  model,
+  calibration,
+  { alpha = 0.5, epsilon = 1e-5 } = {},
+) {
+  return callCalibratedPass("onnxsim_apply_outlier_suppression", model, calibration, [
+    alpha,
+    epsilon,
+  ]);
+}
+
 export default {
   simplify,
   versions,
@@ -524,4 +541,5 @@ export default {
   applyQmoeWholeExpertPruning,
   applyTransformerBlockPruning,
   applyImatrixQuantization,
+  applyOutlierSuppression,
 };

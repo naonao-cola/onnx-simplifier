@@ -912,6 +912,38 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "num_scale_candidates"_a = 41, "scale_lo"_a = 0.4, "scale_hi"_a = 1.6,
       "skip_names"_a = std::vector<std::string>());
 
+  // Outlier Suppression Gamma Migration (Wei et al., 2022): folds the
+  // SmoothQuant-style per-channel migration scale directly into every
+  // matched LayerNormalization's gamma/bias (adding zero runtime nodes),
+  // compensated by scaling every downstream MatMul/vanilla-Gemm
+  // consumer's weight rows by the same scale -- a lossless
+  // pre-conditioning transform ahead of a separate W8A8 quantizer, never
+  // a quantization scheme itself. Same executor-as-first-argument,
+  // `calibration_data` (List[Dict[str, onnx.TensorProto]]) crossing
+  // convention as apply_imatrix_quantization's own binding above. See
+  // ApplyOutlierSuppression in outlier_suppression_entry.h for the full
+  // scope and onnxsim/outlier_suppression.py for the technique this
+  // ports.
+  m.def(
+      "apply_outlier_suppression",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double alpha, double epsilon) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyOutlierSuppression(
+            model, *executor, calibration_data, alpha, epsilon);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "alpha"_a = 0.5,
+      "epsilon"_a = 1e-5);
+
   // MoE expert-intermediate-channel pruning: removes intermediate
   // (`inter_size`) channels from every expert of a matched
   // `com.microsoft::MoE` node at once -- real structural pruning, data-free.

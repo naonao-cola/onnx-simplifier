@@ -2746,6 +2746,34 @@ em::val onnxsim_apply_imatrix_quantization(
   }
 }
 
+// Outlier Suppression Gamma Migration (Wei et al., 2022): folds the
+// SmoothQuant-style per-channel migration scale directly into every
+// matched LayerNormalization's gamma/bias (adding zero runtime nodes),
+// compensated by scaling every downstream MatMul/vanilla-Gemm consumer's
+// weight rows by the same scale -- a lossless pre-conditioning transform
+// ahead of a separate W8A8 quantizer. Same calibration-batch contract and
+// executor as every other calibration-driven binding above. `alpha` is
+// the migration strength (0.5 splits difficulty evenly on a log scale);
+// `epsilon` floors the per-channel max-abs values and the scale itself.
+// See ApplyOutlierSuppression in outlier_suppression_entry.h.
+em::val onnxsim_apply_outlier_suppression(const std::string &data,
+                                          em::val calibration_batches_val,
+                                          double alpha, double epsilon) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyOutlierSuppression(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), alpha, epsilon));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_outlier_suppression error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 EMSCRIPTEN_BINDINGS(module) {
   function("onnxsimplify_export", &onnxsimplify_export);
   function("onnxsim_annotate_model_info", &onnxsim_annotate_model_info);
@@ -2861,6 +2889,8 @@ EMSCRIPTEN_BINDINGS(module) {
            &onnxsim_apply_transformer_block_pruning);
   function("onnxsim_apply_imatrix_quantization",
            &onnxsim_apply_imatrix_quantization);
+  function("onnxsim_apply_outlier_suppression",
+           &onnxsim_apply_outlier_suppression);
 
   // Block-wise QAT: build one block's step graph, run the loop in JS on
   // onnxruntime-web, write the trained state back (see the doc comments

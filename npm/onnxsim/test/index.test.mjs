@@ -27,6 +27,7 @@ import {
   applyGgufQ4_0,
   applyIq4Nl,
   applyMoeExpertChannelPruning,
+  applyOutlierSuppression,
   applyQuarot,
   applyStructuredPruning,
   applyWandaPruning,
@@ -149,6 +150,20 @@ try {
       X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 1.0, 0.0]), [1, 4]),
     });
     const out = await applyWandaPruning(input, [batch(), batch()], { sparsity: 0.5 });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applyOutlierSuppression declines a model with no LayerNorm", async () => {
+    // The shared fixture has no LayerNormalization node, so this is a
+    // no-op round-trip -- the point is the binding (including calibration
+    // crossing) works, not that it migrates anything.
+    const ort = await import("onnxruntime-web");
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 1.0, 0.0]), [1, 4]),
+    });
+    const out = await applyOutlierSuppression(input, [batch(), batch()], { alpha: 0.5 });
     assert.ok(out instanceof Uint8Array);
     assert.ok(out.length > 0);
   });

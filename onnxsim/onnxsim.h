@@ -19,6 +19,7 @@
 // (rather than a byte-for-byte duplicate struct body in each header) avoids
 // two independently-edited copies of the same type ever drifting apart.
 #include "imatrix_quant_entry.h"
+#include "outlier_suppression_entry.h"
 #include "structured_pruning_entry.h"
 
 // RAII owner for a DLManagedTensor: releasing it invokes the tensor's own
@@ -766,6 +767,16 @@ onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
 // that header's own top comment for why this calibration-driven pass
 // follows ApplyWandaPruning's protobuf-level shape rather than
 // ApplyQuarot's data-free PredicateBasedPass one.
+
+// Outlier Suppression (Wei et al., 2022) Gamma Migration -- C++ port of
+// outlier_suppression.py's own apply_outlier_suppression, declared in
+// outlier_suppression_entry.h (included above) rather than duplicated
+// here, mirroring how ApplyImatrixQuantization (imatrix_quant_entry.h,
+// also included above) is documented in its own home header instead of
+// this one. See outlier_suppression.py's own module docstring for the
+// technique and outlier_suppression_entry.h for this port's own scope
+// (including why this calibration-driven pass follows
+// ApplyImatrixQuantization's own protobuf-level shape).
 
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller
