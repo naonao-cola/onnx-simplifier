@@ -1360,6 +1360,49 @@ size deltas are real, parameter-driven effects, not an artifact of
 non-determinism growing with model size -- the negative result there
 stands.
 
+### Determinism across op families: norm permutes, depthwise reschedules
+
+Six rebuilds each of three new single-purpose probes (group-32 depthwise
+conv, last-axis LayerNorm, MatMul/Softmax/MatMul attention with folded K/V
+-- the same builds behind "Three new families, no new forms" above) show
+the two modes side by side, and retire the open question about the messy
+single-`Conv` case. `Wbt` is byte-identical across all six rebuilds of all
+three probes, and mcode length is constant per probe -- the unmodified part
+of the finding holds everywhere it has been checked.
+
+**LayerNorm is Mode A, cleanly.** Four byte positions (303/311/319/325,
+eight apart, inside consecutive `a2`-verb operands) carry `{0x10, 0x20,
+0x30, 0x40}` in a different order on every one of the six rebuilds -- the
+multiset is identical every time. Same signature as the two-Conv case
+(same four values, same spacing), now in `a2` verbs on a non-MAC op.
+
+**Depthwise is Mode B, and Mode B is not reordering.** Its noisy zone
+(660-700) fails the multiset test even with order factored out: sorting
+each run's decoded tokens and comparing still disagrees, so the runs truly
+contain different commands, not the same commands reshuffled. What varies
+is whole short units at a time (`02 23 00 10 82 08`-shaped records appear
+in different orders with different tag/register bytes), consistent with a
+different tile/engine assignment per run rather than a relabelling of a
+fixed one. This also settles the single-`Conv` messy region from the
+earlier section in retrospect: multi-byte records varying together is
+rescheduling, and it needed six rebuilds to tell -- with two, runs 1 and
+2 here agree byte-for-byte and the zone looks deterministic.
+
+**Attention shows both, plus one isolated binary byte.** Its block
+(845-880) diverges the depthwise way, while offset 5256 takes exactly two
+values across six runs (`0x52` four times, `0x54` twice) -- a single-bit
+nondeterministic choice, the same shape as single-`Conv`'s stray byte at
+3232 (which had only two runs behind it and could never be classified).
+Whether that bit is a two-slot label race or something else wants a probe
+built to isolate it; it is recorded, not explained.
+
+The practical upshot for differential analysis is unchanged but now has
+teeth in both directions: same-length diffs under ~100 bytes in op-program
+regions can be either mode and need the multiset test before being read as
+signal, while anything structural (new verbs, new tags, moved boundaries)
+is still unambiguously real -- six rebuilds make the two trivially
+separable.
+
 ### Extending the periodic field across a wider dilation range: real values, no simple formula yet, and a new threshold effect
 
 With determinism now understood well enough to trust same-length diffs
