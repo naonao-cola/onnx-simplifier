@@ -967,7 +967,29 @@ def _op_unsqueeze(lowerer, node, ins, attrs):
 def _op_concat(lowerer, node, ins, attrs):
     axis = int(attrs["axis"])
     axis = axis if axis >= 0 else axis + ins[0].rank
-    return [lowerer.mb.concat(values=ins, axis=axis, name=lowerer.fresh_name(node))]
+    # Drop inputs that are provably empty along the concat axis (static 0):
+    # concatenating them is a no-op semantically, and backends have been
+    # observed to miscompile the pattern -- E5RT/MPS computes a downstream
+    # shape of 97 for Phi-3's full-rotary `[96:96]`-of-96 empty pass-through
+    # slice concatenated back onto the rotated part, failing plan build with
+    # "mps.concat op invalid input tensor shapes" on an otherwise valid
+    # model (verified empty by executing the subgraph on ONNX Runtime).
+    # An input empty along any *other* axis is left alone (the result is
+    # genuinely empty there, not a droppable no-op).
+    live = [
+        v
+        for v in ins
+        if not (
+            len(v.shape) > axis
+            and isinstance(v.shape[axis], (int, np.integer))
+            and int(v.shape[axis]) == 0
+        )
+    ]
+    if not live:
+        live = ins[:1]
+    if len(live) == 1:
+        return [live[0]]
+    return [lowerer.mb.concat(values=live, axis=axis, name=lowerer.fresh_name(node))]
 
 
 @_register("Split")

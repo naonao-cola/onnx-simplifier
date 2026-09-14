@@ -431,6 +431,36 @@ One hard warning: int8-quantized models **break the GPU backend**
 NE-or-CPU choice -- `CPU_AND_GPU` is off the table once weights are
 quantized.
 
+#### Static-coverage summary (one decode step, context 512, M4 Mac mini)
+
+Every model below is a `--static-context 512` export (`--dtype fp16` except
+135M-fp32); placement is the `MLComputePlan` cost share, latency the mean
+single-step `predict()`:
+
+| Model | Weights | Placement | CPU | GPU | NE |
+|---|---|---|---|---|---|
+| SmolLM2-135M fp32 | 0.3GB | ANE 77 / CPU 23 | 8.1ms | -- | 11-14ms |
+| SmolLM2-135M fp16 | 0.2GB | ANE 73 / CPU 27 | 7.9ms | -- | 11.4ms |
+| Qwen2.5-0.5B fp16 | 1.2GB | ANE 61 / GPU 37 / CPU 2 | 19.2ms | 17.4ms | 19.4ms |
+| Qwen2.5-0.5B int8 | 0.6GB | ANE majority | 20.9ms | broken | **13.3ms** |
+| Qwen2.5-1.5B fp16 | 3.3GB | GPU 100 | 55.9ms | 42.9ms | 59.7ms (CPU fallback) |
+| Qwen2.5-1.5B int8 | 1.7GB | ANE 36% | 59.1ms | broken | **36.2ms (fastest)** |
+| SmolLM2-1.7B fp16 | 3.4GB | GPU 100 | 76.4ms | 59.5ms | 79.4ms (CPU fallback) |
+| SmolLM2-1.7B int8 | 1.7GB | ANE 43% | 78.2ms | broken | 92.6ms (CPU wins) |
+| Phi-3.5-mini fp16 | 7.1GB | GPU 100 | 272.2ms | 183.2ms | 237.2ms (CPU fallback) |
+
+Patterns: per-op misses are boundary glue (embedding `gather`s, output
+reshape/cast cluster, one bandwidth-bound vocab-head `matmul` -- 271/272
+matmuls sit on ANE); `--io-dtype fp16` does not move the ANE share
+(75.3% vs. 77.5%, noise); whole-graph GPU spill tracks weight size
+(~1.2GB split zone, 3.3GB+ fully GPU), and int8 pulls graphs back under
+ANE capacity. Phi-3.5 is a new architecture family for this pipeline
+(fused `qkv_proj` + partial rotary): its first real-device run failed plan
+build on an empty pass-through slice concatenated back (`[96:96]` of dim
+96, ORT-verified empty) that E5RT/MPS mis-shapes to 97 -- fixed by dropping
+provably-empty inputs from `Concat` in the translator, after which Phi
+traces and runs as tabulated.
+
 ### fp16 model interface (`--io-dtype fp16`)
 
 Where `--quantize-weights` cuts the bytes read from DRAM *inside* the model and
