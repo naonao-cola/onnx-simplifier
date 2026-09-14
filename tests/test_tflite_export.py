@@ -467,12 +467,15 @@ def test_onnx2tf_backend_rejects_nhwc_layout():
 
 
 def _tflite_op_counts(tflite_model: bytes):
-    litert = pytest.importorskip("ai_edge_litert", reason="LiteRT is not installed")
+    pytest.importorskip("ai_edge_litert", reason="LiteRT is not installed")
     from ai_edge_litert.tools import flatbuffer_utils as fbu
 
-    del litert
+    from onnxsim.edgetpu_export import _builtin_op_names
+
+    names = _builtin_op_names()
+    if names is None:
+        pytest.skip("installed ai_edge_litert is too old to decode operator codes")
     model = fbu.convert_bytearray_to_object(bytearray(tflite_model))
-    names = {v: k for k, v in vars(fbu.BuiltinOperator).items() if isinstance(v, int)}
     counts = {}
     for subgraph in model.subgraphs:
         for op in subgraph.operators:

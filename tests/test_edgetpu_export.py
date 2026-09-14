@@ -371,6 +371,36 @@ def test_setup_hint_covers_udev_and_litert():
     assert "udev" in hint and "ai-edge-litert" in hint and "edgetpu_compiler" in hint
 
 
+def test_builtin_op_names_resolves():
+    pytest.importorskip("ai_edge_litert", reason="LiteRT is not installed")
+    names = edgetpu_export._builtin_op_names()
+    assert names is not None
+    assert "TRANSPOSE" in names.values()
+    assert "CONV_2D" in names.values()
+
+
+def test_builtin_op_names_tolerates_old_litert(monkeypatch):
+    pytest.importorskip("ai_edge_litert", reason="LiteRT is not installed")
+
+    # Simulate a LiteRT too old for the BuiltinOperator enum (as pulled in
+    # transitively by onnx2tf in CI): neither the flatbuffer_utils re-export
+    # nor the schema module carries it.
+    monkeypatch.delattr(
+        "ai_edge_litert.tools.flatbuffer_utils.BuiltinOperator", raising=False
+    )
+    monkeypatch.delattr(
+        "ai_edge_litert.schema_py_generated.BuiltinOperator", raising=False
+    )
+    assert edgetpu_export._builtin_op_names() is None
+
+
+def test_check_tflite_reports_old_litert_clearly(monkeypatch):
+    pytest.importorskip("ai_edge_litert", reason="LiteRT is not installed")
+    monkeypatch.setattr(edgetpu_export, "_builtin_op_names", lambda: None)
+    with pytest.raises(RuntimeError, match="newer LiteRT"):
+        edgetpu_export.check_tflite_for_edgetpu(b"fake-tflite")
+
+
 # ---------------------------------------------------------------------------
 # End to end with real tools (gated)
 # ---------------------------------------------------------------------------

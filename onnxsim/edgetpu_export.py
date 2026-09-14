@@ -610,6 +610,28 @@ class TfliteCompatibilityReport:
         return "\n".join(lines)
 
 
+def _builtin_op_names() -> Optional[Dict[int, str]]:
+    """Reverse map of TFLite builtin operator code -> name, or ``None``.
+
+    Uses LiteRT's own schema. The ``BuiltinOperator`` re-export on
+    ``flatbuffer_utils`` is only present in newer ``ai_edge_litert`` releases,
+    so fall back to ``schema_py_generated`` (and to ``None`` when even that is
+    unavailable, letting callers skip or raise a version hint instead of
+    crashing with ``AttributeError``).
+    """
+    try:
+        from ai_edge_litert.tools import flatbuffer_utils as fbu
+
+        cls = getattr(fbu, "BuiltinOperator", None)
+        if cls is None:
+            from ai_edge_litert import schema_py_generated as schema_fb
+
+            cls = schema_fb.BuiltinOperator
+        return {v: k for k, v in vars(cls).items() if isinstance(v, int)}
+    except (ImportError, AttributeError):
+        return None
+
+
 def check_tflite_for_edgetpu(tflite_model: bytes) -> TfliteCompatibilityReport:
     """Check a ``.tflite`` flatbuffer against the Edge TPU operation table.
 
@@ -635,16 +657,31 @@ def check_tflite_for_edgetpu(tflite_model: bytes) -> TfliteCompatibilityReport:
             + _LITERT_INSTALL_HINT
         ) from exc
 
+    builtin_names = _builtin_op_names()
+    if builtin_names is None:
+        raise RuntimeError(
+            "Checking a .tflite model needs a newer LiteRT schema than the "
+            "installed ai_edge_litert provides. "
+            "Upgrade it with `pip install -U ai-edge-litert`."
+        )
+
     model = fbu.convert_bytearray_to_object(bytearray(tflite_model))
-    builtin_names = {
-        v: k for k, v in vars(fbu.BuiltinOperator).items() if isinstance(v, int)
-    }
     counts: Dict[str, int] = {}
     float_io = False
+    tensor_type = getattr(fbu, "TensorType", None)
+    if tensor_type is None:
+        try:
+            from ai_edge_litert import schema_py_generated as schema_fb
+
+            tensor_type = schema_fb.TensorType
+        except ImportError:
+            tensor_type = None
+    float32 = tensor_type.FLOAT32 if tensor_type is not None else None
     for subgraph in model.subgraphs:
-        for i in list(subgraph.inputs) + list(subgraph.outputs):
-            if subgraph.tensors[i].type == fbu.TensorType.FLOAT32:
-                float_io = True
+        if float32 is not None:
+            for i in list(subgraph.inputs) + list(subgraph.outputs):
+                if subgraph.tensors[i].type == float32:
+                    float_io = True
         for op in subgraph.operators:
             code = model.operatorCodes[op.opcodeIndex]
             builtin = int(fbu.get_builtin_code_from_operator_code(code))
