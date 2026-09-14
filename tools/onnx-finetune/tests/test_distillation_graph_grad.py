@@ -335,3 +335,73 @@ def test_step_graph_trains_on_plain_onnxruntime(toy_models):
         state = {name: out[out_name] for name, out_name in step.state.items()}
 
     assert losses[-1] < losses[0]
+
+
+def test_frozen_prefixes_stay_constants_and_train_the_rest(toy_models):
+    """Initializers matching ``frozen_prefixes`` stay baked-in constants:
+    no state input, no Adam moments, no gradients -- while the rest trains
+    normally. Besides subset training, this is what makes a step graph
+    compilable for NPU: Pulsar2's BatchNorm-to-Conv folding needs constant
+    BN parameters, so freezing them (conv/dense keep training) is what
+    lets a ResNet step graph through ``pulsar2 build`` at all.
+    """
+    _, student_path = toy_models
+    student = onnx.load(str(student_path))
+    step, initial_state, fwd = build_distillation_step_graph(
+        student, frozen_prefixes=("fc1.",)
+    )
+    assert set(fwd.trainable) == {"fc2.weight", "fc2.bias"}
+    assert set(fwd.grads) == {"fc2.weight", "fc2.bias"}
+    assert set(initial_state) == {
+        "fc2.weight",
+        "fc2.weight__m",
+        "fc2.weight__v",
+        "fc2.bias",
+        "fc2.bias__m",
+        "fc2.bias__v",
+    }
+    model_inputs = {i.name for i in step.model.graph.input}
+    for frozen in ("fc1.weight", "fc1.bias"):
+        # Not fed, not state, no gradients. (Whether the initializer
+        # itself survives in `model.graph.initializer` is up to
+        # `simplify()`: a frozen bias legitimately fuses into its Gemm
+        # as a constant, which is still frozen -- what matters is that
+        # nothing trains or feeds it.)
+        assert frozen not in model_inputs, frozen
+        assert not any(n.startswith(frozen) for n in step.state), frozen
+
+    # The frozen-subset graph still trains: two ORT steps on the trainable
+    # remainder, fed exactly the way the native CLI feeds a full graph.
+    ort = pytest.importorskip("onnxruntime")
+    rng = np.random.default_rng(3)
+    sess = ort.InferenceSession(
+        step.model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    output_names = list(step.state.values()) + [step.loss_name]
+    teacher = onnx.load(str(toy_models[0]))
+    teach_sess = ort.InferenceSession(
+        teacher.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    state = {k: np.asarray(v) for k, v in initial_state.items()}
+    for t in range(2):
+        batch_size = 16
+        x = rng.standard_normal((batch_size, 8)).astype(np.float32)
+        teacher_logits = teach_sess.run(None, {"input": x})[0]
+        feeds = dict(state)
+        feeds["input"] = x
+        feeds["teacher_logits"] = teacher_logits
+        feeds["labels_onehot"] = labels_to_onehot(
+            rng.integers(0, 4, size=batch_size), 4
+        )
+        feeds["batch_size"] = np.asarray([float(batch_size)], dtype=np.float32)
+        feeds["lr"] = np.asarray([0.05], dtype=np.float32)
+        feeds["m_correction"] = np.asarray(
+            [1.0 / (1.0 - 0.9 ** (t + 1))], dtype=np.float32
+        )
+        feeds["v_correction"] = np.asarray(
+            [1.0 / (1.0 - 0.999 ** (t + 1))], dtype=np.float32
+        )
+        out = dict(zip(output_names, sess.run(output_names, feeds)))
+        loss = float(np.asarray(out[step.loss_name]).reshape(-1)[0])
+        assert np.isfinite(loss)
+        state = {name: out[out_name] for name, out_name in step.state.items()}

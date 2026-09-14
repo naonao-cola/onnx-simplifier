@@ -65,6 +65,12 @@ def test_layer_configs_passthrough_and_per_input_tars(tmp_path):
     )
     cfg = json.load(open(os.path.join(wd, "config", "step.json")))
     assert cfg["quant"]["layer_configs"] == [{"op_types": ["Sub"], "data_type": "FP32"}]
+    assert make_training_calib.DISTILL_FP32_LAYER_CONFIGS == [
+        {
+            "op_types": ["Mul", "Add", "Sub", "Div", "Sqrt", "MatMul"],
+            "data_type": "FP32",
+        }
+    ]
     model = onnx.load(os.path.join(wd, "step.onnx"))
     assert {i.name for i in model.graph.input} == {"x", "y", "w", "lr"}
     expected = {"x": (4, 3), "y": (4, 2), "w": (3, 2), "lr": (1,)}
