@@ -965,8 +965,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         ONNX_NAMESPACE::ModelProto model;
         ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                             model_proto_bytes.size());
-        const auto result = ApplySmoothQuant(model, *executor,
-                                             calibration_data, alpha, epsilon);
+        const auto result = ApplySmoothQuant(model, *executor, calibration_data,
+                                             alpha, epsilon);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
