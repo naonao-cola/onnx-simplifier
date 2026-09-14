@@ -191,6 +191,11 @@ export function applyOutlierSuppression(
   calibration: CalibrationData,
   options?: { alpha?: number; epsilon?: number },
 ): Promise<Uint8Array>;
+export function applySmoothQuant(
+  model: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: { alpha?: number; epsilon?: number },
+): Promise<Uint8Array>;
 
 declare const _default: {
   simplify: typeof simplify;
@@ -227,5 +232,6 @@ declare const _default: {
   applyTransformerBlockPruning: typeof applyTransformerBlockPruning;
   applyImatrixQuantization: typeof applyImatrixQuantization;
   applyOutlierSuppression: typeof applyOutlierSuppression;
+  applySmoothQuant: typeof applySmoothQuant;
 };
 export default _default;

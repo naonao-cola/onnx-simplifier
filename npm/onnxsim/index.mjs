@@ -507,6 +507,22 @@ export async function applyOutlierSuppression(
   ]);
 }
 
+/**
+ * SmoothQuant migration (lossless pre-conditioning ahead of a W8A8
+ * quantizer): rescales matched weight columns by `s` and inserts a `Mul`
+ * dividing the activation by `s`. Returns a float model.
+ */
+export async function applySmoothQuant(
+  model,
+  calibration,
+  { alpha = 0.5, epsilon = 1e-5 } = {},
+) {
+  return callCalibratedPass("onnxsim_apply_smoothquant", model, calibration, [
+    alpha,
+    epsilon,
+  ]);
+}
+
 export default {
   simplify,
   versions,
@@ -542,4 +558,5 @@ export default {
   applyTransformerBlockPruning,
   applyImatrixQuantization,
   applyOutlierSuppression,
+  applySmoothQuant,
 };

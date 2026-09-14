@@ -29,6 +29,7 @@ import {
   applyMoeExpertChannelPruning,
   applyOutlierSuppression,
   applyQuarot,
+  applySmoothQuant,
   applyStructuredPruning,
   applyWandaPruning,
   crossLayerEqualize,
@@ -164,6 +165,17 @@ try {
       X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 1.0, 0.0]), [1, 4]),
     });
     const out = await applyOutlierSuppression(input, [batch(), batch()], { alpha: 0.5 });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applySmoothQuant migrates scales on synthetic calibration data", async () => {
+    const ort = await import("onnxruntime-web");
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 4.0, 0.0]), [1, 4]),
+    });
+    const out = await applySmoothQuant(input, [batch(), batch()], { alpha: 0.5 });
     assert.ok(out instanceof Uint8Array);
     assert.ok(out.length > 0);
   });

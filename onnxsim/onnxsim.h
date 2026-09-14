@@ -20,6 +20,7 @@
 // two independently-edited copies of the same type ever drifting apart.
 #include "imatrix_quant_entry.h"
 #include "outlier_suppression_entry.h"
+#include "smoothquant_entry.h"
 #include "structured_pruning_entry.h"
 
 // RAII owner for a DLManagedTensor: releasing it invokes the tensor's own
@@ -777,6 +778,16 @@ onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
 // technique and outlier_suppression_entry.h for this port's own scope
 // (including why this calibration-driven pass follows
 // ApplyImatrixQuantization's own protobuf-level shape).
+
+// SmoothQuant (Xiao et al., 2022) migration -- C++ port of
+// smoothquant.py's own apply_smoothquant, declared in
+// smoothquant_entry.h (included above) rather than duplicated here,
+// mirroring how ApplyImatrixQuantization (imatrix_quant_entry.h, also
+// included above) is documented in its own home header instead of this
+// one. See smoothquant.py's own module docstring for the technique and
+// smoothquant_entry.h for this port's own scope (including why this
+// calibration-driven pass follows ApplyImatrixQuantization's own
+// protobuf-level shape).
 
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller
