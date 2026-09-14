@@ -861,7 +861,9 @@ def run_on_device_with_inputs(
     """Feed exactly `inputs` (`{tensor_name: raw_bytes}`, one entry per
     graph input -- e.g. a real reconstructed LLM graph's `input_ids` *and*
     `position_ids`, see `demo_hf_llm.py`) to a real device and return the
-    raw output tensor bytes (one per output, model's declared order) plus
+    raw output tensor bytes (one per output, in ALPHABETICAL output-name
+    order, not the model's declared order -- confirmed with a 3-output
+    probe whose declared `[mh, den, n]` came back `[den, mh, n]`) plus
     latency stats (from `repeat`/`warmup`, same as `run_on_device()`; left
     `None` at the default `repeat=1, warmup=0`, since `axcl_run_model`
     doesn't report a min/max/avg line for a single, non-benchmark run).
