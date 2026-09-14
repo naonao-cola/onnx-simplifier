@@ -1,0 +1,31 @@
+{
+  "file": "webgpu_kernel_add.onnx",
+  "nodeName": "add_node",
+  "n": 256,
+  "entryPoint": "main",
+  "dispatch": [
+    4,
+    1,
+    1
+  ],
+  "bindings": [
+    {
+      "tensor": "a",
+      "group": 0,
+      "binding": 0,
+      "access": "read"
+    },
+    {
+      "tensor": "b",
+      "group": 0,
+      "binding": 1,
+      "access": "read"
+    },
+    {
+      "tensor": "c",
+      "group": 0,
+      "binding": 2,
+      "access": "read_write"
+    }
+  ]
+}

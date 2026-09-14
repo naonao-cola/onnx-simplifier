@@ -343,8 +343,18 @@ from onnxsim.vitisai_target import (
     legalize_for_vitisai,
     split_model,
 )
+from onnxsim.webgpu_kernel_metadata import (
+    WebgpuKernelBinding,
+    WebgpuKernelSpec,
+    attach_webgpu_kernel,
+    list_webgpu_kernels,
+    read_webgpu_kernel,
+)
 from onnxsim.webgpu_target import (
     check_webgpu_attention_support,
+    check_webgpu_conv3d_support,
+    check_webgpu_resize_support,
+    check_webgpu_support,
     estimate_webgpu_islands,
 )
 from onnxsim.webnn_target import check_webnn_support, estimate_webnn_islands
@@ -509,7 +519,15 @@ __all__ = [
     "PruningLayerSensitivity",
     "convert_matmul_to_gemm",
     "check_webgpu_attention_support",
+    "check_webgpu_conv3d_support",
+    "check_webgpu_resize_support",
+    "check_webgpu_support",
     "estimate_webgpu_islands",
+    "WebgpuKernelBinding",
+    "WebgpuKernelSpec",
+    "attach_webgpu_kernel",
+    "list_webgpu_kernels",
+    "read_webgpu_kernel",
     "check_webnn_support",
     "estimate_webnn_islands",
     "chain_slim",
