@@ -1,8 +1,8 @@
 """Target legalizer and support checker for AMD's Ryzen AI NPU (VitisAI EP).
 
 The Vitis AI execution provider partitions the graph into NPU/CPU subgraphs
-transparently, but its compiler front end is strict about two things this
-module covers -- both measured, not guessed, on a Strix Halo NPU with Ryzen
+transparently, but its compiler front end is strict about the shapes this
+module covers -- all measured, not guessed, on a Strix Halo NPU with Ryzen
 AI Software 1.8 (Vitis AI EP build of ONNX Runtime 1.27.0, XRT 2.25):
 
 - **``Conv`` with default attributes aborts the process.** A ``Conv`` that
@@ -20,6 +20,17 @@ AI Software 1.8 (Vitis AI EP build of ONNX Runtime 1.27.0, XRT 2.25):
   quantized ``Conv+Relu``/``MatMul+Add`` shapes the EP fuses, into an NPU
   offload (verified via the EP's own ``DPU subgraph`` log lines, with
   bit-exact NPU-vs-CPU numerics on the quantized conv probe).
+- **``If`` aborts session creation.** Bisected on a ResNeXt-FPN detector
+  (``resnext50_32x4d_fpn.onnx``): the graph minus its ``If`` node compiles
+  (7 min), adding just the ``If`` aborts inside the MLIR lowering
+  (``mlir::Operation::isBeforeInBlock`` assertion in ``libvaiml`` during
+  ``vaiml_get_capability``). The ``If`` is the detector's empty-guard fed
+  by data-dependent shapes (``NonZero``/``TopK`` chains upstream, an
+  empty-tensor branch); minimal static ``If``/``Loop`` probes compile fine,
+  so this is the dynamic-shape ``If`` lowering, not control flow per se.
+  Unlike the ``Conv`` case there is no attribute to materialize -- the
+  mitigation is model surgery: split the model at the ``If`` boundary (the
+  backbone side compiles; run the guard and everything after it on CPU).
 - **Some shapes never reach the NPU at all.** :func:`check_vitisai_support`
   flags the ones with a hard failure attached: the default-attribute
   ``Conv`` above, ``LSTM`` nodes (measured segfault during session
@@ -167,6 +178,21 @@ def _lstm_node_labels(graph: onnx.GraphProto) -> List[str]:
     ]
 
 
+def _if_node_labels(graph: onnx.GraphProto) -> List[str]:
+    """Labels of ``If`` nodes -- session creation with the Vitis AI EP was
+    measured aborting on these (Strix Halo, Ryzen AI 1.8): bisection of a
+    ResNeXt-FPN detector pins the abort on its ``If`` node (the graph
+    without it compiles; adding just it aborts in the MLIR lowering), while
+    minimal static ``If``/``Loop`` probes compile fine -- so this is the
+    dynamic-shape ``If`` lowering, and every ``If`` is flagged since the
+    checker cannot tell the fatal shape from a safe one."""
+    return [
+        node.name or (node.output[0] if node.output else "<unnamed>")
+        for node in graph.node
+        if node.op_type == "If"
+    ]
+
+
 def _bf16_tensor_names(model: onnx.ModelProto) -> List[str]:
     """Names of bf16-typed graph inputs, initializers and node outputs. The
     EP rejects bf16-typed graphs with ``INVALID_GRAPH``; BF16 *execution*
@@ -197,7 +223,8 @@ def _bf16_tensor_names(model: onnx.ModelProto) -> List[str]:
 def check_vitisai_support(model: Union[str, onnx.ModelProto]) -> List[str]:
     """Scans for the Vitis AI EP gaps described in this module's docstring:
     default-attribute ``Conv`` nodes (process abort), ``LSTM`` nodes
-    (measured segfault), and bf16-typed tensors (rejected graph).
+    (measured segfault), ``If`` nodes (measured abort), and bf16-typed
+    tensors (rejected graph).
 
     :param model: the onnx ModelProto to inspect, or a file path
     :returns: one human-readable message per offending node/tensor (empty if
@@ -217,6 +244,14 @@ def check_vitisai_support(model: Union[str, onnx.ModelProto]) -> List[str]:
         f"LSTM node {label!r} segfaulted Vitis AI EP session creation in "
         "measurement (Ryzen AI 1.8); keep it on the CPU provider."
         for label in _lstm_node_labels(source.graph)
+    ]
+    messages += [
+        f"If node {label!r} aborted Vitis AI EP session creation in "
+        "measurement (Ryzen AI 1.8, MLIR lowering abort on a detector's "
+        "empty-guard If); split the model at the If boundary (the side "
+        "without it compiles) and run the guard and everything after it "
+        "on the CPU provider."
+        for label in _if_node_labels(source.graph)
     ]
     messages += [
         f"Tensor {name!r} is bf16-typed; the Vitis AI EP rejects bf16-typed "
