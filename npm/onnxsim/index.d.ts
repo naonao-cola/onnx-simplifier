@@ -186,6 +186,11 @@ export function applyImatrixQuantization(
     skipNames?: string[];
   },
 ): Promise<Uint8Array>;
+export function applyOutlierSuppression(
+  model: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: { alpha?: number; epsilon?: number },
+): Promise<Uint8Array>;
 
 declare const _default: {
   simplify: typeof simplify;
@@ -221,5 +226,6 @@ declare const _default: {
   applyQmoeWholeExpertPruning: typeof applyQmoeWholeExpertPruning;
   applyTransformerBlockPruning: typeof applyTransformerBlockPruning;
   applyImatrixQuantization: typeof applyImatrixQuantization;
+  applyOutlierSuppression: typeof applyOutlierSuppression;
 };
 export default _default;

@@ -2299,6 +2299,79 @@ def apply_imatrix_quantization_cpp(
     )
 
 
+def apply_outlier_suppression_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    alpha: float = 0.5,
+    epsilon: float = 1e-5,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_outlier_suppression`: Outlier
+    Suppression (Wei et al., 2022) "Gamma Migration" -- folds the
+    SmoothQuant-style per-channel migration scale directly into every
+    matched ``LayerNormalization``'s gamma/bias (adding zero runtime
+    nodes), compensated by scaling every downstream MatMul/vanilla-Gemm
+    consumer's weight rows by the same scale. Returns a float model --
+    pass the result to a W8A8 quantizer (e.g.
+    :func:`onnxsim.quantize_static`) to actually quantize it.
+
+    Same real calibration machinery as
+    :func:`onnxsim.apply_imatrix_quantization_cpp` -- a live
+    :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see
+    ``ApplyOutlierSuppression`` in ``outlier_suppression_entry.h`` for the
+    full scope).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to measure each
+            LayerNormalization output channel's activation range on -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param alpha: the migration strength, identical in meaning to
+            :func:`onnxsim.apply_smoothquant_cpp`'s own ``alpha``
+    :param epsilon: floor applied to every per-channel activation/weight
+            max-abs value (and to the scale itself) before computing it
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched ``LayerNormalization`` migrated
+            in place; a ``LayerNormalization`` with any non-MatMul/Gemm
+            consumer (or whose output is itself a graph output) is left
+            completely untouched.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_imatrix_quantization_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_outlier_suppression(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            alpha,
+            epsilon,
+        )
+    )
+
+
 def apply_moe_expert_channel_pruning_cpp(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,

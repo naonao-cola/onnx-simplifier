@@ -71,16 +71,11 @@ W8A8 quantizer afterwards (e.g. :func:`onnxsim.quantize_static`).
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.bias_correction import _add_probe_outputs
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.smoothquant import _match_matmul_like
+from onnxsim.calibration import Tensors
 
 
 def apply_outlier_suppression(
@@ -127,126 +122,31 @@ def apply_outlier_suppression(
             inserted. A ``LayerNormalization`` with any consumer other than
             a plain MatMul/vanilla-Gemm (as its activation input), or whose
             output is itself a graph output, is left completely untouched.
+
+    This pure-Python implementation has been retired in favor of the
+    verified-bit-exact C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_outlier_suppression_cpp`
+    (``onnxsim/outlier_suppression_entry.cpp``'s own
+    ``ApplyOutlierSuppression``), forwarding every argument unchanged.
+    Exact (bit-for-bit) parity was verified against this function's own
+    pre-alias implementation across single/multi-consumer topologies,
+    transB-Gemm consumers, bias-free LayerNormalization, rank-3
+    activations, every decline shape, empty calibration, and alpha in {0,
+    0.25, 0.5, 0.75, 1} -- see tests/test_outlier_suppression_cpp.py --
+    before this alias was made. Imported lazily (inside the function body,
+    not at module scope) to avoid a circular import:
+    ``onnxsim.onnx_simplifier`` already imports from this module, so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_outlier_suppression_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    graph_output_names = {o.name for o in graph.output}
-
-    candidates = []  # (ln_node, gamma_init, beta_init_or_None, consumers)
-    for ln in graph.node:
-        if ln.op_type != "LayerNormalization" or len(ln.input) < 2:
-            continue
-        gamma_init = initializer_map.get(ln.input[1])
-        if (
-            gamma_init is None
-            or gamma_init.data_type != onnx.TensorProto.FLOAT
-            or len(gamma_init.dims) != 1
-        ):
-            continue
-        beta_init = None
-        if len(ln.input) >= 3 and ln.input[2]:
-            beta_init = initializer_map.get(ln.input[2])
-            if beta_init is None or list(beta_init.dims) != list(gamma_init.dims):
-                continue  # malformed/non-constant bias -- decline, don't guess
-
-        ln_out = ln.output[0]
-        if ln_out in graph_output_names:
-            continue  # an external consumer would see the scaled-down value
-
-        consumers = []
-        declined = False
-        for node in graph.node:
-            if ln_out not in node.input:
-                continue
-            match = _match_matmul_like(node)
-            if match is None:
-                declined = True
-                break
-            x_name, w_name, weight_transposed = match
-            if x_name != ln_out:
-                declined = True  # ln_out feeds a weight/bias slot, not activation
-                break
-            w_init = initializer_map.get(w_name)
-            if (
-                w_init is None
-                or w_init.data_type != onnx.TensorProto.FLOAT
-                or len(w_init.dims) != 2
-            ):
-                declined = True
-                break
-            k_dim = w_init.dims[1] if weight_transposed else w_init.dims[0]
-            if k_dim != gamma_init.dims[0]:
-                declined = True
-                break
-            consumers.append((node, w_init, weight_transposed))
-
-        if declined or not consumers:
-            continue
-        candidates.append((ln, gamma_init, beta_init, consumers))
-
-    if not candidates:
-        return out
-
-    probe_names = sorted({ln.output[0] for ln, _, _, _ in candidates})
-    probe_model = _add_probe_outputs(out, probe_names)
-
-    act_absmax: Dict[str, np.ndarray] = {}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            x = np.asarray(result[name], dtype=np.float64)
-            if x.ndim < 1:
-                continue
-            m = np.abs(x).max(axis=tuple(range(x.ndim - 1)))
-            act_absmax[name] = (
-                m if name not in act_absmax else np.maximum(act_absmax[name], m)
-            )
-
-    for ln, gamma_init, beta_init, consumers in candidates:
-        acts = act_absmax.get(ln.output[0])
-        if acts is None or acts.shape[0] != gamma_init.dims[0]:
-            continue  # never observed, or a rank/shape mismatch; skip
-
-        weight_channel = np.full(acts.shape, epsilon, dtype=np.float64)
-        for _, w_init, weight_transposed in consumers:
-            w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-            w_nk = w if weight_transposed else w.T  # [N, K]
-            weight_channel = np.maximum(weight_channel, np.abs(w_nk).max(axis=0))  # [K]
-
-        act_channel = np.maximum(acts, epsilon)
-        s = (act_channel**alpha) / (weight_channel ** (1.0 - alpha))
-        s = np.maximum(s, epsilon)
-
-        gamma = onnx.numpy_helper.to_array(gamma_init).astype(np.float64)
-        gamma_init.CopyFrom(
-            onnx.numpy_helper.from_array(
-                (gamma / s).astype(np.float32), name=gamma_init.name
-            )
-        )
-        if beta_init is not None:
-            beta = onnx.numpy_helper.to_array(beta_init).astype(np.float64)
-            beta_init.CopyFrom(
-                onnx.numpy_helper.from_array(
-                    (beta / s).astype(np.float32), name=beta_init.name
-                )
-            )
-
-        for _, w_init, weight_transposed in consumers:
-            w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-            dim0, dim1 = w.shape
-            w_nk = w if weight_transposed else w.T  # [N, K]
-            w_new_nk = w_nk * s[np.newaxis, :]
-            w_new = w_new_nk if weight_transposed else w_new_nk.T
-            w_new = w_new.reshape(dim0, dim1).astype(np.float32)
-            w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
-
-    return out
+    return apply_outlier_suppression_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        alpha=alpha,
+        epsilon=epsilon,
+        providers=providers,
+    )
