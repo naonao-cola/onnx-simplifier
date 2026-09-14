@@ -236,10 +236,10 @@ swappable-libort design as everything else:
   this writing), confirmed empirically: the plain prebuilt release tarballs
   (CPU *or* GPU) do **not** include it -- `AppendExecutionProvider("WebGPU", {})`
   throws `"WebGPU execution provider is not supported in this build"`
-  against them; a from-source build with `--use_webgpu` is needed. Against
-  an even older ORT (1.18.1/1.19.2, which don't yet recognize the name in
-  this generic mechanism at all) it throws `"Unknown provider name..."`
-  instead -- either way, a clean `ONNX_DEPLOY_ERROR`, not a crash.
+against them; a from-source build with `--use_webgpu` is needed. Against
+a release old enough not to recognize the name in this generic mechanism
+at all it throws `"Unknown provider name..."`
+instead -- either way, a clean `ONNX_DEPLOY_ERROR`, not a crash.
 - **WASM, WebGPU**: `Module.generate(..., executionProviders)` where
   `executionProviders` is a JS array like `["webgpu"]` (empty/omitted =
   onnxruntime-web's own default). Requires the host to actually expose
@@ -278,7 +278,7 @@ exactly this, and is what actually caught the original crash.
 # (any recent release works -- the ORT C API is stable). The libonnxruntime
 # actually run against is chosen separately, at runtime, via --libort /
 # onnx_deploy_load_ort() / onnx_deploy_py.load_ort() -- see below.
-cmake -B build -DORT_HOME=/path/to/onnxruntime-linux-x64-1.19.2
+cmake -B build -DORT_HOME=/path/to/onnxruntime-linux-x64-1.30.0
 cmake --build build
 ```
 
@@ -290,7 +290,7 @@ Add `-DONNX_DEPLOY_PYTHON=ON` (needs `pip install nanobind`) to also build
 CI (`.github/workflows/onnx-deploy.yml`) does exactly this, from a clean
 checkout, on every change under `tools/onnx-deploy/`:
 
-1. Downloads two different real ONNX Runtime releases (1.18.1 and 1.19.2).
+1. Downloads two different real ONNX Runtime releases (1.29.0 and 1.30.0).
 2. Configures and builds `onnx_deploy_c`/`onnx-deploy`/`onnx_deploy_py`
    against **only the older release's headers** -- and asserts
    `ldd build/libonnx_deploy_c.so` shows no `libonnxruntime` dependency.

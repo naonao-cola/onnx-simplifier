@@ -1360,6 +1360,49 @@ size deltas are real, parameter-driven effects, not an artifact of
 non-determinism growing with model size -- the negative result there
 stands.
 
+### Determinism across op families: norm permutes, depthwise reschedules
+
+Six rebuilds each of three new single-purpose probes (group-32 depthwise
+conv, last-axis LayerNorm, MatMul/Softmax/MatMul attention with folded K/V
+-- the same builds behind "Three new families, no new forms" above) show
+the two modes side by side, and retire the open question about the messy
+single-`Conv` case. `Wbt` is byte-identical across all six rebuilds of all
+three probes, and mcode length is constant per probe -- the unmodified part
+of the finding holds everywhere it has been checked.
+
+**LayerNorm is Mode A, cleanly.** Four byte positions (303/311/319/325,
+eight apart, inside consecutive `a2`-verb operands) carry `{0x10, 0x20,
+0x30, 0x40}` in a different order on every one of the six rebuilds -- the
+multiset is identical every time. Same signature as the two-Conv case
+(same four values, same spacing), now in `a2` verbs on a non-MAC op.
+
+**Depthwise is Mode B, and Mode B is not reordering.** Its noisy zone
+(660-700) fails the multiset test even with order factored out: sorting
+each run's decoded tokens and comparing still disagrees, so the runs truly
+contain different commands, not the same commands reshuffled. What varies
+is whole short units at a time (`02 23 00 10 82 08`-shaped records appear
+in different orders with different tag/register bytes), consistent with a
+different tile/engine assignment per run rather than a relabelling of a
+fixed one. This also settles the single-`Conv` messy region from the
+earlier section in retrospect: multi-byte records varying together is
+rescheduling, and it needed six rebuilds to tell -- with two, runs 1 and
+2 here agree byte-for-byte and the zone looks deterministic.
+
+**Attention shows both, plus one isolated binary byte.** Its block
+(845-880) diverges the depthwise way, while offset 5256 takes exactly two
+values across six runs (`0x52` four times, `0x54` twice) -- a single-bit
+nondeterministic choice, the same shape as single-`Conv`'s stray byte at
+3232 (which had only two runs behind it and could never be classified).
+Whether that bit is a two-slot label race or something else wants a probe
+built to isolate it; it is recorded, not explained.
+
+The practical upshot for differential analysis is unchanged but now has
+teeth in both directions: same-length diffs under ~100 bytes in op-program
+regions can be either mode and need the multiset test before being read as
+signal, while anything structural (new verbs, new tags, moved boundaries)
+is still unambiguously real -- six rebuilds make the two trivially
+separable.
+
 ### Extending the periodic field across a wider dilation range: real values, no simple formula yet, and a new threshold effect
 
 With determinism now understood well enough to trust same-length diffs
@@ -5237,7 +5280,7 @@ Everything above needed a Pulsar2 image to compile with or an AX650N to
 confirm on. That makes it untestable in ordinary CI, and a format nobody
 re-checks is a format that quietly rots. `mcode.py` fixes that: the codec and
 every structural rule confirmed on hardware, in a module that imports numpy
-and onnx and nothing else, plus three real compiled streams committed under
+and onnx and nothing else, plus seven real compiled streams committed under
 `fixtures/`.
 
 `mcode.check(blob)` returns a list of violations -- empty means well-formed as
@@ -5272,6 +5315,19 @@ no verb's datapath semantics have been established, and 25 of the 28 operand
 slots that move between builds hold allocator output. An interpreter that
 produced numbers would be inventing them. `check` answers the question that
 can be answered honestly: could the runtime load and walk this?
+
+### Three new families, no new forms
+
+Three single-purpose probes compiled fresh (Pulsar2 7.0-lite) to widen the
+evidence past CNNs, transformers and vocoders: a group-32 depthwise
+convolution, a last-axis LayerNormalization, and a MatMul/Softmax/MatMul
+attention fragment with folded K/V. Their mcodes are committed as fixtures
+(`dwconv_g32`, `layernorm_last_axis`, `attn_qkv_softmax` -- two to five
+kilobytes each), and all three use only the closed verb/tag sets and pass
+every rule at 0.952-0.964 coverage. The layernorm stream carries no
+`a1 00 40 02` op program at all, as expected for a non-MAC op. Op-type
+differences live in operand values, not in new forms -- the same verdict
+the vocoder gave, now with Norm and Softmax in the set.
 
 ### A five-byte form that programs its pair twice
 
@@ -5466,6 +5522,49 @@ other odd tag, at chance level here -- takes the same shape elsewhere, is
 open. The `0x80`/`0xa0`/`0xc0`/`0xe0` holes in the tag set, probed the same
 way, are real absences: all four occur *below* chance as would-be tags,
 with register parity at the background rate.
+
+### The stuttered pair
+
+Nineteen thousand len-two runs after short units, and 5,502 of them are an
+exact echo of the unit's own tail: a short unit ending in `90 03` followed
+by another unexplained `90 03` (eleven of anything else, combined). The
+preceding unit is overwhelmingly the same shape too -- `00 04 90 03` -- so
+this is one fixed context, not a general stutter rule: the pair is
+written twice, back to back, the second copy stranded because no form opens
+at it (`0x90` needs an even register after it, `0x03` is not a prefix). The
+The echo walks as a `Y` record with everything around it parsing exactly as
+before, so this converts only raw escapes: 5,502 takes, zero regressions,
+zero shuffled takes. Whether the doubling is a write-and-confirm on the
+`0x90`/`0x03` slot -- one of the matmul engine's most-programmed addresses
+-- is a card question, and the card work is parked; statically, the codec
+round-trips it and `check` stays clean. The committed fixtures carry no
+stutters, so the test pins the codec synthetically.
+
+### A six-byte prefix
+
+The prefix class grows a third length: `09 0c 80 fe 01 01`, always
+followed by an `a1 00 d0 0c` verb -- all 2,741 occurrences corpus-wide,
+zero shuffled counterparts. The head opens no other form and the anchored
+verb parses identically after it, so like the shorter prefixes it converts
+only raw escapes: 2,741 takes at six bytes each, zero regressions, and only
+42.7% of those verbs take it, so it is an optional prefix rather than part
+of the verb. The training step's stream carries seven; the codec round-trips
+them and `check` stays clean.
+
+### A second repeat form
+
+The quintet repeats a pair (`[04][a][b][a][b]`); this repeats one byte:
+`[0x30][0x03][X][0x03][0x09]`, a fixed frame with one live slot (`0x1c`
+and `0x70` dominate). 648 occurrences corpus-wide against zero shuffled,
+every one an exact five-byte unexplained run -- the short-unit check fails
+there by construction (`0x30` is not a prefix), so unlike the octet and
+template families there is no overlap to adjudicate and no guard to write:
+it fires exactly where the walk emits raw escapes, and nowhere else. 648
+takes, zero regressions, zero shuffled takes; the codec carries them as `R`
+records. The committed fixtures carry none, so the test pins the codec
+synthetically, as with the fixed head. What varies the slot, and whether
+the `YY != 0x09` tails (`9f`, `89`) that sometimes follow are the same
+form with a live tail or a following unit starting mid-run, is open.
 
 ### The `0xc1` five
 
@@ -5979,6 +6078,84 @@ the way -- `ReduceMean`'s `axes` became an input at opset 18.
 The practical consequence: **accuracy on this NPU can be searched offline.**
 Precision configurations and calibration sets can be scored against a build's
 own quantisation table with no card and no rebuild.
+
+### Searching calibration parameters offline
+
+`calib_search.py` is that search, looped: rebuild a model over a
+calibration-method x calibration-size grid, rank the cells by replay SNR.
+The first thing it caught was in the replay itself, not the grid: a
+per-tensor *symmetric* activation (a tiny attention probe came back with a
+symmetric model input) was clipped to `[0, 255]` instead of `[-128, 127]`,
+zeroing every negative input value and inventing ~40 dB of error that is
+not on the card. The table carries each tensor's own `quant_min`/
+`quant_max`; the replay now reads them instead of assuming unsigned.
+Real builds never tripped this because their quantised tensors happened to
+be asymmetric -- which is exactly why it survived validation.
+
+The grid, on three single-purpose probes (group-32 depthwise conv, last-axis
+LayerNorm, MatMul/Softmax/MatMul attention with folded K/V -- Pulsar2
+7.0-lite, replay SNR in dB, mean (min) over 5 inputs):
+
+| probe | MinMax 8/32 | Percentile 8/32 | MSE/KL (both sizes) |
+| --- | --- | --- | --- |
+| depthwise | 36.0 (35.7) / 35.6 (35.3) | 36.9 (35.7) / 36.5 (34.7) | == MinMax |
+| layernorm | 40.5 (29.0) / 41.5 (40.0) | 26.1 (22.5) / 30.3 (23.8) | == MinMax |
+| attn | 36.2 (32.1) / 34.8 (32.3) | 32.9 (29.6) / 34.2 (30.1) | == MinMax |
+
+Three findings, all actionable. First, `MSE` and `KL` fall back to `MinMax`
+on these graphs: byte-identical scales at every size, so do not trust the
+method name -- diff the scales (`tables_equal()` in the script does exactly
+that and reports it mid-sweep). Second, LayerNorm wants `MinMax` and enough
+samples: 8 samples leave the range underestimated badly enough that one
+input in five clips to 29 dB, while 32 hold every seed above 40 dB; and
+`Percentile` is actively harmful there (~26 dB), trimming exactly the tails
+a normaliser needs. Third, everywhere else the choice barely matters (conv
+and attention saturate by 8 samples; method differences are ~1 dB noise),
+so the default (`MinMax`, size 32) is the right default.
+
+### Patching calibration instead of recompiling
+
+A training phase swap recompiles the step graph with new calibration data,
+but a rebuild spends ~60 s mostly re-running the NPU backend scheduler --
+which does not depend on the calibration values at all (see "Reducing the
+per-phase recompile cost" in the training handoff). What actually varies
+with calibration is small, and this time it is identified exactly: build
+the same attention graph at 1x/2x/4x calibration amplitude (plus one
+identical-input control pair) and match every moving mcode byte against
+the quant tables.
+
+The control pair moves 9 bytes (scheduler noise floor). The scaled builds
+move ~50, of which 16 are scale slots with exact table matches, all in
+four copies each:
+
+| slots | encoding | tracks |
+| --- | --- | --- |
+| 4x | bfloat16 of `1/x_scale` | input scale, reciprocated |
+| 4x | float32 of `qk_scale` | MatMul output scale, direct |
+| 4x | bfloat16 of `1/p_scale` | softmax scale, reciprocated |
+| 4x | float32 of `o_scale` | output scale, direct |
+
+Everything else that moves is scheduler noise (same 9 bytes as control),
+ordering (same multiset, new positions), amplitude-independent constants
+(a `127.5` dequant midpoint that wobbles 1 ulp), or one scheduling-divergent
+region the values cannot reach. `patch_scales.py` writes new-table
+encodings over old-table slots in place: unchanged scales never match, so
+constants are safe; nested bfloat16-in-float32 matches keep the widest;
+sites claimed by two tensors are dropped, not guessed -- and every decision
+is reported. Patching by table computation agrees byte for byte with
+patching by copying the rebuilt bytes, and the patched artifact passes
+`mcode.check()`.
+
+What this does *not* prove is card equivalence: replay never reads mcode,
+so replay agreement cannot see a corrupted program, only consistent scales.
+The mechanism is precedented on device (doubling a stored output scale
+doubles the output exactly), but a patched artifact has not run on device
+-- do not train on one that hasn't, at least once per graph shape.
+`--verify` diffs a patch against a real rebuild of the new table for
+qualifying new shapes; steady-state phases skip the rebuild entirely.
+Per-phase cost becomes NumPy MinMax plus a reload, against a ~60 s rebuild
+today -- and weight slots stay out of scope on purpose, since trained
+weights already travel in the resident state files.
 
 **Where it is not yet faithful: fusion.** On the full Audio8 decoder the
 replay reads 3.65 dB against the card's 7.37. `quant/quant_axmodel.onnx` is
@@ -6946,6 +7123,42 @@ past that error, but then fails differently (`IndexError('list index out
 of range')`) -- a second real, distinct internal issue, not chased further
 here since this is an exotic, rarely-relevant op for this project's
 CNN/LLM focus.
+
+## Backward-graph ops: Neg/Log verified, reshape needs a fusable consumer
+
+The distillation training step graph (`tools/onnx-finetune/scripts/
+generate_distillation_step_graph.py` output, the object under test for
+on-device training) is 2312 nodes, of which static coverage flagged only
+`Neg` x22, `Log` x2 and `Squeeze` x1 -- the rest was already eligible.
+A focused single-node-per-op battery plus backward-slice probes
+(`pulsar2:7.0-lite` build, real AX650N run vs ORT fp32) closed the first
+two and refined the third:
+
+- **`Neg`/`Log`: confirmed working** despite being absent from Axera's
+  published list -- recorded in `pulsar2_ops.AX650_CONFIRMED_WORKING_OPS`,
+  which `op_coverage.classify()` treats as eligible and
+  `ax650_build_risks()` no longer warns about. Single-node numerics:
+  Neg max|diff| 0.24 (scale ~2.6), Log 0.004; the full KD soft-loss head
+  (Split/Div/Softmax/Log/Mul/ReduceSum/Neg) at max|diff| 0.012.
+- **Reshape-family (Reshape/Squeeze with shape/axes inputs): compiles
+  only with a consumer.** Standalone (graph output) it hits the same NPU
+  scheduler `ZeroDivisionError` as the documented Squeeze bug, on 7.0 as
+  on 6.0. Consumed, everything builds and runs: Squeeze+Gemm (fuses to
+  FullyConnected, max|diff| 0.94), Reshape+MatMul (0.023),
+  Reshape+Gather (0.005), Reshape+elementwise-Mul (0.005). The step
+  graph's forward Squeeze feeds a Gemm, so it is safe; a terminal
+  Reshape would not be -- the `Squeeze` entry in
+  `AX650_CONFIRMED_BROKEN_OPS` now says exactly this.
+- **Two blockers for compiling a full step graph, both now fixed (see
+  follow-up):** a scalar (rank-0) graph output crashes Pulsar2's
+  quantizer (`zero-dimensional tensor cannot be concatenated`) -- the
+  generator now keeps the loss `[1,1]` (keepdims + ones seed, exact per
+  the finite-difference suite); and the Adam update's `Sub`
+  (full-scale weights minus lr-scaled step, ~4400x scale ratio) fails NPU
+  tiling (`TileFailException: AxQuantizedSub`) -- fixed by a
+  `quant.layer_configs` FP32 override (Sub-only and Mul/Add/Sub/Div
+  variants both compile and return bit-exact Adam updates, max diff
+  0.0; U16 does not clear the tiler).
 
 ## Files
 

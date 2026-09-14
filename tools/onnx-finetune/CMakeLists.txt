@@ -52,7 +52,7 @@ endif()
 # `pip install onnxruntime`'s bundled shared library, or the same from-source
 # checkout as above -- unlike onnx-finetune, this target never needs
 # --enable_training_apis.
-#   cmake -B build -DORT_HOME=/path/to/onnxruntime-linux-x64-1.19.2
+#   cmake -B build -DORT_HOME=/path/to/onnxruntime-linux-x64-1.30.0
 if(ORT_HOME)
   add_executable(onnx-finetune-distill-step-graph src/distill_step_graph_main.cpp)
   target_include_directories(onnx-finetune-distill-step-graph PRIVATE ${ORT_HOME}/include)

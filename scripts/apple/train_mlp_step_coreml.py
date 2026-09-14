@@ -30,6 +30,7 @@ Usage:
     python train_mlp_step_coreml.py --output mlp_step.mlpackage
     python train_mlp_step_coreml.py --steps 15 --compute-units CPU_AND_NE
     python train_mlp_step_coreml.py --qat-int8 --output mlp_step_qat.mlpackage
+    python train_mlp_step_coreml.py --resident --compute-units CPU_ONLY
 """
 
 from __future__ import annotations
@@ -247,6 +248,50 @@ def run_loop(
     return losses, (time.time() - t0) / num_steps * 1000
 
 
+def run_resident_loop(
+    mlpackage: str,
+    step: qat_graph.StepGraph,
+    x: np.ndarray,
+    y: np.ndarray,
+    num_steps: int,
+    lr: float,
+    compute_units: str,
+    shapes: Dict[str, Tuple[int, ...]],
+) -> Tuple[List[float], float]:
+    """Run the training loop with weights resident on-device.
+
+    The model must have been exported with ``state=dict(step.state)``: its
+    parameters and moments live in Core ML states across ``predict()``
+    calls, so only the batch, the target and the scalars cross the boundary
+    each step (here ~2MB vs ~100MB shuttled). Initial state is written once
+    up front; per-step losses come back as the only model output.
+    """
+    import coremltools as ct
+
+    model = ct.models.MLModel(
+        mlpackage, compute_units=getattr(ct.ComputeUnit, compute_units)
+    )
+    st = model.make_state()
+    for name, value in initial_state(shapes).items():
+        st.write_state(name, value.astype(np.float32))
+    losses: List[float] = []
+    t0 = time.time()
+    for t in range(num_steps):
+        corr = qat_graph.adam_bias_corrections(t)
+        out = model.predict(
+            {
+                "x": x,
+                "y": y,
+                "lr": np.array([lr], np.float32),
+                "m_correction": np.array([corr["m_correction"]], np.float32),
+                "v_correction": np.array([corr["v_correction"]], np.float32),
+            },
+            state=st,
+        )
+        losses.append(float(np.asarray(out[step.loss_name]).reshape(-1)[0]))
+    return losses, (time.time() - t0) / num_steps * 1000
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--output", default="mlp_step.mlpackage")
@@ -268,6 +313,15 @@ def main() -> int:
         "forward pass (master fp32 weights train through straight-through "
         "estimation). Scales are calibrated once from the initial weights. "
         "Biases stay fp32.",
+    )
+    ap.add_argument(
+        "--resident",
+        action="store_true",
+        help="Hold parameters and Adam moments resident on-device in Core ML "
+        "states across predict() calls instead of shuttling them every step "
+        "(iOS18+). Only the batch, target and scalars cross per step. ANE "
+        "compilation rejects stateful programs on current macOS, so this "
+        "runs CPU/GPU-side.",
     )
     args = ap.parse_args()
 
@@ -292,11 +346,17 @@ def main() -> int:
         f"step graph: {len(step.model.graph.node)} nodes, state: {sorted(step.state)}",
         flush=True,
     )
-    onnxsim.export_coreml(step.model, args.output, skip_model_load=True)
+    export_kwargs: dict = {}
+    if args.resident:
+        export_kwargs["state"] = dict(step.state)
+    onnxsim.export_coreml(
+        step.model, args.output, skip_model_load=True, **export_kwargs
+    )
     print(f"Wrote {args.output}", flush=True)
 
     x, y = make_data(args.batch, args.dim, args.out)
-    losses, ms = run_loop(
+    loop = run_resident_loop if args.resident else run_loop
+    losses, ms = loop(
         args.output,
         step,
         x,

@@ -63,7 +63,8 @@ whose ``quantized_model`` shape matches
 
     Xq  = QuantizeLinear(X, Xs, Xzp)        -- Xs/Xzp: asymmetric uint8
     Xdq = DequantizeLinear(Xq, Xs, Xzp)
-    Wdq = DequantizeLinear(Wq, Ws, axis=<W's output-channel axis>)
+    Wdq = DequantizeLinear(Wq, Ws, Wzp, axis=<W's output-channel axis>)
+          -- Wzp spelled out explicitly (all zeros, same shape as Ws)
     Y   = MatMul(Xdq, Wdq)                  -- or Gemm
 
 -- this recovers each weight element's quantization bin the same way
@@ -152,10 +153,18 @@ def _find_static_qdq_candidates(
         ):
             continue
 
-        # Weight branch: Wdq = DequantizeLinear(Wq, Ws, axis=...), symmetric
-        # (no zero_point input) -- exactly static_quantize_matmul.h's shape.
+        # Weight branch: Wdq = DequantizeLinear(Wq, Ws, [Wzp], axis=...),
+        # symmetric -- exactly static_quantize_matmul.h's shape. Newer models
+        # spell the (all-zeros) INT8 zero-point out explicitly, same shape as
+        # the scale, because runtimes that fuse the QDQ pattern require it;
+        # models quantized before that change carry the 2-input form, which
+        # stays accepted.
         wdq = q_by_output.get(qn.input[1])
-        if wdq is None or wdq.op_type != "DequantizeLinear" or len(wdq.input) != 2:
+        if (
+            wdq is None
+            or wdq.op_type != "DequantizeLinear"
+            or (len(wdq.input) != 2 and len(wdq.input) != 3)
+        ):
             continue
         wq_init = q_init.get(wdq.input[0])
         ws_init = q_init.get(wdq.input[1])
@@ -166,6 +175,17 @@ def _find_static_qdq_candidates(
             or list(wq_init.dims) != list(w_float_init.dims)
         ):
             continue
+        if len(wdq.input) == 3:
+            wzp_init = q_init.get(wdq.input[2])
+            if (
+                wzp_init is None
+                or wzp_init.data_type != onnx.TensorProto.INT8
+                or list(wzp_init.dims) != list(ws_init.dims)
+            ):
+                continue
+            wzp = onnx.numpy_helper.to_array(wzp_init)
+            if bool((wzp != 0).any()):
+                continue
         axis = 1
         for attr in wdq.attribute:
             if attr.name == "axis":

@@ -335,7 +335,11 @@ from onnxsim.torch_training import (
     export_torch_module_to_onnx,
 )
 from onnxsim.transformers_export import export_transformers_model
-from onnxsim.vitisai_target import check_vitisai_support, legalize_for_vitisai
+from onnxsim.vitisai_target import (
+    check_vitisai_support,
+    legalize_for_vitisai,
+    split_model,
+)
 from onnxsim.webgpu_target import (
     check_webgpu_attention_support,
     estimate_webgpu_islands,
@@ -506,6 +510,7 @@ __all__ = [
     "estimate_webnn_islands",
     "check_vitisai_support",
     "legalize_for_vitisai",
+    "split_model",
     "workaround_ort_matmul_nbits_axis0_bug",
     "quantize_attention_dynamic",
     "quantize_dynamic",

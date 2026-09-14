@@ -67,6 +67,31 @@ def _assert_close(float_outputs, quant_outputs):
         assert rel_l2 < 0.1, f"relative L2 error too large: {rel_l2:.4f}"
 
 
+def _assert_explicit_weight_zp(quant, out_channels):
+    # The weight's DequantizeLinear spells its (all-zeros, symmetric) INT8
+    # zero-point out explicitly, same shape as the per-channel scale: runtimes
+    # that fuse the QDQ pattern into an integer kernel (ORT's QGemm, the
+    # VitisAI EP's MatMulAddFusion) require scale and zero_point to match and
+    # reject/abort the fused node when it is omitted.
+    inits = {t.name: t for t in quant.graph.initializer}
+    wdqs = [
+        n
+        for n in quant.graph.node
+        if n.op_type == "DequantizeLinear"
+        and n.input[0] in inits  # weight branch (activation DQs read a node)
+    ]
+    assert len(wdqs) == 1
+    assert len(wdqs[0].input) == 3
+    wq = onnx.numpy_helper.to_array(inits[wdqs[0].input[0]])
+    ws = onnx.numpy_helper.to_array(inits[wdqs[0].input[1]])
+    wzp = onnx.numpy_helper.to_array(inits[wdqs[0].input[2]])
+    assert wq.dtype == np.int8
+    assert ws.shape == (out_channels,)
+    assert wzp.dtype == np.int8
+    assert wzp.shape == ws.shape
+    assert bool((wzp == 0).all())
+
+
 def test_quantize_matmul():
     rng = np.random.default_rng(0)
     K, N = 32, 16
@@ -87,6 +112,36 @@ def test_quantize_matmul():
     assert ops["MatMul"] == 1  # the MatMul node itself is kept (QDQ format)
     assert ops["QuantizeLinear"] == 1
     assert ops["DequantizeLinear"] == 2  # one for X, one for W
+    _assert_explicit_weight_zp(quant, N)
+
+    x = rng.standard_normal((4, K)).astype(np.float32)
+    _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}))
+
+
+def test_quantize_matmul_add_fusion_runs():
+    # MatMul+Add is what ORT fuses into an integer QGemm at load time -- the
+    # exact shape that failed before the weight zero-point was spelled out
+    # ("zero point and scale of input b should have same shape size"), and
+    # what the VitisAI EP fuses into MatMulAddFusion (it aborted partitioning
+    # the 2-input form). The quantized model must load *and execute*.
+    rng = np.random.default_rng(2)
+    K, N = 32, 16
+    weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
+    bias = _f32(rng.standard_normal(N) * 0.5, "B")
+    model = _model(
+        """
+        g (float[4,32] X) => (float[4,16] Y)
+        {
+          T = MatMul(X, W)
+          Y = Add(T, B)
+        }
+        """,
+        initializer=[weight, bias],
+    )
+
+    quant = onnxsim.quantize_static(model, num_calibration_samples=16, seed=2)
+    onnx.checker.check_model(quant)
+    _assert_explicit_weight_zp(quant, N)
 
     x = rng.standard_normal((4, K)).astype(np.float32)
     _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}))

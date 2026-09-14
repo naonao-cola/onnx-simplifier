@@ -1,8 +1,8 @@
 """Target legalizer and support checker for AMD's Ryzen AI NPU (VitisAI EP).
 
 The Vitis AI execution provider partitions the graph into NPU/CPU subgraphs
-transparently, but its compiler front end is strict about two things this
-module covers -- both measured, not guessed, on a Strix Halo NPU with Ryzen
+transparently, but its compiler front end is strict about the shapes this
+module covers -- all measured, not guessed, on a Strix Halo NPU with Ryzen
 AI Software 1.8 (Vitis AI EP build of ONNX Runtime 1.27.0, XRT 2.25):
 
 - **``Conv`` with default attributes aborts the process.** A ``Conv`` that
@@ -20,6 +20,17 @@ AI Software 1.8 (Vitis AI EP build of ONNX Runtime 1.27.0, XRT 2.25):
   quantized ``Conv+Relu``/``MatMul+Add`` shapes the EP fuses, into an NPU
   offload (verified via the EP's own ``DPU subgraph`` log lines, with
   bit-exact NPU-vs-CPU numerics on the quantized conv probe).
+- **``If`` aborts session creation.** Bisected on a ResNeXt-FPN detector
+  (``resnext50_32x4d_fpn.onnx``): the graph minus its ``If`` node compiles
+  (7 min), adding just the ``If`` aborts inside the MLIR lowering
+  (``mlir::Operation::isBeforeInBlock`` assertion in ``libvaiml`` during
+  ``vaiml_get_capability``). The ``If`` is the detector's empty-guard fed
+  by data-dependent shapes (``NonZero``/``TopK`` chains upstream, an
+  empty-tensor branch); minimal static ``If``/``Loop`` probes compile fine,
+  so this is the dynamic-shape ``If`` lowering, not control flow per se.
+  Unlike the ``Conv`` case there is no attribute to materialize -- the
+  mitigation is model surgery: split the model at the ``If`` boundary (the
+  backbone side compiles; run the guard and everything after it on CPU).
 - **Some shapes never reach the NPU at all.** :func:`check_vitisai_support`
   flags the ones with a hard failure attached: the default-attribute
   ``Conv`` above, ``LSTM`` nodes (measured segfault during session
@@ -167,6 +178,21 @@ def _lstm_node_labels(graph: onnx.GraphProto) -> List[str]:
     ]
 
 
+def _if_node_labels(graph: onnx.GraphProto) -> List[str]:
+    """Labels of ``If`` nodes -- session creation with the Vitis AI EP was
+    measured aborting on these (Strix Halo, Ryzen AI 1.8): bisection of a
+    ResNeXt-FPN detector pins the abort on its ``If`` node (the graph
+    without it compiles; adding just it aborts in the MLIR lowering), while
+    minimal static ``If``/``Loop`` probes compile fine -- so this is the
+    dynamic-shape ``If`` lowering, and every ``If`` is flagged since the
+    checker cannot tell the fatal shape from a safe one."""
+    return [
+        node.name or (node.output[0] if node.output else "<unnamed>")
+        for node in graph.node
+        if node.op_type == "If"
+    ]
+
+
 def _bf16_tensor_names(model: onnx.ModelProto) -> List[str]:
     """Names of bf16-typed graph inputs, initializers and node outputs. The
     EP rejects bf16-typed graphs with ``INVALID_GRAPH``; BF16 *execution*
@@ -197,7 +223,8 @@ def _bf16_tensor_names(model: onnx.ModelProto) -> List[str]:
 def check_vitisai_support(model: Union[str, onnx.ModelProto]) -> List[str]:
     """Scans for the Vitis AI EP gaps described in this module's docstring:
     default-attribute ``Conv`` nodes (process abort), ``LSTM`` nodes
-    (measured segfault), and bf16-typed tensors (rejected graph).
+    (measured segfault), ``If`` nodes (measured abort), and bf16-typed
+    tensors (rejected graph).
 
     :param model: the onnx ModelProto to inspect, or a file path
     :returns: one human-readable message per offending node/tensor (empty if
@@ -219,9 +246,179 @@ def check_vitisai_support(model: Union[str, onnx.ModelProto]) -> List[str]:
         for label in _lstm_node_labels(source.graph)
     ]
     messages += [
+        f"If node {label!r} aborted Vitis AI EP session creation in "
+        "measurement (Ryzen AI 1.8, MLIR lowering abort on a detector's "
+        "empty-guard If); split the model at the If boundary (the side "
+        "without it compiles) and run the guard and everything after it "
+        "on the CPU provider."
+        for label in _if_node_labels(source.graph)
+    ]
+    messages += [
         f"Tensor {name!r} is bf16-typed; the Vitis AI EP rejects bf16-typed "
         "graphs (INVALID_GRAPH). Run BF16 execution as an fp32 graph with "
         "the EP's config_file option instead."
         for name in _bf16_tensor_names(source)
     ]
     return messages
+
+
+def split_model(
+    model: Union[str, onnx.ModelProto],
+    boundary: Sequence[str],
+    boundary_types: Optional[Dict[str, onnx.TypeProto]] = None,
+) -> tuple[onnx.ModelProto, onnx.ModelProto]:
+    """Split ``model`` into a (prefix, suffix) pair at ``boundary`` tensors.
+
+    The prefix holds every node upstream of ``boundary`` (plus the model
+    inputs/initializers they need) and exposes ``boundary`` as its outputs;
+    the suffix holds the rest, takes ``boundary`` as inputs, and keeps the
+    model's original outputs. Side inputs that cross the cut without being
+    requested -- a post-boundary node reading an unrelated prefix tensor --
+    join the boundary automatically, so the pair always reconnects. Run
+    the prefix where it compiles (e.g. the NPU) and the suffix where it
+    must (e.g. the CPU), feeding one's outputs into the other -- the spill
+    this module's ``If`` guidance advises:
+
+    .. code-block:: python
+
+        prefix, suffix = onnxsim.split_model(model, ["onnx::If_3267"])
+        npu = ort.InferenceSession(prefix.SerializeToString(),
+            providers=["VitisAIExecutionProvider", "CPUExecutionProvider"])
+        cpu = ort.InferenceSession(suffix.SerializeToString(),
+            providers=["CPUExecutionProvider"])
+        mid = npu.run(None, {"images": images})
+        out = cpu.run(None, dict(zip([o.name for o in prefix.graph.output], mid)))
+
+    ``boundary`` must name tensors the graph produces (usually the inputs
+    of the unsupported node). Tensors the suffix needs that neither side
+    produces -- original graph inputs consumed downstream, constants -- are
+    carried into the suffix as inputs/initializers automatically.
+    Initializers consumed on both sides are duplicated. Boundary output
+    types come from ``boundary_types`` when given, else the model's own
+    ``value_info``, else a shape inference pass; a boundary tensor whose
+    type is still unknown is left typeless, which onnxruntime may refuse
+    -- pin it down via ``boundary_types`` in that case (e.g. an ``If``
+    condition, always a BOOL scalar, whose type shape inference cannot
+    always recover through dynamic shape chains). Neither input model nor its names are mutated; the two results
+    are fresh objects sharing no state with it.
+    """
+    source = _load(model)
+    produced = {o for n in source.graph.node for o in n.output if o}
+    unknown = [t for t in boundary if t not in produced]
+    if unknown:
+        raise ValueError(f"boundary tensors not produced by the graph: {unknown}")
+    boundary = list(boundary)
+
+    producer_of = {}
+    for node in source.graph.node:
+        for output in node.output:
+            if output:
+                producer_of[output] = node
+    upstream: set = set(boundary)
+    queue = list(boundary)
+    while queue:
+        node = producer_of.get(queue.pop())
+        if node is None:
+            continue
+        for inp in node.input:
+            if inp and inp in produced and inp not in upstream:
+                upstream.add(inp)
+                queue.append(inp)
+    upstream_names = set()
+    for node in source.graph.node:
+        if any(o in upstream for o in node.output if o):
+            upstream_names.add(id(node))
+    prefix_nodes = [n for n in source.graph.node if id(n) in upstream_names]
+    suffix_nodes = [n for n in source.graph.node if id(n) not in upstream_names]
+    produced_prefix = {o for n in prefix_nodes for o in n.output if o}
+
+    # The full cut: every prefix-produced tensor the suffix consumes. The
+    # requested ``boundary`` is a subset by construction (each entry is
+    # consumed downstream); side inputs crossing the cut (a post-boundary
+    # node reading an unrelated prefix tensor, like detector scores beside
+    # the ``If`` condition) join it automatically.
+    cut = list(boundary) + sorted(
+        {
+            i
+            for n in suffix_nodes
+            for i in n.input
+            if i and i in produced_prefix and i not in boundary
+        }
+    )
+
+    init_by_name = {t.name: t for t in source.graph.initializer}
+
+    def needed_inits(nodes) -> List[onnx.TensorProto]:
+        want: List[str] = []
+        for node in nodes:
+            for inp in node.input:
+                if inp in init_by_name and inp not in want:
+                    want.append(inp)
+        return [init_by_name[name] for name in want]
+
+    known_types = {v.name: v.type for v in source.graph.value_info}
+    known_types.update(
+        {i.name: i.type for i in source.graph.input if i.type.ByteSize()}
+    )
+
+    prefix = onnx.ModelProto()
+    prefix.CopyFrom(source)
+    del prefix.graph.node[:]
+    del prefix.graph.output[:]
+    del prefix.graph.initializer[:]
+    prefix.graph.node.extend(prefix_nodes)
+    prefix.graph.initializer.extend(needed_inits(prefix_nodes))
+    for name in cut:
+        vi = onnx.ValueInfoProto(name=name)
+        if boundary_types and name in boundary_types:
+            vi.type.CopyFrom(boundary_types[name])
+        elif name in known_types:
+            vi.type.CopyFrom(known_types[name])
+        prefix.graph.output.append(vi)
+    try:
+        inferred = onnx.shape_inference.infer_shapes(prefix)
+    except Exception:
+        inferred = None
+    if inferred is not None:
+        inferred_types = {v.name: v.type for v in inferred.graph.value_info}
+        for out in prefix.graph.output:
+            if not out.type.ByteSize() and out.name in inferred_types:
+                out.type.CopyFrom(inferred_types[out.name])
+        known_types.update(inferred_types)
+
+    suffix = onnx.ModelProto()
+    suffix.CopyFrom(source)
+    del suffix.graph.node[:]
+    del suffix.graph.input[:]
+    del suffix.graph.output[:]
+    del suffix.graph.initializer[:]
+    suffix.graph.node.extend(suffix_nodes)
+    suffix.graph.initializer.extend(needed_inits(suffix_nodes))
+    produced_suffix = {o for n in suffix_nodes for o in n.output if o}
+    external = sorted(
+        {
+            i
+            for n in suffix_nodes
+            for i in n.input
+            if i
+            and i not in produced_prefix
+            and i not in produced_suffix
+            and i not in init_by_name
+        }
+    )
+    for name in list(cut) + external:
+        tp = None
+        for out in prefix.graph.output:
+            if out.name == name and out.type.ByteSize():
+                tp = out.type
+                break
+        if tp is None and name in known_types:
+            tp = known_types[name]
+        if tp is not None:
+            vi = onnx.ValueInfoProto(name=name)
+            vi.type.CopyFrom(tp)
+            suffix.graph.input.append(vi)
+        else:
+            suffix.graph.input.append(onnx.ValueInfoProto(name=name))
+    suffix.graph.output.extend(source.graph.output)
+    return prefix, suffix

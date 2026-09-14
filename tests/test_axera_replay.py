@@ -25,14 +25,16 @@ if _AXERA_DIR not in sys.path:
 import replay  # noqa: E402
 
 
-def _policy(per_channel=False):
+def _policy(per_channel=False, symmetric=None):
+    if symmetric is None:
+        symmetric = per_channel
     return {
         "PER_TENSOR": not per_channel,
         "PER_CHANNEL": per_channel,
         "LINEAR": True,
         "EXPONENTIAL": False,
-        "SYMMETRICAL": per_channel,
-        "ASYMMETRICAL": not per_channel,
+        "SYMMETRICAL": symmetric,
+        "ASYMMETRICAL": not symmetric,
         "POWER_OF_2": False,
         "PER_CHANNEL_RE_GROUP": False,
         "PER_BLOCK": False,
@@ -42,14 +44,20 @@ def _policy(per_channel=False):
 def _write_build(tmp_path, entries, fused_graph=None):
     """A minimal `out_*/quant/` directory in the shape Pulsar2 writes one.
 
-    `entries` is `{op: {tensor: (bit_width, scale, zero_point, per_channel)}}`.
+    `entries` is `{op: {tensor: (bit_width, scale, zero_point, per_channel)}}.
+    A per-tensor entry may append a fifth element, `symmetric`, for the real
+    tables' per-tensor symmetric case (`quant_min/max` `-128`/`127` instead
+    of `0`/`255`) -- the compiler emits those for symmetric activations,
+    and the replay must clip them to the signed range.
     """
     quant = tmp_path / "quant"
     quant.mkdir(parents=True, exist_ok=True)
     values, configs = {}, {}
     for op, tensors in entries.items():
         configs[op] = {}
-        for tensor, (bits, scale, zero, per_channel) in tensors.items():
+        for tensor, spec in tensors.items():
+            bits, scale, zero, per_channel = spec[:4]
+            symmetric = spec[4] if len(spec) > 4 else per_channel
             h = str(abs(hash((op, tensor))) % (10**10))
             values[h] = {
                 "scale": list(np.atleast_1d(scale).astype(float)),
@@ -57,11 +65,11 @@ def _write_build(tmp_path, entries, fused_graph=None):
             }
             configs[op][tensor] = {
                 "bit_width": bits,
-                "policy": _policy(per_channel),
+                "policy": _policy(per_channel, symmetric),
                 "state": "ACTIVATED",
                 "hash": int(h),
-                "quant_min": -(2 ** (bits - 1)) if per_channel else 0,
-                "quant_max": 2 ** (bits - 1) - 1 if per_channel else 2**bits - 1,
+                "quant_min": -(2 ** (bits - 1)) if symmetric else 0,
+                "quant_max": 2 ** (bits - 1) - 1 if symmetric else 2**bits - 1,
             }
     (quant / "quant_axmodel.json").write_text(
         json.dumps(
@@ -258,3 +266,37 @@ def test_a_tensor_with_no_entry_is_left_in_float(tmp_path):
     quantised, n_act, n_w = replay.insert_qdq(model, replay.load_scales(build))
     assert (n_act, n_w) == (0, 1)
     assert [n.op_type for n in quantised.graph.node] == ["Conv"]
+
+
+def test_symmetric_activation_clips_to_the_signed_range(tmp_path):
+    """A per-tensor *symmetric* activation (the compiler emits these too --
+    a tiny attention probe came back with a symmetric model input) must be
+    clipped to `[-128, 127]`, not `[0, 255]`. The old hardcoded unsigned
+    range zeroed every negative input value and invented ~40 dB of error
+    that is not on the card."""
+    model = onnx.parser.parse_model(
+        '<ir_version: 10, opset_import: ["": 17]>'
+        " g (float[1, 4] x) => (float[1, 4] y) {"
+        "   y = Add (x, z)"
+        " }"
+    )
+    model.graph.initializer.append(
+        numpy_helper.from_array(np.zeros(4, dtype=np.float32), "z")
+    )
+    scale = 0.02
+    build = _write_build(
+        tmp_path,
+        {
+            "add": {
+                "x": (8, scale, 0.0, False, True),
+                "y": (8, scale, 0.0, False, True),
+            }
+        },
+    )
+    scales = replay.load_scales(build)
+    assert scales["x"][5:] == (-128.0, 127.0)
+
+    x = np.array([[-1.5, -0.2, 0.3, 2.0]], dtype=np.float32)
+    got = replay.replay(model, build, {"x": x})[0]
+    want = (np.clip(np.rint(x / scale), -128, 127) * scale).astype(np.float32)
+    assert np.allclose(got, want, atol=1e-6), np.abs(got - want).max()

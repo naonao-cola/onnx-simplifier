@@ -345,8 +345,11 @@ def _build_forward_loss_and_grads(
     soft_axes = _int64_const(b, [-1], "axes")
     per_position = b.op("ReduceSum", [per_token, soft_axes], keepdims=1)
     # ReduceSum + Div(batch_size), not ReduceMean -- see this module's
-    # "Dynamic batch size" docstring section for why.
-    soft_sum = b.op("ReduceSum", [per_position], keepdims=0)
+    # "Dynamic batch size" docstring section for why. keepdims=1 (a [1, 1]
+    # loss, never a rank-0 scalar): Pulsar2's quantizer crashes on a scalar
+    # graph output ("zero-dimensional tensor cannot be concatenated"), so a
+    # step graph meant to ever compile for NPU must not have one.
+    soft_sum = b.op("ReduceSum", [per_position], keepdims=1)
     soft_mean = b.div(soft_sum, BATCH_SIZE_INPUT)
     soft_loss = b.mul(b.op("Neg", [soft_mean]), t_sq_const)
 
@@ -356,7 +359,9 @@ def _build_forward_loss_and_grads(
     selected = b.op(
         "ReduceSum", [b.mul(labels_onehot, log_probs), hard_axes], keepdims=1
     )
-    hard_sum = b.op("ReduceSum", [selected], keepdims=0)
+    # keepdims=1, like soft_sum above: the loss stays [1, 1], never rank-0
+    # (Pulsar2's quantizer cannot take a scalar graph output).
+    hard_sum = b.op("ReduceSum", [selected], keepdims=1)
     hard_mean = b.div(hard_sum, BATCH_SIZE_INPUT)
     hard_loss = b.op("Neg", [hard_mean])
 
@@ -379,14 +384,14 @@ def _build_forward_loss_and_grads(
             labels_onehot, onnx.TensorProto.FLOAT, logits_shape
         ),
         onnx.helper.make_tensor_value_info(
-            BATCH_SIZE_INPUT, onnx.TensorProto.FLOAT, []
+            BATCH_SIZE_INPUT, onnx.TensorProto.FLOAT, [1]
         ),
     ]
     loss_probe_graph = onnx.helper.make_graph(
         list(b.nodes),
         "loss_probe",
         loss_probe_inputs,
-        [onnx.helper.make_tensor_value_info(combined, onnx.TensorProto.FLOAT, [])],
+        [onnx.helper.make_tensor_value_info(combined, onnx.TensorProto.FLOAT, [1, 1])],
         initializer=list(b.initializer),
     )
     loss_probe_model = onnx.helper.make_model(
@@ -395,7 +400,10 @@ def _build_forward_loss_and_grads(
     loss_probe_model.ir_version = 8
     shapes = _shapes_of(loss_probe_model)
 
-    grad_seed = b.const(1.0, "loss_grad_seed")
+    # The backward seed matches the loss's own [1, 1] shape (ones, so the
+    # seed is the exact cotangent of a mean-reduction output, not a scalar
+    # that each rule would have to broadcast back by hand).
+    grad_seed = b.const(np.ones((1, 1), dtype=np.float32), "loss_grad_seed")
     forward_and_loss_nodes = list(b.nodes)
     grads = graph_grad.build_backward(
         b, forward_and_loss_nodes, shapes, {combined: grad_seed}, list(trainable)
@@ -459,17 +467,29 @@ def build_distillation_step_graph(
         initial_state[m_name] = np.zeros(shape, dtype=np.float32)
         initial_state[v_name] = np.zeros(shape, dtype=np.float32)
 
+    # The per-step hyperparameters ride along in per_step as rank-1 [1]
+    # vectors, NOT make_step_graph's scalars (rank-0): Pulsar2's Numpy
+    # calibration fetcher crashes on rank-0 inputs
+    # (IndexError('list index out of range'), while omitting them is
+    # rejected outright), so a step graph meant to ever compile for NPU
+    # must not declare any. Semantically identical -- every caller feeds
+    # one float per step either way.
     per_step = {
         fwd.input_name: (fwd.input_shape, onnx.TensorProto.FLOAT),
         fwd.teacher_logits_name: (fwd.logits_shape, onnx.TensorProto.FLOAT),
         fwd.labels_onehot_name: (fwd.logits_shape, onnx.TensorProto.FLOAT),
+        "lr": ([1], onnx.TensorProto.FLOAT),
+        "m_correction": ([1], onnx.TensorProto.FLOAT),
+        "v_correction": ([1], onnx.TensorProto.FLOAT),
+        BATCH_SIZE_INPUT: ([1], onnx.TensorProto.FLOAT),
     }
     step = qat_graph.make_step_graph(
         b,
         constants={},
         state=state,
-        scalars=["lr", "m_correction", "v_correction", BATCH_SIZE_INPUT],
+        scalars=[],
         loss=combined,
+        loss_shape=[1, 1],
         name="onnxsim_distillation_step",
         per_step=per_step,
     )

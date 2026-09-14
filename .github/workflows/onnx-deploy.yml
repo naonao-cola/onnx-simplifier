@@ -56,8 +56,8 @@ env:
   # NULL if the .so is older than the API version requested), then swapped
   # at runtime to the newer one, so the test exercises the realistic
   # "upgrade your ORT build without recompiling onnx-deploy" case.
-  ORT_VERSION_NEWER: 1.19.2
-  ORT_VERSION_OLDER: 1.18.1
+  ORT_VERSION_NEWER: 1.30.0
+  ORT_VERSION_OLDER: 1.29.0
   # Same Emscripten version static.yml (onnxsim's own wasm build) pins.
   EMSCRIPTEN_VERSION: "5.0.0"
 

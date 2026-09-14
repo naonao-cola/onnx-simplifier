@@ -834,3 +834,354 @@ def test_int8_quantize_rejects_conflicts():
         )
     with pytest.raises(ValueError, match="requires int8_quantize=True"):
         onnxsim.export_tflite(_relu_model(), inference_io_dtype="uint8")
+
+
+def test_invalid_io_layout_raises_without_tensorflow():
+    with pytest.raises(ValueError, match="io_layout"):
+        onnxsim.export_tflite(_relu_model(), io_layout="nchc")
+
+
+def test_onnx2tf_backend_rejects_nhwc_layout():
+    with pytest.raises(TypeError, match="io_layout"):
+        onnxsim.export_tflite(_relu_model(), backend="onnx2tf", io_layout="nhwc")
+
+
+# ---------------------------------------------------------------------------
+# io_layout="nhwc" (channel-last 4-D tensors end to end; no transposes)
+# ---------------------------------------------------------------------------
+
+
+def _tflite_op_counts(tflite_model: bytes):
+    pytest.importorskip("ai_edge_litert", reason="LiteRT is not installed")
+    from ai_edge_litert.tools import flatbuffer_utils as fbu
+
+    from onnxsim.edgetpu_export import _builtin_op_names
+
+    names = _builtin_op_names()
+    if names is None:
+        pytest.skip("installed ai_edge_litert is too old to decode operator codes")
+    model = fbu.convert_bytearray_to_object(bytearray(tflite_model))
+    counts = {}
+    for subgraph in model.subgraphs:
+        for op in subgraph.operators:
+            code = model.operatorCodes[op.opcodeIndex]
+            builtin = int(fbu.get_builtin_code_from_operator_code(code))
+            name = names.get(builtin, builtin)
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _assert_nhwc_matches_onnxruntime(model, inputs_nchw, **export_kwargs):
+    """Like ``_assert_matches_onnxruntime`` but converts with ``io_layout="nhwc"``.
+
+    Feeds are given in ONNX (NCHW) order and transposed for the channel-last
+    model; 4-D outputs are transposed back before comparing against
+    onnxruntime, so the assertion runs in NCHW space either way.
+    """
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    expected = sess.run(None, inputs_nchw)
+    feeds_nhwc = {
+        name: (np.transpose(v, (0, 2, 3, 1)).copy() if v.ndim == 4 else v)
+        for name, v in inputs_nchw.items()
+    }
+    tflite_model = onnxsim.export_tflite(model, io_layout="nhwc", **export_kwargs)
+    actual = _run_tflite(tflite_model, feeds_nhwc)
+    assert len(expected) == len(actual)
+    for e, a in zip(expected, actual):
+        if a.ndim == 4:
+            a = np.transpose(a, (0, 3, 1, 2))
+        np.testing.assert_allclose(e, a, rtol=1e-4, atol=1e-4)
+    return tflite_model
+
+
+def _conv_weights(rng, name, shape):
+    return numpy_helper.from_array(rng.randn(*shape).astype(np.float32), name=name)
+
+
+def test_nhwc_conv_chain_has_no_transposes():
+    rng = np.random.RandomState(10)
+    w1 = _conv_weights(rng, "w1", (4, 3, 3, 3))
+    b1 = numpy_helper.from_array(np.zeros(4, np.float32), name="b1")
+    w2 = _conv_weights(rng, "w2", (4, 4, 3, 3))
+    b2 = numpy_helper.from_array(np.zeros(4, np.float32), name="b2")
+    model = _model(
+        """
+        chain (float[1,3,8,8] x) => (float[1,4,8,8] y)
+        {
+            c1 = Conv <kernel_shape=[3,3], pads=[1,1,1,1]> (x, w1, b1)
+            r1 = Relu (c1)
+            y = Conv <kernel_shape=[3,3], pads=[1,1,1,1]> (r1, w2, b2)
+        }
+        """,
+        initializer=[w1, b1, w2, b2],
+    )
+    onnx.checker.check_model(model)
+    x = rng.randn(1, 3, 8, 8).astype(np.float32)
+    blob = _assert_nhwc_matches_onnxruntime(model, {"x": x})
+    assert _tflite_op_counts(blob).get("TRANSPOSE", 0) == 0
+
+
+def test_nhwc_concat_topology_has_no_transposes():
+    # The NCHW translator needs 5 transposes here (concat blocks TF's
+    # transpose push-through); NHWC-native concatenation needs none.
+    rng = np.random.RandomState(11)
+    wa = _conv_weights(rng, "wa", (4, 4, 3, 3))
+    ba = numpy_helper.from_array(np.zeros(4, np.float32), name="ba")
+    wb = _conv_weights(rng, "wb", (4, 4, 3, 3))
+    bb = numpy_helper.from_array(np.zeros(4, np.float32), name="bb")
+    wc = _conv_weights(rng, "wc", (4, 8, 1, 1))
+    bc = numpy_helper.from_array(np.zeros(4, np.float32), name="bc")
+    model = _model(
+        """
+        conc (float[1,4,8,8] x) => (float[1,4,8,8] y)
+        {
+            a = Conv <kernel_shape=[3,3], pads=[1,1,1,1]> (x, wa, ba)
+            b = Conv <kernel_shape=[3,3], pads=[1,1,1,1]> (x, wb, bb)
+            c = Concat <axis=1> (a, b)
+            y = Conv <kernel_shape=[1,1]> (c, wc, bc)
+        }
+        """,
+        initializer=[wa, ba, wb, bb, wc, bc],
+    )
+    onnx.checker.check_model(model)
+    x = rng.randn(1, 4, 8, 8).astype(np.float32)
+    blob = _assert_nhwc_matches_onnxruntime(model, {"x": x})
+    assert _tflite_op_counts(blob).get("TRANSPOSE", 0) == 0
+
+
+def test_nhwc_batchnorm_pool_and_depthwise():
+    rng = np.random.RandomState(12)
+    dw_w = numpy_helper.from_array(rng.randn(4, 1, 3, 3).astype(np.float32), name="dwW")
+    scale = numpy_helper.from_array(np.ones(4, np.float32), name="scale")
+    bn_bias = numpy_helper.from_array(np.zeros(4, np.float32), name="bn_bias")
+    mean = numpy_helper.from_array(np.zeros(4, np.float32), name="mean")
+    var = numpy_helper.from_array(np.ones(4, np.float32), name="var")
+    model = _model(
+        """
+        bnp (float[1,4,9,9] x) => (float[1,4,3,3] y)
+        {
+            dw = Conv <kernel_shape=[3,3], pads=[1,1,1,1], group=4> (x, dwW)
+            bn = BatchNormalization (dw, scale, bn_bias, mean, var)
+            y = AveragePool <kernel_shape=[3,3], strides=[3,3], pads=[1,1,1,1]> (bn)
+        }
+        """,
+        initializer=[dw_w, scale, bn_bias, mean, var],
+    )
+    onnx.checker.check_model(model)
+    x = rng.randn(1, 4, 9, 9).astype(np.float32)
+    _assert_nhwc_matches_onnxruntime(model, {"x": x})
+
+
+def test_nhwc_softmax_and_reduce_axes():
+    model = _model(
+        """
+        axes (float[1,4,3,3] x) => (float[1,4,1,1] y)
+        {
+            s = Softmax <axis=1> (x)
+            y = ReduceMean <axes=[2,3], keepdims=1> (s)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    x = np.random.RandomState(13).randn(1, 4, 3, 3).astype(np.float32)
+    _assert_nhwc_matches_onnxruntime(model, {"x": x})
+
+
+def test_nhwc_transpose_split_slice_gather():
+    # Fully asymmetric dims (C != H != W) so a misplaced axis can't hide.
+    model = _model(
+        """
+        mods (float[1,3,5,7] x) => (float[1,2,1,1] y)
+        <int64[1] gidx = {1},
+         int64[3] starts = {0,1,0}, int64[3] ends = {2,4,2}, int64[3] axes3 = {0,1,2},
+         int64[2] splitv = {1,2}>
+        {
+            tp = Transpose <perm=[0,2,3,1]> (x)
+            a, b = Split <axis=3> (tp, splitv)
+            sl = Slice (a, starts, ends, axes3)
+            g = Gather <axis=1> (sl, gidx)
+            y = Transpose (g)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    x = np.random.RandomState(14).randn(1, 3, 5, 7).astype(np.float32)
+    _assert_nhwc_matches_onnxruntime(model, {"x": x})
+
+
+def test_nhwc_reshape_flatten_gemm_head():
+    # Flatten crosses the NHWC backbone into the 2-D head through an NCHW
+    # island; the model output is 2-D either way.
+    rng = np.random.RandomState(15)
+    w = _conv_weights(rng, "w", (4, 2, 3, 3))
+    b = numpy_helper.from_array(np.zeros(4, np.float32), name="b")
+    gw = numpy_helper.from_array(rng.randn(3, 64).astype(np.float32), name="gw")
+    gb = numpy_helper.from_array(rng.randn(3).astype(np.float32), name="gb")
+    model = _model(
+        """
+        head (float[1,2,4,4] x) => (float[1,3] y)
+        {
+            c = Conv <kernel_shape=[3,3], pads=[1,1,1,1]> (x, w, b)
+            f = Flatten <axis=1> (c)
+            y = Gemm <transB=1> (f, gw, gb)
+        }
+        """,
+        initializer=[w, b, gw, gb],
+    )
+    onnx.checker.check_model(model)
+    x = rng.randn(1, 2, 4, 4).astype(np.float32)
+    _assert_nhwc_matches_onnxruntime(model, {"x": x})
+
+
+def test_nhwc_reshape_4d_to_4d_and_matmul_island():
+    # 4-D MatMul contracts the last two physical axes, so it runs in an NCHW
+    # island. Numerics run with the XNNPACK delegate disabled: TF 2.21 /
+    # ai-edge-litert 2.2.0 mis-executes transpose->BATCH_MATMUL under default
+    # buffer planning (verified: reference kernels match onnxruntime to 1e-7,
+    # perms/options decode correctly, preserve_all_tensors also matches -- the
+    # model bytes are right, the delegate reuses the transpose output buffer
+    # while BATCH_MATMUL still reads it).
+    pytest.importorskip("ai_edge_litert", reason="LiteRT is not installed")
+    rng = np.random.RandomState(16)
+    w = _conv_weights(rng, "w", (2, 2, 1, 1))
+    b = numpy_helper.from_array(np.zeros(2, np.float32), name="b")
+    model = _model(
+        """
+        rm (float[1,2,2,2] x) => (float[1,2,2,2] y)
+        <int64[4] shp = {1,2,2,2}>
+        {
+            c = Conv <kernel_shape=[1,1]> (x, w, b)
+            r = Reshape (c, shp)
+            y = MatMul (r, r)
+        }
+        """,
+        initializer=[w, b],
+    )
+    onnx.checker.check_model(model)
+    x = rng.randn(1, 2, 2, 2).astype(np.float32)
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (expected,) = sess.run(None, {"x": x})
+    blob = onnxsim.export_tflite(model, io_layout="nhwc")
+    from ai_edge_litert import interpreter as lit_interpreter
+
+    interp = lit_interpreter.Interpreter(
+        model_content=blob,
+        experimental_op_resolver_type=(
+            lit_interpreter.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
+        ),
+    )
+    interp.allocate_tensors()
+    (detail,) = interp.get_input_details()
+    interp.set_tensor(detail["index"], np.transpose(x, (0, 2, 3, 1)).copy())
+    interp.invoke()
+    (out_detail,) = interp.get_output_details()
+    actual = np.transpose(interp.get_tensor(out_detail["index"]), (0, 3, 1, 2))
+    np.testing.assert_allclose(expected, actual, rtol=1e-4, atol=1e-4)
+
+
+def test_nhwc_prelu_tile_pad_squeeze_unsqueeze():
+    rng = np.random.RandomState(17)
+    slope = numpy_helper.from_array(
+        (0.1 * rng.randn(3, 1, 1)).astype(np.float32), name="slope"
+    )
+    model = _model(
+        """
+        misc (float[1,3,4,4] x) => (float[1,6,3,4] y)
+        <int64[4] reps = {1,2,1,2}, int64[8] padsv = {0,0,1,0,0,0,1,0},
+         int64[1] sqax = {0}, int64[1] usqax = {0}>
+        {
+            p = PRelu (x, slope)
+            t = Tile (p, reps)
+            pd = Pad <mode="constant"> (t, padsv)
+            us = Unsqueeze (pd, usqax)
+            sq = Squeeze (us, sqax)
+            y = AveragePool <kernel_shape=[2,2], strides=[2,2]> (sq)
+        }
+        """,
+        initializer=[slope],
+    )
+    onnx.checker.check_model(model)
+    x = rng.randn(1, 3, 4, 4).astype(np.float32)
+    _assert_nhwc_matches_onnxruntime(model, {"x": x})
+
+
+def test_nhwc_shape_to_reshape_chain():
+    # Shape speaks ONNX-logical (NCHW) dims in nhwc mode too, so a Shape-fed
+    # Reshape target needs no reordering inside the Reshape island -- including
+    # through a Gather/Concat chain, and for the direct Shape->Reshape form.
+    model = _model(
+        """
+        shch (float[1,2,2,4] x) => (float[1,4,2,2] y, float[1,2,2,4] z)
+        <int64[1] gidx = {0}, int64[1] four = {4}, int64[2] twos = {2,2}>
+        {
+            sh = Shape (x)
+            g0 = Gather <axis=0> (sh, gidx)
+            tgt = Concat <axis=0> (g0, four, twos)
+            y = Reshape (x, tgt)
+            z = Reshape (x, sh)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    x = np.random.RandomState(18).randn(1, 2, 2, 4).astype(np.float32)
+    _assert_nhwc_matches_onnxruntime(model, {"x": x})
+
+
+def test_nhwc_mixed_rank_broadcast_uses_island():
+    # A [C]-shaped vector broadcasts over W in NCHW but over C in NHWC, so the
+    # mixed-rank Add runs in an NCHW island and keeps NCHW semantics.
+    model = _model(
+        """
+        bc (float[1,2,2,3] x, float[3] v) => (float[1,2,2,3] y)
+        {
+            y = Add (x, v)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    rng = np.random.RandomState(19)
+    x = rng.randn(1, 2, 2, 3).astype(np.float32)
+    v = rng.randn(3).astype(np.float32)
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (expected,) = sess.run(None, {"x": x, "v": v})
+    tflite_model = onnxsim.export_tflite(model, io_layout="nhwc")
+    interp = tf.lite.Interpreter(model_content=tflite_model)
+    interp.allocate_tensors()
+    details = {d["name"]: d for d in interp.get_input_details()}
+    assert len(details) == 2
+    # NCHW input x is still fed NHWC (transposed); the vector is unchanged.
+    (dx,) = [d for n, d in details.items() if list(d["shape"]) == [1, 2, 3, 2]]
+    (dv,) = [d for n, d in details.items() if list(d["shape"]) == [3]]
+    interp.set_tensor(dx["index"], np.transpose(x, (0, 2, 3, 1)).copy())
+    interp.set_tensor(dv["index"], v)
+    interp.invoke()
+    (actual,) = [interp.get_tensor(d["index"]) for d in interp.get_output_details()]
+    np.testing.assert_allclose(
+        expected, np.transpose(actual, (0, 3, 1, 2)), rtol=1e-4, atol=1e-4
+    )
+
+
+def test_nhwc_public_io_order():
+    model = _model(
+        """
+        io (float[1,3,4,5] x) => (float[1,3,4,5] y)
+        {
+            y = Relu (x)
+        }
+        """
+    )
+    tflite_model = onnxsim.export_tflite(model, io_layout="nhwc")
+    interp = tf.lite.Interpreter(model_content=tflite_model)
+    interp.allocate_tensors()
+    assert list(interp.get_input_details()[0]["shape"]) == [1, 4, 5, 3]
+    assert list(interp.get_output_details()[0]["shape"]) == [1, 4, 5, 3]
+    nchw_model = onnxsim.export_tflite(model)
+    interp = tf.lite.Interpreter(model_content=nchw_model)
+    interp.allocate_tensors()
+    assert list(interp.get_input_details()[0]["shape"]) == [1, 3, 4, 5]

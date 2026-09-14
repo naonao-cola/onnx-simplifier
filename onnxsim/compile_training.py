@@ -92,7 +92,7 @@ unsupported source device: let ``feeds``/parameters cross to host memory
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import onnx
@@ -136,6 +136,194 @@ def _to_numpy(value: Any) -> np.ndarray:
     module's docstring). A numpy array has no ``.numpy()`` method of its
     own, which is what tells the two apart here."""
     return value.numpy() if hasattr(value, "numpy") else value
+
+
+def _quantize_forward_for_training(
+    model: onnx.ModelProto,
+    params: Sequence[str],
+    calibration_data: Optional[Sequence[Dict[str, np.ndarray]]],
+) -> onnx.ModelProto:
+    """Rewrites ``model``'s forward onto the INT8 grid while keeping every
+    trained weight trainable in fp32 -- the ``quantize_forward`` half of
+    :meth:`TrainingLoop._compile`.
+
+    Runs :func:`onnxsim.calibration.quantize_static` (QDQ format: the
+    MatMul/Gemm/Conv nodes stay, their inputs are rerouted through
+    ``QuantizeLinear``/``DequantizeLinear`` pairs), then gives each trained
+    weight a fp32 master initializer under its original name, feeding the
+    weight's ``DequantizeLinear`` through a fresh ``QuantizeLinear`` -- a
+    fake-quant chain: the forward computes exactly what INT8 inference
+    would, while the master receives straight-through gradients (see
+    :mod:`onnxsim.graph_grad`'s ``QuantizeLinear`` rule) and the optimizer
+    keeps updating fp32.
+
+    A trained weight the quantizer left untouched (not a constant 2-D/conv
+    weight, or a missing calibration range) is left alone and keeps training
+    in plain fp32 -- mixed precision degrades gracefully, layer by layer.
+    """
+    from onnxsim.calibration import quantize_static
+
+    try:
+        # Intermediate activations need value_info or the calibrator only
+        # ever sees the graph inputs (and the tail of the network silently
+        # trains fp32 -- including, worse, a half-quantized graph that trips
+        # fusing runtimes).
+        model = onnx.shape_inference.infer_shapes(model)
+    except Exception:
+        pass
+    quantized = quantize_static(model, calibration_data)
+    trained = set(params)
+    # Original weight uses, keyed by node output: the quantizer rewires a
+    # node's inputs but never the node itself, so outputs identify nodes
+    # across the rewrite.
+    weight_uses: Dict[str, str] = {}
+    for node in model.graph.node:
+        if (
+            node.op_type in ("MatMul", "Gemm", "Conv")
+            and len(node.input) > 1
+            and node.input[1] in trained
+            and node.output
+        ):
+            weight_uses[node.output[0]] = node.input[1]
+    if not weight_uses:
+        return quantized
+
+    float_inits = {t.name: t for t in model.graph.initializer}
+    inits = {t.name: t for t in quantized.graph.initializer}
+    by_output = {o: n for n in quantized.graph.node for o in n.output}
+    # (param, weight-DQ node) pairs whose fake-quant master to build. The
+    # stale float weight and the int8 codes are dropped by name below, so
+    # collection and mutation stay strictly ordered: dropping first, then
+    # creating the same-named masters, never both at once.
+    jobs: Dict[str, List[onnx.NodeProto]] = {}
+    drop_inits: List[str] = []
+    for out, param in weight_uses.items():
+        node = by_output.get(out)
+        if node is None or len(node.input) < 2:
+            continue
+        dq = by_output.get(node.input[1])
+        if (
+            dq is None
+            or dq.op_type != "DequantizeLinear"
+            or not (2 <= len(dq.input) <= 3)
+            or dq.input[0] not in inits
+        ):
+            continue  # weight left unquantized: trains fp32 as before
+        wq = inits[dq.input[0]]
+        if wq.data_type != onnx.TensorProto.INT8:
+            continue
+        master = float_inits.get(param)
+        if master is None or master.data_type != onnx.TensorProto.FLOAT:
+            continue
+        stale = inits.get(param)
+        if stale is not None:
+            if any(stale.name in n.input for n in quantized.graph.node):
+                raise ValueError(
+                    f"trained weight {param!r} is still consumed in float "
+                    "by some node after quantization; quantize_forward "
+                    "needs every use quantized (or none)"
+                )
+            if stale.name not in drop_inits:
+                drop_inits.append(stale.name)
+        if wq.name not in drop_inits:
+            drop_inits.append(wq.name)
+        jobs.setdefault(param, []).append(dq)
+    if drop_inits:
+        doomed = set(drop_inits)
+        kept = [t for t in quantized.graph.initializer if t.name not in doomed]
+        del quantized.graph.initializer[:]
+        quantized.graph.initializer.extend(kept)
+        inits = {t.name: t for t in quantized.graph.initializer}
+    for param, dqs in jobs.items():
+        master = float_inits[param]
+        ql_out = f"{param}__train_master_q"
+        first = dqs[0]
+        ql = onnx.helper.make_node(
+            "QuantizeLinear", [param, first.input[1], *first.input[2:]], [ql_out]
+        )
+        # Insert directly before the first consuming DequantizeLinear: nodes
+        # must stay topologically sorted.
+        anchor = next(i for i, n in enumerate(quantized.graph.node) if n is first)
+        quantized.graph.node.insert(anchor, ql)
+        fresh = onnx.TensorProto()
+        fresh.CopyFrom(master)
+        quantized.graph.initializer.extend([fresh])
+        for dq in dqs:
+            dq.input[0] = ql_out
+    return quantized
+
+
+def _cast_backward_to_fp16(
+    b: qat_graph.GraphBuilder,
+    n_fwd: int,
+    n_bwd: int,
+    elem_types: Dict[str, int],
+    grads: Dict[str, str],
+) -> Dict[str, str]:
+    """Rewrites the backward slice ``b.nodes[n_fwd:n_bwd]`` onto fp16 and
+    returns the (possibly new) gradient names, one per target.
+
+    Every edge from an fp32 source outside the slice (a forward tensor, a
+    float initializer) into the slice gets a ``Cast`` to ``FLOAT16``; every
+    gradient gets a ``Cast`` back to ``FLOAT`` right where the optimizer
+    section will consume it. Non-float sources (int64 shapes/indices,
+    boolean masks, quantized codes) pass through untouched, and anything
+    the slice computes internally stays whatever dtype its (now fp16)
+    inputs propagate. Casts insert directly before their consumer, so the
+    node list stays topologically sorted.
+    """
+    float_sources = {
+        t.name for t in b.initializer if t.data_type == onnx.TensorProto.FLOAT
+    }
+    float_sources.update(
+        name for name, dtype in elem_types.items() if dtype == onnx.TensorProto.FLOAT
+    )
+    cast_suffix = 0
+    fp16_names = set()
+
+    def cast_to(dtype: int, src: str, hint: str) -> Tuple[str, onnx.NodeProto]:
+        nonlocal cast_suffix
+        out = f"{src}__bwd_{hint}_{cast_suffix}"
+        cast_suffix += 1
+        return out, onnx.helper.make_node("Cast", [src], [out], to=dtype)
+
+    pending: List[Tuple[int, onnx.NodeProto]] = []
+    for idx in range(n_fwd, n_bwd):
+        node = b.nodes[idx]
+        for j, inp in enumerate(node.input):
+            if inp in float_sources and inp not in fp16_names:
+                out, cast = cast_to(onnx.TensorProto.FLOAT16, inp, "f16")
+                pending.append((idx, cast))
+                node.input[j] = out
+                fp16_names.add(out)
+    offset = 0
+    for idx, cast in pending:
+        b.nodes.insert(idx + offset, cast)
+        offset += 1
+    # Rules emit mask/constant casts hardcoded to FLOAT (Greater/Less +
+    # Cast, Where's cond cast, int-index casts). Inside the slice those
+    # must match the surrounding fp16 math, so retarget the ones that do
+    # not provably consume a static-fp32 tensor. (The fp32 grad
+    # cast-backs appended below are created after this walk and keep
+    # their dtype.)
+    for idx in range(n_fwd, n_bwd + offset):
+        node = b.nodes[idx]
+        if node.op_type != "Cast":
+            continue
+        to = next((a.i for a in node.attribute if a.name == "to"), None)
+        if to != onnx.TensorProto.FLOAT:
+            continue
+        if any(inp in float_sources for inp in node.input if inp):
+            continue
+        for attr in node.attribute:
+            if attr.name == "to":
+                attr.i = onnx.TensorProto.FLOAT16
+    new_grads: Dict[str, str] = {}
+    for param, grad in grads.items():
+        out, cast = cast_to(onnx.TensorProto.FLOAT, grad, "f32")
+        b.nodes.append(cast)
+        new_grads[param] = out
+    return new_grads
 
 
 def _static_shapes_and_types(
@@ -321,12 +509,74 @@ class TrainingLoop:
     #: ``onnxsim.torch_training.trace_torch_optimizer`` for the usual way to
     #: build one).
     optimizer: Union[str, CustomOptimizer] = "adam"
+    #: Static loss-scale factor (default 1.0 = off): seeds the backward with
+    #: this value instead of 1 and divides every parameter gradient back out
+    #: before the optimizer update. A no-op mathematically at any value
+    #: (exact for powers of two) -- its purpose is future lower-precision
+    #: backward math, where unscaled gradients underflow: scaling keeps them
+    #: representable through the backward, unscaling restores them for the
+    #: fp32 update. Must be finite and positive.
+    loss_scale: float = 1.0
     #: onnxruntime execution providers for the compiled step, in priority
     #: order. ``None`` means CPU.
     providers: Optional[Sequence[backend.Provider]] = None
+    #: Execution providers for the forward pass only. ``None`` (the
+    #: default) runs the whole fused step on :attr:`providers`. Set it --
+    #: e.g. a VitisAI NPU entry with ``CPUExecutionProvider`` last -- to
+    #: split execution instead: the forward runs on
+    #: :attr:`forward_providers`, the backward+optimizer on
+    #: :attr:`providers`, with the boundary activations crossing the host
+    #: between the two sessions every step.
+    #:
+    #: The split exists for runtimes that fuse the forward fine but abort
+    #: on the backward-containing whole (measured: the VitisAI EP's frontend
+    #: mis-fuses a ``QuantizeLinear`` when the step graph carries the
+    #: training backward alongside the QDQ forward). Split mode always
+    #: crosses numpy (no device-resident state), while the fused mode keeps
+    #: the ``OrtValue`` fast path.
+    forward_providers: Optional[Sequence[backend.Provider]] = None
+    #: Train with an INT8-quantized forward and an fp32 backward: when true,
+    #: :meth:`_compile` first runs :func:`onnxsim.calibration.quantize_static`
+    #: over the model (calibrated on :attr:`calibration_data`), then gives
+    #: every trained weight a trainable fp32 master behind a fake-quant
+    #: ``QuantizeLinear`` (straight-through differentiable -- see
+    #: :mod:`onnxsim.graph_grad`'s ``QuantizeLinear`` rule), so the forward
+    #: computes on the INT8 grid a QDQ-aware runtime fuses into integer
+    #: kernels (e.g. the VitisAI NPU) while gradients, master weights and
+    #: optimizer state all stay fp32. Integer backprop does not exist on
+    #: such runtimes, so this split -- quantized forward, float backward --
+    #: is the whole of what "INT8 training" can mean there.
+    quantize_forward: bool = False
+    #: Representative input batches calibrating :attr:`quantize_forward`'s
+    #: activation ranges -- one ``{input_name: array}`` dict per batch, as
+    #: :func:`onnxsim.calibration.quantize_static` takes them. ``None``
+    #: falls back to that function's own random calibration data (a smoke
+    #: test, not a deployment recipe). Ignored unless
+    #: :attr:`quantize_forward` is true.
+    calibration_data: Optional[Sequence[Dict[str, np.ndarray]]] = None
+    #: Precision of the backward math: ``"float32"`` (default) or
+    #: ``"float16"``. ``"float16"`` casts every fp32 edge entering the
+    #: backward subgraph to fp16 and casts each parameter gradient back to
+    #: fp32 before the optimizer update, so masters, moments and updates
+    #: stay fp32 while the gradient math itself halves in width -- the
+    #: standard AMP shape, minus the dynamic loss scaling (use
+    #: :attr:`loss_scale` with a large power of two: unscaled fp16
+    #: gradients underflow fast). Non-float edges (int64 shapes/indices,
+    #: boolean masks, quantized codes) are left untouched.
+    backward_precision: str = "float32"
 
     _step: Optional[qat_graph.StepGraph] = field(default=None, init=False, repr=False)
     _runner: Optional[backend.Runner] = field(default=None, init=False, repr=False)
+    #: Split-mode sessions (forward on :attr:`forward_providers`,
+    #: backward+optimizer on :attr:`providers`); both ``None`` unless split
+    #: execution is active. ``_needed`` is the boundary activation set the
+    #: forward session returns and the backward session consumes.
+    _runner_fwd: Optional[backend.Runner] = field(default=None, init=False, repr=False)
+    _runner_bwd: Optional[backend.Runner] = field(default=None, init=False, repr=False)
+    _needed: Tuple[str, ...] = field(default=(), init=False, repr=False)
+    #: Split mode's state map (state input name -> updated-state output
+    #: name), mirroring :attr:`step_graph`'s own for the backward session.
+    _bwd_state: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
     #: The state as onnxruntime last returned it: an ``OrtValue`` per entry
     #: when :meth:`onnxsim.backend.Runner.supports_ort_values` (kept
     #: device-resident between calls -- see this module's own docstring),
@@ -347,13 +597,22 @@ class TrainingLoop:
         self.params = tuple(self.params)
         if not self.params:
             raise ValueError("params must name at least one trainable initializer")
+        if not (np.isfinite(self.loss_scale) and self.loss_scale > 0):
+            raise ValueError(
+                f"loss_scale must be finite and positive, got {self.loss_scale!r}"
+            )
+        if self.backward_precision not in ("float32", "float16"):
+            raise ValueError(
+                "backward_precision must be 'float32' or 'float16', "
+                f"got {self.backward_precision!r}"
+            )
 
     @property
     def compiled(self) -> bool:
         """Whether the step graph has been built yet. ``False`` until the
         first call, or until :attr:`step_graph`/:attr:`initial_state` is
         read."""
-        return self._runner is not None
+        return self._runner is not None or self._runner_fwd is not None
 
     @property
     def step_graph(self) -> qat_graph.StepGraph:
@@ -368,7 +627,7 @@ class TrainingLoop:
         or to inspect it. Reading this before any call does not run a step;
         it only builds the graph and the onnxruntime session for it.
         """
-        if self._runner is None:
+        if self._runner is None and self._runner_fwd is None:
             self._compile()
         assert self._step is not None
         return self._step
@@ -405,9 +664,12 @@ class TrainingLoop:
         why that avoids a copy, and :func:`onnxsim.backend.as_ort_value` for
         exactly what "implementing DLPack" buys here.
         """
-        if self._runner is None:
+        if self._runner is None and self._runner_fwd is None:
             self._compile()
-        assert self._step is not None and self._runner is not None
+        assert self._step is not None
+        if self._runner_fwd is not None:
+            return self._call_split(feeds, lr)
+        assert self._runner is not None
 
         if self._runner.supports_ort_values():
             return self._call_with_ort_values(feeds, lr)
@@ -505,6 +767,10 @@ class TrainingLoop:
         :meth:`onnxsim.qat_graph.GraphBuilder.name`.
         """
         model = self.model
+        if self.quantize_forward:
+            model = _quantize_forward_for_training(
+                model, self.params, self.calibration_data
+            )
         shapes, elem_types = _static_shapes_and_types(model)
 
         initializers = {t.name: t for t in model.graph.initializer}
@@ -533,7 +799,8 @@ class TrainingLoop:
         trained = set(self.params)
         b.initializer = [t for t in model.graph.initializer if t.name not in trained]
 
-        seed = b.const(np.array(1.0, dtype=np.float32), "loss_seed")
+        seed = b.const(np.array(self.loss_scale, dtype=np.float32), "loss_seed")
+        n_fwd = len(b.nodes)
         grads = graph_grad.build_backward(
             b,
             nodes=list(model.graph.node),
@@ -541,6 +808,17 @@ class TrainingLoop:
             grad_outputs={self.loss_output: seed},
             targets=list(self.params),
         )
+        if self.backward_precision == "float16":
+            grads = _cast_backward_to_fp16(b, n_fwd, len(b.nodes), elem_types, grads)
+        if self.loss_scale != 1.0:
+            # Unscale: the seed above multiplies every gradient by the loss
+            # scale (backprop is linear), so divide it back out before the
+            # optimizer update. Exact for power-of-two scales; skipped
+            # entirely at 1.0 so default graphs are byte-identical.
+            inv = b.const(
+                np.array(1.0 / self.loss_scale, dtype=np.float32), "loss_unscale"
+            )
+            grads = {p: b.mul(g, inv) for p, g in grads.items()}
 
         state: Dict[str, Tuple[Sequence[int], str]] = {}
         scalars = ["lr"]
@@ -610,19 +888,168 @@ class TrainingLoop:
             loss=self.loss_output,
             name="onnxsim_train_step",
         )
-        self._runner = backend.Runner(
-            self._step.model,
-            output_names=list(self._step.state.values()) + [self.loss_output],
-            providers=self.providers,
-        )
-        # Uploaded once, here, rather than on every call: from this point on
-        # __call__'s onnxruntime path never sees a numpy array for its own
-        # state again (see this module's own docstring).
-        if self._runner.supports_ort_values():
-            self._state = {k: backend.as_ort_value(v) for k, v in initial_state.items()}
+        if self.forward_providers is None:
+            self._runner = backend.Runner(
+                self._step.model,
+                output_names=list(self._step.state.values()) + [self.loss_output],
+                providers=self.providers,
+            )
+            # Uploaded once, here, rather than on every call: from this point on
+            # __call__'s onnxruntime path never sees a numpy array for its own
+            # state again (see this module's own docstring).
+            if self._runner.supports_ort_values():
+                self._state = {
+                    k: backend.as_ort_value(v) for k, v in initial_state.items()
+                }
+            else:
+                self._state = initial_state
         else:
+            self._build_split_runners(
+                b,
+                len(model.graph.node),
+                model,
+                shapes,
+                elem_types,
+                state,
+                scalars,
+                initial_state,
+            )
             self._state = initial_state
         self._t = 0
+
+    def _build_split_runners(
+        self,
+        b: qat_graph.GraphBuilder,
+        n_fwd: int,
+        model: onnx.ModelProto,
+        shapes: Dict[str, Sequence[Union[int, str]]],
+        elem_types: Dict[str, int],
+        state: Dict[str, Tuple[Sequence[int], str]],
+        scalars: Sequence[str],
+        initial_state: Dict[str, np.ndarray],
+    ) -> None:
+        """Split execution: a forward session on :attr:`forward_providers`
+        and a backward+optimizer session on :attr:`providers`.
+
+        The builder holds forward nodes first (copied verbatim from the
+        model) and everything derived after -- the split sits exactly on
+        that boundary. Tensors the tail consumes from the head cross as
+        plain graph outputs/inputs (``_needed``); trained parameters ride
+        along as forward inputs (they are state, fed per step) and the fused
+        :attr:`step_graph` above is still built (but never sessioned), so
+        inspection, ``initial_state`` and ``export`` keep working unchanged.
+        """
+        fwd_nodes = list(b.nodes[:n_fwd])
+        bwd_nodes = list(b.nodes[n_fwd:])
+        fwd_out = {o for n in fwd_nodes for o in n.output if o}
+        tail_in = {i for n in bwd_nodes for i in n.input if i}
+        needed = sorted(t for t in (tail_in & fwd_out) if t != self.loss_output)
+
+        inits = {t.name for t in b.initializer}
+
+        def vinfo(name: str) -> onnx.ValueInfoProto:
+            return onnx.helper.make_tensor_value_info(
+                name,
+                elem_types.get(name, onnx.TensorProto.FLOAT),
+                _int_shape(shapes[name]),
+            )
+
+        model_inputs = [i.name for i in model.graph.input if i.name not in inits]
+        fwd_model = onnx.helper.make_model(
+            onnx.helper.make_graph(
+                fwd_nodes,
+                "onnxsim_train_forward",
+                [vinfo(n) for n in model_inputs]
+                + [vinfo(p) for p in self.params if p not in model_inputs],
+                [vinfo(self.loss_output)] + [vinfo(t) for t in needed],
+                list(b.initializer),
+            ),
+            opset_imports=model.opset_import,
+            ir_version=model.ir_version,
+        )
+        bwd_inputs = (
+            [vinfo(t) for t in needed]
+            # State inputs (trained params and optimizer moments) carry
+            # their own recorded shapes: backward-internal names like the
+            # moment buffers never appear in the forward shapes dict.
+            + [
+                onnx.helper.make_tensor_value_info(
+                    p, onnx.TensorProto.FLOAT, _int_shape(shape)
+                )
+                for p, (shape, _) in state.items()
+            ]
+            + [
+                onnx.helper.make_tensor_value_info(s, onnx.TensorProto.FLOAT, [])
+                for s in scalars
+            ]
+        )
+        bwd_model = onnx.helper.make_model(
+            onnx.helper.make_graph(
+                bwd_nodes,
+                "onnxsim_train_backward",
+                bwd_inputs,
+                [
+                    onnx.helper.make_tensor_value_info(
+                        out_name, onnx.TensorProto.FLOAT, _int_shape(shape)
+                    )
+                    for _, (shape, out_name) in state.items()
+                ],
+                list(b.initializer),
+            ),
+            opset_imports=model.opset_import,
+            ir_version=model.ir_version,
+        )
+        for proto in (fwd_model, bwd_model):
+            proto.functions.extend(b.functions)
+        self._needed = tuple(needed)
+        self._bwd_state = {k: o for k, (_, o) in state.items()}
+        self._runner_fwd = backend.Runner(
+            fwd_model,
+            output_names=[self.loss_output] + list(needed),
+            providers=self.forward_providers,
+        )
+        self._runner_bwd = backend.Runner(
+            bwd_model,
+            output_names=[o for _, o in state.values()],
+            providers=self.providers,
+        )
+
+    def _call_split(self, feeds: Dict[str, Any], lr: float) -> float:
+        """One :meth:`__call__` step in split mode: forward on
+        :attr:`forward_providers`, backward+optimizer on :attr:`providers`,
+        boundary activations and state crossing as numpy."""
+        assert self._runner_fwd is not None and self._runner_bwd is not None
+        # Feed only what the forward session declares: a re-frozen forward
+        # bakes the weights in as initializers instead of taking them as
+        # state inputs (see the periodic re-freeze recipe), and extra feeds
+        # are an error, not ignored. Without an onnxruntime session (the
+        # reference-evaluator fallback) there is nothing to filter against.
+        sess = getattr(self._runner_fwd, "_sess", None)
+        get_inputs = getattr(sess, "get_inputs", None)
+        declared = {i.name for i in get_inputs()} if get_inputs is not None else None
+        fwd_in = {
+            k: np.asarray(v, dtype=np.float32)
+            for k, v in feeds.items()
+            if declared is None or k in declared
+        }
+        for p in self.params:
+            if declared is None or p in declared:
+                fwd_in[p] = np.asarray(self._state[p], dtype=np.float32)
+        fout = self._runner_fwd(fwd_in)
+        bwd_in = {t: np.asarray(fout[t], dtype=np.float32) for t in self._needed}
+        for k, v in self._state.items():
+            bwd_in[k] = np.asarray(v, dtype=np.float32)
+        bwd_in["lr"] = np.asarray(lr, dtype=np.float32)
+        if self.optimizer == "adam":
+            for name, value in qat_graph.adam_bias_corrections(self._t).items():
+                bwd_in[name] = np.asarray(value, dtype=np.float32)
+        out = self._runner_bwd(bwd_in)
+        self._state = {
+            input_name: out[output_name]
+            for input_name, output_name in self._bwd_state.items()
+        }
+        self._t += 1
+        return float(fout[self.loss_output])
 
 
 def compile_training_loop(
@@ -631,6 +1058,11 @@ def compile_training_loop(
     params: Sequence[str],
     optimizer: Union[str, CustomOptimizer] = "adam",
     providers: Optional[Sequence[backend.Provider]] = None,
+    quantize_forward: bool = False,
+    calibration_data: Optional[Sequence[Dict[str, np.ndarray]]] = None,
+    forward_providers: Optional[Sequence[backend.Provider]] = None,
+    loss_scale: float = 1.0,
+    backward_precision: str = "float32",
 ) -> TrainingLoop:
     """Wraps ``model`` as a ``torch.compile``-styled training loop.
 
@@ -651,6 +1083,24 @@ def compile_training_loop(
             covers.
     :param providers: onnxruntime execution providers for the compiled step,
             in priority order. ``None`` means CPU.
+    :param quantize_forward: train with an INT8-quantized forward and an
+            fp32 backward -- see :attr:`TrainingLoop.quantize_forward`. Needs
+            calibrated activation ranges: pass representative batches as
+            :param:`calibration_data`, or omit it for random data (a smoke
+            test only).
+    :param calibration_data: representative input batches for
+            :param:`quantize_forward`'s calibration, one
+            ``{input_name: array}`` dict per batch. Ignored unless
+            :param:`quantize_forward` is true.
+    :param forward_providers: execution providers for the forward pass
+            only -- see :attr:`TrainingLoop.forward_providers`. ``None``
+            runs the whole fused step on :param:`providers`.
+    :param loss_scale: static loss-scale factor, 1.0 (off) by default --
+            see :attr:`TrainingLoop.loss_scale`.
+    :param backward_precision: ``"float32"`` (default) or ``"float16"`` --
+            see :attr:`TrainingLoop.backward_precision`. Combine ``"float16"``
+            with a large :param:`loss_scale`: unscaled fp16 gradients
+            underflow fast.
     """
     return TrainingLoop(
         model=model,
@@ -658,4 +1108,9 @@ def compile_training_loop(
         params=tuple(params),
         optimizer=optimizer,
         providers=providers,
+        quantize_forward=quantize_forward,
+        calibration_data=calibration_data,
+        forward_providers=forward_providers,
+        loss_scale=loss_scale,
+        backward_precision=backward_precision,
     )

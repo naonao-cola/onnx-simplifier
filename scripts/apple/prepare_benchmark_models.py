@@ -120,9 +120,10 @@ BENCHMARK_MODELS: list[BenchmarkModel] = [
         "50x cliff from the 1.5B model's throughput, not just the ~2x weight-size ratio "
         "would suggest, and decode parity didn't finish measuring (the CI run that "
         "produced this was cancelled by a concurrent push mid-parity-check, after the "
-        "decode benchmark itself completed) -- unclear yet whether this tier is "
-        "genuinely unusable on this runner class or something else is going wrong; "
-        "worth a dedicated re-run before drawing conclusions.",
+        "decode benchmark itself completed). Re-running the same model/benchmark on a "
+        "16GB M4 Mac mini (CPU_ONLY, 7.3GB peak RSS) gives 2.44 tok/s with a 15.8s "
+        "prefill -- no cliff -- so the CI number reads as that runner's memory "
+        "ceiling, not an architectural property of the 3B tier.",
     ),
     BenchmarkModel(
         "microsoft/Phi-3.5-mini-instruct",

@@ -406,14 +406,62 @@ def _static_dims(value_info: onnx.ValueInfoProto) -> Optional[List[int]]:
     return dims
 
 
+# Activation-size envelope above which the default NCHW export risks the Edge
+# TPU compiler's "large activation tensors" failure: measured with
+# edgetpu_compiler 16.0 on 3x3 conv graphs, a 4-D activation with at least
+# this many channels and this many elements fails to compile with the NCHW
+# entry transpose (64ch x 32x32 fails; 64ch x 24x24, 32ch x 32x32 and 4ch x
+# 128x128 map), while the identical NHWC graph maps fully. Conservative on
+# purpose -- exit-transpose-only graphs are unaffected, which static analysis
+# cannot tell apart.
+_EDGETPU_LARGE_ACTIVATION_CHANNELS = 8
+_EDGETPU_LARGE_ACTIVATION_ELEMENTS = 65536
+
+
+def _largest_4d_activation(model: onnx.ModelProto) -> Optional[Tuple[int, int, str]]:
+    """Largest 4-D activation as ``(channels, elements, tensor_name)``.
+
+    Scans graph inputs/outputs plus shape-inferred intermediates (initializers
+    excluded -- constant weights never transpose at runtime). Returns ``None``
+    when no fully-static 4-D tensor is found or shape inference is unavailable.
+    """
+    try:
+        inferred = onnx.shape_inference.infer_shapes(model)
+    except Exception:
+        inferred = model
+    initializer_names = {t.name for t in model.graph.initializer}
+    best: Optional[Tuple[int, int, str]] = None
+    seen = set()
+    candidates = (
+        list(inferred.graph.input)
+        + list(inferred.graph.output)
+        + list(inferred.graph.value_info)
+    )
+    for value_info in candidates:
+        if value_info.name in seen or value_info.name in initializer_names:
+            continue
+        seen.add(value_info.name)
+        dims = _static_dims(value_info)
+        if dims is None or len(dims) != 4 or any(d <= 0 for d in dims):
+            continue
+        elements = int(np.prod(dims, dtype=np.int64))
+        if elements == 0:
+            continue
+        if best is None or elements > best[1]:
+            best = (dims[1], elements, value_info.name)
+    return best
+
+
 def check_onnx_for_edgetpu(model: onnx.ModelProto) -> EdgeTPUCompatibilityReport:
     """Statically check an ONNX model against the Edge TPU model requirements.
 
     Covers fully-static input shapes, the >3-D size rule (only the 3 innermost
-    dimensions may exceed 1), and a per-node lookup in the Edge TPU operation
-    table. This is a heuristic pre-check -- the authoritative answer for a
-    converted model comes from :func:`compile_for_edgetpu`'s operator log --
-    but it needs nothing but ``onnx`` and runs before any conversion.
+    dimensions may exceed 1), the activation-size envelope that risks the
+    compiler's "large activation tensors" failure under the default NCHW
+    layout, and a per-node lookup in the Edge TPU operation table. This is a
+    heuristic pre-check -- the authoritative answer for a converted model comes
+    from :func:`compile_for_edgetpu`'s operator log -- but it needs nothing but
+    ``onnx`` and runs before any conversion.
 
     Parameters
     ----------
@@ -454,6 +502,29 @@ def check_onnx_for_edgetpu(model: onnx.ModelProto) -> EdgeTPUCompatibilityReport
                     message=f"shape {dims} has more than 3 dimensions with a "
                     "leading dimension > 1; only the 3 innermost dimensions "
                     "may exceed 1 on the Edge TPU.",
+                )
+            )
+
+    largest = _largest_4d_activation(model)
+    if largest is not None:
+        channels, elements, tensor_name = largest
+        if (
+            channels >= _EDGETPU_LARGE_ACTIVATION_CHANNELS
+            and elements >= _EDGETPU_LARGE_ACTIVATION_ELEMENTS
+        ):
+            report.findings.append(
+                EdgeTPUNodeFinding(
+                    node=tensor_name,
+                    op_type="activation size",
+                    level="warning",
+                    message=f"4-D activation with {channels} channels and "
+                    f"{elements} elements; the default NCHW export risks the "
+                    "Edge TPU compiler's 'large activation tensors' failure "
+                    "on the entry transpose at this size (measured: 64ch x "
+                    "32x32 fails, the identical NHWC graph maps fully). "
+                    "Convert with io_layout='nhwc' (--tflite-layout nhwc) for "
+                    "channel-last I/O with no transposes, or confirm with "
+                    "compile_for_edgetpu.",
                 )
             )
 
@@ -539,6 +610,28 @@ class TfliteCompatibilityReport:
         return "\n".join(lines)
 
 
+def _builtin_op_names() -> Optional[Dict[int, str]]:
+    """Reverse map of TFLite builtin operator code -> name, or ``None``.
+
+    Uses LiteRT's own schema. The ``BuiltinOperator`` re-export on
+    ``flatbuffer_utils`` is only present in newer ``ai_edge_litert`` releases,
+    so fall back to ``schema_py_generated`` (and to ``None`` when even that is
+    unavailable, letting callers skip or raise a version hint instead of
+    crashing with ``AttributeError``).
+    """
+    try:
+        from ai_edge_litert.tools import flatbuffer_utils as fbu
+
+        cls = getattr(fbu, "BuiltinOperator", None)
+        if cls is None:
+            from ai_edge_litert import schema_py_generated as schema_fb
+
+            cls = schema_fb.BuiltinOperator
+        return {v: k for k, v in vars(cls).items() if isinstance(v, int)}
+    except (ImportError, AttributeError):
+        return None
+
+
 def check_tflite_for_edgetpu(tflite_model: bytes) -> TfliteCompatibilityReport:
     """Check a ``.tflite`` flatbuffer against the Edge TPU operation table.
 
@@ -564,16 +657,31 @@ def check_tflite_for_edgetpu(tflite_model: bytes) -> TfliteCompatibilityReport:
             + _LITERT_INSTALL_HINT
         ) from exc
 
+    builtin_names = _builtin_op_names()
+    if builtin_names is None:
+        raise RuntimeError(
+            "Checking a .tflite model needs a newer LiteRT schema than the "
+            "installed ai_edge_litert provides. "
+            "Upgrade it with `pip install -U ai-edge-litert`."
+        )
+
     model = fbu.convert_bytearray_to_object(bytearray(tflite_model))
-    builtin_names = {
-        v: k for k, v in vars(fbu.BuiltinOperator).items() if isinstance(v, int)
-    }
     counts: Dict[str, int] = {}
     float_io = False
+    tensor_type = getattr(fbu, "TensorType", None)
+    if tensor_type is None:
+        try:
+            from ai_edge_litert import schema_py_generated as schema_fb
+
+            tensor_type = schema_fb.TensorType
+        except ImportError:
+            tensor_type = None
+    float32 = tensor_type.FLOAT32 if tensor_type is not None else None
     for subgraph in model.subgraphs:
-        for i in list(subgraph.inputs) + list(subgraph.outputs):
-            if subgraph.tensors[i].type == fbu.TensorType.FLOAT32:
-                float_io = True
+        if float32 is not None:
+            for i in list(subgraph.inputs) + list(subgraph.outputs):
+                if subgraph.tensors[i].type == float32:
+                    float_io = True
         for op in subgraph.operators:
             code = model.operatorCodes[op.opcodeIndex]
             builtin = int(fbu.get_builtin_code_from_operator_code(code))
@@ -613,6 +721,7 @@ def quantize_for_edgetpu(
     num_calibration_samples: int = 100,
     inference_io_dtype: Any = "uint8",
     seed: int = 0,
+    io_layout: str = "nchw",
     **kwargs: Any,
 ) -> bytes:
     """Convert an ONNX model to a fully-integer-quantized ``.tflite`` model.
@@ -631,13 +740,20 @@ def quantize_for_edgetpu(
         The ONNX model to convert (usually the output of :func:`onnxsim.simplify`).
     representative_dataset:
         Calibration batches callable (TensorFlow representative-dataset
-        protocol), or ``None`` for random data.
+        protocol), or ``None`` for random data. With ``io_layout="nhwc"`` the
+        batches must carry 4-D inputs in channel-last order.
     num_calibration_samples:
         Random batches to generate when ``representative_dataset`` is ``None``.
     inference_io_dtype:
         ``"uint8"`` (default) or ``"int8"``: the quantized model I/O type.
     seed:
         Seed for the random calibration data.
+    io_layout:
+        ``"nchw"`` (default) keeps public tensors in ONNX order;
+        ``"nhwc"`` carries 4-D tensors channel-last end to end, emitting no
+        transposes -- required for larger models, whose NCHW entry transpose
+        the Edge TPU compiler refuses (see ``io_layout`` in
+        :func:`onnxsim.tflite_export.convert_to_tflite`).
     **kwargs:
         Forwarded to :func:`onnxsim.tflite_export.convert_to_tflite`
         (e.g. ``backend="builtin"``).
@@ -652,13 +768,14 @@ def quantize_for_edgetpu(
 
     if representative_dataset is None:
         representative_dataset = tflite_export.random_representative_dataset(
-            model, num_calibration_samples, seed=seed
+            model, num_calibration_samples, seed=seed, io_layout=io_layout
         )
     return tflite_export.convert_to_tflite(
         model,
         int8_quantize=True,
         representative_dataset=representative_dataset,
         inference_io_dtype=inference_io_dtype,
+        io_layout=io_layout,
         **kwargs,
     )
 
@@ -848,6 +965,7 @@ def export_edgetpu(
     inference_io_dtype: Any = "uint8",
     compiler: Optional[str] = None,
     extra_compiler_args: Sequence[str] = (),
+    io_layout: str = "nchw",
     **kwargs: Any,
 ) -> EdgeTPUExportResult:
     """Convert an ONNX model to an Edge TPU-compiled ``.tflite`` model.
@@ -867,6 +985,9 @@ def export_edgetpu(
         See :func:`quantize_for_edgetpu`.
     compiler / extra_compiler_args:
         See :func:`compile_for_edgetpu`.
+    io_layout:
+        See :func:`quantize_for_edgetpu`; ``"nhwc"`` is recommended for larger
+        models (see :func:`check_onnx_for_edgetpu`'s activation-size warning).
     **kwargs:
         Forwarded to :func:`onnxsim.tflite_export.convert_to_tflite`.
 
@@ -879,6 +1000,7 @@ def export_edgetpu(
         representative_dataset=representative_dataset,
         num_calibration_samples=num_calibration_samples,
         inference_io_dtype=inference_io_dtype,
+        io_layout=io_layout,
         **kwargs,
     )
     compiled = compile_for_edgetpu(

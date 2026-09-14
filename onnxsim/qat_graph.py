@@ -547,9 +547,12 @@ class StepGraph:
     :param state: ``{input name: output name}`` -- which output carries the
             next value of which input. :func:`run_step_graph` uses exactly this
             to close the loop.
-    :param loss_name: an output holding a scalar loss, recorded per step when
+    :param loss_name: an output holding the loss, recorded per step when
             the caller asks for it. Optional: nothing in the loop needs it, it
-            is for diagnostics.
+            is for diagnostics. Rank-1 ``[1, 1]``, not rank-0: Pulsar2's
+            quantizer crashes on a scalar graph output
+            (``zero-dimensional tensor cannot be concatenated``), so every
+            loss this module exposes keeps one dummy dimension.
     """
 
     model: onnx.ModelProto
@@ -563,6 +566,7 @@ def make_step_graph(
     state: Dict[str, Tuple[Sequence[int], str]],
     scalars: Sequence[str] = (),
     loss: Optional[str] = None,
+    loss_shape: Sequence[int] = (),
     name: str = "onnxsim_step",
     per_step: Optional[Dict[str, Tuple[Sequence[int], int]]] = None,
     simplify: bool = True,
@@ -582,11 +586,19 @@ def make_step_graph(
             own moments
     :param scalars: names of scalar (rank-0) per-step inputs, e.g. a learning
             rate or an annealed regularization weight
-    :param loss: an optional scalar output name to expose as the loss
+    :param loss: an optional loss output name to expose
+    :param loss_shape: the loss output's shape -- rank-1 ``[1, 1]`` for a
+            loss this module built (never rank-0: Pulsar2's quantizer
+            crashes on a scalar graph output). Left as the ``()`` default
+            for callers passing an older scalar loss through untouched.
     :param per_step: ``{input name: (shape, onnx element type)}`` for per-step
             inputs that are neither float32 nor rank-0 -- in practice the
             int64 row index a minibatched loop feeds
-            :meth:`GraphBuilder.gather_rows`. Kept separate from ``scalars``
+            :meth:`GraphBuilder.gather_rows` -- plus float rank-1
+            hyperparameter vectors (a distillation step graph's ``lr`` /
+            bias corrections / batch size), which must avoid the rank-0
+            ``scalars`` form because Pulsar2's calibration fetcher cannot
+            take rank-0 inputs. Kept separate from ``scalars``
             rather than generalizing it because the two are fed differently
             (``run_step_graph`` casts scalars to float32 and passes these
             through with the dtype the caller built them with) and because a
@@ -635,7 +647,9 @@ def make_step_graph(
     ]
     if loss is not None:
         outputs.append(
-            onnx.helper.make_tensor_value_info(loss, onnx.TensorProto.FLOAT, [])
+            onnx.helper.make_tensor_value_info(
+                loss, onnx.TensorProto.FLOAT, list(loss_shape)
+            )
         )
     graph = onnx.helper.make_graph(
         b.nodes, name, inputs, outputs, initializer=b.initializer
@@ -759,7 +773,7 @@ def _run_bound_loop(
         except Exception:
             return None
         if want_loss:
-            collected.append(float(out[str(step.loss_name)]))
+            collected.append(float(np.asarray(out[str(step.loss_name)]).reshape(-1)[0]))
     if losses is not None:
         losses.extend(collected)
     return dict(bound.state())

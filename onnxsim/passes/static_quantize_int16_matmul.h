@@ -19,7 +19,8 @@
 // inputs change):
 //   Xq  = QuantizeLinear(X, Xs, Xzp)        -- Xs/Xzp: CALIBRATED, fixed,
 //   uint16 Xdq = DequantizeLinear(Xq, Xs, Xzp) Wdq = DequantizeLinear(Wq, Ws,
-//   axis=<W's output-channel axis>)  -- Wq: int8 Y   = MatMul(Xdq, Wdq)
+//   Wzp, axis=<W's output-channel axis>)  -- Wq: int8, Wzp: explicit
+//   all-zeros INT8, same shape as Ws. Y   = MatMul(Xdq, Wdq)
 //
 // Why the activation gets the finer type and not the weight: this pass's
 // only real difference from static_quantize_matmul.h is how much rounding
@@ -153,12 +154,20 @@ struct StaticQuantizeInt16MatMul final : public PredicateBasedPass {
 
     Value* w_q_v = graph.addInitializerAndCreateValue(w_q);
     Value* w_scale_v = graph.addInitializerAndCreateValue(w_scale);
+    Tensor w_zp;
+    MakeSymmetricInt8WeightZeroPoint(w_scale.sizes()[0], w_zp);
+    Value* w_zp_v = graph.addInitializerAndCreateValue(w_zp);
 
-    // Wdq = DequantizeLinear(Wq, Ws, axis=channel_axis) -- zero_point
-    // omitted (symmetric, i.e. always 0).
+    // Wdq = DequantizeLinear(Wq, Ws, Wzp, axis=channel_axis), with Wzp an
+    // explicit all-zeros INT8 tensor: symmetric quantization is always 0, so
+    // the zero_point input is optional per the spec -- but runtimes that fuse
+    // the QDQ pattern into an integer kernel (ORT's QGemm, the VitisAI EP's
+    // MatMulAddFusion) require scale and zero_point to have the same shape,
+    // and reject/abort the fused node when it is omitted.
     Node* wdq = graph.create(Symbol("DequantizeLinear"), 1);
     wdq->addInput(w_q_v);
     wdq->addInput(w_scale_v);
+    wdq->addInput(w_zp_v);
     wdq->i_(kaxis, channel_axis);
     wdq->insertBefore(n);
     wdq->output()->setElemType(TensorProto_DataType_FLOAT);

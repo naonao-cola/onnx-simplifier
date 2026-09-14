@@ -4715,6 +4715,17 @@ def main():
         "--tflite-backend builtin.",
     )
     parser.add_argument(
+        "--tflite-layout",
+        choices=["nchw", "nhwc"],
+        default="nchw",
+        help="Dimension order of the --emit-tflite model's 4-D tensors "
+        "(default: nchw, ONNX's own order, with transposes around conv/pool). "
+        "'nhwc' carries 4-D tensors channel-last end to end and emits no "
+        "transposes -- required for Edge TPU compilation of larger models, "
+        "whose NCHW entry transpose the compiler refuses ('large activation "
+        "tensors'). Only applies to --tflite-backend builtin.",
+    )
+    parser.add_argument(
         "--tflite-edgetpu",
         nargs="?",
         const="",
@@ -5682,6 +5693,15 @@ def main():
                 )
             )
             sys.exit(1)
+        if args.tflite_layout != "nchw" and args.tflite_backend != "builtin":
+            print(
+                Text(
+                    "--tflite-layout only applies to --tflite-backend builtin "
+                    "(onnx2tf is channel-last by default).",
+                    style="bold red",
+                )
+            )
+            sys.exit(1)
         if args.tflite_edgetpu_check:
             from onnxsim import edgetpu_export
 
@@ -5704,6 +5724,10 @@ def main():
             f"{tflite_path} ..."
         )
         tflite_kwargs = {"backend": args.tflite_backend}
+        if args.tflite_backend == "builtin":
+            # onnx2tf rejects onnxsim's builtin-only options (and is
+            # channel-last by default), so io_layout stays on the builtin path.
+            tflite_kwargs["io_layout"] = args.tflite_layout
         if args.tflite_optimize:
             tflite_kwargs["optimizations"] = ["DEFAULT"]
         if args.tflite_flex:

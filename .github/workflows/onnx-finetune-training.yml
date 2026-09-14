@@ -60,9 +60,15 @@ permissions:
   contents: read
 
 env:
-  # Pinned so the three jobs below (native, wasm, and a human following
-  # README.md by hand) agree on which release to fetch.
-  PLAIN_ORT_VERSION: "1.19.2"
+  # Pinned so the native job below (and a human following README.md's
+  # distill-runner recipe by hand) agrees on which release to fetch. Only the
+  # native job uses this -- the wasm job trains via the official
+  # onnxruntime-web npm package instead. This is a *plain* inference release
+  # (the step graph runs on Ort::Session); nothing here needs the
+  # training-enabled build, so this tracks a recent release, unlike the
+  # 1.19.2-pinned onnxruntime-training PyPI wheel / from-source training
+  # recipe README.md documents for the TrainingSession-based tools.
+  PLAIN_ORT_VERSION: "1.30.0"
 
 jobs:
   distillation-graph-grad-native:

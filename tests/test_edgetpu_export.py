@@ -136,6 +136,61 @@ def test_unknown_op_warns():
     assert [f.op_type for f in report.warnings] == ["Selu"]
 
 
+def _big_conv_model(channels: int = 64, size: int = 32) -> onnx.ModelProto:
+    rng = np.random.RandomState(0)
+    w = numpy_helper.from_array(
+        rng.randn(channels, channels, 3, 3).astype(np.float32), name="w"
+    )
+    b = numpy_helper.from_array(np.zeros(channels, np.float32), name="b")
+    model = _model(
+        f"""
+        big (float[1,{channels},{size},{size}] x) => (float[1,{channels},{size},{size}] y)
+        {{
+            c = Conv <kernel_shape=[3,3], pads=[1,1,1,1]> (x, w, b)
+            y = Relu (c)
+        }}
+        """,
+        initializer=[w, b],
+    )
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_large_activation_warns_about_nchw_entry_transpose():
+    report = check_onnx_for_edgetpu(_big_conv_model(64, 32))
+    size_warnings = [f for f in report.warnings if f.op_type == "activation size"]
+    assert len(size_warnings) == 1
+    assert "nhwc" in size_warnings[0].message
+    assert not report.fully_supported
+
+
+def test_small_model_has_no_activation_size_warning():
+    report = check_onnx_for_edgetpu(_relu_model())
+    assert [f for f in report.warnings if f.op_type == "activation size"] == []
+    report = check_onnx_for_edgetpu(_big_conv_model(4, 128))
+    assert [f for f in report.warnings if f.op_type == "activation size"] == []
+
+
+def test_activation_size_warning_uses_inferred_shapes():
+    # The input itself is small; only the inferred intermediate is large.
+    rng = np.random.RandomState(0)
+    w = numpy_helper.from_array(rng.randn(64, 4, 3, 3).astype(np.float32), name="w")
+    b = numpy_helper.from_array(np.zeros(64, np.float32), name="b")
+    model = _model(
+        """
+        expand (float[1,4,64,64] x) => (float[1,64,64,64] y)
+        {
+            c = Conv <kernel_shape=[3,3], pads=[1,1,1,1]> (x, w, b)
+            y = Relu (c)
+        }
+        """,
+        initializer=[w, b],
+    )
+    onnx.checker.check_model(model)
+    report = check_onnx_for_edgetpu(model)
+    assert [f.op_type for f in report.warnings] == ["activation size"]
+
+
 # ---------------------------------------------------------------------------
 # Calibration data (onnx + numpy only)
 # ---------------------------------------------------------------------------
@@ -316,6 +371,36 @@ def test_setup_hint_covers_udev_and_litert():
     assert "udev" in hint and "ai-edge-litert" in hint and "edgetpu_compiler" in hint
 
 
+def test_builtin_op_names_resolves():
+    pytest.importorskip("ai_edge_litert", reason="LiteRT is not installed")
+    names = edgetpu_export._builtin_op_names()
+    assert names is not None
+    assert "TRANSPOSE" in names.values()
+    assert "CONV_2D" in names.values()
+
+
+def test_builtin_op_names_tolerates_old_litert(monkeypatch):
+    pytest.importorskip("ai_edge_litert", reason="LiteRT is not installed")
+
+    # Simulate a LiteRT too old for the BuiltinOperator enum (as pulled in
+    # transitively by onnx2tf in CI): neither the flatbuffer_utils re-export
+    # nor the schema module carries it.
+    monkeypatch.delattr(
+        "ai_edge_litert.tools.flatbuffer_utils.BuiltinOperator", raising=False
+    )
+    monkeypatch.delattr(
+        "ai_edge_litert.schema_py_generated.BuiltinOperator", raising=False
+    )
+    assert edgetpu_export._builtin_op_names() is None
+
+
+def test_check_tflite_reports_old_litert_clearly(monkeypatch):
+    pytest.importorskip("ai_edge_litert", reason="LiteRT is not installed")
+    monkeypatch.setattr(edgetpu_export, "_builtin_op_names", lambda: None)
+    with pytest.raises(RuntimeError, match="newer LiteRT"):
+        edgetpu_export.check_tflite_for_edgetpu(b"fake-tflite")
+
+
 # ---------------------------------------------------------------------------
 # End to end with real tools (gated)
 # ---------------------------------------------------------------------------
@@ -368,6 +453,58 @@ def test_export_edgetpu_one_shot(tmp_path):
         _relu_model(), output_path=str(out), num_calibration_samples=5
     )
     assert len(result.quantized_model) > 0
+    assert result.compile_result.success
+    assert result.compile_result.fully_mapped
+    assert out.is_file()
+
+
+@_needs_compiler()
+def test_nhwc_compiles_where_nchw_fails_at_size_cliff(tmp_path):
+    """The money test for ``io_layout="nhwc"``: a 64ch x 32x32 conv refuses
+    compilation with the NCHW entry transpose (``large activation tensors``)
+    while the identical channel-last graph maps fully (measured against
+    edgetpu_compiler 16.0)."""
+    pytest.importorskip("tensorflow", reason="tensorflow is not installed")
+    pytest.importorskip("ai_edge_litert", reason="LiteRT is not installed")
+    model = _big_conv_model(64, 32)
+
+    nchw = onnxsim.export_tflite(
+        model,
+        int8_quantize=True,
+        inference_io_dtype="uint8",
+        num_calibration_samples=5,
+    )
+    nchw_result = edgetpu_export.compile_for_edgetpu(nchw)
+    assert not nchw_result.success
+
+    nhwc = onnxsim.export_tflite(
+        model,
+        int8_quantize=True,
+        inference_io_dtype="uint8",
+        num_calibration_samples=5,
+        io_layout="nhwc",
+    )
+    # No transposes at all in the channel-last graph...
+    tflite_report = edgetpu_export.check_tflite_for_edgetpu(nhwc)
+    assert "TRANSPOSE" not in [o.op for o in tflite_report.operators]
+    # ...and the real compiler maps every op.
+    out = tmp_path / "big_nhwc_edgetpu.tflite"
+    nhwc_result = edgetpu_export.compile_for_edgetpu(nhwc, output_path=str(out))
+    assert nhwc_result.success, nhwc_result.log_text[-2000:]
+    assert nhwc_result.fully_mapped, nhwc_result.summary()
+    assert out.is_file()
+
+
+@_needs_compiler()
+def test_export_edgetpu_nhwc_one_shot(tmp_path):
+    pytest.importorskip("tensorflow", reason="tensorflow is not installed")
+    out = tmp_path / "big_nhwc_edgetpu.tflite"
+    result = onnxsim.export_edgetpu(
+        _big_conv_model(64, 32),
+        output_path=str(out),
+        num_calibration_samples=5,
+        io_layout="nhwc",
+    )
     assert result.compile_result.success
     assert result.compile_result.fully_mapped
     assert out.is_file()

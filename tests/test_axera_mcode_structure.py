@@ -286,7 +286,7 @@ def _build_and_get_mcode_bytes(work_dir, model, input_shape):
     return bytes(inits[mcode_key].raw_data)
 
 
-def _build_and_get_wbt_and_mcode_bytes(work_dir, model, input_shape):
+def _build_and_get_wbt_and_mcode_bytes(work_dir, model, input_shape, input_name="x"):
     os.makedirs(work_dir, exist_ok=True)
     onnx.save(model, os.path.join(work_dir, "model.onnx"))
     rng = np.random.RandomState(0)
@@ -301,7 +301,7 @@ def _build_and_get_wbt_and_mcode_bytes(work_dir, model, input_shape):
         "quant": {
             "input_configs": [
                 {
-                    "tensor_name": "x",
+                    "tensor_name": input_name,
                     "calibration_dataset": "./dataset/calib_x.tar",
                     "calibration_format": "Numpy",
                     "calibration_size": 4,
@@ -608,6 +608,130 @@ def test_mcode_nondeterminism_is_a_label_permutation_not_metadata(tmp_path):
             (n, multiset_0, multiset_n),
             "expected the same multiset of values at the noisy positions, "
             "just reordered",
+        )
+
+
+def _depthwise_conv_model(cin=32, insz=8):
+    """One group-`cin` depthwise `Conv` -- the depthwise engine path, which
+    none of the determinism probes above exercise (all dense)."""
+    rng = np.random.RandomState(0)
+    w = (rng.randn(cin, 1, 3, 3) * 0.1).astype(np.float32)
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Conv",
+                ["x", "w"],
+                ["y"],
+                strides=[1, 1],
+                pads=[1, 1, 1, 1],
+                group=cin,
+            )
+        ],
+        "g_depthwise",
+        [
+            helper.make_tensor_value_info(
+                "x", onnx.TensorProto.FLOAT, [1, cin, insz, insz]
+            )
+        ],
+        [
+            helper.make_tensor_value_info(
+                "y", onnx.TensorProto.FLOAT, [1, cin, insz, insz]
+            )
+        ],
+        initializer=[numpy_helper.from_array(w, name="w")],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
+
+
+def _layernorm_model(rows=4, cols=8):
+    """One last-axis `LayerNormalization` -- the first non-MAC op probed
+    for determinism (no `a1 00 40 02` program exists in its mcode at all)."""
+    graph = helper.make_graph(
+        [helper.make_node("LayerNormalization", ["x", "s", "b"], ["y"], axis=-1)],
+        "g_layernorm",
+        [helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, rows, cols])],
+        [helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, rows, cols])],
+        initializer=[
+            numpy_helper.from_array(np.ones(cols, dtype=np.float32), name="s"),
+            numpy_helper.from_array(np.zeros(cols, dtype=np.float32), name="b"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
+
+
+def _attn_fragment_model(n=2, s=8, d=16, seed=2):
+    """A `MatMul`/`Softmax`/`MatMul` attention fragment with folded K/V --
+    the first softmax-bearing probe of determinism (softmax runs on the
+    NPU here, dispatched `AX_NPU_AX650_INT8` like the matmuls)."""
+    rng = np.random.RandomState(seed)
+    k = rng.standard_normal((n, d, s)).astype(np.float32)
+    v = rng.standard_normal((n, s, d)).astype(np.float32)
+    graph = helper.make_graph(
+        [
+            helper.make_node("MatMul", ["q", "k"], ["qk"]),
+            helper.make_node("Softmax", ["qk"], ["p"], axis=-1),
+            helper.make_node("MatMul", ["p", "v"], ["o"]),
+        ],
+        "g_attn",
+        [helper.make_tensor_value_info("q", onnx.TensorProto.FLOAT, [n, s, d])],
+        [helper.make_tensor_value_info("o", onnx.TensorProto.FLOAT, [n, s, d])],
+        initializer=[
+            numpy_helper.from_array(k, name="k"),
+            numpy_helper.from_array(v, name="v"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_determinism_modes_across_op_families(tmp_path):
+    """Confirmed real (see the README's "Determinism across op families:
+    norm permutes, depthwise reschedules" section): rebuilding identical
+    depthwise/LayerNorm/attention graphs shows the same two nondeterminism
+    modes the Conv work found, in new territory. Wbt stays byte-identical
+    and mcode stays the same length everywhere; the LayerNorm streams
+    permute one fixed label set across rebuilds (multiset-equal, like the
+    two-Conv case); the depthwise and attention streams diverge in content
+    within one zone each (token multisets differ -- rescheduling, not just
+    relabelling). Four rebuilds, like the label-permutation test: two can
+    agree by chance and hide the noise. Needs Docker, no device.
+    """
+    cases = [
+        ("depthwise", _depthwise_conv_model(), (1, 32, 8, 8), "x"),
+        ("layernorm", _layernorm_model(), (1, 4, 8), "x"),
+        ("attn", _attn_fragment_model(), (2, 8, 16), "q"),
+    ]
+    builds = {}
+    for name, model, shape, input_name in cases:
+        builds[name] = [
+            _build_and_get_wbt_and_mcode_bytes(
+                os.path.join(str(tmp_path), f"{name}{i}"), model, shape, input_name
+            )
+            for i in range(4)
+        ]
+    for name, runs in builds.items():
+        wbts, mcodes = zip(*runs)
+        assert len(set(wbts)) == 1, (name, "Wbt differed across identical rebuilds")
+        assert len({len(m) for m in mcodes}) == 1, (name, "mcode length varied")
+        noisy = [i for i in range(len(mcodes[0])) if len({m[i] for m in mcodes}) > 1]
+        assert noisy, (name, "expected the known small run-to-run mcode noise")
+        assert len(noisy) < 100, (name, len(noisy), "noise is no longer small/bounded")
+
+    # The LayerNorm noise is Mode A: one fixed label set, only reordered.
+    ln_mcodes = [m for _, m in builds["layernorm"]]
+    ln_noisy = [
+        i for i in range(len(ln_mcodes[0])) if len({m[i] for m in ln_mcodes}) > 1
+    ]
+    multiset_0 = sorted(ln_mcodes[0][i] for i in ln_noisy)
+    for n, other in enumerate(ln_mcodes[1:], start=1):
+        assert sorted(other[i] for i in ln_noisy) == multiset_0, (
+            n,
+            "layernorm noise is not a label permutation",
         )
 
 

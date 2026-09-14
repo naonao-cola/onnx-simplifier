@@ -241,6 +241,19 @@ The pure comparison logic (`compare_token_sequences`) has no coremltools/
 torch/transformers dependency and is unit-tested directly in
 `tests/test_check_decode_parity.py`.
 
+When a parity run fails, the next question is whether the first divergence
+is fp16 noise or a systematic mistranslation. The discriminating measurement
+is the margin at the divergence point: run both decoders teacher-forced on
+the agreed prefix and compare full logit vectors (top-6 sets, EOS rank and
+logit on each side, max abs drift over the vocab). On
+`SmolLM2-135M-Instruct` the first divergence is a **0.06-logit coin flip**
+between the top two tokens (both sides agree on the top-6 set; cross-side
+drift ~0.03 on ~10.5-scale logits, 0.4 max over the vocab), and the EOS
+logit error there is ordinary (rank ~42k on both sides) -- noise, with no
+EOS-specific mistreatment. A second prompt agrees 20/20. A systematic bug
+would instead show a large margin or an EOS logit far off its reference;
+that is the signal to look for before blaming the translator.
+
 ### Weight-only quantization (`--quantize-weights`)
 
 The "Theoretical ceiling" section above works out that a decode step is
@@ -441,6 +454,8 @@ single-step `predict()`:
 |---|---|---|---|---|---|
 | SmolLM2-135M fp32 | 0.3GB | ANE 77 / CPU 23 | 8.1ms | -- | 11-14ms |
 | SmolLM2-135M fp16 | 0.2GB | ANE 73 / CPU 27 | 7.9ms | -- | 11.4ms |
+| SmolLM2-135M int8 | 0.2GB | ANE + GPU dequant lane | 8.5ms | -- | 8.0ms |
+| SmolLM2-135M int4 | 79MB | ANE 47 / GPU 13 | 30.3ms | -- | 11.1ms |
 | Qwen2.5-0.5B fp16 | 1.2GB | ANE 61 / GPU 37 / CPU 2 | 19.2ms | 17.4ms | 19.4ms |
 | Qwen2.5-0.5B int8 | 0.6GB | ANE majority | 20.9ms | broken | **13.3ms** |
 | Qwen2.5-1.5B fp16 | 3.3GB | GPU 100 | 55.9ms | 42.9ms | 59.7ms (CPU fallback) |
@@ -448,18 +463,49 @@ single-step `predict()`:
 | SmolLM2-1.7B fp16 | 3.4GB | GPU 100 | 76.4ms | 59.5ms | 79.4ms (CPU fallback) |
 | SmolLM2-1.7B int8 | 1.7GB | ANE 43% | 78.2ms | broken | 92.6ms (CPU wins) |
 | Phi-3.5-mini fp16 | 7.1GB | GPU 100 | 272.2ms | 183.2ms | 237.2ms (CPU fallback) |
+| Phi-3.5-mini int8 | 3.6GB | GPU 100 | 6017ms (dequant hell) | 996.2ms | 474.1ms |
 
 Patterns: per-op misses are boundary glue (embedding `gather`s, output
 reshape/cast cluster, one bandwidth-bound vocab-head `matmul` -- 271/272
 matmuls sit on ANE); `--io-dtype fp16` does not move the ANE share
 (75.3% vs. 77.5%, noise); whole-graph GPU spill tracks weight size
 (~1.2GB split zone, 3.3GB+ fully GPU), and int8 pulls graphs back under
-ANE capacity. Phi-3.5 is a new architecture family for this pipeline
+ANE capacity -- except Phi-3.5, where int8 is a regression almost
+everywhere (GPU 996ms vs. fp16 183ms; int8-on-CPU pathologically slow at
+6s/step from per-step weight dequantization). int4 (135M only, needs an
+iOS18-built model -- post-hoc quantization of a lower-target model is
+refused outright) shrinks weights to 79MB with ANE still engaged but no
+latency win at this size, as dispatch-bound theory predicts. Phi-3.5 is a new architecture family for this pipeline
 (fused `qkv_proj` + partial rotary): its first real-device run failed plan
 build on an empty pass-through slice concatenated back (`[96:96]` of dim
 96, ORT-verified empty) that E5RT/MPS mis-shapes to 97 -- fixed by dropping
 provably-empty inputs from `Concat` in the translator, after which Phi
 traces and runs as tabulated.
+
+#### Why dynamic models stay off ANE (the `Range` boundary)
+
+Bisecting the dynamic decoder axis by axis (static S/P/T combinations of
+the same graph) shows the ANE plan gate trips on any tensor whose shape
+derives from a runtime *value*, not just a `RangeDim`: a 5-op repro of
+`Range` with a runtime limit fails plan build with the exact production
+error (`Invalid blob shape: Data-dependent shapes were disabled`), and so
+does `Slice` with a runtime bound -- even a raw graph-input bound. Pure
+`RangeDim` propagation (matmul/reshape/transpose/select/concat of dynamic
+tensors) is fine. In the decoder the poison is the causal-mask machinery:
+two model-level `Range`s with computed limits feed ~60 KV-cache slices and
+a gather with Range-derived bounds, plus the present-cache concat chains.
+
+No MIL reformulation fixes this class -- the information "this runtime
+value equals dim S" cannot be expressed, so the translator leaves these
+ops alone (conversion itself succeeds; pinned by test). What would fix it,
+in increasing order of invasiveness: (1) static export (this section);
+(2) computing positions/masks host-side and passing them as inputs instead
+of building them from `Range` in-graph (model-interface change, fragile
+across families -- not attempted); (3) stateful Core ML (cache as internal
+state, static outputs -- the direction community artifacts like TokForge
+explore); (4) Apple relaxing the gate. The ORT CoreML execution provider
+does not help either: it partitions the decoder into 241 CoreML subgraphs
+fine, but the poisoned partitions fail the same E5RT build at run time.
 
 ### fp16 model interface (`--io-dtype fp16`)
 
@@ -836,19 +882,25 @@ Decode tok/s does **not** scale smoothly with parameter count on this
 runner class: Qwen2.5-3B-Instruct's 0.04 tok/s is a ~50x cliff from the
 1.7B model's 2.11, not the ~2x the weight-size ratio alone would predict
 (bandwidth-bound reasoning per the "Theoretical ceiling" section above
-would suggest roughly linear scaling with weight bytes) -- peak RSS
-approaching the runner's likely memory ceiling at that tier is the leading
-suspect, but this wasn't isolated; treat it as a real, measured number and
-not yet a fully explained one. `SmolLM2-135M-Instruct`'s parity failure is
+would suggest roughly linear scaling with weight bytes). Re-running the
+same model/benchmark on a 16GB M4 Mac mini (CPU_ONLY, 7.3GB peak RSS)
+gives **2.44 tok/s** with a 15.8s prefill -- faster than even the
+weight-ratio extrapolation (~0.9 tok/s from the 1.5B row) -- so the cliff
+does not reproduce where memory is plentiful, and is best read as the old
+runner's memory ceiling (5.6GB RSS there), not an architectural property
+of the 3B tier. `SmolLM2-135M-Instruct`'s parity failure is
 the fp16-Core-ML-vs-fp32-HF-reference divergence the "Decode parity"
 section above already explains (different generated content after the
 first mismatch, not a stopping-point difference). `SmolLM2-1.7B-Instruct`'s
 is a different failure mode: the tokens it generated *agree* with the HF
 reference everywhere the reference has tokens to compare -- Core ML just
 kept generating past where the 3-token HF reference stopped
-(`'Paris.\nThe capital of France is Paris...'` looping), a
-greedy-decoding/EOS-handling difference at this size, not yet root-caused,
-rather than a translator correctness bug.
+(`'Paris.\nThe capital of France is Paris...'` looping). That shape --
+agreement, then the HF side emitting EOS where Core ML does not -- is what
+a sub-0.1-logit fp16 coin flip landing exactly on the EOS decision looks
+like, and the margin probe below confirms flips of exactly that size
+decide top-1 elsewhere; no EOS-specific mistreatment was found (the EOS
+logit error is ordinary, rank ~42k on both sides at a divergence point).
 
 ### Benchmarking a real model suite (`prepare_benchmark_models.py`)
 
@@ -901,6 +953,27 @@ python train_mlp_step_coreml.py --output mlp_step.mlpackage \
     --steps 15 --compute-units CPU_AND_NE
 ```
 
+### Transformer-block training (`train_block_step_coreml.py`)
+
+The same loop around a pre-norm-less transformer block instead of an MLP:
+separate Q/K/V projections, head split, scaled dot-product attention,
+output projection, residual, SiLU FFN, residual, MSE loss, Adam on all 12
+projection params -- the attention backward (`sdpaBwd` in maderix/ANE
+terms) runs on the Neural Engine here along with everything else, where
+maderix splits it (forward+dx on ANE, dW/Adam on CPU).
+
+```bash
+python train_block_step_coreml.py --output block_step.mlpackage \
+    --steps 8 --compute-units CPU_AND_NE
+```
+
+Measured on real hardware (M4 Mac mini, 32x64x512 block, 8 heads, FFN
+2048, ~3.2M params): **352/352 ops on ANE**, loss 2.41 -> 2.22 over 8
+steps tracking CPU, at 34.8ms/step vs. 40.3ms CPU (1.16x). Per-param
+throughput trails maderix's Stories110M loop (~0.09 vs. ~1.2M params/ms)
+-- expected: every step shuttles ~100MB of weights/moments through
+`predict()`, where their IOSurface pipeline keeps weights resident.
+
 Two adaptations the Core ML target forces: rank-0 scalar inputs are widened
 to shape-[1] (MIL has no rank-0 Placeholder; broadcast-identical where used),
 and the step uses loss scaling with eps=1e-3, since default fp16 compute
@@ -948,3 +1021,31 @@ nothing measurable here because the weights still cross the boundary fp32
 every step; the win this unlocks is the one the previous section measured
 for inference (halved weight bytes fitting ANE capacity), now available to
 a training forward pass too.
+
+### Resident weights (`--resident`, Core ML states)
+
+The loop above still shuttles every parameter and moment through
+`predict()` twice per step (~50MB at S1). `export_coreml`'s `state`
+argument (also behind `--resident` here) holds them resident on-device
+instead, in Core ML states: each named input becomes an fp16 state read
+back at the boundary, each named output is written into its state via
+`coreml_update_state` and dropped from the interface, so only the batch,
+the target, the scalars -- and the loss -- cross per step (~2MB here).
+
+```bash
+python train_mlp_step_coreml.py --resident --compute-units CPU_ONLY \
+    --output mlp_step_resident.mlpackage
+```
+
+Measured on real hardware (same S1 MLP): loss 0.82 -> 0.37, tracking the
+shuttling runs, at **5.1ms/step vs. 9.7-10.3ms** -- the traffic win is
+real. Three platform facts came out of validating it: states are fp16-only
+(the weights live one rounding away from the fp32 masters -- convergence
+is unaffected); stateful conversion needs iOS18+ (raised automatically,
+like the other deployment floors); and ANE compilation rejects stateful
+programs on current macOS (`ANECCompile() FAILED`), so resident loops run
+CPU/GPU-side -- the GPU accepts them but slowly (105ms/step here), making
+CPU the best resident backend today. Conversion also drops one coremltools
+pass (`common::canonicalize_inplace_pattern`, which crashes reordering
+clustered trailing updates) -- canonicalization only, functionally
+neutral, pinned by test.
