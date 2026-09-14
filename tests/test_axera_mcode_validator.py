@@ -553,3 +553,52 @@ def test_c1_five_programs_a_slot(name):
         if t[1] == "C"
     )
     assert null <= 2 * len(takes) + 2, (name, len(takes), null)
+
+
+def _synthetic_repeat_stream():
+    """A hand-built stream with a `30 03 XX 03 09` repeat unit: a short
+    unit, the repeat (X = `0x1c`), and a bare pair."""
+    return bytes.fromhex(
+        "00 08 81 e8"  # S
+        "30 03 1c 03 09"  # R
+        "81 96"  # B
+    )
+
+
+def test_second_repeat_form_codec():
+    """The `[0x30][0x03][X][0x03][0x09]` repeat unit repeats its second byte
+    at the fourth, the quintet's pair-repeat with one byte instead of two:
+    648 occurrences corpus-wide, zero shuffled. The committed fixtures carry
+    none, so this pins the codec on a synthetic stream; the corpus numbers
+    are in the README's "A second repeat form" section."""
+    blob = _synthetic_repeat_stream()
+    toks = mcode.tokenize(blob, start=0, end=len(blob), **mcode.FULL_RULE)
+    assert [t[1] for t in toks] == ["S", "R", "B"], [t[1] for t in toks]
+    assert toks[1][2] == 0x1C
+    records = mcode.decode(blob, start=0, end=len(blob), **mcode.FULL_RULE)
+    assert [r["kind"] for r in records] == ["S", "R", "B"]
+    assert [r["x"] for r in records if r["kind"] == "R"] == [0x1C]
+    assert mcode.encode(records) == blob
+
+    # The flag plumbs through: off means the form does not fire.
+    plain = dict(mcode.FULL_RULE)
+    plain["repeat"] = False
+    kinds_off = [t[1] for t in mcode.tokenize(blob, start=0, end=len(blob), **plain)]
+    assert kinds_off == ["S", "?", "?", "?", "?", "?", "B"], kinds_off
+
+    # The repeat's bytes hide no verb.
+    assert not set(bytes.fromhex("30 03 1c 03 09")) & set(mcode.VERBS6)
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_repeat_never_regresses_coverage(name):
+    """The repeat form fires only where the walk emits raw escapes, so
+    per-stream coverage with it on is never below it off. (The fixtures
+    carry no repeats, so this pins equality there and guards the
+    plumbing.)"""
+    blob = _blob(name)
+    plain = dict(mcode.FULL_RULE)
+    plain["repeat"] = False
+    covered_plain, _ = mcode.nonzero_coverage(blob, **plain)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    assert covered_with >= covered_plain, (name, covered_plain, covered_with)
