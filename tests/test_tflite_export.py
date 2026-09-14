@@ -117,8 +117,23 @@ def _run_tflite(tflite_model: bytes, inputs: dict):
         (value,) = inputs.values()
         interp.set_tensor(detail["index"], value)
     else:
-        for name, value in inputs.items():
-            interp.set_tensor(in_details[name]["index"], value)
+        # tf.function tracing renames inputs (args_0, args_1, ...) so the
+        # original graph names don't survive conversion; match positionally
+        # in graph-input order instead (callers pass `inputs` in that order).
+        # Values are cast to the flatbuffer's dtype when only the width
+        # differs (this translator downcasts int64 tensors to int32, so an
+        # int64 feed would otherwise be rejected); anything else still fails
+        # loudly below.
+        details = sorted(in_details.values(), key=lambda d: d["name"])
+        assert len(details) == len(inputs), (len(details), len(inputs))
+        for detail, value in zip(details, inputs.values()):
+            arr = np.asarray(value)
+            if (
+                arr.dtype != detail["dtype"]
+                and arr.dtype.kind == np.dtype(detail["dtype"]).kind
+            ):
+                arr = arr.astype(detail["dtype"])
+            interp.set_tensor(detail["index"], arr)
     interp.invoke()
     return [interp.get_tensor(d["index"]) for d in interp.get_output_details()]
 
@@ -315,8 +330,29 @@ def test_slice_negative_step_reverses_full_axis():
     _assert_matches_onnxruntime(model, {})
 
 
-def test_slice_end_sentinel_survives_int64_downcast():
-    # ONNX graphs routinely use INT64_MAX as a Slice `ends` sentinel meaning "to
+def test_slice_above_5d_decomposes_through_3d_window():
+    # TFLite's slice kernel caps at 5-D, but BEVFormer-style deformable
+    # attention slices 6-D sampling tensors per level -- so >5-D slices peel
+    # axes off one at a time through a 3-D reshape window (see _op_slice).
+    x = np.random.RandomState(23).randn(1, 2, 2, 2, 2, 2).astype(np.float32)
+    model = _model(
+        "s6 (float[1,2,2,2,2,2] x) => (float[1,2,1,2,2,2] y) "
+        "<int64[1] st6 = {1}, int64[1] en6 = {2}, int64[1] ax6 = {2}> "
+        "{ y = Slice (x, st6, en6, ax6) }",
+    )
+    onnx.checker.check_model(model)
+    _assert_matches_onnxruntime(model, {"x": x})
+    model = _model(
+        "s6r (float[1,2,2,2,2,2] x) => (float[1,2,2,2,2,2] y) "
+        "<int64[1] st6 = {1}, int64[1] en6 = {-100}, int64[1] ax6 = {3}, "
+        "int64[1] sp6 = {-1}> "
+        "{ y = Slice (x, st6, en6, ax6, sp6) }",
+    )
+    onnx.checker.check_model(model)
+    _assert_matches_onnxruntime(model, {"x": x})
+
+
+def test_slice_end_sentinel_survives_int64_downcast():  # ONNX graphs routinely use INT64_MAX as a Slice `ends` sentinel meaning "to
     # the end of this axis". This translator downcasts int64 *tensors* to int32
     # for TFLite, but Slice's bounds are read from the original (pre-downcast)
     # numpy constant tracked alongside each traced tensor, so the sentinel's exact
@@ -418,6 +454,355 @@ def test_dropout_training_mode_raises():
     )
     with pytest.raises(RuntimeError, match="training_mode"):
         onnxsim.export_tflite(model)
+
+
+# ---------------------------------------------------------------------------
+# Extended op coverage (transformer/BEV staples: comparisons, Mod, Expand,
+# TopK, Resize, ConvTranspose, LayerNormalization, ScatterND, GridSample,
+# plus Softplus; Atan documents its TFLite/Flex limitation below)
+# ---------------------------------------------------------------------------
+
+
+def test_softplus_matches_onnxruntime():
+    model = _model(
+        """
+        sp (float[2,3] x) => (float[2,3] y)
+        {
+            y = Softplus (x)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    x = np.random.RandomState(9).randn(2, 3).astype(np.float32)
+    _assert_matches_onnxruntime(model, {"x": x})
+
+
+def test_comparison_and_logic_match_onnxruntime():
+    # GreaterOrEqual/LessOrEqual feed And directly, so the bool tensors never
+    # leave the graph -- the same shape they take in BEVFormer validity masks.
+    model = _model(
+        """
+        cmp (float[2,3] x, float[2,3] y) => (bool[2,3] z)
+        {
+            ge = GreaterOrEqual (x, y)
+            le = LessOrEqual (x, y)
+            z = And (ge, le)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    rng = np.random.RandomState(10)
+    _assert_matches_onnxruntime(
+        model,
+        {
+            "x": rng.randn(2, 3).astype(np.float32),
+            "y": rng.randn(2, 3).astype(np.float32),
+        },
+    )
+
+
+def test_mod_both_modes_match_onnxruntime():
+    # Negative dividends/divisors: fmod=0 follows the divisor's sign,
+    # fmod=1 the dividend's -- TF's truediv would promote to float, so the
+    # translator spells both from floormod instead (see _op_mod).
+    for fmod in (0, 1):
+        model = _model(
+            f"""
+            mo (int32[2,3] x, int32[2,3] y) => (int32[2,3] z)
+            {{
+                z = Mod <fmod={fmod}> (x, y)
+            }}
+            """
+        )
+        onnx.checker.check_model(model)
+        _assert_matches_onnxruntime(
+            model,
+            {
+                "x": np.array([[-7, 7, -8], [8, -9, 5]], np.int32),
+                "y": np.array([[3, -3, 4], [-4, 5, -5]], np.int32),
+            },
+        )
+
+
+def test_div_integer_truncates_toward_zero():
+    # ONNX Div on integers is truncated (C-style) division -- tf.divide would
+    # compute float true-division instead (and promote ints to float64,
+    # breaking downstream integer consumers like Gather indices).
+    model = _model(
+        """
+        dv (int32[2,3] x, int32[2,3] y) => (int32[2,3] z)
+        {
+            z = Div (x, y)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    _assert_matches_onnxruntime(
+        model,
+        {
+            "x": np.array([[-7, 7, -8], [8, -9, 5]], np.int32),
+            "y": np.array([[3, -3, 4], [-4, 5, -5]], np.int32),
+        },
+    )
+
+
+def test_expand_matches_onnxruntime():
+    model = _model(
+        """
+        ex (float[1,3] x) => (float[2,3] y)
+        <int64[2] s = {2, 3}>
+        {
+            y = Expand (x, s)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    x = np.random.RandomState(11).randn(1, 3).astype(np.float32)
+    _assert_matches_onnxruntime(model, {"x": x})
+
+
+def test_topk_matches_onnxruntime():
+    rng = np.random.RandomState(12)
+    x = rng.randn(2, 3).astype(np.float32)
+    model = _model(
+        """
+        tk (float[2,3] x) => (float[2,2] v, int64[2,2] i)
+        <int64[1] k = {2}>
+        {
+            v, i = TopK (x, k)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    _assert_matches_onnxruntime(model, {"x": x})
+
+
+def test_topk_off_axis_smallest_matches_onnxruntime():
+    # Non-last axis (transpose round-trip) with largest=0 (negation round-trip).
+    rng = np.random.RandomState(13)
+    x = rng.randn(2, 3).astype(np.float32)
+    model = _model(
+        """
+        tk (float[2,3] x) => (float[2,3] v, int64[2,3] i)
+        <int64[1] k = {2}>
+        {
+            v, i = TopK <axis=0, largest=0> (x, k)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    _assert_matches_onnxruntime(model, {"x": x})
+
+
+def test_resize_matches_onnxruntime():
+    rng = np.random.RandomState(14)
+    x = rng.randn(1, 1, 2, 2).astype(np.float32)
+    for mode, ctm in (
+        ("nearest", "asymmetric"),
+        ("linear", "half_pixel"),
+    ):
+        model = _model(
+            f"""
+            rs (float[1,1,2,2] x) => (float[1,1,4,4] y)
+            <float[0] roi = {{}}, float[0] scales = {{}},
+             int64[4] sizes = {{1, 1, 4, 4}}>
+            {{
+                y = Resize <mode="{mode}", coordinate_transformation_mode="{ctm}"> (x, roi, scales, sizes)
+            }}
+            """
+        )
+        onnx.checker.check_model(model)
+        _assert_matches_onnxruntime(model, {"x": x})
+
+
+def test_resize_3d_trilinear_matches_onnxruntime():
+    # Trilinear occupancy-upsampling with pytorch_half_pixel coordinates,
+    # lowered as explicit gather taps (see _resize_3d_linear).
+    rng = np.random.RandomState(22)
+    x = rng.randn(1, 1, 2, 2, 2).astype(np.float32)
+    model = _model(
+        """
+        rs (float[1,1,2,2,2] x) => (float[1,1,4,4,4] y)
+        <float[0] roi = {}, float[0] scales = {},
+         int64[5] sizes = {1, 1, 4, 4, 4}>
+        {
+            y = Resize <mode="linear", coordinate_transformation_mode="pytorch_half_pixel"> (x, roi, scales, sizes)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    _assert_matches_onnxruntime(model, {"x": x})
+
+
+def test_convtranspose_matches_onnxruntime():
+    rng = np.random.RandomState(15)
+    w = numpy_helper.from_array(rng.randn(3, 2, 3, 3).astype(np.float32), name="w")
+    b = numpy_helper.from_array(np.zeros(2, np.float32), name="b")
+    model = _model(
+        """
+        ct (float[1,3,4,4] x) => (float[1,2,7,7] y)
+        {
+            y = ConvTranspose <kernel_shape=[3,3], strides=[2,2], pads=[1,1,1,1]> (x, w, b)
+        }
+        """,
+        initializer=[w, b],
+    )
+    onnx.checker.check_model(model)
+    x = rng.randn(1, 3, 4, 4).astype(np.float32)
+    _assert_matches_onnxruntime(model, {"x": x})
+
+
+def test_conv_1d_and_3d_match_onnxruntime():
+    # The occupancy branch is genuinely 3-D; 1-D rides the same N-D code path.
+    rng = np.random.RandomState(21)
+    w1 = numpy_helper.from_array(rng.randn(2, 3, 3).astype(np.float32), name="w1")
+    model = _model(
+        """
+        c1 (float[1,3,5] x) => (float[1,2,5] y)
+        {
+            y = Conv <kernel_shape=[3], pads=[1,1]> (x, w1)
+        }
+        """,
+        initializer=[w1],
+    )
+    onnx.checker.check_model(model)
+    _assert_matches_onnxruntime(model, {"x": rng.randn(1, 3, 5).astype(np.float32)})
+    w3 = numpy_helper.from_array(rng.randn(2, 3, 2, 2, 2).astype(np.float32), name="w3")
+    model = _model(
+        """
+        c3 (float[1,3,3,3,3] x) => (float[1,2,4,4,4] y)
+        {
+            y = Conv <kernel_shape=[2,2,2], pads=[1,1,1,1,1,1]> (x, w3)
+        }
+        """,
+        initializer=[w3],
+    )
+    onnx.checker.check_model(model)
+    _assert_matches_onnxruntime(
+        model, {"x": rng.randn(1, 3, 3, 3, 3).astype(np.float32)}
+    )
+
+
+def test_layernorm_matches_onnxruntime():
+    rng = np.random.RandomState(16)
+    s = numpy_helper.from_array(np.ones(4, np.float32), name="s")
+    bb = numpy_helper.from_array(np.zeros(4, np.float32), name="bb")
+    model = _model(
+        """
+        ln (float[2,8,4] x) => (float[2,8,4] y)
+        {
+            y = LayerNormalization <axis=-1> (x, s, bb)
+        }
+        """,
+        initializer=[s, bb],
+    )
+    onnx.checker.check_model(model)
+    x = rng.randn(2, 8, 4).astype(np.float32)
+    _assert_matches_onnxruntime(model, {"x": x})
+
+
+def test_scatternd_matches_onnxruntime():
+    rng = np.random.RandomState(17)
+    d = rng.randn(4, 4).astype(np.float32)
+    ix = np.array([[0], [2]], np.int64)
+    up = rng.randn(2, 4).astype(np.float32)
+    for with_add in (False, True):
+        body = "sn (float[4,4] d, int64[2,1] ix, float[2,4] up) => (float[4,4] y) " + (
+            '{ y = ScatterND <reduction="add"> (d, ix, up) }'
+            if with_add
+            else "{ y = ScatterND (d, ix, up) }"
+        )
+        model = _model(body)
+        onnx.checker.check_model(model)
+        _assert_matches_onnxruntime(model, {"d": d, "ix": ix, "up": up})
+
+
+def test_gridsample_matches_onnxruntime():
+    rng = np.random.RandomState(18)
+    x = rng.randn(1, 2, 4, 4).astype(np.float32)
+    g = rng.random((1, 3, 3, 2)).astype(np.float32) * 2 - 1
+    for mode, padding_mode, align_corners in (
+        ("bilinear", "zeros", 0),
+        ("bilinear", "zeros", 1),
+        ("bilinear", "border", 0),
+        ("nearest", "zeros", 0),
+    ):
+        model = _model(
+            f"""
+            gs (float[1,2,4,4] x, float[1,3,3,2] g) => (float[1,2,3,3] y)
+            {{
+                y = GridSample <mode="{mode}", padding_mode="{padding_mode}", align_corners={align_corners}> (x, g)
+            }}
+            """
+        )
+        onnx.checker.check_model(model)
+        _assert_matches_onnxruntime(model, {"x": x, "g": g})
+
+
+def test_gridsample_3d_matches_onnxruntime():
+    # Trilinear volume sampling (8 taps), as in BEV occupancy sampling.
+    rng = np.random.RandomState(19)
+    x = rng.randn(1, 2, 3, 4, 4).astype(np.float32)
+    g = rng.random((1, 2, 2, 2, 3)).astype(np.float32) * 2 - 1
+    for align_corners in (0, 1):
+        model = _model(
+            f"""
+            gs (float[1,2,3,4,4] x, float[1,2,2,2,3] g) => (float[1,2,2,2,2] y)
+            {{
+                y = GridSample <mode="bilinear", padding_mode="zeros", align_corners={align_corners}> (x, g)
+            }}
+            """
+        )
+        onnx.checker.check_model(model)
+        _assert_matches_onnxruntime(model, {"x": x, "g": g})
+
+
+def test_atan_has_no_tflite_kernel():
+    # TFLite ships no ATAN builtin (Flex-only), so a graph containing Atan
+    # fails conversion loudly at the converter -- the translator still lowers
+    # it correctly to tf.math.atan for TF-level consumers.
+    model = _model(
+        """
+        at (float[2,3] x) => (float[2,3] y)
+        {
+            y = Atan (x)
+        }
+        """
+    )
+    with pytest.raises(RuntimeError, match="Atan"):
+        onnxsim.export_tflite(model)
+
+
+def test_atan_converts_with_flex_ops():
+    # ...unless flex_ops=True, which partitions the Flex kernel to the CPU
+    # while everything else stays a TFLite builtin -- the escape hatch for a
+    # model whose only unmappable op is a CPU-side tail (BEVFormer box-yaw
+    # decoding ends in Atan). A Flex model cannot target the Edge TPU, so
+    # flex_ops and int8_quantize are mutually exclusive. (The pip TensorFlow
+    # ships no Flex *runtime*, so this checks the partition -- a FlexAtan
+    # custom op in the flatbuffer -- plus the lowering's numerics at the
+    # traced-graph level, rather than executing the flatbuffer.)
+    model = _model(
+        """
+        at (float[2,3] x) => (float[2,3] y)
+        {
+            y = Atan (x)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    x = np.random.RandomState(20).randn(2, 3).astype(np.float32)
+    tflite_model = onnxsim.export_tflite(model, flex_ops=True)
+    assert b"FlexAtan" in tflite_model
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (expected,) = sess.run(None, {"x": x})
+    concrete = tflite_export._build_concrete_function(model, tf)
+    (actual,) = [np.asarray(o) for o in concrete(tf.constant(x))]
+    np.testing.assert_allclose(expected, actual, rtol=1e-4, atol=1e-4)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        onnxsim.export_tflite(model, flex_ops=True, int8_quantize=True)
 
 
 # ---------------------------------------------------------------------------

@@ -486,8 +486,9 @@ dropped its own ONNX frontend -- onnxsim ships its own ONNX-to-TensorFlow
 translator: it builds the equivalent computation with plain TensorFlow ops
 inside a `tf.function`, traces it into a concrete function, and hands that to
 `tf.lite.TFLiteConverter` to produce the actual `.tflite` model. It covers a
-practical subset of ops (conv/pooling/normalization, matmul/gemm, elementwise
-math, reshapes, reductions, and more -- see
+practical subset of ops (conv/pooling/normalization incl. LayerNormalization,
+matmul/gemm, elementwise math incl. comparisons, reshapes, reductions, TopK,
+Resize, ConvTranspose, ScatterND and GridSample -- see
 `tflite_export.SUPPORTED_ONNX_OPS`); a node whose op isn't supported raises a
 clear error naming the op, rather than silently producing a wrong model.
 Feeding in a *simplified* model is the point, same as with the other export
@@ -546,6 +547,14 @@ onnxsim.export_tflite(model_simp, "model.tflite")
 `tf.lite.TFLiteConverter.optimizations` (e.g. `["DEFAULT"]`, what
 `--tflite-optimize` sets, to enable post-training dynamic-range
 quantization). See `onnxsim/tflite_export.py` for the full signature.
+
+A few ops have a correct translation but no TFLite kernel of their own
+(`Atan` is one) and fail conversion loudly at the converter. For a model
+whose only unmappable op is such a CPU-side tail (e.g. BEVFormer box-yaw
+decoding), pass `flex_ops=True` (CLI: `--tflite-flex`) to partition those
+kernels to TensorFlow Flex on the CPU while everything else stays a TFLite
+builtin. A Flex model cannot target the Edge TPU (`flex_ops` is mutually
+exclusive with `--tflite-int8`).
 
 ### A broader-coverage backend: onnx2tf
 

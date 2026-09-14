@@ -4705,6 +4705,16 @@ def main():
         "pair at each model boundary on the Edge TPU.",
     )
     parser.add_argument(
+        "--tflite-flex",
+        action="store_true",
+        help="Allow TensorFlow Flex (SELECT_TF_OPS) kernels when converting "
+        "with --emit-tflite for the few ops TFLite has no builtin for (e.g. "
+        "Atan) instead of failing conversion. Flex ops always run on the CPU, "
+        "so a model that needs Flex cannot target the Edge TPU (mutually "
+        "exclusive with --tflite-int8/--tflite-edgetpu). Only applies to "
+        "--tflite-backend builtin.",
+    )
+    parser.add_argument(
         "--tflite-edgetpu",
         nargs="?",
         const="",
@@ -5655,6 +5665,23 @@ def main():
                 )
             )
             sys.exit(1)
+        if args.tflite_flex and args.tflite_backend != "builtin":
+            print(
+                Text(
+                    "--tflite-flex only applies to --tflite-backend builtin.",
+                    style="bold red",
+                )
+            )
+            sys.exit(1)
+        if args.tflite_flex and int8_active:
+            print(
+                Text(
+                    "--tflite-flex and --tflite-int8/--tflite-edgetpu are "
+                    "mutually exclusive.",
+                    style="bold red",
+                )
+            )
+            sys.exit(1)
         if args.tflite_edgetpu_check:
             from onnxsim import edgetpu_export
 
@@ -5679,6 +5706,8 @@ def main():
         tflite_kwargs = {"backend": args.tflite_backend}
         if args.tflite_optimize:
             tflite_kwargs["optimizations"] = ["DEFAULT"]
+        if args.tflite_flex:
+            tflite_kwargs["flex_ops"] = True
         if int8_active:
             tflite_kwargs["int8_quantize"] = True
             if args.tflite_calibration_samples is not None:
