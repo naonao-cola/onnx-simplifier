@@ -360,6 +360,65 @@ def _op_leaky_relu(lowerer, node, ins, attrs):
     return [Val(tf.nn.leaky_relu(ins[0].t, alpha=alpha))]
 
 
+@_register("PRelu")
+def _op_prelu(lowerer, node, ins, attrs):
+    # y = x if x >= 0 else slope * x, lowered as Relu/Minimum/Mul/Add so every
+    # emitted op is Edge TPU compatible (TFLite's own PRELU op has stricter
+    # layout requirements on the slope than ONNX does).
+    tf = lowerer.tf
+    x, slope = ins[0], ins[1]
+    x_shape = x.t.shape.as_list()
+    s = np.asarray(_require_const(slope, "PRelu's 'slope' input"))
+    try:
+        np.broadcast_shapes(s.shape, tuple(x_shape))
+    except ValueError:
+        raise RuntimeError(
+            f"PRelu slope shape {s.shape} is not broadcastable to input shape "
+            f"{x_shape}."
+        )
+    # Broadcast explicitly: TF aligns trailing dimensions for implicit
+    # broadcasting, which would misplace an ONNX [C]-shaped slope on an NCHW
+    # input, so spell the full-shape slope out instead.
+    slope_full = tf.broadcast_to(slope.t, x_shape)
+    y = tf.nn.relu(x.t) + slope_full * tf.minimum(x.t, 0.0)
+    const = None
+    if x.const is not None:
+        xc = np.asarray(x.const)
+        const = np.maximum(xc, 0) + np.broadcast_to(s, xc.shape) * np.minimum(xc, 0)
+    return [Val(y, const)]
+
+
+@_register("Dropout")
+def _op_dropout(lowerer, node, ins, attrs):
+    # Inference-mode Dropout is an identity (ONNX only scales/drops in
+    # training mode), so it lowers to nothing -- this keeps models that still
+    # carry Dropout nodes convertible.
+    x = ins[0]
+    training = bool(attrs.get("training_mode", 0))
+    if len(ins) > 2 and ins[2] is not None:
+        flag = np.asarray(_require_const(ins[2], "Dropout's 'training_mode' input"))
+        training = training or bool(flag.reshape(-1)[0])
+    if training:
+        raise RuntimeError(
+            "Dropout with training_mode=1 cannot be exported to TFLite "
+            "(only inference-mode Dropout, which is an identity, is supported)."
+        )
+    const = np.asarray(x.const) if x.const is not None else None
+    outs = [Val(x.t, const)]
+    if len(node.output) > 1:
+        # Second output is the dropout mask, never consumed by inference
+        # graphs; bind an all-ones mask so the name still resolves.
+        tf = lowerer.tf
+        mask_shape = x.t.shape.as_list()
+        outs.append(
+            Val(
+                tf.ones(mask_shape, tf.bool),
+                np.ones(mask_shape, dtype=np.bool_),
+            )
+        )
+    return outs
+
+
 @_register("Gelu")
 def _op_gelu(lowerer, node, ins, attrs):
     tf = lowerer.tf
@@ -550,6 +609,16 @@ def _pool_2d(reduce_kind: str):
                 )
                 divisor = np.outer(counts_h, counts_w).astype(np.float32)
                 divisor = divisor.reshape(1, divisor.shape[0], divisor.shape[1], 1)
+                # Tile the divisor to the full output shape instead of relying on
+                # broadcasting over the channel axis: the Edge TPU compiler
+                # rejects that broadcast ("non-broadcastable operands") and
+                # refuses the whole model, while a full-shape constant compiles
+                # with every op mapped to the Edge TPU (verified against
+                # edgetpu_compiler; numerics are unchanged).
+                channels = x_nhwc.shape.as_list()[3]
+                divisor = np.broadcast_to(
+                    divisor, (1, divisor.shape[1], divisor.shape[2], channels)
+                ).copy()
                 y = sum_pool / tf.constant(divisor)
             else:
                 y = sum_pool / float(window_area)
@@ -855,6 +924,85 @@ def _op_constant(lowerer, node, ins, attrs):
 SUPPORTED_ONNX_OPS = tuple(sorted(_OP_HANDLERS))
 
 
+def _onnx_elem_type_to_np(elem_type: int) -> Any:
+    TP = onnx.TensorProto
+    mapping = {
+        TP.FLOAT: np.float32,
+        TP.FLOAT16: np.float16,
+        TP.DOUBLE: np.float64,
+        TP.INT32: np.int32,
+        TP.INT64: np.int64,
+        TP.BOOL: np.bool_,
+    }
+    if elem_type not in mapping:
+        raise RuntimeError(
+            f"Unsupported input dtype {TP.DataType.Name(elem_type)} for TFLite "
+            "export calibration data."
+        )
+    return mapping[elem_type]
+
+
+def random_representative_dataset(
+    model: onnx.ModelProto,
+    num_samples: int = 100,
+    seed: int = 0,
+):
+    """Build a ``representative_dataset`` callable for full-integer quantization.
+
+    Generates ``num_samples`` calibration samples of uniform-random data
+    (float inputs in ``[0, 1)``, small ints/bools for the other dtypes) with
+    the model's own static input shapes. This is enough to let the converter
+    measure activation ranges and produce a valid quantized model -- and, with
+    ``inference_io_dtype=``, an Edge TPU-compilable one -- but random data
+    does not match any real data distribution, so for production accuracy
+    prefer a callable yielding batches of real, representative inputs (see
+    :func:`convert_to_tflite`'s ``representative_dataset`` parameter).
+    """
+    initializer_names = {t.name for t in model.graph.initializer}
+    specs = []
+    for inp in model.graph.input:
+        if inp.name in initializer_names:
+            continue
+        specs.append(
+            (
+                _static_input_shape(inp),
+                _onnx_elem_type_to_np(inp.type.tensor_type.elem_type),
+            )
+        )
+    if not specs:
+        raise RuntimeError(
+            "cannot build calibration data: the model has no (non-initializer) inputs"
+        )
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be positive, got {num_samples}")
+
+    def _sample(rng: np.random.Generator, shape: List[int], dtype: Any) -> np.ndarray:
+        if np.dtype(dtype) == np.dtype(np.bool_):
+            return rng.integers(0, 2, size=shape).astype(np.bool_)
+        if np.issubdtype(np.dtype(dtype), np.integer):
+            return rng.integers(-5, 6, size=shape).astype(dtype)
+        return rng.random(size=shape).astype(dtype)
+
+    def gen():
+        rng = np.random.default_rng(seed)
+        for _ in range(num_samples):
+            yield [_sample(rng, shape, dtype) for shape, dtype in specs]
+
+    return gen
+
+
+def _resolve_inference_dtype(inference_io_dtype: Any, tf: Any) -> Any:
+    if isinstance(inference_io_dtype, str):
+        mapping = {"uint8": tf.uint8, "int8": tf.int8}
+        if inference_io_dtype not in mapping:
+            raise ValueError(
+                f"inference_io_dtype must be 'uint8' or 'int8', got "
+                f"{inference_io_dtype!r}"
+            )
+        return mapping[inference_io_dtype]
+    return inference_io_dtype
+
+
 def _build_concrete_function(model: onnx.ModelProto, tf):
     graph = model.graph
     initializer_names = {t.name for t in graph.initializer}
@@ -899,6 +1047,10 @@ def convert_to_tflite(
     *,
     backend: str = "builtin",
     optimizations: Optional[List[Any]] = None,
+    int8_quantize: bool = False,
+    representative_dataset: Any = None,
+    num_calibration_samples: int = 100,
+    inference_io_dtype: Any = None,
     **backend_kwargs: Any,
 ):
     """Convert an ONNX model to an in-memory TFLite flatbuffer (``bytes``).
@@ -921,11 +1073,40 @@ def convert_to_tflite(
         ``tf.lite.TFLiteConverter.optimizations``, e.g. ``["DEFAULT"]`` (string
         names of ``tf.lite.Optimize`` members are accepted, as well as the enum
         members themselves) to enable TFLite's post-training (dynamic-range)
-        quantization.
+        quantization. Mutually exclusive with ``int8_quantize``.
+    int8_quantize:
+        ``backend="builtin"`` only. When true, run full-integer post-training
+        quantization instead: ``target_spec.supported_ops`` is pinned to
+        ``TFLITE_BUILTINS_INT8`` so conversion fails loudly on any op without
+        an integer kernel rather than silently leaving it in float. This is the
+        quantization the Coral Edge TPU requires -- combine it with
+        ``inference_io_dtype="uint8"`` (or ``"int8"``) for fully-quantized I/O
+        and compile the result with :func:`onnxsim.edgetpu_export.compile_for_edgetpu`
+        (or :func:`onnxsim.export_edgetpu` for the one-shot path).
+    representative_dataset:
+        ``backend="builtin"`` only, requires ``int8_quantize=True``. A callable
+        with no arguments yielding calibration batches (each a list of NumPy
+        arrays in graph-input order, following the
+        ``tf.lite.TFLiteConverter.representative_dataset`` protocol), e.g. built
+        from real inputs. When ``None`` (the default),
+        :func:`random_representative_dataset` generates ``num_calibration_samples``
+        uniform-random batches from the model's own input shapes -- enough to
+        produce a valid quantized model, but random data cannot match a real
+        data distribution, so prefer real inputs for production accuracy.
+    num_calibration_samples:
+        How many random batches :func:`random_representative_dataset` generates
+        when ``representative_dataset`` is not given. Ignored otherwise.
+    inference_io_dtype:
+        ``backend="builtin"`` only, requires ``int8_quantize=True``. ``"uint8"``
+        or ``"int8"`` (or the corresponding ``tf.dtypes.DType``), forwarded to
+        the converter's ``inference_input_type``/``inference_output_type`` so the
+        model's public I/O is quantized too. The Edge TPU runs fastest -- and
+        avoids a CPU-side quantize/dequantize pair at each boundary -- with
+        quantized I/O.
     **backend_kwargs:
         ``backend="onnx2tf"`` only. Forwarded to
         :func:`onnxsim.onnx2tf_export.convert_to_tflite_via_onnx2tf` (and from there
-        to ``onnx2tf.convert()``).
+        to ``onnx2tf.convert()``); use onnx2tf's own quantization options there.
 
     Returns
     -------
@@ -942,6 +1123,17 @@ def convert_to_tflite(
     if backend == "onnx2tf":
         from onnxsim import onnx2tf_export
 
+        if (
+            int8_quantize
+            or representative_dataset is not None
+            or inference_io_dtype is not None
+        ):
+            raise TypeError(
+                "convert_to_tflite() with backend='onnx2tf' does not accept "
+                "int8_quantize/representative_dataset/inference_io_dtype; use "
+                "onnx2tf's own quantization options (forwarded as extra keyword "
+                "arguments) instead."
+            )
         return onnx2tf_export.convert_to_tflite_via_onnx2tf(model, **backend_kwargs)
     if backend != "builtin":
         raise ValueError(
@@ -952,11 +1144,33 @@ def convert_to_tflite(
             f"convert_to_tflite() with backend='builtin' got unexpected keyword "
             f"arguments: {sorted(backend_kwargs)}"
         )
+    if optimizations and int8_quantize:
+        raise ValueError(
+            "optimizations= and int8_quantize=True are mutually exclusive: "
+            "int8_quantize already enables the DEFAULT optimization internally "
+            "as part of full-integer quantization."
+        )
+    if representative_dataset is not None and not int8_quantize:
+        raise ValueError("representative_dataset= requires int8_quantize=True.")
+    if inference_io_dtype is not None and not int8_quantize:
+        raise ValueError("inference_io_dtype= requires int8_quantize=True.")
 
     tf = _import_tensorflow()
     concrete = _build_concrete_function(model, tf)
     converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete])
-    if optimizations:
+    if int8_quantize:
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.representative_dataset = (
+            representative_dataset
+            if representative_dataset is not None
+            else random_representative_dataset(model, num_calibration_samples)
+        )
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        if inference_io_dtype is not None:
+            io_dtype = _resolve_inference_dtype(inference_io_dtype, tf)
+            converter.inference_input_type = io_dtype
+            converter.inference_output_type = io_dtype
+    elif optimizations:
         converter.optimizations = [
             getattr(tf.lite.Optimize, o) if isinstance(o, str) else o
             for o in optimizations

@@ -4676,6 +4676,61 @@ def main():
         "when a model hits an unsupported op with the builtin translator.",
     )
     parser.add_argument(
+        "--tflite-int8",
+        action="store_true",
+        help="Full-integer quantize when converting with --emit-tflite "
+        "(TFLITE_BUILTINS_INT8, with quantized I/O). This is the quantization "
+        "the Coral Edge TPU requires; without it, use --tflite-optimize for "
+        "plain dynamic-range quantization instead (the two are mutually "
+        "exclusive). Only applies to --tflite-backend builtin. Calibration "
+        "uses uniform-random data unless the model needs real inputs -- see "
+        "--tflite-calibration-samples.",
+    )
+    parser.add_argument(
+        "--tflite-calibration-samples",
+        default=None,
+        type=int,
+        metavar="N",
+        help="Random calibration batches for --tflite-int8/--tflite-edgetpu "
+        "(default: 100). Random data is enough to produce a valid quantized "
+        "model, but real representative inputs give better accuracy -- for "
+        "that, use the Python API's representative_dataset= instead.",
+    )
+    parser.add_argument(
+        "--tflite-io-dtype",
+        choices=["uint8", "int8"],
+        default=None,
+        help="Quantized model I/O type for --tflite-int8/--tflite-edgetpu "
+        "(default: uint8). Quantized I/O avoids a CPU-side quantize/dequantize "
+        "pair at each model boundary on the Edge TPU.",
+    )
+    parser.add_argument(
+        "--tflite-edgetpu",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Compile the --emit-tflite model for the Coral Edge TPU with "
+        "edgetpu_compiler (implies --tflite-int8 with quantized I/O). "
+        "Optionally give an output path; when the flag is passed without one, "
+        "it is written next to the .tflite file with a '_edgetpu' suffix. "
+        "Only applies to --tflite-backend builtin.",
+    )
+    parser.add_argument(
+        "--tflite-edgetpu-compiler",
+        default=None,
+        metavar="PATH",
+        help="Explicit path to the edgetpu_compiler binary for --tflite-edgetpu "
+        "(default: $EDGETPU_COMPILER or PATH lookup).",
+    )
+    parser.add_argument(
+        "--tflite-edgetpu-check",
+        action="store_true",
+        help="Before converting with --emit-tflite, statically check the "
+        "simplified model against the Edge TPU requirements (static shapes, "
+        "supported ops) and print the findings. Needs nothing but onnx.",
+    )
+    parser.add_argument(
         "--node-reduction-plot",
         help="After simplifying, plot node count per round for each "
         "simplification fixed-point loop (from the --profile trace's "
@@ -5579,6 +5634,40 @@ def main():
                 )
             )
             sys.exit(1)
+        edgetpu_active = args.tflite_edgetpu is not None
+        int8_active = bool(args.tflite_int8) or edgetpu_active
+        if args.tflite_optimize and int8_active:
+            print(
+                Text(
+                    "--tflite-optimize and --tflite-int8/--tflite-edgetpu are "
+                    "mutually exclusive.",
+                    style="bold red",
+                )
+            )
+            sys.exit(1)
+        if int8_active and args.tflite_backend != "builtin":
+            print(
+                Text(
+                    "--tflite-int8/--tflite-edgetpu only apply to "
+                    "--tflite-backend builtin (use onnx2tf's own quantization "
+                    "options via the Python API instead).",
+                    style="bold red",
+                )
+            )
+            sys.exit(1)
+        if args.tflite_edgetpu_check:
+            from onnxsim import edgetpu_export
+
+            report = edgetpu_export.check_onnx_for_edgetpu(model_opt)
+            print(report.summary())
+            if report.errors:
+                print(
+                    Text(
+                        "Edge TPU compatibility errors above must be fixed "
+                        "before the model can run on the device.",
+                        style="bold red",
+                    )
+                )
         if args.emit_tflite:
             tflite_path = args.emit_tflite
         else:
@@ -5590,12 +5679,65 @@ def main():
         tflite_kwargs = {"backend": args.tflite_backend}
         if args.tflite_optimize:
             tflite_kwargs["optimizations"] = ["DEFAULT"]
+        if int8_active:
+            tflite_kwargs["int8_quantize"] = True
+            if args.tflite_calibration_samples is not None:
+                tflite_kwargs["num_calibration_samples"] = (
+                    args.tflite_calibration_samples
+                )
+            tflite_kwargs["inference_io_dtype"] = args.tflite_io_dtype or "uint8"
+        elif (
+            args.tflite_calibration_samples is not None
+            or args.tflite_io_dtype is not None
+        ):
+            print(
+                Text(
+                    "--tflite-calibration-samples/--tflite-io-dtype only apply "
+                    "with --tflite-int8/--tflite-edgetpu.",
+                    style="bold red",
+                )
+            )
+            sys.exit(1)
         try:
-            tflite_export.export_tflite(model_opt, tflite_path, **tflite_kwargs)
-        except RuntimeError as e:
+            tflite_bytes = tflite_export.export_tflite(
+                model_opt, tflite_path, **tflite_kwargs
+            )
+        except (RuntimeError, ValueError) as e:
             print(Text(str(e), style="bold red"))
             sys.exit(1)
         print(f"TFLite model written to {tflite_path}")
+        if edgetpu_active:
+            from onnxsim import edgetpu_export
+
+            if args.tflite_edgetpu:
+                edgetpu_path = args.tflite_edgetpu
+            else:
+                stem, _ = os.path.splitext(tflite_path)
+                edgetpu_path = stem + "_edgetpu.tflite"
+            print(f"Compiling for the Edge TPU at {edgetpu_path} ...")
+            try:
+                result = edgetpu_export.compile_for_edgetpu(
+                    tflite_bytes,
+                    output_path=edgetpu_path,
+                    compiler=args.tflite_edgetpu_compiler,
+                )
+            except (RuntimeError, ValueError) as e:
+                print(Text(str(e), style="bold red"))
+                sys.exit(1)
+            print(result.summary())
+            if not result.success:
+                print(Text("Edge TPU compilation failed.", style="bold red"))
+                sys.exit(1)
+            if not result.fully_mapped:
+                print(
+                    Text(
+                        "Warning: part of the model falls back to the CPU; "
+                        "see the operator statuses above.",
+                        style="bold yellow",
+                    )
+                )
+            else:
+                print(f"Edge TPU model written to {edgetpu_path}")
 
     if check_ok:
         print("Finish! Here is the difference:")

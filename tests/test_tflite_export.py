@@ -363,3 +363,89 @@ def test_builtin_backend_rejects_backend_specific_kwargs():
         onnxsim.export_tflite(
             _relu_model(), keep_ncw_or_nchw_or_ncdhw_input_names=["x"]
         )
+
+
+# ---------------------------------------------------------------------------
+# PRelu / Dropout (translator additions; PRelu lowers to Edge TPU-mappable
+# Relu/Minimum/Mul/Add, Dropout in inference mode is an identity)
+# ---------------------------------------------------------------------------
+
+
+def test_prelu_nchw_slope_matches_onnxruntime():
+    slope = numpy_helper.from_array(
+        np.array([0.1, 0.5, -0.25], np.float32), name="slope"
+    )
+    model = _model(
+        "pr (float[2,3] x) => (float[2,3] y) { y = PRelu (x, slope) }",
+        initializer=[slope],
+    )
+    onnx.checker.check_model(model)
+    x = np.random.RandomState(6).randn(2, 3).astype(np.float32)
+    _assert_matches_onnxruntime(model, {"x": x})
+
+
+def test_prelu_image_slope_matches_onnxruntime():
+    # Channel-shaped slope on an NCHW input: the translator must broadcast it
+    # explicitly (TF's implicit trailing-alignment would misplace it).
+    rng = np.random.RandomState(7)
+    slope = numpy_helper.from_array(
+        (0.1 * rng.randn(3, 1, 1)).astype(np.float32), name="slope"
+    )
+    model = _model(
+        "prim (float[1,3,4,4] x) => (float[1,3,4,4] y) { y = PRelu (x, slope) }",
+        initializer=[slope],
+    )
+    onnx.checker.check_model(model)
+    x = rng.randn(1, 3, 4, 4).astype(np.float32)
+    _assert_matches_onnxruntime(model, {"x": x})
+
+
+def test_dropout_inference_is_identity():
+    model = _model("do (float[2,3] x) => (float[2,3] y) { y = Dropout (x) }")
+    onnx.checker.check_model(model)
+    x = np.random.RandomState(8).randn(2, 3).astype(np.float32)
+    _assert_matches_onnxruntime(model, {"x": x})
+
+
+def test_dropout_training_mode_raises():
+    training = numpy_helper.from_array(np.array(True), name="training")
+    model = _model(
+        "dot (float[2,3] x) => (float[2,3] y) { y = Dropout (x, ratio, training) }",
+        initializer=[
+            numpy_helper.from_array(np.array(0.5, np.float32), name="ratio"),
+            training,
+        ],
+    )
+    with pytest.raises(RuntimeError, match="training_mode"):
+        onnxsim.export_tflite(model)
+
+
+# ---------------------------------------------------------------------------
+# Full-integer quantization (Edge TPU prerequisite)
+# ---------------------------------------------------------------------------
+
+
+def test_int8_quantize_produces_quantized_io():
+    model = _relu_model()
+    tflite_model = onnxsim.export_tflite(
+        model,
+        int8_quantize=True,
+        inference_io_dtype="uint8",
+        num_calibration_samples=5,
+    )
+    assert isinstance(tflite_model, bytes) and len(tflite_model) > 0
+    interp = tf.lite.Interpreter(model_content=tflite_model)
+    interp.allocate_tensors()
+    in_dtype = interp.get_input_details()[0]["dtype"]
+    out_dtype = interp.get_output_details()[0]["dtype"]
+    assert in_dtype == np.uint8
+    assert out_dtype == np.uint8
+
+
+def test_int8_quantize_rejects_conflicts():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        onnxsim.export_tflite(
+            _relu_model(), optimizations=["DEFAULT"], int8_quantize=True
+        )
+    with pytest.raises(ValueError, match="requires int8_quantize=True"):
+        onnxsim.export_tflite(_relu_model(), inference_io_dtype="uint8")
