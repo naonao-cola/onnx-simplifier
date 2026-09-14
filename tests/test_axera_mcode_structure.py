@@ -1444,6 +1444,95 @@ def test_patching_decoded_requant_scale_isolates_to_one_channel(tmp_path):
     assert len(np.unique(patch0)) < len(np.unique(base0))
 
 
+def _reshape_mul_probe_model():
+    """`Reshape([1,8,1,1] -> [1,8])` into an elementwise `Mul` -- the
+    backward-slice shape whose compiled stream sits just under the
+    coverage floor (see `test_known_gap_streams_hold_status_quo` in
+    test_axera_mcode_validator.py)."""
+    return helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node(
+                    "Reshape",
+                    ["x", "shape"],
+                    ["r"],
+                ),
+                helper.make_node("Mul", ["r", "scale"], ["y"]),
+            ],
+            "reshape_mul_probe",
+            [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8, 1, 1])],
+            [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8])],
+            [
+                helper.make_tensor("shape", TensorProto.INT64, [2], np.array([1, 8])),
+                helper.make_tensor("scale", TensorProto.FLOAT, [], np.array(0.5)),
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 17)],
+        ir_version=8,
+    )
+
+
+def test_splice_gap_bytes_split_inert_vs_fault(tmp_path):
+    """Confirmed real on an AX650N: the two unexplained singles in the
+    Reshape->Mul stream's sub-floor region split cleanly. Zeroing the lone
+    `08` byte runs bit-identical (functionally inert, like the
+    frankenstein noise labels). Zeroing the `0b 01` pair faults the
+    runtime (`0x8030070C`) -- live instruction bytes the decoder does not
+    understand yet, not padding (padding would not fault). The offsets are
+    asserted, not assumed: mcode carries run-to-run value noise, so a
+    layout drift fails loudly here instead of splicing the wrong bytes.
+    """
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    model = _reshape_mul_probe_model()
+    path = _build_axmodel(os.path.join(str(tmp_path), "base"), model, (1, 8, 1, 1))
+    compiled = onnx.load(path)
+    key = _mcode_key(compiled)
+    mcode = bytes({i.name: i for i in compiled.graph.initializer}[key].raw_data)
+    # Locate by pattern, not absolute offset: mcode carries run-to-run
+    # value noise, so a layout drift must fail loudly here instead of
+    # splicing the wrong bytes. The pair sits seven bytes after a lone
+    # 08, both followed by zero padding in every build seen so far.
+    cands = [
+        i
+        for i in range(len(mcode) - 10)
+        if mcode[i : i + 2] == b"\x0b\x01" and mcode[i + 2 : i + 10] == b"\x00" * 8
+    ]
+    assert len(cands) == 1, f"expected one zero-padded 0b01 pair, found {cands}"
+    pair, single = cands[0], cands[0] - 7
+    assert mcode[single] == 0x08, "reshape-mul stream layout drifted (08 single)"
+
+    rng = np.random.RandomState(7)
+    x = rng.randn(1, 8, 1, 1).astype(np.float32)
+
+    def run_patched(patches):
+        patched = bytearray(mcode)
+        for offset, value in patches:
+            patched[offset : offset + len(value)] = value
+        c = onnx.load(path)
+        {i.name: i for i in c.graph.initializer}[key].raw_data = bytes(patched)
+        p = os.path.join(str(tmp_path), f"splice_{patches[0][0]}.axmodel")
+        onnx.save(c, p)
+        return _run_retry_once(p, x)
+
+    dev_ref = _run_retry_once(path, x)
+    assert not dev_ref.error, dev_ref.error
+    ref = np.frombuffer(dev_ref.outputs[0], dtype=np.float32)
+
+    dev_inert = run_patched([(single, b"\x00")])
+    assert not dev_inert.error, dev_inert.error
+    assert np.array_equal(np.frombuffer(dev_inert.outputs[0], dtype=np.float32), ref), (
+        "zeroing the 08 single changed the output"
+    )
+
+    dev_live = run_patched([(pair, b"\x00\x00")])
+    assert dev_live.error and "0x8030070C" in dev_live.error, (
+        "zeroing the 0b01 pair should fault the runtime",
+        dev_live.error,
+    )
+
+
 def test_bit_flip_probe_on_real_resnet18d_has_three_outcome_classes(tmp_path):
     """Confirmed real (see the README's "The bit-flip probe on the real
     resnet18d mcode" section): on the real, unmodified resnet18d_Opset18

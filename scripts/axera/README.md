@@ -5329,6 +5329,28 @@ every rule at 0.952-0.964 coverage. The layernorm stream carries no
 differences live in operand values, not in new forms -- the same verdict
 the vocoder gave, now with Norm and Softmax in the set.
 
+### Training-graph streams: first distill-step coverage, one live pair decoded by fault
+
+Seven more fixtures from Pulsar2 7.0-lite builds run on the card: a full
+distillation training step (forward + KD loss + backward + Adam -- the
+first training-*step-graph* stream in the corpus, 24 op programs),
+an INT8 ResNet18, the KD soft-loss head, an Adam update, and three
+Reshape-rooted backward slices. Five pass every rule at 0.944-0.989
+with closed verb/tag sets. The remaining two sit just under the floor
+with the same characterized singles -- a lone `08` byte and a `0b 01`
+pair before zero padding -- pinned by exact-violation tests, not
+admitted as forms.
+
+The pair earned its own device experiment rather than a guess: zeroing
+the `08` single runs bit-identical (functionally inert, like the
+frankenstein noise labels), while zeroing `0b 01` faults the NPU
+(`0x8030070C`) -- live instruction bytes the decoder does not
+understand yet, not padding. The same `0b 01`-before-zeros + `08`
+seven bytes back recurs in all six slice streams, so the splice test
+locates it by pattern with loud asserts rather than hardcoding
+offsets. Decoding what the pair *means* is open work with device
+evidence in hand.
+
 ### A five-byte form that programs its pair twice
 
 Sixty-eight further real streams from the AX650N -- CNN, transformer and

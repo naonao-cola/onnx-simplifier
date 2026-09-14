@@ -57,6 +57,21 @@ _BLOBS = {
     "dwconv_g32": (3176, 5, 3),
     "layernorm_last_axis": (2528, 5, 0),
     "attn_qkv_softmax": (5552, 5, 5),
+    # Training-graph and backward-slice streams, compiled with Pulsar2
+    # 7.0-lite and run on a real AX650N: a full distillation training step
+    # (forward + KD loss + backward + Adam, the first training-graph stream
+    # in this corpus), an INT8 ResNet18 classifier, the KD soft-loss head,
+    # an Adam update with the FP32-Sub override, a Reshape->Gather
+    # backward slice, and the Reshape->Mul / Reshape->MatMul pair that
+    # pinpoint the scheduler's standalone-reshape crash boundary (see the
+    # README's "Training-graph streams" section). The pair sits just under
+    # the coverage floor with characterized 1-2 byte singles -- pinned by
+    # test_known_gap_streams_hold_status_quo below, not by the clean test.
+    "toy_training_step": (31032, 5, 24),
+    "resnet18_int8": (50984, 5, 186),
+    "loss_head_kd": (5480, 5, 1),
+    "adam_update_fp32": (2288, 5, 2),
+    "reshape_gather_bwd": (2600, 5, 1),
 }
 
 
@@ -166,6 +181,11 @@ _Q_COUNTS = {
     "dwconv_g32": 0,
     "layernorm_last_axis": 0,
     "attn_qkv_softmax": 0,
+    "toy_training_step": 0,
+    "resnet18_int8": 0,
+    "loss_head_kd": 0,
+    "adam_update_fp32": 0,
+    "reshape_gather_bwd": 0,
 }
 
 
@@ -279,6 +299,11 @@ _PD_COUNTS = {
     "dwconv_g32": (0, 0),
     "layernorm_last_axis": (0, 0),
     "attn_qkv_softmax": (0, 0),
+    "toy_training_step": (0, 0),
+    "resnet18_int8": (0, 8),
+    "loss_head_kd": (0, 0),
+    "adam_update_fp32": (0, 0),
+    "reshape_gather_bwd": (0, 0),
 }
 
 
@@ -403,6 +428,11 @@ _E_COUNTS = {
     "dwconv_g32": 0,
     "layernorm_last_axis": 0,
     "attn_qkv_softmax": 0,
+    "toy_training_step": 0,
+    "resnet18_int8": 0,
+    "loss_head_kd": 0,
+    "adam_update_fp32": 0,
+    "reshape_gather_bwd": 0,
 }
 
 
@@ -524,6 +554,11 @@ _C_COUNTS = {
     "dwconv_g32": 1,
     "layernorm_last_axis": 0,
     "attn_qkv_softmax": 0,
+    "toy_training_step": 2,
+    "resnet18_int8": 0,
+    "loss_head_kd": 0,
+    "adam_update_fp32": 0,
+    "reshape_gather_bwd": 0,
 }
 
 
@@ -683,6 +718,11 @@ _N_COUNTS = {
     "dwconv_g32": 0,
     "layernorm_last_axis": 0,
     "attn_qkv_softmax": 0,
+    "toy_training_step": 0,
+    "resnet18_int8": 0,
+    "loss_head_kd": 0,
+    "adam_update_fp32": 0,
+    "reshape_gather_bwd": 0,
 }
 
 
@@ -760,3 +800,74 @@ def test_new_families_use_no_new_instruction_forms(name):
     assert btags <= mcode.ALL_TAGS | {0xA1, 0xC1, 0xE1}, (name, btags)
     covered, _ = mcode.nonzero_coverage(blob)
     assert covered >= 0.95, (name, covered)
+
+
+_TRAINING_FAMILIES = (
+    "toy_training_step",
+    "resnet18_int8",
+    "loss_head_kd",
+    "adam_update_fp32",
+)
+
+
+@pytest.mark.parametrize("name", _TRAINING_FAMILIES)
+def test_training_graph_streams_use_no_new_instruction_forms(name):
+    """A full distillation training step (forward + KD loss + backward +
+    Adam), an INT8 ResNet18, the KD soft-loss head and an Adam update --
+    the first training-graph streams in this corpus -- introduce no verb
+    and no tag beyond the closed sets, same bar as the inference-only
+    families above. Op-type differences live in operand values, not in
+    new forms. Needs neither Docker nor a device."""
+    blob = _blob(name)
+    lo, hi = mcode.stream_bounds(blob)
+    toks = mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    verbs = {t[2] for t in toks if t[1] == "V"}
+    assert verbs <= mcode.VERBS6, (name, verbs)
+    stags = set()
+    for t in toks:
+        if t[1] == "S":
+            o, _, p, _, _ = t
+            stags.add(blob[o + p + 2])
+    assert stags <= mcode.ALL_TAGS | {0xA1}, (name, stags)
+    btags = {t[2] for t in toks if t[1] == "B"}
+    assert btags <= mcode.ALL_TAGS | {0xA1, 0xC1, 0xE1}, (name, btags)
+    covered, _ = mcode.nonzero_coverage(blob)
+    assert covered >= 0.95, (name, covered)
+
+
+_GAP_STREAMS = {
+    # Streams just under the coverage floor, with the exact unexplained
+    # runs pinned: a lone `08` byte and a live `0b 01` pair (device-proven:
+    # zeroing the pair faults the NPU, zeroing the single runs
+    # bit-identical -- see test_splice_gap_bytes_* in
+    # test_axera_mcode_structure.py). Fails loudly in either direction: a
+    # regression adds runs, a future form decoding these removes them.
+    "reshape_mul_gap": (
+        "coverage: only 93.4% of non-zero bytes explained "
+        "[(284, 285), (321, 322), (328, 330), (376, 377)]"
+    ),
+    "reshape_matmul_gap": (
+        "coverage: only 93.8% of non-zero bytes explained "
+        "[(280, 281), (321, 322), (328, 330), (344, 345)]"
+    ),
+    "reshape_gather_bwd": (),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_GAP_STREAMS))
+def test_known_gap_streams_hold_status_quo(name):
+    """The three backward-slice streams below the families bar above hold
+    exactly their recorded status -- no more, no less. `reshape_gather_bwd`
+    passes `check()` (0.9443 coverage, above the 0.94 floor) with the same
+    unexplained singles; the pair sits just under the floor with the runs
+    listed. Needs neither Docker nor a device."""
+    blob = _blob(name)
+    expected = _GAP_STREAMS[name]
+    assert mcode.check(blob) == ([expected] if expected else [])
+    covered, runs = mcode.nonzero_coverage(blob)
+    for a, b in runs:
+        assert (b - a) <= 12, (name, (a, b))
+    if expected:
+        assert covered < 0.94, (name, covered)
+    else:
+        assert 0.94 <= covered < 0.95, (name, covered)
