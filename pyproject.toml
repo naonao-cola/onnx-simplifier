@@ -121,6 +121,17 @@ onnxsim = "onnxsim:main"
 # this list into the GitHub Actions job summary when running in CI, so the
 # timings are visible without opening the raw logs.
 addopts = "--durations=10"
+# Auto-applied by tests/conftest.py's pytest_collection_modifyitems based on
+# each test file's name -- see that hook for the exact matching rules. Used
+# by .github/workflows/build-and-test.yml to skip these backend/algorithm-
+# specific suites on macOS and the Windows cross-test job (they have no
+# OS-specific behavior, so running them there on top of every Linux leg is
+# redundant CI time), while still running them in full on Linux.
+markers = [
+    "axera: Axera Pulsar2/AXCL NPU backend tests (test_axera_*, test_axelera_*, test_pulsar2_*, test_voyager_sdk_patterns.py)",
+    "quantization: quantization algorithm/format tests (filename contains 'quant' or 'gguf')",
+    "pruning: pruning algorithm tests (filename contains 'prun')",
+]
 
 [tool.ruff]
 # The vendored single-header option parser is not our code to reformat.

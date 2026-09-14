@@ -15,6 +15,40 @@ collection, so the installed package is imported unchanged.
 """
 
 import os
+import re
+
+
+# Filename patterns for the "axera" marker: Axera Pulsar2/AXCL NPU backend
+# tests. test_voyager_sdk_patterns.py doesn't follow the test_axera_*/
+# test_axelera_* prefix but covers the same Axelera Voyager SDK surface as
+# test_axelera_voyager_*.py, so it's matched by substring instead of prefix.
+_AXERA_PREFIX_RE = re.compile(r"^test_(axera|axelera|pulsar2)_")
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-mark tests by filename so CI can select/deselect whole categories.
+
+    Registered in pyproject.toml's ``markers`` list. There's no practical way
+    to hand-annotate every quantization/pruning/Axera test file (hundreds of
+    them, across many contributors and algorithms), and their names already
+    encode the category reliably, so this infers the marker from the
+    filename instead of requiring every test to carry an explicit
+    ``@pytest.mark.*`` decorator.
+
+    .github/workflows/build-and-test.yml uses ``-m "not axera and not
+    quantization and not pruning"`` to skip these on macOS and the Windows
+    cross-test job -- they exercise onnxsim's own algorithm/format logic,
+    not OS-specific behavior, so running them there in addition to every
+    Linux leg just adds CI time without adding coverage.
+    """
+    for item in items:
+        name = os.path.basename(str(item.fspath)).lower()
+        if _AXERA_PREFIX_RE.match(name) or "voyager" in name:
+            item.add_marker("axera")
+        if "quant" in name or "gguf" in name:
+            item.add_marker("quantization")
+        if "prun" in name:
+            item.add_marker("pruning")
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
