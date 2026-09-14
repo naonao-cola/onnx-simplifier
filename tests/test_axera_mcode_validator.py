@@ -491,3 +491,65 @@ def test_template8_never_regresses_coverage(name):
     covered_plain, _ = mcode.nonzero_coverage(blob, **plain)
     covered_with, _ = mcode.nonzero_coverage(blob)
     assert covered_with >= covered_plain, (name, covered_plain, covered_with)
+
+
+# C-token counts per committed stream -- `[H][A][B][0xc1][D]` units with
+# `H` in `{0x01, 0x30}` and `D` even (see `test_c1_five_programs_a_slot`).
+_C_COUNTS = {
+    "conv64_k5_d2": 1,
+    "conv128_k7_d12": 0,
+    "piper_vocoder": 1,
+    "w2v2fe_training_step": 7,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_c1_five_programs_a_slot(name):
+    """A `[H][A][B][0xc1][D]` unit with `H` in `{0x01, 0x30}` and `D` even:
+    a short-unit-shaped payload against tag `0xc1`, whose `(A, B)` roam
+    over a dozen field-like pairs for `H = 0x01` (concentrated: three pairs
+    are 85% of corpus takes, against a scattered shuffle) and stay fixed
+    for `H = 0x30`. The even-`D` gate keeps it disjoint from the fixed
+    `01 a4 00 c1 W` form, whose tail is always odd. See the README's "The
+    `0xc1` five" section."""
+    blob = _blob(name)
+    lo, hi = mcode.stream_bounds(blob)
+    toks = mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    takes = [t for t in toks if t[1] == "C"]
+    assert len(takes) == _C_COUNTS[name], (name, len(takes))
+    for o, _, h, a, bd in takes:
+        b, d = bd
+        assert bytes(blob[o : o + 5]) == bytes([h, a, b, 0xC1, d]), (name, o)
+        assert h in (0x01, 0x30) and d % 2 == 0, (name, o)
+        for j in range(o + 1, o + 5):
+            assert not (
+                blob[j] in mcode.VERBS6 and blob[j + 1] == 0 and blob[j + 2] % 0x10 == 0
+            ), (name, o, j)
+    records = mcode.decode(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    assert [(r["h"], r["a"], r["b"], r["d"]) for r in records if r["kind"] == "C"] == [
+        (h, a, b, d) for _, _, h, a, (b, d) in takes
+    ]
+
+    # Admitting the form buys coverage where it fires, and nowhere else.
+    without = dict(mcode.FULL_RULE)
+    without["c1five"] = False
+    covered_without, _ = mcode.nonzero_coverage(blob, **without)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    if _C_COUNTS[name]:
+        assert covered_with > covered_without, (name, covered_without, covered_with)
+    else:
+        assert covered_with == covered_without, (name, covered_without, covered_with)
+
+    # The shuffle control is honest about small streams: chance shapes fire
+    # too, just diffusely (scattered pairs, top count 41 corpus-wide --
+    # against 1,561 on the top real pair), so the bound only guards against
+    # pathological over-firing.
+    bulk = bytearray(blob[lo:hi])
+    random.Random(0).shuffle(bulk)
+    shuffled = bytes(blob[:lo]) + bytes(bulk) + bytes(blob[hi:])
+    null = sum(
+        1
+        for t in mcode.tokenize(shuffled, start=lo, end=hi, **mcode.FULL_RULE)
+        if t[1] == "C"
+    )
+    assert null <= 2 * len(takes) + 2, (name, len(takes), null)
