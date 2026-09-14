@@ -66,6 +66,7 @@ FULL_RULE = dict(
     template8=True,
     c1five=True,
     repeat=True,
+    stutter=True,
 )
 """Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
 six verbs -- the README's "The tail is the segment table" section -- plus
@@ -73,8 +74,8 @@ the `[04][a][b][a][b]` quintet ("A five-byte form that programs its pair
 twice"), the bookend pairs ("Bookend pairs: a two-byte prefix class"), the
 fixed head with a live tail ("A fixed head with a live tail"), the two
 adjudicated templates ("An eight-byte template with a fused tail"), the
-`0xc1` five ("The `0xc1` five") and the second repeat form ("A second
-repeat form").
+`0xc1` five ("The `0xc1` five"), the second repeat form ("A second
+repeat form") and the stuttered pair ("The stuttered pair").
 `lookahead` adjudicates the overlaps the greedy walk cannot see past
 ("Adjudicating the overlaps ..."); 64 bytes is where the corpus-wide
 gain converges (32 is slightly worse, 128 no better)."""
@@ -104,6 +105,7 @@ def tokenize(
     template8=False,
     c1five=False,
     repeat=False,
+    stutter=False,
 ):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
@@ -128,7 +130,9 @@ def tokenize(
     -- see "An eight-byte template with a fused tail"), 'C' (a
     `[H][A][B][0xc1][D]` unit with `H` in `{0x01, 0x30}` and `D` even --
     see "The `0xc1` five"), 'R' (a `[0x30][0x03][X][0x03][0x09]` repeat
-    unit -- see "A second repeat form") or '?' (a=byte).
+    unit -- see "A second repeat form"), 'Y' (a stuttered `90 03` echo
+    after a short unit ending in it -- see "The stuttered pair") or '?'
+    (a=byte).
 
     Where a short unit ending in `a1 00` overlaps a verb beginning there,
     the greedy walk cannot tell a genuine tag from a swallowed verb head by
@@ -440,6 +444,27 @@ def tokenize(
                 out.append((i, "T", mcode[i + 4], 0, 0))
                 i += 8
                 continue
+        if stutter and tok[1] == "S" and nxt + 1 < len(mcode):
+            # A short unit ending in `90 03` followed by another `90 03`:
+            # the pair stutters (5,502 of them corpus-wide, eleven of
+            # anything else), and no other form can open at the echo (`0x90`
+            # needs an even register after it, `0x03` is not a prefix). The
+            # echo walks as a `Y` record; everything around it parses
+            # exactly as before, so this converts only raw escapes. See the
+            # README's "The stuttered pair" section.
+            if (
+                mcode[nxt - 2] == 0x90
+                and mcode[nxt - 1] == 0x03
+                and mcode[nxt] == 0x90
+                and mcode[nxt + 1] == 0x03
+                and not companion_at(nxt)
+                and not short_len(nxt + 1)
+                and not companion_at(nxt + 1)
+            ):
+                out.append(tok)
+                out.append((nxt, "Y", 0x90, 0x03, 0))
+                i = nxt + 2
+                continue
         out.append(tok)
         i = nxt
     return out
@@ -543,6 +568,8 @@ def decode(mcode, start=None, end=None, **rule):
     * `C`: a `[H][A][B][0xc1][D]` unit with `H` in `{0x01, 0x30}` and `D`
       even (`h`, `a`, `b`, `d`)
     * `R`: a `[0x30][0x03][X][0x03][0x09]` repeat unit (`x`: the live slot)
+    * `Y`: a stuttered `90 03` echo after a short unit ending in it
+      (`a`, `b`)
     * `raw`: one byte no form accounts for (`byte`)
 
     Every record also carries `at`, its offset in the original stream, so
@@ -624,6 +651,8 @@ def decode(mcode, start=None, end=None, **rule):
             )
         elif kind == "R":
             out.append({"at": o, "kind": "R", "x": t[2]})
+        elif kind == "Y":
+            out.append({"at": o, "kind": "Y", "a": t[2], "b": t[3]})
         else:
             out.append({"at": o, "kind": "raw", "byte": t[2]})
     return out
@@ -665,6 +694,8 @@ def encode(records):
             out += bytes([r["h"], r["a"], r["b"], 0xC1, r["d"]])
         elif kind == "R":
             out += bytes([0x30, 0x03, r["x"], 0x03, 0x09])
+        elif kind == "Y":
+            out += bytes([r["a"], r["b"]])
         else:
             out += bytes([r["byte"]])
     return bytes(out)
