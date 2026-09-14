@@ -11,8 +11,10 @@ There is no maintained "convert this ONNX model" entry point to lean on here eit
 (``onnx-tensorflow``/``onnx-tf`` has been unmaintained for years and only tracks very
 old opsets) -- same situation as Core ML after coremltools dropped its ONNX frontend,
 see ``coreml_export.py``. This translator plays that role, one ONNX op at a time. It
-covers a practical subset of ops (common to CNN/MLP graphs: conv, pooling,
-normalization, matmul/gemm, elementwise math, reshapes, reductions, ...); a node whose
+covers a practical subset of ops (CNN/MLP graphs plus transformer/BEV staples:
+conv, pooling, normalization incl. LayerNormalization, matmul/gemm, elementwise
+math incl. comparisons, reshapes, reductions, TopK, Resize, ConvTranspose,
+ScatterND and GridSample); a node whose
 op isn't in ``SUPPORTED_ONNX_OPS`` raises a ``RuntimeError`` naming the op, rather than
 silently producing a wrong model.
 
@@ -46,7 +48,8 @@ dependency, and a default channel-last I/O layout unlike this module's NCHW-pres
 translator).
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+import itertools
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import onnx
@@ -530,6 +533,8 @@ for _onnx_op, _tf_name in [
     ("Exp", "exp"),
     ("Log", "math.log"),
     ("Erf", "math.erf"),
+    ("Softplus", "math.softplus"),
+    ("Atan", "math.atan"),
     ("Identity", "identity"),
 ]:
     _OP_HANDLERS[_onnx_op] = _simple_unary(_tf_name)
@@ -562,12 +567,118 @@ for _onnx_op, _tf_name, _np_fn in [
     ("Add", "add", np.add),
     ("Sub", "subtract", np.subtract),
     ("Mul", "multiply", np.multiply),
-    ("Div", "divide", np.divide),
     ("Pow", "pow", np.power),
     ("Max", "maximum", np.maximum),
     ("Min", "minimum", np.minimum),
+    ("GreaterOrEqual", "greater_equal", np.greater_equal),
+    ("LessOrEqual", "less_equal", np.less_equal),
+    ("And", "logical_and", np.logical_and),
 ]:
     _OP_HANDLERS[_onnx_op] = _binary(_tf_name, _np_fn)
+
+
+@_register("Div")
+def _op_div(lowerer, node, ins, attrs):
+    # ONNX Div on integers is *truncated* division (C semantics), not the
+    # float true-division tf.divide computes (which would also promote the
+    # result to float64 and break downstream integer consumers such as
+    # Gather indices). floordiv agrees with trunc-div except when the
+    # operands disagree in sign with a nonzero remainder, where trunc-div
+    # is one closer to zero -- all integer ops TFLite lowers natively.
+    # Mixed-rank inputs run in an NCHW island like _binary; same ranks unify.
+    tf = lowerer.tf
+    if lowerer.nhwc and _needs_nchw_island(ins):
+        ins = [lowerer.as_nchw(i) if i is not None else None for i in ins]
+        island = True
+    else:
+        ins = [lowerer.as_nhwc(i) if i is not None else None for i in ins]
+        island = False
+    a, b = ins[0].t, ins[1].t
+    if a.dtype.is_integer:
+        f = tf.math.floordiv(a, b)
+        r = a - f * b
+        need = tf.logical_and(
+            tf.not_equal(r, tf.zeros_like(r)),
+            tf.not_equal(a < 0, b < 0),
+        )
+        t = tf.where(need, f + 1, f)
+    else:
+        t = tf.divide(a, b)
+    const = None
+    if ins[0].const is not None and ins[1].const is not None:
+        ac, bc = np.asarray(ins[0].const), np.asarray(ins[1].const)
+        if np.issubdtype(ac.dtype, np.integer):
+            with np.errstate(divide="ignore", invalid="ignore"):
+                const = (
+                    np.floor_divide(np.abs(ac), np.abs(bc)) * np.sign(ac) * np.sign(bc)
+                ).astype(ac.dtype)
+        else:
+            const = np.divide(ac, bc)
+    out = [Val(t, const)]
+    return _island_exit(lowerer, out) if island else out
+
+
+@_register("Mod")
+def _op_mod(lowerer, node, ins, attrs):
+    # ONNX Mod's two modes have different sign rules: fmod=0 is floor-based
+    # (numpy.mod semantics, sign of the divisor) and fmod=1 is trunc-based
+    # (C fmod semantics, sign of the dividend). fmod=0 is tf.math.floormod
+    # verbatim (a native TFLite kernel, exact for ints and floats alike).
+    # fmod=1 rewrites to it: floormod and fmod agree unless the (nonzero)
+    # remainder's sign disagrees with the dividend's, in which case one
+    # divisor is subtracted -- all comparisons/arithmetic TFLite lowers
+    # natively, with no float casts that would lose int precision. Mixed-rank
+    # inputs run in an NCHW island like _binary (a [C] vector means different
+    # math in each layout); same ranks unify.
+    tf = lowerer.tf
+    if lowerer.nhwc and _needs_nchw_island(ins):
+        ins = [lowerer.as_nchw(i) if i is not None else None for i in ins]
+        island = True
+    else:
+        ins = [lowerer.as_nhwc(i) if i is not None else None for i in ins]
+        island = False
+    a, b = ins[0].t, ins[1].t
+    fmod = int(attrs.get("fmod", 0))
+    f = tf.math.floormod(a, b)
+    if fmod:
+        need = tf.logical_and(
+            tf.not_equal(f, tf.zeros_like(f)),
+            tf.not_equal(f < 0, a < 0),
+        )
+        t = tf.where(need, f - b, f)
+    else:
+        t = f
+    const = None
+    if ins[0].const is not None and ins[1].const is not None:
+        ac, bc = np.asarray(ins[0].const), np.asarray(ins[1].const)
+        const = np.fmod(ac, bc) if fmod else np.mod(ac, bc)
+    out = [Val(t, const)]
+    return _island_exit(lowerer, out) if island else out
+
+
+@_register("Expand")
+def _op_expand(lowerer, node, ins, attrs):
+    # tf.broadcast_to natively handles ONNX's prepend-ones rank promotion,
+    # and accepts a dynamic shape tensor, so no const shape is required. The
+    # target shape carries ONNX-logical dimension order, so in NHWC mode this
+    # runs in an NCHW island (like Reshape).
+    tf = lowerer.tf
+    if lowerer.nhwc:
+        x = lowerer.as_nchw(ins[0])
+        island = True
+    else:
+        x = ins[0]
+        island = False
+    shape = ins[1]
+    target = tf.cast(shape.t, tf.int32)
+    t = tf.broadcast_to(x.t, target)
+    const = None
+    if x.const is not None and shape.const is not None:
+        const = np.broadcast_to(
+            np.asarray(x.const), [int(v) for v in np.asarray(shape.const)]
+        )
+    out = [Val(t, const)]
+    return _island_exit(lowerer, out) if island else out
 
 
 @_register("LeakyRelu")
@@ -749,76 +860,227 @@ def _op_gemm(lowerer, node, ins, attrs):
 
 @_register("Conv")
 def _op_conv(lowerer, node, ins, attrs):
+    # N-D convolution (1-D/2-D/3-D): ONNX is N,C,spatial, TF channel-last, so
+    # transpose to channel-last around tf.nn.conv{1,2,3}d. Explicit pads
+    # always run as a tf.pad + "VALID" (avoiding any ONNX-vs-TF "SAME"
+    # ambiguity, exactly like pooling below).
     tf = lowerer.tf
     # NB: only the activation is unified -- the weight stays OIHW.
     x = lowerer.as_nhwc(ins[0])
     w = ins[1]
     b = ins[2] if len(ins) > 2 else None
     w_shape = w.t.shape.as_list()
-    kernel_shape = [int(k) for k in attrs.get("kernel_shape", w_shape[2:4])]
-    if len(kernel_shape) != 2:
-        raise RuntimeError("only 2-D Conv is supported by onnxsim's TFLite exporter")
-    strides = [int(s) for s in attrs.get("strides", [1, 1])]
-    dilations = [int(d) for d in attrs.get("dilations", [1, 1])]
+    x_shape = x.t.shape.as_list()
+    rank = len(x_shape)
+    n = rank - 2
+    if n not in (1, 2, 3):
+        raise RuntimeError(
+            f"only 1-D/2-D/3-D Conv is supported by onnxsim's TFLite exporter "
+            f"(got {n}-D)"
+        )
+    kernel_shape = [int(k) for k in attrs.get("kernel_shape", w_shape[2:])]
+    if len(kernel_shape) != n:
+        raise RuntimeError(
+            f"Conv kernel_shape {kernel_shape} disagrees with the {n}-D input."
+        )
+    strides = [int(s) for s in attrs.get("strides", [1] * n)]
+    dilations = [int(d) for d in attrs.get("dilations", [1] * n)]
     group = int(attrs.get("group", 1))
     out_c, in_c_per_group = w_shape[0], w_shape[1]
-    x_shape = x.t.shape.as_list()
-    # In NHWC mode the unified input is already channel-last, so the entry and
-    # exit transposes below are skipped and the channel/spatial dims are read
-    # from their NHWC positions (this is what keeps large models compilable on
-    # the Edge TPU -- see io_layout="nhwc").
-    native_nhwc = lowerer.nhwc and len(x_shape) == 4 and x.layout == "NHWC"
-    in_c = x_shape[3] if native_nhwc else x_shape[1]
-    spatial = x_shape[1:3] if native_nhwc else x_shape[2:4]
-
-    pads = _compute_spatial_pad(attrs, spatial, kernel_shape, strides, dilations)
-    filt = tf.transpose(w.t, [2, 3, 1, 0])  # OIHW -> HWIO
-    x_nhwc = x.t if native_nhwc else tf.transpose(x.t, [0, 2, 3, 1])
+    if n == 2:
+        # 2-D path, NHWC-native in io_layout="nhwc" mode (this is what keeps
+        # large models compilable on the Edge TPU -- see io_layout="nhwc").
+        native_nhwc = lowerer.nhwc and len(x_shape) == 4 and x.layout == "NHWC"
+        in_c = x_shape[3] if native_nhwc else x_shape[1]
+        spatial = x_shape[1:3] if native_nhwc else x_shape[2:4]
+        pads = _compute_spatial_pad(attrs, spatial, kernel_shape, strides, dilations)
+        filt = tf.transpose(w.t, [2, 3, 1, 0])  # OIHW -> HWIO
+        x_nhwc = x.t if native_nhwc else tf.transpose(x.t, [0, 2, 3, 1])
+        if any(p != (0, 0) for p in pads):
+            x_nhwc = tf.pad(x_nhwc, [[0, 0], list(pads[0]), list(pads[1]), [0, 0]])
+        conv_strides = [1, strides[0], strides[1], 1]
+        conv_dilations = [1, dilations[0], dilations[1], 1]
+        if group == 1:
+            y = tf.nn.conv2d(
+                x_nhwc,
+                filt,
+                strides=conv_strides,
+                padding="VALID",
+                dilations=conv_dilations,
+            )
+        elif in_c_per_group == 1 and group == in_c:
+            multiplier = out_c // group
+            dw_filt = tf.reshape(
+                filt, [kernel_shape[0], kernel_shape[1], in_c, multiplier]
+            )
+            y = tf.nn.depthwise_conv2d(
+                x_nhwc,
+                dw_filt,
+                strides=conv_strides,
+                padding="VALID",
+                dilations=[dilations[0], dilations[1]],
+            )
+        else:
+            x_groups = tf.split(x_nhwc, group, axis=3)
+            w_groups = tf.split(filt, group, axis=3)
+            y = tf.concat(
+                [
+                    tf.nn.conv2d(
+                        xg,
+                        wg,
+                        strides=conv_strides,
+                        padding="VALID",
+                        dilations=conv_dilations,
+                    )
+                    for xg, wg in zip(x_groups, w_groups)
+                ],
+                axis=3,
+            )
+        if b is not None:
+            y = tf.nn.bias_add(y, b.t)
+        if native_nhwc:
+            return [Val(y)]
+        y = tf.transpose(y, [0, 3, 1, 2])
+        return [Val(y)]
+    # 1-D/3-D path: N-D generalization (NCHW physical -- ranks other than 4
+    # are carried identically in both modes, so the as_nhwc above is a no-op).
+    in_c = x_shape[1]
+    pads = _compute_spatial_pad(attrs, x_shape[2:], kernel_shape, strides, dilations)
+    to_cl = [0] + list(range(2, rank)) + [1]  # N,C,S.. -> N,S..,C
+    from_cl = [0, rank - 1] + list(range(1, rank - 1))
+    filt = tf.transpose(w.t, list(range(2, rank)) + [1, 0])  # O,I,S.. -> S..,I,O
+    x_cl = tf.transpose(x.t, to_cl)
     if any(p != (0, 0) for p in pads):
-        x_nhwc = tf.pad(x_nhwc, [[0, 0], list(pads[0]), list(pads[1]), [0, 0]])
+        x_cl = tf.pad(x_cl, [[0, 0]] + [list(p) for p in pads] + [[0, 0]])
 
-    conv_strides = [1, strides[0], strides[1], 1]
-    conv_dilations = [1, dilations[0], dilations[1], 1]
-    if group == 1:
-        y = tf.nn.conv2d(
-            x_nhwc,
-            filt,
+    conv_strides = [1] + strides + [1]
+    conv_dilations = [1] + dilations + [1]
+
+    def _conv(xg, wg):
+        if n == 1:
+            return tf.nn.conv1d(
+                xg, wg, stride=strides[0], padding="VALID", dilations=dilations[0]
+            )
+        fn = tf.nn.conv2d if n == 2 else tf.nn.conv3d
+        return fn(
+            xg,
+            wg,
             strides=conv_strides,
             padding="VALID",
             dilations=conv_dilations,
         )
-    elif in_c_per_group == 1 and group == in_c:
+
+    if group == 1:
+        y = _conv(x_cl, filt)
+    elif n == 2 and in_c_per_group == 1 and group == in_c:
         multiplier = out_c // group
         dw_filt = tf.reshape(filt, [kernel_shape[0], kernel_shape[1], in_c, multiplier])
         y = tf.nn.depthwise_conv2d(
-            x_nhwc,
+            x_cl,
             dw_filt,
             strides=conv_strides,
             padding="VALID",
             dilations=[dilations[0], dilations[1]],
         )
     else:
-        x_groups = tf.split(x_nhwc, group, axis=3)
-        w_groups = tf.split(filt, group, axis=3)
-        y = tf.concat(
-            [
-                tf.nn.conv2d(
-                    xg,
-                    wg,
-                    strides=conv_strides,
-                    padding="VALID",
-                    dilations=conv_dilations,
-                )
-                for xg, wg in zip(x_groups, w_groups)
-            ],
-            axis=3,
-        )
+        x_groups = tf.split(x_cl, group, axis=-1)
+        w_groups = tf.split(filt, group, axis=-1)
+        y = tf.concat([_conv(xg, wg) for xg, wg in zip(x_groups, w_groups)], axis=-1)
     if b is not None:
         y = tf.nn.bias_add(y, b.t)
-    if native_nhwc:
-        return [Val(y)]
-    y = tf.transpose(y, [0, 3, 1, 2])
+    y = tf.transpose(y, from_cl)
     return [Val(y)]
+
+
+@_register("ConvTranspose")
+def _op_conv_transpose(lowerer, node, ins, attrs):
+    # ONNX's weight layout is (C_in, C_out/group, Kh, Kw); TF's transposed
+    # filter is (Kh, Kw, C_out/group, C_in). pads/output_padding can't be
+    # spelled as a TF padding mode, so run VALID (whose output is the
+    # unpadded size) and then slice off the leading pads / pad the trailing
+    # output_padding explicitly -- exact for every pad combination.
+    # Couples values to physical order, so in NHWC mode this runs in an NCHW
+    # island (like Reshape); the weight is OIHW and never unified.
+    tf = lowerer.tf
+    x = lowerer.as_nchw(ins[0]) if lowerer.nhwc else ins[0]
+    w = ins[1]
+    island = lowerer.nhwc
+    b = ins[2] if len(ins) > 2 else None
+    if str(attrs.get("auto_pad", "NOTSET")) != "NOTSET":
+        raise RuntimeError(
+            "ConvTranspose with auto_pad is not supported by onnxsim's TFLite "
+            "exporter (only explicit pads)."
+        )
+    w_shape = w.t.shape.as_list()
+    x_shape = x.t.shape.as_list()
+    c_in, c_out_per_group, kh, kw = w_shape
+    kernel_shape = [int(k) for k in attrs.get("kernel_shape", [kh, kw])]
+    if len(kernel_shape) != 2:
+        raise RuntimeError(
+            "only 2-D ConvTranspose is supported by onnxsim's TFLite exporter"
+        )
+    strides = [int(s) for s in attrs.get("strides", [1, 1])]
+    dilations = [int(d) for d in attrs.get("dilations", [1, 1])]
+    group = int(attrs.get("group", 1))
+    pads = [int(p) for p in attrs.get("pads", [0, 0, 0, 0])]
+    pad_b = pads[:2]
+    pad_e = pads[2:]
+    out_pad = [int(p) for p in attrs.get("output_padding", [0, 0])]
+    eff_k = [(kernel_shape[i] - 1) * dilations[i] + 1 for i in range(2)]
+    in_hw = x_shape[2:4]
+    valid_hw = [strides[i] * (in_hw[i] - 1) + eff_k[i] for i in range(2)]
+    want_hw = [valid_hw[i] - pad_b[i] - pad_e[i] + out_pad[i] for i in range(2)]
+    if any(v <= 0 for v in want_hw):
+        raise RuntimeError(
+            f"ConvTranspose output shape {want_hw} is not positive "
+            f"(input {in_hw}, strides {strides}, pads {pads})."
+        )
+    filt = tf.transpose(w.t, [2, 3, 1, 0])  # (C_in,C_out/G,Kh,Kw) -> HWIO
+    x_nhwc = tf.transpose(x.t, [0, 2, 3, 1])
+    c_out = c_out_per_group * group
+
+    def _deconv(xg, fg):
+        out_shape = tf.constant(
+            [x_shape[0], valid_hw[0], valid_hw[1], fg.shape.as_list()[2]],
+            dtype=tf.int32,
+        )
+        return tf.nn.conv2d_transpose(
+            xg,
+            fg,
+            output_shape=out_shape,
+            strides=[1, strides[0], strides[1], 1],
+            padding="VALID",
+            dilations=[1, dilations[0], dilations[1], 1],
+        )
+
+    if group == 1:
+        y = _deconv(x_nhwc, filt)
+    else:
+        x_groups = tf.split(x_nhwc, group, axis=3)
+        # HWIO's last axis is C_in: split into per-group filters.
+        w_groups = tf.split(filt, group, axis=3)
+        y = tf.concat(
+            [_deconv(xg, wg) for xg, wg in zip(x_groups, w_groups)],
+            axis=3,
+        )
+    # Slice off the leading pads, then append the trailing output_padding.
+    y = y[
+        :,
+        pad_b[0] : valid_hw[0] - pad_e[0] if pad_e[0] else valid_hw[0],
+        pad_b[1] : valid_hw[1] - pad_e[1] if pad_e[1] else valid_hw[1],
+        :,
+    ]
+    if any(out_pad):
+        y = tf.pad(y, [[0, 0], [0, out_pad[0]], [0, out_pad[1]], [0, 0]])
+    if b is not None:
+        y = tf.nn.bias_add(y, b.t)
+    y = tf.transpose(y, [0, 3, 1, 2])
+    if y.shape.as_list()[1] != c_out:
+        raise RuntimeError(
+            f"ConvTranspose channel mismatch: got {y.shape.as_list()[1]}, "
+            f"expected {c_out}."
+        )
+    return _island_exit(lowerer, [Val(y)]) if island else [Val(y)]
 
 
 def _pool_2d(reduce_kind: str):
@@ -901,6 +1163,215 @@ _OP_HANDLERS["MaxPool"] = _pool_2d("max")
 _OP_HANDLERS["AveragePool"] = _pool_2d("avg")
 
 
+def _resize_3d_linear(lowerer, x, x_shape, sizes, per_axis_scale, mode, ctm, attrs):
+    # Trilinear resizing as 8 explicit gather taps. ONNX linear resizing is
+    # separable with edge-clamped taps (out-of-range taps read the edge pixel
+    # with unchanged weights when exclude_outside=0 -- see onnx's own
+    # op_resize.py), so static per-axis source coordinates (every shape here
+    # is static) plus gather_nd spell it exactly with only TFLite-native ops.
+    # Source-coordinate formulas are onnx's _compute_x_ori verbatim,
+    # including pytorch_half_pixel's size-1 special case.
+    tf = lowerer.tf
+    if mode != "linear":
+        raise RuntimeError(
+            f"3-D Resize mode={mode!r} is not supported by onnxsim's TFLite "
+            "exporter (only linear/trilinear)"
+        )
+    if bool(attrs.get("antialias", 0)):
+        raise RuntimeError(
+            "3-D Resize with antialias=1 is not supported by onnxsim's TFLite exporter"
+        )
+    n = x_shape[0]
+    in_spatial = x_shape[2:]
+    out_spatial = sizes[2:]
+    if any(o <= 0 for o in out_spatial):
+        raise RuntimeError(f"3-D Resize to non-positive shape {out_spatial}.")
+    x_cl = tf.transpose(x.t, [0, 2, 3, 4, 1])
+    lo_list, frac_list = [], []
+    for i in range(3):
+        dim_in, dim_out = in_spatial[i], out_spatial[i]
+        sc = per_axis_scale[i] if per_axis_scale is not None else dim_out / dim_in
+        o = np.arange(dim_out, dtype=np.float64)
+        if ctm == "align_corners":
+            xo = np.zeros(dim_out) if dim_out == 1 else o * (dim_in - 1) / (dim_out - 1)
+        elif ctm == "asymmetric":
+            xo = o / sc
+        elif ctm == "pytorch_half_pixel" and dim_out == 1:
+            xo = np.full(dim_out, -0.5)
+        else:  # half_pixel (and pytorch_half_pixel otherwise)
+            xo = (o + 0.5) / sc - 0.5
+        lo = np.floor(xo)
+        lo_list.append(lo.astype(np.int32))
+        frac_list.append((xo - lo).astype(np.float32))
+
+    full = tuple(out_spatial)
+    b_idx = np.broadcast_to(
+        np.arange(n, dtype=np.int32).reshape((n, 1, 1, 1)), (n,) + full
+    )
+
+    def _axis_grid(v, j):
+        # Per-axis (out_j,) values -> (N, Do, Ho, Wo).
+        shape = [1, 1, 1]
+        shape[j] = out_spatial[j]
+        return np.broadcast_to(v.reshape(shape), (n,) + full)
+
+    y = 0
+    for combo in itertools.product([0, 1], repeat=3):
+        corners = [
+            np.clip(lo_list[j] + combo[j], 0, in_spatial[j] - 1) for j in range(3)
+        ]
+        idx = np.stack(
+            [b_idx] + [_axis_grid(c, j) for j, c in enumerate(corners)], axis=-1
+        )
+        w = np.ones((n,) + full, dtype=np.float32)
+        for j in range(3):
+            f = _axis_grid(frac_list[j], j)
+            w = w * (f if combo[j] else 1 - f)
+        vals = tf.gather_nd(x_cl, tf.constant(idx))
+        y = y + vals * tf.constant(w[..., None], dtype=x_cl.dtype)
+    return Val(tf.transpose(y, [0, 4, 1, 2, 3]))
+
+
+@_register("Resize")
+def _op_resize(lowerer, node, ins, attrs):
+    # N-D resizing of an N,C,spatial tensor (2-D via TF's own resize raw ops
+    # around an NCHW<->NHWC transpose; 3-D linear via explicit gather taps --
+    # see _resize_3d_linear). `sizes` must be a compile-time constant -- the
+    # output shape is static by translator contract; `scales` is accepted only
+    # as a const fallback computing floor(scale * input).
+    tf = lowerer.tf
+    # Couples values to physical order: in NHWC mode the 2-D path runs in an
+    # NCHW island (like Reshape). 3-D tensors are carried identically in both
+    # modes, so the island only ever engages for rank 4.
+    island = lowerer.nhwc and len(ins[0].t.shape.as_list()) == 4
+    x = lowerer.as_nchw(ins[0]) if island else ins[0]
+    x_shape = x.t.shape.as_list()
+    rank = len(x_shape)
+    n = rank - 2
+    if n not in (2, 3):
+        raise RuntimeError(
+            "only 2-D/3-D Resize is supported by onnxsim's TFLite exporter"
+        )
+    if str(attrs.get("keep_aspect_ratio_policy", "stretch")) != "stretch":
+        raise RuntimeError(
+            "Resize with keep_aspect_ratio_policy != 'stretch' is not supported "
+            "by onnxsim's TFLite exporter"
+        )
+    axes = [int(a) % rank for a in attrs.get("axes", list(range(rank)))]
+    if sorted(axes) != list(range(rank)):
+        raise RuntimeError(
+            "Resize over a subset of axes is not supported by onnxsim's TFLite "
+            "exporter (only full-tensor resize)"
+        )
+    mode = str(attrs.get("mode", "nearest")).lower()
+    if mode not in ("nearest", "linear", "cubic"):
+        raise RuntimeError(
+            f"Resize mode {mode!r} is not supported by onnxsim's TFLite exporter "
+            "(supported: nearest, linear, cubic)"
+        )
+    ctm = str(attrs.get("coordinate_transformation_mode", "half_pixel"))
+    if ctm not in ("asymmetric", "half_pixel", "pytorch_half_pixel", "align_corners"):
+        raise RuntimeError(
+            f"Resize coordinate_transformation_mode={ctm!r} is not supported by "
+            "onnxsim's TFLite exporter"
+        )
+    if float(attrs.get("cubic_coeff_a", -0.75)) != -0.75:
+        raise RuntimeError(
+            "Resize with cubic_coeff_a != -0.75 is not supported by onnxsim's "
+            "TFLite exporter (that is TF's own bicubic coefficient)"
+        )
+    if int(attrs.get("exclude_outside", 0)):
+        raise RuntimeError(
+            "Resize with exclude_outside=1 is not supported by onnxsim's TFLite "
+            "exporter"
+        )
+    sizes_in = ins[3] if len(ins) > 3 and ins[3] is not None else None
+    scales_in = ins[2] if len(ins) > 2 and ins[2] is not None else None
+    per_axis_scale: Optional[List[float]] = None
+    if sizes_in is not None:
+        sizes = [int(v) for v in _require_const(sizes_in, "Resize's 'sizes' input")]
+    elif scales_in is not None:
+        scales = [float(v) for v in _require_const(scales_in, "Resize's 'scales'")]
+        if len(scales) != rank:
+            raise RuntimeError(
+                f"Resize 'scales' has rank {len(scales)}, expected {rank}."
+            )
+        if scales[0] != 1.0 or scales[1] != 1.0:
+            raise RuntimeError(
+                "Resize that rescales N/C is not supported by onnxsim's TFLite "
+                "exporter (only spatial resize)"
+            )
+        sizes = [x_shape[0], x_shape[1]] + [
+            int(x_shape[i] * scales[i]) for i in range(2, rank)
+        ]
+        per_axis_scale = list(scales[2:])
+    else:
+        raise RuntimeError(
+            "Resize needs its 'sizes' (or const 'scales') input to determine "
+            "the static output shape"
+        )
+    if sizes[0] != x_shape[0] or sizes[1] != x_shape[1]:
+        raise RuntimeError(
+            "Resize that changes N/C is not supported by onnxsim's TFLite "
+            "exporter (only spatial resize)"
+        )
+    if n == 3:
+        return [
+            _resize_3d_linear(
+                lowerer, x, x_shape, sizes, per_axis_scale, mode, ctm, attrs
+            )
+        ]
+    if ctm == "pytorch_half_pixel":
+        # TF's raw resize ops only spell asymmetric/half_pixel/align_corners;
+        # pytorch_half_pixel differs from half_pixel when an output axis has
+        # size 1 (it pins the source coordinate to -0.5).
+        raise RuntimeError(
+            "Resize coordinate_transformation_mode='pytorch_half_pixel' is not "
+            "supported by onnxsim's TFLite exporter for 2-D Resize"
+        )
+    align_corners, half_pixel = ctm == "align_corners", ctm == "half_pixel"
+    method = {"nearest": "nearest", "linear": "bilinear", "cubic": "bicubic"}[mode]
+    antialias = bool(attrs.get("antialias", 0))
+    x_nhwc = tf.transpose(x.t, [0, 2, 3, 1])
+    out_hw = [sizes[2], sizes[3]]
+    # tf.image.resize hardcodes half-pixel centers, so the sampling grid is
+    # controlled through the raw ops instead (they are what tf.image.resize
+    # itself lowers to, hence equally TFLite-native).
+    if mode == "nearest":
+        if antialias:
+            raise RuntimeError(
+                "Resize nearest with antialias=1 is not supported by onnxsim's "
+                "TFLite exporter"
+            )
+        y = tf.raw_ops.ResizeNearestNeighbor(
+            images=x_nhwc,
+            size=out_hw,
+            align_corners=align_corners,
+            half_pixel_centers=half_pixel,
+        )
+    elif mode == "linear" and not antialias:
+        y = tf.raw_ops.ResizeBilinear(
+            images=x_nhwc,
+            size=out_hw,
+            align_corners=align_corners,
+            half_pixel_centers=half_pixel,
+        )
+    elif mode == "cubic" and align_corners and not antialias:
+        y = tf.raw_ops.ResizeBicubic(images=x_nhwc, size=out_hw, align_corners=True)
+    elif half_pixel and mode in ("linear", "cubic"):
+        # Whatever remains with half-pixel sampling (antialiased linear/cubic,
+        # plain cubic) is exactly tf.image.resize's own convention.
+        y = tf.image.resize(x_nhwc, size=out_hw, method=method, antialias=antialias)
+    else:
+        raise RuntimeError(
+            f"Resize mode={mode!r} with coordinate_transformation_mode={ctm!r}"
+            f"{' and antialias' if antialias else ''} is not supported by "
+            "onnxsim's TFLite exporter"
+        )
+    out = [Val(tf.transpose(y, [0, 3, 1, 2]))]
+    return _island_exit(lowerer, out) if island else out
+
+
 @_register("GlobalAveragePool")
 def _op_global_avg_pool(lowerer, node, ins, attrs):
     tf = lowerer.tf
@@ -951,6 +1422,119 @@ for _onnx_op, _tf_name in [
     _OP_HANDLERS[_onnx_op] = _reduce(_tf_name)
 
 
+@_register("TopK")
+def _op_topk(lowerer, node, ins, attrs):
+    # tf.nn.top_k only reduces the last axis, so transpose any other axis
+    # there first (indices still address the original axis after transposing
+    # back). Indices come out int32, matching this translator's global
+    # 64-bit-to-32-bit downcast convention (see _NP_DOWNCAST). The axis is an
+    # NCHW-semantic reference, remapped in NHWC mode; values and indices are
+    # rank-preserving, so the unified layout inherits.
+    tf = lowerer.tf
+    x = lowerer.as_nhwc(ins[0])
+    x_shape = x.t.shape.as_list()
+    rank = len(x_shape)
+    axis = _remap_axis(int(attrs.get("axis", -1)), rank, lowerer.nhwc) % rank
+    k = int(_require_const(ins[1], "TopK's 'k' input").reshape(-1)[0])
+    if not (1 <= k <= x_shape[axis]):
+        raise RuntimeError(f"TopK with k={k} on axis of size {x_shape[axis]}.")
+    largest = bool(attrs.get("largest", 1))
+    sorted_out = bool(attrs.get("sorted", 1))
+    t = x.t
+    if t.dtype != tf.float32 and t.dtype != tf.float16:
+        raise RuntimeError(
+            f"TopK on dtype {t.dtype.name} is not supported by onnxsim's TFLite "
+            "exporter (only float inputs; cast integer scores to float first)"
+        )
+    if not largest:
+        t = -t
+    if axis != rank - 1:
+        perm = [i for i in range(rank) if i != axis] + [axis]
+        t = tf.transpose(t, perm)
+    values, indices = tf.nn.top_k(t, k=k, sorted=sorted_out)
+    if not largest:
+        values = -values
+    if axis != rank - 1:
+        back = [0] * rank
+        for i, p in enumerate(perm):
+            back[p] = i
+        values = tf.transpose(values, back)
+        indices = tf.transpose(indices, back)
+    const = None
+    if x.const is not None and sorted_out:
+        # sorted=0 leaves the order undefined (TF's runtime order is backend
+        # specific), so claim no compile-time value in that case rather than
+        # a sorted one a downstream const-consumer would disagree with.
+        xc = np.asarray(x.const)
+        order = np.argsort(xc, axis=axis, kind="stable")
+        if largest:
+            order = np.flip(order, axis=axis)
+        take = np.take(order, np.arange(k), axis=axis)
+        values_c = np.take_along_axis(xc, take, axis=axis)
+        const = (values_c, take.astype(np.int32))
+    outs = [
+        Val(values, const[0] if const else None),
+        Val(indices, const[1] if const else None),
+    ]
+    return outs[: len(node.output)] or outs
+
+
+@_register("LayerNormalization")
+def _op_layer_norm(lowerer, node, ins, attrs):
+    # Normalized axes are always the trailing ones, so scale/bias broadcast
+    # plainly. Extra outputs (mean, inv-std-dev) are computed on request;
+    # stash_type only affects those outputs' dtype. The normalized axes are
+    # NCHW-semantic, so in NHWC mode this runs in an NCHW island (like
+    # Reshape); 1-D scale/bias pass through untouched.
+    tf = lowerer.tf
+    island = lowerer.nhwc
+    if island:
+        x = lowerer.as_nchw(ins[0])
+    else:
+        x = ins[0]
+    x_shape = x.t.shape.as_list()
+    rank = len(x_shape)
+    axis = int(attrs.get("axis", -1)) % rank
+    axes = list(range(axis, rank))
+    eps = float(attrs.get("epsilon", 1e-5))
+    scale = ins[1] if len(ins) > 1 and ins[1] is not None else None
+    bias = ins[2] if len(ins) > 2 and ins[2] is not None else None
+    mean = tf.reduce_mean(x.t, axis=axes, keepdims=True)
+    var = tf.reduce_mean(tf.square(x.t - mean), axis=axes, keepdims=True)
+    inv_std = tf.math.rsqrt(var + eps)
+    y = (x.t - mean) * inv_std
+    if scale is not None:
+        y = y * scale.t
+    if bias is not None:
+        y = y + bias.t
+    outs = [Val(y)]
+    if len(node.output) > 1:
+        # stash_type is an ONNX TensorProto dtype enum (default 1 == FLOAT).
+        stash = {10: tf.float16, 16: tf.bfloat16}.get(int(attrs.get("stash_type", 1)))
+        mean_o = tf.cast(mean, stash) if stash is not None else mean
+        inv_o = tf.cast(inv_std, stash) if stash is not None else inv_std
+        outs += [Val(mean_o), Val(inv_o)]
+    const = None
+    if (
+        x.const is not None
+        and (scale is None or scale.const is not None)
+        and (bias is None or bias.const is not None)
+    ):
+        xc = np.asarray(x.const, dtype=np.float32)
+        m = xc.mean(axis=tuple(axes), keepdims=True)
+        v = ((xc - m) ** 2).mean(axis=tuple(axes), keepdims=True)
+        yc = (xc - m) / np.sqrt(v + eps)
+        if scale is not None:
+            yc = yc * np.asarray(scale.const)
+        if bias is not None:
+            yc = yc + np.asarray(bias.const)
+        const = yc.astype(np.asarray(x.const).dtype)
+    if const is not None:
+        outs[0] = Val(y, const)
+    outs = outs[: len(node.output)] or outs
+    return _island_exit(lowerer, outs) if island else outs
+
+
 @_register("BatchNormalization")
 def _op_batch_norm(lowerer, node, ins, attrs):
     tf = lowerer.tf
@@ -961,7 +1545,9 @@ def _op_batch_norm(lowerer, node, ins, attrs):
     if lowerer.nhwc and len(x.t.shape.as_list()) == 4:
         shape = [1, 1, 1, c]
     else:
-        shape = [1, c, 1, 1]
+        # N-D broadcast shape (other ranks are carried identically in both
+        # modes, covering 1-D/3-D normalization as well).
+        shape = [1, c] + [1] * (len(x.t.shape) - 2)
     s = tf.reshape(scale.t, shape)
     b = tf.reshape(bias.t, shape)
     m = tf.reshape(mean.t, shape)
@@ -1120,6 +1706,214 @@ def _op_gather(lowerer, node, ins, attrs):
     return [Val(t, const, lowerer.child_tag(x, len(t.shape.as_list())))]
 
 
+@_register("ScatterND")
+def _op_scatter_nd(lowerer, node, ins, attrs):
+    # reduction="none" (default) is a plain update, "add" an accumulation;
+    # anything else has no TF/TFLite primitive and fails loudly. Indices
+    # address ONNX-logical dimensions (like Gather's, they pair positionally),
+    # so in NHWC mode the data runs in an NCHW island while indices/updates
+    # pass through untouched.
+    tf = lowerer.tf
+    island = lowerer.nhwc
+    if island:
+        data = lowerer.as_nchw(ins[0])
+    else:
+        data = ins[0]
+    indices, updates = ins[1], ins[2]
+    reduction = str(attrs.get("reduction", "none"))
+    if reduction == "none":
+        t = tf.tensor_scatter_nd_update(data.t, indices.t, updates.t)
+    elif reduction == "add":
+        t = tf.tensor_scatter_nd_add(data.t, indices.t, updates.t)
+    else:
+        raise RuntimeError(
+            f"ScatterND reduction={reduction!r} is not supported by onnxsim's "
+            "TFLite exporter (supported: none, add)"
+        )
+    const = None
+    if all(i.const is not None for i in ins):
+        dc = np.asarray(data.const).copy()
+        ixc = np.asarray(indices.const)
+        uc = np.asarray(updates.const)
+        if reduction == "none":
+            dc[tuple(ixc.reshape(-1, ixc.shape[-1]).T)] = uc.reshape(
+                (-1,) + dc.shape[ixc.shape[-1] :]
+            )
+        else:
+            np.add.at(
+                dc,
+                tuple(ixc.reshape(-1, ixc.shape[-1]).T),
+                uc.reshape((-1,) + dc.shape[ixc.shape[-1] :]),
+            )
+        const = dc
+    out = [Val(t, const)]
+    return _island_exit(lowerer, out) if island else out
+
+
+def _numpy_grid_sample(
+    x, grid, mode="bilinear", padding_mode="zeros", align_corners=False
+):
+    """Reference grid sampling (also used for const-folding).
+
+    ``x`` is ``(N, C, *spatial)``, ``grid`` is ``(N, *out, d)`` holding
+    ``(x, y[, z])`` in ``[-1, 1]`` (note the reversed axis order vs the
+    tensor layout). Mirrors ONNX's own reference implementation
+    (``onnx/reference/ops/op_grid_sample.py``): float source coordinates,
+    per-corner validity from the *raw* coordinate for ``zeros`` padding,
+    clamped indices for the gather itself. ``mode="bilinear"`` covers both
+    the 2-D (4 taps) and 3-D trilinear (8 taps) cases.
+    """
+    x = np.asarray(x, dtype=np.float32)
+    grid = np.asarray(grid, dtype=np.float32)
+    xd = x.ndim - 2
+    dims = x.shape[2:]  # spatial sizes, tensor axis order
+    out_shape = grid.shape[1:-1]
+    # Grid's last axis is (x, y[, z]): spatial axis j reads grid coord xd-1-j.
+    scoord = []
+    for j in range(xd):
+        g = grid[..., xd - 1 - j]
+        dim = dims[j]
+        if align_corners:
+            scoord.append((g + 1) / 2 * (dim - 1))
+        else:
+            scoord.append(((g + 1) * dim - 1) / 2)
+    b = np.broadcast_to(
+        np.arange(x.shape[0]).reshape((x.shape[0],) + (1,) * len(out_shape)),
+        (x.shape[0],) + tuple(out_shape),
+    )
+
+    def _tap(corners):
+        # corners: one int array per spatial axis, each (N, *out).
+        if padding_mode == "zeros":
+            valid = np.ones((x.shape[0],) + tuple(out_shape), dtype=bool)
+            for ix, dim in zip(corners, dims):
+                valid &= (ix >= 0) & (ix < dim)
+        else:  # border
+            valid = np.ones((x.shape[0],) + tuple(out_shape), dtype=bool)
+        clamped = tuple(np.clip(ix, 0, dim - 1) for ix, dim in zip(corners, dims))
+        vals = x[(b, slice(None)) + clamped]  # (N, *out, C)
+        vals = np.moveaxis(vals, -1, 1)  # (N, C, *out)
+        return vals * valid[:, None].astype(np.float32)
+
+    if mode in ("bilinear", "linear"):
+        lo = [np.floor(s).astype(np.int64) for s in scoord]
+        frac = [s - base for s, base in zip(scoord, lo)]
+        out = 0
+        for combo in itertools.product([0, 1], repeat=xd):
+            corners = [base + c for base, c in zip(lo, combo)]
+            w = np.ones((x.shape[0],) + tuple(out_shape), dtype=np.float32)
+            for j in range(xd):
+                w = w * (frac[j] if combo[j] else 1 - frac[j])
+            out = out + _tap(corners) * w[(slice(None), None)]
+        return out
+    grid_coords = [np.rint(s).astype(np.int64) for s in scoord]  # ties-to-even
+    return _tap(grid_coords)
+
+
+@_register("GridSample")
+def _op_grid_sample(lowerer, node, ins, attrs):
+    # 2-D/3-D float sampling. Corner taps go through gather_nd on a
+    # channel-last view (batch index stacked in, exactly like the numpy twin
+    # above); every other op is elementwise arithmetic TFLite lowers
+    # natively. Implements the opset <= 19 ("bilinear") and 20+ ("linear")
+    # mode spellings identically.
+    # X is channel data, so in NHWC mode it runs in an NCHW island. grid is
+    # sparse coordinates, not activations: its (N, *out, d) order is physical
+    # in both modes and must NOT be unified (that would permute coordinates
+    # as channels). This assumes the grid pipeline carries ONNX-logical
+    # order in NHWC mode -- true for initializer/Constant grids and for
+    # rank != 4 flows, which are never transposed.
+    tf = lowerer.tf
+    island = lowerer.nhwc
+    x = lowerer.as_nchw(ins[0]) if island else ins[0]
+    grid = ins[1]
+    x_shape = x.t.shape.as_list()
+    grid_shape = grid.t.shape.as_list()
+    xd = len(x_shape) - 2
+    if xd not in (2, 3) or len(grid_shape) != xd + 2 or grid_shape[-1] != xd:
+        raise RuntimeError(
+            "only 2-D/3-D GridSample is supported by onnxsim's TFLite exporter "
+            f"(got X rank {len(x_shape)}, grid rank {len(grid_shape)})"
+        )
+    if x.t.dtype not in (tf.float32, tf.float16):
+        raise RuntimeError(
+            f"GridSample on dtype {x.t.dtype.name} is not supported by onnxsim's "
+            "TFLite exporter (only float inputs)"
+        )
+    mode = str(attrs.get("mode", "bilinear")).lower()
+    if mode not in ("bilinear", "linear", "nearest"):
+        raise RuntimeError(
+            f"GridSample mode={mode!r} is not supported by onnxsim's TFLite "
+            "exporter (supported: bilinear/linear, nearest)"
+        )
+    padding_mode = str(attrs.get("padding_mode", "zeros"))
+    if padding_mode not in ("zeros", "border"):
+        raise RuntimeError(
+            f"GridSample padding_mode={padding_mode!r} is not supported by "
+            "onnxsim's TFLite exporter (supported: zeros, border)"
+        )
+    align_corners = bool(attrs.get("align_corners", 0))
+    n = x_shape[0]
+    dims = x_shape[2:]
+    out_shape = grid_shape[1:-1]
+    to_cl = [0] + list(range(2, 2 + xd)) + [1]
+    from_cl = [0, xd + 1] + list(range(1, xd + 1))
+    x_cl = tf.transpose(x.t, to_cl)
+    # Grid's last axis is (x, y[, z]): spatial axis j reads coord xd-1-j.
+    scoord = []
+    for j in range(xd):
+        g = grid.t[..., xd - 1 - j]
+        dim = dims[j]
+        if align_corners:
+            scoord.append((g + 1) / 2 * (dim - 1))
+        else:
+            scoord.append(((g + 1) * dim - 1) / 2)
+    b_idx = tf.broadcast_to(
+        tf.reshape(tf.range(n), [n] + [1] * len(out_shape)), [n] + out_shape
+    )
+
+    def _tap(corners):
+        # corners: one int32 tensor per spatial axis, each (N, *out).
+        # Validity comes from the raw corner; the gather reads the clamped one.
+        if padding_mode == "zeros":
+            valid = tf.ones([n] + out_shape, dtype=x.t.dtype)
+            for ix, dim in zip(corners, dims):
+                valid = (
+                    valid * tf.cast(ix >= 0, x.t.dtype) * tf.cast(ix < dim, x.t.dtype)
+                )
+        else:
+            valid = tf.ones([n] + out_shape, dtype=x.t.dtype)
+        clamped = [tf.clip_by_value(ix, 0, dim - 1) for ix, dim in zip(corners, dims)]
+        idx = tf.stack([b_idx] + [tf.cast(c, tf.int32) for c in clamped], axis=-1)
+        vals = tf.transpose(tf.gather_nd(x_cl, idx), from_cl)
+        return vals * tf.expand_dims(valid, 1)
+
+    if mode in ("bilinear", "linear"):
+        lo = [tf.cast(tf.floor(s), tf.int32) for s in scoord]
+        frac = [s - tf.floor(s) for s in scoord]
+        y = 0
+        for combo in itertools.product([0, 1], repeat=xd):
+            corners = [base + c for base, c in zip(lo, combo)]
+            w = tf.ones([n] + out_shape, dtype=x.t.dtype)
+            for j in range(xd):
+                w = w * (frac[j] if combo[j] else 1 - frac[j])
+            y = y + _tap(corners) * tf.expand_dims(w, 1)
+    else:
+        corners = [tf.cast(tf.round(s), tf.int32) for s in scoord]
+        y = _tap(corners)
+    const = None
+    if x.const is not None and grid.const is not None:
+        const = _numpy_grid_sample(
+            np.asarray(x.const),
+            np.asarray(grid.const),
+            mode=mode,
+            padding_mode=padding_mode,
+            align_corners=align_corners,
+        ).astype(np.asarray(x.const).dtype)
+    out = [Val(y, const)]
+    return _island_exit(lowerer, out) if island else out
+
+
 @_register("Tile")
 def _op_tile(lowerer, node, ins, attrs):
     tf = lowerer.tf
@@ -1198,6 +1992,8 @@ def _op_slice(lowerer, node, ins, attrs):
     end = list(x_shape)
     strides = [1] * rank
     end_mask = 0
+    # Normalized per-axis parameters, kept alongside for the >5-D path below.
+    normed = {}
     for ax, s, e, st in zip(axes, starts, ends, steps):
         ax = ax % rank
         # slice().indices() implements exactly the clamping semantics ONNX's spec
@@ -1214,7 +2010,39 @@ def _op_slice(lowerer, node, ins, attrs):
             end_mask |= 1 << ax
         else:
             end[ax] = norm_e
-    return [Val(tf.strided_slice(x.t, begin, end, strides, end_mask=end_mask))]
+        normed[ax] = (norm_s, norm_e, norm_st)
+    if rank <= 5:
+        return [Val(tf.strided_slice(x.t, begin, end, strides, end_mask=end_mask))]
+    # TFLite's slice kernel caps at 5-D (BEVFormer-style deformable attention
+    # slices 6-D sampling tensors per level), so peel sliced axes off one at a
+    # time through a 3-D reshape window: merge the untouched axes before/after
+    # into single dimensions, strided_slice that axis, reshape back. Exact --
+    # every shape here is static, and a single-axis slice commutes with
+    # merging the other axes.
+    t = x.t
+    cur_shape = list(x_shape)
+    for ax in range(rank):
+        if ax not in normed:
+            continue
+        norm_s, norm_e, norm_st = normed[ax]
+        dim = cur_shape[ax]
+        if norm_st == 1 and norm_s == 0 and norm_e == dim:
+            continue  # full-range axis: nothing to do
+        pre = int(np.prod(cur_shape[:ax], dtype=np.int64))
+        post = int(np.prod(cur_shape[ax + 1 :], dtype=np.int64))
+        out_len = len(range(norm_s, norm_e, norm_st))
+        t = tf.reshape(t, [pre, dim, post])
+        em = 2 if (norm_st < 0 and norm_e == -1) else 0
+        t = tf.strided_slice(
+            t,
+            [0, norm_s, 0],
+            [pre, dim if em else norm_e, post],
+            [1, norm_st, 1],
+            end_mask=em,
+        )
+        cur_shape[ax] = out_len
+        t = tf.reshape(t, cur_shape)
+    return [Val(t)]
 
 
 @_register("Shape")
@@ -1288,6 +2116,23 @@ def _public_shape(shape: List[int], io_layout: str) -> List[int]:
     return shape
 
 
+def _layout_exempt_inputs(model: onnx.ModelProto) -> Set[str]:
+    """Graph-input names that keep ONNX-logical order even in NHWC mode.
+
+    GridSample's grid slot (input 1) carries sparse ``(N, *out, d)``
+    coordinates, not channel data: permuting it as NHWC would scramble
+    coordinates as channels. Only direct graph inputs are affected (rank != 4
+    tensors are never transposed, and computed tensors keep whatever order
+    their producers establish -- GridSample itself never unifies its grid).
+    """
+    exempt = set()
+    for node in model.graph.node:
+        if node.op_type == "GridSample" and len(node.input) > 1 and node.input[1]:
+            exempt.add(node.input[1])
+    initializer_names = {t.name for t in model.graph.initializer}
+    return {name for name in exempt if name not in initializer_names}
+
+
 def random_representative_dataset(
     model: onnx.ModelProto,
     num_samples: int = 100,
@@ -1309,13 +2154,20 @@ def random_representative_dataset(
     generated batches carry 4-D inputs in channel-last order.
     """
     initializer_names = {t.name for t in model.graph.initializer}
+    exempt = _layout_exempt_inputs(model)
     specs = []
     for inp in model.graph.input:
         if inp.name in initializer_names:
             continue
+        raw_shape = _static_input_shape(inp)
+        if inp.name in exempt:
+            # GridSample grids keep logical order (see _layout_exempt_inputs).
+            shape = raw_shape
+        else:
+            shape = _public_shape(raw_shape, _validate_io_layout(io_layout))
         specs.append(
             (
-                _public_shape(_static_input_shape(inp), _validate_io_layout(io_layout)),
+                shape,
                 _onnx_elem_type_to_np(inp.type.tensor_type.elem_type),
             )
         )
@@ -1378,14 +2230,21 @@ def _build_concrete_function(model: onnx.ModelProto, tf, io_layout: str = "nchw"
     input_names = []
     specs = []
     layouts = []
+    exempt = _layout_exempt_inputs(model)
     for inp in graph.input:
         if inp.name in initializer_names:
             continue
-        shape = _public_shape(_static_input_shape(inp), io_layout)
+        raw_shape = _static_input_shape(inp)
+        if inp.name in exempt:
+            # GridSample grids keep logical order (see _layout_exempt_inputs).
+            shape, layout = raw_shape, None
+        else:
+            shape = _public_shape(raw_shape, io_layout)
+            layout = "NHWC" if (nhwc and len(shape) == 4) else None
         dtype = _onnx_elem_type_to_tf(inp.type.tensor_type.elem_type, tf)
         input_names.append(inp.name)
         specs.append(tf.TensorSpec(shape=shape, dtype=dtype))
-        layouts.append("NHWC" if (nhwc and len(shape) == 4) else None)
+        layouts.append(layout)
 
     output_names = [o.name for o in graph.output]
     if not output_names:
@@ -1416,87 +2275,96 @@ def convert_to_tflite(
     representative_dataset: Any = None,
     num_calibration_samples: int = 100,
     inference_io_dtype: Any = None,
+    flex_ops: bool = False,
     io_layout: str = "nchw",
     **backend_kwargs: Any,
 ):
     """Convert an ONNX model to an in-memory TFLite flatbuffer (``bytes``).
 
-    Parameters
-    ----------
-    model:
-        The ONNX model to convert. Typically the output of :func:`onnxsim.simplify`.
-    backend:
-        Which ONNX-to-TensorFlow translator to use: ``"builtin"`` (default, this
-        module's own hand-written translator -- every graph input dimension must
-        be static and every node's op must be one of ``SUPPORTED_ONNX_OPS``) or
-        ``"onnx2tf"`` (delegates to `onnx2tf <https://github.com/PINTO0309/onnx2tf>`_,
-        which covers far more ops at the cost of a much heavier dependency and
-        changing the model's public input/output tensor layout to channel-last by
-        default -- see ``onnxsim/onnx2tf_export.py``). Reach for ``"onnx2tf"`` when
-        a model hits an unsupported op with the builtin translator.
-    optimizations:
-        ``backend="builtin"`` only. Optional list forwarded to
-        ``tf.lite.TFLiteConverter.optimizations``, e.g. ``["DEFAULT"]`` (string
-        names of ``tf.lite.Optimize`` members are accepted, as well as the enum
-        members themselves) to enable TFLite's post-training (dynamic-range)
-        quantization. Mutually exclusive with ``int8_quantize``.
-    int8_quantize:
-        ``backend="builtin"`` only. When true, run full-integer post-training
-        quantization instead: ``target_spec.supported_ops`` is pinned to
-        ``TFLITE_BUILTINS_INT8`` so conversion fails loudly on any op without
-        an integer kernel rather than silently leaving it in float. This is the
-        quantization the Coral Edge TPU requires -- combine it with
-        ``inference_io_dtype="uint8"`` (or ``"int8"``) for fully-quantized I/O
-        and compile the result with :func:`onnxsim.edgetpu_export.compile_for_edgetpu`
-        (or :func:`onnxsim.export_edgetpu` for the one-shot path).
-    representative_dataset:
-        ``backend="builtin"`` only, requires ``int8_quantize=True``. A callable
-        with no arguments yielding calibration batches (each a list of NumPy
-        arrays in graph-input order, following the
-        ``tf.lite.TFLiteConverter.representative_dataset`` protocol), e.g. built
-        from real inputs. When ``None`` (the default),
-        :func:`random_representative_dataset` generates ``num_calibration_samples``
-        uniform-random batches from the model's own input shapes -- enough to
-        produce a valid quantized model, but random data cannot match a real
-        data distribution, so prefer real inputs for production accuracy.
-    num_calibration_samples:
-        How many random batches :func:`random_representative_dataset` generates
-        when ``representative_dataset`` is not given. Ignored otherwise.
-    inference_io_dtype:
-        ``backend="builtin"`` only, requires ``int8_quantize=True``. ``"uint8"``
-        or ``"int8"`` (or the corresponding ``tf.dtypes.DType``), forwarded to
-        the converter's ``inference_input_type``/``inference_output_type`` so the
-        model's public I/O is quantized too. The Edge TPU runs fastest -- and
-        avoids a CPU-side quantize/dequantize pair at each boundary -- with
-        quantized I/O.
-    io_layout:
-        ``backend="builtin"`` only. ``"nchw"`` (default) keeps the graph's
-        public tensors in ONNX's NCHW order, transposing to NHWC only around
-        the conv/pool ops that need it. ``"nhwc"`` instead carries 4-D tensors
-        channel-last end to end -- the public 4-D I/O changes dimension order
-        to NHWC, but conv/pool/concat emit no transposes at all. Prefer
-        ``"nhwc"`` for Edge TPU deployment: this investigation measured the
-        NCHW entry transpose refusing compilation (``large activation
-        tensors``) from ~64K activation elements up (64ch x 32x32 fails, the
-        identical NHWC graph maps fully), while the exit transpose is harmless.
-        A passed ``representative_dataset`` must then yield NHWC-ordered
-        batches.
-    **backend_kwargs:
-        ``backend="onnx2tf"`` only. Forwarded to
-        :func:`onnxsim.onnx2tf_export.convert_to_tflite_via_onnx2tf` (and from there
-        to ``onnx2tf.convert()``); use onnx2tf's own quantization options there.
+        Parameters
+        ----------
+        model:
+            The ONNX model to convert. Typically the output of :func:`onnxsim.simplify`.
+        backend:
+            Which ONNX-to-TensorFlow translator to use: ``"builtin"`` (default, this
+            module's own hand-written translator -- every graph input dimension must
+            be static and every node's op must be one of ``SUPPORTED_ONNX_OPS``) or
+            ``"onnx2tf"`` (delegates to `onnx2tf <https://github.com/PINTO0309/onnx2tf>`_,
+            which covers far more ops at the cost of a much heavier dependency and
+            changing the model's public input/output tensor layout to channel-last by
+            default -- see ``onnxsim/onnx2tf_export.py``). Reach for ``"onnx2tf"`` when
+            a model hits an unsupported op with the builtin translator.
+        optimizations:
+            ``backend="builtin"`` only. Optional list forwarded to
+            ``tf.lite.TFLiteConverter.optimizations``, e.g. ``["DEFAULT"]`` (string
+            names of ``tf.lite.Optimize`` members are accepted, as well as the enum
+            members themselves) to enable TFLite's post-training (dynamic-range)
+            quantization. Mutually exclusive with ``int8_quantize``.
+        int8_quantize:
+            ``backend="builtin"`` only. When true, run full-integer post-training
+            quantization instead: ``target_spec.supported_ops`` is pinned to
+            ``TFLITE_BUILTINS_INT8`` so conversion fails loudly on any op without
+            an integer kernel rather than silently leaving it in float. This is the
+            quantization the Coral Edge TPU requires -- combine it with
+            ``inference_io_dtype="uint8"`` (or ``"int8"``) for fully-quantized I/O
+            and compile the result with :func:`onnxsim.edgetpu_export.compile_for_edgetpu`
+            (or :func:`onnxsim.export_edgetpu` for the one-shot path).
+        representative_dataset:
+            ``backend="builtin"`` only, requires ``int8_quantize=True``. A callable
+            with no arguments yielding calibration batches (each a list of NumPy
+            arrays in graph-input order, following the
+            ``tf.lite.TFLiteConverter.representative_dataset`` protocol), e.g. built
+            from real inputs. When ``None`` (the default),
+            :func:`random_representative_dataset` generates ``num_calibration_samples``
+            uniform-random batches from the model's own input shapes -- enough to
+            produce a valid quantized model, but random data cannot match a real
+            data distribution, so prefer real inputs for production accuracy.
+        num_calibration_samples:
+            How many random batches :func:`random_representative_dataset` generates
+            when ``representative_dataset`` is not given. Ignored otherwise.
+        inference_io_dtype:
+            ``backend="builtin"`` only, requires ``int8_quantize=True``. ``"uint8"``
+            or ``"int8"`` (or the corresponding ``tf.dtypes.DType``), forwarded to
+            the converter's ``inference_input_type``/``inference_output_type`` so the
+            model's public I/O is quantized too. The Edge TPU runs fastest -- and
+            avoids a CPU-side quantize/dequantize pair at each boundary -- with
+            quantized I/O.
+    <    flex_ops:
+            ``backend="builtin"`` only, mutually exclusive with ``int8_quantize``.
+            When true, allow TensorFlow Flex (``SELECT_TF_OPS``) kernels for the
+            few ops TFLite has no builtin for (e.g. ``Atan``) instead of failing
+            conversion. Flex ops always run on the CPU -- treat them as a
+            CPU-side tail partition (box decoding, ...) while the rest of the
+            graph still maps to TFLite builtins (and from there to delegates such
+            as Hexagon/NNAPI); a model that needs Flex cannot target the Edge TPU.
+        io_layout:
+            ``backend="builtin"`` only. ``"nchw"`` (default) keeps the graph's
+            public tensors in ONNX's NCHW order, transposing to NHWC only around
+            the conv/pool ops that need it. ``"nhwc"`` instead carries 4-D tensors
+            channel-last end to end -- the public 4-D I/O changes dimension order
+            to NHWC, but conv/pool/concat emit no transposes at all. Prefer
+            ``"nhwc"`` for Edge TPU deployment: this investigation measured the
+            NCHW entry transpose refusing compilation (``large activation
+            tensors``) from ~64K activation elements up (64ch x 32x32 fails, the
+            identical NHWC graph maps fully), while the exit transpose is harmless.
+            A passed ``representative_dataset`` must then yield NHWC-ordered
+            batches.
+        **backend_kwargs:
+            ``backend="onnx2tf"`` only. Forwarded to
+            :func:`onnxsim.onnx2tf_export.convert_to_tflite_via_onnx2tf` (and from there
+            to ``onnx2tf.convert()``); use onnx2tf's own quantization options there.
 
-    Returns
-    -------
-    bytes
-        The serialized ``.tflite`` flatbuffer.
+        Returns
+        -------
+        bytes
+            The serialized ``.tflite`` flatbuffer.
 
-    Raises
-    ------
-    RuntimeError
-        If the selected backend's dependency is not installed, or conversion
-        fails -- for ``"builtin"``, an input has a non-static dimension or the
-        graph uses an ONNX op/feature the translator does not support.
+        Raises
+        ------
+        RuntimeError
+            If the selected backend's dependency is not installed, or conversion
+            fails -- for ``"builtin"``, an input has a non-static dimension or the
+            graph uses an ONNX op/feature the translator does not support.
     """
     _validate_io_layout(io_layout)
     if backend == "onnx2tf":
@@ -1506,11 +2374,12 @@ def convert_to_tflite(
             int8_quantize
             or representative_dataset is not None
             or inference_io_dtype is not None
+            or flex_ops
             or io_layout != "nchw"
         ):
             raise TypeError(
                 "convert_to_tflite() with backend='onnx2tf' does not accept "
-                "int8_quantize/representative_dataset/inference_io_dtype/io_layout; "
+                "int8_quantize/representative_dataset/inference_io_dtype/flex_ops/io_layout; "
                 "use onnx2tf's own quantization options (forwarded as extra keyword "
                 "arguments) instead (onnx2tf is channel-last by default)."
             )
@@ -1529,6 +2398,12 @@ def convert_to_tflite(
             "optimizations= and int8_quantize=True are mutually exclusive: "
             "int8_quantize already enables the DEFAULT optimization internally "
             "as part of full-integer quantization."
+        )
+    if flex_ops and int8_quantize:
+        raise ValueError(
+            "flex_ops=True and int8_quantize=True are mutually exclusive: "
+            "Flex kernels run on the CPU in float, outside full-integer "
+            "quantization."
         )
     if representative_dataset is not None and not int8_quantize:
         raise ValueError("representative_dataset= requires int8_quantize=True.")
@@ -1556,6 +2431,11 @@ def convert_to_tflite(
         converter.optimizations = [
             getattr(tf.lite.Optimize, o) if isinstance(o, str) else o
             for o in optimizations
+        ]
+    if flex_ops:
+        converter.target_spec.supported_ops = [
+            tf.lite.OpsSet.TFLITE_BUILTINS,
+            tf.lite.OpsSet.SELECT_TF_OPS,
         ]
     try:
         return converter.convert()
