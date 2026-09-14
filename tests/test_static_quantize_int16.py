@@ -61,6 +61,29 @@ def _assert_close(float_outputs, quant_outputs, rel_l2_tol=0.1):
         assert rel_l2 < rel_l2_tol, f"relative L2 error too large: {rel_l2:.4f}"
 
 
+def _assert_explicit_weight_zp(quant, out_channels):
+    # Same explicit all-zeros INT8 weight zero-point as quantize_static's --
+    # see test_static_quantize_matmul.py's identically-named helper for why
+    # runtimes need it spelled out.
+    inits = {t.name: t for t in quant.graph.initializer}
+    wdqs = [
+        n
+        for n in quant.graph.node
+        if n.op_type == "DequantizeLinear"
+        and n.input[0] in inits  # weight branch (activation DQs read a node)
+    ]
+    assert len(wdqs) == 1
+    assert len(wdqs[0].input) == 3
+    wq = onnx.numpy_helper.to_array(inits[wdqs[0].input[0]])
+    ws = onnx.numpy_helper.to_array(inits[wdqs[0].input[1]])
+    wzp = onnx.numpy_helper.to_array(inits[wdqs[0].input[2]])
+    assert wq.dtype == np.int8
+    assert ws.shape == (out_channels,)
+    assert wzp.dtype == np.int8
+    assert wzp.shape == ws.shape
+    assert bool((wzp == 0).all())
+
+
 def test_quantize_matmul():
     rng = np.random.default_rng(0)
     K, N = 32, 16
@@ -81,6 +104,7 @@ def test_quantize_matmul():
     assert ops["MatMul"] == 1  # the MatMul node itself is kept (QDQ format)
     assert ops["QuantizeLinear"] == 1
     assert ops["DequantizeLinear"] == 2  # one for X, one for W
+    _assert_explicit_weight_zp(quant, N)
 
     x = rng.standard_normal((4, K)).astype(np.float32)
     _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}))
@@ -163,6 +187,7 @@ def test_quantize_conv():
     assert ops["Conv"] == 1
     assert ops["QuantizeLinear"] == 1
     assert ops["DequantizeLinear"] == 2
+    _assert_explicit_weight_zp(quant, cout)
 
     x = rng.standard_normal((1, cin, 16, 16)).astype(np.float32)
     _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}))

@@ -18,7 +18,8 @@
 // After (Conv itself is untouched, only its inputs change):
 //   Xq  = QuantizeLinear(X, Xs, Xzp)        -- Xs/Xzp: CALIBRATED, fixed
 //   Xdq = DequantizeLinear(Xq, Xs, Xzp)
-//   Wdq = DequantizeLinear(Wq, Ws, axis=0)
+//   Wdq = DequantizeLinear(Wq, Ws, Wzp, axis=0)
+//         -- Wzp: explicit all-zeros INT8, same shape as Ws
 //   Y   = Conv(Xdq, Wdq)
 //
 // Only Conv's ``X`` and ``W`` inputs are quantized; its optional bias (a
@@ -126,12 +127,19 @@ struct StaticQuantizeConv final : public PredicateBasedPass {
 
     Value* w_q_v = graph.addInitializerAndCreateValue(w_q);
     Value* w_scale_v = graph.addInitializerAndCreateValue(w_scale);
+    Tensor w_zp;
+    MakeSymmetricInt8WeightZeroPoint(w_scale.sizes()[0], w_zp);
+    Value* w_zp_v = graph.addInitializerAndCreateValue(w_zp);
 
-    // Wdq = DequantizeLinear(Wq, Ws, axis=0) -- zero_point omitted
-    // (symmetric, i.e. always 0).
+    // Wdq = DequantizeLinear(Wq, Ws, Wzp, axis=0), with Wzp an explicit
+    // all-zeros INT8 tensor: symmetric quantization is always 0, so the
+    // zero_point input is optional per the spec -- but runtimes that fuse the
+    // QDQ pattern into an integer kernel require scale and zero_point to have
+    // the same shape, and reject/abort the fused node when it is omitted.
     Node* wdq = graph.create(Symbol("DequantizeLinear"), 1);
     wdq->addInput(w_q_v);
     wdq->addInput(w_scale_v);
+    wdq->addInput(w_zp_v);
     wdq->i_(kaxis, 0);
     wdq->insertBefore(n);
     wdq->output()->setElemType(TensorProto_DataType_FLOAT);
