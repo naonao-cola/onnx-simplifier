@@ -97,9 +97,9 @@ onnxruntime distribution that ships `onnxruntime_cxx_api.h` + `libonnxruntime`, 
 
 ```sh
 # An official prebuilt release works -- no build, no ORT_SOURCE_DIR/ORT_BUILD_DIR.
-curl -sSL -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.19.2/onnxruntime-linux-x64-1.19.2.tgz
+curl -sSL -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.30.0/onnxruntime-linux-x64-1.30.0.tgz
 tar xzf ort.tgz
-cmake -B build -DORT_HOME=$PWD/onnxruntime-linux-x64-1.19.2
+cmake -B build -DORT_HOME=$PWD/onnxruntime-linux-x64-1.30.0
 cmake --build build --target onnx-finetune-distill-step-graph
 ```
 
