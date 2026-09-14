@@ -2,7 +2,8 @@
 
 The EP aborts on ``Conv`` nodes that rely on default attributes, so the
 legalizer materializes them explicitly; the checker flags the remaining
-known-bad shapes (default-attr ``Conv``, ``LSTM``, bf16-typed tensors).
+known-bad shapes (default-attr ``Conv``, ``LSTM``, ``If``, bf16-typed
+tensors).
 """
 
 import numpy as np
@@ -132,6 +133,24 @@ def test_check_flags_lstm():
     messages = check_vitisai_support(model)
     assert len(messages) == 1
     assert "LSTM" in messages[0]
+
+
+def test_check_flags_if():
+    # Bisected on a ResNeXt-FPN detector: the graph without its If node
+    # compiles on the EP, adding just the If aborts session creation in
+    # the MLIR lowering -- while minimal static If/Loop probes compile
+    # fine, so every If is flagged (the checker cannot tell the fatal
+    # dynamic-shape lowering from a safe one).
+    model = _model(
+        """agraph (bool c, float[2,2] x) => (float[2,2] y)
+        {
+          y = If (c) <then_branch = g1 () => (float[2,2] t) { t = Identity (x) },
+            else_branch = g2 () => (float[2,2] e) { e = Relu (x) }>
+        }"""
+    )
+    messages = check_vitisai_support(model)
+    assert len(messages) == 1
+    assert "If" in messages[0]
 
 
 def test_check_flags_bf16():
