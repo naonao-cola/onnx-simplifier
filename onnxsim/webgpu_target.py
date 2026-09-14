@@ -152,9 +152,7 @@ _CONV_LIKE_OPS = ("Conv", "ConvTranspose")
 _DEFAULT_DOMAINS = ("", "ai.onnx")  # onnx.parser/onnx.helper both emit "".
 
 
-def _conv_spatial_rank(
-    node: onnx.NodeProto, initializer_map: dict
-) -> Optional[int]:
+def _conv_spatial_rank(node: onnx.NodeProto, initializer_map: dict) -> Optional[int]:
     """The convolution's spatial rank (2 for a "normal" Conv, 3 for conv3d),
     or ``None`` if it can't be determined from the node alone: prefers the
     ``kernel_shape`` attribute (most exporters set it), else falls back to
@@ -191,7 +189,7 @@ def _flagged_conv3d_nodes(graph: onnx.GraphProto) -> List[Tuple[int, str]]:
                 i,
                 f"{node.op_type} node {node_label!r} has spatial rank 3 (a "
                 f"3-D convolution); onnxruntime-web's WebGPU operator table "
-                f"documents {node.op_type}3d as \"not supported\". This "
+                f'documents {node.op_type}3d as "not supported". This '
                 "rank is visible to ONNX Runtime's GetCapability from "
                 "static graph shape alone (unlike the Attention gap above), "
                 "so this more plausibly falls back gracefully to another "
@@ -241,8 +239,8 @@ def _flagged_resize_align_corners_downsample_nodes(
                 'coordinate_transformation_mode="align_corners" with a '
                 f"constant scales input that downsamples at least one axis "
                 f"({scales.tolist()!r}); onnxruntime-web's WebGPU operator "
-                "table documents align_corners as \"not supported with "
-                "downsampling\". Like the Attention gap above, the scale "
+                'table documents align_corners as "not supported with '
+                'downsampling". Like the Attention gap above, the scale '
                 "values are a runtime tensor input rather than static graph "
                 "shape, so GetCapability plausibly can't see this either -- "
                 "but that mechanism has not been independently re-verified "
@@ -298,7 +296,9 @@ def check_webgpu_resize_support(model: Union[str, onnx.ModelProto]) -> List[str]
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    return [msg for _, msg in _flagged_resize_align_corners_downsample_nodes(model.graph)]
+    return [
+        msg for _, msg in _flagged_resize_align_corners_downsample_nodes(model.graph)
+    ]
 
 
 def check_webgpu_support(model: Union[str, onnx.ModelProto]) -> List[str]:

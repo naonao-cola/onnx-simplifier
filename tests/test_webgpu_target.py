@@ -125,7 +125,11 @@ def _conv3d_model(op_type="Conv", via_kernel_shape=True, spatial=3):
     )
     x_shape = [1, in_c] + [8] * spatial
     y_shape = [1, out_c] + [6] * spatial
-    op = f"{op_type}<kernel_shape = {list((k,) * spatial)}>" if via_kernel_shape else op_type
+    op = (
+        f"{op_type}<kernel_shape = {list((k,) * spatial)}>"
+        if via_kernel_shape
+        else op_type
+    )
     return _model(
         f"""
         g (float{x_shape} x) => (float{y_shape} y)
@@ -225,14 +229,19 @@ def test_check_webgpu_support_aggregates_all_checks():
     assert len(onnxsim.check_webgpu_support(attention_model)) == 1
     assert len(onnxsim.check_webgpu_support(conv3d_model)) == 1
     assert len(onnxsim.check_webgpu_support(resize_model)) == 1
-    assert onnxsim.check_webgpu_support(_model(
-        """
+    assert (
+        onnxsim.check_webgpu_support(
+            _model(
+                """
         g (float[2,3] x, float[3,4] w) => (float[2,4] y)
         {
           y = MatMul(x, w)
         }
         """
-    )) == []
+            )
+        )
+        == []
+    )
 
 
 def test_gemm_fusion_backend_webgpu_matches_unrestricted():

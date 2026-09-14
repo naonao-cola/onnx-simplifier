@@ -86,7 +86,9 @@ def test_attach_and_read_round_trip():
 
 def test_attach_returns_mutated_model_for_chaining():
     model = _add_model()
-    returned = attach_webgpu_kernel(model, "add_node", _WGSL, "main", (1, 1, 1), _BINDINGS)
+    returned = attach_webgpu_kernel(
+        model, "add_node", _WGSL, "main", (1, 1, 1), _BINDINGS
+    )
     assert returned is model
 
 
@@ -103,7 +105,9 @@ def test_read_missing_node_returns_none():
 def test_attach_unknown_node_name_raises():
     model = _add_model()
     with pytest.raises(ValueError, match="no node named"):
-        attach_webgpu_kernel(model, "does_not_exist", _WGSL, "main", (1, 1, 1), _BINDINGS)
+        attach_webgpu_kernel(
+            model, "does_not_exist", _WGSL, "main", (1, 1, 1), _BINDINGS
+        )
 
 
 def test_attach_empty_node_name_raises():
@@ -127,7 +131,9 @@ def test_attach_binding_to_foreign_tensor_raises():
 
 def test_attach_invalid_access_raises():
     model = _add_model()
-    bad_binding = [WebgpuKernelBinding(tensor="a", group=0, binding=0, access="write_only")]
+    bad_binding = [
+        WebgpuKernelBinding(tensor="a", group=0, binding=0, access="write_only")
+    ]
     with pytest.raises(ValueError, match="access"):
         attach_webgpu_kernel(model, "add_node", _WGSL, "main", (1, 1, 1), bad_binding)
 
