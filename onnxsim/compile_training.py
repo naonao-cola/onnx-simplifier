@@ -1019,9 +1019,22 @@ class TrainingLoop:
         :attr:`forward_providers`, backward+optimizer on :attr:`providers`,
         boundary activations and state crossing as numpy."""
         assert self._runner_fwd is not None and self._runner_bwd is not None
-        fwd_in = {k: np.asarray(v, dtype=np.float32) for k, v in feeds.items()}
+        # Feed only what the forward session declares: a re-frozen forward
+        # bakes the weights in as initializers instead of taking them as
+        # state inputs (see the periodic re-freeze recipe), and extra feeds
+        # are an error, not ignored. Without an onnxruntime session (the
+        # reference-evaluator fallback) there is nothing to filter against.
+        sess = getattr(self._runner_fwd, "_sess", None)
+        get_inputs = getattr(sess, "get_inputs", None)
+        declared = {i.name for i in get_inputs()} if get_inputs is not None else None
+        fwd_in = {
+            k: np.asarray(v, dtype=np.float32)
+            for k, v in feeds.items()
+            if declared is None or k in declared
+        }
         for p in self.params:
-            fwd_in[p] = np.asarray(self._state[p], dtype=np.float32)
+            if declared is None or p in declared:
+                fwd_in[p] = np.asarray(self._state[p], dtype=np.float32)
         fout = self._runner_fwd(fwd_in)
         bwd_in = {t: np.asarray(fout[t], dtype=np.float32) for t in self._needed}
         for k, v in self._state.items():
