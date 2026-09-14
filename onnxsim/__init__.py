@@ -238,6 +238,7 @@ from onnxsim.onnx_simplifier import (
     read_gguf_metadata,
     simplify,
 )
+from onnxsim.onnxnet_encoder import chain_slim, chain_slim_base
 from onnxsim.optimize_pipeline import (
     OptimizationPipelineResult,
     apply_optimization_pipeline,
@@ -508,6 +509,8 @@ __all__ = [
     "estimate_webgpu_islands",
     "check_webnn_support",
     "estimate_webnn_islands",
+    "chain_slim",
+    "chain_slim_base",
     "check_vitisai_support",
     "legalize_for_vitisai",
     "split_model",
