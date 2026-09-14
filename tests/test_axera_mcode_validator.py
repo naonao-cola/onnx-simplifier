@@ -251,3 +251,74 @@ def test_lookahead_adjudicates_a1_tag_verb_overlaps():
     # ...and keeps the genuine short unit at the other.
     assert ruled_toks[967] == "S", ruled_toks[967]
     assert blob[967:979] == bytes.fromhex("03 3f 00 00 11 a1 00 b0 03 3f f0 3e")
+
+
+# (P, D) token counts per committed stream -- `0b 91` prefixes under their
+# anchored verb, and raw-on-both-bytes `05 90` doublets (see
+# `test_bookend_prefix_pairs`).
+_PD_COUNTS = {
+    "conv64_k5_d2": (0, 0),
+    "conv128_k7_d12": (0, 6),
+    "piper_vocoder": (0, 35),
+    "w2v2fe_training_step": (16, 48),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_bookend_prefix_pairs(name):
+    """Two-byte prefixes the greedy walk strands: a raw-on-both-bytes
+    `05 90` doublet, and `0b 91`, always followed by an `a1 00 b0 03` verb
+    (2,663 of 2,663 occurrences corpus-wide). Neither byte can open any other
+    form and the guards hold the absorbed bytes to otherwise-raw ones, so
+    admitting them is pure addition -- see the README's "Bookend pairs: a
+    two-byte prefix class" section."""
+    blob = _blob(name)
+    lo, hi = mcode.stream_bounds(blob)
+    toks = mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    prefixes = [t for t in toks if t[1] == "P"]
+    doublets = [t for t in toks if t[1] == "D"]
+    assert (len(prefixes), len(doublets)) == _PD_COUNTS[name], (
+        name,
+        len(prefixes),
+        len(doublets),
+    )
+    for o, _, a, b, _ in prefixes:
+        assert (blob[o], blob[o + 1]) == (0x0B, 0x91) == (a, b), (name, o)
+        assert blob[o + 2 : o + 6] == bytes([0xA1, 0x00, 0xB0, 0x03]), (name, o)
+    for o, _, a, b, _ in doublets:
+        assert (blob[o], blob[o + 1]) == (0x05, 0x90) == (a, b), (name, o)
+    # Neither form can split a verb: no verb byte occurs inside either.
+    for o, kind, a, b, _ in prefixes + doublets:
+        assert a not in mcode.VERBS6 and b not in mcode.VERBS6, (name, kind, o)
+    records = mcode.decode(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    assert [(r["a"], r["b"]) for r in records if r["kind"] == "P"] == [
+        (a, b) for _, _, a, b, _ in prefixes
+    ]
+    assert [(r["a"], r["b"]) for r in records if r["kind"] == "D"] == [
+        (a, b) for _, _, a, b, _ in doublets
+    ]
+
+    # Admitting the forms buys coverage, and only where they fire.
+    without = dict(mcode.FULL_RULE)
+    without["pair_prefix"] = False
+    covered_without, _ = mcode.nonzero_coverage(blob, **without)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    if sum(_PD_COUNTS[name]):
+        assert covered_with > covered_without, (name, covered_without, covered_with)
+    else:
+        assert covered_with == covered_without, (name, covered_without, covered_with)
+
+    # The shuffle control: essentially no prefixes or doublets by chance.
+    bulk = bytearray(blob[lo:hi])
+    random.Random(0).shuffle(bulk)
+    shuffled = bytes(blob[:lo]) + bytes(bulk) + bytes(blob[hi:])
+    null = [
+        t
+        for t in mcode.tokenize(shuffled, start=lo, end=hi, **mcode.FULL_RULE)
+        if t[1] in ("P", "D")
+    ]
+    assert len(null) <= max(2, (len(prefixes) + len(doublets)) // 4), (
+        name,
+        len(prefixes) + len(doublets),
+        len(null),
+    )

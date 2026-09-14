@@ -59,12 +59,14 @@ FULL_RULE = dict(
     companion=True,
     quintet=True,
     lookahead=64,
+    pair_prefix=True,
 )
 """Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
 six verbs -- the README's "The tail is the segment table" section -- plus
 the `[04][a][b][a][b]` quintet ("A five-byte form that programs its pair
-twice"). `lookahead` adjudicates the overlaps the greedy walk cannot see
-past ("Adjudicating the overlaps ..."); 64 bytes is where the corpus-wide
+twice") and the bookend pairs ("Bookend pairs: a two-byte prefix class").
+`lookahead` adjudicates the overlaps the greedy walk cannot see past
+("Adjudicating the overlaps ..."); 64 bytes is where the corpus-wide
 gain converges (32 is slightly worse, 128 no better)."""
 
 TAIL_VECTOR = bytes.fromhex("05000000200000002c000000500000007400000098000000")
@@ -85,6 +87,7 @@ def tokenize(
     companion=False,
     quintet=False,
     lookahead=0,
+    pair_prefix=False,
 ):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
@@ -96,7 +99,10 @@ def tokenize(
     payload byte), 'B' (a=tag, b=register), 'W' (a companion write:
     a=X, b=field, c=bank), 'Q' (a quintet `[04][a][b][a][b]`: a five-byte
     unit repeating its last two payload bytes -- see the README's "A
-    five-byte form that programs its pair twice" section) or '?' (a=byte).
+    five-byte form that programs its pair twice" section), 'P' (a `0b 91`
+    prefix under its anchored verb), 'D' (a raw-on-both-bytes `05 90`
+    doublet -- both see the README's "Bookend pairs: a two-byte prefix
+    class" section) or '?' (a=byte).
 
     Where a short unit ending in `a1 00` overlaps a verb beginning there,
     the greedy walk cannot tell a genuine tag from a swallowed verb head by
@@ -169,6 +175,33 @@ def tokenize(
             and mcode[i + 2] == mcode[i + 4]
         )
 
+    def pair_prefix_at(i):
+        """A two-byte prefix standing immediately before the unit it
+        modifies: `05 90`, always raw on both bytes, or `0b 91`, always raw
+        and always followed by an `a1 00 b0 03` verb. Neither byte can open
+        any other form (both heads are outside the verb, tag and prefix
+        sets), and the guards hold the bytes they absorb to otherwise-raw
+        ones -- `05 90` only when no bare pair starts at the `90` (its
+        register byte is odd there), `0b 91` only under its anchored verb
+        and never overlapping a companion. See the README's "Bookend pairs:
+        a two-byte prefix class" section."""
+        if i + 1 >= len(mcode):
+            return False
+        if not pair_prefix:
+            return False
+        if mcode[i] == 0x05 and mcode[i + 1] == 0x90:
+            return (i + 2 >= end or mcode[i + 2] % 2 == 1) and not companion_at(i + 1)
+        return (
+            mcode[i] == 0x0B
+            and mcode[i + 1] == 0x91
+            and i + 5 < len(mcode)
+            and mcode[i + 2] == 0xA1
+            and mcode[i + 3] == 0
+            and mcode[i + 4] == 0xB0
+            and mcode[i + 5] == 0x03
+            and not companion_at(i + 1)
+        )
+
     def _plain_step(i):
         """One greedy step: `(token, next offset)`, no adjudication. With
         `lookahead=0` the walk below is exactly this step repeated, byte for
@@ -190,6 +223,9 @@ def tokenize(
             return (i, "S", mcode[i], mcode[i + sl - 2], mcode[i + 1]), i + sl
         if quintet_at(i):
             return (i, "Q", mcode[i + 1], mcode[i + 2], 0), i + 5
+        if pair_prefix_at(i):
+            kind = "P" if mcode[i] == 0x0B else "D"
+            return (i, kind, mcode[i], mcode[i + 1], 0), i + 2
         if bare and i + 1 < end and mcode[i] in tags and mcode[i + 1] % 2 == 0:
             n = 2 + (1 if mcode[i] in extra_byte_tags else 0)
             return (i, "B", mcode[i], mcode[i + 1], 0), i + n
@@ -323,6 +359,8 @@ def decode(mcode, start=None, end=None, **rule):
     * `S`: a width-rule unit (`p`, `payload`, `tag`, `reg`, `extra`)
     * `B`: a bare `[tag][register]` pair (`tag`, `reg`, `extra`)
     * `Q`: a quintet `[04][a][b][a][b]` (`a`, `b`)
+    * `P`: a `0b 91` prefix under its anchored verb (`x`, `y`)
+    * `D`: a `05 90` doublet, raw on both bytes (`x`, `y`)
     * `raw`: one byte no form accounts for (`byte`)
 
     Every record also carries `at`, its offset in the original stream, so
@@ -388,6 +426,8 @@ def decode(mcode, start=None, end=None, **rule):
             )
         elif kind == "Q":
             out.append({"at": o, "kind": "Q", "a": t[2], "b": t[3]})
+        elif kind in ("P", "D"):
+            out.append({"at": o, "kind": kind, "a": t[2], "b": t[3]})
         else:
             out.append({"at": o, "kind": "raw", "byte": t[2]})
     return out
@@ -415,6 +455,8 @@ def encode(records):
             out += bytes([r["tag"], r["reg"]]) + r["extra"]
         elif kind == "Q":
             out += bytes([0x04, r["a"], r["b"], r["a"], r["b"]])
+        elif kind in ("P", "D"):
+            out += bytes([r["a"], r["b"]])
         else:
             out += bytes([r["byte"]])
     return bytes(out)

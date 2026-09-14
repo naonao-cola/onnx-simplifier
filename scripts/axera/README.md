@@ -5349,6 +5349,42 @@ lookahead cannot see because stepping onto them would first strand the two
 bytes before. That class wants a wider anchor, not a longer horizon, and is
 next.
 
+### Bookend pairs: a two-byte prefix class
+
+Clustering what was left after the quintet and the lookahead turns up two
+two-byte forms, both standing immediately before the unit they modify, both
+pure addition by construction -- admitted only where the walk emits raw
+escapes, with guards holding every absorbed byte to an otherwise-raw one:
+
+* a `05 90` doublet, raw on both bytes (6,165 occurrences, 183 on shuffled
+  streams -- thirty-four to one);
+* `0b 91`, always followed by an `a1 00 b0 03` verb -- all 2,663
+  occurrences corpus-wide, zero on shuffled streams. The anchor is
+  positional, companion-style: fire only under that exact verb.
+
+Neither byte of either form can open any other unit (both heads sit outside
+the verb, tag and prefix sets), and no verb byte occurs inside either form
+across the corpus, so neither can split a verb the way an `a1`-tagged short
+unit splits one beginning at its tag. Together they take unexplained bytes
+434,679 down to 417,023 with no stream regressing anywhere -- the codec
+carries them as `P` and `D` records, `check` stays clean on all 68 streams
+and the four fixtures (16 prefixes and 48 doublets in the training step, 35
+doublets in the vocoder, 6 in the dilated conv, none in the small one).
+
+Two things found along the way are recorded here rather than admitted.
+First, the `0b 91` verbs take wider company: the four bytes before are
+`81 R2 0b 91` (R2 even) where the prefix fires, but `XX 00 00 91` where it
+does not -- the `91` directly precedes the verb in both cases, so the real
+form may be a four-byte prefix ending in `0x91`, of which `0b 91` is only
+the anchored, provable half. Second, an eight-byte
+`04 40 84 18 83 R TT 40` template recurs 2,252 times exactly (R always even,
+`0x42..0x58`; TT in `{01, 02, 03}`) with zero shuffled counterparts -- real
+by recurrence, but parked: its tail `TT 40` usually completes a
+genuine-looking short unit, so taking the template means breaking that unit,
+and taking it unconditionally was measured to *lose* 1,800 bytes net. Like
+the verb splits before the lookahead, it is an overlap dispute, and it wants
+adjudication, not a guard.
+
 ## Per-ONNX-op coverage, and what it caught
 
 `op_coverage.py` classifies every operator in the ai.onnx default domain
