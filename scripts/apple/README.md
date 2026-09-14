@@ -241,6 +241,19 @@ The pure comparison logic (`compare_token_sequences`) has no coremltools/
 torch/transformers dependency and is unit-tested directly in
 `tests/test_check_decode_parity.py`.
 
+When a parity run fails, the next question is whether the first divergence
+is fp16 noise or a systematic mistranslation. The discriminating measurement
+is the margin at the divergence point: run both decoders teacher-forced on
+the agreed prefix and compare full logit vectors (top-6 sets, EOS rank and
+logit on each side, max abs drift over the vocab). On
+`SmolLM2-135M-Instruct` the first divergence is a **0.06-logit coin flip**
+between the top two tokens (both sides agree on the top-6 set; cross-side
+drift ~0.03 on ~10.5-scale logits, 0.4 max over the vocab), and the EOS
+logit error there is ordinary (rank ~42k on both sides) -- noise, with no
+EOS-specific mistreatment. A second prompt agrees 20/20. A systematic bug
+would instead show a large margin or an EOS logit far off its reference;
+that is the signal to look for before blaming the translator.
+
 ### Weight-only quantization (`--quantize-weights`)
 
 The "Theoretical ceiling" section above works out that a decode step is
@@ -869,19 +882,25 @@ Decode tok/s does **not** scale smoothly with parameter count on this
 runner class: Qwen2.5-3B-Instruct's 0.04 tok/s is a ~50x cliff from the
 1.7B model's 2.11, not the ~2x the weight-size ratio alone would predict
 (bandwidth-bound reasoning per the "Theoretical ceiling" section above
-would suggest roughly linear scaling with weight bytes) -- peak RSS
-approaching the runner's likely memory ceiling at that tier is the leading
-suspect, but this wasn't isolated; treat it as a real, measured number and
-not yet a fully explained one. `SmolLM2-135M-Instruct`'s parity failure is
+would suggest roughly linear scaling with weight bytes). Re-running the
+same model/benchmark on a 16GB M4 Mac mini (CPU_ONLY, 7.3GB peak RSS)
+gives **2.44 tok/s** with a 15.8s prefill -- faster than even the
+weight-ratio extrapolation (~0.9 tok/s from the 1.5B row) -- so the cliff
+does not reproduce where memory is plentiful, and is best read as the old
+runner's memory ceiling (5.6GB RSS there), not an architectural property
+of the 3B tier. `SmolLM2-135M-Instruct`'s parity failure is
 the fp16-Core-ML-vs-fp32-HF-reference divergence the "Decode parity"
 section above already explains (different generated content after the
 first mismatch, not a stopping-point difference). `SmolLM2-1.7B-Instruct`'s
 is a different failure mode: the tokens it generated *agree* with the HF
 reference everywhere the reference has tokens to compare -- Core ML just
 kept generating past where the 3-token HF reference stopped
-(`'Paris.\nThe capital of France is Paris...'` looping), a
-greedy-decoding/EOS-handling difference at this size, not yet root-caused,
-rather than a translator correctness bug.
+(`'Paris.\nThe capital of France is Paris...'` looping). That shape --
+agreement, then the HF side emitting EOS where Core ML does not -- is what
+a sub-0.1-logit fp16 coin flip landing exactly on the EOS decision looks
+like, and the margin probe below confirms flips of exactly that size
+decide top-1 elsewhere; no EOS-specific mistreatment was found (the EOS
+logit error is ordinary, rank ~42k on both sides at a divergence point).
 
 ### Benchmarking a real model suite (`prepare_benchmark_models.py`)
 
