@@ -20,15 +20,38 @@ Example::
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
 
 _EDGETPU_DIR = os.path.dirname(os.path.abspath(__file__))
-if _EDGETPU_DIR not in sys.path:
-    sys.path.insert(0, _EDGETPU_DIR)
 
-import models  # noqa: E402
+
+def _load_models():
+    """Load the sibling ``models.py`` by path, not by module name.
+
+    Every vendor directory under scripts/ has its own ``models.py``
+    (amd, apple, ...), so a plain ``import models`` resolves to whichever
+    one some earlier test already pulled into ``sys.modules``. Loading by
+    path under a unique name is immune to that.
+    """
+    name = "edgetpu_benchmark_models"
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(_EDGETPU_DIR, "models.py")
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot locate scripts/edgetpu/models.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+models = _load_models()
 
 # Link/compute assumptions for the roofline predictions (see README.md).
 _USB2_BW = 40e6  # effective USB 2.0 bulk throughput, bytes/s

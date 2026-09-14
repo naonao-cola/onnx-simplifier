@@ -7,6 +7,7 @@ no TensorFlow, compiler binary, or Edge TPU hardware needed. On-device timing
 runners under scripts/.
 """
 
+import importlib.util
 import json
 import os
 import sys
@@ -18,11 +19,31 @@ import pytest
 _EDGETPU_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "edgetpu"
 )
-if _EDGETPU_DIR not in sys.path:
-    sys.path.insert(0, _EDGETPU_DIR)
 
-import models  # noqa: E402
-import peak_benchmark  # noqa: E402
+
+def _load_module(name: str, filename: str):
+    """Load a scripts/edgetpu module by path under a unique name.
+
+    Every vendor directory under scripts/ has a ``models.py``, so a plain
+    ``import models`` would resolve to whichever one an earlier test already
+    pulled into ``sys.modules`` (this broke CI when the full suite ran).
+    """
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(_EDGETPU_DIR, filename)
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot locate scripts/edgetpu/{filename}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+models = _load_module("edgetpu_benchmark_models", "models.py")
+peak_benchmark = _load_module("edgetpu_peak_benchmark", "peak_benchmark.py")
 
 
 def test_all_models_build_and_validate():
