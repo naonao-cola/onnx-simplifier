@@ -60,11 +60,14 @@ FULL_RULE = dict(
     quintet=True,
     lookahead=64,
     pair_prefix=True,
+    fixed5=True,
+    vprefix=True,
 )
 """Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
 six verbs -- the README's "The tail is the segment table" section -- plus
 the `[04][a][b][a][b]` quintet ("A five-byte form that programs its pair
-twice") and the bookend pairs ("Bookend pairs: a two-byte prefix class").
+twice"), the bookend pairs ("Bookend pairs: a two-byte prefix class") and
+the fixed head with a live tail ("A fixed head with a live tail").
 `lookahead` adjudicates the overlaps the greedy walk cannot see past
 ("Adjudicating the overlaps ..."); 64 bytes is where the corpus-wide
 gain converges (32 is slightly worse, 128 no better)."""
@@ -88,6 +91,8 @@ def tokenize(
     quintet=False,
     lookahead=0,
     pair_prefix=False,
+    fixed5=False,
+    vprefix=False,
 ):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
@@ -102,7 +107,10 @@ def tokenize(
     five-byte form that programs its pair twice" section), 'P' (a `0b 91`
     prefix under its anchored verb), 'D' (a raw-on-both-bytes `05 90`
     doublet -- both see the README's "Bookend pairs: a two-byte prefix
-    class" section) or '?' (a=byte).
+    class" section), 'F' (a fixed `01 a4 00 c1 W` unit: the middle never
+    varies, only the last byte does), 'X' (a four-byte `05 10 e2 0e` verb
+    prefix -- both see the README's "A fixed head with a live tail"
+    section) or '?' (a=byte).
 
     Where a short unit ending in `a1 00` overlaps a verb beginning there,
     the greedy walk cannot tell a genuine tag from a swallowed verb head by
@@ -202,6 +210,42 @@ def tokenize(
             and not companion_at(i + 1)
         )
 
+    def fixed5_at(i):
+        """A fixed five-byte `01 a4 00 c1 W` unit: the middle never varies,
+        only the last byte does (almost always `0x23`/`0x25`). It fires only
+        where no other form matches -- `0x01` is not a verb, a tag or a
+        width prefix with a tag at +3 -- so the walk emits a raw escape
+        there today; the `c1 W` tail re-parses after it exactly as before
+        (a bare odd pair), which is why admitting it only ever converts raw
+        escapes. See the README's "A fixed head with a live tail" section."""
+        return (
+            fixed5
+            and i + 4 < len(mcode)
+            and mcode[i] == 0x01
+            and mcode[i + 1] == 0xA4
+            and mcode[i + 2] == 0
+            and mcode[i + 3] == 0xC1
+        )
+
+    def vprefix_at(i):
+        """A four-byte `05 10 e2 0e` prefix, always followed by an
+        `a1 00 c0 81` verb (96% of those verbs take it). Like the two-byte
+        prefixes, its head opens no other form and the anchored verb parses
+        identically after it, so it converts only raw escapes. See the
+        README's "A fixed head with a live tail" section."""
+        return (
+            vprefix
+            and i + 7 < len(mcode)
+            and mcode[i] == 0x05
+            and mcode[i + 1] == 0x10
+            and mcode[i + 2] == 0xE2
+            and mcode[i + 3] == 0x0E
+            and mcode[i + 4] == 0xA1
+            and mcode[i + 5] == 0
+            and mcode[i + 6] == 0xC0
+            and mcode[i + 7] == 0x81
+        )
+
     def _plain_step(i):
         """One greedy step: `(token, next offset)`, no adjudication. With
         `lookahead=0` the walk below is exactly this step repeated, byte for
@@ -226,6 +270,10 @@ def tokenize(
         if pair_prefix_at(i):
             kind = "P" if mcode[i] == 0x0B else "D"
             return (i, kind, mcode[i], mcode[i + 1], 0), i + 2
+        if fixed5_at(i):
+            return (i, "F", mcode[i + 4], 0, 0), i + 5
+        if vprefix_at(i):
+            return (i, "X", 0, 0, 0), i + 4
         if bare and i + 1 < end and mcode[i] in tags and mcode[i + 1] % 2 == 0:
             n = 2 + (1 if mcode[i] in extra_byte_tags else 0)
             return (i, "B", mcode[i], mcode[i + 1], 0), i + n
@@ -361,6 +409,8 @@ def decode(mcode, start=None, end=None, **rule):
     * `Q`: a quintet `[04][a][b][a][b]` (`a`, `b`)
     * `P`: a `0b 91` prefix under its anchored verb (`x`, `y`)
     * `D`: a `05 90` doublet, raw on both bytes (`x`, `y`)
+    * `F`: a fixed `01 a4 00 c1 W` unit (`w`: the one live byte)
+    * `X`: a `05 10 e2 0e` prefix under its anchored verb (no payload)
     * `raw`: one byte no form accounts for (`byte`)
 
     Every record also carries `at`, its offset in the original stream, so
@@ -428,6 +478,10 @@ def decode(mcode, start=None, end=None, **rule):
             out.append({"at": o, "kind": "Q", "a": t[2], "b": t[3]})
         elif kind in ("P", "D"):
             out.append({"at": o, "kind": kind, "a": t[2], "b": t[3]})
+        elif kind == "F":
+            out.append({"at": o, "kind": "F", "w": t[2]})
+        elif kind == "X":
+            out.append({"at": o, "kind": "X"})
         else:
             out.append({"at": o, "kind": "raw", "byte": t[2]})
     return out
@@ -457,6 +511,10 @@ def encode(records):
             out += bytes([0x04, r["a"], r["b"], r["a"], r["b"]])
         elif kind in ("P", "D"):
             out += bytes([r["a"], r["b"]])
+        elif kind == "F":
+            out += bytes([0x01, 0xA4, 0x00, 0xC1, r["w"]])
+        elif kind == "X":
+            out += bytes([0x05, 0x10, 0xE2, 0x0E])
         else:
             out += bytes([r["byte"]])
     return bytes(out)

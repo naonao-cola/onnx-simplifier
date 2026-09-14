@@ -322,3 +322,53 @@ def test_bookend_prefix_pairs(name):
         len(prefixes) + len(doublets),
         len(null),
     )
+
+
+def _synthetic_fx_stream():
+    """A hand-built stream exercising the F and X forms: a verb, a short
+    unit, a bare pair, then a fixed `01 a4 00 c1 W` unit, a `05 10 e2 0e`
+    prefix under its anchored verb, and the verb itself."""
+    return bytes.fromhex(
+        "a1 00 40 02 00000000"  # V
+        "00 08 81 e8"  # S
+        "83 62"  # B
+        "01 a4 00 c1 23"  # F
+        "05 10 e2 0e"  # X
+        "a1 00 c0 81 00000000"  # the anchored verb
+    )
+
+
+def test_fixed_head_and_verb_prefix_codec():
+    """The F (`01 a4 00 c1 W`) and X (`05 10 e2 0e` + anchored verb) forms
+    tokenize, decode and re-encode exactly on a synthetic stream -- the
+    committed fixtures carry neither (both were found in larger whisper and
+    wav2vec2 builds), so this pins the implementation where no fixture can.
+    The real-stream evidence -- 1,690 fixed heads against 1 shuffled, 1,278
+    anchored prefixes -- is in the README's "A fixed head with a live tail"
+    section."""
+    blob = _synthetic_fx_stream()
+    toks = mcode.tokenize(blob, start=0, end=len(blob), **mcode.FULL_RULE)
+    kinds = [t[1] for t in toks]
+    assert kinds == ["V", "S", "B", "F", "X", "V"], kinds
+    assert toks[3][2] == 0x23
+    records = mcode.decode(blob, start=0, end=len(blob), **mcode.FULL_RULE)
+    assert [(r["kind"]) for r in records] == kinds
+    assert [r["w"] for r in records if r["kind"] == "F"] == [0x23]
+    assert mcode.encode(records) == blob
+
+    # The flags plumb through: off means the forms do not fire.
+    plain = dict(mcode.FULL_RULE)
+    plain["fixed5"] = False
+    plain["vprefix"] = False
+    kinds_off = [t[1] for t in mcode.tokenize(blob, start=0, end=len(blob), **plain)]
+    assert "F" not in kinds_off and "X" not in kinds_off, kinds_off
+
+    # The X anchor is load-bearing: the same four bytes without the verb
+    # after them stay raw.
+    unanchored = bytes.fromhex("05 10 e2 0e") + bytes.fromhex("00 08 81 e8")
+    toks = mcode.tokenize(unanchored, start=0, end=len(unanchored), **mcode.FULL_RULE)
+    assert [t[1] for t in toks] == ["?", "?", "?", "?", "S"], [t[1] for t in toks]
+
+    # Neither form's bytes can hide a verb.
+    assert not set(bytes.fromhex("01 a4 00 c1")) & set(mcode.VERBS6)
+    assert not set(bytes.fromhex("05 10 e2 0e")) & set(mcode.VERBS6)

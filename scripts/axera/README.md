@@ -5385,6 +5385,36 @@ and taking it unconditionally was measured to *lose* 1,800 bytes net. Like
 the verb splits before the lookahead, it is an overlap dispute, and it wants
 adjudication, not a guard.
 
+### A fixed head with a live tail
+
+Two more forms, both found the same way -- exact recurrences in the
+unexplained bytes that never occur shuffled -- and both pure addition (they
+fire only where the walk emits raw escapes, with the anchored verbs parsing
+identically after them):
+
+* a fixed five-byte `01 a4 00 c1 W`: the middle never varies across 1,690
+  occurrences (one shuffled counterpart corpus-wide); only the last byte
+  moves, almost always `0x23`/`0x25`. Read it as a short unit with a
+  `0xc1` tag if you like -- `p = 1`, two payload bytes, tag, register --
+  except `0xc1` is not an admitted width tag and the payload never varies,
+  so it walks as one fixed form with a live tail byte instead. Its tail
+  re-parses after it exactly as before (an odd `c1`-`W` pair), which is why
+  admitting it only ever converts raw escapes.
+* a four-byte `05 10 e2 0e` prefix, always followed by an `a1 00 c0 81`
+  verb -- 1,278 of 1,335 of those verbs take it (96%). The companion-style
+  anchor again: fire only under that exact verb. A third prefix length
+  alongside the one-byte `05` seeds and the two-byte `0b 91`, all standing
+  immediately before the verb they modify.
+
+Together they take unexplained bytes 417,023 down to 408,501 with no stream
+regressing; the codec carries them as `F` and `X` records, `check` stays
+clean on all 68 streams. The committed fixtures carry neither -- both were
+found in larger whisper and wav2vec2 builds -- so the test pins the codec
+on a synthetic stream instead (tokenize, records, round-trip, both rule
+toggles, and the anchor: the same four prefix bytes without the verb stay
+raw). What `W` selects, and what distinguishes a prefixed
+`a1 00 c0 81` verb from the 57 unprefixed ones, is open.
+
 ## Per-ONNX-op coverage, and what it caught
 
 `op_coverage.py` classifies every operator in the ai.onnx default domain
