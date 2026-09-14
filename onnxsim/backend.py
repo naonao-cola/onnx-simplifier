@@ -136,6 +136,20 @@ _PROVIDER_INSTALL_HINTS: Dict[str, str] = {
         "https://ryzenai.docs.amd.com/en/latest/linux.html and "
         "https://onnxruntime.ai/docs/execution-providers/Vitis-AI-ExecutionProvider.html"
     ),
+    # Both Axera NPU providers ship in AXERA-TECH/pyaxengine's `axengine`
+    # wheel -- never in a stock onnxruntime wheel. AxEngineExecutionProvider
+    # drives the on-board NPU (AX650/AX630C board); AXCLRTExecutionProvider
+    # drives an AX650 M.2/PCIe card through the AXCL host driver (which must
+    # be installed separately -- see https://axcl-docs.readthedocs.io/).
+    "AxEngineExecutionProvider": (
+        "AXERA-TECH/pyaxengine's `axengine` wheel "
+        "(https://github.com/AXERA-TECH/pyaxengine/releases -- copy the wheel "
+        "onto the board and `pip install` it there)"
+    ),
+    "AXCLRTExecutionProvider": (
+        "AXERA-TECH/pyaxengine's `axengine` wheel plus the AXCL host driver "
+        "for the M.2/PCIe card (https://axcl-docs.readthedocs.io/)"
+    ),
 }
 
 
@@ -205,7 +219,9 @@ def validate_providers(providers: Optional[Sequence[Provider]]) -> None:
             "onnxruntime. Please install it (e.g. `pip install onnxruntime-gpu` "
             "for CUDA, `pip install onnxruntime-rocm` for ROCm, "
             "`pip install onnxruntime-migraphx` for MIGraphX, AMD's Ryzen AI "
-            "Software bundle for the NPU's VitisAIExecutionProvider). "
+            "Software bundle for the NPU's VitisAIExecutionProvider, "
+            "AXERA-TECH/pyaxengine's `axengine` wheel for the Axera NPU's "
+            "AxEngineExecutionProvider/AXCLRTExecutionProvider). "
         )
 
 
@@ -482,6 +498,11 @@ _PROVIDER_DEVICES: Dict[str, str] = {
     # transparently; its session inputs/outputs stay host tensors, so binding
     # on the CPU is correct (and the safe fallback for any unknown provider).
     "VitisAIExecutionProvider": "cpu",
+    # Same for Axera's NPU providers (on-board AxEngine, M.2/PCIe AXCLRT):
+    # whichever subgraphs land on the NPU, the session's own inputs/outputs
+    # stay host tensors, so CPU binding is correct there too.
+    "AxEngineExecutionProvider": "cpu",
+    "AXCLRTExecutionProvider": "cpu",
     "CANNExecutionProvider": "cann",
     "DmlExecutionProvider": "dml",
     "WebGpuExecutionProvider": "webgpu",

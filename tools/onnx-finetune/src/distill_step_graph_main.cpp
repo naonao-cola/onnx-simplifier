@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -35,7 +36,7 @@ namespace {
 
 struct Args {
   std::string step_graph;  // manifest/initial-state paths are derived from this
-  std::string teacher_model;
+  std::string teacher_model;  // optional when --teacher-logits-in is given
   std::string teacher_output_name;
   std::string train_input;
   std::string train_target;  // raw int64 class indices, num_samples of them
@@ -45,6 +46,24 @@ struct Args {
   double lr = 1e-3;
   int log_every = 50;
   std::string output_weights;
+  // The frozen teacher is re-run for every batch of every epoch by default.
+  // On an AX650 that dominates training time, so its logits are computed once
+  // and cached instead (num_samples * teacher_logits_dim floats). Pass
+  // --no-cache-teacher-logits to keep the old behavior on boards too small
+  // to hold the cache.
+  bool cache_teacher_logits = true;
+  // Skip the teacher session entirely and load precomputed logits (raw
+  // float32, num_samples * teacher_logits_dim, row-major) -- e.g. produced
+  // once offline on the NPU via an AxEngineExecutionProvider session, which
+  // this CPU-side training loop otherwise never touches.
+  std::string teacher_logits_in;
+  // Write the cached teacher logits back out in that same layout, for reuse
+  // across runs.
+  std::string teacher_logits_out;
+  // 0 keeps ORT's default; otherwise forwarded to SetIntraOpNumThreads /
+  // SetInterOpNumThreads (lets a co-running camera/ISP pipeline keep cores).
+  int intra_op_threads = 0;
+  int inter_op_threads = 0;
 };
 
 [[noreturn]] void Usage(const char* prog) {
@@ -52,7 +71,10 @@ struct Args {
       "usage: %s --step-graph FILE --teacher-model FILE\n"
       "          --train-input FILE --train-target FILE --num-samples N\n"
       "          --batch-size N --output-weights FILE\n"
-      "          [--epochs N] [--lr F] [--log-every N] [--teacher-output-name NAME]\n\n"
+      "          [--epochs N] [--lr F] [--log-every N] [--teacher-output-name NAME]\n"
+      "          [--no-cache-teacher-logits] [--teacher-logits-in FILE]\n"
+      "          [--teacher-logits-out FILE]\n"
+      "          [--intra-op-threads N] [--inter-op-threads N]\n\n"
       "FILE is a step graph from scripts/generate_distillation_step_graph.py;\n"
       "FILE.manifest.txt and FILE.initial_state.bin (written alongside it) are\n"
       "read too. --train-input is a raw contiguous float32 binary file\n"
@@ -65,6 +87,14 @@ struct Args {
       "fixed when the graph was built. The final step of each epoch uses\n"
       "whatever is left when num_samples does not divide evenly by\n"
       "--batch-size, rather than dropping it.\n\n"
+      "The frozen teacher's logits are computed once and cached by default\n"
+      "(--no-cache-teacher-logits restores per-epoch re-inference for boards\n"
+      "too small to hold the num_samples * teacher_logits_dim float cache).\n"
+      "--teacher-logits-in skips the teacher model entirely and loads\n"
+      "precomputed logits instead (raw float32, same layout) -- produce them\n"
+      "once on the NPU via an AxEngineExecutionProvider session and reuse them\n"
+      "across runs; --teacher-model may then be omitted. --teacher-logits-out\n"
+      "writes the cache back out in that layout.\n\n"
       "Writes the final weights as a raw float32 blob to --output-weights, in\n"
       "the manifest's own order -- reassemble them into an inference-ready\n"
       ".onnx with scripts/apply_trained_weights.py.\n",
@@ -91,15 +121,24 @@ Args ParseArgs(int argc, char** argv) {
     else if (arg == "--lr") a.lr = std::stod(need(i));
     else if (arg == "--log-every") a.log_every = std::stoi(need(i));
     else if (arg == "--output-weights") a.output_weights = need(i);
+    else if (arg == "--no-cache-teacher-logits") a.cache_teacher_logits = false;
+    else if (arg == "--teacher-logits-in") a.teacher_logits_in = need(i);
+    else if (arg == "--teacher-logits-out") a.teacher_logits_out = need(i);
+    else if (arg == "--intra-op-threads") a.intra_op_threads = std::stoi(need(i));
+    else if (arg == "--inter-op-threads") a.inter_op_threads = std::stoi(need(i));
     else if (arg == "-h" || arg == "--help") Usage(argv[0]);
     else {
       std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
       Usage(argv[0]);
     }
   }
-  if (a.step_graph.empty() || a.teacher_model.empty() || a.train_input.empty() ||
+  if (a.step_graph.empty() || a.train_input.empty() ||
       a.train_target.empty() || a.num_samples <= 0 || a.batch_size <= 0 ||
       a.output_weights.empty()) {
+    Usage(argv[0]);
+  }
+  if (a.teacher_model.empty() && a.teacher_logits_in.empty()) {
+    std::fprintf(stderr, "error: --teacher-model is required unless --teacher-logits-in is given\n");
     Usage(argv[0]);
   }
   return a;
@@ -133,6 +172,19 @@ std::vector<int64_t> ReadRawInt64s(const std::string& path, size_t expected_coun
     std::exit(1);
   }
   return data;
+}
+
+void WriteRawFloats(const std::string& path, const std::vector<float>& data) {
+  std::ofstream f(path, std::ios::binary);
+  if (!f) {
+    std::fprintf(stderr, "error: cannot open %s for writing\n", path.c_str());
+    std::exit(1);
+  }
+  f.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(float));
+  if (!f) {
+    std::fprintf(stderr, "error: failed writing %s\n", path.c_str());
+    std::exit(1);
+  }
 }
 
 // Returns the sole input/output name of a single-input/single-output
@@ -270,12 +322,21 @@ int main(int argc, char** argv) {
 
   Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "onnx-finetune-distill-step-graph");
   Ort::SessionOptions session_options;
+  if (args.intra_op_threads > 0) session_options.SetIntraOpNumThreads(args.intra_op_threads);
+  if (args.inter_op_threads > 0) session_options.SetInterOpNumThreads(args.inter_op_threads);
   Ort::Session step_session(env, args.step_graph.c_str(), session_options);
-  Ort::Session teacher_session(env, args.teacher_model.c_str(), session_options);
-  std::string teacher_input_name = SoleIoName(teacher_session, /*is_input=*/true, "teacher");
-  std::string teacher_output_name = !args.teacher_output_name.empty()
-      ? args.teacher_output_name
-      : SoleIoName(teacher_session, /*is_input=*/false, "teacher");
+  // Optional: absent when --teacher-logits-in supplies precomputed logits
+  // (e.g. run once on the NPU via an AxEngineExecutionProvider session).
+  std::unique_ptr<Ort::Session> teacher_session;
+  std::string teacher_input_name;
+  std::string teacher_output_name;
+  if (args.teacher_logits_in.empty()) {
+    teacher_session = std::make_unique<Ort::Session>(env, args.teacher_model.c_str(), session_options);
+    teacher_input_name = SoleIoName(*teacher_session, /*is_input=*/true, "teacher");
+    teacher_output_name = !args.teacher_output_name.empty()
+        ? args.teacher_output_name
+        : SoleIoName(*teacher_session, /*is_input=*/false, "teacher");
+  }
 
   // Every state tensor's current value -- weights start from the student
   // model's own trained-so-far values (.initial_state.bin); Adam's __m/__v
@@ -308,8 +369,45 @@ int main(int argc, char** argv) {
 
   std::vector<float> inputs = ReadRawFloats(args.train_input, static_cast<size_t>(args.num_samples) * input_dim);
   std::vector<int64_t> labels = ReadRawInt64s(args.train_target, static_cast<size_t>(args.num_samples));
+  for (int64_t i = 0; i < args.num_samples; ++i) {
+    if (labels[static_cast<size_t>(i)] < 0 || labels[static_cast<size_t>(i)] >= manifest.num_classes) {
+      std::fprintf(stderr, "error: train-target[%lld] = %lld out of range [0, %lld)\n",
+                   static_cast<long long>(i), static_cast<long long>(labels[static_cast<size_t>(i)]),
+                   static_cast<long long>(manifest.num_classes));
+      std::exit(1);
+    }
+  }
 
   Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+  // Frozen-teacher logits, computed once up front instead of re-running the
+  // teacher for every batch of every epoch. The teacher dominates step time
+  // on the AX650's small ARM cores, so this turns epochs * num_samples
+  // teacher forwards into exactly num_samples (or zero, with
+  // --teacher-logits-in). Values are per-sample, so caching is bit-identical
+  // to re-inference regardless of the training shuffle.
+  std::vector<float> teacher_logits_cache;
+  if (!args.teacher_logits_in.empty()) {
+    teacher_logits_cache =
+        ReadRawFloats(args.teacher_logits_in, static_cast<size_t>(args.num_samples) * teacher_logits_dim);
+  } else if (args.cache_teacher_logits) {
+    teacher_logits_cache.resize(static_cast<size_t>(args.num_samples) * teacher_logits_dim);
+    const char* teacher_input_names[] = {teacher_input_name.c_str()};
+    const char* teacher_output_names[] = {teacher_output_name.c_str()};
+    for (int64_t start = 0; start < args.num_samples; start += max_batch_size) {
+      const int64_t current_batch_size = std::min(max_batch_size, args.num_samples - start);
+      const std::vector<int64_t> input_shape = ResolveShape(manifest.input_shape, current_batch_size);
+      Ort::Value teacher_input = Ort::Value::CreateTensor<float>(
+          mem_info, inputs.data() + start * input_dim,
+          static_cast<size_t>(current_batch_size) * input_dim, input_shape.data(), input_shape.size());
+      auto teacher_outputs = teacher_session->Run(
+          Ort::RunOptions{nullptr}, teacher_input_names, &teacher_input, 1, teacher_output_names, 1);
+      std::copy_n(teacher_outputs[0].GetTensorData<float>(),
+                  static_cast<size_t>(current_batch_size) * teacher_logits_dim,
+                  teacher_logits_cache.begin() + start * teacher_logits_dim);
+    }
+    if (!args.teacher_logits_out.empty()) WriteRawFloats(args.teacher_logits_out, teacher_logits_cache);
+  }
 
   std::vector<int64_t> order(args.num_samples);
   std::iota(order.begin(), order.end(), 0);
@@ -333,32 +431,50 @@ int main(int argc, char** argv) {
     output_name_ptrs.push_back(state_output.c_str());
   }
 
+  // Reused across steps (only contents/sizes change) to avoid re-allocating
+  // shapes and the feed vectors on every step -- noticeable on the AX650's
+  // small ARM cores when batch_size is small and steps are many.
+  std::vector<int64_t> input_shape;
+  std::vector<int64_t> teacher_logits_shape;
+  std::vector<int64_t> onehot_shape(2);
+  std::vector<int64_t> scalar_shape;  // rank 0, always empty
+  std::vector<Ort::Value> feeds;
+  std::vector<const char*> feed_names;
+  feeds.reserve(7 + manifest.state.size());
+  feed_names.reserve(7 + manifest.state.size());
+
   int64_t global_step = 0;
   for (int64_t epoch = 0; epoch < args.epochs; ++epoch) {
     std::shuffle(order.begin(), order.end(), rng);
 
     for (int64_t start = 0; start < args.num_samples; start += max_batch_size) {
       const int64_t current_batch_size = std::min(max_batch_size, args.num_samples - start);
-      const std::vector<int64_t> input_shape = ResolveShape(manifest.input_shape, current_batch_size);
-      const std::vector<int64_t> teacher_logits_shape =
-          ResolveShape(manifest.teacher_logits_shape, current_batch_size);
-      const std::vector<int64_t> onehot_shape = {current_batch_size, manifest.num_classes};
+      input_shape = ResolveShape(manifest.input_shape, current_batch_size);
+      teacher_logits_shape = ResolveShape(manifest.teacher_logits_shape, current_batch_size);
+      onehot_shape[0] = current_batch_size;
+      onehot_shape[1] = manifest.num_classes;
 
       for (int64_t b = 0; b < current_batch_size; ++b) {
         int64_t src = order[start + b];
         std::copy_n(inputs.begin() + src * input_dim, input_dim, batch_input.begin() + b * input_dim);
         batch_labels[b] = labels[src];
+        if (!teacher_logits_cache.empty()) {
+          std::copy_n(teacher_logits_cache.begin() + src * teacher_logits_dim, teacher_logits_dim,
+                      batch_teacher_logits.begin() + b * teacher_logits_dim);
+        }
       }
 
-      const char* teacher_input_names[] = {teacher_input_name.c_str()};
-      const char* teacher_output_names[] = {teacher_output_name.c_str()};
-      Ort::Value teacher_input = Ort::Value::CreateTensor<float>(
-          mem_info, batch_input.data(), static_cast<size_t>(current_batch_size) * input_dim,
-          input_shape.data(), input_shape.size());
-      auto teacher_outputs = teacher_session.Run(
-          Ort::RunOptions{nullptr}, teacher_input_names, &teacher_input, 1, teacher_output_names, 1);
-      std::copy_n(teacher_outputs[0].GetTensorData<float>(),
-                  static_cast<size_t>(current_batch_size) * teacher_logits_dim, batch_teacher_logits.begin());
+      if (teacher_logits_cache.empty()) {
+        const char* teacher_input_names[] = {teacher_input_name.c_str()};
+        const char* teacher_output_names[] = {teacher_output_name.c_str()};
+        Ort::Value teacher_input = Ort::Value::CreateTensor<float>(
+            mem_info, batch_input.data(), static_cast<size_t>(current_batch_size) * input_dim,
+            input_shape.data(), input_shape.size());
+        auto teacher_outputs = teacher_session->Run(
+            Ort::RunOptions{nullptr}, teacher_input_names, &teacher_input, 1, teacher_output_names, 1);
+        std::copy_n(teacher_outputs[0].GetTensorData<float>(),
+                    static_cast<size_t>(current_batch_size) * teacher_logits_dim, batch_teacher_logits.begin());
+      }
 
       // The one-hot label matrix, built here on the host rather than in the
       // step graph itself -- see generate_distillation_step_graph.py's
@@ -369,8 +485,8 @@ int main(int argc, char** argv) {
         batch_onehot[static_cast<size_t>(r) * manifest.num_classes + batch_labels[r]] = 1.0f;
       }
 
-      std::vector<Ort::Value> feeds;
-      std::vector<const char*> feed_names;
+      feeds.clear();
+      feed_names.clear();
       feed_names.push_back(manifest.input_name.c_str());
       feeds.push_back(Ort::Value::CreateTensor<float>(
           mem_info, batch_input.data(), static_cast<size_t>(current_batch_size) * input_dim,
@@ -388,7 +504,6 @@ int main(int argc, char** argv) {
       float m_correction = static_cast<float>(1.0 / (1.0 - std::pow(0.9, global_step + 1)));
       float v_correction = static_cast<float>(1.0 / (1.0 - std::pow(0.999, global_step + 1)));
       float batch_size_f = static_cast<float>(current_batch_size);
-      std::vector<int64_t> scalar_shape;  // rank 0
       feed_names.push_back("lr");
       feeds.push_back(Ort::Value::CreateTensor<float>(mem_info, &lr, 1, scalar_shape.data(), 0));
       feed_names.push_back("m_correction");

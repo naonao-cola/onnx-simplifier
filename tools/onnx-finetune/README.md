@@ -416,7 +416,39 @@ that module's own docstring for the full scope statement.
 | `--save-checkpoint` | no | also save the post-training checkpoint (for resuming training later) |
 | `--log-every` | no (default 50) | print loss every N steps; 0 disables |
 | `--label-dtype` | no (default `float32`) | `int64` for class-index labels (`--loss cross-entropy`) |
+| `--intra-op-threads` / `--inter-op-threads` | no (default `0` = ORT default) | cap ORT's thread pools so a co-running camera/ISP pipeline keeps cores |
 
 `onnx-finetune-distill-step-graph`'s own flags are different (no `--artifacts-dir`,
 `--input-dim`/`--target-dim`, `--output-names`, or `--label-dtype`) -- see its own `--help` or
-the "Knowledge distillation" section above.
+the "Knowledge distillation" section above. It additionally accepts
+`--no-cache-teacher-logits`, `--teacher-logits-in/--teacher-logits-out`, and the same
+`--intra-op-threads`/`--inter-op-threads` -- see "Running on Axera AX650" below.
+
+## Running on Axera AX650
+
+Both binaries run on the AX650's ARM cores with a plain `onnxruntime` build --
+no NPU execution provider is linked into the training loop itself, deliberately:
+the step graph contains training-only ops (gradient/Adam updates) the NPU cannot
+execute, and the NPU needs Pulsar-compiled `.axmodel` files, not plain `.onnx`.
+What the NPU *can* do is the frozen teacher forward pass, once, offline:
+
+```sh
+# On the AX650 (or anywhere with AxEngineExecutionProvider): run the teacher
+# once over the training set and save raw float32 logits
+# (num_samples * num_classes, row-major) -- e.g. via pyaxengine.
+# Then train with no teacher model at all:
+./build/onnx-finetune-distill-step-graph \
+  --step-graph step.onnx --teacher-logits-in teacher_logits.bin \
+  --train-input train_input.bin --train-target train_labels.bin --num-samples 2048 \
+  --batch-size 32 --epochs 20 --lr 0.01 --output-weights final_weights.bin \
+  --intra-op-threads 4
+```
+
+Without `--teacher-logits-in`, the tool still avoids re-running the teacher every
+epoch: logits are computed once up front and cached (`--teacher-logits-out` writes
+that cache for reuse; `--no-cache-teacher-logits` restores per-epoch re-inference
+for boards too small to hold the `num_samples * teacher_logits_dim` float cache).
+`--intra-op-threads`/`--inter-op-threads` (both tools) cap ORT's pools so training
+doesn't starve a co-running camera pipeline. `onnx-finetune` additionally trains
+the final partial batch now instead of dropping it when `--num-samples` isn't a
+multiple of `--batch-size`.

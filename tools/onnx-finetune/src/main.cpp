@@ -38,6 +38,12 @@ struct Args {
   std::string output_names;   // comma-separated
   std::string save_checkpoint;
   int log_every = 50;
+  // On small SoCs (e.g. Axera AX650) the default thread-pool sizing can steal
+  // cores from a co-running camera/ISP pipeline -- 0 keeps ORT's default,
+  // otherwise the value is forwarded to SetIntraOpNumThreads /
+  // SetInterOpNumThreads.
+  int intra_op_threads = 0;
+  int inter_op_threads = 0;
   // "float32" (default, unchanged behavior) or "int64" -- SoftmaxCrossEntropyLoss
   // (--loss cross-entropy in generate_artifacts.py) needs int64 class-index
   // labels, not float32.
@@ -50,7 +56,8 @@ struct Args {
       "          --input-dim N --target-dim N --num-samples N\n"
       "          --output-model FILE --output-names name1,name2,...\n"
       "          [--batch-size N] [--epochs N] [--lr F] [--save-checkpoint FILE]\n"
-      "          [--log-every N] [--label-dtype float32|int64]\n\n"
+      "          [--log-every N] [--label-dtype float32|int64]\n"
+      "          [--intra-op-threads N] [--inter-op-threads N]\n\n"
       "Trains against artifacts produced by scripts/generate_artifacts.py.\n"
       "--train-input is a raw contiguous float32 binary file\n"
       "  (num_samples * input_dim floats). --train-target is float32 by\n"
@@ -96,6 +103,8 @@ Args ParseArgs(int argc, char** argv) {
     else if (arg == "--output-names") a.output_names = need(i);
     else if (arg == "--save-checkpoint") a.save_checkpoint = need(i);
     else if (arg == "--log-every") a.log_every = std::stoi(need(i));
+    else if (arg == "--intra-op-threads") a.intra_op_threads = std::stoi(need(i));
+    else if (arg == "--inter-op-threads") a.inter_op_threads = std::stoi(need(i));
     else if (arg == "--label-dtype") a.label_dtype = need(i);
     else if (arg == "-h" || arg == "--help") Usage(argv[0]);
     else {
@@ -173,6 +182,8 @@ int main(int argc, char** argv) {
 
   Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "onnx-finetune");
   Ort::SessionOptions session_options;
+  if (args.intra_op_threads > 0) session_options.SetIntraOpNumThreads(args.intra_op_threads);
+  if (args.inter_op_threads > 0) session_options.SetInterOpNumThreads(args.inter_op_threads);
 
   auto checkpoint_state = Ort::CheckpointState::LoadCheckpoint(args.artifacts_dir + "/checkpoint");
   Ort::TrainingSession train_session(
@@ -189,21 +200,35 @@ int main(int argc, char** argv) {
   std::iota(order.begin(), order.end(), 0);
   std::mt19937 rng(42);
 
-  std::vector<float> batch_input(static_cast<size_t>(args.batch_size) * args.input_dim);
+  // Sized for the largest batch this run ever feeds (--batch-size); the last
+  // step of an epoch, when num_samples does not divide evenly, uses a
+  // smaller current_batch_size and just leaves the tail of each buffer
+  // unused.
+  const int64_t max_batch_size = args.batch_size;
+  std::vector<float> batch_input(static_cast<size_t>(max_batch_size) * args.input_dim);
   std::vector<float> batch_target_floats;
   std::vector<int64_t> batch_target_int64s;
   if (args.label_dtype == "int64") {
-    batch_target_int64s.resize(static_cast<size_t>(args.batch_size) * args.target_dim);
+    batch_target_int64s.resize(static_cast<size_t>(max_batch_size) * args.target_dim);
   } else {
-    batch_target_floats.resize(static_cast<size_t>(args.batch_size) * args.target_dim);
+    batch_target_floats.resize(static_cast<size_t>(max_batch_size) * args.target_dim);
   }
+
+  // Reused across steps (only their contents/sizes change) to avoid
+  // re-allocating shapes and the feed vector on every step -- noticeable on
+  // the AX650's small ARM cores when batch_size is small and steps are many.
+  std::vector<int64_t> in_shape(2);
+  std::vector<int64_t> tgt_shape(2);
+  std::vector<Ort::Value> step_inputs;
+  step_inputs.reserve(2);
 
   int64_t global_step = 0;
   for (int64_t epoch = 0; epoch < args.epochs; ++epoch) {
     std::shuffle(order.begin(), order.end(), rng);
 
-    for (int64_t start = 0; start + args.batch_size <= args.num_samples; start += args.batch_size) {
-      for (int64_t b = 0; b < args.batch_size; ++b) {
+    for (int64_t start = 0; start < args.num_samples; start += max_batch_size) {
+      const int64_t current_batch_size = std::min(max_batch_size, args.num_samples - start);
+      for (int64_t b = 0; b < current_batch_size; ++b) {
         int64_t src = order[start + b];
         std::copy_n(inputs.begin() + src * args.input_dim, args.input_dim,
                     batch_input.begin() + b * args.input_dim);
@@ -216,24 +241,34 @@ int main(int argc, char** argv) {
         }
       }
 
-      std::vector<int64_t> in_shape = {args.batch_size, args.input_dim};
+      in_shape[0] = current_batch_size;
+      in_shape[1] = args.input_dim;
       // int64 labels are rank 1 (batch,) -- see ParseArgs's --target-dim
       // check above for why -- float32 targets stay rank 2 (batch, target_dim)
       // as before, for the regression --loss modes' arbitrary output_dim.
-      std::vector<int64_t> tgt_shape = args.label_dtype == "int64"
-          ? std::vector<int64_t>{args.batch_size}
-          : std::vector<int64_t>{args.batch_size, args.target_dim};
+      size_t tgt_rank;
+      if (args.label_dtype == "int64") {
+        tgt_shape[0] = current_batch_size;
+        tgt_rank = 1;
+      } else {
+        tgt_shape[0] = current_batch_size;
+        tgt_shape[1] = args.target_dim;
+        tgt_rank = 2;
+      }
 
-      std::vector<Ort::Value> step_inputs;
+      step_inputs.clear();
       step_inputs.push_back(Ort::Value::CreateTensor<float>(
-          mem_info, batch_input.data(), batch_input.size(), in_shape.data(), in_shape.size()));
+          mem_info, batch_input.data(), static_cast<size_t>(current_batch_size) * args.input_dim,
+          in_shape.data(), in_shape.size()));
 
       if (args.label_dtype == "int64") {
         step_inputs.push_back(Ort::Value::CreateTensor<int64_t>(
-            mem_info, batch_target_int64s.data(), batch_target_int64s.size(), tgt_shape.data(), tgt_shape.size()));
+            mem_info, batch_target_int64s.data(), static_cast<size_t>(current_batch_size) * args.target_dim,
+            tgt_shape.data(), tgt_rank));
       } else {
         step_inputs.push_back(Ort::Value::CreateTensor<float>(
-            mem_info, batch_target_floats.data(), batch_target_floats.size(), tgt_shape.data(), tgt_shape.size()));
+            mem_info, batch_target_floats.data(), static_cast<size_t>(current_batch_size) * args.target_dim,
+            tgt_shape.data(), tgt_rank));
       }
 
       auto step_outputs = train_session.TrainStep(step_inputs);

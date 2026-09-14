@@ -325,3 +325,36 @@ def test_npu_provider_binds_on_cpu():
     assert backend._binding_device(
         [("VitisAIExecutionProvider", {"config_file": "vaip_config.json"})]
     ) == ("cpu", 0)
+
+
+@pytest.mark.skipif(
+    not backend.has_onnxruntime(), reason="requires onnxruntime for provider selection"
+)
+@pytest.mark.parametrize(
+    "provider", ["AxEngineExecutionProvider", "AXCLRTExecutionProvider"]
+)
+def test_unavailable_axera_provider_hint_mentions_pyaxengine(provider):
+    # Both Axera NPU providers ship in AXERA-TECH/pyaxengine's `axengine`
+    # wheel, never in a stock onnxruntime wheel -- so when one is missing
+    # (the normal state off the board), the error must point at pyaxengine
+    # rather than at `onnxruntime-gpu`.
+    import onnxruntime as rt
+
+    if provider in rt.get_available_providers():
+        pytest.skip(f"{provider} is available; cannot test the missing path")
+    model = _make_foldable_model()
+    with pytest.raises(ValueError, match="pyaxengine"):
+        backend.run_model(
+            model,
+            {"x": np.zeros((2, 2), np.float32)},
+            providers=[provider, "CPUExecutionProvider"],
+        )
+
+
+@pytest.mark.parametrize(
+    "provider", ["AxEngineExecutionProvider", "AXCLRTExecutionProvider"]
+)
+def test_axera_provider_binds_on_cpu(provider):
+    # Whichever subgraphs land on the Axera NPU, the session's own
+    # inputs/outputs stay host tensors, so loop binding goes on the CPU.
+    assert backend._binding_device([provider, "CPUExecutionProvider"]) == ("cpu", 0)
