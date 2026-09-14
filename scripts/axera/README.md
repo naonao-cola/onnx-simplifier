@@ -6012,6 +6012,40 @@ The practical consequence: **accuracy on this NPU can be searched offline.**
 Precision configurations and calibration sets can be scored against a build's
 own quantisation table with no card and no rebuild.
 
+### Searching calibration parameters offline
+
+`calib_search.py` is that search, looped: rebuild a model over a
+calibration-method x calibration-size grid, rank the cells by replay SNR.
+The first thing it caught was in the replay itself, not the grid: a
+per-tensor *symmetric* activation (a tiny attention probe came back with a
+symmetric model input) was clipped to `[0, 255]` instead of `[-128, 127]`,
+zeroing every negative input value and inventing ~40 dB of error that is
+not on the card. The table carries each tensor's own `quant_min`/
+`quant_max`; the replay now reads them instead of assuming unsigned.
+Real builds never tripped this because their quantised tensors happened to
+be asymmetric -- which is exactly why it survived validation.
+
+The grid, on three single-purpose probes (group-32 depthwise conv, last-axis
+LayerNorm, MatMul/Softmax/MatMul attention with folded K/V -- Pulsar2
+7.0-lite, replay SNR in dB, mean (min) over 5 inputs):
+
+| probe | MinMax 8/32 | Percentile 8/32 | MSE/KL (both sizes) |
+| --- | --- | --- | --- |
+| depthwise | 36.0 (35.7) / 35.6 (35.3) | 36.9 (35.7) / 36.5 (34.7) | == MinMax |
+| layernorm | 40.5 (29.0) / 41.5 (40.0) | 26.1 (22.5) / 30.3 (23.8) | == MinMax |
+| attn | 36.2 (32.1) / 34.8 (32.3) | 32.9 (29.6) / 34.2 (30.1) | == MinMax |
+
+Three findings, all actionable. First, `MSE` and `KL` fall back to `MinMax`
+on these graphs: byte-identical scales at every size, so do not trust the
+method name -- diff the scales (`tables_equal()` in the script does exactly
+that and reports it mid-sweep). Second, LayerNorm wants `MinMax` and enough
+samples: 8 samples leave the range underestimated badly enough that one
+input in five clips to 29 dB, while 32 hold every seed above 40 dB; and
+`Percentile` is actively harmful there (~26 dB), trimming exactly the tails
+a normaliser needs. Third, everywhere else the choice barely matters (conv
+and attention saturate by 8 samples; method differences are ~1 dB noise),
+so the default (`MinMax`, size 32) is the right default.
+
 **Where it is not yet faithful: fusion.** On the full Audio8 decoder the
 replay reads 3.65 dB against the card's 7.37. `quant/quant_axmodel.onnx` is
 the graph Pulsar2 actually lowers, and 385 of the float graph's 1002 tensors

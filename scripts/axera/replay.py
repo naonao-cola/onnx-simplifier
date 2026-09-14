@@ -89,11 +89,16 @@ def surviving_edges(build_dir, quantising_only=False):
 
 
 def load_scales(build_dir, fused_aware=True, quantising_only=False):
-    """`{tensor: (bit_width, scale, zero_point, per_channel, axis)}` for a build.
+    """`{tensor: (bit_width, scale, zero_point, per_channel, axis, quant_min,
+    quant_max)}` for a build.
 
     `quant_axmodel.json` stores one config per (op, tensor) pair and hashes
     into a shared `values` table, so a tensor consumed by several ops appears
     several times; the entries agree, and the first one carrying a value wins.
+    `quant_min`/`quant_max` are the table's own code range for the tensor --
+    `[-2**(b-1), 2**(b-1)-1]` for a symmetric entry, `[0, 2**b-1]` for an
+    asymmetric one -- or that same unsigned fallback when an entry predates
+    the fields.
 
     `fused_aware` drops the tensors `surviving_edges` says the compiler fused
     away. Weights are always kept -- fusion does not stop a weight being
@@ -125,6 +130,8 @@ def load_scales(build_dir, fused_aware=True, quantising_only=False):
                 np.asarray(value["zero_point"], dtype=np.float64),
                 bool(policy.get("PER_CHANNEL")),
                 None,
+                float(entry.get("quant_min", 0)),
+                float(entry.get("quant_max", 2 ** entry["bit_width"] - 1)),
             )
     return out
 
@@ -140,9 +147,12 @@ def insert_qdq(model, scales):
 
     Every tensor the table knows about gets a `QuantizeLinear` /
     `DequantizeLinear` pair at its producer: activations per tensor and
-    asymmetric, weights per output channel and symmetric. Tensors the table
-    does not mention (shape operands, anything the compiler kept in float)
-    are left alone.
+    weights per output channel and symmetric. Activations are usually
+    asymmetric, but a symmetric entry quantises into its own signed range
+    (`quant_min`/`quant_max` from the table) rather than `[0, 2**bits-1]` --
+    clipping a symmetric tensor's negatives to zero invents tens of dB of
+    error that is not on the card. Tensors the table does not mention
+    (shape operands, anything the compiler kept in float) are left alone.
 
     Returns `(model, n_activations, n_weights)`.
     """
@@ -173,7 +183,7 @@ def insert_qdq(model, scales):
         entry = scales.get(node.input[1])
         if init is None or entry is None:
             continue
-        bits, scale, zero, per_channel, _ = entry
+        bits, scale, zero, per_channel, _, _, _ = entry
         w = numpy_helper.to_array(init).astype(np.float32)
         axis = _weight_axis(node, w.ndim) if per_channel else None
         s = (
@@ -197,11 +207,11 @@ def insert_qdq(model, scales):
     # moved on the way (`ReduceMean`'s `axes` became an input at 18). The
     # arithmetic form runs at whatever opset the model already declares, and
     # ONNX `Round` is round-half-to-even, the same rule `QuantizeLinear` uses.
-    def fake_quant(raw, out, bits, scale, zero):
+    def fake_quant(raw, out, bits, scale, zero, lo, hi):
         s_name = const(unique(f"{out}_s"), np.float32(scale))
         z_name = const(unique(f"{out}_z"), np.float32(zero))
-        lo_name = const(unique(f"{out}_lo"), np.float32(0.0))
-        hi_name = const(unique(f"{out}_hi"), np.float32(2**bits - 1))
+        lo_name = const(unique(f"{out}_lo"), np.float32(lo))
+        hi_name = const(unique(f"{out}_hi"), np.float32(hi))
         t = [unique(f"{out}_t{i}") for i in range(4)]
         return [
             helper.make_node("Div", [raw, s_name], [t[0]], name=unique(f"{out}_Q0")),
@@ -225,14 +235,20 @@ def insert_qdq(model, scales):
             entry = scales.get(out)
             if entry is None or out in inits:
                 continue
-            bits, scale, zero, per_channel, _ = entry
+            bits, scale, zero, per_channel, _, qmin, qmax = entry
             if per_channel or bits not in _ACTIVATION_BITS:
                 continue
             raw = unique(f"{out}_pre_q")
             node.output[i] = raw
             new_nodes.extend(
                 fake_quant(
-                    raw, out, bits, float(scale.reshape(())), float(zero.reshape(()))
+                    raw,
+                    out,
+                    bits,
+                    float(scale.reshape(())),
+                    float(zero.reshape(())),
+                    qmin,
+                    qmax,
                 )
             )
             n_act += 1
@@ -246,7 +262,7 @@ def insert_qdq(model, scales):
         entry = scales.get(inp.name)
         if entry is None:
             continue
-        bits, scale, zero, per_channel, _ = entry
+        bits, scale, zero, per_channel, _, qmin, qmax = entry
         if per_channel or bits not in _ACTIVATION_BITS:
             continue
         renamed = unique(f"{inp.name}_in")
@@ -261,6 +277,8 @@ def insert_qdq(model, scales):
                 bits,
                 float(scale.reshape(())),
                 float(zero.reshape(())),
+                qmin,
+                qmax,
             )
         )
         n_act += 1
