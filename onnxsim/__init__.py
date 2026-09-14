@@ -54,6 +54,7 @@ from onnxsim.deepseek_fp8 import apply_deepseek_fp8, quantize_dequantize_block_f
 from onnxsim.detectron_export import export_detectron_model
 from onnxsim.diffusion_export import export_diffusion_model
 from onnxsim.double_quantization import apply_double_quantization
+from onnxsim.drivetransformer_export import export_drivetransformer_model
 from onnxsim.drop_by_drop import (
     quantize_weight_only_drop_by_drop,
     select_drop_by_drop_prefix,
@@ -641,6 +642,7 @@ __all__ = [
     "export_diffusion_model",
     "export_detectron_model",
     "export_sam2_model",
+    "export_drivetransformer_model",
     "export_mlir",
     "export_coreml",
     "export_tflite",
