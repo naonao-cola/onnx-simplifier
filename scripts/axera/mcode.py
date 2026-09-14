@@ -58,11 +58,14 @@ FULL_RULE = dict(
     odd_tags={0xC1, 0xE1},
     companion=True,
     quintet=True,
+    lookahead=64,
 )
 """Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
 six verbs -- the README's "The tail is the segment table" section -- plus
 the `[04][a][b][a][b]` quintet ("A five-byte form that programs its pair
-twice")."""
+twice"). `lookahead` adjudicates the overlaps the greedy walk cannot see
+past ("Adjudicating the overlaps ..."); 64 bytes is where the corpus-wide
+gain converges (32 is slightly worse, 128 no better)."""
 
 TAIL_VECTOR = bytes.fromhex("05000000200000002c000000500000007400000098000000")
 """The FlatBuffers vector of five table offsets that opens an mcode blob's
@@ -81,6 +84,7 @@ def tokenize(
     odd_tags=frozenset(),
     companion=False,
     quintet=False,
+    lookahead=0,
 ):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
@@ -93,6 +97,16 @@ def tokenize(
     a=X, b=field, c=bank), 'Q' (a quintet `[04][a][b][a][b]`: a five-byte
     unit repeating its last two payload bytes -- see the README's "A
     five-byte form that programs its pair twice" section) or '?' (a=byte).
+
+    Where a short unit ending in `a1 00` overlaps a verb beginning there,
+    the greedy walk cannot tell a genuine tag from a swallowed verb head by
+    looking at those two bytes alone. With `lookahead > 0` both parses are
+    walked for that many bytes and the one leaving fewer unexplained
+    non-zero bytes wins (ties keep the short unit) -- see the README's
+    "Adjudicating the overlaps the greedy walk cannot see past" section.
+    `lookahead=0` (the default) is the historical greedy walk, byte for
+    byte.
+
     The defaults
     (tags 0x81..0x84, p <= 3, no bare pairs, no extra bytes, stop 252 bytes
     before the end) are the original narrow rule; `tags=ALL_TAGS, pmax=4,
@@ -155,12 +169,12 @@ def tokenize(
             and mcode[i + 2] == mcode[i + 4]
         )
 
-    out, i = [], start
-    while i < end:
+    def _plain_step(i):
+        """One greedy step: `(token, next offset)`, no adjudication. With
+        `lookahead=0` the walk below is exactly this step repeated, byte for
+        byte the historical walk."""
         if companion_at(i):
-            out.append((i, "W", mcode[i], mcode[i + 1], mcode[i + 2]))
-            i += 7
-            continue
+            return (i, "W", mcode[i], mcode[i + 1], mcode[i + 2]), i + 7
         if is_verb(i):
             n = (
                 7
@@ -170,24 +184,55 @@ def tokenize(
                 )
                 else 8
             )
-            out.append((i, "V", mcode[i], mcode[i + 2], mcode[i + 3]))
-        elif short_len(i):
-            n = short_len(i)
-            out.append((i, "S", mcode[i], mcode[i + n - 2], mcode[i + 1]))
-        elif quintet_at(i):
-            n = 5
-            out.append((i, "Q", mcode[i + 1], mcode[i + 2], 0))
-        elif bare and i + 1 < end and mcode[i] in tags and mcode[i + 1] % 2 == 0:
+            return (i, "V", mcode[i], mcode[i + 2], mcode[i + 3]), i + n
+        sl = short_len(i)
+        if sl:
+            return (i, "S", mcode[i], mcode[i + sl - 2], mcode[i + 1]), i + sl
+        if quintet_at(i):
+            return (i, "Q", mcode[i + 1], mcode[i + 2], 0), i + 5
+        if bare and i + 1 < end and mcode[i] in tags and mcode[i + 1] % 2 == 0:
             n = 2 + (1 if mcode[i] in extra_byte_tags else 0)
-            out.append((i, "B", mcode[i], mcode[i + 1], 0))
-        elif bare and i + 1 < end and mcode[i] in odd_tags and mcode[i + 1] % 2 == 1:
+            return (i, "B", mcode[i], mcode[i + 1], 0), i + n
+        if bare and i + 1 < end and mcode[i] in odd_tags and mcode[i + 1] % 2 == 1:
             # Tags with bit 6 set (0xc1, 0xe1) pair with an *odd* register byte.
-            n = 2
-            out.append((i, "B", mcode[i], mcode[i + 1], 0))
-        else:
-            n = 1
-            out.append((i, "?", mcode[i], 0, 0))
-        i += n
+            return (i, "B", mcode[i], mcode[i + 1], 0), i + 2
+        return (i, "?", mcode[i], 0, 0), i + 1
+
+    def _simulate_cost(i, stop):
+        """Unexplained non-zero bytes a plain walk leaves between `i` and
+        `stop` -- the score each side of an overlap is judged by."""
+        cost = 0
+        while i < min(stop, end):
+            tok, i = _plain_step(i)
+            if tok[1] == "?" and mcode[tok[0]]:
+                cost += 1
+        return cost
+
+    out, i = [], start
+    while i < end:
+        tok, nxt = _plain_step(i)
+        if (
+            lookahead
+            and tok[1] == "S"
+            and mcode[tok[0] + tok[2] + 2] == 0xA1
+            and mcode[tok[0] + tok[2] + 3] == 0
+            and is_verb(tok[0] + tok[2] + 2)
+        ):
+            # A short unit ending in `a1 00` where a verb begins: either the
+            # tag is real or the `00` is the verb's second byte. Walk both
+            # parses for `lookahead` bytes; the verb-first one wins only by
+            # leaving less unexplained behind. Ties keep the short unit, so
+            # this never fires without evidence.
+            cost_take = _simulate_cost(nxt, nxt + lookahead)
+            cost_skip = (1 if mcode[i] else 0) + _simulate_cost(
+                i + 1, i + 1 + lookahead
+            )
+            if cost_skip < cost_take:
+                out.append((i, "?", mcode[i], 0, 0))
+                i += 1
+                continue
+        out.append(tok)
+        i = nxt
     return out
 
 

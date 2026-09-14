@@ -5312,6 +5312,43 @@ anchor before it becomes a rule; "fixing" the `a1 00` splits by bluntly
 refusing the short unit was measured and *loses* net coverage, which is what
 a greedy walk does at an overlap it cannot see past.
 
+### Adjudicating the overlaps the greedy walk cannot see past
+
+That last sentence now has a number and a fix. The overlap class is short
+units ending in `a1 00` where a verb begins: 16,161 of them corpus-wide, and
+98.5% are followed by unexplained bytes -- the walk swallows the verb's head
+as the unit's tag and register, then strands its field and bank
+(`90 03` is the single most common two-byte leftover for exactly this
+reason). But bluntly refusing the short unit loses net coverage (+2,246
+unexplained bytes): the refused prefix strands on one side while the
+"rescued" verb eats real unit heads as operand on the other. Neither greedy
+choice is principled; the overlap needs a longer horizon than one match.
+
+With `lookahead` set (64 in `FULL_RULE`), each overlap is walked both ways
+for that many bytes and the parse leaving fewer unexplained non-zero bytes
+wins; ties keep the short unit, so the rule never fires without evidence.
+Measured over the 68 streams: ~10,000 keeps against ~4,300 takes, unexplained
+bytes 445,778 down to 434,679 with no stream regressing anywhere, and every
+rescued verb is an `a1` (5,512 of them) -- no exotic verb type is
+manufactured. The horizon is converged, not tuned: 32 bytes buys nearly all
+of it, 128 buys nothing more. And the refactor is provably behaviour-free at
+`lookahead=0`: byte-identical token streams to the old walk over eight
+million tokens, so every narrow-rule measurement in this file still stands
+as written.
+
+The shuffle control reads differently here than for the forms, and honestly:
+the lookahead also "explains" 24,487 shuffled bytes against 11,099 real
+ones. The absolute number is larger only because a shuffled stream's residue
+is thirty-three times the real one's; as rates it is 2.5% of the real
+residue against 0.16% of the shuffled -- fifteen to one in favour of
+structure, the signature of a rule adjudicating real overlaps rather than
+manufacturing explanation. What it does *not* do is reach the forms stranded
+inside overlaps it never stands on: the `02 83 R 83 0e 05` six-byte runs stay
+buried under short units starting two bytes earlier, at a net cost the
+lookahead cannot see because stepping onto them would first strand the two
+bytes before. That class wants a wider anchor, not a longer horizon, and is
+next.
+
 ## Per-ONNX-op coverage, and what it caught
 
 `op_coverage.py` classifies every operator in the ai.onnx default domain

@@ -204,3 +204,50 @@ def test_quintet_programs_its_pair_twice(name):
         if t[1] == "Q"
     )
     assert null <= max(2, len(quintets) // 4), (name, len(quintets), null)
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_lookahead_never_regresses_coverage(name):
+    """Adjudicating overlaps can only move bytes from raw escapes into
+    recognised forms or leave them where they were: per-stream coverage with
+    the lookahead on is never below the greedy walk's."""
+    blob = _blob(name)
+    plain = dict(mcode.FULL_RULE)
+    plain["lookahead"] = 0
+    covered_plain, _ = mcode.nonzero_coverage(blob, **plain)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    assert covered_with >= covered_plain, (name, covered_plain, covered_with)
+
+
+def test_lookahead_adjudicates_a1_tag_verb_overlaps():
+    """Where a short unit ending in `a1 00` overlaps a verb beginning there,
+    the greedy walk always takes the short unit and usually strands the
+    verb's field and bank bytes. With the lookahead, each overlap is walked
+    both ways for 64 bytes and the cleaner parse wins -- a swallowed verb
+    head is restored, while a genuine tag (whose continuation already parses)
+    keeps its short unit. Both outcomes occur in the committed vocoder
+    stream, pinned here by offset."""
+    blob = _blob("piper_vocoder")
+    lo, hi = mcode.stream_bounds(blob)
+    plain = dict(mcode.FULL_RULE)
+    plain["lookahead"] = 0
+
+    plain_toks = {t[0]: t[1] for t in mcode.tokenize(blob, start=lo, end=hi, **plain)}
+    ruled_toks = {
+        t[0]: t[1] for t in mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    }
+    # At both sites the greedy walk takes the short unit...
+    assert plain_toks[1019] == "S", plain_toks[1019]
+    assert plain_toks[967] == "S", plain_toks[967]
+    # ...the lookahead restores the swallowed `a1 00 30 04` verb at one...
+    assert ruled_toks[1019] == "?", ruled_toks[1019]
+    assert blob[1019:1028] == bytes.fromhex("00 03 a1 00 30 04 18 01 80")
+    following = [
+        t
+        for t in mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+        if t[0] == 1021
+    ]
+    assert following[0][1:] == ("V", 0xA1, 0x30, 0x04), following
+    # ...and keeps the genuine short unit at the other.
+    assert ruled_toks[967] == "S", ruled_toks[967]
+    assert blob[967:979] == bytes.fromhex("03 3f 00 00 11 a1 00 b0 03 3f f0 3e")
