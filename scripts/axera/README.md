@@ -6113,6 +6113,50 @@ a normaliser needs. Third, everywhere else the choice barely matters (conv
 and attention saturate by 8 samples; method differences are ~1 dB noise),
 so the default (`MinMax`, size 32) is the right default.
 
+### Patching calibration instead of recompiling
+
+A training phase swap recompiles the step graph with new calibration data,
+but a rebuild spends ~60 s mostly re-running the NPU backend scheduler --
+which does not depend on the calibration values at all (see "Reducing the
+per-phase recompile cost" in the training handoff). What actually varies
+with calibration is small, and this time it is identified exactly: build
+the same attention graph at 1x/2x/4x calibration amplitude (plus one
+identical-input control pair) and match every moving mcode byte against
+the quant tables.
+
+The control pair moves 9 bytes (scheduler noise floor). The scaled builds
+move ~50, of which 16 are scale slots with exact table matches, all in
+four copies each:
+
+| slots | encoding | tracks |
+| --- | --- | --- |
+| 4x | bfloat16 of `1/x_scale` | input scale, reciprocated |
+| 4x | float32 of `qk_scale` | MatMul output scale, direct |
+| 4x | bfloat16 of `1/p_scale` | softmax scale, reciprocated |
+| 4x | float32 of `o_scale` | output scale, direct |
+
+Everything else that moves is scheduler noise (same 9 bytes as control),
+ordering (same multiset, new positions), amplitude-independent constants
+(a `127.5` dequant midpoint that wobbles 1 ulp), or one scheduling-divergent
+region the values cannot reach. `patch_scales.py` writes new-table
+encodings over old-table slots in place: unchanged scales never match, so
+constants are safe; nested bfloat16-in-float32 matches keep the widest;
+sites claimed by two tensors are dropped, not guessed -- and every decision
+is reported. Patching by table computation agrees byte for byte with
+patching by copying the rebuilt bytes, and the patched artifact passes
+`mcode.check()`.
+
+What this does *not* prove is card equivalence: replay never reads mcode,
+so replay agreement cannot see a corrupted program, only consistent scales.
+The mechanism is precedented on device (doubling a stored output scale
+doubles the output exactly), but a patched artifact has not run on device
+-- do not train on one that hasn't, at least once per graph shape.
+`--verify` diffs a patch against a real rebuild of the new table for
+qualifying new shapes; steady-state phases skip the rebuild entirely.
+Per-phase cost becomes NumPy MinMax plus a reload, against a ~60 s rebuild
+today -- and weight slots stay out of scope on purpose, since trained
+weights already travel in the resident state files.
+
 **Where it is not yet faithful: fusion.** On the full Audio8 decoder the
 replay reads 3.65 dB against the card's 7.37. `quant/quant_axmodel.onnx` is
 the graph Pulsar2 actually lowers, and 385 of the float graph's 1002 tensors
