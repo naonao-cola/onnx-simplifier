@@ -5237,7 +5237,7 @@ Everything above needed a Pulsar2 image to compile with or an AX650N to
 confirm on. That makes it untestable in ordinary CI, and a format nobody
 re-checks is a format that quietly rots. `mcode.py` fixes that: the codec and
 every structural rule confirmed on hardware, in a module that imports numpy
-and onnx and nothing else, plus three real compiled streams committed under
+and onnx and nothing else, plus seven real compiled streams committed under
 `fixtures/`.
 
 `mcode.check(blob)` returns a list of violations -- empty means well-formed as
@@ -5272,6 +5272,19 @@ no verb's datapath semantics have been established, and 25 of the 28 operand
 slots that move between builds hold allocator output. An interpreter that
 produced numbers would be inventing them. `check` answers the question that
 can be answered honestly: could the runtime load and walk this?
+
+### Three new families, no new forms
+
+Three single-purpose probes compiled fresh (Pulsar2 7.0-lite) to widen the
+evidence past CNNs, transformers and vocoders: a group-32 depthwise
+convolution, a last-axis LayerNormalization, and a MatMul/Softmax/MatMul
+attention fragment with folded K/V. Their mcodes are committed as fixtures
+(`dwconv_g32`, `layernorm_last_axis`, `attn_qkv_softmax` -- two to five
+kilobytes each), and all three use only the closed verb/tag sets and pass
+every rule at 0.952-0.964 coverage. The layernorm stream carries no
+`a1 00 40 02` op program at all, as expected for a non-MAC op. Op-type
+differences live in operand values, not in new forms -- the same verdict
+the vocoder gave, now with Norm and Softmax in the set.
 
 ### A five-byte form that programs its pair twice
 
