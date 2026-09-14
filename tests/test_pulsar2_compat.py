@@ -224,3 +224,35 @@ def test_ax650_build_risks_flags_confirmed_broken_listed_ops():
 
     risks = pulsar2.ax650_build_risks(model)
     assert any("Xor" in r and "confirmed to hard-fail" in r for r in risks)
+
+
+def test_ax650_build_risks_clears_confirmed_working_unlisted_ops():
+    """`Neg`/`Log` are absent from Axera's published `AX650_SUPPORTED_OPS`
+    but this project verified them on real hardware (single-node
+    `pulsar2:7.0-lite` battery + KD-loss-head composition, all within INT8
+    tolerance of ORT fp32 -- see
+    ``pulsar2_ops.AX650_CONFIRMED_WORKING_OPS``). `ax650_build_risks()` must
+    not flag them as "untested" the way it does a genuinely unknown op.
+    """
+    import onnx
+    from onnx import TensorProto, helper
+
+    graph = helper.make_graph(
+        [
+            helper.make_node("Log", ["x"], ["lx"]),
+            helper.make_node("Neg", ["lx"], ["y"]),
+        ],
+        "confirmed_working_log_neg",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])],
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=8
+    )
+    onnx.checker.check_model(model)
+
+    # Still absent from the vendor docs list (that fact is unchanged)...
+    assert pulsar2.unsupported_on_ax650(model) == {"Log", "Neg"}
+    # ...but verified, so no build risk and eligible coverage.
+    assert pulsar2.confirmed_working_on_ax650(model) == {"Log", "Neg"}
+    assert pulsar2.ax650_build_risks(model) == []

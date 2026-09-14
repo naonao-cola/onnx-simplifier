@@ -52,6 +52,8 @@ def classify(op_type):
         return BROKEN
     if op_type in pulsar2_ops.AX650_SUPPORTED_OPS:
         return ELIGIBLE
+    if op_type in pulsar2_ops.AX650_CONFIRMED_WORKING_OPS:
+        return ELIGIBLE
     if op_type in pulsar2_ops.CPU_ONLY_OPS:
         return CPU_ONLY
     return UNLISTED
