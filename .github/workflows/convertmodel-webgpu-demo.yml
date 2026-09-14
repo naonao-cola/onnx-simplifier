@@ -1,6 +1,6 @@
 name: convertmodel WebGPU + Hugging Face training demos
 
-# Three small, real, end-to-end training pipeline checks, all requiring every
+# Four small, real, end-to-end training pipeline checks, all requiring every
 # training step to actually run on WebGPU -- see each test file's own top
 # comment for the full design (why a real browser rather than plain Node is
 # what makes WebGPU reachable at all, what each training objective is and is
@@ -20,6 +20,17 @@ name: convertmodel WebGPU + Hugging Face training demos
 #     loop's loss trajectory on onnxruntime's CPU provider in Python. Proves
 #     compile_training.py itself, not just the lower-level qat_graph step
 #     graphs the two demos above exercise, actually runs on WebGPU.
+#   * test/webgpu_nas_search.test.mjs -- tools/onnx-finetune/wasm/nas_search's
+#     tiny neural-architecture-search loop (several candidate MLP shapes'
+#     own qat_graph/graph_grad step graphs, generated once by
+#     generate_nas_step_graphs.py and committed as fixtures under
+#     test/nas_search_candidates/), trained on WebGPU and checked against the
+#     same loop's own conclusion on the wasm (CPU) execution provider inside
+#     the same page. Proves the search loop -- not just a single step graph
+#     -- reaches the same answer on WebGPU it does on CPU, and that every op
+#     a candidate's step graph contains actually placed on WebGPU
+#     (JsExecutionProvider), not just that the allowlists it was built from
+#     say those ops are covered.
 #
 # Runs on a stock macOS GitHub-hosted runner: WebGPU needs a real GPU-backed
 # browser, which is exactly what convertmodel-inference.yml's ubuntu job
@@ -32,7 +43,7 @@ name: convertmodel WebGPU + Hugging Face training demos
 # fast/offline test suite should not inherit.
 #
 # Scheduled + on demand, plus on PRs that touch the files either check
-# actually depends on, so all three stay valid without gating unrelated
+# actually depends on, so all four stay valid without gating unrelated
 # convertmodel work.
 
 on:
@@ -52,6 +63,11 @@ on:
       - "scripts/convertmodel/test/webgpu_train_loop_demo.test.mjs"
       - "scripts/convertmodel/test/step_train_loop_demo.onnx"
       - "scripts/convertmodel/test/step_train_loop_demo.json"
+      - "scripts/convertmodel/test/webgpu_nas_search.test.mjs"
+      - "scripts/convertmodel/test/nas_search_candidates/**"
+      - "tools/onnx-finetune/wasm/nas_search/search.mjs"
+      - "tools/onnx-finetune/wasm/federated_lora/step_graph_runner.mjs"
+      - "tools/onnx-finetune/scripts/generate_nas_step_graphs.py"
       - "scripts/convertmodel/hf_datasets.mjs"
       - "scripts/convertmodel/sample_inputs.mjs"
       - "scripts/convertmodel/package.json"
@@ -134,3 +150,28 @@ jobs:
       - name: Run the WebGPU + onnxsim.compile_training_loop demo
         working-directory: scripts/convertmodel
         run: npm run test:webgpu-train-loop-demo
+
+  webgpu-nas-search:
+    name: WebGPU NAS search demo
+    runs-on: macos-15
+    # As webgpu-train-loop-demo's own comment: no onnxsim wheel build here --
+    # test/nas_search_candidates/ is a pre-generated, committed fixture
+    # (tools/onnx-finetune/scripts/generate_nas_step_graphs.py's own output),
+    # so this job's own training run is a few hundred steps across four tiny
+    # MLPs (well under a second each); the rest of the budget is Chromium's
+    # one-time install.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (onnxruntime-web, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the WebGPU NAS search demo
+        working-directory: scripts/convertmodel
+        run: npm run test:webgpu-nas-search

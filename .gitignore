@@ -147,6 +147,12 @@ dmypy.json
 # author's machine.
 !scripts/convertmodel/test/*.onnx
 
+# Same reasoning, one directory level down: webgpu_nas_search.test.mjs's own
+# fixtures (tools/onnx-finetune/scripts/generate_nas_step_graphs.py's output,
+# checked in rather than regenerated at test time -- see that test file's
+# own header comment for why).
+!scripts/convertmodel/test/nas_search_candidates/*.onnx
+
 # Same reasoning for the WASM knowledge-distillation demo's checked-in
 # assets (see examples/llm_distillation/wasm_demo/generate_web_artifacts.py):
 # index.html fetches these small, tiny-architecture files directly, with no

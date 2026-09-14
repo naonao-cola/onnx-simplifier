@@ -1,0 +1,104 @@
+{
+  "batch_size": 32,
+  "dim": 16,
+  "out": 8,
+  "candidates": [
+    {
+      "name": "tiny",
+      "hidden_sizes": [
+        4
+      ],
+      "param_count": 108,
+      "num_nodes": 79,
+      "step_graph": "tiny.step_graph.onnx",
+      "manifest": "tiny.step_graph.onnx.manifest.txt",
+      "initial_state": "tiny.step_graph.onnx.initial_state.bin",
+      "ops": [
+        "Add",
+        "Div",
+        "MatMul",
+        "Mul",
+        "ReduceMean",
+        "ReduceSum",
+        "Reshape",
+        "Sigmoid",
+        "Sqrt",
+        "Sub",
+        "Transpose"
+      ]
+    },
+    {
+      "name": "small",
+      "hidden_sizes": [
+        16
+      ],
+      "param_count": 408,
+      "num_nodes": 79,
+      "step_graph": "small.step_graph.onnx",
+      "manifest": "small.step_graph.onnx.manifest.txt",
+      "initial_state": "small.step_graph.onnx.initial_state.bin",
+      "ops": [
+        "Add",
+        "Div",
+        "MatMul",
+        "Mul",
+        "ReduceMean",
+        "ReduceSum",
+        "Reshape",
+        "Sigmoid",
+        "Sqrt",
+        "Sub",
+        "Transpose"
+      ]
+    },
+    {
+      "name": "medium",
+      "hidden_sizes": [
+        32,
+        16
+      ],
+      "param_count": 1208,
+      "num_nodes": 119,
+      "step_graph": "medium.step_graph.onnx",
+      "manifest": "medium.step_graph.onnx.manifest.txt",
+      "initial_state": "medium.step_graph.onnx.initial_state.bin",
+      "ops": [
+        "Add",
+        "Div",
+        "MatMul",
+        "Mul",
+        "ReduceMean",
+        "ReduceSum",
+        "Reshape",
+        "Sigmoid",
+        "Sqrt",
+        "Sub",
+        "Transpose"
+      ]
+    },
+    {
+      "name": "wide",
+      "hidden_sizes": [
+        64
+      ],
+      "param_count": 1608,
+      "num_nodes": 79,
+      "step_graph": "wide.step_graph.onnx",
+      "manifest": "wide.step_graph.onnx.manifest.txt",
+      "initial_state": "wide.step_graph.onnx.initial_state.bin",
+      "ops": [
+        "Add",
+        "Div",
+        "MatMul",
+        "Mul",
+        "ReduceMean",
+        "ReduceSum",
+        "Reshape",
+        "Sigmoid",
+        "Sqrt",
+        "Sub",
+        "Transpose"
+      ]
+    }
+  ]
+}
