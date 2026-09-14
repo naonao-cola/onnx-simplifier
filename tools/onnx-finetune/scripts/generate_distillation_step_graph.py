@@ -384,7 +384,7 @@ def _build_forward_loss_and_grads(
             labels_onehot, onnx.TensorProto.FLOAT, logits_shape
         ),
         onnx.helper.make_tensor_value_info(
-            BATCH_SIZE_INPUT, onnx.TensorProto.FLOAT, []
+            BATCH_SIZE_INPUT, onnx.TensorProto.FLOAT, [1]
         ),
     ]
     loss_probe_graph = onnx.helper.make_graph(
@@ -467,16 +467,27 @@ def build_distillation_step_graph(
         initial_state[m_name] = np.zeros(shape, dtype=np.float32)
         initial_state[v_name] = np.zeros(shape, dtype=np.float32)
 
+    # The per-step hyperparameters ride along in per_step as rank-1 [1]
+    # vectors, NOT make_step_graph's scalars (rank-0): Pulsar2's Numpy
+    # calibration fetcher crashes on rank-0 inputs
+    # (IndexError('list index out of range'), while omitting them is
+    # rejected outright), so a step graph meant to ever compile for NPU
+    # must not declare any. Semantically identical -- every caller feeds
+    # one float per step either way.
     per_step = {
         fwd.input_name: (fwd.input_shape, onnx.TensorProto.FLOAT),
         fwd.teacher_logits_name: (fwd.logits_shape, onnx.TensorProto.FLOAT),
         fwd.labels_onehot_name: (fwd.logits_shape, onnx.TensorProto.FLOAT),
+        "lr": ([1], onnx.TensorProto.FLOAT),
+        "m_correction": ([1], onnx.TensorProto.FLOAT),
+        "v_correction": ([1], onnx.TensorProto.FLOAT),
+        BATCH_SIZE_INPUT: ([1], onnx.TensorProto.FLOAT),
     }
     step = qat_graph.make_step_graph(
         b,
         constants={},
         state=state,
-        scalars=["lr", "m_correction", "v_correction", BATCH_SIZE_INPUT],
+        scalars=[],
         loss=combined,
         loss_shape=[1, 1],
         name="onnxsim_distillation_step",

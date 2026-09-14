@@ -200,7 +200,7 @@ def _random_feeds(fwd, rng, batch_size):
         fwd.labels_onehot_name: labels_to_onehot(
             rng.integers(0, fwd.num_classes, size=batch_size), fwd.num_classes
         ),
-        fwd.batch_size_name: np.asarray(float(batch_size), dtype=np.float32),
+        fwd.batch_size_name: np.asarray([float(batch_size)], dtype=np.float32),
     }
     for name, value in fwd.trainable.items():
         feeds[name] = value
@@ -319,13 +319,13 @@ def test_step_graph_trains_on_plain_onnxruntime(toy_models):
         feeds["input"] = x
         feeds["teacher_logits"] = teacher_logits
         feeds["labels_onehot"] = onehot
-        feeds["batch_size"] = np.asarray(float(batch_size), dtype=np.float32)
-        feeds["lr"] = np.asarray(0.05, dtype=np.float32)
+        feeds["batch_size"] = np.asarray([float(batch_size)], dtype=np.float32)
+        feeds["lr"] = np.asarray([0.05], dtype=np.float32)
         feeds["m_correction"] = np.asarray(
-            1.0 / (1.0 - 0.9 ** (t + 1)), dtype=np.float32
+            [1.0 / (1.0 - 0.9 ** (t + 1))], dtype=np.float32
         )
         feeds["v_correction"] = np.asarray(
-            1.0 / (1.0 - 0.999 ** (t + 1)), dtype=np.float32
+            [1.0 / (1.0 - 0.999 ** (t + 1))], dtype=np.float32
         )
 
         out = dict(zip(output_names, step_session.run(output_names, feeds)))
