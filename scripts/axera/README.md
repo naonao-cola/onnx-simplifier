@@ -5467,6 +5467,21 @@ open. The `0x80`/`0xa0`/`0xc0`/`0xe0` holes in the tag set, probed the same
 way, are real absences: all four occur *below* chance as would-be tags,
 with register parity at the background rate.
 
+### A second repeat form
+
+The quintet repeats a pair (`[04][a][b][a][b]`); this repeats one byte:
+`[0x30][0x03][X][0x03][0x09]`, a fixed frame with one live slot (`0x1c`
+and `0x70` dominate). 648 occurrences corpus-wide against zero shuffled,
+every one an exact five-byte unexplained run -- the short-unit check fails
+there by construction (`0x30` is not a prefix), so unlike the octet and
+template families there is no overlap to adjudicate and no guard to write:
+it fires exactly where the walk emits raw escapes, and nowhere else. 648
+takes, zero regressions, zero shuffled takes; the codec carries them as `R`
+records. The committed fixtures carry none, so the test pins the codec
+synthetically, as with the fixed head. What varies the slot, and whether
+the `YY != 0x09` tails (`9f`, `89`) that sometimes follow are the same
+form with a live tail or a following unit starting mid-run, is open.
+
 ### The `0xc1` five
 
 The fixed `01 a4 00 c1 W` form has wilder company: `[H][A][B][0xc1][D]`

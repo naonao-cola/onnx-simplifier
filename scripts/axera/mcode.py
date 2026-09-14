@@ -65,14 +65,16 @@ FULL_RULE = dict(
     octet=True,
     template8=True,
     c1five=True,
+    repeat=True,
 )
 """Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
 six verbs -- the README's "The tail is the segment table" section -- plus
 the `[04][a][b][a][b]` quintet ("A five-byte form that programs its pair
 twice"), the bookend pairs ("Bookend pairs: a two-byte prefix class"), the
 fixed head with a live tail ("A fixed head with a live tail"), the two
-adjudicated templates ("An eight-byte template with a fused tail") and the
-`0xc1` five ("The `0xc1` five").
+adjudicated templates ("An eight-byte template with a fused tail"), the
+`0xc1` five ("The `0xc1` five") and the second repeat form ("A second
+repeat form").
 `lookahead` adjudicates the overlaps the greedy walk cannot see past
 ("Adjudicating the overlaps ..."); 64 bytes is where the corpus-wide
 gain converges (32 is slightly worse, 128 no better)."""
@@ -101,6 +103,7 @@ def tokenize(
     octet=False,
     template8=False,
     c1five=False,
+    repeat=False,
 ):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
@@ -124,7 +127,8 @@ def tokenize(
     `01 98 02 83 R 83 0e 05` template, taken only by the same adjudication
     -- see "An eight-byte template with a fused tail"), 'C' (a
     `[H][A][B][0xc1][D]` unit with `H` in `{0x01, 0x30}` and `D` even --
-    see "The `0xc1` five") or '?' (a=byte).
+    see "The `0xc1` five"), 'R' (a `[0x30][0x03][X][0x03][0x09]` repeat
+    unit -- see "A second repeat form") or '?' (a=byte).
 
     Where a short unit ending in `a1 00` overlaps a verb beginning there,
     the greedy walk cannot tell a genuine tag from a swallowed verb head by
@@ -259,6 +263,22 @@ def tokenize(
             and mcode[i + 4] % 2 == 0
         )
 
+    def repeat_at(i):
+        """A five-byte `[0x30][0x03][X][0x03][0x09]` unit: fixed frame with
+        one live slot, repeating its second byte at the fourth (the quintet
+        repeats a pair; this repeats one byte). It fires only where no
+        other form matches (`0x30` is not a verb, a tag or a width prefix),
+        so the walk emits raw escapes there today. See the README's "A
+        second repeat form" section."""
+        return (
+            repeat
+            and i + 4 < len(mcode)
+            and mcode[i] == 0x30
+            and mcode[i + 1] == 0x03
+            and mcode[i + 3] == 0x03
+            and mcode[i + 4] == 0x09
+        )
+
     def pair_prefix_at(i):
         """A two-byte prefix standing immediately before the unit it
         modifies: `05 90`, always raw on both bytes, or `0b 91`, always raw
@@ -352,6 +372,8 @@ def tokenize(
             return (i, "X", 0, 0, 0), i + 4
         if c1five_at(i):
             return (i, "C", mcode[i], mcode[i + 1], (mcode[i + 2], mcode[i + 4])), i + 5
+        if repeat_at(i):
+            return (i, "R", mcode[i + 2], 0, 0), i + 5
         if bare and i + 1 < end and mcode[i] in tags and mcode[i + 1] % 2 == 0:
             n = 2 + (1 if mcode[i] in extra_byte_tags else 0)
             return (i, "B", mcode[i], mcode[i + 1], 0), i + n
@@ -520,6 +542,7 @@ def decode(mcode, start=None, end=None, **rule):
       adjudication (`R`: the one live byte)
     * `C`: a `[H][A][B][0xc1][D]` unit with `H` in `{0x01, 0x30}` and `D`
       even (`h`, `a`, `b`, `d`)
+    * `R`: a `[0x30][0x03][X][0x03][0x09]` repeat unit (`x`: the live slot)
     * `raw`: one byte no form accounts for (`byte`)
 
     Every record also carries `at`, its offset in the original stream, so
@@ -599,6 +622,8 @@ def decode(mcode, start=None, end=None, **rule):
             out.append(
                 {"at": o, "kind": "C", "h": t[2], "a": t[3], "b": t[4][0], "d": t[4][1]}
             )
+        elif kind == "R":
+            out.append({"at": o, "kind": "R", "x": t[2]})
         else:
             out.append({"at": o, "kind": "raw", "byte": t[2]})
     return out
@@ -638,6 +663,8 @@ def encode(records):
             out += bytes([0x01, 0x98, 0x02, 0x83, r["r"], 0x83, 0x0E, 0x05])
         elif kind == "C":
             out += bytes([r["h"], r["a"], r["b"], 0xC1, r["d"]])
+        elif kind == "R":
+            out += bytes([0x30, 0x03, r["x"], 0x03, 0x09])
         else:
             out += bytes([r["byte"]])
     return bytes(out)
