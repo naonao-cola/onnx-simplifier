@@ -204,3 +204,290 @@ def test_quintet_programs_its_pair_twice(name):
         if t[1] == "Q"
     )
     assert null <= max(2, len(quintets) // 4), (name, len(quintets), null)
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_lookahead_never_regresses_coverage(name):
+    """Adjudicating overlaps can only move bytes from raw escapes into
+    recognised forms or leave them where they were: per-stream coverage with
+    the lookahead on is never below the greedy walk's."""
+    blob = _blob(name)
+    plain = dict(mcode.FULL_RULE)
+    plain["lookahead"] = 0
+    covered_plain, _ = mcode.nonzero_coverage(blob, **plain)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    assert covered_with >= covered_plain, (name, covered_plain, covered_with)
+
+
+def test_lookahead_adjudicates_a1_tag_verb_overlaps():
+    """Where a short unit ending in `a1 00` overlaps a verb beginning there,
+    the greedy walk always takes the short unit and usually strands the
+    verb's field and bank bytes. With the lookahead, each overlap is walked
+    both ways for 64 bytes and the cleaner parse wins -- a swallowed verb
+    head is restored, while a genuine tag (whose continuation already parses)
+    keeps its short unit. Both outcomes occur in the committed vocoder
+    stream, pinned here by offset."""
+    blob = _blob("piper_vocoder")
+    lo, hi = mcode.stream_bounds(blob)
+    plain = dict(mcode.FULL_RULE)
+    plain["lookahead"] = 0
+
+    plain_toks = {t[0]: t[1] for t in mcode.tokenize(blob, start=lo, end=hi, **plain)}
+    ruled_toks = {
+        t[0]: t[1] for t in mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    }
+    # At both sites the greedy walk takes the short unit...
+    assert plain_toks[1019] == "S", plain_toks[1019]
+    assert plain_toks[967] == "S", plain_toks[967]
+    # ...the lookahead restores the swallowed `a1 00 30 04` verb at one...
+    assert ruled_toks[1019] == "?", ruled_toks[1019]
+    assert blob[1019:1028] == bytes.fromhex("00 03 a1 00 30 04 18 01 80")
+    following = [
+        t
+        for t in mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+        if t[0] == 1021
+    ]
+    assert following[0][1:] == ("V", 0xA1, 0x30, 0x04), following
+    # ...and keeps the genuine short unit at the other.
+    assert ruled_toks[967] == "S", ruled_toks[967]
+    assert blob[967:979] == bytes.fromhex("03 3f 00 00 11 a1 00 b0 03 3f f0 3e")
+
+
+# (P, D) token counts per committed stream -- `0b 91` prefixes under their
+# anchored verb, and raw-on-both-bytes `05 90` doublets (see
+# `test_bookend_prefix_pairs`).
+_PD_COUNTS = {
+    "conv64_k5_d2": (0, 0),
+    "conv128_k7_d12": (0, 6),
+    "piper_vocoder": (0, 35),
+    "w2v2fe_training_step": (16, 48),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_bookend_prefix_pairs(name):
+    """Two-byte prefixes the greedy walk strands: a raw-on-both-bytes
+    `05 90` doublet, and `0b 91`, always followed by an `a1 00 b0 03` verb
+    (2,663 of 2,663 occurrences corpus-wide). Neither byte can open any other
+    form and the guards hold the absorbed bytes to otherwise-raw ones, so
+    admitting them is pure addition -- see the README's "Bookend pairs: a
+    two-byte prefix class" section."""
+    blob = _blob(name)
+    lo, hi = mcode.stream_bounds(blob)
+    toks = mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    prefixes = [t for t in toks if t[1] == "P"]
+    doublets = [t for t in toks if t[1] == "D"]
+    assert (len(prefixes), len(doublets)) == _PD_COUNTS[name], (
+        name,
+        len(prefixes),
+        len(doublets),
+    )
+    for o, _, a, b, _ in prefixes:
+        assert (blob[o], blob[o + 1]) == (0x0B, 0x91) == (a, b), (name, o)
+        assert blob[o + 2 : o + 6] == bytes([0xA1, 0x00, 0xB0, 0x03]), (name, o)
+    for o, _, a, b, _ in doublets:
+        assert (blob[o], blob[o + 1]) == (0x05, 0x90) == (a, b), (name, o)
+    # Neither form can split a verb: no verb byte occurs inside either.
+    for o, kind, a, b, _ in prefixes + doublets:
+        assert a not in mcode.VERBS6 and b not in mcode.VERBS6, (name, kind, o)
+    records = mcode.decode(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    assert [(r["a"], r["b"]) for r in records if r["kind"] == "P"] == [
+        (a, b) for _, _, a, b, _ in prefixes
+    ]
+    assert [(r["a"], r["b"]) for r in records if r["kind"] == "D"] == [
+        (a, b) for _, _, a, b, _ in doublets
+    ]
+
+    # Admitting the forms buys coverage, and only where they fire.
+    without = dict(mcode.FULL_RULE)
+    without["pair_prefix"] = False
+    covered_without, _ = mcode.nonzero_coverage(blob, **without)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    if sum(_PD_COUNTS[name]):
+        assert covered_with > covered_without, (name, covered_without, covered_with)
+    else:
+        assert covered_with == covered_without, (name, covered_without, covered_with)
+
+    # The shuffle control: essentially no prefixes or doublets by chance.
+    bulk = bytearray(blob[lo:hi])
+    random.Random(0).shuffle(bulk)
+    shuffled = bytes(blob[:lo]) + bytes(bulk) + bytes(blob[hi:])
+    null = [
+        t
+        for t in mcode.tokenize(shuffled, start=lo, end=hi, **mcode.FULL_RULE)
+        if t[1] in ("P", "D")
+    ]
+    assert len(null) <= max(2, (len(prefixes) + len(doublets)) // 4), (
+        name,
+        len(prefixes) + len(doublets),
+        len(null),
+    )
+
+
+def _synthetic_fx_stream():
+    """A hand-built stream exercising the F and X forms: a verb, a short
+    unit, a bare pair, then a fixed `01 a4 00 c1 W` unit, a `05 10 e2 0e`
+    prefix under its anchored verb, and the verb itself."""
+    return bytes.fromhex(
+        "a1 00 40 02 00000000"  # V
+        "00 08 81 e8"  # S
+        "83 62"  # B
+        "01 a4 00 c1 23"  # F
+        "05 10 e2 0e"  # X
+        "a1 00 c0 81 00000000"  # the anchored verb
+    )
+
+
+def test_fixed_head_and_verb_prefix_codec():
+    """The F (`01 a4 00 c1 W`) and X (`05 10 e2 0e` + anchored verb) forms
+    tokenize, decode and re-encode exactly on a synthetic stream -- the
+    committed fixtures carry neither (both were found in larger whisper and
+    wav2vec2 builds), so this pins the implementation where no fixture can.
+    The real-stream evidence -- 1,690 fixed heads against 1 shuffled, 1,278
+    anchored prefixes -- is in the README's "A fixed head with a live tail"
+    section."""
+    blob = _synthetic_fx_stream()
+    toks = mcode.tokenize(blob, start=0, end=len(blob), **mcode.FULL_RULE)
+    kinds = [t[1] for t in toks]
+    assert kinds == ["V", "S", "B", "F", "X", "V"], kinds
+    assert toks[3][2] == 0x23
+    records = mcode.decode(blob, start=0, end=len(blob), **mcode.FULL_RULE)
+    assert [(r["kind"]) for r in records] == kinds
+    assert [r["w"] for r in records if r["kind"] == "F"] == [0x23]
+    assert mcode.encode(records) == blob
+
+    # The flags plumb through: off means the forms do not fire.
+    plain = dict(mcode.FULL_RULE)
+    plain["fixed5"] = False
+    plain["vprefix"] = False
+    kinds_off = [t[1] for t in mcode.tokenize(blob, start=0, end=len(blob), **plain)]
+    assert "F" not in kinds_off and "X" not in kinds_off, kinds_off
+
+    # The X anchor is load-bearing: the same four bytes without the verb
+    # after them stay raw.
+    unanchored = bytes.fromhex("05 10 e2 0e") + bytes.fromhex("00 08 81 e8")
+    toks = mcode.tokenize(unanchored, start=0, end=len(unanchored), **mcode.FULL_RULE)
+    assert [t[1] for t in toks] == ["?", "?", "?", "?", "S"], [t[1] for t in toks]
+
+    # Neither form's bytes can hide a verb.
+    assert not set(bytes.fromhex("01 a4 00 c1")) & set(mcode.VERBS6)
+    assert not set(bytes.fromhex("05 10 e2 0e")) & set(mcode.VERBS6)
+
+
+# Octet takes per committed stream -- the `04 40 84 18 83 R TT 40`
+# template is adjudicated per site, and only the training step's stream
+# takes it (once). See `test_octet_wins_only_by_adjudication`.
+_E_COUNTS = {
+    "conv64_k5_d2": 0,
+    "conv128_k7_d12": 0,
+    "piper_vocoder": 0,
+    "w2v2fe_training_step": 1,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_octet_wins_only_by_adjudication(name):
+    """The `04 40 84 18 83 R TT 40` template recurs exactly with zero
+    shuffled counterparts, but its tail usually completes a genuine-looking
+    short unit -- taking it unconditionally was measured to lose net bytes.
+    So it is never taken blind: only by lookahead adjudication against
+    skipping it, like the verb splits. Pinned here on the training step's
+    single take. See the README's "Bookend pairs" section."""
+    blob = _blob(name)
+    lo, hi = mcode.stream_bounds(blob)
+    toks = mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    takes = [t for t in toks if t[1] == "E"]
+    assert len(takes) == _E_COUNTS[name], (name, len(takes))
+    for o, _, a, b, _ in takes:
+        assert bytes(blob[o : o + 8])[:6] == bytes([0x04, 0x40, 0x84, 0x18, 0x83, a])
+        assert bytes(blob[o + 6 : o + 8]) == bytes([b, 0x40]), (name, o)
+        assert a not in mcode.VERBS6 and b not in mcode.VERBS6, (name, o)
+    records = mcode.decode(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    assert [(r["a"], r["b"]) for r in records if r["kind"] == "E"] == [
+        (a, b) for _, _, a, b, _ in takes
+    ]
+
+    # The take and the skip, side by side, on the training step's site.
+    if takes:
+        o = takes[0][0]
+        assert o == 7826, o
+        assert bytes(blob[o : o + 8]) == bytes(
+            [0x04, 0x40, 0x84, 0x18, 0x83, 0x66, 0x01, 0x40]
+        )
+        plain = dict(mcode.FULL_RULE)
+        plain["octet"] = False
+        skipped = [t for t in mcode.tokenize(blob, start=o, end=o + 16, **plain)]
+        assert [t[1] for t in skipped] == ["?", "?", "B", "B", "S", "B", "S"], [
+            t[1] for t in skipped
+        ]
+
+    # Admitting it buys coverage where it takes, and nowhere else.
+    without = dict(mcode.FULL_RULE)
+    without["octet"] = False
+    covered_without, _ = mcode.nonzero_coverage(blob, **without)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    if _E_COUNTS[name]:
+        assert covered_with > covered_without, (name, covered_without, covered_with)
+    else:
+        assert covered_with == covered_without, (name, covered_without, covered_with)
+
+    # The template never occurs by chance.
+    bulk = bytearray(blob[lo:hi])
+    random.Random(0).shuffle(bulk)
+    shuffled = bytes(blob[:lo]) + bytes(bulk) + bytes(blob[hi:])
+    null = sum(
+        1
+        for t in mcode.tokenize(shuffled, start=lo, end=hi, **mcode.FULL_RULE)
+        if t[1] == "E"
+    )
+    assert null == 0, (name, null)
+
+
+def _synthetic_template_stream():
+    """A hand-built stream with an `01 98 02 83 R 83 0e 05` template: a
+    short unit, the template (R = `0x40`), and a bare pair."""
+    return bytes.fromhex(
+        "00 08 81 e8"  # S
+        "01 98 02 83 40 83 0e 05"  # T
+        "81 96"  # B
+    )
+
+
+def test_template_with_fused_tail_codec():
+    """The `01 98 02 83 R 83 0e 05` template recurs 5,594 times exactly with
+    zero shuffled counterparts, but its head is a valid short unit -- so
+    like the octet it is taken only by lookahead adjudication, never blind.
+    The committed fixtures carry none, so this pins the codec on a synthetic
+    stream; the corpus numbers are in the README's "An eight-byte template
+    with a fused tail" section."""
+    blob = _synthetic_template_stream()
+    toks = mcode.tokenize(blob, start=0, end=len(blob), **mcode.FULL_RULE)
+    assert [t[1] for t in toks] == ["S", "T", "B"], [t[1] for t in toks]
+    assert toks[1][2] == 0x40
+    records = mcode.decode(blob, start=0, end=len(blob), **mcode.FULL_RULE)
+    assert [r["kind"] for r in records] == ["S", "T", "B"]
+    assert [r["r"] for r in records if r["kind"] == "T"] == [0x40]
+    assert mcode.encode(records) == blob
+
+    # Without the template the head parses as the short unit it mimics.
+    plain = dict(mcode.FULL_RULE)
+    plain["template8"] = False
+    kinds_off = [t[1] for t in mcode.tokenize(blob, start=0, end=len(blob), **plain)]
+    assert kinds_off == ["S", "S", "B", "?", "B"], kinds_off
+
+    # The template's bytes hide no verb.
+    assert not set(bytes.fromhex("01 98 02 83 83 0e 05")) & set(mcode.VERBS6)
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_template8_never_regresses_coverage(name):
+    """Adjudicated templates can only move bytes from raw escapes into
+    recognised forms or leave the walk where it was: per-stream coverage
+    with the template on is never below it off. (The fixtures carry no
+    templates, so this pins equality there and guards the plumbing.)"""
+    blob = _blob(name)
+    plain = dict(mcode.FULL_RULE)
+    plain["template8"] = False
+    covered_plain, _ = mcode.nonzero_coverage(blob, **plain)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    assert covered_with >= covered_plain, (name, covered_plain, covered_with)

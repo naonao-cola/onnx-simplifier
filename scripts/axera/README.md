@@ -5312,6 +5312,137 @@ anchor before it becomes a rule; "fixing" the `a1 00` splits by bluntly
 refusing the short unit was measured and *loses* net coverage, which is what
 a greedy walk does at an overlap it cannot see past.
 
+### Adjudicating the overlaps the greedy walk cannot see past
+
+That last sentence now has a number and a fix. The overlap class is short
+units ending in `a1 00` where a verb begins: 16,161 of them corpus-wide, and
+98.5% are followed by unexplained bytes -- the walk swallows the verb's head
+as the unit's tag and register, then strands its field and bank
+(`90 03` is the single most common two-byte leftover for exactly this
+reason). But bluntly refusing the short unit loses net coverage (+2,246
+unexplained bytes): the refused prefix strands on one side while the
+"rescued" verb eats real unit heads as operand on the other. Neither greedy
+choice is principled; the overlap needs a longer horizon than one match.
+
+With `lookahead` set (64 in `FULL_RULE`), each overlap is walked both ways
+for that many bytes and the parse leaving fewer unexplained non-zero bytes
+wins; ties keep the short unit, so the rule never fires without evidence.
+Measured over the 68 streams: ~10,000 keeps against ~4,300 takes, unexplained
+bytes 445,778 down to 434,679 with no stream regressing anywhere, and every
+rescued verb is an `a1` (5,512 of them) -- no exotic verb type is
+manufactured. The horizon is converged, not tuned: 32 bytes buys nearly all
+of it, 128 buys nothing more. And the refactor is provably behaviour-free at
+`lookahead=0`: byte-identical token streams to the old walk over eight
+million tokens, so every narrow-rule measurement in this file still stands
+as written.
+
+The shuffle control reads differently here than for the forms, and honestly:
+the lookahead also "explains" 24,487 shuffled bytes against 11,099 real
+ones. The absolute number is larger only because a shuffled stream's residue
+is thirty-three times the real one's; as rates it is 2.5% of the real
+residue against 0.16% of the shuffled -- fifteen to one in favour of
+structure, the signature of a rule adjudicating real overlaps rather than
+manufacturing explanation. What it does *not* do is reach the forms stranded
+inside overlaps it never stands on: the `02 83 R 83 0e 05` six-byte runs stay
+buried under short units starting two bytes earlier, at a net cost the
+lookahead cannot see because stepping onto them would first strand the two
+bytes before. That class wants a wider anchor, not a longer horizon, and is
+next.
+
+### Bookend pairs: a two-byte prefix class
+
+Clustering what was left after the quintet and the lookahead turns up two
+two-byte forms, both standing immediately before the unit they modify, both
+pure addition by construction -- admitted only where the walk emits raw
+escapes, with guards holding every absorbed byte to an otherwise-raw one:
+
+* a `05 90` doublet, raw on both bytes (6,165 occurrences, 183 on shuffled
+  streams -- thirty-four to one);
+* `0b 91`, always followed by an `a1 00 b0 03` verb -- all 2,663
+  occurrences corpus-wide, zero on shuffled streams. The anchor is
+  positional, companion-style: fire only under that exact verb.
+
+Neither byte of either form can open any other unit (both heads sit outside
+the verb, tag and prefix sets), and no verb byte occurs inside either form
+across the corpus, so neither can split a verb the way an `a1`-tagged short
+unit splits one beginning at its tag. Together they take unexplained bytes
+434,679 down to 417,023 with no stream regressing anywhere -- the codec
+carries them as `P` and `D` records, `check` stays clean on all 68 streams
+and the four fixtures (16 prefixes and 48 doublets in the training step, 35
+doublets in the vocoder, 6 in the dilated conv, none in the small one).
+
+Two things found along the way are recorded here rather than admitted.
+First, the `0b 91` verbs take wider company: the four bytes before are
+`81 R2 0b 91` (R2 even) where the prefix fires, but `XX 00 00 91` where it
+does not -- the `91` directly precedes the verb in both cases, so the real
+form may be a four-byte prefix ending in `0x91`, of which `0b 91` is only
+the anchored, provable half. Second, an eight-byte
+`04 40 84 18 83 R TT 40` template recurs 2,252 times exactly (R always even,
+`0x42..0x58`; TT in `{01, 02, 03}`) with zero shuffled counterparts -- real
+by recurrence. Taking it unconditionally was measured to *lose* 1,800 bytes
+net, because its tail `TT 40` usually completes a genuine-looking short
+unit: taking the template means breaking that unit. Like the verb splits
+before the lookahead, it is an overlap dispute, and it goes through the
+same adjudication rather than a guard: each template site is walked both
+ways, and the template wins only by leaving less unexplained behind. 394
+takes corpus-wide, zero regressions, zero shuffled takes -- and every take
+has tail `TT == 0x01`. The short units that lose are always the shortest
+kind (`p = 1`), the kind most easily completed by chance; the longer-tailed
+ones keep winning. The octet walks as an `E` record where taken, and the
+toggle stays off everywhere else.
+
+### A fixed head with a live tail
+
+Two more forms, both found the same way -- exact recurrences in the
+unexplained bytes that never occur shuffled -- and both pure addition (they
+fire only where the walk emits raw escapes, with the anchored verbs parsing
+identically after them):
+
+* a fixed five-byte `01 a4 00 c1 W`: the middle never varies across 1,690
+  occurrences (one shuffled counterpart corpus-wide); only the last byte
+  moves, almost always `0x23`/`0x25`. Read it as a short unit with a
+  `0xc1` tag if you like -- `p = 1`, two payload bytes, tag, register --
+  except `0xc1` is not an admitted width tag and the payload never varies,
+  so it walks as one fixed form with a live tail byte instead. Its tail
+  re-parses after it exactly as before (an odd `c1`-`W` pair), which is why
+  admitting it only ever converts raw escapes.
+* a four-byte `05 10 e2 0e` prefix, always followed by an `a1 00 c0 81`
+  verb -- 1,278 of 1,335 of those verbs take it (96%). The companion-style
+  anchor again: fire only under that exact verb. A third prefix length
+  alongside the one-byte `05` seeds and the two-byte `0b 91`, all standing
+  immediately before the verb they modify.
+
+Together they take unexplained bytes 417,023 down to 408,501 with no stream
+regressing; the codec carries them as `F` and `X` records, `check` stays
+clean on all 68 streams. The committed fixtures carry neither -- both were
+found in larger whisper and wav2vec2 builds -- so the test pins the codec
+on a synthetic stream instead (tokenize, records, round-trip, both rule
+toggles, and the anchor: the same four prefix bytes without the verb stay
+raw). What `W` selects, and what distinguishes a prefixed
+`a1 00 c0 81` verb from the 57 unprefixed ones, is open.
+
+### An eight-byte template with a fused tail
+
+The `02 83 R 83 0e 05` six-byte runs that no rule could stand on turn out
+to be the tail of an eight-byte template: every one of the 5,594
+occurrences corpus-wide is preceded by exactly `01 98`, with zero shuffled
+counterparts. Read it as a short unit (`p = 1`, tag `0x83`) fused with a
+bare pair and a trailing `05` -- except the walk already parses that head
+as a short unit, so the template is an overlap dispute of the same shape as
+the octet's, and goes through the same adjudication rather than a guard:
+5,564 takes, zero regressions, zero shuffled takes.
+
+The takes are near-unanimous (99.5%), which deserves one honest caveat: had
+the `05` been an established one-byte marker unit, every take would be
+absorbing a genuine marker as a template tail. Markers have no independent
+evidence -- no rule, no anchor, only the lone-byte mass -- while the
+template has 5,594 exact recurrences against zero shuffled, so the evidence
+hierarchy favours the template. The day a marker rule exists, these tails
+must be re-examined; until then the codec walks them as `T` records. What
+`R` selects (even values, `0x80` and `0x7e` dominant) is open, as is why the
+thirty sites that keep the short unit keep it -- they show no `R` pattern
+of their own.
+
 ## Per-ONNX-op coverage, and what it caught
 
 `op_coverage.py` classifies every operator in the ai.onnx default domain
