@@ -469,6 +469,31 @@ build on an empty pass-through slice concatenated back (`[96:96]` of dim
 provably-empty inputs from `Concat` in the translator, after which Phi
 traces and runs as tabulated.
 
+#### Why dynamic models stay off ANE (the `Range` boundary)
+
+Bisecting the dynamic decoder axis by axis (static S/P/T combinations of
+the same graph) shows the ANE plan gate trips on any tensor whose shape
+derives from a runtime *value*, not just a `RangeDim`: a 5-op repro of
+`Range` with a runtime limit fails plan build with the exact production
+error (`Invalid blob shape: Data-dependent shapes were disabled`), and so
+does `Slice` with a runtime bound -- even a raw graph-input bound. Pure
+`RangeDim` propagation (matmul/reshape/transpose/select/concat of dynamic
+tensors) is fine. In the decoder the poison is the causal-mask machinery:
+two model-level `Range`s with computed limits feed ~60 KV-cache slices and
+a gather with Range-derived bounds, plus the present-cache concat chains.
+
+No MIL reformulation fixes this class -- the information "this runtime
+value equals dim S" cannot be expressed, so the translator leaves these
+ops alone (conversion itself succeeds; pinned by test). What would fix it,
+in increasing order of invasiveness: (1) static export (this section);
+(2) computing positions/masks host-side and passing them as inputs instead
+of building them from `Range` in-graph (model-interface change, fragile
+across families -- not attempted); (3) stateful Core ML (cache as internal
+state, static outputs -- the direction community artifacts like TokForge
+explore); (4) Apple relaxing the gate. The ORT CoreML execution provider
+does not help either: it partitions the decoder into 241 CoreML subgraphs
+fine, but the poisoned partitions fail the same E5RT build at run time.
+
 ### fp16 model interface (`--io-dtype fp16`)
 
 Where `--quantize-weights` cuts the bytes read from DRAM *inside* the model and
