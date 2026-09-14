@@ -934,6 +934,27 @@ python train_mlp_step_coreml.py --output mlp_step.mlpackage \
     --steps 15 --compute-units CPU_AND_NE
 ```
 
+### Transformer-block training (`train_block_step_coreml.py`)
+
+The same loop around a pre-norm-less transformer block instead of an MLP:
+separate Q/K/V projections, head split, scaled dot-product attention,
+output projection, residual, SiLU FFN, residual, MSE loss, Adam on all 12
+projection params -- the attention backward (`sdpaBwd` in maderix/ANE
+terms) runs on the Neural Engine here along with everything else, where
+maderix splits it (forward+dx on ANE, dW/Adam on CPU).
+
+```bash
+python train_block_step_coreml.py --output block_step.mlpackage \
+    --steps 8 --compute-units CPU_AND_NE
+```
+
+Measured on real hardware (M4 Mac mini, 32x64x512 block, 8 heads, FFN
+2048, ~3.2M params): **352/352 ops on ANE**, loss 2.41 -> 2.22 over 8
+steps tracking CPU, at 34.8ms/step vs. 40.3ms CPU (1.16x). Per-param
+throughput trails maderix's Stories110M loop (~0.09 vs. ~1.2M params/ms)
+-- expected: every step shuttles ~100MB of weights/moments through
+`predict()`, where their IOSurface pipeline keeps weights resident.
+
 Two adaptations the Core ML target forces: rank-0 scalar inputs are widened
 to shape-[1] (MIL has no rank-0 Placeholder; broadcast-identical where used),
 and the step uses loss scaling with eps=1e-3, since default fp16 compute
