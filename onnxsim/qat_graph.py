@@ -594,7 +594,11 @@ def make_step_graph(
     :param per_step: ``{input name: (shape, onnx element type)}`` for per-step
             inputs that are neither float32 nor rank-0 -- in practice the
             int64 row index a minibatched loop feeds
-            :meth:`GraphBuilder.gather_rows`. Kept separate from ``scalars``
+            :meth:`GraphBuilder.gather_rows` -- plus float rank-1
+            hyperparameter vectors (a distillation step graph's ``lr`` /
+            bias corrections / batch size), which must avoid the rank-0
+            ``scalars`` form because Pulsar2's calibration fetcher cannot
+            take rank-0 inputs. Kept separate from ``scalars``
             rather than generalizing it because the two are fed differently
             (``run_step_graph`` casts scalars to float32 and passes these
             through with the dtype the caller built them with) and because a

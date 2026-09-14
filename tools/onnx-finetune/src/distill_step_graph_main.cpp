@@ -437,7 +437,11 @@ int main(int argc, char** argv) {
   std::vector<int64_t> input_shape;
   std::vector<int64_t> teacher_logits_shape;
   std::vector<int64_t> onehot_shape(2);
-  std::vector<int64_t> scalar_shape;  // rank 0, always empty
+  std::vector<int64_t> scalar_shape = {1};  // rank-1 [1]: Pulsar2's Numpy
+                                       // calibration fetcher cannot take
+                                       // rank-0 inputs, so the step graph
+                                       // declares lr/corrections/batch_size
+                                       // as [1] (see generate script).
   std::vector<Ort::Value> feeds;
   std::vector<const char*> feed_names;
   feeds.reserve(7 + manifest.state.size());
@@ -505,13 +509,13 @@ int main(int argc, char** argv) {
       float v_correction = static_cast<float>(1.0 / (1.0 - std::pow(0.999, global_step + 1)));
       float batch_size_f = static_cast<float>(current_batch_size);
       feed_names.push_back("lr");
-      feeds.push_back(Ort::Value::CreateTensor<float>(mem_info, &lr, 1, scalar_shape.data(), 0));
+      feeds.push_back(Ort::Value::CreateTensor<float>(mem_info, &lr, 1, scalar_shape.data(), scalar_shape.size()));
       feed_names.push_back("m_correction");
-      feeds.push_back(Ort::Value::CreateTensor<float>(mem_info, &m_correction, 1, scalar_shape.data(), 0));
+      feeds.push_back(Ort::Value::CreateTensor<float>(mem_info, &m_correction, 1, scalar_shape.data(), scalar_shape.size()));
       feed_names.push_back("v_correction");
-      feeds.push_back(Ort::Value::CreateTensor<float>(mem_info, &v_correction, 1, scalar_shape.data(), 0));
+      feeds.push_back(Ort::Value::CreateTensor<float>(mem_info, &v_correction, 1, scalar_shape.data(), scalar_shape.size()));
       feed_names.push_back("batch_size");
-      feeds.push_back(Ort::Value::CreateTensor<float>(mem_info, &batch_size_f, 1, scalar_shape.data(), 0));
+      feeds.push_back(Ort::Value::CreateTensor<float>(mem_info, &batch_size_f, 1, scalar_shape.data(), scalar_shape.size()));
 
       for (const auto& [state_input, state_output, shape] : manifest.state) {
         (void)state_output;

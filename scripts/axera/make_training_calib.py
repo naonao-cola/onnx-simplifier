@@ -52,6 +52,7 @@ def make_work_dir(
     weight_scale: float = 0.05,
     real_data: dict = None,
     index_inputs: "dict[str, int] | None" = None,
+    layer_configs: "list[dict] | None" = None,
 ) -> str:
     """Writes `work_dir/step.onnx`, `work_dir/dataset/*.tar` and
     `work_dir/config/*.json` for `pulsar2_docker.build(work_dir, "step.onnx",
@@ -92,6 +93,12 @@ def make_work_dir(
             entry here, an int64 input would otherwise fall into the
             float32 `weight_scale` branch below and produce the wrong
             dtype entirely.
+    :param layer_configs: `quant.layer_configs` entries, passed through
+            verbatim -- e.g. `[{"op_types": ["Sub"], "data_type": "FP32"}]`
+            for a training step graph's Adam update, whose full-scale
+            weights minus lr-scaled step (~4400x scale ratio) fails NPU
+            tiling in INT8 but runs bit-exact in FP32 (confirmed on real
+            AX650N hardware).
     """
     index_inputs = index_inputs or {}
     os.makedirs(work_dir, exist_ok=True)
@@ -193,6 +200,8 @@ def make_work_dir(
         },
         "compiler": {"check": 0},
     }
+    if layer_configs:
+        config["quant"]["layer_configs"] = list(layer_configs)
     with open(work_dir + "/config/step.json", "w") as f:
         json.dump(config, f, indent=2)
     return work_dir

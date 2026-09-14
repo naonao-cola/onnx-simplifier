@@ -169,10 +169,10 @@ export class StepGraphSession {
       [manifest.inputName]: new T("float32", batchInput, inputShape),
       [manifest.teacherLogitsName]: new T("float32", teacherLogits, teacherLogitsShape),
       [manifest.labelsOnehotName]: new T("float32", onehot, [batchSize, manifest.numClasses]),
-      lr: new T("float32", new Float32Array([lr]), []),
-      m_correction: new T("float32", new Float32Array([mCorrection]), []),
-      v_correction: new T("float32", new Float32Array([vCorrection]), []),
-      batch_size: new T("float32", new Float32Array([batchSize]), []),
+      lr: new T("float32", new Float32Array([lr]), [1]),
+      m_correction: new T("float32", new Float32Array([mCorrection]), [1]),
+      v_correction: new T("float32", new Float32Array([vCorrection]), [1]),
+      batch_size: new T("float32", new Float32Array([batchSize]), [1]),
     };
     for (const { input, shape } of manifest.state) {
       feeds[input] = new T("float32", state[input], shape);
