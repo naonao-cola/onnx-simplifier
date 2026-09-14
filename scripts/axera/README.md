@@ -5476,13 +5476,24 @@ preceding unit is overwhelmingly the same shape too -- `00 04 90 03` -- so
 this is one fixed context, not a general stutter rule: the pair is
 written twice, back to back, the second copy stranded because no form opens
 at it (`0x90` needs an even register after it, `0x03` is not a prefix). The
-echo walks as a `Y` record with everything around it parsing exactly as
-before, so it converts only raw escapes: 5,502 takes, zero regressions,
+The echo walks as a `Y` record with everything around it parsing exactly as
+before, so this converts only raw escapes: 5,502 takes, zero regressions,
 zero shuffled takes. Whether the doubling is a write-and-confirm on the
 `0x90`/`0x03` slot -- one of the matmul engine's most-programmed addresses
 -- is a card question, and the card work is parked; statically, the codec
 round-trips it and `check` stays clean. The committed fixtures carry no
 stutters, so the test pins the codec synthetically.
+
+### A six-byte prefix
+
+The prefix class grows a third length: `09 0c 80 fe 01 01`, always
+followed by an `a1 00 d0 0c` verb -- all 2,741 occurrences corpus-wide,
+zero shuffled counterparts. The head opens no other form and the anchored
+verb parses identically after it, so like the shorter prefixes it converts
+only raw escapes: 2,741 takes at six bytes each, zero regressions, and only
+42.7% of those verbs take it, so it is an optional prefix rather than part
+of the verb. The training step's stream carries seven; the codec round-trips
+them and `check` stays clean.
 
 ### A second repeat form
 
