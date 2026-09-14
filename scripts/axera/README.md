@@ -7149,13 +7149,16 @@ two and refined the third:
   graph's forward Squeeze feeds a Gemm, so it is safe; a terminal
   Reshape would not be -- the `Squeeze` entry in
   `AX650_CONFIRMED_BROKEN_OPS` now says exactly this.
-- **Two blockers for compiling a full step graph, both open:** a scalar
-  (rank-0) graph output crashes Pulsar2's quantizer (`zero-dimensional
-  tensor cannot be concatenated` -- the loss would need to stay `[1,1]`),
-  and the Adam update's `Sub` (full-scale weights minus lr-scaled step,
-  ~4400x scale ratio) fails NPU tiling (`TileFailException:
-  AxQuantizedSub`). The latter likely wants a precision-config answer
-  (per-layer float), not a graph rewrite.
+- **Two blockers for compiling a full step graph, both now fixed (see
+  follow-up):** a scalar (rank-0) graph output crashes Pulsar2's
+  quantizer (`zero-dimensional tensor cannot be concatenated`) -- the
+  generator now keeps the loss `[1,1]` (keepdims + ones seed, exact per
+  the finite-difference suite); and the Adam update's `Sub`
+  (full-scale weights minus lr-scaled step, ~4400x scale ratio) fails NPU
+  tiling (`TileFailException: AxQuantizedSub`) -- fixed by a
+  `quant.layer_configs` FP32 override (Sub-only and Mul/Add/Sub/Div
+  variants both compile and return bit-exact Adam updates, max diff
+  0.0; U16 does not clear the tiler).
 
 ## Files
 
