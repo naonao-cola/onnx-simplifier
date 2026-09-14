@@ -19,7 +19,28 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { simplify, versions } from "../index.mjs";
+import {
+  applyAttentionHeadPruning,
+  applyDoubleQuantization,
+  applyEmbeddingVocabMagnitudePruning,
+  applyEmbeddingVocabPruning,
+  applyGgufQ4_0,
+  applyIq4Nl,
+  applyMoeExpertChannelPruning,
+  applyQuarot,
+  applyStructuredPruning,
+  applyWandaPruning,
+  crossLayerEqualize,
+  pruneMagnitude,
+  quantizeAttentionDynamic,
+  quantizeDynamicMatMulIntegerToFloat,
+  quantizeWeightOnlyInt8Block,
+  quantizeWeightOnlyInt16,
+  quantizeWeightOnlyMatMulNbits,
+  quantizeWeightOnlyMxfp4,
+  simplify,
+  versions,
+} from "../index.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "..", "..", "..", "scripts", "convertmodel", "test", "model.onnx");
@@ -69,6 +90,67 @@ try {
     assert.ok(v.onnxsim.length > 0);
     assert.equal(typeof v.onnx_optimizer, "string");
     assert.ok(v.onnx_optimizer.length > 0);
+  });
+
+  // Data-free C++ passes: the fixture (MatMul+Add+Relu, X:[N,4], W:[4,3])
+  // exercises them without needing onnxruntime-web, same as the simplify()
+  // checks above.
+  await check("data-free quantize passes return non-empty models", async () => {
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    for (const fn of [
+      crossLayerEqualize,
+      quantizeDynamicMatMulIntegerToFloat,
+      quantizeAttentionDynamic,
+      quantizeWeightOnlyInt16,
+      quantizeWeightOnlyInt8Block,
+      quantizeWeightOnlyMxfp4,
+      quantizeWeightOnlyMatMulNbits,
+      applyDoubleQuantization,
+      applyIq4Nl,
+      applyGgufQ4_0,
+    ]) {
+      const out = await fn(input);
+      assert.ok(out instanceof Uint8Array, fn.name);
+      assert.ok(out.length > 0, fn.name);
+    }
+  });
+
+  await check("data-free pruning passes return non-empty models", async () => {
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    for (const [fn, options] of [
+      [pruneMagnitude, { sparsity: 0.5 }],
+      [applyStructuredPruning, { sparsity: 0.5, importanceNorm: "l2" }],
+      [applyAttentionHeadPruning, { sparsity: 0.5 }],
+      [applyMoeExpertChannelPruning, { sparsity: 0.5 }],
+      // K=4 is not divisible by 32, so QuaRot matches nothing and the model
+      // comes back unchanged -- the point is the binding round-trips.
+      [applyQuarot, { seed: 0, blockSize: 32, epsilon: 1e-6 }],
+    ]) {
+      const out = await fn(input, options);
+      assert.ok(out instanceof Uint8Array, fn.name);
+      assert.ok(out.length > 0, fn.name);
+    }
+  });
+
+  await check("embedding vocab pruning declines a model with no vocab chain", async () => {
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const r = await applyEmbeddingVocabPruning(input, { dropTokenIds: [1, 2] });
+    assert.equal(r.matched, false);
+    assert.ok(r.model instanceof Uint8Array && r.model.length > 0);
+    const r2 = await applyEmbeddingVocabMagnitudePruning(input, { sparsity: 0.5 });
+    assert.equal(r2.matched, false);
+    assert.ok(r2.model instanceof Uint8Array && r2.model.length > 0);
+  });
+
+  await check("applyWandaPruning runs on synthetic onnxruntime-web calibration data", async () => {
+    const ort = await import("onnxruntime-web");
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 1.0, 0.0]), [1, 4]),
+    });
+    const out = await applyWandaPruning(input, [batch(), batch()], { sparsity: 0.5 });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
   });
 
   console.log(`PASS: ${passed} checks`);

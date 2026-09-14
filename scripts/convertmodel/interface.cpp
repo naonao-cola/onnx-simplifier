@@ -35,10 +35,13 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
@@ -1188,7 +1191,11 @@ em::val onnxsim_apply_bias_corrections(const std::string &data,
     em::val item = corrections_ary[i];
     BiasCorrectionEntry entry;
     entry.output_name = item["name"].as<std::string>();
-    entry.shape = em::vecFromJSArray<int64_t>(item["shape"]);
+    // Via doubles (see OptInt64ListFromVal's own comment for why int64_t
+    // cannot be converted directly).
+    for (double d : em::vecFromJSArray<double>(item["shape"])) {
+      entry.shape.push_back(static_cast<int64_t>(d));
+    }
     entry.data = em::vecFromJSArray<float>(item["data"]);
     corrections.push_back(std::move(entry));
   }
@@ -1968,6 +1975,777 @@ bool onnxsim_lora_release_plan(int plan_handle) {
   return LoraPlans().erase(plan_handle) > 0;
 }
 
+// ---------------------------------------------------------------------------
+// Data-free quantization / pruning passes already ported to C++ (see
+// onnxsim.h, quantize_entry.h, pruning_entry.h, structured_pruning_entry.h,
+// cross_layer_equalization_entry.h) but previously reachable only from
+// Python. Each binding below is a pure graph rewrite -- model bytes in,
+// model bytes out, no executor and no calibration data -- so it follows the
+// exact same parse/call/SerializeModel shape as onnxsim_quantize_dynamic
+// above, and never suspends on Asyncify (safe to call synchronously from
+// any JS context, ORT-web or built-in-ORT build alike).
+
+em::val onnxsim_cross_layer_equalize(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(CrossLayerEqualize(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "cross_layer_equalize error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_quantize_dynamic_matmul_integer_to_float(
+    const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(QuantizeDynamicMatMulIntegerToFloat(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_dynamic_matmul_integer_to_float error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_quantize_attention_dynamic(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(QuantizeAttentionDynamic(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_attention_dynamic error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_quantize_weight_only_int16(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(QuantizeWeightOnlyInt16(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_weight_only_int16 error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_quantize_weight_only_int8_block(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(QuantizeWeightOnlyInt8Block(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_weight_only_int8_block error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_quantize_weight_only_mxfp4(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(QuantizeWeightOnlyMXFP4(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_weight_only_mxfp4 error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_quantize_weight_only_matmul_nbits(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(QuantizeWeightOnlyMatMulNBits(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_weight_only_matmul_nbits error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_double_quantization(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyDoubleQuantization(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_double_quantization error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+// `bits`/`max_bits`/`block_size` mirror apply_any_precision_llm_cpp's own
+// parameters of the same names exactly (see onnxsim.h).
+em::val onnxsim_apply_any_precision_llm(const std::string &data, int bits,
+                                        int max_bits, int block_size) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyAnyPrecisionLlm(xmodel, bits, max_bits,
+                                               block_size));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_any_precision_llm error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+// `seed` arrives as a JS number (double) and is narrowed to the uint64 it
+// feeds, the same way QatOptions' batchSeed is above; `block_size`/
+// `epsilon` mirror apply_quarot_cpp's own parameters exactly (see onnxsim.h).
+em::val onnxsim_apply_quarot(const std::string &data, double seed,
+                             int block_size, float epsilon) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyQuarot(xmodel, static_cast<uint64_t>(seed),
+                                      block_size, epsilon));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_quarot error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_iq4_nl(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyIQ4NL(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_iq4_nl error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_gguf_q4_0(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyGgufQ4_0(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_gguf_q4_0 error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_gguf_q4_1(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyGgufQ4_1(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_gguf_q4_1 error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_gguf_ternary(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyGgufTernaryQuant(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_gguf_ternary error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_fp6_llm(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyFp6Llm(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_fp6_llm error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_gguf_q6_k(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyGgufQ6K(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_gguf_q6_k error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+// An absent (undefined/null) `n`/`m` is "not given" (unstructured sparsity,
+// ranked by `sparsity`); a present number must be given together with the
+// other one (N:M semi-structured) -- mirroring prune_magnitude_cpp's own
+// keyword-argument contract exactly (see onnxsim.h).
+std::optional<int64_t> OptInt64FromVal(em::val v) {
+  if (v.isUndefined() || v.isNull())
+    return std::nullopt;
+  return static_cast<int64_t>(v.as<double>());
+}
+
+em::val onnxsim_prune_magnitude(const std::string &data, double sparsity,
+                                em::val n_val, em::val m_val,
+                                bool global_sparsity) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(PruneMagnitude(xmodel, sparsity,
+                                         OptInt64FromVal(n_val),
+                                         OptInt64FromVal(m_val),
+                                         global_sparsity));
+  } catch (const std::exception &e) {
+    std::cerr << "prune_magnitude error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_structured_pruning(const std::string &data,
+                                         double sparsity,
+                                         const std::string &importance_norm,
+                                         bool global_sparsity) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyStructuredPruning(xmodel, sparsity,
+                                                 importance_norm,
+                                                 global_sparsity));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_structured_pruning error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_attention_head_pruning(const std::string &data,
+                                             double sparsity,
+                                             const std::string &importance_norm) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(
+        ApplyAttentionHeadPruning(xmodel, sparsity, importance_norm));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_attention_head_pruning error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_moe_expert_channel_pruning(const std::string &data,
+                                                 double sparsity) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyMoeExpertChannelPruning(xmodel, sparsity));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_moe_expert_channel_pruning error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_qmoe_expert_channel_pruning(const std::string &data,
+                                                  double sparsity) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyQMoEExpertChannelPruning(xmodel, sparsity));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_qmoe_expert_channel_pruning error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+// An absent (undefined/null) token-id list is "not given" (std::nullopt); a
+// present JS array crosses as the vector -- the same "absent vs.
+// present-but-empty are different requests" shape as LoRA's
+// restrictTargetNames/targetNames above. `input_name` is likewise absent or
+// a string. Returns an object mirroring the C++
+// EmbeddingVocabPruningResult:
+//
+//   { model: Uint8Array, matched: boolean, keptTokenIds: [...],
+//     lmHeadPruned: boolean }
+//
+// (`id_map` is `{keptTokenIds[i]: i}`, trivially rebuilt by the caller --
+// see structured_pruning_entry.h's own comment on why it never crosses.)
+em::val
+EmbeddingVocabPruningResultToVal(const EmbeddingVocabPruningResult &result) {
+  em::val model_bytes = SerializeModel(result.model);
+  if (model_bytes.isNull()) {
+    return em::val::null();
+  }
+  em::val out = em::val::object();
+  out.set("model", model_bytes);
+  out.set("matched", result.matched);
+  em::val kept = em::val::array();
+  for (size_t i = 0; i < result.kept_token_ids.size(); ++i) {
+    kept.set(i, static_cast<double>(result.kept_token_ids[i]));
+  }
+  out.set("keptTokenIds", kept);
+  out.set("lmHeadPruned", result.lm_head_pruned);
+  return out;
+}
+
+std::optional<std::vector<int64_t>> OptInt64ListFromVal(em::val v) {
+  if (v.isUndefined() || v.isNull())
+    return std::nullopt;
+  // Via doubles: embind's vecFromJSArray cannot convert plain JS numbers to
+  // int64_t directly ("emval::as has unknown type"), so convert as doubles
+  // first -- the same narrowing QatOptions' batchSize/batchSeed already use.
+  std::vector<int64_t> out;
+  for (double d : em::vecFromJSArray<double>(v)) {
+    out.push_back(static_cast<int64_t>(d));
+  }
+  return out;
+}
+
+std::optional<std::string> OptStringFromVal(em::val v) {
+  if (v.isUndefined() || v.isNull())
+    return std::nullopt;
+  return v.as<std::string>();
+}
+
+em::val onnxsim_apply_embedding_vocab_pruning(const std::string &data,
+                                              em::val keep_token_ids_val,
+                                              em::val drop_token_ids_val,
+                                              em::val input_name_val) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return EmbeddingVocabPruningResultToVal(ApplyEmbeddingVocabPruning(
+        xmodel, OptInt64ListFromVal(keep_token_ids_val),
+        OptInt64ListFromVal(drop_token_ids_val),
+        OptStringFromVal(input_name_val)));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_embedding_vocab_pruning error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_embedding_vocab_magnitude_pruning(
+    const std::string &data, double sparsity, em::val protect_token_ids_val,
+    em::val input_name_val) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return EmbeddingVocabPruningResultToVal(
+        ApplyEmbeddingVocabMagnitudePruning(
+            xmodel, sparsity, OptInt64ListFromVal(protect_token_ids_val),
+            OptStringFromVal(input_name_val)));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_embedding_vocab_magnitude_pruning error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Calibration-driven passes (Wanda/SparseGPT/imatrix families, MoE
+// whole-expert, transformer-block depth pruning -- see
+// structured_pruning_entry.h and imatrix_quant_entry.h).
+//
+// Same division of labour as static quantization above: the page runs the
+// model over sample inputs with onnxruntime-web itself and hands the
+// observed activations back across this boundary; C++ only runs the
+// probe-augmented model over them (via the same executor fold_constant
+// uses) and applies the rewrite. `calibration_batches` is a JS array of
+// batches, each batch a plain object mapping a graph input name to one
+// tensor:
+//
+//   [{ "<inputName>": { dtype, dims, data }, ... }, ...]
+//
+// `dtype` is the ONNX TensorProto.DataType enum value, `dims` the shape,
+// `data` a Uint8Array (or any TypedArray view -- Float32Array, BigInt64Array,
+// ...) whose underlying bytes are the tensor's raw little-endian element
+// data (exactly what onnxruntime-web's own tensor `.data` already holds, so
+// `new Uint8Array(t.data.buffer, t.data.byteOffset, t.data.byteLength)`
+// crosses with no copy on the JS side). A batch missing one of the model's
+// own graph inputs throws (surfaced as null with the reason on stderr),
+// exactly like the C++ entry points' own std::invalid_argument contract.
+//
+// Because these run the model through the executor, they suspend on Asyncify
+// in the ORT-web build exactly like onnxsim_fold_constant does -- a JS
+// caller must await the result when it is a Promise
+// (`if (r?.then) r = await r`, see worker.js' own fold_constant case).
+
+// Raw element size of the numeric ONNX dtypes calibration tensors can take.
+// 0 means "not a plain numeric dtype" (STRING and friends) -- the caller
+// refuses those rather than guessing a layout.
+size_t OnnxCalibrationDtypeSize(int32_t dtype) {
+  using TP = onnx::TensorProto;
+  switch (dtype) {
+  case TP::FLOAT:
+  case TP::INT32:
+  case TP::UINT32:
+    return 4;
+  case TP::DOUBLE:
+  case TP::INT64:
+  case TP::UINT64:
+    return 8;
+  case TP::INT16:
+  case TP::UINT16:
+  case TP::FLOAT16:
+  case TP::BFLOAT16:
+    return 2;
+  case TP::INT8:
+  case TP::UINT8:
+  case TP::BOOL:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+// Copy a JS TypedArray/Uint8Array's underlying bytes into `out`. `data` must
+// be a view (it has a `buffer`/`byteOffset`/`byteLength`); a plain JS number
+// array is refused loudly rather than converted element-wise, since that
+// conversion would silently reinterpret float values as bytes.
+std::string JsTypedArrayToBytes(em::val data, size_t expect_bytes,
+                                const std::string &name) {
+  em::val buffer = data["buffer"];
+  em::val byte_offset = data["byteOffset"];
+  em::val byte_length = data["byteLength"];
+  if (buffer.isUndefined() || buffer.isNull() || byte_offset.isUndefined() ||
+      byte_offset.isNull() || byte_length.isUndefined() ||
+      byte_length.isNull()) {
+    throw std::invalid_argument("calibration tensor '" + name +
+                                "' data must be a TypedArray/Uint8Array of "
+                                "raw little-endian bytes, not a plain array");
+  }
+  const size_t nbytes = byte_length.as<size_t>();
+  if (nbytes != expect_bytes) {
+    std::ostringstream os;
+    os << "calibration tensor '" << name << "' has " << nbytes
+       << " bytes but dtype*dims implies " << expect_bytes;
+    throw std::invalid_argument(os.str());
+  }
+  em::val u8 = em::val::global("Uint8Array").new_(
+      buffer, byte_offset.as<size_t>(), nbytes);
+  std::string out;
+  out.resize(nbytes);
+  if (nbytes != 0) {
+    em::val dest = em::val(emscripten::typed_memory_view(
+        nbytes, reinterpret_cast<uint8_t *>(out.data())));
+    dest.call<void>("set", u8);
+  }
+  return out;
+}
+
+std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+ParseCalibrationBatches(em::val batches_val) {
+  std::vector<std::unordered_map<std::string, onnx::TensorProto>> batches;
+  if (batches_val.isUndefined() || batches_val.isNull()) {
+    return batches;
+  }
+  const unsigned num_batches = batches_val["length"].as<unsigned>();
+  batches.reserve(num_batches);
+  for (unsigned b = 0; b < num_batches; ++b) {
+    em::val batch_val = batches_val[b];
+    if (batch_val.isUndefined() || batch_val.isNull()) {
+      throw std::invalid_argument("calibration batch " + std::to_string(b) +
+                                  " is missing");
+    }
+    std::unordered_map<std::string, onnx::TensorProto> batch;
+    em::val keys =
+        em::val::global("Object").call<em::val>("keys", batch_val);
+    for (const std::string &name : em::vecFromJSArray<std::string>(keys)) {
+      em::val entry = batch_val[name.c_str()];
+      if (entry.isUndefined() || entry.isNull()) {
+        throw std::invalid_argument("calibration tensor '" + name +
+                                    "' is missing");
+      }
+      em::val dtype_val = entry["dtype"];
+      em::val dims_val = entry["dims"];
+      em::val data_val = entry["data"];
+      if (dtype_val.isUndefined() || dtype_val.isNull() ||
+          dims_val.isUndefined() || dims_val.isNull() ||
+          data_val.isUndefined() || data_val.isNull()) {
+        throw std::invalid_argument("calibration tensor '" + name +
+                                    "' needs dtype, dims and data");
+      }
+      const int32_t dtype = dtype_val.as<int32_t>();
+      const size_t elem_size = OnnxCalibrationDtypeSize(dtype);
+      if (elem_size == 0) {
+        throw std::invalid_argument("calibration tensor '" + name +
+                                    "' has unsupported dtype " +
+                                    std::to_string(dtype));
+      }
+      onnx::TensorProto tensor;
+      tensor.set_name(name);
+      tensor.set_data_type(
+          static_cast<onnx::TensorProto::DataType>(dtype));
+      int64_t numel = 1;
+      for (double dim : em::convertJSArrayToNumberVector<double>(dims_val)) {
+        const int64_t d = static_cast<int64_t>(dim);
+        tensor.add_dims(d);
+        numel *= d;
+      }
+      tensor.set_raw_data(JsTypedArrayToBytes(
+          data_val, static_cast<size_t>(numel) * elem_size, name));
+      batch.emplace(name, std::move(tensor));
+    }
+    batches.push_back(std::move(batch));
+  }
+  return batches;
+}
+
+// The executor calibration-driven passes run probe sub-models through --
+// the same selection fold_constant makes (see its own call site above).
+const ModelExecutor &CalibrationExecutor() {
+#ifdef ONNXSIM_WASM_ORT_WEB
+  return *GetJsModelExecutor();
+#else
+  return *GetBuiltinModelExecutor();
+#endif
+}
+
+em::val onnxsim_apply_structured_wanda_pruning(
+    const std::string &data, em::val calibration_batches_val, double sparsity,
+    double epsilon, const std::string &importance_norm,
+    bool global_sparsity) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyStructuredWandaPruning(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), sparsity, epsilon,
+        importance_norm, global_sparsity));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_structured_wanda_pruning error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_attention_head_wanda_pruning(
+    const std::string &data, em::val calibration_batches_val, double sparsity,
+    double epsilon, const std::string &importance_norm) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyAttentionHeadWandaPruning(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), sparsity, epsilon,
+        importance_norm));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_attention_head_wanda_pruning error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_sparsegpt_pruning(
+    const std::string &data, em::val calibration_batches_val, double sparsity,
+    em::val n_val, em::val m_val, double percdamp, int proc_block_size) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplySparseGptPruning(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), sparsity,
+        OptInt64FromVal(n_val), OptInt64FromVal(m_val), percdamp,
+        proc_block_size));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_sparsegpt_pruning error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_wanda_pruning(const std::string &data,
+                                    em::val calibration_batches_val,
+                                    double sparsity, em::val n_val,
+                                    em::val m_val, double epsilon,
+                                    bool global_sparsity) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyWandaPruning(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), sparsity,
+        OptInt64FromVal(n_val), OptInt64FromVal(m_val), epsilon,
+        global_sparsity));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_wanda_pruning error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_moe_whole_expert_pruning(
+    const std::string &data, em::val calibration_batches_val,
+    double sparsity) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyMoeWholeExpertPruning(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), sparsity));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_moe_whole_expert_pruning error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_qmoe_whole_expert_pruning(
+    const std::string &data, em::val calibration_batches_val,
+    double sparsity) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyQMoEWholeExpertPruning(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), sparsity));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_qmoe_whole_expert_pruning error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+// An absent (undefined/null) `num_blocks_to_drop` leaves the choice to
+// `sparsity` (fraction of matched candidates); a present number is an
+// explicit block count and takes priority -- mirroring
+// apply_transformer_block_pruning_cpp's own contract exactly.
+em::val onnxsim_apply_transformer_block_pruning(
+    const std::string &data, em::val calibration_batches_val, double sparsity,
+    em::val num_blocks_to_drop_val) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyTransformerBlockPruning(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), sparsity,
+        OptInt64FromVal(num_blocks_to_drop_val)));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_transformer_block_pruning error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+// `scale_lo`/`scale_hi` are the two ends of apply_imatrix_quantization_cpp's
+// own `scale_search_range` tuple, split into two numbers; `skip_names` is
+// absent (undefined/null) or a string array of weight initializer names to
+// leave unquantized. Every other parameter mirrors that wrapper exactly.
+em::val onnxsim_apply_imatrix_quantization(
+    const std::string &data, em::val calibration_batches_val, int block_size,
+    int num_scale_candidates, double scale_lo, double scale_hi,
+    em::val skip_names_val) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    std::unordered_set<std::string> skip_names;
+    if (!skip_names_val.isUndefined() && !skip_names_val.isNull()) {
+      for (const std::string &name :
+           em::vecFromJSArray<std::string>(skip_names_val)) {
+        skip_names.insert(name);
+      }
+    }
+    return SerializeModel(ApplyImatrixQuantization(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), block_size,
+        num_scale_candidates, scale_lo, scale_hi, skip_names));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_imatrix_quantization error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 EMSCRIPTEN_BINDINGS(module) {
   function("onnxsimplify_export", &onnxsimplify_export);
   function("onnxsim_annotate_model_info", &onnxsim_annotate_model_info);
@@ -2022,6 +2800,67 @@ EMSCRIPTEN_BINDINGS(module) {
   em::function("onnxsim_list_correctable_outputs",
                &onnxsim_list_correctable_outputs);
   function("onnxsim_apply_bias_corrections", &onnxsim_apply_bias_corrections);
+
+  // Data-free quantization / pruning passes ported to C++ (see their own doc
+  // comments above, and onnxsim.h): model bytes in, model bytes out, no
+  // executor and no calibration data.
+  function("onnxsim_cross_layer_equalize", &onnxsim_cross_layer_equalize);
+  function("onnxsim_quantize_dynamic_matmul_integer_to_float",
+           &onnxsim_quantize_dynamic_matmul_integer_to_float);
+  function("onnxsim_quantize_attention_dynamic",
+           &onnxsim_quantize_attention_dynamic);
+  function("onnxsim_quantize_weight_only_int16",
+           &onnxsim_quantize_weight_only_int16);
+  function("onnxsim_quantize_weight_only_int8_block",
+           &onnxsim_quantize_weight_only_int8_block);
+  function("onnxsim_quantize_weight_only_mxfp4",
+           &onnxsim_quantize_weight_only_mxfp4);
+  function("onnxsim_quantize_weight_only_matmul_nbits",
+           &onnxsim_quantize_weight_only_matmul_nbits);
+  function("onnxsim_apply_double_quantization",
+           &onnxsim_apply_double_quantization);
+  function("onnxsim_apply_any_precision_llm", &onnxsim_apply_any_precision_llm);
+  function("onnxsim_apply_quarot", &onnxsim_apply_quarot);
+  function("onnxsim_apply_iq4_nl", &onnxsim_apply_iq4_nl);
+  function("onnxsim_apply_gguf_q4_0", &onnxsim_apply_gguf_q4_0);
+  function("onnxsim_apply_gguf_q4_1", &onnxsim_apply_gguf_q4_1);
+  function("onnxsim_apply_gguf_ternary", &onnxsim_apply_gguf_ternary);
+  function("onnxsim_apply_fp6_llm", &onnxsim_apply_fp6_llm);
+  function("onnxsim_apply_gguf_q6_k", &onnxsim_apply_gguf_q6_k);
+  function("onnxsim_prune_magnitude", &onnxsim_prune_magnitude);
+  function("onnxsim_apply_structured_pruning",
+           &onnxsim_apply_structured_pruning);
+  function("onnxsim_apply_attention_head_pruning",
+           &onnxsim_apply_attention_head_pruning);
+  function("onnxsim_apply_moe_expert_channel_pruning",
+           &onnxsim_apply_moe_expert_channel_pruning);
+  function("onnxsim_apply_qmoe_expert_channel_pruning",
+           &onnxsim_apply_qmoe_expert_channel_pruning);
+  function("onnxsim_apply_embedding_vocab_pruning",
+           &onnxsim_apply_embedding_vocab_pruning);
+  function("onnxsim_apply_embedding_vocab_magnitude_pruning",
+           &onnxsim_apply_embedding_vocab_magnitude_pruning);
+
+  // Calibration-driven passes (see their own doc comments above): each takes
+  // calibration batches -- [{ name: { dtype, dims, data } }, ...] with raw
+  // little-endian bytes -- runs probe sub-models through the module's
+  // executor, and applies the rewrite. Like onnxsim_fold_constant, these may
+  // return a Promise in the ORT-web build and the caller must await it when
+  // it is one.
+  function("onnxsim_apply_structured_wanda_pruning",
+           &onnxsim_apply_structured_wanda_pruning);
+  function("onnxsim_apply_attention_head_wanda_pruning",
+           &onnxsim_apply_attention_head_wanda_pruning);
+  function("onnxsim_apply_sparsegpt_pruning", &onnxsim_apply_sparsegpt_pruning);
+  function("onnxsim_apply_wanda_pruning", &onnxsim_apply_wanda_pruning);
+  function("onnxsim_apply_moe_whole_expert_pruning",
+           &onnxsim_apply_moe_whole_expert_pruning);
+  function("onnxsim_apply_qmoe_whole_expert_pruning",
+           &onnxsim_apply_qmoe_whole_expert_pruning);
+  function("onnxsim_apply_transformer_block_pruning",
+           &onnxsim_apply_transformer_block_pruning);
+  function("onnxsim_apply_imatrix_quantization",
+           &onnxsim_apply_imatrix_quantization);
 
   // Block-wise QAT: build one block's step graph, run the loop in JS on
   // onnxruntime-web, write the trained state back (see the doc comments
