@@ -7,6 +7,6 @@
     "test": "node --test step_graph_runner.test.mjs"
   },
   "dependencies": {
-    "onnxruntime-web": "^1.19.2"
+    "onnxruntime-web": "^1.29.0"
   }
 }
