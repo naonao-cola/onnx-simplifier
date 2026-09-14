@@ -3,14 +3,24 @@
 The EP aborts on ``Conv`` nodes that rely on default attributes, so the
 legalizer materializes them explicitly; the checker flags the remaining
 known-bad shapes (default-attr ``Conv``, ``LSTM``, ``If``, bf16-typed
-tensors).
+tensors); ``split_model`` spills the graph past an unsupported node to the
+CPU.
 """
 
 import numpy as np
 import onnx
+import pytest
 from onnx import parser
 
-from onnxsim.vitisai_target import check_vitisai_support, legalize_for_vitisai
+from onnxsim.vitisai_target import (
+    check_vitisai_support,
+    legalize_for_vitisai,
+    split_model,
+)
+
+# A bare ``import onnxruntime`` would fail collection (not skip the test) on
+# platforms onnxruntime doesn't ship wheels for (e.g. s390x).
+ort = pytest.importorskip("onnxruntime")
 
 
 def _model(body, initializer=(), opset=18, ir_version=10):
@@ -182,3 +192,82 @@ def test_check_accepts_file_path(tmp_path):
     assert check_vitisai_support(path) == []
     out = legalize_for_vitisai(path)
     onnx.checker.check_model(out)
+
+
+def _run(model, feeds):
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    return sess.run(None, feeds)
+
+
+def _run_split(model, boundary, feeds, boundary_types=None):
+    # Prefix -> suffix reconnected exactly the way the split_model
+    # docstring's own example does.
+    prefix, suffix = split_model(model, boundary, boundary_types=boundary_types or {})
+    outs = [o.name for o in prefix.graph.output]
+    mids = _run(
+        prefix, {k: v for k, v in feeds.items() if k in _session_inputs(prefix)}
+    )
+    feed = dict(zip(outs, mids))
+    inits = {t.name for t in suffix.graph.initializer}
+    for i in suffix.graph.input:
+        if i.name not in feed and i.name not in inits:
+            feed[i.name] = feeds[i.name]
+    return _run(suffix, feed), prefix, suffix
+
+
+def _session_inputs(model):
+    return [i.name for i in model.graph.input]
+
+
+def test_split_linear_chain_matches():
+    rng = np.random.default_rng(0)
+    w = onnx.numpy_helper.from_array(
+        rng.standard_normal((4, 4)).astype(np.float32), "W"
+    )
+    b = onnx.numpy_helper.from_array(rng.standard_normal(4).astype(np.float32), "B")
+    model = _model(
+        """agraph (float[2,4] x) => (float[2,4] y)
+        {
+          h = MatMul(x, W)
+          r = Relu(h)
+          y = Add(r, B)
+        }""",
+        initializer=[w, b],
+    )
+    x = rng.standard_normal((2, 4)).astype(np.float32)
+    (got,), _, _ = _run_split(model, ["h"], {"x": x})
+    (ref,) = _run(model, {"x": x})
+    np.testing.assert_allclose(got, ref, rtol=1e-5)
+
+
+def test_split_at_if_matches():
+    # The detector pattern in miniature: an If the EP cannot take, spilled
+    # past its condition input.
+    rng = np.random.default_rng(1)
+    model = _model(
+        """agraph (bool c, float[2,2] x) => (float[2,2] y)
+        {
+          t = Relu(x)
+          y = If (c) <then_branch = g1 () => (float[2,2] a) { a = Identity (t) },
+            else_branch = g2 () => (float[2,2] e) { e = Neg (t) }>
+        }"""
+    )
+    x = rng.standard_normal((2, 2)).astype(np.float32)
+    for cond in (True, False):
+        feeds = {"c": np.array(cond), "x": x}
+        (got,), _, _ = _run_split(model, ["t"], feeds)
+        (ref,) = _run(model, feeds)
+        np.testing.assert_allclose(got, ref, rtol=1e-5)
+
+
+def test_split_rejects_unknown_boundary():
+    model = _model(
+        """agraph (float[2,2] x) => (float[2,2] y)
+        {
+          y = Relu(x)
+        }"""
+    )
+    with pytest.raises(ValueError, match="not produced by the graph"):
+        split_model(model, ["nope"])
