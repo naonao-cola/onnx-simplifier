@@ -5443,6 +5443,52 @@ must be re-examined; until then the codec walks them as `T` records. What
 thirty sites that keep the short unit keep it -- they show no `R` pattern
 of their own.
 
+### The `0xc1` five
+
+The fixed `01 a4 00 c1 W` form has wilder company: `[H][A][B][0xc1][D]`
+with `H` in `{0x01, 0x30}` and `D` even, 3,062 takes against 671 shuffled
+-- and the takes concentrate where the shuffled ones scatter. Three
+`(A, B)` pairs are 85% of the real takes (`(0x10, 0x02)` alone is 1,561;
+the top shuffled pair manages 41), and the pairs read like the verbs'
+own `(field, bank)` slots: `A` aligned, `B` small. So this is the short
+unit the fixed form only mimicked: a two-byte payload against tag `0xc1`,
+with even-`D` registers where the bare odd pair takes odd ones -- the two
+parities split perfectly by form. The even gate is load-bearing twice
+over: it is 2,721 to 0 in the corpus, and it keeps the new rule disjoint
+from the fixed form, whose tail is always odd (1,690 takes before and
+after, unchanged).
+
+`H = 0x30` is the same shape with a fixed middle (`(0x03, 0xc0)` 429
+times, one variant) -- no prefix can be `0x30`, so it walks as its own
+fixed bytes rather than a short unit, but the codec carries both heads as
+`C` records either way. What the slots program, and whether `0xe1` -- the
+other odd tag, at chance level here -- takes the same shape elsewhere, is
+open. The `0x80`/`0xa0`/`0xc0`/`0xe0` holes in the tag set, probed the same
+way, are real absences: all four occur *below* chance as would-be tags,
+with register parity at the background rate.
+
+### The `0xc1` five
+
+The fixed `01 a4 00 c1 W` form has wilder company: `[H][A][B][0xc1][D]`
+with `H` in `{0x01, 0x30}` and `D` even, 3,062 takes against 671 shuffled
+-- and the takes concentrate where the shuffled ones scatter. Three
+`(A, B)` pairs are 85% of the real takes (`(0x10, 0x02)` alone is 1,561;
+the top shuffled pair manages 41), and the pairs read like the verbs'
+own `(field, bank)` slots: `A` aligned, `B` small. So this is the short
+unit the fixed form only mimicked: a two-byte payload against tag `0xc1`,
+with even-`D` registers where the bare odd pair takes odd ones -- the two
+parities split perfectly by form. The even gate is load-bearing twice
+over: it is 2,721 to 0 in the corpus, and it keeps the new rule disjoint
+from the fixed form, whose tail is always odd (1,690 takes before and
+after, unchanged).
+
+`H = 0x30` is the same shape with a fixed middle (`(0x03, 0xc0)` 429
+times, one variant) -- no prefix can be `0x30`, so it walks as its own
+fixed bytes rather than a short unit, but the codec carries both heads as
+`C` records either way. What the slots program, and whether `0xe1` -- the
+other odd tag, at chance level here -- takes the same shape elsewhere, is
+open.
+
 ## Per-ONNX-op coverage, and what it caught
 
 `op_coverage.py` classifies every operator in the ai.onnx default domain
