@@ -5351,6 +5351,19 @@ locates it by pattern with loud asserts rather than hardcoding
 offsets. Decoding what the pair *means* is open work with device
 evidence in hand.
 
+### A terminal pair before the padding
+
+That open pair is now a form: a two-byte `0b 01` unit admitted where
+the `82 08` tail of a complete short unit stands immediately before it
+and eight zero bytes immediately after. It fires on eight of fourteen
+fixtures with zero shuffled counterparts anywhere, converts only raw
+escapes (decode records are byte-identical everywhere else -- pure
+addition, no stream regresses), and round-trips exactly. The two
+sub-floor Reshape streams improve (93.4% to 93.7%, 93.8% to 94.0%)
+with their remaining singles still pinned. The lone `08` stays
+unformed: its acceptance set (`{00,01,08,0a,0b,0f,88}`, rejecting only
+`09`) admits no clean gate, so pinning exact `08` would over-claim.
+
 ### A five-byte form that programs its pair twice
 
 Sixty-eight further real streams from the AX650N -- CNN, transformer and

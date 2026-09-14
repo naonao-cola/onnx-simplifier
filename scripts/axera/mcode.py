@@ -68,6 +68,7 @@ FULL_RULE = dict(
     repeat=True,
     stutter=True,
     nprefix=True,
+    terminal=True,
 )
 """Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
 six verbs -- the README's "The tail is the segment table" section -- plus
@@ -77,7 +78,8 @@ six-byte prefix ("A six-byte prefix"), the fixed head with a live tail
 ("A fixed head with a live tail"), the two
 adjudicated templates ("An eight-byte template with a fused tail"), the
 `0xc1` five ("The `0xc1` five"), the second repeat form ("A second
-repeat form") and the stuttered pair ("The stuttered pair").
+repeat form"), the stuttered pair ("The stuttered pair") and the terminal
+`0b 01` pair ("A terminal pair before the padding").
 `lookahead` adjudicates the overlaps the greedy walk cannot see past
 ("Adjudicating the overlaps ..."); 64 bytes is where the corpus-wide
 gain converges (32 is slightly worse, 128 no better)."""
@@ -109,6 +111,7 @@ def tokenize(
     repeat=False,
     stutter=False,
     nprefix=False,
+    terminal=False,
 ):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
@@ -134,8 +137,10 @@ def tokenize(
     -- see "An eight-byte template with a fused tail"), 'C' (a
     `[H][A][B][0xc1][D]` unit with `H` in `{0x01, 0x30}` and `D` even --
     see "The `0xc1` five"), 'R' (a `[0x30][0x03][X][0x03][0x09]` repeat
-    unit -- see "A second repeat form"), 'Y' (a stuttered `90 03` echo
-    after a short unit ending in it -- see "The stuttered pair") or '?'
+    unit -- see "A second repeat form"),     'Y' (a stuttered `90 03` echo
+    after a short unit ending in it -- see "The stuttered pair"), 'L' (a
+    terminal `0b 01` pair closing an S-unit rhythm before zero padding --
+    see "A terminal pair before the padding") or '?'
     (a=byte).
 
     Where a short unit ending in `a1 00` overlaps a verb beginning there,
@@ -373,6 +378,27 @@ def tokenize(
             and mcode[i + 7] == 0x81
         )
 
+    def terminal_at(i):
+        """A terminal `0b 01` pair closing an S-unit rhythm before zero
+        padding: the two bytes before it are a complete short unit's tail
+        (`82 08`), the eight bytes after it are zero. Device-mapped on the
+        card (zeroing the pair faults the NPU, zeroing a lone `08` nearby
+        runs bit-identical), 42 exact recurrences corpus-wide against zero
+        shuffled counterparts. Like every other form here its head opens
+        no other rule (`0x0b` alone matches nothing), so it converts only
+        raw escapes. See the README's "A terminal pair before the padding"
+        section."""
+        return (
+            terminal
+            and i >= 2
+            and i + 9 < len(mcode)
+            and mcode[i] == 0x0B
+            and mcode[i + 1] == 0x01
+            and mcode[i - 2] == 0x82
+            and mcode[i - 1] == 0x08
+            and mcode[i + 2 : i + 10] == b"\x00" * 8
+        )
+
     def _plain_step(i):
         """One greedy step: `(token, next offset)`, no adjudication. With
         `lookahead=0` the walk below is exactly this step repeated, byte for
@@ -397,6 +423,8 @@ def tokenize(
         if pair_prefix_at(i):
             kind = "P" if mcode[i] == 0x0B else "D"
             return (i, kind, mcode[i], mcode[i + 1], 0), i + 2
+        if terminal_at(i):
+            return (i, "L", 0, 0, 0), i + 2
         if nprefix_at(i):
             return (i, "N", 0, 0, 0), i + 6
         if fixed5_at(i):
@@ -601,6 +629,8 @@ def decode(mcode, start=None, end=None, **rule):
     * `R`: a `[0x30][0x03][X][0x03][0x09]` repeat unit (`x`: the live slot)
     * `Y`: a stuttered `90 03` echo after a short unit ending in it
       (`a`, `b`)
+    * `L`: a terminal `0b 01` pair closing an S-unit rhythm before zero
+      padding (no payload)
     * `raw`: one byte no form accounts for (`byte`)
 
     Every record also carries `at`, its offset in the original stream, so
@@ -686,6 +716,8 @@ def decode(mcode, start=None, end=None, **rule):
             out.append({"at": o, "kind": "R", "x": t[2]})
         elif kind == "Y":
             out.append({"at": o, "kind": "Y", "a": t[2], "b": t[3]})
+        elif kind == "L":
+            out.append({"at": o, "kind": "L"})
         else:
             out.append({"at": o, "kind": "raw", "byte": t[2]})
     return out
@@ -731,6 +763,8 @@ def encode(records):
             out += bytes([0x30, 0x03, r["x"], 0x03, 0x09])
         elif kind == "Y":
             out += bytes([r["a"], r["b"]])
+        elif kind == "L":
+            out += bytes([0x0B, 0x01])
         else:
             out += bytes([r["byte"]])
     return bytes(out)
