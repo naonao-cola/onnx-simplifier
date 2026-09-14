@@ -16,7 +16,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # (any recent version works -- the ORT C API is stable/backward-compatible);
 # the actual libonnxruntime to run against is chosen at *runtime* via
 # onnx_deploy_load_ort()/--libort, and can be swapped without rebuilding.
-#   cmake -B build -DORT_HOME=/path/to/onnxruntime-linux-x64-1.19.2
+#   cmake -B build -DORT_HOME=/path/to/onnxruntime-linux-x64-1.30.0
 if(NOT ORT_HOME)
   message(FATAL_ERROR "ORT_HOME is not set -- point it at any extracted ONNX Runtime release (only its include/ is used at build time). See README.md.")
 endif()
