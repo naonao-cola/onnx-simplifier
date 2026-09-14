@@ -441,3 +441,53 @@ def test_octet_wins_only_by_adjudication(name):
         if t[1] == "E"
     )
     assert null == 0, (name, null)
+
+
+def _synthetic_template_stream():
+    """A hand-built stream with an `01 98 02 83 R 83 0e 05` template: a
+    short unit, the template (R = `0x40`), and a bare pair."""
+    return bytes.fromhex(
+        "00 08 81 e8"  # S
+        "01 98 02 83 40 83 0e 05"  # T
+        "81 96"  # B
+    )
+
+
+def test_template_with_fused_tail_codec():
+    """The `01 98 02 83 R 83 0e 05` template recurs 5,594 times exactly with
+    zero shuffled counterparts, but its head is a valid short unit -- so
+    like the octet it is taken only by lookahead adjudication, never blind.
+    The committed fixtures carry none, so this pins the codec on a synthetic
+    stream; the corpus numbers are in the README's "An eight-byte template
+    with a fused tail" section."""
+    blob = _synthetic_template_stream()
+    toks = mcode.tokenize(blob, start=0, end=len(blob), **mcode.FULL_RULE)
+    assert [t[1] for t in toks] == ["S", "T", "B"], [t[1] for t in toks]
+    assert toks[1][2] == 0x40
+    records = mcode.decode(blob, start=0, end=len(blob), **mcode.FULL_RULE)
+    assert [r["kind"] for r in records] == ["S", "T", "B"]
+    assert [r["r"] for r in records if r["kind"] == "T"] == [0x40]
+    assert mcode.encode(records) == blob
+
+    # Without the template the head parses as the short unit it mimics.
+    plain = dict(mcode.FULL_RULE)
+    plain["template8"] = False
+    kinds_off = [t[1] for t in mcode.tokenize(blob, start=0, end=len(blob), **plain)]
+    assert kinds_off == ["S", "S", "B", "?", "B"], kinds_off
+
+    # The template's bytes hide no verb.
+    assert not set(bytes.fromhex("01 98 02 83 83 0e 05")) & set(mcode.VERBS6)
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_template8_never_regresses_coverage(name):
+    """Adjudicated templates can only move bytes from raw escapes into
+    recognised forms or leave the walk where it was: per-stream coverage
+    with the template on is never below it off. (The fixtures carry no
+    templates, so this pins equality there and guards the plumbing.)"""
+    blob = _blob(name)
+    plain = dict(mcode.FULL_RULE)
+    plain["template8"] = False
+    covered_plain, _ = mcode.nonzero_coverage(blob, **plain)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    assert covered_with >= covered_plain, (name, covered_plain, covered_with)

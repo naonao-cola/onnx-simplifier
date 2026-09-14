@@ -5421,6 +5421,28 @@ toggles, and the anchor: the same four prefix bytes without the verb stay
 raw). What `W` selects, and what distinguishes a prefixed
 `a1 00 c0 81` verb from the 57 unprefixed ones, is open.
 
+### An eight-byte template with a fused tail
+
+The `02 83 R 83 0e 05` six-byte runs that no rule could stand on turn out
+to be the tail of an eight-byte template: every one of the 5,594
+occurrences corpus-wide is preceded by exactly `01 98`, with zero shuffled
+counterparts. Read it as a short unit (`p = 1`, tag `0x83`) fused with a
+bare pair and a trailing `05` -- except the walk already parses that head
+as a short unit, so the template is an overlap dispute of the same shape as
+the octet's, and goes through the same adjudication rather than a guard:
+5,564 takes, zero regressions, zero shuffled takes.
+
+The takes are near-unanimous (99.5%), which deserves one honest caveat: had
+the `05` been an established one-byte marker unit, every take would be
+absorbing a genuine marker as a template tail. Markers have no independent
+evidence -- no rule, no anchor, only the lone-byte mass -- while the
+template has 5,594 exact recurrences against zero shuffled, so the evidence
+hierarchy favours the template. The day a marker rule exists, these tails
+must be re-examined; until then the codec walks them as `T` records. What
+`R` selects (even values, `0x80` and `0x7e` dominant) is open, as is why the
+thirty sites that keep the short unit keep it -- they show no `R` pattern
+of their own.
+
 ## Per-ONNX-op coverage, and what it caught
 
 `op_coverage.py` classifies every operator in the ai.onnx default domain
