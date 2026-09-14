@@ -5379,11 +5379,17 @@ form may be a four-byte prefix ending in `0x91`, of which `0b 91` is only
 the anchored, provable half. Second, an eight-byte
 `04 40 84 18 83 R TT 40` template recurs 2,252 times exactly (R always even,
 `0x42..0x58`; TT in `{01, 02, 03}`) with zero shuffled counterparts -- real
-by recurrence, but parked: its tail `TT 40` usually completes a
-genuine-looking short unit, so taking the template means breaking that unit,
-and taking it unconditionally was measured to *lose* 1,800 bytes net. Like
-the verb splits before the lookahead, it is an overlap dispute, and it wants
-adjudication, not a guard.
+by recurrence. Taking it unconditionally was measured to *lose* 1,800 bytes
+net, because its tail `TT 40` usually completes a genuine-looking short
+unit: taking the template means breaking that unit. Like the verb splits
+before the lookahead, it is an overlap dispute, and it goes through the
+same adjudication rather than a guard: each template site is walked both
+ways, and the template wins only by leaving less unexplained behind. 394
+takes corpus-wide, zero regressions, zero shuffled takes -- and every take
+has tail `TT == 0x01`. The short units that lose are always the shortest
+kind (`p = 1`), the kind most easily completed by chance; the longer-tailed
+ones keep winning. The octet walks as an `E` record where taken, and the
+toggle stays off everywhere else.
 
 ### A fixed head with a live tail
 

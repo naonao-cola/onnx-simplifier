@@ -372,3 +372,72 @@ def test_fixed_head_and_verb_prefix_codec():
     # Neither form's bytes can hide a verb.
     assert not set(bytes.fromhex("01 a4 00 c1")) & set(mcode.VERBS6)
     assert not set(bytes.fromhex("05 10 e2 0e")) & set(mcode.VERBS6)
+
+
+# Octet takes per committed stream -- the `04 40 84 18 83 R TT 40`
+# template is adjudicated per site, and only the training step's stream
+# takes it (once). See `test_octet_wins_only_by_adjudication`.
+_E_COUNTS = {
+    "conv64_k5_d2": 0,
+    "conv128_k7_d12": 0,
+    "piper_vocoder": 0,
+    "w2v2fe_training_step": 1,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_octet_wins_only_by_adjudication(name):
+    """The `04 40 84 18 83 R TT 40` template recurs exactly with zero
+    shuffled counterparts, but its tail usually completes a genuine-looking
+    short unit -- taking it unconditionally was measured to lose net bytes.
+    So it is never taken blind: only by lookahead adjudication against
+    skipping it, like the verb splits. Pinned here on the training step's
+    single take. See the README's "Bookend pairs" section."""
+    blob = _blob(name)
+    lo, hi = mcode.stream_bounds(blob)
+    toks = mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    takes = [t for t in toks if t[1] == "E"]
+    assert len(takes) == _E_COUNTS[name], (name, len(takes))
+    for o, _, a, b, _ in takes:
+        assert bytes(blob[o : o + 8])[:6] == bytes([0x04, 0x40, 0x84, 0x18, 0x83, a])
+        assert bytes(blob[o + 6 : o + 8]) == bytes([b, 0x40]), (name, o)
+        assert a not in mcode.VERBS6 and b not in mcode.VERBS6, (name, o)
+    records = mcode.decode(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    assert [(r["a"], r["b"]) for r in records if r["kind"] == "E"] == [
+        (a, b) for _, _, a, b, _ in takes
+    ]
+
+    # The take and the skip, side by side, on the training step's site.
+    if takes:
+        o = takes[0][0]
+        assert o == 7826, o
+        assert bytes(blob[o : o + 8]) == bytes(
+            [0x04, 0x40, 0x84, 0x18, 0x83, 0x66, 0x01, 0x40]
+        )
+        plain = dict(mcode.FULL_RULE)
+        plain["octet"] = False
+        skipped = [t for t in mcode.tokenize(blob, start=o, end=o + 16, **plain)]
+        assert [t[1] for t in skipped] == ["?", "?", "B", "B", "S", "B", "S"], [
+            t[1] for t in skipped
+        ]
+
+    # Admitting it buys coverage where it takes, and nowhere else.
+    without = dict(mcode.FULL_RULE)
+    without["octet"] = False
+    covered_without, _ = mcode.nonzero_coverage(blob, **without)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    if _E_COUNTS[name]:
+        assert covered_with > covered_without, (name, covered_without, covered_with)
+    else:
+        assert covered_with == covered_without, (name, covered_without, covered_with)
+
+    # The template never occurs by chance.
+    bulk = bytearray(blob[lo:hi])
+    random.Random(0).shuffle(bulk)
+    shuffled = bytes(blob[:lo]) + bytes(bulk) + bytes(blob[hi:])
+    null = sum(
+        1
+        for t in mcode.tokenize(shuffled, start=lo, end=hi, **mcode.FULL_RULE)
+        if t[1] == "E"
+    )
+    assert null == 0, (name, null)

@@ -62,6 +62,7 @@ FULL_RULE = dict(
     pair_prefix=True,
     fixed5=True,
     vprefix=True,
+    octet=True,
 )
 """Every validated form: all tags, p <= 4, bare pairs, the 0x9f extra byte,
 six verbs -- the README's "The tail is the segment table" section -- plus
@@ -93,6 +94,7 @@ def tokenize(
     pair_prefix=False,
     fixed5=False,
     vprefix=False,
+    octet=False,
 ):
     """Tokenize an mcode blob's bulk with every validated form -- the 8/7-byte
     verb instructions, the width-rule short units `[p][p+1 bytes][tag]
@@ -110,7 +112,9 @@ def tokenize(
     class" section), 'F' (a fixed `01 a4 00 c1 W` unit: the middle never
     varies, only the last byte does), 'X' (a four-byte `05 10 e2 0e` verb
     prefix -- both see the README's "A fixed head with a live tail"
-    section) or '?' (a=byte).
+    section), 'E' (an octet `04 40 84 18 83 R TT 40`, taken only when the
+    lookahead adjudicates its overlap in its favour -- see "Bookend pairs"
+    and "Adjudicating the overlaps ...") or '?' (a=byte).
 
     Where a short unit ending in `a1 00` overlaps a verb beginning there,
     the greedy walk cannot tell a genuine tag from a swallowed verb head by
@@ -181,6 +185,30 @@ def tokenize(
             and mcode[i] == 0x04
             and mcode[i + 1] == mcode[i + 3]
             and mcode[i + 2] == mcode[i + 4]
+        )
+
+    def octet_at(i):
+        """An 8-byte `04 40 84 18 83 R TT 40` template: fixed bookends around
+        two bare pairs (R always even, `0x42..0x58`) and a small tail tag.
+        The template recurs 2,252 times exactly with zero shuffled
+        counterparts, but its tail `TT 40` usually completes a
+        genuine-looking short unit, so taking it unconditionally breaks that
+        unit and loses net bytes -- like the verb splits before the
+        lookahead, it is an overlap dispute, adjudicated per site in the
+        walk below rather than taken blind. See the README's "Bookend
+        pairs" section."""
+        return (
+            octet
+            and i + 7 < len(mcode)
+            and mcode[i] == 0x04
+            and mcode[i + 1] == 0x40
+            and mcode[i + 2] == 0x84
+            and mcode[i + 3] == 0x18
+            and mcode[i + 4] == 0x83
+            and mcode[i + 7] == 0x40
+            and not quintet_at(i + 6)
+            and not companion_at(i + 6)
+            and not companion_at(i + 7)
         )
 
     def pair_prefix_at(i):
@@ -294,6 +322,19 @@ def tokenize(
 
     out, i = [], start
     while i < end:
+        if lookahead and octet and octet_at(i):
+            # The octet template overlaps the short unit starting at its
+            # tail: taking the template breaks that unit, skipping it leaves
+            # the bookends raw. Walk both parses; the template wins only by
+            # leaving less unexplained behind, ties skipping it.
+            cost_take = _simulate_cost(i + 8, i + 8 + lookahead)
+            cost_skip = (1 if mcode[i] else 0) + _simulate_cost(
+                i + 1, i + 1 + lookahead
+            )
+            if cost_take < cost_skip:
+                out.append((i, "E", mcode[i + 5], mcode[i + 6], 0))
+                i += 8
+                continue
         tok, nxt = _plain_step(i)
         if (
             lookahead
@@ -411,6 +452,8 @@ def decode(mcode, start=None, end=None, **rule):
     * `D`: a `05 90` doublet, raw on both bytes (`x`, `y`)
     * `F`: a fixed `01 a4 00 c1 W` unit (`w`: the one live byte)
     * `X`: a `05 10 e2 0e` prefix under its anchored verb (no payload)
+    * `E`: an octet `04 40 84 18 83 R TT 40`, taken only by adjudication
+      (`R`, `TT`)
     * `raw`: one byte no form accounts for (`byte`)
 
     Every record also carries `at`, its offset in the original stream, so
@@ -482,6 +525,8 @@ def decode(mcode, start=None, end=None, **rule):
             out.append({"at": o, "kind": "F", "w": t[2]})
         elif kind == "X":
             out.append({"at": o, "kind": "X"})
+        elif kind == "E":
+            out.append({"at": o, "kind": "E", "a": t[2], "b": t[3]})
         else:
             out.append({"at": o, "kind": "raw", "byte": t[2]})
     return out
@@ -515,6 +560,8 @@ def encode(records):
             out += bytes([0x01, 0xA4, 0x00, 0xC1, r["w"]])
         elif kind == "X":
             out += bytes([0x05, 0x10, 0xE2, 0x0E])
+        elif kind == "E":
+            out += bytes([0x04, 0x40, 0x84, 0x18, 0x83, r["a"], r["b"], 0x40])
         else:
             out += bytes([r["byte"]])
     return bytes(out)
