@@ -523,6 +523,23 @@ export async function applySmoothQuant(
   ]);
 }
 
+/**
+ * Outlier Suppression+ shifting and scaling (lossless pre-conditioning
+ * ahead of a W8A8 quantizer): recenters activation channels with a `Sub`,
+ * rescales with a `Mul`, restores the shift's contribution with an output
+ * `Add`. Returns a float model.
+ */
+export async function applyOutlierSuppressionPlus(
+  model,
+  calibration,
+  { alpha = 0.5, epsilon = 1e-5 } = {},
+) {
+  return callCalibratedPass("onnxsim_apply_outlier_suppression_plus", model, calibration, [
+    alpha,
+    epsilon,
+  ]);
+}
+
 export default {
   simplify,
   versions,
@@ -558,5 +575,6 @@ export default {
   applyTransformerBlockPruning,
   applyImatrixQuantization,
   applyOutlierSuppression,
+  applyOutlierSuppressionPlus,
   applySmoothQuant,
 };

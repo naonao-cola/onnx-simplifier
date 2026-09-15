@@ -2443,6 +2443,82 @@ def apply_smoothquant_cpp(
     )
 
 
+def apply_outlier_suppression_plus_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    alpha: float = 0.5,
+    epsilon: float = 1e-5,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_outlier_suppression_plus`:
+    Outlier Suppression+ (Wei et al., 2023) channel-wise shifting and
+    scaling -- recenters every matched MatMul/vanilla-Gemm layer's
+    constant 2-D FLOAT32 activation channels around zero, rescales the
+    weight columns by the per-channel scale ``s`` in place, inserts a
+    ``Sub``+``Mul`` pair applying the shift and scale before the layer,
+    and inserts an ``Add`` after it restoring the shift's constant
+    contribution to the output. Returns a float model -- pass the result
+    to a W8A8 quantizer (e.g. :func:`onnxsim.quantize_static`) to actually
+    quantize it.
+
+    Same real calibration machinery as
+    :func:`onnxsim.apply_outlier_suppression_cpp` -- a live
+    :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see
+    ``ApplyOutlierSuppressionPlus`` in
+    ``outlier_suppression_plus_entry.h`` for the full scope).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to measure each
+            input channel's activation range on -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param alpha: the scaling step's migration strength, identical in
+            meaning to :func:`onnxsim.apply_smoothquant_cpp`'s own
+            ``alpha`` (applied to the *shifted* activation's range)
+    :param epsilon: floor applied to every per-channel activation/weight
+            max-abs value (and to the scale itself) before computing it
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched layer shifted, scaled, and
+            output-corrected; layers with a non-constant/non-2-D weight,
+            or whose activation was never observed as a plain 2-D tensor
+            matching the weight's reduction dimension, are left untouched.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_outlier_suppression_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_outlier_suppression_plus(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            alpha,
+            epsilon,
+        )
+    )
+
+
 def apply_moe_expert_channel_pruning_cpp(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,

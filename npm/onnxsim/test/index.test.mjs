@@ -28,6 +28,7 @@ import {
   applyIq4Nl,
   applyMoeExpertChannelPruning,
   applyOutlierSuppression,
+  applyOutlierSuppressionPlus,
   applyQuarot,
   applySmoothQuant,
   applyStructuredPruning,
@@ -178,6 +179,20 @@ try {
     const out = await applySmoothQuant(input, [batch(), batch()], { alpha: 0.5 });
     assert.ok(out instanceof Uint8Array);
     assert.ok(out.length > 0);
+  });
+
+  await check("applyOutlierSuppressionPlus migrates scales on synthetic calibration data", async () => {
+    // The shared MatMul fixture migrates for real here (unlike the
+    // LayerNorm-gated check above): the point is the Sub/Mul/Add rewrite
+    // round-trips through the binding, not just a decline.
+    const ort = await import("onnxruntime-web");
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 4.0, 8.0]), [1, 4]),
+    });
+    const out = await applyOutlierSuppressionPlus(input, [batch(), batch()], { alpha: 0.5 });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > input.length);
   });
 
   console.log(`PASS: ${passed} checks`);
