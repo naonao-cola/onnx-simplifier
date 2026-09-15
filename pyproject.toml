@@ -109,6 +109,15 @@ drivetransformer = ["torch"]
 # 'onnxscript'" if it is missing, so it is listed here too rather than left
 # for that confusing error to surface.
 torch-training = ["torch >= 2.5", "onnxscript"]
+# Needed by onnxsim.webgpu_tinygrad_codegen, which builds real tinygrad
+# Tensor graphs and renders them to WGSL via tinygrad's own WGSLRenderer to
+# generate WebGPU kernels for the gaps onnxsim.webgpu_target flags (Conv
+# with a 3-D spatial rank, Resize align_corners). Never imported unless a
+# caller calls one of that module's generate_* functions -- see its own
+# docstring for why it depends on tinygrad's actual (not a stable public
+# API) internals, and why no real GPU/dawn library is needed just to
+# generate a kernel. Built and verified against tinygrad==0.14.0.
+webgpu-codegen = ["tinygrad == 0.14.0"]
 
 [project.urls]
 Homepage = "https://github.com/onnxsim/onnxsim"

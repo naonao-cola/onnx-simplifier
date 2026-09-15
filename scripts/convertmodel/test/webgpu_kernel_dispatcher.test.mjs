@@ -80,7 +80,7 @@ function serveConvertmodelDir() {
 async function runInPage({ port, file, nodeName, n }) {
   const base = `http://localhost:${port}`;
   const { readWebgpuKernelSpecs } = await import(`${base}/onnx_node_metadata.mjs`);
-  const { dispatchWebgpuKernel, createStorageBuffer, readBackFloat32Buffer } = await import(
+  const { dispatchWebgpuProgram, createStorageBuffer, readBackFloat32Buffer } = await import(
     `${base}/webgpu_kernel_dispatcher.mjs`
   );
 
@@ -107,7 +107,7 @@ async function runInPage({ port, file, nodeName, n }) {
   const bufferB = createStorageBuffer(device, b);
   const bufferC = createStorageBuffer(device, new Float32Array(n)); // zero-initialized output
 
-  await dispatchWebgpuKernel(
+  await dispatchWebgpuProgram(
     device,
     spec,
     new Map([

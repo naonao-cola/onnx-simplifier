@@ -348,6 +348,7 @@ from onnxsim.vitisai_target import (
 from onnxsim.webgpu_kernel_metadata import (
     WebgpuKernelBinding,
     WebgpuKernelSpec,
+    WebgpuKernelStep,
     attach_webgpu_kernel,
     list_webgpu_kernels,
     read_webgpu_kernel,
@@ -359,6 +360,7 @@ from onnxsim.webgpu_target import (
     check_webgpu_support,
     estimate_webgpu_islands,
 )
+from onnxsim.webgpu_tinygrad_codegen import generate_conv_kernel, generate_resize_kernel
 from onnxsim.webnn_target import check_webnn_support, estimate_webnn_islands
 from onnxsim.xnnpack_codegen import export_xnnpack_c, generate_xnnpack_c
 from onnxsim.zeroquant import apply_zeroquant
@@ -529,9 +531,12 @@ __all__ = [
     "estimate_webgpu_islands",
     "WebgpuKernelBinding",
     "WebgpuKernelSpec",
+    "WebgpuKernelStep",
     "attach_webgpu_kernel",
     "list_webgpu_kernels",
     "read_webgpu_kernel",
+    "generate_conv_kernel",
+    "generate_resize_kernel",
     "check_webnn_support",
     "estimate_webnn_islands",
     "chain_slim",

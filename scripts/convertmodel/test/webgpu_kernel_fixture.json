@@ -10,22 +10,22 @@
   ],
   "bindings": [
     {
-      "tensor": "a",
       "group": 0,
       "binding": 0,
-      "access": "read"
+      "access": "read",
+      "tensor": "a"
     },
     {
-      "tensor": "b",
       "group": 0,
       "binding": 1,
-      "access": "read"
+      "access": "read",
+      "tensor": "b"
     },
     {
-      "tensor": "c",
       "group": 0,
       "binding": 2,
-      "access": "read_write"
+      "access": "read_write",
+      "tensor": "c"
     }
   ]
 }
