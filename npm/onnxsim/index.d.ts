@@ -196,6 +196,12 @@ export function applyLlmInt8(
   calibration: CalibrationData,
   options?: { outlierThreshold?: number; epsilon?: number },
 ): Promise<Uint8Array>;
+export function applyGptq(
+  floatModel: OnnxModelBytes,
+  quantizedModel: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: { percdamp?: number; procBlockSize?: number },
+): Promise<Uint8Array>;
 export function applySmoothQuant(
   model: OnnxModelBytes,
   calibration: CalibrationData,
@@ -244,6 +250,7 @@ declare const _default: {
   applyOutlierSuppression: typeof applyOutlierSuppression;
   applyOutlierSuppressionPlus: typeof applyOutlierSuppressionPlus;
   applyLlmInt8: typeof applyLlmInt8;
+  applyGptq: typeof applyGptq;
   applySmoothQuant: typeof applySmoothQuant;
 };
 export default _default;

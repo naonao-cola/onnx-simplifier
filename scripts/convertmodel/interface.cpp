@@ -2830,6 +2830,44 @@ em::val onnxsim_apply_smoothquant(const std::string &data,
   }
 }
 
+// GPTQ (Frantar et al., 2022): sequential, Hessian-compensated INT4
+// rounding for every quantize_weight_only_int4-quantized MatMul/Gemm
+// layer shared (by node output name) between a float model and its
+// quantized counterpart, reusing that scheme's own per-block scales.
+// Takes two models: the float model (whose graph inputs the calibration
+// batches are keyed to, and which the executor runs) and the quantized
+// model (which comes back with rewritten INT4 codes). Same
+// calibration-batch contract and executor as every other
+// calibration-driven binding above. `percdamp` is the Hessian damping
+// factor; `proc_block_size` is GPTQ's own column-processing block size
+// (not the quantization scale's block size, which is reused unchanged).
+// See ApplyGptq in gptq_entry.h.
+em::val onnxsim_apply_gptq(const std::string &float_data,
+                           const std::string &quantized_data,
+                           em::val calibration_batches_val, double percdamp,
+                           int proc_block_size) {
+  onnx::ModelProto float_model;
+  if (!float_model.ParseFromArray(float_data.data(), float_data.size())) {
+    std::cerr << "Parse failed (float model)" << std::endl;
+    return em::val::null();
+  }
+  onnx::ModelProto quantized_model;
+  if (!quantized_model.ParseFromArray(quantized_data.data(),
+                                      quantized_data.size())) {
+    std::cerr << "Parse failed (quantized model)" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyGptq(
+        float_model, quantized_model, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), percdamp,
+        proc_block_size));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_gptq error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // Outlier Suppression+ (Wei et al., 2023): per-channel shifting ahead of
 // SmoothQuant's own per-channel scale -- recenters each activation
 // channel around zero, rescales the weight columns in place, inserts a
@@ -2980,6 +3018,7 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_apply_outlier_suppression_plus",
            &onnxsim_apply_outlier_suppression_plus);
   function("onnxsim_apply_llm_int8", &onnxsim_apply_llm_int8);
+  function("onnxsim_apply_gptq", &onnxsim_apply_gptq);
   function("onnxsim_apply_smoothquant", &onnxsim_apply_smoothquant);
 
   // Block-wise QAT: build one block's step graph, run the loop in JS on

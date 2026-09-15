@@ -974,6 +974,41 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a,
       "outlier_threshold"_a = 6.0, "epsilon"_a = 1e-8);
 
+  // GPTQ (Frantar et al., 2022): sequential, Hessian-compensated INT4
+  // rounding for every quantize_weight_only_int4-quantized MatMul/Gemm
+  // layer shared (by node output name) between a float model and its
+  // quantized counterpart, reusing that scheme's own per-block scales and
+  // changing only which integer each element rounds to. Same
+  // executor-as-first-argument shape as every other calibration-driven
+  // binding, except the first two arguments are the float and quantized
+  // model bytes respectively; `calibration_data` (List[Dict[str,
+  // onnx.TensorProto]]) is keyed to the float model's own graph inputs.
+  // See ApplyGptq in gptq_entry.h for the full scope and
+  // onnxsim/gptq.py for the technique this ports.
+  m.def(
+      "apply_gptq",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double percdamp, int64_t proc_block_size) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result =
+            ApplyGptq(float_model, quantized_model, *executor, calibration_data,
+                      percdamp, proc_block_size);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "percdamp"_a = 0.01, "proc_block_size"_a = 128);
+
   // SmoothQuant migration (Xiao et al., 2022): rescales every matched
   // MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight columns by the
   // per-channel migration scale `s` in place and inserts a `Mul` node
