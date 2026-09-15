@@ -1042,6 +1042,41 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "num_alpha_steps"_a = 20);
 
+  // QuaRot+GPTQ (Ashkboos et al., 2024): the real QuaRot paper's optional,
+  // tighter weight quantizer -- rotates every matched MatMul/vanilla-Gemm
+  // node's activation by a fresh per-layer random orthogonal matrix and
+  // quantizes both operands to INT4, the weight via ApplyGptq's own
+  // Hessian-compensated column algorithm (evaluated in the rotated
+  // activation space) instead of round-to-nearest. Unlike apply_gptq/
+  // apply_awq's own two-model bindings above, there is only one model here
+  // (this pass derives its own rotation and quantizes from scratch, like
+  // ApplyQuarot's own data-free pass); `calibration_data` (List[Dict[str,
+  // onnx.TensorProto]]) is keyed to that single model's own graph inputs.
+  // See ApplyQuarotGptq in quarot_gptq_entry.h for the full scope and
+  // onnxsim/quarot.py for the technique this ports.
+  m.def(
+      "apply_quarot_gptq",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         uint64_t seed, int64_t block_size, double percdamp,
+         int64_t proc_block_size, float epsilon) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplyQuarotGptq(model, *executor, calibration_data, seed,
+                            block_size, percdamp, proc_block_size, epsilon);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "seed"_a = 0,
+      "block_size"_a = 32, "percdamp"_a = 0.01, "proc_block_size"_a = 128,
+      "epsilon"_a = 1e-12);
+
   // SmoothQuant migration (Xiao et al., 2022): rescales every matched
   // MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight columns by the
   // per-channel migration scale `s` in place and inserts a `Mul` node

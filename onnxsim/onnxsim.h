@@ -24,6 +24,7 @@
 #include "llm_int8_entry.h"
 #include "outlier_suppression_entry.h"
 #include "outlier_suppression_plus_entry.h"
+#include "quarot_gptq_entry.h"
 #include "smoothquant_entry.h"
 #include "structured_pruning_entry.h"
 
@@ -825,6 +826,18 @@ onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
 // also included above) is documented in its own home header instead of
 // this one. See awq.py's own module docstring for the technique and
 // awq_entry.h for this port's own scope.
+
+// QuaRot+GPTQ (Ashkboos et al., 2024): ApplyQuarot's own per-layer random
+// rotation and data-free activation quantization, but with the weight
+// quantized via ApplyGptq's own Hessian-based column algorithm (evaluated
+// in the rotated activation space) instead of round-to-nearest -- C++ port
+// of quarot.py's own apply_quarot_gptq, declared in quarot_gptq_entry.h
+// (included above) rather than duplicated here, mirroring how ApplyAwq
+// (awq_entry.h, also included above) is documented in its own home header
+// instead of this one. See quarot.py's own module docstring for the
+// technique and quarot_gptq_entry.h for this port's own scope (including
+// its accepted numerical scope and its own permanent RNG divergence from
+// the Python reference, shared with ApplyQuarot's).
 
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller

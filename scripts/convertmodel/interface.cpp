@@ -2900,6 +2900,43 @@ em::val onnxsim_apply_awq(const std::string &float_data,
   }
 }
 
+// QuaRot+GPTQ (Ashkboos et al., 2024): the real QuaRot paper's optional,
+// tighter weight quantizer -- rotates every matched MatMul/vanilla-Gemm
+// node's activation by a fresh per-layer random orthogonal matrix and
+// quantizes both operands to INT4, the weight via onnxsim_apply_gptq's own
+// Hessian-compensated column algorithm (evaluated in the rotated
+// activation space) instead of round-to-nearest. Unlike
+// onnxsim_apply_gptq/onnxsim_apply_awq above, takes a single model (this
+// pass derives its own rotation and quantizes from scratch, like
+// onnxsim_apply_quarot's own data-free binding above); same
+// calibration-batch contract and executor as every other calibration-driven
+// binding. `seed` arrives as a JS number (double) and is narrowed to the
+// uint64 it feeds, the same way onnxsim_apply_quarot's own does;
+// `block_size`/`epsilon` mirror onnxsim_apply_quarot's own parameters,
+// `percdamp`/`proc_block_size` mirror onnxsim_apply_gptq's own. See
+// ApplyQuarotGptq in quarot_gptq_entry.h.
+em::val onnxsim_apply_quarot_gptq(const std::string &data,
+                                  em::val calibration_batches_val,
+                                  double seed, int block_size,
+                                  double percdamp, int proc_block_size,
+                                  float epsilon) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyQuarotGptq(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val),
+        static_cast<uint64_t>(seed), block_size, percdamp, proc_block_size,
+        epsilon));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_quarot_gptq error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // Outlier Suppression+ (Wei et al., 2023): per-channel shifting ahead of
 // SmoothQuant's own per-channel scale -- recenters each activation
 // channel around zero, rescales the weight columns in place, inserts a
@@ -3052,6 +3089,7 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_apply_llm_int8", &onnxsim_apply_llm_int8);
   function("onnxsim_apply_gptq", &onnxsim_apply_gptq);
   function("onnxsim_apply_awq", &onnxsim_apply_awq);
+  function("onnxsim_apply_quarot_gptq", &onnxsim_apply_quarot_gptq);
   function("onnxsim_apply_smoothquant", &onnxsim_apply_smoothquant);
 
   // Block-wise QAT: build one block's step graph, run the loop in JS on
