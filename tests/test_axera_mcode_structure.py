@@ -1532,6 +1532,22 @@ def test_splice_gap_bytes_split_inert_vs_fault(tmp_path):
         dev_live.error,
     )
 
+    # The single byte is not value-agnostic: 0x29 faults like the pair
+    # while 0x19 runs bit-identical, ruling out both a low-nibble rule
+    # (0x19/0x89/0x99 pass) and a bit5 rule (0x69 passes) -- the full
+    # matrix (fault {09,29,39,49,A9}, inert otherwise at this position)
+    # is recorded in the README, with no clean bitwise gate found.
+    dev_narrow = run_patched([(single, b"\x29")])
+    assert dev_narrow.error and "0x8030070C" in dev_narrow.error, (
+        "0x29 at the single position should fault the runtime",
+        dev_narrow.error,
+    )
+    dev_wide = run_patched([(single, b"\x19")])
+    assert not dev_wide.error, dev_wide.error
+    assert np.array_equal(np.frombuffer(dev_wide.outputs[0], dtype=np.float32), ref), (
+        "0x19 at the single position should run bit-identical"
+    )
+
 
 def test_bit_flip_probe_on_real_resnet18d_has_three_outcome_classes(tmp_path):
     """Confirmed real (see the README's "The bit-flip probe on the real

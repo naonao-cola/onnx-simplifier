@@ -5366,9 +5366,19 @@ and eight zero bytes immediately after. It fires on eight of fourteen
 fixtures with zero shuffled counterparts anywhere, converts only raw
 escapes (decode records are byte-identical everywhere else -- pure
 addition, no stream regresses), and round-trips exactly. The lone `08`
-stays unformed: its acceptance set (`{00,01,08,0a,0b,0f,88}`,
-rejecting only `09`) admits no clean gate, so pinning exact `08` would
-over-claim.
+stays unformed: a 17-value sweep at its position (fault
+`{09,29,39,49,A9}`, inert everything else tried including
+`19,59,69,79,89,99,B9,C9,E9`) refutes both a low-nibble rule and a
+bit5 gate with no clean replacement in sight, so pinning exact `08`
+would over-claim -- the splice test locks in two representatives
+(`0x29` faults, `0x19` runs identical) instead.
+
+Sibling trailers split the same way, probed by zeroing whole runs:
+the Reshape->MatMul seg2 `20 c4 07 a3 f7 0b` and the Adam seg2 `0b 32`
++ `20` both fault (live epilogue forms, same class as `0b 01`), while
+the Neg seg3 `09 a3 0b 0b` runs bit-identical (dead bytes -- not every
+unexplained run is load-bearing, which is why each family needs its
+own probe rather than a blanket rule).
 
 ### Trailer singles abutting the next segment
 
