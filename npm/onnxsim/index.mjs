@@ -210,6 +210,16 @@ export async function applyGgufQ4_1(model) {
   return callModelPass("onnxsim_apply_gguf_q4_1", model);
 }
 
+/** GGUF Q5_0 weight-only quantization. */
+export async function applyGgufQ5_0(model) {
+  return callModelPass("onnxsim_apply_gguf_q5_0", model);
+}
+
+/** GGUF Q5_1 weight-only quantization. */
+export async function applyGgufQ5_1(model) {
+  return callModelPass("onnxsim_apply_gguf_q5_1", model);
+}
+
 /** GGUF ternary weight-only quantization. */
 export async function applyGgufTernary(model) {
   return callModelPass("onnxsim_apply_gguf_ternary", model);
@@ -833,6 +843,8 @@ export default {
   applyIq4Nl,
   applyGgufQ4_0,
   applyGgufQ4_1,
+  applyGgufQ5_0,
+  applyGgufQ5_1,
   applyGgufTernary,
   applyFp6Llm,
   applyGgufQ6K,

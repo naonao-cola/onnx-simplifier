@@ -107,6 +107,8 @@ export function applyQuarot(
 export function applyIq4Nl(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyGgufQ4_0(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyGgufQ4_1(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyGgufQ5_0(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyGgufQ5_1(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyGgufTernary(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyFp6Llm(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyGgufQ6K(model: OnnxModelBytes): Promise<Uint8Array>;
@@ -293,6 +295,8 @@ declare const _default: {
   applyIq4Nl: typeof applyIq4Nl;
   applyGgufQ4_0: typeof applyGgufQ4_0;
   applyGgufQ4_1: typeof applyGgufQ4_1;
+  applyGgufQ5_0: typeof applyGgufQ5_0;
+  applyGgufQ5_1: typeof applyGgufQ5_1;
   applyGgufTernary: typeof applyGgufTernary;
   applyFp6Llm: typeof applyFp6Llm;
   applyGgufQ6K: typeof applyGgufQ6K;

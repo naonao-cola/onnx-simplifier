@@ -1573,6 +1573,37 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // llama.cpp's legacy GGUF Q5_0/Q5_1 block formats: weight-only 5-bit
+  // quantization, one plain 32-element block per scale(/min) -- the same
+  // scheme as Q4_0/Q4_1 above, one bit wider. Data-free. See
+  // ApplyGgufQ5_0/ApplyGgufQ5_1 in onnxsim.h.
+  m.def(
+      "apply_gguf_q5_0_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyGgufQ5_0(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+  m.def(
+      "apply_gguf_q5_1_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyGgufQ5_1(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // BitNet b1.58's published absmean ternary weight quantization, as
   // shipped by llama.cpp's GGUF TQ1_0/TQ2_0 tensor types: weight-only,
   // one shared {-1, 0, +1} scale per 256-element block. Data-free. See

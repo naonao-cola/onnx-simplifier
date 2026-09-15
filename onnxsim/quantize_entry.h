@@ -84,6 +84,8 @@ onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
 onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufQ4_0(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufQ4_1(const onnx::ModelProto& model);
+onnx::ModelProto ApplyGgufQ5_0(const onnx::ModelProto& model);
+onnx::ModelProto ApplyGgufQ5_1(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufTernaryQuant(const onnx::ModelProto& model);
 onnx::ModelProto ApplyFp6Llm(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
