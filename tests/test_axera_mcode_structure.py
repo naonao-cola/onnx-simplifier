@@ -1549,6 +1549,91 @@ def test_splice_gap_bytes_split_inert_vs_fault(tmp_path):
     )
 
 
+def test_out_of_range_inputs_saturate_at_calib_max(tmp_path):
+    """Confirmed real on an AX650N: feeding inputs outside the calibration
+    range does not error and does not track -- outputs pin at the
+    calibrated maximum (MinMax input quantization is live, with its
+    parameters encoded non-literally: no float32 scale words for the
+    inputs exist anywhere in the stream, unlike the output's stride-7
+    quadruples). A Mul calibrated on [-1,1] tracks constant inputs
+    exactly up to 2.0, then pins: 2.5/3.0/4.0 all read back the same
+    ~1.97. Needs Docker (build) and a card (run)."""
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device connected")
+
+    model = helper.make_model(
+        helper.make_graph(
+            [helper.make_node("Mul", ["x", "y"], ["z"])],
+            "sat_probe",
+            [
+                helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8]),
+                helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8]),
+            ],
+            [helper.make_tensor_value_info("z", TensorProto.FLOAT, [1, 8])],
+        ),
+        opset_imports=[helper.make_opsetid("", 17)],
+        ir_version=8,
+    )
+    work_dir = os.path.join(str(tmp_path), "sat")
+    os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
+    onnx.save(model, os.path.join(work_dir, "model.onnx"))
+    rng = np.random.RandomState(0)
+    xcal = [(rng.uniform(-1, 1, (1, 8))).astype(np.float32) for _ in range(8)]
+    ycal = [(rng.uniform(-1, 1, (1, 8))).astype(np.float32) for _ in range(8)]
+    pulsar2_docker.make_numpy_calibration_tar(
+        os.path.join(work_dir, "dataset", "x.tar"), xcal
+    )
+    pulsar2_docker.make_numpy_calibration_tar(
+        os.path.join(work_dir, "dataset", "y.tar"), ycal
+    )
+    cfg = {
+        "model_type": "ONNX",
+        "npu_mode": "NPU1",
+        "quant": {
+            "input_configs": [
+                {
+                    "tensor_name": "x",
+                    "calibration_dataset": "./dataset/x.tar",
+                    "calibration_format": "Numpy",
+                    "calibration_size": 8,
+                },
+                {
+                    "tensor_name": "y",
+                    "calibration_dataset": "./dataset/y.tar",
+                    "calibration_format": "Numpy",
+                    "calibration_size": 8,
+                },
+            ],
+            "calibration_method": "MinMax",
+            "precision_analysis": False,
+        },
+        "compiler": {"check": 0},
+    }
+    with open(os.path.join(work_dir, "config.json"), "w") as f:
+        json.dump(cfg, f)
+    result = pulsar2_docker.build(
+        work_dir, "model.onnx", "out", config_path="config.json"
+    )
+    assert result.success, result.error
+    path = result.axmodel_path
+
+    y = np.ones((1, 8), np.float32)
+    got = {}
+    for v in (0.5, 2.0, 3.0, 4.0):
+        x = np.full((1, 8), v, np.float32)
+        dev = _run_retry_once(path, {"x": x.tobytes(), "y": y.tobytes()})
+        assert not dev.error, dev.error
+        got[v] = float(np.frombuffer(dev.outputs[0], dtype=np.float32).mean())
+    assert got[0.5] == pytest.approx(0.5, abs=0.05), got
+    # Past the calibration range (max |x*y| over the samples above) the
+    # output pins instead of tracking: all three read back the same value,
+    # at the observed maximum rather than the true product.
+    assert got[2.0] == pytest.approx(got[3.0], abs=1e-6), got
+    assert got[3.0] == pytest.approx(got[4.0], abs=1e-6), got
+    cmax = max(float(np.abs(a * b).max()) for a, b in zip(xcal, ycal))
+    assert got[4.0] == pytest.approx(cmax, rel=0.1), (got, cmax)
+
+
 def test_bit_flip_probe_on_real_resnet18d_has_three_outcome_classes(tmp_path):
     """Confirmed real (see the README's "The bit-flip probe on the real
     resnet18d mcode" section): on the real, unmodified resnet18d_Opset18
