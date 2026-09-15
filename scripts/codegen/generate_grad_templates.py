@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Generates onnxsim/graph_grad_templates_gen.py from onnxscript.
+"""Generates onnxsim/graph_grad_templates_gen.py/.h from onnxscript.
 
-Proof of concept for the design discussed alongside
-onnxsim.graph_grad: instead of hand-transcribing a VJP rule's graph
-construction once in graph_grad.py and a second time in graph_grad.cpp (the
-duplication that let a real bug -- a wrong `dvar` factor in
-_grad_batch_normalization/GradBatchNormalization -- through review until a
-finite-difference test caught it), author the rule *once*, in onnxscript, and
-have both languages instantiate the same checked-in FunctionProto text via
-ONNX's own function-inlining machinery (onnx.inliner in Python,
-onnx::inliner::InlineLocalFunctions in C++ -- both already vendored,
-see third_party/onnx/onnx/inliner/). This script only produces the Python
-side; a C++ mirror is a followup once this pattern is proven, exactly like
+The design discussed alongside onnxsim.graph_grad: instead of
+hand-transcribing a VJP rule's graph construction once in graph_grad.py and a
+second time in graph_grad.cpp (the duplication that let a real bug -- a wrong
+`dvar` factor in _grad_batch_normalization/GradBatchNormalization -- through
+review until a finite-difference test caught it), author the rule *once*, in
+onnxscript, and have both languages instantiate the same checked-in
+FunctionProto text via ONNX's own function-inlining machinery (onnx.inliner
+in Python, onnx::inliner::InlineLocalFunctions in C++ -- both already
+vendored, see third_party/onnx/onnx/inliner/), exactly like
 generate_moe_function_templates.py above it in this directory produces a
 checked-in header for contrib_schemas.cpp's own FunctionBuilder-based
 instantiation -- the two scripts share the same shape: onnxscript is a
 dev-only tool, never a build or runtime dependency, and its output is
-checked in rather than regenerated on every build.
+checked in rather than regenerated on every build. "Add" and
+"BatchNormalization" were the proof of concept; every other rule below whose
+core arithmetic is separable from shape/attribute resolution (every
+elementwise/broadcasting op) has since been templated the same way -- see
+graph_grad.py's "Templated rules" section for the full list and for which
+rules stay hand-written instead.
 
 **Why these functions take no ONNX-level attributes.** graph_grad.py's
 existing hand-written rules already resolve every rank/shape-dependent
@@ -133,6 +136,107 @@ def GradBatchNormalization(
         neg_half,
     )
     return dx, dscale, dbias, dmean, dvar
+
+
+@script(opset=GRAD_DOMAIN)
+def GradNeg(g: FLOAT["..."]):
+    """``Neg``'s VJP: d/dx (-x) = -g. Closed-form, like ``GradAdd`` -- kept
+    templated anyway so ``graph_grad.py``'s ``_grad_neg_templated`` and
+    ``graph_grad.cpp``'s mirror share this one line instead of each
+    spelling ``Neg(g)`` out separately."""
+    dx = op.Neg(g)
+    return dx
+
+
+@script(opset=GRAD_DOMAIN)
+def GradExp(g: FLOAT["..."], y: FLOAT["..."]):
+    """``Exp``'s VJP, reusing the forward output ``y = exp(x)`` instead of
+    calling ``Exp`` again: dx = g * y."""
+    dx = op.Mul(g, y)
+    return dx
+
+
+@script(opset=GRAD_DOMAIN)
+def GradSqrt(g: FLOAT["..."], y: FLOAT["..."], half: FLOAT):
+    """``Sqrt``'s VJP, reusing the forward output ``y = sqrt(x)``: dx =
+    0.5 * g / y. Singular at x = 0, as the derivative genuinely is."""
+    dx = op.Div(op.Mul(g, half), y)
+    return dx
+
+
+@script(opset=GRAD_DOMAIN)
+def GradLog(g: FLOAT["..."], x: FLOAT["..."]):
+    """``Log``'s VJP: dx = g / x. Singular at x = 0, same reasoning as
+    ``GradSqrt``."""
+    dx = op.Div(g, x)
+    return dx
+
+
+@script(opset=GRAD_DOMAIN)
+def GradSigmoid(g: FLOAT["..."], y: FLOAT["..."], one: FLOAT):
+    """``Sigmoid``'s VJP, reusing the forward output ``y = sigmoid(x)``:
+    dx = g * y * (1 - y)."""
+    dy = op.Mul(y, op.Sub(one, y))
+    dx = op.Mul(g, dy)
+    return dx
+
+
+@script(opset=GRAD_DOMAIN)
+def GradTanh(g: FLOAT["..."], y: FLOAT["..."], one: FLOAT):
+    """``Tanh``'s VJP, reusing the forward output ``y = tanh(x)``:
+    dx = g * (1 - y^2)."""
+    dy = op.Sub(one, op.Mul(y, y))
+    dx = op.Mul(g, dy)
+    return dx
+
+
+@script(opset=GRAD_DOMAIN)
+def GradErf(g: FLOAT["..."], x: FLOAT["..."], c: FLOAT):
+    """``Erf``'s VJP: dx = g * c * exp(-x^2), c = 2/sqrt(pi) supplied by the
+    caller (see ``GradBatchNormalization``'s docstring for why a literal
+    arrives as a plain input rather than an in-body ``Constant``/
+    ``CastLike``: neither is in ``graph_grad.BACKWARD_OPS``). This one is
+    here entirely for GELU, which every transformer FFN block-wise QAT
+    fine-tunes."""
+    dy = op.Mul(c, op.Exp(op.Neg(op.Mul(x, x))))
+    dx = op.Mul(g, dy)
+    return dx
+
+
+# Deliberately NOT templated: Relu. Its VJP needs a Cast, whose ONNX `to`
+# attribute is a static dtype baked into the compiled FunctionProto at
+# codegen time -- fine for this module's own float32-only validation, but
+# wrong for a caller like onnxsim.compile_training's mixed-precision path
+# (backward_precision="float16"), which walks the *raw*, not-yet-inlined
+# node list looking for exactly this shape (a Greater/Less + Cast producing
+# a mask) to retarget its Cast from FLOAT to FLOAT16 before the surrounding
+# fp16 arithmetic is emitted -- see _cast_backward_to_fp16 in
+# onnxsim/compile_training.py. A templated GradRelu hides that Cast inside
+# an uninlined "onnxsim.grad" domain call until inlining happens much later
+# (MakeStepGraph/make_step_graph), by which point the retargeting pass has
+# already run and moved on -- so the mask stays FLOAT32 while the gradient
+# flowing into its multiply is FLOAT16, an invalid mixed-type graph. Keeping
+# GradRelu hand-written keeps its Cast visible to that pass, exactly like
+# every other rule.
+
+
+@script(opset=GRAD_DOMAIN)
+def GradMul(g: FLOAT["..."], a: FLOAT["..."], b: FLOAT["..."]):
+    """``Mul``'s VJP before broadcast-undoing: da = g * b, db = g * a."""
+    da = op.Mul(g, b)
+    db = op.Mul(g, a)
+    return da, db
+
+
+@script(opset=GRAD_DOMAIN)
+def GradDiv(g: FLOAT["..."], a: FLOAT["..."], b: FLOAT["..."], y: FLOAT["..."]):
+    """``Div``'s VJP before broadcast-undoing: da = g / b, db = -g * y / b,
+    reusing the forward quotient ``y = a / b`` rather than recomputing a
+    square -- one fewer node and no risk of overflowing b^2, exactly like
+    the hand-written rule."""
+    da = op.Div(g, b)
+    db = op.Neg(op.Div(op.Mul(g, y), b))
+    return da, db
 
 
 _NP_TO_ONNX = {
@@ -258,6 +362,157 @@ def _validate_grad_batch_normalization() -> None:
             raise AssertionError(f"GradBatchNormalization.{name}: relative error {rel}")
 
 
+def _fd_grad(loss, base: dict, param: str, step: float = 1e-3) -> np.ndarray:
+    """Central finite-difference derivative of scalar ``loss(**base)`` with
+    respect to every element of ``base[param]``, holding the rest fixed.
+    The same closure ``_validate_grad_batch_normalization`` above builds
+    inline, generalized so each elementwise validator below need not repeat
+    it."""
+    grad = np.zeros_like(base[param], dtype=np.float64)
+    flat = grad.reshape(-1)
+    for i in range(flat.size):
+        plus = dict(base)
+        minus = dict(base)
+        plus[param] = base[param].copy()
+        minus[param] = base[param].copy()
+        plus[param].reshape(-1)[i] += step
+        minus[param].reshape(-1)[i] -= step
+        flat[i] = (loss(**plus) - loss(**minus)) / (2 * step)
+    return grad
+
+
+def _assert_close_to_fd(name: str, analytic: np.ndarray, fd: np.ndarray) -> None:
+    err = np.max(np.abs(analytic.astype(np.float64) - fd))
+    rel = err / (np.max(np.abs(fd)) + 1e-6)
+    if rel >= 1e-2:
+        raise AssertionError(f"{name}: relative error {rel}")
+
+
+def _validate_grad_neg() -> None:
+    """Closed-form, like ``GradAdd``: dx = -g exactly."""
+    fn = GradNeg.to_function_proto()
+    onnx.checker.check_function(fn)
+    g = np.random.default_rng(0).standard_normal((5,)).astype(np.float32)
+    (dx,) = _run_function(fn, {"g": g}, {"dx": g.shape})
+    np.testing.assert_array_equal(dx, -g)
+
+
+def _validate_grad_exp() -> None:
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((5,)).astype(np.float32)
+    g = rng.standard_normal((5,)).astype(np.float32)
+    y = np.exp(x)
+    fn = GradExp.to_function_proto()
+    onnx.checker.check_function(fn)
+    (dx,) = _run_function(fn, {"g": g, "y": y}, {"dx": x.shape})
+    fd = _fd_grad(lambda x: float(np.sum(np.exp(x) * g)), {"x": x.astype(np.float64)}, "x")
+    _assert_close_to_fd("GradExp", dx, fd)
+
+
+def _validate_grad_sqrt() -> None:
+    rng = np.random.default_rng(0)
+    x = (np.abs(rng.standard_normal((5,))) + 0.1).astype(np.float32)
+    g = rng.standard_normal((5,)).astype(np.float32)
+    y = np.sqrt(x)
+    fn = GradSqrt.to_function_proto()
+    onnx.checker.check_function(fn)
+    (dx,) = _run_function(
+        fn, {"g": g, "y": y, "half": np.array(0.5, dtype=np.float32)}, {"dx": x.shape}
+    )
+    fd = _fd_grad(lambda x: float(np.sum(np.sqrt(x) * g)), {"x": x.astype(np.float64)}, "x")
+    _assert_close_to_fd("GradSqrt", dx, fd)
+
+
+def _validate_grad_log() -> None:
+    rng = np.random.default_rng(0)
+    x = (np.abs(rng.standard_normal((5,))) + 0.1).astype(np.float32)
+    g = rng.standard_normal((5,)).astype(np.float32)
+    fn = GradLog.to_function_proto()
+    onnx.checker.check_function(fn)
+    (dx,) = _run_function(fn, {"g": g, "x": x}, {"dx": x.shape})
+    fd = _fd_grad(lambda x: float(np.sum(np.log(x) * g)), {"x": x.astype(np.float64)}, "x")
+    _assert_close_to_fd("GradLog", dx, fd)
+
+
+def _validate_grad_sigmoid() -> None:
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((5,)).astype(np.float32)
+    g = rng.standard_normal((5,)).astype(np.float32)
+    y = 1.0 / (1.0 + np.exp(-x))
+    fn = GradSigmoid.to_function_proto()
+    onnx.checker.check_function(fn)
+    (dx,) = _run_function(
+        fn, {"g": g, "y": y, "one": np.array(1.0, dtype=np.float32)}, {"dx": x.shape}
+    )
+    sigmoid = lambda x: 1.0 / (1.0 + np.exp(-x))
+    fd = _fd_grad(lambda x: float(np.sum(sigmoid(x) * g)), {"x": x.astype(np.float64)}, "x")
+    _assert_close_to_fd("GradSigmoid", dx, fd)
+
+
+def _validate_grad_tanh() -> None:
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((5,)).astype(np.float32)
+    g = rng.standard_normal((5,)).astype(np.float32)
+    y = np.tanh(x)
+    fn = GradTanh.to_function_proto()
+    onnx.checker.check_function(fn)
+    (dx,) = _run_function(
+        fn, {"g": g, "y": y, "one": np.array(1.0, dtype=np.float32)}, {"dx": x.shape}
+    )
+    fd = _fd_grad(lambda x: float(np.sum(np.tanh(x) * g)), {"x": x.astype(np.float64)}, "x")
+    _assert_close_to_fd("GradTanh", dx, fd)
+
+
+def _validate_grad_erf() -> None:
+    import math
+
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((5,)).astype(np.float32)
+    g = rng.standard_normal((5,)).astype(np.float32)
+    c = 2.0 / np.sqrt(np.pi)
+    erf = np.vectorize(math.erf)
+    fn = GradErf.to_function_proto()
+    onnx.checker.check_function(fn)
+    (dx,) = _run_function(
+        fn, {"g": g, "x": x, "c": np.array(c, dtype=np.float32)}, {"dx": x.shape}
+    )
+    fd = _fd_grad(
+        lambda x: float(np.sum(erf(x) * g)), {"x": x.astype(np.float64)}, "x", step=1e-4
+    )
+    _assert_close_to_fd("GradErf", dx, fd)
+
+
+def _validate_grad_mul() -> None:
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal((5,)).astype(np.float32)
+    b = rng.standard_normal((5,)).astype(np.float32)
+    g = rng.standard_normal((5,)).astype(np.float32)
+    fn = GradMul.to_function_proto()
+    onnx.checker.check_function(fn)
+    da, db = _run_function(fn, {"g": g, "a": a, "b": b}, {"da": a.shape, "db": b.shape})
+    base = {"a": a.astype(np.float64), "b": b.astype(np.float64)}
+    loss = lambda a, b: float(np.sum(a * b * g))
+    _assert_close_to_fd("GradMul.da", da, _fd_grad(loss, base, "a"))
+    _assert_close_to_fd("GradMul.db", db, _fd_grad(loss, base, "b"))
+
+
+def _validate_grad_div() -> None:
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal((5,)).astype(np.float32)
+    b = (np.abs(rng.standard_normal((5,))) + 0.5).astype(np.float32)
+    g = rng.standard_normal((5,)).astype(np.float32)
+    y = a / b
+    fn = GradDiv.to_function_proto()
+    onnx.checker.check_function(fn)
+    da, db = _run_function(
+        fn, {"g": g, "a": a, "b": b, "y": y}, {"da": a.shape, "db": b.shape}
+    )
+    base = {"a": a.astype(np.float64), "b": b.astype(np.float64)}
+    loss = lambda a, b: float(np.sum((a / b) * g))
+    _assert_close_to_fd("GradDiv.da", da, _fd_grad(loss, base, "a"))
+    _assert_close_to_fd("GradDiv.db", db, _fd_grad(loss, base, "b"))
+
+
 # (python identifier, C++ identifier, onnxscript function). Both languages'
 # generated files are produced from this single list, so they cannot drift
 # from each other -- the whole point of checking in ONNX function *text*
@@ -269,6 +524,15 @@ _ENTRIES = [
         "kGradBatchNormalizationTemplate",
         GradBatchNormalization,
     ),
+    ("GRAD_NEG", "kGradNegTemplate", GradNeg),
+    ("GRAD_EXP", "kGradExpTemplate", GradExp),
+    ("GRAD_SQRT", "kGradSqrtTemplate", GradSqrt),
+    ("GRAD_LOG", "kGradLogTemplate", GradLog),
+    ("GRAD_SIGMOID", "kGradSigmoidTemplate", GradSigmoid),
+    ("GRAD_TANH", "kGradTanhTemplate", GradTanh),
+    ("GRAD_ERF", "kGradErfTemplate", GradErf),
+    ("GRAD_MUL", "kGradMulTemplate", GradMul),
+    ("GRAD_DIV", "kGradDivTemplate", GradDiv),
 ]
 
 
@@ -332,6 +596,15 @@ def _cpp_header(entries) -> str:
 def main() -> None:
     _validate_grad_add()
     _validate_grad_batch_normalization()
+    _validate_grad_neg()
+    _validate_grad_exp()
+    _validate_grad_sqrt()
+    _validate_grad_log()
+    _validate_grad_sigmoid()
+    _validate_grad_tanh()
+    _validate_grad_erf()
+    _validate_grad_mul()
+    _validate_grad_div()
 
     entries = [
         (py_ident, cpp_ident, onnx.printer.to_text(fn.to_function_proto()))

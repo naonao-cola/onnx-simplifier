@@ -1,19 +1,22 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * Exercises graph_grad.cpp's "Templated rules" section:
- * GradAddTemplated/GradBatchNormalizationTemplated, which call into the
- * checked-in onnxscript-compiled FunctionProto templates
- * (graph_grad_templates_gen.h) via GraphBuilder::Call and
- * onnx::inliner::InlineLocalFunctions (run by MakeStepGraph once a builder
- * has accumulated functions) instead of hand-emitting their nodes directly.
- * Rules() now uses these for "Add"/"BatchNormalization" in production;
- * GradAdd/GradBatchNormalization (the original hand-written rules) remain as
- * a reference implementation, reachable here via
- * BuildBackwardWithHandWrittenRules, purely so the second test below keeps
- * an independent structural cross-check. See graph_grad.py's matching
- * section, scripts/codegen/generate_grad_templates.py, and
- * tests/test_graph_grad_templates.py for the Python side.
+ * Exercises graph_grad.cpp's "Templated rules" section: GradAddTemplated,
+ * GradBatchNormalizationTemplated, and the nine elementwise/broadcasting
+ * rules templated alongside them (Neg, Exp, Sqrt, Log, Sigmoid, Tanh, Erf,
+ * Mul, Div), which all call into checked-in onnxscript-compiled
+ * FunctionProto templates (graph_grad_templates_gen.h) via GraphBuilder::Call
+ * and onnx::inliner::InlineLocalFunctions (run by MakeStepGraph once a
+ * builder has accumulated functions) instead of hand-emitting their nodes
+ * directly. Rules() now uses these for all eleven op types in production;
+ * the original hand-written rules remain as a reference implementation,
+ * reachable here via BuildBackwardWithHandWrittenRules, purely so the second
+ * test below keeps an independent structural cross-check. See graph_grad.py's
+ * matching section, scripts/codegen/generate_grad_templates.py, and
+ * tests/test_graph_grad_templates.py for the Python side. Relu is
+ * deliberately NOT templated -- see generate_grad_templates.py's own comment
+ * for why (a mixed-precision caller needs its mask Cast visible before
+ * inlining).
  *
  * Numeric validation is not duplicated here, for the reason graph_grad_test.cpp
  * gives for the hand-written rules: nothing in this build evaluates an ONNX
@@ -223,11 +226,99 @@ void TheBatchNormTemplateInlinesToAnAllowlistedGraph() {
       "the templated BatchNormalization backward");
 }
 
+// Structural check shared by every one-input templated elementwise rule --
+// same division of labor as TheAddTemplateInlinesToAnAllowlistedGraph above:
+// plumbing (call node -> registered function -> MakeStepGraph inline) and
+// the execution-provider allowlist, not the rule's actual numbers (that is
+// tests/test_graph_grad_templates.py's job).
+void CheckUnaryElementwiseTemplate(const std::string& op_type) {
+  const std::vector<onnx::NodeProto> nodes = {Node(op_type, {"X"}, {"Y"})};
+  const Shapes shapes = {{"X", {3, 4}}, {"Y", {3, 4}}};
+
+  GraphBuilder b;
+  const std::map<std::string, std::string> grads =
+      BuildBackwardWithTemplatedRules(b, nodes, shapes, {{"Y", "dY"}}, {"X"});
+  Check(grads.size() == 1 && grads.count("X") == 1,
+        op_type + ": the input gets a gradient");
+  Check(!b.functions().empty(),
+        op_type +
+            ": the builder accumulated a template function before "
+            "inlining");
+  // Several templated rules (Exp, Sqrt, Sigmoid, Tanh, ...) reuse the
+  // forward node's own output as one of the template call's inputs, so the
+  // forward node itself has to precede the backward in the final graph --
+  // exactly as it would in a real step graph, where the forward computation
+  // is already part of it.
+  b.nodes().insert(b.nodes().begin(), nodes.begin(), nodes.end());
+
+  const Shapes constants = {{"X", {3, 4}}, {"dY", {3, 4}}};
+  const StepGraph step =
+      WrapForInspection(b, constants, {{grads.at("X"), {3, 4}}});
+
+  Check(step.model.functions_size() == 0,
+        op_type + ": MakeStepGraph inlines every call site");
+  try {
+    onnx::checker::check_model(step.model);
+  } catch (const std::exception& e) {
+    Check(false, op_type +
+                     ": onnx::checker rejected the templated "
+                     "backward: " +
+                     e.what());
+  }
+  CheckWithinAllowlist(BackwardEmittedOps(step.model.graph(), {op_type}),
+                       "the templated " + op_type + " backward");
+}
+
+// Same as above, for the two broadcasting binary rules (Mul, Div): B's shape
+// {4} against A's {3, 4} exercises ReduceTo the same way the Add test does.
+void CheckBinaryElementwiseTemplate(const std::string& op_type) {
+  const std::vector<onnx::NodeProto> nodes = {Node(op_type, {"A", "B"}, {"Y"})};
+  const Shapes shapes = {{"A", {3, 4}}, {"B", {4}}, {"Y", {3, 4}}};
+
+  GraphBuilder b;
+  const std::map<std::string, std::string> grads =
+      BuildBackwardWithTemplatedRules(b, nodes, shapes, {{"Y", "dY"}},
+                                      {"A", "B"});
+  Check(grads.size() == 2 && grads.count("A") == 1 && grads.count("B") == 1,
+        op_type + ": both operands get a gradient");
+  Check(!b.functions().empty(),
+        op_type +
+            ": the builder accumulated a template function before "
+            "inlining");
+  // GradDiv reuses the forward node's own output (y = a / b); see
+  // CheckUnaryElementwiseTemplate's comment above.
+  b.nodes().insert(b.nodes().begin(), nodes.begin(), nodes.end());
+
+  const Shapes constants = {{"A", {3, 4}}, {"B", {4}}, {"dY", {3, 4}}};
+  const StepGraph step = WrapForInspection(
+      b, constants, {{grads.at("A"), {3, 4}}, {grads.at("B"), {4}}});
+
+  Check(step.model.functions_size() == 0,
+        op_type + ": MakeStepGraph inlines every call site");
+  try {
+    onnx::checker::check_model(step.model);
+  } catch (const std::exception& e) {
+    Check(false, op_type +
+                     ": onnx::checker rejected the templated "
+                     "backward: " +
+                     e.what());
+  }
+  CheckWithinAllowlist(BackwardEmittedOps(step.model.graph(), {op_type}),
+                       "the templated " + op_type + " backward");
+}
+
 }  // namespace
 
 int main() {
   TheAddTemplateInlinesToAnAllowlistedGraph();
   TheBatchNormTemplateInlinesToAnAllowlistedGraph();
+  for (const std::string& op :
+       {"Neg", "Exp", "Sqrt", "Log", "Sigmoid", "Tanh", "Erf"}) {
+    CheckUnaryElementwiseTemplate(op);
+  }
+  for (const std::string& op : {"Mul", "Div"}) {
+    CheckBinaryElementwiseTemplate(op);
+  }
 
   if (g_failures != 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

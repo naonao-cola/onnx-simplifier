@@ -1050,6 +1050,9 @@ std::vector<OptStr> GradSub(Backward& ctx, const onnx::NodeProto& node,
   return {ga, ctx.b().Op("Neg", {gb}, "neg")};
 }
 
+// Reference-only, like GradAdd above: Rules() wires "Mul" to
+// GradMulTemplated instead. Kept, and still exercised by
+// graph_grad_templates_test.cpp, for that cross-check.
 std::vector<OptStr> GradMul(Backward& ctx, const onnx::NodeProto& node,
                             const std::string& g) {
   const std::string& a = node.input(0);
@@ -1062,6 +1065,7 @@ std::vector<OptStr> GradMul(Backward& ctx, const onnx::NodeProto& node,
   return {ga, gb};
 }
 
+// Reference-only: Rules() wires "Div" to GradDivTemplated instead.
 std::vector<OptStr> GradDiv(Backward& ctx, const onnx::NodeProto& node,
                             const std::string& g) {
   const std::string& a = node.input(0);
@@ -1079,6 +1083,10 @@ std::vector<OptStr> GradDiv(Backward& ctx, const onnx::NodeProto& node,
   return {ga, gb};
 }
 
+// Reference-only: Rules() wires "Neg" to GradNegTemplated instead. Kept
+// templated anyway (despite being one node already) so this and the Python
+// mirror share the same checked-in text -- see GradNeg's docstring in
+// generate_grad_templates.py.
 std::vector<OptStr> GradNeg(Backward& ctx, const onnx::NodeProto& node,
                             const std::string& g) {
   (void)node;
@@ -1094,6 +1102,12 @@ std::vector<OptStr> GradIdentity(Backward& ctx, const onnx::NodeProto& node,
   return {g};
 }
 
+// Not templated, deliberately: see generate_grad_templates.py's own comment
+// (beside where a GradRelu template used to be) for why -- its Cast's target
+// dtype has to stay a visible, mutable node for a caller's own
+// precision-conversion pass (the Python side has one, in
+// onnxsim/compile_training.py's _cast_backward_to_fp16) to retarget before
+// inlining, which a call to an uninlined "onnxsim.grad" function would hide.
 std::vector<OptStr> GradRelu(Backward& ctx, const onnx::NodeProto& node,
                              const std::string& g) {
   // The subgradient at exactly 0 is taken as 0 (strict Greater), matching the
@@ -1102,6 +1116,7 @@ std::vector<OptStr> GradRelu(Backward& ctx, const onnx::NodeProto& node,
   return {ctx.b().Mul(g, mask)};
 }
 
+// Reference-only: Rules() wires "Sigmoid" to GradSigmoidTemplated instead.
 std::vector<OptStr> GradSigmoid(Backward& ctx, const onnx::NodeProto& node,
                                 const std::string& g) {
   // y (1 - y), from the forward output: the backward never re-runs the
@@ -1113,6 +1128,7 @@ std::vector<OptStr> GradSigmoid(Backward& ctx, const onnx::NodeProto& node,
   return {ctx.b().Mul(g, dy)};
 }
 
+// Reference-only: Rules() wires "Tanh" to GradTanhTemplated instead.
 std::vector<OptStr> GradTanh(Backward& ctx, const onnx::NodeProto& node,
                              const std::string& g) {
   const std::string& y = node.output(0);
@@ -1122,6 +1138,7 @@ std::vector<OptStr> GradTanh(Backward& ctx, const onnx::NodeProto& node,
   return {ctx.b().Mul(g, dy)};
 }
 
+// Reference-only: Rules() wires "Erf" to GradErfTemplated instead.
 std::vector<OptStr> GradErf(Backward& ctx, const onnx::NodeProto& node,
                             const std::string& g) {
   // 2/sqrt(pi) * exp(-x^2). Here entirely for GELU, which block-wise
@@ -1136,11 +1153,13 @@ std::vector<OptStr> GradErf(Backward& ctx, const onnx::NodeProto& node,
   return {ctx.b().Mul(g, dy)};
 }
 
+// Reference-only: Rules() wires "Exp" to GradExpTemplated instead.
 std::vector<OptStr> GradExp(Backward& ctx, const onnx::NodeProto& node,
                             const std::string& g) {
   return {ctx.b().Mul(g, node.output(0))};
 }
 
+// Reference-only: Rules() wires "Sqrt" to GradSqrtTemplated instead.
 std::vector<OptStr> GradSqrt(Backward& ctx, const onnx::NodeProto& node,
                              const std::string& g) {
   // 0.5 / sqrt(x), again reusing the forward result. Singular at x = 0, as
@@ -1150,6 +1169,7 @@ std::vector<OptStr> GradSqrt(Backward& ctx, const onnx::NodeProto& node,
   return {ctx.b().Div(scaled, node.output(0))};
 }
 
+// Reference-only: Rules() wires "Log" to GradLogTemplated instead.
 std::vector<OptStr> GradLog(Backward& ctx, const onnx::NodeProto& node,
                             const std::string& g) {
   // d/dx log(x) = g / x. Admitted for the log-softmax term a cross-entropy
@@ -1846,6 +1866,217 @@ std::vector<OptStr> GradBatchNormalizationTemplated(Backward& ctx,
   return {outs[0], outs[1], outs[2], outs[3], outs[4]};
 }
 
+// GradNeg/GradExp/GradSqrt/GradLog/GradSigmoid/GradTanh/GradErf/GradMul/
+// GradDiv above are no longer reachable through Rules() either -- same
+// pattern as GradAdd/GradBatchNormalization, extended to every
+// elementwise/broadcasting rule whose forward op was already inside
+// BackwardOps()'s coverage and whose VJP needs no dtype-specific node of its
+// own. See generate_grad_templates.py for each template's derivation and
+// graph_grad.py's "Templated rules" section comment for why GradSub
+// (its only arithmetic is a single Neg, applied after ReduceTo rather than
+// before to run on the smaller, already-reduced tensor) and GradRelu (its
+// mask Cast's target dtype has to stay visible and mutable to a caller's own
+// precision-conversion pass before inlining) both stay hand-written.
+
+const onnx::FunctionProto& GradNegTemplate() {
+  static const onnx::FunctionProto* fn = [] {
+    auto* proto = new onnx::FunctionProto();
+    const auto status = onnx::OnnxParser::Parse(*proto, kGradNegTemplate);
+    if (!status.IsOK()) {
+      throw std::logic_error("failed to parse the GradNeg template: " +
+                             status.ErrorMessage());
+    }
+    return proto;
+  }();
+  return *fn;
+}
+
+std::vector<OptStr> GradNegTemplated(Backward& ctx, const onnx::NodeProto& node,
+                                     const std::string& g) {
+  (void)node;
+  const std::vector<std::string> outs = ctx.b().Call(GradNegTemplate(), {g});
+  return {outs[0]};
+}
+
+const onnx::FunctionProto& GradExpTemplate() {
+  static const onnx::FunctionProto* fn = [] {
+    auto* proto = new onnx::FunctionProto();
+    const auto status = onnx::OnnxParser::Parse(*proto, kGradExpTemplate);
+    if (!status.IsOK()) {
+      throw std::logic_error("failed to parse the GradExp template: " +
+                             status.ErrorMessage());
+    }
+    return proto;
+  }();
+  return *fn;
+}
+
+std::vector<OptStr> GradExpTemplated(Backward& ctx, const onnx::NodeProto& node,
+                                     const std::string& g) {
+  const std::vector<std::string> outs =
+      ctx.b().Call(GradExpTemplate(), {g, node.output(0)});
+  return {outs[0]};
+}
+
+const onnx::FunctionProto& GradSqrtTemplate() {
+  static const onnx::FunctionProto* fn = [] {
+    auto* proto = new onnx::FunctionProto();
+    const auto status = onnx::OnnxParser::Parse(*proto, kGradSqrtTemplate);
+    if (!status.IsOK()) {
+      throw std::logic_error("failed to parse the GradSqrt template: " +
+                             status.ErrorMessage());
+    }
+    return proto;
+  }();
+  return *fn;
+}
+
+std::vector<OptStr> GradSqrtTemplated(Backward& ctx,
+                                      const onnx::NodeProto& node,
+                                      const std::string& g) {
+  const std::string half = ctx.b().Const(0.5f);
+  const std::vector<std::string> outs =
+      ctx.b().Call(GradSqrtTemplate(), {g, node.output(0), half});
+  return {outs[0]};
+}
+
+const onnx::FunctionProto& GradLogTemplate() {
+  static const onnx::FunctionProto* fn = [] {
+    auto* proto = new onnx::FunctionProto();
+    const auto status = onnx::OnnxParser::Parse(*proto, kGradLogTemplate);
+    if (!status.IsOK()) {
+      throw std::logic_error("failed to parse the GradLog template: " +
+                             status.ErrorMessage());
+    }
+    return proto;
+  }();
+  return *fn;
+}
+
+std::vector<OptStr> GradLogTemplated(Backward& ctx, const onnx::NodeProto& node,
+                                     const std::string& g) {
+  const std::vector<std::string> outs =
+      ctx.b().Call(GradLogTemplate(), {g, node.input(0)});
+  return {outs[0]};
+}
+
+const onnx::FunctionProto& GradSigmoidTemplate() {
+  static const onnx::FunctionProto* fn = [] {
+    auto* proto = new onnx::FunctionProto();
+    const auto status = onnx::OnnxParser::Parse(*proto, kGradSigmoidTemplate);
+    if (!status.IsOK()) {
+      throw std::logic_error("failed to parse the GradSigmoid template: " +
+                             status.ErrorMessage());
+    }
+    return proto;
+  }();
+  return *fn;
+}
+
+std::vector<OptStr> GradSigmoidTemplated(Backward& ctx,
+                                         const onnx::NodeProto& node,
+                                         const std::string& g) {
+  const std::string one = ctx.b().Const(1.0f);
+  const std::vector<std::string> outs =
+      ctx.b().Call(GradSigmoidTemplate(), {g, node.output(0), one});
+  return {outs[0]};
+}
+
+const onnx::FunctionProto& GradTanhTemplate() {
+  static const onnx::FunctionProto* fn = [] {
+    auto* proto = new onnx::FunctionProto();
+    const auto status = onnx::OnnxParser::Parse(*proto, kGradTanhTemplate);
+    if (!status.IsOK()) {
+      throw std::logic_error("failed to parse the GradTanh template: " +
+                             status.ErrorMessage());
+    }
+    return proto;
+  }();
+  return *fn;
+}
+
+std::vector<OptStr> GradTanhTemplated(Backward& ctx,
+                                      const onnx::NodeProto& node,
+                                      const std::string& g) {
+  const std::string one = ctx.b().Const(1.0f);
+  const std::vector<std::string> outs =
+      ctx.b().Call(GradTanhTemplate(), {g, node.output(0), one});
+  return {outs[0]};
+}
+
+const onnx::FunctionProto& GradErfTemplate() {
+  static const onnx::FunctionProto* fn = [] {
+    auto* proto = new onnx::FunctionProto();
+    const auto status = onnx::OnnxParser::Parse(*proto, kGradErfTemplate);
+    if (!status.IsOK()) {
+      throw std::logic_error("failed to parse the GradErf template: " +
+                             status.ErrorMessage());
+    }
+    return proto;
+  }();
+  return *fn;
+}
+
+std::vector<OptStr> GradErfTemplated(Backward& ctx, const onnx::NodeProto& node,
+                                     const std::string& g) {
+  const std::string c = ctx.b().Const(
+      static_cast<float>(2.0 / std::sqrt(3.14159265358979323846)));
+  const std::vector<std::string> outs =
+      ctx.b().Call(GradErfTemplate(), {g, node.input(0), c});
+  return {outs[0]};
+}
+
+const onnx::FunctionProto& GradMulTemplate() {
+  static const onnx::FunctionProto* fn = [] {
+    auto* proto = new onnx::FunctionProto();
+    const auto status = onnx::OnnxParser::Parse(*proto, kGradMulTemplate);
+    if (!status.IsOK()) {
+      throw std::logic_error("failed to parse the GradMul template: " +
+                             status.ErrorMessage());
+    }
+    return proto;
+  }();
+  return *fn;
+}
+
+std::vector<OptStr> GradMulTemplated(Backward& ctx, const onnx::NodeProto& node,
+                                     const std::string& g) {
+  const std::string& a = node.input(0);
+  const std::string& b = node.input(1);
+  const Shape out = ctx.ShapeOf(node.output(0));
+  const std::vector<std::string> outs =
+      ctx.b().Call(GradMulTemplate(), {g, a, b});
+  const std::string ga = ctx.ReduceTo(outs[0], out, ctx.ShapeOf(a));
+  const std::string gb = ctx.ReduceTo(outs[1], out, ctx.ShapeOf(b));
+  return {ga, gb};
+}
+
+const onnx::FunctionProto& GradDivTemplate() {
+  static const onnx::FunctionProto* fn = [] {
+    auto* proto = new onnx::FunctionProto();
+    const auto status = onnx::OnnxParser::Parse(*proto, kGradDivTemplate);
+    if (!status.IsOK()) {
+      throw std::logic_error("failed to parse the GradDiv template: " +
+                             status.ErrorMessage());
+    }
+    return proto;
+  }();
+  return *fn;
+}
+
+std::vector<OptStr> GradDivTemplated(Backward& ctx, const onnx::NodeProto& node,
+                                     const std::string& g) {
+  const std::string& a = node.input(0);
+  const std::string& b = node.input(1);
+  const std::string& y = node.output(0);
+  const Shape out = ctx.ShapeOf(y);
+  const std::vector<std::string> outs =
+      ctx.b().Call(GradDivTemplate(), {g, a, b, y});
+  const std::string ga = ctx.ReduceTo(outs[0], out, ctx.ShapeOf(a));
+  const std::string gb = ctx.ReduceTo(outs[1], out, ctx.ShapeOf(b));
+  return {ga, gb};
+}
+
 const std::map<std::string, Rule>& Rules() {
   static const std::map<std::string, Rule>* rules =
       new std::map<std::string, Rule>{
@@ -1854,28 +2085,28 @@ const std::map<std::string, Rule>& Rules() {
           {"BatchNormalization", &GradBatchNormalizationTemplated},
           {"Clip", &GradClip},
           {"Conv", &GradConv},
-          {"Div", &GradDiv},
-          {"Erf", &GradErf},
-          {"Exp", &GradExp},
+          {"Div", &GradDivTemplated},
+          {"Erf", &GradErfTemplated},
+          {"Exp", &GradExpTemplated},
           {"Gather", &GradGather},
           {"Gemm", &GradGemm},
           {"Identity", &GradIdentity},
           {"InstanceNormalization", &GradInstanceNormalization},
           {"LayerNormalization", &GradLayerNormalization},
-          {"Log", &GradLog},
+          {"Log", &GradLogTemplated},
           {"MatMul", &GradMatMul},
           {"MaxPool", &GradMaxPool},
-          {"Mul", &GradMul},
-          {"Neg", &GradNeg},
+          {"Mul", &GradMulTemplated},
+          {"Neg", &GradNegTemplated},
           {"ReduceMean", &GradReduce},
           {"ReduceSum", &GradReduce},
           {"Relu", &GradRelu},
           {"Reshape", &GradReshape},
-          {"Sigmoid", &GradSigmoid},
+          {"Sigmoid", &GradSigmoidTemplated},
           {"Softmax", &GradSoftmax},
-          {"Sqrt", &GradSqrt},
+          {"Sqrt", &GradSqrtTemplated},
           {"Sub", &GradSub},
-          {"Tanh", &GradTanh},
+          {"Tanh", &GradTanhTemplated},
           {"Transpose", &GradTranspose},
       };
   return *rules;
@@ -2039,6 +2270,15 @@ std::map<std::string, std::string> BuildBackwardWithTemplatedRules(
   std::map<std::string, Rule> rules(Rules());
   rules["Add"] = &GradAddTemplated;
   rules["BatchNormalization"] = &GradBatchNormalizationTemplated;
+  rules["Neg"] = &GradNegTemplated;
+  rules["Exp"] = &GradExpTemplated;
+  rules["Sqrt"] = &GradSqrtTemplated;
+  rules["Log"] = &GradLogTemplated;
+  rules["Sigmoid"] = &GradSigmoidTemplated;
+  rules["Tanh"] = &GradTanhTemplated;
+  rules["Erf"] = &GradErfTemplated;
+  rules["Mul"] = &GradMulTemplated;
+  rules["Div"] = &GradDivTemplated;
   return BuildBackwardImpl(b, nodes, shapes, grad_outputs, targets, rules);
 }
 
@@ -2050,5 +2290,14 @@ std::map<std::string, std::string> BuildBackwardWithHandWrittenRules(
   std::map<std::string, Rule> rules(Rules());
   rules["Add"] = &GradAdd;
   rules["BatchNormalization"] = &GradBatchNormalization;
+  rules["Neg"] = &GradNeg;
+  rules["Exp"] = &GradExp;
+  rules["Sqrt"] = &GradSqrt;
+  rules["Log"] = &GradLog;
+  rules["Sigmoid"] = &GradSigmoid;
+  rules["Tanh"] = &GradTanh;
+  rules["Erf"] = &GradErf;
+  rules["Mul"] = &GradMul;
+  rules["Div"] = &GradDiv;
   return BuildBackwardImpl(b, nodes, shapes, grad_outputs, targets, rules);
 }

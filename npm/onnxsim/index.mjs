@@ -508,6 +508,23 @@ export async function applyOutlierSuppression(
 }
 
 /**
+ * LLM.int8() outlier/float32 + vector-wise INT8 decomposition: outlier
+ * channels stay float32, the rest go through MatMulInteger (per-row
+ * activation scales, per-output-channel weight scales, uint8
+ * activation). Output tensor names are preserved.
+ */
+export async function applyLlmInt8(
+  model,
+  calibration,
+  { outlierThreshold = 6.0, epsilon = 1e-8 } = {},
+) {
+  return callCalibratedPass("onnxsim_apply_llm_int8", model, calibration, [
+    outlierThreshold,
+    epsilon,
+  ]);
+}
+
+/**
  * SmoothQuant migration (lossless pre-conditioning ahead of a W8A8
  * quantizer): rescales matched weight columns by `s` and inserts a `Mul`
  * dividing the activation by `s`. Returns a float model.
@@ -576,5 +593,6 @@ export default {
   applyImatrixQuantization,
   applyOutlierSuppression,
   applyOutlierSuppressionPlus,
+  applyLlmInt8,
   applySmoothQuant,
 };

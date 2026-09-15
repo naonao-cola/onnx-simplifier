@@ -19,6 +19,7 @@
 // (rather than a byte-for-byte duplicate struct body in each header) avoids
 // two independently-edited copies of the same type ever drifting apart.
 #include "imatrix_quant_entry.h"
+#include "llm_int8_entry.h"
 #include "outlier_suppression_entry.h"
 #include "outlier_suppression_plus_entry.h"
 #include "smoothquant_entry.h"
@@ -799,6 +800,14 @@ onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
 // smoothquant_entry.h for this port's own scope (including why this
 // calibration-driven pass follows ApplyImatrixQuantization's own
 // protobuf-level shape).
+
+// LLM.int8() (Dettmers et al., 2022) outlier/INT8 decomposition -- C++
+// port of llm_int8.py's own apply_llm_int8, declared in llm_int8_entry.h
+// (included above) rather than duplicated here, mirroring how
+// ApplyOutlierSuppressionPlus (outlier_suppression_plus_entry.h, also
+// included above) is documented in its own home header instead of this
+// one. See llm_int8.py's own module docstring for the technique and
+// llm_int8_entry.h for this port's own scope.
 
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller

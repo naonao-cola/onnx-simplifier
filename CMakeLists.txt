@@ -169,7 +169,7 @@ set(ONNXSIM_BLAKE3_COMPILE_DEFS
     BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
     BLAKE3_USE_NEON=0)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/cross_layer_equalization_entry.cpp onnxsim/pruning_entry.cpp onnxsim/structured_pruning_entry.cpp onnxsim/imatrix_quant_entry.cpp onnxsim/outlier_suppression_entry.cpp onnxsim/outlier_suppression_plus_entry.cpp onnxsim/smoothquant_entry.cpp onnxsim/bias_correction_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/qonnx_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/qat_graph_builder.cpp onnxsim/graph_grad.cpp onnxsim/qat_entry.cpp onnxsim/lora_entry.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp ${ONNXSIM_BLAKE3_SOURCES})
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/cross_layer_equalization_entry.cpp onnxsim/pruning_entry.cpp onnxsim/structured_pruning_entry.cpp onnxsim/imatrix_quant_entry.cpp onnxsim/llm_int8_entry.cpp onnxsim/outlier_suppression_entry.cpp onnxsim/outlier_suppression_plus_entry.cpp onnxsim/smoothquant_entry.cpp onnxsim/bias_correction_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/qonnx_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/qat_graph_builder.cpp onnxsim/graph_grad.cpp onnxsim/qat_entry.cpp onnxsim/lora_entry.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp ${ONNXSIM_BLAKE3_SOURCES})
 target_compile_definitions(onnxsim PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
 if (ONNXSIM_BUILTIN_ORT)
   # Both ways of obtaining ONNX Runtime ship/install headers flat under this
@@ -599,17 +599,45 @@ if (ONNXSIM_TESTS)
   onnxsim_add_ort_rpath(graph_grad_test)
   add_test(NAME graph_grad_test COMMAND graph_grad_test)
 
-  # Proof of concept: BuildBackwardWithTemplatedRules, graph_grad.cpp's
-  # onnxscript-templated rules (see that file's "Templated rules" section).
-  # Needs the fully-configured `onnxsim` target for the same reason
-  # graph_grad_test does, plus onnx::inliner (already compiled into the
-  # `onnx` target, see third_party/onnx/onnx/inliner/CMakeLists.txt) for the
-  # inlining MakeStepGraph now does when a builder has accumulated
-  # functions.
+  # BuildBackwardWithTemplatedRules, graph_grad.cpp's onnxscript-templated
+  # rules (see that file's "Templated rules" section), now wired into
+  # production Rules() for eleven op types. Needs the fully-configured
+  # `onnxsim` target for the same reason graph_grad_test does, plus
+  # onnx::inliner (already compiled into the `onnx` target, see
+  # third_party/onnx/onnx/inliner/CMakeLists.txt) for the inlining
+  # MakeStepGraph now does when a builder has accumulated functions.
   add_executable(graph_grad_templates_test onnxsim/graph_grad_templates_test.cpp)
   target_link_libraries(graph_grad_templates_test onnxsim)
   onnxsim_add_ort_rpath(graph_grad_templates_test)
   add_test(NAME graph_grad_templates_test COMMAND graph_grad_templates_test)
+
+  # Dev convenience only, never part of any default build target or CI job --
+  # the same shape as regenerate_moe_templates below, for the same reason:
+  # re-runs scripts/codegen/generate_grad_templates.py to refresh both
+  # onnxsim/graph_grad_templates_gen.py and .h in place. Both are checked
+  # into the repository specifically so ordinary builds -- including every
+  # cross-compile matrix (Windows/macOS/ARM, WASM/Pyodide, s390x) and, on the
+  # Python side, the wheel build itself (setup.py's own ONNXSIM_BUILTIN_ORT=OFF
+  # already keeps that build lean; it never installs onnxscript either) --
+  # never need onnxscript, which this script (like
+  # generate_moe_function_templates.py) depends on; see that script's own
+  # module docstring. Run explicitly with `cmake --build . --target
+  # regenerate_grad_templates` when iterating on a templated gradient rule
+  # itself, in any development environment that happens to have a Python3
+  # interpreter (onnxscript still needs installing separately) -- this target
+  # simply does not exist otherwise, so a Python-less C++-only build tree
+  # never sees it.
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_custom_target(regenerate_grad_templates
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/scripts/codegen/generate_grad_templates.py
+              ${CMAKE_CURRENT_SOURCE_DIR}/onnxsim/graph_grad_templates_gen.py
+              ${CMAKE_CURRENT_SOURCE_DIR}/onnxsim/graph_grad_templates_gen.h
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      COMMENT "Regenerating graph_grad_templates_gen.{py,h} from onnxscript"
+      VERBATIM)
+  endif()
 
   # xnnpack_codegen.{h,cpp} needs onnx (ModelProto/shape inference), like
   # precision_estimator_test above -- links the fully-configured `onnxsim`

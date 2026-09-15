@@ -5377,6 +5377,24 @@ on it; one Reshape stream remains pinned with its leftover singles.
 The `09`-hole and the sibling 0b-led/0b-terminated runs stay open
 work.
 
+### Emitting mcode, first op: tinygrad-traced negation
+
+`scripts/axera/tiny_emit.py` closes the loop the other way: instead of
+decoding what Pulsar2 wrote, it *writes* a stream -- for one op so far.
+A tinygrad neg graph traces to `MUL(x, const(-1.0))`, which the module
+matches and emits as a Neg command stream assembled from a reference
+build with caller-chosen output scales (found by value as float32
+words: four stride-7 copies; the MinMax formula reproduces Pulsar2's
+scales to 1e-10). Emitted streams round-trip exactly and pass `check`,
+and run on the card. What does not work yet is exact numerics: the
+emitted stream trails a true build 0.19-vs-0.006 against ORT. The gap
+is characterized but unattributed -- same-sub-layout emission,
+transplanting the differing singles, and symmetric zero points have
+all been ruled out; the input-side scale copies and zero-point bytes
+live at unknown offsets (zero points do not correlate with any single
+byte across five builds). That mapping is the next unit of work; the
+module docstring states the boundary honestly.
+
 ### A five-byte form that programs its pair twice
 
 Sixty-eight further real streams from the AX650N -- CNN, transformer and

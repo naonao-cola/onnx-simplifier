@@ -1336,11 +1336,20 @@ def test_a_gradient_seeded_on_an_intermediate_tensor_is_added_in():
         [onnx.helper.make_tensor_value_info("grad_A", onnx.TensorProto.FLOAT, [3, 4])],
         initializer=list(b.initializer),
     )
+    # Both Mul and Tanh are templated rules (see graph_grad.py's "Templated
+    # rules" section), so b.functions may hold model-local functions that
+    # need attaching and inlining -- exactly what _backward_model above does,
+    # spelled out here since this test needs two simultaneous seeds and so
+    # cannot reuse that single-seed helper.
+    opset_imports = [onnx.helper.make_opsetid("", 17)]
+    opset_imports += [onnx.helper.make_opsetid(fn.domain, 1) for fn in b.functions]
     model2 = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+        graph, functions=list(b.functions), opset_imports=opset_imports
     )
     model2.ir_version = 8
     onnx.checker.check_model(model2)
+    if b.functions:
+        model2 = onnx.inliner.inline_local_functions(model2)
 
     rng = np.random.default_rng(7)
     a = rng.standard_normal((3, 4)).astype(np.float32)

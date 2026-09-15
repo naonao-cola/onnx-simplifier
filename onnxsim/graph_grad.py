@@ -1172,6 +1172,9 @@ def _grad_sub(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str
     return [ctx.reduce_to(g, out, ctx.shape(node.input[0])), ctx.b.op("Neg", [gb])]
 
 
+# Reference-only, like _grad_add above: _RULES wires "Mul" to
+# _grad_mul_templated instead. Kept for tests/test_graph_grad_templates.py's
+# cross-check.
 def _grad_mul(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     a, b = node.input[0], node.input[1]
     out = ctx.shape(node.output[0])
@@ -1181,6 +1184,7 @@ def _grad_mul(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str
     ]
 
 
+# Reference-only: _RULES wires "Div" to _grad_div_templated instead.
 def _grad_div(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     a, b = node.input[0], node.input[1]
     y = node.output[0]
@@ -1194,6 +1198,10 @@ def _grad_div(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str
     ]
 
 
+# Reference-only: _RULES wires "Neg" to _grad_neg_templated instead. Kept
+# templated anyway (despite being one node already) so this and its C++
+# mirror share the same checked-in text rather than each spelling "Neg(g)"
+# out separately -- see GradNeg's own docstring in generate_grad_templates.py.
 def _grad_neg(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     return [ctx.b.op("Neg", [g])]
 
@@ -1204,12 +1212,18 @@ def _grad_identity(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optiona
     return [g]
 
 
+# Not templated, deliberately: see generate_grad_templates.py's own comment
+# beside where a GradRelu used to be for why (its Cast's dtype has to stay
+# visible, and mutable, to onnxsim.compile_training._cast_backward_to_fp16
+# before inlining -- a templated rule hides it inside an uninlined call
+# until much later).
 def _grad_relu(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     # The subgradient at exactly 0 is taken as 0 (strict Greater), matching
     # the straight-through masks adaround.py already builds.
     return [ctx.b.mul(g, ctx.b.greater_mask(node.input[0], 0.0))]
 
 
+# Reference-only: _RULES wires "Sigmoid" to _grad_sigmoid_templated instead.
 def _grad_sigmoid(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     # y (1 - y), from the forward output: the forward already computed the
     # sigmoid, so the backward never calls it again.
@@ -1218,12 +1232,14 @@ def _grad_sigmoid(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional
     return [ctx.b.mul(g, dy)]
 
 
+# Reference-only: _RULES wires "Tanh" to _grad_tanh_templated instead.
 def _grad_tanh(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     y = node.output[0]
     dy = ctx.b.sub(ctx.b.const(1.0), ctx.b.mul(y, y))
     return [ctx.b.mul(g, dy)]
 
 
+# Reference-only: _RULES wires "Erf" to _grad_erf_templated instead.
 def _grad_erf(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     # 2/sqrt(pi) * exp(-x^2). This one is here entirely for GELU, which
     # docs/qat.md's block-wise fine-tuning meets in every transformer FFN.
@@ -1235,16 +1251,19 @@ def _grad_erf(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str
     return [ctx.b.mul(g, dy)]
 
 
+# Reference-only: _RULES wires "Exp" to _grad_exp_templated instead.
 def _grad_exp(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     return [ctx.b.mul(g, node.output[0])]
 
 
+# Reference-only: _RULES wires "Sqrt" to _grad_sqrt_templated instead.
 def _grad_sqrt(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     # 0.5 / sqrt(x), again reusing the forward result. Singular at x = 0, as
     # the derivative genuinely is -- not something to paper over here.
     return [ctx.b.div(ctx.b.mul(g, ctx.b.const(0.5)), node.output[0])]
 
 
+# Reference-only: _RULES wires "Log" to _grad_log_templated instead.
 def _grad_log(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     # d/dx log(x) = g / x. Admitted for the log-softmax term a cross-entropy
     # or knowledge-distillation loss needs (log(softmax(x)), built from this
@@ -2155,16 +2174,28 @@ _MULTI_OUTPUT_RULES: Dict[str, MultiOutputRule] = {
 # itself is never imported here -- only onnx.parser, already a base
 # dependency, to read the checked-in text back into a FunctionProto.
 #
-# Wired into :data:`_RULES` below for "Add" and "BatchNormalization" -- these
-# were a proof of concept (see tests/test_graph_grad_templates.py, which
-# checks GradBatchNormalization against torch.autograd) before graduating to
-# production. `_grad_add`/`_grad_batch_normalization` above are no longer
-# reachable through :data:`_RULES`, but are kept, deliberately, as an
-# independent reference implementation: tests/test_graph_grad_templates.py
-# still cross-checks the templated rule's numbers against them on the same
+# "Add" and "BatchNormalization" were a proof of concept (see
+# tests/test_graph_grad_templates.py, which checks GradBatchNormalization
+# against torch.autograd) before graduating to production; :data:`_RULES`
+# below now also wires every elementwise/broadcasting rule whose forward op
+# is in BACKWARD_OPS's coverage already and whose VJP needs no dtype-specific
+# node of its own -- Neg, Exp, Sqrt, Log, Sigmoid, Tanh, Erf, Mul, Div -- the
+# same way. Each hand-written `_grad_*` above is no longer reachable through
+# :data:`_RULES`, but is kept, deliberately, as an independent reference
+# implementation: tests/test_graph_grad_templates.py still cross-checks every
+# templated rule's numbers against its hand-written counterpart on the same
 # inputs, which is exactly the kind of regression check that caught this
 # repo's own dvar-derivation bug in the first place and would otherwise be
-# lost by deleting the hand-written code.
+# lost by deleting the hand-written code. Left hand-written: `_grad_sub` (its
+# only "arithmetic" is a single ``Neg``, applied after ``reduce_to`` rather
+# than before so it runs on the smaller, already-reduced tensor -- an
+# ordering a template called *before* the reduction would lose), `_grad_relu`
+# (its mask ``Cast``'s target dtype has to stay a visible, mutable node for
+# onnxsim.compile_training._cast_backward_to_fp16 to retarget before
+# inlining -- see generate_grad_templates.py's own comment on this), and
+# every rule whose core math is inseparable from shape/attribute resolution
+# (`Conv`, `Gemm`, pooling, `Reshape`/`Transpose`, the reductions, the
+# normalizations, ...).
 
 
 @functools.lru_cache(maxsize=None)
@@ -2248,34 +2279,112 @@ def _grad_batch_normalization_templated(
     return [dx, dscale, dbias, dmean, dvar]
 
 
+def _grad_neg_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    (dx,) = ctx.b.call(_load_template(_templates.GRAD_NEG), [g])
+    return [dx]
+
+
+def _grad_exp_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    (dx,) = ctx.b.call(_load_template(_templates.GRAD_EXP), [g, node.output[0]])
+    return [dx]
+
+
+def _grad_sqrt_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    fn = _load_template(_templates.GRAD_SQRT)
+    (dx,) = ctx.b.call(fn, [g, node.output[0], ctx.b.const(0.5)])
+    return [dx]
+
+
+def _grad_log_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    (dx,) = ctx.b.call(_load_template(_templates.GRAD_LOG), [g, node.input[0]])
+    return [dx]
+
+
+def _grad_sigmoid_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    fn = _load_template(_templates.GRAD_SIGMOID)
+    (dx,) = ctx.b.call(fn, [g, node.output[0], ctx.b.const(1.0)])
+    return [dx]
+
+
+def _grad_tanh_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    fn = _load_template(_templates.GRAD_TANH)
+    (dx,) = ctx.b.call(fn, [g, node.output[0], ctx.b.const(1.0)])
+    return [dx]
+
+
+def _grad_erf_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    fn = _load_template(_templates.GRAD_ERF)
+    (dx,) = ctx.b.call(fn, [g, node.input[0], ctx.b.const(2.0 / np.sqrt(np.pi))])
+    return [dx]
+
+
+def _grad_mul_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    a, b = node.input[0], node.input[1]
+    out = ctx.shape(node.output[0])
+    da, db = ctx.b.call(_load_template(_templates.GRAD_MUL), [g, a, b])
+    return [
+        ctx.reduce_to(da, out, ctx.shape(a)),
+        ctx.reduce_to(db, out, ctx.shape(b)),
+    ]
+
+
+def _grad_div_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
+    a, b = node.input[0], node.input[1]
+    y = node.output[0]
+    out = ctx.shape(y)
+    da, db = ctx.b.call(_load_template(_templates.GRAD_DIV), [g, a, b, y])
+    return [
+        ctx.reduce_to(da, out, ctx.shape(a)),
+        ctx.reduce_to(db, out, ctx.shape(b)),
+    ]
+
+
 _RULES: Dict[str, Rule] = {
     "Add": _grad_add_templated,
     "AveragePool": _grad_averagepool,
     "BatchNormalization": _grad_batch_normalization_templated,
     "Clip": _grad_clip,
     "Conv": _grad_conv,
-    "Div": _grad_div,
-    "Erf": _grad_erf,
-    "Exp": _grad_exp,
+    "Div": _grad_div_templated,
+    "Erf": _grad_erf_templated,
+    "Exp": _grad_exp_templated,
     "Gather": _grad_gather,
     "Gemm": _grad_gemm,
     "Identity": _grad_identity,
     "InstanceNormalization": _grad_instance_normalization,
     "LayerNormalization": _grad_layer_normalization,
-    "Log": _grad_log,
+    "Log": _grad_log_templated,
     "MatMul": _grad_matmul,
     "MaxPool": _grad_maxpool,
-    "Mul": _grad_mul,
-    "Neg": _grad_neg,
+    "Mul": _grad_mul_templated,
+    "Neg": _grad_neg_templated,
     "ReduceMean": _grad_reduce,
     "ReduceSum": _grad_reduce,
     "Relu": _grad_relu,
     "Reshape": _grad_reshape,
-    "Sigmoid": _grad_sigmoid,
+    "Sigmoid": _grad_sigmoid_templated,
     "Softmax": _grad_softmax,
-    "Sqrt": _grad_sqrt,
+    "Sqrt": _grad_sqrt_templated,
     "Sub": _grad_sub,
-    "Tanh": _grad_tanh,
+    "Tanh": _grad_tanh_templated,
     "Transpose": _grad_transpose,
 }
 
