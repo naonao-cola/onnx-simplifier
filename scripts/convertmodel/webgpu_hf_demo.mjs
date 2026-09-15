@@ -48,7 +48,12 @@ async function decodeGraySquare(bytes, side) {
 // qat_graph.run_step_graph's feed-per-step path does. `onStep(t, loss)`, if
 // given, is called after each step -- the interactive panel uses it to show
 // live progress; nothing here needs the callback's return value.
-async function runStepLoop(ort, session, manifest, constants, onStep) {
+//
+// Exported (unlike decodeGraySquare below) so
+// test/webgpu_hf_demo_loss_check.test.mjs can replay this exact loop against
+// a deterministic adversarial `x` under plain Node/wasm, rather than
+// duplicating it -- see that test's own comment for what it's checking.
+export async function runStepLoop(ort, session, manifest, constants, onStep) {
   let state = {};
   for (const [name, spec] of Object.entries(manifest.state)) {
     state[name] = new ort.Tensor("float32", Float32Array.from(spec.data), spec.dims);

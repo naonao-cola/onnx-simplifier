@@ -24,6 +24,10 @@
 //     The point is not what it learns; it's that a real photo, a real
 //     gradient/Adam step graph, and WebGPU all work together, end to end,
 //     inside the time this CI job's own timeout gives it.
+//   * The "loss decreased meaningfully" check below compares windowed
+//     averages, not the raw first/last loss values -- see its own comment
+//     for why a single-sample comparison intermittently failed CI even
+//     though training was working correctly.
 //
 // Requires the "playwright" package and a Chromium binary (not installed by
 // default here -- see package.json's test:webgpu-hf-demo comment and
@@ -68,6 +72,10 @@ async function check(name, fn) {
   await fn();
   passed += 1;
   console.log("  ok -", name);
+}
+
+function average(xs) {
+  return xs.reduce((a, b) => a + b, 0) / xs.length;
 }
 
 // A minimal static file server over scripts/convertmodel/ -- just enough for
@@ -209,11 +217,29 @@ async function main() {
     );
   });
   await check("loss decreased meaningfully over the run", () => {
-    const first = result.losses[0];
-    const last = result.losses[result.losses.length - 1];
+    // Compares a windowed average of the first/last few steps, not the raw
+    // losses[0]/losses[last] endpoints -- found (and reproduced offline; see
+    // this file's own comment above the WINDOW constant) to intermittently
+    // fail CI: for the exact fixed w1/b1/w2/b2 this fixture bakes, *some*
+    // real photos land close enough to the model's existing zero-crossing
+    // that losses[0] is itself a tiny, near-coincidental outlier (e.g.
+    // ~3e-13 in one reproduction). Adam's bias-corrected first step is
+    // roughly lr * sign(gradient) regardless of how small the gradient
+    // already is (see build_qat_hf_demo's own comment on this), so from
+    // such a starting point the loss necessarily jumps up by many orders of
+    // magnitude in *relative* terms even though training is proceeding
+    // completely normally afterward -- the run this was found from went on
+    // to fall ~50x from its early-window average to its late-window one.
+    // Averaging a handful of steps at each end is robust to that single
+    // freak sample without weakening the check for an ordinary run, where
+    // neighboring losses are all on the same scale anyway.
+    const WINDOW = Math.min(5, Math.floor(result.losses.length / 2));
+    const early = average(result.losses.slice(0, WINDOW));
+    const late = average(result.losses.slice(-WINDOW));
     assert.ok(
-      last < 0.8 * first,
-      `loss did not meaningfully decrease: ${first} -> ${last}`,
+      late < 0.8 * early,
+      `loss did not meaningfully decrease: first ${WINDOW} steps avg ${early} -> ` +
+        `last ${WINDOW} steps avg ${late} (raw trace: ${trace})`,
     );
   });
 

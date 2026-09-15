@@ -101,6 +101,26 @@ def _f32(array) -> np.ndarray:
     return np.asarray(array, dtype=np.float32)
 
 
+def _windowed_decrease_ok(losses: Sequence[float], factor: float) -> bool:
+    """Whether ``losses`` decreased "meaningfully" (by ``factor``), comparing
+    the average of the first/last few steps rather than the raw
+    ``losses[0]``/``losses[-1]`` endpoints -- see ``build_qat_hf_demo``'s own
+    sanity check and ``webgpu_hf_demo.test.mjs``'s matching browser-side
+    check (mirrored in JS as ``average``/``WINDOW``, kept in sync with this
+    function) for why: for some real inputs, ``losses[0]`` alone can be a
+    tiny, near-coincidental outlier that any Adam step then jumps away from
+    by orders of magnitude in relative terms, even though training is
+    otherwise proceeding completely normally. Averaging a handful of steps
+    at each end is robust to that single freak sample without weakening the
+    check for an ordinary run, where neighboring losses are all on the same
+    scale anyway.
+    """
+    window = min(5, len(losses) // 2)
+    early = sum(losses[:window]) / window
+    late = sum(losses[-window:]) / window
+    return late < factor * early
+
+
 def _tensor_entry(array: np.ndarray) -> Dict:
     """One tensor as the Node test wants it: dims plus flat float32 data."""
     array = _f32(array)
@@ -583,7 +603,7 @@ def build_qat_hf_demo(rng: np.random.Generator) -> Dict:
         sanity_scalars,
         [],
     )
-    if not (sanity_losses[-1] < 0.5 * sanity_losses[0]):
+    if not _windowed_decrease_ok(sanity_losses, 0.5):
         raise SystemExit(
             "step_qat_hf_demo.onnx sanity check: loss did not meaningfully "
             f"decrease over {NUM_DEMO_STEPS} synthetic steps "
