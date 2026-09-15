@@ -72,159 +72,12 @@ calibration data beyond what :mod:`onnxsim.calibration` already provides.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
-import numpy as np
 import onnx
 import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import (
-    _GAMMA,
-    _ZETA,
-    _Candidate,
-    _find_int4_matmul_candidates,
-    _h_and_dhdv,
-    _pack_int4,
-)
-from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-
-
-def _optimize_tesseraq(
-    w_nk: np.ndarray,
-    scale_blocks: np.ndarray,
-    block_size: int,
-    x: np.ndarray,
-    n_min: float,
-    n_max: float,
-    num_iterations: int,
-    par_rounds: int,
-    learning_rate: float,
-    scale_learning_rate: float,
-    reg_param: float,
-    warm_start: float,
-    beta_range: Tuple[float, float],
-) -> "tuple[np.ndarray, np.ndarray]":
-    """Runs TesseraQ's Progressive Adaptive Rounding for one weight matrix,
-    jointly optimizing its per-block dequantization scale. ``w_nk`` is the
-    float weight and ``scale_blocks`` its per-``(output channel, block)``
-    scale (i.e. not yet broadcast across each block's own elements), both
-    laid out ``[N, K]``/``[N, K / block_size]`` (output channel first)
-    regardless of the op's own storage layout; ``x`` is real calibration
-    activations captured from the float model, shape ``[num_samples, K]``.
-
-    Returns ``(codes_nk, scale_blocks_optimized)``: the fully-hardened
-    integer codes (shape like ``w_nk``, values in ``[n_min, n_max]``) and
-    the optimized per-block scale (shape like ``scale_blocks``).
-    """
-    n, k = w_nk.shape
-    num_blocks = scale_blocks.shape[1]
-    y_float = x @ w_nk.T  # [S, N]
-
-    scale_nk0 = np.repeat(scale_blocks, block_size, axis=1)[:, :k]
-    ratio = w_nk / scale_nk0
-    floor_base = np.floor(ratio)
-    frac = np.clip(ratio - floor_base, 1e-4, 1.0 - 1e-4)
-    sig0 = np.clip((frac - _GAMMA) / (_ZETA - _GAMMA), 1e-4, 1.0 - 1e-4)
-    v = np.log(sig0 / (1.0 - sig0))
-
-    log_delta = np.zeros_like(scale_blocks)  # per-block multiplicative scale correction
-
-    hard_mask = np.zeros((n, k), dtype=bool)
-    hard_code = np.zeros((n, k), dtype=np.float64)
-
-    m_v, v2_v = np.zeros_like(v), np.zeros_like(v)
-    m_s, v2_s = np.zeros_like(log_delta), np.zeros_like(log_delta)
-    beta1, beta2, adam_eps = 0.9, 0.999, 1e-8
-
-    par_rounds = max(1, par_rounds)
-    iters_per_round = max(1, num_iterations // par_rounds)
-    total_iters = iters_per_round * par_rounds
-    warm_start_iters = int(total_iters * warm_start)
-    beta_start, beta_end = beta_range
-    n_elems = x.shape[0] * n
-
-    global_t = 0
-    for round_idx in range(par_rounds):
-        for _ in range(iters_per_round):
-            scale_hat_blocks = scale_blocks * np.exp(log_delta)
-            scale_hat_nk = np.repeat(scale_hat_blocks, block_size, axis=1)[:, :k]
-
-            h, dh_dv = _h_and_dhdv(v)
-            raw = np.where(hard_mask, hard_code, floor_base + h)
-            clipped = np.clip(raw, n_min, n_max)
-            active = (raw > n_min) & (raw < n_max) & ~hard_mask
-            w_hat = clipped * scale_hat_nk
-
-            y_hat = x @ w_hat.T  # [S, N]
-            dl_dy = 2.0 * (y_hat - y_float) / n_elems
-            dl_dw_hat = dl_dy.T @ x  # [N, K]
-
-            dl_dh = dl_dw_hat * np.where(active, scale_hat_nk, 0.0)
-            grad_v = dl_dh * dh_dv
-
-            if global_t >= warm_start_iters:
-                progress = (global_t - warm_start_iters) / max(
-                    1, total_iters - warm_start_iters - 1
-                )
-                beta = beta_start + (beta_end - beta_start) * progress
-                u = 2.0 * h - 1.0
-                abs_u = np.abs(u)
-                dreg_dh = (
-                    -2.0 * reg_param * beta * np.sign(u) * np.power(abs_u, beta - 1.0)
-                )
-                grad_v = grad_v + dreg_dh * dh_dv
-            grad_v = np.where(hard_mask, 0.0, grad_v)
-
-            dl_dscale_hat_nk = dl_dw_hat * clipped  # [N, K]
-            dl_dscale_hat_blocks = dl_dscale_hat_nk.reshape(
-                n, num_blocks, block_size
-            ).sum(axis=2)
-            grad_log_delta = dl_dscale_hat_blocks * scale_hat_blocks
-
-            global_t += 1
-            m_v = beta1 * m_v + (1.0 - beta1) * grad_v
-            v2_v = beta2 * v2_v + (1.0 - beta2) * (grad_v * grad_v)
-            bias_c1 = 1.0 - beta1**global_t
-            bias_c2 = 1.0 - beta2**global_t
-            v = v - learning_rate * (m_v / bias_c1) / (
-                np.sqrt(v2_v / bias_c2) + adam_eps
-            )
-
-            m_s = beta1 * m_s + (1.0 - beta1) * grad_log_delta
-            v2_s = beta2 * v2_s + (1.0 - beta2) * (grad_log_delta * grad_log_delta)
-            log_delta = log_delta - scale_learning_rate * (m_s / bias_c1) / (
-                np.sqrt(v2_s / bias_c2) + adam_eps
-            )
-
-        # End of round: permanently harden the most-confident still-soft
-        # elements (PAR's own coarse-to-fine schedule) -- confidence is each
-        # element's distance from the relaxation's undecided midpoint, i.e.
-        # how far its own soft value already sits from 0.5.
-        h_now, _ = _h_and_dhdv(v)
-        if round_idx == par_rounds - 1:
-            newly = ~hard_mask
-        else:
-            target_fraction = (round_idx + 1) / par_rounds
-            target_count = int(round(target_fraction * n * k))
-            to_harden = max(0, target_count - int(hard_mask.sum()))
-            newly = np.zeros((n, k), dtype=bool)
-            if to_harden > 0:
-                soft_idx = np.flatnonzero(~hard_mask.ravel())
-                if to_harden >= soft_idx.size:
-                    newly_flat = soft_idx
-                else:
-                    confidence = np.abs(h_now.ravel()[soft_idx] - 0.5)
-                    top = np.argpartition(confidence, -to_harden)[-to_harden:]
-                    newly_flat = soft_idx[top]
-                newly.ravel()[newly_flat] = True
-        hard_code = np.where(newly, floor_base + np.round(h_now), hard_code)
-        hard_mask = hard_mask | newly
-
-    codes_nk = np.clip(hard_code, n_min, n_max)
-    scale_blocks_optimized = scale_blocks * np.exp(log_delta)
-    return codes_nk, scale_blocks_optimized
+from onnxsim.calibration import Tensors
 
 
 def apply_tesseraq(
@@ -314,93 +167,48 @@ def apply_tesseraq(
             codes and per-block scale initializers rewritten to their
             PAR-optimized values (same shape and dtype -- only the codes
             and the scale's own values change)
+
+    The pure-Python PAR/Adam implementation above has been retired in
+    favor of the verified C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_tesseraq_cpp` (``onnxsim/tesseraq_entry.cpp``'s
+    own ``ApplyTesseraq``), forwarding every argument unchanged.
+    **Behavior change from earlier onnxsim versions:** this is an
+    iterative Adam optimization, not a closed-form computation, so
+    floating-point summation-order differences between the C++ port's
+    own scalar dense-matmul kernels and this module's own numpy `@` can
+    compound across iterations -- measured (tests/test_tesseraq_cpp.py)
+    to agree with this function's own pre-alias implementation exactly
+    in most configurations, but not always: a tiny, measured fraction of
+    elements can land on the opposite side of the rectified sigmoid's
+    0.5 soft-decision boundary (always its immediate grid neighbor) in
+    the most demanding configurations tested. ``_optimize_tesseraq`` has
+    been removed (nothing else in the codebase imported it); every other
+    helper this module used stays available from its own home module
+    (``onnxsim.adaround``'s ``_GAMMA``/``_ZETA``/``_Candidate``/
+    ``_find_int4_matmul_candidates``/``_h_and_dhdv``/``_pack_int4``).
+    Imported lazily (inside the function body, not at module scope) to
+    avoid a circular import: ``onnxsim.onnx_simplifier`` already imports
+    from this module, so importing it back at module load time here
+    would deadlock the import machinery.
     """
     if not 2 <= num_bits <= 4:
         raise ValueError(f"num_bits must be between 2 and 4, got {num_bits}")
 
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    if isinstance(quantized_model, str):
-        quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_tesseraq_cpp
 
-    candidates: List[_Candidate] = _find_int4_matmul_candidates(
-        float_model, quantized_model
+    return apply_tesseraq_cpp(
+        float_model,
+        quantized_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        num_bits=num_bits,
+        num_iterations=num_iterations,
+        par_rounds=par_rounds,
+        learning_rate=learning_rate,
+        scale_learning_rate=scale_learning_rate,
+        reg_param=reg_param,
+        warm_start=warm_start,
+        beta_range=beta_range,
+        providers=providers,
     )
-    if not candidates:
-        return quantized_model
-
-    probe_names = sorted({c.float_node.input[0] for c in candidates})
-    float_probe = _add_probe_outputs(float_model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        out = backend.run_model(float_probe, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(out[name], dtype=np.float64))
-
-    n_max = float(2 ** (num_bits - 1) - 1)
-    n_min = -n_max
-
-    optimized_codes: Dict[str, np.ndarray] = {}
-    optimized_scale: Dict[str, np.ndarray] = {}
-    for c in candidates:
-        acts = _activation_rows(activations[c.float_node.input[0]])
-        if not acts:
-            continue  # no usable activation (no feature axis); skip
-        x = np.concatenate(acts, axis=0)
-
-        w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)
-        scale = onnx.numpy_helper.to_array(c.ws_init).astype(np.float64)
-        dim0, dim1 = w.shape
-
-        if c.weight_transposed:
-            w_nk = w  # already [N, K]
-            scale_blocks = scale  # already [N, K / block_size]
-        else:
-            w_nk = w.T  # [K, N] -> [N, K]
-            scale_blocks = scale.T  # [K / block_size, N] -> [N, K / block_size]
-        if x.shape[1] != w_nk.shape[1]:
-            continue  # activation's feature dim doesn't match K; skip
-        if w_nk.shape[1] % c.block_size != 0:
-            continue  # ragged block; quantize_weight_only_int4 never produces this
-
-        codes_nk, scale_blocks_opt = _optimize_tesseraq(
-            w_nk,
-            scale_blocks,
-            c.block_size,
-            x,
-            n_min=n_min,
-            n_max=n_max,
-            num_iterations=num_iterations,
-            par_rounds=par_rounds,
-            learning_rate=learning_rate,
-            scale_learning_rate=scale_learning_rate,
-            reg_param=reg_param,
-            warm_start=warm_start,
-            beta_range=beta_range,
-        )
-        codes_orig = codes_nk if c.weight_transposed else codes_nk.T
-        scale_orig = scale_blocks_opt if c.weight_transposed else scale_blocks_opt.T
-        assert codes_orig.shape == (dim0, dim1)
-        optimized_codes[c.wq_name] = codes_orig.astype(np.int8)
-        optimized_scale[c.ws_init.name] = scale_orig.astype(np.float32)
-
-    if not optimized_codes:
-        return quantized_model
-
-    corrected = onnx.ModelProto()
-    corrected.CopyFrom(quantized_model)
-    for t in corrected.graph.initializer:
-        codes = optimized_codes.get(t.name)
-        if codes is not None:
-            t.raw_data = _pack_int4(codes)
-            continue
-        scale = optimized_scale.get(t.name)
-        if scale is not None:
-            t.CopyFrom(onnx.numpy_helper.from_array(scale, name=t.name))
-
-    return corrected

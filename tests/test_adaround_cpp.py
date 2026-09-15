@@ -93,6 +93,7 @@ def _assert_agrees(
 ):
     py = apply_adaround(float_model, quant_model, calibration_data, **kwargs)
     cpp = apply_adaround_cpp(float_model, quant_model, calibration_data, **kwargs)
+    onnx.checker.check_model(cpp)
     py_codes, cpp_codes = _int4_codes(py), _int4_codes(cpp)
     mismatch = int(np.sum(py_codes != cpp_codes))
     # Exact bit-for-bit agreement is the common case (see this module's

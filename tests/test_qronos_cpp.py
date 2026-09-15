@@ -90,6 +90,7 @@ def _assert_exact_parity(float_model, calibration_data, **kwargs):
     quant = onnxsim.quantize_weight_only_int4(float_model)
     py = apply_qronos(float_model, quant, calibration_data, **kwargs)
     cpp = apply_qronos_cpp(float_model, quant, calibration_data, **kwargs)
+    onnx.checker.check_model(cpp)
     py_inits = sorted(py.graph.initializer, key=lambda t: t.name)
     cpp_inits = sorted(cpp.graph.initializer, key=lambda t: t.name)
     assert [t.name for t in py_inits] == [t.name for t in cpp_inits]

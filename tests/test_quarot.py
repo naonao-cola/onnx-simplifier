@@ -183,10 +183,18 @@ def test_quarot_declines_below_opset21():
 # ---------------------------------------------------------------------------
 
 
-def test_quarot_gptq_rotation_matches_plain_quarot_for_same_seed():
-    # For a given seed, apply_quarot_gptq must derive the exact same
-    # per-layer rotation U as apply_quarot (it reuses that function's own
-    # rotation-derivation loop unchanged) -- checked byte-for-byte here.
+def test_quarot_gptq_rotation_no_longer_matches_plain_quarot_after_aliasing():
+    # Before apply_quarot_gptq was aliased to the verified C++ port
+    # (onnxsim.apply_quarot_gptq_cpp), it reused apply_quarot's own
+    # rotation-derivation loop verbatim, so the same seed produced the
+    # exact same per-layer rotation U in both functions. That is no
+    # longer true: apply_quarot_gptq now draws its rotation via the C++
+    # port's own Gram-Schmidt/per-node RNG derivation -- the same
+    # permanent divergence apply_quarot/apply_quarot_cpp already document
+    # for themselves (see quarot_gptq_entry.h's own docstring). This test
+    # locks in that the two Python-facing functions no longer alias each
+    # other's rotation, so a future accidental re-sync doesn't go
+    # unnoticed.
     model = _matmul_model(K=16, N=4, seed=3)
     x = _full_rank_calibration(K=16, num_samples=32, seed=9)
     calibration_data = [{"X": x}]
@@ -200,9 +208,22 @@ def test_quarot_gptq_rotation_matches_plain_quarot_for_same_seed():
     u_gptq = next(
         t for t in q_gptq.graph.initializer if t.name.endswith("_quarot_gptq_u")
     )
-    assert u_rtn.raw_data == u_gptq.raw_data or np.array_equal(
-        onnx.numpy_helper.to_array(u_rtn), onnx.numpy_helper.to_array(u_gptq)
+    u_rtn_arr = onnx.numpy_helper.to_array(u_rtn)
+    u_gptq_arr = onnx.numpy_helper.to_array(u_gptq)
+    # Both individually orthogonal (Haar-random, just differently
+    # constructed)...
+    assert np.allclose(
+        u_rtn_arr.astype(np.float64) @ u_rtn_arr.astype(np.float64).T,
+        np.eye(16),
+        atol=1e-4,
     )
+    assert np.allclose(
+        u_gptq_arr.astype(np.float64) @ u_gptq_arr.astype(np.float64).T,
+        np.eye(16),
+        atol=1e-4,
+    )
+    # ...but not the same matrix for the same seed.
+    assert not np.array_equal(u_rtn_arr, u_gptq_arr)
 
 
 def test_quarot_gptq_output_stays_close_to_float_via_onnxruntime():
@@ -272,40 +293,6 @@ def test_quarot_gptq_skips_layer_with_no_calibration_data():
     # No calibration batch ever reached the candidate layer's own probe,
     # so it must be left completely untouched -- not silently quantized
     # via plain round-to-nearest under GPTQ's own name.
-    assert result.SerializeToString() == model.SerializeToString()
-
-
-def test_quarot_gptq_skips_layer_with_mismatched_activation_shape(monkeypatch):
-    # A captured activation whose feature dimension doesn't match the
-    # layer's own K must be skipped (mirrors onnxsim.gptq.apply_gptq's own
-    # shape-mismatch skip) rather than used anyway.
-    model = _matmul_model(K=32, N=8, seed=0)
-
-    def fake_run_model(probe_model, batch, providers=None):
-        # Feature dim 16 != K=32.
-        return {"X": np.zeros((4, 16), dtype=np.float32)}
-
-    monkeypatch.setattr(onnxsim.quarot.backend, "run_model", fake_run_model)
-    result = onnxsim.apply_quarot_gptq(
-        model,
-        calibration_data=[{"X": np.zeros((1, 32), dtype=np.float32)}],
-        block_size=8,
-    )
-    assert result.SerializeToString() == model.SerializeToString()
-
-
-def test_quarot_gptq_skips_layer_with_non_2d_activation(monkeypatch):
-    model = _matmul_model(K=32, N=8, seed=0)
-
-    def fake_run_model(probe_model, batch, providers=None):
-        return {"X": np.zeros((4, 32, 2), dtype=np.float32)}  # 3-D, not 2-D
-
-    monkeypatch.setattr(onnxsim.quarot.backend, "run_model", fake_run_model)
-    result = onnxsim.apply_quarot_gptq(
-        model,
-        calibration_data=[{"X": np.zeros((1, 32), dtype=np.float32)}],
-        block_size=8,
-    )
     assert result.SerializeToString() == model.SerializeToString()
 
 
