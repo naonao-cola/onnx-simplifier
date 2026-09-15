@@ -208,6 +208,17 @@ export function applyAwq(
   calibration: CalibrationData,
   options?: { numAlphaSteps?: number },
 ): Promise<Uint8Array>;
+export function applyQuarotGptq(
+  model: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: {
+    seed?: number;
+    blockSize?: number;
+    percdamp?: number;
+    procBlockSize?: number;
+    epsilon?: number;
+  },
+): Promise<Uint8Array>;
 export function applySmoothQuant(
   model: OnnxModelBytes,
   calibration: CalibrationData,
@@ -258,6 +269,7 @@ declare const _default: {
   applyLlmInt8: typeof applyLlmInt8;
   applyGptq: typeof applyGptq;
   applyAwq: typeof applyAwq;
+  applyQuarotGptq: typeof applyQuarotGptq;
   applySmoothQuant: typeof applySmoothQuant;
 };
 export default _default;

@@ -616,6 +616,45 @@ export async function applyAwq(
   return new Uint8Array(result);
 }
 
+/**
+ * QuaRot+GPTQ: the real QuaRot paper's optional, tighter weight quantizer --
+ * identical to `applyQuarot` (same per-layer random rotation, same
+ * data-free per-token INT4 activation quantization) except the weight is
+ * quantized via `applyGptq`'s own Hessian-compensated column algorithm,
+ * evaluated in the rotated activation space, instead of round-to-nearest.
+ * Unlike `applyGptq`/`applyAwq`, takes a single model (this pass derives
+ * its own rotation and quantizes from scratch, like `applyQuarot`).
+ * Returns the rotated-and-quantized model bytes.
+ */
+export async function applyQuarotGptq(
+  model,
+  calibration,
+  { seed = 0, blockSize = 32, percdamp = 0.01, procBlockSize = 128, epsilon = 1e-12 } = {},
+) {
+  const bytes = toBytes(model);
+  const runtime = await getRuntime();
+  const fn = runtime.onnxsim_apply_quarot_gptq;
+  if (typeof fn !== "function") {
+    throw new Error("onnxsim: this build has no export 'onnxsim_apply_quarot_gptq' (rebuild the wasm module?)");
+  }
+  let result = fn(
+    bytes,
+    normalizeCalibrationBatches(calibration),
+    seed,
+    blockSize,
+    percdamp,
+    procBlockSize,
+    epsilon,
+  );
+  if (result && typeof result.then === "function") {
+    result = await result;
+  }
+  if (!result) {
+    throw new Error("onnxsim: onnxsim_apply_quarot_gptq failed (see stderr output for details)");
+  }
+  return new Uint8Array(result);
+}
+
 export default {
   simplify,
   versions,
@@ -655,5 +694,6 @@ export default {
   applyLlmInt8,
   applyGptq,
   applyAwq,
+  applyQuarotGptq,
   applySmoothQuant,
 };

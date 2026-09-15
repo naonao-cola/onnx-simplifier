@@ -33,6 +33,7 @@ import {
   applyGptq,
   applyAwq,
   applyQuarot,
+  applyQuarotGptq,
   applySmoothQuant,
   applyStructuredPruning,
   applyWandaPruning,
@@ -231,6 +232,21 @@ try {
       X: new ort.Tensor("float32", new Float32Array(32).map((_, i) => ((i * 37) % 11) - 5), [1, 32]),
     });
     const out = await applyAwq(floatModel, quantModel, [batch(), batch()], { numAlphaSteps: 5 });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applyQuarotGptq rotates and quantizes on synthetic calibration data", async () => {
+    // Same dedicated float fixture as the GPTQ/AWQ checks above (K=32,
+    // divisible by the default block size) -- unlike those, this pass
+    // takes only the float model: it derives its own rotation and
+    // quantizes from scratch, like applyQuarot's own single-model binding.
+    const ort = await import("onnxruntime-web");
+    const floatModel = new Uint8Array(readFileSync(FIXTURE_GPTQ));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array(32).map((_, i) => ((i * 37) % 11) - 5), [1, 32]),
+    });
+    const out = await applyQuarotGptq(floatModel, [batch(), batch()], { seed: 0 });
     assert.ok(out instanceof Uint8Array);
     assert.ok(out.length > 0);
   });

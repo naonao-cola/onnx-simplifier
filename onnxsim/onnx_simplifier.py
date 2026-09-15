@@ -2597,6 +2597,99 @@ def apply_awq_cpp(
     )
 
 
+def apply_quarot_gptq_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    block_size: int = 32,
+    percdamp: float = 0.01,
+    proc_block_size: int = 128,
+    epsilon: float = 1e-12,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_quarot_gptq`: the real QuaRot
+    (Ashkboos et al., 2024) paper's optional, tighter weight quantizer --
+    identical to :func:`onnxsim.apply_quarot_cpp` in every respect (same
+    candidate matching, same per-layer random rotation, same data-free
+    per-token INT4 activation quantization) except the *weight* is
+    quantized via :func:`onnxsim.apply_gptq_cpp`'s own Hessian-based column
+    algorithm, evaluated in the rotated activation space, instead of
+    independent round-to-nearest.
+
+    Same real calibration machinery as :func:`onnxsim.apply_gptq_cpp` --
+    a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through ``model`` in C++ (see
+    ``ApplyQuarotGptq`` in ``quarot_gptq_entry.h`` for the full scope,
+    including its own permanent RNG divergence from the Python reference --
+    shared with :func:`onnxsim.apply_quarot_cpp`'s own -- and its accepted
+    numerical scope, shared with :func:`onnxsim.apply_gptq_cpp`'s own).
+
+    Unlike :func:`onnxsim.apply_gptq_cpp`/:func:`onnxsim.apply_awq_cpp`,
+    there is no separate ``quantized_model`` argument: like
+    :func:`onnxsim.apply_quarot_cpp`, this pass derives its own rotation and
+    quantizes from ``model`` alone.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to compute each
+            matched layer's rotated-space Hessian from -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the per-layer random rotation (independent of,
+            and not comparable to, :func:`onnxsim.apply_quarot_gptq`'s own
+            ``seed`` -- see ``quarot_gptq_entry.h``) and for the random
+            calibration data (ignored for the latter if ``calibration_data``
+            is supplied)
+    :param block_size: elements per weight quantization block along K,
+            matching :func:`onnxsim.apply_quarot_cpp`'s own default
+    :param percdamp: Hessian damping factor, matching
+            :func:`onnxsim.apply_gptq_cpp`'s own parameter and default
+    :param proc_block_size: GPTQ's own column-processing block size (not
+            the quantization scale's own block size)
+    :param epsilon: floor applied to a token's own max-abs rotated-activation
+            value before using it as a scale at graph-run time, matching
+            :func:`onnxsim.apply_quarot_cpp`'s own parameter
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched layer that has usable calibration
+            data rotated and INT4-quantized; a matched layer without usable
+            calibration data is left completely untouched. A model with no
+            matching layer, or an opset older than 21, is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_gptq_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_quarot_gptq(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            seed,
+            block_size,
+            percdamp,
+            proc_block_size,
+            epsilon,
+        )
+    )
+
+
 def apply_smoothquant_cpp(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,
