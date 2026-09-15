@@ -13,37 +13,47 @@ tests/test_axera_mcode_reciprocal.py for the field map): given the
 reference build's recorded scales and the target scales, it rewrites the
 input reciprocal and requant slots by value, verifying each family forms
 its exact stride run. ``patch_mul_output_quad`` does the same for the
-output-side scale quad (``03 <f32(z_scale)> 81 82`` x4 stride 7).
-``patch_mul_zp_x`` patches x's zero point, but *only* when the reference
-build happens to use the one zero-point form this project has actually
-decoded (see below) -- it raises rather than silently doing nothing when
-it doesn't apply, since whether it applies is not predictable in advance.
+output-side scale quad (``03 <f32(z_scale)> 81 <tag2>`` x4 stride 7--
+``tag2`` varies build to build, unlike the always-``81`` byte before it;
+not patched, not relied on). ``patch_mul_zp_x`` patches x's zero point,
+but *only* when the reference build happens to use the one zero-point
+form this project has actually decoded (see below) -- it raises rather
+than silently doing nothing when it doesn't apply, since whether it
+applies is not predictable in advance.
 
 What none of this touches: the S-unit programs themselves (magnitude-
 adaptive shape, unmodeled ISA), the manifest string table (tensor-name
 order varies build to build), y's zero point (no literal encoding found
-for it at all, decoded or not), or x's zero point when the reference
-build doesn't use the literal form -- which is the common case, not an
-edge case (confirmed non-predictable from zp_x's value at any magnitude,
-see ``TestZpXLiteralByteWhenPresent`` in the test file). Because of that
-last point, and because z_scale changing generally moves far more of the
-stream than the five families patched here (z's own calibration range
-shifts the S-unit programs' internal constants throughout, not just the
-named slots -- confirmed by diffing same-shape builds at different z
-scales: over a thousand bytes move), **full-stream equality after
-patching is not a goal and should not be expected**; what is verified is
-that each named family lands on the target build's own bytes for that
-family.
+for it at all, decoded or not), z's own zero point (see the hardware
+result below -- it did not need patching, at least once), or x's zero
+point when the reference build doesn't use the literal form -- which is
+the common case, not an edge case (confirmed non-predictable from zp_x's
+value at any magnitude, see ``TestZpXLiteralByteWhenPresent`` in the
+test file). Because of that last point, and because z_scale changing
+generally moves far more of the stream than the five families patched
+here (A, B, C, the output quad, zp_x -- z's own calibration range shifts
+the S-unit programs' internal
+constants throughout, not just the named slots -- confirmed by diffing
+same-shape builds at different z scales: over a thousand bytes move),
+**full-stream equality after patching is not a goal and should not be
+expected**; what is verified is that each named family lands on the
+target build's own bytes for that family.
 
-Status is honestly v0+v1+v2: scale and output-quad words are mapped and
-verified (the MinMax formula reproduces Pulsar2's scales to 1e-10;
-emitted streams round-trip exactly and pass ``mcode.check``), and x's
-zero point is *sometimes* patchable by value with zero arithmetic
-transform needed -- but the emitted stream still ran ~0.19-vs-0.006
-against ORT the last time it was checked end to end (pre-dating the
-output-quad and zp work here; a fresh device check with those included
-is the natural next step, not yet done). tinygrad itself is an optional,
-lazily-imported dependency: everything else here needs only ``numpy``.
+Status (2026-09-16): scale, output-quad and (when present) zp_x words
+are mapped, verified offline (round-trip exactly, pass ``mcode.check``),
+and confirmed once on real AX650N hardware
+(tests/test_axera_mul_emit_hardware.py): patching a reference build's
+scales + output quad + zp_x (17 bytes total, in that one build pair)
+reproduced a real rebuild's device output *bit-exactly*, not just within
+quantization noise, and neither zp_y nor zp_z needed touching for that
+result to hold. This supersedes an earlier note here about the emitted
+stream running ~0.19-vs-0.006 against ORT -- that check pre-dated the
+output-quad and zp_x work and used a different code path (``emit_neg``,
+not the Mul patch functions); it has not been repeated against these.
+One data point is not a general proof -- see the two functions' own
+docstrings for exactly what is and isn't covered. tinygrad itself is an
+optional, lazily-imported dependency: everything else here needs only
+``numpy``.
 """
 
 from __future__ import annotations
@@ -192,21 +202,28 @@ def patch_mul_output_quad(
     """Rewrite a Mul stream's output scale quads by value.
 
     The output-side counterpart to ``patch_mul_scales``'s input-side
-    families: four copies of ``03 <f32(z_scale)> 81 82`` at stride 7 (see
-    ``TestOutputScaleQuads`` in tests/test_axera_mcode_reciprocal.py).
-    Verifies the ``03``/``81 82`` framing on every copy before patching,
-    on top of ``_strided_run``'s count/stride check, since this family's
-    frame bytes are cheap to confirm and a false match here would silently
-    leave the output at the old scale.
+    families: four copies of ``03 <f32(z_scale)> 81 <tag2>`` at stride 7
+    (see ``TestOutputScaleQuads`` in tests/test_axera_mcode_reciprocal.py).
+    Verifies the ``03``/``81`` framing on every copy before patching, on
+    top of ``_strided_run``'s count/stride check, since those two bytes
+    are cheap to confirm and a false match here would silently leave the
+    output at the old scale. The second tag byte is NOT checked: it read
+    ``82`` on every fixture ``TestOutputScaleQuads`` was written against,
+    which that test's docstring stated as if constant, but two more real
+    builds (zp_x=33/35, output zp 30/32) came back ``80`` instead -- only
+    the *value* (this function's job) and the ``03``/``81`` framing hold
+    across all six builds gathered so far. This function preserves
+    whatever the second tag byte already is; it never depends on its
+    value.
     """
     old_pat = struct.pack("<f", float(old_z_scale))
     new_pat = struct.pack("<f", float(new_z_scale))
     hits = _strided_run(reference_mcode, old_pat, 7)
     for off in hits:
-        lead, tags = reference_mcode[off - 1], reference_mcode[off + 4 : off + 6]
-        if lead != 0x03 or tags != b"\x81\x82":
+        lead, tag1 = reference_mcode[off - 1], reference_mcode[off + 4]
+        if lead != 0x03 or tag1 != 0x81:
             raise ValueError(
-                f"quad @{off}: frame {lead:02x}/{tags.hex()} is not 03../8182"
+                f"quad @{off}: frame {lead:02x}/{tag1:02x} is not 03../81."
             )
     out = bytearray(reference_mcode)
     for off in hits:
