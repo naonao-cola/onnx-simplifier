@@ -6,7 +6,8 @@
 // Adventurous users should note that the APIs will probably change.
 
 // Before:
-//   Y = ReduceSum(X, axes=[2, 3, ..., rank-1], keepdims=k)  // X: [N, C, d2, ..., d_{rank-1}]
+//   X: [N, C, d2, ..., d_{rank-1}]
+//   Y = ReduceSum(X, axes=[2, 3, ..., rank-1], keepdims=k)
 // After:
 //   C0 = Conv(X, W)  // W: ones([C, 1, d2, ..., d_{rank-1}]), group=C,
 //                     // kernel_shape=[d2, ..., d_{rank-1}], strides=1,
@@ -163,9 +164,7 @@ struct FuseReduceSumIntoConv final : public PredicateBasedPass {
     return m;
   }
 
-  bool patternMatchPredicate(Node* node) override {
-    return MatchNode(node).ok;
-  }
+  bool patternMatchPredicate(Node* node) override { return MatchNode(node).ok; }
 
   bool runTransform(Node* n, Graph& graph,
                     NodeDestroyType& destroy_current) override {
@@ -193,8 +192,7 @@ struct FuseReduceSumIntoConv final : public PredicateBasedPass {
     w_t.sizes() = {channels, 1};
     w_t.sizes().insert(w_t.sizes().end(), match.kernel_shape.begin(),
                        match.kernel_shape.end());
-    std::vector<float> ones(static_cast<size_t>(channels * kernel_numel),
-                            1.0f);
+    std::vector<float> ones(static_cast<size_t>(channels * kernel_numel), 1.0f);
     w_t.set_raw_data(WriteRawDataLittleEndian(ones));
     // No name set: addInitializerAndCreateValue(Tensor&&) auto-assigns a
     // fresh, guaranteed-unique one when empty.
@@ -241,7 +239,8 @@ struct FuseReduceSumIntoConv final : public PredicateBasedPass {
         axes_t.elem_type() = TensorProto_DataType_INT64;
         axes_t.sizes().push_back(static_cast<int64_t>(squeeze_axes.size()));
         axes_t.int64s().assign(squeeze_axes.begin(), squeeze_axes.end());
-        squeeze->addInput(graph.addInitializerAndCreateValue(std::move(axes_t)));
+        squeeze->addInput(
+            graph.addInitializerAndCreateValue(std::move(axes_t)));
       }
       squeeze->insertBefore(n);
       squeeze->output()->copyMetadata(n->output());
