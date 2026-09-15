@@ -382,6 +382,78 @@ def test_fuse_matmul_into_conv_declines_non_default_alpha():
     assert ops["Conv"] == 0
 
 
+def test_fuse_reduce_sum_into_conv_keepdims():
+    # A full-spatial-extent ReduceSum (both H and W, keepdims=1) is a global
+    # sum pool, which is mathematically a depthwise Conv against an all-ones
+    # kernel covering the whole spatial extent -- fuse_reduce_sum_into_conv,
+    # opted in via extra_optimizers for accelerators whose Conv datapath is
+    # far better optimized than their generic Reduce one.
+    model = _model(
+        """
+        g (float[1,3,8,8] X) => (float[1,3,1,1] Y)
+        <int64[2] axes = {2, 3}>
+        {
+          Y = ReduceSum<keepdims = 1>(X, axes)
+        }
+        """
+    )
+    _, ops = _simplify_extra(model, extra_optimizers=["fuse_reduce_sum_into_conv"])
+    assert ops["Conv"] == 1
+    assert ops["ReduceSum"] == 0
+
+
+def test_fuse_reduce_sum_into_conv_no_keepdims():
+    # Same rewrite, but keepdims=0 -- the Conv's trailing [1, 1] spatial dims
+    # must additionally be squeezed away to match ReduceSum's own output rank.
+    model = _model(
+        """
+        g (float[2,4,5,6] X) => (float[2,4] Y)
+        <int64[2] axes = {2, 3}>
+        {
+          Y = ReduceSum<keepdims = 0>(X, axes)
+        }
+        """
+    )
+    _, ops = _simplify_extra(model, extra_optimizers=["fuse_reduce_sum_into_conv"])
+    assert ops["Conv"] == 1
+    assert ops["ReduceSum"] == 0
+    assert ops["Squeeze"] == 1
+
+
+def test_fuse_reduce_sum_into_conv_declines_by_default():
+    # PassType::Other, like fuse_matmul_into_conv: never fires unless opted
+    # into via extra_optimizers.
+    model = _model(
+        """
+        g (float[1,3,8,8] X) => (float[1,3,1,1] Y)
+        <int64[2] axes = {2, 3}>
+        {
+          Y = ReduceSum<keepdims = 1>(X, axes)
+        }
+        """
+    )
+    _, ops = _simplify(model)
+    assert ops["ReduceSum"] == 1
+    assert ops["Conv"] == 0
+
+
+def test_fuse_reduce_sum_into_conv_declines_partial_spatial_reduction():
+    # Only axis 2 (not axis 3) is reduced -- not a full spatial reduction, so
+    # no depthwise Conv can express it and the pass leaves this untouched.
+    model = _model(
+        """
+        g (float[1,3,8,8] X) => (float[1,3,1,8] Y)
+        <int64[1] axes = {2}>
+        {
+          Y = ReduceSum<keepdims = 1>(X, axes)
+        }
+        """
+    )
+    _, ops = _simplify_extra(model, extra_optimizers=["fuse_reduce_sum_into_conv"])
+    assert ops["ReduceSum"] == 1
+    assert ops["Conv"] == 0
+
+
 def test_fuse_pad_into_conv():
     # A constant zero-value Pad on the spatial dims is folded into the Conv pads
     # attribute (fuse_pad_into_conv), removing the Pad node.
