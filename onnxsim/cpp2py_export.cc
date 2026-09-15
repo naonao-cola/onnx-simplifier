@@ -944,6 +944,36 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "alpha"_a = 0.5,
       "epsilon"_a = 1e-5);
 
+  // SmoothQuant migration (Xiao et al., 2022): rescales every matched
+  // MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight columns by the
+  // per-channel migration scale `s` in place and inserts a `Mul` node
+  // dividing that layer's activation input by the same `s` -- a lossless
+  // pre-conditioning transform ahead of a separate W8A8 quantizer, never a
+  // quantization scheme itself. Same executor-as-first-argument,
+  // `calibration_data` (List[Dict[str, onnx.TensorProto]]) crossing
+  // convention as apply_imatrix_quantization's own binding above. See
+  // ApplySmoothQuant in smoothquant_entry.h for the full scope and
+  // onnxsim/smoothquant.py for the technique this ports.
+  m.def(
+      "apply_smoothquant",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double alpha, double epsilon) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplySmoothQuant(model, *executor, calibration_data,
+                                             alpha, epsilon);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "alpha"_a = 0.5,
+      "epsilon"_a = 1e-5);
+
   // MoE expert-intermediate-channel pruning: removes intermediate
   // (`inter_size`) channels from every expert of a matched
   // `com.microsoft::MoE` node at once -- real structural pruning, data-free.

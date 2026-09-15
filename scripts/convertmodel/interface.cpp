@@ -2774,6 +2774,33 @@ em::val onnxsim_apply_outlier_suppression(const std::string &data,
   }
 }
 
+// SmoothQuant migration (Xiao et al., 2022): rescales every matched
+// MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight columns by the
+// per-channel migration scale and inserts a `Mul` dividing that layer's
+// activation input by the same scale -- a lossless pre-conditioning
+// transform ahead of a separate W8A8 quantizer. Same calibration-batch
+// contract and executor as every other calibration-driven binding above.
+// `alpha` is the migration strength (0.5 splits difficulty evenly on a log
+// scale); `epsilon` floors the per-channel max-abs values and `s` itself.
+// See ApplySmoothQuant in smoothquant_entry.h.
+em::val onnxsim_apply_smoothquant(const std::string &data,
+                                  em::val calibration_batches_val,
+                                  double alpha, double epsilon) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplySmoothQuant(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), alpha, epsilon));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_smoothquant error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 EMSCRIPTEN_BINDINGS(module) {
   function("onnxsimplify_export", &onnxsimplify_export);
   function("onnxsim_annotate_model_info", &onnxsim_annotate_model_info);
@@ -2891,6 +2918,7 @@ EMSCRIPTEN_BINDINGS(module) {
            &onnxsim_apply_imatrix_quantization);
   function("onnxsim_apply_outlier_suppression",
            &onnxsim_apply_outlier_suppression);
+  function("onnxsim_apply_smoothquant", &onnxsim_apply_smoothquant);
 
   // Block-wise QAT: build one block's step graph, run the loop in JS on
   // onnxruntime-web, write the trained state back (see the doc comments
