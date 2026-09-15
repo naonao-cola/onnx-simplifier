@@ -58,6 +58,8 @@
 #include "passes/gguf_legacy_quant_5bit.h"
 #include "passes/gguf_q2_k.h"
 #include "passes/gguf_q3_k.h"
+#include "passes/gguf_q4_k.h"
+#include "passes/gguf_q5_k.h"
 #include "passes/gguf_q6_k.h"
 #include "passes/gguf_q8_0.h"
 #include "passes/gguf_ternary_quant.h"
@@ -181,8 +183,10 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::GemmTransAToTranspose>(registry);
     RegisterOrReplace<p::GgufQ2K>(registry);
     RegisterOrReplace<p::GgufQ3K>(registry);
+    RegisterOrReplace<p::GgufQ4K>(registry);
     RegisterOrReplace<p::GgufQ4_0>(registry);
     RegisterOrReplace<p::GgufQ4_1>(registry);
+    RegisterOrReplace<p::GgufQ5K>(registry);
     RegisterOrReplace<p::GgufQ5_0>(registry);
     RegisterOrReplace<p::GgufQ5_1>(registry);
     RegisterOrReplace<p::GgufQ6K>(registry);

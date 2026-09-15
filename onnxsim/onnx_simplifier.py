@@ -4203,6 +4203,74 @@ def apply_gguf_q3_k_quantization_cpp(
     )
 
 
+def apply_gguf_q4_k_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_gguf_q4_k_quantization`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight into llama.cpp's Q4_K K-quant format -- a
+    256-element super-block split into 8 sub-blocks of 32, each with its
+    own asymmetric affine (scale, min) pair re-quantized to 6-bit codes
+    relative to one shared super-block (d, dmin) reference pair, times a
+    4-bit element code (``dequant = d*sc_j*q - dmin*m_j``). See
+    :func:`onnxsim.apply_gguf_q4_k_quantization`'s own docstring for the
+    full rationale and this format's own encoder-provenance honesty note.
+
+    Unlike :func:`onnxsim.apply_gguf_q4_k_quantization` and unlike
+    :func:`simplify`, this does not support an ``include_conv`` option,
+    and this does not run shape inference, constant folding or any other
+    simplification pass.
+
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            Q4_K quantize-dequantize round-tripped float32 version, stored
+            under a *new* initializer (the original initializer is left in
+            the graph, unused). A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_gguf_q4_k_quantization(model.SerializeToString())
+    )
+
+
+def apply_gguf_q5_k_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_gguf_q5_k_quantization`:
+    identical to :func:`onnxsim.apply_gguf_q4_k_quantization_cpp` except
+    the element code is 5 bits (``[0, 31]``) rather than Q4_K's 4. See
+    :func:`onnxsim.apply_gguf_q5_k_quantization`'s own docstring for the
+    full rationale and this format's own encoder-provenance honesty note.
+
+    Unlike :func:`onnxsim.apply_gguf_q5_k_quantization` and unlike
+    :func:`simplify`, this does not support an ``include_conv`` option,
+    and this does not run shape inference, constant folding or any other
+    simplification pass.
+
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            Q5_K quantize-dequantize round-tripped float32 version, stored
+            under a *new* initializer (the original initializer is left in
+            the graph, unused). A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_gguf_q5_k_quantization(model.SerializeToString())
+    )
+
+
 def apply_gguf_ternary_quantization_cpp(
     model: Union[str, onnx.ModelProto],
 ) -> onnx.ModelProto:
