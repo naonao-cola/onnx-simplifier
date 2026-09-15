@@ -58,6 +58,7 @@ webgpu_kernel_metadata = _load_onnxsim_module_without_package_init(
     "webgpu_kernel_metadata", "onnxsim/webgpu_kernel_metadata.py"
 )
 WebgpuKernelBinding = webgpu_kernel_metadata.WebgpuKernelBinding
+WebgpuKernelSpec = webgpu_kernel_metadata.WebgpuKernelSpec
 attach_webgpu_kernel = webgpu_kernel_metadata.attach_webgpu_kernel
 
 WGSL = """\
@@ -72,9 +73,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 """
 
 BINDINGS = [
-    WebgpuKernelBinding(tensor="a", group=0, binding=0, access="read"),
-    WebgpuKernelBinding(tensor="b", group=0, binding=1, access="read"),
-    WebgpuKernelBinding(tensor="c", group=0, binding=2, access="read_write"),
+    WebgpuKernelBinding.for_tensor("a", group=0, binding=0, access="read"),
+    WebgpuKernelBinding.for_tensor("b", group=0, binding=1, access="read"),
+    WebgpuKernelBinding.for_tensor("c", group=0, binding=2, access="read_write"),
 ]
 
 N = 256
@@ -95,7 +96,8 @@ def main():
         """
     )
     model.graph.node[0].name = "add_node"
-    attach_webgpu_kernel(model, "add_node", WGSL, "main", DISPATCH, BINDINGS)
+    spec = WebgpuKernelSpec.single_step(WGSL, "main", DISPATCH, BINDINGS)
+    attach_webgpu_kernel(model, "add_node", spec)
 
     import onnx
 

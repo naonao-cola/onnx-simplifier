@@ -53,11 +53,13 @@ check("readWebgpuKernelSpecs decodes the kernel spec written by Python", () => {
   const specs = readWebgpuKernelSpecs(modelBytes);
   assert.equal(specs.size, 1);
   const spec = specs.get(manifest.nodeName);
-  assert.equal(spec.entry_point, manifest.entryPoint);
-  assert.deepEqual(spec.dispatch, manifest.dispatch);
-  assert.deepEqual(spec.bindings, manifest.bindings);
-  assert.equal(typeof spec.wgsl, "string");
-  assert.ok(spec.wgsl.includes("@compute"));
+  assert.equal(spec.steps.length, 1);
+  const step = spec.steps[0];
+  assert.equal(step.entry_point, manifest.entryPoint);
+  assert.deepEqual(step.dispatch, manifest.dispatch);
+  assert.deepEqual(step.bindings, manifest.bindings);
+  assert.equal(typeof step.wgsl, "string");
+  assert.ok(step.wgsl.includes("@compute"));
 });
 
 check("a node with no metadata_props is simply absent from the map", () => {

@@ -509,6 +509,10 @@ async function doLoad() {
     if (typeof window.dimParamsShowBefore === "function") {
       window.dimParamsShowBefore(bytes, name);
     }
+    // Likewise list the "before" model's custom WebGPU kernel annotations.
+    if (typeof window.webgpuKernelsShowBefore === "function") {
+      window.webgpuKernelsShowBefore(bytes, name);
+    }
     // Hand a *copy* to the worker: the buffer is transferred (detached) on
     // postMessage, so copying keeps `bytes` intact for the inference panel.
     const copy = bytes.slice();
