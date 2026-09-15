@@ -203,7 +203,7 @@ struct FuseReduceSumIntoConv final : public PredicateBasedPass {
     Node* conv = graph.create(kConv, 1);
     conv->addInput(x);
     conv->addInput(w);
-    conv->is_(kkernel_shape, match.kernel_shape);
+    conv->is_(kkernel_shape, std::vector<int64_t>(match.kernel_shape));
     conv->is_(kstrides,
               std::vector<int64_t>(static_cast<size_t>(num_spatial), 1));
     conv->is_(kpads,
@@ -235,7 +235,7 @@ struct FuseReduceSumIntoConv final : public PredicateBasedPass {
       squeeze->addInput(conv->output());
       const int opset = getOpsetVersion(graph);
       if (opset < 13 && opset != 0) {
-        squeeze->is_(kaxes, squeeze_axes);
+        squeeze->is_(kaxes, std::move(squeeze_axes));
       } else {
         Tensor axes_t;
         axes_t.elem_type() = TensorProto_DataType_INT64;
