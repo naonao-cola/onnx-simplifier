@@ -153,3 +153,45 @@ class TestRequantMultiplierSlot(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# NOTE: this class lives after the __main__ guard on purpose -- the
+# stacked site-C diff edits the docstring and appends its own class
+# above, and keeping this addition textually disjoint avoids a merge
+# collision between the two PRs.
+class TestOutputScaleQuads(unittest.TestCase):
+    """Output scale quads: `03 <float32(z_scale)> 81 82` x4 at stride 7.
+
+    The output-side counterpart to the input slot families: four copies
+    of the exact float32 output scale, each framed by a 0x03 lead byte
+    and constant 0x81/0x82 tag bytes (verified on all three fixtures).
+    Two things this settles:
+
+    - The `81` tag is NOT the output zero point: x01's z zero point is
+      110 (0x6e) yet its quads still read `... 81 82`. Raw zp immediates
+      (128/127/126/129/110 census over the program region) and zp*scale
+      combined floats were also ruled out across five builds -- zero
+      points live elsewhere (still open).
+    - Emitter caution: base and x10 carry the same real-valued z scale
+      to ~1e-9 yet their quad floats differ by 1 ULP (1e vs 1d) -- the
+      two builds' float64 scales straddle a float32 boundary. Patch by
+      exact float32 word, never by recomputing from float64.
+    """
+
+    _Z = {
+        "mul_1x8.mcode.gz": 0.007151617668569088,
+        "mul_1x8_recip_x10.mcode.gz": 0.007151617202907801,
+        "mul_1x8_recip_x01.mcode.gz": 0.005844127852469683,
+    }
+
+    def test_quads_carry_exact_float32_output_scale(self):
+        for name, zs in self._Z.items():
+            data = load(name)
+            pat = struct.pack("<f", zs)
+            found = hits(data, pat)
+            self.assertEqual(len(found), 4, f"{name}: quad count")
+            strides = {b - a for a, b in zip(found, found[1:])}
+            self.assertEqual(strides, {7}, f"{name}: quad stride")
+            for i in found:
+                self.assertEqual(data[i - 1], 0x03, f"{name}@{i}: lead")
+                self.assertEqual(data[i + 4 : i + 6].hex(), "8182", f"{name}@{i}: tags")
