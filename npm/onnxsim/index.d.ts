@@ -219,6 +219,18 @@ export function applyQuarotGptq(
     epsilon?: number;
   },
 ): Promise<Uint8Array>;
+export function applyGptvq(
+  model: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: {
+    seed?: number;
+    vectorDim?: number;
+    numCentroids?: number;
+    numIterations?: number;
+    percdamp?: number;
+    skipNames?: string[];
+  },
+): Promise<Uint8Array>;
 export function applySmoothQuant(
   model: OnnxModelBytes,
   calibration: CalibrationData,
@@ -270,6 +282,7 @@ declare const _default: {
   applyGptq: typeof applyGptq;
   applyAwq: typeof applyAwq;
   applyQuarotGptq: typeof applyQuarotGptq;
+  applyGptvq: typeof applyGptvq;
   applySmoothQuant: typeof applySmoothQuant;
 };
 export default _default;

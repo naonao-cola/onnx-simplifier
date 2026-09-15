@@ -1077,6 +1077,49 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "block_size"_a = 32, "percdamp"_a = 0.01, "proc_block_size"_a = 128,
       "epsilon"_a = 1e-12);
 
+  // GPTVQ (Van Baalen et al., 2024): a genuine combination of
+  // apply_gptq's own sequential, Hessian-compensated correction with a
+  // k-means-fit vector codebook -- small groups of consecutive
+  // input-channel columns of every matched MatMul/vanilla-Gemm node's
+  // constant 2-D FLOAT32 weight are jointly quantized against the
+  // codebook, then each group's resulting per-column residual is
+  // propagated into every not-yet-quantized column exactly like
+  // apply_gptq's own per-column correction. Rewires only the matched
+  // node's weight input (Gather+Reshape[+Transpose]); the node itself,
+  // including any bias, is left otherwise unchanged. Same
+  // executor-as-first-argument, `calibration_data` (List[Dict[str,
+  // onnx.TensorProto]]) crossing convention, and `skip_names` (List[str])
+  // crossing convention as apply_imatrix_quantization's own binding
+  // above. See ApplyGptvq in gptvq_entry.h for the full scope (including
+  // its own permanent RNG divergence from the Python reference for the
+  // k-means codebook fit) and onnxsim/gptvq.py for the technique this
+  // ports.
+  m.def(
+      "apply_gptvq",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         uint64_t seed, int64_t vector_dim, int64_t num_centroids,
+         int64_t num_iterations, double percdamp,
+         const std::vector<std::string>& skip_names) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const std::unordered_set<std::string> skip_names_set(skip_names.begin(),
+                                                             skip_names.end());
+        const auto result =
+            ApplyGptvq(model, *executor, calibration_data, seed, vector_dim,
+                      num_centroids, num_iterations, percdamp, skip_names_set);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "seed"_a = 0,
+      "vector_dim"_a = 2, "num_centroids"_a = 256, "num_iterations"_a = 10,
+      "percdamp"_a = 0.01, "skip_names"_a = std::vector<std::string>());
+
   // SmoothQuant migration (Xiao et al., 2022): rescales every matched
   // MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight columns by the
   // per-channel migration scale `s` in place and inserts a `Mul` node
