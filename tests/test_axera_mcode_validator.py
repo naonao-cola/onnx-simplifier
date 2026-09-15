@@ -72,6 +72,9 @@ _BLOBS = {
     "loss_head_kd": (5480, 5, 1),
     "adam_update_fp32": (2288, 5, 2),
     "reshape_gather_bwd": (2600, 5, 1),
+    # A unary-negation probe: the first stream emitted against by
+    # scripts/axera/tiny_emit.py (tinygrad-traced MUL-by-minus-one).
+    "neg_1x8": (2432, 5, 1),
 }
 
 
@@ -186,6 +189,7 @@ _Q_COUNTS = {
     "loss_head_kd": 0,
     "adam_update_fp32": 0,
     "reshape_gather_bwd": 0,
+    "neg_1x8": 0,
 }
 
 
@@ -304,6 +308,7 @@ _PD_COUNTS = {
     "loss_head_kd": (0, 0),
     "adam_update_fp32": (0, 0),
     "reshape_gather_bwd": (0, 0),
+    "neg_1x8": (0, 0),
 }
 
 
@@ -433,6 +438,7 @@ _E_COUNTS = {
     "loss_head_kd": 0,
     "adam_update_fp32": 0,
     "reshape_gather_bwd": 0,
+    "neg_1x8": 0,
 }
 
 
@@ -559,6 +565,7 @@ _C_COUNTS = {
     "loss_head_kd": 0,
     "adam_update_fp32": 0,
     "reshape_gather_bwd": 0,
+    "neg_1x8": 0,
 }
 
 
@@ -723,6 +730,7 @@ _N_COUNTS = {
     "loss_head_kd": 0,
     "adam_update_fp32": 0,
     "reshape_gather_bwd": 0,
+    "neg_1x8": 0,
 }
 
 
@@ -885,6 +893,7 @@ _L_COUNTS = {
     "loss_head_kd": 1,
     "adam_update_fp32": 1,
     "reshape_gather_bwd": 1,
+    "neg_1x8": 1,
 }
 
 
@@ -954,6 +963,7 @@ _A_COUNTS = {
     "reshape_gather_bwd": 2,
     "reshape_mul_gap": 1,
     "reshape_matmul_gap": 3,
+    "neg_1x8": 1,
 }
 
 
