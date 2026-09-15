@@ -76,6 +76,19 @@ name: convertmodel WebGPU custom kernel dispatcher
 #     needs both real network access (the PyPI wheel fetch) and a real
 #     GPU-backed browser, unlike either of the two jobs it draws on.
 #
+#   * test/pyodide_webgpu_onnxrunner_codegen.test.mjs -- generalizes the
+#     previous one past a single hand-picked op: drives **tinygrad's own
+#     generic ONNX importer** (tinygrad.nn.onnx.OnnxRunner) directly on a
+#     whole multi-node model's raw bytes inside Pyodide, with no onnxsim
+#     per-op translation and no JS-side shape/attribute reader at all
+#     (OnnxRunner has its own hand-rolled protobuf parser). Exercises a real
+#     two-op graph (Conv3D -> Relu, which tinygrad's own scheduler fuses into
+#     one kernel) including an op onnxsim has no bespoke codegen for at all,
+#     checks the live spec against an offline "ground truth" spec generated
+#     the same way with different random data (make_webgpu_onnxrunner_fixture.py),
+#     then dispatches the live spec against a real WebGPU device. Same
+#     network + GPU-backed-browser requirements as the job above.
+#
 # Scheduled + on demand, plus on PRs that touch the files this check depends
 # on, same reasoning as convertmodel-webgpu-demo.yml / convertmodel-ep-placement.yml.
 
@@ -94,6 +107,10 @@ on:
       - "scripts/convertmodel/test/pyodide_tinygrad_codegen.test.mjs"
       - "scripts/convertmodel/test/pyodide_webgpu_single_node_codegen.test.mjs"
       - "scripts/convertmodel/onnx_conv_node_reader.mjs"
+      - "scripts/convertmodel/test/pyodide_webgpu_onnxrunner_codegen.test.mjs"
+      - "scripts/convertmodel/test/make_webgpu_onnxrunner_fixture.py"
+      - "scripts/convertmodel/test/webgpu_onnxrunner_conv_relu.onnx"
+      - "scripts/convertmodel/test/webgpu_onnxrunner_fixture.json"
       - "scripts/convertmodel/test/make_webgpu_kernel_fixture.py"
       - "scripts/convertmodel/test/make_webgpu_tinygrad_codegen_fixture.py"
       - "scripts/convertmodel/test/make_webgpu_custom_kernel_runtime_fixture.py"
@@ -233,3 +250,22 @@ jobs:
       - name: Run the single-node live WebGPU codegen check
         working-directory: scripts/convertmodel
         run: npm run test:pyodide-single-node-codegen
+
+  pyodide-onnxrunner-codegen:
+    name: Live whole-graph WebGPU kernel generation via tinygrad's ONNX importer (Pyodide + real GPU)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (pyodide, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the OnnxRunner whole-graph live WebGPU codegen check
+        working-directory: scripts/convertmodel
+        run: npm run test:pyodide-onnxrunner-codegen
