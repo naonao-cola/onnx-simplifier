@@ -242,6 +242,47 @@ def test_gradient_matches_finite_differences(toy_models, target):
     np.testing.assert_allclose(analytic, grad_fd, rtol=2e-3, atol=2e-4)
 
 
+@pytest.mark.parametrize("target", ["fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"])
+def test_gradient_matches_tinygrad_autodiff(toy_models, target):
+    """A second independent autodiff (tinygrad) agrees with onnxsim's
+    graph_grad to fp32 noise -- finite differences already check each
+    rule in isolation, but an independent full-graph autodiff catches
+    composition mistakes (wrong cotangent threading, dropped terms)
+    that per-rule checks can miss. Needs neither Docker nor a device
+    (tinygrad itself is import-skipped when absent)."""
+    tg = pytest.importorskip("tinygrad")
+    ort = pytest.importorskip("onnxruntime")
+    _teacher_path, student_path = toy_models
+    student = onnx.load(str(student_path))
+    fwd = _build_forward_loss_and_grads(student, temperature=2.0, alpha=0.5)
+    grad_model, _ = _grad_and_loss_models(fwd)
+
+    rng = np.random.default_rng(3)
+    feeds = _random_feeds(fwd, rng, batch_size=6)
+    session = ort.InferenceSession(
+        grad_model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    analytic = session.run([fwd.grads[target]], feeds)[0].astype(np.float64)
+
+    tw = {
+        name: tg.Tensor(np.asarray(feeds[name]).astype(np.float32))
+        for name in fwd.trainable
+    }
+    tx = tg.Tensor(np.asarray(feeds[fwd.input_name]).astype(np.float32))
+    th = (tx.matmul(tw["fc1.weight"]) + tw["fc1.bias"]).relu()
+    tl = th.matmul(tw["fc2.weight"]) + tw["fc2.bias"]
+    temperature, alpha = 2.0, 0.5
+    tt = tg.Tensor(np.asarray(feeds[fwd.teacher_logits_name]).astype(np.float32))
+    toh = tg.Tensor(np.asarray(feeds[fwd.labels_onehot_name]).astype(np.float32))
+    soft = -(
+        tt.div(temperature).softmax(-1) * tl.div(temperature).log_softmax(-1)
+    ).sum(-1).mean() * temperature * temperature
+    hard = -(toh * tl.log_softmax(-1)).sum(-1).mean()
+    (soft * alpha + hard * (1 - alpha)).backward()
+    check = tw[target].grad.numpy().astype(np.float64)
+    np.testing.assert_allclose(analytic, check, rtol=1e-5, atol=1e-6)
+
+
 def test_gradient_matches_finite_differences_across_batch_sizes(toy_models):
     """The dynamic-batch-specific check: the *same compiled graph* (``fwd``
     built once) checked against an independent finite difference at two
