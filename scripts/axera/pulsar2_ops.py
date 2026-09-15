@@ -322,9 +322,9 @@ AX650_CONFIRMED_BROKEN_OPS: Dict[str, str] = {
     # attribute-defaulting gotcha -- these are genuinely unmapped op names.
     # Only Neg/Log from the unlisted set are known to pass.
     "Reciprocal": (
-        'quant convert error on a [1,8]->[1,8] node (MinMax Numpy calib over '
+        "quant convert error on a [1,8]->[1,8] node (MinMax Numpy calib over "
         '[0.5, 2.0)): "Operator(name:y, type:Reciprocal) convert error: '
-        'Quant doesn\'t support Reciprocal operation" (ErrorCode.QuantError)'
+        "Quant doesn't support Reciprocal operation\" (ErrorCode.QuantError)"
     ),
     "ReduceSumSquare": (
         "KeyError('dont support ReduceSumSquare opr in "

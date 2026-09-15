@@ -36,8 +36,18 @@ FIX = os.path.join(os.path.dirname(__file__), "..", "scripts", "axera", "fixture
 CASES = {
     # fixture: (x_scale, y_scale, siteB_full_float, group_hex)
     "mul_1x8.mcode.gz": (0.007799775805324316, 0.0076893349178135395, False, "7c7cee"),
-    "mul_1x8_recip_x10.mcode.gz": (0.07799775898456573, 0.0007689335034228861, True, "7b7cee"),
-    "mul_1x8_recip_x01.mcode.gz": (0.0007725197938270867, 0.07746022194623947, True, "9b53c3"),
+    "mul_1x8_recip_x10.mcode.gz": (
+        0.07799775898456573,
+        0.0007689335034228861,
+        True,
+        "7b7cee",
+    ),
+    "mul_1x8_recip_x01.mcode.gz": (
+        0.0007725197938270867,
+        0.07746022194623947,
+        True,
+        "9b53c3",
+    ),
 }
 
 # Unary op (Neg): same site-A mechanism for its single input.  All 13 builds
@@ -54,7 +64,7 @@ def load(name):
 
 
 def hits(data, pat):
-    return [i for i in range(len(data) - len(pat) + 1) if data[i:i + len(pat)] == pat]
+    return [i for i in range(len(data) - len(pat) + 1) if data[i : i + len(pat)] == pat]
 
 
 class TestInputReciprocalSlots(unittest.TestCase):
@@ -80,12 +90,16 @@ class TestInputReciprocalSlots(unittest.TestCase):
             pat = struct.pack("<f", 1.0 / ys)
             found = hits(data, pat)
             if full:
-                self.assertEqual(len(found), 4, f"{name}: site B hits for 1/y={1.0 / ys}")
+                self.assertEqual(
+                    len(found), 4, f"{name}: site B hits for 1/y={1.0 / ys}"
+                )
                 strides = {b - a for a, b in zip(found, found[1:])}
                 self.assertEqual(strides, {7}, f"{name}: site B stride")
             else:
                 # Short S-unit form: low 3 bytes of the float, 0x82 tag.
-                self.assertGreaterEqual(len(hits(data, pat[:3])), 3, f"{name}: site B short form")
+                self.assertGreaterEqual(
+                    len(hits(data, pat[:3])), 3, f"{name}: site B short form"
+                )
 
     def test_group_values_pinned(self):
         marker = bytes.fromhex("42a100")
@@ -94,7 +108,7 @@ class TestInputReciprocalSlots(unittest.TestCase):
             idx = hits(data, marker)
             self.assertEqual(len(idx), 4, f"{name}: marker count")
             for i in idx:
-                self.assertEqual(data[i - 3:i].hex(), grp, f"{name}: group")
+                self.assertEqual(data[i - 3 : i].hex(), grp, f"{name}: group")
 
 
 if __name__ == "__main__":
