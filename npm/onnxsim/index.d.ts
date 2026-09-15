@@ -202,6 +202,12 @@ export function applyGptq(
   calibration: CalibrationData,
   options?: { percdamp?: number; procBlockSize?: number },
 ): Promise<Uint8Array>;
+export function applyQronos(
+  floatModel: OnnxModelBytes,
+  quantizedModel: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: { percdamp?: number; procBlockSize?: number },
+): Promise<Uint8Array>;
 export function applyAwq(
   floatModel: OnnxModelBytes,
   quantizedModel: OnnxModelBytes,
@@ -280,6 +286,7 @@ declare const _default: {
   applyOutlierSuppressionPlus: typeof applyOutlierSuppressionPlus;
   applyLlmInt8: typeof applyLlmInt8;
   applyGptq: typeof applyGptq;
+  applyQronos: typeof applyQronos;
   applyAwq: typeof applyAwq;
   applyQuarotGptq: typeof applyQuarotGptq;
   applyGptvq: typeof applyGptvq;

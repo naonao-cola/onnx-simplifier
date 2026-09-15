@@ -25,6 +25,7 @@
 #include "llm_int8_entry.h"
 #include "outlier_suppression_entry.h"
 #include "outlier_suppression_plus_entry.h"
+#include "qronos_entry.h"
 #include "quarot_gptq_entry.h"
 #include "smoothquant_entry.h"
 #include "structured_pruning_entry.h"
@@ -827,6 +828,19 @@ onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
 // also included above) is documented in its own home header instead of
 // this one. See awq.py's own module docstring for the technique and
 // awq_entry.h for this port's own scope.
+
+// Qronos: a sequential, whole-model generalization of ApplyGptq that
+// additionally accounts for the error already baked into a layer's
+// activations because upstream layers were quantized first (not just
+// this layer's own rounding error) -- processes layers in the float
+// model's own node order, re-probing the progressively-corrected
+// quantized model before each subsequent layer. C++ port of
+// qronos.py's own apply_qronos, declared in qronos_entry.h (included
+// above) rather than duplicated here, mirroring how ApplyAwq
+// (awq_entry.h, also included above) is documented in its own home
+// header instead of this one. See qronos.py's own module docstring for
+// the technique and qronos_entry.h for this port's own scope (including
+// its accepted numerical scope, shared with ApplyGptq's).
 
 // QuaRot+GPTQ (Ashkboos et al., 2024): ApplyQuarot's own per-layer random
 // rotation and data-free activation quantization, but with the weight

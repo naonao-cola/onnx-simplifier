@@ -2525,6 +2525,91 @@ def apply_gptq_cpp(
     )
 
 
+def apply_qronos_cpp(
+    float_model: Union[str, onnx.ModelProto],
+    quantized_model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    percdamp: float = 0.01,
+    proc_block_size: int = 128,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_qronos`: a sequential,
+    whole-model generalization of GPTQ that additionally accounts for the
+    error already baked into a layer's activations because upstream
+    layers were quantized first, not just this layer's own rounding --
+    see ``onnxsim/qronos.py``'s own module docstring for the full
+    technique and how it reduces exactly to
+    :func:`onnxsim.apply_gptq_cpp` when a layer has no already-quantized
+    upstream layer feeding it.
+
+    Same real calibration machinery as :func:`onnxsim.apply_gptq_cpp` --
+    a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see
+    ``ApplyQronos`` in ``qronos_entry.h`` for the full scope, including
+    its accepted numerical scope, shared with :func:`onnxsim.apply_gptq_cpp`'s
+    own). Unlike every other calibration-driven ``*_cpp`` port in this
+    codebase, the executor is invoked once per matched layer (not once up
+    front for all of them): each layer's correction re-probes the
+    progressively-corrected quantized model, processing layers in
+    ``float_model``'s own node order.
+
+    :param float_model: the original (unquantized) onnx ModelProto or file
+            path
+    :param quantized_model: a quantized version of ``float_model`` (onnx
+            ModelProto or file path), produced by
+            :func:`onnxsim.quantize_weight_only_int4`
+    :param calibration_data: representative input batches to compute each
+            layer's target/Hessian from -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param percdamp: Hessian damping factor (fraction of the mean diagonal
+            added before inversion)
+    :param proc_block_size: GPTQ's own column-processing block size (not
+            the quantization scale's own block size, reused unchanged)
+    :param providers: onnxruntime execution providers to run ``float_model``
+            on when capturing calibration activations
+    :returns: ``quantized_model`` with every matched layer's INT4 weight
+            initializer rewritten to its Qronos-corrected codes (same
+            shape, dtype, and scale -- only which integer each element
+            rounds to changes).
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(quantized_model, str):
+        quantized_model = onnx.load(quantized_model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            float_model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_gptq_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_qronos(
+            _get_model_executor(providers),
+            float_model.SerializeToString(),
+            quantized_model.SerializeToString(),
+            calibration_data_pb,
+            percdamp,
+            proc_block_size,
+        )
+    )
+
+
 def apply_awq_cpp(
     float_model: Union[str, onnx.ModelProto],
     quantized_model: Union[str, onnx.ModelProto],
