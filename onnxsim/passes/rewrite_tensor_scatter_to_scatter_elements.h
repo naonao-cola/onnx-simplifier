@@ -179,7 +179,9 @@ struct TensorScatterToScatterElementsBuilder {
   }
 
   Value* Add(Value* a, Value* b) { return BinOp(kAdd, a, b, a->elemType()); }
-  Value* Mod(Value* a, Value* b) { return BinOp(Symbol("Mod"), a, b, a->elemType()); }
+  Value* Mod(Value* a, Value* b) {
+    return BinOp(Symbol("Mod"), a, b, a->elemType());
+  }
 
   Value* CastTo(Value* a, int32_t to) {
     Node* n = graph.create(kCast, 1);
@@ -197,7 +199,9 @@ struct TensorScatterToScatterElementsBuilder {
     return CastTo(a, TensorProto_DataType_INT64);
   }
 
-  Value* Shape(Value* a) { return UnOp(Symbol("Shape"), a, TensorProto_DataType_INT64); }
+  Value* Shape(Value* a) {
+    return UnOp(Symbol("Shape"), a, TensorProto_DataType_INT64);
+  }
 
   Value* Gather(Value* data, Value* indices, int64_t axis) {
     Node* n = graph.create(Symbol("Gather"), 1);
@@ -246,7 +250,7 @@ struct TensorScatterToScatterElementsBuilder {
   }
 
   Value* ScatterElements(Value* data, Value* indices, Value* updates,
-                        int64_t axis) {
+                         int64_t axis) {
     Node* n = graph.create(Symbol("ScatterElements"), 1);
     n->addInput(data);
     n->addInput(indices);
@@ -301,8 +305,7 @@ struct RewriteTensorScatterToScatterElements final : public PredicateBasedPass {
       return false;
     }
     const size_t num_inputs = node->inputs().size();
-    if ((num_inputs != 2 && num_inputs != 3) ||
-        node->outputs().size() != 1) {
+    if ((num_inputs != 2 && num_inputs != 3) || node->outputs().size() != 1) {
       return false;
     }
 
@@ -349,8 +352,7 @@ struct RewriteTensorScatterToScatterElements final : public PredicateBasedPass {
 
     Value* past_cache = node->input(0);
     Value* update = node->input(1);
-    Value* write_indices =
-        HasWriteIndices(node) ? node->input(2) : nullptr;
+    Value* write_indices = HasWriteIndices(node) ? node->input(2) : nullptr;
 
     const int64_t r = static_cast<int64_t>(past_cache->sizes().size());
     const int64_t axis =
@@ -360,9 +362,8 @@ struct RewriteTensorScatterToScatterElements final : public PredicateBasedPass {
       return false;  // re-checked: the graph could in principle have
                      // changed between predicate and transform.
     }
-    const std::string mode =
-        GetValueFromAttrWithDefault<std::string>(node, Symbol("mode"),
-                                                 std::string("linear"));
+    const std::string mode = GetValueFromAttrWithDefault<std::string>(
+        node, Symbol("mode"), std::string("linear"));
 
     TensorScatterToScatterElementsBuilder b{graph, node};
 

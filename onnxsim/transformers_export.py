@@ -314,8 +314,12 @@ def export_causal_lm_static_cache(
 
     config = model.config.get_text_config(decoder=True)
     num_layers = config.num_hidden_layers
-    num_kv_heads = getattr(config, "num_key_value_heads", None) or config.num_attention_heads
-    head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
+    num_kv_heads = (
+        getattr(config, "num_key_value_heads", None) or config.num_attention_heads
+    )
+    head_dim = getattr(config, "head_dim", None) or (
+        config.hidden_size // config.num_attention_heads
+    )
 
     class _StaticCacheStep(torch.nn.Module):
         """One forward step against explicit, plain-tensor KV-cache buffers
@@ -388,7 +392,8 @@ def export_causal_lm_static_cache(
         torch.onnx.export(
             exported_program,
             f=path,
-            input_names=["input_ids", "cache_position", "attention_mask"] + kv_input_names,
+            input_names=["input_ids", "cache_position", "attention_mask"]
+            + kv_input_names,
             output_names=["logits"] + kv_output_names,
             opset_version=18,
             dynamo=True,
@@ -406,7 +411,10 @@ def export_causal_lm_static_cache(
     # dummy avoids hitting that branch during tracing.
     dummy_prompt_len = min(4, max_prompt_len) if max_prompt_len > 1 else 1
     prefill_path = _export(
-        prompt_len_dim, dummy_seq_len=dummy_prompt_len, cache_start=0, filename="prefill.onnx"
+        prompt_len_dim,
+        dummy_seq_len=dummy_prompt_len,
+        cache_start=0,
+        filename="prefill.onnx",
     )
     decode_path = _export(None, dummy_seq_len=1, cache_start=1, filename="decode.onnx")
 
@@ -420,7 +428,10 @@ def export_causal_lm_static_cache(
     # pick a concrete size for that on its own. decode.onnx is fully static
     # and needs no such hint.
     per_file_test_input_shapes = {
-        prefill_path: {"input_ids": [1, dummy_prompt_len], "cache_position": [dummy_prompt_len]},
+        prefill_path: {
+            "input_ids": [1, dummy_prompt_len],
+            "cache_position": [dummy_prompt_len],
+        },
         decode_path: None,
     }
 
@@ -429,7 +440,9 @@ def export_causal_lm_static_cache(
         loaded = onnx.load(path)
         extra_kwargs = dict(simplify_kwargs or {})
         if check_n and per_file_test_input_shapes[path] is not None:
-            extra_kwargs.setdefault("test_input_shapes", per_file_test_input_shapes[path])
+            extra_kwargs.setdefault(
+                "test_input_shapes", per_file_test_input_shapes[path]
+            )
         model_opt, check_ok = simplify(loaded, check_n=check_n, **extra_kwargs)
         # Not _save(): its force_external_data path uses size_threshold=0
         # (every tensor moves out, including small helper constants), which
@@ -444,7 +457,9 @@ def export_causal_lm_static_cache(
         # which loads fine.
         if save_as_external_data:
             external_data_path = os.path.basename(path) + ".data"
-            full_external_data_path = os.path.join(os.path.dirname(path), external_data_path)
+            full_external_data_path = os.path.join(
+                os.path.dirname(path), external_data_path
+            )
             if os.path.exists(full_external_data_path):
                 os.remove(full_external_data_path)
             onnx.save(
