@@ -1111,7 +1111,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
                                                              skip_names.end());
         const auto result =
             ApplyGptvq(model, *executor, calibration_data, seed, vector_dim,
-                      num_centroids, num_iterations, percdamp, skip_names_set);
+                       num_centroids, num_iterations, percdamp, skip_names_set);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
