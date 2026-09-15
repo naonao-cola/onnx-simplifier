@@ -88,6 +88,7 @@ onnx::ModelProto ApplyGgufQ5_0(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufQ5_1(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufQ8_0(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufQ2K(const onnx::ModelProto& model);
+onnx::ModelProto ApplyGgufQ3K(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufTernaryQuant(const onnx::ModelProto& model);
 onnx::ModelProto ApplyFp6Llm(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
