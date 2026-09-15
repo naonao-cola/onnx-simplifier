@@ -1639,6 +1639,25 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // llama.cpp's GGUF Q3_K K-quant format: weight-only 3-bit quantization,
+  // a 256-element super-block split into 16 sub-blocks of 16, each with
+  // a 6-bit scale code times one shared super-block scale, times the
+  // format's own asymmetric 3-bit element code. Data-free. See
+  // ApplyGgufQ3K in onnxsim.h.
+  m.def(
+      "apply_gguf_q3_k_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyGgufQ3K(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // BitNet b1.58's published absmean ternary weight quantization, as
   // shipped by llama.cpp's GGUF TQ1_0/TQ2_0 tensor types: weight-only,
   // one shared {-1, 0, +1} scale per 256-element block. Data-free. See

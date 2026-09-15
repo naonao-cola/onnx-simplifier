@@ -2236,6 +2236,20 @@ em::val onnxsim_apply_gguf_q2_k(const std::string &data) {
   }
 }
 
+em::val onnxsim_apply_gguf_q3_k(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyGgufQ3K(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_gguf_q3_k error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 em::val onnxsim_apply_gguf_ternary(const std::string &data) {
   onnx::ModelProto xmodel;
   if (!xmodel.ParseFromArray(data.data(), data.size())) {
@@ -3270,6 +3284,7 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_apply_gguf_q5_1", &onnxsim_apply_gguf_q5_1);
   function("onnxsim_apply_gguf_q8_0", &onnxsim_apply_gguf_q8_0);
   function("onnxsim_apply_gguf_q2_k", &onnxsim_apply_gguf_q2_k);
+  function("onnxsim_apply_gguf_q3_k", &onnxsim_apply_gguf_q3_k);
   function("onnxsim_apply_gguf_ternary", &onnxsim_apply_gguf_ternary);
   function("onnxsim_apply_fp6_llm", &onnxsim_apply_fp6_llm);
   function("onnxsim_apply_gguf_q6_k", &onnxsim_apply_gguf_q6_k);

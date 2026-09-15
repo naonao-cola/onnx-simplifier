@@ -28,6 +28,7 @@ import {
   applyGgufQ5_0,
   applyGgufQ8_0,
   applyGgufQ2K,
+  applyGgufQ3K,
   applyIq4Nl,
   applyMoeExpertChannelPruning,
   applyOutlierSuppression,
@@ -141,6 +142,7 @@ try {
       applyGgufQ5_0,
       applyGgufQ8_0,
       applyGgufQ2K,
+      applyGgufQ3K,
     ]) {
       const out = await fn(input);
       assert.ok(out instanceof Uint8Array, fn.name);
