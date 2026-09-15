@@ -587,6 +587,38 @@ export async function applyGptq(
 }
 
 /**
+ * Qronos: a sequential, whole-model generalization of `applyGptq` that
+ * additionally accounts for the error already baked into a layer's
+ * activations because upstream layers were quantized first, not just
+ * this layer's own rounding -- processes layers in the float model's
+ * own node order, re-probing the progressively-corrected quantized
+ * model before each subsequent layer. Returns the optimized quantized
+ * model bytes.
+ */
+export async function applyQronos(
+  floatModel,
+  quantizedModel,
+  calibration,
+  { percdamp = 0.01, procBlockSize = 128 } = {},
+) {
+  const floatBytes = toBytes(floatModel);
+  const quantBytes = toBytes(quantizedModel);
+  const runtime = await getRuntime();
+  const fn = runtime.onnxsim_apply_qronos;
+  if (typeof fn !== "function") {
+    throw new Error("onnxsim: this build has no export 'onnxsim_apply_qronos' (rebuild the wasm module?)");
+  }
+  let result = fn(floatBytes, quantBytes, normalizeCalibrationBatches(calibration), percdamp, procBlockSize);
+  if (result && typeof result.then === "function") {
+    result = await result;
+  }
+  if (!result) {
+    throw new Error("onnxsim: onnxsim_apply_qronos failed (see stderr output for details)");
+  }
+  return new Uint8Array(result);
+}
+
+/**
  * AWQ grid-searched per-channel weight rescaling: takes the float model
  * and its `quantize_weight_only_int4`-quantized counterpart, reuses the
  * quantized model's structure, and rewrites improved layers (INT4
@@ -720,6 +752,7 @@ export default {
   applyOutlierSuppressionPlus,
   applyLlmInt8,
   applyGptq,
+  applyQronos,
   applyAwq,
   applyQuarotGptq,
   applyGptvq,

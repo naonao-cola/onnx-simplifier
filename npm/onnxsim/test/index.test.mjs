@@ -31,6 +31,7 @@ import {
   applyOutlierSuppressionPlus,
   applyLlmInt8,
   applyGptq,
+  applyQronos,
   applyAwq,
   applyQuarot,
   applyQuarotGptq,
@@ -220,6 +221,23 @@ try {
       X: new ort.Tensor("float32", new Float32Array(32).map((_, i) => ((i * 37) % 11) - 5), [1, 32]),
     });
     const out = await applyGptq(floatModel, quantModel, [batch(), batch()], {});
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applyQronos corrects codes on synthetic calibration data", async () => {
+    // Same dedicated fixtures as the GPTQ check above -- a single-layer
+    // model has no upstream-quantized predecessor, so this also
+    // exercises Qronos's own exact GPTQ reduction, but the point here is
+    // just that the two-model binding (including the per-layer re-probe
+    // against the progressively-corrected working model) round-trips.
+    const ort = await import("onnxruntime-web");
+    const floatModel = new Uint8Array(readFileSync(FIXTURE_GPTQ));
+    const quantModel = new Uint8Array(readFileSync(FIXTURE_GPTQ_INT4));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array(32).map((_, i) => ((i * 37) % 11) - 5), [1, 32]),
+    });
+    const out = await applyQronos(floatModel, quantModel, [batch(), batch()], {});
     assert.ok(out instanceof Uint8Array);
     assert.ok(out.length > 0);
   });

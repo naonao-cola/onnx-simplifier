@@ -105,17 +105,12 @@ paths fed into it upstream.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
 import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _find_int4_matmul_candidates, _pack_int4
-from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.gptq import _gptq_quantize_columns, _inverse_hessian_cholesky
+from onnxsim.calibration import Tensors
 
 
 def apply_qronos(
@@ -166,89 +161,36 @@ def apply_qronos(
             initializer rewritten to its Qronos-corrected codes (same shape,
             dtype, and scale -- only which integer each element rounds to
             changes)
+
+    The pure-Python machinery above (``_find_int4_matmul_candidates``,
+    ``_gptq_quantize_columns``/``_inverse_hessian_cholesky`` reused from
+    :mod:`onnxsim.gptq`) stays available for other modules to import, but
+    this entry point is now a thin alias for the verified C++ port
+    :func:`onnxsim.apply_qronos_cpp` (``onnxsim/qronos_entry.cpp``'s own
+    ``ApplyQronos``), forwarding every argument unchanged. Exact
+    (bit-for-bit) agreement was verified against this function's own
+    pre-alias implementation across single- and multi-layer (real
+    cross-layer correction) models, MatMul/transB-Gemm, block sizes,
+    damping levels, and dead/duplicate calibration channels -- see
+    tests/test_qronos_cpp.py -- before this alias was made. (The port's
+    dense inverse/Cholesky use scalar double-precision kernels rather
+    than LAPACK, the same accepted numerical scope
+    :func:`onnxsim.apply_gptq_cpp` already documents; no divergence was
+    observed anywhere measured.) Imported lazily (inside the function
+    body, not at module scope) to avoid a circular import:
+    ``onnxsim.onnx_simplifier`` already imports from this module, so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    if isinstance(quantized_model, str):
-        quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_qronos_cpp
 
-    candidates = _find_int4_matmul_candidates(float_model, quantized_model)
-    if not candidates:
-        return quantized_model
-
-    node_order = {id(n): i for i, n in enumerate(float_model.graph.node)}
-    candidates = sorted(candidates, key=lambda c: node_order[id(c.float_node)])
-
-    probe_names = sorted({c.float_node.input[0] for c in candidates})
-    float_probe = _add_probe_outputs(float_model, probe_names)
-    float_activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        out = backend.run_model(float_probe, batch, providers=providers)
-        for name in probe_names:
-            float_activations[name].append(np.asarray(out[name], dtype=np.float64))
-
-    working = onnx.ModelProto()
-    working.CopyFrom(quantized_model)
-    working_init = {t.name: t for t in working.graph.initializer}
-
-    any_optimized = False
-    for c in candidates:
-        probe_name = c.float_node.input[0]
-        x_float_batches = _activation_rows(float_activations[probe_name])
-        if not x_float_batches:
-            continue  # no usable activation (no feature axis); skip
-        x_float = np.concatenate(x_float_batches, axis=0)
-
-        working_probe = _add_probe_outputs(working, [probe_name])
-        x_quant_batches = []
-        for batch in calibration_data:
-            out = backend.run_model(working_probe, batch, providers=providers)
-            x_quant_batches.append(np.asarray(out[probe_name], dtype=np.float64))
-        x_quant_batches = _activation_rows(x_quant_batches)
-        # Keep the float and quantized row sets aligned: `dx` below is their
-        # elementwise difference, so a batch usable on one side but not the
-        # other (no feature axis) would misalign samples.
-        if len(x_quant_batches) != len(x_float_batches):
-            continue
-        x_quant = np.concatenate(x_quant_batches, axis=0)
-
-        w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)
-        scale = onnx.numpy_helper.to_array(c.ws_init).astype(np.float64)
-        dim0, dim1 = w.shape
-
-        if c.weight_transposed:
-            w_nk = w  # already [N, K]
-            scale_blocks = scale  # already [N, K / block_size]
-        else:
-            w_nk = w.T  # [K, N] -> [N, K]
-            scale_blocks = scale.T  # [K / block_size, N] -> [N, K / block_size]
-        if x_float.shape[1] != w_nk.shape[1] or x_quant.shape[1] != w_nk.shape[1]:
-            continue  # activation's feature dim doesn't match K; skip
-
-        dx = x_quant - x_float  # [samples, K], the upstream error itself
-        h = x_quant.T @ x_quant  # Hessian of the *real* (corrupted) input
-        u = _inverse_hessian_cholesky(h, percdamp)
-        h_inv = u.T @ u
-        # W_opt = W - W @ dX @ X_quant^T @ H^{-1} -- see this module's own
-        # docstring for why shifting *from* w_nk by a dX-proportional amount
-        # (rather than reconstructing the target from scratch) is what makes
-        # this numerically well-behaved and an exact GPTQ reduction when
-        # dX == 0.
-        w_opt_nk = w_nk - w_nk @ dx.T @ x_quant @ h_inv
-
-        codes_nk = _gptq_quantize_columns(
-            w_opt_nk, scale_blocks, c.block_size, h, percdamp, proc_block_size
-        )
-
-        codes_orig = codes_nk if c.weight_transposed else codes_nk.T
-        assert codes_orig.shape == (dim0, dim1)
-        working_init[c.wq_name].raw_data = _pack_int4(codes_orig.astype(np.int8))
-        any_optimized = True
-
-    if not any_optimized:
-        return quantized_model
-    return working
+    return apply_qronos_cpp(
+        float_model,
+        quantized_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        percdamp=percdamp,
+        proc_block_size=proc_block_size,
+        providers=providers,
+    )

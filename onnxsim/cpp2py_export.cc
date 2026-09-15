@@ -1042,6 +1042,43 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "num_alpha_steps"_a = 20);
 
+  // Qronos: a sequential, whole-model generalization of apply_gptq that
+  // additionally accounts for the error already baked into a layer's
+  // activations because upstream layers were quantized first, not just
+  // this layer's own rounding -- processes layers in the float model's
+  // own node order, re-probing the progressively-corrected quantized
+  // model before each subsequent layer (so `executor` is invoked once
+  // per matched layer here, not once up front for all of them like every
+  // other calibration-driven binding above). Same two-model
+  // executor-as-first-argument shape as apply_gptq's own binding above;
+  // `calibration_data` (List[Dict[str, onnx.TensorProto]]) is keyed to
+  // the float model's own graph inputs. See ApplyQronos in
+  // qronos_entry.h for the full scope and onnxsim/qronos.py for the
+  // technique this ports.
+  m.def(
+      "apply_qronos",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double percdamp, int64_t proc_block_size) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result = ApplyQronos(float_model, quantized_model,
+                                        *executor, calibration_data,
+                                        percdamp, proc_block_size);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "percdamp"_a = 0.01, "proc_block_size"_a = 128);
+
   // QuaRot+GPTQ (Ashkboos et al., 2024): the real QuaRot paper's optional,
   // tighter weight quantizer -- rotates every matched MatMul/vanilla-Gemm
   // node's activation by a fresh per-layer random orthogonal matrix and
