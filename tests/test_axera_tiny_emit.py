@@ -54,6 +54,76 @@ def test_trace_neg_rejects_other_graphs():
         tiny_emit.trace_neg(t * 2.0)
 
 
+def test_trace_add_matches_two_tensor_add():
+    tg = pytest.importorskip("tinygrad")
+    a, b = tg.Tensor.empty(1, 8), tg.Tensor.empty(1, 8)
+    got = tiny_emit.trace_add(a + b)
+    assert got["shape"] == [1, 8]
+
+
+def test_trace_add_rejects_other_graphs():
+    tg = pytest.importorskip("tinygrad")
+    a, b = tg.Tensor.empty(1, 8), tg.Tensor.empty(1, 8)
+    with pytest.raises(ValueError):
+        tiny_emit.trace_add(a * b)  # wrong op
+    with pytest.raises(ValueError):
+        tiny_emit.trace_add(a + 2.0)  # scalar add, not two-tensor
+
+
+def test_trace_mul_matches_two_tensor_multiply():
+    tg = pytest.importorskip("tinygrad")
+    a, b = tg.Tensor.empty(1, 8), tg.Tensor.empty(1, 8)
+    got = tiny_emit.trace_mul(a * b)
+    assert got["shape"] == [1, 8]
+
+
+def test_trace_mul_rejects_other_graphs():
+    tg = pytest.importorskip("tinygrad")
+    a, b = tg.Tensor.empty(1, 8), tg.Tensor.empty(1, 8)
+    with pytest.raises(ValueError):
+        tiny_emit.trace_mul(a + b)  # wrong op
+    with pytest.raises(ValueError):
+        tiny_emit.trace_mul(-a)  # scalar multiply (Neg's own shape)
+    with pytest.raises(ValueError):
+        tiny_emit.trace_mul(a * 2.0)  # scalar multiply, not two-tensor
+
+
+def test_trace_relu_matches_compare_and_select():
+    tg = pytest.importorskip("tinygrad")
+    t = tg.Tensor.empty(1, 8)
+    got = tiny_emit.trace_relu(t.relu())
+    assert got["shape"] == [1, 8]
+
+
+def test_trace_relu_rejects_other_graphs():
+    tg = pytest.importorskip("tinygrad")
+    a, b = tg.Tensor.empty(1, 8), tg.Tensor.empty(1, 8)
+    with pytest.raises(ValueError):
+        tiny_emit.trace_relu(a.sigmoid())  # wrong top-level op
+    with pytest.raises(ValueError):
+        # Same WHERE/CMPLT-against-0.0 shape, but the true branch is a
+        # *different* tensor than the one compared against 0 -- the
+        # identity check, not just shape/dtype matching, must catch this.
+        tiny_emit.trace_relu((0 < a).where(b, 0))
+
+
+def test_trace_sigmoid_matches_reciprocal_chain():
+    tg = pytest.importorskip("tinygrad")
+    t = tg.Tensor.empty(1, 8)
+    got = tiny_emit.trace_sigmoid(t.sigmoid())
+    assert got["shape"] == [1, 8]
+
+
+def test_trace_sigmoid_rejects_other_graphs():
+    tg = pytest.importorskip("tinygrad")
+    t = tg.Tensor.empty(1, 8)
+    with pytest.raises(ValueError):
+        tiny_emit.trace_sigmoid(t.relu())  # wrong top-level op
+    with pytest.raises(ValueError):
+        # 1/(1+2^(-2x)) -- same shape, wrong constant (not -log2(e)).
+        tiny_emit.trace_sigmoid((1.0 + (t * -2.0).exp2()).reciprocal())
+
+
 def test_minmax_scale_matches_pulsar2_to_1e10():
     rng = np.random.default_rng(0)
     samples = [(rng.uniform(-2.5, 2.5, (1, 8))).astype(np.float32) for _ in range(8)]
@@ -139,3 +209,73 @@ def test_patch_mul_preserves_reference_site_b_form():
     _assert_family_matches(patched, target, nz / (nx * ny), 8)
     _assert_slot_run(patched, 1.0 / ny, 6, width=3)
     assert check(patched) == []
+
+
+# Output scale quad (z's own scale, `03 <f32> 81 82` x4 stride 7): source
+# of truth is TestOutputScaleQuads in tests/test_axera_mcode_reciprocal.py.
+
+
+@pytest.mark.parametrize(
+    "src,dst,dst_z",
+    [
+        ("mul_1x8", "mul_1x8_w2", _W2[2]),
+        ("mul_1x8_recip_x10", "mul_1x8_recip_x01", _X01[2]),
+    ],
+)
+def test_patch_mul_output_quad_matches_target(src, dst, dst_z):
+    src_z = {"mul_1x8": _BASE[2], "mul_1x8_recip_x10": _X10[2]}[src]
+    patched = tiny_emit.patch_mul_output_quad(_blob(src), src_z, dst_z)
+    target = _blob(dst)
+    _assert_family_matches(patched, target, dst_z, 7)
+    assert check(patched) == []
+
+
+def test_patch_mul_output_quad_round_trips():
+    blob = _blob("mul_1x8")
+    out_and_back = tiny_emit.patch_mul_output_quad(
+        tiny_emit.patch_mul_output_quad(blob, _BASE[2], _W2[2]), _W2[2], _BASE[2]
+    )
+    assert out_and_back == blob
+
+
+def test_patch_mul_output_quad_rejects_bad_frame():
+    # x_scale's own reciprocal-family words never carry the 03../8182
+    # frame, so patching "the output scale" by a value that only happens
+    # to collide with an unframed word must fail loudly, not silently
+    # patch the wrong bytes.
+    with pytest.raises(ValueError):
+        tiny_emit.patch_mul_output_quad(_blob("mul_1x8"), 1.0 / _BASE[0], 1.0)
+
+
+# x's zero point, literal-byte form only (`02 10 1b <zp_x> 83 36`): source
+# of truth is TestZpXLiteralByteWhenPresent, which also documents that
+# most builds do NOT use this form -- not predictable from zp_x's value.
+
+
+def test_patch_mul_zp_x_matches_target():
+    patched = tiny_emit.patch_mul_zp_x(_blob("mul_1x8_zp33sweep"), 33, 35)
+    target = _blob("mul_1x8_zp35sweep")
+    unit = bytes.fromhex("02101b") + bytes([35]) + bytes.fromhex("8336")
+    assert unit in patched
+    assert unit in target
+    assert check(patched) == []
+
+
+def test_patch_mul_zp_x_round_trips():
+    blob = _blob("mul_1x8_zp33sweep")
+    out_and_back = tiny_emit.patch_mul_zp_x(
+        tiny_emit.patch_mul_zp_x(blob, 33, 35), 35, 33
+    )
+    assert out_and_back == blob
+
+
+def test_patch_mul_zp_x_raises_when_form_absent():
+    # mul_1x8 (base) has zp_x=128 but uses one of the opaque forms, not
+    # the literal one -- the function must say so, not silently no-op.
+    with pytest.raises(ValueError):
+        tiny_emit.patch_mul_zp_x(_blob("mul_1x8"), 128, 100)
+
+
+def test_patch_mul_zp_x_rejects_out_of_range():
+    with pytest.raises(ValueError):
+        tiny_emit.patch_mul_zp_x(_blob("mul_1x8_zp33sweep"), 33, 256)
