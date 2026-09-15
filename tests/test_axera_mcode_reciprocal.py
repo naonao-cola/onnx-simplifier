@@ -47,13 +47,18 @@ constant-span negative shift to flip zp without moving the scale ratio)
 that pins this down across all eight builds gathered so far, including the
 three above.
 
-RESOLVED (2026-09-16, later): x's own zero point (zp_x) is written to the
-stream as a literal byte, once it is large enough. See
-``TestZpXLiteralByteAboveThreshold`` -- for zp_x >= 33 the unit
-``02 10 1b <zp_x> 83 36`` carries zp_x verbatim as its fourth byte, no
-arithmetic transform needed; confirmed across five independent values (33,
-35, 36, 51, 80). ``TestZpXImmediateRegion`` still pins the zp_x <= 32
-regime, which is a different (undecoded) form.
+RESOLVED (2026-09-16, later), corrected same day: x's own zero point
+(zp_x) is *sometimes* written to the stream as a literal byte. See
+``TestZpXLiteralByteWhenPresent`` -- when the unit
+``02 10 1b <zp_x> 83 36`` is present, its fourth byte carries zp_x
+verbatim, no arithmetic transform needed, with zero exceptions in eleven
+independent values (6, 8, 15, 18, 22, 25, 33, 35, 36, 51, 80; zp_x >= 33
+uses this form every time so far, 5/5, but it also fires non-monotonically
+for six smaller values while other similar-sized zp_x do not). A first
+version of this note claimed a clean "zp_x >= 33" threshold -- a same-day
+follow-up sweep over zp_x in [1, 32] falsified that; see the test class
+for the corrected claim. ``TestZpXImmediateRegion`` pins the raw bytes of
+the two forms this literal unit is *not* used for, still undecoded.
 """
 
 import gzip
@@ -338,7 +343,7 @@ class TestZpXImmediateRegion(unittest.TestCase):
       decode as zp_x under any hypothesis tried here.
     - zp_x >= 33: a 6-byte unit ``02 10 1b <zp_x> 83 36`` whose third
       payload byte *is* zp_x, verbatim -- see
-      ``TestZpXLiteralByteAboveThreshold`` below, which resolves that
+      ``TestZpXLiteralByteWhenPresent`` below, which resolves that
       regime completely.
 
     This class keeps pinning the zp_x <= 32 regime (raw bytes only, no
@@ -380,7 +385,7 @@ class TestZpXImmediateRegion(unittest.TestCase):
         # by a byte or two build to build (bytes further upstream can shift
         # it), which is itself part of why a fixed-offset byte correlation
         # search across many builds produces misleading noise -- see the
-        # module-level lesson recorded in TestZpXLiteralByteAboveThreshold.
+        # module-level lesson recorded in TestZpXLiteralByteWhenPresent.
         for name, (_xs, region, _zpx) in self.CASES.items():
             data = load(name)
             idx = data.find(region, 1085, 1130)
@@ -403,8 +408,10 @@ class TestZpXImmediateRegion(unittest.TestCase):
             self.assertEqual(strides, {8}, f"{name}: site A stride")
 
 
-class TestZpXLiteralByteAboveThreshold(unittest.TestCase):
-    """zp_x >= 33 is written to the stream as a literal byte. RESOLVED.
+class TestZpXLiteralByteWhenPresent(unittest.TestCase):
+    """When present, this unit's fourth byte is zp_x, verbatim. RESOLVED
+    (partially -- see the correction below, which replaces an overclaim
+    from when this class was first landed).
 
     The class above localized zp_x's effect but could not decode the
     immediate; the reason turned out to be that the earlier analysis
@@ -414,36 +421,55 @@ class TestZpXLiteralByteAboveThreshold(unittest.TestCase):
     correlation sweep against zp_x topped out around |r|=0.8 instead of
     hitting 1.0 anywhere: it was the same misalignment, just averaged over
     more offsets). Re-deriving each build's variable-width unit with
-    ``mcode.decode()`` instead of a fixed slice removes the misalignment.
-
-    Six more builds (three from the original sweep -- 35, 40 -- plus a
-    follow-up sweep pinning the regime boundary -- 32 still old-form, 33
-    already new-form -- and confirming it holds well past the first two
-    samples -- 36, 51, 80) all agree: once zp_x is large enough to need a
-    3-byte payload, the unit is
+    ``mcode.decode()`` instead of a fixed slice removes the misalignment
+    and turns up a fixed 6-byte form:
 
         02 10 1b <zp_x> 83 36
 
-    a fixed 6-byte form where every byte except the fourth is constant
-    (``02``: p=2, i.e. 3-byte payload; ``10 1b``: constant payload prefix;
-    ``83``: tag; ``36``: register) and the fourth byte *is* zp_x, verbatim,
-    for every one of 33, 35, 36, 51, 80 -- five agreements, zero exceptions,
-    zero arithmetic transform needed. The threshold sits strictly between
-    32 (still the old, undecoded form from the class above) and 33 (this
-    form) -- not yet related to any obvious power-of-two boundary in zp_x
-    itself, only observed to fall there.
+    where every byte except the fourth is constant (``02``: p=2, i.e.
+    3-byte payload; ``10 1b``: constant payload prefix; ``83``: tag;
+    ``36``: register) and the fourth byte *is* zp_x, verbatim, confirmed
+    for eleven independent values (6, 8, 15, 18, 22, 25, 33, 35, 36, 51,
+    80) with zero exceptions and zero arithmetic transform needed.
 
-    Still open: zp_x <= 32 (``TestZpXImmediateRegion`` above), and whether
-    y ever gets an analogous literal-byte encoding (this sweep held y's
-    zero point at 0 throughout, by construction -- see
-    ``TestSiteBFormSelectorIsZpX``, which already showed zp_y plays no part
-    in site B's form selector; whether it gets *its own* literal slot
+    CORRECTION (2026-09-16, same day): this class originally claimed the
+    threshold "sits strictly between 32 and 33" -- that a dense follow-up
+    sweep over zp_x in [1, 32] immediately falsified. This form also fires
+    for several zp_x < 33 (6, 8, 15, 18, 22, 25 above), while *other*
+    zp_x in the very same range (1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14,
+    16, 20, 24, 27, 29, 30, 31, 32) use one of two different, still-opaque
+    forms (``TestZpXImmediateRegion`` above) instead -- non-monotonically:
+    e.g. 8 gets this form but 9 through 14 do not, then 15 does again.
+    zp_x >= 33 happens to use this form 100% of the time in every build
+    gathered so far (5/5), but nothing here explains *why* -- the two
+    small-zp_x forms' own varying byte (nominally a "register") doesn't
+    correlate with zp_x by any hypothesis tried, so the likely mechanism
+    is a compiler code-path choice keyed on something other than zp_x's
+    magnitude (a CSE/register-reuse heuristic is one guess, unverified).
+
+    Practical upshot for an emitter: this pattern can be used
+    *opportunistically* -- search a reference build for
+    ``02 10 1b <byte> 83 36`` and trust the byte if found, since it has
+    never once been wrong -- but its *absence* says nothing about zp_x's
+    value; a small zp_x can legitimately use either form.
+
+    Still open: the two zp_x <= 32 forms' actual encoding
+    (``TestZpXImmediateRegion`` above), what selects between all three
+    forms, and whether y ever gets an analogous literal-byte encoding
+    (this sweep held y's zero point at 0 throughout, by construction --
+    see ``TestSiteBFormSelectorIsZpX``, which already showed zp_y plays no
+    part in site B's form selector; whether it gets *its own* literal slot
     elsewhere is untested).
     """
 
-    # fixture: (zp_x,) -- x_scale is 0.007604781538248062 for every case,
-    # the same value used throughout this sweep family.
+    # fixture: (zp_x,) -- x_scale is one of two builds that agree to
+    # ~2e-14 (0.007604781538248062 or 0.0076047820039093494, a float64
+    # rounding-mode artifact of which MinMax reduction order a given build
+    # happened to use) across every case in this sweep family; irrelevant
+    # to this class, which never reads x_scale.
     CASES = {
+        "mul_1x8_zp6sweep.mcode.gz": 6,
+        "mul_1x8_zp25sweep.mcode.gz": 25,
         "mul_1x8_zp33sweep.mcode.gz": 33,
         "mul_1x8_zp35sweep.mcode.gz": 35,
         "mul_1x8_zp80sweep.mcode.gz": 80,
