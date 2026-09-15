@@ -88,7 +88,10 @@ def test_rewrite_tensor_scatter_to_scatter_elements_witness_arithmetic_is_sound(
     prove(
         z3.Implies(
             z3.And(
-                0 <= s, s < seq_len, 0 <= s2, s2 < seq_len,
+                0 <= s,
+                s < seq_len,
+                0 <= s2,
+                s2 < seq_len,
                 write_indices(b) + s == write_indices(b) + s2,
             ),
             s == s2,

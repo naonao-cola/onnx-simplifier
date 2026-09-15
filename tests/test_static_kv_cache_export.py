@@ -53,14 +53,19 @@ def hf_model_config():
     try:
         config = transformers.AutoConfig.from_pretrained(_MODEL_ID)
     except Exception as e:  # network/hub errors surface as a variety of types
-        pytest.skip(f"Could not fetch config for {_MODEL_ID} from Hugging Face Hub: {e}")
+        pytest.skip(
+            f"Could not fetch config for {_MODEL_ID} from Hugging Face Hub: {e}"
+        )
     return config
 
 
 def _num_layers_heads_head_dim(config):
     text_config = config.get_text_config(decoder=True)
     num_layers = text_config.num_hidden_layers
-    num_kv_heads = getattr(text_config, "num_key_value_heads", None) or text_config.num_attention_heads
+    num_kv_heads = (
+        getattr(text_config, "num_key_value_heads", None)
+        or text_config.num_attention_heads
+    )
     head_dim = getattr(text_config, "head_dim", None) or (
         text_config.hidden_size // text_config.num_attention_heads
     )
@@ -73,7 +78,9 @@ def _run_growing_cache_baseline(model_dir, config, prompt_ids):
         str(model_dir / "model.onnx"), providers=["CPUExecutionProvider"]
     )
     past = {
-        f"past_key_values.{i}.{kind}": np.zeros((1, num_kv_heads, 0, head_dim), dtype=np.float32)
+        f"past_key_values.{i}.{kind}": np.zeros(
+            (1, num_kv_heads, 0, head_dim), dtype=np.float32
+        )
         for i in range(num_layers)
         for kind in ("key", "value")
     }
@@ -82,7 +89,9 @@ def _run_growing_cache_baseline(model_dir, config, prompt_ids):
     total_len = 0
     for _ in range(1 + _N_DECODE_STEPS):
         seq_len = input_ids.shape[1]
-        position_ids = np.arange(total_len, total_len + seq_len)[None, :].astype(np.int64)
+        position_ids = np.arange(total_len, total_len + seq_len)[None, :].astype(
+            np.int64
+        )
         attention_mask = np.ones((1, total_len + seq_len), dtype=np.int64)
         feeds = {
             "input_ids": input_ids,
@@ -115,16 +124,26 @@ def _run_static_cache_export(export_dir, config, prompt_ids):
 
     past_kv = {}
     for i in range(num_layers):
-        past_kv[f"past_key.{i}"] = np.zeros((1, num_kv_heads, _MAX_CACHE_LEN, head_dim), dtype=np.float32)
-        past_kv[f"past_value.{i}"] = np.zeros((1, num_kv_heads, _MAX_CACHE_LEN, head_dim), dtype=np.float32)
+        past_kv[f"past_key.{i}"] = np.zeros(
+            (1, num_kv_heads, _MAX_CACHE_LEN, head_dim), dtype=np.float32
+        )
+        past_kv[f"past_value.{i}"] = np.zeros(
+            (1, num_kv_heads, _MAX_CACHE_LEN, head_dim), dtype=np.float32
+        )
 
     def run_step(sess, input_ids, cache_position, attention_mask, past_kv):
-        feeds = {"input_ids": input_ids, "cache_position": cache_position, "attention_mask": attention_mask}
+        feeds = {
+            "input_ids": input_ids,
+            "cache_position": cache_position,
+            "attention_mask": attention_mask,
+        }
         feeds.update(past_kv)
         outputs = sess.run(None, feeds)
         out = dict(zip([o.name for o in sess.get_outputs()], outputs))
         new_kv = {f"past_key.{i}": out[f"present_key.{i}"] for i in range(num_layers)}
-        new_kv.update({f"past_value.{i}": out[f"present_value.{i}"] for i in range(num_layers)})
+        new_kv.update(
+            {f"past_value.{i}": out[f"present_value.{i}"] for i in range(num_layers)}
+        )
         return out["logits"], new_kv
 
     generated = []
@@ -132,7 +151,9 @@ def _run_static_cache_export(export_dir, config, prompt_ids):
     cache_position = np.arange(0, prompt_len).astype(np.int64)
     attention_mask = np.zeros((1, _MAX_CACHE_LEN), dtype=np.int64)
     attention_mask[:, :prompt_len] = 1
-    logits, past_kv = run_step(prefill_sess, prompt_ids, cache_position, attention_mask, past_kv)
+    logits, past_kv = run_step(
+        prefill_sess, prompt_ids, cache_position, attention_mask, past_kv
+    )
     next_token = int(np.argmax(logits[0, -1]))
     generated.append(next_token)
     write_pos = prompt_len
@@ -142,7 +163,9 @@ def _run_static_cache_export(export_dir, config, prompt_ids):
         cache_position = np.array([write_pos], dtype=np.int64)
         attention_mask = np.zeros((1, _MAX_CACHE_LEN), dtype=np.int64)
         attention_mask[:, : write_pos + 1] = 1
-        logits, past_kv = run_step(decode_sess, input_ids, cache_position, attention_mask, past_kv)
+        logits, past_kv = run_step(
+            decode_sess, input_ids, cache_position, attention_mask, past_kv
+        )
         next_token = int(np.argmax(logits[0, -1]))
         generated.append(next_token)
         write_pos += 1
@@ -174,9 +197,13 @@ def test_static_cache_export_matches_growing_cache_baseline(hf_model_config, tmp
     assert all(results.values()), f"onnxsim numerical check failed: {results}"
 
     rng = np.random.RandomState(0)
-    prompt_ids = rng.randint(0, min(900, hf_model_config.vocab_size), size=(1, _PROMPT_LEN)).astype(np.int64)
+    prompt_ids = rng.randint(
+        0, min(900, hf_model_config.vocab_size), size=(1, _PROMPT_LEN)
+    ).astype(np.int64)
 
-    baseline_tokens = _run_growing_cache_baseline(baseline_dir, hf_model_config, prompt_ids)
+    baseline_tokens = _run_growing_cache_baseline(
+        baseline_dir, hf_model_config, prompt_ids
+    )
     static_tokens = _run_static_cache_export(export_dir, hf_model_config, prompt_ids)
 
     assert static_tokens == baseline_tokens, (
