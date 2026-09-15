@@ -24,6 +24,19 @@ marker (4 copies): base 7c7cee, x10y01 7b7cee (byte0 - 1 for 10x x with z
 fixed), mul_sep (x=0.78) 7a7cee (-2 for 100x), x01y10 9b53c3 (all bytes
 change when z also moves).  They track the input scales but are not a pure
 function of any single scale; pinned here as observations.
+
+Update (2026-09-16): SOLVED -- those "3-byte groups" were a misaligned
+read. The real structure is a third reciprocal-family slot:
+
+- Site C (~offset 1421, 4 copies at stride 8, framed `0f <f32> a1 00 <id>`
+  like site A): float32(z_scale / (x_scale * y_scale)), the integer
+  requant multiplier, bit-exact in all five scratch builds (base, x10y01,
+  x01y10, sep, w2 -- including w2's apparent "8 markers", which were just
+  its site-A slots matching the old `42 a1 00` motif by float-byte
+  coincidence when 1/x fell in [32, 64)). The old motif conflated two
+  different sites sharing one frame: site A carries the input reciprocal
+  (high byte varies: 43/42/41/44/3f), site C the requant (high byte 42
+  in every build so far). `TestRequantMultiplierSlot` pins site C.
 """
 
 import gzip
@@ -48,6 +61,14 @@ CASES = {
         True,
         "9b53c3",
     ),
+}
+
+# Output scales for the same fixtures (quant JSON, pinned alongside the
+# inputs so site C is computable without a rebuild).
+_Z_SCALES = {
+    "mul_1x8.mcode.gz": 0.007151617668569088,
+    "mul_1x8_recip_x10.mcode.gz": 0.007151617202907801,
+    "mul_1x8_recip_x01.mcode.gz": 0.005844127852469683,
 }
 
 # Unary op (Neg): same site-A mechanism for its single input.  All 13 builds
@@ -109,6 +130,25 @@ class TestInputReciprocalSlots(unittest.TestCase):
             self.assertEqual(len(idx), 4, f"{name}: marker count")
             for i in idx:
                 self.assertEqual(data[i - 3 : i].hex(), grp, f"{name}: group")
+
+
+class TestRequantMultiplierSlot(unittest.TestCase):
+    """Site C: float32(z_scale / (x_scale * y_scale)) x4 at stride 8.
+
+    The integer requant multiplier, bit-exact -- the value the NPU's
+    fixed-point core multiplies the (x_q - zpx)(y_q - zpy) product by
+    before shifting down to the output scale. Same `0f <f32> a1 00 <id>`
+    framing as site A (verified context bytes), different payload.
+    """
+
+    def test_site_c_carries_output_over_input_product_scale(self):
+        for name, (xs, ys, _full, _grp) in CASES.items():
+            data = load(name)
+            req = struct.pack("<f", _Z_SCALES[name] / (xs * ys))
+            found = hits(data, req)
+            self.assertEqual(len(found), 4, f"{name}: site C hits")
+            strides = {b - a for a, b in zip(found, found[1:])}
+            self.assertEqual(strides, {8}, f"{name}: site C stride")
 
 
 if __name__ == "__main__":
