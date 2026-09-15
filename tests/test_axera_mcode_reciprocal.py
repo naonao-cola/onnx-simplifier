@@ -47,18 +47,19 @@ constant-span negative shift to flip zp without moving the scale ratio)
 that pins this down across all eight builds gathered so far, including the
 three above.
 
-RESOLVED (2026-09-16, later), corrected same day: x's own zero point
-(zp_x) is *sometimes* written to the stream as a literal byte. See
+RESOLVED (2026-09-16, later), corrected twice same day: x's own zero
+point (zp_x) is *sometimes* written to the stream as a literal byte. See
 ``TestZpXLiteralByteWhenPresent`` -- when the unit
 ``02 10 1b <zp_x> 83 36`` is present, its fourth byte carries zp_x
-verbatim, no arithmetic transform needed, with zero exceptions in eleven
-independent values (6, 8, 15, 18, 22, 25, 33, 35, 36, 51, 80; zp_x >= 33
-uses this form every time so far, 5/5, but it also fires non-monotonically
-for six smaller values while other similar-sized zp_x do not). A first
-version of this note claimed a clean "zp_x >= 33" threshold -- a same-day
-follow-up sweep over zp_x in [1, 32] falsified that; see the test class
-for the corrected claim. ``TestZpXImmediateRegion`` pins the raw bytes of
-the two forms this literal unit is *not* used for, still undecoded.
+verbatim, no arithmetic transform needed, with zero exceptions in twelve
+independent values so far. Presence is *not* gated by zp_x's magnitude in
+any way found yet: it is not a clean "zp_x >= 33" threshold (a first
+version of this note claimed that; a follow-up sweep over zp_x in [1, 32]
+falsified it the same day), and it is not even true that every zp_x >= 33
+uses it (a second correction, caught reusing ``mul_1x8`` -- zp_x=128 uses
+the *opaque* form, while ``mul_1x8_recip_x01``'s zp_x=127 uses the
+literal one). ``TestZpXImmediateRegion`` pins the raw bytes of the two
+opaque forms this literal unit is not used for, still undecoded.
 """
 
 import gzip
@@ -449,8 +450,9 @@ class TestZpXLiteralByteWhenPresent(unittest.TestCase):
     where every byte except the fourth is constant (``02``: p=2, i.e.
     3-byte payload; ``10 1b``: constant payload prefix; ``83``: tag;
     ``36``: register) and the fourth byte *is* zp_x, verbatim, confirmed
-    for eleven independent values (6, 8, 15, 18, 22, 25, 33, 35, 36, 51,
-    80) with zero exceptions and zero arithmetic transform needed.
+    for twelve independent values (6, 8, 15, 18, 22, 25, 33, 35, 36, 51,
+    80, and x01's 127 -- see the second correction below) with zero
+    exceptions and zero arithmetic transform needed.
 
     CORRECTION (2026-09-16, same day): this class originally claimed the
     threshold "sits strictly between 32 and 33" -- that a dense follow-up
@@ -460,18 +462,27 @@ class TestZpXLiteralByteWhenPresent(unittest.TestCase):
     16, 20, 24, 27, 29, 30, 31, 32) use one of two different, still-opaque
     forms (``TestZpXImmediateRegion`` above) instead -- non-monotonically:
     e.g. 8 gets this form but 9 through 14 do not, then 15 does again.
-    zp_x >= 33 happens to use this form 100% of the time in every build
-    gathered so far (5/5), but nothing here explains *why* -- the two
-    small-zp_x forms' own varying byte (nominally a "register") doesn't
-    correlate with zp_x by any hypothesis tried, so the likely mechanism
-    is a compiler code-path choice keyed on something other than zp_x's
-    magnitude (a CSE/register-reuse heuristic is one guess, unverified).
 
-    Practical upshot for an emitter: this pattern can be used
-    *opportunistically* -- search a reference build for
-    ``02 10 1b <byte> 83 36`` and trust the byte if found, since it has
-    never once been wrong -- but its *absence* says nothing about zp_x's
-    value; a small zp_x can legitimately use either form.
+    SECOND CORRECTION (2026-09-16, later still): the surviving claim above
+    -- "zp_x >= 33 uses this form 100% of the time, 5/5" -- is *also*
+    false, caught while reusing the well-established ``mul_1x8`` (base,
+    zp_x=128) fixture as an emitter reference: it uses the opaque
+    ``0x83``-tag form, not this one, and so do ``mul_1x8_recip_x10``
+    (zp_x=128) and ``mul_1x8_w2`` (zp_x=128) -- while ``mul_1x8_recip_x01``
+    (zp_x=127, one less) *does* use this literal form. So the "5/5 for
+    zp_x >= 33" regularity was an artifact of this sweep family's specific
+    construction (a fixed x array shifted down, y and the op otherwise
+    untouched, zp_y always 0) rather than a property of zp_x's magnitude
+    at all -- consistent with the already-documented non-monotonicity
+    below 33, just not previously shown to extend above it too.
+
+    Practical upshot for an emitter, restated without the magnitude
+    claim: this pattern can be used *opportunistically* -- search a
+    reference build for ``02 10 1b <byte> 83 36`` and trust the byte if
+    found, since it has never once been wrong across any build gathered
+    (twelve for twelve) -- but its *absence* says nothing about zp_x's
+    value at any magnitude, small or large; an emitter must handle "not
+    found" as a real, common case, not an edge case.
 
     Still open: the two zp_x <= 32 forms' actual encoding
     (``TestZpXImmediateRegion`` above), what selects between all three
@@ -493,6 +504,10 @@ class TestZpXLiteralByteWhenPresent(unittest.TestCase):
         "mul_1x8_zp33sweep.mcode.gz": 33,
         "mul_1x8_zp35sweep.mcode.gz": 35,
         "mul_1x8_zp80sweep.mcode.gz": 80,
+        # Already-committed fixture, not a new build -- zp_x=127 here (one
+        # less than mul_1x8/x10/w2's 128, which use the *opaque* form; see
+        # the second correction in the class docstring).
+        "mul_1x8_recip_x01.mcode.gz": 127,
     }
 
     _CONST_PREFIX = bytes.fromhex("02101b")
