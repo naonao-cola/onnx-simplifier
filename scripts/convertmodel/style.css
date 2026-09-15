@@ -535,6 +535,53 @@ button:focus-visible {
   color: var(--fg);
 }
 
+/* --- custom WebGPU kernels panel ------------------------------------------ */
+.wk-panes {
+  display: flex;
+  gap: 1em;
+  flex-wrap: wrap;
+}
+.wk-pane {
+  flex: 1 1 320px;
+  min-width: 280px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5em 0.7em;
+  background: var(--panel-bg);
+}
+.wk-head {
+  font-weight: 600;
+  margin-bottom: 0.35em;
+}
+.wk-node {
+  margin-bottom: 0.6em;
+  padding-bottom: 0.5em;
+  border-bottom: 1px solid var(--border);
+}
+.wk-node:last-child {
+  border-bottom: none;
+}
+.wk-node-head {
+  margin-bottom: 0.3em;
+}
+.wk-step summary {
+  cursor: pointer;
+}
+.wk-bindings {
+  margin: 0.3em 0;
+  font-size: 0.9em;
+  color: var(--muted);
+}
+.wk-wgsl {
+  max-height: 240px;
+  overflow: auto;
+  background: var(--code-bg);
+  border-radius: 3px;
+  padding: 0.5em;
+  font-size: 0.85em;
+  white-space: pre;
+}
+
 /* --- before/after inference comparison summary --------------------------- */
 .cmp-table th {
   text-align: left;

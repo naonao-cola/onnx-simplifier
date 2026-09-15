@@ -205,6 +205,13 @@
                             if (window.dimParamsShowAfter) {
                                 window.dimParamsShowAfter(data_url, result_name);
                             }
+                            // List the converted model's custom WebGPU kernel
+                            // annotations ("after") -- simplify/optimize can
+                            // rename or fuse away an annotated node, so this
+                            // is not always the same list as "before".
+                            if (window.webgpuKernelsShowAfter) {
+                                window.webgpuKernelsShowAfter(data_url, result_name);
+                            }
                             // Keep the converted model bytes around so the
                             // "Run inference" panel can run them (not just the
                             // original upload). Decode the base64 data URL back

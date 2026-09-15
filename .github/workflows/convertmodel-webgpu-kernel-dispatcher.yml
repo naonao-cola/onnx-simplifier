@@ -45,9 +45,12 @@ name: convertmodel WebGPU custom kernel dispatcher
 #
 # onnx_node_metadata.test.mjs (the plain-Node half of this same feature,
 # proving the JS protobuf-field reader agrees with what
-# onnxsim/webgpu_kernel_metadata.py actually wrote) needs no browser and no
-# GPU, so it runs as part of `npm run test:all` / test:onnx-node-metadata,
-# not here.
+# onnxsim/webgpu_kernel_metadata.py actually wrote) and
+# webgpu_kernel_annotations.test.mjs (the pure reshaping logic behind the
+# converter page's read-only "Custom WebGPU kernels" panel --
+# webgpu_kernel_annotations_view.mjs -- which lists whatever a model already
+# carries via that same reader) need no browser and no GPU, so they run in
+# the onnx-node-metadata job below, not in a GPU-backed one.
 #
 # Scheduled + on demand, plus on PRs that touch the files this check depends
 # on, same reasoning as convertmodel-webgpu-demo.yml / convertmodel-ep-placement.yml.
@@ -63,6 +66,7 @@ on:
       - "scripts/convertmodel/test/webgpu_tinygrad_codegen.test.mjs"
       - "scripts/convertmodel/test/webgpu_custom_kernel_runtime.test.mjs"
       - "scripts/convertmodel/test/onnx_node_metadata.test.mjs"
+      - "scripts/convertmodel/test/webgpu_kernel_annotations.test.mjs"
       - "scripts/convertmodel/test/make_webgpu_kernel_fixture.py"
       - "scripts/convertmodel/test/make_webgpu_tinygrad_codegen_fixture.py"
       - "scripts/convertmodel/test/make_webgpu_custom_kernel_runtime_fixture.py"
@@ -77,6 +81,7 @@ on:
       - "scripts/convertmodel/onnx_node_metadata.mjs"
       - "scripts/convertmodel/webgpu_kernel_dispatcher.mjs"
       - "scripts/convertmodel/webgpu_custom_kernel_runtime.mjs"
+      - "scripts/convertmodel/webgpu_kernel_annotations.mjs"
       - "scripts/convertmodel/package.json"
       - "onnxsim/webgpu_kernel_metadata.py"
       - "onnxsim/webgpu_tinygrad_codegen.py"
@@ -106,6 +111,9 @@ jobs:
       - name: Run the ONNX node metadata reader test
         working-directory: scripts/convertmodel
         run: npm run test:onnx-node-metadata
+      - name: Run the WebGPU kernel annotations panel unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:webgpu-kernel-annotations
 
   webgpu-kernel-dispatcher:
     name: WebGPU custom kernel dispatch (required)
