@@ -17,7 +17,6 @@ collection, so the installed package is imported unchanged.
 import os
 import re
 
-
 # Filename patterns for the "axera" marker: Axera Pulsar2/AXCL NPU backend
 # tests. test_voyager_sdk_patterns.py doesn't follow the test_axera_*/
 # test_axelera_* prefix but covers the same Axelera Voyager SDK surface as
