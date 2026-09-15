@@ -6,13 +6,12 @@
 // caller-supplied GPUBuffers.
 //
 // This is a standalone execution primitive: "run this WGSL program against
-// these buffers", nothing more. It does not know about onnxruntime-web, ONNX
-// graphs, or tensor shapes/dtypes beyond raw byte buffers -- splicing a
-// dispatch like this into an actual onnxruntime-web session (so a flagged
-// node runs through here instead of ORT-web's own WebGPU kernel, most likely
-// via ORT-web's GPU-buffer IO binding to avoid a CPU round-trip) is future
-// work; see onnxsim/webgpu_kernel_metadata.py's docstring for the current
-// state of that boundary.
+// these buffers", nothing more. It does not know about onnxruntime-web or
+// ONNX graphs beyond raw byte buffers -- webgpu_custom_kernel_runtime.mjs is
+// what splices a dispatch like this into an actual onnxruntime-web session
+// (so a flagged node runs through here instead of ORT-web's own WebGPU
+// kernel), via ORT-web's own GPU-buffer IO binding to avoid a CPU
+// round-trip; see that module's own docstring.
 //
 // Why *program* (steps, plural) rather than one kernel: onnxsim.webgpu_tinygrad_codegen
 // generates specs from real tinygrad Tensor graphs, and tinygrad's own
@@ -22,10 +21,19 @@
 // onnxsim/webgpu_kernel_metadata.py's docstring for the full schema this
 // module consumes.
 //
+// dispatchWebgpuProgram's own `profile: true` option times each step on the
+// GPU itself (see its own docstring for the two WebGPU timestamp-query
+// mechanisms it picks between, matching what onnxruntime-web's own WebGPU EP
+// profiling does) -- useful for comparing a generated kernel's own cost
+// against onnxruntime-web's per-kernel profiling numbers for the node it
+// replaced.
+//
 // webgpu_kernel_dispatcher.test.mjs exercises this against a real WebGPU
 // device (via Playwright/Chromium, the same way the other webgpu_*.test.mjs
 // files in this directory do) with a real elementwise-add WGSL kernel,
-// checking the GPU-computed output against a plain JS reference.
+// checking the GPU-computed output against a plain JS reference, and (when
+// the device supports it) that profiling reports a real, non-negative
+// duration.
 
 /**
  * Resolves one binding's WebGPU resource: the caller-supplied buffer for a
@@ -118,6 +126,35 @@ function buildBindGroups(device, bindings, buffersByTensor, intermediateBuffersB
   return { bindGroupLayouts, bindGroups };
 }
 
+// The standard WebGPU timing feature (times a whole beginComputePass via its
+// own timestampWrites descriptor) and Chromium's own experimental one (times
+// arbitrary points *inside* a pass via pass.writeTimestamp(querySet, index),
+// which onnxruntime-web's WebGPU backend prefers when the adapter offers
+// both -- verified directly against the installed onnxruntime-web bundle:
+// it tries this one first and only falls back to the standard feature if
+// the adapter doesn't have it). Supporting only the standard feature would
+// leave profiling silently unavailable on exactly the device
+// webgpu_custom_kernel_runtime.mjs actually shares with onnxruntime-web in
+// that (common, Chromium) case.
+const STANDARD_TIMESTAMP_FEATURE = "timestamp-query";
+const CHROMIUM_INSIDE_PASSES_TIMESTAMP_FEATURE = "chromium-experimental-timestamp-query-inside-passes";
+
+/**
+ * Whether ``device`` can report per-step GPU timings for
+ * ``dispatchWebgpuProgram``'s ``profile: true`` option -- i.e. whether it was
+ * created with the standard ``"timestamp-query"`` feature or Chromium's own
+ * ``"chromium-experimental-timestamp-query-inside-passes"`` one (see the
+ * constants above). A device's own feature set is fixed at
+ * ``requestDevice()`` time and can't be added afterward, so this is a
+ * read-only check, not something a caller can turn on later.
+ *
+ * @param {GPUDevice} device
+ * @returns {boolean}
+ */
+export function supportsWebgpuProfiling(device) {
+  return device.features.has(STANDARD_TIMESTAMP_FEATURE) || device.features.has(CHROMIUM_INSIDE_PASSES_TIMESTAMP_FEATURE);
+}
+
 /**
  * Runs every step of ``spec`` in order, on one command encoder, against
  * ``buffersByTensor``.
@@ -137,21 +174,56 @@ function buildBindGroups(device, bindings, buffersByTensor, intermediateBuffersB
  *        ``readBackFloat32Buffer`` below for convenience wrappers a caller
  *        (or a test) can use to do so. Buffers for ``intermediate`` and
  *        ``constant`` bindings are created and destroyed internally.
- * @returns {Promise<void>} resolves once every step has run and this
- *        program's own intermediate/constant buffers have been freed --
- *        always awaited internally (unlike a single dispatch, a program
- *        owns temporary buffers it must not destroy before the GPU is done
- *        with them, so there is no "skip the wait" option here).
+ * @param {{profile?: boolean}} [options] - pass ``profile: true`` to time
+ *        each step on the GPU itself, via whichever of the two timestamp
+ *        query mechanisms ``device`` was created with (see
+ *        ``supportsWebgpuProfiling``'s own docstring): the standard
+ *        ``"timestamp-query"`` feature (``beginComputePass({timestampWrites})``)
+ *        or Chromium's ``"...-inside-passes"`` one
+ *        (``pass.writeTimestamp(querySet, index)``), the same two
+ *        primitives onnxruntime-web's own WebGPU EP profiling picks between
+ *        (it prefers the Chromium one when the adapter has it), so the
+ *        reported durations are directly comparable to onnxruntime-web's
+ *        own per-kernel profiling numbers either way. Silently produces no
+ *        timings (rather than throwing) when the device has neither --
+ *        check ``supportsWebgpuProfiling(device)`` first if the caller
+ *        needs to know why, or just check ``result.timings === null``.
+ * @returns {Promise<{timings: Array<{index: number, entryPoint: string, durationNs: number}> | null}>}
+ *        resolves once every step has run and this program's own
+ *        intermediate/constant buffers have been freed -- always awaited
+ *        internally (unlike a single dispatch, a program owns temporary
+ *        buffers it must not destroy before the GPU is done with them, so
+ *        there is no "skip the wait" option here). ``timings`` is ``null``
+ *        unless ``options.profile`` was true *and* the device supports it;
+ *        otherwise one entry per step, in step order, each a real
+ *        GPU-measured wall-clock duration in nanoseconds (per the WebGPU
+ *        spec's ``timestamp-query`` semantics -- browsers may coarsen the
+ *        actual resolution for timing-attack mitigation, but the unit is
+ *        always nanoseconds).
  */
-export async function dispatchWebgpuProgram(device, spec, buffersByTensor) {
+export async function dispatchWebgpuProgram(device, spec, buffersByTensor, options = {}) {
+  const useStandardTimestamps = !!options.profile && device.features.has(STANDARD_TIMESTAMP_FEATURE);
+  const useChromiumInsidePassesTimestamps =
+    !!options.profile && !useStandardTimestamps && device.features.has(CHROMIUM_INSIDE_PASSES_TIMESTAMP_FEATURE);
+  const profile = useStandardTimestamps || useChromiumInsidePassesTimestamps;
+
   const intermediateBuffersByName = new Map();
   for (const [name, byteLength] of Object.entries(spec.intermediates || {})) {
     intermediateBuffersByName.set(name, device.createBuffer({ size: byteLength, usage: GPUBufferUsage.STORAGE }));
   }
   const constantBufferCache = new Map();
 
+  // One "timestamp" query pair (begin, end) per step -- see
+  // https://www.w3.org/TR/webgpu/#timestamp-query for why every count here
+  // is doubled (each pass writes two u64 timestamps, not one). Both
+  // timestamp mechanisms below share this same query set/layout; they only
+  // differ in *how* each pair gets written.
+  const querySet = profile
+    ? device.createQuerySet({ type: "timestamp", count: spec.steps.length * 2 })
+    : null;
+
   const encoder = device.createCommandEncoder();
-  for (const step of spec.steps) {
+  spec.steps.forEach((step, index) => {
     const shaderModule = device.createShaderModule({ code: step.wgsl });
     const { bindGroupLayouts, bindGroups } = buildBindGroups(
       device,
@@ -166,18 +238,61 @@ export async function dispatchWebgpuProgram(device, spec, buffersByTensor) {
       compute: { module: shaderModule, entryPoint: step.entry_point },
     });
 
-    const pass = encoder.beginComputePass();
+    // The standard feature times the pass via its own timestampWrites
+    // descriptor, fixed at beginComputePass() time; the Chromium one has no
+    // such descriptor at all -- it times arbitrary points *inside* the pass
+    // via explicit writeTimestamp() calls, so those go immediately after
+    // the pass starts and immediately before it ends instead.
+    const passDescriptor = useStandardTimestamps
+      ? { timestampWrites: { querySet, beginningOfPassWriteIndex: index * 2, endOfPassWriteIndex: index * 2 + 1 } }
+      : {};
+    const pass = encoder.beginComputePass(passDescriptor);
+    if (useChromiumInsidePassesTimestamps) pass.writeTimestamp(querySet, index * 2);
     pass.setPipeline(pipeline);
     bindGroups.forEach((bindGroup, groupIndex) => pass.setBindGroup(groupIndex, bindGroup));
     const [x, y, z] = step.dispatch;
     pass.dispatchWorkgroups(x, y, z);
+    if (useChromiumInsidePassesTimestamps) pass.writeTimestamp(querySet, index * 2 + 1);
     pass.end();
+  });
+
+  let queryReadback = null;
+  let resolveBuffer = null;
+  if (profile) {
+    resolveBuffer = device.createBuffer({
+      size: querySet.count * 8, // one u64 (BigInt64Array element) per timestamp
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+    });
+    queryReadback = device.createBuffer({
+      size: resolveBuffer.size,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    encoder.resolveQuerySet(querySet, 0, querySet.count, resolveBuffer, 0);
+    encoder.copyBufferToBuffer(resolveBuffer, 0, queryReadback, 0, resolveBuffer.size);
   }
+
   device.queue.submit([encoder.finish()]);
   await device.queue.onSubmittedWorkDone();
 
+  let timings = null;
+  if (profile) {
+    await queryReadback.mapAsync(GPUMapMode.READ);
+    const raw = new BigInt64Array(queryReadback.getMappedRange().slice(0));
+    queryReadback.unmap();
+    queryReadback.destroy();
+    resolveBuffer.destroy();
+    querySet.destroy();
+    timings = spec.steps.map((step, index) => ({
+      index,
+      entryPoint: step.entry_point,
+      durationNs: Number(raw[index * 2 + 1] - raw[index * 2]),
+    }));
+  }
+
   for (const buffer of intermediateBuffersByName.values()) buffer.destroy();
   for (const buffer of constantBufferCache.values()) buffer.destroy();
+
+  return { timings };
 }
 
 /**

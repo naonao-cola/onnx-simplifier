@@ -86,10 +86,28 @@ const DTYPE_BYTES = { float32: 4, float16: 2, int32: 4, uint32: 4, uint8: 1, boo
  *        and to wrap them as `ort.Tensor.fromGpuBuffer` for `post`).
  * @param {string[]} args.finalOutputNames - names to read back from `post`.
  * @param {object} [args.sessionOptions]
- * @returns {Promise<Object<string, InstanceType<object>>>} `post`'s outputs
- *        for `finalOutputNames`, as ordinary onnxruntime-web `ort.Tensor`s
- *        (CPU-resident by default -- pass `postSessionOptions` overrides
- *        via `sessionOptions` if a caller wants to keep chaining on GPU).
+ * @param {boolean} [args.profile] - time the excised node's own program on
+ *        the GPU via `dispatchWebgpuProgram`'s own `profile` option -- see
+ *        that function's own docstring for the two timestamp-query
+ *        mechanisms it picks between and why it's normally available here
+ *        for free (onnxruntime-web's WebGPU backend requests one of them
+ *        unconditionally when the adapter supports it, and this runtime
+ *        shares *that* device -- verified this is usually the Chromium one,
+ *        not the standard one, which is exactly why `dispatchWebgpuProgram`
+ *        supports both rather than only the standard feature). Adds
+ *        negligible overhead when `false` (the default) -- no query set is
+ *        created at all.
+ * @returns {Promise<{outputs: Object<string, InstanceType<object>>, profiling: Array<{index: number, entryPoint: string, durationNs: number}> | null}>}
+ *        `outputs` are `post`'s results for `finalOutputNames`, as ordinary
+ *        onnxruntime-web `ort.Tensor`s (CPU-resident by default -- pass
+ *        `postSessionOptions` overrides via `sessionOptions` if a caller
+ *        wants to keep chaining on GPU). `profiling` is `null` unless
+ *        `profile: true` was passed *and* the shared device supports
+ *        `"timestamp-query"` (a caller who needs to tell "didn't ask" apart
+ *        from "device can't do it" can check
+ *        `webgpu_kernel_dispatcher.mjs`'s own `supportsWebgpuProfiling(await
+ *        ort.env.webgpu.device)`) -- otherwise one entry per program step,
+ *        in step order, matching `dispatchWebgpuProgram`'s own return shape.
  */
 export async function runOnnxModelWithCustomKernel({
   ort,
@@ -101,6 +119,7 @@ export async function runOnnxModelWithCustomKernel({
   nodeOutputs,
   finalOutputNames,
   sessionOptions = { executionProviders: ["webgpu"], graphOptimizationLevel: "disabled" },
+  profile = false,
 }) {
   // preferredOutputLocation is a *session-creation* option (SessionOptions),
   // not a per-run one (RunOptions) -- passing it to run() instead silently
@@ -143,7 +162,7 @@ export async function runOnnxModelWithCustomKernel({
     );
   }
 
-  await dispatchWebgpuProgram(device, spec, buffersByTensor);
+  const { timings } = await dispatchWebgpuProgram(device, spec, buffersByTensor, { profile });
 
   const available = { ...feeds };
   for (const { name, dims, dataType } of nodeOutputs) {
@@ -160,5 +179,5 @@ export async function runOnnxModelWithCustomKernel({
 
   await preSession.release?.();
   await postSession.release?.();
-  return outputs;
+  return { outputs, profiling: timings };
 }

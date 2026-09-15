@@ -45,12 +45,14 @@ Six pieces, one per language/language-boundary:
   backward-compatibility rules guarantee never change.
 - **`scripts/convertmodel/webgpu_kernel_dispatcher.mjs`** -- compiles and
   dispatches every step of a program in order, on one command encoder:
-  `dispatchWebgpuProgram(device, spec, buffersByTensor)` creates the bind
-  group layout(s)/pipeline for each step, allocates and frees any
+  `dispatchWebgpuProgram(device, spec, buffersByTensor, {profile})` creates
+  the bind group layout(s)/pipeline for each step, allocates and frees any
   `intermediate`/`constant` buffers the program needs for its own run, and
   always awaits completion before returning. Also has small
   `createStorageBuffer`/`readBackFloat32Buffer` helpers for
-  uploading/downloading a `Float32Array`.
+  uploading/downloading a `Float32Array`, and `supportsWebgpuProfiling(device)`
+  / the `profile: true` option itself for per-step GPU timing -- see
+  "Profiling" below.
 - **`onnxsim/webgpu_custom_kernel_runtime.py`** -- `split_around_node(model,
   node_name)` splits a model into a `(pre, post)` pair with the named node
   physically excised from both, reusing `onnxsim.vitisai_target.split_model`
@@ -68,7 +70,70 @@ Six pieces, one per language/language-boundary:
   program between them via `dispatchWebgpuProgram`, using
   `preferredOutputLocation: 'gpu-buffer'` and `Tensor.fromGpuBuffer` (the
   same GPU-buffer interop `onnxruntime-web` itself uses for chaining
-  sessions) so the split point never touches the CPU.
+  sessions) so the split point never touches the CPU. Its own `profile: true`
+  option forwards straight through to `dispatchWebgpuProgram`, returning
+  `{outputs, profiling}` instead of just `outputs`.
+
+## Profiling
+
+`dispatchWebgpuProgram(device, spec, buffersByTensor, {profile: true})`
+times each step on the GPU itself and returns
+`{timings: [{index, entryPoint, durationNs}, ...] | null}` -- `null` when
+`device` can't do it (check `supportsWebgpuProfiling(device)` to tell
+"didn't ask" apart from "device can't"). It uses whichever of two real
+WebGPU timestamp-query mechanisms `device` was actually created with --
+verified directly against a real WebGPU device, not assumed from the spec:
+
+- The standard `"timestamp-query"` feature: `beginComputePass({timestampWrites})`.
+- Chromium's own `"chromium-experimental-timestamp-query-inside-passes"`:
+  explicit `pass.writeTimestamp(querySet, index)` calls just inside the pass.
+
+Both are the *same* two primitives `onnxruntime-web`'s own WebGPU EP
+profiling picks between, so the durations this reports are directly
+comparable to `onnxruntime-web`'s own per-kernel numbers for the node a
+generated kernel replaced. The Chromium fallback matters in practice, not
+just in theory: verified against a real (SwiftShader) WebGPU device that
+`onnxruntime-web`'s WebGPU backend requests the Chromium feature over the
+standard one whenever the adapter offers both (checked directly against the
+installed `onnxruntime-web` bundle's own source) -- so the device
+`webgpu_custom_kernel_runtime.mjs` shares with `onnxruntime-web` normally
+has *only* the Chromium feature, not the standard one, and profiling a
+kernel spliced into a real `onnxruntime-web` session would silently report
+no timings at all without this fallback.
+
+## Could the codegen itself run client-side (Pyodide)?
+
+`onnxsim.webgpu_tinygrad_codegen`'s `generate_*` functions run server-side
+today (Python, via a CLI or offline script). Whether tinygrad's own
+Tensor -> UOp -> WGSL pipeline *could* instead run inside the WASM converter
+UI itself, via [Pyodide](https://pyodide.org/), was an open question --
+`scripts/convertmodel/test/pyodide_tinygrad_codegen.test.mjs` answers it:
+yes, verified directly, for both an elementwise case and Conv3D. It does
+this in plain Node (Pyodide runs standalone via its own bundled WASM build,
+no browser or GPU needed) by fetching tinygrad's wheel straight from PyPI
+and unpacking it into Pyodide's own filesystem -- deliberately skipping
+`micropip`/Pyodide's own package CDN, which numpy would otherwise need
+(numpy has no pure-Python wheel on PyPI; it needs a real wasm32 build only
+Pyodide's own index carries). Building each `Tensor` from a plain (possibly
+nested) Python list instead of a numpy array, and never calling
+`.numpy()`/`.realize()`, keeps numpy out of `sys.modules` for the whole
+codegen path -- checked directly, not assumed, for both cases.
+
+This is **not** the same claim as "`webgpu_tinygrad_codegen.py` runs
+unmodified inside Pyodide": that module still imports `numpy` at module
+level for its own convenience (random dummy data for scheduling, reading a
+real initializer's bytes via `onnx.numpy_helper`), and hasn't itself been
+run inside Pyodide. What's proven is that the underlying tinygrad machinery
+those functions build on has no fundamental barrier to running client-side.
+Turning that into an actual in-browser "generate a kernel for this model,
+live" feature would still need either a numpy-free rewrite of the
+ONNX-tensor-reading parts (raw `initializer.raw_data` bytes are plain
+packed floats, readable with the stdlib `struct`/`array` modules) or numpy
+loaded the normal way (which works fine in a real browser's Pyodide --
+Pyodide's package CDN is only unreachable in network-restricted sandboxes
+like the one this was first verified in, not in general), plus a JS port of
+`onnxsim.webgpu_target`'s gap-detection to decide *when* to invoke it. Both
+are un-built follow-ups, not done here.
 
 ## What this does not do (yet)
 
@@ -124,7 +189,9 @@ picking the wrong one would silently produce a working-but-wrong kernel.
   node metadata and runs it on a real WebGPU device (Playwright/Chromium,
   same requirement and SwiftShader caveat as
   `webgpu_attention_placement.test.mjs`), checking the GPU output against a
-  plain-JS reference. Runs in
+  plain-JS reference, and (requesting `"timestamp-query"` explicitly at
+  device creation, so the check is meaningful rather than skipped) that
+  `profile: true` reports a real non-negative GPU duration. Runs in
   `.github/workflows/convertmodel-webgpu-kernel-dispatcher.yml`.
 - `scripts/convertmodel/test/webgpu_tinygrad_codegen.test.mjs` -- same idea,
   but for the actual WGSL `webgpu_tinygrad_codegen` generates (Conv3D,
@@ -137,7 +204,11 @@ picking the wrong one would silently produce a working-but-wrong kernel.
   GPU-buffer output is spliced into a tinygrad-generated Conv3D program, and
   that result is spliced into a second real `onnxruntime-web` WebGPU
   session (`post`) -- checked against `onnx.reference.ReferenceEvaluator`
-  running the *original*, unsplit model. Runs in the same workflow.
+  running the *original*, unsplit model, with `profile: true` passed through
+  end to end (this is the test that actually exercises the Chromium
+  timestamp-query fallback described above, since it shares
+  `onnxruntime-web`'s own device rather than creating one itself). Runs in
+  the same workflow.
 - `scripts/convertmodel/test/make_webgpu_kernel_fixture.py`,
   `make_webgpu_tinygrad_codegen_fixture.py`, and
   `make_webgpu_custom_kernel_runtime_fixture.py` regenerate the fixtures the
