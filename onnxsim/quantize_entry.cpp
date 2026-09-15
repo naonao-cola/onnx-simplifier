@@ -221,6 +221,13 @@ onnx::ModelProto ApplyGgufQ8_0(const onnx::ModelProto& model) {
       model, std::vector<std::string>{"gguf_q8_0"});
 }
 
+onnx::ModelProto ApplyGgufQ2K(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"gguf_q2_k"});
+}
+
 onnx::ModelProto ApplyGgufTernaryQuant(const onnx::ModelProto& model) {
   PrepareSchemasForDebug(model);
   onnxsim::RegisterCustomOptimizerPasses();

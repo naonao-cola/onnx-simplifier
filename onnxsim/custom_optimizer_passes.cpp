@@ -56,6 +56,7 @@
 #include "passes/gemm_transa_to_transpose.h"
 #include "passes/gguf_legacy_quant.h"
 #include "passes/gguf_legacy_quant_5bit.h"
+#include "passes/gguf_q2_k.h"
 #include "passes/gguf_q6_k.h"
 #include "passes/gguf_q8_0.h"
 #include "passes/gguf_ternary_quant.h"
@@ -177,6 +178,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseRope>(registry);
     RegisterOrReplace<p::FuseSplitGatherConcat>(registry);
     RegisterOrReplace<p::GemmTransAToTranspose>(registry);
+    RegisterOrReplace<p::GgufQ2K>(registry);
     RegisterOrReplace<p::GgufQ4_0>(registry);
     RegisterOrReplace<p::GgufQ4_1>(registry);
     RegisterOrReplace<p::GgufQ5_0>(registry);
