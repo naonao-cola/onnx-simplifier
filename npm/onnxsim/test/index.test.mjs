@@ -25,6 +25,7 @@ import {
   applyEmbeddingVocabMagnitudePruning,
   applyEmbeddingVocabPruning,
   applyGgufQ4_0,
+  applyGgufQ5_0,
   applyIq4Nl,
   applyMoeExpertChannelPruning,
   applyOutlierSuppression,
@@ -135,6 +136,7 @@ try {
       applyDoubleQuantization,
       applyIq4Nl,
       applyGgufQ4_0,
+      applyGgufQ5_0,
     ]) {
       const out = await fn(input);
       assert.ok(out instanceof Uint8Array, fn.name);

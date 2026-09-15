@@ -674,6 +674,18 @@ onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufQ4_0(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufQ4_1(const onnx::ModelProto& model);
 
+// llama.cpp's legacy GGUF Q5_0/Q5_1 block formats -- C++ port of
+// gguf_legacy_quant_5bit.py's own apply_gguf_q5_0_quantization/
+// apply_gguf_q5_1_quantization, the same scheme as
+// ApplyGgufQ4_0/ApplyGgufQ4_1 above, one bit wider (code in [0, 31]). See
+// passes/gguf_legacy_quant_5bit.h for the exact reconstruction formulas
+// and the same ACCEPTED, PERMANENT DIVERGENCE note (with s/Q4/Q5/) --
+// ApplyGgufQ5_0/ApplyGgufQ5_1 and their _cpp Python wrappers and
+// apply_gguf_q5_0_quantization/apply_gguf_q5_1_quantization are
+// independently-correct, non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyGgufQ5_0(const onnx::ModelProto& model);
+onnx::ModelProto ApplyGgufQ5_1(const onnx::ModelProto& model);
+
 // BitNet b1.58's published absmean ternary weight quantization (Ma et al.,
 // 2024, "The Era of 1-bit LLMs"), as shipped by llama.cpp's GGUF
 // TQ1_0/TQ2_0 tensor types -- C++ port of gguf_ternary_quant.py's own
