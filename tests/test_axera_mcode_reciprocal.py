@@ -335,25 +335,28 @@ class TestZpXImmediateRegion(unittest.TestCase):
     35, 40. Diffing the region 28-32 bytes *before* site A (offsets
     ~1092-1100, i.e. immediately preceding the frame ``84 22 .. 84 24 ..``
     that leads into site A's own preamble) shows a variable-width field that
-    changes with the sweep and separates into (at least) two regimes:
+    changes with the sweep and separates into three forms -- see
+    ``TestZpXLiteralByteWhenPresent`` below for which zp_x values land in
+    which form; it is not purely magnitude-gated:
 
     - zp_x=0: a fixed 3-byte tail ``00 10 84`` (no extra immediate).
-    - zp_x <= 32: a shorter, register-allocation-looking form (tag ``0x83``
-      or ``0xa1`` depending on the exact value) whose payload does not
-      decode as zp_x under any hypothesis tried here.
-    - zp_x >= 33: a 6-byte unit ``02 10 1b <zp_x> 83 36`` whose third
-      payload byte *is* zp_x, verbatim -- see
-      ``TestZpXLiteralByteWhenPresent`` below, which resolves that
-      regime completely.
+    - The ``02 10 1b <zp_x> 83 36`` literal form (some zp_x, see below).
+    - Two other forms (tag ``0x83`` or ``0xa1``) this class still pins
+      as raw bytes without a decode.
 
-    This class keeps pinning the zp_x <= 32 regime (raw bytes only, no
-    claimed decode) since it is still open; the >= 33 regime that used to be
-    documented as undecoded here has moved to the resolved class below.
-    Most likely explanation for the <= 32 forms: compiler
-    immediate-packing/register-allocation choice rather than a literal
-    encoding of zp_x directly -- consistent with the other "residual,
-    unmodeled" bytes already documented for this stream (module docstring,
-    and ``scripts/axera/README.md``'s "Files" section).
+    The two non-literal forms' own varying byte is a *deterministic*
+    function of zp_x alone -- confirmed by rebuilding zp_x=9 with three
+    wildly different y calibration ranges (y_scale 0.000193 to 0.019528,
+    a 100x span) and getting the identical byte (``0x2c``) every time, so
+    it is not register-allocation noise tied to incidental build context
+    (an earlier, reasonable-sounding guess this rules out) -- but no
+    formula tried (linear, affine, XOR, byte-reversal, mod-256 arithmetic
+    on zp_x) reproduces it from zp_x. Most likely explanation: a lookup
+    table or fixed-point reciprocal-style computation elsewhere in the
+    S-unit ISA that this project hasn't reverse-engineered yet, consistent
+    with the other "residual, unmodeled" bytes already documented for this
+    stream (module docstring, and ``scripts/axera/README.md``'s "Files"
+    section).
     """
 
     # fixture: (x_scale, region bytes at [1090:1090+len], zp_x)
@@ -406,6 +409,23 @@ class TestZpXImmediateRegion(unittest.TestCase):
             self.assertEqual(len(found), 4, f"{name}: site A hits")
             strides = {b - a for a, b in zip(found, found[1:])}
             self.assertEqual(strides, {8}, f"{name}: site A stride")
+
+    def test_zp9_opaque_byte_is_y_independent(self):
+        # mul_1x8_zp9_narrowy: same zp_x=9 (same x shift) as
+        # mul_1x8_zp9sweep, but y's calibration range is 0.9-1.1 instead of
+        # 0-2 (y_scale 0.000784 vs 0.007806, a 10x difference). The opaque
+        # byte at this slot is identical either way -- the CSE/incidental
+        # register-allocation guess in the docstring above would predict
+        # otherwise, since the two builds share nothing about y.
+        zp9_region = self.CASES["mul_1x8_zp9sweep.mcode.gz"][1]
+        data = load("mul_1x8_zp9_narrowy.mcode.gz")
+        self.assertIn(
+            zp9_region,
+            data,
+            "mul_1x8_zp9_narrowy: the zp_x=9 opaque region changed when only"
+            " y's calibration range changed -- the determinism claim in the"
+            " docstring above needs re-examining",
+        )
 
 
 class TestZpXLiteralByteWhenPresent(unittest.TestCase):
