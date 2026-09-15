@@ -1212,7 +1212,11 @@ def _grad_identity(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optiona
     return [g]
 
 
-# Reference-only: _RULES wires "Relu" to _grad_relu_templated instead.
+# Not templated, deliberately: see generate_grad_templates.py's own comment
+# beside where a GradRelu used to be for why (its Cast's dtype has to stay
+# visible, and mutable, to onnxsim.compile_training._cast_backward_to_fp16
+# before inlining -- a templated rule hides it inside an uninlined call
+# until much later).
 def _grad_relu(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
     # The subgradient at exactly 0 is taken as 0 (strict Greater), matching
     # the straight-through masks adaround.py already builds.
@@ -2174,20 +2178,24 @@ _MULTI_OUTPUT_RULES: Dict[str, MultiOutputRule] = {
 # tests/test_graph_grad_templates.py, which checks GradBatchNormalization
 # against torch.autograd) before graduating to production; :data:`_RULES`
 # below now also wires every elementwise/broadcasting rule whose forward op
-# is in BACKWARD_OPS's coverage already -- Neg, Exp, Sqrt, Log, Sigmoid,
-# Tanh, Erf, Relu, Mul, Div -- the same way. Each hand-written
-# `_grad_*` above is no longer reachable through :data:`_RULES`, but is kept,
-# deliberately, as an independent reference implementation:
-# tests/test_graph_grad_templates.py still cross-checks every templated
-# rule's numbers against its hand-written counterpart on the same inputs,
-# which is exactly the kind of regression check that caught this repo's own
-# dvar-derivation bug in the first place and would otherwise be lost by
-# deleting the hand-written code. Left hand-written: `_grad_sub` (its only
-# "arithmetic" is a single ``Neg``, applied after ``reduce_to`` rather than
-# before so it runs on the smaller, already-reduced tensor -- an ordering a
-# template called *before* the reduction would lose) and every rule whose
-# core math is inseparable from shape/attribute resolution (`Conv`, `Gemm`,
-# pooling, `Reshape`/`Transpose`, the reductions, the normalizations, ...).
+# is in BACKWARD_OPS's coverage already and whose VJP needs no dtype-specific
+# node of its own -- Neg, Exp, Sqrt, Log, Sigmoid, Tanh, Erf, Mul, Div -- the
+# same way. Each hand-written `_grad_*` above is no longer reachable through
+# :data:`_RULES`, but is kept, deliberately, as an independent reference
+# implementation: tests/test_graph_grad_templates.py still cross-checks every
+# templated rule's numbers against its hand-written counterpart on the same
+# inputs, which is exactly the kind of regression check that caught this
+# repo's own dvar-derivation bug in the first place and would otherwise be
+# lost by deleting the hand-written code. Left hand-written: `_grad_sub` (its
+# only "arithmetic" is a single ``Neg``, applied after ``reduce_to`` rather
+# than before so it runs on the smaller, already-reduced tensor -- an
+# ordering a template called *before* the reduction would lose), `_grad_relu`
+# (its mask ``Cast``'s target dtype has to stay a visible, mutable node for
+# onnxsim.compile_training._cast_backward_to_fp16 to retarget before
+# inlining -- see generate_grad_templates.py's own comment on this), and
+# every rule whose core math is inseparable from shape/attribute resolution
+# (`Conv`, `Gemm`, pooling, `Reshape`/`Transpose`, the reductions, the
+# normalizations, ...).
 
 
 @functools.lru_cache(maxsize=None)
@@ -2324,14 +2332,6 @@ def _grad_erf_templated(
     return [dx]
 
 
-def _grad_relu_templated(
-    ctx: _Backward, node: onnx.NodeProto, g: str
-) -> List[Optional[str]]:
-    fn = _load_template(_templates.GRAD_RELU)
-    (dx,) = ctx.b.call(fn, [g, node.input[0], ctx.b.const(0.0)])
-    return [dx]
-
-
 def _grad_mul_templated(
     ctx: _Backward, node: onnx.NodeProto, g: str
 ) -> List[Optional[str]]:
@@ -2378,7 +2378,7 @@ _RULES: Dict[str, Rule] = {
     "Neg": _grad_neg_templated,
     "ReduceMean": _grad_reduce,
     "ReduceSum": _grad_reduce,
-    "Relu": _grad_relu_templated,
+    "Relu": _grad_relu,
     "Reshape": _grad_reshape,
     "Sigmoid": _grad_sigmoid_templated,
     "Softmax": _grad_softmax,

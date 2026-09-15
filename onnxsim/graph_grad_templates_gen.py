@@ -117,17 +117,6 @@ GradErf (g, x, c) => (dx)
    [n4] dx = Mul (g, dy)
 }"""
 
-GRAD_RELU = """<
-  domain: "onnxsim.grad",
-  opset_import: ["" : 17]
->
-GradRelu (g, x, zero) => (dx)
-{
-   [n0] tmp = Greater (x, zero)
-   [n1] mask = Cast <to: int = 1> (tmp)
-   [n2] dx = Mul (g, mask)
-}"""
-
 GRAD_MUL = """<
   domain: "onnxsim.grad",
   opset_import: ["" : 17]

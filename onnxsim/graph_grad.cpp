@@ -1102,7 +1102,12 @@ std::vector<OptStr> GradIdentity(Backward& ctx, const onnx::NodeProto& node,
   return {g};
 }
 
-// Reference-only: Rules() wires "Relu" to GradReluTemplated instead.
+// Not templated, deliberately: see generate_grad_templates.py's own comment
+// (beside where a GradRelu template used to be) for why -- its Cast's target
+// dtype has to stay a visible, mutable node for a caller's own
+// precision-conversion pass (the Python side has one, in
+// onnxsim/compile_training.py's _cast_backward_to_fp16) to retarget before
+// inlining, which a call to an uninlined "onnxsim.grad" function would hide.
 std::vector<OptStr> GradRelu(Backward& ctx, const onnx::NodeProto& node,
                              const std::string& g) {
   // The subgradient at exactly 0 is taken as 0 (strict Greater), matching the
@@ -1861,15 +1866,17 @@ std::vector<OptStr> GradBatchNormalizationTemplated(Backward& ctx,
   return {outs[0], outs[1], outs[2], outs[3], outs[4]};
 }
 
-// GradNeg/GradExp/GradSqrt/GradLog/GradSigmoid/GradTanh/GradErf/GradRelu/
-// GradMul/GradDiv above are no longer reachable through Rules() either --
-// same pattern as GradAdd/GradBatchNormalization, extended to every
+// GradNeg/GradExp/GradSqrt/GradLog/GradSigmoid/GradTanh/GradErf/GradMul/
+// GradDiv above are no longer reachable through Rules() either -- same
+// pattern as GradAdd/GradBatchNormalization, extended to every
 // elementwise/broadcasting rule whose forward op was already inside
-// BackwardOps()'s coverage. See generate_grad_templates.py for each
-// template's derivation and graph_grad.py's "Templated rules" section
-// comment for why GradSub stays hand-written (its only arithmetic is a
-// single Neg, applied after ReduceTo rather than before to run on the
-// smaller, already-reduced tensor).
+// BackwardOps()'s coverage and whose VJP needs no dtype-specific node of its
+// own. See generate_grad_templates.py for each template's derivation and
+// graph_grad.py's "Templated rules" section comment for why GradSub
+// (its only arithmetic is a single Neg, applied after ReduceTo rather than
+// before to run on the smaller, already-reduced tensor) and GradRelu (its
+// mask Cast's target dtype has to stay visible and mutable to a caller's own
+// precision-conversion pass before inlining) both stay hand-written.
 
 const onnx::FunctionProto& GradNegTemplate() {
   static const onnx::FunctionProto* fn = [] {
@@ -2019,28 +2026,6 @@ std::vector<OptStr> GradErfTemplated(Backward& ctx, const onnx::NodeProto& node,
   return {outs[0]};
 }
 
-const onnx::FunctionProto& GradReluTemplate() {
-  static const onnx::FunctionProto* fn = [] {
-    auto* proto = new onnx::FunctionProto();
-    const auto status = onnx::OnnxParser::Parse(*proto, kGradReluTemplate);
-    if (!status.IsOK()) {
-      throw std::logic_error("failed to parse the GradRelu template: " +
-                             status.ErrorMessage());
-    }
-    return proto;
-  }();
-  return *fn;
-}
-
-std::vector<OptStr> GradReluTemplated(Backward& ctx,
-                                      const onnx::NodeProto& node,
-                                      const std::string& g) {
-  const std::string zero = ctx.b().Const(0.0f);
-  const std::vector<std::string> outs =
-      ctx.b().Call(GradReluTemplate(), {g, node.input(0), zero});
-  return {outs[0]};
-}
-
 const onnx::FunctionProto& GradMulTemplate() {
   static const onnx::FunctionProto* fn = [] {
     auto* proto = new onnx::FunctionProto();
@@ -2115,7 +2100,7 @@ const std::map<std::string, Rule>& Rules() {
           {"Neg", &GradNegTemplated},
           {"ReduceMean", &GradReduce},
           {"ReduceSum", &GradReduce},
-          {"Relu", &GradReluTemplated},
+          {"Relu", &GradRelu},
           {"Reshape", &GradReshape},
           {"Sigmoid", &GradSigmoidTemplated},
           {"Softmax", &GradSoftmax},
@@ -2292,7 +2277,6 @@ std::map<std::string, std::string> BuildBackwardWithTemplatedRules(
   rules["Sigmoid"] = &GradSigmoidTemplated;
   rules["Tanh"] = &GradTanhTemplated;
   rules["Erf"] = &GradErfTemplated;
-  rules["Relu"] = &GradReluTemplated;
   rules["Mul"] = &GradMulTemplated;
   rules["Div"] = &GradDivTemplated;
   return BuildBackwardImpl(b, nodes, shapes, grad_outputs, targets, rules);
@@ -2313,7 +2297,6 @@ std::map<std::string, std::string> BuildBackwardWithHandWrittenRules(
   rules["Sigmoid"] = &GradSigmoid;
   rules["Tanh"] = &GradTanh;
   rules["Erf"] = &GradErf;
-  rules["Relu"] = &GradRelu;
   rules["Mul"] = &GradMul;
   rules["Div"] = &GradDiv;
   return BuildBackwardImpl(b, nodes, shapes, grad_outputs, targets, rules);

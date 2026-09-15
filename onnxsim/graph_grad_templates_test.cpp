@@ -2,18 +2,21 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Exercises graph_grad.cpp's "Templated rules" section: GradAddTemplated,
- * GradBatchNormalizationTemplated, and the ten elementwise/broadcasting
+ * GradBatchNormalizationTemplated, and the nine elementwise/broadcasting
  * rules templated alongside them (Neg, Exp, Sqrt, Log, Sigmoid, Tanh, Erf,
- * Relu, Mul, Div), which all call into checked-in onnxscript-compiled
+ * Mul, Div), which all call into checked-in onnxscript-compiled
  * FunctionProto templates (graph_grad_templates_gen.h) via GraphBuilder::Call
  * and onnx::inliner::InlineLocalFunctions (run by MakeStepGraph once a
  * builder has accumulated functions) instead of hand-emitting their nodes
- * directly. Rules() now uses these for all twelve op types in production;
+ * directly. Rules() now uses these for all eleven op types in production;
  * the original hand-written rules remain as a reference implementation,
  * reachable here via BuildBackwardWithHandWrittenRules, purely so the second
  * test below keeps an independent structural cross-check. See graph_grad.py's
  * matching section, scripts/codegen/generate_grad_templates.py, and
- * tests/test_graph_grad_templates.py for the Python side.
+ * tests/test_graph_grad_templates.py for the Python side. Relu is
+ * deliberately NOT templated -- see generate_grad_templates.py's own comment
+ * for why (a mixed-precision caller needs its mask Cast visible before
+ * inlining).
  *
  * Numeric validation is not duplicated here, for the reason graph_grad_test.cpp
  * gives for the hand-written rules: nothing in this build evaluates an ONNX
@@ -310,7 +313,7 @@ int main() {
   TheAddTemplateInlinesToAnAllowlistedGraph();
   TheBatchNormTemplateInlinesToAnAllowlistedGraph();
   for (const std::string& op :
-       {"Neg", "Exp", "Sqrt", "Log", "Sigmoid", "Tanh", "Erf", "Relu"}) {
+       {"Neg", "Exp", "Sqrt", "Log", "Sigmoid", "Tanh", "Erf"}) {
     CheckUnaryElementwiseTemplate(op);
   }
   for (const std::string& op : {"Mul", "Div"}) {

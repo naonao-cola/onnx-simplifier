@@ -80,11 +80,11 @@ case planner
   init qat__c_22 1 [] 0x40e00000
   init qat__c_27 1 [] 0x3c800000
   init qat__c_33 1 [] 0x00000000
-  init qat__beta1_40 1 [] 0x3f666666
-  init qat__beta2_41 1 [] 0x3f7fbe77
-  init qat__one_minus_beta1_42 1 [] 0x3dcccccd
-  init qat__one_minus_beta2_43 1 [] 0x3a83126f
-  init qat__eps_55 1 [] 0x322bcc77
+  init qat__beta1_42 1 [] 0x3f666666
+  init qat__beta2_43 1 [] 0x3f7fbe77
+  init qat__one_minus_beta1_44 1 [] 0x3dcccccd
+  init qat__one_minus_beta2_45 1 [] 0x3a83126f
+  init qat__eps_57 1 [] 0x322bcc77
   node Reshape [qat__scale_1,qat__i64_2] [qat__reshape_3] {}
   node Mul [qat__reshape_3,qat__ones_4] [qat__mul_5] {}
   node Reshape [qat__mul_5,qat__i64_6] [qat__reshape_7] {}
@@ -111,32 +111,31 @@ case planner
   node MatMul [qat__mul_28,qat__transpose_29] [qat__matmul_30] {}
   node Transpose [A] [qat__transpose_31] {perm=1,0}
   node MatMul [qat__transpose_31,qat__mul_28] [qat__matmul_32] {}
-  node Greater [H,qat__c_33] [tmp__1] {}
-  node Cast [tmp__1] [mask__1] {to=1}
-  node Mul [qat__matmul_30,mask__1] [qat__gradrelu_34] {}
-  node Transpose [W1] [qat__transpose_35] {perm=1,0}
-  node MatMul [qat__gradrelu_34,qat__transpose_35] [qat__matmul_36] {}
-  node Transpose [X] [qat__transpose_37] {perm=1,0}
-  node MatMul [qat__transpose_37,qat__gradrelu_34] [qat__matmul_38] {}
-  node Mul [qat__matmul_38,qat__mul_25] [qat__mul_39] {}
-  node Mul [qat__beta1_40,qat__mw0] [qat__mul_44] {}
-  node Mul [qat__one_minus_beta1_42,qat__mul_39] [qat__mul_45] {}
-  node Add [qat__mul_44,qat__mul_45] [qat__add_46] {}
-  node Mul [qat__beta2_41,qat__vw0] [qat__mul_47] {}
-  node Mul [qat__mul_39,qat__mul_39] [qat__mul_48] {}
-  node Mul [qat__one_minus_beta2_43,qat__mul_48] [qat__mul_49] {}
-  node Add [qat__mul_47,qat__mul_49] [qat__add_50] {}
-  node Mul [qat__add_46,m_correction] [qat__mul_51] {}
-  node Mul [qat__add_50,v_correction] [qat__mul_52] {}
-  node Mul [qat__lr,qat__mul_51] [qat__mul_53] {}
-  node Sqrt [qat__mul_52] [qat__sqrt_54] {}
-  node Add [qat__sqrt_54,qat__eps_55] [qat__add_56] {}
-  node Div [qat__mul_53,qat__add_56] [qat__div_57] {}
-  node Sub [qat__w0,qat__div_57] [qat__sub_58] {}
-  node Mul [qat__sub_26,qat__sub_26] [qat__mul_59] {}
-  node ReduceMean [qat__mul_59] [qat__reducemean_60] {keepdims=0}
+  node Greater [H,qat__c_33] [qat__greater_34] {}
+  node Cast [qat__greater_34] [qat__cast_35] {to=1}
+  node Mul [qat__matmul_30,qat__cast_35] [qat__mul_36] {}
+  node Transpose [W1] [qat__transpose_37] {perm=1,0}
+  node MatMul [qat__mul_36,qat__transpose_37] [qat__matmul_38] {}
+  node Transpose [X] [qat__transpose_39] {perm=1,0}
+  node MatMul [qat__transpose_39,qat__mul_36] [qat__matmul_40] {}
+  node Mul [qat__matmul_40,qat__mul_25] [qat__mul_41] {}
+  node Mul [qat__beta1_42,qat__mw0] [qat__mul_46] {}
+  node Mul [qat__one_minus_beta1_44,qat__mul_41] [qat__mul_47] {}
+  node Add [qat__mul_46,qat__mul_47] [qat__add_48] {}
+  node Mul [qat__beta2_43,qat__vw0] [qat__mul_49] {}
+  node Mul [qat__mul_41,qat__mul_41] [qat__mul_50] {}
+  node Mul [qat__one_minus_beta2_45,qat__mul_50] [qat__mul_51] {}
+  node Add [qat__mul_49,qat__mul_51] [qat__add_52] {}
+  node Mul [qat__add_48,m_correction] [qat__mul_53] {}
+  node Mul [qat__add_52,v_correction] [qat__mul_54] {}
+  node Mul [qat__lr,qat__mul_53] [qat__mul_55] {}
+  node Sqrt [qat__mul_54] [qat__sqrt_56] {}
+  node Add [qat__sqrt_56,qat__eps_57] [qat__add_58] {}
+  node Div [qat__mul_55,qat__add_58] [qat__div_59] {}
+  node Sub [qat__w0,qat__div_59] [qat__sub_60] {}
+  node Mul [qat__sub_26,qat__sub_26] [qat__mul_61] {}
+  node ReduceMean [qat__mul_61] [qat__reducemean_62] {keepdims=0}
   opset  17
-  opset onnxsim.grad 1
   ir_version 8
   graph_name onnxsim_qat_step
   input X 1 [4,32]
@@ -147,14 +146,14 @@ case planner
   input qat__lr 1 []
   input m_correction 1 []
   input v_correction 1 []
-  output qat__sub_58 1 [32,32]
-  output qat__add_46 1 [32,32]
-  output qat__add_50 1 [32,32]
-  output qat__reducemean_60 1 []
-  state qat__mw0 qat__add_46
-  state qat__vw0 qat__add_50
-  state qat__w0 qat__sub_58
-  loss qat__reducemean_60
+  output qat__sub_60 1 [32,32]
+  output qat__add_48 1 [32,32]
+  output qat__add_52 1 [32,32]
+  output qat__reducemean_62 1 []
+  state qat__mw0 qat__add_48
+  state qat__vw0 qat__add_52
+  state qat__w0 qat__sub_60
+  loss qat__reducemean_62
 case round_to_nearest
   init c_2 1 [] 0x3f000000
   node Abs [x] [abs_1] {}

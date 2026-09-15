@@ -96,6 +96,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import onnx
+import onnx.inliner
 import onnx.numpy_helper
 import onnx.shape_inference
 
@@ -954,6 +955,16 @@ class TrainingLoop:
                 _int_shape(shapes[name]),
             )
 
+        # One opset_import per distinct function domain a templated gradient
+        # rule (see graph_grad.py's "Templated rules" section) may have
+        # registered on `b`, the same way make_step_graph does -- without
+        # this, a call to e.g. GradMul is a node onnxruntime cannot resolve
+        # ("No opset import for domain 'onnxsim.grad'").
+        opset_imports = list(model.opset_import)
+        if b.functions:
+            domains = sorted({fn.domain for fn in b.functions})
+            opset_imports += [onnx.helper.make_opsetid(d, 1) for d in domains]
+
         model_inputs = [i.name for i in model.graph.input if i.name not in inits]
         fwd_model = onnx.helper.make_model(
             onnx.helper.make_graph(
@@ -964,7 +975,7 @@ class TrainingLoop:
                 [vinfo(self.loss_output)] + [vinfo(t) for t in needed],
                 list(b.initializer),
             ),
-            opset_imports=model.opset_import,
+            opset_imports=opset_imports,
             ir_version=model.ir_version,
         )
         bwd_inputs = (
@@ -996,11 +1007,17 @@ class TrainingLoop:
                 ],
                 list(b.initializer),
             ),
-            opset_imports=model.opset_import,
+            opset_imports=opset_imports,
             ir_version=model.ir_version,
         )
         for proto in (fwd_model, bwd_model):
             proto.functions.extend(b.functions)
+        if b.functions:
+            # Expand every call site before either model reaches a runtime --
+            # same reason make_step_graph does this for the fused path: no
+            # execution provider needs to know about the private grad domain.
+            fwd_model = onnx.inliner.inline_local_functions(fwd_model)
+            bwd_model = onnx.inliner.inline_local_functions(bwd_model)
         self._needed = tuple(needed)
         self._bwd_state = {k: o for k, (_, o) in state.items()}
         self._runner_fwd = backend.Runner(

@@ -135,10 +135,10 @@ def _run(model: onnx.ModelProto, output_names, feeds) -> list:
 
 
 # Every op _RULES now wires to a templated rule -- see graph_grad.py's
-# "Templated rules" section comment for why GradSub stays hand-written. Maps
-# each op type to its hand-written rule's own snake_case suffix, since that
-# is not always just the op type lowercased (``BatchNormalization`` ->
-# ``batch_normalization``).
+# "Templated rules" section comment for why GradSub and GradRelu stay
+# hand-written. Maps each op type to its hand-written rule's own snake_case
+# suffix, since that is not always just the op type lowercased
+# (``BatchNormalization`` -> ``batch_normalization``).
 _TEMPLATED_OPS = {
     "Add": "add",
     "BatchNormalization": "batch_normalization",
@@ -149,7 +149,6 @@ _TEMPLATED_OPS = {
     "Sigmoid": "sigmoid",
     "Tanh": "tanh",
     "Erf": "erf",
-    "Relu": "relu",
     "Mul": "mul",
     "Div": "div",
 }
@@ -298,8 +297,10 @@ def _check_within_allowlist(
 
 
 # One representative input per unary op, deliberately kept away from each
-# rule's own singularity (Sqrt/Log at 0, Relu's kink at 0) the same way
-# generate_grad_templates.py's own validators do.
+# rule's own singularity (Sqrt/Log at 0) the same way
+# generate_grad_templates.py's own validators do. Relu is not here: it stays
+# hand-written (see graph_grad.py's "Templated rules" section comment), so
+# it has no templated rule for this file to cross-check.
 _UNARY_CASES = {
     "Neg": np.array([[1.0, -2.0, 3.0], [4.0, -5.0, 6.0]], dtype=np.float32),
     "Exp": np.array([[0.1, -0.2, 0.3], [0.4, -0.5, 0.6]], dtype=np.float32),
@@ -308,7 +309,6 @@ _UNARY_CASES = {
     "Sigmoid": np.array([[0.1, -0.2, 0.3], [4.0, -5.0, 0.6]], dtype=np.float32),
     "Tanh": np.array([[0.1, -0.2, 0.3], [4.0, -5.0, 0.6]], dtype=np.float32),
     "Erf": np.array([[0.1, -0.2, 0.3], [4.0, -5.0, 0.6]], dtype=np.float32),
-    "Relu": np.array([[1.0, -2.0, 3.0], [4.0, -5.0, 6.0]], dtype=np.float32),
 }
 
 

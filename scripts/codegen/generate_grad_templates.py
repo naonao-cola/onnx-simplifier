@@ -203,15 +203,21 @@ def GradErf(g: FLOAT["..."], x: FLOAT["..."], c: FLOAT):
     return dx
 
 
-@script(opset=GRAD_DOMAIN)
-def GradRelu(g: FLOAT["..."], x: FLOAT["..."], zero: FLOAT):
-    """``Relu``'s VJP: mask = (x > 0) as float, dx = g * mask. The
-    subgradient at exactly 0 is taken as 0 (strict ``Greater``), matching
-    the straight-through masks ``adaround.py`` already builds and the
-    hand-written rule this templates."""
-    mask = op.Cast(op.Greater(x, zero), to=1)
-    dx = op.Mul(g, mask)
-    return dx
+# Deliberately NOT templated: Relu. Its VJP needs a Cast, whose ONNX `to`
+# attribute is a static dtype baked into the compiled FunctionProto at
+# codegen time -- fine for this module's own float32-only validation, but
+# wrong for a caller like onnxsim.compile_training's mixed-precision path
+# (backward_precision="float16"), which walks the *raw*, not-yet-inlined
+# node list looking for exactly this shape (a Greater/Less + Cast producing
+# a mask) to retarget its Cast from FLOAT to FLOAT16 before the surrounding
+# fp16 arithmetic is emitted -- see _cast_backward_to_fp16 in
+# onnxsim/compile_training.py. A templated GradRelu hides that Cast inside
+# an uninlined "onnxsim.grad" domain call until inlining happens much later
+# (MakeStepGraph/make_step_graph), by which point the retargeting pass has
+# already run and moved on -- so the mask stays FLOAT32 while the gradient
+# flowing into its multiply is FLOAT16, an invalid mixed-type graph. Keeping
+# GradRelu hand-written keeps its Cast visible to that pass, exactly like
+# every other rule.
 
 
 @script(opset=GRAD_DOMAIN)
@@ -476,25 +482,6 @@ def _validate_grad_erf() -> None:
     _assert_close_to_fd("GradErf", dx, fd)
 
 
-def _validate_grad_relu() -> None:
-    rng = np.random.default_rng(0)
-    # Kept away from 0: a central difference straddling Relu's kink would
-    # not agree with either one-sided subgradient.
-    x = (np.sign(rng.standard_normal((5,))) * (np.abs(rng.standard_normal((5,))) + 0.2)).astype(
-        np.float32
-    )
-    g = rng.standard_normal((5,)).astype(np.float32)
-    fn = GradRelu.to_function_proto()
-    onnx.checker.check_function(fn)
-    (dx,) = _run_function(
-        fn, {"g": g, "x": x, "zero": np.array(0.0, dtype=np.float32)}, {"dx": x.shape}
-    )
-    fd = _fd_grad(
-        lambda x: float(np.sum(np.maximum(x, 0.0) * g)), {"x": x.astype(np.float64)}, "x"
-    )
-    _assert_close_to_fd("GradRelu", dx, fd)
-
-
 def _validate_grad_mul() -> None:
     rng = np.random.default_rng(0)
     a = rng.standard_normal((5,)).astype(np.float32)
@@ -544,7 +531,6 @@ _ENTRIES = [
     ("GRAD_SIGMOID", "kGradSigmoidTemplate", GradSigmoid),
     ("GRAD_TANH", "kGradTanhTemplate", GradTanh),
     ("GRAD_ERF", "kGradErfTemplate", GradErf),
-    ("GRAD_RELU", "kGradReluTemplate", GradRelu),
     ("GRAD_MUL", "kGradMulTemplate", GradMul),
     ("GRAD_DIV", "kGradDivTemplate", GradDiv),
 ]
@@ -617,7 +603,6 @@ def main() -> None:
     _validate_grad_sigmoid()
     _validate_grad_tanh()
     _validate_grad_erf()
-    _validate_grad_relu()
     _validate_grad_mul()
     _validate_grad_div()
 
