@@ -110,6 +110,7 @@ export function applyGgufQ4_1(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyGgufQ5_0(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyGgufQ5_1(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyGgufQ8_0(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyGgufQ2K(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyGgufTernary(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyFp6Llm(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyGgufQ6K(model: OnnxModelBytes): Promise<Uint8Array>;
@@ -299,6 +300,7 @@ declare const _default: {
   applyGgufQ5_0: typeof applyGgufQ5_0;
   applyGgufQ5_1: typeof applyGgufQ5_1;
   applyGgufQ8_0: typeof applyGgufQ8_0;
+  applyGgufQ2K: typeof applyGgufQ2K;
   applyGgufTernary: typeof applyGgufTernary;
   applyFp6Llm: typeof applyFp6Llm;
   applyGgufQ6K: typeof applyGgufQ6K;

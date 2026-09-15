@@ -699,6 +699,21 @@ onnx::ModelProto ApplyGgufQ5_1(const onnx::ModelProto& model);
 // established scope decision.
 onnx::ModelProto ApplyGgufQ8_0(const onnx::ModelProto& model);
 
+// llama.cpp's GGUF Q2_K K-quant format -- C++ port of gguf_q2_k.py's own
+// apply_gguf_q2_k_quantization: a 256-element super-block split into 16
+// sub-blocks of 16, each with its own asymmetric affine (scale, min)
+// pair re-quantized to 4-bit codes relative to one shared super-block
+// (d, dmin) reference pair, times a 2-bit element code
+// (`dequant = d*sc_j*q - dmin*m_j`). See passes/gguf_q2_k.h for the
+// exact reconstruction formula and the same ACCEPTED, PERMANENT
+// DIVERGENCE note (with s/Q6/Q2/) -- ApplyGgufQ2K and its _cpp Python
+// wrapper and apply_gguf_q2_k_quantization are independently-correct,
+// non-interchangeable entry points, not aliases. Unlike the Python side,
+// this port does not add an include_conv option (only a constant 2-D
+// weight on MatMul/vanilla-Gemm is matched), matching gguf_q6_k.h's own
+// established scope decision.
+onnx::ModelProto ApplyGgufQ2K(const onnx::ModelProto& model);
+
 // BitNet b1.58's published absmean ternary weight quantization (Ma et al.,
 // 2024, "The Era of 1-bit LLMs"), as shipped by llama.cpp's GGUF
 // TQ1_0/TQ2_0 tensor types -- C++ port of gguf_ternary_quant.py's own
