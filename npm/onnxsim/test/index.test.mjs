@@ -31,6 +31,7 @@ import {
   applyOutlierSuppressionPlus,
   applyLlmInt8,
   applyGptq,
+  applyAdaround,
   applyQronos,
   applyTesseraq,
   applyAwq,
@@ -222,6 +223,24 @@ try {
       X: new ort.Tensor("float32", new Float32Array(32).map((_, i) => ((i * 37) % 11) - 5), [1, 32]),
     });
     const out = await applyGptq(floatModel, quantModel, [batch(), batch()], {});
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applyAdaround optimizes rounding on synthetic calibration data", async () => {
+    // Same dedicated fixtures as the GPTQ check above; a small iteration
+    // count keeps this check fast, the point being the two-model binding
+    // (including the beta_start/beta_end tuple split) round-trips, not
+    // full convergence.
+    const ort = await import("onnxruntime-web");
+    const floatModel = new Uint8Array(readFileSync(FIXTURE_GPTQ));
+    const quantModel = new Uint8Array(readFileSync(FIXTURE_GPTQ_INT4));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array(32).map((_, i) => ((i * 37) % 11) - 5), [1, 32]),
+    });
+    const out = await applyAdaround(floatModel, quantModel, [batch(), batch()], {
+      numIterations: 20,
+    });
     assert.ok(out instanceof Uint8Array);
     assert.ok(out.length > 0);
   });

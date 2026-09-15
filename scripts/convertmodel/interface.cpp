@@ -2868,6 +2868,46 @@ em::val onnxsim_apply_gptq(const std::string &float_data,
   }
 }
 
+// AdaRound (Nagel et al., 2020): a rectified-sigmoid relaxation of each
+// weight element's floor/ceil rounding decision, optimized by a
+// hand-rolled Adam loop to minimize a layer's own reconstruction error
+// against real calibration activations. Same two-model calibration-batch
+// contract and executor as onnxsim_apply_gptq's own binding above
+// (candidates are processed independently, so `executor` is invoked
+// once, up front, the same as onnxsim_apply_gptq's own). `beta_start`/
+// `beta_end` are the two ends of apply_adaround's own `beta_range`
+// tuple, split into separate parameters here since this binding layer
+// has no tuple type. See ApplyAdaround in adaround_entry.h, including
+// its own accepted numerical scope note (an iterative optimization, not
+// a closed-form computation).
+em::val onnxsim_apply_adaround(const std::string &float_data,
+                               const std::string &quantized_data,
+                               em::val calibration_batches_val,
+                               int num_iterations, double learning_rate,
+                               double reg_param, double warm_start,
+                               double beta_start, double beta_end) {
+  onnx::ModelProto float_model;
+  if (!float_model.ParseFromArray(float_data.data(), float_data.size())) {
+    std::cerr << "Parse failed (float model)" << std::endl;
+    return em::val::null();
+  }
+  onnx::ModelProto quantized_model;
+  if (!quantized_model.ParseFromArray(quantized_data.data(),
+                                      quantized_data.size())) {
+    std::cerr << "Parse failed (quantized model)" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyAdaround(
+        float_model, quantized_model, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), num_iterations,
+        learning_rate, reg_param, warm_start, beta_start, beta_end));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_adaround error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // Qronos: a sequential, whole-model generalization of onnxsim_apply_gptq
 // that additionally accounts for the error already baked into a layer's
 // activations because upstream layers were quantized first, not just
@@ -3213,6 +3253,7 @@ EMSCRIPTEN_BINDINGS(module) {
            &onnxsim_apply_outlier_suppression_plus);
   function("onnxsim_apply_llm_int8", &onnxsim_apply_llm_int8);
   function("onnxsim_apply_gptq", &onnxsim_apply_gptq);
+  function("onnxsim_apply_adaround", &onnxsim_apply_adaround);
   function("onnxsim_apply_qronos", &onnxsim_apply_qronos);
   function("onnxsim_apply_tesseraq", &onnxsim_apply_tesseraq);
   function("onnxsim_apply_awq", &onnxsim_apply_awq);

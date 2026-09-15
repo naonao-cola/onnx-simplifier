@@ -2525,6 +2525,104 @@ def apply_gptq_cpp(
     )
 
 
+def apply_adaround_cpp(
+    float_model: Union[str, onnx.ModelProto],
+    quantized_model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    num_iterations: int = 300,
+    learning_rate: float = 0.1,
+    reg_param: float = 0.01,
+    warm_start: float = 0.2,
+    beta_range: Tuple[float, float] = (20.0, 2.0),
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_adaround`: Nagel et al.
+    (2020)'s AdaRound -- a rectified-sigmoid relaxation of each weight
+    element's floor/ceil rounding decision, optimized by a hand-rolled
+    Adam loop to minimize a layer's own reconstruction error against real
+    calibration activations, rather than round-to-nearest's
+    per-element-independent choice -- see ``onnxsim/adaround.py``'s own
+    module docstring for the full technique.
+
+    Same real calibration machinery as :func:`onnxsim.apply_gptq_cpp` --
+    a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the float model in C++ (see
+    ``ApplyAdaround`` in ``adaround_entry.h`` for the full scope).
+
+    Same accepted-numerical-scope class as
+    :func:`onnxsim.apply_tesseraq_cpp` (not every other calibration-driven
+    ``*_cpp`` port in this codebase, all either closed-form or
+    closed-form-apart-from-RNG): this is an iterative Adam optimization,
+    so cross-language floating-point agreement is measured empirically
+    (see tests/test_adaround_cpp.py) rather than assumed, and this
+    function is not aliased from :func:`onnxsim.apply_adaround`.
+
+    :param float_model: the original (unquantized) onnx ModelProto or file
+            path
+    :param quantized_model: a quantized version of ``float_model`` (onnx
+            ModelProto or file path), produced by
+            :func:`onnxsim.quantize_weight_only_int4`
+    :param calibration_data: representative input batches to optimize the
+            rounding on -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied) -- this port has no RNG of
+            its own, so ``seed`` only ever affects which calibration
+            batches get generated
+    :param num_iterations: Adam steps to run per layer
+    :param learning_rate: Adam learning rate for the per-element rounding
+            relaxation
+    :param reg_param: weight of the regularization term that pulls each
+            element's relaxation toward a hard 0/1 (floor/ceil) decision
+    :param warm_start: fraction of ``num_iterations`` (from the start) run
+            with the regularization term disabled
+    :param beta_range: ``(beta_start, beta_end)`` for the regularization
+            term's exponent, linearly annealed after ``warm_start``
+    :param providers: onnxruntime execution providers to run ``float_model``
+            on when capturing calibration activations
+    :returns: ``quantized_model`` with every matched layer's INT4 weight
+            initializer rewritten to its AdaRound-optimized codes.
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(quantized_model, str):
+        quantized_model = onnx.load(quantized_model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            float_model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_gptq_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    beta_start, beta_end = beta_range
+    return onnx.load_from_string(
+        C.apply_adaround(
+            _get_model_executor(providers),
+            float_model.SerializeToString(),
+            quantized_model.SerializeToString(),
+            calibration_data_pb,
+            num_iterations,
+            learning_rate,
+            reg_param,
+            warm_start,
+            beta_start,
+            beta_end,
+        )
+    )
+
+
 def apply_qronos_cpp(
     float_model: Union[str, onnx.ModelProto],
     quantized_model: Union[str, onnx.ModelProto],

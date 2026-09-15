@@ -188,6 +188,7 @@ from onnxsim.nvfp4_quantization import (
 from onnxsim.olive import quantize_weight_only_olive
 from onnxsim.omniquant import apply_omniquant
 from onnxsim.onnx_simplifier import (
+    apply_adaround_cpp,
     apply_any_precision_llm_cpp,
     apply_attention_head_pruning_cpp,
     apply_attention_head_wanda_pruning_cpp,
@@ -390,6 +391,7 @@ __all__ = [
     "correct_bias",
     "correct_spatial_bias",
     "apply_adaround",
+    "apply_adaround_cpp",
     "apply_adaquant",
     "apply_tesseraq",
     "apply_tesseraq_cpp",

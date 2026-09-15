@@ -18,6 +18,7 @@
 // than including its own home header, sharing a single struct definition
 // (rather than a byte-for-byte duplicate struct body in each header) avoids
 // two independently-edited copies of the same type ever drifting apart.
+#include "adaround_entry.h"
 #include "awq_entry.h"
 #include "gptq_entry.h"
 #include "gptvq_entry.h"
@@ -843,16 +844,30 @@ onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
 // the technique and qronos_entry.h for this port's own scope (including
 // its accepted numerical scope, shared with ApplyGptq's).
 
-// TesseraQ: "Progressive Adaptive Rounding" (PAR) -- ApplyAdaRound-style
-// (not yet ported to C++) rectified-sigmoid rounding relaxation, but
-// optimized by a hand-rolled Adam loop jointly with each weight block's
-// own dequantization scale (in log-space), with a coarse-to-fine
-// element-by-element hardening schedule across a handful of rounds
-// instead of a single monolithic anneal. C++ port of tesseraq.py's own
-// apply_tesseraq, declared in tesseraq_entry.h (included above) rather
+// AdaRound: Nagel et al. 2020's rectified-sigmoid relaxation of each
+// weight element's floor/ceil rounding decision, optimized by a
+// hand-rolled Adam loop to minimize a layer's own reconstruction error
+// against real calibration activations. C++ port of adaround.py's own
+// apply_adaround, declared in adaround_entry.h (included above) rather
 // than duplicated here, mirroring how ApplyQronos (qronos_entry.h, also
 // included above) is documented in its own home header instead of this
-// one. See tesseraq.py's own module docstring for the technique and
+// one. See adaround.py's own module docstring for the technique and
+// adaround_entry.h for this port's own scope -- including its accepted
+// numerical scope (same class as ApplyTesseraq's own, below: an
+// iterative Adam optimization, not a closed-form computation, so
+// cross-language floating-point agreement is measured empirically
+// (tests/test_adaround_cpp.py) rather than assumed).
+
+// TesseraQ: "Progressive Adaptive Rounding" (PAR) -- ApplyAdaRound-style
+// rectified-sigmoid rounding relaxation, but optimized by a hand-rolled
+// Adam loop jointly with each weight block's own dequantization scale
+// (in log-space), with a coarse-to-fine element-by-element hardening
+// schedule across a handful of rounds instead of a single monolithic
+// anneal. C++ port of tesseraq.py's own apply_tesseraq, declared in
+// tesseraq_entry.h (included above) rather than duplicated here,
+// mirroring how ApplyAdaround (adaround_entry.h, also included above)
+// is documented in its own home header instead of this one. See
+// tesseraq.py's own module docstring for the technique and
 // tesseraq_entry.h for this port's own scope -- including its accepted
 // numerical scope, which is NOT the same as every closed-form port's own
 // (ApplyGptq/ApplyAwq/ApplyQronos/ApplyGptvq's correction half): this is

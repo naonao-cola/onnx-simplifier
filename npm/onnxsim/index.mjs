@@ -587,6 +587,54 @@ export async function applyGptq(
 }
 
 /**
+ * AdaRound: a rectified-sigmoid relaxation of each weight element's
+ * floor/ceil rounding decision, optimized by a hand-rolled Adam loop to
+ * minimize a layer's own reconstruction error against real calibration
+ * activations. Takes the float model and its
+ * `quantize_weight_only_int4`-quantized counterpart, like `applyGptq`.
+ * Returns the optimized quantized model bytes.
+ */
+export async function applyAdaround(
+  floatModel,
+  quantizedModel,
+  calibration,
+  {
+    numIterations = 300,
+    learningRate = 0.1,
+    regParam = 0.01,
+    warmStart = 0.2,
+    betaStart = 20.0,
+    betaEnd = 2.0,
+  } = {},
+) {
+  const floatBytes = toBytes(floatModel);
+  const quantBytes = toBytes(quantizedModel);
+  const runtime = await getRuntime();
+  const fn = runtime.onnxsim_apply_adaround;
+  if (typeof fn !== "function") {
+    throw new Error("onnxsim: this build has no export 'onnxsim_apply_adaround' (rebuild the wasm module?)");
+  }
+  let result = fn(
+    floatBytes,
+    quantBytes,
+    normalizeCalibrationBatches(calibration),
+    numIterations,
+    learningRate,
+    regParam,
+    warmStart,
+    betaStart,
+    betaEnd,
+  );
+  if (result && typeof result.then === "function") {
+    result = await result;
+  }
+  if (!result) {
+    throw new Error("onnxsim: onnxsim_apply_adaround failed (see stderr output for details)");
+  }
+  return new Uint8Array(result);
+}
+
+/**
  * Qronos: a sequential, whole-model generalization of `applyGptq` that
  * additionally accounts for the error already baked into a layer's
  * activations because upstream layers were quantized first, not just
@@ -807,6 +855,7 @@ export default {
   applyOutlierSuppressionPlus,
   applyLlmInt8,
   applyGptq,
+  applyAdaround,
   applyQronos,
   applyTesseraq,
   applyAwq,
