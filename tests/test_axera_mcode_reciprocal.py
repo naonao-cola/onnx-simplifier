@@ -310,3 +310,87 @@ class TestSiteBFormSelectorIsZpX(unittest.TestCase):
                 self.assertGreaterEqual(
                     len(short_hits), 3, f"{name}: expected short-form site B"
                 )
+
+
+class TestZpXImmediateRegion(unittest.TestCase):
+    """Localizes -- but does not decode -- zp_x's own magnitude.
+
+    An 8-build shift sweep (x shifted down by 0.04..0.36 in steps, y and the
+    op fixed) holds x_scale constant (0.007604781538248062, confirmed
+    identical across every build with zp_x != 0 -- span is shift-invariant)
+    while sweeping zp_x = round(-min_x / x_scale) through 3, 9, 14, 24, 30,
+    35, 40. Diffing the region 28-32 bytes *before* site A (offsets
+    ~1092-1100, i.e. immediately preceding the frame ``84 22 .. 84 24 ..``
+    that leads into site A's own preamble) shows a variable-width field that
+    changes with the sweep and separates into three regimes:
+
+    - zp_x=0: a fixed 3-byte tail ``00 10 84`` (no extra immediate).
+    - zp_x in {3, 24}: tag ``0x83`` followed by 2 bytes.
+    - zp_x in {9, 14, 30}: tag ``0xa1`` followed by 3 bytes (a 16-bit LE word
+      + ``0x02``).
+    - zp_x in {35, 40}: a third form, tag byte pair changes again.
+
+    This *localizes* where zp_x's effect on the stream begins (site B's
+    short/full selector, ``TestSiteBFormSelectorIsZpX`` above, is a
+    downstream consequence of whichever form fires here) but the immediate
+    itself does not decode under any hypothesis tried: not zp_x directly,
+    not zp_x mod 256, not float32(zp_x) or float32(zp_x * x_scale), not
+    z's own zero point or 1/z_scale (both of which also vary across the
+    sweep, since z = x*y's range shifts with x's -- checked and ruled out),
+    and not any single-slope linear fit against zp_x (correlations across
+    the whole stream top out around |r|=0.81, and the regime split above
+    isn't itself monotonic in zp_x: 3 and 24 share a form that 9, 14, and 30
+    do not, despite 9 < 24). Most likely explanation: this is compiler
+    immediate-packing/register-allocation choice, not a clean arithmetic
+    encoding of zp_x -- consistent with the other "residual, unmodeled"
+    bytes already documented for this stream (module docstring, and
+    ``scripts/axera/README.md``'s "Files" section). Pinned here as raw
+    bytes so a future session extending this sweep doesn't have to rebuild
+    these four fixtures from scratch.
+    """
+
+    # fixture: (x_scale, region bytes at [1090:1090+len], zp_x)
+    CASES = {
+        "mul_1x8_zp0sweep.mcode.gz": (
+            0.007664938922971487,
+            bytes.fromhex("8422001084240020842600"),
+            0,
+        ),
+        "mul_1x8_zp3sweep.mcode.gz": (
+            0.007604781538248062,
+            bytes.fromhex("842201101b8386002084"),
+            3,
+        ),
+        "mul_1x8_zp9sweep.mcode.gz": (
+            0.007604781538248062,
+            bytes.fromhex("842201101ba12c02a10020"),
+            9,
+        ),
+        "mul_1x8_zp35sweep.mcode.gz": (
+            0.007604781538248062,
+            bytes.fromhex("842202101b238336"),
+            35,
+        ),
+    }
+
+    def test_region_bytes_pinned(self):
+        for name, (_xs, region, _zpx) in self.CASES.items():
+            data = load(name)
+            start = 1090
+            self.assertEqual(
+                data[start : start + len(region)],
+                region,
+                f"{name}: pre-site-A region changed -- re-examine before trusting"
+                " the docstring's regime split",
+            )
+
+    def test_site_a_unaffected(self):
+        # Confirms the sweep only ever touches the pre-site-A region --
+        # site A itself (x's own reciprocal scale) is stable throughout.
+        for name, (xs, _region, _zpx) in self.CASES.items():
+            data = load(name)
+            pat = struct.pack("<f", 1.0 / xs)
+            found = hits(data, pat)
+            self.assertEqual(len(found), 4, f"{name}: site A hits")
+            strides = {b - a for a, b in zip(found, found[1:])}
+            self.assertEqual(strides, {8}, f"{name}: site A stride")
