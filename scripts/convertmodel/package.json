@@ -52,6 +52,7 @@
     "test:webgpu-custom-kernel-runtime": "node test/webgpu_custom_kernel_runtime.test.mjs",
     "test:pyodide-tinygrad-codegen": "node test/pyodide_tinygrad_codegen.test.mjs",
     "test:pyodide-single-node-codegen": "node test/pyodide_webgpu_single_node_codegen.test.mjs",
+    "test:pyodide-onnxrunner-codegen": "node test/pyodide_webgpu_onnxrunner_codegen.test.mjs",
     "test:hf-demo-loss-check": "node test/webgpu_hf_demo_loss_check.test.mjs"
   },
   "dependencies": {
