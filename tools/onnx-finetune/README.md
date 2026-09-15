@@ -436,6 +436,43 @@ controller, no zero-cost proxies) -- just the smallest possible "train several a
 compare them" loop, which is also the part any of those would still need at the bottom of their
 own search: a way to actually train a candidate and read back a score.
 
+### Ranking by measured latency, not just loss
+
+`search.mjs`'s `trainCandidate` times its own training loop with `performance.now()` and reports
+`meanStepMs` alongside the loss trajectory -- a real, measured per-step wall-clock latency on
+whatever execution provider that candidate actually ran on, not a predicted or looked-up latency
+the way hardware-aware NAS (MnasNet, FBNet, ProxylessNAS) usually scores candidates. `searchArchitectures`'s
+optional `latencyWeight` (default 0, i.e. today's loss-only ranking) folds it into the ranking via
+`combinedScore = finalLoss + latencyWeight * meanStepMs`, so a slower candidate needs a
+proportionally better loss to still win. There is no one "right" weight -- pass whatever trade-off
+this search is actually for.
+
+### A DARTS-style differentiable supernet, as an alternative to the discrete search
+
+`scripts/generate_darts_supernet_step_graph.py` builds a *single* step graph implementing Liu et
+al.'s DARTS (arXiv:1806.09055) continuous relaxation instead of several discrete candidates: at one
+point in the network, three parameter-free candidate operations (`Identity`, `Sigmoid`, and
+`Sigmoid` applied twice) are combined as a softmax-weighted mixture, and the mixture weights
+(`alpha`) are just one more trainable tensor in the same Adam step every other weight gets --
+architecture search that never leaves gradient descent, so there is no discrete search loop to run
+at all. Softmax itself is hand-built from `Exp`/`ReduceSum`/`Div` rather than the fused `Softmax`
+op, specifically to keep the whole supernet inside the same `onnxsim.qat_graph.EP_FRIENDLY_OPS`
+allowlist the discrete search's candidates already stay within.
+
+```sh
+python3 scripts/generate_darts_supernet_step_graph.py -o darts_supernet/step.onnx \
+  --batch-size 32 --dim 16 --hidden 16 --out 8
+```
+
+See `wasm/nas_search/darts_supernet.test.mjs` for a full worked example, including the (measured,
+not assumed) synthetic-data tuning needed to make the architecture weights actually separate: on a
+purely linear regression target at unit scale, every candidate can approximate a linear map from
+Sigmoid's own near-zero near-linear regime, so `alpha` barely moves. Scaling the input up (and
+skipping the discrete search's own `1/sqrt(dim)` target normalization) widens the range the network
+needs to cover past what a saturating `Sigmoid` can track, and only then does `alpha` reliably drift
+toward the unbounded `Identity` branch -- verified against `onnx.reference.ReferenceEvaluator` before
+being pinned as this test's own expectation, not assumed from the paper's own motivation for DARTS.
+
 ## CLI reference
 
 | flag | required | description |
