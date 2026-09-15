@@ -2937,6 +2937,52 @@ em::val onnxsim_apply_quarot_gptq(const std::string &data,
   }
 }
 
+// GPTVQ (Van Baalen et al., 2024): a genuine combination of
+// onnxsim_apply_gptq's own sequential, Hessian-compensated correction
+// with a k-means-fit vector codebook -- small groups of consecutive
+// input-channel columns of every matched MatMul/vanilla-Gemm node's
+// constant 2-D FLOAT32 weight are jointly quantized against the
+// codebook, then each group's resulting per-column residual is
+// propagated into every not-yet-quantized column exactly like
+// onnxsim_apply_gptq's own per-column correction. Rewires only the
+// matched node's weight input (Gather+Reshape[+Transpose]); the node
+// itself, including any bias, is left otherwise unchanged. Same
+// calibration-batch contract and executor as every other
+// calibration-driven binding above, and the same `skip_names` (JS
+// array of strings, possibly undefined/null) crossing convention as
+// onnxsim_apply_imatrix_quantization's own binding. `seed` arrives as a
+// JS number (double) and is narrowed to the uint64 it feeds, the same
+// way onnxsim_apply_quarot_gptq's own does. See ApplyGptvq in
+// gptvq_entry.h.
+em::val onnxsim_apply_gptvq(const std::string &data,
+                             em::val calibration_batches_val, double seed,
+                             int vector_dim, int num_centroids,
+                             int num_iterations, double percdamp,
+                             em::val skip_names_val) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    std::unordered_set<std::string> skip_names;
+    if (!skip_names_val.isUndefined() && !skip_names_val.isNull()) {
+      for (const std::string &name :
+           em::vecFromJSArray<std::string>(skip_names_val)) {
+        skip_names.insert(name);
+      }
+    }
+    return SerializeModel(ApplyGptvq(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val),
+        static_cast<uint64_t>(seed), vector_dim, num_centroids,
+        num_iterations, percdamp, skip_names));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_gptvq error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // Outlier Suppression+ (Wei et al., 2023): per-channel shifting ahead of
 // SmoothQuant's own per-channel scale -- recenters each activation
 // channel around zero, rescales the weight columns in place, inserts a
@@ -3090,6 +3136,7 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_apply_gptq", &onnxsim_apply_gptq);
   function("onnxsim_apply_awq", &onnxsim_apply_awq);
   function("onnxsim_apply_quarot_gptq", &onnxsim_apply_quarot_gptq);
+  function("onnxsim_apply_gptvq", &onnxsim_apply_gptvq);
   function("onnxsim_apply_smoothquant", &onnxsim_apply_smoothquant);
 
   // Block-wise QAT: build one block's step graph, run the loop in JS on

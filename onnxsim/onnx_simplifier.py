@@ -2690,6 +2690,106 @@ def apply_quarot_gptq_cpp(
     )
 
 
+def apply_gptvq_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    vector_dim: int = 2,
+    num_centroids: int = 256,
+    num_iterations: int = 10,
+    percdamp: float = 0.01,
+    providers: Optional[Sequence[backend.Provider]] = None,
+    skip_names: Optional[Iterable[str]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_gptvq`: GPTVQ
+    (Van Baalen et al., 2024) -- a genuine combination of
+    :func:`onnxsim.apply_gptq_cpp`'s own sequential, Hessian-compensated
+    correction with a k-means-fit vector codebook (like
+    :mod:`onnxsim.aqlm`'s own single shared codebook): small groups of
+    consecutive input-channel columns of every matched MatMul/vanilla-Gemm
+    layer's constant 2-D FLOAT32 weight are jointly quantized against the
+    codebook, then each group's resulting per-column residual is
+    propagated into every not-yet-quantized column exactly like GPTQ's own
+    per-column correction (see ``onnxsim/gptvq.py``'s own module docstring
+    for the full technique).
+
+    Same real calibration machinery as :func:`onnxsim.apply_gptq_cpp` --
+    a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through ``model`` in C++ (see ``ApplyGptvq``
+    in ``gptvq_entry.h`` for the full scope, including its own permanent
+    RNG divergence from the Python reference for the k-means codebook fit
+    -- not aliased to :func:`onnxsim.quantize_weight_only_gptvq` for the
+    same reason :func:`onnxsim.apply_quarot_cpp` is not aliased to
+    :func:`onnxsim.apply_quarot`).
+
+    Rewires only the matched node's weight input (a
+    ``Gather``+``Reshape``[+``Transpose``] chain); the node itself,
+    including any bias, is left otherwise unchanged.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to compute each
+            layer's Hessian from -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the per-layer k-means codebook initialization
+            (independent of, and not comparable to,
+            :func:`onnxsim.quantize_weight_only_gptvq`'s own ``seed`` --
+            see ``gptvq_entry.h``) and for the random calibration data
+            (ignored for the latter if ``calibration_data`` is supplied)
+    :param vector_dim: elements per group (each ``vector_dim``-element
+            chunk of consecutive input-channel columns is jointly
+            quantized to a single codebook entry)
+    :param num_centroids: entries in the layer's own fitted codebook
+    :param num_iterations: Lloyd's-algorithm iterations fitting the
+            codebook
+    :param percdamp: Hessian damping factor, matching
+            :func:`onnxsim.apply_gptq_cpp`'s own parameter and default
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :param skip_names: weight initializer names to leave unquantized even
+            if otherwise eligible
+    :returns: ``model`` with every matched, eligible layer's weight
+            replaced by a codebook lookup reconstructing it in the
+            weight's own units; a layer with a non-constant, non-2-D
+            weight, a name in ``skip_names``, a reduction dimension not
+            divisible by ``vector_dim``, or no usable calibration
+            activation, is left completely untouched.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_gptq_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_gptvq(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            seed,
+            vector_dim,
+            num_centroids,
+            num_iterations,
+            percdamp,
+            list(skip_names) if skip_names is not None else [],
+        )
+    )
+
+
 def apply_smoothquant_cpp(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,

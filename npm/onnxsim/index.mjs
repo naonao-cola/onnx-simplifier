@@ -617,6 +617,33 @@ export async function applyAwq(
 }
 
 /**
+ * GPTVQ: a genuine combination of `applyGptq`'s own sequential,
+ * Hessian-compensated correction with a k-means-fit vector codebook --
+ * small groups of consecutive input-channel columns of every matched
+ * MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight are jointly
+ * quantized against the codebook, then each group's resulting per-column
+ * residual is propagated into every not-yet-quantized column exactly like
+ * `applyGptq`'s own per-column correction. Rewires only the matched
+ * node's weight input (Gather+Reshape[+Transpose]); the node itself,
+ * including any bias, is left otherwise unchanged. Returns the
+ * quantized model bytes.
+ */
+export async function applyGptvq(
+  model,
+  calibration,
+  { seed = 0, vectorDim = 2, numCentroids = 256, numIterations = 10, percdamp = 0.01, skipNames } = {},
+) {
+  return callCalibratedPass("onnxsim_apply_gptvq", model, calibration, [
+    seed,
+    vectorDim,
+    numCentroids,
+    numIterations,
+    percdamp,
+    skipNames,
+  ]);
+}
+
+/**
  * QuaRot+GPTQ: the real QuaRot paper's optional, tighter weight quantizer --
  * identical to `applyQuarot` (same per-layer random rotation, same
  * data-free per-token INT4 activation quantization) except the weight is
@@ -695,5 +722,6 @@ export default {
   applyGptq,
   applyAwq,
   applyQuarotGptq,
+  applyGptvq,
   applySmoothQuant,
 };

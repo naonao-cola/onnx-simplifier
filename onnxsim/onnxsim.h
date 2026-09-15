@@ -20,6 +20,7 @@
 // two independently-edited copies of the same type ever drifting apart.
 #include "awq_entry.h"
 #include "gptq_entry.h"
+#include "gptvq_entry.h"
 #include "imatrix_quant_entry.h"
 #include "llm_int8_entry.h"
 #include "outlier_suppression_entry.h"
@@ -838,6 +839,21 @@ onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
 // technique and quarot_gptq_entry.h for this port's own scope (including
 // its accepted numerical scope and its own permanent RNG divergence from
 // the Python reference, shared with ApplyQuarot's).
+
+// GPTVQ (Van Baalen et al., 2024): a genuine combination of ApplyGptq's
+// own sequential, Hessian-compensated correction with a k-means-fit
+// vector codebook (like onnxsim.aqlm's own single shared codebook) --
+// small groups of consecutive input-channel columns are jointly
+// quantized against the codebook, then each group's resulting per-column
+// residual is propagated into every not-yet-quantized column exactly
+// like ApplyGptq's own per-column correction -- C++ port of gptvq.py's
+// own quantize_weight_only_gptvq, declared in gptvq_entry.h (included
+// above) rather than duplicated here, mirroring how ApplyQuarotGptq
+// (quarot_gptq_entry.h, also included above) is documented in its own
+// home header instead of this one. See gptvq.py's own module docstring
+// for the technique and gptvq_entry.h for this port's own scope
+// (including its accepted numerical scope and its own permanent RNG
+// divergence from the Python reference for the k-means codebook fit).
 
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller
