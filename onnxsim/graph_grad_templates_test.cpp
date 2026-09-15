@@ -236,10 +236,11 @@ void CheckUnaryElementwiseTemplate(const std::string& op_type) {
   const std::map<std::string, std::string> grads =
       BuildBackwardWithTemplatedRules(b, nodes, shapes, {{"Y", "dY"}}, {"X"});
   Check(grads.size() == 1 && grads.count("X") == 1,
-       op_type + ": the input gets a gradient");
+        op_type + ": the input gets a gradient");
   Check(!b.functions().empty(),
-       op_type + ": the builder accumulated a template function before "
-                 "inlining");
+        op_type +
+            ": the builder accumulated a template function before "
+            "inlining");
   // Several templated rules (Exp, Sqrt, Sigmoid, Tanh, ...) reuse the
   // forward node's own output as one of the template call's inputs, so the
   // forward node itself has to precede the backward in the final graph --
@@ -252,12 +253,13 @@ void CheckUnaryElementwiseTemplate(const std::string& op_type) {
       WrapForInspection(b, constants, {{grads.at("X"), {3, 4}}});
 
   Check(step.model.functions_size() == 0,
-       op_type + ": MakeStepGraph inlines every call site");
+        op_type + ": MakeStepGraph inlines every call site");
   try {
     onnx::checker::check_model(step.model);
   } catch (const std::exception& e) {
-    Check(false, op_type + ": onnx::checker rejected the templated "
-                           "backward: " +
+    Check(false, op_type +
+                     ": onnx::checker rejected the templated "
+                     "backward: " +
                      e.what());
   }
   CheckWithinAllowlist(BackwardEmittedOps(step.model.graph(), {op_type}),
@@ -267,8 +269,7 @@ void CheckUnaryElementwiseTemplate(const std::string& op_type) {
 // Same as above, for the two broadcasting binary rules (Mul, Div): B's shape
 // {4} against A's {3, 4} exercises ReduceTo the same way the Add test does.
 void CheckBinaryElementwiseTemplate(const std::string& op_type) {
-  const std::vector<onnx::NodeProto> nodes = {
-      Node(op_type, {"A", "B"}, {"Y"})};
+  const std::vector<onnx::NodeProto> nodes = {Node(op_type, {"A", "B"}, {"Y"})};
   const Shapes shapes = {{"A", {3, 4}}, {"B", {4}}, {"Y", {3, 4}}};
 
   GraphBuilder b;
@@ -276,10 +277,11 @@ void CheckBinaryElementwiseTemplate(const std::string& op_type) {
       BuildBackwardWithTemplatedRules(b, nodes, shapes, {{"Y", "dY"}},
                                       {"A", "B"});
   Check(grads.size() == 2 && grads.count("A") == 1 && grads.count("B") == 1,
-       op_type + ": both operands get a gradient");
+        op_type + ": both operands get a gradient");
   Check(!b.functions().empty(),
-       op_type + ": the builder accumulated a template function before "
-                 "inlining");
+        op_type +
+            ": the builder accumulated a template function before "
+            "inlining");
   // GradDiv reuses the forward node's own output (y = a / b); see
   // CheckUnaryElementwiseTemplate's comment above.
   b.nodes().insert(b.nodes().begin(), nodes.begin(), nodes.end());
@@ -289,12 +291,13 @@ void CheckBinaryElementwiseTemplate(const std::string& op_type) {
       b, constants, {{grads.at("A"), {3, 4}}, {grads.at("B"), {4}}});
 
   Check(step.model.functions_size() == 0,
-       op_type + ": MakeStepGraph inlines every call site");
+        op_type + ": MakeStepGraph inlines every call site");
   try {
     onnx::checker::check_model(step.model);
   } catch (const std::exception& e) {
-    Check(false, op_type + ": onnx::checker rejected the templated "
-                           "backward: " +
+    Check(false, op_type +
+                     ": onnx::checker rejected the templated "
+                     "backward: " +
                      e.what());
   }
   CheckWithinAllowlist(BackwardEmittedOps(step.model.graph(), {op_type}),

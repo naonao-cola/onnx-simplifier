@@ -1924,7 +1924,8 @@ const onnx::FunctionProto& GradSqrtTemplate() {
   return *fn;
 }
 
-std::vector<OptStr> GradSqrtTemplated(Backward& ctx, const onnx::NodeProto& node,
+std::vector<OptStr> GradSqrtTemplated(Backward& ctx,
+                                      const onnx::NodeProto& node,
                                       const std::string& g) {
   const std::string half = ctx.b().Const(0.5f);
   const std::vector<std::string> outs =
@@ -1987,7 +1988,8 @@ const onnx::FunctionProto& GradTanhTemplate() {
   return *fn;
 }
 
-std::vector<OptStr> GradTanhTemplated(Backward& ctx, const onnx::NodeProto& node,
+std::vector<OptStr> GradTanhTemplated(Backward& ctx,
+                                      const onnx::NodeProto& node,
                                       const std::string& g) {
   const std::string one = ctx.b().Const(1.0f);
   const std::vector<std::string> outs =
@@ -2030,7 +2032,8 @@ const onnx::FunctionProto& GradReluTemplate() {
   return *fn;
 }
 
-std::vector<OptStr> GradReluTemplated(Backward& ctx, const onnx::NodeProto& node,
+std::vector<OptStr> GradReluTemplated(Backward& ctx,
+                                      const onnx::NodeProto& node,
                                       const std::string& g) {
   const std::string zero = ctx.b().Const(0.0f);
   const std::vector<std::string> outs =

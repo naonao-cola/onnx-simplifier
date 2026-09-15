@@ -2271,23 +2271,31 @@ def _grad_batch_normalization_templated(
     return [dx, dscale, dbias, dmean, dvar]
 
 
-def _grad_neg_templated(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+def _grad_neg_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
     (dx,) = ctx.b.call(_load_template(_templates.GRAD_NEG), [g])
     return [dx]
 
 
-def _grad_exp_templated(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+def _grad_exp_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
     (dx,) = ctx.b.call(_load_template(_templates.GRAD_EXP), [g, node.output[0]])
     return [dx]
 
 
-def _grad_sqrt_templated(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+def _grad_sqrt_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
     fn = _load_template(_templates.GRAD_SQRT)
     (dx,) = ctx.b.call(fn, [g, node.output[0], ctx.b.const(0.5)])
     return [dx]
 
 
-def _grad_log_templated(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+def _grad_log_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
     (dx,) = ctx.b.call(_load_template(_templates.GRAD_LOG), [g, node.input[0]])
     return [dx]
 
@@ -2300,25 +2308,33 @@ def _grad_sigmoid_templated(
     return [dx]
 
 
-def _grad_tanh_templated(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+def _grad_tanh_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
     fn = _load_template(_templates.GRAD_TANH)
     (dx,) = ctx.b.call(fn, [g, node.output[0], ctx.b.const(1.0)])
     return [dx]
 
 
-def _grad_erf_templated(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+def _grad_erf_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
     fn = _load_template(_templates.GRAD_ERF)
     (dx,) = ctx.b.call(fn, [g, node.input[0], ctx.b.const(2.0 / np.sqrt(np.pi))])
     return [dx]
 
 
-def _grad_relu_templated(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+def _grad_relu_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
     fn = _load_template(_templates.GRAD_RELU)
     (dx,) = ctx.b.call(fn, [g, node.input[0], ctx.b.const(0.0)])
     return [dx]
 
 
-def _grad_mul_templated(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+def _grad_mul_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
     a, b = node.input[0], node.input[1]
     out = ctx.shape(node.output[0])
     da, db = ctx.b.call(_load_template(_templates.GRAD_MUL), [g, a, b])
@@ -2328,7 +2344,9 @@ def _grad_mul_templated(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Op
     ]
 
 
-def _grad_div_templated(ctx: _Backward, node: onnx.NodeProto, g: str) -> List[Optional[str]]:
+def _grad_div_templated(
+    ctx: _Backward, node: onnx.NodeProto, g: str
+) -> List[Optional[str]]:
     a, b = node.input[0], node.input[1]
     y = node.output[0]
     out = ctx.shape(y)

@@ -287,7 +287,9 @@ def test_grad_batch_normalization_templated_matches_torch_autograd():
         )
 
 
-def _check_within_allowlist(model: onnx.ModelProto, forward_ops: set, op_type: str) -> None:
+def _check_within_allowlist(
+    model: onnx.ModelProto, forward_ops: set, op_type: str
+) -> None:
     emitted = {node.op_type for node in model.graph.node} - forward_ops
     assert emitted <= graph_grad.BACKWARD_OPS | {"Identity"}, (
         f"templated {op_type} backward reached outside the allowlist: "
@@ -328,7 +330,9 @@ def test_unary_templated_matches_hand_written(op_type):
     )
     templated = _backward_model(model, ["X"], _templated_rules())
     assert {n.name for n in templated.functions} == set()  # fully inlined
-    _check_within_allowlist(templated, {node.op_type for node in model.graph.node}, op_type)
+    _check_within_allowlist(
+        templated, {node.op_type for node in model.graph.node}, op_type
+    )
     hand_written = _backward_model(model, ["X"], _hand_written_rules())
 
     rng = np.random.default_rng(0)
@@ -336,7 +340,11 @@ def test_unary_templated_matches_hand_written(op_type):
     (analytic,) = _run(templated, ["grad_X"], {"X": x, "dY": g})
     (reference,) = _run(hand_written, ["grad_X"], {"X": x, "dY": g})
     np.testing.assert_allclose(
-        analytic, reference, rtol=1e-5, atol=1e-6, err_msg=f"{op_type}: vs hand-written rule"
+        analytic,
+        reference,
+        rtol=1e-5,
+        atol=1e-6,
+        err_msg=f"{op_type}: vs hand-written rule",
     )
 
 
@@ -356,7 +364,9 @@ def test_binary_templated_matches_hand_written(op_type):
     targets = ["A", "B"]
     templated = _backward_model(model, targets, _templated_rules())
     assert {n.name for n in templated.functions} == set()  # fully inlined
-    _check_within_allowlist(templated, {node.op_type for node in model.graph.node}, op_type)
+    _check_within_allowlist(
+        templated, {node.op_type for node in model.graph.node}, op_type
+    )
     hand_written = _backward_model(model, targets, _hand_written_rules())
 
     rng = np.random.default_rng(0)
@@ -369,5 +379,9 @@ def test_binary_templated_matches_hand_written(op_type):
     reference = _run(hand_written, ["grad_A", "grad_B"], {"A": a, "B": b, "dY": g})
     for name, got, expected in zip(targets, analytic, reference):
         np.testing.assert_allclose(
-            got, expected, rtol=1e-5, atol=1e-6, err_msg=f"{op_type}.{name}: vs hand-written rule"
+            got,
+            expected,
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg=f"{op_type}.{name}: vs hand-written rule",
         )
