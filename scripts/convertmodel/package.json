@@ -47,6 +47,7 @@
     "test:webnn-reshape-placement": "node test/webnn_reshape_placement.test.mjs",
     "test:onnx-node-metadata": "node test/onnx_node_metadata.test.mjs",
     "test:webgpu-kernel-dispatcher": "node test/webgpu_kernel_dispatcher.test.mjs",
+    "test:webgpu-tinygrad-codegen": "node test/webgpu_tinygrad_codegen.test.mjs",
     "test:hf-demo-loss-check": "node test/webgpu_hf_demo_loss_check.test.mjs"
   },
   "dependencies": {

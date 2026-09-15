@@ -13,6 +13,21 @@ name: convertmodel WebGPU custom kernel dispatcher
 #     convertmodel-webgpu-demo.yml's jobs do (see that workflow's own
 #     comment): plain/headless Node has no navigator.gpu at all.
 #
+#   * test/webgpu_tinygrad_codegen.test.mjs -- REQUIRED. Same idea, but for
+#     the WGSL onnxsim.webgpu_tinygrad_codegen actually *generates* (from a
+#     real tinygrad Tensor graph) for the Conv-3D and Resize align_corners
+#     gaps onnxsim.webgpu_target flags, rather than a hand-written kernel --
+#     see webgpu_tinygrad_codegen.py's own docstring for the two-part
+#     verification story this is the GPU half of (the other half,
+#     tests/test_webgpu_tinygrad_codegen.py, only checks the same tinygrad
+#     Tensor graph against onnx.reference.ReferenceEvaluator on tinygrad's
+#     own CPU device, offline). The fixtures
+#     (webgpu_tinygrad_conv3d.onnx/webgpu_tinygrad_resize.onnx +
+#     webgpu_tinygrad_codegen_fixture.json) are pre-generated and committed
+#     by make_webgpu_tinygrad_codegen_fixture.py -- this job never installs
+#     Python or tinygrad, same as webgpu_kernel_dispatcher.test.mjs's own
+#     fixture.
+#
 # onnx_node_metadata.test.mjs (the plain-Node half of this same feature,
 # proving the JS protobuf-field reader agrees with what
 # onnxsim/webgpu_kernel_metadata.py actually wrote) needs no browser and no
@@ -35,14 +50,20 @@ on:
     paths:
       - ".github/workflows/convertmodel-webgpu-kernel-dispatcher.yml"
       - "scripts/convertmodel/test/webgpu_kernel_dispatcher.test.mjs"
+      - "scripts/convertmodel/test/webgpu_tinygrad_codegen.test.mjs"
       - "scripts/convertmodel/test/onnx_node_metadata.test.mjs"
       - "scripts/convertmodel/test/make_webgpu_kernel_fixture.py"
+      - "scripts/convertmodel/test/make_webgpu_tinygrad_codegen_fixture.py"
       - "scripts/convertmodel/test/webgpu_kernel_add.onnx"
       - "scripts/convertmodel/test/webgpu_kernel_fixture.json"
+      - "scripts/convertmodel/test/webgpu_tinygrad_conv3d.onnx"
+      - "scripts/convertmodel/test/webgpu_tinygrad_resize.onnx"
+      - "scripts/convertmodel/test/webgpu_tinygrad_codegen_fixture.json"
       - "scripts/convertmodel/onnx_node_metadata.mjs"
       - "scripts/convertmodel/webgpu_kernel_dispatcher.mjs"
       - "scripts/convertmodel/package.json"
       - "onnxsim/webgpu_kernel_metadata.py"
+      - "onnxsim/webgpu_tinygrad_codegen.py"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -86,3 +107,22 @@ jobs:
       - name: Run the WebGPU custom kernel dispatcher check
         working-directory: scripts/convertmodel
         run: npm run test:webgpu-kernel-dispatcher
+
+  webgpu-tinygrad-codegen:
+    name: WebGPU tinygrad-generated kernel dispatch (required)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (onnxruntime-web, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the WebGPU tinygrad-generated kernel dispatcher check
+        working-directory: scripts/convertmodel
+        run: npm run test:webgpu-tinygrad-codegen
