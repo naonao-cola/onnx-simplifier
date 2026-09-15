@@ -1042,6 +1042,49 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "num_alpha_steps"_a = 20);
 
+  // AdaRound (Nagel et al., 2020): Nagel et al.'s rectified-sigmoid
+  // relaxation of each weight element's floor/ceil rounding decision,
+  // optimized by a hand-rolled Adam loop to minimize a layer's own
+  // reconstruction error against real calibration activations. Same
+  // two-model executor-as-first-argument shape as apply_gptq's own
+  // binding above (candidates are processed independently, so `executor`
+  // is invoked once, up front, the same as apply_gptq's own);
+  // `calibration_data` (List[Dict[str, onnx.TensorProto]]) is keyed to
+  // the float model's own graph inputs. `beta_start`/`beta_end` are the
+  // two ends of apply_adaround's own `beta_range` tuple, split into
+  // separate parameters here since this binding layer has no tuple type.
+  // See ApplyAdaround in adaround_entry.h for the full scope (including
+  // its own accepted numerical scope -- an iterative optimization, not a
+  // closed-form computation) and onnxsim/adaround.py for the technique
+  // this ports.
+  m.def(
+      "apply_adaround",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t num_iterations, double learning_rate, double reg_param,
+         double warm_start, double beta_start, double beta_end) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result =
+            ApplyAdaround(float_model, quantized_model, *executor,
+                          calibration_data, num_iterations, learning_rate,
+                          reg_param, warm_start, beta_start, beta_end);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "num_iterations"_a = 300, "learning_rate"_a = 0.1,
+      "reg_param"_a = 0.01, "warm_start"_a = 0.2, "beta_start"_a = 20.0,
+      "beta_end"_a = 2.0);
+
   // Qronos: a sequential, whole-model generalization of apply_gptq that
   // additionally accounts for the error already baked into a layer's
   // activations because upstream layers were quantized first, not just
