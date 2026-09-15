@@ -836,19 +836,13 @@ def test_training_graph_streams_use_no_new_instruction_forms(name):
 
 
 _GAP_STREAMS = {
-    # Streams just under the coverage floor, with the exact unexplained
-    # runs pinned: a lone `08` byte and a live `0b 01` pair (device-proven:
-    # zeroing the pair faults the NPU, zeroing the single runs
-    # bit-identical -- see test_splice_gap_bytes_* in
-    # test_axera_mcode_structure.py). Fails loudly in either direction: a
-    # regression adds runs, a future form decoding these removes them.
+    # The last sub-floor stream, with its exact unexplained runs pinned:
+    # lone singles the abutting-trailer form does not cover plus the
+    # still-unformed `08`. Fails loudly in either direction: a regression
+    # adds runs, a future form decoding these removes them.
     "reshape_mul_gap": (
-        "coverage: only 93.7% of non-zero bytes explained "
-        "[(284, 285), (321, 322), (376, 377), (465, 468)]"
-    ),
-    "reshape_matmul_gap": (
-        "coverage: only 94.0% of non-zero bytes explained "
-        "[(280, 281), (321, 322), (344, 345), (428, 431)]"
+        "coverage: only 93.8% of non-zero bytes explained "
+        "[(284, 285), (321, 322), (465, 468), (470, 471)]"
     ),
     "reshape_gather_bwd": (),
 }
@@ -937,5 +931,75 @@ def test_terminal_pair_closes_before_padding(name):
         1
         for t in mcode.tokenize(shuffled, start=lo, end=hi, **mcode.FULL_RULE)
         if t[1] == "L"
+    )
+    assert null == 0, (name, null)
+
+
+# Abutting-trailer takes per committed stream -- a lone value byte in
+# {0x23, 0x24, 0x26, 0x2B} with two zero bytes before it, abutting the
+# next segment's `a7 00` marker head. Device-mapped (zeroing faults the
+# NPU); 36 exact recurrences corpus-wide against zero shuffled.
+_A_COUNTS = {
+    "conv64_k5_d2": 3,
+    "conv128_k7_d12": 4,
+    "piper_vocoder": 3,
+    "w2v2fe_training_step": 3,
+    "dwconv_g32": 3,
+    "layernorm_last_axis": 1,
+    "attn_qkv_softmax": 4,
+    "toy_training_step": 4,
+    "resnet18_int8": 4,
+    "loss_head_kd": 1,
+    "adam_update_fp32": 1,
+    "reshape_gather_bwd": 2,
+    "reshape_mul_gap": 1,
+    "reshape_matmul_gap": 3,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_BLOBS))
+def test_trailer_single_abuts_next_segment(name):
+    """A lone trailer single: value in `{0x23, 0x24, 0x26, 0x2B}`, two
+    zero bytes immediately before it, the next segment's `a7 00` marker
+    head immediately after. Found by census over every non-final segment
+    of 62 streams from an AX650N (36 sites, zero shuffled counterparts),
+    and validated the way every other form was: it fires only where no
+    other form matches, so no stream regresses. Zeroing one faults the
+    NPU -- live epilogue bytes, not padding. See the README's "Trailer
+    singles abutting the next segment" section."""
+    blob = _blob(name)
+    lo, hi = mcode.stream_bounds(blob)
+    toks = mcode.tokenize(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    takes = [t for t in toks if t[1] == "A"]
+    assert len(takes) == _A_COUNTS[name], (name, len(takes))
+    for o, _, v, _, _ in takes:
+        assert blob[o] == v, (name, o)
+        assert v in (0x23, 0x24, 0x26, 0x2B), (name, o)
+        assert bytes(blob[o - 2 : o]) == b"\x00" * 2, (name, o)
+        assert bytes(blob[o + 1 : o + 3]) == bytes([0xA7, 0x00]), (name, o)
+        assert v not in mcode.VERBS6, (name, o)
+    records = mcode.decode(blob, start=lo, end=hi, **mcode.FULL_RULE)
+    assert [r["at"] for r in records if r["kind"] == "A"] == [
+        o for o, _, _, _, _ in takes
+    ]
+
+    # Admitting the form buys coverage, and only where it fires.
+    without = dict(mcode.FULL_RULE)
+    without["trailer"] = False
+    covered_without, _ = mcode.nonzero_coverage(blob, **without)
+    covered_with, _ = mcode.nonzero_coverage(blob)
+    if _A_COUNTS[name]:
+        assert covered_with > covered_without, (name, covered_without, covered_with)
+    else:
+        assert covered_with == covered_without, (name, covered_without, covered_with)
+
+    # The shuffle control: no abutting singles by chance.
+    bulk = bytearray(blob[lo:hi])
+    random.Random(0).shuffle(bulk)
+    shuffled = bytes(blob[:lo]) + bytes(bulk) + bytes(blob[hi:])
+    null = sum(
+        1
+        for t in mcode.tokenize(shuffled, start=lo, end=hi, **mcode.FULL_RULE)
+        if t[1] == "A"
     )
     assert null == 0, (name, null)
