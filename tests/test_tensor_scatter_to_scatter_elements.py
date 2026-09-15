@@ -226,40 +226,43 @@ def test_fully_dynamic_shapes_still_rewrites():
 
 # --------------------------------------------------------------------------- #
 # Rank not statically known at all -- the predicate must decline (it has no
-# rank to build the reshape/broadcast literals against). Falls back to
-# `onnx.helper` per CLAUDE.md, since the text parser always assigns some rank
-# once a tensor type's dimensions are given.
+# rank to build the reshape/broadcast literals against). A plain unranked
+# graph input doesn't work: ONNX's own checker requires every main-graph
+# input/output to declare a `shape` field (confirmed empirically -- see
+# `tests/test_formal_verify_fuse_consecutive_unsqueezes.py`'s own note on
+# this exact restriction). Instead, `past_cache`/`update` are produced by
+# `Squeeze`ing an extra trailing size-1 dim off statically-shaped graph
+# inputs using an `axes` value that is itself a genuine runtime graph
+# input (not derivable from any constant, unlike an `Add` of two
+# initializers -- onnxsim's own shape inference does partial constant-data
+# propagation and resolves that case anyway) -- no shape inference can
+# determine which axis a truly runtime-valued `Squeeze` removes, so the
+# squeezed output's rank is genuinely unresolvable at graph-simplification
+# time even though its runtime value never varies for this test's fixed
+# `input_data`.
 # --------------------------------------------------------------------------- #
 
 
 def test_unknown_rank_declines():
-    import onnx
-    from onnx import TensorProto, helper
-
-    past_cache = helper.make_tensor_value_info("past_cache", TensorProto.FLOAT, None)
-    update = helper.make_tensor_value_info("update", TensorProto.FLOAT, None)
-    write_indices = helper.make_tensor_value_info(
-        "write_indices", TensorProto.INT64, None
-    )
-    y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, None)
-    for vi in (past_cache, update, write_indices, y):
-        vi.type.tensor_type.ClearField("shape")
-
-    node = helper.make_node(
-        "TensorScatter", ["past_cache", "update", "write_indices"], ["Y"]
-    )
-    graph = helper.make_graph(
-        [node], "g", [past_cache, update, write_indices], [y]
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 24)], ir_version=10
-    )
-    onnx.checker.check_model(model)
-
+    body = """
+    <
+      ir_version: 10,
+      opset_import: ["": 24]
+    >
+    agraph (float[2,6,3,1] past_cache_raw, float[2,2,3,1] update_raw,
+            int64[2] write_indices, int64[1] axes) => (float[2,6,3] Y)
+    {
+      past_cache = Squeeze (past_cache_raw, axes)
+      update = Squeeze (update_raw, axes)
+      Y = TensorScatter (past_cache, update, write_indices)
+    }
+    """
+    model = parser.parse_model(body)
     rng = np.random.RandomState(6)
     data = {
-        "past_cache": rng.randn(2, 6, 3).astype(np.float32),
-        "update": rng.randn(2, 2, 3).astype(np.float32),
+        "past_cache_raw": rng.randn(2, 6, 3, 1).astype(np.float32),
+        "update_raw": rng.randn(2, 2, 3, 1).astype(np.float32),
         "write_indices": np.array([1, 3], dtype=np.int64),
+        "axes": np.array([3], dtype=np.int64),
     }
     _simplify_and_assert_declined(model, data)
