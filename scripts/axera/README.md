@@ -5391,8 +5391,16 @@ values -- so it is admitted with exactly those guards (zero shuffled
 counterparts, pure addition, exact round-trips), firing 1--4× on all
 fourteen fixtures. The last sub-floor stream but one crosses the floor
 on it; one Reshape stream remains pinned with its leftover singles.
-The `09`-hole and the sibling 0b-led/0b-terminated runs stay open
-work.
+The `09`-hole matrix below and the sibling runs after it stay open
+work only in the rule sense -- their device classes are now mapped.
+
+Probed siblings split by position, not by shape: two `0b`-LED runs
+(ResNet18 seg2 `0b d2 01 20`, seg3 `0b 52 07 30`) fault when zeroed,
+same live class as `0b 01` -- while two `0b`-TERMINATED runs (a
+Squeeze+Gemm `c4 07 a3 f7 0b`, ResNet18 `e4 0f c2 ff 0b`) run
+bit-identical. So a leading `0b` marks live trailer content and a
+trailing `0b` does not -- direction matters, content alone does not
+predict the class.
 
 ### Emitting mcode, first op: tinygrad-traced negation
 
