@@ -345,6 +345,7 @@ from onnxsim.vitisai_target import (
     legalize_for_vitisai,
     split_model,
 )
+from onnxsim.webgpu_custom_kernel_runtime import SplitAroundNode, split_around_node
 from onnxsim.webgpu_kernel_metadata import (
     WebgpuKernelBinding,
     WebgpuKernelSpec,
@@ -537,6 +538,8 @@ __all__ = [
     "read_webgpu_kernel",
     "generate_conv_kernel",
     "generate_resize_kernel",
+    "SplitAroundNode",
+    "split_around_node",
     "check_webnn_support",
     "estimate_webnn_islands",
     "chain_slim",

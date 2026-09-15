@@ -48,7 +48,9 @@ def _load_onnxsim_module_without_package_init(name, relative_path):
         stub = types.ModuleType("onnxsim")
         stub.__path__ = []
         sys.modules["onnxsim"] = stub
-    spec = importlib.util.spec_from_file_location(f"onnxsim.{name}", os.path.join(REPO_ROOT, relative_path))
+    spec = importlib.util.spec_from_file_location(
+        f"onnxsim.{name}", os.path.join(REPO_ROOT, relative_path)
+    )
     module = importlib.util.module_from_spec(spec)
     sys.modules[f"onnxsim.{name}"] = module
     spec.loader.exec_module(module)
@@ -57,8 +59,12 @@ def _load_onnxsim_module_without_package_init(name, relative_path):
 
 _load_onnxsim_module_without_package_init("_rich_compat", "onnxsim/_rich_compat.py")
 _load_onnxsim_module_without_package_init("model_info", "onnxsim/model_info.py")
-_load_onnxsim_module_without_package_init("webgpu_kernel_metadata", "onnxsim/webgpu_kernel_metadata.py")
-codegen = _load_onnxsim_module_without_package_init("webgpu_tinygrad_codegen", "onnxsim/webgpu_tinygrad_codegen.py")
+_load_onnxsim_module_without_package_init(
+    "webgpu_kernel_metadata", "onnxsim/webgpu_kernel_metadata.py"
+)
+codegen = _load_onnxsim_module_without_package_init(
+    "webgpu_tinygrad_codegen", "onnxsim/webgpu_tinygrad_codegen.py"
+)
 
 
 def _flat(array: np.ndarray):
@@ -102,7 +108,10 @@ def _make_conv3d_fixture():
         "file": "webgpu_tinygrad_conv3d.onnx",
         "nodeName": "conv3d_node",
         "outputName": "y",
-        "inputs": {"x": {"shape": list(x_shape), "data": _flat(x)}, "w": {"shape": list(w_shape), "data": _flat(w)}},
+        "inputs": {
+            "x": {"shape": list(x_shape), "data": _flat(x)},
+            "w": {"shape": list(w_shape), "data": _flat(w)},
+        },
         "expectedOutput": {"shape": list(y_ref.shape), "data": _flat(y_ref)},
     }, out_path
 
@@ -126,7 +135,9 @@ def _make_resize_fixture():
         }}
         """
     )
-    model.graph.initializer.append(numpy_helper.from_array(np.asarray(scales, dtype=np.float32), "scales"))
+    model.graph.initializer.append(
+        numpy_helper.from_array(np.asarray(scales, dtype=np.float32), "scales")
+    )
     model.graph.node[0].name = "resize_node"
 
     import onnx

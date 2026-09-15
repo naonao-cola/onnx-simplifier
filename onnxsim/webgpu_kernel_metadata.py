@@ -25,18 +25,22 @@ step reads that an earlier one wrote, but that aren't one of the node's own
 inputs/outputs, are declared once as named *intermediates* on the spec and
 allocated by the dispatcher for the program's lifetime.
 
-**What this does not do (yet):** splice the custom program into an
-onnxruntime-web session -- i.e. there is no graph splitter that runs an ORT
-session up to the flagged node, executes the WebGPU program via this
-metadata, and resumes another ORT session past it. That "runtime on top of
-ort-web" piece needs its own design (most likely handing GPU buffers between
-an ORT-web session and a hand-dispatched program via onnxruntime-web's
-GPU-buffer IO binding, to avoid a CPU round-trip) and is not built here.
-What *is* here and works end to end today: a schema to describe a program,
-and a standalone way to read one back out of a real ``.onnx`` file's bytes
-and run it against arbitrary GPU buffers -- directly useful for "run this
-WGSL program on this data" testing and tuning, and the foundation the
-graph-splicing runtime would build on next.
+**Splicing the program into an onnxruntime-web session:** built, for the
+single-node case, in :mod:`onnxsim.webgpu_custom_kernel_runtime` (Python
+graph surgery -- splits a model into the sub-graph upstream of the flagged
+node and the sub-graph downstream of it) and
+``scripts/convertmodel/webgpu_custom_kernel_runtime.mjs`` (runs those two as
+ordinary onnxruntime-web WebGPU sessions and dispatches this module's
+program between them via onnxruntime-web's own GPU-buffer IO binding, so
+the flagged node's data never round-trips through the CPU). See those two
+modules' own docstrings for the exact scope (one flagged node per model,
+fully static shapes) and for why the node must be physically removed from
+both sub-graphs rather than left in place and expected to fail gracefully.
+What's still not here: an *automatic* multi-node splicer (chaining several
+flagged nodes, or picking split points itself from
+:func:`onnxsim.webgpu_target.estimate_webgpu_islands`) -- today a caller
+calls :func:`onnxsim.webgpu_custom_kernel_runtime.split_around_node` once
+per flagged node itself.
 
 ## Schema
 
