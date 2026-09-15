@@ -2372,6 +2372,79 @@ def apply_outlier_suppression_cpp(
     )
 
 
+def apply_llm_int8_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    outlier_threshold: float = 6.0,
+    epsilon: float = 1e-8,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_llm_int8`: LLM.int8()
+    (Dettmers et al., 2022) -- decomposes every matched MatMul/vanilla-Gemm
+    layer with a constant 2-D FLOAT32 weight into a float32 outlier part
+    plus a vector-wise INT8 part computed via ``MatMulInteger`` (per-row
+    activation scales at runtime, per-output-channel weight scales
+    offline, uint8 activation at zero-point 128). Every rewritten layer
+    keeps its original output tensor name.
+
+    Same real calibration machinery as
+    :func:`onnxsim.apply_outlier_suppression_cpp` -- a live
+    :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see
+    ``ApplyLlmInt8`` in ``llm_int8_entry.h`` for the full scope).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to find each
+            layer's outlier channels on -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param outlier_threshold: an input channel is treated as an outlier if
+            its activation magnitude exceeds this anywhere in the
+            calibration data (the paper's own default, ``6.0``)
+    :param epsilon: floor applied to a zero row/weight-column max-abs
+            value before dividing by it
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched layer replaced by its
+            outlier/INT8 decomposition; layers with a non-constant,
+            non-2-D weight, a non-2-D activation, no (or all) outlier
+            channels, or an int32-unsafe non-outlier reduction depth, are
+            left untouched.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_outlier_suppression_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_llm_int8(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            outlier_threshold,
+            epsilon,
+        )
+    )
+
+
 def apply_smoothquant_cpp(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,

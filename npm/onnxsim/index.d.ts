@@ -191,6 +191,11 @@ export function applyOutlierSuppression(
   calibration: CalibrationData,
   options?: { alpha?: number; epsilon?: number },
 ): Promise<Uint8Array>;
+export function applyLlmInt8(
+  model: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: { outlierThreshold?: number; epsilon?: number },
+): Promise<Uint8Array>;
 export function applySmoothQuant(
   model: OnnxModelBytes,
   calibration: CalibrationData,
@@ -238,6 +243,7 @@ declare const _default: {
   applyImatrixQuantization: typeof applyImatrixQuantization;
   applyOutlierSuppression: typeof applyOutlierSuppression;
   applyOutlierSuppressionPlus: typeof applyOutlierSuppressionPlus;
+  applyLlmInt8: typeof applyLlmInt8;
   applySmoothQuant: typeof applySmoothQuant;
 };
 export default _default;

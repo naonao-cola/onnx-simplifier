@@ -944,6 +944,36 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "alpha"_a = 0.5,
       "epsilon"_a = 1e-5);
 
+  // LLM.int8() (Dettmers et al., 2022): decomposes every matched
+  // MatMul/vanilla-Gemm node into a float32 outlier part plus a
+  // vector-wise INT8 part computed via MatMulInteger (per-row activation
+  // scales at runtime, per-output-channel weight scales offline,
+  // uint8 activation at zero-point 128). Same
+  // executor-as-first-argument, `calibration_data` (List[Dict[str,
+  // onnx.TensorProto]]) crossing convention as
+  // apply_outlier_suppression's own binding above. See ApplyLlmInt8 in
+  // llm_int8_entry.h for the full scope and onnxsim/llm_int8.py for the
+  // technique this ports.
+  m.def(
+      "apply_llm_int8",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double outlier_threshold, double epsilon) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyLlmInt8(model, *executor, calibration_data,
+                                         outlier_threshold, epsilon);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a,
+      "outlier_threshold"_a = 6.0, "epsilon"_a = 1e-8);
+
   // SmoothQuant migration (Xiao et al., 2022): rescales every matched
   // MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight columns by the
   // per-channel migration scale `s` in place and inserts a `Mul` node
