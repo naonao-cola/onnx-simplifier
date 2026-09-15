@@ -199,6 +199,18 @@ class TestOutputScaleQuads(unittest.TestCase):
       to ~1e-9 yet their quad floats differ by 1 ULP (1e vs 1d) -- the
       two builds' float64 scales straddle a float32 boundary. Patch by
       exact float32 word, never by recomputing from float64.
+
+    CORRECTION (2026-09-16): "constant 0x81/0x82 tag bytes" overclaimed
+    from three fixtures -- two more real builds (zp_x=33/35, output zp
+    30/32) came back `81 80`, not `81 82`. The test below is still
+    correct as written (it only asserts `8182` for the three fixtures
+    that actually carry it), but the docstring's "constant" framing does
+    not generalize: only the `81` byte and the `03` lead hold across all
+    six builds gathered so far. The second tag byte is build-specific and
+    still unexplained -- not the output zero point (ruled out above) or
+    anything else tried. See ``tiny_emit.patch_mul_output_quad``, which
+    was written assuming the stronger claim and had to be relaxed to
+    checking only `81` once real hardware output disagreed with it.
     """
 
     _Z = {
