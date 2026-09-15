@@ -61,17 +61,11 @@ exactly how :func:`onnxsim.apply_smoothquant` is used.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.smoothquant import _match_matmul_like
+from onnxsim.calibration import Tensors
 
 
 def apply_outlier_suppression_plus(
@@ -118,136 +112,31 @@ def apply_outlier_suppression_plus(
             the output; layers with a non-constant, non-2-D weight, or whose
             activation input isn't a plain 2-D tensor matching the weight's
             reduction dimension, are left untouched
+
+    This pure-Python implementation has been retired in favor of the
+    verified-bit-exact C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_outlier_suppression_plus_cpp`
+    (``onnxsim/outlier_suppression_plus_entry.cpp``'s own
+    ``ApplyOutlierSuppressionPlus``), forwarding every argument unchanged.
+    Exact (bit-for-bit) parity was verified against this function's own
+    pre-alias implementation across MatMul/Gemm/transB-Gemm/biased-Gemm,
+    shared activations, lopsided and all-negative channels, multi-batch
+    ranges, every skip shape, empty calibration, and alpha in {0, 0.25,
+    0.5, 0.75, 1} -- see tests/test_outlier_suppression_plus_cpp.py --
+    before this alias was made. Imported lazily (inside the function body,
+    not at module scope) to avoid a circular import:
+    ``onnxsim.onnx_simplifier`` already imports from this module, so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_outlier_suppression_plus_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    nodes = list(graph.node)
-    candidates = []
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, weight_transposed))
-
-    if not candidates:
-        return out
-
-    probe_names = sorted({x_name for _, x_name, _, _ in candidates})
-    probe_model = _add_probe_outputs(out, probe_names)
-
-    act_max: Dict[str, np.ndarray] = {}
-    act_min: Dict[str, np.ndarray] = {}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            x = np.asarray(result[name], dtype=np.float64)
-            if x.ndim != 2:
-                continue
-            mx, mn = x.max(axis=0), x.min(axis=0)
-            act_max[name] = mx if name not in act_max else np.maximum(act_max[name], mx)
-            act_min[name] = mn if name not in act_min else np.minimum(act_min[name], mn)
-
-    for node, x_name, w_name, weight_transposed in candidates:
-        mx = act_max.get(x_name)
-        mn = act_min.get(x_name)
-        if mx is None:
-            continue  # never observed as a plain 2-D tensor; skip
-
-        w_init = initializer_map[w_name]
-        w_nk_orig = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w_nk_orig.shape
-        w_nk = w_nk_orig if weight_transposed else w_nk_orig.T  # [N, K]
-        k = w_nk.shape[1]
-        if mx.shape[0] != k:
-            continue  # activation's feature dim doesn't match K; skip
-
-        # Channel-wise shift: recenters each channel around zero. The
-        # shifted channel's own max-abs is exactly half its observed
-        # range -- no second pass over calibration data needed.
-        z = (mx + mn) / 2.0  # [K]
-        shifted_absmax = np.maximum((mx - mn) / 2.0, epsilon)  # [K]
-
-        weight_channel = np.maximum(np.abs(w_nk).max(axis=0), epsilon)  # [K]
-        s = (shifted_absmax**alpha) / (weight_channel ** (1.0 - alpha))
-        s = np.maximum(s, epsilon)
-
-        # Exact algebraic fold: Y = ((X - z) / s) @ (W * s)^T + z @ W^T,
-        # using the *original* (unscaled) weight for the correction term --
-        # see this module's own docstring.
-        correction = (w_nk @ z).astype(np.float32)  # [N]
-
-        w_smooth_nk = w_nk * s[np.newaxis, :]
-        w_new = w_smooth_nk if weight_transposed else w_smooth_nk.T
-        w_new = w_new.reshape(dim0, dim1).astype(np.float32)
-        w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_name))
-
-        z_name = _unique_name(f"{x_name}_os_plus_shift", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(z.astype(np.float32), name=z_name)
-        )
-        shifted_name = _unique_name(f"{x_name}_os_plus_shifted", taken_names)
-        sub_node = onnx.helper.make_node(
-            "Sub",
-            [x_name, z_name],
-            [shifted_name],
-            name=_unique_name(f"{x_name}_os_plus_sub", taken_names),
-        )
-
-        inv_s = (1.0 / s).astype(np.float32)
-        scale_name = _unique_name(f"{x_name}_os_plus_inv_scale", taken_names)
-        graph.initializer.append(onnx.numpy_helper.from_array(inv_s, name=scale_name))
-        scaled_name = _unique_name(f"{x_name}_os_plus_scaled", taken_names)
-        mul_node = onnx.helper.make_node(
-            "Mul",
-            [shifted_name, scale_name],
-            [scaled_name],
-            name=_unique_name(f"{x_name}_os_plus_mul", taken_names),
-        )
-
-        node_idx = next(i for i, n in enumerate(graph.node) if n is node)
-        graph.node.insert(node_idx, mul_node)
-        graph.node.insert(node_idx, sub_node)
-        node.input[0] = scaled_name
-
-        # Restore the shift's constant contribution via a new Add right
-        # after the layer's own output, renaming its output to a fresh
-        # internal name (mirroring onnxsim.bias_correction._apply_correction)
-        # so every existing downstream consumer keeps working unmodified.
-        node_idx = next(i for i, n in enumerate(graph.node) if n is node)
-        pre_name = _unique_name(f"{node.output[0]}_os_plus_pre_shift", taken_names)
-        original_output = node.output[0]
-        node.output[0] = pre_name
-        correction_name = _unique_name(
-            f"{original_output}_os_plus_correction", taken_names
-        )
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(correction, name=correction_name)
-        )
-        add_node = onnx.helper.make_node(
-            "Add",
-            [pre_name, correction_name],
-            [original_output],
-            name=_unique_name(f"{original_output}_os_plus_add", taken_names),
-        )
-        graph.node.insert(node_idx + 1, add_node)
-
-    return out
+    return apply_outlier_suppression_plus_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        alpha=alpha,
+        epsilon=epsilon,
+        providers=providers,
+    )

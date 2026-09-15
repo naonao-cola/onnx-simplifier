@@ -2801,6 +2801,36 @@ em::val onnxsim_apply_smoothquant(const std::string &data,
   }
 }
 
+// Outlier Suppression+ (Wei et al., 2023): per-channel shifting ahead of
+// SmoothQuant's own per-channel scale -- recenters each activation
+// channel around zero, rescales the weight columns in place, inserts a
+// `Sub`+`Mul` pair before the layer and an `Add` after it restoring the
+// shift's constant contribution -- a lossless pre-conditioning transform
+// ahead of a separate W8A8 quantizer. Same calibration-batch contract
+// and executor as every other calibration-driven binding above. `alpha`
+// is the scaling step's migration strength (applied to the *shifted*
+// activation's range); `epsilon` floors the per-channel max-abs values
+// and the scale itself. See ApplyOutlierSuppressionPlus in
+// outlier_suppression_plus_entry.h.
+em::val onnxsim_apply_outlier_suppression_plus(
+    const std::string &data, em::val calibration_batches_val, double alpha,
+    double epsilon) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyOutlierSuppressionPlus(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), alpha, epsilon));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_outlier_suppression_plus error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
 EMSCRIPTEN_BINDINGS(module) {
   function("onnxsimplify_export", &onnxsimplify_export);
   function("onnxsim_annotate_model_info", &onnxsim_annotate_model_info);
@@ -2918,6 +2948,8 @@ EMSCRIPTEN_BINDINGS(module) {
            &onnxsim_apply_imatrix_quantization);
   function("onnxsim_apply_outlier_suppression",
            &onnxsim_apply_outlier_suppression);
+  function("onnxsim_apply_outlier_suppression_plus",
+           &onnxsim_apply_outlier_suppression_plus);
   function("onnxsim_apply_smoothquant", &onnxsim_apply_smoothquant);
 
   // Block-wise QAT: build one block's step graph, run the loop in JS on

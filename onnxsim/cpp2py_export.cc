@@ -974,6 +974,38 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "alpha"_a = 0.5,
       "epsilon"_a = 1e-5);
 
+  // Outlier Suppression+ (Wei et al., 2023): per-channel shifting ahead
+  // of SmoothQuant's own per-channel scale -- recenters each activation
+  // channel around zero, rescales the weight columns in place, inserts a
+  // `Sub`+`Mul` pair before the layer and an `Add` after it restoring the
+  // shift's constant contribution -- a lossless pre-conditioning
+  // transform ahead of a separate W8A8 quantizer, never a quantization
+  // scheme itself. Same executor-as-first-argument, `calibration_data`
+  // (List[Dict[str, onnx.TensorProto]]) crossing convention as
+  // apply_outlier_suppression's own binding above. See
+  // ApplyOutlierSuppressionPlus in outlier_suppression_plus_entry.h for
+  // the full scope and onnxsim/outlier_suppression_plus.py for the
+  // technique this ports.
+  m.def(
+      "apply_outlier_suppression_plus",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double alpha, double epsilon) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyOutlierSuppressionPlus(
+            model, *executor, calibration_data, alpha, epsilon);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "alpha"_a = 0.5,
+      "epsilon"_a = 1e-5);
+
   // MoE expert-intermediate-channel pruning: removes intermediate
   // (`inter_size`) channels from every expert of a matched
   // `com.microsoft::MoE` node at once -- real structural pruning, data-free.

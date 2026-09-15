@@ -20,6 +20,7 @@
 // two independently-edited copies of the same type ever drifting apart.
 #include "imatrix_quant_entry.h"
 #include "outlier_suppression_entry.h"
+#include "outlier_suppression_plus_entry.h"
 #include "smoothquant_entry.h"
 #include "structured_pruning_entry.h"
 
@@ -778,6 +779,16 @@ onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
 // technique and outlier_suppression_entry.h for this port's own scope
 // (including why this calibration-driven pass follows
 // ApplyImatrixQuantization's own protobuf-level shape).
+
+// Outlier Suppression+ (Wei et al., 2023) shifting and scaling -- C++
+// port of outlier_suppression_plus.py's own
+// apply_outlier_suppression_plus, declared in
+// outlier_suppression_plus_entry.h (included above) rather than
+// duplicated here, mirroring how ApplyOutlierSuppression
+// (outlier_suppression_entry.h, also included above) is documented in
+// its own home header instead of this one. See
+// outlier_suppression_plus.py's own module docstring for the technique
+// and outlier_suppression_plus_entry.h for this port's own scope.
 
 // SmoothQuant (Xiao et al., 2022) migration -- C++ port of
 // smoothquant.py's own apply_smoothquant, declared in
