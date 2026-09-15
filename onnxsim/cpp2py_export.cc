@@ -1069,9 +1069,9 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         ONNX_NAMESPACE::ModelProto quantized_model;
         ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
                             quantized_bytes.size());
-        const auto result = ApplyQronos(float_model, quantized_model,
-                                        *executor, calibration_data,
-                                        percdamp, proc_block_size);
+        const auto result =
+            ApplyQronos(float_model, quantized_model, *executor,
+                        calibration_data, percdamp, proc_block_size);
         std::string out;
         result.SerializeToString(&out);
         return py::bytes(out.data(), out.size());
