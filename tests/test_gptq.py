@@ -284,13 +284,25 @@ def test_gptq_captures_a_shared_activation_only_once(monkeypatch):
     )
 
     seen = []
-    original = onnxsim.gptq._add_probe_outputs
+    real_executor = onnxsim.onnx_simplifier._get_model_executor(None)
 
-    def spy(m, names):
-        seen.append(list(names))
-        return original(m, names)
+    class CountingExecutor(onnxsim.onnx_simplifier.PyModelExecutor):
+        def Run(self, model_str, inputs_str):
+            probe = onnx.ModelProto()
+            probe.ParseFromString(model_str)
+            seen.append(sorted(o.name for o in probe.graph.output))
+            return real_executor.Run(model_str, inputs_str)
 
-    monkeypatch.setattr(onnxsim.gptq, "_add_probe_outputs", spy)
+    # apply_gptq is a thin alias for the C++ port, so the probe model is
+    # built inside C++ rather than by onnxsim.gptq._add_probe_outputs --
+    # observe it at the executor boundary instead, which is also the
+    # stronger check: it sees the model that actually runs, after any
+    # internal transformation, rather than one Python helper's output.
+    monkeypatch.setattr(
+        onnxsim.onnx_simplifier,
+        "_get_model_executor",
+        lambda providers=None: CountingExecutor(providers),
+    )
     quant = onnxsim.quantize_weight_only_int4(model)
     onnxsim.apply_gptq(
         model,

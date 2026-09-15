@@ -30,6 +30,7 @@ import {
   applyOutlierSuppression,
   applyOutlierSuppressionPlus,
   applyLlmInt8,
+  applyGptq,
   applyQuarot,
   applySmoothQuant,
   applyStructuredPruning,
@@ -48,6 +49,22 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "..", "..", "..", "scripts", "convertmodel", "test", "model.onnx");
+// GPTQ needs a float model plus its INT4-quantized counterpart. Both are
+// checked in, generated deterministically by quantizing the float one:
+//   python3 -c "import onnx, numpy as np
+//   from onnx import parser
+//   import onnxsim
+//   rng = np.random.default_rng(0)
+//   W = (rng.standard_normal((32, 8)) * 0.5).astype(np.float32)
+//   m = parser.parse_model('''
+//   <ir_version: 10, opset_import: [\"\": 21]>
+//   g (float[batch,32] X) => (float[batch,8] Y) { Y = MatMul(X, W) }
+//   ''')
+//   m.graph.initializer.extend([onnx.numpy_helper.from_array(W, 'W')])
+//   onnx.save(m, 'model_gptq.onnx')
+//   onnx.save(onnxsim.quantize_weight_only_int4(m), 'model_gptq_int4.onnx')"
+const FIXTURE_GPTQ = join(HERE, "..", "..", "..", "scripts", "convertmodel", "test", "model_gptq.onnx");
+const FIXTURE_GPTQ_INT4 = join(HERE, "..", "..", "..", "scripts", "convertmodel", "test", "model_gptq_int4.onnx");
 
 let passed = 0;
 async function check(name, fn) {
@@ -184,6 +201,22 @@ try {
       X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 8.0, 0.0]), [1, 4]),
     });
     const out = await applyLlmInt8(input, [batch(), batch()], { outlierThreshold: 6.0 });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applyGptq optimizes INT4 codes on synthetic calibration data", async () => {
+    // Dedicated fixtures (see the generation note below): a K=32 float
+    // MatMul plus its quantize_weight_only_int4 output, so the layer is
+    // a real GPTQ candidate (the shared K=4 fixture is below the int4
+    // block size and would decline).
+    const ort = await import("onnxruntime-web");
+    const floatModel = new Uint8Array(readFileSync(FIXTURE_GPTQ));
+    const quantModel = new Uint8Array(readFileSync(FIXTURE_GPTQ_INT4));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array(32).map((_, i) => ((i * 37) % 11) - 5), [1, 32]),
+    });
+    const out = await applyGptq(floatModel, quantModel, [batch(), batch()], {});
     assert.ok(out instanceof Uint8Array);
     assert.ok(out.length > 0);
   });

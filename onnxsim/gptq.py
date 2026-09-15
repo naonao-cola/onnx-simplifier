@@ -35,16 +35,12 @@ activations" style.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
 import numpy as np
 import onnx
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _find_int4_matmul_candidates, _pack_int4
-from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
-from onnxsim.calibration import Tensors, generate_random_calibration_data
+from onnxsim.calibration import Tensors
 
 
 def _inverse_hessian_cholesky(h: np.ndarray, percdamp: float) -> np.ndarray:
@@ -175,67 +171,35 @@ def apply_gptq(
             initializer rewritten to its GPTQ-optimized codes (same shape,
             dtype, and scale -- only which integer each element rounds to
             changes)
+
+    The pure-Python column search above (``_inverse_hessian_cholesky`` /
+    ``_gptq_quantize_columns``) stays in this module -- nine other
+    techniques import those helpers -- but this entry point is now a thin
+    alias for the verified C++ port :func:`onnxsim.apply_gptq_cpp`
+    (``onnxsim/gptq_entry.cpp``'s own ``ApplyGptq``), forwarding every
+    argument unchanged. Exact (bit-for-bit) agreement was verified
+    against this function's own pre-alias implementation across
+    MatMul/Gemm/transB-Gemm/biased-Gemm, block sizes, damping levels,
+    multi-batch and rank-3 calibration, dead/duplicate channels, and
+    every skip shape -- see tests/test_gptq_cpp.py -- before this alias
+    was made. (The port's dense inverse/Cholesky use scalar
+    double-precision kernels rather than LAPACK; no divergence was
+    observed anywhere measured, but see ``gptq_entry.h``'s own accepted
+    numerical scope note.) Imported lazily (inside the function body, not
+    at module scope) to avoid a circular import:
+    ``onnxsim.onnx_simplifier`` already imports from this module, so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    if isinstance(quantized_model, str):
-        quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_gptq_cpp
 
-    candidates = _find_int4_matmul_candidates(float_model, quantized_model)
-    if not candidates:
-        return quantized_model
-
-    probe_names = sorted({c.float_node.input[0] for c in candidates})
-    float_probe = _add_probe_outputs(float_model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        out = backend.run_model(float_probe, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(out[name], dtype=np.float64))
-
-    optimized: Dict[str, np.ndarray] = {}
-    for c in candidates:
-        acts = _activation_rows(activations[c.float_node.input[0]])
-        if not acts:
-            continue  # no usable activation (no feature axis); skip
-        x = np.concatenate(acts, axis=0)
-
-        w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)
-        scale = onnx.numpy_helper.to_array(c.ws_init).astype(np.float64)
-        dim0, dim1 = w.shape
-
-        if c.weight_transposed:
-            w_nk = w  # already [N, K]
-            scale_blocks = scale  # already [N, K / block_size]
-        else:
-            w_nk = w.T  # [K, N] -> [N, K]
-            scale_blocks = scale.T  # [K / block_size, N] -> [N, K / block_size]
-        if x.shape[1] != w_nk.shape[1]:
-            continue  # activation's feature dim doesn't match K; skip
-
-        h = x.T @ x
-        codes_nk = _gptq_quantize_columns(
-            w_nk, scale_blocks, c.block_size, h, percdamp, proc_block_size
-        )
-
-        codes_orig = codes_nk if c.weight_transposed else codes_nk.T
-        assert codes_orig.shape == (dim0, dim1)
-        optimized[c.wq_name] = codes_orig.astype(np.int8)
-
-    if not optimized:
-        return quantized_model
-
-    corrected = onnx.ModelProto()
-    corrected.CopyFrom(quantized_model)
-    for t in corrected.graph.initializer:
-        codes = optimized.get(t.name)
-        if codes is None:
-            continue
-        t.raw_data = _pack_int4(codes)
-
-    return corrected
+    return apply_gptq_cpp(
+        float_model,
+        quantized_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        percdamp=percdamp,
+        proc_block_size=proc_block_size,
+        providers=providers,
+    )

@@ -2445,6 +2445,86 @@ def apply_llm_int8_cpp(
     )
 
 
+def apply_gptq_cpp(
+    float_model: Union[str, onnx.ModelProto],
+    quantized_model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    percdamp: float = 0.01,
+    proc_block_size: int = 128,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_gptq`: GPTQ (Frantar et al.,
+    2022) sequential, Hessian-compensated rounding for every
+    ``quantize_weight_only_int4``-quantized MatMul/Gemm layer present (by
+    node output name) in both ``float_model`` and ``quantized_model``,
+    reusing that scheme's own per-block scales and changing only which
+    integer each element rounds to.
+
+    Same real calibration machinery as
+    :func:`onnxsim.apply_llm_int8_cpp` -- a live
+    :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the float model in C++ (see
+    ``ApplyGptq`` in ``gptq_entry.h`` for the full scope, including its
+    accepted numerical scope: the dense inverse/Cholesky at this
+    algorithm's heart use scalar double-precision kernels rather than
+    LAPACK, so codes can differ from the reference in rare rounding ties
+    while reconstruction error tracks it).
+
+    :param float_model: the original (unquantized) onnx ModelProto or file
+            path
+    :param quantized_model: a quantized version of ``float_model`` (onnx
+            ModelProto or file path), produced by
+            :func:`onnxsim.quantize_weight_only_int4`
+    :param calibration_data: representative input batches to compute each
+            layer's Hessian from -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param percdamp: Hessian damping factor (fraction of the mean diagonal
+            added before inversion)
+    :param proc_block_size: GPTQ's own column-processing block size (not
+            the quantization scale's own block size, reused unchanged)
+    :param providers: onnxruntime execution providers to run
+            ``float_model`` on when capturing calibration activations
+    :returns: ``quantized_model`` with every matched layer's INT4 weight
+            initializer rewritten to its GPTQ-optimized codes.
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(quantized_model, str):
+        quantized_model = onnx.load(quantized_model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            float_model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_gptq(
+            _get_model_executor(providers),
+            float_model.SerializeToString(),
+            quantized_model.SerializeToString(),
+            calibration_data_pb,
+            percdamp,
+            proc_block_size,
+        )
+    )
+
+
 def apply_smoothquant_cpp(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,
