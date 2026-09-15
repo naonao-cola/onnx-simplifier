@@ -4096,6 +4096,40 @@ def apply_gguf_q5_1_quantization_cpp(
     )
 
 
+def apply_gguf_q8_0_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_gguf_q8_0_quantization`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight into llama.cpp's Q8_0 format -- one plain
+    32-element block sharing a single fp16 scale, signed 8-bit code with
+    no bias/min (``dequant = code * d``). See
+    :func:`onnxsim.apply_gguf_q8_0_quantization`'s own docstring for the
+    full rationale and this format's own encoder-provenance honesty note.
+
+    Unlike :func:`onnxsim.apply_gguf_q8_0_quantization` and unlike
+    :func:`simplify`, this does not support an ``include_conv`` option,
+    and this does not run shape inference, constant folding or any other
+    simplification pass.
+
+    Layers with a non-constant, non-2-D weight are left untouched. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            Q8_0 quantize-dequantize round-tripped float32 version, stored
+            under a *new* initializer (the original initializer is left in
+            the graph, unused). A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_gguf_q8_0_quantization(model.SerializeToString())
+    )
+
+
 def apply_gguf_ternary_quantization_cpp(
     model: Union[str, onnx.ModelProto],
 ) -> onnx.ModelProto:

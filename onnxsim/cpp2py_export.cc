@@ -1604,6 +1604,23 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // llama.cpp's GGUF Q8_0 block format: weight-only signed 8-bit
+  // quantization, one plain 32-element block sharing a single fp16 scale
+  // (no bias, no min). Data-free. See ApplyGgufQ8_0 in onnxsim.h.
+  m.def(
+      "apply_gguf_q8_0_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyGgufQ8_0(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // BitNet b1.58's published absmean ternary weight quantization, as
   // shipped by llama.cpp's GGUF TQ1_0/TQ2_0 tensor types: weight-only,
   // one shared {-1, 0, +1} scale per 256-element block. Data-free. See

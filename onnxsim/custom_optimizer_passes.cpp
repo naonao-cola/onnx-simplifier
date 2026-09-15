@@ -57,6 +57,7 @@
 #include "passes/gguf_legacy_quant.h"
 #include "passes/gguf_legacy_quant_5bit.h"
 #include "passes/gguf_q6_k.h"
+#include "passes/gguf_q8_0.h"
 #include "passes/gguf_ternary_quant.h"
 #include "passes/iq4_nl.h"
 #include "passes/magnitude_pruning.h"
@@ -181,6 +182,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::GgufQ5_0>(registry);
     RegisterOrReplace<p::GgufQ5_1>(registry);
     RegisterOrReplace<p::GgufQ6K>(registry);
+    RegisterOrReplace<p::GgufQ8_0>(registry);
     RegisterOrReplace<p::GgufTernaryQuant>(registry);
     RegisterOrReplace<p::IQ4NL>(registry);
     RegisterOrReplace<p::MagnitudePruningAttention>(registry);
