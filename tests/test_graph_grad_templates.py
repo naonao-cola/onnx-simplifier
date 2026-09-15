@@ -134,21 +134,43 @@ def _run(model: onnx.ModelProto, output_names, feeds) -> list:
     return session.run(output_names, feeds)
 
 
+# Every op _RULES now wires to a templated rule -- see graph_grad.py's
+# "Templated rules" section comment for why GradSub stays hand-written. Maps
+# each op type to its hand-written rule's own snake_case suffix, since that
+# is not always just the op type lowercased (``BatchNormalization`` ->
+# ``batch_normalization``).
+_TEMPLATED_OPS = {
+    "Add": "add",
+    "BatchNormalization": "batch_normalization",
+    "Neg": "neg",
+    "Exp": "exp",
+    "Sqrt": "sqrt",
+    "Log": "log",
+    "Sigmoid": "sigmoid",
+    "Tanh": "tanh",
+    "Erf": "erf",
+    "Relu": "relu",
+    "Mul": "mul",
+    "Div": "div",
+}
+
+
 def _templated_rules() -> dict:
     rules = dict(graph_grad._RULES)
-    rules["Add"] = graph_grad._grad_add_templated
-    rules["BatchNormalization"] = graph_grad._grad_batch_normalization_templated
+    for op, suffix in _TEMPLATED_OPS.items():
+        rules[op] = getattr(graph_grad, f"_grad_{suffix}_templated")
     return rules
 
 
 def _hand_written_rules() -> dict:
-    """The reference table: "Add"/"BatchNormalization" pinned back to the
-    original hand-written rules, which :data:`graph_grad._RULES` no longer
-    uses directly (see graph_grad.py's "Templated rules" section) but keeps
-    defined for exactly this cross-check."""
+    """The reference table: every templated op in :data:`_TEMPLATED_OPS`
+    pinned back to its original hand-written rule, which
+    :data:`graph_grad._RULES` no longer uses directly (see graph_grad.py's
+    "Templated rules" section) but keeps defined for exactly this
+    cross-check."""
     rules = dict(graph_grad._RULES)
-    rules["Add"] = graph_grad._grad_add
-    rules["BatchNormalization"] = graph_grad._grad_batch_normalization
+    for op, suffix in _TEMPLATED_OPS.items():
+        rules[op] = getattr(graph_grad, f"_grad_{suffix}")
     return rules
 
 
@@ -262,4 +284,90 @@ def test_grad_batch_normalization_templated_matches_torch_autograd():
             rtol=2e-3,
             atol=2e-4,
             err_msg=f"{name}: onnxsim templated rule vs torch.autograd",
+        )
+
+
+def _check_within_allowlist(model: onnx.ModelProto, forward_ops: set, op_type: str) -> None:
+    emitted = {node.op_type for node in model.graph.node} - forward_ops
+    assert emitted <= graph_grad.BACKWARD_OPS | {"Identity"}, (
+        f"templated {op_type} backward reached outside the allowlist: "
+        f"{sorted(emitted - graph_grad.BACKWARD_OPS - {'Identity'})}"
+    )
+
+
+# One representative input per unary op, deliberately kept away from each
+# rule's own singularity (Sqrt/Log at 0, Relu's kink at 0) the same way
+# generate_grad_templates.py's own validators do.
+_UNARY_CASES = {
+    "Neg": np.array([[1.0, -2.0, 3.0], [4.0, -5.0, 6.0]], dtype=np.float32),
+    "Exp": np.array([[0.1, -0.2, 0.3], [0.4, -0.5, 0.6]], dtype=np.float32),
+    "Sqrt": np.array([[1.0, 4.0, 9.0], [0.25, 2.0, 16.0]], dtype=np.float32),
+    "Log": np.array([[1.0, 4.0, 9.0], [0.25, 2.0, 16.0]], dtype=np.float32),
+    "Sigmoid": np.array([[0.1, -0.2, 0.3], [4.0, -5.0, 0.6]], dtype=np.float32),
+    "Tanh": np.array([[0.1, -0.2, 0.3], [4.0, -5.0, 0.6]], dtype=np.float32),
+    "Erf": np.array([[0.1, -0.2, 0.3], [4.0, -5.0, 0.6]], dtype=np.float32),
+    "Relu": np.array([[1.0, -2.0, 3.0], [4.0, -5.0, 6.0]], dtype=np.float32),
+}
+
+
+@pytest.mark.parametrize("op_type", sorted(_UNARY_CASES))
+def test_unary_templated_matches_hand_written(op_type):
+    """Every templated unary rule against its hand-written counterpart, on
+    the same inputs -- the same cross-check
+    ``test_grad_batch_normalization_templated_matches_torch_autograd`` above
+    does for BatchNormalization, minus the torch.autograd leg (there is no
+    single third-party op these map onto the way BatchNormalization maps
+    onto ``torch.nn.functional``)."""
+    x = _UNARY_CASES[op_type]
+    model = _model(
+        f"""
+        g (float{list(x.shape)} X) => (float{list(x.shape)} Y) {{
+          Y = {op_type}(X)
+        }}
+        """
+    )
+    templated = _backward_model(model, ["X"], _templated_rules())
+    assert {n.name for n in templated.functions} == set()  # fully inlined
+    _check_within_allowlist(templated, {node.op_type for node in model.graph.node}, op_type)
+    hand_written = _backward_model(model, ["X"], _hand_written_rules())
+
+    rng = np.random.default_rng(0)
+    g = rng.standard_normal(x.shape).astype(np.float32)
+    (analytic,) = _run(templated, ["grad_X"], {"X": x, "dY": g})
+    (reference,) = _run(hand_written, ["grad_X"], {"X": x, "dY": g})
+    np.testing.assert_allclose(
+        analytic, reference, rtol=1e-5, atol=1e-6, err_msg=f"{op_type}: vs hand-written rule"
+    )
+
+
+@pytest.mark.parametrize("op_type", ["Mul", "Div"])
+def test_binary_templated_matches_hand_written(op_type):
+    """``Mul``/``Div`` with ``B`` broadcasting against ``A``, the same shape
+    as ``test_grad_add_templated_matches_closed_form`` above -- exercises
+    both the template call and the broadcast-undoing (``_Backward.reduce_to``)
+    the wrapper still does outside it."""
+    model = _model(
+        f"""
+        g (float[3,4] A, float[4] B) => (float[3,4] Y) {{
+          Y = {op_type}(A, B)
+        }}
+        """
+    )
+    targets = ["A", "B"]
+    templated = _backward_model(model, targets, _templated_rules())
+    assert {n.name for n in templated.functions} == set()  # fully inlined
+    _check_within_allowlist(templated, {node.op_type for node in model.graph.node}, op_type)
+    hand_written = _backward_model(model, targets, _hand_written_rules())
+
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal((3, 4)).astype(np.float32)
+    # Kept away from 0: Div's own singularity, not exercised here.
+    b = (np.abs(rng.standard_normal((4,))) + 0.5).astype(np.float32)
+    g = rng.standard_normal((3, 4)).astype(np.float32)
+
+    analytic = _run(templated, ["grad_A", "grad_B"], {"A": a, "B": b, "dY": g})
+    reference = _run(hand_written, ["grad_A", "grad_B"], {"A": a, "B": b, "dY": g})
+    for name, got, expected in zip(targets, analytic, reference):
+        np.testing.assert_allclose(
+            got, expected, rtol=1e-5, atol=1e-6, err_msg=f"{op_type}.{name}: vs hand-written rule"
         )

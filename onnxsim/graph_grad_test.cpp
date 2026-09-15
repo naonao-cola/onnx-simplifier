@@ -1230,12 +1230,18 @@ void APoolGeometryThatDoesNotResolveIsRefused() {
 // own input, which is why this matters -- would keep only one contribution,
 // and the parameter upstream of it would train on a fraction of its
 // gradient.
+//
+// BuildBackwardWithHandWrittenRules rather than plain BuildBackward: Rules()
+// now differentiates "Mul" via the checked-in GradMulTemplated, whose Call
+// node this test's exact op-type pin does not care about -- what it is
+// pinning is BuildBackwardImpl's own accumulation logic (the Add), not which
+// rule produced either half.
 void ATensorReadTwiceAccumulatesItsContributions() {
   const std::vector<onnx::NodeProto> nodes = {Node("Mul", {"A", "A"}, {"Y"})};
   const Shapes shapes = {{"A", {2, 3}}, {"Y", {2, 3}}};
   GraphBuilder b;
   const std::map<std::string, std::string> grads =
-      BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"A"});
+      BuildBackwardWithHandWrittenRules(b, nodes, shapes, {{"Y", "dY"}}, {"A"});
   const std::vector<std::string> expected = {"Mul", "Mul", "Add"};
   Check(OpTypes(b) == expected,
         "Mul(A, A) should contribute twice to A and sum the two");

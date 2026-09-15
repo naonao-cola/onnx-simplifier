@@ -46,4 +46,109 @@ GradBatchNormalization (g, x, mean_b, var_b, scale_b, eps, channel_axes, one, ne
    [n15] dvar = Mul (tmp_5, neg_half)
 })GRAD_TPL";
 
+constexpr const char* kGradNegTemplate = R"GRAD_TPL(<
+  domain: "onnxsim.grad",
+  opset_import: ["" : 17]
+>
+GradNeg (g) => (dx)
+{
+   [n0] dx = Neg (g)
+})GRAD_TPL";
+
+constexpr const char* kGradExpTemplate = R"GRAD_TPL(<
+  domain: "onnxsim.grad",
+  opset_import: ["" : 17]
+>
+GradExp (g, y) => (dx)
+{
+   [n0] dx = Mul (g, y)
+})GRAD_TPL";
+
+constexpr const char* kGradSqrtTemplate = R"GRAD_TPL(<
+  domain: "onnxsim.grad",
+  opset_import: ["" : 17]
+>
+GradSqrt (g, y, half) => (dx)
+{
+   [n0] tmp = Mul (g, half)
+   [n1] dx = Div (tmp, y)
+})GRAD_TPL";
+
+constexpr const char* kGradLogTemplate = R"GRAD_TPL(<
+  domain: "onnxsim.grad",
+  opset_import: ["" : 17]
+>
+GradLog (g, x) => (dx)
+{
+   [n0] dx = Div (g, x)
+})GRAD_TPL";
+
+constexpr const char* kGradSigmoidTemplate = R"GRAD_TPL(<
+  domain: "onnxsim.grad",
+  opset_import: ["" : 17]
+>
+GradSigmoid (g, y, one) => (dx)
+{
+   [n0] tmp = Sub (one, y)
+   [n1] dy = Mul (y, tmp)
+   [n2] dx = Mul (g, dy)
+})GRAD_TPL";
+
+constexpr const char* kGradTanhTemplate = R"GRAD_TPL(<
+  domain: "onnxsim.grad",
+  opset_import: ["" : 17]
+>
+GradTanh (g, y, one) => (dx)
+{
+   [n0] tmp = Mul (y, y)
+   [n1] dy = Sub (one, tmp)
+   [n2] dx = Mul (g, dy)
+})GRAD_TPL";
+
+constexpr const char* kGradErfTemplate = R"GRAD_TPL(<
+  domain: "onnxsim.grad",
+  opset_import: ["" : 17]
+>
+GradErf (g, x, c) => (dx)
+{
+   [n0] tmp = Mul (x, x)
+   [n1] tmp_0 = Neg (tmp)
+   [n2] tmp_1 = Exp (tmp_0)
+   [n3] dy = Mul (c, tmp_1)
+   [n4] dx = Mul (g, dy)
+})GRAD_TPL";
+
+constexpr const char* kGradReluTemplate = R"GRAD_TPL(<
+  domain: "onnxsim.grad",
+  opset_import: ["" : 17]
+>
+GradRelu (g, x, zero) => (dx)
+{
+   [n0] tmp = Greater (x, zero)
+   [n1] mask = Cast <to: int = 1> (tmp)
+   [n2] dx = Mul (g, mask)
+})GRAD_TPL";
+
+constexpr const char* kGradMulTemplate = R"GRAD_TPL(<
+  domain: "onnxsim.grad",
+  opset_import: ["" : 17]
+>
+GradMul (g, a, b) => (da, db)
+{
+   [n0] da = Mul (g, b)
+   [n1] db = Mul (g, a)
+})GRAD_TPL";
+
+constexpr const char* kGradDivTemplate = R"GRAD_TPL(<
+  domain: "onnxsim.grad",
+  opset_import: ["" : 17]
+>
+GradDiv (g, a, b, y) => (da, db)
+{
+   [n0] da = Div (g, b)
+   [n1] tmp = Mul (g, y)
+   [n2] tmp_0 = Div (tmp, b)
+   [n3] db = Neg (tmp_0)
+})GRAD_TPL";
+
 #endif  // ONNXSIM_GRAPH_GRAD_TEMPLATES_GEN_H_
