@@ -92,6 +92,17 @@ jobs:
             # Windows runner (see test_wheels_windows_cross). Skip it here; the
             # same test still runs on the cp311-cp313 jobs (cp311/cp312 on PRs).
             pytest_args: '-k "not test_ext"'
+          # macOS has no OS-specific behavior to cover in the axera/
+          # quantization/pruning suites (they exercise onnxsim's own
+          # algorithm/format logic against onnx's reference evaluator, not
+          # anything platform-dependent) -- skip them here since the ubuntu-*
+          # legs above already run them in full on every py_ver. Matches a
+          # subset of matrix keys (os only), so this merges into every
+          # macos-15 combination above rather than adding a new job. See
+          # tests/conftest.py's pytest_collection_modifyitems for how the
+          # axera/quantization/pruning markers get applied.
+          - os: macos-15
+            pytest_args: '-m "not axera and not quantization and not pruning"'
         # macOS runners are the slowest/most contended in this matrix; a pull
         # request only needs one macOS build to confirm the platform still
         # works, so drop it down to the oldest supported version there. push
@@ -294,7 +305,12 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           # test_ext allocates a ~2 GiB fp16 tensor; skip it on the Windows runner.
-          pytest -v -k "not test_ext" "${GITHUB_WORKSPACE}/tests"
+          # The axera/quantization/pruning suites are also skipped here for
+          # the same reason as the macos-15 leg above (see build_wheels'
+          # matrix.include and tests/conftest.py's pytest_collection_modifyitems):
+          # no OS-specific behavior, and the ubuntu-* legs already cover them
+          # in full.
+          pytest -v -k "not test_ext" -m "not axera and not quantization and not pruning" "${GITHUB_WORKSPACE}/tests"
           onnxsim -h
           onnxsim --list-default-optimizers
 
