@@ -190,6 +190,103 @@ WasmTensor RunDecoderStep(const Session& session, const std::vector<int64_t>& st
   return *logits;
 }
 
+// ---------------------------------------------------------------------
+// Fixed-buffer ("static") KV cache pipeline -- WASM port of
+// onnx_deploy::StaticKvCachePipeline's algorithm (see
+// ../../include/onnx_deploy/static_kv_cache_pipeline.h), for the
+// onnxsim.export_causal_lm_static_cache() export shape (prefill.onnx +
+// decode.onnx, decoder-only causal LMs only). Unlike the native pipeline,
+// this can't bind an output back onto the same buffer it read as an input
+// (Ort::IoBinding's buffer-aliasing trick) -- every RunSession call crosses
+// the JS/wasm Asyncify boundary through a serialized WasmTensor, which is
+// always a fresh copy on both sides -- so there is no in-place-write
+// optimization to port here; this is a functionally-equivalent, not
+// performance-equivalent, port (still avoids the *growing*-buffer
+// reallocation-and-copy the Layer 1 WASM port has, since every buffer here
+// stays exactly max_cache_len long, but each step still copies that whole
+// fixed-size buffer across the JS boundary, same as any other tensor).
+//
+// Also unlike the native pipeline (which reads num_kv_heads/head_dim off
+// decode.onnx's own declared input shape via Ort::Session::GetInputTypeInfo),
+// onnxDeployCreateSession's contract here only reports input/output *names*,
+// not shapes (see ort_web_runtime.mjs) -- extending it to report shapes too
+// is a reasonable follow-up, not done here. generateStatic() instead takes
+// num_kv_heads/head_dim as explicit parameters, the same "caller already
+// knows the architecture" pattern max_cache_len itself already uses.
+
+WasmTensor MakeCachePositionTensor(int64_t start, size_t len) {
+  WasmTensor t;
+  t.dtype = "int64";
+  t.shape = {static_cast<double>(len)};
+  t.data.resize(len);
+  for (size_t i = 0; i < len; ++i) t.data[i] = static_cast<double>(start) + static_cast<double>(i);
+  return t;
+}
+
+// Full-buffer-length mask, 1s for real content written so far, 0s for the
+// not-yet-written tail -- same convention transformers.StaticCache's own
+// get_mask_sizes() expects (see onnxsim/transformers_export.py's own
+// docstring, and static_kv_cache_pipeline.h's RunStep, which this mirrors).
+WasmTensor MakeStaticMaskTensor(int64_t max_cache_len, int64_t valid_len) {
+  WasmTensor t;
+  t.dtype = "int64";
+  t.shape = {1, static_cast<double>(max_cache_len)};
+  t.data.assign(static_cast<size_t>(max_cache_len), 0.0);
+  for (int64_t i = 0; i < valid_len && i < max_cache_len; ++i) t.data[static_cast<size_t>(i)] = 1.0;
+  return t;
+}
+
+WasmTensor ZeroKvTensor(int64_t num_kv_heads, int64_t max_cache_len, int64_t head_dim) {
+  WasmTensor t;
+  t.dtype = "float32";
+  t.shape = {1, static_cast<double>(num_kv_heads), static_cast<double>(max_cache_len), static_cast<double>(head_dim)};
+  t.data.assign(static_cast<size_t>(num_kv_heads * max_cache_len * head_dim), 0.0);
+  return t;
+}
+
+// Runs one prefill or decode step against `kv` (keyed "past_key.{i}"/
+// "past_value.{i}", updated in place from this call's present_key.{i}/
+// present_value.{i} outputs -- see this section's own header comment on why
+// that's a copy here, unlike the native pipeline's true buffer aliasing).
+// Returns "logits".
+WasmTensor RunStaticStep(const Session& session, const std::vector<int64_t>& step_input_ids, int64_t cache_start,
+                          int64_t max_cache_len, std::map<std::string, WasmTensor>& kv) {
+  std::map<std::string, WasmTensor> named_inputs;
+  for (const auto& name : session.input_names) {
+    if (name == "input_ids") {
+      named_inputs[name] = MakeIdsTensor(step_input_ids);
+    } else if (name == "cache_position") {
+      named_inputs[name] = MakeCachePositionTensor(cache_start, step_input_ids.size());
+    } else if (name == "attention_mask") {
+      named_inputs[name] = MakeStaticMaskTensor(max_cache_len, cache_start + static_cast<int64_t>(step_input_ids.size()));
+    } else if (name.rfind("past_key.", 0) == 0 || name.rfind("past_value.", 0) == 0) {
+      auto it = kv.find(name);
+      if (it == kv.end()) throw std::runtime_error("missing cache entry for " + name);
+      named_inputs[name] = it->second;
+    } else {
+      throw std::runtime_error("unrecognized static-cache decoder input: " + name);
+    }
+  }
+
+  std::vector<WasmTensor> outputs = RunSession(session, named_inputs);
+
+  static const std::string kPresentKeyPrefix = "present_key.";
+  static const std::string kPresentValuePrefix = "present_value.";
+  const WasmTensor* logits = nullptr;
+  for (size_t i = 0; i < session.output_names.size(); ++i) {
+    const std::string& name = session.output_names[i];
+    if (name == "logits") {
+      logits = &outputs[i];
+    } else if (name.rfind(kPresentKeyPrefix, 0) == 0) {
+      kv["past_key." + name.substr(kPresentKeyPrefix.size())] = outputs[i];
+    } else if (name.rfind(kPresentValuePrefix, 0) == 0) {
+      kv["past_value." + name.substr(kPresentValuePrefix.size())] = outputs[i];
+    }
+  }
+  if (!logits) throw std::runtime_error("static-cache decoder graph has no 'logits' output");
+  return *logits;
+}
+
 int64_t ArgmaxLastToken(const WasmTensor& logits) {
   size_t vocab = static_cast<size_t>(logits.shape.back());
   size_t seq = logits.shape.size() >= 2 ? static_cast<size_t>(logits.shape[logits.shape.size() - 2]) : 1;
@@ -290,6 +387,69 @@ val Generate(val encoder_bytes, val decoder_bytes, val decoder_past_bytes, val i
   }
 }
 
+// Mirrors StaticKvCachePipeline::Generate. `execution_providers` is the
+// same JS array of onnxruntime-web EP name strings Generate() above takes.
+val GenerateStaticImpl(val prefill_bytes, val decode_bytes, val input_ids_val, double max_new_tokens,
+                        double eos_token_id, double max_cache_len, double num_kv_heads, double head_dim,
+                        val execution_providers) {
+  std::vector<double> input_ids_d = emscripten::vecFromJSArray<double>(input_ids_val);
+  std::vector<int64_t> input_ids(input_ids_d.begin(), input_ids_d.end());
+  int64_t max_cache = static_cast<int64_t>(max_cache_len);
+  int64_t kv_heads = static_cast<int64_t>(num_kv_heads);
+  int64_t dim = static_cast<int64_t>(head_dim);
+  int64_t eos = static_cast<int64_t>(eos_token_id);
+
+  Session prefill_session = CreateSession(prefill_bytes, execution_providers);
+  Session decode_session = CreateSession(decode_bytes, execution_providers);
+
+  int64_t num_layers = 0;
+  for (const auto& name : decode_session.input_names)
+    if (name.rfind("past_key.", 0) == 0) ++num_layers;
+  if (num_layers == 0) throw std::runtime_error("decode session has no past_key.* inputs");
+
+  std::map<std::string, WasmTensor> kv;
+  for (int64_t i = 0; i < num_layers; ++i) {
+    kv["past_key." + std::to_string(i)] = ZeroKvTensor(kv_heads, max_cache, dim);
+    kv["past_value." + std::to_string(i)] = ZeroKvTensor(kv_heads, max_cache, dim);
+  }
+
+  std::vector<int64_t> generated;
+  WasmTensor logits = RunStaticStep(prefill_session, input_ids, /*cache_start=*/0, max_cache, kv);
+  int64_t next_token = ArgmaxLastToken(logits);
+  generated.push_back(next_token);
+  int64_t write_pos = static_cast<int64_t>(input_ids.size());
+
+  if (!(eos_token_id >= 0 && next_token == eos)) {
+    for (int64_t step = 1; step < static_cast<int64_t>(max_new_tokens); ++step) {
+      logits = RunStaticStep(decode_session, {next_token}, write_pos, max_cache, kv);
+      next_token = ArgmaxLastToken(logits);
+      generated.push_back(next_token);
+      write_pos += 1;
+      if (eos_token_id >= 0 && next_token == eos) break;
+    }
+  }
+
+  return val::array(generated.begin(), generated.end());
+}
+
+// Same crash-avoidance wrapping as Generate above -- see its own comment.
+val GenerateStatic(val prefill_bytes, val decode_bytes, val input_ids_val, double max_new_tokens,
+                    double eos_token_id, double max_cache_len, double num_kv_heads, double head_dim,
+                    val execution_providers) {
+  try {
+    return GenerateStaticImpl(prefill_bytes, decode_bytes, input_ids_val, max_new_tokens, eos_token_id, max_cache_len,
+                              num_kv_heads, head_dim, execution_providers);
+  } catch (const std::exception& e) {
+    return val::global("Promise").call<val>("reject", val(std::string(e.what())));
+  } catch (...) {
+    return val::global("Promise")
+        .call<val>("reject", val(std::string("unknown error in onnx_deploy_wasm generateStatic()")));
+  }
+}
+
 }  // namespace
 
-EMSCRIPTEN_BINDINGS(onnx_deploy_wasm) { emscripten::function("generate", &Generate); }
+EMSCRIPTEN_BINDINGS(onnx_deploy_wasm) {
+  emscripten::function("generate", &Generate);
+  emscripten::function("generateStatic", &GenerateStatic);
+}

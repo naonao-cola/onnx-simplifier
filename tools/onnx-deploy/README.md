@@ -118,15 +118,26 @@ shapes, since the export doesn't record which dim was originally dynamic)
 needs to come from the caller, and must match what
 `export_causal_lm_static_cache()` was called with.
 
-**Scope note:** this header compiles cleanly against a real ONNX Runtime C++
-API (verified against the `onnxruntime-linux-x64-1.20.0` release headers --
-every method call type-checks, `-Wall -Wextra` clean), and its design
-mirrors `kv_cache_pipeline.h`'s own conventions throughout, but it is not
-yet wired into Layers 2/3 below -- no C ABI functions, no CLI flag, no
-Python/WASM binding. Those are a mechanical follow-up (mirror
-`onnx_deploy_c_api.h`/`.cpp`'s existing `onnx_deploy_create`/
-`onnx_deploy_generate` shape for this pipeline) rather than an open design
-question, but they are not done here.
+**Status:** wired into every Layer 2/3 surface below, mirroring
+`onnx_deploy_create`/`onnx_deploy_generate`'s own shape exactly --
+`onnx_deploy_static_create[_ex]`/`onnx_deploy_static_generate`/
+`onnx_deploy_static_destroy` in the C ABI, `--static --max-cache-len N` on
+the CLI, `onnx_deploy_py.StaticPipeline` in the Python extension, and
+`Module.generateStatic()` in the WASM module. Verified end-to-end against a
+real `libonnxruntime.so` (not just headers): the CLI and the Python
+extension were both built and linked against ONNX Runtime 1.20.0 and run
+against a real `export_causal_lm_static_cache()` export
+(`hf-internal-testing/tiny-random-gpt2`), producing token sequences
+identical to the growing-cache baseline -- including through the
+`Ort::IoBinding` buffer-aliasing path, confirming ONNX Runtime's `ScatterND`
+kernel handles an aliased input/output buffer correctly rather than just
+compiling. The WASM binding (`generateStatic()` in
+`wasm/src/onnx_deploy_wasm.cpp`) is reviewed against the same patterns the
+rest of this file already uses, but not compiled against a real Emscripten
+toolchain -- installing one in this environment was blocked by an unrelated
+package-mirror issue, and forcing it through risked the surrounding
+container, so it's unverified beyond careful manual review; treat it as
+the one piece here still needing a real build/test pass.
 
 ### Layer 2: the swappable-libort C ABI (`onnx_deploy_c_api.h` / `.cpp`)
 

@@ -24,13 +24,16 @@ struct Args {
   int64_t decoder_start_token_id = 0;
   std::string execution_provider = "cpu";
   int cuda_device_id = 0;
+  bool use_static_cache = false;
+  int64_t max_cache_len = 0;
 };
 
 [[noreturn]] void Usage(const char* prog) {
   std::fprintf(stderr,
       "usage: %s --libort PATH <export_dir> <id1,id2,...> [--max-new-tokens N]\n"
       "          [--eos-token-id N] [--decoder-start-token-id N]\n"
-      "          [--execution-provider cpu|cuda|webgpu] [--cuda-device-id N]\n\n"
+      "          [--execution-provider cpu|cuda|webgpu] [--cuda-device-id N]\n"
+      "          [--static --max-cache-len N]\n\n"
       "--libort PATH points at the libonnxruntime shared library to load at\n"
       "runtime (e.g. an extracted onnxruntime-linux-x64-*.tgz's lib/libonnxruntime.so) --\n"
       "any build works, nothing about this tool is compiled against a specific one.\n\n"
@@ -42,10 +45,17 @@ struct Args {
       "the plain prebuilt release tarballs don't include it) and a GPU; this is ORT's\n"
       "own native WebGPU EP (Dawn), not onnxruntime-web's browser one the wasm/ build\n"
       "uses -- same clean-failure behavior if unavailable.\n\n"
-      "<export_dir> must contain decoder_model.onnx + decoder_with_past_model.onnx\n"
-      "(and encoder_model.onnx for seq2seq models) -- the optimum-onnx\n"
-      "no_post_process=True export shape. <id1,id2,...> are token ids (from a\n"
-      "tokenizer run separately), comma-separated, no spaces.\n",
+      "By default, <export_dir> must contain decoder_model.onnx +\n"
+      "decoder_with_past_model.onnx (and encoder_model.onnx for seq2seq models) --\n"
+      "the optimum-onnx no_post_process=True export shape.\n\n"
+      "--static switches to the fixed-buffer KV-cache pipeline instead (decoder-only\n"
+      "causal LMs only, no seq2seq): <export_dir> must contain prefill.onnx +\n"
+      "decode.onnx (onnxsim.export_causal_lm_static_cache()'s export shape -- see\n"
+      "../README.md's \"Layer 1b\" section). --max-cache-len N is then required, and\n"
+      "must match the value that export call used; --decoder-start-token-id is\n"
+      "ignored (--static pipelines have no encoder/cross-attention).\n\n"
+      "<id1,id2,...> are token ids (from a tokenizer run separately),\n"
+      "comma-separated, no spaces.\n",
       prog);
   std::exit(1);
 }
@@ -74,6 +84,8 @@ Args ParseArgs(int argc, char** argv) {
     else if (arg == "--decoder-start-token-id") a.decoder_start_token_id = std::stoll(need(i));
     else if (arg == "--execution-provider") a.execution_provider = need(i);
     else if (arg == "--cuda-device-id") a.cuda_device_id = std::stoi(need(i));
+    else if (arg == "--static") a.use_static_cache = true;
+    else if (arg == "--max-cache-len") a.max_cache_len = std::stoll(need(i));
     else if (arg == "-h" || arg == "--help") Usage(argv[0]);
     else if (!arg.empty() && arg[0] == '-') {
       std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
@@ -83,6 +95,7 @@ Args ParseArgs(int argc, char** argv) {
     }
   }
   if (a.libort_path.empty() || positional.size() != 2) Usage(argv[0]);
+  if (a.use_static_cache && a.max_cache_len <= 0) Usage(argv[0]);
   a.model_dir = positional[0];
   a.input_ids = ParseIds(positional[1]);
   if (a.input_ids.empty()) Usage(argv[0]);
@@ -97,12 +110,10 @@ Args ParseArgs(int argc, char** argv) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  Args args = ParseArgs(argc, argv);
+namespace {
 
+int RunGrowingCache(const Args& args) {
   char* err = nullptr;
-  if (onnx_deploy_load_ort(args.libort_path.c_str(), &err) != ONNX_DEPLOY_OK) Die("onnx_deploy_load_ort", err);
-
   OnnxDeployPipeline* pipeline =
       onnx_deploy_create_ex(args.model_dir.c_str(), args.execution_provider.c_str(), args.cuda_device_id, &err);
   if (!pipeline) Die("onnx_deploy_create_ex", err);
@@ -127,4 +138,43 @@ int main(int argc, char** argv) {
   onnx_deploy_free_ids(out_ids);
   onnx_deploy_destroy(pipeline);
   return 0;
+}
+
+int RunStaticCache(const Args& args) {
+  char* err = nullptr;
+  OnnxDeployStaticPipeline* pipeline = onnx_deploy_static_create_ex(
+      args.model_dir.c_str(), args.max_cache_len, args.execution_provider.c_str(), args.cuda_device_id, &err);
+  if (!pipeline) Die("onnx_deploy_static_create_ex", err);
+  std::printf("loaded static-cache pipeline from %s (max_cache_len=%lld, via %s, execution provider: %s)\n",
+              args.model_dir.c_str(), static_cast<long long>(args.max_cache_len), args.libort_path.c_str(),
+              args.execution_provider.c_str());
+
+  int64_t* out_ids = nullptr;
+  size_t out_count = 0;
+  OnnxDeployStatus status = onnx_deploy_static_generate(pipeline, args.input_ids.data(), args.input_ids.size(),
+                                                        args.max_new_tokens, args.eos_token_id, &out_ids, &out_count,
+                                                        &err);
+  if (status != ONNX_DEPLOY_OK) {
+    onnx_deploy_static_destroy(pipeline);
+    Die("onnx_deploy_static_generate", err);
+  }
+
+  std::printf("generated %zu token(s):", out_count);
+  for (size_t i = 0; i < out_count; ++i) std::printf(" %lld", static_cast<long long>(out_ids[i]));
+  std::printf("\n");
+
+  onnx_deploy_free_ids(out_ids);
+  onnx_deploy_static_destroy(pipeline);
+  return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  Args args = ParseArgs(argc, argv);
+
+  char* err = nullptr;
+  if (onnx_deploy_load_ort(args.libort_path.c_str(), &err) != ONNX_DEPLOY_OK) Die("onnx_deploy_load_ort", err);
+
+  return args.use_static_cache ? RunStaticCache(args) : RunGrowingCache(args);
 }
