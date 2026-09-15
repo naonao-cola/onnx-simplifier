@@ -125,3 +125,13 @@ jobs:
       - name: Run step-graph EP coverage test (wasm EP; webgpu/webnn reported)
         working-directory: scripts/convertmodel
         run: npm run test:stepgraph
+      # Regression test for a real intermittent failure in the (browser-only,
+      # not run here) webgpu_hf_demo.test.mjs: replays step_qat_hf_demo.onnx
+      # against a deterministic adversarial input (webgpu_hf_demo_adversarial_x.json)
+      # whose untrained forward pass already lands within float32 precision
+      # of the target, and checks that a naive first/last endpoint comparison
+      # would fail for it while the windowed-average comparison both files
+      # now use correctly passes. Plain Node/wasm, no browser or GPU needed.
+      - name: Run HF demo loss-check regression test (wasm EP)
+        working-directory: scripts/convertmodel
+        run: npm run test:hf-demo-loss-check
