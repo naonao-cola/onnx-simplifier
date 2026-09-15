@@ -7237,6 +7237,17 @@ two and refined the third:
   the resident runner (which keeps true state on-device) -- see the
   gradient-dies ceiling discussion above for the same mechanism on
   gradients.
+- **Warmup closes the loop: 8 closed-loop NPU steps track ORT.** CPU
+  warmup sidesteps the wall above instead of punching through it:
+  moments grow ~1000x in the first ~20 host steps (m to ~2.5e-2, v to
+  ~2.4e-5 on the toy graph) and then plateau, so compiling against a
+  mid-training trajectory (steps 20-27 snapshots as `real_data`, same
+  FP32 recipe) calibrates ranges the device values actually resolve
+  in. Closed-loop device steps 20-27 (outputs fed back each step):
+  weight divergence vs ORT grows 1.8e-4 to 2.5e-3 (linear INT8-noise
+  accumulation, ~0.1%/step) while moment divergence stays flat at
+  ~1e-4 -- no blowup, the loop genuinely trains on the card. Loss
+  readout still needs the `* B` compensation above.
 
 ## Files
 
