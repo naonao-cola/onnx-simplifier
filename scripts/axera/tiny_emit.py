@@ -41,7 +41,7 @@ target build's own bytes for that family.
 
 Status (2026-09-16): scale, output-quad and (when present) zp_x words
 are mapped, verified offline (round-trip exactly, pass ``mcode.check``),
-and confirmed once on real AX650N hardware
+and confirmed twice on real AX650N hardware
 (tests/test_axera_mul_emit_hardware.py): patching a reference build's
 scales + output quad + zp_x (17 bytes total, in that one build pair)
 reproduced a real rebuild's device output *bit-exactly*, not just within
@@ -50,9 +50,18 @@ result to hold. This supersedes an earlier note here about the emitted
 stream running ~0.19-vs-0.006 against ORT -- that check pre-dated the
 output-quad and zp_x work and used a different code path (``emit_neg``,
 not the Mul patch functions); it has not been repeated against these.
-One data point is not a general proof -- see the two functions' own
-docstrings for exactly what is and isn't covered. tinygrad itself is an
-optional, lazily-imported dependency: everything else here needs only
+
+**Practical recommendation, also hardware-confirmed**: if the calibration
+data can be chosen (as opposed to given), keep it non-negative for both
+inputs -- MinMax clipping then guarantees zp_x = zp_y = 0 (see
+``TestSiteBFormSelectorIsZpX`` in the test file), which sidesteps
+``patch_mul_zp_x`` and its "does this build even use the literal form"
+uncertainty entirely: only ``patch_mul_scales`` + ``patch_mul_output_quad``
+are needed, and that combination also reproduces a real rebuild
+bit-exactly (second test in the hardware file). Two data points, not a
+general proof -- see the hardware test file's own docstring for exactly
+what is and isn't covered. tinygrad itself is an optional, lazily-imported
+dependency: everything else here needs only
 ``numpy``.
 """
 

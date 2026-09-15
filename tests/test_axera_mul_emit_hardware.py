@@ -27,6 +27,17 @@ whenever the opaque zp_x forms are involved (untested -- patch_mul_zp_x
 raises rather than guessing there) or that zp_y ever needs patching (also
 untested -- no known encoding for it, see the module docstring).
 
+A second test below sidesteps the zero-point question entirely: two
+builds calibrated on strictly positive ranges (min >= 0 for both x and
+y, guaranteeing zp_x = zp_y = 0 by how Pulsar2's MinMax clipping works --
+see TestSiteBFormSelectorIsZpX's controlled-shift builds in
+tests/test_axera_mcode_reciprocal.py) need only the scale + output-quad
+patch, no zp_x patching call at all, and *also* match a real rebuild
+bit-exactly on device. **Practical upshot for anyone emitting a fresh Mul
+stream**: choose (or shift) calibration data to be non-negative and this
+project's whole open zero-point-encoding question stops mattering for
+that op -- confirmed on hardware, not just claimed.
+
 Needs a loaded `pulsar2:*` Docker image to (re)build and an AX650N card
 to run -- skip-guarded on both, like the rest of the hardware suite.
 """
@@ -70,7 +81,7 @@ _X_LO, _X_HI = 0.05, 2.0
 _Y_LO, _Y_HI = 0.05, 2.0
 
 
-def _build(tmp_path, tag, x_shift):
+def _build(tmp_path, tag, x_lo, x_hi, y_lo, y_hi):
     work_dir = os.path.join(str(tmp_path), f"mul_{tag}")
     os.makedirs(os.path.join(work_dir, "dataset"), exist_ok=True)
     model = parser.parse_model(
@@ -80,16 +91,13 @@ def _build(tmp_path, tag, x_shift):
     )
     onnx.save(model, os.path.join(work_dir, "model.onnx"))
     # One continuous rng stream, x drawn before y -- matches the scratch
-    # recipe (mul_poscalib.py) this test's shift constants were verified
-    # against offline; drawing y from a separately-seeded stream would
-    # change its calibration values and invalidate the "0.31 -> zp_x=33,
-    # 0.32 -> zp_x=35" facts asserted below.
+    # recipe (mul_poscalib.py, mul_zpsweep2_*.py) this test's calibration
+    # ranges were verified against offline; drawing y from a
+    # separately-seeded stream would change its calibration values and
+    # invalidate the zp_x facts asserted by callers below.
     rng = np.random.default_rng(0)
-    x_cal = [
-        (rng.uniform(_X_LO, _X_HI, (1, 8)) - x_shift).astype(np.float32)
-        for _ in range(8)
-    ]
-    y_cal = [(rng.uniform(_Y_LO, _Y_HI, (1, 8))).astype(np.float32) for _ in range(8)]
+    x_cal = [(rng.uniform(x_lo, x_hi, (1, 8))).astype(np.float32) for _ in range(8)]
+    y_cal = [(rng.uniform(y_lo, y_hi, (1, 8))).astype(np.float32) for _ in range(8)]
     pulsar2_docker.make_numpy_calibration_tar(
         os.path.join(work_dir, "dataset", "x.tar"), x_cal
     )
@@ -172,8 +180,12 @@ def _run_retry_once(axmodel_path, feeds):
 
 
 def test_patched_stream_matches_real_rebuild_bit_exactly(tmp_path):
-    ref_dir = _build(tmp_path, "ref", _SHIFT_REF)
-    tgt_dir = _build(tmp_path, "tgt", _SHIFT_TGT)
+    ref_dir = _build(
+        tmp_path, "ref", _X_LO - _SHIFT_REF, _X_HI - _SHIFT_REF, _Y_LO, _Y_HI
+    )
+    tgt_dir = _build(
+        tmp_path, "tgt", _X_LO - _SHIFT_TGT, _X_HI - _SHIFT_TGT, _Y_LO, _Y_HI
+    )
 
     ref_q = _quant_params(os.path.join(ref_dir, "quant", "quant_axmodel.onnx"))
     tgt_q = _quant_params(os.path.join(tgt_dir, "quant", "quant_axmodel.onnx"))
@@ -219,6 +231,57 @@ def test_patched_stream_matches_real_rebuild_bit_exactly(tmp_path):
 
     # And both are within quantization noise of the float reference, so
     # "bit-exact vs target" isn't bit-exact against a broken target.
+    z_numpy = x * y
+    max_lsb = float(np.abs(z_tgt - z_numpy.reshape(-1)).max() / tgt_q["zs"])
+    assert max_lsb <= 1.5, max_lsb
+
+
+def test_positive_only_calibration_sidesteps_zero_points(tmp_path):
+    """Both builds calibrated non-negative (zp_x = zp_y = 0 guaranteed):
+    only patch_mul_scales + patch_mul_output_quad are needed -- no
+    patch_mul_zp_x call at all -- and the result still matches a real
+    rebuild bit-exactly. This is the practical workaround the module
+    docstring recommends."""
+    ref_dir = _build(tmp_path, "poszp_ref", 0.02, 1.0, 0.02, 1.0)
+    tgt_dir = _build(tmp_path, "poszp_tgt", 0.05, 3.0, 0.1, 2.5)
+
+    ref_q = _quant_params(os.path.join(ref_dir, "quant", "quant_axmodel.onnx"))
+    tgt_q = _quant_params(os.path.join(tgt_dir, "quant", "quant_axmodel.onnx"))
+    assert (ref_q["zpx"], ref_q["zpy"]) == (0, 0), ref_q
+    assert (tgt_q["zpx"], tgt_q["zpy"]) == (0, 0), tgt_q
+
+    ref_ax = os.path.join(ref_dir, "compiled.axmodel")
+    tgt_ax = os.path.join(tgt_dir, "compiled.axmodel")
+
+    ref_mcode = mcode.mcodes_of(ref_ax)[0][1]
+    patched = tiny_emit.patch_mul_scales(
+        ref_mcode,
+        (ref_q["xs"], ref_q["ys"], ref_q["zs"]),
+        (tgt_q["xs"], tgt_q["ys"], tgt_q["zs"]),
+    )
+    patched = tiny_emit.patch_mul_output_quad(patched, ref_q["zs"], tgt_q["zs"])
+    assert mcode.check(patched) == []
+
+    patched_ax = os.path.join(str(tmp_path), "patched_poszp.axmodel")
+    _write_patched_axmodel(ref_ax, patched, patched_ax)
+
+    if not pulsar2_docker.axcl_available():
+        pytest.skip("no AXCL device")
+
+    rng = np.random.default_rng(9)
+    x = (rng.uniform(0.05, 0.95, (1, 8))).astype(np.float32)
+    y = (rng.uniform(0.15, 2.4, (1, 8))).astype(np.float32)
+    feeds = {"x": x.tobytes(), "y": y.tobytes()}
+
+    dev_tgt = _run_retry_once(tgt_ax, feeds)
+    dev_patched = _run_retry_once(patched_ax, feeds)
+    assert not dev_tgt.error, dev_tgt.error
+    assert not dev_patched.error, dev_patched.error
+
+    z_tgt = np.frombuffer(dev_tgt.outputs[0], dtype=np.float32)
+    z_patched = np.frombuffer(dev_patched.outputs[0], dtype=np.float32)
+    assert np.array_equal(z_patched, z_tgt), (z_patched, z_tgt)
+
     z_numpy = x * y
     max_lsb = float(np.abs(z_tgt - z_numpy.reshape(-1)).max() / tgt_q["zs"])
     assert max_lsb <= 1.5, max_lsb
