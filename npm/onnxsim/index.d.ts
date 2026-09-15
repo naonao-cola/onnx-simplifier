@@ -202,6 +202,12 @@ export function applyGptq(
   calibration: CalibrationData,
   options?: { percdamp?: number; procBlockSize?: number },
 ): Promise<Uint8Array>;
+export function applyAwq(
+  floatModel: OnnxModelBytes,
+  quantizedModel: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: { numAlphaSteps?: number },
+): Promise<Uint8Array>;
 export function applySmoothQuant(
   model: OnnxModelBytes,
   calibration: CalibrationData,
@@ -251,6 +257,7 @@ declare const _default: {
   applyOutlierSuppressionPlus: typeof applyOutlierSuppressionPlus;
   applyLlmInt8: typeof applyLlmInt8;
   applyGptq: typeof applyGptq;
+  applyAwq: typeof applyAwq;
   applySmoothQuant: typeof applySmoothQuant;
 };
 export default _default;

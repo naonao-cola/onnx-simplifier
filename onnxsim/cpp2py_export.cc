@@ -1009,6 +1009,39 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "percdamp"_a = 0.01, "proc_block_size"_a = 128);
 
+  // AWQ (Lin et al., 2023): grid-searched per-channel weight rescaling
+  // for every quantize_weight_only_int4-quantized MatMul/Gemm layer
+  // shared (by node output name) between a float model and its quantized
+  // counterpart, re-quantizing from scratch at each grid point and
+  // keeping the exponent with the lowest reconstruction error. Same
+  // two-model executor-as-first-argument shape as apply_gptq's own
+  // binding above; `calibration_data` (List[Dict[str,
+  // onnx.TensorProto]]) is keyed to the float model's own graph inputs.
+  // See ApplyAwq in awq_entry.h for the full scope and onnxsim/awq.py
+  // for the technique this ports.
+  m.def(
+      "apply_awq",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t num_alpha_steps) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result = ApplyAwq(float_model, quantized_model, *executor,
+                                     calibration_data, num_alpha_steps);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "num_alpha_steps"_a = 20);
+
   // SmoothQuant migration (Xiao et al., 2022): rescales every matched
   // MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight columns by the
   // per-channel migration scale `s` in place and inserts a `Mul` node

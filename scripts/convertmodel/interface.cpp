@@ -2868,6 +2868,38 @@ em::val onnxsim_apply_gptq(const std::string &float_data,
   }
 }
 
+// AWQ (Lin et al., 2023): grid-searched per-channel weight rescaling for
+// every quantize_weight_only_int4-quantized MatMul/Gemm layer shared (by
+// node output name) between a float model and its quantized counterpart,
+// re-quantizing from scratch at each grid point. Takes two models like
+// onnxsim_apply_gptq above (float model first) and honors the same
+// calibration-batch contract and executor. `num_alpha_steps` is the grid
+// density over [0, 1] inclusive. See ApplyAwq in awq_entry.h.
+em::val onnxsim_apply_awq(const std::string &float_data,
+                          const std::string &quantized_data,
+                          em::val calibration_batches_val,
+                          int num_alpha_steps) {
+  onnx::ModelProto float_model;
+  if (!float_model.ParseFromArray(float_data.data(), float_data.size())) {
+    std::cerr << "Parse failed (float model)" << std::endl;
+    return em::val::null();
+  }
+  onnx::ModelProto quantized_model;
+  if (!quantized_model.ParseFromArray(quantized_data.data(),
+                                      quantized_data.size())) {
+    std::cerr << "Parse failed (quantized model)" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyAwq(
+        float_model, quantized_model, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), num_alpha_steps));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_awq error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // Outlier Suppression+ (Wei et al., 2023): per-channel shifting ahead of
 // SmoothQuant's own per-channel scale -- recenters each activation
 // channel around zero, rescales the weight columns in place, inserts a
@@ -3019,6 +3051,7 @@ EMSCRIPTEN_BINDINGS(module) {
            &onnxsim_apply_outlier_suppression_plus);
   function("onnxsim_apply_llm_int8", &onnxsim_apply_llm_int8);
   function("onnxsim_apply_gptq", &onnxsim_apply_gptq);
+  function("onnxsim_apply_awq", &onnxsim_apply_awq);
   function("onnxsim_apply_smoothquant", &onnxsim_apply_smoothquant);
 
   // Block-wise QAT: build one block's step graph, run the loop in JS on

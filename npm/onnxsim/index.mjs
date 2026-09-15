@@ -586,6 +586,36 @@ export async function applyGptq(
   return new Uint8Array(result);
 }
 
+/**
+ * AWQ grid-searched per-channel weight rescaling: takes the float model
+ * and its `quantize_weight_only_int4`-quantized counterpart, reuses the
+ * quantized model's structure, and rewrites improved layers (INT4
+ * weight/scale plus a compensating `Mul`). Returns the optimized
+ * quantized model bytes.
+ */
+export async function applyAwq(
+  floatModel,
+  quantizedModel,
+  calibration,
+  { numAlphaSteps = 20 } = {},
+) {
+  const floatBytes = toBytes(floatModel);
+  const quantBytes = toBytes(quantizedModel);
+  const runtime = await getRuntime();
+  const fn = runtime.onnxsim_apply_awq;
+  if (typeof fn !== "function") {
+    throw new Error("onnxsim: this build has no export 'onnxsim_apply_awq' (rebuild the wasm module?)");
+  }
+  let result = fn(floatBytes, quantBytes, normalizeCalibrationBatches(calibration), numAlphaSteps);
+  if (result && typeof result.then === "function") {
+    result = await result;
+  }
+  if (!result) {
+    throw new Error("onnxsim: onnxsim_apply_awq failed (see stderr output for details)");
+  }
+  return new Uint8Array(result);
+}
+
 export default {
   simplify,
   versions,
@@ -624,5 +654,6 @@ export default {
   applyOutlierSuppressionPlus,
   applyLlmInt8,
   applyGptq,
+  applyAwq,
   applySmoothQuant,
 };

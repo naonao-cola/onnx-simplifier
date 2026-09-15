@@ -31,6 +31,7 @@ import {
   applyOutlierSuppressionPlus,
   applyLlmInt8,
   applyGptq,
+  applyAwq,
   applyQuarot,
   applySmoothQuant,
   applyStructuredPruning,
@@ -217,6 +218,19 @@ try {
       X: new ort.Tensor("float32", new Float32Array(32).map((_, i) => ((i * 37) % 11) - 5), [1, 32]),
     });
     const out = await applyGptq(floatModel, quantModel, [batch(), batch()], {});
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applyAwq searches scales on synthetic calibration data", async () => {
+    // Same dedicated fixtures as the GPTQ check above.
+    const ort = await import("onnxruntime-web");
+    const floatModel = new Uint8Array(readFileSync(FIXTURE_GPTQ));
+    const quantModel = new Uint8Array(readFileSync(FIXTURE_GPTQ_INT4));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array(32).map((_, i) => ((i * 37) % 11) - 5), [1, 32]),
+    });
+    const out = await applyAwq(floatModel, quantModel, [batch(), batch()], { numAlphaSteps: 5 });
     assert.ok(out instanceof Uint8Array);
     assert.ok(out.length > 0);
   });

@@ -18,6 +18,7 @@
 // than including its own home header, sharing a single struct definition
 // (rather than a byte-for-byte duplicate struct body in each header) avoids
 // two independently-edited copies of the same type ever drifting apart.
+#include "awq_entry.h"
 #include "gptq_entry.h"
 #include "imatrix_quant_entry.h"
 #include "llm_int8_entry.h"
@@ -817,6 +818,13 @@ onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
 // its own home header instead of this one. See gptq.py's own module
 // docstring for the technique and gptq_entry.h for this port's own scope
 // (including its accepted numerical scope).
+
+// AWQ (Lin et al., 2023) grid-searched per-channel rescaling -- C++ port
+// of awq.py's own apply_awq, declared in awq_entry.h (included above)
+// rather than duplicated here, mirroring how ApplyGptq (gptq_entry.h,
+// also included above) is documented in its own home header instead of
+// this one. See awq.py's own module docstring for the technique and
+// awq_entry.h for this port's own scope.
 
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller
