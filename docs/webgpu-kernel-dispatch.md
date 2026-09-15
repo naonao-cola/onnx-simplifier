@@ -135,6 +135,50 @@ like the one this was first verified in, not in general), plus a JS port of
 `onnxsim.webgpu_target`'s gap-detection to decide *when* to invoke it. Both
 are un-built follow-ups, not done here.
 
+### One flagged node, generated live, verified end to end
+
+`scripts/convertmodel/test/pyodide_webgpu_single_node_codegen.test.mjs`
+takes the above further, for the single simplest real case (a `Conv` node
+with every attribute at its ONNX default -- the same
+`webgpu_tinygrad_conv3d.onnx` fixture `webgpu_tinygrad_codegen.test.mjs`
+already dispatches): it regenerates the *exact same kernel*
+`onnxsim.webgpu_tinygrad_codegen.generate_conv_kernel` already produced for
+that node offline, entirely client-side, with no `onnx`-the-Python-package
+and no numpy anywhere in the browser-side path:
+
+1. `scripts/convertmodel/onnx_conv_node_reader.mjs` -- a new hand-rolled
+   protobuf reader, sibling to `onnx_node_metadata.mjs` -- reads the node's
+   own shapes (from a graph input or an initializer) and attributes
+   (`kernel_shape`, `strides`, `dilations`, `group`, `pads`, `auto_pad`,
+   with the same defaults `generate_conv_kernel` itself applies) straight
+   out of the raw `.onnx` bytes, in JS.
+2. That shape/attribute info -- never any tensor *values*, which kernel
+   generation doesn't depend on -- drives a numpy-free, onnx-free
+   translation of `generate_conv_kernel` + its own `_lower_tensor_program`
+   helper, run inside Pyodide, producing a
+   `onnxsim.webgpu_kernel_metadata.WebgpuKernelSpec`-shaped JSON program.
+3. That live-generated spec is asserted to `deepEqual` the spec
+   `generate_conv_kernel` already attached to the fixture offline -- same
+   WGSL text, entry point, dispatch, bindings -- proving this isn't just "a
+   kernel that happens to run" but the identical one.
+4. The live spec (not the fixture's own) is then dispatched via
+   `webgpu_kernel_dispatcher.mjs` against a real WebGPU device, fed the
+   fixture's real concrete `x`/`w` values, and checked against
+   `onnx.reference.ReferenceEvaluator`'s own output for the real node --
+   the same numeric bar every other kernel test here holds itself to.
+
+Scope: this is one op (`Conv`), one node, attributes read from a graph
+input/initializer only (no shape-inference fallback for an upstream node's
+output shape -- see `onnx_conv_node_reader.mjs`'s own docstring). Getting
+from here to "flag a gap and generate its kernel live for any node in any
+real model" still needs the same two follow-ups named above (a JS port of
+`onnxsim.webgpu_target`'s gap-detection to pick *which* node, and either a
+numpy-free `initializer.raw_data` reader or a real browser's numpy for
+`generate_resize_kernel`'s case, which -- unlike Conv -- does depend on a
+constant input's actual values). What this does settle: the remaining gap
+is that decision-making and data-plumbing, not tinygrad's own codegen
+machinery, which this proves reproduces the server-side result exactly.
+
 ## What this does not do (yet)
 
 The single-flagged-node splice above is real and tested end to end, but
