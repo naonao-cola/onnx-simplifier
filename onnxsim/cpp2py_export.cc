@@ -1079,6 +1079,49 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "percdamp"_a = 0.01, "proc_block_size"_a = 128);
 
+  // TesseraQ: "Progressive Adaptive Rounding" (PAR) -- an AdaRound-style
+  // rectified-sigmoid rounding relaxation, optimized by a hand-rolled
+  // Adam loop jointly with each weight block's own dequantization scale
+  // (in log-space), with a coarse-to-fine element-by-element hardening
+  // schedule across `par_rounds` rounds. Same two-model
+  // executor-as-first-argument shape as apply_gptq's own binding above
+  // (candidates are processed independently, so `executor` is invoked
+  // once, up front, the same as apply_gptq's own); `calibration_data`
+  // (List[Dict[str, onnx.TensorProto]]) is keyed to the float model's own
+  // graph inputs. See ApplyTesseraq in tesseraq_entry.h for the full
+  // scope (including its own accepted numerical scope -- an iterative
+  // optimization, not a closed-form computation) and
+  // onnxsim/tesseraq.py for the technique this ports.
+  m.def(
+      "apply_tesseraq",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t num_bits, int64_t num_iterations, int64_t par_rounds,
+         double learning_rate, double scale_learning_rate, double reg_param,
+         double warm_start, double beta_start, double beta_end) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result = ApplyTesseraq(
+            float_model, quantized_model, *executor, calibration_data, num_bits,
+            num_iterations, par_rounds, learning_rate, scale_learning_rate,
+            reg_param, warm_start, beta_start, beta_end);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "num_bits"_a = 4, "num_iterations"_a = 400,
+      "par_rounds"_a = 4, "learning_rate"_a = 0.1,
+      "scale_learning_rate"_a = 0.01, "reg_param"_a = 0.01,
+      "warm_start"_a = 0.2, "beta_start"_a = 20.0, "beta_end"_a = 2.0);
+
   // QuaRot+GPTQ (Ashkboos et al., 2024): the real QuaRot paper's optional,
   // tighter weight quantizer -- rotates every matched MatMul/vanilla-Gemm
   // node's activation by a fresh per-layer random orthogonal matrix and

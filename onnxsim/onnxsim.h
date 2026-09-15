@@ -29,6 +29,7 @@
 #include "quarot_gptq_entry.h"
 #include "smoothquant_entry.h"
 #include "structured_pruning_entry.h"
+#include "tesseraq_entry.h"
 
 // RAII owner for a DLManagedTensor: releasing it invokes the tensor's own
 // DLPack deleter exactly once (per the DLPack contract), which frees whatever
@@ -841,6 +842,24 @@ onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
 // header instead of this one. See qronos.py's own module docstring for
 // the technique and qronos_entry.h for this port's own scope (including
 // its accepted numerical scope, shared with ApplyGptq's).
+
+// TesseraQ: "Progressive Adaptive Rounding" (PAR) -- ApplyAdaRound-style
+// (not yet ported to C++) rectified-sigmoid rounding relaxation, but
+// optimized by a hand-rolled Adam loop jointly with each weight block's
+// own dequantization scale (in log-space), with a coarse-to-fine
+// element-by-element hardening schedule across a handful of rounds
+// instead of a single monolithic anneal. C++ port of tesseraq.py's own
+// apply_tesseraq, declared in tesseraq_entry.h (included above) rather
+// than duplicated here, mirroring how ApplyQronos (qronos_entry.h, also
+// included above) is documented in its own home header instead of this
+// one. See tesseraq.py's own module docstring for the technique and
+// tesseraq_entry.h for this port's own scope -- including its accepted
+// numerical scope, which is NOT the same as every closed-form port's own
+// (ApplyGptq/ApplyAwq/ApplyQronos/ApplyGptvq's correction half): this is
+// an iterative Adam optimization, not a single closed-form computation,
+// so cross-language floating-point agreement is measured empirically
+// (tests/test_tesseraq_cpp.py) rather than assumed from the algorithm's
+// own structure.
 
 // QuaRot+GPTQ (Ashkboos et al., 2024): ApplyQuarot's own per-layer random
 // rotation and data-free activation quantization, but with the weight

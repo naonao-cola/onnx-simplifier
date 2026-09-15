@@ -619,6 +619,61 @@ export async function applyQronos(
 }
 
 /**
+ * TesseraQ: "Progressive Adaptive Rounding" (PAR) -- an AdaRound-style
+ * rectified-sigmoid rounding relaxation, optimized by a hand-rolled Adam
+ * loop jointly with each weight block's own dequantization scale (in
+ * log-space), with a coarse-to-fine element-by-element hardening
+ * schedule across `parRounds` rounds. Takes the float model and its
+ * `quantize_weight_only_int4`-quantized counterpart, like `applyGptq`.
+ * Returns the optimized quantized model bytes.
+ */
+export async function applyTesseraq(
+  floatModel,
+  quantizedModel,
+  calibration,
+  {
+    numBits = 4,
+    numIterations = 400,
+    parRounds = 4,
+    learningRate = 0.1,
+    scaleLearningRate = 0.01,
+    regParam = 0.01,
+    warmStart = 0.2,
+    betaStart = 20.0,
+    betaEnd = 2.0,
+  } = {},
+) {
+  const floatBytes = toBytes(floatModel);
+  const quantBytes = toBytes(quantizedModel);
+  const runtime = await getRuntime();
+  const fn = runtime.onnxsim_apply_tesseraq;
+  if (typeof fn !== "function") {
+    throw new Error("onnxsim: this build has no export 'onnxsim_apply_tesseraq' (rebuild the wasm module?)");
+  }
+  let result = fn(
+    floatBytes,
+    quantBytes,
+    normalizeCalibrationBatches(calibration),
+    numBits,
+    numIterations,
+    parRounds,
+    learningRate,
+    scaleLearningRate,
+    regParam,
+    warmStart,
+    betaStart,
+    betaEnd,
+  );
+  if (result && typeof result.then === "function") {
+    result = await result;
+  }
+  if (!result) {
+    throw new Error("onnxsim: onnxsim_apply_tesseraq failed (see stderr output for details)");
+  }
+  return new Uint8Array(result);
+}
+
+/**
  * AWQ grid-searched per-channel weight rescaling: takes the float model
  * and its `quantize_weight_only_int4`-quantized counterpart, reuses the
  * quantized model's structure, and rewrites improved layers (INT4
@@ -753,6 +808,7 @@ export default {
   applyLlmInt8,
   applyGptq,
   applyQronos,
+  applyTesseraq,
   applyAwq,
   applyQuarotGptq,
   applyGptvq,
