@@ -56,54 +56,15 @@ opset requirement beyond ordinary ``Gather``/``Reshape``.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
 import numpy as np
 import onnx
 import onnx.helper
 import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.aqlm import _fit_kmeans_codebook
-from onnxsim.bias_correction import (
-    _activation_rows,
-    _add_probe_outputs,
-    _all_names,
-    _unique_name,
-)
-from onnxsim.calibration import Tensors, generate_random_calibration_data
+from onnxsim.calibration import Tensors
 from onnxsim.gptq import _inverse_hessian_cholesky
-
-
-def _match_matmul_like(node: onnx.NodeProto):
-    """Mirrors ``MatchMatMulLike`` (``passes/quantize_matmul_common.h``):
-    a MatMul, or a Gemm with ``transA=0``, ``alpha=1`` and (when it has a
-    bias) ``beta=1``. Returns ``(x_name, w_name, weight_transposed)`` or
-    ``None``.
-    """
-    attrs = {a.name: a for a in node.attribute}
-    if node.op_type == "MatMul":
-        if len(node.input) != 2:
-            return None
-        return node.input[0], node.input[1], False
-    if node.op_type == "Gemm":
-        num_inputs = len(node.input)
-        if num_inputs not in (2, 3):
-            return None
-        trans_a = attrs.get("transA")
-        if trans_a is not None and trans_a.i != 0:
-            return None
-        alpha = attrs.get("alpha")
-        if alpha is not None and alpha.f != 1.0:
-            return None
-        if num_inputs == 3:
-            beta = attrs.get("beta")
-            if beta is not None and beta.f != 1.0:
-                return None
-        trans_b = attrs.get("transB")
-        weight_transposed = bool(trans_b is not None and trans_b.i)
-        return node.input[0], node.input[1], weight_transposed
-    return None
 
 
 def _gptvq_quantize_groups(
@@ -214,134 +175,40 @@ def quantize_weight_only_gptvq(
             weight's own shape, feeding the original MatMul/Gemm node;
             layers with a non-constant, non-2-D, or non-``vector_dim``-
             divisible weight are left untouched
+
+    The pure-Python k-means-plus-Hessian-correction implementation above
+    has been retired in favor of the verified C++ port -- this is now a
+    thin alias for :func:`onnxsim.apply_gptvq_cpp`
+    (``onnxsim/gptvq_entry.cpp``'s own ``ApplyGptvq``), forwarding every
+    argument unchanged. **Behavior change from earlier onnxsim
+    versions:** the C++ port fits its k-means codebook via a partial
+    Fisher-Yates sample over ``std::mt19937_64`` with an independent
+    per-node RNG derivation, not this module's own
+    ``numpy.random.Generator.choice`` sequenced across matches -- the
+    same permanent divergence :func:`onnxsim.apply_quarot`/
+    :func:`onnxsim.apply_quarot_cpp` already document for their own
+    random rotation. A given ``seed`` therefore no longer derives the
+    same codebook this function produced before being aliased; the
+    Hessian-compensated group-correction math itself is unchanged (see
+    tests/test_gptvq_cpp.py's own cross-check). ``_gptvq_quantize_groups``
+    stays in this module (imported by tests/test_gptvq_cpp.py); only the
+    entry point is aliased. Imported lazily (inside the function body,
+    not at module scope) to avoid a circular import:
+    ``onnxsim.onnx_simplifier`` already imports from this module, so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    skip_set: "set[str]" = set(skip_names) if skip_names is not None else set()
+    from onnxsim.onnx_simplifier import apply_gptvq_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    nodes = list(graph.node)
-    candidates = []
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, weight_transposed = match
-        if w_name in skip_set:
-            continue
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, weight_transposed))
-
-    if not candidates:
-        return out
-
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
-
-    probe_names = sorted({x_name for _, x_name, _, _ in candidates})
-    probe_model = _add_probe_outputs(model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(result[name], dtype=np.float64))
-
-    rng = np.random.default_rng(seed)
-
-    for node, x_name, w_name, weight_transposed in candidates:
-        acts = _activation_rows(activations[x_name])
-        if not acts:
-            continue  # no usable activation (no feature axis); skip
-        x = np.concatenate(acts, axis=0)
-
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if weight_transposed else w.T  # [N, K], output channel first
-        n, k = w_nk.shape
-        if k % vector_dim != 0 or x.shape[1] != k:
-            continue
-
-        h = x.T @ x
-
-        num_groups = n * (k // vector_dim)
-        groups = w_nk.reshape(num_groups, vector_dim)
-        centroids, _ = _fit_kmeans_codebook(groups, num_centroids, num_iterations, rng)
-
-        codes = _gptvq_quantize_groups(w_nk, centroids, h, percdamp, vector_dim)
-
-        prefix = f"{w_name}_gptvq"
-        codebook_name = _unique_name(f"{prefix}_codebook", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                centroids.astype(np.float32), name=codebook_name
-            )
-        )
-        codes_name = _unique_name(f"{prefix}_codes", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(codes.astype(np.int64), name=codes_name)
-        )
-
-        new_nodes: List[onnx.NodeProto] = []
-        gathered_out = _unique_name(f"{prefix}_gathered", taken_names)
-        new_nodes.append(
-            onnx.helper.make_node(
-                "Gather",
-                [codebook_name, codes_name],
-                [gathered_out],
-                axis=0,
-                name=_unique_name(f"{prefix}_gather_node", taken_names),
-            )
-        )
-
-        shape_name = _unique_name(f"{prefix}_shape", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.array([n, k], dtype=np.int64), name=shape_name
-            )
-        )
-        unblocked_name = _unique_name(f"{prefix}_unblocked", taken_names)
-        new_nodes.append(
-            onnx.helper.make_node(
-                "Reshape",
-                [gathered_out, shape_name],
-                [unblocked_name],
-                name=_unique_name(f"{prefix}_reshape_node", taken_names),
-            )
-        )
-
-        final_name = unblocked_name
-        if not weight_transposed:
-            final_name = _unique_name(f"{prefix}_transposed", taken_names)
-            new_nodes.append(
-                onnx.helper.make_node(
-                    "Transpose",
-                    [unblocked_name],
-                    [final_name],
-                    name=_unique_name(f"{prefix}_transpose_node", taken_names),
-                    perm=[1, 0],
-                )
-            )
-
-        node_idx = next(i for i, nd in enumerate(graph.node) if nd is node)
-        for offset, new_node in enumerate(new_nodes):
-            graph.node.insert(node_idx + offset, new_node)
-        for i, inp in enumerate(node.input):
-            if inp == w_name:
-                node.input[i] = final_name
-
-    return out
+    return apply_gptvq_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        vector_dim=vector_dim,
+        num_centroids=num_centroids,
+        num_iterations=num_iterations,
+        percdamp=percdamp,
+        providers=providers,
+        skip_names=skip_names,
+    )

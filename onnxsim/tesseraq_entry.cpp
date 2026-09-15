@@ -191,6 +191,18 @@ std::vector<float> ReadFloatTensor(const onnx::TensorProto& t) {
 
 void SetRawFloatInitializer(onnx::TensorProto* t,
                             const std::vector<float>& data) {
+  // quantize_weight_only_int4's own scale initializer is typed
+  // (float_data), not raw_data -- a plain set_raw_data() would leave
+  // both populated, which onnx.checker.check_model rejects ("should
+  // contain one and only one value field"). Clear every other value
+  // field first, mirroring llm_int8_entry.cpp's own SetRawInitializer
+  // (which rebuilds the tensor via Clear() for the same reason).
+  t->clear_float_data();
+  t->clear_int32_data();
+  t->clear_int64_data();
+  t->clear_double_data();
+  t->clear_uint64_data();
+  t->clear_string_data();
   std::string raw(data.size() * sizeof(float), '\0');
   std::memcpy(raw.data(), data.data(), raw.size());
   if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {

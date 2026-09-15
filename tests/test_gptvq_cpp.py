@@ -1,16 +1,21 @@
 """Tests for ``onnxsim.apply_gptvq_cpp`` -- the C++-backed port of
-``onnxsim.quantize_weight_only_gptvq`` (see ``onnxsim/gptvq_entry.h`` and
-``onnxsim/gptvq.py``). Like ``test_quarot_gptq_cpp.py``, this pass fits a
-fresh k-means codebook per layer using its own independent RNG derivation
-(not a numpy Generator sequenced across matches in graph node order), so
-its output is expected to be *accurate*, not bit-identical to the Python
-port -- most tests below check structure and numerical accuracy rather
-than exact equality. The one exception is
+``onnxsim.gptvq``'s own ``quantize_weight_only_gptvq`` (see
+``onnxsim/gptvq_entry.h`` and ``onnxsim/gptvq.py``).
+
+``onnxsim.quantize_weight_only_gptvq`` is now a thin alias for this C++
+port (see ``onnxsim/gptvq.py``'s own docstring), so most of the tests
+below exercise ``apply_gptvq_cpp`` directly. Like ``test_quarot_gptq_cpp.py``,
+this pass fits a fresh k-means codebook per layer using its own
+independent RNG derivation (not a numpy Generator sequenced across
+matches in graph node order), so a *given seed* is not expected to
+reproduce onnxsim.gptvq's own pre-alias codebook -- the structural/
+numerical-accuracy tests below check this pass's own output rather than
+any cross-language comparison. The one exception is
 ``test_cpp_gptvq_matches_python_correction_math``, which plugs the C++
-port's own fitted codebook and captured calibration activations into the
-pure-Python GPTQ-style group correction to isolate that part of the
-pipeline from the two ports' unrelated RNGs -- there, exact agreement is
-expected and checked.
+port's own fitted codebook and captured calibration activations into
+the pure-Python GPTQ-style group correction to isolate that part of the
+pipeline from RNG choice entirely -- there, exact agreement is expected
+and checked.
 """
 
 import numpy as np
@@ -219,23 +224,15 @@ def test_cpp_gptvq_matches_python_correction_math(vector_dim):
     np.testing.assert_array_equal(codes_cpp, codes_ref)
 
 
-def test_cpp_gptvq_codebook_fit_intentionally_diverges_from_python_for_same_seed():
-    # Locks in the same documented, permanent divergence
-    # test_quarot_gptq_cpp.py's own analogous test locks in: this port
-    # fits its k-means codebook via a partial Fisher-Yates sample over
-    # std::mt19937_64, while quantize_weight_only_gptvq (gptvq.py) uses
-    # numpy.random.Generator.choice sequenced through a single Generator.
-    # Not expected to ever alias for the same seed.
+def test_cpp_gptvq_python_alias_matches_the_cpp_port_exactly():
+    # onnxsim.quantize_weight_only_gptvq is now a thin alias for this C++
+    # port (see onnxsim/gptvq.py's own docstring) -- calling either name
+    # for the same arguments must produce byte-identical output, since
+    # they're the same code underneath.
     K, N = 32, 8
     model = _matmul_model(K=K, N=N, seed=20)
     calib = _correlated_calibration(K=K, seed=21)
 
     py_q = onnxsim.quantize_weight_only_gptvq(model, calibration_data=calib, seed=123)
     cpp_q = onnxsim.apply_gptvq_cpp(model, calibration_data=calib, seed=123)
-
-    codebook_py, _ = _codebook_and_codes(py_q, "W")
-    codebook_cpp, _ = _codebook_and_codes(cpp_q, "W")
-    assert codebook_py is not None
-    assert codebook_cpp is not None
-    assert codebook_py.shape == codebook_cpp.shape
-    assert not np.allclose(codebook_py, codebook_cpp)
+    assert py_q.SerializeToString() == cpp_q.SerializeToString()

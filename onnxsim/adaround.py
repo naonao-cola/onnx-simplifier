@@ -472,15 +472,61 @@ def apply_adaround(
             optimization itself* on, as an ONNX step graph
             (:mod:`onnxsim.qat_graph`) rather than in host numpy -- the way to
             reach a GPU, an NPU execution provider, or (in the WASM build)
-            WebGPU with this loop. ``None``, the default, keeps the in-process
-            float64 numpy loop, which is exact and deterministic; a step graph
-            computes in float32, so its result agrees closely rather than
-            bit-exactly. See ``docs/qat.md``.
+            WebGPU with this loop. ``None``, the default, delegates to the
+            verified C++ port (:func:`onnxsim.apply_adaround_cpp`) instead of
+            an in-process numpy loop; a step graph computes in float32, so
+            its result agrees closely rather than bit-exactly with either.
+            See ``docs/qat.md``.
     :returns: ``quantized_model`` with every matched layer's INT4 weight
             initializer rewritten to its AdaRound-optimized codes (same
             shape, dtype, and scale -- only which integer each element
             rounds to changes)
+
+    **Two implementations, one function.** When ``step_providers`` is
+    ``None`` (the default -- the common, host-only case), this is a thin
+    alias for :func:`onnxsim.apply_adaround_cpp`
+    (``onnxsim/adaround_entry.cpp``'s own ``ApplyAdaround``), forwarding
+    every other argument unchanged. **Behavior change from earlier
+    onnxsim versions:** this is an iterative Adam optimization, not a
+    closed-form computation, so floating-point summation-order
+    differences between the C++ port's own scalar dense-matmul kernels
+    and this module's own numpy ``@`` can compound across iterations --
+    measured (tests/test_adaround_cpp.py) to agree with this function's
+    own former in-process numpy loop (:func:`_optimize_rounding`) exactly
+    in most configurations, but not always: a tiny, measured fraction of
+    elements can land on the opposite side of the rectified sigmoid's 0.5
+    soft-decision boundary (always its immediate grid neighbor) in the
+    most demanding configurations tested. When ``step_providers`` is
+    given, this still runs the pure-Python candidate-matching/activation-
+    capture loop below, driving :func:`_optimize_rounding_on_graph`'s own
+    ONNX step-graph execution instead -- that accelerator path has no C++
+    port and is unaffected by this alias. :func:`_optimize_rounding`
+    itself is untouched and stays available (it is a reusable building
+    block :mod:`onnxsim.autoround` imports directly, independent of
+    whether this function still calls it) -- only this function's own
+    default dispatch changed. Imported lazily (inside the function body,
+    not at module scope) to avoid a circular import:
+    ``onnxsim.onnx_simplifier`` already imports from this module, so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
+    if step_providers is None:
+        from onnxsim.onnx_simplifier import apply_adaround_cpp
+
+        return apply_adaround_cpp(
+            float_model,
+            quantized_model,
+            calibration_data=calibration_data,
+            num_samples=num_samples,
+            seed=seed,
+            num_iterations=num_iterations,
+            learning_rate=learning_rate,
+            reg_param=reg_param,
+            warm_start=warm_start,
+            beta_range=beta_range,
+            providers=providers,
+        )
+
     if isinstance(float_model, str):
         float_model = onnx.load(float_model, load_external_data=False)
     if isinstance(quantized_model, str):
@@ -502,6 +548,8 @@ def apply_adaround(
         out = backend.run_model(float_probe, batch, providers=providers)
         for name in probe_names:
             activations[name].append(np.asarray(out[name], dtype=np.float64))
+
+    optimize = functools.partial(_optimize_rounding_on_graph, providers=step_providers)
 
     optimized: Dict[str, np.ndarray] = {}
     for c in candidates:
@@ -526,13 +574,6 @@ def apply_adaround(
             continue  # activation's feature dim doesn't match K; skip
         scale_nk = np.repeat(scale_blocks, c.block_size, axis=1)[:, : w_nk.shape[1]]
 
-        optimize = (
-            _optimize_rounding
-            if step_providers is None
-            else functools.partial(
-                _optimize_rounding_on_graph, providers=step_providers
-            )
-        )
         codes_nk = optimize(
             w_nk,
             scale_nk,
