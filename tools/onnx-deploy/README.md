@@ -88,6 +88,46 @@ Two sessions, one host-side loop: encoder once (seq2seq only), then
 loop with the cache fed back each time, greedy-argmax over `logits` each
 step, until `eos_token_id` or `max_new_tokens`.
 
+### Layer 1b: fixed-buffer KV cache (`include/onnx_deploy/static_kv_cache_pipeline.h`)
+
+A different pipeline, for a different export shape --
+`onnxsim.export_causal_lm_static_cache()` (`onnxsim/transformers_export.py`),
+decoder-only causal LMs only, no `optimum` involved in the export. That
+function's own docstring has the full rationale; the short version: growing
+`past_key_values`/`present` tensors (Layer 1's own shape, above) mean every
+decode step reallocates and copies the *entire* cache seen so far. This
+export instead produces `prefill.onnx` + `decode.onnx` against a **fixed**
+`(batch, kv_heads, max_cache_len, head_dim)` buffer per layer (built on
+`transformers.StaticCache`, traced with `torch.export`/`torch.onnx.export`;
+the cache-update op comes out as `ScatterND`, not ONNX opset 24's new
+`TensorScatter` -- PyTorch's exporter doesn't know about the new op yet, and
+doesn't need to, since `ScatterND` already means the same "overwrite, no
+reduction" thing and runs everywhere).
+
+`StaticKvCachePipeline` drives that pair: it allocates each layer's key/value
+buffer **once** per `Generate()` call and reuses it in place for every
+step -- prefill and every decode step bind the *same* `Ort::Value` as both
+the `past_key.{i}`/`past_value.{i}` input and the `present_key.{i}`/
+`present_value.{i}` output via `Ort::IoBinding`, so ONNX Runtime writes each
+step's result directly into memory this code already owns instead of
+allocating a fresh same-shaped tensor and copying it back. Layer counts and
+head/dim sizes are read off `decode.onnx`'s own declared `past_key.*` input
+shapes, the same "no architecture baked in" idiom `HarvestPresentIntoCache`
+uses above -- only `max_cache_len` (not recoverable from the ONNX file's own
+shapes, since the export doesn't record which dim was originally dynamic)
+needs to come from the caller, and must match what
+`export_causal_lm_static_cache()` was called with.
+
+**Scope note:** this header compiles cleanly against a real ONNX Runtime C++
+API (verified against the `onnxruntime-linux-x64-1.20.0` release headers --
+every method call type-checks, `-Wall -Wextra` clean), and its design
+mirrors `kv_cache_pipeline.h`'s own conventions throughout, but it is not
+yet wired into Layers 2/3 below -- no C ABI functions, no CLI flag, no
+Python/WASM binding. Those are a mechanical follow-up (mirror
+`onnx_deploy_c_api.h`/`.cpp`'s existing `onnx_deploy_create`/
+`onnx_deploy_generate` shape for this pipeline) rather than an open design
+question, but they are not done here.
+
 ### Layer 2: the swappable-libort C ABI (`onnx_deploy_c_api.h` / `.cpp`)
 
 `kv_cache_pipeline.h` builds against ONNX Runtime's C++ API with

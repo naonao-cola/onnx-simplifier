@@ -338,7 +338,10 @@ from onnxsim.torch_training import (
     compile_torch_training_loop,
     export_torch_module_to_onnx,
 )
-from onnxsim.transformers_export import export_transformers_model
+from onnxsim.transformers_export import (
+    export_causal_lm_static_cache,
+    export_transformers_model,
+)
 from onnxsim.vitisai_target import (
     check_vitisai_support,
     legalize_for_vitisai,
@@ -664,6 +667,7 @@ __all__ = [
     "read_hf_config",
     "UnsupportedArchitectureError",
     "export_transformers_model",
+    "export_causal_lm_static_cache",
     "export_diffusion_model",
     "export_detectron_model",
     "export_sam2_model",
