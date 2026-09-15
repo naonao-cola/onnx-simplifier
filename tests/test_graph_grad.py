@@ -1515,6 +1515,51 @@ def test_an_unsupported_op_is_refused_even_when_no_gradient_reaches_it():
         )
 
 
+def test_a_control_flow_op_refusal_hints_at_simplify():
+    """``If``/``Loop``/``Scan`` are refused like any other uncovered op type
+    (see :func:`test_an_unsupported_op_is_refused`), but the message adds one
+    extra sentence for these specifically: a caller hitting this is often
+    looking at an ``If`` a tracer inserted for something statically
+    resolvable, which ``onnxsim.onnx_simplifier.simplify()``'s
+    ``eliminate_if_with_const_cond`` pass already eliminates on its own, so
+    the fix is usually "simplify first," not "teach graph_grad control
+    flow." An ordinary unsupported op (``Sin``) gets no such hint -- it isn't
+    something simplify would ever remove."""
+    model = _model(
+        """
+        g (float[3,4] A, bool cond) => (float[3,4] Y) {
+          Y = If <
+            then_branch = then_graph () => (float[3,4] T) { T = Identity(A) },
+            else_branch = else_graph () => (float[3,4] E) { E = Identity(A) }
+          > (cond)
+        }
+        """
+    )
+    b = qat_graph.GraphBuilder()
+    with pytest.raises(graph_grad.UnsupportedOpError, match="simplify"):
+        graph_grad.build_backward(
+            b, list(model.graph.node), _static_shapes(model), {"Y": "dY"}, ["A"]
+        )
+
+    with pytest.raises(graph_grad.UnsupportedOpError) as excinfo:
+        graph_grad.build_backward(
+            qat_graph.GraphBuilder(),
+            list(
+                _model(
+                    """
+                    g (float[3,4] A) => (float[3,4] Y) {
+                      Y = Sin(A)
+                    }
+                    """
+                ).graph.node
+            ),
+            {"A": [3, 4], "Y": [3, 4]},
+            {"Y": "dY"},
+            ["A"],
+        )
+    assert "simplify" not in str(excinfo.value)
+
+
 def test_a_matmul_with_a_1d_operand_is_refused():
     """A covered op type in a configuration the rule does not handle is
     refused the same way an uncovered op type is -- the caller's remedy is

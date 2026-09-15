@@ -414,6 +414,21 @@ void AnOpWithNoRuleIsRefusedByName() {
       "an op with no rule should be refused, naming the op");
 }
 
+// If this fails, a caller hitting a genuinely uncovered control-flow op
+// (rather than the ordinary "no rule at all" case AnOpWithNoRuleIsRefusedByName
+// covers) would get no pointer toward the actual fix: an If a tracer inserted
+// for something statically resolvable is usually removed by
+// onnx_simplifier's own eliminate_if_with_const_cond pass before graph_grad
+// ever needs to see it.
+void AControlFlowOpRefusalHintsAtSimplify() {
+  const std::vector<onnx::NodeProto> nodes = {Node("If", {"cond"}, {"Y"})};
+  const Shapes shapes = {{"cond", {}}, {"Y", {3, 4}}};
+  GraphBuilder b;
+  CheckThrows<UnsupportedOpError>(
+      [&] { BuildBackward(b, nodes, shapes, {{"Y", "dY"}}, {"cond"}); },
+      "simplify", "an If refusal should hint at onnx_simplifier's simplify()");
+}
+
 // If this fails, whether a block is in scope would depend on which tensor the
 // caller happened to seed -- so the same block would be accepted or refused
 // depending on the loss, which is not a property a caller can reason about.
@@ -1329,6 +1344,7 @@ int main() {
   TheBackwardOpsAreThePythonAllowlistAndSitInsideEpFriendlyOps();
   TheEmittedBackwardStaysInsideTheOperatorAllowlist();
   AnOpWithNoRuleIsRefusedByName();
+  AControlFlowOpRefusalHintsAtSimplify();
   AnUnsupportedOpIsRefusedEvenWhenNoGradientReachesIt();
   AMatMulWithA1DOperandIsRefused();
   AmbiguousReducedAxesAreRefusedRatherThanGuessed();

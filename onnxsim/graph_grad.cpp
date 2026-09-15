@@ -2127,6 +2127,16 @@ std::string SupportedOpsList(const std::map<std::string, Rule>& rules) {
   return out + "]";
 }
 
+// Genuine control-flow ops -- never in Rules(), and never will be: see
+// graph_grad.py's own _CONTROL_FLOW_OPS comment for why, and for why the
+// refusal below adds one extra sentence for these specifically (a caller
+// hitting this is often looking at an If a tracer inserted for something
+// statically resolvable, which onnx_simplifier's eliminate_if_with_const_cond
+// pass -- part of its default pass set -- already eliminates on its own).
+bool IsControlFlowOp(const std::string& op_type) {
+  return op_type == "If" || op_type == "Loop" || op_type == "Scan";
+}
+
 // The core of BuildBackward, parameterized over the rule table -- see
 // BuildBackward and BuildBackwardWithTemplatedRules, its two callers.
 std::map<std::string, std::string> BuildBackwardImpl(
@@ -2153,10 +2163,16 @@ std::map<std::string, std::string> BuildBackwardImpl(
           !node.name().empty()
               ? node.name()
               : (node.output_size() > 0 ? node.output(0) : std::string());
-      throw UnsupportedOpError("no gradient rule for op type " +
-                               Quoted(node.op_type()) + " (node " +
-                               Quoted(where) + "); graph_grad differentiates " +
-                               SupportedOpsList(rules));
+      const std::string hint =
+          IsControlFlowOp(node.op_type())
+              ? " -- if its condition/trip-count is actually static, "
+                "onnx_simplifier's simplify() may eliminate it before this "
+                "module ever sees it (see IsControlFlowOp's own comment)"
+              : "";
+      throw UnsupportedOpError(
+          "no gradient rule for op type " + Quoted(node.op_type()) + " (node " +
+          Quoted(where) + ")" + hint + "; graph_grad differentiates " +
+          SupportedOpsList(rules));
     }
     if (node.output_size() != 1) {
       throw UnsupportedOpError(
