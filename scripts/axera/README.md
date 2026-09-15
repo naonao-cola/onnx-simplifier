@@ -7207,6 +7207,36 @@ two and refined the third:
   `quant.layer_configs` FP32 override (Sub-only and Mul/Add/Sub/Div
   variants both compile and return bit-exact Adam updates, max diff
   0.0; U16 does not clear the tiler).
+- **Step-graph loss readout on device: multiply by the compiled batch.**
+  Pulsar2 folds an extra division by the batch size into `Div(sum,
+  batch_size)` (loss reads sum/B^2: feeding batch_size 1.0 returns
+  exactly the ORT reference, and smaller batches are rejected at feed
+  time -- compiled step graphs are fixed-batch artifacts). Gradients
+  are unaffected (moments/updates match), so training is exact and only
+  the monitored loss needs the host-side `* B` compensation.
+- **ResNet18 dense-head training step, compiled and run (transfer-
+  learning scope).** Dynamic-weight `Conv` fails Pulsar2 7.0's quantizer
+  hardware-spec pass size-independently (`ActWeightConv ... list index
+  out of range`; MatMul/Gemm-with-constant-weights are fine, and so is
+  a dynamic-weight `MatMul`), so a full-ResNet step graph cannot compile
+  as-is -- but freezing the backbone (`frozen_prefixes`, new in the
+  generator) leaves only the classifier head dynamic, which compiles.
+  Recipe that worked on device: rewrite the tail `Gemm` as
+  `Transpose`+`MatMul`+`Add` (dynamic `Gemm` crashes the observer; set
+  `perm=[1,0]` explicitly -- Pulsar2 reads an unset attribute as `None`
+  and its `Transpose_to_None` fold crashes), freeze conv/BN/stage
+  prefixes, trajectory calibration, `DISTILL_FP32_LAYER_CONFIGS`. One
+  device step: weights match ORT at 2e-4, loss within 2.3%.
+- **Moment readback is the next wall for multi-step loops.** The Adam
+  moments come back through a miscalibrated output scale (early values
+  ~1e-5..1e-3 round to the zero-point constant, e.g. flat 0.047) while
+  the internal update using them is correct (weights match) --
+  `replay.py` reproduces both exactly from recorded scales, so this is
+  quantizer-side. Feeding those moments back corrupts the next step;
+  multi-step on-device training wants either per-step recalibration or
+  the resident runner (which keeps true state on-device) -- see the
+  gradient-dies ceiling discussion above for the same mechanism on
+  gradients.
 
 ## Files
 

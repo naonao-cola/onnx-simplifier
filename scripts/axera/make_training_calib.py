@@ -46,12 +46,17 @@ import onnx
 #: Sqrt/MatMul feeding it) in FP32. INT8 silently miscomputes the
 #: wide-dynamic-range quotients (Div with ~1000x input scale ratio) and
 #: hard-fails tiling on moment updates -- while this override returns
-#: bit-exact Adam updates (max diff 0.0) to 5.7e-07-vs-ORT on a toy step
-#: graph on the real AX650N. Pushing Softmax/Log to FP32 as well is NOT
-#: included: that build compiles but the device runtime refuses to load
-#: it, so the loss path stays INT8 (its noise floor is ~1e-2, acceptable).
+#: Adam updates at 5.7e-07-vs-ORT on a toy step graph on the real AX650N
+#: (the Sqrt matters: without it an INT8 v-hat collapses to ~0 and the
+#: Div explodes; the MatMul matters: sub-LSB gradients zero out).
+#: Pushing Softmax/Log to FP32 as well is NOT included: that build
+#: compiles but the device runtime refuses to load it, so the loss path
+#: stays INT8 (its noise floor is ~1e-2, acceptable).
 DISTILL_FP32_LAYER_CONFIGS = [
-    {"op_types": ["Mul", "Add", "Sub", "Div", "Sqrt", "MatMul"], "data_type": "FP32"}
+    {
+        "op_types": ["Mul", "Add", "Sub", "Div", "Sqrt", "MatMul"],
+        "data_type": "FP32",
+    }
 ]
 
 
