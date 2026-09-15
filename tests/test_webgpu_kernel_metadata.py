@@ -128,7 +128,9 @@ def test_single_step_wrong_dispatch_length_raises():
 
 
 def test_attach_binding_to_foreign_tensor_raises():
-    bad_binding = [WebgpuKernelBinding.for_tensor("not_a_node_tensor", group=0, binding=0)]
+    bad_binding = [
+        WebgpuKernelBinding.for_tensor("not_a_node_tensor", group=0, binding=0)
+    ]
     model = _add_model()
     with pytest.raises(ValueError, match="not one of"):
         attach_webgpu_kernel(model, "add_node", _single_step_spec(bindings=bad_binding))
@@ -235,9 +237,13 @@ def test_multi_step_program_with_intermediate_and_constant():
         entry_point="step2",
         dispatch=(1, 1, 1),
         bindings=(
-            WebgpuKernelBinding.for_intermediate("scratch", group=0, binding=0, access="read"),
+            WebgpuKernelBinding.for_intermediate(
+                "scratch", group=0, binding=0, access="read"
+            ),
             WebgpuKernelBinding.for_constant([1.0, 2.0], group=0, binding=1),
-            WebgpuKernelBinding.for_tensor("c", group=0, binding=2, access="read_write"),
+            WebgpuKernelBinding.for_tensor(
+                "c", group=0, binding=2, access="read_write"
+            ),
         ),
     )
     spec = WebgpuKernelSpec(steps=(step1, step2), intermediates={"scratch": 256})
