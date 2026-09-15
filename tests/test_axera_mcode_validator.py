@@ -75,6 +75,11 @@ _BLOBS = {
     # A unary-negation probe: the first stream emitted against by
     # scripts/axera/tiny_emit.py (tinygrad-traced MUL-by-minus-one).
     "neg_1x8": (2432, 5, 1),
+    # A two-input elementwise Mul: the first multi-input stream in the
+    # corpus, which exposed the 297-byte header assumption in
+    # tail_vector (its pointer sits at 328). See "Tails beyond the fixed
+    # header" below.
+    "mul_1x8": (2264, 5, 0),
 }
 
 
@@ -96,6 +101,13 @@ def test_real_mcode_passes_every_structural_rule(name):
     assert sum(len(v) for v in mcode.op_programs(blob).values()) == ops
 
 
+# Per-stream structured-share floors where the default 0.90 below does not
+# fit: mul_1x8's two-input header is proportionally more zero padding.
+_SHARE_FLOOR = {
+    "mul_1x8": 0.88,
+}
+
+
 @pytest.mark.parametrize("name", sorted(_BLOBS))
 def test_the_codec_round_trips_byte_for_byte(name):
     """Decoding and re-encoding reproduces the stream exactly. This is the
@@ -107,8 +119,9 @@ def test_the_codec_round_trips_byte_for_byte(name):
     assert mcode.encode(records) == blob[lo:hi]
     # Nearly all of it comes from a recognised form rather than a raw escape.
     # The floor is 0.90 rather than higher because tiny streams carry
-    # proportionally more zero padding, which counts as raw.
-    assert mcode.structured_share(records) >= 0.90
+    # proportionally more zero padding, which counts as raw. The two-input
+    # Mul stream carries a longer header still, so it gets its own floor.
+    assert mcode.structured_share(records) >= _SHARE_FLOOR.get(name, 0.90)
 
 
 @pytest.mark.parametrize("name", sorted(_BLOBS))
@@ -190,6 +203,7 @@ _Q_COUNTS = {
     "adam_update_fp32": 0,
     "reshape_gather_bwd": 0,
     "neg_1x8": 0,
+    "mul_1x8": 0,
 }
 
 
@@ -309,6 +323,7 @@ _PD_COUNTS = {
     "adam_update_fp32": (0, 0),
     "reshape_gather_bwd": (0, 0),
     "neg_1x8": (0, 0),
+    "mul_1x8": (0, 0),
 }
 
 
@@ -439,6 +454,7 @@ _E_COUNTS = {
     "adam_update_fp32": 0,
     "reshape_gather_bwd": 0,
     "neg_1x8": 0,
+    "mul_1x8": 0,
 }
 
 
@@ -566,6 +582,7 @@ _C_COUNTS = {
     "adam_update_fp32": 0,
     "reshape_gather_bwd": 0,
     "neg_1x8": 0,
+    "mul_1x8": 0,
 }
 
 
@@ -731,6 +748,7 @@ _N_COUNTS = {
     "adam_update_fp32": 0,
     "reshape_gather_bwd": 0,
     "neg_1x8": 0,
+    "mul_1x8": 0,
 }
 
 
@@ -894,6 +912,7 @@ _L_COUNTS = {
     "adam_update_fp32": 1,
     "reshape_gather_bwd": 1,
     "neg_1x8": 1,
+    "mul_1x8": 1,
 }
 
 
@@ -964,6 +983,7 @@ _A_COUNTS = {
     "reshape_mul_gap": 1,
     "reshape_matmul_gap": 3,
     "neg_1x8": 1,
+    "mul_1x8": 1,
 }
 
 

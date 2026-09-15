@@ -3093,6 +3093,13 @@ mode` subgraphs of `llama_p512_l0_together.axmodel` and the LM head
   earlier sections treated as one region is really *three* segments in
   `resnet18d` (11,008 + 4,896 + 3,456 bytes); the op programs are table
   0's segment.
+- **The tail-vector lookup no longer assumes a 297-byte header.** A
+  two-input elementwise Mul stream carries a 340-byte header (per-input
+  descriptors), with the tail pointer at offset 328 -- past the old
+  fallback bound, so `tail_vector` found nothing and the whole stream
+  was unparseable. The lookup now falls back to a wider scan validated
+  by tiling (a chance pattern cannot tile exactly), which changes
+  nothing where the bounded scan already succeeds.
 - **Every segment opens with an `a7` verb, and `a7` is a verb.** The
   17-byte "block terminator" was misread: `2b a7 00 00 0a 00 00 00 00`
   is one leading byte (`2b`, `24`, `33`, `3b` -- segment-specific) and
