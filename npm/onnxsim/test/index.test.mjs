@@ -29,6 +29,7 @@ import {
   applyMoeExpertChannelPruning,
   applyOutlierSuppression,
   applyOutlierSuppressionPlus,
+  applyLlmInt8,
   applyQuarot,
   applySmoothQuant,
   applyStructuredPruning,
@@ -166,6 +167,23 @@ try {
       X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 1.0, 0.0]), [1, 4]),
     });
     const out = await applyOutlierSuppression(input, [batch(), batch()], { alpha: 0.5 });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applyLlmInt8 declines a pre-opset-18 model", async () => {
+    // The shared fixture is opset 13 and LLM.int8() needs opset >= 18
+    // (ReduceMax axes-as-input), so this is a no-op round-trip -- the
+    // point is the binding (including calibration crossing) works. Real
+    // decompositions are covered by the Python parity tests and were
+    // verified bit-identical through this same binding on an opset-18
+    // model during development.
+    const ort = await import("onnxruntime-web");
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 8.0, 0.0]), [1, 4]),
+    });
+    const out = await applyLlmInt8(input, [batch(), batch()], { outlierThreshold: 6.0 });
     assert.ok(out instanceof Uint8Array);
     assert.ok(out.length > 0);
   });

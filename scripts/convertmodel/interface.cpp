@@ -2774,6 +2774,35 @@ em::val onnxsim_apply_outlier_suppression(const std::string &data,
   }
 }
 
+// LLM.int8() (Dettmers et al., 2022): decomposes every matched
+// MatMul/vanilla-Gemm node into a float32 outlier part plus a
+// vector-wise INT8 part computed via MatMulInteger (per-row activation
+// scales at runtime, per-output-channel weight scales offline, uint8
+// activation at zero-point 128). Same calibration-batch contract and
+// executor as every other calibration-driven binding above.
+// `outlier_threshold` marks an input channel an outlier when its
+// activation magnitude exceeds it anywhere in the calibration data;
+// `epsilon` floors zero max-abs values before dividing. See ApplyLlmInt8
+// in llm_int8_entry.h.
+em::val onnxsim_apply_llm_int8(const std::string &data,
+                               em::val calibration_batches_val,
+                               double outlier_threshold, double epsilon) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyLlmInt8(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), outlier_threshold,
+        epsilon));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_llm_int8 error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // SmoothQuant migration (Xiao et al., 2022): rescales every matched
 // MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight columns by the
 // per-channel migration scale and inserts a `Mul` dividing that layer's
@@ -2950,6 +2979,7 @@ EMSCRIPTEN_BINDINGS(module) {
            &onnxsim_apply_outlier_suppression);
   function("onnxsim_apply_outlier_suppression_plus",
            &onnxsim_apply_outlier_suppression_plus);
+  function("onnxsim_apply_llm_int8", &onnxsim_apply_llm_int8);
   function("onnxsim_apply_smoothquant", &onnxsim_apply_smoothquant);
 
   // Block-wise QAT: build one block's step graph, run the loop in JS on
