@@ -559,8 +559,10 @@ def tail_vector(mcode):
     tail, found through the header word that points at it (a uoffset whose
     target holds a small count followed by increasing table offsets) -- the
     fixed five-entry `TAIL_VECTOR` pattern only holds for graphs with one
-    input and one output. See the README's "The tail is the segment table"
-    section."""
+    input and one output. Multi-input graphs carry longer headers (the
+    pointer sits past the 297-byte fallback bound); for those the bounded
+    scan below finds nothing and a wider, tiling-validated scan takes over.
+    See the README's "The tail is the segment table" section."""
     u32 = lambda o: struct.unpack_from("<I", mcode, o)[0]  # noqa: E731
     # The usual anchor is the convolution engine's channel-extent write (see
     # the README's "The first operand with a known meaning" section). A graph
@@ -579,15 +581,29 @@ def tail_vector(mcode):
         offs = [u32(t + 4 + 4 * k) for k in range(n)]
         if all(0 < x < 8192 for x in offs) and offs == sorted(offs):
             return t
+    # Fallback for longer headers (multi-input graphs carry per-input
+    # descriptors that push the pointer past the 297-byte fixed header a
+    # lone Relu-style graph has): scan wide and validate by tiling, which
+    # a chance byte pattern cannot satisfy -- the segments must tile the
+    # blob exactly from the header to the vector.
+    for o in range(0, len(mcode) - 64, 4):
+        t = o + u32(o)
+        if not (0 < t < len(mcode) - 8):
+            continue
+        n = u32(t)
+        if not (1 <= n <= 64) or t + 4 + 4 * n > len(mcode):
+            continue
+        offs = [u32(t + 4 + 4 * k) for k in range(n)]
+        if not (all(0 < x < 8192 for x in offs) and offs == sorted(offs)):
+            continue
+        if _tiling_ok(mcode, t):
+            return t
     raise AssertionError("no header word points at a tail table vector")
 
 
-def tail_tables(mcode):
-    """Walk the FlatBuffers tables of an mcode blob's tail (five for a
-    one-input, one-output CNN; fifteen for an `llm_build` subgraph).
-    Returns, per table, a dict of `field index -> uint32 (or uint16) value`
-    for present fields, read through each table's vtable."""
-    vec = tail_vector(mcode)
+def _tables_at(mcode, vec):
+    """`tail_tables` internals for an already-located vector (so the wide
+    fallback above can validate candidates without recursing)."""
     u32 = lambda o: struct.unpack_from("<I", mcode, o)[0]  # noqa: E731
     i32 = lambda o: struct.unpack_from("<i", mcode, o)[0]  # noqa: E731
     u16 = lambda o: struct.unpack_from("<H", mcode, o)[0]  # noqa: E731
@@ -603,7 +619,28 @@ def tail_tables(mcode):
             if off:
                 fields[f] = u32(tpos + off) if off + 4 <= tsz else u16(tpos + off)
         tables.append(fields)
-    return vec, tables
+    return tables
+
+
+def _tiling_ok(mcode, vec):
+    """Whether `vec` is a genuine tail vector: its tables parse and their
+    word counts tile the blob exactly. False (never raising) otherwise."""
+    try:
+        tables = _tables_at(mcode, vec)
+        words = [t.get(2, 0) for t in tables]
+        header = vec - 8 * sum(words)
+        return 0 <= header < vec and header + 8 * sum(words) == vec
+    except Exception:  # noqa: BLE001 -- any parse failure means "not it"
+        return False
+
+
+def tail_tables(mcode):
+    """Walk the FlatBuffers tables of an mcode blob's tail (five for a
+    one-input, one-output CNN; fifteen for an `llm_build` subgraph).
+    Returns, per table, a dict of `field index -> uint32 (or uint16) value`
+    for present fields, read through each table's vtable."""
+    vec = tail_vector(mcode)
+    return vec, _tables_at(mcode, vec)
 
 
 def segments(mcode):

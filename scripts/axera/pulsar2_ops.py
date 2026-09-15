@@ -142,8 +142,9 @@ surfaced along the way (an ONNX attribute left unset to take its schema
 default -- e.g. `Elu.alpha`, `LeakyRelu.alpha`, `TopK.largest`/`sorted` --
 is read as `None` by Pulsar2's frontend and crashes with a confusing
 internal error, not a graceful fallback; setting the same value explicitly
-fixes it). Most importantly for this module: **7 ops confirmed to hard-fail
-despite being listed in `AX650_SUPPORTED_OPS`** -- see
+fixes it). Most importantly for this module: **7 listed ops confirmed to
+hard-fail despite being in `AX650_SUPPORTED_OPS`, plus 10 unlisted ops
+confirmed to fail at the same frontend stages** -- see
 `AX650_CONFIRMED_BROKEN_OPS` and `confirmed_broken_on_ax650()` below, now
 wired into `pulsar2_backend.ax650_build_risks()` and
 `pulsar2_simulator.partition()` so both flag these correctly instead of
@@ -269,16 +270,19 @@ AX650_SUPPORTED_OPS: frozenset = frozenset(
     }
 )
 
-# Op types that ARE in `AX650_SUPPORTED_OPS` above (i.e. Axera's own docs
-# list them as supported) but that a real `pulsar2:6.0-lite` build was
-# confirmed to hard-fail on anyway, via a single-node-per-op battery run
-# against real hardware -- see README.md's "Systematic op coverage: from 29%
-# to 99% of AX650_SUPPORTED_OPS" section for the full sweep (91/92 ops
-# confirmed; these 7 are the confirmed-broken exceptions). This is a
-# *different* source of truth from `AX650_SUPPORTED_OPS` (docs vs. this
-# project's own real-hardware results) -- kept separate rather than removing
-# these from `AX650_SUPPORTED_OPS`, so that dict continues to mean exactly
-# "what Axera's docs claim." Values are the confirmed real failure mode.
+# Op types a real `pulsar2` build was confirmed to hard-fail on anyway, via a
+# single-node-per-op battery run against real hardware -- see README.md's
+# "Systematic op coverage: from 29% to 99% of AX650_SUPPORTED_OPS" section
+# for the full sweep (91/92 ops confirmed; the first 7 below are the
+# confirmed-broken exceptions from that listed-op sweep) and the
+# "Backward-graph ops" section for the unlisted-op sweep (the remaining 10).
+# The first 7 ARE in `AX650_SUPPORTED_OPS` above (i.e. Axera's own docs list
+# them as supported); the other 10 are absent from the docs list and fail at
+# the same frontend stages. This is a *different* source of truth from
+# `AX650_SUPPORTED_OPS` (docs vs. this project's own real-hardware results)
+# -- kept separate rather than removing these from `AX650_SUPPORTED_OPS`, so
+# that dict continues to mean exactly "what Axera's docs claim." Values are
+# the confirmed real failure mode.
 AX650_CONFIRMED_BROKEN_OPS: Dict[str, str] = {
     "ConvTranspose": ("real RuntimeError('Op Execution Error...') during quantization"),
     "Xor": "KeyError('dont support Xor opr in AXOPS/ONNXOPS/CUSTOM_OPS')",
@@ -308,6 +312,60 @@ AX650_CONFIRMED_BROKEN_OPS: Dict[str, str] = {
     "InverseSigmoid": (
         "not a real ONNX operator schema (like the working Silu extension "
         'op), but this name fails: "InverseSigmoid, pyrun failed"'
+    ),
+    # Unlisted-op sweep (`pulsar2:7.0-lite`, single-node batteries -- see the
+    # README's "Backward-graph ops" section): every one of these fails at the
+    # frontend, nine at ONNX-optimization with the same whitelist error and
+    # one at quantization. Attributes with schema defaults were set
+    # explicitly (Selu alpha/gamma, ReduceSumSquare axes/keepdims, Scatter
+    # axis, OneHot axis, SoftmaxCrossEntropyLoss reduction), ruling out the
+    # attribute-defaulting gotcha -- these are genuinely unmapped op names.
+    # Only Neg/Log from the unlisted set are known to pass.
+    "Reciprocal": (
+        "quant convert error on a [1,8]->[1,8] node (MinMax Numpy calib over "
+        '[0.5, 2.0)): "Operator(name:y, type:Reciprocal) convert error: '
+        "Quant doesn't support Reciprocal operation\" (ErrorCode.QuantError)"
+    ),
+    "ReduceSumSquare": (
+        "KeyError('dont support ReduceSumSquare opr in "
+        "AXOPS/ONNXOPS/CUSTOM_OPS') at ONNX-optimization ([1,8]->[1,1], "
+        "axes=[1] keepdims=1 explicit)"
+    ),
+    "Selu": (
+        "KeyError('dont support Selu opr in AXOPS/ONNXOPS/CUSTOM_OPS') at "
+        "ONNX-optimization ([1,8]->[1,8], alpha/gamma explicit)"
+    ),
+    "Softsign": (
+        "KeyError('dont support Softsign opr in AXOPS/ONNXOPS/CUSTOM_OPS') "
+        "at ONNX-optimization ([1,8]->[1,8])"
+    ),
+    "Sign": (
+        "KeyError('dont support Sign opr in AXOPS/ONNXOPS/CUSTOM_OPS') at "
+        "ONNX-optimization ([1,8]->[1,8])"
+    ),
+    "Sum": (
+        "KeyError('dont support Sum opr in AXOPS/ONNXOPS/CUSTOM_OPS') at "
+        "ONNX-optimization (two [1,8] inputs)"
+    ),
+    "Mean": (
+        "KeyError('dont support Mean opr in AXOPS/ONNXOPS/CUSTOM_OPS') at "
+        "ONNX-optimization (two [1,8] inputs)"
+    ),
+    "Scatter": (
+        "KeyError('dont support Scatter opr in AXOPS/ONNXOPS/CUSTOM_OPS') "
+        "at ONNX-optimization (opset 11, axis=0 explicit, indices/updates "
+        "constant, data [1,8] input)"
+    ),
+    "OneHot": (
+        "KeyError('dont support OneHot opr in AXOPS/ONNXOPS/CUSTOM_OPS') at "
+        "ONNX-optimization (opset 11, axis=-1 explicit, int64[3] indices "
+        "input, depth 4 -> float[3,4])"
+    ),
+    "SoftmaxCrossEntropyLoss": (
+        "KeyError('dont support SoftmaxCrossEntropyLoss opr in "
+        "AXOPS/ONNXOPS/CUSTOM_OPS') at ONNX-optimization (opset 13, "
+        "reduction='mean' explicit, scores float[1,4] + labels int64[1] "
+        "-> scalar)"
     ),
 }
 
@@ -425,7 +483,8 @@ def unsupported_on_ax650(model: onnx.ModelProto) -> Set[str]:
 
 def confirmed_broken_on_ax650(model: onnx.ModelProto) -> Dict[str, str]:
     """Op types in `model` that are confirmed, via real hardware, to fail a
-    real `pulsar2 build` despite being listed in `AX650_SUPPORTED_OPS`.
+    real `pulsar2 build` -- whether listed in `AX650_SUPPORTED_OPS` (docs
+    claim support anyway) or absent from it (the unlisted-op sweep).
 
     Maps each present op type to its confirmed real failure mode (see
     `AX650_CONFIRMED_BROKEN_OPS`). Unlike `unsupported_on_ax650()`, every hit

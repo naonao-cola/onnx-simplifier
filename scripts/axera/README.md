@@ -3093,6 +3093,13 @@ mode` subgraphs of `llama_p512_l0_together.axmodel` and the LM head
   earlier sections treated as one region is really *three* segments in
   `resnet18d` (11,008 + 4,896 + 3,456 bytes); the op programs are table
   0's segment.
+- **The tail-vector lookup no longer assumes a 297-byte header.** A
+  two-input elementwise Mul stream carries a 340-byte header (per-input
+  descriptors), with the tail pointer at offset 328 -- past the old
+  fallback bound, so `tail_vector` found nothing and the whole stream
+  was unparseable. The lookup now falls back to a wider scan validated
+  by tiling (a chance pattern cannot tile exactly), which changes
+  nothing where the bounded scan already succeeds.
 - **Every segment opens with an `a7` verb, and `a7` is a verb.** The
   17-byte "block terminator" was misread: `2b a7 00 00 0a 00 00 00 00`
   is one leading byte (`2b`, `24`, `33`, `3b` -- segment-specific) and
@@ -5359,9 +5366,19 @@ and eight zero bytes immediately after. It fires on eight of fourteen
 fixtures with zero shuffled counterparts anywhere, converts only raw
 escapes (decode records are byte-identical everywhere else -- pure
 addition, no stream regresses), and round-trips exactly. The lone `08`
-stays unformed: its acceptance set (`{00,01,08,0a,0b,0f,88}`,
-rejecting only `09`) admits no clean gate, so pinning exact `08` would
-over-claim.
+stays unformed: a 17-value sweep at its position (fault
+`{09,29,39,49,A9}`, inert everything else tried including
+`19,59,69,79,89,99,B9,C9,E9`) refutes both a low-nibble rule and a
+bit5 gate with no clean replacement in sight, so pinning exact `08`
+would over-claim -- the splice test locks in two representatives
+(`0x29` faults, `0x19` runs identical) instead.
+
+Sibling trailers split the same way, probed by zeroing whole runs:
+the Reshape->MatMul seg2 `20 c4 07 a3 f7 0b` and the Adam seg2 `0b 32`
++ `20` both fault (live epilogue forms, same class as `0b 01`), while
+the Neg seg3 `09 a3 0b 0b` runs bit-identical (dead bytes -- not every
+unexplained run is load-bearing, which is why each family needs its
+own probe rather than a blanket rule).
 
 ### Trailer singles abutting the next segment
 
@@ -5374,8 +5391,16 @@ values -- so it is admitted with exactly those guards (zero shuffled
 counterparts, pure addition, exact round-trips), firing 1--4× on all
 fourteen fixtures. The last sub-floor stream but one crosses the floor
 on it; one Reshape stream remains pinned with its leftover singles.
-The `09`-hole and the sibling 0b-led/0b-terminated runs stay open
-work.
+The `09`-hole matrix below and the sibling runs after it stay open
+work only in the rule sense -- their device classes are now mapped.
+
+Probed siblings split by position, not by shape: two `0b`-LED runs
+(ResNet18 seg2 `0b d2 01 20`, seg3 `0b 52 07 30`) fault when zeroed,
+same live class as `0b 01` -- while two `0b`-TERMINATED runs (a
+Squeeze+Gemm `c4 07 a3 f7 0b`, ResNet18 `e4 0f c2 ff 0b`) run
+bit-identical. So a leading `0b` marks live trailer content and a
+trailing `0b` does not -- direction matters, content alone does not
+predict the class.
 
 ### Emitting mcode, first op: tinygrad-traced negation
 
@@ -7262,10 +7287,31 @@ two and refined the third:
   mid-training trajectory (steps 20-27 snapshots as `real_data`, same
   FP32 recipe) calibrates ranges the device values actually resolve
   in. Closed-loop device steps 20-27 (outputs fed back each step):
-  weight divergence vs ORT grows 1.8e-4 to 2.5e-3 (linear INT8-noise
-  accumulation, ~0.1%/step) while moment divergence stays flat at
-  ~1e-4 -- no blowup, the loop genuinely trains on the card. Loss
-  readout still needs the `* B` compensation above.
+   weight divergence vs ORT grows 1.8e-4 to 2.5e-3 (linear INT8-noise
+   accumulation, ~0.1%/step) while moment divergence stays flat at
+   ~1e-4 -- no blowup, the loop genuinely trains on the card. Loss
+   readout still needs the `* B` compensation above.
+- **Unlisted-op sweep: 10 more fail at the frontend, Neg/Log stand alone.**
+  With the step graph's unlisted ops (`Neg`, `Log`) confirmed working, the
+  natural question was what else off-list the compiler takes. Ten
+  single-node `pulsar2:7.0-lite` batteries (small isolated graphs, Numpy
+  MinMax calibration, attributes with schema defaults set explicitly to
+  rule out the attribute-defaulting gotcha) all fail -- nine at
+  ONNX-optimization with the same whitelist error (`KeyError('dont
+  support <Op> opr in AXOPS/ONNXOPS/CUSTOM_OPS')`): `ReduceSumSquare`
+  ([1,8]->[1,1]), `Selu`, `Softsign`, `Sign` ([1,8]->[1,8]), `Sum`/`Mean`
+  (two [1,8] inputs), `Scatter` (opset 11, constant indices/updates),
+  `OneHot` (opset 11, int64 indices input -> float[3,4]),
+  `SoftmaxCrossEntropyLoss` (opset 13, scores + int64 labels -> scalar);
+  `Reciprocal` ([1,8]->[1,8], calib over [0.5, 2.0)) gets one stage
+  further and fails at quantization (`Quant doesn't support Reciprocal
+  operation`). All ten are recorded in
+  `pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS`, which `op_coverage.classify()`
+  reports as broken, `pulsar2_simulator.partition()` places CPU-side, and
+  `ax650_build_risks()` flags without double-reporting -- the unlisted
+  bucket shrinks 90 to 80, and the practical upshot is that off-list
+  training-graph ops need a listed decomposition (or a Neg/Log-style
+  explicit mapping) rather than hoping the compiler takes them.
 
 ## Files
 
