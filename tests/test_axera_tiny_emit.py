@@ -139,3 +139,73 @@ def test_patch_mul_preserves_reference_site_b_form():
     _assert_family_matches(patched, target, nz / (nx * ny), 8)
     _assert_slot_run(patched, 1.0 / ny, 6, width=3)
     assert check(patched) == []
+
+
+# Output scale quad (z's own scale, `03 <f32> 81 82` x4 stride 7): source
+# of truth is TestOutputScaleQuads in tests/test_axera_mcode_reciprocal.py.
+
+
+@pytest.mark.parametrize(
+    "src,dst,dst_z",
+    [
+        ("mul_1x8", "mul_1x8_w2", _W2[2]),
+        ("mul_1x8_recip_x10", "mul_1x8_recip_x01", _X01[2]),
+    ],
+)
+def test_patch_mul_output_quad_matches_target(src, dst, dst_z):
+    src_z = {"mul_1x8": _BASE[2], "mul_1x8_recip_x10": _X10[2]}[src]
+    patched = tiny_emit.patch_mul_output_quad(_blob(src), src_z, dst_z)
+    target = _blob(dst)
+    _assert_family_matches(patched, target, dst_z, 7)
+    assert check(patched) == []
+
+
+def test_patch_mul_output_quad_round_trips():
+    blob = _blob("mul_1x8")
+    out_and_back = tiny_emit.patch_mul_output_quad(
+        tiny_emit.patch_mul_output_quad(blob, _BASE[2], _W2[2]), _W2[2], _BASE[2]
+    )
+    assert out_and_back == blob
+
+
+def test_patch_mul_output_quad_rejects_bad_frame():
+    # x_scale's own reciprocal-family words never carry the 03../8182
+    # frame, so patching "the output scale" by a value that only happens
+    # to collide with an unframed word must fail loudly, not silently
+    # patch the wrong bytes.
+    with pytest.raises(ValueError):
+        tiny_emit.patch_mul_output_quad(_blob("mul_1x8"), 1.0 / _BASE[0], 1.0)
+
+
+# x's zero point, literal-byte form only (`02 10 1b <zp_x> 83 36`): source
+# of truth is TestZpXLiteralByteWhenPresent, which also documents that
+# most builds do NOT use this form -- not predictable from zp_x's value.
+
+
+def test_patch_mul_zp_x_matches_target():
+    patched = tiny_emit.patch_mul_zp_x(_blob("mul_1x8_zp33sweep"), 33, 35)
+    target = _blob("mul_1x8_zp35sweep")
+    unit = bytes.fromhex("02101b") + bytes([35]) + bytes.fromhex("8336")
+    assert unit in patched
+    assert unit in target
+    assert check(patched) == []
+
+
+def test_patch_mul_zp_x_round_trips():
+    blob = _blob("mul_1x8_zp33sweep")
+    out_and_back = tiny_emit.patch_mul_zp_x(
+        tiny_emit.patch_mul_zp_x(blob, 33, 35), 35, 33
+    )
+    assert out_and_back == blob
+
+
+def test_patch_mul_zp_x_raises_when_form_absent():
+    # mul_1x8 (base) has zp_x=128 but uses one of the opaque forms, not
+    # the literal one -- the function must say so, not silently no-op.
+    with pytest.raises(ValueError):
+        tiny_emit.patch_mul_zp_x(_blob("mul_1x8"), 128, 100)
+
+
+def test_patch_mul_zp_x_rejects_out_of_range():
+    with pytest.raises(ValueError):
+        tiny_emit.patch_mul_zp_x(_blob("mul_1x8_zp33sweep"), 33, 256)

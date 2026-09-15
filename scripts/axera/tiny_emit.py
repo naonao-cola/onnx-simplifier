@@ -12,19 +12,38 @@ Mul streams' input side (sites A/C/B -- see
 tests/test_axera_mcode_reciprocal.py for the field map): given the
 reference build's recorded scales and the target scales, it rewrites the
 input reciprocal and requant slots by value, verifying each family forms
-its exact stride run. What it deliberately does not touch: the output
-scale quads (``emitter.py``'s ``learn_mcode`` domain), the S-unit
-programs (magnitude-adaptive shape, unmodeled ISA), the manifest string
-table (tensor-name order varies build to build), and zero points.
+its exact stride run. ``patch_mul_output_quad`` does the same for the
+output-side scale quad (``03 <f32(z_scale)> 81 82`` x4 stride 7).
+``patch_mul_zp_x`` patches x's zero point, but *only* when the reference
+build happens to use the one zero-point form this project has actually
+decoded (see below) -- it raises rather than silently doing nothing when
+it doesn't apply, since whether it applies is not predictable in advance.
 
-Status is honestly v0+v1: scale words are mapped and verified (the MinMax
-formula reproduces Pulsar2's scales to 1e-10; emitted streams
-round-trip exactly and pass ``mcode.check``), but the emitted stream
-runs ~0.19-vs-0.006 against ORT -- the zero-point
-encodings are still open (see the README's "Emitting mcode" section
-for the full field map and the gap analysis). tinygrad itself is an
-optional, lazily-imported dependency: everything else here needs only
-``numpy``.
+What none of this touches: the S-unit programs themselves (magnitude-
+adaptive shape, unmodeled ISA), the manifest string table (tensor-name
+order varies build to build), y's zero point (no literal encoding found
+for it at all, decoded or not), or x's zero point when the reference
+build doesn't use the literal form -- which is the common case, not an
+edge case (confirmed non-predictable from zp_x's value at any magnitude,
+see ``TestZpXLiteralByteWhenPresent`` in the test file). Because of that
+last point, and because z_scale changing generally moves far more of the
+stream than the five families patched here (z's own calibration range
+shifts the S-unit programs' internal constants throughout, not just the
+named slots -- confirmed by diffing same-shape builds at different z
+scales: over a thousand bytes move), **full-stream equality after
+patching is not a goal and should not be expected**; what is verified is
+that each named family lands on the target build's own bytes for that
+family.
+
+Status is honestly v0+v1+v2: scale and output-quad words are mapped and
+verified (the MinMax formula reproduces Pulsar2's scales to 1e-10;
+emitted streams round-trip exactly and pass ``mcode.check``), and x's
+zero point is *sometimes* patchable by value with zero arithmetic
+transform needed -- but the emitted stream still ran ~0.19-vs-0.006
+against ORT the last time it was checked end to end (pre-dating the
+output-quad and zp work here; a fresh device check with those included
+is the natural next step, not yet done). tinygrad itself is an optional,
+lazily-imported dependency: everything else here needs only ``numpy``.
 """
 
 from __future__ import annotations
@@ -164,4 +183,64 @@ def patch_mul_scales(reference_mcode: bytes, old_scales, new_scales) -> bytes:
     out = bytearray(reference_mcode)
     for off, new_pat in edits:
         out[off : off + len(new_pat)] = new_pat
+    return bytes(out)
+
+
+def patch_mul_output_quad(
+    reference_mcode: bytes, old_z_scale: float, new_z_scale: float
+) -> bytes:
+    """Rewrite a Mul stream's output scale quads by value.
+
+    The output-side counterpart to ``patch_mul_scales``'s input-side
+    families: four copies of ``03 <f32(z_scale)> 81 82`` at stride 7 (see
+    ``TestOutputScaleQuads`` in tests/test_axera_mcode_reciprocal.py).
+    Verifies the ``03``/``81 82`` framing on every copy before patching,
+    on top of ``_strided_run``'s count/stride check, since this family's
+    frame bytes are cheap to confirm and a false match here would silently
+    leave the output at the old scale.
+    """
+    old_pat = struct.pack("<f", float(old_z_scale))
+    new_pat = struct.pack("<f", float(new_z_scale))
+    hits = _strided_run(reference_mcode, old_pat, 7)
+    for off in hits:
+        lead, tags = reference_mcode[off - 1], reference_mcode[off + 4 : off + 6]
+        if lead != 0x03 or tags != b"\x81\x82":
+            raise ValueError(
+                f"quad @{off}: frame {lead:02x}/{tags.hex()} is not 03../8182"
+            )
+    out = bytearray(reference_mcode)
+    for off in hits:
+        out[off : off + 4] = new_pat
+    return bytes(out)
+
+
+def patch_mul_zp_x(reference_mcode: bytes, old_zp_x: int, new_zp_x: int) -> bytes:
+    """Rewrite x's zero point, where the literal-byte form is present.
+
+    The unit ``02 10 1b <zp_x> 83 36`` carries zp_x verbatim as its
+    fourth byte in some Mul builds (see ``TestZpXLiteralByteWhenPresent``)
+    -- but whether a given build uses this form is not predictable from
+    zp_x's value at any magnitude; roughly as many builds use one of two
+    other, still-undecoded forms instead (``TestZpXImmediateRegion``).
+    This function only ever does the one thing it has evidence for:
+    raises ``ValueError`` if the reference build does not carry
+    ``old_zp_x`` in this exact form, rather than silently leaving zp_x
+    unpatched or guessing at the opaque forms' encoding.
+    """
+    if not 0 <= old_zp_x <= 255 or not 0 <= new_zp_x <= 255:
+        raise ValueError(f"zp_x must be a uint8: old={old_zp_x!r} new={new_zp_x!r}")
+    old_unit = bytes.fromhex("02101b") + bytes([old_zp_x]) + bytes.fromhex("8336")
+    hits = [
+        i
+        for i in range(len(reference_mcode) - len(old_unit) + 1)
+        if reference_mcode[i : i + len(old_unit)] == old_unit
+    ]
+    if len(hits) != 1:
+        raise ValueError(
+            f"literal zp_x unit for {old_zp_x} not found exactly once"
+            f" (found {len(hits)}) -- this reference build likely uses one"
+            " of the opaque, undecoded forms instead"
+        )
+    out = bytearray(reference_mcode)
+    out[hits[0] + 3] = new_zp_x
     return bytes(out)
