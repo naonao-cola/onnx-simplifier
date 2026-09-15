@@ -1,11 +1,33 @@
 #!/usr/bin/env python3
-"""Emit NPU mcode for tinygrad-traced graphs -- first op: unary negation.
+"""Emit NPU mcode for tinygrad-traced graphs.
 
-Pipeline: a tinygrad ``Tensor`` graph is traced to its UOp pattern (unary
-negation lowers to ``MUL(x, -1.0)``), matched, and emitted as an mcode
-stream assembled from a reference Pulsar2 build with caller-chosen
-output scales (found by value as float32 words -- Neg carries its
-output scale as four stride-7 copies).
+Pipeline: a tinygrad ``Tensor`` graph is traced to its UOp pattern,
+matched by one of the ``trace_*`` functions below, and (for Neg so far)
+emitted as an mcode stream assembled from a reference Pulsar2 build with
+caller-chosen output scales (found by value as float32 words -- Neg
+carries its output scale as four stride-7 copies).
+
+``trace_neg``/``trace_add``/``trace_mul`` match single- or two-node UOp
+patterns (unary negation lowers to ``MUL(x, CONST(-1.0))``; a genuine
+two-tensor add or multiply to ``ADD(a, b)``/``MUL(a, b)`` with neither
+operand a ``CONST`` -- the two ``Ops.MUL`` matchers are mutually
+exclusive by that const check). ``trace_relu``/``trace_sigmoid`` match
+deeper compound patterns tinygrad lowers these ops to, since neither has
+a dedicated UOp: Relu is ``WHERE(CMPLT(CONST(0.0), x), x, CONST(0.0))``
+(a compare-and-select, with an operand-*identity* check -- not just
+shape/dtype equality -- that the ``x`` compared against 0 is the same
+UOp used as the true branch), and Sigmoid is
+``RECIPROCAL(ADD(CONST(1.0), EXP2(MUL(x, CONST(-log2(e))))))`` (the
+standard ``e^-x = 2^(-x*log2(e))`` rewrite, checked by exact float
+equality against ``-math.log2(math.e)``). Every pattern here was
+confirmed by direct UOp inspection against a real tinygrad install, not
+assumed from tinygrad's Python source -- these lowerings can and do
+change across tinygrad versions.
+
+None of the four new matchers has an ``emit_*`` counterpart yet (only
+Neg does, via ``emit_neg``) -- see each function's own docstring and
+tests/test_axera_tiny_emit.py for what tracing alone does and doesn't
+give you.
 
 ``patch_mul_scales`` extends the same reference-patch idea to two-input
 Mul streams' input side (sites A/C/B -- see
@@ -93,6 +115,147 @@ def trace_neg(tensor):
         raise ValueError(f"not a multiply-by-minus-one: {const}")
     shape = list(data.shape)
     return {"shape": shape, "dtype": str(data.dtype)}
+
+
+def trace_add(tensor):
+    """Match a tinygrad tensor holding elementwise two-tensor addition.
+
+    Returns ``{"shape": [...], "dtype": ...}`` if the tensor's UOp graph
+    is ``ADD(a, b)`` with neither operand a ``CONST`` (a genuine
+    two-tensor add, not a scalar-add lowering, which would need its own
+    matcher the way ``trace_neg`` needs one distinct from a general
+    two-tensor multiply) -- else raises ``ValueError``.
+    """
+    try:
+        from tinygrad.uop.ops import Ops
+    except ImportError as exc:
+        raise ImportError(
+            "tracing needs the tinygrad package (pip install tinygrad)"
+        ) from exc
+
+    uop = tensor.uop
+    if uop.op is not Ops.ADD or len(uop.src) != 2:
+        raise ValueError(f"not an add: {uop.op}")
+    a, b = uop.src
+    if a.op is Ops.CONST or b.op is Ops.CONST:
+        raise ValueError("a scalar add, not a two-tensor add")
+    return {"shape": list(uop.shape), "dtype": str(tensor.dtype)}
+
+
+def trace_mul(tensor):
+    """Match a tinygrad tensor holding elementwise two-tensor multiply.
+
+    Returns ``{"shape": [...], "dtype": ...}`` if the tensor's UOp graph
+    is ``MUL(a, b)`` with neither operand a ``CONST``. This is the
+    complement of ``trace_neg``'s pattern (``MUL(x, CONST(-1.0))``) over
+    the same ``Ops.MUL`` space -- a scalar multiply-by-constant (Neg's
+    shape, or any other scalar multiply) is rejected here and matched by
+    ``trace_neg`` instead when the constant happens to be -1.0; any other
+    scalar multiply matches neither and needs its own matcher, not added
+    here since this project has no confirmed byte-level scalar-multiply
+    encoding yet.
+    """
+    try:
+        from tinygrad.uop.ops import Ops
+    except ImportError as exc:
+        raise ImportError(
+            "tracing needs the tinygrad package (pip install tinygrad)"
+        ) from exc
+
+    uop = tensor.uop
+    if uop.op is not Ops.MUL or len(uop.src) != 2:
+        raise ValueError(f"not a multiply: {uop.op}")
+    a, b = uop.src
+    if a.op is Ops.CONST or b.op is Ops.CONST:
+        raise ValueError("a scalar multiply, not a two-tensor multiply")
+    return {"shape": list(uop.shape), "dtype": str(tensor.dtype)}
+
+
+def trace_relu(tensor):
+    """Match a tinygrad tensor holding ReLU.
+
+    tinygrad has no dedicated Relu UOp -- ``.relu()`` lowers to a
+    compare-and-select, ``WHERE(CMPLT(CONST(0.0), x), x, CONST(0.0))``,
+    confirmed by direct UOp inspection (not assumed from tinygrad's
+    Python source, which can and does change the lowering across
+    versions). Matching it means checking that three-node shape *and*
+    that the ``x`` referenced in the comparison is the identical UOp
+    object used as the true-branch -- tinygrad's UOp graph shares
+    subexpression nodes, so ``is`` identity is the correct check, not
+    structural equality (two different tensors could legitimately have
+    identical shape/dtype without being the same operand).
+    """
+    try:
+        from tinygrad.uop.ops import Ops
+    except ImportError as exc:
+        raise ImportError(
+            "tracing needs the tinygrad package (pip install tinygrad)"
+        ) from exc
+
+    uop = tensor.uop
+    if uop.op is not Ops.WHERE or len(uop.src) != 3:
+        raise ValueError(f"not a where: {uop.op}")
+    cmp, true_branch, false_branch = uop.src
+    if cmp.op is not Ops.CMPLT or len(cmp.src) != 2:
+        raise ValueError(f"not a relu (where's condition isn't a cmplt): {cmp.op}")
+    zero_lhs, x = cmp.src
+    if zero_lhs.op is not Ops.CONST or float(zero_lhs.arg) != 0.0:
+        raise ValueError("not a relu (cmplt's left side isn't the constant 0.0)")
+    if true_branch is not x:
+        raise ValueError("not a relu (where's true branch isn't cmplt's operand)")
+    if false_branch.op is not Ops.CONST or float(false_branch.arg) != 0.0:
+        raise ValueError("not a relu (where's false branch isn't the constant 0.0)")
+    return {"shape": list(uop.shape), "dtype": str(tensor.dtype)}
+
+
+def trace_sigmoid(tensor):
+    """Match a tinygrad tensor holding Sigmoid.
+
+    Like Relu, tinygrad has no dedicated Sigmoid UOp: ``.sigmoid()``
+    lowers to ``RECIPROCAL(ADD(CONST(1.0), EXP2(MUL(x, CONST(c)))))``
+    where ``c`` is exactly ``-log2(e)`` (the standard
+    ``e^-x = 2^(-x*log2(e))`` rewrite so the hardware/software exp
+    lowers through ``EXP2`` rather than a natural-base ``Ops.EXP``),
+    confirmed by direct UOp inspection and an exact float equality check
+    against ``-math.log2(math.e)`` -- not a tolerance-based comparison,
+    since tinygrad computes this constant once at trace time and every
+    build should reproduce the identical float64-rounded-to-float32 bit
+    pattern. The deepest pattern of the four traced here (four nested
+    ops); unlike Relu's compare-and-select, no operand identity check is
+    needed beyond following the chain down to a single ``x``.
+    """
+    try:
+        from tinygrad.uop.ops import Ops
+    except ImportError as exc:
+        raise ImportError(
+            "tracing needs the tinygrad package (pip install tinygrad)"
+        ) from exc
+    import math
+
+    uop = tensor.uop
+    if uop.op is not Ops.RECIPROCAL or len(uop.src) != 1:
+        raise ValueError(f"not a reciprocal: {uop.op}")
+    (add_node,) = uop.src
+    if add_node.op is not Ops.ADD or len(add_node.src) != 2:
+        raise ValueError(
+            f"not a sigmoid (reciprocal's operand isn't an add): {add_node.op}"
+        )
+    one_const, exp2_node = add_node.src
+    if one_const.op is not Ops.CONST or float(one_const.arg) != 1.0:
+        raise ValueError("not a sigmoid (add's first operand isn't the constant 1.0)")
+    if exp2_node.op is not Ops.EXP2 or len(exp2_node.src) != 1:
+        raise ValueError(
+            f"not a sigmoid (add's second operand isn't an exp2): {exp2_node.op}"
+        )
+    (mul_node,) = exp2_node.src
+    if mul_node.op is not Ops.MUL or len(mul_node.src) != 2:
+        raise ValueError(
+            f"not a sigmoid (exp2's operand isn't a multiply): {mul_node.op}"
+        )
+    x, c = mul_node.src
+    if c.op is not Ops.CONST or float(c.arg) != -math.log2(math.e):
+        raise ValueError("not a sigmoid (multiply's constant isn't -log2(e))")
+    return {"shape": list(uop.shape), "dtype": str(tensor.dtype)}
 
 
 def find_scale_words(mcode: bytes, scale: float) -> list:

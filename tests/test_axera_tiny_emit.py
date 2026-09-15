@@ -54,6 +54,76 @@ def test_trace_neg_rejects_other_graphs():
         tiny_emit.trace_neg(t * 2.0)
 
 
+def test_trace_add_matches_two_tensor_add():
+    tg = pytest.importorskip("tinygrad")
+    a, b = tg.Tensor.empty(1, 8), tg.Tensor.empty(1, 8)
+    got = tiny_emit.trace_add(a + b)
+    assert got["shape"] == [1, 8]
+
+
+def test_trace_add_rejects_other_graphs():
+    tg = pytest.importorskip("tinygrad")
+    a, b = tg.Tensor.empty(1, 8), tg.Tensor.empty(1, 8)
+    with pytest.raises(ValueError):
+        tiny_emit.trace_add(a * b)  # wrong op
+    with pytest.raises(ValueError):
+        tiny_emit.trace_add(a + 2.0)  # scalar add, not two-tensor
+
+
+def test_trace_mul_matches_two_tensor_multiply():
+    tg = pytest.importorskip("tinygrad")
+    a, b = tg.Tensor.empty(1, 8), tg.Tensor.empty(1, 8)
+    got = tiny_emit.trace_mul(a * b)
+    assert got["shape"] == [1, 8]
+
+
+def test_trace_mul_rejects_other_graphs():
+    tg = pytest.importorskip("tinygrad")
+    a, b = tg.Tensor.empty(1, 8), tg.Tensor.empty(1, 8)
+    with pytest.raises(ValueError):
+        tiny_emit.trace_mul(a + b)  # wrong op
+    with pytest.raises(ValueError):
+        tiny_emit.trace_mul(-a)  # scalar multiply (Neg's own shape)
+    with pytest.raises(ValueError):
+        tiny_emit.trace_mul(a * 2.0)  # scalar multiply, not two-tensor
+
+
+def test_trace_relu_matches_compare_and_select():
+    tg = pytest.importorskip("tinygrad")
+    t = tg.Tensor.empty(1, 8)
+    got = tiny_emit.trace_relu(t.relu())
+    assert got["shape"] == [1, 8]
+
+
+def test_trace_relu_rejects_other_graphs():
+    tg = pytest.importorskip("tinygrad")
+    a, b = tg.Tensor.empty(1, 8), tg.Tensor.empty(1, 8)
+    with pytest.raises(ValueError):
+        tiny_emit.trace_relu(a.sigmoid())  # wrong top-level op
+    with pytest.raises(ValueError):
+        # Same WHERE/CMPLT-against-0.0 shape, but the true branch is a
+        # *different* tensor than the one compared against 0 -- the
+        # identity check, not just shape/dtype matching, must catch this.
+        tiny_emit.trace_relu((0 < a).where(b, 0))
+
+
+def test_trace_sigmoid_matches_reciprocal_chain():
+    tg = pytest.importorskip("tinygrad")
+    t = tg.Tensor.empty(1, 8)
+    got = tiny_emit.trace_sigmoid(t.sigmoid())
+    assert got["shape"] == [1, 8]
+
+
+def test_trace_sigmoid_rejects_other_graphs():
+    tg = pytest.importorskip("tinygrad")
+    t = tg.Tensor.empty(1, 8)
+    with pytest.raises(ValueError):
+        tiny_emit.trace_sigmoid(t.relu())  # wrong top-level op
+    with pytest.raises(ValueError):
+        # 1/(1+2^(-2x)) -- same shape, wrong constant (not -log2(e)).
+        tiny_emit.trace_sigmoid((1.0 + (t * -2.0).exp2()).reciprocal())
+
+
 def test_minmax_scale_matches_pulsar2_to_1e10():
     rng = np.random.default_rng(0)
     samples = [(rng.uniform(-2.5, 2.5, (1, 8))).astype(np.float32) for _ in range(8)]
