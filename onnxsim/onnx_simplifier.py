@@ -2610,6 +2610,122 @@ def apply_qronos_cpp(
     )
 
 
+def apply_tesseraq_cpp(
+    float_model: Union[str, onnx.ModelProto],
+    quantized_model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    num_bits: int = 4,
+    num_iterations: int = 400,
+    par_rounds: int = 4,
+    learning_rate: float = 0.1,
+    scale_learning_rate: float = 0.01,
+    reg_param: float = 0.01,
+    warm_start: float = 0.2,
+    beta_range: Tuple[float, float] = (20.0, 2.0),
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_tesseraq`: TesseraQ's own
+    "Progressive Adaptive Rounding" (PAR) -- an AdaRound-style
+    rectified-sigmoid rounding relaxation, optimized by a hand-rolled Adam
+    loop jointly with each weight block's own dequantization scale (in
+    log-space), with a coarse-to-fine element-by-element hardening
+    schedule across ``par_rounds`` rounds instead of a single monolithic
+    anneal -- see ``onnxsim/tesseraq.py``'s own module docstring for the
+    full technique.
+
+    Same real calibration machinery as :func:`onnxsim.apply_gptq_cpp` --
+    a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the float model in C++ (see
+    ``ApplyTesseraq`` in ``tesseraq_entry.h`` for the full scope).
+
+    Unlike every other calibration-driven ``*_cpp`` port in this codebase
+    (all either closed-form or, for :func:`onnxsim.apply_quarot_gptq_cpp`/
+    :func:`onnxsim.apply_gptvq_cpp`, closed-form apart from an
+    independently-seeded RNG), this is an iterative Adam optimization: see
+    ``tesseraq_entry.h``'s own accepted numerical scope note for what that
+    means for cross-language floating-point agreement, and
+    tests/test_tesseraq_cpp.py for how closely this tracks the pure-Python
+    reference in practice.
+
+    :param float_model: the original (unquantized) onnx ModelProto or file
+            path
+    :param quantized_model: a quantized version of ``float_model`` (onnx
+            ModelProto or file path), produced by
+            :func:`onnxsim.quantize_weight_only_int4`
+    :param calibration_data: representative input batches to optimize the
+            reconstruction against -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied) -- this port has no RNG of
+            its own (unlike :func:`onnxsim.apply_quarot_gptq_cpp`'s/
+            :func:`onnxsim.apply_gptvq_cpp`'s own), so ``seed`` only ever
+            affects which calibration batches get generated
+    :param num_bits: effective signed bit width PAR rounds each element
+            into (2..4) -- see :func:`onnxsim.apply_tesseraq`'s own
+            parameter of the same name
+    :param num_iterations: total Adam steps to run per layer, split evenly
+            across ``par_rounds``
+    :param par_rounds: number of Progressive Adaptive Rounding rounds
+    :param learning_rate: Adam learning rate for the per-element rounding
+            relaxation
+    :param scale_learning_rate: Adam learning rate for each weight block's
+            dequantization scale
+    :param reg_param: weight of the regularization term pulling each
+            still-soft element toward a hard 0/1 decision
+    :param warm_start: fraction of the total iteration budget run with the
+            regularization term disabled
+    :param beta_range: ``(beta_start, beta_end)`` for the regularization
+            term's exponent, linearly annealed after ``warm_start``
+    :param providers: onnxruntime execution providers to run ``float_model``
+            on when capturing calibration activations
+    :returns: ``quantized_model`` with every matched layer's INT4 weight
+            codes and per-block scale initializers rewritten to their
+            PAR-optimized values.
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(quantized_model, str):
+        quantized_model = onnx.load(quantized_model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            float_model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_gptq_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    beta_start, beta_end = beta_range
+    return onnx.load_from_string(
+        C.apply_tesseraq(
+            _get_model_executor(providers),
+            float_model.SerializeToString(),
+            quantized_model.SerializeToString(),
+            calibration_data_pb,
+            num_bits,
+            num_iterations,
+            par_rounds,
+            learning_rate,
+            scale_learning_rate,
+            reg_param,
+            warm_start,
+            beta_start,
+            beta_end,
+        )
+    )
+
+
 def apply_awq_cpp(
     float_model: Union[str, onnx.ModelProto],
     quantized_model: Union[str, onnx.ModelProto],

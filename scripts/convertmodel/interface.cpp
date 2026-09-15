@@ -2903,6 +2903,50 @@ em::val onnxsim_apply_qronos(const std::string &float_data,
   }
 }
 
+// TesseraQ: "Progressive Adaptive Rounding" (PAR) -- an AdaRound-style
+// rectified-sigmoid rounding relaxation, optimized by a hand-rolled Adam
+// loop jointly with each weight block's own dequantization scale (in
+// log-space), with a coarse-to-fine element-by-element hardening
+// schedule across `par_rounds` rounds. Same two-model calibration-batch
+// contract and executor as onnxsim_apply_gptq's own binding above
+// (candidates are processed independently, so `executor` is invoked
+// once, up front, the same as onnxsim_apply_gptq's own). `beta_start`/
+// `beta_end` are the two ends of apply_tesseraq's own `beta_range`
+// tuple, split into separate parameters here since this binding layer
+// has no tuple type. See ApplyTesseraq in tesseraq_entry.h, including
+// its own accepted numerical scope note (an iterative optimization, not
+// a closed-form computation).
+em::val onnxsim_apply_tesseraq(const std::string &float_data,
+                               const std::string &quantized_data,
+                               em::val calibration_batches_val, int num_bits,
+                               int num_iterations, int par_rounds,
+                               double learning_rate,
+                               double scale_learning_rate, double reg_param,
+                               double warm_start, double beta_start,
+                               double beta_end) {
+  onnx::ModelProto float_model;
+  if (!float_model.ParseFromArray(float_data.data(), float_data.size())) {
+    std::cerr << "Parse failed (float model)" << std::endl;
+    return em::val::null();
+  }
+  onnx::ModelProto quantized_model;
+  if (!quantized_model.ParseFromArray(quantized_data.data(),
+                                      quantized_data.size())) {
+    std::cerr << "Parse failed (quantized model)" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyTesseraq(
+        float_model, quantized_model, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), num_bits,
+        num_iterations, par_rounds, learning_rate, scale_learning_rate,
+        reg_param, warm_start, beta_start, beta_end));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_tesseraq error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // AWQ (Lin et al., 2023): grid-searched per-channel weight rescaling for
 // every quantize_weight_only_int4-quantized MatMul/Gemm layer shared (by
 // node output name) between a float model and its quantized counterpart,
@@ -3170,6 +3214,7 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_apply_llm_int8", &onnxsim_apply_llm_int8);
   function("onnxsim_apply_gptq", &onnxsim_apply_gptq);
   function("onnxsim_apply_qronos", &onnxsim_apply_qronos);
+  function("onnxsim_apply_tesseraq", &onnxsim_apply_tesseraq);
   function("onnxsim_apply_awq", &onnxsim_apply_awq);
   function("onnxsim_apply_quarot_gptq", &onnxsim_apply_quarot_gptq);
   function("onnxsim_apply_gptvq", &onnxsim_apply_gptvq);
