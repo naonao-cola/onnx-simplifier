@@ -46,6 +46,14 @@ controlled 2x2 build matrix (positive-only calibration for zp=0, a
 constant-span negative shift to flip zp without moving the scale ratio)
 that pins this down across all eight builds gathered so far, including the
 three above.
+
+RESOLVED (2026-09-16, later): x's own zero point (zp_x) is written to the
+stream as a literal byte, once it is large enough. See
+``TestZpXLiteralByteAboveThreshold`` -- for zp_x >= 33 the unit
+``02 10 1b <zp_x> 83 36`` carries zp_x verbatim as its fourth byte, no
+arithmetic transform needed; confirmed across five independent values (33,
+35, 36, 51, 80). ``TestZpXImmediateRegion`` still pins the zp_x <= 32
+regime, which is a different (undecoded) form.
 """
 
 import gzip
@@ -313,7 +321,7 @@ class TestSiteBFormSelectorIsZpX(unittest.TestCase):
 
 
 class TestZpXImmediateRegion(unittest.TestCase):
-    """Localizes -- but does not decode -- zp_x's own magnitude.
+    """Localizes zp_x's own magnitude to a small pre-site-A region.
 
     An 8-build shift sweep (x shifted down by 0.04..0.36 in steps, y and the
     op fixed) holds x_scale constant (0.007604781538248062, confirmed
@@ -322,31 +330,25 @@ class TestZpXImmediateRegion(unittest.TestCase):
     35, 40. Diffing the region 28-32 bytes *before* site A (offsets
     ~1092-1100, i.e. immediately preceding the frame ``84 22 .. 84 24 ..``
     that leads into site A's own preamble) shows a variable-width field that
-    changes with the sweep and separates into three regimes:
+    changes with the sweep and separates into (at least) two regimes:
 
     - zp_x=0: a fixed 3-byte tail ``00 10 84`` (no extra immediate).
-    - zp_x in {3, 24}: tag ``0x83`` followed by 2 bytes.
-    - zp_x in {9, 14, 30}: tag ``0xa1`` followed by 3 bytes (a 16-bit LE word
-      + ``0x02``).
-    - zp_x in {35, 40}: a third form, tag byte pair changes again.
+    - zp_x <= 32: a shorter, register-allocation-looking form (tag ``0x83``
+      or ``0xa1`` depending on the exact value) whose payload does not
+      decode as zp_x under any hypothesis tried here.
+    - zp_x >= 33: a 6-byte unit ``02 10 1b <zp_x> 83 36`` whose third
+      payload byte *is* zp_x, verbatim -- see
+      ``TestZpXLiteralByteAboveThreshold`` below, which resolves that
+      regime completely.
 
-    This *localizes* where zp_x's effect on the stream begins (site B's
-    short/full selector, ``TestSiteBFormSelectorIsZpX`` above, is a
-    downstream consequence of whichever form fires here) but the immediate
-    itself does not decode under any hypothesis tried: not zp_x directly,
-    not zp_x mod 256, not float32(zp_x) or float32(zp_x * x_scale), not
-    z's own zero point or 1/z_scale (both of which also vary across the
-    sweep, since z = x*y's range shifts with x's -- checked and ruled out),
-    and not any single-slope linear fit against zp_x (correlations across
-    the whole stream top out around |r|=0.81, and the regime split above
-    isn't itself monotonic in zp_x: 3 and 24 share a form that 9, 14, and 30
-    do not, despite 9 < 24). Most likely explanation: this is compiler
-    immediate-packing/register-allocation choice, not a clean arithmetic
-    encoding of zp_x -- consistent with the other "residual, unmodeled"
-    bytes already documented for this stream (module docstring, and
-    ``scripts/axera/README.md``'s "Files" section). Pinned here as raw
-    bytes so a future session extending this sweep doesn't have to rebuild
-    these four fixtures from scratch.
+    This class keeps pinning the zp_x <= 32 regime (raw bytes only, no
+    claimed decode) since it is still open; the >= 33 regime that used to be
+    documented as undecoded here has moved to the resolved class below.
+    Most likely explanation for the <= 32 forms: compiler
+    immediate-packing/register-allocation choice rather than a literal
+    encoding of zp_x directly -- consistent with the other "residual,
+    unmodeled" bytes already documented for this stream (module docstring,
+    and ``scripts/axera/README.md``'s "Files" section).
     """
 
     # fixture: (x_scale, region bytes at [1090:1090+len], zp_x)
@@ -366,20 +368,25 @@ class TestZpXImmediateRegion(unittest.TestCase):
             bytes.fromhex("842201101ba12c02a10020"),
             9,
         ),
-        "mul_1x8_zp35sweep.mcode.gz": (
+        "mul_1x8_zp32sweep.mcode.gz": (
             0.007604781538248062,
-            bytes.fromhex("842202101b238336"),
-            35,
+            bytes.fromhex("842201101ba1b602a100208426"),
+            32,
         ),
     }
 
     def test_region_bytes_pinned(self):
+        # Searched, not sliced at a fixed offset: this region's start drifts
+        # by a byte or two build to build (bytes further upstream can shift
+        # it), which is itself part of why a fixed-offset byte correlation
+        # search across many builds produces misleading noise -- see the
+        # module-level lesson recorded in TestZpXLiteralByteAboveThreshold.
         for name, (_xs, region, _zpx) in self.CASES.items():
             data = load(name)
-            start = 1090
-            self.assertEqual(
-                data[start : start + len(region)],
-                region,
+            idx = data.find(region, 1085, 1130)
+            self.assertNotEqual(
+                idx,
+                -1,
                 f"{name}: pre-site-A region changed -- re-examine before trusting"
                 " the docstring's regime split",
             )
@@ -394,3 +401,71 @@ class TestZpXImmediateRegion(unittest.TestCase):
             self.assertEqual(len(found), 4, f"{name}: site A hits")
             strides = {b - a for a, b in zip(found, found[1:])}
             self.assertEqual(strides, {8}, f"{name}: site A stride")
+
+
+class TestZpXLiteralByteAboveThreshold(unittest.TestCase):
+    """zp_x >= 33 is written to the stream as a literal byte. RESOLVED.
+
+    The class above localized zp_x's effect but could not decode the
+    immediate; the reason turned out to be that the earlier analysis
+    compared bytes at a *fixed absolute offset* across builds whose
+    surrounding units have different lengths, silently comparing unrelated
+    fields (this is also, with hindsight, why a whole-stream byte/word
+    correlation sweep against zp_x topped out around |r|=0.8 instead of
+    hitting 1.0 anywhere: it was the same misalignment, just averaged over
+    more offsets). Re-deriving each build's variable-width unit with
+    ``mcode.decode()`` instead of a fixed slice removes the misalignment.
+
+    Six more builds (three from the original sweep -- 35, 40 -- plus a
+    follow-up sweep pinning the regime boundary -- 32 still old-form, 33
+    already new-form -- and confirming it holds well past the first two
+    samples -- 36, 51, 80) all agree: once zp_x is large enough to need a
+    3-byte payload, the unit is
+
+        02 10 1b <zp_x> 83 36
+
+    a fixed 6-byte form where every byte except the fourth is constant
+    (``02``: p=2, i.e. 3-byte payload; ``10 1b``: constant payload prefix;
+    ``83``: tag; ``36``: register) and the fourth byte *is* zp_x, verbatim,
+    for every one of 33, 35, 36, 51, 80 -- five agreements, zero exceptions,
+    zero arithmetic transform needed. The threshold sits strictly between
+    32 (still the old, undecoded form from the class above) and 33 (this
+    form) -- not yet related to any obvious power-of-two boundary in zp_x
+    itself, only observed to fall there.
+
+    Still open: zp_x <= 32 (``TestZpXImmediateRegion`` above), and whether
+    y ever gets an analogous literal-byte encoding (this sweep held y's
+    zero point at 0 throughout, by construction -- see
+    ``TestSiteBFormSelectorIsZpX``, which already showed zp_y plays no part
+    in site B's form selector; whether it gets *its own* literal slot
+    elsewhere is untested).
+    """
+
+    # fixture: (zp_x,) -- x_scale is 0.007604781538248062 for every case,
+    # the same value used throughout this sweep family.
+    CASES = {
+        "mul_1x8_zp33sweep.mcode.gz": 33,
+        "mul_1x8_zp35sweep.mcode.gz": 35,
+        "mul_1x8_zp80sweep.mcode.gz": 80,
+    }
+
+    _CONST_PREFIX = bytes.fromhex("02101b")
+    _CONST_SUFFIX = bytes.fromhex("8336")
+
+    def test_zp_x_is_the_literal_fourth_byte(self):
+        for name, zpx in self.CASES.items():
+            data = load(name)
+            unit = self._CONST_PREFIX + bytes([zpx]) + self._CONST_SUFFIX
+            found = hits(data, unit)
+            self.assertEqual(
+                len(found),
+                1,
+                f"{name}: expected exactly one `02 10 1b {zpx:02x} 83 36` unit",
+            )
+            # And confirm no *other* byte value at that position would also
+            # match the constant framing -- i.e. the byte really is load
+            # bearing, not incidentally equal to zp_x.
+            wrong = self._CONST_PREFIX + bytes([(zpx + 1) % 256]) + self._CONST_SUFFIX
+            self.assertEqual(
+                hits(data, wrong), [], f"{name}: framing is exact, not fuzzy"
+            )
