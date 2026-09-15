@@ -52,6 +52,17 @@ name: convertmodel WebGPU custom kernel dispatcher
 # carries via that same reader) need no browser and no GPU, so they run in
 # the onnx-node-metadata job below, not in a GPU-backed one.
 #
+#   * test/pyodide_tinygrad_codegen.test.mjs -- proves tinygrad's own
+#     Tensor -> UOp -> WGSL codegen pipeline (what onnxsim.webgpu_tinygrad_codegen
+#     drives server-side) also runs inside Pyodide -- a real
+#     Python-in-WebAssembly runtime -- for both an elementwise case and the
+#     harder Conv3D one, with no numpy and no browser/GPU involved (Pyodide
+#     runs standalone in plain Node via its own bundled WASM build). Needs
+#     real network access to fetch tinygrad's wheel from PyPI (deliberately
+#     not from Pyodide's own package CDN -- see the test's own docstring for
+#     why), unlike every other job here, which reads only pre-committed
+#     fixtures.
+#
 # Scheduled + on demand, plus on PRs that touch the files this check depends
 # on, same reasoning as convertmodel-webgpu-demo.yml / convertmodel-ep-placement.yml.
 
@@ -67,6 +78,7 @@ on:
       - "scripts/convertmodel/test/webgpu_custom_kernel_runtime.test.mjs"
       - "scripts/convertmodel/test/onnx_node_metadata.test.mjs"
       - "scripts/convertmodel/test/webgpu_kernel_annotations.test.mjs"
+      - "scripts/convertmodel/test/pyodide_tinygrad_codegen.test.mjs"
       - "scripts/convertmodel/test/make_webgpu_kernel_fixture.py"
       - "scripts/convertmodel/test/make_webgpu_tinygrad_codegen_fixture.py"
       - "scripts/convertmodel/test/make_webgpu_custom_kernel_runtime_fixture.py"
@@ -171,3 +183,19 @@ jobs:
       - name: Run the WebGPU custom kernel runtime check
         working-directory: scripts/convertmodel
         run: npm run test:webgpu-custom-kernel-runtime
+
+  pyodide-tinygrad-codegen:
+    name: tinygrad WGSL codegen inside Pyodide (no browser, no GPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (pyodide)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Run the Pyodide + tinygrad codegen check
+        working-directory: scripts/convertmodel
+        run: npm run test:pyodide-tinygrad-codegen

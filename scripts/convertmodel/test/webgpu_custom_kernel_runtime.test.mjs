@@ -98,7 +98,7 @@ async function runInPage({ port, manifest }) {
       extraInputs[name] = data;
     }
 
-    const outputs = await runOnnxModelWithCustomKernel({
+    const { outputs, profiling } = await runOnnxModelWithCustomKernel({
       ort,
       preModelBytes,
       postModelBytes,
@@ -107,10 +107,11 @@ async function runInPage({ port, manifest }) {
       extraInputs,
       nodeOutputs: manifest.nodeOutputs,
       finalOutputNames: [manifest.finalOutputName],
+      profile: true,
     });
 
     const finalTensor = outputs[manifest.finalOutputName];
-    return { ok: true, data: Array.from(finalTensor.data), dims: finalTensor.dims };
+    return { ok: true, data: Array.from(finalTensor.data), dims: finalTensor.dims, profiling };
   } catch (e) {
     return { ok: false, error: e && e.stack ? e.stack : String(e) };
   }
@@ -158,6 +159,23 @@ async function main() {
       maxAbsDiff < 1e-3,
       `max abs diff ${maxAbsDiff} too large -- actual ${JSON.stringify(result.data)} vs expected ${JSON.stringify(expected.data)}`,
     );
+  });
+
+  await check("profile: true either returns real per-step GPU timings or is cleanly unsupported", () => {
+    if (result.profiling === null) {
+      console.log("    (device lacks \"timestamp-query\" here -- profiling silently produced no timings, as documented)");
+      return;
+    }
+    assert.equal(result.profiling.length, MANIFEST.spec.steps.length);
+    for (const [index, timing] of result.profiling.entries()) {
+      assert.equal(timing.index, index);
+      assert.equal(timing.entryPoint, MANIFEST.spec.steps[index].entry_point);
+      assert.ok(
+        Number.isFinite(timing.durationNs) && timing.durationNs >= 0,
+        `expected a non-negative finite duration, got ${timing.durationNs}`,
+      );
+    }
+    console.log(`    (GPU durations: ${result.profiling.map((t) => `${t.entryPoint}=${t.durationNs}ns`).join(", ")})`);
   });
 
   console.log(`\nwebgpu custom kernel runtime: ${passed} checks passed`);

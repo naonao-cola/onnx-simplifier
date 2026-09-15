@@ -80,7 +80,7 @@ function serveConvertmodelDir() {
 async function runInPage({ port, file, nodeName, n }) {
   const base = `http://localhost:${port}`;
   const { readWebgpuKernelSpecs } = await import(`${base}/onnx_node_metadata.mjs`);
-  const { dispatchWebgpuProgram, createStorageBuffer, readBackFloat32Buffer } = await import(
+  const { dispatchWebgpuProgram, createStorageBuffer, readBackFloat32Buffer, supportsWebgpuProfiling } = await import(
     `${base}/webgpu_kernel_dispatcher.mjs`
   );
 
@@ -92,7 +92,15 @@ async function runInPage({ port, file, nodeName, n }) {
   const spec = specs.get(nodeName);
 
   const adapter = await navigator.gpu.requestAdapter();
-  const device = await adapter.requestDevice();
+  // Request "timestamp-query" up front (only if the adapter actually offers
+  // it) so the profiling check below gets a real answer either way, rather
+  // than always seeing "unsupported" just because nobody asked for the
+  // feature at device-creation time -- a device's feature set can't be
+  // grown after the fact.
+  const wantTimestampQuery = adapter.features.has("timestamp-query");
+  const device = await adapter.requestDevice({
+    requiredFeatures: wantTimestampQuery ? ["timestamp-query"] : [],
+  });
 
   const a = new Float32Array(n);
   const b = new Float32Array(n);
@@ -106,23 +114,26 @@ async function runInPage({ port, file, nodeName, n }) {
   const bufferA = createStorageBuffer(device, a);
   const bufferB = createStorageBuffer(device, b);
   const bufferC = createStorageBuffer(device, new Float32Array(n)); // zero-initialized output
+  const buffers = new Map([
+    ["a", bufferA],
+    ["b", bufferB],
+    ["c", bufferC],
+  ]);
 
-  await dispatchWebgpuProgram(
-    device,
-    spec,
-    new Map([
-      ["a", bufferA],
-      ["b", bufferB],
-      ["c", bufferC],
-    ]),
-  );
+  const { timings } = await dispatchWebgpuProgram(device, spec, buffers, { profile: true });
 
   const actual = await readBackFloat32Buffer(device, bufferC, n);
   let maxAbsDiff = 0;
   for (let i = 0; i < n; i++) {
     maxAbsDiff = Math.max(maxAbsDiff, Math.abs(actual[i] - expected[i]));
   }
-  return { ok: true, maxAbsDiff, sample: [actual[0], actual[1], actual[n - 1]] };
+  return {
+    ok: true,
+    maxAbsDiff,
+    sample: [actual[0], actual[1], actual[n - 1]],
+    deviceSupportsProfiling: supportsWebgpuProfiling(device),
+    timings,
+  };
 }
 
 async function main() {
@@ -163,6 +174,23 @@ async function main() {
       result.maxAbsDiff < 1e-5,
       `max abs diff ${result.maxAbsDiff} too large -- sample output ${JSON.stringify(result.sample)}`,
     );
+  });
+
+  await check("profile: true reports a real per-step GPU duration when the device supports it", () => {
+    if (!result.deviceSupportsProfiling) {
+      console.log('    (adapter has no "timestamp-query" here -- skipping the timing assertion itself)');
+      assert.equal(result.timings, null, "expected no timings from a device that can't report them");
+      return;
+    }
+    assert.equal(result.timings.length, 1, "the Add fixture is a single-step program");
+    const [timing] = result.timings;
+    assert.equal(timing.index, 0);
+    assert.equal(timing.entryPoint, MANIFEST.entryPoint);
+    assert.ok(
+      Number.isFinite(timing.durationNs) && timing.durationNs >= 0,
+      `expected a non-negative finite duration, got ${timing.durationNs}`,
+    );
+    console.log(`    (GPU duration: ${timing.durationNs}ns)`);
   });
 
   console.log(`\nwebgpu kernel dispatcher: ${passed} checks passed`);
