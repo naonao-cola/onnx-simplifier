@@ -1658,6 +1658,41 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // llama.cpp's GGUF Q4_K K-quant format: weight-only 4-bit quantization,
+  // a 256-element super-block split into 8 sub-blocks of 32, each with
+  // its own asymmetric (scale, min) pair re-quantized to 6-bit codes.
+  // Data-free. See ApplyGgufQ4K in onnxsim.h.
+  m.def(
+      "apply_gguf_q4_k_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyGgufQ4K(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // llama.cpp's GGUF Q5_K K-quant format: identical to Q4_K above except
+  // a 5-bit (vs 4-bit) element code. Data-free. See ApplyGgufQ5K in
+  // onnxsim.h.
+  m.def(
+      "apply_gguf_q5_k_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyGgufQ5K(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // BitNet b1.58's published absmean ternary weight quantization, as
   // shipped by llama.cpp's GGUF TQ1_0/TQ2_0 tensor types: weight-only,
   // one shared {-1, 0, +1} scale per 256-element block. Data-free. See
