@@ -37,6 +37,15 @@ read. The real structure is a third reciprocal-family slot:
   different sites sharing one frame: site A carries the input reciprocal
   (high byte varies: 43/42/41/44/3f), site C the requant (high byte 42
   in every build so far). `TestRequantMultiplierSlot` pins site C.
+
+RESOLVED (2026-09-16): the short-vs-full selector for site B's S-unit
+program is *not* the x/y scale ratio alone -- it is the conjunction of that
+ratio being close to 1 **and** x's own zero point being nonzero. y's zero
+point plays no part. See ``TestSiteBFormSelectorIsZpX`` below for the
+controlled 2x2 build matrix (positive-only calibration for zp=0, a
+constant-span negative shift to flip zp without moving the scale ratio)
+that pins this down across all eight builds gathered so far, including the
+three above.
 """
 
 import gzip
@@ -195,3 +204,109 @@ class TestOutputScaleQuads(unittest.TestCase):
             for i in found:
                 self.assertEqual(data[i - 1], 0x03, f"{name}@{i}: lead")
                 self.assertEqual(data[i + 4 : i + 6].hex(), "8182", f"{name}@{i}: tags")
+
+
+class TestSiteBFormSelectorIsZpX(unittest.TestCase):
+    """Site B's short-vs-full form tracks x's zero point, not the x/y ratio.
+
+    Four new Mul[1,8] builds complete a 2x2 grid at x/y scale ratio close to
+    1 (where the pre-existing ratio-only hypothesis predicted short form
+    throughout), crossed with zp_x and zp_y independently zero or not:
+
+    - ``mul_1x8_zp_both0`` (positive-only calibration for both inputs: any
+      MinMax range with min >= 0 clips the computed zero point to 0):
+      zp=(0, 0), ratio 1.002 -> **full**.
+    - ``mul_1x8_zp_yonly`` (x unchanged/positive, y shifted negative): zp=(0,
+      16), ratio 1.043 -> **full**.
+    - ``mul_1x8_zp_xonly`` (x shifted negative, y unchanged/positive): zp=(19,
+      0), ratio 0.974 -> **short**.
+    - ``mul_1x8_zp_both`` (both shifted negative by the same constant as
+      xonly/yonly -- same span, hence unchanged scale, as their unshifted
+      counterparts): zp=(19, 16), ratio 1.014 -> **short**.
+
+    "Shifted negative by a constant" is the controlled part: shifting a
+    calibration array by a constant changes min and max by the same amount,
+    so the span (and thus the MinMax scale) is unchanged while the zero
+    point moves off 0 -- isolating zp as the only variable, unconfounded by
+    scale or ratio drift, unlike comparing builds from independent random
+    calibration draws.
+
+    Combined with the three base-file builds above (base: zp=(128, 126),
+    ratio 1.014, short; x10y01/x01y10: zp with both components nonzero,
+    ratio far from 1, full), all eight builds agree: short form iff ratio is
+    close to 1 **and** zp_x != 0. zp_y never matters. This resolves the
+    handoff's open "short-vs-full site-B selection rule" question -- it was
+    never a pure ratio rule.
+
+    (A same-x_scale, different-zp_x pair -- ``mul_1x8_zp_xonly`` shifted by
+    -0.2 giving zp_x=19 vs. an unlanded -0.1 shift giving zp_x=6 -- produced
+    byte-identical site-A-adjacent group/tag bytes despite the different zp
+    magnitude, so whatever selects short-vs-full reads zp_x as a boolean,
+    not a literal value; the group bytes there are not zp's own encoding,
+    since they also depend on which MinMax scale formula fired -- still
+    open, not pinned here.)
+    """
+
+    # fixture: (x_scale, y_scale, zp_x, zp_y, full) -- zp values are quant
+    # JSON ground truth (not independently recoverable from the stream
+    # itself, see the class docstring); `full` is the observed site B form.
+    CASES = {
+        "mul_1x8_zp_both0.mcode.gz": (
+            0.00782180204987526,
+            0.007805639877915382,
+            0,
+            0,
+            True,
+        ),
+        "mul_1x8_zp_yonly.mcode.gz": (
+            0.00782180204987526,
+            0.007497101556509733,
+            0,
+            16,
+            True,
+        ),
+        "mul_1x8_zp_xonly.mcode.gz": (
+            0.007604781538248062,
+            0.007805639877915382,
+            19,
+            0,
+            False,
+        ),
+        "mul_1x8_zp_both.mcode.gz": (
+            0.007604781538248062,
+            0.007497101556509733,
+            19,
+            16,
+            False,
+        ),
+    }
+
+    def test_site_a_present_full_form_regardless(self):
+        # Site A (x's own reciprocal scale) is unaffected by any of this --
+        # only site B's form changes.
+        for name, (xs, _ys, _zpx, _zpy, _full) in self.CASES.items():
+            data = load(name)
+            pat = struct.pack("<f", 1.0 / xs)
+            found = hits(data, pat)
+            self.assertEqual(len(found), 4, f"{name}: site A hits")
+            strides = {b - a for a, b in zip(found, found[1:])}
+            self.assertEqual(strides, {8}, f"{name}: site A stride")
+
+    def test_site_b_form_tracks_zp_x_not_ratio(self):
+        for name, (_xs, ys, zpx, _zpy, full) in self.CASES.items():
+            self.assertEqual(
+                full, zpx == 0, f"{name}: full iff zp_x == 0 (this dataset)"
+            )
+            data = load(name)
+            pat = struct.pack("<f", 1.0 / ys)
+            found = hits(data, pat)
+            if full:
+                self.assertEqual(len(found), 4, f"{name}: expected full-form site B")
+                strides = {b - a for a, b in zip(found, found[1:])}
+                self.assertEqual(strides, {7}, f"{name}: site B stride")
+            else:
+                self.assertEqual(len(found), 0, f"{name}: expected no full-form site B")
+                short_hits = hits(data, pat[:3])
+                self.assertGreaterEqual(
+                    len(short_hits), 3, f"{name}: expected short-form site B"
+                )
