@@ -172,6 +172,23 @@ class UnsupportedOpError(ValueError):
     """
 
 
+#: Genuine control-flow ops -- never in :data:`_RULES`, and never will be:
+#: differentiating one for real means routing gradient through whichever
+#: branch/iteration actually ran, which this module's single-pass, no-tape
+#: design has no mechanism for. Named here only so the refusal these raise
+#: (below) can add one extra sentence: a caller hitting this is often not
+#: looking at genuine runtime branching at all but an ``If`` a tracer (e.g.
+#: PyTorch's) inserted for something statically resolvable (a shape-derived
+#: condition, an export-time flag), which
+#: ``onnxsim.onnx_simplifier.simplify()`` already eliminates on its own --
+#: see the ``eliminate_if_with_const_cond`` pass, part of onnxsim's default
+#: pass set specifically for this ("works well especially when used
+#: together with constant folding" is that pass's own docstring). Simplify
+#: first and this module never sees the node at all, rather than needing
+#: to differentiate it.
+_CONTROL_FLOW_OPS = frozenset({"If", "Loop", "Scan"})
+
+
 def _attr(node: onnx.NodeProto, name: str, default: Any) -> Any:
     """One of ``node``'s attributes by name, or ``default``.
 
@@ -2732,9 +2749,17 @@ def build_backward(
 
         rule = rules.get(node.op_type)
         if rule is None:
+            hint = (
+                " -- if its condition/trip-count is actually static, "
+                "onnxsim.onnx_simplifier.simplify() may eliminate it before "
+                "this module ever sees it (see UnsupportedOpError's own note "
+                "on this near _CONTROL_FLOW_OPS)"
+                if node.op_type in _CONTROL_FLOW_OPS
+                else ""
+            )
             raise UnsupportedOpError(
                 f"no gradient rule for op type {node.op_type!r} "
-                f"(node {node.name or node.output[0]!r}); "
+                f"(node {node.name or node.output[0]!r}){hint}; "
                 f"onnxsim.graph_grad differentiates {sorted(rules) + sorted(_MULTI_OUTPUT_RULES)}"
             )
         if len(node.output) != 1:
