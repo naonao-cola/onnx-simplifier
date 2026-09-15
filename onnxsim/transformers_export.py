@@ -204,3 +204,272 @@ def _cleanup_stale_external_data(path: str, stale_candidates: Set[str]) -> None:
     for stale in stale_candidates - _referenced_external_data_files(path):
         if os.path.exists(stale):
             os.remove(stale)
+
+
+# --------------------------------------------------------------------------- #
+# Fixed-buffer ("static") KV cache export, decoder-only causal LMs only.
+# --------------------------------------------------------------------------- #
+
+
+def export_causal_lm_static_cache(
+    model_id: str,
+    output_dir: str,
+    max_cache_len: int,
+    max_prompt_len: Optional[int] = None,
+    check_n: int = 0,
+    save_as_external_data: bool = True,
+    model_kwargs: Optional[Dict] = None,
+    simplify_kwargs: Optional[Dict] = None,
+) -> Dict[str, bool]:
+    """Export a decoder-only causal-LM ``transformers`` model to a *fixed*-size
+    ("static") KV cache ONNX pair -- ``prefill.onnx`` (variable prompt length,
+    empty cache) and ``decode.onnx`` (one new token, cache already partly
+    filled) -- then simplify both.
+
+    This is a different shape than :func:`export_transformers_model`'s
+    ``optimum``-based export, on purpose. ``optimum``'s
+    ``decoder_with_past_model.onnx`` grows its ``past_key_values``/``present``
+    tensors by one position every decode step (a `Concat`), which means every
+    single-token decode step reallocates and copies the *entire* cache seen
+    so far -- O(n) work per step, O(n^2) over a full generation. The ONNX
+    ``TensorScatter`` op (opset 24) exists specifically to let backends avoid
+    that: write each new token's K/V into a pre-allocated
+    ``(batch, heads, max_cache_len, head_dim)`` buffer in place, O(1) per
+    step. But ``optimum``'s own export can't be rewritten into that shape
+    after the fact -- HF's modern causal-mask construction
+    (``transformers.masking_utils``) derives the mask's own size from the
+    cache's *real* valid length, which is exactly the cache's *tensor* length
+    for a growing cache, but silently wrong once the tensor is a fixed-size
+    buffer with a smaller amount of real content (confirmed empirically: a
+    post-hoc ``Concat``->``TensorScatter`` graph rewrite hits an ONNX Runtime
+    broadcast error deep in the mask math).
+
+    The fix is to control the export instead of patching its output:
+    ``transformers.StaticCache`` (built for ``torch.compile``/``torch.export``)
+    already allocates fixed-size buffers and already gets the mask math right
+    -- its ``get_mask_sizes()`` reports the *buffer's* length, not the real
+    valid count, which is exactly the missing piece. Tracing a
+    ``StaticCache``-based forward pass turns its ``index_copy_`` cache update
+    into ``ScatterND`` (not ``TensorScatter`` -- PyTorch's exporter doesn't
+    know about the new op, and doesn't need to: ``ScatterND`` is the same
+    "overwrite, no reduction" semantics and already runs everywhere). Verified
+    against the standard ``optimum`` export: identical greedy-decoded tokens
+    over a multi-step generation, via a real ``onnxruntime.InferenceSession``
+    for both.
+
+    Needs the optional ``torch`` and ``transformers`` packages (``pip install
+    onnxsim[transformers]``) -- unlike :func:`export_transformers_model`, this
+    does NOT go through ``optimum``: ``StaticCache``-based tracing is driven
+    directly against the ``transformers`` model here, since integrating a
+    custom fixed-buffer cache into ``optimum.exporters.onnx``'s own
+    per-architecture ``OnnxConfig``/dummy-input-generator machinery is a much
+    larger, more architecture-specific undertaking than tracing the model
+    directly.
+
+    Scope: decoder-only causal LMs with **uniform, full (non-sliding-window,
+    non-hybrid) attention across every layer** -- this wrapper feeds a single
+    ``max_cache_len`` to every layer via ``StaticCache``, which allocates a
+    (possibly different) ``StaticSlidingWindowLayer`` per layer for hybrid
+    architectures (e.g. Gemma 2/3's alternating local/global attention); this
+    function does not attempt to distinguish or size those layers separately.
+    Encoder-decoder/seq2seq models remain :func:`export_transformers_model`'s
+    job -- their cross-attention KV cache doesn't grow at all (computed once
+    from the encoder), so it never had this problem in the first place.
+
+    :param model_id: Hugging Face Hub model id or local model directory.
+    :param output_dir: directory to export into (``prefill.onnx``,
+            ``decode.onnx``, plus tokenizer/config files).
+    :param max_cache_len: fixed KV-cache buffer length. Must be at least as
+            large as the longest prompt plus the number of tokens you intend
+            to generate -- there is no bounds checking at runtime (writing
+            past the end wraps around via ``TensorScatter``/``ScatterND``'s
+            own modulo-free overwrite semantics, silently corrupting the
+            cache instead of erroring).
+    :param max_prompt_len: largest prompt length ``prefill.onnx`` accepts
+            (a dynamic axis up to this bound). Defaults to ``max_cache_len``.
+    :param check_n: forwarded to :func:`onnxsim.simplify` for both exported
+            graphs.
+    :param save_as_external_data: see :func:`export_transformers_model`.
+    :param model_kwargs: extra keyword arguments forwarded to
+            ``AutoModelForCausalLM.from_pretrained``.
+    :param simplify_kwargs: extra keyword arguments forwarded to
+            :func:`onnxsim.simplify` for both exported graphs.
+    :returns: ``{"prefill.onnx": check_ok, "decode.onnx": check_ok}``.
+    """
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer, StaticCache
+    except ImportError as e:
+        raise ImportError(
+            "export_causal_lm_static_cache needs the optional 'torch' and "
+            "'transformers' packages: pip install onnxsim[transformers]"
+        ) from e
+
+    os.makedirs(output_dir, exist_ok=True)
+    max_prompt_len = max_prompt_len or max_cache_len
+
+    model = AutoModelForCausalLM.from_pretrained(model_id, **(model_kwargs or {}))
+    model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    config = model.config.get_text_config(decoder=True)
+    num_layers = config.num_hidden_layers
+    num_kv_heads = (
+        getattr(config, "num_key_value_heads", None) or config.num_attention_heads
+    )
+    head_dim = getattr(config, "head_dim", None) or (
+        config.hidden_size // config.num_attention_heads
+    )
+
+    class _StaticCacheStep(torch.nn.Module):
+        """One forward step against explicit, plain-tensor KV-cache buffers
+        (``StaticCache`` itself is stateful and Python-object-shaped, not
+        something ``torch.export`` can take as an input/output directly --
+        this wraps one around plain tensors for tracing, the same technique
+        ``onnxsim``'s own dlpack/tensor_pool bridges use to cross a
+        stateless-graph/stateful-object boundary elsewhere in this repo)."""
+
+        def __init__(self, model, num_layers):
+            super().__init__()
+            self.model = model
+            self.num_layers = num_layers
+
+        def forward(self, input_ids, cache_position, attention_mask, *flat_kv):
+            cache = StaticCache(config=self.model.config, max_cache_len=max_cache_len)
+            for i in range(self.num_layers):
+                cache.layers[i].keys = flat_kv[2 * i]
+                cache.layers[i].values = flat_kv[2 * i + 1]
+                cache.layers[i].is_initialized = True
+            out = self.model(
+                input_ids=input_ids,
+                past_key_values=cache,
+                cache_position=cache_position,
+                attention_mask=attention_mask,
+                use_cache=True,
+            )
+            new_kv = []
+            for i in range(self.num_layers):
+                new_kv.append(cache.layers[i].keys)
+                new_kv.append(cache.layers[i].values)
+            return (out.logits, *new_kv)
+
+    wrapper = _StaticCacheStep(model, num_layers)
+    dummy_kv = [
+        torch.zeros(1, num_kv_heads, max_cache_len, head_dim, dtype=model.dtype)
+        for _ in range(2 * num_layers)
+    ]
+    kv_input_names = []
+    kv_output_names = []
+    for i in range(num_layers):
+        kv_input_names += [f"past_key.{i}", f"past_value.{i}"]
+        kv_output_names += [f"present_key.{i}", f"present_value.{i}"]
+
+    def _export(seq_len_dim, dummy_seq_len, cache_start, filename):
+        input_ids = torch.zeros(1, dummy_seq_len, dtype=torch.long)
+        cache_position = torch.arange(cache_start, cache_start + dummy_seq_len)
+        attention_mask = torch.zeros(1, max_cache_len, dtype=torch.long)
+        attention_mask[:, : cache_start + dummy_seq_len] = 1
+        dynamic_shapes = (
+            ({1: seq_len_dim} if seq_len_dim is not None else None),
+            ({0: seq_len_dim} if seq_len_dim is not None else None),
+            None,
+            tuple([None] * len(dummy_kv)),
+        )
+        path = os.path.join(output_dir, filename)
+        # torch.onnx.export's own dynamic_shapes handling (dynamo=True,
+        # passed a plain nn.Module) mishandles a trailing *args group -- it
+        # reports a spurious tuple/list structural mismatch that a direct
+        # torch.export.export call with the exact same dynamic_shapes does
+        # NOT hit (confirmed with a minimal repro). Route around it: call
+        # torch.export.export ourselves first, then hand the already-traced
+        # ExportedProgram to torch.onnx.export, which skips its own
+        # (buggy, for this shape) capture/dynamic_shapes path entirely.
+        exported_program = torch.export.export(
+            wrapper,
+            (input_ids, cache_position, attention_mask, *dummy_kv),
+            dynamic_shapes=dynamic_shapes,
+        )
+        torch.onnx.export(
+            exported_program,
+            f=path,
+            input_names=["input_ids", "cache_position", "attention_mask"]
+            + kv_input_names,
+            output_names=["logits"] + kv_output_names,
+            opset_version=18,
+            dynamo=True,
+        )
+        return path
+
+    prompt_len_dim = torch.export.Dim("prompt_len", min=1, max=max_prompt_len)
+    # dummy_seq_len must be > 1 here despite prompt_len_dim marking it
+    # dynamic: some model code branches on seq_len == 1 vs > 1 internally
+    # (the single-new-token decode step vs. a real multi-token prompt), and
+    # tracing with a length-1 dummy specializes to that branch regardless of
+    # the Dim annotation (confirmed empirically -- torch.export then reports
+    # a "you marked prompt_len as dynamic but your code specialized it to a
+    # constant" ConstraintViolationError). A representative multi-token
+    # dummy avoids hitting that branch during tracing.
+    dummy_prompt_len = min(4, max_prompt_len) if max_prompt_len > 1 else 1
+    prefill_path = _export(
+        prompt_len_dim,
+        dummy_seq_len=dummy_prompt_len,
+        cache_start=0,
+        filename="prefill.onnx",
+    )
+    decode_path = _export(None, dummy_seq_len=1, cache_start=1, filename="decode.onnx")
+
+    tokenizer.save_pretrained(output_dir)
+    model.config.save_pretrained(output_dir)
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.save_pretrained(output_dir)
+
+    # prefill.onnx's input_ids/cache_position have a dynamic (prompt-length)
+    # axis; onnxsim's own random-input equivalence check (check_n > 0) can't
+    # pick a concrete size for that on its own. decode.onnx is fully static
+    # and needs no such hint.
+    per_file_test_input_shapes = {
+        prefill_path: {
+            "input_ids": [1, dummy_prompt_len],
+            "cache_position": [dummy_prompt_len],
+        },
+        decode_path: None,
+    }
+
+    results = {}
+    for path in (prefill_path, decode_path):
+        loaded = onnx.load(path)
+        extra_kwargs = dict(simplify_kwargs or {})
+        if check_n and per_file_test_input_shapes[path] is not None:
+            extra_kwargs.setdefault(
+                "test_input_shapes", per_file_test_input_shapes[path]
+            )
+        model_opt, check_ok = simplify(loaded, check_n=check_n, **extra_kwargs)
+        # Not _save(): its force_external_data path uses size_threshold=0
+        # (every tensor moves out, including small helper constants), which
+        # onnxsim's other exporters never trip over but the dynamo/
+        # torch.export path here does -- it bakes in many tiny int64 scalar
+        # constants (shape/index helpers), and pushing those to external
+        # data too produces a file onnxruntime fails to load ("Cannot parse
+        # data from external tensors" on one such scalar), even though plain
+        # onnx.load + checker.check_model call it valid (confirmed
+        # empirically). The default threshold (1024 bytes) keeps those small
+        # constants inline and only moves the real weight tensors out,
+        # which loads fine.
+        if save_as_external_data:
+            external_data_path = os.path.basename(path) + ".data"
+            full_external_data_path = os.path.join(
+                os.path.dirname(path), external_data_path
+            )
+            if os.path.exists(full_external_data_path):
+                os.remove(full_external_data_path)
+            onnx.save(
+                model_opt,
+                path,
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                location=external_data_path,
+            )
+        else:
+            onnx.save(model_opt, path)
+        results[os.path.basename(path)] = check_ok
+    return results

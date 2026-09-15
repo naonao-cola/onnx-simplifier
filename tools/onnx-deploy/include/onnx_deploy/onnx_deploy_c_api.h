@@ -119,7 +119,7 @@ ONNX_DEPLOY_C_API int onnx_deploy_is_seq2seq(const OnnxDeployPipeline* pipeline)
  * allocated array of *out_count int64_t token ids (the newly generated
  * ids, not including the prompt); release it with onnx_deploy_free_ids.
  * On ONNX_DEPLOY_ERROR, *out_error is set the same way as
- * onnx_deploy_load_ort (out_error may be NULL); *out_ids/*out_count are
+ * onnx_deploy_load_ort (out_error may be NULL); *out_ids / *out_count are
  * left untouched.
  */
 ONNX_DEPLOY_C_API OnnxDeployStatus onnx_deploy_generate(OnnxDeployPipeline* pipeline, const int64_t* input_ids,
@@ -132,6 +132,72 @@ ONNX_DEPLOY_C_API void onnx_deploy_free_ids(int64_t* ids);
 
 /* Free a string returned via an out_error parameter. NULL is ignored. */
 ONNX_DEPLOY_C_API void onnx_deploy_free_string(char* data);
+
+/*
+ * ---------------------------------------------------------------------
+ * Fixed-buffer ("static") KV cache pipeline -- a C ABI over
+ * onnx_deploy::StaticKvCachePipeline (see static_kv_cache_pipeline.h),
+ * for the onnxsim.export_causal_lm_static_cache() export shape
+ * (prefill.onnx + decode.onnx, decoder-only causal LMs only -- no
+ * seq2seq/encoder support, unlike OnnxDeployPipeline above).
+ *
+ * Shares onnx_deploy_load_ort/onnx_deploy_free_ids/onnx_deploy_free_string
+ * above -- both pipeline kinds run against the same process-wide libort,
+ * loaded once.
+ * ---------------------------------------------------------------------
+ */
+
+/* Opaque handle over a loaded export_causal_lm_static_cache() export
+ * directory's sessions. */
+typedef struct OnnxDeployStaticPipeline OnnxDeployStaticPipeline;
+
+/*
+ * Loads model_dir (must contain prefill.onnx and decode.onnx -- see
+ * ../../README.md's "Layer 1b" section). max_cache_len must match the value
+ * onnxsim.export_causal_lm_static_cache() was called with -- it sizes every
+ * KV-cache buffer this pipeline allocates and is cross-checked against the
+ * exported graph's own declared shape (a mismatch fails this call, not a
+ * later onnx_deploy_static_generate call). onnx_deploy_load_ort must have
+ * succeeded first. Returns NULL on failure, with *out_error set the same
+ * way as onnx_deploy_load_ort (out_error may be NULL).
+ */
+ONNX_DEPLOY_C_API OnnxDeployStaticPipeline* onnx_deploy_static_create(const char* model_dir, int64_t max_cache_len,
+                                                                       char** out_error);
+
+/* Same as onnx_deploy_static_create, but selects the execution provider --
+ * see onnx_deploy_create_ex's own doc comment for the exact semantics of
+ * execution_provider/cuda_device_id, identical here. */
+ONNX_DEPLOY_C_API OnnxDeployStaticPipeline* onnx_deploy_static_create_ex(const char* model_dir,
+                                                                          int64_t max_cache_len,
+                                                                          const char* execution_provider,
+                                                                          int cuda_device_id, char** out_error);
+
+/* Releases a pipeline created by onnx_deploy_static_create[_ex]. NULL is
+ * ignored. */
+ONNX_DEPLOY_C_API void onnx_deploy_static_destroy(OnnxDeployStaticPipeline* pipeline);
+
+/*
+ * Greedy-decodes up to max_new_tokens token ids (batch size 1), stopping
+ * early if a generated id equals eos_token_id (pass -1 to disable early
+ * stop). `input_ids`/`num_input_ids` is the full prompt.
+ *
+ * Precondition: num_input_ids + max_new_tokens <= the max_cache_len the
+ * pipeline was created with -- not checked here (see
+ * StaticKvCachePipeline::Generate's own doc comment on what happens if
+ * violated: silent wraparound, not an error).
+ *
+ * On success, returns ONNX_DEPLOY_OK and sets *out_ids to a freshly
+ * allocated array of *out_count int64_t token ids (the newly generated
+ * ids, not including the prompt); release it with onnx_deploy_free_ids.
+ * On ONNX_DEPLOY_ERROR, *out_error is set the same way as
+ * onnx_deploy_load_ort (out_error may be NULL); *out_ids / *out_count are
+ * left untouched.
+ */
+ONNX_DEPLOY_C_API OnnxDeployStatus onnx_deploy_static_generate(OnnxDeployStaticPipeline* pipeline,
+                                                                const int64_t* input_ids, size_t num_input_ids,
+                                                                int64_t max_new_tokens, int64_t eos_token_id,
+                                                                int64_t** out_ids, size_t* out_count,
+                                                                char** out_error);
 
 #ifdef __cplusplus
 }

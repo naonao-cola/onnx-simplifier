@@ -64,6 +64,41 @@ class Pipeline {
   OnnxDeployPipeline* handle_ = nullptr;
 };
 
+// Fixed-buffer ("static") KV cache pipeline -- mirrors Pipeline above
+// exactly, over onnx_deploy_static_* instead of onnx_deploy_* (see
+// onnx_deploy_c_api.h's own doc comments). Decoder-only causal LMs only --
+// no is_seq2seq/decoder_start_token_id, since that pipeline kind has no
+// encoder/cross-attention concept at all.
+class StaticPipeline {
+ public:
+  explicit StaticPipeline(const std::string& model_dir, int64_t max_cache_len,
+                          const std::string& execution_provider = "cpu", int cuda_device_id = 0) {
+    char* err = nullptr;
+    handle_ = onnx_deploy_static_create_ex(model_dir.c_str(), max_cache_len, execution_provider.c_str(),
+                                           cuda_device_id, &err);
+    if (!handle_) ThrowFromError("StaticPipeline", err);
+  }
+  ~StaticPipeline() { onnx_deploy_static_destroy(handle_); }
+  StaticPipeline(const StaticPipeline&) = delete;
+  StaticPipeline& operator=(const StaticPipeline&) = delete;
+
+  std::vector<int64_t> generate(const std::vector<int64_t>& input_ids, int64_t max_new_tokens,
+                                 int64_t eos_token_id) {
+    int64_t* out_ids = nullptr;
+    size_t out_count = 0;
+    char* err = nullptr;
+    OnnxDeployStatus status = onnx_deploy_static_generate(handle_, input_ids.data(), input_ids.size(),
+                                                           max_new_tokens, eos_token_id, &out_ids, &out_count, &err);
+    if (status != ONNX_DEPLOY_OK) ThrowFromError("generate", err);
+    std::vector<int64_t> result(out_ids, out_ids + out_count);
+    onnx_deploy_free_ids(out_ids);
+    return result;
+  }
+
+ private:
+  OnnxDeployStaticPipeline* handle_ = nullptr;
+};
+
 }  // namespace
 
 NB_MODULE(onnx_deploy_py, m) {
@@ -94,4 +129,18 @@ NB_MODULE(onnx_deploy_py, m) {
            "Greedy-decode up to max_new_tokens ids (batch size 1), stopping early if a "
            "generated id equals eos_token_id (-1 disables early stop). Returns the newly "
            "generated ids, not including the prompt.");
+
+  nb::class_<StaticPipeline>(m, "StaticPipeline")
+      .def(nb::init<const std::string&, int64_t, const std::string&, int>(), nb::arg("model_dir"),
+           nb::arg("max_cache_len"), nb::arg("execution_provider") = "cpu", nb::arg("cuda_device_id") = 0,
+           "Loads an onnxsim.export_causal_lm_static_cache() export directory (prefill.onnx "
+           "+ decode.onnx -- see ../README.md's \"Layer 1b\" section), decoder-only causal "
+           "LMs only. load_ort() must have already succeeded. max_cache_len must match the "
+           "value export_causal_lm_static_cache() was called with. execution_provider is "
+           "\"cpu\" (default), \"cuda\", or \"webgpu\" -- same semantics as Pipeline's own.")
+      .def("generate", &StaticPipeline::generate, nb::arg("input_ids"), nb::arg("max_new_tokens") = 32,
+           nb::arg("eos_token_id") = -1,
+           "Greedy-decode up to max_new_tokens ids (batch size 1) from the full prompt "
+           "input_ids, stopping early if a generated id equals eos_token_id (-1 disables "
+           "early stop). Returns the newly generated ids, not including the prompt.");
 }

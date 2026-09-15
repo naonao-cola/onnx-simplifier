@@ -88,6 +88,57 @@ Two sessions, one host-side loop: encoder once (seq2seq only), then
 loop with the cache fed back each time, greedy-argmax over `logits` each
 step, until `eos_token_id` or `max_new_tokens`.
 
+### Layer 1b: fixed-buffer KV cache (`include/onnx_deploy/static_kv_cache_pipeline.h`)
+
+A different pipeline, for a different export shape --
+`onnxsim.export_causal_lm_static_cache()` (`onnxsim/transformers_export.py`),
+decoder-only causal LMs only, no `optimum` involved in the export. That
+function's own docstring has the full rationale; the short version: growing
+`past_key_values`/`present` tensors (Layer 1's own shape, above) mean every
+decode step reallocates and copies the *entire* cache seen so far. This
+export instead produces `prefill.onnx` + `decode.onnx` against a **fixed**
+`(batch, kv_heads, max_cache_len, head_dim)` buffer per layer (built on
+`transformers.StaticCache`, traced with `torch.export`/`torch.onnx.export`;
+the cache-update op comes out as `ScatterND`, not ONNX opset 24's new
+`TensorScatter` -- PyTorch's exporter doesn't know about the new op yet, and
+doesn't need to, since `ScatterND` already means the same "overwrite, no
+reduction" thing and runs everywhere).
+
+`StaticKvCachePipeline` drives that pair: it allocates each layer's key/value
+buffer **once** per `Generate()` call and reuses it in place for every
+step -- prefill and every decode step bind the *same* `Ort::Value` as both
+the `past_key.{i}`/`past_value.{i}` input and the `present_key.{i}`/
+`present_value.{i}` output via `Ort::IoBinding`, so ONNX Runtime writes each
+step's result directly into memory this code already owns instead of
+allocating a fresh same-shaped tensor and copying it back. Layer counts and
+head/dim sizes are read off `decode.onnx`'s own declared `past_key.*` input
+shapes, the same "no architecture baked in" idiom `HarvestPresentIntoCache`
+uses above -- only `max_cache_len` (not recoverable from the ONNX file's own
+shapes, since the export doesn't record which dim was originally dynamic)
+needs to come from the caller, and must match what
+`export_causal_lm_static_cache()` was called with.
+
+**Status:** wired into every Layer 2/3 surface below, mirroring
+`onnx_deploy_create`/`onnx_deploy_generate`'s own shape exactly --
+`onnx_deploy_static_create[_ex]`/`onnx_deploy_static_generate`/
+`onnx_deploy_static_destroy` in the C ABI, `--static --max-cache-len N` on
+the CLI, `onnx_deploy_py.StaticPipeline` in the Python extension, and
+`Module.generateStatic()` in the WASM module. Verified end-to-end against a
+real `libonnxruntime.so` (not just headers): the CLI and the Python
+extension were both built and linked against ONNX Runtime 1.20.0 and run
+against a real `export_causal_lm_static_cache()` export
+(`hf-internal-testing/tiny-random-gpt2`), producing token sequences
+identical to the growing-cache baseline -- including through the
+`Ort::IoBinding` buffer-aliasing path, confirming ONNX Runtime's `ScatterND`
+kernel handles an aliased input/output buffer correctly rather than just
+compiling. The WASM binding (`generateStatic()` in
+`wasm/src/onnx_deploy_wasm.cpp`) is reviewed against the same patterns the
+rest of this file already uses, but not compiled against a real Emscripten
+toolchain -- installing one in this environment was blocked by an unrelated
+package-mirror issue, and forcing it through risked the surrounding
+container, so it's unverified beyond careful manual review; treat it as
+the one piece here still needing a real build/test pass.
+
 ### Layer 2: the swappable-libort C ABI (`onnx_deploy_c_api.h` / `.cpp`)
 
 `kv_cache_pipeline.h` builds against ONNX Runtime's C++ API with

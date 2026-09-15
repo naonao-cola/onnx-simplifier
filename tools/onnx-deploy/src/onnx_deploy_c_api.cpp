@@ -9,6 +9,7 @@
 #include "onnx_deploy/onnx_deploy_c_api.h"
 
 #include "onnx_deploy/kv_cache_pipeline.h"
+#include "onnx_deploy/static_kv_cache_pipeline.h"
 
 #include <cstring>
 #include <exception>
@@ -42,6 +43,25 @@ void SetError(char** out_error, const std::string& msg) {
 // at link time -- only header type/inline-wrapper definitions are used, so
 // nothing here requires -lonnxruntime at all.
 using OrtGetApiBaseFn = const OrtApiBase* (*)();
+
+// Shared between onnx_deploy_create_ex and onnx_deploy_static_create_ex --
+// see either's own doc comment for the exact per-value semantics.
+bool ParseExecutionProvider(const char* execution_provider, int cuda_device_id,
+                            onnx_deploy::PipelineOptions& out_options, std::string& out_error) {
+  std::string ep = execution_provider ? execution_provider : "cpu";
+  if (ep == "cpu") {
+    out_options.execution_provider = onnx_deploy::PipelineOptions::ExecutionProvider::kCpu;
+  } else if (ep == "cuda") {
+    out_options.execution_provider = onnx_deploy::PipelineOptions::ExecutionProvider::kCuda;
+    out_options.cuda_device_id = cuda_device_id;
+  } else if (ep == "webgpu") {
+    out_options.execution_provider = onnx_deploy::PipelineOptions::ExecutionProvider::kWebGpu;
+  } else {
+    out_error = "unknown execution_provider '" + ep + "' (expected \"cpu\", \"cuda\", or \"webgpu\")";
+    return false;
+  }
+  return true;
+}
 
 }  // namespace
 
@@ -105,17 +125,9 @@ extern "C" OnnxDeployPipeline* onnx_deploy_create_ex(const char* model_dir, cons
                                                       int cuda_device_id, char** out_error) {
   try {
     onnx_deploy::PipelineOptions pipeline_options;
-    std::string ep = execution_provider ? execution_provider : "cpu";
-    if (ep == "cpu") {
-      pipeline_options.execution_provider = onnx_deploy::PipelineOptions::ExecutionProvider::kCpu;
-    } else if (ep == "cuda") {
-      pipeline_options.execution_provider = onnx_deploy::PipelineOptions::ExecutionProvider::kCuda;
-      pipeline_options.cuda_device_id = cuda_device_id;
-    } else if (ep == "webgpu") {
-      pipeline_options.execution_provider = onnx_deploy::PipelineOptions::ExecutionProvider::kWebGpu;
-    } else {
-      SetError(out_error,
-               "onnx_deploy_create_ex: unknown execution_provider '" + ep + "' (expected \"cpu\", \"cuda\", or \"webgpu\")");
+    std::string parse_error;
+    if (!ParseExecutionProvider(execution_provider, cuda_device_id, pipeline_options, parse_error)) {
+      SetError(out_error, "onnx_deploy_create_ex: " + parse_error);
       return nullptr;
     }
     return new OnnxDeployPipeline(model_dir ? model_dir : "", pipeline_options);
@@ -172,3 +184,80 @@ extern "C" OnnxDeployStatus onnx_deploy_generate(OnnxDeployPipeline* pipeline, c
 extern "C" void onnx_deploy_free_ids(int64_t* ids) { std::free(ids); }
 
 extern "C" void onnx_deploy_free_string(char* data) { std::free(data); }
+
+// ---------------------------------------------------------------------
+// Fixed-buffer ("static") KV cache pipeline -- see onnx_deploy_c_api.h's
+// own doc comments for the contract; this mirrors OnnxDeployPipeline's
+// implementation above exactly, just over StaticKvCachePipeline instead of
+// KvCachePipeline.
+// ---------------------------------------------------------------------
+
+struct OnnxDeployStaticPipeline {
+  Ort::Env env;
+  onnx_deploy::StaticKvCachePipeline pipeline;
+  OnnxDeployStaticPipeline(const std::string& model_dir, int64_t max_cache_len,
+                           const onnx_deploy::PipelineOptions& pipeline_options)
+      : env(ORT_LOGGING_LEVEL_WARNING, "onnx-deploy-static"),
+        pipeline(env, model_dir, max_cache_len, pipeline_options) {}
+};
+
+extern "C" OnnxDeployStaticPipeline* onnx_deploy_static_create(const char* model_dir, int64_t max_cache_len,
+                                                                char** out_error) {
+  return onnx_deploy_static_create_ex(model_dir, max_cache_len, "cpu", 0, out_error);
+}
+
+extern "C" OnnxDeployStaticPipeline* onnx_deploy_static_create_ex(const char* model_dir, int64_t max_cache_len,
+                                                                   const char* execution_provider,
+                                                                   int cuda_device_id, char** out_error) {
+  try {
+    onnx_deploy::PipelineOptions pipeline_options;
+    std::string parse_error;
+    if (!ParseExecutionProvider(execution_provider, cuda_device_id, pipeline_options, parse_error)) {
+      SetError(out_error, "onnx_deploy_static_create_ex: " + parse_error);
+      return nullptr;
+    }
+    return new OnnxDeployStaticPipeline(model_dir ? model_dir : "", max_cache_len, pipeline_options);
+  } catch (const std::exception& e) {
+    SetError(out_error, e.what());
+    return nullptr;
+  } catch (...) {
+    SetError(out_error, "unknown error in onnx_deploy_static_create_ex");
+    return nullptr;
+  }
+}
+
+extern "C" void onnx_deploy_static_destroy(OnnxDeployStaticPipeline* pipeline) { delete pipeline; }
+
+extern "C" OnnxDeployStatus onnx_deploy_static_generate(OnnxDeployStaticPipeline* pipeline, const int64_t* input_ids,
+                                                         size_t num_input_ids, int64_t max_new_tokens,
+                                                         int64_t eos_token_id, int64_t** out_ids, size_t* out_count,
+                                                         char** out_error) {
+  if (!pipeline || !input_ids || !out_ids || !out_count) {
+    SetError(out_error, "onnx_deploy_static_generate: null argument");
+    return ONNX_DEPLOY_ERROR;
+  }
+  try {
+    onnx_deploy::StaticKvCacheGenerationConfig config;
+    config.max_new_tokens = max_new_tokens;
+    config.eos_token_id = eos_token_id;
+
+    std::vector<int64_t> ids(input_ids, input_ids + num_input_ids);
+    std::vector<int64_t> generated = pipeline->pipeline.Generate(ids, config);
+
+    int64_t* buf = generated.empty() ? nullptr : static_cast<int64_t*>(std::malloc(generated.size() * sizeof(int64_t)));
+    if (!generated.empty() && !buf) {
+      SetError(out_error, "onnx_deploy_static_generate: allocation failure");
+      return ONNX_DEPLOY_ERROR;
+    }
+    if (buf) std::memcpy(buf, generated.data(), generated.size() * sizeof(int64_t));
+    *out_ids = buf;
+    *out_count = generated.size();
+    return ONNX_DEPLOY_OK;
+  } catch (const std::exception& e) {
+    SetError(out_error, e.what());
+    return ONNX_DEPLOY_ERROR;
+  } catch (...) {
+    SetError(out_error, "unknown error in onnx_deploy_static_generate");
+    return ONNX_DEPLOY_ERROR;
+  }
+}
