@@ -40,6 +40,13 @@ CASES = {
     "mul_1x8_recip_x01.mcode.gz": (0.0007725197938270867, 0.07746022194623947, True, "9b53c3"),
 }
 
+# Unary op (Neg): same site-A mechanism for its single input.  All 13 builds
+# of the Neg input-range sweep carry float32(1/x) x4 at stride 8 (offsets
+# 1067/1068 family); pinned here for the neg_1x8 fixture (x=0.00768933).
+NEG_CASES = {
+    "neg_1x8.mcode.gz": 0.0076893349178135395,
+}
+
 
 def load(name):
     with gzip.open(os.path.join(FIX, name), "rb") as f:
@@ -59,6 +66,13 @@ class TestInputReciprocalSlots(unittest.TestCase):
             self.assertEqual(len(found), 4, f"{name}: site A hits for 1/x={1.0 / xs}")
             strides = {b - a for a, b in zip(found, found[1:])}
             self.assertEqual(strides, {8}, f"{name}: site A stride")
+        for name, xs in NEG_CASES.items():
+            data = load(name)
+            pat = struct.pack("<f", 1.0 / xs)
+            found = hits(data, pat)
+            self.assertEqual(len(found), 4, f"{name}: unary site A hits")
+            strides = {b - a for a, b in zip(found, found[1:])}
+            self.assertEqual(strides, {8}, f"{name}: unary site A stride")
 
     def test_site_b_carries_inverse_y_scale(self):
         for name, (_xs, ys, full, _grp) in CASES.items():
