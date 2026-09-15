@@ -168,3 +168,28 @@ def test_model_usage_counts_nodes_without_loading_weights(tmp_path):
     assert total == 3
     assert eligible == 2  # Conv and Relu
     assert dict(blocked) == {"Shape": 1}
+
+
+def test_unlisted_frontend_failures_classify_as_broken():
+    """The unlisted-op sweep (single-node `pulsar2:7.0-lite` batteries, one
+    real build each) confirmed these 10 fail at the frontend -- nine with
+    the ONNX-optimizer whitelist error, Reciprocal at quantization -- so
+    they classify as broken, not unknown. Only Neg/Log from the unlisted
+    set are known to pass."""
+    swept = [
+        "Reciprocal",
+        "ReduceSumSquare",
+        "Selu",
+        "Softsign",
+        "Sign",
+        "Sum",
+        "Mean",
+        "Scatter",
+        "OneHot",
+        "SoftmaxCrossEntropyLoss",
+    ]
+    for op in swept:
+        assert op not in pulsar2_ops.AX650_SUPPORTED_OPS, op
+        assert op in pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS, op
+        assert op_coverage.classify(op) == op_coverage.BROKEN, op
+    assert len(op_coverage.coverage_table()["unlisted"]) == 80

@@ -7287,10 +7287,31 @@ two and refined the third:
   mid-training trajectory (steps 20-27 snapshots as `real_data`, same
   FP32 recipe) calibrates ranges the device values actually resolve
   in. Closed-loop device steps 20-27 (outputs fed back each step):
-  weight divergence vs ORT grows 1.8e-4 to 2.5e-3 (linear INT8-noise
-  accumulation, ~0.1%/step) while moment divergence stays flat at
-  ~1e-4 -- no blowup, the loop genuinely trains on the card. Loss
-  readout still needs the `* B` compensation above.
+   weight divergence vs ORT grows 1.8e-4 to 2.5e-3 (linear INT8-noise
+   accumulation, ~0.1%/step) while moment divergence stays flat at
+   ~1e-4 -- no blowup, the loop genuinely trains on the card. Loss
+   readout still needs the `* B` compensation above.
+- **Unlisted-op sweep: 10 more fail at the frontend, Neg/Log stand alone.**
+  With the step graph's unlisted ops (`Neg`, `Log`) confirmed working, the
+  natural question was what else off-list the compiler takes. Ten
+  single-node `pulsar2:7.0-lite` batteries (small isolated graphs, Numpy
+  MinMax calibration, attributes with schema defaults set explicitly to
+  rule out the attribute-defaulting gotcha) all fail -- nine at
+  ONNX-optimization with the same whitelist error (`KeyError('dont
+  support <Op> opr in AXOPS/ONNXOPS/CUSTOM_OPS')`): `ReduceSumSquare`
+  ([1,8]->[1,1]), `Selu`, `Softsign`, `Sign` ([1,8]->[1,8]), `Sum`/`Mean`
+  (two [1,8] inputs), `Scatter` (opset 11, constant indices/updates),
+  `OneHot` (opset 11, int64 indices input -> float[3,4]),
+  `SoftmaxCrossEntropyLoss` (opset 13, scores + int64 labels -> scalar);
+  `Reciprocal` ([1,8]->[1,8], calib over [0.5, 2.0)) gets one stage
+  further and fails at quantization (`Quant doesn't support Reciprocal
+  operation`). All ten are recorded in
+  `pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS`, which `op_coverage.classify()`
+  reports as broken, `pulsar2_simulator.partition()` places CPU-side, and
+  `ax650_build_risks()` flags without double-reporting -- the unlisted
+  bucket shrinks 90 to 80, and the practical upshot is that off-list
+  training-graph ops need a listed decomposition (or a Neg/Log-style
+  explicit mapping) rather than hoping the compiler takes them.
 
 ## Files
 

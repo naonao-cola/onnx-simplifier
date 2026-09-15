@@ -112,13 +112,13 @@ class Partition:
     npu_nodes: List[str]
     cpu_nodes: List[str]
     cpu_op_types: Dict[str, int] = field(default_factory=dict)
-    # Subset of `cpu_op_types` that ARE in AX650_SUPPORTED_OPS but were
-    # placed on the CPU side anyway because a real single-node-per-op
-    # hardware sweep confirmed they hard-fail a real build -- see
-    # `pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS`. Surfaced separately from the
-    # rest of `cpu_op_types` (ops never claimed to be supported at all)
-    # since these represent a confirmed gap in the docs-scraped list, not
-    # just an ordinary CPU-fallback op.
+    # Subset of `cpu_op_types` placed on the CPU side because a real
+    # single-node-per-op hardware sweep confirmed they hard-fail a real
+    # build -- see `pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS`. Surfaced
+    # separately from the rest of `cpu_op_types` (ops never tested at all)
+    # since these are confirmed failures, not just ordinary CPU-fallback
+    # ops; the docs-listed ones among them additionally represent a
+    # confirmed gap in the docs-scraped list.
     confirmed_broken_op_types: Dict[str, int] = field(default_factory=dict)
 
     @property
@@ -134,12 +134,12 @@ def partition(model: onnx.ModelProto) -> Partition:
     mode` node, e.g. from re-loading a real `.axmodel`) counts as NPU, not
     CPU -- it's already placed, not something left over for the partitioner.
 
-    An op type in `AX650_CONFIRMED_BROKEN_OPS` is placed on the CPU side
-    even though it's also in `AX650_SUPPORTED_OPS`: a real hardware sweep
-    confirmed these hard-fail a real build despite being docs-listed as
-    supported (see `pulsar2_ops.py`'s docstring). Tracked separately in
-    `Partition.confirmed_broken_op_types` so callers can distinguish "not
-    docs-supported" from "docs-supported but confirmed broken."
+    An op type in `AX650_CONFIRMED_BROKEN_OPS` is placed on the CPU side:
+    a real hardware sweep confirmed these hard-fail a real build (see
+    `pulsar2_ops.py`'s docstring) -- most are docs-listed as supported, the
+    rest failed as unlisted ops at the same frontend stages. Tracked
+    separately in `Partition.confirmed_broken_op_types` so callers can
+    distinguish "untested" from "confirmed broken."
     """
     npu: List[str] = []
     cpu: List[str] = []
