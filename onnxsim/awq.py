@@ -47,33 +47,12 @@ gets no inserted node at all.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Union
+from typing import Optional, Sequence, Union
 
 import numpy as np
 import onnx
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _find_int4_matmul_candidates, _node_outputs, _pack_int4
-from onnxsim.bias_correction import (
-    _activation_rows,
-    _add_probe_outputs,
-    _all_names,
-    _unique_name,
-)
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-
-
-@dataclass
-class _AwqRewrite:
-    output_name: str  # the MatMul/Gemm node's own output name
-    activation_name: str  # that node's activation input name
-    wq_name: str
-    ws_name: str
-    codes: np.ndarray  # int8, original (Wq's) layout/shape
-    scale: np.ndarray  # float32, original (Ws's) layout/shape
-    channel_scale: Optional[np.ndarray]  # None means "no Mul needed" (alpha == 0)
+from onnxsim.calibration import Tensors
 
 
 def _quantize_blockwise_int4(
@@ -150,140 +129,30 @@ def apply_awq(
             inserted before it applying the compensating inverse channel
             scale to its activation input. A layer AWQ found no improvement
             for (``alpha = 0`` best) is left completely untouched.
+
+    The pure-Python grid search below has been retired in favor of the
+    verified-bit-exact C++ port -- this is now a thin alias for
+    :func:`onnxsim.apply_awq_cpp` (``onnxsim/awq_entry.cpp``'s own
+    ``ApplyAwq``), forwarding every argument unchanged. Exact
+    (bit-for-bit) agreement was verified against this function's own
+    pre-alias implementation across MatMul/Gemm/transB-Gemm, grid
+    densities, multi-batch and rank-3 calibration, winning and losing
+    alphas, and every skip shape -- see tests/test_awq_cpp.py -- before
+    this alias was made. ``_quantize_blockwise_int4`` stays in this
+    module (imported by :mod:`onnxsim.quantease`); only the entry point
+    is aliased. Imported lazily (inside the function body, not at module
+    scope) to avoid a circular import: ``onnxsim.onnx_simplifier``
+    already imports from this module, so importing it back at module load
+    time here would deadlock the import machinery.
     """
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    if isinstance(quantized_model, str):
-        quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_awq_cpp
 
-    candidates = _find_int4_matmul_candidates(float_model, quantized_model)
-    if not candidates:
-        return quantized_model
-
-    probe_names = sorted({c.float_node.input[0] for c in candidates})
-    float_probe = _add_probe_outputs(float_model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        out = backend.run_model(float_probe, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(out[name], dtype=np.float64))
-
-    alphas = np.linspace(0.0, 1.0, num_alpha_steps)
-
-    rewrites: List[_AwqRewrite] = []
-    for c in candidates:
-        acts = _activation_rows(activations[c.float_node.input[0]])
-        if not acts:
-            continue  # no usable activation (no feature axis); skip
-        x = np.concatenate(acts, axis=0)
-
-        w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if c.weight_transposed else w.T  # [N, K], output channel first
-        if x.shape[1] != w_nk.shape[1]:
-            continue  # activation's feature dim doesn't match K; skip
-
-        y_float = x @ w_nk.T
-        # AWQ's own saliency signal: each input channel's average activation
-        # magnitude across the calibration set.
-        act_magnitude = np.maximum(np.abs(x).mean(axis=0), 1e-12)  # [K]
-
-        # alpha == 0 (uniform scale 1, i.e. plain round-to-nearest) is
-        # always a candidate and always the grid's first point -- evaluate
-        # it first so best_* below never needs an Optional/None sentinel.
-        best_channel_scale = np.ones_like(act_magnitude)
-        best_codes_nk, best_scale_blocks = _quantize_blockwise_int4(w_nk, c.block_size)
-        best_scale_full = np.repeat(best_scale_blocks, c.block_size, axis=1)
-        best_err = float(
-            np.mean((y_float - x @ (best_codes_nk * best_scale_full).T) ** 2)
-        )
-        best_alpha = 0.0
-
-        for alpha in alphas[1:]:
-            raw = act_magnitude**alpha
-            # Geometric-mean normalization keeps the scale (and its inverse,
-            # applied to the activation) centered around 1 -- standard AWQ
-            # practice, and here purely for numerical hygiene since
-            # weight-only quantization has no activation dynamic-range
-            # constraint to respect.
-            channel_scale = raw / np.exp(np.mean(np.log(raw)))
-            w_scaled_nk = w_nk * channel_scale[np.newaxis, :]
-            codes_nk, scale_blocks = _quantize_blockwise_int4(w_scaled_nk, c.block_size)
-            scale_full = np.repeat(scale_blocks, c.block_size, axis=1)
-            w_hat_nk = codes_nk * scale_full
-            y_hat = (x / channel_scale[np.newaxis, :]) @ w_hat_nk.T
-            err = float(np.mean((y_float - y_hat) ** 2))
-            if err < best_err:
-                best_err = err
-                best_alpha = alpha
-                best_codes_nk = codes_nk
-                best_scale_blocks = scale_blocks
-                best_channel_scale = channel_scale
-
-        codes_orig = best_codes_nk if c.weight_transposed else best_codes_nk.T
-        scale_orig = best_scale_blocks if c.weight_transposed else best_scale_blocks.T
-        assert codes_orig.shape == (dim0, dim1)
-        rewrites.append(
-            _AwqRewrite(
-                output_name=c.output_name,
-                # quantize_weight_only_int4 only ever replaces a node's
-                # weight input (index 1), never its activation input (index
-                # 0) or the node's own identity -- so the quantized graph's
-                # matching node still has this exact activation input name.
-                activation_name=c.float_node.input[0],
-                wq_name=c.wq_name,
-                ws_name=c.ws_init.name,
-                codes=codes_orig.astype(np.int8),
-                scale=scale_orig.astype(np.float32),
-                channel_scale=None if best_alpha == 0.0 else best_channel_scale,
-            )
-        )
-
-    if not rewrites:
-        return quantized_model
-
-    corrected = onnx.ModelProto()
-    corrected.CopyFrom(quantized_model)
-
-    codes_by_name = {r.wq_name: r.codes for r in rewrites}
-    scale_by_name = {
-        r.ws_name: r.scale for r in rewrites if r.channel_scale is not None
-    }
-    for t in corrected.graph.initializer:
-        codes = codes_by_name.get(t.name)
-        if codes is not None:
-            t.raw_data = _pack_int4(codes)
-        scale = scale_by_name.get(t.name)
-        if scale is not None:
-            t.CopyFrom(onnx.numpy_helper.from_array(scale, name=t.name))
-
-    taken_names: Set[str] = _all_names(corrected.graph)
-    q_by_output = _node_outputs(corrected.graph)
-    for r in rewrites:
-        if r.channel_scale is None:
-            continue
-        qn = q_by_output[r.output_name]
-        act_input = r.activation_name
-        inv_scale = (1.0 / r.channel_scale).astype(np.float32)
-
-        scale_name = _unique_name(f"{act_input}_awq_inv_scale", taken_names)
-        corrected.graph.initializer.append(
-            onnx.numpy_helper.from_array(inv_scale, name=scale_name)
-        )
-        scaled_name = _unique_name(f"{act_input}_awq_scaled", taken_names)
-        mul_node = onnx.helper.make_node(
-            "Mul",
-            [act_input, scale_name],
-            [scaled_name],
-            name=_unique_name(f"{act_input}_awq_mul", taken_names),
-        )
-        node_idx = next(i for i, n in enumerate(corrected.graph.node) if n is qn)
-        corrected.graph.node.insert(node_idx, mul_node)
-        qn.input[0] = scaled_name
-
-    return corrected
+    return apply_awq_cpp(
+        float_model,
+        quantized_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        num_alpha_steps=num_alpha_steps,
+        providers=providers,
+    )

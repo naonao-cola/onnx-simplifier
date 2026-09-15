@@ -2525,6 +2525,78 @@ def apply_gptq_cpp(
     )
 
 
+def apply_awq_cpp(
+    float_model: Union[str, onnx.ModelProto],
+    quantized_model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    num_alpha_steps: int = 20,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_awq`: AWQ (Lin et al., 2023)
+    grid-searched per-channel weight rescaling for every
+    ``quantize_weight_only_int4``-quantized MatMul/Gemm layer present (by
+    node output name) in both ``float_model`` and ``quantized_model``,
+    re-quantizing from scratch at each grid point over ``[0, 1]`` and
+    keeping the exponent with the lowest reconstruction error.
+
+    Same real calibration machinery as :func:`onnxsim.apply_gptq_cpp` --
+    a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the float model in C++ (see
+    ``ApplyAwq`` in ``awq_entry.h`` for the full scope).
+
+    :param float_model: the original (unquantized) onnx ModelProto or file
+            path
+    :param quantized_model: a quantized version of ``float_model`` (onnx
+            ModelProto or file path), produced by
+            :func:`onnxsim.quantize_weight_only_int4`
+    :param calibration_data: representative input batches to search and
+            measure the rescaling on -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param num_alpha_steps: grid points for the per-channel scale exponent
+            ``alpha``, evenly spaced over ``[0, 1]`` inclusive
+    :param providers: onnxruntime execution providers to run
+            ``float_model`` on when capturing calibration activations
+    :returns: ``quantized_model`` with every measurably improved layer
+            rewritten (INT4 weight/scale replaced, compensating ``Mul``
+            inserted); unimproved layers are left completely untouched.
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(quantized_model, str):
+        quantized_model = onnx.load(quantized_model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            float_model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_gptq_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_awq(
+            _get_model_executor(providers),
+            float_model.SerializeToString(),
+            quantized_model.SerializeToString(),
+            calibration_data_pb,
+            num_alpha_steps,
+        )
+    )
+
+
 def apply_smoothquant_cpp(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,
