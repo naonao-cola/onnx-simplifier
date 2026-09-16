@@ -14,8 +14,8 @@ PlatformIO against `esp32-s3-devkitc-1` + `framework = arduino`, linking
 Actual output:
 
 ```
-RAM:   40.1% (131456 / 327680 bytes)
-Flash: 23.8% (747413 / 3145728 bytes, the "factory" app partition)
+RAM:   49.9% (163640 / 327680 bytes)
+Flash: 25.0% (784865 / 3145728 bytes, the "factory" app partition)
 ```
 
 **Real-hardware finding #1 (fixed): the `esp32-s3-devkitc-1` board profile's
@@ -166,6 +166,30 @@ this model flashed at `0x310000`, booted, and **`Invoke()` returned
 output dtype). This is the first fully successful real-hardware, real-model,
 correct-quantization-path inference this tool has produced end to end.
 
+**Real-hardware finding #7: the Cardputer's own microphone now feeds real
+audio into a matching model.** `src/main.cpp` checks whether the loaded
+model's input is exactly `int8`, single-input, 1960 bytes (`40 x 49` --
+this model family's shape); if so, it records one second of real audio via
+`M5Cardputer.Mic`, runs it through TF's own `microfrontend` library
+(already vendored inside `Chirale_TensorFLowLite` -- FFT, mel filterbank,
+noise reduction, PCAN gain control, log, configured with the exact
+16kHz/30ms-window/20ms-step/40-channel settings this model family's own
+`micro_model_settings.h` uses), and quantizes the result with the same
+`value_scale=256, value_div=666` conversion as TF's own
+`feature_provider.cc` (a re-implementation of that specific,
+training-pipeline-derived scaling, not a generic one). Confirmed working
+end to end on real hardware: `mic ready -- feeding real audio into the
+model below`, then repeated `test inference: OK (46 ms)` with real, varying
+output values (e.g. `out[0] dequant: 0.2500,0.2461,0.2461,0.2539` for
+ambient background noise -- a genuine, if unremarkable, live prediction,
+not a placeholder). Any model whose input doesn't match this exact
+shape/type still falls back to the original zeroed-input sanity check --
+this is a narrow, model-family-specific special case, not a general "runs
+any model's real preprocessing" claim (see the file's own header comment).
+Inference latency (`millis()` around `Invoke()`) and every output tensor's
+actual values (raw quantized + dequantized) are now printed on every cycle,
+not just once at boot.
+
 The `tensor_arena` size (100KB default) is untested against a model that
 actually needs meaningfully more than this one did -- `AllocateTensors()`
 fails loudly and tells you to raise it if a model needs more, but no model
@@ -186,14 +210,16 @@ has gotten that far yet.
    runtime, the partition is erased flash (`0xFF` bytes), and the board
    should say "no model flashed yet" rather than crash on garbage.
 3. `tflite::GetModel()` + `tflite::AllOpsResolver` + `tflite::MicroInterpreter`
-   load and initialize the model, `AllocateTensors()`, then run **one**
-   inference over a zeroed input and print each tensor's shape/type plus
-   the output. This proves the load-from-flash-partition path executes a
-   real model end to end; it says nothing about the model's accuracy, and
-   deliberately doesn't include any model-specific input preprocessing
-   (MFCC framing for a keyword-spotting model, etc.) — that's real,
-   per-model work that belongs in a follow-up sketch built against one
-   chosen model, not something a "generic" runtime can do generically.
+   load and initialize the model, then `AllocateTensors()`.
+4. If the model's input matches the 40-channel/49-frame int8 audio-frontend
+   shape (see finding #7), records real microphone audio and extracts
+   features into it every cycle; otherwise zeroes it (proves `Invoke()`
+   runs, says nothing about accuracy). Either way, every cycle prints
+   `Invoke()`'s status, latency, and the actual output values -- not just
+   "OK" and a shape dump. Repeats every 2 seconds in `loop()`, both so a
+   mic-driven model gets a fresh real prediction each cycle and so a host
+   reconnecting after this board's native-USB reset-time disconnect isn't
+   limited to one narrow window right after boot.
 
 ## Partition layout (`partitions.csv`)
 
@@ -217,7 +243,10 @@ A model must fit in 1MB (every candidate in the main README's table is
    *just* the resulting `.tflite` file's bytes at address `0x310000`, same
    flasher, same page. No rebuild.
 3. Open a serial monitor (115200 baud) or look at the Cardputer's screen —
-   it prints what it loaded and the sanity-inference result.
+   it prints what it loaded and, every 2 seconds, a fresh inference's
+   status, latency, and output values. For a model matching the 40x49 int8
+   audio-frontend shape (finding #7), that's a real prediction from the
+   built-in mic; otherwise it's a zeroed-input sanity check.
 
 ## Rebuilding it yourself
 
@@ -238,4 +267,4 @@ above (real-hardware finding #1). `board_build.flash_mode = dio` in
 step needs the same flag repeated since it stamps its own image header.
 
 `sha256sum` of the committed `prebuilt/cardputer-runtime.bin`:
-`29799bdc4a303c9e7020487696c693a67f983f8360f77942d8eba2dc51905a1b`
+`9229e9d52009189088f84ab3479ba715812d503d67a8e33a877531fd4851ac98`

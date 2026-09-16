@@ -29,18 +29,20 @@ Serial was picked over WebUSB for this class of board).
 | Fetch + simplify/quantize an HF model | the existing [onnxsim model converter](../convertmodel/index.html) — this tool doesn't repeat that UI | already shipped, unrelated to this addition |
 | ONNX → TFLite (int8) | `scripts/onnx_to_tflite_micro.py` (`convert_to_tflite`, wraps `onnx2tf -oiqt`) | **run for real against real HF models — found two real bugs, both worked around manually**: `-oiqt` requires a Float32 ONNX input, so it errors out on an already-quantized model (finding #3); and even given a Float32 input, `-oiqt`'s own default calibration data fails to load on a current numpy for *any* model (finding #6, an onnx2tf bug, not this repo's). Supplying real calibration data directly via onnx2tf's own `-cind` flag (not yet wired into this script) works and produced a real, correctly-quantized int8 model — see `firmware/runtime/README.md`'s "Status", findings #3 and #6 |
 | TFLite → C header | `scripts/onnx_to_tflite_micro.py` (`emit_c_header`) | unit-tested, see `tests/` |
-| Firmware (generic TFLite Micro runtime) | [`firmware/runtime/`](firmware/runtime/README.md) — a real PlatformIO project, not just a recipe | **compiled, flashed, booted, and ran a real, correctly-quantized model end to end on a real M5Stack Cardputer -- `Invoke()` returned `kTfLiteOk`, confirmed live over serial (finding #6).** Getting there found and fixed a `qio`→`dio` flash-mode bug (finding #1); found (unfixed, upstream-library) a crash on legacy-quantized `DepthwiseConv` models (finding #2); found and precisely root-caused (unfixed, upstream-library) that a differently-quantized model's `Transpose` op runs on unsupported `uint8` data (finding #4); and found and fixed a `Serial`-routing bug that was hiding *all* app/TFLM diagnostic output (finding #5) — see that README's "Status" for the full sequence |
+| Firmware (generic TFLite Micro runtime) | [`firmware/runtime/`](firmware/runtime/README.md) — a real PlatformIO project, not just a recipe | **compiled, flashed, booted, and ran a real, correctly-quantized model end to end on a real M5Stack Cardputer, now driven by the board's own microphone** -- `Invoke()` returns `kTfLiteOk` on real audio, confirmed live over serial with real output values and latency (findings #6, #7). Getting there found and fixed a `qio`→`dio` flash-mode bug (finding #1); found (unfixed, upstream-library) a crash on legacy-quantized `DepthwiseConv` models (finding #2); found and precisely root-caused (unfixed, upstream-library) that a differently-quantized model's `Transpose` op runs on unsupported `uint8` data (finding #4); and found and fixed a `Serial`-routing bug that was hiding *all* app/TFLM diagnostic output (finding #5) — see that README's "Status" for the full sequence |
 | Flash over Web Serial | `web/flasher.mjs` (Espressif's `esptool-js`) | loads and runs its UI logic cleanly in a browser (checked headless); the underlying ISP protocol was exercised for real via `esptool` directly against `/dev/ttyACM0` (same USB-Serial/JTAG port Web Serial would use) — `flasher.mjs`'s own browser-side call shapes are still **not** exercised through an actual Chrome Web Serial session |
 
 Real hardware confirmed, fully end to end: flashing, booting, mmap'ing the
 model partition, `AllocateTensors()`, and a correct `Invoke()` all work for
-a real, properly int8-quantized model -- `test inference: OK` repeatedly,
-live, over the now-working `Serial` port (finding #5). The specific model
-tried first (legacy-quantized, finding #2/#4) still doesn't work -- that's
-a real upstream-library gap, not something wrong with the pipeline itself.
-The browser UI itself doing the flashing (vs. `esptool` CLI standing in for
-it) is also still unverified. See `firmware/runtime/README.md`'s "Status"
-for the full, numbered findings.
+a real, properly int8-quantized model fed real microphone audio through
+TF's own audio frontend -- `test inference: OK`, with real (if currently
+unremarkable -- no wake word was actually spoken at it) output values and
+latency, repeatedly, live, over the now-working `Serial` port (findings #5,
+#7). The specific model tried first (legacy-quantized, finding #2/#4)
+still doesn't work -- that's a real upstream-library gap, not something
+wrong with the pipeline itself. The browser UI itself doing the flashing
+(vs. `esptool` CLI standing in for it) is also still unverified. See
+`firmware/runtime/README.md`'s "Status" for the full, numbered findings.
 
 ## Using it
 
