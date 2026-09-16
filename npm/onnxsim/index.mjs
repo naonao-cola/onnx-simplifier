@@ -333,6 +333,21 @@ export async function applyAqlm(model) {
   return callModelPass("onnxsim_apply_aqlm", model);
 }
 
+/** Drop-by-Drop: additive multi-bitwidth codebook weight quantization. */
+export async function applyDropByDrop(model) {
+  return callModelPass("onnxsim_apply_drop_by_drop", model);
+}
+
+/** LO-BCQ: block-clustered codebook weight quantization. */
+export async function applyLoBcq(model) {
+  return callModelPass("onnxsim_apply_lo_bcq", model);
+}
+
+/** QuIP#: rotation-based incoherence processing + E8-lattice vector quantization. */
+export async function applyQuipSharp(model) {
+  return callModelPass("onnxsim_apply_quip_sharp", model);
+}
+
 /**
  * DAQ (Delta-Aware Quantization): unlike every other data-free pass
  * above, this needs TWO models (a base and a fine-tuned checkpoint,
@@ -353,6 +368,32 @@ export async function applyDaq(baseModel, postTrainedModel, { metric = "cosine",
   }
   if (!result) {
     throw new Error("onnxsim: onnxsim_apply_daq failed (see stderr output for details)");
+  }
+  return new Uint8Array(result);
+}
+
+/**
+ * Low-Rank Compensation (LoRC): unlike every other data-free pass above,
+ * this needs TWO models (a float model and its own INT4-quantized
+ * counterpart, matched by node output name), so it does not go through
+ * callModelPass's own single-model convenience wrapper.
+ */
+export async function applyLowRankCompensation(floatModel, quantizedModel, { rank = 8 } = {}) {
+  const floatBytes = toBytes(floatModel);
+  const quantizedBytes = toBytes(quantizedModel);
+  const runtime = await getRuntime();
+  const fn = runtime.onnxsim_apply_low_rank_compensation;
+  if (typeof fn !== "function") {
+    throw new Error(
+      "onnxsim: this build has no export 'onnxsim_apply_low_rank_compensation' (rebuild the wasm module?)",
+    );
+  }
+  let result = fn(floatBytes, quantizedBytes, rank);
+  if (result && typeof result.then === "function") {
+    result = await result;
+  }
+  if (!result) {
+    throw new Error("onnxsim: onnxsim_apply_low_rank_compensation failed (see stderr output for details)");
   }
   return new Uint8Array(result);
 }
@@ -988,7 +1029,11 @@ export default {
   applyIcquant,
   applyOlive,
   applyAqlm,
+  applyDropByDrop,
+  applyLoBcq,
+  applyQuipSharp,
   applyDaq,
+  applyLowRankCompensation,
   pruneMagnitude,
   applyStructuredPruning,
   applyAttentionHeadPruning,

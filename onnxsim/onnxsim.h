@@ -25,6 +25,7 @@
 #include "gptvq_entry.h"
 #include "imatrix_quant_entry.h"
 #include "llm_int8_entry.h"
+#include "low_rank_compensation_entry.h"
 #include "outlier_suppression_entry.h"
 #include "outlier_suppression_plus_entry.h"
 #include "qronos_entry.h"
@@ -1060,6 +1061,69 @@ onnx::ModelProto ApplyOlive(const onnx::ModelProto& model);
 // aliases.
 onnx::ModelProto ApplyAQLM(const onnx::ModelProto& model);
 
+// Drop-by-Drop (Babaoglu, Chen, Khisti, 2026) -- C++ port of
+// drop_by_drop.py's own quantize_weight_only_drop_by_drop: each
+// (output-channel, 8-element K-block) group is reconstructed by 4
+// additive residual codebook stages, each an *importance-weighted*
+// Lloyd's-algorithm k-means fit (weighted by the group's own fixed
+// original-magnitude RMS), unlike AQLM's own unweighted fit. See
+// passes/drop_by_drop.h for the exact algorithm and its own documented
+// divergence. Unlike quantize_weight_only_drop_by_drop, this port folds
+// the reconstruction directly into a replacement float32 initializer
+// rather than building a Gather/Add-chain graph rewrite. ACCEPTED,
+// PERMANENT DIVERGENCE from quantize_weight_only_drop_by_drop: the same
+// deterministic-magnitude-sorted-init-instead-of-seeded-random-sample
+// divergence ApplyAQLM's own doc comment above already explains in full,
+// applied to each of this port's own 4 weighted k-means fits. ApplyDropByDrop
+// and its _cpp Python wrapper and quantize_weight_only_drop_by_drop
+// remain independently-correct, non-interchangeable entry points, not
+// aliases.
+onnx::ModelProto ApplyDropByDrop(const onnx::ModelProto& model);
+
+// LO-BCQ -- Block Clustered Quantization (Elangovan, Sakr, Raghunathan,
+// Khailany, 2025) -- C++ port of the weight-side half of lo_bcq.py's own
+// quantize_weight_only_lo_bcq: blocks of the reduction dimension are
+// clustered by their own [mean, std] feature vector into 4 groups (via
+// multi-dimensional Lloyd's k-means), then each cluster fits its own
+// small 1-D codebook from only its own currently-assigned blocks, in an
+// outer loop alternating cluster-codebook refit and block-reassignment.
+// See passes/lo_bcq.h for the exact algorithm and its own two documented
+// divergences. Unlike quantize_weight_only_lo_bcq, this port folds the
+// reconstruction directly into a replacement float32 initializer rather
+// than building a Gather/GatherElements/Reshape graph rewrite. ACCEPTED,
+// PERMANENT DIVERGENCE from quantize_weight_only_lo_bcq, two-fold: see
+// passes/lo_bcq.h's own top-of-file comment for the full rationale (a
+// deterministic percentile-derived-centroid 1-D fit, matching
+// kmeans_quantization.h's own precedent; and a deterministic
+// feature-norm-sorted block-clustering init, matching ApplyAQLM's own
+// precedent). ApplyLoBcq and its _cpp Python wrapper and
+// quantize_weight_only_lo_bcq remain independently-correct,
+// non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyLoBcq(const onnx::ModelProto& model);
+
+// QuIP# (Tseng et al., 2024) -- C++ port of quip_sharp.py's own
+// apply_quip_sharp: conjugates the weight by a pair of random orthogonal
+// matrices (Wtilde = V @ W @ U, incoherence processing) so its entries
+// look i.i.d. Gaussian, then jointly quantizes each 8-element group to
+// the nearest E8 lattice point (Conway & Sloane, 1982). See
+// passes/quip_sharp.h for the exact algorithm and its own documented
+// divergence. Unlike quantize_weight_only_quip_sharp's own graph
+// rewrite (which keeps U, V and the packed INT4 lattice codes as
+// explicit initializers and new MatMul nodes), this port folds the
+// entire rotate/quantize/rotate-back sandwich into a single replacement
+// weight initializer -- exact, not an approximation, since U/V are
+// square and only sandwich the weight (see passes/quip_sharp.h's own
+// top-of-file comment for the associativity argument). ACCEPTED,
+// PERMANENT DIVERGENCE from apply_quip_sharp: the random orthogonal
+// matrices are generated via passes/random_orthogonal.h's Gram-Schmidt
+// construction (the same precedent ApplyQuarot already establishes for
+// this codebase), not quip_sharp.py's own QR-with-sign-correction one --
+// both are independently Haar-uniform; cross-language bit parity is
+// explicitly not a goal. ApplyQuipSharp and its _cpp Python wrapper and
+// apply_quip_sharp remain independently-correct, non-interchangeable
+// entry points, not aliases.
+onnx::ModelProto ApplyQuipSharp(const onnx::ModelProto& model);
+
 // DAQ (Delta-Aware Quantization) -- C++ port of daq.py's own apply_daq,
 // declared in daq_entry.h (included above) rather than duplicated here.
 // Unlike every other port in this file, DAQ is data-free but still takes
@@ -1069,6 +1133,23 @@ onnx::ModelProto ApplyAQLM(const onnx::ModelProto& model);
 // calibration_data. See daq_entry.h for the full rationale, the exact
 // coarse-to-fine FP8 scale search, and its own ACCEPTED, PERMANENT
 // DIVERGENCE note.
+
+// Low-Rank Compensation (LoRC), from ZeroQuant-V2 (Yao et al., 2023) --
+// C++ port of low_rank_compensation.py's own apply_low_rank_compensation,
+// declared in low_rank_compensation_entry.h (included above) rather than
+// duplicated here, mirroring how ApplyDAQ is documented in this file
+// instead of daq_entry.h. Like DAQ, this is a data-free, two-model port
+// (a float model and its own already-INT4-quantized counterpart, matched
+// by node output name, the same correspondence ApplyGptq/ApplyQronos/DAQ
+// all make). Unlike every other data-free *_cpp port in this file (which
+// folds its correction into a replacement weight initializer), LoRC's
+// own correction is *additive to a matched layer's output*: it computes
+// the quantization error matrix's best rank-r approximation (Eckart-Young
+// theorem, via a hand-rolled Jacobi SVD -- no linear-algebra library is
+// linked into this codebase) and injects it as two new small MatMul
+// nodes plus an Add. See low_rank_compensation_entry.h/.cpp for the full
+// rationale and their own ACCEPTED, PERMANENT DIVERGENCE note on the SVD
+// choice.
 
 // llama.cpp's "importance matrix" (imatrix) -- C++ port of
 // imatrix_quant.py's own apply_imatrix_quantization, declared in

@@ -17,6 +17,7 @@
 #include "passes/defuse_matmul_integer_to_float.h"
 #include "passes/dilated_conv_to_taps.h"
 #include "passes/double_quantization.h"
+#include "passes/drop_by_drop.h"
 #include "passes/dynamic_quantize_attention.h"
 #include "passes/dynamic_quantize_matmul.h"
 #include "passes/dynamic_quantize_matmul_integer_to_float.h"
@@ -74,6 +75,7 @@
 #include "passes/iq4_nl.h"
 #include "passes/kmeans_quantization.h"
 #include "passes/leptoquant.h"
+#include "passes/lo_bcq.h"
 #include "passes/magnitude_pruning.h"
 #include "passes/maxpool_rowmajor_when_indices_unused.h"
 #include "passes/neg_to_mul.h"
@@ -94,6 +96,7 @@
 #include "passes/quantize_fp16.h"
 #include "passes/quantize_fp8.h"
 #include "passes/quarot.h"
+#include "passes/quip_sharp.h"
 #include "passes/rank0_to_rank1.h"
 #include "passes/rewrite_arg_reduce_select_last_index.h"
 #include "passes/rewrite_bev_pool_to_scatter.h"
@@ -160,6 +163,9 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::ADPQ>(registry);
     RegisterOrReplace<p::AnyPrecisionLlm>(registry);
     RegisterOrReplace<p::AQLM>(registry);
+    RegisterOrReplace<p::DropByDrop>(registry);
+    RegisterOrReplace<p::LoBcq>(registry);
+    RegisterOrReplace<p::QuipSharp>(registry);
     RegisterOrReplace<p::CrossLayerEqualization>(registry);
     RegisterOrReplace<p::DeepSeekFp8>(registry);
     RegisterOrReplace<p::DefuseMatMulIntegerToFloat>(registry);

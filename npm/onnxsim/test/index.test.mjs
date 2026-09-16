@@ -45,7 +45,11 @@ import {
   applyIcquant,
   applyOlive,
   applyAqlm,
+  applyDropByDrop,
+  applyLoBcq,
+  applyQuipSharp,
   applyDaq,
+  applyLowRankCompensation,
   applyMoeExpertChannelPruning,
   applyOutlierSuppression,
   applyOutlierSuppressionPlus,
@@ -174,6 +178,9 @@ try {
       applyIcquant,
       applyOlive,
       applyAqlm,
+      applyDropByDrop,
+      applyLoBcq,
+      applyQuipSharp,
     ]) {
       const out = await fn(input);
       assert.ok(out instanceof Uint8Array, fn.name);
@@ -184,6 +191,16 @@ try {
   await check("applyDaq quantizes a fine-tuned checkpoint against its base", async () => {
     const baseModel = new Uint8Array(readFileSync(FIXTURE));
     const out = await applyDaq(baseModel, baseModel, { metric: "cosine" });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applyLowRankCompensation round-trips a two-model call", async () => {
+    const floatModel = new Uint8Array(readFileSync(FIXTURE));
+    // No DequantizeLinear(INT4, ...)-fed layer in FIXTURE, so no candidate
+    // matches -- the point here is the binding round-trips, same as the
+    // applyDaq test above.
+    const out = await applyLowRankCompensation(floatModel, floatModel, { rank: 8 });
     assert.ok(out instanceof Uint8Array);
     assert.ok(out.length > 0);
   });
