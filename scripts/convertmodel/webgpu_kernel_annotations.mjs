@@ -7,11 +7,14 @@
 // "Dynamic dimensions" panel.
 //
 // This only *displays* whatever a model already carries -- it does not run
-// onnxsim.webgpu_target's gap-detection (Conv3D/Resize/Attention) itself,
-// generate a kernel, or dispatch one; see this repo's own conversation
-// history / docs/webgpu-kernel-dispatch.md for why those are bigger,
-// separate pieces (gap-detection has no JS port yet; generation needs
-// tinygrad, which the WASM UI can't run in-browser today).
+// onnxsim.webgpu_target's gap-detection (Conv3D/Resize/Attention) itself.
+// Generating an *alternative* kernel for a Conv node and dispatching it is
+// possible from the browser too (tinygrad runs fine in Pyodide -- see
+// webgpu_kernel_tuner.mjs), but deliberately lives in a separate, opt-in
+// module rather than here: this module stays pure display logic, DOM-free
+// and cheap to import, while the tuner's own real cost (Pyodide + a tinygrad
+// wheel fetch) only loads when webgpu_kernel_annotations_view.mjs's "Tune
+// this kernel" button is actually clicked.
 
 import { readWebgpuKernelSpecs } from "./onnx_node_metadata.mjs";
 

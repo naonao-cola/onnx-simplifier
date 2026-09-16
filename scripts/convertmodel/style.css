@@ -598,6 +598,43 @@ details.tool-details > summary::-webkit-details-marker {
   font-size: 0.85em;
   white-space: pre;
 }
+.wk-tune {
+  margin-top: 0.5em;
+}
+.wk-tune-btn {
+  margin: 0.2em 0.4em 0.2em 0;
+}
+.wk-tune-status {
+  font-size: 0.9em;
+  margin-bottom: 0.3em;
+}
+.wk-tune-error {
+  color: var(--bad);
+}
+.wk-tune-log {
+  font-size: 0.8em;
+  color: var(--muted);
+  font-family: var(--mono, monospace);
+  margin-bottom: 0.4em;
+}
+.wk-tune-table {
+  font-size: 0.85em;
+  border-collapse: collapse;
+  margin-bottom: 0.4em;
+}
+.wk-tune-table th,
+.wk-tune-table td {
+  text-align: left;
+  padding: 0.15em 0.6em 0.15em 0;
+}
+.wk-tune-table th {
+  color: var(--muted);
+  font-weight: 600;
+}
+.wk-tune-winner {
+  color: var(--ok);
+  font-weight: 600;
+}
 
 /* --- before/after inference comparison summary --------------------------- */
 .cmp-table th {
