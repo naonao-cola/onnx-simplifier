@@ -807,6 +807,85 @@ export async function applyBillm(
 }
 
 /**
+ * KV-cache quantization (KIVI/KVQuant): per-channel static INT8 for a
+ * matched `Concat(past, new, axis=seq)` stream's own Key-style values,
+ * per-token dynamic INT8 (data-free) for Value-style ones (present output
+ * name contains ".value", or listed explicitly in `valueOutputNames`).
+ */
+export async function quantizeKvCache(
+  model,
+  calibration,
+  { valueOutputNames } = {},
+) {
+  return callCalibratedPass("onnxsim_quantize_kv_cache", model, calibration, [
+    valueOutputNames,
+  ]);
+}
+
+/**
+ * OWQ: rescues the top `outlierFraction` OBS-salient columns of an
+ * already-`quantizeWeightOnlyInt4`-quantized layer back to exact float32
+ * precision via an additive Gather/MatMul/Add correction, reusing GPTQ's
+ * own Cholesky-factored-inverse-Hessian mechanism. Takes the float model
+ * and its quantized counterpart, like `applyGptq`. Returns the corrected
+ * quantized model bytes.
+ */
+export async function applyOwq(
+  floatModel,
+  quantizedModel,
+  calibration,
+  { outlierFraction = 0.01, percdamp = 0.01 } = {},
+) {
+  const floatBytes = toBytes(floatModel);
+  const quantBytes = toBytes(quantizedModel);
+  const runtime = await getRuntime();
+  const fn = runtime.onnxsim_apply_owq;
+  if (typeof fn !== "function") {
+    throw new Error("onnxsim: this build has no export 'onnxsim_apply_owq' (rebuild the wasm module?)");
+  }
+  let result = fn(
+    floatBytes,
+    quantBytes,
+    normalizeCalibrationBatches(calibration),
+    outlierFraction,
+    percdamp,
+  );
+  if (result && typeof result.then === "function") {
+    result = await result;
+  }
+  if (!result) {
+    throw new Error("onnxsim: onnxsim_apply_owq failed (see stderr output for details)");
+  }
+  return new Uint8Array(result);
+}
+
+/**
+ * GEAR: low-rank-plus-sparse residual compensation layered on top of
+ * `quantizeKvCache`'s own static per-channel INT8 base quantization,
+ * applied only to a freshly-produced KV-cache token.
+ */
+export async function applyGear(
+  model,
+  calibration,
+  { rank = 4, outlierFraction = 0.05 } = {},
+) {
+  return callCalibratedPass("onnxsim_apply_gear", model, calibration, [
+    rank,
+    outlierFraction,
+  ]);
+}
+
+/**
+ * RotateKV: fits a per-stream orthogonal rotation from a matched KV-cache
+ * stream's own calibration-activation covariance and applies it to both
+ * the stream's fresh Key and its compensating Query, exact by
+ * construction for any orthogonal rotation.
+ */
+export async function applyRotateKv(model, calibration) {
+  return callCalibratedPass("onnxsim_apply_rotatekv", model, calibration, []);
+}
+
+/**
  * SmoothQuant migration (lossless pre-conditioning ahead of a W8A8
  * quantizer): rescales matched weight columns by `s` and inserts a `Mul`
  * dividing the activation by `s`. Returns a float model.
@@ -1169,6 +1248,10 @@ export default {
   quantizeWeightOnlyPbLlm,
   quantizeWeightOnlySqueezeLlm,
   applyBillm,
+  quantizeKvCache,
+  applyOwq,
+  applyGear,
+  applyRotateKv,
   applyGptq,
   applyAdaround,
   applyQronos,

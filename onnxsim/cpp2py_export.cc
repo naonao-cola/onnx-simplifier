@@ -1088,6 +1088,122 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "block_size"_a = 128,
       "percdamp"_a = 0.01, "max_salient_search"_a = 30);
 
+  // KV-cache quantization (KIVI/KVQuant): per-channel static INT8 for a
+  // matched Concat(past, new, axis=seq) stream's own Key-style values,
+  // per-token dynamic INT8 (data-free) for Value-style ones -- see
+  // onnxsim.kv_cache_quantization's own docstring for the split criterion
+  // (present output name contains ".value", or listed explicitly in
+  // `value_output_names`). Same executor-as-first-argument,
+  // `calibration_data` crossing convention as apply_llm_int8's own binding
+  // above. See ApplyKvCacheQuantization in kv_cache_quantization_entry.h
+  // for the full scope and onnxsim/kv_cache_quantization.py for the
+  // technique this ports.
+  m.def(
+      "quantize_kv_cache",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         const std::vector<std::string>& value_output_names) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyKvCacheQuantization(
+            model, *executor, calibration_data, value_output_names);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a,
+      "value_output_names"_a = std::vector<std::string>());
+
+  // OWQ (Lee, Park, Kim, Kim and Sung, 2023, AAAI 2024): rescues the top
+  // `outlier_fraction` OBS-salient columns of an already-
+  // quantize_weight_only_int4-quantized layer back to exact float32
+  // precision via an additive Gather/MatMul/Add correction, reusing
+  // apply_gptq's own Cholesky-factored-inverse-Hessian mechanism --
+  // `quantized_model`'s own INT4 codes are never modified. Same
+  // two-model executor-as-first-argument shape as apply_gptq's own binding
+  // below; `calibration_data` (List[Dict[str, onnx.TensorProto]]) is keyed
+  // to the float model's own graph inputs. See ApplyOwq in owq_entry.h for
+  // the full scope and onnxsim/owq.py for the technique this ports.
+  m.def(
+      "apply_owq",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double outlier_fraction, double percdamp) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result =
+            ApplyOwq(float_model, quantized_model, *executor, calibration_data,
+                     outlier_fraction, percdamp);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "outlier_fraction"_a = 0.01, "percdamp"_a = 0.01);
+
+  // GEAR (Kang et al., 2024): low-rank-plus-sparse residual compensation
+  // layered on top of onnxsim.kv_cache_quantization's own static
+  // per-channel INT8 base quantization, applied only to a freshly-produced
+  // KV-cache token. Same executor-as-first-argument, `calibration_data`
+  // crossing convention as apply_llm_int8's own binding above. See
+  // ApplyGear in gear_entry.h for the full scope and onnxsim/gear.py for
+  // the technique this ports.
+  m.def(
+      "apply_gear",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t rank, double outlier_fraction) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyGear(model, *executor, calibration_data, rank,
+                                      outlier_fraction);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "rank"_a = 4,
+      "outlier_fraction"_a = 0.05);
+
+  // RotateKV (Su et al., 2025): fits a per-stream orthogonal rotation from
+  // a matched KV-cache stream's own calibration-activation covariance and
+  // applies it to both the stream's fresh Key and its compensating Query,
+  // exact by construction for any orthogonal R. Same
+  // executor-as-first-argument, `calibration_data` crossing convention as
+  // apply_llm_int8's own binding above. See ApplyRotateKv in
+  // rotatekv_entry.h for the full scope and onnxsim/rotatekv.py for the
+  // technique this ports.
+  m.def(
+      "apply_rotatekv",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyRotateKv(model, *executor, calibration_data);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a);
+
   // GPTQ (Frantar et al., 2022): sequential, Hessian-compensated INT4
   // rounding for every quantize_weight_only_int4-quantized MatMul/Gemm
   // layer shared (by node output name) between a float model and its

@@ -3371,6 +3371,116 @@ em::val onnxsim_apply_billm(const std::string &data,
   }
 }
 
+// KV-cache quantization (KIVI/KVQuant): per-channel static INT8 for a
+// matched Concat(past, new, axis=seq) stream's own Key-style values,
+// per-token dynamic INT8 (data-free) for Value-style ones. Same
+// calibration-batch contract and executor as every other calibration-driven
+// binding above; `value_output_names` is absent (undefined/null) or a
+// string array of `present` output names to treat as Value-style instead of
+// the default ".value"-in-name heuristic. See ApplyKvCacheQuantization in
+// kv_cache_quantization_entry.h.
+em::val onnxsim_quantize_kv_cache(const std::string &data,
+                                  em::val calibration_batches_val,
+                                  em::val value_output_names_val) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    std::vector<std::string> value_output_names;
+    if (!value_output_names_val.isUndefined() &&
+        !value_output_names_val.isNull()) {
+      value_output_names = em::vecFromJSArray<std::string>(value_output_names_val);
+    }
+    return SerializeModel(ApplyKvCacheQuantization(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), value_output_names));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_kv_cache error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+// OWQ (Lee, Park, Kim, Kim and Sung, 2023, AAAI 2024): rescues the top
+// `outlier_fraction` OBS-salient columns of an already-
+// quantize_weight_only_int4-quantized layer back to exact float32 precision
+// via an additive Gather/MatMul/Add correction, reusing
+// onnxsim_apply_gptq's own Cholesky-factored-inverse-Hessian mechanism --
+// `quantized_model`'s own INT4 codes are never modified. Takes two models,
+// the same shape as onnxsim_apply_gptq. See ApplyOwq in owq_entry.h.
+em::val onnxsim_apply_owq(const std::string &float_data,
+                          const std::string &quantized_data,
+                          em::val calibration_batches_val,
+                          double outlier_fraction, double percdamp) {
+  onnx::ModelProto float_model;
+  if (!float_model.ParseFromArray(float_data.data(), float_data.size())) {
+    std::cerr << "Parse failed (float model)" << std::endl;
+    return em::val::null();
+  }
+  onnx::ModelProto quantized_model;
+  if (!quantized_model.ParseFromArray(quantized_data.data(),
+                                      quantized_data.size())) {
+    std::cerr << "Parse failed (quantized model)" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyOwq(
+        float_model, quantized_model, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), outlier_fraction,
+        percdamp));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_owq error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+// GEAR (Kang et al., 2024): low-rank-plus-sparse residual compensation
+// layered on top of onnxsim_quantize_kv_cache's own static per-channel
+// INT8 base quantization, applied only to a freshly-produced KV-cache
+// token. Same calibration-batch contract and executor as every other
+// calibration-driven binding above. See ApplyGear in gear_entry.h.
+em::val onnxsim_apply_gear(const std::string &data,
+                           em::val calibration_batches_val, int rank,
+                           double outlier_fraction) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyGear(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), rank,
+        outlier_fraction));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_gear error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+// RotateKV (Su et al., 2025): fits a per-stream orthogonal rotation from a
+// matched KV-cache stream's own calibration-activation covariance and
+// applies it to both the stream's fresh Key and its compensating Query.
+// Same calibration-batch contract and executor as every other
+// calibration-driven binding above. See ApplyRotateKv in rotatekv_entry.h.
+em::val onnxsim_apply_rotatekv(const std::string &data,
+                               em::val calibration_batches_val) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyRotateKv(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val)));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_rotatekv error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // SmoothQuant migration (Xiao et al., 2022): rescales every matched
 // MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight columns by the
 // per-channel migration scale and inserts a `Mul` dividing that layer's
@@ -3862,6 +3972,10 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_quantize_weight_only_squeezellm",
            &onnxsim_quantize_weight_only_squeezellm);
   function("onnxsim_apply_billm", &onnxsim_apply_billm);
+  function("onnxsim_quantize_kv_cache", &onnxsim_quantize_kv_cache);
+  function("onnxsim_apply_owq", &onnxsim_apply_owq);
+  function("onnxsim_apply_gear", &onnxsim_apply_gear);
+  function("onnxsim_apply_rotatekv", &onnxsim_apply_rotatekv);
   function("onnxsim_apply_gptq", &onnxsim_apply_gptq);
   function("onnxsim_apply_adaround", &onnxsim_apply_adaround);
   function("onnxsim_apply_qronos", &onnxsim_apply_qronos);
