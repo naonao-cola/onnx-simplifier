@@ -49,6 +49,7 @@
     "test:webgpu-kernel-annotations": "node test/webgpu_kernel_annotations.test.mjs",
     "test:webgpu-kernel-dispatcher": "node test/webgpu_kernel_dispatcher.test.mjs",
     "test:webgpu-tinygrad-codegen": "node test/webgpu_tinygrad_codegen.test.mjs",
+    "test:webgpu-kernel-tuning": "node test/webgpu_kernel_tuning.test.mjs",
     "test:webgpu-custom-kernel-runtime": "node test/webgpu_custom_kernel_runtime.test.mjs",
     "test:pyodide-tinygrad-codegen": "node test/pyodide_tinygrad_codegen.test.mjs",
     "test:pyodide-single-node-codegen": "node test/pyodide_webgpu_single_node_codegen.test.mjs",

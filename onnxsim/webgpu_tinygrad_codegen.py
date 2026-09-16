@@ -163,7 +163,6 @@ def _lower_tensor_program(
     :raises RuntimeError: tinygrad scheduled no compute kernel at all (e.g.
             the whole graph constant-folded away).
     """
-    from tinygrad.codegen import to_program
     from tinygrad.helpers import Target
     from tinygrad.renderer.wgsl import WGSLRenderer
     from tinygrad.uop.ops import Ops
@@ -225,53 +224,69 @@ def _lower_tensor_program(
     for call in kernel_calls:
         ast = call.src[0]
         buffer_uops = list(call.src[1:])
-        prg = to_program(ast, renderer)
-        info = prg.arg
-        source_uop = next(s for s in prg.src if s.op is Ops.SOURCE)
-        wgsl = source_uop.arg
-        entry_point = _ANSI_RE.sub("", info.function_name)
-
-        bindings: List[WebgpuKernelBinding] = [
-            # tinygrad's WGSLRenderer always reserves binding 0 for this,
-            # whether or not the kernel body reads it -- see this module's
-            # docstring.
-            WebgpuKernelBinding.for_constant([float("inf")], group=0, binding=0)
-        ]
-        for slot, buf_uop in enumerate(buffer_uops):
-            kind, name = _name_for(buf_uop)
-            if kind == "tensor":
-                bindings.append(
-                    WebgpuKernelBinding.for_tensor(
-                        name, group=0, binding=slot + 1, access="read_write"
-                    )
-                )
-            else:
-                bindings.append(
-                    WebgpuKernelBinding.for_intermediate(
-                        name, group=0, binding=slot + 1, access="read_write"
-                    )
-                )
-
-        # ProgramInfo.global_size can be shorter than 3 dims (e.g. a 1-D
-        # workgroup count) -- pad with 1s to match the schema's fixed-3-tuple
-        # dispatch (see onnxsim/webgpu_kernel_metadata.py's own docstring for
-        # why dispatch is a fixed triple, not a variable-length list).
-        padded_size = [int(x) for x in info.global_size] + [1, 1, 1]
-        dispatch: Tuple[int, int, int] = (
-            padded_size[0],
-            padded_size[1],
-            padded_size[2],
-        )
-        steps.append(
-            WebgpuKernelStep(
-                wgsl=wgsl,
-                entry_point=entry_point,
-                dispatch=dispatch,
-                bindings=tuple(bindings),
-            )
-        )
+        steps.append(_render_kernel_step(ast, buffer_uops, _name_for, renderer))
 
     return WebgpuKernelSpec(steps=tuple(steps), intermediates=intermediate_bytes)
+
+
+def _render_kernel_step(ast, buffer_uops, name_for, renderer) -> WebgpuKernelStep:
+    """Renders one already-scheduled kernel ``ast`` (an ``Ops.SINK``-rooted
+    per-kernel AST -- one ``Ops.CALL``'s own ``src[0]``) to a single
+    :class:`WebgpuKernelStep`, via tinygrad's own ``to_program``/
+    ``WGSLRenderer``. Factored out of :func:`_lower_tensor_program`'s own
+    loop body so :mod:`onnxsim.webgpu_kernel_tuning` can render several
+    *alternative* (differently ``Opt``-tuned) ASTs for the very same call --
+    same ``buffer_uops``/``name_for`` (a kernel's tuning options change its
+    loop/tiling structure, never which buffers it reads/writes, so bindings
+    are identical across every tuning candidate for one call; see that
+    module's own docstring) -- without duplicating the bindings/dispatch
+    bookkeeping a second time.
+
+    :param buffer_uops: the owning ``Ops.CALL``'s own ``src[1:]`` -- fixed
+            per call, independent of which optimized variant of ``ast`` is
+            rendered (see above).
+    :param name_for: ``_lower_tensor_program``'s own ``_name_for`` closure
+            (or an equivalent) -- maps a buffer ``UOp`` to ``(kind, name)``.
+    """
+    from tinygrad.codegen import to_program
+    from tinygrad.uop.ops import Ops
+
+    prg = to_program(ast, renderer)
+    info = prg.arg
+    source_uop = next(s for s in prg.src if s.op is Ops.SOURCE)
+    wgsl = source_uop.arg
+    entry_point = _ANSI_RE.sub("", info.function_name)
+
+    bindings: List[WebgpuKernelBinding] = [
+        # tinygrad's WGSLRenderer always reserves binding 0 for this,
+        # whether or not the kernel body reads it -- see this module's
+        # docstring.
+        WebgpuKernelBinding.for_constant([float("inf")], group=0, binding=0)
+    ]
+    for slot, buf_uop in enumerate(buffer_uops):
+        kind, name = name_for(buf_uop)
+        if kind == "tensor":
+            bindings.append(
+                WebgpuKernelBinding.for_tensor(
+                    name, group=0, binding=slot + 1, access="read_write"
+                )
+            )
+        else:
+            bindings.append(
+                WebgpuKernelBinding.for_intermediate(
+                    name, group=0, binding=slot + 1, access="read_write"
+                )
+            )
+
+    # ProgramInfo.global_size can be shorter than 3 dims (e.g. a 1-D
+    # workgroup count) -- pad with 1s to match the schema's fixed-3-tuple
+    # dispatch (see onnxsim/webgpu_kernel_metadata.py's own docstring for
+    # why dispatch is a fixed triple, not a variable-length list).
+    padded_size = [int(x) for x in info.global_size] + [1, 1, 1]
+    dispatch: Tuple[int, int, int] = (padded_size[0], padded_size[1], padded_size[2])
+    return WebgpuKernelStep(
+        wgsl=wgsl, entry_point=entry_point, dispatch=dispatch, bindings=tuple(bindings)
+    )
 
 
 def _get_attr(node: onnx.NodeProto, name: str):

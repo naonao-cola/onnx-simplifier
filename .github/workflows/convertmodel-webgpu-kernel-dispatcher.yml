@@ -89,6 +89,21 @@ name: convertmodel WebGPU custom kernel dispatcher
 #     then dispatches the live spec against a real WebGPU device. Same
 #     network + GPU-backed-browser requirements as the job above.
 #
+#   * test/webgpu_kernel_tuning.test.mjs -- REQUIRED. Proves
+#     onnxsim.webgpu_kernel_tuning.generate_kernel_candidates's whole point:
+#     several *alternative* WGSL kernels for the same real Conv2D (different
+#     tinygrad Opt tunings -- tinygrad's own BEAM search can't be reused
+#     directly here, since it insists on a real, natively-loaded Device to
+#     time candidates itself; see that module's own docstring) all dispatch
+#     correctly on a real WebGPU device, and dispatchWebgpuProgram's own
+#     profile: true option reports real, usably-different per-candidate GPU
+#     durations -- checked once by hand against this exact fixture: the
+#     untuned baseline was the *slowest* of 8 candidates, ~3x slower than
+#     the fastest tuned one. The fixture
+#     (webgpu_kernel_tuning_fixture.json) is pre-generated and committed by
+#     make_webgpu_kernel_tuning_fixture.py, same convention as the other
+#     fixture-based jobs.
+#
 # Scheduled + on demand, plus on PRs that touch the files this check depends
 # on, same reasoning as convertmodel-webgpu-demo.yml / convertmodel-ep-placement.yml.
 
@@ -111,6 +126,10 @@ on:
       - "scripts/convertmodel/test/make_webgpu_onnxrunner_fixture.py"
       - "scripts/convertmodel/test/webgpu_onnxrunner_conv_relu.onnx"
       - "scripts/convertmodel/test/webgpu_onnxrunner_fixture.json"
+      - "scripts/convertmodel/test/webgpu_kernel_tuning.test.mjs"
+      - "scripts/convertmodel/test/make_webgpu_kernel_tuning_fixture.py"
+      - "scripts/convertmodel/test/webgpu_kernel_tuning_fixture.json"
+      - "onnxsim/webgpu_kernel_tuning.py"
       - "scripts/convertmodel/test/make_webgpu_kernel_fixture.py"
       - "scripts/convertmodel/test/make_webgpu_tinygrad_codegen_fixture.py"
       - "scripts/convertmodel/test/make_webgpu_custom_kernel_runtime_fixture.py"
@@ -196,6 +215,25 @@ jobs:
       - name: Run the WebGPU tinygrad-generated kernel dispatcher check
         working-directory: scripts/convertmodel
         run: npm run test:webgpu-tinygrad-codegen
+
+  webgpu-kernel-tuning:
+    name: WebGPU kernel tuning (browser-timed candidates, required)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (onnxruntime-web, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the WebGPU kernel tuning check
+        working-directory: scripts/convertmodel
+        run: npm run test:webgpu-kernel-tuning
 
   webgpu-custom-kernel-runtime:
     name: WebGPU custom kernel runtime (ort-web splice, required)
