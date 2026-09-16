@@ -39,6 +39,14 @@ rather than left for the next person to rediscover:
   pinning the batch dimension to 1 before compiling (`_pin_batch_dim`
   below) avoids the whole class of failure rather than debugging each
   symptom of it.
+- nncase 1.9.0's ONNX importer covers roughly half of the ai.onnx domain
+  (see `onnx_legalizer.py`'s module docstring for the actual coverage
+  check) and throws "Not supported ONNX opcode: ..." on the rest, even
+  though several of those are just a named shorthand for a small
+  expression built entirely out of ops it does support (`Gelu`, `Swish`,
+  `Mish`, `MeanVarianceNormalization`, ...) -- increasingly common in
+  Hugging Face exports. `legalize()` rewrites those before nncase ever
+  sees them.
 """
 
 from __future__ import annotations
@@ -50,6 +58,8 @@ from pathlib import Path
 import numpy as np
 import onnx
 from onnx import shape_inference
+
+from onnx_legalizer import legalize
 
 
 def _pin_batch_dim(model: onnx.ModelProto) -> onnx.ModelProto:
@@ -89,6 +99,7 @@ def convert_to_kmodel(
     import nncase  # deferred: only needed here, and only installable on Python <=3.10
 
     model = onnx.load(str(onnx_path))
+    model = legalize(model)  # rewrite ops nncase's importer doesn't support (see onnx_legalizer.py)
     model = shape_inference.infer_shapes(model)
     model = _pin_batch_dim(model)
 

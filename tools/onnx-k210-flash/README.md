@@ -159,6 +159,24 @@ actual cause -- fixed by pinning the batch dimension to 1 before compiling
 test skips cleanly when `nncase` isn't importable (the normal case under
 this repo's own Python) rather than failing the suite.
 
+**ONNX op coverage.** nncase 1.9.0's ONNX importer implements 111 of the
+202 ops in the ai.onnx domain (checked against `onnx==1.22.0`'s own
+`onnx.defs.get_all_schemas_with_history()` -- see `scripts/onnx_legalizer.py`'s
+module docstring for the full missing list). Most of the gap is either
+irrelevant here (control flow, sequence/string ops, training losses) or a
+named shorthand for a small expression nncase's *supported* ops can already
+express -- `scripts/onnx_legalizer.py` rewrites the latter
+(`Gelu`, `Swish`, `Mish`, `MeanVarianceNormalization`, `Reciprocal`, `Or`,
+`Xor`, `IsNaN`, `IsInf`) into that expression before nncase ever sees the
+node, and `convert_to_kmodel()` runs it automatically. Each rewrite is
+tested in `tests/test_onnx_legalizer.py` by running both the original node
+and its legalized replacement through `onnx.reference.ReferenceEvaluator`
+and checking the outputs match -- proof the substitution is mathematically
+equivalent, not merely "some other ops that also run". `GroupNormalization`
+and `Mod` have real decompositions too but were left out (bigger, or
+semantics-attribute-dependent) since nothing this repo has actually
+compiled has needed them yet -- see that module's own docstring.
+
 **What this does and doesn't prove.** nncase's `Simulator` runs the
 compiled kmodel's actual op kernels on the host CPU -- it's nncase's own
 reference execution path, the same one its PTQ calibration step uses
