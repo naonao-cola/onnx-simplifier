@@ -403,6 +403,56 @@ def patch_mul_output_quad(
     return bytes(out)
 
 
+def patch_output_quad(
+    reference_mcode: bytes, old_z_scale: float, new_z_scale: float
+) -> bytes:
+    """Rewrite the output-scale quad for Gemm/Conv/MatMul (and Mul).
+
+    ``patch_mul_output_quad`` only recognizes Mul's own bare frame (``03
+    <f32(z_scale)> 81 <tag2>`` x4 stride 7). This session's later decode
+    work found the *identical* mechanism on Gemm, Conv and MatMul too
+    (``tests/test_axera_output_scale_quad_generalizes.py``,
+    ``tests/test_axera_gemm_output_quad.py``), framed with a `05 50 0f`
+    lead-in before the first copy instead: ``05 50 0f <f32(z_scale)> 81
+    <tag2> 03`` x4 stride 7. This function handles both frames by
+    checking for the lead-in first and falling back to Mul's bare-``03``
+    frame when it's absent, so one function covers every op this project
+    has found the quad on.
+
+    Same defensive posture as ``patch_mul_output_quad``: verifies the
+    stride-7 x4 run and the ``0x81`` tail byte (and the lead-in, when
+    present) before patching, but never depends on ``tag2`` -- confirmed
+    build-specific across every op checked, not a shared constant.
+    Preserves whatever ``tag2`` and the trailing 0x03/0x83 high-bit byte
+    already are; this only ever rewrites the 4-byte float.
+
+    Verified (2026-09-17), compile-only, no device access needed:
+    patching `gemm_1x8x8_tb0.mcode.gz`'s quad to `gemm_1x8x8_tb1.mcode.gz`'s
+    real output_scale reproduces `tb1`'s own mcode byte-for-byte outside
+    this project's already-known ``~295-330`` noise zone -- see
+    ``tests/test_axera_output_quad_generator.py``.
+    """
+    old_pat = struct.pack("<f", float(old_z_scale))
+    new_pat = struct.pack("<f", float(new_z_scale))
+    hits = _strided_run(reference_mcode, old_pat, 7)
+    lead_in = reference_mcode[hits[0] - 3 : hits[0]]
+    has_lead_in = lead_in == bytes.fromhex("05500f")
+    if not has_lead_in and reference_mcode[hits[0] - 1] != 0x03:
+        raise ValueError(
+            f"quad @{hits[0]}: lead-in {lead_in.hex()} is neither the"
+            " generalized 05500f frame nor Mul's bare 03 frame"
+        )
+    for off in hits:
+        if reference_mcode[off + 4] != 0x81:
+            raise ValueError(
+                f"quad @{off}: tail byte {reference_mcode[off + 4]:02x} is not 81"
+            )
+    out = bytearray(reference_mcode)
+    for off in hits:
+        out[off : off + 4] = new_pat
+    return bytes(out)
+
+
 def patch_mul_zp_x(reference_mcode: bytes, old_zp_x: int, new_zp_x: int) -> bytes:
     """Rewrite x's zero point, where the literal-byte form is present.
 
