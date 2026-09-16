@@ -146,7 +146,11 @@ name: convertmodel WebGPU custom kernel dispatcher
 #     from inside the browser page itself (Pyodide from jsdelivr, tinygrad's
 #     wheel from PyPI) -- see that test's own comment for how it was
 #     verified in this repo's own dev sandbox, whose egress policy denies
-#     jsdelivr specifically.
+#     jsdelivr specifically. Also drives a third scenario, the "Tune full
+#     graph" button, against a purpose-built two-Conv-node fixture
+#     (webgpu_kernel_tuning_multi_conv_fixture.onnx) -- one click tunes both
+#     nodes and one export carries both winners, proving the batching itself
+#     rather than just the same single-node path run twice.
 #
 # Scheduled + on demand, plus on PRs that touch the files this check depends
 # on, same reasoning as convertmodel-webgpu-demo.yml / convertmodel-ep-placement.yml.
@@ -180,6 +184,9 @@ on:
       - "scripts/convertmodel/test/make_webgpu_kernel_tuning_fixture.py"
       - "scripts/convertmodel/test/webgpu_kernel_tuning_fixture.json"
       - "scripts/convertmodel/test/webgpu_kernel_tuning_fixture.onnx"
+      - "scripts/convertmodel/test/make_webgpu_kernel_tuning_multi_conv_fixture.py"
+      - "scripts/convertmodel/test/webgpu_kernel_tuning_multi_conv_fixture.json"
+      - "scripts/convertmodel/test/webgpu_kernel_tuning_multi_conv_fixture.onnx"
       - "scripts/convertmodel/webnn.mjs"
       - "onnxsim/webgpu_kernel_tuning.py"
       - "scripts/convertmodel/test/make_webgpu_kernel_fixture.py"

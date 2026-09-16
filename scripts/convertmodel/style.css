@@ -641,6 +641,11 @@ details.tool-details > summary::-webkit-details-marker {
   padding-top: 0.4em;
   border-top: 1px solid var(--border);
 }
+.wk-fullgraph {
+  margin-bottom: 0.8em;
+  padding-bottom: 0.6em;
+  border-bottom: 1px solid var(--border);
+}
 
 /* --- before/after inference comparison summary --------------------------- */
 .cmp-table th {

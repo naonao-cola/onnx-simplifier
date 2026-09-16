@@ -1025,7 +1025,14 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             running tinygrad, a real multi-second/multi-megabyte download —
             nothing loads until you click it) and lets you download a model
             with the fastest candidate it found attached in place of the
-            original kernel.
+            original kernel. A <b>Tune full graph…</b> button (shown once per
+            side, above the per-node list) runs the same loop for every
+            <code>Conv</code> node in sequence and folds every winner into
+            one export — handy for a model with more than a couple of
+            <code>Conv</code> nodes, though each node's own dispatch loop
+            still takes real GPU time, so a big model can take a while (the
+            button reports live per-node progress; a node that fails to
+            tune is skipped, not fatal to the rest of the batch).
             </p>
         </details>
         <div id="webgpu-kernels-content"></div>

@@ -16,7 +16,14 @@
 //      the deployed page. See webgpu_kernel_annotations_view.mjs's own
 //      setSide/listConvNodeNames fix (the "Tune a Conv kernel" section).
 //
-// Each scenario, via the shared runScenario() below:
+// Plus a third, separate check (runFullGraphScenario) for the "Tune full
+// graph" button: a model with *two* independent Conv nodes
+// (webgpu_kernel_tuning_multi_conv_fixture.onnx), one click, and both nodes
+// get tuned and exported into a single file -- proving the batch actually
+// tunes more than one node and attachWebgpuKernelSpec's own chaining
+// carries more than one winner into one export, not just the last one.
+//
+// Each single-node scenario, via the shared runScenario() below:
 //
 //   1. Load the fixture via `window.webgpuKernelsShowBefore`, the same hook
 //      Hugging Face loads use.
@@ -69,6 +76,8 @@ const ROOT = join(HERE, "..");
 const CODEGEN_MANIFEST = JSON.parse(readFileSync(join(HERE, "webgpu_tinygrad_codegen_fixture.json"), "utf8"));
 const CONV3D_FIXTURE = CODEGEN_MANIFEST.conv3d;
 const TUNING_MANIFEST = JSON.parse(readFileSync(join(HERE, "webgpu_kernel_tuning_fixture.json"), "utf8"));
+const MULTI_CONV_FILE = "webgpu_kernel_tuning_multi_conv_fixture.onnx";
+const MULTI_CONV_MANIFEST = JSON.parse(readFileSync(join(HERE, "webgpu_kernel_tuning_multi_conv_fixture.json"), "utf8"));
 
 const SCENARIOS = [
   {
@@ -227,6 +236,109 @@ async function runScenario(page, port, scenario) {
   });
 }
 
+// Loads a two-Conv-node model, clicks the single "Tune full graph" button,
+// and verifies BOTH nodes actually got tuned (not just one) and that one
+// export carries both winners, each still computing its own correct answer.
+async function runFullGraphScenario(page, port) {
+  console.log(`\n-- scenario: Tune full graph (${MULTI_CONV_FILE}, two independent Conv nodes) --`);
+  console.log(`Loading ${MULTI_CONV_FILE} into the panel via window.webgpuKernelsShowBefore...`);
+  const modelBytes = new Uint8Array(readFileSync(join(HERE, MULTI_CONV_FILE)));
+  await page.evaluate(
+    ({ bytes, name }) => window.webgpuKernelsShowBefore(new Uint8Array(bytes), name),
+    { bytes: Array.from(modelBytes), name: MULTI_CONV_FILE },
+  );
+
+  const tuneFullGraphSelector = '#webgpu-kernels-content button[data-action="tune-full-graph"]';
+  await check("[full graph] the panel shows a 'Tune full graph' button", async () => {
+    await page.waitForSelector(tuneFullGraphSelector, { timeout: 10_000 });
+  });
+
+  console.log("Clicking 'Tune full graph…' -- tunes conv_a then conv_b in one click...");
+  await page.click(tuneFullGraphSelector);
+
+  const exportFullGraphSelector = '#webgpu-kernels-content button[data-action="export-full-graph"]';
+  await page.waitForSelector(exportFullGraphSelector, { timeout: 180_000 });
+
+  const fgResult = await page.evaluate(() => window.__wkLastFullGraphTuneResult);
+
+  await check("[full graph] both Conv nodes were tuned, not just one", () => {
+    assert.ok(fgResult, "window.__wkLastFullGraphTuneResult was never set");
+    assert.deepEqual(fgResult.nodeNames.sort(), ["conv_a", "conv_b"]);
+    for (const nodeName of fgResult.nodeNames) {
+      const r = fgResult.results[nodeName];
+      assert.equal(r.status, "done", `node ${nodeName} did not finish tuning: ${JSON.stringify(r)}`);
+      assert.ok(r.result.results.length > 1, `node ${nodeName} got only ${r.result.results.length} candidate(s)`);
+    }
+  });
+
+  console.log("Clicking 'Export full graph' and capturing the real browser download...");
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.click(exportFullGraphSelector),
+  ]);
+  const exportedBytes = new Uint8Array(readFileSync(await download.path()));
+
+  await check("[full graph] the exported file carries BOTH nodes' winning specs", async () => {
+    const { readWebgpuKernelSpecs } = await import("../onnx_node_metadata.mjs");
+    const specs = readWebgpuKernelSpecs(exportedBytes);
+    for (const nodeName of ["conv_a", "conv_b"]) {
+      const attached = specs.get(nodeName);
+      assert.ok(attached, `no onnxsim.webgpu_kernel metadata found on ${nodeName} in the exported model`);
+      assert.deepEqual(attached, fgResult.results[nodeName].result.winner.spec);
+    }
+  });
+
+  console.log("Dispatching both exported kernels against a real device...");
+  const actuals = await page.evaluate(
+    async ({ port, exportedBytesArray, inputs, nodes }) => {
+      const base = `http://localhost:${port}`;
+      const { readWebgpuKernelSpecs } = await import(`${base}/onnx_node_metadata.mjs`);
+      const { dispatchWebgpuProgram, createStorageBuffer, readBackFloat32Buffer } = await import(
+        `${base}/webgpu_kernel_dispatcher.mjs`
+      );
+      const specs = readWebgpuKernelSpecs(new Uint8Array(exportedBytesArray));
+
+      const adapter = await navigator.gpu.requestAdapter();
+      const device = await adapter.requestDevice();
+      const results = {};
+      for (const [nodeName, { outputName, expectedLength }] of Object.entries(nodes)) {
+        const buffersByTensor = new Map();
+        for (const [name, { data }] of Object.entries(inputs)) {
+          buffersByTensor.set(name, createStorageBuffer(device, Float32Array.from(data)));
+        }
+        buffersByTensor.set(outputName, createStorageBuffer(device, new Float32Array(expectedLength)));
+        await dispatchWebgpuProgram(device, specs.get(nodeName), buffersByTensor, {});
+        const out = await readBackFloat32Buffer(device, buffersByTensor.get(outputName), expectedLength);
+        results[nodeName] = Array.from(out);
+      }
+      return results;
+    },
+    {
+      port,
+      exportedBytesArray: Array.from(exportedBytes),
+      inputs: MULTI_CONV_MANIFEST.inputs,
+      nodes: Object.fromEntries(
+        Object.entries(MULTI_CONV_MANIFEST.nodes).map(([nodeName, n]) => [
+          nodeName,
+          { outputName: n.outputName, expectedLength: n.expectedOutput.data.length },
+        ]),
+      ),
+    },
+  );
+
+  await check("[full graph] both exported kernels still compute the right answer", () => {
+    for (const [nodeName, n] of Object.entries(MULTI_CONV_MANIFEST.nodes)) {
+      const expected = n.expectedOutput.data;
+      const actual = actuals[nodeName];
+      let maxAbsDiff = 0;
+      for (let i = 0; i < expected.length; i++) {
+        maxAbsDiff = Math.max(maxAbsDiff, Math.abs(actual[i] - expected[i]));
+      }
+      assert.ok(maxAbsDiff < 1e-3, `${nodeName}: max abs diff ${maxAbsDiff} too large`);
+    }
+  });
+}
+
 async function main() {
   console.log("WebGPU kernel tuner UI check (real Pyodide + tinygrad + WebGPU)");
 
@@ -247,6 +359,7 @@ async function main() {
     for (const scenario of SCENARIOS) {
       await runScenario(page, port, scenario);
     }
+    await runFullGraphScenario(page, port);
 
     await page.close();
   } finally {

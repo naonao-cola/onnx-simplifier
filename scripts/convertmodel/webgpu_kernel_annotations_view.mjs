@@ -20,9 +20,20 @@
 // model has any pre-attached kernel at all. `onnx_conv_node_reader.mjs`'s
 // listConvNodeNames lists every Conv node in the graph instead, and this
 // view offers the same tune UI on any of them that isn't already shown
-// above (see setSide's own comment). Nothing here changes what
-// Simplify/Optimize themselves produce; a tuned export is a separate
-// download the visitor asks for.
+// above (see setSide's own comment). A **"Tune full graph…"** button per
+// side (see fullGraphSectionHtml/handleTuneFullGraphClick) tunes every Conv
+// node one after another instead of clicking each one by hand -- it drives
+// the exact same per-node state a single click would, so each node's own
+// card updates live as the batch works through it, then one "Export full
+// graph" button chains attachWebgpuKernelSpec across every node that
+// succeeded into a single download. Pyodide/tinygrad load once and stay
+// cached across nodes, but each node's own GPU dispatch loop still costs
+// real time, so this can take a while on a model with many Conv nodes -- a
+// node that fails to tune (non-static shape, more than one scheduled kernel
+// call, ...) is recorded on its own card and the batch moves on, it doesn't
+// abort the rest of the graph. Nothing here changes what Simplify/Optimize
+// themselves produce; a tuned export is a separate download the visitor
+// asks for.
 //
 // Wiring mirrors the "Dynamic dimensions" panel (shapes_view.mjs): the
 // "before" side watches the file input directly and exposes a
@@ -63,6 +74,29 @@ function tuningStateFor(which, nodeName) {
     tuning.set(key, { status: "idle", log: [], result: null, error: null });
   }
   return tuning.get(key);
+}
+
+// One "Tune full graph" run per side -- drives the exact same per-node
+// `tuning` map entries a click on an individual node's own button would
+// (see handleTuneFullGraphClick), so every Conv node's own card updates
+// live as the batch works through it, instead of duplicating a whole
+// separate results display. Only tracks the batch's own overall progress;
+// a node's success/failure/result lives in `tuning` as usual.
+// {status: "idle"|"running"|"done", nodeNames: string[], doneCount: number}
+const fullGraphTuning = new Map();
+
+function fullGraphStateFor(which) {
+  if (!fullGraphTuning.has(which)) {
+    fullGraphTuning.set(which, { status: "idle", nodeNames: [], doneCount: 0 });
+  }
+  return fullGraphTuning.get(which);
+}
+
+// Every Conv node for a side, already-annotated ones first (display order),
+// deduplicated -- tunableConvNodes is already filtered to exclude them (see
+// setSide's own comment), so a plain concat is enough here.
+function allConvNodeNames(side) {
+  return [...side.annotations.map((a) => a.nodeName), ...side.tunableConvNodes];
 }
 
 function esc(s) {
@@ -154,6 +188,48 @@ function tunableConvNodeHtml(nodeName, which) {
   );
 }
 
+// The single "Tune every Conv node in this model" entry point -- sits above
+// the per-node lists since it's the fastest way to get a fully-tuned export
+// for a model with more than a couple of Conv nodes (clicking each one's own
+// button is still there for a single node, or to re-tune one node after a
+// full-graph run). Not shown at all when there's nothing to tune.
+function fullGraphSectionHtml(which, side) {
+  const nodeNames = allConvNodeNames(side);
+  if (nodeNames.length === 0) return "";
+  const fg = fullGraphStateFor(which);
+
+  if (fg.status === "idle") {
+    return (
+      `<div class="wk-fullgraph">` +
+      `<button type="button" class="wk-tune-btn" data-action="tune-full-graph" data-which="${esc(which)}">` +
+      `Tune full graph… (${nodeNames.length} Conv node${nodeNames.length === 1 ? "" : "s"})</button>` +
+      `</div>`
+    );
+  }
+  if (fg.status === "running") {
+    return (
+      `<div class="wk-fullgraph">` +
+      `<div class="wk-tune-status">Tuning full graph… (${fg.doneCount}/${fg.nodeNames.length} node(s) done)</div>` +
+      `</div>`
+    );
+  }
+  // done -- tally each node's own (already-updated) tuning state.
+  const succeeded = fg.nodeNames.filter((n) => tuningStateFor(which, n).status === "done");
+  const failed = fg.nodeNames.filter((n) => tuningStateFor(which, n).status === "error");
+  const summary =
+    `Tuned ${succeeded.length}/${fg.nodeNames.length} node(s) successfully` +
+    (failed.length ? ` — failed: ${failed.map((n) => esc(n)).join(", ")}` : "");
+  return (
+    `<div class="wk-fullgraph">` +
+    `<div class="wk-tune-status">${summary}</div>` +
+    (succeeded.length
+      ? `<button type="button" class="wk-tune-btn" data-action="export-full-graph" data-which="${esc(which)}">Export full graph (${succeeded.length} winner${succeeded.length === 1 ? "" : "s"}) ↓</button> `
+      : "") +
+    `<button type="button" class="wk-tune-btn" data-action="tune-full-graph" data-which="${esc(which)}">Re-tune full graph</button>` +
+    `</div>`
+  );
+}
+
 function paneHtml(title, which, side) {
   if (!side) {
     return `<div class="wk-pane"><div class="wk-head">${esc(title)}</div><em>—</em></div>`;
@@ -166,7 +242,10 @@ function paneHtml(title, which, side) {
     ? `<div class="wk-tune-section-head">Tune a Conv kernel</div>` +
       side.tunableConvNodes.map((n) => tunableConvNodeHtml(n, which)).join("")
     : "";
-  return `<div class="wk-pane"><div class="wk-head">${esc(title)}</div>${attached}${tunable}</div>`;
+  return (
+    `<div class="wk-pane"><div class="wk-head">${esc(title)}</div>` +
+    `${fullGraphSectionHtml(which, side)}${attached}${tunable}</div>`
+  );
 }
 
 function render() {
@@ -207,6 +286,7 @@ function setSide(which, data, name) {
   for (const key of [...tuning.keys()]) {
     if (key.startsWith(`${which}:`)) tuning.delete(key);
   }
+  fullGraphTuning.delete(which);
   render();
 }
 
@@ -283,6 +363,111 @@ function handleExportClick(which, nodeName) {
   }
 }
 
+// Tunes every Conv node in the model, one at a time -- Pyodide/tinygrad load
+// once and stay cached across nodes (webgpu_kernel_tuner.mjs's own
+// module-level singleton), but each node's own dispatch loop still costs
+// real GPU time, so a model with many Conv nodes can take a while; that's
+// why this reports per-node progress rather than looking hung. A node that
+// throws (non-static shape, more than one scheduled kernel call, ...) is
+// recorded as failed in its own card and the batch moves on -- one bad node
+// doesn't block tuning the rest of the graph.
+async function handleTuneFullGraphClick(which) {
+  const side = state[which];
+  if (!side) return;
+  const fg = fullGraphStateFor(which);
+  if (fg.status === "running") return;
+
+  const nodeNames = allConvNodeNames(side);
+  fg.status = "running";
+  fg.nodeNames = nodeNames;
+  fg.doneCount = 0;
+  render();
+
+  const { tuneConvKernel } = await import("./webgpu_kernel_tuner.mjs");
+  let device;
+  try {
+    device = await getWebgpuDevice();
+  } catch (err) {
+    console.error(`webgpu kernel tuner (${which}, full graph): could not get a WebGPU device:`, err);
+    // No device at all -- every node fails the same way; still finish the
+    // batch (rather than leaving it stuck on "running") so the summary
+    // shows why.
+    for (const nodeName of nodeNames) {
+      const t = tuningStateFor(which, nodeName);
+      t.status = "error";
+      t.error = (err && err.message) || String(err);
+      fg.doneCount += 1;
+    }
+    fg.status = "done";
+    render();
+    return;
+  }
+
+  for (const nodeName of nodeNames) {
+    const t = tuningStateFor(which, nodeName);
+    t.status = "running";
+    t.log = [];
+    t.error = null;
+    t.result = null;
+    render();
+
+    try {
+      const result = await tuneConvKernel(device, side.bytes, nodeName, {
+        onProgress: (msg) => {
+          t.log.push(msg);
+          render();
+        },
+      });
+      t.status = "done";
+      t.result = result;
+    } catch (err) {
+      console.error(`webgpu kernel tuner (${which}/${nodeName}, full graph):`, err);
+      t.status = "error";
+      t.error = (err && err.message) || String(err);
+    }
+    fg.doneCount += 1;
+    render();
+  }
+
+  fg.status = "done";
+  // Test-observability only (mirrors window.__onnxsimConverted's own
+  // precedent) -- nothing reads this at runtime.
+  window.__wkLastFullGraphTuneResult = {
+    which,
+    nodeNames,
+    results: Object.fromEntries(nodeNames.map((n) => [n, tuningStateFor(which, n)])),
+  };
+  render();
+}
+
+// Chains attachWebgpuKernelSpec across every node that finished tuning
+// successfully -- the writer takes bytes-in/bytes-out, so folding N winners
+// into one export is just N sequential calls, no new low-level machinery.
+function handleExportFullGraphClick(which) {
+  const side = state[which];
+  const fg = fullGraphStateFor(which);
+  if (!side || fg.status !== "done") return;
+
+  let bytes = side.bytes;
+  let exportedCount = 0;
+  for (const nodeName of fg.nodeNames) {
+    const t = tuningStateFor(which, nodeName);
+    if (t.status !== "done" || !t.result) continue;
+    try {
+      bytes = attachWebgpuKernelSpec(bytes, nodeName, t.result.winner.spec);
+      exportedCount += 1;
+    } catch (err) {
+      console.error(`webgpu kernel export (${which}/${nodeName}, full graph):`, err);
+    }
+  }
+  if (exportedCount === 0) {
+    console.error(`webgpu kernel export (${which}, full graph): no successfully-tuned node to export`);
+    return;
+  }
+  const base = side.name.replace(/\.onnx$/i, "");
+  downloadBytes(bytes, `${base}.tuned-full-graph.onnx`);
+}
+
 function initWebgpuKernelsPanel() {
   render(); // draw the empty placeholder up front
 
@@ -294,6 +479,8 @@ function initWebgpuKernelsPanel() {
       const { action, which, node } = btn.dataset;
       if (action === "tune") handleTuneClick(which, node);
       else if (action === "export") handleExportClick(which, node);
+      else if (action === "tune-full-graph") handleTuneFullGraphClick(which);
+      else if (action === "export-full-graph") handleExportFullGraphClick(which);
     });
   }
 
