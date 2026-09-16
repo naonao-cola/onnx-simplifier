@@ -127,30 +127,48 @@ name: convertmodel WebGPU custom kernel dispatcher
 #     provably untouched.
 #
 #   * test/onnx_conv_node_reader.test.mjs -- REQUIRED, no browser. Unit-tests
-#     onnx_conv_node_reader.mjs's listConvNodeNames -- every Conv node in a
-#     model, not just already-flagged ones -- against real fixtures.
+#     onnx_conv_node_reader.mjs's listConvNodeNames (every Conv node in a
+#     model, not just already-flagged ones) and listAllNodeNames (the same,
+#     generalized to every node of any op type, used by the tuner's own
+#     "any op type" support) against real fixtures.
+#
+#   * test/webgpu_kernel_profile.test.mjs -- REQUIRED, no browser, no GPU,
+#     synthetic numbers only. Unit-tests webgpu_kernel_profile.mjs's
+#     selectDominantNodes -- the pure half of "profile first, then tune only
+#     the latency-dominant ops" (picks the smallest slowest-first subset
+#     whose combined time crosses a threshold fraction of the total). The
+#     live half (real per-node GPU timing) is covered by
+#     webgpu_kernel_tuner_ui.test.mjs's own profiling scenario below.
 #
 #   * test/webgpu_kernel_tuner_ui.test.mjs -- REQUIRED. The opt-in "Tune
 #     this kernel" button in the Custom WebGPU kernels panel
 #     (webgpu_kernel_annotations_view.mjs), driven end to end in the real
-#     converter page, for two scenarios: a fixture with an already-attached
-#     Conv kernel, and (a regression check -- this used to show no button at
+#     converter page, for three scenarios: a fixture with an already-attached
+#     Conv kernel; (a regression check -- this used to show no button at
 #     all, since the button only ever lived inside an already-attached
 #     entry, which is nearly no real upload) a plain Conv model with no
-#     kernel metadata attached. Each: clicks Tune (real Pyodide + tinygrad,
-#     live in the page, generating several candidates via
-#     onnxsim.webgpu_kernel_tuning's own approach), dispatches every
-#     candidate on a real WebGPU device, picks the fastest, clicks Export,
-#     and checks the downloaded model's attached kernel both matches the
-#     winner and still computes the right answer. Needs real network access
-#     from inside the browser page itself (Pyodide from jsdelivr, tinygrad's
-#     wheel from PyPI) -- see that test's own comment for how it was
-#     verified in this repo's own dev sandbox, whose egress policy denies
-#     jsdelivr specifically. Also drives a third scenario, the "Tune full
-#     graph" button, against a purpose-built two-Conv-node fixture
-#     (webgpu_kernel_tuning_multi_conv_fixture.onnx) -- one click tunes both
-#     nodes and one export carries both winners, proving the batching itself
-#     rather than just the same single-node path run twice.
+#     kernel metadata attached; and a non-Conv op (Gather -- a real "memory
+#     operation", unlike a pure view op such as Reshape/Transpose, which
+#     needs no dedicated kernel at all in isolation), proving the tuner's
+#     generalization beyond Conv via tinygrad's own OnnxRunner op table
+#     actually works end to end, including a non-float (int64) index input
+#     that can't go through the usual Float32Array-only buffer path. Each:
+#     clicks Tune (real Pyodide + tinygrad, live in the page, generating
+#     every candidate via onnxsim.webgpu_kernel_tuning's own approach, no
+#     cap), dispatches every candidate on a real WebGPU device, picks the
+#     fastest, clicks Export, and checks the downloaded model's attached
+#     kernel both matches the winner and still computes the right answer.
+#     Needs real network access from inside the browser page itself (Pyodide
+#     from jsdelivr, tinygrad's wheel from PyPI) -- see that test's own
+#     comment for how it was verified in this repo's own dev sandbox, whose
+#     egress policy denies jsdelivr specifically. Also drives a fourth
+#     scenario, the "Tune full graph" button, against a purpose-built
+#     two-Conv-node fixture (webgpu_kernel_tuning_multi_conv_fixture.onnx) --
+#     one click tunes both nodes and one export carries both winners,
+#     proving the batching itself rather than just the same single-node path
+#     run twice -- and a fifth, "Profile graph" -> "Tune dominant ops only"
+#     against the same fixture, proving the profile-first workflow actually
+#     measures both nodes and tunes exactly the dominant subset it picks.
 #
 # Scheduled + on demand, plus on PRs that touch the files this check depends
 # on, same reasoning as convertmodel-webgpu-demo.yml / convertmodel-ep-placement.yml.
@@ -209,6 +227,11 @@ on:
       - "scripts/convertmodel/webgpu_kernel_annotations_view.mjs"
       - "scripts/convertmodel/webgpu_kernel_tuner.mjs"
       - "scripts/convertmodel/test/webgpu_kernel_tuner_ui.test.mjs"
+      - "scripts/convertmodel/webgpu_kernel_profile.mjs"
+      - "scripts/convertmodel/test/webgpu_kernel_profile.test.mjs"
+      - "scripts/convertmodel/test/make_webgpu_node_tuning_fixture.py"
+      - "scripts/convertmodel/test/webgpu_node_tuning_gather_fixture.onnx"
+      - "scripts/convertmodel/test/webgpu_node_tuning_gather_fixture.json"
       - "scripts/convertmodel/onnx_conv_node_reader.mjs"
       - "scripts/convertmodel/test/onnx_conv_node_reader.test.mjs"
       - "scripts/convertmodel/download.mjs"
@@ -252,6 +275,9 @@ jobs:
       - name: Run the ONNX conv node reader unit test
         working-directory: scripts/convertmodel
         run: npm run test:onnx-conv-node-reader
+      - name: Run the WebGPU kernel profile (dominant-node selection) unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:webgpu-kernel-profile
 
   webgpu-kernel-dispatcher:
     name: WebGPU custom kernel dispatch (required)

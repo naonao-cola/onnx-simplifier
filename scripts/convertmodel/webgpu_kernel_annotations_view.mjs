@@ -10,30 +10,44 @@
 // does not run onnxsim.webgpu_target's own gap detection. The opt-in part is
 // the "Tune this kernel" button: click it and webgpu_kernel_tuner.mjs runs
 // the real browser-timed tuning loop (Pyodide + tinygrad, live, against a
-// real WebGPU device -- see that module's own docstring for scope and why
-// it's opt-in, not automatic) and offers an "Export tuned model" download
-// once a winner is picked, via onnx_metadata_writer.mjs's
-// attachWebgpuKernelSpec. This button isn't limited to nodes that already
-// carry a kernel spec -- onnxsim.webgpu_tinygrad_codegen's own server-side
-// gap-flagging only ever attaches one to the narrow Conv3D/align_corners-
-// Resize gaps onnxsim.webgpu_target detects, so almost no ordinary uploaded
-// model has any pre-attached kernel at all. `onnx_conv_node_reader.mjs`'s
-// listConvNodeNames lists every Conv node in the graph instead, and this
-// view offers the same tune UI on any of them that isn't already shown
-// above (see setSide's own comment). A **"Tune full graph…"** button per
-// side (see fullGraphSectionHtml/handleTuneFullGraphClick) tunes every Conv
-// node one after another instead of clicking each one by hand -- it drives
-// the exact same per-node state a single click would, so each node's own
-// card updates live as the batch works through it, then one "Export full
-// graph" button chains attachWebgpuKernelSpec across every node that
-// succeeded into a single download. Pyodide/tinygrad load once and stay
-// cached across nodes, but each node's own GPU dispatch loop still costs
-// real time, so this can take a while on a model with many Conv nodes -- a
-// node that fails to tune (non-static shape, more than one scheduled kernel
-// call, ...) is recorded on its own card and the batch moves on, it doesn't
-// abort the rest of the graph. Nothing here changes what Simplify/Optimize
-// themselves produce; a tuned export is a separate download the visitor
-// asks for.
+// real WebGPU device -- see that module's own docstring for scope: ANY op
+// type tinygrad's own OnnxRunner supports, not just Conv) and offers an
+// "Export tuned model" download once a winner is picked, via
+// onnx_metadata_writer.mjs's attachWebgpuKernelSpec. This button isn't
+// limited to nodes that already carry a kernel spec -- onnxsim's own
+// server-side gap-flagging only ever attaches one to the narrow
+// Conv3D/align_corners-Resize gaps onnxsim.webgpu_target detects, so almost
+// no ordinary uploaded model has any pre-attached kernel at all.
+// `onnx_conv_node_reader.mjs`'s listAllNodeNames lists every node in the
+// graph instead, and this view offers the same tune UI on any of them that
+// isn't already shown above (see setSide's own comment). A **"Tune full
+// graph…"** button per side (see fullGraphSectionHtml/
+// handleTuneFullGraphClick) tunes every node one after another instead of
+// clicking each one by hand -- it drives the exact same per-node state a
+// single click would, so each node's own card updates live as the batch
+// works through it, then one "Export full graph" button chains
+// attachWebgpuKernelSpec across every node that succeeded into a single
+// download. Pyodide/tinygrad load once and stay cached across nodes, but
+// each node's own GPU dispatch loop still costs real time, so this can take
+// a while on a model with many nodes -- a node that fails to tune
+// (non-static shape, unsupported op, more than one scheduled kernel call,
+// ...) is recorded on its own card and the batch moves on, it doesn't abort
+// the rest of the graph. A node tinygrad schedules to *zero* kernel calls in
+// isolation (a pure view op -- see webgpu_kernel_tuner.mjs's own docstring)
+// isn't a failure either, it's recorded as "nothing to tune".
+//
+// A **"Profile graph…"** button (profileSectionHtml/handleProfileClick) runs
+// first, cheaply: it renders and times just the *baseline* (unsearched)
+// kernel for every node, then webgpu_kernel_profile.mjs's
+// selectDominantNodes picks the smallest set of the slowest ones whose
+// combined time covers most of the model's own measured total -- the
+// resulting "Tune dominant ops only" button runs the exact same full-graph
+// tuning loop as above, restricted to that subset, so a model where a
+// handful of memory-bound ops (Gather/Concat/Pad/Slice/...) dominate real
+// latency doesn't need a full search spent on every cheap node too.
+//
+// Nothing here changes what Simplify/Optimize themselves produce; a tuned
+// export is a separate download the visitor asks for.
 //
 // Wiring mirrors the "Dynamic dimensions" panel (shapes_view.mjs): the
 // "before" side watches the file input directly and exposes a
@@ -48,14 +62,15 @@ import { dataUrlToArrayBuffer } from "./netron.mjs";
 import { listWebgpuKernelAnnotations } from "./webgpu_kernel_annotations.mjs";
 import { downloadBytes } from "./download.mjs";
 import { attachWebgpuKernelSpec } from "./onnx_metadata_writer.mjs";
-import { listConvNodeNames } from "./onnx_conv_node_reader.mjs";
+import { listAllNodeNames } from "./onnx_conv_node_reader.mjs";
+import { selectDominantNodes } from "./webgpu_kernel_profile.mjs";
 
 // Latest parsed state for each side: null until a model arrives there,
-// {bytes, name, annotations, tunableConvNodes} once parsed (annotations is
-// [] when nothing found; tunableConvNodes is every Conv node NOT already in
-// annotations -- see setSide's own comment on why this list exists at all).
-// Bytes are kept (not just the display summary) so a "Tune"/"Export" action
-// has something to tune/attach onto.
+// {bytes, name, annotations, tunableNodes} once parsed (annotations is []
+// when nothing found; tunableNodes is every node NOT already in annotations
+// -- see setSide's own comment on why this list exists at all). Bytes are
+// kept (not just the display summary) so a "Tune"/"Export" action has
+// something to tune/attach onto.
 const state = { before: null, after: null };
 
 // Tuning progress/results, keyed by `${which}:${nodeName}` so the "before"
@@ -78,10 +93,13 @@ function tuningStateFor(which, nodeName) {
 
 // One "Tune full graph" run per side -- drives the exact same per-node
 // `tuning` map entries a click on an individual node's own button would
-// (see handleTuneFullGraphClick), so every Conv node's own card updates
-// live as the batch works through it, instead of duplicating a whole
-// separate results display. Only tracks the batch's own overall progress;
-// a node's success/failure/result lives in `tuning` as usual.
+// (see handleTuneFullGraphClick), so every node's own card updates live as
+// the batch works through it, instead of duplicating a whole separate
+// results display. Only tracks the batch's own overall progress; a node's
+// success/failure/result lives in `tuning` as usual. `nodeNames` is
+// whichever subset was asked for -- every tunable node for a plain "Tune
+// full graph…" click, or just the profiler's own dominant subset for "Tune
+// dominant ops only".
 // {status: "idle"|"running"|"done", nodeNames: string[], doneCount: number}
 const fullGraphTuning = new Map();
 
@@ -92,11 +110,25 @@ function fullGraphStateFor(which) {
   return fullGraphTuning.get(which);
 }
 
-// Every Conv node for a side, already-annotated ones first (display order),
-// deduplicated -- tunableConvNodes is already filtered to exclude them (see
+// One "Profile graph" run per side -- see profileSectionHtml/
+// handleProfileClick. `results` is profileNodeLatency's own return value;
+// `dominant` is selectDominantNodes's pick from it, computed once profiling
+// finishes.
+// {status: "idle"|"running"|"done", results: Array, dominant: string[]}
+const profiling = new Map();
+
+function profileStateFor(which) {
+  if (!profiling.has(which)) {
+    profiling.set(which, { status: "idle", results: [], dominant: [] });
+  }
+  return profiling.get(which);
+}
+
+// Every node for a side, already-annotated ones first (display order),
+// deduplicated -- tunableNodes is already filtered to exclude them (see
 // setSide's own comment), so a plain concat is enough here.
-function allConvNodeNames(side) {
-  return [...side.annotations.map((a) => a.nodeName), ...side.tunableConvNodes];
+function allNodeNames(side) {
+  return [...side.annotations.map((a) => a.nodeName), ...side.tunableNodes];
 }
 
 function esc(s) {
@@ -135,6 +167,13 @@ function tuneResultHtml(which, nodeName, t) {
     );
   }
   // done
+  if (t.result.noKernel) {
+    return (
+      `${log}<div class="wk-tune-status">${esc(t.result.opType)} needs no dedicated WebGPU kernel in isolation ` +
+      `(a pure view op) -- nothing to tune here.</div>` +
+      `<button type="button" class="wk-tune-btn" data-action="tune" data-which="${esc(which)}" data-node="${esc(nodeName)}">Re-check</button>`
+    );
+  }
   const { results, winner } = t.result;
   const rows = results
     .map((r, i) => {
@@ -174,11 +213,11 @@ function annotationHtml(a, which) {
   );
 }
 
-// A Conv node with no kernel spec attached yet -- just its name and the same
+// A node with no kernel spec attached yet -- just its name and the same
 // tune UI an already-annotated node gets, so "Tune this kernel" is
-// discoverable on a plain, never-flagged Conv node too (see setSide's own
+// discoverable on a plain, never-flagged node too (see setSide's own
 // comment: this is the common case, not the exception).
-function tunableConvNodeHtml(nodeName, which) {
+function tunableNodeHtml(nodeName, which) {
   const t = tuningStateFor(which, nodeName);
   return (
     `<div class="wk-node">` +
@@ -188,36 +227,46 @@ function tunableConvNodeHtml(nodeName, which) {
   );
 }
 
-// The single "Tune every Conv node in this model" entry point -- sits above
-// the per-node lists since it's the fastest way to get a fully-tuned export
-// for a model with more than a couple of Conv nodes (clicking each one's own
+// The single "Tune every node in this model" entry point -- sits above the
+// per-node lists since it's the fastest way to get a fully-tuned export for
+// a model with more than a couple of tunable nodes (clicking each one's own
 // button is still there for a single node, or to re-tune one node after a
 // full-graph run). Not shown at all when there's nothing to tune.
-function fullGraphSectionHtml(which, side) {
-  const nodeNames = allConvNodeNames(side);
+//
+// `restrictTo`, when set (a non-empty node-name array), narrows both the
+// button's own label and what a click actually tunes to that subset --
+// that's the profiler's own dominant-node list, for "Tune dominant ops
+// only" (see profileSectionHtml). Left unset, this offers every tunable
+// node, same as before profiling existed at all.
+function fullGraphSectionHtml(which, side, restrictTo) {
+  const nodeNames = restrictTo && restrictTo.length ? restrictTo : allNodeNames(side);
   if (nodeNames.length === 0) return "";
   const fg = fullGraphStateFor(which);
+  const label = restrictTo && restrictTo.length ? "Tune dominant ops only" : "Tune full graph…";
+  const action = restrictTo && restrictTo.length ? "tune-dominant" : "tune-full-graph";
 
   if (fg.status === "idle") {
     return (
       `<div class="wk-fullgraph">` +
-      `<button type="button" class="wk-tune-btn" data-action="tune-full-graph" data-which="${esc(which)}">` +
-      `Tune full graph… (${nodeNames.length} Conv node${nodeNames.length === 1 ? "" : "s"})</button>` +
+      `<button type="button" class="wk-tune-btn" data-action="${action}" data-which="${esc(which)}">` +
+      `${esc(label)} (${nodeNames.length} node${nodeNames.length === 1 ? "" : "s"})</button>` +
       `</div>`
     );
   }
   if (fg.status === "running") {
     return (
       `<div class="wk-fullgraph">` +
-      `<div class="wk-tune-status">Tuning full graph… (${fg.doneCount}/${fg.nodeNames.length} node(s) done)</div>` +
+      `<div class="wk-tune-status">Tuning… (${fg.doneCount}/${fg.nodeNames.length} node(s) done)</div>` +
       `</div>`
     );
   }
   // done -- tally each node's own (already-updated) tuning state.
-  const succeeded = fg.nodeNames.filter((n) => tuningStateFor(which, n).status === "done");
+  const succeeded = fg.nodeNames.filter((n) => tuningStateFor(which, n).status === "done" && tuningStateFor(which, n).result?.winner);
+  const noKernel = fg.nodeNames.filter((n) => tuningStateFor(which, n).status === "done" && tuningStateFor(which, n).result?.noKernel);
   const failed = fg.nodeNames.filter((n) => tuningStateFor(which, n).status === "error");
   const summary =
     `Tuned ${succeeded.length}/${fg.nodeNames.length} node(s) successfully` +
+    (noKernel.length ? ` — ${noKernel.length} needed no kernel` : "") +
     (failed.length ? ` — failed: ${failed.map((n) => esc(n)).join(", ")}` : "");
   return (
     `<div class="wk-fullgraph">` +
@@ -225,7 +274,48 @@ function fullGraphSectionHtml(which, side) {
     (succeeded.length
       ? `<button type="button" class="wk-tune-btn" data-action="export-full-graph" data-which="${esc(which)}">Export full graph (${succeeded.length} winner${succeeded.length === 1 ? "" : "s"}) ↓</button> `
       : "") +
-    `<button type="button" class="wk-tune-btn" data-action="tune-full-graph" data-which="${esc(which)}">Re-tune full graph</button>` +
+    `<button type="button" class="wk-tune-btn" data-action="${action}" data-which="${esc(which)}">Re-tune</button>` +
+    `</div>`
+  );
+}
+
+// "Profile graph…" -- see this module's own docstring. Sits above the
+// per-node lists too, alongside "Tune full graph…": running it first is
+// optional (a visitor can always just tune everything, or one node at a
+// time), but on a model with many tunable nodes it's the fast way to find
+// out which ones are worth a full search at all.
+function profileSectionHtml(which, side) {
+  const nodeNames = allNodeNames(side);
+  if (nodeNames.length === 0) return "";
+  const p = profileStateFor(which);
+
+  if (p.status === "idle") {
+    return (
+      `<div class="wk-fullgraph">` +
+      `<button type="button" class="wk-tune-btn" data-action="profile-graph" data-which="${esc(which)}">` +
+      `Profile graph… (${nodeNames.length} node${nodeNames.length === 1 ? "" : "s"})</button>` +
+      `</div>`
+    );
+  }
+  if (p.status === "running") {
+    return `<div class="wk-fullgraph"><div class="wk-tune-status">Profiling…</div></div>`;
+  }
+  // done
+  const rows = p.results
+    .map((r) => {
+      if (r.skipped) {
+        return `<tr><td><code>${esc(r.nodeName)}</code></td><td>${esc(r.opType || "?")}</td><td colspan="1">skipped${r.error ? `: ${esc(r.error)}` : ""}</td></tr>`;
+      }
+      const dominant = p.dominant.includes(r.nodeName) ? " class=\"wk-tune-winner\"" : "";
+      return `<tr${dominant}><td><code>${esc(r.nodeName)}</code></td><td>${esc(r.opType)}</td><td>${r.medianMs.toFixed(3)}ms</td></tr>`;
+    })
+    .join("");
+  return (
+    `<div class="wk-fullgraph">` +
+    `<table class="wk-tune-table"><thead><tr><th>node</th><th>op</th><th>baseline median time</th></tr></thead>` +
+    `<tbody>${rows}</tbody></table>` +
+    `${fullGraphSectionHtml(which, side, p.dominant)}` +
+    `<button type="button" class="wk-tune-btn" data-action="profile-graph" data-which="${esc(which)}">Re-profile</button>` +
     `</div>`
   );
 }
@@ -238,13 +328,12 @@ function paneHtml(title, which, side) {
     side.annotations.length === 0
       ? `<em>no custom WebGPU kernels attached</em>`
       : side.annotations.map((a) => annotationHtml(a, which)).join("");
-  const tunable = side.tunableConvNodes.length
-    ? `<div class="wk-tune-section-head">Tune a Conv kernel</div>` +
-      side.tunableConvNodes.map((n) => tunableConvNodeHtml(n, which)).join("")
+  const tunable = side.tunableNodes.length
+    ? `<div class="wk-tune-section-head">Tune a kernel</div>` + side.tunableNodes.map((n) => tunableNodeHtml(n, which)).join("")
     : "";
   return (
     `<div class="wk-pane"><div class="wk-head">${esc(title)}</div>` +
-    `${fullGraphSectionHtml(which, side)}${attached}${tunable}</div>`
+    `${profileSectionHtml(which, side)}${fullGraphSectionHtml(which, side)}${attached}${tunable}</div>`
   );
 }
 
@@ -267,15 +356,24 @@ function setSide(which, data, name) {
     // gap-flagging, so `annotations` is empty for nearly every real upload --
     // the "Tune this kernel" button must not live only inside an
     // already-attached entry (see this module's own docstring for why that
-    // was too narrow), so every OTHER Conv node in the graph gets offered
-    // here too, deduplicated against the ones already shown above.
-    let tunableConvNodes = [];
+    // was too narrow), so every OTHER node in the graph gets offered here
+    // too (default domain only -- a custom-domain op has no entry in
+    // tinygrad's own OnnxRunner op table at all, so there's nothing to
+    // offer), deduplicated against the ones already shown above and against
+    // an unnamed node (webgpu_kernel_tuner.mjs looks a node up by name, so
+    // one with no name -- or two sharing a name -- can't be addressed
+    // unambiguously here).
+    let tunableNodes = [];
     try {
-      tunableConvNodes = listConvNodeNames(bytes).filter((n) => !alreadyAnnotated.has(n));
+      const seen = new Set();
+      tunableNodes = listAllNodeNames(bytes)
+        .filter((n) => n.name && (n.domain === "" || n.domain === "ai.onnx") && !alreadyAnnotated.has(n.name))
+        .filter((n) => (seen.has(n.name) ? false : (seen.add(n.name), true)))
+        .map((n) => n.name);
     } catch (err) {
-      console.error(`webgpu kernels (${which}) conv node listing:`, err);
+      console.error(`webgpu kernels (${which}) node listing:`, err);
     }
-    state[which] = { bytes, name: name || "model.onnx", annotations, tunableConvNodes };
+    state[which] = { bytes, name: name || "model.onnx", annotations, tunableNodes };
   } catch (err) {
     console.error(`webgpu kernels (${which}):`, err);
     state[which] = null;
@@ -287,13 +385,14 @@ function setSide(which, data, name) {
     if (key.startsWith(`${which}:`)) tuning.delete(key);
   }
   fullGraphTuning.delete(which);
+  profiling.delete(which);
   render();
 }
 
 // Lazily creates (and caches) one WebGPU device, shared by every tuning run
 // on this page -- matches the pattern the webgpu_kernel_tuning*.test.mjs
 // files use, requesting the timestamp-query feature when available so GPU
-// durations show up alongside the wall-clock ones tuneConvKernel always
+// durations show up alongside the wall-clock ones tuneNodeKernel always
 // reports.
 let devicePromise = null;
 function getWebgpuDevice() {
@@ -326,9 +425,9 @@ async function handleTuneClick(which, nodeName) {
   render();
 
   try {
-    const { tuneConvKernel } = await import("./webgpu_kernel_tuner.mjs");
+    const { tuneNodeKernel } = await import("./webgpu_kernel_tuner.mjs");
     const device = await getWebgpuDevice();
-    const result = await tuneConvKernel(device, side.bytes, nodeName, {
+    const result = await tuneNodeKernel(device, side.bytes, nodeName, {
       onProgress: (msg) => {
         t.log.push(msg);
         render();
@@ -350,7 +449,7 @@ async function handleTuneClick(which, nodeName) {
 function handleExportClick(which, nodeName) {
   const side = state[which];
   const t = tuningStateFor(which, nodeName);
-  if (!side || t.status !== "done" || !t.result) return;
+  if (!side || t.status !== "done" || !t.result || !t.result.winner) return;
   try {
     const updated = attachWebgpuKernelSpec(side.bytes, nodeName, t.result.winner.spec);
     const base = side.name.replace(/\.onnx$/i, "");
@@ -363,27 +462,29 @@ function handleExportClick(which, nodeName) {
   }
 }
 
-// Tunes every Conv node in the model, one at a time -- Pyodide/tinygrad load
-// once and stay cached across nodes (webgpu_kernel_tuner.mjs's own
-// module-level singleton), but each node's own dispatch loop still costs
-// real GPU time, so a model with many Conv nodes can take a while; that's
-// why this reports per-node progress rather than looking hung. A node that
-// throws (non-static shape, more than one scheduled kernel call, ...) is
-// recorded as failed in its own card and the batch moves on -- one bad node
-// doesn't block tuning the rest of the graph.
-async function handleTuneFullGraphClick(which) {
+// Tunes every node in `nodeNames` (every tunable node in the model, or just
+// the profiler's own dominant subset -- see fullGraphSectionHtml), one at a
+// time -- Pyodide/tinygrad load once and stay cached across nodes
+// (webgpu_kernel_tuner.mjs's own module-level singleton), but each node's
+// own dispatch loop still costs real GPU time, so a model with many nodes
+// can take a while; that's why this reports per-node progress rather than
+// looking hung. A node that throws (non-static shape, unsupported op, more
+// than one scheduled kernel call, ...) is recorded as failed in its own card
+// and the batch moves on -- one bad node doesn't block tuning the rest of
+// the graph. A node tinygrad schedules to zero kernel calls in isolation is
+// recorded as "done" with a `noKernel` result, not a failure.
+async function handleTuneFullGraphClick(which, nodeNames) {
   const side = state[which];
   if (!side) return;
   const fg = fullGraphStateFor(which);
   if (fg.status === "running") return;
 
-  const nodeNames = allConvNodeNames(side);
   fg.status = "running";
   fg.nodeNames = nodeNames;
   fg.doneCount = 0;
   render();
 
-  const { tuneConvKernel } = await import("./webgpu_kernel_tuner.mjs");
+  const { tuneNodeKernel } = await import("./webgpu_kernel_tuner.mjs");
   let device;
   try {
     device = await getWebgpuDevice();
@@ -412,7 +513,7 @@ async function handleTuneFullGraphClick(which) {
     render();
 
     try {
-      const result = await tuneConvKernel(device, side.bytes, nodeName, {
+      const result = await tuneNodeKernel(device, side.bytes, nodeName, {
         onProgress: (msg) => {
           t.log.push(msg);
           render();
@@ -452,7 +553,7 @@ function handleExportFullGraphClick(which) {
   let exportedCount = 0;
   for (const nodeName of fg.nodeNames) {
     const t = tuningStateFor(which, nodeName);
-    if (t.status !== "done" || !t.result) continue;
+    if (t.status !== "done" || !t.result || !t.result.winner) continue;
     try {
       bytes = attachWebgpuKernelSpec(bytes, nodeName, t.result.winner.spec);
       exportedCount += 1;
@@ -468,6 +569,43 @@ function handleExportFullGraphClick(which) {
   downloadBytes(bytes, `${base}.tuned-full-graph.onnx`);
 }
 
+// The "profile first" half of the workflow -- see this module's own
+// docstring. Renders and times just the baseline kernel for every tunable
+// node (cheap, no candidate search), then picks the dominant subset via
+// selectDominantNodes so "Tune dominant ops only" (see
+// fullGraphSectionHtml's own `restrictTo`) has something to act on.
+async function handleProfileClick(which) {
+  const side = state[which];
+  if (!side) return;
+  const p = profileStateFor(which);
+  if (p.status === "running") return;
+
+  const nodeNames = allNodeNames(side);
+  p.status = "running";
+  p.results = [];
+  p.dominant = [];
+  render();
+
+  try {
+    const { profileNodeLatency } = await import("./webgpu_kernel_tuner.mjs");
+    const device = await getWebgpuDevice();
+    const results = await profileNodeLatency(device, side.bytes, nodeNames, {
+      onProgress: () => render(),
+    });
+    p.results = results;
+    p.dominant = selectDominantNodes(results);
+    // Test-observability only (mirrors window.__onnxsimConverted's own
+    // precedent) -- nothing reads this at runtime.
+    window.__wkLastProfileResult = { which, results, dominant: p.dominant };
+  } catch (err) {
+    console.error(`webgpu kernel profiler (${which}):`, err);
+    p.results = [{ nodeName: "(profiling)", opType: null, medianMs: 0, skipped: true, error: (err && err.message) || String(err) }];
+    p.dominant = [];
+  }
+  p.status = "done";
+  render();
+}
+
 function initWebgpuKernelsPanel() {
   render(); // draw the empty placeholder up front
 
@@ -479,7 +617,9 @@ function initWebgpuKernelsPanel() {
       const { action, which, node } = btn.dataset;
       if (action === "tune") handleTuneClick(which, node);
       else if (action === "export") handleExportClick(which, node);
-      else if (action === "tune-full-graph") handleTuneFullGraphClick(which);
+      else if (action === "profile-graph") handleProfileClick(which);
+      else if (action === "tune-dominant") handleTuneFullGraphClick(which, profileStateFor(which).dominant);
+      else if (action === "tune-full-graph") handleTuneFullGraphClick(which, state[which] ? allNodeNames(state[which]) : []);
       else if (action === "export-full-graph") handleExportFullGraphClick(which);
     });
   }

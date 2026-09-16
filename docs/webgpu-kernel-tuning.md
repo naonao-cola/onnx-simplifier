@@ -78,7 +78,8 @@ scheduled kernel call gets candidates enumerated independently per call;
 this module does not attempt to jointly tune across calls, and there is no
 persistence/caching layer yet for a picked winner (e.g. keyed by GPU
 vendor/browser) -- a caller re-runs the whole dispatch-and-compare loop
-every time today.
+every time today. There is no cap on how many candidates get generated --
+every one `get_kernel_actions` finds is dispatched and timed.
 
 ## How much could tinygrad's tuned kernel outperform WebNN?
 
@@ -136,41 +137,85 @@ Everything above ran offline (a Python script) or through a Node+Playwright
 test -- useful for proving the idea, but not something a visitor to the
 actual converter page (`scripts/convertmodel/index.html`) could ever trigger
 themselves. `scripts/convertmodel/webgpu_kernel_tuner.mjs` closes that gap: an
-opt-in **"Tune this kernel…"** button on every `Conv` node in the loaded
-model, in the existing "Custom WebGPU kernels" panel
+opt-in **"Tune this kernel…"** button on every node in the loaded model, in
+the existing "Custom WebGPU kernels" panel
 (`webgpu_kernel_annotations_view.mjs`), runs the *entire* loop above live, in
-the browser, no server involved. This includes Conv nodes that don't already
+the browser, no server involved. This includes nodes that don't already
 carry any kernel metadata -- which is nearly every real upload, since
 `onnxsim.webgpu_tinygrad_codegen`'s own server-side gap-flagging only ever
 attaches one for the narrow Conv3D/align_corners-Resize cases
 `onnxsim.webgpu_target` detects. (An earlier version of this button lived
 only inside an already-attached node's own entry, so it never showed up at
 all on an ordinary model -- fixed by having `onnx_conv_node_reader.mjs`'s
-`listConvNodeNames` list every Conv node in the graph, and offering the same
-tune UI on any of them not already shown above; see
+`listAllNodeNames` list every node in the graph, and offering the same tune
+UI on any of them not already shown above; see
 `webgpu_kernel_annotations_view.mjs`'s own `setSide` for the fix and
 `test/webgpu_kernel_tuner_ui.test.mjs`'s "plain Conv node" scenario for the
 regression check.)
 
-1. **Generation, live, via Pyodide.** `onnx_conv_node_reader.mjs` reads the
-   target node's shapes/attributes straight out of the model bytes already in
-   the page (no re-upload). `webgpu_kernel_tuner.mjs` then boots
+### Any op type, not just Conv
+
+The button isn't Conv-only: `tuneNodeKernel` drives **tinygrad's own generic
+ONNX importer** (`tinygrad.nn.onnx.OnnxRunner`) instead of a hand-written
+per-op-type translation, so it can tune a node of *any* op type that
+importer supports -- Gather, Transpose, Concat, Pad, Slice, elementwise, and
+so on, not only Conv. Two problems this has to solve that Conv-only tuning
+didn't:
+
+- **Isolating one node's own kernel.** Same trick as the original Conv-only
+  implementation: rebuild *only* the target node's computation from fresh
+  random leaf tensors (never the real, chained whole-graph tensors), so
+  tinygrad's scheduler can't fuse it with a neighbor. This is what lets a
+  caller swap in exactly one node's own kernel without touching the rest of
+  the exported graph. A node whose isolated computation needs *zero* kernel
+  calls (a pure view op -- a contiguous `Reshape`/`Transpose`/`Squeeze` that
+  needs no data movement on its own) is a normal outcome, not an error --
+  the panel shows "needs no dedicated WebGPU kernel in isolation" instead of
+  a candidate table. A node that schedules to *more* than one kernel call in
+  isolation still isn't supported (same restriction Conv-only tuning always
+  had) and raises a clear error.
+- **Resolving "python-const" inputs without a real device.** Some ops take a
+  *structural* argument as a second tensor input rather than an attribute
+  (`Reshape`'s target shape, `Slice`'s starts/ends/axes, ...) --
+  `tinygrad.nn.onnx.required_input_python_consts` marks which. Resolving one
+  needs `Tensor.tolist()`, which needs to *realize* that tensor -- but
+  realizing **any** WEBGPU-tagged tensor for any reason tries to load
+  tinygrad's native wgpu-backed device library, which doesn't exist inside
+  Pyodide (or most native builds without it installed). So this runs the
+  *whole* graph once, for real, on tinygrad's "PYTHON" device -- a
+  pure-Python UOp interpreter needing no native library at all, the one
+  tinygrad device that actually works inside Pyodide -- purely to learn
+  every python-const value and real shape/dtype the target node needs, then
+  rebuilds that node's isolated computation on a *separate*, never-realized
+  WEBGPU-tagged instance using those resolved values. See
+  `webgpu_kernel_tuner.mjs`'s own module docstring for the full two-pass
+  design.
+
+Verified end to end in `test/webgpu_kernel_tuner_ui.test.mjs`'s own Gather
+scenario (`make_webgpu_node_tuning_fixture.py`) -- a real "memory operation"
+(unlike a pure view op, Gather still needs its own dedicated kernel even in
+isolation) with a non-python-const, non-float index input, proving the
+generalization beyond Conv/float pipelines specifically, not just a renamed
+copy of the same Conv path.
+
+1. **Generation, live, via Pyodide.** `webgpu_kernel_tuner.mjs` boots
    [Pyodide](https://pyodide.org/) (loaded from a CDN on first use, not
    bundled into the page) and fetches tinygrad's wheel straight from PyPI --
-   the same numpy-free, onnx-free technique
-   `pyodide_webgpu_single_node_codegen.test.mjs` already proved works for a
-   single kernel, extended here to `onnxsim.webgpu_kernel_tuning`'s own
+   the same numpy-free, onnx-free-Python-package technique
+   `pyodide_webgpu_onnxrunner_codegen.test.mjs` already proved works for a
+   whole graph, extended here to `onnxsim.webgpu_kernel_tuning`'s own
    `Scheduler`/`get_kernel_actions` approach so *several* candidates come
-   back, not just one. Both downloads are real, multi-second, multi-megabyte
-   fetches -- nothing loads until the button is clicked, and a second tuning
-   run (same node or a different one) reuses the already-booted runtime.
+   back for one isolated node, not just tinygrad's own default rendering.
+   Both downloads are real, multi-second, multi-megabyte fetches -- nothing
+   loads until the button is clicked, and a second tuning run (same node or
+   a different one) reuses the already-booted runtime.
 2. **Dispatch, live, on a real device.** Every candidate is dispatched via
-   the page's own `webgpu_kernel_dispatcher.mjs` against random data matching
-   the node's real shapes (see `webgpu_kernel_tuner.mjs`'s own docstring for
-   why random data is exactly as valid here as real pipeline data would be --
-   picking a winner is about speed, and kernel generation never depends on
-   concrete values), timed the same way `webgpu_kernel_tuning_vs_webnn.test.mjs`
-   times its own candidates, ranked, fastest first.
+   the page's own `webgpu_kernel_dispatcher.mjs` against zero-filled buffers
+   sized to the node's real shapes (see `webgpu_kernel_tuner.mjs`'s own
+   docstring for why concrete values don't matter here -- picking a winner
+   is about speed, and kernel generation never depends on them), timed the
+   same way `webgpu_kernel_tuning_vs_webnn.test.mjs` times its own
+   candidates, ranked, fastest first.
 3. **Export.** Clicking **"Export tuned model"** attaches the winning
    candidate's `WebgpuKernelSpec` onto that exact node via
    `onnx_metadata_writer.mjs`'s `attachWebgpuKernelSpec` -- the write-side
@@ -186,34 +231,29 @@ regression check.)
    about Simplify/Optimize themselves changes -- a tuned export is a separate
    download, on top of whatever model bytes are already in the page.
 
-Scope matches `onnx_conv_node_reader.mjs`'s own: a `Conv` node (any spatial
-rank, including what this repo calls "Conv3D") with fully static shapes, and
-only when tinygrad schedules it to exactly one kernel call. Clicking Tune on
-anything else surfaces `readConvNodeInfo`'s own clear error rather than
-silently doing nothing.
-
 ## Tuning the whole graph in one click
 
-Clicking each Conv node's own "Tune this kernel…" button one at a time works
-fine for a handful of nodes, but doesn't scale to a real model with a dozen
-or more. A **"Tune full graph…"** button (once per side, shown whenever the
-model has at least one Conv node) runs the exact same per-node loop above
-for every Conv node in sequence:
+Clicking each node's own "Tune this kernel…" button one at a time works fine
+for a handful of nodes, but doesn't scale to a real model with a dozen or
+more. A **"Tune full graph…"** button (once per side, shown whenever the
+model has at least one tunable node) runs the exact same per-node loop above
+for every node in sequence:
 
 - Pyodide and tinygrad's wheel load once and stay cached across nodes
   (`webgpu_kernel_tuner.mjs`'s own module-level singleton), but each node's
   own candidate-dispatch loop still costs real GPU time, so tuning a model
-  with many Conv nodes can take a while -- the button reports live
-  per-node progress (`N/M done`) rather than looking hung, and each node's
-  own card in the panel updates as the batch reaches it (the batch drives
-  the exact same per-node state a single click would, nothing is
-  duplicated).
-- A node that fails to tune (non-static shape, more than one scheduled
-  kernel call, ...) is recorded as failed on its own card and the batch
-  moves on to the next node -- one bad node doesn't block tuning the rest
-  of the graph.
+  with many nodes can take a while -- the button reports live per-node
+  progress (`N/M done`) rather than looking hung, and each node's own card
+  in the panel updates as the batch reaches it (the batch drives the exact
+  same per-node state a single click would, nothing is duplicated).
+- A node that fails to tune (non-static shape, unsupported op, more than
+  one scheduled kernel call, ...) is recorded as failed on its own card and
+  the batch moves on to the next node -- one bad node doesn't block tuning
+  the rest of the graph. A node that schedules to zero kernel calls in
+  isolation (a pure view op) is recorded as done with nothing to export,
+  not a failure.
 - **"Export full graph"** chains `attachWebgpuKernelSpec` across every node
-  that tuned successfully into a single download -- the writer's own
+  that tuned to a real kernel into a single download -- the writer's own
   bytes-in/bytes-out shape makes this a plain loop, no new low-level
   machinery needed.
 
