@@ -1,12 +1,20 @@
-# Cardputer firmware recipe
+# Cardputer firmware
 
-Not a buildable project checked into this repo — a recipe for building one
-locally, since it needs the Arduino/PlatformIO toolchain, the TFLite Micro
-runtime, and (for audio) M5Stack's own board library, none of which belong
-vendored into `onnxsim`. **Status: not verified against real hardware** —
-there is no Cardputer attached to the environment this was written in; the
-steps below are reviewed against each project's own docs, not run end to
-end. Treat this as a starting point, not a tested build.
+**Recommended: use the prebuilt generic runtime** — see
+[`runtime/README.md`](runtime/README.md). It's a real, compiled,
+checksummed image (`runtime/prebuilt/cardputer-runtime.bin`): flash it once
+at `0x0`, and every model swap after that is just a second Web Serial write
+of a `.tflite` file's bytes at a fixed offset (`0x310000`) — no PlatformIO,
+no compiler, no rebuild, ever, in that loop. It is still **not verified
+against real hardware** (no Cardputer attached to the environment this was
+built in) — the ELF links and sizes fit, but nobody has powered on a board
+with it yet.
+
+The rest of this page is the older alternative: baking one specific model
+directly into the firmware as a C array, producing a single self-contained
+binary with no separate "model" partition. Use it if you specifically want
+that (e.g. no interest in ever swapping models on this device), otherwise
+prefer the runtime above.
 
 ## Why audio (keyword spotting), not vision
 
@@ -27,8 +35,8 @@ framework = arduino
 board_build.flash_size = 8MB
 board_build.partitions = huge_app.csv   ; app needs room for TFLite Micro + model
 lib_deps =
-    tanakamasayuki/TensorFlowLite_ESP32   ; or chirale/Chirale_TensorFlowLite
-    m5stack/M5Unified                     ; Cardputer's keyboard/screen/mic HAL
+    m5stack/M5Cardputer                   ; Cardputer's keyboard/screen/mic HAL (confirmed on the PlatformIO registry)
+    spaziochirale/Chirale_TensorFLowLite   ; TFLite Micro, generated from the upstream tflite-micro sources (confirmed buildable -- see runtime/)
 ```
 
 There is no dedicated PlatformIO board id for Cardputer as of this writing —
@@ -52,7 +60,9 @@ const tflite::Model* model = tflite::GetModel(g_model);
 Everything else — the `tflite::MicroInterpreter` setup, op resolver, and the
 mic-capture loop — follows TFLite Micro's own `micro_speech` example
 (https://github.com/tensorflow/tflite-micro/tree/main/tensorflow/lite/micro/examples/micro_speech)
-almost unchanged; swap its `AudioProvider` for `M5Cardputer.Mic` reads.
+almost unchanged (`runtime/src/main.cpp` has a real, compiled version of the
+`MicroInterpreter`/`AllOpsResolver` setup to copy from); swap its
+`AudioProvider` for `M5Cardputer.Mic` reads.
 
 ## 3. Build a single flashable image
 
@@ -63,7 +73,7 @@ table + app by default, so do it explicitly after `pio run`:
 ```sh
 pio run -e cardputer
 esptool.py --chip esp32s3 merge_bin -o merged-firmware.bin \
-    --flash_mode dio --flash_freq 40m --flash_size 8MB \
+    --flash_mode qio --flash_freq 80m --flash_size 8MB \
     0x0     .pio/build/cardputer/bootloader.bin \
     0x8000  .pio/build/cardputer/partitions.bin \
     0x10000 .pio/build/cardputer/firmware.bin
@@ -71,3 +81,10 @@ esptool.py --chip esp32s3 merge_bin -o merged-firmware.bin \
 
 `merged-firmware.bin` is what you pick in the Web Serial panel's file input,
 flashed at `0x0`.
+
+`--flash_mode qio --flash_freq 80m` (not `dio`/`40m`, this section's own
+earlier guess): confirmed against `esp32-s3-devkitc-1`'s actual PlatformIO
+board manifest (`f_flash: 80000000L, flash_mode: qio`) while building
+`runtime/`, not assumed — a mismatched flash mode in the merged image's
+header is exactly the kind of thing that compiles fine and then fails
+silently on real hardware.

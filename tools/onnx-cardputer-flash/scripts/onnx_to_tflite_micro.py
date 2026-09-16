@@ -83,18 +83,25 @@ def emit_c_header(data: bytes, var_name: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("onnx_model", type=Path, help="simplified/quantized .onnx file")
-    parser.add_argument("out_header", type=Path, help="C header to write")
-    parser.add_argument("--var-name", default="g_model", help="C array name (default: g_model)")
+    parser.add_argument("out_path", type=Path,
+                         help="where to write the result -- a .tflite extension writes the plain "
+                              "converted model (for the runtime firmware's flash-partition load path, "
+                              "see ../firmware/runtime/README.md); anything else writes a C header")
+    parser.add_argument("--var-name", default="g_model", help="C array name (default: g_model, .h output only)")
     parser.add_argument("--tflite-dir", type=Path, default=None,
-                         help="where onnx2tf writes its outputs (default: alongside out_header)")
+                         help="where onnx2tf writes its outputs (default: alongside out_path)")
     parser.add_argument("--no-int8", action="store_true", help="keep float32 instead of quantizing")
     args = parser.parse_args(argv)
 
-    tflite_dir = args.tflite_dir or args.out_header.parent / "tflite_out"
+    tflite_dir = args.tflite_dir or args.out_path.parent / "tflite_out"
     tflite_path = convert_to_tflite(args.onnx_model, tflite_dir, quant_int8=not args.no_int8)
-    header = emit_c_header(tflite_path.read_bytes(), args.var_name)
-    args.out_header.write_text(header)
-    print(f"wrote {args.out_header} ({tflite_path.stat().st_size} bytes from {tflite_path.name})")
+
+    if args.out_path.suffix == ".tflite":
+        args.out_path.write_bytes(tflite_path.read_bytes())
+    else:
+        header = emit_c_header(tflite_path.read_bytes(), args.var_name)
+        args.out_path.write_text(header)
+    print(f"wrote {args.out_path} ({tflite_path.stat().st_size} bytes from {tflite_path.name})")
     return 0
 
 

@@ -29,7 +29,7 @@ Serial was picked over WebUSB for this class of board).
 | Fetch + simplify/quantize an HF model | the existing [onnxsim model converter](../convertmodel/index.html) — this tool doesn't repeat that UI | already shipped, unrelated to this addition |
 | ONNX → TFLite (int8) | `scripts/onnx_to_tflite_micro.py` (`convert_to_tflite`, wraps `onnx2tf`) | reviewed, not run in CI (needs onnx2tf + TensorFlow, not installed anywhere else in this repo) |
 | TFLite → C header | `scripts/onnx_to_tflite_micro.py` (`emit_c_header`) | unit-tested, see `tests/` |
-| Firmware build (TFLite Micro + model) | `firmware/README.md` (recipe, not a checked-in project) | reviewed against upstream docs, not built/run — no hardware here |
+| Firmware (generic TFLite Micro runtime) | [`firmware/runtime/`](firmware/runtime/README.md) — a real PlatformIO project, not just a recipe | **compiled and linked for real** (RAM 40.2%, flash 24.2% of the app partition); the merged, checksummed image is committed at `firmware/runtime/prebuilt/cardputer-runtime.bin` |
 | Flash over Web Serial | `web/flasher.mjs` (Espressif's `esptool-js`) | loads and runs its UI logic cleanly in a browser (checked headless); **not** exercised against a real board — no ESP32-S3 attached to this environment |
 
 Nothing here claims to be hardware-verified end to end — that step needs a
@@ -39,16 +39,26 @@ stale.
 
 ## Using it
 
-1. Simplify/quantize your model with the
-   [onnxsim converter](../convertmodel/index.html), download the result.
-2. `pip install onnx2tf` (pulls in TensorFlow), then:
+1. **Once per board:** serve `web/` locally (`python3 -m http.server` from
+   `web/`), open it in Chrome/Edge, Connect, pick
+   `firmware/runtime/prebuilt/cardputer-runtime.bin`, flash at `0x0`.
+2. Simplify/quantize your model with the
+   [onnxsim converter](../convertmodel/index.html) (the candidate-model
+   table on this tool's own page has one-click links), download the result.
+3. `pip install onnx2tf` (pulls in TensorFlow), then:
    ```sh
-   python3 scripts/onnx_to_tflite_micro.py your_model.onnx model_data.h
+   python3 scripts/onnx_to_tflite_micro.py your_model.onnx model.tflite
    ```
-3. Follow `firmware/README.md` to bake `model_data.h` into a TFLite Micro
-   sketch and produce one merged `.bin`.
-4. Serve `web/` locally (`python3 -m http.server` from `web/`) and open it
-   in Chrome/Edge — Connect, pick the `.bin`, Flash.
+   (a `.tflite` output path writes the plain converted model; any other
+   extension writes a C header instead — the runtime firmware reads a
+   plain `.tflite` file from its flash partition, not a C array).
+4. Flash *that* `.tflite` file's raw bytes at `0x310000`, same page, same
+   Connect session — no rebuild, no PlatformIO, step 1 doesn't repeat.
+5. Reset the board (or power-cycle) — it prints what it loaded over serial
+   (115200 baud) and on its own screen.
+
+Prefer one self-contained binary per model instead? `firmware/README.md`'s
+older recipe bakes the model directly into the firmware as a C array.
 
 ## Not done yet / follow-ups
 

@@ -31,8 +31,8 @@
   <p>
     Fetch and simplify/quantize a Hugging Face ONNX model with the
     <a href="../../convertmodel/index.html" target="_blank" rel="noopener">onnxsim model converter</a>,
-    then download the result. This page doesn't repeat that UI — it starts
-    from step 2 below, offline.
+    then download the result. This page doesn't repeat that UI — it picks
+    back up at step 3 below, offline.
   </p>
   <p class="note">
     Candidates (Cardputer has a mic, no camera, so these are all audio
@@ -75,32 +75,53 @@
 </div>
 
 <div class="step">
-  <h2>2. Convert to a flashable firmware image (offline, local machine)</h2>
-  <p class="note">
-    Not done in-browser — see <code>../scripts/onnx_to_tflite_micro.py</code>
-    (ONNX → TFLite → C array) and <code>../firmware/README.md</code>
-    (build a merged <code>.bin</code> with the model baked in). Bring the
-    resulting <code>.bin</code> back here.
+  <h2>2. Flash the generic runtime (once per board)</h2>
+  <p>
+    <a href="../firmware/runtime/prebuilt/cardputer-runtime.bin" download>Download cardputer-runtime.bin</a>
+    — a real, compiled, checksummed TFLite Micro runtime (see
+    <code>../firmware/runtime/README.md</code>). Flash it at address
+    <code>0x0</code> below. You only do this once: it reads whatever model
+    currently sits in a fixed flash partition at boot, so swapping models
+    later (step 4) never touches this again.
   </p>
 </div>
 
 <div class="step">
-  <h2>3. Flash over Web Serial</h2>
+  <h2>3. Convert your model to .tflite (offline, local machine)</h2>
+  <p class="note">
+    Not done in-browser:
+    <code>pip install onnx2tf</code>, then
+    <code>python3 ../scripts/onnx_to_tflite_micro.py your_model.onnx model.tflite</code>.
+    Bring the resulting <code>model.tflite</code> back here — it must fit in
+    the runtime's 1MB model partition (every candidate in step 1's table
+    does).
+  </p>
+</div>
+
+<div class="step">
+  <h2>4. Flash over Web Serial</h2>
   <p id="serial-unsupported" class="note" style="display: none; color: #b00;">
     This browser has no <code>navigator.serial</code> — try Chrome or Edge
     (desktop), 89+.
+  </p>
+  <p class="note">
+    Same Connect session for both: flash <b>cardputer-runtime.bin</b> at
+    <code>0x0</code> (step 2, once), then flash <b>your model.tflite</b> at
+    <code>0x310000</code> (step 4, every time you swap models) — pick the
+    file, set the address, Flash; repeat for the second file without
+    reconnecting.
   </p>
   <div id="serial-controls">
     <button id="connect-button" type="button">Connect to board</button>
     <button id="disconnect-button" type="button" disabled>Disconnect</button>
     <span id="chip-status" class="note"></span>
     <br><br>
-    <label for="firmware-input">firmware image (merged .bin)</label>
-    <input type="file" id="firmware-input" accept=".bin" disabled>
+    <label for="firmware-input">file (runtime .bin or model .tflite)</label>
+    <input type="file" id="firmware-input" accept=".bin,.tflite" disabled>
     <br><br>
     <label for="flash-address">flash address</label>
-    <input type="text" id="flash-address" value="0x0" size="8" title="0x0 for ESP32-S3/S2/C3/C6 (Cardputer included); 0x1000 for the original ESP32.">
-    <span class="note">(0x0 for ESP32-S3 boards like Cardputer — the bootloader offset differs on classic ESP32)</span>
+    <input type="text" id="flash-address" value="0x0" size="8" title="0x0 for the runtime firmware; 0x310000 for a model (this runtime's fixed model-partition offset).">
+    <span class="note">(<code>0x0</code> for the runtime firmware; <code>0x310000</code> for a model — this runtime's fixed model-partition offset)</span>
     <br><br>
     <button id="flash-button" type="button" disabled>Flash</button>
   </div>

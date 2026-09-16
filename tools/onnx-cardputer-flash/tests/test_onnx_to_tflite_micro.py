@@ -9,11 +9,12 @@ function's own docstring.
 import re
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import pytest
-from onnx_to_tflite_micro import emit_c_header
+from onnx_to_tflite_micro import emit_c_header, main
 
 
 def _extract_bytes(header: str, var_name: str) -> bytes:
@@ -45,3 +46,33 @@ def test_declares_length_and_alignment():
 def test_rejects_non_identifier_var_name():
     with pytest.raises(ValueError):
         emit_c_header(b"\x00", "not a valid name")
+
+
+def _fake_convert_to_tflite(fake_bytes, tmp_path):
+    fake_tflite = tmp_path / "fake.tflite"
+    fake_tflite.write_bytes(fake_bytes)
+    return fake_tflite
+
+
+def test_main_writes_plain_tflite_for_dot_tflite_output(tmp_path):
+    onnx_path = tmp_path / "model.onnx"
+    onnx_path.write_bytes(b"not a real onnx file -- convert_to_tflite is mocked")
+    out_path = tmp_path / "model.tflite"
+    fake_bytes = b"\x01\x02\x03tflite-flatbuffer-bytes"
+    with patch("onnx_to_tflite_micro.convert_to_tflite",
+               return_value=_fake_convert_to_tflite(fake_bytes, tmp_path)):
+        assert main([str(onnx_path), str(out_path)]) == 0
+    assert out_path.read_bytes() == fake_bytes
+
+
+def test_main_writes_c_header_for_dot_h_output(tmp_path):
+    onnx_path = tmp_path / "model.onnx"
+    onnx_path.write_bytes(b"not a real onnx file -- convert_to_tflite is mocked")
+    out_path = tmp_path / "model_data.h"
+    fake_bytes = b"\x01\x02\x03\x04"
+    with patch("onnx_to_tflite_micro.convert_to_tflite",
+               return_value=_fake_convert_to_tflite(fake_bytes, tmp_path)):
+        assert main([str(onnx_path), str(out_path), "--var-name", "my_model"]) == 0
+    header = out_path.read_text()
+    assert "const unsigned char my_model[]" in header
+    assert _extract_bytes(header, "my_model") == fake_bytes
