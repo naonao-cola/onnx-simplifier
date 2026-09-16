@@ -6,11 +6,17 @@ source-code generator that compiles a quantized model straight to C for
 ARMv7E-M (Cortex-M) microcontrollers. **It has no NPU and nothing to do with
 TI's edgeai/TIDL** -- an earlier request in this project's history conflated
 a "~2.5 GOPS NPU" figure with TI's accelerator when it actually referred to
-this project instead, and TinyEngine has no accelerator of any kind; see
-``scripts/tinyengine/README.md`` for the correction. It is a pure-CPU
-inference *compiler*: the C it emits for each op *is* the runtime
+this project instead, and TinyEngine has no accelerator of any kind. It is
+a pure-CPU inference *compiler*: the C it emits for each op *is* the runtime
 implementation, generated ahead of time, not dispatched to a library at
 run time.
+
+**This is also not the same thing as "TI's TinyEngine NPU"**, a genuinely
+different, unrelated hardware product Texas Instruments announced in March
+2026 (a dedicated NPU silicon block for its MSPM0G5187/AM13Ex MCUs, built
+on a TVM-based toolchain) that happens to share this project's name --
+see ``scripts/tinyengine/README.md`` for the full disambiguation and the
+correction history.
 
 Two structural differences from every other ``scripts/<vendor>/*_ops.py`` in
 this repo matter enough to shape this whole module:

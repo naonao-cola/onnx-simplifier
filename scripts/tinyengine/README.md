@@ -4,20 +4,59 @@ Verifies that `onnxsim`'s output stays friendly to
 [**TinyEngine**](https://github.com/mit-han-lab/tinyengine), MIT HAN Lab's
 source-code generator for microcontroller inference.
 
-## TinyEngine is not TI's edgeai/TIDL, and it has no NPU
+## TinyEngine (this integration) is not TI's edgeai/TIDL, and has no NPU
+## -- and, as of March 2026, is *also* not TI's own "TinyEngine NPU"
 
-This deserves its own section because an earlier request in this project's
-history conflated the two: a "~2.5 GOPS NPU" figure that actually referred
-to TinyEngine was initially attributed to TI's TIDL accelerator instead
+This deserves its own section because of two separate mix-ups, one from
+this project's own history and one from outside it.
+
+First, an earlier request in this project's history conflated MIT HAN
+Lab's TinyEngine with TI's TIDL accelerator: a "~2.5 GOPS NPU" figure that
+actually referred to TinyEngine was initially attributed to TIDL instead
 (see `scripts/edgeai/README.md`, a completely separate integration in this
-repo for TI's actual C7x-MMA accelerator). **TinyEngine has no NPU, no
-accelerator, and nothing to do with TI.** It is a pure-CPU code generator
-for ARMv7E-M (Cortex-M) microcontrollers -- it compiles a quantized model
-straight into C source; the generated C *is* the runtime, with no separate
-library dispatch and no accelerator offload of any kind. Real published
-latency numbers (from TinyEngine's own top-level `README.md`, "Measured
-Results", profiled on an STM32H743 Cortex-M7 MCU) confirm this is squarely
-a CPU-microsecond-to-millisecond-scale regime, not an NPU one:
+repo for TI's actual C7x-MMA accelerator). **The TinyEngine this module
+checks against -- `github.com/mit-han-lab/tinyengine` -- has no NPU, no
+accelerator, and (at the time that history happened) nothing to do with
+TI.** It is a pure-CPU code generator for ARMv7E-M (Cortex-M)
+microcontrollers -- it compiles a quantized model straight into C source;
+the generated C *is* the runtime, with no separate library dispatch and no
+accelerator offload of any kind.
+
+Second, and unrelated to that history: **Texas Instruments announced its
+own, genuinely new hardware product also named "TinyEngine™ NPU" on March
+10, 2026** (at embedded world 2026), integrated into two new MCU families
+-- MSPM0G5187 (Cortex-M0+) and AM13Ex (Cortex-M33, motor control). Checked
+directly (TI's own press materials, since `www.ti.com` itself is not
+reachable from this repo's network policy the way `software-dl.ti.com`/
+`downloads.ti.com` are -- see `scripts/edgeai/README.md`), **this is a
+different technology, not this project's TinyEngine wearing a new name**:
+
+- TI's TinyEngine NPU is a *dedicated hardware accelerator block* that
+  executes neural-network layers (conv/depthwise/pointwise/transposed,
+  fully-connected, average/max pooling) in parallel to the MCU's own CPU,
+  claiming up to 90x lower latency and 120x lower energy per inference
+  than software-only inference on a similar MCU, with <2uA standby draw.
+  Its software toolchain is built on the **TVM** (Tensor Virtual Machine)
+  compiler framework via TI's "Edge AI Studio".
+- MIT HAN Lab's TinyEngine (this module's subject) has no hardware
+  component *at all* -- it is a from-scratch C code generator with its
+  own hand-written dispatch (`TfliteConvertor.py`), nothing to do with
+  TVM, and the CPU itself runs the emitted C.
+
+No licensing relationship, technology transfer, or shared codebase between
+the two was found in TI's own announcement coverage -- this looks like an
+independently-chosen, identical product name (both draw on the same
+"tiny"/edge-AI vocabulary MIT's own TinyML work popularized), not a
+rebrand or a derivative. **If a future task in this repo says
+"TinyEngine NPU" and means TI's March-2026 hardware part, that is not what
+`scripts/tinyengine/` checks -- this module and its whole suite are about
+the MIT HAN Lab software project only.**
+
+Real published latency numbers for *this* (MIT HAN Lab's) TinyEngine (from
+its own top-level `README.md`, "Measured Results", profiled on an
+STM32H743 Cortex-M7 MCU, no dedicated NPU hardware involved) confirm it is
+squarely a CPU-microsecond-to-millisecond-scale regime, not the NPU-scale
+performance profile TI's newer, unrelated hardware product claims:
 
 | model | latency |
 | --- | --- |
