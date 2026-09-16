@@ -251,6 +251,15 @@ function exportFromNetron(target, format, name, onDone, onError) {
   target.postMessage(buildExportMessage(format, name), NETRON_ORIGIN);
 }
 
+// Expose the "before" pane's current model bytes/name, so other panels (e.g.
+// debug_tools.mjs's "extract from loaded model" button) can read whatever
+// model is currently loaded here regardless of which source (file upload,
+// Hugging Face, a previous text-graph parse, ...) put it there. `buffer` is
+// this pane's own ArrayBuffer -- callers must copy out of it before mutating.
+export function currentModel() {
+  return { buffer: panes.before.buffer, name: panes.before.name };
+}
+
 function initNetronPanel() {
   const fileInput = document.getElementById("file-input");
   if (fileInput) {

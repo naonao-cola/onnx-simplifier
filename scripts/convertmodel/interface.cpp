@@ -3,6 +3,7 @@
 #include "model_info.h"
 #include "onnx/checker.h"
 #include "onnx/defs/parser.h"
+#include "onnx/defs/printer.h"
 #include "onnx/defs/schema.h"
 #include "onnx/inliner/inliner.h"
 #include "onnxoptimizer/optimize.h"
@@ -696,6 +697,30 @@ em::val onnxsim_parse_graph(const std::string &text) {
     return out;
   }
   out.set("model", bytes);
+  return out;
+}
+
+// Extract a serialized ModelProto's ONNX *textual* representation -- the
+// inverse of onnxsim_parse_graph above: the same syntax onnx.parser.parse_model
+// accepts (and onnx.printer.to_text produces on the Python side), covering the
+// model's ir_version/opset imports, its graph, and any local function
+// definitions. Lets the "loaded" model shown in the converter's Netron pane be
+// read as text -- e.g. to inspect it, or to round-trip it through the "Parse a
+// text graph" panel after editing. Returns { text: string } on success or {
+// error: string } if the bytes don't parse as a model.
+em::val onnxsim_extract_graph(const std::string &data) {
+  em::val out = em::val::object();
+  onnx::ModelProto model;
+  if (!model.ParseFromArray(data.data(), data.size())) {
+    out.set("error", std::string("failed to parse ModelProto"));
+    return out;
+  }
+  try {
+    out.set("text", onnx::ProtoToString(model));
+  } catch (const std::exception &e) {
+    out.set("error", std::string("failed to print the model as text: ") +
+                          e.what());
+  }
   return out;
 }
 
@@ -3589,6 +3614,7 @@ EMSCRIPTEN_BINDINGS(module) {
   // single-pass debugging entry points (see the definitions above).
   em::function("onnxsim_versions", &onnxsim_versions);
   em::function("onnxsim_parse_graph", &onnxsim_parse_graph);
+  em::function("onnxsim_extract_graph", &onnxsim_extract_graph);
   em::function("onnxsim_inline_functions", &onnxsim_inline_functions);
   em::function("onnxsim_parse_tensor", &onnxsim_parse_tensor);
   em::function("onnxsim_infer_shapes", &onnxsim_infer_shapes);

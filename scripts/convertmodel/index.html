@@ -71,7 +71,10 @@
                     for each function's domain so it validates. With <b>convert after
                     parsing</b> on, it is also run straight through the currently selected
                     convert mode below (Simplify / Optimize / Inline functions, or a single
-                    debug pass).
+                    debug pass). <b>Extract from loaded model</b> runs this in reverse: it
+                    reads back whatever model is currently shown in the <b>Before</b> Netron
+                    pane below and fills this box with its textual representation, so it can
+                    be inspected and -- after editing -- reparsed.
                 </p>
             </details>
             <textarea id="parse-graph-text" rows="8" style="width: 100%; box-sizing: border-box; font-family: monospace;"
@@ -87,6 +90,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 <input type="checkbox" id="parse-graph-convert" checked>
                 <label for="parse-graph-convert">convert after parsing</label>
                 <button id="parse-graph-download" type="button" style="display: none;">download model ↓</button>
+                <button id="extract-graph-button" type="button">Extract from loaded model ↑</button>
                 <span id="parse-graph-status" class="tool-note"></span>
             </div>
         </div>
