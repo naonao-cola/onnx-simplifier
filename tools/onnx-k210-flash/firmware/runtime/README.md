@@ -59,6 +59,17 @@ on the host; this proves the *on-device* `interpreter::load_model()` call
 specifically is where the real gap is, not the model or the conversion
 pipeline.
 
+The board's KPU and camera hardware themselves are known-good, for what
+that's worth in narrowing this down: Sipeed's own official MaixPy firmware
+(`sipeed/MaixPy-v1`, a completely separate codebase/nncase-runtime
+integration from this repo's) was flashed onto the same board this session
+and ran real KPU-backed inference (a built-in Haar-cascade face detector)
+plus real camera capture without incident. That rules out a broken board
+or a physically bad KPU/camera as the explanation for `load_model()`
+hanging -- the gap is specific to this runtime's own nncase v1
+integration (or that nncase v1 release's K210 runtime code in general),
+not the hardware underneath it.
+
 ## How it works
 
 `src/main.cpp`:
