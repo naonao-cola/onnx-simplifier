@@ -7,8 +7,17 @@
 // folding) are exposed as options of the converter's mode radios, not here.
 //
 // Parsing needs no model executor, so it runs on this page's runtime directly.
+//
+// The panel also offers the inverse: "extract from loaded model" reads back
+// whatever model is currently shown in the Netron "before" pane (see
+// netron_view.mjs's currentModel()) and fills this textarea with its ONNX
+// textual representation, via the module's `onnxsim_extract_graph`. That lets
+// an uploaded (or Hugging-Face-loaded) model be inspected as text, and -- since
+// it lands in the same textarea -- edited and reparsed with the "Parse graph"
+// button above.
 
 import { downloadBytes } from "./download.mjs";
+import { currentModel } from "./netron_view.mjs";
 import { syncInputUrl } from "./query_params.mjs";
 
 // Resolve this page's WASM runtime (published by index.html's inline loader).
@@ -73,4 +82,39 @@ async function initParsePanel() {
   });
 }
 
+async function initExtractPanel() {
+  const textEl = document.getElementById("parse-graph-text");
+  const btn = document.getElementById("extract-graph-button");
+  const statusEl = document.getElementById("parse-graph-status");
+  if (!btn || !textEl) return;
+
+  btn.addEventListener("click", async () => {
+    const { buffer, name } = currentModel();
+    if (!buffer) {
+      if (statusEl) {
+        statusEl.textContent = "No model loaded yet -- upload one (or load one from Hugging Face) first.";
+      }
+      return;
+    }
+    btn.disabled = true;
+    if (statusEl) statusEl.textContent = "extracting…";
+    try {
+      const runtime = await getRuntime();
+      const res = runtime.onnxsim_extract_graph(new Uint8Array(buffer));
+      if (!res || res.error) {
+        throw new Error(res ? res.error : "unknown error");
+      }
+      textEl.value = res.text;
+      if (statusEl) statusEl.textContent = `extracted from ${name || "the loaded model"}.`;
+    } catch (err) {
+      if (statusEl) {
+        statusEl.textContent = "extract failed: " + (err && err.message ? err.message : err);
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
 initParsePanel();
+initExtractPanel();

@@ -251,6 +251,16 @@ model is shown in the **Before** Netron pane, becomes the source for the
 single-feature passes, and — with *convert after parsing* on — is run straight
 through the Simplify path.
 
+The panel also runs in reverse: **Extract from loaded model** reads back
+whichever model bytes the **Before** Netron pane currently holds (see
+`netron_view.mjs`'s `currentModel()` — set by an uploaded file, a Hugging Face
+load, a backend test case, or a previous parse/extract) and fills the textarea
+with its ONNX textual representation, via the `onnxsim_extract_graph` binding
+(`onnx::ProtoToString`, the same printer `onnx.printer.to_text` uses on the
+Python side). That makes any loaded model inspectable as text, and — since the
+result lands back in the same box — editable and reparseable with **Parse
+graph** above.
+
 ## Single-pass debug modes
 
 Alongside **Simplify** / **Optimize** / **Fixed Optimize**, the converter's mode
