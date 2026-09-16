@@ -62,7 +62,14 @@ wrong with the pipeline itself. The browser UI itself doing the flashing
 4. Flash *that* `.tflite` file's raw bytes at `0x310000`, same page, same
    Connect session — no rebuild, no PlatformIO, step 1 doesn't repeat.
 5. Reset the board (or power-cycle) — it prints what it loaded over serial
-   (115200 baud) and on its own screen.
+   (115200 baud) and on its own screen. Or skip the serial terminal
+   entirely: the
+   [onnxsim model converter](../convertmodel/index.html#sec-cardputer)'s
+   own "Live Cardputer output" panel connects over Web Serial and streams
+   the same lines straight into that page, rendering each cycle's status,
+   latency, and output values (see
+   `../convertmodel/cardputer_monitor_ui.mjs`) — a live monitor, not a
+   flasher; it doesn't touch the board's flash.
 
 Prefer one self-contained binary per model instead? `firmware/README.md`'s
 older recipe bakes the model directly into the firmware as a C array.
