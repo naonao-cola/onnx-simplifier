@@ -1901,6 +1901,7 @@ conversion tooling include:
 * [ncnn](https://github.com/Tencent/ncnn) (Tencent) — recommends simplifying with onnxsim before `onnx2ncnn`
 * [RKNN Model Zoo](https://github.com/airockchip/rknn_model_zoo) (Rockchip) — runs onnxsim in its ONNX export scripts before RKNN conversion
 * [Voyager SDK](https://github.com/axelera-ai-hub/voyager-sdk) (Axelera AI) — its deployment tutorials simplify models with onnxsim before deploying them to Metis accelerators
+* [edgeai-tidl-tools](https://github.com/TexasInstruments/edgeai-tidl-tools) (Texas Instruments) — its Vision Transformer walkthrough (`docs/vision_transformers.md`) runs onnxsim on a DeiT ONNX export before compiling it for TIDL, the inference engine for the C7x-MMA accelerator on Jacinto/Sitara SoCs
 
 ## Chat
 
