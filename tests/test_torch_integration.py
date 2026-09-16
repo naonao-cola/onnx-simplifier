@@ -3,9 +3,9 @@
 ``docs/dlpack-executor.md`` frames onnxsim's DLPack executor boundary as an
 "embeddability" seam: onnxsim should be droppable into another ONNX-based
 compiler or runtime stack with the host only implementing one executor
-callback. ``tests/test_nncase_integration.py``, ``tests/test_tvm_integration.py``,
+callback. ``tests/test_tvm_integration.py``
 and ``tests/test_tinygrad_integration.py`` are the regression tests for that
-claim against nncase's, Apache TVM's, and tinygrad's own ONNX frontends. This
+claim against Apache TVM's and tinygrad's own ONNX frontends. This
 module is the analogous test for PyTorch, via
 `onnx2torch <https://github.com/ENOT-AutoDL/onnx2torch>`_'s ``convert``, which
 imports an ONNX ``ModelProto`` directly into an ``fx.GraphModule`` -- no
@@ -30,7 +30,7 @@ A third, more interesting case is also covered: the classic
 ``Shape -> Gather -> Concat -> Reshape`` chain that ships fully-constant
 dimensions. onnxsim constant-folds the whole chain into a literal ``Reshape``
 target shape, which onnx2torch ingests fine either way here, but is the same
-regression guard the nncase/TVM/tinygrad modules carry for a
+regression guard the TVM/tinygrad modules carry for a
 fixed-shape-preferring backend.
 
 ``torch`` and ``onnx2torch`` are not part of onnxsim's test requirements, so
@@ -115,7 +115,7 @@ def _foldable_shape_reshape() -> onnx.ModelProto:
 
     onnxsim folds the whole chain into the ``Reshape``'s literal target
     shape, which onnx2torch ingests either way -- the same regression guard
-    the nncase/TVM/tinygrad equivalents carry for backends that do prefer a
+    the TVM/tinygrad equivalents carry for backends that do prefer a
     literal target.
     """
     w = numpy_helper.from_array(_rand(8, 3, 3, 3, seed=1), "w")
