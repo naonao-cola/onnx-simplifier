@@ -66,9 +66,10 @@ older recipe bakes the model directly into the firmware as a C array.
   a real camera (Amigo) and better on-device inference (KPU). The Web
   Serial flasher this needed didn't exist anywhere, so it's now built —
   see [`../onnx-k210-flash/`](../onnx-k210-flash/README.md) (a from-scratch
-  port of `kflash.py`'s ISP protocol). Still needs an onnx→kmodel
-  conversion script (nncase, not TFLite Micro) and a firmware recipe,
-  mirroring this tool's `scripts/`/`firmware/` — not done yet.
+  port of `kflash.py`'s ISP protocol). Its onnx→kmodel conversion
+  (nncase, not TFLite Micro) is done and run for real against a real HF
+  model; still needs a firmware recipe (MaixPy or bare-metal K210 SDK) to
+  actually load a kmodel on-device, mirroring this tool's `firmware/`.
 - No CI coverage — nothing here can run without either a real board or a
   TensorFlow install this repo doesn't otherwise carry.
 - Vision models are out of scope for Cardputer specifically (no camera); an

@@ -176,6 +176,11 @@ test*.py
 !tests/test*.py
 !tools/onnx-finetune/tests/test*.py
 !tools/onnx-cardputer-flash/tests/test*.py
+!tools/onnx-k210-flash/tests/test*.py
+
+# nncase's own compile-time report, written to the CWD it's invoked from
+# (tools/onnx-k210-flash/scripts/onnx_to_kmodel.py) -- not an output we produce.
+kmodel_info.txt
 
 .setuptools-cmake-build/
 onnxsim/version.py
