@@ -53,7 +53,8 @@ opposite fact permanently, so the same mistake can't silently come back.
 | Protocol sequence (reset → greeting → stub upload/boot → flash-mode greeting → init → erase → write → reboot) | Reviewed line-by-line against kflash.py's source; matches its control flow |
 | `isp_stub.bin` | Extracted and decompressed from kflash.py's own `ISP_PROG` constant; its size/CRC32 are pinned by a test |
 | ONNX → kmodel (`scripts/onnx_to_kmodel.py`) | **Run for real**, not just reviewed: compiled a real Hugging Face model to a 104792-byte kmodel and ran it through nncase's own `Simulator`, producing the correct output shape (see "Model conversion" below) |
-| Real hardware (flashing) | **Not run against a board.** No K210 device is attached to the environment this was written in |
+| On-device runtime (`firmware/runtime/`) | **Compiled and linked for real** against `kendryte-standalone-sdk` (see `firmware/runtime/README.md`); its flash-model-without-re-erasing path is explicitly *not* verified |
+| Real hardware (flashing, and everything above running on it) | **Not run against a board.** No K210 device is attached to the environment this was written in |
 
 Nothing here should be taken as "flashes real hardware reliably" until
 someone runs it against an actual M5StickV or Maix Amigo. If the reset
@@ -66,9 +67,10 @@ please report back what needed to change.
 If you have a board, this is the first thing to actually verify -- and the
 single most likely first failure point:
 
-1. Open `web/index.html`, pick any `.bin` (even a wrong one -- this just
-   tests whether the board answers `greeting()` at all), leave **reset
-   scheme** on `dan`, click **Connect and flash**.
+1. Open `web/index.html`, pick any `.bin` -- `firmware/runtime/prebuilt/onnx-k210-runtime.bin`
+   is a real one to use, downloadable right from the page -- leave **flash
+   address** at `0x0`, **skip erase** unchecked, **reset scheme** on `dan`,
+   click **Connect and flash**.
 2. Watch the log for `entering ISP mode`. If it hangs there and eventually
    throws "no K210 found", the DTR/RTS sequence isn't the one this board
    needs -- reselect **kd233**, then **goD**, retrying step 1 each time
@@ -80,7 +82,12 @@ single most likely first failure point:
    reached, and the last few log lines.
 4. Once a scheme gets all the way through with a real `.bin`, the board
    should reset and boot it -- that's the actual end-to-end proof this
-   SDK works, not just that it talks to the mask ROM.
+   SDK works, not just that it talks to the mask ROM. With
+   `onnx-k210-runtime.bin` specifically, it should print "no model
+   flashed yet" over UART/its own log (nothing's at `0x00C00000` yet).
+5. Then work through `firmware/runtime/README.md`'s "Flashing a model
+   without re-erasing" section -- it's the other real open question
+   real hardware can answer that nothing here can.
 
 `chip-type` (in-chip vs on-board flash) is the other per-board unknown --
 M5StickV and Maix Amigo both have their flash on the K210 module itself,
@@ -103,7 +110,10 @@ unverified the same way the reset scheme is.
   const firmware = new Uint8Array(await (await fetch("your-firmware.bin")).arrayBuffer());
 
   await loader.flashFirmware(stub, firmware, {
-    chipType: 0, // 0 = in-chip flash (M5StickV/Maix Amigo), 1 = on-board
+    chipType: 0,      // 0 = in-chip flash (M5StickV/Maix Amigo), 1 = on-board
+    addressOffset: 0, // 0x0 for firmware, 0x00C00000 for a model (see firmware/runtime/README.md)
+    skipErase: false, // FLASH_ERASE is always full-chip -- see that README's
+                       // "Flashing a model without re-erasing" before setting this true
     onStage: (s) => console.log(s),
     onProgress: (kind, n, total) => console.log(kind, n, "/", total),
   });
@@ -111,7 +121,10 @@ unverified the same way the reset scheme is.
 </script>
 ```
 
-Or open `web/index.html` through a local static server and use the UI.
+Or open `web/index.html` through a local static server and use the UI --
+it now has a flash-address field and a "skip erase" checkbox for exactly
+this, plus a direct download link for `firmware/runtime/`'s prebuilt
+on-device runtime.
 
 ## Model conversion (offline, tested for real)
 
@@ -157,13 +170,16 @@ hardware" above is for.
 
 ## Not done / follow-ups
 
-- **Firmware to actually load a kmodel on-device.** `scripts/onnx_to_kmodel.py`
-  produces the `.kmodel` bytes; there's no equivalent of
-  `onnx-cardputer-flash/firmware/runtime` here yet -- a MaixPy build (or a
-  bare-metal K210 SDK app) that reads a kmodel from a fixed flash offset
-  and runs it through the KPU. Without it, `writeFirmware()` can flash
-  *something* but there's no known-good firmware image on this side to
-  flash it into yet.
+- **Verifying "skip erase" is actually safe.** `firmware/runtime/` (the
+  on-device kmodel runtime, now built and real -- see its own README) can
+  only have its model swapped without re-flashing the firmware itself if
+  the flash-mode stub's `FLASH_WRITE` erases its own target sectors
+  before programming them. That's plausible (a common embedded NOR-flash
+  driver convenience) but unverified -- the stub is an opaque vendored
+  binary with no available source, and there's no K210 board here to test
+  it against. `firmware/runtime/README.md`'s "Flashing a model without
+  re-erasing" section has the real workflow this needs (and a safe
+  fallback) until someone with hardware confirms one way or the other.
 - **nncase compiled to WASM**, so this conversion step could run in-browser
   like `onnx-cardputer-flash`'s simplify/quantize step already does --
   deliberately deferred. A source-level check (grepping nncase's actual

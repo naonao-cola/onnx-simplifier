@@ -469,9 +469,28 @@ export class K210Loader {
 
   // Runs the whole sequence in the order kflash.py's own process() does:
   // enter ISP mode, upload+boot the flash-mode stub, wait for it to greet,
-  // init+erase flash, write the firmware, then reset into it. `stubBytes`
+  // init(+erase) flash, write the firmware, then reset into it. `stubBytes`
   // is normally isp_stub.bin fetched alongside this module.
-  async flashFirmware(stubBytes, firmwareBytes, { chipType = 0, addressOffset = 0, onStage = () => {}, onProgress = () => {} } = {}) {
+  //
+  // `skipErase` (default false -- erase runs): FLASH_ERASE (0xd3) has no
+  // address/range parameter at the protocol level -- kflash.py's own
+  // flash_erase() sends the same fixed, args-less frame this SDK's
+  // FLASH_ERASE_FRAME does -- so it is a **full-chip** erase, not a
+  // range erase. Calling flashFirmware() twice at two different
+  // addressOffsets (e.g. a runtime image at 0x0, then a model at
+  // 0x00C00000, per onnx-k210-flash/firmware/runtime/README.md's flash
+  // layout) with the default skipErase=false would erase the first
+  // write before the second one's write ever happens. skipErase=true
+  // writes without erasing first -- correct only if the flash-mode
+  // stub's own FLASH_WRITE (0xd4) implementation erases the sectors it's
+  // about to program itself before writing them (a common convenience in
+  // embedded NOR-flash write helpers, but NOT verified here: this
+  // session has no K210 board to check it against, and the ISP stub is
+  // an opaque vendored binary with no available source -- see
+  // ../README.md's "Flashing a model without re-erasing" section before
+  // relying on this for anything other than a first careful hardware
+  // test).
+  async flashFirmware(stubBytes, firmwareBytes, { chipType = 0, addressOffset = 0, skipErase = false, onStage = () => {}, onProgress = () => {} } = {}) {
     onStage("entering ISP mode");
     await this.enterISPMode();
     onStage("uploading flash-mode stub");
@@ -480,8 +499,10 @@ export class K210Loader {
     await this.flashGreeting();
     onStage("initializing flash");
     await this.initFlash(chipType);
-    onStage("erasing flash");
-    await this.flashErase();
+    if (!skipErase) {
+      onStage("erasing flash (full chip -- see flashFirmware's own comment)");
+      await this.flashErase();
+    }
     onStage("writing firmware");
     await this.writeFirmware(firmwareBytes, { addressOffset, onProgress: (n, total) => onProgress("firmware", n, total) });
     onStage("resetting into new firmware");

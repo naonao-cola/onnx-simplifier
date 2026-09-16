@@ -27,6 +27,19 @@
 </p>
 
 <div class="step" style="border: 1px solid #888; border-radius: 6px; padding: 0.75rem 1rem; margin: 1rem 0;">
+  <h2 style="margin-top: 0;">Runtime firmware (flash once per board)</h2>
+  <p class="note">
+    <a href="../firmware/runtime/prebuilt/onnx-k210-runtime.bin" download>Download onnx-k210-runtime.bin</a>
+    -- a compiled, checksummed image (see <code>../firmware/runtime/README.md</code>)
+    that reads whatever model currently sits at flash address <code>0x00C00000</code>
+    and runs one sanity inference at boot. Flash it at <code>0x0</code> below;
+    swap models afterward by flashing just a <code>.kmodel</code> at
+    <code>0x00C00000</code> -- see the flash-address field's note and the
+    "skip erase" checkbox's warning below before doing that a second time.
+  </p>
+</div>
+
+<div class="step" style="border: 1px solid #888; border-radius: 6px; padding: 0.75rem 1rem; margin: 1rem 0;">
   <h2 style="margin-top: 0;">Candidate models</h2>
   <p class="note">
     This page only flashes an already-built <code>.bin</code> — there is no
@@ -75,8 +88,17 @@
   (desktop), 89+.
 </p>
 <div id="controls">
-  <label for="firmware-input">firmware .bin (plain binary, not .kfpkg)</label>
-  <input type="file" id="firmware-input" accept=".bin">
+  <label for="firmware-input">file (runtime .bin or model .kmodel)</label>
+  <input type="file" id="firmware-input" accept=".bin,.kmodel">
+  <br><br>
+  <label for="flash-address">flash address</label>
+  <input type="text" id="flash-address" value="0x0" size="10" title="0x0 for the runtime firmware; 0x00C00000 for a model (see firmware/runtime/README.md's flash layout).">
+  <span class="note">(<code>0x0</code> for the runtime firmware; <code>0x00C00000</code> for a model)</span>
+  <br><br>
+  <input type="checkbox" id="skip-erase">
+  <label for="skip-erase" title="FLASH_ERASE has no address range -- it always erases the WHOLE chip. Leave this unchecked (the safe default: erase, then write) unless you are specifically re-flashing a model onto a board whose runtime firmware is already correctly flashed and you are testing, on real hardware, whether the flash-mode stub's own write command erases-before-programming on its own. Not verified here either way -- see the K210 tool's README.">
+    skip erase (only after you've confirmed on real hardware that writing a model doesn't need it -- see README)
+  </label>
   <br><br>
   <label for="chip-type">flash location</label>
   <select id="chip-type">

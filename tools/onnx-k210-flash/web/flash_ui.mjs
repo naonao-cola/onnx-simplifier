@@ -15,6 +15,8 @@ const flashButton = document.getElementById("flash-button");
 const firmwareInput = document.getElementById("firmware-input");
 const chipTypeSelect = document.getElementById("chip-type");
 const resetSchemeSelect = document.getElementById("reset-scheme");
+const flashAddressInput = document.getElementById("flash-address");
+const skipEraseCheckbox = document.getElementById("skip-erase");
 
 flashButton.addEventListener("click", async () => {
   const file = firmwareInput.files && firmwareInput.files[0];
@@ -40,10 +42,18 @@ flashButton.addEventListener("click", async () => {
 
     const firmwareBytes = new Uint8Array(await file.arrayBuffer());
     const chipType = parseInt(chipTypeSelect.value, 10);
+    const addressOffset = flashAddressInput ? parseInt(flashAddressInput.value, 16) : 0;
+    if (!Number.isFinite(addressOffset) || addressOffset < 0) {
+      throw new Error(`invalid flash address: ${flashAddressInput.value}`);
+    }
+    const skipErase = skipEraseCheckbox ? skipEraseCheckbox.checked : false;
 
-    log(`flashing ${file.name} (${firmwareBytes.length.toLocaleString()} bytes)...`);
+    log(`flashing ${file.name} (${firmwareBytes.length.toLocaleString()} bytes) at 0x${addressOffset.toString(16)}` +
+        (skipErase ? " (skipping erase)" : " (full-chip erase first)") + "...");
     await loader.flashFirmware(stubBytes, firmwareBytes, {
       chipType,
+      addressOffset,
+      skipErase,
       onStage: (stage) => log(`-- ${stage}`),
       onProgress: (kind, n, total) => {
         if (n === total || n % 8 === 0) log(`  ${kind}: ${n}/${total} chunks`);

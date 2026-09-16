@@ -43,3 +43,40 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## kendryte-standalone-demo (w25qxx.c / w25qxx.h)
+
+`firmware/runtime/src/w25qxx.c` and `.h` are copied, as-is, from
+[kendryte/kendryte-standalone-demo](https://github.com/kendryte/kendryte-standalone-demo)'s
+`kpu/` example directory -- the SPI-NOR-flash driver
+`firmware/runtime/src/main.cpp` uses to read a kmodel off flash at boot.
+It isn't part of the base `kendryte-standalone-sdk` (only this separate
+demo repo), and isn't otherwise available as source. Per the files' own
+header comment:
+
+```
+Copyright 2018 Canaan Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+## kendryte-standalone-sdk
+
+`firmware/runtime/prebuilt/onnx-k210-runtime.bin` is built against
+[kendryte/kendryte-standalone-sdk](https://github.com/kendryte/kendryte-standalone-sdk)
+(Apache License 2.0) -- its `lib/` (drivers, the vendored `nncase` v0/v1
+runtime including prebuilt `lib/nncase/v1/lib/*.a`, and `third_party/`
+gsl-lite/mpark-variant/nlohmann_json/xtl) links into that binary. The SDK
+itself isn't vendored into this repo (see `firmware/runtime/README.md`
+for how to fetch it to rebuild); this note covers what ends up compiled
+into the committed `.bin`.
