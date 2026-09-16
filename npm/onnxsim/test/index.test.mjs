@@ -62,6 +62,10 @@ import {
   quantizeWeightOnlyPbLlm,
   quantizeWeightOnlySqueezeLlm,
   applyBillm,
+  quantizeKvCache,
+  applyOwq,
+  applyGear,
+  applyRotateKv,
   applyGptq,
   applyAdaround,
   applyQronos,
@@ -347,6 +351,63 @@ try {
       X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 1.0, 0.0]), [1, 4]),
     });
     const out = await applyBillm(input, [batch(), batch()], { blockSize: 128 });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("quantizeKvCache round-trips on a model with no KV-cache pattern", async () => {
+    // The shared fixture is a plain MatMul with no Concat(past, new,
+    // axis=seq) KV-cache stream, so this is a no-op round-trip -- the
+    // point is the binding (including calibration crossing and the
+    // optional valueOutputNames array) works. Real quantization is
+    // covered by the Python parity tests.
+    const ort = await import("onnxruntime-web");
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 1.0, 0.0]), [1, 4]),
+    });
+    const out = await quantizeKvCache(input, [batch(), batch()]);
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applyGear round-trips on a model with no KV-cache pattern", async () => {
+    // Same no-KV-cache-pattern reasoning as quantizeKvCache above -- the
+    // point is the binding works, not a tight numeric check.
+    const ort = await import("onnxruntime-web");
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 1.0, 0.0]), [1, 4]),
+    });
+    const out = await applyGear(input, [batch(), batch()], { rank: 4 });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applyRotateKv round-trips on a model with no KV-cache/attention pattern", async () => {
+    // Same no-matching-pattern reasoning as quantizeKvCache above -- the
+    // point is the binding works, not a tight numeric check.
+    const ort = await import("onnxruntime-web");
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 1.0, 0.0]), [1, 4]),
+    });
+    const out = await applyRotateKv(input, [batch(), batch()]);
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applyOwq restores salient columns on synthetic calibration data", async () => {
+    // Same dedicated fixtures as the GPTQ check above: a K=32 float MatMul
+    // plus its quantize_weight_only_int4 output, so the layer is a real
+    // OWQ candidate.
+    const ort = await import("onnxruntime-web");
+    const floatModel = new Uint8Array(readFileSync(FIXTURE_GPTQ));
+    const quantModel = new Uint8Array(readFileSync(FIXTURE_GPTQ_INT4));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array(32).map((_, i) => ((i * 37) % 11) - 5), [1, 32]),
+    });
+    const out = await applyOwq(floatModel, quantModel, [batch(), batch()], { outlierFraction: 0.1 });
     assert.ok(out instanceof Uint8Array);
     assert.ok(out.length > 0);
   });

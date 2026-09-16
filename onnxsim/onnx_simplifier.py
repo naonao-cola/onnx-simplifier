@@ -2729,6 +2729,281 @@ def apply_billm_cpp(
     )
 
 
+def quantize_kv_cache_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    value_output_names: Optional[Sequence[str]] = None,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_kv_cache`: per-channel
+    static INT8 for a matched ``Concat(past, new, axis=seq)`` stream's own
+    Key-style values, per-token dynamic INT8 (data-free) for Value-style
+    ones.
+
+    Same real calibration machinery as :func:`onnxsim.apply_llm_int8_cpp`
+    -- a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see
+    ``ApplyKvCacheQuantization`` in ``kv_cache_quantization_entry.h`` for
+    the full scope).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to compute each
+            Key-style stream's own per-channel scale from -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param value_output_names: which matched streams' ``present`` output
+            names get Value-style (per-token) treatment instead of the
+            default Key-style (per-channel) treatment; when omitted, a
+            stream whose ``present`` output name contains ``".value"`` is
+            treated as Value-style instead
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched KV-cache stream quantized to
+            INT8.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.quantize_kv_cache(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            list(value_output_names) if value_output_names is not None else [],
+        )
+    )
+
+
+def apply_owq_cpp(
+    float_model: Union[str, onnx.ModelProto],
+    quantized_model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    outlier_fraction: float = 0.01,
+    percdamp: float = 0.01,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_owq`: OWQ (Lee, Park, Kim, Kim
+    and Sung, 2023, AAAI 2024) -- rescues the top ``outlier_fraction``
+    OBS-salient columns of an already-``quantize_weight_only_int4``-quantized
+    layer back to exact float32 precision via an additive
+    ``Gather``/``MatMul``/``Add`` correction; ``quantized_model``'s own
+    INT4 codes are never modified.
+
+    Same real calibration machinery as :func:`onnxsim.apply_gptq_cpp` -- a
+    live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the float model in C++ (see
+    ``ApplyOwq`` in ``owq_entry.h`` for the full scope, including its
+    accepted numerical scope: the dense inverse/Cholesky at this
+    algorithm's heart -- reused from ``apply_gptq_cpp``'s own machinery --
+    use scalar double-precision kernels rather than LAPACK).
+
+    :param float_model: the original (unquantized) onnx ModelProto or file
+            path
+    :param quantized_model: a quantized version of ``float_model`` (onnx
+            ModelProto or file path), produced by
+            :func:`onnxsim.quantize_weight_only_int4`
+    :param calibration_data: representative input batches to compute each
+            layer's Hessian and per-column error from -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param outlier_fraction: fraction of each layer's input columns to
+            restore to full precision
+    :param percdamp: Hessian damping factor (fraction of the mean diagonal
+            added before inversion)
+    :param providers: onnxruntime execution providers to run
+            ``float_model`` on when capturing calibration activations
+    :returns: ``quantized_model`` with a new ``Gather``/``MatMul``/``Add``
+            correction inserted after every matched layer.
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(quantized_model, str):
+        quantized_model = onnx.load(quantized_model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            float_model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_owq(
+            _get_model_executor(providers),
+            float_model.SerializeToString(),
+            quantized_model.SerializeToString(),
+            calibration_data_pb,
+            outlier_fraction,
+            percdamp,
+        )
+    )
+
+
+def apply_gear_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    rank: int = 4,
+    outlier_fraction: float = 0.05,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_gear`: GEAR (Kang et al., 2024)
+    -- low-rank-plus-sparse residual compensation layered on top of
+    :func:`onnxsim.quantize_kv_cache`'s own static per-channel INT8 base
+    quantization, applied only to a freshly-produced KV-cache token.
+
+    Same real calibration machinery as :func:`onnxsim.apply_llm_int8_cpp`
+    -- a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see ``ApplyGear``
+    in ``gear_entry.h`` for the full scope, including its accepted
+    numerical scope: the reconstructed low-rank projector matches the
+    Python reference's own up to ordinary floating-point rounding, not
+    sign-for-sign for individual singular vectors).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to fit each
+            matched stream's own low-rank projector and sparse mask from --
+            see :func:`onnxsim.generate_random_calibration_data` (the
+            default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param rank: the low-rank correction's own rank (clamped to
+            ``min(rank, head_dim, num_calibration_rows)`` per stream)
+    :param outlier_fraction: fraction of each stream's channels kept as an
+            explicit sparse correction after the low-rank term is
+            subtracted
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched KV-cache stream's own
+            reconstruction error corrected by a low-rank-plus-sparse term.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_gear(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            rank,
+            outlier_fraction,
+        )
+    )
+
+
+def apply_rotatekv_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_rotatekv`: RotateKV (Su et al.,
+    2025) -- fits a per-stream orthogonal rotation from a matched KV-cache
+    stream's own calibration-activation covariance and applies it to both
+    the stream's fresh Key and its compensating Query, exact by
+    construction for any orthogonal ``R``.
+
+    Same real calibration machinery as :func:`onnxsim.apply_llm_int8_cpp`
+    -- a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see
+    ``ApplyRotateKv`` in ``rotatekv_entry.h`` for the full scope, including
+    its permanent divergence: the fitted rotation is the eigenvector basis
+    of a from-scratch Jacobi eigensolver, not LAPACK's own ``eigh``, so the
+    exact basis differs from the pure Python reference's own -- both are
+    valid orthogonal rotations with the same reconstruction-quality
+    property).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to fit each
+            matched stream's own rotation from -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched KV-cache stream's own fresh Key
+            and compensating Query rotated by a fitted orthogonal matrix.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_rotatekv(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+        )
+    )
+
+
 def apply_gptq_cpp(
     float_model: Union[str, onnx.ModelProto],
     quantized_model: Union[str, onnx.ModelProto],

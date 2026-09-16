@@ -265,6 +265,26 @@ export function applyBillm(
     maxSalientSearch?: number;
   },
 ): Promise<Uint8Array>;
+export function quantizeKvCache(
+  model: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: { valueOutputNames?: string[] },
+): Promise<Uint8Array>;
+export function applyOwq(
+  floatModel: OnnxModelBytes,
+  quantizedModel: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: { outlierFraction?: number; percdamp?: number },
+): Promise<Uint8Array>;
+export function applyGear(
+  model: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: { rank?: number; outlierFraction?: number },
+): Promise<Uint8Array>;
+export function applyRotateKv(
+  model: OnnxModelBytes,
+  calibration: CalibrationData,
+): Promise<Uint8Array>;
 export function applyGptq(
   floatModel: OnnxModelBytes,
   quantizedModel: OnnxModelBytes,
@@ -416,6 +436,10 @@ declare const _default: {
   quantizeWeightOnlyPbLlm: typeof quantizeWeightOnlyPbLlm;
   quantizeWeightOnlySqueezeLlm: typeof quantizeWeightOnlySqueezeLlm;
   applyBillm: typeof applyBillm;
+  quantizeKvCache: typeof quantizeKvCache;
+  applyOwq: typeof applyOwq;
+  applyGear: typeof applyGear;
+  applyRotateKv: typeof applyRotateKv;
   applyGptq: typeof applyGptq;
   applyAdaround: typeof applyAdaround;
   applyQronos: typeof applyQronos;
