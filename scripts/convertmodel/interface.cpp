@@ -3243,6 +3243,109 @@ em::val onnxsim_apply_llm_int8(const std::string &data,
   }
 }
 
+// SpQR (Dettmers et al., 2023): outlier-aware block-wise INT4
+// quantization -- per-element outliers (by Hessian-diagonal-weighted
+// sensitivity) are excluded from their own block's scale and stored as an
+// exact sparse correction. Same calibration-batch contract and executor
+// as every other calibration-driven binding above. See ApplySpqr in
+// spqr_entry.h.
+em::val onnxsim_apply_spqr(const std::string &data,
+                           em::val calibration_batches_val,
+                           int block_size, double outlier_fraction) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplySpqr(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), block_size,
+        outlier_fraction));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_spqr error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+// PB-LLM (Shang et al., 2024): a structured mixed-precision binarizer --
+// per matched layer, the `salient_ratio` fraction of input channels with
+// the highest Hessian-diagonal-weighted magnitude stay INT8, every other
+// channel is binarized to ~1 bit/element. Same calibration-batch contract
+// and executor as every other calibration-driven binding above. See
+// ApplyPbLlm in pb_llm_entry.h.
+em::val onnxsim_quantize_weight_only_pb_llm(const std::string &data,
+                                            em::val calibration_batches_val,
+                                            double salient_ratio) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyPbLlm(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), salient_ratio));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_weight_only_pb_llm error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+// SqueezeLLM (Kim et al., 2023): sensitivity-weighted per-group codebook
+// (a real GatherND-based graph rewrite, not folded to a single
+// initializer) plus a dense-and-sparse outlier correction. Same
+// calibration-batch contract and executor as every other
+// calibration-driven binding above. See ApplySqueezeLlm in
+// squeezellm_entry.h.
+em::val onnxsim_quantize_weight_only_squeezellm(
+    const std::string &data, em::val calibration_batches_val,
+    int block_size, int bits, double outlier_fraction,
+    int num_kmeans_iterations) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplySqueezeLlm(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), block_size, bits,
+        outlier_fraction, num_kmeans_iterations));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_weight_only_squeezellm error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+// BiLLM (Huang et al., 2024, ICML): a genuine ~1-bit-average weight
+// binarizer -- Hessian-guided salient-column selection, a two-level
+// binary residual approximation for salient columns, plain flat binary
+// for the rest, and OBC-style forward error compensation (reusing
+// onnxsim_apply_gptq's own Cholesky-factored-inverse-Hessian mechanism).
+// Same calibration-batch contract and executor as every other
+// calibration-driven binding above. See ApplyBillm in billm_entry.h.
+em::val onnxsim_apply_billm(const std::string &data,
+                            em::val calibration_batches_val, int block_size,
+                            double percdamp, int max_salient_search) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyBillm(
+        xmodel, CalibrationExecutor(),
+        ParseCalibrationBatches(calibration_batches_val), block_size,
+        percdamp, max_salient_search));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_billm error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // SmoothQuant migration (Xiao et al., 2022): rescales every matched
 // MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight columns by the
 // per-channel migration scale and inserts a `Mul` dividing that layer's
@@ -3727,6 +3830,12 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_apply_outlier_suppression_plus",
            &onnxsim_apply_outlier_suppression_plus);
   function("onnxsim_apply_llm_int8", &onnxsim_apply_llm_int8);
+  function("onnxsim_apply_spqr", &onnxsim_apply_spqr);
+  function("onnxsim_quantize_weight_only_pb_llm",
+           &onnxsim_quantize_weight_only_pb_llm);
+  function("onnxsim_quantize_weight_only_squeezellm",
+           &onnxsim_quantize_weight_only_squeezellm);
+  function("onnxsim_apply_billm", &onnxsim_apply_billm);
   function("onnxsim_apply_gptq", &onnxsim_apply_gptq);
   function("onnxsim_apply_adaround", &onnxsim_apply_adaround);
   function("onnxsim_apply_qronos", &onnxsim_apply_qronos);

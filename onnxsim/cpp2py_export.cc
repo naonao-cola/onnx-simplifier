@@ -974,6 +974,120 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a,
       "outlier_threshold"_a = 6.0, "epsilon"_a = 1e-8);
 
+  // SpQR (Dettmers et al., 2023): outlier-aware block-wise INT4
+  // quantization -- per-element outliers (by Hessian-diagonal-weighted
+  // sensitivity) are excluded from their own block's scale and stored as
+  // an exact sparse correction. Same executor-as-first-argument,
+  // `calibration_data` crossing convention as apply_llm_int8's own binding
+  // above. See ApplySpqr in spqr_entry.h for the full scope and
+  // onnxsim/spqr.py for the technique this ports.
+  m.def(
+      "apply_spqr",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t block_size, double outlier_fraction) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplySpqr(model, *executor, calibration_data,
+                                      block_size, outlier_fraction);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "block_size"_a = 16,
+      "outlier_fraction"_a = 0.01);
+
+  // PB-LLM (Shang et al., 2024): a structured mixed-precision binarizer --
+  // per matched layer, the `salient_ratio` fraction of input channels with
+  // the highest Hessian-diagonal-weighted magnitude stay INT8, every other
+  // channel is binarized to ~1 bit/element. Same executor-as-first-argument,
+  // `calibration_data` crossing convention as apply_llm_int8's own binding
+  // above. See ApplyPbLlm in pb_llm_entry.h for the full scope and
+  // onnxsim/pb_llm.py for the technique this ports.
+  m.def(
+      "quantize_weight_only_pb_llm",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double salient_ratio) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplyPbLlm(model, *executor, calibration_data, salient_ratio);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a,
+      "salient_ratio"_a = 0.15);
+
+  // SqueezeLLM (Kim et al., 2023): sensitivity-weighted per-group codebook
+  // (a real GatherND-based graph rewrite, not folded to a single
+  // initializer) plus a dense-and-sparse outlier correction. Same
+  // executor-as-first-argument, `calibration_data` crossing convention as
+  // apply_llm_int8's own binding above. See ApplySqueezeLlm in
+  // squeezellm_entry.h for the full scope and onnxsim/squeezellm.py for the
+  // technique this ports.
+  m.def(
+      "quantize_weight_only_squeezellm",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t block_size, int64_t bits, double outlier_fraction,
+         int64_t num_kmeans_iterations) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplySqueezeLlm(model, *executor, calibration_data, block_size,
+                            bits, outlier_fraction, num_kmeans_iterations);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "block_size"_a = 32,
+      "bits"_a = 4, "outlier_fraction"_a = 0.0045,
+      "num_kmeans_iterations"_a = 20);
+
+  // BiLLM (Huang et al., 2024, ICML): a genuine ~1-bit-average weight
+  // binarizer -- Hessian-guided salient-column selection, a two-level
+  // binary residual approximation for salient columns, plain flat binary
+  // for the rest, and OBC-style forward error compensation (reusing
+  // apply_gptq's own Cholesky-factored-inverse-Hessian mechanism). Same
+  // executor-as-first-argument, `calibration_data` crossing convention as
+  // apply_llm_int8's own binding above. See ApplyBillm in billm_entry.h for
+  // the full scope and onnxsim/billm.py for the technique this ports.
+  m.def(
+      "apply_billm",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t block_size, double percdamp,
+         int64_t max_salient_search) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplyBillm(model, *executor, calibration_data, block_size, percdamp,
+                       max_salient_search);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "block_size"_a = 128,
+      "percdamp"_a = 0.01, "max_salient_search"_a = 30);
+
   // GPTQ (Frantar et al., 2022): sequential, Hessian-compensated INT4
   // rounding for every quantize_weight_only_int4-quantized MatMul/Gemm
   // layer shared (by node output name) between a float model and its

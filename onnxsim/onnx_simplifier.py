@@ -2445,6 +2445,290 @@ def apply_llm_int8_cpp(
     )
 
 
+def apply_spqr_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    block_size: int = 16,
+    outlier_fraction: float = 0.01,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_spqr`: SpQR
+    (Dettmers et al., 2023) -- outlier-aware block-wise INT4 quantization
+    where per-element outliers (by Hessian-diagonal-weighted sensitivity)
+    are excluded from their own block's scale computation and stored
+    instead as an exact sparse correction.
+
+    Same real calibration machinery as :func:`onnxsim.apply_llm_int8_cpp`
+    -- a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see ``ApplySpqr``
+    in ``spqr_entry.h`` for the full scope, including its one documented
+    divergence: outlier-position storage order can differ from the pure
+    Python reference, though the SET of outlier positions and the
+    reconstructed model are numerically identical).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to compute each
+            weight element's sensitivity score -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param block_size: elements per quantization block along ``K``
+    :param outlier_fraction: fraction of each layer's weight elements (by
+            count) excluded from block-scale computation and stored as an
+            exact sparse correction instead
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched layer's weight replaced by
+            block-wise INT4 codes plus a sparse outlier correction.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_spqr(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            block_size,
+            outlier_fraction,
+        )
+    )
+
+
+def quantize_weight_only_pb_llm_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    salient_ratio: float = 0.15,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_pb_llm`: PB-LLM
+    (Shang et al., 2024, ICLR) -- a structured mixed-precision binarizer:
+    per matched layer, the ``salient_ratio`` fraction of input channels
+    with the highest Hessian-diagonal-weighted magnitude stay INT8, every
+    other channel is binarized to ~1 bit/element.
+
+    Same real calibration machinery as :func:`onnxsim.apply_llm_int8_cpp`
+    -- a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see ``ApplyPbLlm``
+    in ``pb_llm_entry.h`` for the full scope).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to compute each
+            layer's Hessian diagonal from -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param salient_ratio: fraction of each layer's input columns (by
+            count, most salient first) kept at INT8; the rest are
+            binarized
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched layer's weight replaced by
+            ``Mul(Cast(Code), Scale)`` feeding the original MatMul/Gemm
+            node.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.quantize_weight_only_pb_llm(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            salient_ratio,
+        )
+    )
+
+
+def quantize_weight_only_squeezellm_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    block_size: int = 32,
+    bits: int = 4,
+    outlier_fraction: float = 0.0045,
+    num_kmeans_iterations: int = 20,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_squeezellm`:
+    SqueezeLLM (Kim et al., 2023) -- sensitivity-weighted per-group
+    codebook (a real ``GatherND``-based graph rewrite, not folded to a
+    single initializer) plus a dense-and-sparse outlier correction.
+
+    Same real calibration machinery as :func:`onnxsim.apply_llm_int8_cpp`
+    -- a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see
+    ``ApplySqueezeLlm`` in ``squeezellm_entry.h`` for the full scope). This
+    technique's own weighted k-means fit initializes deterministically (no
+    RNG anywhere), so this port is expected to track the Python reference
+    numerically closely, not just structurally.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to measure each
+            input channel's sensitivity on -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param block_size: elements per ``(output channel, block)`` codebook
+            group along the reduction dimension
+    :param bits: codebook size is ``2 ** bits`` centroids per group
+    :param outlier_fraction: fraction of weight elements (by magnitude,
+            across the whole tensor) excluded from the k-means fit and
+            corrected back to their exact original value instead
+    :param num_kmeans_iterations: weighted Lloyd's-algorithm iterations
+            refining each group's codebook
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched layer's weight replaced by a
+            per-group codebook lookup plus a sparse outlier correction.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.quantize_weight_only_squeezellm(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            block_size,
+            bits,
+            outlier_fraction,
+            num_kmeans_iterations,
+        )
+    )
+
+
+def apply_billm_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    block_size: int = 128,
+    percdamp: float = 0.01,
+    max_salient_search: int = 30,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_billm`: BiLLM
+    (Huang et al., 2024, ICML) -- a genuine ~1-bit-average weight
+    binarizer: Hessian-guided salient-column selection, a two-level binary
+    residual approximation for salient columns, plain flat binary for the
+    rest, and OBC-style forward error compensation.
+
+    Same real calibration machinery as :func:`onnxsim.apply_gptq_cpp` -- a
+    live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see ``ApplyBillm``
+    in ``billm_entry.h`` for the full scope, including its accepted
+    numerical scope: the dense inverse/Cholesky at this algorithm's heart
+    -- reused from ``apply_gptq_cpp``'s own machinery -- use scalar
+    double-precision kernels rather than LAPACK).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to compute each
+            layer's Hessian from -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param block_size: BiLLM's own salient-column-search/OBC-compensation
+            block width
+    :param percdamp: Hessian damping factor (fraction of the mean diagonal
+            added before inversion)
+    :param max_salient_search: bounds how many leading (most Hessian-
+            salient) columns of a block the search tries as "the salient
+            group"
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched layer's weight replaced by a
+            two-level binary residual (salient columns) or a flat binary
+            level (non-salient columns).
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_billm(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            block_size,
+            percdamp,
+            max_salient_search,
+        )
+    )
+
+
 def apply_gptq_cpp(
     float_model: Union[str, onnx.ModelProto],
     quantized_model: Union[str, onnx.ModelProto],

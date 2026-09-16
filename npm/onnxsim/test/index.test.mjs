@@ -58,6 +58,10 @@ import {
   applyOutlierSuppression,
   applyOutlierSuppressionPlus,
   applyLlmInt8,
+  applySpqr,
+  quantizeWeightOnlyPbLlm,
+  quantizeWeightOnlySqueezeLlm,
+  applyBillm,
   applyGptq,
   applyAdaround,
   applyQronos,
@@ -282,6 +286,67 @@ try {
       X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 8.0, 0.0]), [1, 4]),
     });
     const out = await applyLlmInt8(input, [batch(), batch()], { outlierThreshold: 6.0 });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applySpqr declines a pre-opset-21 model", async () => {
+    // The shared fixture is opset 13 and SpQR needs opset >= 21 (INT4
+    // tensor type, DequantizeLinear's block_size attribute), so this is a
+    // no-op round-trip -- the point is the binding (including calibration
+    // crossing) works. Real quantization is covered by the Python parity
+    // tests.
+    const ort = await import("onnxruntime-web");
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 1.0, 0.0]), [1, 4]),
+    });
+    const out = await applySpqr(input, [batch(), batch()], { blockSize: 16 });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("quantizeWeightOnlyPbLlm runs on synthetic calibration data", async () => {
+    // No block-size/opset gate on this technique (ordinary Cast/Mul,
+    // opset 11+), so the shared K=4 fixture is a genuine candidate -- the
+    // point is the binding (including calibration crossing) works, not a
+    // tight numeric check (that's the Python parity tests' own job).
+    const ort = await import("onnxruntime-web");
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 1.0, 0.0]), [1, 4]),
+    });
+    const out = await quantizeWeightOnlyPbLlm(input, [batch(), batch()], { salientRatio: 0.15 });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("quantizeWeightOnlySqueezeLlm declines a non-block-divisible model", async () => {
+    // The shared fixture's K=4 is below the default block_size=32, so
+    // this is a no-op round-trip -- the point is the binding (including
+    // calibration crossing) works. Real quantization is covered by the
+    // Python parity tests.
+    const ort = await import("onnxruntime-web");
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 1.0, 0.0]), [1, 4]),
+    });
+    const out = await quantizeWeightOnlySqueezeLlm(input, [batch(), batch()], { blockSize: 32 });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
+  });
+
+  await check("applyBillm runs on synthetic calibration data", async () => {
+    // No block-size divisibility requirement (any K works, chunked into
+    // min(blockSize, remaining)-wide blocks), so the shared K=4 fixture is
+    // a genuine candidate -- the point is the binding (including
+    // calibration crossing) works, not a tight numeric check.
+    const ort = await import("onnxruntime-web");
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const batch = () => ({
+      X: new ort.Tensor("float32", new Float32Array([0.5, -0.25, 1.0, 0.0]), [1, 4]),
+    });
+    const out = await applyBillm(input, [batch(), batch()], { blockSize: 128 });
     assert.ok(out instanceof Uint8Array);
     assert.ok(out.length > 0);
   });

@@ -20,6 +20,7 @@
 // two independently-edited copies of the same type ever drifting apart.
 #include "adaround_entry.h"
 #include "awq_entry.h"
+#include "billm_entry.h"
 #include "daq_entry.h"
 #include "gptq_entry.h"
 #include "gptvq_entry.h"
@@ -28,9 +29,12 @@
 #include "low_rank_compensation_entry.h"
 #include "outlier_suppression_entry.h"
 #include "outlier_suppression_plus_entry.h"
+#include "pb_llm_entry.h"
 #include "qronos_entry.h"
 #include "quarot_gptq_entry.h"
 #include "smoothquant_entry.h"
+#include "spqr_entry.h"
+#include "squeezellm_entry.h"
 #include "structured_pruning_entry.h"
 #include "tesseraq_entry.h"
 

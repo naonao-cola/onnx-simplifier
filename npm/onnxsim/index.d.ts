@@ -236,6 +236,35 @@ export function applyLlmInt8(
   calibration: CalibrationData,
   options?: { outlierThreshold?: number; epsilon?: number },
 ): Promise<Uint8Array>;
+export function applySpqr(
+  model: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: { blockSize?: number; outlierFraction?: number },
+): Promise<Uint8Array>;
+export function quantizeWeightOnlyPbLlm(
+  model: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: { salientRatio?: number },
+): Promise<Uint8Array>;
+export function quantizeWeightOnlySqueezeLlm(
+  model: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: {
+    blockSize?: number;
+    bits?: number;
+    outlierFraction?: number;
+    numKmeansIterations?: number;
+  },
+): Promise<Uint8Array>;
+export function applyBillm(
+  model: OnnxModelBytes,
+  calibration: CalibrationData,
+  options?: {
+    blockSize?: number;
+    percdamp?: number;
+    maxSalientSearch?: number;
+  },
+): Promise<Uint8Array>;
 export function applyGptq(
   floatModel: OnnxModelBytes,
   quantizedModel: OnnxModelBytes,
@@ -383,6 +412,10 @@ declare const _default: {
   applyOutlierSuppression: typeof applyOutlierSuppression;
   applyOutlierSuppressionPlus: typeof applyOutlierSuppressionPlus;
   applyLlmInt8: typeof applyLlmInt8;
+  applySpqr: typeof applySpqr;
+  quantizeWeightOnlyPbLlm: typeof quantizeWeightOnlyPbLlm;
+  quantizeWeightOnlySqueezeLlm: typeof quantizeWeightOnlySqueezeLlm;
+  applyBillm: typeof applyBillm;
   applyGptq: typeof applyGptq;
   applyAdaround: typeof applyAdaround;
   applyQronos: typeof applyQronos;

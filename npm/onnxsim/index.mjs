@@ -739,6 +739,74 @@ export async function applyLlmInt8(
 }
 
 /**
+ * SpQR outlier-aware block-wise INT4 quantization: per-element outliers
+ * (by Hessian-diagonal-weighted sensitivity) are excluded from their own
+ * block's scale and stored as an exact sparse correction.
+ */
+export async function applySpqr(
+  model,
+  calibration,
+  { blockSize = 16, outlierFraction = 0.01 } = {},
+) {
+  return callCalibratedPass("onnxsim_apply_spqr", model, calibration, [
+    blockSize,
+    outlierFraction,
+  ]);
+}
+
+/**
+ * PB-LLM structured mixed-precision binarizer: the `salientRatio`
+ * fraction of input channels with the highest Hessian-diagonal-weighted
+ * magnitude stay INT8, every other channel is binarized to ~1 bit/element.
+ */
+export async function quantizeWeightOnlyPbLlm(
+  model,
+  calibration,
+  { salientRatio = 0.15 } = {},
+) {
+  return callCalibratedPass("onnxsim_quantize_weight_only_pb_llm", model, calibration, [
+    salientRatio,
+  ]);
+}
+
+/**
+ * SqueezeLLM sensitivity-weighted per-group codebook (a real
+ * GatherND-based graph rewrite, not folded to a single initializer) plus
+ * a dense-and-sparse outlier correction.
+ */
+export async function quantizeWeightOnlySqueezeLlm(
+  model,
+  calibration,
+  { blockSize = 32, bits = 4, outlierFraction = 0.0045, numKmeansIterations = 20 } = {},
+) {
+  return callCalibratedPass("onnxsim_quantize_weight_only_squeezellm", model, calibration, [
+    blockSize,
+    bits,
+    outlierFraction,
+    numKmeansIterations,
+  ]);
+}
+
+/**
+ * BiLLM ~1-bit-average weight binarizer: Hessian-guided salient-column
+ * selection, a two-level binary residual approximation for salient
+ * columns, plain flat binary for the rest, and OBC-style forward error
+ * compensation (reuses GPTQ's own Cholesky-factored-inverse-Hessian
+ * mechanism).
+ */
+export async function applyBillm(
+  model,
+  calibration,
+  { blockSize = 128, percdamp = 0.01, maxSalientSearch = 30 } = {},
+) {
+  return callCalibratedPass("onnxsim_apply_billm", model, calibration, [
+    blockSize,
+    percdamp,
+    maxSalientSearch,
+  ]);
+}
+
+/**
  * SmoothQuant migration (lossless pre-conditioning ahead of a W8A8
  * quantizer): rescales matched weight columns by `s` and inserts a `Mul`
  * dividing the activation by `s`. Returns a float model.
@@ -1097,6 +1165,10 @@ export default {
   applyOutlierSuppression,
   applyOutlierSuppressionPlus,
   applyLlmInt8,
+  applySpqr,
+  quantizeWeightOnlyPbLlm,
+  quantizeWeightOnlySqueezeLlm,
+  applyBillm,
   applyGptq,
   applyAdaround,
   applyQronos,
