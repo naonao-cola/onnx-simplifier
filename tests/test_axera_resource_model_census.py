@@ -175,7 +175,16 @@ _CENSUS = _census()
 
 class TestFixtureCorpusSize(unittest.TestCase):
     def test_306_fixtures_all_decode_cleanly(self):
-        self.assertEqual(_CENSUS["n_fixtures"], 306)
+        # Corpus grew from 306 to 310 with
+        # tests/test_axera_gemm_sparse_bank_n_boundary.py's 4 new
+        # fixtures (2 states x 2 rebuilds) -- the two extra bank-0x81
+        # carriers pushed that bank's own fixture count from 8 to 10,
+        # moving it out of TestBankCensus's own <=9 "sparse" bucket (see
+        # that test's updated count below). Method name kept as-is
+        # (matches this file's own established "N fixtures" naming
+        # convention elsewhere) rather than renamed on every corpus
+        # change.
+        self.assertEqual(_CENSUS["n_fixtures"], 310)
 
 
 class TestFieldOffsetGranularity(unittest.TestCase):
@@ -195,7 +204,7 @@ class TestBankCensus(unittest.TestCase):
         for bank in (0x00, 0x01, 0x02, 0x03, 0x04):
             self.assertEqual(
                 len(_CENSUS["bank_fixture_set"][bank]),
-                306,
+                310,
                 f"bank {bank:#04x} should appear in every fixture",
             )
 
@@ -207,11 +216,16 @@ class TestBankCensus(unittest.TestCase):
             self.assertGreaterEqual(len(_CENSUS["bank_fixture_set"][bank]), 305)
 
     def test_most_banks_are_sparse(self):
+        # Was 21 of 39 at the original 306-fixture corpus
+        # (tests/test_axera_resource_model_census.py's own original PR
+        # #1563). tests/test_axera_gemm_sparse_bank_n_boundary.py's 2
+        # new bank-0x81 carriers push that bank from 8 to 10 fixtures,
+        # crossing out of this <=9 bucket -- 20 of 39 now.
         sparse = [
             b for b, fixset in _CENSUS["bank_fixture_set"].items() if len(fixset) <= 9
         ]
         self.assertEqual(
-            len(sparse), 21, "21 of 39 banks should be sparse (<=9 fixtures)"
+            len(sparse), 20, "20 of 39 banks should be sparse (<=9 fixtures)"
         )
 
 
@@ -266,7 +280,10 @@ class TestRegisterCensus(unittest.TestCase):
         self.assertEqual(universal, expected)
 
     def test_reg8_is_the_heaviest_universal_register(self):
-        self.assertEqual(_CENSUS["reg_counts"][8], 27369)
+        # Was 27,369 at the original 306-fixture corpus; the 4 new
+        # fixtures from tests/test_axera_gemm_sparse_bank_n_boundary.py
+        # add their own reg=8 usage.
+        self.assertEqual(_CENSUS["reg_counts"][8], 27601)
         counts = _CENSUS["reg_counts"]
         universal = {
             r
