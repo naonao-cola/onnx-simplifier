@@ -135,6 +135,127 @@ like the one this was first verified in, not in general), plus a JS port of
 `onnxsim.webgpu_target`'s gap-detection to decide *when* to invoke it. Both
 are un-built follow-ups, not done here.
 
+### One flagged node, generated live, verified end to end
+
+`scripts/convertmodel/test/pyodide_webgpu_single_node_codegen.test.mjs`
+takes the above further, for the single simplest real case (a `Conv` node
+with every attribute at its ONNX default -- the same
+`webgpu_tinygrad_conv3d.onnx` fixture `webgpu_tinygrad_codegen.test.mjs`
+already dispatches): it regenerates the *exact same kernel*
+`onnxsim.webgpu_tinygrad_codegen.generate_conv_kernel` already produced for
+that node offline, entirely client-side, with no `onnx`-the-Python-package
+and no numpy anywhere in the browser-side path:
+
+1. `scripts/convertmodel/onnx_conv_node_reader.mjs` -- a new hand-rolled
+   protobuf reader, sibling to `onnx_node_metadata.mjs` -- reads the node's
+   own shapes (from a graph input or an initializer) and attributes
+   (`kernel_shape`, `strides`, `dilations`, `group`, `pads`, `auto_pad`,
+   with the same defaults `generate_conv_kernel` itself applies) straight
+   out of the raw `.onnx` bytes, in JS.
+2. That shape/attribute info -- never any tensor *values*, which kernel
+   generation doesn't depend on -- drives a numpy-free, onnx-free
+   translation of `generate_conv_kernel` + its own `_lower_tensor_program`
+   helper, run inside Pyodide, producing a
+   `onnxsim.webgpu_kernel_metadata.WebgpuKernelSpec`-shaped JSON program.
+3. That live-generated spec is asserted to `deepEqual` the spec
+   `generate_conv_kernel` already attached to the fixture offline -- same
+   WGSL text, entry point, dispatch, bindings -- proving this isn't just "a
+   kernel that happens to run" but the identical one.
+4. The live spec (not the fixture's own) is then dispatched via
+   `webgpu_kernel_dispatcher.mjs` against a real WebGPU device, fed the
+   fixture's real concrete `x`/`w` values, and checked against
+   `onnx.reference.ReferenceEvaluator`'s own output for the real node --
+   the same numeric bar every other kernel test here holds itself to.
+
+Scope: this is one op (`Conv`), one node, attributes read from a graph
+input/initializer only (no shape-inference fallback for an upstream node's
+output shape -- see `onnx_conv_node_reader.mjs`'s own docstring). Getting
+from here to "flag a gap and generate its kernel live for any node in any
+real model" still needs the same two follow-ups named above (a JS port of
+`onnxsim.webgpu_target`'s gap-detection to pick *which* node, and either a
+numpy-free `initializer.raw_data` reader or a real browser's numpy for
+`generate_resize_kernel`'s case, which -- unlike Conv -- does depend on a
+constant input's actual values). What this does settle: the remaining gap
+is that decision-making and data-plumbing, not tinygrad's own codegen
+machinery, which this proves reproduces the server-side result exactly.
+
+### A whole graph, any op tinygrad supports -- via tinygrad's own ONNX importer
+
+The single-node prototype above still needed a bespoke, per-op JS reader
+(`onnx_conv_node_reader.mjs`) mirroring `generate_conv_kernel`'s own
+hand-written translation, because `onnxsim.webgpu_tinygrad_codegen` only
+covers two ops. tinygrad itself ships a much broader answer:
+`tinygrad.nn.onnx.OnnxRunner` (`tinygrad/nn/onnx.py`) is a *generic* ONNX
+interpreter with its own hand-rolled protobuf parser (no dependency on the
+`onnx` Python package at all) and a large op table (`get_onnx_ops()`)
+covering well over 100 ops, executing a graph node by node as ordinary
+tinygrad `Tensor` calls.
+
+`scripts/convertmodel/test/pyodide_webgpu_onnxrunner_codegen.test.mjs`
+proves this runs inside Pyodide and produces real, correct WebGPU kernels
+for a **whole multi-node graph** -- not tuned per op by onnxsim at all:
+
+1. The raw `.onnx` model bytes (a two-node `Conv3D -> Relu` graph --
+   `Relu` has no bespoke onnxsim codegen at all) are written straight into
+   Pyodide's own virtual filesystem; `OnnxRunner` parses and runs the whole
+   thing itself, so unlike the single-node case there is **no JS-side
+   shape/attribute reader at all**.
+2. `OnnxRunner(path)` is constructed, and the graph is run with random
+   dummy input data (again: kernel generation depends only on shapes, never
+   values), entirely inside `with Context(DEV="WEBGPU"):` -- every tensor
+   this produces, including every initializer, is tagged for the `WEBGPU`
+   device with no real device backend ever touched.
+3. The same `_lower_tensor_program` lowering `generate_conv_kernel` itself
+   uses (schedule, find each real compute kernel, render each to WGSL via
+   `WGSLRenderer`) turns the resulting output tensor into a
+   `WebgpuKernelSpec`-shaped program -- tinygrad's own scheduler fuses the
+   Conv3D and Relu into a **single** kernel here, with no fusion logic of
+   onnxsim's own involved.
+4. That live spec is checked, field for field, against an offline "ground
+   truth" spec (`make_webgpu_onnxrunner_fixture.py`) generated the exact
+   same way but with *different* random dummy data -- an exact match here
+   is real evidence the result is deterministic from shapes alone, not a
+   coincidence of matching inputs -- and then dispatched against a real
+   WebGPU device with the fixture's real weights, checked against
+   `onnx.reference.ReferenceEvaluator`.
+
+Two non-obvious things surfaced building this, both specific to using
+`OnnxRunner` rather than hand-building the `Tensor` graph:
+
+- **`tinygrad.nn.onnx` must be imported inside `Context(DEV="WEBGPU")`,
+  not just the tensors a caller builds.** That module evaluates a stray
+  `Tensor(0)` default argument (for `ConvInteger`) at *module import* time,
+  which resolves tinygrad's device default like any other tensor
+  construction -- harmless wherever some other usable device exists (a real
+  Python process normally has a working CPU backend), but Pyodide has *no*
+  usable tinygrad device at all outside that context (no GPU, no native
+  compiler for a CPU backend), so the bare import fails outright with "no
+  usable devices" otherwise.
+- **An initializer must be constructed directly on the target device, not
+  moved there afterward.** `OnnxPBParser` parses initializers on tinygrad's
+  *default* device; calling `OnnxRunner(...).to("WEBGPU")` afterward (the
+  single-node prototype never needed this, since its hand-built leaf
+  tensors were already constructed with `device="WEBGPU"`) inserts a
+  same-thread device-transfer op that, once scheduled, materializes into a
+  *new* buffer distinct from the one captured before scheduling -- so
+  matching an initializer's own buffer identity against the buffer the
+  compiled kernel actually reads silently fails. Building everything
+  (including the `OnnxRunner(...)` construction itself) inside
+  `Context(DEV="WEBGPU")` avoids the transfer, and therefore the mismatch,
+  entirely.
+
+Scope: still a single-output graph (multi-output would need iterating
+`OnnxRunner.graph_outputs`), and correctness of `OnnxRunner`'s own op
+*translations* is checked separately and natively -- in
+`make_webgpu_onnxrunner_fixture.py`, on tinygrad's ordinary CPU-ish device,
+against `ReferenceEvaluator` -- since Pyodide itself has no way to execute
+anything (no real device backend at all, same limitation
+`pyodide_tinygrad_codegen.test.mjs` already documented). What this does
+prove: a path to covering *any* op tinygrad's own ONNX importer already
+implements, for an *entire graph* at once, without onnxsim writing a single
+line of per-op translation -- a materially larger step than the single
+hand-picked `Conv` node above.
+
 ## What this does not do (yet)
 
 The single-flagged-node splice above is real and tested end to end, but

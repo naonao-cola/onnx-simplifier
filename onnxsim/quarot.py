@@ -108,16 +108,12 @@ import onnx
 import onnx.helper
 import onnx.numpy_helper
 
-from onnxsim import backend
 from onnxsim.adaround import _pack_int4
 from onnxsim.bias_correction import (
-    _activation_rows,
-    _add_probe_outputs,
     _all_names,
     _unique_name,
 )
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.gptq import _gptq_quantize_columns
+from onnxsim.calibration import Tensors
 from onnxsim.omniquant import _quantize_blockwise_int4_with_clip
 from onnxsim.quip_sharp import _match_matmul_like, _random_orthogonal_matrix
 
@@ -785,198 +781,36 @@ def apply_quarot_gptq(
             calibration data is left completely untouched. A model with no
             matching layer, or an opset older than 21, is returned
             unchanged (matching :func:`apply_quarot`).
+
+    The pure-Python rotation-plus-GPTQ implementation above has been
+    retired in favor of the verified C++ port -- this is now a thin alias
+    for :func:`onnxsim.apply_quarot_gptq_cpp` (``onnxsim/quarot_gptq_entry.cpp``'s
+    own ``ApplyQuarotGptq``), forwarding every argument unchanged.
+    **Behavior change from earlier onnxsim versions:** the C++ port draws
+    its per-layer random rotation via Gram-Schmidt with an independent
+    per-node RNG derivation, not this module's own sign-corrected QR
+    sequenced through a single ``numpy.random.Generator`` -- the same
+    permanent divergence :func:`apply_quarot`/:func:`onnxsim.apply_quarot_cpp`
+    already have from each other (see that pair's own docstrings). A given
+    ``seed`` therefore no longer derives the same rotation as
+    :func:`apply_quarot`'s own (true in every onnxsim version before this
+    alias), nor the same rotation this function itself produced before
+    being aliased -- both are still independently Haar-uniform, just a
+    different draw. Imported lazily (inside the function body, not at
+    module scope) to avoid a circular import: ``onnxsim.onnx_simplifier``
+    already imports from this module, so importing it back at module load
+    time here would deadlock the import machinery.
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if not _has_min_opset(model, 21):
-        return model
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_quarot_gptq_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    nodes = list(graph.node)
-    candidates = []
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, bias_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, bias_name, weight_transposed))
-
-    if not candidates:
-        return out
-
-    rng = np.random.default_rng(seed)
-
-    # Pass 1: derive each eligible layer's rotation via the exact same
-    # loop apply_quarot uses (matching node order, matching k % block_size
-    # skip before drawing from rng) so the "same seed" yields the same U
-    # per layer in both functions.
-    rotated = []
-    for node, x_name, w_name, bias_name, weight_transposed in candidates:
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_nk = w if weight_transposed else w.T  # [N, K], output channel first
-        n, k = w_nk.shape
-        if k % block_size != 0:
-            continue
-
-        u = _random_orthogonal_matrix(k, rng)  # [K, K]
-        rotated.append((node, x_name, w_name, bias_name, w_nk, n, k, u))
-
-    if not rotated:
-        return out
-
-    # Pass 2: capture every rotation-eligible layer's own (pre-rotation)
-    # activation from the *original* model -- same probe pattern as
-    # onnxsim.gptq.apply_gptq.
-    probe_names = sorted({r[1] for r in rotated})  # x_name
-    probe_model = _add_probe_outputs(model, probe_names)
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(result[name], dtype=np.float64))
-
-    for node, x_name, w_name, bias_name, w_nk, n, k, u in rotated:
-        acts = _activation_rows(activations[x_name])
-        if not acts:
-            continue  # no usable calibration activation -- leave untouched
-        x = np.concatenate(acts, axis=0)
-        if x.shape[1] != k:
-            continue  # activation's feature dim doesn't match K -- leave untouched
-
-        w_tilde_nk = w_nk @ u  # [N, K] -- exact before quantization
-        x_rotated = x @ u  # [S, K] -- same rotation, rotated-space Hessian
-        h = x_rotated.T @ x_rotated  # [K, K]
-
-        _, scale_blocks_nk = _quantize_blockwise_int4_with_clip(
-            w_tilde_nk, block_size, 1.0
-        )
-        codes_nk = _gptq_quantize_columns(
-            w_tilde_nk, scale_blocks_nk, block_size, h, percdamp, proc_block_size
-        )
-        codes_kn = codes_nk.T.astype(np.int64)  # [K, N], ready for a plain MatMul
-        scale_kn = scale_blocks_nk.T.astype(np.float32)  # [K/block_size, N]
-
-        prefix = f"{w_name}_quarot_gptq"
-        codes_name = _unique_name(f"{prefix}_codes", taken_names)
-        codes_tensor = onnx.TensorProto()
-        codes_tensor.name = codes_name
-        codes_tensor.data_type = onnx.TensorProto.INT4
-        codes_tensor.dims.extend([k, n])
-        codes_tensor.raw_data = _pack_int4(codes_kn)
-        graph.initializer.append(codes_tensor)
-
-        scale_name = _unique_name(f"{prefix}_scale", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(scale_kn, name=scale_name)
-        )
-        u_name = _unique_name(f"{prefix}_u", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(u.astype(np.float32), name=u_name)
-        )
-        eps_name = _unique_name(f"{prefix}_eps", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.array(epsilon, dtype=np.float32), name=eps_name
-            )
-        )
-        seven_name = _unique_name(f"{prefix}_seven", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.array(7.0, dtype=np.float32), name=seven_name
-            )
-        )
-        clip_min_name = _unique_name(f"{prefix}_clip_min", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.array(-7.0, dtype=np.float32), name=clip_min_name
-            )
-        )
-        clip_max_name = _unique_name(f"{prefix}_clip_max", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.array(7.0, dtype=np.float32), name=clip_max_name
-            )
-        )
-        axes_name = _unique_name(f"{prefix}_reduce_axes", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64), name=axes_name)
-        )
-
-        new_nodes: List[onnx.NodeProto] = []
-
-        def _new(op_type, inputs, out_suffix, **attrs):
-            out_name = _unique_name(f"{prefix}_{out_suffix}", taken_names)
-            n_ = onnx.helper.make_node(
-                op_type,
-                inputs,
-                [out_name],
-                name=_unique_name(f"{prefix}_{out_suffix}_node", taken_names),
-                **attrs,
-            )
-            new_nodes.append(n_)
-            return out_name
-
-        x_rotated_name = _new("MatMul", [x_name, u_name], "x_rotated")
-
-        # Data-free, per-token round-to-nearest INT4 activation
-        # quantization -- simulated via an immediate dequantize (kept in
-        # float32) rather than a true packed INT4 tensor, since X isn't
-        # constant: scale = max(reduce_max(abs(x_rotated), axis=-1), eps) / 7
-        abs_name = _new("Abs", [x_rotated_name], "x_abs")
-        max_name = _new("ReduceMax", [abs_name, axes_name], "x_max", keepdims=1)
-        safe_max_name = _new("Clip", [max_name, eps_name], "x_safe_max")
-        x_scale = _new("Div", [safe_max_name, seven_name], "x_scale")
-        x_scaled = _new("Div", [x_rotated_name, x_scale], "x_scaled")
-        x_rounded = _new("Round", [x_scaled], "x_rounded")
-        x_clipped = _new("Clip", [x_rounded, clip_min_name, clip_max_name], "x_clipped")
-        x_dequant = _new("Mul", [x_clipped, x_scale], "x_dequant")
-
-        w_dequant = _new(
-            "DequantizeLinear",
-            [codes_name, scale_name],
-            "w_dequant",
-            axis=0,
-            block_size=block_size,
-        )
-        core = _new("MatMul", [x_dequant, w_dequant], "core")
-
-        old_output = node.output[0]
-        if bias_name is not None:
-            final = onnx.helper.make_node(
-                "Add",
-                [core, bias_name],
-                [old_output],
-                name=_unique_name(f"{prefix}_bias_add_node", taken_names),
-            )
-        else:
-            final = onnx.helper.make_node(
-                "Identity",
-                [core],
-                [old_output],
-                name=_unique_name(f"{prefix}_identity_node", taken_names),
-            )
-        new_nodes.append(final)
-
-        node_idx = next(i for i, n_ in enumerate(graph.node) if n_ is node)
-        for offset, new_node in enumerate(new_nodes):
-            graph.node.insert(node_idx + offset, new_node)
-        del graph.node[node_idx + len(new_nodes)]
-
-    return out
+    return apply_quarot_gptq_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        block_size=block_size,
+        percdamp=percdamp,
+        proc_block_size=proc_block_size,
+        epsilon=epsilon,
+        providers=providers,
+    )

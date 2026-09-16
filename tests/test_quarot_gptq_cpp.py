@@ -1,15 +1,25 @@
 """Tests for ``onnxsim.apply_quarot_gptq_cpp`` -- the C++-backed port of
-``onnxsim.apply_quarot_gptq`` (see ``onnxsim/quarot_gptq_entry.h`` and
-``onnxsim/quarot.py``). Like ``test_quarot_cpp.py``, this pass draws a
-fresh random rotation per layer using its own independent RNG derivation
-(not a numpy Generator sequenced across matches in graph node order), so
-its output is expected to be *accurate*, not bit-identical to the Python
-port -- most tests below check structure and numerical accuracy rather
-than exact equality. The one exception is
+``onnxsim.quarot``'s own ``apply_quarot_gptq`` (see
+``onnxsim/quarot_gptq_entry.h`` and ``onnxsim/quarot.py``).
+
+``onnxsim.apply_quarot_gptq`` is now a thin alias for this C++ port (see
+``onnxsim/quarot.py``'s own docstring), so most of the tests below
+exercise ``apply_quarot_gptq_cpp`` directly -- calling
+``onnxsim.apply_quarot_gptq`` would just be an extra indirection to the
+same code. Like ``test_quarot_cpp.py``, this pass draws a fresh random
+rotation per layer using its own independent RNG derivation (not a numpy
+Generator sequenced across matches in graph node order), so a *given
+seed* is not expected to reproduce onnxsim.quarot's own pre-alias
+rotation -- see ``test_quarot.py``'s own
+``test_quarot_gptq_rotation_no_longer_matches_plain_quarot_after_aliasing``
+for that side of it (``apply_quarot`` itself was never aliased, so the
+two functions' rotations permanently diverge from each other now). The
+structural/numerical-accuracy tests below check this pass's own output
+rather than any cross-language comparison. The one exception is
 ``test_cpp_quarot_gptq_matches_python_quantization_math``, which plugs
-the C++ port's own rotation and captured calibration activations into the
-pure-Python GPTQ column algorithm to isolate that part of the pipeline
-from the two ports' unrelated RNGs -- there, exact agreement is expected
+the C++ port's own rotation and captured calibration activations into
+the pure-Python GPTQ column algorithm to isolate that part of the
+pipeline from RNG choice entirely -- there, exact agreement is expected
 and checked.
 """
 
@@ -267,30 +277,16 @@ def test_cpp_quarot_gptq_matches_python_quantization_math(block_size):
     np.testing.assert_allclose(scale_kn_cpp, scale_kn_ref, rtol=1e-5, atol=1e-6)
 
 
-def test_cpp_quarot_gptq_rotation_intentionally_diverges_from_python_for_same_seed():
-    # Locks in the same documented, permanent divergence
-    # test_quarot_cpp.py's own analogous test locks in for apply_quarot:
-    # this port builds its random rotation via Gram-Schmidt with a
-    # per-node RNG derivation, while apply_quarot_gptq (quarot.py) uses a
-    # sign-corrected QR decomposition sequenced through a single
-    # numpy.random.Generator. Both are independently Haar-uniform, but NOT
-    # expected to ever alias for the same seed.
+def test_cpp_quarot_gptq_python_alias_matches_the_cpp_port_exactly():
+    # onnxsim.apply_quarot_gptq is now a thin alias for this C++ port (see
+    # onnxsim/quarot.py's own docstring) -- unlike the old two-independent-
+    # implementations relationship this test module's own docstring
+    # describes, calling either name for the same arguments must produce
+    # byte-identical output, since they're the same code underneath.
     K, N = 32, 8
     model = _matmul_model(K=K, N=N, seed=20)
     calib = _correlated_calibration(K=K, seed=21)
 
     py_q = onnxsim.apply_quarot_gptq(model, calibration_data=calib, seed=123)
     cpp_q = onnxsim.apply_quarot_gptq_cpp(model, calibration_data=calib, seed=123)
-
-    def _rotation(m):
-        return next(
-            onnx.numpy_helper.to_array(t)
-            for t in m.graph.initializer
-            if list(t.dims) == [K, K]
-        )
-
-    u_py = _rotation(py_q)
-    u_cpp = _rotation(cpp_q)
-    assert np.allclose(u_py @ u_py.T, np.eye(K), atol=1e-4)
-    assert np.allclose(u_cpp @ u_cpp.T, np.eye(K), atol=1e-4)
-    assert not np.allclose(u_py, u_cpp)
+    assert py_q.SerializeToString() == cpp_q.SerializeToString()

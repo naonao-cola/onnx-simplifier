@@ -63,6 +63,62 @@ name: convertmodel WebGPU custom kernel dispatcher
 #     why), unlike every other job here, which reads only pre-committed
 #     fixtures.
 #
+#   * test/pyodide_webgpu_single_node_codegen.test.mjs -- the next step past
+#     the previous one: not just "tinygrad's codegen runs in Pyodide" but
+#     "it can regenerate the SAME kernel onnxsim.webgpu_tinygrad_codegen's
+#     generate_conv_kernel already produces server-side, for one real
+#     flagged node". Reads that node's own shapes/attributes straight out of
+#     webgpu_tinygrad_conv3d.onnx's bytes via the new onnx_conv_node_reader.mjs
+#     (no onnx-the-Python-package, no numpy), drives tinygrad-in-Pyodide with
+#     them, checks the result matches the fixture's own already-attached spec
+#     field for field, then dispatches that *live* spec (not the fixture's)
+#     against a real WebGPU device and checks the numeric output -- so it
+#     needs both real network access (the PyPI wheel fetch) and a real
+#     GPU-backed browser, unlike either of the two jobs it draws on.
+#
+#   * test/pyodide_webgpu_onnxrunner_codegen.test.mjs -- generalizes the
+#     previous one past a single hand-picked op: drives **tinygrad's own
+#     generic ONNX importer** (tinygrad.nn.onnx.OnnxRunner) directly on a
+#     whole multi-node model's raw bytes inside Pyodide, with no onnxsim
+#     per-op translation and no JS-side shape/attribute reader at all
+#     (OnnxRunner has its own hand-rolled protobuf parser). Exercises a real
+#     two-op graph (Conv3D -> Relu, which tinygrad's own scheduler fuses into
+#     one kernel) including an op onnxsim has no bespoke codegen for at all,
+#     checks the live spec against an offline "ground truth" spec generated
+#     the same way with different random data (make_webgpu_onnxrunner_fixture.py),
+#     then dispatches the live spec against a real WebGPU device. Same
+#     network + GPU-backed-browser requirements as the job above.
+#
+#   * test/webgpu_kernel_tuning.test.mjs -- REQUIRED. Proves
+#     onnxsim.webgpu_kernel_tuning.generate_kernel_candidates's whole point:
+#     several *alternative* WGSL kernels for the same real Conv2D (different
+#     tinygrad Opt tunings -- tinygrad's own BEAM search can't be reused
+#     directly here, since it insists on a real, natively-loaded Device to
+#     time candidates itself; see that module's own docstring) all dispatch
+#     correctly on a real WebGPU device, and dispatchWebgpuProgram's own
+#     profile: true option reports real, usably-different per-candidate GPU
+#     durations -- checked once by hand against this exact fixture: the
+#     untuned baseline was the *slowest* of 8 candidates, ~3x slower than
+#     the fastest tuned one. The fixture
+#     (webgpu_kernel_tuning_fixture.json) is pre-generated and committed by
+#     make_webgpu_kernel_tuning_fixture.py, same convention as the other
+#     fixture-based jobs.
+#
+#   * test/webgpu_kernel_tuning_vs_webnn.test.mjs -- ATTEMPTED AND REPORTED,
+#     never required, same posture as webnn_reshape_placement.test.mjs in
+#     convertmodel-ep-placement.yml: runs the exact same Conv2D from the
+#     webgpu-kernel-tuning job above through onnxruntime-web's WebNN EP
+#     (webgpu_kernel_tuning_fixture.onnx, also emitted by
+#     make_webgpu_kernel_tuning_fixture.py) and times it wall-clock against
+#     the fastest tinygrad-tuned candidate, wall-clock too, to answer "how
+#     much could tinygrad's own tuned kernel outperform WebNN here". Skips
+#     the comparison (not the whole job) when this runner's Chromium has no
+#     WebNN device reachable -- see that test file's own docstring for a
+#     measured result from this repo's own dev sandbox and why its direction
+#     shouldn't be treated as settled without a run on real hardware. Set
+#     ORT_REQUIRE_WEBNN=1 (via workflow_dispatch, edited in here, or a repo
+#     variable) once/if WebNN is confirmed reliable in this repo's own CI.
+#
 # Scheduled + on demand, plus on PRs that touch the files this check depends
 # on, same reasoning as convertmodel-webgpu-demo.yml / convertmodel-ep-placement.yml.
 
@@ -70,6 +126,11 @@ on:
   schedule:
     - cron: "0 10 * * 1" # Mondays 10:00 UTC (weekly, offset from the other two WebGPU workflows)
   workflow_dispatch:
+    inputs:
+      require_webnn:
+        description: "Fail the tuning-vs-WebNN job if no WebNN device is reachable here (ORT_REQUIRE_WEBNN)"
+        type: boolean
+        default: false
   pull_request:
     paths:
       - ".github/workflows/convertmodel-webgpu-kernel-dispatcher.yml"
@@ -79,6 +140,19 @@ on:
       - "scripts/convertmodel/test/onnx_node_metadata.test.mjs"
       - "scripts/convertmodel/test/webgpu_kernel_annotations.test.mjs"
       - "scripts/convertmodel/test/pyodide_tinygrad_codegen.test.mjs"
+      - "scripts/convertmodel/test/pyodide_webgpu_single_node_codegen.test.mjs"
+      - "scripts/convertmodel/onnx_conv_node_reader.mjs"
+      - "scripts/convertmodel/test/pyodide_webgpu_onnxrunner_codegen.test.mjs"
+      - "scripts/convertmodel/test/make_webgpu_onnxrunner_fixture.py"
+      - "scripts/convertmodel/test/webgpu_onnxrunner_conv_relu.onnx"
+      - "scripts/convertmodel/test/webgpu_onnxrunner_fixture.json"
+      - "scripts/convertmodel/test/webgpu_kernel_tuning.test.mjs"
+      - "scripts/convertmodel/test/webgpu_kernel_tuning_vs_webnn.test.mjs"
+      - "scripts/convertmodel/test/make_webgpu_kernel_tuning_fixture.py"
+      - "scripts/convertmodel/test/webgpu_kernel_tuning_fixture.json"
+      - "scripts/convertmodel/test/webgpu_kernel_tuning_fixture.onnx"
+      - "scripts/convertmodel/webnn.mjs"
+      - "onnxsim/webgpu_kernel_tuning.py"
       - "scripts/convertmodel/test/make_webgpu_kernel_fixture.py"
       - "scripts/convertmodel/test/make_webgpu_tinygrad_codegen_fixture.py"
       - "scripts/convertmodel/test/make_webgpu_custom_kernel_runtime_fixture.py"
@@ -165,6 +239,46 @@ jobs:
         working-directory: scripts/convertmodel
         run: npm run test:webgpu-tinygrad-codegen
 
+  webgpu-kernel-tuning:
+    name: WebGPU kernel tuning (browser-timed candidates, required)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (onnxruntime-web, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the WebGPU kernel tuning check
+        working-directory: scripts/convertmodel
+        run: npm run test:webgpu-kernel-tuning
+
+  webgpu-kernel-tuning-vs-webnn:
+    name: WebGPU kernel tuning vs WebNN (best-effort)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (onnxruntime-web, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the WebGPU kernel tuning vs WebNN check
+        working-directory: scripts/convertmodel
+        env:
+          ORT_REQUIRE_WEBNN: ${{ inputs.require_webnn && '1' || '' }}
+        run: npm run test:webgpu-kernel-tuning-vs-webnn
+
   webgpu-custom-kernel-runtime:
     name: WebGPU custom kernel runtime (ort-web splice, required)
     runs-on: macos-15
@@ -199,3 +313,41 @@ jobs:
       - name: Run the Pyodide + tinygrad codegen check
         working-directory: scripts/convertmodel
         run: npm run test:pyodide-tinygrad-codegen
+
+  pyodide-single-node-codegen:
+    name: Live single-node WebGPU kernel generation (Pyodide + real GPU)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (pyodide, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the single-node live WebGPU codegen check
+        working-directory: scripts/convertmodel
+        run: npm run test:pyodide-single-node-codegen
+
+  pyodide-onnxrunner-codegen:
+    name: Live whole-graph WebGPU kernel generation via tinygrad's ONNX importer (Pyodide + real GPU)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (pyodide, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the OnnxRunner whole-graph live WebGPU codegen check
+        working-directory: scripts/convertmodel
+        run: npm run test:pyodide-onnxrunner-codegen

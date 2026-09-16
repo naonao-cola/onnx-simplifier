@@ -675,6 +675,89 @@ onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufQ4_0(const onnx::ModelProto& model);
 onnx::ModelProto ApplyGgufQ4_1(const onnx::ModelProto& model);
 
+// llama.cpp's legacy GGUF Q5_0/Q5_1 block formats -- C++ port of
+// gguf_legacy_quant_5bit.py's own apply_gguf_q5_0_quantization/
+// apply_gguf_q5_1_quantization, the same scheme as
+// ApplyGgufQ4_0/ApplyGgufQ4_1 above, one bit wider (code in [0, 31]). See
+// passes/gguf_legacy_quant_5bit.h for the exact reconstruction formulas
+// and the same ACCEPTED, PERMANENT DIVERGENCE note (with s/Q4/Q5/) --
+// ApplyGgufQ5_0/ApplyGgufQ5_1 and their _cpp Python wrappers and
+// apply_gguf_q5_0_quantization/apply_gguf_q5_1_quantization are
+// independently-correct, non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyGgufQ5_0(const onnx::ModelProto& model);
+onnx::ModelProto ApplyGgufQ5_1(const onnx::ModelProto& model);
+
+// llama.cpp's GGUF Q8_0 block format -- C++ port of gguf_q8_0.py's own
+// apply_gguf_q8_0_quantization: a plain 32-element block, one fp16 scale,
+// signed 8-bit code with no bias/min (`dequant = code * d`). See
+// passes/gguf_q8_0.h for the exact reconstruction formula and the same
+// ACCEPTED, PERMANENT DIVERGENCE note (with s/Q4/Q8/) --
+// ApplyGgufQ8_0 and its _cpp Python wrapper and
+// apply_gguf_q8_0_quantization are independently-correct,
+// non-interchangeable entry points, not aliases. Unlike the Python side,
+// this port does not add an include_conv option (only a constant 2-D
+// weight on MatMul/vanilla-Gemm is matched), matching gguf_q6_k.h's own
+// established scope decision.
+onnx::ModelProto ApplyGgufQ8_0(const onnx::ModelProto& model);
+
+// llama.cpp's GGUF Q2_K K-quant format -- C++ port of gguf_q2_k.py's own
+// apply_gguf_q2_k_quantization: a 256-element super-block split into 16
+// sub-blocks of 16, each with its own asymmetric affine (scale, min)
+// pair re-quantized to 4-bit codes relative to one shared super-block
+// (d, dmin) reference pair, times a 2-bit element code
+// (`dequant = d*sc_j*q - dmin*m_j`). See passes/gguf_q2_k.h for the
+// exact reconstruction formula and the same ACCEPTED, PERMANENT
+// DIVERGENCE note (with s/Q6/Q2/) -- ApplyGgufQ2K and its _cpp Python
+// wrapper and apply_gguf_q2_k_quantization are independently-correct,
+// non-interchangeable entry points, not aliases. Unlike the Python side,
+// this port does not add an include_conv option (only a constant 2-D
+// weight on MatMul/vanilla-Gemm is matched), matching gguf_q6_k.h's own
+// established scope decision.
+onnx::ModelProto ApplyGgufQ2K(const onnx::ModelProto& model);
+
+// llama.cpp's GGUF Q3_K K-quant format -- C++ port of gguf_q3_k.py's own
+// apply_gguf_q3_k_quantization: a 256-element super-block split into 16
+// sub-blocks of 16, each with its own 6-bit unsigned scale code sc_j
+// ([0, 63], restricted by this encoder to a non-negative offset,
+// sc_j - 32 in [0, 31]) times one shared float16 super-block scale
+// d_all, times the format's own asymmetric 3-bit element code q
+// ([-4, 3]) -- `dequant = d_all * (sc_j - 32) * q`. See
+// passes/gguf_q3_k.h for the exact reconstruction formula and the same
+// ACCEPTED, PERMANENT DIVERGENCE note (with s/Q6/Q3/) -- ApplyGgufQ3K and
+// its _cpp Python wrapper and apply_gguf_q3_k_quantization are
+// independently-correct, non-interchangeable entry points, not aliases.
+// Unlike the Python side, this port does not add an include_conv option
+// (only a constant 2-D weight on MatMul/vanilla-Gemm is matched),
+// matching gguf_q6_k.h's own established scope decision.
+onnx::ModelProto ApplyGgufQ3K(const onnx::ModelProto& model);
+
+// llama.cpp's GGUF Q4_K K-quant format -- C++ port of onnxsim.gguf_kquant's
+// own apply_gguf_q4_k_quantization: a 256-element super-block split into
+// 8 sub-blocks of 32, each with its own asymmetric affine (scale, min)
+// pair re-quantized to 6-bit codes relative to one shared super-block
+// (d, dmin) reference pair, times a 4-bit element code
+// (`dequant = d*sc_j*q - dmin*m_j`). See passes/gguf_q4_k.h for the
+// exact reconstruction formula and the same ACCEPTED, PERMANENT
+// DIVERGENCE note (with s/Q2/Q4/) -- ApplyGgufQ4K and its _cpp Python
+// wrapper and apply_gguf_q4_k_quantization are independently-correct,
+// non-interchangeable entry points, not aliases. Unlike the Python side,
+// this port does not add an include_conv option (only a constant 2-D
+// weight on MatMul/vanilla-Gemm is matched), matching gguf_q6_k.h's own
+// established scope decision.
+onnx::ModelProto ApplyGgufQ4K(const onnx::ModelProto& model);
+
+// llama.cpp's GGUF Q5_K K-quant format -- C++ port of onnxsim.gguf_q5_k's
+// own apply_gguf_q5_k_quantization: identical to ApplyGgufQ4K above
+// except the element code is 5 bits ([0, 31]) rather than Q4_K's 4. See
+// passes/gguf_q5_k.h for the exact reconstruction formula and the same
+// ACCEPTED, PERMANENT DIVERGENCE note (with s/Q4/Q5/) -- ApplyGgufQ5K and
+// its _cpp Python wrapper and apply_gguf_q5_k_quantization are
+// independently-correct, non-interchangeable entry points, not aliases.
+// Unlike the Python side, this port does not add an include_conv option
+// (only a constant 2-D weight on MatMul/vanilla-Gemm is matched),
+// matching gguf_q6_k.h's own established scope decision.
+onnx::ModelProto ApplyGgufQ5K(const onnx::ModelProto& model);
+
 // BitNet b1.58's published absmean ternary weight quantization (Ma et al.,
 // 2024, "The Era of 1-bit LLMs"), as shipped by llama.cpp's GGUF
 // TQ1_0/TQ2_0 tensor types -- C++ port of gguf_ternary_quant.py's own
