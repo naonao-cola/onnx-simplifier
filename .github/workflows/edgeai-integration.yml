@@ -1,0 +1,174 @@
+name: Edgeai Integration
+
+# Checks onnxsim's output against TI's TIDL (edgeai) accelerator toolchain
+# -- see scripts/edgeai/README.md.
+#
+# Unlike QNN/OpenVINO/MIGraphX's execution providers, the TIDL-enabled
+# onnxruntime build (`onnxruntime_tidl`, TI's own fork) is not on PyPI --
+# it ships as part of TI's PSDK/edgeai-tidl-tools SDK, downloaded from
+# `software-dl.ti.com`. Two jobs here, in increasing order of how real they
+# are:
+#
+# - `tidl-compat`: a static, dependency-light heuristic
+#   (tests/test_edgeai_tidl_compat.py, scripts/edgeai/run_tidl_compat.py)
+#   that runs on any stock runner with just onnxsim -- no download, no
+#   device. Always runs.
+# - `tidl-real-compile`: an *actual* compile, via the real
+#   `onnxruntime_tidl` wheel + `tidl_tools` binaries in x86 "PC
+#   emulation"/compile-only mode (tests/test_edgeai_tidl_real_compile.py,
+#   scripts/edgeai/real_compile.py) -- genuinely real, not a mock, though
+#   it's the compile/import stage only, not on-device inference (see that
+#   module's docstring). This needs no Docker and no self-hosted runner
+#   (unlike axera-integration.yml's `pulsar2-docker-convert`, which is
+#   gated on both) -- just network access to `software-dl.ti.com` and the
+#   `downloads.ti.com` host its download links redirect to, which a normal
+#   GitHub-hosted runner has and this repository's own contributor-facing
+#   documentation did not always assume (see scripts/edgeai/README.md's
+#   history for why the static check was the only thing here at first).
+#   Not yet verified on an actual GitHub Actions runner -- only reproduced
+#   directly in a development sandbox with the same network access.
+
+on:
+  schedule:
+    - cron: "0 8 * * 1" # Mondays 08:00 UTC (weekly)
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/edgeai-integration.yml"
+      - "scripts/edgeai/**"
+      - "scripts/common/**"
+      - "tests/test_edgeai_tidl_compat.py"
+      - "tests/test_edgeai_legalize.py"
+      - "tests/test_edgeai_quantize_for_tidl.py"
+      - "tests/test_edgeai_tidl_real_compile.py"
+
+concurrency:
+  group: edgeai-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build onnxsim wheel
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Build cp312 wheel
+        uses: pypa/cibuildwheel@v4.2.1
+        env:
+          CIBW_BUILD: "cp312-manylinux_x86_64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel-edgeai
+          path: ./wheelhouse/*.whl
+
+  tidl-compat:
+    name: TIDL compatibility check (static, no SDK/device)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-edgeai
+          path: wheelhouse
+      - name: Install onnxsim wheel
+        run: |
+          python -m pip install --upgrade pip
+          # onnxruntime: quantize_for_tidl.py's onnxsim.calibration.quantize_static
+          # runs the float model to collect calibration ranges.
+          python -m pip install pytest onnxruntime
+          python -m pip install wheelhouse/*.whl
+      # Run from runner.temp, not the checkout: the repo root contains the
+      # `onnxsim/` source dir (no compiled extension), which would shadow the
+      # installed wheel on `import onnxsim`. Reference the harness by absolute
+      # $GITHUB_WORKSPACE path. Same guard the EP/model-regression workflows use.
+      - name: Show environment
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim; print('onnxsim', onnxsim.__version__)"
+      - name: Run static TIDL compatibility suite
+        working-directory: ${{ runner.temp }}
+        run: |
+          pytest -v "$GITHUB_WORKSPACE/tests/test_edgeai_tidl_compat.py" \
+            "$GITHUB_WORKSPACE/tests/test_edgeai_legalize.py" \
+            "$GITHUB_WORKSPACE/tests/test_edgeai_quantize_for_tidl.py"
+          python "$GITHUB_WORKSPACE/scripts/edgeai/run_tidl_compat.py" \
+            --output tidl-compat.csv
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: tidl-compat-report
+          path: ${{ runner.temp }}/tidl-compat.csv
+          if-no-files-found: ignore
+
+  tidl-real-compile:
+    name: Real TIDL compile check (x86 PC emulation, no device)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      # Two Pythons in one job: onnxsim's own wheel is cp312 (matching the
+      # `build` job above); the real onnxruntime_tidl wheel TI publishes is
+      # cp310-only (see scripts/edgeai/real_compile.py's docstring) and
+      # needs its own venv. Referencing each by its `python-path` output
+      # avoids relying on whichever setup-python call last won PATH.
+      - uses: actions/setup-python@v7
+        id: py312
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-python@v7
+        id: py310
+        with:
+          python-version: "3.10"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-edgeai
+          path: wheelhouse
+      - name: Install onnxsim + pytest (cp312)
+        run: |
+          "${{ steps.py312.outputs.python-path }}" -m pip install --upgrade pip
+          # onnxruntime: quantize_for_tidl.py's onnxsim.calibration.quantize_static
+          # (used by test_prequantized_qdq_import_still_crashes) runs the float
+          # model to collect calibration ranges.
+          "${{ steps.py312.outputs.python-path }}" -m pip install onnx onnxruntime pytest wheelhouse/*.whl
+      - name: Download the real tidl_tools + onnxruntime_tidl wheel
+        run: |
+          "${{ steps.py312.outputs.python-path }}" \
+            "$GITHUB_WORKSPACE/scripts/edgeai/real_compile.py" setup \
+            "${{ runner.temp }}/tidl" --soc J721S2
+      - name: Set up the onnxruntime_tidl venv (Python 3.10, numpy<2)
+        run: |
+          "${{ steps.py310.outputs.python-path }}" -m venv "${{ runner.temp }}/tidl_venv"
+          "${{ runner.temp }}/tidl_venv/bin/pip" install --upgrade pip
+          "${{ runner.temp }}/tidl_venv/bin/pip" install \
+            "${{ runner.temp }}"/tidl/onnxruntime_tidl-*.whl "numpy<2"
+      - name: Run the real compile check
+        working-directory: ${{ runner.temp }}
+        env:
+          TIDL_PYTHON: ${{ runner.temp }}/tidl_venv/bin/python
+          TIDL_TOOLS_PATH: ${{ runner.temp }}/tidl/tidl_tools
+        run: |
+          "${{ steps.py312.outputs.python-path }}" -m pytest -v \
+            "$GITHUB_WORKSPACE/tests/test_edgeai_tidl_real_compile.py"
