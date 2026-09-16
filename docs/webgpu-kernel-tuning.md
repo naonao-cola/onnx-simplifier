@@ -129,3 +129,67 @@ gaps (non-constant `Reshape`/`Expand` shapes, INT64 graph boundaries) mean
 "reachable" is model-dependent, and this comparison only covers the one op
 it measures, not the fusion patterns (conv+activation) the original question
 also asked about.
+
+## Running the tuner from the actual converter page
+
+Everything above ran offline (a Python script) or through a Node+Playwright
+test -- useful for proving the idea, but not something a visitor to the
+actual converter page (`scripts/convertmodel/index.html`) could ever trigger
+themselves. `scripts/convertmodel/webgpu_kernel_tuner.mjs` closes that gap: an
+opt-in **"Tune this kernel…"** button on a `Conv` node's own entry in the
+existing "Custom WebGPU kernels" panel
+(`webgpu_kernel_annotations_view.mjs`) runs the *entire* loop above live, in
+the browser, no server involved:
+
+1. **Generation, live, via Pyodide.** `onnx_conv_node_reader.mjs` reads the
+   target node's shapes/attributes straight out of the model bytes already in
+   the page (no re-upload). `webgpu_kernel_tuner.mjs` then boots
+   [Pyodide](https://pyodide.org/) (loaded from a CDN on first use, not
+   bundled into the page) and fetches tinygrad's wheel straight from PyPI --
+   the same numpy-free, onnx-free technique
+   `pyodide_webgpu_single_node_codegen.test.mjs` already proved works for a
+   single kernel, extended here to `onnxsim.webgpu_kernel_tuning`'s own
+   `Scheduler`/`get_kernel_actions` approach so *several* candidates come
+   back, not just one. Both downloads are real, multi-second, multi-megabyte
+   fetches -- nothing loads until the button is clicked, and a second tuning
+   run (same node or a different one) reuses the already-booted runtime.
+2. **Dispatch, live, on a real device.** Every candidate is dispatched via
+   the page's own `webgpu_kernel_dispatcher.mjs` against random data matching
+   the node's real shapes (see `webgpu_kernel_tuner.mjs`'s own docstring for
+   why random data is exactly as valid here as real pipeline data would be --
+   picking a winner is about speed, and kernel generation never depends on
+   concrete values), timed the same way `webgpu_kernel_tuning_vs_webnn.test.mjs`
+   times its own candidates, ranked, fastest first.
+3. **Export.** Clicking **"Export tuned model"** attaches the winning
+   candidate's `WebgpuKernelSpec` onto that exact node via
+   `onnx_metadata_writer.mjs`'s `attachWebgpuKernelSpec` -- the write-side
+   counterpart to `onnx_node_metadata.mjs`'s read-only
+   `readWebgpuKernelSpecs`, and the JS equivalent of
+   `onnxsim.webgpu_kernel_metadata.attach_webgpu_kernel` -- and downloads the
+   result. This is a from-scratch, hand-rolled protobuf field editor (see
+   that module's own docstring): it never assumes it understands the whole
+   `ModelProto` schema, only the one path from the top-level message down to
+   the target node's `metadata_props`, so every other field at every level
+   (initializers, other nodes, opset imports, ...) round-trips untouched,
+   verified byte-for-byte in `test/onnx_metadata_writer.test.mjs`. Nothing
+   about Simplify/Optimize themselves changes -- a tuned export is a separate
+   download, on top of whatever model bytes are already in the page.
+
+Scope matches `onnx_conv_node_reader.mjs`'s own: a `Conv` node (any spatial
+rank, including what this repo calls "Conv3D") with fully static shapes, and
+only when tinygrad schedules it to exactly one kernel call. Clicking Tune on
+anything else surfaces `readConvNodeInfo`'s own clear error rather than
+silently doing nothing.
+
+**Verified end to end** in `test/webgpu_kernel_tuner_ui.test.mjs`, driving the
+*real* page (not a synthetic harness): load a fixture, click Tune, wait for
+several real candidates with real per-candidate timings, click Export, and
+confirm the downloaded model's attached kernel both matches the chosen
+winner and still computes the right answer against the same ground truth
+`webgpu_tinygrad_codegen.test.mjs` itself checks against. The one piece that
+sandbox couldn't verify against the real, public CDN is noted in that test's
+own comment (an internal network-policy restriction specific to this repo's
+dev sandbox, not a property of a real visitor's browser or of the CI runner
+this test runs on) -- everything else, including the tinygrad-wheel-from-PyPI
+fetch, the real dispatch loop, and the export/re-verify round trip, was
+proven working, unmodified, end to end.

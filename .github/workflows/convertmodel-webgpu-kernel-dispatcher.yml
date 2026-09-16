@@ -119,6 +119,27 @@ name: convertmodel WebGPU custom kernel dispatcher
 #     ORT_REQUIRE_WEBNN=1 (via workflow_dispatch, edited in here, or a repo
 #     variable) once/if WebNN is confirmed reliable in this repo's own CI.
 #
+#   * test/onnx_metadata_writer.test.mjs -- REQUIRED, no browser. Unit-tests
+#     onnx_metadata_writer.mjs's attachWebgpuKernelSpec -- the write-side
+#     counterpart to onnx_node_metadata.mjs's read-only readWebgpuKernelSpecs
+#     -- against a real committed fixture, checking both that the attached
+#     spec reads back exactly and that every other node's raw bytes are
+#     provably untouched.
+#
+#   * test/webgpu_kernel_tuner_ui.test.mjs -- REQUIRED. The opt-in "Tune
+#     this kernel" button in the Custom WebGPU kernels panel
+#     (webgpu_kernel_annotations_view.mjs), driven end to end in the real
+#     converter page: loads a fixture with an attached Conv kernel, clicks
+#     Tune (real Pyodide + tinygrad, live in the page, generating several
+#     candidates via onnxsim.webgpu_kernel_tuning's own approach), dispatches
+#     every candidate on a real WebGPU device, picks the fastest, clicks
+#     Export, and checks the downloaded model's attached kernel both matches
+#     the winner and still computes the right answer. Needs real network
+#     access from inside the browser page itself (Pyodide from jsdelivr,
+#     tinygrad's wheel from PyPI) -- see that test's own comment for how it
+#     was verified in this repo's own dev sandbox, whose egress policy
+#     denies jsdelivr specifically.
+#
 # Scheduled + on demand, plus on PRs that touch the files this check depends
 # on, same reasoning as convertmodel-webgpu-demo.yml / convertmodel-ep-placement.yml.
 
@@ -165,9 +186,18 @@ on:
       - "scripts/convertmodel/test/webgpu_custom_kernel_runtime_post.onnx"
       - "scripts/convertmodel/test/webgpu_custom_kernel_runtime_fixture.json"
       - "scripts/convertmodel/onnx_node_metadata.mjs"
+      - "scripts/convertmodel/onnx_metadata_writer.mjs"
+      - "scripts/convertmodel/test/onnx_metadata_writer.test.mjs"
       - "scripts/convertmodel/webgpu_kernel_dispatcher.mjs"
       - "scripts/convertmodel/webgpu_custom_kernel_runtime.mjs"
       - "scripts/convertmodel/webgpu_kernel_annotations.mjs"
+      - "scripts/convertmodel/webgpu_kernel_annotations_view.mjs"
+      - "scripts/convertmodel/webgpu_kernel_tuner.mjs"
+      - "scripts/convertmodel/test/webgpu_kernel_tuner_ui.test.mjs"
+      - "scripts/convertmodel/onnx_conv_node_reader.mjs"
+      - "scripts/convertmodel/download.mjs"
+      - "scripts/convertmodel/style.css"
+      - "scripts/convertmodel/index.html"
       - "scripts/convertmodel/package.json"
       - "onnxsim/webgpu_kernel_metadata.py"
       - "onnxsim/webgpu_tinygrad_codegen.py"
@@ -200,6 +230,9 @@ jobs:
       - name: Run the WebGPU kernel annotations panel unit test
         working-directory: scripts/convertmodel
         run: npm run test:webgpu-kernel-annotations
+      - name: Run the ONNX metadata writer unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:onnx-metadata-writer
 
   webgpu-kernel-dispatcher:
     name: WebGPU custom kernel dispatch (required)
@@ -278,6 +311,25 @@ jobs:
         env:
           ORT_REQUIRE_WEBNN: ${{ inputs.require_webnn && '1' || '' }}
         run: npm run test:webgpu-kernel-tuning-vs-webnn
+
+  webgpu-kernel-tuner-ui:
+    name: WebGPU kernel tuner UI (Pyodide + tinygrad, live in page, required)
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the WebGPU kernel tuner UI check
+        working-directory: scripts/convertmodel
+        run: npm run test:webgpu-kernel-tuner-ui
 
   webgpu-custom-kernel-runtime:
     name: WebGPU custom kernel runtime (ort-web splice, required)
