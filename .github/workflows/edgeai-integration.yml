@@ -25,6 +25,7 @@ on:
       - "scripts/edgeai/**"
       - "scripts/common/**"
       - "tests/test_edgeai_tidl_compat.py"
+      - "tests/test_edgeai_legalize.py"
 
 concurrency:
   group: edgeai-integration-${{ github.ref }}
@@ -92,7 +93,8 @@ jobs:
       - name: Run static TIDL compatibility suite
         working-directory: ${{ runner.temp }}
         run: |
-          pytest -v "$GITHUB_WORKSPACE/tests/test_edgeai_tidl_compat.py"
+          pytest -v "$GITHUB_WORKSPACE/tests/test_edgeai_tidl_compat.py" \
+            "$GITHUB_WORKSPACE/tests/test_edgeai_legalize.py"
           python "$GITHUB_WORKSPACE/scripts/edgeai/run_tidl_compat.py" \
             --output tidl-compat.csv
       - uses: actions/upload-artifact@v7

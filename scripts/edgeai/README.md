@@ -57,6 +57,42 @@ provisioned, replace this with an actual model-import/compile check, the way
 `scripts/qualcomm`/`scripts/intel`/`scripts/amd` wrap a real execution
 provider.
 
+## Running TI's real tools
+
+Neither TI's binary download host (`software-dl.ti.com`, where
+edgeai-tidl-tools' setup script fetches the actual `tidl_tools`/
+`onnxruntime_tidl` artifacts from) nor `github.com/TexasInstruments/*` are
+reachable from this repository's CI or from a normal contributor checkout
+without that SDK already installed, so there is currently no way to
+replace this static heuristic with a real compile/import check from here.
+If a runner with the real SDK is ever provisioned, wire it in as a
+`workflow_dispatch`-only job (like `axera-integration.yml`'s
+`pulsar2-docker-convert`), which stays dormant until such a runner exists.
+
+## `legalize.py`: acting on what the heuristic flags
+
+A static check can flag a graph; it can't fix it. `legalize.py` holds
+semantics-preserving rewrites that fuse a decomposed op export into the
+form edgeai-tidl-tools' documentation prefers:
+
+- `fuse_decomposed_layernorm` -- the hand-written `ReduceMean`/`Sub`/
+  `Pow(2)`/`ReduceMean`/`Add`/`Sqrt`/`Div` chain `has_decomposed_normalization()`
+  flags, replaced with a single `LayerNormalization` node (folding a
+  trailing `Mul(scale)`/`Add(bias)` pair into its scale/bias inputs when
+  present).
+- `fuse_erf_gelu` -- the exact/erf-based GELU export
+  (`0.5 * x * (1 + Erf(x / sqrt(2)))`, what `torch.onnx.export` gives
+  `nn.GELU()` before opset 20 added a native op) replaced with the fused
+  `Gelu` op.
+
+Both are exact, not approximate, and only fire on the specific node
+wiring real exporters produce -- see each rule's own docstring for exactly
+what is matched and what is conservatively left alone. Run standalone as
+`legalize.py in.onnx out.onnx`, or call `legalize(model)` directly; see
+`../../tests/test_edgeai_legalize.py` for the correctness checks (each
+rewrite is compared against `onnx.reference.ReferenceEvaluator` on the
+original graph).
+
 ## Files
 
 - `tidl_ops.py` -- the op-type blocker lists (control flow, Sequence/
@@ -79,4 +115,7 @@ provider.
   for the exact steps and status values.
 - `run_tidl_compat.py` -- drives `worker.py` over the whole suite (or a
   `--models` subset) and writes a CSV report.
+- `legalize.py` -- the fusion rewrites described above.
 - `../../tests/test_edgeai_tidl_compat.py` -- the pytest suite CI runs.
+- `../../tests/test_edgeai_legalize.py` -- correctness checks for
+  `legalize.py`'s rewrites.
