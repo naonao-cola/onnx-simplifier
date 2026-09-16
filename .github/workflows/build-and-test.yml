@@ -55,7 +55,20 @@ jobs:
       # job specifically: it doesn't install z3-solver at all).
       CIBW_TEST_REQUIRES: pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy onnx-shape-inference onnxslim onnx_safetensors
       CIBW_BEFORE_TEST: pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
-      CIBW_TEST_COMMAND: pytest -v ${{ matrix.pytest_args }} {project}/tests && onnxsim -h && onnxsim --list-default-optimizers
+      # The axera/quantization/pruning suites (tests/test_axera_*.py,
+      # tests/test_axelera_*.py, tests/test_pulsar2_*.py,
+      # tests/test_voyager_sdk_patterns.py, and every file whose name
+      # contains "quant"/"gguf"/"prun" -- see tests/conftest.py's
+      # pytest_collection_modifyitems for how the three markers below get
+      # applied) exercise onnxsim's own algorithm/format logic against
+      # onnx's reference evaluator or a committed fixture, not anything
+      # OS/arch/interpreter-dependent. Running hundreds of such tests
+      # identically on every one of this matrix's legs (2 OSes x up to 4
+      # Python versions) would just multiply CI cost with no additional
+      # coverage, so they're deselected here and instead run exactly once,
+      # in the dedicated test_axera_quantization_pruning job below (same
+      # rationale as test_formal_verification and its Z3 proof suite).
+      CIBW_TEST_COMMAND: pytest -v -m "not axera and not quantization and not pruning" ${{ matrix.pytest_args }} {project}/tests && onnxsim -h && onnxsim --list-default-optimizers
       # Only build on Python 3 and skip 32-bit or musl builds
       CIBW_SKIP: "*-win32 *-manylinux_i686 *-musllinux_*"
       # The extension is built RelWithDebInfo (see setup.py) so the sanitizer
@@ -92,17 +105,6 @@ jobs:
             # Windows runner (see test_wheels_windows_cross). Skip it here; the
             # same test still runs on the cp311-cp313 jobs (cp311/cp312 on PRs).
             pytest_args: '-k "not test_ext"'
-          # macOS has no OS-specific behavior to cover in the axera/
-          # quantization/pruning suites (they exercise onnxsim's own
-          # algorithm/format logic against onnx's reference evaluator, not
-          # anything platform-dependent) -- skip them here since the ubuntu-*
-          # legs above already run them in full on every py_ver. Matches a
-          # subset of matrix keys (os only), so this merges into every
-          # macos-15 combination above rather than adding a new job. See
-          # tests/conftest.py's pytest_collection_modifyitems for how the
-          # axera/quantization/pruning markers get applied.
-          - os: macos-15
-            pytest_args: '-m "not axera and not quantization and not pruning"'
         # macOS runners are the slowest/most contended in this matrix; a pull
         # request only needs one macOS build to confirm the platform still
         # works, so drop it down to the oldest supported version there. push
@@ -191,6 +193,63 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           pytest -v "${GITHUB_WORKSPACE}"/tests/test_formal_verify_*.py "${GITHUB_WORKSPACE}/tests/test_fusion_patterns.py" "${GITHUB_WORKSPACE}/tests/test_ort_matmul_nbits_workaround.py"
+
+  # Runs onnxsim's Axera/Axelera/Pulsar2 NPU-backend suite plus the
+  # quantization- and pruning-algorithm suites (tests/test_axera_*.py,
+  # tests/test_axelera_*.py, tests/test_pulsar2_*.py,
+  # tests/test_voyager_sdk_patterns.py, and every test file whose name
+  # contains "quant"/"gguf"/"prun" -- see tests/conftest.py's
+  # pytest_collection_modifyitems for how the axera/quantization/pruning
+  # markers below get applied) exactly ONCE -- these tests exercise
+  # onnxsim's own algorithm/format logic against onnx's reference evaluator
+  # (or, for the Axera mcode suites, a committed fixture), not anything
+  # OS/arch/interpreter-dependent, so running hundreds of them identically
+  # on every build_wheels/test_wheels_windows_cross leg (2 OSes x up to 4
+  # Python versions) would just multiply CI cost with no additional
+  # coverage. They run exactly once here instead; every other leg
+  # deselects all three markers with
+  # `-m "not axera and not quantization and not pruning"`.
+  #
+  # Deliberately does NOT `needs: build_wheels`, for the same reason
+  # test_formal_verification (right above) doesn't: it builds its own
+  # onnxsim extension (native `pip install .`, matching what the wheel
+  # build ships) so it runs fully in parallel with build_wheels rather than
+  # serialized behind its slowest (macOS) leg.
+  test_axera_quantization_pruning:
+    name: Axera/quantization/pruning suites
+    runs-on: ubuntu-24.04
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      CMAKE_LINKER_TYPE: LLD
+      SCCACHE_GHA_ENABLED: on
+      ACTIONS_CACHE_SERVICE_V2: on
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ninja sccache pytest onnxruntime ml_dtypes
+          python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu/
+      - name: Build and install onnxsim
+        run: python -m pip install -v .
+      # Run from a neutral directory, same reason as test_formal_verification
+      # above: the repo root's ./onnxsim source package would otherwise
+      # shadow the installed wheel on sys.path.
+      - name: Verify onnxsim under test is the freshly built extension
+        working-directory: ${{ runner.temp }}
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print('onnxsim', onnxsim.__version__); print(m.__file__)"
+      - name: Run Axera/quantization/pruning suites
+        working-directory: ${{ runner.temp }}
+        run: |
+          pytest -v -m "axera or quantization or pruning" "${GITHUB_WORKSPACE}/tests"
 
   # Windows wheels are cross-compiled on a cheap Ubuntu runner with llvm-mingw
   # (clang + lld + a self-contained UCRT sysroot) instead of built natively on a
@@ -305,11 +364,11 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           # test_ext allocates a ~2 GiB fp16 tensor; skip it on the Windows runner.
-          # The axera/quantization/pruning suites are also skipped here for
-          # the same reason as the macos-15 leg above (see build_wheels'
-          # matrix.include and tests/conftest.py's pytest_collection_modifyitems):
-          # no OS-specific behavior, and the ubuntu-* legs already cover them
-          # in full.
+          # The axera/quantization/pruning suites are also skipped here, same
+          # as every build_wheels leg (see that job's CIBW_TEST_COMMAND and
+          # tests/conftest.py's pytest_collection_modifyitems): they run
+          # exactly once, in the dedicated test_axera_quantization_pruning
+          # job, since they have no OS/arch/interpreter-dependent behavior.
           pytest -v -k "not test_ext" -m "not axera and not quantization and not pruning" "${GITHUB_WORKSPACE}/tests"
           onnxsim -h
           onnxsim --list-default-optimizers
@@ -524,7 +583,7 @@ jobs:
   upload_pypi:
     if: (github.repository == 'onnxsim/onnxsim') && (github.event_name == 'release' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     name: Upload to PyPI
-    needs: [build_wheels, test_formal_verification, build_wheels_windows_cross, test_wheels_windows_cross, build_sdist, build_wheel_pyodide]
+    needs: [build_wheels, test_formal_verification, test_axera_quantization_pruning, build_wheels_windows_cross, test_wheels_windows_cross, build_sdist, build_wheel_pyodide]
     runs-on: ubuntu-latest
     environment:
       name: pypi

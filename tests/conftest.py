@@ -35,10 +35,12 @@ def pytest_collection_modifyitems(config, items):
     ``@pytest.mark.*`` decorator.
 
     .github/workflows/build-and-test.yml uses ``-m "not axera and not
-    quantization and not pruning"`` to skip these on macOS and the Windows
-    cross-test job -- they exercise onnxsim's own algorithm/format logic,
-    not OS-specific behavior, so running them there in addition to every
-    Linux leg just adds CI time without adding coverage.
+    quantization and not pruning"`` to skip these on every build_wheels
+    leg and the Windows cross-test job -- they exercise onnxsim's own
+    algorithm/format logic, not OS/arch/interpreter-dependent behavior, so
+    running them on every one of those legs just adds CI time without
+    adding coverage. They instead run exactly once, in that workflow's
+    dedicated ``test_axera_quantization_pruning`` job.
     """
     for item in items:
         name = os.path.basename(str(item.fspath)).lower()
