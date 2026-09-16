@@ -104,6 +104,21 @@ name: convertmodel WebGPU custom kernel dispatcher
 #     make_webgpu_kernel_tuning_fixture.py, same convention as the other
 #     fixture-based jobs.
 #
+#   * test/webgpu_kernel_tuning_vs_webnn.test.mjs -- ATTEMPTED AND REPORTED,
+#     never required, same posture as webnn_reshape_placement.test.mjs in
+#     convertmodel-ep-placement.yml: runs the exact same Conv2D from the
+#     webgpu-kernel-tuning job above through onnxruntime-web's WebNN EP
+#     (webgpu_kernel_tuning_fixture.onnx, also emitted by
+#     make_webgpu_kernel_tuning_fixture.py) and times it wall-clock against
+#     the fastest tinygrad-tuned candidate, wall-clock too, to answer "how
+#     much could tinygrad's own tuned kernel outperform WebNN here". Skips
+#     the comparison (not the whole job) when this runner's Chromium has no
+#     WebNN device reachable -- see that test file's own docstring for a
+#     measured result from this repo's own dev sandbox and why its direction
+#     shouldn't be treated as settled without a run on real hardware. Set
+#     ORT_REQUIRE_WEBNN=1 (via workflow_dispatch, edited in here, or a repo
+#     variable) once/if WebNN is confirmed reliable in this repo's own CI.
+#
 # Scheduled + on demand, plus on PRs that touch the files this check depends
 # on, same reasoning as convertmodel-webgpu-demo.yml / convertmodel-ep-placement.yml.
 
@@ -111,6 +126,11 @@ on:
   schedule:
     - cron: "0 10 * * 1" # Mondays 10:00 UTC (weekly, offset from the other two WebGPU workflows)
   workflow_dispatch:
+    inputs:
+      require_webnn:
+        description: "Fail the tuning-vs-WebNN job if no WebNN device is reachable here (ORT_REQUIRE_WEBNN)"
+        type: boolean
+        default: false
   pull_request:
     paths:
       - ".github/workflows/convertmodel-webgpu-kernel-dispatcher.yml"
@@ -127,8 +147,11 @@ on:
       - "scripts/convertmodel/test/webgpu_onnxrunner_conv_relu.onnx"
       - "scripts/convertmodel/test/webgpu_onnxrunner_fixture.json"
       - "scripts/convertmodel/test/webgpu_kernel_tuning.test.mjs"
+      - "scripts/convertmodel/test/webgpu_kernel_tuning_vs_webnn.test.mjs"
       - "scripts/convertmodel/test/make_webgpu_kernel_tuning_fixture.py"
       - "scripts/convertmodel/test/webgpu_kernel_tuning_fixture.json"
+      - "scripts/convertmodel/test/webgpu_kernel_tuning_fixture.onnx"
+      - "scripts/convertmodel/webnn.mjs"
       - "onnxsim/webgpu_kernel_tuning.py"
       - "scripts/convertmodel/test/make_webgpu_kernel_fixture.py"
       - "scripts/convertmodel/test/make_webgpu_tinygrad_codegen_fixture.py"
@@ -234,6 +257,27 @@ jobs:
       - name: Run the WebGPU kernel tuning check
         working-directory: scripts/convertmodel
         run: npm run test:webgpu-kernel-tuning
+
+  webgpu-kernel-tuning-vs-webnn:
+    name: WebGPU kernel tuning vs WebNN (best-effort)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install dependencies (onnxruntime-web, playwright)
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Install Chromium for Playwright
+        working-directory: scripts/convertmodel
+        run: npx playwright install chromium
+      - name: Run the WebGPU kernel tuning vs WebNN check
+        working-directory: scripts/convertmodel
+        env:
+          ORT_REQUIRE_WEBNN: ${{ inputs.require_webnn && '1' || '' }}
+        run: npm run test:webgpu-kernel-tuning-vs-webnn
 
   webgpu-custom-kernel-runtime:
     name: WebGPU custom kernel runtime (ort-web splice, required)

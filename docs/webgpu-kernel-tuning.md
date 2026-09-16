@@ -79,3 +79,53 @@ this module does not attempt to jointly tune across calls, and there is no
 persistence/caching layer yet for a picked winner (e.g. keyed by GPU
 vendor/browser) -- a caller re-runs the whole dispatch-and-compare loop
 every time today.
+
+## How much could tinygrad's tuned kernel outperform WebNN?
+
+`scripts/convertmodel/test/webgpu_kernel_tuning_vs_webnn.test.mjs` answers
+this directly, on the *same* Conv2D as the fixture above: it dispatches every
+tinygrad-tuned candidate (fastest wins) and, separately, runs
+`webgpu_kernel_tuning_fixture.onnx` (the same Conv2D, saved as an ordinary
+standalone model by `make_webgpu_kernel_tuning_fixture.py`) through
+onnxruntime-web's WebNN execution provider -- both timed the same way
+(wall-clock median over several warmed-up runs), since WebNN has no
+GPU-timestamp-query equivalent exposed through onnxruntime-web the way
+`dispatchWebgpuProgram`'s own `profile: true` does.
+
+Like `webnn_reshape_placement.test.mjs` (`docs/webnn.md`,
+`onnxsim/webnn_target.py`), this is **attempted and reported, not required**:
+WebNN's browser support is still experimental. Concretely, in this repo's own
+dev sandbox (headless Linux Chromium), `navigator.ml` is absent under plain
+`--enable-unsafe-webgpu`, but *does* appear -- and its `"gpu"` device type
+context actually builds and runs -- once
+`--enable-features=WebMachineLearningNeuralNetwork` is also passed. So
+whether the comparison runs at all depends on that flag and the runner's
+browser, not the platform alone; when no WebNN device is reachable, the test
+still reports tinygrad's own fastest candidate (useful on its own) and skips
+only the comparison-specific checks.
+
+**A measured result** from that sandbox: WebNN's `"gpu"` device type came out
+**~1.7-2.4x *faster*** than tinygrad's own best-tuned candidate across
+repeated runs -- the opposite direction from what the tuning work above might
+suggest. Take that with real caution, though: neither side is running on real
+hardware there. WebGPU goes through SwiftShader's software rasterizer (see
+`webgpu_hf_demo.test.mjs`'s own comment), and Chromium's WebNN `"gpu"` device
+type falls back to its own software ML backend when there's no real GPU/NPU
+init path available in a headless Linux container. So this result says
+neither backend is a safe default assumption in a software-emulated sandbox
+-- it does not say which one wins on an end user's actual GPU or NPU. Treat
+the *magnitude* (WebNN and a hand-tuned custom kernel can land within a small
+constant factor of each other on the same op) as the finding, and the
+*direction* as unconfirmed pending a run on real hardware (a real macOS/
+Windows CI runner, or a developer's own machine with
+`ORT_REQUIRE_WEBNN=1 npm run test:webgpu-kernel-tuning-vs-webnn`).
+
+This is also why offloading conv/matmul/gemm to WebNN wholesale (the other
+half of the question that motivated this work) isn't a clear win to chase
+blindly: where WebNN is actually reachable, it's already competitive with a
+hand-tuned custom kernel on at least this op, without onnxsim needing to
+generate or maintain any kernel at all -- but `onnxsim.webnn_target`'s own
+gaps (non-constant `Reshape`/`Expand` shapes, INT64 graph boundaries) mean
+"reachable" is model-dependent, and this comparison only covers the one op
+it measures, not the fusion patterns (conv+activation) the original question
+also asked about.

@@ -13,6 +13,12 @@ candidates -- there's no ONNX node to attach any *one* of them to, since the
 whole point is comparing several against each other, not shipping a single
 picked winner.
 
+Also saves ``webgpu_kernel_tuning_fixture.onnx`` -- the *same* Conv2D as an
+ordinary, standalone ONNX model (no custom kernel spec attached at all) --
+so ``webgpu_kernel_tuning_vs_webnn.test.mjs`` can run it through
+onnxruntime-web's WebNN execution provider for a same-op comparison against
+the tinygrad-tuned candidates above.
+
 Regenerate (needs ``onnx``, ``numpy``, and ``tinygrad``)::
 
     pip install onnx numpy 'tinygrad==0.14.0'
@@ -26,6 +32,7 @@ import sys
 import types
 
 import numpy as np
+import onnx
 from onnx import numpy_helper, parser
 from onnx.reference import ReferenceEvaluator
 
@@ -84,7 +91,7 @@ def main():
     model = parser.parse_model(
         f"""
         <ir_version: 10, opset_import: ["": 17]>
-        g (float{list(x_shape)} x) => (float[?] y)
+        g (float{list(x_shape)} x) => (float[?,?,?,?] y)
         {{
           y = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(x, w)
         }}
@@ -130,7 +137,11 @@ def main():
         json.dump(manifest, f, indent=2)
         f.write("\n")
 
+    model_path = os.path.join(HERE, "webgpu_kernel_tuning_fixture.onnx")
+    onnx.save(model, model_path)
+
     print(f"wrote {manifest_path} with {len(candidates.steps)} candidates")
+    print(f"wrote {model_path} (the same Conv2D, as a plain runnable model)")
 
 
 if __name__ == "__main__":
