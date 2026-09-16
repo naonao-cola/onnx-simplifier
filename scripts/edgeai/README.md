@@ -15,11 +15,16 @@ provider -- the TIDL-enabled `onnxruntime` build ships as part of TI's own
 PSDK/edgeai-tidl-tools SDK and needs either the target device or a matching
 x86 "PC emulation" build, neither of which this repository provisions.
 
-So, **unlike `scripts/axera`, this check makes no hardware-confirmed
-claims at all** -- there is no equivalent here of a real device, a real
-compiled artifact, or a real toolchain run to cite. Everything in
-`tidl_ops.py`/`tidl_backend.py` is a static heuristic built from two things
-TIDL's own published documentation states plainly:
+So, **unlike `scripts/axera`, this check makes no hardware- or
+compiler-confirmed claims at all** -- there is no equivalent here of a real
+device, a real compiled artifact, or a real toolchain run to cite. It *is*,
+however, checked directly against edgeai-tidl-tools' own published docs --
+`docs/operators.md` ("Supported Operators") and `docs/vision_transformers.md`
+("Vision Transformers") -- fetched from `raw.githubusercontent.com` (see
+"Reaching edgeai-tidl-tools from here" below) rather than reconstructed from
+memory. That distinction mattered in practice: an earlier version of this
+harness's `legalize.py` had a GELU rule backwards until the actual doc was
+checked (see that section).
 
 1. **No dynamic shapes.** Every graph input must have a fully static shape
    (including batch size) for TIDL to compile it at all.
@@ -28,15 +33,22 @@ TIDL's own published documentation states plainly:
    container ops, and string tensors -- the same generic complement
    `scripts/axera/pulsar2_ops.py` and the sibling QNN/OpenVINO/MIGraphX
    backends already use, not a TIDL-specific op list. `NonMaxSuppression` is
-   also flagged: edgeai-tidl-tools' own detection-model documentation
-   describes NMS running as host (ARM-core) post-processing, not an
-   in-graph accelerator op.
-3. **Transformer blocks should use the fused `LayerNormalization`/`Gelu`
-   ops, not their decomposed equivalents.** edgeai-tidl-tools'
-   transformer-support notes call this out; `has_decomposed_normalization()`
-   flags the classic hand-spelled LayerNorm signature
-   (`ReduceMean`/`Sub`/`Pow`/`Sqrt`/`Div`) so a graph exported in that form
-   gets surfaced rather than silently offloading worse than it needs to.
+   also flagged: it has no entry in `docs/operators.md`'s supported-op
+   table, and detection post-processing runs it on the host ARM core per
+   `docs/od_meta_arch.md`.
+3. **The decomposed LayerNorm chain should be fused, but the decomposed
+   GELU chain should *not* be.** `docs/operators.md` lists
+   `LayerNormalization` as its own directly supported layer
+   (`TIDL_LayerNormLayer`), so `has_decomposed_normalization()` flags the
+   hand-spelled `ReduceMean`/`Sub`/`Pow`/`Sqrt`/`Div` chain. GELU is the
+   opposite: that same doc has *no* `Gelu` entry at all -- only
+   `Erf`/`Identity`, "not supported as an individual operator... only
+   supported as part of the fused combination of GELU"
+   (`docs/vision_transformers.md`'s GELU section: the real importer
+   pattern-matches the decomposed `Div`/`Erf`/`Add`/`Mul`/`Mul` sequence
+   itself and maps it to TIDL's internal BatchNorm-with-activation layer).
+   So a literal ONNX `Gelu` node is the thing to flag/unfuse, not the
+   decomposed form -- see "`legalize.py`" below.
 
 What this check does, per model:
 
@@ -57,33 +69,60 @@ provisioned, replace this with an actual model-import/compile check, the way
 `scripts/qualcomm`/`scripts/intel`/`scripts/amd` wrap a real execution
 provider.
 
-## Running TI's real tools
+## Reaching edgeai-tidl-tools from here
 
-Neither TI's binary download host (`software-dl.ti.com`, where
-edgeai-tidl-tools' setup script fetches the actual `tidl_tools`/
-`onnxruntime_tidl` artifacts from) nor `github.com/TexasInstruments/*` are
-reachable from this repository's CI or from a normal contributor checkout
-without that SDK already installed, so there is currently no way to
-replace this static heuristic with a real compile/import check from here.
-If a runner with the real SDK is ever provisioned, wire it in as a
-`workflow_dispatch`-only job (like `axera-integration.yml`'s
-`pulsar2-docker-convert`), which stays dormant until such a runner exists.
+Two different hosts, two different answers:
+
+- **`raw.githubusercontent.com` is reachable.** `docs/operators.md`,
+  `docs/vision_transformers.md`, the top-level `README.md`, `docs/
+  model_compilation.md`, `scripts/setup/setup.sh`, and
+  `runtimes/examples/python/basic_example/config.yaml` were all fetched
+  directly from there (`master` branch) and used to write and correct
+  this harness. The interactive `github.com` repo page and
+  `api.github.com` both 403 (looks like GitHub's normal anti-automation
+  response to a plain unauthenticated request, not something specific to
+  this repository), but the raw file server does not.
+- **`software-dl.ti.com` is not.** `scripts/setup/setup.sh` downloads
+  *everything* real from there -- the TIDL-patched `onnxruntime_tidl`
+  wheel, `tidl_tools` itself, the TFLite/TVM runtime wheels, even the
+  out-of-box example data -- and this repository's own network policy
+  403s that host at the CONNECT level. So there is currently no way to
+  replace this static heuristic with a real compile/import check from
+  here, even though the documentation describing what that check should
+  look for is readable. If a runner with the real SDK is ever
+  provisioned, wire it in as a `workflow_dispatch`-only job (like
+  `axera-integration.yml`'s `pulsar2-docker-convert`), which stays
+  dormant until such a runner exists.
+
+One thing worth citing directly rather than the general "onnxsim is used
+as post-export cleanup" framing this repo's top-level README already
+gives other projects: edgeai-tidl-tools' own `docs/vision_transformers.md`
+DeiT walkthrough runs `onnxsim` as one of its own documented steps --
+`pip install timm onnx onnxsim` then `!onnxsim deit_tiny.onnx
+deit_tiny_1.onnx`, right before the resulting model is handed to TIDL.
 
 ## `legalize.py`: acting on what the heuristic flags
 
 A static check can flag a graph; it can't fix it. `legalize.py` holds
-semantics-preserving rewrites that fuse a decomposed op export into the
-form edgeai-tidl-tools' documentation prefers:
+semantics-preserving rewrites that steer a graph toward what the real
+importer wants -- and, per the point above, that is not always "fuse
+everything":
 
 - `fuse_decomposed_layernorm` -- the hand-written `ReduceMean`/`Sub`/
   `Pow(2)`/`ReduceMean`/`Add`/`Sqrt`/`Div` chain `has_decomposed_normalization()`
   flags, replaced with a single `LayerNormalization` node (folding a
   trailing `Mul(scale)`/`Add(bias)` pair into its scale/bias inputs when
-  present).
-- `fuse_erf_gelu` -- the exact/erf-based GELU export
-  (`0.5 * x * (1 + Erf(x / sqrt(2)))`, what `torch.onnx.export` gives
-  `nn.GELU()` before opset 20 added a native op) replaced with the fused
-  `Gelu` op.
+  present) -- fusing *toward* the op `docs/operators.md` lists as directly
+  supported.
+- `unfuse_gelu_to_erf` -- the reverse direction: a literal `Gelu` node
+  (`approximate="none"`, opset 20+) expanded back into
+  `Div`/`Erf`/`Add`/`Mul`/`Mul`, since `docs/operators.md` has no `Gelu`
+  entry at all and the real importer only recognizes the decomposed form
+  (see the note above). An earlier version of this module had a
+  `fuse_erf_gelu` rule that went the *other* way -- fusing toward a
+  `Gelu` node -- based on a wrong assumption that GELU worked the same way
+  as LayerNorm. It didn't; this is the correction, made after actually
+  reading `docs/operators.md` instead of assuming.
 
 Both are exact, not approximate, and only fire on the specific node
 wiring real exporters produce -- see each rule's own docstring for exactly
@@ -108,9 +147,12 @@ original graph).
   suite and adds three fixtures: `edgeai_dynamic_batch_leaf` (a symbolic
   batch dimension, since none of the shared suite's models are
   dynamic-shaped), `mobilenet_block` (MobileNetV2's inverted-residual
-  bottleneck -- the structure of edgeai-tidl-tools' own quickstart example
-  model), and `vision_transformer_block` (a pre-LN ViT encoder block built
-  from the doc-preferred fused `LayerNormalization`/`Gelu` ops).
+  bottleneck -- verified as the real backbone in edgeai-tidl-tools' own
+  object-detection/segmentation example configs, not "the quickstart
+  model" as an earlier version of this comment claimed without checking),
+  and `vision_transformer_block` (a pre-LN ViT encoder block using the
+  fused `LayerNormalization` op but the *decomposed* GELU sequence -- see
+  the note on GELU above).
 - `worker.py` -- checks one model in its own subprocess; see its docstring
   for the exact steps and status values.
 - `run_tidl_compat.py` -- drives `worker.py` over the whole suite (or a

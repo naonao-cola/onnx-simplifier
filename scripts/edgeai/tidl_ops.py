@@ -11,12 +11,20 @@ Jacinto/Sitara SoCs (TDA4x, AM62A/68A, ...).
 Like Axera's Pulsar2 (see ``scripts/axera/pulsar2_ops.py``), TIDL has no PyPI
 package and no ONNX Runtime execution provider installable in a plain CI
 container: the TIDL-enabled ``onnxruntime`` build ships as part of TI's
-PSDK/edgeai-tidl-tools SDK and needs either the target device or a matching
-x86 "PC emulation" build, neither of which this repository provisions. So,
-same as ``pulsar2_ops.py``, **this module wraps no real compiler and makes no
-hardware-confirmed claims** -- everything here is a static heuristic derived
-from TIDL's own published operator-support documentation (edgeai-tidl-tools'
-"Supported operators" tables), not a real device, SDK, or simulator run. If a
+PSDK/edgeai-tidl-tools SDK, and every binary artifact its own setup script
+(``scripts/setup/setup.sh``) fetches -- ``onnxruntime_tidl``, ``tidl_tools``,
+even its out-of-box example data -- comes from ``software-dl.ti.com``, a host
+this repository's own network policy 403s. So, same as ``pulsar2_ops.py``,
+**this module wraps no real compiler and makes no hardware- or
+compiler-confirmed claims** -- everything here is a static heuristic. It is,
+however, checked directly against edgeai-tidl-tools' own published
+``docs/operators.md`` ("Supported Operators") and ``docs/
+vision_transformers.md`` ("Vision Transformers"), fetched from
+``raw.githubusercontent.com`` (which, unlike the interactive ``github.com``
+repo page and ``software-dl.ti.com``, is reachable from here) rather than
+reconstructed from memory -- catching, among other things, a backwards GELU
+rule an earlier version of this module's sibling ``legalize.py`` had (see
+that module's docstring for the correction and exactly what changed). If a
 runner with the real SDK is ever provisioned, replace this with an actual
 model-import/compile check the way ``scripts/qualcomm``/``scripts/intel``/
 ``scripts/amd`` wrap a real execution provider.
@@ -45,19 +53,33 @@ per-op attribute-level constraints (e.g. supported ``Resize`` modes,
 ``Conv`` group/dilation limits) TIDL's docs also list.
 
 A third thing worth checking for, specifically for transformer-style graphs:
-edgeai-tidl-tools' own transformer/attention support notes recommend the
-*fused* ``LayerNormalization``/``Gelu`` ops over their decomposed,
-multi-node equivalents (``ReduceMean``/``Sub``/``Pow``/``Sqrt``/``Div`` for
-LayerNorm; ``Erf``-based Gelu) -- a fused op is one accelerator-schedulable
-primitive, while the decomposed form is a handful of separate elementwise/
-reduction ops the partitioner has to recognize and fuse itself, and
-TIDL's docs call this out as something to check for. Two well-known example
-model families this harness's suite adds fixtures for, matching what
-edgeai-tidl-tools' own model zoo and quickstart use as its representative
-cases: **MobileNetV2** (the literal quickstart/demo model in
-edgeai-tidl-tools' README, a depthwise-separable-conv classifier) and a
-**Vision Transformer** encoder block (the doc-preferred fused-op form, per
-the note above).
+``docs/operators.md`` lists ``LayerNormalization`` as its own directly
+supported layer (``TIDL_LayerNormLayer``), so the decomposed
+``ReduceMean``/``Sub``/``Pow``/``Sqrt``/``Div`` chain -- a handful of
+separate elementwise/reduction ops the importer has to recognize and fuse
+itself, rather than one op it already knows -- is worth flagging.
+``has_decomposed_normalization()`` below does that.
+
+**GELU is the opposite case, confirmed by actually reading the doc rather
+than assuming symmetry with LayerNorm**: ``docs/operators.md`` has *no*
+``Gelu`` entry at all -- only ``Erf``/``Identity``, explicitly "not
+supported as an individual operator... only supported as part of the fused
+combination of GELU". ``docs/vision_transformers.md``'s own GELU section
+confirms why: the importer pattern-matches the decomposed
+``Div``/``Erf``/``Add``/``Mul``/``Mul`` sequence itself and maps it to
+TIDL's internal BatchNorm-with-activation layer, so a literal ONNX ``Gelu``
+node (opset 20+) has nothing to match. This module does not add a
+"decomposed GELU" flag -- unlike LayerNorm, the decomposed form here is
+already what's wanted, so there is nothing to flag; ``legalize.py``'s
+``unfuse_gelu_to_erf`` handles the one direction that does need acting on
+(a literal ``Gelu`` node).
+
+Two model families this harness's suite adds fixtures for:
+**MobileNetV2** (the inverted-residual bottleneck backing
+edgeai-tidl-tools' own real object-detection and segmentation example
+configs) and a **Vision Transformer** encoder block, built using the fused
+``LayerNormalization`` op and the *decomposed* GELU form -- see
+``scripts/edgeai/models.py``'s docstring for exactly where each is verified.
 """
 
 from __future__ import annotations

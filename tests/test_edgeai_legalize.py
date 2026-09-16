@@ -1,12 +1,15 @@
-"""TIDL-preferred fused-op legalization rewrites, checked offline.
+"""TIDL-preferred-op legalization rewrites, checked offline.
 
-`scripts/edgeai/legalize.py` holds rewrites that fuse a decomposed op
-export into the single fused op edgeai-tidl-tools' own documentation
-recommends (see that module's docstring for why this, unlike
-`scripts/axera/legalize.py`, has no real-compiler motivation behind it).
-The tests here check the two properties that matter: the rewrite fires on
-the pattern it targets and leaves everything else alone, and it does not
-change what the graph computes.
+`scripts/edgeai/legalize.py` holds rewrites that steer a graph toward what
+edgeai-tidl-tools' own `docs/operators.md`/`docs/vision_transformers.md`
+document as TIDL's real importer behavior -- fusing LayerNorm *toward* the
+single `LayerNormalization` op, but GELU *away* from the literal `Gelu` op
+(see that module's docstring for why these point in different directions,
+and why neither is motivated by a real compiler run the way
+`scripts/axera/legalize.py`'s rules are). The tests here check the two
+properties that matter for each rule: it fires on the pattern it targets
+and leaves everything else alone, and it does not change what the graph
+computes.
 
 Needs no vendor package or device -- correctness is checked against onnx's
 own reference evaluator, not a real TIDL run.
@@ -114,23 +117,19 @@ def _decomposed_layernorm(affine=False, opset=17):
     return model
 
 
-def _erf_gelu():
-    """The `torch.onnx.export`-style exact/erf-based GELU export."""
+def _gelu_node(approximate="none"):
+    """A model with a single, literal `Gelu` op -- what `unfuse_gelu_to_erf`
+    targets (in the `approximate="none"` case only)."""
     model = parser.parse_model(
-        """
+        f"""
         <
           ir_version: 8,
-          opset_import: ["": 17]
+          opset_import: ["": 20]
         >
-        erf_gelu (float[1,4] x) => (float[1,4] y)
-        <float sqrt2 = {1.4142135}, float one = {1.0}, float half = {0.5}>
-        {
-          t0 = Div(x, sqrt2)
-          t1 = Erf(t0)
-          t2 = Add(t1, one)
-          t3 = Mul(x, t2)
-          y = Mul(t3, half)
-        }
+        gelu_leaf (float[1,4] x) => (float[1,4] y)
+        {{
+          y = Gelu<approximate = "{approximate}">(x)
+        }}
         """
     )
     onnx.checker.check_model(model)
@@ -212,54 +211,46 @@ def test_fuse_decomposed_layernorm_leaves_other_reduce_mean_pairs_alone():
     ]
 
 
-def test_fuse_erf_gelu_matches_reference_output():
-    model = _erf_gelu()
+def test_unfuse_gelu_to_erf_matches_reference_output():
+    """The opposite direction of the old (backwards) rule: a literal `Gelu`
+    node has no match in `docs/operators.md`'s supported-op list, so it is
+    unfused back into the decomposed sequence the real importer actually
+    recognizes (see `legalize.py`'s docstring)."""
+    model = _gelu_node()
     before = copy.deepcopy(model)
 
-    assert legalize.fuse_erf_gelu(model) == 1
+    assert legalize.unfuse_gelu_to_erf(model) == 1
     onnx.checker.check_model(model)
-    assert [n.op_type for n in model.graph.node] == ["Gelu"]
-    assert any(o.version >= 20 for o in model.opset_import if o.domain == "")
+    assert [n.op_type for n in model.graph.node] == ["Div", "Erf", "Add", "Mul", "Mul"]
 
     x = np.random.RandomState(2).randn(1, 4).astype(np.float32)
     _assert_same_output(before, model, "x", x)
 
 
-def test_fuse_erf_gelu_ignores_the_wrong_constant():
-    """A `Div` by something other than `sqrt(2)` is not GELU -- must not fuse."""
-    model = parser.parse_model(
-        """
-        <
-          ir_version: 8,
-          opset_import: ["": 17]
-        >
-        not_gelu (float[1,4] x) => (float[1,4] y)
-        <float two = {2.0}, float one = {1.0}, float half = {0.5}>
-        {
-          t0 = Div(x, two)
-          t1 = Erf(t0)
-          t2 = Add(t1, one)
-          t3 = Mul(x, t2)
-          y = Mul(t3, half)
-        }
-        """
-    )
-    onnx.checker.check_model(model)
-    assert legalize.fuse_erf_gelu(model) == 0
+def test_unfuse_gelu_to_erf_leaves_tanh_approximation_alone():
+    """`approximate="tanh"` computes a different formula, not the exact
+    erf-based one this rule targets -- must not be touched."""
+    model = _gelu_node(approximate="tanh")
+    assert legalize.unfuse_gelu_to_erf(model) == 0
+    assert [n.op_type for n in model.graph.node] == ["Gelu"]
 
 
 def test_legalize_dispatches_selected_rules_only():
     model = _decomposed_layernorm()
-    counts = legalize.legalize(model, rules=["fuse_erf_gelu"])
-    assert counts == {"fuse_erf_gelu": 0}
+    counts = legalize.legalize(model, rules=["unfuse_gelu_to_erf"])
+    assert counts == {"unfuse_gelu_to_erf": 0}
     # fuse_decomposed_layernorm was not asked for, so the pattern survives.
     assert tidl.normalization_risks(model)
 
 
 def test_legalize_all_rules_is_a_no_op_on_already_fused_fixtures():
-    """The suite's own MobileNet/ViT fixtures are already fused; legalizing
-    them must be a true no-op, not a spurious rewrite."""
+    """The suite's own MobileNet/ViT fixtures already use the TIDL-preferred
+    forms (fused `LayerNormalization`, decomposed GELU); legalizing them
+    must be a true no-op, not a spurious rewrite."""
     for name in ("mobilenet_block", "vision_transformer_block", "conv_bn_relu"):
         model = models.build(name)
         counts = legalize.legalize(model)
-        assert counts == {"fuse_decomposed_layernorm": 0, "fuse_erf_gelu": 0}, name
+        assert counts == {
+            "fuse_decomposed_layernorm": 0,
+            "unfuse_gelu_to_erf": 0,
+        }, name

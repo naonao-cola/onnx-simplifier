@@ -1,21 +1,36 @@
 #!/usr/bin/env python3
-"""Rewrites that fuse decomposed ops into the forms TIDL's docs prefer.
+"""Rewrites that steer a graph toward the forms TIDL's real importer wants.
 
 `tidl_ops.has_decomposed_normalization()` (see that module's docstring)
 flags a graph that spells LayerNorm out by hand instead of using the fused
-`LayerNormalization` op -- edgeai-tidl-tools' transformer-support notes
-recommend the fused form. This module is how you act on that flag: each
-rule here recognizes one standard decomposed-op export pattern and rewrites
-it into the single fused op, exactly (not approximately) preserving the
-graph's numerics.
+`LayerNormalization` op. This module is how you act on that flag -- and,
+having fetched edgeai-tidl-tools' actual `docs/operators.md` and
+`docs/vision_transformers.md` (raw.githubusercontent.com is reachable even
+though the interactive `github.com` repo page and `software-dl.ti.com`'s
+binary downloads are not, see `scripts/edgeai/README.md`), the two rules
+here point in *different* directions, not the same one:
 
-Unlike `scripts/axera/legalize.py`, none of these rules are motivated by a
-real compiler run -- there is no real TIDL toolchain reachable from this
-repository to have refused a model and prompted one (see
-`scripts/edgeai/README.md`). They exist purely because TI's own published
-guidance names the fused ops as preferred; running the rewritten graph
-through the real `edgeai-tidl-tools` importer, if one is ever available, is
-the only way to confirm it actually changes what the accelerator schedules.
+- `fuse_decomposed_layernorm` fuses *toward* a single op:
+  `docs/operators.md` lists `LayerNormalization` as its own directly
+  supported layer (`TIDL_LayerNormLayer`), so collapsing the decomposed
+  `ReduceMean`/`Sub`/`Pow`/`Sqrt`/`Div` chain into that op is what the real
+  importer wants.
+- `unfuse_gelu_to_erf` fuses *away* from a single op, in the opposite
+  direction of what an earlier version of this module did. `docs/
+  operators.md` has no `Gelu` entry at all -- only `Erf`/`Identity`,
+  explicitly "not supported as an individual operator... only supported as
+  part of the fused combination of GELU" (`docs/vision_transformers.md`'s
+  own GELU section: the importer pattern-matches the decomposed
+  `Div`/`Erf`/`Add`/`Mul`/`Mul` sequence itself and maps it to TIDL's
+  internal BatchNorm-with-activation layer). A literal ONNX `Gelu` node
+  (opset 20+) is exactly what this rule un-fuses back into that sequence,
+  since the real importer has nothing else to do with it otherwise.
+
+Neither rule's target has been confirmed against a real compile -- there is
+no real TIDL toolchain reachable from this repository to run one (see
+`scripts/edgeai/README.md`) -- but both are now checked against the actual
+published operator-support doc rather than reconstructed from memory, which
+is what caught the GELU direction being backwards in the first place.
 
 Each rule only rewrites the *default* graph -- it does not recurse into
 subgraph attributes (`If`/`Loop` bodies), and only matches the specific
@@ -26,7 +41,7 @@ than guessed at.
 Usage::
 
     legalize.py in.onnx out.onnx                    # apply every rule
-    legalize.py --rules fuse_erf_gelu in.onnx out.onnx
+    legalize.py --rules unfuse_gelu_to_erf in.onnx out.onnx
 """
 
 from __future__ import annotations
@@ -39,7 +54,7 @@ import math
 import numpy as np
 import onnx
 import onnx.shape_inference
-from onnx import helper, numpy_helper
+from onnx import TensorProto, helper, numpy_helper
 
 
 def _producer_map(nodes):
@@ -298,87 +313,99 @@ def fuse_decomposed_layernorm(model: onnx.ModelProto) -> int:
     return changed
 
 
-def fuse_erf_gelu(model: onnx.ModelProto) -> int:
-    """`0.5 * x * (1 + Erf(x / sqrt(2)))` -> the fused, exact `Gelu` op.
+def _elem_types(model):
+    """`{tensor_name: onnx.TensorProto element type}` for every tensor whose
+    type is statically known -- same non-mutating-copy approach as
+    `_last_dims`, for the same reason."""
+    try:
+        inferred = onnx.shape_inference.infer_shapes(model)
+    except Exception:
+        inferred = model
+    types = {}
+    for value in (
+        *inferred.graph.input,
+        *inferred.graph.value_info,
+        *inferred.graph.output,
+    ):
+        if value.type.HasField("tensor_type"):
+            types[value.name] = value.type.tensor_type.elem_type
+    for init in model.graph.initializer:
+        types[init.name] = init.data_type
+    return types
 
-    This is the graph `torch.onnx.export` gives `nn.GELU()` (its default,
-    exact/erf-based mode) before ONNX opset 20 added a native `Gelu` op --
-    exactly what `Gelu`'s own default (`approximate="none"`) computes, so
-    this is an exact fusion, not the tanh approximation.
+
+def _attr_str(node, name, default=""):
+    for attr in node.attribute:
+        if attr.name == name:
+            return attr.s.decode() if isinstance(attr.s, bytes) else attr.s
+    return default
+
+
+def unfuse_gelu_to_erf(model: onnx.ModelProto) -> int:
+    """The fused, exact `Gelu` op (`approximate="none"`) -> `0.5 * x * (1 +
+    Erf(x / sqrt(2)))`.
+
+    The opposite direction of what an earlier version of this rule did --
+    see this module's docstring for why: `docs/operators.md` has no `Gelu`
+    entry at all, only `Erf`/`Identity`, "not supported as an individual
+    operator... only supported as part of the fused combination of GELU" --
+    the real importer pattern-matches this exact decomposed sequence itself
+    and maps it to TIDL's internal BatchNorm-with-activation layer, so a
+    literal `Gelu` node has nothing to match. Only the exact/erf-based
+    approximation mode is unfused: `approximate="tanh"` computes a
+    different formula, not this one, so it is conservatively left alone
+    (ONNX's own default for `approximate`, when the attribute is absent, is
+    `"none"`).
     """
+    elem_types = _elem_types(model)
     nodes = list(model.graph.node)
-    producer = _producer_map(nodes)
-    consumers = _consumer_map(nodes)
     to_remove: set = set()
     to_add = []
     changed = 0
     half_sqrt2 = math.sqrt(2.0)
 
-    for erf_node in nodes:
-        if erf_node.op_type != "Erf" or id(erf_node) in to_remove:
-            continue
-        div_node = producer.get(erf_node.input[0])
-        if div_node is None or div_node.op_type != "Div":
-            continue
-        if len(div_node.input) != 2:
-            continue
-        x_name, sqrt2_name = div_node.input
-        sqrt2 = _scalar_constant(model, sqrt2_name)
-        if sqrt2 is None or abs(sqrt2 - half_sqrt2) > 1e-4:
+    for node in nodes:
+        if node.op_type != "Gelu" or _attr_str(node, "approximate", "none") != "none":
             continue
 
-        add_node = next(
-            (n for n in consumers.get(erf_node.output[0], []) if n.op_type == "Add"),
-            None,
+        x_name = node.input[0]
+        y_name = node.output[0]
+        np_dtype = helper.tensor_dtype_to_np_dtype(
+            elem_types.get(x_name, TensorProto.FLOAT)
         )
-        if add_node is None:
-            continue
-        one_name = next((i for i in add_node.input if i != erf_node.output[0]), None)
-        if _scalar_constant(model, one_name) != 1.0:
-            continue
 
-        mul1_node = next(
-            (
-                n
-                for n in consumers.get(add_node.output[0], [])
-                if n.op_type == "Mul" and x_name in n.input
-            ),
-            None,
+        sqrt2_name = _unique_name(model, "gelu_sqrt2")
+        one_name = _unique_name(model, "gelu_one")
+        half_name = _unique_name(model, "gelu_half")
+        model.graph.initializer.extend(
+            [
+                numpy_helper.from_array(np.array(half_sqrt2, np_dtype), sqrt2_name),
+                numpy_helper.from_array(np.array(1.0, np_dtype), one_name),
+                numpy_helper.from_array(np.array(0.5, np_dtype), half_name),
+            ]
         )
-        if mul1_node is None:
-            continue
-
-        mul2_node = next(
-            (n for n in consumers.get(mul1_node.output[0], []) if n.op_type == "Mul"),
-            None,
+        stem = _unique_name(model, "gelu_unfused")
+        t0, t1, t2, t3 = (f"{stem}_t{i}" for i in range(4))
+        to_add.extend(
+            [
+                helper.make_node("Div", [x_name, sqrt2_name], [t0], name=f"{stem}_div"),
+                helper.make_node("Erf", [t0], [t1], name=f"{stem}_erf"),
+                helper.make_node("Add", [t1, one_name], [t2], name=f"{stem}_add"),
+                helper.make_node("Mul", [x_name, t2], [t3], name=f"{stem}_mul1"),
+                helper.make_node("Mul", [t3, half_name], [y_name], name=f"{stem}_mul2"),
+            ]
         )
-        if mul2_node is None:
-            continue
-        half_name = next((i for i in mul2_node.input if i != mul1_node.output[0]), None)
-        if _scalar_constant(model, half_name) != 0.5:
-            continue
-
-        chain = [div_node, erf_node, add_node, mul1_node, mul2_node]
-        gelu_node = helper.make_node(
-            "Gelu",
-            [x_name],
-            [mul2_node.output[0]],
-            name=_unique_name(model, "fused_gelu"),
-            approximate="none",
-        )
-        to_add.append(gelu_node)
-        to_remove.update(id(n) for n in chain)
+        to_remove.add(id(node))
         changed += 1
 
     if changed:
         _replace_nodes(model, to_remove, to_add)
-        _ensure_min_opset(model, 20)
     return changed
 
 
 RULES = {
     "fuse_decomposed_layernorm": fuse_decomposed_layernorm,
-    "fuse_erf_gelu": fuse_erf_gelu,
+    "unfuse_gelu_to_erf": unfuse_gelu_to_erf,
 }
 
 

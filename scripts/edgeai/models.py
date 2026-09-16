@@ -8,16 +8,21 @@ Re-exports `scripts/common/synthetic_models.py` (see that module) and adds:
   be fully static (see `tidl_ops.py`'s docstring), a constraint none of the
   shared suite's fixed-shape models trip.
 - `mobilenet_block`: a small MobileNetV2-style inverted-residual bottleneck
-  (expand/depthwise/project convs + a residual Add), matching the structure
-  of edgeai-tidl-tools' own README quickstart model (a real MobileNetV2 ONNX
-  export is literally the first example that project's docs walk through
-  compiling for TIDL).
+  (expand/depthwise/project convs + a residual Add). MobileNetV2 is the
+  backbone edgeai-tidl-tools' own real example configs use for object
+  detection (`od-ort-ssd-lite_mobilenetv2_fpn`) and segmentation
+  (`ss-ort-deeplabv3lite_mobilenetv2`, both in
+  `runtimes/examples/python/basic_example/config.yaml`) -- verified
+  directly, not "the quickstart model" (that's a plain ResNet18,
+  `resnet18_opset9.onnx`, the first ONNX Runtime entry in that same file).
 - `vision_transformer_block`: one pre-LN Vision Transformer encoder block
-  (LayerNorm, MatMul-based attention, LayerNorm, a Gelu MLP, both residual),
-  built from the *fused* `LayerNormalization`/`Gelu` ops rather than their
-  decomposed equivalents -- see `tidl_ops.has_decomposed_normalization`'s
-  docstring for why edgeai-tidl-tools' transformer-support notes prefer that
-  form.
+  (LayerNorm, MatMul-based attention, LayerNorm, an exact/erf-based-GELU
+  MLP, both residual). Built from the fused `LayerNormalization` op (a
+  directly supported layer per `docs/operators.md`) but the *decomposed*
+  `Div`/`Erf`/`Add`/`Mul`/`Mul` GELU sequence, not the literal ONNX `Gelu`
+  op -- `docs/operators.md` has no `Gelu` entry at all; see
+  `tidl_ops.py`'s docstring and `legalize.py`'s `unfuse_gelu_to_erf` for
+  why the decomposed form is what the real importer actually wants here.
 """
 
 from __future__ import annotations
@@ -96,13 +101,13 @@ def mobilenet_block() -> onnx.ModelProto:
     """MobileNetV2's inverted-residual bottleneck, at a small scale.
 
     Expand (1x1 Conv) -> BN -> ReLU6 -> depthwise (3x3 Conv, group=C) -> BN
-    -> ReLU6 -> project (1x1 Conv) -> BN -> residual Add -- the exact block
-    shape MobileNetV2 (edgeai-tidl-tools' own quickstart example model) is
-    built from. ReLU6 is expressed as `Clip(0, 6)`, matching the real
-    network's activation rather than substituting a plain Relu. BN is
-    expressed as the usual foldable Mul/Add pair (onnxsim fuses this into
-    the preceding Conv), same convention as
-    `scripts/common/synthetic_models.conv_bn_relu`.
+    -> ReLU6 -> project (1x1 Conv) -> BN -> residual Add -- the block shape
+    MobileNetV2 is built from (see this module's docstring for where it's
+    verified to actually appear in edgeai-tidl-tools' own example configs).
+    ReLU6 is expressed as `Clip(0, 6)`, matching the real network's
+    activation rather than substituting a plain Relu. BN is expressed as
+    the usual foldable Mul/Add pair (onnxsim fuses this into the preceding
+    Conv), same convention as `scripts/common/synthetic_models.conv_bn_relu`.
     """
     c_in, c_mid = 16, 32
     expand_w = numpy_helper.from_array(_rand(c_mid, c_in, 1, 1, seed=10), "expand_w")
@@ -179,11 +184,13 @@ def vision_transformer_block() -> onnx.ModelProto:
     """One pre-LN Vision Transformer encoder block.
 
     LayerNorm -> MatMul-based Q/K/V -> scaled dot-product attention (MatMul,
-    Softmax, MatMul) -> residual Add -> LayerNorm -> MatMul/Gelu/MatMul MLP
-    -> residual Add -- the standard ViT encoder block, built entirely from
-    the *fused* `LayerNormalization`/`Gelu` ops edgeai-tidl-tools'
-    transformer-support notes recommend over their decomposed multi-op
-    equivalents (see `tidl_ops.has_decomposed_normalization`'s docstring).
+    Softmax, MatMul) -> residual Add -> LayerNorm -> MatMul/GELU/MatMul MLP
+    -> residual Add -- the standard ViT encoder block. Uses the fused
+    `LayerNormalization` op (a directly supported TIDL layer per
+    `docs/operators.md`) but the *decomposed*, exact/erf-based GELU
+    (`Div`/`Erf`/`Add`/`Mul`/`Mul`), matching what edgeai-tidl-tools'
+    real importer recognizes -- not the literal ONNX `Gelu` op, which has
+    no entry in that same doc (see `tidl_ops.py`'s docstring).
     """
     tokens, dim, hidden = 4, 8, 16
     scale = numpy_helper.from_array(
@@ -198,6 +205,9 @@ def vision_transformer_block() -> onnx.ModelProto:
     wv = numpy_helper.from_array(_rand(dim, dim, seed=36), "wv")
     w1 = numpy_helper.from_array(_rand(dim, hidden, seed=37), "w1")
     w2 = numpy_helper.from_array(_rand(hidden, dim, seed=38), "w2")
+    gelu_sqrt2 = numpy_helper.from_array(np.array(2.0**0.5, np.float32), "gelu_sqrt2")
+    gelu_one = numpy_helper.from_array(np.array(1.0, np.float32), "gelu_one")
+    gelu_half = numpy_helper.from_array(np.array(0.5, np.float32), "gelu_half")
 
     nodes = [
         helper.make_node("LayerNormalization", ["x", "ln1_scale", "ln1_bias"], ["ln1"]),
@@ -214,7 +224,11 @@ def vision_transformer_block() -> onnx.ModelProto:
             "LayerNormalization", ["res1", "ln2_scale", "ln2_bias"], ["ln2"]
         ),
         helper.make_node("MatMul", ["ln2", "w1"], ["fc1"]),
-        helper.make_node("Gelu", ["fc1"], ["act"]),
+        helper.make_node("Div", ["fc1", "gelu_sqrt2"], ["gelu_t0"]),
+        helper.make_node("Erf", ["gelu_t0"], ["gelu_t1"]),
+        helper.make_node("Add", ["gelu_t1", "gelu_one"], ["gelu_t2"]),
+        helper.make_node("Mul", ["fc1", "gelu_t2"], ["gelu_t3"]),
+        helper.make_node("Mul", ["gelu_t3", "gelu_half"], ["act"]),
         helper.make_node("MatMul", ["act", "w2"], ["fc2"]),
         helper.make_node("Add", ["res1", "fc2"], ["y"]),
     ]
@@ -223,10 +237,24 @@ def vision_transformer_block() -> onnx.ModelProto:
         _VIT_BLOCK_NAME,
         [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, tokens, dim])],
         [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, tokens, dim])],
-        [scale, ln1_scale, ln1_bias, ln2_scale, ln2_bias, wq, wk, wv, w1, w2],
+        [
+            scale,
+            ln1_scale,
+            ln1_bias,
+            ln2_scale,
+            ln2_bias,
+            wq,
+            wk,
+            wv,
+            w1,
+            w2,
+            gelu_sqrt2,
+            gelu_one,
+            gelu_half,
+        ],
     )
     model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 20)], ir_version=10
+        graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=10
     )
     onnx.checker.check_model(model)
     return model
