@@ -175,6 +175,7 @@ test*.py
 # tracked.
 !tests/test*.py
 !tools/onnx-finetune/tests/test*.py
+!tools/onnx-cardputer-flash/tests/test*.py
 
 .setuptools-cmake-build/
 onnxsim/version.py

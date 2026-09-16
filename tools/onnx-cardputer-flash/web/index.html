@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>onnx-cardputer-flash</title>
+<style>
+  body { font-family: monospace; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  #log { white-space: pre-wrap; background: #111; color: #0f0; padding: 1rem; height: 260px; overflow-y: auto; }
+  .step { border: 1px solid #888; border-radius: 6px; padding: 0.75rem 1rem; margin: 1rem 0; }
+  .step h2 { margin-top: 0; }
+  .note { font-size: 0.9em; color: #555; }
+  button:disabled { opacity: 0.5; }
+</style>
+</head>
+<body>
+<h1>onnx-cardputer-flash</h1>
+<p class="note">
+  Flashes a TFLite Micro firmware image to an ESP32-S3 board (e.g. M5Stack
+  Cardputer) straight from the browser over
+  <a href="https://developer.chrome.com/docs/capabilities/serial" target="_blank" rel="noopener">Web Serial</a>.
+  See <code>../README.md</code> for the full pipeline (Hugging Face model →
+  onnxsim simplify/quantize → TFLite Micro conversion → this page).
+</p>
+
+<div class="step">
+  <h2>1. Get a model</h2>
+  <p>
+    Fetch and simplify/quantize a Hugging Face ONNX model with the
+    <a href="../../convertmodel/index.html" target="_blank" rel="noopener">onnxsim model converter</a>,
+    then download the result. This page doesn't repeat that UI — it starts
+    from step 2 below, offline.
+  </p>
+</div>
+
+<div class="step">
+  <h2>2. Convert to a flashable firmware image (offline, local machine)</h2>
+  <p class="note">
+    Not done in-browser — see <code>../scripts/onnx_to_tflite_micro.py</code>
+    (ONNX → TFLite → C array) and <code>../firmware/README.md</code>
+    (build a merged <code>.bin</code> with the model baked in). Bring the
+    resulting <code>.bin</code> back here.
+  </p>
+</div>
+
+<div class="step">
+  <h2>3. Flash over Web Serial</h2>
+  <p id="serial-unsupported" class="note" style="display: none; color: #b00;">
+    This browser has no <code>navigator.serial</code> — try Chrome or Edge
+    (desktop), 89+.
+  </p>
+  <div id="serial-controls">
+    <button id="connect-button" type="button">Connect to board</button>
+    <button id="disconnect-button" type="button" disabled>Disconnect</button>
+    <span id="chip-status" class="note"></span>
+    <br><br>
+    <label for="firmware-input">firmware image (merged .bin)</label>
+    <input type="file" id="firmware-input" accept=".bin" disabled>
+    <br><br>
+    <label for="flash-address">flash address</label>
+    <input type="text" id="flash-address" value="0x0" size="8" title="0x0 for ESP32-S3/S2/C3/C6 (Cardputer included); 0x1000 for the original ESP32.">
+    <span class="note">(0x0 for ESP32-S3 boards like Cardputer — the bootloader offset differs on classic ESP32)</span>
+    <br><br>
+    <button id="flash-button" type="button" disabled>Flash</button>
+  </div>
+</div>
+
+<div id="log"></div>
+
+<script type="module" src="./flasher.mjs"></script>
+</body>
+</html>
