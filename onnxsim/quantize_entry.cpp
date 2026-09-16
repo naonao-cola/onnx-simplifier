@@ -361,6 +361,27 @@ onnx::ModelProto ApplyAQLM(const onnx::ModelProto& model) {
                                            std::vector<std::string>{"aqlm"});
 }
 
+onnx::ModelProto ApplyDropByDrop(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"drop_by_drop"});
+}
+
+onnx::ModelProto ApplyLoBcq(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(model,
+                                           std::vector<std::string>{"lo_bcq"});
+}
+
+onnx::ModelProto ApplyQuipSharp(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"quip_sharp"});
+}
+
 std::vector<std::string> ListQuantizableActivations(
     const onnx::ModelProto& model) {
   PrepareSchemasForDebug(model);

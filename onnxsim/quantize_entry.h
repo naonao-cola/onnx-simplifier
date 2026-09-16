@@ -107,3 +107,6 @@ onnx::ModelProto ApplyADPQ(const onnx::ModelProto& model);
 onnx::ModelProto ApplyICQuant(const onnx::ModelProto& model);
 onnx::ModelProto ApplyOlive(const onnx::ModelProto& model);
 onnx::ModelProto ApplyAQLM(const onnx::ModelProto& model);
+onnx::ModelProto ApplyDropByDrop(const onnx::ModelProto& model);
+onnx::ModelProto ApplyLoBcq(const onnx::ModelProto& model);
+onnx::ModelProto ApplyQuipSharp(const onnx::ModelProto& model);

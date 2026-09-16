@@ -130,10 +130,18 @@ export function applyAdpq(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyIcquant(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyOlive(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyAqlm(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyDropByDrop(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyLoBcq(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyQuipSharp(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyDaq(
   baseModel: OnnxModelBytes,
   postTrainedModel: OnnxModelBytes,
   options?: { metric?: "cosine" | "sign_preservation"; skipNames?: string[] },
+): Promise<Uint8Array>;
+export function applyLowRankCompensation(
+  floatModel: OnnxModelBytes,
+  quantizedModel: OnnxModelBytes,
+  options?: { rank?: number },
 ): Promise<Uint8Array>;
 export function pruneMagnitude(
   model: OnnxModelBytes,
@@ -341,7 +349,11 @@ declare const _default: {
   applyIcquant: typeof applyIcquant;
   applyOlive: typeof applyOlive;
   applyAqlm: typeof applyAqlm;
+  applyDropByDrop: typeof applyDropByDrop;
+  applyLoBcq: typeof applyLoBcq;
+  applyQuipSharp: typeof applyQuipSharp;
   applyDaq: typeof applyDaq;
+  applyLowRankCompensation: typeof applyLowRankCompensation;
   pruneMagnitude: typeof pruneMagnitude;
   applyStructuredPruning: typeof applyStructuredPruning;
   applyAttentionHeadPruning: typeof applyAttentionHeadPruning;

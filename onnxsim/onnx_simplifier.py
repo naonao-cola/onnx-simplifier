@@ -4774,6 +4774,127 @@ def apply_aqlm_cpp(
     return onnx.load_from_string(C.apply_aqlm(model.SerializeToString()))
 
 
+def apply_drop_by_drop_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_drop_by_drop`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight via Drop-by-Drop's own additive multi-bitwidth
+    codebook scheme -- each (output-channel, 8-element K-block) group is
+    reconstructed by 4 additive residual codebook stages, each an
+    *importance-weighted* Lloyd's-algorithm k-means fit (weighted by the
+    group's own fixed original-magnitude RMS). See
+    :func:`onnxsim.quantize_weight_only_drop_by_drop`'s own docstring for
+    the full rationale.
+
+    Unlike :func:`onnxsim.quantize_weight_only_drop_by_drop`, this port
+    folds the reconstruction directly into a replacement float32
+    initializer instead of building a Gather+Add-chain graph rewrite, and
+    unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass. Like
+    :func:`onnxsim.apply_aqlm_cpp`'s own divergence, this port's own
+    k-means initialization is deterministically magnitude-sorted rather
+    than :func:`onnxsim.quantize_weight_only_drop_by_drop`'s own
+    seeded-random sample, applied to each of the 4 weighted fits.
+
+    A layer whose reduction dimension isn't evenly divisible by 8 is
+    left completely untouched.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            Drop-by-Drop-reconstructed float32 version, stored under a
+            *new* initializer. A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_drop_by_drop(model.SerializeToString()))
+
+
+def apply_lo_bcq_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of the weight-side half of
+    :func:`onnxsim.quantize_weight_only_lo_bcq`: weight-only quantizes
+    every MatMul/vanilla-Gemm layer with a constant 2-D float32 weight via
+    LO-BCQ's own block-clustered codebook scheme -- blocks of the
+    reduction dimension are clustered by their own [mean, std] feature
+    vector into 4 groups, then each cluster fits its own small codebook
+    from only its own currently-assigned blocks, alternating cluster
+    refit and block reassignment. See
+    :func:`onnxsim.quantize_weight_only_lo_bcq`'s own docstring for the
+    full rationale.
+
+    Unlike :func:`onnxsim.quantize_weight_only_lo_bcq`, this port folds
+    the reconstruction directly into a replacement float32 initializer
+    instead of building a Gather/GatherElements/Reshape graph rewrite,
+    and unlike :func:`simplify`, this does not run shape inference,
+    constant folding or any other simplification pass. This port's own
+    per-cluster/fallback 1-D codebook fits are deterministic
+    (percentile-derived centroids, matching
+    :func:`onnxsim.apply_kmeans_quantization_cpp`'s own precedent), while
+    its own block-clustering step's initialization is deterministically
+    feature-norm-sorted rather than
+    :func:`onnxsim.quantize_weight_only_lo_bcq`'s own seeded-random
+    sample (matching :func:`onnxsim.apply_aqlm_cpp`'s own precedent).
+
+    A layer whose reduction dimension isn't evenly divisible by 32 is
+    left completely untouched.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            LO-BCQ-reconstructed float32 version, stored under a *new*
+            initializer. A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_lo_bcq(model.SerializeToString()))
+
+
+def apply_quip_sharp_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_quip_sharp`: weight-only
+    quantizes every MatMul/vanilla-Gemm layer with a constant 2-D
+    float32 weight via QuIP#'s own incoherence-processing-plus-E8-lattice
+    scheme -- conjugates the weight by a pair of random orthogonal
+    matrices (``Wtilde = V @ W @ U``) so its entries look i.i.d.
+    Gaussian, then jointly quantizes each 8-element group to the nearest
+    E8 lattice point. See :func:`onnxsim.apply_quip_sharp`'s own
+    docstring for the full rationale.
+
+    Unlike :func:`onnxsim.apply_quip_sharp`'s own graph rewrite (which
+    keeps U, V and the packed INT4 lattice codes as explicit initializers
+    and new MatMul nodes), this port folds the entire
+    rotate/quantize/rotate-back sandwich into a single replacement weight
+    initializer -- exact, not an approximation, since U/V are square and
+    only sandwich the weight -- and unlike :func:`simplify`, this does
+    not run shape inference, constant folding or any other
+    simplification pass. This port's own random orthogonal matrices are
+    generated via a Gram-Schmidt construction (the same precedent
+    :func:`onnxsim.apply_quarot_cpp` already establishes for this
+    module), not :func:`onnxsim.apply_quip_sharp`'s own
+    QR-with-sign-correction one -- both are independently Haar-uniform;
+    cross-language bit parity is explicitly not a goal.
+
+    A layer whose reduction dimension isn't evenly divisible by 8 is
+    left completely untouched.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            QuIP#-reconstructed float32 version, stored under a *new*
+            initializer. A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_quip_sharp(model.SerializeToString()))
+
+
 def apply_daq_cpp(
     base_model: Union[str, onnx.ModelProto],
     post_trained_model: Union[str, onnx.ModelProto],
@@ -4820,6 +4941,64 @@ def apply_daq_cpp(
             post_trained_model.SerializeToString(),
             metric,
             skip_names,
+        )
+    )
+
+
+def apply_low_rank_compensation_cpp(
+    float_model: Union[str, onnx.ModelProto],
+    quantized_model: Union[str, onnx.ModelProto],
+    rank: int = 8,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_low_rank_compensation`: adds a
+    rank-``r`` low-rank correction (ZeroQuant-V2's LoRC, Yao et al., 2023)
+    to every ``quantize_weight_only_int4``-quantized MatMul/Gemm layer
+    matched (by node output name) between ``float_model`` and
+    ``quantized_model``, canceling out that much of its existing
+    quantization error via the Eckart-Young-optimal rank-``r``
+    approximation of the reconstruction error matrix. See
+    :func:`onnxsim.apply_low_rank_compensation`'s own docstring for the
+    full rationale.
+
+    Unlike every other ``*_cpp`` weight-only port in this module (which
+    folds its correction into a replacement weight initializer), this
+    one's correction is *additive to a matched layer's output*: it adds
+    two new small ``MatMul`` nodes plus an ``Add`` node
+    (``Y = X @ Wq_dequant + (X @ B) @ A``), leaving the layer's own
+    existing INT4 weight and scale completely untouched. Like
+    :func:`onnxsim.apply_daq_cpp`, this is data-free (no calibration data
+    or ``providers`` argument) yet still takes two full model arguments.
+    This port's own SVD is a hand-rolled Jacobi SVD rather than
+    ``numpy.linalg.svd``'s own LAPACK routine (no linear-algebra library
+    is linked into this codebase) -- individual singular vectors/values
+    are not expected to match sign-for-sign or bit-for-bit, but the
+    reconstructed rank-``r`` correction itself is (up to ordinary
+    floating-point rounding, by the Eckart-Young theorem's own
+    uniqueness).
+
+    :param float_model: the original (unquantized) onnx ModelProto or
+            file path
+    :param quantized_model: a quantized version of ``float_model`` (onnx
+            ModelProto or file path), produced by
+            :func:`onnxsim.quantize_weight_only_int4`; this is the model
+            that gets corrected and returned
+    :param rank: the correction's rank ``r`` (clamped to
+            ``min(r, N, K)`` per layer)
+    :returns: ``quantized_model`` with every matched layer's output
+            summed with a new rank-``r`` correction term. A layer with no
+            ``float_model`` counterpart, a shape mismatch, or a clamped
+            rank ``<= 0`` is left completely untouched.
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(quantized_model, str):
+        quantized_model = onnx.load(quantized_model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_low_rank_compensation(
+            float_model.SerializeToString(),
+            quantized_model.SerializeToString(),
+            rank,
         )
     )
 

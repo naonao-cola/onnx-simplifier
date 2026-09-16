@@ -2502,6 +2502,48 @@ em::val onnxsim_apply_aqlm(const std::string &data) {
   }
 }
 
+em::val onnxsim_apply_drop_by_drop(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyDropByDrop(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_drop_by_drop error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_lo_bcq(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyLoBcq(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_lo_bcq error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_quip_sharp(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyQuipSharp(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_quip_sharp error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // DAQ is data-free but still needs two full models (base + fine-tuned,
 // matched by node output name) -- the same two-model shape
 // onnxsim_list_correctable_outputs/onnxsim_apply_bias_corrections above
@@ -2529,6 +2571,32 @@ em::val onnxsim_apply_daq(const std::string &base_data,
         ApplyDaq(base_model, post_trained_model, metric, skip_names));
   } catch (const std::exception &e) {
     std::cerr << "apply_daq error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+// Low-Rank Compensation is data-free but still needs two full models
+// (float + INT4-quantized, matched by node output name) -- the same
+// two-model shape onnxsim_apply_daq above already uses. `rank` arrives as
+// a JS number (double) and is narrowed to the int64_t it feeds, the same
+// way onnxsim_apply_quarot's own `seed` is -- embind has no binding for
+// int64_t itself.
+em::val onnxsim_apply_low_rank_compensation(const std::string &float_data,
+                                            const std::string &quantized_data,
+                                            double rank) {
+  onnx::ModelProto float_model, quantized_model;
+  if (!float_model.ParseFromArray(float_data.data(), float_data.size()) ||
+      !quantized_model.ParseFromArray(quantized_data.data(),
+                                      quantized_data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyLowRankCompensation(
+        float_model, quantized_model, static_cast<int64_t>(rank)));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_low_rank_compensation error: " << e.what()
+              << std::endl;
     return em::val::null();
   }
 }
@@ -3548,7 +3616,12 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_apply_icquant", &onnxsim_apply_icquant);
   function("onnxsim_apply_olive", &onnxsim_apply_olive);
   function("onnxsim_apply_aqlm", &onnxsim_apply_aqlm);
+  function("onnxsim_apply_drop_by_drop", &onnxsim_apply_drop_by_drop);
+  function("onnxsim_apply_lo_bcq", &onnxsim_apply_lo_bcq);
+  function("onnxsim_apply_quip_sharp", &onnxsim_apply_quip_sharp);
   function("onnxsim_apply_daq", &onnxsim_apply_daq);
+  function("onnxsim_apply_low_rank_compensation",
+           &onnxsim_apply_low_rank_compensation);
   function("onnxsim_prune_magnitude", &onnxsim_prune_magnitude);
   function("onnxsim_apply_structured_pruning",
            &onnxsim_apply_structured_pruning);

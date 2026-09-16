@@ -1966,6 +1966,57 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // Drop-by-Drop: additive multi-bitwidth codebook quantization via 4
+  // importance-weighted greedy residual k-means stages. Data-free. See
+  // ApplyDropByDrop in onnxsim.h.
+  m.def(
+      "apply_drop_by_drop",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyDropByDrop(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // LO-BCQ: block-clustered quantization -- blocks are clustered by their
+  // own [mean, std] feature vector, then each cluster fits its own small
+  // codebook. Data-free. See ApplyLoBcq in onnxsim.h.
+  m.def(
+      "apply_lo_bcq",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyLoBcq(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // QuIP#: rotation-based incoherence processing plus E8-lattice vector
+  // quantization, folded into a single replacement weight initializer.
+  // Data-free. See ApplyQuipSharp in onnxsim.h.
+  m.def(
+      "apply_quip_sharp",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyQuipSharp(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // DAQ (Delta-Aware Quantization): data-free, but takes two full model
   // byte buffers (a base and a fine-tuned checkpoint, matched by node
   // output name) rather than one -- see ApplyDaq in daq_entry.h.
@@ -1992,6 +2043,29 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "base_model_bytes"_a, "post_trained_model_bytes"_a, "metric"_a = "cosine",
       "skip_names"_a = std::vector<std::string>{});
+
+  // Low-Rank Compensation (LoRC): data-free, but takes two full model byte
+  // buffers (a float model and its own INT4-quantized counterpart, matched
+  // by node output name) rather than one -- see ApplyLowRankCompensation
+  // in low_rank_compensation_entry.h.
+  m.def(
+      "apply_low_rank_compensation",
+      [](const py::bytes& float_model_bytes,
+         const py::bytes& quantized_model_bytes, int64_t rank) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_model_bytes.c_str(),
+                            quantized_model_bytes.size());
+        const auto result =
+            ApplyLowRankCompensation(float_model, quantized_model, rank);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "float_model_bytes"_a, "quantized_model_bytes"_a, "rank"_a = 8);
 
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
