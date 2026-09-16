@@ -27,21 +27,20 @@ Serial was picked over WebUSB for this class of board).
 | Step | Where | Status |
 |---|---|---|
 | Fetch + simplify/quantize an HF model | the existing [onnxsim model converter](../convertmodel/index.html) — this tool doesn't repeat that UI | already shipped, unrelated to this addition |
-| ONNX → TFLite (int8) | `scripts/onnx_to_tflite_micro.py` (`convert_to_tflite`, wraps `onnx2tf -oiqt`) | **run for real against a real HF model — found a real bug**: `-oiqt` requires a Float32 ONNX input, but a model that's already ONNX-quantized (QuantizeLinear/DequantizeLinear baked in, `uint8` input) makes onnx2tf error out before producing anything. `--no-int8` (plain Float32 output, skips `-oiqt`) works around it; the script doesn't yet detect/handle already-quantized inputs itself — see `firmware/runtime/README.md`'s "Status", finding #3 |
+| ONNX → TFLite (int8) | `scripts/onnx_to_tflite_micro.py` (`convert_to_tflite`, wraps `onnx2tf -oiqt`) | **run for real against real HF models — found two real bugs, both worked around manually**: `-oiqt` requires a Float32 ONNX input, so it errors out on an already-quantized model (finding #3); and even given a Float32 input, `-oiqt`'s own default calibration data fails to load on a current numpy for *any* model (finding #6, an onnx2tf bug, not this repo's). Supplying real calibration data directly via onnx2tf's own `-cind` flag (not yet wired into this script) works and produced a real, correctly-quantized int8 model — see `firmware/runtime/README.md`'s "Status", findings #3 and #6 |
 | TFLite → C header | `scripts/onnx_to_tflite_micro.py` (`emit_c_header`) | unit-tested, see `tests/` |
-| Firmware (generic TFLite Micro runtime) | [`firmware/runtime/`](firmware/runtime/README.md) — a real PlatformIO project, not just a recipe | **compiled, flashed, and booted on a real M5Stack Cardputer.** Real hardware found and fixed a `qio`→`dio` flash-mode bug (finding #1); found (unfixed, upstream-library) a crash on legacy-quantized `DepthwiseConv` models (finding #2); found and precisely root-caused (unfixed, upstream-library) that this model's `Transpose` op runs on `uint8` data, which this TFLM version's `Transpose` kernel doesn't support (finding #4); and found and fixed a `Serial`-routing bug that was hiding *all* app/TFLM diagnostic output, including finding #4's own error text (finding #5) — see that README's "Status" for all five |
+| Firmware (generic TFLite Micro runtime) | [`firmware/runtime/`](firmware/runtime/README.md) — a real PlatformIO project, not just a recipe | **compiled, flashed, booted, and ran a real, correctly-quantized model end to end on a real M5Stack Cardputer -- `Invoke()` returned `kTfLiteOk`, confirmed live over serial (finding #6).** Getting there found and fixed a `qio`→`dio` flash-mode bug (finding #1); found (unfixed, upstream-library) a crash on legacy-quantized `DepthwiseConv` models (finding #2); found and precisely root-caused (unfixed, upstream-library) that a differently-quantized model's `Transpose` op runs on unsupported `uint8` data (finding #4); and found and fixed a `Serial`-routing bug that was hiding *all* app/TFLM diagnostic output (finding #5) — see that README's "Status" for the full sequence |
 | Flash over Web Serial | `web/flasher.mjs` (Espressif's `esptool-js`) | loads and runs its UI logic cleanly in a browser (checked headless); the underlying ISP protocol was exercised for real via `esptool` directly against `/dev/ttyACM0` (same USB-Serial/JTAG port Web Serial would use) — `flasher.mjs`'s own browser-side call shapes are still **not** exercised through an actual Chrome Web Serial session |
 
-Real hardware confirmed: flashing, booting, mmap'ing the model partition,
-and (for a Float32 model) `AllocateTensors()` all work end to end, and
-`Serial`/on-device diagnostics are now real and readable (finding #5). Not
-yet confirmed: a *correct* inference result -- the one real model tried so
-far loads but its `Transpose` op fails on `uint8` input, a precise, real
-TFLM library gap (finding #4), and no int8-quantized model has cleared
-`AllocateTensors()` at all (blocked on findings #2 and #3). The browser UI
-itself doing the flashing (vs. `esptool` CLI standing in for it) is also
-still unverified. See `firmware/runtime/README.md`'s "Status" for the full,
-numbered findings.
+Real hardware confirmed, fully end to end: flashing, booting, mmap'ing the
+model partition, `AllocateTensors()`, and a correct `Invoke()` all work for
+a real, properly int8-quantized model -- `test inference: OK` repeatedly,
+live, over the now-working `Serial` port (finding #5). The specific model
+tried first (legacy-quantized, finding #2/#4) still doesn't work -- that's
+a real upstream-library gap, not something wrong with the pipeline itself.
+The browser UI itself doing the flashing (vs. `esptool` CLI standing in for
+it) is also still unverified. See `firmware/runtime/README.md`'s "Status"
+for the full, numbered findings.
 
 ## Using it
 
@@ -68,20 +67,31 @@ older recipe bakes the model directly into the firmware as a C array.
 
 ## Not done yet / follow-ups
 
-- **A model whose graph doesn't feed `uint8` data into `Transpose`** would
-  sidestep finding #4 (root-caused, not fixed -- the gap is in vendored
-  `Chirale_TensorFLowLite`, not this repo). Either a model whose converted
-  graph doesn't have a `Transpose` immediately on the raw quantized input,
-  or a genuine per-channel int8-quantized model (which needs finding #3
-  fixed first) would be the next real test of whether `Invoke()` can
-  produce a *correct* result on this hardware, not just avoid crashing.
-- **Handle already-quantized ONNX inputs in `onnx_to_tflite_micro.py`**
-  (finding #3): `convert_to_tflite()` always passes onnx2tf's `-oiqt`,
-  which needs a Float32 input and errors out on a model that's already
-  ONNX-quantized (QuantizeLinear/DequantizeLinear baked in). Detecting that
-  case (e.g. checking the ONNX graph's input dtype, or catching onnx2tf's
-  specific error) and skipping `-oiqt` automatically would make the script
-  work uniformly across both already-quantized and still-float HF models.
+- **Done, real hardware confirmed:** a genuinely per-channel int8-quantized
+  model (the HF repo's `-fp32-onnx` variant run through `onnx2tf -oiqt`
+  with real calibration data) flashed, booted, and `Invoke()` returned
+  `kTfLiteOk` repeatedly -- real, correct end-to-end inference, not just
+  "doesn't crash". See `firmware/runtime/README.md`'s finding #6.
+- **Wire `onnx2tf`'s `-cind`/custom-calibration-data support into
+  `onnx_to_tflite_micro.py`** (findings #3 and #6): `convert_to_tflite()`
+  always passes plain `-oiqt`, which (a) errors out on an already-quantized
+  ONNX input (finding #3) and (b) even for a Float32 input, only works if
+  onnx2tf's own default image-shaped calibration data loads successfully,
+  which it currently doesn't for *any* model on a current numpy (finding
+  #6) -- both were worked around manually outside the script this session.
+  The script should accept caller-supplied calibration data (numpy array or
+  path) and pass it through via `-cind`, rather than only ever relying on
+  onnx2tf's broken default.
+- **Fix `convert_to_tflite()`'s output-file glob** (`tests/` doesn't cover
+  this): `sorted(out_dir.glob(f"*{suffix}"))[0]` with
+  `suffix = "_integer_quant.tflite"` matches *both*
+  `..._integer_quant.tflite` and `..._full_integer_quant.tflite` (the
+  latter also ends with that suffix) and picks whichever sorts first
+  alphabetically -- currently `full_integer_quant` (the one with real int8
+  I/O boundaries, which is what worked on real hardware this session), but
+  that's alphabetical luck, not an intentional selection. Should match the
+  exact filename onnx2tf documents for `-oiqt`'s int8-with-int8-I/O output,
+  not a glob that happens to also catch a differently-named sibling file.
 - A Sipeed Maix Amigo / M5StickV (Kendryte K210) target: same board family,
   a real camera (Amigo) and better on-device inference (KPU). The Web
   Serial flasher this needed didn't exist anywhere, so it's now built —

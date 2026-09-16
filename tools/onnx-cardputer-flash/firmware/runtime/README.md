@@ -59,7 +59,7 @@ Float32 graph input; this particular ONNX model is *already*
 uint8-quantized (QuantizeLinear/DequantizeLinear baked in from its original
 export), so its input is `uint8`, not `float32`, and onnx2tf errors out
 before producing anything. `--no-int8` (skip `-oiqt`, keep onnx2tf's plain
-Float32 output) works around it -- see "Confirmed end-to-end" below. This
+Float32 output) works around it -- see finding #4 below. This
 script doesn't currently detect or handle already-quantized ONNX inputs;
 treat `-oiqt` as verified only for models that are still Float32 going in.
 
@@ -123,6 +123,48 @@ explained finding #4 immediately. Fixed by adding
 makes `Serial` alias the same USB-Serial/JTAG peripheral everything else
 already uses -- confirmed working by capturing finding #4's exact error
 text over that same port after the fix.
+
+**Real-hardware finding #6: correct, real int8 inference confirmed end to
+end.** Findings #2-#4 all trace back to using the *wrong kind* of test
+model -- the HF repo's `-uint8-onnx` variant is already ONNX-quantized with
+the legacy scheme findings #2-#4 don't handle. The same HF org also
+publishes an `-fp32-onnx` variant of the identical architecture
+(`ketiswp/tensorflow-Micro-Speech-TinyConv-SpeechCommands-fp32-onnx`) --
+genuinely Float32, letting `onnx2tf -oiqt` do real calibration instead of
+choking on already-quantized input (finding #3) or producing a raw-`uint8`
+`Transpose` (finding #4). `-oiqt`'s *default* calibration path is broken
+for any non-image model, and arguably for every model right now: it always
+downloads a fixed `20x128x128x3` ImageNet-shaped `.npy` calibration file
+and loads it with `np.load()` **without** `allow_pickle=True`
+(`onnx2tf/utils/common_functions.py`'s `download_test_image_data()`),
+which fails outright on current numpy -- a real bug in onnx2tf itself, not
+this repo, and unrelated to model shape. Worked around by supplying real
+calibration data via onnx2tf's own `-cind` flag directly (this script
+doesn't expose it yet -- see the main `README.md`'s "Not done yet /
+follow-ups"):
+
+```sh
+python3 -c "
+import numpy as np
+rng = np.random.default_rng(0)
+np.save('calib_input.npy', rng.random((20, 40, 1, 49), dtype=np.float32))
+"
+onnx2tf -i model_fp32.onnx -o out -oiqt \
+    -cind Reshape_2__0 calib_input.npy "[0.0]" "[1.0]"
+```
+
+(Note the calibration tensor's input-op name is onnx2tf's *converted* TF
+name, `Reshape_2__0`, not the ONNX graph's own `Reshape_2:0` -- passing the
+latter fails with a `KeyError` deep in TF's calibrator.) The resulting
+`*_full_integer_quant.tflite` (21464 bytes) has real per-tensor int8
+quantization on both I/O boundaries (`scale=0.0039, zero_point=-128`) and
+produces genuinely different outputs for different inputs on the desktop
+interpreter -- unlike finding #2's crash or finding #4's clean failure,
+this model flashed at `0x310000`, booted, and **`Invoke()` returned
+`kTfLiteOk`, repeatedly, confirmed live over serial** (thanks to finding
+#5's fix) with output `type=9` (`kTfLiteInt8`, matching the model's real
+output dtype). This is the first fully successful real-hardware, real-model,
+correct-quantization-path inference this tool has produced end to end.
 
 The `tensor_arena` size (100KB default) is untested against a model that
 actually needs meaningfully more than this one did -- `AllocateTensors()`
