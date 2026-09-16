@@ -3,17 +3,30 @@ name: Edgeai Integration
 # Checks onnxsim's output against TI's TIDL (edgeai) accelerator toolchain
 # -- see scripts/edgeai/README.md.
 #
-# Like axera-integration.yml's Pulsar2 check, TIDL has no pip package or
-# ONNX Runtime execution provider installable in a plain CI container (the
-# TIDL-enabled onnxruntime build ships as part of TI's PSDK/edgeai-tidl-tools
-# SDK), so `tidl-compat` below is a static, dependency-light check
-# (tests/test_edgeai_tidl_compat.py, scripts/edgeai/run_tidl_compat.py) that
-# runs on any stock runner with just onnxsim -- no Docker, no device. Unlike
-# axera-integration.yml, there is currently no self-hosted-runner job here at
-# all: this repository has no TI SDK image or connected device to run a real
-# TIDL compile against, so nothing beyond the static heuristic is dormant
-# waiting on hardware -- see scripts/edgeai/README.md for what such a job
-# would need to replace this with.
+# Unlike QNN/OpenVINO/MIGraphX's execution providers, the TIDL-enabled
+# onnxruntime build (`onnxruntime_tidl`, TI's own fork) is not on PyPI --
+# it ships as part of TI's PSDK/edgeai-tidl-tools SDK, downloaded from
+# `software-dl.ti.com`. Two jobs here, in increasing order of how real they
+# are:
+#
+# - `tidl-compat`: a static, dependency-light heuristic
+#   (tests/test_edgeai_tidl_compat.py, scripts/edgeai/run_tidl_compat.py)
+#   that runs on any stock runner with just onnxsim -- no download, no
+#   device. Always runs.
+# - `tidl-real-compile`: an *actual* compile, via the real
+#   `onnxruntime_tidl` wheel + `tidl_tools` binaries in x86 "PC
+#   emulation"/compile-only mode (tests/test_edgeai_tidl_real_compile.py,
+#   scripts/edgeai/real_compile.py) -- genuinely real, not a mock, though
+#   it's the compile/import stage only, not on-device inference (see that
+#   module's docstring). This needs no Docker and no self-hosted runner
+#   (unlike axera-integration.yml's `pulsar2-docker-convert`, which is
+#   gated on both) -- just network access to `software-dl.ti.com` and the
+#   `downloads.ti.com` host its download links redirect to, which a normal
+#   GitHub-hosted runner has and this repository's own contributor-facing
+#   documentation did not always assume (see scripts/edgeai/README.md's
+#   history for why the static check was the only thing here at first).
+#   Not yet verified on an actual GitHub Actions runner -- only reproduced
+#   directly in a development sandbox with the same network access.
 
 on:
   schedule:
@@ -26,6 +39,7 @@ on:
       - "scripts/common/**"
       - "tests/test_edgeai_tidl_compat.py"
       - "tests/test_edgeai_legalize.py"
+      - "tests/test_edgeai_tidl_real_compile.py"
 
 concurrency:
   group: edgeai-integration-${{ github.ref }}
@@ -103,3 +117,51 @@ jobs:
           name: tidl-compat-report
           path: ${{ runner.temp }}/tidl-compat.csv
           if-no-files-found: ignore
+
+  tidl-real-compile:
+    name: Real TIDL compile check (x86 PC emulation, no device)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      # Two Pythons in one job: onnxsim's own wheel is cp312 (matching the
+      # `build` job above); the real onnxruntime_tidl wheel TI publishes is
+      # cp310-only (see scripts/edgeai/real_compile.py's docstring) and
+      # needs its own venv. Referencing each by its `python-path` output
+      # avoids relying on whichever setup-python call last won PATH.
+      - uses: actions/setup-python@v7
+        id: py312
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-python@v7
+        id: py310
+        with:
+          python-version: "3.10"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-edgeai
+          path: wheelhouse
+      - name: Install onnxsim + pytest (cp312)
+        run: |
+          "${{ steps.py312.outputs.python-path }}" -m pip install --upgrade pip
+          "${{ steps.py312.outputs.python-path }}" -m pip install onnx pytest wheelhouse/*.whl
+      - name: Download the real tidl_tools + onnxruntime_tidl wheel
+        run: |
+          "${{ steps.py312.outputs.python-path }}" \
+            "$GITHUB_WORKSPACE/scripts/edgeai/real_compile.py" setup \
+            "${{ runner.temp }}/tidl" --soc J721S2
+      - name: Set up the onnxruntime_tidl venv (Python 3.10, numpy<2)
+        run: |
+          "${{ steps.py310.outputs.python-path }}" -m venv "${{ runner.temp }}/tidl_venv"
+          "${{ runner.temp }}/tidl_venv/bin/pip" install --upgrade pip
+          "${{ runner.temp }}/tidl_venv/bin/pip" install \
+            "${{ runner.temp }}"/tidl/onnxruntime_tidl-*.whl "numpy<2"
+      - name: Run the real compile check
+        working-directory: ${{ runner.temp }}
+        env:
+          TIDL_PYTHON: ${{ runner.temp }}/tidl_venv/bin/python
+          TIDL_TOOLS_PATH: ${{ runner.temp }}/tidl/tidl_tools
+        run: |
+          "${{ steps.py312.outputs.python-path }}" -m pytest -v \
+            "$GITHUB_WORKSPACE/tests/test_edgeai_tidl_real_compile.py"

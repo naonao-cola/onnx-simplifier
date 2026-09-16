@@ -6,25 +6,25 @@ SDK (`edgeai-modeloptimization`, `edgeai-tensorlab`, `edgeai-tidl-tools`, ...)
 compiles ONNX models for, targeting the C7x-MMA deep-learning accelerator on
 Jacinto/Sitara SoCs (TDA4x, AM62A/68A, ...).
 
-## This one is not like `scripts/qualcomm`/`scripts/intel`/`scripts/amd`
+## Two checks, not one: a static heuristic, and now a real compile
 
-Those wrap a **real** compiler via a pip-installable ONNX Runtime execution
-provider, so they measure actual compile/run behavior. TIDL, like Axera's
-Pulsar2 (`scripts/axera`), has no PyPI package and no plain-pip execution
-provider -- the TIDL-enabled `onnxruntime` build ships as part of TI's own
-PSDK/edgeai-tidl-tools SDK and needs either the target device or a matching
-x86 "PC emulation" build, neither of which this repository provisions.
+`tidl_ops.py`/`tidl_backend.py` are a static heuristic that needs nothing
+beyond `onnx` -- it runs on every PR. `real_compile.py` is a *genuinely
+real* compile/import via TI's own `onnxruntime_tidl` (`TIDLCompilationProvider`)
+and `tidl_tools` binaries, in x86 "PC emulation"/compile-only mode -- see
+"Running a real compile" below for how that became possible and what it
+does and doesn't confirm. Keep both: the static check runs everywhere with
+no setup and no network dependency, the real one is the actual ground
+truth when it's available.
 
-So, **unlike `scripts/axera`, this check makes no hardware- or
-compiler-confirmed claims at all** -- there is no equivalent here of a real
-device, a real compiled artifact, or a real toolchain run to cite. It *is*,
-however, checked directly against edgeai-tidl-tools' own published docs --
-`docs/operators.md` ("Supported Operators") and `docs/vision_transformers.md`
-("Vision Transformers") -- fetched from `raw.githubusercontent.com` (see
-"Reaching edgeai-tidl-tools from here" below) rather than reconstructed from
-memory. That distinction mattered in practice: an earlier version of this
-harness's `legalize.py` had a GELU rule backwards until the actual doc was
-checked (see that section).
+Everything the static heuristic checks for is verified directly against
+edgeai-tidl-tools' own published docs -- `docs/operators.md` ("Supported
+Operators") and `docs/vision_transformers.md` ("Vision Transformers") --
+fetched from `raw.githubusercontent.com` (see "Reaching edgeai-tidl-tools
+from here" below) rather than reconstructed from memory. That distinction
+mattered in practice: an earlier version of this harness's `legalize.py`
+had a GELU rule backwards until the actual doc was checked (see that
+section below).
 
 1. **No dynamic shapes.** Every graph input must have a fully static shape
    (including batch size) for TIDL to compile it at all.
@@ -50,7 +50,7 @@ checked (see that section).
    So a literal ONNX `Gelu` node is the thing to flag/unfuse, not the
    decomposed form -- see "`legalize.py`" below.
 
-What this check does, per model:
+What the static check does, per model:
 
 - Compute the blocker set (op-type blockers + the static-shape check) before
   and after `onnxsim.simplify()`.
@@ -63,15 +63,14 @@ What this check does, per model:
 What it deliberately does **not** claim: that a model with zero flagged
 blockers actually compiles on a real TIDL toolchain, or that its per-op
 attribute-level limits (e.g. supported `Resize` modes, `Conv` group/dilation
-ranges) are satisfied -- this harness only checks op *type* and
-shape-staticness. If a runner with the real SDK (or a device) is ever
-provisioned, replace this with an actual model-import/compile check, the way
-`scripts/qualcomm`/`scripts/intel`/`scripts/amd` wrap a real execution
-provider.
+ranges) are satisfied -- it only checks op *type* and shape-staticness.
+`real_compile.py` (below) is what actually confirms the rest, when it's
+available.
 
 ## Reaching edgeai-tidl-tools from here
 
-Two different hosts, two different answers:
+Three different hosts, three different (and, for two of them, since-changed)
+answers:
 
 - **`raw.githubusercontent.com` is reachable.** `docs/operators.md`,
   `docs/vision_transformers.md`, the top-level `README.md`, `docs/
@@ -82,17 +81,18 @@ Two different hosts, two different answers:
   `api.github.com` both 403 (looks like GitHub's normal anti-automation
   response to a plain unauthenticated request, not something specific to
   this repository), but the raw file server does not.
-- **`software-dl.ti.com` is not.** `scripts/setup/setup.sh` downloads
-  *everything* real from there -- the TIDL-patched `onnxruntime_tidl`
-  wheel, `tidl_tools` itself, the TFLite/TVM runtime wheels, even the
-  out-of-box example data -- and this repository's own network policy
-  403s that host at the CONNECT level. So there is currently no way to
-  replace this static heuristic with a real compile/import check from
-  here, even though the documentation describing what that check should
-  look for is readable. If a runner with the real SDK is ever
-  provisioned, wire it in as a `workflow_dispatch`-only job (like
-  `axera-integration.yml`'s `pulsar2-docker-convert`), which stays
-  dormant until such a runner exists.
+- **`software-dl.ti.com` and `downloads.ti.com` are now both reachable.**
+  `scripts/setup/setup.sh` downloads everything real from
+  `software-dl.ti.com` -- the TIDL-patched `onnxruntime_tidl` wheel,
+  `tidl_tools` itself, the TFLite/TVM runtime wheels, even the out-of-box
+  example data -- but every one of those links 302-redirects to a
+  *second* host, `downloads.ti.com`, that actually serves the file. Both
+  were confirmed 403 (at the CONNECT level) at an earlier point in this
+  project's history; both are unblocked now, which is what made
+  `real_compile.py` (below) possible. If they are blocked again,
+  `find_tidl_python()`/`tidl_tools_path()` return `None` and
+  `tests/test_edgeai_tidl_real_compile.py` skips cleanly rather than
+  failing -- the static heuristic keeps working regardless either way.
 
 One thing worth citing directly rather than the general "onnxsim is used
 as post-export cleanup" framing this repo's top-level README already
@@ -100,6 +100,37 @@ gives other projects: edgeai-tidl-tools' own `docs/vision_transformers.md`
 DeiT walkthrough runs `onnxsim` as one of its own documented steps --
 `pip install timm onnx onnxsim` then `!onnxsim deit_tiny.onnx
 deit_tiny_1.onnx`, right before the resulting model is handed to TIDL.
+
+## Running a real compile
+
+`real_compile.py` wraps TI's actual `onnxruntime_tidl` (`TIDLCompilationProvider`)
+and `tidl_tools` binaries -- see that module's docstring for the two things
+this does and doesn't confirm (a real compile/import stage, not on-device
+inference; genuinely real, not a mock). To set it up locally:
+
+```bash
+# 1. Download the real tidl_tools + onnxruntime_tidl wheel (needs network
+#    access to software-dl.ti.com and downloads.ti.com).
+python3 scripts/edgeai/real_compile.py setup /tmp/tidl --soc J721S2
+
+# 2. onnxruntime_tidl ships as a cp310-only wheel, so it needs its own
+#    Python 3.10 venv, pinned to numpy<2 (the wheel predates NumPy 2's ABI).
+python3.10 -m venv /tmp/tidl_venv
+/tmp/tidl_venv/bin/pip install /tmp/tidl/onnxruntime_tidl-*.whl "numpy<2"
+
+# 3. Point the real-compile tests at both.
+export TIDL_PYTHON=/tmp/tidl_venv/bin/python
+export TIDL_TOOLS_PATH=/tmp/tidl/tidl_tools
+pytest -v tests/test_edgeai_tidl_real_compile.py
+```
+
+`--soc` can be any device from the top-level README's supported-devices
+table (normalized per `scripts/setup/setup_env.sh`, e.g. `AM68A`/`TDA4VL`
+both map to `J721S2`) -- the compile stage needs no device, so which one
+you pick only changes which C7x firmware profile it compiles against.
+`.github/workflows/edgeai-integration.yml`'s `tidl-real-compile` job
+automates exactly these steps in CI (not yet verified there directly --
+only reproduced in a development sandbox with the same network access).
 
 ## `legalize.py`: acting on what the heuristic flags
 
@@ -158,6 +189,10 @@ original graph).
 - `run_tidl_compat.py` -- drives `worker.py` over the whole suite (or a
   `--models` subset) and writes a CSV report.
 - `legalize.py` -- the fusion rewrites described above.
+- `real_compile.py` -- the real `onnxruntime_tidl`/`tidl_tools` compile
+  wrapper described above ("Running a real compile").
 - `../../tests/test_edgeai_tidl_compat.py` -- the pytest suite CI runs.
 - `../../tests/test_edgeai_legalize.py` -- correctness checks for
   `legalize.py`'s rewrites.
+- `../../tests/test_edgeai_tidl_real_compile.py` -- the real-compile
+  regression check, skip-guarded on `TIDL_PYTHON`/`TIDL_TOOLS_PATH`.

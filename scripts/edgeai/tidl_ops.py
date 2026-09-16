@@ -9,25 +9,29 @@ inference engine for the C7x-MMA deep-learning accelerator on TI's
 Jacinto/Sitara SoCs (TDA4x, AM62A/68A, ...).
 
 Like Axera's Pulsar2 (see ``scripts/axera/pulsar2_ops.py``), TIDL has no PyPI
-package and no ONNX Runtime execution provider installable in a plain CI
-container: the TIDL-enabled ``onnxruntime`` build ships as part of TI's
-PSDK/edgeai-tidl-tools SDK, and every binary artifact its own setup script
-(``scripts/setup/setup.sh``) fetches -- ``onnxruntime_tidl``, ``tidl_tools``,
-even its out-of-box example data -- comes from ``software-dl.ti.com``, a host
-this repository's own network policy 403s. So, same as ``pulsar2_ops.py``,
-**this module wraps no real compiler and makes no hardware- or
-compiler-confirmed claims** -- everything here is a static heuristic. It is,
-however, checked directly against edgeai-tidl-tools' own published
+package and no ONNX Runtime execution provider installable via a plain
+``pip install`` -- the TIDL-enabled ``onnxruntime`` build (``onnxruntime_tidl``,
+TI's own fork) ships as part of TI's PSDK/edgeai-tidl-tools SDK, downloaded
+from ``software-dl.ti.com``/``downloads.ti.com``. **This module itself still
+wraps no real compiler and makes no hardware- or compiler-confirmed claims
+on its own** -- everything here is a static heuristic. It is, however,
+checked directly against edgeai-tidl-tools' own published
 ``docs/operators.md`` ("Supported Operators") and ``docs/
 vision_transformers.md`` ("Vision Transformers"), fetched from
-``raw.githubusercontent.com`` (which, unlike the interactive ``github.com``
-repo page and ``software-dl.ti.com``, is reachable from here) rather than
-reconstructed from memory -- catching, among other things, a backwards GELU
-rule an earlier version of this module's sibling ``legalize.py`` had (see
-that module's docstring for the correction and exactly what changed). If a
-runner with the real SDK is ever provisioned, replace this with an actual
-model-import/compile check the way ``scripts/qualcomm``/``scripts/intel``/
-``scripts/amd`` wrap a real execution provider.
+``raw.githubusercontent.com`` rather than reconstructed from memory --
+catching, among other things, a backwards GELU rule an earlier version of
+this module's sibling ``legalize.py`` had (see that module's docstring for
+the correction and exactly what changed).
+
+A sibling module, ``real_compile.py``, *does* wrap a real compiler now:
+once this repository's network policy allowed reaching
+``software-dl.ti.com``/``downloads.ti.com``, an actual compile/import via
+TI's real ``onnxruntime_tidl``/``tidl_tools`` binaries (x86 "PC
+emulation"/compile-only mode) became possible -- see that module's
+docstring and ``tests/test_edgeai_tidl_real_compile.py``. This module's
+heuristic still runs on every PR regardless (no download, no network
+dependency), with the real check as a stronger, skip-guarded second
+opinion when the toolchain is reachable.
 
 Two things TIDL's public documentation states plainly enough to check for
 without hardware:
