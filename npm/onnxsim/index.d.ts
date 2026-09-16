@@ -124,6 +124,12 @@ export function quantizeWeightOnlyNvfp4(model: OnnxModelBytes): Promise<Uint8Arr
 export function applyDeepseekFp8(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyKmeansQuantization(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyHqq(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyIbertGelu(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyIbertSoftmax(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyAdpq(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyIcquant(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyOlive(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyAqlm(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyDaq(
   baseModel: OnnxModelBytes,
   postTrainedModel: OnnxModelBytes,
@@ -329,6 +335,12 @@ declare const _default: {
   applyDeepseekFp8: typeof applyDeepseekFp8;
   applyKmeansQuantization: typeof applyKmeansQuantization;
   applyHqq: typeof applyHqq;
+  applyIbertGelu: typeof applyIbertGelu;
+  applyIbertSoftmax: typeof applyIbertSoftmax;
+  applyAdpq: typeof applyAdpq;
+  applyIcquant: typeof applyIcquant;
+  applyOlive: typeof applyOlive;
+  applyAqlm: typeof applyAqlm;
   applyDaq: typeof applyDaq;
   pruneMagnitude: typeof pruneMagnitude;
   applyStructuredPruning: typeof applyStructuredPruning;

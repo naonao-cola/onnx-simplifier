@@ -39,6 +39,12 @@ import {
   applyDeepseekFp8,
   applyKmeansQuantization,
   applyHqq,
+  applyIbertGelu,
+  applyIbertSoftmax,
+  applyAdpq,
+  applyIcquant,
+  applyOlive,
+  applyAqlm,
   applyDaq,
   applyMoeExpertChannelPruning,
   applyOutlierSuppression,
@@ -162,6 +168,12 @@ try {
       applyDeepseekFp8,
       applyKmeansQuantization,
       applyHqq,
+      applyIbertGelu,
+      applyIbertSoftmax,
+      applyAdpq,
+      applyIcquant,
+      applyOlive,
+      applyAqlm,
     ]) {
       const out = await fn(input);
       assert.ok(out instanceof Uint8Array, fn.name);

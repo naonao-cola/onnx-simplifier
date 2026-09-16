@@ -9,7 +9,9 @@
 #include <string>
 
 #include "onnxoptimizer/optimize.h"
+#include "passes/adpq.h"
 #include "passes/any_precision_llm.h"
+#include "passes/aqlm.h"
 #include "passes/cross_layer_equalization.h"
 #include "passes/deepseek_fp8.h"
 #include "passes/defuse_matmul_integer_to_float.h"
@@ -65,6 +67,9 @@
 #include "passes/gguf_q8_0.h"
 #include "passes/gguf_ternary_quant.h"
 #include "passes/hqq.h"
+#include "passes/ibert_gelu.h"
+#include "passes/ibert_softmax.h"
+#include "passes/icquant.h"
 #include "passes/if4_quantization.h"
 #include "passes/iq4_nl.h"
 #include "passes/kmeans_quantization.h"
@@ -74,6 +79,7 @@
 #include "passes/neg_to_mul.h"
 #include "passes/nf4.h"
 #include "passes/nvfp4_quantization.h"
+#include "passes/olive.h"
 #include "passes/pow2_to_mul.h"
 #include "passes/qoperator_quantize_activation.h"
 #include "passes/qoperator_quantize_concat.h"
@@ -151,7 +157,9 @@ void RegisterCustomOptimizerPasses() {
     auto& registry = ONNX_NAMESPACE::optimization::Optimizer::passes;
 
     // onnxsim-only rewrites (no built-in of the same name today).
+    RegisterOrReplace<p::ADPQ>(registry);
     RegisterOrReplace<p::AnyPrecisionLlm>(registry);
+    RegisterOrReplace<p::AQLM>(registry);
     RegisterOrReplace<p::CrossLayerEqualization>(registry);
     RegisterOrReplace<p::DeepSeekFp8>(registry);
     RegisterOrReplace<p::DefuseMatMulIntegerToFloat>(registry);
@@ -201,6 +209,9 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::GgufQ8_0>(registry);
     RegisterOrReplace<p::GgufTernaryQuant>(registry);
     RegisterOrReplace<p::HQQ>(registry);
+    RegisterOrReplace<p::IBertGelu>(registry);
+    RegisterOrReplace<p::IBertSoftmax>(registry);
+    RegisterOrReplace<p::ICQuant>(registry);
     RegisterOrReplace<p::IF4>(registry);
     RegisterOrReplace<p::IQ4NL>(registry);
     RegisterOrReplace<p::KMeansQuant>(registry);
@@ -213,6 +224,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::NegToMul>(registry);
     RegisterOrReplace<p::NF4>(registry);
     RegisterOrReplace<p::NVFP4Quantization>(registry);
+    RegisterOrReplace<p::Olive>(registry);
     RegisterOrReplace<p::Pow2ToMul>(registry);
     RegisterOrReplace<p::QOperatorQuantizeActivation>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConcat>(registry);

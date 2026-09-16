@@ -956,6 +956,110 @@ onnx::ModelProto ApplyKMeansQuantization(const onnx::ModelProto& model);
 // correct, non-interchangeable entry points, not aliases.
 onnx::ModelProto ApplyHQQ(const onnx::ModelProto& model);
 
+// I-BERT's own i-GELU polynomial approximation of Erf -- C++ port of
+// ibert_gelu.py's own apply_ibert_gelu. Unlike every weight-only port
+// above, this is a nonlinear-activation rewrite: it matches any
+// standalone, single-input/single-output Erf node anywhere in the graph
+// (no MatMul/weight involvement at all) and rebuilds its output from a
+// fixed Abs/Clip/Add/Mul/Sign sequence. See passes/ibert_gelu.h for the
+// exact formula and constants. Both sides build the exact same five ONNX
+// ops from the exact same three float32 constants, so this port is
+// expected to be numerically identical to apply_ibert_gelu up to
+// onnxruntime's own float32 evaluation of the resulting graph.
+// ApplyIBertGelu and its _cpp Python wrapper and apply_ibert_gelu remain
+// independently-correct, non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyIBertGelu(const onnx::ModelProto& model);
+
+// I-BERT's own integer-friendly Softmax exp-approximation -- C++ port of
+// ibert_softmax.py's own apply_ibert_softmax. Also a nonlinear-activation
+// rewrite, not a weight quantizer: matches any standalone Softmax node
+// and rebuilds its exp-and-normalize computation out of ordinary
+// opset-18+ ops (ReduceMax/Sub/Neg/Div/Floor/Add/Mul/Pow/ReduceSum/Div).
+// See passes/ibert_softmax.h for the exact formula, constants, and its
+// own documented scope narrowing (the final normalization uses a plain
+// Div, not the paper's own integer-only iterative reciprocal -- already
+// ibert_softmax.py's own scope, not one this port adds). A model whose
+// opset is below 18 is left completely untouched. ApplyIBertSoftmax and
+// its _cpp Python wrapper and apply_ibert_softmax remain independently-
+// correct, non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyIBertSoftmax(const onnx::ModelProto& model);
+
+// AdpQ (Ghaffari et al., 2024) -- C++ port of adpq.py's own
+// quantize_weight_only_adpq: a calibration-free salient/non-salient
+// weight split per (output-channel, 128-element K-group), decided
+// purely from a weight's own values via a median/MAD-based adaptive
+// threshold borrowed from Adaptive LASSO. See passes/adpq.h for the
+// exact formula. Unlike quantize_weight_only_adpq, this port folds the
+// round trip directly into a replacement float32 initializer rather
+// than building a real DequantizeLinear+ScatterND+Add graph rewrite.
+// ACCEPTED, PERMANENT DIVERGENCE from quantize_weight_only_adpq: no
+// accumulation step, so this port is expected to track the Python
+// port's own float64 numpy implementation closely, up to floating-point
+// median-tie-breaking and summation-order differences. ApplyADPQ and its
+// _cpp Python wrapper and quantize_weight_only_adpq remain independently-
+// correct, non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyADPQ(const onnx::ModelProto& model);
+
+// ICQuant (Li, Hanna, Fragouli, Diggavi, 2025) -- C++ port of
+// icquant.py's own quantize_weight_only_icquant: per (output-channel,
+// 32-element K-block), the single largest-magnitude element is excluded
+// from the block's own scale computation and reconstructed exactly; the
+// rest quantize to a symmetric 7-level-per-side grid. See
+// passes/icquant.h for the exact formula and its own note that
+// icquant.py's "combinadic" index encoding is a pure storage detail with
+// no effect on the reconstructed values, so this port skips it entirely.
+// Unlike quantize_weight_only_icquant, this port folds the round trip
+// directly into a replacement float32 initializer rather than building a
+// real INT4/DequantizeLinear/ScatterND/MatMul/Add graph rewrite.
+// ACCEPTED, PERMANENT DIVERGENCE from quantize_weight_only_icquant: no
+// accumulation step, so this port is expected to track the Python port's
+// own float64 numpy implementation closely, up to floating-point
+// summation-order differences and up to how ties are broken among
+// equal-magnitude outlier candidates. ApplyICQuant and its _cpp Python
+// wrapper and quantize_weight_only_icquant remain independently-correct,
+// non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyICQuant(const onnx::ModelProto& model);
+
+// OliVe -- Outlier-Victim Pair quantization (Guo et al., ISCA 2023) --
+// C++ port of olive.py's own quantize_weight_only_olive: per
+// (output-channel, 32-element K-block), adjacent element pairs with
+// exactly one outlier member become an OVP pair (the outlier gets a
+// wider code, its neighbor a narrower "victim" code at the same total
+// bit budget as two ordinary elements); pairs with zero or two outliers
+// fall back to ordinary quantization. See passes/olive.h for the exact
+// formula. Unlike quantize_weight_only_olive, this port folds the round
+// trip directly into a replacement float32 initializer rather than
+// building a real DequantizeLinear x2 + Cast + Where + MatMul[+Add]
+// graph rewrite. ACCEPTED, PERMANENT DIVERGENCE from
+// quantize_weight_only_olive: no accumulation step, so this port is
+// expected to track the Python port's own float64 numpy implementation
+// closely, up to floating-point summation-order/median-tie-breaking
+// differences. ApplyOlive and its _cpp Python wrapper and
+// quantize_weight_only_olive remain independently-correct, non-
+// interchangeable entry points, not aliases.
+onnx::ModelProto ApplyOlive(const onnx::ModelProto& model);
+
+// AQLM -- Additive Quantization for Language Models (Egiazarian et al.,
+// 2024) -- C++ port of aqlm.py's own quantize_weight_only_aqlm: each
+// (output-channel, 8-element K-block) group is reconstructed as the sum
+// of 2 codebook lookups, each codebook fit via greedy residual Lloyd's-
+// algorithm k-means. See passes/aqlm.h for the exact algorithm and its
+// own documented divergence. Unlike quantize_weight_only_aqlm, this port
+// folds the reconstruction directly into a replacement float32
+// initializer rather than building a Gather+Add-chain graph rewrite.
+// ACCEPTED, PERMANENT DIVERGENCE from quantize_weight_only_aqlm: unlike
+// kmeans_quantization.h's own scalar percentile-based initialization
+// (which matches its Python counterpart exactly outside a narrow edge
+// case), this port's own k-means initialization is deterministically
+// magnitude-sorted rather than aqlm.py's own seeded-random sample --
+// reproducing numpy's own PCG64 bitstream in C++ was judged not worth
+// it, so this is a genuinely different (though algorithmically
+// identical) fit, not merely a floating-point-order divergence.
+// ApplyAQLM and its _cpp Python wrapper and quantize_weight_only_aqlm
+// remain independently-correct, non-interchangeable entry points, not
+// aliases.
+onnx::ModelProto ApplyAQLM(const onnx::ModelProto& model);
+
 // DAQ (Delta-Aware Quantization) -- C++ port of daq.py's own apply_daq,
 // declared in daq_entry.h (included above) rather than duplicated here.
 // Unlike every other port in this file, DAQ is data-free but still takes

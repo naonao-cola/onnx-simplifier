@@ -2418,6 +2418,90 @@ em::val onnxsim_apply_hqq(const std::string &data) {
   }
 }
 
+em::val onnxsim_apply_ibert_gelu(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyIBertGelu(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_ibert_gelu error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_ibert_softmax(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyIBertSoftmax(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_ibert_softmax error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_adpq(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyADPQ(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_adpq error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_icquant(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyICQuant(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_icquant error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_olive(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyOlive(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_olive error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_aqlm(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyAQLM(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_aqlm error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // DAQ is data-free but still needs two full models (base + fine-tuned,
 // matched by node output name) -- the same two-model shape
 // onnxsim_list_correctable_outputs/onnxsim_apply_bias_corrections above
@@ -3458,6 +3542,12 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_apply_kmeans_quantization",
            &onnxsim_apply_kmeans_quantization);
   function("onnxsim_apply_hqq", &onnxsim_apply_hqq);
+  function("onnxsim_apply_ibert_gelu", &onnxsim_apply_ibert_gelu);
+  function("onnxsim_apply_ibert_softmax", &onnxsim_apply_ibert_softmax);
+  function("onnxsim_apply_adpq", &onnxsim_apply_adpq);
+  function("onnxsim_apply_icquant", &onnxsim_apply_icquant);
+  function("onnxsim_apply_olive", &onnxsim_apply_olive);
+  function("onnxsim_apply_aqlm", &onnxsim_apply_aqlm);
   function("onnxsim_apply_daq", &onnxsim_apply_daq);
   function("onnxsim_prune_magnitude", &onnxsim_prune_magnitude);
   function("onnxsim_apply_structured_pruning",

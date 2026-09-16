@@ -296,6 +296,44 @@ export async function applyHqq(model) {
 }
 
 /**
+ * I-BERT's own i-GELU polynomial approximation of Erf. Unlike every
+ * other data-free pass above, this is not a weight quantizer -- it
+ * replaces every standalone Erf node with a closed-form approximation.
+ */
+export async function applyIbertGelu(model) {
+  return callModelPass("onnxsim_apply_ibert_gelu", model);
+}
+
+/**
+ * I-BERT's own integer-friendly Softmax exp-approximation. Also not a
+ * weight quantizer -- replaces every standalone Softmax node. Needs
+ * opset 18+.
+ */
+export async function applyIbertSoftmax(model) {
+  return callModelPass("onnxsim_apply_ibert_softmax", model);
+}
+
+/** AdpQ: calibration-free salient/non-salient weight quantization. */
+export async function applyAdpq(model) {
+  return callModelPass("onnxsim_apply_adpq", model);
+}
+
+/** ICQuant: single-outlier-per-block weight quantization. */
+export async function applyIcquant(model) {
+  return callModelPass("onnxsim_apply_icquant", model);
+}
+
+/** OliVe: outlier-victim pair weight quantization. */
+export async function applyOlive(model) {
+  return callModelPass("onnxsim_apply_olive", model);
+}
+
+/** AQLM: additive/residual multi-codebook weight quantization. */
+export async function applyAqlm(model) {
+  return callModelPass("onnxsim_apply_aqlm", model);
+}
+
+/**
  * DAQ (Delta-Aware Quantization): unlike every other data-free pass
  * above, this needs TWO models (a base and a fine-tuned checkpoint,
  * matched by node output name), so it does not go through
@@ -944,6 +982,12 @@ export default {
   applyDeepseekFp8,
   applyKmeansQuantization,
   applyHqq,
+  applyIbertGelu,
+  applyIbertSoftmax,
+  applyAdpq,
+  applyIcquant,
+  applyOlive,
+  applyAqlm,
   applyDaq,
   pruneMagnitude,
   applyStructuredPruning,
