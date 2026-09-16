@@ -150,9 +150,7 @@ def test_cpp_multi_group_weight_quantization_matches_python_reference():
     assert len(mmi_nodes) == num_groups
 
     initializer_by_name = {t.name: t for t in q.graph.initializer}
-    cast_by_input = {
-        n.input[0]: n for n in q.graph.node if n.op_type == "Cast"
-    }
+    cast_by_input = {n.input[0]: n for n in q.graph.node if n.op_type == "Cast"}
     mul_by_input = {n.input[0]: n for n in q.graph.node if n.op_type == "Mul"}
 
     wq_ref, scale_ref = _quantize_weight_groupwise_int8(
@@ -178,7 +176,9 @@ def test_cpp_multi_group_weight_quantization_matches_python_reference():
             if np.array_equal(wq_cpp, wq_ref[g * block_size : (g + 1) * block_size]):
                 matched_group = g
                 break
-        assert matched_group is not None, "no reference group matches this MatMulInteger's own weight codes"
+        assert matched_group is not None, (
+            "no reference group matches this MatMulInteger's own weight codes"
+        )
         assert matched_group not in seen_groups
         seen_groups.add(matched_group)
         np.testing.assert_allclose(

@@ -173,7 +173,9 @@ def test_cpp_end_to_end_matches_unsplit_reference():
     )
 
     np.testing.assert_array_equal(got["present_key_pivot"], pivot)
-    np.testing.assert_array_equal(got["present_key_rest"], np.concatenate([rest, new_key], axis=1))
+    np.testing.assert_array_equal(
+        got["present_key_rest"], np.concatenate([rest, new_key], axis=1)
+    )
     np.testing.assert_array_equal(got["present_key"], ref["present_key"])
     np.testing.assert_array_equal(got["attn_out"], ref["attn_out"])
 

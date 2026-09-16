@@ -194,8 +194,8 @@ def test_cpp_shared_basis_beats_matched_budget_per_expert_kmeans():
     mean = rng.standard_normal(d) * 0.05
     shared = mean + coeffs @ basis
     small_residual = rng.standard_normal((num_experts, d)) * 0.02
-    fc1_w = (shared + small_residual).reshape(num_experts, inter, hidden).astype(
-        np.float32
+    fc1_w = (
+        (shared + small_residual).reshape(num_experts, inter, hidden).astype(np.float32)
     )
     fc2_w = rng.standard_normal((num_experts, hidden, inter)).astype(np.float32) * 0.01
     router_w = rng.standard_normal((hidden, num_experts)).astype(np.float32) * 0.2
@@ -205,7 +205,9 @@ def test_cpp_shared_basis_beats_matched_budget_per_expert_kmeans():
     quantized = onnxsim.apply_kbvq_moe_cpp(model)
     kbvq_recon, _ = _current_expert_weights(quantized)
     kbvq_recon = kbvq_recon.astype(np.float64).reshape(num_experts, d)
-    kbvq_err = float(np.mean((fc1_w.astype(np.float64).reshape(num_experts, d) - kbvq_recon) ** 2))
+    kbvq_err = float(
+        np.mean((fc1_w.astype(np.float64).reshape(num_experts, d) - kbvq_recon) ** 2)
+    )
 
     # Naive baseline: quantize_weight_only_kmeans's own per-layer codebook,
     # run independently per expert (one flattened [1, D] "matrix" per
@@ -231,12 +233,14 @@ def test_cpp_shared_basis_beats_matched_budget_per_expert_kmeans():
         # here would silently read the UNQUANTIZED original weight instead
         # (giving a trivially-zero, meaningless baseline_err below).
         matmul = next(n for n in q.graph.node if n.op_type == "MatMul")
-        w_init = next(
-            t for t in q.graph.initializer if t.name == matmul.input[1]
+        w_init = next(t for t in q.graph.initializer if t.name == matmul.input[1])
+        baseline_recon[e] = (
+            onnx.numpy_helper.to_array(w_init).astype(np.float64).reshape(d)
         )
-        baseline_recon[e] = onnx.numpy_helper.to_array(w_init).astype(np.float64).reshape(d)
     baseline_err = float(
-        np.mean((fc1_w.astype(np.float64).reshape(num_experts, d) - baseline_recon) ** 2)
+        np.mean(
+            (fc1_w.astype(np.float64).reshape(num_experts, d) - baseline_recon) ** 2
+        )
     )
 
     assert kbvq_err < baseline_err * 0.5
