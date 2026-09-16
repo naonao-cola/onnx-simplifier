@@ -23,6 +23,7 @@ import {
   GREETING_FRAME,
   FLASH_GREETING_FRAME,
   FLASH_ERASE_FRAME,
+  RESET_SCHEMES,
 } from "../web/k210_isp.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -94,6 +95,23 @@ test("greeting/flash_greeting/flash_erase are literal frames, NOT buildPacket ou
   const built = slipEncode(buildPacket(0xc2, new Uint8Array(0)));
   assert.notEqual(hex(built), vectors.literal_greeting_hex,
     "buildPacket must NOT match the literal greeting frame -- if it now does, kflash.py's format changed and k210_isp.mjs's literals need re-checking, not deleting");
+});
+
+test("RESET_SCHEMES match kflash.py's reset_to_isp_*()/reset_to_boot_*() sequences exactly", () => {
+  // [dtr, rts] per step, re-checked against kflash.py's source line-by-line
+  // (not from memory) at the time these were added.
+  assert.deepEqual(RESET_SCHEMES.dan, {
+    isp: [[false, false], [false, true], [true, false]],
+    boot: [[false, false], [false, true], [false, false]],
+  });
+  assert.deepEqual(RESET_SCHEMES.kd233, {
+    isp: [[false, false], [true, false], [false, true]],
+    boot: [[false, false], [true, false], [false, false]],
+  });
+  assert.deepEqual(RESET_SCHEMES.goD, {
+    isp: [[true, true], [true, false], [true, false]],
+    boot: [[false, false], [true, false], [true, true]],
+  });
 });
 
 test("isp_stub.bin is intact (size + crc32 against the value computed when it was extracted)", () => {

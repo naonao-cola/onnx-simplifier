@@ -71,6 +71,31 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// DTR/RTS reset sequences, [dtr, rts] per step, 100ms apart -- kflash.py's
+// reset_to_isp_*()/reset_to_boot_*() for the three board families most
+// likely to cover M5StickV/Maix Amigo (plain CH340/CP210x-style boards;
+// "goE"/"trainer"/"bit_mic" need FTDI dual-interface port auto-detection
+// that doesn't apply here, so they're not included). "dan" is the default
+// -- Sipeed's own "Dan Dock" scheme, what community M5StickV instructions
+// use -- but which one a given board actually needs is exactly the kind
+// of thing that only shows up against real hardware; if "dan" doesn't
+// enter ISP mode, try the other two before assuming something else is
+// wrong.
+export const RESET_SCHEMES = {
+  dan: {
+    isp: [[false, false], [false, true], [true, false]],
+    boot: [[false, false], [false, true], [false, false]],
+  },
+  kd233: {
+    isp: [[false, false], [true, false], [false, true]],
+    boot: [[false, false], [true, false], [false, false]],
+  },
+  goD: {
+    isp: [[true, true], [true, false], [true, false]],
+    boot: [[false, false], [true, false], [true, true]],
+  },
+};
+
 // Standard CRC-32 (zlib/PNG/gzip polynomial, reflected 0xEDB88320) --
 // matches Python's binascii.crc32, which is what every packet's checksum
 // field in kflash.py is computed with.
@@ -189,9 +214,13 @@ function chunk(bytes, size) {
 }
 
 export class K210Loader {
-  constructor(port, { log = () => {} } = {}) {
+  constructor(port, { log = () => {}, resetScheme = "dan" } = {}) {
+    if (!RESET_SCHEMES[resetScheme]) {
+      throw new Error(`unknown resetScheme ${resetScheme} -- one of ${Object.keys(RESET_SCHEMES).join(", ")}`);
+    }
     this.port = port;
     this.log = log;
+    this.resetScheme = resetScheme;
     this._decoder = new SlipDecoder();
     this._frameQueue = [];
     this._waiters = [];
@@ -286,28 +315,21 @@ export class K210Loader {
   }
 
   // --- reset sequences -------------------------------------------------
-  // kflash.py's reset_to_isp_dan() / reset_to_boot_dan() -- the DTR/RTS
-  // scheme it uses for Sipeed "Dan dock"-style boards, which is what
-  // community instructions for M5StickV and (by the same K210 module
-  // family) Maix Amigo use. If your board resets into ISP mode
-  // differently, this is the one piece you'll need to swap.
+  // Runs this.resetScheme's steps (see RESET_SCHEMES) -- 100ms per step,
+  // matching kflash.py's own reset_to_isp_*()/reset_to_boot_*() timing.
 
   async resetToISP() {
-    await this._setSignals(false, false);
-    await sleep(100);
-    await this._setSignals(false, true);
-    await sleep(100);
-    await this._setSignals(true, false); // release RTS, then release reset (DTR) high
-    await sleep(100);
+    for (const [dtr, rts] of RESET_SCHEMES[this.resetScheme].isp) {
+      await this._setSignals(dtr, rts);
+      await sleep(100);
+    }
   }
 
   async resetToBoot() {
-    await this._setSignals(false, false);
-    await sleep(100);
-    await this._setSignals(false, true);
-    await sleep(100);
-    await this._setSignals(false, false);
-    await sleep(100);
+    for (const [dtr, rts] of RESET_SCHEMES[this.resetScheme].boot) {
+      await this._setSignals(dtr, rts);
+      await sleep(100);
+    }
   }
 
   // --- mask-ROM ISP stage ------------------------------------------------

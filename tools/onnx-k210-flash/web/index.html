@@ -84,6 +84,14 @@
     <option value="1">on-board (separate flash chip)</option>
   </select>
   <br><br>
+  <label for="reset-scheme">reset scheme</label>
+  <select id="reset-scheme" title="The DTR/RTS sequence used to enter ISP mode. 'dan' is the default (Sipeed's own scheme, what community M5StickV instructions use) -- if the board never responds to greeting, try the others before assuming something else is wrong.">
+    <option value="dan" selected>dan (Sipeed Dan Dock -- default, try first)</option>
+    <option value="kd233">kd233</option>
+    <option value="goD">goD</option>
+  </select>
+  <span class="note">unsure which one your board needs? Try them in this order.</span>
+  <br><br>
   <button id="flash-button" type="button">Connect and flash</button>
 </div>
 <div id="log"></div>

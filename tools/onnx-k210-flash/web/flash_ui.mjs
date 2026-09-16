@@ -14,6 +14,7 @@ if (!("serial" in navigator)) {
 const flashButton = document.getElementById("flash-button");
 const firmwareInput = document.getElementById("firmware-input");
 const chipTypeSelect = document.getElementById("chip-type");
+const resetSchemeSelect = document.getElementById("reset-scheme");
 
 flashButton.addEventListener("click", async () => {
   const file = firmwareInput.files && firmwareInput.files[0];
@@ -27,7 +28,9 @@ flashButton.addEventListener("click", async () => {
   try {
     log("requesting serial port...");
     const port = await navigator.serial.requestPort();
-    loader = new K210Loader(port, { log });
+    const resetScheme = resetSchemeSelect ? resetSchemeSelect.value : "dan";
+    log(`using reset scheme: ${resetScheme}`);
+    loader = new K210Loader(port, { log, resetScheme });
     await loader.connect();
 
     log("fetching ISP flash-mode stub (isp_stub.bin, vendored from kflash.py)...");
