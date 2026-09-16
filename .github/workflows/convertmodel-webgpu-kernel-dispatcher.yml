@@ -126,19 +126,31 @@ name: convertmodel WebGPU custom kernel dispatcher
 #     spec reads back exactly and that every other node's raw bytes are
 #     provably untouched.
 #
+#   * test/onnx_conv_node_reader.test.mjs -- REQUIRED, no browser. Unit-tests
+#     onnx_conv_node_reader.mjs's listConvNodeNames -- every Conv node in a
+#     model, not just already-flagged ones -- against real fixtures.
+#
 #   * test/webgpu_kernel_tuner_ui.test.mjs -- REQUIRED. The opt-in "Tune
 #     this kernel" button in the Custom WebGPU kernels panel
 #     (webgpu_kernel_annotations_view.mjs), driven end to end in the real
-#     converter page: loads a fixture with an attached Conv kernel, clicks
-#     Tune (real Pyodide + tinygrad, live in the page, generating several
-#     candidates via onnxsim.webgpu_kernel_tuning's own approach), dispatches
-#     every candidate on a real WebGPU device, picks the fastest, clicks
-#     Export, and checks the downloaded model's attached kernel both matches
-#     the winner and still computes the right answer. Needs real network
-#     access from inside the browser page itself (Pyodide from jsdelivr,
-#     tinygrad's wheel from PyPI) -- see that test's own comment for how it
-#     was verified in this repo's own dev sandbox, whose egress policy
-#     denies jsdelivr specifically.
+#     converter page, for two scenarios: a fixture with an already-attached
+#     Conv kernel, and (a regression check -- this used to show no button at
+#     all, since the button only ever lived inside an already-attached
+#     entry, which is nearly no real upload) a plain Conv model with no
+#     kernel metadata attached. Each: clicks Tune (real Pyodide + tinygrad,
+#     live in the page, generating several candidates via
+#     onnxsim.webgpu_kernel_tuning's own approach), dispatches every
+#     candidate on a real WebGPU device, picks the fastest, clicks Export,
+#     and checks the downloaded model's attached kernel both matches the
+#     winner and still computes the right answer. Needs real network access
+#     from inside the browser page itself (Pyodide from jsdelivr, tinygrad's
+#     wheel from PyPI) -- see that test's own comment for how it was
+#     verified in this repo's own dev sandbox, whose egress policy denies
+#     jsdelivr specifically. Also drives a third scenario, the "Tune full
+#     graph" button, against a purpose-built two-Conv-node fixture
+#     (webgpu_kernel_tuning_multi_conv_fixture.onnx) -- one click tunes both
+#     nodes and one export carries both winners, proving the batching itself
+#     rather than just the same single-node path run twice.
 #
 # Scheduled + on demand, plus on PRs that touch the files this check depends
 # on, same reasoning as convertmodel-webgpu-demo.yml / convertmodel-ep-placement.yml.
@@ -172,6 +184,9 @@ on:
       - "scripts/convertmodel/test/make_webgpu_kernel_tuning_fixture.py"
       - "scripts/convertmodel/test/webgpu_kernel_tuning_fixture.json"
       - "scripts/convertmodel/test/webgpu_kernel_tuning_fixture.onnx"
+      - "scripts/convertmodel/test/make_webgpu_kernel_tuning_multi_conv_fixture.py"
+      - "scripts/convertmodel/test/webgpu_kernel_tuning_multi_conv_fixture.json"
+      - "scripts/convertmodel/test/webgpu_kernel_tuning_multi_conv_fixture.onnx"
       - "scripts/convertmodel/webnn.mjs"
       - "onnxsim/webgpu_kernel_tuning.py"
       - "scripts/convertmodel/test/make_webgpu_kernel_fixture.py"
@@ -195,6 +210,7 @@ on:
       - "scripts/convertmodel/webgpu_kernel_tuner.mjs"
       - "scripts/convertmodel/test/webgpu_kernel_tuner_ui.test.mjs"
       - "scripts/convertmodel/onnx_conv_node_reader.mjs"
+      - "scripts/convertmodel/test/onnx_conv_node_reader.test.mjs"
       - "scripts/convertmodel/download.mjs"
       - "scripts/convertmodel/style.css"
       - "scripts/convertmodel/index.html"
@@ -233,6 +249,9 @@ jobs:
       - name: Run the ONNX metadata writer unit test
         working-directory: scripts/convertmodel
         run: npm run test:onnx-metadata-writer
+      - name: Run the ONNX conv node reader unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:onnx-conv-node-reader
 
   webgpu-kernel-dispatcher:
     name: WebGPU custom kernel dispatch (required)

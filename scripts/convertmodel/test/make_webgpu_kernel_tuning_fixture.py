@@ -98,6 +98,13 @@ def main():
         """
     )
     model.graph.initializer.append(numpy_helper.from_array(w, "w"))
+    # onnx.parser never assigns node names; give this one a real name (like
+    # onnxsim's own node-naming pass would) so it's usable with the
+    # name-keyed APIs (readConvNodeInfo, attachWebgpuKernelSpec) the same way
+    # a node in a real converted model is -- see
+    # make_webgpu_tinygrad_codegen_fixture.py's own conv3d_node for the same
+    # convention.
+    model.graph.node[0].name = "conv_node"
 
     (y_ref,) = ReferenceEvaluator(model).run(None, {"x": x})
 
