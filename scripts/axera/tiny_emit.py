@@ -41,7 +41,15 @@ not patched, not relied on). ``patch_mul_zp_x`` patches x's zero point,
 but *only* when the reference build happens to use the one zero-point
 form this project has actually decoded (see below) -- it raises rather
 than silently doing nothing when it doesn't apply, since whether it
-applies is not predictable in advance.
+applies is not predictable in advance. ``patch_conv_zp_x`` is the same
+patch for Conv (the literal unit was confirmed identical across ops);
+see its own docstring for a caveat ``patch_mul_zp_x`` does not carry --
+patching this unit alone was checked against a real second Conv build
+with x_scale held bit-identical and did *not* reproduce that build's
+mcode elsewhere in the stream (~20 bytes beyond the unit and the
+shape's own noise floor also move with zp_x), unlike the scale-family
+patches below, which a real hardware test confirmed reproduce a
+rebuild bit-exactly.
 
 What none of this touches: the S-unit programs themselves (magnitude-
 adaptive shape, unmodeled ISA), the manifest string table (tensor-name
@@ -433,3 +441,40 @@ def patch_mul_zp_x(reference_mcode: bytes, old_zp_x: int, new_zp_x: int) -> byte
     out = bytearray(reference_mcode)
     out[hits[0] + 3] = new_zp_x
     return bytes(out)
+
+
+def patch_conv_zp_x(reference_mcode: bytes, old_zp_x: int, new_zp_x: int) -> bytes:
+    """Rewrite Conv's input zero point, where the literal-byte form is
+    present -- the same ``02 10 1b <zp_x> 83 36`` unit ``patch_mul_zp_x``
+    patches for Mul, confirmed to generalize byte-for-byte to Conv at the
+    identical framing (``tests/test_axera_zpx_generalizes.py``). Delegates
+    to ``patch_mul_zp_x`` directly: the unit and its patch are op-agnostic
+    once the literal form is present, so there is nothing Conv-specific to
+    do here beyond documenting Conv's own generation-scope caveat below.
+
+    **This patches the VALUE inside an already-literal-form unit. It does
+    NOT, and per current knowledge cannot, predict whether a genuinely
+    fresh Conv build at ``new_zp_x`` would itself land in this literal
+    form or one of the two still-undecoded opaque forms** -- presence is
+    non-monotone in zp_x for both Mul and Conv (see
+    ``TestZpXLiteralByteWhenPresent``), so this function's success at
+    finding ``old_zp_x``'s unit says nothing about whether ``new_zp_x``
+    "should" have used the same form; it only says the reference happens
+    to hold both bytes in the one slot this project knows how to write.
+
+    **A second, newly-confirmed caveat, found verifying this function
+    against a real second Conv build (2026-09-17):** even holding
+    x_scale exactly fixed (bit-identical between the two builds, not
+    just close), patching *only* this 6-byte unit does not reproduce a
+    real second build's mcode elsewhere in the stream -- roughly twenty
+    bytes beyond this unit and beyond the shape's own ~3-byte rebuild
+    noise floor also move with zp_x alone, at offsets this project has
+    not decoded. Callers should not expect (and this function does not
+    claim) that patching this unit alone reproduces a real rebuild
+    bit-exactly, the way Mul's *scale*-family patches were confirmed to
+    on real hardware (``tests/test_axera_mul_emit_hardware.py``) --
+    zp_x's own patch has not had, and does not currently pass, that same
+    bar. See ``tests/test_axera_conv_zpx_generator.py`` for the exact
+    build pair and byte counts this was checked against.
+    """
+    return patch_mul_zp_x(reference_mcode, old_zp_x, new_zp_x)
