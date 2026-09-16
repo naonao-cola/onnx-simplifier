@@ -11,6 +11,7 @@
 #include "onnxoptimizer/optimize.h"
 #include "passes/any_precision_llm.h"
 #include "passes/cross_layer_equalization.h"
+#include "passes/deepseek_fp8.h"
 #include "passes/defuse_matmul_integer_to_float.h"
 #include "passes/dilated_conv_to_taps.h"
 #include "passes/double_quantization.h"
@@ -63,10 +64,16 @@
 #include "passes/gguf_q6_k.h"
 #include "passes/gguf_q8_0.h"
 #include "passes/gguf_ternary_quant.h"
+#include "passes/hqq.h"
+#include "passes/if4_quantization.h"
 #include "passes/iq4_nl.h"
+#include "passes/kmeans_quantization.h"
+#include "passes/leptoquant.h"
 #include "passes/magnitude_pruning.h"
 #include "passes/maxpool_rowmajor_when_indices_unused.h"
 #include "passes/neg_to_mul.h"
+#include "passes/nf4.h"
+#include "passes/nvfp4_quantization.h"
 #include "passes/pow2_to_mul.h"
 #include "passes/qoperator_quantize_activation.h"
 #include "passes/qoperator_quantize_concat.h"
@@ -146,6 +153,7 @@ void RegisterCustomOptimizerPasses() {
     // onnxsim-only rewrites (no built-in of the same name today).
     RegisterOrReplace<p::AnyPrecisionLlm>(registry);
     RegisterOrReplace<p::CrossLayerEqualization>(registry);
+    RegisterOrReplace<p::DeepSeekFp8>(registry);
     RegisterOrReplace<p::DefuseMatMulIntegerToFloat>(registry);
     RegisterOrReplace<p::DilatedConvToTaps>(registry);
     RegisterOrReplace<p::DoubleQuantization>(registry);
@@ -192,13 +200,19 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::GgufQ6K>(registry);
     RegisterOrReplace<p::GgufQ8_0>(registry);
     RegisterOrReplace<p::GgufTernaryQuant>(registry);
+    RegisterOrReplace<p::HQQ>(registry);
+    RegisterOrReplace<p::IF4>(registry);
     RegisterOrReplace<p::IQ4NL>(registry);
+    RegisterOrReplace<p::KMeansQuant>(registry);
+    RegisterOrReplace<p::LeptoQuant>(registry);
     RegisterOrReplace<p::MagnitudePruningAttention>(registry);
     RegisterOrReplace<p::MagnitudePruningConv>(registry);
     RegisterOrReplace<p::MagnitudePruningGlobal>(registry);
     RegisterOrReplace<p::MagnitudePruningMatMul>(registry);
     RegisterOrReplace<p::MaxPoolRowMajorWhenIndicesUnused>(registry);
     RegisterOrReplace<p::NegToMul>(registry);
+    RegisterOrReplace<p::NF4>(registry);
+    RegisterOrReplace<p::NVFP4Quantization>(registry);
     RegisterOrReplace<p::Pow2ToMul>(registry);
     RegisterOrReplace<p::QOperatorQuantizeActivation>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConcat>(registry);

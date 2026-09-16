@@ -117,6 +117,18 @@ export function applyGgufQ5K(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyGgufTernary(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyFp6Llm(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyGgufQ6K(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyLeptoquant(model: OnnxModelBytes): Promise<Uint8Array>;
+export function quantizeWeightOnlyNf4(model: OnnxModelBytes): Promise<Uint8Array>;
+export function quantizeWeightOnlyIf4(model: OnnxModelBytes): Promise<Uint8Array>;
+export function quantizeWeightOnlyNvfp4(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyDeepseekFp8(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyKmeansQuantization(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyHqq(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyDaq(
+  baseModel: OnnxModelBytes,
+  postTrainedModel: OnnxModelBytes,
+  options?: { metric?: "cosine" | "sign_preservation"; skipNames?: string[] },
+): Promise<Uint8Array>;
 export function pruneMagnitude(
   model: OnnxModelBytes,
   options?: PatternOptions & { globalSparsity?: boolean },
@@ -310,6 +322,14 @@ declare const _default: {
   applyGgufTernary: typeof applyGgufTernary;
   applyFp6Llm: typeof applyFp6Llm;
   applyGgufQ6K: typeof applyGgufQ6K;
+  applyLeptoquant: typeof applyLeptoquant;
+  quantizeWeightOnlyNf4: typeof quantizeWeightOnlyNf4;
+  quantizeWeightOnlyIf4: typeof quantizeWeightOnlyIf4;
+  quantizeWeightOnlyNvfp4: typeof quantizeWeightOnlyNvfp4;
+  applyDeepseekFp8: typeof applyDeepseekFp8;
+  applyKmeansQuantization: typeof applyKmeansQuantization;
+  applyHqq: typeof applyHqq;
+  applyDaq: typeof applyDaq;
   pruneMagnitude: typeof pruneMagnitude;
   applyStructuredPruning: typeof applyStructuredPruning;
   applyAttentionHeadPruning: typeof applyAttentionHeadPruning;

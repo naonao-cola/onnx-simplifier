@@ -4369,6 +4369,261 @@ def apply_gguf_q6_k_quantization_cpp(
     )
 
 
+def apply_leptoquant_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_leptoquant`: weight-only
+    quantizes every MatMul/vanilla-Gemm layer with a constant 2-D
+    float32 weight into AngelSlim's LeptoQuant format -- a 128x128-tile
+    FLOAT8E4M3FN round trip, refined by a 5-point outlier-fraction grid
+    search per tile. See :func:`onnxsim.apply_leptoquant`'s own docstring
+    for the full rationale.
+
+    Unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            LeptoQuant round-tripped float32 version, stored under a
+            *new* initializer. A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_leptoquant(model.SerializeToString()))
+
+
+def quantize_weight_only_nf4_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_nf4`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight into bitsandbytes' NF4 format -- a fixed 16-value
+    non-uniform codebook, one scale per 64-element (output-channel,
+    K-block) group. See :func:`onnxsim.quantize_weight_only_nf4`'s own
+    docstring for the full rationale.
+
+    Unlike :func:`onnxsim.quantize_weight_only_nf4`, this port folds the
+    round trip directly into a replacement float32 initializer instead of
+    building it out of Gather/Reshape/Mul graph nodes, and unlike
+    :func:`simplify`, this does not run shape inference, constant folding
+    or any other simplification pass.
+
+    A layer whose reduction dimension isn't evenly divisible by 64 is
+    left completely untouched.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            NF4 round-tripped float32 version, stored under a *new*
+            initializer. A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.quantize_weight_only_nf4(model.SerializeToString()))
+
+
+def quantize_weight_only_if4_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_if4`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight into the IF4 format -- per (output-channel,
+    16-element K-block), tries both a plain INT4 grid and MXFP4's own
+    E2M1 codebook and keeps whichever reconstructs that block with lower
+    MSE. See :func:`onnxsim.quantize_weight_only_if4`'s own docstring for
+    the full rationale.
+
+    Unlike :func:`onnxsim.quantize_weight_only_if4`, this port folds the
+    round trip directly into a replacement float32 initializer instead of
+    building it out of Cast/Gather/Reshape/Mul graph nodes, and unlike
+    :func:`simplify`, this does not run shape inference, constant folding
+    or any other simplification pass.
+
+    A layer whose reduction dimension isn't evenly divisible by 16 is
+    left completely untouched.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            IF4 round-tripped float32 version, stored under a *new*
+            initializer. A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.quantize_weight_only_if4(model.SerializeToString()))
+
+
+def quantize_weight_only_nvfp4_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_nvfp4`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight into NVIDIA's NVFP4 format -- shares OCP MXFP4's
+    E2M1 element codebook, with a two-level (per-tensor global scale,
+    E4M3-rounded per-block scale) rule. See
+    :func:`onnxsim.quantize_weight_only_nvfp4`'s own docstring for the
+    full rationale.
+
+    Unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass. A layer whose reduction
+    dimension isn't evenly divisible by 16 is left completely untouched.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            NVFP4 round-tripped float32 version (via the same
+            Cast/Gather/Reshape/Mul graph shape
+            :func:`onnxsim.quantize_weight_only_mxfp4_cpp` already uses).
+            A model with no matching layer is returned unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_weight_only_nvfp4(model.SerializeToString())
+    )
+
+
+def apply_deepseek_fp8_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of the *weight* half of
+    :func:`onnxsim.apply_deepseek_fp8`: weight-only quantizes every
+    MatMul/vanilla-Gemm layer with a constant 2-D float32 weight via a
+    real FLOAT8E4M3FN round trip, one scale per 128x128 tile. See
+    :func:`onnxsim.apply_deepseek_fp8`'s own docstring for the full
+    rationale.
+
+    Unlike :func:`onnxsim.apply_deepseek_fp8`, this port does not also
+    insert the activation-quantization (W8A8) graph rewrite -- weight-only
+    scope, matching every other data-free ``*_cpp`` port in this repo.
+    Unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            block-FP8 round-tripped float32 version, stored under a *new*
+            initializer. A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_deepseek_fp8(model.SerializeToString()))
+
+
+def apply_kmeans_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_kmeans`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight by fitting a 16-centroid codebook per layer via
+    Lloyd's algorithm. See
+    :func:`onnxsim.quantize_weight_only_kmeans`'s own docstring for the
+    full rationale.
+
+    Unlike :func:`onnxsim.quantize_weight_only_kmeans`, this port folds
+    the round trip directly into a replacement float32 initializer
+    instead of building it out of Cast/Gather graph nodes, and unlike
+    :func:`simplify`, this does not run shape inference, constant folding
+    or any other simplification pass.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            k-means-fitted float32 version, stored under a *new*
+            initializer. A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_kmeans_quantization(model.SerializeToString()))
+
+
+def apply_hqq_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_int4_hqq`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight via an asymmetric affine INT4 quantizer whose
+    zero-point is IRLS-refined per (output-channel, 32-element K-block)
+    group. See :func:`onnxsim.quantize_weight_only_int4_hqq`'s own
+    docstring for the full rationale.
+
+    Unlike :func:`onnxsim.quantize_weight_only_int4_hqq`, this port folds
+    the round trip directly into a replacement float32 initializer
+    instead of building a real ``DequantizeLinear`` node with packed
+    UINT4 codes, and unlike :func:`simplify`, this does not run shape
+    inference, constant folding or any other simplification pass.
+
+    A layer whose reduction dimension isn't evenly divisible by 32 is
+    left completely untouched.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            HQQ-quantized float32 version, stored under a *new*
+            initializer. A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_hqq(model.SerializeToString()))
+
+
+def apply_daq_cpp(
+    base_model: Union[str, onnx.ModelProto],
+    post_trained_model: Union[str, onnx.ModelProto],
+    metric: str = "cosine",
+    skip_names: Optional[Iterable[str]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_daq`: FP8-quantizes every
+    matched MatMul/vanilla-Gemm weight of ``post_trained_model`` with a
+    per-layer scalar scale chosen to preserve that layer's fine-tuning
+    update (``ΔW = W_post - W_base``) rather than to minimize its raw
+    reconstruction error. See :func:`onnxsim.apply_daq`'s own docstring
+    for the full rationale.
+
+    Unlike every other ``*_cpp`` port in this module, this one is
+    data-free yet still takes two full model arguments (matched by node
+    output name, the same correspondence assumption
+    :func:`onnxsim.apply_gptq_cpp`/:func:`onnxsim.apply_qronos_cpp` make
+    about their own two model arguments) -- neither model is ever run, and
+    no calibration data or ``providers`` argument is needed.
+
+    :param base_model: the pre-fine-tuning checkpoint (onnx ModelProto or
+            file path)
+    :param post_trained_model: the fine-tuned checkpoint (onnx ModelProto
+            or file path); this is the model that gets quantized and
+            returned
+    :param metric: ``"cosine"`` (default) or ``"sign_preservation"`` --
+            see :func:`onnxsim.apply_daq`'s own docstring
+    :param skip_names: weight initializer names to leave unquantized even
+            if otherwise eligible
+    :returns: ``post_trained_model`` with every matched layer's weight
+            replaced by its delta-aware FP8 round trip. A layer with no
+            ``base_model`` counterpart, a shape mismatch, or a
+            within-tolerance-zero ``ΔW`` is left completely untouched.
+    """
+    if isinstance(base_model, str):
+        base_model = onnx.load(base_model, load_external_data=False)
+    if isinstance(post_trained_model, str):
+        post_trained_model = onnx.load(post_trained_model, load_external_data=False)
+    skip_names = list(skip_names) if skip_names is not None else []
+    return onnx.load_from_string(
+        C.apply_daq(
+            base_model.SerializeToString(),
+            post_trained_model.SerializeToString(),
+            metric,
+            skip_names,
+        )
+    )
+
+
 def quantize_fp16(
     model: Union[str, onnx.ModelProto], keep_io_types: bool = True
 ) -> onnx.ModelProto:

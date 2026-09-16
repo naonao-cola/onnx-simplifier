@@ -32,6 +32,14 @@ import {
   applyGgufQ4K,
   applyGgufQ5K,
   applyIq4Nl,
+  applyLeptoquant,
+  quantizeWeightOnlyNf4,
+  quantizeWeightOnlyIf4,
+  quantizeWeightOnlyNvfp4,
+  applyDeepseekFp8,
+  applyKmeansQuantization,
+  applyHqq,
+  applyDaq,
   applyMoeExpertChannelPruning,
   applyOutlierSuppression,
   applyOutlierSuppressionPlus,
@@ -147,11 +155,25 @@ try {
       applyGgufQ3K,
       applyGgufQ4K,
       applyGgufQ5K,
+      applyLeptoquant,
+      quantizeWeightOnlyNf4,
+      quantizeWeightOnlyIf4,
+      quantizeWeightOnlyNvfp4,
+      applyDeepseekFp8,
+      applyKmeansQuantization,
+      applyHqq,
     ]) {
       const out = await fn(input);
       assert.ok(out instanceof Uint8Array, fn.name);
       assert.ok(out.length > 0, fn.name);
     }
+  });
+
+  await check("applyDaq quantizes a fine-tuned checkpoint against its base", async () => {
+    const baseModel = new Uint8Array(readFileSync(FIXTURE));
+    const out = await applyDaq(baseModel, baseModel, { metric: "cosine" });
+    assert.ok(out instanceof Uint8Array);
+    assert.ok(out.length > 0);
   });
 
   await check("data-free pruning passes return non-empty models", async () => {
