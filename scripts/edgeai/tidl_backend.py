@@ -24,6 +24,7 @@ from tidl_ops import (
     BlockingOp,
     blocking_op_types,
     blocking_ops,
+    has_decomposed_normalization,
     has_dynamic_shape,
     has_string_tensor,
 )
@@ -44,7 +45,15 @@ def coverage(model: onnx.ModelProto) -> str:
     published documentation, not a guarantee the whole graph maps onto the
     accelerator (see ``tidl_ops.py``'s docstring).
     """
-    return "partial" if (blocking_ops(model) or dynamic_shape_risks(model)) else "full"
+    return (
+        "partial"
+        if (
+            blocking_ops(model)
+            or dynamic_shape_risks(model)
+            or normalization_risks(model)
+        )
+        else "full"
+    )
 
 
 def blockers(model: onnx.ModelProto) -> List[BlockingOp]:
@@ -72,3 +81,21 @@ def dynamic_shape_risks(model: onnx.ModelProto) -> List[str]:
     if has_string_tensor(model):
         risks.append("model uses a STRING tensor; TIDL has no string op support")
     return risks
+
+
+def normalization_risks(model: onnx.ModelProto) -> List[str]:
+    """Human-readable reasons `model` may not offload as a single fused unit.
+
+    Only checks for the decomposed-LayerNorm signature (see
+    `tidl_ops.has_decomposed_normalization`'s docstring) -- absence doesn't
+    guarantee every op fuses cleanly, only that this one known pattern wasn't
+    found.
+    """
+    if has_decomposed_normalization(model):
+        return [
+            "graph spells LayerNorm out as separate ReduceMean/Sub/Pow/Sqrt/"
+            "Div-style ops instead of using the fused LayerNormalization op; "
+            "edgeai-tidl-tools' transformer-support notes recommend the fused "
+            "form"
+        ]
+    return []

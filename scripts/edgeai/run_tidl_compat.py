@@ -123,6 +123,8 @@ def main() -> int:
         "new_blocking_ops",
         "shape_risks_orig",
         "shape_risks_simp",
+        "norm_risks_orig",
+        "norm_risks_simp",
         "seconds",
         "error",
     ]

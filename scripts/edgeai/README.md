@@ -31,6 +31,12 @@ TIDL's own published documentation states plainly:
    also flagged: edgeai-tidl-tools' own detection-model documentation
    describes NMS running as host (ARM-core) post-processing, not an
    in-graph accelerator op.
+3. **Transformer blocks should use the fused `LayerNormalization`/`Gelu`
+   ops, not their decomposed equivalents.** edgeai-tidl-tools'
+   transformer-support notes call this out; `has_decomposed_normalization()`
+   flags the classic hand-spelled LayerNorm signature
+   (`ReduceMean`/`Sub`/`Pow`/`Sqrt`/`Div`) so a graph exported in that form
+   gets surfaced rather than silently offloading worse than it needs to.
 
 What this check does, per model:
 
@@ -54,16 +60,21 @@ provider.
 ## Files
 
 - `tidl_ops.py` -- the op-type blocker lists (control flow, Sequence/
-  Optional, data-dependent-shape ops, host-only ops) and the static-shape
-  check, plus the functions that walk a `ModelProto` (including subgraphs)
-  to apply them.
+  Optional, data-dependent-shape ops, host-only ops), the static-shape
+  check, and the decomposed-LayerNorm signature check, plus the functions
+  that walk a `ModelProto` (including subgraphs) to apply them.
 - `tidl_backend.py` -- the small `coverage()`/`blockers()`/
-  `new_blocking_op_types()`/`dynamic_shape_risks()` API `worker.py` and the
-  tests use, kept separate from `tidl_ops.py` for the same interface-symmetry
-  reason `scripts/axera/pulsar2_backend.py` is split from `pulsar2_ops.py`.
+  `new_blocking_op_types()`/`dynamic_shape_risks()`/`normalization_risks()`
+  API `worker.py` and the tests use, kept separate from `tidl_ops.py` for
+  the same interface-symmetry reason `scripts/axera/pulsar2_backend.py` is
+  split from `pulsar2_ops.py`.
 - `models.py` -- re-exports `scripts/common/synthetic_models.py`'s shared
-  suite and adds `edgeai_dynamic_batch_leaf`, a fixture with a symbolic batch
-  dimension, since none of the shared suite's models are dynamic-shaped.
+  suite and adds three fixtures: `edgeai_dynamic_batch_leaf` (a symbolic
+  batch dimension, since none of the shared suite's models are
+  dynamic-shaped), `mobilenet_block` (MobileNetV2's inverted-residual
+  bottleneck -- the structure of edgeai-tidl-tools' own quickstart example
+  model), and `vision_transformer_block` (a pre-LN ViT encoder block built
+  from the doc-preferred fused `LayerNormalization`/`Gelu` ops).
 - `worker.py` -- checks one model in its own subprocess; see its docstring
   for the exact steps and status values.
 - `run_tidl_compat.py` -- drives `worker.py` over the whole suite (or a

@@ -63,6 +63,8 @@ def check(model_name: str, onnx_path: str | None) -> dict:
         "new_blocking_ops": None,
         "shape_risks_orig": None,
         "shape_risks_simp": None,
+        "norm_risks_orig": None,
+        "norm_risks_simp": None,
         "error": None,
         "seconds": None,
     }
@@ -81,6 +83,7 @@ def check(model_name: str, onnx_path: str | None) -> dict:
         res["orig_nodes"] = len(model.graph.node)
         res["coverage_orig"] = tidl.coverage(model)
         res["shape_risks_orig"] = tidl.dynamic_shape_risks(model)
+        res["norm_risks_orig"] = tidl.normalization_risks(model)
 
         try:
             simp, _check_ok = simplify(model)
@@ -91,6 +94,7 @@ def check(model_name: str, onnx_path: str | None) -> dict:
         res["simp_nodes"] = len(simp.graph.node)
         res["coverage_simp"] = tidl.coverage(simp)
         res["shape_risks_simp"] = tidl.dynamic_shape_risks(simp)
+        res["norm_risks_simp"] = tidl.normalization_risks(simp)
 
         new_blockers = sorted(tidl.new_blocking_op_types(model, simp))
         res["new_blocking_ops"] = new_blockers

@@ -140,3 +140,75 @@ def test_overwrite_input_shapes_clears_the_dynamic_shape_risk():
     simp, _ = simplify(model, overwrite_input_shapes={"x": [1, 3, 8, 8]})
     assert tidl.dynamic_shape_risks(simp) == []
     assert tidl.coverage(simp) == "full"
+
+
+def test_mobilenet_block_bn_fold_keeps_full_coverage():
+    """MobileNetV2's inverted-residual block (edgeai-tidl-tools' own quickstart
+    example model) must simplify cleanly and stay TIDL-blocker-free.
+
+    onnxsim folds the expand/depthwise/project convs' BN Mul/Add pairs into
+    the preceding Conv, so the simplified graph has fewer nodes -- that fold
+    must not introduce anything TIDL's accelerator can't schedule.
+    """
+    from onnxsim import simplify
+
+    model = models.mobilenet_block()
+    assert tidl.coverage(model) == "full"
+
+    simp, check_ok = simplify(model)
+    assert check_ok
+    assert len(simp.graph.node) < len(model.graph.node)
+    assert tidl.new_blocking_op_types(model, simp) == set()
+    assert tidl.coverage(simp) == "full"
+
+
+def test_vision_transformer_block_stays_full_coverage():
+    """A pre-LN ViT encoder block, built from the doc-preferred fused
+    `LayerNormalization`/`Gelu` ops, must not trip any TIDL heuristic and
+    must simplify without introducing a new blocker.
+    """
+    from onnxsim import simplify
+
+    model = models.vision_transformer_block()
+    assert tidl.coverage(model) == "full"
+    assert tidl.normalization_risks(model) == []
+
+    simp, check_ok = simplify(model)
+    assert check_ok
+    assert tidl.new_blocking_op_types(model, simp) == set()
+    assert tidl.coverage(simp) == "full"
+
+
+def test_decomposed_layer_norm_flagged_as_normalization_risk():
+    """LayerNorm spelled out by hand (mean/sub/pow/mean/add/sqrt/div) must be
+    flagged: edgeai-tidl-tools' transformer-support notes prefer the fused
+    `LayerNormalization` op over this decomposed form -- see
+    `tidl_ops.has_decomposed_normalization`'s docstring. Built via
+    `onnx.parser` per this repo's CLAUDE.md guidance for new test models.
+    """
+    import onnx
+    from onnx import parser
+
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 8,
+          opset_import: ["": 17]
+        >
+        decomposed_layernorm (float[1,4] x) => (float[1,4] y)
+        <float two = {2.0}, float eps = {1e-05}>
+        {
+          mean = ReduceMean<axes = [-1], keepdims = 1>(x)
+          centered = Sub(x, mean)
+          sq = Pow(centered, two)
+          var = ReduceMean<axes = [-1], keepdims = 1>(sq)
+          var_eps = Add(var, eps)
+          std = Sqrt(var_eps)
+          y = Div(centered, std)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+
+    assert tidl.coverage(model) == "partial"
+    assert tidl.normalization_risks(model)

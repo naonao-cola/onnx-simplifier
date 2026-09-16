@@ -43,6 +43,21 @@ not run on TIDL's accelerator as-is; *absence* is not proof the rest offloads
 cleanly -- this harness only checks op *type* and shape-staticness, not the
 per-op attribute-level constraints (e.g. supported ``Resize`` modes,
 ``Conv`` group/dilation limits) TIDL's docs also list.
+
+A third thing worth checking for, specifically for transformer-style graphs:
+edgeai-tidl-tools' own transformer/attention support notes recommend the
+*fused* ``LayerNormalization``/``Gelu`` ops over their decomposed,
+multi-node equivalents (``ReduceMean``/``Sub``/``Pow``/``Sqrt``/``Div`` for
+LayerNorm; ``Erf``-based Gelu) -- a fused op is one accelerator-schedulable
+primitive, while the decomposed form is a handful of separate elementwise/
+reduction ops the partitioner has to recognize and fuse itself, and
+TIDL's docs call this out as something to check for. Two well-known example
+model families this harness's suite adds fixtures for, matching what
+edgeai-tidl-tools' own model zoo and quickstart use as its representative
+cases: **MobileNetV2** (the literal quickstart/demo model in
+edgeai-tidl-tools' README, a depthwise-separable-conv classifier) and a
+**Vision Transformer** encoder block (the doc-preferred fused-op form, per
+the note above).
 """
 
 from __future__ import annotations
@@ -173,3 +188,21 @@ def has_string_tensor(model: onnx.ModelProto) -> bool:
         ):
             return True
     return False
+
+
+# The decomposed-LayerNorm signature: a graph that spells LayerNorm out as
+# separate ops (mean -> subtract -> square -> mean -> sqrt -> divide) rather
+# than using the single fused ``LayerNormalization`` op. Presence-based, like
+# every other check in this module -- a graph could use these three op types
+# together for something else entirely, so this is a coarse signal, not proof.
+DECOMPOSED_NORM_SIGNATURE_OPS: frozenset = frozenset({"ReduceMean", "Sqrt", "Pow"})
+
+
+def has_decomposed_normalization(model: onnx.ModelProto) -> bool:
+    """True if the graph looks like it spells LayerNorm out by hand.
+
+    See this module's docstring: edgeai-tidl-tools' transformer-support notes
+    recommend the fused ``LayerNormalization`` op over this decomposed form.
+    """
+    op_types = {node.op_type for node in _iter_all_nodes(model.graph)}
+    return DECOMPOSED_NORM_SIGNATURE_OPS.issubset(op_types)
