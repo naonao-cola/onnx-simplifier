@@ -1866,6 +1866,106 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // I-BERT's own i-GELU polynomial approximation of Erf: a
+  // nonlinear-activation rewrite, not a weight quantizer -- matches any
+  // standalone Erf node. Data-free. See ApplyIBertGelu in onnxsim.h.
+  m.def(
+      "apply_ibert_gelu",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyIBertGelu(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // I-BERT's own integer-friendly Softmax exp-approximation: matches any
+  // standalone Softmax node. Data-free. See ApplyIBertSoftmax in
+  // onnxsim.h.
+  m.def(
+      "apply_ibert_softmax",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyIBertSoftmax(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // AdpQ: calibration-free salient/non-salient weight split via a
+  // median/MAD-based adaptive threshold. Data-free. See ApplyADPQ in
+  // onnxsim.h.
+  m.def(
+      "apply_adpq",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyADPQ(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // ICQuant: per-block single-outlier exact reconstruction plus a
+  // symmetric 7-level-per-side grid for the rest. Data-free. See
+  // ApplyICQuant in onnxsim.h.
+  m.def(
+      "apply_icquant",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyICQuant(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // OliVe: outlier-victim pair quantization. Data-free. See ApplyOlive
+  // in onnxsim.h.
+  m.def(
+      "apply_olive",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyOlive(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // AQLM: additive/residual multi-codebook quantization via greedy
+  // residual k-means. Data-free. See ApplyAQLM in onnxsim.h.
+  m.def(
+      "apply_aqlm",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyAQLM(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // DAQ (Delta-Aware Quantization): data-free, but takes two full model
   // byte buffers (a base and a fine-tuned checkpoint, matched by node
   // output name) rather than one -- see ApplyDaq in daq_entry.h.

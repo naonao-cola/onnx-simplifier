@@ -4574,6 +4574,206 @@ def apply_hqq_cpp(
     return onnx.load_from_string(C.apply_hqq(model.SerializeToString()))
 
 
+def apply_ibert_gelu_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_ibert_gelu`: unlike every
+    other ``*_cpp`` port in this module, this is not a weight quantizer
+    -- it replaces every standalone ``Erf`` node anywhere in the graph
+    with I-BERT's own closed-form second-order polynomial approximation
+    (``sign(x) * (a*(clip(|x|, max=-b)+b)**2 + c)``), built from ordinary
+    Abs/Clip/Add/Mul/Sign ops. See :func:`onnxsim.apply_ibert_gelu`'s own
+    docstring for the full rationale.
+
+    Both sides build the exact same five ONNX ops from the exact same
+    three float32 constants, so this port is expected to be numerically
+    identical to :func:`onnxsim.apply_ibert_gelu` up to onnxruntime's own
+    float32 evaluation of the resulting graph.
+
+    :param model: the original onnx ModelProto or file path
+    :returns: ``model`` with every standalone Erf node replaced. A model
+            with no Erf node is returned unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_ibert_gelu(model.SerializeToString()))
+
+
+def apply_ibert_softmax_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_ibert_softmax`: unlike every
+    weight-only ``*_cpp`` port in this module, this is a nonlinear-
+    activation rewrite, not a weight quantizer -- it replaces every
+    standalone ``Softmax`` node with I-BERT's own integer-friendly
+    exp-approximation subgraph (a base-2 exponent decomposition plus a
+    quadratic polynomial fit, then an ordinary division for the row
+    normalization). See :func:`onnxsim.apply_ibert_softmax`'s own
+    docstring for the full rationale and its own scope note (the final
+    normalization is a plain division, not the paper's own integer-only
+    iterative reciprocal).
+
+    Needs opset 18+ (``ReduceMax``/``ReduceSum``'s axes-as-input form); a
+    model below that opset is returned unchanged.
+
+    :param model: the original onnx ModelProto or file path
+    :returns: ``model`` with every standalone Softmax node replaced. A
+            model with no Softmax node, or below opset 18, is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_ibert_softmax(model.SerializeToString()))
+
+
+def apply_adpq_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_adpq`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight via AdpQ's own calibration-free salient/non-
+    salient split -- per (output-channel, 128-element K-group), a median/
+    MAD-based adaptive threshold (borrowed from Adaptive LASSO) decides
+    which elements are salient (reconstructed exactly) versus quantized
+    to a symmetric 7-level-per-side grid. See
+    :func:`onnxsim.quantize_weight_only_adpq`'s own docstring for the
+    full rationale.
+
+    Unlike :func:`onnxsim.quantize_weight_only_adpq`, this port folds the
+    round trip directly into a replacement float32 initializer instead of
+    building a real ``DequantizeLinear``+``ScatterND``+``Add`` graph
+    rewrite, and unlike :func:`simplify`, this does not run shape
+    inference, constant folding or any other simplification pass.
+
+    A layer whose reduction dimension isn't evenly divisible by 128 is
+    left completely untouched.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            AdpQ-quantized float32 version, stored under a *new*
+            initializer. A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_adpq(model.SerializeToString()))
+
+
+def apply_icquant_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_icquant`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight via ICQuant's own single-outlier-per-block scheme
+    -- per (output-channel, 32-element K-block), the single largest-
+    magnitude element is excluded from the block's own scale computation
+    and reconstructed exactly; the rest quantize to a symmetric
+    7-level-per-side grid. See
+    :func:`onnxsim.quantize_weight_only_icquant`'s own docstring for the
+    full rationale and its own note that the paper's "combinadic" index
+    encoding is a pure storage detail with no effect on the reconstructed
+    values (this port skips it entirely).
+
+    Unlike :func:`onnxsim.quantize_weight_only_icquant`, this port folds
+    the round trip directly into a replacement float32 initializer
+    instead of building a real INT4/``DequantizeLinear``/``ScatterND``/
+    ``MatMul``/``Add`` graph rewrite, and unlike :func:`simplify`, this
+    does not run shape inference, constant folding or any other
+    simplification pass.
+
+    A layer whose reduction dimension isn't evenly divisible by 32 is
+    left completely untouched.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            ICQuant-quantized float32 version, stored under a *new*
+            initializer. A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_icquant(model.SerializeToString()))
+
+
+def apply_olive_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_olive`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight via OliVe's own outlier-victim pair scheme -- per
+    (output-channel, 32-element K-block), adjacent element pairs with
+    exactly one outlier member become an OVP pair (the outlier gets a
+    wider code, its neighbor a narrower "victim" code at the same total
+    bit budget as two ordinary elements). See
+    :func:`onnxsim.quantize_weight_only_olive`'s own docstring for the
+    full rationale.
+
+    Unlike :func:`onnxsim.quantize_weight_only_olive`, this port folds
+    the round trip directly into a replacement float32 initializer
+    instead of building a real ``DequantizeLinear`` x2 + ``Cast`` +
+    ``Where`` + ``MatMul``[+``Add``] graph rewrite, and unlike
+    :func:`simplify`, this does not run shape inference, constant folding
+    or any other simplification pass.
+
+    A layer whose reduction dimension isn't evenly divisible by 32 is
+    left completely untouched.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            OliVe-quantized float32 version, stored under a *new*
+            initializer. A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_olive(model.SerializeToString()))
+
+
+def apply_aqlm_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_aqlm`:
+    weight-only quantizes every MatMul/vanilla-Gemm layer with a constant
+    2-D float32 weight via AQLM's own additive/residual multi-codebook
+    scheme -- each (output-channel, 8-element K-block) group is
+    reconstructed as the sum of 2 codebook lookups, each codebook fit via
+    greedy residual Lloyd's-algorithm k-means. See
+    :func:`onnxsim.quantize_weight_only_aqlm`'s own docstring for the
+    full rationale.
+
+    Unlike :func:`onnxsim.quantize_weight_only_aqlm`, this port folds the
+    reconstruction directly into a replacement float32 initializer
+    instead of building a Gather+Add-chain graph rewrite, and unlike
+    :func:`simplify`, this does not run shape inference, constant folding
+    or any other simplification pass. Unlike
+    :func:`onnxsim.apply_kmeans_quantization_cpp`'s own scalar
+    percentile-based initialization (which matches its Python counterpart
+    exactly outside a narrow edge case), this port's own k-means
+    initialization is deterministically magnitude-sorted rather than
+    :func:`onnxsim.quantize_weight_only_aqlm`'s own seeded-random sample
+    -- a genuinely different (though algorithmically identical) fit, not
+    merely a floating-point-order divergence.
+
+    A layer whose reduction dimension isn't evenly divisible by 8 is
+    left completely untouched.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by its
+            AQLM-reconstructed float32 version, stored under a *new*
+            initializer. A model with no matching layer is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_aqlm(model.SerializeToString()))
+
+
 def apply_daq_cpp(
     base_model: Union[str, onnx.ModelProto],
     post_trained_model: Union[str, onnx.ModelProto],

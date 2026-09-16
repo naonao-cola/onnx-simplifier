@@ -319,6 +319,48 @@ onnx::ModelProto ApplyHQQ(const onnx::ModelProto& model) {
                                            std::vector<std::string>{"hqq"});
 }
 
+onnx::ModelProto ApplyIBertGelu(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"ibert_gelu"});
+}
+
+onnx::ModelProto ApplyIBertSoftmax(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"ibert_softmax"});
+}
+
+onnx::ModelProto ApplyADPQ(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(model,
+                                           std::vector<std::string>{"adpq"});
+}
+
+onnx::ModelProto ApplyICQuant(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(model,
+                                           std::vector<std::string>{"icquant"});
+}
+
+onnx::ModelProto ApplyOlive(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(model,
+                                           std::vector<std::string>{"olive"});
+}
+
+onnx::ModelProto ApplyAQLM(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(model,
+                                           std::vector<std::string>{"aqlm"});
+}
+
 std::vector<std::string> ListQuantizableActivations(
     const onnx::ModelProto& model) {
   PrepareSchemasForDebug(model);
