@@ -9,6 +9,9 @@
   #log { white-space: pre-wrap; background: #111; color: #0f0; padding: 1rem; height: 260px; overflow-y: auto; }
   .note { font-size: 0.9em; color: #555; }
   button:disabled { opacity: 0.5; }
+  table.candidates { border-collapse: collapse; width: 100%; margin-top: 0.5rem; font-size: 0.9em; }
+  table.candidates th, table.candidates td { border: 1px solid #ccc; padding: 0.35rem 0.5rem; text-align: left; }
+  table.candidates th { background: #f0f0f0; }
 </style>
 </head>
 <body>
@@ -22,6 +25,51 @@
   reviewed against kflash.py's source and unit-tested at the framing level,
   <b>not yet run against a real board</b>).
 </p>
+
+<div class="step" style="border: 1px solid #888; border-radius: 6px; padding: 0.75rem 1rem; margin: 1rem 0;">
+  <h2 style="margin-top: 0;">Candidate models</h2>
+  <p class="note">
+    This page only flashes an already-built <code>.bin</code> — there is no
+    onnx→kmodel (nncase) conversion step or firmware recipe here yet (see
+    <code>../README.md</code>'s follow-ups). These are the vision models to
+    build that pipeline against once it exists (Maix Amigo has a camera;
+    M5StickV's is often flaky). Each link opens the
+    <a href="../../convertmodel/index.html" target="_blank" rel="noopener">onnxsim model converter</a>
+    pre-filled with that model, to fetch/simplify/quantize the ONNX starting point.
+  </p>
+  <table class="candidates">
+    <tr><th>Model</th><th>Size</th><th>Why</th></tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-MobileNetV1-0.25-VisualWakeWords-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-MobileNetV1-0.25-VisualWakeWords-int8-onnx</a></td>
+      <td>358 KB</td>
+      <td>Person detection (binary) — the natural "hello world" for K210's KPU + a camera</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-ResNet8-CIFAR10-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-ResNet8-CIFAR10-int8-onnx</a></td>
+      <td>113 KB</td>
+      <td>Tiny 10-class image classifier, MLPerf Tiny reference — good sanity check</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/tensorflow-MobileNetV1-0.25-ImageNet-224-uint8-onnx&autoload=1" target="_blank" rel="noopener">tensorflow-MobileNetV1-0.25-ImageNet-224-uint8-onnx</a></td>
+      <td>530 KB</td>
+      <td>Full 1000-class ImageNet classifier — matches Sipeed's own official K210 MobileNet demo shape</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/tensorflow-MobileNetV1-0.5-ImageNet-224-uint8-onnx&autoload=1" target="_blank" rel="noopener">tensorflow-MobileNetV1-0.5-ImageNet-224-uint8-onnx</a></td>
+      <td>1.4 MB</td>
+      <td>Wider/more-accurate MobileNet if the KPU weight budget allows</td>
+    </tr>
+  </table>
+  <p class="note">
+    Checked but not recommended: <code>google-coral-DeepLabV3-*</code>
+    (883 KB–1.7 MB, segmentation output handling adds real complexity) and
+    <code>mediapipe-EfficientDet-Lite0</code> (4.1 MB int8 — too big for
+    K210's practical KPU/SRAM budget). These are community re-exports (the
+    <code>ketiswp</code> Hub org), not the original MLCommons/Google
+    accounts — spot-check one before trusting it on hardware.
+  </p>
+</div>
+
 <p class="note" id="serial-unsupported" style="display: none; color: #b00;">
   This browser has no <code>navigator.serial</code> -- try Chrome or Edge
   (desktop), 89+.

@@ -11,6 +11,9 @@
   .step h2 { margin-top: 0; }
   .note { font-size: 0.9em; color: #555; }
   button:disabled { opacity: 0.5; }
+  table.candidates { border-collapse: collapse; width: 100%; margin-top: 0.5rem; font-size: 0.9em; }
+  table.candidates th, table.candidates td { border: 1px solid #ccc; padding: 0.35rem 0.5rem; text-align: left; }
+  table.candidates th { background: #f0f0f0; }
 </style>
 </head>
 <body>
@@ -30,6 +33,44 @@
     <a href="../../convertmodel/index.html" target="_blank" rel="noopener">onnxsim model converter</a>,
     then download the result. This page doesn't repeat that UI — it starts
     from step 2 below, offline.
+  </p>
+  <p class="note">
+    Candidates (Cardputer has a mic, no camera, so these are all audio
+    models; sizes are the actual <code>model.onnx</code> size on the Hub).
+    Each link opens the converter pre-filled with that model.
+  </p>
+  <table class="candidates">
+    <tr><th>Model</th><th>Size</th><th>Why</th></tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/tensorflow-Micro-Speech-TinyConv-SpeechCommands-uint8-onnx&autoload=1" target="_blank" rel="noopener">tensorflow-Micro-Speech-TinyConv-SpeechCommands-uint8-onnx</a></td>
+      <td>19 KB</td>
+      <td>Google's official <code>micro_speech</code> reference (yes/no + a few words) — smallest, best first end-to-end test</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-DS-CNN-SpeechCommands-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-DS-CNN-SpeechCommands-int8-onnx</a></td>
+      <td>74 KB</td>
+      <td>MLPerf Tiny's official keyword-spotting benchmark model</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-Streaming-Wakeword-DS-CNN-SpeechCommands-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-Streaming-Wakeword-DS-CNN-SpeechCommands-int8-onnx</a></td>
+      <td>72 KB</td>
+      <td>Streaming variant — closer to real "always-listening" wake-word behavior</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/arm-DS-CNN-Large-SpeechCommands-clustered-int8-onnx&autoload=1" target="_blank" rel="noopener">arm-DS-CNN-Large-SpeechCommands-clustered-int8-onnx</a></td>
+      <td>476 KB</td>
+      <td>ARM's larger KWS reference — more accuracy if you have the flash budget</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-Deep-Autoencoder-DCASE2020-ToyCar-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-Deep-Autoencoder-DCASE2020-ToyCar-int8-onnx</a></td>
+      <td>285 KB</td>
+      <td>Anomaly-sound detection (autoencoder + reconstruction-error threshold) — a different task, still mic-only</td>
+    </tr>
+  </table>
+  <p class="note">
+    These are community re-exports (the <code>ketiswp</code> Hub org), not
+    the original MLCommons/Google/ARM accounts — spot-check one with the
+    converter's own Netron/inference panel before trusting it on hardware.
   </p>
 </div>
 
