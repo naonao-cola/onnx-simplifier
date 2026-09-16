@@ -134,5 +134,17 @@ void setup() {
 }
 
 void loop() {
-  delay(1000);
+  delay(2000);
+  // Repeated so a status/error line printed once during setup() isn't the
+  // only chance to observe it -- this device's native USB-Serial/JTOG port
+  // disconnects and re-enumerates on every reset, so a host reconnecting
+  // afterward can otherwise miss a one-shot boot-time print entirely.
+  if (interpreter != nullptr) {
+    for (size_t i = 0; i < interpreter->inputs_size(); i++) {
+      TfLiteTensor* t = interpreter->input(i);
+      memset(t->data.raw, 0, t->bytes);
+    }
+    TfLiteStatus invoke_status = interpreter->Invoke();
+    printLine(invoke_status == kTfLiteOk ? "test inference: OK" : "test inference: FAILED");
+  }
 }

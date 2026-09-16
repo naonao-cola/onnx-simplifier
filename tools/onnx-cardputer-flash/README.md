@@ -29,17 +29,19 @@ Serial was picked over WebUSB for this class of board).
 | Fetch + simplify/quantize an HF model | the existing [onnxsim model converter](../convertmodel/index.html) — this tool doesn't repeat that UI | already shipped, unrelated to this addition |
 | ONNX → TFLite (int8) | `scripts/onnx_to_tflite_micro.py` (`convert_to_tflite`, wraps `onnx2tf -oiqt`) | **run for real against a real HF model — found a real bug**: `-oiqt` requires a Float32 ONNX input, but a model that's already ONNX-quantized (QuantizeLinear/DequantizeLinear baked in, `uint8` input) makes onnx2tf error out before producing anything. `--no-int8` (plain Float32 output, skips `-oiqt`) works around it; the script doesn't yet detect/handle already-quantized inputs itself — see `firmware/runtime/README.md`'s "Status", finding #3 |
 | TFLite → C header | `scripts/onnx_to_tflite_micro.py` (`emit_c_header`) | unit-tested, see `tests/` |
-| Firmware (generic TFLite Micro runtime) | [`firmware/runtime/`](firmware/runtime/README.md) — a real PlatformIO project, not just a recipe | **compiled, flashed, and booted on a real M5Stack Cardputer.** Real hardware found and fixed a `qio`→`dio` flash-mode bug (finding #1); found (unfixed, upstream-library) a crash on legacy-quantized `DepthwiseConv` models (finding #2); and found (unfixed, unroot-caused) that a model which *does* clear `AllocateTensors()` still fails its sanity `Invoke()` call (finding #4) — see that README's "Status" for all four |
+| Firmware (generic TFLite Micro runtime) | [`firmware/runtime/`](firmware/runtime/README.md) — a real PlatformIO project, not just a recipe | **compiled, flashed, and booted on a real M5Stack Cardputer.** Real hardware found and fixed a `qio`→`dio` flash-mode bug (finding #1); found (unfixed, upstream-library) a crash on legacy-quantized `DepthwiseConv` models (finding #2); found and precisely root-caused (unfixed, upstream-library) that this model's `Transpose` op runs on `uint8` data, which this TFLM version's `Transpose` kernel doesn't support (finding #4); and found and fixed a `Serial`-routing bug that was hiding *all* app/TFLM diagnostic output, including finding #4's own error text (finding #5) — see that README's "Status" for all five |
 | Flash over Web Serial | `web/flasher.mjs` (Espressif's `esptool-js`) | loads and runs its UI logic cleanly in a browser (checked headless); the underlying ISP protocol was exercised for real via `esptool` directly against `/dev/ttyACM0` (same USB-Serial/JTAG port Web Serial would use) — `flasher.mjs`'s own browser-side call shapes are still **not** exercised through an actual Chrome Web Serial session |
 
 Real hardware confirmed: flashing, booting, mmap'ing the model partition,
-and (for a Float32 model) `AllocateTensors()` all work end to end. Not yet
-confirmed: a *correct* inference result -- the one real model tried so far
-loads but fails its own sanity `Invoke()` call (finding #4, unroot-caused),
-and no int8-quantized model has cleared `AllocateTensors()` at all (blocked
-on findings #2 and #3). The browser UI itself doing the flashing (vs.
-`esptool` CLI standing in for it) is also still unverified. See
-`firmware/runtime/README.md`'s "Status" for the full, numbered findings.
+and (for a Float32 model) `AllocateTensors()` all work end to end, and
+`Serial`/on-device diagnostics are now real and readable (finding #5). Not
+yet confirmed: a *correct* inference result -- the one real model tried so
+far loads but its `Transpose` op fails on `uint8` input, a precise, real
+TFLM library gap (finding #4), and no int8-quantized model has cleared
+`AllocateTensors()` at all (blocked on findings #2 and #3). The browser UI
+itself doing the flashing (vs. `esptool` CLI standing in for it) is also
+still unverified. See `firmware/runtime/README.md`'s "Status" for the full,
+numbered findings.
 
 ## Using it
 
@@ -66,14 +68,13 @@ older recipe bakes the model directly into the firmware as a C array.
 
 ## Not done yet / follow-ups
 
-- **Root-cause the `Invoke()` failure** (finding #4): a Float32 model that
-  cleared `AllocateTensors()` on real hardware still failed its sanity
-  inference over a zeroed input. Candidates: the all-zero input being
-  out-of-range for some op in this graph (its real input is MFCC audio
-  features, not raw zeros), or a real float32 kernel bug in this TFLM
-  version for one of this graph's ops. Needs per-op output inspection on
-  real hardware (or a host-side `tflite::MicroInterpreter` run with the
-  same zeroed input, if that reproduces the failure without a board).
+- **A model whose graph doesn't feed `uint8` data into `Transpose`** would
+  sidestep finding #4 (root-caused, not fixed -- the gap is in vendored
+  `Chirale_TensorFLowLite`, not this repo). Either a model whose converted
+  graph doesn't have a `Transpose` immediately on the raw quantized input,
+  or a genuine per-channel int8-quantized model (which needs finding #3
+  fixed first) would be the next real test of whether `Invoke()` can
+  produce a *correct* result on this hardware, not just avoid crashing.
 - **Handle already-quantized ONNX inputs in `onnx_to_tflite_micro.py`**
   (finding #3): `convert_to_tflite()` always passes onnx2tf's `-oiqt`,
   which needs a Float32 input and errors out on a model that's already

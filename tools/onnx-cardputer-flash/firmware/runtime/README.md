@@ -14,8 +14,8 @@ PlatformIO against `esp32-s3-devkitc-1` + `framework = arduino`, linking
 Actual output:
 
 ```
-RAM:   40.2% (131672 / 327680 bytes)
-Flash: 24.2% (761105 / 3145728 bytes, the "factory" app partition)
+RAM:   40.1% (131456 / 327680 bytes)
+Flash: 23.8% (747413 / 3145728 bytes, the "factory" app partition)
 ```
 
 **Real-hardware finding #1 (fixed): the `esp32-s3-devkitc-1` board profile's
@@ -63,26 +63,66 @@ Float32 output) works around it -- see "Confirmed end-to-end" below. This
 script doesn't currently detect or handle already-quantized ONNX inputs;
 treat `-oiqt` as verified only for models that are still Float32 going in.
 
-**Real-hardware finding #4 (real bug, unfixed here): the sanity `Invoke()`
-call fails even after a clean `AllocateTensors()`.** The Float32 `.tflite`
-produced by the `--no-int8` workaround above (71232 bytes, from the same HF
-model) flashed at `0x310000`, booted with no crash, and the Cardputer's own
-screen showed `model loaded ok` plus its input/output shape dump -- real
-proof the flash-partition-mmap -> `TFL3` detection -> `tflite::GetModel()`
--> `AllOpsResolver` -> `MicroInterpreter::AllocateTensors()` chain works
-end to end on real hardware (float32 kernels don't call
-`PopulateConvolutionQuantizationParams`, so this doesn't retest finding #2).
-But the very next step, `interpreter->Invoke()` over a zeroed input
-(`main.cpp`'s deliberately minimal sanity check), printed `test inference:
-FAILED` -- `Invoke()` returned a non-`kTfLiteOk` status. Not yet
-root-caused: candidates are the all-zero input being out of a range some op
-in this graph doesn't handle (this model's real input is MFCC audio
-features, not raw zeros), or a real kernel bug for one of this graph's ops
-in this TFLM version's float32 path. A per-channel int8-quantized model
-(fixing finding #3) also still hasn't cleared `AllocateTensors()` on real
-hardware, so neither quantized nor float inference has been proven to
-produce a *correct* result end to end yet -- only that the pipeline can
-load and attempt to run a real model without crashing.
+**Real-hardware finding #4 (real bug, unfixed here, but precisely
+root-caused): `Transpose` doesn't support `uint8` in this TFLM version.**
+The Float32 `.tflite` produced by the `--no-int8` workaround above (71232
+bytes, from the same HF model) flashed at `0x310000`, booted with no crash,
+and cleared `AllocateTensors()` for real on hardware -- real proof the
+flash-partition-mmap -> `TFL3` detection -> `tflite::GetModel()` ->
+`AllOpsResolver` -> `MicroInterpreter::AllocateTensors()` chain works end to
+end (float32 kernels don't call `PopulateConvolutionQuantizationParams`, so
+this doesn't retest finding #2). But `interpreter->Invoke()` over a zeroed
+input (`main.cpp`'s deliberately minimal sanity check) fails every time,
+printing this exact pair of lines (see finding #5 for how these became
+visible at all):
+
+```
+Type UINT8 is currently not supported by Transpose. Only float32 and int8 is supported
+Node TRANSPOSE (number 0) failed to invoke with status 1
+```
+
+This model's graph (per onnx2tf's own conversion log) is
+`Reshape -> Transpose -> ... -> DequantizeLinear -> Conv/MatMul (float) ->
+... -> QuantizeLinear -> output` -- the graph's true external input is
+`uint8` (this "float32" export keeps the original ONNX QuantizeLinear/
+DequantizeLinear nodes as real ops rather than folding them into tensor
+metadata; only the *internal* compute is float32), and `Transpose` is the
+very first op, running on that still-`uint8` data before `DequantizeLinear`
+ever converts it. `Chirale_TensorFLowLite`'s vendored TFLM `Transpose`
+kernel (`tensorflow/lite/micro/kernels/transpose.cpp`) only implements
+`float32` and `int8` -- not `uint8` -- so it fails cleanly rather than
+computing a wrong result. This is a real op/dtype coverage gap in the
+vendored library, not something to patch in this repo. A per-channel
+int8-quantized model (fixing finding #3) also still hasn't cleared
+`AllocateTensors()` on real hardware, so neither quantized nor float
+inference has produced a *correct* result end to end yet -- only that the
+pipeline can load and attempt to run a real model without crashing, and
+that a specific, real cause blocks this specific model's actual inference.
+
+**Real-hardware finding #5 (fixed): `Serial` -- and `Chirale_TensorFLowLite`'s
+own internal error reporting -- silently went to a disconnected pin.**
+Every serial capture attempt in this session (both remote, via a Python
+`pyserial` script driving the board's DTR/RTS directly, and local, via
+`screen`/`pio device monitor` on the same machine) came back with nothing
+beyond the ROM boot banner -- no app output at all, success or failure,
+even though the Cardputer's *screen* clearly showed real `printLine()` text
+the whole time. Root cause: `esp32-s3-devkitc-1`'s board profile defines
+`ARDUINO_USB_MODE=1` but not `ARDUINO_USB_CDC_ON_BOOT`, and
+Arduino-ESP32's `HardwareSerial.cpp`/`HWCDC.cpp` both gate on that second
+flag -- without it, `Serial` is `HardwareSerial(0)` (UART0's physical GPIO
+pins), and the native USB-Serial/JTAG peripheral (the *only* port actually
+wired to the host on this board, and the same one the ROM bootloader and
+`esptool` both use) is instead exposed under a *different* name,
+`USBSerial`, that nothing in this firmware or `Chirale_TensorFLowLite`
+references. `Chirale_TensorFLowLite`'s own `DebugLog()` (and therefore
+every `MicroPrintf` diagnostic TFLM itself emits on a kernel failure, like
+finding #4's exact error text above) also writes to `Serial`, so this
+silently swallowed the *one* piece of diagnostic output that would have
+explained finding #4 immediately. Fixed by adding
+`build_flags = -DARDUINO_USB_CDC_ON_BOOT=1` to `platformio.ini`, which
+makes `Serial` alias the same USB-Serial/JTAG peripheral everything else
+already uses -- confirmed working by capturing finding #4's exact error
+text over that same port after the fix.
 
 The `tensor_arena` size (100KB default) is untested against a model that
 actually needs meaningfully more than this one did -- `AllocateTensors()`
@@ -156,4 +196,4 @@ above (real-hardware finding #1). `board_build.flash_mode = dio` in
 step needs the same flag repeated since it stamps its own image header.
 
 `sha256sum` of the committed `prebuilt/cardputer-runtime.bin`:
-`e22990fe84bd37dd7399f47dec896b28a8f96a5b4ca6999b28703114cbdc9b24`
+`29799bdc4a303c9e7020487696c693a67f983f8360f77942d8eba2dc51905a1b`
