@@ -133,6 +133,13 @@ export function applyAqlm(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyDropByDrop(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyLoBcq(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyQuipSharp(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyAttentionQuantization(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyZeroquant(
+  model: OnnxModelBytes,
+  options?: { blockSize?: number; epsilon?: number },
+): Promise<Uint8Array>;
+export function applyIntactkv(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyKbvqMoe(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyDaq(
   baseModel: OnnxModelBytes,
   postTrainedModel: OnnxModelBytes,
@@ -352,6 +359,10 @@ declare const _default: {
   applyDropByDrop: typeof applyDropByDrop;
   applyLoBcq: typeof applyLoBcq;
   applyQuipSharp: typeof applyQuipSharp;
+  applyAttentionQuantization: typeof applyAttentionQuantization;
+  applyZeroquant: typeof applyZeroquant;
+  applyIntactkv: typeof applyIntactkv;
+  applyKbvqMoe: typeof applyKbvqMoe;
   applyDaq: typeof applyDaq;
   applyLowRankCompensation: typeof applyLowRankCompensation;
   pruneMagnitude: typeof pruneMagnitude;

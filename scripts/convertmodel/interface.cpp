@@ -2544,6 +2544,67 @@ em::val onnxsim_apply_quip_sharp(const std::string &data) {
   }
 }
 
+em::val onnxsim_apply_attention_quantization(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyAttentionQuantization(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_attention_quantization error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+// `block_size`/`epsilon` mirror apply_zeroquant_cpp's own parameters
+// exactly (see onnxsim.h) -- the same way onnxsim_apply_quarot's own are.
+em::val onnxsim_apply_zeroquant(const std::string &data, int block_size,
+                                float epsilon) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(
+        ApplyZeroQuant(xmodel, static_cast<int64_t>(block_size), epsilon));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_zeroquant error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_intactkv(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyIntactKv(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_intactkv error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_kbvq_moe(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyKbvqMoe(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_kbvq_moe error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // DAQ is data-free but still needs two full models (base + fine-tuned,
 // matched by node output name) -- the same two-model shape
 // onnxsim_list_correctable_outputs/onnxsim_apply_bias_corrections above
@@ -3619,6 +3680,11 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_apply_drop_by_drop", &onnxsim_apply_drop_by_drop);
   function("onnxsim_apply_lo_bcq", &onnxsim_apply_lo_bcq);
   function("onnxsim_apply_quip_sharp", &onnxsim_apply_quip_sharp);
+  function("onnxsim_apply_attention_quantization",
+           &onnxsim_apply_attention_quantization);
+  function("onnxsim_apply_zeroquant", &onnxsim_apply_zeroquant);
+  function("onnxsim_apply_intactkv", &onnxsim_apply_intactkv);
+  function("onnxsim_apply_kbvq_moe", &onnxsim_apply_kbvq_moe);
   function("onnxsim_apply_daq", &onnxsim_apply_daq);
   function("onnxsim_apply_low_rank_compensation",
            &onnxsim_apply_low_rank_compensation);

@@ -2017,6 +2017,78 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // Attention computation quantization: per-token dynamic INT8 for Q/K/V,
+  // fixed-scale UINT8 for the Softmax output. Data-free. New graph nodes
+  // (not a fold-to-initializer -- no constant weight is involved). See
+  // ApplyAttentionQuantization in onnxsim.h.
+  m.def(
+      "apply_attention_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyAttentionQuantization(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // ZeroQuant (Yao et al., 2022): group-wise INT8 weight quantization paired
+  // with per-token dynamic INT8 activation quantization, executed as a real
+  // int8 x int8 MatMulInteger. Data-free. New graph nodes (not a
+  // fold-to-initializer -- the activation's own per-token scale is a
+  // runtime value). See ApplyZeroQuant in onnxsim.h.
+  m.def(
+      "apply_zeroquant",
+      [](const py::bytes& model_proto_bytes, int64_t block_size,
+         float epsilon) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyZeroQuant(model, block_size, epsilon);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "block_size"_a = 32, "epsilon"_a = 1e-12f);
+
+  // IntactKV (Liu et al., 2024): splits a KV-cache stream's own fixed-length
+  // leading pivot prefix into its own always-exact stream. Data-free.
+  // Companion pass, not a quantizer -- see ApplyIntactKv in onnxsim.h.
+  m.def(
+      "apply_intactkv",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyIntactKv(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // KBVQ-MoE (Xu et al., 2026): KLT-shared-basis plus per-expert
+  // bias-corrected vector quantization for a com.microsoft::MoE router
+  // group's own experts. Data-free. See ApplyKbvqMoe in onnxsim.h.
+  m.def(
+      "apply_kbvq_moe",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyKbvqMoe(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // DAQ (Delta-Aware Quantization): data-free, but takes two full model
   // byte buffers (a base and a fine-tuned checkpoint, matched by node
   // output name) rather than one -- see ApplyDaq in daq_entry.h.

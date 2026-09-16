@@ -4895,6 +4895,172 @@ def apply_quip_sharp_cpp(
     return onnx.load_from_string(C.apply_quip_sharp(model.SerializeToString()))
 
 
+def apply_attention_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_attention_quantization`:
+    quantizes the decomposed attention subgraph's own Q/K/V operands
+    (data-free, per-token dynamic INT8, ``scale = max(|x|, axis=-1) /
+    127``) and the Softmax output itself (a fixed UINT8 scale of ``1/255``,
+    since a Softmax output's range is guaranteed ``[0, 1]``). See
+    :func:`onnxsim.apply_attention_quantization`'s own docstring for the
+    full rationale.
+
+    Unlike every weight-only ``*_cpp`` port in this module, this is not a
+    fold-to-initializer pass -- none of the four quantized tensors is a
+    constant weight, so this builds real new quantize/dequantize graph
+    nodes instead. Unlike :func:`simplify`, this does not run shape
+    inference, constant folding or any other simplification pass. No
+    RNG/fitting step anywhere in this technique, so this port is expected
+    to track the pure-Python reference closely, up to ordinary
+    floating-point summation-order differences.
+
+    Only the common, decomposed
+    ``MatMul(Q,Kt) -> [Mul] -> [Add] -> Softmax -> MatMul(_,V)`` subgraph is
+    matched, on an opset 18+ model (``ReduceMax``'s axes-as-input form).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched attention subgraph's own Q/K/V
+            and Softmax-output operands replaced by an INT8
+            quantize-dequantize round trip. A model with no matching
+            subgraph, or an opset older than 18, is returned unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_attention_quantization(model.SerializeToString())
+    )
+
+
+def apply_zeroquant_cpp(
+    model: Union[str, onnx.ModelProto],
+    block_size: int = 32,
+    epsilon: float = 1e-12,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_zeroquant`: applies
+    ZeroQuant-style W8A8 quantization (Yao et al., 2022) -- group-wise INT8
+    weight quantization paired with per-token dynamic INT8 activation
+    quantization, executed as a real ``int8 x int8`` integer matmul -- to
+    every MatMul/vanilla-Gemm layer with a constant 2-D float32 weight whose
+    reduction dimension ``K`` is divisible by ``block_size``. See
+    :func:`onnxsim.apply_zeroquant`'s own docstring for the full rationale.
+
+    Unlike every other per-token-dynamic-INT8 activation-quantization pass
+    in this module (which immediately dequantizes back to float32,
+    simulating precision loss), this one feeds the quantized activation into
+    a genuine ``MatMulInteger`` -- so, like :func:`onnxsim.apply_quarot_cpp`,
+    this cannot fold to a single replacement weight (the activation's own
+    per-token scale is a runtime value) and builds real new graph nodes
+    instead. Unlike :func:`simplify`, this does not run shape inference,
+    constant folding or any other simplification pass. No RNG/fitting step
+    anywhere in this technique, so this port is expected to track the
+    pure-Python reference closely, up to ordinary floating-point
+    summation-order differences.
+
+    Needs no calibration data: the weight's per-group scales come from the
+    weight's own static values, and the activation's per-token scale is
+    computed fresh at graph-run time from that token's own values.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param block_size: elements per weight quantization group along ``K``,
+            matching :func:`onnxsim.quantize_weight_only_int8_block`'s own
+            default
+    :param epsilon: floor applied to a weight group's own max-abs value
+            (and, at graph-run time, a token's own quantization range)
+            before using it as a scale, avoiding a divide-by-zero on an
+            all-zero group or token
+    :returns: ``model`` with every matched layer's weight and activation
+            replaced by a group-wise/per-token INT8 ``MatMulInteger``
+            pipeline (plus the original bias, if any). Layers with a
+            non-constant, non-2-D weight, or a reduction dimension not
+            divisible by ``block_size``, are left untouched. A model whose
+            opset is older than 18, or with ``block_size`` not a positive
+            divisor within the safe int32-accumulation bound, is returned
+            unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_zeroquant(model.SerializeToString(), block_size, epsilon)
+    )
+
+
+def apply_intactkv_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_intactkv`: not a quantizer, but
+    a *companion* pass (IntactKV, Liu et al., 2024) that splits a KV-cache
+    stream's own fixed-length leading "pivot" prefix (attention-sink
+    tokens, disproportionately sensitive to quantization error) out into
+    its own always-exact stream, so a following KV-cache quantizer can
+    leave the pivots untouched forever and quantize only the remaining,
+    still-growing "rest" of the cache. See
+    :func:`onnxsim.apply_intactkv`'s own docstring for the full rationale.
+
+    Matches a ``Concat(past, new, axis=seq)`` KV-cache stream (``past``: a
+    float32 graph input consumed by nothing else, whose Concat output is
+    directly a graph output) and rewrites it into a new fixed-size
+    ``*_pivot`` graph input/output plus an ordinary ``*_rest`` stream,
+    reconstructed back under the ORIGINAL ``present_*`` name/binding via a
+    new ``Concat`` node -- real graph input/output surgery, not a
+    fold-to-initializer or a same-shape node rewrite. Unlike
+    :func:`simplify`, this does not run shape inference, constant folding
+    or any other simplification pass. No RNG/fitting step anywhere in this
+    technique (a closed-form structural transformation), so this port is
+    expected to track the pure-Python reference exactly.
+
+    This port hardcodes :func:`onnxsim.apply_intactkv`'s own default
+    ``num_pivot_tokens=4`` rather than exposing it as a parameter.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched KV-cache stream split into a
+            ``*_pivot``/``*_rest`` pair, reconstructed under the original
+            name. A model with no matching stream is returned unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_intactkv(model.SerializeToString()))
+
+
+def apply_kbvq_moe_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_kbvq_moe`: fits a KLT (PCA)
+    basis shared across a ``com.microsoft::MoE`` router group's own experts
+    (KBVQ-MoE, Xu et al., 2026), then vector-quantizes each expert's own
+    residual against that shared basis with an ordinary per-expert k-means
+    codebook. See :func:`onnxsim.apply_kbvq_moe`'s own docstring for the
+    full rationale.
+
+    Unlike :func:`simplify`, this does not run shape inference, constant
+    folding or any other simplification pass. Only FLOAT32
+    ``fc1_experts_weights``/``fc2_experts_weights`` are quantized
+    (FLOAT16/BFLOAT16 left untouched, per-tensor, matching
+    :func:`onnxsim.apply_kbvq_moe`'s own scope exactly). This port's own
+    shared-basis fit has no RNG (an ordinary deterministic SVD); its
+    per-expert residual codebook reuses this module's own
+    :func:`onnxsim.apply_kmeans_quantization_cpp` k-means fit, whose only
+    divergence from the pure-Python reference is the same deterministic,
+    percentile-initialized scheme that function's own docstring already
+    documents. This port hardcodes :func:`onnxsim.apply_kbvq_moe`'s own
+    defaults (``rank=4``, ``bits=4``, ``kmeans_iters=20``) rather than
+    exposing them as parameters.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched MoE router group's own FLOAT32
+            expert weights replaced by their shared-basis-plus-residual-
+            codebook reconstruction, stored under *new* initializers. A
+            model with no matching MoE node is returned unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_kbvq_moe(model.SerializeToString()))
+
+
 def apply_daq_cpp(
     base_model: Union[str, onnx.ModelProto],
     post_trained_model: Union[str, onnx.ModelProto],

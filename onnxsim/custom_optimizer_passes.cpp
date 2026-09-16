@@ -12,6 +12,7 @@
 #include "passes/adpq.h"
 #include "passes/any_precision_llm.h"
 #include "passes/aqlm.h"
+#include "passes/attention_quantization.h"
 #include "passes/cross_layer_equalization.h"
 #include "passes/deepseek_fp8.h"
 #include "passes/defuse_matmul_integer_to_float.h"
@@ -72,7 +73,9 @@
 #include "passes/ibert_softmax.h"
 #include "passes/icquant.h"
 #include "passes/if4_quantization.h"
+#include "passes/intactkv.h"
 #include "passes/iq4_nl.h"
+#include "passes/kbvq_moe.h"
 #include "passes/kmeans_quantization.h"
 #include "passes/leptoquant.h"
 #include "passes/lo_bcq.h"
@@ -126,6 +129,7 @@
 #include "passes/weight_only_quantize_matmul.h"
 #include "passes/weight_only_quantize_matmul_nbits.h"
 #include "passes/weight_only_quantize_mxfp4_matmul.h"
+#include "passes/zeroquant.h"
 
 namespace onnxsim {
 
@@ -166,6 +170,10 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::DropByDrop>(registry);
     RegisterOrReplace<p::LoBcq>(registry);
     RegisterOrReplace<p::QuipSharp>(registry);
+    RegisterOrReplace<p::AttentionQuantization>(registry);
+    RegisterOrReplace<p::IntactKv>(registry);
+    RegisterOrReplace<p::KbvqMoe>(registry);
+    RegisterOrReplace<p::ZeroQuant>(registry);
     RegisterOrReplace<p::CrossLayerEqualization>(registry);
     RegisterOrReplace<p::DeepSeekFp8>(registry);
     RegisterOrReplace<p::DefuseMatMulIntegerToFloat>(registry);
