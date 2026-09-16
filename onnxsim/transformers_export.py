@@ -190,12 +190,19 @@ def _save(model: onnx.ModelProto, path: str, force_external_data: bool) -> None:
         save_as_external_data=True,
         all_tensors_to_one_file=True,
         location=external_data_path,
-        # onnx's own default (1024) leaves any tensor smaller than that
-        # inline regardless of save_as_external_data -- fine for the >2GB
-        # fallback above (the handful of huge tensors that tripped the limit
-        # are what matters), but force_external_data promises *every*
-        # tensor moves out, so drop the threshold to 0 only in that case.
-        size_threshold=0 if force_external_data else 1024,
+        # Always keep onnx's own default (1024) tensor-size cutoff, even
+        # under force_external_data -- do NOT drop it to 0. A real
+        # transformers export bakes in many tiny int64 scalar constants
+        # (shape/index helpers); externalizing those too produces a file
+        # onnxruntime fails to reload ("Cannot parse data from external
+        # tensors" on one such scalar), even though plain onnx.load +
+        # checker.check_model call it valid (confirmed empirically -- see
+        # the identical workaround/comment on export_causal_lm_static_cache's
+        # own onnx.save call below, which hit the same bug and avoids _save()
+        # entirely for that reason). Tensors this small contribute nothing
+        # worth saving to the in-pipeline-copying problem force_external_data
+        # exists for anyway, so there is no tradeoff in leaving them inline.
+        size_threshold=1024,
     )
     _cleanup_stale_external_data(path, stale_candidates)
 
