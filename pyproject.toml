@@ -133,9 +133,10 @@ addopts = "--durations=10"
 # Auto-applied by tests/conftest.py's pytest_collection_modifyitems based on
 # each test file's name -- see that hook for the exact matching rules. Used
 # by .github/workflows/build-and-test.yml to skip these backend/algorithm-
-# specific suites on macOS and the Windows cross-test job (they have no
-# OS-specific behavior, so running them there on top of every Linux leg is
-# redundant CI time), while still running them in full on Linux.
+# specific suites on every build_wheels leg and the Windows cross-test job
+# (they have no OS/arch/interpreter-dependent behavior, so running them on
+# every wheel-test leg is redundant CI time); they instead run exactly once,
+# in that workflow's dedicated test_axera_quantization_pruning job.
 markers = [
     "axera: Axera Pulsar2/AXCL NPU backend tests (test_axera_*, test_axelera_*, test_pulsar2_*, test_voyager_sdk_patterns.py)",
     "quantization: quantization algorithm/format tests (filename contains 'quant' or 'gguf')",
