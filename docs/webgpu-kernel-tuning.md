@@ -136,10 +136,21 @@ Everything above ran offline (a Python script) or through a Node+Playwright
 test -- useful for proving the idea, but not something a visitor to the
 actual converter page (`scripts/convertmodel/index.html`) could ever trigger
 themselves. `scripts/convertmodel/webgpu_kernel_tuner.mjs` closes that gap: an
-opt-in **"Tune this kernel…"** button on a `Conv` node's own entry in the
-existing "Custom WebGPU kernels" panel
-(`webgpu_kernel_annotations_view.mjs`) runs the *entire* loop above live, in
-the browser, no server involved:
+opt-in **"Tune this kernel…"** button on every `Conv` node in the loaded
+model, in the existing "Custom WebGPU kernels" panel
+(`webgpu_kernel_annotations_view.mjs`), runs the *entire* loop above live, in
+the browser, no server involved. This includes Conv nodes that don't already
+carry any kernel metadata -- which is nearly every real upload, since
+`onnxsim.webgpu_tinygrad_codegen`'s own server-side gap-flagging only ever
+attaches one for the narrow Conv3D/align_corners-Resize cases
+`onnxsim.webgpu_target` detects. (An earlier version of this button lived
+only inside an already-attached node's own entry, so it never showed up at
+all on an ordinary model -- fixed by having `onnx_conv_node_reader.mjs`'s
+`listConvNodeNames` list every Conv node in the graph, and offering the same
+tune UI on any of them not already shown above; see
+`webgpu_kernel_annotations_view.mjs`'s own `setSide` for the fix and
+`test/webgpu_kernel_tuner_ui.test.mjs`'s "plain Conv node" scenario for the
+regression check.)
 
 1. **Generation, live, via Pyodide.** `onnx_conv_node_reader.mjs` reads the
    target node's shapes/attributes straight out of the model bytes already in
@@ -182,10 +193,12 @@ anything else surfaces `readConvNodeInfo`'s own clear error rather than
 silently doing nothing.
 
 **Verified end to end** in `test/webgpu_kernel_tuner_ui.test.mjs`, driving the
-*real* page (not a synthetic harness): load a fixture, click Tune, wait for
-several real candidates with real per-candidate timings, click Export, and
-confirm the downloaded model's attached kernel both matches the chosen
-winner and still computes the right answer against the same ground truth
+*real* page (not a synthetic harness), for two scenarios: a fixture with an
+already-attached kernel, and a plain Conv model with none at all (the
+regression case above). Each: load the fixture, click Tune, wait for several
+real candidates with real per-candidate timings, click Export, and confirm
+the downloaded model's attached kernel both matches the chosen winner and
+still computes the right answer against the same ground truth
 `webgpu_tinygrad_codegen.test.mjs` itself checks against. The one piece that
 sandbox couldn't verify against the real, public CDN is noted in that test's
 own comment (an internal network-policy restriction specific to this repo's

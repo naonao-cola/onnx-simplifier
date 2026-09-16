@@ -6,16 +6,22 @@
 // real dispatcher would use (see webgpu_kernel_annotations.mjs's own
 // docstring for the pure reshaping logic this delegates to).
 //
-// Display is still entirely passive -- this does not run
-// onnxsim.webgpu_target's own gap detection, and never generates or
-// dispatches anything on its own. The one exception, opt-in only, is the
-// "Tune this kernel" button on a Conv node's own entry: click it and
-// webgpu_kernel_tuner.mjs runs the real browser-timed tuning loop (Pyodide +
-// tinygrad, live, against a real WebGPU device -- see that module's own
-// docstring for scope and why it's opt-in, not automatic) and offers an
-// "Export tuned model" download once a winner is picked, via
-// onnx_metadata_writer.mjs's attachWebgpuKernelSpec. Nothing here changes
-// what Simplify/Optimize themselves produce; a tuned export is a separate
+// Display of *already-attached* kernels is still entirely passive -- this
+// does not run onnxsim.webgpu_target's own gap detection. The opt-in part is
+// the "Tune this kernel" button: click it and webgpu_kernel_tuner.mjs runs
+// the real browser-timed tuning loop (Pyodide + tinygrad, live, against a
+// real WebGPU device -- see that module's own docstring for scope and why
+// it's opt-in, not automatic) and offers an "Export tuned model" download
+// once a winner is picked, via onnx_metadata_writer.mjs's
+// attachWebgpuKernelSpec. This button isn't limited to nodes that already
+// carry a kernel spec -- onnxsim.webgpu_tinygrad_codegen's own server-side
+// gap-flagging only ever attaches one to the narrow Conv3D/align_corners-
+// Resize gaps onnxsim.webgpu_target detects, so almost no ordinary uploaded
+// model has any pre-attached kernel at all. `onnx_conv_node_reader.mjs`'s
+// listConvNodeNames lists every Conv node in the graph instead, and this
+// view offers the same tune UI on any of them that isn't already shown
+// above (see setSide's own comment). Nothing here changes what
+// Simplify/Optimize themselves produce; a tuned export is a separate
 // download the visitor asks for.
 //
 // Wiring mirrors the "Dynamic dimensions" panel (shapes_view.mjs): the
@@ -31,11 +37,14 @@ import { dataUrlToArrayBuffer } from "./netron.mjs";
 import { listWebgpuKernelAnnotations } from "./webgpu_kernel_annotations.mjs";
 import { downloadBytes } from "./download.mjs";
 import { attachWebgpuKernelSpec } from "./onnx_metadata_writer.mjs";
+import { listConvNodeNames } from "./onnx_conv_node_reader.mjs";
 
 // Latest parsed state for each side: null until a model arrives there,
-// {bytes, name, annotations} once parsed (annotations is [] when nothing
-// found). Bytes are kept (not just the display summary) so a "Tune"/"Export"
-// action has something to tune/attach onto.
+// {bytes, name, annotations, tunableConvNodes} once parsed (annotations is
+// [] when nothing found; tunableConvNodes is every Conv node NOT already in
+// annotations -- see setSide's own comment on why this list exists at all).
+// Bytes are kept (not just the display summary) so a "Tune"/"Export" action
+// has something to tune/attach onto.
 const state = { before: null, after: null };
 
 // Tuning progress/results, keyed by `${which}:${nodeName}` so the "before"
@@ -131,18 +140,33 @@ function annotationHtml(a, which) {
   );
 }
 
+// A Conv node with no kernel spec attached yet -- just its name and the same
+// tune UI an already-annotated node gets, so "Tune this kernel" is
+// discoverable on a plain, never-flagged Conv node too (see setSide's own
+// comment: this is the common case, not the exception).
+function tunableConvNodeHtml(nodeName, which) {
+  const t = tuningStateFor(which, nodeName);
+  return (
+    `<div class="wk-node">` +
+    `<div class="wk-node-head"><code>${esc(nodeName)}</code> — no custom kernel attached yet</div>` +
+    `<div class="wk-tune">${tuneResultHtml(which, nodeName, t)}</div>` +
+    `</div>`
+  );
+}
+
 function paneHtml(title, which, side) {
   if (!side) {
     return `<div class="wk-pane"><div class="wk-head">${esc(title)}</div><em>—</em></div>`;
   }
-  if (side.annotations.length === 0) {
-    return `<div class="wk-pane"><div class="wk-head">${esc(title)}</div><em>no custom WebGPU kernels attached</em></div>`;
-  }
-  return (
-    `<div class="wk-pane"><div class="wk-head">${esc(title)}</div>` +
-    side.annotations.map((a) => annotationHtml(a, which)).join("") +
-    `</div>`
-  );
+  const attached =
+    side.annotations.length === 0
+      ? `<em>no custom WebGPU kernels attached</em>`
+      : side.annotations.map((a) => annotationHtml(a, which)).join("");
+  const tunable = side.tunableConvNodes.length
+    ? `<div class="wk-tune-section-head">Tune a Conv kernel</div>` +
+      side.tunableConvNodes.map((n) => tunableConvNodeHtml(n, which)).join("")
+    : "";
+  return `<div class="wk-pane"><div class="wk-head">${esc(title)}</div>${attached}${tunable}</div>`;
 }
 
 function render() {
@@ -158,7 +182,21 @@ function render() {
 function setSide(which, data, name) {
   try {
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-    state[which] = { bytes, name: name || "model.onnx", annotations: listWebgpuKernelAnnotations(bytes) };
+    const annotations = listWebgpuKernelAnnotations(bytes);
+    const alreadyAnnotated = new Set(annotations.map((a) => a.nodeName));
+    // Most models never go through onnxsim.webgpu_tinygrad_codegen's own
+    // gap-flagging, so `annotations` is empty for nearly every real upload --
+    // the "Tune this kernel" button must not live only inside an
+    // already-attached entry (see this module's own docstring for why that
+    // was too narrow), so every OTHER Conv node in the graph gets offered
+    // here too, deduplicated against the ones already shown above.
+    let tunableConvNodes = [];
+    try {
+      tunableConvNodes = listConvNodeNames(bytes).filter((n) => !alreadyAnnotated.has(n));
+    } catch (err) {
+      console.error(`webgpu kernels (${which}) conv node listing:`, err);
+    }
+    state[which] = { bytes, name: name || "model.onnx", annotations, tunableConvNodes };
   } catch (err) {
     console.error(`webgpu kernels (${which}):`, err);
     state[which] = null;

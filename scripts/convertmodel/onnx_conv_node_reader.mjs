@@ -288,6 +288,42 @@ function readGraph(bytes) {
 }
 
 /**
+ * Every default-domain ``Conv`` node's own ``NodeProto.name`` in the graph,
+ * in graph node order -- regardless of whether its shapes are static enough
+ * for ``readConvNodeInfo`` to actually read (a caller finds that out, with a
+ * clear error, only once it tries to tune a specific one). This is the
+ * "what could I offer to tune" list: unlike ``readConvNodeInfo``, it doesn't
+ * require the node to already carry any attached kernel metadata --
+ * onnxsim's own kernel-tuning UI uses this to offer a "Tune this kernel"
+ * button for every Conv node a model has, not just ones
+ * onnxsim.webgpu_target already flagged as a gap.
+ *
+ * A node with no name (onnx.parser-built graphs, or third-party exports that
+ * skip naming) is included as an empty string like any other -- the same
+ * "every onnxsim-produced node has a name" caveat readConvNodeInfo's own
+ * caller has to handle applies here too.
+ *
+ * @param {Uint8Array} modelBytes
+ * @returns {string[]}
+ */
+export function listConvNodeNames(modelBytes) {
+  const r = new Reader(modelBytes);
+  let graph = null;
+  while (!r.eof()) {
+    const { field, wireType } = r.readTag();
+    if (field === 7 && wireType === WIRE_LEN) {
+      graph = readGraph(r.readLenDelimited());
+    } else {
+      r.skip(wireType);
+    }
+  }
+  if (!graph) return [];
+  return graph.nodes
+    .filter((n) => (n.domain === "" || n.domain === "ai.onnx") && n.opType === "Conv")
+    .map((n) => n.name);
+}
+
+/**
  * Reads everything ``onnxsim.webgpu_tinygrad_codegen.generate_conv_kernel``
  * itself reads off a ``Conv`` node -- shapes (initializer or graph-input
  * only, see this file's own docstring), attributes (with the same defaults
