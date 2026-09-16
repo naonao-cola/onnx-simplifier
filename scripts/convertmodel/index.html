@@ -40,6 +40,7 @@
             <a href="#sec-parse">Parse graph</a>
             <a href="#sec-convert">Convert</a>
             <a href="#sec-quantize">Quantize</a>
+            <a href="#sec-edgeai">Edge AI (TIDL)</a>
             <a href="#sec-qat">Fine-tune (QAT)</a>
             <a href="#sec-lora">Fine-tune (LoRA)</a>
             <a href="#sec-bias-correction">Correct bias</a>
@@ -465,6 +466,65 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         </div>
         <script type="module" src="./quantize_ui.mjs"></script>
         <script type="module" src="./quantize_risk_estimate.mjs"></script>
+        <h2 id="sec-edgeai">Check Edge AI (TI TIDL) compatibility</h2>
+        <div class="tool-panel">
+            <p class="tool-note">
+                Checks a model against a static, offline heuristic for
+                <a href="https://github.com/TexasInstruments/edgeai-tidl-tools" target="_blank" rel="noopener">TI's TIDL</a>
+                (the inference engine for the C7x-MMA accelerator on
+                Jacinto/Sitara SoCs), entirely in your browser — nothing is
+                uploaded. Ported from
+                <a href="https://github.com/onnxsim/onnxsim/blob/master/scripts/edgeai/tidl_ops.py" target="_blank" rel="noopener">scripts/edgeai/tidl_ops.py</a>,
+                checked against edgeai-tidl-tools' own published
+                <code>docs/operators.md</code> — control flow
+                (<code>If</code>/<code>Loop</code>/<code>Scan</code>),
+                <code>Sequence</code>/<code>Optional</code> ops,
+                <code>NonMaxSuppression</code> (host-only), QOperator-format
+                quantized ops (<code>QLinearConv</code> and friends — TIDL
+                only supports the QDQ form), and any input with a dynamic
+                (symbolic or unranked) shape. This is a heuristic, not a
+                real compile — see the note below the report.
+            </p>
+            <div class="convert-modes">
+                <input type="radio" name="edgeai-tidl-source" value="original" id="edgeai_tidl_source_original" checked>
+                <label for="edgeai_tidl_source_original">Original upload</label>
+                <input type="radio" name="edgeai-tidl-source" value="converted" id="edgeai_tidl_source_converted">
+                <label for="edgeai_tidl_source_converted" title="Checks the Convert section's own simplify/optimize output, so it reflects what onnxsim actually produced rather than the raw upload. Run Simplify/Optimize above first.">onnxsim-simplified (Convert section result)</label>
+            </div>
+            <p class="tool-note">
+                Target precision (informational — TIDL's C7x-MMA runs
+                8-bit or 16-bit fixed-point, or a per-layer mix of the two;
+                there is no lower-precision mode, and this selector does
+                not change the check above):
+            </p>
+            <select id="edgeai-tidl-precision">
+                <option value="int8" selected>8-bit (default)</option>
+                <option value="int16">16-bit</option>
+                <option value="mixed">Mixed 8/16-bit</option>
+            </select>
+            <div id="edgeai-tidl-precision-note"></div>
+            <p class="tool-note">
+                To produce a QDQ-quantized model matching TIDL's documented
+                per-layer scheme (per-channel symmetric weights, per-tensor
+                activations), use the <b>Static (QDQ)</b> method in the
+                Quantize section above — the same
+                <code>onnxsim.calibration.quantize_static</code> this
+                page's WASM module runs.
+                <a href="https://github.com/onnxsim/onnxsim/blob/master/scripts/edgeai/quantize_for_tidl.py" target="_blank" rel="noopener">scripts/edgeai/quantize_for_tidl.py</a>
+                checks that match on the Python side, and its docstring
+                records a real, reproduced TIDL compiler crash on that
+                exact QDQ output via
+                <code>advanced_options:prequantized_model=1</code> — so
+                treat that output as inspection-only for now, not something
+                confirmed to compile.
+            </p>
+            <div class="debug-actions">
+                <button id="edgeai-tidl-button" type="button">Check TIDL compatibility</button>
+                <span id="edgeai-tidl-status" class="tool-note"></span>
+            </div>
+            <div id="edgeai-tidl-result" style="display: none; margin-top: 0.4em;"></div>
+        </div>
+        <script type="module" src="./edgeai_tidl_ui.mjs"></script>
         <h2 id="sec-qat">Fine-tune a quantized model (QAT)</h2>
         <div class="tool-panel">
             <p class="tool-note">
