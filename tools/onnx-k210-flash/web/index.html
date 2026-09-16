@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>onnx-k210-flash</title>
+<style>
+  body { font-family: monospace; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  #log { white-space: pre-wrap; background: #111; color: #0f0; padding: 1rem; height: 260px; overflow-y: auto; }
+  .note { font-size: 0.9em; color: #555; }
+  button:disabled { opacity: 0.5; }
+</style>
+</head>
+<body>
+<h1>onnx-k210-flash</h1>
+<p class="note">
+  Flashes a firmware image to a Kendryte K210 board (M5StickV, Sipeed Maix
+  Amigo) over <a href="https://developer.chrome.com/docs/capabilities/serial" target="_blank" rel="noopener">Web Serial</a>,
+  using <code>k210_isp.mjs</code> -- a from-scratch port of
+  <a href="https://github.com/kendryte/kflash.py" target="_blank" rel="noopener">kflash.py</a>'s
+  ISP protocol. See <code>../README.md</code> for status (short version:
+  reviewed against kflash.py's source and unit-tested at the framing level,
+  <b>not yet run against a real board</b>).
+</p>
+<p class="note" id="serial-unsupported" style="display: none; color: #b00;">
+  This browser has no <code>navigator.serial</code> -- try Chrome or Edge
+  (desktop), 89+.
+</p>
+<div id="controls">
+  <label for="firmware-input">firmware .bin (plain binary, not .kfpkg)</label>
+  <input type="file" id="firmware-input" accept=".bin">
+  <br><br>
+  <label for="chip-type">flash location</label>
+  <select id="chip-type">
+    <option value="0" selected>in-chip (M5StickV / Maix Amigo)</option>
+    <option value="1">on-board (separate flash chip)</option>
+  </select>
+  <br><br>
+  <button id="flash-button" type="button">Connect and flash</button>
+</div>
+<div id="log"></div>
+
+<script type="module" src="./flash_ui.mjs"></script>
+</body>
+</html>

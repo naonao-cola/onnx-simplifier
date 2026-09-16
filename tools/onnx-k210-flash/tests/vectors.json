@@ -1,0 +1,16 @@
+{
+  "literal_greeting_hex": "c0c2000000000000000000000000c0",
+  "built_greeting_hex": "c0c200000000000000c0",
+  "greeting_matches_literal": false,
+  "boot_packet_hex": "c5000000fb6fc4d40000008000000000",
+  "boot_packet_slip_hex": "c0c5000000fb6fc4d40000008000000000c0",
+  "memwrite_packet_hex": "c30000000becb20e000000800400000001020304",
+  "memwrite_packet_slip_hex": "c0c30000000becb20e000000800400000001020304c0",
+  "crc32_empty": 0,
+  "crc32_123456789": 3421780262,
+  "crc32_quickfox": 1095738169,
+  "tricky_packet_hex": "c300000043a060b5c001db02c0db",
+  "tricky_packet_slip_hex": "c0c300000043a060b5dbdc01dbdd02dbdcdbddc0",
+  "sample_response_hex": "c2e0",
+  "debug_response_hex": "d1e068656c6c6f"
+}

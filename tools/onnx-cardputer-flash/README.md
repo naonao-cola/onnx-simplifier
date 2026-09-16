@@ -53,10 +53,12 @@ stale.
 ## Not done yet / follow-ups
 
 - A Sipeed Maix Amigo / M5StickV (Kendryte K210) target: same board family,
-  a real camera (Amigo) and better on-device inference (KPU), but no
-  existing Web Serial port of K210's ISP protocol (what `kflash.py` speaks)
-  — that would need writing from scratch, mirroring what `esptool-js` did
-  for ESP32.
+  a real camera (Amigo) and better on-device inference (KPU). The Web
+  Serial flasher this needed didn't exist anywhere, so it's now built —
+  see [`../onnx-k210-flash/`](../onnx-k210-flash/README.md) (a from-scratch
+  port of `kflash.py`'s ISP protocol). Still needs an onnx→kmodel
+  conversion script (nncase, not TFLite Micro) and a firmware recipe,
+  mirroring this tool's `scripts/`/`firmware/` — not done yet.
 - No CI coverage — nothing here can run without either a real board or a
   TensorFlow install this repo doesn't otherwise carry.
 - Vision models are out of scope for Cardputer specifically (no camera); an
