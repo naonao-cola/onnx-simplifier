@@ -239,3 +239,8 @@ node_modules/
 /.claude/
 scripts/axera/vm/share/
 tiny-random-mistral/
+
+# PlatformIO build output for the Cardputer/K210 firmware runtimes -- local
+# toolchain/library downloads and object files, not part of the repo.
+tools/onnx-cardputer-flash/firmware/runtime/.pio/
+tools/onnx-k210-flash/firmware/runtime/.pio/

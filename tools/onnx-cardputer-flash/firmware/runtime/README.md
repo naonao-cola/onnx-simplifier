@@ -8,26 +8,86 @@ no PlatformIO/compiler involved.
 
 ## Status
 
-**Compiled and linked for real** (this isn't a recipe someone still has to
-get working): built with PlatformIO against `esp32-s3-devkitc-1` +
-`framework = arduino`, linking `m5stack/M5Cardputer@1.1.1` and
-`spaziochirale/Chirale_TensorFLowLite@2.0.0`. Actual output:
+**Compiled, flashed, and booted on a real M5Stack Cardputer.** Built with
+PlatformIO against `esp32-s3-devkitc-1` + `framework = arduino`, linking
+`m5stack/M5Cardputer@1.1.1` and `spaziochirale/Chirale_TensorFLowLite@2.0.0`.
+Actual output:
 
 ```
 RAM:   40.2% (131672 / 327680 bytes)
-Flash: 24.2% (760961 / 3145728 bytes, the "factory" app partition)
+Flash: 24.2% (761105 / 3145728 bytes, the "factory" app partition)
 ```
 
-**Not run on real hardware.** No Cardputer is attached to the environment
-this was built in — the ELF links, sizes fit, and the merge step produces
-a well-formed image, but nobody has powered on a board with it yet. If you
-try it, the most likely failure points are: the DTR/RTS flashing sequence
-(`onnx-k210-flash` had a real bug here that only showed up against source;
-this ESP32 side reuses `esptool-js`, which is much better-trodden ground),
-the `tensor_arena` size (100KB default — `AllocateTensors()` fails loudly
-and tells you to raise it if a model needs more), and the mmap flash-mode
-match (`qio`, the `esp32-s3-devkitc-1` board profile's actual default —
-verified from that board's own PlatformIO manifest, not assumed).
+**Real-hardware finding #1 (fixed): the `esp32-s3-devkitc-1` board profile's
+default flash mode (`qio`) doesn't work on the Cardputer's actual flash
+chip.** Flashed as `qio`, the ROM bootloader loops forever
+(`ets_loader.c 78` → `TG0WDT_SYS_RST` → repeat) and never reaches app code
+-- it never gets past the ROM's own SPI flash read. Flashed as `dio`
+instead, the ROM loads the second-stage bootloader and app correctly. Fixed
+by `board_build.flash_mode = dio` in `platformio.ini`; `prebuilt/` and the
+rebuild recipe below are updated to match.
+
+**Real-hardware finding #2 (real bug, unfixed here): a legacy-quantized
+model's `DepthwiseConv` filter crashes `AllocateTensors()`.** Flashing
+Google's official `micro_speech` TinyConv reference model (from the
+`tensorflow-Micro-Speech-TinyConv-SpeechCommands-uint8-onnx` HF repo's own
+`source/model.tflite`, as a shortcut to get *some* real `.tflite` onto the
+board fast -- *not* run through this tool's own conversion) at `0x310000`
+causes a `Guru Meditation Error (StoreProhibited)` crash loop. Symbolized
+with `xtensa-esp32s3-elf-addr2line` against a matching build: the crash is
+`tflite::PopulateConvolutionQuantizationParams`
+(`Chirale_TensorFLowLite/src/tensorflow/lite/kernels/kernel_util.cpp:212`),
+called from `CalculateOpDataDepthwiseConv` while preparing the DepthwiseConv
+op inside `AllocateTensors()`. That function's per-axis-only overload does
+`reinterpret_cast<TfLiteAffineQuantization*>(filter->quantization.params)`
+and immediately dereferences `->scale->size` with **no null check** (the
+other overload right below it does `TF_LITE_ENSURE(context,
+affine_quantization)` first) -- it assumes every DepthwiseConv filter has
+per-channel affine quantization metadata attached. That old reference model
+predates per-channel affine quantization (legacy scalar scale/zero_point
+only, no `TfLiteAffineQuantization` struct), so `filter->quantization.params`
+is null and the dereference crashes. This is a real gap in the vendored
+`Chirale_TensorFLowLite` library, not something to patch in this repo (it's
+a separate PlatformIO dependency, not vendored here).
+
+**Real-hardware finding #3 (real bug, this tool's own script): `onnx2tf
+-oiqt` rejects an already-quantized ONNX input.** Running this tool's own
+`scripts/onnx_to_tflite_micro.py` (`convert_to_tflite()`, which always
+passes `-oiqt` by default) against that same HF repo's `model.onnx` fails:
+`-oiqt` is onnx2tf's own float->int8 calibration flow, which requires a
+Float32 graph input; this particular ONNX model is *already*
+uint8-quantized (QuantizeLinear/DequantizeLinear baked in from its original
+export), so its input is `uint8`, not `float32`, and onnx2tf errors out
+before producing anything. `--no-int8` (skip `-oiqt`, keep onnx2tf's plain
+Float32 output) works around it -- see "Confirmed end-to-end" below. This
+script doesn't currently detect or handle already-quantized ONNX inputs;
+treat `-oiqt` as verified only for models that are still Float32 going in.
+
+**Real-hardware finding #4 (real bug, unfixed here): the sanity `Invoke()`
+call fails even after a clean `AllocateTensors()`.** The Float32 `.tflite`
+produced by the `--no-int8` workaround above (71232 bytes, from the same HF
+model) flashed at `0x310000`, booted with no crash, and the Cardputer's own
+screen showed `model loaded ok` plus its input/output shape dump -- real
+proof the flash-partition-mmap -> `TFL3` detection -> `tflite::GetModel()`
+-> `AllOpsResolver` -> `MicroInterpreter::AllocateTensors()` chain works
+end to end on real hardware (float32 kernels don't call
+`PopulateConvolutionQuantizationParams`, so this doesn't retest finding #2).
+But the very next step, `interpreter->Invoke()` over a zeroed input
+(`main.cpp`'s deliberately minimal sanity check), printed `test inference:
+FAILED` -- `Invoke()` returned a non-`kTfLiteOk` status. Not yet
+root-caused: candidates are the all-zero input being out of a range some op
+in this graph doesn't handle (this model's real input is MFCC audio
+features, not raw zeros), or a real kernel bug for one of this graph's ops
+in this TFLM version's float32 path. A per-channel int8-quantized model
+(fixing finding #3) also still hasn't cleared `AllocateTensors()` on real
+hardware, so neither quantized nor float inference has been proven to
+produce a *correct* result end to end yet -- only that the pipeline can
+load and attempt to run a real model without crashing.
+
+The `tensor_arena` size (100KB default) is untested against a model that
+actually needs meaningfully more than this one did -- `AllocateTensors()`
+fails loudly and tells you to raise it if a model needs more, but no model
+has gotten that far yet.
 
 ## How it works
 
@@ -84,11 +144,16 @@ pip install platformio   # if you don't have it
 cd tools/onnx-cardputer-flash/firmware/runtime
 pio run
 python3 -m esptool --chip esp32s3 merge_bin -o cardputer-runtime.bin \
-    --flash_mode qio --flash_freq 80m --flash_size 8MB \
+    --flash_mode dio --flash_freq 80m --flash_size 8MB \
     0x0     .pio/build/cardputer/bootloader.bin \
     0x8000  .pio/build/cardputer/partitions.bin \
     0x10000 .pio/build/cardputer/firmware.bin
 ```
 
+`--flash_mode dio`, not the board profile's default `qio` -- see "Status"
+above (real-hardware finding #1). `board_build.flash_mode = dio` in
+`platformio.ini` makes `pio run` itself build the right thing; the `merge_bin`
+step needs the same flag repeated since it stamps its own image header.
+
 `sha256sum` of the committed `prebuilt/cardputer-runtime.bin`:
-`fd8c4cd46b850fcf63e0a6fe630230a0b02233f8ddac15be5e25a6eaa2cc6585`
+`e22990fe84bd37dd7399f47dec896b28a8f96a5b4ca6999b28703114cbdc9b24`
