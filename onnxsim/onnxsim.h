@@ -20,6 +20,7 @@
 // two independently-edited copies of the same type ever drifting apart.
 #include "adaround_entry.h"
 #include "awq_entry.h"
+#include "daq_entry.h"
 #include "gptq_entry.h"
 #include "gptvq_entry.h"
 #include "imatrix_quant_entry.h"
@@ -766,6 +767,121 @@ onnx::ModelProto ApplyFp6Llm(const onnx::ModelProto& model);
 // ``apply_gguf_q6_k_quantization`` are independently-correct,
 // non-interchangeable entry points, not aliases.
 onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
+
+// AngelSlim's LeptoQuant -- C++ port of leptoquant.py's own
+// apply_leptoquant: DeepSeek-V3-style 128x128-block FP8 E4M3 weight
+// quantization, refined by a 5-point outlier-fraction grid search per
+// tile. See passes/leptoquant.h for the exact reconstruction formula.
+// ACCEPTED, PERMANENT DIVERGENCE from apply_leptoquant: this scheme's own
+// grid search is closed-form/deterministic, so this port is expected to
+// track the Python port's own float64 numpy implementation closely, up
+// to floating-point summation-order/quantile-interpolation differences.
+// ApplyLeptoquant and its _cpp Python wrapper and apply_leptoquant remain
+// independently-correct, non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyLeptoquant(const onnx::ModelProto& model);
+
+// bitsandbytes' NF4 (NormalFloat 4-bit) weight-only quantization -- C++
+// port of nf4.py's own quantize_weight_only_nf4: a fixed, 16-value,
+// zero-symmetric non-uniform codebook, one scale per 64-element
+// (output-channel, K-block) group. See passes/nf4.h for the exact
+// reconstruction formula. Unlike quantize_weight_only_nf4, this port
+// folds the round trip directly into a replacement float32 initializer
+// rather than building it out of Gather/Reshape/Mul graph nodes.
+// ACCEPTED, PERMANENT DIVERGENCE from quantize_weight_only_nf4: no
+// accumulation step, so this port is expected to track the Python port's
+// own float64 numpy implementation closely, up to floating-point
+// summation-order/argmin tie-breaking differences. ApplyNF4 and its _cpp
+// Python wrapper and quantize_weight_only_nf4 remain independently-
+// correct, non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyNF4(const onnx::ModelProto& model);
+
+// IF4 (Adaptive Block-Scaled Data Types) -- C++ port of
+// if4_quantization.py's own quantize_weight_only_if4: per
+// (output-channel, 16-element K-block), tries both a plain signed INT4
+// grid and MXFP4's own E2M1 codebook and keeps whichever reconstructs
+// that block with lower MSE. See passes/if4_quantization.h for the exact
+// reconstruction formula. Unlike quantize_weight_only_if4, this port
+// folds the round trip directly into a replacement float32 initializer
+// rather than building it out of Cast/Gather/Reshape/Mul graph nodes.
+// ACCEPTED, PERMANENT DIVERGENCE from quantize_weight_only_if4: no
+// accumulation step, so this port is expected to track the Python port's
+// own float64 numpy implementation closely, up to floating-point
+// summation-order differences. ApplyIF4 and its _cpp Python wrapper and
+// quantize_weight_only_if4 remain independently-correct, non-
+// interchangeable entry points, not aliases.
+onnx::ModelProto ApplyIF4(const onnx::ModelProto& model);
+
+// NVIDIA's NVFP4 weight-only quantization -- C++ port of
+// nvfp4_quantization.py's own quantize_weight_only_nvfp4: shares OCP
+// MXFP4's E2M1 element codebook but replaces its power-of-two-only block
+// scale with a two-level (per-tensor global scale, E4M3-rounded
+// per-block scale) rule. See passes/nvfp4_quantization.h for the exact
+// reconstruction formula; the graph shape (Cast/Gather/Reshape/Mul) is
+// identical to weight_only_quantize_mxfp4_matmul.h's own, matching this
+// repo's own established representation for a real, hardware-meaningful
+// microscaling format. ACCEPTED, PERMANENT DIVERGENCE from
+// quantize_weight_only_nvfp4: no accumulation step, so this port is
+// expected to track the Python port's own float64 numpy implementation
+// closely, up to floating-point summation-order differences.
+// ApplyNVFP4Quantization and its _cpp Python wrapper and
+// quantize_weight_only_nvfp4 remain independently-correct, non-
+// interchangeable entry points, not aliases.
+onnx::ModelProto ApplyNVFP4Quantization(const onnx::ModelProto& model);
+
+// DeepSeek-V3-style fine-grained block FP8 weight quantization -- C++
+// port of the *weight* half of deepseek_fp8.py's own apply_deepseek_fp8:
+// one real FLOAT8E4M3FN round trip per 128x128 output-channel x
+// input-feature tile. See passes/deepseek_fp8.h for the exact
+// reconstruction formula and its own scope-narrowing note (the
+// activation-quantization/W8A8 half of apply_deepseek_fp8 is out of
+// scope for this port entirely). ApplyDeepSeekFp8 and its _cpp Python
+// wrapper and apply_deepseek_fp8 remain independently-correct, non-
+// interchangeable entry points, not aliases -- though unlike most
+// sibling *_cpp ports here, both directions are a real, fully-specified
+// FP8 cast with no encoder ambiguity, so this port is expected to track
+// deepseek_fp8.py's own quantize_dequantize_block_fp8 unusually closely.
+onnx::ModelProto ApplyDeepSeekFp8(const onnx::ModelProto& model);
+
+// K-means per-layer codebook weight quantization (Han et al., 2015,
+// "Deep Compression") -- C++ port of kmeans_quantization.py's own
+// quantize_weight_only_kmeans: a 16-centroid codebook fit per layer via
+// Lloyd's algorithm, directly to that layer's own weight values. See
+// passes/kmeans_quantization.h for the exact algorithm and its own
+// documented narrow-edge-case divergence (the too-few-distinct-
+// percentiles initialization fallback). Unlike quantize_weight_only_
+// kmeans, this port folds the round trip directly into a replacement
+// float32 initializer rather than building it out of Cast/Gather graph
+// nodes. ApplyKMeansQuantization and its _cpp Python wrapper and
+// quantize_weight_only_kmeans remain independently-correct, non-
+// interchangeable entry points, not aliases.
+onnx::ModelProto ApplyKMeansQuantization(const onnx::ModelProto& model);
+
+// HQQ -- Half-Quadratic Quantization (Badri & Shaji, 2023) -- C++ port
+// of hqq.py's own quantize_weight_only_int4_hqq: an asymmetric affine
+// INT4 quantizer whose zero-point is refined per (output-channel,
+// 32-element K-block) group by a bounded (10-step) Iteratively
+// Reweighted Least Squares (IRLS) fit. See passes/hqq.h for the exact
+// reconstruction formula. Unlike quantize_weight_only_int4_hqq, this
+// port folds the round trip directly into a replacement float32
+// initializer rather than building a real DequantizeLinear node with
+// packed UINT4 codes. ACCEPTED, PERMANENT DIVERGENCE from
+// quantize_weight_only_int4_hqq: IRLS here is a deterministic
+// fixed-point iteration with no RNG, so this port is expected to track
+// the Python port's own float64 numpy implementation closely, up to
+// floating-point summation-order differences. ApplyHQQ and its _cpp
+// Python wrapper and quantize_weight_only_int4_hqq remain independently-
+// correct, non-interchangeable entry points, not aliases.
+onnx::ModelProto ApplyHQQ(const onnx::ModelProto& model);
+
+// DAQ (Delta-Aware Quantization) -- C++ port of daq.py's own apply_daq,
+// declared in daq_entry.h (included above) rather than duplicated here.
+// Unlike every other port in this file, DAQ is data-free but still takes
+// two full ModelProto arguments (a base and a fine-tuned checkpoint,
+// matched by node output name) -- the same two-model correspondence
+// assumption ApplyGptq/ApplyQronos make, minus their ModelExecutor/
+// calibration_data. See daq_entry.h for the full rationale, the exact
+// coarse-to-fine FP8 scale search, and its own ACCEPTED, PERMANENT
+// DIVERGENCE note.
 
 // llama.cpp's "importance matrix" (imatrix) -- C++ port of
 // imatrix_quant.py's own apply_imatrix_quantization, declared in

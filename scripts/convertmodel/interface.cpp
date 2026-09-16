@@ -2222,6 +2222,135 @@ em::val onnxsim_apply_gguf_q6_k(const std::string &data) {
   }
 }
 
+em::val onnxsim_apply_leptoquant(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyLeptoquant(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_leptoquant error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_quantize_weight_only_nf4(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyNF4(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_weight_only_nf4 error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_quantize_weight_only_if4(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyIF4(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_weight_only_if4 error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_quantize_weight_only_nvfp4(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyNVFP4Quantization(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_weight_only_nvfp4 error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_deepseek_fp8(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyDeepSeekFp8(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_deepseek_fp8 error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_kmeans_quantization(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyKMeansQuantization(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_kmeans_quantization error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_hqq(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyHQQ(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_hqq error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+// DAQ is data-free but still needs two full models (base + fine-tuned,
+// matched by node output name) -- the same two-model shape
+// onnxsim_list_correctable_outputs/onnxsim_apply_bias_corrections above
+// already use, minus any activation-probing arguments.
+em::val onnxsim_apply_daq(const std::string &base_data,
+                          const std::string &post_trained_data,
+                          const std::string &metric,
+                          em::val skip_names_ary) {
+  onnx::ModelProto base_model, post_trained_model;
+  if (!base_model.ParseFromArray(base_data.data(), base_data.size()) ||
+      !post_trained_model.ParseFromArray(post_trained_data.data(),
+                                         post_trained_data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  std::unordered_set<std::string> skip_names;
+  if (!skip_names_ary.isUndefined() && !skip_names_ary.isNull()) {
+    for (const auto &name :
+        em::vecFromJSArray<std::string>(skip_names_ary)) {
+      skip_names.insert(name);
+    }
+  }
+  try {
+    return SerializeModel(
+        ApplyDaq(base_model, post_trained_model, metric, skip_names));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_daq error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // An absent (undefined/null) `n`/`m` is "not given" (unstructured sparsity,
 // ranked by `sparsity`); a present number must be given together with the
 // other one (N:M semi-structured) -- mirroring prune_magnitude_cpp's own
@@ -3213,6 +3342,18 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_apply_gguf_ternary", &onnxsim_apply_gguf_ternary);
   function("onnxsim_apply_fp6_llm", &onnxsim_apply_fp6_llm);
   function("onnxsim_apply_gguf_q6_k", &onnxsim_apply_gguf_q6_k);
+  function("onnxsim_apply_leptoquant", &onnxsim_apply_leptoquant);
+  function("onnxsim_quantize_weight_only_nf4",
+           &onnxsim_quantize_weight_only_nf4);
+  function("onnxsim_quantize_weight_only_if4",
+           &onnxsim_quantize_weight_only_if4);
+  function("onnxsim_quantize_weight_only_nvfp4",
+           &onnxsim_quantize_weight_only_nvfp4);
+  function("onnxsim_apply_deepseek_fp8", &onnxsim_apply_deepseek_fp8);
+  function("onnxsim_apply_kmeans_quantization",
+           &onnxsim_apply_kmeans_quantization);
+  function("onnxsim_apply_hqq", &onnxsim_apply_hqq);
+  function("onnxsim_apply_daq", &onnxsim_apply_daq);
   function("onnxsim_prune_magnitude", &onnxsim_prune_magnitude);
   function("onnxsim_apply_structured_pruning",
            &onnxsim_apply_structured_pruning);

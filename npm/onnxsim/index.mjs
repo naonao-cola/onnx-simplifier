@@ -225,6 +225,65 @@ export async function applyGgufQ6K(model) {
   return callModelPass("onnxsim_apply_gguf_q6_k", model);
 }
 
+/** AngelSlim's LeptoQuant outlier-aware block FP8 weight quantization. */
+export async function applyLeptoquant(model) {
+  return callModelPass("onnxsim_apply_leptoquant", model);
+}
+
+/** bitsandbytes' NF4 weight-only quantization. */
+export async function quantizeWeightOnlyNf4(model) {
+  return callModelPass("onnxsim_quantize_weight_only_nf4", model);
+}
+
+/** IF4 (per-block INT4/FP4 choice) weight-only quantization. */
+export async function quantizeWeightOnlyIf4(model) {
+  return callModelPass("onnxsim_quantize_weight_only_if4", model);
+}
+
+/** NVIDIA's NVFP4 weight-only quantization. */
+export async function quantizeWeightOnlyNvfp4(model) {
+  return callModelPass("onnxsim_quantize_weight_only_nvfp4", model);
+}
+
+/** DeepSeek-V3-style block FP8 weight quantization (weight side only). */
+export async function applyDeepseekFp8(model) {
+  return callModelPass("onnxsim_apply_deepseek_fp8", model);
+}
+
+/** K-means per-layer codebook weight quantization. */
+export async function applyKmeansQuantization(model) {
+  return callModelPass("onnxsim_apply_kmeans_quantization", model);
+}
+
+/** HQQ (Half-Quadratic Quantization) weight-only quantization. */
+export async function applyHqq(model) {
+  return callModelPass("onnxsim_apply_hqq", model);
+}
+
+/**
+ * DAQ (Delta-Aware Quantization): unlike every other data-free pass
+ * above, this needs TWO models (a base and a fine-tuned checkpoint,
+ * matched by node output name), so it does not go through
+ * callModelPass's own single-model convenience wrapper.
+ */
+export async function applyDaq(baseModel, postTrainedModel, { metric = "cosine", skipNames } = {}) {
+  const baseBytes = toBytes(baseModel);
+  const postBytes = toBytes(postTrainedModel);
+  const runtime = await getRuntime();
+  const fn = runtime.onnxsim_apply_daq;
+  if (typeof fn !== "function") {
+    throw new Error("onnxsim: this build has no export 'onnxsim_apply_daq' (rebuild the wasm module?)");
+  }
+  let result = fn(baseBytes, postBytes, metric, skipNames);
+  if (result && typeof result.then === "function") {
+    result = await result;
+  }
+  if (!result) {
+    throw new Error("onnxsim: onnxsim_apply_daq failed (see stderr output for details)");
+  }
+  return new Uint8Array(result);
+}
+
 /**
  * Magnitude pruning (unstructured, or N:M when both `n` and `m` are given).
  * `globalSparsity` pools every layer into one whole-model ranking.
@@ -836,6 +895,14 @@ export default {
   applyGgufTernary,
   applyFp6Llm,
   applyGgufQ6K,
+  applyLeptoquant,
+  quantizeWeightOnlyNf4,
+  quantizeWeightOnlyIf4,
+  quantizeWeightOnlyNvfp4,
+  applyDeepseekFp8,
+  applyKmeansQuantization,
+  applyHqq,
+  applyDaq,
   pruneMagnitude,
   applyStructuredPruning,
   applyAttentionHeadPruning,

@@ -1625,6 +1625,154 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // AngelSlim's LeptoQuant: outlier-aware block FP8 weight quantization,
+  // one FLOAT8E4M3FN scale per 128x128 tile, grid-searched over an
+  // outlier fraction. Data-free. See ApplyLeptoquant in onnxsim.h.
+  m.def(
+      "apply_leptoquant",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyLeptoquant(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // bitsandbytes' NF4: weight-only quantization with a fixed 16-value
+  // non-uniform codebook, one scale per 64-element (output-channel,
+  // K-block) group. Data-free. See ApplyNF4 in onnxsim.h.
+  m.def(
+      "quantize_weight_only_nf4",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyNF4(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // IF4: per (output-channel, 16-element K-block) choice between a plain
+  // INT4 grid and MXFP4's own E2M1 codebook, whichever reconstructs that
+  // block with lower MSE. Data-free. See ApplyIF4 in onnxsim.h.
+  m.def(
+      "quantize_weight_only_if4",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyIF4(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // NVIDIA's NVFP4: shares MXFP4's E2M1 codebook, with a two-level
+  // (per-tensor global scale, E4M3-rounded per-block scale) rule.
+  // Data-free. See ApplyNVFP4Quantization in onnxsim.h.
+  m.def(
+      "quantize_weight_only_nvfp4",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyNVFP4Quantization(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // DeepSeek-V3-style fine-grained block FP8 weight quantization: one
+  // real FLOAT8E4M3FN round trip per 128x128 tile. Weight side only --
+  // see ApplyDeepSeekFp8 in onnxsim.h for the activation-quantization
+  // scope-narrowing note. Data-free.
+  m.def(
+      "apply_deepseek_fp8",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyDeepSeekFp8(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // K-means per-layer codebook weight quantization (Han et al., 2015,
+  // "Deep Compression"): a 16-centroid codebook fit per layer via
+  // Lloyd's algorithm. Data-free. See ApplyKMeansQuantization in
+  // onnxsim.h.
+  m.def(
+      "apply_kmeans_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyKMeansQuantization(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // HQQ (Half-Quadratic Quantization): asymmetric affine INT4 with an
+  // IRLS-refined zero-point per (output-channel, 32-element K-block)
+  // group. Data-free. See ApplyHQQ in onnxsim.h.
+  m.def(
+      "apply_hqq",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyHQQ(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // DAQ (Delta-Aware Quantization): data-free, but takes two full model
+  // byte buffers (a base and a fine-tuned checkpoint, matched by node
+  // output name) rather than one -- see ApplyDaq in daq_entry.h.
+  m.def(
+      "apply_daq",
+      [](const py::bytes& base_model_bytes,
+         const py::bytes& post_trained_model_bytes, const std::string& metric,
+         const std::vector<std::string>& skip_names) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto base_model;
+        ParseProtoFromBytes(&base_model, base_model_bytes.c_str(),
+                            base_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto post_trained_model;
+        ParseProtoFromBytes(&post_trained_model,
+                            post_trained_model_bytes.c_str(),
+                            post_trained_model_bytes.size());
+        const std::unordered_set<std::string> skip_names_set(skip_names.begin(),
+                                                             skip_names.end());
+        const auto result =
+            ApplyDaq(base_model, post_trained_model, metric, skip_names_set);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "base_model_bytes"_a, "post_trained_model_bytes"_a, "metric"_a = "cosine",
+      "skip_names"_a = std::vector<std::string>{});
+
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
   m.def(
