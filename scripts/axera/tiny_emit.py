@@ -29,6 +29,22 @@ Neg does, via ``emit_neg``) -- see each function's own docstring and
 tests/test_axera_tiny_emit.py for what tracing alone does and doesn't
 give you.
 
+``patch_site_a`` and ``patch_matmul_a_scale`` (2026-09) generalize the
+site-A idea beyond Mul, to Gemm/Conv and MatMul's own operands -- the
+first mcode *generation* work built directly on this project's later,
+much larger decode effort (site A's cross-op generalization, and
+MatMul's exact short/full-form switching rule). See
+tests/test_axera_sitea_generator.py for what's verified (byte-exact
+against real target builds, both directions of MatMul's same-form
+case) and, just as importantly, what's refused and why: a form-crossing
+MatMul ``A`` edit is not a local patch -- a controlled build pair
+(same ``B`` seed, same table order) shows it reflows 201 bytes across
+the stream, not just the quad's own footprint. That refusal is the
+general shape of why most of this project's later shape-derived
+decode findings (Gemm's ``K*M-1`` field, Conv's dilation/orientation
+fields) are *understood* but not yet *generatable*: knowing a field's
+value is not the same as knowing it's safe to write in place.
+
 ``patch_mul_scales`` extends the same reference-patch idea to two-input
 Mul streams' input side (sites A/C/B -- see
 tests/test_axera_mcode_reciprocal.py for the field map): given the
@@ -458,6 +474,135 @@ def patch_output_quad(
     out = bytearray(reference_mcode)
     for off in hits:
         out[off : off + 4] = new_pat
+    return bytes(out)
+
+
+def patch_site_a(
+    reference_mcode: bytes, old_x_scale: float, new_x_scale: float
+) -> bytes:
+    """Rewrite site A's full-form quad by value -- the generalized-op
+    counterpart of ``patch_mul_scales``'s own site-A edit.
+
+    Site A (``<f32(1/x_scale)> a1 00 <id>`` x4, stride 8) was confirmed
+    full-form-only for Gemm and Conv, and for MatMul's ``B`` operand, in
+    ``tests/test_axera_site_a_generalizes.py`` (merged). This function is
+    literally the same value-only, framing-agnostic edit
+    ``patch_mul_scales``'s own ``locate(1/old_x, 1/new_x, 8)`` call
+    already performs for Mul's site A -- that call never checked the
+    ``a1 00 <id>`` suffix either, so no new framing logic is needed here,
+    only a standalone entry point for ops that have no output-side
+    scale/y-operand to patch alongside it.
+
+    Does not apply to MatMul's ``A`` operand -- see ``patch_matmul_a_scale``
+    for why that one needs its own function.
+    """
+    old_pat = struct.pack("<f", float(1.0 / old_x_scale))
+    new_pat = struct.pack("<f", float(1.0 / new_x_scale))
+    hits = _strided_run(reference_mcode, old_pat, 8)
+    out = bytearray(reference_mcode)
+    for off in hits:
+        out[off : off + 4] = new_pat
+    return bytes(out)
+
+
+def matmul_a_quad_form(a_scale: float) -> str:
+    """Which encoding MatMul's rank-3 batched ``A`` quad uses for this
+    scale, per the closed-form rule in
+    ``tests/test_axera_matmul_quad_form_switch.py`` (merged): the short
+    3-byte-truncated form is used exactly when ``1/a_scale``'s float32
+    representation has high byte ``0x42`` (the value lies in
+    ``[32, 128)``); any other high byte forces the full 4-byte form.
+    Returns ``"short"`` or ``"full"``. This is the general IEEE754 fact
+    (one high byte covers two consecutive power-of-two exponent groups),
+    but the *codec's* choice of ``0x42`` as its one implied-default byte
+    was only ever confirmed for values landing in that specific
+    ``[32,128)`` window -- other high bytes are assumed (not verified
+    against real hardware here) to all fall back to the full form, since
+    that is the only fallback this project has ever observed.
+    """
+    high_byte = struct.pack("<f", float(1.0 / a_scale))[3]
+    return "short" if high_byte == 0x42 else "full"
+
+
+def patch_matmul_a_scale(
+    reference_mcode: bytes, old_a_scale: float, new_a_scale: float
+) -> bytes:
+    """Rewrite MatMul's rank-3 batched ``A`` quad by value -- but only
+    within one encoding form; refuses a form-crossing edit outright.
+
+    Same-form edits (old and new scale's ``1/scale`` share a float32 high
+    byte, so ``matmul_a_quad_form`` agrees on both) are a plain value
+    patch, mirroring ``patch_site_a``: short form is ``<3 bytes,
+    low(1/a_scale)> 82 <var> <02|83>`` x4 at stride 6 (the last copy's
+    tail byte is ``0x83`` instead of ``0x02`` -- both are accepted and
+    each preserved as-is, since the tag/var bytes are not this function's
+    job); full form is ``<f32(1/a_scale)> 81 <var>`` x4 at stride 7.
+
+    A form-crossing edit -- e.g. patching a short-form reference to a
+    target scale whose ``1/scale`` needs the full form, or vice versa --
+    is refused with ``ValueError`` rather than attempted. This was tested
+    directly, not assumed: a controlled pair (identical ``B`` calibration
+    seed, identical mcode length 3336 bytes both ways, identical
+    ``A_offset``/``B_offset`` table order -- ruling out both of this
+    project's two known confounds, per
+    ``tests/test_axera_matmul_offset_table_coinflip.py`` -- differing
+    *only* in whether ``A``'s scale crosses the ``0x42``/``0x43``
+    boundary) shows 201 bytes differ, spanning offset 785 to 2896, not
+    just the quad's own ~28-36 byte footprint. One concrete piece of that
+    footprint: a little-endian u32 count/length field at offset 2896
+    reads 1060 in the short-form build and 1064 in the full-form build --
+    exactly the difference between the short form's stride-6 x4 = 24-byte
+    footprint and the full form's stride-7 x4 = 28-byte footprint. The
+    extra 4 bytes the full form needs are drawn from elsewhere in the
+    stream (that count field, plus a real content change at offset
+    785-802), not local padding -- so despite the *total* stream length
+    coincidentally staying equal in this pair, the edit is not a local
+    swap and this function does not attempt it.
+    """
+    old_form = matmul_a_quad_form(old_a_scale)
+    new_form = matmul_a_quad_form(new_a_scale)
+    if old_form != new_form:
+        raise ValueError(
+            f"cannot patch MatMul A's quad from {old_a_scale!r} ({old_form} form)"
+            f" to {new_a_scale!r} ({new_form} form): a form-crossing edit changes"
+            " the quad's own byte width (24 vs 28 bytes total) and reflows at"
+            " least 201 bytes elsewhere in the stream (offsets 785-2896 in a"
+            " controlled test pair) -- not a local patch. Choose a target scale"
+            " on the same side of the 0x42/0x43 float32-high-byte boundary as"
+            " the reference, or recompile with Pulsar2."
+        )
+    if old_form == "full":
+        old_pat = struct.pack("<f", float(1.0 / old_a_scale))
+        new_pat = struct.pack("<f", float(1.0 / new_a_scale))
+        hits = _strided_run(reference_mcode, old_pat, 7)
+        out = bytearray(reference_mcode)
+        for off in hits:
+            out[off : off + 4] = new_pat
+        return bytes(out)
+    old_pat = struct.pack("<f", float(1.0 / old_a_scale))[:3]
+    new_pat = struct.pack("<f", float(1.0 / new_a_scale))[:3]
+    hits = [
+        i
+        for i in range(len(reference_mcode) - 2)
+        if reference_mcode[i : i + 3] == old_pat
+    ]
+    run = []
+    for start in hits:
+        candidate = [start]
+        i = start + 6
+        while i in hits:
+            candidate.append(i)
+            i += 6
+        if len(candidate) == 4:
+            run = candidate
+            break
+    if len(run) != 4:
+        raise ValueError(
+            f"short-form A quad for {old_a_scale!r} not found as a stride-6 x4 run"
+        )
+    out = bytearray(reference_mcode)
+    for off in run:
+        out[off : off + 3] = new_pat
     return bytes(out)
 
 
