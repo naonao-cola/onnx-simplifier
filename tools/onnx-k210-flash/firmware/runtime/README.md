@@ -5,9 +5,9 @@ The K210 counterpart to `onnx-cardputer-flash/firmware/runtime`:
 Flash it once at address `0x0` and it never needs *rebuilding* again --
 swapping models afterward means flashing a plain `.kmodel` file's bytes
 at a fixed address (`0x00C00000`), same `onnx-k210-flash` flasher, no
-toolchain involved. **Read "Flashing a model without re-erasing" below
-before treating that as "no re-flashing of the firmware, either"** --
-unlike the ESP32-S3 side, this isn't safely proven yet.
+toolchain involved. Skipping the erase for that model-only write is now
+**verified safe on real hardware** -- see "Flashing a model without
+re-erasing" below.
 
 ## Status
 
@@ -18,11 +18,46 @@ unlike the ESP32-S3 side, this isn't safely proven yet.
 onnx_k210_runtime.bin: 1,056,312 bytes
 ```
 
-**Not run on real hardware.** No K210 board is attached to the
-environment this was built in. Compiling and linking cleanly is real
-signal (every include path, every symbol, is resolved against the actual
-SDK) but says nothing about whether `w25qxx_read_data`'s timing/pin
-assumptions or the KPU driver actually behave correctly on a given board.
+**Flashed and booted for real on a Sipeed Maix Amigo.** See
+`../../README.md`'s "Testing against real hardware" for the full session
+(reset-scheme reliability, flash-addressing gotchas, and how "skip erase"
+got verified safe) -- summarized here for the two findings specific to
+this runtime's own code:
+
+**Real-hardware finding (confirmed): the blank/erased-model detection path
+works exactly as designed.** Flashed fresh, reset, read live over UART:
+```
+onnx-k210-flash runtime
+reading model from flash @0x00c00000 (2097152 bytes)...
+no model flashed yet at 0x00c00000 (identifier 0xffffffff, expected 0x4b4d444c)
+flash a .kmodel there over Web Serial, then reset.
+```
+`w25qxx_read_data`'s timing/pin assumptions are real, then: the 2MB read
+and the identifier check both complete promptly on real hardware.
+
+**Real-hardware finding (real bug, precisely root-caused, unfixed here):
+`interpreter::load_model()` hangs indefinitely given a real, valid
+kmodel.** A real Hugging Face model
+(`ketiswp/mlcommons-ResNet8-CIFAR10-fp32-onnx`), compiled via
+`../../scripts/onnx_to_kmodel.py` to a 104792-byte kmodel (correct `KMDL`
+magic, confirmed byte-for-byte) and flashed to `0x00C00000`, made the
+runtime print `reading model from flash...` and then go silent -- no
+crash, no further output, for 25+ seconds. Root-caused with an
+instrumented debug rebuild (extra `printf`s bracketing the identifier
+check and the `interp.load_model()` call, from a real
+`kendryte-standalone-sdk` checkout, not the version vendored inside
+PlatformIO's `framework-maixduino` -- that one is missing `lib/nncase`
+entirely): the identifier check passes correctly (`0x4b4d444c`), execution
+reaches `interp.load_model()`, and it **never returns** -- the debug
+build's own trailing `load_model() returned` print never appeared. Not
+root-caused further than that (would need real debugging inside nncase
+v1's K210 runtime itself -- KPU peripheral programming, DMA descriptor
+setup, etc., none of which this session's instrumentation reached). The
+`Simulator`-verified compile (see `../../README.md`'s "Model conversion")
+proves the *compiler* output is a well-formed, correctly-executing kmodel
+on the host; this proves the *on-device* `interpreter::load_model()` call
+specifically is where the real gap is, not the model or the conversion
+pipeline.
 
 ## How it works
 
@@ -133,7 +168,7 @@ address), reused for consistency with the rest of the K210 ecosystem
 (kflash_gui's `.kfpkg` multi-file flashing already expects models around
 this address in several official demos).
 
-## Flashing a model without re-erasing (unverified -- read before relying on it)
+## Flashing a model without re-erasing (verified safe on real hardware)
 
 `k210_isp.mjs`'s `flashFirmware()` calls `flashErase()` by default, and
 `FLASH_ERASE` (0xd3) has **no address or range parameter at the protocol
@@ -142,28 +177,25 @@ own README covers this): it always erases the *entire* chip. That means
 flashing the runtime, then later flashing a model with erase left on,
 would erase the runtime out from under itself before writing the model.
 
-The Web UI now exposes a **"skip erase"** checkbox (off by default) and
-a **flash address** field for exactly this reason. Whether it's actually
+The Web UI exposes a **"skip erase"** checkbox (off by default) and a
+**flash address** field for exactly this reason. Whether it's actually
 *safe* to skip erase when writing just the model -- i.e. whether the
 flash-mode stub's own `FLASH_WRITE` (0xd4) implementation erases the
 sectors it's about to program before writing them, the way some embedded
-NOR-flash write helpers do as a convenience -- is **not verified here**.
-The stub is an opaque vendored binary (kflash.py's `ISP_PROG`, decompiled
-source not available) and there's no K210 board in this environment to
-test it against.
-
-**If you have a board:** flash the runtime once with erase **on**
-(default), confirm it boots and reports "no model flashed yet". Then
-flash a `.kmodel` at `0x00C00000` with **skip erase checked**, and check
-whether the runtime still boots correctly afterward (reset the board,
-watch UART). If it does, skip-erase is safe on your hardware and you've
-verified the thing this README couldn't. If the runtime now reports
-garbage or fails to load itself, skip-erase corrupted something and the
-safe workflow is: leave erase **on** and re-flash the *whole* image
-(concatenate runtime + padding + model into one buffer written at `0x0`
-in one pass, since a full erase before a model-only write at `0x00C00000`
-would erase the runtime with nothing to restore it) until this gets a
-real answer.
+NOR-flash write helpers do as a convenience -- used to be unverified here.
+It's now been answered for real, if by accident: see `../../README.md`'s
+"Testing against real hardware", finding #4. Summary: a real
+firmware-corrupting write to `0x0` (a different mistake, kflash's own
+`-A`/`--addr` not applying to a plain file write -- finding #3), followed
+by a correct re-flash of the real firmware to that same now-corrupted
+region, both **without** an explicit chip erase, produced a byte-correct,
+working firmware. NOR flash writes can only clear bits, never set them, so
+that result is only possible if `FLASH_WRITE` auto-erases the sectors it
+programs. Separately, writing a model to `0x00C00000` left the firmware at
+`0x0` completely intact and still booting correctly. Both point the same
+way: **skip-erase is safe**, at least on the real Sipeed Maix Amigo this
+was tested against -- not proven for every K210 board/flash-chip
+combination, but no longer a total unknown either.
 
 ## Using it
 

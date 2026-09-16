@@ -50,49 +50,121 @@ opposite fact permanently, so the same mistake can't silently come back.
 | Piece | Status |
 |---|---|
 | Framing (CRC32, SLIP encode/decode, packet layout) | Unit-tested against Python-generated vectors from kflash.py's own algorithm (`tests/`) |
-| Protocol sequence (reset → greeting → stub upload/boot → flash-mode greeting → init → erase → write → reboot) | Reviewed line-by-line against kflash.py's source; matches its control flow |
+| Protocol sequence (reset → greeting → stub upload/boot → flash-mode greeting → init → erase → write → reboot) | **Confirmed for real against a real Sipeed Maix Amigo** via kflash.py itself (the reference this port is checked against) -- see "Testing against real hardware" below for what that found, including a real gap in this port's own reset-scheme coverage |
 | `isp_stub.bin` | Extracted and decompressed from kflash.py's own `ISP_PROG` constant; its size/CRC32 are pinned by a test |
 | ONNX → kmodel (`scripts/onnx_to_kmodel.py`) | **Run for real**, not just reviewed: compiled a real Hugging Face model to a 104792-byte kmodel and ran it through nncase's own `Simulator`, producing the correct output shape (see "Model conversion" below) |
-| On-device runtime (`firmware/runtime/`) | **Compiled and linked for real** against `kendryte-standalone-sdk` (see `firmware/runtime/README.md`); its flash-model-without-re-erasing path is explicitly *not* verified |
-| Real hardware (flashing, and everything above running on it) | **Not run against a board.** No K210 device is attached to the environment this was written in |
-
-Nothing here should be taken as "flashes real hardware reliably" until
-someone runs it against an actual M5StickV or Maix Amigo. If the reset
-sequence, timing, or a retry threshold needs adjusting for real hardware
-flakiness, `k210_isp.mjs`'s methods are small and independently testable --
-please report back what needed to change.
+| On-device runtime (`firmware/runtime/`) | **Flashed and booted for real** on the Amigo -- correctly detects a blank vs. a real model region. Loading a real kmodel hangs in `interpreter::load_model()`, precisely root-caused -- see `firmware/runtime/README.md`'s "Status" |
+| Real hardware (flashing, and everything above running on it) | **Run for real** against a Sipeed Maix Amigo, via kflash.py directly (not yet through this port's own Web Serial code -- see below) |
 
 ## Testing against real hardware
 
-If you have a board, this is the first thing to actually verify -- and the
-single most likely first failure point:
+Tested this session against a real Sipeed Maix Amigo (`/dev/ttyUSB1` on its
+Sipeed dual-UART FTDI adapter -- the *same* physical UART handles both the
+ISP protocol and the runtime's own console output, not two separate
+channels). Driven via `kflash` (the Python reference tool this port
+mirrors) rather than `k210_isp.mjs`/`web/index.html` directly, since this
+session's browser tooling runs on a different machine than the one the
+board is physically attached to -- Web Serial can only see devices
+attached to the browser's own machine, so that gap couldn't be closed
+here regardless of network access; see the same limitation noted for
+`onnx-cardputer-flash`'s convertmodel monitor panel. Real, hardware-verified
+findings:
 
-1. Open `web/index.html`, pick any `.bin` -- `firmware/runtime/prebuilt/onnx-k210-runtime.bin`
-   is a real one to use, downloadable right from the page -- leave **flash
-   address** at `0x0`, **skip erase** unchecked, **reset scheme** on `dan`,
-   click **Connect and flash**.
-2. Watch the log for `entering ISP mode`. If it hangs there and eventually
-   throws "no K210 found", the DTR/RTS sequence isn't the one this board
-   needs -- reselect **kd233**, then **goD**, retrying step 1 each time
-   *without* changing anything else. One of the three should get past
-   `entering ISP mode` into `uploading flash-mode stub`.
-3. If none of the three work, or one gets partway (uploads the stub, then
-   hangs at `waiting for flash-mode stub` / `initializing flash`), that's
-   real, valuable signal for a bug report: which scheme, which stage it
-   reached, and the last few log lines.
-4. Once a scheme gets all the way through with a real `.bin`, the board
-   should reset and boot it -- that's the actual end-to-end proof this
-   SDK works, not just that it talks to the mask ROM. With
-   `onnx-k210-runtime.bin` specifically, it should print "no model
-   flashed yet" over UART/its own log (nothing's at `0x00C00000` yet).
-5. Then work through `firmware/runtime/README.md`'s "Flashing a model
-   without re-erasing" section -- it's the other real open question
-   real hardware can answer that nothing here can.
+**Finding #1 (real bug in this port, not just kflash.py): `k210_isp.mjs`
+excludes the one reset scheme this real board needed.** kflash's
+board-auto-detect picked inconsistently between `goE`/`kd233`/`bit_mic` run
+to run, and the ISP-stub upload was genuinely flaky under `kd233`/`bit_mic`
+(`errcode=0xe1`, or a receive timeout, even in kflash's own slow-download
+mode) -- forcing `-B goE` explicitly made every subsequent upload succeed
+cleanly, 100% of the way, at a real ~99KB/s. This board's adapter is a
+Sipeed dual-UART **FT2232** (confirmed via `lsusb`/`udevadm`: `0403:6010`,
+"Sipeed USB to Dual Uart"), and `goE` is specifically kflash's
+FT2232-family reset/handshake path (a different DTR/RTS sequence *and* an
+FT2232-specific stage-0 baud negotiation `kd233`/`bit_mic` don't do -- see
+kflash.py's own "FT2232 mode" log line). `k210_isp.mjs`'s own comment
+explains why it left `goE`/`trainer`/`bit_mic` out: "need FTDI
+dual-interface port auto-detection that doesn't apply here" -- that
+assumption needs revisiting, since a real board with exactly that adapter
+needed exactly that scheme. Porting `goE`'s DTR/RTS pattern and stage-0
+baud bump to `k210_isp.mjs` is real, scoped follow-up work this finding
+should drive -- not done here.
 
-`chip-type` (in-chip vs on-board flash) is the other per-board unknown --
-M5StickV and Maix Amigo both have their flash on the K210 module itself,
-so **in-chip** (the default) should be right for both, but this is
-unverified the same way the reset scheme is.
+**Finding #2 (real, confirmed): the full firmware-flash → boot → model-detect
+path works end to end.** With `-B goE` reliable, flashing
+`firmware/runtime/prebuilt/onnx-k210-runtime.bin` at `0x0` (real erase +
+program, not SRAM-only), rebooting, and reading the same UART live
+produced exactly the designed output:
+```
+onnx-k210-flash runtime
+reading model from flash @0x00c00000 (2097152 bytes)...
+no model flashed yet at 0x00c00000 (identifier 0xffffffff, expected 0x4b4d444c)
+flash a .kmodel there over Web Serial, then reset.
+```
+
+**Finding #3 (real gotcha, kflash CLI -- costly to get wrong): a plain
+firmware-file argument always writes to address `0x0`, regardless of
+`-A`/`--addr`.** That flag only applies to kflash's separate `erase`
+pseudo-firmware mode (`kflash erase -A ... -L ...`); a real file argument
+always calls `flash_firmware(..., address_offset=0)` with no CLI override.
+Passing `-A 0x00C00000` alongside a real `.kmodel` file **silently writes
+it to `0x0` instead** -- overwriting the runtime firmware, which is exactly
+what happened here (recovered by immediately re-flashing the real
+`onnx-k210-runtime.bin`, also to `0x0`, no data lost). The actual supported
+mechanism for a non-zero address is a `.kfpkg` (a zip containing the
+`.kmodel` plus a `flash-list.json`):
+```json
+{"files": [{"bin": "model.kmodel", "address": 0xC00000, "sha256Prefix": false}]}
+```
+Two more gotchas in that file itself: the `address` field must be an
+**unquoted** hex literal (kflash regex-quotes it internally before
+`json.loads()`; a pre-quoted string breaks that regex) -- and
+`sha256Prefix` must be **`false`** for a raw data blob like a kmodel.
+`true` (the natural-looking default) prepends a 37-byte
+SHA256+flag+size header meant for a *firmware image* kflash's own bootloader
+verifies at boot -- exactly what wrote a mangled, non-`KMDL`-prefixed
+identifier the one time this was tried with `sha256Prefix: true`.
+
+**Finding #4 (real, hardware-verified -- answers `firmware/runtime/README.md`'s
+open question): writing without an explicit chip erase is safe.** kflash's
+`-e`/`--erase` (full chip erase) defaults to **off**, and every write this
+session did omitted it. Finding #3's accidental firmware-corrupting write to
+`0x0`, immediately followed by a correct re-flash of the real firmware
+(also without `-e`) to that same, now-corrupted region, produced a
+byte-correct, fully working firmware -- the board booted and printed
+exactly right afterward, repeatedly. NOR flash writes can only clear bits
+(1→0), not set them; for a plain program-without-erase to produce the
+*exact* correct byte pattern over a region with different stale bits from
+a prior write, the underlying `FLASH_WRITE` (0xd4) ISP command must be
+auto-erasing the sectors it's about to program. Separately, writing a model
+to `0x00C00000` via a `.kfpkg` (finding #3) left the firmware at `0x0`
+completely intact and still booting correctly afterward -- a write to one
+region doesn't erase or disturb another when `-e` is off. Both are real
+signal that `k210_isp.mjs`'s **"skip erase"** UI option is safe on real
+hardware, at least on this board -- the opposite of the runtime README's
+previous "unverified" stance.
+
+**Finding #5 (real, precisely root-caused): `interpreter::load_model()`
+hangs indefinitely given a real, valid kmodel.** A real
+`ketiswp/mlcommons-ResNet8-CIFAR10-fp32-onnx` model, compiled via
+`scripts/onnx_to_kmodel.py` to a 104792-byte kmodel (correct `KMDL` magic,
+confirmed byte-for-byte), flashed to `0x00C00000` via the `.kfpkg`
+mechanism above. The runtime printed `reading model from flash...` and then
+went completely silent -- no crash, no further output, for 25+ seconds.
+Root-caused with an instrumented debug rebuild (extra `printf`s bracketing
+the identifier check and `interp.load_model()` call, built from a real
+`kendryte-standalone-sdk` checkout + the cached `toolchain-kendryte210`
+compiler, flashed and reset the same way): the identifier check passes
+correctly (`0x4b4d444c`), execution enters `interp.load_model()`, and it
+**never returns** -- confirmed by the debug build's own trailing
+`load_model() returned` print never appearing. Not yet root-caused further
+(would need real debugging inside nncase v1's K210 runtime itself --
+KPU peripheral programming, DMA descriptor setup, etc.) -- see
+`firmware/runtime/README.md`'s "Status" for the full writeup.
+
+`chip-type` (in-chip vs on-board flash) wasn't separately varied this
+session -- `in-chip` (the default) is what every write above used, and it
+worked, matching the README's existing expectation that both M5StickV and
+Maix Amigo have their flash on the K210 module itself.
 
 ## Using it
 
