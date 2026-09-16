@@ -367,6 +367,23 @@ button:focus-visible {
   font-size: 0.85em;
   margin: 0.3em 0;
 }
+
+/* Long explanations collapse behind a one-line summary so panels stay
+   scannable; click to read the full text. */
+details.tool-details {
+  margin: 0.3em 0;
+}
+details.tool-details > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.85em;
+}
+details.tool-details[open] > summary {
+  margin-bottom: 0.3em;
+}
+details.tool-details > summary::-webkit-details-marker {
+  color: var(--muted);
+}
 .debug-actions {
   display: flex;
   flex-wrap: wrap;

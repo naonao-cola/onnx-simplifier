@@ -28,14 +28,15 @@
             compiled to WebAssembly. Everything runs locally in your browser —
             models are never uploaded.
         </p>
-        <p class="note">
-            Also experimental: a
-            <a href="./pyodide-demo/">Pyodide (Python-in-the-browser) demo</a>
-            running full <code>onnxsim.simplify()</code>, or onnxsim's native
-            quantization passes on their own; see
-            <a href="https://github.com/onnxsim/onnxsim/blob/master/docs/wasm_pyodide.md" target="_blank" rel="noopener">docs/wasm_pyodide.md</a>
-            for the toolchain story behind it.
-        </p>
+        <details class="tool-details">
+            <summary>Also experimental: a <a href="./pyodide-demo/">Pyodide (Python-in-the-browser) demo</a> — details</summary>
+            <p class="note">
+                Runs full <code>onnxsim.simplify()</code>, or onnxsim's native
+                quantization passes on their own; see
+                <a href="https://github.com/onnxsim/onnxsim/blob/master/docs/wasm_pyodide.md" target="_blank" rel="noopener">docs/wasm_pyodide.md</a>
+                for the toolchain story behind it.
+            </p>
+        </details>
         <nav class="section-nav" aria-label="Jump to section">
             <a href="#sec-parse">Parse graph</a>
             <a href="#sec-convert">Convert</a>
@@ -57,20 +58,21 @@
 
         <h2 id="sec-parse">Parse a text graph</h2>
         <div class="tool-panel">
-            <p class="tool-note">
-                Paste an ONNX model or graph in the
-                <a href="https://onnx.ai/onnx/repo-docs/Syntax.html" target="_blank" rel="noopener">textual representation</a>
-                — the form <code>onnx.parser.parse_graph</code> / <code>parse_model</code> accept.
-                It is parsed into a model by the WebAssembly module (a bare graph is
-                wrapped into a model with a default-domain opset import) and shown in
-                the <b>Before</b> Netron pane. Local <b>function</b> definitions
-                (<code>&lt;domain: "..."&gt; name (...) =&gt; (...) {...}</code> blocks after
-                the graph) are parsed too, and the wrapped model gains an opset import
-                for each function's domain so it validates. With <b>convert after
-                parsing</b> on, it is also run straight through the currently selected
-                convert mode below (Simplify / Optimize / Inline functions, or a single
-                debug pass).
-            </p>
+            <details class="tool-details">
+                <summary>Paste an ONNX <a href="https://onnx.ai/onnx/repo-docs/Syntax.html" target="_blank" rel="noopener">textual representation</a> graph or model — details</summary>
+                <p class="tool-note">
+                    The form <code>onnx.parser.parse_graph</code> / <code>parse_model</code> accept.
+                    It is parsed into a model by the WebAssembly module (a bare graph is
+                    wrapped into a model with a default-domain opset import) and shown in
+                    the <b>Before</b> Netron pane. Local <b>function</b> definitions
+                    (<code>&lt;domain: "..."&gt; name (...) =&gt; (...) {...}</code> blocks after
+                    the graph) are parsed too, and the wrapped model gains an opset import
+                    for each function's domain so it validates. With <b>convert after
+                    parsing</b> on, it is also run straight through the currently selected
+                    convert mode below (Simplify / Optimize / Inline functions, or a single
+                    debug pass).
+                </p>
+            </details>
             <textarea id="parse-graph-text" rows="8" style="width: 100%; box-sizing: border-box; font-family: monospace;"
                 placeholder="&lt;
    ir_version: 7,
@@ -119,17 +121,20 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 <select id="hf-file-select"></select>
                 <span id="hf-file-note" class="note" style="margin-left: 0.25em;"></span>
             </div>
-            <div class="note" style="margin-top: 0.25em;">
-                Fetches the model straight from the Hugging Face Hub in your
-                browser (nothing is uploaded), then runs it through the same
-                Simplify / Optimize path as an uploaded file. Bare names default
-                to the <code>onnxmodelzoo</code> org; any <code>owner/repo</code>
-                or direct <code>.onnx</code> URL works too. Picking a model (or
-                entering a repo id / URL) shows its download size first, so you
-                can see how big it is before fetching. When a repo holds more than
-                one <code>.onnx</code>, the largest is auto-detected; use the
-                <b>file</b> selector to convert a different one.
-            </div>
+            <details class="tool-details" style="margin-top: 0.25em;">
+                <summary>How loading from Hugging Face works — details</summary>
+                <div class="note">
+                    Fetches the model straight from the Hugging Face Hub in your
+                    browser (nothing is uploaded), then runs it through the same
+                    Simplify / Optimize path as an uploaded file. Bare names default
+                    to the <code>onnxmodelzoo</code> org; any <code>owner/repo</code>
+                    or direct <code>.onnx</code> URL works too. Picking a model (or
+                    entering a repo id / URL) shows its download size first, so you
+                    can see how big it is before fetching. When a repo holds more than
+                    one <code>.onnx</code>, the largest is auto-detected; use the
+                    <b>file</b> selector to convert a different one.
+                </div>
+            </details>
             <div id="hf-token-row" style="margin-top: 0.4em;">
                 <label for="hf-token-input">Hugging Face token</label>
                 <input type="password" id="hf-token-input" size="38"
@@ -139,54 +144,61 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 <input type="checkbox" id="hf-token-remember">
                 <label for="hf-token-remember">remember in this browser</label>
                 <span id="hf-token-status" class="note" style="margin-left: 0.3em;"></span>
-                <div class="note" style="margin-top: 0.2em;">
-                    Optional — only needed to load a <b>gated</b> or
-                    <b>private</b> repo you have access to; public repos (like
-                    <code>onnxmodelzoo</code>) don't need one. Create one at
-                    <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">huggingface.co/settings/tokens</a>
-                    ("read" access is enough). It is sent straight from your
-                    browser to <code>huggingface.co</code> as an
-                    <code>Authorization</code> header for size checks, file
-                    listing, and the download itself — never anywhere else, and
-                    never included in the "Copy shareable link" URL above. With
-                    <b>remember</b> off (the default) it lives only in this
-                    page's memory and is gone on reload; checking it saves the
-                    token in this browser's local storage (still local to your
-                    machine) so it survives a reload.
-                </div>
+                <details class="tool-details" style="margin-top: 0.2em;">
+                    <summary>Only needed for gated/private repos — how the token is used</summary>
+                    <div class="note">
+                        Optional — only needed to load a <b>gated</b> or
+                        <b>private</b> repo you have access to; public repos (like
+                        <code>onnxmodelzoo</code>) don't need one. Create one at
+                        <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">huggingface.co/settings/tokens</a>
+                        ("read" access is enough). It is sent straight from your
+                        browser to <code>huggingface.co</code> as an
+                        <code>Authorization</code> header for size checks, file
+                        listing, and the download itself — never anywhere else, and
+                        never included in the "Copy shareable link" URL above. With
+                        <b>remember</b> off (the default) it lives only in this
+                        page's memory and is gone on reload; checking it saves the
+                        token in this browser's local storage (still local to your
+                        machine) so it survives a reload.
+                    </div>
+                </details>
             </div>
             <div class="note" style="margin-top: 0.25em;">
                 <b>Shareable link:</b> the input model and options can be set from
-                the URL — e.g.
-                <code>?model=onnxmodelzoo/resnet18d_Opset18</code> or
-                <code>?model=https://…/foo.onnx&amp;optimizer=optimize&amp;cf=0</code>.
-                It loads and converts automatically (add <code>&amp;autoload=0</code>
-                to only prefill). Keys: <code>model</code>
-                (<code>hf</code>/<code>url</code>), <code>graph</code> (an ONNX text
-                graph to parse), <code>optimizer</code> (a.k.a. <code>mode</code>/<code>processor</code>; the
-                convert mode —
-                <code>simplify</code>/<code>optimize</code>/<code>optimize_fixed</code>/<code>inline</code>/<code>infer_shapes</code>/<code>data_propagation</code>/<code>fold_constant</code>),
-                <code>constant_fold</code>/<code>cf</code>,
-                <code>shape_inference</code>/<code>si</code>,
-                <code>inline_functions</code>/<code>inline</code>,
-                <code>tensor_size_threshold</code>/<code>tst</code>,
-                <code>target_opset</code>/<code>opset</code>,
-                <code>autorun</code>/<code>autoinfer</code> (auto-run inference
-                after each conversion),
-                <code>backend</code> (prefills the backend-test URL). Setting an
-                input updates this URL so it stays shareable (uploads excepted).
+                the URL. Setting an input updates this URL so it stays shareable
+                (uploads excepted).
                 <div style="margin-top: 0.35em;">
                     <button id="share-link-button" type="button">Copy shareable link</button>
                     <span id="share-link-status" class="ok" style="font-size: 0.85em; margin-left: 0.4em;"></span>
-                    <div style="margin-top: 0.2em;">
-                        Builds a link that reproduces the <b>current</b> input and
-                        <i>all</i> the conversion options below (processor, constant
-                        fold, shape inference, tensor size threshold, target opset)
-                        and copies it to your clipboard. Uploaded local files have no
-                        URL, so share a Hugging Face model / URL, a backend test case,
-                        or a pasted text graph.
-                    </div>
                 </div>
+                <details class="tool-details" style="margin-top: 0.2em;">
+                    <summary>URL query keys and what "Copy shareable link" does</summary>
+                    <div class="note">
+                        e.g. <code>?model=onnxmodelzoo/resnet18d_Opset18</code> or
+                        <code>?model=https://…/foo.onnx&amp;optimizer=optimize&amp;cf=0</code>.
+                        It loads and converts automatically (add <code>&amp;autoload=0</code>
+                        to only prefill). Keys: <code>model</code>
+                        (<code>hf</code>/<code>url</code>), <code>graph</code> (an ONNX text
+                        graph to parse), <code>optimizer</code> (a.k.a. <code>mode</code>/<code>processor</code>; the
+                        convert mode —
+                        <code>simplify</code>/<code>optimize</code>/<code>optimize_fixed</code>/<code>inline</code>/<code>infer_shapes</code>/<code>data_propagation</code>/<code>fold_constant</code>),
+                        <code>constant_fold</code>/<code>cf</code>,
+                        <code>shape_inference</code>/<code>si</code>,
+                        <code>inline_functions</code>/<code>inline</code>,
+                        <code>tensor_size_threshold</code>/<code>tst</code>,
+                        <code>target_opset</code>/<code>opset</code>,
+                        <code>autorun</code>/<code>autoinfer</code> (auto-run inference
+                        after each conversion),
+                        <code>backend</code> (prefills the backend-test URL).
+                        <br>
+                        <b>Copy shareable link</b> builds a link that reproduces the
+                        <b>current</b> input and <i>all</i> the conversion options below
+                        (processor, constant fold, shape inference, tensor size
+                        threshold, target opset) and copies it to your clipboard.
+                        Uploaded local files have no URL, so share a Hugging Face
+                        model / URL, a backend test case, or a pasted text graph.
+                    </div>
+                </details>
             </div>
             <div style="margin-top: 0.25em;">
                 <input type="checkbox" id="hf-use-xet" checked>
@@ -200,23 +212,26 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                        title="Ceiling on parallel connections for a Xet download. XetBlob tunes the actual count adaptively from measured throughput, up to this limit; ~10 or fewer is usually best.">
                 <button id="hf-clear-cache" type="button">clear chunk cache</button>
                 <span id="hf-cache-size" class="note" style="margin-left: 0.4em;"></span>
-                <div class="note" style="margin-top: 0.2em;">
-                    Downloads via <code>@huggingface/hub</code>, reconstructing the
-                    file from content-addressed chunks and caching them in
-                    IndexedDB so repeated / overlapping loads reuse them. On by
-                    default; falls back to a direct download automatically if the
-                    Xet path isn't available (e.g. a non-Xet repo or a CORS block).
-                    <br>
-                    The in-browser Xet client
-                    (<a href="https://github.com/huggingface/huggingface.js/blob/main/packages/hub/src/utils/XetBlob.ts" target="_blank" rel="noopener"><code>XetBlob</code></a>)
-                    fetches multiple content-addressed blocks at once and adapts
-                    the connection count to measured throughput, up to
-                    <b>max connections</b>, to saturate your link — this is what
-                    makes Xet fast enough to be the default (~10 or fewer is
-                    usually best; <code>1</code> forces a single serial
-                    connection). Xet also gives chunk dedup / cache reuse across
-                    repeated or overlapping loads.
-                </div>
+                <details class="tool-details" style="margin-top: 0.2em;">
+                    <summary>What Xet does and how "max connections" works</summary>
+                    <div class="note">
+                        Downloads via <code>@huggingface/hub</code>, reconstructing the
+                        file from content-addressed chunks and caching them in
+                        IndexedDB so repeated / overlapping loads reuse them. On by
+                        default; falls back to a direct download automatically if the
+                        Xet path isn't available (e.g. a non-Xet repo or a CORS block).
+                        <br>
+                        The in-browser Xet client
+                        (<a href="https://github.com/huggingface/huggingface.js/blob/main/packages/hub/src/utils/XetBlob.ts" target="_blank" rel="noopener"><code>XetBlob</code></a>)
+                        fetches multiple content-addressed blocks at once and adapts
+                        the connection count to measured throughput, up to
+                        <b>max connections</b>, to saturate your link — this is what
+                        makes Xet fast enough to be the default (~10 or fewer is
+                        usually best; <code>1</code> forces a single serial
+                        connection). Xet also gives chunk dedup / cache reuse across
+                        repeated or overlapping loads.
+                    </div>
+                </details>
             </div>
         </div>
         <div id="nanochat-demo-loader" style="margin-top: 0.6em;">
@@ -225,16 +240,19 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 demo:</label>
             <button id="nanochat-demo-button" type="button" disabled title="Loading WebAssembly runtime…">Load nanochat demo model</button>
             <span id="nanochat-demo-status" role="status" aria-live="polite"></span>
-            <div class="note" style="margin-top: 0.25em;">
-                Loads <code>nanochat_wasm_demo.onnx</code> (bundled with this page,
-                34KB, no network fetch beyond this page itself) -- a tiny
-                nanochat-style GPT (rotary embeddings, QK norm, Group-Query
-                Attention, <code>relu²</code> MLP) exported unsimplified from
-                <a href="https://github.com/onnxsim/onnxsim/tree/master/scripts/nanochat" target="_blank" rel="noopener">scripts/nanochat</a>
-                (nanochat itself has no ONNX export path of its own -- see that
-                directory's README for why). Runs the same Simplify / Optimize /
-                Netron / Run-inference path as an uploaded file.
-            </div>
+            <details class="tool-details" style="margin-top: 0.25em;">
+                <summary>What the nanochat demo model is</summary>
+                <div class="note">
+                    Loads <code>nanochat_wasm_demo.onnx</code> (bundled with this page,
+                    34KB, no network fetch beyond this page itself) -- a tiny
+                    nanochat-style GPT (rotary embeddings, QK norm, Group-Query
+                    Attention, <code>relu²</code> MLP) exported unsimplified from
+                    <a href="https://github.com/onnxsim/onnxsim/tree/master/scripts/nanochat" target="_blank" rel="noopener">scripts/nanochat</a>
+                    (nanochat itself has no ONNX export path of its own -- see that
+                    directory's README for why). Runs the same Simplify / Optimize /
+                    Netron / Run-inference path as an uploaded file.
+                </div>
+            </details>
         </div>
         <div id="backend-loader" style="margin-top: 0.6em;">
             <label for="backend-select">…or run an
@@ -246,17 +264,20 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 placeholder="…or a GitHub tree / raw URL to a test-case directory">
             <button id="backend-run" type="button">Run test case</button>
             <span id="backend-status" role="status" aria-live="polite"></span>
-            <div class="note" style="margin-top: 0.25em;">
-                Fetches <code>model.onnx</code> and the test data
-                (<code>test_data_set_N/</code> of <code>input_*.pb</code> /
-                <code>output_*.pb</code>) from GitHub, runs the model through
-                onnxruntime-web <b>with the test inputs</b>, and checks each output
-                against the expected tensor within tolerance. Pick a preset above or
-                paste a GitHub <code>tree</code> / <code>raw.githubusercontent.com</code>
-                URL; listing uses GitHub's public (rate-limited) API. With
-                <b>convert the model</b> on, the fetched model is also run through the
-                selected convert mode below (and shown in the Netron panes).
-            </div>
+            <details class="tool-details" style="margin-top: 0.25em;">
+                <summary>What "Run test case" fetches and checks</summary>
+                <div class="note">
+                    Fetches <code>model.onnx</code> and the test data
+                    (<code>test_data_set_N/</code> of <code>input_*.pb</code> /
+                    <code>output_*.pb</code>) from GitHub, runs the model through
+                    onnxruntime-web <b>with the test inputs</b>, and checks each output
+                    against the expected tensor within tolerance. Pick a preset above or
+                    paste a GitHub <code>tree</code> / <code>raw.githubusercontent.com</code>
+                    URL; listing uses GitHub's public (rate-limited) API. With
+                    <b>convert the model</b> on, the fetched model is also run through the
+                    selected convert mode below (and shown in the Netron panes).
+                </div>
+            </details>
             <div style="margin-top: 0.25em;">
                 <input type="checkbox" id="backend-convert" checked>
                 <label for="backend-convert">convert the model too</label>
@@ -330,79 +351,88 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         </section>
         <h2 id="sec-quantize">Quantize a model</h2>
         <div class="tool-panel">
-            <p class="tool-note">
-                Quantizes a model with onnxsim's WebAssembly module, entirely in
-                your browser -- nothing is uploaded. Its result is kept
-                independent of the plain <b>Convert</b> section above (it never
-                overwrites the "after" Netron pane or <code>converted</code>
-                inference source) so you can inspect all three stages side by
-                side: <b>original</b> -- <b>onnxsim-simplified</b> (Convert
-                section, optional) -- <b>quantized</b> (its own "Quantized"
-                Netron pane and <code>quantized</code> inference source below).
-                Pick what to quantize:
-            </p>
+            <details class="tool-details">
+                <summary>How this panel relates to Convert / Fine-tune / Correct bias — details</summary>
+                <p class="tool-note">
+                    Quantizes a model with onnxsim's WebAssembly module, entirely in
+                    your browser -- nothing is uploaded. Its result is kept
+                    independent of the plain <b>Convert</b> section above (it never
+                    overwrites the "after" Netron pane or <code>converted</code>
+                    inference source) so you can inspect all three stages side by
+                    side: <b>original</b> -- <b>onnxsim-simplified</b> (Convert
+                    section, optional) -- <b>quantized</b> (its own "Quantized"
+                    Netron pane and <code>quantized</code> inference source below).
+                </p>
+            </details>
+            <p class="tool-note">Pick what to quantize:</p>
             <div class="convert-modes">
                 <input type="radio" name="quantize-source" value="original" id="quantize_source_original" checked>
                 <label for="quantize_source_original">Original upload</label>
                 <input type="radio" name="quantize-source" value="converted" id="quantize_source_converted">
                 <label for="quantize_source_converted" title="Runs the selected quantize method on the Convert section's own simplify/optimize output, so it applies to already-simplified graphs (e.g. fused Conv+BN, MatMul+Add -> Gemm) rather than the raw upload. Run Simplify/Optimize above first.">onnxsim-simplified (Convert section result)</label>
             </div>
-            <p class="tool-note">
-                Before picking a method, you can check whether INT8 (Dynamic /
-                Static / QOperator's scheme) looks numerically safe for this
-                model -- a static analysis of its own weights and shapes, no
-                execution or calibration data needed, so it runs instantly.
-            </p>
+            <details class="tool-details">
+                <summary>Check quantization risk before picking a method — details</summary>
+                <p class="tool-note">
+                    Check whether INT8 (Dynamic / Static / QOperator's scheme) looks
+                    numerically safe for this model -- a static analysis of its own
+                    weights and shapes, no execution or calibration data needed, so
+                    it runs instantly.
+                </p>
+            </details>
             <div class="debug-actions">
                 <button id="quantize-risk-button" type="button">Check quantization risk</button>
                 <span id="quantize-risk-status" class="tool-note"></span>
             </div>
             <div id="quantize-risk-result" style="display: none; margin-top: 0.4em;"></div>
             <p class="tool-note">Pick a method:</p>
-            <ul class="tool-note">
-                <li><b>Dynamic</b> -- MatMul/Gemm weights are quantized to INT8
-                    ahead of time; the activation is quantized at inference time
-                    via <code>DynamicQuantizeLinear</code>. No calibration
-                    needed.</li>
-                <li><b>Ternary</b> -- like Dynamic, but for weights whose values
-                    are already (approximately) ternary
-                    (<code>{-1, 0, 1} × scale</code>), e.g. BitNet-style models.
-                    No calibration needed.</li>
-                <li><b>Weight-only</b> / <b>Weight-only INT4</b> -- only the
-                    weight is quantized (INT8 / block-wise INT4); the activation
-                    is never touched. No calibration needed, smallest download,
-                    but needs a runtime that supports on-the-fly dequantization.</li>
-                <li><b>Static (QDQ)</b> -- MatMul/Gemm/Conv are wrapped in
-                    <code>QuantizeLinear</code>/<code>DequantizeLinear</code>
-                    pairs using a <i>calibrated</i> activation range; the graph
-                    still computes in float32, and a QDQ-aware runtime fuses the
-                    pattern into an integer kernel. Needs calibration (below).</li>
-                <li><b>QOperator</b> -- MatMul/Gemm are replaced outright with
-                    <code>QLinearMatMul</code>, computing directly in int8; also
-                    needs a calibrated <i>output</i> range, not just the
-                    activation. Needs calibration (below).</li>
-                <li><b>Float16</b> / <b>BFloat16</b> / <b>Float8</b> -- a
-                    different kind of "quantization": every weight (and, by
-                    default, every internal activation -- a boundary
-                    <code>Cast</code> keeps the model's own external
-                    input/output types float32) is simply rounded to a
-                    narrower floating-point format, not an integer scheme, so
-                    no calibration data is needed at all. Float16/BFloat16
-                    halve storage; Float8 (E4M3 or E5M2, below) quarters it,
-                    at the cost of the least precision of any format here.</li>
-            </ul>
-            <p class="tool-note">
-                <b>Calibration</b> (Static/QOperator only) runs the model over a
-                few batches of synthetic random input through
-                <a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">onnxruntime-web</a>
-                (downloaded on demand, same as the "Run inference" panel below)
-                to observe each quantizable tensor's actual value range -- the
-                same approach <code>onnxsim.calibrate()</code> uses in Python,
-                just run here in the browser instead. Random data is a
-                reasonable stand-in when representative data isn't at hand, but
-                real calibration data (e.g. via the Python API) usually gives
-                tighter, more accurate ranges.
-            </p>
+            <details class="tool-details">
+                <summary>What each method does, and when it needs calibration — details</summary>
+                <ul class="tool-note">
+                    <li><b>Dynamic</b> -- MatMul/Gemm weights are quantized to INT8
+                        ahead of time; the activation is quantized at inference time
+                        via <code>DynamicQuantizeLinear</code>. No calibration
+                        needed.</li>
+                    <li><b>Ternary</b> -- like Dynamic, but for weights whose values
+                        are already (approximately) ternary
+                        (<code>{-1, 0, 1} × scale</code>), e.g. BitNet-style models.
+                        No calibration needed.</li>
+                    <li><b>Weight-only</b> / <b>Weight-only INT4</b> -- only the
+                        weight is quantized (INT8 / block-wise INT4); the activation
+                        is never touched. No calibration needed, smallest download,
+                        but needs a runtime that supports on-the-fly dequantization.</li>
+                    <li><b>Static (QDQ)</b> -- MatMul/Gemm/Conv are wrapped in
+                        <code>QuantizeLinear</code>/<code>DequantizeLinear</code>
+                        pairs using a <i>calibrated</i> activation range; the graph
+                        still computes in float32, and a QDQ-aware runtime fuses the
+                        pattern into an integer kernel. Needs calibration (below).</li>
+                    <li><b>QOperator</b> -- MatMul/Gemm are replaced outright with
+                        <code>QLinearMatMul</code>, computing directly in int8; also
+                        needs a calibrated <i>output</i> range, not just the
+                        activation. Needs calibration (below).</li>
+                    <li><b>Float16</b> / <b>BFloat16</b> / <b>Float8</b> -- a
+                        different kind of "quantization": every weight (and, by
+                        default, every internal activation -- a boundary
+                        <code>Cast</code> keeps the model's own external
+                        input/output types float32) is simply rounded to a
+                        narrower floating-point format, not an integer scheme, so
+                        no calibration data is needed at all. Float16/BFloat16
+                        halve storage; Float8 (E4M3 or E5M2, below) quarters it,
+                        at the cost of the least precision of any format here.</li>
+                </ul>
+                <p class="tool-note">
+                    <b>Calibration</b> (Static/QOperator only) runs the model over a
+                    few batches of synthetic random input through
+                    <a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">onnxruntime-web</a>
+                    (downloaded on demand, same as the "Run inference" panel below)
+                    to observe each quantizable tensor's actual value range -- the
+                    same approach <code>onnxsim.calibrate()</code> uses in Python,
+                    just run here in the browser instead. Random data is a
+                    reasonable stand-in when representative data isn't at hand, but
+                    real calibration data (e.g. via the Python API) usually gives
+                    tighter, more accurate ranges.
+                </p>
+            </details>
             <div class="convert-modes quantize-modes">
                 <input type="radio" name="quantize-method" value="dynamic" id="quantize_dynamic" checked>
                 <label for="quantize_dynamic">Dynamic</label>
@@ -468,35 +498,40 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <h2 id="sec-qat">Fine-tune a quantized model (QAT)</h2>
         <div class="tool-panel">
             <p class="tool-note">
-                Recovers some of the accuracy quantization cost, by
-                <b>training</b> the quantized model -- in your browser, with no
-                server and no labels. The float model is the <b>teacher</b>, the
-                quantized one is the <b>student</b>, and each block's weights are
-                optimized by Adam so the student reproduces the teacher's own
-                activations at that block's output. This is
-                <code>onnxsim.apply_qat</code>, reachable without Python: the
-                WebAssembly module emits one optimizer step as a plain ONNX
-                inference graph (a hand-derived backward pass is just dataflow --
-                no autograd, no training runtime) and
-                <a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">onnxruntime-web</a>
-                runs that graph in a loop, so the whole training step reaches
-                WebGPU (and WebNN) through the same execution providers the
-                inference panel uses. See
+                Recovers some of the accuracy quantization cost, by <b>training</b>
+                the quantized model in your browser. This is
+                <code>onnxsim.apply_qat</code>, reachable without Python — see
                 <a href="https://github.com/onnxsim/onnxsim/blob/master/docs/qat.md" target="_blank" rel="noopener">docs/qat.md</a>.
             </p>
-            <p class="tool-note">
-                <b>What it can and cannot do.</b> The objective is
-                "reproduce what the teacher produced", so it cannot exceed the
-                float model and it is not a way to train on new data or a new
-                task -- it fixes a model something else made worse. With
-                <b>fine-tune only</b> below, the quantizer comes out of the
-                middle and the student's own float weights are trained instead
-                (<code>apply_block_finetune</code>), which is for a pruned or
-                otherwise altered model; the two models have to differ, or there
-                is nothing to learn. Training runs on a handful of calibration
-                rows, so treat the result as a demonstration of the machinery
-                rather than a production tuning run.
-            </p>
+            <details class="tool-details">
+                <summary>How it works, and what it can/cannot do — details</summary>
+                <p class="tool-note">
+                    The float model is the <b>teacher</b>, the
+                    quantized one is the <b>student</b>, and each block's weights are
+                    optimized by Adam so the student reproduces the teacher's own
+                    activations at that block's output. The
+                    WebAssembly module emits one optimizer step as a plain ONNX
+                    inference graph (a hand-derived backward pass is just dataflow --
+                    no autograd, no training runtime) and
+                    <a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">onnxruntime-web</a>
+                    runs that graph in a loop, so the whole training step reaches
+                    WebGPU (and WebNN) through the same execution providers the
+                    inference panel uses.
+                </p>
+                <p class="tool-note">
+                    <b>What it can and cannot do.</b> The objective is
+                    "reproduce what the teacher produced", so it cannot exceed the
+                    float model and it is not a way to train on new data or a new
+                    task -- it fixes a model something else made worse. With
+                    <b>fine-tune only</b> below, the quantizer comes out of the
+                    middle and the student's own float weights are trained instead
+                    (<code>apply_block_finetune</code>), which is for a pruned or
+                    otherwise altered model; the two models have to differ, or there
+                    is nothing to learn. Training runs on a handful of calibration
+                    rows, so treat the result as a demonstration of the machinery
+                    rather than a production tuning run.
+                </p>
+            </details>
             <div>
                 <label for="qat-teacher">teacher (float)</label>
                 <select id="qat-teacher">
@@ -579,36 +614,39 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <div class="tool-panel">
             <p class="tool-note">
                 Recovers accuracy an output-preserving algorithm change cost a
-                model -- quantization, or a Resize node's <code>mode</code>/
-                <code>coordinate_transformation_mode</code> swapped for one a
-                deployment accelerator supports -- by measuring, on
-                synthetic calibration data run through
-                <a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">onnxruntime-web</a>,
-                a systematic shift between the float model and the modified
-                one, and adding a constant to cancel it. This is
+                model -- quantization, or a Resize node's <code>mode</code>
+                swapped for one a deployment accelerator supports. This is
                 <code>onnxsim.correct_bias</code> /
                 <code>onnxsim.correct_spatial_bias</code>, reachable without
-                Python. No training, no gradients -- only ordinary forward
-                passes, so it is much cheaper than fine-tuning, and much more
-                limited: see
+                Python -- see
                 <a href="https://github.com/onnxsim/onnxsim/blob/master/onnxsim/bias_correction.py" target="_blank" rel="noopener">bias_correction.py</a>'s
-                own module docstring for exactly when a constant (or a
-                coarse per-position grid) can and cannot recover an
-                algorithm change's error.
+                own module docstring for exactly when it can and cannot recover
+                an algorithm change's error.
             </p>
-            <p class="tool-note">
-                <b>Per-channel vs per-position.</b> Per-channel (the
-                default) fits a single number per output channel and suits
-                quantization rounding and similar shifts. A Resize mode/
-                coordinate-transformation swap's error is instead
-                spatially-varying, so tick <b>per-position (spatial)</b>
-                below for that case -- it only helps when the calibration
-                images share real spatial structure (a fixed-mount camera, a
-                consistent framing), and is verified against held-out
-                calibration data before being applied at all: on generic,
-                independent images it correctly does nothing rather than
-                risk making things worse.
-            </p>
+            <details class="tool-details">
+                <summary>How it works, and per-channel vs per-position — details</summary>
+                <p class="tool-note">
+                    By measuring, on synthetic calibration data run through
+                    <a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">onnxruntime-web</a>,
+                    a systematic shift between the float model and the modified
+                    one, and adding a constant to cancel it. No training, no
+                    gradients -- only ordinary forward passes, so it is much
+                    cheaper than fine-tuning, and much more limited.
+                </p>
+                <p class="tool-note">
+                    <b>Per-channel vs per-position.</b> Per-channel (the
+                    default) fits a single number per output channel and suits
+                    quantization rounding and similar shifts. A Resize mode/
+                    coordinate-transformation swap's error is instead
+                    spatially-varying, so tick <b>per-position (spatial)</b>
+                    below for that case -- it only helps when the calibration
+                    images share real spatial structure (a fixed-mount camera, a
+                    consistent framing), and is verified against held-out
+                    calibration data before being applied at all: on generic,
+                    independent images it correctly does nothing rather than
+                    risk making things worse.
+                </p>
+            </details>
             <div>
                 <label for="bc-float">float (original)</label>
                 <select id="bc-float">
@@ -665,34 +703,40 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 layer and trains only <code>A</code>/<code>B</code> by Adam,
                 with every base weight frozen -- in your browser, with no
                 server. This is <code>onnxsim.inject_lora</code> +
-                <code>onnxsim.train_lora</code>, reachable without Python: the
-                WebAssembly module performs the injection and emits one
-                optimizer step as a plain ONNX inference graph, and
-                <a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">onnxruntime-web</a>
-                runs that graph in a loop, exactly as the QAT panel above
-                does for its own step graph. See
+                <code>onnxsim.train_lora</code> -- see
                 <a href="https://github.com/onnxsim/onnxsim/blob/master/onnxsim/lora_entry.h" target="_blank" rel="noopener">onnxsim/lora_entry.h</a>.
             </p>
-            <p class="tool-note">
-                <b>What it can and cannot do.</b> The adapter is trained to
-                reproduce a <b>reference</b> model's own output on the same
-                inputs, so the two models have to differ or there is nothing
-                to learn -- a natural pairing is <b>base = onnxsim-simplified</b>
-                against <b>reference = the original upload</b>, patching back
-                whatever simplification changed with a small trainable branch
-                instead of a full re-tune. It trains on a handful of
-                calibration rows, so treat the result as a demonstration of
-                the machinery rather than a production adapter. <b>QLoRA</b>
-                (composing this with an NF4-quantized base) and
-                <b>caller-supplied training targets</b> (rather than a
-                reference model) are not wired into this panel yet -- see
-                <code>lora_finetune.mjs</code>'s own top comment. Exporting to
-                ONNX Runtime's native <code>.onnx_adapter</code> format
-                (<code>export_lora_adapter</code>) needs its Python
-                <code>onnxruntime.AdapterFormat</code> API, which has no C++
-                counterpart to reach from wasm, so this panel exports the
-                trained <b>full model</b> only.
-            </p>
+            <details class="tool-details">
+                <summary>How it works, and what it can/cannot do — details</summary>
+                <p class="tool-note">
+                    Reachable without Python: the WebAssembly module performs
+                    the injection and emits one optimizer step as a plain ONNX
+                    inference graph, and
+                    <a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">onnxruntime-web</a>
+                    runs that graph in a loop, exactly as the QAT panel above
+                    does for its own step graph.
+                </p>
+                <p class="tool-note">
+                    <b>What it can and cannot do.</b> The adapter is trained to
+                    reproduce a <b>reference</b> model's own output on the same
+                    inputs, so the two models have to differ or there is nothing
+                    to learn -- a natural pairing is <b>base = onnxsim-simplified</b>
+                    against <b>reference = the original upload</b>, patching back
+                    whatever simplification changed with a small trainable branch
+                    instead of a full re-tune. It trains on a handful of
+                    calibration rows, so treat the result as a demonstration of
+                    the machinery rather than a production adapter. <b>QLoRA</b>
+                    (composing this with an NF4-quantized base) and
+                    <b>caller-supplied training targets</b> (rather than a
+                    reference model) are not wired into this panel yet -- see
+                    <code>lora_finetune.mjs</code>'s own top comment. Exporting to
+                    ONNX Runtime's native <code>.onnx_adapter</code> format
+                    (<code>export_lora_adapter</code>) needs its Python
+                    <code>onnxruntime.AdapterFormat</code> API, which has no C++
+                    counterpart to reach from wasm, so this panel exports the
+                    trained <b>full model</b> only.
+                </p>
+            </details>
             <div>
                 <label for="lora-base">base (trained)</label>
                 <select id="lora-base">
@@ -783,16 +827,23 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <div class="tool-panel">
             <p class="tool-note">
                 Not a tool for your own model -- a small, fixed, self-contained
-                demo of the machinery above: a tiny two-layer network,
-                <code>onnxsim.graph_grad</code>/<code>qat_graph</code>'s own
-                gradient/Adam step graph, trained on <b>real data fetched live
-                from Hugging Face</b>, with <b>WebGPU required</b> (no wasm/CPU
-                fallback -- this fails loudly on a browser without it, rather
-                than silently training somewhere else). See
-                <a href="https://github.com/onnxsim/onnxsim/blob/master/scripts/convertmodel/webgpu_hf_demo.mjs" target="_blank" rel="noopener">webgpu_hf_demo.mjs</a>
-                and <a href="https://github.com/onnxsim/onnxsim/blob/master/scripts/convertmodel/test/make_step_graph_fixtures.py" target="_blank" rel="noopener">test/make_step_graph_fixtures.py</a>
-                for exactly what each demo trains and why.
+                demo of the machinery above, with <b>WebGPU required</b> (no
+                wasm/CPU fallback).
             </p>
+            <details class="tool-details">
+                <summary>What this demo trains, and why WebGPU is required — details</summary>
+                <p class="tool-note">
+                    A tiny two-layer network,
+                    <code>onnxsim.graph_grad</code>/<code>qat_graph</code>'s own
+                    gradient/Adam step graph, trained on <b>real data fetched live
+                    from Hugging Face</b> -- this fails loudly on a browser
+                    without WebGPU, rather than silently training somewhere else.
+                    See
+                    <a href="https://github.com/onnxsim/onnxsim/blob/master/scripts/convertmodel/webgpu_hf_demo.mjs" target="_blank" rel="noopener">webgpu_hf_demo.mjs</a>
+                    and <a href="https://github.com/onnxsim/onnxsim/blob/master/scripts/convertmodel/test/make_step_graph_fixtures.py" target="_blank" rel="noopener">test/make_step_graph_fixtures.py</a>
+                    for exactly what each demo trains and why.
+                </p>
+            </details>
             <div>
                 <label for="webgpu-demo-mode">demo</label>
                 <select id="webgpu-demo-mode">
@@ -812,21 +863,26 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             Renders the model graph with a self-hosted
             <a href="https://github.com/onnxsim/netron" target="_blank" rel="noopener">Netron</a>:
             the original model on the left and the simplified/optimized result on
-            the right, so you can compare them side by side. Nothing is uploaded —
-            the model bytes are posted straight into the embedded Netron in your
-            browser, so there is no model-size limit. Use <b>export SVG</b> to save
-            the rendered graph as an SVG image.
-            <br>
-            The quantized result has its own Netron preview inside the
-            <a href="#sec-quantize">Quantize panel</a> above instead of a third
-            pane here, so it never crowds this before/after comparison.
+            the right. Nothing is uploaded.
         </p>
-        <p class="macs-note">
-            Netron is driven here purely as an embeddable model-preview component
-            over a <code>postMessage</code> protocol; that idea and protocol are
-            being discussed upstream in
-            <a href="https://github.com/lutzroeder/netron/pull/1591#issuecomment-5148706256" target="_blank" rel="noopener">lutzroeder/netron#1591</a>.
-        </p>
+        <details class="tool-details">
+            <summary>Model-size limit, the quantized preview, and the Netron embedding — details</summary>
+            <p class="note">
+                The model bytes are posted straight into the embedded Netron in your
+                browser, so there is no model-size limit. Use <b>export SVG</b> to save
+                the rendered graph as an SVG image.
+                <br>
+                The quantized result has its own Netron preview inside the
+                <a href="#sec-quantize">Quantize panel</a> above instead of a third
+                pane here, so it never crowds this before/after comparison.
+            </p>
+            <p class="macs-note">
+                Netron is driven here purely as an embeddable model-preview component
+                over a <code>postMessage</code> protocol; that idea and protocol are
+                being discussed upstream in
+                <a href="https://github.com/lutzroeder/netron/pull/1591#issuecomment-5148706256" target="_blank" rel="noopener">lutzroeder/netron#1591</a>.
+            </p>
+        </details>
         <div id="netron-panes" class="wide" style="display: flex; gap: 1em; flex-wrap: wrap;">
             <div class="netron-pane">
                 <div class="netron-head">
@@ -856,42 +912,48 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <p>
             Lists the model's symbolic axis names (ONNX
             <code>dim_param</code>s) on its graph inputs and outputs —
-            <b>before</b> and <b>after</b> simplify/optimize — so you can see how
-            the conversion changed the dynamic axes: a <code>batch</code> /
-            <code>sequence</code> axis kept symbolic, or a symbolic dimension
-            folded to a fixed size. Read straight from the model bytes in your
-            browser (nothing is uploaded); symbolic axes are shown
-            <span class="dp-param">highlighted</span>.
+            <b>before</b> and <b>after</b> simplify/optimize. Read straight from
+            the model bytes in your browser (nothing is uploaded); symbolic axes
+            are shown <span class="dp-param">highlighted</span>.
         </p>
-        <p class="note">
-            <b>Try it:</b>
-            <a href="?model=https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx&amp;optimizer=simplify">load
-            <code>Xenova/all-MiniLM-L6-v2</code></a>
-            (a ~21&nbsp;MB quantized MiniLM sentence-transformer) — its inputs
-            and output carry the named dynamic axes <code>batch_size</code> and
-            <code>sequence_length</code>, so they show up here on both the
-            <b>before</b> and <b>after</b> sides. Most image models (e.g. the
-            <code>onnxmodelzoo</code> ResNets in the dropdown) are fully static
-            and list no <code>dim_param</code>s.
-        </p>
+        <details class="tool-details">
+            <summary><b>Try it:</b> load <code>Xenova/all-MiniLM-L6-v2</code> to see dim_params — details</summary>
+            <p class="note">
+                <a href="?model=https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx&amp;optimizer=simplify">load
+                <code>Xenova/all-MiniLM-L6-v2</code></a>
+                (a ~21&nbsp;MB quantized MiniLM sentence-transformer) — its inputs
+                and output carry the named dynamic axes <code>batch_size</code> and
+                <code>sequence_length</code>, so they show up here on both the
+                <b>before</b> and <b>after</b> sides. Most image models (e.g. the
+                <code>onnxmodelzoo</code> ResNets in the dropdown) are fully static
+                and list no <code>dim_param</code>s.
+            </p>
+        </details>
         <div id="dim-params-content"></div>
         <script type="module" src="./shapes_view.mjs"></script>
 
         <h2 id="sec-webgpu-kernels">Custom WebGPU kernels</h2>
         <p>
-            Lists every node that carries a custom WebGPU program attached via
-            <a href="https://github.com/onnxsim/onnxsim/blob/master/docs/webgpu-kernel-dispatch.md" target="_blank" rel="noopener">onnxsim's
-            WebGPU kernel metadata</a> (hand-written, or generated by
+            Lists every node that carries a custom
+            <a href="https://github.com/onnxsim/onnxsim/blob/master/docs/webgpu-kernel-dispatch.md" target="_blank" rel="noopener">WebGPU
+            kernel metadata</a> — <b>before</b> and <b>after</b>
+            simplify/optimize. Nothing is uploaded. This panel is read-only.
+        </p>
+        <details class="tool-details">
+            <summary>Where this metadata comes from, and how the WGSL is shown — details</summary>
+            <p class="note">
+            Attached via onnxsim's WebGPU kernel metadata
+            (hand-written, or generated by
             <code>onnxsim.webgpu_tinygrad_codegen</code> for a gap
             <code>onnxsim.webgpu_target</code> flags, e.g. a 3-D <code>Conv</code>
-            or an <code>align_corners</code> <code>Resize</code>) — <b>before</b>
-            and <b>after</b> simplify/optimize, since a conversion can rename or
-            fuse away an annotated node. Read straight from the model bytes in
-            your browser (nothing is uploaded); each step's WGSL source and
+            or an <code>align_corners</code> <code>Resize</code>), since a
+            conversion can rename or fuse away an annotated node. Read straight
+            from the model bytes in your browser; each step's WGSL source and
             bindings are shown collapsed — click a step to expand it.
-            This panel is read-only: it does not detect gaps or generate a
+            This panel does not detect gaps or generate a
             kernel itself, only displays what a model already carries.
-        </p>
+            </p>
+        </details>
         <div id="webgpu-kernels-content"></div>
         <script type="module" src="./webgpu_kernel_annotations_view.mjs"></script>
         <script type="module" src="./hf_load.mjs"></script>
@@ -966,61 +1028,70 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <h2 id="sec-inference">Run inference (onnxruntime-web)</h2>
         <p>
             Runs a model for a few iterations to check it executes, using dummy
-            inputs generated from the model's input shapes. The <b>model</b>
-            picker chooses what to run: <b>compare (before vs after
-            conversion)</b> — the default — runs <i>both</i> the original upload
-            and the converted result on the <b>same</b> deterministic input and
-            reports how far their outputs diverge (max |Δ|) plus the speed
-            difference, so you can confirm the simplify/optimize step preserved
-            the model's numerics and see how much faster it got. You can also run
-            just the <b>converted</b> result or the <b>original</b> upload on
-            their own. The <b>batch</b> control sizes the model's dynamic batch
-            (first) axis; it has no effect on inputs whose first dimension is
-            fixed. The <b>warmup</b> control runs that many untimed passes before
-            the timed iterations, so one-time costs (kernel/program compilation,
-            buffer allocation) don't add noise to the reported latency; set it to
-            0 to time every run. WebGPU falls back to WebAssembly when
-            unavailable. Tick <b>auto-run after each conversion</b> to run this
-            panel automatically whenever a conversion finishes (with the options
-            selected here), instead of clicking <b>Run inference</b> each time.
-            The <b>input fill</b> picker's <b>sample data</b> option feeds real
-            data instead of synthetic numbers: a photo from
-            <a href="https://huggingface.co/datasets/uoft-cs/cifar10" target="_blank" rel="noopener">uoft-cs/cifar10</a>
-            for an image-shaped input, or a tokenized sentence from
-            <a href="https://huggingface.co/datasets/stanfordnlp/sst2" target="_blank" rel="noopener">stanfordnlp/sst2</a>
-            for a recognized NLP model's <code>input_ids</code>/
-            <code>attention_mask</code>/<code>token_type_ids</code> — both
-            fetched live from Hugging Face for each run. Any input that doesn't
-            match one of those shapes, or an NLP model whose tokenizer family
-            isn't recognized, falls back to random fill (logged in the output
-            below). With <b>sample data</b> selected, a run also shows what it
-            actually fed the model and got back — the fetched image/sentence
-            next to the model's raw output, decoded as top-5 ImageNet-1k
-            predictions when the output looks like a standard 1000-way
-            classifier (a best-effort guess, not verified per model).
+            inputs generated from the model's input shapes. <b>compare (before
+            vs after conversion)</b> — the default — runs both the original
+            upload and the converted result on the same input and reports how
+            far their outputs diverge plus the speed difference.
         </p>
-        <p>
-            The execution-provider picker also offers
-            <a href="https://www.w3.org/TR/webnn/" target="_blank" rel="noopener">WebNN</a>
-            (GPU / NPU / CPU), which runs the model through the browser's own
-            ML stack. WebNN is <b>experimental</b> and ships behind a flag
-            (Chrome/Edge: <code>chrome://flags/#web-machine-learning-neural-network</code>),
-            with the broadest support on Windows — the <b>WebNN status</b> line
-            below the controls reports whether it is usable in your browser, and
-            any WebNN run falls back to WebAssembly when the chosen device or an
-            operator is unsupported.
-        </p>
-        <p>
-            If the model carries onnxsim's MAC/FLOP metrics in its
-            <code>metadata_props</code> (onnxsim
-            <a href="https://github.com/onnxsim/onnxsim/pull/527" target="_blank" rel="noopener">PR #527</a>,
-            e.g. annotated via <code>onnxsim.model_info.annotate_metadata</code>),
-            they are shown below with the achieved throughput (GFLOP/s = model
-            FLOPs ÷ average latency). With <b>annotate model info</b> on (the
-            default), the converter bakes these metrics into <i>both</i> the
-            converted result <i>and</i> the original upload, so you can run each
-            and compare their MACs alongside the measured inference speed.
-        </p>
+        <details class="tool-details">
+            <summary>What each control does (model picker, batch, warmup, input fill, WebNN, MACs) — details</summary>
+            <p>
+                The <b>model</b>
+                picker chooses what to run: <b>compare (before vs after
+                conversion)</b> — the default — runs <i>both</i> the original upload
+                and the converted result on the <b>same</b> deterministic input and
+                reports how far their outputs diverge (max |Δ|) plus the speed
+                difference, so you can confirm the simplify/optimize step preserved
+                the model's numerics and see how much faster it got. You can also run
+                just the <b>converted</b> result or the <b>original</b> upload on
+                their own. The <b>batch</b> control sizes the model's dynamic batch
+                (first) axis; it has no effect on inputs whose first dimension is
+                fixed. The <b>warmup</b> control runs that many untimed passes before
+                the timed iterations, so one-time costs (kernel/program compilation,
+                buffer allocation) don't add noise to the reported latency; set it to
+                0 to time every run. WebGPU falls back to WebAssembly when
+                unavailable. Tick <b>auto-run after each conversion</b> to run this
+                panel automatically whenever a conversion finishes (with the options
+                selected here), instead of clicking <b>Run inference</b> each time.
+                The <b>input fill</b> picker's <b>sample data</b> option feeds real
+                data instead of synthetic numbers: a photo from
+                <a href="https://huggingface.co/datasets/uoft-cs/cifar10" target="_blank" rel="noopener">uoft-cs/cifar10</a>
+                for an image-shaped input, or a tokenized sentence from
+                <a href="https://huggingface.co/datasets/stanfordnlp/sst2" target="_blank" rel="noopener">stanfordnlp/sst2</a>
+                for a recognized NLP model's <code>input_ids</code>/
+                <code>attention_mask</code>/<code>token_type_ids</code> — both
+                fetched live from Hugging Face for each run. Any input that doesn't
+                match one of those shapes, or an NLP model whose tokenizer family
+                isn't recognized, falls back to random fill (logged in the output
+                below). With <b>sample data</b> selected, a run also shows what it
+                actually fed the model and got back — the fetched image/sentence
+                next to the model's raw output, decoded as top-5 ImageNet-1k
+                predictions when the output looks like a standard 1000-way
+                classifier (a best-effort guess, not verified per model).
+            </p>
+            <p>
+                The execution-provider picker also offers
+                <a href="https://www.w3.org/TR/webnn/" target="_blank" rel="noopener">WebNN</a>
+                (GPU / NPU / CPU), which runs the model through the browser's own
+                ML stack. WebNN is <b>experimental</b> and ships behind a flag
+                (Chrome/Edge: <code>chrome://flags/#web-machine-learning-neural-network</code>),
+                with the broadest support on Windows — the <b>WebNN status</b> line
+                below the controls reports whether it is usable in your browser, and
+                any WebNN run falls back to WebAssembly when the chosen device or an
+                operator is unsupported.
+            </p>
+            <p>
+                If the model carries onnxsim's MAC/FLOP metrics in its
+                <code>metadata_props</code> (onnxsim
+                <a href="https://github.com/onnxsim/onnxsim/pull/527" target="_blank" rel="noopener">PR #527</a>,
+                e.g. annotated via <code>onnxsim.model_info.annotate_metadata</code>),
+                they are shown below with the achieved throughput (GFLOP/s = model
+                FLOPs ÷ average latency). With <b>annotate model info</b> on (the
+                default), the converter bakes these metrics into <i>both</i> the
+                converted result <i>and</i> the original upload, so you can run each
+                and compare their MACs alongside the measured inference speed.
+            </p>
+        </details>
         <div>
             <label for="inference-source">model</label>
             <select id="inference-source">
