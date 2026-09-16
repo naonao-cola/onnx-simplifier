@@ -28,6 +28,7 @@
 #include "passes/quantize_matmul_common.h"
 #include "passes/quarot.h"
 #include "passes/static_quantize_matmul.h"
+#include "passes/zeroquant.h"
 
 onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model) {
   PrepareSchemasForDebug(model);
@@ -380,6 +381,40 @@ onnx::ModelProto ApplyQuipSharp(const onnx::ModelProto& model) {
   onnxsim::RegisterCustomOptimizerPasses();
   return onnx::optimization::OptimizeFixed(
       model, std::vector<std::string>{"quip_sharp"});
+}
+
+onnx::ModelProto ApplyAttentionQuantization(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"attention_quantization"});
+}
+
+onnx::ModelProto ApplyZeroQuant(const onnx::ModelProto& model,
+                                int64_t block_size, float epsilon) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  // zeroquant reads these the same way quarot reads QuarotBlockSize()/
+  // QuarotEpsilon() -- OptimizeFixed's pass-name list has no way to carry a
+  // parameter directly.
+  onnx::optimization::onnxsim_passes::ZeroQuantBlockSize() = block_size;
+  onnx::optimization::onnxsim_passes::ZeroQuantEpsilon() = epsilon;
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"zeroquant"});
+}
+
+onnx::ModelProto ApplyIntactKv(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"intactkv"});
+}
+
+onnx::ModelProto ApplyKbvqMoe(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"kbvq_moe"});
 }
 
 std::vector<std::string> ListQuantizableActivations(

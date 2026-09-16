@@ -349,6 +349,47 @@ export async function applyQuipSharp(model) {
 }
 
 /**
+ * Attention computation quantization: per-token dynamic INT8 for the
+ * decomposed attention subgraph's own Q/K/V operands, fixed-scale UINT8 for
+ * the Softmax output. Unlike every other data-free pass above, this is not
+ * a weight quantizer -- none of the four quantized tensors is a constant
+ * weight, so this builds new quantize/dequantize graph nodes instead of
+ * replacing an initializer. Needs opset 18+.
+ */
+export async function applyAttentionQuantization(model) {
+  return callModelPass("onnxsim_apply_attention_quantization", model);
+}
+
+/**
+ * ZeroQuant: group-wise INT8 weight quantization paired with per-token
+ * dynamic INT8 activation quantization, executed as a real int8 x int8
+ * MatMulInteger (unlike every other per-token-dynamic-INT8 pass in this
+ * module, which simulates precision loss with an immediate float
+ * round-trip instead). Needs opset 18+.
+ */
+export async function applyZeroquant(model, { blockSize = 32, epsilon = 1e-12 } = {}) {
+  return callModelPass("onnxsim_apply_zeroquant", model, [blockSize, epsilon]);
+}
+
+/**
+ * IntactKV: splits a KV-cache stream's own fixed-length leading pivot
+ * prefix into its own always-exact stream, so a following KV-cache
+ * quantizer can leave those tokens untouched. A companion pass, not a
+ * quantizer -- real graph input/output surgery, not a weight replacement.
+ */
+export async function applyIntactkv(model) {
+  return callModelPass("onnxsim_apply_intactkv", model);
+}
+
+/**
+ * KBVQ-MoE: KLT-shared-basis plus per-expert bias-corrected vector
+ * quantization for a com.microsoft::MoE router group's own experts.
+ */
+export async function applyKbvqMoe(model) {
+  return callModelPass("onnxsim_apply_kbvq_moe", model);
+}
+
+/**
  * DAQ (Delta-Aware Quantization): unlike every other data-free pass
  * above, this needs TWO models (a base and a fine-tuned checkpoint,
  * matched by node output name), so it does not go through
@@ -1032,6 +1073,10 @@ export default {
   applyDropByDrop,
   applyLoBcq,
   applyQuipSharp,
+  applyAttentionQuantization,
+  applyZeroquant,
+  applyIntactkv,
+  applyKbvqMoe,
   applyDaq,
   applyLowRankCompensation,
   pruneMagnitude,

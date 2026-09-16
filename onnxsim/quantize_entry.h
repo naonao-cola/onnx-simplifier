@@ -110,3 +110,8 @@ onnx::ModelProto ApplyAQLM(const onnx::ModelProto& model);
 onnx::ModelProto ApplyDropByDrop(const onnx::ModelProto& model);
 onnx::ModelProto ApplyLoBcq(const onnx::ModelProto& model);
 onnx::ModelProto ApplyQuipSharp(const onnx::ModelProto& model);
+onnx::ModelProto ApplyAttentionQuantization(const onnx::ModelProto& model);
+onnx::ModelProto ApplyZeroQuant(const onnx::ModelProto& model,
+                                int64_t block_size, float epsilon);
+onnx::ModelProto ApplyIntactKv(const onnx::ModelProto& model);
+onnx::ModelProto ApplyKbvqMoe(const onnx::ModelProto& model);

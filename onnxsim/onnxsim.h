@@ -1124,6 +1124,89 @@ onnx::ModelProto ApplyLoBcq(const onnx::ModelProto& model);
 // entry points, not aliases.
 onnx::ModelProto ApplyQuipSharp(const onnx::ModelProto& model);
 
+// Attention computation quantization -- C++ port of
+// attention_quantization.py's own apply_attention_quantization: quantizes
+// the decomposed attention subgraph's own Q/K/V operands (data-free,
+// per-token dynamic INT8, scale = max(|x|, axis=-1)/127) and the Softmax
+// output itself (a fixed UINT8 scale of 1/255, since a Softmax output's
+// range is guaranteed [0, 1]). Unlike every weight-only *_cpp port in this
+// repo, this is not a fold-to-initializer pass -- none of the four
+// quantized tensors is a constant weight, so this builds real new
+// quantize/dequantize graph nodes instead, the same shape
+// ApplyIBertSoftmax/ApplyQuarot already establish. See
+// passes/attention_quantization.h for the exact match/rewrite and its own
+// documented FLOAT-dtype scope narrowing. No RNG/fitting step anywhere in
+// this technique, so this port is expected to track
+// apply_attention_quantization closely, up to ordinary floating-point
+// summation-order differences.
+onnx::ModelProto ApplyAttentionQuantization(const onnx::ModelProto& model);
+
+// ZeroQuant (Yao et al., 2022) -- C++ port of zeroquant.py's own
+// apply_zeroquant: pairs this repo's own existing group-wise INT8 weight
+// quantization (quantize_weight_only_int8_block) with per-token dynamic
+// INT8 activation quantization, and -- unlike every other per-token-
+// dynamic-INT8 use in this repo, which immediately dequantizes back to
+// float32 -- feeds the result into a genuine int8 x int8 MatMulInteger.
+// Cannot fold to a single replacement weight (the activation's own
+// per-token scale is a runtime value, the same reason ApplyQuarot can't
+// fold either); builds real new graph nodes instead, node for node
+// matching zeroquant.py's own Shape/Gather/Concat/Reshape flatten prelude
+// and Split/MatMulInteger/Cast/Mul/Sum construction. See passes/zeroquant.h
+// for the exact node sequence and its own "Why grouped MatMulInteger"
+// rationale. `block_size` (elements per weight-quantization group along K,
+// default 32) and `epsilon` (scale floor, default 1e-12) mirror
+// apply_zeroquant's own identically-named/defaulted parameters exactly. No
+// RNG/fitting step anywhere in this technique, so this port is expected to
+// track apply_zeroquant closely, up to ordinary floating-point
+// summation-order differences.
+onnx::ModelProto ApplyZeroQuant(const onnx::ModelProto& model,
+                                int64_t block_size, float epsilon);
+
+// IntactKV (Liu et al., 2024) -- C++ port of intactkv.py's own
+// apply_intactkv: not a quantizer, but a *companion* pass that splits a
+// KV-cache stream's own fixed-length leading "pivot" prefix
+// (attention-sink tokens, disproportionately sensitive to quantization
+// error) out into its own always-exact stream, so a following KV-cache
+// quantizer can leave the pivots untouched forever and quantize only the
+// remaining, still-growing "rest" of the cache. Matches a
+// `Concat(past, new, axis=seq)` KV-cache stream (past: a float32 graph
+// input consumed by nothing else, output: a graph output) and rewrites it
+// into a new fixed-size `*_pivot` graph input/output plus an ordinary
+// `*_rest` stream, reconstructed back under the ORIGINAL present_* name via
+// a new Concat node -- real graph input/output surgery, not a
+// fold-to-initializer or a same-shape node rewrite. See passes/intactkv.h
+// for the exact match/rewrite. No RNG/fitting step anywhere in this
+// technique (a closed-form structural transformation), so this port is
+// expected to track apply_intactkv exactly. This port hardcodes
+// intactkv.py's own default `num_pivot_tokens=4` rather than exposing it as
+// a parameter.
+onnx::ModelProto ApplyIntactKv(const onnx::ModelProto& model);
+
+// KBVQ-MoE (Xu et al., 2026) -- C++ port of kbvq_moe.py's own
+// apply_kbvq_moe: fits a KLT (PCA) basis shared across a `com.microsoft::
+// MoE` router group's own experts (a closed-form economy SVD of the
+// centered [E, D] expert-weight stack, the same Jacobi-SVD technique
+// low_rank_compensation_entry.cpp already establishes for this codebase --
+// see passes/kbvq_moe.h's own "SVD IMPLEMENTATION NOTE" for why this port
+// keeps its own header-only copy rather than sharing that file's), then
+// vector-quantizes each expert's own residual against that shared basis
+// with an ordinary per-expert k-means codebook (reusing
+// kmeans_quantization.h's own QuantizeDequantizeKMeans directly -- see
+// passes/kbvq_moe.h's own top-of-file comment for why its bits=4/
+// kmeans_iters=20 defaults already match that function's own hardcoded
+// constants exactly). Only FLOAT32 fc1_experts_weights/fc2_experts_weights
+// are quantized (FLOAT16/BFLOAT16 left untouched, matching kbvq_moe.py's
+// own scope exactly); node/shape matching mirrors pruning.py's own
+// _match_moe_producer, reused unmodified by kbvq_moe.py itself. ACCEPTED,
+// PERMANENT DIVERGENCE from apply_kbvq_moe: none beyond what
+// kmeans_quantization.h's own top-of-file comment already documents for
+// QuantizeDequantizeKMeans's own deterministic percentile-init scheme (vs.
+// kbvq_moe.py's own seeded-random-sample fallback in the rare
+// too-few-distinct-percentiles edge case) -- the KLT/SVD piece itself has
+// no RNG at all. This port hardcodes kbvq_moe.py's own defaults (rank=4,
+// bits=4, kmeans_iters=20) rather than exposing them as parameters.
+onnx::ModelProto ApplyKbvqMoe(const onnx::ModelProto& model);
+
 // DAQ (Delta-Aware Quantization) -- C++ port of daq.py's own apply_daq,
 // declared in daq_entry.h (included above) rather than duplicated here.
 // Unlike every other port in this file, DAQ is data-free but still takes

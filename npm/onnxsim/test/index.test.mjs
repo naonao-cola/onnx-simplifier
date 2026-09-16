@@ -48,6 +48,10 @@ import {
   applyDropByDrop,
   applyLoBcq,
   applyQuipSharp,
+  applyAttentionQuantization,
+  applyZeroquant,
+  applyIntactkv,
+  applyKbvqMoe,
   applyDaq,
   applyLowRankCompensation,
   applyMoeExpertChannelPruning,
@@ -181,6 +185,14 @@ try {
       applyDropByDrop,
       applyLoBcq,
       applyQuipSharp,
+      // FIXTURE has no decomposed-attention/MoE subgraph, so
+      // applyAttentionQuantization/applyKbvqMoe match nothing and the model
+      // comes back unchanged -- same "binding round-trips" point as
+      // applyQuarot's own inclusion in the pruning sweep below.
+      applyAttentionQuantization,
+      applyZeroquant,
+      applyIntactkv,
+      applyKbvqMoe,
     ]) {
       const out = await fn(input);
       assert.ok(out instanceof Uint8Array, fn.name);
