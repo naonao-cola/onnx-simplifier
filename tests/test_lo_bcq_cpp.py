@@ -152,7 +152,9 @@ def test_cpp_beats_naive_single_codebook_baseline_on_multiscale_weight():
     centroids = np.unique(np.percentile(sorted_vals, percentiles))
     if centroids.shape[0] < _NUM_CODES:
         extra_rng = np.random.default_rng(123)
-        extra = extra_rng.choice(flat, size=_NUM_CODES - centroids.shape[0], replace=True)
+        extra = extra_rng.choice(
+            flat, size=_NUM_CODES - centroids.shape[0], replace=True
+        )
         centroids = np.concatenate([centroids, extra])
     for _ in range(20):
         dist = np.abs(flat[:, None] - centroids[None, :])
