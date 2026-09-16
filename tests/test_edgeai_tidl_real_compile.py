@@ -81,3 +81,44 @@ def test_simplify_does_not_regress_real_tidl_offload(name, tmp_path):
     assert simp["returncode"] == 0, simp["stdout"][-2000:]
     assert simp["c7x_nodes"] >= orig["c7x_nodes"], (orig, simp)
     assert simp["cpu_nodes"] <= orig["cpu_nodes"], (orig, simp)
+
+
+def test_prequantized_qdq_import_still_crashes(tmp_path):
+    """Documents a real, reproduced bug rather than assuming it's fixed.
+
+    `quantize_for_tidl.py`'s docstring records that feeding a QDQ model
+    (produced by `onnxsim.calibration.quantize_static`, which matches
+    edgeai-tidl-tools' own documented per-layer quantization scheme
+    exactly) back into the real compiler via
+    `advanced_options:prequantized_model=1` segfaults the x86 PC compiler,
+    on both a `Conv`-only and a `MatMul`-only model, in `tidl_tools`
+    release `11_02_20_00`. If this test starts failing because the
+    compile now succeeds (`returncode == 0`), that's TI's real bug fixed
+    upstream, not a regression -- update `quantize_for_tidl.py`'s
+    docstring accordingly instead of just deleting this test.
+    """
+    import onnx
+
+    from onnxsim.calibration import generate_random_calibration_data
+
+    sys.path.insert(0, _EDGEAI_DIR)
+    import quantize_for_tidl as qft
+
+    model = models.build("conv_bn_relu")
+    calibration_data = generate_random_calibration_data(model, num_samples=8, seed=0)
+    quantized = qft.quantize_for_tidl(model, calibration_data=calibration_data)
+    assert qft.check_tidl_qdq_scheme(quantized) == []
+
+    quantized = onnx.shape_inference.infer_shapes(quantized)
+    model_path = str(tmp_path / "conv_bn_relu_qdq.onnx")
+    onnx.save(quantized, model_path)
+    result = rc.compile_offload_summary(
+        _TIDL_PYTHON,
+        model_path,
+        _TIDL_TOOLS_PATH,
+        str(tmp_path / "artifacts_prequantized"),
+        extra_provider_options={"advanced_options:prequantized_model": 1},
+    )
+    assert result["returncode"] != 0, (
+        "prequantized QDQ import no longer crashes -- see this test's docstring"
+    )

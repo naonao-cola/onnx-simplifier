@@ -145,12 +145,16 @@ def tidl_tools_path() -> Optional[str]:
 
 # Run in the TIDL_PYTHON subprocess (see `find_tidl_python`'s docstring for
 # why this can't run in-process under whatever interpreter pytest uses).
+# A crash in TIDL's native compiler (confirmed real: see
+# quantize_for_tidl.py's docstring) kills this subprocess, not the caller --
+# that isolation is exactly why this runs out-of-process in the first place.
 _COMPILE_SCRIPT = r"""
-import os, sys, shutil
+import json, os, sys, shutil
 import numpy as np
 import onnxruntime as ort
 
 model_path, artifacts_dir, tidl_tools_path = sys.argv[1], sys.argv[2], sys.argv[3]
+extra_provider_options = json.loads(sys.argv[4]) if len(sys.argv) > 4 else {}
 if os.path.exists(artifacts_dir):
     shutil.rmtree(artifacts_dir)
 os.makedirs(artifacts_dir)
@@ -164,6 +168,7 @@ provider_options = {
     "debug_level": 1,
     "advanced_options:calibration_frames": 1,
     "advanced_options:calibration_iterations": 1,
+    **extra_provider_options,
 }
 sess = ort.InferenceSession(
     model_path,
@@ -185,6 +190,7 @@ def compile_offload_summary(
     tidl_tools_path: str,
     artifacts_dir: str,
     timeout: int = 300,
+    extra_provider_options: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """Compile `model_path` for TIDL and parse the offload summary it prints.
 
@@ -192,11 +198,19 @@ def compile_offload_summary(
         ``{"c7x_nodes": int, "c7x_subgraphs": int, "cpu_nodes": int,
         "returncode": int, "stdout": str, "stderr": str}``.
     ``c7x_nodes``/``c7x_subgraphs`` are 0 if nothing was offloaded (or the
-    compile failed -- check ``returncode``). Extra environment beyond
+    compile failed -- check ``returncode``, which is negative on POSIX if
+    the compile crashed rather than exited, e.g. ``-11`` for the confirmed
+    real ``advanced_options:prequantized_model=1`` segfault --
+    ``quantize_for_tidl.py``'s docstring). Extra environment beyond
     ``TIDL_TOOLS_PATH`` (notably ``LD_LIBRARY_PATH`` including that same
     directory, which the native `.so`\\ s need to resolve their own
     dependencies) is set here rather than left to the caller.
+    :param extra_provider_options: merged into the default provider options
+        (``tensor_bits``, ``artifacts_folder``, minimal calibration frames);
+        e.g. ``{"advanced_options:prequantized_model": 1}``.
     """
+    import json
+
     env = dict(os.environ)
     env["TIDL_TOOLS_PATH"] = tidl_tools_path
     env["LD_LIBRARY_PATH"] = (
@@ -204,7 +218,15 @@ def compile_offload_summary(
     )
 
     proc = subprocess.run(
-        [python_exe, "-c", _COMPILE_SCRIPT, model_path, artifacts_dir, tidl_tools_path],
+        [
+            python_exe,
+            "-c",
+            _COMPILE_SCRIPT,
+            model_path,
+            artifacts_dir,
+            tidl_tools_path,
+            json.dumps(extra_provider_options or {}),
+        ],
         capture_output=True,
         text=True,
         timeout=timeout,

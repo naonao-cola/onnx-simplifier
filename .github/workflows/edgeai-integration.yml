@@ -39,6 +39,7 @@ on:
       - "scripts/common/**"
       - "tests/test_edgeai_tidl_compat.py"
       - "tests/test_edgeai_legalize.py"
+      - "tests/test_edgeai_quantize_for_tidl.py"
       - "tests/test_edgeai_tidl_real_compile.py"
 
 concurrency:
@@ -94,7 +95,9 @@ jobs:
       - name: Install onnxsim wheel
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest
+          # onnxruntime: quantize_for_tidl.py's onnxsim.calibration.quantize_static
+          # runs the float model to collect calibration ranges.
+          python -m pip install pytest onnxruntime
           python -m pip install wheelhouse/*.whl
       # Run from runner.temp, not the checkout: the repo root contains the
       # `onnxsim/` source dir (no compiled extension), which would shadow the
@@ -108,7 +111,8 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           pytest -v "$GITHUB_WORKSPACE/tests/test_edgeai_tidl_compat.py" \
-            "$GITHUB_WORKSPACE/tests/test_edgeai_legalize.py"
+            "$GITHUB_WORKSPACE/tests/test_edgeai_legalize.py" \
+            "$GITHUB_WORKSPACE/tests/test_edgeai_quantize_for_tidl.py"
           python "$GITHUB_WORKSPACE/scripts/edgeai/run_tidl_compat.py" \
             --output tidl-compat.csv
       - uses: actions/upload-artifact@v7
@@ -145,7 +149,10 @@ jobs:
       - name: Install onnxsim + pytest (cp312)
         run: |
           "${{ steps.py312.outputs.python-path }}" -m pip install --upgrade pip
-          "${{ steps.py312.outputs.python-path }}" -m pip install onnx pytest wheelhouse/*.whl
+          # onnxruntime: quantize_for_tidl.py's onnxsim.calibration.quantize_static
+          # (used by test_prequantized_qdq_import_still_crashes) runs the float
+          # model to collect calibration ranges.
+          "${{ steps.py312.outputs.python-path }}" -m pip install onnx onnxruntime pytest wheelhouse/*.whl
       - name: Download the real tidl_tools + onnxruntime_tidl wheel
         run: |
           "${{ steps.py312.outputs.python-path }}" \

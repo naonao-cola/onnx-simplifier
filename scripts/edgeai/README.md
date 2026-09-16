@@ -163,12 +163,81 @@ what is matched and what is conservatively left alone. Run standalone as
 rewrite is compared against `onnx.reference.ReferenceEvaluator` on the
 original graph).
 
+## Quantization: what TIDL supports, and using onnxsim's own quantizer
+
+Surveyed directly from `docs/quantization.md`, `docs/quantization_proto.md`,
+and `docs/model_compilation.md`'s "Quantization Specific Options" table
+(all fetched the same way as the operator docs above).
+
+**Precision TIDL's C7x-MMA actually runs in: 8-bit and 16-bit fixed-point,
+and mixtures of the two -- nothing lower.**
+
+- **8-bit is the default and "recommended for optimal performance"** on
+  every supported SoC.
+- **16-bit** is available "for cases requiring higher precision", at a
+  performance cost.
+- **Mixed precision** (per-layer 8-bit *or* 16-bit, not both at once on
+  the same tensor) is TIDL's main accuracy/performance dial -- manual
+  (`advanced_options:output_feature_16bit_names_list`/
+  `params_16bit_names_list`) or automatic
+  (`advanced_options:mixed_precision_factor`, framed as a latency budget:
+  `T_mixed_precision / T_8bit`).
+- **32-bit is floating point and explicitly "not supported for target
+  execution"** (`model_compilation.md`'s `tensor_bits` option) -- it's the
+  CPU-fallback path, not something the accelerator runs.
+- No 4-bit (or lower) mode is documented anywhere in these three files.
+
+Other real constraints worth knowing before assuming "any QDQ model
+works": **asymmetric quantization is unsupported on one SoC**
+(`J721E`/`TDA4VM` -- symmetric-only there; every other SoC supports both);
+weights are quantized **per-channel** and activations **per-tensor**
+(`docs/quantization.md`'s per-layer table, e.g.
+`TIDL_ConvolutionLayer`: "Weights: Symmetric, Per-channel" /
+"Activations: Asymmetric, Per-tensor" -- the exact scheme
+`quantize_for_tidl.py` below matches); and QAT (embedding ranges into the
+model at training time, near-zero accuracy drop) is documented as
+**`J721E`/`TDA4VM`-specific**, via a separate project
+([edgeai-modeloptimization](https://github.com/TexasInstruments/edgeai-tensorlab/blob/main/edgeai-modeloptimization/torchmodelopt/README.md#quantization)),
+not this repo.
+
+**`quantize_for_tidl.py` uses `onnxsim.calibration.quantize_static`/
+`quantize_static_int16`** (already in this package) as exactly the "use
+your own quantization algorithm" case `docs/quantization.md`'s
+pre-quantized-models section names as a first-class use case for feeding
+TIDL an ONNX QDQ model directly
+(`advanced_options:prequantized_model=1`). Structurally, the match to
+`docs/quantization.md`'s per-layer table is exact --
+`check_tidl_qdq_scheme()` checks this on any model.
+
+**But actually compiling that QDQ output through the real x86 PC
+compiler segfaults it**, confirmed by trying rather than assumed working
+just because the structure matches: `advanced_options:prequantized_model=1`
+crashes `tidl_tools` release `11_02_20_00` on both a `Conv`-only and a
+separate `MatMul`-only model, always at the same point
+(`TIDL_runtimesOptimizeNet`, right after optimization for the subgraph
+starts). The same exact models compile fine through TIDL's *own*
+calibration on the plain float model. `tests/test_edgeai_tidl_real_compile.py::
+test_prequantized_qdq_import_still_crashes` reproduces this as a
+regression guard (documenting the bug, not working around it) -- see
+`quantize_for_tidl.py`'s docstring for the full record, including a
+parallel attempt at the third documented path (`quant_params_proto_path`
+"write mode") that didn't produce output in testing either, so isn't
+wired up.
+
+**So, for now**: use `quantize_for_tidl.py` to produce and structurally
+validate a QDQ model (for inspection, another QDQ-aware runtime, or a
+future/patched `tidl_tools` release), but compile via TIDL's own
+calibration on the *float* `onnxsim.simplify()` output for an actual
+compile today -- plain `tensor_bits: 8`/`16` provider options, per
+`real_compile.py`'s already-confirmed-working path.
+
 ## Files
 
 - `tidl_ops.py` -- the op-type blocker lists (control flow, Sequence/
-  Optional, data-dependent-shape ops, host-only ops), the static-shape
-  check, and the decomposed-LayerNorm signature check, plus the functions
-  that walk a `ModelProto` (including subgraphs) to apply them.
+  Optional, data-dependent-shape ops, host-only ops, QOperator-format
+  quantized ops), the static-shape check, and the decomposed-LayerNorm
+  signature check, plus the functions that walk a `ModelProto` (including
+  subgraphs) to apply them.
 - `tidl_backend.py` -- the small `coverage()`/`blockers()`/
   `new_blocking_op_types()`/`dynamic_shape_risks()`/`normalization_risks()`
   API `worker.py` and the tests use, kept separate from `tidl_ops.py` for
@@ -191,8 +260,13 @@ original graph).
 - `legalize.py` -- the fusion rewrites described above.
 - `real_compile.py` -- the real `onnxruntime_tidl`/`tidl_tools` compile
   wrapper described above ("Running a real compile").
+- `quantize_for_tidl.py` -- the QDQ quantization flow and scheme checker
+  described above ("Quantization").
 - `../../tests/test_edgeai_tidl_compat.py` -- the pytest suite CI runs.
 - `../../tests/test_edgeai_legalize.py` -- correctness checks for
   `legalize.py`'s rewrites.
+- `../../tests/test_edgeai_quantize_for_tidl.py` -- structural checks for
+  `quantize_for_tidl.py`'s QDQ output and the QOperator-format blocker.
 - `../../tests/test_edgeai_tidl_real_compile.py` -- the real-compile
-  regression check, skip-guarded on `TIDL_PYTHON`/`TIDL_TOOLS_PATH`.
+  regression check (including the confirmed prequantized-import crash),
+  skip-guarded on `TIDL_PYTHON`/`TIDL_TOOLS_PATH`.

@@ -84,6 +84,26 @@ edgeai-tidl-tools' own real object-detection and segmentation example
 configs) and a **Vision Transformer** encoder block, built using the fused
 ``LayerNormalization`` op and the *decomposed* GELU form -- see
 ``scripts/edgeai/models.py``'s docstring for exactly where each is verified.
+
+**Quantization: QDQ only, never QOperator.** ``docs/operators.md`` lists
+``QuantizeLinear``/``DequantizeLinear`` themselves as supported (only in
+"ONNX QDQ models"), but has no entry anywhere for the fused-integer
+QOperator-format ops (``QLinearConv``, ``QLinearMatMul``, ``ConvInteger``,
+...) a different quantization tool might emit instead of the QDQ
+(float-sandwiched-by-Q/DQ) form. ``QOPERATOR_OPS`` below flags those --
+real ONNX ops, just not ones this importer's supported-op list has a
+mapping for. See ``scripts/edgeai/quantize_for_tidl.py`` for the
+recommended way to actually produce a QDQ-format model (via
+``onnxsim.calibration.quantize_static``/``quantize_static_int16``,
+verified structurally against ``docs/quantization.md``'s per-layer
+scheme table) and, importantly, for a real, reproduced compiler crash
+that recommendation stops short of papering over: feeding that QDQ output
+back into the real ``TIDLCompilationProvider`` via
+``advanced_options:prequantized_model=1`` segfaults the x86 PC compiler in
+the exact `tidl_tools` release this was tested against (11_02_20_00) --
+confirmed on both a `Conv`-only and a `MatMul`-only model, so it is not
+specific to one op or to onnxsim's own output shape. That module's
+docstring has the full record.
 """
 
 from __future__ import annotations
@@ -127,8 +147,34 @@ DATA_DEPENDENT_SHAPE_OPS: frozenset = frozenset({"NonZero", "Unique", "Compress"
 # docstring.
 HOST_ONLY_OPS: frozenset = frozenset({"NonMaxSuppression"})
 
+# QOperator-format fused-integer ops (as opposed to QDQ, the
+# float-sandwiched-by-QuantizeLinear/DequantizeLinear form): none of these
+# have an entry in docs/operators.md, only plain QuantizeLinear/
+# DequantizeLinear do ("only supported in ONNX QDQ models") -- see this
+# module's docstring.
+QOPERATOR_OPS: frozenset = frozenset(
+    {
+        "QLinearConv",
+        "QLinearMatMul",
+        "QGemm",
+        "QLinearAdd",
+        "QLinearMul",
+        "QLinearAveragePool",
+        "QLinearGlobalAveragePool",
+        "QLinearLeakyRelu",
+        "QLinearSigmoid",
+        "QLinearConcat",
+        "ConvInteger",
+        "MatMulInteger",
+    }
+)
+
 BLOCKING_OP_TYPES: frozenset = frozenset(
-    CONTROL_FLOW_OPS | SEQUENCE_OPTIONAL_OPS | DATA_DEPENDENT_SHAPE_OPS | HOST_ONLY_OPS
+    CONTROL_FLOW_OPS
+    | SEQUENCE_OPTIONAL_OPS
+    | DATA_DEPENDENT_SHAPE_OPS
+    | HOST_ONLY_OPS
+    | QOPERATOR_OPS
 )
 
 
@@ -147,6 +193,8 @@ def _reason(op_type: str) -> str:
         return "output shape depends on runtime data, not just input shape"
     if op_type in HOST_ONLY_OPS:
         return "documented as running on the host ARM core, not the accelerator"
+    if op_type in QOPERATOR_OPS:
+        return "QOperator-format fused-integer op; TIDL only supports the QDQ form"
     return "unrecognized blocker category"
 
 
