@@ -103,7 +103,10 @@ def _rand(*shape, seed=0) -> np.ndarray:
 
 
 def _conv_bn_relu() -> onnx.ModelProto:
-    """Conv -> Mul(scale) -> Add(shift) -> Relu: onnxsim fuses scale into Conv."""
+    """Conv -> Mul(scale) -> Add(shift) -> Relu: onnxsim's fuse_bn_into_conv
+    folds the scale into Conv's weights, and its fuse_add_bias_into_conv
+    (onnxsim/custom_optimizer_passes.cpp) then folds the shift into Conv's
+    bias, so neither Mul nor Add survives simplification."""
     w = numpy_helper.from_array(_rand(8, 3, 3, 3, seed=1), "w")
     scale = numpy_helper.from_array(_rand(1, 8, 1, 1, seed=2), "scale")
     shift = numpy_helper.from_array(_rand(1, 8, 1, 1, seed=3), "shift")
@@ -238,9 +241,10 @@ def test_onnx_converter_accepts_simplified_input(name, tmp_path):
 
 
 def test_simplify_bn_fusion_reaches_top_mlir(tmp_path):
-    """The Mul(scale) onnxsim fuses into Conv must not reappear as a separate
-    top.Mul in tpu-mlir's own Top MLIR -- confirms onnxsim's simplification
-    (not just a pass-through no-op) survives ingestion."""
+    """The Mul(scale)/Add(shift) onnxsim fuses into Conv must not reappear as
+    separate top.Mul/top.Add ops in tpu-mlir's own Top MLIR -- confirms
+    onnxsim's simplification (not just a pass-through no-op) survives
+    ingestion."""
     model = _conv_bn_relu()
     t = _ingest(model, "conv_bn_relu_check", tmp_path)
     with _chdir(tmp_path):
@@ -248,7 +252,7 @@ def test_simplify_bn_fusion_reaches_top_mlir(tmp_path):
         text = open(mlir_path).read()
     assert "top.Conv" in text
     assert "top.Mul" not in text  # scale folded into the Conv's weights
-    assert "top.Add" in text  # shift remains (onnxsim doesn't fold Conv+Add)
+    assert "top.Add" not in text  # shift folded into the Conv's bias
 
 
 @pytest.mark.parametrize("name", sorted(_MODELS))
