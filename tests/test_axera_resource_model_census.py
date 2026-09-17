@@ -178,25 +178,19 @@ _CENSUS = _census()
 
 class TestFixtureCorpusSize(unittest.TestCase):
     def test_306_fixtures_all_decode_cleanly(self):
-        # Corpus grew from 306 to 310 with
-        # tests/test_axera_gemm_sparse_bank_n_boundary.py's 4 new
-        # fixtures (2 states x 2 rebuilds) -- the two extra bank-0x81
-        # carriers pushed that bank's own fixture count from 8 to 10,
-        # moving it out of TestBankCensus's own <=9 "sparse" bucket (see
-        # that test's updated count below).
-        #
-        # Grew again, 310 -> 318, from other fixtures added to the
-        # corpus by later work in this session that didn't touch this
-        # file's own asserted counts at the time (an oversight, not a
-        # corpus problem -- found and fixed here while adding this
-        # file's own next 4 fixtures). Then 318 -> 322 from this file's
-        # own new fixtures (`gemm_1x128x1000`, `gemm_1x256x1000`,
-        # `gemm_1x512x100` + its rebuild), decoding bank `0x81`'s
-        # field=192 operand (`tests/test_axera_gemm_bank_81_e1_decode.py`).
-        # Method name kept as-is (matches this file's own established "N
-        # fixtures" naming convention elsewhere) rather than renamed on
-        # every corpus change.
-        self.assertEqual(_CENSUS["n_fixtures"], 322)
+        # Corpus grew 306 -> 310 (PR #1568, 4 new bank-0x81/0xe1 boundary
+        # fixtures) -> 318 (other PRs merged in between that didn't touch
+        # this file's own counts) -> 322 (PR #1570's 4 new large-N Gemm
+        # fixtures, decoding bank 0x81's field=192 operand) -> 327 (this
+        # PR's own 5 new gemm_1x256x{16,32,32_rebuild,33,33_rebuild}
+        # fixtures, testing K-independence of the N=32/33 boundary).
+        # Recomputed directly against the merged fixture set rather than
+        # trusting either PR's own count in isolation, since #1570 and
+        # this PR each grew the corpus independently before either
+        # landed on top of the other. Method name kept as-is (matches
+        # this file's own established "N fixtures" naming convention
+        # elsewhere) rather than renamed on every corpus change.
+        self.assertEqual(_CENSUS["n_fixtures"], 327)
 
 
 class TestFieldOffsetGranularity(unittest.TestCase):
@@ -216,7 +210,7 @@ class TestBankCensus(unittest.TestCase):
         for bank in (0x00, 0x01, 0x02, 0x03, 0x04):
             self.assertEqual(
                 len(_CENSUS["bank_fixture_set"][bank]),
-                322,
+                327,
                 f"bank {bank:#04x} should appear in every fixture",
             )
 
@@ -292,16 +286,16 @@ class TestRegisterCensus(unittest.TestCase):
         self.assertEqual(universal, expected)
 
     def test_reg8_is_the_heaviest_universal_register(self):
-        # Was 27,369 at the original 306-fixture corpus; the 4 new
-        # fixtures from tests/test_axera_gemm_sparse_bank_n_boundary.py
-        # pushed it to 27,601 (310 fixtures). Corpus growth to 318
-        # fixtures (see TestFixtureCorpusSize's own comment) and then to
-        # 322 with this file's own 4 new large-N Gemm fixtures --
-        # `gemm_1x128x1000`/`gemm_1x256x1000` carry hundreds of
-        # additional `reg=8` short-unit records each, being much larger
-        # programs than the small probe fixtures this corpus is mostly
-        # made of -- bring it to 28,346.
-        self.assertEqual(_CENSUS["reg_counts"][8], 28346)
+        # Was 27,369 at the original 306-fixture corpus, growing through
+        # 27,601 (310, PR #1568) and 28,346 (322, PR #1570's larger Gemm
+        # fixtures) to this value at 327 fixtures (this PR's own 5 new
+        # K=256-boundary fixtures added on top). Recomputed directly
+        # against the merged fixture set (28,636), not trusted from
+        # either PR's own isolated guess -- #1570's own 28,346 and this
+        # PR's own 28,285 were both computed against different,
+        # incomplete corpus snapshots and neither was correct once
+        # combined.
+        self.assertEqual(_CENSUS["reg_counts"][8], 28636)
         counts = _CENSUS["reg_counts"]
         universal = {
             r
