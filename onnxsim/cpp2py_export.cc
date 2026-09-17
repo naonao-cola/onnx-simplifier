@@ -2319,6 +2319,58 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // LLM-FP4 (Liu et al., 2023): searched (exponent/mantissa split,
+  // per-block real-valued scale) FP4 weight-only quantization. Data-free.
+  // See QuantizeWeightOnlyLlmFp4 in onnxsim.h.
+  m.def(
+      "quantize_weight_only_llm_fp4",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeWeightOnlyLlmFp4(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // QServe's QoQ quantization (Lin et al., 2024): progressive
+  // (INT8-then-INT4) block-wise weight quantization. Data-free. See
+  // ApplyQoq in onnxsim.h.
+  m.def(
+      "apply_qoq",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyQoq(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // D2Quant's Dual-Scale Quantizer (Yan et al., 2026): a per-column
+  // auxiliary scale for SwiGLU/GLU down-projection weights, absorbed into
+  // the paired up-projection's own weight. Data-free. See ApplyDsq in
+  // onnxsim.h.
+  m.def(
+      "apply_dsq",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyDsq(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // DAQ (Delta-Aware Quantization): data-free, but takes two full model
   // byte buffers (a base and a fine-tuned checkpoint, matched by node
   // output name) rather than one -- see ApplyDaq in daq_entry.h.
@@ -2368,6 +2420,27 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "float_model_bytes"_a, "quantized_model_bytes"_a, "rank"_a = 8);
+
+  // Embedding-output binarization: data-free, single-model, no
+  // ModelExecutor -- targets a whole graph OUTPUT declaration rather than a
+  // matched node. `output_name` empty stands in for Python's own
+  // `output_name=None` sentinel. See ApplyEmbeddingQuantizationBinary in
+  // embedding_quantization_entry.h.
+  m.def(
+      "quantize_embedding_binary",
+      [](const py::bytes& model_proto_bytes,
+         const std::string& output_name) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplyEmbeddingQuantizationBinary(model, output_name);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "output_name"_a = "");
 
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.

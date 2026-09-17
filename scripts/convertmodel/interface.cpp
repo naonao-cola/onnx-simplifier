@@ -2630,6 +2630,49 @@ em::val onnxsim_apply_kbvq_moe(const std::string &data) {
   }
 }
 
+em::val onnxsim_quantize_weight_only_llm_fp4(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(QuantizeWeightOnlyLlmFp4(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_weight_only_llm_fp4 error: " << e.what()
+              << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_qoq(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyQoq(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_qoq error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
+em::val onnxsim_apply_dsq(const std::string &data) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  try {
+    return SerializeModel(ApplyDsq(xmodel));
+  } catch (const std::exception &e) {
+    std::cerr << "apply_dsq error: " << e.what() << std::endl;
+    return em::val::null();
+  }
+}
+
 // DAQ is data-free but still needs two full models (base + fine-tuned,
 // matched by node output name) -- the same two-model shape
 // onnxsim_list_correctable_outputs/onnxsim_apply_bias_corrections above
@@ -2683,6 +2726,31 @@ em::val onnxsim_apply_low_rank_compensation(const std::string &float_data,
   } catch (const std::exception &e) {
     std::cerr << "apply_low_rank_compensation error: " << e.what()
               << std::endl;
+    return em::val::null();
+  }
+}
+
+// Embedding-output binarization is data-free, single-model, and needs no
+// ModelExecutor -- it targets a whole graph OUTPUT declaration rather than
+// a matched node. An absent (undefined/null) `output_name` is this port's
+// own empty-string stand-in for Python's `output_name=None` sentinel
+// ("resolve automatically, requiring exactly one FLOAT output").
+em::val onnxsim_quantize_embedding_binary(const std::string &data,
+                                          em::val output_name_val) {
+  onnx::ModelProto xmodel;
+  if (!xmodel.ParseFromArray(data.data(), data.size())) {
+    std::cerr << "Parse failed" << std::endl;
+    return em::val::null();
+  }
+  std::string output_name;
+  if (!output_name_val.isUndefined() && !output_name_val.isNull()) {
+    output_name = output_name_val.as<std::string>();
+  }
+  try {
+    return SerializeModel(
+        ApplyEmbeddingQuantizationBinary(xmodel, output_name));
+  } catch (const std::exception &e) {
+    std::cerr << "quantize_embedding_binary error: " << e.what() << std::endl;
     return em::val::null();
   }
 }
@@ -3924,9 +3992,15 @@ EMSCRIPTEN_BINDINGS(module) {
   function("onnxsim_apply_zeroquant", &onnxsim_apply_zeroquant);
   function("onnxsim_apply_intactkv", &onnxsim_apply_intactkv);
   function("onnxsim_apply_kbvq_moe", &onnxsim_apply_kbvq_moe);
+  function("onnxsim_quantize_weight_only_llm_fp4",
+           &onnxsim_quantize_weight_only_llm_fp4);
+  function("onnxsim_apply_qoq", &onnxsim_apply_qoq);
+  function("onnxsim_apply_dsq", &onnxsim_apply_dsq);
   function("onnxsim_apply_daq", &onnxsim_apply_daq);
   function("onnxsim_apply_low_rank_compensation",
            &onnxsim_apply_low_rank_compensation);
+  function("onnxsim_quantize_embedding_binary",
+           &onnxsim_quantize_embedding_binary);
   function("onnxsim_prune_magnitude", &onnxsim_prune_magnitude);
   function("onnxsim_apply_structured_pruning",
            &onnxsim_apply_structured_pruning);

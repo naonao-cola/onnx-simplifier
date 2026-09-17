@@ -140,6 +140,9 @@ export function applyZeroquant(
 ): Promise<Uint8Array>;
 export function applyIntactkv(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyKbvqMoe(model: OnnxModelBytes): Promise<Uint8Array>;
+export function quantizeWeightOnlyLlmFp4(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyQoq(model: OnnxModelBytes): Promise<Uint8Array>;
+export function applyDsq(model: OnnxModelBytes): Promise<Uint8Array>;
 export function applyDaq(
   baseModel: OnnxModelBytes,
   postTrainedModel: OnnxModelBytes,
@@ -149,6 +152,10 @@ export function applyLowRankCompensation(
   floatModel: OnnxModelBytes,
   quantizedModel: OnnxModelBytes,
   options?: { rank?: number },
+): Promise<Uint8Array>;
+export function quantizeEmbeddingBinary(
+  model: OnnxModelBytes,
+  options?: { outputName?: string },
 ): Promise<Uint8Array>;
 export function pruneMagnitude(
   model: OnnxModelBytes,
@@ -412,8 +419,12 @@ declare const _default: {
   applyZeroquant: typeof applyZeroquant;
   applyIntactkv: typeof applyIntactkv;
   applyKbvqMoe: typeof applyKbvqMoe;
+  quantizeWeightOnlyLlmFp4: typeof quantizeWeightOnlyLlmFp4;
+  applyQoq: typeof applyQoq;
+  applyDsq: typeof applyDsq;
   applyDaq: typeof applyDaq;
   applyLowRankCompensation: typeof applyLowRankCompensation;
+  quantizeEmbeddingBinary: typeof quantizeEmbeddingBinary;
   pruneMagnitude: typeof pruneMagnitude;
   applyStructuredPruning: typeof applyStructuredPruning;
   applyAttentionHeadPruning: typeof applyAttentionHeadPruning;

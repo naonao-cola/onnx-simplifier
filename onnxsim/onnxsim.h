@@ -22,6 +22,7 @@
 #include "awq_entry.h"
 #include "billm_entry.h"
 #include "daq_entry.h"
+#include "embedding_quantization_entry.h"
 #include "gear_entry.h"
 #include "gptq_entry.h"
 #include "gptvq_entry.h"
@@ -1214,6 +1215,59 @@ onnx::ModelProto ApplyIntactKv(const onnx::ModelProto& model);
 // no RNG at all. This port hardcodes kbvq_moe.py's own defaults (rank=4,
 // bits=4, kmeans_iters=20) rather than exposing them as parameters.
 onnx::ModelProto ApplyKbvqMoe(const onnx::ModelProto& model);
+
+// LLM-FP4 (Liu et al., 2023, EMNLP) -- C++ port of llm_fp4.py's own
+// quantize_weight_only_llm_fp4 (weight-only half only; that module's own
+// apply_llm_fp4_activation_quantization[_per_tensor] are separate,
+// out-of-scope activation-quantization passes): a standard sign/exponent/
+// mantissa FP4 format whose per-block scale is an ordinary real-valued
+// float (not restricted to a power of two, unlike MXFP4) and whose
+// exponent/mantissa bit split is itself searched (E1M2, E2M1, E3M0) per
+// tensor, picking whichever (format, per-block scale) combination
+// minimizes reconstruction MSE. Data-free: both choices are fit directly to
+// each weight's own values by exhaustive grid search. This port hardcodes
+// llm_fp4.py's own defaults (block_size=32, formats=(e1m2, e2m1, e3m0),
+// num_scale_candidates=17, min_clip_ratio=0.5) rather than exposing them as
+// parameters, and omits its own skip_names parameter. ACCEPTED NUMERICAL
+// SCOPE: a closed-form grid search with no RNG, so this port is expected to
+// track the Python reference closely, up to floating-point summation-order
+// differences and first-occurrence tie-breaking (matching numpy's own
+// argmin/comparison convention).
+onnx::ModelProto QuantizeWeightOnlyLlmFp4(const onnx::ModelProto& model);
+
+// QServe's QoQ quantization (Lin et al., 2024, MLSys 2025) -- C++ port of
+// qoq.py's own quantize_weight_only_qoq (the module's primary contribution;
+// that module's own apply_smooth_attention is a separate, calibration-
+// driven KV-cache-side technique, out of scope here): progressive
+// (INT8-then-INT4) block-wise weight quantization, first to a protective
+// per-output-channel INT8 grid, then that already-INT8-quantized tensor
+// down to INT4 per (channel, block) group -- folded into one combined
+// per-group scale so the graph only needs a single DequantizeLinear. This
+// port hardcodes qoq.py's own defaults (block_size=32, int8_clip_max=119).
+// ACCEPTED, PERMANENT DIVERGENCE: none -- a closed-form, deterministic
+// two-stage scheme with no RNG, expected to track the Python reference
+// closely.
+onnx::ModelProto ApplyQoq(const onnx::ModelProto& model);
+
+// D2Quant's Dual-Scale Quantizer (DSQ) (Yan et al., 2026) -- C++ port of
+// d2quant.py's own apply_dsq (that module's own apply_dac is a separate,
+// calibration-driven technique, out of scope here): a weight-side fix for
+// down-projection matrices in a SwiGLU/GLU-style MLP block. Derives a
+// per-input-channel auxiliary scale for the down-projection (fit by
+// alternating: quantize W/s with an ordinary blockwise INT4 quantizer, then
+// re-solve s in closed form as a per-column weighted least squares against
+// the quantized reconstruction) and folds its reciprocal into the paired
+// up-projection's own raw weight -- "absorbable," no new runtime op beyond
+// the down-projection's own DequantizeLinear. Matches a down-projection
+// MatMul/vanilla-Gemm whose activation input is produced by a two-operand
+// elementwise Mul, at least one of whose operands is directly the output of
+// another MatMul/vanilla-Gemm (the up-projection); both matched weights'
+// own consumer counts and shapes are checked, mirroring apply_dsq's own
+// matching exactly. This port hardcodes d2quant.py's own defaults
+// (block_size=32, num_iterations=15). ACCEPTED, PERMANENT DIVERGENCE: none
+// -- a closed-form, deterministic alternating fit with no RNG, expected to
+// track the Python reference closely.
+onnx::ModelProto ApplyDsq(const onnx::ModelProto& model);
 
 // DAQ (Delta-Aware Quantization) -- C++ port of daq.py's own apply_daq,
 // declared in daq_entry.h (included above) rather than duplicated here.
