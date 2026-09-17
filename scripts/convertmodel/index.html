@@ -1256,14 +1256,12 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             terminal or the board's own screen, just rendered here too. This
             only reads and displays what the board is already printing; it
             does not run or compare against onnxruntime-web above, and it
-            doesn't flash anything — that's
-            <a href="https://github.com/onnxsim/onnxsim/blob/master/tools/onnx-cardputer-flash/web/index.html" target="_blank" rel="noopener">onnx-cardputer-flash/web/index.html</a>'s
-            job (source only, not a live page here — only this directory,
-            <code>scripts/convertmodel/</code>, gets deployed; run that page
-            locally via a static server, e.g. <code>python3 -m http.server</code>
-            from its own directory, since Web Serial needs a real HTTP
-            origin). The same project's
-            <a href="https://github.com/onnxsim/onnxsim/blob/master/tools/onnx-k210-flash/web/index.html" target="_blank" rel="noopener">onnx-k210-flash/web/index.html</a>
+            doesn't flash anything — that's the
+            <a href="/onnx-cardputer-flash/web/index.html" target="_blank" rel="noopener">onnx-cardputer-flash flasher</a>'s
+            job (a real page, deployed alongside this one — see
+            <a href="https://github.com/onnxsim/onnxsim/blob/master/tools/onnx-cardputer-flash/README.md" target="_blank" rel="noopener">its README</a>
+            for the full pipeline). The same project's
+            <a href="/onnx-k210-flash/web/index.html" target="_blank" rel="noopener">onnx-k210-flash flasher</a>
             flashes Kendryte K210 boards (Sipeed Maix Amigo, M5StickV) the
             same way — see
             <a href="https://github.com/onnxsim/onnxsim/blob/master/tools/onnx-k210-flash/README.md" target="_blank" rel="noopener">its own README</a>

@@ -1,4 +1,15 @@
 <!doctype html>
+<!--
+  This page's own "../../index.html"-style links assume the deployed
+  layout .github/workflows/static.yml's own staging step produces --
+  this file served at /onnx-k210-flash/web/index.html, with the onnxsim
+  model converter (scripts/convertmodel/) at the site root -- NOT the raw
+  git repo's own directory layout (there is no repo-relative
+  "convertmodel" two levels up from here). Opening this file directly
+  from a repo checkout's own local static server (as this tool's README
+  documents) can't reach that link at all either way, since serving from
+  this directory's own root refuses to serve anything above it.
+-->
 <html>
 <head>
 <meta charset="utf-8">
@@ -47,28 +58,28 @@
     <code>../README.md</code>'s follow-ups). These are the vision models to
     build that pipeline against once it exists (Maix Amigo has a camera;
     M5StickV's is often flaky). Each link opens the
-    <a href="../../convertmodel/index.html" target="_blank" rel="noopener">onnxsim model converter</a>
+    <a href="../../index.html" target="_blank" rel="noopener">onnxsim model converter</a>
     pre-filled with that model, to fetch/simplify/quantize the ONNX starting point.
   </p>
   <table class="candidates">
     <tr><th>Model</th><th>Size</th><th>Why</th></tr>
     <tr>
-      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-MobileNetV1-0.25-VisualWakeWords-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-MobileNetV1-0.25-VisualWakeWords-int8-onnx</a></td>
+      <td><a href="../../index.html?model=ketiswp/mlcommons-MobileNetV1-0.25-VisualWakeWords-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-MobileNetV1-0.25-VisualWakeWords-int8-onnx</a></td>
       <td>358 KB</td>
       <td>Person detection (binary) — the natural "hello world" for K210's KPU + a camera</td>
     </tr>
     <tr>
-      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-ResNet8-CIFAR10-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-ResNet8-CIFAR10-int8-onnx</a></td>
+      <td><a href="../../index.html?model=ketiswp/mlcommons-ResNet8-CIFAR10-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-ResNet8-CIFAR10-int8-onnx</a></td>
       <td>113 KB</td>
       <td>Tiny 10-class image classifier, MLPerf Tiny reference — good sanity check</td>
     </tr>
     <tr>
-      <td><a href="../../convertmodel/index.html?model=ketiswp/tensorflow-MobileNetV1-0.25-ImageNet-224-uint8-onnx&autoload=1" target="_blank" rel="noopener">tensorflow-MobileNetV1-0.25-ImageNet-224-uint8-onnx</a></td>
+      <td><a href="../../index.html?model=ketiswp/tensorflow-MobileNetV1-0.25-ImageNet-224-uint8-onnx&autoload=1" target="_blank" rel="noopener">tensorflow-MobileNetV1-0.25-ImageNet-224-uint8-onnx</a></td>
       <td>530 KB</td>
       <td>Full 1000-class ImageNet classifier — matches Sipeed's own official K210 MobileNet demo shape</td>
     </tr>
     <tr>
-      <td><a href="../../convertmodel/index.html?model=ketiswp/tensorflow-MobileNetV1-0.5-ImageNet-224-uint8-onnx&autoload=1" target="_blank" rel="noopener">tensorflow-MobileNetV1-0.5-ImageNet-224-uint8-onnx</a></td>
+      <td><a href="../../index.html?model=ketiswp/tensorflow-MobileNetV1-0.5-ImageNet-224-uint8-onnx&autoload=1" target="_blank" rel="noopener">tensorflow-MobileNetV1-0.5-ImageNet-224-uint8-onnx</a></td>
       <td>1.4 MB</td>
       <td>Wider/more-accurate MobileNet if the KPU weight budget allows</td>
     </tr>
@@ -92,7 +103,7 @@
     see <code>ncc/README.md</code>) entirely on this page -- no local
     Python/nncase install, no upload anywhere. Give it a model that's
     already been through the
-    <a href="../../convertmodel/index.html" target="_blank" rel="noopener">onnxsim converter</a>
+    <a href="../../index.html" target="_blank" rel="noopener">onnxsim converter</a>
     (shape inference matters: nncase's importer needs <code>value_info</code>
     on intermediate tensors, which the converter's simplify step already
     produces). This does <b>not</b> run nncase's own PTQ calibration yet --
