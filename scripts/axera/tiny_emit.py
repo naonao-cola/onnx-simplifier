@@ -982,3 +982,156 @@ def emit_conv_reg8_group(
     old_group_end = pos
 
     return reference_mcode[:anchor] + new_group + reference_mcode[old_group_end:]
+
+
+def _gemm_reg8_group_bounds(reference_mcode: bytes) -> tuple:
+    """Locate Gemm's ``reg=78``-anchored 3-slot ``reg=8`` pool group's
+    own exact byte span ``[start, end)``.
+
+    Unlike ``emit_matmul_reg8_quad``'s own fixed-byte-pattern anchor
+    (unique across the whole MatMul stream it was checked against),
+    Gemm's own reg=78 anchor record's closing ``tag+reg`` byte pair
+    (``84 4e`` for its short form, ``82 4e`` for its long form,
+    decoded in ``tests/test_axera_gemm_reg8_second_noise_source.py``)
+    is NOT globally unique in a Gemm stream -- both patterns recur
+    several more times elsewhere (verified directly: `84 4e` and
+    `82 4e` each appear 2-3 times total across the 8 real
+    `Gemm(1,512,1000)` fixtures this was checked against, only one of
+    which is the pool's own anchor). A raw literal-byte search
+    therefore cannot locate the group unambiguously the way it could
+    for MatMul's own case. This function uses ``mcode.decode()``
+    instead (imported locally, the one function in this file that
+    needs it -- every other function here is deliberately
+    decode-free), matching
+    ``tests/test_axera_gemm_reg8_second_noise_source.py``'s own
+    ``three_slot_group()`` filter exactly: the one ``S``-kind record
+    with ``reg=78``, ``tag`` in ``(130, 132)``, and a payload matching
+    one of the 3 known candidate classes.
+
+    The group's own end is the first ``verb=162, field=0, bank=0``
+    V-record after the anchor -- the same recurring cross-op marker
+    this project's reg=8 work has repeatedly used as an anchor for
+    Mul's and MatMul's own versions of this mechanism too.
+
+    Raises if the anchor, or its own immediately-following end marker,
+    is not found exactly once.
+    """
+    import mcode  # noqa: PLC0415 -- deliberately local, see docstring
+
+    recs = mcode.decode(reference_mcode, **mcode.FULL_RULE)
+    class_of = {
+        b"\x93\x00\x40": "A",
+        b"\x93\x00\x30": "B",
+        b"\x23\x00\x20": "C",
+        b"\x23": "C",
+    }
+    anchor_hits = [
+        r
+        for r in recs
+        if r["kind"] == "S"
+        and r.get("reg") == 78
+        and r.get("tag") in (130, 132)
+        and r.get("payload") in class_of
+    ]
+    if len(anchor_hits) != 1:
+        raise ValueError(
+            f"reg=78 pool anchor found {len(anchor_hits)} times, expected exactly 1"
+        )
+    start = anchor_hits[0]["at"]
+    end_hits = [
+        r
+        for r in recs
+        if r["kind"] == "V"
+        and r.get("verb") == 162
+        and r.get("field") == 0
+        and r.get("bank") == 0
+        and r["at"] > start
+    ]
+    if not end_hits:
+        raise ValueError(
+            "no verb=162,field=0,bank=0 V-record found after the reg=78 anchor"
+        )
+    end = min(r["at"] for r in end_hits)
+    return start, end
+
+
+def emit_gemm_reg8_group(reference_mcode: bytes, donor_mcode: bytes) -> bytes:
+    """Splice Gemm's own 3-slot ``reg=8`` unordered-pool group -- the
+    ``reg=78``-anchored region ``tests/test_axera_gemm_reg8_second_noise_source.py``
+    decoded, together with its own linked ``reg=0`` biconditional
+    indicator -- out of ``donor_mcode`` and into ``reference_mcode``,
+    in place of ``reference_mcode``'s own version of the same group.
+
+    Unlike MatMul's own version of this mechanism
+    (``emit_matmul_reg8_quad``, a fixed-length 4-slot permutation
+    overwritten byte-for-byte in place), Gemm's own group is NOT
+    fixed-length: each of its 3 candidate classes has both a 3-byte
+    "long" form and (class ``C`` only, observed) a 1-byte "short" form,
+    the group can be 3-of-3 distinct or duplicate-tolerant (2 distinct,
+    one class repeated or a whole slot dropped), and the source file's
+    own ``reg=0`` biconditional indicator is not a separately-inserted
+    record at all -- it is a different GRAMMAR INTERPRETATION of a
+    fixed-position byte range that follows the pool slots, verified
+    directly here: every one of the 8 real builds this was checked
+    against has the *exact same* total group span (either 21 or 23
+    bytes, correlated with whether the anchor itself uses its short or
+    long form) as every other build sharing that same anchor form --
+    the indicator's presence/absence changes what THOSE bytes decode
+    as, not how many bytes there are.
+
+    Given that real complexity, this function does not attempt to
+    SYNTHESIZE an arbitrary caller-chosen slot assignment from
+    scratch (which would require independently re-deriving exactly
+    which byte encodes what under which of the two anchor forms, a
+    real risk of getting subtly wrong) -- it instead extracts a real,
+    already-*compiled* group verbatim from a donor build (itself one
+    of the 8 already-observed real Pulsar2 outputs, or any other
+    stream this function's own bounds-search succeeds on) and splices
+    it whole into the reference stream, which is safe precisely
+    because the spliced bytes are never anything other than bytes a
+    real Pulsar2 build actually produced. This is a genuine, if more
+    conservative, generation capability: given a target reference
+    build and a *menu* of already-observed donor group states (this
+    project's own real fixture corpus already provides several), a
+    generator can choose which one to splice in.
+
+    **What this establishes and does not.** Verified in
+    ``tests/test_axera_gemm_reg8_emit_verify.py`` against all 8 real
+    ``Gemm(1,512,1000)`` fixtures:
+
+    - A no-op splice (any donor identical to the reference, including
+      ``donor_mcode is reference_mcode``) reproduces the reference
+      byte-for-byte, for all 8.
+    - Splicing a donor whose anchor uses the SAME form as the
+      reference's own (the 8 fixtures split cleanly into two groups of
+      4 by anchor form -- short/21-byte-span, long/23-byte-span; all 12
+      ordered same-group cross-pairs checked) preserves the total
+      stream length, round-trips through ``mcode.decode()``/
+      ``mcode.check()`` with zero hard errors, and reads back exactly
+      the donor's own slot assignment and ``reg=0`` indicator state,
+      with everything outside the spliced span byte-identical to the
+      original reference.
+    - Splicing ACROSS anchor forms (a length-changing splice, e.g. a
+      21-byte donor group into a 23-byte reference span or vice versa)
+      is NOT safe: verified directly, this reliably produces a specific
+      hard ``mcode.check()`` error --
+      ``"tail: no readable segment table (no header word points at a
+      tail table vector)"`` -- the stream's own header/tail table
+      apparently encodes an absolute pointer or length elsewhere that a
+      pure local splice does not update, the same class of "local edit,
+      global consequence" finding ``bank81_field192_operand``'s own
+      verified K-changing reflow test found for a completely different
+      field. This function does not attempt to fix that up.
+
+    It does NOT establish that every one of the 3^3 = 27 mathematically
+    conceivable slot-class combinations (ignoring form/duplicate
+    subtleties entirely) is itself a valid Pulsar2 output, nor does it
+    attempt the harder problem ``emit_matmul_reg8_quad`` solved of
+    accepting an arbitrary caller-chosen assignment directly -- only 8
+    real, verified group states (4 same-length pairs each) are known to
+    be safe to splice as of this function.
+    """
+    ref_start, ref_end = _gemm_reg8_group_bounds(reference_mcode)
+    donor_start, donor_end = _gemm_reg8_group_bounds(donor_mcode)
+    donor_group = donor_mcode[donor_start:donor_end]
+    return reference_mcode[:ref_start] + donor_group + reference_mcode[ref_end:]
