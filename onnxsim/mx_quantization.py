@@ -60,6 +60,7 @@ import onnx.helper
 import onnx.numpy_helper
 
 from onnxsim.bias_correction import _all_names, _unique_name
+from onnxsim.onnx_simplifier import quantize_weight_only_mxfp4_cpp
 
 # E2M1's own 16 bit patterns, evaluated per the format definition (bias 1,
 # subnormal exponent field 0): magnitudes {0, 0.5, 1, 1.5, 2, 3, 4, 6},
@@ -184,7 +185,26 @@ def quantize_weight_only_mxfp4(
             ``block_size`` attribute since the codebook lookup is built
             from ordinary ops directly). Layers with a non-constant,
             non-2-D, or non-block-divisible weight are left untouched.
+
+    Delegates to the verified C++ port
+    (:func:`onnxsim.quantize_weight_only_mxfp4_cpp`) when called with the
+    default ``block_size=32``/``skip_names=None`` -- the C++ port's own
+    hardcoded block size and lack of a skip-list knob. A non-default
+    ``block_size`` or a real ``skip_names`` value falls back to this
+    module's own original pure-Python implementation.
     """
+    if block_size == MX_BLOCK_SIZE and not skip_names:
+        if isinstance(model, str):
+            model = onnx.load(model, load_external_data=False)
+        return quantize_weight_only_mxfp4_cpp(model)
+    return _quantize_weight_only_mxfp4_python(model, block_size, skip_names)
+
+
+def _quantize_weight_only_mxfp4_python(
+    model: Union[str, onnx.ModelProto],
+    block_size: int = MX_BLOCK_SIZE,
+    skip_names: Optional[Iterable[str]] = None,
+) -> onnx.ModelProto:
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
     skip_names = set(skip_names) if skip_names is not None else frozenset()
