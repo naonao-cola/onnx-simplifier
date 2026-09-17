@@ -1,15 +1,20 @@
 """Renesas RZ/V DRP-AI TVM legalization rewrites, checked offline.
 
-`scripts/renesas/legalize.py` holds rewrites for the three ONNX ops absent
-from TVM v0.8's ONNX-import convert map
-(`drp_ai_tvm_ops.DRP_AI_TVM_IMPORTABLE_OPS`) that have an *exact* primitive
-decomposition per their own ONNX spec text: `HardSwish`, `Mish`,
-`LayerNormalization`. Each test checks the two properties that matter: the
-rewrite fires where it should (and nowhere else), and it does not change
-what the graph computes -- plus, since (unlike Voyager SDK's
-attribute-level constraints) this is a binary op_type-membership question,
-that `drp_ai_tvm_simulator.would_import_succeed()` flips from `False` to
-`True` for a graph using each op.
+`scripts/renesas/legalize.py` replaces an ONNX op absent from TVM v0.8's
+ONNX-import convert map (`drp_ai_tvm_ops.DRP_AI_TVM_IMPORTABLE_OPS`) with
+its own ONNX operator schema's function-body decomposition, extracted via
+`onnx.defs` and inlined via `onnx.inliner.inline_local_functions()` -- not
+a hand-transcribed rewrite. `hardswish_to_primitives`/`mish_to_primitives`/
+`layer_normalization_to_primitives` are thin op_types-filtered wrappers
+around the one general rule, `legalize_via_onnx_function()`; a dedicated
+section below (using `MeanVarianceNormalization`, not otherwise covered by
+this file) checks that the general rule really is generic -- no `HardSwish`/
+`Mish`/`LayerNormalization`-specific code makes it work.
+
+Each test checks the two properties that matter: the rewrite fires where it
+should (and nowhere else), and it does not change what the graph computes
+-- plus that `drp_ai_tvm_simulator.would_import_succeed()` flips from
+`False` to `True` for a graph using each op.
 
 Numeric equivalence is checked with `onnx.reference.ReferenceEvaluator`,
 same as `tests/test_axelera_legalize.py`; nothing here needs onnxsim built,
@@ -168,28 +173,35 @@ def test_layer_normalization_rewrites_and_computes_the_same_thing(with_bias):
 
 
 def test_layer_normalization_respects_explicit_axis():
-    before, rng = _ln_model(with_bias=False, axis=1)
-    after, _ = _ln_model(with_bias=False, axis=1)
+    # Scale/B must be unidirectionally broadcastable to X.shape[axis:] --
+    # for axis=1, rank 3, that's dims [1, 2], so scale/bias need that shape
+    # here (unlike the default axis=-1 cases above, where dim [2] alone
+    # suffices).
+    before = _model("""
+        g (float[2,3,4] x, float[3,4] scale) => (float[2,3,4] y)
+        { y = LayerNormalization<axis = 1>(x, scale) }
+        """)
+    after = _model("""
+        g (float[2,3,4] x, float[3,4] scale) => (float[2,3,4] y)
+        { y = LayerNormalization<axis = 1>(x, scale) }
+        """)
     assert legalize.layer_normalization_to_primitives(after) == 1
-    reduce_mean = next(n for n in after.graph.node if n.op_type == "ReduceMean")
-    # opset 18's ReduceMean takes `axes` as its second input (an
-    # initializer here), not an attribute -- see legalize.py's
-    # _make_reduce_mean().
-    axes_init = next(
-        i for i in after.graph.initializer if i.name == reduce_mean.input[1]
-    )
-    axes = onnx.numpy_helper.to_array(axes_init)
-    assert list(axes) == [1, 2]  # rank 3, axis=1 -> normalize over dims [1, 2]
+    assert "LayerNormalization" not in [n.op_type for n in after.graph.node]
 
-    feeds = _ln_feeds(rng, with_bias=False)
+    rng = np.random.RandomState(3)
+    feeds = {
+        "x": rng.randn(2, 3, 4).astype(np.float32),
+        "scale": rng.randn(3, 4).astype(np.float32),
+    }
     _assert_same_output(before, after, feeds)
 
 
-def test_layer_normalization_pre_opset18_uses_reducemean_axes_attribute():
-    # ReduceMean's `axes` was an attribute before opset 18 (see
-    # legalize.py's _make_reduce_mean() docstring) -- LayerNormalization
-    # itself only exists from opset 17 onward, so 17 is the lowest opset
-    # this branch is reachable at.
+def test_layer_normalization_pre_opset18_still_works():
+    # LayerNormalization exists from opset 17 onward -- 17 is the lowest
+    # opset this rule is reachable at (before ONNX moved ReduceMean's
+    # `axes` from an attribute to an input at opset 18; ONNX's own
+    # schema-derived function picks whichever form its own target opset
+    # needs, transparently).
     before = _model(
         """
         g (float[2,3,4] x, float[4] scale) => (float[2,3,4] y)
@@ -205,12 +217,9 @@ def test_layer_normalization_pre_opset18_uses_reducemean_axes_attribute():
         opset=17,
     )
     assert legalize.layer_normalization_to_primitives(after) == 1
-    reduce_mean = next(n for n in after.graph.node if n.op_type == "ReduceMean")
-    assert len(reduce_mean.input) == 1
-    axes = next(a for a in reduce_mean.attribute if a.name == "axes").ints
-    assert list(axes) == [2]  # rank 3, default axis=-1 -> normalize over dim [2]
+    onnx.checker.check_model(after)
 
-    rng = np.random.RandomState(3)
+    rng = np.random.RandomState(4)
     feeds = {
         "x": rng.randn(2, 3, 4).astype(np.float32),
         "scale": rng.randn(4).astype(np.float32),
@@ -218,31 +227,78 @@ def test_layer_normalization_pre_opset18_uses_reducemean_axes_attribute():
     _assert_same_output(before, after, feeds)
 
 
-def test_layer_normalization_skipped_when_mean_output_consumed():
-    model = _model("""
+def test_layer_normalization_works_when_mean_output_requested():
+    # ONNX's own schema function declares Mean/InvStdDev as real formal
+    # outputs (opset 17's 2nd/3rd outputs) and computes them correctly for
+    # any subset a call site actually wires up -- unlike this file's old
+    # hand-written version, requesting Mean no longer needs special-casing
+    # or a fallback to leaving the node alone.
+    before = _model("""
         g (float[2,3,4] x, float[4] scale) => (float[2,3,4] y, float[2,3,1] mean)
         { y, mean = LayerNormalization(x, scale) }
         """)
-    assert legalize.layer_normalization_to_primitives(model) == 0
-    assert model.graph.node[0].op_type == "LayerNormalization"
+    after = _model("""
+        g (float[2,3,4] x, float[4] scale) => (float[2,3,4] y, float[2,3,1] mean)
+        { y, mean = LayerNormalization(x, scale) }
+        """)
+    assert legalize.layer_normalization_to_primitives(after) == 1
+    assert "LayerNormalization" not in [n.op_type for n in after.graph.node]
+
+    rng = np.random.RandomState(5)
+    feeds = {
+        "x": rng.randn(2, 3, 4).astype(np.float32),
+        "scale": rng.randn(4).astype(np.float32),
+    }
+    _assert_same_output(before, after, feeds)
 
 
-def test_layer_normalization_skipped_when_rank_unknown():
-    # No value_info at all for `x` beyond a placeholder parse, and no
-    # initializer either -- shape_inference can't resolve it, so the rule
-    # must fail closed rather than guess a rank.
+def test_layer_normalization_skipped_when_dtype_unknown():
+    # ONNX's context-dependent function still needs each input's element
+    # type (used for the stash_type upcast/downcast, and to type the
+    # wrapper graph's own value_info) -- unlike static rank, which the
+    # schema function no longer needs at all (it resolves shape
+    # dynamically via Shape/Slice/Reshape), a genuinely unknown dtype is
+    # still a real "can't extract this" case, checked by clearing the
+    # elem_type field entirely (not just the shape).
     model = _model("""
         g (float[2,3,4] x, float[4] scale) => (float[2,3,4] y)
         { y = LayerNormalization(x, scale) }
         """)
-    model.graph.input[0].type.tensor_type.ClearField("shape")
+    model.graph.input[0].type.tensor_type.ClearField("elem_type")
     assert legalize.layer_normalization_to_primitives(model) == 0
+    assert model.graph.node[0].op_type == "LayerNormalization"
+
+
+# --- legalize_via_onnx_function() genuinely generalizes: MeanVarianceNormalization ---
+# (not covered by any op-specific wrapper -- this exercises the general
+# rule directly, including a schema function that references the node's
+# own attribute via `ref_attr_name` (MeanVarianceNormalization's `axes`),
+# which onnx.inliner substitutes automatically.)
+
+
+def test_mean_variance_normalization_rewrites_via_the_general_rule():
+    before = _model("""
+        g (float[2,3,4] x) => (float[2,3,4] y)
+        { y = MeanVarianceNormalization<axes = [1, 2]>(x) }
+        """)
+    after = _model("""
+        g (float[2,3,4] x) => (float[2,3,4] y)
+        { y = MeanVarianceNormalization<axes = [1, 2]>(x) }
+        """)
+    assert sim.would_import_succeed(before) is False
+
+    assert legalize.legalize_via_onnx_function(after) == 1
+    assert "MeanVarianceNormalization" not in [n.op_type for n in after.graph.node]
+    assert sim.would_import_succeed(after) is True
+
+    x = np.random.RandomState(6).randn(2, 3, 4).astype(np.float32)
+    _assert_same_output(before, after, {"x": x})
 
 
 # --- legalize() / as_custom_rewriter() orchestration ---
 
 
-def test_legalize_applies_all_three_rules_by_default():
+def test_legalize_applies_the_general_rule_by_default():
     model = _model("""
         g (float[2,4] x) => (float[2,4] y)
         {
@@ -251,11 +307,22 @@ def test_legalize_applies_all_three_rules_by_default():
         }
         """)
     applied = legalize.legalize(model)
-    assert applied == {
-        "hardswish_to_primitives": 1,
-        "mish_to_primitives": 1,
-        "layer_normalization_to_primitives": 0,
-    }
+    assert applied == {"legalize_via_onnx_function": 2}
+    assert sim.would_import_succeed(model) is True
+
+
+def test_legalize_can_still_select_the_per_op_wrappers_explicitly():
+    model = _model("""
+        g (float[2,4] x) => (float[2,4] y)
+        {
+          h = HardSwish(x)
+          y = Mish(h)
+        }
+        """)
+    applied = legalize.legalize(
+        model, rules=["hardswish_to_primitives", "mish_to_primitives"]
+    )
+    assert applied == {"hardswish_to_primitives": 1, "mish_to_primitives": 1}
     assert sim.would_import_succeed(model) is True
 
 

@@ -99,26 +99,41 @@ build included.
 
 ## Legalizing: fixing what `would_import_succeed()` finds
 
-`legalize.py` holds semantics-preserving rewrites for three ONNX ops that
-are simply absent from TVM v0.8's convert map -- `HardSwish`, `Mish`,
-`LayerNormalization` -- each replaced with the exact primitive-op
-decomposition its own ONNX spec defines it as (e.g. `HardSwish(x)` ==
-`x * HardSigmoid(x, alpha=1/6, beta=0.5)`, spec-exact, not an
-approximation). Unlike `scripts/axelera/legalize.py`'s rules (fixing an
-op used *outside* its documented attribute/shape range), there's no
-attribute value that would make these three importable as-is -- TVM v0.8
-(2021) simply predates all three ops (opset 14/17/18). See `legalize.py`'s
-module docstring for the full reasoning and each rule's caveats (in
-particular: `layer_normalization_to_primitives` needs `X`'s rank and
-element type statically known, and skips a node whose optional `Mean`/
-`InvStdDev` outputs are consumed).
+`legalize.py` replaces an ONNX op absent from TVM v0.8's convert map with
+its own ONNX operator schema's function-body decomposition -- extracted
+straight from `onnx.defs.get_schema()` (`OpSchema.function_body` /
+`get_context_dependent_function(...)`, a real `FunctionProto`) and inlined
+with ONNX's own `onnx.inliner.inline_local_functions()`, the same tool
+ONNX's reference evaluator and backend test suite use for the same
+purpose. Nothing here hand-transcribes an op's spec formula. Unlike
+`scripts/axelera/legalize.py`'s rules (fixing an op used *outside* its
+documented attribute/shape range), there's no attribute value that would
+make an op like `HardSwish`/`Mish`/`LayerNormalization` importable as-is
+-- TVM v0.8 (2021) simply predates all three (opset 14/17/18) -- so the fix
+is expanding it into ops that are importable, and `legalize_via_onnx_
+function()` is the one general rule this reduces to: try extracting a
+node's schema function, and only commit the replacement if every resulting
+op_type is itself importable (fails closed otherwise). This one rule
+already covers all three ops with no op-specific code, and picks up any
+other function-defined op (`GroupNormalization`, `Gelu`,
+`MeanVarianceNormalization`, ...) the same way. `hardswish_to_primitives`/
+`mish_to_primitives`/`layer_normalization_to_primitives` remain as thin,
+op_types-filtered wrappers around it, kept only so existing callers/`
+--rules` keep their names. See `legalize.py`'s module docstring for the
+full reasoning, including what this genuinely improves on versus an
+earlier hand-written version of this file: that version required `X`'s
+rank statically known (to build `ReduceMean`'s `axes` by hand) and
+explicitly punted on `stash_type`'s dtype upcast/downcast and the optional
+`Mean`/`InvStdDev` outputs (skipping a node needing either); the
+schema-derived function handles all of that correctly, since it *is* the
+same computation the real op performs, not a re-derivation of it.
 
 ```python
 import onnx
 import legalize
 
 model = onnx.load("model.onnx")
-applied = legalize.legalize(model)  # {"hardswish_to_primitives": 2, ...}
+applied = legalize.legalize(model)  # {"legalize_via_onnx_function": 2}
 onnx.save(model, "model.legalized.onnx")
 ```
 
