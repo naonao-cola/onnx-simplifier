@@ -206,12 +206,15 @@ jobs:
       # runtime-value-driven ConstantFolding pass, run immediately around
       # every onnxsim.simplify() call -- see the test module's docstring)
       # unconditionally imports torch, which isn't part of the [onnx] extra.
+      # tpu_mlir.python.utils.mlir_shell (imported transitively by
+      # tools.model_transform, which the integration test imports directly)
+      # unconditionally imports psutil, which [onnx] also doesn't pull in.
       - name: Install tpu_mlir[onnx] + torch
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install --timeout 120 --retries 5 "tpu_mlir[onnx]"
           python3 -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
-          python3 -m pip install pytest
+          python3 -m pip install pytest psutil
       # onnxsim's own onnx.inliner import (added in onnx 1.15) doesn't exist
       # in tpu_mlir[onnx]'s pinned onnx==1.14.1, so bump onnx specifically --
       # 1.17.0 is confirmed (locally) to still leave numpy==1.24.3/
