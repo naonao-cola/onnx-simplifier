@@ -27,7 +27,8 @@ Serial was picked over WebUSB for this class of board).
 | Step | Where | Status |
 |---|---|---|
 | Fetch + simplify/quantize an HF model | the existing [onnxsim model converter](../convertmodel/index.html) — this tool doesn't repeat that UI | already shipped, unrelated to this addition |
-| ONNX → TFLite (int8) | `scripts/onnx_to_tflite_micro.py` (`convert_to_tflite`, wraps `onnx2tf -oiqt`) | **run for real against real HF models — found two real bugs, both worked around manually**: `-oiqt` requires a Float32 ONNX input, so it errors out on an already-quantized model (finding #3); and even given a Float32 input, `-oiqt`'s own default calibration data fails to load on a current numpy for *any* model (finding #6, an onnx2tf bug, not this repo's). Supplying real calibration data directly via onnx2tf's own `-cind` flag (not yet wired into this script) works and produced a real, correctly-quantized int8 model — see `firmware/runtime/README.md`'s "Status", findings #3 and #6 |
+| ONNX → TFLite (int8), via onnx2tf | `scripts/onnx_to_tflite_micro.py` (`convert_to_tflite`, wraps `onnx2tf -oiqt`) | **run for real against real HF models — found two real bugs, both worked around manually**: `-oiqt` requires a Float32 ONNX input, so it errors out on an already-quantized model (finding #3); and even given a Float32 input, `-oiqt`'s own default calibration data fails to load on a current numpy for *any* model (finding #6, an onnx2tf bug, not this repo's). Supplying real calibration data directly via onnx2tf's own `-cind` flag (not yet wired into this script) works and produced a real, correctly-quantized int8 model — see `firmware/runtime/README.md`'s "Status", findings #3 and #6. Needs a real TensorFlow install -- can't run in-browser, see the row below |
+| ONNX → TFLite, via flatbuffers directly (no TensorFlow) | `scripts/onnx_to_tflite_flatbuffers.py` | **Run for real against a real Hugging Face model, output verified**: recognizes the "fake-quant sandwich" pattern (DequantizeLinear → op → QuantizeLinear) a TF→ONNX exporter produces when re-exporting an *already-quantized* TFLite graph, and repackages the quantized weights/scale/zero-point already in the ONNX file straight into a `.tflite` -- no TensorFlow, no requantization, no new-computed quantization params. `ketiswp/tensorflow-Micro-Speech-TinyConv-SpeechCommands-uint8-onnx`'s `model.onnx` → emitted `.tflite` loads in a real TFLite interpreter (`ai-edge-litert`) and matches `onnx.reference.ReferenceEvaluator`'s output exactly in 199/200 random trials (the 1 exception differs by ±1 -- a known rounding-domain difference between ONNX's reference evaluator and TFLite's fixed-point kernels, not a conversion bug: both consumed the identical scale/zero-point/weight bytes). See `scripts/onnx_to_tflite_flatbuffers.py`'s own module docstring for exactly which op patterns are recognized -- it is **not** a general ONNX importer. Not yet wired into a browser UI (see "Not done yet / follow-ups") |
 | TFLite → C header | `scripts/onnx_to_tflite_micro.py` (`emit_c_header`) | unit-tested, see `tests/` |
 | Firmware (generic TFLite Micro runtime) | [`firmware/runtime/`](firmware/runtime/README.md) — a real PlatformIO project, not just a recipe | **compiled, flashed, booted, and ran a real, correctly-quantized model end to end on a real M5Stack Cardputer, now driven by the board's own microphone** -- `Invoke()` returns `kTfLiteOk` on real audio, confirmed live over serial with real output values and latency (findings #6, #7). Getting there found and fixed a `qio`→`dio` flash-mode bug (finding #1); found (unfixed, upstream-library) a crash on legacy-quantized `DepthwiseConv` models (finding #2); found and precisely root-caused (unfixed, upstream-library) that a differently-quantized model's `Transpose` op runs on unsupported `uint8` data (finding #4); and found and fixed a `Serial`-routing bug that was hiding *all* app/TFLM diagnostic output (finding #5) — see that README's "Status" for the full sequence |
 | Flash over Web Serial | `web/flasher.mjs` (Espressif's `esptool-js`) | loads and runs its UI logic cleanly in a browser (checked headless); the underlying ISP protocol was exercised for real via `esptool` directly against `/dev/ttyACM0` (same USB-Serial/JTAG port Web Serial would use) — `flasher.mjs`'s own browser-side call shapes are still **not** exercised through an actual Chrome Web Serial session |
@@ -61,6 +62,16 @@ wrong with the pipeline itself. The browser UI itself doing the flashing
    (a `.tflite` output path writes the plain converted model; any other
    extension writes a C header instead — the runtime firmware reads a
    plain `.tflite` file from its flash partition, not a C array).
+
+   Model already carries real TFLite-style quantization (like the
+   candidate models above) and you'd rather not install TensorFlow?
+   `pip install flatbuffers onnx`, then:
+   ```sh
+   python3 scripts/onnx_to_tflite_flatbuffers.py your_model.onnx model.tflite
+   ```
+   — no TensorFlow, no onnx2tf. See "Not done yet / follow-ups" below for
+   exactly what op patterns this recognizes; it's real but narrower than
+   the onnx2tf path.
 4. Flash *that* `.tflite` file's raw bytes at `0x310000` — switch the
    dropdown to "model (0x310000)" — same page, same Connect session, no
    rebuild, no PlatformIO, step 1 doesn't repeat.
@@ -92,6 +103,37 @@ before overwriting your known-working runtime).
 
 ## Not done yet / follow-ups
 
+- **Emitting `.tflite` with only `flatbuffers` (no TensorFlow): done for
+  a real, scoped op pattern.** `scripts/onnx_to_tflite_flatbuffers.py`
+  recognizes the "fake-quant sandwich" a TF→ONNX exporter produces for an
+  already-quantized TFLite graph and repackages it directly, without
+  TensorFlow -- verified against a real Hugging Face model (see the
+  pipeline table above and that script's own module docstring). It is
+  **not** a general ONNX importer -- it raises `NotImplementedError`
+  rather than emit something silently wrong on anything outside the
+  patterns it recognizes (Conv/DepthwiseConv, a bias-less MatMul as
+  FullyConnected, Softmax). Real follow-ups:
+  - **Not wired into a browser UI yet.** Unlike `onnx-k210-flash/web/ncc_wasm.mjs`
+    (nncase compiled to WASM, see that tool's README), this script hasn't
+    been ported to run in a browser -- it's plain Python today. Since it
+    has no TensorFlow/heavy-framework dependency to begin with (that was
+    the whole point), this should be a much smaller lift than the nncase
+    port was: either a from-scratch JS port of the same pattern-matching +
+    `flatbuffers`-npm-package emission logic, or, if Pyodide's own
+    `flatbuffers`/`onnx` wheels are good enough, running this exact script
+    under Pyodide with no C++/wasm build at all.
+  - **FullyConnected with a real bias isn't handled** (the test model's
+    own ONNX export happens to have dropped its FC bias upstream, before
+    this script ever sees it -- see that script's docstring and the
+    pipeline table's note on the ±1 rounding mismatch). Extending
+    `_emit_matmul()` to recognize a MatMul+Add pair the same way
+    `_emit_conv_like()` already handles Conv's bias input is a bounded,
+    real follow-up.
+  - **Only one Conv/DepthwiseConv, one MatMul, one Softmax chain is
+    tested for real** (this repo's own smallest candidate model). Wider op
+    coverage (multiple conv layers, pooling, Add/Relu as separate nodes)
+    would need real models exercising them before claiming support, same
+    as everywhere else in this repo.
 - **Done, real hardware confirmed:** a genuinely per-channel int8-quantized
   model (the HF repo's `-fp32-onnx` variant run through `onnx2tf -oiqt`
   with real calibration data) flashed, booted, and `Invoke()` returned
