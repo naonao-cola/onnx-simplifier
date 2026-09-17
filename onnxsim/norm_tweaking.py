@@ -60,15 +60,12 @@ instead of the fused op, is left untouched rather than guessed at.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
-from onnxsim.calibration import Tensors, generate_random_calibration_data
+from onnxsim.calibration import Tensors
+from onnxsim.onnx_simplifier import apply_norm_tweaking_cpp
 
 
 def apply_norm_tweaking(
@@ -111,120 +108,18 @@ def apply_norm_tweaking(
             copies (new initializers, uniquely named -- the originals are
             left in the model only if some other node still references
             them)
+
+    Delegates to :func:`onnxsim.apply_norm_tweaking_cpp` (the verified C++
+    port, which has full parameter parity with this function -- see
+    ``norm_tweaking_entry.h`` for its own scope note); this pure-Python
+    name is kept only for backward compatibility with existing callers.
     """
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    if isinstance(quantized_model, str):
-        quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
-
-    quantized_by_output: Dict[str, onnx.NodeProto] = {}
-    for n in quantized_model.graph.node:
-        if n.op_type == "LayerNormalization" and n.output:
-            quantized_by_output[n.output[0]] = n
-
-    q_initializers = {t.name: t for t in quantized_model.graph.initializer}
-
-    candidates: List[Tuple[str, onnx.NodeProto]] = []
-    for n in float_model.graph.node:
-        if n.op_type != "LayerNormalization" or not n.output:
-            continue
-        q_node = quantized_by_output.get(n.output[0])
-        if q_node is None or len(q_node.input) < 2:
-            continue
-        scale_init = q_initializers.get(q_node.input[1])
-        if scale_init is None or len(scale_init.dims) != 1:
-            continue
-        candidates.append((n.output[0], q_node))
-    if not candidates:
-        return quantized_model
-
-    names = [name for name, _ in candidates]
-    float_probe = _add_probe_outputs(float_model, names)
-    quantized_probe = _add_probe_outputs(quantized_model, names)
-
-    f_sum: Dict[str, np.ndarray] = {}
-    f_sumsq: Dict[str, np.ndarray] = {}
-    q_sum: Dict[str, np.ndarray] = {}
-    q_sumsq: Dict[str, np.ndarray] = {}
-    counts: Dict[str, int] = {}
-
-    for batch in calibration_data:
-        f_out = backend.run_model(float_probe, batch, providers=providers)
-        q_out = backend.run_model(quantized_probe, batch, providers=providers)
-        for name in names:
-            f = np.asarray(f_out[name], dtype=np.float64)
-            q = np.asarray(q_out[name], dtype=np.float64)
-            if f.shape != q.shape or f.ndim == 0:
-                continue
-            channels = f.shape[-1]
-            f2 = f.reshape(-1, channels)
-            q2 = q.reshape(-1, channels)
-            if name in counts:
-                f_sum[name] += f2.sum(axis=0)
-                f_sumsq[name] += np.square(f2).sum(axis=0)
-                q_sum[name] += q2.sum(axis=0)
-                q_sumsq[name] += np.square(q2).sum(axis=0)
-                counts[name] += f2.shape[0]
-            else:
-                f_sum[name] = f2.sum(axis=0)
-                f_sumsq[name] = np.square(f2).sum(axis=0)
-                q_sum[name] = q2.sum(axis=0)
-                q_sumsq[name] = np.square(q2).sum(axis=0)
-                counts[name] = f2.shape[0]
-
-    corrected = onnx.ModelProto()
-    corrected.CopyFrom(quantized_model)
-    taken_names = _all_names(corrected.graph)
-    initializer_index = {t.name: i for i, t in enumerate(corrected.graph.initializer)}
-    node_by_output = {
-        n.output[0]: n
-        for n in corrected.graph.node
-        if n.op_type == "LayerNormalization" and n.output
-    }
-
-    for name in names:
-        if name not in counts:
-            continue
-        n = counts[name]
-        mu_f = f_sum[name] / n
-        var_f = np.maximum(f_sumsq[name] / n - mu_f**2, 0.0)
-        sigma_f = np.sqrt(var_f)
-        mu_q = q_sum[name] / n
-        var_q = np.maximum(q_sumsq[name] / n - mu_q**2, 0.0)
-        sigma_q = np.sqrt(var_q)
-
-        alpha = sigma_f / (sigma_q + eps)
-        beta = mu_f - alpha * mu_q
-
-        q_node = node_by_output[name]
-        scale_init = corrected.graph.initializer[initializer_index[q_node.input[1]]]
-        old_scale = onnx.numpy_helper.to_array(scale_init).astype(np.float64)
-        new_scale = (old_scale * alpha).astype(np.float32)
-        new_scale_name = _unique_name(f"{name}_norm_tweak_scale", taken_names)
-        corrected.graph.initializer.append(
-            onnx.numpy_helper.from_array(new_scale, name=new_scale_name)
-        )
-        q_node.input[1] = new_scale_name
-
-        if len(q_node.input) >= 3 and q_node.input[2]:
-            old_bias_init = corrected.graph.initializer[
-                initializer_index[q_node.input[2]]
-            ]
-            old_bias = onnx.numpy_helper.to_array(old_bias_init).astype(np.float64)
-            new_bias = (alpha * old_bias + beta).astype(np.float32)
-        else:
-            new_bias = beta.astype(np.float32)
-        new_bias_name = _unique_name(f"{name}_norm_tweak_bias", taken_names)
-        corrected.graph.initializer.append(
-            onnx.numpy_helper.from_array(new_bias, name=new_bias_name)
-        )
-        if len(q_node.input) >= 3:
-            q_node.input[2] = new_bias_name
-        else:
-            q_node.input.append(new_bias_name)
-
-    return corrected
+    return apply_norm_tweaking_cpp(
+        float_model,
+        quantized_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        providers=providers,
+        eps=eps,
+    )

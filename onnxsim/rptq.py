@@ -94,13 +94,8 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.smoothquant import _match_matmul_like
+from onnxsim.calibration import Tensors
 
 
 @dataclass
@@ -121,73 +116,6 @@ class RptqLayerInfo:
     cluster_bounds: List[Tuple[int, int]] = field(default_factory=list)
 
 
-def _kmeans_1d(
-    values: np.ndarray,
-    num_clusters: int,
-    rng: np.random.Generator,
-    num_iters: int = 50,
-) -> np.ndarray:
-    """Plain Lloyd's-algorithm k-means (no ``scipy`` dependency) clustering
-    1-D ``values`` into ``num_clusters`` groups. Returns a same-length
-    ``int64`` array of cluster assignments.
-
-    Centroids are seeded at evenly spaced percentiles of ``values`` (a
-    deterministic spread across the value range, not a random draw, so a
-    small ``num_clusters`` reliably separates distinct scales from the very
-    first iteration) rather than seeded fully randomly; ``rng`` only breaks
-    ties when two or more centroids end up numerically identical after
-    seeding (e.g. many duplicate values), nudging the duplicates apart so no
-    cluster is ever left permanently empty.
-    """
-    n = values.shape[0]
-    k = min(num_clusters, n)
-    percentiles = np.linspace(0.0, 100.0, k)
-    centroids = np.percentile(values, percentiles)
-    # Break ties from duplicate percentile values so every cluster starts
-    # with a distinct centroid.
-    for i in range(1, k):
-        if centroids[i] <= centroids[i - 1]:
-            centroids[i] = centroids[i - 1] + 1e-9 * (1.0 + abs(centroids[i - 1]))
-    jitter_scale = 1e-9 * (1.0 + np.abs(centroids).max())
-    centroids = centroids + rng.normal(scale=jitter_scale, size=k)
-
-    assignments = np.zeros(n, dtype=np.int64)
-    for _ in range(num_iters):
-        dist = np.abs(values[:, np.newaxis] - centroids[np.newaxis, :])
-        new_assignments = np.argmin(dist, axis=1)
-        if np.array_equal(new_assignments, assignments) and _ > 0:
-            break
-        assignments = new_assignments
-        for c in range(k):
-            members = values[assignments == c]
-            if members.size > 0:
-                centroids[c] = members.mean()
-    return assignments
-
-
-def _reorder_permutation(
-    assignments: np.ndarray,
-) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
-    """Builds the permutation that sorts channel indices by cluster id (a
-    stable sort, so within a cluster channels keep their original relative
-    order), plus that permuted order's per-cluster ``[start, end)`` bounds.
-    ``perm[i]`` is the *original* channel index now sitting at permuted
-    position ``i``: ``Gather(X, perm, axis=-1)[..., i] == X[..., perm[i]]``.
-    """
-    order = np.argsort(assignments, kind="stable")
-    sorted_assignments = assignments[order]
-    bounds: List[Tuple[int, int]] = []
-    start = 0
-    for i in range(1, len(sorted_assignments) + 1):
-        if (
-            i == len(sorted_assignments)
-            or sorted_assignments[i] != sorted_assignments[start]
-        ):
-            bounds.append((start, i))
-            start = i
-    return order.astype(np.int64), bounds
-
-
 def apply_rptq_reorder(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,
@@ -203,6 +131,13 @@ def apply_rptq_reorder(
     per-cluster-aware W8A8 quantizer; see this module's own docstring for
     how far that composition is (and isn't) wired up today.
 
+    Thin wrapper delegating to the verified C++ port
+    (:func:`onnxsim.apply_rptq_reorder_cpp`) -- full parameter parity, no
+    functionality gap (see that function's own docstring, and
+    ``onnxsim/rptq_entry.h``, for the one documented, immaterial-to-
+    -correctness numerical divergence: the k-means fit's own RNG does not
+    reproduce numpy's PCG64 bit-for-bit).
+
     :param model: the original (unquantized) onnx ModelProto or file path
     :param calibration_data: representative input batches to measure each
             input channel's calibration range on. Each batch is a
@@ -215,8 +150,7 @@ def apply_rptq_reorder(
             ``calibration_data`` is omitted
     :param seed: seed for the random calibration data (ignored if
             ``calibration_data`` is supplied) and for the k-means centroid
-            tie-breaking (a fresh ``numpy.random.Generator`` is derived per
-            matched layer, in graph node order)
+            tie-breaking
     :param num_clusters: number of channel clusters to reorder each
             matched layer's input into (the paper's own default range is a
             handful of clusters per layer; RPTQ's bespoke integer-
@@ -235,97 +169,13 @@ def apply_rptq_reorder(
             tensor matching the weight's reduction dimension, are left
             untouched and have no entry in ``layer_info``.
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_rptq_reorder_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    nodes = list(graph.node)
-    candidates = []
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, weight_transposed))
-
-    layer_info: Dict[str, RptqLayerInfo] = {}
-    if not candidates:
-        return out, layer_info
-
-    probe_names = sorted({x_name for _, x_name, _, _ in candidates})
-    probe_model = _add_probe_outputs(out, probe_names)
-
-    act_absmax: Dict[str, np.ndarray] = {}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            x = np.asarray(result[name], dtype=np.float64)
-            if x.ndim != 2:
-                continue
-            m = np.abs(x).max(axis=0)
-            act_absmax[name] = (
-                m if name not in act_absmax else np.maximum(act_absmax[name], m)
-            )
-
-    rng = np.random.default_rng(seed)
-
-    for node, x_name, w_name, weight_transposed in candidates:
-        absmax = act_absmax.get(x_name)
-        if absmax is None:
-            continue  # never observed as a plain 2-D tensor; skip
-
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if weight_transposed else w.T  # [N, K], output channel first
-        k = w_nk.shape[1]
-        if absmax.shape[0] != k:
-            continue  # activation's feature dim doesn't match K; skip
-
-        assignments = _kmeans_1d(absmax, num_clusters, rng)
-        perm, bounds = _reorder_permutation(assignments)
-
-        w_permuted_nk = w_nk[:, perm]
-        w_new = w_permuted_nk if weight_transposed else w_permuted_nk.T
-        w_new = w_new.reshape(dim0, dim1).astype(np.float32)
-        w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_name))
-
-        perm_name = _unique_name(f"{x_name}_rptq_perm", taken_names)
-        graph.initializer.append(onnx.numpy_helper.from_array(perm, name=perm_name))
-        gathered_name = _unique_name(f"{x_name}_rptq_reordered", taken_names)
-        gather_node = onnx.helper.make_node(
-            "Gather",
-            [x_name, perm_name],
-            [gathered_name],
-            name=_unique_name(f"{x_name}_rptq_gather", taken_names),
-            axis=-1,
-        )
-        node_idx = next(i for i, n in enumerate(graph.node) if n is node)
-        graph.node.insert(node_idx, gather_node)
-        node.input[0] = gathered_name
-
-        layer_info[x_name] = RptqLayerInfo(
-            x_name=x_name,
-            w_name=w_name,
-            gather_output=gathered_name,
-            permutation=perm,
-            cluster_bounds=bounds,
-        )
-
-    return out, layer_info
+    return apply_rptq_reorder_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        num_clusters=num_clusters,
+        providers=providers,
+    )

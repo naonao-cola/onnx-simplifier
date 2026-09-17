@@ -69,31 +69,11 @@ uses.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _pack_int4
-from onnxsim.bias_correction import (
-    _activation_rows,
-    _add_probe_outputs,
-    _all_names,
-    _unique_name,
-)
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.omniquant import _quantize_blockwise_int4_with_clip
-from onnxsim.quip_sharp import _match_matmul_like
-
-
-def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:
-    return any(
-        o.domain in ("", "ai.onnx") and o.version >= min_version
-        for o in model.opset_import
-    )
+from onnxsim.calibration import Tensors
 
 
 def apply_spinquant(
@@ -137,143 +117,23 @@ def apply_spinquant(
             older than 21 (INT4's tensor type and ``DequantizeLinear``'s
             ``block_size`` attribute both need opset 21), is returned
             unchanged
+
+    Thin wrapper delegating to the verified C++ port
+    (:func:`onnxsim.apply_spinquant_cpp`) -- full parameter parity, no
+    functionality gap (see that function's own docstring, and
+    ``onnxsim/spinquant_entry.h``, for the one documented, immaterial-to-
+    -correctness numerical divergence: the fitted rotation's own
+    eigendecomposition uses a hand-rolled Jacobi algorithm rather than
+    LAPACK's, so individual columns need not match sign-for-sign or
+    order-for-order, only that the rotation stays orthogonal).
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if not _has_min_opset(model, 21):
-        return model
+    from onnxsim.onnx_simplifier import apply_spinquant_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    nodes = list(graph.node)
-    candidates = []
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, bias_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, bias_name, weight_transposed))
-
-    if not candidates:
-        return out
-
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
-
-    probe_names = sorted({x_name for _, x_name, _, _, _ in candidates})
-    probe_model = _add_probe_outputs(model, probe_names)
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            arr = np.asarray(result[name], dtype=np.float64)
-            activations[name].extend(_activation_rows([arr]))
-
-    for node, x_name, w_name, bias_name, weight_transposed in candidates:
-        acts = activations.get(x_name, [])
-        if not acts:
-            continue
-        x = np.concatenate(acts, axis=0)
-
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_nk = w if weight_transposed else w.T  # [N, K], output channel first
-        n, k = w_nk.shape
-        if k % block_size != 0 or x.shape[1] != k:
-            continue
-
-        # PCA/eigenvector-basis rotation: the closed-form, classical
-        # orthogonal matrix diagonalizing this layer's own calibration-
-        # activation covariance -- see module docstring. eigh always
-        # returns an orthonormal basis for any real symmetric matrix, so
-        # this is exact and well-defined even for a rank-deficient
-        # (few-sample) covariance.
-        cov = x.T @ x / x.shape[0]  # [K, K]
-        _eigvals, u = np.linalg.eigh(cov)  # u: [K, K], orthogonal columns
-
-        w_tilde_nk = w_nk @ u  # [N, K] -- exact before quantization
-
-        codes_nk, scale_blocks_nk = _quantize_blockwise_int4_with_clip(
-            w_tilde_nk, block_size, 1.0
-        )
-        codes_kn = codes_nk.T.astype(np.int64)  # [K, N], ready for a plain MatMul
-        scale_kn = scale_blocks_nk.T.astype(np.float32)  # [K/block_size, N]
-
-        prefix = f"{w_name}_spinquant"
-        codes_name = _unique_name(f"{prefix}_codes", taken_names)
-        codes_tensor = onnx.TensorProto()
-        codes_tensor.name = codes_name
-        codes_tensor.data_type = onnx.TensorProto.INT4
-        codes_tensor.dims.extend([k, n])
-        codes_tensor.raw_data = _pack_int4(codes_kn)
-        graph.initializer.append(codes_tensor)
-
-        scale_name = _unique_name(f"{prefix}_scale", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(scale_kn, name=scale_name)
-        )
-        u_name = _unique_name(f"{prefix}_u", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(u.astype(np.float32), name=u_name)
-        )
-
-        new_nodes: List[onnx.NodeProto] = []
-
-        def _new(op_type, inputs, out_suffix, **attrs):
-            out_name = _unique_name(f"{prefix}_{out_suffix}", taken_names)
-            n_ = onnx.helper.make_node(
-                op_type,
-                inputs,
-                [out_name],
-                name=_unique_name(f"{prefix}_{out_suffix}_node", taken_names),
-                **attrs,
-            )
-            new_nodes.append(n_)
-            return out_name
-
-        x_rotated = _new("MatMul", [x_name, u_name], "x_rotated")
-        w_dequant = _new(
-            "DequantizeLinear",
-            [codes_name, scale_name],
-            "w_dequant",
-            axis=0,
-            block_size=block_size,
-        )
-        core = _new("MatMul", [x_rotated, w_dequant], "core")
-
-        old_output = node.output[0]
-        if bias_name is not None:
-            final = onnx.helper.make_node(
-                "Add",
-                [core, bias_name],
-                [old_output],
-                name=_unique_name(f"{prefix}_bias_add_node", taken_names),
-            )
-        else:
-            final = onnx.helper.make_node(
-                "Identity",
-                [core],
-                [old_output],
-                name=_unique_name(f"{prefix}_identity_node", taken_names),
-            )
-        new_nodes.append(final)
-
-        node_idx = next(i for i, n_ in enumerate(graph.node) if n_ is node)
-        for offset, new_node in enumerate(new_nodes):
-            graph.node.insert(node_idx + offset, new_node)
-        del graph.node[node_idx + len(new_nodes)]
-
-    return out
+    return apply_spinquant_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        block_size=block_size,
+        providers=providers,
+    )
