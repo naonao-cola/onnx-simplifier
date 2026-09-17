@@ -156,207 +156,12 @@ a token gets when it is "new" is what it keeps forever afterward, the same
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.kv_cache_quantization import _find_kv_cache_candidates, _KvCacheCandidate
-
-
-def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:
-    return any(
-        o.domain in ("", "ai.onnx") and o.version >= min_version
-        for o in model.opset_import
-    )
-
-
-@dataclass
-class _GearFit:
-    scale: np.ndarray  # float32 [head_dim]
-    projector: Optional[np.ndarray]  # float32 [head_dim, head_dim] or None
-    sparse_mask: Optional[np.ndarray]  # float32 [head_dim] or None
-
-
-def _fit_gear(
-    candidates: Sequence[_KvCacheCandidate],
-    model: onnx.ModelProto,
-    calibration_data: Sequence[Tensors],
-    providers: Optional[Sequence[str]],
-    rank: int,
-    outlier_fraction: float,
-) -> Dict[str, _GearFit]:
-    probe_names = sorted({c.new_name for c in candidates})
-    probe = _add_probe_outputs(model, probe_names)
-
-    samples: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        outputs = backend.run_model(probe, batch, providers=providers)
-        for name in probe_names:
-            arr = np.asarray(outputs[name], dtype=np.float64)
-            if arr.ndim == 0:
-                continue
-            samples[name].append(arr.reshape(-1, arr.shape[-1]))
-
-    fits: Dict[str, _GearFit] = {}
-    for name, batches in samples.items():
-        if not batches:
-            continue
-        x = np.concatenate(batches, axis=0)  # [N, head_dim]
-        head_dim = x.shape[1]
-
-        channel_absmax = np.abs(x).max(axis=0)
-        scale = (np.maximum(channel_absmax, 1e-12) / 127.0).astype(np.float32)
-
-        codes = np.clip(np.round(x / scale), -128, 127)
-        dequant = codes * scale
-        residual = x - dequant  # [N, head_dim], exact simulated QDQ residual
-
-        r = max(0, min(rank, head_dim, x.shape[0]))
-        projector = None
-        remainder = residual
-        if r > 0:
-            _u, _s, vt = np.linalg.svd(residual, full_matrices=False)
-            v_r = vt[:r].T  # [head_dim, r]
-            projector = (v_r @ v_r.T).astype(np.float32)
-            remainder = residual - residual @ projector
-
-        sparse_mask = None
-        num_outliers = int(round(outlier_fraction * head_dim))
-        if num_outliers > 0:
-            channel_score = np.abs(remainder).mean(axis=0)
-            outlier_channels = np.argsort(channel_score)[-num_outliers:]
-            mask = np.zeros(head_dim, dtype=np.float32)
-            mask[outlier_channels] = 1.0
-            sparse_mask = mask
-
-        fits[name] = _GearFit(scale=scale, projector=projector, sparse_mask=sparse_mask)
-
-    return fits
-
-
-def _rewire_consumers(
-    graph: onnx.GraphProto, c: _KvCacheCandidate, replacement_name: str
-) -> None:
-    # See onnxsim.kv_cache_quantization._rewire_consumers for why this must
-    # run before any new node referencing c.present_name is inserted.
-    for node in graph.node:
-        if node is c.concat_node:
-            continue
-        for i, inp in enumerate(node.input):
-            if inp == c.present_name:
-                node.input[i] = replacement_name
-
-
-def _apply_gear(
-    graph: onnx.GraphProto,
-    c: _KvCacheCandidate,
-    fit: _GearFit,
-    taken_names: Set[str],
-    input_by_name: Dict[str, onnx.ValueInfoProto],
-    output_by_name: Dict[str, onnx.ValueInfoProto],
-) -> None:
-    prefix = f"{c.present_name}_gear"
-    num_channels = fit.scale.shape[0]
-
-    scale_name = _unique_name(f"{prefix}_scale", taken_names)
-    graph.initializer.append(onnx.numpy_helper.from_array(fit.scale, name=scale_name))
-    zp_name = _unique_name(f"{prefix}_zero_point", taken_names)
-    zp = np.zeros(num_channels, dtype=np.int8)
-    graph.initializer.append(onnx.numpy_helper.from_array(zp, name=zp_name))
-
-    # past: FLOAT -> INT8 (same shape) -- unchanged from
-    # onnxsim.kv_cache_quantization's own Key-style rewrite.
-    past_input = input_by_name[c.past_name]
-    past_input.type.tensor_type.elem_type = onnx.TensorProto.INT8
-
-    new_nodes: List[onnx.NodeProto] = []
-
-    def _new(op_type: str, inputs: List[str], out_suffix: str, **attrs) -> str:
-        out_name = _unique_name(f"{prefix}_{out_suffix}", taken_names)
-        node = onnx.helper.make_node(
-            op_type,
-            inputs,
-            [out_name],
-            name=_unique_name(f"{prefix}_{out_suffix}_node", taken_names),
-            **attrs,
-        )
-        new_nodes.append(node)
-        return out_name
-
-    new_q_name = _new(
-        "QuantizeLinear",
-        [c.new_name, scale_name, zp_name],
-        "new_q",
-        axis=c.channel_axis,
-    )
-    quantize_node = new_nodes.pop()
-
-    if c.new_is_first_input:
-        c.concat_node.input[0] = new_q_name
-    else:
-        c.concat_node.input[1] = new_q_name
-    present_output = output_by_name[c.present_name]
-    present_output.type.tensor_type.elem_type = onnx.TensorProto.INT8
-
-    past_dequant_name = _new(
-        "DequantizeLinear",
-        [c.past_name, scale_name, zp_name],
-        "past_dequant",
-        axis=c.channel_axis,
-    )
-    new_dequant_name = _new(
-        "DequantizeLinear",
-        [new_q_name, scale_name, zp_name],
-        "new_dequant",
-        axis=c.channel_axis,
-    )
-    residual_name = _new("Sub", [c.new_name, new_dequant_name], "new_residual")
-
-    correction_terms = []
-    remainder_name = residual_name
-    if fit.projector is not None:
-        p_name = _unique_name(f"{prefix}_p", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(fit.projector, name=p_name)
-        )
-        low_rank_name = _new("MatMul", [residual_name, p_name], "low_rank")
-        correction_terms.append(low_rank_name)
-        if fit.sparse_mask is not None:
-            remainder_name = _new("Sub", [residual_name, low_rank_name], "remainder")
-
-    if fit.sparse_mask is not None:
-        mask_name = _unique_name(f"{prefix}_sparse_mask", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(fit.sparse_mask, name=mask_name)
-        )
-        sparse_name = _new("Mul", [remainder_name, mask_name], "sparse")
-        correction_terms.append(sparse_name)
-
-    new_corrected_name = new_dequant_name
-    for term_name in correction_terms:
-        new_corrected_name = _new("Add", [new_corrected_name, term_name], "corrected")
-
-    if c.new_is_first_input:
-        concat_inputs = [new_corrected_name, past_dequant_name]
-    else:
-        concat_inputs = [past_dequant_name, new_corrected_name]
-    present_corrected_name = _new(
-        "Concat", concat_inputs, "present_corrected", axis=c.seq_axis
-    )
-
-    _rewire_consumers(graph, c, present_corrected_name)
-
-    concat_idx = next(i for i, n in enumerate(graph.node) if n is c.concat_node)
-    graph.node.insert(concat_idx, quantize_node)
-    for offset, node in enumerate(new_nodes):
-        graph.node.insert(concat_idx + 2 + offset, node)
+from onnxsim.calibration import Tensors
+from onnxsim.onnx_simplifier import apply_gear_cpp
 
 
 def apply_gear(
@@ -405,40 +210,23 @@ def apply_gear(
             the whole model when no stream matches at all, or when
             ``model``'s opset is older than 13 (``QuantizeLinear``/
             ``DequantizeLinear``'s per-channel ``axis`` needs opset 13)
+
+    Delegates to the verified C++ port (:func:`onnxsim.apply_gear_cpp`),
+    which shares this function's own full parameter set exactly -- no
+    compatibility gap. That port's own SVD is a hand-rolled Jacobi
+    implementation (no LAPACK dependency), so the reconstructed low-rank
+    projector tracks this function's own former implementation closely
+    without being sign-for-sign identical (same Eckart-Young-uniqueness
+    argument as :func:`onnxsim.apply_low_rank_compensation`).
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-
-    if not _has_min_opset(model, 13):
-        return model
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-
-    candidates = _find_kv_cache_candidates(graph)
-    if not candidates:
-        return out
-
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
-
-    fits = _fit_gear(
-        candidates, model, calibration_data, providers, rank, outlier_fraction
+    return apply_gear_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        rank=rank,
+        outlier_fraction=outlier_fraction,
+        providers=providers,
     )
-    if not fits:
-        return out
-
-    taken_names: Set[str] = _all_names(graph)
-    input_by_name = {i.name: i for i in graph.input}
-    output_by_name = {o.name: o for o in graph.output}
-
-    for c in candidates:
-        fit = fits.get(c.new_name)
-        if fit is None:
-            continue
-        _apply_gear(graph, c, fit, taken_names, input_by_name, output_by_name)
-
-    return out

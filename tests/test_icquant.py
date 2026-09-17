@@ -121,16 +121,34 @@ def test_icquant_metadata_bits_zero_outliers_is_free():
 
 
 # --- End-to-end quantization -------------------------------------------------
+#
+# quantize_weight_only_icquant now delegates to the verified C++ port
+# (apply_icquant_cpp), which hardcodes group_size=32/num_outliers=1 and
+# folds the round trip directly into a replacement float32 initializer
+# instead of building a real INT4/DequantizeLinear/ScatterND graph rewrite
+# -- see onnxsim/icquant.py's own docstring. The detailed algorithmic
+# properties (outlier exact reconstruction, grid size, error reduction vs.
+# a naive single-scale fit, opset-independence) are already covered end to
+# end against apply_icquant_cpp directly in tests/test_icquant_cpp.py; the
+# tests below only exercise the thin wrapper itself: parameter validation
+# and basic delegation sanity.
+
+
+def _current_weight(model, weight_input_index=1):
+    node = next(n for n in model.graph.node if n.op_type in ("MatMul", "Gemm"))
+    w_name = node.input[weight_input_index]
+    w_init = next(t for t in model.graph.initializer if t.name == w_name)
+    return onnx.numpy_helper.to_array(w_init)
 
 
 def test_icquant_output_stays_close_to_float_via_onnxruntime():
     model = _matmul_model(K=32, N=8, seed=0)
-    q = onnxsim.quantize_weight_only_icquant(model, group_size=8, num_outliers=1)
+    q = onnxsim.quantize_weight_only_icquant(model)
     onnx.checker.check_model(q)
 
-    op_types = [n.op_type for n in q.graph.node]
-    assert "DequantizeLinear" in op_types
-    assert "ScatterND" in op_types
+    new_w = _current_weight(q)
+    assert new_w.shape == (32, 8)
+    assert new_w.dtype == np.float32
 
     rng = np.random.default_rng(2)
     x = rng.standard_normal((8, 32)).astype(np.float32)
@@ -140,78 +158,16 @@ def test_icquant_output_stays_close_to_float_via_onnxruntime():
     assert _rel_l2(float_y, q_y) < 0.3
 
 
-def test_icquant_outlier_positions_reconstruct_exactly_via_numpy():
-    # Verify reconstruction directly against the emitted initializers with
-    # numpy (a tight *relative* tolerance), rather than round-tripping
-    # through onnxruntime -- onnxruntime's MatMul reduction order isn't
-    # bit-exact across CPU architectures, so it isn't the right tool to
-    # confirm codes reconstruct the original weight exactly.
-    rng = np.random.default_rng(3)
-    weight = rng.standard_normal((32, 8)).astype(np.float32) * 0.1
-    weight[0, 0] = 50.0  # row 0 (of W.T's [N, K] view: N=col 0, K=row 0)
-    model = _matmul_model(K=32, N=8, weight=weight)
-    q = onnxsim.quantize_weight_only_icquant(model, group_size=8, num_outliers=1)
-    onnx.checker.check_model(q)
-
-    init_map = {t.name: onnx.numpy_helper.to_array(t) for t in q.graph.initializer}
-    codes_name = next(n for n in init_map if n.endswith("_icquant_codes"))
-    scale_name = next(n for n in init_map if n.endswith("_icquant_scale"))
-    idx_name = next(n for n in init_map if n.endswith("_icquant_outlier_indices"))
-    val_name = next(n for n in init_map if n.endswith("_icquant_outlier_values"))
-
-    codes = init_map[codes_name].astype(np.float64)  # [K, N]
-    scale = init_map[scale_name].astype(np.float64)  # [K/group_size, N]
-    dequant = codes * np.repeat(scale, 8, axis=0)  # [K, N]
-
-    indices = init_map[idx_name]  # [num_outliers, 2] as [k_pos, n_pos]
-    values = init_map[val_name].astype(np.float64)
-    dequant[indices[:, 0], indices[:, 1]] = values
-
-    assert np.any((indices[:, 0] == 0) & (indices[:, 1] == 0))
-    reconstructed_outlier = dequant[0, 0]
-    assert reconstructed_outlier == pytest.approx(50.0, rel=1e-6)
-
-    # Every other element quantized to within its own group's scale/2.
-    non_outlier_mask = np.ones_like(dequant, dtype=bool)
-    non_outlier_mask[indices[:, 0], indices[:, 1]] = False
-    w_kn = weight.astype(np.float64)  # already [K, N]
-    err = np.abs(w_kn - dequant)[non_outlier_mask]
-    scale_full = np.repeat(scale, 8, axis=0)[non_outlier_mask]
-    assert np.all(err <= scale_full / 2 + 1e-9)
-
-
-def test_icquant_reduces_max_error_vs_zero_outliers():
-    rng = np.random.default_rng(6)
-    weight = rng.standard_normal((32, 8)).astype(np.float32) * 0.1
-    weight[0, 0] = 40.0
-    weight[5, 3] = -35.0
-
-    model = _matmul_model(K=32, N=8, weight=weight)
-    q_plain = onnxsim.quantize_weight_only_icquant(model, group_size=8, num_outliers=0)
-    q_ic = onnxsim.quantize_weight_only_icquant(model, group_size=8, num_outliers=1)
-
-    probe = np.eye(32, dtype=np.float32)
-    (plain_y,) = _run(q_plain, {"X": probe})
-    (ic_y,) = _run(q_ic, {"X": probe})
-
-    w64 = weight.astype(np.float64)
-    plain_err = np.abs(w64 - plain_y.astype(np.float64))
-    ic_err = np.abs(w64 - ic_y.astype(np.float64))
-    assert ic_err.max() < plain_err.max()
-
-
 def test_icquant_declines_when_k_not_divisible_by_group_size():
-    model = _matmul_model(K=20, N=4, seed=9)  # 20 is not a multiple of 8
-    q = onnxsim.quantize_weight_only_icquant(model, group_size=8)
+    model = _matmul_model(K=20, N=4, seed=9)  # 20 is not a multiple of 32
+    q = onnxsim.quantize_weight_only_icquant(model)
     assert q.SerializeToString() == model.SerializeToString()
 
 
-def test_icquant_declines_when_num_outliers_too_large():
-    model = _matmul_model(K=32, N=8, seed=9)
-    q = onnxsim.quantize_weight_only_icquant(
-        model, group_size=8, num_outliers=8
-    )  # num_outliers must be < group_size
-    assert q.SerializeToString() == model.SerializeToString()
+def test_icquant_rejects_non_default_group_size():
+    model = _matmul_model(K=32, N=8, seed=0)
+    with pytest.raises(ValueError):
+        onnxsim.quantize_weight_only_icquant(model, group_size=8)
 
 
 def test_icquant_declines_non_constant_weight():
@@ -238,21 +194,6 @@ def test_icquant_noop_when_no_matmul_present():
     )
     result = onnxsim.quantize_weight_only_icquant(model)
     assert result.SerializeToString() == model.SerializeToString()
-
-
-def test_icquant_declines_below_opset21():
-    model = _matmul_model(K=32, N=8, opset=13)
-    result = onnxsim.quantize_weight_only_icquant(model)
-    assert result.SerializeToString() == model.SerializeToString()
-
-
-def test_icquant_zero_outliers_skips_scatternd():
-    model = _matmul_model(K=32, N=8, seed=10)
-    q = onnxsim.quantize_weight_only_icquant(model, group_size=8, num_outliers=0)
-    onnx.checker.check_model(q)
-    op_types = [n.op_type for n in q.graph.node]
-    assert "ScatterND" not in op_types
-    assert "DequantizeLinear" in op_types
 
 
 def test_icquant_rejects_negative_num_outliers():

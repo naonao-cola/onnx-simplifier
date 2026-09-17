@@ -103,10 +103,14 @@ from typing import Tuple, Union
 
 import numpy as np
 import onnx
-import onnx.numpy_helper
 
 from onnxsim.kmeans_quantization import _kmeans_1d
-from onnxsim.pruning import _find_moe_chains
+from onnxsim.onnx_simplifier import apply_kbvq_moe_cpp
+
+# _klt_basis/_kbvq_reconstruct below are still imported directly by
+# tests/test_kbvq_moe.py (as a reference oracle for the C++ port's own
+# reconstruction math) even though apply_kbvq_moe itself no longer calls
+# them.
 
 
 def _klt_basis(stack_ed: np.ndarray, rank: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -192,35 +196,23 @@ def apply_kbvq_moe(
             router group whose ``fc1``/``fc2`` tensor is not FLOAT32 is
             left untouched, the same restriction
             :func:`onnxsim.moequant.apply_moequant` applies.
+
+    Delegates to the verified C++ port (:func:`onnxsim.apply_kbvq_moe_cpp`)
+    when called with the default ``rank=4``/``bits=4``/``kmeans_iters=20``/
+    ``seed=0`` -- the C++ port's own hardcoded values. A non-default value
+    raises ``ValueError`` rather than being silently ignored (no real
+    caller in this codebase needs a non-default value). The KLT/SVD basis
+    fit itself has no RNG and is expected to track this function's own
+    former implementation closely; the per-expert residual codebook reuses
+    :func:`onnxsim.kmeans_quantization`'s own established deterministic
+    (percentile-init) k-means precedent on both sides.
     """
+    if rank != 4 or bits != 4 or kmeans_iters != 20 or seed != 0:
+        raise ValueError(
+            "apply_kbvq_moe now delegates to apply_kbvq_moe_cpp, which "
+            "hardcodes rank=4, bits=4, kmeans_iters=20, seed=0; call with "
+            "the defaults, or use apply_kbvq_moe_cpp directly"
+        )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-
-    chains = _find_moe_chains(model.graph)
-    if not chains:
-        return model
-
-    result = onnx.ModelProto()
-    result.CopyFrom(model)
-    initializer_map = {t.name: t for t in result.graph.initializer}
-    touched: "set[str]" = set()
-
-    for chain in chains:
-        weight_names = {chain.fc1_w, chain.fc2_w}
-        if weight_names & touched:
-            continue  # a shared/tied initializer another MoE node already quantized
-        touched |= weight_names
-
-        for w_name in (chain.fc1_w, chain.fc2_w):
-            init = initializer_map[w_name]
-            if init.data_type != onnx.TensorProto.FLOAT:
-                continue  # FLOAT16/BFLOAT16 experts are out of scope -- see docstring
-
-            w = onnx.numpy_helper.to_array(init).astype(np.float64)
-            shape = w.shape
-            flat = w.reshape(shape[0], -1)
-            reconstructed = _kbvq_reconstruct(flat, rank, bits, kmeans_iters, seed)
-            new_w = reconstructed.reshape(shape).astype(np.float32)
-            init.CopyFrom(onnx.numpy_helper.from_array(new_w, name=w_name))
-
-    return result
+    return apply_kbvq_moe_cpp(model)

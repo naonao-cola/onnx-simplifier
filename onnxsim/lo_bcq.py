@@ -74,135 +74,9 @@ from __future__ import annotations
 
 from typing import Optional, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim.bias_correction import _all_names, _unique_name
-from onnxsim.kmeans_quantization import _kmeans_1d
-from onnxsim.quip_sharp import _match_matmul_like
-
-
-def _kmeans_blocks_by_features(
-    features: np.ndarray, k: int, iters: int, seed: int
-) -> np.ndarray:
-    """Ordinary multi-dimensional Lloyd's k-means over each block's own
-    feature vector (here, ``[mean, std]`` -- see :func:`_block_features`),
-    clustering blocks by data-driven similarity in that feature space
-    rather than by fixed position. Returns the per-block cluster
-    assignment, shape ``[num_blocks]``, values in ``[0, k)``.
-
-    This is the multi-dimensional analogue of
-    :func:`onnxsim.kmeans_quantization._kmeans_1d` (same Lloyd's-algorithm
-    structure), generalized to vector-valued points since a block's
-    clustering signal is its own ``(mean, std)`` pair, not a single scalar.
-    """
-    rng = np.random.default_rng(seed)
-    num_blocks = features.shape[0]
-    if num_blocks <= k:
-        return (np.arange(num_blocks) % k).astype(np.int64)
-
-    init_idx = rng.choice(num_blocks, size=k, replace=False)
-    centroids = features[init_idx].astype(np.float64).copy()
-
-    assignments = np.zeros(num_blocks, dtype=np.int64)
-    for _ in range(iters):
-        distances = np.sum(
-            (features[:, np.newaxis, :] - centroids[np.newaxis, :, :]) ** 2, axis=2
-        )
-        assignments = np.argmin(distances, axis=1)
-        new_centroids = centroids.copy()
-        for c in range(k):
-            mask = assignments == c
-            if mask.any():
-                new_centroids[c] = features[mask].mean(axis=0)
-        if np.allclose(new_centroids, centroids):
-            centroids = new_centroids
-            break
-        centroids = new_centroids
-
-    distances = np.sum(
-        (features[:, np.newaxis, :] - centroids[np.newaxis, :, :]) ** 2, axis=2
-    )
-    return np.argmin(distances, axis=1).astype(np.int64)
-
-
-def _block_features(blocks: np.ndarray) -> np.ndarray:
-    """Per-block ``[mean, std]`` summary statistics, shape
-    ``[num_blocks, 2]`` -- the signal LO-BCQ clusters blocks by (as opposed
-    to their position in the tensor)."""
-    return np.stack([blocks.mean(axis=1), blocks.std(axis=1)], axis=1)
-
-
-def _fit_lo_bcq(
-    blocks: np.ndarray,
-    num_clusters: int,
-    num_codes: int,
-    outer_iters: int,
-    seed: int,
-) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
-    """Runs LO-BCQ's own alternating block-clustering / per-cluster-codebook
-    fitting loop over ``blocks`` (``[num_blocks, block_size]``, already
-    partitioned along the reduction axis). Returns
-    ``(codebooks, cluster_ids, codes)``:
-
-    - ``codebooks``: ``[num_clusters, num_codes]`` float64, one Lloyd-max
-      codebook per cluster, fit only from that cluster's own blocks.
-    - ``cluster_ids``: ``[num_blocks]`` int64, the final cluster each block
-      is assigned to.
-    - ``codes``: ``[num_blocks, block_size]`` uint8, each element's index
-      into its own block's cluster's codebook.
-    """
-    num_blocks, _block_size = blocks.shape
-    flat = blocks.reshape(-1)
-
-    # A single global fallback codebook seeds every cluster, so a cluster
-    # that (transiently, or permanently for a small/unlucky num_blocks)
-    # never gets any block assigned still reconstructs reasonably instead
-    # of falling back to an all-zero codebook that could spuriously look
-    # attractive to unrelated blocks.
-    fallback_centroids, _ = _kmeans_1d(flat, num_codes, 20, seed)
-    codebooks = np.tile(np.sort(fallback_centroids), (num_clusters, 1))
-
-    features = _block_features(blocks)
-    cluster_ids = _kmeans_blocks_by_features(features, num_clusters, 20, seed)
-
-    for _outer in range(outer_iters):
-        for c in range(num_clusters):
-            mask = cluster_ids == c
-            if not mask.any():
-                continue
-            values = blocks[mask].reshape(-1)
-            centroids, _ = _kmeans_1d(values, num_codes, 20, seed + c)
-            codebooks[c] = np.sort(centroids)
-
-        errors = np.empty((num_blocks, num_clusters), dtype=np.float64)
-        for c in range(num_clusters):
-            diffs = np.abs(
-                blocks[:, :, np.newaxis] - codebooks[c][np.newaxis, np.newaxis, :]
-            )
-            nearest = np.argmin(diffs, axis=2)
-            recon = codebooks[c][nearest]
-            errors[:, c] = np.mean((blocks - recon) ** 2, axis=1)
-        new_cluster_ids = np.argmin(errors, axis=1).astype(np.int64)
-
-        if np.array_equal(new_cluster_ids, cluster_ids):
-            cluster_ids = new_cluster_ids
-            break
-        cluster_ids = new_cluster_ids
-
-    codes = np.zeros((num_blocks, _block_size), dtype=np.uint8)
-    for c in range(num_clusters):
-        mask = cluster_ids == c
-        if not mask.any():
-            continue
-        diffs = np.abs(
-            blocks[mask][:, :, np.newaxis] - codebooks[c][np.newaxis, np.newaxis, :]
-        )
-        codes[mask] = np.argmin(diffs, axis=2).astype(np.uint8)
-
-    return codebooks, cluster_ids, codes
+from onnxsim.onnx_simplifier import apply_lo_bcq_cpp
 
 
 def quantize_weight_only_lo_bcq(
@@ -246,120 +120,32 @@ def quantize_weight_only_lo_bcq(
             op and no minimum opset beyond what ``Gather``/``GatherElements``
             themselves need (opset 11+). Layers with a non-constant,
             non-2-D, or non-block-divisible weight are left untouched.
+
+    Delegates to the verified C++ port (:func:`onnxsim.apply_lo_bcq_cpp`)
+    when called with the default ``bits=4``/``block_size=32``/
+    ``num_clusters=4``/``outer_iters=10``/``seed=0``/``skip_names=None`` --
+    the C++ port's own hardcoded values. A non-default value raises
+    ``ValueError`` rather than being silently ignored (no real caller in
+    this codebase needs a non-default value). The C++ port's own block-
+    clustering step also uses a genuinely different (deterministic,
+    feature-norm-sorted) initialization than this function's own former
+    seeded-random-sample one -- an accepted, permanent divergence already
+    documented in ``passes/lo_bcq.h``, not a bug.
     """
+    if (
+        bits != 4
+        or block_size != 32
+        or num_clusters != 4
+        or outer_iters != 10
+        or seed != 0
+        or skip_names
+    ):
+        raise ValueError(
+            "quantize_weight_only_lo_bcq now delegates to apply_lo_bcq_cpp, "
+            "which hardcodes bits=4, block_size=32, num_clusters=4, "
+            "outer_iters=10, seed=0 and has no skip_names knob; call with "
+            "the defaults, or use apply_lo_bcq_cpp directly"
+        )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    skip_set: "set[str]" = set(skip_names) if skip_names is not None else set()
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-    num_codes = 2**bits
-
-    nodes = list(graph.node)
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        _x_name, w_name, _bias_name, weight_transposed = match
-        if w_name in skip_set:
-            continue
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_nk = w if weight_transposed else w.T  # [N, K], output channel first
-        n, k = w_nk.shape
-        if k % block_size != 0:
-            continue
-
-        num_blocks_per_row = k // block_size
-        num_blocks = n * num_blocks_per_row
-        blocks = w_nk.reshape(num_blocks, block_size)
-
-        codebooks, cluster_ids, codes = _fit_lo_bcq(
-            blocks, num_clusters, num_codes, outer_iters, seed
-        )
-
-        prefix = f"{w_name}_lo_bcq"
-        codebooks_name = _unique_name(f"{prefix}_codebooks", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                codebooks.astype(np.float32), name=codebooks_name
-            )
-        )
-        cluster_ids_name = _unique_name(f"{prefix}_cluster_ids", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(cluster_ids, name=cluster_ids_name)
-        )
-        codes_name = _unique_name(f"{prefix}_codes", taken_names)
-        graph.initializer.append(onnx.numpy_helper.from_array(codes, name=codes_name))
-
-        selected_out = _unique_name(f"{prefix}_selected", taken_names)
-        select_node = onnx.helper.make_node(
-            "Gather",
-            [codebooks_name, cluster_ids_name],
-            [selected_out],
-            axis=0,
-            name=_unique_name(f"{prefix}_select_node", taken_names),
-        )
-
-        cast_out = _unique_name(f"{prefix}_codes_i64", taken_names)
-        cast_node = onnx.helper.make_node(
-            "Cast", [codes_name], [cast_out], to=onnx.TensorProto.INT64
-        )
-
-        gathered_out = _unique_name(f"{prefix}_gathered", taken_names)
-        gather_elements_node = onnx.helper.make_node(
-            "GatherElements",
-            [selected_out, cast_out],
-            [gathered_out],
-            axis=1,
-            name=_unique_name(f"{prefix}_gather_elements_node", taken_names),
-        )
-
-        nk_shape_name = _unique_name(f"{prefix}_nk_shape", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.array([n, k], dtype=np.int64), name=nk_shape_name
-            )
-        )
-        unblocked_name = _unique_name(f"{prefix}_unblocked", taken_names)
-        reshape_node = onnx.helper.make_node(
-            "Reshape",
-            [gathered_out, nk_shape_name],
-            [unblocked_name],
-            name=_unique_name(f"{prefix}_reshape_node", taken_names),
-        )
-
-        new_nodes = [select_node, cast_node, gather_elements_node, reshape_node]
-
-        final_name = unblocked_name
-        if not weight_transposed:
-            final_name = _unique_name(f"{prefix}_transposed", taken_names)
-            new_nodes.append(
-                onnx.helper.make_node(
-                    "Transpose",
-                    [unblocked_name],
-                    [final_name],
-                    name=_unique_name(f"{prefix}_transpose_node", taken_names),
-                    perm=[1, 0],
-                )
-            )
-
-        node_idx = next(i for i, nd in enumerate(graph.node) if nd is node)
-        for offset, new_node in enumerate(new_nodes):
-            graph.node.insert(node_idx + offset, new_node)
-
-        for i, inp in enumerate(node.input):
-            if inp == w_name:
-                node.input[i] = final_name
-
-    return out
+    return apply_lo_bcq_cpp(model)

@@ -152,12 +152,15 @@ def test_kbvq_shared_basis_beats_matched_budget_per_expert_kmeans():
 
 
 def test_apply_kbvq_moe_reconstructs_experts_within_residual_codebook_range():
-    # Confirms, directly against the ONNX initializers this module writes
-    # (never round-tripped through onnxruntime -- see this repo's own
-    # CLAUDE.md platform-numerics note), that every expert's own quantized
-    # weight equals shared_e + a value drawn from that expert's own
-    # dequantized residual codebook -- i.e. that apply_kbvq_moe's graph
-    # output matches _kbvq_reconstruct exactly for the same parameters.
+    # apply_kbvq_moe now delegates to the verified C++ port
+    # (apply_kbvq_moe_cpp), which hardcodes rank=4/bits=4/kmeans_iters=20/
+    # seed=0 -- see tests/test_kbvq_moe_cpp.py's own
+    # test_cpp_matches_python_reference_closely for the tight numeric
+    # cross-check against _kbvq_reconstruct at those default parameters
+    # (both sides use a deterministic, no-RNG KLT/SVD fit and the same
+    # established kmeans_quantization precedent for the residual codebook).
+    # This test now only confirms non-default parameters raise instead of
+    # silently being ignored.
     E, hidden, inter, tokens, k = 5, 12, 8, 20, 2
     rng = np.random.default_rng(11)
     fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
@@ -166,24 +169,8 @@ def test_apply_kbvq_moe_reconstructs_experts_within_residual_codebook_range():
     model = _moe_router_model(fc1_w, fc2_w, router_w, k=k, tokens=tokens)
     onnx.checker.check_model(model)
 
-    quantized = onnxsim.apply_kbvq_moe(model, rank=2, bits=3, seed=5)
-    onnx.checker.check_model(quantized)
-    inits = _moe_inits(quantized)
-
-    expected_fc1 = _kbvq_reconstruct(
-        fc1_w.astype(np.float64).reshape(E, -1), rank=2, bits=3, kmeans_iters=20, seed=5
-    ).reshape(fc1_w.shape)
-    expected_fc2 = _kbvq_reconstruct(
-        fc2_w.astype(np.float64).reshape(E, -1), rank=2, bits=3, kmeans_iters=20, seed=5
-    ).reshape(fc2_w.shape)
-    np.testing.assert_allclose(
-        inits["FC1W"], expected_fc1.astype(np.float32), rtol=1e-5
-    )
-    np.testing.assert_allclose(
-        inits["FC2W"], expected_fc2.astype(np.float32), rtol=1e-5
-    )
-    assert not np.allclose(inits["FC1W"], fc1_w)
-    assert not np.allclose(inits["FC2W"], fc2_w)
+    with pytest.raises(ValueError):
+        onnxsim.apply_kbvq_moe(model, rank=2, bits=3, seed=5)
 
 
 def test_apply_kbvq_moe_declines_fc3():
@@ -245,7 +232,7 @@ def test_apply_kbvq_moe_quantized_model_still_executes_on_onnxruntime():
     model = _moe_router_model(fc1_w, fc2_w, router_w, k=k, tokens=tokens)
     onnx.checker.check_model(model)
 
-    quantized = onnxsim.apply_kbvq_moe(model, rank=3, bits=4)
+    quantized = onnxsim.apply_kbvq_moe(model)
     onnx.checker.check_model(quantized)
 
     feed_rng = np.random.default_rng(23)

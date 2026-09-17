@@ -230,13 +230,15 @@ def test_noop_on_non_matching_layer():
     model, weight = _matmul_model(K=K, N=N, seed=11)
     calib = [{"X": _salient_calibration(K, salient_channels=(1, 6), seed=12)}]
 
-    quantized = onnxsim.quantize_weight_only_pb_llm(
-        model, calibration_data=calib, skip_names={"W"}
-    )
-    assert quantized.SerializeToString() == model.SerializeToString()
+    # quantize_weight_only_pb_llm now delegates to
+    # quantize_weight_only_pb_llm_cpp, which has no skip_names equivalent.
+    with pytest.raises(ValueError):
+        onnxsim.quantize_weight_only_pb_llm(
+            model, calibration_data=calib, skip_names={"W"}
+        )
 
-    # Also a layer whose weight isn't a plain constant 2-D float32 tensor
-    # (a 1-D bias-shaped initializer here) shouldn't be touched at all.
+    # A layer whose weight isn't a plain constant 2-D float32 tensor (a 1-D
+    # bias-shaped initializer here) shouldn't be touched at all.
     conv_like = _model(
         """
         g (float[1,4] X) => (float[1,4] Y)

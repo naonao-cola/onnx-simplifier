@@ -126,64 +126,12 @@ residual pair). Ordinary ONNX ops only (``Cast``/``Mul``), opset 11+.
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Sequence, Union
+from typing import Iterable, Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.bias_correction import (
-    _activation_rows,
-    _add_probe_outputs,
-    _all_names,
-    _unique_name,
-)
-from onnxsim.billm import _sign
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.quip_sharp import _match_matmul_like
-
-
-def _pb_llm_quantize_columns(
-    w_nk: np.ndarray, diag_h: np.ndarray, salient_ratio: float
-) -> "tuple[np.ndarray, np.ndarray]":
-    """Splits ``w_nk``'s ([N, K], output channel first) columns into a
-    salient (INT8) and non-salient (~1-bit) set by
-    ``mean_n(|w|) * diag_h`` per column (see this module's own docstring),
-    and quantizes each column accordingly. Returns ``(code_nk, scale_k)``:
-    an ``[N, K]`` int8 code array and a length-``K`` per-column float64
-    scale array.
-    """
-    n, k = w_nk.shape
-    code = np.empty((n, k), dtype=np.int8)
-    scale = np.empty(k, dtype=np.float64)
-    if k == 0:
-        return code, scale
-
-    col_mag = np.mean(np.abs(w_nk), axis=0)
-    salience = col_mag * diag_h
-    order = np.argsort(-salience)
-    num_salient = int(round(salient_ratio * k))
-    num_salient = max(0, min(k, num_salient))
-    salient_cols = order[:num_salient]
-    nonsalient_cols = order[num_salient:]
-
-    if salient_cols.size > 0:
-        w_sal = w_nk[:, salient_cols]
-        scale_sal = np.maximum(np.abs(w_sal).max(axis=0), 1e-12) / 127.0
-        code_sal = np.clip(np.round(w_sal / scale_sal), -127, 127)
-        code[:, salient_cols] = code_sal.astype(np.int8)
-        scale[salient_cols] = scale_sal
-
-    if nonsalient_cols.size > 0:
-        w_ns = w_nk[:, nonsalient_cols]
-        scale_ns = np.mean(np.abs(w_ns), axis=0)
-        code_ns = _sign(w_ns)
-        code[:, nonsalient_cols] = code_ns.astype(np.int8)
-        scale[nonsalient_cols] = scale_ns
-
-    return code, scale
+from onnxsim.calibration import Tensors
+from onnxsim.onnx_simplifier import quantize_weight_only_pb_llm_cpp
 
 
 def quantize_weight_only_pb_llm(
@@ -204,9 +152,11 @@ def quantize_weight_only_pb_llm(
     :mod:`onnxsim.mixed_precision` (whole-layer, not per-column,
     bit-width dispatch).
 
-    Needs real calibration activations to compute each layer's
-    Hessian-diagonal salience, the same as :mod:`onnxsim.gptq`/
-    :mod:`onnxsim.billm`/:mod:`onnxsim.owq`.
+    Delegates to the verified C++ port
+    (:func:`onnxsim.quantize_weight_only_pb_llm_cpp`), which takes the same
+    ``calibration_data``/``num_samples``/``seed``/``salient_ratio``/
+    ``providers`` parameters unchanged but has no ``skip_names``
+    equivalent -- it always considers every eligible layer.
 
     :param model: the original (unquantized) onnx ModelProto or file path
     :param calibration_data: representative input batches to compute each
@@ -223,117 +173,28 @@ def quantize_weight_only_pb_llm(
             every column to INT8 -- see this module's own docstring for
             both limits
     :param skip_names: weight initializer names to leave unquantized even
-            if otherwise eligible
+            if otherwise eligible. Not supported by the C++ port; must be
+            omitted (or empty)
     :param providers: onnxruntime execution providers to run ``model`` on
             when capturing calibration activations
-    :returns: ``model`` with every matched layer's weight replaced by
-            ``Mul(Cast(Code), Scale)`` feeding the original MatMul/Gemm
-            node -- ordinary ONNX ops only, opset 11+. Layers with a
-            non-constant, non-2-D, or non-float32 weight, or whose
-            activation input has no feature axis at all (rank < 2), are
-            left untouched; a higher-rank ``[batch, seq, K]`` activation
-            is flattened to ``[batch * seq, K]``, which is exact.
+    :returns: ``model`` with every matched layer's weight replaced by the
+            C++ port's own quantized representation -- see
+            :func:`onnxsim.quantize_weight_only_pb_llm_cpp`'s own
+            docstring for the exact graph shape.
     """
+    if skip_names:
+        raise ValueError(
+            "quantize_weight_only_pb_llm now delegates to "
+            "quantize_weight_only_pb_llm_cpp, which has no skip_names "
+            "equivalent and always considers every eligible layer"
+        )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    skip_names = set(skip_names) if skip_names is not None else frozenset()
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    candidates = []
-    for node in graph.node:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, _bias_name, weight_transposed = match
-        if w_name in skip_names:
-            continue
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, weight_transposed))
-
-    if not candidates:
-        return out
-
-    probe_names = sorted({c[1] for c in candidates})
-    probe_model = _add_probe_outputs(model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(result[name], dtype=np.float64))
-
-    for node, x_name, w_name, weight_transposed in candidates:
-        acts = _activation_rows(activations[x_name])
-        if not acts:
-            continue  # no usable activation (no feature axis); skip
-        x = np.concatenate(acts, axis=0)
-
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if weight_transposed else w.T  # [N, K]
-        n, k = w_nk.shape
-        if x.shape[1] != k:
-            continue  # activation's feature dim doesn't match K; skip
-
-        diag_h = np.sum(x**2, axis=0)  # [K]
-        code_nk, scale_k = _pb_llm_quantize_columns(w_nk, diag_h, salient_ratio)
-
-        code_orig = code_nk if weight_transposed else code_nk.T
-        assert code_orig.shape == (dim0, dim1)
-
-        # scale_k is indexed along K (the reduction dim). When
-        # weight_transposed (W is [N, K], K last), it broadcasts against W
-        # as-is; otherwise (W is [K, N], K first) it needs a trailing
-        # size-1 axis to broadcast against axis 0 instead of axis -1 --
-        # the same reasoning onnxsim.billm's own quantize_weight_only_billm
-        # uses for its own per-column scale.
-        scale_orig = scale_k if weight_transposed else scale_k[:, np.newaxis]
-
-        prefix = f"{w_name}_pb_llm"
-        code_name = _unique_name(f"{prefix}_code", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(code_orig.astype(np.int8), name=code_name)
-        )
-        scale_name = _unique_name(f"{prefix}_scale", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(scale_orig.astype(np.float32), name=scale_name)
-        )
-
-        cast_out = _unique_name(f"{prefix}_code_f", taken_names)
-        cast_node = onnx.helper.make_node(
-            "Cast", [code_name], [cast_out], to=onnx.TensorProto.FLOAT
-        )
-        dq_out = _unique_name(f"{prefix}_dq", taken_names)
-        mul_node = onnx.helper.make_node(
-            "Mul",
-            [cast_out, scale_name],
-            [dq_out],
-            name=_unique_name(f"{prefix}_dequant", taken_names),
-        )
-
-        insertion_point = next(i for i, n in enumerate(graph.node) if n is node)
-        for new_node in (cast_node, mul_node):
-            graph.node.insert(insertion_point, new_node)
-            insertion_point += 1
-
-        for i, inp in enumerate(node.input):
-            if inp == w_name:
-                node.input[i] = dq_out
-
-    return out
+    return quantize_weight_only_pb_llm_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        salient_ratio=salient_ratio,
+        providers=providers,
+    )
