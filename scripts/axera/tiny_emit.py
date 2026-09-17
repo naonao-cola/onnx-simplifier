@@ -703,5 +703,35 @@ def bank81_field192_operand(k: int) -> bytes:
     decoded formula for a field's own value is a necessary but not
     sufficient condition for that field to be *generatable* in a target
     stream this function did not itself compile.
+
+    **This was tested directly, not left as a hedge (2026-09-18).**
+    Patching a real ``K=512`` reference build's own two field=192
+    records to this function's own ``K=256``-predicted operand, then
+    diffing the result byte-for-byte against a REAL, independently-built
+    ``K=256`` reference -- the same ground-truth-comparison bar
+    ``patch_matmul_a_scale``'s own form-crossing check and
+    ``patch_conv_zp_x``'s own zp_x check used -- finds the two are not
+    remotely close: the raw stream lengths themselves already differ
+    (4368 vs 3792 bytes, a 576-byte gap no in-place byte patch can ever
+    close), and even over their shared 3792-byte prefix, 2776 bytes
+    differ (73%), with the first mismatch at byte 36 -- nowhere near
+    either copy of the patched field itself (bytes 533 and 1172). The
+    reverse direction (``K=256`` source patched to ``K=512``'s own
+    predicted value, diffed against a real ``K=512`` build) shows the
+    identical picture: same 2776/3792 diff count, same first-mismatch
+    offset. This is confined-vs-scattered-diff evidence, and it is
+    unambiguously scattered -- worse than ``patch_matmul_a_scale``'s own
+    201-byte, single-region reflow for a form-crossing MatMul edit. The
+    patched stream still round-trips through ``mcode.decode()``/
+    ``mcode.check()`` with zero grammar errors either direction -- a
+    weak, uninformative signal on its own (this project's grammar does
+    not validate semantic correctness, only structural well-formedness)
+    -- but it is NOT a real ``K=256`` build by any byte-level measure.
+    See ``tests/test_axera_bank81_field192_patch_verify.py`` for the
+    exact fixture pair and byte counts. **Conclusion: this field is
+    understood, not generatable** -- changing ``K`` restructures nearly
+    the entire compiled stream (consistent with ``K`` being Gemm's own
+    real contraction dimension, driving tiling/scheduling throughout),
+    not just this one field's own recorded value.
     """
     return b"\x4c\x05" + bytes([1024 // k - 1])
