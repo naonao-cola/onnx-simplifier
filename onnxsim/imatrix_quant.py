@@ -97,10 +97,11 @@ import onnx.helper
 import onnx.numpy_helper
 
 from onnxsim import backend
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
+from onnxsim.bias_correction import _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.llm_int8 import _match_matmul_like
 from onnxsim.omniquant import _quantize_blockwise_int4_with_clip
+from onnxsim.onnx_simplifier import apply_imatrix_quantization_cpp
 
 _MAX_CODE = 7.0  # symmetric 4-bit code range [-7, 7], matching
 # onnxsim.omniquant._quantize_blockwise_int4_with_clip's own convention.
@@ -328,71 +329,19 @@ def apply_imatrix_quantization(
             reduction dimension not divisible by ``block_size``, or whose
             activation was never observed as a real-valued tensor across
             the calibration data, is left untouched.
+
+    Delegates to the verified C++ port
+    (:func:`onnxsim.apply_imatrix_quantization_cpp`), which has full
+    parameter parity with this function.
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    skip_names = set(skip_names) if skip_names is not None else frozenset()
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    candidates = []  # (node, x_name, w_name, weight_transposed)
-    for node in graph.node:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, _bias_name, weight_transposed = match
-        if w_name in skip_names:
-            continue
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, weight_transposed))
-    if not candidates:
-        return out
-
-    importance = compute_activation_importance(
-        out,
+    return apply_imatrix_quantization_cpp(
+        model,
         calibration_data=calibration_data,
         num_samples=num_samples,
         seed=seed,
         providers=providers,
+        block_size=block_size,
+        num_scale_candidates=num_scale_candidates,
+        scale_search_range=scale_search_range,
+        skip_names=skip_names,
     )
-
-    quantized_names: Dict[str, str] = {}
-    for node, x_name, w_name, weight_transposed in candidates:
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_nk = w if weight_transposed else w.T  # [N, K], output channel first
-        n, k = w_nk.shape
-
-        importance_k = importance.get(x_name)
-        if importance_k is None or importance_k.shape[0] != k or k % block_size != 0:
-            continue
-
-        new_name = quantized_names.get(w_name)
-        if new_name is None:
-            w_quant_nk = quantize_dequantize_int4_imatrix(
-                w_nk,
-                importance_k,
-                block_size=block_size,
-                num_scale_candidates=num_scale_candidates,
-                scale_search_range=scale_search_range,
-            )
-            w_quant = w_quant_nk if weight_transposed else w_quant_nk.T
-
-            new_name = _unique_name(f"{w_name}_imatrix", taken_names)
-            graph.initializer.append(
-                onnx.numpy_helper.from_array(w_quant.astype(np.float32), name=new_name)
-            )
-            quantized_names[w_name] = new_name
-        node.input[1] = new_name
-
-    return out
