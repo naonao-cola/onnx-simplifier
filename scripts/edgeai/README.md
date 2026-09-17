@@ -155,6 +155,27 @@ everything":
   as LayerNorm. It didn't; this is the correction, made after actually
   reading `docs/operators.md` instead of assuming.
 
+  This hand-written formula is deliberately *not* built the way
+  `scripts/renesas/legalize.py::legalize_via_onnx_function` builds its
+  own rewrites (extracting ONNX's schema-defined decomposition directly
+  via `onnx.defs`/`onnx.inliner`, rather than hand-deriving one) -- the
+  two are checked as genuinely different considerations, not the same
+  choice made twice. ONNX's own schema function for `Gelu` is real and
+  extractable, but produces a structurally different, `Constant`/
+  `CastLike`/`Sqrt`/`Sum`-heavy 12-node sequence (its own formal spec
+  artifact, opset 20+) instead of the 5-node `Div`/`Erf`/`Add`/`Mul`/`Mul`
+  shape real exporters emit and TIDL's real importer most likely
+  pattern-matches against (per `docs/vision_transformers.md`'s GELU
+  section -- an image, not literal text, so neither shape is textually
+  confirmed against it). Emitting the schema-derived shape here would risk
+  producing something the real importer doesn't recognize, silently
+  defeating this rule's purpose -- so `unfuse_gelu_to_erf` still emits the
+  original 5-node form; the schema function is used only as an
+  independent correctness cross-check (`tests/test_edgeai_legalize.py::
+  test_unfuse_gelu_to_erf_matches_onnx_schema_function_decomposition`),
+  confirming the hand-written formula computes what ONNX's own spec says
+  `Gelu` means, not as the rewrite's actual output.
+
 Both are exact, not approximate, and only fire on the specific node
 wiring real exporters produce -- see each rule's own docstring for exactly
 what is matched and what is conservatively left alone. Run standalone as

@@ -356,6 +356,24 @@ def unfuse_gelu_to_erf(model: onnx.ModelProto) -> int:
     different formula, not this one, so it is conservatively left alone
     (ONNX's own default for `approximate`, when the attribute is absent, is
     `"none"`).
+
+    This formula is *also* independently confirmed against ONNX's own
+    schema-defined `Gelu` decomposition (`onnx.defs.get_schema("Gelu",
+    ...).get_context_dependent_function_with_opset_version(...)`, inlined
+    via `onnx.inliner.inline_local_functions()` -- the same mechanism
+    `scripts/renesas/legalize.py::legalize_via_onnx_function` uses) in
+    `tests/test_edgeai_legalize.py::
+    test_unfuse_gelu_to_erf_matches_onnx_schema_function_decomposition`.
+    That schema-derived form is deliberately *not* what this rule emits,
+    though: it's a structurally different, `Constant`/`CastLike`/`Sqrt`/
+    `Sum`-heavy 12-node sequence (ONNX's own formal spec artifact, opset
+    20+), not the 5-node `Div`/`Erf`/`Add`/`Mul`/`Mul` shape real exporters
+    (and, per `docs/vision_transformers.md`'s image-only GELU diagram --
+    not literal text -- most likely TIDL's real importer) actually expect.
+    Producing the schema-derived shape here would risk silently defeating
+    this rule's whole purpose; extracting it is useful only as an
+    independent check that this hand-written formula computes what ONNX's
+    own spec says `Gelu` means, not as the rewrite's output.
     """
     elem_types = _elem_types(model)
     nodes = list(model.graph.node)

@@ -22,7 +22,8 @@ import sys
 
 import numpy as np
 import onnx
-from onnx import numpy_helper, parser
+import onnx.inliner
+from onnx import FunctionProto, TypeProto, helper, numpy_helper, parser
 from onnx.reference import ReferenceEvaluator
 
 _EDGEAI_DIR = os.path.join(
@@ -56,8 +57,7 @@ models = fresh("models", _EDGEAI_DIR)
 def _decomposed_layernorm(affine=False, opset=17):
     """The hand-written LayerNorm export `fuse_decomposed_layernorm` targets."""
     if not affine:
-        model = parser.parse_model(
-            f"""
+        model = parser.parse_model(f"""
             <
               ir_version: 8,
               opset_import: ["": {opset}]
@@ -73,13 +73,11 @@ def _decomposed_layernorm(affine=False, opset=17):
               std = Sqrt(var_eps)
               y = Div(centered, std)
             }}
-            """
-        )
+            """)
         onnx.checker.check_model(model)
         return model
 
-    model = parser.parse_model(
-        f"""
+    model = parser.parse_model(f"""
         <
           ir_version: 8,
           opset_import: ["": {opset}]
@@ -97,8 +95,7 @@ def _decomposed_layernorm(affine=False, opset=17):
           scaled = Mul(normed, gamma)
           y = Add(scaled, beta)
         }}
-        """
-    )
+        """)
     # Kept as numpy-built initializers per this repo's CLAUDE.md guidance --
     # the parser encodes tensor literals as `float_data`, byte-different
     # from a `numpy_helper.from_array` tensor, which does not matter here
@@ -120,8 +117,7 @@ def _decomposed_layernorm(affine=False, opset=17):
 def _gelu_node(approximate="none"):
     """A model with a single, literal `Gelu` op -- what `unfuse_gelu_to_erf`
     targets (in the `approximate="none"` case only)."""
-    model = parser.parse_model(
-        f"""
+    model = parser.parse_model(f"""
         <
           ir_version: 8,
           opset_import: ["": 20]
@@ -130,8 +126,7 @@ def _gelu_node(approximate="none"):
         {{
           y = Gelu<approximate = "{approximate}">(x)
         }}
-        """
-    )
+        """)
     onnx.checker.check_model(model)
     return model
 
@@ -186,8 +181,7 @@ def test_fuse_decomposed_layernorm_clears_the_normalization_risk():
 def test_fuse_decomposed_layernorm_leaves_other_reduce_mean_pairs_alone():
     """Two `ReduceMean`s and a `Sqrt` used for something else entirely (not
     this exact wiring) must not be mistaken for the pattern."""
-    model = parser.parse_model(
-        """
+    model = parser.parse_model("""
         <
           ir_version: 8,
           opset_import: ["": 17]
@@ -199,8 +193,7 @@ def test_fuse_decomposed_layernorm_leaves_other_reduce_mean_pairs_alone():
           s = Sqrt(b)
           y = Add(a, s)
         }
-        """
-    )
+        """)
     onnx.checker.check_model(model)
     assert legalize.fuse_decomposed_layernorm(model) == 0
     assert [n.op_type for n in model.graph.node] == [
@@ -225,6 +218,70 @@ def test_unfuse_gelu_to_erf_matches_reference_output():
 
     x = np.random.RandomState(2).randn(1, 4).astype(np.float32)
     _assert_same_output(before, model, "x", x)
+
+
+def _onnx_schema_gelu_model(opset=20, approximate="none"):
+    """ONNX's *own* schema-defined decomposition for `Gelu` -- extracted via
+    `onnx.defs`/`onnx.inliner`, the same mechanism `scripts/renesas/
+    legalize.py::legalize_via_onnx_function` uses -- wrapped as a
+    standalone runnable model, for cross-checking `unfuse_gelu_to_erf`'s
+    hand-written formula against.
+
+    Deliberately NOT reused as `unfuse_gelu_to_erf`'s actual rewrite: ONNX's
+    schema function produces a structurally different node sequence
+    (`Constant`/`CastLike`/`Sqrt`/`Sum`-heavy, 12 nodes) than the
+    `Div`/`Erf`/`Add`/`Mul`/`Mul` (5 nodes) shape real ONNX exporters
+    (e.g. PyTorch pre-opset-20) actually emit and, per `docs/
+    vision_transformers.md` (image-only, not literal text -- see
+    `legalize.py`'s docstring), TIDL's real importer most likely
+    pattern-matches against. Swapping the rewrite's *output* to the
+    schema-derived shape would risk producing something the real importer
+    no longer recognizes; this function exists only to confirm the
+    existing hand-written formula computes the same thing ONNX's own spec
+    says `Gelu` means, as an independent correctness cross-check.
+    """
+    node = helper.make_node("Gelu", ["x"], ["y"], approximate=approximate)
+    schema = onnx.defs.get_schema("Gelu", opset)
+    input_type = TypeProto()
+    input_type.tensor_type.elem_type = onnx.TensorProto.FLOAT
+    function_bytes = schema.get_context_dependent_function_with_opset_version(
+        opset, node.SerializeToString(), [input_type.SerializeToString()]
+    )
+    function_proto = FunctionProto()
+    function_proto.ParseFromString(function_bytes)
+
+    wrapper_graph = helper.make_graph(
+        [node],
+        "wrapper",
+        [helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 4])],
+        [helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 4])],
+    )
+    wrapper_model = helper.make_model(
+        wrapper_graph, opset_imports=[helper.make_opsetid("", opset)]
+    )
+    wrapper_model.functions.append(function_proto)
+    inlined = onnx.inliner.inline_local_functions(wrapper_model)
+    onnx.checker.check_model(inlined)
+    return inlined
+
+
+def test_unfuse_gelu_to_erf_matches_onnx_schema_function_decomposition():
+    """Independent cross-check of `unfuse_gelu_to_erf`'s hand-written
+    formula against ONNX's own schema-defined `Gelu` decomposition
+    (extracted via `onnx.defs`/`onnx.inliner`, not hand-derived) -- same
+    input, both should compute the same output even though the two
+    decompositions use structurally different node sequences (see
+    `_onnx_schema_gelu_model`'s docstring for why the rewrite itself still
+    targets the hand-written shape, not this one).
+    """
+    hand_written = _gelu_node()
+    legalize.unfuse_gelu_to_erf(hand_written)
+    onnx.checker.check_model(hand_written)
+
+    schema_derived = _onnx_schema_gelu_model()
+
+    x = np.random.RandomState(3).randn(1, 4).astype(np.float32)
+    _assert_same_output(schema_derived, hand_written, "x", x)
 
 
 def test_unfuse_gelu_to_erf_leaves_tanh_approximation_alone():
