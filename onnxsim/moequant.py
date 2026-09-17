@@ -251,6 +251,30 @@ def apply_moequant(
             expert that received no calibration tokens at all (top-``k``
             selected it for zero observed tokens) is left at its original
             float value -- there is nothing for AGQ/EBSS to weight.
+
+    **Not delegated to the C++ port, deliberately.** Unlike most other
+    ``apply_*``/``apply_*_cpp`` pairs in this codebase, this function stays
+    its own independent, pure-Python implementation rather than aliasing
+    :func:`onnxsim.apply_moequant_cpp` -- the same
+    "two independently-correct, non-interchangeable entry points" contract
+    ``ApplyQuarot``/``apply_quarot_cpp`` and ``apply_quarot`` already
+    establish for their own random-rotation gap (see ``onnxsim.h``'s own
+    ``ApplyQuarot`` doc comment). The reason here is EBSS's own weighted-
+    without-replacement subsampling: this function's ``_ebss_select`` draws
+    from a caller-supplied ``numpy.random.Generator``, while
+    ``apply_moequant_cpp`` uses its own independent splitmix64-derived RNG
+    (see ``onnxsim/moequant_entry.h``'s own accepted numerical scope note)
+    -- aliasing this function to the C++ port would silently change which
+    tokens EBSS keeps for every existing caller that relies on this
+    function's own reproducible-from-a-numpy-seed behavior (directly, or
+    via ``rng`` threaded through other pure-Python callers). Column
+    quantization itself (GPTQ's own machinery, reused via
+    :func:`onnxsim.gptq._gptq_quantize_columns`) is otherwise the same
+    algorithm on both sides -- ``apply_moequant_cpp`` is the faster,
+    independently-verified alternative when that RNG difference doesn't
+    matter to the caller (e.g. ``ebss=False``, or ``ebss=True`` when only
+    the resulting quantization quality -- not which exact tokens were
+    kept -- is being compared).
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)

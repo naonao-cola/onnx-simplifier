@@ -96,38 +96,19 @@ activation input is a plain 2-D tensor.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Union
+from typing import Optional, Sequence, Union
 
 import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _find_int4_matmul_candidates, _node_outputs, _pack_int4
-from onnxsim.bias_correction import (
-    _activation_rows,
-    _add_probe_outputs,
-    _all_names,
-    _unique_name,
-)
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.omniquant import _quantize_blockwise_int4_with_clip
+from onnxsim.calibration import Tensors
 
-
-@dataclass
-class _AffineQuantRewrite:
-    output_name: str
-    activation_name: str
-    wq_name: str
-    ws_name: str
-    codes: np.ndarray  # int8, original (Wq's) layout/shape
-    scale: np.ndarray  # float32, original (Ws's) layout/shape
-    channel_scale: Optional[np.ndarray]  # None means no LET transform needed
-    shift: Optional[np.ndarray]  # [K]; paired with channel_scale
-    rotation: Optional[np.ndarray]  # [K, K] block-diagonal; None means diagonal-only
-    bias_correction: Optional[np.ndarray]  # [N]; paired with channel_scale
+# _block_diagonal_rotation is kept as a plain, directly reusable function
+# (not folded into apply_affinequant's own now-C++ implementation below)
+# because tests/test_affinequant.py's own
+# test_block_diagonal_rotation_is_orthogonal_and_block_diagonal unit-tests
+# it directly, exercising the rotation-construction step of this
+# technique's own "Search strategy" in isolation from the full grid search.
 
 
 def _block_diagonal_rotation(
@@ -152,39 +133,6 @@ def _block_diagonal_rotation(
         _, eigvecs = np.linalg.eigh(cov)
         rotation[start:stop, start:stop] = eigvecs
     return rotation
-
-
-def _diagonal_scale_grid(
-    weight_col_absmax: np.ndarray, act_col_absmax: np.ndarray, alphas: np.ndarray
-):
-    """Yields, for each ``alpha``, the same SmoothQuant/OmniQuant-style
-    closed-form per-channel scale ``s_j = act_j**alpha / weight_j**(1 -
-    alpha)`` (renormalized to unit geometric mean) that
-    :func:`onnxsim.apply_omniquant`'s own LET stage already computes,
-    reused verbatim here in whatever basis the caller passes in.
-    """
-    for alpha in alphas:
-        raw = act_col_absmax**alpha / weight_col_absmax ** (1.0 - alpha)
-        yield raw / np.exp(np.mean(np.log(raw)))
-
-
-def _reconstruction_error(
-    x: np.ndarray,
-    y_float: np.ndarray,
-    w_hat_nk: np.ndarray,
-    shift,
-    rotation,
-    channel_scale,
-    bias_correction,
-) -> float:
-    if channel_scale is None:
-        y_hat = x @ w_hat_nk.T
-    else:
-        x_centered = x - shift[np.newaxis, :]
-        x_rot = x_centered @ rotation if rotation is not None else x_centered
-        x_transformed = x_rot / channel_scale[np.newaxis, :]
-        y_hat = x_transformed @ w_hat_nk.T + bias_correction[np.newaxis, :]
-    return float(np.mean((y_float - y_hat) ** 2))
 
 
 def apply_affinequant(
@@ -256,252 +204,29 @@ def apply_affinequant(
             ``Add`` folding in the constant bias correction after it. A
             layer AffineQuant found no LET improvement for still gets its
             LWC-only reclipping, with no inserted activation-side nodes.
+
+    Thin wrapper delegating to the verified C++ port
+    (:func:`onnxsim.apply_affinequant_cpp`) -- full parameter parity, no
+    functionality gap (see that function's own docstring, and
+    ``onnxsim/affinequant_entry.h``, for the one documented, immaterial-
+    -to-correctness numerical divergence: the block-affine candidate's own
+    hand-rolled cyclic Jacobi eigendecomposition does not reproduce
+    ``numpy.linalg.eigh``'s own eigenvector basis bit-for-bit on a block
+    with repeated/near-degenerate eigenvalues -- both are equally valid
+    orthonormal bases of the same eigenspace, verified to reach the same
+    reconstruction-error quality, not merely "close").
     """
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    if isinstance(quantized_model, str):
-        quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_affinequant_cpp
 
-    candidates = _find_int4_matmul_candidates(float_model, quantized_model)
-    if not candidates:
-        return quantized_model
-
-    probe_names = sorted({c.float_node.input[0] for c in candidates})
-    float_probe = _add_probe_outputs(float_model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        out = backend.run_model(float_probe, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(out[name], dtype=np.float64))
-
-    clip_ratios = np.linspace(min_clip_ratio, 1.0, num_clip_steps)[::-1]  # 1.0 first
-    alphas = np.linspace(0.0, 1.0, num_alpha_steps)
-
-    rewrites: List[_AffineQuantRewrite] = []
-    for c in candidates:
-        acts = _activation_rows(activations[c.float_node.input[0]])
-        if not acts:
-            continue  # no usable activation (no feature axis); skip
-        x = np.concatenate(acts, axis=0)
-
-        w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if c.weight_transposed else w.T  # [N, K]
-        if x.shape[1] != w_nk.shape[1]:
-            continue
-        k = w_nk.shape[1]
-
-        y_float = x @ w_nk.T
-
-        # Candidate 1: LWC only (no LET) -- clip_ratio=1.0 is always tried
-        # first and is exactly quantize_weight_only_int4's own scale, so
-        # this candidate can only match or improve on plain RTN.
-        best_codes_nk, best_scale_blocks = _quantize_blockwise_int4_with_clip(
-            w_nk, c.block_size, 1.0
-        )
-        best_err = _reconstruction_error(
-            x,
-            y_float,
-            best_codes_nk * np.repeat(best_scale_blocks, c.block_size, axis=1),
-            None,
-            None,
-            None,
-            None,
-        )
-        best_clip_ratio = 1.0
-        for clip_ratio in clip_ratios[1:]:
-            codes_nk, scale_blocks = _quantize_blockwise_int4_with_clip(
-                w_nk, c.block_size, clip_ratio
-            )
-            w_hat_nk = codes_nk * np.repeat(scale_blocks, c.block_size, axis=1)
-            err = _reconstruction_error(x, y_float, w_hat_nk, None, None, None, None)
-            if err < best_err:
-                best_err = err
-                best_clip_ratio = clip_ratio
-                best_codes_nk, best_scale_blocks = codes_nk, scale_blocks
-
-        shift = np.mean(x, axis=0)  # [K]
-        x_centered = x - shift[np.newaxis, :]
-
-        best_channel_scale = None
-        best_shift = None
-        best_rotation = None
-        best_bias_correction = None
-
-        # Candidate 2: diagonal LET (OmniQuant's own transform) on top of
-        # the best LWC ratio found -- alpha == 0 (no transform) is
-        # already covered by candidate 1, so only alpha > 0 is tried.
-        weight_col_absmax = np.maximum(np.abs(w_nk).max(axis=0), 1e-12)  # [K]
-        act_col_absmax = np.maximum(np.abs(x_centered).mean(axis=0), 1e-12)  # [K]
-        bias_correction = w_nk @ shift  # [N]
-        for channel_scale in _diagonal_scale_grid(
-            weight_col_absmax, act_col_absmax, alphas[1:]
-        ):
-            w_scaled_nk = w_nk * channel_scale[np.newaxis, :]
-            codes_nk, scale_blocks = _quantize_blockwise_int4_with_clip(
-                w_scaled_nk, c.block_size, best_clip_ratio
-            )
-            w_hat_nk = codes_nk * np.repeat(scale_blocks, c.block_size, axis=1)
-            err = _reconstruction_error(
-                x, y_float, w_hat_nk, shift, None, channel_scale, bias_correction
-            )
-            if err < best_err:
-                best_err = err
-                best_codes_nk, best_scale_blocks = codes_nk, scale_blocks
-                best_channel_scale = channel_scale
-                best_shift = shift
-                best_rotation = None
-                best_bias_correction = bias_correction
-
-        # Candidate 3: block-affine LET -- this module's own contribution.
-        # Only attempted when K divides evenly into affine_block_size
-        # blocks (see the "Scope" docstring section); otherwise this
-        # candidate is skipped and the search falls back to whichever of
-        # (1)/(2) already won above.
-        if affine_block_size >= 1 and k % affine_block_size == 0:
-            rotation = _block_diagonal_rotation(x_centered, affine_block_size)
-            x_rot = x_centered @ rotation
-            w_rot_nk = w_nk @ rotation
-            weight_col_absmax_rot = np.maximum(np.abs(w_rot_nk).max(axis=0), 1e-12)
-            act_col_absmax_rot = np.maximum(np.abs(x_rot).mean(axis=0), 1e-12)
-            for channel_scale in _diagonal_scale_grid(
-                weight_col_absmax_rot, act_col_absmax_rot, alphas[1:]
-            ):
-                w_hat_rot_nk = w_rot_nk * channel_scale[np.newaxis, :]
-                codes_nk, scale_blocks = _quantize_blockwise_int4_with_clip(
-                    w_hat_rot_nk, c.block_size, best_clip_ratio
-                )
-                w_hat_nk = codes_nk * np.repeat(scale_blocks, c.block_size, axis=1)
-                err = _reconstruction_error(
-                    x,
-                    y_float,
-                    w_hat_nk,
-                    shift,
-                    rotation,
-                    channel_scale,
-                    bias_correction,
-                )
-                if err < best_err:
-                    best_err = err
-                    best_codes_nk, best_scale_blocks = codes_nk, scale_blocks
-                    best_channel_scale = channel_scale
-                    best_shift = shift
-                    best_rotation = rotation
-                    best_bias_correction = bias_correction
-
-        codes_orig = best_codes_nk if c.weight_transposed else best_codes_nk.T
-        scale_orig = best_scale_blocks if c.weight_transposed else best_scale_blocks.T
-        assert codes_orig.shape == (dim0, dim1)
-        rewrites.append(
-            _AffineQuantRewrite(
-                output_name=c.output_name,
-                activation_name=c.float_node.input[0],
-                wq_name=c.wq_name,
-                ws_name=c.ws_init.name,
-                codes=codes_orig.astype(np.int8),
-                scale=scale_orig.astype(np.float32),
-                channel_scale=best_channel_scale,
-                shift=best_shift,
-                rotation=best_rotation,
-                bias_correction=best_bias_correction,
-            )
-        )
-
-    if not rewrites:
-        return quantized_model
-
-    corrected = onnx.ModelProto()
-    corrected.CopyFrom(quantized_model)
-
-    codes_by_name = {r.wq_name: r.codes for r in rewrites}
-    scale_by_name = {r.ws_name: r.scale for r in rewrites}
-    for t in corrected.graph.initializer:
-        codes = codes_by_name.get(t.name)
-        if codes is not None:
-            t.raw_data = _pack_int4(codes)
-        scale = scale_by_name.get(t.name)
-        if scale is not None:
-            t.CopyFrom(onnx.numpy_helper.from_array(scale, name=t.name))
-
-    taken_names: Set[str] = _all_names(corrected.graph)
-    q_by_output = _node_outputs(corrected.graph)
-    for r in rewrites:
-        if r.channel_scale is None or r.shift is None or r.bias_correction is None:
-            continue
-        qn = q_by_output[r.output_name]
-        act_input = r.activation_name
-        inv_scale = (1.0 / r.channel_scale).astype(np.float32)
-
-        shift_name = _unique_name(f"{act_input}_affinequant_shift", taken_names)
-        corrected.graph.initializer.append(
-            onnx.numpy_helper.from_array(r.shift.astype(np.float32), name=shift_name)
-        )
-        centered_name = _unique_name(f"{act_input}_affinequant_centered", taken_names)
-        sub_node = onnx.helper.make_node(
-            "Sub",
-            [act_input, shift_name],
-            [centered_name],
-            name=_unique_name(f"{act_input}_affinequant_sub", taken_names),
-        )
-        node_idx = next(i for i, n in enumerate(corrected.graph.node) if n is qn)
-        corrected.graph.node.insert(node_idx, sub_node)
-        node_idx += 1
-
-        rotated_name = centered_name
-        if r.rotation is not None:
-            rotation_name = _unique_name(
-                f"{act_input}_affinequant_rotation", taken_names
-            )
-            corrected.graph.initializer.append(
-                onnx.numpy_helper.from_array(
-                    r.rotation.astype(np.float32), name=rotation_name
-                )
-            )
-            rotated_name = _unique_name(f"{act_input}_affinequant_rotated", taken_names)
-            matmul_node = onnx.helper.make_node(
-                "MatMul",
-                [centered_name, rotation_name],
-                [rotated_name],
-                name=_unique_name(f"{act_input}_affinequant_matmul", taken_names),
-            )
-            corrected.graph.node.insert(node_idx, matmul_node)
-            node_idx += 1
-
-        inv_scale_name = _unique_name(f"{act_input}_affinequant_inv_scale", taken_names)
-        corrected.graph.initializer.append(
-            onnx.numpy_helper.from_array(inv_scale, name=inv_scale_name)
-        )
-        scaled_name = _unique_name(f"{act_input}_affinequant_scaled", taken_names)
-        mul_node = onnx.helper.make_node(
-            "Mul",
-            [rotated_name, inv_scale_name],
-            [scaled_name],
-            name=_unique_name(f"{act_input}_affinequant_mul", taken_names),
-        )
-        corrected.graph.node.insert(node_idx, mul_node)
-        qn.input[0] = scaled_name
-
-        old_output = qn.output[0]
-        base_name = _unique_name(f"{r.output_name}_affinequant_base", taken_names)
-        qn.output[0] = base_name
-        bias_name = _unique_name(f"{r.output_name}_affinequant_bias", taken_names)
-        corrected.graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                r.bias_correction.astype(np.float32), name=bias_name
-            )
-        )
-        add_node = onnx.helper.make_node(
-            "Add",
-            [base_name, bias_name],
-            [old_output],
-            name=_unique_name(f"{r.output_name}_affinequant_bias_add", taken_names),
-        )
-        qn_idx = next(i for i, n in enumerate(corrected.graph.node) if n is qn)
-        corrected.graph.node.insert(qn_idx + 1, add_node)
-
-    return corrected
+    return apply_affinequant_cpp(
+        float_model,
+        quantized_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        num_clip_steps=num_clip_steps,
+        num_alpha_steps=num_alpha_steps,
+        min_clip_ratio=min_clip_ratio,
+        affine_block_size=affine_block_size,
+        providers=providers,
+    )

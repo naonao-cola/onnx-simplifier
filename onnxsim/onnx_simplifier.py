@@ -3920,6 +3920,554 @@ def apply_adaround_cpp(
     )
 
 
+def apply_adaquant_cpp(
+    float_model: Union[str, onnx.ModelProto],
+    quantized_model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    num_iterations: int = 300,
+    weight_learning_rate: float = 0.1,
+    activation_learning_rate: float = 0.01,
+    reg_param: float = 0.01,
+    warm_start: float = 0.2,
+    beta_range: Tuple[float, float] = (20.0, 2.0),
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_adaquant`: Hubara, Nahshan,
+    Hanani, Banner, Soudry (2020/2021)'s AdaQuant -- a per-layer joint
+    Adam optimization over the same rectified-sigmoid weight-rounding
+    relaxation :func:`onnxsim.apply_adaround_cpp` uses, PLUS the
+    activation's own (scale, zero_point), against
+    :func:`onnxsim.quantize_static`'s W8A8 QDQ scheme (not
+    :func:`onnxsim.quantize_weight_only_int4`'s blocked-INT4 one) -- see
+    ``onnxsim/adaquant.py``'s own module docstring for the full technique
+    and its relationship to AdaRound.
+
+    Same real calibration machinery as :func:`onnxsim.apply_adaround_cpp`
+    -- a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the float model in C++ (see
+    ``ApplyAdaquant`` in ``adaquant_entry.h`` for the full scope).
+
+    Same accepted-numerical-scope class as :func:`onnxsim.apply_adaround_cpp`:
+    this is an iterative Adam optimization over three parameter groups
+    jointly, so cross-language floating-point agreement is measured
+    empirically (see tests/test_adaquant_cpp.py) rather than assumed.
+
+    :param float_model: the original (unquantized) onnx ModelProto or file
+            path
+    :param quantized_model: a quantized version of ``float_model`` (onnx
+            ModelProto or file path), produced by
+            :func:`onnxsim.quantize_static`. Layers quantized by any other
+            scheme (including :func:`onnxsim.quantize_qoperator_gemm`'s
+            QGemm format), or left unquantized, are left untouched.
+    :param calibration_data: representative input batches to optimize
+            against -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied) -- this port has no RNG of
+            its own, so ``seed`` only ever affects which calibration
+            batches get generated
+    :param num_iterations: Adam steps to run per layer
+    :param weight_learning_rate: Adam learning rate for the per-element
+            weight-rounding relaxation (same role as
+            :func:`onnxsim.apply_adaround_cpp`'s ``learning_rate``)
+    :param activation_learning_rate: Adam learning rate for the
+            activation's scale (optimized in log-space) and zero-point
+    :param reg_param: weight of the regularization term that pulls each
+            weight element's rounding relaxation toward a hard 0/1
+            (floor/ceil) decision
+    :param warm_start: fraction of ``num_iterations`` (from the start) run
+            with the weight-rounding regularization term disabled
+    :param beta_range: ``(beta_start, beta_end)`` for the weight-rounding
+            regularization term's exponent, linearly annealed after
+            ``warm_start``
+    :param providers: onnxruntime execution providers to run ``float_model``
+            on when capturing calibration activations
+    :returns: ``quantized_model`` with every matched layer's weight INT8
+            codes and activation (scale, zero_point) initializers rewritten
+            to their jointly-optimized values.
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(quantized_model, str):
+        quantized_model = onnx.load(quantized_model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            float_model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_adaround_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    beta_start, beta_end = beta_range
+    return onnx.load_from_string(
+        C.apply_adaquant(
+            _get_model_executor(providers),
+            float_model.SerializeToString(),
+            quantized_model.SerializeToString(),
+            calibration_data_pb,
+            num_iterations,
+            weight_learning_rate,
+            activation_learning_rate,
+            reg_param,
+            warm_start,
+            beta_start,
+            beta_end,
+        )
+    )
+
+
+def apply_omniquant_cpp(
+    float_model: Union[str, onnx.ModelProto],
+    quantized_model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    num_clip_steps: int = 20,
+    num_alpha_steps: int = 20,
+    min_clip_ratio: float = 0.5,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_omniquant`: OmniQuant (Shao et
+    al., 2023)'s Learnable Weight Clipping (LWC) and Learnable Equivalent
+    Transformation (LET), applied to every
+    ``quantize_weight_only_int4``-quantized MatMul/Gemm layer shared (by
+    node output name) between ``float_model`` and ``quantized_model`` --
+    see ``onnxsim/omniquant.py``'s own module docstring for the full
+    technique.
+
+    Same real calibration machinery as :func:`onnxsim.apply_adaround_cpp` --
+    a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the float model in C++ (see
+    ``ApplyOmniquant`` in ``omniquant_entry.h`` for the full scope).
+
+    Unlike :func:`onnxsim.apply_adaround_cpp`/:func:`onnxsim.apply_tesseraq_cpp`
+    (iterative Adam optimizations), this is a bounded, deterministic
+    coordinate-descent GRID search -- no RNG, no hand-rolled dense linear
+    algebra -- so this port is expected to track the Python reference
+    closely, including exact-tie behavior at every grid point boundary (see
+    tests/test_omniquant_cpp.py for the measured agreement), and this
+    function is not aliased from :func:`onnxsim.apply_omniquant`.
+
+    :param float_model: the original (unquantized) onnx ModelProto or file
+            path
+    :param quantized_model: a quantized version of ``float_model`` (onnx
+            ModelProto or file path), produced by
+            :func:`onnxsim.quantize_weight_only_int4`
+    :param calibration_data: representative input batches to search and
+            measure the transform on -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param num_clip_steps: grid points for the LWC clip ratio (see
+            ``onnxsim/omniquant.py``'s own docstring for the grid layout)
+    :param num_alpha_steps: grid points for the LET migration-strength
+            exponent
+    :param min_clip_ratio: the LWC grid's lower bound
+    :param providers: onnxruntime execution providers to run ``float_model``
+            on when capturing calibration activations
+    :returns: ``quantized_model`` with every layer OmniQuant measurably
+            improved rewritten (its INT4 weight/scale, and -- only where
+            LET was found to help -- a new ``Sub``/``Mul``/``Add`` inserted
+            around it).
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(quantized_model, str):
+        quantized_model = onnx.load(quantized_model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            float_model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_adaround_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_omniquant(
+            _get_model_executor(providers),
+            float_model.SerializeToString(),
+            quantized_model.SerializeToString(),
+            calibration_data_pb,
+            num_clip_steps,
+            num_alpha_steps,
+            min_clip_ratio,
+        )
+    )
+
+
+def apply_affinequant_cpp(
+    float_model: Union[str, onnx.ModelProto],
+    quantized_model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    num_clip_steps: int = 20,
+    num_alpha_steps: int = 20,
+    min_clip_ratio: float = 0.5,
+    affine_block_size: int = 8,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_affinequant`: AffineQuant (Ma
+    et al., 2024, ICLR)'s block-diagonal generalization of
+    :func:`onnxsim.apply_omniquant_cpp`'s own Learnable Equivalent
+    Transformation -- see ``onnxsim/affinequant.py``'s own module
+    docstring for the full technique and how it generalizes OmniQuant's
+    own diagonal transform.
+
+    Same real calibration machinery, and same bounded-grid-search (not
+    iterative Adam) numerical character, as
+    :func:`onnxsim.apply_omniquant_cpp` -- see that function's own
+    docstring. This port's own block-affine candidate additionally uses a
+    hand-rolled cyclic Jacobi eigendecomposition (no LAPACK/BLAS linked
+    into this codebase) to fit each block's own rotation; see
+    ``affinequant_entry.h`` for this port's own accepted
+    eigendecomposition-algorithm divergence. This function is not aliased
+    from :func:`onnxsim.apply_affinequant`.
+
+    :param float_model: the original (unquantized) onnx ModelProto or file
+            path
+    :param quantized_model: a quantized version of ``float_model`` (onnx
+            ModelProto or file path), produced by
+            :func:`onnxsim.quantize_weight_only_int4`
+    :param calibration_data: representative input batches to search and
+            measure the transform on -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param num_clip_steps: grid points for the LWC clip ratio
+    :param num_alpha_steps: grid points for the LET migration-strength
+            exponent, used identically for both the diagonal and the
+            block-affine candidate
+    :param min_clip_ratio: the LWC grid's lower bound
+    :param affine_block_size: the size of each independently-rotated block
+            of activation channels in the block-affine candidate -- see
+            ``onnxsim/affinequant.py``'s own docstring's "Scope" section
+    :param providers: onnxruntime execution providers to run ``float_model``
+            on when capturing calibration activations
+    :returns: ``quantized_model`` with every layer AffineQuant measurably
+            improved rewritten (its INT4 weight/scale, and -- only where a
+            diagonal or block-affine transform was found to help -- a new
+            ``Sub``/(optionally ``MatMul``)/``Mul``/``Add`` inserted
+            around it).
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(quantized_model, str):
+        quantized_model = onnx.load(quantized_model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            float_model, num_samples=num_samples, seed=seed
+        )
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_affinequant(
+            _get_model_executor(providers),
+            float_model.SerializeToString(),
+            quantized_model.SerializeToString(),
+            calibration_data_pb,
+            num_clip_steps,
+            num_alpha_steps,
+            min_clip_ratio,
+            affine_block_size,
+        )
+    )
+
+
+def apply_brecq_cpp(
+    float_model: Union[str, onnx.ModelProto],
+    quantized_model: Union[str, onnx.ModelProto],
+    blocks: Sequence[Tuple[str, str]],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    num_iterations: int = 300,
+    learning_rate: float = 0.1,
+    reg_param: float = 0.01,
+    warm_start: float = 0.2,
+    beta_range: Tuple[float, float] = (20.0, 2.0),
+    fisher_eps: float = 1e-3,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_brecq`: BRECQ (Li et al.,
+    2021, ICLR)'s joint, Fisher-diagonal-weighted block reconstruction --
+    see ``onnxsim/brecq.py``'s own module docstring for the full technique,
+    its block-discovery contract, and what it simplifies relative to the
+    paper.
+
+    Same real calibration machinery as :func:`onnxsim.apply_adaround_cpp`,
+    and the same accepted-numerical-scope class (an iterative Adam
+    optimization, so cross-language floating-point agreement is measured
+    empirically -- see tests/test_brecq_cpp.py -- rather than assumed),
+    extended to jointly optimize an entire caller-delimited block of
+    layers rather than one layer independently. This function is not
+    aliased from :func:`onnxsim.apply_brecq`.
+
+    :param float_model: the original (unquantized) onnx ModelProto or file
+            path
+    :param quantized_model: a quantized version of ``float_model`` (onnx
+            ModelProto or file path), produced by
+            :func:`onnxsim.quantize_weight_only_int4`
+    :param blocks: ``(block_input_name, block_output_name)`` pairs, one per
+            residual/linear block to jointly optimize -- see
+            ``onnxsim/brecq.py``'s own docstring for exactly which
+            topologies between those two tensor names are recognized
+    :param calibration_data: representative input batches to optimize the
+            rounding on -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param num_iterations: Adam steps to run per block
+    :param learning_rate: Adam learning rate for the per-element rounding
+            relaxation
+    :param reg_param: weight of the regularization term that pulls each
+            element's relaxation toward a hard 0/1 (floor/ceil) decision,
+            applied independently per layer inside the block
+    :param warm_start: fraction of ``num_iterations`` (from the start) run
+            with the regularization term disabled
+    :param beta_range: ``(beta_start, beta_end)`` for the regularization
+            term's exponent, linearly annealed after ``warm_start``
+    :param fisher_eps: numerical floor added to the empirical per-element
+            variance before normalizing it into the Fisher-diagonal weight
+    :param providers: onnxruntime execution providers to run ``float_model``
+            on when capturing calibration activations
+    :returns: ``quantized_model`` with every discovered block's layers'
+            INT4 weight initializers rewritten to their jointly-optimized
+            codes.
+    """
+    if isinstance(float_model, str):
+        float_model = onnx.load(float_model, load_external_data=False)
+    if isinstance(quantized_model, str):
+        quantized_model = onnx.load(quantized_model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            float_model, num_samples=num_samples, seed=seed
+        )
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    beta_start, beta_end = beta_range
+    return onnx.load_from_string(
+        C.apply_brecq(
+            _get_model_executor(providers),
+            float_model.SerializeToString(),
+            quantized_model.SerializeToString(),
+            list(blocks),
+            calibration_data_pb,
+            num_iterations,
+            learning_rate,
+            reg_param,
+            warm_start,
+            beta_start,
+            beta_end,
+            fisher_eps,
+        )
+    )
+
+
+def apply_slim_llm_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    target_bits: float = 3.0,
+    low_bits: int = 2,
+    high_bits: int = 4,
+    group_size: int = 32,
+    percdamp: float = 0.01,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_slim_llm`: SliM-LLM (Huang,
+    Shao, Dong, Luo, Qiao et al., 2024) -- salience-driven mixed-precision
+    quantization that picks a bit-width per GROUP within a layer's own
+    weight (contrast :mod:`onnxsim.mixed_precision`, which picks one
+    bit-width per whole layer) -- see ``onnxsim/slim_llm.py``'s own module
+    docstring for the full technique (salience score, bit assignment, and
+    storage format).
+
+    Same real calibration machinery as :func:`onnxsim.apply_llm_int8_cpp`
+    -- a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see
+    ``ApplySlimLlm`` in ``slim_llm_entry.h`` for the full scope, including
+    its own accepted numerical scope: the dense inverse/Cholesky behind
+    the per-column salience score uses scalar double-precision kernels
+    rather than LAPACK).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches used to build
+            each layer's Hessian and per-column error -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when ``calibration_data``
+            is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param target_bits: target average bits/weight for each matched layer
+    :param low_bits: bit-width for the least salient groups in each layer
+    :param high_bits: bit-width for the most salient groups in each layer
+    :param group_size: elements per quantization group along K
+    :param percdamp: Hessian damping factor (fraction of the mean diagonal
+            added to every diagonal entry before inversion)
+    :param providers: onnxruntime execution providers to run calibration on
+    :returns: ``model`` with every matched layer's weight replaced by
+            per-group mixed ``low_bits``/``high_bits`` INT8-stored codes
+            plus a per-group float32 scale and a parallel per-group
+            bit-width INT64 initializer; layers with a non-constant,
+            non-2-D weight, a reduction dimension not divisible by
+            ``group_size``, or no calibration activation available, are
+            left untouched.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_slim_llm(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            target_bits,
+            low_bits,
+            high_bits,
+            group_size,
+            percdamp,
+        )
+    )
+
+
+def apply_moequant_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    quant_block_size: int = 32,
+    percdamp: float = 0.01,
+    proc_block_size: int = 128,
+    ebss: bool = True,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_moequant`: MoEQuant (Hu, Chen
+    et al., 2025) -- Expert-Balanced Self-Sampling (EBSS) plus
+    Affinity-Guided Quantization (AGQ), a calibration METHODOLOGY (not a
+    new quantization algorithm -- the column-update machinery is
+    apply_gptq's own, reused as-is) for ``com.microsoft::MoE`` nodes' per-
+    expert weights -- see ``onnxsim/moequant.py``'s own module docstring
+    for the full technique.
+
+    Same real calibration machinery as :func:`onnxsim.apply_llm_int8_cpp`
+    -- a live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see
+    ``ApplyMoequant`` in ``moequant_entry.h`` for the full scope, including
+    its own two accepted numerical divergences: EBSS's own weighted-
+    without-replacement subsampling does not reproduce numpy's own RNG
+    stream, and the reused GPTQ machinery's dense inverse/Cholesky uses
+    scalar double-precision kernels rather than LAPACK).
+
+    :param model: onnx ModelProto object or file path
+    :param calibration_data: representative input batches to capture each
+            MoE node's own input activations and router gate scores from
+            -- see :func:`onnxsim.generate_random_calibration_data` (the
+            default when omitted)
+    :param num_samples: random batches to generate when ``calibration_data``
+            is omitted
+    :param seed: seed for the random calibration data AND for this port's
+            own independent EBSS subsampling RNG (NOT the same random
+            stream as :func:`onnxsim.apply_moequant`'s own numpy
+            ``Generator`` -- see ``ApplyMoequant``'s own accepted
+            numerical scope note)
+    :param quant_block_size: INT4 block size along each expert weight's own
+            reduction axis
+    :param percdamp: GPTQ Hessian damping factor
+    :param proc_block_size: GPTQ's own column-processing block size
+    :param ebss: when true (default), cap an over-represented expert's
+            routed calibration tokens down to a shared, balanced per-expert
+            budget before building its Hessian
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched, FLOAT32 MoE node's per-expert
+            ``fc1``/``fc2`` weight simulated-INT4-quantized in place.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_moequant(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            quant_block_size,
+            percdamp,
+            proc_block_size,
+            ebss,
+            seed,
+        )
+    )
+
+
 def apply_qronos_cpp(
     float_model: Union[str, onnx.ModelProto],
     quantized_model: Union[str, onnx.ModelProto],

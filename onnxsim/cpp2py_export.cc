@@ -1483,6 +1483,227 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "reg_param"_a = 0.01, "warm_start"_a = 0.2, "beta_start"_a = 20.0,
       "beta_end"_a = 2.0);
 
+  // AdaQuant (Hubara, Nahshan, Hanani, Banner, Soudry, 2020/2021): a
+  // per-layer joint Adam optimization over the same rectified-sigmoid
+  // weight-rounding relaxation apply_adaround's own binding above uses,
+  // PLUS the activation's own (scale, zero_point) for
+  // onnxsim.quantize_static's W8A8 QDQ scheme (not
+  // quantize_weight_only_int4's blocked-INT4 one). Same two-model
+  // executor-as-first-argument shape as apply_adaround's own binding
+  // above (candidates are processed independently, so `executor` is
+  // invoked once, up front); `beta_start`/`beta_end` are the two ends of
+  // apply_adaquant's own `beta_range` tuple, split the same way. See
+  // ApplyAdaquant in adaquant_entry.h for the full scope and
+  // onnxsim/adaquant.py for the technique this ports.
+  m.def(
+      "apply_adaquant",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t num_iterations, double weight_learning_rate,
+         double activation_learning_rate, double reg_param, double warm_start,
+         double beta_start, double beta_end) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result = ApplyAdaquant(
+            float_model, quantized_model, *executor, calibration_data,
+            num_iterations, weight_learning_rate, activation_learning_rate,
+            reg_param, warm_start, beta_start, beta_end);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "num_iterations"_a = 300,
+      "weight_learning_rate"_a = 0.1, "activation_learning_rate"_a = 0.01,
+      "reg_param"_a = 0.01, "warm_start"_a = 0.2, "beta_start"_a = 20.0,
+      "beta_end"_a = 2.0);
+
+  // OmniQuant (Shao et al., 2023): grid-searched Learnable Weight Clipping
+  // plus a closed-form-shift/grid-searched-scale Learnable Equivalent
+  // Transformation, applied to every quantize_weight_only_int4-quantized
+  // MatMul/Gemm layer shared (by node output name) between a float model
+  // and its quantized counterpart. Same two-model executor-as-first-
+  // argument shape as apply_adaround's own binding above (candidates are
+  // processed independently, so `executor` is invoked once, up front); a
+  // BOUNDED GRID SEARCH, not an iterative Adam optimization, unlike
+  // apply_adaround's own. See ApplyOmniquant in omniquant_entry.h for the
+  // full scope and onnxsim/omniquant.py for the technique this ports.
+  m.def(
+      "apply_omniquant",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t num_clip_steps, int64_t num_alpha_steps,
+         double min_clip_ratio) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result = ApplyOmniquant(
+            float_model, quantized_model, *executor, calibration_data,
+            num_clip_steps, num_alpha_steps, min_clip_ratio);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "num_clip_steps"_a = 20, "num_alpha_steps"_a = 20,
+      "min_clip_ratio"_a = 0.5);
+
+  // AffineQuant (Ma et al., 2024, ICLR): OmniQuant's own LWC plus a
+  // block-diagonal Learnable Equivalent Transformation (a per-block
+  // orthogonal rotation on top of OmniQuant's own diagonal scale/shift).
+  // Same shape as apply_omniquant's own binding above, plus
+  // `affine_block_size`. See ApplyAffinequant in affinequant_entry.h for
+  // the full scope and onnxsim/affinequant.py for the technique this
+  // ports.
+  m.def(
+      "apply_affinequant",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t num_clip_steps, int64_t num_alpha_steps, double min_clip_ratio,
+         int64_t affine_block_size) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result = ApplyAffinequant(
+            float_model, quantized_model, *executor, calibration_data,
+            num_clip_steps, num_alpha_steps, min_clip_ratio, affine_block_size);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "num_clip_steps"_a = 20, "num_alpha_steps"_a = 20,
+      "min_clip_ratio"_a = 0.5, "affine_block_size"_a = 8);
+
+  // BRECQ (Li et al., 2021, ICLR): jointly optimizes every
+  // quantize_weight_only_int4-quantized MatMul/Gemm layer inside a
+  // caller-delimited block against the block's own final output
+  // reconstruction error, Fisher-diagonal weighted -- extends
+  // apply_adaround's own rectified-sigmoid relaxation and Adam loop to a
+  // jointly optimized block of layers. Same two-model executor-as-first-
+  // argument shape as apply_adaround's own binding above; `blocks` is a
+  // list of `(block_input_name, block_output_name)` string pairs;
+  // `beta_start`/`beta_end` are the two ends of apply_brecq's own
+  // `beta_range` tuple, split the same way apply_adaround's own binding
+  // splits it. See ApplyBrecq in brecq_entry.h for the full scope and
+  // onnxsim/brecq.py for the technique this ports.
+  m.def(
+      "apply_brecq",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::pair<std::string, std::string>> blocks,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t num_iterations, double learning_rate, double reg_param,
+         double warm_start, double beta_start, double beta_end,
+         double fisher_eps) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result =
+            ApplyBrecq(float_model, quantized_model, *executor, blocks,
+                       calibration_data, num_iterations, learning_rate,
+                       reg_param, warm_start, beta_start, beta_end, fisher_eps);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "blocks"_a, "calibration_data"_a, "num_iterations"_a = 300,
+      "learning_rate"_a = 0.1, "reg_param"_a = 0.01, "warm_start"_a = 0.2,
+      "beta_start"_a = 20.0, "beta_end"_a = 2.0, "fisher_eps"_a = 1e-3);
+
+  // SliM-LLM (Huang, Shao, Dong, Luo, Qiao et al., 2024): salience-driven
+  // mixed-precision quantization picking a bit-width per GROUP within a
+  // layer's own weight (rather than per whole layer). Single-model,
+  // node-inserting rewrite (unlike apply_gptq's own binding above, there
+  // is no separate "already quantized" model -- this pass builds and
+  // inserts its own DequantizeLinear-based dequantization subgraph),
+  // same executor-as-first-argument, `calibration_data` crossing
+  // convention as apply_llm_int8's own binding. See ApplySlimLlm in
+  // slim_llm_entry.h for the full scope and onnxsim/slim_llm.py for the
+  // technique this ports.
+  m.def(
+      "apply_slim_llm",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double target_bits, int64_t low_bits, int64_t high_bits,
+         int64_t group_size, double percdamp) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplySlimLlm(model, *executor, calibration_data, target_bits,
+                         low_bits, high_bits, group_size, percdamp);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a,
+      "target_bits"_a = 3.0, "low_bits"_a = 2, "high_bits"_a = 4,
+      "group_size"_a = 32, "percdamp"_a = 0.01);
+
+  // MoEQuant (Hu, Chen et al., 2025): Expert-Balanced Self-Sampling (EBSS)
+  // plus Affinity-Guided Quantization (AGQ) calibration methodology for
+  // com.microsoft::MoE nodes' per-expert weights, reusing apply_gptq's own
+  // column-update machinery as-is via a precomputed, per-expert Hessian --
+  // NOT a new quantization algorithm (see this module's own docstring).
+  // Single-model, node-structure-preserving (only the matched MoE node's
+  // own fc1/fc2 weight initializers are rewritten in place -- simulated
+  // ("fake") quantization, same graph/dtype/shape as the input). Same
+  // executor-as-first-argument, `calibration_data` crossing convention as
+  // apply_llm_int8's own binding. See ApplyMoequant in moequant_entry.h
+  // for the full scope (including its own two accepted numerical
+  // divergences) and onnxsim/moequant.py for the technique this ports.
+  m.def(
+      "apply_moequant",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t quant_block_size, double percdamp, int64_t proc_block_size,
+         bool ebss, uint64_t seed) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplyMoequant(model, *executor, calibration_data, quant_block_size,
+                          percdamp, proc_block_size, ebss, seed);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a,
+      "quant_block_size"_a = 32, "percdamp"_a = 0.01, "proc_block_size"_a = 128,
+      "ebss"_a = true, "seed"_a = 0);
+
   // Qronos: a sequential, whole-model generalization of apply_gptq that
   // additionally accounts for the error already baked into a layer's
   // activations because upstream layers were quantized first, not just
