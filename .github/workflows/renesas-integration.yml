@@ -112,9 +112,9 @@ jobs:
       # Run from runner.temp, not the checkout -- same guard the EP/Axera
       # workflows use: the repo root's `onnxsim/` source dir would shadow
       # the installed wheel on `import onnxsim`.
-      - name: Run scraped-data / simulator tests
+      - name: Run scraped-data / simulator / legalize tests
         working-directory: ${{ runner.temp }}
-        run: pytest -v "$GITHUB_WORKSPACE/tests/test_renesas_drp_ai_tvm_op_support.py"
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_renesas_drp_ai_tvm_op_support.py" "$GITHUB_WORKSPACE/tests/test_renesas_legalize.py"
 
   gen-fixtures:
     name: Generate onnxsim before/after ONNX fixtures

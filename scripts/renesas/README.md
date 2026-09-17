@@ -97,6 +97,42 @@ those stay behind the gated Renesas account this repository doesn't have.
 This only ever validates the open-source TVM ONNX-*import* step, real
 build included.
 
+## Legalizing: fixing what `would_import_succeed()` finds
+
+`legalize.py` holds semantics-preserving rewrites for three ONNX ops that
+are simply absent from TVM v0.8's convert map -- `HardSwish`, `Mish`,
+`LayerNormalization` -- each replaced with the exact primitive-op
+decomposition its own ONNX spec defines it as (e.g. `HardSwish(x)` ==
+`x * HardSigmoid(x, alpha=1/6, beta=0.5)`, spec-exact, not an
+approximation). Unlike `scripts/axelera/legalize.py`'s rules (fixing an
+op used *outside* its documented attribute/shape range), there's no
+attribute value that would make these three importable as-is -- TVM v0.8
+(2021) simply predates all three ops (opset 14/17/18). See `legalize.py`'s
+module docstring for the full reasoning and each rule's caveats (in
+particular: `layer_normalization_to_primitives` needs `X`'s rank and
+element type statically known, and skips a node whose optional `Mean`/
+`InvStdDev` outputs are consumed).
+
+```python
+import onnx
+import legalize
+
+model = onnx.load("model.onnx")
+applied = legalize.legalize(model)  # {"hardswish_to_primitives": 2, ...}
+onnx.save(model, "model.legalized.onnx")
+```
+
+Or, run after onnxsim's own simplify loop, inside its fixed point with no
+rebuild: `onnxsim.simplify(model, custom_rewriter=legalize.
+as_custom_rewriter())` -- same `custom_rewriter` contract
+`scripts/axelera/legalize.py`'s own adapter uses. `tests/
+test_renesas_legalize.py` checks each rule both structurally (against the
+ONNX operator spec's own formula) and numerically (`onnx.reference.
+ReferenceEvaluator`, before vs. after), and confirms
+`drp_ai_tvm_simulator.would_import_succeed()` flips from `False` to `True`
+where the rewrite is supposed to fully resolve a node -- none of that
+needs TVM installed or a real DRP-AI TVM/HyCo compiler.
+
 ## Usage
 
 ```python
