@@ -261,7 +261,9 @@ def test_simplified_model_matches_onnx_reference_on_tpu_mlir(name, tmp_path):
 
     from onnx.reference import ReferenceEvaluator
 
-    reference_out = ReferenceEvaluator(model).run(None, {model.graph.input[0].name: feed})[0]
+    reference_out = ReferenceEvaluator(model).run(
+        None, {model.graph.input[0].name: feed}
+    )[0]
     np.testing.assert_allclose(reference_out, tpu_out, rtol=1e-3, atol=1e-4)
 
 
