@@ -210,15 +210,25 @@ def test_gemm_transb_weight():
     assert _rel_l2(float_out, quant_out) < 0.9
 
 
-def test_noop_on_non_matching_layer():
+def test_skip_names_raises_since_the_delegated_cpp_port_does_not_support_it():
+    # apply_bwa_ptq now delegates to apply_bwa_ptq_cpp (see
+    # onnxsim/bwa_ptq.py's own "Delegates to" note), which has no
+    # skip_names parameter -- a non-empty value must raise rather than be
+    # silently ignored (which would wrongly quantize a layer the caller
+    # asked to skip).
     K, N = 32, 4
     model, weight = _matmul_model(K=K, N=N, seed=11)
     calib = [{"X": _calibration(K, seed=12)}]
 
-    quantized = onnxsim.apply_bwa_ptq(
-        model, calibration_data=calib, group_size=16, skip_names={"W"}
-    )
-    assert quantized.SerializeToString() == model.SerializeToString()
+    with pytest.raises(ValueError):
+        onnxsim.apply_bwa_ptq(
+            model, calibration_data=calib, group_size=16, skip_names={"W"}
+        )
+
+
+def test_noop_on_non_matching_layer():
+    K = 32
+    calib = [{"X": _calibration(K, seed=12)}]
 
     # A layer whose weight isn't a plain constant 2-D float32 tensor (a
     # 1-D bias-shaped initializer here) shouldn't be touched at all.

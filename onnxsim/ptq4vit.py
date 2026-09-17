@@ -79,25 +79,14 @@ literal low-bit hardware storage format -- see above.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
 import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
-from onnxsim.calibration import Tensors, generate_random_calibration_data
+from onnxsim.calibration import Tensors
 
 _EPS = 1e-12
-
-
-def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:
-    return any(
-        o.domain in ("", "ai.onnx") and o.version >= min_version
-        for o in model.opset_import
-    )
 
 
 def _twin_quantize_dequantize(
@@ -190,159 +179,6 @@ def _search_twin_split(
     return best_t
 
 
-def _find_softmax_targets(graph: onnx.GraphProto) -> List[onnx.NodeProto]:
-    return [n for n in graph.node if n.op_type == "Softmax"]
-
-
-def _find_gelu_targets(graph: onnx.GraphProto) -> List[onnx.NodeProto]:
-    """Finds every node whose *output* is a finished GELU activation:
-    a standalone ``Gelu`` node, or the final ``Mul`` of the standard
-    ``0.5 * x * (1 + Erf(x / sqrt(2)))`` export decomposition (an ``Erf``
-    feeding an ``Add``, feeding a ``Mul``, feeding a second ``Mul`` --
-    matched structurally, the same decomposition
-    :mod:`onnxsim.ibert_gelu` targets by its ``Erf`` node, though this
-    module wraps the whole GELU output rather than rewriting ``Erf``
-    itself). Matching by structure alone (not also checking the ``Add``'s
-    and second ``Mul``'s constant operands are actually ~1.0/~0.5) is a
-    deliberate simplification: it can in principle match a non-GELU
-    ``Erf``-based expression with the same node shape, which is why this
-    is only ever used to *wrap* the existing output with a quantize-
-    dequantize round trip, never to change what the graph computes.
-    """
-    consumers_by_input: Dict[str, List[onnx.NodeProto]] = {}
-    for node in graph.node:
-        for inp in node.input:
-            consumers_by_input.setdefault(inp, []).append(node)
-
-    targets = [n for n in graph.node if n.op_type == "Gelu"]
-
-    for node in graph.node:
-        if node.op_type != "Erf" or len(node.input) != 1:
-            continue
-        add_node = next(
-            (
-                c
-                for c in consumers_by_input.get(node.output[0], [])
-                if c.op_type == "Add"
-            ),
-            None,
-        )
-        if add_node is None:
-            continue
-        mul1 = next(
-            (
-                c
-                for c in consumers_by_input.get(add_node.output[0], [])
-                if c.op_type == "Mul"
-            ),
-            None,
-        )
-        if mul1 is None:
-            continue
-        mul2 = next(
-            (
-                c
-                for c in consumers_by_input.get(mul1.output[0], [])
-                if c.op_type == "Mul"
-            ),
-            None,
-        )
-        if mul2 is None:
-            continue
-        targets.append(mul2)
-
-    return targets
-
-
-def _insert_twin_quantize(
-    graph: onnx.GraphProto,
-    target_output: str,
-    lo: float,
-    split: float,
-    hi: float,
-    n_levels: int,
-    tag: str,
-    taken_names: set,
-) -> None:
-    """Rewires every consumer of ``target_output`` to instead read the
-    twin-uniform quantize-dequantize round trip of it, and appends the new
-    nodes/initializers implementing that round trip -- the same
-    "quantize/dequantize wraps the value in place" splice
-    :mod:`onnxsim.attention_quantization` uses for its own Softmax-output
-    quantization. ``target_output`` must not itself be a graph output name
-    (the caller filters those out) -- rewiring a graph output would need
-    renaming the output's ``ValueInfoProto``, not a node input.
-    """
-    # Snapshot the consumers *before* creating any new node -- the new
-    # nodes below (mask/shifted_lo/shifted_hi) themselves read
-    # ``target_output``, and would otherwise get caught by the same
-    # rewiring loop and rewired into a self-referential cycle.
-    old_consumers = [n for n in graph.node if target_output in n.input]
-
-    new_nodes: List[onnx.NodeProto] = []
-
-    def _const(value: float, suffix: str) -> str:
-        name = _unique_name(f"ptq4vit_{tag}_{suffix}", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(np.array(value, dtype=np.float32), name=name)
-        )
-        return name
-
-    def _node(op_type: str, inputs: List[str], suffix: str, **attrs) -> str:
-        out_name = _unique_name(f"ptq4vit_{tag}_{suffix}", taken_names)
-        new_nodes.append(
-            onnx.helper.make_node(
-                op_type,
-                inputs,
-                [out_name],
-                name=_unique_name(f"ptq4vit_{tag}_{suffix}_node", taken_names),
-                **attrs,
-            )
-        )
-        return out_name
-
-    lo_name = _const(lo, "lo")
-    split_name = _const(split, "split")
-    scale_lo_name = _const(max(split - lo, _EPS) / (n_levels - 1), "scale_lo")
-    scale_hi_name = _const(max(hi - split, _EPS) / (n_levels - 1), "scale_hi")
-    zero_name = _const(0.0, "zero")
-    max_level_name = _const(float(n_levels - 1), "max_level")
-
-    mask_name = _node("Less", [target_output, split_name], "mask")
-
-    shifted_lo = _node("Sub", [target_output, lo_name], "shifted_lo")
-    scaled_lo = _node("Div", [shifted_lo, scale_lo_name], "scaled_lo")
-    rounded_lo = _node("Round", [scaled_lo], "rounded_lo")
-    clipped_lo = _node("Clip", [rounded_lo, zero_name, max_level_name], "clipped_lo")
-    dq_lo = _node("Mul", [clipped_lo, scale_lo_name], "dq_lo_scaled")
-    dq_lo = _node("Add", [dq_lo, lo_name], "dq_lo")
-
-    shifted_hi = _node("Sub", [target_output, split_name], "shifted_hi")
-    scaled_hi = _node("Div", [shifted_hi, scale_hi_name], "scaled_hi")
-    rounded_hi = _node("Round", [scaled_hi], "rounded_hi")
-    clipped_hi = _node("Clip", [rounded_hi, zero_name, max_level_name], "clipped_hi")
-    dq_hi = _node("Mul", [clipped_hi, scale_hi_name], "dq_hi_scaled")
-    dq_hi = _node("Add", [dq_hi, split_name], "dq_hi")
-
-    result_name = _node("Where", [mask_name, dq_lo, dq_hi], "result")
-
-    # Splice the new nodes in right after target_output's own producer --
-    # appending them at the end of graph.node instead would leave any
-    # existing consumer that now reads `result_name` (rewired below)
-    # pointing at a node that appears *later* in the list than it does,
-    # breaking the topological order onnx.checker requires.
-    producer_index = next(
-        i for i, n in enumerate(graph.node) if target_output in n.output
-    )
-    for offset, new_node in enumerate(new_nodes):
-        graph.node.insert(producer_index + 1 + offset, new_node)
-
-    for node in old_consumers:
-        for i, inp in enumerate(node.input):
-            if inp == target_output:
-                node.input[i] = result_name
-
-
 def apply_ptq4vit_quantization(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,
@@ -390,71 +226,29 @@ def apply_ptq4vit_quantization(
             pattern, or an opset older than 11 (the 3-input ``Clip`` form
             this module's quantize-dequantize round trip needs), is
             returned unchanged.
+
+    Delegates to the verified C++ port
+    (:func:`onnxsim.apply_ptq4vit_quantization_cpp`), which reimplements
+    this function's own candidate matching, per-tensor value capture, and
+    :func:`_search_twin_split`-equivalent grid search exactly (a bounded,
+    deterministic search with no RNG -- see ``ptq4vit_entry.h`` for the
+    full scope). This function's own former pure-Python graph-rewrite
+    implementation (``_find_softmax_targets``/``_find_gelu_targets``/
+    ``_insert_twin_quantize``) is preserved as-is in this module's own git
+    history; :func:`_search_twin_split`/:func:`_twin_quantize_dequantize`/
+    :func:`_single_uniform_quantize_dequantize` above remain (still
+    directly unit-tested by ``tests/test_ptq4vit.py`` at the pure-math
+    level, independent of this function).
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    if not _has_min_opset(model, 11):
-        return model
+    from onnxsim.onnx_simplifier import apply_ptq4vit_quantization_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-
-    graph_output_names = {o.name for o in graph.output}
-    softmax_targets = [
-        n for n in _find_softmax_targets(graph) if n.output[0] not in graph_output_names
-    ]
-    gelu_targets = [
-        n for n in _find_gelu_targets(graph) if n.output[0] not in graph_output_names
-    ]
-    candidate_names = [n.output[0] for n in softmax_targets] + [
-        n.output[0] for n in gelu_targets
-    ]
-    if not candidate_names:
-        return out
-
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_calibration_samples, seed=seed
-        )
-
-    probe_model = _add_probe_outputs(model, candidate_names)
-    collected: Dict[str, List[np.ndarray]] = {name: [] for name in candidate_names}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in candidate_names:
-            arr = np.asarray(result[name])
-            if arr.size:
-                collected[name].append(arr.ravel())
-
-    taken_names = _all_names(graph)
-    for i, node in enumerate(softmax_targets):
-        name = node.output[0]
-        values = collected.get(name, [])
-        if not values:
-            continue
-        split = _search_twin_split(
-            np.concatenate(values), lo=0.0, hi=1.0, n_levels=n_levels
-        )
-        if split is None:
-            continue
-        _insert_twin_quantize(
-            graph, name, 0.0, split, 1.0, n_levels, f"softmax{i}", taken_names
-        )
-
-    for i, node in enumerate(gelu_targets):
-        name = node.output[0]
-        values = collected.get(name, [])
-        if not values:
-            continue
-        v = np.concatenate(values)
-        lo = float(v.min())
-        hi = float(v.max())
-        split = _search_twin_split(v, lo=lo, hi=hi, n_levels=n_levels)
-        if split is None:
-            continue
-        _insert_twin_quantize(
-            graph, name, lo, split, hi, n_levels, f"gelu{i}", taken_names
-        )
-
-    return out
+    return apply_ptq4vit_quantization_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_calibration_samples=num_calibration_samples,
+        seed=seed,
+        providers=providers,
+        n_levels=n_levels,
+    )

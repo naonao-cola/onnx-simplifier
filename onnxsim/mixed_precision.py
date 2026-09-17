@@ -75,14 +75,11 @@ the same backend :mod:`onnxsim.spinquant`/:mod:`onnxsim.spqr` already use).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, Union
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
-
-from onnxsim import backend
 
 # onnxsim.accuracy does not import anything from this module (checked by
 # grep), so this is not a cycle -- it is in fact the reverse of
@@ -90,16 +87,7 @@ from onnxsim import backend
 # `mixed_precision`), so `onnxsim.accuracy` is already fully initialized in
 # `sys.modules` by the time this module is loaded as part of `import onnxsim`.
 from onnxsim.accuracy import AccuracyDropReport, measure_accuracy_drop
-from onnxsim.adaround import _pack_int4
-from onnxsim.bias_correction import (
-    _activation_rows,
-    _add_probe_outputs,
-    _all_names,
-    _unique_name,
-)
 from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.omniquant import _quantize_blockwise_int4_with_clip
-from onnxsim.quip_sharp import _match_matmul_like
 
 
 def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:
@@ -126,24 +114,6 @@ def _full_hessian_sensitivity(err_nk: np.ndarray, h: np.ndarray) -> float:
     ``E`` ([N, K]); ``h`` is ``H`` ([K, K]). Reduces to
     :func:`_hessian_diag_sensitivity` whenever ``h`` is itself diagonal."""
     return float(np.mean(np.sum((err_nk @ h) * err_nk, axis=1)))
-
-
-def _quantize_blockwise_int8(
-    w_nk: np.ndarray, block_size: int
-) -> "tuple[np.ndarray, np.ndarray]":
-    """Round-to-nearest block-wise INT8 (``[-127, 127]``) quantization of
-    ``w_nk`` ([N, K], output channel first) -- the same granularity
-    :func:`onnxsim.quantize_weight_only_int8_block` uses, reimplemented
-    here (rather than reused) since that function quantizes a whole model
-    uniformly and this module needs to apply it to only some layers.
-    """
-    n, k = w_nk.shape
-    num_blocks = k // block_size
-    blocks = w_nk.reshape(n, num_blocks, block_size)
-    scale_blocks = np.maximum(np.abs(blocks).max(axis=2), 1e-12) / 127.0
-    scale_full = np.repeat(scale_blocks, block_size, axis=1)
-    codes_nk = np.clip(np.round(w_nk / scale_full), -127.0, 127.0)
-    return codes_nk, scale_blocks
 
 
 def apply_mixed_precision_quantization(
@@ -199,6 +169,19 @@ def apply_mixed_precision_quantization(
             older than 21 (INT4's tensor type and ``DequantizeLinear``'s
             ``block_size`` attribute both need opset 21), is returned
             unchanged
+
+    Delegates to the verified C++ port
+    (:func:`onnxsim.apply_mixed_precision_quantization_cpp`), which
+    reimplements this function's own candidate matching, Hessian-diagonal/
+    full-Hessian accumulation, and block-wise INT4/INT8 RTN quantization
+    exactly (a closed-form computation with no RNG or gradient descent --
+    see ``mixed_precision_entry.h`` for the full scope). This function's
+    own former pure-Python implementation is preserved as-is in this
+    module's own git history; the standalone ``_hessian_diag_sensitivity``/
+    ``_full_hessian_sensitivity``/``_quantize_blockwise_int8`` helpers
+    above remain (the first two are still directly unit-tested by
+    ``tests/test_mixed_precision.py`` at the pure-math level, independent
+    of this function).
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -207,189 +190,18 @@ def apply_mixed_precision_quantization(
             f"sensitivity_metric must be one of {SENSITIVITY_METRICS}, "
             f"got {sensitivity_metric!r}"
         )
-    if not _has_min_opset(model, 21):
-        return model
+    from onnxsim.onnx_simplifier import apply_mixed_precision_quantization_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    nodes = list(graph.node)
-    candidates = []
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, bias_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        dims = list(w_init.dims)
-        w_nk_shape = dims if weight_transposed else dims[::-1]
-        if w_nk_shape[1] % block_size != 0:
-            continue
-        candidates.append((node, x_name, w_name, bias_name, weight_transposed))
-
-    if not candidates:
-        return out
-
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
-
-    need_full_hessian = sensitivity_metric == "full_hessian"
-
-    probe_names = sorted({x_name for _, x_name, _, _, _ in candidates})
-    probe_model = _add_probe_outputs(model, probe_names)
-    # diag_h[name]: per-input-channel mean(X^2) -- diag(X^T X) / rows, the
-    # diagonal of the same reconstruction-error Hessian onnxsim.gptq builds
-    # (see module docstring). full_h[name]: the full [K, K] Gram matrix,
-    # only accumulated when actually needed (it's O(K^2) memory per layer,
-    # vs. diag_h's O(K)) -- accumulated across batches before dividing by
-    # the total row count, exactly like onnxsim.gptq's own H = X^T X.
-    diag_h_sum: Dict[str, np.ndarray] = {}
-    full_h_sum: Dict[str, np.ndarray] = {}
-    rows_seen: Dict[str, int] = {}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            x = np.asarray(result[name], dtype=np.float64)
-            for x_rows in _activation_rows([x]):
-                diag_h_sum[name] = diag_h_sum.get(name, 0.0) + np.sum(x_rows**2, axis=0)
-                if need_full_hessian:
-                    full_h_sum[name] = full_h_sum.get(name, 0.0) + x_rows.T @ x_rows
-                rows_seen[name] = rows_seen.get(name, 0) + x_rows.shape[0]
-
-    diag_h: Dict[str, np.ndarray] = {
-        name: total / rows_seen[name]
-        for name, total in diag_h_sum.items()
-        if rows_seen[name] > 0
-    }
-    full_h: Dict[str, np.ndarray] = {
-        name: total / rows_seen[name]
-        for name, total in full_h_sum.items()
-        if rows_seen[name] > 0
-    }
-
-    # Sensitivity per candidate -- see module docstring for both metrics.
-    sensitivities: List[Optional[float]] = []
-    for node, x_name, w_name, bias_name, weight_transposed in candidates:
-        if x_name not in diag_h:
-            sensitivities.append(None)
-            continue
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_nk = w if weight_transposed else w.T  # [N, K]
-        codes_nk, scale_blocks_nk = _quantize_blockwise_int4_with_clip(
-            w_nk, block_size, 1.0
-        )
-        scale_full = np.repeat(scale_blocks_nk, block_size, axis=1)
-        err_nk = w_nk - codes_nk * scale_full
-        if need_full_hessian:
-            sensitivities.append(_full_hessian_sensitivity(err_nk, full_h[x_name]))
-        else:
-            sensitivities.append(_hessian_diag_sensitivity(err_nk, diag_h[x_name]))
-
-    eligible_idx = [i for i, s in enumerate(sensitivities) if s is not None]
-    eligible_idx.sort(key=lambda i: sensitivities[i] or 0.0, reverse=True)
-    num_high_bits = int(round(high_bits_fraction * len(eligible_idx)))
-    high_bits_set = set(eligible_idx[:num_high_bits])
-
-    for idx, (node, x_name, w_name, bias_name, weight_transposed) in enumerate(
-        candidates
-    ):
-        if idx not in eligible_idx:
-            continue
-
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_nk = w if weight_transposed else w.T  # [N, K]
-        n, k = w_nk.shape
-
-        use_int8 = idx in high_bits_set
-        if use_int8:
-            codes_nk, scale_blocks_nk = _quantize_blockwise_int8(w_nk, block_size)
-            codes_dtype = onnx.TensorProto.INT8
-            prefix = f"{w_name}_mixedprec_int8"
-        else:
-            codes_nk, scale_blocks_nk = _quantize_blockwise_int4_with_clip(
-                w_nk, block_size, 1.0
-            )
-            codes_dtype = onnx.TensorProto.INT4
-            prefix = f"{w_name}_mixedprec_int4"
-
-        codes_kn = codes_nk.T.astype(np.int64)  # [K, N], ready for a plain MatMul
-        scale_kn = scale_blocks_nk.T.astype(np.float32)  # [K/block_size, N]
-
-        codes_name = _unique_name(f"{prefix}_codes", taken_names)
-        codes_tensor = onnx.TensorProto()
-        codes_tensor.name = codes_name
-        codes_tensor.data_type = codes_dtype
-        codes_tensor.dims.extend([k, n])
-        if codes_dtype == onnx.TensorProto.INT4:
-            codes_tensor.raw_data = _pack_int4(codes_kn)
-        else:
-            codes_tensor.raw_data = codes_kn.astype(np.int8).tobytes()
-        graph.initializer.append(codes_tensor)
-
-        scale_name = _unique_name(f"{prefix}_scale", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(scale_kn, name=scale_name)
-        )
-
-        new_nodes: List[onnx.NodeProto] = []
-
-        def _new(op_type, inputs, out_suffix, **attrs):
-            out_name = _unique_name(f"{prefix}_{out_suffix}", taken_names)
-            n_ = onnx.helper.make_node(
-                op_type,
-                inputs,
-                [out_name],
-                name=_unique_name(f"{prefix}_{out_suffix}_node", taken_names),
-                **attrs,
-            )
-            new_nodes.append(n_)
-            return out_name
-
-        w_dequant = _new(
-            "DequantizeLinear",
-            [codes_name, scale_name],
-            "w_dequant",
-            axis=0,
-            block_size=block_size,
-        )
-        core = _new("MatMul", [x_name, w_dequant], "core")
-
-        old_output = node.output[0]
-        if bias_name is not None:
-            final = onnx.helper.make_node(
-                "Add",
-                [core, bias_name],
-                [old_output],
-                name=_unique_name(f"{prefix}_bias_add_node", taken_names),
-            )
-        else:
-            final = onnx.helper.make_node(
-                "Identity",
-                [core],
-                [old_output],
-                name=_unique_name(f"{prefix}_identity_node", taken_names),
-            )
-        new_nodes.append(final)
-
-        node_idx = next(i for i, n_ in enumerate(graph.node) if n_ is node)
-        for offset, new_node in enumerate(new_nodes):
-            graph.node.insert(node_idx + offset, new_node)
-        del graph.node[node_idx + len(new_nodes)]
-
-    return out
+    return apply_mixed_precision_quantization_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        high_bits_fraction=high_bits_fraction,
+        block_size=block_size,
+        sensitivity_metric=sensitivity_metric,
+        providers=providers,
+    )
 
 
 DEFAULT_SEARCH_FRACTIONS: Sequence[float] = (0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0)

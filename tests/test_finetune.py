@@ -208,7 +208,12 @@ def test_finetune_is_a_noop_when_no_matmul_or_gemm_nodes_present():
     pruned.CopyFrom(model)
 
     result = onnxsim.apply_pruning_finetune(model, pruned)
-    assert result is pruned
+    # apply_pruning_finetune now delegates to apply_pruning_finetune_cpp
+    # (see onnxsim/finetune.py's own "Delegates to" note), which crosses
+    # a serialize/parse boundary even on a no-op, so `result` is a fresh
+    # ModelProto rather than `pruned` itself -- byte-identical content is
+    # the real guarantee here, not object identity.
+    assert result.SerializeToString() == pruned.SerializeToString()
 
 
 def test_finetune_is_a_noop_when_pruned_model_equals_original():

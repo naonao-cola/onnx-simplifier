@@ -1636,6 +1636,215 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "learning_rate"_a = 0.1, "reg_param"_a = 0.01, "warm_start"_a = 0.2,
       "beta_start"_a = 20.0, "beta_end"_a = 2.0, "fisher_eps"_a = 1e-3);
 
+  // Sensitivity-based mixed-precision weight quantization: quantizes
+  // every matched MatMul/vanilla-Gemm layer to block-wise INT8 or INT4,
+  // chosen per layer from a calibration-driven Hessian-diagonal (or
+  // full-Hessian) sensitivity score, budgeted so the top
+  // `high_bits_fraction` most-sensitive layers get INT8. Single-model
+  // executor-as-first-argument shape (same `calibration_data` crossing
+  // convention as apply_llm_int8's own binding above -- see that binding
+  // for the shape). See ApplyMixedPrecisionQuantization in
+  // mixed_precision_entry.h for the full scope and
+  // onnxsim/mixed_precision.py for the technique this ports.
+  m.def(
+      "apply_mixed_precision_quantization",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double high_bits_fraction, int64_t block_size,
+         const std::string& sensitivity_metric) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyMixedPrecisionQuantization(
+            model, *executor, calibration_data, high_bits_fraction, block_size,
+            sensitivity_metric);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a,
+      "high_bits_fraction"_a = 0.2, "block_size"_a = 32,
+      "sensitivity_metric"_a = "hessian_diag");
+
+  // QoQ's SmoothAttention: migrates Key's per-channel quantization
+  // difficulty into Query (which stays float) for every decomposed
+  // attention subgraph (MatMul(Q,Kt) -> [Mul/Div] -> [Add] -> Softmax ->
+  // MatMul(_,V)) -- a provably-lossless calibrated scale migration, no
+  // quantization happens here at all. Same executor-as-first-argument,
+  // `calibration_data` crossing convention as apply_llm_int8's own
+  // binding above. See ApplySmoothAttention in smooth_attention_entry.h
+  // for the full scope and onnxsim/qoq.py for the technique this ports.
+  m.def(
+      "apply_smooth_attention",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double epsilon) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplySmoothAttention(model, *executor, calibration_data, epsilon);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "epsilon"_a = 1e-5);
+
+  // PTQ4ViT's twin uniform quantization: splits a matched Softmax/GELU
+  // output's value range at a calibration-searched threshold into two
+  // independently-quantized sub-ranges, doubling usable resolution where
+  // the real distribution concentrates its mass. Same executor-as-first-
+  // argument, `calibration_data` crossing convention as apply_llm_int8's
+  // own binding above. See ApplyPtq4Vit in ptq4vit_entry.h for the full
+  // scope and onnxsim/ptq4vit.py for the technique this ports.
+  m.def(
+      "apply_ptq4vit_quantization",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t n_levels) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplyPtq4Vit(model, *executor, calibration_data, n_levels);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "n_levels"_a = 256);
+
+  // AutoRound (Cheng et al., 2023): jointly optimizes AdaRound's own
+  // rectified-sigmoid rounding relaxation AND a second, per-(output
+  // channel, block) clip-ratio parameter that lets the effective scale
+  // move during the same Adam optimization -- closing the one gap between
+  // apply_adaround's own binding above (fixed-scale, rounding-only) and
+  // AutoRound proper. Same two-model executor-as-first-argument shape as
+  // apply_adaround's own binding above (candidates are processed
+  // independently, so `executor` is invoked once, up front);
+  // `beta_start`/`beta_end` and `clip_ratio_min`/`clip_ratio_max` are the
+  // two ends of apply_autoround's own `beta_range`/`clip_ratio_range`
+  // tuples, split the same way apply_adaround's own binding splits
+  // `beta_range`. Always runs AdaRound's own fixed-scale optimization too
+  // and keeps whichever candidate has the lower measured reconstruction
+  // error, so a layer's scale is only ever rewritten when doing so actually
+  // helps. See ApplyAutoround in autoround_entry.h for the full scope and
+  // onnxsim/autoround.py for the technique this ports.
+  m.def(
+      "apply_autoround",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t num_iterations, double learning_rate,
+         double clip_learning_rate, double reg_param, double warm_start,
+         double beta_start, double beta_end, double clip_ratio_min,
+         double clip_ratio_max) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result = ApplyAutoround(
+            float_model, quantized_model, *executor, calibration_data,
+            num_iterations, learning_rate, clip_learning_rate, reg_param,
+            warm_start, beta_start, beta_end, clip_ratio_min, clip_ratio_max);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "num_iterations"_a = 300, "learning_rate"_a = 0.1,
+      "clip_learning_rate"_a = 0.03, "reg_param"_a = 0.01, "warm_start"_a = 0.2,
+      "beta_start"_a = 20.0, "beta_end"_a = 2.0, "clip_ratio_min"_a = 0.5,
+      "clip_ratio_max"_a = 1.5);
+
+  // FlexRound (Lee et al., 2023, ICML): "learnable-division rounding" --
+  // the fourth onnxsim-native PTQ technique alongside apply_adaround's own
+  // binding above, apply_gptq's, and apply_awq's, each pulling a different
+  // lever on the same target scheme. Reparametrizes the divisor itself
+  // (`S = scale * S2 * s3`, both `S2`/`s3` learnable and log-space
+  // parametrized) rather than AdaRound's own additive rounding
+  // perturbation. Same two-model executor-as-first-argument shape as
+  // apply_adaround's own binding above (candidates are processed
+  // independently, so `executor` is invoked once, up front); never
+  // rewrites a scale initializer (unlike apply_autoround's own binding
+  // above), only the matched layer's own codes. See ApplyFlexround in
+  // flexround_entry.h for the full scope and onnxsim/flexround.py for the
+  // technique this ports.
+  m.def(
+      "apply_flexround",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t num_iterations, double learning_rate,
+         double log_clip) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result = ApplyFlexround(
+            float_model, quantized_model, *executor, calibration_data,
+            num_iterations, learning_rate, log_clip);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "num_iterations"_a = 300, "learning_rate"_a = 0.05,
+      "log_clip"_a = 4.0);
+
+  // FOEM ("First-Order Error Matters", 2025): extends apply_gptq's own
+  // binding above with an additional first-order-drift compensation term
+  // -- alongside GPTQ's own Hessian-compensated rounding error, also
+  // charges forward a damped fraction of how far each column's own
+  // pre-quantization value has already drifted from the weight's true
+  // original column, due to every earlier column's own forward
+  // propagation. `foem_beta == 0.0` recovers plain GPTQ exactly. Same
+  // two-model executor-as-first-argument shape as apply_gptq's own binding
+  // above; `percdamp`/`proc_block_size` mirror apply_gptq's own parameters
+  // of the same names and defaults. See ApplyFoem in foem_entry.h for the
+  // full scope and onnxsim/foem.py for the technique this ports.
+  m.def(
+      "apply_foem",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double percdamp, int64_t proc_block_size,
+         double foem_beta) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result =
+            ApplyFoem(float_model, quantized_model, *executor, calibration_data,
+                      percdamp, proc_block_size, foem_beta);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "percdamp"_a = 0.01, "proc_block_size"_a = 128,
+      "foem_beta"_a = 0.005);
+
   // SliM-LLM (Huang, Shao, Dong, Luo, Qiao et al., 2024): salience-driven
   // mixed-precision quantization picking a bit-width per GROUP within a
   // layer's own weight (rather than per whole layer). Single-model,
@@ -2933,6 +3142,121 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+
+  // LLM-FP4 activation quantization, data-free per-token variant (Liu et
+  // al., 2023): completes W4A4 for every quantize_weight_only_llm_fp4-
+  // quantized layer by inserting a per-token, data-free FP4 quantize/
+  // dequantize round-trip on that layer's own activation input, reusing
+  // that same layer's own already-baked codebook. NOT the paper's own
+  // per-channel-migration design -- see
+  // ApplyLlmFp4ActivationQuantization in llm_fp4_activation_entry.h for
+  // the full "Honesty note" and onnxsim/llm_fp4.py for the technique.
+  // Data-free.
+  m.def(
+      "apply_llm_fp4_activation_quantization",
+      [](const py::bytes& model_proto_bytes, double epsilon) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyLlmFp4ActivationQuantization(model, epsilon);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "epsilon"_a = 1e-12);
+
+  // LLM-FP4 activation quantization, calibrated per-tensor variant (Liu
+  // et al., 2023): the paper's own quantizer half (the migration half is
+  // the caller's job, via apply_smoothquant/apply_outlier_suppression
+  // run first) -- fits one real-valued per-tensor scale from calibration
+  // data and bakes it into the graph as a constant before inserting a
+  // static FP4 quantize/dequantize round-trip. Same
+  // executor-as-first-argument, `calibration_data` crossing convention
+  // as apply_llm_int8's own binding above. See
+  // ApplyLlmFp4ActivationQuantizationPerTensor in
+  // llm_fp4_activation_entry.h for the full scope and
+  // onnxsim/llm_fp4.py for the technique this ports.
+  m.def(
+      "apply_llm_fp4_activation_quantization_per_tensor",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         std::optional<std::vector<double>> clip_ratios) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyLlmFp4ActivationQuantizationPerTensor(
+            model, *executor, calibration_data, clip_ratios);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a,
+      "clip_ratios"_a = std::nullopt);
+
+  // Binary Weight-Activation PTQ (Song et al., 2025, ACL Findings), weight
+  // side only (W(1+1)): binarizes every matched MatMul/vanilla-Gemm layer
+  // to exactly 1 sign bit + 1 group-select bit/element via Hessian-
+  // weighted two-scale binary EM. Same executor-as-first-argument,
+  // `calibration_data` crossing convention as apply_llm_int8's own
+  // binding above. See ApplyBwaPtq in bwa_ptq_entry.h for the full scope
+  // and onnxsim/bwa_ptq.py for the technique this ports.
+  m.def(
+      "apply_bwa_ptq",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t group_size, int64_t max_em_iters) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyBwaPtq(model, *executor, calibration_data,
+                                        group_size, max_em_iters);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "group_size"_a = 128,
+      "max_em_iters"_a = 10);
+
+  // Pruning-recovery fine-tuning: for every surviving MatMul/vanilla-Gemm
+  // layer present (by node output name) in both `original_model` and
+  // `pruned_model`, re-solves its weight (and bias) as a closed-form
+  // ridge-regression fit against `original_model`'s own real
+  // activations. Same two-model executor-as-first-argument shape as
+  // apply_gptq's own binding above; `calibration_data` (List[Dict[str,
+  // onnx.TensorProto]]) is keyed to `original_model`'s own graph inputs.
+  // See ApplyPruningFinetune in finetune_entry.h for the full scope and
+  // onnxsim/finetune.py for the technique this ports.
+  m.def(
+      "apply_pruning_finetune",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& original_model_bytes,
+         const py::bytes& pruned_model_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double reg_param) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto original_model;
+        ParseProtoFromBytes(&original_model, original_model_bytes.c_str(),
+                            original_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto pruned_model;
+        ParseProtoFromBytes(&pruned_model, pruned_model_bytes.c_str(),
+                            pruned_model_bytes.size());
+        const auto result =
+            ApplyPruningFinetune(original_model, pruned_model, *executor,
+                                 calibration_data, reg_param);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "original_model_bytes"_a, "pruned_model_bytes"_a,
+      "calibration_data"_a, "reg_param"_a = 1e-2);
 
   // QServe's QoQ quantization (Lin et al., 2024): progressive
   // (INT8-then-INT4) block-wise weight quantization. Data-free. See

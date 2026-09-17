@@ -101,89 +101,13 @@ what ``apply_structured_pruning``'s own chain finders themselves recognize.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
 import numpy as np
 import onnx
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.smoothquant import _match_matmul_like
-
-
-@dataclass
-class _Candidate:
-    x_name: str
-    pruned_node: onnx.NodeProto
-    w_orig: onnx.TensorProto
-    w_pruned: onnx.TensorProto
-    b_orig: Optional[onnx.TensorProto]
-    b_pruned: Optional[onnx.TensorProto]
-    weight_transposed: bool
-
-
-def _node_by_output(graph: onnx.GraphProto) -> Dict[str, onnx.NodeProto]:
-    m: Dict[str, onnx.NodeProto] = {}
-    for n in graph.node:
-        if n.output:
-            m[n.output[0]] = n
-    return m
-
-
-def _find_matmul_finetune_candidates(
-    original_model: onnx.ModelProto, pruned_model: onnx.ModelProto
-) -> List[_Candidate]:
-    orig_by_output = _node_by_output(original_model.graph)
-    pruned_by_output = _node_by_output(pruned_model.graph)
-    orig_init = {t.name: t for t in original_model.graph.initializer}
-    pruned_init = {t.name: t for t in pruned_model.graph.initializer}
-
-    candidates: List[_Candidate] = []
-    for out_name, pn in pruned_by_output.items():
-        on = orig_by_output.get(out_name)
-        if on is None or on.op_type != pn.op_type:
-            continue
-        p_match = _match_matmul_like(pn)
-        o_match = _match_matmul_like(on)
-        if p_match is None or o_match is None:
-            continue
-        p_x_name, p_w_name, p_transposed = p_match
-        o_x_name, o_w_name, o_transposed = o_match
-        if p_transposed != o_transposed:
-            continue
-
-        w_pruned = pruned_init.get(p_w_name)
-        w_orig = orig_init.get(o_w_name)
-        if (
-            w_pruned is None
-            or w_orig is None
-            or w_pruned.data_type != onnx.TensorProto.FLOAT
-            or w_orig.data_type != onnx.TensorProto.FLOAT
-            or len(w_pruned.dims) != 2
-            or len(w_orig.dims) != 2
-        ):
-            continue
-
-        b_pruned = pruned_init.get(pn.input[2]) if len(pn.input) == 3 else None
-        b_orig = orig_init.get(on.input[2]) if len(on.input) == 3 else None
-        if (b_pruned is None) != (b_orig is None):
-            continue  # bias presence disagrees -- something other than pruning touched this
-
-        candidates.append(
-            _Candidate(
-                x_name=o_x_name,
-                pruned_node=pn,
-                w_orig=w_orig,
-                w_pruned=w_pruned,
-                b_orig=b_orig,
-                b_pruned=b_pruned,
-                weight_transposed=p_transposed,
-            )
-        )
-    return candidates
+from onnxsim.calibration import Tensors
+from onnxsim.onnx_simplifier import apply_pruning_finetune_cpp
 
 
 def _find_keep_indices(
@@ -327,86 +251,22 @@ def apply_pruning_finetune(
             has no feature axis at all (rank < 2), is left completely
             untouched; a higher-rank ``[batch, seq, K]`` activation is
             flattened to ``[batch * seq, K]``, which is exact
+
+    Delegates to :func:`onnxsim.apply_pruning_finetune_cpp` (the verified
+    C++ port), which solves the exact same closed-form ridge-regression
+    fit this function's own docstring describes. This pure-Python name is
+    kept only for backward compatibility with existing callers.
     """
     if isinstance(original_model, str):
         original_model = onnx.load(original_model, load_external_data=False)
     if isinstance(pruned_model, str):
         pruned_model = onnx.load(pruned_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            original_model, num_samples=num_samples, seed=seed
-        )
-
-    candidates = _find_matmul_finetune_candidates(original_model, pruned_model)
-    if not candidates:
-        return pruned_model
-
-    probe_names = sorted({c.x_name for c in candidates})
-    orig_probe = _add_probe_outputs(original_model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        out = backend.run_model(orig_probe, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(out[name], dtype=np.float64))
-
-    optimized_w: Dict[str, np.ndarray] = {}
-    optimized_b: Dict[str, np.ndarray] = {}
-    for c in candidates:
-        acts = _activation_rows(activations[c.x_name])
-        if not acts:
-            continue  # no usable activation (no feature axis); skip
-        x_full = np.concatenate(acts, axis=0)
-
-        w_orig = onnx.numpy_helper.to_array(c.w_orig).astype(np.float64)
-        w_pruned = onnx.numpy_helper.to_array(c.w_pruned).astype(np.float64)
-        b_orig = (
-            onnx.numpy_helper.to_array(c.b_orig).astype(np.float64)
-            if c.b_orig is not None
-            else None
-        )
-        b_pruned = (
-            onnx.numpy_helper.to_array(c.b_pruned).astype(np.float64)
-            if c.b_pruned is not None
-            else None
-        )
-
-        # Normalize to [N, K] (output channel first) regardless of storage
-        # layout, mirroring apply_adaround's own convention.
-        w_orig_nk = w_orig if c.weight_transposed else w_orig.T
-        w_pruned_nk = w_pruned if c.weight_transposed else w_pruned.T
-        if x_full.shape[1] != w_orig_nk.shape[1]:
-            continue  # activation's feature dim doesn't match K -- skip
-
-        keep_out, keep_in = _find_channel_correspondence(w_orig_nk, w_pruned_nk)
-        if keep_in is None or keep_out is None:
-            continue  # not a clean subsequence of the original -- decline
-
-        x = x_full[:, keep_in]
-        y_full = x_full @ w_orig_nk.T
-        if b_orig is not None:
-            y_full = y_full + b_orig
-        y = y_full[:, keep_out]
-
-        w_new_nk, b_new = _ridge_fit(x, y, w_pruned_nk, b_pruned, reg_param)
-
-        w_write = w_new_nk if c.weight_transposed else w_new_nk.T
-        optimized_w[c.w_pruned.name] = w_write.astype(np.float32)
-        if b_new is not None and c.b_pruned is not None:
-            optimized_b[c.b_pruned.name] = b_new.astype(np.float32)
-
-    if not optimized_w:
-        return pruned_model
-
-    finetuned = onnx.ModelProto()
-    finetuned.CopyFrom(pruned_model)
-    for t in finetuned.graph.initializer:
-        w = optimized_w.get(t.name)
-        if w is not None:
-            t.CopyFrom(onnx.numpy_helper.from_array(w, name=t.name))
-            continue
-        b = optimized_b.get(t.name)
-        if b is not None:
-            t.CopyFrom(onnx.numpy_helper.from_array(b, name=t.name))
-
-    return finetuned
+    return apply_pruning_finetune_cpp(
+        original_model,
+        pruned_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        reg_param=reg_param,
+        providers=providers,
+    )

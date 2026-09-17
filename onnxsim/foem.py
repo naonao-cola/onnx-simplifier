@@ -60,71 +60,11 @@ GPTQ already stores" efficiency claim.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _find_int4_matmul_candidates, _pack_int4
-from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.gptq import _inverse_hessian_cholesky
-
-
-def _foem_quantize_columns(
-    w_nk: np.ndarray,
-    scale_blocks: np.ndarray,
-    quant_block_size: int,
-    h: np.ndarray,
-    percdamp: float,
-    proc_block_size: int,
-    foem_beta: float,
-) -> np.ndarray:
-    """Returns FOEM-optimized integer codes for ``w_nk`` ([N, K], output
-    channel first) -- see this module's own docstring. Mirrors
-    :func:`onnxsim.gptq._gptq_quantize_columns`'s own structure and
-    parameters exactly, adding only ``foem_beta`` (the damping factor on
-    the additional first-order drift term).
-    """
-    n, k = w_nk.shape
-    hinv = _inverse_hessian_cholesky(h, percdamp)
-
-    codes_nk = np.zeros((n, k), dtype=np.float64)
-    w_orig = w_nk  # never modified -- FOEM's own "untouched full weights"
-    w_work = w_nk.copy()
-
-    for block_start in range(0, k, proc_block_size):
-        block_end = min(block_start + proc_block_size, k)
-        bs = block_end - block_start
-        w1 = w_work[:, block_start:block_end].copy()
-        err1 = np.zeros_like(w1)
-        hinv1 = hinv[block_start:block_end, block_start:block_end]
-
-        for i in range(bs):
-            k_abs = block_start + i
-            group = k_abs // quant_block_size
-            s = scale_blocks[:, group]  # [N]
-            w_col = w1[:, i]
-            code_col = np.clip(np.round(w_col / s), -7.0, 7.0)
-            codes_nk[:, k_abs] = code_col
-            d = hinv1[i, i]
-            second_order_err = (w_col - code_col * s) / d
-            # FOEM's own additional term: how far this column's own
-            # pre-quantization value has already drifted from W's true
-            # original column, due to every earlier column's own forward
-            # propagation -- damped by foem_beta, not compensated in full.
-            drift = (w_col - w_orig[:, k_abs]) / d
-            err = second_order_err - foem_beta * drift
-            err1[:, i] = err
-            if i + 1 < bs:
-                w1[:, i + 1 :] -= np.outer(err, hinv1[i, i + 1 :])
-
-        if block_end < k:
-            w_work[:, block_end:] -= err1 @ hinv[block_start:block_end, block_end:]
-
-    return codes_nk
+from onnxsim.calibration import Tensors
 
 
 def apply_foem(
@@ -182,67 +122,35 @@ def apply_foem(
             initializer rewritten to its FOEM-optimized codes (same shape,
             dtype, and scale -- only which integer each element rounds to
             changes)
+
+    This entry point is a thin alias for the verified C++ port
+    :func:`onnxsim.apply_foem_cpp` (``onnxsim/foem_entry.cpp``'s own
+    ``ApplyFoem``), forwarding every argument unchanged. Exact (bit-for-bit)
+    agreement was verified against this function's own pre-alias
+    implementation (its former ``_foem_quantize_columns``, now removed as
+    dead code -- no other module imported it) across MatMul/Gemm/transB-Gemm/
+    biased-Gemm, block sizes, damping levels, multi-batch and rank-3
+    calibration, dead/duplicate channels, every ``foem_beta`` (including the
+    ``0.0``-recovers-plain-GPTQ degenerate case), and every skip shape --
+    see tests/test_foem_cpp.py -- before this alias was made. (The port's
+    dense inverse/Cholesky use scalar double-precision kernels rather than
+    LAPACK, the same accepted numerical scope as
+    :func:`onnxsim.apply_gptq`'s own C++ port; no divergence was observed
+    anywhere measured.) Imported lazily (inside the function body, not at
+    module scope) to avoid a circular import: ``onnxsim.onnx_simplifier``
+    already imports from this module, so importing it back at module load
+    time here would deadlock the import machinery.
     """
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    if isinstance(quantized_model, str):
-        quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_foem_cpp
 
-    candidates = _find_int4_matmul_candidates(float_model, quantized_model)
-    if not candidates:
-        return quantized_model
-
-    probe_names = sorted({c.float_node.input[0] for c in candidates})
-    float_probe = _add_probe_outputs(float_model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        out = backend.run_model(float_probe, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(out[name], dtype=np.float64))
-
-    optimized: Dict[str, np.ndarray] = {}
-    for c in candidates:
-        acts = _activation_rows(activations[c.float_node.input[0]])
-        if not acts:
-            continue  # no usable activation (no feature axis); skip
-        x = np.concatenate(acts, axis=0)
-
-        w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)
-        scale = onnx.numpy_helper.to_array(c.ws_init).astype(np.float64)
-        dim0, dim1 = w.shape
-
-        if c.weight_transposed:
-            w_nk = w  # already [N, K]
-            scale_blocks = scale  # already [N, K / block_size]
-        else:
-            w_nk = w.T  # [K, N] -> [N, K]
-            scale_blocks = scale.T  # [K / block_size, N] -> [N, K / block_size]
-        if x.shape[1] != w_nk.shape[1]:
-            continue  # activation's feature dim doesn't match K; skip
-
-        h = x.T @ x
-        codes_nk = _foem_quantize_columns(
-            w_nk, scale_blocks, c.block_size, h, percdamp, proc_block_size, foem_beta
-        )
-
-        codes_orig = codes_nk if c.weight_transposed else codes_nk.T
-        assert codes_orig.shape == (dim0, dim1)
-        optimized[c.wq_name] = codes_orig.astype(np.int8)
-
-    if not optimized:
-        return quantized_model
-
-    corrected = onnx.ModelProto()
-    corrected.CopyFrom(quantized_model)
-    for t in corrected.graph.initializer:
-        codes = optimized.get(t.name)
-        if codes is None:
-            continue
-        t.raw_data = _pack_int4(codes)
-
-    return corrected
+    return apply_foem_cpp(
+        float_model,
+        quantized_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        percdamp=percdamp,
+        proc_block_size=proc_block_size,
+        foem_beta=foem_beta,
+        providers=providers,
+    )
