@@ -55,7 +55,10 @@ at roughly 10x the sample size it was originally checked against.
   a real, corpus-wide finding worth folding into that earlier picture,
   not decoded further (what these four banks' fields mean is not
   established here).
-- **The other 21 of 39 banks are sparse**: seen in 9 or fewer fixtures
+- **The other 20 of 39 banks are sparse** (originally 21 at the
+  306-fixture corpus; PR #1568's 2 new bank-`0x81` carrier fixtures
+  pushed that bank's own count from 8 to 10, crossing out of this
+  bucket): seen in 9 or fewer fixtures
   each (most in 1-3), with small write counts. These read as genuinely
   op/shape-specific banks, not a general vocabulary -- but the sample
   per bank is too thin here to say anything about what any individual
@@ -180,11 +183,20 @@ class TestFixtureCorpusSize(unittest.TestCase):
         # fixtures (2 states x 2 rebuilds) -- the two extra bank-0x81
         # carriers pushed that bank's own fixture count from 8 to 10,
         # moving it out of TestBankCensus's own <=9 "sparse" bucket (see
-        # that test's updated count below). Method name kept as-is
-        # (matches this file's own established "N fixtures" naming
-        # convention elsewhere) rather than renamed on every corpus
-        # change.
-        self.assertEqual(_CENSUS["n_fixtures"], 310)
+        # that test's updated count below).
+        #
+        # Grew again, 310 -> 318, from other fixtures added to the
+        # corpus by later work in this session that didn't touch this
+        # file's own asserted counts at the time (an oversight, not a
+        # corpus problem -- found and fixed here while adding this
+        # file's own next 4 fixtures). Then 318 -> 322 from this file's
+        # own new fixtures (`gemm_1x128x1000`, `gemm_1x256x1000`,
+        # `gemm_1x512x100` + its rebuild), decoding bank `0x81`'s
+        # field=192 operand (`tests/test_axera_gemm_bank_81_e1_decode.py`).
+        # Method name kept as-is (matches this file's own established "N
+        # fixtures" naming convention elsewhere) rather than renamed on
+        # every corpus change.
+        self.assertEqual(_CENSUS["n_fixtures"], 322)
 
 
 class TestFieldOffsetGranularity(unittest.TestCase):
@@ -204,7 +216,7 @@ class TestBankCensus(unittest.TestCase):
         for bank in (0x00, 0x01, 0x02, 0x03, 0x04):
             self.assertEqual(
                 len(_CENSUS["bank_fixture_set"][bank]),
-                310,
+                322,
                 f"bank {bank:#04x} should appear in every fixture",
             )
 
@@ -282,8 +294,14 @@ class TestRegisterCensus(unittest.TestCase):
     def test_reg8_is_the_heaviest_universal_register(self):
         # Was 27,369 at the original 306-fixture corpus; the 4 new
         # fixtures from tests/test_axera_gemm_sparse_bank_n_boundary.py
-        # add their own reg=8 usage.
-        self.assertEqual(_CENSUS["reg_counts"][8], 27601)
+        # pushed it to 27,601 (310 fixtures). Corpus growth to 318
+        # fixtures (see TestFixtureCorpusSize's own comment) and then to
+        # 322 with this file's own 4 new large-N Gemm fixtures --
+        # `gemm_1x128x1000`/`gemm_1x256x1000` carry hundreds of
+        # additional `reg=8` short-unit records each, being much larger
+        # programs than the small probe fixtures this corpus is mostly
+        # made of -- bring it to 28,346.
+        self.assertEqual(_CENSUS["reg_counts"][8], 28346)
         counts = _CENSUS["reg_counts"]
         universal = {
             r
@@ -326,10 +344,14 @@ class TestRegisterCensus(unittest.TestCase):
         )
 
     def test_67_registers_are_sparse(self):
+        # Was 67 at the 310-fixture corpus; one register that
+        # previously appeared in <=3 fixtures crossed above that
+        # threshold with this file's own new large-N Gemm fixtures,
+        # leaving 66 at 322 fixtures.
         sparse = [
             r for r, fixset in _CENSUS["reg_fixture_set"].items() if len(fixset) <= 3
         ]
-        self.assertEqual(len(sparse), 67)
+        self.assertEqual(len(sparse), 66)
 
 
 if __name__ == "__main__":
