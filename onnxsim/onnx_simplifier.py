@@ -7612,6 +7612,280 @@ def quantize_weight_only_llm_fp4_cpp(
     )
 
 
+def apply_llm_fp4_activation_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+    epsilon: float = 1e-12,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_llm_fp4_activation_quantization`:
+    completes W4A4 for every :func:`onnxsim.quantize_weight_only_llm_fp4`-
+    quantized layer by inserting a **per-token, data-free** FP4 quantize/
+    dequantize round-trip on that layer's own activation input, reusing
+    that same layer's own already-baked codebook. This is NOT the LLM-FP4
+    paper's own activation-quantization design -- read
+    :func:`onnxsim.apply_llm_fp4_activation_quantization`'s own docstring
+    (in particular its "Honesty note") before using; the paper's own
+    calibrated per-tensor scheme is
+    :func:`onnxsim.apply_llm_fp4_activation_quantization_per_tensor_cpp`.
+    Needs no calibration data.
+
+    :param model: the original or weight-quantized onnx ModelProto or
+            file path -- must already have been passed through
+            :func:`onnxsim.quantize_weight_only_llm_fp4`/
+            :func:`onnxsim.quantize_weight_only_llm_fp4_cpp` for this
+            function to do anything
+    :param epsilon: floor applied to a token's own max-abs value before
+            using it as a scale, avoiding a divide-by-zero on an
+            all-zero token
+    :returns: ``model`` with every already-FP4-weight-quantized layer's
+            activation input replaced by its own per-token FP4 quantize/
+            dequantize round-trip; a layer whose weight input isn't fed
+            by exactly :func:`onnxsim.quantize_weight_only_llm_fp4`'s own
+            dequantization pattern is left completely untouched. A model
+            with an opset older than 18 is returned unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_llm_fp4_activation_quantization(model.SerializeToString(), epsilon)
+    )
+
+
+def apply_llm_fp4_activation_quantization_per_tensor_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    clip_ratios: Optional[Sequence[float]] = None,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of
+    :func:`onnxsim.apply_llm_fp4_activation_quantization_per_tensor`: the
+    **calibrated per-tensor** half of the LLM-FP4 paper's own activation-
+    quantization design. Fits one real-valued per-tensor scale per
+    already-:func:`onnxsim.quantize_weight_only_llm_fp4`-quantized
+    layer's activation from calibration data (the same clip-ratio grid
+    search the weight side already uses, applied to the whole captured
+    activation as a single group), bakes it in as a constant initializer,
+    then inserts a *static* FP4 quantize/dequantize round-trip. This
+    implements only the quantizer half of the paper's own design -- the
+    migration half (pushing per-channel activation outliers into the
+    preceding weight/LayerNormalization) is the caller's job, via
+    :func:`onnxsim.apply_smoothquant`/
+    :func:`onnxsim.apply_outlier_suppression` run first -- see
+    :func:`onnxsim.apply_llm_fp4_activation_quantization_per_tensor`'s
+    own docstring for the full three-call sequence and honesty note.
+
+    Same real calibration machinery as :func:`onnxsim.apply_gptq_cpp` -- a
+    live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++.
+
+    :param model: a weight-quantized onnx ModelProto or file path -- must
+            already have been passed through
+            :func:`onnxsim.quantize_weight_only_llm_fp4`/
+            :func:`onnxsim.quantize_weight_only_llm_fp4_cpp` for this
+            function to do anything
+    :param calibration_data: representative input batches to fit each
+            activation's scale on -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param clip_ratios: per-tensor clip-ratio candidates to grid-search;
+            defaults to 17 points evenly spaced over ``[0.5, 1.0]``
+            (:func:`onnxsim.quantize_weight_only_llm_fp4`'s own weight-side
+            default grid)
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every already-FP4-weight-quantized layer's
+            activation input replaced by a static, per-tensor FP4
+            quantize/dequantize round-trip driven by a constant scale
+            initializer; a layer whose weight input isn't fed by exactly
+            :func:`onnxsim.quantize_weight_only_llm_fp4`'s own
+            dequantization pattern, or whose activation no calibration
+            batch reached (or for which every captured value was zero or
+            non-finite), is left completely untouched. A model with an
+            opset older than 13 is returned unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_llm_fp4_activation_quantization_per_tensor(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            None if clip_ratios is None else [float(r) for r in clip_ratios],
+        )
+    )
+
+
+def apply_bwa_ptq_cpp(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    group_size: int = 128,
+    max_em_iters: int = 10,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_bwa_ptq`: Binary Weight-
+    Activation PTQ (Song et al., 2025, ACL Findings), weight side only
+    (W(1+1)) -- binarizes every matched MatMul/vanilla-Gemm layer's
+    weight to exactly 1 sign bit + 1 group-select bit/element via
+    Hessian-weighted two-scale binary EM. See
+    :func:`onnxsim.apply_bwa_ptq`'s own module docstring for the full
+    technique and its documented scope (the paper's own A(1x4)
+    activation-side bit-plane decomposition is deliberately not ported --
+    it is numerically equivalent to ordinary calibrated INT4 activation
+    quantization).
+
+    Same real calibration machinery as :func:`onnxsim.apply_billm_cpp` -- a
+    live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through the model in C++ (see ``ApplyBwaPtq``
+    in ``bwa_ptq_entry.h`` for the full scope, including its accepted
+    numerical scope).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param calibration_data: representative input batches to compute each
+            layer's Hessian diagonal from -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param group_size: contiguous reduction-axis elements sharing one
+            pair of candidate scales
+    :param max_em_iters: upper bound on EM iterations per group
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched layer's weight replaced by its
+            two-scale binary reconstruction.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_bwa_ptq(
+            _get_model_executor(providers),
+            model.SerializeToString(),
+            calibration_data_pb,
+            group_size,
+            max_em_iters,
+        )
+    )
+
+
+def apply_pruning_finetune_cpp(
+    original_model: Union[str, onnx.ModelProto],
+    pruned_model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    reg_param: float = 1e-2,
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_pruning_finetune`: for every
+    surviving MatMul/vanilla-Gemm layer present (by node output name) in
+    both ``original_model`` and ``pruned_model``, re-solves its weight
+    (and bias, if it has one) as a closed-form ridge-regression fit
+    against ``original_model``'s own real activations -- see
+    :func:`onnxsim.apply_pruning_finetune`'s own module docstring for the
+    full technique, its "exactness argument", and its scope boundaries.
+
+    Same real calibration machinery as :func:`onnxsim.apply_gptq_cpp` -- a
+    live :class:`onnxsim.onnx_simplifier.PyModelExecutor`-backed
+    :func:`onnxsim.onnx_simplifier._get_model_executor` executor actually
+    runs ``calibration_data`` through ``original_model`` in C++ (see
+    ``ApplyPruningFinetune`` in ``finetune_entry.h`` for the full scope,
+    including its accepted numerical scope: the dense linear solve at
+    this fit's heart uses a scalar double-precision Gaussian-elimination
+    kernel rather than LAPACK).
+
+    :param original_model: the pre-pruning onnx ModelProto or file path
+    :param pruned_model: ``original_model`` after
+            :func:`onnxsim.apply_structured_pruning_cpp`/
+            :func:`onnxsim.apply_attention_head_pruning_cpp` (or their
+            Wanda-calibrated counterparts) -- onnx ModelProto or file
+            path
+    :param calibration_data: representative input batches to fit each
+            layer's own reconstruction on -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param reg_param: ridge-regression regularization strength, relative
+            to the calibration data's own scale
+    :param providers: onnxruntime execution providers to run
+            ``original_model`` on when capturing calibration activations
+    :returns: ``pruned_model`` with every matched layer's weight (and
+            bias, if it has one) replaced by its fine-tuned fit; a layer
+            whose weight isn't a clean row/column subsequence of its own
+            ``original_model`` counterpart, or whose captured activation
+            has no feature axis at all, is left completely untouched.
+    """
+    if isinstance(original_model, str):
+        original_model = onnx.load(original_model, load_external_data=False)
+    if isinstance(pruned_model, str):
+        pruned_model = onnx.load(pruned_model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            original_model, num_samples=num_samples, seed=seed
+        )
+    # Same {input_name: TensorProto}-per-batch crossing convention as
+    # apply_llm_int8_cpp -- see that function's own comment.
+    calibration_data_pb = [
+        {
+            name: onnx.numpy_helper.from_array(np.asarray(arr), name)
+            for name, arr in batch.items()
+        }
+        for batch in calibration_data
+    ]
+    return onnx.load_from_string(
+        C.apply_pruning_finetune(
+            _get_model_executor(providers),
+            original_model.SerializeToString(),
+            pruned_model.SerializeToString(),
+            calibration_data_pb,
+            reg_param,
+        )
+    )
+
+
 def apply_qoq_cpp(
     model: Union[str, onnx.ModelProto],
 ) -> onnx.ModelProto:

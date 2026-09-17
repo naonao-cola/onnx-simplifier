@@ -3143,6 +3143,121 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // LLM-FP4 activation quantization, data-free per-token variant (Liu et
+  // al., 2023): completes W4A4 for every quantize_weight_only_llm_fp4-
+  // quantized layer by inserting a per-token, data-free FP4 quantize/
+  // dequantize round-trip on that layer's own activation input, reusing
+  // that same layer's own already-baked codebook. NOT the paper's own
+  // per-channel-migration design -- see
+  // ApplyLlmFp4ActivationQuantization in llm_fp4_activation_entry.h for
+  // the full "Honesty note" and onnxsim/llm_fp4.py for the technique.
+  // Data-free.
+  m.def(
+      "apply_llm_fp4_activation_quantization",
+      [](const py::bytes& model_proto_bytes, double epsilon) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyLlmFp4ActivationQuantization(model, epsilon);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "epsilon"_a = 1e-12);
+
+  // LLM-FP4 activation quantization, calibrated per-tensor variant (Liu
+  // et al., 2023): the paper's own quantizer half (the migration half is
+  // the caller's job, via apply_smoothquant/apply_outlier_suppression
+  // run first) -- fits one real-valued per-tensor scale from calibration
+  // data and bakes it into the graph as a constant before inserting a
+  // static FP4 quantize/dequantize round-trip. Same
+  // executor-as-first-argument, `calibration_data` crossing convention
+  // as apply_llm_int8's own binding above. See
+  // ApplyLlmFp4ActivationQuantizationPerTensor in
+  // llm_fp4_activation_entry.h for the full scope and
+  // onnxsim/llm_fp4.py for the technique this ports.
+  m.def(
+      "apply_llm_fp4_activation_quantization_per_tensor",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         std::optional<std::vector<double>> clip_ratios) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyLlmFp4ActivationQuantizationPerTensor(
+            model, *executor, calibration_data, clip_ratios);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a,
+      "clip_ratios"_a = std::nullopt);
+
+  // Binary Weight-Activation PTQ (Song et al., 2025, ACL Findings), weight
+  // side only (W(1+1)): binarizes every matched MatMul/vanilla-Gemm layer
+  // to exactly 1 sign bit + 1 group-select bit/element via Hessian-
+  // weighted two-scale binary EM. Same executor-as-first-argument,
+  // `calibration_data` crossing convention as apply_llm_int8's own
+  // binding above. See ApplyBwaPtq in bwa_ptq_entry.h for the full scope
+  // and onnxsim/bwa_ptq.py for the technique this ports.
+  m.def(
+      "apply_bwa_ptq",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t group_size, int64_t max_em_iters) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyBwaPtq(model, *executor, calibration_data,
+                                        group_size, max_em_iters);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "group_size"_a = 128,
+      "max_em_iters"_a = 10);
+
+  // Pruning-recovery fine-tuning: for every surviving MatMul/vanilla-Gemm
+  // layer present (by node output name) in both `original_model` and
+  // `pruned_model`, re-solves its weight (and bias) as a closed-form
+  // ridge-regression fit against `original_model`'s own real
+  // activations. Same two-model executor-as-first-argument shape as
+  // apply_gptq's own binding above; `calibration_data` (List[Dict[str,
+  // onnx.TensorProto]]) is keyed to `original_model`'s own graph inputs.
+  // See ApplyPruningFinetune in finetune_entry.h for the full scope and
+  // onnxsim/finetune.py for the technique this ports.
+  m.def(
+      "apply_pruning_finetune",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& original_model_bytes,
+         const py::bytes& pruned_model_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double reg_param) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto original_model;
+        ParseProtoFromBytes(&original_model, original_model_bytes.c_str(),
+                            original_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto pruned_model;
+        ParseProtoFromBytes(&pruned_model, pruned_model_bytes.c_str(),
+                            pruned_model_bytes.size());
+        const auto result =
+            ApplyPruningFinetune(original_model, pruned_model, *executor,
+                                 calibration_data, reg_param);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "original_model_bytes"_a, "pruned_model_bytes"_a,
+      "calibration_data"_a, "reg_param"_a = 1e-2);
+
   // QServe's QoQ quantization (Lin et al., 2024): progressive
   // (INT8-then-INT4) block-wise weight quantization. Data-free. See
   // ApplyQoq in onnxsim.h.

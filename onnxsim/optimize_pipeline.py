@@ -91,9 +91,11 @@ function matches -- ``pruning.py``'s own newer options on top of that
 directly callable on their own too, not exposed as pipeline parameters
 here.
 
-:func:`onnxsim.apply_pruning_finetune` is pure-Python only, same as
-``pruning_method="wanda"`` and ``rotation_method="duquant"``/``"spinquant"``
--- see this module's own "C++ vs. Python" note below.
+:func:`onnxsim.apply_pruning_finetune` now delegates to
+:func:`onnxsim.apply_pruning_finetune_cpp` (a verified C++ port); unlike
+that function, ``pruning_method="wanda"`` and
+``rotation_method="duquant"``/``"spinquant"`` remain pure-Python only --
+see this module's own "C++ vs. Python" note below.
 
 **C++ vs. Python.** The magnitude-based pruning sub-stages (stage 2's own
 default), rotation (stage 4b's own ``rotation_method="quarot"`` default),

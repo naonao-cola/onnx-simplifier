@@ -74,107 +74,12 @@ sides together) -- out of scope alongside the activation side it smooths.
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Iterable, Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.bias_correction import (
-    _activation_rows,
-    _add_probe_outputs,
-    _all_names,
-    _unique_name,
-)
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.quip_sharp import _match_matmul_like
-
-
-def _sign(w: np.ndarray) -> np.ndarray:
-    """``sign(x) = 1 if x >= 0 else -1`` -- matches :func:`onnxsim.billm._sign`
-    (not ``np.sign``, which maps exactly 0 to 0 rather than +1).
-    """
-    return np.where(w >= 0.0, 1.0, -1.0)
-
-
-def _em_two_scale_binary(
-    abs_w: np.ndarray, importance: np.ndarray, max_iters: int
-) -> Tuple[np.ndarray, float, float]:
-    """One group's Hessian-weighted 2-component binary EM (see this
-    module's own docstring): alternates a closed-form weighted-mean scale
-    update (M-step) with a nearest-scale reassignment (E-step) until the
-    assignment stops changing. Returns ``(assign, scale0, scale1)`` --
-    ``assign`` (int8, same shape as ``abs_w``) is 0/1 per element,
-    ``scale0 <= scale1`` by construction (canonicalized so the encoding is
-    deterministic regardless of which component the search happens to
-    settle into first).
-    """
-    if abs_w.size == 0:
-        return np.zeros(0, dtype=np.int8), 0.0, 0.0
-    median = float(np.median(abs_w))
-    assign = (abs_w >= median).astype(np.int64)
-    scale0 = scale1 = 0.0
-    for _ in range(max_iters):
-        mask1 = assign == 1
-        mask0 = ~mask1
-        w0, w1 = importance[mask0], importance[mask1]
-        scale0 = (
-            float(np.sum(w0 * abs_w[mask0]) / max(np.sum(w0), 1e-12))
-            if mask0.any()
-            else 0.0
-        )
-        scale1 = (
-            float(np.sum(w1 * abs_w[mask1]) / max(np.sum(w1), 1e-12))
-            if mask1.any()
-            else 0.0
-        )
-        err0 = importance * (abs_w - scale0) ** 2
-        err1 = importance * (abs_w - scale1) ** 2
-        new_assign = (err1 < err0).astype(np.int64)
-        if np.array_equal(new_assign, assign):
-            break
-        assign = new_assign
-    if scale0 > scale1:
-        assign = 1 - assign
-        scale0, scale1 = scale1, scale0
-    return assign.astype(np.int8), scale0, scale1
-
-
-def _bwa_quantize_weight(
-    w_nk: np.ndarray, hessian_diag_k: np.ndarray, group_size: int, max_iters: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Runs the Hessian-weighted two-scale binary EM over every
-    ``group_size``-column group of ``w_nk`` ([N, K], output channel
-    first). Returns ``(sign_nk, group_select_nk, scale0_g, scale1_g)``:
-    two ``[N, K]`` int8 arrays and two length-``num_groups`` float64 scale
-    arrays (one pair of scales shared by every element of a group,
-    regardless of output row -- only the sign and the group-select bit
-    vary per element).
-    """
-    n, k = w_nk.shape
-    num_groups = (k + group_size - 1) // group_size
-    sign_nk = np.empty((n, k), dtype=np.int8)
-    group_select_nk = np.empty((n, k), dtype=np.int8)
-    scale0_g = np.zeros(num_groups, dtype=np.float64)
-    scale1_g = np.zeros(num_groups, dtype=np.float64)
-
-    for gi, start in enumerate(range(0, k, group_size)):
-        end = min(start + group_size, k)
-        w_blk = w_nk[:, start:end]  # [N, gs]
-        sign_blk = _sign(w_blk)
-        abs_flat = np.abs(w_blk).ravel()
-        importance_flat = np.broadcast_to(
-            hessian_diag_k[start:end], w_blk.shape
-        ).ravel()
-        assign_flat, s0, s1 = _em_two_scale_binary(abs_flat, importance_flat, max_iters)
-        sign_nk[:, start:end] = sign_blk.astype(np.int8)
-        group_select_nk[:, start:end] = assign_flat.reshape(w_blk.shape)
-        scale0_g[gi] = s0
-        scale1_g[gi] = s1
-
-    return sign_nk, group_select_nk, scale0_g, scale1_g
+from onnxsim.calibration import Tensors
+from onnxsim.onnx_simplifier import apply_bwa_ptq_cpp
 
 
 def apply_bwa_ptq(
@@ -225,147 +130,29 @@ def apply_bwa_ptq(
             feature axis at all (rank < 2), are left untouched; a
             higher-rank ``[batch, seq, K]`` activation is flattened to
             ``[batch * seq, K]``, which is exact.
+
+    Delegates to :func:`onnxsim.apply_bwa_ptq_cpp` (the verified C++
+    port), which emits the exact same node pattern this function's own
+    docstring describes. This pure-Python name is kept for backward
+    compatibility with existing callers; ``skip_names`` is not supported
+    by the C++ port (which has no established way to plumb a denylist
+    through its own candidate search), so a non-empty value raises
+    ``ValueError`` rather than being silently ignored.
     """
+    if skip_names:
+        raise ValueError(
+            "apply_bwa_ptq now delegates to apply_bwa_ptq_cpp, which does "
+            "not support skip_names; filter candidates yourself, or call "
+            "apply_bwa_ptq_cpp directly"
+        )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    skip_names = set(skip_names) if skip_names is not None else frozenset()
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    candidates = []
-    for node in graph.node:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, _bias_name, weight_transposed = match
-        if w_name in skip_names:
-            continue
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, weight_transposed))
-
-    if not candidates:
-        return out
-
-    probe_names = sorted({c[1] for c in candidates})
-    probe_model = _add_probe_outputs(model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(result[name], dtype=np.float64))
-
-    for node, x_name, w_name, weight_transposed in candidates:
-        acts = _activation_rows(activations[x_name])
-        if not acts:
-            continue  # no usable activation (no feature axis); skip
-        x = np.concatenate(acts, axis=0)
-
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if weight_transposed else w.T  # [N, K]
-        n, k = w_nk.shape
-        if x.shape[1] != k:
-            continue  # activation's feature dim doesn't match K; skip
-
-        hessian_diag_k = np.sum(x**2, axis=0)
-        sign_nk, group_select_nk, scale0_g, scale1_g = _bwa_quantize_weight(
-            w_nk, hessian_diag_k, group_size, max_em_iters
-        )
-
-        sign_orig = sign_nk if weight_transposed else sign_nk.T
-        group_select_orig = group_select_nk if weight_transposed else group_select_nk.T
-        assert sign_orig.shape == (dim0, dim1)
-
-        scale0_full_k = np.repeat(scale0_g, group_size)[:k]
-        scale1_full_k = np.repeat(scale1_g, group_size)[:k]
-
-        # scale{0,1}_full_k are indexed along K (the reduction dim). When
-        # weight_transposed (W is [N, K], K last), they broadcast against
-        # W as-is; otherwise (W is [K, N], K first) they need a trailing
-        # size-1 axis to broadcast against axis 0 instead of axis -1.
-        if weight_transposed:
-            scale0_orig = scale0_full_k
-            scale1_orig = scale1_full_k
-        else:
-            scale0_orig = scale0_full_k[:, np.newaxis]
-            scale1_orig = scale1_full_k[:, np.newaxis]
-
-        prefix = f"{w_name}_bwa"
-        sign_name = _unique_name(f"{prefix}_sign", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(sign_orig.astype(np.int8), name=sign_name)
-        )
-        group_name = _unique_name(f"{prefix}_group_select", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                group_select_orig.astype(np.int8), name=group_name
-            )
-        )
-        scale0_name = _unique_name(f"{prefix}_scale0", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.ascontiguousarray(scale0_orig).astype(np.float32), name=scale0_name
-            )
-        )
-        scale1_name = _unique_name(f"{prefix}_scale1", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.ascontiguousarray(scale1_orig).astype(np.float32), name=scale1_name
-            )
-        )
-
-        sign_f_out = _unique_name(f"{prefix}_sign_f", taken_names)
-        sign_cast_node = onnx.helper.make_node(
-            "Cast", [sign_name], [sign_f_out], to=onnx.TensorProto.FLOAT
-        )
-        group_f_out = _unique_name(f"{prefix}_group_f", taken_names)
-        group_cast_node = onnx.helper.make_node(
-            "Cast", [group_name], [group_f_out], to=onnx.TensorProto.FLOAT
-        )
-        diff_out = _unique_name(f"{prefix}_scale_diff", taken_names)
-        sub_node = onnx.helper.make_node("Sub", [scale1_name, scale0_name], [diff_out])
-        sel_out = _unique_name(f"{prefix}_scale_sel", taken_names)
-        mul_sel_node = onnx.helper.make_node("Mul", [group_f_out, diff_out], [sel_out])
-        scale_eff_out = _unique_name(f"{prefix}_scale_eff", taken_names)
-        add_node = onnx.helper.make_node("Add", [scale0_name, sel_out], [scale_eff_out])
-        dq_out = _unique_name(f"{prefix}_dq", taken_names)
-        mul_final_node = onnx.helper.make_node(
-            "Mul",
-            [sign_f_out, scale_eff_out],
-            [dq_out],
-            name=_unique_name(f"{prefix}_dequant", taken_names),
-        )
-
-        insertion_point = next(i for i, n in enumerate(graph.node) if n is node)
-        for new_node in (
-            sign_cast_node,
-            group_cast_node,
-            sub_node,
-            mul_sel_node,
-            add_node,
-            mul_final_node,
-        ):
-            graph.node.insert(insertion_point, new_node)
-            insertion_point += 1
-
-        for i, inp in enumerate(node.input):
-            if inp == w_name:
-                node.input[i] = dq_out
-
-    return out
+    return apply_bwa_ptq_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        group_size=group_size,
+        max_em_iters=max_em_iters,
+        providers=providers,
+    )
