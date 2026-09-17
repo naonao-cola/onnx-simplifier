@@ -133,7 +133,7 @@ def test_cpp_any_precision_llm_behaves_similarly_to_python_port():
 
     py_q = onnxsim.apply_any_precision_llm(model, bits=5, max_bits=8)
     cpp_q = onnxsim.apply_any_precision_llm_cpp(model, bits=5, max_bits=8)
-    py_w = onnx.numpy_helper.to_array(py_q.graph.initializer[0]).astype(np.float64)
+    py_w = _current_weight(py_q).astype(np.float64)
     cpp_w = _current_weight(cpp_q).astype(np.float64)
 
     w64 = w.astype(np.float64)

@@ -59,6 +59,20 @@ def _rel_l2(a, b):
     return np.linalg.norm(a - b) / max(np.linalg.norm(a), 1e-9)
 
 
+def _current_weight(model, weight_input_index=1):
+    # onnxsim.apply_any_precision_llm now delegates to the verified C++
+    # port (apply_any_precision_llm_cpp), which -- like
+    # weight_only_quantize_matmul.h's own pattern -- rewires the matched
+    # node's weight input to a freshly created initializer rather than
+    # overwriting the original one in place, so the node's own current
+    # input name is the only reliable way to find the actual
+    # (post-quantization) weight, not initializer list position.
+    node = next(n for n in model.graph.node if n.op_type in ("MatMul", "Gemm"))
+    w_name = node.input[weight_input_index]
+    w_init = next(t for t in model.graph.initializer if t.name == w_name)
+    return onnx.numpy_helper.to_array(w_init)
+
+
 def test_nested_codes_satisfy_exact_shift_invariant():
     # The core algebraic claim: for every bit-width up to max_bits, that
     # bit-width's own code is exactly recoverable from the max-bit-width
@@ -93,7 +107,7 @@ def test_reconstruction_error_improves_with_more_bits():
     errors = []
     for bits in (2, 4, 6, 8):
         q = onnxsim.apply_any_precision_llm(model, bits=bits, max_bits=8)
-        new_w = onnx.numpy_helper.to_array(q.graph.initializer[0])
+        new_w = _current_weight(q)
         errors.append(
             float(np.linalg.norm(new_w.astype(np.float64) - w.astype(np.float64)))
         )
@@ -116,8 +130,8 @@ def test_low_bit_reconstruction_matches_direct_low_bit_call():
 
     direct = onnxsim.apply_any_precision_llm(model, bits=3, max_bits=3)
     via_tree = onnxsim.apply_any_precision_llm(model, bits=3, max_bits=8)
-    w_direct = onnx.numpy_helper.to_array(direct.graph.initializer[0])
-    w_tree = onnx.numpy_helper.to_array(via_tree.graph.initializer[0])
+    w_direct = _current_weight(direct)
+    w_tree = _current_weight(via_tree)
     # Same code assignment either way (both are 3-bit prefixes of the same
     # per-value split history), so the per-bin-mean reconstruction (which
     # only depends on the codes and the original values within each block)

@@ -79,16 +79,12 @@ tensor ever enters the graph.
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple, Union
 
 import numpy as np
 import onnx
-import onnx.numpy_helper
 
-from onnxsim.adaround import _node_outputs
-from onnxsim.bias_correction import _all_names, _unique_name
-from onnxsim.deepseek_fp8 import _FP8_MAX, _fp8_round_trip
-from onnxsim.mx_quantization import _match_matmul_like
+from onnxsim.onnx_simplifier import apply_daq_cpp
 
 #: The two delta-fidelity metrics the paper names, and the only values
 #: :func:`apply_daq`'s ``metric`` accepts.
@@ -119,70 +115,6 @@ def _sign_preservation_rate(a: np.ndarray, b: np.ndarray) -> float:
     if x.size == 0:
         return 0.0
     return float(np.mean(np.sign(x) == np.sign(y)))
-
-
-def _delta_score(delta_w: np.ndarray, delta_w_hat: np.ndarray, metric: str) -> float:
-    if metric == "cosine":
-        return _cosine_similarity(delta_w, delta_w_hat)
-    return _sign_preservation_rate(delta_w, delta_w_hat)
-
-
-def _search_delta_aware_scale(
-    w_post: np.ndarray, w_base: np.ndarray, metric: str
-) -> Tuple[float, float]:
-    """Coarse-to-fine search for the single scalar FP8 scale that best
-    preserves ``w_post - w_base`` under ``metric`` -- see this module's
-    own docstring. Returns ``(best_scale, best_score)``.
-    """
-    delta_w = w_post - w_base
-    scale0 = max(float(np.max(np.abs(w_post))), 1e-12) / _FP8_MAX
-
-    def evaluate(multiplier: float) -> float:
-        scale = scale0 * float(multiplier)
-        w_hat = _fp8_round_trip(w_post / scale) * scale
-        return _delta_score(delta_w, w_hat - w_base, metric)
-
-    best_multiplier = 1.0
-    best_score = -np.inf
-    # Coarse pass first, then one refinement pass around its winner. The
-    # best candidate is kept across *both* passes (the fine grid is not
-    # guaranteed to contain the coarse winner's exact multiplier once it
-    # has been re-centered, so the coarse best must not be forgotten).
-    coarse = np.geomspace(0.5, 2.0, 9)
-    for multiplier in coarse:
-        score = evaluate(float(multiplier))
-        if score > best_score:
-            best_score = score
-            best_multiplier = float(multiplier)
-
-    fine = np.linspace(best_multiplier * 0.9, best_multiplier * 1.1, 9)
-    for multiplier in fine:
-        score = evaluate(float(multiplier))
-        if score > best_score:
-            best_score = score
-            best_multiplier = float(multiplier)
-
-    return scale0 * best_multiplier, float(best_score)
-
-
-def _constant_2d_float_weight(
-    node: onnx.NodeProto, initializers: "dict[str, onnx.TensorProto]"
-) -> Optional[onnx.TensorProto]:
-    """The node's weight initializer, if it is a MatMul/vanilla-Gemm whose
-    weight is a constant 2-D float32 tensor; ``None`` otherwise.
-    """
-    match = _match_matmul_like(node)
-    if match is None:
-        return None
-    w_name, _weight_transposed = match
-    w_init = initializers.get(w_name)
-    if (
-        w_init is None
-        or w_init.data_type != onnx.TensorProto.FLOAT
-        or len(w_init.dims) != 2
-    ):
-        return None
-    return w_init
 
 
 def apply_daq(
@@ -223,65 +155,7 @@ def apply_daq(
             all-zero ``ΔW`` is left completely untouched.
     :raises ValueError: if ``metric`` is neither ``"cosine"`` nor
             ``"sign_preservation"``
+
+    Delegates to the verified C++ port (:func:`onnxsim.apply_daq_cpp`).
     """
-    if metric not in DAQ_METRICS:
-        raise ValueError(
-            f"unknown metric {metric!r}; expected one of {list(DAQ_METRICS)}"
-        )
-    if isinstance(base_model, str):
-        base_model = onnx.load(base_model, load_external_data=False)
-    if isinstance(post_trained_model, str):
-        post_trained_model = onnx.load(post_trained_model, load_external_data=False)
-    skip_names = set(skip_names) if skip_names is not None else frozenset()
-
-    out = onnx.ModelProto()
-    out.CopyFrom(post_trained_model)
-    graph = out.graph
-
-    base_by_output = _node_outputs(base_model.graph)
-    base_initializers = {t.name: t for t in base_model.graph.initializer}
-    post_initializers = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    # (node, post weight initializer, base weight initializer)
-    matched: List[Tuple[onnx.NodeProto, onnx.TensorProto, onnx.TensorProto]] = []
-    for node in graph.node:
-        if not node.output:
-            continue
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        w_name, _weight_transposed = match
-        if w_name in skip_names:
-            continue
-        w_post_init = _constant_2d_float_weight(node, post_initializers)
-        if w_post_init is None:
-            continue
-        base_node = base_by_output.get(node.output[0])
-        if base_node is None or base_node.op_type != node.op_type:
-            continue
-        w_base_init = _constant_2d_float_weight(base_node, base_initializers)
-        if w_base_init is None or list(w_base_init.dims) != list(w_post_init.dims):
-            continue
-        matched.append((node, w_post_init, w_base_init))
-
-    for node, w_post_init, w_base_init in matched:
-        w_post = onnx.numpy_helper.to_array(w_post_init).astype(np.float64)
-        w_base = onnx.numpy_helper.to_array(w_base_init).astype(np.float64)
-        # No fine-tuning update in this layer -- nothing for a
-        # delta-preserving objective to preserve, so leave it alone
-        # entirely rather than quantize it against an objective that
-        # cannot distinguish any two candidates.
-        if float(np.linalg.norm(w_post - w_base)) < 1e-12:
-            continue
-
-        best_scale, _best_score = _search_delta_aware_scale(w_post, w_base, metric)
-        w_quant = _fp8_round_trip(w_post / best_scale) * best_scale
-
-        new_w_name = _unique_name(f"{w_post_init.name}_daq", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(w_quant.astype(np.float32), name=new_w_name)
-        )
-        node.input[1] = new_w_name
-
-    return out
+    return apply_daq_cpp(base_model, post_trained_model, metric, skip_names)

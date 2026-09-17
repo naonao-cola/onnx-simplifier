@@ -65,6 +65,7 @@ import onnx.numpy_helper
 
 from onnxsim.bias_correction import _all_names, _unique_name
 from onnxsim.llm_int8 import _match_matmul_like
+from onnxsim.onnx_simplifier import apply_fp6_llm_quantization_cpp
 
 _BLOCK_SIZE = 64
 
@@ -127,6 +128,15 @@ def apply_fp6_llm_quantization(
     FP6-LLM's 6-bit floating-point format -- see this module's own
     docstring.
 
+    Delegates to the verified C++ port
+    (:func:`onnxsim.apply_fp6_llm_quantization_cpp`) only when its own
+    scope exactly covers this call -- ``fmt="e3m2"``, ``include_conv=False``,
+    and no ``skip_names`` -- since that port implements only the paper's
+    primary E3M2 format and matches MatMul/vanilla-Gemm only (never
+    ``Conv``). Any other call (including the default ``include_conv=True``)
+    falls back to this module's own original pure-Python implementation
+    (:func:`_apply_fp6_llm_quantization_python`).
+
     :param model: the original (unquantized) onnx ModelProto or file path
     :param fmt: ``"e3m2"`` (default, the paper's primary weight format) or
             ``"e2m3"``
@@ -135,6 +145,19 @@ def apply_fp6_llm_quantization(
     :returns: ``model`` with every matched layer's weight replaced by its
             FP6 round trip
     """
+    if fmt == "e3m2" and not include_conv and not skip_names:
+        if isinstance(model, str):
+            model = onnx.load(model, load_external_data=False)
+        return apply_fp6_llm_quantization_cpp(model)
+    return _apply_fp6_llm_quantization_python(model, fmt, include_conv, skip_names)
+
+
+def _apply_fp6_llm_quantization_python(
+    model: Union[str, onnx.ModelProto],
+    fmt: str = "e3m2",
+    include_conv: bool = True,
+    skip_names: Optional[Iterable[str]] = None,
+) -> onnx.ModelProto:
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
     skip_names = set(skip_names) if skip_names is not None else frozenset()

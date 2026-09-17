@@ -85,7 +85,7 @@ import numpy as np
 import onnx
 import onnx.numpy_helper
 
-from onnxsim.llm_int8 import _match_matmul_like
+from onnxsim.onnx_simplifier import apply_any_precision_llm_cpp
 
 
 def _nested_bitplane_codes(values: np.ndarray, max_bits: int) -> np.ndarray:
@@ -174,48 +174,18 @@ def apply_any_precision_llm(
             by its ``bits``-bit nested-quantization float32
             quantize-dequantize round trip. Layers with a non-constant,
             non-2-D weight are left untouched.
+
+    Delegates to the verified C++ port
+    (:func:`onnxsim.apply_any_precision_llm_cpp`), which has full
+    parameter parity with this function (``bits``/``max_bits``/
+    ``block_size`` all supported). The only difference: the C++ port's own
+    per-bin bisection groups indices via a hash map rather than numpy's own
+    reduction order, so results are not expected to match this module's
+    original pure-Python implementation bit-for-bit -- only to be
+    similarly accurate (an accepted, documented divergence).
     """
     if not (1 <= bits <= max_bits):
         raise ValueError(f"bits ({bits}) must be in [1, max_bits={max_bits}]")
     if isinstance(float_model, str):
         float_model = onnx.load(float_model, load_external_data=False)
-
-    initializer_map = {t.name: t for t in float_model.graph.initializer}
-    candidates = []  # (w_init, weight_transposed)
-    for node in float_model.graph.node:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        _x_name, w_name, _bias_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((w_init, weight_transposed))
-    if not candidates:
-        return float_model
-
-    out = onnx.ModelProto()
-    out.CopyFrom(float_model)
-    out_initializer_map = {t.name: t for t in out.graph.initializer}
-
-    for w_init, weight_transposed in candidates:
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_nk = w if weight_transposed else w.T  # [N, K], output-channel first
-
-        quant_nk = np.empty_like(w_nk)
-        for i in range(w_nk.shape[0]):
-            quant_nk[i, :] = _quantize_channel_nested(
-                w_nk[i, :], bits, max_bits, block_size
-            )
-        quant = quant_nk if weight_transposed else quant_nk.T
-
-        out_init = out_initializer_map[w_init.name]
-        out_init.CopyFrom(
-            onnx.numpy_helper.from_array(quant.astype(np.float32), name=w_init.name)
-        )
-
-    return out
+    return apply_any_precision_llm_cpp(float_model, bits, max_bits, block_size)
