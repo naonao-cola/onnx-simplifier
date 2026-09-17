@@ -160,16 +160,18 @@ jobs:
     container: ubuntu:22.04
     timeout-minutes: 30
     steps:
-      # The bare ubuntu:22.04 image has neither git nor Python -- actions/
-      # checkout needs the former (it exec's a real git binary inside the
-      # container, unlike the runner-hosted jobs above where it's
+      # The bare ubuntu:22.04 image has neither git, Python, nor a C compiler
+      # -- actions/checkout needs the former (it exec's a real git binary
+      # inside the container, unlike the runner-hosted jobs above where it's
       # preinstalled). ubuntu:22.04 ships Python 3.10 as its default python3,
       # exactly the one version tpu_mlir's wheel supports
-      # (python_requires=">=3.10,<3.11").
-      - name: Install git + Python 3.10
+      # (python_requires=">=3.10,<3.11"). build-essential is needed because
+      # tpu_mlir[onnx] pulls in pycocotools, which has no prebuilt wheel for
+      # this platform and compiles a Cython extension (_mask.pyx) from source.
+      - name: Install git + Python 3.10 + build tools
         run: |
           apt-get update -qq
-          apt-get install -y --no-install-recommends git ca-certificates python3 python3-pip python3-venv
+          apt-get install -y --no-install-recommends git ca-certificates python3 python3-pip python3-venv build-essential
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:

@@ -50,6 +50,7 @@ Then, with the YOLOX checkout on PYTHONPATH:
         --download --weights-dir yolox-weights --workdir tpu-mlir-reg-work \
         --opset 13 --output tpu-mlir-regression.csv
 """
+
 import argparse
 import csv
 import json
@@ -61,13 +62,14 @@ import urllib.request
 
 import numpy as np
 import onnx
-import onnxsim
 import torch
 from onnx.reference import ReferenceEvaluator
 from torch import nn
 from yolox.exp import get_exp
 from yolox.models.network_blocks import SiLU
 from yolox.utils import replace_module
+
+import onnxsim
 
 # variant name -> release weight file (same official checkpoints as
 # scripts/regression/yolox/run_yolox_regression.py)
@@ -105,9 +107,13 @@ def export_raw(exp_name, ckpt_path, out_path, opset):
     model.head.decode_in_inference = False
     dummy = torch.randn(1, 3, exp.test_size[0], exp.test_size[1])
     torch.onnx.export(
-        model, dummy, out_path,
-        input_names=["images"], output_names=["output"],
-        opset_version=opset, dynamo=False,
+        model,
+        dummy,
+        out_path,
+        input_names=["images"],
+        output_names=["output"],
+        opset_version=opset,
+        dynamo=False,
     )
     return exp.test_size
 
@@ -156,7 +162,9 @@ def run_one(exp_name, ckpt_path, workdir, opset):
         feed = {"images": rng.rand(1, 3, *test_size).astype(np.float32)}
 
         t0 = time.perf_counter()
-        tpu_out = run_through_tpu_mlir(model_simp, f"{exp_name}_tpu_mlir", workdir, feed)
+        tpu_out = run_through_tpu_mlir(
+            model_simp, f"{exp_name}_tpu_mlir", workdir, feed
+        )
         rec["tpu_mlir_seconds"] = round(time.perf_counter() - t0, 2)
 
         ref_out = ReferenceEvaluator(raw).run(None, feed)[0]
@@ -189,9 +197,19 @@ def main():
         print(json.dumps(rec, indent=2), flush=True)
         rows.append(rec)
 
-    fields = ["variant", "opset", "input_hw", "raw_nodes", "simp_nodes",
-              "reduction_pct", "onnxsim_valid", "seconds",
-              "tpu_mlir_status", "tpu_mlir_seconds", "error"]
+    fields = [
+        "variant",
+        "opset",
+        "input_hw",
+        "raw_nodes",
+        "simp_nodes",
+        "reduction_pct",
+        "onnxsim_valid",
+        "seconds",
+        "tpu_mlir_status",
+        "tpu_mlir_seconds",
+        "error",
+    ]
     with open(args.output, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -199,7 +217,9 @@ def main():
             w.writerow({k: r.get(k, "") for k in fields})
     print(f"\nWrote {args.output}", flush=True)
 
-    failed = [r for r in rows if not r.get("onnxsim_valid") or r["tpu_mlir_status"] != "ok"]
+    failed = [
+        r for r in rows if not r.get("onnxsim_valid") or r["tpu_mlir_status"] != "ok"
+    ]
     print(f"\nSUMMARY: {len(rows) - len(failed)}/{len(rows)} passed onnxsim + tpu-mlir")
     return 1 if failed else 0
 
