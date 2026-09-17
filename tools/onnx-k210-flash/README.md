@@ -61,14 +61,29 @@ opposite fact permanently, so the same mistake can't silently come back.
 Tested this session against a real Sipeed Maix Amigo (`/dev/ttyUSB1` on its
 Sipeed dual-UART FTDI adapter -- the *same* physical UART handles both the
 ISP protocol and the runtime's own console output, not two separate
-channels). Driven via `kflash` (the Python reference tool this port
-mirrors) rather than `k210_isp.mjs`/`web/index.html` directly, since this
-session's browser tooling runs on a different machine than the one the
-board is physically attached to -- Web Serial can only see devices
-attached to the browser's own machine, so that gap couldn't be closed
-here regardless of network access; see the same limitation noted for
-`onnx-cardputer-flash`'s convertmodel monitor panel. Real, hardware-verified
-findings:
+channels).
+
+**Two testing methods, in two separate rounds.** The first round used
+`kflash` (the Python reference tool this port mirrors) directly, because
+that session's browser tooling ran on a different machine than the one the
+board was physically attached to -- Web Serial only sees devices attached
+to the browser's own machine, so that gap couldn't be closed regardless of
+network access (findings #1-#5 below). The second round closed that gap a
+different way: rather than a browser, a small Node.js harness
+(`serialport` npm package wrapped in a Web-Serial-`SerialPort`-compatible
+shim -- `open()`/`readable`/`writable`/`setSignals()`/`close()`, exactly
+what `k210_isp.mjs` calls) runs **the actual, unmodified `k210_isp.mjs`
+file** against the real board, imported directly from this repo -- not a
+reimplementation, not kflash.py standing in for it. This is how findings
+#6-#8 were found: real bugs in this SDK's own code, invisible to the
+kflash.py-based testing above since that never executes this file at all.
+The harness isn't part of this repo (a throwaway scratch script), but the
+technique -- any environment with Node and a real serial port can drive
+this SDK's real browser code path, no Chrome required -- is worth knowing
+about for anyone continuing this without a browser on the right machine
+either.
+
+Real, hardware-verified findings:
 
 **Finding #1 (real bug in this port, not just kflash.py): `k210_isp.mjs`
 excludes the one reset scheme this real board needed.** kflash's
@@ -160,6 +175,95 @@ correctly (`0x4b4d444c`), execution enters `interp.load_model()`, and it
 (would need real debugging inside nncase v1's K210 runtime itself --
 KPU peripheral programming, DMA descriptor setup, etc.) -- see
 `firmware/runtime/README.md`'s "Status" for the full writeup.
+
+**Finding #6 (real bug, fixed and verified): `disconnect()` can hang
+forever after any failed or quiet connection.** Confirmed by running
+`k210_isp.mjs` itself (via the Node harness above) with `resetScheme:
+"dan"` -- the wrong scheme for this board's DTR/RTS wiring (see finding
+#1): `enterISPMode()` correctly failed fast, but the following
+`disconnect()` call never returned. Root cause: `disconnect()` called
+`this.port.readable.cancel()` while `_readLoop()` still held that same
+stream's reader (from `getReader()`, never released until the loop's own
+`reader.read()` settles) -- and per the WHATWG Streams spec,
+`ReadableStream.cancel()` on a stream with a checked-out reader always
+throws ("Invalid state: ReadableStream is locked"), confirmed directly in
+Node with no serial port involved at all, so this isn't a shim quirk or a
+browser-specific quirk -- it's the same in every JS engine. That throw was
+silently swallowed by the surrounding `try {} catch {}`, leaving
+`_readLoop()`'s pending `reader.read()` unresolved forever whenever the
+port had gone quiet (any failed connection attempt, reliably; a successful
+one too, if nothing arrives right after). **Fixed**: `_readLoop()` now
+stores the reader it holds (`this._reader`), and `disconnect()` cancels
+*that* instead of the stream -- canceling via the reader that holds the
+lock is well-defined and doesn't throw. Verified: the same failing-scheme
+test that used to hang indefinitely now disconnects cleanly and quickly.
+
+**Finding #7 (real bug, fixed but still not achieving its goal on this
+board): `flashErase()` sent an op the stub never responds to; the
+non-blocking replacement doesn't get a valid response either.** The
+previous `flashErase()` sent `FLASH_ERASE` (0xd3) and waited up to 10s (a
+value this file's own comment already flagged as probably too short).
+Bumping that timeout to 90s (kflash.py's own value for the *different*
+erase op it actually uses) still got **no response at all** -- confirmed
+via the Node harness. Looking at kflash.py more closely: it never actually
+sends 0xd3 in its own default code path either -- it always uses
+`FLASH_ERASE_NONBLOCKING` (0xd8) followed by polling `FLASH_STATUS` (0xd9)
+every 5s until it stops reporting busy, both with 90s per-attempt
+timeouts. Ported that exact two-phase protocol into `flashErase()`
+(`_eraseSendCommand()` + `_erasePollStatus()`, including kflash.py's own
+behavior of resetting the retry budget -- not counting against it -- on a
+busy response). Against this real board, the 0xd8 command *does* get a
+response, but with `reason=0x00` (`ISP_RET_DEFAULT` in kflash.py's own
+enum) -- neither `RET_OK` (0xe0) nor `RET_FLASH_BUSY` (0xe7), a response
+kflash.py's own logic would equally treat as invalid. So even kflash.py's
+real, working erase protocol isn't recognized as successful by this
+board's flash-mode stub. Consistent with finding #4 (skip-erase is safe
+because `FLASH_WRITE` erases its own sectors): explicit erase may simply
+not be something this stub build supports at all. `flashFirmware()`'s
+`skipErase` default is now **`true`** (was `false`) -- matching what
+actually works on real hardware rather than kflash.py's own default,
+which doesn't -- and `web/index.html`'s "skip erase" checkbox now starts
+checked to match.
+
+**Finding #8 (real bug found and precisely diagnosed, one real cause
+fixed, still open): `writeFirmware()`'s header byte was wrong, and
+`FLASH_WRITE` still doesn't get a response on real hardware even after
+fixing it.** Reading kflash.py's `flash_firmware()` closely: the header
+byte this SDK's comment called "no AES encryption" (hardcoded to `0x00`)
+is not only an AES flag -- kflash.py ORs bit `0x02` into it whenever
+`io_mode == "dio"`, which is kflash.py's default *and* the only mode this
+SDK has ever targeted (there's no separate QIO path here). Sending `0x00`
+silently told the flash-mode stub the opposite of the truth on every real
+write. **Fixed**: the byte is now `0x02` (DIO, no AES) -- a real,
+source-verified correctness fix, kept regardless of the rest of this
+finding. It did not, by itself, fix real writes: `FLASH_WRITE` (0xd4)
+against this board still gets **no response at all**, tested from a few
+seconds up to a patient 280s wait, for both the real ~1MB runtime image
+and a minimal single 64KiB padded chunk written to an untouched flash
+region. Real alternate causes investigated and ruled out, not just
+assumed: (a) *the Node shim silently truncating or not flushing large
+writes* -- disproved by instrumenting the shim's write path, which showed
+the full, correctly-sized buffer (e.g. 65554 bytes after SLIP framing)
+handed to the underlying serial write, and by adding an explicit
+`.drain()` after `write()` (Node's `serialport.write()` callback fires
+once a buffer is *accepted*, not once it's actually left the OS's output
+buffer -- a real gap for a ~64KiB write, though not the fix here); (b)
+*the protocol framing itself being wrong* -- checked line-by-line against
+kflash.py's `dump_to_flash()`, including the CRC32 coverage (over
+address+length+data together, matching exactly) and chunk size (64KiB,
+matching exactly). What's notable: the *ISP-stage* stub upload (also many
+sequential writes over the same link, just smaller -- 1KiB chunks) is
+completely reliable (5/5 clean runs, finding #1), while every *flash-stage*
+64KiB write gets no response at all, on the same physical link, same
+board, same session. That size-correlated split is real signal for
+whoever picks this up next, not yet run to ground: something specific to
+a full 64KiB single write -- not the protocol logic, not (as far as this
+session could tell) the transport layer moving the bytes -- is the
+remaining gap. Note finding #2's successful full flash-write went through
+`kflash` (Python) directly, not this file -- it doesn't demonstrate
+`writeFirmware()` working, only that a 64KiB-chunked write *can* succeed
+against this exact board over this exact link when the reference
+implementation sends it.
 
 `chip-type` (in-chip vs on-board flash) wasn't separately varied this
 session -- `in-chip` (the default) is what every write above used, and it
@@ -260,16 +364,20 @@ hardware" above is for.
 
 ## Not done / follow-ups
 
-- **Verifying "skip erase" is actually safe.** `firmware/runtime/` (the
-  on-device kmodel runtime, now built and real -- see its own README) can
-  only have its model swapped without re-flashing the firmware itself if
-  the flash-mode stub's `FLASH_WRITE` erases its own target sectors
-  before programming them. That's plausible (a common embedded NOR-flash
-  driver convenience) but unverified -- the stub is an opaque vendored
-  binary with no available source, and there's no K210 board here to test
-  it against. `firmware/runtime/README.md`'s "Flashing a model without
-  re-erasing" section has the real workflow this needs (and a safe
-  fallback) until someone with hardware confirms one way or the other.
+- **Root-cause why `k210_isp.mjs`'s `writeFirmware()` gets no response
+  from the flash-mode stub on real hardware** (finding #8) -- the header
+  byte bug is fixed, but `FLASH_WRITE` (0xd4) still never gets a response,
+  for both a real ~1MB image and a single padded 64KiB chunk, despite the
+  *ISP-stage* stub upload (many small 1KiB writes over the same link)
+  being completely reliable. The size-correlated split (small writes:
+  fine; the one write size that matters for this SDK: never responds) is
+  the strongest lead so far. A byte-for-byte comparison of what kflash.py
+  actually puts on the wire for one real 64KiB chunk (e.g. via a serial
+  sniffer, or logging kflash.py's own `self._port.write()` calls) against
+  what `k210_isp.mjs` sends for the identical chunk would be the direct
+  way to settle whether anything else about the framing still differs.
+  `Verifying "skip erase" is actually safe` (this bullet's old text) is
+  now done -- see findings #4 and #7.
 - **nncase compiled to WASM**, so this conversion step could run in-browser
   like `onnx-cardputer-flash`'s simplify/quantize step already does --
   deliberately deferred. A source-level check (grepping nncase's actual

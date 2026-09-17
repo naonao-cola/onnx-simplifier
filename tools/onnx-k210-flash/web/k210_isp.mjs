@@ -48,13 +48,17 @@ const ISP_OP = {
 const FLASH_OP = {
   DEBUG_INFO: 0xd1,
   NOP: 0xd2,
-  FLASH_ERASE: 0xd3,
+  FLASH_ERASE: 0xd3, // kflash.py defines this but never actually sends it (see flashErase()'s own comment)
   FLASH_WRITE: 0xd4,
   REBOOT: 0xd5,
   BAUDRATE_SET: 0xd6,
   FLASH_INIT: 0xd7,
+  FLASH_ERASE_NONBLOCKING: 0xd8,
+  FLASH_STATUS: 0xd9,
 };
 const RET_OK = 0xe0;
+const RET_FLASH_BUSY = 0xe7;
+const ERASE_POLL_INTERVAL_MS = 5000; // kflash.py's own erase-status poll interval
 
 // greeting()/flash_greeting()/flash_erase() in kflash.py send a hardcoded
 // raw literal frame directly (`self._port.write(...)`), bypassing its own
@@ -225,6 +229,7 @@ export class K210Loader {
     this._frameQueue = [];
     this._waiters = [];
     this._writer = null;
+    this._reader = null;
     this._readLoopPromise = null;
     this._closed = false;
   }
@@ -248,7 +253,20 @@ export class K210Loader {
       // ignore -- port may already be gone
     }
     try {
-      if (this.port.readable) await this.port.readable.cancel();
+      // Must cancel via the *reader* _readLoop() holds, not the stream
+      // itself: ReadableStream.cancel() throws "stream is locked" whenever
+      // a reader is checked out (getReader() was called and releaseLock()
+      // hasn't run yet -- standard Streams semantics, not Web-Serial-
+      // specific, so this isn't a browser-only quirk). That throw used to
+      // be silently swallowed here, leaving _readLoop()'s pending
+      // reader.read() unresolved forever whenever the port had gone quiet
+      // (e.g. right after a failed enterISPMode()) -- disconnect() would
+      // hang indefinitely waiting on _readLoopPromise below. Found by
+      // running this file against real hardware from Node (no browser on
+      // that machine could reach the attached board), which surfaced the
+      // hang directly; confirmed the exact cause by checking
+      // ReadableStream.cancel()-while-locked semantics in isolation.
+      if (this._reader) await this._reader.cancel();
     } catch {
       // ignore
     }
@@ -266,6 +284,7 @@ export class K210Loader {
 
   async _readLoop() {
     const reader = this.port.readable.getReader();
+    this._reader = reader;
     try {
       while (!this._closed) {
         const { value, done } = await reader.read();
@@ -282,6 +301,7 @@ export class K210Loader {
       } catch {
         // ignore
       }
+      this._reader = null;
     }
   }
 
@@ -421,22 +441,90 @@ export class K210Loader {
     throw new Error("failed to initialize K210 flash");
   }
 
+  // Full-chip erase, via the non-blocking erase (0xd8) + status poll (0xd9)
+  // dance -- kflash.py's own default and only path for this, ported here
+  // exactly (including retrying the erase command itself, not just
+  // polling, while it reports busy: kflash.py's real behavior, not an
+  // embellishment). The simpler-looking blocking FLASH_ERASE (0xd3,
+  // FLASH_ERASE_FRAME above) that this method used to send instead is
+  // defined in kflash.py's own protocol enum but never actually sent
+  // anywhere in kflash.py itself -- and confirmed here, against a real
+  // Sipeed Maix Amigo (via Node + a Web-Serial-compatible shim, since no
+  // browser in that session's environment could reach the board), to
+  // never produce a response at all (no response within 90s). See
+  // ../README.md's "Testing against real hardware" for the write-up.
   async flashErase() {
-    await this._writer.write(FLASH_ERASE_FRAME);
-    const { reason } = parseResponse(await this._readFrame(10000)); // full-chip erase is slow
-    if (reason !== RET_OK) throw new Error(`flash erase failed (reason 0x${reason.toString(16)})`);
+    await this._eraseSendCommand();
+    await this._erasePollStatus();
+  }
+
+  async _eraseSendCommand() {
+    let retryCount = 0;
+    for (;;) {
+      await this._send(FLASH_OP.FLASH_ERASE_NONBLOCKING, concatBytes(u32le(0), u32le(0)));
+      retryCount++;
+      let resp;
+      try {
+        resp = parseResponse(await this._readFrame(90000));
+      } catch {
+        if (retryCount > MAX_RETRY_TIMES) throw new Error("failed to communicate with K210 (erase command)");
+        continue;
+      }
+      if (resp.op === FLASH_OP.FLASH_ERASE_NONBLOCKING && resp.reason === RET_OK) return;
+      if (resp.op === FLASH_OP.FLASH_ERASE_NONBLOCKING && resp.reason === RET_FLASH_BUSY) {
+        retryCount = 0; // busy doesn't count against the retry budget, same as kflash.py
+        await sleep(ERASE_POLL_INTERVAL_MS);
+        continue;
+      }
+      if (retryCount > MAX_RETRY_TIMES) throw new Error("failed to erase K210 flash (unexpected response to erase command)");
+    }
+  }
+
+  async _erasePollStatus() {
+    let retryCount = 0;
+    for (;;) {
+      await this._send(FLASH_OP.FLASH_STATUS, new Uint8Array(0));
+      retryCount++;
+      let resp;
+      try {
+        resp = parseResponse(await this._readFrame(90000));
+      } catch {
+        if (retryCount > MAX_RETRY_TIMES) throw new Error("failed to communicate with K210 (erase status)");
+        continue;
+      }
+      if (resp.op === FLASH_OP.FLASH_STATUS && resp.reason === RET_OK) return;
+      if (resp.op === FLASH_OP.FLASH_STATUS && resp.reason === RET_FLASH_BUSY) {
+        retryCount = 0;
+        await sleep(ERASE_POLL_INTERVAL_MS);
+        continue;
+      }
+      if (retryCount > MAX_RETRY_TIMES) throw new Error("failed to erase K210 flash (unexpected erase-status response)");
+    }
   }
 
   // Writes `firmwareBytes` to flash starting at `addressOffset`, framed
-  // exactly as kflash.py's flash_firmware() does: [aes_flag=0x00][len u32 LE]
+  // exactly as kflash.py's flash_firmware() does: [header byte][len u32 LE]
   // [firmware bytes][SHA-256 of the three previous fields] -- kflash.py
   // computes that hash with Python's hashlib.sha256; this uses the
   // browser's Web Crypto SubtleCrypto.digest for the same SHA-256, not a
   // vendored implementation. The result is split into 64KiB chunks
   // (zero-padded on the last one) and each chunk is written with
   // FLASH_WRITE (0xd4) at chunk_index * 64KiB + addressOffset.
+  //
+  // The header byte is NOT simply an AES-enabled flag, despite kflash.py's
+  // own variable name (aes_cipher_flag): kflash.py sets bit 0x01 for AES
+  // (irrelevant here -- this SDK never encrypts) but ALSO ORs bit 0x02
+  // into it whenever io_mode == "dio" -- which is kflash.py's default and
+  // the *only* mode this SDK ever uses (there is no separate QIO code path
+  // here). A previous version of this method hardcoded this byte to
+  // 0x00, silently telling the flash-mode stub QIO instead of DIO on every
+  // real write -- confirmed to make FLASH_WRITE hang/fail against a real
+  // Sipeed Maix Amigo (via Node + a Web-Serial-compatible shim; see
+  // ../README.md's "Testing against real hardware" for the write-up of
+  // how this was actually found, and the erase-protocol/timeout fixes
+  // alongside it).
   async writeFirmware(firmwareBytes, { addressOffset = 0, onProgress = () => {} } = {}) {
-    const aesFlag = new Uint8Array([0x00]); // no AES encryption
+    const aesFlag = new Uint8Array([0x02]); // DIO mode (bit 0x02), no AES encryption (bit 0x01)
     const lenField = u32le(firmwareBytes.length);
     const withoutHash = concatBytes(aesFlag, lenField, firmwareBytes);
     const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", withoutHash));
@@ -453,11 +541,23 @@ export class K210Loader {
       const address = i * FLASH_WRITE_CHUNK + addressOffset;
       const body = concatBytes(u32le(address), u32le(padded.length), padded);
       let ok = false;
+      // kflash.py's dump_to_flash() uses a 90s per-attempt timeout here
+      // (this used to be 3000ms -- "kflash.py widens this timeout", noted
+      // but not actually done -- confirmed against real hardware, via
+      // Node + a Web-Serial-compatible shim, that programming a real 64KiB
+      // chunk genuinely needs much longer than 3s) and explicitly handles
+      // a busy response by resetting its retry budget and waiting, rather
+      // than immediately hammering the stub again -- both ported here.
       for (let attempt = 0; attempt <= MAX_RETRY_TIMES && !ok; attempt++) {
         await this._send(FLASH_OP.FLASH_WRITE, body);
         try {
-          const { reason } = parseResponse(await this._readFrame(3000)); // kflash.py widens this timeout for the actual write loop
-          ok = reason === RET_OK;
+          const { reason } = parseResponse(await this._readFrame(90000));
+          if (reason === RET_OK) {
+            ok = true;
+          } else if (reason === RET_FLASH_BUSY) {
+            attempt = -1; // reset the retry budget, same as kflash.py
+            await sleep(500);
+          }
         } catch {
           // timeout -- retry this chunk
         }
@@ -472,25 +572,32 @@ export class K210Loader {
   // init(+erase) flash, write the firmware, then reset into it. `stubBytes`
   // is normally isp_stub.bin fetched alongside this module.
   //
-  // `skipErase` (default false -- erase runs): FLASH_ERASE (0xd3) has no
-  // address/range parameter at the protocol level -- kflash.py's own
-  // flash_erase() sends the same fixed, args-less frame this SDK's
-  // FLASH_ERASE_FRAME does -- so it is a **full-chip** erase, not a
-  // range erase. Calling flashFirmware() twice at two different
-  // addressOffsets (e.g. a runtime image at 0x0, then a model at
-  // 0x00C00000, per onnx-k210-flash/firmware/runtime/README.md's flash
-  // layout) with the default skipErase=false would erase the first
-  // write before the second one's write ever happens. skipErase=true
-  // writes without erasing first -- correct only if the flash-mode
-  // stub's own FLASH_WRITE (0xd4) implementation erases the sectors it's
-  // about to program itself before writing them (a common convenience in
-  // embedded NOR-flash write helpers, but NOT verified here: this
-  // session has no K210 board to check it against, and the ISP stub is
-  // an opaque vendored binary with no available source -- see
-  // ../README.md's "Flashing a model without re-erasing" section before
-  // relying on this for anything other than a first careful hardware
-  // test).
-  async flashFirmware(stubBytes, firmwareBytes, { chipType = 0, addressOffset = 0, skipErase = false, onStage = () => {}, onProgress = () => {} } = {}) {
+  // `skipErase` (default **true** -- see below): flashErase()'s erase-all
+  // command (addr=0, len=0, matching kflash.py's own flash_erase() default
+  // args) has no way to target a range -- it's a **full-chip** erase.
+  // Calling flashFirmware() twice at two different addressOffsets (e.g. a
+  // runtime image at 0x0, then a model at 0x00C00000, per
+  // onnx-k210-flash/firmware/runtime/README.md's flash layout) with
+  // skipErase=false would erase the first write before the second one's
+  // write ever happens -- one reason to prefer skipErase=true regardless.
+  // skipErase=true writes without erasing first -- **verified safe against
+  // a real Sipeed Maix Amigo**: real, hardware-confirmed evidence (an
+  // accidental firmware-corrupting write followed by a correct re-write,
+  // both without an explicit erase, producing byte-correct firmware; a
+  // model write at 0x00C00000 leaving separately-flashed firmware at 0x0
+  // untouched) shows the flash-mode stub's own FLASH_WRITE (0xd4) does
+  // erase the sectors it's about to program before writing them -- see
+  // ../README.md's "Testing against real hardware", finding #4, and
+  // "Flashing a model without re-erasing" in firmware/runtime/README.md
+  // for the full write-up. The default here is `true`, not kflash.py's own
+  // default of running a real erase, because -- also confirmed against
+  // real hardware this session -- neither erase command variant
+  // (FLASH_ERASE 0xd3, or the non-blocking FLASH_ERASE_NONBLOCKING 0xd8
+  // this method now sends, matching kflash.py's own real behavior exactly)
+  // gets a response this stub recognizes as success on this board; skip it
+  // rather than fail flashFirmware() by default over a step that isn't
+  // needed anyway.
+  async flashFirmware(stubBytes, firmwareBytes, { chipType = 0, addressOffset = 0, skipErase = true, onStage = () => {}, onProgress = () => {} } = {}) {
     onStage("entering ISP mode");
     await this.enterISPMode();
     onStage("uploading flash-mode stub");

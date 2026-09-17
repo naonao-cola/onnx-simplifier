@@ -95,9 +95,9 @@
   <input type="text" id="flash-address" value="0x0" size="10" title="0x0 for the runtime firmware; 0x00C00000 for a model (see firmware/runtime/README.md's flash layout).">
   <span class="note">(<code>0x0</code> for the runtime firmware; <code>0x00C00000</code> for a model)</span>
   <br><br>
-  <input type="checkbox" id="skip-erase">
-  <label for="skip-erase" title="FLASH_ERASE has no address range -- it always erases the WHOLE chip. Leave this unchecked (the safe default: erase, then write) unless you are specifically re-flashing a model onto a board whose runtime firmware is already correctly flashed and you are testing, on real hardware, whether the flash-mode stub's own write command erases-before-programming on its own. Not verified here either way -- see the K210 tool's README.">
-    skip erase (only after you've confirmed on real hardware that writing a model doesn't need it -- see README)
+  <input type="checkbox" id="skip-erase" checked>
+  <label for="skip-erase" title="FLASH_ERASE has no address range -- it always erases the WHOLE chip, so it isn't safe to leave on when writing a model at a non-zero address without also re-flashing the runtime afterward. Checked by default because, confirmed against a real Sipeed Maix Amigo: neither erase command variant this SDK can send gets a response this board's flash-mode stub recognizes as success, while writing without erasing first works correctly (the stub's own FLASH_WRITE erases the sectors it programs on its own) -- see the K210 tool's README, 'Testing against real hardware'. Uncheck only if you specifically need a full-chip erase and are prepared for it to likely just fail.">
+    skip erase (checked by default -- erase itself doesn't work on real hardware tested so far; see README)
   </label>
   <br><br>
   <label for="chip-type">flash location</label>
