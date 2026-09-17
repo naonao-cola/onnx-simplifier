@@ -143,41 +143,19 @@ def test_cpp_beats_naive_single_scale_int4_on_clustered_weight():
 
 
 def test_cpp_behaves_similarly_to_python_port():
-    # Not required to be bit-for-bit identical (see
-    # passes/kmeans_quantization.h's own documented divergence note), but
-    # for a weight tensor with plenty of distinct values (so the
-    # too-few-distinct-percentiles fallback never triggers on either
-    # side), initialization is fully deterministic and identical between
-    # the two ports, so Lloyd's algorithm is expected to converge to
-    # matching codebooks up to ordinary floating-point summation-order
-    # noise.
+    # onnxsim.quantize_weight_only_kmeans itself now delegates directly to
+    # this same C++ port (see onnxsim/kmeans_quantization.py), so the two
+    # names are expected to produce byte-identical output for the default
+    # parameters both sides now share -- this is no longer an independent
+    # cross-check of two different implementations, just a guard against
+    # the two entry points silently drifting apart.
     rng = np.random.default_rng(4)
     w = rng.standard_normal((64, 8)).astype(np.float32) * 0.5
     model = _matmul_model(w, K=64, N=8)
 
     py_q = onnxsim.quantize_weight_only_kmeans(model)
     cpp_q = onnxsim.apply_kmeans_quantization_cpp(model)
-
-    # The Python port keeps the codebook/codes split visible in the graph
-    # (Gather(Codebook, Cast(Codes, INT64))); the C++ port folds straight
-    # to a replacement float32 initializer (see this header's own scope
-    # note). Reconstruct the Python side's own dequantized weight
-    # directly from its codebook/codes initializers instead.
-    py_codebook = onnx.numpy_helper.to_array(
-        next(t for t in py_q.graph.initializer if t.name.endswith("_codebook"))
-    )
-    py_codes = onnx.numpy_helper.to_array(
-        next(t for t in py_q.graph.initializer if t.name.endswith("_codes"))
-    )
-    py_w = py_codebook[py_codes.astype(np.int64)].astype(np.float64)
-
-    cpp_w = _current_weight(cpp_q).astype(np.float64)
-    w64 = w.astype(np.float64)
-
-    py_err = np.linalg.norm(py_w - w64)
-    cpp_err = np.linalg.norm(cpp_w - w64)
-    assert cpp_err < np.linalg.norm(w64) * 0.5
-    assert cpp_err < py_err * 1.5 and py_err < cpp_err * 1.5
+    assert py_q.SerializeToString() == cpp_q.SerializeToString()
 
 
 def test_cpp_gemm_with_bias():

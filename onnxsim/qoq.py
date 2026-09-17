@@ -82,43 +82,10 @@ import onnx.helper
 import onnx.numpy_helper
 
 from onnxsim import backend
-from onnxsim.adaround import _pack_int4
 from onnxsim.attention_quantization import _find_attention_candidates
 from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
 from onnxsim.calibration import Tensors, generate_random_calibration_data
-
-_EPS = 1e-12
-
-
-def _match_matmul_like(node: onnx.NodeProto):
-    """Mirrors ``MatchMatMulLike`` (``passes/quantize_matmul_common.h``):
-    a MatMul, or a Gemm with ``transA=0``, ``alpha=1`` and (when it has a
-    bias) ``beta=1``. Returns ``(x_name, w_name, weight_transposed)`` or
-    ``None``.
-    """
-    attrs = {a.name: a for a in node.attribute}
-    if node.op_type == "MatMul":
-        if len(node.input) != 2:
-            return None
-        return node.input[0], node.input[1], False
-    if node.op_type == "Gemm":
-        num_inputs = len(node.input)
-        if num_inputs not in (2, 3):
-            return None
-        trans_a = attrs.get("transA")
-        if trans_a is not None and trans_a.i != 0:
-            return None
-        alpha = attrs.get("alpha")
-        if alpha is not None and alpha.f != 1.0:
-            return None
-        if num_inputs == 3:
-            beta = attrs.get("beta")
-            if beta is not None and beta.f != 1.0:
-                return None
-        trans_b = attrs.get("transB")
-        weight_transposed = bool(trans_b is not None and trans_b.i)
-        return node.input[0], node.input[1], weight_transposed
-    return None
+from onnxsim.onnx_simplifier import apply_qoq_cpp
 
 
 def quantize_weight_only_qoq(
@@ -134,123 +101,41 @@ def quantize_weight_only_qoq(
     rounding. Needs no calibration data: like ``quantize_weight_only_int4``,
     every quantization decision comes from the weight tensor's own values.
 
+    Delegates to the verified C++ port (:func:`onnxsim.apply_qoq_cpp`),
+    which hardcodes this function's own defaults (``block_size=32``,
+    ``int8_clip_max=119``) and builds the exact same
+    ``DequantizeLinear(Wq, Ws, ...)`` graph rewrite this function's own
+    former implementation did (INT4 codes plus a combined per-group
+    scale) -- no storage-format change here, unlike several of this
+    module's own siblings.
+
     :param model: the original (unquantized) onnx ModelProto or file path
     :param block_size: elements per (output-channel, block) quantization
             group along the reduction dimension, for the second (INT4)
-            stage
+            stage. **The C++ port's own only supported value is 32** -- a
+            non-default value raises ``ValueError``.
     :param int8_clip_max: the first stage's protective INT8 clipping range
-            (the paper's own headroom below the full 127-magnitude INT8
-            range, leaving room for the second stage's own rounding error
-            without overflowing); must be in ``(0, 127]``
+            (see this module's own docstring); must be in ``(0, 127]``.
+            **The C++ port's own only supported value is 119** -- a
+            non-default value raises ``ValueError``.
     :returns: ``model`` with every matched layer's weight replaced by
             ``DequantizeLinear(Wq, Ws, axis=<reduction axis>,
-            block_size=block_size)`` feeding the original MatMul/Gemm node
-            (signed INT4 codes, symmetric -- no zero-point input, matching
-            ``quantize_weight_only_int4``'s own convention), where ``Ws``
-            is each ``(output channel, block)`` group's *combined*
-            two-stage scale; layers with a non-constant, non-2-D, or
-            non-block-divisible weight are left untouched, as is the whole
-            model if its opset is below 21 (``DequantizeLinear``'s
-            ``block_size`` attribute and the native INT4 tensor type both
-            need opset 21+)
+            block_size=32)`` feeding the original MatMul/Gemm node; layers
+            with a non-constant, non-2-D, or non-block-divisible weight
+            are left untouched, as is the whole model if its opset is
+            below 21.
     """
     if not 0 < int8_clip_max <= 127:
         raise ValueError("int8_clip_max must be in (0, 127]")
-
+    if block_size != 32 or int8_clip_max != 119:
+        raise ValueError(
+            "quantize_weight_only_qoq now delegates to apply_qoq_cpp, "
+            "which hardcodes block_size=32, int8_clip_max=119 and cannot "
+            "honor other values"
+        )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    opset_ge_21 = any(
-        o.domain in ("", "ai.onnx") and o.version >= 21 for o in out.opset_import
-    )
-    if not opset_ge_21:
-        return model
-
-    nodes = list(graph.node)
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if weight_transposed else w.T  # [N, K]
-        n, k = w_nk.shape
-        if k % block_size != 0:
-            continue
-        num_groups = k // block_size
-
-        # Stage 1: FP16 -> INT8, per output channel, protective clip range.
-        channel_absmax = np.maximum(np.abs(w_nk).max(axis=1), _EPS)  # [N]
-        s1 = channel_absmax / int8_clip_max
-        code8 = np.clip(
-            np.round(w_nk / s1[:, np.newaxis]), -int8_clip_max, int8_clip_max
-        )  # [N, K], already-quantized INT8 grid values
-
-        # Stage 2: that INT8 grid -> INT4, per (channel, block-of-K) group --
-        # rounds the already-quantized code8, not the original float weight.
-        code8_blocks = code8.reshape(n, num_groups, block_size)
-        group_absmax = np.maximum(np.abs(code8_blocks).max(axis=2), _EPS)
-        s2 = group_absmax / 7.0  # [N, num_groups]
-        code4 = np.clip(
-            np.round(code8_blocks / s2[:, :, np.newaxis]), -7.0, 7.0
-        ).reshape(n, k)
-
-        # Final reconstruction folds both stages into one combined scale --
-        # code4 * s2 * s1 -- so the graph only needs a single
-        # DequantizeLinear, even though the codes were derived via the
-        # two-stage round-trip through the INT8 grid described above.
-        combined_scale = s1[:, np.newaxis] * s2  # [N, num_groups]
-
-        codes_orig = code4 if weight_transposed else code4.T
-        scale_orig = combined_scale if weight_transposed else combined_scale.T
-        assert codes_orig.shape == (dim0, dim1)
-
-        wq = onnx.TensorProto()
-        wq.name = _unique_name(f"{w_name}_qoq_q", taken_names)
-        wq.data_type = onnx.TensorProto.INT4
-        wq.dims.extend(codes_orig.shape)
-        wq.raw_data = _pack_int4(codes_orig)
-        graph.initializer.append(wq)
-
-        ws = onnx.numpy_helper.from_array(
-            scale_orig.astype(np.float32),
-            name=_unique_name(f"{w_name}_qoq_scale", taken_names),
-        )
-        graph.initializer.append(ws)
-
-        reduction_axis = 1 if weight_transposed else 0
-        dq_out = _unique_name(f"{w_name}_qoq_dq", taken_names)
-        dq_node = onnx.helper.make_node(
-            "DequantizeLinear",
-            [wq.name, ws.name],
-            [dq_out],
-            name=_unique_name(f"{w_name}_qoq_dequant", taken_names),
-            axis=reduction_axis,
-            block_size=block_size,
-        )
-        graph.node.insert(
-            next(i for i, n in enumerate(graph.node) if n is node), dq_node
-        )
-        for i, inp in enumerate(node.input):
-            if inp == w_name:
-                node.input[i] = dq_out
-
-    return out
+    return apply_qoq_cpp(model)
 
 
 def apply_smooth_attention(

@@ -77,36 +77,11 @@ reconstruct through the INT4 grid, and both paths share one
 
 from __future__ import annotations
 
-from typing import List, Union
+from typing import Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim.adaround import _pack_int4
-from onnxsim.bias_correction import _all_names, _unique_name
-from onnxsim.quip_sharp import _match_matmul_like
-
-
-def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:
-    return any(
-        o.domain in ("", "ai.onnx") and o.version >= min_version
-        for o in model.opset_import
-    )
-
-
-def _adaptive_thresholds(
-    blocks: np.ndarray, lambda_: float, gamma: float
-) -> np.ndarray:
-    """Per-``(row, group)`` Adaptive-LASSO-style soft threshold -- see this
-    module's own docstring. ``blocks`` is ``[N, num_groups, group_size]``;
-    returns ``[N, num_groups]``.
-    """
-    median = np.median(blocks, axis=2, keepdims=True)
-    mad = np.median(np.abs(blocks - median), axis=2)
-    sigma_hat = np.maximum(1.4826 * mad, 1e-12)
-    return lambda_ * sigma_hat ** (1.0 - gamma)
+from onnxsim.onnx_simplifier import apply_adpq_cpp
 
 
 def quantize_weight_only_adpq(
@@ -122,188 +97,40 @@ def quantize_weight_only_adpq(
     decision -- which elements are salient, and the scale used for the
     rest -- comes from the weight tensor's own values.
 
+    Delegates to the verified C++ port (:func:`onnxsim.apply_adpq_cpp`),
+    which hardcodes this function's own defaults (``group_size=128``,
+    ``lambda_=3.0``, ``gamma=0.3``) and folds the round trip directly into
+    a replacement float32 initializer rather than building a real
+    ``DequantizeLinear``+``ScatterND``+``Add`` graph rewrite -- a
+    storage-format change from this function's own former behavior, not a
+    numeric one.
+
     :param model: the original (unquantized) onnx ModelProto or file path
     :param group_size: elements per quantization group along ``K``, matching
             :func:`onnxsim.quantize_weight_only_int4`'s own block-wise
-            granularity
+            granularity. **The C++ port's own only supported value is 128**
+            -- a non-default value raises ``ValueError``.
     :param lambda_: overall threshold scale -- at ``gamma=0`` this is the
-            number of robust sigmas (see ``sigma_hat`` in this module's own
-            docstring) above which a weight counts as salient
+            number of robust sigmas (see this module's own docstring) above
+            which a weight counts as salient. **Not supported by the C++
+            port** -- a non-default value raises ``ValueError``.
     :param gamma: Adaptive LASSO exponent in ``[0, 1)`` controlling how much
-            a group's own scale flattens the threshold -- ``0`` is an
-            ordinary constant multiple of that group's robust sigma; values
-            closer to ``1`` let wider-spread groups keep comparatively more
-            salient mass (see this module's own docstring)
-    :returns: ``model`` with every matched layer's weight replaced by
-            group-wise INT4 codes (scale excluding that group's own salient
-            elements) plus a sparse exact correction restoring salient
-            elements to their original float32 value -- see the module
-            docstring's diagram in :mod:`onnxsim.spqr` for the shared
-            ``DequantizeLinear``/``ScatterND`` graph shape. Layers with a
-            non-constant, non-2-D weight, or a reduction dimension not
-            divisible by ``group_size``, are left untouched; a model with no
-            matching layer, or an opset older than 21 (INT4's tensor type
-            and ``DequantizeLinear``'s ``block_size`` attribute both need
-            opset 21), is returned unchanged.
+            a group's own scale flattens the threshold (see this module's
+            own docstring). **Not supported by the C++ port** -- a
+            non-default value raises ``ValueError``.
+    :returns: ``model`` with every matched layer's weight replaced by its
+            AdpQ-quantized float32 version, stored under a new
+            initializer. Layers with a non-constant, non-2-D weight, or a
+            reduction dimension not divisible by ``group_size``, are left
+            untouched; a model with no matching layer, or an opset older
+            than 21, is returned unchanged.
     """
+    if group_size != 128 or lambda_ != 3.0 or gamma != 0.3:
+        raise ValueError(
+            "quantize_weight_only_adpq now delegates to apply_adpq_cpp, "
+            "which hardcodes group_size=128, lambda_=3.0, gamma=0.3 and "
+            "cannot honor other values"
+        )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    if not _has_min_opset(model, 21):
-        return model
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    candidates = []
-    for node in list(graph.node):
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, bias_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, bias_name, weight_transposed))
-
-    if not candidates:
-        return out
-
-    for node, x_name, w_name, bias_name, weight_transposed in candidates:
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_nk = w if weight_transposed else w.T  # [N, K], output channel first
-        n, k = w_nk.shape
-        if k % group_size != 0:
-            continue
-
-        num_groups = k // group_size
-        blocks = w_nk.reshape(n, num_groups, group_size)
-
-        threshold = _adaptive_thresholds(blocks, lambda_, gamma)  # [N, num_groups]
-        threshold_full = np.repeat(threshold, group_size, axis=1)  # [N, K]
-        salient_mask = np.abs(w_nk) > threshold_full
-
-        mask_blocks = (~salient_mask).reshape(n, num_groups, group_size)
-        abs_masked = np.where(mask_blocks, np.abs(blocks), 0.0)
-        scale_blocks = (
-            np.maximum(abs_masked.max(axis=2), 1e-12) / 7.0
-        )  # [N, num_groups]
-        scale_full = np.repeat(scale_blocks, group_size, axis=1)  # [N, K]
-
-        codes_nk = np.clip(np.round(w_nk / scale_full), -7.0, 7.0)
-        dequant_nk = codes_nk * scale_full
-
-        prefix = f"{w_name}_adpq"
-        codes_kn = codes_nk.T.astype(np.int64)  # [K, N]
-        scale_kn = scale_blocks.T.astype(np.float32)  # [K/group_size, N]
-
-        codes_name = _unique_name(f"{prefix}_codes", taken_names)
-        codes_tensor = onnx.TensorProto()
-        codes_tensor.name = codes_name
-        codes_tensor.data_type = onnx.TensorProto.INT4
-        codes_tensor.dims.extend([k, n])
-        codes_tensor.raw_data = _pack_int4(codes_kn)
-        graph.initializer.append(codes_tensor)
-
-        scale_name = _unique_name(f"{prefix}_scale", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(scale_kn, name=scale_name)
-        )
-
-        new_nodes: List[onnx.NodeProto] = []
-
-        def _new(op_type, inputs, out_suffix, **attrs):
-            out_name = _unique_name(f"{prefix}_{out_suffix}", taken_names)
-            n_ = onnx.helper.make_node(
-                op_type,
-                inputs,
-                [out_name],
-                name=_unique_name(f"{prefix}_{out_suffix}_node", taken_names),
-                **attrs,
-            )
-            new_nodes.append(n_)
-            return out_name
-
-        w_dequant = _new(
-            "DequantizeLinear",
-            [codes_name, scale_name],
-            "w_dequant",
-            axis=0,
-            block_size=group_size,
-        )
-
-        salient_rows, salient_cols = np.nonzero(salient_mask)
-        num_salient = salient_rows.shape[0]
-        if num_salient > 0:
-            correction_values = (
-                w_nk[salient_rows, salient_cols]
-                - dequant_nk[salient_rows, salient_cols]
-            )
-            # [K, N]-layout indices, matching codes_kn/scale_kn's own
-            # transposed storage: index[i] = [k_pos, n_pos].
-            salient_indices_kn = np.stack([salient_cols, salient_rows], axis=1)
-
-            indices_name = _unique_name(f"{prefix}_salient_indices", taken_names)
-            graph.initializer.append(
-                onnx.numpy_helper.from_array(
-                    salient_indices_kn.astype(np.int64), name=indices_name
-                )
-            )
-            values_name = _unique_name(f"{prefix}_salient_values", taken_names)
-            graph.initializer.append(
-                onnx.numpy_helper.from_array(
-                    correction_values.astype(np.float32), name=values_name
-                )
-            )
-            shape_name = _unique_name(f"{prefix}_shape", taken_names)
-            graph.initializer.append(
-                onnx.numpy_helper.from_array(
-                    np.array([k, n], dtype=np.int64), name=shape_name
-                )
-            )
-
-            zeros = _new(
-                "ConstantOfShape",
-                [shape_name],
-                "zeros",
-                value=onnx.numpy_helper.from_array(np.array([0.0], dtype=np.float32)),
-            )
-            correction = _new(
-                "ScatterND", [zeros, indices_name, values_name], "correction"
-            )
-            w_reconstructed = _new("Add", [w_dequant, correction], "w_reconstructed")
-        else:
-            w_reconstructed = w_dequant
-
-        core = _new("MatMul", [x_name, w_reconstructed], "core")
-
-        old_output = node.output[0]
-        if bias_name is not None:
-            final = onnx.helper.make_node(
-                "Add",
-                [core, bias_name],
-                [old_output],
-                name=_unique_name(f"{prefix}_bias_add_node", taken_names),
-            )
-        else:
-            final = onnx.helper.make_node(
-                "Identity",
-                [core],
-                [old_output],
-                name=_unique_name(f"{prefix}_identity_node", taken_names),
-            )
-        new_nodes.append(final)
-
-        node_idx = next(i for i, n_ in enumerate(graph.node) if n_ is node)
-        for offset, new_node in enumerate(new_nodes):
-            graph.node.insert(node_idx + offset, new_node)
-        del graph.node[node_idx + len(new_nodes)]
-
-    return out
+    return apply_adpq_cpp(model)

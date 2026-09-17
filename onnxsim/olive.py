@@ -143,107 +143,11 @@ values, no activation probing needed.
 
 from __future__ import annotations
 
-from typing import List, Union
+from typing import Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim.bias_correction import _all_names, _unique_name
-from onnxsim.quip_sharp import _match_matmul_like
-
-_INT8 = onnx.TensorProto.INT8
-
-
-def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:
-    return any(
-        o.domain in ("", "ai.onnx") and o.version >= min_version
-        for o in model.opset_import
-    )
-
-
-def _qmax(num_bits: int) -> int:
-    return 2 ** (num_bits - 1) - 1
-
-
-def _olive_quantize_blockwise(
-    w_nk: np.ndarray, block_size: int, bits: int, outlier_threshold: float
-) -> "tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]":
-    """OVP-encodes ``w_nk`` ([N, K], output channel first; ``K`` must be
-    divisible by ``block_size``, itself even) -- see this module's own
-    docstring. Returns ``(codes_nk, base_scale, outlier_scale,
-    outlier_mask_nk)``: ``codes_nk`` int64 ``[N, K]``; ``base_scale``/
-    ``outlier_scale`` float64 ``[N, K // block_size]``; ``outlier_mask_nk``
-    bool ``[N, K]`` (True at each OVP pair's outlier position).
-    """
-    n, k = w_nk.shape
-    num_blocks = k // block_size
-    eps = 1e-12
-
-    blocks = w_nk.reshape(n, num_blocks, block_size)
-    abs_blocks = np.abs(blocks)
-
-    typical_scale = np.median(abs_blocks, axis=2, keepdims=True)  # [n, nb, 1]
-    is_outlier = abs_blocks > (outlier_threshold * typical_scale)  # [n, nb, bs]
-
-    ordinary_qmax = _qmax(bits)
-    outlier_qmax = _qmax(bits + 1)
-    victim_qmax = _qmax(bits - 1)
-
-    # base_scale: block-wide scale from non-outlier elements only, so a
-    # block's ordinary elements quantize tightly, unaffected by whichever
-    # of their neighbors are outliers (mirrors onnxsim.spqr's own
-    # exclude-outliers-from-the-scale idea).
-    non_outlier_abs = np.where(is_outlier, 0.0, abs_blocks)
-    base_max = non_outlier_abs.max(axis=2)  # [n, nb]
-    block_all_outlier = ~np.any(~is_outlier, axis=2)
-    base_max = np.where(block_all_outlier, abs_blocks.max(axis=2), base_max)
-    base_scale = np.maximum(base_max, eps) / ordinary_qmax  # [n, nb]
-
-    # outlier_scale: a second block-wide scale fit to this block's own
-    # outlier magnitudes only, so the wider code actually extends dynamic
-    # range instead of just reusing base_scale's (too-narrow) coverage.
-    outlier_abs_only = np.where(is_outlier, abs_blocks, 0.0)
-    outlier_max = outlier_abs_only.max(axis=2)  # [n, nb]
-    block_has_outlier = np.any(is_outlier, axis=2)
-    outlier_scale = np.where(
-        block_has_outlier, np.maximum(outlier_max, eps) / outlier_qmax, base_scale
-    )
-
-    # Adjacent, non-overlapping pairing within each block.
-    pair_outlier = is_outlier.reshape(n, num_blocks, block_size // 2, 2)
-    ovp_pair = pair_outlier[..., 0] != pair_outlier[..., 1]  # exactly one outlier
-    ovp_pair_full = np.repeat(ovp_pair, 2, axis=2)  # [n, nb, bs]
-
-    is_final_outlier = is_outlier & ovp_pair_full
-    is_victim = (~is_outlier) & ovp_pair_full
-    # Declined: an outlier with no unpaired non-outlier neighbor (its pair
-    # partner is also an outlier) -- falls back to ordinary quantization,
-    # same as any plain non-outlier element.
-    is_ordinary = ~ovp_pair_full
-
-    base_scale3 = base_scale[:, :, np.newaxis]
-    outlier_scale3 = outlier_scale[:, :, np.newaxis]
-
-    code_ordinary = np.clip(
-        np.round(blocks / base_scale3), -ordinary_qmax, ordinary_qmax
-    )
-    code_victim = np.clip(np.round(blocks / base_scale3), -victim_qmax, victim_qmax)
-    code_outlier = np.clip(
-        np.round(blocks / outlier_scale3), -outlier_qmax, outlier_qmax
-    )
-
-    codes = np.where(is_ordinary, code_ordinary, 0.0)
-    codes = np.where(is_victim, code_victim, codes)
-    codes = np.where(is_final_outlier, code_outlier, codes)
-
-    return (
-        codes.reshape(n, k).astype(np.int64),
-        base_scale,
-        outlier_scale,
-        is_final_outlier.reshape(n, k),
-    )
+from onnxsim.onnx_simplifier import apply_olive_cpp
 
 
 def quantize_weight_only_olive(
@@ -258,174 +162,40 @@ def quantize_weight_only_olive(
     ``K`` is divisible by ``block_size``. Needs no calibration data: every
     quantization decision comes from the weight tensor's own values.
 
+    Delegates to the verified C++ port (:func:`onnxsim.apply_olive_cpp`),
+    which hardcodes this function's own defaults (``bits=4``,
+    ``block_size=32``, ``outlier_threshold=4.0``) and folds the round trip
+    directly into a replacement float32 initializer rather than building a
+    real ``DequantizeLinear`` x2 + ``Cast`` + ``Where`` + ``MatMul``[+
+    ``Add``] graph rewrite -- a storage-format change from this function's
+    own former behavior, not a numeric one.
+
     :param model: the original (unquantized) onnx ModelProto or file path
     :param bits: the ordinary (non-outlier, non-victim) group-wide code
-            width; must be at least 3 so the victim code width (``bits -
-            1``) has at least 1 representable level. The outlier code width
-            is ``bits + 1``
+            width. **The C++ port's own only supported value is 4** -- a
+            non-default value raises ``ValueError``.
     :param block_size: elements per ``(output channel, block)``
-            quantization group along the reduction dimension; must be even
-            (elements are paired up within each block)
+            quantization group along the reduction dimension. **The C++
+            port's own only supported value is 32** -- a non-default
+            value raises ``ValueError``.
     :param outlier_threshold: an element is an outlier if its magnitude
             exceeds ``outlier_threshold`` times its block's median absolute
-            value (the paper's own "victim-outlier" split is threshold-based
-            rather than a fixed top-k fraction, since which elements are
-            outliers is expected to vary block to block)
+            value (see this module's own docstring). **The C++ port's own
+            only supported value is 4.0** -- a non-default value raises
+            ``ValueError``.
     :returns: ``model`` with every matched layer's weight replaced by its
-            OVP-encoded reconstruction (see the module docstring's
-            diagram); output tensor name unchanged. Layers with a
-            non-constant, non-2-D weight, a reduction dimension not
-            divisible by ``block_size``, or an odd ``block_size``, are left
+            OliVe-quantized float32 version, stored under a new
+            initializer. Layers with a non-constant, non-2-D weight, or a
+            reduction dimension not divisible by ``block_size``, are left
             untouched; a model with no matching layer, or an opset older
-            than 21 (``DequantizeLinear``'s ``block_size`` attribute needs
-            opset 21), is returned unchanged
+            than 21, is returned unchanged.
     """
-    if bits < 3:
+    if bits != 4 or block_size != 32 or outlier_threshold != 4.0:
         raise ValueError(
-            f"bits must be >= 3 (victim code width bits-1 needs >=1 level), got {bits}"
+            "quantize_weight_only_olive now delegates to apply_olive_cpp, "
+            "which hardcodes bits=4, block_size=32, outlier_threshold=4.0 "
+            "and cannot honor other values"
         )
-    if block_size % 2 != 0:
-        raise ValueError(f"block_size must be even, got {block_size}")
-
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    if not _has_min_opset(model, 21):
-        return model
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    candidates = []
-    for node in graph.node:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, bias_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, bias_name, weight_transposed))
-
-    if not candidates:
-        return out
-
-    for node, x_name, w_name, bias_name, weight_transposed in candidates:
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_nk = w if weight_transposed else w.T  # [N, K], output channel first
-        n, k = w_nk.shape
-        if k % block_size != 0:
-            continue
-
-        codes_nk, base_scale, outlier_scale, outlier_mask_nk = (
-            _olive_quantize_blockwise(w_nk, block_size, bits, outlier_threshold)
-        )
-        has_any_outlier = bool(outlier_mask_nk.any())
-
-        # The codes/scale/mask tensors below are brand-new initializers (the
-        # original W is replaced, not overwritten in place), so -- like
-        # onnxsim.spqr's own scale_kn/codes_kn -- they are always stored
-        # reduction-axis-first ([K, N] / [K // block_size, N]), independent
-        # of whether the original W happened to be stored transposed.
-        codes_kn = codes_nk.T  # [K, N]
-        mask_kn = outlier_mask_nk.T  # [K, N]
-        base_scale_kn = base_scale.T  # [K // block_size, N]
-        outlier_scale_kn = outlier_scale.T  # [K // block_size, N]
-
-        prefix = f"{w_name}_olive"
-
-        codes_name = _unique_name(f"{prefix}_codes", taken_names)
-        wq = onnx.TensorProto()
-        wq.name = codes_name
-        wq.data_type = _INT8
-        wq.dims.extend([k, n])
-        wq.raw_data = codes_kn.astype(np.int8).tobytes()
-        graph.initializer.append(wq)
-
-        base_scale_name = _unique_name(f"{prefix}_base_scale", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                base_scale_kn.astype(np.float32), name=base_scale_name
-            )
-        )
-
-        new_nodes: List[onnx.NodeProto] = []
-
-        def _new(op_type, inputs, out_suffix, **attrs):
-            out_name = _unique_name(f"{prefix}_{out_suffix}", taken_names)
-            n_ = onnx.helper.make_node(
-                op_type,
-                inputs,
-                [out_name],
-                name=_unique_name(f"{prefix}_{out_suffix}_node", taken_names),
-                **attrs,
-            )
-            new_nodes.append(n_)
-            return out_name
-
-        base_dequant = _new(
-            "DequantizeLinear",
-            [codes_name, base_scale_name],
-            "base_dequant",
-            axis=0,
-            block_size=block_size,
-        )
-
-        if has_any_outlier:
-            outlier_scale_name = _unique_name(f"{prefix}_outlier_scale", taken_names)
-            graph.initializer.append(
-                onnx.numpy_helper.from_array(
-                    outlier_scale_kn.astype(np.float32), name=outlier_scale_name
-                )
-            )
-            mask_name = _unique_name(f"{prefix}_outlier_mask", taken_names)
-            graph.initializer.append(
-                onnx.numpy_helper.from_array(mask_kn.astype(np.int8), name=mask_name)
-            )
-
-            outlier_dequant = _new(
-                "DequantizeLinear",
-                [codes_name, outlier_scale_name],
-                "outlier_dequant",
-                axis=0,
-                block_size=block_size,
-            )
-            mask_bool = _new("Cast", [mask_name], "mask_bool", to=onnx.TensorProto.BOOL)
-            w_reconstructed = _new(
-                "Where", [mask_bool, outlier_dequant, base_dequant], "w_reconstructed"
-            )
-        else:
-            w_reconstructed = base_dequant
-
-        old_output = node.output[0]
-        node_idx = next(i for i, n_ in enumerate(graph.node) if n_ is node)
-
-        core = _new("MatMul", [x_name, w_reconstructed], "core")
-        if bias_name:
-            final = onnx.helper.make_node(
-                "Add",
-                [core, bias_name],
-                [old_output],
-                name=_unique_name(f"{prefix}_bias_add_node", taken_names),
-            )
-        else:
-            final = onnx.helper.make_node(
-                "Identity",
-                [core],
-                [old_output],
-                name=_unique_name(f"{prefix}_identity_node", taken_names),
-            )
-        new_nodes.append(final)
-
-        for offset, new_node in enumerate(new_nodes):
-            graph.node.insert(node_idx + offset, new_node)
-        del graph.node[node_idx + len(new_nodes)]
-
-    return out
+    return apply_olive_cpp(model)

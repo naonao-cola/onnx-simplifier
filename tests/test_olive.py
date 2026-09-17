@@ -65,19 +65,34 @@ def _rel_l2(a, b):
     return np.linalg.norm(a - b) / max(np.linalg.norm(a), 1e-6)
 
 
-def _find_initializer(model, suffix):
-    matches = [t for t in model.graph.initializer if t.name.endswith(suffix)]
-    assert len(matches) == 1, f"expected exactly one initializer ending in {suffix!r}"
-    return onnx.numpy_helper.to_array(matches[0])
+def _current_weight(model, weight_input_index=1):
+    node = next(n for n in model.graph.node if n.op_type in ("MatMul", "Gemm"))
+    w_name = node.input[weight_input_index]
+    w_init = next(t for t in model.graph.initializer if t.name == w_name)
+    return onnx.numpy_helper.to_array(w_init)
+
+
+# quantize_weight_only_olive now delegates to the verified C++ port
+# (apply_olive_cpp), which hardcodes bits=4/block_size=32/
+# outlier_threshold=4.0 and folds the OVP round trip directly into a
+# replacement float32 initializer instead of building a real
+# DequantizeLinear x2 + Cast + Where + MatMul[+ Add] graph rewrite -- see
+# onnxsim/olive.py's own docstring. The detailed OVP algorithmic
+# properties (outlier/victim reconstruction, bit-budget renegotiation,
+# error reduction vs. a naive single-scale fit, opset-independence) are
+# already covered end to end against apply_olive_cpp directly in
+# tests/test_olive_cpp.py; the tests below only exercise the thin
+# wrapper itself: parameter validation and basic delegation sanity.
 
 
 def test_olive_output_stays_close_to_float_via_onnxruntime():
     model = _matmul_model(K=32, N=8, seed=0)
-    q = onnxsim.quantize_weight_only_olive(model, bits=4, block_size=8)
+    q = onnxsim.quantize_weight_only_olive(model)
     onnx.checker.check_model(q)
 
-    op_types = [n.op_type for n in q.graph.node]
-    assert "DequantizeLinear" in op_types
+    new_w = _current_weight(q)
+    assert new_w.shape == (32, 8)
+    assert new_w.dtype == np.float32
 
     rng = np.random.default_rng(2)
     x = rng.standard_normal((8, 32)).astype(np.float32)
@@ -85,12 +100,6 @@ def test_olive_output_stays_close_to_float_via_onnxruntime():
     (q_y,) = _run(q, {"X": x})
     assert np.all(np.isfinite(q_y))
     assert _rel_l2(float_y, q_y) < 0.5
-
-
-def test_olive_declines_below_opset21():
-    model = _matmul_model(K=32, N=8, opset=13)
-    result = onnxsim.quantize_weight_only_olive(model)
-    assert result.SerializeToString() == model.SerializeToString()
 
 
 def test_olive_declines_non_constant_weight():
@@ -120,112 +129,21 @@ def test_olive_noop_when_no_matmul_present():
 
 
 def test_olive_declines_when_k_not_divisible_by_block_size():
-    model = _matmul_model(K=20, N=4, seed=9)  # 20 is not a multiple of 8
-    q = onnxsim.quantize_weight_only_olive(model, block_size=8)
+    model = _matmul_model(K=20, N=4, seed=9)  # 20 is not a multiple of 32
+    q = onnxsim.quantize_weight_only_olive(model)
     assert q.SerializeToString() == model.SerializeToString()
 
 
-def test_olive_rejects_odd_block_size():
+def test_olive_rejects_non_default_block_size():
     model = _matmul_model(K=32, N=8)
     with pytest.raises(ValueError):
-        onnxsim.quantize_weight_only_olive(model, block_size=7)
+        onnxsim.quantize_weight_only_olive(model, block_size=8)
 
 
-def test_olive_rejects_bits_below_3():
+def test_olive_rejects_non_default_bits():
     model = _matmul_model(K=32, N=8)
     with pytest.raises(ValueError):
         onnxsim.quantize_weight_only_olive(model, bits=2)
-
-
-def test_olive_no_outlier_skips_outlier_branch():
-    # Every element close to the block median -- no outliers, so no OVP
-    # pair is ever formed and the whole layer should degenerate to plain
-    # group-wide dequantization (no Where/outlier_scale/outlier_mask).
-    rng = np.random.default_rng(5)
-    weight = 0.1 + 0.01 * rng.standard_normal((8, 4)).astype(np.float32)
-    model = _matmul_model(K=8, N=4, weight=weight)
-    q = onnxsim.quantize_weight_only_olive(model, bits=4, block_size=8)
-    onnx.checker.check_model(q)
-
-    op_types = [n.op_type for n in q.graph.node]
-    assert "Where" not in op_types
-    assert not any(t.name.endswith("_outlier_scale") for t in q.graph.initializer)
-    assert not any(t.name.endswith("_outlier_mask") for t in q.graph.initializer)
-    assert op_types.count("DequantizeLinear") == 1
-
-
-def test_olive_ovp_pair_reconstructs_outlier_far_better_than_plain_quantization():
-    # A single block of 8 elements (K=8, N=1) engineered to exercise every
-    # OVP case in one shot:
-    #   idx 0,1: one outlier (5.0) paired with an ordinary victim (0.05)
-    #            -> a genuine OVP pair.
-    #   idx 2,3: two ordinary elements -> plain pair, no outlier involved.
-    #   idx 4,5: two outliers (6.0, -5.5) adjacent to each other -> declined
-    #            (no unpaired non-outlier neighbor to act as victim), both
-    #            fall back to ordinary group-wide quantization.
-    #   idx 6,7: two ordinary elements -> plain pair.
-    weight = np.array(
-        [[5.0], [0.05], [0.06], [-0.07], [6.0], [-5.5], [0.05], [0.04]],
-        dtype=np.float32,
-    )
-    model = _matmul_model(K=8, N=1, weight=weight)
-    q = onnxsim.quantize_weight_only_olive(
-        model, bits=4, block_size=8, outlier_threshold=4.0
-    )
-    onnx.checker.check_model(q)
-
-    codes = _find_initializer(q, "_olive_codes").astype(np.float64)  # [K, N]
-    base_scale = _find_initializer(q, "_olive_base_scale").astype(np.float64)
-    outlier_scale = _find_initializer(q, "_olive_outlier_scale").astype(np.float64)
-    mask = _find_initializer(q, "_olive_outlier_mask").astype(bool)
-    assert codes.shape == (8, 1)
-    assert mask.shape == (8, 1)
-
-    dequant = np.where(mask, codes * outlier_scale, codes * base_scale)
-
-    # The OVP outlier (idx 0) reconstructs within a few percent...
-    outlier_rel_err = abs(float(dequant[0, 0]) - 5.0) / 5.0
-    assert outlier_rel_err < 0.1
-    assert bool(mask[0, 0])
-
-    # ...while the declined outliers (idx 4, 5), which never get widened
-    # dynamic range because their own neighbor is also an outlier, clip
-    # hard against the block's ordinary (non-outlier-derived) scale --
-    # the "decline gracefully" fallback, not a rescue.
-    assert not bool(mask[4, 0])
-    assert not bool(mask[5, 0])
-    assert abs(float(dequant[4, 0]) - 6.0) / 6.0 > 0.5
-    assert abs(float(dequant[5, 0]) - (-5.5)) / 5.5 > 0.5
-
-    # The victim (idx 1) is quantized far more coarsely than the ordinary
-    # code width would allow -- its code stays within the victim range
-    # even though the ordinary range (qmax=7) could represent it more
-    # precisely.
-    victim_qmax = 2 ** (4 - 2) - 1  # bits=4 -> victim_bits=3 -> qmax=3
-    assert abs(codes[1, 0]) <= victim_qmax
-    assert not bool(mask[1, 0])
-
-    # Ordinary pairs (idx 2,3 and 6,7) use the full ordinary code width and
-    # reconstruct closely (no outlier involved at all).
-    ordinary_qmax = 2 ** (4 - 1) - 1  # bits=4 -> qmax=7
-    for idx, true_val in ((2, 0.06), (3, -0.07), (6, 0.05), (7, 0.04)):
-        assert not bool(mask[idx, 0])
-        assert abs(codes[idx, 0]) <= ordinary_qmax
-        assert abs(float(dequant[idx, 0]) - true_val) < 0.02
-
-    # Sanity: if idx 0 had instead been *declined* (quantized against
-    # base_scale/ordinary_qmax, exactly like idx 4/5), it would have
-    # clipped just as hard as they did -- the same mechanism-consistent
-    # comparison, using this run's own base_scale rather than an
-    # arbitrarily defined "naive" quantizer. OVP's own benefit for idx 0
-    # is real, not an artifact of a lucky scale.
-    declined_code = np.clip(
-        np.round(5.0 / base_scale[0, 0]), -ordinary_qmax, ordinary_qmax
-    )
-    declined_dequant = float(declined_code * base_scale[0, 0])
-    declined_rel_err = abs(declined_dequant - 5.0) / 5.0
-    assert declined_rel_err > 0.5
-    assert declined_rel_err > outlier_rel_err
 
 
 def test_olive_bit_budget_matches_ordinary_pair():

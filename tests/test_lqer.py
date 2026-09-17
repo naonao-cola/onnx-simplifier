@@ -165,15 +165,27 @@ def test_lqer_falls_back_to_plain_svd_without_calibration_activation():
     # so no channel weight is ever recorded for it) should still get a
     # correction -- via the same unweighted fallback
     # low_rank_compensation.py always uses.
+    #
+    # onnxsim.apply_low_rank_compensation now delegates to the verified C++
+    # port, whose own SVD (a hand-rolled Jacobi solver, documented in
+    # low_rank_compensation_entry.h as an ACCEPTED, PERMANENT DIVERGENCE
+    # from numpy's LAPACK-backed one) is not guaranteed to agree with
+    # apply_lqer's own numpy-SVD-based fallback sign-for-sign per singular
+    # vector -- only the reconstructed rank-r correction B @ A is unique
+    # (Eckart-Young), so compare that product instead of the raw B factor
+    # alone, the same convention this repo's own SVD-based *_cpp tests
+    # already use.
     model = _matmul_model(K=32, N=8, seed=4)
     quant = onnxsim.quantize_weight_only_int4(model)
 
     lqer_model = onnxsim.apply_lqer(model, quant, rank=4, calibration_data=[])
     lorc_model = onnxsim.apply_low_rank_compensation(model, quant, rank=4)
 
-    lqer_w = onnx.numpy_helper.to_array(lqer_model.graph.initializer[-2])
-    lorc_w = onnx.numpy_helper.to_array(lorc_model.graph.initializer[-2])
-    np.testing.assert_allclose(lqer_w, lorc_w, atol=1e-4)
+    lqer_b = onnx.numpy_helper.to_array(lqer_model.graph.initializer[-2])
+    lqer_a = onnx.numpy_helper.to_array(lqer_model.graph.initializer[-1])
+    lorc_b = onnx.numpy_helper.to_array(lorc_model.graph.initializer[-2])
+    lorc_a = onnx.numpy_helper.to_array(lorc_model.graph.initializer[-1])
+    np.testing.assert_allclose(lqer_b @ lqer_a, lorc_b @ lorc_a, atol=1e-4)
 
 
 def test_lqer_higher_rank_never_increases_error():

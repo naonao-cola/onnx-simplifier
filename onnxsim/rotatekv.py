@@ -136,95 +136,12 @@ already true of every other calibrated per-channel scale in
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.attention_quantization import _find_attention_candidates
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.kv_cache_quantization import (
-    _find_kv_cache_candidates,
-    _is_value_style,
-    _KvCacheCandidate,
-)
-
-
-def _resolve_kt_source(
-    kt_name: str, producer_by_output: Dict[str, onnx.NodeProto]
-) -> str:
-    """Unwraps at most one ``Transpose`` hop: ``Kt = Transpose(X)`` (the
-    shape a KV-cache stream's own head-dim-last layout needs to become the
-    head-dim-second-to-last layout ``QK^T`` wants) resolves to ``X``.
-    Anything else -- no producer (a graph input/output), a non-Transpose
-    producer, or a multi-input node -- resolves to ``kt_name`` itself,
-    unchanged.
-    """
-    node = producer_by_output.get(kt_name)
-    if node is not None and node.op_type == "Transpose" and len(node.input) == 1:
-        return node.input[0]
-    return kt_name
-
-
-@dataclass
-class _RotateKvTarget:
-    kv_candidate: _KvCacheCandidate
-    q_name: str
-    qk_matmul: onnx.NodeProto
-
-
-def _find_rotatekv_targets(graph: onnx.GraphProto) -> List[_RotateKvTarget]:
-    kv_candidates = [
-        c
-        for c in _find_kv_cache_candidates(graph)
-        if not _is_value_style(c.present_name, None)
-    ]
-    if not kv_candidates:
-        return []
-
-    producer_by_output: Dict[str, onnx.NodeProto] = {}
-    for node in graph.node:
-        for out in node.output:
-            producer_by_output[out] = node
-
-    attention_candidates = []
-    seen = set()
-    for a in _find_attention_candidates(graph):
-        if id(a.qk_matmul) in seen:
-            continue
-        seen.add(id(a.qk_matmul))
-        attention_candidates.append(a)
-
-    kt_source_by_matmul = {
-        id(a.qk_matmul): _resolve_kt_source(a.qk_matmul.input[1], producer_by_output)
-        for a in attention_candidates
-    }
-
-    targets = []
-    for c in kv_candidates:
-        match = next(
-            (
-                a
-                for a in attention_candidates
-                if kt_source_by_matmul[id(a.qk_matmul)] == c.present_name
-            ),
-            None,
-        )
-        if match is None:
-            continue  # no attention consumer found -- can't compensate Query
-        targets.append(
-            _RotateKvTarget(
-                kv_candidate=c,
-                q_name=match.qk_matmul.input[0],
-                qk_matmul=match.qk_matmul,
-            )
-        )
-    return targets
+from onnxsim.calibration import Tensors
+from onnxsim.onnx_simplifier import apply_rotatekv_cpp
 
 
 def apply_rotatekv(
@@ -262,85 +179,21 @@ def apply_rotatekv(
             attention consumer, or whose calibration activation never
             appeared in any batch, is left untouched, as is the whole
             model when no stream matches at all
+
+    Delegates to the verified C++ port (:func:`onnxsim.apply_rotatekv_cpp`),
+    which shares this function's own full parameter set exactly -- no
+    compatibility gap. That port's own rotation is the eigenvector basis of
+    a from-scratch Jacobi eigensolver, not LAPACK's own ``eigh``, so the
+    exact basis differs from this function's own former implementation --
+    an accepted, permanent divergence (both are valid orthogonal rotations
+    with the same reconstruction-quality property).
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-
-    targets = _find_rotatekv_targets(graph)
-    if not targets:
-        return out
-
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
-
-    probe_names = sorted({t.kv_candidate.new_name for t in targets})
-    probe_model = _add_probe_outputs(out, probe_names)
-
-    samples: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            arr = np.asarray(result[name], dtype=np.float64)
-            if arr.ndim == 0:
-                continue
-            samples[name].append(arr.reshape(-1, arr.shape[-1]))
-
-    taken_names = _all_names(graph)
-
-    for t in targets:
-        c = t.kv_candidate
-        batches = samples.get(c.new_name, [])
-        if not batches:
-            continue  # this stream's activation never appeared in any batch
-        x = np.concatenate(batches, axis=0)
-        head_dim = x.shape[1]
-        if head_dim < 2:
-            continue  # nothing to rotate
-
-        # Closed-form, classical eigenvector-basis rotation -- see module
-        # docstring. eigh always returns an orthonormal basis for any real
-        # symmetric matrix, so this is exact and well-defined even for a
-        # rank-deficient (few-sample) covariance.
-        cov = x.T @ x / x.shape[0]  # [head_dim, head_dim]
-        _eigvals, r = np.linalg.eigh(cov)  # r: [head_dim, head_dim], orthogonal
-        r32 = r.astype(np.float32)
-
-        prefix = f"{c.present_name}_rotatekv"
-        r_name = _unique_name(f"{prefix}_r", taken_names)
-        graph.initializer.append(onnx.numpy_helper.from_array(r32, name=r_name))
-
-        new_key_rot_name = _unique_name(f"{c.new_name}_rotatekv", taken_names)
-        new_key_node = onnx.helper.make_node(
-            "MatMul",
-            [c.new_name, r_name],
-            [new_key_rot_name],
-            name=_unique_name(f"{prefix}_new_key_node", taken_names),
-        )
-
-        q_rot_name = _unique_name(f"{t.q_name}_rotatekv", taken_names)
-        q_node = onnx.helper.make_node(
-            "MatMul",
-            [t.q_name, r_name],
-            [q_rot_name],
-            name=_unique_name(f"{prefix}_q_node", taken_names),
-        )
-
-        if c.new_is_first_input:
-            c.concat_node.input[0] = new_key_rot_name
-        else:
-            c.concat_node.input[1] = new_key_rot_name
-        t.qk_matmul.input[0] = q_rot_name
-
-        concat_idx = next(i for i, n in enumerate(graph.node) if n is c.concat_node)
-        graph.node.insert(concat_idx, new_key_node)
-
-        qk_idx = next(i for i, n in enumerate(graph.node) if n is t.qk_matmul)
-        graph.node.insert(qk_idx, q_node)
-
-    return out
+    return apply_rotatekv_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        providers=providers,
+    )

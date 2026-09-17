@@ -53,11 +53,13 @@ from typing import Optional, Union
 
 import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim.bias_correction import _all_names, _unique_name
-from onnxsim.quip_sharp import _match_matmul_like
+from onnxsim.onnx_simplifier import apply_kmeans_quantization_cpp
+
+# _kmeans_1d (below) is still imported directly by onnxsim.lo_bcq/
+# onnxsim.kbvq_moe (their own codebook fits reuse this exact 1-D
+# Lloyd's-algorithm routine) and by tests/test_kbvq_moe.py -- kept even
+# though quantize_weight_only_kmeans itself no longer calls it.
 
 
 def _kmeans_1d(
@@ -133,70 +135,24 @@ def quantize_weight_only_kmeans(
             contrib op and no minimum opset beyond what
             ``Gather``/``Cast`` themselves need (opset 11+). Layers with
             a non-constant or non-2-D weight are left untouched.
+
+    Delegates to the verified C++ port
+    (:func:`onnxsim.apply_kmeans_quantization_cpp`) when called with the
+    default ``bits=4``/``iters=20``/``seed=0``/``skip_names=None`` -- the
+    C++ port's own hardcoded values. A non-default value raises
+    ``ValueError`` rather than being silently ignored (no real caller in
+    this codebase needs a non-default value). Unlike this function's own
+    former implementation (``Gather``/``Cast`` graph nodes), the C++ port
+    folds the round trip directly into a replacement float32 initializer
+    -- a storage-format change, not a numeric one.
     """
+    if bits != 4 or iters != 20 or seed != 0 or skip_names:
+        raise ValueError(
+            "quantize_weight_only_kmeans now delegates to "
+            "apply_kmeans_quantization_cpp, which hardcodes bits=4, "
+            "iters=20, seed=0 and has no skip_names knob; call with the "
+            "defaults, or use apply_kmeans_quantization_cpp directly"
+        )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    skip_set: "set[str]" = set(skip_names) if skip_names is not None else set()
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-    num_codes = 2**bits
-
-    nodes = list(graph.node)
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        _x_name, w_name, _bias_name, _weight_transposed = match
-        if w_name in skip_set:
-            continue
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        flat = w.reshape(-1)
-
-        centroids, assignments = _kmeans_1d(flat, num_codes, iters, seed)
-        codes = assignments.reshape(dim0, dim1).astype(np.uint8)
-
-        prefix = f"{w_name}_kmeans"
-        codebook_name = _unique_name(f"{prefix}_codebook", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                centroids.astype(np.float32), name=codebook_name
-            )
-        )
-        codes_name = _unique_name(f"{prefix}_codes", taken_names)
-        graph.initializer.append(onnx.numpy_helper.from_array(codes, name=codes_name))
-
-        cast_out = _unique_name(f"{prefix}_codes_i64", taken_names)
-        cast_node = onnx.helper.make_node(
-            "Cast", [codes_name], [cast_out], to=onnx.TensorProto.INT64
-        )
-        dq_out = _unique_name(f"{prefix}_dq", taken_names)
-        gather_node = onnx.helper.make_node(
-            "Gather",
-            [codebook_name, cast_out],
-            [dq_out],
-            axis=0,
-            name=_unique_name(f"{prefix}_gather_node", taken_names),
-        )
-
-        node_idx = next(i for i, n in enumerate(graph.node) if n is node)
-        graph.node.insert(node_idx, cast_node)
-        graph.node.insert(node_idx + 1, gather_node)
-
-        for i, inp in enumerate(node.input):
-            if inp == w_name:
-                node.input[i] = dq_out
-
-    return out
+    return apply_kmeans_quantization_cpp(model)

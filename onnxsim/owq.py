@@ -69,42 +69,12 @@ out of scope" section): it needs a training loop, not a graph rewrite.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _find_int4_matmul_candidates
-from onnxsim.bias_correction import (
-    _activation_rows,
-    _add_probe_outputs,
-    _all_names,
-    _unique_name,
-)
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.gptq import _inverse_hessian_cholesky
-
-
-def _unpack_int4(tensor: onnx.TensorProto) -> np.ndarray:
-    """Unpacks a ``TensorProto.INT4`` tensor's ``raw_data`` (the same
-    low-nibble-first packing ``weight_only_quantize_int4_matmul.h`` uses:
-    ``byte[i] = (code[2i] & 0xF) | ((code[2i+1] & 0xF) << 4)``) into a plain
-    float64 array shaped ``tensor.dims``.
-    """
-    dims = list(tensor.dims)
-    numel = int(np.prod(dims))
-    raw = np.frombuffer(tensor.raw_data, dtype=np.uint8)
-    lo = (raw & 0x0F).astype(np.int8)
-    hi = ((raw >> 4) & 0x0F).astype(np.int8)
-    lo = np.where(lo >= 8, lo - 16, lo)
-    hi = np.where(hi >= 8, hi - 16, hi)
-    codes = np.empty(numel, dtype=np.int8)
-    codes[0::2] = lo[: (numel + 1) // 2]
-    codes[1::2] = hi[: numel // 2]
-    return codes.reshape(dims).astype(np.float64)
+from onnxsim.calibration import Tensors
+from onnxsim.onnx_simplifier import apply_owq_cpp
 
 
 def apply_owq(
@@ -165,134 +135,21 @@ def apply_owq(
             layer with fewer calibration-observed columns than needed for a
             meaningful split, or that OWQ found no columns worth restoring
             for (``outlier_fraction`` rounds to 0), is left untouched.
+
+    Delegates to the verified C++ port (:func:`onnxsim.apply_owq_cpp`),
+    which takes the exact same parameters -- no gap to bridge here.
     """
     if isinstance(float_model, str):
         float_model = onnx.load(float_model, load_external_data=False)
     if isinstance(quantized_model, str):
         quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
-
-    candidates = _find_int4_matmul_candidates(float_model, quantized_model)
-    if not candidates:
-        return quantized_model
-
-    wq_init_map = {t.name: t for t in quantized_model.graph.initializer}
-
-    probe_names = sorted({c.float_node.input[0] for c in candidates})
-    float_probe = _add_probe_outputs(float_model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        out = backend.run_model(float_probe, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(out[name], dtype=np.float64))
-
-    corrected = onnx.ModelProto()
-    corrected.CopyFrom(quantized_model)
-    graph = corrected.graph
-    taken_names = _all_names(graph)
-    node_by_output = {n.output[0]: n for n in graph.node if n.output}
-
-    for c in candidates:
-        acts = _activation_rows(activations[c.float_node.input[0]])
-        if not acts:
-            continue  # no usable activation (no feature axis); skip
-        x = np.concatenate(acts, axis=0)
-
-        w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if c.weight_transposed else w.T  # [N, K], output channel first
-        k = w_nk.shape[1]
-        if x.shape[1] != k:
-            continue  # activation's feature dim doesn't match K; skip
-
-        num_weak = int(round(outlier_fraction * k))
-        if num_weak < 1:
-            continue
-
-        h = x.T @ x
-        u = _inverse_hessian_cholesky(h, percdamp)  # inv(h) == u.T @ u
-        h_inv_diag = np.maximum((u**2).sum(axis=0), 1e-12)  # [K]
-
-        # Unpack quantized_model's own real INT4 codes (not a fresh
-        # from-scratch RTN recomputation) so the residual below is exact
-        # against what the graph actually contains -- see this module's own
-        # docstring for why that distinction matters here.
-        codes = _unpack_int4(wq_init_map[c.wq_name])
-        scale = onnx.numpy_helper.to_array(c.ws_init).astype(np.float64)
-        if c.weight_transposed:
-            codes_nk = codes  # already [N, K]
-            scale_blocks = scale  # already [N, K / block_size]
-        else:
-            codes_nk = codes.T  # [K, N] -> [N, K]
-            scale_blocks = scale.T  # [K / block_size, N] -> [N, K / block_size]
-        scale_full = np.repeat(scale_blocks, c.block_size, axis=1)
-        w_rtn = codes_nk * scale_full
-        col_error = np.mean((w_nk - w_rtn) ** 2, axis=0)  # [K]
-
-        sensitivity = col_error / h_inv_diag
-        weak_idx = np.argsort(-sensitivity)[:num_weak]
-        weak_idx.sort()
-
-        # Exact residual for the rescued columns only -- everywhere else,
-        # quantized_model's own INT4 codes are left completely untouched.
-        delta_w = (w_nk - w_rtn)[:, weak_idx]  # [N, num_weak]
-        if not np.any(delta_w):
-            continue  # RTN already exact on every selected column; no-op
-
-        original_output = c.output_name
-        qn = node_by_output.get(original_output)
-        if qn is None:
-            continue  # shouldn't happen -- output_name came from this graph
-
-        idx_name = _unique_name(f"{original_output}_owq_weak_idx", taken_names)
-        graph.initializer.append(
-            onnx.helper.make_tensor(
-                idx_name,
-                onnx.TensorProto.INT64,
-                [num_weak],
-                weak_idx.astype(np.int64).tobytes(),
-                raw=True,
-            )
-        )
-        x_weak_name = _unique_name(f"{original_output}_owq_x_weak", taken_names)
-        gather_node = onnx.helper.make_node(
-            "Gather",
-            [c.float_node.input[0], idx_name],
-            [x_weak_name],
-            name=_unique_name(f"{original_output}_owq_gather", taken_names),
-            axis=-1,
-        )
-
-        delta_w_name = _unique_name(f"{original_output}_owq_delta_w", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                delta_w.T.astype(np.float32), name=delta_w_name
-            )
-        )
-        corr_name = _unique_name(f"{original_output}_owq_correction", taken_names)
-        matmul_node = onnx.helper.make_node(
-            "MatMul",
-            [x_weak_name, delta_w_name],
-            [corr_name],
-            name=_unique_name(f"{original_output}_owq_matmul", taken_names),
-        )
-
-        pre_name = _unique_name(f"{original_output}_owq_pre_correction", taken_names)
-        node_idx = next(i for i, n in enumerate(graph.node) if n is qn)
-        qn.output[0] = pre_name
-        add_node = onnx.helper.make_node(
-            "Add",
-            [pre_name, corr_name],
-            [original_output],
-            name=_unique_name(f"{original_output}_owq_add", taken_names),
-        )
-        graph.node.insert(node_idx + 1, add_node)
-        graph.node.insert(node_idx + 1, matmul_node)
-        graph.node.insert(node_idx + 1, gather_node)
-        node_by_output[original_output] = add_node
-
-    return corrected
+    return apply_owq_cpp(
+        float_model,
+        quantized_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        outlier_fraction=outlier_fraction,
+        percdamp=percdamp,
+        providers=providers,
+    )
