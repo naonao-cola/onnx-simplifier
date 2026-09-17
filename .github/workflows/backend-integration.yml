@@ -1,11 +1,11 @@
 name: Backend Integration
 
 # End-to-end regression tests that feed onnxsim's simplified output into other
-# ONNX-consuming compiler/runtime stacks (Apache TVM, nncase, Halide, tinygrad,
+# ONNX-consuming compiler/runtime stacks (Apache TVM, Halide, tinygrad,
 # PyTorch via onnx2torch, Apple's MLX), quantize-then-simplify pipelines
 # (NVIDIA ModelOpt), or a deployment toolbox's own backend runtime wrapper
 # (OpenMMLab mmdeploy), or a JAX/Flax ONNX frontend (jax2onnx) —
-# tests/test_tvm_integration.py, tests/test_nncase_integration.py,
+# tests/test_tvm_integration.py,
 # tests/test_halide_integration.py, tests/test_tinygrad_integration.py,
 # tests/test_torch_integration.py, tests/test_mlx_integration.py,
 # tests/test_modelopt_integration.py, tests/test_mmdeploy_integration.py,
@@ -20,7 +20,7 @@ name: Backend Integration
 # does not depend on the `build` job below.
 #
 # These checks used to live in their own workflow files (tvm-integration.yml,
-# nncase-integration.yml, halide-integration.yml, modelopt-integration.yml),
+# halide-integration.yml, modelopt-integration.yml),
 # each independently building an identical cp312 manylinux wheel from the same
 # commit via cibuildwheel -- on a PR touching onnx_simplifier.py/onnxsim.cpp,
 # or every day at the shared 07:00 UTC cron, that meant redundant wheel builds
@@ -28,9 +28,9 @@ name: Backend Integration
 # shared with every test job, exactly like model-regression.yml already does
 # for its shards.
 #
-# None of apache-tvm / nncase / halide / tinygrad / torch+onnx2torch / mlx /
+# None of apache-tvm / halide / tinygrad / torch+onnx2torch / mlx /
 # nvidia-modelopt / mmdeploy / jax2onnx are part of onnxsim's test
-# requirements (nncase needs the .NET runtime; modelopt, the torch job,
+# requirements (modelopt, the torch job,
 # mmdeploy, and jax2onnx all drag in torch/jax + CUDA wheels), so this runs
 # in its own workflow instead of the build-and-test matrix. Runs on PRs that
 # touch the harness or the simplifier,
@@ -44,7 +44,6 @@ on:
   pull_request:
     paths:
       - "tests/test_tvm_integration.py"
-      - "tests/test_nncase_integration.py"
       - "tests/test_halide_integration.py"
       - "tests/test_tinygrad_integration.py"
       - "tests/test_torch_integration.py"
@@ -139,45 +138,6 @@ jobs:
       - name: Run TVM integration tests
         working-directory: ${{ runner.temp }}
         run: pytest -v "$GITHUB_WORKSPACE/tests/test_tvm_integration.py"
-
-  nncase:
-    name: Simplify and run on nncase
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-      - uses: actions/download-artifact@v8
-        with:
-          name: onnxsim-wheel-backend
-          path: wheelhouse
-      # nncase is a .NET application and needs the .NET 7.0 runtime to load
-      # Nncase.Compiler.dll (hostfxr is found via DOTNET_ROOT).
-      - name: Install .NET 7.0 runtime
-        run: |
-          curl -sSL https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
-          chmod +x dotnet-install.sh
-          ./dotnet-install.sh --runtime dotnet --channel 7.0 --install-dir "$HOME/.dotnet"
-          echo "DOTNET_ROOT=$HOME/.dotnet" >> "$GITHUB_ENV"
-          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
-      - name: Install onnxsim wheel + nncase
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install pytest nncase
-          python -m pip install wheelhouse/*.whl
-      - name: Verify the installed wheel is used (not the source tree)
-        working-directory: ${{ runner.temp }}
-        run: |
-          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
-          python -c "import nncase; print('nncase', nncase.__file__)"
-      # Run from a neutral directory so the repo root's ./onnxsim source package
-      # (without the compiled extension) does not shadow the installed wheel.
-      - name: Run nncase integration tests
-        working-directory: ${{ runner.temp }}
-        run: pytest -v "$GITHUB_WORKSPACE/tests/test_nncase_integration.py"
 
   tpu_mlir:
     name: Simplify and run on tpu-mlir

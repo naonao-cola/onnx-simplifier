@@ -1,0 +1,10 @@
+# Name,      Type, SubType,  Offset,    Size,      Flags
+# "model" is a raw, filesystem-free blob region -- swapping models is a
+# single Web Serial write of a .tflite file's bytes at 0x310000, nothing
+# else on the device changes. Subtype 0x40 is an ESP-IDF "custom" data
+# subtype (no filesystem/OTA meaning attached); the firmware finds it by
+# label ("model"), not by subtype.
+nvs,        data, nvs,      0x9000,    0x5000,
+phy_init,   data, phy,      0xe000,    0x1000,
+factory,    app,  factory,  0x10000,   0x300000,
+model,      data, 0x40,     0x310000,  0x100000,

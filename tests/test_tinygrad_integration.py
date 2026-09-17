@@ -3,15 +3,14 @@
 ``docs/dlpack-executor.md`` frames onnxsim's DLPack executor boundary as an
 "embeddability" seam: onnxsim should be droppable into another ONNX-based
 compiler or runtime stack with the host only implementing one executor
-callback. ``tests/test_nncase_integration.py`` and
-``tests/test_tvm_integration.py`` are the regression tests for that claim
-against nncase's and Apache TVM's own ONNX frontends. This module is the
+callback. ``tests/test_tvm_integration.py`` is the regression test for that
+claim against Apache TVM's own ONNX frontend. This module is the
 analogous test for `tinygrad <https://github.com/tinygrad/tinygrad>`_, a
 small tensor library with its own eager ``OnnxRunner``
 (``tinygrad.nn.onnx.OnnxRunner``) that imports and executes an ONNX
 ``ModelProto`` directly -- no separate "compile" step, and no vendor
 hardware or driver needed: it runs on tinygrad's own default backend
-(typically the CPU/CLANG device on an ordinary CI runner), so, like nncase,
+(typically the CPU/CLANG device on an ordinary CI runner), so
 this is a genuine independent ONNX backend to cross-check onnxsim's
 simplifications against.
 
@@ -32,7 +31,7 @@ A third, more interesting case is also covered: the classic
 ``Shape -> Gather -> Concat -> Reshape`` chain that ships fully-constant
 dimensions. onnxsim constant-folds the whole chain into a literal
 ``Reshape`` target shape, which tinygrad ingests fine either way here, but
-is the same regression guard the nncase/TVM modules carry for a
+is the same regression guard the TVM module carries for a
 fixed-shape-preferring backend.
 
 ``tinygrad`` is not part of onnxsim's test requirements, so the whole module
@@ -120,7 +119,7 @@ def _foldable_shape_reshape() -> onnx.ModelProto:
 
     onnxsim folds the whole chain into the ``Reshape``'s literal target
     shape, which tinygrad ingests either way -- the same regression guard
-    the nncase/TVM equivalents carry for backends that do prefer a literal
+    the TVM equivalent carries for backends that do prefer a literal
     target.
     """
     w = numpy_helper.from_array(_rand(8, 3, 3, 3, seed=1), "w")
