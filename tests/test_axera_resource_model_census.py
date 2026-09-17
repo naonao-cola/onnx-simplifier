@@ -336,10 +336,32 @@ class TestRegisterCensus(unittest.TestCase):
         # single fixture -- still fails loudly); new registers joining
         # the universal set as the corpus grows is not asserted against
         # either way.
+        #
+        # tests/test_axera_mul_bank81_check.py's own 9 deliberately
+        # atypical constant-operand Mul probes (a single live tensor
+        # plus a compile-time-constant second operand, built to
+        # stress-test a codec mechanism no ROUTINE op probe in this
+        # corpus otherwise exercises) genuinely lack registers
+        # 100/101/107 at three of those nine shapes -- a real
+        # structural fact about that atypical construction, not a
+        # regression in the "routine op corpus" this check's own
+        # known_universal set describes. Excluded here by name prefix
+        # (all nine, not just the three that actually lack a register,
+        # since all nine share the same atypical single-live-tensor
+        # construction), the same targeted-exclusion precedent
+        # tests/test_axera_bank81_cross_op_check.py's own
+        # test_no_matmul_fixture_carries_bank_0x81 already used for a
+        # sibling file's own deliberately atypical probe fixtures.
+        _mul_bank81_probes = {
+            os.path.basename(fx)
+            for fx in _all_fixtures()
+            if os.path.basename(fx).startswith("mul_bank81_probe_")
+        }
+        _non_atypical_total = _CENSUS["n_fixtures"] - len(_mul_bank81_probes)
         universal = {
             r
             for r, fixset in _CENSUS["reg_fixture_set"].items()
-            if len(fixset) == _CENSUS["n_fixtures"]
+            if len(fixset - _mul_bank81_probes) >= _non_atypical_total
         }
         known_universal = {
             0,
