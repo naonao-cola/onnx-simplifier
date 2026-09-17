@@ -13,6 +13,7 @@ import pytest
 from onnx import parser
 
 import onnxsim
+from onnxsim.mx_quantization import _quantize_weight_only_mxfp4_python
 
 ort = pytest.importorskip("onnxruntime")
 
@@ -151,12 +152,15 @@ def test_cpp_mxfp4_matches_python_reference_output():
     # block-wise MXFP4 algorithm (round-to-nearest onto the same fixed E2M1
     # codebook, the same power-of-two scale rule) -- on the same weight they
     # should produce numerically equivalent dequantized outputs, not just
-    # separately "close to float32".
+    # separately "close to float32". onnxsim.quantize_weight_only_mxfp4
+    # itself now delegates to this same C++ port for block_size=32 (the
+    # default), so the pure-Python reference is called directly here to
+    # keep this a real cross-check.
     rng = np.random.default_rng(9)
     weight = rng.standard_normal((64, 16)).astype(np.float32) * 0.7
     model = _matmul_model(weight=weight)
 
-    q_py = onnxsim.quantize_weight_only_mxfp4(model, block_size=32)
+    q_py = _quantize_weight_only_mxfp4_python(model, block_size=32)
     q_cpp = onnxsim.quantize_weight_only_mxfp4_cpp(model)
     onnx.checker.check_model(q_py)
     onnx.checker.check_model(q_cpp)

@@ -1276,8 +1276,8 @@ def quantize_weight_only_mxfp4_cpp(
     ordinary affine range -- see :func:`onnxsim.quantize_weight_only_mxfp4`'s
     own docstring for the format's full definition. Needs no calibration
     data: both the codebook and the per-block power-of-two scale come from
-    the weight's own values. Unlike the pure-Python implementation, ``Conv``
-    layers are not (yet) handled -- only ``MatMul``/``Gemm``.
+    the weight's own values. Like the pure-Python implementation, only
+    ``MatMul``/``Gemm`` are handled -- neither port supports ``Conv``.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
