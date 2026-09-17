@@ -165,13 +165,15 @@ jobs:
       # inside the container, unlike the runner-hosted jobs above where it's
       # preinstalled). ubuntu:22.04 ships Python 3.10 as its default python3,
       # exactly the one version tpu_mlir's wheel supports
-      # (python_requires=">=3.10,<3.11"). build-essential is needed because
-      # tpu_mlir[onnx] pulls in pycocotools, which has no prebuilt wheel for
-      # this platform and compiles a Cython extension (_mask.pyx) from source.
+      # (python_requires=">=3.10,<3.11"). build-essential + python3-dev are
+      # needed because tpu_mlir[onnx] pulls in pycocotools, which has no
+      # prebuilt wheel for this platform and compiles a Cython extension
+      # (_mask.pyx) from source, including against Python.h (not shipped by
+      # the bare python3 apt package).
       - name: Install git + Python 3.10 + build tools
         run: |
           apt-get update -qq
-          apt-get install -y --no-install-recommends git ca-certificates python3 python3-pip python3-venv build-essential
+          apt-get install -y --no-install-recommends git ca-certificates python3 python3-pip python3-venv python3-dev build-essential
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
