@@ -74,17 +74,11 @@ way :mod:`onnxsim.smoothquant` is meant to run before
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.attention_quantization import _find_attention_candidates
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
-from onnxsim.calibration import Tensors, generate_random_calibration_data
+from onnxsim.calibration import Tensors
 from onnxsim.onnx_simplifier import apply_qoq_cpp
 
 
@@ -181,87 +175,26 @@ def apply_smooth_attention(
             a plain-enough (rank >= 2) probe, or a model with no matching
             subgraph at all, is left untouched for that subgraph (or
             returned unchanged, respectively)
+
+    Delegates to the verified C++ port
+    (:func:`onnxsim.apply_smooth_attention_cpp`), which reimplements this
+    function's own attention-subgraph matching (transcribed from
+    :func:`onnxsim.attention_quantization._find_attention_candidates` at
+    the protobuf level -- see ``smooth_attention_entry.h`` for why) and
+    per-head-dim-channel absmax/scale computation exactly -- a closed-form
+    diagonal rescaling with no RNG. This function's own former
+    pure-Python implementation is preserved as-is in this module's own
+    git history.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_smooth_attention_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    taken_names = _all_names(graph)
-
-    candidates = []
-    seen_matmuls = set()
-    for c in _find_attention_candidates(graph):
-        if id(c.qk_matmul) in seen_matmuls:
-            continue
-        seen_matmuls.add(id(c.qk_matmul))
-        candidates.append(c)
-    if not candidates:
-        return out
-
-    probe_names = sorted({c.qk_matmul.input[1] for c in candidates})
-    probe_model = _add_probe_outputs(out, probe_names)
-
-    # Key's own per-head-dim-channel max-abs value, over the calibration
-    # set -- Kt (Key, transposed) has shape [..., head_dim, seq_k], so the
-    # channel axis is the second-to-last one.
-    k_absmax: Dict[str, np.ndarray] = {}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            arr = np.asarray(result[name], dtype=np.float64)
-            if arr.ndim < 2:
-                continue
-            flat = np.moveaxis(arr, -2, -1).reshape(-1, arr.shape[-2])
-            m = np.abs(flat).max(axis=0)
-            k_absmax[name] = (
-                m if name not in k_absmax else np.maximum(k_absmax[name], m)
-            )
-
-    for c in candidates:
-        kt_name = c.qk_matmul.input[1]
-        absmax = k_absmax.get(kt_name)
-        if absmax is None:
-            continue  # never observed as a rank >= 2 tensor; skip
-
-        s = np.maximum(absmax, epsilon).astype(np.float32)  # [head_dim]
-        head_dim = s.shape[0]
-        q_name = c.qk_matmul.input[0]
-
-        # Q *= s -- broadcasts over Q's own last axis (head_dim).
-        s_row_name = _unique_name(f"{q_name}_smooth_attn_s", taken_names)
-        graph.initializer.append(onnx.numpy_helper.from_array(s, name=s_row_name))
-        q_scaled_name = _unique_name(f"{q_name}_smooth_attn_q", taken_names)
-        q_mul_node = onnx.helper.make_node(
-            "Mul",
-            [q_name, s_row_name],
-            [q_scaled_name],
-            name=_unique_name(f"{q_name}_smooth_attn_q_node", taken_names),
-        )
-
-        # Kt /= s -- broadcasts over Kt's second-to-last axis (head_dim),
-        # via a [head_dim, 1]-shaped divisor.
-        s_col_name = _unique_name(f"{kt_name}_smooth_attn_s_col", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(s.reshape(head_dim, 1), name=s_col_name)
-        )
-        kt_scaled_name = _unique_name(f"{kt_name}_smooth_attn_k", taken_names)
-        k_div_node = onnx.helper.make_node(
-            "Div",
-            [kt_name, s_col_name],
-            [kt_scaled_name],
-            name=_unique_name(f"{kt_name}_smooth_attn_k_node", taken_names),
-        )
-
-        node_idx = next(i for i, n in enumerate(graph.node) if n is c.qk_matmul)
-        graph.node.insert(node_idx, q_mul_node)
-        graph.node.insert(node_idx + 1, k_div_node)
-        c.qk_matmul.input[0] = q_scaled_name
-        c.qk_matmul.input[1] = kt_scaled_name
-
-    return out
+    return apply_smooth_attention_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        epsilon=epsilon,
+        providers=providers,
+    )

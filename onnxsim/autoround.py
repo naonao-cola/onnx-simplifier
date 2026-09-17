@@ -42,11 +42,15 @@ problem than AdaRound's fixed-scale search over rounding alone -- both `v`
 and the clip-ratio parameter `c` influence `floor_base` every iteration, so
 with a matched iteration budget this can occasionally converge to a worse
 local optimum than AdaRound's own decoupled search would reach. Rather
-than risk that regression, :func:`_optimize_rounding_and_clip` always runs
-AdaRound's own fixed-scale search as well and keeps whichever of the two
-has the lower measured reconstruction error -- so :func:`apply_autoround`
-is guaranteed to never do worse than :func:`onnxsim.apply_adaround` would
-on the same layer and calibration data.
+than risk that regression, both this module's own C++ port
+(``onnxsim/autoround_entry.cpp``'s own ``ApplyAutoround``, what
+:func:`apply_autoround` delegates to by default -- see that function's own
+docstring) and its ``step_providers``-driven ONNX-step-graph path
+(:func:`_optimize_rounding_and_clip_on_graph` below) always ALSO run
+AdaRound's own fixed-scale search and keep whichever of the two has the
+lower measured reconstruction error -- so :func:`apply_autoround` is
+guaranteed to never do worse than :func:`onnxsim.apply_adaround` would on
+the same layer and calibration data.
 
 Both halves of that -- the joint search and the AdaRound comparison run --
 also exist as an ONNX *step graph* (:mod:`onnxsim.qat_graph`), reached by
@@ -77,7 +81,6 @@ from onnxsim.adaround import (
     _find_int4_matmul_candidates,
     _h_and_dhdv,
     _init_relaxation,
-    _optimize_rounding,
     _optimize_rounding_on_graph,
     _pack_int4,
     _rounding_codes,
@@ -223,15 +226,19 @@ def _joint_loop(
     clip parameter ``c`` jointly, in host numpy (float64). Returns the two
     optimized parameters, not the codes they collapse to.
 
-    Split out of :func:`_optimize_rounding_and_clip` so that it and
-    :func:`_joint_loop_on_graph` are two implementations of exactly one
-    thing -- the same warm start in, the same parameters out, with the
-    collapse (:func:`_autoround_results`) and the AdaRound safety net
-    (:func:`_keep_better_of`) around them shared rather than duplicated.
-    That is also what makes the two comparable in a test at all: the safety
+    This and :func:`_joint_loop_on_graph` are two implementations of
+    exactly one thing -- the same warm start in, the same parameters out,
+    with the collapse (:func:`_autoround_results`) and the AdaRound safety
+    net (:func:`_keep_better_of`) around them shared rather than
+    duplicated (the C++ port, ``onnxsim/autoround_entry.cpp``'s own
+    ``ApplyAutoround``, is a third, independent implementation of that same
+    shape). That is also what makes this one and
+    :func:`_joint_loop_on_graph` comparable in a test at all: the safety
     net can pick different branches on the two paths, so an assertion about
     *the optimizers* has to be able to look at ``(v, c)`` before that choice
-    is made.
+    is made -- see tests/test_autoround_step_graph.py, the only remaining
+    caller of this function now that :func:`apply_autoround` itself
+    delegates to the C++ port whenever ``step_providers`` is ``None``.
     """
     n_out, k = w_nk.shape
     num_blocks = scale_blocks.shape[1]
@@ -299,82 +306,6 @@ def _joint_loop(
     return v, c
 
 
-def _optimize_rounding_and_clip(
-    w_nk: np.ndarray,
-    scale_blocks: np.ndarray,
-    block_size: int,
-    x: np.ndarray,
-    n_min: float,
-    n_max: float,
-    num_iterations: int,
-    learning_rate: float,
-    clip_learning_rate: float,
-    reg_param: float,
-    warm_start: float,
-    beta_range: "tuple[float, float]",
-    clip_ratio_range: "tuple[float, float]",
-) -> "tuple[np.ndarray, np.ndarray]":
-    """Like :func:`onnxsim.adaround._optimize_rounding`, but jointly
-    optimizes a per-(N, block) clip-ratio parameter alongside the
-    per-element rounding relaxation. ``w_nk``/``scale_blocks`` are laid out
-    ``[N, K]``/``[N, K / block_size]`` (output channel first), matching
-    :func:`onnxsim.apply_autoround`'s own normalization. Returns
-    ``(codes_nk, scale_blocks_optimized)``.
-
-    Jointly optimizing two coupled parameter sets (v and c both influence
-    ``floor_base`` every iteration, unlike AdaRound's fixed-scale search
-    over v alone) is a harder, non-convex problem than AdaRound's own --
-    with a matched iteration budget it can occasionally converge to a
-    reconstruction error *worse* than AdaRound's decoupled optimum would
-    reach. Rather than accept that risk, this always finishes by running
-    AdaRound's own fixed-scale optimization too (``clip_ratio == 1``
-    throughout, i.e. exactly :func:`onnxsim.adaround._optimize_rounding`'s
-    own search) and returns whichever of the two actually has the lower
-    measured reconstruction error on ``x`` -- so :func:`apply_autoround`
-    is guaranteed never to do worse than :func:`onnxsim.apply_adaround`
-    would on the same layer and calibration data.
-    """
-    y_float = x @ w_nk.T  # [num_samples, N]
-    scale_nk0, v, c = _init_autoround(w_nk, scale_blocks, block_size)
-    v, c = _joint_loop(
-        w_nk,
-        scale_blocks,
-        block_size,
-        x,
-        y_float,
-        v,
-        c,
-        n_min,
-        n_max,
-        num_iterations,
-        learning_rate,
-        clip_learning_rate,
-        reg_param,
-        warm_start,
-        beta_range,
-        clip_ratio_range,
-    )
-    joint = _autoround_results(
-        w_nk, scale_blocks, block_size, v, c, n_min, n_max, clip_ratio_range
-    )
-
-    # Safety net (see docstring): never return worse than AdaRound's own
-    # fixed-scale optimum would.
-    codes_ada_only = _optimize_rounding(
-        w_nk,
-        scale_nk0,
-        x,
-        n_min,
-        n_max,
-        num_iterations,
-        learning_rate,
-        reg_param,
-        warm_start,
-        beta_range,
-    )
-    return _keep_better_of(x, y_float, scale_blocks, scale_nk0, joint, codes_ada_only)
-
-
 def _int64_const(
     b: qat_graph.GraphBuilder,
     value: Union[Sequence[int], np.ndarray],
@@ -440,8 +371,9 @@ def _build_autoround_step_graph(
     n_max: float,
     clip_ratio_range: "tuple[float, float]",
 ) -> qat_graph.StepGraph:
-    """One Adam step of :func:`_optimize_rounding_and_clip`, as an ONNX
-    graph.
+    """One Adam step of AutoRound's own joint rounding-and-clip search
+    (:func:`_joint_loop`'s own numpy loop, or equivalently the C++ port's
+    own ``ApplyAutoround``), as an ONNX graph.
 
     Node for node the same computation the numpy loop performs -- the same
     rectified-sigmoid rounding relaxation, the same bounded clip-ratio
@@ -702,8 +634,9 @@ def _optimize_rounding_and_clip_on_graph(
     clip_ratio_range: "tuple[float, float]",
     providers: Optional[Sequence[str]],
 ) -> "tuple[np.ndarray, np.ndarray]":
-    """:func:`_optimize_rounding_and_clip`, run on ``providers`` as an ONNX
-    step graph instead of in host numpy.
+    """AutoRound's own joint rounding-and-clip search (:func:`_joint_loop`'s
+    own numpy loop, or equivalently the C++ port's own ``ApplyAutoround``),
+    run on ``providers`` as an ONNX step graph instead of in host numpy.
 
     Structurally the same function: the same warm start
     (:func:`_init_autoround`), the same collapse
@@ -834,13 +767,61 @@ def apply_autoround(
             build) WebGPU with this loop. Both halves of the layer's work go
             there: the joint rounding-and-clip search and the AdaRound
             comparison run its safety net needs. ``None``, the default,
-            keeps the in-process float64 numpy loop, which is exact and
-            deterministic; a step graph computes in float32, so its result
-            agrees closely rather than bit-exactly. See ``docs/qat.md``.
+            delegates to the verified C++ port
+            (:func:`onnxsim.apply_autoround_cpp`) instead of an in-process
+            numpy loop; a step graph computes in float32, so its result
+            agrees closely rather than bit-exactly with either. See
+            ``docs/qat.md``.
     :returns: ``quantized_model`` with every matched layer's INT4 weight
             initializer rewritten to its AutoRound-optimized codes, and its
             scale initializer rewritten to the optimized per-block scale
+
+    **Two implementations, one function.** When ``step_providers`` is
+    ``None`` (the default -- the common, host-only case), this is a thin
+    alias for :func:`onnxsim.apply_autoround_cpp`
+    (``onnxsim/autoround_entry.cpp``'s own ``ApplyAutoround``), forwarding
+    every other argument unchanged. **Behavior change from earlier onnxsim
+    versions:** this is a two-parameter-group iterative Adam optimization,
+    not a closed-form computation, so floating-point differences between
+    the C++ port's own scalar dense-matmul kernels and this module's own
+    numpy loop can compound across iterations -- the C++ port's own
+    ``ApplyAutoround`` always ALSO runs AdaRound's own fixed-scale safety
+    net and keeps whichever candidate has the lower measured
+    reconstruction error, the identical guarantee this module's own numpy
+    path provides, so this alias can never regress reconstruction error
+    below what :func:`onnxsim.apply_adaround` would reach on the same layer
+    and calibration data -- see ``onnxsim/autoround_entry.h``'s own
+    accepted numerical scope note and tests/test_autoround_cpp.py for how
+    closely (or not) it otherwise tracks this module's own numpy loop. When
+    ``step_providers`` is given, this still runs the pure-Python
+    candidate-matching/activation-capture loop below, driving
+    :func:`_optimize_rounding_and_clip_on_graph`'s own ONNX step-graph
+    execution instead -- that accelerator path has no C++ port and is
+    unaffected by this alias. Imported lazily (inside the function body,
+    not at module scope) to avoid a circular import:
+    ``onnxsim.onnx_simplifier`` already imports from this module, so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
+    if step_providers is None:
+        from onnxsim.onnx_simplifier import apply_autoround_cpp
+
+        return apply_autoround_cpp(
+            float_model,
+            quantized_model,
+            calibration_data=calibration_data,
+            num_samples=num_samples,
+            seed=seed,
+            num_iterations=num_iterations,
+            learning_rate=learning_rate,
+            clip_learning_rate=clip_learning_rate,
+            reg_param=reg_param,
+            warm_start=warm_start,
+            beta_range=beta_range,
+            clip_ratio_range=clip_ratio_range,
+            providers=providers,
+        )
+
     if isinstance(float_model, str):
         float_model = onnx.load(float_model, load_external_data=False)
     if isinstance(quantized_model, str):
@@ -863,6 +844,14 @@ def apply_autoround(
         for name in probe_names:
             activations[name].append(np.asarray(out[name], dtype=np.float64))
 
+    # step_providers is guaranteed non-None here (the None case delegates
+    # to the C++ port and returns above), so this is always the ONNX
+    # step-graph path -- matches onnxsim.adaround's own identical
+    # simplification once its own numpy path was replaced by a C++ port.
+    optimize = functools.partial(
+        _optimize_rounding_and_clip_on_graph, providers=step_providers
+    )
+
     optimized_codes: Dict[str, np.ndarray] = {}
     optimized_scale: Dict[str, np.ndarray] = {}
     for cand in candidates:
@@ -884,13 +873,6 @@ def apply_autoround(
         if x.shape[1] != w_nk.shape[1]:
             continue  # activation's feature dim doesn't match K; skip
 
-        optimize = (
-            _optimize_rounding_and_clip
-            if step_providers is None
-            else functools.partial(
-                _optimize_rounding_and_clip_on_graph, providers=step_providers
-            )
-        )
         codes_nk, scale_blocks_new = optimize(
             w_nk,
             scale_blocks,

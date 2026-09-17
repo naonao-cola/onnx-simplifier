@@ -65,7 +65,9 @@ additive perturbation does.
   initialized to 0) -- a standard reparametrization for a
   positive-multiplicative learned quantity, and, as a useful side effect,
   algebraically simplifies the gradient (``d(S)/d(v2) == S`` and
-  ``d(S)/d(v3) == S``; see ``_optimize_divisor`` below).
+  ``d(S)/d(v3) == S``; see ``onnxsim/flexround_entry.cpp``'s own
+  ``OptimizeDivisor`` for the C++ port :func:`apply_flexround` delegates
+  to).
 - The paper's own forward pass applies ``round()`` every iteration
   (straight-through for the backward pass). This module instead keeps the
   *continuous* relaxation ``clip(W / S, n_min, n_max)`` throughout
@@ -90,117 +92,11 @@ numpy, matching :mod:`onnxsim.adaround`/:mod:`onnxsim.gptq`/
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _find_int4_matmul_candidates, _pack_int4
-from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-
-
-def _optimize_divisor(
-    w_nk: np.ndarray,
-    scale_nk: np.ndarray,
-    x: np.ndarray,
-    n_min: float,
-    n_max: float,
-    num_iterations: int,
-    learning_rate: float,
-    log_clip: float,
-) -> np.ndarray:
-    """Returns FlexRound-optimized integer codes (shape like ``w_nk``,
-    values in ``[n_min, n_max]``) for one weight matrix, given its layer's
-    activation ``x`` (shape ``[num_samples, K]``) captured from the float
-    model. ``w_nk``/``scale_nk`` are the float weight and its (already
-    block-broadcast) per-element scale, both laid out ``[N, K]`` (output
-    channel first) regardless of the op's own storage layout.
-
-    Implements the paper's Eq. 2 for a linear layer, with ``s1`` fixed at
-    ``scale_nk`` (see this module's own docstring for why): the effective
-    divisor is ``S = scale_nk * S2 * s3``, ``S2`` element-wise (``[N, K]``)
-    and ``s3`` per-output-channel (``[N, 1]``), both parametrized in
-    log-space (``S2 = exp(v2)``, ``s3 = exp(v3)``) to keep them positive by
-    construction and initialized at ``v2 = v3 = 0`` (``S2 = s3 = 1``, so the
-    very first forward pass is exactly round-to-nearest at ``scale_nk``,
-    the paper's own stated initialization).
-
-    The paper's own forward pass applies ``round()`` every iteration
-    (straight-through for the backward pass). This implementation instead
-    keeps the *continuous* relaxation ``clip(ratio, n_min, n_max)`` (no
-    ``round()``) throughout the optimization loop, and only rounds once at
-    the very end to produce integer codes -- the same structure
-    :func:`onnxsim.adaround._optimize_rounding` uses for its own relaxation
-    (optimize a smooth surrogate throughout, discretize once at the end).
-    Empirically, re-rounding every iteration makes the loss surface a step
-    function of ``v2``/``v3``, which destabilizes Adam's per-parameter
-    second-moment estimate for no benefit here (there's no annealed
-    regularizer, unlike AdaRound's, pulling values toward a hard decision
-    mid-optimization that would need it); the continuous-throughout version
-    below is mathematically the direct straight-through gradient of the
-    quantity it actually optimizes, verified against finite differences.
-
-    Gradients use a straight-through estimator through ``round()``
-    (``codes ~= ratio`` for backward purposes, zeroed wherever clamping to
-    ``[n_min, n_max]`` already saturated -- the same "active" masking
-    :func:`onnxsim.adaround._optimize_rounding` applies to its own
-    relaxation), combined with the log-parametrization's own simplification
-    (``d(S)/d(v2) == S`` element-wise, ``d(S)/d(v3) == S`` summed over
-    ``K``) so no explicit Jacobian of ``S2``/``s3`` w.r.t. ``S`` is needed.
-    """
-    y_float = x @ w_nk.T  # [num_samples, N]
-    n = x.shape[0] * w_nk.shape[0]
-
-    v2 = np.zeros_like(w_nk)
-    v3 = np.zeros((w_nk.shape[0], 1), dtype=w_nk.dtype)
-
-    m2 = np.zeros_like(v2)
-    u2 = np.zeros_like(v2)
-    m3 = np.zeros_like(v3)
-    u3 = np.zeros_like(v3)
-    adam_beta1, adam_beta2, adam_eps = 0.9, 0.999, 1e-8
-
-    for t in range(num_iterations):
-        s2 = np.exp(v2)
-        s3 = np.exp(v3)
-        s = scale_nk * s2 * s3  # [N, K], effective (element-wise) divisor
-
-        ratio = w_nk / s
-        active = (ratio > n_min) & (ratio < n_max)
-        codes = np.clip(ratio, n_min, n_max)  # continuous surrogate this loop optimizes
-        w_hat = codes * scale_nk  # deployed dequant always uses scale_nk, not s
-
-        y_hat = x @ w_hat.T
-        dl_dy = 2.0 * (y_hat - y_float) / n
-        dl_dw_hat = dl_dy.T @ x  # [N, K]
-
-        dw_hat_dratio = np.where(active, scale_nk, 0.0)
-        dratio_ds = np.where(active, -w_nk / (s * s), 0.0)
-        grad_s = dl_dw_hat * dw_hat_dratio * dratio_ds
-
-        grad_sv = grad_s * s  # == dL/d(v2) elementwise, and dL/d(v3) pre-sum
-        grad_v2 = grad_sv
-        grad_v3 = grad_sv.sum(axis=1, keepdims=True)
-
-        m2 = adam_beta1 * m2 + (1.0 - adam_beta1) * grad_v2
-        u2 = adam_beta2 * u2 + (1.0 - adam_beta2) * (grad_v2 * grad_v2)
-        m2_hat = m2 / (1.0 - adam_beta1 ** (t + 1))
-        u2_hat = u2 / (1.0 - adam_beta2 ** (t + 1))
-        v2 = v2 - learning_rate * m2_hat / (np.sqrt(u2_hat) + adam_eps)
-        v2 = np.clip(v2, -log_clip, log_clip)
-
-        m3 = adam_beta1 * m3 + (1.0 - adam_beta1) * grad_v3
-        u3 = adam_beta2 * u3 + (1.0 - adam_beta2) * (grad_v3 * grad_v3)
-        m3_hat = m3 / (1.0 - adam_beta1 ** (t + 1))
-        u3_hat = u3 / (1.0 - adam_beta2 ** (t + 1))
-        v3 = v3 - learning_rate * m3_hat / (np.sqrt(u3_hat) + adam_eps)
-        v3 = np.clip(v3, -log_clip, log_clip)
-
-    s_final = scale_nk * np.exp(v2) * np.exp(v3)
-    return np.clip(np.round(w_nk / s_final), n_min, n_max)
+from onnxsim.calibration import Tensors
 
 
 def apply_flexround(
@@ -264,75 +160,34 @@ def apply_flexround(
             initializer rewritten to its FlexRound-optimized codes (same
             shape, dtype, and scale -- only which integer each element
             rounds to changes)
+
+    This entry point is a thin alias for the verified C++ port
+    :func:`onnxsim.apply_flexround_cpp` (``onnxsim/flexround_entry.cpp``'s
+    own ``ApplyFlexround``), forwarding every argument unchanged. **Not**
+    bit-exact with this function's own former in-process numpy loop (this
+    module's own former ``_optimize_divisor``, now removed as dead code --
+    no other module imported it): FlexRound's reciprocal parametrization is
+    measurably MORE sensitive to floating-point summation-order/libm
+    differences than e.g. AdaRound's own rectified-sigmoid relaxation is,
+    since its gradient divides by the effective divisor squared -- see
+    ``flexround_entry.h``'s own accepted numerical scope note and
+    tests/test_flexround_cpp.py for exactly how closely (or not) the C++
+    port tracks what this function's own numpy loop used to compute.
+    Imported lazily (inside the function body, not at module scope) to
+    avoid a circular import: ``onnxsim.onnx_simplifier`` already imports
+    from this module, so importing it back at module load time here would
+    deadlock the import machinery.
     """
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    if isinstance(quantized_model, str):
-        quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_flexround_cpp
 
-    candidates = _find_int4_matmul_candidates(float_model, quantized_model)
-    if not candidates:
-        return quantized_model
-
-    probe_names = sorted({c.float_node.input[0] for c in candidates})
-    float_probe = _add_probe_outputs(float_model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        out = backend.run_model(float_probe, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(out[name], dtype=np.float64))
-
-    optimized: Dict[str, np.ndarray] = {}
-    for c in candidates:
-        acts = _activation_rows(activations[c.float_node.input[0]])
-        if not acts:
-            continue  # no usable activation (no feature axis); skip
-        x = np.concatenate(acts, axis=0)
-
-        w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)
-        scale = onnx.numpy_helper.to_array(c.ws_init).astype(np.float64)
-        dim0, dim1 = w.shape
-
-        # Normalize to [N, K] (output channel first) regardless of storage
-        # layout, and broadcast the block-wise scale up to full [N, K].
-        if c.weight_transposed:
-            w_nk = w  # already [N, K]
-            scale_blocks = scale  # already [N, K / block_size]
-        else:
-            w_nk = w.T  # [K, N] -> [N, K]
-            scale_blocks = scale.T  # [K / block_size, N] -> [N, K / block_size]
-        if x.shape[1] != w_nk.shape[1]:
-            continue  # activation's feature dim doesn't match K; skip
-        scale_nk = np.repeat(scale_blocks, c.block_size, axis=1)[:, : w_nk.shape[1]]
-
-        codes_nk = _optimize_divisor(
-            w_nk,
-            scale_nk,
-            x,
-            n_min=-7.0,
-            n_max=7.0,
-            num_iterations=num_iterations,
-            learning_rate=learning_rate,
-            log_clip=log_clip,
-        )
-        codes_orig = codes_nk if c.weight_transposed else codes_nk.T
-        assert codes_orig.shape == (dim0, dim1)
-        optimized[c.wq_name] = codes_orig.astype(np.int8)
-
-    if not optimized:
-        return quantized_model
-
-    corrected = onnx.ModelProto()
-    corrected.CopyFrom(quantized_model)
-    for t in corrected.graph.initializer:
-        codes = optimized.get(t.name)
-        if codes is None:
-            continue
-        t.raw_data = _pack_int4(codes)
-
-    return corrected
+    return apply_flexround_cpp(
+        float_model,
+        quantized_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        num_iterations=num_iterations,
+        learning_rate=learning_rate,
+        log_clip=log_clip,
+        providers=providers,
+    )
