@@ -32,12 +32,18 @@ def _model(body, initializer=(), opset=17, ir_version=9):
 
 
 def _tiny_model():
+    # (64, 64) float32 = 16KB, comfortably over the 1024-byte per-tensor
+    # externalization threshold _save always applies (even under
+    # force_external_data=True, see _save's own comment) -- a smaller weight
+    # here would stay inline under "force" mode too, and the
+    # force_external_data-specific tests below need a tensor that actually
+    # moves out to a companion .data file.
     w = onnx.numpy_helper.from_array(
-        np.random.RandomState(0).rand(4, 4).astype(np.float32), "W"
+        np.random.RandomState(0).rand(64, 64).astype(np.float32), "W"
     )
     return _model(
         """
-        g (float[4,4] X) => (float[4,4] Y)
+        g (float[64,64] X) => (float[64,64] Y)
         {
           Y = Add(X, W)
         }
