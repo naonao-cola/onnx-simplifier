@@ -62,61 +62,11 @@ here instead of once. Plain numpy, no framework dependency, matching
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _find_int4_matmul_candidates, _pack_int4
-from onnxsim.awq import _quantize_blockwise_int4
-from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-
-
-def _quantease_quantize_columns(
-    w_nk: np.ndarray,
-    scale_blocks: np.ndarray,
-    quant_block_size: int,
-    h: np.ndarray,
-    num_epochs: int,
-) -> np.ndarray:
-    """Returns QuantEase-optimized integer codes for ``w_nk`` ([N, K],
-    output channel first), reusing ``scale_blocks``' existing per-(output
-    channel, quantization group) scale (shape ``[N, K // quant_block_size]``
-    -- unchanged from what :func:`onnxsim.quantize_weight_only_int4` already
-    computed; like GPTQ, this only changes which integer each element rounds
-    to, never the scale). ``h`` is the layer's ``[K, K]`` Hessian
-    (``X^T @ X``), used directly (no inverse/factorization needed, unlike
-    :func:`onnxsim.gptq._gptq_quantize_columns`).
-    """
-    n, k = w_nk.shape
-    scale_full = np.repeat(scale_blocks, quant_block_size, axis=1)  # [N, K]
-
-    # Start from plain round-to-nearest -- the same starting point GPTQ's
-    # own sequential correction implicitly builds from -- then refine.
-    codes_nk, _ = _quantize_blockwise_int4(w_nk, quant_block_size)
-    w_hat = codes_nk * scale_full
-    r = w_nk - w_hat  # residual, updated in place as each column moves
-
-    diag = np.arange(k)
-    h_diag = np.maximum(h[diag, diag], 1e-12)  # guard a "dead" (all-zero) channel
-
-    for _ in range(num_epochs):
-        for kk in range(k):
-            delta = (r @ h[:, kk]) / h_diag[kk]  # [N], vectorized over rows
-            group = kk // quant_block_size
-            s = scale_blocks[:, group]  # [N]
-            unconstrained = w_hat[:, kk] + delta
-            new_code = np.clip(np.round(unconstrained / s), -7.0, 7.0)
-            new_val = new_code * s
-            r[:, kk] -= new_val - w_hat[:, kk]
-            w_hat[:, kk] = new_val
-            codes_nk[:, kk] = new_code
-
-    assert w_hat.shape == (n, k)
-    return codes_nk
+from onnxsim.calibration import Tensors
 
 
 def apply_quantease(
@@ -168,67 +118,24 @@ def apply_quantease(
             initializer rewritten to its QuantEase-optimized codes (same
             shape, dtype, and scale -- only which integer each element
             rounds to changes)
+
+    Thin wrapper delegating to the verified C++ port
+    (:func:`onnxsim.apply_quantease_cpp`) -- full parameter parity, no
+    functionality gap and no accepted numerical-algorithm divergence (see
+    that function's own docstring, and ``onnxsim/quantease_entry.h``: this
+    port needs no matrix inversion/factorization at all, unlike
+    :func:`onnxsim.apply_gptq_cpp`'s own Cholesky-inverse note, so there is
+    no linear-algebra routine whose choice of algorithm could diverge from
+    numpy's own).
     """
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    if isinstance(quantized_model, str):
-        quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_quantease_cpp
 
-    candidates = _find_int4_matmul_candidates(float_model, quantized_model)
-    if not candidates:
-        return quantized_model
-
-    probe_names = sorted({c.float_node.input[0] for c in candidates})
-    float_probe = _add_probe_outputs(float_model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        out = backend.run_model(float_probe, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(out[name], dtype=np.float64))
-
-    optimized: Dict[str, np.ndarray] = {}
-    for c in candidates:
-        acts = _activation_rows(activations[c.float_node.input[0]])
-        if not acts:
-            continue  # no usable activation (no feature axis); skip
-        x = np.concatenate(acts, axis=0)
-
-        w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)
-        scale = onnx.numpy_helper.to_array(c.ws_init).astype(np.float64)
-        dim0, dim1 = w.shape
-
-        if c.weight_transposed:
-            w_nk = w  # already [N, K]
-            scale_blocks = scale  # already [N, K / block_size]
-        else:
-            w_nk = w.T  # [K, N] -> [N, K]
-            scale_blocks = scale.T  # [K / block_size, N] -> [N, K / block_size]
-        if x.shape[1] != w_nk.shape[1]:
-            continue  # activation's feature dim doesn't match K; skip
-
-        h = x.T @ x
-        codes_nk = _quantease_quantize_columns(
-            w_nk, scale_blocks, c.block_size, h, num_epochs
-        )
-
-        codes_orig = codes_nk if c.weight_transposed else codes_nk.T
-        assert codes_orig.shape == (dim0, dim1)
-        optimized[c.wq_name] = codes_orig.astype(np.int8)
-
-    if not optimized:
-        return quantized_model
-
-    corrected = onnx.ModelProto()
-    corrected.CopyFrom(quantized_model)
-    for t in corrected.graph.initializer:
-        codes = optimized.get(t.name)
-        if codes is None:
-            continue
-        t.raw_data = _pack_int4(codes)
-
-    return corrected
+    return apply_quantease_cpp(
+        float_model,
+        quantized_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        num_epochs=num_epochs,
+        providers=providers,
+    )

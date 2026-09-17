@@ -23,8 +23,12 @@
 #include "billm_entry.h"
 #include "dac_entry.h"
 #include "daq_entry.h"
+#include "duquant_entry.h"
+#include "easyquant_entry.h"
 #include "embedding_quantization_entry.h"
+#include "fptq_entry.h"
 #include "gear_entry.h"
+#include "gptaq_entry.h"
 #include "gptq_entry.h"
 #include "gptvq_entry.h"
 #include "imatrix_quant_entry.h"
@@ -39,6 +43,7 @@
 #include "paroquant_entry.h"
 #include "pb_llm_entry.h"
 #include "qronos_entry.h"
+#include "quantease_entry.h"
 #include "quarot_gptq_entry.h"
 #include "rotatekv_entry.h"
 #include "rptq_entry.h"
@@ -47,6 +52,7 @@
 #include "spqr_entry.h"
 #include "squeezellm_entry.h"
 #include "structured_pruning_entry.h"
+#include "svdquant_entry.h"
 #include "tesseraq_entry.h"
 
 // RAII owner for a DLManagedTensor: releasing it invokes the tensor's own
@@ -1351,6 +1357,22 @@ onnx::ModelProto ApplyDsq(const onnx::ModelProto& model);
 // one. See llm_int8.py's own module docstring for the technique and
 // llm_int8_entry.h for this port's own scope.
 
+// EasyQuant (Wu, Judd, Isaev, Micikevicius, 2020) coordinate-descent
+// W8A8 scale search -- C++ port of easyquant.py's own apply_easyquant,
+// declared in easyquant_entry.h (included above) rather than duplicated
+// here, mirroring how ApplyLlmInt8 (llm_int8_entry.h, also included
+// above) is documented in its own home header instead of this one. See
+// easyquant.py's own module docstring for the technique and
+// easyquant_entry.h for this port's own scope.
+
+// FPTQ (Li, Zhang, Li, Yao, Zhang, Chu, Sun, Du and Xie, 2023)
+// logarithmic-equalization migration -- C++ port of fptq.py's own
+// apply_fptq, declared in fptq_entry.h (included above) rather than
+// duplicated here, mirroring how ApplySmoothQuant (smoothquant_entry.h,
+// also included above) is documented in its own home header instead of
+// this one. See fptq.py's own module docstring for the technique and
+// fptq_entry.h for this port's own scope.
+
 // GPTQ (Frantar et al., 2022) sequential Hessian-compensated rounding --
 // C++ port of gptq.py's own apply_gptq, declared in gptq_entry.h
 // (included above) rather than duplicated here, mirroring how
@@ -1358,6 +1380,15 @@ onnx::ModelProto ApplyDsq(const onnx::ModelProto& model);
 // its own home header instead of this one. See gptq.py's own module
 // docstring for the technique and gptq_entry.h for this port's own scope
 // (including its accepted numerical scope).
+
+// GPTAQ (Li, Yin, Lee, Xiao, Panda, 2025) asymmetric-calibration
+// correction layered on top of ApplyGptq -- C++ port of gptaq.py's own
+// apply_gptaq, declared in gptaq_entry.h (included above) rather than
+// duplicated here, mirroring how ApplyGptq (gptq_entry.h, also included
+// above) is documented in its own home header instead of this one. See
+// gptaq.py's own module docstring for the technique's first-principles
+// derivation and gptaq_entry.h for this port's own scope (including its
+// accepted numerical scope, shared with ApplyGptq's).
 
 // AWQ (Lin et al., 2023) grid-searched per-channel rescaling -- C++ port
 // of awq.py's own apply_awq, declared in awq_entry.h (included above)
