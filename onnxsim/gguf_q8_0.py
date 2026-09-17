@@ -65,6 +65,7 @@ import onnx.numpy_helper
 
 from onnxsim.bias_correction import _all_names, _unique_name
 from onnxsim.llm_int8 import _match_matmul_like
+from onnxsim.onnx_simplifier import apply_gguf_q8_0_quantization_cpp
 
 _BLOCK_SIZE = 32
 _MAX_CODE = 127  # signed 8-bit code range [-128, 127]
@@ -98,7 +99,7 @@ def quantize_dequantize_q8_0(values: np.ndarray) -> np.ndarray:
     return dequant.reshape(-1)[:n].reshape(original_shape)
 
 
-def apply_gguf_q8_0_quantization(
+def _apply_gguf_q8_0_quantization_python(
     model: Union[str, onnx.ModelProto],
     include_conv: bool = True,
     skip_names: Optional[Iterable[str]] = None,
@@ -154,3 +155,32 @@ def apply_gguf_q8_0_quantization(
         node.input[1] = new_name
 
     return out
+
+
+def apply_gguf_q8_0_quantization(
+    model: Union[str, onnx.ModelProto],
+    include_conv: bool = True,
+    skip_names: Optional[Iterable[str]] = None,
+) -> onnx.ModelProto:
+    """Weight-only-quantizes every matched layer's float32 weight into
+    llama.cpp's own Q8_0 format -- see this module's own docstring.
+
+    Delegates to the verified C++ port (:func:`onnxsim.apply_gguf_q8_0_quantization_cpp`) only when
+    its own scope exactly covers this call -- ``include_conv=False`` and no
+    ``skip_names`` -- since that port matches MatMul/vanilla-Gemm only
+    (never ``Conv``) and has no ``skip_names`` knob at all. Any other call
+    (including the default ``include_conv=True``) falls back to this
+    module's own original pure-Python implementation
+    (:func:`_apply_gguf_q8_0_quantization_python`).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param include_conv: also quantize ``Conv``'s weight input
+    :param skip_names: weight initializer names to leave unquantized
+    :returns: ``model`` with every matched layer's weight replaced by its
+            Q8_0 round trip
+    """
+    if include_conv or skip_names:
+        return _apply_gguf_q8_0_quantization_python(model, include_conv, skip_names)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return apply_gguf_q8_0_quantization_cpp(model)
