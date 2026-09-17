@@ -11,7 +11,7 @@ name: Backend Integration
 # tests/test_modelopt_integration.py, tests/test_mmdeploy_integration.py,
 # tests/test_jax_export_integration.py, tests/test_jax_real_model_integration.py,
 # tests/test_bev_models_torch_e2e.py, tests/test_optimum_export_deploy.py,
-# tests/test_export_transformers.py.
+# tests/test_export_transformers.py, tests/test_tpu_mlir_integration.py.
 # See docs/dlpack-executor.md, which frames
 # the DLPack executor boundary as an "embeddability" seam for stacks like these.
 # The xnnpack job below is the odd one out: it exercises
@@ -57,6 +57,7 @@ on:
       - "tests/_bev_torch_custom_ops.py"
       - "tests/test_optimum_export_deploy.py"
       - "tests/test_export_transformers.py"
+      - "tests/test_tpu_mlir_integration.py"
       - "onnxsim/transformers_export.py"
       - "onnxsim/passes/rewrite_msdeformattn_to_gridsample.h"
       - "onnxsim/passes/rewrite_deform_conv_to_gather.h"
@@ -177,6 +178,73 @@ jobs:
       - name: Run nncase integration tests
         working-directory: ${{ runner.temp }}
         run: pytest -v "$GITHUB_WORKSPACE/tests/test_nncase_integration.py"
+
+  tpu_mlir:
+    name: Simplify and run on tpu-mlir
+    needs: build
+    # tpu-mlir's own setup.py declares platforms="unbuntu22.04": its compiled
+    # tpuc-opt/pymlir native extensions are linked against Ubuntu 22.04's
+    # glibc/libstdc++ and segfault on a newer ABI (confirmed directly against
+    # ubuntu-24.04, the OS every other job in this workflow runs on -- with or
+    # without LD_LIBRARY_PATH tricks to mix vendored and host libraries: using
+    # the full vendored lib/third_party crashes any *freshly spawned* process
+    # (tpuc-opt shells out via os.system, and even /bin/sh itself fails to
+    # resolve GLIBC_2.38 against the vendored, older libc.so.6 it pulls in
+    # via LD_LIBRARY_PATH), while excluding just the vendored glibc/libstdc++
+    # in favor of the host's own makes tpuc-opt itself segfault outright (an
+    # ABI mismatch, not a missing symbol). A container pinned to the actual
+    # declared OS sidesteps this entirely, and is more durable than pinning a
+    # runs-on: ubuntu-22.04 runner label, since GitHub has been retiring older
+    # ubuntu-*.04 runner images over time.
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    timeout-minutes: 30
+    steps:
+      # The bare ubuntu:22.04 image has neither git nor Python -- actions/
+      # checkout needs the former (it exec's a real git binary inside the
+      # container, unlike the runner-hosted jobs above where it's
+      # preinstalled). ubuntu:22.04 ships Python 3.10 as its default python3,
+      # exactly the one version tpu_mlir's wheel supports
+      # (python_requires=">=3.10,<3.11").
+      - name: Install git + Python 3.10
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git ca-certificates python3 python3-pip python3-venv
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-backend
+          path: wheelhouse
+      # tpu_mlir's own [onnx] extra pins the only onnx/onnxruntime/onnxsim/
+      # numpy/protobuf combination it ships pre-verified against
+      # (onnx==1.14.1, onnxruntime==1.16.3, onnxsim==0.4.17, numpy==1.24.3,
+      # protobuf==3.20.3) -- installing plain `tpu_mlir` alone resolves a
+      # numpy/protobuf pair current `onnx` can't even import against
+      # (ml_dtypes needs numpy>=2, tpu_mlir's compiled extensions need
+      # numpy==1.24.3 exactly). Installing the [onnx] extra first gets a
+      # mutually-compatible baseline, then the onnxsim wheel under test is
+      # force-reinstalled over the top with --no-deps so it doesn't drag its
+      # own numpy/onnx resolution back in. transform.OnnxOpt (tpu_mlir's own
+      # runtime-value-driven ConstantFolding pass, run immediately around
+      # every onnxsim.simplify() call -- see the test module's docstring)
+      # unconditionally imports torch, which isn't part of the [onnx] extra.
+      - name: Install tpu_mlir[onnx] + torch, then the onnxsim wheel under test
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --timeout 120 --retries 5 "tpu_mlir[onnx]"
+          python3 -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+          python3 -m pip install pytest
+          python3 -m pip install --force-reinstall --no-deps wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python3 -c "import tpu_mlir; print('tpu_mlir', tpu_mlir.__file__)"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run tpu-mlir integration tests
+        working-directory: ${{ runner.temp }}
+        run: python3 -m pytest -v "$GITHUB_WORKSPACE/tests/test_tpu_mlir_integration.py"
 
   halide:
     name: Simplify and run on Halide
