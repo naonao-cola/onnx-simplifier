@@ -705,3 +705,87 @@ def bank81_field192_operand(k: int) -> bytes:
     stream this function did not itself compile.
     """
     return b"\x4c\x05" + bytes([1024 // k - 1])
+
+
+_REG8_QUAD_CANDIDATES = {
+    b"\x33\x00\x20",
+    b"\x23\x00\x40",
+    b"\x23\x00\x30",
+    b"\x23\x00\x10",
+}
+
+_REG8_QUAD_ANCHOR = bytes.fromhex("a2000000") + bytes.fromhex("12000000")
+
+
+def emit_matmul_reg8_quad(reference_mcode: bytes, permutation) -> bytes:
+    """Rewrite MatMul's 4-slot ``reg=8`` unordered-pool group to a
+    caller-chosen permutation of the same 4-member candidate pool, in
+    place.
+
+    ``permutation`` is a 4-tuple of the candidate 3-byte payloads
+    (``{33 00 20, 23 00 40, 23 00 30, 23 00 10}``, decoded for
+    ``MatMul(A[4,8],B[8,8])`` in
+    ``tests/test_axera_matmul_reg8_noise_source.py``, merged) in slot
+    order -- the three ``V``-kind records at relative offsets +8/+16/+24
+    from the group's own anchor, then the one ``S``-kind ``reg=8``
+    record at +33. Must be a genuine permutation of the full 4-member
+    set (no duplicate, no omission): the one constraint that source file
+    found held with zero exceptions across all 10 real Pulsar2 builds it
+    checked, unlike Gemm's own duplicate-tolerant 3-slot version
+    (``tests/test_axera_gemm_reg8_second_noise_source.py``) or Conv's
+    always-omits-one 3-of-4 version
+    (``tests/test_axera_conv_reg8_reg60_noise_source.py``).
+
+    Locates the group by its own stable anchor record (``a2 00 00 00
+    12 00 00 00``) -- searched for here rather than hardcoded to a fixed
+    offset, so this raises loudly if the anchor is not found exactly
+    once instead of silently patching the wrong bytes. Only the 4
+    candidate-identity fields (12 bytes total) are rewritten; every
+    framing byte around them (the verb/bank/field header on each
+    V-record, the positional ``0x00``/``0x82`` trailing byte, the raw
+    length/link byte between the third V-record and the S-record, the
+    S-record's own ``p``/tag/reg bytes) is left completely untouched --
+    this project's usual "patch only what varies" discipline (see
+    ``patch_output_quad``).
+
+    **What this establishes and does not.** Verified in
+    ``tests/test_axera_matmul_reg8_emit_verify.py``: every one of the 7
+    distinct permutations actually observed across the source file's own
+    10 real builds round-trips through this function exactly (a
+    no-op emit reproduces the reference byte-for-byte; emitting a
+    *different* observed permutation and re-decoding recovers exactly
+    that permutation, at the same fixed offsets, with the rest of the
+    stream untouched), and every result still passes ``mcode.check()``
+    cleanly. It does NOT establish that a permutation this function CAN
+    produce, but that no real Pulsar2 build has ever been observed to
+    use, is itself a valid Pulsar2 output -- only that it is
+    syntactically well-formed by this project's own grammar (of the 24
+    mathematically possible permutations, only 7 have actually been
+    observed in the small sample checked; this function does not know
+    or enforce which subset a real compiler would choose). Unlike the
+    scale-family patches (``tests/test_axera_mul_emit_hardware.py``),
+    this has not been checked against real AX650N hardware.
+    """
+    perm = list(permutation)
+    if len(perm) != 4 or set(perm) != _REG8_QUAD_CANDIDATES:
+        raise ValueError(
+            f"permutation must contain each of {sorted(_REG8_QUAD_CANDIDATES)} "
+            f"exactly once, got {perm!r}"
+        )
+    hits = [
+        i
+        for i in range(len(reference_mcode) - len(_REG8_QUAD_ANCHOR) + 1)
+        if reference_mcode[i : i + len(_REG8_QUAD_ANCHOR)] == _REG8_QUAD_ANCHOR
+    ]
+    if len(hits) != 1:
+        raise ValueError(
+            f"reg=8 quad anchor found {len(hits)} times in reference_mcode,"
+            " expected exactly 1 -- wrong shape/reference?"
+        )
+    anchor = hits[0]
+    out = bytearray(reference_mcode)
+    for off, cand in zip((anchor + 8, anchor + 16, anchor + 24), perm[:3]):
+        out[off + 4 : off + 7] = cand
+    s_off = anchor + 33
+    out[s_off + 1 : s_off + 4] = perm[3]
+    return bytes(out)
