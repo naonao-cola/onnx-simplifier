@@ -56,97 +56,9 @@ from __future__ import annotations
 
 from typing import Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim._onnx_compat import UINT4 as _UINT4
-from onnxsim.bias_correction import _all_names, _unique_name
-
-
-def _match_matmul_like(node: onnx.NodeProto):
-    """Mirrors ``MatchMatMulLike`` (``passes/quantize_matmul_common.h``):
-    a MatMul, or a Gemm with ``transA=0``, ``alpha=1`` and (when it has a
-    bias) ``beta=1``. Returns ``(x_name, w_name, weight_transposed)`` or
-    ``None``.
-    """
-    attrs = {a.name: a for a in node.attribute}
-    if node.op_type == "MatMul":
-        if len(node.input) != 2:
-            return None
-        return node.input[0], node.input[1], False
-    if node.op_type == "Gemm":
-        num_inputs = len(node.input)
-        if num_inputs not in (2, 3):
-            return None
-        trans_a = attrs.get("transA")
-        if trans_a is not None and trans_a.i != 0:
-            return None
-        alpha = attrs.get("alpha")
-        if alpha is not None and alpha.f != 1.0:
-            return None
-        if num_inputs == 3:
-            beta = attrs.get("beta")
-            if beta is not None and beta.f != 1.0:
-                return None
-        trans_b = attrs.get("transB")
-        weight_transposed = bool(trans_b is not None and trans_b.i)
-        return node.input[0], node.input[1], weight_transposed
-    return None
-
-
-def _irls_affine_quantize_blockwise(
-    w_nk: np.ndarray, block_size: int, num_iterations: int, lp_norm: float
-) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
-    """Returns ``(codes_nk, scale_blocks, zero_blocks)`` for ``w_nk``
-    ([N, K], output channel first): unsigned 4-bit codes in ``[0, 15]``, a
-    scale and (IRLS-refined) zero-point per ``(output channel, block-of-K)``
-    group, each shape ``[N, K // block_size]``. Assumes ``K % block_size ==
-    0``.
-    """
-    n, k = w_nk.shape
-    num_blocks = k // block_size
-    blocks = w_nk.reshape(n, num_blocks, block_size)
-
-    lo = blocks.min(axis=2)
-    hi = blocks.max(axis=2)
-    scale = np.maximum((hi - lo) / 15.0, 1e-12)  # [N, num_blocks]
-    scale3 = scale[:, :, np.newaxis]
-    zero = -lo / scale  # [N, num_blocks]; code 0 maps back to the block min
-
-    eps = 1e-8
-    for _ in range(num_iterations):
-        zero3 = zero[:, :, np.newaxis]
-        code = np.round(blocks / scale3 + zero3)
-        d = blocks - scale3 * code  # residual before the zero-point term
-        dequant = scale3 * (code - zero3)
-        resid = blocks - dequant
-        # IRLS reweighting: elements with a larger current residual count
-        # for less in the next weighted-least-squares solve, the mechanism
-        # by which this converges toward an Lp<2 (robust) fit instead of
-        # the ordinary L2 one a single unweighted solve would give.
-        weight = np.power(np.abs(resid) + eps, lp_norm - 2.0)
-        # Closed-form weighted-least-squares solution for a shared additive
-        # zero-point per block, minimizing sum(weight * (d + scale*zero)^2).
-        zero = -np.sum(weight * d, axis=2) / (scale * np.sum(weight, axis=2) + eps)
-
-    zero = np.clip(np.round(zero), 0.0, 15.0)
-    zero3 = zero[:, :, np.newaxis]
-    codes = np.clip(np.round(blocks / scale3 + zero3), 0.0, 15.0)
-    return codes.reshape(n, k), scale, zero
-
-
-def _pack_uint4(codes: np.ndarray) -> bytes:
-    # Low-nibble-first, matching ONNX's documented UINT4/INT4 raw_data
-    # packing (byte[i] = code[2i] | (code[2i+1] << 4)); codes here are
-    # already unsigned [0, 15], so no sign-bit handling is needed.
-    flat = codes.astype(np.int64).ravel()
-    nibbles = (flat & 0xF).astype(np.uint8)
-    lo = nibbles[0::2]
-    hi = nibbles[1::2]
-    packed = (lo | (hi << 4)).astype(np.uint8)
-    return packed.tobytes()
+from onnxsim.onnx_simplifier import apply_hqq_cpp
 
 
 def quantize_weight_only_int4_hqq(
@@ -171,97 +83,33 @@ def quantize_weight_only_int4_hqq(
             few large residuals over spreading error evenly -- lower values
             downweight outliers more aggressively, ``p = 2`` would recover
             an ordinary (non-robust) least-squares fit)
-    :returns: ``model`` with every matched layer's weight replaced by
-            ``DequantizeLinear(Wq, Ws, Wz, axis=<reduction axis>,
-            block_size=block_size)`` feeding the original MatMul/Gemm node;
-            layers with a non-constant, non-2-D, or non-block-divisible
-            weight are left untouched
+    :returns: ``model`` with every matched layer's weight replaced by its
+            HQQ-quantized float32 reconstruction (see the "Delegates to"
+            note below for a storage-format caveat); layers with a
+            non-constant, non-2-D, or non-block-divisible weight are left
+            untouched
+
+    Delegates to :func:`onnxsim.apply_hqq_cpp`, which hardcodes
+    ``block_size=32``, ``num_iterations=10`` and ``lp_norm=0.7`` (this
+    function's own defaults) and cannot honor other values -- a
+    non-default value raises ``ValueError`` rather than being silently
+    ignored. Unlike this function's own former implementation (which
+    built a real, packed-UINT4 ``DequantizeLinear(Wq, Ws, Wz, ...)``
+    initializer triple), the C++ port folds the quantize/dequantize round
+    trip directly into a *plain float32* replacement initializer -- a
+    genuine storage-format difference, not merely a numerical one: the
+    result no longer carries real INT4-packed storage, only the
+    *simulated* precision loss. If your caller specifically needs the
+    packed-UINT4 graph shape, this function can no longer provide it. This
+    function also no longer needs opset 21 (the C++ fold uses no
+    ``DequantizeLinear``/native UINT4 tensor type at all).
     """
+    if block_size != 32 or num_iterations != 10 or lp_norm != 0.7:
+        raise ValueError(
+            "quantize_weight_only_int4_hqq now delegates to apply_hqq_cpp, "
+            "which hardcodes block_size=32, num_iterations=10, lp_norm=0.7 "
+            "and cannot honor other values"
+        )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    opset_ge_21 = any(
-        o.domain in ("", "ai.onnx") and o.version >= 21 for o in out.opset_import
-    )
-    if not opset_ge_21:
-        return (
-            model  # UINT4 tensors and DequantizeLinear's block_size both need opset 21+
-        )
-
-    nodes = list(graph.node)
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if weight_transposed else w.T  # [N, K]
-        k = w_nk.shape[1]
-        if k % block_size != 0:
-            continue
-
-        codes_nk, scale_blocks, zero_blocks = _irls_affine_quantize_blockwise(
-            w_nk, block_size, num_iterations, lp_norm
-        )
-        codes_orig = codes_nk if weight_transposed else codes_nk.T
-        scale_orig = scale_blocks if weight_transposed else scale_blocks.T
-        zero_orig = zero_blocks if weight_transposed else zero_blocks.T
-        assert codes_orig.shape == (dim0, dim1)
-
-        wq = onnx.TensorProto()
-        wq.name = _unique_name(f"{w_name}_hqq_q", taken_names)
-        wq.data_type = _UINT4
-        wq.dims.extend(codes_orig.shape)
-        wq.raw_data = _pack_uint4(codes_orig)
-        graph.initializer.append(wq)
-
-        ws = onnx.numpy_helper.from_array(
-            scale_orig.astype(np.float32),
-            name=_unique_name(f"{w_name}_hqq_scale", taken_names),
-        )
-        graph.initializer.append(ws)
-
-        wz = onnx.TensorProto()
-        wz.name = _unique_name(f"{w_name}_hqq_zero", taken_names)
-        wz.data_type = _UINT4
-        wz.dims.extend(zero_orig.shape)
-        wz.raw_data = _pack_uint4(zero_orig)
-        graph.initializer.append(wz)
-
-        # w_nk normalizes to [N, K] (K = axis 1); transposing codes/scale
-        # back to the original storage layout puts K on axis 1 when the
-        # weight was already stored [N, K] (weight_transposed), else K
-        # lands on axis 0 (MatMul's own untransposed [K, N] layout).
-        reduction_axis = 1 if weight_transposed else 0
-        dq_out = _unique_name(f"{w_name}_hqq_dq", taken_names)
-        dq_node = onnx.helper.make_node(
-            "DequantizeLinear",
-            [wq.name, ws.name, wz.name],
-            [dq_out],
-            name=_unique_name(f"{w_name}_hqq_dequant", taken_names),
-            axis=reduction_axis,
-            block_size=block_size,
-        )
-        graph.node.insert(
-            next(i for i, n in enumerate(graph.node) if n is node), dq_node
-        )
-        for i, inp in enumerate(node.input):
-            if inp == w_name:
-                node.input[i] = dq_out
-
-    return out
+    return apply_hqq_cpp(model)

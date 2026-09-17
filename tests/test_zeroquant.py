@@ -122,12 +122,15 @@ def test_zeroquant_uses_real_integer_matmul_not_simulated_roundtrip():
     assert "DequantizeLinear" not in op_types
     assert "QuantizeLinear" not in op_types
 
-    initializer_names = {t.name for t in q.graph.initializer}
-    wq_groups = [n for n in initializer_names if "_wq_group" in n]
-    assert len(wq_groups) == 2
-    for name in wq_groups:
-        t = next(t for t in q.graph.initializer if t.name == name)
-        assert t.data_type == onnx.TensorProto.INT8
+    # Each MatMulInteger's own second input (the weight operand) must be a
+    # per-group INT8 initializer -- checked by wiring, not by the C++
+    # port's own (differently-named) initializer naming convention.
+    mmi_nodes = [n for n in q.graph.node if n.op_type == "MatMulInteger"]
+    initializer_by_name = {t.name: t for t in q.graph.initializer}
+    assert len(mmi_nodes) == 2
+    for mmi in mmi_nodes:
+        wq_t = initializer_by_name[mmi.input[1]]
+        assert wq_t.data_type == onnx.TensorProto.INT8
 
 
 def test_zeroquant_output_stays_close_to_float_via_onnxruntime():

@@ -178,44 +178,17 @@ def test_cpp_quantizes_down_proj_and_rescales_up_proj():
 
 
 def test_cpp_matches_python_reference_exactly():
-    model, _, w_up, w_down = _swiglu_model(seed=1)
+    # onnxsim.apply_dsq (onnxsim/d2quant.py) now delegates directly to
+    # apply_dsq_cpp -- there is no longer a separate pure-Python
+    # implementation to cross-check against, so this is now a trivial,
+    # structural consistency check (both calls run the identical C++ code
+    # path) rather than a real parity test between two independent
+    # implementations. Kept only to catch a future regression where
+    # apply_dsq's own delegation is accidentally broken.
+    model, _, _w_up, _w_down = _swiglu_model(seed=1)
     py = onnxsim.apply_dsq(model)
     cpp = onnxsim.apply_dsq_cpp(model)
-    onnx.checker.check_model(cpp)
-
-    py_wq = next(t for t in py.graph.initializer if t.name.endswith("_dsq_q"))
-    py_ws = next(t for t in py.graph.initializer if t.name.endswith("_dsq_scale"))
-    py_codes = _decode_int4_signed(py_wq)
-
-    # This port never names its own new initializers (unlike the Python
-    # reference's own "_dsq_q"/"_dsq_scale" suffixes) -- find the INT4
-    # weight directly by dtype, then follow the DequantizeLinear node that
-    # actually consumes it (wq, ws) to the paired scale initializer, the
-    # same robust-by-wiring-not-by-name convention this session's other
-    # exact-parity tests already establish.
-    cpp_wq = next(
-        t for t in cpp.graph.initializer if t.data_type == onnx.TensorProto.INT4
-    )
-    dq_node = next(
-        n
-        for n in cpp.graph.node
-        if n.op_type == "DequantizeLinear" and n.input[0] == cpp_wq.name
-    )
-    cpp_ws = next(t for t in cpp.graph.initializer if t.name == dq_node.input[1])
-    cpp_codes = _decode_int4_signed(cpp_wq)
-    np.testing.assert_array_equal(cpp_codes, py_codes)
-    np.testing.assert_allclose(
-        onnx.numpy_helper.to_array(cpp_ws),
-        onnx.numpy_helper.to_array(py_ws),
-        rtol=1e-4,
-        atol=1e-6,
-    )
-
-    py_up = onnx.numpy_helper.to_array(
-        next(t for t in py.graph.initializer if t.name == "Wup")
-    )
-    cpp_up = _cpp_up_weight(cpp)
-    np.testing.assert_allclose(cpp_up, py_up, rtol=1e-4, atol=1e-6)
+    assert py.SerializeToString() == cpp.SerializeToString()
 
 
 def test_cpp_reconstruction_matches_original_weight():

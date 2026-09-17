@@ -2,6 +2,16 @@
 ``onnxsim/aqlm.py``) -- greedy residual k-means fits ``M`` codebooks
 shared across every group in a layer, each group represented as the sum
 of one lookup per codebook.
+
+``quantize_weight_only_aqlm`` now delegates to ``onnxsim.apply_aqlm_cpp``
+(see ``onnxsim/aqlm.py``'s own "Delegates to" note): the returned graph
+folds the additive-codebook reconstruction directly into a replacement
+float32 initializer (no ``Gather``/``Add`` chain, no separate
+codebook/codes initializers to inspect), and the delegated C++ port
+hardcodes ``group_dim=8``/``num_codebooks=2``/``codebook_size=256``/
+``num_iterations=10`` -- a non-default value now raises ``ValueError``
+rather than being honored. See ``tests/test_aqlm_cpp.py`` for the full
+C++ port test suite this one now exercises indirectly.
 """
 
 import numpy as np
@@ -61,42 +71,24 @@ def _rel_l2(a, b):
     return np.linalg.norm(a - b) / max(np.linalg.norm(a), 1e-6)
 
 
-def _dequantize_aqlm_by_hand(model, w_name, num_codebooks):
-    """Independent reference decode: reads the codebook/codes initializers
-    directly and reconstructs via numpy, without using any of this
-    module's own internal functions or the ops it inserts. Returns the
-    ``[num_groups, group_dim]`` sum of all additive stages -- reshaping
-    back to the weight's own ``[N, K]``/original layout is the caller's
-    job, since only the caller knows which.
-    """
-    stages = []
-    for m in range(num_codebooks):
-        codebook = onnx.numpy_helper.to_array(
-            next(
-                t
-                for t in model.graph.initializer
-                if t.name == f"{w_name}_aqlm_codebook{m}"
-            )
-        ).astype(np.float64)
-        codes = onnx.numpy_helper.to_array(
-            next(
-                t
-                for t in model.graph.initializer
-                if t.name == f"{w_name}_aqlm_codes{m}"
-            )
-        )
-        stages.append(codebook[codes])
-    return sum(stages)
+def _current_weight(model, weight_input_index=1):
+    # apply_aqlm_cpp (which quantize_weight_only_aqlm now delegates to)
+    # folds the additive-codebook reconstruction directly into a
+    # replacement float32 initializer, rewiring the matched node's own
+    # weight input -- see onnxsim/aqlm.py's own "Delegates to" note.
+    node = next(n for n in model.graph.node if n.op_type in ("MatMul", "Gemm"))
+    w_name = node.input[weight_input_index]
+    w_init = next(t for t in model.graph.initializer if t.name == w_name)
+    return onnx.numpy_helper.to_array(w_init)
 
 
 def test_aqlm_output_stays_close_to_float_via_onnxruntime():
     model = _matmul_model(K=64, N=16, seed=0)
-    q = onnxsim.quantize_weight_only_aqlm(model, group_dim=8, seed=0)
+    q = onnxsim.quantize_weight_only_aqlm(model)
     onnx.checker.check_model(q)
 
-    op_types = {n.op_type for n in q.graph.node}
-    assert "Gather" in op_types
-    assert "Add" in op_types
+    # No new graph nodes -- folded straight into a replacement initializer.
+    assert [n.op_type for n in q.graph.node] == [n.op_type for n in model.graph.node]
 
     rng = np.random.default_rng(1)
     x = rng.standard_normal((8, 64)).astype(np.float32)
@@ -106,55 +98,40 @@ def test_aqlm_output_stays_close_to_float_via_onnxruntime():
     assert _rel_l2(float_y, q_y) < 0.3
 
 
-def test_aqlm_dequantized_values_match_hand_decoded_reference():
-    K, N = 32, 8
+def test_aqlm_replaces_weight_with_same_shape_float():
+    # num_groups = N * (K // group_dim) must exceed codebook_size (256) --
+    # otherwise every group can claim its own exact centroid and the
+    # reconstruction is trivially exact, the same degenerate-sizing trap
+    # tests/test_aqlm_cpp.py's own docstring already documents.
+    K, N = 8 * 40, 10  # num_groups = 400 > codebook_size (256)
     rng = np.random.default_rng(2)
     weight = rng.standard_normal((K, N)).astype(np.float32) * 0.3
     model = _matmul_model(K=K, N=N, weight=weight)
-    q = onnxsim.quantize_weight_only_aqlm(model, group_dim=8, num_codebooks=2, seed=1)
-
-    combined = _dequantize_aqlm_by_hand(q, "W", num_codebooks=2)
-    w_hand_nk = combined.reshape(N, K)
-    w_hand = w_hand_nk.T  # back to original [K, N] storage
-
-    matmul_node = next(n for n in q.graph.node if n.op_type == "MatMul")
-    weight_tensor_name = matmul_node.input[1]
-    probe_model = onnx.ModelProto()
-    probe_model.CopyFrom(q)
-    probe_model.graph.output.append(onnx.ValueInfoProto(name=weight_tensor_name))
-    rng2 = np.random.default_rng(3)
-    x = rng2.standard_normal((4, K)).astype(np.float32)
-    (w_graph,) = _run(probe_model, {"X": x})[len(q.graph.output) :]
-
-    assert np.allclose(w_hand, w_graph.astype(np.float64), rtol=0, atol=1e-5)
+    q = onnxsim.quantize_weight_only_aqlm(model)
+    new_w = _current_weight(q)
+    assert new_w.shape == (K, N)
+    assert new_w.dtype == np.float32
+    assert not np.array_equal(new_w, weight)
 
 
-def test_aqlm_more_codebooks_never_increases_error():
-    # Each additive stage fits its own codebook to exactly the residual
-    # the previous stages left over, so adding more codebooks can only
-    # reduce (never increase) the layer's own reconstruction error.
-    K, N = 32, 8
-    rng = np.random.default_rng(4)
-    weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
-    model = _matmul_model(K=K, N=N, weight=weight)
-    w_float = weight.astype(np.float64)
-
-    errors = []
-    for m in (1, 2, 3):
-        q = onnxsim.quantize_weight_only_aqlm(
-            model, group_dim=8, num_codebooks=m, codebook_size=8, seed=5
-        )
-        matmul_node = next(n for n in q.graph.node if n.op_type == "MatMul")
-        weight_tensor_name = matmul_node.input[1]
-        probe_model = onnx.ModelProto()
-        probe_model.CopyFrom(q)
-        probe_model.graph.output.append(onnx.ValueInfoProto(name=weight_tensor_name))
-        rng2 = np.random.default_rng(6)
-        x = rng2.standard_normal((4, K)).astype(np.float32)
-        (w_graph,) = _run(probe_model, {"X": x})[len(q.graph.output) :]
-        errors.append(np.sum((w_graph.astype(np.float64) - w_float) ** 2))
-
-    assert all(errors[i] >= errors[i + 1] - 1e-6 for i in range(len(errors) - 1))
+def test_aqlm_non_default_params_raise():
+    # apply_aqlm_cpp (which this function now delegates to) hardcodes
+    # group_dim=8/num_codebooks=2/codebook_size=256/num_iterations=10 and
+    # cannot honor other values -- including varying num_codebooks/
+    # codebook_size, which the old pure-Python implementation's own
+    # "more codebooks never increases error"/"codes stay in codebook
+    # range" tests used to exercise; that property is no longer testable
+    # through this entry point, only through the C++ port's own fixed
+    # configuration (see tests/test_aqlm_cpp.py).
+    model = _matmul_model(K=32, N=8, seed=8)
+    with pytest.raises(ValueError):
+        onnxsim.quantize_weight_only_aqlm(model, group_dim=4)
+    with pytest.raises(ValueError):
+        onnxsim.quantize_weight_only_aqlm(model, num_codebooks=3)
+    with pytest.raises(ValueError):
+        onnxsim.quantize_weight_only_aqlm(model, codebook_size=16)
+    with pytest.raises(ValueError):
+        onnxsim.quantize_weight_only_aqlm(model, num_iterations=5)
 
 
 def test_aqlm_gemm_transb():
@@ -170,25 +147,13 @@ def test_aqlm_gemm_transb():
         """,
         initializer=[_f32(weight, "W")],
     )
-    q = onnxsim.quantize_weight_only_aqlm(model, group_dim=8, seed=2)
+    q = onnxsim.quantize_weight_only_aqlm(model)
     onnx.checker.check_model(q)
 
     x = rng.standard_normal((4, K)).astype(np.float32)
     (float_y,) = _run(model, {"X": x})
     (q_y,) = _run(q, {"X": x})
     assert _rel_l2(float_y, q_y) < 0.3
-
-
-def test_aqlm_codes_stay_in_codebook_range():
-    model = _matmul_model(K=32, N=8, seed=8)
-    q = onnxsim.quantize_weight_only_aqlm(
-        model, group_dim=8, num_codebooks=2, codebook_size=16, seed=3
-    )
-    for m in range(2):
-        codes = onnx.numpy_helper.to_array(
-            next(t for t in q.graph.initializer if t.name == f"W_aqlm_codes{m}")
-        )
-        assert np.all(codes >= 0) and np.all(codes < 16)
 
 
 def test_aqlm_skips_non_group_divisible_k():

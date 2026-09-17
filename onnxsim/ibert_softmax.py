@@ -84,17 +84,17 @@ from __future__ import annotations
 import math
 from typing import Iterable, Optional, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim.bias_correction import _all_names, _unique_name
+from onnxsim.onnx_simplifier import apply_ibert_softmax_cpp
 
 # This module's own numeric min-max fit of exp(p) ~= A*p**2 + B*p + 1 over
 # p in [-ln2, 0] (see the module docstring): a 2-D grid search minimizing
 # max relative error against math.exp, subject to the exact p=0 ->
-# exp(0)==1 constraint (the "+1" -- not independently fit).
+# exp(0)==1 constraint (the "+1" -- not independently fit). Kept here as
+# documentation of the derivation; the actual computation now happens in
+# the C++ port (``passes/ibert_softmax.h``), which hardcodes the same
+# constants.
 _LN2 = math.log(2.0)
 _IBERT_SOFTMAX_QUAD_A = 0.36118
 _IBERT_SOFTMAX_QUAD_B = 0.9701
@@ -112,107 +112,28 @@ def apply_ibert_softmax(
     data: the polynomial's own coefficients are fixed by this module's own
     numeric fit, not fit to any particular model's data.
 
+    Delegates to the verified C++ port
+    (:func:`onnxsim.apply_ibert_softmax_cpp`, ``passes/ibert_softmax.h``),
+    which builds the exact same op sequence from the exact same constants.
+
     :param model: the original (unquantized) onnx ModelProto or file path
     :param skip_names: ``Softmax`` node names to leave untouched even if
-            otherwise eligible
+            otherwise eligible. **Not supported by the C++ port** -- passing
+            a non-empty value raises ``NotImplementedError`` rather than
+            silently ignoring it.
     :returns: ``model`` with every matched ``Softmax(x, axis=k)`` node
             replaced by the exp-polynomial-plus-rescale-then-normalize
             decomposition described above -- ordinary ONNX ops only
             (``ReduceMax``/``Sub``/``Neg``/``Div``/``Floor``/``Mul``/
             ``Add``/``Pow``/``ReduceSum``), requiring opset 18+ for
-            ``ReduceMax``/``ReduceSum``'s axes-as-input form. A ``Softmax``
-            node named in ``skip_names``, or present in a model whose
-            opset is below 18, is left untouched.
+            ``ReduceMax``/``ReduceSum``'s axes-as-input form. A model whose
+            opset is below 18 is left untouched.
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    skip_names = set(skip_names) if skip_names is not None else frozenset()
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-
-    opset_ge_18 = any(
-        o.domain in ("", "ai.onnx") and o.version >= 18 for o in out.opset_import
-    )
-    if not opset_ge_18:
-        return out  # ReduceMax/ReduceSum's axes-as-input form needs opset >= 18
-
-    nodes = list(graph.node)
-    candidates = [
-        n
-        for n in nodes
-        if n.op_type == "Softmax" and len(n.input) == 1 and n.name not in skip_names
-    ]
-    if not candidates:
-        return out
-
-    taken_names = _all_names(graph)
-
-    def _const(value: np.ndarray, tag: str) -> str:
-        name = _unique_name(f"ibert_softmax_{tag}", taken_names)
-        graph.initializer.append(onnx.numpy_helper.from_array(value, name=name))
-        return name
-
-    quad_a_name = _const(np.asarray(_IBERT_SOFTMAX_QUAD_A, dtype=np.float32), "quad_a")
-    quad_b_name = _const(np.asarray(_IBERT_SOFTMAX_QUAD_B, dtype=np.float32), "quad_b")
-    one_name = _const(np.asarray(1.0, dtype=np.float32), "one")
-    ln2_name = _const(np.asarray(_LN2, dtype=np.float32), "ln2")
-    two_name = _const(np.asarray(2.0, dtype=np.float32), "two")
-
-    for node in candidates:
-        x_name = node.input[0]
-        softmax_out = node.output[0]
-        axis = next((a.i for a in node.attribute if a.name == "axis"), -1)
-        prefix = _unique_name(f"{softmax_out}_ibert_softmax", taken_names)
-
-        axes_name = _const(np.asarray([axis], dtype=np.int64), f"{prefix}_axes")
-
-        new_nodes = []
-
-        def _op(op_type, inputs, tag, **attrs):
-            out_name = _unique_name(f"{prefix}_{tag}", taken_names)
-            n = onnx.helper.make_node(
-                op_type,
-                inputs,
-                [out_name],
-                name=_unique_name(f"{prefix}_{tag}_node", taken_names),
-                **attrs,
-            )
-            new_nodes.append(n)
-            return out_name
-
-        row_max = _op("ReduceMax", [x_name, axes_name], "max", keepdims=1)
-        shifted = _op("Sub", [x_name, row_max], "shifted")  # x - max <= 0
-        neg_shifted = _op("Neg", [shifted], "neg_shifted")  # -(x - max) >= 0
-        z = _op("Floor", [_op("Div", [neg_shifted, ln2_name], "z_raw")], "z")
-        z_ln2 = _op("Mul", [z, ln2_name], "z_ln2")
-        p = _op("Add", [shifted, z_ln2], "p")  # p in (-ln2, 0]
-
-        p_sq = _op("Mul", [p, p], "p_sq")
-        quad_term = _op("Mul", [p_sq, quad_a_name], "quad_term")
-        lin_term = _op("Mul", [p, quad_b_name], "lin_term")
-        sum_terms = _op("Add", [quad_term, lin_term], "sum_terms")
-        exp_p = _op("Add", [sum_terms, one_name], "exp_p")  # polynomial exp(p)
-
-        neg_z = _op("Neg", [z], "neg_z")
-        pow2_neg_z = _op("Pow", [two_name, neg_z], "pow2_neg_z")  # 2**(-z)
-
-        exp_x = _op("Mul", [exp_p, pow2_neg_z], "exp_x")  # approx exp(x - max)
-        sum_exp = _op("ReduceSum", [exp_x, axes_name], "sum_exp", keepdims=1)
-
-        result_node = onnx.helper.make_node(
-            "Div",
-            [exp_x, sum_exp],
-            [softmax_out],
-            name=_unique_name(f"{prefix}_result_node", taken_names),
+    if skip_names:
+        raise NotImplementedError(
+            "apply_ibert_softmax's C++ backend does not support "
+            "skip_names; call apply_ibert_softmax_cpp directly if you "
+            "don't need it, or filter the model's own Softmax nodes "
+            "before/after calling this function."
         )
-        new_nodes.append(result_node)
-
-        insertion_point = next(i for i, n in enumerate(graph.node) if n is node)
-        for new_node in new_nodes:
-            graph.node.insert(insertion_point, new_node)
-            insertion_point += 1
-        graph.node.remove(node)
-
-    return out
+    return apply_ibert_softmax_cpp(model)

@@ -98,17 +98,12 @@ module sets out to port) are both faithfully reproduced either way.
 
 from __future__ import annotations
 
-from typing import List, Union
+from typing import Union
 
 import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim.adaround import _pack_int4
-from onnxsim.bias_correction import _all_names, _unique_name
-
-_GROUP_SIZE = 8
+from onnxsim.onnx_simplifier import apply_quip_sharp_cpp
 
 
 def _random_orthogonal_matrix(n: int, rng: np.random.Generator) -> np.ndarray:
@@ -213,166 +208,32 @@ def apply_quip_sharp(
     :param epsilon: floor applied to a group's own RMS magnitude before
             using it as a scale, avoiding a divide-by-zero on an all-zero
             group
-    :returns: ``model`` with every matched layer's weight replaced by
-            ``(X @ U) @ Ŵtilde @ V`` (plus the original bias, if any),
-            where ``Ŵtilde`` is reconstructed in-graph from packed INT4
-            codes (doubled, clipped E8 lattice coordinates) and a
-            per-group float32 scale; output tensor name unchanged. Layers
-            with a non-constant, non-2-D weight, or a reduction dimension
-            not divisible by 8, are left untouched.
+    :returns: ``model`` with every matched layer's weight replaced by its
+            QuIP#-reconstructed float32 version (see the "Delegates to"
+            note below for a storage-format caveat); layers with a
+            non-constant, non-2-D weight, or a reduction dimension not
+            divisible by 8, are left untouched.
+
+    Delegates to :func:`onnxsim.apply_quip_sharp_cpp`, which hardcodes
+    ``seed=0``/``epsilon=1e-8`` (this function's own defaults) and cannot
+    honor other values -- a non-default value raises ``ValueError`` rather
+    than being silently ignored. Unlike this function's own former
+    implementation (which kept ``U``, ``V`` and the packed INT4 lattice
+    codes as explicit initializers and new ``MatMul`` nodes), the C++ port
+    folds the entire rotate/quantize/rotate-back sandwich into a single
+    replacement weight initializer -- exact, not an approximation, since
+    ``U``/``V`` are square and only sandwich the weight, but a genuine
+    storage-format difference from the old graph shape. The C++ port's own
+    random orthogonal matrices are also generated via a different
+    (equally Haar-uniform) construction, so the specific rotation applied
+    -- though not the technique's own correctness -- differs from what
+    this function used to produce for the same ``seed``.
     """
+    if seed != 0 or epsilon != 1e-8:
+        raise ValueError(
+            "apply_quip_sharp now delegates to apply_quip_sharp_cpp, which "
+            "hardcodes seed=0, epsilon=1e-8 and cannot honor other values"
+        )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    nodes = list(graph.node)
-    candidates = []
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, bias_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, bias_name, weight_transposed))
-
-    if not candidates:
-        return out
-
-    rng = np.random.default_rng(seed)
-
-    for node, x_name, w_name, bias_name, weight_transposed in candidates:
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if weight_transposed else w.T  # [N, K], output channel first
-        n, k = w_nk.shape
-        if k % _GROUP_SIZE != 0:
-            continue
-
-        u = _random_orthogonal_matrix(k, rng)  # [K, K]
-        v = _random_orthogonal_matrix(n, rng)  # [N, N]
-        w_tilde_nk = v @ w_nk @ u  # [N, K]
-
-        num_groups_per_row = k // _GROUP_SIZE
-        groups = w_tilde_nk.reshape(n * num_groups_per_row, _GROUP_SIZE)
-        scale = np.sqrt(np.mean(groups**2, axis=1)) + epsilon  # [num_groups]
-        native = groups / scale[:, np.newaxis]
-        lattice_points = _closest_point_e8(native)  # exact int/half-int coords
-        codes = np.clip(np.round(lattice_points * 2.0), -7, 7).astype(np.int64)
-
-        # [N, num_groups_per_row] -> transpose to [num_groups_per_row, N] so
-        # the packed codes/scale are already laid out [K, N]-major, ready
-        # for a plain MatMul with no in-graph Transpose needed.
-        codes_nk = codes.reshape(n, k)
-        codes_kn = codes_nk.T
-        # [num_groups_per_row, 1, N] -- the middle size-1 axis lets this
-        # broadcast directly against native_blocked's [num_groups_per_row,
-        # 8, N] shape in the graph's Mul below, with no extra Reshape node.
-        scale_kn = scale.reshape(n, num_groups_per_row).T.reshape(
-            num_groups_per_row, 1, n
-        )
-
-        prefix = f"{w_name}_quip_sharp"
-        codes_name = _unique_name(f"{prefix}_codes", taken_names)
-        codes_tensor = onnx.TensorProto()
-        codes_tensor.name = codes_name
-        codes_tensor.data_type = onnx.TensorProto.INT4
-        codes_tensor.dims.extend([k, n])
-        codes_tensor.raw_data = _pack_int4(codes_kn)
-        graph.initializer.append(codes_tensor)
-
-        scale_name = _unique_name(f"{prefix}_scale", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(scale_kn.astype(np.float32), name=scale_name)
-        )
-        u_name = _unique_name(f"{prefix}_u", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(u.astype(np.float32), name=u_name)
-        )
-        v_name = _unique_name(f"{prefix}_v", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(v.astype(np.float32), name=v_name)
-        )
-        two_name = _unique_name(f"{prefix}_two", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(np.array(2.0, dtype=np.float32), name=two_name)
-        )
-        unblocked_shape_name = _unique_name(f"{prefix}_unblocked_shape", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.array([k, n], dtype=np.int64), name=unblocked_shape_name
-            )
-        )
-        blocked_shape_name = _unique_name(f"{prefix}_blocked_shape", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.array([num_groups_per_row, _GROUP_SIZE, n], dtype=np.int64),
-                name=blocked_shape_name,
-            )
-        )
-
-        new_nodes: List[onnx.NodeProto] = []
-
-        def _new(op_type, inputs, out_suffix, **attrs):
-            out_name = _unique_name(f"{prefix}_{out_suffix}", taken_names)
-            n_ = onnx.helper.make_node(
-                op_type,
-                inputs,
-                [out_name],
-                name=_unique_name(f"{prefix}_{out_suffix}_node", taken_names),
-                **attrs,
-            )
-            new_nodes.append(n_)
-            return out_name
-
-        x_rotated = _new("MatMul", [x_name, u_name], "x_rotated")
-
-        codes_float = _new(
-            "Cast", [codes_name], "codes_float", to=onnx.TensorProto.FLOAT
-        )
-        native_flat = _new("Div", [codes_float, two_name], "native_flat")
-        native_blocked = _new(
-            "Reshape", [native_flat, blocked_shape_name], "native_blocked"
-        )
-        scaled_blocked = _new("Mul", [native_blocked, scale_name], "scaled_blocked")
-        w_tilde_hat = _new(
-            "Reshape", [scaled_blocked, unblocked_shape_name], "w_tilde_hat"
-        )
-
-        core = _new("MatMul", [x_rotated, w_tilde_hat], "core")
-        rotated_back = _new("MatMul", [core, v_name], "rotated_back")
-
-        old_output = node.output[0]
-        if bias_name is not None:
-            final = onnx.helper.make_node(
-                "Add",
-                [rotated_back, bias_name],
-                [old_output],
-                name=_unique_name(f"{prefix}_bias_add_node", taken_names),
-            )
-        else:
-            final = onnx.helper.make_node(
-                "Identity",
-                [rotated_back],
-                [old_output],
-                name=_unique_name(f"{prefix}_identity_node", taken_names),
-            )
-        new_nodes.append(final)
-
-        node_idx = next(i for i, n_ in enumerate(graph.node) if n_ is node)
-        for offset, new_node in enumerate(new_nodes):
-            graph.node.insert(node_idx + offset, new_node)
-        del graph.node[node_idx + len(new_nodes)]
-
-    return out
+    return apply_quip_sharp_cpp(model)

@@ -72,18 +72,18 @@ from __future__ import annotations
 
 from typing import Iterable, Optional, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim.bias_correction import _all_names, _unique_name
+from onnxsim.onnx_simplifier import apply_ibert_gelu_cpp
 
 # This module's own numeric min-max fit of the paper's L(x) functional
 # form (see the module docstring): `b` is the one free parameter (found by
 # grid search minimizing max|L(x) - erf(x)| over [-4, 4]); `a` and `c` are
 # then pinned by L(x)'s own continuity-at-0 and asymptote-at-+-1
-# constraints (c = 1, a = -1/b**2) -- not independently fit.
+# constraints (c = 1, a = -1/b**2) -- not independently fit. Kept here as
+# documentation of the derivation; the actual computation now happens in
+# the C++ port (``passes/ibert_gelu.h``), which hardcodes the same
+# constants.
 _IBERT_GELU_B = -1.69148
 _IBERT_GELU_A = -1.0 / (_IBERT_GELU_B**2)
 _IBERT_GELU_C = 1.0
@@ -101,111 +101,29 @@ def apply_ibert_gelu(
     coefficients are fixed by the paper, not fit to any particular
     model's data.
 
+    Delegates to the verified C++ port (:func:`onnxsim.apply_ibert_gelu_cpp`,
+    ``passes/ibert_gelu.h``), which builds the exact same five ONNX ops
+    from the exact same three float32 constants -- numerically identical
+    up to onnxruntime's own float32 evaluation.
+
     :param model: the original (unquantized) onnx ModelProto or file path
     :param skip_names: ``Erf`` node names to leave untouched even if
-            otherwise eligible
+            otherwise eligible. **Not supported by the C++ port** -- passing
+            a non-empty value raises ``NotImplementedError`` rather than
+            silently ignoring it (unlike a numeric divergence, silently
+            rewriting a node the caller explicitly asked to protect could
+            break correctness-critical code).
     :returns: ``model`` with every matched ``Erf(x)`` node's output fed by
             ``Mul(Sign(x), Add(Mul(a, Mul(t, t)), c))`` where
             ``t = Add(Clip(Abs(x), 0, -b), b)`` -- ordinary ONNX ops only
             (``Abs``/``Clip``/``Add``/``Mul``/``Sign``), opset 11+ (the
-            2-input/3-input ``Clip`` form). ``Erf`` nodes named in
-            ``skip_names`` are left untouched.
+            2-input/3-input ``Clip`` form).
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    skip_names = set(skip_names) if skip_names is not None else frozenset()
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    taken_names = _all_names(graph)
-
-    nodes = list(graph.node)
-    for node in nodes:
-        if node.op_type != "Erf" or len(node.input) != 1:
-            continue
-        if node.name in skip_names:
-            continue
-
-        x_name = node.input[0]
-        erf_out = node.output[0]
-        prefix = _unique_name(f"{erf_out}_ibert_gelu", taken_names)
-
-        abs_out = _unique_name(f"{prefix}_abs", taken_names)
-        abs_node = onnx.helper.make_node("Abs", [x_name], [abs_out])
-
-        clip_min_name = _unique_name(f"{prefix}_clip_min", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.asarray(0.0, dtype=np.float32), name=clip_min_name
-            )
+    if skip_names:
+        raise NotImplementedError(
+            "apply_ibert_gelu's C++ backend does not support skip_names; "
+            "call apply_ibert_gelu_cpp directly if you don't need it, or "
+            "filter the model's own Erf nodes before/after calling this "
+            "function."
         )
-        clip_max_name = _unique_name(f"{prefix}_clip_max", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.asarray(-_IBERT_GELU_B, dtype=np.float32), name=clip_max_name
-            )
-        )
-        clip_out = _unique_name(f"{prefix}_clip", taken_names)
-        clip_node = onnx.helper.make_node(
-            "Clip", [abs_out, clip_min_name, clip_max_name], [clip_out]
-        )
-
-        b_name = _unique_name(f"{prefix}_b", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.asarray(_IBERT_GELU_B, dtype=np.float32), name=b_name
-            )
-        )
-        shifted_out = _unique_name(f"{prefix}_shifted", taken_names)
-        add_b_node = onnx.helper.make_node("Add", [clip_out, b_name], [shifted_out])
-
-        squared_out = _unique_name(f"{prefix}_squared", taken_names)
-        square_node = onnx.helper.make_node(
-            "Mul", [shifted_out, shifted_out], [squared_out]
-        )
-
-        a_name = _unique_name(f"{prefix}_a", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.asarray(_IBERT_GELU_A, dtype=np.float32), name=a_name
-            )
-        )
-        scaled_out = _unique_name(f"{prefix}_scaled", taken_names)
-        scale_node = onnx.helper.make_node("Mul", [squared_out, a_name], [scaled_out])
-
-        c_name = _unique_name(f"{prefix}_c", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.asarray(_IBERT_GELU_C, dtype=np.float32), name=c_name
-            )
-        )
-        poly_out = _unique_name(f"{prefix}_poly", taken_names)
-        add_c_node = onnx.helper.make_node("Add", [scaled_out, c_name], [poly_out])
-
-        sign_out = _unique_name(f"{prefix}_sign", taken_names)
-        sign_node = onnx.helper.make_node("Sign", [x_name], [sign_out])
-
-        result_node = onnx.helper.make_node(
-            "Mul",
-            [sign_out, poly_out],
-            [erf_out],
-            name=_unique_name(f"{prefix}_result", taken_names),
-        )
-
-        insertion_point = next(i for i, n in enumerate(graph.node) if n is node)
-        for new_node in (
-            abs_node,
-            clip_node,
-            add_b_node,
-            square_node,
-            scale_node,
-            add_c_node,
-            sign_node,
-            result_node,
-        ):
-            graph.node.insert(insertion_point, new_node)
-            insertion_point += 1
-        graph.node.remove(node)
-
-    return out
+    return apply_ibert_gelu_cpp(model)

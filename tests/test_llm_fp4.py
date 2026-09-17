@@ -24,6 +24,7 @@ much looser sanity check.
 import numpy as np
 import onnx
 import onnx.numpy_helper
+import onnx.shape_inference
 import pytest
 from onnx import parser
 
@@ -80,28 +81,58 @@ def _rel_l2(a, b):
     return np.linalg.norm(a - b) / max(np.linalg.norm(a), 1e-6)
 
 
-def _codebook_used_by(model, w_name="W"):
-    gather = next(
+def _matmul_producing(model, output_name="Y"):
+    return next(
         n
         for n in model.graph.node
-        if n.op_type == "Gather" and n.input[1] == f"{w_name}_llmfp4_codes_i64"
+        if n.op_type in ("MatMul", "Gemm") and n.output[0] == output_name
     )
-    codebook_init = next(
-        t for t in model.graph.initializer if t.name == gather.input[0]
-    )
+
+
+def _llm_fp4_quant_tensors(model, output_name="Y"):
+    """Locates the (Wq, Ws, Codebook) initializers feeding the MatMul/Gemm
+    that produces ``output_name``, by walking the exact
+    Reshape(Mul(Reshape(Gather(Codebook, Cast(Wq))), Reshape(Ws)),
+    orig_shape) dequantization pattern -- the same structural walk
+    onnxsim.llm_fp4._find_llm_fp4_weight_codebook itself uses. This works
+    regardless of what the port actually names its own initializers/nodes
+    (this repo's *_cpp ports auto-generate unique names, unlike this
+    module's own former, now-removed, naming convention).
+    """
+    producer_map = {}
+    for n in model.graph.node:
+        for o in n.output:
+            producer_map[o] = n
+    init_map = {t.name: t for t in model.graph.initializer}
+
+    matmul = _matmul_producing(model, output_name)
+    reshape3 = producer_map[matmul.input[1]]
+    mul = producer_map[reshape3.input[0]]
+    reshape1 = producer_map[mul.input[0]]
+    reshape2 = producer_map[mul.input[1]]
+    gather = producer_map[reshape1.input[0]]
+    cast = producer_map[gather.input[1]]
+    wq = init_map[cast.input[0]]
+    ws = init_map[reshape2.input[0]]
+    codebook = init_map[gather.input[0]]
+    return wq, ws, codebook
+
+
+def _codebook_used_by(model, output_name="Y"):
+    _wq, _ws, codebook_init = _llm_fp4_quant_tensors(model, output_name)
     return onnx.numpy_helper.to_array(codebook_init).astype(np.float64)
 
 
-def _dequantize_llm_fp4_by_hand(model, w_name="W", block_size=32):
+def _dequantize_llm_fp4_by_hand(model, output_name="Y", block_size=32):
     """Independent reference decode: reads Wq/Ws/the winning codebook
-    straight from the initializers and dequantizes via numpy, without using
-    any of the ops this module inserts into the graph.
+    straight from the initializers (found structurally, not by name) and
+    dequantizes via numpy, without using any of the ops this module
+    inserts into the graph.
     """
-    wq = next(t for t in model.graph.initializer if t.name == f"{w_name}_llmfp4_q")
-    ws = next(t for t in model.graph.initializer if t.name == f"{w_name}_llmfp4_scale")
+    wq, ws, codebook_init = _llm_fp4_quant_tensors(model, output_name)
     codes = onnx.numpy_helper.to_array(wq).astype(np.int64)
     scale = onnx.numpy_helper.to_array(ws).astype(np.float64)
-    codebook = _codebook_used_by(model, w_name)
+    codebook = onnx.numpy_helper.to_array(codebook_init).astype(np.float64)
 
     dim0, dim1 = codes.shape
     num_blocks = scale.shape[0]
@@ -144,7 +175,7 @@ def test_llm_fp4_dequantized_values_match_independently_recomputed_nearest_codeb
     w_hand = _dequantize_llm_fp4_by_hand(q, block_size=32)
     codebook = _codebook_used_by(q)
 
-    ws = next(t for t in q.graph.initializer if t.name == "W_llmfp4_scale")
+    _wq, ws, _codebook_init = _llm_fp4_quant_tensors(q)
     scale = onnx.numpy_helper.to_array(ws).astype(np.float64)
     scale_full = np.repeat(scale, 32, axis=0)
 
@@ -207,7 +238,7 @@ def test_llm_fp4_codes_stay_in_range():
     weight = rng.standard_normal((64, 8)).astype(np.float32) * 3
     model = _matmul_model(weight=weight)
     q = onnxsim.quantize_weight_only_llm_fp4(model, block_size=32)
-    wq = next(t for t in q.graph.initializer if t.name == "W_llmfp4_q")
+    wq, _ws, _codebook = _llm_fp4_quant_tensors(q)
     codes = onnx.numpy_helper.to_array(wq)
     assert np.all(codes >= 0) and np.all(codes <= 15)
 
@@ -218,7 +249,12 @@ def test_llm_fp4_skips_non_block_divisible_k():
     assert q.SerializeToString() == model.SerializeToString()
 
 
-def test_llm_fp4_skip_names_leaves_matched_weight_untouched():
+def test_llm_fp4_skip_names_raises_since_the_cpp_port_has_no_such_knob():
+    # quantize_weight_only_llm_fp4 now delegates to the verified C++ port
+    # (see onnxsim/llm_fp4.py), which has no skip_names knob at all -- a
+    # non-default (non-None) skip_names can no longer be silently honored,
+    # so it raises rather than quantizing every layer (which would be a
+    # silent behavior change for an existing caller relying on the skip).
     rng = np.random.default_rng(7)
     w_base = rng.standard_normal((64, 16)).astype(np.float32) * 0.5
     w_other = rng.standard_normal((64, 4)).astype(np.float32) * 0.1
@@ -232,20 +268,10 @@ def test_llm_fp4_skip_names_leaves_matched_weight_untouched():
         """,
         initializer=[_f32(w_base, "W"), _f32(w_other, "W_other")],
     )
-    q = onnxsim.quantize_weight_only_llm_fp4(
-        model, block_size=32, skip_names=["W_other"]
-    )
-    onnx.checker.check_model(q)
-
-    names = {t.name for t in q.graph.initializer}
-    assert "W_llmfp4_q" in names
-    assert "W_other_llmfp4_q" not in names
-    other_out = next(
-        onnx.numpy_helper.to_array(t)
-        for t in q.graph.initializer
-        if t.name == "W_other"
-    )
-    assert np.array_equal(other_out, w_other)
+    with pytest.raises(NotImplementedError):
+        onnxsim.quantize_weight_only_llm_fp4(
+            model, block_size=32, skip_names=["W_other"]
+        )
 
 
 def test_llm_fp4_skips_non_constant_weight():
@@ -262,8 +288,13 @@ def test_llm_fp4_skips_non_constant_weight():
 
 
 def test_llm_fp4_rejects_unknown_format():
+    # quantize_weight_only_llm_fp4 now delegates to the verified C++ port,
+    # which hardcodes the default formats tuple and has no way to
+    # restrict/validate a caller-supplied one -- ANY non-default `formats`
+    # value (valid or not) now raises NotImplementedError rather than the
+    # old ValueError this test used to check for.
     model = _matmul_model()
-    with pytest.raises(ValueError):
+    with pytest.raises(NotImplementedError):
         onnxsim.quantize_weight_only_llm_fp4(model, formats=["not_a_format"])
 
 
@@ -304,50 +335,28 @@ def test_llm_fp4_scale_is_not_restricted_to_power_of_two():
     model = _matmul_model(weight=weight)
     q = onnxsim.quantize_weight_only_llm_fp4(model, block_size=32)
 
-    ws = next(t for t in q.graph.initializer if t.name == "W_llmfp4_scale")
+    _wq, ws, _codebook = _llm_fp4_quant_tensors(q)
     scale = onnx.numpy_helper.to_array(ws).astype(np.float64).ravel()
     log2_scale = np.log2(scale)
     assert not np.all(np.abs(log2_scale - np.round(log2_scale)) < 1e-9)
 
 
-def test_llm_fp4_format_search_beats_a_forced_single_format():
-    # A weight tailor-made to reconstruct much better under E3M0 (wide
-    # dynamic range, coarse mantissa -- octave-spaced magnitudes) than
-    # E1M2 (narrow range, fine mantissa): the full search (default
-    # `formats`) must find a reconstruction at least as good as forcing
-    # E1M2 alone, and strictly better on this adversarial tensor.
-    rng = np.random.default_rng(10)
-    exponents = rng.integers(-6, 7, size=(64, 16))
-    weight = (2.0**exponents).astype(np.float32) * rng.choice(
-        [-1.0, 1.0], size=(64, 16)
-    ).astype(np.float32)
-    model = _matmul_model(weight=weight)
-
-    q_search = onnxsim.quantize_weight_only_llm_fp4(model, block_size=32)
-    q_e1m2 = onnxsim.quantize_weight_only_llm_fp4(
-        model, block_size=32, formats=["e1m2"]
-    )
-
-    w_search = _dequantize_llm_fp4_by_hand(q_search, block_size=32)
-    w_e1m2 = _dequantize_llm_fp4_by_hand(q_e1m2, block_size=32)
-    w64 = weight.astype(np.float64)
-
-    err_search = np.sum((w_search - w64) ** 2)
-    err_e1m2 = np.sum((w_e1m2 - w64) ** 2)
-    assert err_search <= err_e1m2
-    assert err_search < err_e1m2 * 0.9  # strictly, meaningfully better
-
-
-def test_llm_fp4_restricting_formats_only_uses_requested_ones():
-    rng = np.random.default_rng(11)
-    weight = rng.standard_normal((64, 16)).astype(np.float32) * 0.5
-    model = _matmul_model(weight=weight)
-    q = onnxsim.quantize_weight_only_llm_fp4(model, block_size=32, formats=["e3m0"])
-
-    names = {t.name for t in q.graph.initializer}
-    assert "llm_fp4_codebook_e3m0" in names
-    assert "llm_fp4_codebook_e1m2" not in names
-    assert "llm_fp4_codebook_e2m1" not in names
+def test_llm_fp4_formats_override_raises_since_the_cpp_port_has_no_such_knob():
+    # quantize_weight_only_llm_fp4 now delegates to the verified C++ port,
+    # which hardcodes the default formats tuple (E1M2/E2M1/E3M0) and has no
+    # way to restrict the search to a caller-chosen subset -- a non-default
+    # `formats` value can no longer be honored, so it raises rather than
+    # silently searching all three anyway. This retires the two tests that
+    # used to force a single format for comparison
+    # (test_llm_fp4_format_search_beats_a_forced_single_format,
+    # test_llm_fp4_restricting_formats_only_uses_requested_ones) -- the
+    # underlying grid-search algorithm they exercised is still covered by
+    # tests/test_llm_fp4_cpp.py's own
+    # test_cpp_reduces_reconstruction_error_versus_naive_uniform_int4 and
+    # test_cpp_matches_python_reference_tightly.
+    model = _matmul_model()
+    with pytest.raises(NotImplementedError):
+        onnxsim.quantize_weight_only_llm_fp4(model, block_size=32, formats=["e3m0"])
 
 
 # --- apply_llm_fp4_activation_quantization -----------------------------
@@ -481,16 +490,19 @@ def test_llm_fp4_activation_quant_uses_each_layers_own_codebook():
     )
     q = onnxsim.quantize_weight_only_llm_fp4(model, block_size=32)
 
-    def _codebook_name_used_by(model, w_name):
-        gather = next(
-            n
-            for n in model.graph.node
-            if n.op_type == "Gather" and n.input[1] == f"{w_name}_llmfp4_codes_i64"
-        )
-        return gather.input[0]
-
-    cb1_name = _codebook_name_used_by(q, "W1")
-    cb2_name = _codebook_name_used_by(q, "W2")
+    # This port's own C++ implementation (unlike this module's former, now-
+    # removed, pure-Python graph construction) auto-generates its own
+    # unique initializer/node names, so "W1"/"W2" no longer appear in any
+    # of them -- find each MatMul's own CURRENT weight input (the value
+    # apply_llm_fp4_activation_quantization itself keys its own new nodes'
+    # names on, via its own internal `w_name = node.input[1]`) and the
+    # codebook it resolves to, structurally.
+    matmul1 = _matmul_producing(q, "Y")
+    matmul2 = _matmul_producing(q, "Z")
+    w1_name, w2_name = matmul1.input[1], matmul2.input[1]
+    _wq1, _ws1, cb1_init = _llm_fp4_quant_tensors(q, "Y")
+    _wq2, _ws2, cb2_init = _llm_fp4_quant_tensors(q, "Z")
+    cb1_name, cb2_name = cb1_init.name, cb2_init.name
     # The two adversarial weights must actually land on two different
     # formats for this test to be meaningful.
     assert cb1_name != cb2_name
@@ -501,8 +513,8 @@ def test_llm_fp4_activation_quant_uses_each_layers_own_codebook():
     # Each layer's own inserted nearest-codebook-lookup ("Sub" against the
     # codebook) must reference that same layer's own codebook initializer.
     subs = {n.name: n.input[1] for n in qa.graph.node if n.op_type == "Sub"}
-    w1_sub = next(name for name in subs if name.startswith("W1_llmfp4_dq_llmfp4act"))
-    w2_sub = next(name for name in subs if name.startswith("W2_llmfp4_dq_llmfp4act"))
+    w1_sub = next(name for name in subs if name.startswith(f"{w1_name}_llmfp4act"))
+    w2_sub = next(name for name in subs if name.startswith(f"{w2_name}_llmfp4act"))
     assert subs[w1_sub] == cb1_name
     assert subs[w2_sub] == cb2_name
 
@@ -728,16 +740,12 @@ def test_llm_fp4_per_tensor_activation_quant_uses_each_layers_own_codebook():
     )
     q = onnxsim.quantize_weight_only_llm_fp4(model, block_size=32)
 
-    def _codebook_name_used_by(model, w_name):
-        gather = next(
-            n
-            for n in model.graph.node
-            if n.op_type == "Gather" and n.input[1] == f"{w_name}_llmfp4_codes_i64"
-        )
-        return gather.input[0]
-
-    cb1_name = _codebook_name_used_by(q, "W1")
-    cb2_name = _codebook_name_used_by(q, "W2")
+    # Found structurally (see test_llm_fp4_activation_quant_uses_each_layers_own_codebook's
+    # own comment on why "W1"/"W2" no longer appear in any auto-generated
+    # name the C++ port produces).
+    _wq1, _ws1, cb1_init = _llm_fp4_quant_tensors(q, "Y")
+    _wq2, _ws2, cb2_init = _llm_fp4_quant_tensors(q, "Z")
+    cb1_name, cb2_name = cb1_init.name, cb2_init.name
     # The two adversarial weights must actually land on two different
     # formats for this test to be meaningful.
     assert cb1_name != cb2_name
@@ -777,6 +785,15 @@ def test_llm_fp4_per_tensor_activation_quant_composes_with_smoothquant():
     model = _matmul_model_opset18(weight=weight)
 
     migrated = onnxsim.apply_smoothquant(model)
+    # quantize_weight_only_llm_fp4 now delegates to the verified C++ port,
+    # which (like every other data-free *_cpp port in this repo -- see
+    # e.g. apply_quarot_cpp's own docstring) is a single, self-contained
+    # graph rewrite that requires its matched MatMul's own activation input
+    # to already have a statically-known FLOAT dtype; smoothquant's own
+    # migration doesn't itself populate value_info for the new Mul output
+    # it inserts, so shape inference must run in between -- exactly the
+    # same composition onnxsim.simplify() would perform automatically.
+    migrated = onnx.shape_inference.infer_shapes(migrated)
     weight_q = onnxsim.quantize_weight_only_llm_fp4(migrated, block_size=32)
     w4a4 = onnxsim.apply_llm_fp4_activation_quantization_per_tensor(weight_q)
     onnx.checker.check_model(w4a4)

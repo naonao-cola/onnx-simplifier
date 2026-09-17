@@ -29,7 +29,7 @@ time, with no separate post-processing step downstream.
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Set, Union
+from typing import Optional, Sequence, Set, Union
 
 import numpy as np
 import onnx
@@ -39,17 +39,7 @@ import onnx.numpy_helper
 from onnxsim import backend
 from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
 from onnxsim.calibration import Tensors, generate_random_calibration_data
-
-_BIT_WEIGHTS = [
-    128,
-    64,
-    32,
-    16,
-    8,
-    4,
-    2,
-    1,
-]  # MSB-first, matches numpy.packbits(bitorder="big")
+from onnxsim.onnx_simplifier import quantize_embedding_binary_cpp
 
 
 def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:
@@ -85,13 +75,6 @@ def _resolve_output(
     return float_outputs[0] if len(float_outputs) == 1 else None
 
 
-def _static_last_dim(value_info: onnx.ValueInfoProto) -> Optional[int]:
-    dims = value_info.type.tensor_type.shape.dim
-    if not dims or not dims[-1].HasField("dim_value"):
-        return None
-    return dims[-1].dim_value
-
-
 def quantize_embedding_binary(
     model: Union[str, onnx.ModelProto],
     output_name: Optional[str] = None,
@@ -104,6 +87,10 @@ def quantize_embedding_binary(
     ``numpy.packbits(x > 0, axis=-1, bitorder="big")`` -- a 32x reduction
     in output size, and needs no calibration data at all.
 
+    Delegates to :func:`onnxsim.quantize_embedding_binary_cpp` (the
+    verified C++ port); this pure-Python name is kept only for backward
+    compatibility with existing callers.
+
     :param model: the original (unquantized) onnx ModelProto or file path
     :param output_name: which graph output to binarize; if omitted, the
             graph must have exactly one float32 output (declining
@@ -113,122 +100,7 @@ def quantize_embedding_binary(
             output can't be resolved, whose last dimension isn't known
             statically, or isn't a multiple of 8, is returned unchanged
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if not _has_min_opset(model, 13):
-        return model
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-
-    idx = _resolve_output(graph, output_name)
-    if idx is None:
-        return out
-    target = graph.output[idx]
-    embed_dim = _static_last_dim(target)
-    if embed_dim is None or embed_dim % 8 != 0:
-        return out
-    # Snapshot the leading (batch/sequence) dims before target is mutated
-    # in place below -- symbolic dims (dim_param) are preserved as-is,
-    # concrete ones (dim_value) copied through unchanged.
-    leading_dims = list(target.type.tensor_type.shape.dim[:-1])
-
-    taken_names: Set[str] = _all_names(graph)
-    x = target.name
-    prefix = f"{x}_bin"
-
-    zero_name = _unique_name(f"{prefix}_zero", taken_names)
-    graph.initializer.append(
-        onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name=zero_name)
-    )
-    weights_name = _unique_name(f"{prefix}_weights", taken_names)
-    graph.initializer.append(
-        onnx.numpy_helper.from_array(
-            np.array(_BIT_WEIGHTS, dtype=np.int64), name=weights_name
-        )
-    )
-    group_shape_name = _unique_name(f"{prefix}_group_shape", taken_names)
-    graph.initializer.append(
-        onnx.numpy_helper.from_array(
-            np.array([embed_dim // 8, 8], dtype=np.int64), name=group_shape_name
-        )
-    )
-    last_axis_name = _unique_name(f"{prefix}_last_axis", taken_names)
-    graph.initializer.append(
-        onnx.numpy_helper.from_array(
-            np.array([-1], dtype=np.int64), name=last_axis_name
-        )
-    )
-
-    new_nodes: List[onnx.NodeProto] = []
-
-    greater_out = _unique_name(f"{prefix}_greater", taken_names)
-    new_nodes.append(onnx.helper.make_node("Greater", [x, zero_name], [greater_out]))
-    bits_i64 = _unique_name(f"{prefix}_bits_i64", taken_names)
-    new_nodes.append(
-        onnx.helper.make_node(
-            "Cast", [greater_out], [bits_i64], to=onnx.TensorProto.INT64
-        )
-    )
-
-    shape_full = _unique_name(f"{prefix}_shape", taken_names)
-    new_nodes.append(onnx.helper.make_node("Shape", [x], [shape_full]))
-    slice_start_name = _unique_name(f"{prefix}_slice_start", taken_names)
-    graph.initializer.append(
-        onnx.numpy_helper.from_array(
-            np.array([0], dtype=np.int64), name=slice_start_name
-        )
-    )
-    slice_end_name = _unique_name(f"{prefix}_slice_end", taken_names)
-    graph.initializer.append(
-        onnx.numpy_helper.from_array(
-            np.array([-1], dtype=np.int64), name=slice_end_name
-        )
-    )
-    shape_prefix = _unique_name(f"{prefix}_shape_prefix", taken_names)
-    new_nodes.append(
-        onnx.helper.make_node(
-            "Slice",
-            [shape_full, slice_start_name, slice_end_name],
-            [shape_prefix],
-        )
-    )
-    new_shape = _unique_name(f"{prefix}_new_shape", taken_names)
-    new_nodes.append(
-        onnx.helper.make_node(
-            "Concat", [shape_prefix, group_shape_name], [new_shape], axis=0
-        )
-    )
-
-    reshaped = _unique_name(f"{prefix}_reshaped", taken_names)
-    new_nodes.append(
-        onnx.helper.make_node("Reshape", [bits_i64, new_shape], [reshaped])
-    )
-    weighted = _unique_name(f"{prefix}_weighted", taken_names)
-    new_nodes.append(onnx.helper.make_node("Mul", [reshaped, weights_name], [weighted]))
-    packed_i64 = _unique_name(f"{prefix}_packed_i64", taken_names)
-    new_nodes.append(
-        onnx.helper.make_node(
-            "ReduceSum", [weighted, last_axis_name], [packed_i64], keepdims=0
-        )
-    )
-    packed_u8 = _unique_name(f"{prefix}_packed_u8", taken_names)
-    new_nodes.append(
-        onnx.helper.make_node(
-            "Cast", [packed_i64], [packed_u8], to=onnx.TensorProto.UINT8
-        )
-    )
-
-    graph.node.extend(new_nodes)
-
-    target.name = packed_u8
-    target.type.tensor_type.elem_type = onnx.TensorProto.UINT8
-    del target.type.tensor_type.shape.dim[:]
-    target.type.tensor_type.shape.dim.extend(leading_dims)
-    target.type.tensor_type.shape.dim.add().dim_value = embed_dim // 8
-
-    return out
+    return quantize_embedding_binary_cpp(model, output_name)
 
 
 def quantize_embedding_int8(

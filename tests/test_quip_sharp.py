@@ -1,8 +1,19 @@
 """Tests for ``onnxsim.apply_quip_sharp`` (QuIP#, see
 ``onnxsim/quip_sharp.py``) -- conjugates each matched layer's weight by a
 pair of random orthogonal matrices (incoherence processing) before
-quantizing 8-element groups onto the E8 lattice, reconstructed in-graph
-via (X @ U) @ Ŵtilde @ V.
+quantizing 8-element groups onto the E8 lattice.
+
+``apply_quip_sharp`` now delegates to ``onnxsim.apply_quip_sharp_cpp``
+(see ``onnxsim/quip_sharp.py``'s own "Delegates to" note): the returned
+graph folds the entire rotate/quantize/rotate-back sandwich into a single
+replacement float32 initializer rather than keeping ``U``/``V``/the
+packed INT4 lattice codes as explicit initializers and new ``MatMul``
+nodes, and it no longer accepts a non-default ``seed``/``epsilon`` (both
+hardcoded by the delegated C++ port) -- see ``tests/test_quip_sharp_cpp.py``
+for the full C++ port test suite this one now exercises indirectly. The
+E8-lattice/random-orthogonal-matrix helper functions below are unaffected
+(still pure Python, reused directly by ``tests/test_quip_sharp_cpp.py``
+for its own independent baseline).
 """
 
 import itertools
@@ -127,13 +138,24 @@ def test_closest_point_d8_has_even_coordinate_sum():
     assert np.all(sums.astype(np.int64) % 2 == 0)  # even
 
 
+def _current_weight(model, weight_input_index=1):
+    # apply_quip_sharp_cpp (which apply_quip_sharp now delegates to) folds
+    # the entire rotate/quantize/rotate-back sandwich into a replacement
+    # float32 initializer, rewiring the matched node's own weight input --
+    # see onnxsim/quip_sharp.py's own "Delegates to" note.
+    node = next(n for n in model.graph.node if n.op_type in ("MatMul", "Gemm"))
+    w_name = node.input[weight_input_index]
+    w_init = next(t for t in model.graph.initializer if t.name == w_name)
+    return onnx.numpy_helper.to_array(w_init)
+
+
 def test_quip_sharp_output_stays_close_to_float_via_onnxruntime():
     model = _matmul_model(K=32, N=16, seed=4)
-    q = onnxsim.apply_quip_sharp(model, seed=0)
+    q = onnxsim.apply_quip_sharp(model)
     onnx.checker.check_model(q)
 
-    op_types = {n.op_type for n in q.graph.node}
-    assert op_types <= {"MatMul", "Cast", "Div", "Reshape", "Mul", "Identity", "Add"}
+    # No new graph nodes -- folded straight into a replacement initializer.
+    assert [n.op_type for n in q.graph.node] == [n.op_type for n in model.graph.node]
 
     rng = np.random.default_rng(5)
     x = rng.standard_normal((16, 32)).astype(np.float32)
@@ -143,64 +165,25 @@ def test_quip_sharp_output_stays_close_to_float_via_onnxruntime():
     assert _rel_l2(float_y, q_y) < 0.3
 
 
-def test_quip_sharp_dequantized_values_match_hand_decoded_reference():
+def test_quip_sharp_replaces_weight_with_same_shape_float():
     K, N = 32, 16
     model = _matmul_model(K=K, N=N, seed=4)
-    q = onnxsim.apply_quip_sharp(model, seed=0)
-
-    codes = onnx.numpy_helper.to_array(
-        next(t for t in q.graph.initializer if t.name.endswith("_codes"))
-    ).astype(np.float64)
-    scale = onnx.numpy_helper.to_array(
-        next(t for t in q.graph.initializer if t.name.endswith("_scale"))
-    ).astype(np.float64)
-    u = onnx.numpy_helper.to_array(
-        next(t for t in q.graph.initializer if t.name.endswith("_u"))
-    ).astype(np.float64)
-    v = onnx.numpy_helper.to_array(
-        next(t for t in q.graph.initializer if t.name.endswith("_v"))
-    ).astype(np.float64)
-    num_groups = K // 8
-    native = (codes / 2.0).reshape(num_groups, 8, N)
-    w_tilde_hat = (native * scale).reshape(K, N)
-
-    rng = np.random.default_rng(5)
-    x = rng.standard_normal((16, K)).astype(np.float32)
-    y_hand = (x.astype(np.float64) @ u) @ w_tilde_hat @ v
-
-    (q_y,) = _run(q, {"X": x})
-    assert np.allclose(y_hand, q_y.astype(np.float64), rtol=0, atol=1e-3)
-
-
-def test_quip_sharp_orthogonal_matrices_stored_in_graph_are_valid():
-    model = _matmul_model(K=24, N=8, seed=6)
-    q = onnxsim.apply_quip_sharp(model, seed=2)
-    u = onnx.numpy_helper.to_array(
-        next(t for t in q.graph.initializer if t.name.endswith("_u"))
-    ).astype(np.float64)
-    v = onnx.numpy_helper.to_array(
-        next(t for t in q.graph.initializer if t.name.endswith("_v"))
-    ).astype(np.float64)
-    assert np.allclose(u @ u.T, np.eye(24), atol=1e-5)
-    assert np.allclose(v @ v.T, np.eye(8), atol=1e-5)
-
-
-def test_quip_sharp_codes_stay_in_int4_range():
-    model = _matmul_model(K=32, N=8, seed=7)
-    q = onnxsim.apply_quip_sharp(model, seed=3)
-    codes = onnx.numpy_helper.to_array(
-        next(t for t in q.graph.initializer if t.name.endswith("_codes"))
-    )
-    assert np.all(codes >= -7) and np.all(codes <= 7)
+    q = onnxsim.apply_quip_sharp(model)
+    new_w = _current_weight(q)
+    orig_w = onnx.numpy_helper.to_array(model.graph.initializer[0])
+    assert new_w.shape == orig_w.shape
+    assert new_w.dtype == np.float32
+    assert not np.array_equal(new_w, orig_w)
 
 
 def test_quip_sharp_unaffected_by_ort_graph_optimization_level():
     # Unlike DequantizeLinear-based weight-only quantization (see
-    # onnxsim/ort_matmul_nbits_workaround.py), this module's dequantize
-    # path uses no DequantizeLinear node at all, so it shouldn't trip
-    # ONNX Runtime's MatMulNBitsFusion transformer.
+    # onnxsim/ort_matmul_nbits_workaround.py), this module's own delegated
+    # C++ implementation folds to a plain float32 initializer with no new
+    # nodes at all, so it shouldn't trip ONNX Runtime's MatMulNBitsFusion
+    # transformer.
     model = _matmul_model(K=32, N=16, seed=8)
-    q = onnxsim.apply_quip_sharp(model, seed=4)
+    q = onnxsim.apply_quip_sharp(model)
     rng = np.random.default_rng(9)
     x = rng.standard_normal((8, 32)).astype(np.float32)
 
@@ -217,6 +200,16 @@ def test_quip_sharp_unaffected_by_ort_graph_optimization_level():
     assert np.allclose(y_off, y_on, rtol=0, atol=1e-5)
 
 
+def test_quip_sharp_seed_and_epsilon_must_be_default():
+    # apply_quip_sharp_cpp (which this function now delegates to)
+    # hardcodes seed=0/epsilon=1e-8 and cannot honor other values.
+    model = _matmul_model(K=32, N=16, seed=8)
+    with pytest.raises(ValueError):
+        onnxsim.apply_quip_sharp(model, seed=4)
+    with pytest.raises(ValueError):
+        onnxsim.apply_quip_sharp(model, epsilon=1e-6)
+
+
 def test_quip_sharp_gemm_transb_with_bias():
     rng = np.random.default_rng(10)
     K, N = 40, 10
@@ -231,9 +224,8 @@ def test_quip_sharp_gemm_transb_with_bias():
         """,
         initializer=[_f32(weight, "W"), _f32(bias, "B")],
     )
-    q = onnxsim.apply_quip_sharp(model, seed=1)
+    q = onnxsim.apply_quip_sharp(model)
     onnx.checker.check_model(q)
-    assert any(n.op_type == "Add" for n in q.graph.node)
 
     x = rng.standard_normal((8, K)).astype(np.float32)
     (float_y,) = _run(model, {"X": x})
