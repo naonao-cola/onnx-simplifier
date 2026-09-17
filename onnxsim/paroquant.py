@@ -72,87 +72,11 @@ stays exact for the same reason either piece alone is: ``X @ W ==
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _pack_int4
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.omniquant import _quantize_blockwise_int4_with_clip
-from onnxsim.quip_sharp import _match_matmul_like
-
-
-def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:
-    return any(
-        o.domain in ("", "ai.onnx") and o.version >= min_version
-        for o in model.opset_import
-    )
-
-
-def _fit_paroquant_pairwise_rotation(
-    w_nk: np.ndarray, block_size: int, num_angle_steps: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Fits ParoQuant's block-diagonal pairwise (Givens) rotation, ``[K, K]``
-    -- one independent 2x2 rotation per adjacent channel pair
-    ``(0, 1), (2, 3), ...`` within each ``block_size``-wide quantization
-    block, identity everywhere else -- against ``w_nk`` ([N, K], output
-    channel first; already SmoothQuant-scaled by the caller). See this
-    module's own docstring. Returns ``(r, w_rotated_nk)``: the rotation
-    matrix and ``w_nk @ r`` (equal by construction, returned together since
-    the fit already computes the rotated weight incrementally).
-
-    Pairs are processed in a fixed left-to-right order within each block;
-    each pair's own angle is grid-searched over ``num_angle_steps`` points
-    in ``[-pi/4, pi/4]`` (``0`` always included when ``num_angle_steps`` is
-    odd, so a pair the search can't improve keeps its original, unrotated
-    columns) to minimize the mean squared INT4 round-to-nearest
-    reconstruction error of its own block, evaluated on the block's
-    already-partially-rotated state so later pairs in the same block adapt
-    to earlier ones.
-    """
-    n, k = w_nk.shape
-    assert block_size % 2 == 0 and k % block_size == 0
-    r = np.eye(k, dtype=np.float64)
-    w_work = w_nk.astype(np.float64).copy()
-    thetas = np.linspace(-np.pi / 4.0, np.pi / 4.0, num_angle_steps)
-
-    for start in range(0, k, block_size):
-        end = start + block_size
-        for i in range(start, end, 2):
-            j = i + 1
-            col_i = w_work[:, i].copy()
-            col_j = w_work[:, j].copy()
-
-            best_err: Optional[float] = None
-            best_theta = 0.0
-            best_ci, best_cj = col_i, col_j
-            for theta in thetas:
-                c, s = np.cos(theta), np.sin(theta)
-                new_i = c * col_i - s * col_j
-                new_j = s * col_i + c * col_j
-                block = w_work[:, start:end].copy()
-                block[:, i - start] = new_i
-                block[:, j - start] = new_j
-                codes, scale_blocks = _quantize_blockwise_int4_with_clip(
-                    block, block_size, 1.0
-                )
-                recon = codes * np.repeat(scale_blocks, block_size, axis=1)
-                err = float(np.mean((block - recon) ** 2))
-                if best_err is None or err < best_err:
-                    best_err, best_theta = err, theta
-                    best_ci, best_cj = new_i, new_j
-
-            w_work[:, i], w_work[:, j] = best_ci, best_cj
-            c, s = np.cos(best_theta), np.sin(best_theta)
-            r[i, i], r[i, j] = c, s
-            r[j, i], r[j, j] = -s, c
-
-    return r, w_work
+from onnxsim.calibration import Tensors
 
 
 def apply_paroquant(
@@ -208,151 +132,26 @@ def apply_paroquant(
             older than 21 (INT4's tensor type and ``DequantizeLinear``'s
             ``block_size`` attribute both need opset 21), is returned
             unchanged
+
+    Thin wrapper delegating to the verified C++ port
+    (:func:`onnxsim.apply_paroquant_cpp`) -- full parameter parity, no
+    functionality gap (see that function's own docstring, and
+    ``onnxsim/paroquant_entry.h``; unlike :func:`onnxsim.apply_spinquant`'s
+    own eigendecomposition-algorithm divergence, the per-pair Givens angle
+    search here has no RNG/LAPACK-equivalent choice to diverge on, so
+    fitted angles are expected to agree closely with this function's own
+    former pure-Python implementation).
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if not _has_min_opset(model, 21) or block_size % 2 != 0:
-        return model
+    from onnxsim.onnx_simplifier import apply_paroquant_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    nodes = list(graph.node)
-    candidates = []
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, bias_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, bias_name, weight_transposed))
-
-    if not candidates:
-        return out
-
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
-
-    probe_names = sorted({x_name for _, x_name, _, _, _ in candidates})
-    probe_model = _add_probe_outputs(model, probe_names)
-    act_absmax: Dict[str, np.ndarray] = {}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            x = np.asarray(result[name], dtype=np.float64)
-            if x.ndim != 2:
-                continue
-            m = np.abs(x).max(axis=0)
-            act_absmax[name] = (
-                m if name not in act_absmax else np.maximum(act_absmax[name], m)
-            )
-
-    for node, x_name, w_name, bias_name, weight_transposed in candidates:
-        absmax = act_absmax.get(x_name)
-        if absmax is None:
-            continue
-
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_nk = w if weight_transposed else w.T  # [N, K], output channel first
-        n, k = w_nk.shape
-        if k % block_size != 0 or absmax.shape[0] != k:
-            continue
-
-        act_channel = np.maximum(absmax, epsilon)
-        weight_channel = np.maximum(np.abs(w_nk).max(axis=0), epsilon)  # [K]
-        s = (act_channel**alpha) / (weight_channel ** (1.0 - alpha))
-        s = np.maximum(s, epsilon)
-
-        w_smooth_nk = w_nk * s[np.newaxis, :]
-        r, w_tilde_nk = _fit_paroquant_pairwise_rotation(
-            w_smooth_nk, block_size, num_angle_steps
-        )
-
-        codes_nk, scale_blocks_nk = _quantize_blockwise_int4_with_clip(
-            w_tilde_nk, block_size, 1.0
-        )
-        codes_kn = codes_nk.T.astype(np.int64)  # [K, N], ready for a plain MatMul
-        scale_kn = scale_blocks_nk.T.astype(np.float32)  # [K/block_size, N]
-
-        prefix = f"{w_name}_paroquant"
-        codes_name = _unique_name(f"{prefix}_codes", taken_names)
-        codes_tensor = onnx.TensorProto()
-        codes_tensor.name = codes_name
-        codes_tensor.data_type = onnx.TensorProto.INT4
-        codes_tensor.dims.extend([k, n])
-        codes_tensor.raw_data = _pack_int4(codes_kn)
-        graph.initializer.append(codes_tensor)
-
-        scale_name = _unique_name(f"{prefix}_scale", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(scale_kn, name=scale_name)
-        )
-        r_name = _unique_name(f"{prefix}_r", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(r.astype(np.float32), name=r_name)
-        )
-        inv_s_name = _unique_name(f"{prefix}_inv_scale", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array((1.0 / s).astype(np.float32), name=inv_s_name)
-        )
-
-        new_nodes: List[onnx.NodeProto] = []
-
-        def _new(op_type, inputs, out_suffix, **attrs):
-            out_name = _unique_name(f"{prefix}_{out_suffix}", taken_names)
-            n_ = onnx.helper.make_node(
-                op_type,
-                inputs,
-                [out_name],
-                name=_unique_name(f"{prefix}_{out_suffix}_node", taken_names),
-                **attrs,
-            )
-            new_nodes.append(n_)
-            return out_name
-
-        x_scaled = _new("Mul", [x_name, inv_s_name], "x_scaled")
-        x_rotated = _new("MatMul", [x_scaled, r_name], "x_rotated")
-        w_dequant = _new(
-            "DequantizeLinear",
-            [codes_name, scale_name],
-            "w_dequant",
-            axis=0,
-            block_size=block_size,
-        )
-        core = _new("MatMul", [x_rotated, w_dequant], "core")
-
-        old_output = node.output[0]
-        if bias_name is not None:
-            final = onnx.helper.make_node(
-                "Add",
-                [core, bias_name],
-                [old_output],
-                name=_unique_name(f"{prefix}_bias_add_node", taken_names),
-            )
-        else:
-            final = onnx.helper.make_node(
-                "Identity",
-                [core],
-                [old_output],
-                name=_unique_name(f"{prefix}_identity_node", taken_names),
-            )
-        new_nodes.append(final)
-
-        node_idx = next(i for i, n_ in enumerate(graph.node) if n_ is node)
-        for offset, new_node in enumerate(new_nodes):
-            graph.node.insert(node_idx + offset, new_node)
-        del graph.node[node_idx + len(new_nodes)]
-
-    return out
+    return apply_paroquant_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        block_size=block_size,
+        alpha=alpha,
+        num_angle_steps=num_angle_steps,
+        epsilon=epsilon,
+        providers=providers,
+    )

@@ -1239,6 +1239,101 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "percdamp"_a = 0.01, "proc_block_size"_a = 128);
 
+  // LQER (Zhang et al., 2024): activation-weighted low-rank correction of
+  // an INT4-quantized MatMul/Gemm layer's own existing reconstruction
+  // error -- an activation-weighted generalization of
+  // apply_low_rank_compensation's own plain (unweighted) SVD. Same
+  // executor-as-first-argument, `calibration_data` crossing convention as
+  // apply_gptq's own binding above. See ApplyLqer in lqer_entry.h for the
+  // full scope and onnxsim/lqer.py for the technique this ports.
+  m.def(
+      "apply_lqer",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t rank, double eps) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result = ApplyLqer(float_model, quantized_model, *executor,
+                                      calibration_data, rank, eps);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "rank"_a = 8, "eps"_a = 1e-6);
+
+  // Norm Tweaking (Li, Xu, Ni, Chen, Ye, Sun, 2023): recalibrates a
+  // LayerNormalization node's own scale/bias in place so its output
+  // distribution's per-channel mean/standard deviation matches the float
+  // model's own, correcting for the distribution shift a quantized
+  // upstream layer introduces. Same executor-as-first-argument,
+  // `calibration_data` crossing convention as apply_gptq's own binding
+  // above. See ApplyNormTweaking in norm_tweaking_entry.h for the full
+  // scope and onnxsim/norm_tweaking.py for the technique this ports.
+  m.def(
+      "apply_norm_tweaking",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double eps) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result = ApplyNormTweaking(float_model, quantized_model,
+                                              *executor, calibration_data, eps);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "eps"_a = 1e-6);
+
+  // D2Quant's Deviation-Aware Correction (DAC) (Yan et al., 2026): folds a
+  // measured, quantization-induced per-channel mean-shift deviation
+  // directly into the following LayerNormalization's own bias. Same
+  // executor-as-first-argument, `calibration_data` crossing convention as
+  // apply_gptq's own binding above. See ApplyDac in dac_entry.h for the
+  // full scope and onnxsim/d2quant.py's own apply_dac for the technique
+  // this ports (that module's own apply_dsq is a separate technique,
+  // already ported elsewhere as "apply_dsq" above).
+  m.def(
+      "apply_dac",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& float_model_bytes, const py::bytes& quantized_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         double min_expected_error_reduction,
+         double correction_threshold) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto float_model;
+        ParseProtoFromBytes(&float_model, float_model_bytes.c_str(),
+                            float_model_bytes.size());
+        ONNX_NAMESPACE::ModelProto quantized_model;
+        ParseProtoFromBytes(&quantized_model, quantized_bytes.c_str(),
+                            quantized_bytes.size());
+        const auto result =
+            ApplyDac(float_model, quantized_model, *executor, calibration_data,
+                     min_expected_error_reduction, correction_threshold);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
+      "calibration_data"_a, "min_expected_error_reduction"_a = 0.5,
+      "correction_threshold"_a = 1e-12);
+
   // AWQ (Lin et al., 2023): grid-searched per-channel weight rescaling
   // for every quantize_weight_only_int4-quantized MatMul/Gemm layer
   // shared (by node output name) between a float model and its quantized
@@ -1502,6 +1597,114 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "alpha"_a = 0.5,
       "epsilon"_a = 1e-5);
+
+  // RPTQ (Yuan et al., 2023): clusters every matched MatMul/vanilla-Gemm
+  // node's input channels by their own calibration abs-max (a plain
+  // Lloyd's-algorithm k-means) and permutes them -- plus the weight's
+  // matching K-axis rows -- so same-cluster channels sit contiguously,
+  // via a new `Gather` before the node. An exact reordering, not a
+  // quantization -- see ApplyRptqReorder in rptq_entry.h for the full
+  // scope and onnxsim/rptq.py for the technique this ports. Returned as a
+  // (model_bytes, layers) pair rather than bare bytes, mirroring
+  // apply_embedding_vocab_pruning's own precedent above: `layers` is a
+  // list of (x_name, w_name, gather_output, permutation, cluster_bounds)
+  // tuples, reconstructed into the real, public
+  // `onnxsim.rptq.RptqLayerInfo` dict by the Python wrapper
+  // (onnx_simplifier.py's own apply_rptq_reorder_cpp).
+  m.def(
+      "apply_rptq_reorder",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t seed, int64_t num_clusters)
+          -> std::tuple<
+              py::bytes,
+              std::vector<std::tuple<
+                  std::string, std::string, std::string, std::vector<int64_t>,
+                  std::vector<std::pair<int64_t, int64_t>>>>> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyRptqReorder(model, *executor, calibration_data,
+                                             seed, num_clusters);
+        std::string out;
+        result.model.SerializeToString(&out);
+        std::vector<std::tuple<std::string, std::string, std::string,
+                               std::vector<int64_t>,
+                               std::vector<std::pair<int64_t, int64_t>>>>
+            layers;
+        layers.reserve(result.layers.size());
+        for (const auto& l : result.layers) {
+          layers.emplace_back(l.x_name, l.w_name, l.gather_output,
+                              l.permutation, l.cluster_bounds);
+        }
+        return {py::bytes(out.data(), out.size()), layers};
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "seed"_a = 0,
+      "num_clusters"_a = 4);
+
+  // SpinQuant (Liu et al., 2024), "R1-only" variant: fits a single dense
+  // [K, K] rotation per matched MatMul/vanilla-Gemm layer as the
+  // eigenvector basis of that layer's own calibration-activation
+  // covariance (a closed-form substitute for SpinQuant's own learned,
+  // Cayley-manifold-optimized rotation), conjugates the weight by it, then
+  // block-wise INT4-quantizes the result. See ApplySpinquant in
+  // spinquant_entry.h for the full scope and onnxsim/spinquant.py for the
+  // technique this ports. Same executor-as-first-argument,
+  // `calibration_data` crossing convention as apply_spqr's own binding
+  // above.
+  m.def(
+      "apply_spinquant",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t block_size) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplySpinquant(model, *executor, calibration_data, block_size);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "block_size"_a = 32);
+
+  // ParoQuant (Liang et al., 2025): combines a SmoothQuant-style per-
+  // -channel scale with many independent, cheap 2x2 (pairwise, Givens)
+  // rotations on fixed adjacent-channel pairs within each quantization
+  // block -- each angle grid-searched against its own block's INT4
+  // reconstruction error -- instead of onnxsim.apply_spinquant's single
+  // dense rotation, then block-wise INT4-quantizes the result. See
+  // ApplyParoquant in paroquant_entry.h for the full scope and
+  // onnxsim/paroquant.py for the technique this ports. Same executor-as-
+  // -first-argument, `calibration_data` crossing convention as
+  // apply_spqr's own binding above.
+  m.def(
+      "apply_paroquant",
+      [](std::shared_ptr<PyModelExecutor> executor,
+         const py::bytes& model_proto_bytes,
+         std::vector<std::unordered_map<std::string, onnx::TensorProto>>
+             calibration_data,
+         int64_t block_size, double alpha, int64_t num_angle_steps,
+         double epsilon) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            ApplyParoquant(model, *executor, calibration_data, block_size,
+                           alpha, num_angle_steps, epsilon);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "executor"_a, "model_bytes"_a, "calibration_data"_a, "block_size"_a = 32,
+      "alpha"_a = 0.5, "num_angle_steps"_a = 9, "epsilon"_a = 1e-5);
 
   // Outlier Suppression+ (Wei et al., 2023): per-channel shifting ahead
   // of SmoothQuant's own per-channel scale -- recenters each activation

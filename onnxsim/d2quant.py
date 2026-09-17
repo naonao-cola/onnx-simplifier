@@ -59,17 +59,12 @@ objective, not a specific reference implementation" stance
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.onnx_simplifier import apply_dsq_cpp
+from onnxsim.calibration import Tensors
+from onnxsim.onnx_simplifier import apply_dac_cpp, apply_dsq_cpp
 
 # ---------------------------------------------------------------------------
 # Dual-Scale Quantizer (DSQ) -- apply_dsq below delegates to the verified C++
@@ -146,43 +141,11 @@ def apply_dsq(
 
 
 # ---------------------------------------------------------------------------
-# Deviation-Aware Correction (DAC)
+# Deviation-Aware Correction (DAC) -- apply_dac below delegates to the
+# verified C++ port (apply_dac_cpp); this section's own former helper
+# function (_apply_ln_bias_correction) was removed as dead code once
+# nothing else in this file used it.
 # ---------------------------------------------------------------------------
-
-
-def _apply_ln_bias_correction(
-    graph: onnx.GraphProto,
-    ln_node: onnx.NodeProto,
-    correction: np.ndarray,
-    initializer_map: Dict[str, onnx.TensorProto],
-    taken_names: "set[str]",
-) -> None:
-    if len(ln_node.input) >= 3 and ln_node.input[2]:
-        bias_init = initializer_map.get(ln_node.input[2])
-        if (
-            bias_init is None
-            or bias_init.data_type != onnx.TensorProto.FLOAT
-            or list(bias_init.dims) != [correction.shape[0]]
-        ):
-            return
-        bias = onnx.numpy_helper.to_array(bias_init).astype(np.float64)
-        bias_init.CopyFrom(
-            onnx.numpy_helper.from_array(
-                (bias + correction).astype(np.float32), name=bias_init.name
-            )
-        )
-        return
-
-    new_bias = onnx.numpy_helper.from_array(
-        correction.astype(np.float32),
-        name=_unique_name(f"{ln_node.output[0]}_dac_bias", taken_names),
-    )
-    graph.initializer.append(new_bias)
-    initializer_map[new_bias.name] = new_bias
-    if len(ln_node.input) >= 3:
-        ln_node.input[2] = new_bias.name
-    else:
-        ln_node.input.append(new_bias.name)
 
 
 def apply_dac(
@@ -265,92 +228,19 @@ def apply_dac(
     :returns: ``quantized_model`` with a per-channel mean-shift correction
             folded into every measurably-shifted, gated-in
             ``LayerNormalization``'s own bias
+
+    Delegates to :func:`onnxsim.apply_dac_cpp` (the verified C++ port,
+    which has full parameter parity with this function -- see
+    ``dac_entry.h`` for its own scope note); this pure-Python name is kept
+    only for backward compatibility with existing callers.
     """
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    if isinstance(quantized_model, str):
-        quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
-
-    quantized_ln_outputs = {
-        n.output[0]
-        for n in quantized_model.graph.node
-        if n.op_type == "LayerNormalization" and n.output
-    }
-    candidates = [
-        n.output[0]
-        for n in float_model.graph.node
-        if n.op_type == "LayerNormalization"
-        and n.output
-        and n.output[0] in quantized_ln_outputs
-    ]
-    if not candidates:
-        return quantized_model
-
-    float_probe = _add_probe_outputs(float_model, candidates)
-    quantized_probe = _add_probe_outputs(quantized_model, candidates)
-
-    sums: Dict[str, np.ndarray] = {}
-    sumsqs: Dict[str, np.ndarray] = {}
-    counts: Dict[str, int] = {}
-    for batch in calibration_data:
-        float_out = backend.run_model(float_probe, batch, providers=providers)
-        quantized_out = backend.run_model(quantized_probe, batch, providers=providers)
-        for name in candidates:
-            f = np.asarray(float_out[name], dtype=np.float64)
-            q = np.asarray(quantized_out[name], dtype=np.float64)
-            if f.shape != q.shape or f.ndim == 0:
-                continue
-            diff = f - q
-            reduce_axes = tuple(range(diff.ndim - 1))
-            s = diff.sum(axis=reduce_axes) if reduce_axes else diff
-            ssq = (diff * diff).sum(axis=reduce_axes) if reduce_axes else diff * diff
-            cnt = diff.size // diff.shape[-1]
-            if name in sums:
-                sums[name] = sums[name] + s
-                sumsqs[name] = sumsqs[name] + ssq
-                counts[name] += cnt
-            else:
-                sums[name] = s
-                sumsqs[name] = ssq
-                counts[name] = cnt
-
-    corrected = onnx.ModelProto()
-    corrected.CopyFrom(quantized_model)
-    graph = corrected.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-    node_by_output = {
-        n.output[0]: n
-        for n in graph.node
-        if n.op_type == "LayerNormalization" and n.output
-    }
-
-    for name, total in sums.items():
-        cnt = counts[name]
-        mu = total / cnt
-        var = np.maximum(sumsqs[name] / cnt - mu * mu, 0.0)
-        expected_reduction = (mu * mu) / (mu * mu + var + 1e-12)
-        correction = np.where(
-            expected_reduction >= min_expected_error_reduction, mu, 0.0
-        )
-        if np.max(np.abs(correction)) <= correction_threshold:
-            continue
-        ln_node = node_by_output.get(name)
-        if ln_node is None or len(ln_node.input) < 2:
-            continue
-        gamma_init = initializer_map.get(ln_node.input[1])
-        if (
-            gamma_init is None
-            or gamma_init.data_type != onnx.TensorProto.FLOAT
-            or list(gamma_init.dims) != [correction.shape[0]]
-        ):
-            continue
-        _apply_ln_bias_correction(
-            graph, ln_node, correction.astype(np.float32), initializer_map, taken_names
-        )
-
-    return corrected
+    return apply_dac_cpp(
+        float_model,
+        quantized_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        providers=providers,
+        min_expected_error_reduction=min_expected_error_reduction,
+        correction_threshold=correction_threshold,
+    )
