@@ -673,3 +673,35 @@ def patch_conv_zp_x(reference_mcode: bytes, old_zp_x: int, new_zp_x: int) -> byt
     build pair and byte counts this was checked against.
     """
     return patch_mul_zp_x(reference_mcode, old_zp_x, new_zp_x)
+
+
+def bank81_field192_operand(k: int) -> bytes:
+    """Predict Gemm bank ``0x81`` field=192's V-record operand from the
+    contraction dimension ``K`` alone, no compiler in the loop.
+
+    The 3-byte operand is ``4c 05 <1024 // k - 1>``, decoded from Gemm's
+    native `Gemm` op (``tests/test_axera_gemm_bank_81_e1_decode.py``,
+    merged) and independently reconfirmed byte-identical for a
+    constant-weight ``MatMul(x, w)`` (``tests/test_axera_bank81_cross_op_check.py``,
+    merged) -- the same formula, same leading bytes, same op-independent
+    value, for every ``K`` both files tested. Verified directly against
+    real committed fixtures in
+    ``tests/test_axera_generator_progress_stocktake.py``.
+
+    **What this narrow capability does NOT give you.** This predicts one
+    field's own correct byte value for a shape that would trigger bank
+    ``0x81`` at all -- it does not decode, and this function does not
+    check, whether a given ``(K, N)`` pair actually lands in the
+    ``0x81``-alone regime in the first place (that switch is itself a
+    multi-plateau function of both ``K`` and ``N`` together, only
+    partially mapped -- see ``tests/test_axera_gemm_e1_threshold_formula.py``
+    and its own siblings). Nor does it establish that this field is
+    SAFE to patch in place in an arbitrary target stream without the
+    rest of the stream reflowing, the same caution ``patch_site_a``'s
+    own docstring already raises for this project's other shape-derived
+    fields (Gemm's ``K*M-1``, Conv's dilation/orientation fields): a
+    decoded formula for a field's own value is a necessary but not
+    sufficient condition for that field to be *generatable* in a target
+    stream this function did not itself compile.
+    """
+    return b"\x4c\x05" + bytes([1024 // k - 1])
