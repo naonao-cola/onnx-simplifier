@@ -696,16 +696,55 @@ def apply_adaquant(
             optimization itself* on, as an ONNX step graph
             (:mod:`onnxsim.qat_graph`) rather than in host numpy -- the way to
             reach a GPU, an NPU execution provider, or (in the WASM build)
-            WebGPU with this loop. ``None``, the default, keeps the in-process
-            float64 numpy loop, which is exact and deterministic; a step graph
-            computes in float32, so its result agrees closely rather than
-            bit-exactly. See ``docs/qat.md``.
+            WebGPU with this loop. ``None``, the default, delegates to the
+            verified C++ port (:func:`onnxsim.apply_adaquant_cpp`) instead of
+            an in-process numpy loop; a step graph computes in float32, so
+            its result agrees closely rather than bit-exactly with either.
+            See ``docs/qat.md``.
     :returns: ``quantized_model`` with every matched layer's weight INT8
             codes and activation (scale, zero_point) initializers rewritten
             to their jointly-optimized values (same shapes/dtypes -- the
             weight's own per-channel scale and the graph structure are
             untouched)
+
+    **Two implementations, one function.** Mirrors
+    :func:`onnxsim.apply_adaround`'s own ``step_providers is None``
+    dispatch exactly: when ``step_providers`` is ``None`` (the default --
+    the common, host-only case), this is a thin alias for
+    :func:`onnxsim.apply_adaquant_cpp` (``onnxsim/adaquant_entry.cpp``'s
+    own ``ApplyAdaquant``), forwarding every other argument unchanged.
+    When ``step_providers`` is given, this still runs the pure-Python
+    candidate-matching/activation-capture loop below, driving
+    :func:`_optimize_adaquant_on_graph`'s own ONNX step-graph execution
+    instead -- that accelerator path has no C++ port and is unaffected by
+    this alias. :func:`_optimize_adaquant`/:func:`_find_static_qdq_candidates`
+    themselves are untouched and stay available (the latter is a reusable
+    building block :mod:`onnxsim.qat` imports directly, independent of
+    whether this function still calls it) -- only this function's own
+    default dispatch changed. Imported lazily (inside the function body,
+    not at module scope) to avoid a circular import:
+    ``onnxsim.onnx_simplifier`` already imports from this module, so
+    importing it back at module load time here would deadlock the import
+    machinery.
     """
+    if step_providers is None:
+        from onnxsim.onnx_simplifier import apply_adaquant_cpp
+
+        return apply_adaquant_cpp(
+            float_model,
+            quantized_model,
+            calibration_data=calibration_data,
+            num_samples=num_samples,
+            seed=seed,
+            num_iterations=num_iterations,
+            weight_learning_rate=weight_learning_rate,
+            activation_learning_rate=activation_learning_rate,
+            reg_param=reg_param,
+            warm_start=warm_start,
+            beta_range=beta_range,
+            providers=providers,
+        )
+
     if isinstance(float_model, str):
         float_model = onnx.load(float_model, load_external_data=False)
     if isinstance(quantized_model, str):
@@ -762,12 +801,11 @@ def apply_adaquant(
         x_scale0 = float(onnx.numpy_helper.to_array(x_scale_init).reshape(-1)[0])
         x_zp0 = float(onnx.numpy_helper.to_array(x_zp_init).reshape(-1)[0])
 
-        optimize = (
-            _optimize_adaquant
-            if step_providers is None
-            else functools.partial(
-                _optimize_adaquant_on_graph, providers=step_providers
-            )
+        # step_providers is always given here -- the step_providers is None
+        # case returns early via apply_adaquant_cpp above, mirroring
+        # apply_adaround's own simplification of this same dispatch.
+        optimize = functools.partial(
+            _optimize_adaquant_on_graph, providers=step_providers
         )
         codes_nk, x_scale, x_zp = optimize(
             w_nk,

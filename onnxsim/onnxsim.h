@@ -18,9 +18,12 @@
 // than including its own home header, sharing a single struct definition
 // (rather than a byte-for-byte duplicate struct body in each header) avoids
 // two independently-edited copies of the same type ever drifting apart.
+#include "adaquant_entry.h"
 #include "adaround_entry.h"
+#include "affinequant_entry.h"
 #include "awq_entry.h"
 #include "billm_entry.h"
+#include "brecq_entry.h"
 #include "dac_entry.h"
 #include "daq_entry.h"
 #include "duquant_entry.h"
@@ -36,7 +39,9 @@
 #include "llm_int8_entry.h"
 #include "low_rank_compensation_entry.h"
 #include "lqer_entry.h"
+#include "moequant_entry.h"
 #include "norm_tweaking_entry.h"
+#include "omniquant_entry.h"
 #include "outlier_suppression_entry.h"
 #include "outlier_suppression_plus_entry.h"
 #include "owq_entry.h"
@@ -47,6 +52,7 @@
 #include "quarot_gptq_entry.h"
 #include "rotatekv_entry.h"
 #include "rptq_entry.h"
+#include "slim_llm_entry.h"
 #include "smoothquant_entry.h"
 #include "spinquant_entry.h"
 #include "spqr_entry.h"
@@ -1468,6 +1474,45 @@ onnx::ModelProto ApplyDsq(const onnx::ModelProto& model);
 // for the technique and gptvq_entry.h for this port's own scope
 // (including its accepted numerical scope and its own permanent RNG
 // divergence from the Python reference for the k-means codebook fit).
+
+// OmniQuant (Shao et al., 2023): grid-searched Learnable Weight Clipping
+// (LWC) plus a closed-form-shift/grid-searched-scale Learnable Equivalent
+// Transformation (LET), applied to every quantize_weight_only_int4-
+// quantized MatMul/Gemm layer shared (by node output name) between a float
+// model and its quantized counterpart -- C++ port of omniquant.py's own
+// apply_omniquant, declared in omniquant_entry.h (included above) rather
+// than duplicated here, mirroring how ApplyGptvq (gptvq_entry.h, also
+// included above) is documented in its own home header instead of this
+// one. See omniquant.py's own module docstring for the technique (and why
+// this is a bounded grid search rather than the paper's own gradient
+// descent) and omniquant_entry.h for this port's own scope.
+
+// AffineQuant (Ma et al., 2024, ICLR): OmniQuant's own LWC plus a
+// block-diagonal (not fully dense) Learnable Equivalent Transformation --
+// a per-block orthogonal rotation on top of OmniQuant's own diagonal
+// scale/shift, searched against the same reconstruction-error objective --
+// C++ port of affinequant.py's own apply_affinequant, built directly on
+// ApplyOmniquant's own machinery (omniquant_entry.h, also included above),
+// declared in affinequant_entry.h (included above) rather than duplicated
+// here. See affinequant.py's own module docstring for the technique and
+// affinequant_entry.h for this port's own scope (including its accepted
+// eigendecomposition-algorithm divergence for the block rotation).
+
+// BRECQ (Li et al., 2021, ICLR): jointly optimizes every
+// quantize_weight_only_int4-quantized MatMul/Gemm layer inside a
+// caller-delimited block (a linear chain plus an optional trailing
+// residual Add) against the block's own final output reconstruction
+// error, Fisher-diagonal weighted -- extending ApplyAdaround's own
+// rectified-sigmoid relaxation and hand-rolled Adam loop to a jointly
+// optimized block of layers instead of one layer at a time -- C++ port of
+// brecq.py's own apply_brecq, declared in brecq_entry.h (included above)
+// rather than duplicated here, mirroring how ApplyAdaround
+// (adaround_entry.h, also included above) is documented in its own home
+// header instead of this one. See brecq.py's own module docstring for the
+// technique (and what it simplifies relative to the paper) and
+// brecq_entry.h for this port's own scope -- including its accepted
+// numerical scope (same class as ApplyAdaround's own: an iterative Adam
+// optimization, not a closed-form computation).
 
 // Structured (channel) pruning: removes whole output channels from
 // MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller

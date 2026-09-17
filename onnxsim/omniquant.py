@@ -69,36 +69,21 @@ every other technique built on ``quantize_weight_only_int4``'s output).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Union
+from typing import Optional, Sequence, Union
 
 import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _find_int4_matmul_candidates, _node_outputs, _pack_int4
-from onnxsim.bias_correction import (
-    _activation_rows,
-    _add_probe_outputs,
-    _all_names,
-    _unique_name,
-)
-from onnxsim.calibration import Tensors, generate_random_calibration_data
+from onnxsim.calibration import Tensors
 
-
-@dataclass
-class _OmniQuantRewrite:
-    output_name: str
-    activation_name: str
-    wq_name: str
-    ws_name: str
-    codes: np.ndarray  # int8, original (Wq's) layout/shape
-    scale: np.ndarray  # float32, original (Ws's) layout/shape
-    channel_scale: Optional[np.ndarray]  # None means no LET transform needed
-    shift: Optional[np.ndarray]  # [K]; paired with channel_scale
-    bias_correction: Optional[np.ndarray]  # [N]; paired with channel_scale
+# _quantize_blockwise_int4_with_clip is kept as a plain, directly reusable
+# function (not folded into apply_omniquant's own now-C++ implementation
+# below) because it is reused by other modules' own pure-Python searches --
+# onnxsim.quarot, onnxsim.imatrix_quant, and onnxsim.mixed_precision all
+# import it directly, and it is not itself a hot loop worth porting on its
+# own (apply_omniquant_cpp's own C++ port re-derives the identical formula
+# internally, since it operates at the protobuf level, not via this
+# function).
 
 
 def _quantize_blockwise_int4_with_clip(
@@ -118,22 +103,6 @@ def _quantize_blockwise_int4_with_clip(
     scale_full = np.repeat(scale_blocks, block_size, axis=1)
     codes_nk = np.clip(np.round(w_nk / scale_full), -7.0, 7.0)
     return codes_nk, scale_blocks
-
-
-def _reconstruction_error(
-    x: np.ndarray,
-    y_float: np.ndarray,
-    w_hat_nk: np.ndarray,
-    shift,
-    channel_scale,
-    bias_correction,
-) -> float:
-    if channel_scale is None:
-        y_hat = x @ w_hat_nk.T
-    else:
-        x_transformed = (x - shift[np.newaxis, :]) / channel_scale[np.newaxis, :]
-        y_hat = x_transformed @ w_hat_nk.T + bias_correction[np.newaxis, :]
-    return float(np.mean((y_float - y_hat) ** 2))
 
 
 def apply_omniquant(
@@ -193,186 +162,26 @@ def apply_omniquant(
             A layer OmniQuant found no LET improvement for (``alpha = 0``
             best) still gets its LWC-only reclipping, with no inserted
             activation-side nodes.
+
+    Thin wrapper delegating to the verified C++ port
+    (:func:`onnxsim.apply_omniquant_cpp`) -- full parameter parity, no
+    functionality gap: this is a bounded, deterministic grid search (no
+    RNG, no hand-rolled dense linear algebra), and the C++ port has been
+    verified to track this module's own numpy arithmetic bit-for-bit
+    across every shape/GEMM-orientation/3-D-activation configuration this
+    module's own test suite exercises (see
+    ``tests/test_omniquant_cpp.py``).
     """
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    if isinstance(quantized_model, str):
-        quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_omniquant_cpp
 
-    candidates = _find_int4_matmul_candidates(float_model, quantized_model)
-    if not candidates:
-        return quantized_model
-
-    probe_names = sorted({c.float_node.input[0] for c in candidates})
-    float_probe = _add_probe_outputs(float_model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        out = backend.run_model(float_probe, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(out[name], dtype=np.float64))
-
-    clip_ratios = np.linspace(min_clip_ratio, 1.0, num_clip_steps)[::-1]  # 1.0 first
-    alphas = np.linspace(0.0, 1.0, num_alpha_steps)
-
-    rewrites: List[_OmniQuantRewrite] = []
-    for c in candidates:
-        acts = _activation_rows(activations[c.float_node.input[0]])
-        if not acts:
-            continue  # no usable activation (no feature axis); skip
-        x = np.concatenate(acts, axis=0)
-
-        w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if c.weight_transposed else w.T  # [N, K]
-        if x.shape[1] != w_nk.shape[1]:
-            continue
-
-        y_float = x @ w_nk.T
-
-        # Stage 1: LWC only (no LET) -- clip_ratio=1.0 is always tried
-        # first and is exactly quantize_weight_only_int4's own scale, so
-        # this stage can only match or improve on plain RTN.
-        best_codes_nk, best_scale_blocks = _quantize_blockwise_int4_with_clip(
-            w_nk, c.block_size, 1.0
-        )
-        best_err = _reconstruction_error(
-            x,
-            y_float,
-            best_codes_nk * np.repeat(best_scale_blocks, c.block_size, axis=1),
-            None,
-            None,
-            None,
-        )
-        best_clip_ratio = 1.0
-        for clip_ratio in clip_ratios[1:]:
-            codes_nk, scale_blocks = _quantize_blockwise_int4_with_clip(
-                w_nk, c.block_size, clip_ratio
-            )
-            w_hat_nk = codes_nk * np.repeat(scale_blocks, c.block_size, axis=1)
-            err = _reconstruction_error(x, y_float, w_hat_nk, None, None, None)
-            if err < best_err:
-                best_err = err
-                best_clip_ratio = clip_ratio
-                best_codes_nk, best_scale_blocks = codes_nk, scale_blocks
-
-        # Stage 2: LET (shift + scale) on top of the best LWC ratio found.
-        shift = np.mean(x, axis=0)  # [K]
-        x_centered = x - shift[np.newaxis, :]
-        weight_col_absmax = np.maximum(np.abs(w_nk).max(axis=0), 1e-12)  # [K]
-        act_col_absmax = np.maximum(np.abs(x_centered).mean(axis=0), 1e-12)  # [K]
-
-        best_channel_scale = None
-        best_shift = None
-        best_bias_correction = None
-        for alpha in alphas[1:]:  # alpha == 0 (no LET) already covered by stage 1
-            raw = act_col_absmax**alpha / weight_col_absmax ** (1.0 - alpha)
-            channel_scale = raw / np.exp(np.mean(np.log(raw)))
-            w_scaled_nk = w_nk * channel_scale[np.newaxis, :]
-            codes_nk, scale_blocks = _quantize_blockwise_int4_with_clip(
-                w_scaled_nk, c.block_size, best_clip_ratio
-            )
-            w_hat_nk = codes_nk * np.repeat(scale_blocks, c.block_size, axis=1)
-            bias_correction = w_nk @ shift  # [N]
-            err = _reconstruction_error(
-                x, y_float, w_hat_nk, shift, channel_scale, bias_correction
-            )
-            if err < best_err:
-                best_err = err
-                best_codes_nk, best_scale_blocks = codes_nk, scale_blocks
-                best_channel_scale = channel_scale
-                best_shift = shift
-                best_bias_correction = bias_correction
-
-        codes_orig = best_codes_nk if c.weight_transposed else best_codes_nk.T
-        scale_orig = best_scale_blocks if c.weight_transposed else best_scale_blocks.T
-        assert codes_orig.shape == (dim0, dim1)
-        rewrites.append(
-            _OmniQuantRewrite(
-                output_name=c.output_name,
-                activation_name=c.float_node.input[0],
-                wq_name=c.wq_name,
-                ws_name=c.ws_init.name,
-                codes=codes_orig.astype(np.int8),
-                scale=scale_orig.astype(np.float32),
-                channel_scale=best_channel_scale,
-                shift=best_shift,
-                bias_correction=best_bias_correction,
-            )
-        )
-
-    if not rewrites:
-        return quantized_model
-
-    corrected = onnx.ModelProto()
-    corrected.CopyFrom(quantized_model)
-
-    codes_by_name = {r.wq_name: r.codes for r in rewrites}
-    scale_by_name = {r.ws_name: r.scale for r in rewrites}
-    for t in corrected.graph.initializer:
-        codes = codes_by_name.get(t.name)
-        if codes is not None:
-            t.raw_data = _pack_int4(codes)
-        scale = scale_by_name.get(t.name)
-        if scale is not None:
-            t.CopyFrom(onnx.numpy_helper.from_array(scale, name=t.name))
-
-    taken_names: Set[str] = _all_names(corrected.graph)
-    q_by_output = _node_outputs(corrected.graph)
-    for r in rewrites:
-        if r.channel_scale is None or r.shift is None or r.bias_correction is None:
-            continue
-        qn = q_by_output[r.output_name]
-        act_input = r.activation_name
-        inv_scale = (1.0 / r.channel_scale).astype(np.float32)
-
-        shift_name = _unique_name(f"{act_input}_omniquant_shift", taken_names)
-        corrected.graph.initializer.append(
-            onnx.numpy_helper.from_array(r.shift.astype(np.float32), name=shift_name)
-        )
-        centered_name = _unique_name(f"{act_input}_omniquant_centered", taken_names)
-        sub_node = onnx.helper.make_node(
-            "Sub",
-            [act_input, shift_name],
-            [centered_name],
-            name=_unique_name(f"{act_input}_omniquant_sub", taken_names),
-        )
-        inv_scale_name = _unique_name(f"{act_input}_omniquant_inv_scale", taken_names)
-        corrected.graph.initializer.append(
-            onnx.numpy_helper.from_array(inv_scale, name=inv_scale_name)
-        )
-        scaled_name = _unique_name(f"{act_input}_omniquant_scaled", taken_names)
-        mul_node = onnx.helper.make_node(
-            "Mul",
-            [centered_name, inv_scale_name],
-            [scaled_name],
-            name=_unique_name(f"{act_input}_omniquant_mul", taken_names),
-        )
-        node_idx = next(i for i, n in enumerate(corrected.graph.node) if n is qn)
-        corrected.graph.node.insert(node_idx, sub_node)
-        corrected.graph.node.insert(node_idx + 1, mul_node)
-        qn.input[0] = scaled_name
-
-        old_output = qn.output[0]
-        base_name = _unique_name(f"{r.output_name}_omniquant_base", taken_names)
-        qn.output[0] = base_name
-        bias_name = _unique_name(f"{r.output_name}_omniquant_bias", taken_names)
-        corrected.graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                r.bias_correction.astype(np.float32), name=bias_name
-            )
-        )
-        add_node = onnx.helper.make_node(
-            "Add",
-            [base_name, bias_name],
-            [old_output],
-            name=_unique_name(f"{r.output_name}_omniquant_bias_add", taken_names),
-        )
-        qn_idx = next(i for i, n in enumerate(corrected.graph.node) if n is qn)
-        corrected.graph.node.insert(qn_idx + 1, add_node)
-
-    return corrected
+    return apply_omniquant_cpp(
+        float_model,
+        quantized_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        num_clip_steps=num_clip_steps,
+        num_alpha_steps=num_alpha_steps,
+        min_clip_ratio=min_clip_ratio,
+        providers=providers,
+    )

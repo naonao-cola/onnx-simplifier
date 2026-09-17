@@ -93,221 +93,11 @@ matching every other reconstruction-based pass in this repository.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
-import numpy as np
 import onnx
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import (
-    _GAMMA,
-    _ZETA,
-    _Candidate,
-    _find_int4_matmul_candidates,
-    _h_and_dhdv,
-    _node_outputs,
-    _pack_int4,
-)
-from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-
-_N_MIN = -7.0
-_N_MAX = 7.0
-
-
-def _layer_arrays(
-    c: _Candidate,
-) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int], bool]:
-    """Returns ``(w_nk, scale_nk, (dim0, dim1), weight_transposed)`` for one
-    candidate -- the float weight and its (block-broadcast) per-element
-    scale, both normalized to ``[N, K]`` (output channel first), matching
-    :mod:`onnxsim.adaround`'s own normalization exactly.
-    """
-    w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)
-    scale = onnx.numpy_helper.to_array(c.ws_init).astype(np.float64)
-    dim0, dim1 = w.shape
-    if c.weight_transposed:
-        w_nk = w  # already [N, K]
-        scale_blocks = scale  # already [N, K / block_size]
-    else:
-        w_nk = w.T  # [K, N] -> [N, K]
-        scale_blocks = scale.T  # [K / block_size, N] -> [N, K / block_size]
-    scale_nk = np.repeat(scale_blocks, c.block_size, axis=1)[:, : w_nk.shape[1]]
-    return w_nk, scale_nk, (dim0, dim1), c.weight_transposed
-
-
-def _discover_block_chain(
-    float_model: onnx.ModelProto,
-    quantized_model: onnx.ModelProto,
-    block_input_name: str,
-    block_output_name: str,
-) -> Optional[Tuple[List[_Candidate], bool]]:
-    """Walks the float graph from ``block_input_name`` to
-    ``block_output_name``, returning ``(chain, has_residual)`` -- the
-    ordered list of quantized MatMul/Gemm candidates found along the way,
-    and whether the chain ends in a residual ``Add`` back to
-    ``block_input_name`` -- or ``None`` if no such chain/candidate exists
-    (an unrecognized topology, not an error: callers are expected to pass
-    tensor names that actually delimit a block they know the shape of).
-    See this module's own docstring for exactly which topologies are
-    recognized.
-    """
-    candidates = _find_int4_matmul_candidates(float_model, quantized_model)
-    by_input = {c.float_node.input[0]: c for c in candidates}
-
-    chain: List[_Candidate] = []
-    seen_outputs = set()
-    cur = block_input_name
-    while cur != block_output_name:
-        c = by_input.get(cur)
-        if c is None or c.output_name in seen_outputs:
-            break
-        seen_outputs.add(c.output_name)
-        chain.append(c)
-        cur = c.output_name
-
-    if cur == block_output_name:
-        return (chain, False) if chain else None
-
-    if not chain:
-        return None
-
-    f_by_output = _node_outputs(float_model.graph)
-    add_node = f_by_output.get(block_output_name)
-    if (
-        add_node is not None
-        and add_node.op_type == "Add"
-        and len(add_node.input) == 2
-        and set(add_node.input) == {cur, block_input_name}
-    ):
-        return chain, True
-
-    return None
-
-
-def _fisher_diag(final_float: np.ndarray, eps: float) -> np.ndarray:
-    """Empirical per-output-element variance across calibration samples,
-    normalized to a mean of 1 -- see this module's own docstring for why
-    this stands in for the paper's own task-loss-gradient-based Fisher
-    diagonal.
-    """
-    var = final_float.var(axis=0)
-    mean_var = var.mean()
-    if mean_var <= eps:
-        return np.ones_like(var)
-    return (var + eps) / (mean_var + eps)
-
-
-def _optimize_block_rounding(
-    chain: List[_Candidate],
-    has_residual: bool,
-    x0: np.ndarray,
-    final_float: np.ndarray,
-    num_iterations: int,
-    learning_rate: float,
-    reg_param: float,
-    warm_start: float,
-    beta_range: Tuple[float, float],
-    fisher_eps: float,
-) -> List[np.ndarray]:
-    """Jointly optimizes every layer's rounding relaxation in ``chain``
-    against the block's own final output reconstruction error (post
-    residual add, if ``has_residual``), Fisher-diagonal-weighted. Returns
-    the optimized integer codes for each layer, in ``[N, K]`` layout, same
-    order as ``chain``.
-    """
-    layers = [_layer_arrays(c) for c in chain]
-    w_nks = [w for w, _, _, _ in layers]
-    scale_nks = [s for _, s, _, _ in layers]
-    floor_bases = [np.floor(w / s) for w, s in zip(w_nks, scale_nks)]
-
-    v_list = []
-    for w, s, floor_base in zip(w_nks, scale_nks, floor_bases):
-        frac = np.clip(w / s - floor_base, 1e-4, 1.0 - 1e-4)
-        # Same rectified-sigmoid inverse-at-init as onnxsim.adaround: start
-        # each element's relaxation at round-to-nearest's own choice.
-        sig0 = np.clip((frac - _GAMMA) / (_ZETA - _GAMMA), 1e-4, 1.0 - 1e-4)
-        v_list.append(np.log(sig0 / (1.0 - sig0)))
-
-    fisher = _fisher_diag(final_float, fisher_eps)
-
-    m_list = [np.zeros_like(v) for v in v_list]
-    v2_list = [np.zeros_like(v) for v in v_list]
-    adam_beta1, adam_beta2, adam_eps = 0.9, 0.999, 1e-8
-
-    warm_start_iters = int(num_iterations * warm_start)
-    beta_start, beta_end = beta_range
-    n_elems = x0.shape[0] * final_float.shape[1]
-    num_layers = len(chain)
-
-    for t in range(num_iterations):
-        # Forward: run the whole chain with each layer's current relaxation.
-        ys = [x0]
-        h_list, dh_dv_list, w_hat_list, active_list = [], [], [], []
-        for w_nk, scale_nk, floor_base, v in zip(w_nks, scale_nks, floor_bases, v_list):
-            h, dh_dv = _h_and_dhdv(v)
-            raw = floor_base + h
-            w_hat = np.clip(raw, _N_MIN, _N_MAX) * scale_nk
-            active = (raw > _N_MIN) & (raw < _N_MAX)
-            h_list.append(h)
-            dh_dv_list.append(dh_dv)
-            w_hat_list.append(w_hat)
-            active_list.append(active)
-            ys.append(ys[-1] @ w_hat.T)
-
-        final_hat = ys[-1] + x0 if has_residual else ys[-1]
-        diff = final_hat - final_float
-        grad_y = 2.0 * fisher[None, :] * diff / n_elems  # dL/dys[-1]
-
-        # Backward through the chain, layer by layer, propagating the
-        # gradient of the *block's own final output* loss back to each
-        # layer's own weight relaxation -- the joint part of BRECQ: a
-        # layer's own gradient here depends on every downstream layer's
-        # current weights, not just its own output.
-        grads_v_reversed: List[np.ndarray] = []
-        for layer_idx in range(num_layers - 1, -1, -1):
-            dl_dw_hat = grad_y.T @ ys[layer_idx]  # [N_l, K_l]
-            dl_dh = dl_dw_hat * np.where(
-                active_list[layer_idx], scale_nks[layer_idx], 0.0
-            )
-            grad_v = dl_dh * dh_dv_list[layer_idx]
-
-            if t >= warm_start_iters:
-                progress = (t - warm_start_iters) / max(
-                    1, num_iterations - warm_start_iters - 1
-                )
-                beta = beta_start + (beta_end - beta_start) * progress
-                u = 2.0 * h_list[layer_idx] - 1.0
-                abs_u = np.abs(u)
-                dreg_dh = (
-                    -2.0 * reg_param * beta * np.sign(u) * np.power(abs_u, beta - 1.0)
-                )
-                grad_v = grad_v + dreg_dh * dh_dv_list[layer_idx]
-
-            grads_v_reversed.append(grad_v)
-            if layer_idx > 0:
-                grad_y = grad_y @ w_hat_list[layer_idx]  # dL/dys[layer_idx]
-        grads_v = list(reversed(grads_v_reversed))
-
-        for layer_idx in range(num_layers):
-            m_list[layer_idx] = (
-                adam_beta1 * m_list[layer_idx] + (1.0 - adam_beta1) * grads_v[layer_idx]
-            )
-            v2_list[layer_idx] = adam_beta2 * v2_list[layer_idx] + (
-                1.0 - adam_beta2
-            ) * (grads_v[layer_idx] * grads_v[layer_idx])
-            m_hat = m_list[layer_idx] / (1.0 - adam_beta1 ** (t + 1))
-            v_hat = v2_list[layer_idx] / (1.0 - adam_beta2 ** (t + 1))
-            v_list[layer_idx] = v_list[layer_idx] - learning_rate * m_hat / (
-                np.sqrt(v_hat) + adam_eps
-            )
-
-    codes = []
-    for floor_base, v in zip(floor_bases, v_list):
-        h_final, _ = _h_and_dhdv(v)
-        codes.append(np.clip(floor_base + np.round(h_final), _N_MIN, _N_MAX))
-    return codes
+from onnxsim.calibration import Tensors
 
 
 def apply_brecq(
@@ -382,94 +172,39 @@ def apply_brecq(
             INT4 weight initializers rewritten to their jointly-optimized
             codes (same shape, dtype, and scale -- only which integer each
             element rounds to changes)
+
+    Thin wrapper delegating to the verified C++ port
+    (:func:`onnxsim.apply_brecq_cpp`) -- full parameter parity, no
+    functionality gap (BRECQ has no :func:`onnxsim.apply_adaround`-style
+    ``step_providers`` accelerator path to preserve a pure-Python
+    candidate-matching loop for). Same accepted-numerical-scope class as
+    :func:`onnxsim.apply_adaround` itself (see that function's own
+    docstring): this is an iterative Adam optimization, not a closed-form
+    computation, so floating-point summation-order differences between the
+    C++ port's own scalar dense-matmul kernels and this module's former
+    in-process numpy loop can compound across iterations -- measured
+    (tests/test_brecq_cpp.py) to agree exactly in every configuration that
+    test file exercises, but (matching AdaRound's own documented
+    possibility, since the joint block Adam loop here is the same
+    numerical class) not guaranteed to on every input. Imported lazily
+    (inside the function body, not at module scope), matching
+    :func:`onnxsim.apply_adaround`'s own identical precedent, to avoid a
+    module-load-time import cycle with ``onnxsim.onnx_simplifier``.
     """
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    if isinstance(quantized_model, str):
-        quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
+    from onnxsim.onnx_simplifier import apply_brecq_cpp
 
-    discovered = []
-    for block_input_name, block_output_name in blocks:
-        found = _discover_block_chain(
-            float_model, quantized_model, block_input_name, block_output_name
-        )
-        if found is not None:
-            discovered.append((block_input_name, block_output_name, *found))
-
-    if not discovered:
-        return quantized_model
-
-    probe_names = sorted(
-        {block_input_name for block_input_name, _, _, _ in discovered}
-        | {block_output_name for _, block_output_name, _, _ in discovered}
+    return apply_brecq_cpp(
+        float_model,
+        quantized_model,
+        blocks,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        num_iterations=num_iterations,
+        learning_rate=learning_rate,
+        reg_param=reg_param,
+        warm_start=warm_start,
+        beta_range=beta_range,
+        fisher_eps=fisher_eps,
+        providers=providers,
     )
-    float_probe = _add_probe_outputs(float_model, probe_names)
-
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
-    for batch in calibration_data:
-        out = backend.run_model(float_probe, batch, providers=providers)
-        for name in probe_names:
-            activations[name].append(np.asarray(out[name], dtype=np.float64))
-
-    optimized: Dict[str, np.ndarray] = {}
-    for block_input_name, block_output_name, chain, has_residual in discovered:
-        # Keep each batch's block-input/block-output pair together: only a
-        # batch whose two probed tensors flatten to the *same* number of
-        # rows is usable, and concatenating them independently (rather
-        # than pairwise) could silently misalign samples if the two ever
-        # disagreed per batch. A block preserves its token axis, so a
-        # [batch, seq, K] input and its [batch, seq, N] output both
-        # flatten to batch * seq rows, in the same order.
-        x0_batches = []
-        final_batches = []
-        for xa, fa in zip(
-            activations[block_input_name], activations[block_output_name]
-        ):
-            xr = _activation_rows([xa])
-            fr = _activation_rows([fa])
-            if xr and fr and xr[0].shape[0] == fr[0].shape[0]:
-                x0_batches.append(xr[0])
-                final_batches.append(fr[0])
-        if not x0_batches:
-            continue  # no usable activation pair; skip this block
-        x0 = np.concatenate(x0_batches, axis=0)
-        final_float = np.concatenate(final_batches, axis=0)
-
-        first_w_nk, _, _, _ = _layer_arrays(chain[0])
-        if x0.shape[1] != first_w_nk.shape[1]:
-            continue  # activation's feature dim doesn't match the first layer's K; skip
-
-        layer_codes = _optimize_block_rounding(
-            chain,
-            has_residual,
-            x0,
-            final_float,
-            num_iterations=num_iterations,
-            learning_rate=learning_rate,
-            reg_param=reg_param,
-            warm_start=warm_start,
-            beta_range=beta_range,
-            fisher_eps=fisher_eps,
-        )
-        for c, codes_nk in zip(chain, layer_codes):
-            _, _, (dim0, dim1), weight_transposed = _layer_arrays(c)
-            codes_orig = codes_nk if weight_transposed else codes_nk.T
-            assert codes_orig.shape == (dim0, dim1)
-            optimized[c.wq_name] = codes_orig.astype(np.int8)
-
-    if not optimized:
-        return quantized_model
-
-    corrected = onnx.ModelProto()
-    corrected.CopyFrom(quantized_model)
-    for t in corrected.graph.initializer:
-        codes = optimized.get(t.name)
-        if codes is None:
-            continue
-        t.raw_data = _pack_int4(codes)
-
-    return corrected
