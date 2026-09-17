@@ -77,26 +77,13 @@ relative to :mod:`onnxsim.quip_sharp`'s own random rotation.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, Union
 
 import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _pack_int4
-from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.omniquant import _quantize_blockwise_int4_with_clip
-from onnxsim.quip_sharp import _match_matmul_like, _random_orthogonal_matrix
-
-
-def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:
-    return any(
-        o.domain in ("", "ai.onnx") and o.version >= min_version
-        for o in model.opset_import
-    )
+from onnxsim.calibration import Tensors
+from onnxsim.quip_sharp import _random_orthogonal_matrix
 
 
 def _build_duquant_rotation(
@@ -206,183 +193,30 @@ def apply_duquant(
             model with no matching layer, or an opset older than 21
             (INT4's tensor type and ``DequantizeLinear``'s ``block_size``
             attribute both need opset 21), is returned unchanged
+
+    Thin wrapper delegating to the verified C++ port
+    (:func:`onnxsim.apply_duquant_cpp`) -- full parameter parity, no
+    functionality gap (see that function's own docstring, and
+    ``onnxsim/duquant_entry.h``, for the one documented, immaterial-to-
+    -correctness numerical divergence: this port seeds a fresh RNG per
+    matched layer -- rather than reproducing this module's own single,
+    sequentially-advancing ``numpy.random.Generator`` thread across every
+    layer and block -- and its own block-local rotation is a Gram-Schmidt
+    construction, not :func:`onnxsim.quip_sharp._random_orthogonal_matrix`'s
+    sign-corrected QR, so individual rotation columns and near-tied
+    outlier-channel assignments need not match exactly, only that the
+    permute-rotate-then-quantize composition stays exact before
+    quantization for any orthogonal rotation).
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if not _has_min_opset(model, 21):
-        return model
+    from onnxsim.onnx_simplifier import apply_duquant_cpp
 
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    nodes = list(graph.node)
-    candidates = []
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, bias_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, bias_name, weight_transposed))
-
-    if not candidates:
-        return out
-
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
-        )
-
-    probe_names = sorted({x_name for _, x_name, _, _, _ in candidates})
-    probe_model = _add_probe_outputs(model, probe_names)
-    act_absmax: Dict[str, np.ndarray] = {}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            x = np.asarray(result[name], dtype=np.float64)
-            if x.ndim != 2:
-                continue
-            m = np.abs(x).max(axis=0)
-            act_absmax[name] = (
-                m if name not in act_absmax else np.maximum(act_absmax[name], m)
-            )
-
-    rng = np.random.default_rng(seed)
-
-    for node, x_name, w_name, bias_name, weight_transposed in candidates:
-        absmax = act_absmax.get(x_name)
-        if absmax is None:
-            continue
-
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_nk = w if weight_transposed else w.T  # [N, K], output channel first
-        n, k = w_nk.shape
-        if k % block_size != 0 or absmax.shape[0] != k:
-            continue
-
-        u = _build_duquant_rotation(absmax, block_size, outlier_fraction, rng)
-        w_tilde_nk = w_nk @ u  # [N, K] -- exact before quantization
-
-        codes_nk, scale_blocks_nk = _quantize_blockwise_int4_with_clip(
-            w_tilde_nk, block_size, 1.0
-        )
-        codes_kn = codes_nk.T.astype(np.int64)  # [K, N], ready for a plain MatMul
-        scale_kn = scale_blocks_nk.T.astype(np.float32)  # [K/block_size, N]
-
-        prefix = f"{w_name}_duquant"
-        codes_name = _unique_name(f"{prefix}_codes", taken_names)
-        codes_tensor = onnx.TensorProto()
-        codes_tensor.name = codes_name
-        codes_tensor.data_type = onnx.TensorProto.INT4
-        codes_tensor.dims.extend([k, n])
-        codes_tensor.raw_data = _pack_int4(codes_kn)
-        graph.initializer.append(codes_tensor)
-
-        scale_name = _unique_name(f"{prefix}_scale", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(scale_kn, name=scale_name)
-        )
-        u_name = _unique_name(f"{prefix}_u", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(u.astype(np.float32), name=u_name)
-        )
-        eps_name = _unique_name(f"{prefix}_eps", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.array(epsilon, dtype=np.float32), name=eps_name
-            )
-        )
-        seven_name = _unique_name(f"{prefix}_seven", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.array(7.0, dtype=np.float32), name=seven_name
-            )
-        )
-        clip_min_name = _unique_name(f"{prefix}_clip_min", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.array(-7.0, dtype=np.float32), name=clip_min_name
-            )
-        )
-        clip_max_name = _unique_name(f"{prefix}_clip_max", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.array(7.0, dtype=np.float32), name=clip_max_name
-            )
-        )
-        axes_name = _unique_name(f"{prefix}_reduce_axes", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64), name=axes_name)
-        )
-
-        new_nodes: List[onnx.NodeProto] = []
-
-        def _new(op_type, inputs, out_suffix, **attrs):
-            out_name = _unique_name(f"{prefix}_{out_suffix}", taken_names)
-            n_ = onnx.helper.make_node(
-                op_type,
-                inputs,
-                [out_name],
-                name=_unique_name(f"{prefix}_{out_suffix}_node", taken_names),
-                **attrs,
-            )
-            new_nodes.append(n_)
-            return out_name
-
-        x_rotated = _new("MatMul", [x_name, u_name], "x_rotated")
-
-        # Data-free, per-token round-to-nearest INT4 activation
-        # quantization -- same pattern as onnxsim.quarot, simulated via
-        # an immediate dequantize (kept in float32) since X isn't
-        # constant: scale = max(reduce_max(abs(x_rotated), axis=-1), eps) / 7
-        abs_name = _new("Abs", [x_rotated], "x_abs")
-        max_name = _new("ReduceMax", [abs_name, axes_name], "x_max", keepdims=1)
-        safe_max_name = _new("Clip", [max_name, eps_name], "x_safe_max")
-        x_scale = _new("Div", [safe_max_name, seven_name], "x_scale")
-        x_scaled = _new("Div", [x_rotated, x_scale], "x_scaled")
-        x_rounded = _new("Round", [x_scaled], "x_rounded")
-        x_clipped = _new("Clip", [x_rounded, clip_min_name, clip_max_name], "x_clipped")
-        x_dequant = _new("Mul", [x_clipped, x_scale], "x_dequant")
-
-        w_dequant = _new(
-            "DequantizeLinear",
-            [codes_name, scale_name],
-            "w_dequant",
-            axis=0,
-            block_size=block_size,
-        )
-        core = _new("MatMul", [x_dequant, w_dequant], "core")
-
-        old_output = node.output[0]
-        if bias_name is not None:
-            final = onnx.helper.make_node(
-                "Add",
-                [core, bias_name],
-                [old_output],
-                name=_unique_name(f"{prefix}_bias_add_node", taken_names),
-            )
-        else:
-            final = onnx.helper.make_node(
-                "Identity",
-                [core],
-                [old_output],
-                name=_unique_name(f"{prefix}_identity_node", taken_names),
-            )
-        new_nodes.append(final)
-
-        node_idx = next(i for i, n_ in enumerate(graph.node) if n_ is node)
-        for offset, new_node in enumerate(new_nodes):
-            graph.node.insert(node_idx + offset, new_node)
-        del graph.node[node_idx + len(new_nodes)]
-
-    return out
+    return apply_duquant_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        block_size=block_size,
+        outlier_fraction=outlier_fraction,
+        epsilon=epsilon,
+        providers=providers,
+    )

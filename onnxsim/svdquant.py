@@ -70,26 +70,11 @@ any MatMul/Gemm the same way.
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim.adaround import _pack_int4
-from onnxsim.bias_correction import _all_names, _unique_name
 from onnxsim.calibration import Tensors
-from onnxsim.omniquant import _quantize_blockwise_int4_with_clip
-from onnxsim.quip_sharp import _match_matmul_like
-from onnxsim.smoothquant import apply_smoothquant
-
-
-def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:
-    return any(
-        o.domain in ("", "ai.onnx") and o.version >= min_version
-        for o in model.opset_import
-    )
 
 
 def apply_svdquant(
@@ -145,136 +130,26 @@ def apply_svdquant(
             matching layer, or an opset older than 21 (INT4's tensor type
             and ``DequantizeLinear``'s ``block_size`` attribute both need
             opset 21), is returned unchanged.
+
+    Thin wrapper delegating to the verified C++ port
+    (:func:`onnxsim.apply_svdquant_cpp`) -- full parameter parity, no
+    functionality gap (see that function's own docstring, and
+    ``onnxsim/svdquant_entry.h``, for the one documented, immaterial-to-
+    -correctness numerical divergence: this port's own SVD is a hand-rolled
+    Jacobi solver rather than ``numpy.linalg.svd``'s own LAPACK routine, so
+    individual singular vectors/values need not match sign-for-sign or
+    bit-for-bit, only that the reconstructed rank-``r`` low-rank branch
+    itself agrees closely).
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    if not _has_min_opset(model, 21):
-        return model
+    from onnxsim.onnx_simplifier import apply_svdquant_cpp
 
-    if smooth_alpha is not None:
-        model = apply_smoothquant(
-            model,
-            calibration_data=calibration_data,
-            num_samples=num_samples,
-            seed=seed,
-            alpha=smooth_alpha,
-            providers=providers,
-        )
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-
-    candidates = []
-    for node in list(graph.node):
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        x_name, w_name, bias_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, x_name, w_name, bias_name, weight_transposed))
-
-    if not candidates:
-        return out
-
-    for node, x_name, w_name, bias_name, weight_transposed in candidates:
-        w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_kn = w.T if weight_transposed else w  # [K, N], matching X @ W
-        k, n = w_kn.shape
-        if k % block_size != 0:
-            continue
-
-        r = min(rank, k, n)
-        if r <= 0:
-            continue
-
-        u, s, vt = np.linalg.svd(w_kn, full_matrices=False)
-        l1_kr = (u[:, :r] * s[np.newaxis, :r]).astype(np.float32)  # [K, r]
-        l2_rn = vt[:r, :].astype(np.float32)  # [r, N]
-        residual_kn = w_kn - (l1_kr.astype(np.float64) @ l2_rn.astype(np.float64))
-
-        residual_nk = residual_kn.T  # [N, K], output channel first
-        codes_nk, scale_blocks = _quantize_blockwise_int4_with_clip(
-            residual_nk, block_size, 1.0
-        )
-
-        prefix = f"{w_name}_svdquant"
-        codes_kn = codes_nk.T.astype(np.int64)  # [K, N]
-        scale_kn = scale_blocks.T.astype(np.float32)  # [K / block_size, N]
-
-        codes_name = _unique_name(f"{prefix}_codes", taken_names)
-        codes_tensor = onnx.TensorProto()
-        codes_tensor.name = codes_name
-        codes_tensor.data_type = onnx.TensorProto.INT4
-        codes_tensor.dims.extend([k, n])
-        codes_tensor.raw_data = _pack_int4(codes_kn)
-        graph.initializer.append(codes_tensor)
-
-        scale_name = _unique_name(f"{prefix}_scale", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(scale_kn, name=scale_name)
-        )
-
-        l1_name = _unique_name(f"{prefix}_l1", taken_names)
-        graph.initializer.append(onnx.numpy_helper.from_array(l1_kr, name=l1_name))
-        l2_name = _unique_name(f"{prefix}_l2", taken_names)
-        graph.initializer.append(onnx.numpy_helper.from_array(l2_rn, name=l2_name))
-
-        new_nodes: List[onnx.NodeProto] = []
-
-        def _new(op_type, inputs, out_suffix, **attrs):
-            out_name = _unique_name(f"{prefix}_{out_suffix}", taken_names)
-            n_ = onnx.helper.make_node(
-                op_type,
-                inputs,
-                [out_name],
-                name=_unique_name(f"{prefix}_{out_suffix}_node", taken_names),
-                **attrs,
-            )
-            new_nodes.append(n_)
-            return out_name
-
-        w_dequant = _new(
-            "DequantizeLinear",
-            [codes_name, scale_name],
-            "w_dequant",
-            axis=0,
-            block_size=block_size,
-        )
-        base = _new("MatMul", [x_name, w_dequant], "base")
-        lowrank_tmp = _new("MatMul", [x_name, l1_name], "lowrank_tmp")
-        lowrank = _new("MatMul", [lowrank_tmp, l2_name], "lowrank")
-        summed = _new("Add", [base, lowrank], "sum")
-
-        old_output = node.output[0]
-        if bias_name is not None:
-            final = onnx.helper.make_node(
-                "Add",
-                [summed, bias_name],
-                [old_output],
-                name=_unique_name(f"{prefix}_bias_add_node", taken_names),
-            )
-        else:
-            final = onnx.helper.make_node(
-                "Identity",
-                [summed],
-                [old_output],
-                name=_unique_name(f"{prefix}_identity_node", taken_names),
-            )
-        new_nodes.append(final)
-
-        node_idx = next(i for i, n_ in enumerate(graph.node) if n_ is node)
-        for offset, new_node in enumerate(new_nodes):
-            graph.node.insert(node_idx + offset, new_node)
-        del graph.node[node_idx + len(new_nodes)]
-
-    return out
+    return apply_svdquant_cpp(
+        model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        rank=rank,
+        block_size=block_size,
+        smooth_alpha=smooth_alpha,
+        providers=providers,
+    )

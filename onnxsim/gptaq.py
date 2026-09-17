@@ -59,17 +59,12 @@ module's own tests check directly.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
-import numpy as np
 import onnx
-import onnx.numpy_helper
 
-from onnxsim import backend
-from onnxsim.adaround import _find_int4_matmul_candidates, _node_outputs, _pack_int4
-from onnxsim.bias_correction import _activation_rows, _add_probe_outputs
-from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.gptq import _gptq_quantize_columns, _inverse_hessian_cholesky
+from onnxsim.calibration import Tensors
+from onnxsim.onnx_simplifier import apply_gptaq_cpp
 
 
 def apply_gptaq(
@@ -126,99 +121,19 @@ def apply_gptaq(
             initializer rewritten to its GPTAQ-optimized codes (same shape,
             dtype, and scale -- only which integer each element rounds to
             changes)
+
+    Delegates to :func:`onnxsim.apply_gptaq_cpp` (the verified C++ port,
+    which has full parameter parity with this function -- see
+    ``gptaq_entry.h`` for its own scope note); this pure-Python name is
+    kept only for backward compatibility with existing callers.
     """
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    if isinstance(quantized_model, str):
-        quantized_model = onnx.load(quantized_model, load_external_data=False)
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            float_model, num_samples=num_samples, seed=seed
-        )
-
-    candidates = _find_int4_matmul_candidates(float_model, quantized_model)
-    if not candidates:
-        return quantized_model
-
-    q_by_output = _node_outputs(quantized_model.graph)
-    quant_probe_name: Dict[str, str] = {}
-    for c in candidates:
-        qn = q_by_output.get(c.output_name)
-        if qn is not None and len(qn.input) >= 1:
-            quant_probe_name[c.output_name] = qn.input[0]
-
-    float_probe_names = sorted({c.float_node.input[0] for c in candidates})
-    float_probe = _add_probe_outputs(float_model, float_probe_names)
-    quant_probe = _add_probe_outputs(quantized_model, list(quant_probe_name.values()))
-
-    float_acts: Dict[str, List[np.ndarray]] = {name: [] for name in float_probe_names}
-    quant_acts: Dict[str, List[np.ndarray]] = {
-        name: [] for name in quant_probe_name.values()
-    }
-    for batch in calibration_data:
-        out_f = backend.run_model(float_probe, batch, providers=providers)
-        for name in float_probe_names:
-            float_acts[name].append(np.asarray(out_f[name], dtype=np.float64))
-        out_q = backend.run_model(quant_probe, batch, providers=providers)
-        for name in quant_acts:
-            quant_acts[name].append(np.asarray(out_q[name], dtype=np.float64))
-
-    optimized: Dict[str, np.ndarray] = {}
-    for c in candidates:
-        quant_name = quant_probe_name.get(c.output_name)
-        if quant_name is None:
-            continue
-        x_true_parts = _activation_rows(float_acts[c.float_node.input[0]])
-        x_quant_parts = _activation_rows(quant_acts[quant_name])
-        if not x_true_parts or len(x_true_parts) != len(x_quant_parts):
-            continue
-        if any(a.shape != b.shape for a, b in zip(x_true_parts, x_quant_parts)):
-            continue
-        x_true = np.concatenate(x_true_parts, axis=0)
-        x_quant = np.concatenate(x_quant_parts, axis=0)
-
-        w = onnx.numpy_helper.to_array(c.w_float_init).astype(np.float64)
-        scale = onnx.numpy_helper.to_array(c.ws_init).astype(np.float64)
-        dim0, dim1 = w.shape
-
-        if c.weight_transposed:
-            w_nk = w  # already [N, K]
-            scale_blocks = scale  # already [N, K / block_size]
-        else:
-            w_nk = w.T  # [K, N] -> [N, K]
-            scale_blocks = scale.T  # [K / block_size, N] -> [N, K / block_size]
-        if x_quant.shape[1] != w_nk.shape[1]:
-            continue  # activation's feature dim doesn't match K; skip
-
-        delta_x = x_true - x_quant  # [S, K]: upstream quantization's own corruption
-        h = x_quant.T @ x_quant  # [K, K]: GPTQ's own Hessian, from the corrupted signal
-        hinv_u = _inverse_hessian_cholesky(
-            h, percdamp
-        )  # inverse(h) == hinv_u.T @ hinv_u
-
-        r = delta_x @ w_nk.T  # [S, N]: this row's own float weight times the corruption
-        c_mat = x_quant.T @ r  # [K, N]: the new objective's linear-term coefficient
-        shift = (
-            hinv_u.T @ (hinv_u @ c_mat)
-        ).T  # [N, K]: inverse(h) @ c_mat, transposed
-
-        codes_nk = _gptq_quantize_columns(
-            w_nk + shift, scale_blocks, c.block_size, h, percdamp, proc_block_size
-        )
-
-        codes_orig = codes_nk if c.weight_transposed else codes_nk.T
-        assert codes_orig.shape == (dim0, dim1)
-        optimized[c.wq_name] = codes_orig.astype(np.int8)
-
-    if not optimized:
-        return quantized_model
-
-    corrected = onnx.ModelProto()
-    corrected.CopyFrom(quantized_model)
-    for t in corrected.graph.initializer:
-        codes = optimized.get(t.name)
-        if codes is None:
-            continue
-        t.raw_data = _pack_int4(codes)
-
-    return corrected
+    return apply_gptaq_cpp(
+        float_model,
+        quantized_model,
+        calibration_data=calibration_data,
+        num_samples=num_samples,
+        seed=seed,
+        percdamp=percdamp,
+        proc_block_size=proc_block_size,
+        providers=providers,
+    )
