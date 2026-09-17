@@ -212,6 +212,17 @@ jobs:
           python3 -m pip install --timeout 120 --retries 5 "tpu_mlir[onnx]"
           python3 -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
           python3 -m pip install pytest
+      # onnxsim's own onnx.inliner import (added in onnx 1.15) doesn't exist
+      # in tpu_mlir[onnx]'s pinned onnx==1.14.1, so bump onnx specifically --
+      # 1.17.0 is confirmed (locally) to still leave numpy==1.24.3/
+      # protobuf==3.20.3 untouched (unlike current onnx, whose ml_dtypes
+      # dependency wants numpy>=2). onnxsim's own onnxsim/deepseek_fp8.py also
+      # imports ml_dtypes unconditionally, but doesn't declare it as a
+      # dependency (it normally rides in transitively via onnx) -- pinned
+      # here explicitly at <0.6, the last line still importable under
+      # numpy==1.24.3 (0.6.0 requires numpy>=2, confirmed locally).
+      - name: Bump onnx for onnxsim's onnx.inliner import, pin a numpy-1.24-compatible ml_dtypes
+        run: python3 -m pip install "onnx==1.17.0" "ml_dtypes==0.5.1"
       # Builds onnxsim's C++ extension directly against this container's
       # Python 3.10 (see the job-level comment above for why no prebuilt
       # wheel can be used here). Mirrors the `build` job's own
