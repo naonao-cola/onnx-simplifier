@@ -83,6 +83,38 @@
   </p>
 </div>
 
+<div class="step" style="border: 1px solid #888; border-radius: 6px; padding: 0.75rem 1rem; margin: 1rem 0;">
+  <h2 style="margin-top: 0;">Convert ONNX &rarr; kmodel (in-browser, WASM)</h2>
+  <p class="note">
+    Runs nncase's own <code>ncc</code> compiler
+    (<a href="https://github.com/onnxsim/nncase/tree/wasm-k210-build" target="_blank" rel="noopener">onnxsim/nncase</a>'s
+    <code>wasm-k210-build</code> branch, cross-compiled to wasm32 --
+    see <code>ncc/README.md</code>) entirely on this page -- no local
+    Python/nncase install, no upload anywhere. Give it a model that's
+    already been through the
+    <a href="../../convertmodel/index.html" target="_blank" rel="noopener">onnxsim converter</a>
+    (shape inference matters: nncase's importer needs <code>value_info</code>
+    on intermediate tensors, which the converter's simplify step already
+    produces). This does <b>not</b> run nncase's own PTQ calibration yet --
+    an already-quantized ONNX input (like the <code>-int8-onnx</code>
+    candidates above) compiles as-is; a float32 model compiles without
+    quantization. See <code>../README.md</code>'s "Not done / follow-ups"
+    for real calibration-dataset support.
+  </p>
+  <label for="ncc-onnx-input">ONNX model</label>
+  <input type="file" id="ncc-onnx-input" accept=".onnx">
+  <br><br>
+  <label for="ncc-target">target</label>
+  <select id="ncc-target">
+    <option value="k210" selected>k210 (KPU-aware codegen)</option>
+    <option value="cpu">cpu (no KPU, for comparison/debugging)</option>
+  </select>
+  <br><br>
+  <button id="ncc-compile-button" type="button">Compile to kmodel</button>
+  <span id="ncc-status" class="note"></span>
+  <div id="ncc-log" style="white-space: pre-wrap; background: #111; color: #0f0; padding: 0.5rem; max-height: 160px; overflow-y: auto; font-size: 0.85em; margin-top: 0.5rem;"></div>
+</div>
+
 <p class="note" id="serial-unsupported" style="display: none; color: #b00;">
   This browser has no <code>navigator.serial</code> -- try Chrome or Edge
   (desktop), 89+.
@@ -125,6 +157,8 @@
 </div>
 <div id="log"></div>
 
+<script type="text/javascript" src="./ncc/ncc.js"></script>
+<script type="module" src="./ncc_ui.mjs"></script>
 <script type="module" src="./flash_ui.mjs"></script>
 </body>
 </html>

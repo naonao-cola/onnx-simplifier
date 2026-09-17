@@ -52,7 +52,8 @@ opposite fact permanently, so the same mistake can't silently come back.
 | Framing (CRC32, SLIP encode/decode, packet layout) | Unit-tested against Python-generated vectors from kflash.py's own algorithm (`tests/`) |
 | Protocol sequence (reset → greeting → stub upload/boot → flash-mode greeting → init → erase → write → reboot) | **Confirmed for real against a real Sipeed Maix Amigo**, both via kflash.py and via `k210_isp.mjs` itself run from Node (see below) -- reset, greeting, and the ISP-stage stub upload/boot all work reliably through this port's own code; `FLASH_WRITE` doesn't get a response on real hardware despite being confirmed byte-for-byte identical to a working kflash.py packet -- see "Testing against real hardware" below, finding #8 |
 | `isp_stub.bin` | Extracted and decompressed from kflash.py's own `ISP_PROG` constant; its size/CRC32 are pinned by a test |
-| ONNX → kmodel (`scripts/onnx_to_kmodel.py`) | **Run for real**, not just reviewed: compiled a real Hugging Face model to a 104792-byte kmodel and ran it through nncase's own `Simulator`, producing the correct output shape (see "Model conversion" below) |
+| ONNX → kmodel (`scripts/onnx_to_kmodel.py`, local Python) | **Run for real**, not just reviewed: compiled a real Hugging Face model to a 104792-byte kmodel and ran it through nncase's own `Simulator`, producing the correct output shape (see "Model conversion" below) |
+| ONNX → kmodel (`web/ncc_wasm.mjs`, in-browser WASM) | **Compile itself run for real** via the browser-safe MEMFS/`callMain` interface (Node-side, both `cpu` and `k210` targets) -- **not yet run in an actual browser tab**, see `web/ncc/README.md`'s "Status" |
 | On-device runtime (`firmware/runtime/`) | **Flashed and booted for real** on the Amigo -- correctly detects a blank vs. a real model region. Loading a real kmodel hangs in `interpreter::load_model()`, precisely root-caused -- see `firmware/runtime/README.md`'s "Status" |
 | Real hardware (flashing, and everything above running on it) | **Run for real** against a Sipeed Maix Amigo, both via kflash.py and via `k210_isp.mjs` itself (run from Node, not a browser -- see below). Everything through the flash-mode stub's own greeting works via this port's real code; `FLASH_WRITE` specifically remains unverified on real hardware -- see finding #8 |
 
@@ -358,14 +359,26 @@ to type any other address -- e.g. for a firmware image you built yourself
 (see `firmware/runtime/README.md`'s "Building it yourself") flashed at a
 non-default offset, or a model at a non-default flash layout.
 
-## Model conversion (offline, tested for real)
+## Model conversion
 
-Unlike `onnx-cardputer-flash`'s ONNX → TFLite step (which needs
-`onnx2tf` + TensorFlow), nncase's K210-targeting compiler (1.9.0, its last
-K210-compatible release) is a plain PyPI wheel -- no C++ build, no conan.
-The one catch: it only ships wheels for Python ≤3.10 (nncase's later 2.x
-line dropped K210 for the newer K230/K510 chips), so it needs its own venv
-if your default Python is newer:
+Two ways to get from ONNX to a `.kmodel`, both using the same nncase 1.9.0
+compiler underneath:
+
+**In-browser (WASM), no install.** `web/ncc/` vendors a real
+`ncc.js`/`ncc.wasm` build (nncase's actual compiler, cross-compiled from
+[`onnxsim/nncase`](https://github.com/onnxsim/nncase)'s `wasm-k210-build`
+branch); `web/index.html`'s "Convert ONNX -> kmodel" section runs it
+entirely on the page. See `web/ncc/README.md` for what's verified so far
+(the compile itself, via Node driving the exact browser-safe interface --
+not yet an actual browser click-through) and how to rebuild the artifact.
+Doesn't support real PTQ calibration data yet (see "Not done / follow-ups").
+
+**Local Python (offline), tested for real.** Unlike `onnx-cardputer-flash`'s
+ONNX → TFLite step (which needs `onnx2tf` + TensorFlow), nncase's
+K210-targeting compiler (1.9.0, its last K210-compatible release) is a
+plain PyPI wheel -- no C++ build, no conan. The one catch: it only ships
+wheels for Python ≤3.10 (nncase's later 2.x line dropped K210 for the newer
+K230/K510 chips), so it needs its own venv if your default Python is newer:
 
 ```sh
 python3.10 -m venv .venv
@@ -439,20 +452,20 @@ hardware" above is for.
   construction has now been proven to be.
   `Verifying "skip erase" is actually safe` (this bullet's old text) is
   now done -- see findings #4 and #7.
-- **nncase compiled to WASM**, so this conversion step could run in-browser
-  like `onnx-cardputer-flash`'s simplify/quantize step already does --
-  deliberately deferred. A source-level check (grepping nncase's actual
-  compiler source, not just its declared build dependencies) found its
-  real Vulkan/OpenCV/shaderc usage is much smaller than the conanfile
-  suggests, and this session's successful native compile+simulate run
-  (above) is further evidence: it happened inside a plain container with
-  no Vulkan driver at all, so whatever that dependency is for, K210 PTQ
-  compilation doesn't need it at runtime. The real remaining blocker is
-  cross-compiling nncase's *actually*-used dependencies (protobuf,
-  flatbuffers, xtensor, ...) for `wasm32-emscripten` via `conan` -- each
-  one individually, since nncase's own conan remote won't have prebuilt
-  wasm packages. That's a real, bounded-but-uncertain project for later,
-  not attempted here.
+- **nncase compiled to WASM: done, wired into this page.** `web/ncc/`
+  vendors a real `ncc.js`/`ncc.wasm` build (from
+  [`onnxsim/nncase`](https://github.com/onnxsim/nncase)'s `wasm-k210-build`
+  branch), and `web/ncc_wasm.mjs` + the page's own "Convert ONNX -> kmodel"
+  section drive a real compile through it -- see `web/ncc/README.md` for
+  the three real build bugs fixed to get a working artifact at all, and
+  what's verified (a real ONNX -> kmodel compile via the browser-safe
+  `FS.writeFile`/`callMain`/`FS.readFile` interface, for both `cpu` and
+  `k210` targets) vs. still open (an actual browser click-through -- this
+  session's browser automation couldn't reach a local dev server to test
+  it live; see that README's "Status"). Doesn't yet support nncase's own
+  PTQ calibration (`--dataset`) -- an already-quantized ONNX input compiles
+  as-is, a float32 model compiles without quantization; real calibration
+  data support is a real, scoped follow-up, not attempted here.
 - **Baud-rate bump.** kflash.py raises the baud rate (to 1.5Mbps by
   default) once the flash-mode stub is running, for much faster writes.
   Web Serial has no in-place baud change -- only close-then-reopen -- and
