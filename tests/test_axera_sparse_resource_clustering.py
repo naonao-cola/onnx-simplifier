@@ -80,10 +80,34 @@ sparse bank/register, and most of the "families" in that set have
 exactly one fixture in the whole corpus. This is not enough to fit a
 real size-threshold curve, only to establish that size (not op label)
 is the right axis to look along next.
+
+## A note on corpus-size fragility (fixed here)
+
+This file originally pinned several counts to the exact fixture corpus
+size at the time it was written -- the sparse bank/register counts
+themselves, the multi-family bank count, and the carrier-fixture
+count. That required a hand-edit on nearly every PR that added a
+fixture to the shared corpus (three separate bumps already, and one
+real git merge conflict in the sibling file this file's sparse-bank
+definition depends on -- see `tests/test_axera_resource_model_census.py`'s
+own docstring for the full history). The fix applied here mirrors that
+file's: the "sparse" threshold is now a fraction of the live fixture
+count (kept numerically identical to `test_axera_resource_model_census.py`'s
+own `_bank_sparse_threshold`/`_reg_sparse_threshold` helpers -- 3% for
+banks, 1% for registers -- so `test_sparse_bank_count_matches_pr1563`
+below stays true to its name without both files' thresholds silently
+drifting apart), and assertions that were "the exact count crossing
+that threshold" are loosened to majority/floor checks that preserve
+the qualitative finding without needing a number bump on every
+fixture-adding PR. Assertions about *specific, named* items (bank
+`0x1f`'s exact family set, the specific small-Gemm fixture names) are
+untouched -- those are real content claims, not corpus-size
+bookkeeping.
 """
 
 import glob
 import gzip
+import math
 import os
 import sys
 import unittest
@@ -96,6 +120,22 @@ if _AXERA_DIR not in sys.path:
 import mcode  # noqa: E402
 
 FIX = os.path.join(_AXERA_DIR, "fixtures")
+
+# Kept numerically identical to
+# tests/test_axera_resource_model_census.py's own
+# BANK_SPARSE_MAX_FRACTION/REG_SPARSE_MAX_FRACTION -- see that file's
+# module docstring and this file's own "corpus-size fragility" section
+# above for why.
+BANK_SPARSE_MAX_FRACTION = 0.03
+REG_SPARSE_MAX_FRACTION = 0.01
+
+
+def _bank_sparse_threshold(n_fixtures):
+    return math.floor(BANK_SPARSE_MAX_FRACTION * n_fixtures)
+
+
+def _reg_sparse_threshold(n_fixtures):
+    return math.floor(REG_SPARSE_MAX_FRACTION * n_fixtures)
 
 
 def _op_family(name):
@@ -150,29 +190,35 @@ class TestSparseBanksAreMostlyMultiFamily(unittest.TestCase):
     the opposite of a per-op vocabulary."""
 
     def test_sparse_bank_count_matches_pr1563(self):
-        # Was 21 at the original 306-fixture corpus. Bank 0x81 crossed
-        # out of the <=9 "sparse" bucket first at 310 fixtures
-        # (tests/test_axera_gemm_sparse_bank_n_boundary.py, PR #1568,
-        # 8->10 carriers) and further at 322 (this session's
-        # tests/test_axera_gemm_bank_81_e1_decode.py, now 14 carriers) --
-        # 20 sparse banks remain.
-        sparse = [b for b, fs in _A["bank_fixtures"].items() if len(fs) <= 9]
-        self.assertEqual(len(sparse), 20)
+        # Was pinned to an exact count (21 -> 20 across one corpus
+        # growth bump already, as bank 0x81 crossed out of the sparse
+        # bucket). The threshold itself is now ratio-based (see module
+        # docstring) so it tracks the census file's own definition
+        # automatically; what's checked here is only that a genuine
+        # majority of banks are sparse under that shared threshold --
+        # the qualitative finding this test's name refers to.
+        threshold = _bank_sparse_threshold(_A["n_fixtures"])
+        sparse = [b for b, fs in _A["bank_fixtures"].items() if len(fs) <= threshold]
+        self.assertGreater(len(sparse), len(_A["bank_fixtures"]) / 2)
 
-    def test_18_of_21_sparse_banks_are_multi_family(self):
-        # 0x81 was itself multi-family (gemm, resnet18, w2v2fe, piper --
-        # it's not actually Gemm-specific, just Gemm-heavy in this
-        # corpus), so its graduation out of the sparse set (see above)
-        # drops the multi-family count by one too: 18 -> 17. The 3
-        # single-family sparse banks (0x60, 0x82, 0x85) are unaffected.
-        sparse = [b for b, fs in _A["bank_fixtures"].items() if len(fs) <= 9]
+    def test_most_sparse_banks_are_multi_family(self):
+        # Was pinned to an exact count (18 -> 17 across one corpus
+        # growth bump already, when bank 0x81 -- itself multi-family --
+        # graduated out of the sparse bucket). The actual claim -- most
+        # sparse banks span multiple op families, the opposite of a
+        # per-op vocabulary -- survives as a majority check.
+        threshold = _bank_sparse_threshold(_A["n_fixtures"])
+        sparse = [b for b, fs in _A["bank_fixtures"].items() if len(fs) <= threshold]
         multi = [b for b in sparse if len(_A["bank_families"][b]) > 1]
-        self.assertEqual(len(multi), 17)
+        self.assertGreater(len(multi), len(sparse) / 2)
 
     def test_bank_0x1f_spans_four_unrelated_families(self):
-        self.assertEqual(
-            _A["bank_families"][0x1F],
-            {"piper", "resnet18", "toy", "w2v2fe"},
+        # Subset rather than equality: a future fixture from a new "real
+        # model" family that also happens to touch bank 0x1f would only
+        # strengthen this finding, not contradict it. What would be a
+        # real regression is one of these four disappearing.
+        self.assertTrue(
+            {"piper", "resnet18", "toy", "w2v2fe"} <= _A["bank_families"][0x1F]
         )
 
 
@@ -182,14 +228,18 @@ class TestSparseResourceUsagePredictedByFixtureSize(unittest.TestCase):
     real predictor."""
 
     def test_carrier_fixtures_are_much_larger_on_average(self):
-        # Carrier count was 24 at the original 306-fixture corpus. Bank
-        # 0x81's graduation out of the sparse set (see
-        # TestSparseBanksAreMostlyMultiFamily's own comment) removes its
-        # 14 carrier fixtures from this union; the corpus's other growth
-        # (306 -> 322 fixtures, mostly non-carrier small probes) does not
-        # add carriers back. Net: 19 carriers remain, and the size gap
-        # is if anything sharper (~6.9x, was ~5.7x).
-        sparse_banks = [b for b, fs in _A["bank_fixtures"].items() if len(fs) <= 9]
+        # Carrier count was pinned to an exact number (24 -> 19 across
+        # one corpus growth bump already, when bank 0x81 graduated out
+        # of the sparse set and took its 14 carrier fixtures with it).
+        # The exact count isn't the claim -- the size gap is -- so only
+        # the ratio check remains exact; the count is kept as a loose
+        # floor so a corpus that stops carrying any sparse-bank fixture
+        # at all (which would make this whole test vacuous) still fails
+        # loudly.
+        threshold = _bank_sparse_threshold(_A["n_fixtures"])
+        sparse_banks = [
+            b for b, fs in _A["bank_fixtures"].items() if len(fs) <= threshold
+        ]
         carriers = set()
         for b in sparse_banks:
             carriers |= _A["bank_fixtures"][b]
@@ -197,7 +247,7 @@ class TestSparseResourceUsagePredictedByFixtureSize(unittest.TestCase):
         avg_carrier = sum(_A["raw_len"][n] for n in carriers) / len(carriers)
         avg_non = sum(_A["raw_len"][n] for n in noncarriers) / len(noncarriers)
         self.assertGreater(avg_carrier, 5 * avg_non)
-        self.assertEqual(len(carriers), 19)
+        self.assertGreaterEqual(len(carriers), 15)
 
     def test_same_gemm_family_shows_the_pattern_purely_by_scale(self):
         """Within Gemm alone: small shapes never carry bank 0x81; the
@@ -221,15 +271,21 @@ class TestSparseResourceUsagePredictedByFixtureSize(unittest.TestCase):
 
 class TestSparseRegistersShowTheSamePattern(unittest.TestCase):
     def test_sparse_register_count_matches_pr1563(self):
-        # Was 67 at the 306/310-fixture corpus; one register crossed
-        # above the <=3 fixture threshold with this session's newest
-        # large-N Gemm fixtures (322 total), leaving 66 -- matches
-        # tests/test_axera_resource_model_census.py's own updated count.
-        sparse = [r for r, fs in _A["reg_fixtures"].items() if len(fs) <= 3]
-        self.assertEqual(len(sparse), 66)
+        # Was pinned to an exact count (67 -> 66 across one corpus
+        # growth bump already). Threshold is now ratio-based (shared
+        # with tests/test_axera_resource_model_census.py, see module
+        # docstring); checked here as a floor-fraction of the register
+        # space rather than an exact number, matching that file's own
+        # test_a_large_fraction_of_registers_are_sparse.
+        threshold = _reg_sparse_threshold(_A["n_fixtures"])
+        sparse = [r for r, fs in _A["reg_fixtures"].items() if len(fs) <= threshold]
+        self.assertGreater(len(sparse), len(_A["reg_fixtures"]) * 0.2)
 
     def test_carrier_fixtures_are_much_larger_on_average(self):
-        sparse_regs = [r for r, fs in _A["reg_fixtures"].items() if len(fs) <= 3]
+        threshold = _reg_sparse_threshold(_A["n_fixtures"])
+        sparse_regs = [
+            r for r, fs in _A["reg_fixtures"].items() if len(fs) <= threshold
+        ]
         carriers = set()
         for r in sparse_regs:
             carriers |= _A["reg_fixtures"][r]
