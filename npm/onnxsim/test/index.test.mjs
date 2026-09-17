@@ -52,8 +52,12 @@ import {
   applyZeroquant,
   applyIntactkv,
   applyKbvqMoe,
+  quantizeWeightOnlyLlmFp4,
+  applyQoq,
+  applyDsq,
   applyDaq,
   applyLowRankCompensation,
+  quantizeEmbeddingBinary,
   applyMoeExpertChannelPruning,
   applyOutlierSuppression,
   applyOutlierSuppressionPlus,
@@ -201,6 +205,17 @@ try {
       applyZeroquant,
       applyIntactkv,
       applyKbvqMoe,
+      quantizeWeightOnlyLlmFp4,
+      applyQoq,
+      // FIXTURE has no SwiGLU/GLU-style MLP block, so applyDsq matches
+      // nothing and the model comes back unchanged -- same
+      // "binding round-trips" point as applyKbvqMoe's own inclusion above.
+      applyDsq,
+      // FIXTURE's own output last dim (3) isn't a multiple of 8, so
+      // quantizeEmbeddingBinary declines and the model comes back
+      // unchanged -- same "binding round-trips" point as applyDsq's own
+      // inclusion above.
+      quantizeEmbeddingBinary,
     ]) {
       const out = await fn(input);
       assert.ok(out instanceof Uint8Array, fn.name);

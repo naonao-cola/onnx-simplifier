@@ -115,3 +115,6 @@ onnx::ModelProto ApplyZeroQuant(const onnx::ModelProto& model,
                                 int64_t block_size, float epsilon);
 onnx::ModelProto ApplyIntactKv(const onnx::ModelProto& model);
 onnx::ModelProto ApplyKbvqMoe(const onnx::ModelProto& model);
+onnx::ModelProto QuantizeWeightOnlyLlmFp4(const onnx::ModelProto& model);
+onnx::ModelProto ApplyQoq(const onnx::ModelProto& model);
+onnx::ModelProto ApplyDsq(const onnx::ModelProto& model);

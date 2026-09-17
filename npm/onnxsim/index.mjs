@@ -390,6 +390,32 @@ export async function applyKbvqMoe(model) {
 }
 
 /**
+ * LLM-FP4: searches, per matched layer's weight, an exponent/mantissa FP4
+ * format split (E1M2/E2M1/E3M0) and a per-block real-valued clip-ratio
+ * scale minimizing reconstruction MSE.
+ */
+export async function quantizeWeightOnlyLlmFp4(model) {
+  return callModelPass("onnxsim_quantize_weight_only_llm_fp4", model);
+}
+
+/**
+ * QServe's QoQ quantization: progressive (INT8-then-INT4) block-wise
+ * weight quantization, folded into one combined per-group scale.
+ */
+export async function applyQoq(model) {
+  return callModelPass("onnxsim_apply_qoq", model);
+}
+
+/**
+ * D2Quant's Dual-Scale Quantizer (DSQ): a per-input-channel auxiliary
+ * scale for SwiGLU/GLU down-projection weights, absorbed into the paired
+ * up-projection's own raw weight.
+ */
+export async function applyDsq(model) {
+  return callModelPass("onnxsim_apply_dsq", model);
+}
+
+/**
  * DAQ (Delta-Aware Quantization): unlike every other data-free pass
  * above, this needs TWO models (a base and a fine-tuned checkpoint,
  * matched by node output name), so it does not go through
@@ -437,6 +463,17 @@ export async function applyLowRankCompensation(floatModel, quantizedModel, { ran
     throw new Error("onnxsim: onnxsim_apply_low_rank_compensation failed (see stderr output for details)");
   }
   return new Uint8Array(result);
+}
+
+/**
+ * Embedding-output binarization: data-free, single-model, targets a whole
+ * graph OUTPUT declaration rather than a matched node. Binarizes the
+ * resolved FLOAT output (sign-thresholded) and packs 8 consecutive
+ * elements MSB-first into one uint8 byte. `outputName` omitted requires
+ * the graph to have exactly one FLOAT output.
+ */
+export async function quantizeEmbeddingBinary(model, { outputName } = {}) {
+  return callModelPass("onnxsim_quantize_embedding_binary", model, [outputName ?? null]);
 }
 
 /**
@@ -1224,8 +1261,12 @@ export default {
   applyZeroquant,
   applyIntactkv,
   applyKbvqMoe,
+  quantizeWeightOnlyLlmFp4,
+  applyQoq,
+  applyDsq,
   applyDaq,
   applyLowRankCompensation,
+  quantizeEmbeddingBinary,
   pruneMagnitude,
   applyStructuredPruning,
   applyAttentionHeadPruning,

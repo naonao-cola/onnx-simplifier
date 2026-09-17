@@ -5620,6 +5620,113 @@ def apply_kbvq_moe_cpp(
     return onnx.load_from_string(C.apply_kbvq_moe(model.SerializeToString()))
 
 
+def quantize_weight_only_llm_fp4_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_llm_fp4`
+    (LLM-FP4, Liu et al., 2023): searches, per matched MatMul/vanilla-Gemm
+    layer's constant 2-D float32 weight, an exponent/mantissa FP4 format
+    split (E1M2/E2M1/E3M0) and a per-block real-valued clip-ratio scale,
+    picking whichever combination minimizes reconstruction MSE. Needs no
+    calibration data. This port hardcodes
+    :func:`onnxsim.quantize_weight_only_llm_fp4`'s own defaults
+    (``block_size=32``, ``formats=("e1m2", "e2m1", "e3m0")``,
+    ``num_scale_candidates=17``, ``min_clip_ratio=0.5``) rather than
+    exposing them as parameters, and omits its own ``skip_names``
+    parameter.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by a
+            searched FP4 codebook/codes/scale reconstruction feeding the
+            original node; layers with a non-constant, non-2-D, or
+            non-block-divisible weight are left untouched.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_weight_only_llm_fp4(model.SerializeToString())
+    )
+
+
+def apply_qoq_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_qoq` (QServe's
+    QoQ quantization, Lin et al., 2024): progressive (INT8-then-INT4)
+    block-wise weight quantization, folded into one combined per-group
+    scale. Needs no calibration data. This port hardcodes
+    :func:`onnxsim.quantize_weight_only_qoq`'s own defaults
+    (``block_size=32``, ``int8_clip_max=119``) rather than exposing them as
+    parameters.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched layer's weight replaced by
+            ``DequantizeLinear(Wq, Ws, ...)`` feeding the original node;
+            layers with a non-constant, non-2-D, or non-block-divisible
+            weight are left untouched.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_qoq(model.SerializeToString()))
+
+
+def apply_dsq_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_dsq` (D2Quant's Dual-Scale
+    Quantizer, Yan et al., 2026): a per-input-channel auxiliary scale for
+    SwiGLU/GLU down-projection weights, fit by alternating blockwise INT4
+    quantization and a closed-form per-column weighted least squares, then
+    absorbed into the paired up-projection's own raw weight. Needs no
+    calibration data. This port hardcodes :func:`onnxsim.apply_dsq`'s own
+    defaults (``block_size=32``, ``num_iterations=15``) rather than
+    exposing them as parameters.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :returns: ``model`` with every matched down-projection's weight
+            replaced by ``DequantizeLinear(Wq, Ws, ...)`` and the paired
+            up-projection's own weight rescaled in place; a model with no
+            matching SwiGLU/GLU block is returned unchanged.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_dsq(model.SerializeToString()))
+
+
+def quantize_embedding_binary_cpp(
+    model: Union[str, onnx.ModelProto],
+    output_name: Optional[str] = None,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_embedding_binary`: binarizes
+    a model's own embedding output at inference time (sign-thresholded,
+    then 8 consecutive elements packed MSB-first into one ``uint8`` byte --
+    exactly ``numpy.packbits(x > 0, axis=-1, bitorder="big")``). Needs no
+    calibration data. Unlike every other ``*_cpp`` port in this module,
+    this one targets a whole graph OUTPUT declaration directly rather than
+    a matched node.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param output_name: which graph output to binarize; if omitted, the
+            graph must have exactly one float32 output (declining
+            otherwise, rather than guessing)
+    :returns: ``model`` with the resolved output's dtype changed to
+            ``uint8`` and its last dimension divided by 8; a model whose
+            output can't be resolved, whose last dimension isn't known
+            statically, or isn't a multiple of 8, is returned unchanged
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_embedding_binary(
+            model.SerializeToString(), output_name if output_name is not None else ""
+        )
+    )
+
+
 def apply_daq_cpp(
     base_model: Union[str, onnx.ModelProto],
     post_trained_model: Union[str, onnx.ModelProto],

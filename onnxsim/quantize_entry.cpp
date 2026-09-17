@@ -417,6 +417,27 @@ onnx::ModelProto ApplyKbvqMoe(const onnx::ModelProto& model) {
       model, std::vector<std::string>{"kbvq_moe"});
 }
 
+onnx::ModelProto QuantizeWeightOnlyLlmFp4(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(model,
+                                           std::vector<std::string>{"llm_fp4"});
+}
+
+onnx::ModelProto ApplyQoq(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(model,
+                                           std::vector<std::string>{"qoq"});
+}
+
+onnx::ModelProto ApplyDsq(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"d2quant_dsq"});
+}
+
 std::vector<std::string> ListQuantizableActivations(
     const onnx::ModelProto& model) {
   PrepareSchemasForDebug(model);
