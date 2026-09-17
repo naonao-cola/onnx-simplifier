@@ -190,6 +190,16 @@ class TestExistingCorpusNeverShowsBank0x81(unittest.TestCase):
     fresh, not something already latent in the routine probe corpus."""
 
     def test_no_matmul_fixture_carries_bank_0x81(self):
+        # Excludes this file's own new fixtures AND
+        # tests/test_axera_matmul_field112_boundary.py's own
+        # `matmul_field112_*` fixtures -- that file's own K=128 probes
+        # at N=64/N=100 deliberately build a constant-weight MatMul
+        # into the bank=0x81-alone state (to characterize field=112's
+        # own boundary), so "the pre-existing routine corpus never
+        # carries it" no longer holds once that sibling file's own
+        # fixtures land alongside these. This assertion's real claim --
+        # that the ORIGINAL, non-constant-weight two-live-tensor MatMul
+        # corpus never carries bank 0x81 -- is unaffected.
         fixdir = FIX
         names = [
             n
@@ -197,6 +207,7 @@ class TestExistingCorpusNeverShowsBank0x81(unittest.TestCase):
             if n.startswith("matmul_")
             and n.endswith(".mcode.gz")
             and n not in ALL_NEW_FIXTURES
+            and not n.startswith("matmul_field112_")
         ]
         self.assertGreater(len(names), 100, "expected the large existing MatMul corpus")
         for n in names:
