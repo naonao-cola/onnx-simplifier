@@ -33,6 +33,7 @@ platform = espressif32
 board = esp32-s3-devkitc-1   ; generic ESP32-S3 devkit; Cardputer is ESP32-S3FN8
 framework = arduino
 board_build.flash_size = 8MB
+board_build.flash_mode = dio   ; NOT the board profile's qio default -- see step 3 below
 board_build.partitions = huge_app.csv   ; app needs room for TFLite Micro + model
 lib_deps =
     m5stack/M5Cardputer                   ; Cardputer's keyboard/screen/mic HAL (confirmed on the PlatformIO registry)
@@ -73,18 +74,33 @@ table + app by default, so do it explicitly after `pio run`:
 ```sh
 pio run -e cardputer
 esptool.py --chip esp32s3 merge_bin -o merged-firmware.bin \
-    --flash_mode qio --flash_freq 80m --flash_size 8MB \
+    --flash_mode dio --flash_freq 80m --flash_size 8MB \
     0x0     .pio/build/cardputer/bootloader.bin \
     0x8000  .pio/build/cardputer/partitions.bin \
     0x10000 .pio/build/cardputer/firmware.bin
 ```
 
-`merged-firmware.bin` is what you pick in the Web Serial panel's file input,
-flashed at `0x0`.
+Add `board_build.flash_mode = dio` to the `platformio.ini` in step 1 too, so
+`pio run` itself builds the right thing (`merge_bin` needs the flag repeated
+since it stamps its own separate image header).
 
-`--flash_mode qio --flash_freq 80m` (not `dio`/`40m`, this section's own
-earlier guess): confirmed against `esp32-s3-devkitc-1`'s actual PlatformIO
-board manifest (`f_flash: 80000000L, flash_mode: qio`) while building
-`runtime/`, not assumed — a mismatched flash mode in the merged image's
-header is exactly the kind of thing that compiles fine and then fails
-silently on real hardware.
+`--flash_mode dio`, **not** `qio` (this section's own earlier guess, and
+still what `esp32-s3-devkitc-1`'s stock PlatformIO board manifest
+defaults to): flashed as `qio`, the ROM bootloader loops forever
+(`ets_loader.c 78` → `TG0WDT_SYS_RST` → repeat) and never reaches app code
+on a real Cardputer — this is the same real-hardware finding #1 from
+`runtime/README.md`, confirmed there against the identical board/chip, and
+it applies here too since this recipe uses the same `esp32-s3-devkitc-1`
+board profile. This specific single-binary recipe hasn't itself been
+flashed and booted on hardware (only `runtime/`'s path has), but the flash
+mode is a board/chip property, not a firmware-content one, so the fix
+transfers directly — don't repeat the `qio` mistake here just because it
+wasn't hit again from scratch.
+
+`merged-firmware.bin` is what you pick in the Web Serial panel's file
+input. Flash it at `0x0` — same as `runtime/`'s image, since this is also a
+complete bootloader+partitions+app image, not just a model. The panel's
+flash-address dropdown (`web/index.html`) has a "runtime firmware (0x0)"
+preset for exactly this; pick "custom address…" only if you deliberately
+want a non-default offset (e.g. testing this image at a spare address
+before overwriting your known-working runtime at `0x0`).

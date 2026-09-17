@@ -15,8 +15,27 @@ const flashButton = document.getElementById("flash-button");
 const firmwareInput = document.getElementById("firmware-input");
 const chipTypeSelect = document.getElementById("chip-type");
 const resetSchemeSelect = document.getElementById("reset-scheme");
+const flashPresetSelect = document.getElementById("flash-preset");
 const flashAddressInput = document.getElementById("flash-address");
 const skipEraseCheckbox = document.getElementById("skip-erase");
+
+// The address field always holds the value actually used to flash; the
+// preset dropdown is just a friendlier way to fill it in for the two
+// well-known addresses, without losing the ability to type an arbitrary
+// one (e.g. for a self-built custom firmware image at a non-default
+// offset -- see firmware/runtime/README.md's "Building it yourself").
+if (flashPresetSelect && flashAddressInput) {
+  flashPresetSelect.addEventListener("change", () => {
+    if (flashPresetSelect.value === "custom") {
+      flashAddressInput.disabled = false;
+      flashAddressInput.focus();
+      flashAddressInput.select();
+    } else {
+      flashAddressInput.disabled = true;
+      flashAddressInput.value = flashPresetSelect.value;
+    }
+  });
+}
 
 flashButton.addEventListener("click", async () => {
   const file = firmwareInput.files && firmwareInput.files[0];

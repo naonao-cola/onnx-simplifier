@@ -119,9 +119,16 @@
     <label for="firmware-input">file (runtime .bin or model .tflite)</label>
     <input type="file" id="firmware-input" accept=".bin,.tflite" disabled>
     <br><br>
+    <label for="flash-preset">what are you flashing</label>
+    <select id="flash-preset">
+      <option value="0x0" selected>runtime firmware (0x0)</option>
+      <option value="0x310000">model (0x310000)</option>
+      <option value="custom">custom address&hellip;</option>
+    </select>
+    <br><br>
     <label for="flash-address">flash address</label>
-    <input type="text" id="flash-address" value="0x0" size="8" title="0x0 for the runtime firmware; 0x310000 for a model (this runtime's fixed model-partition offset).">
-    <span class="note">(<code>0x0</code> for the runtime firmware; <code>0x310000</code> for a model — this runtime's fixed model-partition offset)</span>
+    <input type="text" id="flash-address" value="0x0" size="8" disabled title="0x0 for the runtime firmware; 0x310000 for a model (this runtime's fixed model-partition offset). Pick 'custom address...' above to type your own -- e.g. for a self-built custom firmware image flashed at a non-default offset.">
+    <span class="note">(auto-filled from the preset above; pick <code>custom address&hellip;</code> to type your own -- e.g. for a self-built custom firmware image, see <code>../firmware/runtime/README.md</code>'s "Rebuilding it yourself")</span>
     <br><br>
     <button id="flash-button" type="button" disabled>Flash</button>
   </div>

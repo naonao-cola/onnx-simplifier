@@ -91,9 +91,16 @@
   <label for="firmware-input">file (runtime .bin or model .kmodel)</label>
   <input type="file" id="firmware-input" accept=".bin,.kmodel">
   <br><br>
+  <label for="flash-preset">what are you flashing</label>
+  <select id="flash-preset">
+    <option value="0x0" selected>runtime firmware (0x0)</option>
+    <option value="0x00C00000">model (0x00C00000)</option>
+    <option value="custom">custom address&hellip;</option>
+  </select>
+  <br><br>
   <label for="flash-address">flash address</label>
-  <input type="text" id="flash-address" value="0x0" size="10" title="0x0 for the runtime firmware; 0x00C00000 for a model (see firmware/runtime/README.md's flash layout).">
-  <span class="note">(<code>0x0</code> for the runtime firmware; <code>0x00C00000</code> for a model)</span>
+  <input type="text" id="flash-address" value="0x0" size="10" disabled title="0x0 for the runtime firmware; 0x00C00000 for a model (see firmware/runtime/README.md's flash layout). Pick 'custom address...' above to type your own -- e.g. for a self-built custom firmware image flashed at a non-default offset.">
+  <span class="note">(auto-filled from the preset above; pick <code>custom address&hellip;</code> to type your own -- e.g. for a self-built custom firmware image, see <code>firmware/runtime/README.md</code>'s "Building it yourself")</span>
   <br><br>
   <input type="checkbox" id="skip-erase" checked>
   <label for="skip-erase" title="FLASH_ERASE has no address range -- it always erases the WHOLE chip, so it isn't safe to leave on when writing a model at a non-zero address without also re-flashing the runtime afterward. Checked by default because, confirmed against a real Sipeed Maix Amigo: neither erase command variant this SDK can send gets a response this board's flash-mode stub recognizes as success, while writing without erasing first works correctly (the stub's own FLASH_WRITE erases the sectors it programs on its own) -- see the K210 tool's README, 'Testing against real hardware'. Uncheck only if you specifically need a full-chip erase and are prepared for it to likely just fail.">

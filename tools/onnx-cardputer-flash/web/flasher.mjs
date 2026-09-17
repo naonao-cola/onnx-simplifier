@@ -27,8 +27,27 @@ const connectButton = document.getElementById("connect-button");
 const disconnectButton = document.getElementById("disconnect-button");
 const chipStatus = document.getElementById("chip-status");
 const firmwareInput = document.getElementById("firmware-input");
+const presetSelect = document.getElementById("flash-preset");
 const addressInput = document.getElementById("flash-address");
 const flashButton = document.getElementById("flash-button");
+
+// The address field always holds the value actually used to flash; the
+// preset dropdown is just a friendlier way to fill it in for the two
+// well-known addresses, without losing the ability to type an arbitrary
+// one (e.g. for a self-built custom firmware image at a non-default
+// offset -- see ../firmware/runtime/README.md's "Rebuilding it yourself").
+if (presetSelect && addressInput) {
+  presetSelect.addEventListener("change", () => {
+    if (presetSelect.value === "custom") {
+      addressInput.disabled = false;
+      addressInput.focus();
+      addressInput.select();
+    } else {
+      addressInput.disabled = true;
+      addressInput.value = presetSelect.value;
+    }
+  });
+}
 
 if (!("serial" in navigator)) {
   document.getElementById("serial-unsupported").style.display = "";

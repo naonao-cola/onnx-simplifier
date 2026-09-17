@@ -48,7 +48,9 @@ wrong with the pipeline itself. The browser UI itself doing the flashing
 
 1. **Once per board:** serve `web/` locally (`python3 -m http.server` from
    `web/`), open it in Chrome/Edge, Connect, pick
-   `firmware/runtime/prebuilt/cardputer-runtime.bin`, flash at `0x0`.
+   `firmware/runtime/prebuilt/cardputer-runtime.bin`, leave the "what are
+   you flashing" dropdown on its default "runtime firmware (0x0)" preset,
+   flash.
 2. Simplify/quantize your model with the
    [onnxsim converter](../convertmodel/index.html) (the candidate-model
    table on this tool's own page has one-click links), download the result.
@@ -59,8 +61,9 @@ wrong with the pipeline itself. The browser UI itself doing the flashing
    (a `.tflite` output path writes the plain converted model; any other
    extension writes a C header instead — the runtime firmware reads a
    plain `.tflite` file from its flash partition, not a C array).
-4. Flash *that* `.tflite` file's raw bytes at `0x310000`, same page, same
-   Connect session — no rebuild, no PlatformIO, step 1 doesn't repeat.
+4. Flash *that* `.tflite` file's raw bytes at `0x310000` — switch the
+   dropdown to "model (0x310000)" — same page, same Connect session, no
+   rebuild, no PlatformIO, step 1 doesn't repeat.
 5. Reset the board (or power-cycle) — it prints what it loaded over serial
    (115200 baud) and on its own screen. Or skip the serial terminal
    entirely: the
@@ -71,8 +74,21 @@ wrong with the pipeline itself. The browser UI itself doing the flashing
    `../convertmodel/cardputer_monitor_ui.mjs`) — a live monitor, not a
    flasher; it doesn't touch the board's flash.
 
-Prefer one self-contained binary per model instead? `firmware/README.md`'s
-older recipe bakes the model directly into the firmware as a C array.
+Building your own firmware and model instead of using the prebuilt runtime
+and swappable `.tflite`? Two supported paths, both documented with real
+build commands:
+
+- **Custom runtime firmware, same swappable-model layout** (change
+  `main.cpp`'s behavior but keep flashing models separately at `0x310000`):
+  `firmware/runtime/README.md`'s "Rebuilding it yourself".
+- **One self-contained binary with your model baked in** (no separate
+  model partition, no swapping later): `firmware/README.md`'s "Bake the
+  model in" / "Build a single flashable image".
+
+Either way, the resulting `.bin` still flashes at `0x0` through the same
+panel — pick "custom address…" from the dropdown only if you deliberately
+want a non-default offset (e.g. testing a custom image at a spare address
+before overwriting your known-working runtime).
 
 ## Not done yet / follow-ups
 

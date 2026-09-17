@@ -350,9 +350,13 @@ Maix Amigo have their flash on the K210 module itself.
 ```
 
 Or open `web/index.html` through a local static server and use the UI --
-it now has a flash-address field and a "skip erase" checkbox for exactly
-this, plus a direct download link for `firmware/runtime/`'s prebuilt
-on-device runtime.
+it now has a "what are you flashing" preset dropdown (runtime firmware /
+model / custom address) that fills in the flash-address field for the two
+known addresses, a "skip erase" checkbox, and a direct download link for
+`firmware/runtime/`'s prebuilt on-device runtime. Pick "custom address..."
+to type any other address -- e.g. for a firmware image you built yourself
+(see `firmware/runtime/README.md`'s "Building it yourself") flashed at a
+non-default offset, or a model at a non-default flash layout.
 
 ## Model conversion (offline, tested for real)
 
