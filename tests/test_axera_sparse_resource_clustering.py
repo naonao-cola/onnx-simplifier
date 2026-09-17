@@ -150,13 +150,24 @@ class TestSparseBanksAreMostlyMultiFamily(unittest.TestCase):
     the opposite of a per-op vocabulary."""
 
     def test_sparse_bank_count_matches_pr1563(self):
+        # Was 21 at the original 306-fixture corpus. Bank 0x81 crossed
+        # out of the <=9 "sparse" bucket first at 310 fixtures
+        # (tests/test_axera_gemm_sparse_bank_n_boundary.py, PR #1568,
+        # 8->10 carriers) and further at 322 (this session's
+        # tests/test_axera_gemm_bank_81_e1_decode.py, now 14 carriers) --
+        # 20 sparse banks remain.
         sparse = [b for b, fs in _A["bank_fixtures"].items() if len(fs) <= 9]
-        self.assertEqual(len(sparse), 21)
+        self.assertEqual(len(sparse), 20)
 
     def test_18_of_21_sparse_banks_are_multi_family(self):
+        # 0x81 was itself multi-family (gemm, resnet18, w2v2fe, piper --
+        # it's not actually Gemm-specific, just Gemm-heavy in this
+        # corpus), so its graduation out of the sparse set (see above)
+        # drops the multi-family count by one too: 18 -> 17. The 3
+        # single-family sparse banks (0x60, 0x82, 0x85) are unaffected.
         sparse = [b for b, fs in _A["bank_fixtures"].items() if len(fs) <= 9]
         multi = [b for b in sparse if len(_A["bank_families"][b]) > 1]
-        self.assertEqual(len(multi), 18)
+        self.assertEqual(len(multi), 17)
 
     def test_bank_0x1f_spans_four_unrelated_families(self):
         self.assertEqual(
@@ -171,6 +182,13 @@ class TestSparseResourceUsagePredictedByFixtureSize(unittest.TestCase):
     real predictor."""
 
     def test_carrier_fixtures_are_much_larger_on_average(self):
+        # Carrier count was 24 at the original 306-fixture corpus. Bank
+        # 0x81's graduation out of the sparse set (see
+        # TestSparseBanksAreMostlyMultiFamily's own comment) removes its
+        # 14 carrier fixtures from this union; the corpus's other growth
+        # (306 -> 322 fixtures, mostly non-carrier small probes) does not
+        # add carriers back. Net: 19 carriers remain, and the size gap
+        # is if anything sharper (~6.9x, was ~5.7x).
         sparse_banks = [b for b, fs in _A["bank_fixtures"].items() if len(fs) <= 9]
         carriers = set()
         for b in sparse_banks:
@@ -179,7 +197,7 @@ class TestSparseResourceUsagePredictedByFixtureSize(unittest.TestCase):
         avg_carrier = sum(_A["raw_len"][n] for n in carriers) / len(carriers)
         avg_non = sum(_A["raw_len"][n] for n in noncarriers) / len(noncarriers)
         self.assertGreater(avg_carrier, 5 * avg_non)
-        self.assertEqual(len(carriers), 24)
+        self.assertEqual(len(carriers), 19)
 
     def test_same_gemm_family_shows_the_pattern_purely_by_scale(self):
         """Within Gemm alone: small shapes never carry bank 0x81; the
@@ -203,8 +221,12 @@ class TestSparseResourceUsagePredictedByFixtureSize(unittest.TestCase):
 
 class TestSparseRegistersShowTheSamePattern(unittest.TestCase):
     def test_sparse_register_count_matches_pr1563(self):
+        # Was 67 at the 306/310-fixture corpus; one register crossed
+        # above the <=3 fixture threshold with this session's newest
+        # large-N Gemm fixtures (322 total), leaving 66 -- matches
+        # tests/test_axera_resource_model_census.py's own updated count.
         sparse = [r for r, fs in _A["reg_fixtures"].items() if len(fs) <= 3]
-        self.assertEqual(len(sparse), 67)
+        self.assertEqual(len(sparse), 66)
 
     def test_carrier_fixtures_are_much_larger_on_average(self):
         sparse_regs = [r for r, fs in _A["reg_fixtures"].items() if len(fs) <= 3]
