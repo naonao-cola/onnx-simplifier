@@ -238,13 +238,16 @@ class TestFixtureCorpusSize(unittest.TestCase):
         # expected and fine, corpus *shrinkage* -- e.g. an accidentally
         # deleted fixture -- is the real regression to catch). This
         # used to be a hardcoded exact count (306 -> 310 -> 318 -> 322
-        # -> 327, most recently PR #1571's own 5 new K-boundary Gemm
-        # fixtures) that needed a manual bump on nearly every
-        # fixture-adding PR -- including one real merge conflict
-        # between #1570 and #1571 bumping the same number differently;
-        # see the module docstring's "corpus-size fragility" section
-        # for why that was dropped in favor of a floor.
-        self.assertGreaterEqual(_CENSUS["n_fixtures"], 327)
+        # -> 327 -> 336, most recently PR #1573's own 9 new Gemm shapes
+        # probing bank 0x81's field=144 presence pattern) that needed a
+        # manual bump on nearly every fixture-adding PR -- including one
+        # real merge conflict between #1570 and #1571 (and another
+        # between #1572's own growth-robustness rewrite and #1573's
+        # count bump, resolved by keeping this dynamic form) bumping the
+        # same number differently; see the module docstring's
+        # "corpus-size fragility" section for why that was dropped in
+        # favor of a floor.
+        self.assertGreaterEqual(_CENSUS["n_fixtures"], 336)
 
 
 class TestFieldOffsetGranularity(unittest.TestCase):
@@ -383,12 +386,14 @@ class TestRegisterCensus(unittest.TestCase):
 
     def test_reg8_is_the_heaviest_universal_register_by_a_wide_margin(self):
         # Was pinned to an exact use-count (27,369 -> 27,601 -> 28,346
-        # -> 28,636 across four separate corpus-growth bumps, the last
-        # one itself the product of a real merge conflict between PR
-        # #1570 and PR #1571 independently guessing this number). The
-        # actual claim -- reg=8 so dominates usage that it's not a
-        # coincidence of corpus composition -- survives as a ratio
-        # check instead: at the 327-fixture corpus reg=8 is used ~4.4x
+        # -> 28,636 -> 29,417 across five separate corpus-growth bumps,
+        # two of them the product of a real merge conflict -- PR #1570
+        # vs. #1571 independently guessing this number, then #1572's own
+        # growth-robustness rewrite vs. #1573's own count bump to 29,417
+        # at the 336-fixture corpus, resolved here by keeping this ratio
+        # form). The actual claim -- reg=8 so dominates usage that it's
+        # not a coincidence of corpus composition -- survives as a ratio
+        # check instead: at the 336-fixture corpus reg=8 is used ~4.4x
         # more than the next busiest universal register (reg=10). A 3x
         # floor keeps real margin for corpus growth to shift the exact
         # ratio without losing the substance of the claim.
