@@ -60,6 +60,7 @@ import onnx.helper
 import onnx.numpy_helper
 
 from onnxsim.bias_correction import _all_names, _unique_name
+from onnxsim.onnx_simplifier import apply_double_quantization_cpp
 
 
 def apply_double_quantization(
@@ -89,7 +90,27 @@ def apply_double_quantization(
             :func:`onnxsim.quantize_kv_cache`'s Value-style per-token
             scale), not float32, or too small, is left untouched; a model
             with no matching node is returned unchanged
+
+    Delegates to the verified C++ port
+    (:func:`onnxsim.apply_double_quantization_cpp`), which hardcodes
+    ``min_elements=64``, when called with that default. A non-default
+    ``min_elements`` (used directly by several of this module's own
+    tests, and forwarded from :class:`onnxsim.accuracy.AccuracyConfig`'s
+    own ``double_quant_min_elements`` knob) falls back to this module's
+    own original pure-Python implementation
+    (:func:`_apply_double_quantization_python`).
     """
+    if min_elements == 64:
+        if isinstance(model, str):
+            model = onnx.load(model, load_external_data=False)
+        return apply_double_quantization_cpp(model)
+    return _apply_double_quantization_python(model, min_elements)
+
+
+def _apply_double_quantization_python(
+    model: Union[str, onnx.ModelProto],
+    min_elements: int = 64,
+) -> onnx.ModelProto:
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
 
