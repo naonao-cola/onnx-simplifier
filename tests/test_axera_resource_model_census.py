@@ -352,16 +352,25 @@ class TestRegisterCensus(unittest.TestCase):
         # tests/test_axera_bank81_cross_op_check.py's own
         # test_no_matmul_fixture_carries_bank_0x81 already used for a
         # sibling file's own deliberately atypical probe fixtures.
-        _mul_bank81_probes = {
+        #
+        # tests/test_axera_mul_e1_threshold.py's own 8
+        # `mul_e1thresh_*` fixtures share the identical atypical
+        # single-live-tensor-plus-constant-operand construction (they
+        # exist to bisect the same K*N<=65536 threshold that file's own
+        # `mul_bank81_probe_*` fixtures first found) -- register 100
+        # is likewise genuinely absent from some of them. Excluded by
+        # name prefix for the same reason.
+        _atypical_mul_probes = {
             os.path.basename(fx)
             for fx in _all_fixtures()
             if os.path.basename(fx).startswith("mul_bank81_probe_")
+            or os.path.basename(fx).startswith("mul_e1thresh_")
         }
-        _non_atypical_total = _CENSUS["n_fixtures"] - len(_mul_bank81_probes)
+        _non_atypical_total = _CENSUS["n_fixtures"] - len(_atypical_mul_probes)
         universal = {
             r
             for r, fixset in _CENSUS["reg_fixture_set"].items()
-            if len(fixset - _mul_bank81_probes) >= _non_atypical_total
+            if len(fixset - _atypical_mul_probes) >= _non_atypical_total
         }
         known_universal = {
             0,
