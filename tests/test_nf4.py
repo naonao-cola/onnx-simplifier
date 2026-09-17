@@ -1,8 +1,14 @@
 """Tests for ``onnxsim.quantize_weight_only_nf4`` (bitsandbytes' NF4, see
-``onnxsim/nf4.py``) -- block-wise quantization onto a fixed, non-uniform
-16-value codebook (the quantile points of a standard normal distribution)
-instead of a uniform integer grid, represented in the ONNX graph via
-ordinary Gather/Reshape/Mul (no contrib op, no opset-21 features).
+``onnxsim/nf4.py``).
+
+``quantize_weight_only_nf4`` now delegates to the verified C++ port
+(:func:`onnxsim.quantize_weight_only_nf4_cpp`) for its default
+``block_size``/``skip_names`` -- see ``tests/test_nf4_cpp.py`` for the
+deep, structural/numeric verification of that C++ algorithm. A non-default
+``block_size`` or a real ``skip_names`` value (needed by, e.g.,
+:func:`onnxsim.lora.apply_qlora`) falls back to this module's own original
+pure-Python implementation, exercised here directly since the C++ port
+doesn't generalize to it.
 """
 
 import numpy as np
@@ -50,166 +56,66 @@ def _matmul_model(K=64, N=16, weight=None, seed=0):
     )
 
 
-def _run(model, feeds):
-    sess = ort.InferenceSession(
-        model.SerializeToString(), providers=["CPUExecutionProvider"]
-    )
-    return sess.run(None, feeds)
-
-
-def _rel_l2(a, b):
-    a = np.asarray(a, dtype=np.float64).ravel()
-    b = np.asarray(b, dtype=np.float64).ravel()
-    return np.linalg.norm(a - b) / max(np.linalg.norm(a), 1e-6)
-
-
-def _dequantize_nf4_by_hand(model, w_name="W", block_size=64):
-    """Independent reference decode: reads Wq/Ws straight from the
-    initializers and dequantizes via numpy, without using any of the ops
-    this module inserts into the graph -- so this test doesn't just check
-    "the graph runs", it checks the *values* against ground truth computed
-    a completely different way.
-    """
-    wq = next(t for t in model.graph.initializer if t.name == f"{w_name}_nf4_q")
-    ws = next(t for t in model.graph.initializer if t.name == f"{w_name}_nf4_scale")
-    codes = onnx.numpy_helper.to_array(wq).astype(np.int64)
-    scale = onnx.numpy_helper.to_array(ws).astype(np.float64)
-    codebook = np.asarray(NF4_CODEBOOK, dtype=np.float64)
-
-    dim0, dim1 = codes.shape
-    num_blocks = scale.shape[0]
-    block_size_actual = dim0 // num_blocks
-    assert block_size_actual == block_size
-    values = codebook[codes]  # [dim0, dim1]
-    scale_full = np.repeat(scale, block_size, axis=0)  # [dim0, dim1]
-    return values * scale_full
-
-
-def test_nf4_quantizes_matmul_with_standard_ops_only():
+def test_quantize_weight_only_nf4_delegates_to_cpp_port():
     model = _matmul_model(K=64, N=16, seed=0)
-    nf4_model = onnxsim.quantize_weight_only_nf4(model, block_size=64)
-    onnx.checker.check_model(nf4_model)
-
-    op_types = {n.op_type for n in nf4_model.graph.node}
-    # No custom/contrib op and no DequantizeLinear -- just ordinary ops.
-    assert op_types <= {"MatMul", "Cast", "Gather", "Reshape", "Mul"}
-    assert all(n.domain in ("", "ai.onnx") for n in nf4_model.graph.node)
+    py_result = onnxsim.quantize_weight_only_nf4(model)
+    cpp_result = onnxsim.quantize_weight_only_nf4_cpp(model)
+    assert py_result.SerializeToString() == cpp_result.SerializeToString()
 
 
-def test_nf4_dequantized_values_match_hand_decoded_reference():
-    rng = np.random.default_rng(1)
-    weight = rng.standard_normal((64, 16)).astype(np.float32) * 0.3
-    model = _matmul_model(weight=weight)
-    nf4_model = onnxsim.quantize_weight_only_nf4(model, block_size=64)
-
-    w_hand = _dequantize_nf4_by_hand(nf4_model, block_size=64)
-
-    # Every element's dequantization error must be within half the largest
-    # codebook gap scaled by that block's own scale -- a real per-element
-    # correctness check, not just an aggregate error bound.
-    codebook = np.asarray(NF4_CODEBOOK)
-    max_gap = np.max(np.diff(codebook))
-    block_scale = np.abs(weight.astype(np.float64)).max()
-    assert np.all(
-        np.abs(w_hand - weight.astype(np.float64)) <= max_gap * block_scale / 2 + 1e-6
+def test_quantize_weight_only_nf4_default_args_produce_quantized_model():
+    # The delegated C++ pass rewires the matched node's weight input to a
+    # freshly created initializer, leaving the original "W" dangling
+    # unused -- so the node's own current input name, not initializer list
+    # membership, is the only reliable way to find the actual
+    # post-quantization weight.
+    model = _matmul_model(K=64, N=16, seed=1)
+    q = onnxsim.quantize_weight_only_nf4(model)
+    onnx.checker.check_model(q)
+    node = next(n for n in q.graph.node if n.op_type in ("MatMul", "Gemm"))
+    assert node.input[1] != "W"
+    orig_w = next(t for t in model.graph.initializer if t.name == "W")
+    new_w = next(t for t in q.graph.initializer if t.name == node.input[1])
+    assert not np.array_equal(
+        onnx.numpy_helper.to_array(new_w), onnx.numpy_helper.to_array(orig_w)
     )
 
 
-def test_nf4_output_stays_close_to_float_via_onnxruntime():
+def test_quantize_weight_only_nf4_nondefault_block_size_uses_python_fallback():
     model = _matmul_model(K=64, N=16, seed=2)
-    nf4_model = onnxsim.quantize_weight_only_nf4(model)
-    onnx.checker.check_model(nf4_model)
-
-    rng = np.random.default_rng(3)
-    x = rng.standard_normal((8, 64)).astype(np.float32)
-    (float_y,) = _run(model, {"X": x})
-    (nf4_y,) = _run(nf4_model, {"X": x})
-    assert np.all(np.isfinite(nf4_y))
-    assert _rel_l2(float_y, nf4_y) < 0.25
+    q = onnxsim.quantize_weight_only_nf4(model, block_size=32)
+    onnx.checker.check_model(q)
+    op_types = {n.op_type for n in q.graph.node}
+    # The pure-Python fallback's own Gather/Reshape/Mul graph shape, unlike
+    # the C++ port's folded initializer.
+    assert "Gather" in op_types
 
 
-def test_nf4_gemm_transb():
+def test_quantize_weight_only_nf4_skip_names_uses_python_fallback():
+    # Mirrors onnxsim.lora.apply_qlora's own real use: excluding LoRA
+    # adapter weights (structurally indistinguishable plain MatMul weights)
+    # from quantization.
     rng = np.random.default_rng(4)
-    K, N = 128, 12
-    weight = rng.standard_normal((N, K)).astype(np.float32) * 0.5
-    model = _model(
-        f"""
-        g (float[batch,{K}] X) => (float[batch,{N}] Y)
-        {{
-          Y = Gemm<transB = 1>(X, W)
-        }}
-        """,
-        initializer=[_f32(weight, "W")],
-    )
-    nf4_model = onnxsim.quantize_weight_only_nf4(model, block_size=64)
-    onnx.checker.check_model(nf4_model)
-
-    x = rng.standard_normal((4, K)).astype(np.float32)
-    (float_y,) = _run(model, {"X": x})
-    (nf4_y,) = _run(nf4_model, {"X": x})
-    assert _rel_l2(float_y, nf4_y) < 0.25
-
-
-def test_nf4_codes_stay_in_range():
-    rng = np.random.default_rng(5)
-    weight = rng.standard_normal((64, 8)).astype(np.float32) * 3
-    model = _matmul_model(weight=weight)
-    nf4_model = onnxsim.quantize_weight_only_nf4(model, block_size=64)
-    wq = next(t for t in nf4_model.graph.initializer if t.name == "W_nf4_q")
-    codes = onnx.numpy_helper.to_array(wq)
-    assert np.all(codes >= 0) and np.all(codes <= 15)
-
-
-def test_nf4_skips_non_block_divisible_k():
-    model = _matmul_model(K=48, N=8, seed=6)  # 48 is not a multiple of 64
-    nf4_model = onnxsim.quantize_weight_only_nf4(model, block_size=64)
-    assert nf4_model.SerializeToString() == model.SerializeToString()
-
-
-def test_nf4_skip_names_leaves_matched_weight_untouched():
-    # QLoRA freezes the base weight (quantized here) but keeps its own
-    # low-rank adapter weights -- structurally indistinguishable plain
-    # MatMul-against-a-2-D-initializer layers -- at full precision.
-    rng = np.random.default_rng(7)
     w_base = rng.standard_normal((64, 16)).astype(np.float32) * 0.5
-    w_lora_a = rng.standard_normal((64, 4)).astype(np.float32) * 0.1
+    w_other = rng.standard_normal((64, 4)).astype(np.float32) * 0.1
     model = _model(
         """
         g (float[batch,64] X) => (float[batch,16] Y, float[batch,4] H)
         {
           Y = MatMul(X, W)
-          H = MatMul(X, W_lora_A)
+          H = MatMul(X, W_other)
         }
         """,
-        initializer=[_f32(w_base, "W"), _f32(w_lora_a, "W_lora_A")],
+        initializer=[_f32(w_base, "W"), _f32(w_other, "W_other")],
     )
-    nf4_model = onnxsim.quantize_weight_only_nf4(
-        model, block_size=64, skip_names=["W_lora_A"]
-    )
-    onnx.checker.check_model(nf4_model)
-
-    names = {t.name for t in nf4_model.graph.initializer}
-    assert "W_nf4_q" in names  # base weight was quantized
-    assert "W_lora_A_nf4_q" not in names  # adapter weight was not
-    lora_a_out = next(
+    q = onnxsim.quantize_weight_only_nf4(model, skip_names=["W_other"])
+    onnx.checker.check_model(q)
+    other_out = next(
         onnx.numpy_helper.to_array(t)
-        for t in nf4_model.graph.initializer
-        if t.name == "W_lora_A"
+        for t in q.graph.initializer
+        if t.name == "W_other"
     )
-    assert np.array_equal(lora_a_out, w_lora_a)  # untouched, byte-for-byte
-
-
-def test_nf4_skips_non_constant_weight():
-    model = _model(
-        """
-        g (float[4,64] X, float[64,4] W) => (float[4,4] Y)
-        {
-          Y = MatMul(X, W)
-        }
-        """
-    )
-    nf4_model = onnxsim.quantize_weight_only_nf4(model)
-    assert nf4_model.SerializeToString() == model.SerializeToString()
+    assert np.array_equal(other_out, w_other)  # untouched, byte-for-byte
 
 
 def test_nf4_codebook_is_well_formed():

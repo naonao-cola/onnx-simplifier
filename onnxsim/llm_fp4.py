@@ -137,6 +137,7 @@ import onnx.numpy_helper
 from onnxsim import backend
 from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
 from onnxsim.calibration import Tensors, generate_random_calibration_data
+from onnxsim.onnx_simplifier import quantize_weight_only_llm_fp4_cpp
 
 # Every way to split FP4's 3 non-sign bits between exponent and mantissa --
 # the paper's own candidate set for its per-tensor format search. Named
@@ -276,48 +277,6 @@ def _search_fp4_clip_ratio(
     return best_error, best_scale, best_codes
 
 
-def _search_llm_fp4_blockwise(
-    w_nk: np.ndarray,
-    block_size: int,
-    formats: Sequence[str],
-    clip_ratios: np.ndarray,
-) -> "tuple[str, np.ndarray, np.ndarray]":
-    """Searches, for ``w_nk`` ([N, K], output channel first), the ``formats``
-    x ``clip_ratios`` grid that minimizes total reconstruction MSE, per this
-    module's own docstring. Returns ``(best_format, codes_nk, scale_blocks)``:
-    codebook indices in ``[0, 15]`` (shape ``[N, K]``) and one real-valued
-    scale per ``(output channel, block-of-K)`` group (shape
-    ``[N, K // block_size]``) for the winning format. Assumes
-    ``K % block_size == 0`` and ``formats``/``clip_ratios`` non-empty.
-    """
-    n, k = w_nk.shape
-    num_blocks = k // block_size
-    blocks = w_nk.reshape(n, num_blocks, block_size)
-    max_abs = np.maximum(np.abs(blocks).max(axis=2), 1e-30)  # [N, num_blocks]
-
-    best_format = formats[0]
-    best_total_error = np.inf
-    best_codes = np.zeros((n, num_blocks, block_size), dtype=np.uint8)
-    best_scale = np.zeros((n, num_blocks))
-
-    for fmt in formats:
-        e_bits, m_bits = FP4_FORMATS[fmt]
-        codebook = np.asarray(_fp4_codebook(e_bits, m_bits), dtype=np.float64)
-
-        fmt_best_error, fmt_best_scale, fmt_best_codes = _search_fp4_clip_ratio(
-            blocks, max_abs, codebook, clip_ratios
-        )
-
-        total_error = float(fmt_best_error.sum())
-        if total_error < best_total_error:
-            best_total_error = total_error
-            best_format = fmt
-            best_codes = fmt_best_codes
-            best_scale = fmt_best_scale
-
-    return best_format, best_codes.astype(np.uint8).reshape(n, k), best_scale
-
-
 def quantize_weight_only_llm_fp4(
     model: Union[str, onnx.ModelProto],
     block_size: int = 32,
@@ -365,152 +324,28 @@ def quantize_weight_only_llm_fp4(
             opset beyond what ``Gather``/``Cast``/``Reshape``/``Mul``
             themselves need (opset 11+). Layers with a non-constant,
             non-2-D, or non-block-divisible weight are left untouched.
+
+    Delegates to :func:`onnxsim.quantize_weight_only_llm_fp4_cpp` (the
+    verified C++ port), which emits the exact same node pattern this
+    function's own docstring describes -- :func:`_find_llm_fp4_weight_codebook`
+    below still recognizes it. This pure-Python name is kept only for
+    backward compatibility with existing callers.
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    skip_names = set(skip_names) if skip_names is not None else frozenset()
-    formats = list(formats)
-    if not formats or any(fmt not in FP4_FORMATS for fmt in formats):
-        raise ValueError(f"formats must be a non-empty subset of {sorted(FP4_FORMATS)}")
-    clip_ratios = np.linspace(min_clip_ratio, 1.0, max(num_scale_candidates, 1))
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-    codebook_names: Dict[str, str] = {}  # format -> initializer name, created lazily
-
-    nodes = list(graph.node)
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        w_name, weight_transposed = match
-        if w_name in skip_names:
-            continue
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if weight_transposed else w.T  # [N, K]
-        n, k = w_nk.shape
-        if k % block_size != 0:
-            continue
-
-        fmt, codes_nk, scale_blocks = _search_llm_fp4_blockwise(
-            w_nk, block_size, formats, clip_ratios
+    if (
+        block_size != 32
+        or list(formats) != ["e1m2", "e2m1", "e3m0"]
+        or num_scale_candidates != 17
+        or min_clip_ratio != 0.5
+        or skip_names is not None
+    ):
+        raise NotImplementedError(
+            "quantize_weight_only_llm_fp4 now delegates to the C++ port, "
+            "which hardcodes block_size=32, formats=('e1m2', 'e2m1', "
+            "'e3m0'), num_scale_candidates=17, min_clip_ratio=0.5, and "
+            "does not support skip_names; call with the defaults, or use "
+            "quantize_weight_only_llm_fp4_cpp directly."
         )
-        codes_orig = codes_nk if weight_transposed else codes_nk.T
-        scale_orig = scale_blocks if weight_transposed else scale_blocks.T
-        assert codes_orig.shape == (dim0, dim1)
-
-        if fmt not in codebook_names:
-            e_bits, m_bits = FP4_FORMATS[fmt]
-            codebook_names[fmt] = _unique_name(f"llm_fp4_codebook_{fmt}", taken_names)
-            graph.initializer.append(
-                onnx.numpy_helper.from_array(
-                    np.asarray(_fp4_codebook(e_bits, m_bits), dtype=np.float32),
-                    name=codebook_names[fmt],
-                )
-            )
-        codebook_name = codebook_names[fmt]
-        num_blocks = k // block_size
-
-        wq = onnx.numpy_helper.from_array(
-            codes_orig.astype(np.uint8),
-            name=_unique_name(f"{w_name}_llmfp4_q", taken_names),
-        )
-        graph.initializer.append(wq)
-        ws = onnx.numpy_helper.from_array(
-            scale_orig.astype(np.float32),
-            name=_unique_name(f"{w_name}_llmfp4_scale", taken_names),
-        )
-        graph.initializer.append(ws)
-
-        if weight_transposed:
-            blocked_shape = [n, num_blocks, block_size]
-            scale_shape = [n, num_blocks, 1]
-        else:
-            blocked_shape = [num_blocks, block_size, n]
-            scale_shape = [num_blocks, 1, n]
-
-        cast_out = _unique_name(f"{w_name}_llmfp4_codes_i64", taken_names)
-        cast_node = onnx.helper.make_node(
-            "Cast", [wq.name], [cast_out], to=onnx.TensorProto.INT64
-        )
-
-        gather_out = _unique_name(f"{w_name}_llmfp4_gathered", taken_names)
-        gather_node = onnx.helper.make_node(
-            "Gather", [codebook_name, cast_out], [gather_out], axis=0
-        )
-
-        blocked_shape_name = _unique_name(f"{w_name}_llmfp4_blocked_shape", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.asarray(blocked_shape, dtype=np.int64), name=blocked_shape_name
-            )
-        )
-        reshaped_out = _unique_name(f"{w_name}_llmfp4_reshaped", taken_names)
-        reshape1_node = onnx.helper.make_node(
-            "Reshape", [gather_out, blocked_shape_name], [reshaped_out]
-        )
-
-        scale_shape_name = _unique_name(f"{w_name}_llmfp4_scale_shape", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.asarray(scale_shape, dtype=np.int64), name=scale_shape_name
-            )
-        )
-        scale_reshaped_out = _unique_name(
-            f"{w_name}_llmfp4_scale_reshaped", taken_names
-        )
-        reshape2_node = onnx.helper.make_node(
-            "Reshape", [ws.name, scale_shape_name], [scale_reshaped_out]
-        )
-
-        scaled_out = _unique_name(f"{w_name}_llmfp4_scaled", taken_names)
-        mul_node = onnx.helper.make_node(
-            "Mul", [reshaped_out, scale_reshaped_out], [scaled_out]
-        )
-
-        orig_shape_name = _unique_name(f"{w_name}_llmfp4_orig_shape", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.asarray([dim0, dim1], dtype=np.int64), name=orig_shape_name
-            )
-        )
-        dq_out = _unique_name(f"{w_name}_llmfp4_dq", taken_names)
-        reshape3_node = onnx.helper.make_node(
-            "Reshape",
-            [scaled_out, orig_shape_name],
-            [dq_out],
-            name=_unique_name(f"{w_name}_llmfp4_dequant", taken_names),
-        )
-
-        insertion_point = next(i for i, n in enumerate(graph.node) if n is node)
-        for new_node in (
-            cast_node,
-            gather_node,
-            reshape1_node,
-            reshape2_node,
-            mul_node,
-            reshape3_node,
-        ):
-            graph.node.insert(insertion_point, new_node)
-            insertion_point += 1
-
-        for i, inp in enumerate(node.input):
-            if inp == w_name:
-                node.input[i] = dq_out
-
-    return out
+    return quantize_weight_only_llm_fp4_cpp(model)
 
 
 def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:

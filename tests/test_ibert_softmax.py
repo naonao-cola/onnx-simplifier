@@ -130,14 +130,19 @@ def test_ibert_softmax_respects_non_default_axis():
     np.testing.assert_allclose(col_sums, np.ones_like(col_sums), atol=1e-4)
 
 
-def test_ibert_softmax_skip_names_leaves_matched_node_untouched():
+def test_ibert_softmax_skip_names_raises_not_implemented():
+    # apply_ibert_softmax now delegates to the C++ backend, which has no
+    # skip_names concept -- silently ignoring a caller's request to protect
+    # a specific node would be worse than an ordinary numeric divergence,
+    # so this raises instead of quietly rewriting a node the caller asked
+    # to skip.
     model = _softmax_model()
     softmax_name = "my_softmax_node"
     for n in model.graph.node:
         if n.op_type == "Softmax":
             n.name = softmax_name
-    q = onnxsim.apply_ibert_softmax(model, skip_names={softmax_name})
-    assert q.SerializeToString() == model.SerializeToString()
+    with pytest.raises(NotImplementedError):
+        onnxsim.apply_ibert_softmax(model, skip_names={softmax_name})
 
 
 def test_ibert_softmax_noop_when_opset_below_18():

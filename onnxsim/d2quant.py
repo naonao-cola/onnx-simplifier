@@ -59,7 +59,7 @@ objective, not a specific reference implementation" stance
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Dict, Optional, Sequence, Union
 
 import numpy as np
 import onnx
@@ -67,86 +67,17 @@ import onnx.helper
 import onnx.numpy_helper
 
 from onnxsim import backend
-from onnxsim._onnx_compat import INT4 as _INT4
 from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
 from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.smoothquant import _match_matmul_like
+from onnxsim.onnx_simplifier import apply_dsq_cpp
 
 # ---------------------------------------------------------------------------
-# Dual-Scale Quantizer (DSQ)
+# Dual-Scale Quantizer (DSQ) -- apply_dsq below delegates to the verified C++
+# port (apply_dsq_cpp); this section's own former helper functions
+# (_quantize_int4_blockwise_symmetric, _dequantize_int4_blockwise_symmetric,
+# _dsq_optimize, _pack_int4_signed) were removed as dead code once nothing
+# else in this file used them.
 # ---------------------------------------------------------------------------
-
-
-def _quantize_int4_blockwise_symmetric(
-    w_nk: np.ndarray, block_size: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Ordinary symmetric INT4 block quantization -- one absmax-derived
-    scale per (output row, ``block_size``-wide slice of the reduction
-    dimension), matching :func:`onnxsim.quantize_weight_only_int4`'s own
-    scheme (codes in ``[-7, 7]``). Returns ``(codes_nk, scale_nb)``.
-    """
-    n, k = w_nk.shape
-    num_blocks = k // block_size
-    blocks = w_nk.reshape(n, num_blocks, block_size)
-    amax = np.max(np.abs(blocks), axis=2)
-    scale = np.maximum(amax / 7.0, 1e-12)
-    scale3 = scale[:, :, np.newaxis]
-    codes = np.clip(np.round(blocks / scale3), -7, 7)
-    return codes.reshape(n, k), scale
-
-
-def _dequantize_int4_blockwise_symmetric(
-    codes_nk: np.ndarray, scale_nb: np.ndarray, block_size: int
-) -> np.ndarray:
-    n, k = codes_nk.shape
-    num_blocks = k // block_size
-    codes3 = codes_nk.reshape(n, num_blocks, block_size)
-    scale3 = scale_nb[:, :, np.newaxis]
-    return (codes3 * scale3).reshape(n, k)
-
-
-def _dsq_optimize(
-    w_nk: np.ndarray, block_size: int, num_iterations: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Solves ``min_s ||W - Q(W / s) * s||_F^2`` for a per-column scale
-    ``s`` (one scalar per reduction-dimension column, shared by every output
-    row/block) by alternating: (a) freeze ``s``, re-quantize ``W / s`` with
-    the ordinary block quantizer above; (b) freeze the resulting integer
-    codes' dequantized values, re-solve ``s`` in closed form (per-column
-    weighted least squares: ``s[h] = sum_row(W[:,h] * dequant[:,h]) /
-    sum_row(dequant[:,h] ** 2)``). Returns ``(s, codes_nk, scale_nb)`` for
-    the ``W / s`` quantization from the final iteration.
-    """
-    k = w_nk.shape[1]
-    s_c = np.ones(k, dtype=np.float64)
-    codes = np.zeros_like(w_nk)
-    scale_blocks = np.zeros((w_nk.shape[0], k // block_size), dtype=np.float64)
-    for _ in range(max(num_iterations, 0)):
-        w_norm = w_nk / s_c[np.newaxis, :]
-        codes, scale_blocks = _quantize_int4_blockwise_symmetric(w_norm, block_size)
-        dequant_norm = _dequantize_int4_blockwise_symmetric(
-            codes, scale_blocks, block_size
-        )
-        num = np.sum(w_nk * dequant_norm, axis=0)
-        den = np.sum(dequant_norm * dequant_norm, axis=0)
-        s_c = np.where(den > 1e-20, num / den, s_c)
-    w_norm = w_nk / s_c[np.newaxis, :]
-    codes, scale_blocks = _quantize_int4_blockwise_symmetric(w_norm, block_size)
-    return s_c, codes, scale_blocks
-
-
-def _pack_int4_signed(codes: np.ndarray) -> bytes:
-    # Two's-complement nibble packing, low-nibble-first (ONNX's documented
-    # INT4 raw_data layout) -- same masking trick as
-    # onnxsim.hqq._pack_uint4, but the values here are already signed
-    # (numpy's bitwise AND on a signed dtype operates on its two's-complement
-    # bit pattern, so `& 0xF` recovers the correct nibble either way).
-    flat = codes.astype(np.int64).ravel()
-    nibbles = (flat & 0xF).astype(np.uint8)
-    lo = nibbles[0::2]
-    hi = nibbles[1::2]
-    packed = (lo | (hi << 4)).astype(np.uint8)
-    return packed.tobytes()
 
 
 def apply_dsq(
@@ -200,139 +131,18 @@ def apply_dsq(
             with no matched block, is returned unchanged. Consider calling
             :func:`onnxsim.simplify` afterward to drop the now-orphaned
             float down-projection initializers.
+
+    Delegates to :func:`onnxsim.apply_dsq_cpp` (the verified C++ port);
+    this pure-Python name is kept only for backward compatibility with
+    existing callers.
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-
-    opset_ge_21 = any(
-        o.domain in ("", "ai.onnx") and o.version >= 21 for o in model.opset_import
-    )
-    if not opset_ge_21:
-        return model
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-    graph_output_names = {o.name for o in graph.output}
-
-    producer_of: Dict[str, onnx.NodeProto] = {}
-    consumer_count: Dict[str, int] = {}
-    for n in graph.node:
-        for out_name in n.output:
-            producer_of[out_name] = n
-        for in_name in n.input:
-            consumer_count[in_name] = consumer_count.get(in_name, 0) + 1
-
-    targets = []  # (down_node, down_w_init, down_transposed, up_w_init, up_transposed)
-    for down_node in graph.node:
-        match = _match_matmul_like(down_node)
-        if match is None:
-            continue
-        down_x, down_w, down_transposed = match
-        gate_mul = producer_of.get(down_x)
-        if (
-            gate_mul is None
-            or gate_mul.op_type != "Mul"
-            or len(gate_mul.input) != 2
-            or consumer_count.get(down_x, 0) != 1
-            or down_x in graph_output_names
-        ):
-            continue
-
-        up_info = None
-        for operand in gate_mul.input:
-            up_node = producer_of.get(operand)
-            if up_node is None:
-                continue
-            up_match = _match_matmul_like(up_node)
-            if up_match is None:
-                continue
-            _, up_w, up_transposed = up_match
-            if (
-                consumer_count.get(operand, 0) != 1
-                or operand in graph_output_names
-                or consumer_count.get(up_w, 0) != 1
-            ):
-                continue
-            up_info = (up_w, up_transposed)
-            break
-        if up_info is None:
-            continue
-        up_w, up_transposed = up_info
-
-        down_w_init = initializer_map.get(down_w)
-        up_w_init = initializer_map.get(up_w)
-        if (
-            down_w_init is None
-            or up_w_init is None
-            or down_w_init.data_type != onnx.TensorProto.FLOAT
-            or up_w_init.data_type != onnx.TensorProto.FLOAT
-            or len(down_w_init.dims) != 2
-            or len(up_w_init.dims) != 2
-        ):
-            continue
-
-        down_k = down_w_init.dims[1] if down_transposed else down_w_init.dims[0]
-        up_n = up_w_init.dims[0] if up_transposed else up_w_init.dims[1]
-        if down_k != up_n or down_k % block_size != 0:
-            continue
-
-        targets.append(
-            (down_node, down_w_init, down_transposed, up_w_init, up_transposed)
+    if block_size != 32 or num_iterations != 15:
+        raise NotImplementedError(
+            "apply_dsq now delegates to the C++ port, which hardcodes "
+            "block_size=32, num_iterations=15; call with the defaults, "
+            "or use apply_dsq_cpp directly."
         )
-
-    for down_node, down_w_init, down_transposed, up_w_init, up_transposed in targets:
-        w = onnx.numpy_helper.to_array(down_w_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if down_transposed else w.T  # [N=Dout, K=H]
-
-        s_c, codes_nk, scale_nb = _dsq_optimize(w_nk, block_size, num_iterations)
-
-        up_w = onnx.numpy_helper.to_array(up_w_init).astype(np.float64)
-        up_dim0, up_dim1 = up_w.shape
-        up_nk = up_w if up_transposed else up_w.T  # [N=H, K]
-        up_new_nk = up_nk * s_c[:, np.newaxis]
-        up_new = up_new_nk if up_transposed else up_new_nk.T
-        up_new = up_new.reshape(up_dim0, up_dim1).astype(np.float32)
-        up_w_init.CopyFrom(onnx.numpy_helper.from_array(up_new, name=up_w_init.name))
-
-        codes_orig = codes_nk if down_transposed else codes_nk.T
-        scale_orig = scale_nb if down_transposed else scale_nb.T
-        assert codes_orig.shape == (dim0, dim1)
-
-        wq = onnx.TensorProto()
-        wq.name = _unique_name(f"{down_w_init.name}_dsq_q", taken_names)
-        wq.data_type = _INT4
-        wq.dims.extend(codes_orig.shape)
-        wq.raw_data = _pack_int4_signed(codes_orig)
-        graph.initializer.append(wq)
-
-        ws = onnx.numpy_helper.from_array(
-            scale_orig.astype(np.float32),
-            name=_unique_name(f"{down_w_init.name}_dsq_scale", taken_names),
-        )
-        graph.initializer.append(ws)
-
-        reduction_axis = 1 if down_transposed else 0
-        dq_out = _unique_name(f"{down_w_init.name}_dsq_dq", taken_names)
-        dq_node = onnx.helper.make_node(
-            "DequantizeLinear",
-            [wq.name, ws.name],
-            [dq_out],
-            name=_unique_name(f"{down_w_init.name}_dsq_dequant", taken_names),
-            axis=reduction_axis,
-            block_size=block_size,
-        )
-        graph.node.insert(
-            next(i for i, n in enumerate(graph.node) if n is down_node), dq_node
-        )
-        for i, inp in enumerate(down_node.input):
-            if inp == down_w_init.name:
-                down_node.input[i] = dq_out
-
-    return out
+    return apply_dsq_cpp(model)
 
 
 # ---------------------------------------------------------------------------

@@ -112,13 +112,11 @@ result untouched forever after -- not deciding when to take it.
 
 from __future__ import annotations
 
-from typing import Dict, Set, Union
+from typing import Union
 
 import onnx
-import onnx.helper
 
-from onnxsim.bias_correction import _all_names, _unique_name
-from onnxsim.kv_cache_quantization import _find_kv_cache_candidates, _KvCacheCandidate
+from onnxsim.onnx_simplifier import apply_intactkv_cpp
 
 
 def apply_intactkv(
@@ -138,14 +136,22 @@ def apply_intactkv(
     anything itself, the same way :func:`onnxsim.apply_smooth_attention`
     only migrates and leaves quantizing to a later pipeline stage.
 
+    Delegates to the verified C++ port
+    (:func:`onnxsim.apply_intactkv_cpp`, ``passes/intactkv.h``), which
+    performs the exact same structural (no RNG/fitting step) rewrite.
+
     :param model: the original (unquantized) onnx ModelProto or file path
     :param num_pivot_tokens: how many of each stream's leading (oldest)
             cached tokens to exempt from quantization -- the paper's own
-            typical choice is 4; the caller is responsible for supplying
-            that many tokens' worth of pivot Key/Value (sliced once from
-            the prompt's own prefill-step output -- see this module's own
+            typical choice, and the C++ port's own only supported value,
+            is 4; the caller is responsible for supplying that many
+            tokens' worth of pivot Key/Value (sliced once from the
+            prompt's own prefill-step output -- see this module's own
             docstring) as each new ``*_pivot`` graph input from the first
-            decode step onward
+            decode step onward. **The C++ port hardcodes 4** -- passing any
+            other value raises ``ValueError`` rather than silently
+            building a graph whose fixed ``*_pivot`` input shape doesn't
+            match what the caller asked for.
     :returns: ``model`` with every matched KV-cache stream split into a
             ``*_pivot``/``*_rest`` pair of graph input/output streams (see
             the module docstring's diagram) and the original
@@ -153,102 +159,12 @@ def apply_intactkv(
             no matching ``Concat(past, new, axis=seq)`` pattern is returned
             unchanged
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-
-    candidates = _find_kv_cache_candidates(graph)
-    if not candidates:
-        return out
-
-    taken_names: Set[str] = _all_names(graph)
-    input_by_name = {i.name: i for i in graph.input}
-
-    for c in candidates:
-        _split_pivot_stream(graph, c, num_pivot_tokens, taken_names, input_by_name)
-
-    return out
-
-
-def _split_pivot_stream(
-    graph: onnx.GraphProto,
-    c: _KvCacheCandidate,
-    num_pivot_tokens: int,
-    taken_names: Set[str],
-    input_by_name: Dict[str, onnx.ValueInfoProto],
-) -> None:
-    past_input = input_by_name[c.past_name]
-
-    pivot_past_name = _unique_name(f"{c.past_name}_pivot", taken_names)
-    rest_past_name = _unique_name(f"{c.past_name}_rest", taken_names)
-    pivot_present_name = _unique_name(f"{c.present_name}_pivot", taken_names)
-    rest_present_name = _unique_name(f"{c.present_name}_rest", taken_names)
-
-    # New past_*_pivot graph input: same rank/leading dims as past_*, seq
-    # axis fixed to num_pivot_tokens -- read before past_input's own name
-    # is mutated below.
-    pivot_input = onnx.ValueInfoProto()
-    pivot_input.name = pivot_past_name
-    pivot_input.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
-    for i, d in enumerate(past_input.type.tensor_type.shape.dim):
-        new_dim = pivot_input.type.tensor_type.shape.dim.add()
-        if i == c.seq_axis:
-            new_dim.dim_value = num_pivot_tokens
-        elif d.HasField("dim_value"):
-            new_dim.dim_value = d.dim_value
-        elif d.HasField("dim_param"):
-            new_dim.dim_param = d.dim_param
-    graph.input.append(pivot_input)
-
-    # Rename past_* -> past_*_rest in place: still consumed only by
-    # concat_node, still float32, now holding everything but the pivots.
-    past_input.name = rest_past_name
-    for i, inp in enumerate(c.concat_node.input):
-        if inp == c.past_name:
-            c.concat_node.input[i] = rest_past_name
-
-    # present_* -> present_*_rest in place: concat_node's own output,
-    # unchanged apart from the name, now a plain KV-cache stream in its
-    # own right for a following quantizer to match.
-    c.concat_node.output[0] = rest_present_name
-    rest_output = onnx.ValueInfoProto()
-    rest_output.name = rest_present_name
-    rest_output.type.CopyFrom(past_input.type)
-    # seq_past - num_pivot_tokens (statically unknown here, same as the
-    # original present_* declaration) -- clear any dim_value the pivot
-    # branch above would have copied and leave the seq axis symbolic.
-    rest_output.type.tensor_type.shape.dim[c.seq_axis].ClearField("dim_value")
-    rest_output.type.tensor_type.shape.dim[c.seq_axis].ClearField("dim_param")
-    graph.output.append(rest_output)
-
-    # present_*_pivot = Identity(past_*_pivot): exact passthrough, every
-    # step -- the pivot tokens are set once and never revised.
-    identity_node = onnx.helper.make_node(
-        "Identity",
-        [pivot_past_name],
-        [pivot_present_name],
-        name=_unique_name(f"{c.present_name}_intactkv_pivot", taken_names),
-    )
-    pivot_output = onnx.ValueInfoProto()
-    pivot_output.name = pivot_present_name
-    pivot_output.type.CopyFrom(pivot_input.type)
-    graph.output.append(pivot_output)
-
-    # present_* (original name/binding, untouched) = Concat(pivot, rest):
-    # every original consumer of present_* (the attention math) keeps
-    # referring to it by that same name, so nothing downstream needs
-    # rewiring.
-    reconstruct_node = onnx.helper.make_node(
-        "Concat",
-        [pivot_present_name, rest_present_name],
-        [c.present_name],
-        name=_unique_name(f"{c.present_name}_intactkv_reconstruct", taken_names),
-        axis=c.seq_axis,
-    )
-
-    concat_idx = next(i for i, n in enumerate(graph.node) if n is c.concat_node)
-    graph.node.insert(concat_idx + 1, identity_node)
-    graph.node.insert(concat_idx + 2, reconstruct_node)
+    if num_pivot_tokens != 4:
+        raise ValueError(
+            "apply_intactkv's C++ backend hardcodes num_pivot_tokens=4; "
+            f"got {num_pivot_tokens}. Call apply_intactkv_cpp directly "
+            "(it takes no num_pivot_tokens parameter) if 4 pivot tokens "
+            "suit your model, or split the KV-cache stream by hand "
+            "otherwise."
+        )
+    return apply_intactkv_cpp(model)

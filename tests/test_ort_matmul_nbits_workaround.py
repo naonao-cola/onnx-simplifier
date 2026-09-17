@@ -149,15 +149,64 @@ def test_workaround_noop_when_no_matmul_present():
     assert result.SerializeToString() == model.SerializeToString()
 
 
+def _asymmetric_int4_dequant_model(K=32, N=8, block_size=32, seed=4):
+    # A synthetic axis=0 block-quantized DequantizeLinear WITH a zero-point
+    # (Wq, Ws, Wz) -- what onnxsim.quantize_weight_only_int4_hqq's own
+    # graph rewrite used to produce before it started delegating to
+    # apply_hqq_cpp (which folds to a plain float32 initializer instead --
+    # see onnxsim/hqq.py's own "Delegates to" note). This workaround's own
+    # "handles a 3-input DequantizeLinear" property is about the ORT bug,
+    # not about HQQ specifically, so a hand-built fixture keeps it covered
+    # independent of which onnxsim quantizer (if any) still emits this
+    # shape.
+    rng = np.random.default_rng(seed)
+    num_blocks = K // block_size
+    codes = rng.integers(0, 16, size=(K, N), dtype=np.uint8)
+    zero = rng.integers(0, 16, size=(num_blocks, N), dtype=np.uint8)
+    scale = (rng.random((num_blocks, N)).astype(np.float32) + 0.1) * 0.1
+
+    def _pack_uint4(arr):
+        flat = arr.astype(np.uint8).ravel()
+        lo = flat[0::2]
+        hi = flat[1::2]
+        return (lo | (hi << 4)).astype(np.uint8).tobytes()
+
+    wq = onnx.TensorProto()
+    wq.name = "Wq"
+    wq.data_type = onnx.TensorProto.UINT4
+    wq.dims.extend([K, N])
+    wq.raw_data = _pack_uint4(codes)
+
+    wz = onnx.TensorProto()
+    wz.name = "Wz"
+    wz.data_type = onnx.TensorProto.UINT4
+    wz.dims.extend([num_blocks, N])
+    wz.raw_data = _pack_uint4(zero)
+
+    ws = onnx.numpy_helper.from_array(scale, name="Ws")
+
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Wdq = DequantizeLinear<axis=0, block_size={block_size}>(Wq, Ws, Wz)
+          Y = MatMul(X, Wdq)
+        }}
+        """,
+        [wq, ws, wz],
+    )
+    return model
+
+
 def test_workaround_handles_hqq_three_input_dequantize_linear():
-    # HQQ's DequantizeLinear has a zero-point (Wq, Ws, Wz) -- confirm all
-    # three tensors get transposed together, not just Wq/Ws.
+    # A real axis=0, block-quantized DequantizeLinear with a zero-point
+    # (Wq, Ws, Wz) -- confirm all three tensors get transposed together,
+    # not just Wq/Ws.
     K, N = 32, 8
-    model = _matmul_model(K=K, N=N, seed=4)
+    quant = _asymmetric_int4_dequant_model(K=K, N=N, block_size=32, seed=4)
     rng = np.random.default_rng(5)
     x = rng.standard_normal((16, K)).astype(np.float32)
 
-    quant = onnxsim.quantize_weight_only_int4_hqq(model, block_size=32)
     dq_node = next(n for n in quant.graph.node if n.op_type == "DequantizeLinear")
     assert len(dq_node.input) == 3
     axis = next(a.i for a in dq_node.attribute if a.name == "axis")

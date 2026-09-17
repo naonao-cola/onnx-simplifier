@@ -68,16 +68,9 @@ from typing import Iterable, Optional, Union
 
 import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim.bias_correction import _all_names, _unique_name
-from onnxsim.mx_quantization import (
-    _MXFP4_MAX_MAGNITUDE,
-    MXFP4_CODEBOOK,
-    _match_matmul_like,
-    _nearest_codebook_index,
-)
+from onnxsim.mx_quantization import _MXFP4_MAX_MAGNITUDE
+from onnxsim.onnx_simplifier import quantize_weight_only_nvfp4_cpp
 
 # NVFP4's own reference block size: groups of 16, half OCP MX's canonical
 # 32 -- see module docstring.
@@ -130,34 +123,6 @@ def _round_to_e4m3(magnitudes: np.ndarray) -> np.ndarray:
     return np.where((hi - clamped) < (clamped - lo), hi, lo)
 
 
-def _quantize_nvfp4_blockwise(
-    w_nk: np.ndarray, block_size: int
-) -> "tuple[np.ndarray, np.ndarray, float]":
-    """Returns ``(codes_nk, effective_scale_blocks, global_scale)`` for
-    ``w_nk`` ([N, K], output channel first): E2M1 codebook indices in
-    ``[0, 15]``, one *effective* scale (the E4M3-rounded block scale
-    already multiplied by the per-tensor global scale -- see module
-    docstring) per ``(output channel, block-of-K)`` group, shape
-    ``[N, K // block_size]``, and the scalar ``global_scale`` itself.
-    Assumes ``K % block_size == 0``.
-    """
-    n, k = w_nk.shape
-    num_blocks = k // block_size
-    blocks = w_nk.reshape(n, num_blocks, block_size)
-
-    tensor_amax = max(float(np.abs(w_nk).max()), 1e-30)
-    global_scale = tensor_amax / (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX)
-
-    block_amax = np.maximum(np.abs(blocks).max(axis=2), 1e-30)  # [N, num_blocks]
-    raw_block_scale = block_amax / (global_scale * FLOAT4_E2M1_MAX)
-    block_scale = _round_to_e4m3(raw_block_scale)
-
-    effective_scale = block_scale * global_scale  # [N, num_blocks]
-    normalized = blocks / effective_scale[:, :, np.newaxis]
-    codes = _nearest_codebook_index(normalized)
-    return codes.reshape(n, k), effective_scale, global_scale
-
-
 def quantize_weight_only_nvfp4(
     model: Union[str, onnx.ModelProto],
     block_size: int = NVFP4_BLOCK_SIZE,
@@ -170,155 +135,34 @@ def quantize_weight_only_nvfp4(
     scale, and the per-tensor global scale all come from the weight's own
     values.
 
+    Delegates to the verified C++ port
+    (:func:`onnxsim.quantize_weight_only_nvfp4_cpp`), which hardcodes
+    ``block_size=16`` and does not support ``skip_names`` (this repo's own
+    established convention: a C++ port need not mirror every optional knob
+    its Python counterpart has). Called with only default arguments, this
+    function is fully backward compatible; a non-default ``block_size`` or
+    a non-``None`` ``skip_names`` raises ``NotImplementedError`` rather
+    than silently ignoring the request.
+
     :param model: the original (unquantized) onnx ModelProto or file path
     :param block_size: elements per (output-channel, block) scale group
-            along the reduction dimension; NVFP4's own canonical choice is
-            16
+            along the reduction dimension; must be 16 (the only value the
+            delegated C++ implementation supports)
     :param skip_names: weight initializer names to leave unquantized even
-            if otherwise eligible
-    :returns: ``model`` with every matched layer's weight replaced by
-            ``Mul(Reshape(Gather(codebook, Cast(Wq, INT64)), ...), Ws) ->
-            Reshape(..., original shape)`` feeding the original MatMul/Gemm
-            node -- ordinary ONNX ops only, no contrib op and no minimum
-            opset beyond what ``Gather``/``Cast``/``Reshape``/``Mul``
-            themselves need (opset 11+), identical graph shape to
-            :func:`onnxsim.mx_quantization.quantize_weight_only_mxfp4`.
-            Layers with a non-constant, non-2-D, or non-block-divisible
-            weight are left untouched.
+            if otherwise eligible -- not supported by the delegated C++
+            implementation; must be ``None``
+    :returns: ``model`` with every matched layer's weight replaced by its
+            NVFP4 round-tripped float32 version, stored under a *new*
+            initializer. A model with no matching layer is returned
+            unchanged.
     """
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    skip_names = set(skip_names) if skip_names is not None else frozenset()
-
-    out = onnx.ModelProto()
-    out.CopyFrom(model)
-    graph = out.graph
-    initializer_map = {t.name: t for t in graph.initializer}
-    taken_names = _all_names(graph)
-    codebook_name = None  # created lazily on first match
-
-    nodes = list(graph.node)
-    for node in nodes:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        w_name, weight_transposed = match
-        if w_name in skip_names:
-            continue
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if weight_transposed else w.T  # [N, K]
-        n, k = w_nk.shape
-        if k % block_size != 0:
-            continue
-
-        if codebook_name is None:
-            codebook_name = _unique_name("nvfp4_codebook", taken_names)
-            graph.initializer.append(
-                onnx.numpy_helper.from_array(
-                    np.asarray(MXFP4_CODEBOOK, dtype=np.float32), name=codebook_name
-                )
-            )
-        num_blocks = k // block_size
-
-        codes_nk, scale_blocks, _global_scale = _quantize_nvfp4_blockwise(
-            w_nk, block_size
+    if block_size != NVFP4_BLOCK_SIZE or skip_names is not None:
+        raise NotImplementedError(
+            "quantize_weight_only_nvfp4 now delegates to the C++ port "
+            "(quantize_weight_only_nvfp4_cpp), which only supports the "
+            f"default block_size={NVFP4_BLOCK_SIZE} and does not support "
+            "skip_names; call quantize_weight_only_nvfp4_cpp directly if "
+            "that's sufficient, or file an issue if you need these knobs "
+            "back."
         )
-        codes_orig = codes_nk if weight_transposed else codes_nk.T
-        scale_orig = scale_blocks if weight_transposed else scale_blocks.T
-        assert codes_orig.shape == (dim0, dim1)
-
-        wq = onnx.numpy_helper.from_array(
-            codes_orig.astype(np.uint8),
-            name=_unique_name(f"{w_name}_nvfp4_q", taken_names),
-        )
-        graph.initializer.append(wq)
-        ws = onnx.numpy_helper.from_array(
-            scale_orig.astype(np.float32),
-            name=_unique_name(f"{w_name}_nvfp4_scale", taken_names),
-        )
-        graph.initializer.append(ws)
-
-        if weight_transposed:
-            blocked_shape = [n, num_blocks, block_size]
-            scale_shape = [n, num_blocks, 1]
-        else:
-            blocked_shape = [num_blocks, block_size, n]
-            scale_shape = [num_blocks, 1, n]
-
-        cast_out = _unique_name(f"{w_name}_nvfp4_codes_i64", taken_names)
-        cast_node = onnx.helper.make_node(
-            "Cast", [wq.name], [cast_out], to=onnx.TensorProto.INT64
-        )
-
-        gather_out = _unique_name(f"{w_name}_nvfp4_gathered", taken_names)
-        gather_node = onnx.helper.make_node(
-            "Gather", [codebook_name, cast_out], [gather_out], axis=0
-        )
-
-        blocked_shape_name = _unique_name(f"{w_name}_nvfp4_blocked_shape", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.asarray(blocked_shape, dtype=np.int64), name=blocked_shape_name
-            )
-        )
-        reshaped_out = _unique_name(f"{w_name}_nvfp4_reshaped", taken_names)
-        reshape1_node = onnx.helper.make_node(
-            "Reshape", [gather_out, blocked_shape_name], [reshaped_out]
-        )
-
-        scale_shape_name = _unique_name(f"{w_name}_nvfp4_scale_shape", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.asarray(scale_shape, dtype=np.int64), name=scale_shape_name
-            )
-        )
-        scale_reshaped_out = _unique_name(f"{w_name}_nvfp4_scale_reshaped", taken_names)
-        reshape2_node = onnx.helper.make_node(
-            "Reshape", [ws.name, scale_shape_name], [scale_reshaped_out]
-        )
-
-        scaled_out = _unique_name(f"{w_name}_nvfp4_scaled", taken_names)
-        mul_node = onnx.helper.make_node(
-            "Mul", [reshaped_out, scale_reshaped_out], [scaled_out]
-        )
-
-        orig_shape_name = _unique_name(f"{w_name}_nvfp4_orig_shape", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(
-                np.asarray([dim0, dim1], dtype=np.int64), name=orig_shape_name
-            )
-        )
-        dq_out = _unique_name(f"{w_name}_nvfp4_dq", taken_names)
-        reshape3_node = onnx.helper.make_node(
-            "Reshape",
-            [scaled_out, orig_shape_name],
-            [dq_out],
-            name=_unique_name(f"{w_name}_nvfp4_dequant", taken_names),
-        )
-
-        insertion_point = next(i for i, n in enumerate(graph.node) if n is node)
-        for new_node in (
-            cast_node,
-            gather_node,
-            reshape1_node,
-            reshape2_node,
-            mul_node,
-            reshape3_node,
-        ):
-            graph.node.insert(insertion_point, new_node)
-            insertion_point += 1
-
-        for i, inp in enumerate(node.input):
-            if inp == w_name:
-                node.input[i] = dq_out
-
-    return out
+    return quantize_weight_only_nvfp4_cpp(model)

@@ -4,6 +4,13 @@ the paper's closed-form second-order polynomial approximation
 (``sign(x) * (a*(clip(|x|, max=-b)+b)**2 + c)``), the piece of GELU's
 standard ``0.5*x*(1+Erf(x/sqrt(2)))`` export decomposition an
 integer-only accelerator can't evaluate directly.
+
+``apply_ibert_gelu`` now delegates directly to the verified C++ port
+(``apply_ibert_gelu_cpp``) -- see ``tests/test_ibert_gelu_cpp.py`` for the
+port's own tests. This file only covers what's specific to the Python
+entry point itself: that it forwards correctly, and that ``skip_names``
+(not supported by the C++ backend) raises rather than being silently
+ignored.
 """
 
 import numpy as np
@@ -125,14 +132,18 @@ def test_ibert_gelu_end_to_end_on_decomposed_gelu():
     assert approx_out[zero_idx] == pytest.approx(0.0, abs=1e-5)
 
 
-def test_ibert_gelu_skip_names_leaves_matched_node_untouched():
+def test_ibert_gelu_skip_names_raises_not_implemented():
+    # The C++ backend apply_ibert_gelu now delegates to has no skip_names
+    # concept -- silently ignoring a caller's request to protect a specific
+    # node would be worse than an ordinary numeric divergence, so this
+    # raises instead of quietly rewriting a node the caller asked to skip.
     model = _erf_model()
     erf_name = "my_erf_node"
     for n in model.graph.node:
         if n.op_type == "Erf":
             n.name = erf_name
-    q = onnxsim.apply_ibert_gelu(model, skip_names={erf_name})
-    assert q.SerializeToString() == model.SerializeToString()
+    with pytest.raises(NotImplementedError):
+        onnxsim.apply_ibert_gelu(model, skip_names={erf_name})
 
 
 def test_ibert_gelu_noop_when_no_erf_present():

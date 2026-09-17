@@ -116,12 +116,20 @@ def test_attention_quantization_leaves_score_matmul_and_softmax_untouched():
 
 
 def test_attention_quantization_probs_use_a_fixed_1_over_255_scale():
+    # apply_attention_quantization now delegates to the verified C++ port
+    # (see onnxsim/attention_quantization.py), which auto-names its own
+    # constants rather than using this module's own "attnq_probs_scale"
+    # convention -- check by value instead of by initializer name, the
+    # same convention tests/test_attention_quantization_cpp.py's own
+    # test_cpp_probs_use_a_fixed_1_over_255_scale already establishes.
     model = _attention_model()
     q = onnxsim.apply_attention_quantization(model)
 
-    scale_init = next(t for t in q.graph.initializer if t.name == "attnq_probs_scale")
-    scale = onnx.numpy_helper.to_array(scale_init)
-    assert np.isclose(scale, 1.0 / 255.0)
+    assert any(
+        onnx.numpy_helper.to_array(t).size == 1
+        and np.isclose(float(onnx.numpy_helper.to_array(t).reshape(-1)[0]), 1.0 / 255.0)
+        for t in q.graph.initializer
+    )
 
 
 def test_attention_quantization_noop_without_attention_pattern():

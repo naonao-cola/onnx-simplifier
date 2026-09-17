@@ -65,6 +65,26 @@ def _decode_int4_signed(t: onnx.TensorProto) -> np.ndarray:
     return signed.reshape(dims)
 
 
+def _up_weight_after(q: onnx.ModelProto) -> np.ndarray:
+    """Finds the up-projection's own CURRENT weight by following the actual
+    graph wiring, not by name: apply_dsq now delegates to the C++ port,
+    which -- like every other ``*_cpp`` port in this repo -- rescales the
+    up-projection's weight into a freshly created initializer with an
+    auto-generated name, rewiring UpProj's own input to it and leaving the
+    original "Wup" initializer orphaned, unchanged, and unused in the
+    graph. Looking it up by the stale "Wup" name would silently find that
+    orphaned original instead of the real value the model actually
+    computes with (see tests/test_d2quant_dsq_cpp.py's own
+    ``_cpp_up_weight`` helper, which this mirrors).
+    """
+    up_node = next(
+        n for n in q.graph.node if n.op_type == "MatMul" and n.output[0] == "UpProj"
+    )
+    return onnx.numpy_helper.to_array(
+        next(t for t in q.graph.initializer if t.name == up_node.input[1])
+    )
+
+
 # ---------------------------------------------------------------------------
 # DSQ
 # ---------------------------------------------------------------------------
@@ -108,8 +128,11 @@ def _swiglu_model(D=8, H=16, Dout=6, extra_up_consumer=False, gemm_down=False, s
 
 
 def test_apply_dsq_quantizes_down_proj_and_rescales_up_proj():
-    model, w_gate, w_up, w_down = _swiglu_model(D=8, H=16, Dout=6, seed=0)
-    dsq_model = onnxsim.apply_dsq(model, block_size=4, num_iterations=15)
+    # apply_dsq now delegates to the verified C++ port (apply_dsq_cpp),
+    # which hardcodes block_size=32/num_iterations=15 -- H must be a
+    # multiple of 32 (was 16, with block_size=4) for the same reason.
+    model, w_gate, w_up, w_down = _swiglu_model(D=8, H=32, Dout=6, seed=0)
+    dsq_model = onnxsim.apply_dsq(model)
     onnx.checker.check_model(dsq_model)
 
     down_node = next(
@@ -119,14 +142,13 @@ def test_apply_dsq_quantizes_down_proj_and_rescales_up_proj():
     assert dq_node.op_type == "DequantizeLinear"
     attrs = {a.name: a for a in dq_node.attribute}
     assert attrs["axis"].i == 0
-    assert attrs["block_size"].i == 4
+    assert attrs["block_size"].i == 32
 
     wq = next(t for t in dsq_model.graph.initializer if t.name == dq_node.input[0])
     assert wq.data_type == onnx.TensorProto.INT4
-    assert list(wq.dims) == [16, 6]
+    assert list(wq.dims) == [32, 6]
 
-    up_init = next(t for t in dsq_model.graph.initializer if t.name == "Wup")
-    up_after = onnx.numpy_helper.to_array(up_init)
+    up_after = _up_weight_after(dsq_model)
     assert not np.allclose(up_after, w_up)
     # Every column's rescale ratio must be a single constant down that
     # column (only the up-proj's *output channel* -- H -- is rescaled).
@@ -135,9 +157,9 @@ def test_apply_dsq_quantizes_down_proj_and_rescales_up_proj():
 
 
 def test_apply_dsq_reconstruction_matches_original_weight():
-    D, H, Dout, block_size = 8, 16, 6, 4
+    D, H, Dout, block_size = 8, 32, 6, 32
     model, _, w_up, w_down = _swiglu_model(D=D, H=H, Dout=Dout, seed=1)
-    dsq_model = onnxsim.apply_dsq(model, block_size=block_size, num_iterations=15)
+    dsq_model = onnxsim.apply_dsq(model)
 
     down_node = next(
         n for n in dsq_model.graph.node if n.op_type == "MatMul" and n.output[0] == "Y"
@@ -152,8 +174,7 @@ def test_apply_dsq_reconstruction_matches_original_weight():
         codes.reshape(num_blocks, block_size, Dout) * scale[:, np.newaxis, :]
     ).reshape(H, Dout)
 
-    up_init = next(t for t in dsq_model.graph.initializer if t.name == "Wup")
-    up_after = onnx.numpy_helper.to_array(up_init).astype(np.float64)
+    up_after = _up_weight_after(dsq_model).astype(np.float64)
     s_c_recovered = (up_after / w_up.astype(np.float64)).mean(axis=0)  # [H]
 
     reconstructed = dequant_normalized * s_c_recovered[:, np.newaxis]
@@ -162,8 +183,8 @@ def test_apply_dsq_reconstruction_matches_original_weight():
 
 
 def test_apply_dsq_output_stays_close_to_float_via_onnxruntime():
-    model, *_ = _swiglu_model(D=8, H=16, Dout=6, seed=2)
-    dsq_model = onnxsim.apply_dsq(model, block_size=4, num_iterations=15)
+    model, *_ = _swiglu_model(D=8, H=32, Dout=6, seed=2)
+    dsq_model = onnxsim.apply_dsq(model)
     onnx.checker.check_model(dsq_model)
 
     rng = np.random.default_rng(3)
@@ -175,8 +196,8 @@ def test_apply_dsq_output_stays_close_to_float_via_onnxruntime():
 
 
 def test_apply_dsq_gemm_transb_down_proj():
-    model, *_ = _swiglu_model(D=8, H=16, Dout=6, gemm_down=True, seed=4)
-    dsq_model = onnxsim.apply_dsq(model, block_size=4, num_iterations=15)
+    model, *_ = _swiglu_model(D=8, H=32, Dout=6, gemm_down=True, seed=4)
+    dsq_model = onnxsim.apply_dsq(model)
     onnx.checker.check_model(dsq_model)
 
     dq_nodes = [n for n in dsq_model.graph.node if n.op_type == "DequantizeLinear"]
@@ -192,29 +213,29 @@ def test_apply_dsq_gemm_transb_down_proj():
 
 
 def test_apply_dsq_declines_when_up_proj_has_extra_consumer():
-    model, *_ = _swiglu_model(D=8, H=16, Dout=6, extra_up_consumer=True, seed=6)
-    dsq_model = onnxsim.apply_dsq(model, block_size=4, num_iterations=15)
+    model, *_ = _swiglu_model(D=8, H=32, Dout=6, extra_up_consumer=True, seed=6)
+    dsq_model = onnxsim.apply_dsq(model)
     assert dsq_model.SerializeToString() == model.SerializeToString()
 
 
 def test_apply_dsq_noop_when_no_swiglu_pattern():
     model = _model(
         """
-        g (float[4,16] X) => (float[4,6] Y)
+        g (float[4,32] X) => (float[4,6] Y)
         {
           Y = MatMul(X, W)
         }
         """,
-        [_f32(np.random.default_rng(7).standard_normal((16, 6)), "W")],
+        [_f32(np.random.default_rng(7).standard_normal((32, 6)), "W")],
     )
-    dsq_model = onnxsim.apply_dsq(model, block_size=4)
+    dsq_model = onnxsim.apply_dsq(model)
     assert dsq_model.SerializeToString() == model.SerializeToString()
 
 
 def test_apply_dsq_noop_below_opset_21():
-    model, *_ = _swiglu_model(D=8, H=16, Dout=6, seed=8)
+    model, *_ = _swiglu_model(D=8, H=32, Dout=6, seed=8)
     model.opset_import[0].version = 17
-    dsq_model = onnxsim.apply_dsq(model, block_size=4)
+    dsq_model = onnxsim.apply_dsq(model)
     assert dsq_model.SerializeToString() == model.SerializeToString()
 
 

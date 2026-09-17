@@ -76,12 +76,9 @@ from typing import Iterable, Optional, Sequence, Union
 
 import numpy as np
 import onnx
-import onnx.helper
-import onnx.numpy_helper
 
-from onnxsim.bias_correction import _all_names, _unique_name
 from onnxsim.deepseek_fp8 import _FP8_MAX, _fp8_round_trip
-from onnxsim.llm_int8 import _match_matmul_like
+from onnxsim.onnx_simplifier import apply_leptoquant_cpp
 
 # AngelSlim's own paper describes searching the outlier fraction alpha in
 # [0, 0.001]. alpha = 0 is the plain-absmax (deepseek_fp8) candidate and
@@ -155,59 +152,40 @@ def apply_leptoquant(
     own docstring for the technique. Needs no calibration data: every
     quantization decision comes from the weight tensor's own values.
 
+    Delegates to the verified C++ port (:func:`onnxsim.apply_leptoquant_cpp`),
+    which hardcodes ``block_size=128`` and ``alpha_grid=DEFAULT_ALPHA_GRID``
+    and does not support ``skip_names`` (this repo's own established
+    convention: a C++ port need not mirror every optional knob its Python
+    counterpart has). Called with only default arguments, this function is
+    fully backward compatible; any non-default argument raises
+    ``NotImplementedError`` rather than silently ignoring the request.
+
     :param float_model: the original (unquantized) onnx ModelProto or file
             path
-    :param block_size: weight tile size along both axes (K and N)
-    :param alpha_grid: per-block outlier fractions to grid-search over
+    :param block_size: weight tile size along both axes (K and N); must be
+            128 (the only value the delegated C++ implementation supports)
+    :param alpha_grid: per-block outlier fractions to grid-search over;
+            must be ``DEFAULT_ALPHA_GRID`` -- not supported by the delegated
+            C++ implementation
     :param skip_names: weight initializer names to leave unquantized even
-            if otherwise eligible
+            if otherwise eligible -- not supported by the delegated C++
+            implementation; must be ``None``
     :returns: ``float_model`` with every matched layer's weight replaced by
             a new float32 initializer holding its LeptoQuant block-FP8
             round trip. No graph nodes are added or removed at all; layers
             with a non-constant or non-2-D weight are left untouched.
     """
-    if isinstance(float_model, str):
-        float_model = onnx.load(float_model, load_external_data=False)
-    skip_names = set(skip_names) if skip_names is not None else frozenset()
-
-    out = onnx.ModelProto()
-    out.CopyFrom(float_model)
-    graph = out.graph
-
-    initializer_map = {t.name: t for t in graph.initializer}
-    candidates = []  # (node, weight_initializer, weight_transposed)
-    for node in graph.node:
-        match = _match_matmul_like(node)
-        if match is None:
-            continue
-        _x_name, w_name, _bias_name, weight_transposed = match
-        if w_name in skip_names:
-            continue
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        candidates.append((node, w_init, weight_transposed))
-    if not candidates:
-        return out
-
-    taken_names = _all_names(graph)
-
-    for node, w_init, weight_transposed in candidates:
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_nk = w if weight_transposed else w.T  # [N, K], output-channel first
-        w_quant_nk = quantize_dequantize_block_fp8_leptoquant(
-            w_nk, block_size, alpha_grid
+    if (
+        block_size != 128
+        or tuple(alpha_grid) != DEFAULT_ALPHA_GRID
+        or skip_names is not None
+    ):
+        raise NotImplementedError(
+            "apply_leptoquant now delegates to the C++ port "
+            "(apply_leptoquant_cpp), which only supports the default "
+            "block_size=128/alpha_grid=DEFAULT_ALPHA_GRID and does not "
+            "support skip_names; call apply_leptoquant_cpp directly if "
+            "that's sufficient, or file an issue if you need these knobs "
+            "back."
         )
-        w_quant = w_quant_nk if weight_transposed else w_quant_nk.T
-
-        new_w_name = _unique_name(f"{w_init.name}_leptoquant", taken_names)
-        graph.initializer.append(
-            onnx.numpy_helper.from_array(w_quant.astype(np.float32), name=new_w_name)
-        )
-        node.input[1] = new_w_name
-
-    return out
+    return apply_leptoquant_cpp(float_model)

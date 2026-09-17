@@ -3,6 +3,15 @@
 quantization that fits each block's zero-point via IRLS to minimize a
 robust (Lp, p<2) reconstruction loss instead of the ordinary least-squares
 fit a naive min/max range implicitly targets.
+
+``quantize_weight_only_int4_hqq`` now delegates to
+``onnxsim.apply_hqq_cpp`` (see ``onnxsim/hqq.py``'s own "Delegates to"
+note): the returned graph folds the IRLS-refined round trip directly into
+a replacement float32 initializer rather than building a real
+``DequantizeLinear(Wq, Ws, Wz, ...)`` node with packed UINT4 codes, so
+tests here read that replacement initializer directly instead of decoding
+a ``DequantizeLinear`` node -- see ``tests/test_hqq_cpp.py`` for the full
+C++ port test suite this one now exercises indirectly.
 """
 
 import numpy as np
@@ -62,56 +71,31 @@ def _rel_l2(a, b):
     return np.linalg.norm(a - b) / max(np.linalg.norm(a), 1e-6)
 
 
-def _dequantize_hqq(model):
-    dq_node = next(n for n in model.graph.node if n.op_type == "DequantizeLinear")
-    wq = next(t for t in model.graph.initializer if t.name == dq_node.input[0])
-    ws = next(t for t in model.graph.initializer if t.name == dq_node.input[1])
-    wz = next(t for t in model.graph.initializer if t.name == dq_node.input[2])
-    block_size = next(a.i for a in dq_node.attribute if a.name == "block_size")
-    axis = next((a.i for a in dq_node.attribute if a.name == "axis"), 1)
-
-    def _unpack_uint4(t):
-        dims = list(t.dims)
-        numel = int(np.prod(dims))
-        raw = np.frombuffer(t.raw_data, dtype=np.uint8)
-        lo = (raw & 0x0F).astype(np.int64)
-        hi = ((raw >> 4) & 0x0F).astype(np.int64)
-        codes = np.empty(numel, dtype=np.int64)
-        codes[0::2] = lo[: (numel + 1) // 2]
-        codes[1::2] = hi[: numel // 2]
-        return codes.reshape(dims).astype(np.float64)
-
-    codes = _unpack_uint4(wq)
-    zero = _unpack_uint4(wz)
-    scale = onnx.numpy_helper.to_array(ws).astype(np.float64)
-
-    scale_full = np.repeat(scale, block_size, axis=axis)
-    zero_full = np.repeat(zero, block_size, axis=axis)
-    slicer = [slice(None)] * codes.ndim
-    slicer[axis] = slice(0, codes.shape[axis])
-    scale_full = scale_full[tuple(slicer)]
-    zero_full = zero_full[tuple(slicer)]
-    return (codes - zero_full) * scale_full
+def _current_weight(model, weight_input_index=1):
+    # apply_hqq_cpp (which quantize_weight_only_int4_hqq now delegates to)
+    # folds the IRLS-refined round trip directly into a replacement
+    # float32 initializer, rewiring the matched node's own weight input --
+    # see onnxsim/hqq.py's own "Delegates to" note.
+    node = next(n for n in model.graph.node if n.op_type in ("MatMul", "Gemm"))
+    w_name = node.input[weight_input_index]
+    w_init = next(t for t in model.graph.initializer if t.name == w_name)
+    return onnx.numpy_helper.to_array(w_init).astype(np.float64)
 
 
-def test_hqq_quantizes_matmul_to_dequantize_linear():
+def test_hqq_quantizes_matmul_to_replacement_float_weight():
     model = _matmul_model(K=64, N=16, seed=0)
     hqq_model = onnxsim.quantize_weight_only_int4_hqq(model)
     onnx.checker.check_model(hqq_model)
 
-    op_types = [n.op_type for n in hqq_model.graph.node]
-    assert op_types.count("DequantizeLinear") == 1
-    assert "MatMul" in op_types
-
-    (dq_node,) = [n for n in hqq_model.graph.node if n.op_type == "DequantizeLinear"]
-    assert (
-        len(dq_node.input) == 3
-    )  # Wq, Ws, Wz -- asymmetric, unlike quantize_weight_only_int4
-
-    wq = next(t for t in hqq_model.graph.initializer if t.name == dq_node.input[0])
-    assert wq.data_type == onnx.TensorProto.UINT4
-    wz = next(t for t in hqq_model.graph.initializer if t.name == dq_node.input[2])
-    assert wz.data_type == onnx.TensorProto.UINT4
+    # No new graph nodes -- weight-only, folded straight into a new
+    # initializer (see onnxsim/hqq.py's own "Delegates to" note).
+    assert [n.op_type for n in hqq_model.graph.node] == [
+        n.op_type for n in model.graph.node
+    ]
+    new_w = _current_weight(hqq_model)
+    orig_w = onnx.numpy_helper.to_array(model.graph.initializer[0]).astype(np.float64)
+    assert new_w.shape == orig_w.shape
+    assert not np.array_equal(new_w, orig_w)
 
 
 def test_hqq_output_stays_close_to_float_via_onnxruntime():
@@ -144,7 +128,7 @@ def test_hqq_beats_naive_minmax_on_outlier_heavy_weights():
 
     model = _matmul_model(K=K, N=N, weight=weight)
     hqq_model = onnxsim.quantize_weight_only_int4_hqq(model)
-    w_hqq = _dequantize_hqq(hqq_model)  # [K, N]
+    w_hqq = _current_weight(hqq_model)  # [K, N]
 
     # Naive min/max affine quantization (p=2, i.e. plain least squares --
     # what a naive min/max range effectively targets) for comparison:
@@ -185,23 +169,19 @@ def test_hqq_gemm_transb():
     assert _rel_l2(float_y, hqq_y) < 0.25
 
 
-def test_hqq_codes_and_zero_stay_in_range():
+def test_hqq_reconstructed_block_has_at_most_16_distinct_values():
+    # HQQ's own codes are unsigned 4-bit ([0, 15]), so each (output-channel,
+    # block) group can reconstruct at most 16 distinct values -- still
+    # true of the folded float32 replacement weight, even though the codes
+    # themselves are no longer visible in the graph.
     rng = np.random.default_rng(5)
     weight = rng.standard_normal((32, 8)).astype(np.float32) * 3
     model = _matmul_model(K=32, N=8, weight=weight)
     hqq_model = onnxsim.quantize_weight_only_int4_hqq(model)
 
-    dq_node = next(n for n in hqq_model.graph.node if n.op_type == "DequantizeLinear")
-    for name in (dq_node.input[0], dq_node.input[2]):
-        t = next(t for t in hqq_model.graph.initializer if t.name == name)
-        numel = int(np.prod(list(t.dims)))
-        raw = np.frombuffer(t.raw_data, dtype=np.uint8)
-        lo = raw & 0x0F
-        hi = (raw >> 4) & 0x0F
-        codes = np.empty(numel, dtype=np.uint8)
-        codes[0::2] = lo[: (numel + 1) // 2]
-        codes[1::2] = hi[: numel // 2]
-        assert np.all(codes <= 15)
+    w_hqq = _current_weight(hqq_model)  # [K, N], one block per column here
+    for col in range(w_hqq.shape[1]):
+        assert len(np.unique(np.round(w_hqq[:, col], 6))) <= 16
 
 
 def test_hqq_skips_non_block_divisible_k():

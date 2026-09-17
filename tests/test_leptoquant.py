@@ -229,14 +229,18 @@ def test_apply_leptoquant_gemm_transb():
     assert _rel_l2(float_y, q_y) < 0.2
 
 
-def test_apply_leptoquant_respects_skip_names():
+def test_apply_leptoquant_skip_names_no_longer_supported():
+    # apply_leptoquant now delegates to the verified C++ port
+    # (apply_leptoquant_cpp), which doesn't support skip_names -- a
+    # non-None value now raises rather than silently being honored or
+    # ignored.
     rng = np.random.default_rng(9)
     K, N = 128, 128
     w = rng.standard_normal((K, N)).astype(np.float32) * 0.5
     model = _matmul_model(w, K, N)
 
-    result = onnxsim.apply_leptoquant(model, skip_names={"W"})
-    assert result.SerializeToString() == model.SerializeToString()
+    with pytest.raises(NotImplementedError):
+        onnxsim.apply_leptoquant(model, skip_names={"W"})
 
 
 def test_apply_leptoquant_noop_when_weight_is_not_constant():

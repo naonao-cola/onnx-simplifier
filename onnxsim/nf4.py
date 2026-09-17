@@ -35,13 +35,17 @@ ONNX ops any opset-11+ runtime already supports -- no contrib op, no
 opset-21 features: ``Gather`` the (per-element) 4-bit code out of a
 16-entry constant codebook tensor, then ``Mul`` by the per-block scale
 (broadcast via ``Reshape``, exposing the block dimension so ordinary numpy-
-style broadcasting handles the rest). Codes are stored one byte per element
-(``[0, 15]``, unpacked) rather than 2-per-byte packed -- packing would need
-either non-standard low-bit ``Gather`` indices (unsupported) or extra
-bit-unpacking ops in the graph itself, adding real complexity for a
-storage saving orthogonal to NF4's actual point (quantization *accuracy*
-from a distribution-matched codebook, not maximal file size); a packed
-variant is a possible future addition, not attempted here.
+style broadcasting handles the rest).
+
+:func:`quantize_weight_only_nf4` delegates to the verified C++ port
+(:func:`onnxsim.quantize_weight_only_nf4_cpp`, which folds the round trip
+directly into a replacement float32 initializer instead of building this
+module's own Gather/Reshape/Mul graph) whenever it's called with the
+default ``block_size``/``skip_names`` -- the common case. A non-default
+``block_size`` or a real ``skip_names`` value (needed by, e.g.,
+:func:`onnxsim.lora.apply_qlora`'s own real per-adapter exclusion) falls
+back to this module's own original pure-Python implementation below, which
+the C++ port does not (yet) generalize to.
 """
 
 from __future__ import annotations
@@ -54,6 +58,7 @@ import onnx.helper
 import onnx.numpy_helper
 
 from onnxsim.bias_correction import _all_names, _unique_name
+from onnxsim.onnx_simplifier import quantize_weight_only_nf4_cpp
 
 # bitsandbytes' own NF4 codebook (`bitsandbytes/functional.py`'s
 # `create_normal_map`/hardcoded NF4 table) -- the 16 quantile points of a
@@ -77,6 +82,8 @@ NF4_CODEBOOK: List[float] = [
     0.7229568362236023,
     1.0,
 ]
+
+_DEFAULT_BLOCK_SIZE = 64
 
 
 def _match_matmul_like(node: onnx.NodeProto):
@@ -111,10 +118,6 @@ def _match_matmul_like(node: onnx.NodeProto):
 
 def _nearest_codebook_index(normalized: np.ndarray) -> np.ndarray:
     codebook = np.asarray(NF4_CODEBOOK, dtype=np.float64)
-    # [..., 16] absolute differences -> nearest index per element. Blocks
-    # are small (tens of thousands of elements at most for any single
-    # layer), so a dense (E, 16) distance matrix is cheap; no need for a
-    # sorted-codebook binary search.
     diffs = np.abs(normalized[..., np.newaxis] - codebook)
     return np.argmin(diffs, axis=-1).astype(np.uint8)
 
@@ -136,35 +139,15 @@ def _quantize_nf4_blockwise(
     return codes.reshape(n, k), scale
 
 
-def quantize_weight_only_nf4(
+def _quantize_weight_only_nf4_python(
     model: Union[str, onnx.ModelProto],
-    block_size: int = 64,
-    skip_names: Optional[Iterable[str]] = None,
+    block_size: int,
+    skip_names: Optional[Iterable[str]],
 ) -> onnx.ModelProto:
-    """Quantizes every MatMul/vanilla-Gemm layer with a constant 2-D
-    float32 weight (whose reduction dimension ``K`` is evenly divisible by
-    ``block_size``) into bitsandbytes' NF4 format -- see this module's own
-    docstring for the technique. Needs no calibration data: every
-    quantization decision comes from the weight tensor's own values
-    against NF4's fixed codebook.
-
-    :param model: the original (unquantized) onnx ModelProto or file path
-    :param block_size: elements per (output-channel, block) scale group
-            along the reduction dimension; bitsandbytes' own QLoRA default
-            is 64 (versus 32 for onnxsim's uniform-grid INT4 schemes)
-    :param skip_names: weight initializer names to leave unquantized even
-            if otherwise eligible -- e.g. QLoRA's own low-rank adapter
-            weights, which the recipe keeps at full precision and would
-            otherwise get caught here too (a LoRA branch is itself a plain
-            MatMul against a small 2-D initializer, indistinguishable from
-            any other layer's weight by shape alone)
-    :returns: ``model`` with every matched layer's weight replaced by
-            ``Mul(Reshape(Gather(codebook, Cast(Wq, INT64)), ...), Ws) ->
-            Reshape(..., original shape)`` feeding the original MatMul/Gemm
-            node -- ordinary ONNX ops only, no contrib op and no minimum
-            opset beyond what ``Gather``/``Cast``/``Reshape``/``Mul``
-            themselves need (opset 11+). Layers with a non-constant,
-            non-2-D, or non-block-divisible weight are left untouched.
+    """This module's own original pure-Python implementation -- kept as a
+    fallback for a non-default ``block_size``/``skip_names`` the C++ port
+    doesn't (yet) generalize to. See :func:`quantize_weight_only_nf4`'s own
+    docstring.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -308,3 +291,44 @@ def quantize_weight_only_nf4(
                 node.input[i] = dq_out
 
     return out
+
+
+def quantize_weight_only_nf4(
+    model: Union[str, onnx.ModelProto],
+    block_size: int = _DEFAULT_BLOCK_SIZE,
+    skip_names: Optional[Iterable[str]] = None,
+) -> onnx.ModelProto:
+    """Quantizes every MatMul/vanilla-Gemm layer with a constant 2-D
+    float32 weight (whose reduction dimension ``K`` is evenly divisible by
+    ``block_size``) into bitsandbytes' NF4 format -- see this module's own
+    docstring for the technique. Needs no calibration data: every
+    quantization decision comes from the weight tensor's own values
+    against NF4's fixed codebook.
+
+    Delegates to the verified C++ port
+    (:func:`onnxsim.quantize_weight_only_nf4_cpp`) when called with the
+    default ``block_size=64``/``skip_names=None``; a non-default
+    ``block_size`` or a real ``skip_names`` value falls back to this
+    module's own original pure-Python implementation, which the C++ port
+    does not (yet) generalize to (see :func:`onnxsim.lora.apply_qlora` for
+    a real caller that needs both).
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param block_size: elements per (output-channel, block) scale group
+            along the reduction dimension; bitsandbytes' own QLoRA default
+            is 64 (versus 32 for onnxsim's uniform-grid INT4 schemes)
+    :param skip_names: weight initializer names to leave unquantized even
+            if otherwise eligible -- e.g. QLoRA's own low-rank adapter
+            weights, which the recipe keeps at full precision and would
+            otherwise get caught here too (a LoRA branch is itself a plain
+            MatMul against a small 2-D initializer, indistinguishable from
+            any other layer's weight by shape alone)
+    :returns: ``model`` with every matched layer's weight replaced by
+            its NF4 round trip; layers with a non-constant, non-2-D, or
+            non-block-divisible weight are left untouched.
+    """
+    if block_size == _DEFAULT_BLOCK_SIZE and skip_names is None:
+        if isinstance(model, str):
+            model = onnx.load(model, load_external_data=False)
+        return quantize_weight_only_nf4_cpp(model)
+    return _quantize_weight_only_nf4_python(model, block_size, skip_names)
