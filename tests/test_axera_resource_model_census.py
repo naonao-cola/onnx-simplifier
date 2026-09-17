@@ -110,14 +110,67 @@ register or bank appearing in every fixture could still be assigned to
 different *content* on different builds of the identical graph, which
 this file does not check. It is a first, purely empirical map of what
 exists and how often, not of what determines placement.
+
+## A note on corpus-size fragility (fixed here)
+
+This file originally pinned every aggregate to the exact fixture count
+at the time it was written (306, then hand-bumped to 310, 318, 322 as
+later PRs added fixtures). That turned out to be a real, recurring
+maintenance problem, not a one-off: PR #1568 had to bump these counts,
+PR #1570 had to bump them again (finding a *second* round of silent
+drift that had happened in between with no test catching it), and PR
+#1571 hit an actual git merge conflict against PR #1570's own count
+bump -- both PRs independently "fixed" the same hardcoded numbers to
+different, both slightly-stale values, resolved only by recomputing
+the true numbers directly against the final combined fixture set
+rather than trusting either side.
+
+The fix applied here: assertions that exist to catch a *structural*
+regression (a core bank stops appearing in every fixture; the register
+space collapses to a handful) now compare against `_CENSUS["n_fixtures"]`
+computed live, or use a ratio/threshold that scales with corpus size,
+instead of a hardcoded absolute number. Assertions whose only content
+*was* "how many fixtures exist right now" are loosened to floor
+checks (the corpus should only grow) rather than deleted, so a
+fixture accidentally going missing is still caught. The "sparse"
+bucket's own boundary (previously the pinned constant `<=9` fixtures
+for banks, `<=3` for registers) is now derived from the live fixture
+count via a fixed *fraction* (3% for banks, 1% for registers -- chosen
+to reproduce the exact same boundary, 9 and 3, at both the 306- and
+322-fixture corpus sizes this project has already passed through), so
+adding fixtures no longer requires touching this file at all unless a
+genuinely new structural pattern emerges (a bank/register crossing a
+bucket boundary is still visible in the *aggregate* counts these tests
+check, just no longer as a hardcoded number that has to be hand-edited
+in lockstep with every fixture-adding PR).
 """
 
 import glob
 import gzip
+import math
 import os
 import sys
 import unittest
 from collections import Counter, defaultdict
+
+# Mirrored in tests/test_axera_sparse_resource_clustering.py -- both
+# files classify "sparse" banks/registers the same way, and
+# TestSparseBanksAreMostlyMultiFamily.test_sparse_bank_count_matches_pr1563
+# there depends on this file's own definition matching. Chosen to
+# reproduce the project's original pinned thresholds (<=9 fixtures for
+# banks, <=3 for registers) at both the 306-fixture corpus these were
+# first measured against and the 322-fixture corpus as of PR #1570.
+BANK_SPARSE_MAX_FRACTION = 0.03
+REG_SPARSE_MAX_FRACTION = 0.01
+
+
+def _bank_sparse_threshold(n_fixtures):
+    return math.floor(BANK_SPARSE_MAX_FRACTION * n_fixtures)
+
+
+def _reg_sparse_threshold(n_fixtures):
+    return math.floor(REG_SPARSE_MAX_FRACTION * n_fixtures)
+
 
 _AXERA_DIR = os.path.join(os.path.dirname(__file__), "..", "scripts", "axera")
 if _AXERA_DIR not in sys.path:
@@ -177,20 +230,21 @@ _CENSUS = _census()
 
 
 class TestFixtureCorpusSize(unittest.TestCase):
-    def test_306_fixtures_all_decode_cleanly(self):
-        # Corpus grew 306 -> 310 (PR #1568, 4 new bank-0x81/0xe1 boundary
-        # fixtures) -> 318 (other PRs merged in between that didn't touch
-        # this file's own counts) -> 322 (PR #1570's 4 new large-N Gemm
-        # fixtures, decoding bank 0x81's field=192 operand) -> 327 (this
-        # PR's own 5 new gemm_1x256x{16,32,32_rebuild,33,33_rebuild}
-        # fixtures, testing K-independence of the N=32/33 boundary).
-        # Recomputed directly against the merged fixture set rather than
-        # trusting either PR's own count in isolation, since #1570 and
-        # this PR each grew the corpus independently before either
-        # landed on top of the other. Method name kept as-is (matches
-        # this file's own established "N fixtures" naming convention
-        # elsewhere) rather than renamed on every corpus change.
-        self.assertEqual(_CENSUS["n_fixtures"], 327)
+    def test_fixtures_all_decode_cleanly(self):
+        # `_census()` above already raises if any committed fixture
+        # fails to decode -- reaching this assertion at all is the real
+        # test. The exact fixture count is not a claim this test needs
+        # to make; it's tracked here only as a floor (corpus growth is
+        # expected and fine, corpus *shrinkage* -- e.g. an accidentally
+        # deleted fixture -- is the real regression to catch). This
+        # used to be a hardcoded exact count (306 -> 310 -> 318 -> 322
+        # -> 327, most recently PR #1571's own 5 new K-boundary Gemm
+        # fixtures) that needed a manual bump on nearly every
+        # fixture-adding PR -- including one real merge conflict
+        # between #1570 and #1571 bumping the same number differently;
+        # see the module docstring's "corpus-size fragility" section
+        # for why that was dropped in favor of a floor.
+        self.assertGreaterEqual(_CENSUS["n_fixtures"], 327)
 
 
 class TestFieldOffsetGranularity(unittest.TestCase):
@@ -203,49 +257,88 @@ class TestFieldOffsetGranularity(unittest.TestCase):
 
 
 class TestBankCensus(unittest.TestCase):
-    def test_39_distinct_banks_total(self):
-        self.assertEqual(len(_CENSUS["bank_field_counts"]), 39)
+    def test_at_least_39_distinct_banks_total(self):
+        # Was exactly 39 at the 322-fixture corpus; a floor rather than
+        # an exact count since a new fixture can introduce a bank this
+        # corpus has never seen (this has already happened repeatedly
+        # as the corpus grew -- there's no reason to expect it's done).
+        self.assertGreaterEqual(len(_CENSUS["bank_field_counts"]), 39)
 
     def test_core_banks_0_to_4_are_universal(self):
         for bank in (0x00, 0x01, 0x02, 0x03, 0x04):
             self.assertEqual(
                 len(_CENSUS["bank_fixture_set"][bank]),
-                327,
+                _CENSUS["n_fixtures"],
                 f"bank {bank:#04x} should appear in every fixture",
             )
 
     def test_four_additional_banks_are_also_near_universal(self):
         """Not previously singled out by the README's own two-model
         sample as "core" the way 1-4 were -- a new finding from this
-        wider corpus."""
+        wider corpus. "Near-universal" tolerates being absent from at
+        most one fixture (computed against the live fixture count, not
+        a hardcoded number, since these two are anchored to the same
+        underlying property)."""
         for bank in (0x0E, 0x0F, 0x1C, 0x1E):
-            self.assertGreaterEqual(len(_CENSUS["bank_fixture_set"][bank]), 305)
+            self.assertGreaterEqual(
+                len(_CENSUS["bank_fixture_set"][bank]), _CENSUS["n_fixtures"] - 1
+            )
 
     def test_most_banks_are_sparse(self):
-        # Was 21 of 39 at the original 306-fixture corpus
-        # (tests/test_axera_resource_model_census.py's own original PR
-        # #1563). tests/test_axera_gemm_sparse_bank_n_boundary.py's 2
-        # new bank-0x81 carriers push that bank from 8 to 10 fixtures,
-        # crossing out of this <=9 bucket -- 20 of 39 now.
+        # Was pinned to an exact "20 of 39" at the 322-fixture corpus
+        # (originally "21 of 39" at 306, hand-bumped once already when
+        # bank 0x81 crossed out of the sparse bucket). The *exact*
+        # count of sparse banks drifts every time a fixture pushes some
+        # bank across the threshold -- not a useful thing to pin. What
+        # this test actually claims -- that bank usage is bimodal, a
+        # small core plus a long sparse tail -- survives as a majority
+        # check instead: most banks should be sparse under the shared
+        # ratio-based threshold (see module docstring).
+        threshold = _bank_sparse_threshold(_CENSUS["n_fixtures"])
         sparse = [
-            b for b, fixset in _CENSUS["bank_fixture_set"].items() if len(fixset) <= 9
+            b
+            for b, fixset in _CENSUS["bank_fixture_set"].items()
+            if len(fixset) <= threshold
         ]
-        self.assertEqual(
-            len(sparse), 20, "20 of 39 banks should be sparse (<=9 fixtures)"
+        self.assertGreater(
+            len(sparse),
+            len(_CENSUS["bank_field_counts"]) / 2,
+            f"most banks should be sparse (<= {threshold} fixtures, i.e. "
+            f"<={BANK_SPARSE_MAX_FRACTION:.0%} of the corpus)",
         )
 
 
 class TestRegisterCensus(unittest.TestCase):
-    def test_247_distinct_registers_total(self):
-        self.assertEqual(len(_CENSUS["reg_counts"]), 247)
+    def test_richer_than_a_small_fixed_register_set(self):
+        # Was pinned to exactly 247 at the 322-fixture corpus. The
+        # precise count isn't a load-bearing claim -- what matters is
+        # that the register space is genuinely large (hundreds), not a
+        # small fixed handful, which is what motivates treating the
+        # 36-register "universal" set below as meaningfully small by
+        # comparison. A generous floor preserves that claim without
+        # needing an edit on every corpus change.
+        self.assertGreater(len(_CENSUS["reg_counts"]), 100)
 
-    def test_exactly_36_registers_are_universal(self):
+    def test_known_universal_registers_stay_universal(self):
+        # Originally an exact-set-equality check pinned to the 36
+        # registers observed universal at the 322-fixture corpus. That
+        # is too strict for a growing corpus: a new fixture could
+        # legitimately introduce a 37th register that also happens to
+        # be universal (an addition, not a regression) without this
+        # project's actual claim -- "these particular registers are
+        # foundational, present in literally every build" -- being
+        # violated. Converted to a subset check: every one of the
+        # already-known-universal registers must REMAIN universal (a
+        # real regression -- one of these disappearing from even a
+        # single fixture -- still fails loudly); new registers joining
+        # the universal set as the corpus grows is not asserted against
+        # either way.
         universal = {
             r
             for r, fixset in _CENSUS["reg_fixture_set"].items()
             if len(fixset) == _CENSUS["n_fixtures"]
         }
-        expected = {
+        known_universal = {
             0,
             2,
             7,
@@ -283,26 +376,36 @@ class TestRegisterCensus(unittest.TestCase):
             128,
             138,
         }
-        self.assertEqual(universal, expected)
+        self.assertTrue(
+            known_universal <= universal,
+            f"registers no longer universal: {known_universal - universal}",
+        )
 
-    def test_reg8_is_the_heaviest_universal_register(self):
-        # Was 27,369 at the original 306-fixture corpus, growing through
-        # 27,601 (310, PR #1568) and 28,346 (322, PR #1570's larger Gemm
-        # fixtures) to this value at 327 fixtures (this PR's own 5 new
-        # K=256-boundary fixtures added on top). Recomputed directly
-        # against the merged fixture set (28,636), not trusted from
-        # either PR's own isolated guess -- #1570's own 28,346 and this
-        # PR's own 28,285 were both computed against different,
-        # incomplete corpus snapshots and neither was correct once
-        # combined.
-        self.assertEqual(_CENSUS["reg_counts"][8], 28636)
+    def test_reg8_is_the_heaviest_universal_register_by_a_wide_margin(self):
+        # Was pinned to an exact use-count (27,369 -> 27,601 -> 28,346
+        # -> 28,636 across four separate corpus-growth bumps, the last
+        # one itself the product of a real merge conflict between PR
+        # #1570 and PR #1571 independently guessing this number). The
+        # actual claim -- reg=8 so dominates usage that it's not a
+        # coincidence of corpus composition -- survives as a ratio
+        # check instead: at the 327-fixture corpus reg=8 is used ~4.4x
+        # more than the next busiest universal register (reg=10). A 3x
+        # floor keeps real margin for corpus growth to shift the exact
+        # ratio without losing the substance of the claim.
         counts = _CENSUS["reg_counts"]
         universal = {
             r
             for r, fixset in _CENSUS["reg_fixture_set"].items()
             if len(fixset) == _CENSUS["n_fixtures"]
         }
-        self.assertEqual(max(universal, key=lambda r: counts[r]), 8)
+        ranked = sorted(universal, key=lambda r: -counts[r])
+        self.assertEqual(ranked[0], 8)
+        self.assertGreater(
+            counts[ranked[0]],
+            3 * counts[ranked[1]],
+            "reg=8 should dominate the next-heaviest universal register"
+            " by a wide margin, not just edge it out",
+        )
 
     def test_small_registers_skew_toward_higher_presence_but_not_cleanly(self):
         """Small register numbers (<=0x40) average higher corpus-wide
@@ -337,15 +440,28 @@ class TestRegisterCensus(unittest.TestCase):
             " universal set, showing magnitude alone doesn't determine it",
         )
 
-    def test_67_registers_are_sparse(self):
-        # Was 67 at the 310-fixture corpus; one register that
-        # previously appeared in <=3 fixtures crossed above that
-        # threshold with this file's own new large-N Gemm fixtures,
-        # leaving 66 at 322 fixtures.
+    def test_a_large_fraction_of_registers_are_sparse(self):
+        # Was pinned to an exact count (67 -> 66 across one corpus
+        # growth bump already). Unlike banks (a bare majority, 20/39),
+        # sparse registers are a large minority (66/247, ~27%) rather
+        # than a majority -- the register space has a longer "middle
+        # tier" between the 36-register universal core and the sparse
+        # tail. The actual claim -- a large share of the 247-register
+        # space is rarely used, well beyond the 36-register universal
+        # core -- survives as a floor-fraction check under the shared
+        # ratio-based threshold instead of an exact pinned count.
+        threshold = _reg_sparse_threshold(_CENSUS["n_fixtures"])
         sparse = [
-            r for r, fixset in _CENSUS["reg_fixture_set"].items() if len(fixset) <= 3
+            r
+            for r, fixset in _CENSUS["reg_fixture_set"].items()
+            if len(fixset) <= threshold
         ]
-        self.assertEqual(len(sparse), 66)
+        self.assertGreater(
+            len(sparse),
+            len(_CENSUS["reg_counts"]) * 0.2,
+            f"a large fraction of registers should be sparse (<= {threshold}"
+            f" fixtures, i.e. <={REG_SPARSE_MAX_FRACTION:.0%} of the corpus)",
+        )
 
 
 if __name__ == "__main__":
