@@ -11,7 +11,7 @@ name: Backend Integration
 # tests/test_modelopt_integration.py, tests/test_mmdeploy_integration.py,
 # tests/test_jax_export_integration.py, tests/test_jax_real_model_integration.py,
 # tests/test_bev_models_torch_e2e.py, tests/test_optimum_export_deploy.py,
-# tests/test_export_transformers.py.
+# tests/test_export_transformers.py, tests/test_tpu_mlir_integration.py.
 # See docs/dlpack-executor.md, which frames
 # the DLPack executor boundary as an "embeddability" seam for stacks like these.
 # The xnnpack job below is the odd one out: it exercises
@@ -56,6 +56,7 @@ on:
       - "tests/_bev_torch_custom_ops.py"
       - "tests/test_optimum_export_deploy.py"
       - "tests/test_export_transformers.py"
+      - "tests/test_tpu_mlir_integration.py"
       - "onnxsim/transformers_export.py"
       - "onnxsim/passes/rewrite_msdeformattn_to_gridsample.h"
       - "onnxsim/passes/rewrite_deform_conv_to_gather.h"
@@ -137,6 +138,118 @@ jobs:
       - name: Run TVM integration tests
         working-directory: ${{ runner.temp }}
         run: pytest -v "$GITHUB_WORKSPACE/tests/test_tvm_integration.py"
+
+  tpu_mlir:
+    name: Simplify and run on tpu-mlir
+    # No `needs: build`: unlike every other job here, this one cannot use the
+    # shared onnxsim-wheel-backend artifact at all -- that wheel is built
+    # cp312-abi3 (see the `build` job's CIBW_BUILD above), and abi3 wheels are
+    # forward-compatible only (a cp312-abi3 wheel never installs on 3.10).
+    # tpu_mlir's own wheel is hard-pinned to Python 3.10
+    # (python_requires=">=3.10,<3.11" -- its compiled extensions are built
+    # only for that ABI), and onnxsim's pyproject.toml separately declares
+    # requires-python = ">=3.11", so no single prebuilt onnxsim wheel can ever
+    # satisfy both at once. That floor is a packaging/release-matrix choice,
+    # not a technical one, though: onnxsim's C++ extension (nanobind +
+    # vendored onnx/onnx-optimizer) builds and runs correctly under 3.10 when
+    # built directly against it (confirmed locally) -- so this job builds
+    # onnxsim from source against its own Python 3.10 instead of installing
+    # any prebuilt wheel, with `--ignore-requires-python` to bypass the
+    # declared (but not technically enforced) floor.
+    #
+    # tpu-mlir's own setup.py declares platforms="unbuntu22.04": its compiled
+    # tpuc-opt/pymlir native extensions are linked against Ubuntu 22.04's
+    # glibc/libstdc++ and segfault on a newer ABI (confirmed directly against
+    # ubuntu-24.04, the OS every other job in this workflow runs on -- with or
+    # without LD_LIBRARY_PATH tricks to mix vendored and host libraries: using
+    # the full vendored lib/third_party crashes any *freshly spawned* process
+    # (tpuc-opt shells out via os.system, and even /bin/sh itself fails to
+    # resolve GLIBC_2.38 against the vendored, older libc.so.6 it pulls in
+    # via LD_LIBRARY_PATH), while excluding just the vendored glibc/libstdc++
+    # in favor of the host's own makes tpuc-opt itself segfault outright (an
+    # ABI mismatch, not a missing symbol). A container pinned to the actual
+    # declared OS sidesteps this entirely, and is more durable than pinning a
+    # runs-on: ubuntu-22.04 runner label, since GitHub has been retiring older
+    # ubuntu-*.04 runner images over time.
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    timeout-minutes: 60
+    steps:
+      # The bare ubuntu:22.04 image has neither git, Python, nor a C compiler
+      # -- actions/checkout needs the former (it exec's a real git binary
+      # inside the container, unlike the runner-hosted jobs above where it's
+      # preinstalled). ubuntu:22.04 ships Python 3.10 as its default python3,
+      # exactly the one version tpu_mlir's wheel supports
+      # (python_requires=">=3.10,<3.11"). build-essential + python3-dev are
+      # needed both for pycocotools (a tpu_mlir[onnx] dependency with no
+      # prebuilt wheel for this platform, compiling a Cython extension
+      # against Python.h, not shipped by the bare python3 apt package) and
+      # for building onnxsim's own C++ extension below.
+      - name: Install git + Python 3.10 + build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git ca-certificates python3 python3-pip python3-venv python3-dev build-essential
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      # tpu_mlir's own [onnx] extra pins the only onnx/onnxruntime/onnxsim/
+      # numpy/protobuf combination it ships pre-verified against
+      # (onnx==1.14.1, onnxruntime==1.16.3, onnxsim==0.4.17, numpy==1.24.3,
+      # protobuf==3.20.3) -- installing plain `tpu_mlir` alone resolves a
+      # numpy/protobuf pair current `onnx` can't even import against
+      # (ml_dtypes needs numpy>=2, tpu_mlir's compiled extensions need
+      # numpy==1.24.3 exactly). Installing the [onnx] extra first gets a
+      # mutually-compatible baseline; the onnxsim build below then uses
+      # --no-deps so it doesn't drag its own numpy/onnx resolution back in
+      # and disturb that pinned set. transform.OnnxOpt (tpu_mlir's own
+      # runtime-value-driven ConstantFolding pass, run immediately around
+      # every onnxsim.simplify() call -- see the test module's docstring)
+      # unconditionally imports torch, which isn't part of the [onnx] extra.
+      # tpu_mlir.python.utils.mlir_shell (imported transitively by
+      # tools.model_transform, which the integration test imports directly)
+      # unconditionally imports psutil, which [onnx] also doesn't pull in.
+      - name: Install tpu_mlir[onnx] + torch
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --timeout 120 --retries 5 "tpu_mlir[onnx]"
+          python3 -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+          python3 -m pip install pytest psutil
+      # onnxsim's own onnx.inliner import (added in onnx 1.15) doesn't exist
+      # in tpu_mlir[onnx]'s pinned onnx==1.14.1, so bump onnx specifically --
+      # 1.17.0 is confirmed (locally) to still leave numpy==1.24.3/
+      # protobuf==3.20.3 untouched (unlike current onnx, whose ml_dtypes
+      # dependency wants numpy>=2). onnxsim's own onnxsim/deepseek_fp8.py also
+      # imports ml_dtypes unconditionally, but doesn't declare it as a
+      # dependency (it normally rides in transitively via onnx) -- pinned
+      # here explicitly at <0.6, the last line still importable under
+      # numpy==1.24.3 (0.6.0 requires numpy>=2, confirmed locally).
+      - name: Bump onnx for onnxsim's onnx.inliner import, pin a numpy-1.24-compatible ml_dtypes
+        run: python3 -m pip install "onnx==1.17.0" "ml_dtypes==0.5.1"
+      # Builds onnxsim's C++ extension directly against this container's
+      # Python 3.10 (see the job-level comment above for why no prebuilt
+      # wheel can be used here). Mirrors the `build` job's own
+      # CIBW_BEFORE_BUILD/CIBW_ENVIRONMENT: same build deps, same CMAKE_ARGS.
+      # --no-build-isolation reuses the nanobind/cmake/ninja installed here
+      # instead of pip silently fetching its own copies; --no-deps keeps
+      # tpu_mlir's pinned onnx/numpy alone; --ignore-requires-python bypasses
+      # the declared (but not technically enforced, see above) 3.11 floor.
+      - name: Build onnxsim from source against Python 3.10 (no prebuilt wheel fits)
+        env:
+          CMAKE_ARGS: -DONNX_USE_PROTOBUF_SHARED_LIBS=OFF
+        run: |
+          python3 -m pip install cmake ninja setuptools "nanobind>=2.12.0"
+          python3 -m pip install --no-build-isolation --no-deps --ignore-requires-python .
+      - name: Verify the built extension is used (not a stray source-tree import)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python3 -c "import tpu_mlir; print('tpu_mlir', tpu_mlir.__file__)"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run tpu-mlir integration tests
+        working-directory: ${{ runner.temp }}
+        run: python3 -m pytest -v "$GITHUB_WORKSPACE/tests/test_tpu_mlir_integration.py"
 
   halide:
     name: Simplify and run on Halide
