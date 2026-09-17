@@ -14,7 +14,14 @@
 //      button whatsoever, because the button only ever lived inside an
 //      already-attached annotation's own entry -- reported directly against
 //      the deployed page. See webgpu_kernel_annotations_view.mjs's own
-//      setSide/listConvNodeNames fix (the "Tune a Conv kernel" section).
+//      setSide/listAllNodeNames fix (the "Tune a kernel" section).
+//   C. A *non-Conv* op -- Gather, a real "memory operation" (its own
+//      isolated computation still needs a dedicated kernel, unlike a pure
+//      view op such as Reshape/Transpose -- see webgpu_kernel_tuner.mjs's
+//      own module docstring), proving the tuner's generalization beyond
+//      Conv (webgpu_node_tuning_gather_fixture.onnx, via
+//      make_webgpu_node_tuning_fixture.py) actually works end to end, not
+//      just for the op the original Conv-only implementation covered.
 //
 // Plus a third, separate check (runFullGraphScenario) for the "Tune full
 // graph" button: a model with *two* independent Conv nodes
@@ -78,6 +85,7 @@ const CONV3D_FIXTURE = CODEGEN_MANIFEST.conv3d;
 const TUNING_MANIFEST = JSON.parse(readFileSync(join(HERE, "webgpu_kernel_tuning_fixture.json"), "utf8"));
 const MULTI_CONV_FILE = "webgpu_kernel_tuning_multi_conv_fixture.onnx";
 const MULTI_CONV_MANIFEST = JSON.parse(readFileSync(join(HERE, "webgpu_kernel_tuning_multi_conv_fixture.json"), "utf8"));
+const GATHER_MANIFEST = JSON.parse(readFileSync(join(HERE, "webgpu_node_tuning_gather_fixture.json"), "utf8"));
 
 const SCENARIOS = [
   {
@@ -95,6 +103,14 @@ const SCENARIOS = [
     outputName: TUNING_MANIFEST.outputName,
     inputs: TUNING_MANIFEST.inputs,
     expectedOutput: TUNING_MANIFEST.expectedOutput.data,
+  },
+  {
+    label: "non-Conv op -- Gather (webgpu_node_tuning_gather_fixture.onnx) -- generalization",
+    file: "webgpu_node_tuning_gather_fixture.onnx",
+    nodeName: GATHER_MANIFEST.nodeName,
+    outputName: GATHER_MANIFEST.outputName,
+    inputs: GATHER_MANIFEST.inputs,
+    expectedOutput: GATHER_MANIFEST.expectedOutput.data,
   },
 ];
 
@@ -206,11 +222,32 @@ async function runScenario(page, port, scenario) {
       const specs = readWebgpuKernelSpecs(new Uint8Array(exportedBytesArray));
       const spec = [...specs.values()][0];
 
+      // Gather's own index input keeps its real "int64" dtype (see
+      // make_webgpu_node_tuning_fixture.py's own manifest comment) -- unlike
+      // every other (real float) input here, so it can't go through
+      // createStorageBuffer's Float32Array-only path: tinygrad's WGSL
+      // renderer represents a 64-bit integer buffer as two packed 32-bit
+      // words per element (low, high), exactly a BigInt64Array's own
+      // little-endian byte layout.
+      function createInt64StorageBuffer(device, values) {
+        const data = BigInt64Array.from(values, (v) => BigInt(Math.trunc(v)));
+        const buffer = device.createBuffer({
+          size: data.byteLength,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+          mappedAtCreation: true,
+        });
+        new BigInt64Array(buffer.getMappedRange()).set(data);
+        buffer.unmap();
+        return buffer;
+      }
+
       const adapter = await navigator.gpu.requestAdapter();
       const device = await adapter.requestDevice();
       const buffersByTensor = new Map();
-      for (const [name, { data }] of Object.entries(inputs)) {
-        buffersByTensor.set(name, createStorageBuffer(device, Float32Array.from(data)));
+      for (const [name, { data, dtype }] of Object.entries(inputs)) {
+        const buffer =
+          dtype === "int64" ? createInt64StorageBuffer(device, data) : createStorageBuffer(device, Float32Array.from(data));
+        buffersByTensor.set(name, buffer);
       }
       buffersByTensor.set(outputName, createStorageBuffer(device, new Float32Array(expectedLength)));
       await dispatchWebgpuProgram(device, spec, buffersByTensor, {});
@@ -339,6 +376,68 @@ async function runFullGraphScenario(page, port) {
   });
 }
 
+// Loads the same two-Conv-node model as runFullGraphScenario, clicks
+// "Profile graph…", and checks the profiler actually produced a real
+// per-node latency measurement for both nodes and picked a non-empty
+// dominant subset -- then clicks "Tune dominant ops only" and checks that
+// subset actually got tuned. Doesn't assert *which* node is dominant (real
+// GPU timing on a software-rendered CI device is too noisy to pin down
+// reliably) -- only that the whole profile -> select -> tune-a-subset
+// pipeline actually runs end to end and produces real results.
+async function runProfileScenario(page, port) {
+  console.log(`\n-- scenario: Profile graph (${MULTI_CONV_FILE}, two independent Conv nodes) --`);
+  const modelBytes = new Uint8Array(readFileSync(join(HERE, MULTI_CONV_FILE)));
+  await page.evaluate(
+    ({ bytes, name }) => window.webgpuKernelsShowBefore(new Uint8Array(bytes), name),
+    { bytes: Array.from(modelBytes), name: MULTI_CONV_FILE },
+  );
+
+  const profileSelector = '#webgpu-kernels-content button[data-action="profile-graph"]';
+  await check("[profile] the panel shows a 'Profile graph…' button", async () => {
+    await page.waitForSelector(profileSelector, { timeout: 10_000 });
+  });
+
+  console.log("Clicking 'Profile graph…'...");
+  await page.click(profileSelector);
+
+  const tuneDominantSelector = '#webgpu-kernels-content button[data-action="tune-dominant"]';
+  await page.waitForSelector(tuneDominantSelector, { timeout: 180_000 });
+
+  const profileResult = await page.evaluate(() => window.__wkLastProfileResult);
+
+  await check("[profile] both Conv nodes got a real latency measurement", () => {
+    assert.ok(profileResult, "window.__wkLastProfileResult was never set");
+    assert.deepEqual(
+      profileResult.results.map((r) => r.nodeName).sort(),
+      ["conv_a", "conv_b"],
+    );
+    for (const r of profileResult.results) {
+      assert.equal(r.skipped, false, `${r.nodeName} was skipped: ${r.error}`);
+      assert.ok(Number.isFinite(r.medianMs) && r.medianMs >= 0, `${r.nodeName} has no real medianMs`);
+    }
+  });
+
+  await check("[profile] a non-empty dominant subset was selected", () => {
+    assert.ok(profileResult.dominant.length > 0);
+    for (const nodeName of profileResult.dominant) {
+      assert.ok(["conv_a", "conv_b"].includes(nodeName));
+    }
+  });
+
+  console.log(`Clicking 'Tune dominant ops only' (${profileResult.dominant.join(", ")})...`);
+  await page.click(tuneDominantSelector);
+  await page.waitForSelector('#webgpu-kernels-content button[data-action="export-full-graph"]', { timeout: 180_000 });
+
+  const fgResult = await page.evaluate(() => window.__wkLastFullGraphTuneResult);
+  await check("[profile] 'Tune dominant ops only' tuned exactly the dominant subset", () => {
+    assert.deepEqual(fgResult.nodeNames.sort(), [...profileResult.dominant].sort());
+    for (const nodeName of fgResult.nodeNames) {
+      const r = fgResult.results[nodeName];
+      assert.equal(r.status, "done", `node ${nodeName} did not finish tuning: ${JSON.stringify(r)}`);
+    }
+  });
+}
+
 async function main() {
   console.log("WebGPU kernel tuner UI check (real Pyodide + tinygrad + WebGPU)");
 
@@ -360,6 +459,7 @@ async function main() {
       await runScenario(page, port, scenario);
     }
     await runFullGraphScenario(page, port);
+    await runProfileScenario(page, port);
 
     await page.close();
   } finally {

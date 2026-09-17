@@ -324,6 +324,43 @@ export function listConvNodeNames(modelBytes) {
 }
 
 /**
+ * Every node's own ``NodeProto.name``/``op_type``/``domain``, in graph node
+ * order, alongside its own position (``index``) -- the "what could I offer
+ * to tune" list for webgpu_kernel_tuner.mjs's generalized ``tuneNodeKernel``,
+ * which tunes a node of *any* op type (not just Conv -- see that module's
+ * own docstring for how, via tinygrad's own generic ``OnnxRunner`` op
+ * table). ``index`` is the node's position among ``GraphProto.node``,
+ * needed to locate it inside tinygrad's own ``OnnxRunner.graph_nodes`` tuple
+ * (which iterates that exact same repeated field, in the same order, so the
+ * two indices always agree) -- ``OnnxNode`` itself carries no name at all,
+ * only ``listAllNodeNames``'s own hand-rolled read of the raw ``NodeProto``
+ * does.
+ *
+ * Like ``listConvNodeNames``, this doesn't require the node to already carry
+ * any attached kernel metadata, or validate that tuning it will actually
+ * succeed (non-static shapes, an op tinygrad's ``OnnxRunner`` doesn't
+ * support, more than one scheduled kernel call, ...) -- ``tuneNodeKernel``
+ * raises its own clear error for any of that once a caller actually tries.
+ *
+ * @param {Uint8Array} modelBytes
+ * @returns {Array<{name: string, opType: string, domain: string, index: number}>}
+ */
+export function listAllNodeNames(modelBytes) {
+  const r = new Reader(modelBytes);
+  let graph = null;
+  while (!r.eof()) {
+    const { field, wireType } = r.readTag();
+    if (field === 7 && wireType === WIRE_LEN) {
+      graph = readGraph(r.readLenDelimited());
+    } else {
+      r.skip(wireType);
+    }
+  }
+  if (!graph) return [];
+  return graph.nodes.map((n, index) => ({ name: n.name, opType: n.opType, domain: n.domain, index }));
+}
+
+/**
  * Reads everything ``onnxsim.webgpu_tinygrad_codegen.generate_conv_kernel``
  * itself reads off a ``Conv`` node -- shapes (initializer or graph-input
  * only, see this file's own docstring), attributes (with the same defaults
