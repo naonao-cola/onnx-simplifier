@@ -1,0 +1,205 @@
+name: Renesas Integration
+
+# Checks onnxsim's output against the ONNX-frontend admission gate of
+# Renesas RZ/V's DRP-AI TVM (see scripts/renesas/README.md). Nothing here
+# covers R-Car's Hybrid Compiler at all -- its GitHub repo is docs-only,
+# with no code or op-support data to check against (see that README).
+#
+# `op-support-check` is the static leg: scripts/renesas/drp_ai_tvm_ops.py's
+# data, scraped once from a local apache/tvm v0.8 checkout (the exact
+# version renesas-rz/rzv_drp-ai_tvm pins as its `tvm` git submodule) and
+# committed. No TVM build, runs on any stock runner.
+#
+# `real-tvm-v08-frontend` is the real thing: it actually builds Apache TVM
+# v0.8 from source (Apache-2.0, no Renesas account needed -- this is *not*
+# the same as DRP-AI hardware acceleration or the gated DRP-AI Translator,
+# which stay entirely out of reach here; see scripts/renesas/README.md and
+# tvm_v08_frontend_backend.py's docstring for exactly where that line is)
+# and cross-checks the scraped data against tvm.relay.frontend.onnx's live
+# `_get_convert_map()`, plus feeds it a real onnxsim.simplify() output.
+#
+# TVM v0.8 needs Python <=3.8 (apache/tvm's own v0.8-tagged
+# docs/install/from_source.rst) while this repo needs Python >=3.11
+# (pyproject.toml) -- the two can't share an interpreter. `gen-fixtures`
+# (Python >=3.11, has onnxsim) produces plain .onnx files and hands them to
+# `real-tvm-v08-frontend` (Python 3.8, has TVM, never imports onnxsim) as a
+# build artifact -- see scripts/renesas/gen_simplify_fixtures.py's
+# docstring.
+#
+# apache/tvm's C++ build needs llvm-*-dev's static archives (not just the
+# runtime .so) to satisfy `llvm-config --libfiles` -- confirmed by actually
+# running `cmake -G Ninja ..` against a real v0.8 checkout while writing
+# this workflow, which is also how `set(USE_LLVM llvm-config-14)` (an
+# explicit binary path, not bare `ON`) was settled on: apache/tvm's own
+# docs recommend this form when config-file-based LLVM discovery isn't set
+# up. gcc-11 (Ubuntu 22.04's stock build-essential) is used rather than
+# renesas-rz/rzv_drp-ai_tvm's own Dockerfile's gcc-13 -- apache/tvm's docs
+# only require "g++-5 or higher" for this build, and Jammy's default
+# toolchain clears that without adding a PPA.
+#
+# Not run as blocking on every PR: a from-source TVM C++ build is real CI
+# time, not a quick pip install (no apache-tvm PyPI wheel goes back to
+# 0.8 -- PyPI starts at 0.25). Path-triggered on PRs that touch this area,
+# plus a weekly schedule and workflow_dispatch, the same pattern
+# amd-integration.yml/axera-integration.yml use for their own real-backend
+# jobs.
+
+on:
+  schedule:
+    - cron: "0 8 * * 1" # Mondays 08:00 UTC (weekly)
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - ".github/workflows/renesas-integration.yml"
+      - "scripts/renesas/**"
+      - "tests/test_renesas_*.py"
+
+concurrency:
+  group: renesas-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build onnxsim wheel
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Build cp312 wheel
+        uses: pypa/cibuildwheel@v4.2.1
+        env:
+          CIBW_BUILD: "cp312-manylinux_x86_64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel-renesas
+          path: ./wheelhouse/*.whl
+
+  op-support-check:
+    name: DRP-AI TVM op-support data check (static, no build)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-renesas
+          path: wheelhouse
+      - name: Install onnxsim wheel + test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest onnx
+          python -m pip install wheelhouse/*.whl
+      # Run from runner.temp, not the checkout -- same guard the EP/Axera
+      # workflows use: the repo root's `onnxsim/` source dir would shadow
+      # the installed wheel on `import onnxsim`.
+      - name: Run scraped-data / simulator tests
+        working-directory: ${{ runner.temp }}
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_renesas_drp_ai_tvm_op_support.py"
+
+  gen-fixtures:
+    name: Generate onnxsim before/after ONNX fixtures
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-renesas
+          path: wheelhouse
+      - name: Install onnxsim wheel + deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy onnx
+          python -m pip install wheelhouse/*.whl
+      - name: Generate fixtures
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir -p fixtures
+          python "$GITHUB_WORKSPACE/scripts/renesas/gen_simplify_fixtures.py" fixtures
+      - uses: actions/upload-artifact@v7
+        with:
+          name: renesas-simplify-fixtures
+          path: ${{ runner.temp }}/fixtures/*.onnx
+
+  real-tvm-v08-frontend:
+    name: Real TVM v0.8 ONNX frontend cross-check
+    needs: gen-fixtures
+    runs-on: ubuntu-24.04
+    # Pins the guest OS to the exact Ubuntu 22.04 apt repos (llvm-14's
+    # native availability, matching renesas-rz/rzv_drp-ai_tvm's own
+    # Dockerfile) rather than pinning the `ubuntu-22.04` runner label
+    # itself, which GitHub has been retiring -- same pattern
+    # backend-integration.yml uses for an equivalent reason.
+    container: ubuntu:22.04
+    timeout-minutes: 90
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.8"
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Install TVM v0.8 build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git ca-certificates \
+            libtinfo-dev zlib1g-dev libedit-dev libxml2-dev \
+            llvm-14 llvm-14-dev
+      - name: Clone apache/tvm at the v0.8 tag renesas-rz/rzv_drp-ai_tvm pins
+        run: |
+          git clone --depth 1 --branch v0.8 --recursive https://github.com/apache/tvm.git /tmp/tvm-v0.8
+      - name: Configure and build libtvm.so / libtvm_runtime.so
+        working-directory: /tmp/tvm-v0.8
+        run: |
+          mkdir build
+          cp cmake/config.cmake build/
+          echo 'set(USE_LLVM llvm-config-14)' >> build/config.cmake
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          cmake --build build --target tvm tvm_runtime
+      - name: Install TVM's Python package
+        working-directory: /tmp/tvm-v0.8/python
+        run: python3 -m pip install -e .
+      - name: Install test deps
+        # pytest>=8 dropped Python 3.8 support -- TVM v0.8 needs <=3.8 (see
+        # this workflow's top-level comment), so this leg pins pytest<8.
+        run: python3 -m pip install "pytest<8" onnx
+      - uses: actions/download-artifact@v8
+        with:
+          name: renesas-simplify-fixtures
+          path: /tmp/renesas-fixtures
+      - name: Show environment
+        run: python3 -c "import tvm; print('tvm', tvm.__version__)"
+      - name: Run real-frontend cross-check tests
+        env:
+          RENESAS_SIMPLIFY_FIXTURE_DIR: /tmp/renesas-fixtures
+        run: python3 -m pytest -v tests/test_renesas_drp_ai_tvm_real_frontend.py
