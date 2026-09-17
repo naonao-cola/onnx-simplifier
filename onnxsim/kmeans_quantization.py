@@ -104,48 +104,6 @@ def _kmeans_1d(
     return centroids, assignments
 
 
-def _kmeans_1d(
-    values: np.ndarray, k: int, iters: int, seed: int
-) -> "tuple[np.ndarray, np.ndarray]":
-    """Ordinary Lloyd's-algorithm k-means over a flat array of scalar
-    values. Returns ``(centroids, assignments)``: ``k`` fitted cluster
-    centers and, for each element of ``values``, its nearest centroid's
-    index.
-
-    Centroids are initialized at ``k`` evenly-spaced percentiles of
-    ``values`` itself (not uniformly random) -- a deterministic choice
-    that already roughly matches the data's own distribution shape,
-    converging in far fewer iterations than random initialization would
-    for the skewed, near-zero-centered distributions real weight tensors
-    have.
-    """
-    rng = np.random.default_rng(seed)
-    percentiles = np.linspace(0, 100, k)
-    centroids = np.unique(np.percentile(values, percentiles))
-    if centroids.shape[0] < k:
-        extra = rng.choice(values, size=k - centroids.shape[0], replace=True)
-        centroids = np.concatenate([centroids, extra])
-    centroids = centroids.astype(np.float64)
-
-    assignments = np.zeros(values.shape[0], dtype=np.int64)
-    for _ in range(iters):
-        distances = np.abs(values[:, np.newaxis] - centroids[np.newaxis, :])
-        assignments = np.argmin(distances, axis=1)
-        new_centroids = centroids.copy()
-        for c in range(k):
-            mask = assignments == c
-            if mask.any():
-                new_centroids[c] = values[mask].mean()
-        if np.allclose(new_centroids, centroids):
-            centroids = new_centroids
-            break
-        centroids = new_centroids
-
-    distances = np.abs(values[:, np.newaxis] - centroids[np.newaxis, :])
-    assignments = np.argmin(distances, axis=1)
-    return centroids, assignments
-
-
 def quantize_weight_only_kmeans(
     model: Union[str, onnx.ModelProto],
     bits: int = 4,
