@@ -167,8 +167,7 @@ build or a null-pointer check.
 This makes `GetXnnpackModelExecutor()` an explicitly opt-in *alternative*
 executor (pass it to `Simplify` instead of `GetBuiltinModelExecutor()` when
 you specifically want XNNPACK — e.g. to test XNNPACK embeddability the same
-way `tests/test_tinygrad_integration.py` / `test_nncase_integration.py` test
-those backends), not a general-purpose replacement: swapping it in for a
+way `tests/test_tinygrad_integration.py` tests that backend), not a general-purpose replacement: swapping it in for a
 model using an unsupported op fails constant folding outright rather than
 falling back. `onnxsim/xnnpack_executor_test.cpp` exercises it end to end
 (each supported op, a two-node chain, quantize/dequantize round trips,
@@ -273,22 +272,13 @@ Consequences for the design:
   so the test ships a small ONNX-subset-to-Halide lowering and checks that
   onnxsim's simplified output still lowers, compiles, and computes the same
   result as onnx's reference evaluator.
-- `tests/test_nncase_integration.py` (+ `.github/workflows/backend-integration.yml`) —
-  the same embeddability claim exercised against
-  [nncase](https://github.com/kendryte/nncase), the model compiler for the
-  Kendryte K230 / K510 processors (and a generic `cpu` target). nncase imports
-  an ONNX `ModelProto` directly, compiles it, and can evaluate the compiled
-  module, so the test feeds onnxsim's simplified output into nncase and checks
-  it still imports, compiles, and computes the same result. Every op the test
-  models use is drawn from nncase's supported-ops list
-  (<https://github.com/kendryte/nncase/blob/master/docs/onnx_ops.md>).
 - `tests/test_tinygrad_integration.py` (+ `.github/workflows/backend-integration.yml`) —
   the same embeddability claim exercised against
   [tinygrad](https://github.com/tinygrad/tinygrad)'s own `OnnxRunner`
   (`tinygrad.nn.onnx.OnnxRunner`), which imports and eagerly executes an ONNX
   `ModelProto` directly -- no separate compile step, and no vendor hardware
   needed (it runs on tinygrad's own default backend, typically CPU/CLANG on an
-  ordinary CI runner). Like the nncase test, this feeds onnxsim's simplified
+  ordinary CI runner). This feeds onnxsim's simplified
   output straight into the target's native ONNX frontend and checks it still
   runs and computes the same result.
 

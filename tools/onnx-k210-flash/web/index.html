@@ -1,0 +1,130 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>onnx-k210-flash</title>
+<style>
+  body { font-family: monospace; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  #log { white-space: pre-wrap; background: #111; color: #0f0; padding: 1rem; height: 260px; overflow-y: auto; }
+  .note { font-size: 0.9em; color: #555; }
+  button:disabled { opacity: 0.5; }
+  table.candidates { border-collapse: collapse; width: 100%; margin-top: 0.5rem; font-size: 0.9em; }
+  table.candidates th, table.candidates td { border: 1px solid #ccc; padding: 0.35rem 0.5rem; text-align: left; }
+  table.candidates th { background: #f0f0f0; }
+</style>
+</head>
+<body>
+<h1>onnx-k210-flash</h1>
+<p class="note">
+  Flashes a firmware image to a Kendryte K210 board (M5StickV, Sipeed Maix
+  Amigo) over <a href="https://developer.chrome.com/docs/capabilities/serial" target="_blank" rel="noopener">Web Serial</a>,
+  using <code>k210_isp.mjs</code> -- a from-scratch port of
+  <a href="https://github.com/kendryte/kflash.py" target="_blank" rel="noopener">kflash.py</a>'s
+  ISP protocol. See <code>../README.md</code> for status (short version:
+  reviewed against kflash.py's source and unit-tested at the framing level,
+  <b>not yet run against a real board</b>).
+</p>
+
+<div class="step" style="border: 1px solid #888; border-radius: 6px; padding: 0.75rem 1rem; margin: 1rem 0;">
+  <h2 style="margin-top: 0;">Runtime firmware (flash once per board)</h2>
+  <p class="note">
+    <a href="../firmware/runtime/prebuilt/onnx-k210-runtime.bin" download>Download onnx-k210-runtime.bin</a>
+    -- a compiled, checksummed image (see <code>../firmware/runtime/README.md</code>)
+    that reads whatever model currently sits at flash address <code>0x00C00000</code>
+    and runs one sanity inference at boot. Flash it at <code>0x0</code> below;
+    swap models afterward by flashing just a <code>.kmodel</code> at
+    <code>0x00C00000</code> -- see the flash-address field's note and the
+    "skip erase" checkbox's warning below before doing that a second time.
+  </p>
+</div>
+
+<div class="step" style="border: 1px solid #888; border-radius: 6px; padding: 0.75rem 1rem; margin: 1rem 0;">
+  <h2 style="margin-top: 0;">Candidate models</h2>
+  <p class="note">
+    This page only flashes an already-built <code>.bin</code> — there is no
+    onnx→kmodel (nncase) conversion step or firmware recipe here yet (see
+    <code>../README.md</code>'s follow-ups). These are the vision models to
+    build that pipeline against once it exists (Maix Amigo has a camera;
+    M5StickV's is often flaky). Each link opens the
+    <a href="../../convertmodel/index.html" target="_blank" rel="noopener">onnxsim model converter</a>
+    pre-filled with that model, to fetch/simplify/quantize the ONNX starting point.
+  </p>
+  <table class="candidates">
+    <tr><th>Model</th><th>Size</th><th>Why</th></tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-MobileNetV1-0.25-VisualWakeWords-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-MobileNetV1-0.25-VisualWakeWords-int8-onnx</a></td>
+      <td>358 KB</td>
+      <td>Person detection (binary) — the natural "hello world" for K210's KPU + a camera</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-ResNet8-CIFAR10-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-ResNet8-CIFAR10-int8-onnx</a></td>
+      <td>113 KB</td>
+      <td>Tiny 10-class image classifier, MLPerf Tiny reference — good sanity check</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/tensorflow-MobileNetV1-0.25-ImageNet-224-uint8-onnx&autoload=1" target="_blank" rel="noopener">tensorflow-MobileNetV1-0.25-ImageNet-224-uint8-onnx</a></td>
+      <td>530 KB</td>
+      <td>Full 1000-class ImageNet classifier — matches Sipeed's own official K210 MobileNet demo shape</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/tensorflow-MobileNetV1-0.5-ImageNet-224-uint8-onnx&autoload=1" target="_blank" rel="noopener">tensorflow-MobileNetV1-0.5-ImageNet-224-uint8-onnx</a></td>
+      <td>1.4 MB</td>
+      <td>Wider/more-accurate MobileNet if the KPU weight budget allows</td>
+    </tr>
+  </table>
+  <p class="note">
+    Checked but not recommended: <code>google-coral-DeepLabV3-*</code>
+    (883 KB–1.7 MB, segmentation output handling adds real complexity) and
+    <code>mediapipe-EfficientDet-Lite0</code> (4.1 MB int8 — too big for
+    K210's practical KPU/SRAM budget). These are community re-exports (the
+    <code>ketiswp</code> Hub org), not the original MLCommons/Google
+    accounts — spot-check one before trusting it on hardware.
+  </p>
+</div>
+
+<p class="note" id="serial-unsupported" style="display: none; color: #b00;">
+  This browser has no <code>navigator.serial</code> -- try Chrome or Edge
+  (desktop), 89+.
+</p>
+<div id="controls">
+  <label for="firmware-input">file (runtime .bin or model .kmodel)</label>
+  <input type="file" id="firmware-input" accept=".bin,.kmodel">
+  <br><br>
+  <label for="flash-preset">what are you flashing</label>
+  <select id="flash-preset">
+    <option value="0x0" selected>runtime firmware (0x0)</option>
+    <option value="0x00C00000">model (0x00C00000)</option>
+    <option value="custom">custom address&hellip;</option>
+  </select>
+  <br><br>
+  <label for="flash-address">flash address</label>
+  <input type="text" id="flash-address" value="0x0" size="10" disabled title="0x0 for the runtime firmware; 0x00C00000 for a model (see firmware/runtime/README.md's flash layout). Pick 'custom address...' above to type your own -- e.g. for a self-built custom firmware image flashed at a non-default offset.">
+  <span class="note">(auto-filled from the preset above; pick <code>custom address&hellip;</code> to type your own -- e.g. for a self-built custom firmware image, see <code>firmware/runtime/README.md</code>'s "Building it yourself")</span>
+  <br><br>
+  <input type="checkbox" id="skip-erase" checked>
+  <label for="skip-erase" title="FLASH_ERASE has no address range -- it always erases the WHOLE chip, so it isn't safe to leave on when writing a model at a non-zero address without also re-flashing the runtime afterward. Checked by default because, confirmed against a real Sipeed Maix Amigo: neither erase command variant this SDK can send gets a response this board's flash-mode stub recognizes as success, while writing without erasing first works correctly (the stub's own FLASH_WRITE erases the sectors it programs on its own) -- see the K210 tool's README, 'Testing against real hardware'. Uncheck only if you specifically need a full-chip erase and are prepared for it to likely just fail.">
+    skip erase (checked by default -- erase itself doesn't work on real hardware tested so far; see README)
+  </label>
+  <br><br>
+  <label for="chip-type">flash location</label>
+  <select id="chip-type">
+    <option value="0" selected>in-chip (M5StickV / Maix Amigo)</option>
+    <option value="1">on-board (separate flash chip)</option>
+  </select>
+  <br><br>
+  <label for="reset-scheme">reset scheme</label>
+  <select id="reset-scheme" title="The DTR/RTS sequence used to enter ISP mode. 'dan' is the default (Sipeed's own scheme, what community M5StickV instructions use) -- if the board never responds to greeting, try the others before assuming something else is wrong.">
+    <option value="dan" selected>dan (Sipeed Dan Dock -- default, try first)</option>
+    <option value="kd233">kd233</option>
+    <option value="goD">goD</option>
+  </select>
+  <span class="note">unsure which one your board needs? Try them in this order.</span>
+  <br><br>
+  <button id="flash-button" type="button">Connect and flash</button>
+</div>
+<div id="log"></div>
+
+<script type="module" src="./flash_ui.mjs"></script>
+</body>
+</html>

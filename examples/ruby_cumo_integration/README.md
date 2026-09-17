@@ -112,7 +112,7 @@ ONNX Runtime session (via the
 the unsimplified *and* the simplified model -- the same "does it still
 compute the same result" claim this repo's other backend integrations make
 (see [`docs/dlpack-executor.md`](../../docs/dlpack-executor.md)'s TVM/Halide/
-nncase/tinygrad tests), now exercised from Ruby with a real ORT.
+tinygrad tests), now exercised from Ruby with a real ORT.
 
 This ORT is intentionally a separate story from onnxsim_c's own: the
 `onnxruntime` gem vendors its own prebuilt ONNX Runtime binary, so running

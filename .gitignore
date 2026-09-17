@@ -175,6 +175,12 @@ test*.py
 # tracked.
 !tests/test*.py
 !tools/onnx-finetune/tests/test*.py
+!tools/onnx-cardputer-flash/tests/test*.py
+!tools/onnx-k210-flash/tests/test*.py
+
+# nncase's own compile-time report, written to the CWD it's invoked from
+# (tools/onnx-k210-flash/scripts/onnx_to_kmodel.py) -- not an output we produce.
+kmodel_info.txt
 
 .setuptools-cmake-build/
 onnxsim/version.py
@@ -233,3 +239,8 @@ node_modules/
 /.claude/
 scripts/axera/vm/share/
 tiny-random-mistral/
+
+# PlatformIO build output for the Cardputer/K210 firmware runtimes -- local
+# toolchain/library downloads and object files, not part of the repo.
+tools/onnx-cardputer-flash/firmware/runtime/.pio/
+tools/onnx-k210-flash/firmware/runtime/.pio/

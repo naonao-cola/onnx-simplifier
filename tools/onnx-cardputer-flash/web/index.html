@@ -1,0 +1,141 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>onnx-cardputer-flash</title>
+<style>
+  body { font-family: monospace; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  #log { white-space: pre-wrap; background: #111; color: #0f0; padding: 1rem; height: 260px; overflow-y: auto; }
+  .step { border: 1px solid #888; border-radius: 6px; padding: 0.75rem 1rem; margin: 1rem 0; }
+  .step h2 { margin-top: 0; }
+  .note { font-size: 0.9em; color: #555; }
+  button:disabled { opacity: 0.5; }
+  table.candidates { border-collapse: collapse; width: 100%; margin-top: 0.5rem; font-size: 0.9em; }
+  table.candidates th, table.candidates td { border: 1px solid #ccc; padding: 0.35rem 0.5rem; text-align: left; }
+  table.candidates th { background: #f0f0f0; }
+</style>
+</head>
+<body>
+<h1>onnx-cardputer-flash</h1>
+<p class="note">
+  Flashes a TFLite Micro firmware image to an ESP32-S3 board (e.g. M5Stack
+  Cardputer) straight from the browser over
+  <a href="https://developer.chrome.com/docs/capabilities/serial" target="_blank" rel="noopener">Web Serial</a>.
+  See <code>../README.md</code> for the full pipeline (Hugging Face model →
+  onnxsim simplify/quantize → TFLite Micro conversion → this page).
+</p>
+
+<div class="step">
+  <h2>1. Get a model</h2>
+  <p>
+    Fetch and simplify/quantize a Hugging Face ONNX model with the
+    <a href="../../convertmodel/index.html" target="_blank" rel="noopener">onnxsim model converter</a>,
+    then download the result. This page doesn't repeat that UI — it picks
+    back up at step 3 below, offline.
+  </p>
+  <p class="note">
+    Candidates (Cardputer has a mic, no camera, so these are all audio
+    models; sizes are the actual <code>model.onnx</code> size on the Hub).
+    Each link opens the converter pre-filled with that model.
+  </p>
+  <table class="candidates">
+    <tr><th>Model</th><th>Size</th><th>Why</th></tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/tensorflow-Micro-Speech-TinyConv-SpeechCommands-uint8-onnx&autoload=1" target="_blank" rel="noopener">tensorflow-Micro-Speech-TinyConv-SpeechCommands-uint8-onnx</a></td>
+      <td>19 KB</td>
+      <td>Google's official <code>micro_speech</code> reference (yes/no + a few words) — smallest, best first end-to-end test</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-DS-CNN-SpeechCommands-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-DS-CNN-SpeechCommands-int8-onnx</a></td>
+      <td>74 KB</td>
+      <td>MLPerf Tiny's official keyword-spotting benchmark model</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-Streaming-Wakeword-DS-CNN-SpeechCommands-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-Streaming-Wakeword-DS-CNN-SpeechCommands-int8-onnx</a></td>
+      <td>72 KB</td>
+      <td>Streaming variant — closer to real "always-listening" wake-word behavior</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/arm-DS-CNN-Large-SpeechCommands-clustered-int8-onnx&autoload=1" target="_blank" rel="noopener">arm-DS-CNN-Large-SpeechCommands-clustered-int8-onnx</a></td>
+      <td>476 KB</td>
+      <td>ARM's larger KWS reference — more accuracy if you have the flash budget</td>
+    </tr>
+    <tr>
+      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-Deep-Autoencoder-DCASE2020-ToyCar-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-Deep-Autoencoder-DCASE2020-ToyCar-int8-onnx</a></td>
+      <td>285 KB</td>
+      <td>Anomaly-sound detection (autoencoder + reconstruction-error threshold) — a different task, still mic-only</td>
+    </tr>
+  </table>
+  <p class="note">
+    These are community re-exports (the <code>ketiswp</code> Hub org), not
+    the original MLCommons/Google/ARM accounts — spot-check one with the
+    converter's own Netron/inference panel before trusting it on hardware.
+  </p>
+</div>
+
+<div class="step">
+  <h2>2. Flash the generic runtime (once per board)</h2>
+  <p>
+    <a href="../firmware/runtime/prebuilt/cardputer-runtime.bin" download>Download cardputer-runtime.bin</a>
+    — a real, compiled, checksummed TFLite Micro runtime (see
+    <code>../firmware/runtime/README.md</code>). Flash it at address
+    <code>0x0</code> below. You only do this once: it reads whatever model
+    currently sits in a fixed flash partition at boot, so swapping models
+    later (step 4) never touches this again.
+  </p>
+</div>
+
+<div class="step">
+  <h2>3. Convert your model to .tflite (offline, local machine)</h2>
+  <p class="note">
+    Not done in-browser:
+    <code>pip install onnx2tf</code>, then
+    <code>python3 ../scripts/onnx_to_tflite_micro.py your_model.onnx model.tflite</code>.
+    Bring the resulting <code>model.tflite</code> back here — it must fit in
+    the runtime's 1MB model partition (every candidate in step 1's table
+    does).
+  </p>
+</div>
+
+<div class="step">
+  <h2>4. Flash over Web Serial</h2>
+  <p id="serial-unsupported" class="note" style="display: none; color: #b00;">
+    This browser has no <code>navigator.serial</code> — try Chrome or Edge
+    (desktop), 89+.
+  </p>
+  <p class="note">
+    Same Connect session for both: flash <b>cardputer-runtime.bin</b> at
+    <code>0x0</code> (step 2, once), then flash <b>your model.tflite</b> at
+    <code>0x310000</code> (step 4, every time you swap models) — pick the
+    file, set the address, Flash; repeat for the second file without
+    reconnecting.
+  </p>
+  <div id="serial-controls">
+    <button id="connect-button" type="button">Connect to board</button>
+    <button id="disconnect-button" type="button" disabled>Disconnect</button>
+    <span id="chip-status" class="note"></span>
+    <br><br>
+    <label for="firmware-input">file (runtime .bin or model .tflite)</label>
+    <input type="file" id="firmware-input" accept=".bin,.tflite" disabled>
+    <br><br>
+    <label for="flash-preset">what are you flashing</label>
+    <select id="flash-preset">
+      <option value="0x0" selected>runtime firmware (0x0)</option>
+      <option value="0x310000">model (0x310000)</option>
+      <option value="custom">custom address&hellip;</option>
+    </select>
+    <br><br>
+    <label for="flash-address">flash address</label>
+    <input type="text" id="flash-address" value="0x0" size="8" disabled title="0x0 for the runtime firmware; 0x310000 for a model (this runtime's fixed model-partition offset). Pick 'custom address...' above to type your own -- e.g. for a self-built custom firmware image flashed at a non-default offset.">
+    <span class="note">(auto-filled from the preset above; pick <code>custom address&hellip;</code> to type your own -- e.g. for a self-built custom firmware image, see <code>../firmware/runtime/README.md</code>'s "Rebuilding it yourself")</span>
+    <br><br>
+    <button id="flash-button" type="button" disabled>Flash</button>
+  </div>
+</div>
+
+<div id="log"></div>
+
+<script type="module" src="./flasher.mjs"></script>
+</body>
+</html>

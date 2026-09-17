@@ -51,6 +51,7 @@
             <a href="#sec-console">Console</a>
             <a href="#sec-profiling">Profiling</a>
             <a href="#sec-inference">Run inference</a>
+            <a href="#sec-cardputer">Cardputer live output</a>
         </nav>
         <div id="versions-panel" title="Library versions built into this WebAssembly module (also included in a bug report).">
             <span class="version-badge"><span class="version-k">versions</span><span class="version-v">loading…</span></span>
@@ -1244,6 +1245,64 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         </p>
         <div id="inference-trace" class="wide"></div>
         <script type="module" src="./inference_browser.mjs"></script>
+
+        <h2 id="sec-cardputer">Live Cardputer output (Web Serial)</h2>
+        <p>
+            Streams a physical
+            <a href="https://github.com/onnxsim/onnxsim/blob/master/tools/onnx-cardputer-flash/README.md" target="_blank" rel="noopener">onnx-cardputer-flash</a>
+            board's own printed output straight into this page over
+            <a href="https://developer.chrome.com/docs/capabilities/serial" target="_blank" rel="noopener">Web Serial</a>
+            — the exact same lines the runtime already prints to a serial
+            terminal or the board's own screen, just rendered here too. This
+            only reads and displays what the board is already printing; it
+            does not run or compare against onnxruntime-web above, and it
+            doesn't flash anything (see the cardputer tool's own page for
+            that).
+        </p>
+        <details class="tool-details">
+            <summary>What this reads, and reconnect behavior — details</summary>
+            <p>
+                Parses the runtime's own two print formats
+                (<code>tools/onnx-cardputer-flash/firmware/runtime/src/main.cpp</code>'s
+                <code>RunAndReportInference()</code>/<code>printOutputValues()</code>):
+                a <code>test inference: OK (N ms)</code> /
+                <code>test inference: FAILED (N ms)</code> status+latency line,
+                followed by each output tensor's
+                <code>out[i] raw: ...</code> (quantized) and
+                <code>out[i] dequant: ...</code> (real-unit, int8/uint8 only)
+                or <code>out[i] values: ...</code> (float32) lines. Everything
+                else the board prints (boot messages, <code>mic ready</code>,
+                errors) is shown in the raw log below but not specially
+                parsed. The <b>latest result</b> panel above the log re-renders
+                on each new status line using whatever <code>out[]</code>
+                lines followed the previous one.
+            </p>
+            <p>
+                This board's native USB-Serial/JTAG peripheral (not a
+                separate USB-UART chip) genuinely disconnects and
+                re-enumerates on every hardware reset — a real property of
+                the chip, not a bug here. A read error is treated as an
+                expected disconnect, not a fatal one: the status line says
+                so and the <b>Connect</b> button re-enables; reconnecting
+                after a reset needs one more click, the same way this page's
+                own Web Serial permission model requires a user gesture for
+                each new <code>requestPort()</code> call.
+            </p>
+        </details>
+        <div>
+            <button id="cardputer-connect-button" type="button">Connect to Cardputer</button>
+            <button id="cardputer-disconnect-button" type="button" disabled>Disconnect</button>
+            <button id="cardputer-clear-button" type="button">Clear log</button>
+            <span id="cardputer-status" class="note"></span>
+        </div>
+        <p id="cardputer-serial-unsupported" class="note" style="display: none; color: #b00;">
+            This browser has no <code>navigator.serial</code> — try Chrome or
+            Edge (desktop), 89+.
+        </p>
+        <div id="cardputer-latest" class="wide"></div>
+        <textarea id="cardputer-log" readonly rows="10"
+                  style="width: 100%; box-sizing: border-box; font-family: monospace; font-size: 0.85em;"></textarea>
+        <script type="module" src="./cardputer_monitor_ui.mjs"></script>
 
     </body>
 </html>

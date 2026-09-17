@@ -116,7 +116,7 @@ def _foldable_shape_reshape() -> onnx.ModelProto:
 
     onnxsim folds the whole chain into the ``Reshape``'s literal target
     shape, which the lowering below ingests either way -- the same
-    regression guard the nncase/TVM/tinygrad/torch equivalents carry for
+    regression guard the TVM/tinygrad/torch equivalents carry for
     backends that do prefer a literal target.
     """
     w = numpy_helper.from_array(_rand(8, 3, 3, 3, seed=1), "w")
