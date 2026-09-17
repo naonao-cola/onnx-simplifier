@@ -819,3 +819,166 @@ def emit_matmul_reg8_quad(reference_mcode: bytes, permutation) -> bytes:
     s_off = anchor + 33
     out[s_off + 1 : s_off + 4] = perm[3]
     return bytes(out)
+
+
+_CONV_REG8_ANCHOR = bytes([0x00]) + b"\x12" + bytes([132, 170])
+
+_CONV_REG8_CLASSES = {
+    "P1": b"\x23\x00\x20",
+    "P2": b"\x23\x00\x10",
+    "P3": b"\x23\x00\x40",
+    "P4": b"\x30",
+}
+
+
+def _conv_reg8_slot_bytes(cls: str, tag: int, reg: int) -> bytes:
+    payload = _CONV_REG8_CLASSES[cls]
+    return bytes([len(payload) - 1]) + payload + bytes([tag, reg])
+
+
+def emit_conv_reg8_group(
+    reference_mcode: bytes,
+    slot1: tuple[str, int],
+    slot2: tuple[int, str, int],
+    slot3: tuple[int, str, int],
+) -> bytes:
+    """Rewrite Conv's 3-of-4 ``reg=8`` unordered-pool group (anchored at
+    a stable ``reg=170`` record) to a caller-chosen configuration,
+    completing this same session's generator-progress theme for the
+    RICHEST of the three op-specific ``reg=8`` variants decoded so far
+    (``emit_matmul_reg8_quad`` did MatMul's own simpler, fixed-length
+    4-of-4 case; this is Conv's own, per
+    ``tests/test_axera_conv_reg8_reg60_noise_source.py``, PR #1580).
+
+    ``slot1`` is ``(class, tag)`` -- always labeled ``reg=174``.
+    ``slot2``/``slot3`` are each ``(reg, class, tag)``, ``reg`` one of
+    ``8``/``242``/``176`` (the register-label pool PR #1580 found
+    those two slots draw from). ``class`` is one of ``"P1"``/``"P2"``/
+    ``"P3"``/``"P4"``; the 3 slots must use 3 DISTINCT classes with
+    zero duplicates -- unlike Gemm's own duplicate-tolerant version
+    (``tests/test_axera_gemm_reg8_second_noise_source.py``), Conv's
+    mechanism was found to hold this with zero exceptions across all 8
+    real builds checked. ``P4``'s own payload is always the 1-byte
+    short form (``0x30``) -- observed in every one of its 3
+    occurrences across the 8 real samples regardless of which slot it
+    lands in, never the 3-byte long form the other 3 classes use.
+
+    ``reg=172``'s own tag is derived automatically (``134`` iff
+    ``slot1``'s class is ``"P4"``, else ``132``) -- the exact
+    biconditional PR #1580 verified with zero exceptions.
+
+    **Every slot's own record tag must be supplied explicitly, not
+    just slot1's -- two previously-unnoticed wrinkles, surfaced
+    building this function, not by PR #1580's own original decode**
+    (whose own ``EXPECTED`` table discarded each slot record's own tag
+    entirely, keeping only ``(reg, class)``): slot1's own tag is
+    ``130`` in 7 of 8 real builds but ``132`` in one
+    (``conv_dilation3_v7stability_r0.mcode.gz``, an otherwise-identical
+    long-form ``P2`` slot1); separately, slot2/slot3's own tag is
+    ``130`` in every occurrence of ``reg=8``/``242`` but ``132`` in the
+    corpus's one ``reg=176`` occurrence
+    (``conv_dilation3_v7stability_r1.mcode.gz``). Whether ``132``
+    tracks "first time this register label is used" or something else
+    is not decoded here -- with only 2 exceptions in 24 total slot
+    observations, there isn't enough data in this project's own corpus
+    to tell. Rather than silently defaulting past this and risking a
+    plausible-looking but wrong emission, every slot's tag is a
+    required, explicit argument (matching PR #1580's own established
+    value, ``130``, is the safe default for any NEW, not-yet-observed
+    configuration, but callers reproducing a specific real build must
+    pass that build's own actual per-slot values).
+
+    Locates the group by ``reg=170``'s own stable, byte-identical-
+    across-all-8-samples anchor record (``00 12 84 aa``) -- searched
+    for, not hardcoded to a fixed offset. **This is a length-changing
+    edit, unlike ``emit_matmul_reg8_quad``'s fixed-size splice**: the
+    group's own total byte length is 24 or 26 bytes depending on
+    whether slot1's class is ``"P4"`` (short form) or not, and the OLD
+    group being replaced may be either length regardless of what the
+    NEW one is -- the old group's own true length is walked byte-by-
+    byte from the reference's own p-bytes (not assumed), and
+    everything after it is shifted accordingly.
+
+    **What this establishes and does not.** Verified in
+    ``tests/test_axera_conv_reg8_emit_verify.py`` against all 8 real
+    Pulsar2 builds this project has of ``Conv(k=3, dilation=3, pad=3,
+    cin=4, cout=4, insz=16)``: a no-op emit (using each fixture's own
+    exact observed configuration, including its own per-slot tags)
+    reproduces that fixture byte-for-byte in every one of the 8 cases.
+    Emitting a DIFFERENT real fixture's own configuration into another
+    fixture's base stream always re-decodes to exactly that target
+    configuration, with the rest of the stream untouched -- but
+    ``mcode.check()`` on the result depends on whether the edit
+    changed the GROUP's own total length: when the target configuration
+    has the same number of ``"P4"`` (short-form) slots as the base --
+    so the group's own byte length is unchanged -- the result passes
+    ``mcode.check()`` cleanly (verified directly). When it does not --
+    e.g. splicing in a target where a DIFFERENT slot is (or isn't)
+    ``"P4"`` than the base had, shrinking or growing the group by 2
+    bytes -- ``mcode.check()`` reports a real error
+    (``"tail: no readable segment table"``): something elsewhere in the
+    stream (a header or footer table encoding an absolute offset or
+    total length) is not updated by this splice, the same class of
+    "understood the field, not its whole-stream consequences" limit
+    ``patch_conv_zp_x``'s own docstring already found for a *different*
+    field. This function does NOT establish end-to-end shape-to-mcode
+    generation, that an untested ``(class, reg, tag)`` combination not
+    seen in these 8 samples is something a real Pulsar2 build would
+    produce, or anything about device-level correctness -- the same
+    scope limits ``emit_matmul_reg8_quad``'s own docstring already
+    states.
+    """
+    slot1_class, slot1_tag = slot1
+    if slot1_class not in _CONV_REG8_CLASSES:
+        raise ValueError(
+            f"slot1 class must be one of {sorted(_CONV_REG8_CLASSES)}, got"
+            f" {slot1_class!r}"
+        )
+    for reg, cls, tag in (slot2, slot3):
+        if cls not in _CONV_REG8_CLASSES:
+            raise ValueError(
+                f"slot class must be one of {sorted(_CONV_REG8_CLASSES)}, got {cls!r}"
+            )
+        if reg not in (8, 242, 176):
+            raise ValueError(f"slot register must be one of 8/242/176, got {reg!r}")
+        if tag not in (130, 132):
+            raise ValueError(f"slot tag must be 130 or 132, got {tag!r}")
+    classes = {slot1_class, slot2[1], slot3[1]}
+    if len(classes) != 3:
+        raise ValueError(
+            "the 3 slots must use 3 DISTINCT classes (Conv's mechanism is never"
+            " duplicate-tolerant, unlike Gemm's) -- got"
+            f" {(slot1_class, slot2[1], slot3[1])!r}"
+        )
+    if slot1_tag not in (130, 132):
+        raise ValueError(f"slot1 tag must be 130 or 132, got {slot1_tag!r}")
+
+    hits = [
+        i
+        for i in range(len(reference_mcode) - len(_CONV_REG8_ANCHOR) + 1)
+        if reference_mcode[i : i + len(_CONV_REG8_ANCHOR)] == _CONV_REG8_ANCHOR
+    ]
+    if len(hits) != 1:
+        raise ValueError(
+            f"reg=170 anchor found {len(hits)} times in reference_mcode, expected"
+            " exactly 1 -- wrong shape/reference?"
+        )
+    anchor = hits[0]
+
+    reg172_tag = 134 if slot1_class == "P4" else 132
+    reg172_bytes = bytes([0x00]) + b'"' + bytes([reg172_tag, 172])
+    new_group = (
+        reference_mcode[anchor : anchor + 4]
+        + reg172_bytes
+        + _conv_reg8_slot_bytes(slot1_class, slot1_tag, 174)
+        + _conv_reg8_slot_bytes(slot2[1], slot2[2], slot2[0])
+        + _conv_reg8_slot_bytes(slot3[1], slot3[2], slot3[0])
+    )
+
+    pos = anchor + 8
+    for _ in range(3):
+        p = reference_mcode[pos]
+        pos += p + 4
+    old_group_end = pos
+
+    return reference_mcode[:anchor] + new_group + reference_mcode[old_group_end:]
