@@ -171,8 +171,10 @@ FIX = os.path.join(_AXERA_DIR, "fixtures")
 # tests/test_axera_resource_model_census.py's own
 # BANK_SPARSE_MAX_FRACTION/REG_SPARSE_MAX_FRACTION -- see that file's
 # module docstring and this file's own "corpus-size fragility" section
-# above for why.
-BANK_SPARSE_MAX_FRACTION = 0.03
+# above for why. Bumped 0.03 -> 0.10 at the 738-fixture corpus; see
+# the census file's own module-level comment for the real per-bank
+# distribution behind this number.
+BANK_SPARSE_MAX_FRACTION = 0.10
 REG_SPARSE_MAX_FRACTION = 0.01
 
 
