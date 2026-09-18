@@ -1,4 +1,15 @@
 <!doctype html>
+<!--
+  This page's own "../../index.html"-style links assume the deployed
+  layout .github/workflows/static.yml's own staging step produces --
+  this file served at /onnx-cardputer-flash/web/index.html, with the
+  onnxsim model converter (scripts/convertmodel/) at the site root -- NOT
+  the raw git repo's own directory layout (there is no repo-relative
+  "convertmodel" two levels up from here). Opening this file directly
+  from a repo checkout's own local static server (as this tool's README
+  documents) can't reach that link at all either way, since serving from
+  this directory's own root refuses to serve anything above it.
+-->
 <html>
 <head>
 <meta charset="utf-8">
@@ -30,7 +41,7 @@
   <h2>1. Get a model</h2>
   <p>
     Fetch and simplify/quantize a Hugging Face ONNX model with the
-    <a href="../../convertmodel/index.html" target="_blank" rel="noopener">onnxsim model converter</a>,
+    <a href="../../index.html" target="_blank" rel="noopener">onnxsim model converter</a>,
     then download the result. This page doesn't repeat that UI — it picks
     back up at step 3 below, offline.
   </p>
@@ -42,27 +53,27 @@
   <table class="candidates">
     <tr><th>Model</th><th>Size</th><th>Why</th></tr>
     <tr>
-      <td><a href="../../convertmodel/index.html?model=ketiswp/tensorflow-Micro-Speech-TinyConv-SpeechCommands-uint8-onnx&autoload=1" target="_blank" rel="noopener">tensorflow-Micro-Speech-TinyConv-SpeechCommands-uint8-onnx</a></td>
+      <td><a href="../../index.html?model=ketiswp/tensorflow-Micro-Speech-TinyConv-SpeechCommands-uint8-onnx&autoload=1" target="_blank" rel="noopener">tensorflow-Micro-Speech-TinyConv-SpeechCommands-uint8-onnx</a></td>
       <td>19 KB</td>
       <td>Google's official <code>micro_speech</code> reference (yes/no + a few words) — smallest, best first end-to-end test</td>
     </tr>
     <tr>
-      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-DS-CNN-SpeechCommands-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-DS-CNN-SpeechCommands-int8-onnx</a></td>
+      <td><a href="../../index.html?model=ketiswp/mlcommons-DS-CNN-SpeechCommands-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-DS-CNN-SpeechCommands-int8-onnx</a></td>
       <td>74 KB</td>
       <td>MLPerf Tiny's official keyword-spotting benchmark model</td>
     </tr>
     <tr>
-      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-Streaming-Wakeword-DS-CNN-SpeechCommands-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-Streaming-Wakeword-DS-CNN-SpeechCommands-int8-onnx</a></td>
+      <td><a href="../../index.html?model=ketiswp/mlcommons-Streaming-Wakeword-DS-CNN-SpeechCommands-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-Streaming-Wakeword-DS-CNN-SpeechCommands-int8-onnx</a></td>
       <td>72 KB</td>
       <td>Streaming variant — closer to real "always-listening" wake-word behavior</td>
     </tr>
     <tr>
-      <td><a href="../../convertmodel/index.html?model=ketiswp/arm-DS-CNN-Large-SpeechCommands-clustered-int8-onnx&autoload=1" target="_blank" rel="noopener">arm-DS-CNN-Large-SpeechCommands-clustered-int8-onnx</a></td>
+      <td><a href="../../index.html?model=ketiswp/arm-DS-CNN-Large-SpeechCommands-clustered-int8-onnx&autoload=1" target="_blank" rel="noopener">arm-DS-CNN-Large-SpeechCommands-clustered-int8-onnx</a></td>
       <td>476 KB</td>
       <td>ARM's larger KWS reference — more accuracy if you have the flash budget</td>
     </tr>
     <tr>
-      <td><a href="../../convertmodel/index.html?model=ketiswp/mlcommons-Deep-Autoencoder-DCASE2020-ToyCar-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-Deep-Autoencoder-DCASE2020-ToyCar-int8-onnx</a></td>
+      <td><a href="../../index.html?model=ketiswp/mlcommons-Deep-Autoencoder-DCASE2020-ToyCar-int8-onnx&autoload=1" target="_blank" rel="noopener">mlcommons-Deep-Autoencoder-DCASE2020-ToyCar-int8-onnx</a></td>
       <td>285 KB</td>
       <td>Anomaly-sound detection (autoencoder + reconstruction-error threshold) — a different task, still mic-only</td>
     </tr>

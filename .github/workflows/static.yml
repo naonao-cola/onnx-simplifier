@@ -425,6 +425,31 @@ jobs:
           rm -rf scripts/convertmodel/netron
           cp -r netron-src/dist/web scripts/convertmodel/netron
 
+      # Stage the K210/Cardputer flasher pages (tools/onnx-*-flash/web/)
+      # under this site too -- previously reachable only via a GitHub
+      # source link (see scripts/convertmodel/index.html's own "Live
+      # Cardputer output" section), since only this directory gets
+      # deployed. Each tool's web/index.html already expects to sit next
+      # to its own firmware/runtime/prebuilt/ (a repo-relative
+      # `../firmware/...` download link) and two levels below the site
+      # root (a `../../index.html` link back to this page) -- that shape,
+      # /onnx-<board>-flash/web/index.html plus a sibling
+      # firmware/runtime/prebuilt/, is exactly what gets staged here, so
+      # neither page's own links needed to change for local vs. deployed
+      # use, only to stop assuming a raw git-checkout layout that was
+      # never actually reachable from either page anyway (see each page's
+      # own top-of-file comment). Demo-only, same as Netron above.
+      - name: Stage the K210/Cardputer flasher pages
+        if: ${{ github.event_name == 'push' || github.event_name == 'issue_comment' }}
+        run: |
+          for tool in onnx-cardputer-flash onnx-k210-flash; do
+            dest="scripts/convertmodel/$tool"
+            rm -rf "$dest"
+            mkdir -p "$dest/web" "$dest/firmware/runtime/prebuilt"
+            cp -r "tools/$tool/web/." "$dest/web/"
+            cp "tools/$tool/firmware/runtime/prebuilt/"*.bin "$dest/firmware/runtime/prebuilt/"
+          done
+
       # --- Production: GitHub Pages (push to master/pages only) ---
       - name: Upload artifact
         if: ${{ github.event_name == 'push' }}

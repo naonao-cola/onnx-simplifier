@@ -1256,8 +1256,16 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             terminal or the board's own screen, just rendered here too. This
             only reads and displays what the board is already printing; it
             does not run or compare against onnxruntime-web above, and it
-            doesn't flash anything (see the cardputer tool's own page for
-            that).
+            doesn't flash anything — that's the
+            <a href="/onnx-cardputer-flash/web/index.html" target="_blank" rel="noopener">onnx-cardputer-flash flasher</a>'s
+            job (a real page, deployed alongside this one — see
+            <a href="https://github.com/onnxsim/onnxsim/blob/master/tools/onnx-cardputer-flash/README.md" target="_blank" rel="noopener">its README</a>
+            for the full pipeline). The same project's
+            <a href="/onnx-k210-flash/web/index.html" target="_blank" rel="noopener">onnx-k210-flash flasher</a>
+            flashes Kendryte K210 boards (Sipeed Maix Amigo, M5StickV) the
+            same way — see
+            <a href="https://github.com/onnxsim/onnxsim/blob/master/tools/onnx-k210-flash/README.md" target="_blank" rel="noopener">its own README</a>
+            for status; there's no live monitor panel for it on this page.
         </p>
         <details class="tool-details">
             <summary>What this reads, and reconnect behavior — details</summary>
