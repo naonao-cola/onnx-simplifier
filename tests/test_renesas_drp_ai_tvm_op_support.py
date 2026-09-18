@@ -52,8 +52,9 @@ def test_convert_map_has_known_common_ops():
     assert "Conv" in ops.DRP_AI_TVM_IMPORTABLE_OPS
     assert "MatMul" in ops.DRP_AI_TVM_IMPORTABLE_OPS
     assert "BatchNormalization" in ops.DRP_AI_TVM_IMPORTABLE_OPS
-    # "Constant" is handled as a GraphProto.from_onnx() special case, not a
-    # _get_convert_map() entry -- still importable.
+    # An ordinary _get_convert_map() entry, not a special case (see
+    # drp_ai_tvm_ops.py's docstring for how an earlier version of this
+    # project got that wrong).
     assert "Constant" in ops.DRP_AI_TVM_IMPORTABLE_OPS
 
 

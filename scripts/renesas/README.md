@@ -38,11 +38,13 @@ What *is* public and exact is which TVM version DRP-AI TVM vendors: its
 (`.gitmodules`), and that TVM version's own ONNX importer
 (`python/tvm/relay/frontend/onnx.py`) is real, public source with an exact,
 checkable list of which ONNX `op_type`s it can convert into Relay IR at all
-(`_get_convert_map()`). `GraphProto.from_onnx()` raises
-`tvm.error.OpNotImplemented` for the *entire* import if even one node's
-`op_type` is missing from that list (and isn't "Constant", handled
-separately) -- not a per-node CPU fallback. That hard, whole-graph gate is
-exactly what this directory checks:
+(`_get_convert_map()`, a plain dict -- "Constant" is an ordinary entry in
+it like any other, not a separate case; an earlier version of this README
+claimed otherwise, based on misreading `GraphProto.from_onnx()`'s admission
+check). That function raises `tvm.error.OpNotImplemented` for the *entire*
+import if even one node's `op_type` is missing from the dict -- not a
+per-node CPU fallback. That hard, whole-graph gate is exactly what this
+directory checks:
 
 - `scrape_tvm_onnx_frontend.py` -- scrapes `_get_convert_map()` from a local
   `apache/tvm` checkout at the pinned tag/branch.

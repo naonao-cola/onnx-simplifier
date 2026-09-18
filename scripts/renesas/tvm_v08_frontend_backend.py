@@ -73,7 +73,5 @@ def try_import(model: onnx.ModelProto) -> tuple[bool, Optional[str]]:
     try:
         tvm.relay.frontend.from_onnx(model)
         return True, None
-    except (
-        Exception
-    ) as exc:  # noqa: BLE001 -- reporting *any* real failure verbatim is the point
+    except Exception as exc:  # noqa: BLE001 -- reporting *any* real failure verbatim is the point
         return False, str(exc)

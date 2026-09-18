@@ -174,6 +174,3 @@ TVM_V08_ONNX_CONVERT_MAP_OPS = frozenset(
         "Xor",
     }
 )
-
-#: `GraphProto.from_onnx()` special-cases "Constant" as always importable, separately from `_get_convert_map()` -- see this module's docstring.
-TVM_V08_ONNX_ALWAYS_IMPORTABLE_OPS = frozenset({"Constant"})

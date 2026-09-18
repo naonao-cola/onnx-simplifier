@@ -47,13 +47,16 @@ if not backend.has_tvm():
 
 
 def _model(body, opset=13, ir_version=7):
-    model = parser.parse_model("""
+    model = parser.parse_model(
+        """
         <
           ir_version: %d,
           opset_import: ["": %d]
         >
         %s
-        """ % (ir_version, opset, body))
+        """
+        % (ir_version, opset, body)
+    )
     onnx.checker.check_model(model)
     return model
 
@@ -64,10 +67,13 @@ def test_scraped_convert_map_matches_real_installed_tvm():
     # (tvm_v08_onnx_frontend_op_support_data.py, committed) and the *live*
     # dict the actually-installed tvm package returns. Any mismatch means
     # the scrape is stale relative to whatever TVM build this job produced.
-    assert (
-        drp_ai_tvm_ops.DRP_AI_TVM_IMPORTABLE_OPS - {"Constant"}
-        == backend.real_convert_map_ops()
-    )
+    #
+    # This is also what caught drp_ai_tvm_ops.py's own "Constant is a
+    # GraphProto.from_onnx() special case, not a _get_convert_map() entry"
+    # claim being wrong: this exact assertion failed in CI with "Constant"
+    # as an extra item on the real side, because it's an ordinary dict
+    # entry -- see that module's docstring for the corrected account.
+    assert drp_ai_tvm_ops.DRP_AI_TVM_IMPORTABLE_OPS == backend.real_convert_map_ops()
 
 
 def test_real_tvm_imports_a_small_importable_op_graph():

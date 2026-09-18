@@ -23,9 +23,16 @@ per-operator ONNX support matrix the way Axelera's Voyager SDK does.
 What *is* public and exact, though, is the ONNX importer TVM itself ships:
 `python/tvm/relay/frontend/onnx.py`'s `_get_convert_map()` -- a literal
 Python dict whose keys are every ONNX `op_type` TVM's Relay frontend knows
-how to convert at all. `GraphProto.from_onnx()` (same file) checks every
-graph node's `op_type` against this dict (plus a special-cased "Constant")
-before converting anything, and raises `tvm.error.OpNotImplemented` for the
+how to convert at all ("Constant" included -- it's an ordinary entry in
+this dict, not a separate case; an earlier version of this docstring
+wrongly claimed `GraphProto.from_onnx()` special-cased it outside the
+dict, based on misreading that function's admission check, whose
+`op_name != "Constant"` clause is dead code precisely *because* "Constant"
+is already in `convert_map` -- confirmed by cross-checking this scraped
+data against the live, installed package in
+`tests/test_renesas_drp_ai_tvm_real_frontend.py`). `GraphProto.from_onnx()`
+(same file) checks every graph node's `op_type` against this dict before
+converting anything, and raises `tvm.error.OpNotImplemented` for the
 *whole* import if any node's op_type is missing -- not a per-node CPU
 fallback, unlike Voyager SDK's AIPU/host partitioning. That exact gate is
 what this data (and `drp_ai_tvm_simulator.py`, built on it) reproduces.
@@ -104,13 +111,6 @@ def main(tvm_root: str) -> None:
         print(f'        "{op}",')
     print("    }")
     print(")")
-    print()
-    print(
-        '#: `GraphProto.from_onnx()` special-cases "Constant" as always '
-        "importable, separately from `_get_convert_map()` -- see this "
-        "module's docstring."
-    )
-    print('TVM_V08_ONNX_ALWAYS_IMPORTABLE_OPS = frozenset({"Constant"})')
 
 
 if __name__ == "__main__":

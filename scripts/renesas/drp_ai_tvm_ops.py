@@ -28,11 +28,16 @@ Apache TVM version as a git submodule (`.gitmodules`: `branch = v0.8`, as of
 the checkout this was scraped against) -- and that TVM version's own ONNX
 importer (`python/tvm/relay/frontend/onnx.py`) is real, public code with an
 exact, checkable list of which ONNX `op_type`s it can convert into Relay IR
-at all. `GraphProto.from_onnx()` raises `tvm.error.OpNotImplemented` for the
-*entire* import if even one node's `op_type` isn't in that list (or isn't
-"Constant", special-cased separately) -- it does not silently fall back
-individual unsupported nodes to CPU. That hard, whole-graph gate is exactly
-what `TVM_V08_ONNX_CONVERT_MAP_OPS` reproduces.
+at all -- `_get_convert_map()`, a plain Python dict, "Constant" included as
+an ordinary entry like any other (an earlier version of this docstring
+wrongly claimed `GraphProto.from_onnx()` special-cased "Constant" outside
+that dict; it doesn't -- see `scrape_tvm_onnx_frontend.py`'s docstring for
+how that misreading happened and how it was caught: a live diff against the
+installed package in `tests/test_renesas_drp_ai_tvm_real_frontend.py`).
+`GraphProto.from_onnx()` raises `tvm.error.OpNotImplemented` for the
+*entire* import if even one node's `op_type` isn't in that dict -- it does
+not silently fall back individual unsupported nodes to CPU. That hard,
+whole-graph gate is exactly what `TVM_V08_ONNX_CONVERT_MAP_OPS` reproduces.
 
 ## What this module can and cannot tell you
 
@@ -58,15 +63,9 @@ what `TVM_V08_ONNX_CONVERT_MAP_OPS` reproduces.
   currently says before trusting this against a current install.
 """
 
-from tvm_v08_onnx_frontend_op_support_data import (
-    TVM_V08_ONNX_ALWAYS_IMPORTABLE_OPS,
-    TVM_V08_ONNX_CONVERT_MAP_OPS,
-)
+from tvm_v08_onnx_frontend_op_support_data import TVM_V08_ONNX_CONVERT_MAP_OPS
 
-#: Every ONNX op_type TVM v0.8's Relay ONNX frontend can convert at all,
-#: including the "Constant" special case `_get_convert_map()` itself doesn't
-#: list. This is the set `drp_ai_tvm_simulator.py`'s `partition()` checks
-#: node op_types against.
-DRP_AI_TVM_IMPORTABLE_OPS = (
-    TVM_V08_ONNX_CONVERT_MAP_OPS | TVM_V08_ONNX_ALWAYS_IMPORTABLE_OPS
-)
+#: Every ONNX op_type TVM v0.8's Relay ONNX frontend can convert at all.
+#: This is the set `drp_ai_tvm_simulator.py`'s `partition()` checks node
+#: op_types against.
+DRP_AI_TVM_IMPORTABLE_OPS = TVM_V08_ONNX_CONVERT_MAP_OPS

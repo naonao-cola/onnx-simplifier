@@ -70,8 +70,8 @@ def partition(model: onnx.ModelProto) -> Partition:
 
 
 def would_import_succeed(model: onnx.ModelProto) -> bool:
-    """True iff every node's op_type is in TVM v0.8's ONNX convert map (or
-    is "Constant") -- i.e. `tvm.relay.frontend.from_onnx()` would not raise
+    """True iff every node's op_type is in TVM v0.8's ONNX convert map --
+    i.e. `tvm.relay.frontend.from_onnx()` would not raise
     `OpNotImplemented` for this graph, per `drp_ai_tvm_ops.py`'s scraped
     data. Says nothing about whether import would otherwise succeed (a
     converter can still raise for an unsupported attribute/shape on an
