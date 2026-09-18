@@ -671,6 +671,38 @@ def patch_conv_zp_x(reference_mcode: bytes, old_zp_x: int, new_zp_x: int) -> byt
     zp_x's own patch has not had, and does not currently pass, that same
     bar. See ``tests/test_axera_conv_zpx_generator.py`` for the exact
     build pair and byte counts this was checked against.
+
+    **A third caveat, decoded (not merely observed) 2026-09-18: for
+    ``Conv(dilation=3, pad=3, cin=4, cout=4, insz=16)``-shaped inputs
+    specifically, the ``<zp_x>`` byte this function writes IS the same
+    register as ``reg=60``, part of Conv's own already-decoded 28-byte
+    "binary path switch" (``tests/test_axera_conv_reg60_mechanism.py``).**
+    Confirmed structurally across all 52 already-committed fixtures of
+    that exact shape (this project's own PR #1636 test file, zero
+    exceptions): the 6-byte literal unit this function searches for
+    is the complete on-the-wire encoding of an ``S``-kind, ``reg=54``,
+    ``tag=131`` record, and ``reg=54`` is independently already known to
+    be byte-identical to ``reg=60`` in every sample checked. Practical
+    consequences for THIS shape family only: (1) this function's own
+    ``old_zp_x``/``new_zp_x`` values are not free parameters independent
+    of the binary-cluster switch's own state -- patching zp_x here also
+    changes which of the switch's own alternate states the stream reads
+    as being in, whether or not that is what a caller intended; (2) this
+    is very likely part of what the second caveat above ("~20 bytes
+    beyond this unit... also move with zp_x alone, at offsets this
+    project has not decoded") was actually seeing, since the binary-
+    cluster switch is a real, coordinated 28-byte flip, not an isolated
+    zp_x-adjacent artifact -- not confirmed by direct byte-offset
+    cross-reference here, flagged as a plausible connection for whoever
+    chases the remaining ~20 bytes next, not claimed as settled; (3)
+    this function's own existing hardware-adjacent verification
+    (``tests/test_axera_conv_zpx_generator.py``) used a DIFFERENT,
+    unaffected shape (``Conv(cin=1,cout=1,hw=8,k=3)``), confirmed
+    directly to sit at a different offset with values that don't
+    resemble a switch pair -- that verification is not called into
+    question by this caveat, only patches against the `dilation=3`
+    shape family are. Whether an analogous collision exists for
+    ``patch_mul_zp_x`` on any Mul shape has not been checked.
     """
     return patch_mul_zp_x(reference_mcode, old_zp_x, new_zp_x)
 
