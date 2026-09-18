@@ -2216,6 +2216,65 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "seed"_a = 0,
       "num_clusters"_a = 4);
 
+  // LoRA adapter injection: splices a trainable low-rank `X @ A @ B` branch
+  // around every eligible MatMul/Gemm/Conv weight (2-D float32
+  // MatMul/Gemm; 4-D float32, kernel_shape==[1,1], group==1 Conv), leaving
+  // the base weight itself untouched -- `A` is Kaiming-normal-initialized
+  // from `seed`, `B` starts at all zeros, so injection is a numeric no-op
+  // until trained. Data-free, single-model, no executor needed. See
+  // InjectLora in lora_entry.h for the full scope (including its one
+  // documented divergence: the `A` initializer's RNG stream does not
+  // reproduce numpy's PCG64 bit-for-bit for the same seed -- immaterial
+  // here since `B` is always zero) and onnxsim/lora.py's inject_lora for
+  // the technique this ports. Returned as a (model_bytes, targets) pair,
+  // mirroring apply_rptq_reorder's own precedent just above: `targets` is
+  // a list of (weight_name, node_output, op_type, lora_a_name,
+  // lora_b_name, rank, alpha) tuples, reconstructed into the real, public
+  // `onnxsim.lora.LoraTarget`/`LoraAdapter` by the Python wrapper
+  // (onnx_simplifier.py's own inject_lora_cpp).
+  m.def(
+      "inject_lora",
+      [](const py::bytes& model_proto_bytes, int64_t rank,
+         std::optional<double> alpha, std::vector<std::string> target_op_types,
+         bool restrict_target_names, std::vector<std::string> target_names,
+         int64_t seed)
+          -> std::tuple<py::bytes,
+                        std::vector<std::tuple<
+                            std::string, std::string, std::string, std::string,
+                            std::string, int64_t, std::optional<double>>>> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        InjectLoraOptions options;
+        options.rank = rank;
+        options.has_alpha = alpha.has_value();
+        options.alpha = alpha.has_value() ? static_cast<float>(*alpha) : 0.0f;
+        options.target_op_types = std::move(target_op_types);
+        options.restrict_target_names = restrict_target_names;
+        options.target_names = std::move(target_names);
+        options.seed = static_cast<uint64_t>(seed);
+        const auto result = InjectLora(model, options);
+        std::string out;
+        result.model.SerializeToString(&out);
+        std::vector<
+            std::tuple<std::string, std::string, std::string, std::string,
+                       std::string, int64_t, std::optional<double>>>
+            targets;
+        targets.reserve(result.adapter.targets.size());
+        for (const LoraTarget& t : result.adapter.targets) {
+          targets.emplace_back(
+              t.weight_name, t.node_output, t.op_type, t.lora_a_name,
+              t.lora_b_name, t.rank,
+              t.has_alpha ? std::optional<double>(t.alpha) : std::nullopt);
+        }
+        return {py::bytes(out.data(), out.size()), targets};
+      },
+      "model_bytes"_a, "rank"_a = 8, "alpha"_a = std::nullopt,
+      "target_op_types"_a = std::vector<std::string>{"MatMul", "Gemm", "Conv"},
+      "restrict_target_names"_a = false,
+      "target_names"_a = std::vector<std::string>{}, "seed"_a = 0);
+
   // SpinQuant (Liu et al., 2024), "R1-only" variant: fits a single dense
   // [K, K] rotation per matched MatMul/vanilla-Gemm layer as the
   // eigenvector basis of that layer's own calibration-activation
