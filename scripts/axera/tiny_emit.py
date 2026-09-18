@@ -1135,3 +1135,97 @@ def emit_gemm_reg8_group(reference_mcode: bytes, donor_mcode: bytes) -> bytes:
     donor_start, donor_end = _gemm_reg8_group_bounds(donor_mcode)
     donor_group = donor_mcode[donor_start:donor_end]
     return reference_mcode[:ref_start] + donor_group + reference_mcode[ref_end:]
+
+
+def retarget_tail_vector(reference_mcode: bytes, edited_mcode: bytes) -> bytes:
+    """Fix the ONE shared root cause behind every length-changing edit's
+    ``mcode.check()`` failure this session's own generator work has hit:
+    ``emit_conv_reg8_group``'s length-changing reconfigurations and
+    ``emit_gemm_reg8_group``'s cross-anchor-form splices both reliably
+    produce the identical hard error, ``"tail: no readable segment table
+    (no header word points at a tail table vector)"``
+    (``tests/test_axera_reg8_emit_capability_synthesis.py``, PR #1631,
+    named this as a recurring, never-decoded failure mode across 3
+    independent functions).
+
+    **The mechanism, decoded directly against real broken output from
+    both functions.** ``mcode.tail_vector()`` (``scripts/axera/mcode.py``)
+    locates an mcode stream's tail FlatBuffers vector by scanning the
+    fixed-size header (the first ~297 bytes, or up to the convolution-
+    engine channel-extent marker ``a1 00 40 02`` for graphs that have
+    one) for a 4-byte little-endian word ``w`` at some offset ``o`` such
+    that ``o + w`` points at a valid-looking vector -- a FlatBuffers-
+    style *relative* uoffset. Every ``reg=8`` group (and, more generally,
+    every one of this project's own decoded resource-model fields) lives
+    well AFTER this header, and BEFORE the tail vector itself -- so when
+    an edit changes that region's own total length, the true tail vector
+    shifts by the same delta, but the header's own stored *relative*
+    uoffset does not, since none of this session's own emit functions
+    touch bytes before offset ~300. Confirmed directly at a single
+    concrete offset (``o=272`` for the `Conv(dilation=3)`/`Gemm(1,512,1000)`
+    shape family this was checked against) via the four cases below --
+    but this function does not hardcode that offset; it re-locates ``o``
+    fresh from ``reference_mcode`` every call, the same defensive
+    posture every other locate-by-content function in this file uses.
+
+    ``reference_mcode`` must be the UNEDITED stream ``edited_mcode`` was
+    derived from (so this function can locate the tail vector's own
+    correct OLD position and offset word before the edit) --
+    ``len(edited_mcode) - len(reference_mcode)`` is taken directly as the
+    length delta to apply; no assumption is made about WHERE within the
+    stream that length changed, only that it happened somewhere after
+    the header region this function scans.
+
+    **What this establishes and does not.** Verified in
+    ``tests/test_axera_tail_table_mechanism.py`` against all 4 already-
+    known broken cases from this session's own prior work -- both
+    directions of ``emit_conv_reg8_group``'s own length-changing
+    reconfiguration (shrink and grow) and both directions of
+    ``emit_gemm_reg8_group``'s own cross-anchor-form splice: applying
+    this function to each function's own broken output makes
+    ``mcode.check()`` report zero hard errors, ``mcode.segments()``
+    tile exactly to the (correctly relocated) tail vector, and
+    ``mcode.decode()`` succeed -- a genuine fix, not merely a
+    check-passes technicality, confirmed 4/4. It does NOT fix
+    ``bank81_field192_operand``'s own K-changing reflow (tested
+    directly, and correctly found not to need fixing by this function:
+    that edit is length-PRESERVING -- a 1-byte in-place value overwrite
+    -- so it never triggers this specific tail-vector error in the
+    first place; ``mcode.check()`` already reports it clean, per
+    ``tests/test_axera_bank81_field192_patch_verify.py``'s own finding
+    that the patched stream "still decodes/checks cleanly" despite being
+    semantically wrong. Field192's own problem is that `K` drives the
+    ENTIRE stream's tiling/scheduling, not a single stale pointer --
+    a fundamentally different, and NOT locally fixable, class of
+    failure). This function also does NOT establish that a
+    length-changed stream it retargets is a valid Pulsar2 output
+    semantically (only that it is structurally well-formed by this
+    project's own grammar) -- the same "syntactically valid, not proven
+    to be what Pulsar2 would produce" scope every other emit function in
+    this file already carries. Composing this with the length-changing
+    emit functions it fixes -- so a caller never has to call it
+    separately -- is a natural next step, not attempted here.
+    """
+    # struct is already imported at module level; mcode is deliberately
+    # local here, matching _gemm_reg8_group_bounds's own precedent --
+    # every OTHER function in this file is decode-free.
+    import mcode  # noqa: PLC0415
+
+    t_ref = mcode.tail_vector(reference_mcode)
+    first_verb = reference_mcode.find(b"\xa1\x00\x40\x02")
+    if first_verb <= 0:
+        first_verb = 297
+    header_off = None
+    for o in range(0, first_verb - 3, 4):
+        if o + struct.unpack_from("<I", reference_mcode, o)[0] == t_ref:
+            header_off = o
+            break
+    if header_off is None:
+        raise ValueError(
+            "could not locate the tail-vector header word in reference_mcode"
+        )
+    delta = len(edited_mcode) - len(reference_mcode)
+    new_t = t_ref + delta
+    patched = bytearray(edited_mcode)
+    struct.pack_into("<I", patched, header_off, new_t - header_off)
+    return bytes(patched)
