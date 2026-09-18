@@ -42,11 +42,16 @@ other short-form donors each, plus the analogous 4x3 for long-form)
 splice cleanly: same total length, zero `mcode.check()` hard errors,
 and the spliced group's own content plus `reg=0` indicator state read
 back exactly as the donor's own. Splicing ACROSS anchor forms (a
-length-changing edit) reliably breaks with a specific hard error --
-`"tail: no readable segment table"` -- the same "local edit, global
+length-changing edit) used to reliably break with a specific hard error
+-- `"tail: no readable segment table"` -- the same "local edit, global
 consequence" pattern this session's other generator-progress work
 (`bank81_field192_operand`'s own K-changing reflow test) already found
-for a completely different field.
+for a completely different field. **This is now fixed automatically**
+(`scripts/axera/tiny_emit.py`'s own `retarget_tail_vector`, PR #1634,
+decoded the shared root cause -- a stale relative-uoffset header word --
+and `emit_gemm_reg8_group` now calls it internally before returning):
+a cross-anchor-form splice now passes `mcode.check()` cleanly too,
+verified directly below.
 """
 
 import gzip
@@ -219,30 +224,34 @@ class TestSpliceIndicatorFollowsDonorNotReference(unittest.TestCase):
         self.assertFalse(reg0_has_extra_b147(decode(out)))
 
 
-class TestCrossFormSpliceFailsPredictably(unittest.TestCase):
-    """Splicing across anchor forms (a length-changing edit) reliably
-    produces the same specific hard mcode.check() error -- not a silent
-    success, and not an arbitrary/unpredictable failure."""
+class TestCrossFormSpliceIsNowFixedByRetarget(unittest.TestCase):
+    """Splicing across anchor forms (a length-changing edit) used to
+    reliably produce the same specific hard mcode.check() error --
+    `emit_gemm_reg8_group` now calls `tiny_emit.retarget_tail_vector`
+    internally (PR #1634), so the same cross-form splice now passes
+    mcode.check() cleanly instead. See
+    `tests/test_axera_tail_table_mechanism.py` for the mechanism this
+    fix is based on."""
 
-    def test_short_ref_long_donor_breaks_tail_table(self):
+    def test_short_ref_long_donor_is_now_clean(self):
         ref = load("gemm_1x512x1000_tb0.mcode.gz")
         donor = load("gemm_1x512x1000_tb0_rebuild0.mcode.gz")
         out = tiny_emit.emit_gemm_reg8_group(ref, donor)
         self.assertNotEqual(len(out), len(ref))
         hard = [e for e in mcode.check(out) if not e.startswith("coverage:")]
-        self.assertEqual(len(hard), 1)
-        self.assertIn("tail", hard[0])
-        self.assertIn("segment table", hard[0])
+        self.assertEqual(hard, [])
+        recs = mcode.decode(out, **mcode.FULL_RULE)
+        self.assertGreater(len(recs), 0)
 
-    def test_long_ref_short_donor_breaks_tail_table(self):
+    def test_long_ref_short_donor_is_now_clean(self):
         ref = load("gemm_1x512x1000_tb0_rebuild0.mcode.gz")
         donor = load("gemm_1x512x1000_tb0.mcode.gz")
         out = tiny_emit.emit_gemm_reg8_group(ref, donor)
         self.assertNotEqual(len(out), len(ref))
         hard = [e for e in mcode.check(out) if not e.startswith("coverage:")]
-        self.assertEqual(len(hard), 1)
-        self.assertIn("tail", hard[0])
-        self.assertIn("segment table", hard[0])
+        self.assertEqual(hard, [])
+        recs = mcode.decode(out, **mcode.FULL_RULE)
+        self.assertGreater(len(recs), 0)
 
 
 class TestBoundsHelperRaisesOnInvalidInput(unittest.TestCase):

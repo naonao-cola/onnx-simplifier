@@ -899,34 +899,38 @@ def emit_conv_reg8_group(
     byte from the reference's own p-bytes (not assumed), and
     everything after it is shifted accordingly.
 
-    **What this establishes and does not.** Verified in
+    **The length change is now handled automatically (2026-09-18).**
+    Earlier versions of this function returned the raw length-changed
+    stream directly, which left ``mcode.check()`` reporting a real
+    error (``"tail: no readable segment table"``) whenever the edit
+    actually changed the group's own total length -- ``retarget_tail_vector``
+    (below) decoded the shared root cause (a stale FlatBuffers-style
+    relative-uoffset header word) and fixed it; this function now calls
+    it internally before returning, so callers no longer need a manual
+    second step. Verified in
     ``tests/test_axera_conv_reg8_emit_verify.py`` against all 8 real
     Pulsar2 builds this project has of ``Conv(k=3, dilation=3, pad=3,
-    cin=4, cout=4, insz=16)``: a no-op emit (using each fixture's own
-    exact observed configuration, including its own per-slot tags)
-    reproduces that fixture byte-for-byte in every one of the 8 cases.
-    Emitting a DIFFERENT real fixture's own configuration into another
-    fixture's base stream always re-decodes to exactly that target
-    configuration, with the rest of the stream untouched -- but
-    ``mcode.check()`` on the result depends on whether the edit
-    changed the GROUP's own total length: when the target configuration
-    has the same number of ``"P4"`` (short-form) slots as the base --
-    so the group's own byte length is unchanged -- the result passes
-    ``mcode.check()`` cleanly (verified directly). When it does not --
-    e.g. splicing in a target where a DIFFERENT slot is (or isn't)
-    ``"P4"`` than the base had, shrinking or growing the group by 2
-    bytes -- ``mcode.check()`` reports a real error
-    (``"tail: no readable segment table"``): something elsewhere in the
-    stream (a header or footer table encoding an absolute offset or
-    total length) is not updated by this splice, the same class of
-    "understood the field, not its whole-stream consequences" limit
-    ``patch_conv_zp_x``'s own docstring already found for a *different*
-    field. This function does NOT establish end-to-end shape-to-mcode
-    generation, that an untested ``(class, reg, tag)`` combination not
-    seen in these 8 samples is something a real Pulsar2 build would
-    produce, or anything about device-level correctness -- the same
-    scope limits ``emit_matmul_reg8_quad``'s own docstring already
-    states.
+    cin=4, cout=4, insz=16)``, including every length-changing
+    cross-fixture case that used to be broken: the result now passes
+    ``mcode.check()`` cleanly regardless of whether the edit changed
+    the group's own total length.
+
+    **What this establishes and does not.** A no-op emit (using each
+    fixture's own exact observed configuration, including its own
+    per-slot tags) reproduces that fixture byte-for-byte in every one
+    of the 8 cases. Emitting a DIFFERENT real fixture's own
+    configuration into another fixture's base stream always re-decodes
+    to exactly that target configuration, with the rest of the stream
+    (outside the reg=8 group and the one retargeted header word)
+    byte-identical to the original reference. This function does NOT
+    establish end-to-end shape-to-mcode generation, that an untested
+    ``(class, reg, tag)`` combination not seen in these 8 samples is
+    something a real Pulsar2 build would produce, or anything about
+    device-level correctness -- the same scope limits
+    ``emit_matmul_reg8_quad``'s own docstring already states. Nor does
+    the tail-vector fix establish semantic validity, only structural
+    well-formedness by this project's own grammar (``retarget_tail_vector``'s
+    own docstring).
     """
     slot1_class, slot1_tag = slot1
     if slot1_class not in _CONV_REG8_CLASSES:
@@ -981,7 +985,8 @@ def emit_conv_reg8_group(
         pos += p + 4
     old_group_end = pos
 
-    return reference_mcode[:anchor] + new_group + reference_mcode[old_group_end:]
+    edited = reference_mcode[:anchor] + new_group + reference_mcode[old_group_end:]
+    return retarget_tail_vector(reference_mcode, edited)
 
 
 def _gemm_reg8_group_bounds(reference_mcode: bytes) -> tuple:
@@ -1113,15 +1118,19 @@ def emit_gemm_reg8_group(reference_mcode: bytes, donor_mcode: bytes) -> bytes:
       original reference.
     - Splicing ACROSS anchor forms (a length-changing splice, e.g. a
       21-byte donor group into a 23-byte reference span or vice versa)
-      is NOT safe: verified directly, this reliably produces a specific
-      hard ``mcode.check()`` error --
-      ``"tail: no readable segment table (no header word points at a
-      tail table vector)"`` -- the stream's own header/tail table
-      apparently encodes an absolute pointer or length elsewhere that a
-      pure local splice does not update, the same class of "local edit,
-      global consequence" finding ``bank81_field192_operand``'s own
-      verified K-changing reflow test found for a completely different
-      field. This function does not attempt to fix that up.
+      used to reliably produce a specific hard ``mcode.check()`` error
+      -- ``"tail: no readable segment table (no header word points at a
+      tail table vector)"``. **This is now fixed automatically
+      (2026-09-18).** ``retarget_tail_vector`` (below) decoded the
+      shared root cause (a stale FlatBuffers-style relative-uoffset
+      header word left over from the length change) and this function
+      now calls it internally before returning: verified in
+      ``tests/test_axera_gemm_reg8_emit_verify.py`` against both
+      cross-anchor-form directions, the spliced result now passes
+      ``mcode.check()`` cleanly, decodes to exactly the donor's own
+      slot assignment and ``reg=0`` indicator state, and leaves
+      everything outside the spliced group (and the one retargeted
+      header word) byte-identical to the original reference.
 
     It does NOT establish that every one of the 3^3 = 27 mathematically
     conceivable slot-class combinations (ignoring form/duplicate
@@ -1129,12 +1138,16 @@ def emit_gemm_reg8_group(reference_mcode: bytes, donor_mcode: bytes) -> bytes:
     attempt the harder problem ``emit_matmul_reg8_quad`` solved of
     accepting an arbitrary caller-chosen assignment directly -- only 8
     real, verified group states (4 same-length pairs each) are known to
-    be safe to splice as of this function.
+    be safe to splice as of this function. Nor does the tail-vector fix
+    establish semantic validity, only structural well-formedness by
+    this project's own grammar (``retarget_tail_vector``'s own
+    docstring).
     """
     ref_start, ref_end = _gemm_reg8_group_bounds(reference_mcode)
     donor_start, donor_end = _gemm_reg8_group_bounds(donor_mcode)
     donor_group = donor_mcode[donor_start:donor_end]
-    return reference_mcode[:ref_start] + donor_group + reference_mcode[ref_end:]
+    edited = reference_mcode[:ref_start] + donor_group + reference_mcode[ref_end:]
+    return retarget_tail_vector(reference_mcode, edited)
 
 
 def retarget_tail_vector(reference_mcode: bytes, edited_mcode: bytes) -> bytes:

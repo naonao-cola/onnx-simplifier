@@ -46,11 +46,15 @@ guess -- it requires every slot's own tag as an explicit argument.
 
 A same-length swap (the target configuration has the same number of
 `"P4"` slots as the base, just permuted) always passes `mcode.check()`
-cleanly. A length-changing swap (a different slot count of `"P4"`) always
-trips `mcode.check()`'s own tail-table validation -- a real,
-precisely-characterized limitation, not a bug in the splice itself (the
-group's own re-decoded content is still exactly correct in both cases;
-only the STREAM's own separate tail/segment table goes stale). See
+cleanly. A length-changing swap (a different slot count of `"P4"`) used
+to always trip `mcode.check()`'s own tail-table validation -- the
+group's own re-decoded content was still exactly correct in both cases;
+only the STREAM's own separate tail/segment table went stale. **This is
+now fixed automatically** (`scripts/axera/tiny_emit.py`'s own
+`retarget_tail_vector`, PR #1634, decoded the shared root cause -- a
+stale relative-uoffset header word -- and `emit_conv_reg8_group` now
+calls it internally before returning): a length-changing swap now
+passes `mcode.check()` cleanly too, verified directly below. See
 `scripts/axera/tiny_emit.py`'s own updated docstring for the full
 finding.
 """
@@ -236,14 +240,16 @@ class TestSameLengthCrossFixtureEmissionIsClean(unittest.TestCase):
         self.assertEqual(hard, [])
 
 
-class TestLengthChangingCrossFixtureEmissionBreaksTheTailTable(unittest.TestCase):
+class TestLengthChangingCrossFixtureEmissionIsNowFixedByRetarget(unittest.TestCase):
     """conv_dilation3 (all long-form, 26-byte group) spliced with
     rebuild0's own config (P4 in slot1, 24-byte group) shrinks the
-    group by 2 bytes. The group's own content still re-decodes to
-    exactly the target configuration -- but mcode.check() now reports
-    a real error, a precisely-characterized limitation documented
-    directly in emit_conv_reg8_group's own docstring, not silently
-    hidden."""
+    group by 2 bytes. The group's own content re-decodes to exactly the
+    target configuration, and -- since `emit_conv_reg8_group` now calls
+    `tiny_emit.retarget_tail_vector` internally (PR #1634) -- the
+    result also passes `mcode.check()` cleanly now, where it used to
+    report a real "tail: no readable segment table" error. See
+    `tests/test_axera_tail_table_mechanism.py` for the mechanism this
+    fix is based on."""
 
     def test_group_content_is_still_correct(self):
         base = load("conv_dilation3.mcode.gz")
@@ -252,14 +258,20 @@ class TestLengthChangingCrossFixtureEmissionBreaksTheTailTable(unittest.TestCase
         self.assertEqual(len(out), len(base) - 2)
         self.assertEqual(config_of(out), target_cfg)
 
-    def test_mcode_check_reports_a_tail_table_error(self):
+    def test_mcode_check_is_now_clean(self):
         base = load("conv_dilation3.mcode.gz")
         target_cfg = CONFIG["conv_dilation3_rebuild0.mcode.gz"]
         out = tiny_emit.emit_conv_reg8_group(base, *target_cfg)
         errs = mcode.check(out)
         hard = [e for e in errs if not e.startswith("coverage:")]
-        self.assertTrue(hard)
-        self.assertTrue(any("tail" in e for e in hard), hard)
+        self.assertEqual(hard, [])
+
+    def test_decode_succeeds(self):
+        base = load("conv_dilation3.mcode.gz")
+        target_cfg = CONFIG["conv_dilation3_rebuild0.mcode.gz"]
+        out = tiny_emit.emit_conv_reg8_group(base, *target_cfg)
+        recs = mcode.decode(out, **mcode.FULL_RULE)
+        self.assertGreater(len(recs), 0)
 
 
 class TestInvalidConfigurationIsRejected(unittest.TestCase):
