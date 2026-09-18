@@ -9333,19 +9333,23 @@ def test_cpp_dynamic_quantize_matmul_matches_python_reference():
 # helpers (trimmed here of that file's own ``Reshape([0,-1])`` classifier-head
 # variant, out of scope for this C++ port -- see below).
 #
-# KNOWN, DELIBERATE GAP (documented in the C++ section comment above
-# ``ApplyConvIntegerChains``): the classifier-head
-# ``GlobalAveragePool -> Flatten -> {MatMul, Gemm}`` hop pruning.py's own
-# reference additionally matches is NOT recognized by this C++ port --
-# ``test_cpp_dynamic_quantize_conv_gap_flatten_gemm_classifier_head_is_not_matched``
-# below confirms that shape is left completely untouched by
-# ``apply_structured_pruning_cpp`` (while the Python reference DOES prune
-# it), so this is documented directly by a test rather than merely implied.
-# Because of this gap, ``onnxsim.pruning.apply_structured_pruning_dynamic_
-# quantize_conv`` itself is NOT aliased to the C++ port (see that function's
-# own docstring/pruning.py's own section comment) -- only the ordinary
-# same-family producer/consumer chain (with the Clip/depthwise-mid-chain
-# hops) is covered here.
+# The classifier-head ``GlobalAveragePool -> {Flatten(axis=1), Reshape to
+# [batch, -1], Squeeze-of-trailing-axes} -> {MatMul, vanilla Gemm}`` hop
+# pruning.py's own reference also matches IS now recognized by this C++ port
+# too (see ``structured_pruning_entry.cpp``'s own "DynamicQuantizeConv
+# (ConvInteger, ...)" section comment and
+# ``MatchGapFlattenMatmulConsumer``) --
+# ``test_cpp_dynamic_quantize_conv_gap_flatten_gemm_classifier_head_matches_
+# python_reference`` below confirms byte-for-byte parity with the Python
+# reference. Despite this, ``onnxsim.pruning.apply_structured_pruning_
+# dynamic_quantize_conv`` itself is still NOT aliased to the C++ port (see
+# that function's own docstring) -- the QOperator and plain-float ``Conv``
+# families' own identical gap is still open, and delegating this one function
+# alone, while its two sibling entry points remain un-widened, was judged not
+# worth the inconsistency for now; see this repo's own dedicated
+# ``tests/test_structured_pruning_conv_integer_gap_cpp.py`` for the full,
+# focused coverage of this new hop (Flatten/Reshape/Squeeze/dynamic-batch
+# shapes, plus negative "left undeclined" cases).
 
 
 def _quantize_dynamic_conv_weight(W, spatial=8, per_channel=False):
@@ -9661,18 +9665,13 @@ def _dqconv_depthwise_chain_model(
 
 
 def _dqconv_gap_flatten_gemm_model_from_weights(c, m1, out, w1f, w3f, spatial=8):
-    """The classifier-head shape pruning.py's own reference matches --
-    a single ``ConvInteger`` producer's own logical output feeding
+    """The classifier-head shape pruning.py's own reference matches, and
+    this C++ port now matches too (see this section's own top comment and
+    ``structured_pruning_entry.cpp``'s own ``MatchGapFlattenMatmulConsumer``)
+    -- a single ``ConvInteger`` producer's own logical output feeding
     ``GlobalAveragePool -> Flatten(axis=1) -> Gemm`` DIRECTLY (no downstream
     ``ConvInteger`` consumer at all, isolating this hop from the ordinary
-    producer/consumer chain shape already covered by the tests above) --
-    but this C++ port deliberately does NOT match (see this section's own
-    top comment) -- used only to confirm that gap directly: with no
-    recognized consumer of any kind, `WalkToConvIntegerConsumer` declines at
-    the very first hop (`GlobalAveragePool` isn't a unary/`Clip`/
-    `DynamicQuantizeLinear`-leading-to-`ConvInteger` hop), so
-    `FindConvIntegerChains` finds nothing at all here and the whole graph is
-    left untouched.
+    producer/consumer chain shape already covered by the tests above).
     """
     w1q, w1s, w1zp = _quantize_dynamic_conv_weight(w1f, spatial=spatial)
     kh1, kw1 = w1f.shape[2], w1f.shape[3]
@@ -9812,14 +9811,12 @@ def test_cpp_dynamic_quantize_conv_zero_sparsity_is_a_no_op():
     assert pruned.SerializeToString() == model.SerializeToString()
 
 
-def test_cpp_dynamic_quantize_conv_gap_flatten_gemm_classifier_head_is_not_matched():
-    # KNOWN, DELIBERATE GAP (see this section's own top comment and
-    # ``structured_pruning_entry.cpp``'s own "DynamicQuantizeConv
-    # (ConvInteger, ...)" section comment): the C++ port has no
-    # `GlobalAveragePool`/`Flatten`/`Gemm`-walking machinery at all, so this
-    # classifier-head shape -- which the Python reference DOES match and
-    # prune -- is left completely untouched here, exactly like any other
-    # unrecognized topology (never mis-sliced).
+def test_cpp_dynamic_quantize_conv_gap_flatten_gemm_classifier_head_matches_python_reference():
+    # The classifier-head shape (see this section's own top comment and
+    # ``structured_pruning_entry.cpp``'s own `MatchGapFlattenMatmulConsumer`)
+    # is now matched and pruned byte-for-byte identically to the Python
+    # reference -- see ``tests/test_structured_pruning_conv_integer_gap_cpp.py``
+    # for the full, focused coverage of every recognized shape.
     c, m1, out = 4, 8, 5
     rng = np.random.default_rng(26)
     w1f = (rng.standard_normal((m1, c, 3, 3)) * 0.3).astype(np.float32)
@@ -9827,18 +9824,20 @@ def test_cpp_dynamic_quantize_conv_gap_flatten_gemm_classifier_head_is_not_match
     model = _dqconv_gap_flatten_gemm_model_from_weights(c, m1, out, w1f, w3f)
     onnx.checker.check_model(model)
 
-    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
-    assert pruned_cpp.SerializeToString() == model.SerializeToString()
-
-    # Confirm this is a genuine "C++ doesn't recognize it" gap, not simply an
-    # unmatchable fixture: the Python reference DOES prune it (the whole
-    # point of this test).
     pruned_py = onnxsim.apply_structured_pruning_dynamic_quantize_conv(
         model, sparsity=0.5
     )
+    pruned_cpp = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned_py)
+    onnx.checker.check_model(pruned_cpp)
     assert pruned_py.SerializeToString() != model.SerializeToString()
-    py_inits = {t.name: t for t in pruned_py.graph.initializer}
-    assert list(py_inits["w1_quantized"].dims)[0] == m1 // 2
+
+    py_bytes = {t.name: t.SerializeToString() for t in pruned_py.graph.initializer}
+    cpp_bytes = {t.name: t.SerializeToString() for t in pruned_cpp.graph.initializer}
+    assert py_bytes == cpp_bytes
+    inits = {t.name: t for t in pruned_cpp.graph.initializer}
+    assert list(inits["w1_quantized"].dims)[0] == m1 // 2
+    assert list(inits["w3"].dims)[1] == m1 // 2
 
 
 # --- importance_norm ("l1" vs "l2") and global_sparsity ---------------------
