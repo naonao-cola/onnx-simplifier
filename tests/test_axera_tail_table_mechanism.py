@@ -46,6 +46,16 @@ happen to share it, not assumed), computes the length delta directly
 from `len(edited_mcode) - len(reference_mcode)`, and rewrites that one
 word in a copy of `edited_mcode`.
 
+**Update (2026-09-18, same day): `emit_conv_reg8_group` and
+`emit_gemm_reg8_group` now call `retarget_tail_vector` internally
+before returning** (composing the fix into the functions it fixes was
+this section's own originally-named next step, done immediately after
+this file was first written). Their own output is clean by default
+now; the tests below reconstruct the pre-fix intermediate state
+manually where needed to keep this file's own mechanism-decode claims
+directly checkable, rather than only inferable from the fact that the
+public functions no longer expose it.
+
 ## Verified against all 4 already-known broken cases, both directions
 ## each
 
@@ -115,78 +125,141 @@ def hard_errors(data):
 class TestConvShrinkIsFixed(unittest.TestCase):
     """conv_dilation3 (P2/reg8/reg242, long-form slot1) reconfigured to
     rebuild0's own config (P4 slot1, short form) shrinks the group by 2
-    bytes and breaks the tail table before the fix."""
+    bytes.
+
+    **Update (2026-09-18): `emit_conv_reg8_group` now calls
+    `retarget_tail_vector` internally before returning** (composing the
+    fix into the function it fixes was this file's own originally-named
+    next step) -- so the raw, still-broken intermediate state this class
+    used to observe directly via the public function is no longer
+    reachable that way. `test_manually_reconstructed_pre_fix_state_is_broken`
+    reconstructs that intermediate state by duplicating just the splice
+    (not the fix) to confirm the mechanism this file decodes is still
+    real, not merely no-longer-observable; `test_clean_by_default` and
+    `test_segments_and_decode_succeed` check the function's own actual,
+    current public behavior directly, with no manual fix-up call needed
+    -- and re-applying `retarget_tail_vector` on top of that is checked
+    separately to be a safe, idempotent no-op, not silently trusted."""
+
+    def _raw_splice_without_fix(self, base_name, target_name):
+        # Duplicates emit_conv_reg8_group's own splice logic up to (not
+        # including) its internal retarget_tail_vector call, purely to
+        # demonstrate the pre-fix intermediate state this class' own
+        # docstring describes -- not a supported public entry point.
+        base = load(base_name)
+        target = CONV_CONFIG[target_name]
+        slot1, slot2, slot3 = target
+        slot1_class, slot1_tag = slot1
+        anchor_bytes = tiny_emit._CONV_REG8_ANCHOR
+        hits = [
+            i
+            for i in range(len(base) - len(anchor_bytes) + 1)
+            if base[i : i + len(anchor_bytes)] == anchor_bytes
+        ]
+        self.assertEqual(len(hits), 1)
+        anchor = hits[0]
+        reg172_tag = 134 if slot1_class == "P4" else 132
+        reg172_bytes = bytes([0x00]) + b'"' + bytes([reg172_tag, 172])
+        new_group = (
+            base[anchor : anchor + 4]
+            + reg172_bytes
+            + tiny_emit._conv_reg8_slot_bytes(slot1_class, slot1_tag, 174)
+            + tiny_emit._conv_reg8_slot_bytes(slot2[1], slot2[2], slot2[0])
+            + tiny_emit._conv_reg8_slot_bytes(slot3[1], slot3[2], slot3[0])
+        )
+        pos = anchor + 8
+        for _ in range(3):
+            p = base[pos]
+            pos += p + 4
+        old_group_end = pos
+        return base, base[:anchor] + new_group + base[old_group_end:]
 
     def _out(self):
         base = load("conv_dilation3.mcode.gz")
         target = CONV_CONFIG["conv_dilation3_rebuild0.mcode.gz"]
         return base, tiny_emit.emit_conv_reg8_group(base, *target)
 
-    def test_broken_before_fix(self):
-        base, out = self._out()
-        self.assertEqual(len(out), len(base) - 2)
-        errs = hard_errors(out)
+    def test_manually_reconstructed_pre_fix_state_is_broken(self):
+        base, raw = self._raw_splice_without_fix(
+            "conv_dilation3.mcode.gz", "conv_dilation3_rebuild0.mcode.gz"
+        )
+        self.assertEqual(len(raw), len(base) - 2)
+        errs = hard_errors(raw)
         self.assertTrue(errs)
         self.assertIn("tail", errs[0])
-
-    def test_clean_after_fix(self):
-        base, out = self._out()
-        fixed = tiny_emit.retarget_tail_vector(base, out)
+        # And retarget_tail_vector fixes exactly that reconstructed state.
+        fixed = tiny_emit.retarget_tail_vector(base, raw)
         self.assertEqual(hard_errors(fixed), [])
 
-    def test_segments_and_decode_succeed_after_fix(self):
+    def test_clean_by_default(self):
         base, out = self._out()
-        fixed = tiny_emit.retarget_tail_vector(base, out)
-        header, segs = mcode.segments(fixed)
-        self.assertEqual(segs[-1][0] + segs[-1][1], mcode.tail_vector(fixed))
-        recs = mcode.decode(fixed, **mcode.FULL_RULE)
+        self.assertEqual(len(out), len(base) - 2)
+        self.assertEqual(hard_errors(out), [])
+
+    def test_reapplying_retarget_is_a_safe_noop(self):
+        base, out = self._out()
+        fixed_again = tiny_emit.retarget_tail_vector(base, out)
+        self.assertEqual(fixed_again, out)
+
+    def test_segments_and_decode_succeed(self):
+        base, out = self._out()
+        header, segs = mcode.segments(out)
+        self.assertEqual(segs[-1][0] + segs[-1][1], mcode.tail_vector(out))
+        recs = mcode.decode(out, **mcode.FULL_RULE)
         self.assertGreater(len(recs), 0)
 
 
 class TestConvGrowIsFixed(unittest.TestCase):
     """The reverse direction: rebuild0 (short form) reconfigured to
-    conv_dilation3's own config (long form) grows the group by 2 bytes."""
+    conv_dilation3's own config (long form) grows the group by 2 bytes.
+    See `TestConvShrinkIsFixed`'s own docstring for why this class no
+    longer observes a raw broken state via the public function."""
 
     def _out(self):
         base = load("conv_dilation3_rebuild0.mcode.gz")
         target = CONV_CONFIG["conv_dilation3.mcode.gz"]
         return base, tiny_emit.emit_conv_reg8_group(base, *target)
 
-    def test_broken_before_fix(self):
+    def test_clean_by_default(self):
         base, out = self._out()
         self.assertEqual(len(out), len(base) + 2)
-        self.assertTrue(hard_errors(out))
+        self.assertEqual(hard_errors(out), [])
 
-    def test_clean_after_fix(self):
+    def test_reapplying_retarget_is_a_safe_noop(self):
         base, out = self._out()
-        fixed = tiny_emit.retarget_tail_vector(base, out)
-        self.assertEqual(hard_errors(fixed), [])
+        fixed_again = tiny_emit.retarget_tail_vector(base, out)
+        self.assertEqual(fixed_again, out)
 
 
 class TestGemmCrossFormSplicesAreFixed(unittest.TestCase):
     """emit_gemm_reg8_group's own cross-anchor-form (length-changing)
     splices, both directions, from tests/test_axera_gemm_reg8_emit_verify.py's
-    own TestCrossFormSpliceFailsPredictably."""
+    own TestCrossFormSpliceIsNowFixedByRetarget.
+
+    **Update (2026-09-18): `emit_gemm_reg8_group` now calls
+    `retarget_tail_vector` internally before returning** -- its own
+    output is clean by default; re-applying the fix on top is checked
+    to be a safe, idempotent no-op rather than assumed."""
 
     def test_short_ref_long_donor(self):
         ref = load("gemm_1x512x1000_tb0.mcode.gz")
         donor = load("gemm_1x512x1000_tb0_rebuild0.mcode.gz")
         out = tiny_emit.emit_gemm_reg8_group(ref, donor)
         self.assertNotEqual(len(out), len(ref))
-        self.assertTrue(hard_errors(out))
-        fixed = tiny_emit.retarget_tail_vector(ref, out)
-        self.assertEqual(hard_errors(fixed), [])
-        header, segs = mcode.segments(fixed)
-        self.assertEqual(segs[-1][0] + segs[-1][1], mcode.tail_vector(fixed))
+        self.assertEqual(hard_errors(out), [])
+        header, segs = mcode.segments(out)
+        self.assertEqual(segs[-1][0] + segs[-1][1], mcode.tail_vector(out))
+        fixed_again = tiny_emit.retarget_tail_vector(ref, out)
+        self.assertEqual(fixed_again, out)
 
     def test_long_ref_short_donor(self):
         ref = load("gemm_1x512x1000_tb0_rebuild0.mcode.gz")
         donor = load("gemm_1x512x1000_tb0.mcode.gz")
         out = tiny_emit.emit_gemm_reg8_group(ref, donor)
         self.assertNotEqual(len(out), len(ref))
-        self.assertTrue(hard_errors(out))
-        fixed = tiny_emit.retarget_tail_vector(ref, out)
-        self.assertEqual(hard_errors(fixed), [])
+        self.assertEqual(hard_errors(out), [])
+        fixed_again = tiny_emit.retarget_tail_vector(ref, out)
+        self.assertEqual(fixed_again, out)
 
 
 class TestHeaderWordIsAtTheExpectedOffsetInThisSharedShapeFamily(unittest.TestCase):

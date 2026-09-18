@@ -37,6 +37,24 @@ calling its real functions against the real committed fixtures listed
 in each contributing PR's own test file -- not copied from any PR's
 own docstring prose.
 
+**Update (2026-09-18, PR #1634): the "real failure mode" column below
+for `emit_conv_reg8_group`/`emit_gemm_reg8_group`, and the "0% clean
+record" claim for length-changing edits in the "pattern" section below,
+describe the state as of THIS file's own original writing --
+`tests/test_axera_tail_table_mechanism.py` has since decoded the shared
+root cause (a stale FlatBuffers-style relative-uoffset header word) and
+both functions now call the fix (`retarget_tail_vector`) internally
+before returning, so their own length-changing edits now pass
+`mcode.check()` cleanly too. The tests below are updated to check the
+now-fixed behavior directly (not left silently stale); the narrative
+prose is left as an accurate historical record of what this cluster's
+own contributing PRs found AT THE TIME, since that sequence -- decode
+the pattern first, only then find and fix the shared cause -- is itself
+part of the honest account. `bank81_field192_operand`'s own failure
+mode is UNCHANGED (that edit is length-preserving, so `retarget_tail_vector`
+correctly never applies to it -- its own problem is a different,
+non-local one, per that function's own docstring).
+
 ## The four-function comparison table
 
 | function | mechanism | design | verification bar met | real failure mode |
@@ -214,9 +232,10 @@ class TestMatMulEmitIsFixedLengthAndByteExact(unittest.TestCase):
         self.assertEqual(len(out), len(data))
 
 
-class TestConvEmitChangesLengthAndCanBreakTheTailTable(unittest.TestCase):
-    """Reconfirms PR #1628's own two findings: same-length reconfig is
-    clean, length-changing reconfig breaks mcode.check()."""
+class TestConvEmitChangesLengthAndTailIsNowFixed(unittest.TestCase):
+    """Reconfirms PR #1628's own same-length-reconfig-is-clean finding,
+    and PR #1634's own fix for the length-changing case (which PR #1628
+    found broke mcode.check() before that fix existed)."""
 
     def test_noop_emit_matches_real_fixture(self):
         data = load("conv_dilation3.mcode.gz")
@@ -241,9 +260,13 @@ class TestConvEmitChangesLengthAndCanBreakTheTailTable(unittest.TestCase):
         )
         self.assertEqual(mcode.check(out), [])
 
-    def test_length_changing_reconfig_breaks_tail_table(self):
+    def test_length_changing_reconfig_is_now_clean(self):
         # rebuild0 uses slot1=P4 (short form, tag 132) -- switching to
         # slot1=P2 (long form) changes the group's own total length.
+        # This used to break mcode.check() (PR #1628's own original
+        # finding); emit_conv_reg8_group now calls
+        # tiny_emit.retarget_tail_vector internally (PR #1634), so it
+        # no longer does.
         ref = load("conv_dilation3_rebuild0.mcode.gz")
         out = tiny_emit.emit_conv_reg8_group(
             ref,
@@ -251,13 +274,14 @@ class TestConvEmitChangesLengthAndCanBreakTheTailTable(unittest.TestCase):
             slot2=(8, "P1", 130),
             slot3=(242, "P3", 130),
         )
-        errs = mcode.check(out)
-        self.assertTrue(any("tail" in e for e in errs), errs)
+        self.assertNotEqual(len(out), len(ref))
+        self.assertEqual(mcode.check(out), [])
 
 
 class TestGemmEmitIsADonorSpliceNotSynthesis(unittest.TestCase):
-    """Reconfirms PR #1629's own two findings: same-anchor-form splices
-    are clean, cross-form splices break the same tail table."""
+    """Reconfirms PR #1629's own same-anchor-form-splices-are-clean
+    finding, and PR #1634's own fix for the cross-form case (which PR
+    #1629 found broke mcode.check() before that fix existed)."""
 
     def test_noop_splice_matches_real_fixture(self):
         data = load("gemm_1x512x1000_tb0.mcode.gz")
@@ -270,7 +294,11 @@ class TestGemmEmitIsADonorSpliceNotSynthesis(unittest.TestCase):
         out = tiny_emit.emit_gemm_reg8_group(ref, donor)
         self.assertEqual(mcode.check(out), [])
 
-    def test_cross_form_splice_breaks_tail_table(self):
+    def test_cross_form_splice_is_now_clean(self):
+        # This used to break mcode.check() (PR #1629's own original
+        # finding); emit_gemm_reg8_group now calls
+        # tiny_emit.retarget_tail_vector internally (PR #1634), so it
+        # no longer does.
         short_names = [
             "gemm_1x512x1000_tb0.mcode.gz",
             "gemm_1x512x1000_tb0_rebuild1.mcode.gz",
@@ -289,16 +317,20 @@ class TestGemmEmitIsADonorSpliceNotSynthesis(unittest.TestCase):
         donor_start, donor_end = tiny_emit._gemm_reg8_group_bounds(donor)
         self.assertNotEqual(ref_end - ref_start, donor_end - donor_start)
         out = tiny_emit.emit_gemm_reg8_group(ref, donor)
-        errs = mcode.check(out)
-        self.assertTrue(any("tail" in e for e in errs), errs)
+        self.assertEqual(mcode.check(out), [])
 
 
 class TestLengthPreservingEditsAreCleanLengthChangingEditsAreNot(unittest.TestCase):
-    """The one crisp rule this cluster establishes, checked directly
-    across all three emit functions plus the field192 negative: every
-    length-preserving edit tested is mcode.check()-clean; every
-    length-changing edit tested (including field192's own K-driven
-    case, which is not a direct length edit but still fails) is not."""
+    """This file's own original rule -- "every length-preserving edit
+    tested is mcode.check()-clean; every length-changing edit tested is
+    not" -- held for the whole cluster at the time this file was
+    written, but PR #1634 has since fixed the length-changing case for
+    emit_conv_reg8_group/emit_gemm_reg8_group (see the two classes
+    above). What survives unchanged, checked here: MatMul's own emit is
+    always length-preserving and clean (it never needed the fix), and
+    field192's own failure is a genuinely different, NOT locally
+    fixable case -- length-preserving yet still wrong, because K drives
+    the whole stream's tiling, not one stale pointer."""
 
     def test_matmul_is_always_length_preserving_and_clean(self):
         data = load("matmul_4x8x8_v7stability_diag0.mcode.gz")
