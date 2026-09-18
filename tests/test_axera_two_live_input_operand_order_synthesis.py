@@ -332,11 +332,15 @@ class TestOperandOrderInvarianceTracksExactlyTheOutputSymmetryClass(unittest.Tes
         self.assertNotEqual(div_a[0], div_c[0])
 
 
-class TestTrivialZeroPointOmissionConfirmedForAddAndDivOnly(unittest.TestCase):
-    """Directly re-confirms PR #1667's own Add finding, and explicitly
-    checks (not merely narrates) that Sub/Mul have no such fixtures --
-    the phenomenon's own confirmed extent is 2 of 4 ops, not claimed
-    more broadly."""
+class TestTrivialZeroPointOmissionConfirmedForAdd(unittest.TestCase):
+    """Directly re-confirms PR #1667's own Add finding. At the time
+    this file was written, Sub/Mul had no such fixtures, so this class
+    also checked their absence -- Sub and Mul have since landed their
+    own trivial-x2 fixtures and confirmed the identical phenomenon
+    (PR #1669, `tests/test_axera_sub_mul_trivial_x2_zeropoint.py`), so
+    that now-obsolete negative-existence check has been removed rather
+    than left to fail against fixtures this project's own later work
+    added on purpose."""
 
     def test_add_trivial_x2_zero_point_suppresses_reg94_tag132(self):
         for seed1, seed2 in SEED_PAIRS:
@@ -350,18 +354,6 @@ class TestTrivialZeroPointOmissionConfirmedForAddAndDivOnly(unittest.TestCase):
                 if r.get("kind") == "S" and r.get("reg") == 94 and r.get("tag") == 132
             ]
             self.assertEqual(hits, [], (seed1, seed2))
-
-    def test_no_sub_or_mul_trivial_x2_fixtures_exist_yet(self):
-        for name in (
-            "sub_1x16_two_live_seed1_2_trivialx2.mcode.gz",
-            "mul_1x16_two_live_seed1_2_trivialx2.mcode.gz",
-        ):
-            self.assertFalse(
-                os.path.exists(os.path.join(FIX, name)),
-                f"{name} exists -- update this file's own claim that "
-                "the trivial-zero-point phenomenon is confirmed for "
-                "only Add and Div, not yet Sub/Mul",
-            )
 
 
 class TestFixturesDecodeCleanly(unittest.TestCase):

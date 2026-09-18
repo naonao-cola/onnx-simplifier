@@ -301,17 +301,19 @@ class TestMulClusterReconfirmed(unittest.TestCase):
         self.assertNotEqual((76, 132), (14, 131))
 
 
-class TestHypothesisHasExactlyTwoDataPointsNotAnEstablishedLaw(unittest.TestCase):
-    """A concrete, checkable claim about the state of evidence itself:
-    no `Sub` two-live-input survey has landed, so the additive-vs-
-    multiplicative hypothesis remains a 2-op observation."""
-
-    def test_no_sub_two_live_input_fixtures_exist_yet(self):
-        if not os.path.isdir(FIX):
-            self.skipTest("fixtures directory not present in this checkout")
-        names = os.listdir(FIX)
-        sub_two_live = [n for n in names if n.startswith("sub_1x16_two_live_seed")]
-        self.assertEqual(sub_two_live, [])
+class TestAddAndMulDisagreeOnTheOutputScaleStorageStrategy(unittest.TestCase):
+    """At the time this file was written, no `Sub` two-live-input
+    survey had landed yet, so the additive-vs-multiplicative
+    hypothesis below rested on exactly these two ops. `Sub` has since
+    landed (PR #1661) and confirmed the additive branch directly --
+    see `tests/test_axera_two_live_input_four_op_synthesis.py`'s own
+    `TestSubClusterReconfirmed` and `TestHypothesisNowHasFourDataPoints
+    NotTwo` for the up-to-date, four-op picture. This class keeps only
+    its own still-valid claim (Add's and Mul's own output-scale
+    mechanisms genuinely differ); the sibling "no Sub fixtures exist
+    yet" existence check that used to live here has been removed as
+    obsolete, not weakened -- the claim it protected is now fully
+    superseded and re-verified elsewhere, not merely unchecked."""
 
     def test_add_and_mul_disagree_on_the_output_scale_storage_strategy(self):
         # The hypothesis's own two data points, restated as a direct
