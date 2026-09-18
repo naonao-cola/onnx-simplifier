@@ -202,12 +202,25 @@ class TestExistingMulCorpusNeverShowsBank0x81ButSomeShowE1(unittest.TestCase):
             self.assertEqual(bank_records(decode(n), 0x81), [], n)
 
     def test_at_least_some_existing_mul_fixtures_carry_e1(self):
+        # Excludes tests/test_axera_mul_e1_threshold.py's own
+        # `mul_e1thresh_*` fixtures -- those are the same kind of
+        # deliberately atypical constant-operand Mul probe this file's
+        # own `ALL_NEW_FIXTURES` fixtures are (built specifically to
+        # cross the K*N<=65536 threshold, so several of them carry the
+        # GEMM-matching pair this test does not expect from the
+        # "ordinary corpus" claim it's checking), not something already
+        # covered by ALL_NEW_FIXTURES since they're a separate file's
+        # own fixtures. Same targeted-exclusion precedent
+        # tests/test_axera_matmul_field112_boundary.py's own
+        # test_no_matmul_fixture_carries_bank_0x81 fix already used for
+        # a sibling file's own atypical probes.
         names = [
             n
             for n in os.listdir(FIX)
             if n.startswith("mul_")
             and n.endswith(".mcode.gz")
             and n not in ALL_NEW_FIXTURES
+            and not n.startswith("mul_e1thresh_")
         ]
         carriers = [n for n in names if bank_records(decode(n), 0xE1)]
         self.assertGreaterEqual(len(carriers), 5, carriers)
