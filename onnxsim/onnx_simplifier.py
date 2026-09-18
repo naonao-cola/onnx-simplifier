@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 from typing import (
+    TYPE_CHECKING,
     Callable,
     Dict,
     Iterable,
@@ -32,6 +33,18 @@ from ._rich_compat import Text, print
 from .calibration import Tensors, generate_random_calibration_data
 from .pruning import EmbeddingPruningResult, _ImportanceNorm
 from .rptq import RptqLayerInfo
+
+if TYPE_CHECKING:
+    # onnxsim.lora itself imports from onnxsim.nf4, which imports back from
+    # this module (quantize_weight_only_nf4_cpp) -- a real circular import
+    # at module-load time, unlike RptqLayerInfo's own plain top-level import
+    # just above (onnxsim.rptq never imports the onnxsim package itself).
+    # inject_lora_cpp below imports onnxsim.lora lazily, inside its own
+    # function body, for the same reason onnxsim.gptq's own apply_gptq
+    # imports apply_gptq_cpp lazily; this TYPE_CHECKING-only import exists
+    # purely so this file's own LoraAdapter annotation (written as a string
+    # below) resolves for a type checker.
+    from .lora import LoraAdapter
 
 TensorShape = List[int]
 TensorShapes = Dict[str, TensorShape]
@@ -2595,6 +2608,84 @@ def apply_rptq_reorder_cpp(
         for x_name, w_name, gather_output, permutation, cluster_bounds in layers
     }
     return out_model, layer_info
+
+
+def inject_lora_cpp(
+    model: Union[str, onnx.ModelProto],
+    rank: int = 8,
+    alpha: Optional[float] = None,
+    target_op_types: Sequence[str] = ("MatMul", "Gemm", "Conv"),
+    target_names: Optional[Sequence[str]] = None,
+    seed: int = 0,
+) -> "Tuple[onnx.ModelProto, LoraAdapter]":
+    """
+    C++-backed port of :func:`onnxsim.lora.inject_lora`: splices a trainable
+    low-rank ``X @ A @ B`` branch around every eligible ``MatMul``/``Gemm``/
+    ``Conv`` weight, leaving the base weight itself untouched and every
+    other byte of the model unchanged. See this module's own
+    :func:`onnxsim.lora.inject_lora` and ``onnxsim/lora.py``'s module
+    docstring for the full technique.
+
+    Data-free and single-model, unlike :func:`onnxsim.apply_rptq_reorder_cpp`
+    above -- no executor or calibration data crosses into C++ (see
+    ``InjectLora`` in ``lora_entry.h`` for the full scope, including its one
+    documented divergence: ``A``'s Kaiming-normal initializer is drawn from
+    a ``std::mt19937_64`` stream, not numpy's PCG64-backed
+    ``default_rng``, so the same ``seed`` does not reproduce the Python's
+    exact ``A`` values -- immaterial to injected-model behavior since ``B``
+    always starts at zero, so the branch is a numeric no-op until trained
+    regardless of what ``A`` drew).
+
+    :param model: the model to inject into, or a file path.
+    :param rank: the adapter's inner dimension.
+    :param alpha: when given, the branch is scaled by ``alpha / rank``
+            before being added to the base branch's output; when ``None``,
+            the branch is added unscaled.
+    :param target_op_types: restrict injection to these op types.
+    :param target_names: restrict injection to weights with these
+            initializer names; ``None`` means every eligible node.
+    :param seed: seeds ``A``'s Kaiming-normal initialization (see this
+            function's own divergence note above).
+    :returns: ``(model with adapters injected, the injected LoraAdapter)``,
+            matching :func:`onnxsim.lora.inject_lora`'s own return contract
+            exactly -- reconstructed into the real, public
+            :class:`onnxsim.lora.LoraAdapter`/:class:`onnxsim.lora.LoraTarget`.
+    """
+    # Imported lazily (inside the function body, not at module scope) to
+    # avoid a circular import: onnxsim.lora itself imports from onnxsim.nf4,
+    # which imports quantize_weight_only_nf4_cpp back from this module --
+    # importing onnxsim.lora at this module's own top level would deadlock
+    # the import machinery the same way onnxsim.gptq's own lazy
+    # `from onnxsim.onnx_simplifier import apply_gptq_cpp` avoids.
+    from .lora import LoraAdapter, LoraTarget
+
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    model_bytes, targets = C.inject_lora(
+        model.SerializeToString(),
+        rank,
+        alpha,
+        list(target_op_types),
+        target_names is not None,
+        list(target_names) if target_names is not None else [],
+        seed,
+    )
+    out_model = onnx.load_from_string(model_bytes)
+    adapter = LoraAdapter(
+        targets=[
+            LoraTarget(
+                weight_name=weight_name,
+                node_output=node_output,
+                op_type=op_type,
+                lora_a_name=lora_a_name,
+                lora_b_name=lora_b_name,
+                rank=int(rank_out),
+                alpha=alpha_out,
+            )
+            for weight_name, node_output, op_type, lora_a_name, lora_b_name, rank_out, alpha_out in targets
+        ]
+    )
+    return out_model, adapter
 
 
 def apply_spinquant_cpp(

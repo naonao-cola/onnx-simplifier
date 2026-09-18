@@ -43,6 +43,7 @@
 #include "kv_cache_quantization_entry.h"
 #include "llm_fp4_activation_entry.h"
 #include "llm_int8_entry.h"
+#include "lora_entry.h"
 #include "low_rank_compensation_entry.h"
 #include "lqer_entry.h"
 #include "mixed_precision_entry.h"

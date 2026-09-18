@@ -21182,25 +21182,32 @@ void ApplyDynQuantChains(onnx::GraphProto* graph,
 // `Conv` peer on either side is declined outright, mirroring pruning.py's
 // own deliberate scope narrowing there exactly.
 //
-// KNOWN, DELIBERATE GAP relative to pruning.py's own
-// `apply_structured_pruning_dynamic_quantize_conv` (left out of THIS port
-// rather than guessed at, the same "decline rather than mis-match" bar
-// every other quantized-weight section in this file already holds): the one
-// narrow exception pruning.py matches where a producer's logical output
-// feeds `GlobalAveragePool -> {Flatten(axis=1), Reshape to [batch, -1],
-// Squeeze-of-trailing-axes} -> {MatMul, vanilla Gemm}` (the canonical
-// dynamically-quantized classifier head) directly is NOT recognized here --
-// this walker simply has no case for `GlobalAveragePool` at all, so that
-// shape is left undeclined the same way an ordinary unmatched topology
-// already is. This mirrors an EXISTING, already-accepted gap in this very
-// file: the QOperator section's own top comment above documents the
-// identical `QLinearConv -> Flatten/Reshape -> QLinearMatMul/QGemm`
-// classifier-head shape as "a REAL, confirmed gap, not an oversight" for
-// the exact same reason (no `GlobalAveragePool`/`Flatten`/`Reshape`-walking
-// machinery exists anywhere in this file's C++ port yet, for ANY quantized
-// family, plain-float included) -- so this is a consistent, not a novel,
-// scope narrowing, not a correctness risk (an unrecognized topology is
-// always left completely untouched, never mis-sliced).
+// One narrow exception to that same-family-only consumer rule IS matched --
+// mirroring pruning.py's own `_ConvIntegerChain`/`_walk_to_conv_integer_
+// consumer`/`_find_conv_integer_chains` exactly: a producer whose logical
+// output feeds `GlobalAveragePool -> {Flatten(axis=1), Reshape to
+// [batch, -1], Squeeze-of-trailing-axes} -> {MatMul, vanilla Gemm}` (the
+// canonical dynamically-quantized classifier head -- see
+// MatchGapFlattenMatmulConsumer's own comment, a transcription of pruning.py's
+// own `_match_gap_flatten_matmul_consumer`, for the axis-correspondence
+// proof this relies on) directly is also recognized, surfacing as
+// `ConvIntegerChain::matmul_consumer` rather than an ordinary
+// `ConvIntegerMatch` consumer. That matched MatMul/Gemm consumer is NEVER
+// itself quantized (the matcher only ever matches a constant, plain FLOAT32
+// weight -- narrower than pruning.py's own FLOAT/FLOAT16/BFLOAT16
+// `_is_supported_float_dtype` gate there, mirroring MatchProducer's own
+// identical FLOAT32-only narrowing elsewhere in this file: SliceConsumerWeight,
+// used to slice it, assumes a raw FLOAT32 buffer), so it is sliced by the
+// ordinary SliceConsumerWeight, not this section's own int8-aware
+// SliceConvIntegerConsumer. This mirrors an EXISTING, already-accepted gap in
+// this very file for the OTHER two quantized-weight families: the QOperator
+// section's own top comment above still documents the identical
+// `QLinearConv -> Flatten/Reshape -> QLinearMatMul/QGemm` classifier-head
+// shape as "a REAL, confirmed gap, not an oversight", and the plain-float
+// `Conv` family's own chain walker still has no such case either -- fixing
+// either of those is explicitly out of scope for this ConvInteger-only
+// extension (an unrecognized topology there is always left completely
+// untouched, never mis-sliced).
 //
 // This entire section is a genuinely separate match: `ConvInteger` is a node
 // type no other Find*Chains call in this file's ApplyStructuredPruning
@@ -21779,16 +21786,324 @@ void SliceConvIntegerConsumer(const ConvIntegerMatch& w,
   SliceConvIntegerWeightAxis(init_map.at(w.w_name), /*axis=*/1, keep);
 }
 
-// Mirrors pruning.py's own `_ConvIntegerChain`. `consumer` is always set
-// here -- unlike pruning.py's own `matmul_consumer` union member (the
-// GAP -> Flatten -> MatMul classifier-head exception), this port has no
-// second consumer shape at all, see this section's own top comment for why.
+// --- GlobalAveragePool -> {Flatten(axis=1), Reshape to [batch, -1],
+//     Squeeze-of-trailing-axes} -> {MatMul, vanilla Gemm} classifier-head
+//     match, transcribed from pruning.py's own
+//     `_match_flatten_axis1_pass_through`/`_match_reshape_batch_neg1_pass_
+//     through`/`_gap_squeeze_axes`/`_squeeze_axis_is_trailing_spatial`/
+//     `_match_gap_flatten_matmul_consumer` -- used ONLY by
+//     WalkToConvIntegerConsumer below (this section's own narrow exception
+//     to its same-family-only consumer rule; see this section's own top
+//     comment). Domain-/quantization-agnostic: by the time
+//     WalkToConvIntegerConsumer reaches a `GlobalAveragePool`, `cur` is
+//     always already a plain FLOAT32 tensor (`ConvInteger`'s own rescale
+//     `Mul`/`Cast` pair, matched by MatchConvInteger before the walk's own
+//     `start` is even chosen, already produced a plain float logical
+//     output), so this machinery needs no int8-awareness of its own at all.
+// -------------------------------------------------------------------------
+
+// True iff `node` is a plain, single-output `Flatten` with `axis == 1`
+// reading only `gap_out` -- the original, narrowest shape
+// MatchGapFlattenMatmulConsumer matches. `GlobalAveragePool`'s own schema
+// reduces every trailing spatial axis to size 1, so `gap_out` has shape
+// `[N, C, 1, ..., 1]`; `Flatten`'s own `axis == 1` merge of every trailing
+// axis into one is then a *trivial* 1:1 channel relabeling, not a real
+// memory-layout re-derivation. Only `axis == 1` (`Flatten`'s own
+// schema-documented default) is ever matched -- any other value, positive or
+// negative, is declined. Mirrors pruning.py's own
+// `_match_flatten_axis1_pass_through` exactly.
+bool MatchFlattenAxis1PassThrough(const onnx::NodeProto& node,
+                                  const std::string& gap_out) {
+  if (node.op_type() != "Flatten" || !node.domain().empty()) {
+    return false;
+  }
+  if (node.input_size() != 1 || node.input(0) != gap_out ||
+      node.output_size() != 1) {
+    return false;
+  }
+  int64_t axis = 1;  // Flatten's own schema-documented default.
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "axis") {
+      axis = attr.i();
+      break;
+    }
+  }
+  return axis == 1;
+}
+
+// True iff `node` is a plain, single-output `Reshape` reading `gap_out` as
+// its `data` input, whose `shape` input is provably a 2-element
+// `[batch, -1]` target -- the `x.view(x.size(0), -1)`/`x.reshape(x.shape[0],
+// -1)` shape a real `torch.onnx.export` emits in place of an explicit
+// `nn.Flatten()` after global average pooling. Needs no shape-initializer
+// mutation at all when pruned (`Reshape`'s own trailing `-1` auto-infers the
+// post-pruning column count), the same trivial-1:1 argument
+// MatchFlattenAxis1PassThrough relies on for `Flatten`, applied to a
+// *computed* rather than *literal* target shape.
+//
+// Two ways the `shape` input resolves to a constant `[batch, -1]` are
+// recognized, exactly mirroring pruning.py's own
+// `_match_reshape_batch_neg1_pass_through`:
+// - The whole `shape` input is itself a constant, 1-D, 2-element INT64
+//   initializer whose last element is `-1`.
+// - `shape` is produced by a `Concat` with exactly two inputs: an
+//   unvalidated first segment (the dynamic batch-size computation a real
+//   export emits, typically `Shape(x) -> Gather(indices=[0]) -> Unsqueeze` --
+//   never inspected in any detail here, since whatever it computes only ever
+//   feeds the *batch* position, never the channel one) and a constant, 1-D,
+//   single-element INT64 second segment equal to `-1`. `producers_of`
+//   resolves `shape`'s own producer node this way -- unlike pruning.py's own
+//   optional parameter, always available here (WalkToConvIntegerConsumer's
+//   own caller, FindConvIntegerChains, always builds one), so this port
+//   takes it as a plain required reference rather than an optional one.
+bool MatchReshapeBatchNeg1PassThrough(const onnx::NodeProto& node,
+                                      const std::string& gap_out,
+                                      const InitMap& init_map,
+                                      const ProducerMap& producers_of) {
+  if (node.op_type() != "Reshape" || !node.domain().empty()) {
+    return false;
+  }
+  if (node.input_size() < 2 || node.input(0) != gap_out ||
+      node.output_size() != 1) {
+    return false;
+  }
+  const std::string& shape_name = node.input(1);
+  auto sit = init_map.find(shape_name);
+  if (sit != init_map.end()) {
+    if (sit->second->data_type() != onnx::TensorProto::INT64) {
+      return false;
+    }
+    const std::vector<int64_t> vals = ReadInt64Tensor(*sit->second);
+    return vals.size() == 2 && vals.back() == -1;
+  }
+  auto cit = producers_of.find(shape_name);
+  if (cit == producers_of.end()) {
+    return false;
+  }
+  onnx::NodeProto* concat_node = cit->second;
+  if (concat_node->op_type() != "Concat" || !concat_node->domain().empty() ||
+      concat_node->output_size() != 1 || concat_node->input_size() != 2) {
+    return false;
+  }
+  auto tit = init_map.find(concat_node->input(1));
+  if (tit == init_map.end() ||
+      tit->second->data_type() != onnx::TensorProto::INT64) {
+    return false;
+  }
+  const std::vector<int64_t> tail_vals = ReadInt64Tensor(*tit->second);
+  return tail_vals.size() == 1 && tail_vals[0] == -1;
+}
+
+// Returns a plain, single-output `Squeeze` `node`'s own resolved `axes` list
+// -- from the opset>=13 constant second input, or the opset<13 `axes`
+// attribute -- or nullopt if `node` isn't such a `Squeeze`, or its `axes`
+// isn't resolvable this way (including the opset>=13 "no `axes` input at
+// all" shape, which squeezes *every* size-1 dimension and needs full shape
+// knowledge to validate -- declined, never guessed at). Mirrors pruning.py's
+// own `_gap_squeeze_axes` exactly.
+std::optional<std::vector<int64_t>> GapSqueezeAxes(const onnx::NodeProto& node,
+                                                   const InitMap& init_map) {
+  if (node.op_type() != "Squeeze" || !node.domain().empty() ||
+      node.output_size() != 1) {
+    return std::nullopt;
+  }
+  if (node.input_size() >= 2 && !node.input(1).empty()) {
+    auto ait = init_map.find(node.input(1));
+    if (ait == init_map.end() ||
+        ait->second->data_type() != onnx::TensorProto::INT64) {
+      return std::nullopt;
+    }
+    return ReadInt64Tensor(*ait->second);
+  }
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "axes") {
+      return std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    }
+  }
+  return std::nullopt;
+}
+
+// True iff `axis` (one entry of a mid-chain `Squeeze`'s own resolved `axes`,
+// see GapSqueezeAxes) is confirmed to select one of `GlobalAveragePool`'s own
+// guaranteed-size-1 TRAILING axes (index >= 2 in the `[N, C, ...]` layout) --
+// never the batch (0) or channel (1) axis. A non-negative `axis` is checked
+// directly: `axis >= 2`. A negative `axis` is accepted only for the single
+// unambiguous case `axis == -1` -- ruled safe here by requiring
+// `n_channels != 1` (a classifier head's channel count feeding a MatMul/Gemm
+// is never `1`); any other negative axis would need the tensor's own rank to
+// resolve unambiguously and is declined, never guessed at. Mirrors
+// pruning.py's own `_squeeze_axis_is_trailing_spatial` exactly -- see that
+// function's own docstring for the full proof.
+bool SqueezeAxisIsTrailingSpatial(int64_t axis, int64_t n_channels) {
+  if (axis >= 0) {
+    return axis >= 2;
+  }
+  return axis == -1 && n_channels != 1;
+}
+
+// The narrowly-scoped `GlobalAveragePool -> {Flatten(axis=1), Reshape to
+// [batch, -1], Squeeze-of-trailing-axes} -> {MatMul, vanilla Gemm}` consumer
+// match -- transcribed from pruning.py's own
+// `_match_gap_flatten_matmul_consumer` (see that function's own docstring
+// for the full axis-correspondence proof every matched shape here relies
+// on: each of the three shapes produces a *trivial* 1:1 channel relabeling,
+// never an approximation). `gap_out` is a matched `GlobalAveragePool` node's
+// own single output. Tries, in order: MatchFlattenAxis1PassThrough,
+// MatchReshapeBatchNeg1PassThrough, then a chain of one or more `Squeeze`
+// nodes each squeezing only TRAILING axes (SqueezeAxisIsTrailingSpatial) --
+// the `x.squeeze(-1).squeeze(-1)` shape a real export emits at least as
+// often as an explicit `nn.Flatten()`.
+//
+// `gap_out` is ordinarily read by exactly one consumer; also admits exactly
+// two -- the `x.view(x.size(0), -1)`/`x.reshape(x.shape[0], -1)` shape's own
+// root tensor read TWICE (once by the `Reshape` that actually consumes it as
+// data, once by a `Shape` node feeding the dynamic batch-size computation,
+// see MatchReshapeBatchNeg1PassThrough's own comment) -- declined unless
+// *exactly* one of the two readers is a `Reshape` and the other a plain
+// `Shape` (never validated further: the safety proof rests entirely on the
+// `Reshape`'s own resolved target shape, independent of where the `Shape`
+// node's own output goes).
+//
+// On a full match, the matched MatMul/vanilla-Gemm consumer's own weight
+// must additionally be a constant, 2-D, FLOAT32 initializer (narrower than
+// pruning.py's own FLOAT/FLOAT16/BFLOAT16 `_is_supported_float_dtype` gate
+// here -- see this section's own top comment for why: mirrors MatchProducer's
+// own identical FLOAT32-only narrowing elsewhere in this file, since
+// SliceConsumerWeight, used to slice it, assumes a raw FLOAT32 buffer) whose
+// reduction dimension equals `n_channels`. Returns the matched
+// reshape/squeeze node chain (in walk order) together with the matched
+// consumer as a ConsumerMatch, or nullopt if any part of this doesn't hold.
+std::optional<std::pair<std::vector<onnx::NodeProto*>, ConsumerMatch>>
+MatchGapFlattenMatmulConsumer(
+    const std::string& gap_out, const ConsumerMap& consumers_of,
+    const InitMap& init_map,
+    const std::unordered_set<std::string>& graph_outputs, int64_t n_channels,
+    const ProducerMap& producers_of) {
+  if (graph_outputs.count(gap_out)) {
+    return std::nullopt;
+  }
+  auto cit = consumers_of.find(gap_out);
+  const std::vector<onnx::NodeProto*> empty_consumers;
+  const std::vector<onnx::NodeProto*>& gap_consumers =
+      cit == consumers_of.end() ? empty_consumers : cit->second;
+
+  onnx::NodeProto* first = nullptr;
+  if (gap_consumers.size() == 1) {
+    first = gap_consumers[0];
+  } else if (gap_consumers.size() == 2) {
+    std::vector<onnx::NodeProto*> reshape_candidates;
+    std::vector<onnx::NodeProto*> shape_candidates;
+    for (onnx::NodeProto* c : gap_consumers) {
+      if (c->op_type() == "Reshape") {
+        reshape_candidates.push_back(c);
+      } else if (c->op_type() == "Shape" && c->domain().empty()) {
+        shape_candidates.push_back(c);
+      }
+    }
+    if (reshape_candidates.size() != 1 || shape_candidates.size() != 1) {
+      return std::nullopt;
+    }
+    first = reshape_candidates[0];
+  } else {
+    return std::nullopt;
+  }
+
+  std::vector<onnx::NodeProto*> reshape_chain;
+  std::string final_out;
+
+  if (MatchFlattenAxis1PassThrough(*first, gap_out)) {
+    reshape_chain = {first};
+    final_out = first->output(0);
+  } else if (MatchReshapeBatchNeg1PassThrough(*first, gap_out, init_map,
+                                              producers_of)) {
+    reshape_chain = {first};
+    final_out = first->output(0);
+  } else {
+    std::vector<onnx::NodeProto*> squeeze_chain;
+    onnx::NodeProto* cand = first;
+    std::string cur = gap_out;
+    while (cand != nullptr) {
+      if (cand->op_type() != "Squeeze" || !cand->domain().empty() ||
+          cand->input_size() == 0 || cand->input(0) != cur ||
+          cand->output_size() != 1) {
+        break;
+      }
+      auto axes = GapSqueezeAxes(*cand, init_map);
+      if (!axes || axes->empty()) {
+        break;
+      }
+      bool all_trailing = true;
+      for (int64_t a : *axes) {
+        if (!SqueezeAxisIsTrailingSpatial(a, n_channels)) {
+          all_trailing = false;
+          break;
+        }
+      }
+      if (!all_trailing) {
+        break;
+      }
+      const std::string& out2 = cand->output(0);
+      if (graph_outputs.count(out2)) {
+        break;
+      }
+      squeeze_chain.push_back(cand);
+      cur = out2;
+      auto nit = consumers_of.find(cur);
+      cand = (nit != consumers_of.end() && nit->second.size() == 1)
+                 ? nit->second[0]
+                 : nullptr;
+    }
+    if (squeeze_chain.empty()) {
+      return std::nullopt;
+    }
+    reshape_chain = std::move(squeeze_chain);
+    final_out = cur;
+  }
+
+  if (graph_outputs.count(final_out)) {
+    return std::nullopt;
+  }
+  auto fit = consumers_of.find(final_out);
+  if (fit == consumers_of.end() || fit->second.size() != 1) {
+    return std::nullopt;
+  }
+  onnx::NodeProto* mm_node = fit->second[0];
+  auto cm = MatchMatMulLikeRaw(*mm_node);
+  if (!cm || cm->x_name != final_out) {
+    return std::nullopt;
+  }
+  auto wit = init_map.find(cm->w_name);
+  if (wit == init_map.end() ||
+      wit->second->data_type() != onnx::TensorProto::FLOAT ||
+      wit->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+  const int64_t k =
+      cm->weight_transposed ? wit->second->dims(1) : wit->second->dims(0);
+  if (k != n_channels) {
+    return std::nullopt;
+  }
+  return std::make_pair(
+      std::move(reshape_chain),
+      ConsumerMatch{mm_node, cm->w_name, cm->weight_transposed});
+}
+
+// Mirrors pruning.py's own `_ConvIntegerChain`. Exactly one of
+// `consumer`/`matmul_consumer` is ever set: `consumer` is the ordinary
+// same-family (`ConvInteger`-based) consumer role; a non-nullopt
+// `matmul_consumer` instead means the walk terminated at the
+// GlobalAveragePool -> Flatten/Reshape/Squeeze -> MatMul/Gemm classifier-head
+// shape (see MatchGapFlattenMatmulConsumer's own comment and this section's
+// own top comment) -- that consumer is always plain FLOAT32, never a
+// ConvIntegerMatch, so it is sliced via the ordinary SliceConsumerWeight, not
+// this section's own int8-aware SliceConvIntegerConsumer.
 struct ConvIntegerChain {
   ConvIntegerMatch producer;
   std::vector<onnx::NodeProto*> chain_ops;
-  ConvIntegerMatch consumer;
+  std::optional<ConvIntegerMatch> consumer;
   int64_t n_channels = 0;
   std::vector<ConvIntegerPassThrough> conv_pass_through;
+  std::optional<ConsumerMatch> matmul_consumer;
 };
 
 // From tensor `start` (a matched `ConvInteger` Conv layer's own logical
@@ -21800,16 +22115,26 @@ struct ConvIntegerChain {
 // along the way, until a same-family, ordinary (`group == 1`)
 // `ConvInteger`-based consumer (reached through its own
 // `DynamicQuantizeLinear` producer) is found whose own `K` matches
-// `n_channels`. Mirrors pruning.py's own `_walk_to_conv_integer_consumer`,
-// EXCEPT for the `GlobalAveragePool` classifier-head exception it also
-// matches -- see this section's own top comment for why that one hop is a
-// known, deliberate gap in this port: a `GlobalAveragePool` hit here simply
-// isn't a recognized op (not in UnaryPassThroughOps, no dedicated case), so
-// the walk declines exactly like any other unmatched topology, never
-// guessing. Returns nullopt if the walk runs out of hops, hits a branch, or
-// never reaches a consumer.
-std::optional<std::tuple<ConvIntegerMatch, std::vector<onnx::NodeProto*>,
-                         std::vector<ConvIntegerPassThrough>>>
+// `n_channels`. Mirrors pruning.py's own `_walk_to_conv_integer_consumer`.
+//
+// As one narrow exception to that same-family-only restriction -- mirroring
+// this file's own plain-float `WalkToConvConsumer`'s identical
+// `recognize_gap_flatten_matmul_consumer` hop, and pruning.py's own
+// `_walk_to_conv_integer_consumer` -- a `GlobalAveragePool` node hit mid-walk
+// is additionally checked for the `-> {Flatten(axis=1), Reshape to
+// [batch, -1], Squeeze-of-trailing-axes} -> {MatMul, vanilla Gemm}` shape
+// MatchGapFlattenMatmulConsumer describes. A match ends the walk there,
+// returned as this function's own 4th value instead of the ordinary
+// ConvIntegerMatch consumer -- mutually exclusive with it. A
+// `GlobalAveragePool` feeding anything else (no recognized
+// `Flatten`/`Reshape`/`Squeeze`-then-matmul-consumer right after it) simply
+// ends the walk undeclined -- this walker has no other, unconditional use
+// for a pooling hop the way the plain-float Conv-chain walker does. Returns
+// nullopt if the walk runs out of hops, hits a branch, or never reaches
+// either kind of consumer.
+std::optional<std::tuple<
+    std::optional<ConvIntegerMatch>, std::vector<onnx::NodeProto*>,
+    std::vector<ConvIntegerPassThrough>, std::optional<ConsumerMatch>>>
 WalkToConvIntegerConsumer(const std::string& start, const InitMap& init_map,
                           const ConsumerMap& consumers_of,
                           const ProducerMap& producers_of,
@@ -21836,8 +22161,9 @@ WalkToConvIntegerConsumer(const std::string& start, const InitMap& init_map,
         auto m =
             MatchConvInteger(ci_node, init_map, consumers_of, producers_of);
         if (m && m->dq_node == nxt && m->K == n_channels) {
-          return std::make_tuple(*m, std::move(chain_ops),
-                                 std::move(pass_through));
+          return std::make_tuple(std::optional<ConvIntegerMatch>(*m),
+                                 std::move(chain_ops), std::move(pass_through),
+                                 std::optional<ConsumerMatch>());
         }
         auto dw = MatchConvIntegerDepthwisePassThrough(
             ci_node, init_map, consumers_of, producers_of, n_channels, nxt);
@@ -21871,6 +22197,28 @@ WalkToConvIntegerConsumer(const std::string& start, const InitMap& init_map,
       continue;
     }
 
+    if (nxt->op_type() == "GlobalAveragePool" && nxt->domain().empty() &&
+        nxt->input_size() == 1 && nxt->input(0) == cur &&
+        nxt->output_size() == 1) {
+      auto gap_match = MatchGapFlattenMatmulConsumer(
+          nxt->output(0), consumers_of, init_map, graph_outputs, n_channels,
+          producers_of);
+      if (gap_match) {
+        chain_ops.push_back(nxt);
+        for (onnx::NodeProto* reshape_node : gap_match->first) {
+          chain_ops.push_back(reshape_node);
+        }
+        return std::make_tuple(std::optional<ConvIntegerMatch>(),
+                               std::move(chain_ops), std::move(pass_through),
+                               std::optional<ConsumerMatch>(gap_match->second));
+      }
+      // No recognized Flatten(axis=1)/Reshape([batch,-1])/Squeeze ->
+      // {MatMul, vanilla Gemm} right after this GlobalAveragePool -- this
+      // walker has no other, unconditional use for a pooling hop, so decline
+      // outright, same as any other unmatched topology.
+      return std::nullopt;
+    }
+
     if (!(UnaryPassThroughOps().count(nxt->op_type()) != 0 &&
           nxt->input_size() == 1 && nxt->input(0) == cur &&
           nxt->output_size() == 1)) {
@@ -21889,15 +22237,27 @@ WalkToConvIntegerConsumer(const std::string& start, const InitMap& init_map,
 }
 
 // Every `ConvInteger`-based producer/consumer pair connected by
-// WalkToConvIntegerConsumer -- both sides always `ConvInteger`-based, see
-// this section's own top comment for why. Mirrors pruning.py's own
-// `_find_conv_integer_chains`, minus its own `matmul_consumer` exception
-// (see this section's own top comment for that known gap).
+// WalkToConvIntegerConsumer -- both sides always `ConvInteger`-based, with
+// one narrow exception: a producer whose logical output reaches the
+// classifier-head `GlobalAveragePool -> {Flatten(axis=1), Reshape to
+// [batch, -1], Squeeze-of-trailing-axes} -> {MatMul, vanilla Gemm}` shape
+// instead surfaces as `matmul_consumer` on the returned ConvIntegerChain --
+// see this section's own top comment. Mirrors pruning.py's own
+// `_find_conv_integer_chains`.
 std::vector<ConvIntegerChain> FindConvIntegerChains(onnx::GraphProto* graph) {
-  InitMap init_map;
-  for (const auto& t : graph->initializer()) {
-    init_map[t.name()] = &t;
-  }
+  // BuildConstantMap (not a bare `graph->initializer()` loop) -- needed so
+  // MatchGapFlattenMatmulConsumer's own MatchReshapeBatchNeg1PassThrough hop
+  // can resolve a `Concat`-produced Reshape target shape's constant tail
+  // segment even when a real `torch.onnx.export` lowers it to a `Constant`
+  // node rather than a genuine `graph.initializer` entry (see
+  // BuildConstantMap's own comment) -- mirrors pruning.py's own
+  // `_find_conv_integer_chains`, which already builds its own `initializer_
+  // map` via `_constant_map` (the identical Python counterpart) for exactly
+  // this reason. Every OTHER matcher this map feeds (MatchConvInteger's own
+  // weight/scale/zero_point resolution, etc.) only ever looks up a
+  // genuine, always-initializer-backed quantized tensor anyway, so this is a
+  // strict widening, never a behavior change for them.
+  InitMap init_map = BuildConstantMap(*graph);
   ConsumerMap consumers_of = ConsumersOf(graph);
   ProducerMap producers_of = ProducersOf(graph);
   std::unordered_set<std::string> graph_outputs;
@@ -21929,13 +22289,14 @@ std::vector<ConvIntegerChain> FindConvIntegerChains(onnx::GraphProto* graph) {
     if (!found) {
       continue;
     }
-    auto& [consumer, chain_ops, pass_through] = *found;
+    auto& [consumer, chain_ops, pass_through, matmul_consumer] = *found;
     ConvIntegerChain chain;
     chain.producer = *m;
     chain.chain_ops = std::move(chain_ops);
     chain.consumer = std::move(consumer);
     chain.n_channels = m->N;
     chain.conv_pass_through = std::move(pass_through);
+    chain.matmul_consumer = std::move(matmul_consumer);
     chains.push_back(std::move(chain));
   }
   return chains;
@@ -21959,9 +22320,11 @@ void ApplyConvIntegerChains(onnx::GraphProto* graph,
 
   for (auto& chain : chains) {
     const ConvIntegerMatch& p = chain.producer;
-    const ConvIntegerMatch& c = chain.consumer;
+    // Exactly one of `chain.consumer`/`chain.matmul_consumer` is ever set --
+    // see ConvIntegerChain's own comment.
+    const std::string& c_key =
+        chain.consumer ? chain.consumer->w_name : chain.matmul_consumer->weight;
     const std::string& p_key = p.w_name;
-    const std::string& c_key = c.w_name;
     if (p_key == c_key) {
       continue;  // Degenerate (the same weight in both roles).
     }
@@ -21984,7 +22347,18 @@ void ApplyConvIntegerChains(onnx::GraphProto* graph,
         StableTopKIndicesAscending(importance, keep_count);
 
     SliceConvIntegerProducer(p, keep, init_map);
-    SliceConvIntegerConsumer(c, keep, init_map);
+    if (chain.consumer) {
+      SliceConvIntegerConsumer(*chain.consumer, keep, init_map);
+    } else {
+      // The classifier-head hop's matched consumer is always a plain
+      // FLOAT32 MatMul/vanilla-Gemm (never a ConvInteger) -- see
+      // ConvIntegerChain's own `matmul_consumer` comment -- sliced by the
+      // ordinary SliceConsumerWeight, not this section's own int8-aware
+      // SliceConvIntegerConsumer.
+      SliceConsumerWeight(init_map.at(chain.matmul_consumer->weight),
+                          chain.matmul_consumer->weight_transposed, keep,
+                          /*is_conv=*/false);
+    }
 
     for (auto& hop : chain.conv_pass_through) {
       // Mirrors _apply_conv_pass_through_hop's identical depthwise-Conv
