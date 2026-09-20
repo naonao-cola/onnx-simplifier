@@ -14,23 +14,13 @@ import zipfile
 
 import numpy as np
 import onnx
-from onnx import parser
+from onnx import TensorProto, helper, numpy_helper
 from onnxsim import simplify
 
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "scripts/android/runner"
 ANDROID_APP = ROOT / "scripts/android/app"
-MODEL_TEXT = '''
-<ir_version: 8, opset_import: ["" : 13]>
-agraph (float[1,4] X) => (float[1,4] Y) {
-  R = Relu(X)
-  T = Identity(R)
-  Y = Identity(T)
-}
-'''
-
-
 def run(command: list[str], *, capture: bool = False) -> str:
     result = subprocess.run(
         command,
@@ -43,7 +33,19 @@ def run(command: list[str], *, capture: bool = False) -> str:
 
 
 def make_models(directory: Path) -> tuple[Path, Path, Path]:
-    original = parser.parse_model(MODEL_TEXT)
+    graph = helper.make_graph(
+        [
+            helper.make_node("Relu", ["X"], ["R"]),
+            helper.make_node("Identity", ["R"], ["T"]),
+            helper.make_node("Identity", ["T"], ["Y"]),
+        ],
+        "relu_smoke",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+    )
+    original = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)], ir_version=8
+    )
     onnx.checker.check_model(original)
     simplified, valid = simplify(original)
     if not valid:
@@ -58,6 +60,43 @@ def make_models(directory: Path) -> tuple[Path, Path, Path]:
     onnx.save(original, original_path)
     onnx.save(simplified, simplified_path)
     np.array([-2.5, -0.25, 0.75, 4.0], dtype=np.float32).tofile(input_path)
+    return original_path, simplified_path, input_path
+
+
+def make_qnn_htp_models(directory: Path) -> tuple[Path, Path, Path]:
+    scale = numpy_helper.from_array(np.array(0.1, dtype=np.float32), name="scale")
+    input_zero_point = numpy_helper.from_array(
+        np.array(128, dtype=np.uint8), name="input_zero_point"
+    )
+    output_zero_point = numpy_helper.from_array(
+        np.array(0, dtype=np.uint8), name="output_zero_point"
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node("QuantizeLinear", ["X", "scale", "input_zero_point"], ["Xq"]),
+            helper.make_node("DequantizeLinear", ["Xq", "scale", "input_zero_point"], ["Xdq"]),
+            helper.make_node("Relu", ["Xdq"], ["R"]),
+            helper.make_node("QuantizeLinear", ["R", "scale", "output_zero_point"], ["Yq"]),
+            helper.make_node("DequantizeLinear", ["Yq", "scale", "output_zero_point"], ["Y"]),
+        ],
+        "quantized_relu",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+        [scale, input_zero_point, output_zero_point],
+    )
+    original = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)], ir_version=8
+    )
+    onnx.checker.check_model(original)
+    simplified, valid = simplify(original)
+    if not valid:
+        raise RuntimeError("onnxsim validation failed for the quantized QNN smoke graph")
+    original_path = directory / "qnn_original.onnx"
+    simplified_path = directory / "qnn_simplified.onnx"
+    input_path = directory / "qnn_input.f32"
+    onnx.save(original, original_path)
+    onnx.save(simplified, simplified_path)
+    np.array([-2.5, -0.5, 0.5, 4.0], dtype=np.float32).tofile(input_path)
     return original_path, simplified_path, input_path
 
 
@@ -99,8 +138,11 @@ def run_qnn_in_app(work: Path, sdk: Path, ndk: Path, adb_prefix: list[str],
     shutil.copy2(runtime_lib, jni_libs / "libonnxruntime.so")
     shutil.copy2(qnn_library, jni_libs / "libonnxruntime_providers_qnn.so")
     shutil.copytree(include_dir, headers, dirs_exist_ok=True)
-    for source in (original, simplified, input_file):
-        shutil.copy2(source, assets / source.name)
+    for source, asset_name in zip(
+        (original, simplified, input_file),
+        ("original.onnx", "simplified.onnx", "input.f32"),
+    ):
+        shutil.copy2(source, assets / asset_name)
     (project / "local.properties").write_text(
         f"sdk.dir={sdk}\nndk.dir={ndk}\n", encoding="utf-8"
     )
@@ -202,6 +244,7 @@ def main() -> int:
             qnn_library = Path(aar.extract(qnn_library_name, qnn_extracted))
 
     model_a, model_b, input_file = make_models(work)
+    qnn_model_a, qnn_model_b, qnn_input_file = make_qnn_htp_models(work)
     build = work / "build"
     runtime_lib = extracted / "jni/arm64-v8a/libonnxruntime.so"
     include_dir = extracted / "headers"
@@ -264,9 +307,15 @@ def main() -> int:
                                      ("qnn-gpu", args.require_gpu),
                                      ("nnapi-no-cpu", args.require_nnapi_hw),
                                      ("nnapi-dsp-direct", args.require_nnapi_dsp)):
+                if target == "qnn-htp":
+                    target_model_a, target_model_b, target_input = (
+                        qnn_model_a, qnn_model_b, qnn_input_file
+                    )
+                else:
+                    target_model_a, target_model_b, target_input = model_a, model_b, input_file
                 ok, detail = run_qnn_in_app(
                     work, sdk, ndk, adb_prefix, runtime_lib, include_dir,
-                    qnn_library, model_a, model_b, input_file, target,
+                    qnn_library, target_model_a, target_model_b, target_input, target,
                 )
                 if not ok:
                     print(f"{'FAIL' if required else 'SKIP'} {target}: {detail[-1500:]}")
