@@ -169,14 +169,18 @@ Java_org_onnxsim_androidtest_MainActivity_runModel(JNIEnv* env, jclass,
                                 device_diagnostics).c_str());
     }
 
-    Ort::Env ort_env(ORT_LOGGING_LEVEL_WARNING, "onnxsim-android-app-test");
+    Ort::Env ort_env(ORT_LOGGING_LEVEL_VERBOSE, "onnxsim-android-app-test");
     Ort::SessionOptions options;
     options.SetIntraOpNumThreads(1);
-    if (target == "qnn-htp" || target == "qnn-gpu") {
+    if (target == "qnn-htp-fallback" || target == "nnapi-fallback") {
+      options.SetLogSeverityLevel(0);
+    }
+    if (target == "qnn-htp" || target == "qnn-gpu" ||
+        target == "qnn-htp-fallback") {
       ort_env.RegisterExecutionProviderLibrary("QNNExecutionProvider", qnn_library);
       std::vector<Ort::ConstEpDevice> qnn_devices;
-      const auto wanted_type = target == "qnn-htp" ? OrtHardwareDeviceType_NPU
-                                                   : OrtHardwareDeviceType_GPU;
+      const auto wanted_type = target == "qnn-gpu" ? OrtHardwareDeviceType_GPU
+                                                    : OrtHardwareDeviceType_NPU;
       for (const auto& device : ort_env.GetEpDevices()) {
         if (device.EpName() == std::string("QNNExecutionProvider")) {
           device_diagnostics += std::string(device.EpName()) + "/" +
@@ -188,17 +192,30 @@ Java_org_onnxsim_androidtest_MainActivity_runModel(JNIEnv* env, jclass,
         throw std::runtime_error("QNN EP exposed no device matching backend; devices: " +
                                  device_diagnostics);
       }
-      options.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
+      const bool allow_cpu_fallback = target == "qnn-htp-fallback";
+      if (!allow_cpu_fallback) options.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
+      else options.EnableProfiling((output_file_path + ".profile").c_str());
+      options.AddFreeDimensionOverrideByName("N", 1);
       std::unordered_map<std::string, std::string> qnn_options{
-          {"backend_type", target == "qnn-htp" ? "htp" : "gpu"}};
-      if (target == "qnn-htp") {
+          {"backend_type", target == "qnn-gpu" ? "gpu" : "htp"}};
+      if (target != "qnn-gpu") {
         qnn_options["enable_htp_fp16_precision"] = "1";
-        qnn_options["offload_graph_io_quantization"] = "0";
+        qnn_options["offload_graph_io_quantization"] =
+            target == "qnn-htp-fallback" ? "1" : "0";
+        if (target == "qnn-htp-fallback") {
+          qnn_options["profiling_level"] = "optrace";
+          qnn_options["profiling_file_path"] = output_file_path + ".optrace.csv";
+          options.AddConfigEntry("ep.context_enable", "1");
+          options.AddConfigEntry("ep.context_embed_mode", "0");
+        }
       }
       options.AppendExecutionProvider_V2(ort_env, qnn_devices, qnn_options);
-    } else if (target == "nnapi-no-cpu") {
+    } else if (target == "nnapi-no-cpu" || target == "nnapi-fallback") {
       device_diagnostics = NnapiDevices();
-      options.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
+      const bool allow_cpu_fallback = target == "nnapi-fallback";
+      if (!allow_cpu_fallback) options.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
+      else options.EnableProfiling((output_file_path + ".profile").c_str());
+      if (allow_cpu_fallback) options.AddFreeDimensionOverrideByName("N", 1);
       Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_Nnapi(
           options.GetUnowned(), NNAPI_FLAG_USE_FP16 | NNAPI_FLAG_CPU_DISABLED));
     } else if (target != "cpu") {
@@ -207,14 +224,26 @@ Java_org_onnxsim_androidtest_MainActivity_runModel(JNIEnv* env, jclass,
 
     auto memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     const auto run_one = [&](const std::string& model, Ort::SessionOptions& run_options) {
-      Ort::Session session(ort_env, model.c_str(), run_options);
-      if (session.GetInputCount() != 1 || session.GetOutputCount() != 1) {
+      std::unique_ptr<Ort::Session> session;
+      if (target == "qnn-htp-fallback" && &run_options == &options) {
+        const auto context_path = model + ".ctx.onnx";
+        run_options.AddConfigEntry("ep.context_file_path", context_path.c_str());
+        run_options.AddConfigEntry("ep.context_enable", "1");
+        {
+          Ort::Session context_session(ort_env, model.c_str(), run_options);
+        }
+        run_options.AddConfigEntry("ep.context_enable", "0");
+        session = std::make_unique<Ort::Session>(ort_env, context_path.c_str(), run_options);
+      } else {
+        session = std::make_unique<Ort::Session>(ort_env, model.c_str(), run_options);
+      }
+      if (session->GetInputCount() != 1 || session->GetOutputCount() != 1) {
         throw std::runtime_error("only single-input, single-output models are supported");
       }
       Ort::AllocatorWithDefaultOptions allocator;
-      auto input_name = session.GetInputNameAllocated(0, allocator);
-      auto output_name = session.GetOutputNameAllocated(0, allocator);
-      auto input_info = session.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
+      auto input_name = session->GetInputNameAllocated(0, allocator);
+      auto output_name = session->GetOutputNameAllocated(0, allocator);
+      auto input_info = session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
       auto shape = input_info.GetShape();
       for (auto& dimension : shape) {
         if (dimension < 0) dimension = 1;
@@ -229,8 +258,13 @@ Java_org_onnxsim_androidtest_MainActivity_runModel(JNIEnv* env, jclass,
                                                      shape.data(), shape.size());
       const char* input_names[] = {input_name.get()};
       const char* output_names[] = {output_name.get()};
-      auto outputs = session.Run(Ort::RunOptions{nullptr}, input_names, &tensor, 1,
-                                 output_names, 1);
+      auto outputs = session->Run(Ort::RunOptions{nullptr}, input_names, &tensor, 1,
+                                  output_names, 1);
+      if ((target == "qnn-htp-fallback" || target == "nnapi-fallback") &&
+          &run_options == &options) {
+        auto profile_path = session->EndProfilingAllocated(allocator);
+        device_diagnostics += " profile=" + std::string(profile_path.get()) + " ";
+      }
       if (outputs.size() != 1 || !outputs[0].IsTensor() ||
           outputs[0].GetTensorTypeAndShapeInfo().GetElementType() !=
               ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {

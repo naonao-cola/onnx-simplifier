@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -135,6 +137,7 @@ def gradle_executable() -> str:
 
 def run_qnn_in_app(work: Path, sdk: Path, ndk: Path, adb_prefix: list[str],
                    runtime_lib: Path, include_dir: Path, qnn_library: Path,
+                   qnn_runtime_aar: Path | None,
                    original: Path, simplified: Path, input_file: Path,
                    target: str) -> tuple[bool, str]:
     """Run a QNN probe in Android's app linker namespace, where vendor libraries are visible."""
@@ -149,6 +152,32 @@ def run_qnn_in_app(work: Path, sdk: Path, ndk: Path, adb_prefix: list[str],
     assets.mkdir(parents=True, exist_ok=True)
     shutil.copy2(runtime_lib, jni_libs / "libonnxruntime.so")
     shutil.copy2(qnn_library, jni_libs / "libonnxruntime_providers_qnn.so")
+    if qnn_runtime_aar is not None and target.startswith("qnn-"):
+        with zipfile.ZipFile(qnn_runtime_aar) as aar:
+            runtime_names = set(aar.namelist())
+            vendor_names = set(run([*adb_prefix, "shell", "ls", "/vendor/lib64"],
+                                   capture=True).splitlines())
+            versions = [
+                int(match.group(1))
+                for name in runtime_names
+                if (match := re.fullmatch(r"jni/arm64-v8a/libQnnHtpV(\d+)Stub\.so", name))
+                and f"libQnnHtpV{match.group(1)}Stub.so" in vendor_names
+            ]
+            if target in ("qnn-htp", "qnn-htp-fallback"):
+                if not versions:
+                    return False, "QNN runtime AAR has no HTP stub matching the phone's vendor libraries"
+                names = ["libQnnHtp.so", "libQnnHtpPrepare.so", "libQnnSystem.so",
+                         f"libQnnHtpV{max(versions)}Stub.so",
+                         f"libQnnHtpV{max(versions)}Skel.so"]
+            elif target == "qnn-gpu":
+                names = ["libQnnGpu.so", "libQnnSystem.so"]
+            else:
+                names = []
+            for name in names:
+                aar_name = f"jni/arm64-v8a/{name}"
+                if aar_name not in runtime_names:
+                    return False, f"QNN runtime AAR is missing {aar_name}"
+                (jni_libs / name).write_bytes(aar.read(aar_name))
     shutil.copytree(include_dir, headers, dirs_exist_ok=True)
     for source, asset_name in zip(
         (original, simplified, input_file),
@@ -191,6 +220,49 @@ def run_qnn_in_app(work: Path, sdk: Path, ndk: Path, adb_prefix: list[str],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if result.returncode == 0 and result.stdout.strip():
             content = result.stdout.strip()
+            if target in ("qnn-htp-fallback", "nnapi-fallback"):
+                logcat = subprocess.run(
+                    [*adb_prefix, "logcat", "-d", "-t", "900"], text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                keywords = ("qnn", "executionprovider", "partition", "fallback",
+                            "supported nodes", "provider")
+                relevant_logs = [
+                    line.strip() for line in logcat.stdout.splitlines()
+                    if any(word in line.lower() for word in keywords)
+                    and ("onnxruntime" in line.lower() or "qnn" in line.lower())
+                ]
+                if relevant_logs:
+                    content += "\nProvider log excerpts: " + " | ".join(relevant_logs[-30:])
+                listing = subprocess.run(
+                    [*adb_prefix, "shell", "run-as", package, "ls", "-1", "files"],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                summaries = []
+                profile_prefix = f"output_{target}.f32.profile_"
+                profile_names = sorted(
+                    name for name in listing.stdout.splitlines()
+                    if name.startswith(profile_prefix)
+                )[-2:]
+                for name in profile_names:
+                    profile = subprocess.run(
+                        [*adb_prefix, "shell", "run-as", package, "cat", f"files/{name}"],
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    )
+                    if profile.returncode != 0:
+                        continue
+                    assignments: dict[str, list[str]] = {}
+                    for event in json.loads(profile.stdout):
+                        if event.get("cat") == "Node":
+                            provider = event.get("args", {}).get("provider", "unknown")
+                            assignments.setdefault(provider, []).append(event.get("name", "?"))
+                    summary = {
+                        provider: f"{len(nodes)} node events; sample={nodes[:2]}"
+                        for provider, nodes in assignments.items()
+                    }
+                    summaries.append(f"{name}: {summary}")
+                if summaries:
+                    content += "\nProfile node assignments: " + " | ".join(summaries)
             return content.startswith("PASS "), content
         time.sleep(0.25)
     return False, "Android test app produced no result (native crash or timeout)"
@@ -201,6 +273,8 @@ def main() -> int:
     ap.add_argument("--runtime-aar", required=True, type=Path)
     ap.add_argument("--qnn-aar", type=Path,
                     help="Qualcomm ONNX Runtime QNN provider AAR; enables HTP and GPU probes")
+    ap.add_argument("--qnn-runtime-aar", type=Path,
+                    help="Qualcomm QNN runtime AAR; packages backend libraries in the test app")
     ap.add_argument("--model", type=Path,
                     help="run a real single-input, single-output float32 ONNX model")
     ap.add_argument("--input-tensor-pb", type=Path,
@@ -216,7 +290,8 @@ def main() -> int:
     ap.add_argument("--require-nnapi-dsp", action="store_true",
                     help="fail unless a direct NNAPI RELU compiles and runs on qti-dsp")
     ap.add_argument("--only-target", action="append",
-                    choices=("qnn-htp", "qnn-gpu", "nnapi-no-cpu", "nnapi-dsp-direct"),
+                    choices=("qnn-htp", "qnn-gpu", "nnapi-no-cpu", "nnapi-dsp-direct",
+                             "qnn-htp-fallback", "nnapi-fallback"),
                     help="run only this hardware target; may be specified more than once")
     ap.add_argument("--android-sdk", type=Path, default=os.environ.get("ANDROID_HOME"))
     ap.add_argument("--ndk-version", default="27.2.12479018")
@@ -236,6 +311,8 @@ def main() -> int:
         ap.error(f"Android ONNX Runtime AAR not found: {args.runtime_aar}")
     if args.qnn_aar is not None and not args.qnn_aar.is_file():
         ap.error(f"Android ONNX Runtime QNN AAR not found: {args.qnn_aar}")
+    if args.qnn_runtime_aar is not None and not args.qnn_runtime_aar.is_file():
+        ap.error(f"Qualcomm QNN runtime AAR not found: {args.qnn_runtime_aar}")
     if args.model is not None and not args.model.is_file():
         ap.error(f"ONNX model not found: {args.model}")
     if args.input_tensor_pb is not None and not args.input_tensor_pb.is_file():
@@ -352,7 +429,9 @@ def main() -> int:
             targets = (("qnn-htp", args.require_htp),
                        ("qnn-gpu", args.require_gpu),
                        ("nnapi-no-cpu", args.require_nnapi_hw),
-                       ("nnapi-dsp-direct", args.require_nnapi_dsp))
+                       ("nnapi-dsp-direct", args.require_nnapi_dsp),
+                       ("qnn-htp-fallback", False),
+                       ("nnapi-fallback", False))
             if args.only_target:
                 targets = tuple(item for item in targets if item[0] in args.only_target)
             for target, required in targets:
@@ -364,7 +443,8 @@ def main() -> int:
                     target_model_a, target_model_b, target_input = model_a, model_b, input_file
                 ok, detail = run_qnn_in_app(
                     work, sdk, ndk, adb_prefix, runtime_lib, include_dir,
-                    qnn_library, target_model_a, target_model_b, target_input, target,
+                    qnn_library, args.qnn_runtime_aar,
+                    target_model_a, target_model_b, target_input, target,
                 )
                 if not ok:
                     print(f"{'FAIL' if required else 'SKIP'} {target}: {detail[-1500:]}")
