@@ -135,10 +135,20 @@ def test_check_flags_default_attr_conv():
 def test_check_flags_lstm():
     model = _model(
         """agraph (float[3,1,4] x) => (float[3,1,1,2] y, float[1,1,2] yh, float[1,1,2] yc)
-        <float[1,8,4] w = {0.1}, float[1,8,2] r = {0.1}>
         {
           y, yh, yc = LSTM(x, w, r) <hidden_size = 2>
-        }"""
+        }""",
+        # Keep the fixture valid across ONNX checker versions. The parser's
+        # inline initializer syntax accepts one float for these multi-element
+        # tensors, but the checker requires all values to be present.
+        initializer=[
+            onnx.numpy_helper.from_array(
+                np.full((1, 8, 4), 0.1, dtype=np.float32), "w"
+            ),
+            onnx.numpy_helper.from_array(
+                np.full((1, 8, 2), 0.1, dtype=np.float32), "r"
+            ),
+        ],
     )
     messages = check_vitisai_support(model)
     assert len(messages) == 1
