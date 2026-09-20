@@ -22,6 +22,9 @@ providers.
 - CMake and Python packages `onnx`, `numpy`, and this repository's `onnxsim`.
 - An ONNX Runtime Android AAR, such as `onnxruntime-android-1.30.0.aar`.
 - For DSP/GPU runs, a QNN provider AAR built for the same ONNX Runtime version.
+- For QNN HTP/GPU app runs, the matching Qualcomm QNN runtime AAR as well. The
+  provider AAR contains the ORT plugin; the runtime AAR supplies QNN backend
+  libraries and HTP skeletons needed by Android apps.
 
 ## Run
 
@@ -29,6 +32,7 @@ providers.
 python scripts/android/run_onnxruntime_android.py \
   --runtime-aar /path/to/onnxruntime-android.aar \
   --qnn-aar /path/to/onnxruntime-android-qnn.aar \
+  --qnn-runtime-aar /path/to/qnn-runtime.aar \
   --android-sdk "$ANDROID_HOME" \
   --ndk-version 27.2.12479018
 ```

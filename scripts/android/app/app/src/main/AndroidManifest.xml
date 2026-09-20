@@ -3,6 +3,7 @@
         android:allowBackup="false"
         android:label="onnxsim device test"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true">
