@@ -188,7 +188,10 @@ Java_org_onnxsim_androidtest_MainActivity_runModel(JNIEnv* env, jclass,
       options.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
       std::unordered_map<std::string, std::string> qnn_options{
           {"backend_type", target == "qnn-htp" ? "htp" : "gpu"}};
-      if (target == "qnn-htp") qnn_options["enable_htp_fp16_precision"] = "1";
+      if (target == "qnn-htp") {
+        qnn_options["enable_htp_fp16_precision"] = "1";
+        qnn_options["offload_graph_io_quantization"] = "0";
+      }
       options.AppendExecutionProvider_V2(ort_env, qnn_devices, qnn_options);
     } else if (target == "nnapi-no-cpu") {
       device_diagnostics = NnapiDevices();

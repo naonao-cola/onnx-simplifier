@@ -9,9 +9,11 @@ The QNN sessions disable ORT CPU fallback; a pass means QNN accepted the
 complete graph. The automatic NNAPI run records available device names/types
 and disables NNAPI's CPU device.
 
-The probe keeps a `Relu` node after simplification and removes redundant
-`Identity` nodes around it. It checks the original and simplified graph against
-the same expected output on each available backend.
+The CPU and NNAPI probes keep a float32 `Relu` node and remove redundant
+`Identity` nodes around it. The QNN HTP probe uses a separate quantize/dequantize
+`Relu` graph because HTP expects quantized models. Each run checks both graph
+outputs against the expected values with CPU fallback disabled for hardware
+providers.
 
 ## Requirements
 
@@ -48,10 +50,10 @@ executable.
 
 ## Xiaomi 12S probe result
 
-The current probe passes with the CPU provider and NNAPI with NNAPI's CPU device
-disabled. Android reports `qti-gpu` and `qti-dsp` hardware devices, but NNAPI
-chooses the device automatically, so this result does not prove which device
-handled the graph. The QNN EP exposes an NPU device but rejects the current
-`Relu` graph with CPU fallback disabled; it does not expose a separate QNN GPU
-device on this phone. Those QNN results are reported as skips until a graph and
-provider setup achieve full placement.
+The CPU and NNAPI float32 probes pass, including direct compilation on
+`qti-dsp`. Android reports `qti-gpu` and `qti-dsp` hardware devices; the NNAPI
+execution provider chooses the device automatically, while the direct DSP probe
+explicitly selects `qti-dsp`. The QNN EP exposes an NPU device, but the
+quantized QDQ `Relu` graph still leaves nodes assigned to the default CPU EP
+with fallback disabled. It also does not expose a separate QNN GPU device on
+this phone, so QNN HTP/GPU remain unconfirmed.
