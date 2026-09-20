@@ -39,6 +39,10 @@ backend that cannot load or execute reports `SKIP`. Use `--require-htp` and/or
 `--require-gpu` to make the matching QNN backend mandatory. Use
 `--require-nnapi-hw` to require NNAPI execution with its CPU device disabled.
 Use `--require-nnapi-dsp` to require the explicit `qti-dsp` NNAPI compile and run.
+Use `--only-target qnn-htp` or `--only-target nnapi-no-cpu` (repeatable) to run
+selected accelerator targets. For a real model, pass `--model` with its sample
+`--input-tensor-pb`; `--reference-output-pb` additionally checks the CPU output
+against a published sample output.
 Android chooses among its available NNAPI hardware devices, so this check does
 not claim a specific GPU driver was selected. CPU is always required. Host build
 artifacts use a temporary directory unless `--work-dir` is provided; phone
@@ -47,6 +51,26 @@ staging files are removed after the run. The debug test APK remains installed.
 The runtime and QNN AARs are not vendored. The script extracts only the arm64
 runtime library, headers, and QNN provider needed to build the smoke-test
 executable.
+
+## Real MobileNetV2 model
+
+The same runner accepts the ONNX Model Zoo MobileNetV2 QDQ model and its
+published sample tensors. The model expects an RGB tensor `[1,3,224,224]`
+normalized with ImageNet mean and standard deviation. Its archive includes the
+preprocessed input and expected 1000-class output. After extracting it, run:
+
+```bash
+python scripts/android/run_onnxruntime_android.py \
+  --runtime-aar /path/to/onnxruntime-android.aar \
+  --qnn-aar /path/to/onnxruntime-android-qnn.aar \
+  --android-sdk "$ANDROID_HOME" \
+  --model /path/to/mobilenetv2-12-qdq.onnx \
+  --input-tensor-pb /path/to/test_data_set_0/input_0.pb \
+  --reference-output-pb /path/to/test_data_set_0/output_0.pb
+```
+
+The fp32 MobileNetV2 archive can be tested the same way. QNN HTP is tested with
+the QDQ variant; NNAPI can be tested with either variant.
 
 ## Xiaomi 12S probe result
 
@@ -57,3 +81,9 @@ explicitly selects `qti-dsp`. The QNN EP exposes an NPU device, but the
 quantized QDQ `Relu` graph still leaves nodes assigned to the default CPU EP
 with fallback disabled. It also does not expose a separate QNN GPU device on
 this phone, so QNN HTP/GPU remain unconfirmed.
+
+The real ONNX Model Zoo MobileNetV2 fp32 and QDQ models both pass Android CPU
+comparison against their published sample outputs. The QDQ model still leaves
+nodes on CPU in QNN HTP, and NNAPI leaves nodes on CPU for both fp32 and QDQ
+MobileNet when CPU fallback is disabled. The independent direct `qti-dsp` RELU
+probe passes on the image tensor's first four values.

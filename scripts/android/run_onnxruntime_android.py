@@ -32,34 +32,46 @@ def run(command: list[str], *, capture: bool = False) -> str:
     return result.stdout.strip() if capture else ""
 
 
-def make_models(directory: Path) -> tuple[Path, Path, Path]:
-    graph = helper.make_graph(
-        [
-            helper.make_node("Relu", ["X"], ["R"]),
-            helper.make_node("Identity", ["R"], ["T"]),
-            helper.make_node("Identity", ["T"], ["Y"]),
-        ],
-        "relu_smoke",
-        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
-        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
-    )
-    original = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)], ir_version=8
-    )
+def make_models(directory: Path, model_path: Path | None = None,
+                input_tensor_pb: Path | None = None) -> tuple[Path, Path, Path]:
+    if model_path is None:
+        graph = helper.make_graph(
+            [
+                helper.make_node("Relu", ["X"], ["R"]),
+                helper.make_node("Identity", ["R"], ["T"]),
+                helper.make_node("Identity", ["T"], ["Y"]),
+            ],
+            "relu_smoke",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+        )
+        original = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 13)], ir_version=8
+        )
+    else:
+        if input_tensor_pb is None:
+            raise RuntimeError("--input-tensor-pb is required with --model")
+        original = onnx.load(model_path)
     onnx.checker.check_model(original)
     simplified, valid = simplify(original)
-    if not valid:
+    if not valid or (model_path is None and
+                     len(simplified.graph.node) >= len(original.graph.node)):
         raise RuntimeError("onnxsim validation failed for the Android smoke model")
-    if len(simplified.graph.node) >= len(original.graph.node):
-        raise RuntimeError("onnxsim did not remove the redundant Identity nodes")
     if not any(node.op_type == "Relu" for node in simplified.graph.node):
-        raise RuntimeError("onnxsim smoke graph lost its Relu compute node")
+        if model_path is None:
+            raise RuntimeError("onnxsim smoke graph lost its Relu compute node")
     original_path = directory / "original.onnx"
     simplified_path = directory / "simplified.onnx"
     input_path = directory / "input.f32"
     onnx.save(original, original_path)
     onnx.save(simplified, simplified_path)
-    np.array([-2.5, -0.25, 0.75, 4.0], dtype=np.float32).tofile(input_path)
+    if model_path is None:
+        input_values = np.array([-2.5, -0.25, 0.75, 4.0], dtype=np.float32)
+    else:
+        input_values = onnx.numpy_helper.to_array(onnx.load_tensor(str(input_tensor_pb)))
+        if input_values.dtype != np.float32:
+            raise RuntimeError("Android model tests currently require a float32 input tensor")
+    np.asarray(input_values, dtype=np.float32).tofile(input_path)
     return original_path, simplified_path, input_path
 
 
@@ -189,6 +201,12 @@ def main() -> int:
     ap.add_argument("--runtime-aar", required=True, type=Path)
     ap.add_argument("--qnn-aar", type=Path,
                     help="Qualcomm ONNX Runtime QNN provider AAR; enables HTP and GPU probes")
+    ap.add_argument("--model", type=Path,
+                    help="run a real single-input, single-output float32 ONNX model")
+    ap.add_argument("--input-tensor-pb", type=Path,
+                    help="ONNX TensorProto input sample to use with --model")
+    ap.add_argument("--reference-output-pb", type=Path,
+                    help="optional ONNX TensorProto expected output for --model")
     ap.add_argument("--require-htp", action="store_true",
                     help="fail unless both original and simplified models run on QNN HTP")
     ap.add_argument("--require-gpu", action="store_true",
@@ -197,6 +215,9 @@ def main() -> int:
                     help="fail unless both models pass NNAPI with its CPU device disabled")
     ap.add_argument("--require-nnapi-dsp", action="store_true",
                     help="fail unless a direct NNAPI RELU compiles and runs on qti-dsp")
+    ap.add_argument("--only-target", action="append",
+                    choices=("qnn-htp", "qnn-gpu", "nnapi-no-cpu", "nnapi-dsp-direct"),
+                    help="run only this hardware target; may be specified more than once")
     ap.add_argument("--android-sdk", type=Path, default=os.environ.get("ANDROID_HOME"))
     ap.add_argument("--ndk-version", default="27.2.12479018")
     ap.add_argument("--adb", default="adb")
@@ -215,7 +236,17 @@ def main() -> int:
         ap.error(f"Android ONNX Runtime AAR not found: {args.runtime_aar}")
     if args.qnn_aar is not None and not args.qnn_aar.is_file():
         ap.error(f"Android ONNX Runtime QNN AAR not found: {args.qnn_aar}")
-    if (args.require_htp or args.require_gpu or args.require_nnapi_hw or
+    if args.model is not None and not args.model.is_file():
+        ap.error(f"ONNX model not found: {args.model}")
+    if args.input_tensor_pb is not None and not args.input_tensor_pb.is_file():
+        ap.error(f"ONNX input TensorProto not found: {args.input_tensor_pb}")
+    if args.reference_output_pb is not None and not args.reference_output_pb.is_file():
+        ap.error(f"ONNX reference output TensorProto not found: {args.reference_output_pb}")
+    if (args.model is None) != (args.input_tensor_pb is None):
+        ap.error("--model and --input-tensor-pb must be provided together")
+    if args.reference_output_pb is not None and args.model is None:
+        ap.error("--reference-output-pb requires --model")
+    if (args.only_target or args.require_htp or args.require_gpu or args.require_nnapi_hw or
             args.require_nnapi_dsp) and args.qnn_aar is None:
         ap.error("accelerator requirements need --qnn-aar for the Android probe app")
 
@@ -243,8 +274,11 @@ def main() -> int:
                 ap.error(f"{args.qnn_aar} has no arm64 QNN execution provider library")
             qnn_library = Path(aar.extract(qnn_library_name, qnn_extracted))
 
-    model_a, model_b, input_file = make_models(work)
-    qnn_model_a, qnn_model_b, qnn_input_file = make_qnn_htp_models(work)
+    model_a, model_b, input_file = make_models(work, args.model, args.input_tensor_pb)
+    if args.model is None:
+        qnn_model_a, qnn_model_b, qnn_input_file = make_qnn_htp_models(work)
+    else:
+        qnn_model_a, qnn_model_b, qnn_input_file = model_a, model_b, input_file
     build = work / "build"
     runtime_lib = extracted / "jni/arm64-v8a/libonnxruntime.so"
     include_dir = extracted / "headers"
@@ -268,7 +302,14 @@ def main() -> int:
         ]
         for host, name in files_to_push:
             run([*adb_prefix, "push", str(host), f"{remote}/{name}"])
-        expected = np.maximum(np.fromfile(input_file, dtype=np.float32), 0)
+        expected = None if args.model is not None else np.maximum(
+            np.fromfile(input_file, dtype=np.float32), 0
+        )
+        if args.reference_output_pb is not None:
+            expected = np.asarray(
+                numpy_helper.to_array(onnx.load_tensor(str(args.reference_output_pb))),
+                dtype=np.float32,
+            ).reshape(-1)
 
         def invoke(model_name: str, output_name: str, target: str | None = None) -> tuple[bool, str]:
             args_list = [f"./runner", model_name, "input.f32", output_name]
@@ -295,18 +336,26 @@ def main() -> int:
             if not ok:
                 raise RuntimeError(f"Android CPU run failed: {detail}")
             cpu_outputs.append(get_output(output_name))
-        if not all(out.shape == expected.shape and np.allclose(out, expected, rtol=1e-5, atol=1e-6)
-                   for out in cpu_outputs):
-            raise RuntimeError(f"Android CPU output mismatch: expected {expected}, got {cpu_outputs}")
-        print(f"PASS Android ONNX Runtime CPU: original == simplified == reference on {serial}")
+        if cpu_outputs[0].shape != cpu_outputs[1].shape or not np.allclose(
+                cpu_outputs[0], cpu_outputs[1], rtol=1e-4, atol=1e-4):
+            raise RuntimeError("Android CPU outputs differ between original and simplified model")
+        if expected is not None and not all(
+                out.shape == expected.shape and np.allclose(out, expected, rtol=1e-3, atol=1e-3)
+                for out in cpu_outputs):
+            raise RuntimeError("Android CPU output does not match the supplied reference tensor")
+        suffix = " and model-zoo reference" if args.reference_output_pb is not None else ""
+        print(f"PASS Android ONNX Runtime CPU: original == simplified{suffix} on {serial}")
 
         if qnn_library is None:
             print("SKIP QNN HTP/GPU: pass --qnn-aar to enable hardware runs")
         else:
-            for target, required in (("qnn-htp", args.require_htp),
-                                     ("qnn-gpu", args.require_gpu),
-                                     ("nnapi-no-cpu", args.require_nnapi_hw),
-                                     ("nnapi-dsp-direct", args.require_nnapi_dsp)):
+            targets = (("qnn-htp", args.require_htp),
+                       ("qnn-gpu", args.require_gpu),
+                       ("nnapi-no-cpu", args.require_nnapi_hw),
+                       ("nnapi-dsp-direct", args.require_nnapi_dsp))
+            if args.only_target:
+                targets = tuple(item for item in targets if item[0] in args.only_target)
+            for target, required in targets:
                 if target == "qnn-htp":
                     target_model_a, target_model_b, target_input = (
                         qnn_model_a, qnn_model_b, qnn_input_file

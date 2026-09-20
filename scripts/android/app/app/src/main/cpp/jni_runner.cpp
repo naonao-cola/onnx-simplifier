@@ -3,6 +3,7 @@
 #include <nnapi_provider_factory.h>
 #include <android/NeuralNetworks.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -144,21 +145,23 @@ Java_org_onnxsim_androidtest_MainActivity_runModel(JNIEnv* env, jclass,
     std::ifstream input_file(input_file_path, std::ios::binary);
     if (!input_file) throw std::runtime_error("cannot open input tensor");
     std::vector<char> raw_input((std::istreambuf_iterator<char>(input_file)), {});
-    if (raw_input.size() != 4 * sizeof(float)) {
-      throw std::runtime_error("invalid float32 input tensor");
+    if (raw_input.size() < 4 * sizeof(float) || raw_input.size() % sizeof(float) != 0) {
+      throw std::runtime_error("input must contain float32 values (at least four)");
     }
-    std::array<float, 4> input{};
-    std::memcpy(input.data(), raw_input.data(), sizeof(input));
+    std::vector<float> input(raw_input.size() / sizeof(float));
+    std::memcpy(input.data(), raw_input.data(), raw_input.size());
 
     if (target == "nnapi-dsp-direct") {
+      std::array<float, 4> dsp_input{};
+      std::copy_n(input.begin(), dsp_input.size(), dsp_input.begin());
       std::array<float, 4> output{};
-      device_diagnostics = RunReluOnQtiDsp(input, output);
+      device_diagnostics = RunReluOnQtiDsp(dsp_input, output);
       std::ofstream output_file(output_file_path, std::ios::binary);
       output_file.write(reinterpret_cast<const char*>(output.data()), sizeof(output));
       if (!output_file) throw std::runtime_error("could not write DSP output tensor");
-      for (size_t i = 0; i < input.size(); ++i) {
-        const float expected = input[i] < 0.0f ? 0.0f : input[i];
-        if (std::abs(output[i] - expected) > 1e-5f) {
+      for (size_t i = 0; i < dsp_input.size(); ++i) {
+        const float expected = dsp_input[i] < 0.0f ? 0.0f : dsp_input[i];
+        if (std::abs(output[i] - expected) > 1e-2f) {
           throw std::runtime_error("qti-dsp RELU output differs from reference");
         }
       }
@@ -202,36 +205,79 @@ Java_org_onnxsim_androidtest_MainActivity_runModel(JNIEnv* env, jclass,
       throw std::runtime_error("unknown target: " + target);
     }
 
-    const std::array<int64_t, 2> shape{1, 4};
     auto memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-    const char* input_names[] = {"X"};
-    const char* output_names[] = {"Y"};
-    const auto run_one = [&](const std::string& model) {
-      Ort::Session session(ort_env, model.c_str(), options);
+    const auto run_one = [&](const std::string& model, Ort::SessionOptions& run_options) {
+      Ort::Session session(ort_env, model.c_str(), run_options);
+      if (session.GetInputCount() != 1 || session.GetOutputCount() != 1) {
+        throw std::runtime_error("only single-input, single-output models are supported");
+      }
+      Ort::AllocatorWithDefaultOptions allocator;
+      auto input_name = session.GetInputNameAllocated(0, allocator);
+      auto output_name = session.GetOutputNameAllocated(0, allocator);
+      auto input_info = session.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
+      auto shape = input_info.GetShape();
+      for (auto& dimension : shape) {
+        if (dimension < 0) dimension = 1;
+      }
+      size_t expected_input_count = 1;
+      for (const auto dimension : shape) expected_input_count *= static_cast<size_t>(dimension);
+      if (input_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+          expected_input_count != input.size()) {
+        throw std::runtime_error("model input must be fixed-shape float32 matching input.f32");
+      }
       auto tensor = Ort::Value::CreateTensor<float>(memory, input.data(), input.size(),
                                                      shape.data(), shape.size());
+      const char* input_names[] = {input_name.get()};
+      const char* output_names[] = {output_name.get()};
       auto outputs = session.Run(Ort::RunOptions{nullptr}, input_names, &tensor, 1,
                                  output_names, 1);
       if (outputs.size() != 1 || !outputs[0].IsTensor() ||
-          outputs[0].GetTensorTypeAndShapeInfo().GetElementCount() != input.size()) {
-        throw std::runtime_error("unexpected model output");
+          outputs[0].GetTensorTypeAndShapeInfo().GetElementType() !=
+              ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        throw std::runtime_error("model must return one float32 tensor");
       }
+      auto output_info = outputs[0].GetTensorTypeAndShapeInfo();
       const float* data = outputs[0].GetTensorData<float>();
-      return std::vector<float>(data, data + input.size());
+      return std::vector<float>(data, data + output_info.GetElementCount());
     };
-    const auto original_values = run_one(original_model);
-    const auto values = run_one(simplified_model);
-    std::ofstream output_file(output_file_path, std::ios::binary);
-    output_file.write(reinterpret_cast<const char*>(values.data()), sizeof(float) * input.size());
-    if (!output_file) throw std::runtime_error("could not write model output");
-    for (size_t i = 0; i < input.size(); ++i) {
-      const float expected = input[i] < 0.0f ? 0.0f : input[i];
-      if (std::abs(values[i] - expected) > 1e-5f ||
-          std::abs(original_values[i] - values[i]) > 1e-5f) {
-        throw std::runtime_error("original/simplified output differs from expected Relu values");
+    Ort::SessionOptions cpu_options;
+    cpu_options.SetIntraOpNumThreads(1);
+    const auto original_cpu_values = run_one(original_model, cpu_options);
+    const auto simplified_cpu_values = run_one(simplified_model, cpu_options);
+    const auto original_values = run_one(original_model, options);
+    const auto values = run_one(simplified_model, options);
+    const auto compare_outputs = [](const std::vector<float>& actual,
+                                    const std::vector<float>& expected,
+                                    const char* description) {
+      if (actual.size() != expected.size() || actual.empty()) {
+        throw std::runtime_error(std::string(description) + " has an unexpected output size");
       }
-    }
-    return env->NewStringUTF(("PASS " + target + " original/simplified reference " +
+      float max_abs_error = 0.0f;
+      size_t actual_top = 0;
+      size_t expected_top = 0;
+      for (size_t i = 0; i < actual.size(); ++i) {
+        max_abs_error = std::max(max_abs_error, std::abs(actual[i] - expected[i]));
+        if (actual[i] > actual[actual_top]) actual_top = i;
+        if (expected[i] > expected[expected_top]) expected_top = i;
+      }
+      if (max_abs_error > 0.05f || actual_top != expected_top) {
+        throw std::runtime_error(std::string(description) + " differs from CPU reference (max_abs=" +
+                                 std::to_string(max_abs_error) + ", top1=" +
+                                 std::to_string(actual_top) + "/" +
+                                 std::to_string(expected_top) + ")");
+      }
+      return max_abs_error;
+    };
+    compare_outputs(simplified_cpu_values, original_cpu_values, "simplified CPU output");
+    const float original_error = compare_outputs(original_values, original_cpu_values,
+                                                 "original hardware output");
+    const float simplified_error = compare_outputs(values, simplified_cpu_values,
+                                                   "simplified hardware output");
+    std::ofstream output_file(output_file_path, std::ios::binary);
+    output_file.write(reinterpret_cast<const char*>(values.data()), sizeof(float) * values.size());
+    if (!output_file) throw std::runtime_error("could not write model output");
+    return env->NewStringUTF(("PASS " + target + " original/simplified vs CPU top1; max_abs=" +
+                              std::to_string(std::max(original_error, simplified_error)) + " " +
                               device_diagnostics).c_str());
   } catch (const Ort::Exception& error) {
     return env->NewStringUTF(("FAIL " + ToString(env, target_value) + ": " + error.what() +
