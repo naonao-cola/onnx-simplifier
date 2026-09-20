@@ -153,6 +153,8 @@ def main() -> int:
                     help="fail unless both original and simplified models run on QNN GPU")
     ap.add_argument("--require-nnapi-hw", action="store_true",
                     help="fail unless both models pass NNAPI with its CPU device disabled")
+    ap.add_argument("--require-nnapi-dsp", action="store_true",
+                    help="fail unless a direct NNAPI RELU compiles and runs on qti-dsp")
     ap.add_argument("--android-sdk", type=Path, default=os.environ.get("ANDROID_HOME"))
     ap.add_argument("--ndk-version", default="27.2.12479018")
     ap.add_argument("--adb", default="adb")
@@ -171,8 +173,9 @@ def main() -> int:
         ap.error(f"Android ONNX Runtime AAR not found: {args.runtime_aar}")
     if args.qnn_aar is not None and not args.qnn_aar.is_file():
         ap.error(f"Android ONNX Runtime QNN AAR not found: {args.qnn_aar}")
-    if (args.require_htp or args.require_gpu or args.require_nnapi_hw) and args.qnn_aar is None:
-        ap.error("accelerator requirements need --qnn-aar")
+    if (args.require_htp or args.require_gpu or args.require_nnapi_hw or
+            args.require_nnapi_dsp) and args.qnn_aar is None:
+        ap.error("accelerator requirements need --qnn-aar for the Android probe app")
 
     serial = select_device(args.adb, args.serial)
     work_ctx = tempfile.TemporaryDirectory(prefix="onnxsim-android-") if args.work_dir is None else None
@@ -259,7 +262,8 @@ def main() -> int:
         else:
             for target, required in (("qnn-htp", args.require_htp),
                                      ("qnn-gpu", args.require_gpu),
-                                     ("nnapi-no-cpu", args.require_nnapi_hw)):
+                                     ("nnapi-no-cpu", args.require_nnapi_hw),
+                                     ("nnapi-dsp-direct", args.require_nnapi_dsp)):
                 ok, detail = run_qnn_in_app(
                     work, sdk, ndk, adb_prefix, runtime_lib, include_dir,
                     qnn_library, model_a, model_b, input_file, target,

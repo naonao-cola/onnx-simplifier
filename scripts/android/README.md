@@ -3,9 +3,11 @@
 This smoke test runs an ONNX model and its `onnxsim` result with ONNX Runtime's
 CPU execution provider on a connected Android arm64 device. When given the QNN
 provider AAR, it also tries QNN HTP, QNN GPU, and Android NNAPI with NNAPI's CPU
-device disabled. The QNN sessions disable ORT CPU fallback; a pass means QNN
-accepted the complete graph. The NNAPI run records available device names/types
-and disables NNAPI's CPU device, while Android selects the supporting hardware.
+device disabled. It also builds a tiny NNAPI RELU model and compiles it directly
+for `qti-dsp`, checking that the DSP driver accepts and executes the program.
+The QNN sessions disable ORT CPU fallback; a pass means QNN accepted the
+complete graph. The automatic NNAPI run records available device names/types
+and disables NNAPI's CPU device.
 
 The probe keeps a `Relu` node after simplification and removes redundant
 `Identity` nodes around it. It checks the original and simplified graph against
@@ -34,6 +36,7 @@ device. QNN HTP and GPU runs are attempted when `--qnn-aar` is provided; a
 backend that cannot load or execute reports `SKIP`. Use `--require-htp` and/or
 `--require-gpu` to make the matching QNN backend mandatory. Use
 `--require-nnapi-hw` to require NNAPI execution with its CPU device disabled.
+Use `--require-nnapi-dsp` to require the explicit `qti-dsp` NNAPI compile and run.
 Android chooses among its available NNAPI hardware devices, so this check does
 not claim a specific GPU driver was selected. CPU is always required. Host build
 artifacts use a temporary directory unless `--work-dir` is provided; phone
