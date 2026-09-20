@@ -107,11 +107,10 @@ _QUANT_CONV_VARIANTS = {
         { Y = ConvInteger(X, W) }
     """,
     "qlinear_conv": """
-        g (uint8[1,8,10,10] X) => (uint8[1,8,8,8] Y)
+        g (uint8[1,8,10,10] X, uint8[8,8,3,3] w) => (uint8[1,8,8,8] Y)
         <
           float x_scale = {0.5},
           uint8 x_zero_point = {0},
-          float[8,8,3,3] w = {0.0},
           float w_scale = {0.5},
           uint8 w_zero_point = {0},
           float y_scale = {0.5},
@@ -150,11 +149,10 @@ _QUANT_MATMUL_VARIANTS = {
         { Y = MatMulInteger(A, B) }
     """,
     "qlinear_matmul": """
-        g (uint8[4,8] A) => (uint8[4,16] Y)
+        g (uint8[4,8] A, uint8[8,16] b) => (uint8[4,16] Y)
         <
           float a_scale = {0.5},
           uint8 a_zero_point = {0},
-          float[8,16] b = {0.0},
           float b_scale = {0.5},
           uint8 b_zero_point = {0},
           float y_scale = {0.5},

@@ -192,4 +192,7 @@ def test_unlisted_frontend_failures_classify_as_broken():
         assert op not in pulsar2_ops.AX650_SUPPORTED_OPS, op
         assert op in pulsar2_ops.AX650_CONFIRMED_BROKEN_OPS, op
         assert op_coverage.classify(op) == op_coverage.BROKEN, op
-    assert len(op_coverage.coverage_table()["unlisted"]) == 80
+    # ONNX can add default-domain operators between releases (for example,
+    # SwiGLU in 1.23), so keep the historical floor without pinning an exact
+    # count to one ONNX schema snapshot.
+    assert len(op_coverage.coverage_table()["unlisted"]) >= 80
