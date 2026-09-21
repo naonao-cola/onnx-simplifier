@@ -267,3 +267,141 @@ well on Hexagon:
 - Kernels must link with `-nostdlib++` and the skeleton must be relinked with
   `relink_hexagon_skel_static_libcxx.sh` (see `docs/tvm-hexagon-conv-transpose-handoff.md`).
 
+## Hexagon DSP vs. Adreno GPU code generation
+
+`bench_tvm_adreno_maskrcnn_ops.py` runs the same operator shapes through TVM's OpenCL code
+generator (`opencl -device=adreno`) on the phone's Adreno GPU. Operators are written as plain
+TE and scheduled automatically by `tvm.dlight` (Matmul/GEMV/Reduction/Fallback rules); there
+are no hand-written GPU schedules. Kernels run over RPC and are checked against a host-CPU
+TVM build of the same compute. This needs a TVM Android runtime with OpenCL, which the
+Hexagon build does not include:
+
+```bash
+cmake $TVM -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 -DUSE_LLVM=OFF -DUSE_OPENCL=ON \
+  -DUSE_RPC=ON -DUSE_CPP_RPC=ON -DCMAKE_CXX_FLAGS="-isystem <dir containing CL/opencl.h>"
+ninja tvm_runtime tvm_rpc   # push both to the phone, then:
+./tvm_rpc server --host=0.0.0.0 --port=9190 --port-end=9199 --key=adreno
+adb forward tcp:9190 tcp:9190
+TVM_NDK_CC=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++ \
+  python scripts/android/bench_tvm_adreno_maskrcnn_ops.py
+```
+
+(`3rdparty/OpenCL-Headers` is an empty submodule in the TVM release tarball, hence the header
+directory; the runtime `dlopen`s the phone's `libOpenCL.so`.) Medians of single invocations,
+fp32 on both sides, device buffers preallocated, transfers excluded, ROI batch 8:
+
+| Operator | Hexagon DSP | Adreno GPU (dlight) |
+|---|---:|---:|
+| Conv 3x3 + bias + ReLU `[1,64,56,56]` | 178.5 ms | 20.3 ms |
+| Conv 1x1 `[1,64,56,56]` | 12.2 ms | 3.4 ms |
+| Conv 3x3 `[1,256,14,14]` | 158.9 ms | 29.0 ms |
+| Conv 3x3 `[8,256,14,14]` (mask head) | 1337.7 ms | 169.9 ms |
+| MaxPool `[1,64,112,112]` | 6.5 ms | 0.20 ms |
+| FPN resize `[1,256,14,14]`->28 | 7.2 ms | 0.05 ms |
+| RoIAlign 56x56 -> 7x7 x8 | 27.5 ms | 0.99 ms |
+| ConvTranspose `[8,256,14,14]`, generic TOPI | 5802 ms | 192.8 ms |
+| ConvTranspose, stride-2 parity formulation | 12.8 ms (hand-written HVX; ~23 ms with layout copies) | 40.8 ms |
+| Quantize + dequantize `[1,3,224,224]` | 3.64 ms | 0.08 ms |
+| Add / Relu / Add+Relu `[1,256,56,56]` | 0.51 / 0.29 / 0.46 ms | 0.31 / 0.19 / 0.32 ms |
+| Add / Relu / Add+Relu `[1,2048,7,7]` | 0.07 / 0.01 / 0.07 ms | 0.04 / 0.03 / 0.04 ms |
+| MatMul `[8,12544]x[12544,1024]` + ReLU | 78.5 ms generic, 12.6 ms HVX | 34.3 ms |
+| MatMul `[8,1024]x[1024,1024]` + ReLU | 6.2 ms generic, 1.19 ms HVX | 2.27 ms |
+| MatMul `[8,1024]x[1024,324]` | 8.4 ms generic, 0.61 ms HVX | 5.54 ms |
+| MatMul `[8,1024]x[1024,81]` | 2.5 ms generic, 0.11 ms HVX | 5.33 ms |
+| Softmax `[8,81]` | 0.05 ms | 0.01 ms |
+| Sigmoid `[8,81,28,28]` | 10.0 ms TOPI, 1.0 ms polynomial exp | 0.11 ms |
+| Box decode / level mapper / score filter | 0.11 / 0.05 / 0.05 ms | 0.01 / 0.007 / 0.01 ms |
+| Gather / Concat / Split / Transpose / Flatten | 0.02 / 0.12 / 0.01 / 0.003 / 0.20 ms | 0.007 / 0.013 / 0.02 / 0.005 / 0.03 ms |
+| ReduceMin `[1000]` | 0.002 ms | 0.20 ms |
+| TopK, NMS, NonZero, ScatterElements | 0.93, 8.1, 0.05, 0.44 ms | not attempted (data-dependent) |
+
+How to read this:
+
+- **Like-for-like schedules favour the GPU by 5-20x** for convolution, pooling, resize and
+  RoIAlign in fp32; the DSP has no native HVX fp32 multiply-add on this generation (fp32 goes
+  through qf32 conversions), while the Adreno has fp32 ALUs and far higher memory bandwidth.
+  The DSP's strength is int8 `vrmpy`: the NCHWc int8 3x3 probe above runs the same
+  `[1,64,56,56]` convolution in 1.2 ms, a different dtype but the relevant comparison for a
+  quantized model.
+- **Hand-tuned DSP kernels beat auto-scheduled GPU ones where effort was spent**: the HVX
+  ConvTranspose (12.8 vs 40.8 ms) and the small-batch box-head MatMuls (up to 9x). A tuned
+  GPU kernel for these was not written, so this is an effort comparison as much as a
+  hardware one.
+- Tiny operators (<0.1 ms) are within launch/timer noise on both sides; the GPU's 0.2 ms
+  ReduceMin is a single-workgroup reduction, and NMS/TopK/NonZero-style sequential ops
+  belong on the CPU or DSP scalar side either way.
+- Timings are per-kernel with warm buffers, not end-to-end; power and the cost of moving
+  tensors between DSP and GPU are not measured. Hexagon kernels were compiled for `v73`
+  while the SoC reports V69.
+
+## fp16 ConvTranspose on Hexagon
+
+`bench_tvm_hexagon_conv_transpose_fp16.py` repeats the mask-head ConvTranspose (`[8,256,14,14]`,
+2x2 kernel, stride 2) with fp16 activations, weights and output (NHWC, packed weights) on the
+connected phone. Errors are the max absolute error divided by the output's max magnitude,
+against an fp32 reference computed from the fp16-rounded operands; fp16 output rounding alone
+gives about 5e-4. Medians of three single invocations, layout copies and weight packing excluded.
+
+| Kernel | Time | Error | Notes |
+|---|---:|---:|---|
+| fp32, LLVM-generated (best) | 34.6 ms | 1e-6 | baseline from the fp32 section |
+| fp32, hand-written HVX qf32 | 12.8 ms | 1e-6 | `vmpy.qf32.sf` + `vadd.qf32` |
+| fp16, LLVM-generated, fp16 accumulate | 12.4 ms | 1.2e-2 | 64 lanes but qf16 conversions per op |
+| fp16, LLVM-generated, fp32 accumulate | 24.7 ms | 7e-4 | |
+| fp16, HVX `vmpy.qf16.hf` + `vadd.qf16` | 4.04 ms | 1.2e-2 | 64 MACs per vector op; fp16 accumulation over K=256 is too coarse |
+| fp16, HVX qf16 chunks of 8, widened into qf32 | **4.15 ms** | 2.0e-3 | `vmpy.qf32.qf16` by qf16 1.0 every 8 input channels |
+| fp16, HVX `vmpy.qf32.hf` widening, fp32 accumulate | 5.56 ms | 8.8e-4 | at the fp16-output rounding floor |
+
+So fp16 storage roughly triples the hand-written kernel's speed (12.8 to 4.2-5.6 ms) and is
+about 8x faster than the LLVM-generated fp32 path, with `hf` operands halving weight and
+activation traffic. Notes:
+
+- Accumulating 256 products in qf16 (the same precision class as LLVM's fp16 path) costs about
+  1.2% error; chunked qf16 with widening recovers most of it at almost no speed cost, and
+  the widening `vmpy.qf32.hf` form reaches the fp16 rounding floor at ~30% more time.
+- LLVM 19 has no `llvm.hexagon.V6.vmpy.rt.hf` intrinsic (the SDK headers do); the kernels use
+  `lvsplath` + `vmpy.qf16.hf` instead.
+- **Silent wrong results under register pressure.** Configurations with many live
+  accumulators (for example `--vectors 4 --pixel-blocks 2 --unrolls 4` for `qf32w`, or any
+  7-pixel block) return garbage (error >= 1) while the same tile shape with `--unrolls 1` or
+  `2` is correct, so the failure follows spilling/hoisted loads and was not root-caused. The
+  script marks any error above 5% as `** WRONG RESULT **`; only verified configurations are
+  quoted above (`--vectors 2 --pixel-blocks 2`).
+- The V69 phone has HVX `qf16`/`hf` instructions but no IEEE fp16 vector arithmetic, so fp16
+  kernels still convert through qf formats; fp16 activations would need matching fp16
+  layout-copy kernels to keep the whole path fp16 (not done).
+
+### Letting TVM generate the qfloat code
+
+The hand-written kernels above call `vmpy.qf32.sf` / `vmpy.qf16.hf` / `vmpy.qf32.hf` directly
+because Hexagon's LLVM backend converts qf32/qf16 <-> IEEE around every fp operation.
+`hexagon_qfloat.py` moves that into TVM: a TIR pass (registered at lowering phase 2, after
+vectorization and unrolling) finds vector accumulators whose stores are a zero initialiser or
+`acc[i] = acc[i] + A * B`, rewrites the updates into chained qfloat intrinsics, and wraps other
+reads of the accumulator in `vconv`. It handles fp32 (`vmpy.qf32.sf` + `vadd.qf32`), fp16
+inputs with fp32 accumulation (widening `vmpy.qf32.hf`, lane order restored on read), qf16
+accumulators, and widening qf16 partial sums into an fp32 total (`vmpy.qf32.qf16` by qf16 1.0).
+`hexagon_qfloat.build` also declares 128-byte-aligned argument buffers with no symbolic
+`elem_offset` (a symbolic offset hides the alignment and produces `vmem` + `valign` pairs).
+
+`bench_tvm_hexagon_conv_transpose_generated.py` uses *plain TE schedules* (no intrinsics: a
+parity-plane compute, split/reorder/unroll/vectorize) for the same mask-head ConvTranspose. Same
+schedule, stock TVM vs. with the pass, against the hand-written kernels (best tile per row,
+median of 3):
+
+| Kernel | Stock TVM | TVM + qfloat pass | Hand-written | Error (max/scale) |
+|---|---:|---:|---:|---:|
+| fp32 | 29.2 ms | **15.8 ms** | 12.8 ms | 1e-6 |
+| fp16 in/out, fp32 accumulate (`f16w`) | 30.9 ms | **6.06 ms** | 5.56 ms | 3e-4 |
+| fp16, qf16 chunks widened to fp32 (`f16k`, chunk 16) | 13.4 ms | **6.8 ms** | 4.15 ms (chunk 8) | 2e-3 |
+
+So the generated code reaches 81% (fp32) and 92% (fp16 widening) of the hand-written speed,
+and 5x/1.8x/2x over stock TVM on identical schedules. Remaining gap: the fp32 and chunked
+kernels still pay for per-output `vconv` epilogues and scalar splats that the hand-written
+loops schedule more tightly. Unlike the hand-written fp16 kernels, none of the 36 swept
+generated configurations returned a wrong result (`** WRONG RESULT **` is still flagged if it
+happens). The pass is a Python `prim_func_pass` in `scripts/android/`; moving it into
+`src/target/llvm/codegen_hexagon.cc` / `tir.transform` would make it available without the
+build wrapper.
+
