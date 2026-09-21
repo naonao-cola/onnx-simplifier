@@ -70,15 +70,19 @@ runner were scratch scripts; the recipe is `docker run pulsar2:7.0-lite pulsar2
 build` on a one-node Gather model with MinMax calibration, four uniform +/-0.9
 samples).
 
-The ResNet18 step's real Gathers are `[16,1,C,HW] -> [16,1,C,9*HW]`. Nothing at
-that scale (batch 16, C=64, N=28224) has been built or run yet.
+18 of the ResNet18 step's 19 distinct Gather `(shape, N)` pairs now have
+templates and device checks, up to `[16,1,64,3136]` with 28,224 indices and
+`[1024,28224]` with 112,896. Only the stem's `[16,1,3,50176] -> 614656` is
+missing: Pulsar2 rejects it compiled alone. Scratch builds are
+`/home/takecheeze/npu-scratch/t_train_gather/r_*`.
 
 ## Next steps
 
-0. Build a Gather at a real training shape (e.g. `[16,1,64,3136]`, N=28224, or a
-   smaller batch/channel version) and see whether the tail and MCode still
-   depend only on shape/N. Then the same for the 170 Reshapes and 41
-   Transposes, which dominate the step's remaining memory ops.
+0. Transpose (41 in the step: swap the last two axes of `[16,1,R,C]`
+   activations, or swap axes 1 and 2 of `[1,C,C,9]` weights) and Reshape (170).
+   Neither has data to retarget, so per-shape templates would only cache Pulsar2
+   output. Sweep shapes and diff the MCode to see whether it can be predicted
+   from the shape; that is what would make them generation rather than lookup.
 
 1. Add Gather output lengths or axes only with separate compiled templates
    where MCode changes, plus device checks. Keep runtime values inside the

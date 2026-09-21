@@ -38,7 +38,9 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import re
 import struct
+import tempfile
 from collections.abc import Sequence
 
 import onnx
@@ -58,15 +60,26 @@ _SLICE_STEP4_TEMPLATE = os.path.join(
 )
 _GATHER_TEMPLATE = os.path.join(_HERE, "fixtures", "gather_1x8_axis1_even4.axmodel.gz")
 # Measured last-axis Gather templates, keyed by (input shape, index count).
-# Each is a real Pulsar2 7.0-lite AX650 build of ``Gather(x, idx, axis=-1)``.
-_GATHER_LAST_AXIS_TEMPLATES = {
-    ((1, 1, 4, 16), 8): "gather_1x1x4x16_axis3_n8.axmodel.gz",
-    ((1, 1, 4, 16), 16): "gather_1x1x4x16_axis3_n16.axmodel.gz",
-    ((1, 1, 4, 256), 8): "gather_1x1x4x256_axis3_n8.axmodel.gz",
-    ((2, 1, 4, 16), 8): "gather_2x1x4x16_axis3_n8.axmodel.gz",
-    ((1, 1, 8, 196), 1764): "gather_1x1x8x196_axis3_n1764.axmodel.gz",
-    ((1, 1, 4, 70000), 8): "gather_1x1x4x70000_axis3_n8.axmodel.gz",
-}
+# Each is a real Pulsar2 7.0-lite AX650 build of ``Gather(x, idx, axis=-1)``,
+# stored as ``gather_<dims>_axis<k>_n<N>.axmodel.gz`` (index words may be zeroed
+# by ``make_gather_fixture``; the emitter overwrites them anyway). Oracle
+# fixtures carry an extra suffix and are not templates.
+_GATHER_FIXTURE_RE = re.compile(
+    r"^gather_(\d+(?:x\d+)*)_axis(\d+)_n(\d+)\.axmodel\.gz$"
+)
+
+
+def _discover_gather_templates() -> dict[tuple[tuple[int, ...], int], str]:
+    found = {}
+    for name in sorted(os.listdir(os.path.join(_HERE, "fixtures"))):
+        match = _GATHER_FIXTURE_RE.match(name)
+        if match:
+            shape = tuple(int(d) for d in match.group(1).split("x"))
+            found[(shape, int(match.group(3)))] = name
+    return found
+
+
+_GATHER_LAST_AXIS_TEMPLATES = _discover_gather_templates()
 _NOISE_START = 301
 _NOISE_END = 326
 _GATHER_INDEX_COUNT = 4
@@ -443,3 +456,43 @@ def emit_gather_last_axis_axmodel(
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     onnx.save(model, output_path)
     return output_path
+
+
+def make_gather_fixture(compiled_path: str, output_path: str) -> str:
+    """Store a compiled last-axis Gather as a compact template fixture.
+
+    Zeroes the index words (the emitter overwrites them) and gzips the model, so
+    a large index vector does not bloat the repository. Name the result
+    ``gather_<dims>_axis<k>_n<N>.axmodel.gz`` for ``_discover_gather_templates``.
+    """
+    model = onnx.load(compiled_path, load_external_data=False)
+    out_shape = _output_dims(model.graph.output[0], "y")
+    words = _param_words(model)
+    table = _initializer(model, "npu_params")
+    table.raw_data = struct.pack(
+        f"<{len(words)}I", *([0] * out_shape[-1]), *words[out_shape[-1] :]
+    )
+    with gzip.open(output_path, "wb", compresslevel=9) as f:
+        f.write(model.SerializeToString())
+    return output_path
+
+
+def emit_gather_last_axis_from_template(
+    input_shape: Sequence[int], output_path: str, *, indices: Sequence[int]
+) -> str:
+    """Emit a measured last-axis Gather without a compiler-built reference.
+
+    ``input_shape`` and ``len(indices)`` must be a measured pair in
+    ``_GATHER_LAST_AXIS_TEMPLATES``; the committed fixture serves as reference.
+    """
+    key = (tuple(input_shape), len(indices))
+    if key not in _GATHER_LAST_AXIS_TEMPLATES:
+        raise ValueError(
+            f"unmeasured Gather (input shape, index count) {key}; "
+            f"measured: {sorted(_GATHER_LAST_AXIS_TEMPLATES)}"
+        )
+    template = _load_gather_last_axis_template(key)
+    with tempfile.TemporaryDirectory() as tmp:
+        reference = os.path.join(tmp, "reference.axmodel")
+        onnx.save(template, reference)
+        return emit_gather_last_axis_axmodel(reference, output_path, indices=indices)
