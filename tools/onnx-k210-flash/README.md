@@ -54,8 +54,8 @@ opposite fact permanently, so the same mistake can't silently come back.
 | `isp_stub.bin` | Extracted and decompressed from kflash.py's own `ISP_PROG` constant; its size/CRC32 are pinned by a test |
 | ONNX → kmodel (`scripts/onnx_to_kmodel.py`, local Python) | **Run for real**, not just reviewed: compiled a real Hugging Face model to a 104792-byte kmodel and ran it through nncase's own `Simulator`, producing the correct output shape (see "Model conversion" below) |
 | ONNX → kmodel (`web/ncc_wasm.mjs`, in-browser WASM) | **Compile itself run for real** via the browser-safe MEMFS/`callMain` interface (Node-side, both `cpu` and `k210` targets) -- **not yet run in an actual browser tab**, see `web/ncc/README.md`'s "Status" |
-| On-device runtime (`firmware/runtime/`) | **Flashed and booted for real** on the Amigo -- correctly detects a blank vs. a real model region. Loading a real kmodel hangs in `interpreter::load_model()`, precisely root-caused -- see `firmware/runtime/README.md`'s "Status" |
-| Real hardware (flashing, and everything above running on it) | **Run for real** against a Sipeed Maix Amigo, both via kflash.py and via `k210_isp.mjs` itself (run from Node, not a browser -- see below). Everything through the flash-mode stub's own greeting works via this port's real code; `FLASH_WRITE` specifically remains unverified on real hardware -- see finding #8 |
+| On-device runtime (`firmware/runtime/`) | **Built, flashed and run end to end on a real M5StickV**: loads a real kmodel and runs an inference, output correlating 0.98 with onnxruntime (uint8 PTQ error). The earlier `load_model()` hang (found on the Maix Amigo) was two bugs -- missing PLL1/DMAC/AI-clock setup and an nncase 1.0.0 runtime vs 1.9.0 compiler mismatch -- both fixed; see `firmware/runtime/README.md`'s "Status". Other boards (Maix Amigo, Maix Bit, Maix Cube) not re-tested with the fixed runtime |
+| Real hardware (flashing, and everything above running on it) | **Run for real** against a Sipeed Maix Amigo and an M5StickV (the latter via kflash.py only: firmware + model flashed, runtime + model run on-device), both via kflash.py and via `k210_isp.mjs` itself (run from Node, not a browser -- see below). Everything through the flash-mode stub's own greeting works via this port's real code; `FLASH_WRITE` specifically remains unverified on real hardware -- see finding #8 |
 
 ## Testing against real hardware
 
@@ -171,7 +171,7 @@ signal that `k210_isp.mjs`'s **"skip erase"** UI option is safe on real
 hardware, at least on this board -- the opposite of the runtime README's
 previous "unverified" stance.
 
-**Finding #5 (real, precisely root-caused): `interpreter::load_model()`
+**Finding #5 (real, precisely root-caused; *since fixed* -- see `firmware/runtime/README.md`'s "Status": missing PLL1/DMAC/AI-clock setup, plus an nncase 1.0.0-runtime/1.9.0-compiler mismatch that surfaced right after): `interpreter::load_model()`
 hangs indefinitely given a real, valid kmodel.** A real
 `ketiswp/mlcommons-ResNet8-CIFAR10-fp32-onnx` model, compiled via
 `scripts/onnx_to_kmodel.py` to a 104792-byte kmodel (correct `KMDL` magic,

@@ -11,64 +11,53 @@ re-erasing" below.
 
 ## Status
 
-**Compiled and linked for real**, against `kendryte-standalone-sdk`
-(`master`, RISC-V toolchain `kendryte-gnu-toolchain` 8.2.0):
+**Built from source, flashed and run end to end on a real M5StickV**
+(2026-09-21): firmware at `0x0`, a `.kmodel` at `0x00C00000`, and the runtime
+loads it and runs an inference. Earlier (Sipeed Maix Amigo) this runtime
+booted and detected a blank model region correctly but hung in
+`interpreter::load_model()` given a real kmodel; that turned out to be two
+separate bugs, both fixed here:
 
-```
-onnx_k210_runtime.bin: 1,056,312 bytes
-```
+1. **Missing KPU clock/DMA setup (the hang).** `main()` only configured PLL0.
+   The k210 runtime module touches KPU registers while loading, and with PLL1
+   (the KPU clock source) unconfigured and the AI clock gate closed that access
+   never returns. `main()` now sets PLL1/PLL2, calls `dmac_init()` and
+   `sysctl_clock_enable(SYSCTL_CLOCK_AI)`, as kendryte's own kpu demos do. (All
+   four were applied together; which of them is strictly necessary wasn't
+   isolated.)
+2. **nncase compiler/runtime version mismatch (failure at `run()`).** The SDK
+   vendors nncase runtime **1.0.0** (2021) in `lib/nncase/v1`, while
+   `../../scripts/onnx_to_kmodel.py` compiles with **nncase 1.9.0**. With the
+   mismatch, `load_model()` succeeds but `run()` fails with
+   `runtime_module.cpp:65 (shape_reg) id < shape_regs_.size()` /
+   "Result too large". `build.sh` swaps in the matching runtime from the
+   [kendryte/nncase v1.9.0 release](https://github.com/kendryte/nncase/releases/tag/v1.9.0)
+   (`nncaseruntime-riscv64-none-k210.zip`).
 
-**Flashed and booted for real on a Sipeed Maix Amigo.** See
-`../../README.md`'s "Testing against real hardware" for the full session
-(reset-scheme reliability, flash-addressing gotchas, and how "skip erase"
-got verified safe) -- summarized here for the two findings specific to
-this runtime's own code:
+**Verified output.** A 2-conv test net (`1x3x32x32` float32 in, `1x10` out,
+5240-byte kmodel) fed the ramp `x[j] = ((j*7)%256)/255 - 0.5`, compared with
+onnxruntime on the same ramp: correlation 0.98, same argmax/argmin, max
+absolute error 0.45 -- the expected size of uint8 PTQ error (calibrated on
+random data, ramp input outside that distribution), not bit-exactness.
+The runtime doesn't report whether ops ran on the KPU or fell back to CPU.
 
-**Real-hardware finding (confirmed): the blank/erased-model detection path
-works exactly as designed.** Flashed fresh, reset, read live over UART:
-```
-onnx-k210-flash runtime
-reading model from flash @0x00c00000 (2097152 bytes)...
-no model flashed yet at 0x00c00000 (identifier 0xffffffff, expected 0x4b4d444c)
-flash a .kmodel there over Web Serial, then reset.
-```
-`w25qxx_read_data`'s timing/pin assumptions are real, then: the 2MB read
-and the identifier check both complete promptly on real hardware.
+Things learned while testing on the M5StickV (kept because each cost time):
 
-**Real-hardware finding (real bug, precisely root-caused, unfixed here):
-`interpreter::load_model()` hangs indefinitely given a real, valid
-kmodel.** A real Hugging Face model
-(`ketiswp/mlcommons-ResNet8-CIFAR10-fp32-onnx`), compiled via
-`../../scripts/onnx_to_kmodel.py` to a 104792-byte kmodel (correct `KMDL`
-magic, confirmed byte-for-byte) and flashed to `0x00C00000`, made the
-runtime print `reading model from flash...` and then go silent -- no
-crash, no further output, for 25+ seconds. Root-caused with an
-instrumented debug rebuild (extra `printf`s bracketing the identifier
-check and the `interp.load_model()` call, from a real
-`kendryte-standalone-sdk` checkout, not the version vendored inside
-PlatformIO's `framework-maixduino` -- that one is missing `lib/nncase`
-entirely): the identifier check passes correctly (`0x4b4d444c`), execution
-reaches `interp.load_model()`, and it **never returns** -- the debug
-build's own trailing `load_model() returned` print never appeared. Not
-root-caused further than that (would need real debugging inside nncase
-v1's K210 runtime itself -- KPU peripheral programming, DMA descriptor
-setup, etc., none of which this session's instrumentation reached). The
-`Simulator`-verified compile (see `../../README.md`'s "Model conversion")
-proves the *compiler* output is a well-formed, correctly-executing kmodel
-on the host; this proves the *on-device* `interpreter::load_model()` call
-specifically is where the real gap is, not the model or the conversion
-pipeline.
-
-The board's KPU and camera hardware themselves are known-good, for what
-that's worth in narrowing this down: Sipeed's own official MaixPy firmware
-(`sipeed/MaixPy-v1`, a completely separate codebase/nncase-runtime
-integration from this repo's) was flashed onto the same board this session
-and ran real KPU-backed inference (a built-in Haar-cascade face detector)
-plus real camera capture without incident. That rules out a broken board
-or a physically bad KPU/camera as the explanation for `load_model()`
-hanging -- the gap is specific to this runtime's own nncase v1
-integration (or that nncase v1 release's K210 runtime code in general),
-not the hardware underneath it.
+- **Don't test with `kflash -s` (SRAM boot).** The ISP stub leaves state behind
+  that makes this runtime's DMA flash read hang -- it *looks* like the same
+  `load_model()` hang but happens earlier, before the model is even read.
+  Real flash boots don't have it.
+- **Opening the serial port resets the M5StickV** (DTR/RTS are wired to reset)
+  into whatever is in flash. With pyserial, set `dtr=False; rts=False` before
+  `open()` to avoid it; the runtime's banner is printed within milliseconds of
+  boot, so read the port promptly.
+- **kflash flags on M5StickV:** `-B goE -b 115200`. `-b 1500000` drops the port
+  right after the ISP stub boots.
+- **A `.kfpkg`'s `address` must be a string** (`"0x00C00000"`); kflash calls
+  `int(x, 0)` on it and a JSON number fails with
+  `int() can't convert non-string with explicit base`. Set
+  `"sha256Prefix": false` for a model (`true` prepends a length+SHA header, and
+  the runtime expects `KMDL` at the very start).
 
 ## How it works
 
@@ -98,46 +87,33 @@ not the hardware underneath it.
    the same "runtime introspects the model" property
    `onnx-cardputer-flash`'s TFLite Micro firmware has via
    `interpreter->input(0)->dims`.
-4. Runs one inference over the zeroed input(s) and prints each tensor's
-   shape/dtype plus the output byte count. Proves the
-   flash-read + interpreter path executes a real model end to end; says
-   nothing about accuracy (needs real sensor data, wired up per model)
-   or about the KPU hardware specifically -- see the note in
-   `onnx-k210-flash/README.md`'s "Model conversion" section about what
-   nncase's `Simulator` (used to test the *compiler* side) does and
-   doesn't prove, which applies here too, in reverse: this proves the
-   *device* runtime loads and runs a model, not that its numerical
-   output matches the PC-side `Simulator`'s.
-
-## Getting the toolchain and SDK
-
-Neither is vendored into this repo (matches this repo's own stance on
-`onnx2tf`/`nncase`/PlatformIO -- external toolchains stay external):
-
-```sh
-# RISC-V toolchain (prebuilt, ~20MB)
-curl -LO https://github.com/kendryte/kendryte-gnu-toolchain/releases/download/v8.2.0-20190409/kendryte-toolchain-ubuntu-amd64-8.2.0-20190409.tar.xz
-tar xf kendryte-toolchain-ubuntu-amd64-8.2.0-20190409.tar.xz
-
-# SDK
-git clone https://github.com/kendryte/kendryte-standalone-sdk.git
-```
+4. Runs one inference (float32 inputs get a deterministic ramp, others zeros)
+   and prints each tensor's shape/dtype, the output byte count, and float32
+   output values. Proves the flash-read + interpreter path executes a real
+   model end to end, and the printed values can be checked against
+   onnxruntime on the host fed the same ramp (see "Status"). That's a
+   sanity check with expected uint8-PTQ error, not real sensor data, and it
+   says nothing about whether ops ran on the KPU or fell back to CPU.
 
 ## Building it yourself
 
 ```sh
-mkdir -p kendryte-standalone-sdk/src/onnx_k210_runtime
-cp src/main.cpp src/w25qxx.c src/w25qxx.h src/project.cmake \
-   kendryte-standalone-sdk/src/onnx_k210_runtime/
-
-cd kendryte-standalone-sdk
-mkdir build && cd build
-cmake .. -DPROJ=onnx_k210_runtime -DTOOLCHAIN=/path/to/kendryte-toolchain/bin
-ninja   # or `make`, if the SDK picked Unix Makefiles instead of Ninja
-
-# onnx_k210_runtime.bin is the flashable image -- no separate merge step
-# (unlike ESP32-S3): objcopy already produces one complete raw image.
+./build.sh [WORKDIR]     # default WORKDIR: ./build-work (git-ignored)
+# -> WORKDIR/onnx-k210-runtime.bin, same as prebuilt/onnx-k210-runtime.bin
 ```
+
+`build.sh` downloads the Kendryte RISC-V toolchain (`kendryte-gnu-toolchain`
+8.2.0) and `kendryte-standalone-sdk` into WORKDIR (neither is vendored -- this
+repo's own stance on external toolchains), swaps the SDK's nncase runtime for
+1.9.0 (see "Status" above; `sdk-patch/nncase_v1_CMakeLists.txt` is the
+replacement `lib/nncase/v1/CMakeLists.txt` -- 1.9.0's cmake package declares an
+imported target named `kendryte` that collides with the SDK's own, so the `.a`
+files are linked directly), copies `src/` into the SDK as project
+`onnx_k210_runtime`, and builds. CMake 4.x needs
+`-DCMAKE_POLICY_VERSION_MINIMUM=3.5` for the SDK's old
+`cmake_minimum_required`; the script passes it. The SDK's CMake also resets
+`CMAKE_C/CXX_FLAGS`, so extra `-D` defines have to go through `project.cmake`,
+not the command line.
 
 **Two real build issues hit and fixed, kept here so the next person
 doesn't rediscover them:**
