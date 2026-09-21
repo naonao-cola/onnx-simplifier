@@ -23,9 +23,7 @@ returned the expected values for input
 `[[0,1,2,3,4,5,6,7]]`. Unit coverage is in
 `tests/test_axera_memory_emit.py`.
 
-Code and tests are on branch `codex/axera-slice-memory-emitter`. PR
-[#1723](https://github.com/onnxsim/onnxsim/pull/1723) is open with auto-merge
-enabled; check its CI status before building on this work.
+The Slice and static Gather emitters landed in PR [#1723](https://github.com/onnxsim/onnxsim/pull/1723) (merged). The last-axis Gather emitter is on branch `codex/axera-gather-last-axis`, PR [#1726](https://github.com/onnxsim/onnxsim/pull/1726) with auto-merge enabled; check its CI status before building on it.
 The working tree also has unrelated changes under `third_party/onnx` and two
 untracked npm lockfiles under `tools/onnx-finetune/wasm/`; leave those alone.
 
@@ -59,7 +57,28 @@ No NPU runs were made for these output lengths, so the emitter remains
 restricted to four outputs; shorter outputs need their own compiled template
 and device check.
 
+## Last-axis Gather for training shapes
+
+`emit_gather_last_axis_axmodel(...)` retargets `Gather(x[..., W], axis=-1)` for
+six measured `(input shape, index count)` pairs, up to `[1,1,8,196]` with 1764
+indices and `[1,1,4,70000]`. The table is N index words plus a
+shape-dependent tail that is preserved; MCode depends on shape and N only.
+Evidence, oracles, and the device run are in
+[`axera-memory-op-generator.md`](axera-memory-op-generator.md). Probe builds are
+under `/home/takecheeze/npu-scratch/t_train_gather` (build harness and device
+runner were scratch scripts; the recipe is `docker run pulsar2:7.0-lite pulsar2
+build` on a one-node Gather model with MinMax calibration, four uniform +/-0.9
+samples).
+
+The ResNet18 step's real Gathers are `[16,1,C,HW] -> [16,1,C,9*HW]`. Nothing at
+that scale (batch 16, C=64, N=28224) has been built or run yet.
+
 ## Next steps
+
+0. Build a Gather at a real training shape (e.g. `[16,1,64,3136]`, N=28224, or a
+   smaller batch/channel version) and see whether the tail and MCode still
+   depend only on shape/N. Then the same for the 170 Reshapes and 41
+   Transposes, which dominate the step's remaining memory ops.
 
 1. Add Gather output lengths or axes only with separate compiled templates
    where MCode changes, plus device checks. Keep runtime values inside the
