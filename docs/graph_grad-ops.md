@@ -80,7 +80,12 @@ template used to live.
 
 | ONNX op | VJP | Python rule | C++ rule |
 |---|---|---|---|
+| `Dropout` | identity for inference mode (omitted or constant-false `training_mode`); no gradient for optional mask, ratio, or mode inputs | `_grad_inference_dropout` | -- (Python only) |
 | `Split` | one `MatMul` per output against a constant 0/1 selection matrix (not a `Concat` of the incoming gradients -- `Concat` isn't in `BACKWARD_OPS`) | `_grad_split` | `GradSplit` |
+
+`Dropout` with a true or runtime `training_mode` remains unsupported. Its VJP
+would need the sampled dropout mask and training scale; treating that case as
+an identity would be incorrect.
 
 ## `_PYTHON_ONLY_RULES` -- no C++/WASM mirror yet
 
@@ -94,7 +99,9 @@ once ported to C++; the only reason they live here is the missing mirror
 | `DequantizeLinear` | straight-through: `dx = g` (paired with `QuantizeLinear` below) | `_grad_dequantize_linear` |
 | `DepthToSpace` | reshape-transpose-reshape, the exact inverse of the op's own decomposition -- for `nn.PixelShuffle` exports | `_grad_depth_to_space` |
 | `IsNaN` | no gradient (boolean output) | `_grad_is_nan` |
+| `Pad` | crop `g` back to the unpadded input with constant-index `Gather`s; constant mode and static nonnegative pads only | `_grad_pad` |
 | `QuantizeLinear` | straight-through: `dx = g`, no gradient for `scale`/`zero_point` (fake-quantization convention) | `_grad_quantize_linear` |
+| `Slice` | embed `g` into the input positions selected by static `starts`/`ends`/`axes`/positive `steps`, using constant selection `MatMul`s | `_grad_slice` |
 | `Squeeze` | `g` reshaped back to `data`'s own (pre-squeeze) shape | `_grad_squeeze_or_unsqueeze` |
 | `Unsqueeze` | same as `Squeeze`, the same reshape either direction | `_grad_squeeze_or_unsqueeze` |
 | `Where` | `g` masked by `Cast(cond)` and routed to whichever of the two data operands was selected; `cond` gets no gradient | `_grad_where` |
