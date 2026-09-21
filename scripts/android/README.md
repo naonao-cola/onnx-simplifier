@@ -92,3 +92,33 @@ comparison against their published sample outputs. The QDQ model still leaves
 nodes on CPU in QNN HTP, and NNAPI leaves nodes on CPU for both fp32 and QDQ
 MobileNet when CPU fallback is disabled. The independent direct `qti-dsp` RELU
 probe passes on the image tensor's first four values.
+
+## TVM Hexagon Mask R-CNN kernel probe
+
+`test_tvm_hexagon_maskrcnn.py` is an opt-in test for TVM's Hexagon code
+generator and RPC execution path. It reads the ResNet/FPN convolution and
+pooling, resize, and RoIAlign attributes from a Mask R-CNN ONNX model, compiles
+representative convolution + bias + ReLU, max-pooling, nearest-neighbor FPN
+resize, and four-level 7x7 RoIAlign kernels for V73, runs them on the connected
+Hexagon DSP, and compares their results with TVM/LLVM CPU kernels or TOPI's
+Python reference. The ROI workloads use a configurable synthetic proposal
+batch (default 8) because the model's ROI count is dynamic. Tensor values,
+weights, and regions are randomized. This checks individual kernels, not the
+full Mask R-CNN graph, model weights, QNN integration, or detector accuracy.
+
+The probe needs an Apache TVM build with Hexagon enabled, the matching Hexagon
+SDK/toolchain, and Python packages `onnx`, `numpy`, and TVM's dependencies. Set
+`HEXAGON_SDK_ROOT` and `HEXAGON_TOOLCHAIN` to the corresponding SDK roots and
+make the TVM Python package and host library available with `PYTHONPATH` and
+`TVM_LIBRARY_PATH`. For example:
+
+```bash
+python scripts/android/test_tvm_hexagon_maskrcnn.py \
+  --model /path/to/MaskRCNN-12-qdq.onnx \
+  --serial ANDROID_SERIAL
+```
+
+Generated shared objects are stored in `/tmp/tvm-maskrcnn` by default. Pass
+`--artifact-dir` to choose another location or `--roi-batch` to change the
+synthetic ROI workload size. The device needs to be reachable by ADB, and the
+host must allow local TVM RPC connections.
