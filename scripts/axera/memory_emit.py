@@ -82,6 +82,10 @@ def _discover_gather_templates() -> dict[tuple[tuple[int, ...], int], str]:
 _GATHER_LAST_AXIS_TEMPLATES = _discover_gather_templates()
 _NOISE_START = 301
 _NOISE_END = 326
+# The stem's 7-chunk Gather + Concat template (a single 614,656-index Gather
+# overflows Pulsar2's on-chip memory job) has a wider noise region: identical
+# rebuilds flip bytes 333..357, in three-byte groups.
+_GATHER_NOISE_END = {((16, 1, 3, 50176), 614656): 358}
 _GATHER_INDEX_COUNT = 4
 _GATHER_INPUT_WIDTH = 8
 
@@ -442,10 +446,11 @@ def emit_gather_last_axis_axmodel(
         raise ValueError(
             "reference MCode size does not match the known Gather template"
         )
+    noise_end = _GATHER_NOISE_END.get(key, _NOISE_END)
     actual = bytearray(actual_mcode)
     wanted = bytearray(template_mcode)
-    actual[_NOISE_START:_NOISE_END] = bytes(_NOISE_END - _NOISE_START)
-    wanted[_NOISE_START:_NOISE_END] = bytes(_NOISE_END - _NOISE_START)
+    actual[_NOISE_START:noise_end] = bytes(noise_end - _NOISE_START)
+    wanted[_NOISE_START:noise_end] = bytes(noise_end - _NOISE_START)
     if actual != wanted:
         raise ValueError(
             "reference MCode does not match the characterized Gather template"
