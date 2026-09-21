@@ -23,9 +23,7 @@ returned the expected values for input
 `[[0,1,2,3,4,5,6,7]]`. Unit coverage is in
 `tests/test_axera_memory_emit.py`.
 
-Code and tests are on branch `codex/axera-slice-memory-emitter`. PR
-[#1723](https://github.com/onnxsim/onnxsim/pull/1723) is open with auto-merge
-enabled; check its CI status before building on this work.
+The Slice and static Gather emitters landed in PR [#1723](https://github.com/onnxsim/onnxsim/pull/1723) (merged). The last-axis Gather emitter is on branch `codex/axera-gather-last-axis`, PR [#1726](https://github.com/onnxsim/onnxsim/pull/1726) with auto-merge enabled; check its CI status before building on it.
 The working tree also has unrelated changes under `third_party/onnx` and two
 untracked npm lockfiles under `tools/onnx-finetune/wasm/`; leave those alone.
 
