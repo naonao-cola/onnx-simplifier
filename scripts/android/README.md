@@ -137,3 +137,33 @@ Generated shared objects are stored in `/tmp/tvm-maskrcnn` by default. Pass
 `--artifact-dir` to choose another location or `--roi-batch` to change the
 synthetic ROI workload size. The device needs to be reachable by ADB, and the
 host must allow local TVM RPC connections.
+
+## TVM Hexagon NCHWc int8 convolution probe
+
+`bench_tvm_hexagon_nchwc_int8.py` compares a scalar NCHW uint8-by-int8
+convolution with TVM's Hexagon NCHWc schedule, which tensorizes the inner
+reduction with HVX `vrmpy`. The probe checks each int32 accumulator exactly
+against NumPy and reports five-run median kernel times on the connected phone.
+It uses 64 input and output channels at 56x56, with 1x1 and 3x3 kernels. It
+times prepacked device inputs and weights; host-side layout packing, RPC
+transfers, bias, and output requantization are excluded. These are kernel
+results, not end-to-end ONNX model latency.
+
+```bash
+python scripts/android/bench_tvm_hexagon_nchwc_int8.py --kernels 1,3
+```
+
+On the tested Xiaomi 12S, the 1x1 probe measured 6.768 ms for scalar NCHW and
+0.330 ms for tensorized NCHWc (20.5x). The 3x3 probe measured 176.402 ms and
+1.212 ms respectively (145.6x). Disassembly of the generated 3x3 module
+contains HVX `vrmpy` instructions. Inputs and weights use uint8 and int8 dtypes
+with small random ranges; the measurements do not include quantization
+parameter handling or real model weights.
+
+## Tinygrad Hexagon survey
+
+See [TINYGRAD_HEXAGON_SURVEY.md](TINYGRAD_HEXAGON_SURVEY.md) for the survey of
+Tinygrad's local Hexagon backend. It targets V65 and expects Linux FastRPC
+device nodes, so its DSP runtime does not directly match this Android/TVM RPC
+setup. The source offers a codegen experiment, but does not establish a
+phone-specific memory-bandwidth model.
