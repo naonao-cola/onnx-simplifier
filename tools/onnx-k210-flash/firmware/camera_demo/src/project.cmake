@@ -1,0 +1,5 @@
+include_directories(${SDK_ROOT}/lib/nncase/v1/include)
+include_directories(${SDK_ROOT}/third_party/gsl-lite/include)
+include_directories(${SDK_ROOT}/third_party/mpark-variant/include)
+include_directories(${SDK_ROOT}/third_party/nlohmann_json/include)
+include_directories(${SDK_ROOT}/third_party/xtl/include)
