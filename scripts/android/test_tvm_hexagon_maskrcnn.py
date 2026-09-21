@@ -122,7 +122,36 @@ def _model_workloads(model_path: Path, roi_batch: int):
                 tuple(attrs.get("pads", [0, 0, 0, 0])),
             )
         )
-    return convs, pools
+
+    resizes = []
+    for node in model.graph.node:
+        if node.op_type != "Resize":
+            continue
+        input_shape = shapes.get(node.input[0])
+        if (
+            input_shape is None
+            or len(input_shape) != 4
+            or input_shape[1] != 256
+            or input_shape[2] not in (7, 14, 28)
+            or input_shape[3] != input_shape[2]
+        ):
+            continue
+        attrs = _attrs(node)
+        if attrs.get("mode", b"nearest") != b"nearest":
+            continue
+        size = (input_shape[2] * 2, input_shape[3] * 2)
+        resizes.append(
+            (
+                f"fpn_resize_{input_shape[2]}_to_{size[0]}",
+                (1, 256, input_shape[2], input_shape[3]),
+                size,
+                attrs.get("coordinate_transformation_mode", b"half_pixel").decode(),
+                attrs.get("nearest_mode", b"round_prefer_floor").decode(),
+            )
+        )
+    if not resizes:
+        raise RuntimeError("No nearest-neighbor FPN Resize operators found")
+    return convs, pools, resizes
 
 
 def _hexagon_target():
@@ -172,6 +201,22 @@ def _pool_module(data_shape, kernel, stride, pads, target):
     return module, tuple(int(dim) for dim in output.shape)
 
 
+def _resize_module(data_shape, size, coordinate_mode, rounding_mode, target):
+    x = te.placeholder(data_shape, name="x", dtype="float32")
+    output = topi.image.resize2d(
+        x,
+        roi=(0.0, 0.0, 0.0, 0.0),
+        size=size,
+        layout="NCHW",
+        method="nearest_neighbor",
+        coordinate_transformation_mode=coordinate_mode,
+        rounding_method=rounding_mode,
+    )
+    schedule = te.create_schedule(output.op)
+    module = tvm.build(schedule, [x, output], target=target, name="main")
+    return module, tuple(int(dim) for dim in output.shape)
+
+
 def _cpu_conv(data, weight, bias, stride, pad_before, pad_after):
     data_shape, weight_shape = data.shape, weight.shape
     x = te.placeholder(data_shape, name="x", dtype="float32")
@@ -200,7 +245,7 @@ def _cpu_conv(data, weight, bias, stride, pad_before, pad_after):
 
 
 def run(args):
-    convs, pools = _model_workloads(args.model, args.roi_batch)
+    convs, pools, resizes = _model_workloads(args.model, args.roi_batch)
     target = _hexagon_target()
     rng = np.random.default_rng(11)
     tracker = Tracker(host=args.rpc_host, port=args.tracker_port)
@@ -260,6 +305,37 @@ def run(args):
                 )
                 schedule = topi.hexagon.schedule_pool(output, layout="NCHW")
                 cpu_module = tvm.build(schedule, [x, output], target="llvm", name="main")
+                expected = tvm.nd.empty(output_shape)
+                cpu_module["main"](tvm.nd.array(data), expected)
+                np.testing.assert_allclose(actual, expected.numpy(), rtol=0, atol=0)
+                print(f"PASS {name}: output={output_shape} exact", flush=True)
+
+            for name, data_shape, size, coordinate_mode, rounding_mode in resizes:
+                module, output_shape = _resize_module(
+                    data_shape, size, coordinate_mode, rounding_mode, target
+                )
+                local_path = Path(args.artifact_dir) / f"{name}.so"
+                module.save(str(local_path))
+                remote_path = session.upload(str(local_path), local_path.name)
+                remote_module = session.load_module(remote_path)
+                data = rng.normal(size=data_shape).astype("float32")
+                remote_output = tvm.nd.empty(output_shape, "float32", session.device)
+                remote_module["main"](tvm.nd.array(data, session.device), remote_output)
+                actual = remote_output.numpy()
+
+                x = te.placeholder(data_shape, name="x", dtype="float32")
+                output = topi.image.resize2d(
+                    x,
+                    roi=(0.0, 0.0, 0.0, 0.0),
+                    size=size,
+                    layout="NCHW",
+                    method="nearest_neighbor",
+                    coordinate_transformation_mode=coordinate_mode,
+                    rounding_method=rounding_mode,
+                )
+                cpu_module = tvm.build(
+                    te.create_schedule(output.op), [x, output], target="llvm", name="main"
+                )
                 expected = tvm.nd.empty(output_shape)
                 cpu_module["main"](tvm.nd.array(data), expected)
                 np.testing.assert_allclose(actual, expected.numpy(), rtol=0, atol=0)

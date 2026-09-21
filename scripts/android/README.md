@@ -98,8 +98,9 @@ probe passes on the image tensor's first four values.
 `test_tvm_hexagon_maskrcnn.py` is an opt-in test for TVM's Hexagon code
 generator and RPC execution path. It reads the ResNet/FPN convolution and
 pooling shapes from a Mask R-CNN ONNX model, compiles representative
-convolution + bias + ReLU and max-pooling kernels for V73, runs them on the
-connected Hexagon DSP, and compares their results with TVM/LLVM CPU kernels.
+convolution + bias + ReLU, max-pooling, and nearest-neighbor feature-pyramid
+resize kernels for V73, runs them on the connected Hexagon DSP, and compares
+their results with TVM/LLVM CPU kernels.
 The ROI mask-head convolution uses a configurable synthetic proposal batch
 (default 8) because the model's ROI count is dynamic. Tensor values and weights
 are randomized. This checks individual kernels, not the full Mask R-CNN graph,
