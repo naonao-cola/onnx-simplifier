@@ -65,6 +65,76 @@ def _direct_stride2_module(data_shape, weight_shape, bias_shape, target, width_t
     return module, (n, out_channels, out_height, out_width)
 
 
+def _channel_vectorized_module(
+    data_shape, weight_shape, bias_shape, target, channel_tile, input_nhwc=False
+):
+    """Vectorize contiguous output channels and produce NHWC output."""
+    n, in_channels, in_height, in_width = data_shape
+    _, out_channels, kernel_h, kernel_w = weight_shape
+    assert kernel_h == kernel_w == 2
+    out_height, out_width = in_height * 2, in_width * 2
+    data_layout = (
+        (n, in_height, in_width, in_channels) if input_nhwc else data_shape
+    )
+    data = te.placeholder(data_layout, name="data", dtype="float32")
+    # Host-side packing turns output-channel loads into contiguous vectors.
+    weight = te.placeholder(
+        (kernel_h, kernel_w, in_channels, out_channels), name="weight_packed", dtype="float32"
+    )
+    bias = te.placeholder(bias_shape, name="bias", dtype="float32")
+    rc = te.reduce_axis((0, in_channels), name="rc")
+    output = te.compute(
+        (n, out_height, out_width, out_channels),
+        lambda b, y, x, oc: te.sum(
+            (data[b, y // 2, x // 2, rc] if input_nhwc else data[b, rc, y // 2, x // 2])
+            * weight[y % 2, x % 2, rc, oc]
+            + bias[oc] / in_channels,
+            axis=rc,
+        ),
+        name="conv_transpose_nhwc",
+    )
+    schedule = te.create_schedule(output.op)
+    batch, height, width, channel = schedule[output].op.axis
+    channel_outer, channel_inner = schedule[output].split(channel, factor=channel_tile)
+    outer = schedule[output].fuse(batch, height, width, channel_outer)
+    schedule[output].reorder(outer, channel_inner, *schedule[output].op.reduce_axis)
+    schedule[output].vectorize(channel_inner)
+    schedule[output].parallel(outer)
+    module = tvm.build(schedule, [data, weight, bias, output], target=target, name="main")
+    return module, (n, out_height, out_width, out_channels)
+
+
+def _layout_copy_module(shape, target, to_nhwc):
+    n, channels, height, width = shape
+    input_shape = shape if to_nhwc else (n, height, width, channels)
+    data = te.placeholder(input_shape, name="layout_input", dtype="float32")
+    if to_nhwc:
+        output = te.compute(
+            (n, height, width, channels),
+            lambda b, y, x, c: data[b, c, y, x],
+            name="to_nhwc",
+        )
+        schedule = te.create_schedule(output.op)
+        batch, y, x, channel = schedule[output].op.axis
+        channel_outer, channel_inner = schedule[output].split(channel, factor=16)
+        outer = schedule[output].fuse(batch, y, x, channel_outer)
+        schedule[output].reorder(outer, channel_inner)
+        schedule[output].vectorize(channel_inner)
+    else:
+        output = te.compute(
+            shape,
+            lambda b, c, y, x: data[b, y, x, c],
+            name="to_nchw",
+        )
+        schedule = te.create_schedule(output.op)
+        batch, channel, y, x = schedule[output].op.axis
+        x_outer, x_inner = schedule[output].split(x, factor=16)
+        outer = schedule[output].fuse(batch, channel, y, x_outer)
+        schedule[output].reorder(outer, x_inner)
+        schedule[output].vectorize(x_inner)
+    return tvm.build(schedule, [data, output], target=target, name="main"), tuple(output.shape)
+
+
 def _numpy_stride2_reference(data, weight, bias):
     batch, _, height, width = data.shape
     _, out_channels, kh, kw = weight.shape
@@ -100,6 +170,7 @@ def main():
     parser.add_argument("--roi-batch", type=int, default=8)
     parser.add_argument("--tiles", default="4,8,16")
     parser.add_argument("--repeat", type=int, default=5)
+    parser.add_argument("--channel-only", action="store_true")
     args = parser.parse_args()
     _configure_linker()
 
@@ -127,38 +198,94 @@ def main():
     )
     try:
         launcher.start_server()
-        baseline, out_shape = _conv_transpose_module(
-            data_shape, weight_shape, stride, pads, output_padding, target
-        )
-        assert out_shape == expected.shape
-        baseline_path = Path("/tmp/tvm_hexagon_conv_transpose_topi.so")
-        baseline.save(str(baseline_path))
-        with launcher.create_session() as session:
-            baseline_ms, baseline_error = _run_kernel(
-                session, baseline_path, inputs, out_shape, expected, args.repeat
+        if args.channel_only:
+            baseline_ms = 5892.6  # Last phone-measured generic baseline (ms).
+        else:
+            baseline, out_shape = _conv_transpose_module(
+                data_shape, weight_shape, stride, pads, output_padding, target
             )
-        print(
-            f"topi_transpose: median={baseline_ms:.3f} ms, "
-            f"max_abs_err={baseline_error:.3g}",
-            flush=True,
-        )
+            assert out_shape == expected.shape
+            baseline_path = Path("/tmp/tvm_hexagon_conv_transpose_topi.so")
+            baseline.save(str(baseline_path))
+            with launcher.create_session() as session:
+                baseline_ms, baseline_error = _run_kernel(
+                    session, baseline_path, inputs, out_shape, expected, args.repeat
+                )
+            print(
+                f"topi_transpose: median={baseline_ms:.3f} ms, "
+                f"max_abs_err={baseline_error:.3g}",
+                flush=True,
+            )
 
         macs = data_shape[0] * weight_shape[1] * data_shape[2] * data_shape[3]
         macs *= data_shape[1] * weight_shape[2] * weight_shape[3]
+        if not args.channel_only:
+            for tile in map(int, args.tiles.split(",")):
+                module, out_shape = _direct_stride2_module(
+                    data_shape, weight_shape, (weight_shape[1],), target, tile
+                )
+                path = Path("/tmp") / f"tvm_hexagon_conv_transpose_direct_w{tile}.so"
+                module.save(str(path))
+                with launcher.create_session() as session:
+                    elapsed_ms, max_error = _run_kernel(
+                        session, path, inputs, out_shape, expected, args.repeat
+                    )
+                print(
+                    f"direct_parity width_tile={tile}: median={elapsed_ms:.3f} ms, "
+                    f"speedup={baseline_ms / elapsed_ms:.2f}x, "
+                    f"MACs={macs:,}, max_abs_err={max_error:.3g}",
+                    flush=True,
+                )
+
+        packed_weight = np.ascontiguousarray(weight.transpose(2, 3, 0, 1))
+        expected_nhwc = np.ascontiguousarray(expected.transpose(0, 2, 3, 1))
         for tile in map(int, args.tiles.split(",")):
-            module, out_shape = _direct_stride2_module(
-                data_shape, weight_shape, (weight_shape[1],), target, tile
-            )
-            path = Path("/tmp") / f"tvm_hexagon_conv_transpose_direct_w{tile}.so"
+            for input_nhwc in (False, True):
+                module, out_shape = _channel_vectorized_module(
+                    data_shape, weight_shape, (weight_shape[1],), target, tile, input_nhwc
+                )
+                input_data = (
+                    np.ascontiguousarray(data.transpose(0, 2, 3, 1)) if input_nhwc else data
+                )
+                path = Path("/tmp") / f"tvm_hexagon_conv_transpose_nhwc_c{tile}_in{'nhwc' if input_nhwc else 'nchw'}.so"
+                module.save(str(path))
+                with launcher.create_session() as session:
+                    elapsed_ms, max_error = _run_kernel(
+                        session,
+                        path,
+                        [input_data, packed_weight, bias],
+                        out_shape,
+                        expected_nhwc,
+                        args.repeat,
+                    )
+                print(
+                    f"channel_vectorized_nhwc channel_tile={tile} input={'NHWC' if input_nhwc else 'NCHW'}: "
+                    f"median={elapsed_ms:.3f} ms, speedup={baseline_ms / elapsed_ms:.2f}x, "
+                    f"max_abs_err={max_error:.3g} (weight packing and layout conversion excluded)",
+                    flush=True,
+                )
+
+        copy_specs = [
+            ("input_nchw_to_nhwc", data_shape, data,
+             np.ascontiguousarray(data.transpose(0, 2, 3, 1)), True),
+            ("output_nhwc_to_nchw", expected.shape, expected_nhwc,
+             np.ascontiguousarray(expected), False),
+        ]
+        for label, logical_shape, source, expected_copy, to_nhwc in copy_specs:
+            module, copy_shape = _layout_copy_module(logical_shape, target, to_nhwc)
+            path = Path("/tmp") / f"tvm_hexagon_{label}.so"
             module.save(str(path))
             with launcher.create_session() as session:
                 elapsed_ms, max_error = _run_kernel(
-                    session, path, inputs, out_shape, expected, args.repeat
+                    session,
+                    path,
+                    [np.ascontiguousarray(source)],
+                    copy_shape,
+                    expected_copy,
+                    args.repeat,
                 )
             print(
-                f"direct_parity width_tile={tile}: median={elapsed_ms:.3f} ms, "
-                f"speedup={baseline_ms / elapsed_ms:.2f}x, "
-                f"MACs={macs:,}, max_abs_err={max_error:.3g}",
+                f"layout_copy {label}: median={elapsed_ms:.3f} ms, max_abs_err={max_error:.3g}",
                 flush=True,
             )
     finally:

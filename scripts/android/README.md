@@ -203,3 +203,15 @@ NumPy reference with maximum absolute error below 5e-7. This is useful but
 still far from practical latency, so the specialization remains an exploratory
 benchmark pending better Hexagon vectorization and scheduling. These numbers
 are per-kernel synthetic workloads, not end-to-end Mask R-CNN inference.
+
+The next schedule vectorizes output channels and packs the weights to
+`[kernel_h, kernel_w, input_channel, output_channel]`, with NHWC output. At
+channel tile 16 it measured 149.7 ms with NCHW input and 68.1 ms with NHWC
+input. The corresponding DSP layout copies took 4.3 ms for NCHW-to-NHWC input
+and 32.6 ms for NHWC-to-NCHW output. Including both copies, the NHWC-input
+path is about 105 ms, roughly 56x faster than the 5.89 s generic baseline;
+weight packing is excluded because model weights can be packed once. Numerical
+error remained below 5e-7. The output conversion still costs about half of the
+optimized path, so fusing it into a following operator or retaining NHWC across
+operators is the next opportunity. The results are from an exploratory
+benchmark and do not yet change the general ConvTranspose implementation.
