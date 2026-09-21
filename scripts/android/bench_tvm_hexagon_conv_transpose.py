@@ -104,7 +104,7 @@ def _channel_vectorized_module(
     return module, (n, out_height, out_width, out_channels)
 
 
-def _layout_copy_module(shape, target, to_nhwc):
+def _layout_copy_module(shape, target, to_nhwc, channel_tile=None):
     n, channels, height, width = shape
     input_shape = shape if to_nhwc else (n, height, width, channels)
     data = te.placeholder(input_shape, name="layout_input", dtype="float32")
@@ -128,10 +128,16 @@ def _layout_copy_module(shape, target, to_nhwc):
         )
         schedule = te.create_schedule(output.op)
         batch, channel, y, x = schedule[output].op.axis
-        x_outer, x_inner = schedule[output].split(x, factor=16)
-        outer = schedule[output].fuse(batch, channel, y, x_outer)
-        schedule[output].reorder(outer, x_inner)
-        schedule[output].vectorize(x_inner)
+        if channel_tile:
+            channel_outer, channel_inner = schedule[output].split(channel, factor=channel_tile)
+            outer = schedule[output].fuse(batch, channel_outer, y, x)
+            schedule[output].reorder(outer, channel_inner)
+            schedule[output].vectorize(channel_inner)
+        else:
+            x_outer, x_inner = schedule[output].split(x, factor=16)
+            outer = schedule[output].fuse(batch, channel, y, x_outer)
+            schedule[output].reorder(outer, x_inner)
+            schedule[output].vectorize(x_inner)
     return tvm.build(schedule, [data, output], target=target, name="main"), tuple(output.shape)
 
 
@@ -171,6 +177,7 @@ def main():
     parser.add_argument("--tiles", default="4,8,16")
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--channel-only", action="store_true")
+    parser.add_argument("--channel-inputs", choices=("both", "nchw", "nhwc"), default="both")
     args = parser.parse_args()
     _configure_linker()
 
@@ -239,8 +246,13 @@ def main():
 
         packed_weight = np.ascontiguousarray(weight.transpose(2, 3, 0, 1))
         expected_nhwc = np.ascontiguousarray(expected.transpose(0, 2, 3, 1))
+        input_layouts = {
+            "both": (False, True),
+            "nchw": (False,),
+            "nhwc": (True,),
+        }[args.channel_inputs]
         for tile in map(int, args.tiles.split(",")):
-            for input_nhwc in (False, True):
+            for input_nhwc in input_layouts:
                 module, out_shape = _channel_vectorized_module(
                     data_shape, weight_shape, (weight_shape[1],), target, tile, input_nhwc
                 )
@@ -272,22 +284,28 @@ def main():
              np.ascontiguousarray(expected), False),
         ]
         for label, logical_shape, source, expected_copy, to_nhwc in copy_specs:
-            module, copy_shape = _layout_copy_module(logical_shape, target, to_nhwc)
-            path = Path("/tmp") / f"tvm_hexagon_{label}.so"
-            module.save(str(path))
-            with launcher.create_session() as session:
-                elapsed_ms, max_error = _run_kernel(
-                    session,
-                    path,
-                    [np.ascontiguousarray(source)],
-                    copy_shape,
-                    expected_copy,
-                    args.repeat,
+            variants = (None, 16) if label == "output_nhwc_to_nchw" else (None,)
+            for channel_tile in variants:
+                module, copy_shape = _layout_copy_module(
+                    logical_shape, target, to_nhwc, channel_tile
                 )
-            print(
-                f"layout_copy {label}: median={elapsed_ms:.3f} ms, max_abs_err={max_error:.3g}",
-                flush=True,
-            )
+                suffix = f"_c{channel_tile}" if channel_tile else ""
+                path = Path("/tmp") / f"tvm_hexagon_{label}{suffix}.so"
+                module.save(str(path))
+                with launcher.create_session() as session:
+                    elapsed_ms, max_error = _run_kernel(
+                        session,
+                        path,
+                        [np.ascontiguousarray(source)],
+                        copy_shape,
+                        expected_copy,
+                        args.repeat,
+                    )
+                print(
+                    f"layout_copy {label}{suffix}: median={elapsed_ms:.3f} ms, "
+                    f"max_abs_err={max_error:.3g}",
+                    flush=True,
+                )
     finally:
         launcher.stop_server()
         tracker.terminate()
