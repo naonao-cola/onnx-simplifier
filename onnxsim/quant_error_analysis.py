@@ -41,7 +41,6 @@ from typing import Tuple
 
 import numpy as np
 
-
 # ---------------------------------------------------------------------------
 # Section 3.2 -- persistent channel-wise outlier decomposition
 # ---------------------------------------------------------------------------
@@ -255,14 +254,7 @@ def randomized_rotation_co_bound(
     """Eq. 11: with probability >= ``1 - delta``,
     ``J_co(Lambda, D) <= 2*T*n_co/d * l_lambda_max^2 * (log(2d) + log(1/delta))``
     for a Hadamard rotation with independent Rademacher signs ``D``."""
-    return (
-        2
-        * T
-        * n_co
-        / d
-        * l_lambda_max**2
-        * (np.log(2 * d) + np.log(1.0 / delta))
-    )
+    return 2 * T * n_co / d * l_lambda_max**2 * (np.log(2 * d) + np.log(1.0 / delta))
 
 
 def sampled_rotation_co_bound(
@@ -275,12 +267,7 @@ def sampled_rotation_co_bound(
     :func:`randomized_rotation_co_bound`), matching the paper's own point
     that sampling more candidates can only help."""
     return (
-        2
-        * T
-        * n_co
-        / d
-        * l_lambda_max**2
-        * (np.log(2 * d) + np.log(1.0 / delta) / n_s)
+        2 * T * n_co / d * l_lambda_max**2 * (np.log(2 * d) + np.log(1.0 / delta) / n_s)
     )
 
 
