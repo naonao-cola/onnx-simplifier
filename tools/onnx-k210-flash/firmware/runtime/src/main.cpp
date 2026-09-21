@@ -23,10 +23,9 @@
 // implementation) is what this is modeled on -- it calls the exact same
 // interpreter API internally, just without exposing the shape query.
 //
-// Status: compiled and linked for real against kendryte-standalone-sdk
-// (toolchain: kendryte-gnu-toolchain 8.2.0, riscv64-unknown-elf) -- see
-// ../README.md for the exact build/verification. NOT run on a real K210
-// board: no device attached to the environment this was written in.
+// Status: built against kendryte-standalone-sdk (toolchain:
+// kendryte-gnu-toolchain 8.2.0, riscv64-unknown-elf) with nncase's v1.9.0
+// K210 runtime, and run for real on an M5StickV -- see ../README.md.
 
 #include <cstdio>
 #include <cstring>
@@ -45,6 +44,7 @@
 #include <nncase/runtime/interpreter.h>
 #include <nncase/runtime/runtime_op_utility.h>
 
+#include "dmac.h"
 #include "plic.h"
 #include "sysctl.h"
 #include "uarths.h"
@@ -60,6 +60,8 @@ namespace {
 constexpr uint32_t kModelFlashAddress = 0x00C00000; // Kendryte's own kfpkg convention (e.g. kendryte-standalone-demo/kpu's flash-list.json) -- reused rather than inventing a new offset.
 constexpr size_t kModelBufferSize = 2 * 1024 * 1024; // must fit the real kmodel; every candidate in ../README.md's table does with room to spare.
 constexpr uint32_t PLL0_OUTPUT_FREQ = 800000000UL;
+constexpr uint32_t PLL1_OUTPUT_FREQ = 400000000UL; // KPU (AI) clock source
+constexpr uint32_t PLL2_OUTPUT_FREQ = 45158400UL;
 
 alignas(256) uint8_t g_model_buffer[kModelBufferSize];
 
@@ -87,9 +89,19 @@ void print_shape(const runtime_shape_t &shape) {
 
 int main() {
   sysctl_pll_set_freq(SYSCTL_PLL0, PLL0_OUTPUT_FREQ);
+  // PLL1 feeds the KPU and the AI clock gate must be open, and DMAC must be
+  // initialised, *before* interp.load_model(): the k210 runtime module
+  // programs KPU registers while loading, and with only PLL0 configured
+  // that access hangs the bus (verified on a real M5StickV: load_model()
+  // never returned; with these four lines it does). kendryte's own kpu demos
+  // do the same setup.
+  sysctl_pll_set_freq(SYSCTL_PLL1, PLL1_OUTPUT_FREQ);
+  sysctl_pll_set_freq(SYSCTL_PLL2, PLL2_OUTPUT_FREQ);
   uarths_init();
   plic_init();
   sysctl_enable_irq();
+  dmac_init();
+  sysctl_clock_enable(SYSCTL_CLOCK_AI);
 
   printf("onnx-k210-flash runtime\n");
   printf("reading model from flash @0x%08x (%zu bytes)...\n", kModelFlashAddress, kModelBufferSize);
@@ -120,11 +132,14 @@ int main() {
 
   printf("model loaded ok. inputs: %zu  outputs: %zu\n", interp.inputs_size(), interp.outputs_size());
 
-  // Sanity inference over zeroed input(s) for every input tensor, sized
-  // from the model's own declared shape/dtype -- proves the load-from-
-  // flash + interpreter path actually executes this model on this
-  // device. Says nothing about accuracy; that needs real sensor data,
-  // wired up per-model (this runtime is deliberately generic).
+  // Sanity inference over every input tensor, sized from the model's own
+  // declared shape/dtype -- proves the load-from-flash + interpreter path
+  // actually executes this model on this device. float32 inputs are filled
+  // with the deterministic ramp x[j] = ((j*7)%256)/255 - 0.5 (zeros
+  // otherwise) and float32 outputs are printed, so the result can be
+  // compared against onnxruntime on the host fed the same ramp. That's a
+  // sanity check (uint8 PTQ error is expected), not real sensor data --
+  // this runtime is deliberately generic.
   for (size_t i = 0; i < interp.inputs_size(); i++) {
     auto &shape = interp.input_shape(i);
     auto type = interp.input_desc(i).datatype;
@@ -140,6 +155,10 @@ int main() {
       while (1) {}
     }
     memset(input_buf, 0, nbytes);
+    if (type == dt_float32) {
+      float *f = reinterpret_cast<float *>(input_buf);
+      for (size_t j = 0; j < nbytes / sizeof(float); j++) f[j] = (float)((j * 7) % 256) / 255.0f - 0.5f;
+    }
 
     auto tensor_result = hrt::create(type, shape, {reinterpret_cast<gsl::byte *>(input_buf), nbytes}, false, hrt::pool_shared);
     if (!tensor_result.is_ok()) {
@@ -173,6 +192,10 @@ int main() {
     if (!map_result.is_ok()) continue;
     auto buffer = map_result.unwrap().buffer();
     printf("  out[%zu]: %zu bytes\n", i, buffer.size_bytes());
+    if (interp.output_desc(i).datatype == dt_float32) {
+      const float *f = reinterpret_cast<const float *>(buffer.data());
+      for (size_t j = 0; j < buffer.size_bytes() / sizeof(float) && j < 32; j++) printf("    [%zu] %.5f\n", j, (double)f[j]);
+    }
   }
 
   while (1) {}
