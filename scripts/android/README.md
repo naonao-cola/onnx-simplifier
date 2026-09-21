@@ -372,3 +372,36 @@ activation traffic. Notes:
   kernels still convert through qf formats; fp16 activations would need matching fp16
   layout-copy kernels to keep the whole path fp16 (not done).
 
+### Letting TVM generate the qfloat code
+
+The hand-written kernels above call `vmpy.qf32.sf` / `vmpy.qf16.hf` / `vmpy.qf32.hf` directly
+because Hexagon's LLVM backend converts qf32/qf16 <-> IEEE around every fp operation.
+`hexagon_qfloat.py` moves that into TVM: a TIR pass (registered at lowering phase 2, after
+vectorization and unrolling) finds vector accumulators whose stores are a zero initialiser or
+`acc[i] = acc[i] + A * B`, rewrites the updates into chained qfloat intrinsics, and wraps other
+reads of the accumulator in `vconv`. It handles fp32 (`vmpy.qf32.sf` + `vadd.qf32`), fp16
+inputs with fp32 accumulation (widening `vmpy.qf32.hf`, lane order restored on read), qf16
+accumulators, and widening qf16 partial sums into an fp32 total (`vmpy.qf32.qf16` by qf16 1.0).
+`hexagon_qfloat.build` also declares 128-byte-aligned argument buffers with no symbolic
+`elem_offset` (a symbolic offset hides the alignment and produces `vmem` + `valign` pairs).
+
+`bench_tvm_hexagon_conv_transpose_generated.py` uses *plain TE schedules* (no intrinsics: a
+parity-plane compute, split/reorder/unroll/vectorize) for the same mask-head ConvTranspose. Same
+schedule, stock TVM vs. with the pass, against the hand-written kernels (best tile per row,
+median of 3):
+
+| Kernel | Stock TVM | TVM + qfloat pass | Hand-written | Error (max/scale) |
+|---|---:|---:|---:|---:|
+| fp32 | 29.2 ms | **15.8 ms** | 12.8 ms | 1e-6 |
+| fp16 in/out, fp32 accumulate (`f16w`) | 30.9 ms | **6.06 ms** | 5.56 ms | 3e-4 |
+| fp16, qf16 chunks widened to fp32 (`f16k`, chunk 16) | 13.4 ms | **6.8 ms** | 4.15 ms (chunk 8) | 2e-3 |
+
+So the generated code reaches 81% (fp32) and 92% (fp16 widening) of the hand-written speed,
+and 5x/1.8x/2x over stock TVM on identical schedules. Remaining gap: the fp32 and chunked
+kernels still pay for per-output `vconv` epilogues and scalar splats that the hand-written
+loops schedule more tightly. Unlike the hand-written fp16 kernels, none of the 36 swept
+generated configurations returned a wrong result (`** WRONG RESULT **` is still flagged if it
+happens). The pass is a Python `prim_func_pass` in `scripts/android/`; moving it into
+`src/target/llvm/codegen_hexagon.cc` / `tir.transform` would make it available without the
+build wrapper.
+
