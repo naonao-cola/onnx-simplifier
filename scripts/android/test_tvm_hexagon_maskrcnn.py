@@ -3,10 +3,11 @@
 
 This is an opt-in hardware probe, not part of the normal test suite. It takes
 the static ResNet/FPN tensor shapes and pooling attributes from a Mask R-CNN
-ONNX model, generates representative convolution/pooling kernels with TVM's
-Hexagon target, runs them through TVM RPC, and compares against TVM/LLVM CPU
-results. Weights and activations are randomized: this checks kernel codegen
-and DSP execution, not end-to-end model accuracy or graph delegation.
+ONNX model, generates representative convolution, pooling, resize, and RoIAlign
+kernels with TVM's Hexagon target, runs them through TVM RPC, and compares
+against TVM/LLVM CPU or TOPI's Python reference. Weights, activations, and
+regions are randomized: this checks kernel codegen and DSP execution, not
+end-to-end model accuracy or graph delegation.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import tvm
 from tvm import te, topi
 from tvm.contrib.hexagon.build import HexagonLauncher
 from tvm.rpc.tracker import Tracker
+from tvm.topi.testing import roi_align_nchw_python
 
 
 def _attrs(node):
@@ -151,7 +153,37 @@ def _model_workloads(model_path: Path, roi_batch: int):
         )
     if not resizes:
         raise RuntimeError("No nearest-neighbor FPN Resize operators found")
-    return convs, pools, resizes
+
+    roi_aligns = {}
+    for node in model.graph.node:
+        if node.op_type != "RoiAlign":
+            continue
+        input_shape = shapes.get(node.input[0])
+        if input_shape is None or len(input_shape) != 4 or input_shape[1:] not in (
+            (256, 7, 7),
+            (256, 14, 14),
+            (256, 28, 28),
+            (256, 56, 56),
+        ):
+            continue
+        attrs = _attrs(node)
+        if attrs.get("output_height") != 7 or attrs.get("output_width") != 7:
+            continue
+        height = input_shape[2]
+        roi_aligns.setdefault(
+            height,
+            (
+                f"roi_align_{height}x{height}_to_7x7",
+                (1, 256, height, height),
+                (7, 7),
+                attrs["spatial_scale"],
+                attrs.get("sampling_ratio", 0),
+                attrs.get("mode", b"avg").decode(),
+            ),
+        )
+    if len(roi_aligns) != 4:
+        raise RuntimeError(f"Expected four FPN RoiAlign inputs, found {sorted(roi_aligns)}")
+    return convs, pools, resizes, list(roi_aligns.values())
 
 
 def _hexagon_target():
@@ -217,6 +249,20 @@ def _resize_module(data_shape, size, coordinate_mode, rounding_mode, target):
     return module, tuple(int(dim) for dim in output.shape)
 
 
+def _roi_align_module(data_shape, rois_shape, pooled_size, spatial_scale, sample_ratio, mode, target):
+    data = te.placeholder(data_shape, name="data", dtype="float32")
+    rois = te.placeholder(rois_shape, name="rois", dtype="float32")
+    output = topi.vision.roi_align_nchw(
+        data, rois, pooled_size, spatial_scale, mode.encode(), sample_ratio
+    )
+    # TVM 0.17 has no registered Hexagon Relay schedule for RoiAlign. Its TOPI
+    # compute is TE-based, so an explicit default TE schedule still lets the
+    # Hexagon code generator lower and execute this operator on its own.
+    schedule = te.create_schedule(output.op)
+    module = tvm.build(schedule, [data, rois, output], target=target, name="main")
+    return module, tuple(int(dim) for dim in output.shape)
+
+
 def _cpu_conv(data, weight, bias, stride, pad_before, pad_after):
     data_shape, weight_shape = data.shape, weight.shape
     x = te.placeholder(data_shape, name="x", dtype="float32")
@@ -245,7 +291,7 @@ def _cpu_conv(data, weight, bias, stride, pad_before, pad_after):
 
 
 def run(args):
-    convs, pools, resizes = _model_workloads(args.model, args.roi_batch)
+    convs, pools, resizes, roi_aligns = _model_workloads(args.model, args.roi_batch)
     target = _hexagon_target()
     rng = np.random.default_rng(11)
     tracker = Tracker(host=args.rpc_host, port=args.tracker_port)
@@ -340,6 +386,48 @@ def run(args):
                 cpu_module["main"](tvm.nd.array(data), expected)
                 np.testing.assert_allclose(actual, expected.numpy(), rtol=0, atol=0)
                 print(f"PASS {name}: output={output_shape} exact", flush=True)
+
+            for name, data_shape, pooled_size, spatial_scale, sample_ratio, mode in roi_aligns:
+                rois_shape = (args.roi_batch, 5)
+                module, output_shape = _roi_align_module(
+                    data_shape,
+                    rois_shape,
+                    pooled_size,
+                    spatial_scale,
+                    sample_ratio,
+                    mode,
+                    target,
+                )
+                local_path = Path(args.artifact_dir) / f"{name}.so"
+                module.save(str(local_path))
+                remote_path = session.upload(str(local_path), local_path.name)
+                remote_module = session.load_module(remote_path)
+                data = rng.normal(0, 0.1, data_shape).astype("float32")
+                rois = np.zeros(rois_shape, dtype="float32")
+                rois[:, 1] = np.arange(args.roi_batch, dtype="float32") * 3.0
+                rois[:, 2] = np.arange(args.roi_batch, dtype="float32") * 2.0
+                rois[:, 3] = np.minimum(rois[:, 1] + 112.0, 223.0)
+                rois[:, 4] = np.minimum(rois[:, 2] + 96.0, 223.0)
+                remote_output = tvm.nd.empty(output_shape, "float32", session.device)
+                remote_module["main"](
+                    tvm.nd.array(data, session.device),
+                    tvm.nd.array(rois, session.device),
+                    remote_output,
+                )
+                actual = remote_output.numpy()
+                expected = roi_align_nchw_python(
+                    data,
+                    rois,
+                    pooled_size,
+                    spatial_scale,
+                    sample_ratio,
+                    mode=mode.encode(),
+                )
+                np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+                error = float(np.max(np.abs(actual - expected)))
+                print(
+                    f"PASS {name}: output={output_shape} max_abs_err={error:.8g}", flush=True
+                )
     finally:
         launcher.stop_server()
         tracker.terminate()
