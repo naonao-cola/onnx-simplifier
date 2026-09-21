@@ -389,6 +389,32 @@ from onnxsim.qat_interop import (
 )
 from onnxsim.qoq import apply_smooth_attention, quantize_weight_only_qoq
 from onnxsim.qronos import apply_qronos
+from onnxsim.quant_error_analysis import (
+    LocalErrorDecomposition,
+    decompose_local_error,
+    detect_persistent_outlier_channels,
+    fixed_rotation_co_bound,
+    frobenius_surrogate,
+    l2_channel_scale,
+    linf_channel_scale,
+    local_reconstruction_error,
+    normalized_hadamard_matrix,
+    persistent_co_split,
+    randomized_rotation_co_bound,
+    residual_upper_bound,
+    sampled_rotation_co_bound,
+)
+from onnxsim.quant_error_eval import (
+    ChannelScalingEvaluation,
+    LayerEvaluation,
+    RotationCoEvaluation,
+    evaluate_channel_scaling,
+    evaluate_model,
+    evaluate_rotation_co_control,
+    quarot_style_rotation,
+    smoothquant_scale,
+    spinquant_style_rotation,
+)
 from onnxsim.quantease import apply_quantease
 from onnxsim.quarot import apply_quarot, apply_quarot_fused, apply_quarot_gptq
 from onnxsim.quip_sharp import apply_quip_sharp
@@ -486,6 +512,28 @@ __all__ = [
     "apply_ptq4vit_quantization_cpp",
     "apply_qronos",
     "apply_qronos_cpp",
+    "LocalErrorDecomposition",
+    "decompose_local_error",
+    "detect_persistent_outlier_channels",
+    "fixed_rotation_co_bound",
+    "frobenius_surrogate",
+    "l2_channel_scale",
+    "linf_channel_scale",
+    "local_reconstruction_error",
+    "normalized_hadamard_matrix",
+    "persistent_co_split",
+    "randomized_rotation_co_bound",
+    "residual_upper_bound",
+    "sampled_rotation_co_bound",
+    "ChannelScalingEvaluation",
+    "LayerEvaluation",
+    "RotationCoEvaluation",
+    "evaluate_channel_scaling",
+    "evaluate_model",
+    "evaluate_rotation_co_control",
+    "quarot_style_rotation",
+    "smoothquant_scale",
+    "spinquant_style_rotation",
     "quantize_weight_only_qoq",
     "apply_qoq_cpp",
     "apply_smooth_attention",
