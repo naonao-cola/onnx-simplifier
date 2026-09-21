@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+import setuptools  # noqa: F401  # TVM 0.17 imports distutils during module initialization.
 import tvm
 from tvm import te
 from tvm.contrib.hexagon.build import HexagonLauncher
@@ -28,7 +29,9 @@ def _configure_linker():
         "import subprocess, sys\n"
         f"clang = {str(clang_link)!r}\n"
         "args = ['-Wl,--export-dynamic' if x == '-export-dynamic' else x for x in sys.argv[1:]]\n"
-        "raise SystemExit(subprocess.call([clang, *args]))\n",
+        # Kernels only use C symbols; a dynamic libc++ dependency would pull in libc++abi,
+        # which needs libc symbols (aligned_alloc, __cxa_thread_atexit_impl) the DSP lacks.
+        "raise SystemExit(subprocess.call([clang, '-nostdlib++', *args]))\n",
         encoding="utf-8",
     )
     wrapper.chmod(0o755)
@@ -130,6 +133,7 @@ def _layout_copy_module(shape, target, to_nhwc, channel_tile=None):
         batch, channel, y, x = schedule[output].op.axis
         if channel_tile:
             channel_outer, channel_inner = schedule[output].split(channel, factor=channel_tile)
+            schedule[output].reorder(batch, channel_outer, y, x, channel_inner)
             outer = schedule[output].fuse(batch, channel_outer, y, x)
             schedule[output].reorder(outer, channel_inner)
             schedule[output].vectorize(channel_inner)
@@ -171,7 +175,7 @@ def _run_kernel(session, module_path, inputs, output_shape, expected, repeat):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--model", type=Path)
     parser.add_argument("--device", default="239dbd8f")
     parser.add_argument("--roi-batch", type=int, default=8)
     parser.add_argument("--tiles", default="4,8,16")
@@ -181,8 +185,14 @@ def main():
     args = parser.parse_args()
     _configure_linker()
 
-    _, _, _, _, workload, _ = _model_workloads(args.model, args.roi_batch)
-    name, data_shape, weight_shape, stride, pads, output_padding = workload
+    if args.model:
+        _, _, _, _, workload, _ = _model_workloads(args.model, args.roi_batch)
+        workload_name, data_shape, weight_shape, stride, pads, output_padding = workload
+    else:
+        workload_name = "roi_mask_head_conv_transpose_2x"
+        data_shape = (args.roi_batch, 256, 14, 14)
+        weight_shape = (256, 256, 2, 2)
+        stride, pads, output_padding = (2, 2), (0, 0, 0, 0), (0, 0)
     if stride != (2, 2) or pads not in ((0, 0), (0, 0, 0, 0)) or output_padding != (0, 0):
         raise ValueError("This specialization currently requires stride 2, zero padding, and no output padding")
     target = _hexagon_target()
@@ -284,7 +294,7 @@ def main():
              np.ascontiguousarray(expected), False),
         ]
         for label, logical_shape, source, expected_copy, to_nhwc in copy_specs:
-            variants = (None, 16) if label == "output_nhwc_to_nchw" else (None,)
+            variants = (None, 16, 32, 64, 128, 256) if label == "output_nhwc_to_nchw" else (None,)
             for channel_tile in variants:
                 module, copy_shape = _layout_copy_module(
                     logical_shape, target, to_nhwc, channel_tile
