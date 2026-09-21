@@ -215,3 +215,55 @@ error remained below 5e-7. The output conversion still costs about half of the
 optimized path, so fusing it into a following operator or retaining NHWC across
 operators is the next opportunity. The results are from an exploratory
 benchmark and do not yet change the general ConvTranspose implementation.
+
+## Remaining Mask R-CNN operator coverage
+
+`bench_tvm_hexagon_maskrcnn_more_ops.py` covers the rest of the model's operator set
+(`MaskRCNN-12-qdq.onnx` has 42 op types; the six above were covered before). Static shapes
+(residual feature maps, box-head weights, the RPN NMS IoU threshold) are read from the model;
+data-dependent counts use `--roi-batch` (8) and `--proposals` (1000). Each kernel is verified
+against a NumPy reference on the phone, then timed (median of 5 single invocations, warm
+buffers, so the sub-10 us rows are at the timer's resolution).
+
+```bash
+python scripts/android/bench_tvm_hexagon_maskrcnn_more_ops.py \
+  --model /path/to/MaskRCNN-12-qdq.onnx
+```
+
+| Group | ONNX ops | Workload | Median |
+|---|---|---|---:|
+| Residual | Add, Relu (+fused) | `[1,256,56,56]` add / relu / add+relu | 0.51 / 0.29 / 0.46 ms |
+| | | `[1,2048,7,7]` add / relu / add+relu | 0.07 / 0.01 / 0.07 ms |
+| Box head | MatMul, Add, Relu | `[8,12544]x[12544,1024]` generic TE schedule | 78.5 ms |
+| | | same, hand-written HVX qf32 (weights pre-packed) | 12.6 ms |
+| | | `[8,1024]x[1024,1024]` generic / HVX | 6.2 / 1.19 ms |
+| | | `[8,1024]x[1024,324]` (bbox) generic / HVX | 8.4 / 0.61 ms |
+| | | `[8,1024]x[1024,81]` (cls) generic / HVX | 2.5 / 0.11 ms |
+| | Softmax, Clip, Div | `[8,81]` | 0.05 ms |
+| Mask head | Sigmoid | `[8,81,28,28]` TOPI (libm `expf`) / polynomial exp | 10.0 / 1.0 ms |
+| Box decode | Exp, Mul, Add, Sub, Div, Clip | 1000 boxes | 0.11 ms |
+| Level mapper | Sqrt, Log, Floor, Clip | 1000 boxes | 0.05 ms |
+| Filtering | Greater, Less, Not, And, Cast | 9408 anchors | 0.05 ms |
+| Proposals | TopK | 9408 candidates to 1000 | 0.93 ms |
+| | NonMaxSuppression | 1000 boxes, IoU 0.7 (greedy) | 8.1 ms |
+| | NonZero | 9408-element mask | 0.05 ms |
+| | Gather | 1000 rows of `[9408,4]` | 0.02 ms |
+| RoI merge | ScatterElements | `[8,256,7,7]` | 0.44 ms |
+| Layout | Concat, Slice/Split, Transpose, Flatten, ReduceMin | RPN levels `12543x4`, `[1000,4]`, `[1,1000]`, `[8,256,7,7]` | 0.12 / 0.01 / 0.003 / 0.20 / 0.002 ms |
+
+Metadata-only ops (`Shape`, `Unsqueeze`, `Squeeze`, `Reshape`, `ConstantOfShape`, `Expand`,
+integer `Cast`) touch tiny tensors and are not benchmarked. Notes from getting these to run
+well on Hexagon:
+
+- The generic box-head MatMul streams weights at under 1 GB/s. Column-tile parallelism with
+  all activation rows held in HVX qf32 accumulators (the ConvTranspose kernel's approach) is
+  6-23x faster; fc6 is then weight-bandwidth bound (51 MB fp32), which the model's int8
+  weights would cut 4x.
+- `te.floor` and `te.abs` lower to one scalar libm call per lane, and `tvm.tir.if_then_else`
+  keeps a loop scalar; `Select` plus an int-cast floor keeps polynomial `exp`/Sigmoid
+  vectorized (10x faster than TOPI's Sigmoid).
+- NMS and NonZero are single-threaded `te.extern` loops; NMS at 8 ms for 1000 boxes is the
+  clear next candidate (bit-mask/parallel-row formulation).
+- Kernels must link with `-nostdlib++` and the skeleton must be relinked with
+  `relink_hexagon_skel_static_libcxx.sh` (see `docs/tvm-hexagon-conv-transpose-handoff.md`).
+
