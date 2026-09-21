@@ -167,3 +167,32 @@ Tinygrad's local Hexagon backend. It targets V65 and expects Linux FastRPC
 device nodes, so its DSP runtime does not directly match this Android/TVM RPC
 setup. The source offers a codegen experiment, but does not establish a
 phone-specific memory-bandwidth model.
+
+## Other Mask R-CNN Hexagon operator timings
+
+`bench_tvm_hexagon_maskrcnn_ops.py` extends the phone measurements to
+max-pooling, FPN resize, RoIAlign, mask-head ConvTranspose, and the model's
+uint8 quantize/dequantize pair. It uses the model-derived shapes, randomized
+values, preallocated DSP buffers, five single-invocation timing samples, and
+operator-specific CPU/NumPy correctness checks. Input generation, transfers,
+and output reads are outside the timed region. Run it with:
+
+```bash
+python scripts/android/bench_tvm_hexagon_maskrcnn_ops.py \
+  --model /path/to/MaskRCNN-12-qdq.onnx
+```
+
+On the tested Xiaomi 12S (Hexagon V73), median kernel times were:
+
+| Operator | Workload | Median |
+|---|---|---:|
+| MaxPool | `[1,64,112,112]`, 3x3, stride 2 | 6.894 ms |
+| FPN resize | `[1,256,14,14]` to `[1,256,28,28]` | 7.654 ms |
+| RoIAlign | `[8,256,56,56]` to `[8,256,7,7]` | 27.712 ms |
+| Mask-head ConvTranspose | `[8,256,14,14]` to `[8,256,28,28]` | 5802.006 ms |
+| Quantize + dequantize | model input `[1,3,224,224]` | 3.890 ms |
+
+The 5.8-second ConvTranspose result is a major remaining bottleneck in this
+synthetic kernel coverage and should be optimized separately before treating
+DSP offload as practical for that operator. These numbers are per-kernel
+synthetic workloads, not end-to-end Mask R-CNN inference.
