@@ -246,7 +246,9 @@ def _hexagon_target():
     return tvm.target.Target(target, host=target)
 
 
-def _conv_module(name, data_shape, weight_shape, stride, pad_before, pad_after, target):
+def _conv_module(
+    name, data_shape, weight_shape, stride, pad_before, pad_after, target, width_tile=8
+):
     x = te.placeholder(data_shape, name="x", dtype="float32")
     weight = te.placeholder(weight_shape, name="weight", dtype="float32")
     bias = te.placeholder((weight_shape[0],), name="bias", dtype="float32")
@@ -266,7 +268,7 @@ def _conv_module(name, data_shape, weight_shape, stride, pad_before, pad_after, 
     # Width is contiguous in NCHW. Small width vectors leave more independent
     # outer tiles for the Hexagon worker pool than a single 32-wide vector.
     n, channel, height, width = schedule[conv].op.axis
-    width_outer, width_inner = schedule[conv].split(width, factor=8)
+    width_outer, width_inner = schedule[conv].split(width, factor=width_tile)
     outer = schedule[conv].fuse(n, channel, height, width_outer)
     schedule[conv].reorder(outer, width_inner, *schedule[conv].op.reduce_axis)
     schedule[conv].vectorize(width_inner)
