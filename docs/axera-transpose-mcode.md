@@ -211,3 +211,72 @@ worse. A usable alignment needs a grammar validated on these segments first.
 2. Build the grammar for segment 2 from those catalogues instead of the
    tokenizer's forms, and validate it by round-tripping every sweep build.
 3. Only then attempt the tiled segments, starting from the 184-byte block.
+
+## Third pass: the step-1 sweep (alignment classes and the size immediate)
+
+Every `R` and every `C` from 8 to 64 at a fixed other dimension (`C=32` and
+`R=16`), 113 builds, reproduced by `scripts/axera/transpose_decode.py` from the
+sweep root. This corrects one claim above and pins down several fields.
+
+**Alignment to 8 is the first-order structure, not value thresholds.** With `R=16`
+and `C` varying, the untiled segment-2 content is 800 bytes for every `C` that is
+not a multiple of 8 and 736 for multiples of 8 (768 at `C=16`). Between
+neighbouring unaligned `C` values only 1-2 bytes change, with no insertions or
+deletions, except at the block edges (`C = 8k+1`) where a whole new form
+appears (`ins` of 60-90 bytes), and at `C=12` (one-byte shift). With `C=32` and
+`R` varying, multiples of 8 give 736 bytes and other `R` give 768 (`R=55` is the one
+exception, at 736), with small form changes (3-byte inserts) between neighbours. So the rule that a
+"shape change re-flows the stream" is really a per-block change: streams are
+stable inside a block of 8 and change form at block edges.
+
+**A 16-bit size immediate, by alignment class.** Every untiled stream holds the
+tensor's byte size as a little-endian uint16, `4*R*C - 1` or `4*R*C` depending on
+alignment (only tested where the value is below 65536):
+
+| C | R | field | present |
+| --- | --- | --- | --- |
+| unaligned | aligned | `4*R*C - 1` | 54 of 54 |
+| aligned | aligned | `4*R*C` | 61 of 64 |
+| aligned | unaligned | `4*R*C` | 43 of 50 |
+| unaligned | unaligned | neither | 0 of 6 (`9x49`, `12x20`, `13x17`, `17x13`, `20x12`, `49x9`) |
+
+The ten aligned-`C` shapes where `4*R*C` is absent are `8x24`, `11x32`, `13x32`,
+`15x32`, `16x8`, `24x8`, `25x32`, `55x32`, `57x32` and `61x32`; the cause is
+unknown (a different form of the same value is one possibility, and several of
+them have a zero byte in the value, such as 512 and 768). Inside a block of
+unaligned `C` at `R=16`, exactly these two bytes are the only ones that vary:
+`C=17..23` gives `3f 04, 7f 04, bf 04, ff 04, 3f 05, 7f 05, bf 05`, which is
+`64*C - 1`, and the same holds for the blocks at `C=25, 33, 41, 49, 57`.
+
+**Block templates, at R=16.** Masking the size field and diffing block against
+block shows 7-13 differences, nearly all of them immediates that are simple
+functions of `q = ceil(C/8)` (rows of 8 elements) and `R`. Observed, not fitted
+across all shapes:
+
+| field (approx. byte offset) | value | for `q` = 3..8 |
+| --- | --- | --- |
+| 549 | `32*q`, the row size padded to 8 elements | 0x60, 0x80, 0xa0, 0xc0, 0xe0 (q=3..7) |
+| 617 and 629 | `R*q - 1` | 0x2f, 0x3f, 0x4f, 0x5f, 0x6f, 0x7f |
+| before `82 1a` | `2*q` | 8, 10, 14, 16 (q = 4, 5, 7, 8) |
+| before `83 34 93` | `4*q` | 16, 20, 24, 28, 32 (q = 4..8) |
+
+So the earlier "4C" reading at offset 549 was right only for aligned `C`; the
+padded row size is what is stored. The exceptions line up with `q` divisible by
+3: for `q=3` and `q=6` the same slots use a different form (`82 56 02` and
+`82 98 02` instead of `00 2q 82 1a`, and `82 cc 95` instead of `00 4q 83 34 93`).
+`2q` and `4q` take the values 6, 12 and 24 there, so the trigger looks like a
+value that is a multiple of 3 (or of 6). It is a pattern over six data points,
+not a rule.
+
+**What this does not establish.**
+- No dependence on `R` beyond the two sweeps; the `R` blocks (`R = 8k+1..8k+7`)
+  were only seen through the `C=32` sweep, where the changes are larger and
+  shifted, and they were not decoded.
+- Nothing for the both-unaligned class, or the ten aligned-`C` exceptions.
+- Nothing in the tiled regime, and every Transpose in the ResNet18 training step
+  (for example `[16,1,576,3136]`, `[1,64,64,9]` at 147 KB) is tiled. The untiled
+  decode is a stepping stone: the same quantities (byte size, `ceil(C/8)` row
+  counts, `R*q - 1`) should reappear per tile, but that has not been checked.
+- No predictor. A generator would still need templates per `(ceil(R/8), ceil(C/8))`
+  class (or the rule that produces them), the form-switch rule for `q` divisible
+  by 3, and validation on held-out shapes with a device run.
