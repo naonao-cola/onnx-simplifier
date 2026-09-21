@@ -9,6 +9,8 @@ hand-built-graph tests in `tests/test_tensorrt_*.py` (which never invoke TensorR
 | `trt_harness.py` | system Python with `tensorrt` | builds engines, dumps per-layer tactic/precision, times inference, compares orig vs sim outputs |
 | `modelopt_pipeline.py` | onnxsim + `nvidia-modelopt[onnx]` | fixes batch, runs `simplify()` and ModelOpt INT8 quantization on a real model, with an un-simplified control |
 | `bench_trtexec.py` | any (stdlib) | builds/times every variant with `trtexec` and prints a table |
+| `imagenette_data.py` | any with Pillow | preprocesses Imagenette (real ImageNet images, 10 classes) into val + calibration `.npy` sets |
+| `eval_accuracy.py` | system Python with `tensorrt` | streams the val set through each variant's TensorRT engine; top-1 and agreement with fp32 |
 
 They are split because JetPack 6's TensorRT Python bindings are cp310-only while onnxsim
 needs Python >= 3.11; models are exchanged as `.onnx` files.
@@ -49,38 +51,59 @@ fails with "no scaling factors" otherwise, since no calibrator is supplied).
 Memory note: the Orin's 7.4 GB is shared CPU/GPU. `trtexec` failed with CUDA OOM while a
 parallel C++ build was running; retry on an idle machine.
 
-## ModelOpt + TensorRT GPU performance: ResNet-18 (ONNX model zoo `resnet18-v1-7`)
+## ModelOpt + TensorRT: latency and accuracy on 3 ImageNet classifiers
+
+ONNX model zoo `resnet18-v1-7`, `resnet50-v1-7`, `mobilenetv2-12`, all pretrained
+ImageNet-1k. The pipeline lifts each to opset 17, pins the batch, then runs
+`onnxsim.simplify()` (`sim`; ResNet-18 69 -> 49 nodes, ResNet-50 175 -> 122, MobileNetV2
+106 -> 100) and ModelOpt INT8 (explicit Q/DQ, entropy or max calibration, mixed FP16/INT8
+output, built with `--int8 --fp16`). `raw` is the same model without onnxsim.
 
 ```sh
-python3.12 scripts/nvidia/modelopt_pipeline.py resnet18.onnx /tmp/r18 --batch 1 8
-python3 scripts/nvidia/bench_trtexec.py /tmp/r18 --duration 5
+python3.12 scripts/nvidia/imagenette_data.py imagenette2-320 /tmp/data      # needs Pillow
+python3.12 scripts/nvidia/modelopt_pipeline.py resnet18.onnx /tmp/pl_r18 --batch 1 8 \
+    --calib-npy /tmp/data/calib_x.npy --methods entropy max
+python3 scripts/nvidia/bench_trtexec.py /tmp/pl_r18 --glob '*.sim*.onnx'       # latency
+python3.10 scripts/nvidia/eval_accuracy.py /tmp/pl_r18 /tmp/data              # accuracy
 ```
 
-The zoo model is opset 8 / IR 3 with weights declared as graph inputs and a dynamic
-batch; the pipeline lifts it to opset 17, pins the batch, then (`sim`) runs
-`onnxsim.simplify()` (69 -> 49 nodes). `raw` is the same model without onnxsim.
-ModelOpt's INT8 output is mixed FP16 + INT8 explicit Q/DQ, built with `--int8 --fp16`.
-Mean GPU compute time from `trtexec` (`--noDataTransfers`), MAXN_SUPER power mode:
+**Accuracy** is 1000-way top-1 on the **Imagenette val split**: 3,925 real ImageNet images
+of 10 ImageNet-1k classes (the gated ImageNet val set was not available). These are easy
+classes, so absolute numbers run high; compare variants, not against published top-1.
+Calibration uses 128 *train* images of the same 10 classes, disjoint from val, which is
+in-distribution and likely flatters INT8 compared with a proper 1000-class calibration
+set. Standard error on 3,925 images is ~0.65 points; "agree" is top-1 agreement with the
+fp32 engine (two fp32 builds of one model agree only 99.9-100%: TensorRT tactic noise).
 
-| batch | precision | raw (ms) | onnxsim (ms) | vs fp32 |
-|---|---|---|---|---|
-| 1 | fp32 | 1.566 | 1.591 | 1.0x |
-| 1 | fp16 | 0.758 | 0.759 | 2.1x |
-| 1 | ModelOpt int8+fp16 | 0.498 | 0.497 | 3.2x |
-| 8 | fp32 | 8.131 | 8.022 | 1.0x |
-| 8 | fp16 | 3.527 | 3.541 | 2.3x |
-| 8 | ModelOpt int8+fp16 | 1.931 | 1.929 | 4.2x |
+| model (sim, batch 8 eval) | fp32 | fp16 | int8 entropy | int8 max | agree w/ fp32 (entropy) |
+|---|---|---|---|---|---|
+| ResNet-18 | 75.18 | 75.16 | 75.46 | 75.44 | 95.95% |
+| ResNet-50 | 80.99 | 80.97 | 80.82 | 80.74 | 97.38% |
+| MobileNetV2 | 79.03 | 79.03 | **77.76** | **76.99** | 90.96% |
 
-- INT8 is ~1.5x (batch 1) and ~1.8x (batch 8) faster than FP16 on the Orin Nano GPU.
-- onnxsim makes **no measurable latency difference** here: TensorRT's own graph
-  optimizer already folds BN and constants, so raw and simplified engines run at the
-  same speed (differences are within run-to-run noise). onnxsim's value for this
-  workflow is a clean, fixed-shape input (and ModelOpt accepts both variants).
-- Output sanity (batch 8, 64 random inputs, engine outputs vs the fp32 engine): fp16
-  cosine 0.99999 / top-1 agree 64/64; ModelOpt int8 (simplified) cosine 0.9956 / 59/64;
-  (raw) 0.9956 / 56/64. **This is not an accuracy measurement**: calibration and
-  these inputs are random noise, not ImageNet images. It only shows the INT8 engines
-  are not degenerate. Real accuracy needs a real calibration/eval set.
+**Latency** (mean GPU ms, `trtexec --noDataTransfers`, MAXN_SUPER, simplified model,
+INT8 = entropy calibration; max calibration is within 3% of it everywhere):
+
+| model | batch | fp32 | fp16 | int8+fp16 | int8 vs fp16 |
+|---|---|---|---|---|---|
+| ResNet-18 | 1 | 1.578 | 0.758 | 0.485 | 1.56x |
+| ResNet-18 | 8 | 8.357 | 3.537 | 1.927 | 1.84x |
+| ResNet-50 | 1 | 3.596 | 1.814 | 1.190 | 1.52x |
+| ResNet-50 | 8 | 19.969 | 8.816 | 4.930 | 1.79x |
+| MobileNetV2 | 1 | 1.386 | 0.850 | 0.781 | **1.09x** |
+| MobileNetV2 | 8 | 8.147 | 3.925 | 2.446 | 1.60x |
+
+Takeaways:
+- ResNets: INT8 is 1.5-1.8x faster than FP16 (3.0-4.3x vs fp32) at no measurable accuracy
+  cost (within the ~0.65-point standard error).
+- MobileNetV2 is the counter-example: INT8 loses 1.3 (entropy) to 2.0 (max) points and
+  only 91% of predictions match fp32, while batch-1 INT8 is just 1.09x faster than FP16
+  (depthwise convs get little from INT8 and add many Q/DQ reformats). On this board
+  MobileNetV2 is better left at FP16 unless batch >= 8. Entropy beats max calibration.
+- **onnxsim did not change accuracy or latency** for any of the three: raw and simplified
+  models agree within noise (MobileNetV2's quantized raw and sim models score identically),
+  since TensorRT and ModelOpt already fold BN/constants themselves. The earlier ResNet-18
+  latency check (raw vs sim, batch 1/8) likewise showed <1% differences.
 
 ## DLA (NVDLA): not available on this board
 
