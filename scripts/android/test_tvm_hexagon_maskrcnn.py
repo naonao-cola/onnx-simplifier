@@ -3,11 +3,11 @@
 
 This is an opt-in hardware probe, not part of the normal test suite. It takes
 the static ResNet/FPN tensor shapes and pooling attributes from a Mask R-CNN
-ONNX model, generates representative convolution, pooling, resize, and RoIAlign
-kernels with TVM's Hexagon target, runs them through TVM RPC, and compares
-against TVM/LLVM CPU or TOPI's Python reference. Weights, activations, and
-regions are randomized: this checks kernel codegen and DSP execution, not
-end-to-end model accuracy or graph delegation.
+ONNX model, generates representative convolution, transpose convolution,
+pooling, resize, RoIAlign, and quantize/dequantize kernels with TVM's Hexagon
+target, runs them through TVM RPC, and compares against TVM/LLVM CPU or NumPy.
+Weights, activations, and regions are randomized: this checks kernel codegen
+and DSP execution, not end-to-end model accuracy or graph delegation.
 """
 
 from __future__ import annotations
@@ -183,7 +183,62 @@ def _model_workloads(model_path: Path, roi_batch: int):
         )
     if len(roi_aligns) != 4:
         raise RuntimeError(f"Expected four FPN RoiAlign inputs, found {sorted(roi_aligns)}")
-    return convs, pools, resizes, list(roi_aligns.values())
+    deconv_node = next((node for node in model.graph.node if node.op_type == "ConvTranspose"), None)
+    if deconv_node is None:
+        raise RuntimeError("No mask-head ConvTranspose operator found")
+    deconv_attrs = _attrs(deconv_node)
+    deconv_weight_shape = shapes.get(deconv_node.input[1])
+    if deconv_weight_shape != (256, 256, 2, 2):
+        raise RuntimeError(f"Unexpected mask-head ConvTranspose weights: {deconv_weight_shape}")
+    deconv = (
+        "roi_mask_head_conv_transpose_2x",
+        (roi_batch, 256, 14, 14),
+        deconv_weight_shape,
+        tuple(deconv_attrs.get("strides", [1, 1])),
+        tuple(deconv_attrs.get("pads", [0, 0, 0, 0])),
+        tuple(deconv_attrs.get("output_padding", [0, 0])),
+    )
+
+    initializers = {
+        value.name: onnx.numpy_helper.to_array(value) for value in model.graph.initializer
+    }
+    qdq = None
+    for node in model.graph.node:
+        if node.op_type != "QuantizeLinear" or len(node.input) < 3:
+            continue
+        scale = initializers.get(node.input[1])
+        zero_point = initializers.get(node.input[2])
+        data_shape = shapes.get(node.input[0])
+        if (
+            scale is None
+            or zero_point is None
+            or np.asarray(scale).ndim != 0
+            or np.asarray(zero_point).dtype != np.uint8
+            or data_shape is None
+            or any(dim is None or dim <= 0 for dim in data_shape)
+        ):
+            continue
+        matching_dequant = next(
+            (
+                candidate
+                for candidate in model.graph.node
+                if candidate.op_type == "DequantizeLinear"
+                and candidate.input[0] == node.output[0]
+            ),
+            None,
+        )
+        if matching_dequant is None:
+            continue
+        qdq = (
+            "activation_quantize_dequantize_uint8",
+            data_shape,
+            float(np.asarray(scale)),
+            int(np.asarray(zero_point)),
+        )
+        break
+    if qdq is None:
+        raise RuntimeError("No static per-tensor uint8 QuantizeLinear/DequantizeLinear pair found")
+    return convs, pools, resizes, list(roi_aligns.values()), deconv, qdq
 
 
 def _hexagon_target():
@@ -263,6 +318,48 @@ def _roi_align_module(data_shape, rois_shape, pooled_size, spatial_scale, sample
     return module, tuple(int(dim) for dim in output.shape)
 
 
+def _conv_transpose_module(data_shape, weight_shape, stride, pads, output_padding, target):
+    data = te.placeholder(data_shape, name="data", dtype="float32")
+    weight = te.placeholder(weight_shape, name="weight", dtype="float32")
+    bias = te.placeholder((weight_shape[1],), name="bias", dtype="float32")
+    output = topi.nn.conv2d_transpose_nchw(
+        data,
+        weight,
+        stride,
+        pads,
+        "float32",
+        output_padding,
+    )
+    biased = te.compute(
+        output.shape,
+        lambda n, c, h, w: output[n, c, h, w] + bias[c],
+        name="bias_add",
+    )
+    schedule = topi.hexagon.schedule_conv2d_transpose_nchw(biased)
+    module = tvm.build(schedule, [data, weight, bias, biased], target=target, name="main")
+    return module, tuple(int(dim) for dim in biased.shape)
+
+
+def _qdq_module(data_shape, scale, zero_point, target):
+    data = te.placeholder(data_shape, name="data", dtype="float32")
+    quantized = te.compute(
+        data_shape,
+        lambda *idx: te.min(
+            te.max(tvm.tir.round(data[idx] / scale) + zero_point, 0.0),
+            255.0,
+        ).astype("uint8"),
+        name="quantize_linear",
+    )
+    dequantized = te.compute(
+        data_shape,
+        lambda *idx: (quantized[idx].astype("float32") - zero_point) * scale,
+        name="dequantize_linear",
+    )
+    schedule = te.create_schedule([quantized.op, dequantized.op])
+    module = tvm.build(schedule, [data, quantized, dequantized], target=target, name="main")
+    return module
+
+
 def _cpu_conv(data, weight, bias, stride, pad_before, pad_after):
     data_shape, weight_shape = data.shape, weight.shape
     x = te.placeholder(data_shape, name="x", dtype="float32")
@@ -291,7 +388,7 @@ def _cpu_conv(data, weight, bias, stride, pad_before, pad_after):
 
 
 def run(args):
-    convs, pools, resizes, roi_aligns = _model_workloads(args.model, args.roi_batch)
+    convs, pools, resizes, roi_aligns, deconv, qdq = _model_workloads(args.model, args.roi_batch)
     target = _hexagon_target()
     rng = np.random.default_rng(11)
     tracker = Tracker(host=args.rpc_host, port=args.tracker_port)
@@ -428,6 +525,70 @@ def run(args):
                 print(
                     f"PASS {name}: output={output_shape} max_abs_err={error:.8g}", flush=True
                 )
+
+            name, data_shape, weight_shape, stride, pads, output_padding = deconv
+            module, output_shape = _conv_transpose_module(
+                data_shape, weight_shape, stride, pads, output_padding, target
+            )
+            local_path = Path(args.artifact_dir) / f"{name}.so"
+            module.save(str(local_path))
+            remote_path = session.upload(str(local_path), local_path.name)
+            remote_module = session.load_module(remote_path)
+            data = rng.normal(0, 0.1, data_shape).astype("float32")
+            weight = rng.normal(0, 0.05, weight_shape).astype("float32")
+            bias = np.zeros((weight_shape[1],), dtype="float32")
+            remote_output = tvm.nd.empty(output_shape, "float32", session.device)
+            remote_module["main"](
+                tvm.nd.array(data, session.device),
+                tvm.nd.array(weight, session.device),
+                tvm.nd.array(bias, session.device),
+                remote_output,
+            )
+            actual = remote_output.numpy()
+
+            x = te.placeholder(data_shape, name="data", dtype="float32")
+            w = te.placeholder(weight_shape, name="weight", dtype="float32")
+            b = te.placeholder((weight_shape[1],), name="bias", dtype="float32")
+            cpu_conv = topi.nn.conv2d_transpose_nchw(
+                x, w, stride, pads, "float32", output_padding
+            )
+            expected_expr = te.compute(
+                cpu_conv.shape,
+                lambda n, c, h, wi: cpu_conv[n, c, h, wi] + b[c],
+                name="bias_add",
+            )
+            cpu_schedule = topi.hexagon.schedule_conv2d_transpose_nchw(expected_expr)
+            cpu_module = tvm.build(
+                cpu_schedule, [x, w, b, expected_expr], target="llvm", name="main"
+            )
+            expected = tvm.nd.empty(output_shape)
+            cpu_module["main"](tvm.nd.array(data), tvm.nd.array(weight), tvm.nd.array(bias), expected)
+            np.testing.assert_allclose(actual, expected.numpy(), rtol=2e-3, atol=2e-3)
+            error = float(np.max(np.abs(actual - expected.numpy())))
+            print(f"PASS {name}: output={output_shape} max_abs_err={error:.8g}", flush=True)
+
+            name, data_shape, scale, zero_point = qdq
+            qdq_module = _qdq_module(data_shape, scale, zero_point, target)
+            qdq_path = Path(args.artifact_dir) / f"{name}.so"
+            qdq_module.save(str(qdq_path))
+            remote_path = session.upload(str(qdq_path), qdq_path.name)
+            remote_qdq = session.load_module(remote_path)
+            data = rng.normal(0, 1.0, data_shape).astype("float32")
+            q_output = tvm.nd.empty(data_shape, "uint8", session.device)
+            dq_output = tvm.nd.empty(data_shape, "float32", session.device)
+            remote_qdq["main"](tvm.nd.array(data, session.device), q_output, dq_output)
+            actual_q = q_output.numpy()
+            actual_dq = dq_output.numpy()
+            expected_q = np.clip(np.rint(data / scale) + zero_point, 0, 255).astype("uint8")
+            expected_dq = (expected_q.astype("float32") - zero_point) * scale
+            np.testing.assert_array_equal(actual_q, expected_q)
+            dq_max_abs_err = float(np.max(np.abs(actual_dq - expected_dq)))
+            np.testing.assert_allclose(actual_dq, expected_dq, rtol=1e-6, atol=1e-5)
+            print(
+                f"PASS {name}: shape={data_shape} quantized_exact "
+                f"dequantized_max_abs_err={dq_max_abs_err:.7g}",
+                flush=True,
+            )
     finally:
         launcher.stop_server()
         tracker.terminate()

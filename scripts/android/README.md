@@ -96,15 +96,18 @@ probe passes on the image tensor's first four values.
 ## TVM Hexagon Mask R-CNN kernel probe
 
 `test_tvm_hexagon_maskrcnn.py` is an opt-in test for TVM's Hexagon code
-generator and RPC execution path. It reads the ResNet/FPN convolution and
-pooling, resize, and RoIAlign attributes from a Mask R-CNN ONNX model, compiles
-representative convolution + bias + ReLU, max-pooling, nearest-neighbor FPN
-resize, and four-level 7x7 RoIAlign kernels for V73, runs them on the connected
-Hexagon DSP, and compares their results with TVM/LLVM CPU kernels or TOPI's
-Python reference. The ROI workloads use a configurable synthetic proposal
-batch (default 8) because the model's ROI count is dynamic. Tensor values,
-weights, and regions are randomized. This checks individual kernels, not the
-full Mask R-CNN graph, model weights, QNN integration, or detector accuracy.
+generator and RPC execution path. It reads ResNet/FPN convolution and pooling,
+resize, RoIAlign, mask-head ConvTranspose, and a static uint8 QDQ pair from a
+Mask R-CNN ONNX model. It compiles representative convolution + bias + ReLU,
+max-pooling, nearest-neighbor FPN resize, four-level 7x7 RoIAlign,
+mask-head 2x transpose convolution, and quantize/dequantize kernels for V73,
+runs them on the connected Hexagon DSP, and compares their results with
+TVM/LLVM CPU kernels or NumPy. The uint8 quantized values are checked exactly;
+dequantized floats allow a 1e-5 absolute tolerance for DSP floating-point
+rounding. The ROI workloads use a configurable synthetic proposal batch
+(default 8) because the model's ROI count is dynamic. Tensor values, weights,
+and regions are randomized. This checks individual kernels, not the full Mask
+R-CNN graph, model weights, QNN integration, or detector accuracy.
 
 The probe needs an Apache TVM build with Hexagon enabled, the matching Hexagon
 SDK/toolchain, and Python packages `onnx`, `numpy`, and TVM's dependencies. Set
