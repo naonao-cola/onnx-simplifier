@@ -151,3 +151,63 @@ R*C/8, R*C/256, when below 256) appear as bytes in the suffix of its own
 segment 2 for 90% of the 64 multiple-of-8 grid shapes, versus 61% for other
 shapes' values. Bytes 0-255 are dense in a 200-byte suffix, so this is much less
 convincing than the controlled one-dimension variations above.
+
+## Second pass: decode attempt (what held and what did not)
+
+Re-examined the 76 untiled `[1,1,R,C]` builds in `t_transpose_sweep` with the
+`mcode.decode` codec and raw byte diffs. No predictor came out of it; these are
+corrections and measurements for whoever continues.
+
+**The fixed-offset formulas do not generalize.** The table above (offsets 549,
+569, 619/631, 668, 673, 682) was read off two one-dimensional sweeps (R at
+C=32, C at R=16). Checking all seven offsets at once against the six formulas
+holds for 3 of the 76 untiled shapes. Read those offsets as "where the field
+sits in that neighbourhood", not as a layout.
+
+**What is solid, at R=16 with C varying.** The immediates are directly visible
+as single bytes: `01 02 X 83 92` with X = 4C (0x60, 0x80, 0xa0, 0xc0, 0xe0 for
+C = 24..56), `0c X 83 14` and `0c X 83 62` with X = R*C/8-1 (0x2f..0x7f), and
+`88 7c 00 X 82 1a` with X = C/4 for C = 32, 40, 56, 64.
+
+**Two things that need a real encoder.**
+- *Discrete micro-program switches.* C/4 is written `00 X 82 1a` for C = 32, 40,
+  56 and 64, but as `82 56 02` (C=24) and `82 98 02` (C=48). Both are C/8
+  divisible by 3. The trigger is not established.
+- *Value-dependent form changes that insert or remove a byte.* `16x32 -> 16x40`
+  changes 27 bytes: five immediates, then from byte 692 on the same
+  instructions shifted by one, because 3 bytes (`82 8c 8a`) become 4
+  (`07 83 3c 88`). Equal-length blobs therefore differ by anywhere from 27 to
+  143+ bytes for the same R and near C, and `16x40 -> 16x56` shifts the whole
+  stream from byte 572.
+
+**Cluster count says "not a few templates".** Grouping the 76 shapes whose
+segment-2 streams have equal length and differ in at most 14 bytes gives 61
+clusters. The largest has five shapes (16x32, 24x40, 24x48, 40x16, 40x32); 47
+clusters are singletons. So a template-plus-immediates model would need dozens
+of templates, and the choice among them is the unknown encoder.
+
+**The tokenizer is not reliable enough on these segments to align by record.**
+A record-level diff (`mcode.decode(..., **FULL_RULE)`, `difflib` on record
+signatures) of `16x16` against `16x24` splits the same bytes into different
+forms and emits raw bytes and B/S units that do not line up. A byte diff is no
+worse. A usable alignment needs a grammar validated on these segments first.
+
+**Tiled regime (training sizes) is more regular, but only partly.**
+- Segment 4 has high self-similarity at a fixed period: 184 bytes for
+  `[16,1,4608,49]` and `[16,1,2304,196]` (64% and 69% of bytes equal to the byte
+  one period later), and 1064 for `[16,1,576,3136]` (73%), with about 54% zero
+  bytes. That fits repeated per-tile blocks with varying immediates.
+- The `npu_params` tile offsets are not monotonic. The first entry of
+  `[16,1,4608,49]` is `0, 451584, 1354752, 903168, 1806336, 2257920, 4515840,
+  4064256, 2709504, 3612672` (multiples of 451584 = 4608*49*2). The order looks
+  like an allocator's, so even with the block structure decoded, the offset
+  order would need its own model. Rebuilds of four shapes were identical here,
+  but only four were tried.
+
+**Next steps if this is continued.**
+1. A one-dimensional sweep of every R (or C) from 8 to 64 in steps of 1 at a
+   fixed other dimension, cataloguing each form change against the value that
+   caused it (is it a threshold, a divisibility rule, or both?).
+2. Build the grammar for segment 2 from those catalogues instead of the
+   tokenizer's forms, and validate it by round-tripping every sweep build.
+3. Only then attempt the tiled segments, starting from the 184-byte block.
