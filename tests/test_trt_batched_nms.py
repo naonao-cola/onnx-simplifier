@@ -137,18 +137,18 @@ def _iou(b1, b2):
 
 
 def _greedy_nms(boxes_c, scores_c, iou_threshold, top_k):
-    """Standard greedy NMS: sort by score descending, keep a box, suppress
-    any remaining box with IoU > iou_threshold against it. Returns indices
-    into boxes_c/scores_c, at most top_k of them."""
-    order = np.argsort(-scores_c, kind="stable")
+    """Standard greedy NMS: only the top_k highest-scoring boxes (ties toward
+    the lower index) are candidates -- TensorRT's ``topK`` limits the boxes fed
+    INTO NMS, not the boxes it emits -- then sort by score descending, keep a
+    box, suppress any remaining box with IoU > iou_threshold against it.
+    Returns indices into boxes_c/scores_c."""
+    order = np.argsort(-scores_c, kind="stable")[:top_k]
     suppressed = np.zeros(len(order), dtype=bool)
     keep = []
     for pos, i in enumerate(order):
         if suppressed[pos]:
             continue
         keep.append(i)
-        if len(keep) >= top_k:
-            break
         for pos2 in range(pos + 1, len(order)):
             if suppressed[pos2]:
                 continue
@@ -454,3 +454,81 @@ def test_extra_optimizers_required_to_fire():
     assert ok
     op_types = [nd.op_type for nd in simplified.graph.node]
     assert "TRTBatchedNMS" in op_types, op_types
+
+
+def _top_k_scene(top_k, num_boxes_dyn=False):
+    """One class, 8 boxes: 4 heavily-overlapping high-score boxes (IoU well
+    above 0.5 with each other) followed by 4 disjoint low-score boxes."""
+    hi = np.array(
+        [[0, 0, 10, 10], [0.5, 0, 10.5, 10], [0, 0.5, 10, 10.5], [0.5, 0.5, 10.5, 10.5]],
+        dtype=np.float32,
+    )
+    lo = np.array(
+        [[20, 0, 30, 10], [40, 0, 50, 10], [60, 0, 70, 10], [80, 0, 90, 10]],
+        dtype=np.float32,
+    )
+    boxes = np.concatenate([hi, lo])[None]  # (1, 8, 4)
+    scores = np.array([0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2], dtype=np.float32)
+    scores = scores[None, :, None]  # (1, 8, 1)
+    model = _trt_batched_nms_model(
+        1, 8, 1, keep_top_k=8, top_k=top_k, num_boxes_dyn=num_boxes_dyn
+    )
+    return model, boxes[:, :, None, :], boxes, scores
+
+
+@pytest.mark.parametrize("num_boxes_dyn", [False, True])
+def test_top_k_limits_candidates_before_nms_not_after(num_boxes_dyn):
+    # TensorRT's BatchedNMS plugin only feeds the topK highest-scoring boxes
+    # per class INTO NMS. Here the top 4 are all mutually overlapping, so NMS
+    # over them keeps exactly 1 box -- the 4 disjoint low-score boxes never
+    # become candidates. (Capping NMS's *output* at topK instead would return
+    # 4 detections: box 0 plus three of the disjoint boxes.) Expected values
+    # confirmed against the real BatchedNMSDynamic_TRT plugin on TensorRT 10.3
+    # (scripts/nvidia/trt_nms_check.py).
+    model, boxes_5d, boxes, scores = _top_k_scene(top_k=4, num_boxes_dyn=num_boxes_dyn)
+    _, actual = _run_simplified(model, boxes_5d, scores)
+    assert int(actual[0][0, 0]) == 1
+    np.testing.assert_allclose(actual[1][0, 0], boxes[0, 0])
+    assert actual[2][0, 0] == pytest.approx(0.9)
+
+    expected = reference_trt_batched_nms(
+        boxes, scores, -1, top_k=4, keep_top_k=8, score_threshold=0.05, iou_threshold=0.5
+    )
+    _assert_same_detections(actual, expected)
+
+
+def test_top_k_at_least_num_boxes_is_a_no_op():
+    # topK >= num_boxes: every box is a candidate, so NMS keeps the 1 overlapping
+    # winner plus all 4 disjoint boxes, and the static-shape rewrite adds no
+    # pre-NMS TopK at all.
+    model, boxes_5d, boxes, scores = _top_k_scene(top_k=8)
+    simplified, actual = _run_simplified(model, boxes_5d, scores)
+    # Only the step-6 per-batch-item merge TopK (N == 1): no pre-NMS TopK.
+    assert [n.op_type for n in simplified.graph.node].count("TopK") == 1
+    assert int(actual[0][0, 0]) == 5
+    expected = reference_trt_batched_nms(
+        boxes, scores, -1, top_k=8, keep_top_k=8, score_threshold=0.05, iou_threshold=0.5
+    )
+    _assert_same_detections(actual, expected)
+
+
+def test_top_k_dynamic_num_boxes_fewer_than_top_k():
+    # num_boxes is dynamic and (at runtime) smaller than topK: the pre-NMS
+    # TopK's k must clamp to num_boxes (TopK with k > dim is an error).
+    model, boxes_5d, boxes, scores = _top_k_scene(top_k=100, num_boxes_dyn=True)
+    _, actual = _run_simplified(model, boxes_5d, scores)
+    assert int(actual[0][0, 0]) == 5
+
+
+def test_top_k_ties_at_the_cutoff_prefer_lower_box_index():
+    # Six disjoint boxes with identical scores, topK=3: the plugin (and ONNX
+    # TopK) break ties toward the lower box index, so boxes 0, 1, 2 survive.
+    boxes = np.array(
+        [[20 * i, 0, 20 * i + 10, 10] for i in range(6)], dtype=np.float32
+    )[None]
+    scores = np.full((1, 6, 1), 0.5, dtype=np.float32)
+    model = _trt_batched_nms_model(1, 6, 1, keep_top_k=6, top_k=3, num_boxes_dyn=True)
+    _, actual = _run_simplified(model, boxes[:, :, None, :], scores)
+    assert int(actual[0][0, 0]) == 3
+    kept = sorted(tuple(b) for b in actual[1][0, :3])
+    assert kept == sorted(tuple(b) for b in boxes[0, :3])

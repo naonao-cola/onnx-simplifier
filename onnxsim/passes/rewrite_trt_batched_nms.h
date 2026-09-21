@@ -19,20 +19,22 @@
 // `extra_optimizers=["rewrite_trt_batched_nms"]` (Python) or
 // `--enable-optimization rewrite_trt_batched_nms` (CLI).
 //
-// KNOWN LIMITATION -- read before trusting bit-exactness: `TRTBatchedNMS`'s
-// exact numerical behavior (greedy-NMS tie-breaking when two boxes have
-// identical scores, floating-point rounding inside the plugin, the precise
-// interaction of `topK`/`keepTopK` with duplicate scores at the cutoff) is
-// not fully documented outside NVIDIA's closed TensorRT plugin source (see
-// `plugin/batchedNMSPlugin` / `efficientNMSPlugin` in the public TensorRT OSS
-// repo for the closest available description). This rewrite instead
-// implements a standard, well-specified "per-class greedy NMS, then global
-// per-batch top-K merge" algorithm (spelled out step by step below) and
-// aims only for producing the same SET of kept detections (by box + class +
-// score, up to `keepTopK` and padding) as that well-specified algorithm --
-// NOT bit-identical output, and NOT identical tie-breaking order against the
-// real plugin. Treat any exact-order or exact-tie match against a real
-// TensorRT-plugin-produced reference as coincidental.
+// VERIFICATION STATUS: the closed plugin's exact numerical behavior is not
+// documented outside NVIDIA's source (see `plugin/batchedNMSPlugin` in the
+// public TensorRT OSS repo for the closest description), so this rewrite
+// implements a standard, well-specified "per-class top-`topK` candidates,
+// greedy NMS, then global per-batch top-K merge" algorithm (step by step
+// below). It has been differentially checked against the real
+// `BatchedNMSDynamic_TRT` plugin on TensorRT 10.3 (Jetson Orin, 28 cases;
+// see scripts/nvidia/trt_nms_check.py): the same kept detections in the same
+// order, including identical-score ties (ascending box index), IoU exactly
+// at the threshold, scores exactly at `scoreThreshold`, `topK`/`keepTopK`
+// truncation, `clipBoxes` and zero/-1 padding. NOT covered / known
+// differences: `isNormalized=0` (the plugin measures areas in pixel +1
+// convention; this pass ignores the flag), `shareLocation=0` (declined),
+// mmdeploy's own plugin fork (a different plugin from TensorRT's), and other
+// TensorRT versions. Floating-point rounding inside the plugin is not
+// guaranteed bit-identical.
 //
 // Op spec (as emitted by mmdeploy; see `mmdeploy.mmcv.ops.nms`):
 //   Inputs (2, fixed order):
@@ -42,7 +44,8 @@
 //     background_label_id (int, default -1): a class index to exclude
 //       entirely from consideration if >= 0.
 //     num_classes (int): authoritative static class count.
-//     topK (int): max boxes retained per class going into NMS.
+//     topK (int): max boxes per class fed INTO NMS (the top-topK by score);
+//       NOT a cap on NMS's output -- see step 3b.
 //     keepTopK (int): max final detections per batch item after merging
 //       across classes, sorted by score descending.
 //     scoreThreshold (float): scores below this are discarded pre-NMS.
@@ -118,13 +121,20 @@
 //    from the `num_classes` attribute (assumed to match the actual runtime
 //    class count -- undefined behavior, silently wrong broadcasting, if it
 //    doesn't; this is the spec's own stated contract for the attribute).
-// 4. `NonMaxSuppression(boxes_sq, scores_t, max_output_boxes_per_class=
+// 3b. Per (batch, class), keep only the `topK` highest-scoring boxes as NMS
+//    candidates: `k = Min(topK, num_boxes)`; `idx = TopK(scores_t, k, axis=2)`;
+//    scatter ones at `idx` into a zeros tensor of `scores_t`'s shape to get a
+//    keep-mask; `scores_nms = Where(mask, scores_t, -1e9)`. Skipped when
+//    `num_boxes` is static and `<= topK`. Downstream gathers still read the
+//    unmasked `scores_t`.
+// 4. `NonMaxSuppression(boxes_sq, scores_nms, max_output_boxes_per_class=
 //    Const(topK), iou_threshold=Const(iouThreshold),
 //    score_threshold=Const(scoreThreshold), center_point_box=0)` ->
 //    `selected_indices`, shape `(num_selected, 3)`, INT64, each row
 //    `[batch_index, class_index, box_index]`. This single call already
 //    performs step-1-of-the-reference-algorithm's "per class, greedy NMS,
-//    keep at most topK" for every `(batch, class)` pair at once -- ONNX
+//    keep at most topK" for every `(batch, class)` pair at once (the
+//    pre-NMS candidate limit having been applied in step 3b) -- ONNX
 //    `NonMaxSuppression` is inherently per-batch-per-class internally, so no
 //    separate per-class C++-unrolled loop is needed, only the per-batch-item
 //    loop in step 6 (merging across classes).
@@ -287,6 +297,9 @@ struct TRTBatchedNMSBuilder {
   Value* Sub(Value* a, Value* b) { return BinOp(kSub, a, b, a->elemType()); }
   Value* Max(Value* a, Value* b) {
     return BinOp(Symbol("Max"), a, b, a->elemType());
+  }
+  Value* Min(Value* a, Value* b) {
+    return BinOp(Symbol("Min"), a, b, a->elemType());
   }
   Value* Equal(Value* a, Value* b) {
     return BinOp(Symbol("Equal"), a, b, TensorProto_DataType_BOOL);
@@ -451,6 +464,48 @@ struct TRTBatchedNMSBuilder {
     return {n->outputs()[0], n->outputs()[1]};
   }
 
+  // TopK with a runtime `k` (a rank-1, length-1 int64 value). Returns
+  // {values, indices}, both with `data`'s rank.
+  std::pair<Value*, Value*> TopKDyn(Value* data, Value* k, int64_t axis) {
+    Node* n = graph.create(Symbol("TopK"), 2);
+    n->addInput(data);
+    n->addInput(k);
+    n->i_(kaxis, axis);
+    n->i_(Symbol("largest"), 1);
+    n->i_(Symbol("sorted"), 1);
+    n->insertBefore(anchor);
+    n->outputs()[0]->setElemType(data->elemType());
+    n->outputs()[1]->setElemType(TensorProto_DataType_INT64);
+    return {n->outputs()[0], n->outputs()[1]};
+  }
+
+  Value* ScatterElements(Value* data, Value* indices, Value* updates,
+                         int64_t axis) {
+    Node* n = graph.create(Symbol("ScatterElements"), 1);
+    n->addInput(data);
+    n->addInput(indices);
+    n->addInput(updates);
+    n->i_(kaxis, axis);
+    n->insertBefore(anchor);
+    n->output()->setElemType(data->elemType());
+    return n->output();
+  }
+
+  // Float tensor of runtime shape `shape` (a rank-1 int64 value), filled with
+  // `fill`.
+  Value* ConstantOfShape(Value* shape, float fill) {
+    Node* n = graph.create(Symbol("ConstantOfShape"), 1);
+    n->addInput(shape);
+    Tensor t;
+    t.elem_type() = TensorProto_DataType_FLOAT;
+    t.sizes().push_back(1);
+    t.floats().push_back(fill);
+    n->t_(Symbol("value"), std::move(t));
+    n->insertBefore(anchor);
+    n->output()->setElemType(TensorProto_DataType_FLOAT);
+    return n->output();
+  }
+
   Value* NMS(Value* boxes, Value* scores, Value* max_boxes_per_class,
              Value* iou_threshold, Value* score_threshold) {
     Node* n = graph.create(Symbol("NonMaxSuppression"), 1);
@@ -589,9 +644,33 @@ struct RewriteTRTBatchedNMS final : public PredicateBasedPass {
       scores_t = b.Add(scores_t, mask_3d);
     }
 
+    // 3b. `topK` limits the boxes fed INTO NMS per (batch, class): only the
+    // topK highest-scoring boxes are candidates (TensorRT's
+    // BatchedNMS/BatchedNMSDynamic plugin semantics, verified against the
+    // real plugin; ONNX NonMaxSuppression's own max_output_boxes_per_class
+    // instead caps the boxes coming OUT of NMS, which differs whenever
+    // topK-limited candidates suppress each other). Every box outside a
+    // class's top-topK gets a sentinel score so NMS's score_threshold drops
+    // it. ONNX TopK breaks ties toward the lower index, matching the
+    // plugin's ascending-box-index tie order. Skipped when num_boxes is
+    // statically <= topK (nothing to cut).
+    Value* scores_nms = scores_t;
+    const Dimension& num_boxes_dim = scores->sizes()[1];
+    if (!(num_boxes_dim.is_int && num_boxes_dim.dim <= topK)) {
+      Value* num_boxes =
+          b.Gather(b.Shape(scores_t), b.ConstI64Vec1(2), 0);  // (1,) int64
+      Value* k = b.Min(b.ConstI64Vec1(topK), num_boxes);      // (1,) int64
+      std::pair<Value*, Value*> top = b.TopKDyn(scores_t, k, 2);
+      Value* keep_f = b.ScatterElements(
+          b.ConstantOfShape(b.Shape(scores_t), 0.0f), top.second,
+          b.ConstantOfShape(b.Shape(top.second), 1.0f), 2);
+      Value* keep = b.Greater(keep_f, b.ConstF(0.5f));  // (N, C, num_boxes)
+      scores_nms = b.Where(keep, scores_t, b.ConstF(-1e9f));
+    }
+
     // 4. One NonMaxSuppression call handles every (batch, class) pair.
     Value* selected_indices = b.NMS(
-        boxes_sq, scores_t, b.ConstI64Scalar(topK), b.ConstF(iouThreshold),
+        boxes_sq, scores_nms, b.ConstI64Scalar(topK), b.ConstF(iouThreshold),
         b.ConstF(scoreThreshold));  // (num_selected, 3) int64
 
     // 5. Split into columns and gather the actual box/score/class values.
