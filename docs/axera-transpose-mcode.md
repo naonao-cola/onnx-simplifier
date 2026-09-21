@@ -224,8 +224,8 @@ not a multiple of 8 and 736 for multiples of 8 (768 at `C=16`). Between
 neighbouring unaligned `C` values only 1-2 bytes change, with no insertions or
 deletions, except at the block edges (`C = 8k+1`) where a whole new form
 appears (`ins` of 60-90 bytes), and at `C=12` (one-byte shift). With `C=32` and
-`R` varying, multiples of 8 give 736 bytes and other `R` give 768, with small
-form changes (3-byte inserts) between neighbours. So the rule that a
+`R` varying, multiples of 8 give 736 bytes and other `R` give 768 (`R=55` is the one
+exception, at 736), with small form changes (3-byte inserts) between neighbours. So the rule that a
 "shape change re-flows the stream" is really a per-block change: streams are
 stable inside a block of 8 and change form at block edges.
 
