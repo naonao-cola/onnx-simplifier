@@ -147,3 +147,42 @@ unmodified reference and a health run after each template were clean.
 This does not generate MCode for a new shape or count. That still requires a
 Pulsar2 build of the new shape, which is the next thing to characterize (how
 the MCode grows with N and with the leading dimensions).
+
+## ResNet18 training-step Gather coverage
+
+The ResNet18 step (`t6-r18fold/step.onnx`, batch 16, 224x224 input) has 41
+Gathers with 19 distinct `(input shape, index count)` pairs. Every one is a
+last-axis Gather with a constant index vector, and the same pair is often used
+with different vectors (eight different vectors for `[16,1,64,3136] -> 28224`),
+which is what index retargeting handles.
+
+18 of the 19 pairs now have a compiled template and a device check. They are
+`[16,1,C,HW]` gathers for C/HW of 64/3136, 128/784, 256/196, and 512/49 with
+counts from 49 to 28,224, plus the two 2-D stem/backward gathers
+`[1024,12544] -> 28224` and `[1024,28224] -> 112896`. The last-axis emitter
+accepts them all, and `emit_gather_last_axis_from_template(shape, out,
+indices=...)` emits one without a compiler-built reference.
+
+- **Oracle at real scale.** A Pulsar2 build of `[16,1,64,3136]` with a shuffled
+  28,224-index vector has `npu_params` and MCode byte-identical to the emitter's
+  output from the real-index reference. Building the same vector twice, real and
+  shuffled, gave identical MCode with zero differing bytes, even in the noise
+  window.
+- **Batch matters.** The table tail is a byte-offset table that depends on the
+  shape and batch: 1,920 words at batch 16 versus 100 at batch 1 for
+  `[.,1,64,3136] -> 28224`, and the MCode is 41,768 versus 4,072 bytes. It never
+  depends on index values.
+- **Device.** A random in-range index vector per template ran on the AX8850
+  (`axcl-vm`) and matched numpy Gather with maximum error 0.0035 for all 18
+  pairs, up to 115.6M output elements. Inputs were uniform in +/-0.8, within the
+  calibration range.
+- **Not built.** The stem's `[16,1,3,50176] -> 614656` Gather fails when Pulsar2
+  compiles it alone (a tensor-allocation error in "build op serially"). It may
+  compile inside the real graph, next to a consumer; that is untested.
+- **Fixtures.** `make_gather_fixture` zeroes the index words before gzipping, so
+  the 17 new fixtures total about 100 KB. Templates are discovered from the
+  `gather_<dims>_axis<k>_n<N>.axmodel.gz` filename.
+
+These are standalone one-op models. A real training step is one `neu mode` node
+whose MCode contains these Gathers as segments alongside the convolutions and
+elementwise ops; composing them is not attempted here.

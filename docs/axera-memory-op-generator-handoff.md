@@ -70,15 +70,47 @@ runner were scratch scripts; the recipe is `docker run pulsar2:7.0-lite pulsar2
 build` on a one-node Gather model with MinMax calibration, four uniform +/-0.9
 samples).
 
-The ResNet18 step's real Gathers are `[16,1,C,HW] -> [16,1,C,9*HW]`. Nothing at
-that scale (batch 16, C=64, N=28224) has been built or run yet.
+18 of the ResNet18 step's 19 distinct Gather `(shape, N)` pairs now have
+templates and device checks, up to `[16,1,64,3136]` with 28,224 indices and
+`[1024,28224]` with 112,896. Only the stem's `[16,1,3,50176] -> 614656` is
+missing: Pulsar2 rejects it compiled alone. Scratch builds are
+`/home/takecheeze/npu-scratch/t_train_gather/r_*`.
+
+## Transpose: first measurements (no emitter)
+
+Pulsar2 7.0-lite builds of a standalone float32 `Transpose` (scratch:
+`/home/takecheeze/npu-scratch/t_train_transpose`) compile to one `neu mode` node
+with a 40-byte `npu_params` of all zeros and an empty dynamic table, so there is
+no data to retarget. Everything is in the MCode, roughly 2.1 KB:
+
+| case | perm | MCode bytes |
+| --- | --- | --- |
+| `[1,1,16,16]` | `0,1,3,2` | 2144 |
+| `[1,1,8,32]`, `[1,1,32,8]` | `0,1,3,2` | 2112 |
+| `[1,16,8,9]` | `0,2,1,3` | 2112 |
+| `[1,8,8,9]` | `0,2,1,3` | 2080 |
+| `[1,1,16,16]` + `Relu` consumer | `0,1,3,2` | 2216 |
+
+Equal-sized blobs differ in 158 (`8x32` vs `32x8`) to 411 bytes (`8x32` vs
+`[1,16,8,9]`): a few bytes near 311-325, then a run from about 890 to 1085 that
+looks like one byte-shifted stream, plus one byte near 1748. So the instruction
+stream is variable-length coded and a shape change re-flows it; there is no
+single field to patch. Adding a consumer (`Relu`) also changes the MCode by 72
+bytes, so a standalone-op template would not drop into a full training graph.
+
+Consequence: a Transpose (and likely Reshape) generator needs the encoding of
+these DMA programs decoded from a shape sweep, not a template cache. That has
+not been attempted. The two Transpose families to sweep are those in the
+ResNet18 step: swap the last two axes of `[16,1,R,C]`, and swap axes 1 and 2 of
+`[1,C,C,9]`.
 
 ## Next steps
 
-0. Build a Gather at a real training shape (e.g. `[16,1,64,3136]`, N=28224, or a
-   smaller batch/channel version) and see whether the tail and MCode still
-   depend only on shape/N. Then the same for the 170 Reshapes and 41
-   Transposes, which dominate the step's remaining memory ops.
+0. Transpose (41 in the step: swap the last two axes of `[16,1,R,C]`
+   activations, or swap axes 1 and 2 of `[1,C,C,9]` weights) and Reshape (170).
+   Neither has data to retarget, so per-shape templates would only cache Pulsar2
+   output. Sweep shapes and diff the MCode to see whether it can be predicted
+   from the shape; that is what would make them generation rather than lookup.
 
 1. Add Gather output lengths or axes only with separate compiled templates
    where MCode changes, plus device checks. Keep runtime values inside the

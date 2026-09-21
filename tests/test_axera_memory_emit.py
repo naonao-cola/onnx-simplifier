@@ -21,7 +21,9 @@ from memory_emit import (  # noqa: E402
     _NOISE_START,
     emit_gather_axmodel,
     emit_gather_last_axis_axmodel,
+    emit_gather_last_axis_from_template,
     emit_slice_axmodel,
+    make_gather_fixture,
 )
 
 _FIXTURE = os.path.join(
@@ -445,3 +447,66 @@ def test_emit_gather_last_axis_rejects_altered_table_tail_and_mcode(tmp_path):
         emit_gather_last_axis_axmodel(
             reference, str(tmp_path / "bad.axmodel"), indices=list(range(8))
         )
+
+
+def test_gather_template_registry_covers_resnet18_step_shapes():
+    # Every distinct (input shape, index count) of the ResNet18 training step's
+    # Gathers except the stem's [16,1,3,50176] -> 614656, which Pulsar2 rejects
+    # when compiled on its own.
+    resnet18 = {
+        ((16, 1, 64, 3136), 784),
+        ((16, 1, 64, 3136), 7056),
+        ((16, 1, 64, 3136), 28224),
+        ((16, 1, 128, 784), 196),
+        ((16, 1, 128, 784), 1764),
+        ((16, 1, 128, 784), 3136),
+        ((16, 1, 128, 784), 7056),
+        ((16, 1, 128, 784), 28224),
+        ((16, 1, 256, 196), 49),
+        ((16, 1, 256, 196), 441),
+        ((16, 1, 256, 196), 784),
+        ((16, 1, 256, 196), 1764),
+        ((16, 1, 256, 196), 7056),
+        ((16, 1, 512, 49), 196),
+        ((16, 1, 512, 49), 441),
+        ((16, 1, 512, 49), 1764),
+        ((1024, 12544), 28224),
+        ((1024, 28224), 112896),
+    }
+    assert resnet18 <= set(_GATHER_LAST_AXIS_TEMPLATES)
+
+
+def test_emit_gather_from_template_needs_no_reference(tmp_path):
+    shape, count = (16, 1, 256, 196), 441
+    indices = [(7 * i + 3) % shape[-1] for i in range(count)]
+    target = tmp_path / "t.axmodel"
+
+    emit_gather_last_axis_from_template(shape, str(target), indices=indices)
+
+    emitted = onnx.load(str(target), load_external_data=False)
+    assert list(_words(emitted)[:count]) == indices
+    assert [
+        d.dim_value for d in emitted.graph.output[0].type.tensor_type.shape.dim
+    ] == [16, 1, 256, count]
+
+
+def test_emit_gather_from_template_rejects_unmeasured_pair(tmp_path):
+    with pytest.raises(ValueError, match="unmeasured"):
+        emit_gather_last_axis_from_template(
+            (16, 1, 256, 196), str(tmp_path / "bad.axmodel"), indices=[0, 1]
+        )
+
+
+def test_make_gather_fixture_zeroes_indices_and_keeps_tail(tmp_path):
+    compiled = _unzip_fixture(tmp_path, "gather_1x1x8x196_axis3_n1764.axmodel.gz")
+    before = onnx.load(compiled, load_external_data=False)
+    # the committed compiler-built fixture holds real (non-zero) indices
+    assert any(_words(before)[:1764])
+    out = tmp_path / "gather_1x1x8x196_axis3_n1764.axmodel.gz"
+
+    make_gather_fixture(compiled, str(out))
+
+    with gzip.open(out, "rb") as f:
+        after = onnx.load_model_from_string(f.read())
+    assert _words(after)[:1764] == (0,) * 1764
+    assert _words(after)[1764:] == _words(before)[1764:]
