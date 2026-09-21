@@ -137,6 +137,35 @@ def learn(code_samples, table_samples):
     all_zero = _signatures(np.zeros((n, 1), np.uint8))[0]
     all_one = _signatures(np.ones((n, 1), np.uint8))[0]
 
+    # For <=64 calibration builds each bit's complete sample history is one
+    # uint64. Resolve all code/table signatures in NumPy instead of inserting
+    # and looking up tens of millions of Python integers one at a time (real
+    # ResNet weight tables can contain that many candidate bits).
+    if n <= 64:
+        code_sig = np.asarray(code_sig, dtype=np.uint64)
+        table_sig = np.asarray(table_sig, dtype=np.uint64)
+        code_indices = np.flatnonzero((code_sig != all_zero) & (code_sig != all_one))
+        unique_sig, first = np.unique(code_sig[code_indices], return_index=True)
+        first = code_indices[first]
+
+        origin = np.full(table_bits.shape[1], CONST, dtype=np.int64)
+        const = np.zeros(table_bits.shape[1], dtype=np.uint8)
+        constant = (table_sig == all_zero) | (table_sig == all_one)
+        const[table_sig == all_one] = 1
+        candidates = np.flatnonzero(~constant)
+        if unique_sig.size:
+            slots = np.searchsorted(unique_sig, table_sig[candidates])
+            in_range = slots < unique_sig.size
+            matched = np.zeros(len(candidates), dtype=bool)
+            matched[in_range] = (
+                unique_sig[slots[in_range]] == table_sig[candidates[in_range]]
+            )
+            origin[candidates[matched]] = first[slots[matched]]
+        else:
+            matched = np.zeros(len(candidates), dtype=bool)
+        ambiguous = candidates[~matched]
+        return origin, const, ambiguous
+
     lookup = {}
     for idx, sig in enumerate(code_sig):
         if sig in (all_zero, all_one):
@@ -169,6 +198,17 @@ def collisions(code_samples, origin):
     n = code_bits.shape[0]
     all_zero = _signatures(np.zeros((n, 1), np.uint8))[0]
     all_one = _signatures(np.ones((n, 1), np.uint8))[0]
+    if n <= 64:
+        sig = np.asarray(sig, dtype=np.uint64)
+        informative = (sig != all_zero) & (sig != all_one)
+        unique_sig, counts = np.unique(sig[informative], return_counts=True)
+        used = origin[origin != CONST]
+        if not len(used):
+            return 0
+        used_sig = np.unique(sig[used])
+        slots = np.searchsorted(unique_sig, used_sig)
+        return int(np.sum(counts[slots] - 1))
+
     counts = {}
     for s in sig:
         if s in (all_zero, all_one):
@@ -183,14 +223,34 @@ def emit_table(reference_table, origin, codes):
 
     Bits the map calls `CONST` -- and anything it could not explain -- keep the
     reference's value, so the result is the reference table with exactly the
-    weight bits replaced.
+    weight bits replaced. Work one bit plane at a time: expanding both a large
+    reference table and a multi-million-element weight tensor with
+    `unpackbits()` creates several temporary arrays many times larger than the
+    model. Eight vector passes keep peak scratch space proportional to the
+    number of table bytes instead.
     """
-    table_bits = _bits([np.asarray(reference_table, dtype=np.uint8)])[0]
-    code_bits = _bits([np.asarray(codes, dtype=np.uint8).ravel()])[0]
-    mapped = origin != CONST
-    out = table_bits.copy()
-    out[mapped] = code_bits[origin[mapped]]
-    return np.packbits(out, bitorder="little")
+    table = np.asarray(reference_table, dtype=np.uint8).reshape(-1)
+    code = np.asarray(codes, dtype=np.uint8).reshape(-1)
+    origin = np.asarray(origin, dtype=np.int64).reshape(-1)
+    if origin.size != table.size * 8:
+        raise ValueError(
+            f"origin has {origin.size} bits for a {table.size}-byte table"
+        )
+    if np.any(origin < CONST) or np.any(origin >= code.size * 8):
+        raise ValueError("origin contains a code-bit index outside the code array")
+
+    out = table.copy()
+    for bit in range(8):
+        source = origin[bit::8]
+        mapped = source != CONST
+        if not np.any(mapped):
+            continue
+        dst = np.flatnonzero(mapped)
+        src = source[mapped]
+        value = (code[src >> 3] >> (src & 7)) & 1
+        mask = np.uint8(1 << bit)
+        out[dst] = (out[dst] & np.uint8(0xFF ^ int(mask))) | (value * mask)
+    return out
 
 
 def requant_block(codes, x_scale, x_zero, y_scale, y_zero, w_scale):

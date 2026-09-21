@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import threading
 
 import numpy as np
 import onnx
@@ -123,11 +124,36 @@ def pow2_to_mul(model):
     every Pulsar2-bound graph is float32 throughout (`float16_to_float32`
     runs first in `TRAINING_RULES`/`RULES` when it doesn't).
     """
-    changed = 0
+    pow_nodes = [
+        node
+        for node in model.graph.node
+        if node.op_type == "Pow" and len(node.input) == 2
+    ]
+    needed = {node.input[1] for node in pow_nodes}
+    constants = {}
+    for init in model.graph.initializer:
+        if init.name in needed and init.name not in constants:
+            arr = numpy_helper.to_array(init)
+            constants[init.name] = float(arr.reshape(-1)[0]) if arr.size == 1 else None
     for node in model.graph.node:
-        if node.op_type != "Pow" or len(node.input) != 2:
+        if (
+            node.op_type != "Constant"
+            or not node.output
+            or node.output[0] not in needed
+            or node.output[0] in constants
+        ):
             continue
-        if _scalar_constant(model, node.input[1]) != 2.0:
+        for attr in node.attribute:
+            if attr.name == "value":
+                arr = numpy_helper.to_array(attr.t)
+                constants[node.output[0]] = (
+                    float(arr.reshape(-1)[0]) if arr.size == 1 else None
+                )
+                break
+
+    changed = 0
+    for node in pow_nodes:
+        if constants.get(node.input[1]) != 2.0:
             continue
         base = node.input[0]
         del node.input[:]
@@ -210,10 +236,18 @@ def explicit_conv_padding(model):
 
 
 def _initializer(model, name):
-    for init in model.graph.initializer:
-        if init.name == name:
-            return init
-    return None
+    cached_model = getattr(_name_state, "initializer_model", None)
+    initializers = getattr(_name_state, "initializers", None)
+    if cached_model is not model or getattr(_name_state, "initializer_count", -1) != len(
+        model.graph.initializer
+    ):
+        initializers = {}
+        for init in model.graph.initializer:
+            initializers.setdefault(init.name, init)
+        _name_state.initializer_model = model
+        _name_state.initializer_count = len(model.graph.initializer)
+        _name_state.initializers = initializers
+    return initializers.get(name)
 
 
 def dilated_conv_to_taps(model, min_dilation=2):
@@ -413,16 +447,33 @@ def neg_to_mul(model):
     return changed
 
 
+_name_state = threading.local()
+
+
+def _reset_name_cache(model):
+    """Start a fresh name-allocation pass for ``model``.
+
+    Legalization passes can add thousands of nodes. Rebuilding the complete
+    namespace in `_unique_name()` for every generated value made expansion
+    quadratic in graph size. Cache the namespace for one pass instead; each
+    allocated name is inserted immediately, including names whose protobuf
+    node/initializer is assembled locally and appended later.
+    """
+    _name_state.model = model
+    _name_state.taken = {i.name for i in model.graph.initializer}
+    _name_state.taken.update(n.name for n in model.graph.node if n.name)
+    _name_state.taken.update(o for n in model.graph.node for o in n.output)
+    _name_state.initializer_model = None
+
+
 def _unique_name(model, stem):
-    taken = (
-        {i.name for i in model.graph.initializer}
-        | {n.name for n in model.graph.node if n.name}
-        | {o for n in model.graph.node for o in n.output}
-    )
+    if model is not getattr(_name_state, "model", None):
+        _reset_name_cache(model)
     name, k = stem, 0
-    while name in taken:
+    while name in _name_state.taken:
         k += 1
         name = f"{stem}_{k}"
+    _name_state.taken.add(name)
     return name
 
 
@@ -520,7 +571,7 @@ def rank0_to_rank1(model):
 
 
 def _is_initializer(model, name):
-    return any(i.name == name for i in model.graph.initializer)
+    return _initializer(model, name) is not None
 
 
 def _opset(model, domain=""):
@@ -1651,6 +1702,10 @@ def legalize(model, rules=None):
     """Apply the named rules in order; returns `{rule: sites changed}`."""
     applied = collections.OrderedDict()
     for name in rules or RULES:
+        # Prior passes may have replaced nodes or added values without using
+        # `_unique_name()`. Reconcile once at the pass boundary, not once per
+        # generated tensor.
+        _reset_name_cache(model)
         applied[name] = RULES[name](model)
     return applied
 
