@@ -110,9 +110,11 @@ these schedules reduced representative kernel times versus the initial
 schedule by 5.7x for ResNet 3x3 convolution, 4.7x for mask-head transpose
 convolution, 2.5x for 56x56 RoIAlign, 3.5x for QDQ, 1.6x for resize, and 1.5x
 for max-pooling. These speedups compare the old and updated schedules on the
-same device, using the median of five single-invocation timings with buffers
-preallocated; they are per-kernel timings, not end-to-end model latency. The uint8 quantized
-values are checked exactly; dequantized floats allow a 1e-5 absolute tolerance
+same device, with buffers preallocated and input/output transfers excluded.
+The sweeps used three single-invocation timings for convolution, pooling,
+resize, and RoIAlign; five for QDQ; and one for transpose convolution. They are
+per-kernel timings, not end-to-end model latency. The uint8 quantized values
+are checked exactly; dequantized floats allow a 1e-5 absolute tolerance
 for DSP floating-point rounding. The ROI workloads use a configurable
 synthetic proposal batch (default 8) because the model's ROI count is dynamic.
 Tensor values, weights, and regions are randomized. This checks individual
