@@ -192,7 +192,14 @@ On the tested Xiaomi 12S (Hexagon V73), median kernel times were:
 | Mask-head ConvTranspose | `[8,256,14,14]` to `[8,256,28,28]` | 5802.006 ms |
 | Quantize + dequantize | model input `[1,3,224,224]` | 3.890 ms |
 
-The 5.8-second ConvTranspose result is a major remaining bottleneck in this
-synthetic kernel coverage and should be optimized separately before treating
-DSP offload as practical for that operator. These numbers are per-kernel
-synthetic workloads, not end-to-end Mask R-CNN inference.
+The generic TOPI ConvTranspose timing was 5.822 s in a follow-up run. The
+experimental `bench_tvm_hexagon_conv_transpose.py` compares it with a direct
+stride-2 parity-plane schedule for this exact 2x2, zero-padding workload. The
+direct schedule avoids the three zero positions introduced by input dilation,
+reducing arithmetic from about 1.64B to 411M MACs. On the Xiaomi 12S, width
+tiles 4, 8, and 16 measured 5.666 s, 3.680 s, and 3.140 s respectively; tile 16
+was 1.85x faster than the generic baseline. All direct variants matched the
+NumPy reference with maximum absolute error below 5e-7. This is useful but
+still far from practical latency, so the specialization remains an exploratory
+benchmark pending better Hexagon vectorization and scheduling. These numbers
+are per-kernel synthetic workloads, not end-to-end Mask R-CNN inference.
