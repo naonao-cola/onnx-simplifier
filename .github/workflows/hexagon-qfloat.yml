@@ -60,17 +60,21 @@ jobs:
           sudo apt-get install -y --no-install-recommends llvm-17-dev libzstd-dev ninja-build \
             ccache libncurses6
           llvm-config-17 --targets-built | tr ' ' '\n' | grep -x Hexagon
+          # TVM 0.17's python package imports decorator/attrs/scipy at import time.
           python -m pip install "numpy<2" ml_dtypes psutil cloudpickle tornado \
-            typing_extensions pytest setuptools
+            typing_extensions pytest setuptools decorator attrs scipy
 
+      # restore + save are separate steps so an expensive build is kept even if a later step
+      # (e.g. the tests) fails; a plain actions/cache only saves when the whole job succeeds.
       - name: Restore TVM build
         id: tvm-cache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: ~/tvm
           key: tvm-${{ env.TVM_VERSION }}-llvm17-${{ runner.os }}-v1
 
       - name: Build TVM v0.17.0
+        id: tvm-build
         if: steps.tvm-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/tvm && cd ~/tvm
@@ -82,21 +86,42 @@ jobs:
             -DUSE_LLVM=/usr/bin/llvm-config-17 -DHIDE_PRIVATE_SYMBOLS=ON \
             -DUSE_LIBBACKTRACE=OFF -DUSE_CUDA=OFF
           cmake --build build --target tvm tvm_runtime
+          # Keep only what the tests import (Python package + the two shared libraries) so the
+          # cache stays small.
+          find build -mindepth 1 -maxdepth 1 ! -name libtvm.so ! -name libtvm_runtime.so \
+            -exec rm -rf {} +
+          find src -mindepth 1 -maxdepth 1 ! -name python -exec rm -rf {} +
+          du -sh ~/tvm
+
+      - name: Save TVM build
+        if: always() && steps.tvm-build.conclusion == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/tvm
+          key: ${{ steps.tvm-cache.outputs.cache-primary-key }}
 
       - name: Restore Hexagon toolchain
         id: toolchain-cache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: ~/hexagon-toolchain
           key: hexagon-open-access-${{ env.HEXAGON_TOOLCHAIN_VERSION }}-v1
 
       - name: Download Hexagon open-access toolchain
+        id: toolchain-download
         if: steps.toolchain-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/hexagon-toolchain && cd ~/hexagon-toolchain
           curl -fsSL "$HEXAGON_TOOLCHAIN_URL" -o toolchain.tar.gz
           tar xzf toolchain.tar.gz
           rm toolchain.tar.gz
+
+      - name: Save Hexagon toolchain
+        if: always() && steps.toolchain-download.conclusion == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/hexagon-toolchain
+          key: ${{ steps.toolchain-cache.outputs.cache-primary-key }}
 
       - name: Locate toolchain and verify tools
         run: |
