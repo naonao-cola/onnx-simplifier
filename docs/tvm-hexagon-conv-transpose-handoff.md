@@ -26,7 +26,18 @@ Channel-vectorized ConvTranspose, median of 3, max abs err 4.9e-7, weights pre-p
 | 128 | -- | 34.6 ms |
 | 256 | -- | 40.1 ms |
 
-Layout copies: NCHW->NHWC 4.5 ms; NHWC->NCHW 32.5 ms untiled, and with channel tiling (fixed a fuse-order bug in the tiled schedule): c16 20.8, c32 17.5, c64 11.1, c128 7.7, **c256 6.2 ms**. Reproduces the pre-cache-loss numbers (tile 16: 149.7/66.8 ms). Best end-to-end so far: NCHW->NHWC 4.5 + kernel 34.6 (tile 128; optimum is 64-128) + NHWC->NCHW 6.2 ≈ 45 ms vs 5.89 s generic. Next: reduce the kernel itself (HVX vrmpy-style/fp16 or blocking IC), or fuse the layout copies into neighbours; the Hexagon arch is built for `v68` but the SoC reports V69 (SD 8+ Gen 1), so the "V73" in older notes is likely wrong.
+**Hand-written HVX qf32 kernel (`--qf32`, `_qf32_module`).** LLVM's Hexagon backend converts qf32<->sf around *every* fmul/fadd (374 converts for 374 ops in the generated asm; `-fast-math`/`llvm-options`/`llvm`-kind targets change nothing), i.e. ~4 HVX ops per MAC. A `te.extern` that calls `llvm.hexagon.V6.vmpy.qf32.sf.128B` + `vadd.qf32.128B` directly (one `vconv.sf.qf32` + bias add at the end) halves that. Buffers are bound with `data_alignment=128` (removes `vmem`+`valign` pairs). NHWC input, median of 3, max abs err 5.07e-7:
+
+| oc tile (vectors) | pixel block | unroll | time |
+|---|---|---|---|
+| 32 (1) | 2 | 4 | 26.0 ms |
+| 64 (2) | 2 | 4 | 18.8 ms |
+| 128 (4) | 1 | 4 | 14.1 ms |
+| 128 (4) | 2 | 2 | **12.8 ms** |
+
+End to end with the copies: 4.5 + 12.8 + 6.2 = ~23.5 ms (generic TOPI 5.89 s; LLVM-vectorized 45 ms). Findings: serial is 43 ms so 4 threads scale ~2.9x; pixel blocks of 7 get *slower* because LLVM auto-unrolls the reduction and stores every accumulator back to memory each iteration (56 `vmem` stores per 56 `vmpy`; `-unroll-count` etc. via `-llvm-options` did not reach it) -- keeping accumulators in registers for larger blocks is the next lever. Making the parallel task a (parity, oc-block) weight slice (`--weight-major`) did not help (16.5 ms), so weight re-streaming is not the limit. The same LLVM `pixel_block` schedule without intrinsics (`--pixel-blocks`) is slower than unblocked (75 ms at 7).
+
+Layout copies: NCHW->NHWC 4.5 ms; NHWC->NCHW 32.5 ms untiled, and with channel tiling (fixed a fuse-order bug in the tiled schedule): c16 20.8, c32 17.5, c64 11.1, c128 7.7, **c256 6.2 ms**. Reproduces the pre-cache-loss numbers (tile 16: 149.7/66.8 ms). Best end-to-end so far: NCHW->NHWC 4.5 + kernel 34.6 (tile 128; optimum is 64-128) + NHWC->NCHW 6.2 ≈ 45 ms vs 5.89 s generic. Next: keep larger accumulator blocks in registers in the qf32 kernel, fp16, or fuse the layout copies into neighbours; the Hexagon arch is built for `v68` but the SoC reports V69 (SD 8+ Gen 1), so the "V73" in older notes is likely wrong.
 
 ## Persistent build locations
 
