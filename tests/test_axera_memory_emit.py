@@ -451,9 +451,10 @@ def test_emit_gather_last_axis_rejects_altered_table_tail_and_mcode(tmp_path):
 
 def test_gather_template_registry_covers_resnet18_step_shapes():
     # Every distinct (input shape, index count) of the ResNet18 training step's
-    # Gathers except the stem's [16,1,3,50176] -> 614656, which Pulsar2 rejects
-    # when compiled on its own.
+    # Gathers. The stem's [16,1,3,50176] -> 614656 is a 7-chunk Gather + Concat
+    # in its template, because Pulsar2 rejects a single Gather that large.
     resnet18 = {
+        ((16, 1, 3, 50176), 614656),
         ((16, 1, 64, 3136), 784),
         ((16, 1, 64, 3136), 7056),
         ((16, 1, 64, 3136), 28224),
@@ -510,3 +511,36 @@ def test_make_gather_fixture_zeroes_indices_and_keeps_tail(tmp_path):
         after = onnx.load_model_from_string(f.read())
     assert _words(after)[:1764] == (0,) * 1764
     assert _words(after)[1764:] == _words(before)[1764:]
+
+
+def _stem_reference_with_mcode_byte_flipped(tmp_path, offset):
+    reference = _unzip_fixture(tmp_path, "gather_16x1x3x50176_axis3_n614656.axmodel.gz")
+    model = onnx.load(reference, load_external_data=False)
+    mcode = _init(model, "subgraph_npu_0_b1_neu")
+    data = bytearray(mcode.raw_data)
+    data[offset] ^= 0xFF
+    mcode.raw_data = bytes(data)
+    onnx.save(model, reference)
+    return reference
+
+
+def test_emit_stem_gather_accepts_compiler_noise_beyond_the_default_window(tmp_path):
+    # Identical rebuilds of the 7-chunk stem graph flip bytes 333..357, which
+    # the single-Gather window (301..325) would reject.
+    reference = _stem_reference_with_mcode_byte_flipped(tmp_path, 341)
+    indices = [(5 * i + 1) % 50176 for i in range(614656)]
+
+    emit_gather_last_axis_axmodel(
+        reference, str(tmp_path / "stem.axmodel"), indices=indices
+    )
+
+    emitted = onnx.load(str(tmp_path / "stem.axmodel"), load_external_data=False)
+    assert list(_words(emitted)[:614656]) == indices
+
+
+def test_emit_stem_gather_still_rejects_mcode_changes_outside_the_window(tmp_path):
+    reference = _stem_reference_with_mcode_byte_flipped(tmp_path, 400)
+    with pytest.raises(ValueError, match="MCode"):
+        emit_gather_last_axis_axmodel(
+            reference, str(tmp_path / "bad.axmodel"), indices=[0] * 614656
+        )
