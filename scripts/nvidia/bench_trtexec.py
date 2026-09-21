@@ -2,7 +2,7 @@
 
 Stdlib only. Each ``*.onnx`` in DIR is built and run with the precision flags implied
 by its name (``*.int8*.onnx`` -> ``--int8 --fp16``, i.e. ModelOpt's mixed INT8/FP16
-Q/DQ output; everything else runs at both fp32 and ``--fp16``). Reports mean/median
+Q/DQ output; everything else runs at both fp32 and ``--fp16``). Engines are cached in ``DIR/engines/`` (shared with ``eval_accuracy.py``). Reports mean/median
 GPU compute time (trtexec's own CUDA-event timing, transfers excluded) and engine
 build time.
 
@@ -19,8 +19,13 @@ from pathlib import Path
 TRTEXEC = "/usr/src/tensorrt/bin/trtexec"
 
 
-def run(onnx, flags, duration):
-    cmd = [TRTEXEC, f"--onnx={onnx}", "--noDataTransfers", f"--duration={duration}",
+def run(onnx, flags, duration, engine=None):
+    """Build (and save to ``engine``) or, if ``engine`` exists, just load and time it."""
+    src = [f"--loadEngine={engine}"] if engine and engine.exists() else [f"--onnx={onnx}"]
+    if engine and not engine.exists():
+        engine.parent.mkdir(exist_ok=True)
+        src.append(f"--saveEngine={engine}")
+    cmd = [TRTEXEC, *src, "--noDataTransfers", f"--duration={duration}",
            "--warmUp=500", "--avgRuns=20", *flags]
     p = subprocess.run(cmd, capture_output=True, text=True)
     out = p.stdout + p.stderr
@@ -36,7 +41,7 @@ def run(onnx, flags, duration):
 
 def configs(path):
     if ".int8" in path.name:
-        return [("int8+fp16", ["--int8", "--fp16"])]
+        return [("int8fp16", ["--int8", "--fp16"])]
     return [("fp32", []), ("fp16", ["--fp16"])]
 
 
@@ -50,18 +55,18 @@ def main(argv=None):
     rows = []
     for path in sorted(Path(args.dir).glob(args.glob)):
         for prec, flags in configs(path):
-            r = run(path, flags, args.duration)
+            r = run(path, flags, args.duration, path.parent / "engines" / f"{path.stem}.{prec}.engine")
             variant = path.name[: -len(".onnx")]
             rows.append({"model": variant, "precision": prec, **r})
             print(rows[-1], flush=True)
     if args.json:
         Path(args.json).write_text(json.dumps(rows, indent=1))
-    print(f"\n{'model':<22}{'precision':<11}{'mean ms':>9}{'median ms':>11}{'build s':>9}")
+    print(f"\n{'model':<44}{'precision':<11}{'mean ms':>9}{'median ms':>11}{'build s':>9}")
     for r in rows:
         if "error" in r:
-            print(f"{r['model']:<22}{r['precision']:<11}  ERROR {r['error']}")
+            print(f"{r['model']:<44}{r['precision']:<11}  ERROR {r['error']}")
         else:
-            print(f"{r['model']:<22}{r['precision']:<11}{r['mean_ms']:>9.3f}"
+            print(f"{r['model']:<44}{r['precision']:<11}{r['mean_ms']:>9.3f}"
                   f"{r['median_ms']:>11.3f}{r['build_s'] or 0:>9.1f}")
     return 0
 

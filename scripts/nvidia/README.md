@@ -10,6 +10,7 @@ hand-built-graph tests in `tests/test_tensorrt_*.py` (which never invoke TensorR
 | `modelopt_pipeline.py` | onnxsim + `nvidia-modelopt[onnx]` | fixes batch, runs `simplify()` and ModelOpt INT8 quantization on a real model, with an un-simplified control |
 | `bench_trtexec.py` | any (stdlib) | builds/times every variant with `trtexec` and prints a table |
 | `imagenette_data.py` | any with Pillow | preprocesses Imagenette (real ImageNet images, 10 classes) into val + calibration `.npy` sets |
+| `ort_cpu_check.py` | any with onnxruntime | top-1 of ONNX models on a val subset via ORT CPU: separates "quantized model is inaccurate" from "TensorRT mishandles it" |
 | `eval_accuracy.py` | system Python with `tensorrt` | streams the val set through each variant's TensorRT engine; top-1 and agreement with fp32 |
 
 They are split because JetPack 6's TensorRT Python bindings are cp310-only while onnxsim
@@ -104,6 +105,62 @@ Takeaways:
   models agree within noise (MobileNetV2's quantized raw and sim models score identically),
   since TensorRT and ModelOpt already fold BN/constants themselves. The earlier ResNet-18
   latency check (raw vs sim, batch 1/8) likewise showed <1% differences.
+
+## Transformer: ViT-B/16 (`Xenova/vit-base-patch16-224`, HF `google/vit-base-patch16-224`)
+
+```sh
+python3.12 scripts/nvidia/imagenette_data.py imagenette2-320 /tmp/data_vit vit    # resize 224, mean=std=0.5
+python3.12 scripts/nvidia/modelopt_pipeline.py vit_base.onnx /tmp/pl_vit --batch 1 --chw 3 224 224 \
+    --calib-npy /tmp/data_vit/calib_x.npy --calib-n 32 --methods entropy \
+    --variants default hp32 noattn hp32+noattn only-linear      # see variant_options()
+python3 scripts/nvidia/bench_trtexec.py /tmp/pl_vit
+python3.10 scripts/nvidia/eval_accuracy.py /tmp/pl_vit /tmp/data_vit --glob 'b1.*.onnx' \
+    --ref b1.raw.onnx --mean .5 .5 .5 --std .5 .5 .5
+```
+
+The HF export is opset 11 with symbolic H/W and 1,375 nodes once lifted to opset 17
+(385 `Constant`, 111 `Shape`, hand-decomposed LayerNorm/GELU); `simplify()` takes it to 420
+nodes (standard `LayerNormalization`, `Gemm`, `Split`). Batch 1 only: a batch-8 ModelOpt run
+was OOM-killed on the 8 GB board even with process isolation and 32 calibration images.
+Calibration is 32 train images, same-10-class caveat as above. Standard error is ~0.6 points.
+
+| batch 1 | latency ms | top-1 % |
+|---|---|---|
+| fp32, raw | 13.06 | 85.22 |
+| fp32, onnxsim | 13.65 | 85.22 |
+| fp16, raw | 5.59 | **18.96** |
+| fp16, onnxsim | 5.68 | 85.27 |
+| ModelOpt int8, default (all ops), raw | 4.30 | **0.03** |
+| ModelOpt int8, default (all ops), onnxsim | 4.58 | **4.99** |
+| ModelOpt int8, onnxsim, `only-linear` (fp16 remainder) | **4.92** | **84.51** |
+| ModelOpt int8, onnxsim, `only-linear` (fp32 remainder) | 5.07 | 84.51 |
+
+Findings, and here onnxsim does matter:
+
+1. **Raw FP16 is broken; onnxsim fixes it.** The raw graph's hand-decomposed LayerNorm does
+   `Pow(x, 2)`. On a real image, 13 of its 25 LayerNorms receive values up to |x| = 1418
+   (the residual-stream outliers), so x^2 ~ 2e6 exceeds FP16's 65,504 and overflows: top-1
+   collapses to 19%. onnxsim collapses the pattern into `LayerNormalization`, which TensorRT
+   accumulates in fp32 (extra `Cast`s in the engine), and FP16 stays at 85.27%. The
+   correct engine is ~2-7% *slower* than the broken one (92 vs 89 layers: per-encoder-layer
+   extra small kernels and unfused `Gemm`s), a price worth paying. This was read from engine
+   layer names, not profiled.
+2. **ModelOpt's default INT8 collapses ViT-B** (0.03% raw, 5.0% simplified; max calibration
+   and excluding attention MatMuls / head / FP16 remainder change nothing, all 0.4-5%).
+   ORT CPU shows the same collapse (4.7% vs 78.7% fp32 on 150 images), so it is the
+   quantized model, not TensorRT.
+3. **Cause: ModelOpt quantizes the residual-stream `Add`s** (the ~46 Q nodes beyond the
+   Linears in the `noattn` model), where those |x| ~ 1000 outliers live. Quantizing any one
+   Linear group alone (QKV, attn-out, FC1, FC2) is harmless (77-79% vs 78.7% on ORT-150),
+   and all 48 Linears together (`only-linear`, 96 Q nodes, `Add`/attention left in
+   FP16/FP32) give **84.51% (-0.7 vs fp32, ~ within noise)**.
+4. That correct INT8 model is **1.15x faster than FP16 (4.92 vs 5.68 ms) and 2.8x faster than
+   FP32**, far less than the 1.5-1.8x the ResNets get, because attention, LayerNorm, GELU
+   and the residual stream stay in higher precision. The fully-quantized 4.58 ms model is
+   only ~7% faster and produces garbage.
+5. The raw-graph counterpart of `only-linear` could not be built: the group matcher found no
+   weight Linears in the raw graph (0 Q nodes, so those rows are plain FP16 at 19%). The
+   only raw INT8 result is the default one (0.03%).
 
 ## DLA (NVDLA): not available on this board
 
