@@ -80,3 +80,24 @@ gsl-lite/mpark-variant/nlohmann_json/xtl) links into that binary. The SDK
 itself isn't vendored into this repo (see `firmware/runtime/README.md`
 for how to fetch it to rebuild); this note covers what ends up compiled
 into the committed `.bin`.
+
+## MaixPy-v1 and OpenMV (camera demo)
+
+`firmware/camera_demo/src/m5stickv.c` is not a copy of, but is derived from
+reading, [sipeed/MaixPy-v1](https://github.com/sipeed/MaixPy-v1) (released
+under MIT or Apache 2.0, at the reader's choice): the M5StickV pin map, the
+AXP192 register sequence (`components/boards/m5stick`), the ST7789 command
+sequence, panel offsets and M5StickV register tweaks (`components/drivers/lcd`,
+`projects/maixpy_m5stickv/builtin_py/_boot.py`), the DVP/interrupt setup
+(`components/micropython/port/src/omv/sensor.c`) and the
+camera-through-hardware-I2C2 arrangement (`.../omv/cambus.c`).
+
+The OV7740 register table in that file (`ov7740_regs`) is OpenMV's default
+OV7740 configuration as shipped in MaixPy
+(`components/micropython/port/src/omv/ov7740.c`), MIT-licensed:
+
+```
+This file is part of the OpenMV project.
+Copyright (c) 2013/2014 Ibrahim Abdelkader <i.abdalkader@gmail.com>
+This work is licensed under the MIT license, see the file LICENSE for details.
+```
