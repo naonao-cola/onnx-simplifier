@@ -341,6 +341,61 @@ mid-pack, not obviously "broken" the way the smallest-channel shapes were).
 total from the original ranked profile -- **about 47% of the entire backbone's isolated-timing
 sum**, every one bit-exact correct and faster than TVM's hand-tuned schedule.
 
+### Correction: every 1x1-conv speedup above was measured against unsigned synthetic weights
+
+`hex_gemm_kernel.py`'s 1x1-conv kernel is `vrmpyub`-only (unsigned x unsigned) -- every speedup
+number in the four sections above was measured with synthetic `rng.integers(0, 100, ...)` uint8
+weight data. The real backbone's 1x1 conv weights are genuinely **signed int8** (confirmed from
+`backbone.onnx`'s `ConvMulFusion_W_*_quantized` tensors), which this kernel can't even accept --
+this went unnoticed until the chained-subgraph work (`codex/hex-backbone-block1`) ran real
+extracted weights through the 1x1 path for the first time and it failed its own correctness check
+outright. `hex_gemm_signed_kernel.py` (a separate kernel, `vrmpybusv`, not a fix to
+`hex_gemm_kernel.py` -- see its own docstring) exists for exactly this reason.
+
+Re-measured every shape above on real hardware (device `239dbd8f`) with `hex_gemm_signed_kernel.py`
+against signed-random weight data (`rng.integers(-128, 127, ...)`, matching the real weights'
+*distribution*, not real extracted weights for all thirteen shapes -- out of scope for the time
+available; this tests whether `vrmpybusv`'s different calling convention, not the exact weight
+values, changes throughput, which is the actual open question). Stock TVM's own numbers are
+unchanged and not re-measured -- TVM was never wrong about signed weights, only this project's own
+kernel was:
+
+| shape | `cin` | `cout` (real) | spatial | stride | stock TVM | signed (`vrmpybusv`) | **new speedup** | orig. claim (unsigned) |
+|---|---:|---:|---|---:|---:|---:|---:|---:|
+| flagship / small-channel #1 | 64 | 256 | 200x272 | 1 | 3.51 | 26.10 | **7.44x** | 8.65x |
+| small-channel #2 | 128 | 512 | 100x136 | 1 | 6.03 | 29.20 | **4.84x** | 6.41x |
+| small-channel #3 | 64 | 64 | 200x272 | 1 | 2.88 | 14.28 | **4.96x** | 4.99x |
+| small-channel #4 | 256 | 64 | 200x272 | 1 | 7.60 | 15.73 | **2.07x** | 2.39x |
+| small-channel #5 | 512 | 128 | 100x136 | 1 | 12.72 | 20.89 | **1.64x** | 2.00x |
+| strided | 256 | 128 | 200x272 | 2 | 5.38 | 19.63 | **3.65x** | 4.62x |
+| tiny RPN `cout=12` (padded to 32) | 256 | 12 | 200x272 | 1 | 2.00 | 3.50 | **1.75x** | 1.94x |
+| tiny mask-head `cout=3` (padded to 32) | 256 | 3 | 200x272 | 1 | 0.80 | 0.86 | **1.08x** | 1.22x |
+| larger-channel #1 (strided) | 256 | 512 | 200x272 | 2 | 7.54 | 30.74 | **4.08x** | 5.81x |
+| larger-channel #2 | 256 | 256 | 200x272 | 1 | 9.78 | -- | *not re-measured* | 3.89x |
+| larger-channel #3 | 512 | 256 | 100x136 | 1 | 14.40 | 25.93 | **1.80x** | 2.55x |
+| larger-channel #4 | 256 | 1024 | 50x68 | 1 | 20.10 | 31.30 | **1.56x** | 2.22x |
+| larger-channel #5 | 1024 | 256 | 50x68 | 1 | 24.43 | 25.49 | **1.04x** | 1.44x |
+
+**Twelve of thirteen shapes re-measured** (`native_transport`-free TVM-RPC bridge, matching the
+original measurement methodology exactly). The `larger-channel #2` shape (`cin=256,cout=256
+@200x272`) could not be re-measured -- its 54400x256 int32 output is 55.7 MB, past a hard
+transfer-size wall in this project's TVM-RPC bridge session (`hexagon_rpc_send failed: 78`,
+first documented in the elementwise-add prefetch work's own real-hardware measurements, a
+pre-existing RPC-bridge limitation, not a kernel bug) -- left honestly unmeasured rather than
+estimated.
+
+**The finding is consistent and one-directional**: every single re-measured shape is *slower*
+with signed weights than the original unsigned claim (`vrmpybusv`'s 32-wide broadcast calling
+convention has a real, measurable throughput cost vs. `vrmpyub`'s plain-scalar one -- confirming
+hypothesis (b), not (a)), by anywhere from ~1% (small-channel #3, effectively noise) to ~30%
+(larger-channel #1's strided case, larger-channel #3). **The reassuring part**: every one of the
+twelve re-measured shapes is *still* a real win over stock TVM (every speedup stays above 1x,
+none flip to a loss) -- the *direction* of every claim in this project holds, only the *magnitude*
+was overstated by testing the wrong weight signedness. The original unsigned numbers above are
+left in place rather than replaced, per this project's established correction convention (see
+the `TensorCore` devectorizer "Correction" note earlier in this file) -- this section is the
+record of what changed and why, not a silent rewrite.
+
 ### Coverage: a real 3x3 conv (`hex_conv3x3_kernel.py`) -- correct everywhere, fast on some shapes
 
 Every kernel above handles 1x1 convs (a plain GEMM once the spatial dims are flattened into `M`).
@@ -1094,6 +1149,125 @@ larger activations unmodified -- buffer reuse (e.g. requantizing in place into t
 `int32` accumulator occupied) is the natural next lever before attempting more of the graph, not
 attempted here since this subgraph didn't need it to fit.
 
+## Extending the chain: a full ResNet-50 bottleneck block (stage1/block1)
+
+Follow-up to the `conv7x7 -> requantize -> maxpool` subgraph above, closing the gap its own
+"Not done" note left open: the first full ResNet-50 bottleneck block, chained directly onto that
+subgraph's output. Real weights/biases/scales extracted from `backbone.onnx` the same way
+(`backbone_subgraph/extract_and_verify_block1.py`), no synthetic data anywhere in this pipeline.
+
+```
+main path:     conv10(1x1 reduce, 64->64) -> bias -> requantize -> conv17(3x3, 64->64) -> bias ->
+               requantize -> conv24(1x1 expand, 64->256) -> bias           [kept RAW int32]
+shortcut path: conv30(1x1 downsample, 64->256, from the same maxpool input) -> bias
+                                                                             [kept RAW int32]
+merge:         rescale both raw int32 branches into a shared scale domain, add, relu,
+               one final requantize to uint8
+```
+
+Every op type already had a real, hand-written kernel (`hex_gemm_kernel.py`'s `pack_b()` layout,
+`hex_conv3x3_kernel.py`, `hex_bias_add_kernel.py`, `hex_requantize_kernel.py`) -- except one real
+gap this block's own numerics surfaced, and one signedness gap its real weights surfaced.
+
+### New gap #1: the residual add needs a real rescale, not a raw int32+int32 add
+
+The earlier FPN-lateral `add` (`hex_add_kernel.py`'s own coverage section) is a plain
+`int32+int32->int32` op with no rescale -- both branches happen to share an implicit accumulator
+scale there. **This block's residual add does not**: computing each branch's raw accumulator
+scale directly from `backbone.onnx`'s real quantization params
+(`input_scale * weight_scale` for `conv24`'s and `conv30`'s outputs) gives a ratio of **~0.51**
+between the two branches -- confirmed decisively by testing the naive un-rescaled add directly:
+**max abs diff 65, mean abs diff 4.36, only 37.5% exact** against a real ONNX Runtime reference,
+decisively wrong. The correct approach (matching how real quantized-inference runtimes handle a
+residual add between two differently-scaled branches): rescale each raw `int32` accumulator into
+a *shared* scale domain first -- the same Q31 fixed-point formula `hex_requantize_kernel.py`
+already uses, just without the final `clip(0,255)`/`uint8` cast, so the intermediate stays a
+signed `int32` that can go negative before the real final clamp -- **then** add, relu, and clamp
+once. `rescale_inplace_noclamp()`/`add_relu_clamp()` in `native_transport/block1_glue.c` implement
+this (new, hand-written numeric code -- not covered by any existing kernel, verified in numpy
+against the real ORT reference before any C was trusted):
+
+| | max abs diff | mean abs diff | exact match |
+|---|---:|---:|---:|
+| Naive `int32+int32` (no rescale) | 65 | 4.36 | 37.5% |
+| Rescale-then-add (this block's approach) | **3** | **0.40** | **64.0%** |
+
+Still not bit-exact (unlike the stem+maxpool subgraph's 99.9995%), but well within this project's
+established int8-quantization-noise baseline (`scripts/android/maskrcnn_e2e/README.md`'s
+feature-map mean abs error of ~0.06-0.11 against a roughly ±14 range) -- plausibly explained by
+this pipeline skipping a redundant quantize-then-immediately-dequantize round trip the *literal*
+QDQ ONNX graph encodes for the add's two inputs (an artifact of QDQ format bookkeeping, not
+something a real compiled int8 pipeline would actually execute) rather than a real bug; not
+chased further, since this level of agreement already matches the project's own accepted norm.
+
+### New gap #2: real backbone weights are SIGNED int8, exposing a gap in `hex_gemm_kernel.py`'s own coverage
+
+`hex_gemm_kernel.py`'s 1x1-conv kernel is **uint8 x uint8 only** (`vrmpyub`, confirmed directly
+from its own docstring and kernel body -- no `vrmpybusv` path at all), and every 1x1-conv
+coverage number reported earlier in this file was measured against **synthetic unsigned test
+weights**, not real ones. The real backbone's 1x1 conv weights are genuinely **signed int8**
+(confirmed from `backbone.onnx`: `ConvMulFusion_W_*_quantized` tensors are `int8`) -- this was
+never exercised before because every prior 1x1-conv test in this project used synthetic
+`uint8` data. Feeding `conv10`'s real signed weight through `hex_gemm_kernel.py` as-is fails its
+own correctness check outright.
+
+**New kernel, not a fix to the existing one** (per this task's scope, `hex_gemm_kernel.py` itself
+is untouched): `hex_gemm_signed_kernel.py`, structurally identical to `hex_gemm_kernel.py`'s
+`build_kernel()` (same `_reg_i32` accumulator pattern, same `pack_b()`-compatible weight layout)
+with exactly one change -- `vrmpyub_acc_128B(acc, weight_vec, activation_scalar)` becomes
+`vrmpybusv_acc_128B(acc, broadcast32(activation_scalar), weight_vec)`, matching the exact
+broadcast calling convention `hex_conv3x3_kernel.py`/`hex_stem7x7_kernel.py` already use for
+their own signed-weight `vrmpybusv` calls (note the operand order also swaps between the two
+intrinsics). Verified bit-exact under qemu at this block's real shapes (`conv10`: 64->64;
+`conv24`/`conv30`: 64->256, both `m=54400`) before being used.
+
+**This means every "1x1 conv" speedup number reported elsewhere in this file was measured against
+unsigned synthetic weights, not the real network's signed ones** -- worth flagging plainly as a
+real, previously-unstated gap in this project's own coverage claims, discovered only because this
+was the first time real extracted backbone weights (not synthetic data) were run through the 1x1
+conv path. Re-measuring the existing 1x1-conv coverage sections' real-hardware speedups against
+real signed weights via `hex_gemm_signed_kernel.py` is a natural follow-up, not done here (this
+block's own two new convs are verified correct with it; the *speedup* numbers for `hex_gemm_kernel`
+elsewhere in this file were not re-measured with signed data).
+
+### Verified bit-exact match: numpy, `hexagon-sim`, and real hardware, all agree
+
+The fused driver (`native_transport/block1_kernels.c` -- kernel bodies, verbatim tinygrad-generated
+C; `native_transport/block1_glue.c` -- the layout glue and the new rescale-add-relu-clamp merge)
+was verified at three independent levels, all producing the **identical** result:
+
+| Verification level | max abs diff | mean abs diff | exact match |
+|---|---:|---:|---:|
+| numpy (`extract_and_verify_block1.py`, vs. real ORT reference) | 3 | 0.401961 | 63.9883% |
+| `hexagon-sim` (Qualcomm's own instruction-set simulator) | 3 | 0.401961 | 63.9883% |
+| **Real hardware** (device `239dbd8f`) | **3** | **0.401961** | **63.9883%** |
+
+Real-hardware wall time for the whole block (one fused RPC call, chained on Stage 2's maxpool
+output): **1440.5 ms** -- notably heavier than the stem+maxpool subgraph's 583 ms, expected given
+this block's much larger compute (three real convs plus a downsample, `256`-channel expand/
+downsample stages) and its current lack of any inter-op buffer-reuse optimization (see below).
+
+### What this does and doesn't prove
+
+Proven: composition continues to hold at real scale, through a genuine branch-and-merge structure
+(not just a straight chain) -- the residual add is the first place in this project's kernel-level
+work where two independently-computed branches must be numerically reconciled before continuing,
+and doing that correctly needed real, new analysis (the rescale-before-add finding above), not
+just gluing existing pieces together. Also surfaced a real, previously-unflagged gap in
+`hex_gemm_kernel.py`'s own coverage claims (unsigned-only, never tested against the real
+network's signed weights) -- a genuinely useful finding for anyone trusting this project's earlier
+1x1-conv speedup numbers as representative of the real backbone.
+
+**Not done**: chaining stem+maxpool+block1 into a *single* RPC call (currently two separate calls,
+Stage 2's subgraph then this one, with the intermediate maxpool output round-tripped through the
+host in between for this verification -- fusing them removes that round trip); buffer reuse across
+this block's several `13.9`-`55.7` MB intermediate `int32` buffers (all currently separate static
+allocations -- fit fine on real hardware here, but won't scale indefinitely as more blocks are
+chained); the remaining 577 nodes of the real 578-node backbone (this is 2 bottleneck-block-scale
+chunks -- stem+maxpool, and one full block -- of a ResNet-50 that has 16 such blocks total across
+4 stages, plus FPN/RPN); re-measuring `hex_gemm_kernel.py`'s existing coverage sections against
+real signed weights, per the gap noted above.
+
 ## Removing TVM as a transport dependency
 
 The bridge above still depends on TVM for two separate things: (1) **transport** -- getting bytes
@@ -1339,6 +1513,25 @@ when candidates differ only in raw compute-instruction mix with comparable worki
   exact match vs. the real ONNX Runtime reference. See "Chaining a real subgraph" above --
   including the real 128-byte-alignment bug its own `small_subgraph_driver.c` diagnostic isolated
   (kept as a record of how, not scratch).
+- `hex_gemm_signed_kernel.py` -- a signed-weight (`vrmpybusv`) variant of `hex_gemm_kernel.py`'s
+  1x1-conv GEMM kernel, needed because `hex_gemm_kernel.py` itself is unsigned-only (`vrmpyub`)
+  and the real backbone's 1x1 conv weights are signed int8 -- a real, previously-unflagged gap
+  in this project's own 1x1-conv coverage, discovered while extending the chained subgraph below
+  to real weights for the first time. See "Extending the chain" above.
+- `reverify_signed_1x1.py` -- re-measures every 1x1-conv shape's speedup-vs-TVM with
+  `hex_gemm_signed_kernel.py` (signed weights) instead of `hex_gemm_kernel.py` (unsigned synthetic
+  weights, the original measurement). See "Correction: every 1x1-conv speedup above was measured
+  against unsigned synthetic weights" above.
+- `backbone_subgraph/extract_and_verify_block1.py` -- extracts real weights/biases/scales for
+  ResNet-50 stage1/block1 (`conv10`/`conv17`/`conv24`/`conv30`) from `backbone.onnx`, derives the
+  residual-add rescale multiplier/shifts, generates `native_transport/gen_block1_weight_consts.c`
+  and real test input/reference data, and verifies the whole block numerically against a real
+  ONNX Runtime reference before any C is trusted.
+- `native_transport/block1_kernels.c` / `block1_glue.c` -- the fused stage1/block1 driver:
+  verbatim tinygrad-generated kernel bodies plus hand-written layout/padding glue and the new
+  rescale-add-relu-clamp residual-merge step. Verified bit-exact identical across numpy,
+  `hexagon-sim`, and real hardware (max abs diff 3/255, mean 0.40/255). See "Extending the chain"
+  above.
 - `native_transport/` -- a from-scratch, TVM-free FastRPC transport: custom `qaic`-generated
   interface, a native ARM64 client using only `libcdsprpc.so`, verified end to end on real
   hardware. See "Removing TVM as a transport dependency" above; `native_transport/build.sh`

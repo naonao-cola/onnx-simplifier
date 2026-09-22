@@ -7,6 +7,11 @@
 #include "subgraph_driver.c"
 #include "small_subgraph_driver.c"
 
+/* Stage 3: ResNet-50 stage1/block1 (the first bottleneck block after Stage 2's stem+maxpool
+ * subgraph) -- see ../README.md's "Chaining a real subgraph" section, block1 follow-up. */
+#include "block1_kernels.c"
+#include "block1_glue.c"
+
 int mini_rpc_open(const char* uri, remote_handle64* h) {
   *h = (remote_handle64)(uintptr_t)malloc(1);
   return *h ? 0 : -1;
@@ -106,6 +111,10 @@ int mini_rpc_run_kernel(remote_handle64 h, const unsigned char* a, int aLen,
   }
   if (aLen == 5776 && cLen == 4096) {
     run_small_stem_subgraph(a, c);
+    return 0;
+  }
+  if (aLen == 3481600 && cLen == 13926400) {
+    run_block1(a, c);
     return 0;
   }
   int n = aLen < cLen ? aLen : cLen;
