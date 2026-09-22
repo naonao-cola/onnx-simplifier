@@ -107,19 +107,107 @@ scalar elements of a warp-distributed fragment, so there's nothing to "keep as a
 per-thread level. It's *wrong* for Hexagon: the "32 elements" is one HVX vector register that a
 single thread (`threads=1`, no warp) processes atomically in one instruction, and it should stay
 vector-resident across the whole reduction loop instead of being rebuilt from 32 scalar reads
-before every accumulate call. Confirmed this isn't specific to BEAM's automatic
-"interleave-for-ILP" upcast step -- a minimal, non-interleaved single-TC-call test (bypassing
-`hand_coded_optimizations` entirely, applying only `Opt(OptOps.TC, ...)`) still shows the same
-scalar rebuild. BEAM search independently corroborates the regression: across 15+ candidates
-explored at BEAM=2, it never selects the WMMA path, consistently preferring plain scalar codegen
--- exactly matching what the real-hardware measurement shows.
+before every accumulate call. BEAM search independently corroborates the regression: across 15+
+candidates explored at BEAM=2, it never selects the WMMA path, consistently preferring plain
+scalar codegen -- exactly matching what the real-hardware measurement shows.
 
-A real fix needs either the generic devectorizer or `postrange.py`'s `_apply_tc_opt`
-(accumulator axis-ordering/layout) to recognize single-thread, vector-native tensor cores as a
-distinct case from warp-distributed ones -- both are shared across every backend tinygrad
-supports, so this is real, if bounded, upstream-tinygrad-core work, not a local patch. Not
-attempted here; documented as the precise next step, including a stopping point that was reached
-deliberately rather than a task that was abandoned mid-diagnosis.
+**Correction**: an earlier version of this note claimed a "minimal, non-interleaved single-TC-call
+test" still showed the scalar rebuild, "confirming" the issue wasn't about interleaving. That test
+used a hand-rolled monkeypatch of `postrange.apply_opts` to try to isolate a bare `Opt(OptOps.TC)`
+application -- the monkeypatch silently wasn't being hit (confirmed later via the official
+`NOOPT=1` control, which behaves differently), so that test was actually exercising the normal,
+unmodified path the whole time and proved nothing about interleaving specifically. See "Three
+more attempts" below for what a *reliable* trace found instead.
+
+### Three more attempts at a fix, each real and each a dead end
+
+Further digging (tracing via a monkeypatch of `heuristic.hand_coded_optimizations` directly,
+which -- unlike patching `apply_opts` -- reliably fires) found the actual mechanism: `applied_opts`
+after a real TC application is `[Opt(TC, ...), Opt(UPCAST, axis=0, amt=4)]` -- `hand_coded_optimizations`'s
+own "improve ILP by upcasting M and N" step is what groups multiple independent M-row accumulators
+into one interleaved buffer. Three attempts followed, each tested for correctness and, where
+correct, for real speed on hardware:
+
+1. **Skip the M-upcast for backends without locals** (guard `for tc_dim in [1,0]` down to `[0]`
+   when `not tk.ren.has_local`): eliminates the interleaving cleanly -- WMMA call count drops from
+   4 to 1 at the same shape, and the accumulator becomes a plain contiguous 32-element buffer
+   slice instead of a stride-4 interleaved one. **Measured on real hardware: slower**, not
+   faster -- 0.19 GMAC/s vs. 0.28 GMAC/s. Losing the M-row interleaving's instruction-level
+   parallelism costs more than the simpler accumulator access saves. Reverted.
+2. **Reorder the `TensorCore.swizzle` field's upcast axis list**: swept several permutations of
+   `('u0','u1','u2','u3','u4')`. Every permutation except the original either produced **wrong
+   results** (confirmed against a numpy reference) or left the accumulator's offset pattern
+   completely unchanged. Conclusion: `swizzle` governs `A`/`B`'s data layout, tightly coupled to
+   `vrmpy`'s actual hardware lane semantics (permuting it independently breaks which output lane
+   receives which input) -- it does not control `C`'s (the accumulator's) element ordering at all.
+3. **Remove the reversal in `TensorCore.base_upcast_axes()`** (the actual, separate mechanism that
+   *does* order `C`, via `_apply_tc_opt`'s `tc_upcast_axes` slicing): even with only Hexagon's TC
+   registered, this **crashes** a different invariant -- `codegen/late/coalesce.py`'s
+   `memory_coalescing` pass asserts (`attempting multiple stores: 4`) on the resulting UOp
+   structure. The reversal isn't an arbitrary convention; something else downstream depends on it
+   being there, even though its only in-repo justification is a one-line comment ("this is defined
+   in the swizzle... first we use the upcast axes, then the reduce").
+
+All three are consistent with one pattern: every lever that touches the accumulator's construction
+or ordering is entangled with some *other* invariant in the generic, shared kernel-optimization
+pipeline that every backend goes through -- not something a local, Hexagon-only tweak can safely
+adjust without either the fix itself regressing (attempt 1) or breaking a different, seemingly
+unrelated assumption (attempts 2 and 3). A real fix within the shared `TensorCore`/`WMMA`
+machinery needs a maintainer's-level map of what `_apply_tc_opt`, `base_upcast_axes`, and
+`memory_coalescing` jointly assume -- more archaeology than this session had time for.
+
+### Modeling Hexagon as its own accelerator, not a `TensorCore` variant
+
+Given the shared-machinery entanglement above, the more promising direction is to **stop routing
+through `Ops.WMMA`/`TensorCore` entirely** for Hexagon and instead give it its own, hand-written
+lowering -- sidestepping `do_stack_wmma`, `base_upcast_axes`, and `memory_coalescing` altogether
+rather than trying to make them single-thread-aware.
+
+tinygrad has an established, precedented mechanism for exactly this: `Tensor.custom_kernel`
+(`UOp.custom_kernel`) lets you hand-build a kernel's UOp graph directly -- explicit `UOp.range`
+loops, `.index()`/`.store()`/`.load()`, and `Ops.CUSTOM`/`Ops.CUSTOMI` for injecting a raw,
+target-specific intrinsic as a format string (`arg.format(*rendered_srcs)`). `tinygrad/llm/kernels/amd.py`
+is a full, real, ~500-line module built this way for AMD-specific quantized-linear/attention
+kernels, including register-resident (never memory-array-decomposed) accumulators via
+`UOp.placeholder(shape, dtype, addrspace=AddrSpace.REG)` threaded through the reduction loop with
+`.store()`/`.after()` -- precisely the "stay vector-resident across the loop" property `do_stack_wmma`
+fails to give Hexagon's accumulator. `_amd_dp4a` (`amd.py`) is the exact same shape of problem as
+`vrmpy`: a 4-element dot-product-accumulate hardware intrinsic, injected via one `Ops.CUSTOMI` call.
+
+`custom_kernel_attempt.py` is a from-scratch attempt at the Hexagon equivalent -- one `vrmpy` call,
+accumulating a real `int32x32` register value across a 16-step K-reduction, entirely bypassing
+`Ops.WMMA`. It does not yet run, but made real, incremental progress through five iterations, each
+diagnosing and fixing a genuine, understood bug (not the same wall hit three times):
+
+1. **UOp shape-broadcast mismatch** (`(32,)`/`(128,)`/`(1,)` couldn't unify): caused by calling
+   `.load()` on the wide A/B slices before feeding them to the `Ops.CUSTOMI` intrinsic call, which
+   gives them their full array shape. Traced `Ops.CUSTOM`/`Ops.CUSTOMI`'s shape rule directly
+   (`case Ops.CUSTOM | Ops.CUSTOMI: if self.dtype is dtypes.void: return None` in `uop/ops.py`) and
+   `_amd_load`'s real pattern in `amd.py` to find the fix.
+2. **Fixed** by passing the raw `Ops.INDEX` (an address, shape `()`) directly into the `CUSTOMI` op
+   instead of a `.load()`'d array value, matching `_amd_load`'s actual usage exactly -- then hit a
+   **UOp spec-verification failure** (`uop/spec.py`'s `type_verify`) on `acc.load()`: loading an
+   `Ops.AFTER`-wrapped placeholder directly isn't a form the verifier recognizes.
+3. **Fixed** by dropping the explicit `.load()` entirely -- re-reading
+   `_amd_flash_attention_decode_partial`'s real, working accumulator idiom
+   (`prev_acc = acc.after(offset)[head]`, `acc[head].store(...)`, no `.load()` calls anywhere) showed
+   that a `AddrSpace.REG` placeholder, once `AFTER`-scoped to its dependency, *is* the loadable value
+   directly -- indexing/using it does the load implicitly.
+4. Past both of those, it now fails **later and deeper**: `codegen/late/linearizer.py`'s
+   control-flow pass, on an assertion (`assert y.src[1] not in x.backward_slice_with_self`) whose
+   own adjacent comment reads *"TODO: this can happen! it causes infinite loop in shufflenet"* --
+   a **known, tinygrad-acknowledged edge case** in the scheduler's "sibling ranges" dependency
+   ordering, not an obvious usage mistake. Likely triggered by the reduction range (`kc`) being used
+   in two structural roles at once: as the plain `REDUCE` range on the accumulate/store side, and
+   referenced inside the `A`/`B` index expressions on the load side.
+
+This is real evidence the approach itself is sound (it gets *past* both the shape system and the
+UOp spec verifier, further than any of the three `TensorCore`-machinery attempts got before hitting
+their own, different dead ends) -- what's blocking it now is either a genuine tinygrad scheduler bug
+or a kernel-structure choice this investigation hasn't found yet. Picking this back up means
+understanding the linearizer's sibling-range ordering logic well enough to route around it, or
+fixing the underlying scheduler issue upstream (which would also fix it for `amd.py`'s equally
+affected `shufflenet` case, per the comment).
 
 ## Files
 
@@ -128,3 +216,6 @@ deliberately rather than a task that was abandoned mid-diagnosis.
 - `bridge_and_test.py` -- compile with the real toolchain, link, deploy via TVM RPC, run, time.
 - `vrmpy_tensorcore.patch` -- the tinygrad-side vrmpy `TensorCore` support (also at
   https://github.com/onnxsim/tinygrad/pull/1, branch `vrmpy-hexagon-support`).
+- `custom_kernel_attempt.py` -- in-progress attempt at modeling `vrmpy` as its own hand-written
+  `custom_kernel`, bypassing `TensorCore`/`Ops.WMMA` entirely; does not yet run (see "Modeling
+  Hexagon as its own accelerator" above for exactly where and why).
