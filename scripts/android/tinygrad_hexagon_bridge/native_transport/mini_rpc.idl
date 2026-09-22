@@ -1,0 +1,6 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+interface mini_rpc : remote_handle64 {
+  AEEResult run_add(in int32 a, in int32 b, rout int32 result);
+  AEEResult run_kernel(in sequence<octet> a, in sequence<octet> b, rout sequence<octet> c);
+};
