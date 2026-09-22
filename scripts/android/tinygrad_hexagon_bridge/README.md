@@ -714,6 +714,73 @@ windows make neighboring *output* positions' input windows non-contiguous (each 
 contiguous load), the same deinterleave complexity the original blocker flagged -- avoided
 deliberately here in favor of landing a correct, real, already-faster-than-TVM result first.
 
+### Coverage: FPN `resize2d` (`hex_resize2x_kernel.py`) -- correct, beats stock, loses to the already-fixed fast path
+
+The last op in the profile with no tinygrad-generated kernel at all: `resize` (595.6 ms across 3
+shapes, FPN's 2x nearest-neighbor upsamples). Unlike every op above, this one already has a real,
+shipped fix in this project -- `scripts/android/hexagon_resize2x.py`, landed earlier (see
+`scripts/android/maskrcnn_e2e/README.md`'s "Fixed: FPN resize2d, via an exact-2x integer fast
+path"), a monkeypatched TVM `te.compute` schedule, not a `custom_kernel`. That fast path is the
+real bar to clear here, not stock TVM's original (much slower, per-pixel float `ceil`/`floor`/
+`round`) schedule.
+
+FPN's resize is always exactly 2x per axis, `nearest_neighbor` + `half_pixel` +
+`round_prefer_floor`, which collapses to plain integer replication with no float math:
+`out[c, oh, ow] = in[c, oh // 2, ow // 2]`, `int8` dtype -- no accumulator, no reduction, pure
+data movement (every input pixel replicated into a 2x2 output block, per channel, independently).
+
+`build_kernel()`'s approach: NCHW's innermost (contiguous) axis is W, so the horizontal doubling
+is vectorizable via a compile-time `__builtin_shufflevector` byte-duplication mask over 128-byte
+input chunks (`pad_input_row()` zero-pads each row to a multiple of 128 host-side, the same
+pre-padding convention `hex_conv3x3_kernel.py` established). Vertical doubling (output rows `2r`
+and `2r+1` are byte-identical) is done by building the doubled row once into a **local stack
+buffer**, then writing that buffer to both output row addresses.
+
+**A real bug found getting there**: the first version wrote row `2r` directly to the output array,
+then read that same output memory back through a plain `signed char*` cast to duplicate it into
+row `2r+1`. Under qemu this looked fine at the smallest shape but failed at the other two: row
+`2r` itself was bit-exact, but row `2r+1` diverged in *exactly* the byte range covered by a
+preceding partial (non-full-128-byte) shuffle write. The compiler doesn't reliably order a later
+scalar read against an earlier HVX vector store to the same output-array region across separate
+statements, even inside one function body -- confirmed by testing `-fno-strict-aliasing` (no
+effect, ruling out the obvious TBAA explanation) and then by direct byte-level inspection (rows
+matched everywhere *except* the tail region a partial vector write had just touched). A local
+buffer sidesteps the ambiguity entirely: never aliased by anything else, so the two final output
+writes are trivially independent and can't be reordered into each other.
+
+Verified **bit-exact correct on real hardware** (device `239dbd8f`) at all three real FPN shapes.
+Comparing against both stock TVM and the fast path needed one more real fix along the way:
+building both in the same Python process (matching this project's usual bridge-script pattern)
+produced a fast-path timing number numerically identical to stock's -- a real, reproducible
+compilation-cache collision (TVM appears to cache a compiled result keyed in a way that doesn't
+account for the `topi.image.resize2d` monkeypatch swap between builds), not a property of the fast
+path itself. Confirmed by rebuilding the fast path in complete process isolation, which reproduced
+the originally-established ~4/6.7/27.5 ms numbers from `maskrcnn_e2e/README.md` almost exactly:
+
+| shape | stock TVM | fast-path TVM (isolated build) | `custom_kernel` | vs stock | vs fast path |
+|---|---:|---:|---:|---:|---:|
+| `(25,34)->(50,68)` | 29.794 ms | 4.004 ms | 5.332 ms | **5.59x** | 0.75x (slower) |
+| `(50,68)->(100,136)` | 113.403 ms | 6.712 ms | 9.994 ms | **11.35x** | 0.67x (slower) |
+| `(100,136)->(200,272)` | 450.945 ms | 27.492 ms | 26.124 ms | **17.26x** | **1.05x** (barely faster) |
+
+Reported honestly, matching this project's norm: this kernel is dramatically faster than *stock*
+TVM everywhere, but the fast path was already a good fix -- also pure `//2` integer indexing,
+just lowered through TVM's own auto-vectorizing schedule rather than hand-written. The
+hand-written kernel only edges it out at the largest shape; at the two smaller ones, TVM's
+compiler-generated loop beats the hand-rolled shuffle+scalar-tail-loop version, likely because
+fixed per-call/per-row overhead (the scalar tail loops handling non-128-aligned widths) matters
+more at smaller sizes than any advantage from hand-picking the shuffle instruction. This closes
+out `resize` as a **code-generation** target (a real, correct, bridged tinygrad kernel now exists
+for every op in the profile except the 3x3 conv's remaining tiling gap), but not as a **speed**
+target against the already-good fast path -- consistent with this file's running distinction
+between the two kinds of "coverage."
+
+**Not done**: closing the two-smaller-shapes gap (a smarter row-vectorized loop with less scalar
+tail overhead, or `HEXSIM=1`-guided tuning the way the 3x3 conv's tiling work did, was flagged but
+not attempted given the fast path is already a solid, shipped baseline); folding this kernel back
+into the real `relay.build()` graph the way `backbone_splice/` attempts for convs (blocked on that
+same unresolved RPC loading bug).
+
 ## Removing TVM as a transport dependency
 
 The bridge above still depends on TVM for two separate things: (1) **transport** -- getting bytes
@@ -935,6 +1002,11 @@ when candidates differ only in raw compute-instruction mix with comparable worki
   above.
 - `maxpool_wrapper_template.c` -- a thin TVM PackedFunc ABI shim for `hex_maxpool_kernel.py`'s
   single-buffer-in `uint8` signature (no second operand, unlike the GEMM/add kernels).
+- `hex_resize2x_kernel.py` -- the FPN `resize2d` (exact-2x nearest-neighbor upsample), the last op
+  in the profile that had no tinygrad-generated kernel at all. Bit-exact correct and 5.6x-17.3x
+  faster than *stock* TVM on real hardware, but slower than the already-fixed fast path
+  (`../hexagon_resize2x.py`) at two of the three real shapes -- see "Coverage: FPN `resize2d`"
+  above for the honest breakdown.
 - `native_transport/` -- a from-scratch, TVM-free FastRPC transport: custom `qaic`-generated
   interface, a native ARM64 client using only `libcdsprpc.so`, verified end to end on real
   hardware. See "Removing TVM as a transport dependency" above; `native_transport/build.sh`
