@@ -1,12 +1,18 @@
-"""Attempt at modeling Hexagon vrmpy as its own hand-written custom_kernel path (see
+"""SUPERSEDED by hex_gemm_kernel.py, which is the working, correct, and fast result of this
+investigation (8.65x faster than stock TVM at the real Mask R-CNN shape -- see ../README.md's
+"It works" section). This file is kept as the historical record of the intermediate, still-broken
+step (v5) that got past the shape-broadcast and UOp-verification issues but not yet the
+control-flow linearizer assertion described below -- useful context for the bug-by-bug history in
+../README.md's "Modeling Hexagon as its own accelerator" section, not something to run as-is.
+
+Attempt at modeling Hexagon vrmpy as its own hand-written custom_kernel path (see
 tinygrad/llm/kernels/amd.py for the established pattern this follows), bypassing
 Ops.WMMA/TensorCore/the generic devectorizer entirely -- motivated by three earlier, independent
 dead ends trying to fix the WMMA accumulator's scalar-decomposition problem within the shared,
 generic machinery (see ../README.md's "Three more attempts" section). Requires a tinygrad
 checkout with vrmpy_tensorcore.patch applied, though this script itself never uses Ops.WMMA.
 
-CURRENT STATE: does not yet run. Progressed through five iterations, each fixing a real,
-understood bug (documented in ../README.md's "Modeling Hexagon as its own accelerator" section):
+STATE AT THIS FILE (v5): progressed through five iterations, each fixing a real, understood bug:
   v1/v2: UOp shape-broadcast mismatch (32,)/(128,)/(1,) from calling .load() on differently-
          shaped array values before passing them to the CUSTOMI op.
   v3/v4: fixed by passing raw Ops.INDEX (shape ()) instead of .load()'d values -- but then a UOp
@@ -14,14 +20,16 @@ understood bug (documented in ../README.md's "Modeling Hexagon as its own accele
   v5 (this file): fixed by dropping .load() entirely, matching amd.py's real idiom exactly
          (`acc.after(offset)[head]`, no .load()) -- now fails LATER, in the control-flow
          linearizer, on an assertion whose own comment says "TODO: this can happen! it causes
-         infinite loop in shufflenet" -- a known, acknowledged edge case in tinygrad's own
-         scheduler for this sibling-range dependency shape, not obviously a usage error.
+         infinite loop in shufflenet".
 
-Next step, if picked up again: understand the linearizer's "sibling ranges" ordering logic
-(codegen/late/linearizer.py, the assert this hits) well enough to either restructure the kernel
-to avoid triggering it (kc is used in two structural roles -- as the plain REDUCE range on the
-accumulate/store side, and referenced inside the A/B index expressions -- which may be exactly
-what triggers the sibling-ordering ambiguity), or fix the scheduler bug itself upstream."""
+RESOLUTION (in hex_gemm_kernel.py, not this file): that assertion turned out to be triggered by
+calling `.end(kc)` on the reduction range twice (once implicitly via the accumulate step, again
+in the final store) -- not an unrelated tinygrad scheduler bug after all. Fixing that, plus three
+more bugs (AxisType.GLOBAL needing renderer support ClangRenderer lacks; a stray `&` on an
+already-pointer INDEX expression; and the real semantic fix -- representing the whole accumulate
+step as one void-dtype Ops.CUSTOM statement addressed by pointer, never a (32,)-shaped VALUE the
+generic elementwise devectorizer tries to decompose per-lane), got to a correct, fast kernel.
+See ../README.md for the full bug-by-bug list."""
 import os
 os.environ["DEV"] = "DSP"
 os.environ["MOCKDSP"] = "1"

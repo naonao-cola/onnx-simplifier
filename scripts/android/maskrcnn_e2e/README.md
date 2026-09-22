@@ -380,11 +380,19 @@ slower results specifically on real Hexagon hardware, in a way not yet root-caus
 `vrmpy` tensorize/reduction-accumulation interaction specific to the relocated `oc_chunk`/`ic_outer`
 loop nesting. Not landed.
 
-## Follow-up: bridging tinygrad's Hexagon codegen onto real hardware
+## Follow-up: bridging tinygrad's Hexagon codegen onto real hardware -- and fixing the 1x1-conv gap
 
-Asked to eliminate the 1x1-conv finding above using tinygrad instead. Full writeup, including a
-real, working TVM-transport bridge (tinygrad's own DSP driver can't reach this phone's hardware --
-production build, SELinux-blocked) and a genuine new capability added to tinygrad itself (real
-`vrmpy` HVX dot-product codegen, verified correct on real hardware but not yet fast, root cause
-precisely diagnosed) in `scripts/android/tinygrad_hexagon_bridge/README.md`.
+Asked to eliminate the 1x1-conv finding above using tinygrad instead. Full writeup in
+`scripts/android/tinygrad_hexagon_bridge/README.md`, including a real, working TVM-transport
+bridge (tinygrad's own DSP driver can't reach this phone's hardware -- production build,
+SELinux-blocked) and, after `Ops.WMMA`/`TensorCore` turned out to be a dead end (entangled with
+generic, shared kernel-optimization machinery no local fix could safely touch -- three separate,
+real attempts each broke something else), a from-scratch, hand-written `vrmpy` GEMM kernel via
+`tinygrad.Tensor.custom_kernel` (bypassing `Ops.WMMA` entirely).
+
+**Verified correct and measured on real hardware at the exact `cin=64, cout=256 @200x272` shape
+from the ranked profile above: 30.35 GMAC/s, 8.65x faster than stock TVM's hand-tuned `vrmpy`
+schedule (3.51 GMAC/s) at the same shape.** This is the small-channel 1x1-conv gap from the
+"systemic pattern 1" finding above, closed -- not with a TVM schedule fix, but by generating and
+running a real, correct, fast kernel via tinygrad instead.
 

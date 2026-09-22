@@ -174,10 +174,11 @@ kernels, including register-resident (never memory-array-decomposed) accumulator
 fails to give Hexagon's accumulator. `_amd_dp4a` (`amd.py`) is the exact same shape of problem as
 `vrmpy`: a 4-element dot-product-accumulate hardware intrinsic, injected via one `Ops.CUSTOMI` call.
 
-`custom_kernel_attempt.py` is a from-scratch attempt at the Hexagon equivalent -- one `vrmpy` call,
-accumulating a real `int32x32` register value across a 16-step K-reduction, entirely bypassing
-`Ops.WMMA`. It does not yet run, but made real, incremental progress through five iterations, each
-diagnosing and fixing a genuine, understood bug (not the same wall hit three times):
+`custom_kernel_attempt.py` was a from-scratch attempt at the Hexagon equivalent -- one `vrmpy`
+call, accumulating a real `int32x32` register value across a K-reduction, entirely bypassing
+`Ops.WMMA`. It got stuck for a while (see the file's own header comment for that history), but
+**this now works**, in `hex_gemm_kernel.py` -- see "It works" below. The bugs found and fixed
+along the way, each a genuine, distinct issue (not the same wall hit repeatedly):
 
 1. **UOp shape-broadcast mismatch** (`(32,)`/`(128,)`/`(1,)` couldn't unify): caused by calling
    `.load()` on the wide A/B slices before feeding them to the `Ops.CUSTOMI` intrinsic call, which
@@ -193,13 +194,63 @@ diagnosing and fixing a genuine, understood bug (not the same wall hit three tim
    (`prev_acc = acc.after(offset)[head]`, `acc[head].store(...)`, no `.load()` calls anywhere) showed
    that a `AddrSpace.REG` placeholder, once `AFTER`-scoped to its dependency, *is* the loadable value
    directly -- indexing/using it does the load implicitly.
-4. Past both of those, it now fails **later and deeper**: `codegen/late/linearizer.py`'s
-   control-flow pass, on an assertion (`assert y.src[1] not in x.backward_slice_with_self`) whose
-   own adjacent comment reads *"TODO: this can happen! it causes infinite loop in shufflenet"* --
-   a **known, tinygrad-acknowledged edge case** in the scheduler's "sibling ranges" dependency
-   ordering, not an obvious usage mistake. Likely triggered by the reduction range (`kc`) being used
-   in two structural roles at once: as the plain `REDUCE` range on the accumulate/store side, and
-   referenced inside the `A`/`B` index expressions on the load side.
+4. Past both of those, hit **a genuine tinygrad control-flow bug**: `codegen/late/linearizer.py`'s
+   scheduling pass asserted (`assert y.src[1] not in x.backward_slice_with_self`) on an adjacent
+   comment reading *"TODO: this can happen! it causes infinite loop in shufflenet"*. **Fixed** by
+   calling `.end(kc)` on the reduction range exactly once (only where the accumulate step's update
+   value is constructed), not again in the final store's `.end(...)` call -- the double-`.end()` on
+   the same range was the trigger, not an unrelated tinygrad bug after all.
+5. Next error was mundane: `AxisType.GLOBAL` for the outer `M` loop rendered to `Ops.SPECIAL` with a
+   GPU-style workitem code (`'g'`) `ClangRenderer` doesn't implement (`has_threads=False`, no grid
+   dispatch). **Fixed** by using `AxisType.WEAK` (plain sequential loop) instead.
+6. Then a **pointer-cast bug**: the format string wrote `*(unsigned char128*)&{1}`, but `{1}`
+   (an `Ops.INDEX`) already renders as a pointer expression -- taking `&` of it is invalid. **Fixed**
+   by dropping the `&`.
+7. With that fixed, the *compiled* code revealed the real semantic bug: the `(32,)`-shaped
+   `Ops.CUSTOMI` result was still being decomposed by the generic elementwise devectorizer into 32
+   separate calls, each with a spurious `+lane_index` appended to the result -- `Ops.CUSTOMI`,
+   despite representing one opaque hardware call, gets treated exactly like any other `(32,)`-shaped
+   elementwise computation, which assumes each of the 32 output elements is an independent
+   per-lane result. **Fixed** by never constructing a `(32,)`-shaped *value* at all: the whole
+   accumulate step became one `dtypes.void`-dtype `Ops.CUSTOM` **statement** (`case Ops.CUSTOM |
+   Ops.CUSTOMI: if self.dtype is dtypes.void: return None` in `uop/ops.py` -- `void` dtype exempts
+   it from shape/broadcast tracking entirely), addressing the accumulator only by its base pointer
+   (`acc[0]`, shape `()`, from indexing the `AddrSpace.REG` placeholder -- same address-not-value
+   pattern as step 2) and doing the load-vrmpy-store round trip as raw C inside the format string.
+8. Final snag: the format string referenced `unsigned char128`/`int32` -- vector typedefs the
+   renderer only auto-emits when a shaped *value* of that type appears somewhere, which no longer
+   happens once accumulation is a `void` statement. **Fixed** by using
+   `__attribute__((vector_size(128)))` inline in the cast expression instead of a named typedef,
+   sidestepping the need to inject a declaration into the kernel prologue at all.
+
+### It works
+
+`hex_gemm_kernel.py` is the resulting, working, from-scratch `vrmpy` GEMM kernel: `C[M,N] =
+A[M,K] @ B[K,N]` (uint8 x uint8 -> int32), correct under qemu and **correct on real Hexagon v73
+hardware** (via the TVM-transport bridge), at the *exact* pathological shape this whole
+investigation started from -- `scripts/android/maskrcnn_e2e/README.md`'s ranked-profile finding,
+`cin=64, cout=256`, spatial `200x272` (`M=54400`):
+
+| | Median | Throughput |
+|---|---:|---:|
+| tinygrad, naive (BEAM=0) | -- | 0.42 GMAC/s (isolated 512-row proxy shape) |
+| tinygrad, BEAM=2 (tiled) | -- | 1.00 GMAC/s (isolated 512-row proxy shape) |
+| tinygrad, `Ops.WMMA`/`TensorCore` (broken accumulator) | -- | 0.28 GMAC/s (isolated 512-row proxy shape) |
+| stock TVM (hand-tuned `vrmpy` schedule) | 254.1 ms | 3.51 GMAC/s (**real shape**) |
+| **tinygrad, hand-written `custom_kernel`** | **29.363 ms** | **30.35 GMAC/s (real shape)** |
+
+**8.65x faster than stock TVM's hand-tuned schedule, bit-exact correct, at the real shape** --
+not a synthetic proxy. This is the single largest line item in the original ranked profile
+(rank 2, 13.4% of the isolated-timing total, one of the "small-channel 1x1 convs at 10.1x below
+the throughput of large-channel 3x3 convs" from the systemic-pattern finding); at 30.35 GMAC/s it's
+now well past that comparison point entirely.
+
+`B` needs pre-packing into `hex_gemm_kernel.pack_b()`'s layout before use (128 contiguous bytes
+per `(N-tile, K-chunk)`, matching what one `vrmpy` call reads in one shot) -- a one-time,
+host-side repack of the (static) weight tensor, not something done per-inference.
+
+**Known limitation**: fails when `cout == 32` exactly (a degenerate single-iteration N-tile loop)
+-- not investigated further since it doesn't affect the real target shape (`cout=256`, 8 N-tiles).
 
 This is real evidence the approach itself is sound (it gets *past* both the shape system and the
 UOp spec verifier, further than any of the three `TensorCore`-machinery attempts got before hitting
@@ -215,7 +266,13 @@ affected `shufflenet` case, per the comment).
 - `wrapper_template.c` -- the plain-C TVM PackedFunc ABI shim template.
 - `bridge_and_test.py` -- compile with the real toolchain, link, deploy via TVM RPC, run, time.
 - `vrmpy_tensorcore.patch` -- the tinygrad-side vrmpy `TensorCore` support (also at
-  https://github.com/onnxsim/tinygrad/pull/1, branch `vrmpy-hexagon-support`).
-- `custom_kernel_attempt.py` -- in-progress attempt at modeling `vrmpy` as its own hand-written
-  `custom_kernel`, bypassing `TensorCore`/`Ops.WMMA` entirely; does not yet run (see "Modeling
-  Hexagon as its own accelerator" above for exactly where and why).
+  https://github.com/onnxsim/tinygrad/pull/1, branch `vrmpy-hexagon-support`); superseded in
+  practice by `hex_gemm_kernel.py` below, which is both correct and fast, but kept as the record
+  of the `TensorCore`-machinery dead ends (see "Three more attempts" above).
+- `custom_kernel_attempt.py` -- the intermediate, still-broken steps of the `custom_kernel`
+  investigation (see its own header comment for the bug-by-bug history); superseded by
+  `hex_gemm_kernel.py`.
+- `hex_gemm_kernel.py` -- **the working result**: a correct, hand-written Hexagon `vrmpy` GEMM
+  kernel via `Tensor.custom_kernel`, measured 8.65x faster than stock TVM's hand-tuned schedule at
+  the real Mask R-CNN pathological shape (see "It works" above). Bridge its output through
+  `bridge_and_test.py` (after pre-packing `B` via `pack_b()`) to run it on real hardware.
