@@ -230,10 +230,11 @@ def _iou_xyxy(box_a, box_b):
 
 
 def _greedy_nms_indices(boxes, class_scores, score_threshold, iou_threshold, top_k):
-    """Standard greedy NMS for one (batch, class) pair: sort surviving
-    candidates (score > score_threshold) by score descending, greedily keep
-    a box unless it overlaps (IoU > iou_threshold) a box already kept, and
-    stop once ``top_k`` have been kept. This is exactly what
+    """Standard greedy NMS for one (batch, class) pair: candidates are the
+    ``top_k`` highest-scoring boxes with score > score_threshold (ties toward
+    the lower index -- TensorRT's ``topK`` limits the boxes fed INTO NMS, header
+    step 3b), sorted by score descending; greedily keep a box unless it
+    overlaps (IoU > iou_threshold) a box already kept. This is what
     NonMaxSuppression is documented to do internally, per-class -- header
     step 4 -- reimplemented here independently so the differential tests
     below have a from-scratch oracle."""
@@ -241,10 +242,9 @@ def _greedy_nms_indices(boxes, class_scores, score_threshold, iou_threshold, top
         i for i in range(len(class_scores)) if class_scores[i] > score_threshold
     ]
     survivors.sort(key=lambda i: -class_scores[i])
+    survivors = survivors[:top_k]
     kept = []
     for i in survivors:
-        if len(kept) >= top_k:
-            break
         if all(_iou_xyxy(boxes[i], boxes[k]) <= iou_threshold for k in kept):
             kept.append(i)
     return kept
