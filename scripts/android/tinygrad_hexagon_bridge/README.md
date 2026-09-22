@@ -484,6 +484,61 @@ percentage).
 which was already handled separately via a TVM-schedule-level fix earlier in this project, not a
 `custom_kernel`) -- out of scope here, left for a follow-up.
 
+### Coverage: the elementwise add (`hex_add_kernel.py`) -- a real mixed result, not a win
+
+The follow-up to the note just above: `add` (FPN lateral + top-down merge, `int32 + int32 ->
+int32`, pre-requantization accumulators -- confirmed from
+`scripts/android/maskrcnn_e2e/profile_noncon_ops.py`'s `build_specs()`) is the biggest remaining
+uncovered item, 102.3 ms across 6 shapes; the single biggest of those is `ishape=[1,256,200,272]`
+(40.6 ms across 4 occurrences at that shape -- used below as the representative real shape).
+
+**Tried tinygrad's normal codegen path first**, per this file's own stated preference (a
+`custom_kernel` is for when a specific hardware intrinsic like `vrmpy` is needed and the generic
+devectorizer mishandles it -- a plain add has no such need in principle): `a + b` through BEAM
+search (BEAM=2 and BEAM=6 both tried) at the real full-scale shape (13,926,400 elements) found
+**no vectorized candidate at all** -- every candidate was the identical plain scalar `for` loop
+(`*(data0+i) = *(data1+i) + *(data2+i)`, no HVX, no unrolling). Bridged to real hardware anyway
+rather than assume it wasn't worth measuring:
+
+| kernel | median | throughput | vs TVM |
+|---|---:|---:|---:|
+| scalar (normal codegen, BEAM=2) | 292.812 ms | 0.048 G-elem/s | **0.057x (17.6x slower)** |
+| stock TVM (`relay.add`) | 16.620 ms | 0.838 G-elem/s | -- |
+
+Not remotely competitive -- a genuine negative result for "just let BEAM handle it," not a search
+budget problem (BEAM=6 converged to the same kernel as BEAM=2).
+
+**So a hand-written `custom_kernel` after all**, but for a different reason than every other
+kernel in this file: not because a specific accumulate-in-place HVX instruction (`vrmpy`) needs
+explicit intrinsics, but because tinygrad's Hexagon backend apparently won't auto-vectorize even a
+trivial elementwise loop to HVX width on its own. `build_vector_kernel()` is the simplest
+`custom_kernel` in this project: no accumulator, no reduction, no `_reg_i32`-style degenerate-range
+dependency tracking (every other kernel needed that because of a persistent `REG` accumulator
+across a reduction loop; this op has neither) -- one `(32,)`-wide `int __attribute__((
+vector_size(128)))` vector load/add/store per iteration (one HVX register, 32 int32 lanes), using
+plain C vector-extension `+` rather than an HVX builtin (clang lowers vector-extension arithmetic
+to the matching HVX instruction directly under `-mhvx`; unlike `vrmpy`, plain add has no
+accumulate-into-place semantics needing an explicit intrinsic).
+
+Verified bit-exact correct under qemu and on real hardware (device `239dbd8f`) at the real
+`[1,256,200,272]` shape:
+
+| kernel | median | throughput | vs TVM |
+|---|---:|---:|---:|
+| scalar (normal codegen) | 292.812 ms | 0.048 G-elem/s | 0.057x |
+| vectorized `custom_kernel` | **23.367 ms** | **0.596 G-elem/s** | **0.71x (still slower)** |
+| stock TVM (`relay.add`) | 16.620 ms | 0.838 G-elem/s | -- |
+
+Vectorizing alone recovered **12.5x** over the scalar version -- a real, large improvement -- but
+still lands at 0.71x of TVM's throughput, not a win. Most likely reason, consistent with this
+being a genuinely memory-bandwidth-bound op (3 buffers x 200x272x256x4 bytes = ~64 MB of total
+traffic per call, none of it reused): TVM's own schedule for a plain elementwise op likely blocks/
+prefetches or otherwise manages the memory pipeline better than this kernel's single flat loop
+does, similar in spirit to the 3x3 conv's cache-blocking gap above, though for pure bandwidth
+rather than working-set-fits-in-cache reasons. **Not attempted here**: any prefetch/blocking
+tuning to close this gap, or coverage of `maxpool`/`sigmoid` (deferred -- a well-verified single op
+was judged more valuable than three rushed ones; see the file's own docstring).
+
 ## Removing TVM as a transport dependency
 
 The bridge above still depends on TVM for two separate things: (1) **transport** -- getting bytes
@@ -681,6 +736,13 @@ when candidates differ only in raw compute-instruction mix with comparable worki
   9-position pattern to 49 and handling `cin=3` (not a multiple of 4) via reduction-axis
   zero-padding. Bit-exact correct and 14.08x faster than stock TVM on real hardware at the real
   profile shape -- see "Coverage: the ResNet stem 7x7 conv" above.
+- `hex_add_kernel.py` -- the elementwise `add`, both a normal-codegen+BEAM attempt (found no
+  vectorization, 17.6x slower than TVM -- a real negative result) and a hand-vectorized
+  `custom_kernel` (12.5x faster than the scalar version, but still 0.71x of TVM's throughput --
+  a real, honestly-reported mixed result). See "Coverage: the elementwise add" above.
+- `add_wrapper_template.c` -- a thin TVM PackedFunc ABI shim for `hex_add_kernel.py`'s
+  `int32/int32/int32` signature, alongside `wrapper_template.c` (which is hardcoded to the GEMM
+  kernels' `uint8/uint8/int32` signature and can't be reused as-is).
 - `native_transport/` -- a from-scratch, TVM-free FastRPC transport: custom `qaic`-generated
   interface, a native ARM64 client using only `libcdsprpc.so`, verified end to end on real
   hardware. See "Removing TVM as a transport dependency" above; `native_transport/build.sh`
