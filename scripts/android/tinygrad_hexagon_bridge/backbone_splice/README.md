@@ -52,19 +52,69 @@ packing fallback file directly, which `link_shared` (a pure linker wrapper, not 
 handle -- the wrapper compiles any `.c` inputs with the Hexagon toolchain first.
 
 **Not yet resolved**: loading and running the spliced `.so` via `session.load_module()` +
-`tvm.contrib.graph_executor.create(...)` fails at runtime with an opaque `hexagon_rpc_send
-failed: 78` RPC error. The well-tested `session.get_executor_from_factory()` path (used
-successfully everywhere else in this project) isn't exercised by this manual
-export_library+load_module+graph_executor.create sequence, so this is most likely a
-module-metadata/imports-packing gap specific to using a custom `fcompile`, not a problem with the
-splice itself -- the compute/build/link side is proven correct up to this final loading step.
+`tvm.contrib.graph_executor.create(...)` fails at runtime -- narrowed significantly, still open.
+
+### Diagnosing the runtime failure
+
+Bisecting the failing call step by step (`diag1.py`/`diag2.py`/`diag3.py`, not committed --
+scratch scripts, reproducible from the pattern below) showed:
+
+```
+session.upload(...)          OK
+session.load_module(...)     OK   -- the module DOES load and IS runnable on the DSP
+graph_executor.create(...)   OK
+gm.load_params(...)          OK
+gm.set_input(...)            OK
+gm.run()                     FAILS
+```
+
+So the module itself loads fine -- the failure is specifically in *running* the graph. `adb
+logcat` around the failure shows the real underlying error, one level below TVM's opaque
+`hexagon_rpc_send failed: N` wrapper:
+
+```
+tvm_rpc_android: .../fastrpc_apps_user.c:1323: Error 0x27: remote_handle64_invoke failed
+  for handle 0x68004180, method 5 on domain 3 (sc 0x5000100) (errno Success)
+```
+
+`0x27` = 39 = Qualcomm's `AEE_EUNSUPPORTED` -- the DSP-side FastRPC skeleton is rejecting
+"method 5" for this call, repeated many times for the same handle (once per graph-execution
+step, i.e. per op/buffer-management call TVM's runtime makes while running the graph -- not a
+crash in the kernel's own compute, which is never reached).
+
+**Ruled out** (both implemented and tested on real hardware, neither fixed it):
+- **HVX alignment**: `te.extern`'s auto-allocated in/out buffers might not get the 128-byte
+  alignment HVX vector load/store needs (unlike TVM's own vrmpy-tensorized buffers, which do).
+  Passed explicit `tvm.tir.decl_buffer(..., data_alignment=128, offset_factor=128)` via
+  `te.extern`'s `in_buffers`/`out_buffers` params. No change.
+- **`call_extern` return-type ABI mismatch**: the kernel function is `void`
+  (`__attribute__((noinline)) void hex_gemm_...(...)`, matching every other kernel in this
+  session), but `tvm.tir.call_extern("int32", "hex_gemm_...", ...)` declares it as returning
+  `int32` -- a real ABI mismatch, fixed by changing the dtype to `"void"`. Still failed
+  identically afterward, so this wasn't the (sole) cause either, though it's a correct fix to
+  keep regardless.
+
+Since the error happens on a repeated `method 5` FastRPC call *before* the kernel's own compute
+would run, and *not* while the (correctly loaded, per `load_module` succeeding) module's data is
+being used, the most likely remaining explanation is a **structural difference between how
+`relay.build()`'s own internal Hexagon codegen links a module and how this session's manual
+`export_library(fcompile=..., addons=[...])` does** -- e.g. missing device-module metadata
+(`__tvm_dev_mblob`-style embedding, or similar) that the DSP-side skel's dispatch path for
+"method 5" (likely graph-executor-specific buffer/workspace setup, not a data compute call)
+relies on and that TVM's *own* internal Hexagon link step (invoked inside
+`codegen_hexagon.cc`, confirmed to call `tvm.contrib.hexagon.link_shared` itself as part of
+`relay.build()`, before this session's script ever gets a chance to intervene) embeds
+correctly but a from-scratch `export_library` re-link does not reproduce.
 
 ## Next steps if picked back up
 
-- Root-cause the `hexagon_rpc_send failed: 78` error -- likely needs comparing exactly what
-  `get_executor_from_factory` does differently at the module-loading level (it may re-derive
-  metadata `export_library`'s custom-fcompile path skips, or use a different `.save()`/packing
-  route entirely for `ExecutorFactoryModule` objects specifically).
+- This looks like it needs either: (a) C++-level reading of `rpc_module.cc` /
+  `runtime/hexagon/rpc/*` to find what "method 5" actually dispatches to and what state it
+  expects the loaded module to be in, or (b) finding a way to get the extra kernel object file
+  linked into TVM's *own* internal Hexagon codegen link step (inside `codegen_hexagon.cc`)
+  instead of re-linking separately via `export_library` -- which would make the resulting
+  module identical in structure to a normal `relay.build()` output, sidestepping the
+  metadata-gap hypothesis entirely rather than needing to diagnose it.
 - Once loading works: apply the same splice to all 4 instances of the `cin=64,cout=256` shape in
   the real backbone (`$S/rcnn/backbone_relay.json`), run the *whole* backbone on real hardware,
   and measure genuine end-to-end wall-time improvement against the known baseline (~3.6s).
