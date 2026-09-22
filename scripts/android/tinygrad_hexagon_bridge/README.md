@@ -568,6 +568,51 @@ rather than working-set-fits-in-cache reasons. **Not attempted here**: any prefe
 tuning to close this gap, or coverage of `maxpool`/`sigmoid` (deferred -- a well-verified single op
 was judged more valuable than three rushed ones; see the file's own docstring).
 
+### `maxpool`/`sigmoid`: investigated, not covered -- two real, structural blockers
+
+The last two items in `noncon_profile.json` (confirmed via `profile_noncon_ops.py`'s
+`build_specs()`, not assumed): `maxpool` is `uint8`, kernel `3x3`, stride `2`, pad `1`, dominant
+shape `ishape=[1,64,400,544]` (60.2 ms of `maxpool`'s 61.8 ms total -- the ResNet stem's pool
+right after the 7x7 conv, `400x544 -> 200x272`); `sigmoid` is plain `float32`
+(`relay.sigmoid(relay.var("d", dtype="float32"))` -- RPN/mask-head logits, not a quantized/LUT op),
+five shapes from 663 to 163200 elements, 12.6 ms total. Neither got a `custom_kernel` this pass --
+both hit a real blocker within the time available, documented here rather than forced:
+
+- **`maxpool`**: tinygrad's normal codegen (BEAM=2, real shape) produces correct (qemu-verified
+  against a numpy reference), fully scalar code -- the exact same "no vectorization at all" finding
+  as `add`'s own history. But unlike `add` (a flat, fully-contiguous elementwise op) or the conv
+  kernels (which vectorize across `cout`, a 32-wide axis `vrmpy` matches directly), `maxpool` has
+  **no equivalent wide, contiguous axis to vectorize across** in this backbone's `NCHW` layout: the
+  only "wide" dimension is channels (64 here), but channels are non-contiguous in memory (stride
+  `H*W` apart), so a single HVX vector load can't gather multiple channels' worth of data in one
+  instruction; the one genuinely contiguous axis (`W`) needs a stride-2 windowed reduction (kernel
+  3, stride 2), which is vectorizable in principle via HVX's `vmax` plus a deinterleave/byte-pack
+  step (`vdeal`/`vpacke`-style builtins) to subsample the stride-1-computed max back down to the
+  real stride-2 output positions -- but that's a genuinely new HVX pattern this project hasn't used
+  before (every other kernel here either has no windowing at all, or windows along the
+  `vrmpy`-native `cout`/K-chunk axes), and getting its lane semantics right without a real chance to
+  debug on hardware afterward (this was a single-pass task) was judged too likely to land a subtly
+  wrong kernel to attempt here.
+- **`sigmoid`**: blocked earlier and more fundamentally -- tinygrad's `DSPCompiler` (`MOCKDSP=1`
+  path, and very likely the real-hardware path too, since both use the same freestanding
+  `-nostdlib -ffreestanding` link setup) can't even *compile* a plain float division:
+  `ld.lld: error: undefined symbol: __hexagon_divsf3` on the simplest possible `a.sigmoid()`
+  correctness check. Every kernel this project has ever built (12+ conv/GEMM/elementwise kernels
+  across `hex_gemm_kernel.py`, `hex_conv3x3_kernel.py`, `hex_stem7x7_kernel.py`,
+  `hex_add_kernel.py`) has been `uint8`/`int8`/`int32` -- **this is the first time this project has
+  tried a `float32` op on this DSP backend at all**, and it surfaces a real gap: no Hexagon
+  compiler-rt soft-float helpers (`__hexagon_divsf3`, and transitively whatever `expf`/`powf`-style
+  helpers a real `exp()` would need) are linked into `DSPCompiler`'s minimal freestanding build. A
+  hand-written `custom_kernel` sigmoid could route around `exp()`/division entirely with a
+  division-free polynomial or bit-trick approximation, but designing and numerically verifying one
+  with confidence, in addition to fixing or working around the missing compiler-rt symbols, was
+  more than fit in the time available this pass.
+
+Both are real, evidenced findings, not just "ran out of time" -- useful for whoever picks these up
+next: `maxpool` needs a genuinely new HVX deinterleave pattern; `sigmoid` needs `DSPCompiler`
+extended with Hexagon compiler-rt soft-float symbols (or a division/exp-free approximation) before
+any float32 op can run on this backend at all, `custom_kernel` or otherwise.
+
 ## Removing TVM as a transport dependency
 
 The bridge above still depends on TVM for two separate things: (1) **transport** -- getting bytes
