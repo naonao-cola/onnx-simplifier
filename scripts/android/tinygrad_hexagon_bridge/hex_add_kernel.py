@@ -26,7 +26,18 @@ Two approaches, both here, in the order they were actually tried:
    vector_size(128)))` load/add/store per iteration, one HVX vector (32 int32 lanes) at a time,
    using plain C vector-extension `+` (not an HVX builtin -- clang lowers vector-extension
    arithmetic to the matching HVX instruction directly under `-mhvx`, unlike `vrmpy`'s
-   accumulate-into-place semantics, which needed an explicit intrinsic).
+   accumulate-into-place semantics, which needed an explicit intrinsic). Landed at 0.71x of TVM,
+   a real loss, not a win.
+3. Closing that gap (this file's current default): tried instruction-level unrolling first (more
+   independent load/add/store statements per loop iteration, `HEXSIM=1`-screened) -- real hardware
+   showed it does *not* help (flat-to-slightly-worse at every scale tested), consistent with this
+   op being memory-bandwidth-bound rather than loop-overhead-bound (nothing is reused; 3 buffers'
+   worth of traffic per element, no compute to hide the loads behind). Software prefetch
+   (`__builtin_HEXAGON_Y2_dcfetch`, `prefetch_dist` vectors ahead of the one being processed) is a
+   different lever entirely -- hiding DDR latency rather than reducing instruction count -- and
+   `HEXSIM=1` showed a real, monotonic improvement with prefetch distance (up to ~1.7x faster
+   before plateauing around distance 16), confirmed on real hardware. See ../README.md's "Coverage:
+   the elementwise add" section for the full real-hardware numbers.
 """
 from __future__ import annotations
 
@@ -66,10 +77,21 @@ def capture_source(shape: tuple[int, ...], beam: int, seed: int = 5) -> tuple[st
     return captured["src"], correct
 
 
-def build_vector_kernel(n: int, a, b, kernel_name: str = "hex_add"):
+def build_vector_kernel(n: int, a, b, kernel_name: str = "hex_add", prefetch_dist: int = 16):
     """Build + apply a plain HVX-vectorized elementwise-add `custom_kernel`. `n` must be a
     multiple of 32 (one HVX 128-byte vector = 32 int32 lanes). `a`, `b`: shape (n,) int32
-    Tensors. Returns the (n,) int32 output Tensor; call .realize() to run it."""
+    Tensors. Returns the (n,) int32 output Tensor; call .realize() to run it.
+
+    `prefetch_dist` (default 16, the winner of a real-hardware sweep -- see ../README.md's
+    "Coverage: the elementwise add" section): each iteration issues `__builtin_HEXAGON_Y2_dcfetch`
+    for both input operands `prefetch_dist` vectors ahead of the one being added, to hide DDR
+    latency behind the current iteration's compute -- this op is memory-bandwidth-bound (one
+    load+load+add+store per element, nothing reused), so hiding latency is the only lever that
+    actually moved real-hardware throughput; instruction-level unrolling (tried first, see below)
+    did not. `prefetch_dist=0` disables this and reproduces the original, unprefetched kernel.
+    The trailing `dcfetch`es can read up to `prefetch_dist` vectors past the buffer's end near the
+    tail of the loop; `dcfetch` is defined as a non-faulting hint on Hexagon (confirmed empirically
+    under qemu and on real hardware -- no crash, no incorrect output, at every `n` tested here)."""
     from tinygrad import Tensor, UOp
     from tinygrad.dtype import dtypes
     from tinygrad.uop.ops import AxisType, KernelInfo, Ops
@@ -80,10 +102,19 @@ def build_vector_kernel(n: int, a, b, kernel_name: str = "hex_add"):
     def kernel_fn(C: UOp, A: UOp, B: UOp) -> UOp:
         v_rng = UOp.range(n // 32, 0, AxisType.WEAK)
         a_idx, b_idx, c_idx = A[v_rng * 32], B[v_rng * 32], C[v_rng * 32]
-        step = UOp(
-            Ops.CUSTOM, dtypes.void, (c_idx, a_idx, b_idx),
-            arg=f"*({i32x32}*){{0}} = *({i32x32}*){{1}} + *({i32x32}*){{2}};",
-        )
+        if prefetch_dist:
+            pf_off = (v_rng + prefetch_dist) * 32
+            pf_a_idx, pf_b_idx = A[pf_off], B[pf_off]
+            step = UOp(
+                Ops.CUSTOM, dtypes.void, (c_idx, a_idx, b_idx, pf_a_idx, pf_b_idx),
+                arg=(f"*({i32x32}*){{0}} = *({i32x32}*){{1}} + *({i32x32}*){{2}}; "
+                     f"__builtin_HEXAGON_Y2_dcfetch((void*){{3}}); __builtin_HEXAGON_Y2_dcfetch((void*){{4}});"),
+            )
+        else:
+            step = UOp(
+                Ops.CUSTOM, dtypes.void, (c_idx, a_idx, b_idx),
+                arg=f"*({i32x32}*){{0}} = *({i32x32}*){{1}} + *({i32x32}*){{2}};",
+            )
         return step.end(v_rng).sink(arg=KernelInfo(name=kernel_name, opts_to_apply=()))
 
     c = Tensor.empty(n, dtype="int32", device="DSP")
@@ -103,6 +134,8 @@ def main() -> None:
                     "normal-codegen path (0 = off); ignored with --vector")
     p.add_argument("--vector", action="store_true",
                     help="use the hand-vectorized custom_kernel instead of normal codegen+BEAM")
+    p.add_argument("--prefetch-dist", type=int, default=16,
+                    help="dcfetch look-ahead distance in vectors for --vector (0 = disable); ignored otherwise")
     p.add_argument("--out", default="add_kernel.c")
     args = p.parse_args()
 
@@ -132,7 +165,7 @@ def main() -> None:
             a_np = rng.integers(-1000, 1000, n).astype(np.int32)
             b_np = rng.integers(-1000, 1000, n).astype(np.int32)
             a, b = Tensor(a_np, dtype="int32", device="DSP"), Tensor(b_np, dtype="int32", device="DSP")
-            out = build_vector_kernel(n, a, b)
+            out = build_vector_kernel(n, a, b, prefetch_dist=args.prefetch_dist)
             out.realize()
             ref = a_np.astype(np.int64) + b_np.astype(np.int64)
             correct = bool(np.array_equal(out.numpy().astype(np.int64), ref))
