@@ -38,6 +38,9 @@ class ProfileResult:
     """Per-call times in seconds (each entry is the mean of ``number`` runs), like TVM's."""
 
     results: List[float]
+    # Extra runtime statistics when the server provides them (the tinygrad runtime reports kernel
+    # count, GFLOPs, GB moved and device kernel time for one steady-state call).
+    stats: Optional[Dict[str, Any]] = None
 
     @property
     def mean(self) -> float:
@@ -97,7 +100,7 @@ class RemoteModel:
             },
             blobs,
         )
-        return ProfileResult(list(reply["results"]))
+        return ProfileResult(list(reply["results"]), reply.get("stats"))
 
     def close(self) -> None:
         self._session._call({"op": "unload", "handle": self.handle})
@@ -134,14 +137,23 @@ class Session:
         model: ModelLike,
         providers: Optional[Sequence[str]] = None,
         single_threaded: bool = False,
+        runtime: str = "onnxruntime",
+        device: Optional[str] = None,
+        options: Optional[Dict[str, int]] = None,
     ) -> RemoteModel:
-        """Load a model on the server: an uploaded file name, a path, bytes or a ``ModelProto``."""
+        """Load a model on the server: an uploaded file name, a path, bytes or a ``ModelProto``.
+
+        ``runtime="tinygrad"`` runs it through tinygrad's ONNX frontend on ``device`` (a tinygrad
+        device name such as ``"NV"`` or ``"CPU"``) with codegen ``options`` such as ``{"BEAM": 2}``.
+        """
         header: Dict[str, Any] = {
             "op": "load_model",
             "single_threaded": single_threaded,
         }
         if providers:
             header["providers"] = list(providers)
+        if runtime != "onnxruntime":
+            header.update(runtime=runtime, device=device, options=options or {})
         if isinstance(model, str) and not os.path.exists(model):
             header["name"] = model  # a name previously passed to upload()
             reply, _ = self._call(header)
@@ -154,12 +166,17 @@ class Session:
         model: ModelLike,
         inputs: Dict[str, np.ndarray],
         providers: Optional[Sequence[str]] = None,
+        runtime: str = "onnxruntime",
+        device: Optional[str] = None,
+        options: Optional[Dict[str, int]] = None,
     ) -> Dict[str, np.ndarray]:
         """One-shot: send the model with its inputs, get the outputs (no handle kept)."""
         specs, blobs = proto.encode_tensors(inputs)
         header: Dict[str, Any] = {"op": "run_once", "tensors": specs}
         if providers:
             header["providers"] = list(providers)
+        if runtime != "onnxruntime":
+            header.update(runtime=runtime, device=device, options=options or {})
         reply, out = self._call(header, [_model_bytes(model), *blobs])
         return proto.decode_tensors(reply["tensors"], out)
 

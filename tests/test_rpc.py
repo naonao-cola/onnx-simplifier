@@ -212,3 +212,84 @@ def test_executor_override_is_scoped(server):
         with rpc.remote_executor(session) as executor:
             assert onnx_simplifier._get_model_executor() is executor
         assert onnx_simplifier._executor_override.get() is None
+
+
+# ---- tinygrad runtime (skipped unless tinygrad is installed on the server) ----------------------
+
+tinygrad_available = pytest.mark.skipif(
+    __import__("importlib").util.find_spec("tinygrad") is None,
+    reason="tinygrad is not installed",
+)
+
+
+@tinygrad_available
+def test_tinygrad_runtime_matches_numpy_and_reports_kernel_stats(server):
+    x = np.random.default_rng(3).normal(size=(2, 3)).astype("float32")
+    y = np.random.default_rng(4).normal(size=(2, 3)).astype("float32")
+    with _connect(server) as session:
+        assert session.info["tinygrad"]["version"]
+        model = session.load_model(
+            _model(ADD_RELU), runtime="tinygrad", device="PYTHON"
+        )
+        np.testing.assert_allclose(
+            model.run({"x": x, "y": y})["z"], np.maximum(x + y, 0), rtol=1e-6
+        )
+        timing = model.time_evaluator({"x": x, "y": y}, number=2, repeat=3)
+    assert len(timing.results) == 3 and timing.median > 0
+    assert timing.stats["kernels"] >= 1
+    assert timing.stats["device"] == "PYTHON" and timing.stats["options"] == {}
+
+
+@tinygrad_available
+def test_tinygrad_runtime_one_shot_and_codegen_options(server):
+    x = np.ones((2, 3), dtype="float32")
+    with _connect(server) as session:
+        out = session.run(
+            _model(ADD_RELU),
+            {"x": x, "y": x},
+            runtime="tinygrad",
+            device="PYTHON",
+            options={"NOOPT": 1},
+        )
+        np.testing.assert_array_equal(out["z"], 2 * x)
+        model = session.load_model(
+            _model(ADD_RELU), runtime="tinygrad", device="PYTHON", options={"NOOPT": 1}
+        )
+        assert model.time_evaluator({"x": x, "y": x}).stats["options"] == {"NOOPT": 1}
+
+
+@tinygrad_available
+def test_tinygrad_runtime_validates_its_arguments(server):
+    with _connect(server) as session:
+        with pytest.raises(rpc.RPCError, match="unsupported tinygrad options"):
+            session.load_model(
+                _model(ADD_RELU), runtime="tinygrad", options={"DEBUG": 5}
+            )
+        with pytest.raises(rpc.RPCError, match="invalid tinygrad device"):
+            session.load_model(_model(ADD_RELU), runtime="tinygrad", device="rm -rf /")
+        with pytest.raises(rpc.RPCError, match="unknown runtime"):
+            session.load_model(_model(ADD_RELU), runtime="tvm")
+
+
+def test_tinygrad_runtime_without_tinygrad_is_a_clean_error(server, monkeypatch):
+    import sys
+
+    monkeypatch.setitem(
+        sys.modules, "tinygrad", None
+    )  # makes `import tinygrad` raise ImportError
+    with _connect(server) as session:
+        with pytest.raises(rpc.RPCError, match="needs tinygrad installed"):
+            session.load_model(_model(ADD_RELU), runtime="tinygrad")
+
+
+@tinygrad_available
+def test_tinygrad_calls_run_on_one_worker_thread_across_connections(server):
+    """tinygrad's SQLite cache is thread-bound; each connection is served by its own thread."""
+    x = np.ones((2, 3), dtype="float32")
+    for _ in range(3):
+        with _connect(server) as session:
+            model = session.load_model(
+                _model(ADD_RELU), runtime="tinygrad", device="PYTHON"
+            )
+            np.testing.assert_array_equal(model.run({"x": x, "y": x})["z"], 2 * x)
+            assert model.time_evaluator({"x": x, "y": x}).stats["kernels"] >= 1
