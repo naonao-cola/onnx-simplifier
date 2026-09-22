@@ -1497,6 +1497,88 @@ explicit permission for a correctness-only Stage-1 result); batching over more t
 (single-ROI correctness was this pass's whole scope); the HVX-native `vgather`/`vlutvvb` kernel
 itself.
 
+## RoiAlign, Stage 2: a real, fast kernel on the phone -- no gather instruction needed
+
+**Correction to Stage 1 first.** Stage 1's "dense one-hot-mask-and-reduce, O(H*W) per gathered
+pixel" description is what `Tensor.gather()` *builds*, not what tinygrad *emits*. Rendering Stage 1's
+kernel at a real shape (`DEBUG=4 DEV=DSP MOCKDSP=1`, P5 level, 25x34x256, one RoI) shows tinygrad's
+own rewrite rules fold the `one_hot(...).where(x, 0).sum()` pattern into a **direct indexed load**
+(`val = cond ? *(data2 + idx) : 0.0f`, the index read from a loaded tensor) -- no loop over H*W at
+all. So Stage 1 already did genuine indirect loads; what it lacked was vectorization (NCHW makes every
+tap a stride-850 scalar read per channel, and it was rendered for `-mhvx=v65`, which has no HVX fp32).
+
+**Design: the data dependence is per *pixel*, not per *lane*.** In a channels-last (H, W, C) feature
+map, each bilinear tap is C=256 contiguous floats -- 8 whole, aligned 128-byte HVX vectors. So the
+scalar core computes each sample's two rows/cols and four weights (cheap, runtime box coords), and the
+HVX unit does plain aligned `vmem` loads plus a 4-tap multiply-accumulate across channels. No per-lane
+gather is needed at all. `vgathermh`/`vgathermw` (checked in the SDK's `hvx_hexagon_protos.h`: per-lane
+16/32-bit offsets into a **VTCM** source region, result lands in VTCM) would be the wrong tool twice
+over: nothing here needs per-lane addresses, and the P2 feature map (55.7 MB) is an order of magnitude
+bigger than VTCM (single-digit MB). This is the same packed-channels insight that unblocked `maxpool`.
+The kernel is hand-written C (`roialign_fast/roialign_kernel.h`, header-only so host, qemu and the
+DSP skel compile identical code) rather than a tinygrad `custom_kernel`: its body is almost entirely
+data-dependent scalar control flow (float->int, clamps, bounds skips) around a trivial vector FMA,
+which in `custom_kernel` form would be one big `Ops.CUSTOM` string anyway.
+
+Exact ONNX semantics (opset-12 `RoiAlign`, no `coordinate_transformation_mode` attribute, i.e. no
+half-pixel offset; `avg`; `sampling_ratio=2`; clamp/skip rules) taken from the real model's 8 RoiAlign
+nodes, with **real inputs**: one COCO image (val2017 `000000000139`) through the full
+`MaskRCNN-12-qdq` in ONNX Runtime, capturing every RoiAlign node's real feature map, real RoIs and real
+output (`roialign_fast/dump_real_roialign_io.py`). Real call shapes: box head 43/111/218/628 RoIs at
+7x7 on P5/P4/P3/P2 (1000 total), mask head 1/3/22/74 at 14x14 (100 total), all fp32, C=256.
+
+**Verification, three levels, all 8 real calls:**
+
+| Level | Result |
+|---|---|
+| Host C (x86, same header) vs ORT's real outputs | bit-exact (max abs err 0) |
+| `qemu-hexagon-static`, Hexagon ISA, scalar fp32 (`-mhvx=v65`) | max abs err <= 9e-6 |
+| **Real hardware** (device `239dbd8f`, CDSP, HVX qf32, via a dedicated TVM-free FastRPC skel) | **max abs err <= 6.5e-5** (qf32 rounding), PASS at every call and thread count |
+
+qemu 8.2's Hexagon decoder can't execute the qfloat HVX instructions the vectorized build uses
+(`decode_packet: assertion failed`), hence the scalar build there; the real phone is the check for the
+vector build. The 55.7 MB P2 map didn't hit this project's ~32 MB transfer ceiling: the client
+allocates every buffer with `rpcmem_alloc` (ION-backed, mapped into the DSP rather than copied).
+
+**Speed, real hardware, all 8 real calls summed** (DSP-side time from `HAP_perf_get_time_us`, median
+of 5; FastRPC round trip adds ~0.3-0.5 ms per call):
+
+| | 1 thread | 4 threads |
+|---|---:|---:|
+| This kernel, plain | 137.1 ms | 44.7 ms |
+| This kernel, + `l2fetch` of the next bin's tap rows | **85.4 ms** | **27.1 ms** |
+| ONNX Runtime CPU **on the phone** (stock `onnxruntime-android` 1.26 arm64, C API) | 267.4 ms | 63.3 ms (default, all cores) |
+| ONNX Runtime CPU on the 32-thread desktop host (Ryzen AI Max+ 395), for scale | 86.2 ms | 11.5 ms (default) |
+
+So on the phone: **3.1x faster than one CPU thread, 2.3x faster than ORT using every CPU core**, which
+is how `rest.onnx` runs today. Split by head: box head 19.8 ms vs ORT 46.7 ms; mask head 7.3 ms vs
+16.6 ms. The kernel is memory-latency bound, not compute bound: the plain version spends ~500 cycles
+per sample against ~50 cycles of HVX work, a `HAP_power_set` TURBO/DCVS-off vote changed nothing
+(the DSP was already at full clock), and a one-bin-ahead 1-D `l2fetch` of the two 2-pixel row
+segments each sample reads cut time 1.6x -- except on the smallest (P5) level, whose 0.87 MB map is
+already cache-resident (flat to ~5% slower there). Threads split RoIs across QuRT threads, each holding
+the HVX unit (`qurt_hvx_lock`); 4 threads give 2.9-3.2x.
+
+For the record against Stage 1 on the only path Stage 1 ever ran (qemu, scalar, same single P5 RoI):
+1.00 M vs 1.49 M executed instructions -- 1.5x from the channels-last layout alone. The real speedup
+comes from HVX fp32 vectors, threads and prefetch, none of which Stage 1's `-mhvx=v65` rendering had;
+Stage 1 was never run on hardware.
+
+**Caveats, stated plainly:**
+- **Layout is assumed, not paid for.** The kernel reads channels-last features and writes channels-last
+  (R, OH, OW, C) output; ORT reads/writes NCHW. The numbers above exclude any transpose. The output side
+  is free in practice (the fc6 box-head MatMul consumes the flattened crop, so its weight rows can be
+  permuted offline), but the input side is not: the backbone's FPN maps are NCHW today, and transposing
+  P2-P5 (~73 MB fp32) on the fly would cost real time. Making the backbone's last FPN kernels emit
+  channels-last is the real fix and isn't done here.
+- One image's RoIs, fp32 only (the real model's RoiAlign inputs are dequantized fp32).
+- Not integrated into any pipeline; each call is a standalone FastRPC round trip.
+
+`roialign_fast/` reproduces everything: `dump_real_roialign_io.py` (real inputs/outputs from ORT),
+`gen_roialign_test_data.py` (channels-last binaries), `roialign_host_check.c`, `roialign_qemu.c`,
+`build.sh` (qaic + hexagon-clang/link + NDK client + adb run; `TURBO=1` adds the clock vote),
+`make_roialign_single_node_models.py` + `ort_roialign_bench.c` (the host and phone ORT baselines).
+
 ## Files
 
 - `capture_kernel.py` -- capture tinygrad's rendered Hexagon C for a shape, verified under qemu.
@@ -1597,3 +1679,11 @@ itself.
   `DEV=DSP MOCKDSP=1` compile+qemu path, not just the default device. Correctness only -- the
   generic `.gather()` lowers to a dense one-hot-mask-and-reduce, not real HVX indexed addressing;
   see "RoiAlign, Stage 1" above for the concrete `vgathermh`/`vlutvvb`-based next step.
+  (Corrected in Stage 2: tinygrad already folds that pattern into a direct indexed load.)
+- `roialign_fast/` -- RoiAlign Stage 2: a hand-written channels-last HVX kernel
+  (`roialign_kernel.h`, plain + `l2fetch`-prefetching variants), its dedicated TVM-free FastRPC skel
+  (`roialign_rpc.idl`, `roialign_impl.c`, `roialign_client.c`, `build.sh`), real-input capture
+  (`dump_real_roialign_io.py`, `gen_roialign_test_data.py`), host/qemu checks
+  (`roialign_host_check.c`, `roialign_qemu.c`) and the ORT baselines
+  (`make_roialign_single_node_models.py`, `ort_roialign_bench.c`). Correct on the phone at all 8
+  real calls; 27.1 ms vs ORT's 63.3 ms on the phone's CPU. See "RoiAlign, Stage 2" above.
