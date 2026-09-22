@@ -398,6 +398,53 @@ does) -- the natural next step if this is picked back up, and the same kind of t
 the same splice-into-`relay.build()` mechanism `backbone_splice/` uses, currently blocked on that
 work's own unresolved RPC loading bug -- see `backbone_splice/README.md`).
 
+### Coverage: the ResNet stem 7x7 conv (`hex_stem7x7_kernel.py`) -- the last uncovered conv shape
+
+`conv_profile.json`'s last remaining uncovered *conv* bucket (excluding the 3x3 tiling refinement
+above): the single ResNet stem conv, `ishape=[1,3,800,1088]`, `wshape=[64,3,7,7]`, `stride=[2,2]`,
+`pad=[3,3]`, 308.5 ms. `hex_stem7x7_kernel.py` generalizes `hex_conv3x3_kernel.py`'s pattern from
+9 kernel positions to 49, and adds real output-vs-input spatial size mismatch (stride=2, so unlike
+the 3x3 kernels' "same"-size case, `(oh, ow)` need their own ranges computed from `(ih, iw)`, not
+reused directly -- the same `(oh, ow)` vs `(ih, iw)` split `build_strided_kernel()` in
+`hex_gemm_kernel.py` already established for strided 1x1 convs).
+
+One genuinely new wrinkle: `cin=3` isn't a multiple of 4, the K-chunk width every `vrmpybusv` call
+in this project assumes. Handled the same way `hex_gemm_kernel.py`'s tiny-`cout` coverage handled
+`cout` not being a multiple of 32 ("Coverage: the tiny RPN/mask-head convs" above) -- zero-pad, but
+on the reduction (`cin`) axis instead of the N (`cout`) axis this time: `cin` padded up to 4 with
+an all-zero weight channel, so the padding lane always contributes `activation * 0 == 0` regardless
+of what's in the corresponding activation padding byte. Free for the same reason N-axis padding
+was free: `vrmpybusv`'s K-chunk width is fixed at 4 regardless, so `cin=3` already pays for a
+4-wide reduction step; padding to `cin=4` just makes that width explicit.
+
+Verified **bit-exact correct on real hardware** (device `239dbd8f`, `vrmpybusv_acc_128B`, uint8
+activation x signed int8 weight) at the exact real profile shape, at full scale (`oh=400, ow=544`,
+~10.66M reduction steps) -- also bit-exact under qemu at that same full scale (6 seconds to
+generate+verify, not just the smaller shapes checked during development):
+
+| `cin` | `cout` | spatial (in) | kernel | stride | stock TVM | `custom_kernel` | speedup |
+|---:|---:|---|---:|---:|---:|---:|---:|
+| 3 | 64 | 800x1088 | 7x7 | 2 | 2.27 GMAC/s | 31.92 GMAC/s | **14.08x** |
+
+The largest speedup of any shape covered so far, and it makes sense why: TVM's packed NCHWc
+schedule pads `cin` up to a full 32-wide input-channel block regardless of the real channel count
+(the same packed-layout convention `chunked_kernel_test.py` inspected earlier in this project),
+so at `cin=3` it's doing >10x more multiply-accumulate work than necessary padding to 32; this
+kernel only pads to 4, the minimum `vrmpybusv` needs, wasting a much smaller fraction.
+
+This closes out every *conv* shape in the profile except the 3x3 tiling refinement above. Adding
+this unambiguous win (308.5 ms) to the twelve 1x1 shapes' running total (~3562 ms) gives ~3870.5 ms
+of the 7623 ms grand total covered by a kernel that's faster than TVM everywhere it's been
+measured -- **about 51%** (the 3x3 conv's ~2509 ms is left out of this figure, same as before,
+since one of its three measured shapes is a real, reported loss against TVM, not an unambiguous
+win -- see its own section above for the honest breakdown rather than folding it into one summary
+percentage).
+
+**Not covered by this file**: the small elementwise/pooling ops (`add`/`maxpool`/`sigmoid`,
+~176.7 ms combined, the only remaining uncovered items in `noncon_profile.json` besides `resize`,
+which was already handled separately via a TVM-schedule-level fix earlier in this project, not a
+`custom_kernel`) -- out of scope here, left for a follow-up.
+
 ## Removing TVM as a transport dependency
 
 The bridge above still depends on TVM for two separate things: (1) **transport** -- getting bytes
@@ -508,6 +555,10 @@ one of `hex_gemm_kernel.py`'s generated kernel functions instead of the placehol
   hardware at every shape tested; faster than stock TVM at two of the three real profile shapes
   tested, slower at the biggest one (`cin=cout=256`) -- see "Coverage: a real 3x3 conv" above for
   why, and what tiling work would likely close the gap.
+- `hex_stem7x7_kernel.py` -- the ResNet stem 7x7 conv, generalizing `hex_conv3x3_kernel.py`'s
+  9-position pattern to 49 and handling `cin=3` (not a multiple of 4) via reduction-axis
+  zero-padding. Bit-exact correct and 14.08x faster than stock TVM on real hardware at the real
+  profile shape -- see "Coverage: the ResNet stem 7x7 conv" above.
 - `native_transport/` -- a from-scratch, TVM-free FastRPC transport: custom `qaic`-generated
   interface, a native ARM64 client using only `libcdsprpc.so`, verified end to end on real
   hardware. See "Removing TVM as a transport dependency" above; `native_transport/build.sh`
