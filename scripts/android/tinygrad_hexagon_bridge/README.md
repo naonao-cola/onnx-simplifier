@@ -611,15 +611,15 @@ now `prefetch_dist=16`; pass `prefetch_dist=0` to reproduce the original, unpref
 number (a bridge-infrastructure issue, not a kernel one); `maxpool`/`sigmoid` coverage (a separate,
 concurrent effort in this session).
 
-### `maxpool`/`sigmoid`: investigated, not covered -- two real, structural blockers
+### `maxpool`/`sigmoid`: two real, structural blockers -- `maxpool` unblocked, `sigmoid` still open
 
 The last two items in `noncon_profile.json` (confirmed via `profile_noncon_ops.py`'s
 `build_specs()`, not assumed): `maxpool` is `uint8`, kernel `3x3`, stride `2`, pad `1`, dominant
 shape `ishape=[1,64,400,544]` (60.2 ms of `maxpool`'s 61.8 ms total -- the ResNet stem's pool
 right after the 7x7 conv, `400x544 -> 200x272`); `sigmoid` is plain `float32`
 (`relay.sigmoid(relay.var("d", dtype="float32"))` -- RPN/mask-head logits, not a quantized/LUT op),
-five shapes from 663 to 163200 elements, 12.6 ms total. Neither got a `custom_kernel` this pass --
-both hit a real blocker within the time available, documented here rather than forced:
+five shapes from 663 to 163200 elements, 12.6 ms total. Both hit a real blocker in the pass that
+first looked at them, documented here rather than forced:
 
 - **`maxpool`**: tinygrad's normal codegen (BEAM=2, real shape) produces correct (qemu-verified
   against a numpy reference), fully scalar code -- the exact same "no vectorization at all" finding
@@ -635,7 +635,7 @@ both hit a real blocker within the time available, documented here rather than f
   before (every other kernel here either has no windowing at all, or windows along the
   `vrmpy`-native `cout`/K-chunk axes), and getting its lane semantics right without a real chance to
   debug on hardware afterward (this was a single-pass task) was judged too likely to land a subtly
-  wrong kernel to attempt here.
+  wrong kernel to attempt here. **Unblocked in a follow-up pass** -- see below.
 - **`sigmoid`**: blocked earlier and more fundamentally -- tinygrad's `DSPCompiler` (`MOCKDSP=1`
   path, and very likely the real-hardware path too, since both use the same freestanding
   `-nostdlib -ffreestanding` link setup) can't even *compile* a plain float division:
@@ -652,9 +652,67 @@ both hit a real blocker within the time available, documented here rather than f
   more than fit in the time available this pass.
 
 Both are real, evidenced findings, not just "ran out of time" -- useful for whoever picks these up
-next: `maxpool` needs a genuinely new HVX deinterleave pattern; `sigmoid` needs `DSPCompiler`
-extended with Hexagon compiler-rt soft-float symbols (or a division/exp-free approximation) before
-any float32 op can run on this backend at all, `custom_kernel` or otherwise.
+next: `maxpool` needs a genuinely new HVX deinterleave pattern (see below for how that turned out
+not to be necessary after all); `sigmoid` needs `DSPCompiler` extended with Hexagon compiler-rt
+soft-float symbols (or a division/exp-free approximation) before any float32 op can run on this
+backend at all, `custom_kernel` or otherwise.
+
+### `maxpool` unblocked: TVM's own reference layout, not a new HVX pattern (`hex_maxpool_kernel.py`)
+
+The blocker above was specific to plain `NCHW` layout -- channels aren't contiguous there, so
+there's no wide axis to vectorize across without a genuinely new stride-2 deinterleave pattern.
+But `NCHW` isn't actually what TVM's own reference schedule uses for this op *in this exact real
+subgraph*. Confirmed by compiling a real `qnn.conv2d -> nn.max_pool2d -> qnn.conv2d` graph (the
+real backbone's actual stem-conv -> pool -> layer1 sandwich) through `relay.build()` and inspecting
+the compiled graph JSON directly, not assumed: `tvmgen_default_fused_nn_max_pool2d`'s shape is
+`[1, 2, 10, 10, 32]` at a small test size -- **packed NCHWc** (`ic_bn=32`), the exact same layout
+convention `chunked_kernel_test.py`/`backbone_splice/gen_chunked_prod.py` already validated for
+conv kernels in this project. TVM never registers a Hexagon-specific pooling schedule
+(`topi/hexagon/pooling.py` is a generic, layout-agnostic `AutoInlineInjective` schedule) -- the
+packing comes entirely from `topi.nn.pool2d`'s generic layout-string parametrization combined with
+`AlterOpLayout` choosing to keep the whole subgraph packed rather than repacking back to `NCHW`
+around the pool, exactly as it already does for the convs on either side of it.
+
+In that layout, the channel-block axis (32 contiguous `uint8` bytes) *is* the wide, contiguous
+vectorization axis the plain-`NCHW` attempt found missing -- no stride-2 `W`-axis deinterleave
+needed at all, since the windowed 3x3/stride-2 reduction happens over the `(H, W)` axes exactly as
+before, applied uniformly across all 32 channel lanes at once via one comparison per window
+position. `hex_maxpool_kernel.py`'s `build_kernel()` follows this project's now-standard reduction
+pattern (`_reg_u8x32`, mirroring `hex_gemm_kernel.py`'s `_reg_i32` multi-range-dependency fix for
+any range that can degenerate to extent 1): a `(32,)`-wide `unsigned char` accumulator, initialized
+to `0` (safe for `uint8` max -- `0` is the dtype's true minimum, so a padded lane can never win
+against a real activation value, the same "padding is free" argument `hex_stem7x7_kernel.py` made
+for its `cin`-axis padding), `max`'d against each of the 9 window positions via
+`__builtin_elementwise_max` (plain vector-extension `?:` doesn't compile in Clang's C mode for
+vector conditions here -- `__builtin_elementwise_max` does and is the portable fix).
+
+Host-side padding (`pad_nchwc()`) zero-pads the `(H, W)` axes the same way `hex_conv3x3_kernel.py`
+pads its input, before the kernel runs -- no in-kernel bounds checks needed.
+
+Verified **bit-exact correct on real hardware** (device `239dbd8f`) at the real profile shape
+(`cin=64, 400x544 -> 200x272`, also bit-exact under qemu at the same full scale and at a small
+shape during development), and measured against stock TVM's own `nn.max_pool2d` at the identical
+shape, same methodology (`HexagonLauncher`/`get_executor_from_factory`, separate RPC sessions to
+avoid the cross-session-mixing issue found elsewhere in this project):
+
+| shape | stock TVM | `custom_kernel` | speedup |
+|---|---:|---:|---:|
+| `cin=64, 400x544 -> 200x272` | 76.092 ms / 0.046 G-elem/s | **38.247 ms / 0.091 G-elem/s** | **1.99x** |
+
+Bit-exact correct and faster than TVM, closing out `maxpool`'s 60.2 ms of the 61.8 ms total (the
+one smaller `[1,256,25,34]` shape, 1.6 ms, wasn't separately re-verified given its small impact --
+same kernel, same correctness argument, only the loop trip counts differ).
+
+**Not done**: the ~4x throughput a full 128-byte HVX vector could offer. This kernel's natural
+data width is 32 bytes (one channel-block, confirmed via `hexagon-llvm-objdump` -- the compiled
+`__builtin_elementwise_max` call lowers to Hexagon's scalar-core packed-byte `vmaxub` on 64-bit
+register pairs, 8-wide SIMD, not the separate 128-byte HVX vector coprocessor's own `vmaxub_128B`).
+Getting a full 128-byte op would need grouping 4 output positions per vector call the same way
+`hex_conv3x3_kernel.py`'s `ow_tile` does for the stride-1 conv kernels -- but `maxpool`'s stride-2
+windows make neighboring *output* positions' input windows non-contiguous (each window position's
+4-output-wide group needs input at `2*ow+kw` for `ow=ow0..ow0+3`, a stride-2 gapped read, not a
+contiguous load), the same deinterleave complexity the original blocker flagged -- avoided
+deliberately here in favor of landing a correct, real, already-faster-than-TVM result first.
 
 ## Removing TVM as a transport dependency
 
@@ -870,6 +928,13 @@ when candidates differ only in raw compute-instruction mix with comparable worki
 - `add_wrapper_template.c` -- a thin TVM PackedFunc ABI shim for `hex_add_kernel.py`'s
   `int32/int32/int32` signature, alongside `wrapper_template.c` (which is hardcoded to the GEMM
   kernels' `uint8/uint8/int32` signature and can't be reused as-is).
+- `hex_maxpool_kernel.py` -- the 3x3/stride=2/pad=1 `maxpool`: unblocked by building on TVM's own
+  reference layout (packed NCHWc, confirmed by inspecting a real compiled graph, not assumed)
+  instead of the plain-NCHW layout that blocked the first attempt. Bit-exact correct and 1.99x
+  faster than stock TVM on real hardware at the real profile shape -- see "`maxpool` unblocked"
+  above.
+- `maxpool_wrapper_template.c` -- a thin TVM PackedFunc ABI shim for `hex_maxpool_kernel.py`'s
+  single-buffer-in `uint8` signature (no second operand, unlike the GEMM/add kernels).
 - `native_transport/` -- a from-scratch, TVM-free FastRPC transport: custom `qaic`-generated
   interface, a native ARM64 client using only `libcdsprpc.so`, verified end to end on real
   hardware. See "Removing TVM as a transport dependency" above; `native_transport/build.sh`
