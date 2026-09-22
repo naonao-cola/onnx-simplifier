@@ -390,9 +390,23 @@ generic, shared kernel-optimization machinery no local fix could safely touch --
 real attempts each broke something else), a from-scratch, hand-written `vrmpy` GEMM kernel via
 `tinygrad.Tensor.custom_kernel` (bypassing `Ops.WMMA` entirely).
 
-**Verified correct and measured on real hardware at the exact `cin=64, cout=256 @200x272` shape
-from the ranked profile above: 30.35 GMAC/s, 8.65x faster than stock TVM's hand-tuned `vrmpy`
-schedule (3.51 GMAC/s) at the same shape.** This is the small-channel 1x1-conv gap from the
-"systemic pattern 1" finding above, closed -- not with a TVM schedule fix, but by generating and
-running a real, correct, fast kernel via tinygrad instead.
+**Verified correct and measured on real hardware at five of the small-channel 1x1-conv shapes from
+the ranked profile above** (same kernel code, re-parameterized by shape) -- 2.00x to 8.65x faster
+than stock TVM's hand-tuned `vrmpy` schedule at every one, covering roughly 28% of the *entire*
+backbone's isolated-timing total:
+
+| `cin` | `cout` | spatial | speedup vs. TVM |
+|---:|---:|---|---:|
+| 64 | 256 | 200x272 | 8.65x |
+| 128 | 512 | 100x136 | 6.41x |
+| 64 | 64 | 200x272 | 4.99x |
+| 256 | 64 | 200x272 | 2.39x |
+| 512 | 128 | 100x136 | 2.00x |
+
+This is the small-channel 1x1-conv gap from the "systemic pattern 1" finding above, closed for
+its largest shapes -- not with a TVM schedule fix, but by generating and running a real, correct,
+fast kernel via tinygrad instead. Not yet covered: the one strided 1x1 conv (`stride=2`, needs 2D
+spatial indexing this kernel doesn't yet support) and the tiny RPN/mask-head convs (`cout=12` or
+`3`, not a multiple of the kernel's 32-wide N-tile) -- see
+`scripts/android/tinygrad_hexagon_bridge/README.md` for the details.
 

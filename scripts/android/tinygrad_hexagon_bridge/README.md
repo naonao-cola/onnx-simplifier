@@ -252,13 +252,34 @@ host-side repack of the (static) weight tensor, not something done per-inference
 **Known limitation**: fails when `cout == 32` exactly (a degenerate single-iteration N-tile loop)
 -- not investigated further since it doesn't affect the real target shape (`cout=256`, 8 N-tiles).
 
-This is real evidence the approach itself is sound (it gets *past* both the shape system and the
-UOp spec verifier, further than any of the three `TensorCore`-machinery attempts got before hitting
-their own, different dead ends) -- what's blocking it now is either a genuine tinygrad scheduler bug
-or a kernel-structure choice this investigation hasn't found yet. Picking this back up means
-understanding the linearizer's sibling-range ordering logic well enough to route around it, or
-fixing the underlying scheduler issue upstream (which would also fix it for `amd.py`'s equally
-affected `shufflenet` case, per the comment).
+### Coverage: the other small-channel 1x1 convs in the backbone
+
+`maskrcnn_e2e/profile_data/conv_profile.json` lists every unique conv shape in the backbone. The
+same kernel (just re-parameterized by `cin`/`cout`/`M`, no code changes) was verified correct and
+measured on real hardware against the next four largest small-channel 1x1-conv shapes by
+isolated-timing impact:
+
+| `cin` | `cout` | spatial | stock TVM | `custom_kernel` | speedup | correct |
+|---:|---:|---|---:|---:|---:|---|
+| 64 | 256 | 200x272 | 3.51 GMAC/s | 30.35 GMAC/s | **8.65x** | yes |
+| 128 | 512 | 100x136 | 6.03 GMAC/s | 38.66 GMAC/s | **6.41x** | yes |
+| 64 | 64 | 200x272 | 2.88 GMAC/s | 14.36 GMAC/s | **4.99x** | yes |
+| 256 | 64 | 200x272 | 7.60 GMAC/s | 18.15 GMAC/s | **2.39x** | yes |
+| 512 | 128 | 100x136 | 12.72 GMAC/s | 25.45 GMAC/s | **2.00x** | yes |
+
+All five bit-exact correct, all faster than TVM's hand-tuned schedule. Together they account for
+~2134 ms of the ~7620 ms isolated-timing total from the original ranked profile -- **about 28% of
+the entire backbone's isolated-timing sum**, from five kernel invocations of the same
+`hex_gemm_kernel.py` code with different shape parameters.
+
+**Not yet covered**:
+- `cin=256, cout=128, stride=2` (82.9 ms): a strided 1x1 conv (output spatial is half the input in
+  each dimension) needs 2D spatial indexing into `A` (skip every other row/column), not the flat
+  contiguous-`M` indexing this kernel assumes. A real but bounded extension, not attempted here.
+- The RPN/mask head convs with `cout=12` or `cout=3` (roughly 14 ms combined, spread across several
+  small shapes): `cout` isn't a multiple of 32, so `hex_gemm_kernel.py`'s N-tile loop doesn't apply
+  as-is. Would need either zero-padding `cout` up to 32 (wasting most of a `vrmpy` lane) or a
+  genuinely narrower reduction primitive. Low absolute impact; not attempted.
 
 ## Files
 
