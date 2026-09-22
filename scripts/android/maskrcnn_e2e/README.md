@@ -373,3 +373,18 @@ real fix would swap the loop order so a cache-sized spatial tile is fully proces
 `oc_chunk`s before advancing (genuine cache blocking) -- that's a schedule rewrite, not a
 parameter tweak, and wasn't attempted this session.
 
+A hand-written TVM cache-blocking schedule was also attempted directly for this bug (make the
+spatial tile the parallel task instead of `oc_chunk`): the reorder logic checks out bit-exact on
+host CPU (with and without tensorize, at multiple channel counts), but produces both wrong and
+slower results specifically on real Hexagon hardware, in a way not yet root-caused -- likely a
+`vrmpy` tensorize/reduction-accumulation interaction specific to the relocated `oc_chunk`/`ic_outer`
+loop nesting. Not landed.
+
+## Follow-up: bridging tinygrad's Hexagon codegen onto real hardware
+
+Asked to eliminate the 1x1-conv finding above using tinygrad instead. Full writeup, including a
+real, working TVM-transport bridge (tinygrad's own DSP driver can't reach this phone's hardware --
+production build, SELinux-blocked) and a genuine new capability added to tinygrad itself (real
+`vrmpy` HVX dot-product codegen, verified correct on real hardware but not yet fast, root cause
+precisely diagnosed) in `scripts/android/tinygrad_hexagon_bridge/README.md`.
+

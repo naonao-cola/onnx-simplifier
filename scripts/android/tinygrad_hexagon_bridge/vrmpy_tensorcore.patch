@@ -1,0 +1,148 @@
+From 8b3c424a647b147108fd0a5dbfa583b2516df7f0 Mon Sep 17 00:00:00 2001
+From: take-cheeze <takechi101010@gmail.com>
+Date: Tue, 22 Sep 2026 15:55:55 +0900
+Subject: [PATCH] dsp: add vrmpy TensorCore support for int8 dot-product on
+ Hexagon HVX
+
+Adds hexagon_v65, a TensorCore declaration for Hexagon's vrmpy instruction
+(V6_vrmpyub_acc_128B / V6_vrmpybusv_acc_128B): D(int32x32) = C(int32x32) +
+dot4(A(u8x4 broadcast scalar), B(u8x128, 32 groups of 4)), one HVX vector
+instruction. This is the first TensorCore in tinygrad with threads=1 -- every
+existing definition (CUDA/AMD/Metal) assumes warp-cooperative execution;
+vrmpy needs none. The swizzle/opts math (local_axes=0 since 2**0==threads,
+all 5 axis-doubling opts for N=32 are "u"-type since M=1 needs none) has no
+existing single-thread precedent to copy from and was derived from
+TensorCore.__post_init__'s assertions directly.
+
+Wires it into DSPRenderer (and MockDSPRenderer, which had its own __init__
+override that silently dropped tensor_cores -- fixed) and adds render_kernel
+support emitting the real HVX builtin.
+
+Also fixes hand_coded_optimizations unconditionally attempting an
+OptOps.LOCAL opt after a successful TC application, uncaught, which crashes
+outright on any backend that has tensor cores but not locals (Hexagon is the
+first such backend); guard it behind renderer.has_local.
+
+Verified: correct under DSP MOCKDSP (qemu) and bit-exact correct on real
+Hexagon v73 hardware (via a TVM-runtime bridge, since tinygrad's own DSP
+backend needs raw /dev/adsprpc-smd access not available on production
+Android builds -- see onnx-simplifier's scripts/android/tinygrad_hexagon_bridge/
+for the harness and full writeup).
+
+KNOWN ISSUE (documented in ops_dsp.py): currently slower than plain scalar
+codegen on real hardware, because devectorizer2's do_stack_wmma
+unconditionally decomposes every WMMA accumulator into per-element scalar
+loads -- correct for every other (per-thread-narrow-fragment) backend, wrong
+for Hexagon's single-thread-wide-vector accumulator, which should stay
+vector-resident across the reduction loop instead of being rebuilt from
+scalars on every accumulate call. Root-caused but not fixed; needs either
+generic devectorizer changes or accumulator layout control in
+postrange.py's _apply_tc_opt, both of which are shared across every backend.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015CoomjWQRvxTX5PVoUYCmJ
+---
+ tinygrad/codegen/opt/heuristic.py |  4 +++-
+ tinygrad/codegen/opt/tc.py        | 15 ++++++++++++++
+ tinygrad/runtime/ops_dsp.py       | 33 ++++++++++++++++++++++++++++---
+ 3 files changed, 48 insertions(+), 4 deletions(-)
+
+diff --git a/tinygrad/codegen/opt/heuristic.py b/tinygrad/codegen/opt/heuristic.py
+index f78dcb2b7..fd7259caf 100644
+--- a/tinygrad/codegen/opt/heuristic.py
++++ b/tinygrad/codegen/opt/heuristic.py
+@@ -36,7 +36,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
+         if szs:
+           # set it to the replaced range
+           rngs[tc_dim] = tk.apply_opt(Opt(OptOps.UPCAST, tk.rngs.index(rngs[tc_dim]), szs[0]))[0]
+-      if (szs := [sz for sz in [4,2] if rngs[0].src[0].divides(sz) is not None]): # attempt to local N
++      # attempt to local N -- only for backends that support locals (e.g. Hexagon's vrmpy tensor core is a
++      # single-instruction, single-thread op with no warp/lane cooperation, so it has no LOCAL axis to use)
++      if tk.ren is not None and tk.ren.has_local and (szs := [sz for sz in [4,2] if rngs[0].src[0].divides(sz) is not None]):
+         tk.apply_opt(Opt(OptOps.LOCAL, tk.rngs.index(rngs[0]), szs[0]))
+       return tk
+ 
+diff --git a/tinygrad/codegen/opt/tc.py b/tinygrad/codegen/opt/tc.py
+index 6d13624a1..faec00e30 100644
+--- a/tinygrad/codegen/opt/tc.py
++++ b/tinygrad/codegen/opt/tc.py
+@@ -180,3 +180,18 @@ metal = [TensorCore(dims=(8,8,8), threads=32, elements_per_thread=(2,2,2), dtype
+            (('l0', 'r0', 'r1', 'l3', 'r2'), ('u0',), ('l1', 'l2', 'l4'))))
+   for di,do in [(dtypes.float,dtypes.float),(dtypes.half,dtypes.float),
+                 (dtypes.half,dtypes.half),(dtypes.bfloat16,dtypes.float),(dtypes.bfloat16,dtypes.bfloat16)]]
++
++# ***** Qualcomm Hexagon HVX *****
++
++# https://developer.qualcomm.com/downloads/hexagon-v66-programmer-s-reference-manual (V6_vrmpyub / V6_vrmpybusv)
++# D (int32x32) = C (int32x32) + dot4(A (uint8x4, broadcast scalar), B (uint8x128, 32 groups of 4))
++# One HVX vector instruction, single-threaded (no warp/lane cooperation -- unlike every other backend's
++# TensorCore, which all assume warp-level thread cooperation): dims=(N,M,K)=(32,1,4), threads=1 means
++# local_axes=0 (2**0 threads), so all 5 axis-doubling opts needed for N=32=2**5 are upcast ("u0") opts,
++# and M=1 needs none. elements_per_thread=(4,128,32): A is the full K=4 reduction (M contributes nothing
++# since M=1), B is all 5 upcast bits x the K=4 reduction (32*4=128), C is all 5 upcast bits (32).
++hexagon_v65 = [TensorCore(dims=(32,1,4), threads=1, elements_per_thread=(4,128,32), dtype_in=di, dtype_out=dtypes.int32,
++  opts=("u0","u0","u0","u0","u0"),
++  swizzle=(((), ('u0','u1','u2','u3','u4'), ('r0','r1')),
++           ((), ('u0','u1','u2','u3','u4'), ('r0','r1'))))
++  for di in [dtypes.uint8, dtypes.int8]]
+diff --git a/tinygrad/runtime/ops_dsp.py b/tinygrad/runtime/ops_dsp.py
+index 0f001ed79..ceca6e733 100644
+--- a/tinygrad/runtime/ops_dsp.py
++++ b/tinygrad/runtime/ops_dsp.py
+@@ -5,7 +5,8 @@ from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program,
+ from tinygrad.dtype import dtypes, AddrSpace
+ from tinygrad.uop.ops import Ops, UOp
+ from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap
+-from tinygrad.renderer.cstyle import ClangRenderer
++from tinygrad.renderer.cstyle import ClangRenderer, wmma_args
++from tinygrad.codegen.opt import tc
+ from tinygrad.runtime.autogen import libc, qcom_dsp
+ if getenv("IOCTL"): import extra.dsp.run # noqa: F401 # pylint: disable=unused-import
+ 
+@@ -24,7 +25,33 @@ class DSPRenderer(ClangRenderer):
+   type_map = { **ClangRenderer.type_map, dtypes.uint64: "unsigned long long", dtypes.int64: "long long" }
+   code_for_op = {k:v for k,v in ClangRenderer.code_for_op.items() if k != Ops.SQRT}
+ 
+-  def __init__(self, target:Target): self.target, self.compiler = target, DSPCompiler()
++  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, DSPCompiler(), tc.hexagon_v65
++
++  # V6_vrmpyub/V6_vrmpybusv (HVX): D(int32x32) = C(int32x32) + dot4(A(u8x4 broadcast scalar), B(u8x128, 32
++  # groups of 4)) in one instruction -- no warp/lane cooperation needed (tensor_cores' threads=1), unlike
++  # every other backend's WMMA. The accumulator-add form always needs a real HVX_Vector C; a plain (not
++  # "_acc") vrmpy variant only exists for the from-zero case, so we always pass C through.
++  #
++  # KNOWN PERFORMANCE ISSUE: correct but currently slower than plain scalar code on real hardware,
++  # because devectorizer2's do_stack_wmma (codegen/__init__.py) unconditionally decomposes every WMMA's
++  # accumulator into per-element scalar loads/stores before rendering -- the right behavior for every
++  # other backend (each GPU thread only ever holds a few scalar elements of a warp-distributed
++  # fragment), but wrong here: Hexagon's "32 elements" is one HVX vector register that a single thread
++  # (threads=1, no warp) processes atomically, and it should stay vector-resident across the reduction
++  # loop instead of being rebuilt from 32 scalar reads on every accumulate call. A real fix needs the
++  # generic devectorizer (or the accumulator's axis-ordering/layout in postrange.py's _apply_tc_opt) to
++  # recognize single-thread/vector-native tensor cores as a distinct case -- out of scope here.
++  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
++    prefix = list(prefix or [])
++    for name, _, dtype_in, dtype_out, _, _, upcast_sizes in wmma_args(uops):
++      dstr_a, dstr_b, dstr_c = (self._render_dtype(dt, sz, AddrSpace.REG) for dt, sz in
++                                 zip([dtype_in, dtype_in, dtype_out], upcast_sizes))
++      builtin = "__builtin_HEXAGON_V6_vrmpyub_acc_128B" if dtype_in == dtypes.uint8 else "__builtin_HEXAGON_V6_vrmpybusv_acc_128B"
++      prefix.append(f"""static inline {dstr_c} __{name}({dstr_a} a, {dstr_b} b, {dstr_c} c) {{
++  unsigned int a_scalar; __builtin_memcpy(&a_scalar, &a, 4);
++  return {builtin}(c, b, a_scalar);
++}}""")
++    return super().render_kernel(function_name, kernel, bufs, uops, prefix)
+ 
+   def _render_defines(self, uops) -> list[str]:
+     return ['''/* DSP boilerplate */ struct dcvs_v2_req { int type; int _pad; _Bool dcvs_enable; char dcvs_option; _Bool set_latency; int latency;
+@@ -259,7 +286,7 @@ static void *mmap2(void *addr, unsigned int length, int prot, int flags, int fd,
+ return (void*)syscall((long)addr, length, prot, flags, fd, offset, 222); }}'''
+ 
+ class MockDSPRenderer(DSPRenderer):
+-  def __init__(self, target:Target): self.target, self.compiler = target, DSPCompiler(mock=True)
++  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, DSPCompiler(mock=True), tc.hexagon_v65
+   def _render_defines(self, uops) -> list[str]: return ClangRenderer._render_defines(self, uops)
+   def _render_entry(self, function_name:str, bufs:list[tuple[str,tuple[UOp,bool]]]) -> str:
+     # https://gpages.juszkiewicz.com.pl/syscalls-table/syscalls.html
+-- 
+2.54.0
+
