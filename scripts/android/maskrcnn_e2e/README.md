@@ -392,21 +392,22 @@ real attempts each broke something else), a from-scratch, hand-written `vrmpy` G
 
 **Verified correct and measured on real hardware at five of the small-channel 1x1-conv shapes from
 the ranked profile above** (same kernel code, re-parameterized by shape) -- 2.00x to 8.65x faster
-than stock TVM's hand-tuned `vrmpy` schedule at every one, covering roughly 28% of the *entire*
-backbone's isolated-timing total:
+than stock TVM's hand-tuned `vrmpy` schedule at every one (including the backbone's one strided
+1x1 conv, via a second kernel variant with real 2D spatial indexing), covering roughly 29% of the
+*entire* backbone's isolated-timing total:
 
-| `cin` | `cout` | spatial | speedup vs. TVM |
-|---:|---:|---|---:|
-| 64 | 256 | 200x272 | 8.65x |
-| 128 | 512 | 100x136 | 6.41x |
-| 64 | 64 | 200x272 | 4.99x |
-| 256 | 64 | 200x272 | 2.39x |
-| 512 | 128 | 100x136 | 2.00x |
+| `cin` | `cout` | spatial | stride | speedup vs. TVM |
+|---:|---:|---|---:|---:|
+| 64 | 256 | 200x272 | 1 | 8.65x |
+| 128 | 512 | 100x136 | 1 | 6.41x |
+| 64 | 64 | 200x272 | 1 | 4.99x |
+| 256 | 128 | 200x272 | 2 | 4.62x |
+| 256 | 64 | 200x272 | 1 | 2.39x |
+| 512 | 128 | 100x136 | 1 | 2.00x |
 
 This is the small-channel 1x1-conv gap from the "systemic pattern 1" finding above, closed for
 its largest shapes -- not with a TVM schedule fix, but by generating and running a real, correct,
-fast kernel via tinygrad instead. Not yet covered: the one strided 1x1 conv (`stride=2`, needs 2D
-spatial indexing this kernel doesn't yet support) and the tiny RPN/mask-head convs (`cout=12` or
+fast kernel via tinygrad instead. Not yet covered: the tiny RPN/mask-head convs (`cout=12` or
 `3`, not a multiple of the kernel's 32-wide N-tile) -- see
 `scripts/android/tinygrad_hexagon_bridge/README.md` for the details.
 

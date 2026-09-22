@@ -267,19 +267,28 @@ isolated-timing impact:
 | 256 | 64 | 200x272 | 7.60 GMAC/s | 18.15 GMAC/s | **2.39x** | yes |
 | 512 | 128 | 100x136 | 12.72 GMAC/s | 25.45 GMAC/s | **2.00x** | yes |
 
-All five bit-exact correct, all faster than TVM's hand-tuned schedule. Together they account for
-~2134 ms of the ~7620 ms isolated-timing total from the original ranked profile -- **about 28% of
-the entire backbone's isolated-timing sum**, from five kernel invocations of the same
-`hex_gemm_kernel.py` code with different shape parameters.
+All five bit-exact correct, all faster than TVM's hand-tuned schedule. Together with the strided
+shape below, they account for ~2217 ms of the ~7620 ms isolated-timing total from the original
+ranked profile -- **about 29% of the entire backbone's isolated-timing sum**, from the same
+`hex_gemm_kernel.py`/`build_strided_kernel()` code, re-parameterized by shape each time.
 
-**Not yet covered**:
-- `cin=256, cout=128, stride=2` (82.9 ms): a strided 1x1 conv (output spatial is half the input in
-  each dimension) needs 2D spatial indexing into `A` (skip every other row/column), not the flat
-  contiguous-`M` indexing this kernel assumes. A real but bounded extension, not attempted here.
-- The RPN/mask head convs with `cout=12` or `cout=3` (roughly 14 ms combined, spread across several
-  small shapes): `cout` isn't a multiple of 32, so `hex_gemm_kernel.py`'s N-tile loop doesn't apply
-  as-is. Would need either zero-padding `cout` up to 32 (wasting most of a `vrmpy` lane) or a
-  genuinely narrower reduction primitive. Low absolute impact; not attempted.
+### Coverage: the strided 1x1 conv
+
+The one strided shape in the profile (`cin=256, cout=128, stride=2 @200x272`, 82.9 ms) needed
+real 2D spatial indexing -- `build_strided_kernel()` in `hex_gemm_kernel.py` takes the flat,
+*unstrided* input (`ih*iw, cin`) and two `(oh, ow)` `WEAK` ranges instead of one flat `M` range,
+computing the strided source row as `(oh*stride)*iw + (ow*stride)` directly in the index
+expression -- no change to the accumulate/vrmpy step at all, only to how `A`'s address is
+computed. Correct on the first attempt (qemu and real hardware), no new bugs:
+
+| `cin` | `cout` | spatial | stride | stock TVM | `custom_kernel` | speedup |
+|---:|---:|---|---:|---:|---:|---:|
+| 256 | 128 | 200x272 | 2 | 5.38 GMAC/s | 24.86 GMAC/s | **4.62x** |
+
+**Not yet covered**: the RPN/mask head convs with `cout=12` or `cout=3` (roughly 14 ms combined,
+spread across several small shapes) -- `cout` isn't a multiple of 32, so the N-tile loop doesn't
+apply as-is. Would need either zero-padding `cout` up to 32 (wasting most of a `vrmpy` lane) or a
+genuinely narrower reduction primitive. Low absolute impact; not attempted.
 
 ## Files
 
