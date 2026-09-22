@@ -1446,6 +1446,57 @@ sizes, blocking, working-set-sensitive reduction orders); `MOCKDSP=1` remains th
 (no real hexagon-clang/hexagon-sim round trip) when only correctness verification is needed, or
 when candidates differ only in raw compute-instruction mix with comparable working sets.
 
+## RoiAlign, Stage 1: yes, data-dependent addressing is expressible -- no, it isn't fast yet
+
+`dynamic_ops_survey.md` (PR #1813) ranked `RoiAlign` the second most tractable of the four
+dynamic-shape ops in Mask R-CNN's "rest" graph, but flagged a genuine open question first: can
+this project's tinygrad/`custom_kernel` machinery express **data-dependent source addressing** at
+all -- every RoI's bilinear-sample feature-map location depends on that RoI's own runtime box
+coordinates, unlike every kernel built so far (`hex_gemm_kernel.py` through
+`hex_boxhead_gemm_kernel.py`), which all read from a compile-time-known, purely shape-derived
+address pattern.
+
+**Answer: yes**, and it needed no new UOp/`Ops` capability -- `Tensor.gather(dim, index)`
+(`tinygrad/mixin/op.py`) already exists as a first-class, backend-agnostic Tensor op. `hex_roialign_kernel.py`'s
+`roi_align_tensor()` rebuilds `scripts/android/maskrcnn_e2e/tinygrad_ops.py`'s exact NumPy
+`roi_align()` reference (avg pooling, `sampling_ratio=2`, matching this model's real RoiAlign node
+attributes) as `Tensor` composition, using `.gather()` for the four data-dependent bilinear-tap
+reads. Verified correct two ways against that same NumPy reference:
+
+| Path | max abs err |
+|---|---:|
+| Default device | 5.90e-06 |
+| `DEV=DSP MOCKDSP=1` (real `--target=hexagon` compile, `qemu-hexagon-static` execution) | 1.53e-05 |
+
+The second row is the one that mattered for this task -- it confirms the actual Hexagon-targeted
+compile+execute path handles this, not just tinygrad's generic default device. One real bug hit
+getting there, the same class `sigmoid` already established: the bilinear weight arrays are plain
+`np.arange`-derived arithmetic, which defaults to `float64` -- feeding that straight to `Tensor(...)`
+pulled in `__hexagon_muldf3`/`__hexagon_adddf3` (double-precision compiler-rt symbols, a different,
+larger set than the single-precision ones `sigmoid`'s `libgcc.a` fix covers), missing from the
+freestanding link. Fixed with an explicit `.astype(np.float32)` -- a bug in this file's own
+arithmetic, not a Hexagon/tinygrad limitation.
+
+**What this does not establish: speed.** `Tensor.gather()`'s real implementation
+(`index.unsqueeze(-1)._one_hot_along_dim(self.shape[dim]).where(x, 0)).sum(-1)`, read directly from
+`tinygrad/mixin/op.py`) is a **dense one-hot-mask-and-reduce over the whole gathered dimension**,
+not a genuine indirect/sparse load -- O(H*W) work per gathered pixel, not O(1). At real box-head
+scale (a ~200x272 feature map, 4 taps x 49 positions per ROI, up to 1000 ROIs) this would be
+enormously wasteful. A fast kernel needs real HVX indexed-load hardware -- confirmed present and
+compiler-accessible on this exact toolchain, not assumed: `__builtin_HEXAGON_V6_vgathermh_128B`
+(HVX vector gather) and `__builtin_HEXAGON_V6_vlutvvb_128B` (HVX vector lookup-table) both compile
+cleanly against `hexagon-clang -mcpu=hexagonv73 -mhvx=v73`. The concrete next step: a hand-written
+`custom_kernel` around one of those, with each RoI's sample addresses + bilinear weights computed
+host-side (cheap scalar arithmetic, per the survey's own hybrid-split design) and fed to the
+HVX-native instruction inside the kernel, padded to a compile-time-max ROI count the same way
+`hex_gemm_kernel.py`'s tiny-`cout` coverage and `hex_stem7x7_kernel.py`'s `cin=3` padding already
+established for a fixed-upper-bound trick.
+
+**Not done**: real hardware (this stayed at `MOCKDSP=1`/qemu correctness, matching the survey's own
+explicit permission for a correctness-only Stage-1 result); batching over more than one ROI
+(single-ROI correctness was this pass's whole scope); the HVX-native `vgather`/`vlutvvb` kernel
+itself.
+
 ## Files
 
 - `capture_kernel.py` -- capture tinygrad's rendered Hexagon C for a shape, verified under qemu.
@@ -1540,3 +1591,9 @@ when candidates differ only in raw compute-instruction mix with comparable worki
   shape ops in Mask R-CNN's `rest.onnx` (proposal decode, TopK, NonMaxSuppression, RoiAlign) could
   be ported to hand-written HVX kernels, with real shapes/dtypes/constants pulled from the actual
   graph and a ranked, honest difficulty assessment per op.
+- `hex_roialign_kernel.py` -- Stage 1 of `RoiAlign` (the "beyond the backbone" survey's
+  second-ranked target): confirms data-dependent source addressing is expressible via tinygrad's
+  existing `Tensor.gather()` (no new UOp capability needed) and runs correctly through the real
+  `DEV=DSP MOCKDSP=1` compile+qemu path, not just the default device. Correctness only -- the
+  generic `.gather()` lowers to a dense one-hot-mask-and-reduce, not real HVX indexed addressing;
+  see "RoiAlign, Stage 1" above for the concrete `vgathermh`/`vlutvvb`-based next step.
