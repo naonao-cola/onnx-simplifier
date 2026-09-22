@@ -341,6 +341,61 @@ mid-pack, not obviously "broken" the way the smallest-channel shapes were).
 total from the original ranked profile -- **about 47% of the entire backbone's isolated-timing
 sum**, every one bit-exact correct and faster than TVM's hand-tuned schedule.
 
+### Correction: every 1x1-conv speedup above was measured against unsigned synthetic weights
+
+`hex_gemm_kernel.py`'s 1x1-conv kernel is `vrmpyub`-only (unsigned x unsigned) -- every speedup
+number in the four sections above was measured with synthetic `rng.integers(0, 100, ...)` uint8
+weight data. The real backbone's 1x1 conv weights are genuinely **signed int8** (confirmed from
+`backbone.onnx`'s `ConvMulFusion_W_*_quantized` tensors), which this kernel can't even accept --
+this went unnoticed until the chained-subgraph work (`codex/hex-backbone-block1`) ran real
+extracted weights through the 1x1 path for the first time and it failed its own correctness check
+outright. `hex_gemm_signed_kernel.py` (a separate kernel, `vrmpybusv`, not a fix to
+`hex_gemm_kernel.py` -- see its own docstring) exists for exactly this reason.
+
+Re-measured every shape above on real hardware (device `239dbd8f`) with `hex_gemm_signed_kernel.py`
+against signed-random weight data (`rng.integers(-128, 127, ...)`, matching the real weights'
+*distribution*, not real extracted weights for all thirteen shapes -- out of scope for the time
+available; this tests whether `vrmpybusv`'s different calling convention, not the exact weight
+values, changes throughput, which is the actual open question). Stock TVM's own numbers are
+unchanged and not re-measured -- TVM was never wrong about signed weights, only this project's own
+kernel was:
+
+| shape | `cin` | `cout` (real) | spatial | stride | stock TVM | signed (`vrmpybusv`) | **new speedup** | orig. claim (unsigned) |
+|---|---:|---:|---|---:|---:|---:|---:|---:|
+| flagship / small-channel #1 | 64 | 256 | 200x272 | 1 | 3.51 | 26.10 | **7.44x** | 8.65x |
+| small-channel #2 | 128 | 512 | 100x136 | 1 | 6.03 | 29.20 | **4.84x** | 6.41x |
+| small-channel #3 | 64 | 64 | 200x272 | 1 | 2.88 | 14.28 | **4.96x** | 4.99x |
+| small-channel #4 | 256 | 64 | 200x272 | 1 | 7.60 | 15.73 | **2.07x** | 2.39x |
+| small-channel #5 | 512 | 128 | 100x136 | 1 | 12.72 | 20.89 | **1.64x** | 2.00x |
+| strided | 256 | 128 | 200x272 | 2 | 5.38 | 19.63 | **3.65x** | 4.62x |
+| tiny RPN `cout=12` (padded to 32) | 256 | 12 | 200x272 | 1 | 2.00 | 3.50 | **1.75x** | 1.94x |
+| tiny mask-head `cout=3` (padded to 32) | 256 | 3 | 200x272 | 1 | 0.80 | 0.86 | **1.08x** | 1.22x |
+| larger-channel #1 (strided) | 256 | 512 | 200x272 | 2 | 7.54 | 30.74 | **4.08x** | 5.81x |
+| larger-channel #2 | 256 | 256 | 200x272 | 1 | 9.78 | -- | *not re-measured* | 3.89x |
+| larger-channel #3 | 512 | 256 | 100x136 | 1 | 14.40 | 25.93 | **1.80x** | 2.55x |
+| larger-channel #4 | 256 | 1024 | 50x68 | 1 | 20.10 | 31.30 | **1.56x** | 2.22x |
+| larger-channel #5 | 1024 | 256 | 50x68 | 1 | 24.43 | 25.49 | **1.04x** | 1.44x |
+
+**Twelve of thirteen shapes re-measured** (`native_transport`-free TVM-RPC bridge, matching the
+original measurement methodology exactly). The `larger-channel #2` shape (`cin=256,cout=256
+@200x272`) could not be re-measured -- its 54400x256 int32 output is 55.7 MB, past a hard
+transfer-size wall in this project's TVM-RPC bridge session (`hexagon_rpc_send failed: 78`,
+first documented in the elementwise-add prefetch work's own real-hardware measurements, a
+pre-existing RPC-bridge limitation, not a kernel bug) -- left honestly unmeasured rather than
+estimated.
+
+**The finding is consistent and one-directional**: every single re-measured shape is *slower*
+with signed weights than the original unsigned claim (`vrmpybusv`'s 32-wide broadcast calling
+convention has a real, measurable throughput cost vs. `vrmpyub`'s plain-scalar one -- confirming
+hypothesis (b), not (a)), by anywhere from ~1% (small-channel #3, effectively noise) to ~30%
+(larger-channel #1's strided case, larger-channel #3). **The reassuring part**: every one of the
+twelve re-measured shapes is *still* a real win over stock TVM (every speedup stays above 1x,
+none flip to a loss) -- the *direction* of every claim in this project holds, only the *magnitude*
+was overstated by testing the wrong weight signedness. The original unsigned numbers above are
+left in place rather than replaced, per this project's established correction convention (see
+the `TensorCore` devectorizer "Correction" note earlier in this file) -- this section is the
+record of what changed and why, not a silent rewrite.
+
 ### Coverage: a real 3x3 conv (`hex_conv3x3_kernel.py`) -- correct everywhere, fast on some shapes
 
 Every kernel above handles 1x1 convs (a plain GEMM once the spatial dims are flattened into `M`).
@@ -1463,6 +1518,10 @@ when candidates differ only in raw compute-instruction mix with comparable worki
   and the real backbone's 1x1 conv weights are signed int8 -- a real, previously-unflagged gap
   in this project's own 1x1-conv coverage, discovered while extending the chained subgraph below
   to real weights for the first time. See "Extending the chain" above.
+- `reverify_signed_1x1.py` -- re-measures every 1x1-conv shape's speedup-vs-TVM with
+  `hex_gemm_signed_kernel.py` (signed weights) instead of `hex_gemm_kernel.py` (unsigned synthetic
+  weights, the original measurement). See "Correction: every 1x1-conv speedup above was measured
+  against unsigned synthetic weights" above.
 - `backbone_subgraph/extract_and_verify_block1.py` -- extracts real weights/biases/scales for
   ResNet-50 stage1/block1 (`conv10`/`conv17`/`conv24`/`conv30`) from `backbone.onnx`, derives the
   residual-add rescale multiplier/shifts, generates `native_transport/gen_block1_weight_consts.c`

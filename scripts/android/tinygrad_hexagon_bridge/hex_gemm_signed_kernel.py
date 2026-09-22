@@ -72,3 +72,51 @@ def build_kernel(cin: int, cout: int, m: int, a, bp, kernel_name: str = "hex_gem
 
     c = Tensor.empty(m, cout, dtype="int32", device="DSP")
     return Tensor.custom_kernel(c, a, bp, fxn=functools.partial(kernel_fn))[0]
+
+
+def build_strided_kernel(cin: int, cout: int, ih: int, iw: int, stride: int, a, bp, kernel_name: str = "hex_gemm_signed_strided"):
+    """Signed-weight (vrmpybusv) counterpart to hex_gemm_kernel.build_strided_kernel() -- same
+    (oh, ow) 2D spatial indexing for a strided 1x1 conv, same vrmpyub->vrmpybusv swap as
+    build_kernel() above (broadcast32 activation, weight as the vector operand, operand order
+    swapped)."""
+    from tinygrad import Tensor, UOp
+    from tinygrad.dtype import AddrSpace, dtypes
+    from tinygrad.uop.ops import AxisType, KernelInfo, Ops
+
+    assert cin % 4 == 0 and cout % 32 == 0
+    oh_count, ow_count = ih // stride, iw // stride
+    nt_count, kc_count = cout // 32, cin // 4
+    i32x32 = "int __attribute__((vector_size(128)))"
+    u8x128 = "unsigned char __attribute__((vector_size(128)))"
+    broadcast32 = ",".join(["*(unsigned int*){2}"] * 32)
+
+    def _reg_i32(shape, slot, *deps):
+        ret = UOp.placeholder(shape, dtypes.int32, slot=slot, addrspace=AddrSpace.REG)
+        return ret.after((ret.after(*deps) if deps else ret).store(ret.const_like(0)))
+
+    def kernel_fn(C: UOp, A: UOp, Bp: UOp) -> UOp:
+        oh_rng = UOp.range(oh_count, 0, AxisType.WEAK)
+        ow_rng = UOp.range(ow_count, 1, AxisType.WEAK)
+        nt_rng = UOp.range(nt_count, 2, AxisType.WEAK)
+        acc = _reg_i32((32,), 0, oh_rng, ow_rng, nt_rng)
+        kc_rng = UOp.range(kc_count, 3, AxisType.REDUCE)
+        acc_addr = acc.after(kc_rng)[0]
+        flat_row = (oh_rng * stride) * iw + (ow_rng * stride)
+        a_idx = A[flat_row, kc_rng * 4]
+        b_idx = Bp[nt_rng, kc_rng, 0]
+        step = UOp(
+            Ops.CUSTOM, dtypes.void, (acc_addr, b_idx, a_idx),
+            arg=(f"*({i32x32}*){{0}} = __builtin_HEXAGON_V6_vrmpybusv_acc_128B("
+                 f"*({i32x32}*){{0}}, ({i32x32}){{{{{broadcast32}}}}}, *({u8x128}*){{1}});"),
+        )
+        update = step.end(kc_rng)
+        final_addr = acc.after(update)[0]
+        out_row = oh_rng * ow_count + ow_rng
+        out_step = UOp(
+            Ops.CUSTOM, dtypes.void, (C[out_row, nt_rng * 32], final_addr),
+            arg=f"*({i32x32}*){{0}} = *({i32x32}*){{1}};",
+        )
+        return out_step.end(nt_rng, ow_rng, oh_rng).sink(arg=KernelInfo(name=kernel_name, opts_to_apply=()))
+
+    c = Tensor.empty(oh_count * ow_count, cout, dtype="int32", device="DSP")
+    return Tensor.custom_kernel(c, a, bp, fxn=functools.partial(kernel_fn))[0]
