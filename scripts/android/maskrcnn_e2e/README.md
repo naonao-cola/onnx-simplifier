@@ -380,11 +380,34 @@ slower results specifically on real Hexagon hardware, in a way not yet root-caus
 `vrmpy` tensorize/reduction-accumulation interaction specific to the relocated `oc_chunk`/`ic_outer`
 loop nesting. Not landed.
 
-## Follow-up: bridging tinygrad's Hexagon codegen onto real hardware
+## Follow-up: bridging tinygrad's Hexagon codegen onto real hardware -- and fixing the 1x1-conv gap
 
-Asked to eliminate the 1x1-conv finding above using tinygrad instead. Full writeup, including a
-real, working TVM-transport bridge (tinygrad's own DSP driver can't reach this phone's hardware --
-production build, SELinux-blocked) and a genuine new capability added to tinygrad itself (real
-`vrmpy` HVX dot-product codegen, verified correct on real hardware but not yet fast, root cause
-precisely diagnosed) in `scripts/android/tinygrad_hexagon_bridge/README.md`.
+Asked to eliminate the 1x1-conv finding above using tinygrad instead. Full writeup in
+`scripts/android/tinygrad_hexagon_bridge/README.md`, including a real, working TVM-transport
+bridge (tinygrad's own DSP driver can't reach this phone's hardware -- production build,
+SELinux-blocked) and, after `Ops.WMMA`/`TensorCore` turned out to be a dead end (entangled with
+generic, shared kernel-optimization machinery no local fix could safely touch -- three separate,
+real attempts each broke something else), a from-scratch, hand-written `vrmpy` GEMM kernel via
+`tinygrad.Tensor.custom_kernel` (bypassing `Ops.WMMA` entirely).
+
+**Verified correct and measured on real hardware at five of the small-channel 1x1-conv shapes from
+the ranked profile above** (same kernel code, re-parameterized by shape) -- 2.00x to 8.65x faster
+than stock TVM's hand-tuned `vrmpy` schedule at every one (including the backbone's one strided
+1x1 conv, via a second kernel variant with real 2D spatial indexing), covering roughly 29% of the
+*entire* backbone's isolated-timing total:
+
+| `cin` | `cout` | spatial | stride | speedup vs. TVM |
+|---:|---:|---|---:|---:|
+| 64 | 256 | 200x272 | 1 | 8.65x |
+| 128 | 512 | 100x136 | 1 | 6.41x |
+| 64 | 64 | 200x272 | 1 | 4.99x |
+| 256 | 128 | 200x272 | 2 | 4.62x |
+| 256 | 64 | 200x272 | 1 | 2.39x |
+| 512 | 128 | 100x136 | 1 | 2.00x |
+
+This is the small-channel 1x1-conv gap from the "systemic pattern 1" finding above, closed for
+its largest shapes -- not with a TVM schedule fix, but by generating and running a real, correct,
+fast kernel via tinygrad instead. Not yet covered: the tiny RPN/mask-head convs (`cout=12` or
+`3`, not a multiple of the kernel's 32-wide N-tile) -- see
+`scripts/android/tinygrad_hexagon_bridge/README.md` for the details.
 
