@@ -1,0 +1,233 @@
+"""onnxsim RPC client: a TVM-shaped session API for running ONNX models on a remote device.
+
+::
+
+    import onnxsim.rpc as rpc
+
+    remote = rpc.connect("127.0.0.1", 9090, key="pixel")     # or rpc.connect_tracker(...).request(key)
+    remote.upload("model.onnx")                               # like tvm.rpc session.upload
+    model = remote.load_model("model.onnx")                   # like session.load_module
+    outputs = model.run({"x": x})
+    timing = model.time_evaluator({"x": x}, number=5, repeat=3)   # like module.time_evaluator
+    print(timing.median * 1e3, "ms")
+
+    with rpc.remote_executor(remote):                         # fold constants on the device
+        simplified, ok = onnxsim.simplify(model_proto)
+"""
+
+from __future__ import annotations
+
+import os
+import socket
+import statistics
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+
+import numpy as np
+import onnx
+
+from . import _protocol as proto
+from ._protocol import RPCError
+
+ModelLike = Union[str, os.PathLike, bytes, onnx.ModelProto]
+
+
+@dataclass
+class ProfileResult:
+    """Per-call times in seconds (each entry is the mean of ``number`` runs), like TVM's."""
+
+    results: List[float]
+
+    @property
+    def mean(self) -> float:
+        return statistics.fmean(self.results)
+
+    @property
+    def median(self) -> float:
+        return statistics.median(self.results)
+
+    @property
+    def min(self) -> float:
+        return min(self.results)
+
+    @property
+    def max(self) -> float:
+        return max(self.results)
+
+    @property
+    def std(self) -> float:
+        return statistics.pstdev(self.results) if len(self.results) > 1 else 0.0
+
+
+def _model_bytes(model: ModelLike) -> bytes:
+    if isinstance(model, bytes):
+        return model
+    if isinstance(model, onnx.ModelProto):
+        return model.SerializeToString()
+    with open(model, "rb") as f:
+        return f.read()
+
+
+class RemoteModel:
+    """A model loaded on the server; keeps its onnxruntime session alive between calls."""
+
+    def __init__(self, session: "Session", handle: int):
+        self._session, self.handle = session, handle
+
+    def run(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        specs, blobs = proto.encode_tensors(inputs)
+        reply, out = self._session._call(
+            {"op": "run", "handle": self.handle, "tensors": specs}, blobs
+        )
+        return proto.decode_tensors(reply["tensors"], out)
+
+    def time_evaluator(
+        self, inputs: Dict[str, np.ndarray], number: int = 1, repeat: int = 3
+    ) -> ProfileResult:
+        """Time ``session.run`` on the device only: transfers and session creation are excluded."""
+        specs, blobs = proto.encode_tensors(inputs)
+        reply, _ = self._session._call(
+            {
+                "op": "time",
+                "handle": self.handle,
+                "tensors": specs,
+                "number": number,
+                "repeat": repeat,
+            },
+            blobs,
+        )
+        return ProfileResult(list(reply["results"]))
+
+    def close(self) -> None:
+        self._session._call({"op": "unload", "handle": self.handle})
+
+
+class Session:
+    def __init__(self, sock: socket.socket, info: Dict[str, Any]):
+        self._sock, self.info = sock, info
+
+    def _call(self, header: Dict[str, Any], blobs: Sequence[bytes] = ()):
+        proto.send_message(self._sock, header, blobs)
+        reply, out = proto.recv_message(self._sock)
+        if not reply.get("ok"):
+            raise RPCError(reply.get("error", "remote error"))
+        return reply, out
+
+    def upload(
+        self, data: Union[str, os.PathLike, bytes], name: Optional[str] = None
+    ) -> str:
+        """Copy a file (or bytes) into the server's workspace; returns its remote name."""
+        if isinstance(data, bytes):
+            if name is None:
+                raise ValueError("uploading raw bytes needs a name")
+            payload = data
+        else:
+            with open(data, "rb") as f:
+                payload = f.read()
+            name = name or os.path.basename(os.fspath(data))
+        reply, _ = self._call({"op": "upload", "name": name}, [payload])
+        return reply["name"]
+
+    def load_model(
+        self,
+        model: ModelLike,
+        providers: Optional[Sequence[str]] = None,
+        single_threaded: bool = False,
+    ) -> RemoteModel:
+        """Load a model on the server: an uploaded file name, a path, bytes or a ``ModelProto``."""
+        header: Dict[str, Any] = {
+            "op": "load_model",
+            "single_threaded": single_threaded,
+        }
+        if providers:
+            header["providers"] = list(providers)
+        if isinstance(model, str) and not os.path.exists(model):
+            header["name"] = model  # a name previously passed to upload()
+            reply, _ = self._call(header)
+        else:
+            reply, _ = self._call(header, [_model_bytes(model)])
+        return RemoteModel(self, reply["handle"])
+
+    def run(
+        self,
+        model: ModelLike,
+        inputs: Dict[str, np.ndarray],
+        providers: Optional[Sequence[str]] = None,
+    ) -> Dict[str, np.ndarray]:
+        """One-shot: send the model with its inputs, get the outputs (no handle kept)."""
+        specs, blobs = proto.encode_tensors(inputs)
+        header: Dict[str, Any] = {"op": "run_once", "tensors": specs}
+        if providers:
+            header["providers"] = list(providers)
+        reply, out = self._call(header, [_model_bytes(model), *blobs])
+        return proto.decode_tensors(reply["tensors"], out)
+
+    def executor(self, providers: Optional[Sequence[str]] = None):
+        from .executor import RemoteModelExecutor
+
+        return RemoteModelExecutor(self, providers)
+
+    def close(self) -> None:
+        try:
+            self._call({"op": "close"})
+        except (OSError, RPCError):
+            pass
+        self._sock.close()
+
+    def __enter__(self) -> "Session":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def connect(host: str, port: int, key: str = "", timeout: float = 30.0) -> Session:
+    """Connect to a server; ``key`` must match the server's key if it has one."""
+    sock = socket.create_connection((host, port), timeout=timeout)
+    sock.settimeout(None)
+    proto.send_message(sock, {"op": "hello", "key": key, "client": "onnxsim"})
+    reply, _ = proto.recv_message(sock)
+    if not reply.get("ok"):
+        sock.close()
+        raise RPCError(reply.get("error", "handshake failed"))
+    return Session(sock, reply["info"])
+
+
+class TrackerClient:
+    def __init__(self, host: str, port: int, timeout: float = 30.0):
+        self._addr, self._timeout = (host, port), timeout
+
+    def _ask(self, header: Dict[str, Any]) -> Dict[str, Any]:
+        with socket.create_connection(self._addr, timeout=self._timeout) as sock:
+            proto.send_message(sock, header)
+            reply, _ = proto.recv_message(sock)
+        if not reply.get("ok"):
+            raise RPCError(reply.get("error", "tracker error"))
+        return reply
+
+    def summary(self) -> Dict[str, List[Tuple[str, int]]]:
+        return self._ask({"op": "summary"})["servers"]
+
+    def request(self, key: str, timeout: float = 30.0) -> Session:
+        host, port = self._ask({"op": "request", "key": key})["addr"]
+        return connect(host, port, key=key, timeout=timeout)
+
+
+def connect_tracker(host: str, port: int, timeout: float = 30.0) -> TrackerClient:
+    return TrackerClient(host, port, timeout)
+
+
+@contextmanager
+def remote_executor(
+    session: Session, providers: Optional[Sequence[str]] = None
+) -> Iterator[Any]:
+    """Make ``onnxsim.simplify`` (and friends) evaluate constant-folding sub-models remotely."""
+    from onnxsim import onnx_simplifier
+
+    executor = session.executor(providers)
+    token = onnx_simplifier._executor_override.set(executor)
+    try:
+        yield executor
+    finally:
+        onnx_simplifier._executor_override.reset(token)

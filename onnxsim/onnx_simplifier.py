@@ -1,4 +1,5 @@
 import argparse
+import contextvars
 import copy
 import os
 import re
@@ -9383,6 +9384,12 @@ class _GraphRewriterAdapter(C.GraphRewriter):
 _model_executor: Optional[PyModelExecutor] = None
 
 
+# Set by ``onnxsim.rpc.remote_executor`` so constant folding can run on a remote device.
+_executor_override: contextvars.ContextVar[Optional[C.ModelExecutor]] = (
+    contextvars.ContextVar("onnxsim_executor_override", default=None)
+)
+
+
 def _get_model_executor(
     providers: Optional[Sequence[backend.Provider]] = None,
 ) -> PyModelExecutor:
@@ -9394,6 +9401,9 @@ def _get_model_executor(
     so a later call asking for a different provider set gets a fresh executor
     rather than silently keeping the previous one.
     """
+    override = _executor_override.get()
+    if override is not None:
+        return override
     global _model_executor
     if _model_executor is None or _model_executor.providers != providers:
         _model_executor = PyModelExecutor(providers)
