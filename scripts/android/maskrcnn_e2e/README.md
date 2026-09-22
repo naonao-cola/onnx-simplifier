@@ -92,3 +92,53 @@ fp32 did not finish in 27 minutes (untuned scalar-ish schedules for ~160 GMAC).
     fails on this DSP, see `../relink_hexagon_skel_static_libcxx.sh`), and the session helper
     bug above; a real app would use AOT/FastRPC packaging instead of the RPC server.
   - **Accuracy sign-off.** Six images vs. the reference model, not a COCO evaluation.
+
+## The same model in tinygrad
+
+tinygrad 0.14 (`pip install tinygrad`) loads the whole graph from ONNX in about 5 s (Relay needs
+~10 minutes) and implements 41 of the model's 43 operator types out of the box; TVM's Relax
+frontend lacks 11. `tinygrad_ops.py` adds the two missing ones, `NonMaxSuppression` (85 nodes)
+and `RoiAlign` (8), on NumPy, plus a guard for zero-size `ScatterElements` (an FPN level that
+received no RoIs). `tinygrad_eval.py` runs everything, backbone included, in tinygrad:
+
+```bash
+DEV=NV python tinygrad_eval.py --workdir work --model <MaskRCNN-12-qdq.onnx> --images ...
+```
+
+- **Correctness of the added operators.** Feeding ONNX Runtime's backbone features into the
+  remainder graph in tinygrad reproduces ONNX Runtime's remainder output: labels exactly, box
+  coordinates within 1.2e-4, scores within 3.6e-7 (`--rest-only`).
+- **Full model on an RTX 5050 (NV backend), same six images** (QDQ emulated in fp32 by the
+  frontend): 57 of 61 reference detections matched (93%), mean box IoU ~0.96, mean score
+  difference ~0.01, mean mask IoU ~0.92, i.e. on par with the TVM int8 DSP pipeline above
+  (58/61, ~0.93). It is slow, 72-160 s per image: an op-by-op Python interpreter, NumPy NMS and
+  RoiAlign, and per-image kernel compilation.
+- **One tinygrad quirk.** `OnnxRunner` caches Python constants across calls, which goes stale
+  when shapes are data-dependent (the second image raised a shape mismatch), so the script builds
+  a fresh runner per image.
+
+### tinygrad's Hexagon path
+
+`tinygrad_dsp_qemu.py` drives tinygrad's Hexagon renderer through its mock mode (clang
+`--target=hexagon -mcpu=hexagonv65 -mhvx=v65`, executed under `qemu-hexagon-static`):
+
+| Convolution (fp32) | max abs error vs NumPy | instructions per MAC |
+|---|---:|---:|
+| 1x1 64->64 @28x28 | 5.8e-7 | 3.2 |
+| 3x3 64->64 @14x14 | 4.3e-6 | 4.7 |
+| 3x3 128->128 @14x14 | 1.1e-5 | 4.0 |
+
+Numerically correct, but the default schedule emits a single-thread scalar accumulator loop per
+output element (no output-channel vectorization, no int8/`vrmpy`, no qfloat), about 16x the
+instructions a vectorized HVX kernel needs. And it cannot reach this phone's DSP: tinygrad's
+runtime opens `/dev/ion` and `/dev/adsprpc-smd` directly, which the ADB shell is denied (TVM's
+RPC path works because libadsprpc opens the device through the HAL). Running tinygrad kernels on
+the phone would need a FastRPC bridge, and competitive speed would need renderer work (HVX vector
+accumulators with qfloat/`vrmpy`, multiple hardware threads), the same ground the TVM pass in
+`../hexagon_qfloat.py` covers.
+
+**Where that leaves the two stacks.** tinygrad has the better frontend and a robust
+op-at-a-time execution model (a clear `NotImplementedError` per missing operator, no
+whole-graph compiler to crash), and a QEMU test path that works out of the box. TVM has the
+working int8 Hexagon backend. A practical combination is tinygrad as the graph executor
+and correctness reference, with TVM-compiled Hexagon kernels behind it.
