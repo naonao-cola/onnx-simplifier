@@ -15,6 +15,11 @@
 #define GEMM_B_PATH "/data/local/tmp/native_transport/gemm_bp.bin"
 #define GEMM_C_PATH "/data/local/tmp/native_transport/gemm_c_out.bin"
 
+#define REQUANT_A_LEN 8000000
+#define REQUANT_C_LEN 2000000
+#define REQUANT_A_PATH "/data/local/tmp/native_transport/requant_a.bin"
+#define REQUANT_C_PATH "/data/local/tmp/native_transport/requant_c_out.bin"
+
 static unsigned char* read_file_exact(const char* path, int expect_len) {
   FILE* f = fopen(path, "rb");
   if (!f) return NULL;
@@ -80,6 +85,27 @@ int main(int argc, char** argv) {
   }
   free(ga);
   free(gb);
+
+  /* Real hex_requantize_kernel.py-generated requantize, n=2,000,000 (a real-scale, RPC-safe
+   * slice of the stem conv's output) -- only runs if gen_requantize_test_data.py's output was
+   * pushed first; skipped gracefully otherwise. */
+  unsigned char* ra = read_file_exact(REQUANT_A_PATH, REQUANT_A_LEN);
+  if (ra) {
+    unsigned char* rc_out = malloc(REQUANT_C_LEN);
+    printf("running real hex_requantize kernel (n=2000000)...\n");
+    int rrc = mini_rpc_run_kernel(h, ra, REQUANT_A_LEN, ra, 0, rc_out, REQUANT_C_LEN);
+    printf("run_requantize_kernel rc=%d\n", rrc);
+    if (rrc == 0) {
+      FILE* out = fopen(REQUANT_C_PATH, "wb");
+      fwrite(rc_out, 1, REQUANT_C_LEN, out);
+      fclose(out);
+      printf("wrote %s (%d bytes) -- verify against the numpy reference host-side\n", REQUANT_C_PATH, REQUANT_C_LEN);
+    }
+    free(rc_out);
+  } else {
+    printf("requantize test data not found at %s, skipping\n", REQUANT_A_PATH);
+  }
+  free(ra);
 
   mini_rpc_close(h);
   printf("closed OK\n");

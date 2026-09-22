@@ -869,6 +869,103 @@ not attempted given the fast path is already a solid, shipped baseline); folding
 into the real `relay.build()` graph the way `backbone_splice/` attempts for convs (blocked on that
 same unresolved RPC loading bug).
 
+## Running the full backbone graph, TVM-free: `requantize`, the missing piece
+
+The user's explicit ask, after all of the above: chain every covered op together and run the
+*real* backbone graph end to end, through `native_transport/` only -- **zero TVM anywhere in the
+runtime execution path** (TVM as an offline correctness oracle is fine; TVM as part of what
+actually executes on the phone is not, by explicit choice: "tvm dependency bothers a lot").
+
+Every op above is covered, but chaining any two covered conv kernels together needs one thing none
+of them produce: **`qnn.requantize`**, the int32-accumulator-to-uint8 rescale+clamp step ONNX's
+`FakeQuantizationToInteger` pass inserts between every conv layer. `grep -rl requantize
+scripts/android/tinygrad_hexagon_bridge/` confirms it: nothing in this project had ever built one.
+
+### The formula, read out of TVM's own source, not assumed
+
+`scripts/android/maskrcnn_e2e/README.md`'s finding #3 already flagged that rounding mode matters
+here ("`requantize` with `TONEAREST` rounding mismatched the host on a synthetic test (72% of
+elements); the default `UPWARD` mode ... is correct") without spelling out the exact bit-level
+formula. Reading `src/relay/qnn/op/requantize.cc` and `src/target/intrin_rule.cc`'s
+`QMultiplyShift` (what `UPWARD`'s `fixed_point_multiply` lowers to, via the `tir.q_multiply_shift`
+intrinsic) gives the precise, otherwise-undocumented arithmetic:
+
+```
+tensor        = int32(x) - input_zero_point                    # usually 0 for a fresh accumulator
+left_shift    = max(shift, 0);  right_shift = max(-shift, 0)     # shift from GetFixedPointMultiplierShift
+prod          = (int64(tensor) << left_shift) * int64(multiplier)  # multiplier: Q31 fixed-point int32
+total_shift   = right_shift + 31                                  # q=31 (Q31 format)
+scaled        = (prod + (1 << (total_shift - 1))) >> total_shift  # UPWARD: bias-then-shift = round-half-up
+out           = clip(scaled + output_zero_point, 0, 255)          # uint8 range
+```
+
+`(multiplier, shift)` come from `GetFixedPointMultiplierShift(input_scale / output_scale)`, a
+`frexp`-based Q31 decomposition -- ported directly into Python
+(`hex_requantize_kernel.py`'s `compute_multiplier_shift()`), so every quantization node's real
+scale/zero-point pair can be turned into the exact same integer constants TVM itself would bake in,
+computed host-side and traced into the kernel as compile-time constants (matching how every other
+kernel in this project bakes shapes in at trace time).
+
+### `hex_requantize_kernel.py`
+
+A plain per-element `long long` scalar loop implementing the formula above exactly (int64
+arithmetic throughout, matching TVM's own intermediate precision bit-for-bit) -- not vectorized to
+HVX width: the variable-shift, wide-multiply arithmetic this op needs has no single HVX vector
+instruction the way `vrmpy`/plain `+` do, so a good vectorization is real follow-up work, not
+attempted here (this is a small, simple op -- 12.6ms-add-scale territory, not a conv-scale
+bottleneck -- and correctness was the actual blocker, not speed).
+
+Verified against `requantize_ref()`, a bit-exact numpy port of the same int64 formula (not a float
+approximation), across several distinct `(multiplier, shift, input_zero_point, output_zero_point)`
+combinations covering both the left-shift and right-shift branches of the formula: under
+`MOCKDSP=1`/qemu at n=1,000, n=13,926,400 (this project's standard "real full-scale" element
+count), and three additional parameter combinations -- **bit-exact correct in every case**.
+
+### Real hardware, through `native_transport` only
+
+Spliced the generated kernel into `native_transport/mini_rpc_impl.c` the same way the flagship
+`hex_gemm_kernel.py` GEMM was (dispatch by buffer size in `mini_rpc_run_kernel`, no IDL change),
+at `n=2,000,000` (`in_scale=0.02, out_scale=0.05, in_zp=0, out_zp=114`) -- a real-scale slice sized
+to stay under the ~32MB/buffer RPC transfer wall this project's own `native_transport` work already
+found (the full 13.9M-element/55.6MB-input real stem-conv size would exceed it). Verified
+**bit-exact correct on real hardware** (device `239dbd8f`), zero TVM anywhere in the executed path
+-- `client_main.c`/`mini_rpc_impl.c` only, same as every other `native_transport` result in this
+file. `gen_requantize_test_data.py` regenerates the test vectors; `build.sh` picks them up
+automatically once pushed.
+
+### What this does and doesn't prove
+
+Proven: the one missing kernel now exists, is bit-exact against TVM's own documented-nowhere-else
+fixed-point formula, and runs correctly on real hardware through the TVM-free transport. Combined
+with the already-covered conv/add/maxpool/resize kernels, every *kind* of node the real 578-node
+backbone graph contains now has a working, real-hardware-verified, TVM-free kernel.
+
+**Not done, and worth being precise about why**: actually chaining several of these kernels
+together into one real, running subgraph (e.g. the ResNet stem: `conv7x7 -> requantize ->
+maxpool`) against real extracted backbone weights, let alone the full 578-node graph. This needs,
+concretely:
+1. **Real weight/scale extraction**: `backbone.onnx` (from `scripts/android/maskrcnn_e2e/prepare.py`)
+   is still in ONNX QDQ form -- `DequantizeLinear`/`QuantizeLinear` nodes carrying the real
+   per-tensor `scale`/`zero_point` initializers, not yet Relay's fixed-point `(multiplier, shift)`
+   form. Extracting the real stem conv's weight tensor and the real scale/zero-point pair for its
+   following `requantize` (`compute_multiplier_shift()` above turns that directly into kernel
+   constants, no TVM needed for this step) is a data-extraction task distinct from anything else
+   built here.
+2. **A fused driver**: `native_transport/`'s own philosophy -- "call one fixed, hand-written kernel
+   function with a handful of buffer pointers" -- extends naturally to a whole *static* graph
+   (this backbone's shape/topology are fixed for the 800x1088 input): generate ONE `.so` containing
+   every op's already-existing kernel-generation function's output concatenated in topological
+   order, sharing on-device local/global buffers for intermediate activations, called via a single
+   FastRPC round trip -- no new dynamic dispatch protocol needed, just concatenation +
+   buffer-plumbing of code this project already generates correctly per-op.
+3. **A reference to check against**: ONNX Runtime on the same sliced ONNX subgraph is the simplest
+   ground truth (already the established reference throughout `scripts/android/maskrcnn_e2e/`).
+
+None of this is hypothetical -- every piece has a working precedent elsewhere in this project
+(per-op kernel generation, buffer-safe accumulator patterns, real-hardware `native_transport`
+verification, ONNX-vs-kernel correctness checking) -- it's a real, scoped, multi-step follow-up,
+not a research question. Flagged precisely rather than rushed, per this file's established norm.
+
 ## Removing TVM as a transport dependency
 
 The bridge above still depends on TVM for two separate things: (1) **transport** -- getting bytes
@@ -1095,6 +1192,11 @@ when candidates differ only in raw compute-instruction mix with comparable worki
   faster than *stock* TVM on real hardware, but slower than the already-fixed fast path
   (`../hexagon_resize2x.py`) at two of the three real shapes -- see "Coverage: FPN `resize2d`"
   above for the honest breakdown.
+- `hex_requantize_kernel.py` -- `qnn.requantize`, the int32-to-uint8 rescale+clamp glue between
+  conv layers, bit-exact against TVM's own `UPWARD`-rounding fixed-point formula (read out of
+  TVM's source, not assumed) -- the one kernel missing before any two covered convs can be chained
+  into a real subgraph. Verified on real hardware through `native_transport/` only, zero TVM in
+  the executed path. See "Running the full backbone graph, TVM-free" above.
 - `native_transport/` -- a from-scratch, TVM-free FastRPC transport: custom `qaic`-generated
   interface, a native ARM64 client using only `libcdsprpc.so`, verified end to end on real
   hardware. See "Removing TVM as a transport dependency" above; `native_transport/build.sh`
