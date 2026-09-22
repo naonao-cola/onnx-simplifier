@@ -63,24 +63,37 @@ def pad_input(a: np.ndarray) -> np.ndarray:
     return np.pad(a, ((1, 1), (1, 1), (0, 0)), mode="constant", constant_values=0)
 
 
-def build_kernel(cin: int, cout: int, ih: int, iw: int, a_pad, wp, kernel_name: str = "hex_conv3x3"):
+def build_kernel(cin: int, cout: int, ih: int, iw: int, a_pad, wp, kernel_name: str = "hex_conv3x3", ow_tile: int = 1):
     """Build + apply the HVX vrmpybusv 3x3-conv custom_kernel. `a_pad`: flat (ih+2)*(iw+2)*cin
     uint8 Tensor (pre-padded, see pad_input()). `wp`: flat 9*(cout//32)*(cin//4)*128 uint8
     Tensor (pre-packed via pack_weight_3x3(), viewed/flattened to 1D). Returns the (ih*iw, cout)
-    int32 output Tensor; call .realize() to run it."""
+    int32 output Tensor; call .realize() to run it.
+
+    `ow_tile`: number of adjacent output columns processed per accumulator group (default 1 =
+    the original untiled kernel). For each reduction step, the packed weight slice for that
+    (kh, kw, kc) position depends only on `nt`/`kc`, not on the output column -- with ow_tile>1,
+    it's loaded into a local vector once and reused across `ow_tile` separate vrmpybusv_acc
+    calls (one per tiled output column, each with its own accumulator) before the next reduction
+    step, instead of being re-fetched from memory once per output pixel. This is the fix for the
+    real-hardware slowdown at cin=cout=256 documented in ../README.md's "Coverage: a real 3x3
+    conv" section: that shape's packed weight (589824 bytes) blows past L1, so with ow_tile=1
+    every output pixel independently re-streams the whole 9-position weight set from L2/memory;
+    tiling amortizes each weight fetch across ow_tile pixels' worth of MACs."""
     from tinygrad import Tensor, UOp
     from tinygrad.dtype import AddrSpace, dtypes
     from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 
     assert cin % 4 == 0 and cout % 32 == 0
+    assert iw % ow_tile == 0, f"iw={iw} must be divisible by ow_tile={ow_tile}"
     nt_count, kc_count = cout // 32, cin // 4
     r_count = 9 * kc_count
+    owt_count = iw // ow_tile
     iw_pad = iw + 2
     i32x32 = "int __attribute__((vector_size(128)))"
     u8x128 = "unsigned char __attribute__((vector_size(128)))"
 
     def _reg_i32(shape, slot, *deps):
-        # See ../hex_gemm_kernel.py's _reg_i32: depend on every enclosing range (oh, ow, nt),
+        # See ../hex_gemm_kernel.py's _reg_i32: depend on every enclosing range (oh, owt, nt),
         # not just the innermost one, so a degenerate extent-1 range never silently downgrades
         # the "reset once per output pixel" init to "reset once total".
         ret = UOp.placeholder(shape, dtypes.int32, slot=slot, addrspace=AddrSpace.REG)
@@ -88,11 +101,12 @@ def build_kernel(cin: int, cout: int, ih: int, iw: int, a_pad, wp, kernel_name: 
 
     def kernel_fn(C: UOp, A: UOp, Wp: UOp) -> UOp:
         oh_rng = UOp.range(ih, 0, AxisType.WEAK)
-        ow_rng = UOp.range(iw, 1, AxisType.WEAK)
+        owt_rng = UOp.range(owt_count, 1, AxisType.WEAK)
         nt_rng = UOp.range(nt_count, 2, AxisType.WEAK)
-        acc = _reg_i32((32,), 0, oh_rng, ow_rng, nt_rng)
+        # One accumulator per tiled output column, each its own REG slot (physical register).
+        accs = [_reg_i32((32,), t, oh_rng, owt_rng, nt_rng) for t in range(ow_tile)]
         r_rng = UOp.range(r_count, 3, AxisType.REDUCE)
-        acc_addr = acc.after(r_rng)[0]
+        acc_addrs = [acc.after(r_rng)[0] for acc in accs]
 
         pos = r_rng // kc_count
         kc = r_rng % kc_count
@@ -100,26 +114,52 @@ def build_kernel(cin: int, cout: int, ih: int, iw: int, a_pad, wp, kernel_name: 
         kw = pos % 3
 
         a_row = oh_rng + kh
-        a_col = ow_rng + kw
-        a_flat_idx = a_row * (iw_pad * cin) + a_col * cin + kc * 4
         wp_flat_idx = pos * (nt_count * kc_count * 128) + nt_rng * (kc_count * 128) + kc * 128
-
-        a_idx = A[a_flat_idx]
         w_idx = Wp[wp_flat_idx]
-        broadcast32 = ",".join(["*(unsigned int*){2}"] * 32)
-        step = UOp(
-            Ops.CUSTOM, dtypes.void, (acc_addr, w_idx, a_idx),
-            arg=(f"*({i32x32}*){{0}} = __builtin_HEXAGON_V6_vrmpybusv_acc_128B("
-                 f"*({i32x32}*){{0}}, ({i32x32}){{{{{broadcast32}}}}}, *({u8x128}*){{1}});"),
-        )
+
+        a_idxs = []
+        for t in range(ow_tile):
+            a_col = owt_rng * ow_tile + t + kw
+            a_flat_idx = a_row * (iw_pad * cin) + a_col * cin + kc * 4
+            a_idxs.append(A[a_flat_idx])
+
+        # Fuse all ow_tile accumulate updates for this reduction step into one CUSTOM statement:
+        # load the (kh,kw,kc) weight slice (the operand that's *shared* across tiled output
+        # columns) into a local vector once (__wv), then reuse it across ow_tile vrmpybusv_acc
+        # calls -- the compiler keeps __wv register-resident across the statements below (no
+        # repeated memory load per tiled column). vrmpybusv_acc_128B's calling convention (see
+        # ../hex_gemm_kernel.py/../chunked_kernel_test.py): 2nd arg is the *activation*
+        # broadcast to a 32-wide vector (one scalar per tiled column, differs per t), 3rd arg is
+        # the raw 128-byte *weight* vector (shared -- this is __wv).
+        acc_lines = []
+        for t in range(ow_tile):
+            broadcast = ",".join([f"*(unsigned int*){{{ow_tile + 1 + t}}}"] * 32)
+            acc_lines.append(
+                f"*({i32x32}*){{{t}}} = __builtin_HEXAGON_V6_vrmpybusv_acc_128B("
+                f"*({i32x32}*){{{t}}}, ({i32x32}){{{{{broadcast}}}}}, __wv);"
+            )
+        arg = f"{u8x128} __wv = *({u8x128}*){{{ow_tile}}}; " + " ".join(acc_lines)
+        step = UOp(Ops.CUSTOM, dtypes.void, (*acc_addrs, w_idx, *a_idxs), arg=arg)
         update = step.end(r_rng)
-        final_addr = acc.after(update)[0]
-        out_row = oh_rng * iw + ow_rng
+        final_addrs = [acc.after(update)[0] for acc in accs]
+
+        # Fuse all ow_tile output writes into one CUSTOM statement too -- chaining separate
+        # per-column CUSTOM statements via .after() looked right (each later write's source
+        # embeds a dependency on the earlier write) but silently dropped every write except the
+        # last from the rendered output: .after() only orders two nodes relative to each other
+        # when both are already reachable from the sink, it does not itself make an
+        # otherwise-unreferenced void statement reachable. Confirmed by inspecting the generated
+        # C for ow_tile=2: only the t=1 write appeared, so half the output columns (t=0) were
+        # simply never written -- exactly the 50% mismatch this bug produced. One CUSTOM with
+        # all ow_tile writes as one statement list sidesteps this the same way the fused
+        # accumulate step above does.
+        out_cptrs = [C[oh_rng * iw + (owt_rng * ow_tile + t), nt_rng * 32] for t in range(ow_tile)]
+        out_lines = [f"*({i32x32}*){{{t}}} = *({i32x32}*){{{ow_tile + t}}};" for t in range(ow_tile)]
         out_step = UOp(
-            Ops.CUSTOM, dtypes.void, (C[out_row, nt_rng * 32], final_addr),
-            arg=f"*({i32x32}*){{0}} = *({i32x32}*){{1}};",
+            Ops.CUSTOM, dtypes.void, (*out_cptrs, *final_addrs),
+            arg=" ".join(out_lines),
         )
-        return out_step.end(nt_rng, ow_rng, oh_rng).sink(arg=KernelInfo(name=kernel_name, opts_to_apply=()))
+        return out_step.end(nt_rng, owt_rng, oh_rng).sink(arg=KernelInfo(name=kernel_name, opts_to_apply=()))
 
     c = Tensor.empty(ih * iw, cout, dtype="int32", device="DSP")
     return Tensor.custom_kernel(c, a_pad, wp, fxn=functools.partial(kernel_fn))[0]
@@ -146,6 +186,7 @@ def main() -> None:
     p.add_argument("--cout", type=int, default=64)
     p.add_argument("--ih", type=int, default=6)
     p.add_argument("--iw", type=int, default=6)
+    p.add_argument("--ow-tile", type=int, default=1)
     p.add_argument("--out", default="conv3x3_kernel.c")
     args = p.parse_args()
 
@@ -175,7 +216,7 @@ def main() -> None:
 
         a_pad_t = Tensor(a_pad_np, device="DSP")
         wp_t = Tensor(wp_np, device="DSP")
-        out = build_kernel(args.cin, args.cout, args.ih, args.iw, a_pad_t, wp_t)
+        out = build_kernel(args.cin, args.cout, args.ih, args.iw, a_pad_t, wp_t, ow_tile=args.ow_tile)
         out.realize()
 
         ref = reference_conv3x3(a_np, w_np)
