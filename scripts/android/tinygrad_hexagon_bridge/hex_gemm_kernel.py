@@ -20,11 +20,9 @@ Verified end-to-end on real Hexagon v73 hardware (via ../bridge_and_test.py's TV
 bridge, since tinygrad's own DSP driver can't reach this phone -- see ../README.md) at the exact
 pathological shape from `scripts/android/maskrcnn_e2e/README.md`'s ranked profile
 (cin=64, cout=256, spatial 200x272 -> M=54400): **30.35 GMAC/s, 8.65x faster than stock TVM's
-hand-tuned vrmpy schedule (3.51 GMAC/s) at the same shape**, bit-exact correct.
-
-Known limitation: fails (produces incorrect results) when cout == 32 exactly (N-tile count
-NT=1, a degenerate single-iteration WEAK range) -- not investigated further since it doesn't
-affect the real target shape (cout=256, NT=8). Use cout >= 64 (NT >= 2).
+hand-tuned vrmpy schedule (3.51 GMAC/s) at the same shape**, bit-exact correct. See ../README.md's
+coverage tables for six more shapes (including a strided one and two padded-to-32-lane tiny-`cout`
+ones) verified the same way.
 """
 from __future__ import annotations
 
@@ -60,14 +58,19 @@ def build_kernel(cin: int, cout: int, m: int, a, bp, kernel_name: str = "hex_gem
     i32x32 = "int __attribute__((vector_size(128)))"
     u8x128 = "unsigned char __attribute__((vector_size(128)))"
 
-    def _reg_i32(shape, slot, dep=None):
+    def _reg_i32(shape, slot, *deps):
+        # Depend on ALL enclosing loop ranges, not just the innermost -- a degenerate extent-1
+        # range (e.g. NT=1 when cout==32) gets eliminated by tinygrad's optimizer, and if the
+        # accumulator's init was scoped to *only* that range, the "reset once per iteration"
+        # behavior silently degrades to "reset once total", corrupting every row after the
+        # first. Depending on every range (M can never degenerate) makes this robust.
         ret = UOp.placeholder(shape, dtypes.int32, slot=slot, addrspace=AddrSpace.REG)
-        return ret.after((ret if dep is None else ret.after(dep)).store(ret.const_like(0)))
+        return ret.after((ret.after(*deps) if deps else ret).store(ret.const_like(0)))
 
     def kernel_fn(C: UOp, A: UOp, Bp: UOp) -> UOp:
         m_rng = UOp.range(m, 0, AxisType.WEAK)
         nt_rng = UOp.range(nt_count, 1, AxisType.WEAK)
-        acc = _reg_i32((32,), slot=0, dep=nt_rng)
+        acc = _reg_i32((32,), 0, m_rng, nt_rng)
         kc_rng = UOp.range(kc_count, 2, AxisType.REDUCE)
         acc_addr = acc.after(kc_rng)[0]
         a_idx = A[m_rng, kc_rng * 4]
@@ -105,15 +108,17 @@ def build_strided_kernel(cin: int, cout: int, ih: int, iw: int, stride: int, a, 
     i32x32 = "int __attribute__((vector_size(128)))"
     u8x128 = "unsigned char __attribute__((vector_size(128)))"
 
-    def _reg_i32(shape, slot, dep=None):
+    def _reg_i32(shape, slot, *deps):
+        # See build_kernel()'s _reg_i32 for why we depend on every enclosing range, not just
+        # the innermost one (degenerate extent-1 ranges get eliminated by the optimizer).
         ret = UOp.placeholder(shape, dtypes.int32, slot=slot, addrspace=AddrSpace.REG)
-        return ret.after((ret if dep is None else ret.after(dep)).store(ret.const_like(0)))
+        return ret.after((ret.after(*deps) if deps else ret).store(ret.const_like(0)))
 
     def kernel_fn(C: UOp, A: UOp, Bp: UOp) -> UOp:
         oh_rng = UOp.range(oh_count, 0, AxisType.WEAK)
         ow_rng = UOp.range(ow_count, 1, AxisType.WEAK)
         nt_rng = UOp.range(nt_count, 2, AxisType.WEAK)
-        acc = _reg_i32((32,), slot=0, dep=nt_rng)
+        acc = _reg_i32((32,), 0, oh_rng, ow_rng, nt_rng)
         kc_rng = UOp.range(kc_count, 3, AxisType.REDUCE)
         acc_addr = acc.after(kc_rng)[0]
         flat_row = (oh_rng * stride) * iw + (ow_rng * stride)
