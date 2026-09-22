@@ -460,7 +460,12 @@ def _top_k_scene(top_k, num_boxes_dyn=False):
     """One class, 8 boxes: 4 heavily-overlapping high-score boxes (IoU well
     above 0.5 with each other) followed by 4 disjoint low-score boxes."""
     hi = np.array(
-        [[0, 0, 10, 10], [0.5, 0, 10.5, 10], [0, 0.5, 10, 10.5], [0.5, 0.5, 10.5, 10.5]],
+        [
+            [0, 0, 10, 10],
+            [0.5, 0, 10.5, 10],
+            [0, 0.5, 10, 10.5],
+            [0.5, 0.5, 10.5, 10.5],
+        ],
         dtype=np.float32,
     )
     lo = np.array(
@@ -492,7 +497,13 @@ def test_top_k_limits_candidates_before_nms_not_after(num_boxes_dyn):
     assert actual[2][0, 0] == pytest.approx(0.9)
 
     expected = reference_trt_batched_nms(
-        boxes, scores, -1, top_k=4, keep_top_k=8, score_threshold=0.05, iou_threshold=0.5
+        boxes,
+        scores,
+        -1,
+        top_k=4,
+        keep_top_k=8,
+        score_threshold=0.05,
+        iou_threshold=0.5,
     )
     _assert_same_detections(actual, expected)
 
@@ -507,7 +518,13 @@ def test_top_k_at_least_num_boxes_is_a_no_op():
     assert [n.op_type for n in simplified.graph.node].count("TopK") == 1
     assert int(actual[0][0, 0]) == 5
     expected = reference_trt_batched_nms(
-        boxes, scores, -1, top_k=8, keep_top_k=8, score_threshold=0.05, iou_threshold=0.5
+        boxes,
+        scores,
+        -1,
+        top_k=8,
+        keep_top_k=8,
+        score_threshold=0.05,
+        iou_threshold=0.5,
     )
     _assert_same_detections(actual, expected)
 
