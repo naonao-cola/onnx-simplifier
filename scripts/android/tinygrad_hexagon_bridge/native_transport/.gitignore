@@ -5,3 +5,6 @@ gemm_a.bin
 gemm_bp.bin
 gemm_ref.bin
 gemm_c_out.bin
+requant_a.bin
+requant_ref.bin
+requant_c_out.bin

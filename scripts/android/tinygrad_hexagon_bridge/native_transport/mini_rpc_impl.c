@@ -64,15 +64,34 @@ __attribute__((noinline)) void hex_gemm(int* restrict __attribute__((align_value
 #define HEX_GEMM_B_LEN 16384
 #define HEX_GEMM_C_LEN 55705600
 
+/* Real hex_requantize_kernel.py-generated requantize, n=2000000 (a real-scale, RPC-transfer-safe
+ * slice of the stem conv's cin=64,H=400,W=544 output -- the full 13.9M-element size would exceed
+ * the ~32MB/buffer RPC transfer wall this project's own native_transport work already found),
+ * in_scale=0.02 out_scale=0.05 in_zp=0 out_zp=114 -- verified bit-exact under qemu against TVM's
+ * own q_multiply_shift fixed-point formula (see hex_requantize_kernel.py) before being pasted
+ * here. */
+__attribute__((noinline)) void hex_requantize(unsigned char* restrict __attribute__((align_value(128))) data0_2000000, int* restrict __attribute__((align_value(128))) data1_2000000) {
+  for (int Lidx0 = 0; Lidx0 < 2000000; Lidx0++) {
+    { long long t = (long long)(*(int*)(data1_2000000+Lidx0)) - 0; t = (t << 0) * 1717986918LL; t = (t + 2147483648LL) >> 32; t += 114; if (t < 0) t = 0; if (t > 255) t = 255; *(unsigned char*)(data0_2000000+Lidx0) = (unsigned char)t; }
+  }
+}
+
+#define HEX_REQUANT_A_LEN 8000000
+#define HEX_REQUANT_C_LEN 2000000
+
 int mini_rpc_run_kernel(remote_handle64 h, const unsigned char* a, int aLen,
                          const unsigned char* b, int bLen, unsigned char* c, int cLen) {
   /* Dispatch by buffer size: the original transport-PoC test (8/8/8-byte buffers, see
    * ../README.md) still gets the placeholder byte-add below; a call sized for the real
-   * cin=64,cout=256,m=54400 GEMM (hex_gemm_kernel.py's own default shape) runs the real kernel.
-   * This keeps the original PoC test working unchanged while adding real capability, without an
-   * IDL change. */
+   * cin=64,cout=256,m=54400 GEMM (hex_gemm_kernel.py's own default shape) runs the real kernel,
+   * and a call sized for the requantize slice above runs that. This keeps every prior test
+   * working unchanged while adding real capability, without an IDL change. */
   if (aLen == HEX_GEMM_A_LEN && bLen == HEX_GEMM_B_LEN && cLen == HEX_GEMM_C_LEN) {
     hex_gemm((int*)(void*)c, (unsigned char*)(void*)a, (unsigned char*)(void*)b);
+    return 0;
+  }
+  if (aLen == HEX_REQUANT_A_LEN && cLen == HEX_REQUANT_C_LEN) {
+    hex_requantize(c, (int*)(void*)a);
     return 0;
   }
   int n = aLen < cLen ? aLen : cLen;
