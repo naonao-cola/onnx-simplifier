@@ -15,6 +15,7 @@ hand-built-graph tests in `tests/test_tensorrt_*.py` (which never invoke TensorR
 | `sparsity_check.py` | onnxsim (`gen`) then system Python with `tensorrt` (`trt`) | checks whether TensorRT's builder gives 2:4-pruned `MatMul`/`Gemm` weights sparse tactics |
 | `trt_nms_check.py` | onnxsim (`gen`), system Python with `tensorrt` (`trt`), any (`compare`) | differentially checks `rewrite_trt_batched_nms`'s output against the real `BatchedNMSDynamic_TRT` plugin |
 | `run_cuda_feature_notebook.py` | onnxsim + a GPU `onnxruntime` | runs `examples/cuda_feature_tests/cuda_feature_tests.ipynb`'s tests as a plain script |
+| `llm_pipeline.py` | onnxsim (Python >= 3.11) | pins shapes on a decoder-with-KV-cache LLM export and runs `simplify()` on it |
 
 They are split because JetPack 6's TensorRT Python bindings are cp310-only while onnxsim
 needs Python >= 3.11; models are exchanged as `.onnx` files.
@@ -305,4 +306,83 @@ multi-hour build disproportionate to this check). The script itself is unaffecte
 of this and should work as-is on a board where a GPU `onnxruntime` matching onnxsim's
 Python floor actually exists (e.g. an x86 box with `onnxruntime-gpu`, or a future JetPack
 release on CUDA 13).
+
+## Decoder LLM: Qwen2.5-0.5B-Instruct (KV cache, RoPE, GQA, RMSNorm)
+
+`scripts/nvidia/llm_pipeline.py` checks onnxsim on a real decoder-with-KV-cache export --
+a different shape of graph than any CNN/ViT above: RoPE and RMSNorm hand-decomposed into
+primitive ops, grouped-query attention (14 query heads sharing 2 KV heads), and 48
+`past_key_values.N.{key,value}` inputs / 48 `present.N.{key,value}` outputs alongside
+`input_ids`/`attention_mask`/`position_ids`. Model:
+[`onnx-community/Qwen2.5-0.5B-Instruct`](https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct)
+`onnx/model_fp16.onnx` (opset 14, IR 10, 2759 nodes, 24 layers, head_dim 64; no `If` node --
+`past_key_values` are required inputs, a length-0 cache standing in for prefill).
+
+```sh
+python3.12 scripts/nvidia/llm_pipeline.py model_fp16.onnx /tmp/llm --seq 1 --past 31   # decode step
+```
+
+Pinning `batch_size`/`sequence_length`/`past_sequence_length` to concrete values (batch 1,
+1 new token, 31 cached) and running `simplify()`:
+
+**2759 -> 1703 nodes (-38%)**, reproduced across two independent runs (bit-identical node
+counts and, per ORT CPU, bit-identical logits: `max_abs_diff = 0.0` between the raw and
+simplified fixed-shape models, argmax token matches). `RMSNorm`'s decomposition (`Pow`/
+`ReduceMean`/`Sqrt`/`Div`, 49 each) and RoPE's (`Neg`, 48) are **untouched** -- no fusion
+pass recognizes either pattern here -- so the whole reduction comes from constant-folding
+now-static shape/dtype bookkeeping (`Concat` 267 -> 96, `Expand` 54 -> 48, `Cast` 99 -> 98):
+once every KV-cache dimension is a fixed number instead of a symbolic
+`past_sequence_length`, the `Shape`/`Gather`/`Range`/`Where`/`Concat` chains that computed
+those dimensions at graph-run time become foldable constants outright. ORT CPU session
+load+run was also faster on the simplified model (1.9s vs 3.1s, one sample, not a
+controlled benchmark).
+
+**Could not complete a TensorRT engine build for either variant on this board.**
+TensorRT compiles this attention pattern as a single large fused ("Myelin") subgraph
+rather than decomposable layers, and its constant-weight staging buffer needs
+**physically contiguous** GPU memory: the raw model requested a 988 MB contiguous
+allocation, the *simplified* model (fewer nodes, same weights) needed only 272 MB at
+first -- a real ~3.6x reduction from `simplify()`:
+
+```
+NvMapMemAllocInternalTagged: ... error 12
+Error Code 1: Cuda Runtime (out of memory)
+Requested amount of GPU memory (272573440 bytes) could not be allocated.
+```
+
+The board's CMA (contiguous memory allocator) pool -- `CmaTotal` in `/proc/meminfo` --
+was originally capped at **256 MB**, well under 272 MB. Raising it (`cma=` in
+`/boot/extlinux/extlinux.conf`, needs `sudo` + reboot) turned out to be more involved
+than a size fix, and **did not unblock the build**:
+
+- `cma=1024M` **failed to reserve at boot** (`dmesg`: `cma: Failed to reserve 1024 MiB`)
+  -- this board's physical memory layout has other fixed carveouts (framebuffer, VPR,
+  camera debug, PVA, ...) that a 1 GB contiguous request can't fit around -- leaving CMA
+  at **0 MB**, worse than the default.
+- `cma=512M` **did** reserve cleanly (`dmesg`: `cma: Reserved 512 MiB`, confirmed in
+  `/proc/meminfo`) -- but with CMA actually available, TensorRT's tactic autotuner
+  stopped picking the 272 MB strategy at all and consistently requested **988 MB**
+  instead (matching the raw model's original request almost exactly), which still
+  exceeds the 512 MB pool. `--noBuilderCache --noCompilationCache`,
+  `--builderOptimizationLevel=0/1/3`, and dropping the page cache before the build made
+  no difference -- this looks like a genuine TensorRT tactic-selection interaction with
+  CMA availability (a bigger contiguous pool makes a more memory-hungry fusion strategy
+  look viable to the cost model, which then doesn't fit either), not a simple
+  size-threshold problem. Not investigated further (would need TensorRT internals access
+  this write-up doesn't have); a CMA size between 256 MB and 512 MB, never tried, might
+  keep the cheaper tactic while still fitting it, but that needs another reboot per
+  attempt and was not pursued past this point.
+
+CMA was left at 512 MB (a reasonable general-purpose increase for future GPU work on
+this board) rather than reverted. A dynamic-INT8 variant of the same model
+(`model_int8.onnx`, `MatMulInteger`/`DynamicQuantizeLinear`) was fetched as a
+smaller-weights workaround attempt but not pursued: it is a substantially different graph
+shape (dynamic per-token activation quantization) that risks confounding TensorRT parser
+compatibility with the actual question, for uncertain payoff given the same ceiling.
+
+**Takeaway**: on hardware with enough contiguous GPU memory, this would be worth finishing
+(TensorRT build/latency/correctness comparison, matching the CNN/ViT sections above).
+Here, the graph-level finding stands on its own: `simplify()` is exact and shrinks a real
+decoder LLM export by more than a third, entirely by folding now-static KV-cache shape
+arithmetic, without touching (or needing to touch) RoPE/RMSNorm/GQA at all.
 
