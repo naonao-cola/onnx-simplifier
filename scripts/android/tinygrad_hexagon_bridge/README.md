@@ -1565,12 +1565,12 @@ comes from HVX fp32 vectors, threads and prefetch, none of which Stage 1's `-mhv
 Stage 1 was never run on hardware.
 
 **Caveats, stated plainly:**
-- **Layout is assumed, not paid for.** The kernel reads channels-last features and writes channels-last
-  (R, OH, OW, C) output; ORT reads/writes NCHW. The numbers above exclude any transpose. The output side
-  is free in practice (the fc6 box-head MatMul consumes the flattened crop, so its weight rows can be
-  permuted offline), but the input side is not: the backbone's FPN maps are NCHW today, and transposing
-  P2-P5 (~73 MB fp32) on the fly would cost real time. Making the backbone's last FPN kernels emit
-  channels-last is the real fix and isn't done here.
+- **Layout: now priced, see Stage 3 below.** The kernel reads channels-last features and writes
+  channels-last (R, OH, OW, C) output; ORT reads/writes NCHW. The output side is free in practice (the
+  fc6 box-head MatMul consumes the flattened crop, so its weight rows can be permuted offline). The
+  input side was unpriced here: converting the backbone's NCHW FPN maps costs 13.3 ms on the DSP, and
+  having the FPN output convs write channels-last directly costs ~2.3 ms instead -- measured, verified
+  and compared against a same-session ORT baseline in "RoiAlign, Stage 3".
 - One image's RoIs, fp32 only (the real model's RoiAlign inputs are dequantized fp32).
 - Not integrated into any pipeline; each call is a standalone FastRPC round trip.
 
@@ -1578,6 +1578,123 @@ Stage 1 was never run on hardware.
 `gen_roialign_test_data.py` (channels-last binaries), `roialign_host_check.c`, `roialign_qemu.c`,
 `build.sh` (qaic + hexagon-clang/link + NDK client + adb run; `TURBO=1` adds the clock vote),
 `make_roialign_single_node_models.py` + `ort_roialign_bench.c` (the host and phone ORT baselines).
+
+## RoiAlign, Stage 3: pricing the channels-last layout, then removing its cost
+
+Stage 2's 2.3x assumed the FPN feature maps were already channels-last. This stage measures what
+getting them there actually costs, two ways, on the phone with real data.
+
+**Where the RoiAlign inputs come from.** Traced in the real `backbone.onnx`: each of the four
+RoiAlign feature maps (`391`/`423`/`455`/`487` = P5/P4/P3/P2, `spatial_scale` 1/32..1/4) is a
+**backbone graph output** that crosses the backbone/rest split as fp32 NCHW. Each is produced by
+`Conv` (the FPN 3x3 "output" conv, 256->256, pad 1) -> `QuantizeLinear` (uint8, per-tensor scale,
+zero point 128-133) -> `DequantizeLinear` (fp32). Weights are int8 symmetric (zero point 0), the bias
+is int32 at scale `s_in * s_w`, and the conv inputs are uint8 with zero points 125-127. ONNX Runtime
+fuses that QDQ pattern into `QLinearConv`, so its outputs come from exact integer accumulation plus a
+float requantize. `fpn_channels_last/capture_fpn_out.py` shows that an integer-only reimplementation
+reproduces ORT **bit for bit at all four levels**:
+- exact int32 accumulation, with the input zero point folded into the bias and the border padded
+  with that zero point;
+- `q = clamp(round_half_even(float(acc) * (s_in*s_w/s_out)) + zp)`;
+- `(q - zp) * s_out`.
+
+That is 0 uint8 mismatches out of 18.5 M values, and bit-identical fp32. It is also bit-identical to
+the maps Stage 2's RoiAlign data was captured from.
+
+**Two ways to get channels-last, both measured on the phone** (device `239dbd8f`, DSP-side time, six
+full runs, three with DCVS and three with a core+bus TURBO vote, which changed nothing measurable):
+
+1. **Keep the backbone as is and transpose its NCHW outputs.** `fpn_channels_last/layout_kernels.h`
+   transposes 32x32 fp32 blocks in HVX registers with five rounds of the perfect-shuffle trick:
+   `vshuff(.., -4)` word-zips rows i and i+16, and five rotations of the (row, col) index make a
+   transpose. It checks bit-exact against a scalar transpose under qemu at every level shape,
+   including the non-multiple-of-32 tails. All four maps (P2-P5, ~74 MB fp32):
+
+   | Transpose variant | ms (mean of 6, min-max) |
+   |---|---:|
+   | scalar, 1 thread | 224.0 (222.0-225.5) |
+   | HVX, 1 thread | 37.0 (36.8-37.2) |
+   | HVX, 4 threads (split by pixel range) | **13.3** (13.1-13.6) |
+   | HVX + next-block `l2fetch`, 4 threads | 13.3 (12.6-13.6) |
+   | HVX, channel-group-outer loop, 1 / 4 threads | 33.6 / 13.9 |
+
+   It is memory-bound: 4 threads help (2.8x), while prefetch and the other loop order don't. One
+   earlier cold first run measured P2 alone at ~28-30 ms, so the first call after the DSP has been
+   idle can pay ~2x.
+
+2. **Have the producer write channels-last.** `hex_conv3x3_fpnout_kernel.py` is
+   `hex_conv3x3_kernel.py`'s vrmpybusv conv, generated through tinygrad `custom_kernel` with the same
+   `ow_tile` reuse. It adds the requantize+dequantize epilogue above into its store, and a `layout`
+   switch:
+   - channels-last: each accumulator vector is 32 channels of one pixel, stored contiguously;
+   - NCHW: the same 32 lanes land H*W floats apart.
+
+   The epilogue runs as scalar IEEE fp32, with vectorization explicitly disabled. HVX fp32 on this
+   phone is qf32, which is not IEEE-rounded, and one ulp would lose bit-exactness. Run on the phone
+   with the real FPN conv inputs, weights and biases, all four levels, every run:
+   - The **NCHW output is bit-identical to ORT's real backbone output.**
+   - The channels-last output is bit-identical to every transpose variant's output.
+   - The qemu-hexagon run agreed at all four levels too.
+
+   The store layout is the only difference between the two variants:
+
+   | FPN output conv (fused epilogue, 1 thread) | channels-last store | NCHW store | delta |
+   |---|---:|---:|---:|
+   | P5 25x34 | 14.7 ms | 14.4 ms | +0.3 ms |
+   | P4 50x68 | 46.6 ms | 45.8 ms | +0.8 ms |
+   | P3 100x136 | 217.8 ms | 214.9 ms | +2.9 ms |
+   | P2 200x272 | 871.5 ms | 873.2 ms | -1.8 ms |
+   | **total** | 1150.7 ms | 1148.4 ms | **+2.3 ms** |
+
+   The conv's absolute time isn't part of this comparison. It is backbone work either way, runs
+   single-threaded here with a scalar epilogue, and isn't competing with TVM's multi-threaded
+   backbone in this table. The delta is what the layout costs.
+
+**End to end, RoiAlign side, all 8 real calls.** RoiAlign runs on the NHWC maps the fused conv
+produced (4 threads with prefetch): 27.8 ms (27.7-27.9), max abs err vs ORT's real outputs 6.5e-5, the
+same as Stage 2. ORT's CPU RoiAlign on the phone, which reads NCHW directly, was re-measured this
+session with Stage 2's own `ort_roialign_bench` at **57.3-59.5 ms** (mean 58.3; Stage 2 recorded
+63.3):
+
+| Path to RoiAlign output | ms | vs ORT (58.3 / 63.3) |
+|---|---:|---:|
+| ORT CPU RoiAlign on the phone (all cores, NCHW) | 58.3 | 1.00x |
+| Stage 2 kernel, maps assumed channels-last (layout unpriced) | 27.8 | 2.10x / 2.28x |
+| + separate HVX transpose of today's NCHW maps | 27.8 + 13.3 = **41.1** | **1.42x / 1.54x** |
+| FPN output convs write channels-last (fused) | 27.8 + 2.3 = **30.1** | **1.94x / 2.10x** |
+
+So the answer to "is the 2.3x real today" is **mostly no, and fixably yes.** With the existing NCHW
+backbone the transpose costs 13.3 ms, about 44% of the ~30 ms the kernel saves, leaving ~1.4-1.5x.
+With the producer writing channels-last, the win survives at ~1.9-2.1x, for a layout cost of about
+2 ms.
+
+One real bug on the way. The first fused-epilogue kernel read accumulator lanes as scalars straight
+out of tinygrad's `REG` placeholder, which renders as a plain 4-byte-aligned `int bufN[32]` that the
+reduction also accesses through 128-byte vector casts. That crashed `qemu-hexagon-static` outright. A
+standalone repro isolated it: the reduction alone, and a static-buffer harness, both ran fine, while
+any scalar read of that buffer crashed. Copying the accumulator into an explicitly
+`aligned(128)` local first fixed it.
+
+**Not done**:
+- The fused conv isn't wired into a TVM-free full-backbone run. The chain in "Running the full
+  backbone graph, TVM-free" stops at stage1/block1, far upstream of the FPN, so the ~2 ms figure is
+  for the verified producer at real shapes and real data, not a measured full pipeline.
+- The epilogue is scalar, for exact IEEE results. A qf32 HVX epilogue would be faster but not
+  bit-exact.
+- RoiAlign reading uint8 maps directly (4x less traffic for a latency/bandwidth-bound kernel) wasn't
+  tried. It interacts with how out-of-range samples contribute, since dequantize is affine and
+  skipped samples add 0 in fp32, not the zero point.
+
+`fpn_channels_last/` reproduces everything:
+- `capture_fpn_out.py` (real conv inputs/params/outputs from `backbone.onnx` in ORT, plus the
+  bit-exact epilogue check);
+- `gen_fpn_test_data.py` (phone binaries);
+- `layout_kernels.h` + `layout_qemu.c` (transpose and its qemu check);
+- `fpn_rpc.idl` / `fpn_impl.c` / `fpn_client.c` / `build.sh` (TVM-free FastRPC skel + client:
+  transpose, fused conv, RoiAlign, clock vote).
+
+The conv kernels themselves come from `../hex_conv3x3_fpnout_kernel.py --data fpn_out_real.npz --out
+$DATA/fpn_out_kernels.c`, which also runs all four levels under qemu against ORT.
 
 ## Files
 
@@ -1687,3 +1804,12 @@ Stage 1 was never run on hardware.
   (`roialign_host_check.c`, `roialign_qemu.c`) and the ORT baselines
   (`make_roialign_single_node_models.py`, `ort_roialign_bench.c`). Correct on the phone at all 8
   real calls; 27.1 ms vs ORT's 63.3 ms on the phone's CPU. See "RoiAlign, Stage 2" above.
+- `hex_conv3x3_fpnout_kernel.py` -- the FPN 3x3 output conv (vrmpybusv, `ow_tile`) with ORT's
+  requantize+dequantize epilogue fused into its store, writing fp32 channels-last or NCHW. Bit-exact
+  vs ORT's real backbone outputs at all four levels, under qemu and on the phone; the channels-last
+  store costs ~2.3 ms more than NCHW across P2-P5. See "RoiAlign, Stage 3" above.
+- `fpn_channels_last/` -- RoiAlign Stage 3: real FPN-conv capture (`capture_fpn_out.py`), an HVX
+  NCHW->NHWC transpose (`layout_kernels.h`, qemu-checked by `layout_qemu.c`), and a TVM-free FastRPC
+  skel/client (`fpn_rpc.idl`, `fpn_impl.c`, `fpn_client.c`, `build.sh`) that prices the layout on the
+  phone: separate transpose 13.3 ms (RoiAlign side 1.42x vs ORT) vs. channels-last producer +2.3 ms
+  (1.94x). See "RoiAlign, Stage 3" above.
