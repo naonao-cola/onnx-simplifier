@@ -487,6 +487,89 @@ instead of through `bridge_and_test.py`'s TVM-RPC bridge. `run_kernel`'s signatu
 buffer-in/out args) was deliberately shaped to make this a straightforward follow-up: point it at
 one of `hex_gemm_kernel.py`'s generated kernel functions instead of the placeholder body.
 
+## Timing BEAM search candidates with hexagon-sim instead of raw instruction counting
+
+`MOCKDSP=1`'s `qemu-hexagon-static` path (used throughout this whole investigation for fast
+host-side iteration) times BEAM search candidates via QEMU's `inscount()` pseudo-register -- a
+raw instruction count, not a cycle-accurate signal, and structurally blind to Hexagon-specific
+pipeline behavior (HVX multi-cycle vector ops, dual/triple-issue slotting) or memory-hierarchy
+effects. The 3x3 conv coverage work (`hex_conv3x3_kernel.py`, `codex/hex-gemm-3x3-conv`) found
+exactly the case where this matters: the same kernel *shape*, same instruction-count profile, ran
+faster than TVM at `cin=64` and **slower** than TVM at `cin=256` on real hardware, purely from
+cache/working-set effects a plain instruction count can't see (no output-tile reuse across
+pixels -- the fix is real, just not yet built). BEAM search using QEMU's inscount as its cost
+signal has no way to detect a difference like that.
+
+### hexagon-sim, and specifically its `--timing` mode
+
+`hexagon-sim` is Qualcomm's own instruction-set simulator (ships in the Hexagon SDK's
+`HEXAGON_Tools/*/Tools/bin/hexagon-sim` -- the same simulator this project's separate
+`scripts/android/hexagon_sim_harness.py` already uses for TVM-compiled-kernel cycle counts, with
+sim-vs-phone speedup correlation previously validated at 2.4x/4.5x/2.5x tracking the real phone's
+1.8x/5.1x/2.0x). Its default mode reports a PMU-derived `Pcycles=` total at process exit, but
+that default mode turned out to be a fast functional-only estimate, not meaningfully better than
+instruction counting for this purpose. `hexagon-sim --help` reveals a separate, undocumented
+(from this project's prior usage) `--timing` flag ("Run timing mode") alongside `--timing_nodbc`
+("...without data backed cache") and per-component cache trace flags (`--dcachetrace`,
+`--l2cachetrace`) -- strong evidence of a real pipeline/cache-hierarchy model gated behind that
+flag, distinct from the default.
+
+**Confirmed empirically**, with a minimal, decisive test: two synthetic kernels with the
+*identical* instruction count (a fixed 65536-iteration load-increment-store loop), differing only
+in whether their working set is a 4KB (L1-resident) or 4MB (cache-hostile, strided) buffer:
+
+| Working set | `--timing` Pcycles-derived time |
+|---|---:|
+| 4KB, cache-resident | 0.000393 s |
+| 4MB, cache-hostile | 0.010925 s |
+
+**~27.8x apart, despite executing the exact same instructions in the exact same order.** Raw
+instruction counting (what `MOCKDSP` gives BEAM today) would report these as identical. This is
+real evidence `--timing` mode sees a real class of effect instruction counting cannot, in
+principle, ever see.
+
+### The tinygrad-side change
+
+`HEXSIM=1` is a new third `DSPDevice` mode (alongside the real phone and `MOCKDSP=1`), landed on
+the `onnxsim/tinygrad` fork's `vrmpy-hexagon-support` branch
+(https://github.com/onnxsim/tinygrad/pull/1, same PR as the earlier `vrmpy` `TensorCore` work --
+stacked onto it rather than a new PR, matching this project's usual pattern for an already-open,
+unmerged PR). Mechanism, in `tinygrad/runtime/ops_dsp.py`:
+
+- `HexagonSimRenderer` emits a hosted `main()` (hexagon-sim's standalone-OS mode has real libc,
+  unlike `MOCKDSP`'s bare-metal `trap0`-syscall entry) with zero-filled static buffers. This is
+  safe because cycle count for a fixed-control-flow kernel (true of every kernel this project
+  generates -- conv/gemm with static loop bounds, no data-dependent branches) doesn't depend on
+  data *values*, only on the shapes/loop-bounds already baked into the generated source -- so no
+  live buffer data needs copying from the caller at all.
+- Reading a cycle-counter register live from inside a standalone-sim binary doesn't work (the
+  PCYCLE control register pair reads back 0 in this mode -- the same finding
+  `hexagon_sim_harness.py` already made), so `HexagonSimCompiler.compile()` compiles the *same*
+  kernel wrapper twice (`REPEAT=1` vs `REPEAT=2`, calling the kernel body once vs. twice) and
+  `HexagonSimProgram.__call__` runs both ELFs under `hexagon-sim --timing`, returning the
+  *difference* in each run's total Pcycles -- the simulator is deterministic, so this exactly
+  isolates one kernel invocation's cost and cancels the fixed process-startup overhead (same
+  differencing technique `hexagon_sim_harness.py`'s `run_kernel(..., measure_cycles=True)` uses).
+  Both ELFs are cached together via the normal `Compiler.compile_cached()` path, so the real
+  hexagon-clang + hexagon-sim round trip only happens once per distinct kernel source, not once
+  per `__call__`.
+- This needed **zero changes to BEAM search itself** -- `Program.__call__`'s return value (a
+  float, lower is better) is the only integration point, and it already treats that value as an
+  opaque timing signal regardless of which `DSPDevice` mode produced it.
+
+Verified: deterministic across repeated runs of the same compiled ELF pair; scales correctly with
+workload (doubling a kernel's inner-loop trip count measured ~1.93-1.97x, not exactly 2x --
+plausible with pipeline/dual-issue overlap now being modeled); a real tinygrad-rendered GEMM
+kernel run end to end through `Tensor.realize()` under `HEXSIM=1` reports a sane, nonzero,
+Hexagon-pipeline-derived per-kernel time through the normal `DEBUG=2` display.
+
+Usage: `HEXSIM=1 DEV=DSP HEXAGON_TOOLS=<Hexagon SDK Tools dir> BEAM=2 python3 your_script.py` --
+same shape as `MOCKDSP=1`'s existing usage, just swap the env var. Prefer `HEXSIM=1` over
+`MOCKDSP=1` whenever a BEAM search decision plausibly involves a memory/cache tradeoff (tile
+sizes, blocking, working-set-sensitive reduction orders); `MOCKDSP=1` remains the faster option
+(no real hexagon-clang/hexagon-sim round trip) when only correctness verification is needed, or
+when candidates differ only in raw compute-instruction mix with comparable working sets.
+
 ## Files
 
 - `capture_kernel.py` -- capture tinygrad's rendered Hexagon C for a shape, verified under qemu.
