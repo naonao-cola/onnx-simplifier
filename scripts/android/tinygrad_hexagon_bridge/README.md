@@ -366,37 +366,76 @@ accumulate-loop pattern to a genuine spatial convolution:
 
 Verified **bit-exact correct on real hardware** (`vrmpybusv_acc_128B`, uint8 activation x signed
 int8 weight, matching the real backbone's QNN quantization) at the three highest-impact 3x3 shapes
-in the profile, at their real spatial sizes:
+in the profile, at their real spatial sizes. Initial (untiled, `ow_tile=1`) results were a **mixed
+result**: correct everywhere, but the single biggest 3x3 bucket in the whole profile
+(`cin=cout=256`) was *slower* than stock TVM, the two smaller-channel shapes roughly even to
+modestly faster:
 
-| `cin` | `cout` | spatial | stock TVM | `custom_kernel` | speedup | correct |
-|---:|---:|---|---:|---:|---:|---|
-| 256 | 256 | 200x272 | 49.30 GMAC/s (0.651 s) | 33.41 GMAC/s (0.960 s) | **0.68x (slower)** | yes |
-| 64 | 64 | 200x272 | 20.86 GMAC/s (0.096 s) | 28.96 GMAC/s (0.069 s) | **1.39x** | yes |
-| 128 | 128 | 100x136 | 31.87 GMAC/s (0.063 s) | 32.19 GMAC/s (0.062 s) | **1.01x** | yes |
+| `cin` | `cout` | spatial | stock TVM | untiled (`ow_tile=1`) | speedup |
+|---:|---:|---|---:|---:|---:|
+| 256 | 256 | 200x272 | 49.30 GMAC/s (0.651 s) | 33.41 GMAC/s (0.960 s) | **0.68x (slower)** |
+| 64 | 64 | 200x272 | 20.86 GMAC/s (0.096 s) | 28.96 GMAC/s (0.069 s) | **1.39x** |
+| 128 | 128 | 100x136 | 31.87 GMAC/s (0.063 s) | 32.19 GMAC/s (0.062 s) | **1.01x** |
 
-Unlike every 1x1 shape above, this is a **mixed result, reported honestly**: correctness holds at
-every shape (three more data points at smaller scales during development, `cin/cout` from 4 to 256,
-also matched a numpy reference under qemu), but speed doesn't uniformly beat TVM the way the 1x1
-kernel did. The `cin=cout=256` shape -- the single biggest 3x3 bucket in the whole profile -- is
-*slower* than stock TVM; the two smaller-channel shapes are roughly even to modestly faster.
-
-**Why, most likely**: this kernel does zero explicit cache-blocking or output-tile reuse -- it's a
-direct nested loop (`oh -> ow -> nt -> reduction`) with no register tiling across neighboring output
+**Why, most likely**: this kernel did zero explicit cache-blocking or output-tile reuse -- a direct
+nested loop (`oh -> ow -> nt -> reduction`) with no register tiling across neighboring output
 pixels, unlike the 1x1 kernels where every "row" (`M`) is independent and TVM's own baseline was
 already memory-bound in a way a single-accumulator loop matches well. A 3x3 conv's per-output-pixel
 weight working set is 9x an equivalent 1x1's (`9*256*256 = 589824` packed weight bytes at the
-biggest shape -- past a typical Hexagon L1's size, so every output pixel's full reduction re-streams
-weight data from L2/memory with no reuse across pixels); TVM's schedule likely blocks/tiles this
-where our naive loop doesn't, which plausibly explains why the *smaller*-channel shapes (weight
-working set 9x smaller, fits cache more easily) come out roughly even or ahead while the biggest one
-falls behind.
+biggest shape -- past a typical Hexagon L1's size, so every output pixel's full reduction re-streamed
+weight data from L2/memory with no reuse across pixels).
 
-**Not done**: any register/cache-blocking tiling (e.g. accumulating several output columns per
-weight load to amortize the reduction across neighbors, matching what `TVM`'s own schedule likely
-does) -- the natural next step if this is picked back up, and the same kind of tuning investment the
-1x1 kernels never needed to make. Real end-to-end backbone impact also isn't measured (would need
-the same splice-into-`relay.build()` mechanism `backbone_splice/` uses, currently blocked on that
-work's own unresolved RPC loading bug -- see `backbone_splice/README.md`).
+### Fixing it: output-tile reuse (`ow_tile`)
+
+`build_kernel()`'s new `ow_tile` parameter processes several adjacent output columns per
+accumulator group: for each reduction step, the packed weight slice (shared across all tiled output
+columns -- it depends only on `nt`/`kc`, not on the output column) is loaded into a local vector
+once and reused across `ow_tile` separate `vrmpybusv_acc` calls, one per tiled column with its own
+`AddrSpace.REG` accumulator, instead of being re-fetched from memory once per output pixel. Both the
+fused accumulate step and the fused output write-back are single `Ops.CUSTOM` statements covering
+all `ow_tile` columns at once (see the file for why: an earlier version tried chaining `ow_tile`
+separate per-column `CUSTOM` statements via `.after()`, which looked right -- each later write's
+source embeds a dependency on the earlier write -- but silently dropped every write except the last
+from the rendered output, since `.after()` only orders two nodes that are *already* reachable from
+the sink; it doesn't itself make an otherwise-unreferenced void statement reachable. Confirmed by
+inspecting the generated C for `ow_tile=2`: only the last column's write appeared, so half the
+output columns were simply never written -- exactly the 50% mismatch that bug produced before the
+fix).
+
+Tile size was picked using the `HEXSIM=1` BEAM-search timing mode (see "Timing BEAM search
+candidates with hexagon-sim instead of raw instruction counting" elsewhere in this file, or PR
+https://github.com/onnxsim/onnxsim/pull/1780) rather than guessed -- a genuine, deliberate test of
+that infrastructure, not just a demonstration. At the real `cin=cout=256, 200x272` shape,
+`hexagon-sim --timing`'s Pcycles-derived cost was **non-monotonic** in tile size, real signal a
+qemu-instruction-count proxy would not have shown:
+
+| `ow_tile` | Pcycles-derived time | vs untiled |
+|---:|---:|---:|
+| 1 (untiled) | 7244.75 us | -- |
+| 2 | 8265.37 us | **worse** |
+| 4 | 5319.82 us | 1.36x better |
+| 8 | 4745.00 us | **1.53x better** |
+
+`ow_tile=8` won clearly and was verified bit-exact correct on real hardware at all three profile
+shapes, with a uniform ~1.3x real-hardware speedup over the untiled kernel and no regressions:
+
+| `cin` | `cout` | spatial | stock TVM | untiled | tiled (`ow_tile=8`) | vs TVM | vs untiled |
+|---:|---:|---|---:|---:|---:|---:|---:|
+| 256 | 256 | 200x272 | 49.30 GMAC/s | 33.41 GMAC/s | **44.16 GMAC/s** (0.727 s) | 0.90x (still slower) | 1.32x |
+| 64 | 64 | 200x272 | 20.86 GMAC/s | 28.96 GMAC/s | **38.01 GMAC/s** (0.053 s) | **1.82x** | 1.31x |
+| 128 | 128 | 100x136 | 31.87 GMAC/s | 32.19 GMAC/s | **42.44 GMAC/s** (0.047 s) | **1.33x** | 1.32x |
+
+Reported honestly: tiling closes *most* of the gap at the biggest shape (0.68x -> 0.90x of TVM) but
+not all of it, while pushing the two already-ahead shapes further ahead (1.39x -> 1.82x, 1.01x ->
+1.33x). `ow_tile=8` needs 8 concurrent `(32,)` `int32` accumulators live at once (8 HVX vector
+registers, 1KB) plus the weight/activation working set -- likely close to Hexagon v73's real
+register budget, which is a plausible reason larger tiles weren't swept further.
+
+**Not done**: sweeping `ow_tile` values beyond 8 (`iw`'s divisors go up to 68 for the `272`-wide
+shapes) in case a larger tile keeps helping without spilling; row-tiling (`oh`) in addition to
+column-tiling; fully closing the `cin=cout=256` gap. Real end-to-end backbone impact also isn't
+measured (would need the same splice-into-`relay.build()` mechanism `backbone_splice/` uses,
+currently blocked on that work's own unresolved RPC loading bug -- see `backbone_splice/README.md`).
 
 ### Coverage: the ResNet stem 7x7 conv (`hex_stem7x7_kernel.py`) -- the last uncovered conv shape
 
@@ -634,10 +673,10 @@ when candidates differ only in raw compute-instruction mix with comparable worki
   the real Mask R-CNN pathological shape (see "It works" above). Bridge its output through
   `bridge_and_test.py` (after pre-packing `B` via `pack_b()`) to run it on real hardware.
 - `hex_conv3x3_kernel.py` -- a real spatial 3x3 conv via the same `vrmpybusv`/`custom_kernel`
-  pattern, extended to a 9-position reduction and pre-padded input addressing. Correct on real
-  hardware at every shape tested; faster than stock TVM at two of the three real profile shapes
-  tested, slower at the biggest one (`cin=cout=256`) -- see "Coverage: a real 3x3 conv" above for
-  why, and what tiling work would likely close the gap.
+  pattern, extended to a 9-position reduction, pre-padded input addressing, and (`ow_tile`)
+  output-tile reuse across neighboring output columns. Bit-exact correct at every shape tested;
+  faster than stock TVM at two of the three real profile shapes, ~0.90x of TVM (up from 0.68x
+  before tiling) at the biggest one (`cin=cout=256`) -- see "Coverage: a real 3x3 conv" above.
 - `hex_stem7x7_kernel.py` -- the ResNet stem 7x7 conv, generalizing `hex_conv3x3_kernel.py`'s
   9-position pattern to 49 and handling `cin=3` (not a multiple of 4) via reduction-axis
   zero-padding. Bit-exact correct and 14.08x faster than stock TVM on real hardware at the real
