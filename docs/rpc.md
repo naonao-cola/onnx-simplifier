@@ -60,6 +60,29 @@ python -m onnxsim.rpc server --port 9090 --key pixel --tracker host:9190     # r
 | `Session.run(model, inputs)` | one-shot run without keeping a handle |
 | `rpc.remote_executor(session)` | context manager: `onnxsim.simplify` folds constants remotely |
 
+## Benchmarking tinygrad's code generation
+
+`load_model(..., runtime="tinygrad", device="NV", options={"BEAM": 2})` runs the model through
+tinygrad's ONNX frontend on a tinygrad device of the *server's* hardware, so tinygrad's codegen can
+be benchmarked (and compared with onnxruntime through the same API) on any machine that can run a
+server. `time_evaluator` then returns tinygrad-specific `stats` next to the timings:
+
+| Key | Meaning |
+|---|---|
+| `results` | wall time per call of a steady-state `TinyJit` replay (no Python ONNX interpreter cost) |
+| `kernels`, `gflops`, `gbytes` | kernel count, FLOPs and bytes moved by one replay (tinygrad's counters) |
+| `kernel_time_s` | summed device kernel time of one replay (measured under `DEBUG=2`) |
+| `eager_call_s`, `first_call_s` | one interpreted call, and the first call including kernel compilation |
+| `device`, `options` | what actually ran |
+
+Codegen `options` are allow-listed (`BEAM`, `NOOPT`). Each loaded tinygrad model runs in its own
+worker process, so every `(device, options)` pair starts from clean kernel/schedule caches -- a
+`BEAM` setting really applies instead of reusing kernels compiled earlier under another setting --
+and tinygrad's thread-bound state and GPU faults stay out of the server. tinygrad's ONNX frontend
+caches Python constants between calls, so this suits static-shape models. `scripts/tinygrad/`
+has a benchmark built on this; a server started with `MOCKDSP=1` also exposes tinygrad's Hexagon
+renderer (kernels executed under `qemu-hexagon-static`, where "time" is an instruction count).
+
 ## Remote constant folding
 
 onnxsim's folder builds a throwaway sub-model per fold group and hands it to a `ModelExecutor`
