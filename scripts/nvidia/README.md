@@ -12,6 +12,9 @@ hand-built-graph tests in `tests/test_tensorrt_*.py` (which never invoke TensorR
 | `imagenette_data.py` | any with Pillow | preprocesses Imagenette (real ImageNet images, 10 classes) into val + calibration `.npy` sets |
 | `ort_cpu_check.py` | any with onnxruntime | top-1 of ONNX models on a val subset via ORT CPU: separates "quantized model is inaccurate" from "TensorRT mishandles it" |
 | `eval_accuracy.py` | system Python with `tensorrt` | streams the val set through each variant's TensorRT engine; top-1 and agreement with fp32 |
+| `sparsity_check.py` | onnxsim (`gen`) then system Python with `tensorrt` (`trt`) | checks whether TensorRT's builder gives 2:4-pruned `MatMul`/`Gemm` weights sparse tactics |
+| `trt_nms_check.py` | onnxsim (`gen`), system Python with `tensorrt` (`trt`), any (`compare`) | differentially checks `rewrite_trt_batched_nms`'s output against the real `BatchedNMSDynamic_TRT` plugin |
+| `run_cuda_feature_notebook.py` | onnxsim + a GPU `onnxruntime` | runs `examples/cuda_feature_tests/cuda_feature_tests.ipynb`'s tests as a plain script |
 
 They are split because JetPack 6's TensorRT Python bindings are cp310-only while onnxsim
 needs Python >= 3.11; models are exchanged as `.onnx` files.
@@ -169,3 +172,60 @@ The Orin Nano has no DLA. `tensorrt.Builder().num_DLA_cores == 0`, there is no
 `--buildDLAStandalone`) fails with `Cannot create DLA engine, 0 not available` even
 though `nvidia-l4t-dla-compiler` is installed. DLA compilation and latency need an
 Orin NX or AGX Orin; none of the numbers above involve a DLA.
+
+## CUDA feature notebook (`examples/cuda_feature_tests/`): blocked on this board
+
+`scripts/nvidia/run_cuda_feature_notebook.py` runs `cuda_feature_tests.ipynb`'s 7 tests
+(Tests A-G: `backend.run_model` CPU/CUDA parity, `simplify(providers=CUDA)` GPU constant
+folding, the `(name, options)` device-pinning tuple form, CLI `--cuda`, the
+unavailable-provider `ValueError`, DLPack zero-copy with a CUDA `torch.Tensor`, and
+`measure_accuracy_drop(providers=CUDA)`) as a plain script, so they can run outside
+Jupyter/Colab -- the notebook is explicitly hand-run-only and has never executed on real
+hardware.
+
+```sh
+python3.12 scripts/nvidia/run_cuda_feature_notebook.py
+```
+
+**Could not actually run any of the 7 tests on this board.** onnxsim requires Python >=
+3.11 (its wheel is `cp312-abi3`), but the only real GPU-capable `onnxruntime` for JetPack
+6/CUDA 12.6 -- the Jetson AI Lab index
+(`--index-url https://pypi.jetson-ai-lab.io/jp6/cu126`) -- ships `onnxruntime-gpu` (1.24.0)
+for `cp310` only (confirmed with `uv pip install --dry-run`, not by guessing: it resolves
+cleanly against `/usr/bin/python3.10` and fails ABI resolution against 3.12). No single
+interpreter on this board can import both `onnxsim` and a working GPU `onnxruntime`.
+
+PyPI's plain `onnxruntime-gpu==1.30.0` does have a `cp312`/aarch64 wheel and installs
+without error, so it is tempting to reach for as a workaround -- but it requires CUDA
+13.x/cuDNN 9.x, and this board runs CUDA 12.6. Concretely reproduced (not just inferred
+from the version requirement): `rt.get_available_providers()` lists
+`CUDAExecutionProvider` regardless -- that check is static metadata, not a real capability
+probe -- but creating an `InferenceSession` with it requested fails to `dlopen
+libcublasLt.so.13` and **silently falls back to `CPUExecutionProvider`**, with no
+exception, only a stderr warning:
+
+```
+Failed to load library .../libonnxruntime_providers_cuda.so with error:
+  libcublasLt.so.13: cannot open shared object file: No such file or directory
+Failed to create CUDAExecutionProvider. Require cuDNN 9.* and CUDA 13.*.
+```
+
+**This is worth a maintainer's attention beyond this board's mismatch**: onnxsim's own
+provider validation (`onnxsim/backend.py:178`, `available = set(rt.get_available_providers())`)
+checks exactly the same static list that just lied above. So `onnxsim.simplify(providers=
+["CUDAExecutionProvider"])` or `backend.run_model(..., providers=CUDA)` on a
+version-mismatched `onnxruntime-gpu` install raises nothing and silently returns a
+CPU-computed result -- indistinguishable from a real GPU run to the caller, including
+Test A's "CPU vs CUDA parity" check, which would trivially pass either way (both sides
+would be CPU). Not fixed here (a behavior change to a core runtime path deserves its own
+review, not a bundled verification-script PR); the fix would compare each requested
+provider against the *session's actual* `sess.get_providers()` after construction (which
+does reflect real fallback) rather than trusting `get_available_providers()` alone, and
+warn or raise on mismatch.
+
+Not attempted: building `onnxruntime-gpu` from source for `cp312`/CUDA 12.6/sm_87 (a
+multi-hour build disproportionate to this check). The script itself is unaffected by any
+of this and should work as-is on a board where a GPU `onnxruntime` matching onnxsim's
+Python floor actually exists (e.g. an x86 box with `onnxruntime-gpu`, or a future JetPack
+release on CUDA 13).
+
