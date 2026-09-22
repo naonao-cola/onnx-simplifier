@@ -142,3 +142,78 @@ op-at-a-time execution model (a clear `NotImplementedError` per missing operator
 whole-graph compiler to crash), and a QEMU test path that works out of the box. TVM has the
 working int8 Hexagon backend. A practical combination is tinygrad as the graph executor
 and correctness reference, with TVM-compiled Hexagon kernels behind it.
+
+## Follow-up: does the int8 backbone actually use the DSP's hardware threads?
+
+A quick disassembly check (grepping for the literal string `TVMBackendParallelLaunch` in
+`hexagon-llvm-objdump -d` output) found zero matches in the compiled int8 backbone and
+concluded parallel scheduling was silently dropped on Hexagon. **That conclusion was wrong** --
+`objdump -d` does not print a symbol name for an indirect call through a GOT-resolved function
+pointer, which is exactly how Hexagon RPC modules import `TVMBackendParallelLaunch` (a weak
+`OBJECT` symbol resolved at load time, the same mechanism as `__TVMBackendAllocWorkspace` in
+`../hexagon_sim_harness.py`). `hexagon-readelf --dyn-syms` / `-r` on the same `.so` show the
+relocation is present and correctly wired:
+
+```
+18: 002e20d8   4 OBJECT WEAK DEFAULT 13 __TVMBackendParallelLaunch
+```
+
+Checked on the real phone with a controlled A/B (`relay.transform.FakeQuantizationToInteger` +
+`relay.build`, same backbone, `te.schedule.Stage.parallel` monkeypatched to a no-op for the
+"forced serial" row):
+
+| Build | Median wall time |
+|---|---:|
+| default (parallel schedule, as shipped) | 3.68 s |
+| target `num_cores=1` vs `num_cores=4` | 3.68 s vs 3.69 s -- no measurable difference |
+| every `.parallel()` call replaced with a no-op (truly serial) | 12.56 s |
+
+So parallel dispatch is genuine and contributes a real **3.4x** on this workload -- the earlier
+"0 ParallelLaunch calls" claim was a tooling mistake (checking disassembly text instead of
+relocations), not a finding about the runtime. The `num-cores` target attribute, however, has no
+measurable effect: `CreateParallelLaunch` in TVM's Hexagon codegen path calls
+`TVMBackendParallelLaunch(body, /*num_task=*/0, ...)` for a plain `.parallel()`-scheduled loop
+(no explicit task count), so the actual worker-thread count is a Hexagon-runtime-side decision,
+not something the compiled kernel's target string controls. With about 3.4x already realized,
+thread count is not the remaining bottleneck for this workload; the leads noted above (per-shape
+vrmpy tiling, MetaSchedule/AutoTVM tuning) remain the likely next gains.
+
+## Follow-up: a 21x anomaly in the FPN upsample op
+
+Looking for where the backbone's 3.68s actually goes (attempting `tvm.contrib.hexagon`'s
+`get_graph_debug_executor().run_individual()` for exact per-op timing hit a FastRPC transfer
+limit -- `hexagon_rpc_send failed: 78` -- on this 116-function graph; a genuine tool limitation
+worth noting for anyone trying real per-op profiling on this Hexagon RPC path, not something
+fixed here), a static instruction-count breakdown of the compiled `.so` pointed at 18 separate
+`layout_transform`/`resize2d` kernels (`hexagon-nm` categorised: 71 `conv2d_NCHWc` functions at
+71.4% of static instructions, `layout_transform`-family functions at ~16%). The single largest
+non-conv function (3384 static instructions) is the FPN's nearest-neighbor upsample fused with
+its layout transform.
+
+Isolated and measured directly on the phone (`relay.image.resize2d`, int8, 34x34x256 ->
+68x68x256, the P5->P4 FPN upsample shape for an 800x1088 input):
+
+| Kernel | Output size | Median wall time |
+|---|---|---:|
+| `nn.relu` (trivial elementwise baseline) | `[1,256,68,68]` int8 | 1.88 ms |
+| `image.resize2d` nearest-neighbor upsample | `[1,256,68,68]` int8 | **39.77 ms** |
+
+**21x slower than a trivial op of the identical output size**, for an operator that does *less*
+real work (index/copy, no per-element arithmetic). The compiled kernel is vectorized and does
+import `TVMBackendParallelLaunch` (144 `vmem` HVX loads/stores, one parallel-launch relocation --
+so this is not a repeat of the earlier false "parallel is broken" lead), but its disassembly
+shows `call 0x330 <ceilf@plt>` immediately before groups of vector stores: the coordinate
+transform (`half_pixel` + `round_prefer_floor` by default) computes each output row/column's
+source index with a **scalar libm `ceilf` call**, the same class of bug the Sigmoid work found
+earlier in this project (`te.floor`/`te.abs` lowering to one scalar call per lane and
+serialising an otherwise-vectorized loop -- see `../hexagon_qfloat.py`'s docstring and the
+Sigmoid section of `../README.md`). Not root-caused to a specific line of
+`topi/image/resize.py`'s `resize2d` compute in this session, and not fixed -- a good next step
+for whoever continues this: precompute the per-row/column integer source indices as a small
+vectorizable int32 loop (or, since Mask R-CNN's FPN always upsamples by exactly 2x with
+`nearest_neighbor`, special-case integer-factor nearest-neighbor resize to skip the general
+`coordinate_transformation_mode` float math entirely).
+
+With 3-4 such FPN merges in the backbone, this is on the order of 100-150 ms of the 3.68s total
+(3-4%) -- not the dominant cost, but a disproportionate, well-isolated, likely-cheap-to-fix one.
+
