@@ -611,7 +611,7 @@ now `prefetch_dist=16`; pass `prefetch_dist=0` to reproduce the original, unpref
 number (a bridge-infrastructure issue, not a kernel one); `maxpool`/`sigmoid` coverage (a separate,
 concurrent effort in this session).
 
-### `maxpool`/`sigmoid`: two real, structural blockers -- `maxpool` unblocked, `sigmoid` still open
+### `maxpool`/`sigmoid`: two real, structural blockers -- both now unblocked
 
 The last two items in `noncon_profile.json` (confirmed via `profile_noncon_ops.py`'s
 `build_specs()`, not assumed): `maxpool` is `uint8`, kernel `3x3`, stride `2`, pad `1`, dominant
@@ -643,19 +643,13 @@ first looked at them, documented here rather than forced:
   correctness check. Every kernel this project has ever built (12+ conv/GEMM/elementwise kernels
   across `hex_gemm_kernel.py`, `hex_conv3x3_kernel.py`, `hex_stem7x7_kernel.py`,
   `hex_add_kernel.py`) has been `uint8`/`int8`/`int32` -- **this is the first time this project has
-  tried a `float32` op on this DSP backend at all**, and it surfaces a real gap: no Hexagon
-  compiler-rt soft-float helpers (`__hexagon_divsf3`, and transitively whatever `expf`/`powf`-style
-  helpers a real `exp()` would need) are linked into `DSPCompiler`'s minimal freestanding build. A
-  hand-written `custom_kernel` sigmoid could route around `exp()`/division entirely with a
-  division-free polynomial or bit-trick approximation, but designing and numerically verifying one
-  with confidence, in addition to fixing or working around the missing compiler-rt symbols, was
-  more than fit in the time available this pass.
+  tried a `float32` op on this DSP backend at all**. **Follow-up below: root-caused and fixed** --
+  turned out to be a clang-version-dependent soft-float linking gap, not a fundamental Hexagon
+  limitation.
 
 Both are real, evidenced findings, not just "ran out of time" -- useful for whoever picks these up
 next: `maxpool` needs a genuinely new HVX deinterleave pattern (see below for how that turned out
-not to be necessary after all); `sigmoid` needs `DSPCompiler` extended with Hexagon compiler-rt
-soft-float symbols (or a division/exp-free approximation) before any float32 op can run on this
-backend at all, `custom_kernel` or otherwise.
+not to be necessary after all); `sigmoid`'s blocker is also resolved -- see its own section below.
 
 ### `maxpool` unblocked: TVM's own reference layout, not a new HVX pattern (`hex_maxpool_kernel.py`)
 
@@ -713,6 +707,100 @@ windows make neighboring *output* positions' input windows non-contiguous (each 
 4-output-wide group needs input at `2*ow+kw` for `ow=ow0..ow0+3`, a stride-2 gapped read, not a
 contiguous load), the same deinterleave complexity the original blocker flagged -- avoided
 deliberately here in favor of landing a correct, real, already-faster-than-TVM result first.
+### `sigmoid`, unblocked: it was a clang version, not a Hexagon limitation
+
+Investigating via TVM's own reference approach (checking what TVM's Hexagon target does
+differently, per this project's established `hexagon-sim`/`+hvx-qfloat` context) turned up the
+real cause before qfloat/LUT tricks were even needed: **`__hexagon_divsf3` is a clang/LLVM-version
+dependency, not a fundamental gap.** Reproducing the exact failure with different `clang` binaries
+(all available in this environment, `clang-15` through `clang-21`) shows a clean version split:
+
+| `clang` version | `a.sigmoid()` under `MOCKDSP=1` |
+|---|---|
+| 15, 17 | `ld.lld: error: undefined symbol: __hexagon_divsf3` (the original finding) |
+| 19, 21 | **compiles and runs correctly**, no missing symbol at all |
+
+Disassembling a minimal repro compiled with `clang-19` shows why: it inlines scalar Hexagon float
+division as a native Newton-Raphson instruction sequence (`sfrecipa`/`sffixupn`/`sffixupd` +
+`sfmpy:lib`) directly in the generated code, never calling out to compiler-rt at all. `clang-15`/
+`clang-17` instead emit a libcall to `__hexagon_divsf3` -- which `DSPCompiler`'s freestanding
+`-nostdlib` build has nothing to provide, hence the link failure. Same Hexagon target, same `-O2`,
+different codegen choice depending purely on which LLVM version compiled it.
+
+**The fix, landed in `onnxsim/tinygrad`'s `vrmpy-hexagon-support` branch** (commit `4ac16f5b6`,
+stacked onto the existing open PR https://github.com/onnxsim/tinygrad/pull/1, same branch every
+other tinygrad-side change in this project has used): link the Hexagon toolchain's own `libgcc.a`
+(a plain static archive providing `__hexagon_divsf3` and friends) into `DSPCompiler`'s build when
+`HEXAGON_TOOLCHAIN`/`HEXAGON_SDK_ROOT` is set, so `float32` ops work regardless of which `clang`
+version ends up compiling them -- a robust, version-independent fix rather than pinning a specific
+clang. Since it's a static archive, only symbols a kernel actually references get pulled in, so
+this is a costless no-op for every existing `uint8`/`int8`/`int32` kernel (confirmed: an existing
+`int32` add kernel produces identical output with and without the archive linked).
+
+Verified **bit-exact correct under qemu** (`MOCKDSP=1`, `CC=clang-17` -- the previously-failing
+version, now working via the `libgcc.a` link) against a numpy `1/(1+exp(-x))` reference at all five
+real profile shapes:
+
+| elements | max abs error vs numpy |
+|---:|---:|
+| 663 | 5.96e-08 |
+| 2,550 | 5.96e-08 |
+| 10,200 | 5.96e-08 |
+| 40,800 | 5.96e-08 |
+| 163,200 | 1.19e-07 |
+
+All within float32 rounding precision -- a clean pass, not an approximation with a real error
+budget (no polynomial/bit-trick approximation was needed after all; tinygrad's own composition of
+primitive UOps for `.sigmoid()`, once it can actually link, is already numerically exact to
+float32 precision).
+
+### Real-hardware follow-up: correct, but no auto-vectorization, same lesson as `add`
+
+Bridged via the same pattern as every other kernel here (`hexagon-clang` compile + a thin
+`sigmoid_wrapper_template.c` TVM `PackedFunc` shim + `tvm.contrib.hexagon.tools.link_shared` +
+`HexagonLauncher`/RPC session, device `239dbd8f`, real profile shape `n=163200`).
+
+**The anticipated "same class of problem resurfaces in the bridge's own link step" did NOT
+happen**: the Hexagon SDK's own `hexagon-clang` is version **19.0.04** -- squarely in the "clang
+>=19 inlines float division natively" bucket this section already found, not the 15/17 bucket that
+needed `libgcc.a`. Compiling the captured kernel with it produces zero undefined symbols; no
+soft-float archive needed on this path at all. (The `DSPCompiler`-side `libgcc.a` fix above is
+still correct and still needed -- it's what makes `MOCKDSP=1`/qemu work with whichever `CC` a given
+environment happens to default to -- this is just confirmation that the specific real-hardware
+toolchain in use here was never going to hit the same gap.)
+
+**Correctness: bit-exact with the qemu run**, same `max_abs_err=9.16e-08` on real silicon as under
+`MOCKDSP=1` -- deterministic, not a coincidence of RNG seeding.
+
+**Speed: correct, but real, honest loss** -- confirmed at both `BEAM=0` (tinygrad's default here,
+which turned out to fully unroll the loop into a 125 KB source, one literal expression per element)
+and `BEAM=2` (which found a proper single scalar loop, ~1 KB source) -- both landed at essentially
+the same real-hardware throughput, consistent with neither being vectorized at all:
+
+| kernel | median | throughput | vs TVM |
+|---|---:|---:|---:|
+| tinygrad, `BEAM=0` (full unroll) | 15.797 ms | 0.0103 G-elem/s | 0.32x (3.1x slower) |
+| tinygrad, `BEAM=2` (scalar loop) | 16.763 ms | 0.0097 G-elem/s | 0.30x (3.3x slower) |
+| stock TVM (`relay.sigmoid`) | 5.038-5.072 ms | 0.0322-0.0324 G-elem/s | -- |
+
+Both tinygrad variants are within noise of each other and consistently ~3x behind TVM -- the same
+finding `add`'s own history already established for this backend: tinygrad's normal codegen path
+does not reach for HVX vector width on its own for a plain elementwise op, regardless of `BEAM`
+search width (higher `BEAM` finds better *loop structure*, not vectorization, here). `add` closed
+an equivalent gap with a hand-written `Tensor.custom_kernel` (`hex_add_kernel.py`); the same move
+would very plausibly work here too (`sigmoid`'s transcendental body doesn't block it -- the
+existing scalar composition already proved numerically exact, so a vectorized version only needs
+to run that same expression across an HVX-width group of lanes at once, not re-derive the
+approximation) -- not attempted here, flagged as the natural next step.
+
+Also unverified on real Hexagon v65 hardware specifically (this test phone is Hexagon v69, kernels
+here targeted `v73` for forward-compatibility, matching every other real-hardware kernel in this
+project -- see `scripts/android/maskrcnn_e2e/README.md`'s "Xiaomi 12S (Hexagon V69; kernels
+compiled for v73)"): this SDK snapshot ships no `v65`-specific `libgcc.a` (oldest available is
+`v68`), so `DSPCompiler`'s `MOCKDSP=1`/qemu-side fallback uses the lowest available version --
+Hexagon's scalar ISA has been stable `v65`-`v81`, making this a reasonable bet, but not one this
+real-hardware run (targeting `v73`, which has its own `libgcc.a` and didn't need it anyway) confirms
+for `v65` specifically.
 
 ### Coverage: FPN `resize2d` (`hex_resize2x_kernel.py`) -- correct, beats stock, loses to the already-fixed fast path
 
