@@ -29,6 +29,32 @@ So: **building ONNX Runtime is not required to build, test, or ship the Python w
 If you see long ONNX Runtime C++ compilation, that's the `ONNXSIM_BUILTIN_ORT=ON` path
 (standalone C++/WASM), not the wheel path.
 
+## `ONNXSIM_NON_CORE_FEATURES` skips the LLM/PTQ quantization + pruning algorithm library
+
+`onnxsim/` ships ~50 self-contained, single-call quantization- and pruning-algorithm
+entry points (`*_entry.cpp` -- GPTQ, AWQ, SmoothQuant, Wanda/structured/magnitude
+pruning, cross-layer equalization, ...), each its own translation unit compiled into
+the `onnxsim` static library and bound to Python in `cpp2py_export.cc`. None of them
+sit on `Simplify()`'s own fixed point or the `onnxsim` CLI -- they're opt-in passes a
+caller invokes by name -- so they are real, avoidable compile time for a CI job that
+only exercises core simplification.
+
+`CMakeLists.txt`'s `ONNXSIM_NON_CORE_FEATURES` option (default **ON**, so the default
+build is unchanged) controls whether those `*_entry.cpp` files are added to the
+`onnxsim` target at all. Turning it `OFF`:
+- drops the ~50 files from the `onnxsim` library build (`ONNXSIM_NON_CORE_FEATURE_SOURCES`
+  in `CMakeLists.txt`),
+- `#ifdef`s out the matching prototypes/includes in `onnxsim.h` and nanobind bindings in
+  `cpp2py_export.cc` behind `ONNXSIM_HAS_NON_CORE_FEATURES` (only defined when the option
+  is `ON`), the same pattern `ONNXSIM_HAS_ORT`/`ONNXSIM_HAS_XNNPACK` already use.
+
+For the Python wheel/`pip install`, set the env var `ONNXSIM_NON_CORE_FEATURES=0` (setup.py
+maps it to the CMake flag); for a plain CMake build, pass `-DONNXSIM_NON_CORE_FEATURES=OFF`
+directly (or via `CMAKE_ARGS` under setup.py). This is purely a build-time trim: it does
+not touch `ONNXSIM_BUILTIN_ORT`, and it leaves QAT/LoRA/fine-tuning (`qat_entry.cpp`,
+`lora_entry.cpp`, `finetune_entry.cpp`) and the core optimizer untouched -- only the
+quantization/pruning algorithm entries listed in `ONNXSIM_NON_CORE_FEATURE_SOURCES`.
+
 ## Prefer `onnx.parser`-based model construction in tests
 
 When writing new tests or touching an existing test file's model-building code, build

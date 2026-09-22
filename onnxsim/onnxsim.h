@@ -18,6 +18,14 @@
 // than including its own home header, sharing a single struct definition
 // (rather than a byte-for-byte duplicate struct body in each header) avoids
 // two independently-edited copies of the same type ever drifting apart.
+// finetune_entry.h/lora_entry.h are always built (see
+// ONNXSIM_NON_CORE_FEATURE_SOURCES in CMakeLists.txt -- QAT/LoRA/fine-tuning
+// are not part of what ONNXSIM_NON_CORE_FEATURES controls), so their own
+// includes stay outside the guarded block below.
+#include "finetune_entry.h"
+#include "lora_entry.h"
+
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 #include "adaquant_entry.h"
 #include "adaround_entry.h"
 #include "affinequant_entry.h"
@@ -31,7 +39,6 @@
 #include "duquant_entry.h"
 #include "easyquant_entry.h"
 #include "embedding_quantization_entry.h"
-#include "finetune_entry.h"
 #include "flexround_entry.h"
 #include "foem_entry.h"
 #include "fptq_entry.h"
@@ -43,7 +50,6 @@
 #include "kv_cache_quantization_entry.h"
 #include "llm_fp4_activation_entry.h"
 #include "llm_int8_entry.h"
-#include "lora_entry.h"
 #include "low_rank_compensation_entry.h"
 #include "lqer_entry.h"
 #include "mixed_precision_entry.h"
@@ -70,6 +76,8 @@
 #include "structured_pruning_entry.h"
 #include "svdquant_entry.h"
 #include "tesseraq_entry.h"
+
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // RAII owner for a DLManagedTensor: releasing it invokes the tensor's own
 // DLPack deleter exactly once (per the DLPack contract), which frees whatever
@@ -284,7 +292,9 @@ onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
 // any other simplification pass -- it applies exactly this one rewrite,
 // repeated to a fixed point, to a copy of ``model`` (which is left
 // untouched) and returns the result.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto CrossLayerEqualize(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Dynamically quantizes every MatMul, and every "vanilla" Gemm (transA=0,
 // alpha=1, beta=1), whose weight is a constant 2-D float32 tensor: the weight
@@ -301,7 +311,9 @@ onnx::ModelProto CrossLayerEqualize(const onnx::ModelProto& model);
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
 // attributes, non-float32 operands, an opset older than 11) are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Same rewrite as ``QuantizeDynamic`` -- same matching rules, same weight
 // quantization, same runtime ``DynamicQuantizeLinear`` activation
@@ -322,8 +334,10 @@ onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model);
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
 // attributes, non-float32 operands, an opset older than 11) are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeDynamicMatMulIntegerToFloat(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Dynamically quantizes an existing "com.microsoft" ``Attention`` node (see
 // ``passes/fuse_attention.h`` -- this does not fuse attention itself, it
@@ -345,7 +359,9 @@ onnx::ModelProto QuantizeDynamicMatMulIntegerToFloat(
 // ``Attention`` node, a non-constant or non-2-D weight, a non-float32
 // operand, an opset older than 11, or an uneven ``qkv_hidden_sizes`` split)
 // are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeAttentionDynamic(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Dynamically quantizes every MatMul/"vanilla" Gemm whose constant weight is
 // *structurally ternary* -- every element of every output column is one of
@@ -365,7 +381,9 @@ onnx::ModelProto QuantizeAttentionDynamic(const onnx::ModelProto& model);
 // Unlike ``Simplify``, this does not run shape inference, constant folding or
 // any other simplification pass -- it applies exactly this one rewrite, once,
 // to a copy of ``model`` (which is left untouched) and returns the result.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeTernary(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Weight-only quantizes every MatMul, every "vanilla" Gemm (transA=0,
 // alpha=1, beta=1), and every Conv, whose weight is a constant float32
@@ -389,7 +407,9 @@ onnx::ModelProto QuantizeTernary(const onnx::ModelProto& model);
 // result. Nodes that do not match (dynamic or unsupported-rank weights,
 // non-default Gemm attributes, non-float32 operands, an opset older than 13)
 // are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeWeightOnly(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Block-wise INT4 weight-only quantizes every MatMul, every "vanilla" Gemm
 // (transA=0, alpha=1, beta=1), and every Conv, whose weight is a constant
@@ -416,7 +436,9 @@ onnx::ModelProto QuantizeWeightOnly(const onnx::ModelProto& model);
 // result. Nodes that do not match (dynamic or unsupported-rank weights, a
 // reduction size not divisible by 32, non-default Gemm attributes,
 // non-float32 operands, an opset older than 21) are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeWeightOnlyInt4(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Weight-only quantizes every MatMul, and every "vanilla" Gemm (transA=0,
 // alpha=1, beta=1), whose weight is a constant 2-D float32 tensor, to ONNX
@@ -438,7 +460,9 @@ onnx::ModelProto QuantizeWeightOnlyInt4(const onnx::ModelProto& model);
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
 // attributes, non-float32 operands) are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeWeightOnlyMatMulNBits(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // INT16 weight-only quantizes every MatMul, every "vanilla" Gemm (transA=0,
 // alpha=1, beta=1), and every Conv, whose weight is a constant float32
@@ -467,7 +491,9 @@ onnx::ModelProto QuantizeWeightOnlyMatMulNBits(const onnx::ModelProto& model);
 // result. Nodes that do not match (dynamic or unsupported-rank weights,
 // non-default Gemm attributes, non-float32 operands, an opset older than 21)
 // are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeWeightOnlyInt16(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Block-wise INT8 weight-only quantizes every MatMul, every "vanilla" Gemm
 // (transA=0, alpha=1, beta=1), and every Conv, whose weight is a constant
@@ -500,7 +526,9 @@ onnx::ModelProto QuantizeWeightOnlyInt16(const onnx::ModelProto& model);
 // result. Nodes that do not match (dynamic or unsupported-rank weights, a
 // reduction size not divisible by 32, non-default Gemm attributes,
 // non-float32 operands, an opset older than 21) are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeWeightOnlyInt8Block(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // OCP Microscaling MXFP4 weight-only quantizes every MatMul and every
 // "vanilla" Gemm (transA=0, alpha=1, beta=1) whose weight is a constant
@@ -524,7 +552,9 @@ onnx::ModelProto QuantizeWeightOnlyInt8Block(const onnx::ModelProto& model);
 // layer with a non-constant, non-2-D weight, or a reduction dimension not
 // divisible by 32, is left untouched; a model with no matching layer is
 // returned unchanged.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeWeightOnlyMXFP4(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Applies QLoRA-style double quantization (Dettmers et al., 2023, Section
 // 3.2) to every ``DequantizeLinear`` node already present in ``model`` whose
@@ -543,7 +573,9 @@ onnx::ModelProto QuantizeWeightOnlyMXFP4(const onnx::ModelProto& model);
 // returns the result. A scale that is not a constant initializer, not
 // float32, or too small, is left untouched; a model with no matching node is
 // returned unchanged.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyDoubleQuantization(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Magnitude pruning (Han et al., 2015) -- the data-free unstructured
 // pruning baseline. Zeros the least-magnitude entries of every
@@ -576,10 +608,12 @@ onnx::ModelProto ApplyDoubleQuantization(const onnx::ModelProto& model);
 // given; throws ``std::invalid_argument`` otherwise. A layer with a
 // non-constant, non-2-D (MatMul/Gemm/Attention), or non-4-D (Conv) weight is
 // left untouched.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity,
                                 const std::optional<int64_t>& n = std::nullopt,
                                 const std::optional<int64_t>& m = std::nullopt,
                                 bool global_sparsity = false);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Any-Precision LLM (Park et al., 2024, ICML 2024, "Any-Precision LLM:
 // Low-Cost Deployment of Multiple, Different-Sized LLMs") -- C++ port of
@@ -608,9 +642,11 @@ onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity,
 // differ in the last ULP or two -- the same "independently correct, not
 // required to be bit-for-bit identical" contract ``ApplyQuarot``/
 // ``apply_quarot_cpp`` already established for their own pair.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyAnyPrecisionLlm(const onnx::ModelProto& model,
                                       int64_t bits, int64_t max_bits,
                                       int64_t block_size);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // QuaRot (Ashkboos et al., 2024) rotation preprocessing plus INT4
 // round-to-nearest quantization of *both* the weight and the activation of
@@ -647,8 +683,10 @@ onnx::ModelProto ApplyAnyPrecisionLlm(const onnx::ModelProto& model,
 // investigation and evidence. This is intentional and will not be changed;
 // ``ApplyQuarot``/``apply_quarot_cpp`` and ``apply_quarot`` are two
 // independently-correct, non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
                              int64_t block_size, float epsilon);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // llama.cpp's IQ4_NL -- C++ port of iq4_nl.py's own
 // apply_iq4_nl_quantization. Weight-only quantizes every MatMul/vanilla-Gemm
@@ -676,7 +714,9 @@ onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed,
 // iterative-refinement step at all) -- ``ApplyIQ4NL``/
 // ``apply_iq4_nl_quantization_cpp`` and ``apply_iq4_nl_quantization`` are
 // two independently-correct, non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // llama.cpp's legacy GGUF "Q4_0"/"Q4_1" block formats -- C++ port of
 // gguf_legacy_quant.py's own apply_gguf_q4_0_quantization/
@@ -710,8 +750,13 @@ onnx::ModelProto ApplyIQ4NL(const onnx::ModelProto& model);
 // ``ApplyGgufQ4_0``/``ApplyGgufQ4_1`` and their ``_cpp`` Python wrappers
 // and ``apply_gguf_q4_0_quantization``/``apply_gguf_q4_1_quantization`` are
 // independently-correct, non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyGgufQ4_0(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyGgufQ4_1(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // llama.cpp's legacy GGUF Q5_0/Q5_1 block formats -- C++ port of
 // gguf_legacy_quant_5bit.py's own apply_gguf_q5_0_quantization/
@@ -722,8 +767,13 @@ onnx::ModelProto ApplyGgufQ4_1(const onnx::ModelProto& model);
 // ApplyGgufQ5_0/ApplyGgufQ5_1 and their _cpp Python wrappers and
 // apply_gguf_q5_0_quantization/apply_gguf_q5_1_quantization are
 // independently-correct, non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyGgufQ5_0(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyGgufQ5_1(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // llama.cpp's GGUF Q8_0 block format -- C++ port of gguf_q8_0.py's own
 // apply_gguf_q8_0_quantization: a plain 32-element block, one fp16 scale,
@@ -736,7 +786,9 @@ onnx::ModelProto ApplyGgufQ5_1(const onnx::ModelProto& model);
 // this port does not add an include_conv option (only a constant 2-D
 // weight on MatMul/vanilla-Gemm is matched), matching gguf_q6_k.h's own
 // established scope decision.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyGgufQ8_0(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // llama.cpp's GGUF Q2_K K-quant format -- C++ port of gguf_q2_k.py's own
 // apply_gguf_q2_k_quantization: a 256-element super-block split into 16
@@ -751,7 +803,9 @@ onnx::ModelProto ApplyGgufQ8_0(const onnx::ModelProto& model);
 // this port does not add an include_conv option (only a constant 2-D
 // weight on MatMul/vanilla-Gemm is matched), matching gguf_q6_k.h's own
 // established scope decision.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyGgufQ2K(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // llama.cpp's GGUF Q3_K K-quant format -- C++ port of gguf_q3_k.py's own
 // apply_gguf_q3_k_quantization: a 256-element super-block split into 16
@@ -767,7 +821,9 @@ onnx::ModelProto ApplyGgufQ2K(const onnx::ModelProto& model);
 // Unlike the Python side, this port does not add an include_conv option
 // (only a constant 2-D weight on MatMul/vanilla-Gemm is matched),
 // matching gguf_q6_k.h's own established scope decision.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyGgufQ3K(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // llama.cpp's GGUF Q4_K K-quant format -- C++ port of onnxsim.gguf_kquant's
 // own apply_gguf_q4_k_quantization: a 256-element super-block split into
@@ -782,7 +838,9 @@ onnx::ModelProto ApplyGgufQ3K(const onnx::ModelProto& model);
 // this port does not add an include_conv option (only a constant 2-D
 // weight on MatMul/vanilla-Gemm is matched), matching gguf_q6_k.h's own
 // established scope decision.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyGgufQ4K(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // llama.cpp's GGUF Q5_K K-quant format -- C++ port of onnxsim.gguf_q5_k's
 // own apply_gguf_q5_k_quantization: identical to ApplyGgufQ4K above
@@ -794,7 +852,9 @@ onnx::ModelProto ApplyGgufQ4K(const onnx::ModelProto& model);
 // Unlike the Python side, this port does not add an include_conv option
 // (only a constant 2-D weight on MatMul/vanilla-Gemm is matched),
 // matching gguf_q6_k.h's own established scope decision.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyGgufQ5K(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // BitNet b1.58's published absmean ternary weight quantization (Ma et al.,
 // 2024, "The Era of 1-bit LLMs"), as shipped by llama.cpp's GGUF
@@ -825,7 +885,9 @@ onnx::ModelProto ApplyGgufQ5K(const onnx::ModelProto& model);
 // ``ApplyGgufTernaryQuant``/its ``_cpp`` Python wrapper and
 // ``apply_gguf_ternary_quantization`` are independently-correct,
 // non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyGgufTernaryQuant(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // FP6-LLM (Xia et al., 2024, "FP6-LLM: Efficiently Serving Large Language
 // Models Through FP6-Centric Algorithm-System Co-Design") -- C++ port of
@@ -854,7 +916,9 @@ onnx::ModelProto ApplyGgufTernaryQuant(const onnx::ModelProto& model);
 // ``ApplyFp6Llm``/its ``_cpp`` Python wrapper and
 // ``apply_fp6_llm_quantization`` are independently-correct,
 // non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyFp6Llm(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // llama.cpp's GGUF Q6_K K-quant format -- C++ port of gguf_q6_k.py's own
 // apply_gguf_q6_k_quantization. Weight-only quantizes every MatMul/
@@ -887,7 +951,9 @@ onnx::ModelProto ApplyFp6Llm(const onnx::ModelProto& model);
 // ``ApplyGgufQ6K``/its ``_cpp`` Python wrapper and
 // ``apply_gguf_q6_k_quantization`` are independently-correct,
 // non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // AngelSlim's LeptoQuant -- C++ port of leptoquant.py's own
 // apply_leptoquant: DeepSeek-V3-style 128x128-block FP8 E4M3 weight
@@ -899,7 +965,9 @@ onnx::ModelProto ApplyGgufQ6K(const onnx::ModelProto& model);
 // to floating-point summation-order/quantile-interpolation differences.
 // ApplyLeptoquant and its _cpp Python wrapper and apply_leptoquant remain
 // independently-correct, non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyLeptoquant(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // bitsandbytes' NF4 (NormalFloat 4-bit) weight-only quantization -- C++
 // port of nf4.py's own quantize_weight_only_nf4: a fixed, 16-value,
@@ -914,7 +982,9 @@ onnx::ModelProto ApplyLeptoquant(const onnx::ModelProto& model);
 // summation-order/argmin tie-breaking differences. ApplyNF4 and its _cpp
 // Python wrapper and quantize_weight_only_nf4 remain independently-
 // correct, non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyNF4(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // IF4 (Adaptive Block-Scaled Data Types) -- C++ port of
 // if4_quantization.py's own quantize_weight_only_if4: per
@@ -930,7 +1000,9 @@ onnx::ModelProto ApplyNF4(const onnx::ModelProto& model);
 // summation-order differences. ApplyIF4 and its _cpp Python wrapper and
 // quantize_weight_only_if4 remain independently-correct, non-
 // interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyIF4(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // NVIDIA's NVFP4 weight-only quantization -- C++ port of
 // nvfp4_quantization.py's own quantize_weight_only_nvfp4: shares OCP
@@ -947,7 +1019,9 @@ onnx::ModelProto ApplyIF4(const onnx::ModelProto& model);
 // ApplyNVFP4Quantization and its _cpp Python wrapper and
 // quantize_weight_only_nvfp4 remain independently-correct, non-
 // interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyNVFP4Quantization(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // DeepSeek-V3-style fine-grained block FP8 weight quantization -- C++
 // port of the *weight* half of deepseek_fp8.py's own apply_deepseek_fp8:
@@ -961,7 +1035,9 @@ onnx::ModelProto ApplyNVFP4Quantization(const onnx::ModelProto& model);
 // sibling *_cpp ports here, both directions are a real, fully-specified
 // FP8 cast with no encoder ambiguity, so this port is expected to track
 // deepseek_fp8.py's own quantize_dequantize_block_fp8 unusually closely.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyDeepSeekFp8(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // K-means per-layer codebook weight quantization (Han et al., 2015,
 // "Deep Compression") -- C++ port of kmeans_quantization.py's own
@@ -975,7 +1051,9 @@ onnx::ModelProto ApplyDeepSeekFp8(const onnx::ModelProto& model);
 // nodes. ApplyKMeansQuantization and its _cpp Python wrapper and
 // quantize_weight_only_kmeans remain independently-correct, non-
 // interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyKMeansQuantization(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // HQQ -- Half-Quadratic Quantization (Badri & Shaji, 2023) -- C++ port
 // of hqq.py's own quantize_weight_only_int4_hqq: an asymmetric affine
@@ -992,7 +1070,9 @@ onnx::ModelProto ApplyKMeansQuantization(const onnx::ModelProto& model);
 // floating-point summation-order differences. ApplyHQQ and its _cpp
 // Python wrapper and quantize_weight_only_int4_hqq remain independently-
 // correct, non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyHQQ(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // I-BERT's own i-GELU polynomial approximation of Erf -- C++ port of
 // ibert_gelu.py's own apply_ibert_gelu. Unlike every weight-only port
@@ -1006,7 +1086,9 @@ onnx::ModelProto ApplyHQQ(const onnx::ModelProto& model);
 // onnxruntime's own float32 evaluation of the resulting graph.
 // ApplyIBertGelu and its _cpp Python wrapper and apply_ibert_gelu remain
 // independently-correct, non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyIBertGelu(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // I-BERT's own integer-friendly Softmax exp-approximation -- C++ port of
 // ibert_softmax.py's own apply_ibert_softmax. Also a nonlinear-activation
@@ -1020,7 +1102,9 @@ onnx::ModelProto ApplyIBertGelu(const onnx::ModelProto& model);
 // opset is below 18 is left completely untouched. ApplyIBertSoftmax and
 // its _cpp Python wrapper and apply_ibert_softmax remain independently-
 // correct, non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyIBertSoftmax(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // AdpQ (Ghaffari et al., 2024) -- C++ port of adpq.py's own
 // quantize_weight_only_adpq: a calibration-free salient/non-salient
@@ -1036,7 +1120,9 @@ onnx::ModelProto ApplyIBertSoftmax(const onnx::ModelProto& model);
 // median-tie-breaking and summation-order differences. ApplyADPQ and its
 // _cpp Python wrapper and quantize_weight_only_adpq remain independently-
 // correct, non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyADPQ(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // ICQuant (Li, Hanna, Fragouli, Diggavi, 2025) -- C++ port of
 // icquant.py's own quantize_weight_only_icquant: per (output-channel,
@@ -1056,7 +1142,9 @@ onnx::ModelProto ApplyADPQ(const onnx::ModelProto& model);
 // equal-magnitude outlier candidates. ApplyICQuant and its _cpp Python
 // wrapper and quantize_weight_only_icquant remain independently-correct,
 // non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyICQuant(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // OliVe -- Outlier-Victim Pair quantization (Guo et al., ISCA 2023) --
 // C++ port of olive.py's own quantize_weight_only_olive: per
@@ -1075,7 +1163,9 @@ onnx::ModelProto ApplyICQuant(const onnx::ModelProto& model);
 // differences. ApplyOlive and its _cpp Python wrapper and
 // quantize_weight_only_olive remain independently-correct, non-
 // interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyOlive(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // AQLM -- Additive Quantization for Language Models (Egiazarian et al.,
 // 2024) -- C++ port of aqlm.py's own quantize_weight_only_aqlm: each
@@ -1096,7 +1186,9 @@ onnx::ModelProto ApplyOlive(const onnx::ModelProto& model);
 // ApplyAQLM and its _cpp Python wrapper and quantize_weight_only_aqlm
 // remain independently-correct, non-interchangeable entry points, not
 // aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyAQLM(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Drop-by-Drop (Babaoglu, Chen, Khisti, 2026) -- C++ port of
 // drop_by_drop.py's own quantize_weight_only_drop_by_drop: each
@@ -1115,7 +1207,9 @@ onnx::ModelProto ApplyAQLM(const onnx::ModelProto& model);
 // and its _cpp Python wrapper and quantize_weight_only_drop_by_drop
 // remain independently-correct, non-interchangeable entry points, not
 // aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyDropByDrop(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // LO-BCQ -- Block Clustered Quantization (Elangovan, Sakr, Raghunathan,
 // Khailany, 2025) -- C++ port of the weight-side half of lo_bcq.py's own
@@ -1136,7 +1230,9 @@ onnx::ModelProto ApplyDropByDrop(const onnx::ModelProto& model);
 // precedent). ApplyLoBcq and its _cpp Python wrapper and
 // quantize_weight_only_lo_bcq remain independently-correct,
 // non-interchangeable entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyLoBcq(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // QuIP# (Tseng et al., 2024) -- C++ port of quip_sharp.py's own
 // apply_quip_sharp: conjugates the weight by a pair of random orthogonal
@@ -1159,7 +1255,9 @@ onnx::ModelProto ApplyLoBcq(const onnx::ModelProto& model);
 // explicitly not a goal. ApplyQuipSharp and its _cpp Python wrapper and
 // apply_quip_sharp remain independently-correct, non-interchangeable
 // entry points, not aliases.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyQuipSharp(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Attention computation quantization -- C++ port of
 // attention_quantization.py's own apply_attention_quantization: quantizes
@@ -1176,7 +1274,9 @@ onnx::ModelProto ApplyQuipSharp(const onnx::ModelProto& model);
 // this technique, so this port is expected to track
 // apply_attention_quantization closely, up to ordinary floating-point
 // summation-order differences.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyAttentionQuantization(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // ZeroQuant (Yao et al., 2022) -- C++ port of zeroquant.py's own
 // apply_zeroquant: pairs this repo's own existing group-wise INT8 weight
@@ -1196,8 +1296,10 @@ onnx::ModelProto ApplyAttentionQuantization(const onnx::ModelProto& model);
 // RNG/fitting step anywhere in this technique, so this port is expected to
 // track apply_zeroquant closely, up to ordinary floating-point
 // summation-order differences.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyZeroQuant(const onnx::ModelProto& model,
                                 int64_t block_size, float epsilon);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // IntactKV (Liu et al., 2024) -- C++ port of intactkv.py's own
 // apply_intactkv: not a quantizer, but a *companion* pass that splits a
@@ -1217,7 +1319,9 @@ onnx::ModelProto ApplyZeroQuant(const onnx::ModelProto& model,
 // expected to track apply_intactkv exactly. This port hardcodes
 // intactkv.py's own default `num_pivot_tokens=4` rather than exposing it as
 // a parameter.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyIntactKv(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // KBVQ-MoE (Xu et al., 2026) -- C++ port of kbvq_moe.py's own
 // apply_kbvq_moe: fits a KLT (PCA) basis shared across a `com.microsoft::
@@ -1242,7 +1346,9 @@ onnx::ModelProto ApplyIntactKv(const onnx::ModelProto& model);
 // too-few-distinct-percentiles edge case) -- the KLT/SVD piece itself has
 // no RNG at all. This port hardcodes kbvq_moe.py's own defaults (rank=4,
 // bits=4, kmeans_iters=20) rather than exposing them as parameters.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyKbvqMoe(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // LLM-FP4 (Liu et al., 2023, EMNLP) -- C++ port of llm_fp4.py's own
 // quantize_weight_only_llm_fp4 (weight-only half only; that module's own
@@ -1261,7 +1367,9 @@ onnx::ModelProto ApplyKbvqMoe(const onnx::ModelProto& model);
 // track the Python reference closely, up to floating-point summation-order
 // differences and first-occurrence tie-breaking (matching numpy's own
 // argmin/comparison convention).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeWeightOnlyLlmFp4(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // QServe's QoQ quantization (Lin et al., 2024, MLSys 2025) -- C++ port of
 // qoq.py's own quantize_weight_only_qoq (the module's primary contribution;
@@ -1275,7 +1383,9 @@ onnx::ModelProto QuantizeWeightOnlyLlmFp4(const onnx::ModelProto& model);
 // ACCEPTED, PERMANENT DIVERGENCE: none -- a closed-form, deterministic
 // two-stage scheme with no RNG, expected to track the Python reference
 // closely.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyQoq(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // D2Quant's Dual-Scale Quantizer (DSQ) (Yan et al., 2026) -- C++ port of
 // d2quant.py's own apply_dsq (that module's own apply_dac is a separate,
@@ -1295,7 +1405,9 @@ onnx::ModelProto ApplyQoq(const onnx::ModelProto& model);
 // (block_size=32, num_iterations=15). ACCEPTED, PERMANENT DIVERGENCE: none
 // -- a closed-form, deterministic alternating fit with no RNG, expected to
 // track the Python reference closely.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyDsq(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // DAQ (Delta-Aware Quantization) -- C++ port of daq.py's own apply_daq,
 // declared in daq_entry.h (included above) rather than duplicated here.
@@ -1593,8 +1705,10 @@ onnx::ModelProto ApplyDsq(const onnx::ModelProto& model);
 // ``std::invalid_argument`` otherwise. Anything not matching the exact
 // topology above (branching, a non-constant bias, a consumer whose
 // reduction dimension doesn't line up, ...) is left completely untouched.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
                                         double sparsity);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Attention-head pruning: removes whole attention heads -- or, for
 // grouped-query attention, whole KV groups -- from every matched
@@ -1644,8 +1758,10 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
 // (only forward-declared in this header, see this header's own top comment)
 // and this header's own duplicated-prototype convention is otherwise
 // reserved for the plain, executor-free entry points.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
                                            double sparsity);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // MoE expert-intermediate-channel pruning: removes intermediate
 // (``inter_size``) channels from every expert of a matched
@@ -1678,8 +1794,10 @@ onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
 // Unlike ``Simplify``, this does not run shape inference, constant folding or
 // any other simplification pass. ``sparsity`` must be in [0, 1); throws
 // ``std::invalid_argument`` otherwise.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyMoeExpertChannelPruning(const onnx::ModelProto& model,
                                               double sparsity);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // QMoE expert-channel pruning: removes intermediate (``inter_size``)
 // channels from every expert of a matched ``com.microsoft::QMoE`` node at
@@ -1729,8 +1847,10 @@ onnx::ModelProto ApplyMoeExpertChannelPruning(const onnx::ModelProto& model,
 // or any other simplification pass. ``sparsity`` must be in [0, 1); throws
 // ``std::invalid_argument`` otherwise. Anything not matching the exact
 // topology above is left completely untouched.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto ApplyQMoEExpertChannelPruning(const onnx::ModelProto& model,
                                                double sparsity);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Embedding vocabulary pruning: shrinks a matched token-embedding table's
 // vocabulary axis (a plain ``Gather``'s ``data`` input feeding a graph
@@ -1747,19 +1867,23 @@ onnx::ModelProto ApplyQMoEExpertChannelPruning(const onnx::ModelProto& model,
 // topology, scope, and the deliberately-narrower-than-pruning.py
 // restrictions this C++ port makes (plain ``Gather`` producer only, plain
 // ``MatMul``/``Gemm`` ``lm_head`` only, FLOAT32-only tensors).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 EmbeddingVocabPruningResult ApplyEmbeddingVocabPruning(
     const onnx::ModelProto& model,
     const std::optional<std::vector<int64_t>>& keep_token_ids,
     const std::optional<std::vector<int64_t>>& drop_token_ids,
     const std::optional<std::string>& input_name);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // The importance-ranked variant -- see structured_pruning_entry.h's own
 // ``ApplyEmbeddingVocabMagnitudePruning`` doc comment, the C++ port of
 // pruning.py's own ``apply_embedding_vocab_magnitude_pruning``.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 EmbeddingVocabPruningResult ApplyEmbeddingVocabMagnitudePruning(
     const onnx::ModelProto& model, double sparsity,
     const std::optional<std::vector<int64_t>>& protect_token_ids,
     const std::optional<std::string>& input_name);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Lists the activation tensor names that ``QuantizeStatic`` could quantize in
 // ``model`` -- the first input of every MatMul, every "vanilla" Gemm
@@ -1773,8 +1897,10 @@ EmbeddingVocabPruningResult ApplyEmbeddingVocabMagnitudePruning(
 // here, since calibrating a tensor that then turns out to be unusable
 // (opset < 13) is harmless -- the pass simply ignores its entry in
 // ``activation_ranges``.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQuantizableActivations(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Statically (calibration-based) quantizes every MatMul, every "vanilla"
 // Gemm (transA=0, alpha=1, beta=1), and every Conv, whose weight is a
@@ -1798,10 +1924,12 @@ std::vector<std::string> ListQuantizableActivations(
 // each, to a copy of ``model`` (which is left untouched) and returns the
 // result. Nodes that do not match, or whose activation has no entry in
 // ``activation_ranges``, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeStatic(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Same as ``QuantizeStatic``, but a "W8A16" scheme: the weight stays INT8
 // (identical per-output-channel symmetric scheme), while the activation is
@@ -1822,10 +1950,12 @@ onnx::ModelProto QuantizeStatic(
 // each, to a copy of ``model`` (which is left untouched) and returns the
 // result. Nodes that do not match, whose activation has no entry in
 // ``activation_ranges``, or whose opset is older than 21, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeStaticInt16(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Lists the *output* tensor names that ``QuantizeQOperator`` could quantize
 // in ``model``, on top of the input tensor names ``ListQuantizableActivations``
@@ -1839,8 +1969,10 @@ onnx::ModelProto QuantizeStaticInt16(
 // unlike QDQ format (``QuantizeStatic``), whose DequantizeLinear can leave
 // the result in float. A caller preparing to call ``QuantizeQOperator``
 // should calibrate the union of this and ``ListQuantizableActivations``.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQOperatorQuantizableOutputs(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Statically (calibration-based) quantizes every MatMul, every "vanilla"
 // Gemm (transA=0, alpha=1, beta=1), and every Conv, whose weight is a
@@ -1868,10 +2000,12 @@ std::vector<std::string> ListQOperatorQuantizableOutputs(
 // each, to a copy of ``model`` (which is left untouched) and returns the
 // result. Nodes that do not match, or whose activation/output has no entry
 // in ``activation_ranges``, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeQOperator(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Lists the tensor names ``QuantizeQOperatorElementwise`` could quantize in
 // ``model``: for every Add/Mul node with exactly 2 float32 inputs, neither a
@@ -1883,8 +2017,10 @@ onnx::ModelProto QuantizeQOperator(
 // should calibrate this list (there is no separate
 // ``ListQuantizableActivations``-style overlap to union it with, since
 // MatMul/Conv activation names and Add/Mul operand names never coincide).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQOperatorElementwiseQuantizableTensors(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Statically (calibration-based) quantizes every elementwise Add/Mul node
 // whose two inputs are both non-constant float32 tensors, and whose two
@@ -1908,17 +2044,21 @@ std::vector<std::string> ListQOperatorElementwiseQuantizableTensors(
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match, or whose operands/output have no entry in
 // ``activation_ranges``, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeQOperatorElementwise(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Lists the tensor names ``QuantizeQOperatorActivation`` could quantize in
 // ``model``: for every standalone Sigmoid or LeakyRelu node with exactly 1
 // float32 input, both the input's and the node's own output's tensor names
 // (two entries per qualifying node).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQOperatorActivationQuantizableTensors(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Statically (calibration-based) quantizes every standalone Sigmoid or
 // LeakyRelu node whose input is float32, and whose input name *and* whose
@@ -1940,16 +2080,20 @@ std::vector<std::string> ListQOperatorActivationQuantizableTensors(
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match, or whose input/output have no entry in
 // ``activation_ranges``, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeQOperatorActivation(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Lists the tensor names ``QuantizeQOperatorConcat`` could quantize in
 // ``model``: for every Concat node whose inputs are all non-constant float32
 // tensors, one entry per input plus one for the node's own output.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQOperatorConcatQuantizableTensors(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Statically (calibration-based) quantizes every Concat node whose inputs
 // are all non-constant float32 tensors, and whose every input name *and*
@@ -1970,17 +2114,21 @@ std::vector<std::string> ListQOperatorConcatQuantizableTensors(
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match, or whose operands/output have no entry in
 // ``activation_ranges``, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeQOperatorConcat(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Lists the tensor names ``QuantizeQOperatorSoftmax`` could quantize in
 // ``model``: for every standalone Softmax node with exactly 1 float32 input
 // and a resolvable default-domain opset import, both the input's and the
 // node's own output's tensor names (two entries per qualifying node).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQOperatorSoftmaxQuantizableTensors(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Statically (calibration-based) quantizes every standalone Softmax node
 // whose input is float32, whose input name *and* whose own output name are
@@ -2007,18 +2155,22 @@ std::vector<std::string> ListQOperatorSoftmaxQuantizableTensors(
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match, or whose input/output have no entry in
 // ``activation_ranges``, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeQOperatorSoftmax(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Lists the tensor names ``QuantizeQOperatorPool`` could quantize in
 // ``model``: for every standalone AveragePool/GlobalAveragePool node with
 // exactly 1 float32 input and (for AveragePool) no ``dilations`` attribute,
 // both the input's and the node's own output's tensor names (two entries
 // per qualifying node).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQOperatorPoolQuantizableTensors(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Statically (calibration-based) quantizes every standalone AveragePool or
 // GlobalAveragePool node whose input is float32, whose input name *and*
@@ -2045,10 +2197,12 @@ std::vector<std::string> ListQOperatorPoolQuantizableTensors(
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match, or whose input/output have no entry in
 // ``activation_ranges``, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeQOperatorPool(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Lists the tensor names ``QuantizeQOperatorWhere`` could quantize in
 // ``model``: for every ``Where`` node whose two data operands (inputs 1
@@ -2057,8 +2211,10 @@ onnx::ModelProto QuantizeQOperatorPool(
 // ``ListQOperatorElementwiseQuantizableTensors``'s convention (no "weight"
 // role to distinguish, since neither operand is pre-quantized from its own
 // static values).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQOperatorWhereQuantizableTensors(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Statically (calibration-based) quantizes every ``Where`` node whose two
 // data operands are both non-constant float32 tensors, and whose two
@@ -2081,10 +2237,12 @@ std::vector<std::string> ListQOperatorWhereQuantizableTensors(
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match, or whose operands/output have no entry in
 // ``activation_ranges``, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeQOperatorWhere(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Lists the tensor names ``QuantizeQOperatorGemm`` could quantize in
 // ``model``: for every ``Gemm`` node whose weight B is a constant 2-D
@@ -2094,8 +2252,10 @@ onnx::ModelProto QuantizeQOperatorWhere(
 // quantized from their own static values, not calibrated, the same
 // "weight" role ``ListQuantizableActivations`` already treats Gemm/MatMul's
 // weight as elsewhere).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQOperatorGemmQuantizableTensors(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Statically (calibration-based) quantizes every ``Gemm`` node whose weight
 // B is a constant 2-D float32 tensor, whose bias C (if present) is a
@@ -2124,10 +2284,12 @@ std::vector<std::string> ListQOperatorGemmQuantizableTensors(
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match, or whose activation/output have no entry in
 // ``activation_ranges``, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeQOperatorGemm(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Converts every float32 weight (and, by default, every internal activation)
 // in ``model`` to float16 -- a different kind of "quantization" from every
@@ -2162,8 +2324,10 @@ onnx::ModelProto QuantizeQOperatorGemm(
 // subgraphs (If/Loop/Scan bodies) are left as-is, and an initializer whose
 // name is also a graph input (the rarely-used ONNX "optional input with a
 // default value" convention) is left alone entirely.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeFp16(const onnx::ModelProto& model,
                               bool keep_io_types = true);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Converts a model's float32 weights and (by default) internal activations
 // to bfloat16. The same kind of calibration-free, whole-graph "quantization"
@@ -2173,8 +2337,10 @@ onnx::ModelProto QuantizeFp16(const onnx::ModelProto& model,
 // every finite float32 value maps to a finite bfloat16 value. See
 // ``passes/quantize_bf16.h`` for the rewrite itself; ``keep_io_types``, scope,
 // and every other semantic exactly mirror ``QuantizeFp16`` above.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeBf16(const onnx::ModelProto& model,
                               bool keep_io_types = true);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 // Converts a model's float32 weights and (by default) internal activations
 // to an 8-bit floating-point format -- the same kind of calibration-free,
@@ -2192,9 +2358,11 @@ onnx::ModelProto QuantizeBf16(const onnx::ModelProto& model,
 // mirror ``QuantizeFp16`` above. Casting to/from these types needs opset >=
 // 19. Throws ``std::invalid_argument`` if ``format`` is not ``"e4m3"`` or
 // ``"e5m2"``.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeFp8(const onnx::ModelProto& model,
                              const std::string& format = "e4m3",
                              bool keep_io_types = true);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
 void SimplifyPath(
     const ModelExecutor& executor, const std::string& in_path,
