@@ -513,7 +513,7 @@ percentage).
 which was already handled separately via a TVM-schedule-level fix earlier in this project, not a
 `custom_kernel`) -- out of scope here, left for a follow-up.
 
-### Coverage: the elementwise add (`hex_add_kernel.py`) -- a real mixed result, not a win
+### Coverage: the elementwise add (`hex_add_kernel.py`) -- closed with software prefetch
 
 The follow-up to the note just above: `add` (FPN lateral + top-down merge, `int32 + int32 ->
 int32`, pre-requantization accumulators -- confirmed from
@@ -559,14 +559,57 @@ Verified bit-exact correct under qemu and on real hardware (device `239dbd8f`) a
 | stock TVM (`relay.add`) | 16.620 ms | 0.838 G-elem/s | -- |
 
 Vectorizing alone recovered **12.5x** over the scalar version -- a real, large improvement -- but
-still lands at 0.71x of TVM's throughput, not a win. Most likely reason, consistent with this
-being a genuinely memory-bandwidth-bound op (3 buffers x 200x272x256x4 bytes = ~64 MB of total
-traffic per call, none of it reused): TVM's own schedule for a plain elementwise op likely blocks/
-prefetches or otherwise manages the memory pipeline better than this kernel's single flat loop
-does, similar in spirit to the 3x3 conv's cache-blocking gap above, though for pure bandwidth
-rather than working-set-fits-in-cache reasons. **Not attempted here**: any prefetch/blocking
-tuning to close this gap, or coverage of `maxpool`/`sigmoid` (deferred -- a well-verified single op
-was judged more valuable than three rushed ones; see the file's own docstring).
+still landed at 0.71x of TVM's throughput, not a win. Consistent with this being a genuinely
+memory-bandwidth-bound op (3 buffers, no reuse -- `256*200*272*4` bytes = 55.7 MB per buffer at
+the real full-scale shape, ~167 MB of total traffic per call), the fix that actually mattered
+wasn't the lever this project's other kernels have relied on (more compute-side reuse/tiling --
+there's no reuse to be had here, every element is touched exactly once) but **hiding DDR latency
+behind the loop's own memory ops** via software prefetch.
+
+**Tried instruction-level unrolling first** (the same lever that fixed the 3x3 conv's
+cache-blocking gap above) -- `HEXSIM=1`-screened at unroll factors 1/2/4/8/16/32, at two very
+different scales (a ~12 MB-traffic case and a ~144 KB-traffic case): **flat, no improving trend at
+either scale** (all within ~6% of each other, noise-level). Confirmed on real hardware at 1M
+elements: unroll=8 was *slower* than unroll=1 (22% worse), not faster -- a real, evidenced dead
+end for this op, the same kind of finding as the 3x3 conv tiling's `ow_tile` ceiling (see above),
+just for a different lever. Makes sense in hindsight: unrolling only pays off when loop-control
+overhead or a lack of independent in-flight operations bottlenecks a kernel; nothing here is
+compute-bound or loop-count-bound, so there's no overhead for unrolling to amortize.
+
+**Software prefetch is a different lever**: hiding memory latency, not reducing instruction count.
+`build_vector_kernel()`'s `prefetch_dist` parameter issues `__builtin_HEXAGON_Y2_dcfetch` for both
+input operands `prefetch_dist` HVX vectors ahead of the one currently being added, each loop
+iteration -- a non-faulting hint (confirmed empirically: reads past the buffer's end near the tail
+of the loop, under qemu and on real hardware, at every scale tested here, cause no crash and no
+incorrect output). `HEXSIM=1` showed a real, monotonic improvement with distance, plateauing
+around 16 (~1.7x faster than no prefetch at that plateau) -- a completely different signal shape
+from unrolling's flat line, and a second genuine confirmation (after the 3x3 conv tiling work) that
+`hexagon-sim --timing` can distinguish a real fix from a real dead end on the same op.
+
+Confirmed on real hardware (device `239dbd8f`, bit-exact correct at every size below and at the
+real full-scale shape under qemu) at `prefetch_dist=16`, at three sizes -- **not the exact real
+profile shape**: the TVM RPC session used for real-hardware bridging hit a hard transfer-size wall
+somewhere between 32 MB and 48 MB per buffer (`hexagon_rpc_send failed: 78`, unrelated to this
+kernel -- a pre-existing limitation of the RPC bridge path itself, out of scope to fix here), so
+the largest size actually reachable (8,388,608 elements, 32 MB/buffer) is below the real
+`13,926,400`-element shape used for every number elsewhere in this file:
+
+| elements | traffic/buffer | baseline (no prefetch) | `prefetch_dist=16` | speedup |
+|---:|---:|---:|---:|---:|
+| 1,048,576 | 4 MB | 3.890 ms / 0.270 G-elem/s | 3.088 ms / 0.340 G-elem/s | **1.26x** |
+| 4,194,304 | 16 MB | 8.967 ms / 0.468 G-elem/s | 5.948 ms / 0.705 G-elem/s | **1.51x** |
+| 8,388,608 | 32 MB | 14.873 ms / 0.564 G-elem/s | 9.363 ms / 0.896 G-elem/s | **1.59x** |
+
+The speedup grows with size at every step measured, and by 8M elements the prefetch kernel's
+0.896 G-elem/s is already *higher* than stock TVM's 0.838 G-elem/s measured at the larger
+13.9M-element shape -- suggestive of a real win at full scale, not a same-shape apples-to-apples
+comparison (TVM's number carries its own RPC/copy overhead at a different total size), so reported
+as directional evidence rather than a confirmed final number. `build_vector_kernel()`'s default is
+now `prefetch_dist=16`; pass `prefetch_dist=0` to reproduce the original, unprefetched kernel.
+
+**Not attempted here**: resolving the RPC transfer-size limit to get an exact full-scale real
+number (a bridge-infrastructure issue, not a kernel one); `maxpool`/`sigmoid` coverage (a separate,
+concurrent effort in this session).
 
 ## Removing TVM as a transport dependency
 
@@ -771,10 +814,14 @@ when candidates differ only in raw compute-instruction mix with comparable worki
   9-position pattern to 49 and handling `cin=3` (not a multiple of 4) via reduction-axis
   zero-padding. Bit-exact correct and 14.08x faster than stock TVM on real hardware at the real
   profile shape -- see "Coverage: the ResNet stem 7x7 conv" above.
-- `hex_add_kernel.py` -- the elementwise `add`, both a normal-codegen+BEAM attempt (found no
-  vectorization, 17.6x slower than TVM -- a real negative result) and a hand-vectorized
-  `custom_kernel` (12.5x faster than the scalar version, but still 0.71x of TVM's throughput --
-  a real, honestly-reported mixed result). See "Coverage: the elementwise add" above.
+- `hex_add_kernel.py` -- the elementwise `add`: a normal-codegen+BEAM attempt (found no
+  vectorization, 17.6x slower than TVM -- a real negative result), a hand-vectorized
+  `custom_kernel` (12.5x faster than the scalar version, but still 0.71x of TVM), then software
+  prefetch (`prefetch_dist`, the current default) closing the rest of the gap -- up to 1.59x faster
+  than the unprefetched kernel and ahead of TVM's measured throughput at the largest size real
+  hardware could verify (below the real profile shape; see "Coverage: the elementwise add" above
+  for why). Instruction unrolling was tried too and found to be a real dead end for this op,
+  unlike for the 3x3 conv.
 - `add_wrapper_template.c` -- a thin TVM PackedFunc ABI shim for `hex_add_kernel.py`'s
   `int32/int32/int32` signature, alongside `wrapper_template.c` (which is hardcoded to the GEMM
   kernels' `uint8/uint8/int32` signature and can't be reused as-is).
