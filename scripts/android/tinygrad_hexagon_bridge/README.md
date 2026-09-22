@@ -1446,6 +1446,82 @@ sizes, blocking, working-set-sensitive reduction orders); `MOCKDSP=1` remains th
 (no real hexagon-clang/hexagon-sim round trip) when only correctness verification is needed, or
 when candidates differ only in raw compute-instruction mix with comparable working sets.
 
+## Beyond the backbone: the box-head fc6 MatMul (`hex_boxhead_gemm_kernel.py`)
+
+Every kernel above targets `backbone.onnx` (ResNet-50/FPN/RPN, the Hexagon DSP half of the split
+pipeline documented in `../maskrcnn_e2e/README.md`). This is the project's first step into
+`rest.onnx` -- the dynamic-shape remainder (proposal decode, TopK, 85x NMS, RoiAlign, 4 MatMuls,
+mask head, post-processing) currently running 100% on ONNX Runtime CPU -- specifically the fc6
+box-head layer, the single largest compute chunk there (`../maskrcnn_e2e/README.md`'s own
+"roughly 13 GMAC for the fc6 box-head layer on 1000 proposals" note).
+
+**The open question this section resolves first**: whether `rest.onnx`'s MatMuls retain int8 QDQ
+quantization or run in fp32. Traced directly from the real graph (`rest.onnx`, produced by
+`../maskrcnn_e2e/prepare.py`): the fc6 `MatMul` node's own inputs are both `DequantizeLinear`
+outputs (`elem_type` FLOAT), and its output feeds a `QuantizeLinear` -- the classic QDQ-wrapped-fp32
+pattern, not a real `QLinearMatMul`/`MatMulInteger`. **The MatMul itself computes in fp32.** Real
+weight shape confirmed from the graph: `(12544, 1024)` -- `12544 = 7*7*256` (RoiAlign's 7x7 crop of
+256-channel FPN features, flattened), `1024` the fc6 output width; activation rows = proposal count
+(dynamic, ~1000 in the real pipeline). This puts the op in the same category as `sigmoid` (this
+project's only other fp32 op) rather than the `vrmpy`-based int8 path every other kernel here uses.
+
+**The kernel**: no `vrmpy` equivalent exists for fp32 -- `hex_boxhead_gemm_kernel.py`'s
+`build_kernel()` is a plain HVX vector FMA loop, following `hex_gemm_kernel.py`'s exact structure
+(`_reg_f32`, the same multi-range-dependency accumulator-init fix every kernel in this series has
+needed) but with one `float __attribute__((vector_size(128)))` (32-lane) accumulator stepped one
+K element at a time (`acc += a_scalar * b_vec`, a scalar-broadcast FMA clang lowers directly to
+HVX float instructions) instead of a 4-wide `vrmpyub`/`vrmpybusv` int8 dot product per step.
+
+Verified bit-exact (within fp32 sequential-accumulation tolerance vs. a float64 reference) under
+qemu at multiple scales, including the **exact full real shape** (`M=1000, K=12544, N=1024`,
+matching the real fc6 layer precisely): `max_abs_err=2.95e-3`, consistent with every smaller-scale
+check (tiny, multi-tile, real-K-depth-with-small-M all land in the same 1e-7 to 3e-3 range
+depending on reduction depth -- expected fp32 rounding, not a correctness concern; a
+`std::float64`-precision reference at this reduction depth necessarily disagrees with any fp32
+accumulator by a comparable amount regardless of implementation).
+
+**Real hardware** (device `239dbd8f`, via `native_transport/`): the full real weight
+(`12544*1024*4 ~= 49MB`) exceeds the ~32MB/buffer RPC transfer wall this project's own
+`native_transport`/`requantize` work already found, so real-hardware verification used a
+real-shape-consistent **slice** (`M=64, K=12544` -- unchanged, the real reduction depth --
+`N=512`, half the real width, chosen so the packed weight buffer fits at ~24.5MB) rather than
+forcing an oversized transfer. Ran successfully (`rc=0`), bit-exact within tolerance against the
+float64 reference (`max_abs_err=2.98e-3`, same magnitude as the qemu runs).
+
+**A new, real finding for this project**: real hardware's output is **not bit-exact against
+qemu's**, given the identical input data and identical generated kernel source (`max abs diff
+3.02e-3` between the two, evenly spread across every output row -- not concentrated in a few
+elements the way a logic bug would show, and the same magnitude as both environments'
+independent agreement with the float64 reference). This is the first kernel in this project with
+both a real fp32 dtype *and* a substantial (12544-step) reduction -- `sigmoid` was fp32 but had no
+reduction; every reduction-heavy kernel before this was int8/int32, where fixed-point arithmetic
+has no equivalent rounding-path ambiguity. The most likely explanation is a genuine FMA-contraction
+or rounding-mode difference between `MOCKDSP`'s qemu build (Hexagon v65 target) and the real
+hardware bridge's build (v73) -- not chased down further here, but worth flagging precisely for
+any future fp32 reduction kernel in this project: don't expect bit-exact qemu/real-hardware
+agreement the way every int8 kernel here has had, expect fp32-rounding-tolerance agreement instead.
+
+**Speed, reported honestly**: 942.751 ms real-hardware wall time for the verified slice
+(`M=64,K=12544,N=512`, ~0.411 GMAC) -- **~0.436 GMAC/s**, roughly two orders of magnitude slower
+than every int8 kernel in this project (30-50 GMAC/s). This is expected, not a red flag: fp32 has
+no `vrmpy`-equivalent wide dot-product instruction on this HVX generation (one FMA processes 32
+output lanes but only *one* K-step per instruction, versus `vrmpyub`'s 128 lanes/4-wide-K per
+instruction for int8), and this kernel has had **zero tuning** applied (no tiling/blocking, no
+prefetch, no register accumulation reuse -- exactly the untuned starting point `hex_add_kernel.py`
+was at before its own prefetch pass, and `hex_conv3x3_kernel.py` was at before its `ow_tile` pass).
+An x86 desktop `onnxruntime` CPU run of the identical shape took 0.64 ms -- **not a fair comparison
+point** (a multi-core, BLAS-backed desktop CPU vs. one untuned DSP thread) and explicitly not the
+real baseline (ONNX Runtime running on the phone's own ARM CPU, which is what this op actually
+competes against in the real pipeline) -- that real comparison was not measured here.
+
+**Not done**: tuning (this kernel is a direct, unoptimized port of the pattern that worked for
+int8 -- real headroom likely exists, matching every other kernel's own before/after tuning story
+in this project); a real phone-ARM-CPU ONNX Runtime baseline for a fair speed comparison; the
+mask head (the other real compute chunk `../maskrcnn_e2e/README.md` names alongside fc6); NMS,
+TopK, RoiAlign, proposal decode (fundamentally dynamic-shape/control-flow ops, a different
+engineering problem than every static-shape kernel in this project, deliberately out of scope
+here).
+
 ## Files
 
 - `capture_kernel.py` -- capture tinygrad's rendered Hexagon C for a shape, verified under qemu.
@@ -1499,6 +1575,14 @@ when candidates differ only in raw compute-instruction mix with comparable worki
   TVM's source, not assumed) -- the one kernel missing before any two covered convs can be chained
   into a real subgraph. Verified on real hardware through `native_transport/` only, zero TVM in
   the executed path. See "Running the full backbone graph, TVM-free" above.
+- `hex_boxhead_gemm_kernel.py` -- the box-head fc6 MatMul, this project's first step outside
+  `backbone.onnx` into the dynamic-shape `rest.onnx` remainder. The first fp32-*and*-reduction
+  kernel here (confirmed the op is genuinely fp32 by tracing the real graph, not assumed);
+  correct at the exact real shape under qemu and on real hardware (a real-shape-consistent slice,
+  RPC-transfer-limited); real hardware and qemu agree within fp32 rounding tolerance but not
+  bit-exact, a new finding for this project -- see "Beyond the backbone" above. Untuned,
+  ~0.436 GMAC/s, honestly two orders of magnitude behind this project's int8 kernels -- real
+  tuning headroom likely exists, not yet attempted.
 - `hex_bias_add_kernel.py` -- the per-output-channel `int32` bias-add every real conv needs
   before `requantize`, and (via the standard zero-point-folding trick) how this project's kernels
   handle the raw image's nonzero activation zero-point without any on-device subtraction logic.
