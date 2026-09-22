@@ -27,7 +27,7 @@ QAIC="$HEXAGON_SDK_ROOT/ipc/fastrpc/qaic/Ubuntu/qaic"
 "$HEXAGON_TOOLCHAIN/bin/hexagon-clang" -c -O2 -fPIC -mcpu=hexagon"$HEX_ARCH" -Wall \
   -I "$HEXAGON_SDK_ROOT/incs" -I "$HEXAGON_SDK_ROOT/incs/stddef" \
   -o mini_rpc_skel.o mini_rpc_skel.c
-"$HEXAGON_TOOLCHAIN/bin/hexagon-clang" -c -O2 -fPIC -mcpu=hexagon"$HEX_ARCH" -Wall \
+"$HEXAGON_TOOLCHAIN/bin/hexagon-clang" -c -O2 -fPIC -mcpu=hexagon"$HEX_ARCH" -mhvx="$HEX_ARCH" -mhvx-length=128b -Wall \
   -I "$HEXAGON_SDK_ROOT/incs" -I "$HEXAGON_SDK_ROOT/incs/stddef" \
   -o mini_rpc_impl.o mini_rpc_impl.c
 
@@ -42,6 +42,11 @@ LIBPATH="$HEXAGON_TOOLCHAIN/target/hexagon/lib/$HEX_ARCH/G0"
 adb -s "$DEVICE_SERIAL" shell "mkdir -p /data/local/tmp/native_transport"
 adb -s "$DEVICE_SERIAL" push mini_client mini_rpc.so /data/local/tmp/native_transport/
 adb -s "$DEVICE_SERIAL" shell "chmod 755 /data/local/tmp/native_transport/mini_client"
+# If gen_gemm_test_data.py's output is present, push it too so client_main.c's real-kernel test
+# (cin=64,cout=256,m=54400, hex_gemm_kernel.py's own default shape) runs instead of being skipped.
+if [ -f gemm_a.bin ] && [ -f gemm_bp.bin ]; then
+  adb -s "$DEVICE_SERIAL" push gemm_a.bin gemm_bp.bin /data/local/tmp/native_transport/
+fi
 adb -s "$DEVICE_SERIAL" shell "cd /data/local/tmp/native_transport && \
   LD_LIBRARY_PATH=/vendor/lib64 ADSP_LIBRARY_PATH=/data/local/tmp/native_transport \
   ./mini_client 'file:///mini_rpc.so?mini_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp'"

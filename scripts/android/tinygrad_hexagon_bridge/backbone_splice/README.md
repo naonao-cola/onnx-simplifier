@@ -106,16 +106,99 @@ relies on and that TVM's *own* internal Hexagon link step (invoked inside
 `relay.build()`, before this session's script ever gets a chance to intervene) embeds
 correctly but a from-scratch `export_library` re-link does not reproduce.
 
+## Third pass: still open, but significantly narrowed, plus a real fallback landed
+
+A third investigation pass (following up on the two above) did the C++-level reading option (a)
+named below, and used the meanwhile-completed `../native_transport/` work (a from-scratch,
+TVM-free FastRPC client) as new leverage this bug's first two passes didn't have. Two real,
+permanent fixes landed in `splice_test.py` regardless of the outcome below:
+
+- **The `call_extern` return-type ABI bug (int32 vs the kernel's actual void) was never actually
+  fixed in the committed script** -- the "fixed to `void`... still failed identically" note above
+  described a fix that only ever existed in the uncommitted scratch diagnostic scripts
+  (`diag1.py`/`diag2.py`/`diag3.py`), never landed in `splice_test.py` itself. Fixed for real this
+  time (`"int32"` -> `"void"` in the `call_extern` call).
+- **Isolated the spliced-vs-stock comparison into two separate `Session`s** instead of one --
+  mixing a manually-loaded custom `.so` with `get_executor_from_factory()` in a single session was
+  independently found (in this project's elementwise-add coverage work) to cause spurious
+  `hexagon_rpc_send` failures of its own, unrelated to either module. `splice_test.py` was doing
+  exactly that; splitting it removes that confound from this test permanently.
+
+### Decisive new test: the manual loading path itself is not the problem
+
+The standing hypothesis (a structural difference between `relay.build()`'s own internal Hexagon
+link step and this session's manual `export_library(fcompile=..., addons=[...])` re-link) was
+never actually tested in isolation before -- both prior passes only ever ran the *spliced* module
+through the manual path. Running a **completely unmodified, stock TVM-compiled module** (no
+splice, no custom kernel, same `fcompile_wrapper`) through the exact same
+`session.load_module()` + `graph_executor.create()` + `gm.run()` sequence, in a fresh session,
+**succeeds outright** -- `RUN OK`, correct output, no `AEE_EUNSUPPORTED`, nothing. This
+conclusively rules out "the manual loading path is generally broken" as an explanation: it works
+fine on its own. Whatever's wrong is specific to the *spliced* module, not the loading pattern.
+
+### The failure, decoded precisely
+
+Rerunning the spliced test (with both fixes above applied) still fails at `gm.run()`, same
+symptom as before -- but fresh `adb logcat` this time around shows **two distinct handles**,
+where only one line was ever examined previously:
+
+```
+Error 0x27: remote_handle64_invoke failed for handle 0x69204180, method 5 on domain 3 (sc 0x5000100)
+Error 0x27: remote_handle64_invoke failed for handle 0x692040c0, method 2 on domain 3 (sc 0x2020000)
+```
+
+Decoding `sc` via QAIC's actual scalar bit layout (`REMOTE_SCALARS_METHOD`/`INBUFS`/`OUTBUFS`):
+`0x5000100` = method 5, **0 input buffers, 1 output buffer**, 0 handles either way -- a
+zero-argument "give me a small result" call, repeated dozens of times in a tight loop (once per
+graph-execution step, matching the original finding). `0x692040c0`'s `method 2` matches
+`hexagon_rpc_skel.c`'s own `send` case exactly -- almost certainly a secondary/cascade failure on
+the *main* session handle while it tries to report the first error back over the wire, not an
+independent bug.
+
+Two hypotheses this new evidence lets rule out cleanly, both now confirmed *false*:
+- **"A second `remote_handle64_open` gets called somewhere in TVM's own C++."** Grepping the
+  entire TVM source tree (`src/`, `apps/`) for `remote_handle64_open` turns up exactly one call
+  site -- the host-side stub in `hexagon_rpc_stub.c`. TVM's C++ never opens a second handle
+  itself; if `0x69204180` is a second handle, something outside TVM's own explicit code path
+  opens it.
+- **"The spliced kernel's HVX use never gets 'powered on' because `te.extern` bypasses whatever
+  bookkeeping TVM's own codegen normally inserts for HVX-using compute."** `HexagonPowerManager`
+  (`hexagon_power_manager.cc`) calls `PowerOnHVX()` unconditionally in its own constructor, which
+  runs during `Session.__enter__`'s `device_api.hexagon.acquire_resources` call -- **once per
+  session, before any module is even loaded**, not per-kernel or per-module. HVX is already fully
+  powered on by the time `load_module`/`set_input` (which already succeed) run.
+
+What's left unexplained: what specifically calls `method 5` on that second handle during
+`gm.run()`, dozens of times, only for the spliced module. The trail leads into either a
+Qualcomm-proprietary system library (most plausibly something in the DCVS/power-request or
+VTCM/DMA-allocation path triggered specifically by executing our externally-linked kernel's HVX
+instructions, as opposed to TVM's own tensorized/codegen-inserted HVX use) or some other
+TVM-runtime-internal per-op dispatch path not yet identified -- genuinely still open, at the same
+kind of closed-source boundary both prior passes hit, just narrowed much further than before.
+
+### The fallback: real value delivered a different way
+
+Given a third serious attempt still didn't land the root cause, and `../native_transport/` (a
+separate, since-completed effort to remove TVM as a transport dependency entirely) already proved
+a working, TVM-free alternative for calling a fixed hand-written kernel, that fallback was
+completed instead: a **real** `hex_gemm_kernel.py`-generated kernel (not a placeholder) now runs
+end to end through `native_transport/`, at the exact flagship shape this splice work targets
+(`cin=64,cout=256,m=54400`), verified **bit-exact correct on real hardware** against a numpy
+reference. See `../README.md`'s "Removing TVM as a transport dependency" section for the result.
+This sidesteps the bug above rather than fixing it -- the two are not the same outcome, and this
+README keeps them distinct rather than conflating a bypass with a fix.
+
 ## Next steps if picked back up
 
-- This looks like it needs either: (a) C++-level reading of `rpc_module.cc` /
-  `runtime/hexagon/rpc/*` to find what "method 5" actually dispatches to and what state it
-  expects the loaded module to be in, or (b) finding a way to get the extra kernel object file
-  linked into TVM's *own* internal Hexagon codegen link step (inside `codegen_hexagon.cc`)
-  instead of re-linking separately via `export_library` -- which would make the resulting
-  module identical in structure to a normal `relay.build()` output, sidestepping the
-  metadata-gap hypothesis entirely rather than needing to diagnose it.
-- Once loading works: apply the same splice to all 4 instances of the `cin=64,cout=256` shape in
-  the real backbone (`$S/rcnn/backbone_relay.json`), run the *whole* backbone on real hardware,
-  and measure genuine end-to-end wall-time improvement against the known baseline (~3.6s).
-- Extend to the other 5 covered shapes (`../README.md`'s coverage table) the same way.
+- Root-causing "method 5": would need either (a) instrumenting/tracing the actual DSP-side
+  syscalls or FastRPC calls made specifically during `gm.run()` for the spliced module (e.g. via
+  the Hexagon simulator's tracing flags now known to exist, see `../README.md`'s hexagon-sim
+  section, if the failure reproduces there too) to see exactly what triggers the second handle, or
+  (b) finding a way to get the extra kernel object file linked into TVM's *own* internal Hexagon
+  codegen link step (inside `codegen_hexagon.cc`) instead of re-linking separately via
+  `export_library` -- untested in isolation, though now a weaker lead than before given the stock
+  module (which *does* go through that same manual `export_library` path) runs fine.
+- Given the fallback above already delivers the underlying goal for one shape, the more valuable
+  next step is probably extending `native_transport/`'s real-kernel pattern to the other 5 covered
+  shapes and to a genuine multi-op graph (not just one splice into TVM's compiled graph), rather
+  than continuing to chase this specific TVM-internal bug.
