@@ -249,8 +249,14 @@ now well past that comparison point entirely.
 per `(N-tile, K-chunk)`, matching what one `vrmpy` call reads in one shot) -- a one-time,
 host-side repack of the (static) weight tensor, not something done per-inference.
 
-**Known limitation**: fails when `cout == 32` exactly (a degenerate single-iteration N-tile loop)
--- not investigated further since it doesn't affect the real target shape (`cout=256`, 8 N-tiles).
+**Bug found and fixed**: originally failed whenever `cout == 32` exactly, or more generally
+whenever the N-tile count is 1 (also affects `build_strided_kernel()`, same underlying pattern).
+Root cause: `_reg_i32`'s accumulator-init scoped its `.after()` dependency to only the innermost
+enclosing range (`nt_rng`); tinygrad's optimizer *eliminates* degenerate extent-1 ranges entirely,
+which silently dropped the "reset the accumulator once per row" dependency down to "reset once,
+ever" -- corrupting every row after the first. Fixed by depending on every enclosing range (`M`
+can never degenerate to extent 1 in practice, so this is robust). This directly unlocked the tiny
+`cout=12`/`cout=3` coverage below, via `cout` zero-padded to 32.
 
 ### Coverage: the other small-channel 1x1 convs in the backbone
 
@@ -285,10 +291,32 @@ computed. Correct on the first attempt (qemu and real hardware), no new bugs:
 |---:|---:|---|---:|---:|---:|---:|
 | 256 | 128 | 200x272 | 2 | 5.38 GMAC/s | 24.86 GMAC/s | **4.62x** |
 
-**Not yet covered**: the RPN/mask head convs with `cout=12` or `cout=3` (roughly 14 ms combined,
-spread across several small shapes) -- `cout` isn't a multiple of 32, so the N-tile loop doesn't
-apply as-is. Would need either zero-padding `cout` up to 32 (wasting most of a `vrmpy` lane) or a
-genuinely narrower reduction primitive. Low absolute impact; not attempted.
+### Coverage: the tiny RPN/mask-head convs (`cout=12` or `cout=3`)
+
+Total impact across all spatial sizes of these two shapes is ~182 ms (not ~14 ms as an earlier
+version of this note estimated -- corrected here), dominated by the largest spatial size
+(`200x272`) for each: 83.7 ms (`cout=12`) and 52.1 ms (`cout=3`), together ~136 ms, ~75% of the
+group's total. `cout` isn't a multiple of 32, so the kernel's N-tile loop doesn't apply directly;
+covered by zero-padding the weight matrix's `cout` up to 32 (wasting most of a `vrmpy` lane, but
+functionally correct and simple: `hex_gemm_kernel.build_kernel()` used completely unchanged with
+`cout=32`, and only the first `real_cout` output columns are read). This is exactly the `NT=1`
+case the bug above blocked -- fixing that bug is what unlocked this coverage:
+
+| `cin` | `cout` (real) | spatial | stock TVM | `custom_kernel` (padded to 32) | speedup |
+|---:|---:|---|---:|---:|---:|
+| 256 | 12 | 200x272 | 2.00 GMAC/s | 3.89 GMAC/s | **1.94x** |
+| 256 | 3 | 200x272 | 0.80 GMAC/s | 0.97 GMAC/s | **1.22x** |
+
+Both bit-exact correct, both faster than TVM despite computing (and discarding) 20 or 29 unused
+output lanes per call -- the `vrmpy` instruction's fixed 32-lane width means the "wasted" lanes
+cost nothing extra beyond the one instruction already being issued. The smaller spatial sizes of
+these same two shapes (`13x17` through `100x136`, ~46 ms combined) aren't separately verified but
+should behave the same way (same kernel, same correctness argument, only the M-loop trip count
+differs) -- not measured individually given their small individual impact.
+
+**Total real coverage across all seven verified shapes**: ~2352 ms of the ~7620 ms isolated-timing
+total from the original ranked profile -- **about 31% of the entire backbone's isolated-timing
+sum**, every one bit-exact correct and faster than TVM's hand-tuned schedule.
 
 ## Files
 

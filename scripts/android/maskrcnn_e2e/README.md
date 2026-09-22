@@ -390,11 +390,11 @@ generic, shared kernel-optimization machinery no local fix could safely touch --
 real attempts each broke something else), a from-scratch, hand-written `vrmpy` GEMM kernel via
 `tinygrad.Tensor.custom_kernel` (bypassing `Ops.WMMA` entirely).
 
-**Verified correct and measured on real hardware at five of the small-channel 1x1-conv shapes from
-the ranked profile above** (same kernel code, re-parameterized by shape) -- 2.00x to 8.65x faster
+**Verified correct and measured on real hardware at seven of the small-channel 1x1-conv shapes from
+the ranked profile above** (same kernel code, re-parameterized by shape) -- 1.22x to 8.65x faster
 than stock TVM's hand-tuned `vrmpy` schedule at every one (including the backbone's one strided
-1x1 conv, via a second kernel variant with real 2D spatial indexing), covering roughly 29% of the
-*entire* backbone's isolated-timing total:
+1x1 conv and its two tiny-`cout` RPN/mask-head convs, `cout=12`/`3`, padded to 32 lanes), covering
+roughly 31% of the *entire* backbone's isolated-timing total:
 
 | `cin` | `cout` | spatial | stride | speedup vs. TVM |
 |---:|---:|---|---:|---:|
@@ -404,10 +404,12 @@ than stock TVM's hand-tuned `vrmpy` schedule at every one (including the backbon
 | 256 | 128 | 200x272 | 2 | 4.62x |
 | 256 | 64 | 200x272 | 1 | 2.39x |
 | 512 | 128 | 100x136 | 1 | 2.00x |
+| 256 | 12 (padded to 32) | 200x272 | 1 | 1.94x |
+| 256 | 3 (padded to 32) | 200x272 | 1 | 1.22x |
 
 This is the small-channel 1x1-conv gap from the "systemic pattern 1" finding above, closed for
 its largest shapes -- not with a TVM schedule fix, but by generating and running a real, correct,
-fast kernel via tinygrad instead. Not yet covered: the tiny RPN/mask-head convs (`cout=12` or
-`3`, not a multiple of the kernel's 32-wide N-tile) -- see
-`scripts/android/tinygrad_hexagon_bridge/README.md` for the details.
+fast kernel via tinygrad instead. See `scripts/android/tinygrad_hexagon_bridge/README.md` for the
+full details, including the accumulator bug that had to be fixed first to cover the tiny-`cout`
+shapes at all.
 
