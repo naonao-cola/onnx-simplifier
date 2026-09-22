@@ -754,16 +754,53 @@ budget (no polynomial/bit-trick approximation was needed after all; tinygrad's o
 primitive UOps for `.sigmoid()`, once it can actually link, is already numerically exact to
 float32 precision).
 
-**Not done here**: real-hardware verification and a `custom_kernel`/speed-vs-TVM comparison.
-tinygrad's own DSP driver is confirmed blocked on the available test phone (SELinux `Enforcing`,
-unprivileged `shell` user, no root -- see "Why tinygrad can't reach this phone's DSP directly"
-above), so real-hardware timing needs the same TVM-RPC or `native_transport` bridging every other
-kernel in this project has used -- building that bridge for this new (first-ever float32) op class
-was judged out of scope for landing this specific unblock; this section resolves the *compile-time*
-blocker precisely, real-hardware speed is the natural next step. Also unverified on real Hexagon
-v65 hardware specifically: this SDK snapshot ships no `v65`-specific `libgcc.a` (oldest available
-is `v68`), so the fallback uses the lowest available version -- Hexagon's scalar ISA has been
-stable `v65`-`v81`, making this a reasonable bet, but not one confirmed on real v65 silicon here.
+### Real-hardware follow-up: correct, but no auto-vectorization, same lesson as `add`
+
+Bridged via the same pattern as every other kernel here (`hexagon-clang` compile + a thin
+`sigmoid_wrapper_template.c` TVM `PackedFunc` shim + `tvm.contrib.hexagon.tools.link_shared` +
+`HexagonLauncher`/RPC session, device `239dbd8f`, real profile shape `n=163200`).
+
+**The anticipated "same class of problem resurfaces in the bridge's own link step" did NOT
+happen**: the Hexagon SDK's own `hexagon-clang` is version **19.0.04** -- squarely in the "clang
+>=19 inlines float division natively" bucket this section already found, not the 15/17 bucket that
+needed `libgcc.a`. Compiling the captured kernel with it produces zero undefined symbols; no
+soft-float archive needed on this path at all. (The `DSPCompiler`-side `libgcc.a` fix above is
+still correct and still needed -- it's what makes `MOCKDSP=1`/qemu work with whichever `CC` a given
+environment happens to default to -- this is just confirmation that the specific real-hardware
+toolchain in use here was never going to hit the same gap.)
+
+**Correctness: bit-exact with the qemu run**, same `max_abs_err=9.16e-08` on real silicon as under
+`MOCKDSP=1` -- deterministic, not a coincidence of RNG seeding.
+
+**Speed: correct, but real, honest loss** -- confirmed at both `BEAM=0` (tinygrad's default here,
+which turned out to fully unroll the loop into a 125 KB source, one literal expression per element)
+and `BEAM=2` (which found a proper single scalar loop, ~1 KB source) -- both landed at essentially
+the same real-hardware throughput, consistent with neither being vectorized at all:
+
+| kernel | median | throughput | vs TVM |
+|---|---:|---:|---:|
+| tinygrad, `BEAM=0` (full unroll) | 15.797 ms | 0.0103 G-elem/s | 0.32x (3.1x slower) |
+| tinygrad, `BEAM=2` (scalar loop) | 16.763 ms | 0.0097 G-elem/s | 0.30x (3.3x slower) |
+| stock TVM (`relay.sigmoid`) | 5.038-5.072 ms | 0.0322-0.0324 G-elem/s | -- |
+
+Both tinygrad variants are within noise of each other and consistently ~3x behind TVM -- the same
+finding `add`'s own history already established for this backend: tinygrad's normal codegen path
+does not reach for HVX vector width on its own for a plain elementwise op, regardless of `BEAM`
+search width (higher `BEAM` finds better *loop structure*, not vectorization, here). `add` closed
+an equivalent gap with a hand-written `Tensor.custom_kernel` (`hex_add_kernel.py`); the same move
+would very plausibly work here too (`sigmoid`'s transcendental body doesn't block it -- the
+existing scalar composition already proved numerically exact, so a vectorized version only needs
+to run that same expression across an HVX-width group of lanes at once, not re-derive the
+approximation) -- not attempted here, flagged as the natural next step.
+
+Also unverified on real Hexagon v65 hardware specifically (this test phone is Hexagon v69, kernels
+here targeted `v73` for forward-compatibility, matching every other real-hardware kernel in this
+project -- see `scripts/android/maskrcnn_e2e/README.md`'s "Xiaomi 12S (Hexagon V69; kernels
+compiled for v73)"): this SDK snapshot ships no `v65`-specific `libgcc.a` (oldest available is
+`v68`), so `DSPCompiler`'s `MOCKDSP=1`/qemu-side fallback uses the lowest available version --
+Hexagon's scalar ISA has been stable `v65`-`v81`, making this a reasonable bet, but not one this
+real-hardware run (targeting `v73`, which has its own `libgcc.a` and didn't need it anyway) confirms
+for `v65` specifically.
 
 ## Removing TVM as a transport dependency
 
