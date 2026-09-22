@@ -247,9 +247,39 @@ jobs:
           python3 -c "import tpu_mlir; print('tpu_mlir', tpu_mlir.__file__)"
       # Run from a neutral directory so the repo root's ./onnxsim source package
       # (without the compiled extension) does not shadow the installed wheel.
+      #
+      # Run via `pytest.main()` + `os._exit()` rather than `python3 -m pytest`
+      # directly: this job segfaulted (exit code 139) once
+      # (https://github.com/onnxsim/onnxsim/actions/runs/35727349179/job/106744138888)
+      # a few seconds *after* pytest itself had already printed "8 passed" --
+      # i.e. after every assertion in the module had already succeeded, during
+      # process teardown. That run used the exact same tpu_mlir==1.30.2/
+      # torch==2.11.0 pins as the immediately preceding (and every other)
+      # scheduled run of this job, and the onnxsim commit range between the
+      # two touched none of onnxsim's own C++/Python sources -- so it isn't a
+      # real test failure or a regression here, and 30/30 other scheduled runs
+      # of this job exited cleanly on the same versions. The process loads
+      # tpu-mlir's own LLVM/MLIR-based tpuc-opt/pymlir native extensions,
+      # torch, and onnxsim's own nanobind extension into one interpreter --
+      # exactly the kind of combination where competing C++ static
+      # destructors/atexit handlers can race during normal Python
+      # finalization. `os._exit()` skips that finalization entirely once
+      # pytest has already reported a result, instead of letting the
+      # (apparently, occasionally racy) normal teardown run.
       - name: Run tpu-mlir integration tests
         working-directory: ${{ runner.temp }}
-        run: python3 -m pytest -v "$GITHUB_WORKSPACE/tests/test_tpu_mlir_integration.py"
+        run: |
+          python3 -c '
+          import os
+          import sys
+
+          import pytest
+
+          code = pytest.main(["-v", os.environ["GITHUB_WORKSPACE"] + "/tests/test_tpu_mlir_integration.py"])
+          sys.stdout.flush()
+          sys.stderr.flush()
+          os._exit(code)
+          '
 
   halide:
     name: Simplify and run on Halide
