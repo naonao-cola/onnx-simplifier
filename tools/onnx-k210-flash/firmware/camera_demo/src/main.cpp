@@ -28,7 +28,7 @@
 #include "sysctl.h"
 #include "uarths.h"
 extern "C" {
-#include "m5stickv.h"
+#include "board.h"
 #include "w25qxx.h"
 }
 
@@ -40,7 +40,7 @@ namespace {
 constexpr uint32_t kModelFlashAddress = 0x00C00000;
 constexpr size_t kModelBufferSize = 2 * 1024 * 1024;
 constexpr size_t kMaxInputFloats = 3 * 240 * 240;
-constexpr int kW = M5_CAM_W, kH = M5_CAM_H;
+constexpr int kW = CAM_W, kH = CAM_H;
 
 alignas(256) uint8_t g_model_buffer[kModelBufferSize];
 float g_input[kMaxInputFloats];
@@ -220,25 +220,25 @@ int main() {
   dmac_init();
   sysctl_clock_enable(SYSCTL_CLOCK_AI);
 
-  printf("onnx-k210-flash camera demo (M5StickV)\n");
-  if (m5_power_init() != 0) printf("AXP192 init failed (not an M5StickV?) -- carrying on\n");
-  m5_buttons_init();
+  printf("onnx-k210-flash camera demo (%s)\n", BOARD_NAME);
+  if (board_power_init() != 0) printf("power init failed -- carrying on\n");
+  board_buttons_init();
 
-  g_fb = (uint16_t *)m5_alloc_dma(kW * kH * 2);
-  g_cam_fb = (uint16_t *)m5_alloc_dma(kW * kH * 2);
+  g_fb = (uint16_t *)dma_alloc(kW * kH * 2);
+  g_cam_fb = (uint16_t *)dma_alloc(kW * kH * 2);
   if (!g_fb || !g_cam_fb) {
     printf("out of iomem\n");
     while (1) {}
   }
-  m5_lcd_init();
+  board_lcd_init();
   // Test pattern first, so a working LCD is visible even if the camera isn't.
   for (int y = 0; y < kH; y++)
     for (int x = 0; x < kW; x++) g_fb[y * kW + x] = (uint16_t)(((x * 31 / kW) << 11) | ((y * 63 / kH) << 5) | 0x0F);
-  m5_lcd_show(g_fb);
+  board_lcd_show(g_fb);
 
-  uint16_t cam = m5_camera_init();
+  uint16_t cam = cam_init();
   if (cam != 0x7742) {
-    printf("camera: expected OV7740 (0x7742), got 0x%04x -- only OV7740 M5StickVs are supported\n", cam);
+    printf("camera: expected OV7740 (0x7742), got 0x%04x -- only OV7740 boards are supported\n", cam);
     while (1) {}
   }
   printf("camera: OV7740 ok\n");
@@ -254,15 +254,15 @@ int main() {
 
   while (1) {
     uint64_t t0 = now_us();
-    if (m5_camera_snapshot(500) != 0) {
+    if (cam_snapshot(500) != 0) {
       printf("camera: frame timeout\n");
       continue;
     }
     uint64_t t1 = now_us();
     cam_us += t1 - t0;
 
-    const uint8_t *planes = m5_camera_ai_planes();
-    m5_ai_to_rgb565(planes, g_cam_fb);
+    const uint8_t *planes = cam_ai_planes();
+    cam_ai_to_rgb565(planes, g_cam_fb);
 
     Output out;
     bool have_out = false;
@@ -299,10 +299,10 @@ int main() {
       if (++frame_no % 30 == 0)
         printf("top5: %d %d %d %d %d  (p=%.3f)\n", idx[0], idx[1], idx[2], idx[3], idx[4], (double)p);
     }
-    m5_lcd_show(g_fb);
+    board_lcd_show(g_fb);
     frames++;
 
-    bool a = m5_button_a(), b = m5_button_b();
+    bool a = board_button_a(), b = board_button_b();
     if (a && !prev_a) g_view = (g_view + 1) % kViewCount;
     if (b && !prev_b) g_gain_idx = (g_gain_idx + 1) % kGainCount;
     prev_a = a;
