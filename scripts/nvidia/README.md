@@ -12,6 +12,9 @@ hand-built-graph tests in `tests/test_tensorrt_*.py` (which never invoke TensorR
 | `imagenette_data.py` | any with Pillow | preprocesses Imagenette (real ImageNet images, 10 classes) into val + calibration `.npy` sets |
 | `ort_cpu_check.py` | any with onnxruntime | top-1 of ONNX models on a val subset via ORT CPU: separates "quantized model is inaccurate" from "TensorRT mishandles it" |
 | `eval_accuracy.py` | system Python with `tensorrt` | streams the val set through each variant's TensorRT engine; top-1 and agreement with fp32 |
+| `sparsity_check.py` | onnxsim (`gen`) then system Python with `tensorrt` (`trt`) | checks whether TensorRT's builder gives 2:4-pruned `MatMul`/`Gemm` weights sparse tactics |
+| `trt_nms_check.py` | onnxsim (`gen`), system Python with `tensorrt` (`trt`), any (`compare`) | differentially checks `rewrite_trt_batched_nms`'s output against the real `BatchedNMSDynamic_TRT` plugin |
+| `run_cuda_feature_notebook.py` | onnxsim + a GPU `onnxruntime` | runs `examples/cuda_feature_tests/cuda_feature_tests.ipynb`'s tests as a plain script |
 
 They are split because JetPack 6's TensorRT Python bindings are cp310-only while onnxsim
 needs Python >= 3.11; models are exchanged as `.onnx` files.
@@ -169,3 +172,137 @@ The Orin Nano has no DLA. `tensorrt.Builder().num_DLA_cores == 0`, there is no
 `--buildDLAStandalone`) fails with `Cannot create DLA engine, 0 not available` even
 though `nvidia-l4t-dla-compiler` is installed. DLA compilation and latency need an
 Orin NX or AGX Orin; none of the numbers above involve a DLA.
+
+## 2:4 sparsity: does `convert_matmul_to_gemm` matter on TensorRT 10.3?
+
+`scripts/nvidia/sparsity_check.py` checks `onnxsim/tensorrt_sparsity.py`'s claim (citing
+[NVIDIA/TensorRT#2271](https://github.com/NVIDIA/TensorRT/issues/2271), filed against an
+older TensorRT) that N:M sparse math only ever applies to `Gemm`, not `MatMul`, so
+2:4-pruned transformer FFN/attention weights (which are wired through `MatMul`, since
+their activation is 3-D) need `convert_matmul_to_gemm` first. **Scope note**: that claim
+is specifically about *ONNX Runtime's* TensorRT execution provider
+(`ORT_TENSORRT_SPARSITY_ENABLE=1`); this checks the underlying TensorRT builder directly
+(same as `trt_harness.py`), which ORT's EP delegates to -- informative, not a direct test
+of the literal claim (see `run_cuda_feature_notebook.py`'s findings for why ORT-TRT-EP
+itself could not be run on this board).
+
+```sh
+python3.12 scripts/nvidia/sparsity_check.py gen /tmp/sp --layers 6      # onnxsim venv
+python3.10 scripts/nvidia/sparsity_check.py trt /tmp/sp --runs 3        # tensorrt venv
+```
+
+Built a 6-layer ViT-B-shaped MLP stack (768&rarr;3072 ReLU 3072&rarr;768) at three
+activation shapes -- `2d197` `[197,768]`, `3d197` `[1,197,768]` (the realistic
+batched/transformer case), `2d2048` `[2048,768]` (larger, 2-D) -- each as dense and
+`apply_magnitude_pruning(n=2, m=4)`-pruned weights (correctly 50% zero, valid 2:4-along-K
+pattern, confirmed programmatically), both as plain `MatMul` and after
+`convert_matmul_to_gemm` (value-preserving: `max_abs_diff = 0.0` against the un-converted
+model). Built each of the 12 resulting models with `trtexec --fp16
+--sparsity={disable,enable,force}` (36 engines) and timed the successful ones (median of
+2 rounds; TensorRT's internal timing-based tactic autotuner was still re-run per engine).
+
+**Eligibility** (`enable` mode; `force` ignores actual weight content and is a sanity
+check, not a real signal):
+
+| shape | dense (either op) | pruned `MatMul` | pruned `Gemm` |
+|---|---|---|---|
+| `2d197` (2-D) | 0/12 eligible | **12/12** | 12/12 |
+| `3d197` (3-D, batched) | 0/12 eligible | **12/12** | 12/12 |
+| `2d2048` (2-D, large) | 0/12 eligible | 11/12 | 12/12 |
+
+**`MatMul` does get sparse-tactic eligibility on TensorRT 10.3** -- at small/medium
+shapes, identically to `Gemm`; at the largest shape tested, nearly so (11 vs 12). This
+updates the premise behind issue #2271 for current TensorRT: it is no longer categorically
+true that `MatMul` never gets N:M sparse math. The one clean exception found: `force`
+mode on the 3-D-activation *dense* `MatMul` got 0/12 eligible (vs `Gemm`'s 12/12 via its
+reshape scaffold) -- but `force` on dense weights isn't the real-world case either way.
+
+**Latency** (median GPU ms, `enable` mode -- the real-world setting):
+
+| shape | dense | pruned `MatMul` | pruned `Gemm` | pruning speedup |
+|---|---|---|---|---|
+| `2d197` | 1.33 ms | 1.061 ms | 1.052 ms | ~1.26x, both ops tied (&lt;1% apart) |
+| `3d197` | dense `MatMul` 1.34 ms / `Gemm` 1.48 ms | **1.059 ms** | 1.212 ms | `MatMul` 1.27x; converting to `Gemm` is **13% slower**, not faster |
+| `2d2048` | ~12.2 ms | **10.17 ms** | 10.84 ms | `MatMul` 1.20x; converting to `Gemm` is **7% slower** |
+
+At every shape tested, `convert_matmul_to_gemm` gave **no latency benefit** -- and at the
+two shapes where it isn't a zero-overhead rewrite (`3d197`'s reshape/unflatten scaffold
+around the batched activation; `2d2048`, plain 2-D, where the extra overhead is less
+obvious), the *converted* engine was measurably **slower** than leaving it as `MatMul`.
+Pruning itself is worth it either way (~1.2-1.3x over dense at `fp16`); the conversion
+pass is not, at least at these shapes on TRT 10.3.
+
+Numeric correctness: `convert_matmul_to_gemm` is exact (checked in `gen`, fp32); the fp16
+engines' relative error vs the fp32 reference stayed in the same range regardless of form
+(`~0.1%-1%`), and the pruned+`enable` engines were consistently *more* accurate than their
+dense fp16 counterparts (e.g. `2d197`: `1.25e-3` vs `1.05e-2`) -- plausibly because a sparse
+kernel accumulates over fewer (only nonzero) terms, though this isn't a guaranteed property
+and is incidental to the claim under test.
+
+**Caveat -- tactic-selection nondeterminism**: two independent full `trt`-stage runs gave
+the *same* eligibility pattern above both times, but a different `chosen` count for one
+config (`2d2048 pruned_matmul enable`: 6/11 chosen in run 1, 11/11 in run 2 -- TensorRT's
+timing-based autotuner re-profiles tactics per build and can land on a different one).
+The eligibility table is corroborated across both runs; the latency table is from one
+full run only (each number's own 2-sample spread was tight, 0.0-1.1%, but a re-build
+could plausibly pick different tactics and shift the exact numbers, especially at
+`2d2048` where `MatMul`'s eligibility was already partial). Given this, treat the
+qualitative result -- pruning helps, conversion doesn't, on TRT 10.3 -- as the reliable
+takeaway rather than the exact percentages.
+
+## CUDA feature notebook (`examples/cuda_feature_tests/`): blocked on this board
+
+`scripts/nvidia/run_cuda_feature_notebook.py` runs `cuda_feature_tests.ipynb`'s 7 tests
+(Tests A-G: `backend.run_model` CPU/CUDA parity, `simplify(providers=CUDA)` GPU constant
+folding, the `(name, options)` device-pinning tuple form, CLI `--cuda`, the
+unavailable-provider `ValueError`, DLPack zero-copy with a CUDA `torch.Tensor`, and
+`measure_accuracy_drop(providers=CUDA)`) as a plain script, so they can run outside
+Jupyter/Colab -- the notebook is explicitly hand-run-only and has never executed on real
+hardware.
+
+```sh
+python3.12 scripts/nvidia/run_cuda_feature_notebook.py
+```
+
+**Could not actually run any of the 7 tests on this board.** onnxsim requires Python >=
+3.11 (its wheel is `cp312-abi3`), but the only real GPU-capable `onnxruntime` for JetPack
+6/CUDA 12.6 -- the Jetson AI Lab index
+(`--index-url https://pypi.jetson-ai-lab.io/jp6/cu126`) -- ships `onnxruntime-gpu` (1.24.0)
+for `cp310` only (confirmed with `uv pip install --dry-run`, not by guessing: it resolves
+cleanly against `/usr/bin/python3.10` and fails ABI resolution against 3.12). No single
+interpreter on this board can import both `onnxsim` and a working GPU `onnxruntime`.
+
+PyPI's plain `onnxruntime-gpu==1.30.0` does have a `cp312`/aarch64 wheel and installs
+without error, so it is tempting to reach for as a workaround -- but it requires CUDA
+13.x/cuDNN 9.x, and this board runs CUDA 12.6. Concretely reproduced (not just inferred
+from the version requirement): `rt.get_available_providers()` lists
+`CUDAExecutionProvider` regardless -- that check is static metadata, not a real capability
+probe -- but creating an `InferenceSession` with it requested fails to `dlopen
+libcublasLt.so.13` and **silently falls back to `CPUExecutionProvider`**, with no
+exception, only a stderr warning:
+
+```
+Failed to load library .../libonnxruntime_providers_cuda.so with error:
+  libcublasLt.so.13: cannot open shared object file: No such file or directory
+Failed to create CUDAExecutionProvider. Require cuDNN 9.* and CUDA 13.*.
+```
+
+**This is worth a maintainer's attention beyond this board's mismatch**: onnxsim's own
+provider validation (`onnxsim/backend.py:178`, `available = set(rt.get_available_providers())`)
+checks exactly the same static list that just lied above. So `onnxsim.simplify(providers=
+["CUDAExecutionProvider"])` or `backend.run_model(..., providers=CUDA)` on a
+version-mismatched `onnxruntime-gpu` install raises nothing and silently returns a
+CPU-computed result -- indistinguishable from a real GPU run to the caller, including
+Test A's "CPU vs CUDA parity" check, which would trivially pass either way (both sides
+would be CPU). Not fixed here (a behavior change to a core runtime path deserves its own
+review, not a bundled verification-script PR); the fix would compare each requested
+provider against the *session's actual* `sess.get_providers()` after construction (which
+does reflect real fallback) rather than trusting `get_available_providers()` alone, and
+warn or raise on mismatch.
+
+Not attempted: building `onnxruntime-gpu` from source for `cp312`/CUDA 12.6/sm_87 (a
+multi-hour build disproportionate to this check). The script itself is unaffected by any
+of this and should work as-is on a board where a GPU `onnxruntime` matching onnxsim's
+Python floor actually exists (e.g. an x86 box with `onnxruntime-gpu`, or a future JetPack
+release on CUDA 13).
+
