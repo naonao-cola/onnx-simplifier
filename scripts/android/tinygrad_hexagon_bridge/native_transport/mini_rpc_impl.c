@@ -1,6 +1,12 @@
 #include "mini_rpc.h"
 #include <stdlib.h>
 
+/* Stage 2: the fused stem->requantize->maxpool subgraph driver (see ../README.md's "Chaining a
+ * real subgraph" section) -- kernel functions prefixed sg_ to avoid colliding with the
+ * standalone test kernels below. */
+#include "subgraph_driver.c"
+#include "small_subgraph_driver.c"
+
 int mini_rpc_open(const char* uri, remote_handle64* h) {
   *h = (remote_handle64)(uintptr_t)malloc(1);
   return *h ? 0 : -1;
@@ -92,6 +98,14 @@ int mini_rpc_run_kernel(remote_handle64 h, const unsigned char* a, int aLen,
   }
   if (aLen == HEX_REQUANT_A_LEN && cLen == HEX_REQUANT_C_LEN) {
     hex_requantize(c, (int*)(void*)a);
+    return 0;
+  }
+  if (aLen == 3527056 && cLen == 3481600) {
+    run_stem_subgraph(a, c);
+    return 0;
+  }
+  if (aLen == 5776 && cLen == 4096) {
+    run_small_stem_subgraph(a, c);
     return 0;
   }
   int n = aLen < cLen ? aLen : cLen;

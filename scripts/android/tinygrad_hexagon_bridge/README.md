@@ -966,6 +966,134 @@ None of this is hypothetical -- every piece has a working precedent elsewhere in
 verification, ONNX-vs-kernel correctness checking) -- it's a real, scoped, multi-step follow-up,
 not a research question. Flagged precisely rather than rushed, per this file's established norm.
 
+## Chaining a real subgraph: `conv7x7 -> requantize -> maxpool`, real weights, real hardware
+
+The follow-up to all three points above, done for real: the ResNet-50 stem (`conv7x7(s2,p3) ->
+requantize -> maxpool(3x3,s2,p1)`) running end to end on real Hexagon hardware, real
+`backbone.onnx` weights/scales, real image input, zero TVM in the executed path. The user's
+explicit direction for this whole thread was to keep it that way -- reuse TVM/ONNX Runtime only as
+an offline correctness *reference*, never as part of what runs on the phone.
+
+### Real weight/scale extraction (`backbone_subgraph/extract_and_verify.py`)
+
+`backbone.onnx`'s QDQ graph, traced forward from the `image` input (not assumed): a stem
+`Conv` node (`2_quant`, `pads=[3,3,3,3]`, `strides=[2,2]`, `kernel_shape=[7,7]`, confirmed
+matching `hex_stem7x7_kernel.py`'s own `K/STRIDE/PAD` constants exactly) consuming
+`ConvMulFusion_W_2_quantized` (int8 weight, **per-tensor** scale -- confirmed via its
+initializer's shape being `()`, not `(64,)`, so no per-channel requantize complication) and
+`ConvAddFusion_Add_B_5_quantized` (a real int32 bias, pre-scaled to `input_scale * weight_scale`
+-- standard QDQ convention), followed by a `MaxPool` node (`8_quant`, `pads=[1,1,1,1]`,
+`strides=[2,2]`, `kernel_shape=[3,3]`, matching `hex_maxpool_kernel.py` exactly) whose surrounding
+`QuantizeLinear`/`DequantizeLinear` pair reuses the *same* scale/zero-point before and after --
+confirming numerically what was already known architecturally: maxpool needs no real requantize
+step at all, its uint8 output is directly usable as the next op's input.
+
+Two real gaps this surfaced, neither covered by any kernel in this project before now:
+
+1. **Bias-add.** Every real conv in this graph has a nonzero bias (`ConvAddFusion_Add_B_5`'s
+   values run into the thousands, not negligible) -- none of `hex_gemm_kernel.py`/
+   `hex_conv3x3_kernel.py`/`hex_stem7x7_kernel.py` compute one; they're pure `sum(x*w)`.
+   `hex_bias_add_kernel.py` is a new, minimal `custom_kernel` (no accumulator, no reduction --
+   same class as `hex_add_kernel.py`, just a per-channel broadcast instead of an elementwise
+   same-shape add): `out[pos,c] = acc[pos,c] + bias[c]`.
+2. **The image's zero-point (114, not 0).** Every activation *after* the stem conv has
+   `zero_point=0` (confirmed from the graph's own scale/zero-point initializers -- expected,
+   ReLU makes everything non-negative) -- but the raw `image` input's `zero_point` is 114, and
+   none of this project's kernels subtract an activation zero-point before their dot product (all
+   of them assume it's 0, which is why they've worked correctly everywhere *except* here). Rather
+   than add real zero-point-subtraction arithmetic to the kernel, the standard quantized-inference
+   trick applies: fold it into the bias instead, host-side, once, since weights are static --
+   `folded_bias[oc] = bias[oc] - image_zp * sum_{ic,kh,kw}(weight[oc,ic,kh,kw])`, so
+   `sum(x*w) + folded_bias == sum((x-image_zp)*w) + bias` exactly, no on-device zero-point logic
+   needed at all. (One more real detail this forced: `hex_stem7x7_kernel.py`'s `pad_input()`
+   docstring already flagged that "a real integration needs the input's actual quantization
+   zero-point for the spatial border, not literal 0" -- this is that real integration, so the
+   image's spatial padding uses `image_zp=114`, not literal 0, this time.)
+
+A quick host-side numpy composition of the whole chain (real weight, real folded bias, real
+multiplier/shift, real image) against the ORT reference agreed to 98.8% exact / mean abs error
+0.096 -- confirming the *math* was right before spending any device time on it.
+
+### The layout-mismatch gap composition alone surfaced
+
+Something no single kernel's own correctness check could have caught: `hex_stem7x7_kernel.py`'s
+output is `(pos, cout)` **NHWC-flat** (position-major, channel-minor), but `hex_maxpool_kernel.py`
+expects TVM's packed **NCHWc** layout (`[ic_chunk, h, w, 32]`, channel-block-major) -- two
+individually-correct, individually-verified kernels whose outputs and inputs are simply different
+physical layouts. Every kernel in this project was right in isolation; nothing had ever tested
+whether two of them *compose*, and this is exactly the kind of gap that only shows up when they
+do. Bridged with a plain, unvectorized copy loop (`nhwc_to_padded_nchwc()` in
+`native_transport/subgraph_driver.c`) -- correctness first, matching this project's precedent for
+every new piece of glue; not a `custom_kernel`, just a hand-written C loop, since it's pure
+data movement with no arithmetic to get an HVX instruction for.
+
+### The fused driver, and a real bug its own diagnostic isolated
+
+`native_transport/subgraph_driver.c`: one exported function, `run_stem_subgraph()`, calling
+`hex_stem7x7 -> hex_bias_add -> hex_requantize -> nhwc_to_padded_nchwc -> hex_maxpool` in
+sequence against on-device `static` buffers (~84 MB total: the stem's raw `int32` accumulator,
+the packed-NCHWc layout buffer, the requantized intermediate) -- none of it crosses the RPC
+boundary, only the padded input image goes in and the final packed maxpool output comes out,
+via one more size-dispatched branch in `mini_rpc_impl.c`'s `mini_rpc_run_kernel()` (same pattern
+`requantize` used above). Weight (12.5 KB) and folded bias (256 B) are baked in as compile-time
+`static const` arrays rather than passed as extra RPC buffers -- simplest fit for a fixed,
+known-at-generation-time subgraph, avoiding an IDL change.
+
+First real-hardware attempt failed: `rc=78`, and `adb logcat` showed a DSP-side crash with
+`Bad VA` (bad virtual address) inside `mini_rpc.so`. **Isolated with a second, tiny-scale
+(32x32 input) copy of the exact same driver structure** (`native_transport/small_subgraph_driver.c`,
+kept as a real diagnostic artifact, not scratch) run *before* the full-scale one in the same test
+binary: it linked and ran (`rc=0`) but its output was **wrong** -- 92% of pixels mismatched,
+not a boundary-only discrepancy. Two symptoms, traced to one real cause: every kernel function's
+parameters are declared `__attribute__((align_value(128)))` (a compiler *assumption*, not an
+enforced check) because every prior kernel's buffers came straight from the FastRPC-mapped,
+page-aligned `a`/`b`/`c` RPC arguments -- but this driver's *new* on-device `static` intermediate
+buffers (the accumulator, the layout buffer, the requantized array) had no alignment attribute at
+all, so the compiler emitted HVX vector loads/stores assuming 128-byte alignment against memory
+the linker never actually guaranteed it for. Silently wrong at small scale (the misaligned vector
+ops just read/wrote adjacent-but-wrong bytes); a hard fault at full scale, large enough to cross
+an actual unmapped boundary. Fixed by adding `__attribute__((aligned(128)))` to every static
+buffer and constant array in the driver -- after which **both** the small-scale diagnostic (now
+bit-exact against its own numpy reference) and the full-scale run (`rc=0`) succeeded.
+
+### Real-hardware result, real weights, real image, real ORT reference
+
+Device `239dbd8f`, the true `800x1088` input processed by the true stem conv through the true
+maxpool, `wall_ms=583.153` (client-measured, covering the *entire* fused chain in one RPC call --
+no TVM, no `tvm.rpc`, no `relay.build`, nowhere in this path):
+
+| | value |
+|---|---:|
+| Match vs. ONNX Runtime reference | **99.9995%** of pixels exact |
+| Max abs diff | **1** (uint8, i.e. off-by-one rounding at 5 pixels out of 87,040) |
+| Mean abs diff | 4.9e-6 |
+| Wall time (fused, on-device) | 583.153 ms |
+
+Tighter agreement than this project's own established int8-quantization-noise baseline
+(`scripts/android/maskrcnn_e2e/README.md`'s feature-map mean abs error of ~0.06-0.11) --
+consistent with a handful of genuine rounding-order differences between this fixed-point pipeline
+and ORT's own float-simulated QDQ graph, not a real correctness gap. **First proof in this
+project that independently-verified kernels compose correctly into a real, multi-op, real-weight
+subgraph on real hardware** -- the specific question Stage 1 left open.
+
+### What this does and doesn't prove
+
+Proven: the composition question. Kernels built and verified in isolation (`hex_stem7x7_kernel.py`,
+`hex_bias_add_kernel.py`, `hex_requantize_kernel.py`, `hex_maxpool_kernel.py`) chain correctly
+into a real multi-op subgraph against real backbone weights, entirely through the TVM-free
+`native_transport` path, with real ORT-level accuracy. The layout-mismatch and alignment bugs are
+now both fixed and documented, so extending this same pattern to more of the graph is mechanical,
+not exploratory.
+
+**Not done**: the full 578-node backbone (this subgraph is 3 of those 578 nodes' worth of ops --
+the stem, one requantize, one maxpool); a first ResNet bottleneck block was scoped in the original
+directive but not reached, this subgraph's own investigation (extraction methodology, the layout
+gap, the alignment bug) filled the available time. `native_transport`'s current ~84 MB-per-call
+static buffer footprint for just this small subgraph also won't scale to the full backbone's much
+larger activations unmodified -- buffer reuse (e.g. requantizing in place into the same memory the
+`int32` accumulator occupied) is the natural next lever before attempting more of the graph, not
+attempted here since this subgraph didn't need it to fit.
+
 ## Removing TVM as a transport dependency
 
 The bridge above still depends on TVM for two separate things: (1) **transport** -- getting bytes
@@ -1197,6 +1325,20 @@ when candidates differ only in raw compute-instruction mix with comparable worki
   TVM's source, not assumed) -- the one kernel missing before any two covered convs can be chained
   into a real subgraph. Verified on real hardware through `native_transport/` only, zero TVM in
   the executed path. See "Running the full backbone graph, TVM-free" above.
+- `hex_bias_add_kernel.py` -- the per-output-channel `int32` bias-add every real conv needs
+  before `requantize`, and (via the standard zero-point-folding trick) how this project's kernels
+  handle the raw image's nonzero activation zero-point without any on-device subtraction logic.
+  See "Chaining a real subgraph" above.
+- `backbone_subgraph/extract_and_verify.py` -- extracts real stem-conv weight/bias/scales from a
+  prepared `backbone.onnx`, computes the folded bias and requantize multiplier/shift, and
+  generates the padded-image/packed-weight data files `native_transport/subgraph_driver.c` embeds.
+- `native_transport/subgraph_driver.c` -- the fused `conv7x7 -> bias_add -> requantize ->
+  layout_transform -> maxpool` driver: real backbone weights/bias baked in as compile-time
+  constants, every intermediate activation on-device only (never crosses the RPC boundary), one
+  `native_transport` call for the whole chain. Verified on real hardware, real image, 99.9995%
+  exact match vs. the real ONNX Runtime reference. See "Chaining a real subgraph" above --
+  including the real 128-byte-alignment bug its own `small_subgraph_driver.c` diagnostic isolated
+  (kept as a record of how, not scratch).
 - `native_transport/` -- a from-scratch, TVM-free FastRPC transport: custom `qaic`-generated
   interface, a native ARM64 client using only `libcdsprpc.so`, verified end to end on real
   hardware. See "Removing TVM as a transport dependency" above; `native_transport/build.sh`
