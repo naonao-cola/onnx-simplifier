@@ -18,6 +18,13 @@
 // than including its own home header, sharing a single struct definition
 // (rather than a byte-for-byte duplicate struct body in each header) avoids
 // two independently-edited copies of the same type ever drifting apart.
+// finetune_entry.h/lora_entry.h are always built (see
+// ONNXSIM_NON_CORE_FEATURE_SOURCES in CMakeLists.txt -- QAT/LoRA/fine-tuning
+// are not part of what ONNXSIM_NON_CORE_FEATURES controls), so their own
+// includes stay outside the guarded block below.
+#include "finetune_entry.h"
+#include "lora_entry.h"
+
 #ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 #include "adaquant_entry.h"
 #include "adaround_entry.h"
@@ -32,7 +39,6 @@
 #include "duquant_entry.h"
 #include "easyquant_entry.h"
 #include "embedding_quantization_entry.h"
-#include "finetune_entry.h"
 #include "flexround_entry.h"
 #include "foem_entry.h"
 #include "fptq_entry.h"
@@ -44,7 +50,6 @@
 #include "kv_cache_quantization_entry.h"
 #include "llm_fp4_activation_entry.h"
 #include "llm_int8_entry.h"
-#include "lora_entry.h"
 #include "low_rank_compensation_entry.h"
 #include "lqer_entry.h"
 #include "mixed_precision_entry.h"
