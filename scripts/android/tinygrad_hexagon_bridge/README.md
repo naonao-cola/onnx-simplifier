@@ -341,6 +341,63 @@ mid-pack, not obviously "broken" the way the smallest-channel shapes were).
 total from the original ranked profile -- **about 47% of the entire backbone's isolated-timing
 sum**, every one bit-exact correct and faster than TVM's hand-tuned schedule.
 
+### Coverage: a real 3x3 conv (`hex_conv3x3_kernel.py`) -- correct everywhere, fast on some shapes
+
+Every kernel above handles 1x1 convs (a plain GEMM once the spatial dims are flattened into `M`).
+3x3 convs are `2509 ms` of the `6851 ms` conv-only profile total (the biggest bucket after 1x1),
+so they're the natural next target. `hex_conv3x3_kernel.py` extends the same `vrmpybusv`
+accumulate-loop pattern to a genuine spatial convolution:
+
+- **Padding pushed out of the kernel**: the real backbone's 3x3 convs are all `stride=1, pad=1`
+  ("same" output size). Rather than branch on boundary conditions inside the hot loop, the input is
+  zero-padded by 1 pixel on each spatial side *before* the kernel runs (`pad_input()`) -- once padded,
+  `a_row = oh + kh` / `a_col = ow + kw` directly index the padded array for `kh, kw in 0..2`, no `-1`
+  offset or bounds check needed. (A real integration into the backbone would need to pad with the
+  input's actual quantization zero-point, not literal 0, to match `qnn.conv2d` semantics exactly --
+  noted in the file, not yet done, since this file's own correctness check compares against a
+  reference padded the same literal-0 way.)
+- **Combined reduction range**: one `REDUCE` range of extent `9 * (cin//4)`, decomposed inside the
+  kernel via `//`/`%` into `(kh, kw, kc)` -- reuses the exact `_reg_i32` multi-range-dependency
+  accumulator-init fix from `hex_gemm_kernel.py` (needed here too: `cin==4` makes this reduction
+  range itself degenerate-extent-9, and separately `cout==32` still makes `nt` extent-1).
+- **Weight packing extended to 9 positions**: `pack_weight_3x3()` packs each of the 9 kernel
+  positions with `pack_b()`'s exact per-position layout (`Wp[pos, nt, kc, n_lane*4+ks]`), so each
+  `vrmpybusv` call still reads one contiguous 128-byte weight slice.
+
+Verified **bit-exact correct on real hardware** (`vrmpybusv_acc_128B`, uint8 activation x signed
+int8 weight, matching the real backbone's QNN quantization) at the three highest-impact 3x3 shapes
+in the profile, at their real spatial sizes:
+
+| `cin` | `cout` | spatial | stock TVM | `custom_kernel` | speedup | correct |
+|---:|---:|---|---:|---:|---:|---|
+| 256 | 256 | 200x272 | 49.30 GMAC/s (0.651 s) | 33.41 GMAC/s (0.960 s) | **0.68x (slower)** | yes |
+| 64 | 64 | 200x272 | 20.86 GMAC/s (0.096 s) | 28.96 GMAC/s (0.069 s) | **1.39x** | yes |
+| 128 | 128 | 100x136 | 31.87 GMAC/s (0.063 s) | 32.19 GMAC/s (0.062 s) | **1.01x** | yes |
+
+Unlike every 1x1 shape above, this is a **mixed result, reported honestly**: correctness holds at
+every shape (three more data points at smaller scales during development, `cin/cout` from 4 to 256,
+also matched a numpy reference under qemu), but speed doesn't uniformly beat TVM the way the 1x1
+kernel did. The `cin=cout=256` shape -- the single biggest 3x3 bucket in the whole profile -- is
+*slower* than stock TVM; the two smaller-channel shapes are roughly even to modestly faster.
+
+**Why, most likely**: this kernel does zero explicit cache-blocking or output-tile reuse -- it's a
+direct nested loop (`oh -> ow -> nt -> reduction`) with no register tiling across neighboring output
+pixels, unlike the 1x1 kernels where every "row" (`M`) is independent and TVM's own baseline was
+already memory-bound in a way a single-accumulator loop matches well. A 3x3 conv's per-output-pixel
+weight working set is 9x an equivalent 1x1's (`9*256*256 = 589824` packed weight bytes at the
+biggest shape -- past a typical Hexagon L1's size, so every output pixel's full reduction re-streams
+weight data from L2/memory with no reuse across pixels); TVM's schedule likely blocks/tiles this
+where our naive loop doesn't, which plausibly explains why the *smaller*-channel shapes (weight
+working set 9x smaller, fits cache more easily) come out roughly even or ahead while the biggest one
+falls behind.
+
+**Not done**: any register/cache-blocking tiling (e.g. accumulating several output columns per
+weight load to amortize the reduction across neighbors, matching what `TVM`'s own schedule likely
+does) -- the natural next step if this is picked back up, and the same kind of tuning investment the
+1x1 kernels never needed to make. Real end-to-end backbone impact also isn't measured (would need
+the same splice-into-`relay.build()` mechanism `backbone_splice/` uses, currently blocked on that
+work's own unresolved RPC loading bug -- see `backbone_splice/README.md`).
+
 ## Removing TVM as a transport dependency
 
 The bridge above still depends on TVM for two separate things: (1) **transport** -- getting bytes
@@ -446,6 +503,11 @@ one of `hex_gemm_kernel.py`'s generated kernel functions instead of the placehol
   kernel via `Tensor.custom_kernel`, measured 8.65x faster than stock TVM's hand-tuned schedule at
   the real Mask R-CNN pathological shape (see "It works" above). Bridge its output through
   `bridge_and_test.py` (after pre-packing `B` via `pack_b()`) to run it on real hardware.
+- `hex_conv3x3_kernel.py` -- a real spatial 3x3 conv via the same `vrmpybusv`/`custom_kernel`
+  pattern, extended to a 9-position reduction and pre-padded input addressing. Correct on real
+  hardware at every shape tested; faster than stock TVM at two of the three real profile shapes
+  tested, slower at the biggest one (`cin=cout=256`) -- see "Coverage: a real 3x3 conv" above for
+  why, and what tiling work would likely close the gap.
 - `native_transport/` -- a from-scratch, TVM-free FastRPC transport: custom `qaic`-generated
   interface, a native ARM64 client using only `libcdsprpc.so`, verified end to end on real
   hardware. See "Removing TVM as a transport dependency" above; `native_transport/build.sh`
