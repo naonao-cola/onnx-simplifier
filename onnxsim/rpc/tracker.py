@@ -70,7 +70,8 @@ class Tracker(socketserver.ThreadingTCPServer):
 
     @property
     def address(self) -> Tuple[str, int]:
-        return self.server_address[0], self.server_address[1]
+        host, port = self.server_address[:2]
+        return str(host), int(port)
 
     def add(self, key: str, addr: Tuple[str, int]) -> None:
         with self._lock:

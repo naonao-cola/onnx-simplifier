@@ -23,7 +23,8 @@ class RemoteModelExecutor(PyModelExecutor):
         super().__init__(providers)
         self._session = session
 
-    def Run(self, model_str: bytes, inputs_str: List[bytes]) -> List[bytes]:  # noqa: N802
+    # The base class annotates these as str/List[str] although the C++ core passes serialized bytes.
+    def Run(self, model_str: str, inputs_str: List[str]) -> List[bytes]:  # noqa: N802
         model = onnx.ModelProto()
         model.ParseFromString(model_str)
         arrays = []
@@ -32,7 +33,13 @@ class RemoteModelExecutor(PyModelExecutor):
             tensor.ParseFromString(serialized)
             arrays.append(onnx.numpy_helper.to_array(tensor))
         inputs = dict(zip((i.name for i in model.graph.input), arrays))
-        outputs = self._session.run(model, inputs, providers=self.providers)
+        # Only provider names cross the wire (per-provider option dicts are not transferred).
+        names = (
+            [p if isinstance(p, str) else p[0] for p in self.providers]
+            if self.providers
+            else None
+        )
+        outputs = self._session.run(model, inputs, providers=names)
         return [
             onnx.numpy_helper.from_array(np.asarray(value)).SerializeToString()
             for value in outputs.values()
