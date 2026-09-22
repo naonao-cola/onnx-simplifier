@@ -390,21 +390,27 @@ generic, shared kernel-optimization machinery no local fix could safely touch --
 real attempts each broke something else), a from-scratch, hand-written `vrmpy` GEMM kernel via
 `tinygrad.Tensor.custom_kernel` (bypassing `Ops.WMMA` entirely).
 
-**Verified correct and measured on real hardware at seven of the small-channel 1x1-conv shapes from
-the ranked profile above** (same kernel code, re-parameterized by shape) -- 1.22x to 8.65x faster
-than stock TVM's hand-tuned `vrmpy` schedule at every one (including the backbone's one strided
-1x1 conv and its two tiny-`cout` RPN/mask-head convs, `cout=12`/`3`, padded to 32 lanes), covering
-roughly 31% of the *entire* backbone's isolated-timing total:
+**Verified correct and measured on real hardware at twelve 1x1-conv shapes from the ranked profile
+above** (same kernel code, re-parameterized by shape -- not just the small-channel group the
+"systemic pattern 1" finding identified, but several larger-channel shapes that turned out to
+also be running well below peak throughput) -- 1.22x to 8.65x faster than stock TVM's hand-tuned
+`vrmpy` schedule at every one, covering roughly **47% of the entire backbone's isolated-timing
+total**:
 
 | `cin` | `cout` | spatial | stride | speedup vs. TVM |
 |---:|---:|---|---:|---:|
 | 64 | 256 | 200x272 | 1 | 8.65x |
 | 128 | 512 | 100x136 | 1 | 6.41x |
+| 256 | 512 | 200x272 | 2 | 5.81x |
 | 64 | 64 | 200x272 | 1 | 4.99x |
 | 256 | 128 | 200x272 | 2 | 4.62x |
+| 256 | 256 | 200x272 | 1 | 3.89x |
+| 512 | 256 | 100x136 | 1 | 2.55x |
 | 256 | 64 | 200x272 | 1 | 2.39x |
+| 256 | 1024 | 50x68 | 1 | 2.22x |
 | 512 | 128 | 100x136 | 1 | 2.00x |
 | 256 | 12 (padded to 32) | 200x272 | 1 | 1.94x |
+| 1024 | 256 | 50x68 | 1 | 1.44x |
 | 256 | 3 (padded to 32) | 200x272 | 1 | 1.22x |
 
 This is the small-channel 1x1-conv gap from the "systemic pattern 1" finding above, closed for

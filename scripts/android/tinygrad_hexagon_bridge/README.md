@@ -314,8 +314,31 @@ these same two shapes (`13x17` through `100x136`, ~46 ms combined) aren't separa
 should behave the same way (same kernel, same correctness argument, only the M-loop trip count
 differs) -- not measured individually given their small individual impact.
 
-**Total real coverage across all seven verified shapes**: ~2352 ms of the ~7620 ms isolated-timing
-total from the original ranked profile -- **about 31% of the entire backbone's isolated-timing
+### Coverage: the larger-channel 1x1 convs (`cin`/`cout` > 128)
+
+The earlier coverage passes only looked at shapes with `cin<=128 or cout<=128` (the "small-channel"
+systemic-pattern group). Re-checking the *entire* `conv_profile.json` (not just that filtered
+subset) by total isolated-timing impact turned up several **larger**-channel 1x1 convs still
+running well below the backbone's ~50-80 GMAC/s ceiling -- an earlier version of this note missed
+these entirely by filtering too narrowly. The kernel needed zero code changes (it was never
+channel-count-limited, only the earlier *search* for targets was) -- verified correct and measured
+on real hardware exactly as before:
+
+| `cin` | `cout` | spatial | stride | stock TVM | `custom_kernel` | speedup |
+|---:|---:|---|---:|---:|---:|---:|
+| 256 | 512 | 200x272 | 2 | 7.54 GMAC/s | 43.80 GMAC/s | **5.81x** |
+| 256 | 256 | 200x272 | 1 | 9.78 GMAC/s | 38.00 GMAC/s | **3.89x** |
+| 512 | 256 | 100x136 | 1 | 14.40 GMAC/s | 36.73 GMAC/s | **2.55x** |
+| 256 | 1024 | 50x68 | 1 | 20.10 GMAC/s | 44.53 GMAC/s | **2.22x** |
+| 1024 | 256 | 50x68 | 1 | 24.43 GMAC/s | 35.15 GMAC/s | **1.44x** |
+
+All five bit-exact correct, all faster than TVM -- including the strided `cin=256,cout=512` case
+(the `build_strided_kernel()` variant), which got the *largest* speedup of any shape covered so
+far (5.81x) despite TVM already doing reasonably well on it in absolute terms (7.54 GMAC/s is
+mid-pack, not obviously "broken" the way the smallest-channel shapes were).
+
+**Total real coverage across all twelve verified shapes**: ~3562 ms of the ~7623 ms isolated-timing
+total from the original ranked profile -- **about 47% of the entire backbone's isolated-timing
 sum**, every one bit-exact correct and faster than TVM's hand-tuned schedule.
 
 ## Files
