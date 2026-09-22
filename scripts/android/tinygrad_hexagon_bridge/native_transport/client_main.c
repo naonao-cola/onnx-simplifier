@@ -31,6 +31,11 @@
 #define SMALL_SUBGRAPH_A_PATH "/data/local/tmp/native_transport/small_image_padded.bin"
 #define SMALL_SUBGRAPH_C_PATH "/data/local/tmp/native_transport/small_maxpool_out.bin"
 
+#define BLOCK1_A_LEN 3481600
+#define BLOCK1_C_LEN 13926400
+#define BLOCK1_A_PATH "/data/local/tmp/native_transport/block1_input_packed.bin"
+#define BLOCK1_C_PATH "/data/local/tmp/native_transport/block1_output.bin"
+
 static unsigned char* read_file_exact(const char* path, int expect_len) {
   FILE* f = fopen(path, "rb");
   if (!f) return NULL;
@@ -165,6 +170,32 @@ int main(int argc, char** argv) {
     printf("subgraph test data not found at %s, skipping\n", SUBGRAPH_A_PATH);
   }
   free(sa);
+
+  /* Stage 3: ResNet-50 stage1/block1 -- conv10(1x1 reduce)->bias->requantize->conv17(3x3)->
+   * bias->requantize->conv24(1x1 expand)->bias plus a conv30(1x1 downsample)->bias shortcut,
+   * rescale-add-relu-clamp merge. Input is Stage 2's maxpool output (packed NCHWc), real
+   * weights/scales from backbone.onnx. Only runs if the input was pushed first. */
+  unsigned char* b1a = read_file_exact(BLOCK1_A_PATH, BLOCK1_A_LEN);
+  if (b1a) {
+    unsigned char* b1c = malloc(BLOCK1_C_LEN);
+    printf("running real ResNet-50 stage1/block1 subgraph...\n");
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int b1rc = mini_rpc_run_kernel(h, b1a, BLOCK1_A_LEN, b1a, 0, b1c, BLOCK1_C_LEN);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    printf("run_block1 rc=%d wall_ms=%.3f\n", b1rc, ms);
+    if (b1rc == 0) {
+      FILE* out = fopen(BLOCK1_C_PATH, "wb");
+      fwrite(b1c, 1, BLOCK1_C_LEN, out);
+      fclose(out);
+      printf("wrote %s (%d bytes) -- verify against the ORT reference host-side\n", BLOCK1_C_PATH, BLOCK1_C_LEN);
+    }
+    free(b1c);
+  } else {
+    printf("block1 test data not found at %s, skipping\n", BLOCK1_A_PATH);
+  }
+  free(b1a);
 
   mini_rpc_close(h);
   printf("closed OK\n");

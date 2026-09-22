@@ -8,3 +8,6 @@ gemm_c_out.bin
 requant_a.bin
 requant_ref.bin
 requant_c_out.bin
+block1_input_packed.bin
+block1_ref_output.bin
+block1_output.bin
