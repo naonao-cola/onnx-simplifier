@@ -4,8 +4,26 @@
  * the qaic-generated stub (mini_rpc_stub.c) for marshaling. No tvm.rpc, no tvm.contrib.hexagon,
  * no MinRPC, no libhexagon_rpc_skel.so anywhere in this binary or its dependency graph. */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "mini_rpc.h"
+
+#define GEMM_A_LEN 3481600
+#define GEMM_B_LEN 16384
+#define GEMM_C_LEN 55705600
+#define GEMM_A_PATH "/data/local/tmp/native_transport/gemm_a.bin"
+#define GEMM_B_PATH "/data/local/tmp/native_transport/gemm_bp.bin"
+#define GEMM_C_PATH "/data/local/tmp/native_transport/gemm_c_out.bin"
+
+static unsigned char* read_file_exact(const char* path, int expect_len) {
+  FILE* f = fopen(path, "rb");
+  if (!f) return NULL;
+  unsigned char* buf = malloc(expect_len);
+  size_t n = fread(buf, 1, expect_len, f);
+  fclose(f);
+  if ((int)n != expect_len) { free(buf); return NULL; }
+  return buf;
+}
 
 int main(int argc, char** argv) {
   const char* uri = argv[1];  /* e.g. "file:///data/local/tmp/native_transport/mini_rpc.so?mini_rpc_skel_handle_invoke&_dom=cdsp" */
@@ -36,9 +54,32 @@ int main(int argc, char** argv) {
   unsigned char b[8] = {10, 20, 30, 40, 50, 60, 70, 80};
   unsigned char c[8] = {0};
   rc = mini_rpc_run_kernel(h, a, 8, b, 8, c, 8);
-  printf("run_kernel rc=%d out=", rc);
+  printf("run_kernel (placeholder byte-add) rc=%d out=", rc);
   for (int i = 0; i < 8; i++) printf("%d ", c[i]);
   printf("\n");
+
+  /* Real hex_gemm_kernel.py-generated vrmpy GEMM at the flagship Mask R-CNN backbone shape
+   * (cin=64,cout=256,m=54400) -- only runs if gen_gemm_test_data.py's output files were pushed
+   * to the device first; skipped gracefully otherwise so the base PoC still works standalone. */
+  unsigned char* ga = read_file_exact(GEMM_A_PATH, GEMM_A_LEN);
+  unsigned char* gb = read_file_exact(GEMM_B_PATH, GEMM_B_LEN);
+  if (ga && gb) {
+    unsigned char* gc = malloc(GEMM_C_LEN);
+    printf("running real hex_gemm kernel (cin=64,cout=256,m=54400)...\n");
+    int grc = mini_rpc_run_kernel(h, ga, GEMM_A_LEN, gb, GEMM_B_LEN, gc, GEMM_C_LEN);
+    printf("run_gemm_kernel rc=%d\n", grc);
+    if (grc == 0) {
+      FILE* out = fopen(GEMM_C_PATH, "wb");
+      fwrite(gc, 1, GEMM_C_LEN, out);
+      fclose(out);
+      printf("wrote %s (%d bytes) -- verify against a numpy reference host-side\n", GEMM_C_PATH, GEMM_C_LEN);
+    }
+    free(gc);
+  } else {
+    printf("gemm test data not found at %s / %s, skipping real-kernel test\n", GEMM_A_PATH, GEMM_B_PATH);
+  }
+  free(ga);
+  free(gb);
 
   mini_rpc_close(h);
   printf("closed OK\n");

@@ -1,3 +1,7 @@
 mini_client
 mini_rpc.so
 *.o
+gemm_a.bin
+gemm_bp.bin
+gemm_ref.bin
+gemm_c_out.bin

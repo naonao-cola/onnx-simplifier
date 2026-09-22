@@ -26,7 +26,7 @@ def chunked_compute(data, kernel, stride, padding, dilation, layout, out_layout,
 
     def fcompute(ins, outs):
         return tvm.tir.Evaluate(tvm.tir.call_extern(
-            "int32", "hex_gemm_chunked_64_256", outs[0].data, ins[0].data, ins[1].data))
+            "void", "hex_gemm_chunked_64_256", outs[0].data, ins[0].data, ins[1].data))
 
     return te.extern(out_shape, [data, kernel], fcompute, name="conv2d_chunked_64_256", dtype=out_dtype)
 
@@ -102,28 +102,35 @@ launcher = HexagonLauncher("239dbd8f", rpc_info={"rpc_tracker_host": "127.0.0.1"
     "rpc_server_port": 7067, "workspace_base": "/data/local/tmp/tg_splice_verify", "adb_server_socket": None})
 try:
     launcher.start_server()
+    # Separate sessions for spliced vs. stock -- mixing a manually-loaded module with
+    # get_executor_from_factory() in one session causes spurious hexagon_rpc_send failures
+    # unrelated to either module (found independently in this project's elementwise-add work).
     with launcher.create_session() as session:
-        # spliced
         remote_path = session.upload("spliced_test.so", "spliced_test.so")
         graph_mod = session.load_module(str(remote_path))
+        print("load_module OK")
         gm = tvm.contrib.graph_executor.create(lib.get_graph_json(), graph_mod, session.device)
+        print("graph_executor.create OK")
         gm.load_params(tvm.runtime.save_param_dict(lib.get_params()))
+        print("load_params OK")
         gm.set_input("data", image)
+        print("set_input OK")
         gm.run()
+        print("gm.run() OK (spliced)")
         out_spliced = gm.get_output(0).numpy().copy()
 
-        # stock
+    with launcher.create_session() as session:
         gm2 = session.get_executor_from_factory(lib_stock)
         gm2.load_params(tvm.runtime.save_param_dict(lib_stock.get_params()))
         gm2.set_input("data", image)
         gm2.run()
         out_stock = gm2.get_output(0).numpy().copy()
 
-        match = bool(np.array_equal(out_spliced, out_stock))
-        print("spliced vs stock TVM, real hardware, bit-exact match:", match)
-        if not match:
-            diff = out_spliced.astype(np.int64) - out_stock.astype(np.int64)
-            print("max abs diff", np.abs(diff).max(), "mismatched", np.count_nonzero(diff), "/", diff.size)
+    match = bool(np.array_equal(out_spliced, out_stock))
+    print("spliced vs stock TVM, real hardware, bit-exact match:", match)
+    if not match:
+        diff = out_spliced.astype(np.int64) - out_stock.astype(np.int64)
+        print("max abs diff", np.abs(diff).max(), "mismatched", np.count_nonzero(diff), "/", diff.size)
 finally:
     launcher.stop_server()
     tracker.terminate()

@@ -651,11 +651,17 @@ DSP-side `.so` -- has **no TVM dependency at all**. `tvm.rpc.tracker.Tracker`,
 `native_transport/`'s pattern for this project's actual use case (call fixed, hand-written
 kernels, not arbitrary graphs).
 
-Not yet done: wiring a *real* `hex_gemm_kernel.py`-generated vrmpy kernel (not the placeholder
-byte-add) into `mini_rpc_impl.c`'s `run_kernel`, and measuring it end to end through this path
-instead of through `bridge_and_test.py`'s TVM-RPC bridge. `run_kernel`'s signature (three
-buffer-in/out args) was deliberately shaped to make this a straightforward follow-up: point it at
-one of `hex_gemm_kernel.py`'s generated kernel functions instead of the placeholder body.
+**Now done**: `mini_rpc_impl.c`'s `run_kernel` dispatches on buffer size -- the original 8-byte PoC
+test still gets the placeholder byte-add unchanged, but a call sized for `hex_gemm_kernel.py`'s
+own default shape (`cin=64,cout=256,m=54400`, the flagship Mask R-CNN pathological shape used
+throughout this project) runs the *real*, unmodified generated kernel (`hex_gemm_kernel.py --cin
+64 --cout 256 --m 54400`'s output, pasted in verbatim after its own qemu correctness check
+passed). `gen_gemm_test_data.py` generates real input data (`pack_b()`-packed, same random seed
+as `hex_gemm_kernel.py`'s own `main()`) as `gemm_a.bin`/`gemm_bp.bin`; `build.sh` picks them up
+automatically if present and pushes them alongside the binaries. Verified **bit-exact correct on
+real hardware** (device `239dbd8f`) against a numpy reference -- the full 55.7 MB output, zero TVM
+anywhere in the loop, end to end through this transport instead of `bridge_and_test.py`'s TVM-RPC
+bridge.
 
 ## Timing BEAM search candidates with hexagon-sim instead of raw instruction counting
 
