@@ -47,6 +47,17 @@ option(ONNXSIM_WASM_ORT_WEB "For the Emscripten build: delegate constant folding
 # ops. Independent of ONNXSIM_BUILTIN_ORT -- both may be built at once; the
 # caller picks which GetXxxModelExecutor() to hand to Simplify.
 option(ONNXSIM_BUILTIN_XNNPACK "Build and link Google's XNNPACK as an additional (opt-in) ModelExecutor backend for constant folding" OFF)
+# Roughly 50 self-contained LLM/PTQ quantization- and pruning-algorithm entry
+# points (onnxsim/*_entry.cpp -- GPTQ, AWQ, SmoothQuant, Wanda pruning,
+# structured/magnitude pruning, cross-layer equalization, ...), each its own
+# translation unit exposed to Python via cpp2py_export.cc. None of them are
+# reachable from Simplify()'s own fixed point or from onnxsim_bin's CLI --
+# they are opt-in, single-call passes a caller invokes by name -- so turning
+# this OFF is a pure build-time optimization (fewer translation units to
+# compile) for CI jobs that only exercise core simplification and have no
+# need to compile or test this algorithm library. ON by default to keep the
+# full feature set (matching every prior release).
+option(ONNXSIM_NON_CORE_FEATURES "Build the non-core LLM/PTQ quantization and pruning algorithm entry points (onnxsim/*_entry.cpp, e.g. GPTQ/AWQ/SmoothQuant/Wanda pruning) and their Python bindings" ON)
 
 if (ONNXSIM_WASM_ORT_WEB)
   # The whole point of this mode is to NOT bundle ONNX Runtime -- constant
@@ -169,7 +180,35 @@ set(ONNXSIM_BLAKE3_COMPILE_DEFS
     BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
     BLAKE3_USE_NEON=0)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/cross_layer_equalization_entry.cpp onnxsim/pruning_entry.cpp onnxsim/structured_pruning_entry.cpp onnxsim/imatrix_quant_entry.cpp onnxsim/llm_int8_entry.cpp onnxsim/spqr_entry.cpp onnxsim/pb_llm_entry.cpp onnxsim/squeezellm_entry.cpp onnxsim/billm_entry.cpp onnxsim/kv_cache_quantization_entry.cpp onnxsim/owq_entry.cpp onnxsim/gear_entry.cpp onnxsim/rotatekv_entry.cpp onnxsim/awq_entry.cpp onnxsim/gptq_entry.cpp onnxsim/quarot_gptq_entry.cpp onnxsim/gptvq_entry.cpp onnxsim/qronos_entry.cpp onnxsim/daq_entry.cpp onnxsim/embedding_quantization_entry.cpp onnxsim/low_rank_compensation_entry.cpp onnxsim/lqer_entry.cpp onnxsim/norm_tweaking_entry.cpp onnxsim/dac_entry.cpp onnxsim/tesseraq_entry.cpp onnxsim/adaround_entry.cpp onnxsim/outlier_suppression_entry.cpp onnxsim/outlier_suppression_plus_entry.cpp onnxsim/smoothquant_entry.cpp onnxsim/rptq_entry.cpp onnxsim/spinquant_entry.cpp onnxsim/paroquant_entry.cpp onnxsim/gptaq_entry.cpp onnxsim/easyquant_entry.cpp onnxsim/fptq_entry.cpp onnxsim/duquant_entry.cpp onnxsim/svdquant_entry.cpp onnxsim/quantease_entry.cpp onnxsim/adaquant_entry.cpp onnxsim/slim_llm_entry.cpp onnxsim/moequant_entry.cpp onnxsim/bias_correction_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/qonnx_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/qat_graph_builder.cpp onnxsim/graph_grad.cpp onnxsim/qat_entry.cpp onnxsim/lora_entry.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp onnxsim/omniquant_entry.cpp onnxsim/affinequant_entry.cpp onnxsim/brecq_entry.cpp onnxsim/mixed_precision_entry.cpp onnxsim/smooth_attention_entry.cpp onnxsim/ptq4vit_entry.cpp onnxsim/autoround_entry.cpp onnxsim/flexround_entry.cpp onnxsim/foem_entry.cpp onnxsim/llm_fp4_activation_entry.cpp onnxsim/bwa_ptq_entry.cpp onnxsim/finetune_entry.cpp ${ONNXSIM_BLAKE3_SOURCES})
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/qonnx_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/qat_graph_builder.cpp onnxsim/graph_grad.cpp onnxsim/qat_entry.cpp onnxsim/lora_entry.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp onnxsim/finetune_entry.cpp ${ONNXSIM_BLAKE3_SOURCES})
+
+# ~50 self-contained LLM/PTQ quantization- and pruning-algorithm entry points
+# (see the ONNXSIM_NON_CORE_FEATURES option above for the rationale) --
+# added to the target rather than the add_library() call above so they can
+# be skipped entirely when the option is OFF, cutting real compile time for
+# CI jobs that never exercise them. ONNXSIM_HAS_NON_CORE_FEATURES gates the
+# matching #include's/prototypes in onnxsim.h and their nanobind bindings in
+# cpp2py_export.cc, mirroring the ONNXSIM_HAS_ORT / ONNXSIM_HAS_XNNPACK
+# pattern used for those optional backends.
+set(ONNXSIM_NON_CORE_FEATURE_SOURCES
+    onnxsim/quantize_entry.cpp onnxsim/cross_layer_equalization_entry.cpp onnxsim/pruning_entry.cpp onnxsim/structured_pruning_entry.cpp
+    onnxsim/imatrix_quant_entry.cpp onnxsim/llm_int8_entry.cpp onnxsim/spqr_entry.cpp onnxsim/pb_llm_entry.cpp
+    onnxsim/squeezellm_entry.cpp onnxsim/billm_entry.cpp onnxsim/kv_cache_quantization_entry.cpp onnxsim/owq_entry.cpp
+    onnxsim/gear_entry.cpp onnxsim/rotatekv_entry.cpp onnxsim/awq_entry.cpp onnxsim/gptq_entry.cpp
+    onnxsim/quarot_gptq_entry.cpp onnxsim/gptvq_entry.cpp onnxsim/qronos_entry.cpp onnxsim/daq_entry.cpp
+    onnxsim/embedding_quantization_entry.cpp onnxsim/low_rank_compensation_entry.cpp onnxsim/lqer_entry.cpp onnxsim/norm_tweaking_entry.cpp
+    onnxsim/dac_entry.cpp onnxsim/tesseraq_entry.cpp onnxsim/adaround_entry.cpp onnxsim/outlier_suppression_entry.cpp
+    onnxsim/outlier_suppression_plus_entry.cpp onnxsim/smoothquant_entry.cpp onnxsim/rptq_entry.cpp onnxsim/spinquant_entry.cpp
+    onnxsim/paroquant_entry.cpp onnxsim/gptaq_entry.cpp onnxsim/easyquant_entry.cpp onnxsim/fptq_entry.cpp
+    onnxsim/duquant_entry.cpp onnxsim/svdquant_entry.cpp onnxsim/quantease_entry.cpp onnxsim/adaquant_entry.cpp
+    onnxsim/slim_llm_entry.cpp onnxsim/moequant_entry.cpp onnxsim/bias_correction_entry.cpp onnxsim/omniquant_entry.cpp
+    onnxsim/affinequant_entry.cpp onnxsim/brecq_entry.cpp onnxsim/mixed_precision_entry.cpp onnxsim/smooth_attention_entry.cpp
+    onnxsim/ptq4vit_entry.cpp onnxsim/autoround_entry.cpp onnxsim/flexround_entry.cpp onnxsim/foem_entry.cpp
+    onnxsim/llm_fp4_activation_entry.cpp onnxsim/bwa_ptq_entry.cpp)
+if (ONNXSIM_NON_CORE_FEATURES)
+  target_sources(onnxsim PRIVATE ${ONNXSIM_NON_CORE_FEATURE_SOURCES})
+  target_compile_definitions(onnxsim PUBLIC ONNXSIM_HAS_NON_CORE_FEATURES)
+endif()
 target_compile_definitions(onnxsim PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
 if (ONNXSIM_BUILTIN_ORT)
   # Both ways of obtaining ONNX Runtime ship/install headers flat under this
@@ -680,12 +719,20 @@ if (ONNXSIM_TESTS)
   # emits against onnxsim/qat_parity_fixtures.txt, which is generated from
   # onnxsim/qat_graph.py -- so the fixture path has to reach the source tree at
   # runtime rather than the build tree, hence the compile definition.
-  add_executable(qat_graph_parity_test onnxsim/qat_graph_parity_test.cpp)
-  target_link_libraries(qat_graph_parity_test onnxsim)
-  target_compile_definitions(qat_graph_parity_test PRIVATE
-      QAT_PARITY_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/onnxsim/qat_parity_fixtures.txt")
-  onnxsim_add_ort_rpath(qat_graph_parity_test)
-  add_test(NAME qat_graph_parity_test COMMAND qat_graph_parity_test)
+  #
+  # Its own "planner" case (CasePlanner in qat_graph_parity_test.cpp) needs
+  # QuantizeWeightOnlyInt4 to build a quantized weight to plan a step graph
+  # around -- one of the ONNXSIM_NON_CORE_FEATURES entry points -- so this
+  # whole test is gated on that option too, like the sources providing that
+  # symbol are (see ONNXSIM_NON_CORE_FEATURE_SOURCES above).
+  if (ONNXSIM_NON_CORE_FEATURES)
+    add_executable(qat_graph_parity_test onnxsim/qat_graph_parity_test.cpp)
+    target_link_libraries(qat_graph_parity_test onnxsim)
+    target_compile_definitions(qat_graph_parity_test PRIVATE
+        QAT_PARITY_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/onnxsim/qat_parity_fixtures.txt")
+    onnxsim_add_ort_rpath(qat_graph_parity_test)
+    add_test(NAME qat_graph_parity_test COMMAND qat_graph_parity_test)
+  endif()
 
   # contrib_schemas.cpp's MoE/QMoE registration needs onnx's schema
   # registry and function-building API, like precision_estimator_test

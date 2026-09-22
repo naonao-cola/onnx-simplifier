@@ -31,6 +31,15 @@ ONNX_VERIFY_PROTO3 = bool(os.getenv('ONNX_VERIFY_PROTO3') == '1')
 ONNX_NAMESPACE = os.getenv('ONNX_NAMESPACE', 'onnx')
 ONNX_BUILD_TESTS = bool(os.getenv('ONNX_BUILD_TESTS') == '1')
 ONNX_OPT_USE_SYSTEM_PROTOBUF = bool(os.getenv('ONNX_OPT_USE_SYSTEM_PROTOBUF', '0') == '1')
+# On by default (matches CMakeLists.txt's own ONNXSIM_NON_CORE_FEATURES
+# default), so an unset env var never changes build output. Set
+# ONNXSIM_NON_CORE_FEATURES=0 to skip compiling the ~50 self-contained
+# LLM/PTQ quantization- and pruning-algorithm entry points (onnxsim/
+# *_entry.cpp -- GPTQ, AWQ, SmoothQuant, Wanda/structured/magnitude
+# pruning, ...) and their Python bindings -- a pure build-time win for CI
+# jobs that only need core simplification, since none of those passes are
+# reachable from Simplify() itself.
+ONNXSIM_NON_CORE_FEATURES = not bool(os.getenv('ONNXSIM_NON_CORE_FEATURES') == '0')
 IS_FREE_THREADED = sysconfig.get_config_var("Py_GIL_DISABLED")
 
 DEBUG = bool(os.getenv('DEBUG'))
@@ -193,6 +202,8 @@ class cmake_build(setuptools.Command):
                 '-DONNX_NAMESPACE={}'.format(ONNX_NAMESPACE),
                 '-DONNX_OPT_USE_SYSTEM_PROTOBUF={}'.format(
                     'ON' if ONNX_OPT_USE_SYSTEM_PROTOBUF else 'OFF'),
+                '-DONNXSIM_NON_CORE_FEATURES={}'.format(
+                    'ON' if ONNXSIM_NON_CORE_FEATURES else 'OFF'),
             ]
             if IS_FREE_THREADED:
                 cmake_args.append('-DPython3_FIND_ABI=ANY;ANY;ANY;ANY')

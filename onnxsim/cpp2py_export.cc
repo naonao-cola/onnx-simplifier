@@ -433,6 +433,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // Data-free Cross-Layer Equalization preprocessing (not itself a
   // quantization scheme) -- see CrossLayerEqualize in onnxsim.h. Pure graph
   // rewrite: no ModelExecutor or calibration data needed.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "cross_layer_equalize",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -446,11 +447,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Dynamically quantizes MatMul/Gemm weights to INT8 (per output channel,
   // symmetric) and activations to uint8 at runtime via DynamicQuantizeLinear
   // -- see QuantizeDynamic in onnxsim.h. Pure graph rewrite: no ModelExecutor
   // or calibration data needed.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_dynamic",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -464,6 +467,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Same rewrite as quantize_dynamic, but the dequantize step is a single
   // ONNX Runtime "com.microsoft" contrib op (MatMulIntegerToFloat) instead
@@ -508,6 +512,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // DynamicQuantizeLinear/MatMulInteger shape as quantize_dynamic, but with a
   // lossless ternary weight encoding instead of a rounded approximation --
   // see QuantizeTernary in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_ternary",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -521,11 +526,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Weight-only quantizes MatMul/Gemm/Conv weights to INT8 (per output
   // channel, symmetric) via a single DequantizeLinear -- activations are
   // never touched, so no calibration data or ModelExecutor is needed. See
   // QuantizeWeightOnly in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_weight_only",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -539,12 +546,14 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Block-wise INT4 weight-only quantizes MatMul/Gemm/Conv weights (one
   // symmetric scale per 32-element block of the reduction dimension, per
   // output channel) via a single DequantizeLinear(block_size=32) --
   // activations are never touched, so no calibration data or ModelExecutor
   // is needed. See QuantizeWeightOnlyInt4 in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_weight_only_int4",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -558,11 +567,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Block-wise INT4 weight-only quantizes MatMul/Gemm weights into ONNX
   // Runtime's own com.microsoft::MatMulNBits contrib op -- a vendor-specific
   // (ORT-only) counterpart to quantize_weight_only_int4's portable standard-
   // ONNX output. See QuantizeWeightOnlyMatMulNBits in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_weight_only_matmul_nbits",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -576,11 +587,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // INT16 weight-only quantizes MatMul/Gemm/Conv weights (one symmetric
   // scale per output channel, INT16's finer step than INT8's) -- activations
   // are never touched, so no calibration data or ModelExecutor is needed.
   // See QuantizeWeightOnlyInt16 in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_weight_only_int16",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -594,6 +607,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Block-wise INT8 weight-only quantizes MatMul/Gemm/Conv weights (one
   // symmetric scale per 32-element block of the flattened reduction
@@ -601,6 +615,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // block_size=32) -- activations are never touched, so no calibration data
   // or ModelExecutor is needed. See QuantizeWeightOnlyInt8Block in
   // onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_weight_only_int8_block",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -614,12 +629,14 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // OCP Microscaling MXFP4 weight-only quantizes every MatMul/vanilla-Gemm
   // whose weight is a constant float32 tensor whose reduction dimension is
   // divisible by 32, via a Gather-a-codebook-then-scale dequant chain (no
   // native ONNX MX tensor type). Activations are never touched, so no
   // calibration data is needed. See QuantizeWeightOnlyMXFP4 in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_weight_only_mxfp4",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -633,11 +650,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // QLoRA-style double quantization: quantizes every already-present
   // DequantizeLinear node's own (large enough) constant scale tensor to
   // UINT8 with a per-tensor meta-scale. See ApplyDoubleQuantization in
   // onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_double_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -651,6 +670,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Magnitude pruning (Han et al., 2015): zeros the least-magnitude entries
   // of every MatMul/vanilla-Gemm/Conv/com.microsoft::Attention layer's
@@ -660,6 +680,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // layer's importance into one whole-model ranking; incompatible with
   // `n`/`m`. Same `n`/`m`/`global_sparsity` shape as apply_wanda_pruning's
   // own binding above. See PruneMagnitude in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "prune_magnitude",
       [](const py::bytes& model_proto_bytes, double sparsity,
@@ -677,6 +698,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "sparsity"_a, "n"_a.none(), "m"_a.none(),
       "global_sparsity"_a = false);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Structured (channel) pruning: removes whole output channels from
   // MatMul/vanilla-Gemm and Conv layers -- real structural pruning, not
@@ -685,6 +707,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // `global_sparsity` mirror pruning.py's own `apply_structured_pruning`
   // parameters of the same names exactly -- see that function's own
   // declaration comment.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_structured_pruning",
       [](const py::bytes& model_proto_bytes, double sparsity,
@@ -702,6 +725,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "sparsity"_a, "importance_norm"_a = "l2",
       "global_sparsity"_a = false);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // The calibration-driven (Wanda-style) upgrade of apply_structured_pruning
   // above -- same executor-as-first-argument shape as `simplify`'s own
@@ -718,6 +742,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // (including exactly where the name -> ModelExecutor::Run-positional
   // reordering happens). See ApplyStructuredWandaPruning in
   // structured_pruning_entry.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_structured_wanda_pruning",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -740,10 +765,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
       "epsilon"_a = 1e-8, "importance_norm"_a = "l2",
       "global_sparsity"_a = false);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Attention-head pruning: removes whole attention heads (or, for
   // grouped-query attention, whole KV groups) from every matched fused
   // self-attention block. See ApplyAttentionHeadPruning in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_attention_head_pruning",
       [](const py::bytes& model_proto_bytes, double sparsity,
@@ -759,6 +786,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "sparsity"_a, "importance_norm"_a = "l2");
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // The calibration-driven (Wanda-style) upgrade of
   // apply_attention_head_pruning above -- same executor-as-first-argument
@@ -767,6 +795,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // pruning's own binding above (see that binding's own comment for the
   // full calibration-crossing design). See ApplyAttentionHeadWandaPruning
   // in structured_pruning_entry.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_attention_head_wanda_pruning",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -788,6 +817,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
       "epsilon"_a = 1e-8, "importance_norm"_a = "l2");
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // SparseGPT (Frantar & Alistarh, 2023) unstructured/N:M pruning: zeros
   // the least-important entries of every matched MatMul/vanilla-Gemm/
@@ -806,6 +836,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // structured_pruning_entry.h for the full scope, now at full parity with
   // pruning.py's own `apply_sparsegpt_pruning` (itself now a thin alias for
   // this port), Conv included.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_sparsegpt_pruning",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -828,6 +859,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
       "n"_a.none(), "m"_a.none(), "percdamp"_a = 0.01,
       "proc_block_size"_a = 128);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Wanda pruning (Sun et al., 2023): the calibration-driven upgrade of
   // magnitude pruning's data-free baseline, zeroing the least-important
@@ -853,6 +885,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // `global_sparsity` pools every matched layer's importance into one
   // whole-model ranking, mirroring apply_structured_wanda_pruning's own
   // `sparsity`-only mode's structural analogue; incompatible with `n`/`m`.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_wanda_pruning",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -875,6 +908,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
       "n"_a.none(), "m"_a.none(), "epsilon"_a = 1e-8,
       "global_sparsity"_a = false);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // llama.cpp's "importance matrix" (imatrix): weight-only-quantizes every
   // matched MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight to INT4
@@ -886,6 +920,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // binding above. See ApplyImatrixQuantization in imatrix_quant_entry.h
   // for the full scope and onnxsim/imatrix_quant.py for the technique this
   // ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_imatrix_quantization",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -911,6 +946,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "block_size"_a = 32,
       "num_scale_candidates"_a = 41, "scale_lo"_a = 0.4, "scale_hi"_a = 1.6,
       "skip_names"_a = std::vector<std::string>());
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Outlier Suppression Gamma Migration (Wei et al., 2022): folds the
   // SmoothQuant-style per-channel migration scale directly into every
@@ -924,6 +960,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // ApplyOutlierSuppression in outlier_suppression_entry.h for the full
   // scope and onnxsim/outlier_suppression.py for the technique this
   // ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_outlier_suppression",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -943,6 +980,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "alpha"_a = 0.5,
       "epsilon"_a = 1e-5);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // LLM.int8() (Dettmers et al., 2022): decomposes every matched
   // MatMul/vanilla-Gemm node into a float32 outlier part plus a
@@ -954,6 +992,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // apply_outlier_suppression's own binding above. See ApplyLlmInt8 in
   // llm_int8_entry.h for the full scope and onnxsim/llm_int8.py for the
   // technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_llm_int8",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -973,6 +1012,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a,
       "outlier_threshold"_a = 6.0, "epsilon"_a = 1e-8);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // SpQR (Dettmers et al., 2023): outlier-aware block-wise INT4
   // quantization -- per-element outliers (by Hessian-diagonal-weighted
@@ -981,6 +1021,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // `calibration_data` crossing convention as apply_llm_int8's own binding
   // above. See ApplySpqr in spqr_entry.h for the full scope and
   // onnxsim/spqr.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_spqr",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1000,6 +1041,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "block_size"_a = 16,
       "outlier_fraction"_a = 0.01);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // PB-LLM (Shang et al., 2024): a structured mixed-precision binarizer --
   // per matched layer, the `salient_ratio` fraction of input channels with
@@ -1008,6 +1050,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // `calibration_data` crossing convention as apply_llm_int8's own binding
   // above. See ApplyPbLlm in pb_llm_entry.h for the full scope and
   // onnxsim/pb_llm.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_weight_only_pb_llm",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1027,6 +1070,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a,
       "salient_ratio"_a = 0.15);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // SqueezeLLM (Kim et al., 2023): sensitivity-weighted per-group codebook
   // (a real GatherND-based graph rewrite, not folded to a single
@@ -1035,6 +1079,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // apply_llm_int8's own binding above. See ApplySqueezeLlm in
   // squeezellm_entry.h for the full scope and onnxsim/squeezellm.py for the
   // technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_weight_only_squeezellm",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1057,6 +1102,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "block_size"_a = 32,
       "bits"_a = 4, "outlier_fraction"_a = 0.0045,
       "num_kmeans_iterations"_a = 20);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // BiLLM (Huang et al., 2024, ICML): a genuine ~1-bit-average weight
   // binarizer -- Hessian-guided salient-column selection, a two-level
@@ -1066,6 +1112,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // executor-as-first-argument, `calibration_data` crossing convention as
   // apply_llm_int8's own binding above. See ApplyBillm in billm_entry.h for
   // the full scope and onnxsim/billm.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_billm",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1087,6 +1134,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "block_size"_a = 128,
       "percdamp"_a = 0.01, "max_salient_search"_a = 30);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // KV-cache quantization (KIVI/KVQuant): per-channel static INT8 for a
   // matched Concat(past, new, axis=seq) stream's own Key-style values,
@@ -1098,6 +1146,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // above. See ApplyKvCacheQuantization in kv_cache_quantization_entry.h
   // for the full scope and onnxsim/kv_cache_quantization.py for the
   // technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_kv_cache",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1117,6 +1166,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a,
       "value_output_names"_a = std::vector<std::string>());
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // OWQ (Lee, Park, Kim, Kim and Sung, 2023, AAAI 2024): rescues the top
   // `outlier_fraction` OBS-salient columns of an already-
@@ -1128,6 +1178,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // below; `calibration_data` (List[Dict[str, onnx.TensorProto]]) is keyed
   // to the float model's own graph inputs. See ApplyOwq in owq_entry.h for
   // the full scope and onnxsim/owq.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_owq",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1151,6 +1202,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "outlier_fraction"_a = 0.01, "percdamp"_a = 0.01);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // GEAR (Kang et al., 2024): low-rank-plus-sparse residual compensation
   // layered on top of onnxsim.kv_cache_quantization's own static
@@ -1159,6 +1211,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // crossing convention as apply_llm_int8's own binding above. See
   // ApplyGear in gear_entry.h for the full scope and onnxsim/gear.py for
   // the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gear",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1178,6 +1231,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "rank"_a = 4,
       "outlier_fraction"_a = 0.05);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // RotateKV (Su et al., 2025): fits a per-stream orthogonal rotation from
   // a matched KV-cache stream's own calibration-activation covariance and
@@ -1187,6 +1241,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // apply_llm_int8's own binding above. See ApplyRotateKv in
   // rotatekv_entry.h for the full scope and onnxsim/rotatekv.py for the
   // technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_rotatekv",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1203,6 +1258,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // GPTQ (Frantar et al., 2022): sequential, Hessian-compensated INT4
   // rounding for every quantize_weight_only_int4-quantized MatMul/Gemm
@@ -1215,6 +1271,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // onnx.TensorProto]]) is keyed to the float model's own graph inputs.
   // See ApplyGptq in gptq_entry.h for the full scope and
   // onnxsim/gptq.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gptq",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1238,6 +1295,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "percdamp"_a = 0.01, "proc_block_size"_a = 128);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // GPTAQ (Li, Yin, Lee, Xiao, Panda, 2025): a small, closed-form
   // asymmetric-calibration correction layered on top of apply_gptq's own
@@ -1252,6 +1310,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // apply_gptq's own binding, which only ever probes the float model).
   // See ApplyGptaq in gptaq_entry.h for the full scope and
   // onnxsim/gptaq.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gptaq",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1275,6 +1334,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "percdamp"_a = 0.01, "proc_block_size"_a = 128);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // QuantEase (Behdin, Acharya, Gupta, Song, Zhu and Keerthi, 2023): plain
   // cyclic coordinate descent over the same per-row reconstruction
@@ -1288,6 +1348,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // sweeps. Same two-model executor-as-first-argument shape as apply_gptq's
   // own binding above. See ApplyQuantease in quantease_entry.h for the full
   // scope and onnxsim/quantease.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_quantease",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1311,6 +1372,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "num_epochs"_a = 4);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // LQER (Zhang et al., 2024): activation-weighted low-rank correction of
   // an INT4-quantized MatMul/Gemm layer's own existing reconstruction
@@ -1319,6 +1381,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // executor-as-first-argument, `calibration_data` crossing convention as
   // apply_gptq's own binding above. See ApplyLqer in lqer_entry.h for the
   // full scope and onnxsim/lqer.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_lqer",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1341,6 +1404,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "rank"_a = 8, "eps"_a = 1e-6);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Norm Tweaking (Li, Xu, Ni, Chen, Ye, Sun, 2023): recalibrates a
   // LayerNormalization node's own scale/bias in place so its output
@@ -1350,6 +1414,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // `calibration_data` crossing convention as apply_gptq's own binding
   // above. See ApplyNormTweaking in norm_tweaking_entry.h for the full
   // scope and onnxsim/norm_tweaking.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_norm_tweaking",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1372,6 +1437,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "eps"_a = 1e-6);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // D2Quant's Deviation-Aware Correction (DAC) (Yan et al., 2026): folds a
   // measured, quantization-induced per-channel mean-shift deviation
@@ -1381,6 +1447,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // full scope and onnxsim/d2quant.py's own apply_dac for the technique
   // this ports (that module's own apply_dsq is a separate technique,
   // already ported elsewhere as "apply_dsq" above).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_dac",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1406,6 +1473,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "min_expected_error_reduction"_a = 0.5,
       "correction_threshold"_a = 1e-12);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // AWQ (Lin et al., 2023): grid-searched per-channel weight rescaling
   // for every quantize_weight_only_int4-quantized MatMul/Gemm layer
@@ -1417,6 +1485,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // onnx.TensorProto]]) is keyed to the float model's own graph inputs.
   // See ApplyAwq in awq_entry.h for the full scope and onnxsim/awq.py
   // for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_awq",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1439,6 +1508,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "num_alpha_steps"_a = 20);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // AdaRound (Nagel et al., 2020): Nagel et al.'s rectified-sigmoid
   // relaxation of each weight element's floor/ceil rounding decision,
@@ -1455,6 +1525,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // its own accepted numerical scope -- an iterative optimization, not a
   // closed-form computation) and onnxsim/adaround.py for the technique
   // this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_adaround",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1482,6 +1553,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "calibration_data"_a, "num_iterations"_a = 300, "learning_rate"_a = 0.1,
       "reg_param"_a = 0.01, "warm_start"_a = 0.2, "beta_start"_a = 20.0,
       "beta_end"_a = 2.0);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // AdaQuant (Hubara, Nahshan, Hanani, Banner, Soudry, 2020/2021): a
   // per-layer joint Adam optimization over the same rectified-sigmoid
@@ -1495,6 +1567,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // apply_adaquant's own `beta_range` tuple, split the same way. See
   // ApplyAdaquant in adaquant_entry.h for the full scope and
   // onnxsim/adaquant.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_adaquant",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1524,6 +1597,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "weight_learning_rate"_a = 0.1, "activation_learning_rate"_a = 0.01,
       "reg_param"_a = 0.01, "warm_start"_a = 0.2, "beta_start"_a = 20.0,
       "beta_end"_a = 2.0);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // OmniQuant (Shao et al., 2023): grid-searched Learnable Weight Clipping
   // plus a closed-form-shift/grid-searched-scale Learnable Equivalent
@@ -1535,6 +1609,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // BOUNDED GRID SEARCH, not an iterative Adam optimization, unlike
   // apply_adaround's own. See ApplyOmniquant in omniquant_entry.h for the
   // full scope and onnxsim/omniquant.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_omniquant",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1560,6 +1635,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "num_clip_steps"_a = 20, "num_alpha_steps"_a = 20,
       "min_clip_ratio"_a = 0.5);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // AffineQuant (Ma et al., 2024, ICLR): OmniQuant's own LWC plus a
   // block-diagonal Learnable Equivalent Transformation (a per-block
@@ -1568,6 +1644,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // `affine_block_size`. See ApplyAffinequant in affinequant_entry.h for
   // the full scope and onnxsim/affinequant.py for the technique this
   // ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_affinequant",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1593,6 +1670,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "num_clip_steps"_a = 20, "num_alpha_steps"_a = 20,
       "min_clip_ratio"_a = 0.5, "affine_block_size"_a = 8);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // BRECQ (Li et al., 2021, ICLR): jointly optimizes every
   // quantize_weight_only_int4-quantized MatMul/Gemm layer inside a
@@ -1606,6 +1684,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // `beta_range` tuple, split the same way apply_adaround's own binding
   // splits it. See ApplyBrecq in brecq_entry.h for the full scope and
   // onnxsim/brecq.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_brecq",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1635,6 +1714,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "blocks"_a, "calibration_data"_a, "num_iterations"_a = 300,
       "learning_rate"_a = 0.1, "reg_param"_a = 0.01, "warm_start"_a = 0.2,
       "beta_start"_a = 20.0, "beta_end"_a = 2.0, "fisher_eps"_a = 1e-3);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Sensitivity-based mixed-precision weight quantization: quantizes
   // every matched MatMul/vanilla-Gemm layer to block-wise INT8 or INT4,
@@ -1646,6 +1726,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // for the shape). See ApplyMixedPrecisionQuantization in
   // mixed_precision_entry.h for the full scope and
   // onnxsim/mixed_precision.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_mixed_precision_quantization",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1668,6 +1749,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a,
       "high_bits_fraction"_a = 0.2, "block_size"_a = 32,
       "sensitivity_metric"_a = "hessian_diag");
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // QoQ's SmoothAttention: migrates Key's per-channel quantization
   // difficulty into Query (which stays float) for every decomposed
@@ -1677,6 +1759,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // `calibration_data` crossing convention as apply_llm_int8's own
   // binding above. See ApplySmoothAttention in smooth_attention_entry.h
   // for the full scope and onnxsim/qoq.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_smooth_attention",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1695,6 +1778,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "epsilon"_a = 1e-5);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // PTQ4ViT's twin uniform quantization: splits a matched Softmax/GELU
   // output's value range at a calibration-searched threshold into two
@@ -1703,6 +1787,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // argument, `calibration_data` crossing convention as apply_llm_int8's
   // own binding above. See ApplyPtq4Vit in ptq4vit_entry.h for the full
   // scope and onnxsim/ptq4vit.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_ptq4vit_quantization",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1721,6 +1806,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "n_levels"_a = 256);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // AutoRound (Cheng et al., 2023): jointly optimizes AdaRound's own
   // rectified-sigmoid rounding relaxation AND a second, per-(output
@@ -1738,6 +1824,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // error, so a layer's scale is only ever rewritten when doing so actually
   // helps. See ApplyAutoround in autoround_entry.h for the full scope and
   // onnxsim/autoround.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_autoround",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1768,6 +1855,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "clip_learning_rate"_a = 0.03, "reg_param"_a = 0.01, "warm_start"_a = 0.2,
       "beta_start"_a = 20.0, "beta_end"_a = 2.0, "clip_ratio_min"_a = 0.5,
       "clip_ratio_max"_a = 1.5);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // FlexRound (Lee et al., 2023, ICML): "learnable-division rounding" --
   // the fourth onnxsim-native PTQ technique alongside apply_adaround's own
@@ -1782,6 +1870,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // above), only the matched layer's own codes. See ApplyFlexround in
   // flexround_entry.h for the full scope and onnxsim/flexround.py for the
   // technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_flexround",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1807,6 +1896,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "num_iterations"_a = 300, "learning_rate"_a = 0.05,
       "log_clip"_a = 4.0);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // FOEM ("First-Order Error Matters", 2025): extends apply_gptq's own
   // binding above with an additional first-order-drift compensation term
@@ -1819,6 +1909,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // above; `percdamp`/`proc_block_size` mirror apply_gptq's own parameters
   // of the same names and defaults. See ApplyFoem in foem_entry.h for the
   // full scope and onnxsim/foem.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_foem",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1844,6 +1935,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "percdamp"_a = 0.01, "proc_block_size"_a = 128,
       "foem_beta"_a = 0.005);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // SliM-LLM (Huang, Shao, Dong, Luo, Qiao et al., 2024): salience-driven
   // mixed-precision quantization picking a bit-width per GROUP within a
@@ -1855,6 +1947,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // convention as apply_llm_int8's own binding. See ApplySlimLlm in
   // slim_llm_entry.h for the full scope and onnxsim/slim_llm.py for the
   // technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_slim_llm",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1877,6 +1970,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a,
       "target_bits"_a = 3.0, "low_bits"_a = 2, "high_bits"_a = 4,
       "group_size"_a = 32, "percdamp"_a = 0.01);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // MoEQuant (Hu, Chen et al., 2025): Expert-Balanced Self-Sampling (EBSS)
   // plus Affinity-Guided Quantization (AGQ) calibration methodology for
@@ -1890,6 +1984,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // apply_llm_int8's own binding. See ApplyMoequant in moequant_entry.h
   // for the full scope (including its own two accepted numerical
   // divergences) and onnxsim/moequant.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_moequant",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1912,6 +2007,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a,
       "quant_block_size"_a = 32, "percdamp"_a = 0.01, "proc_block_size"_a = 128,
       "ebss"_a = true, "seed"_a = 0);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Qronos: a sequential, whole-model generalization of apply_gptq that
   // additionally accounts for the error already baked into a layer's
@@ -1926,6 +2022,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // the float model's own graph inputs. See ApplyQronos in
   // qronos_entry.h for the full scope and onnxsim/qronos.py for the
   // technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_qronos",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1949,6 +2046,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "float_model_bytes"_a, "quantized_model_bytes"_a,
       "calibration_data"_a, "percdamp"_a = 0.01, "proc_block_size"_a = 128);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // TesseraQ: "Progressive Adaptive Rounding" (PAR) -- an AdaRound-style
   // rectified-sigmoid rounding relaxation, optimized by a hand-rolled
@@ -1963,6 +2061,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // scope (including its own accepted numerical scope -- an iterative
   // optimization, not a closed-form computation) and
   // onnxsim/tesseraq.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_tesseraq",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -1992,6 +2091,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "par_rounds"_a = 4, "learning_rate"_a = 0.1,
       "scale_learning_rate"_a = 0.01, "reg_param"_a = 0.01,
       "warm_start"_a = 0.2, "beta_start"_a = 20.0, "beta_end"_a = 2.0);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // QuaRot+GPTQ (Ashkboos et al., 2024): the real QuaRot paper's optional,
   // tighter weight quantizer -- rotates every matched MatMul/vanilla-Gemm
@@ -2005,6 +2105,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // onnx.TensorProto]]) is keyed to that single model's own graph inputs.
   // See ApplyQuarotGptq in quarot_gptq_entry.h for the full scope and
   // onnxsim/quarot.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_quarot_gptq",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -2027,6 +2128,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "seed"_a = 0,
       "block_size"_a = 32, "percdamp"_a = 0.01, "proc_block_size"_a = 128,
       "epsilon"_a = 1e-12);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // GPTVQ (Van Baalen et al., 2024): a genuine combination of
   // apply_gptq's own sequential, Hessian-compensated correction with a
@@ -2045,6 +2147,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // its own permanent RNG divergence from the Python reference for the
   // k-means codebook fit) and onnxsim/gptvq.py for the technique this
   // ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gptvq",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -2070,6 +2173,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "seed"_a = 0,
       "vector_dim"_a = 2, "num_centroids"_a = 256, "num_iterations"_a = 10,
       "percdamp"_a = 0.01, "skip_names"_a = std::vector<std::string>());
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // SmoothQuant migration (Xiao et al., 2022): rescales every matched
   // MatMul/vanilla-Gemm node's constant 2-D FLOAT32 weight columns by the
@@ -2081,6 +2185,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // convention as apply_imatrix_quantization's own binding above. See
   // ApplySmoothQuant in smoothquant_entry.h for the full scope and
   // onnxsim/smoothquant.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_smoothquant",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -2100,6 +2205,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "alpha"_a = 0.5,
       "epsilon"_a = 1e-5);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // FPTQ (Li, Zhang, Li, Yao, Zhang, Chu, Sun, Du and Xie, 2023): shares
   // apply_smoothquant's own binding above core mechanism (rescale a
@@ -2112,6 +2218,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // executor-as-first-argument, `calibration_data` crossing convention as
   // apply_smoothquant's own binding above. See ApplyFptq in fptq_entry.h
   // for the full scope and onnxsim/fptq.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_fptq",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -2132,6 +2239,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "alpha"_a = 0.5,
       "outlier_ratio_threshold"_a = 10.0, "epsilon"_a = 1e-5);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // EasyQuant (Wu, Judd, Isaev, Micikevicius, 2020): plain W8A8 (INT8
   // weight + INT8 activation) quantizer using coordinate-descent GRID
@@ -2147,6 +2255,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // binding above (single-model, unlike apply_gptq's own two-model
   // shape). See ApplyEasyquant in easyquant_entry.h for the full scope
   // and onnxsim/easyquant.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_easyquant",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -2168,6 +2277,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a,
       "num_iterations"_a = 3, "num_candidates"_a = 21, "search_span"_a = 0.5);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // RPTQ (Yuan et al., 2023): clusters every matched MatMul/vanilla-Gemm
   // node's input channels by their own calibration abs-max (a plain
@@ -2182,6 +2292,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // tuples, reconstructed into the real, public
   // `onnxsim.rptq.RptqLayerInfo` dict by the Python wrapper
   // (onnx_simplifier.py's own apply_rptq_reorder_cpp).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_rptq_reorder",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -2215,6 +2326,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "seed"_a = 0,
       "num_clusters"_a = 4);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // LoRA adapter injection: splices a trainable low-rank `X @ A @ B` branch
   // around every eligible MatMul/Gemm/Conv weight (2-D float32
@@ -2285,6 +2397,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // technique this ports. Same executor-as-first-argument,
   // `calibration_data` crossing convention as apply_spqr's own binding
   // above.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_spinquant",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -2303,6 +2416,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "block_size"_a = 32);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // ParoQuant (Liang et al., 2025): combines a SmoothQuant-style per-
   // -channel scale with many independent, cheap 2x2 (pairwise, Givens)
@@ -2314,6 +2428,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // onnxsim/paroquant.py for the technique this ports. Same executor-as-
   // -first-argument, `calibration_data` crossing convention as
   // apply_spqr's own binding above.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_paroquant",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -2335,6 +2450,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "block_size"_a = 32,
       "alpha"_a = 0.5, "num_angle_steps"_a = 9, "epsilon"_a = 1e-5);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // DuQuant (Lin et al., 2024): a calibration-ranked permutation that
   // redistributes each matched MatMul/vanilla-Gemm layer's worst outlier
@@ -2347,6 +2463,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // in duquant_entry.h for the full scope (including its own accepted
   // per-node RNG divergence) and onnxsim/duquant.py for the technique this
   // ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_duquant",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -2368,6 +2485,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "seed"_a = 0,
       "block_size"_a = 32, "outlier_fraction"_a = 0.05, "epsilon"_a = 1e-12);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Outlier Suppression+ (Wei et al., 2023): per-channel shifting ahead
   // of SmoothQuant's own per-channel scale -- recenters each activation
@@ -2381,6 +2499,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // ApplyOutlierSuppressionPlus in outlier_suppression_plus_entry.h for
   // the full scope and onnxsim/outlier_suppression_plus.py for the
   // technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_outlier_suppression_plus",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -2400,12 +2519,14 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "alpha"_a = 0.5,
       "epsilon"_a = 1e-5);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // MoE expert-intermediate-channel pruning: removes intermediate
   // (`inter_size`) channels from every expert of a matched
   // `com.microsoft::MoE` node at once -- real structural pruning, data-free.
   // Whole-expert pruning (shrinking `num_experts` itself) is NOT ported --
   // see ApplyMoeExpertChannelPruning in structured_pruning_entry.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_moe_expert_channel_pruning",
       [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
@@ -2419,11 +2540,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "sparsity"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // QMoE expert-channel pruning: removes intermediate (inter_size) channels
   // from every expert of a matched com.microsoft::QMoE node -- the
   // quantized-weight counterpart of apply_structured_pruning. See
   // ApplyQMoEExpertChannelPruning in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_qmoe_expert_channel_pruning",
       [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
@@ -2437,6 +2560,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "sparsity"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // MoE whole-expert pruning: the calibration-driven complementary
   // technique to apply_moe_expert_channel_pruning above -- drops whole
@@ -2446,6 +2570,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // data-free -- it runs `model_bytes` over `calibration_data` to capture
   // router activations). See ApplyMoeWholeExpertPruning in
   // structured_pruning_entry.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_moe_whole_expert_pruning",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -2464,6 +2589,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // QMoE whole-expert pruning: the quantized-weight counterpart of
   // apply_moe_whole_expert_pruning above -- same calibration-driven
@@ -2472,6 +2598,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // second input too, upstream of and oblivious to its quantized
   // fc1/fc2), same executor-as-first-argument shape. See
   // ApplyQMoEWholeExpertPruning in structured_pruning_entry.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_qmoe_whole_expert_pruning",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -2490,6 +2617,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Transformer block (depth) pruning: drops whole redundant pre-norm
   // transformer residual sub-blocks wholesale -- a GENUINELY DIFFERENT
@@ -2504,6 +2632,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // given, mirroring pruning.py's own `apply_transformer_block_pruning`
   // keyword-argument precedence exactly. See ApplyTransformerBlockPruning
   // in structured_pruning_entry.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_transformer_block_pruning",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -2524,6 +2653,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "sparsity"_a,
       "num_blocks_to_drop"_a = std::nullopt);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Embedding vocabulary pruning: shrinks a matched token-embedding
   // table's vocabulary axis (plus, where a tied/untied lm_head exists, its
@@ -2540,6 +2670,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // `kept_token_ids` (trivial: `{tok: i for i, tok in
   // enumerate(kept_token_ids)}`) rather than this needing to also cross
   // the nanobind boundary as a separate map.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_embedding_vocab_pruning",
       [](const py::bytes& model_proto_bytes,
@@ -2560,10 +2691,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "keep_token_ids"_a.none(), "drop_token_ids"_a.none(),
       "input_name"_a.none());
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // The importance-ranked variant -- see EmbeddingVocabPruningResult/
   // ApplyEmbeddingVocabMagnitudePruning in structured_pruning_entry.h.
   // Same return shape as apply_embedding_vocab_pruning above.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_embedding_vocab_magnitude_pruning",
       [](const py::bytes& model_proto_bytes, double sparsity,
@@ -2583,10 +2716,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "sparsity"_a = 0.5, "protect_token_ids"_a.none(),
       "input_name"_a.none());
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Any-Precision LLM (Park et al., 2024, ICML 2024): nested bit-plane
   // weight-only quantization, one quantization pass serving any bit-width
   // up to max_bits. See ApplyAnyPrecisionLlm in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_any_precision_llm",
       [](const py::bytes& model_proto_bytes, int64_t bits, int64_t max_bits,
@@ -2602,11 +2737,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "bits"_a = 4, "max_bits"_a = 8, "block_size"_a = 32);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // QuaRot (Ashkboos et al., 2024): rotation preprocessing plus INT4
   // round-to-nearest quantization of both the weight and the activation of
   // every MatMul/vanilla-Gemm layer. Data-free. See ApplyQuarot in
   // onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_quarot",
       [](const py::bytes& model_proto_bytes, uint64_t seed, int64_t block_size,
@@ -2621,10 +2758,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "seed"_a, "block_size"_a = 32, "epsilon"_a = 1e-12f);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // llama.cpp's IQ4_NL: fixed 16-entry non-uniform-codebook weight-only 4-bit
   // quantization, one scale per 32-element block. Data-free. See ApplyIQ4NL
   // in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_iq4_nl",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2638,10 +2777,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // llama.cpp's legacy GGUF Q4_0/Q4_1 block formats: weight-only 4-bit
   // quantization, one plain 32-element block per scale(/min). Data-free.
   // See ApplyGgufQ4_0/ApplyGgufQ4_1 in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gguf_q4_0_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2655,6 +2796,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gguf_q4_1_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2668,11 +2811,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // llama.cpp's legacy GGUF Q5_0/Q5_1 block formats: weight-only 5-bit
   // quantization, one plain 32-element block per scale(/min) -- the same
   // scheme as Q4_0/Q4_1 above, one bit wider. Data-free. See
   // ApplyGgufQ5_0/ApplyGgufQ5_1 in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gguf_q5_0_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2686,6 +2831,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gguf_q5_1_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2699,10 +2846,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // llama.cpp's GGUF Q8_0 block format: weight-only signed 8-bit
   // quantization, one plain 32-element block sharing a single fp16 scale
   // (no bias, no min). Data-free. See ApplyGgufQ8_0 in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gguf_q8_0_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2716,11 +2865,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // llama.cpp's GGUF Q2_K K-quant format: weight-only 2-bit quantization,
   // a 256-element super-block split into 16 sub-blocks of 16, each with
   // its own asymmetric (scale, min) pair re-quantized to 4-bit codes.
   // Data-free. See ApplyGgufQ2K in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gguf_q2_k_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2734,12 +2885,14 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // llama.cpp's GGUF Q3_K K-quant format: weight-only 3-bit quantization,
   // a 256-element super-block split into 16 sub-blocks of 16, each with
   // a 6-bit scale code times one shared super-block scale, times the
   // format's own asymmetric 3-bit element code. Data-free. See
   // ApplyGgufQ3K in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gguf_q3_k_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2753,11 +2906,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // llama.cpp's GGUF Q4_K K-quant format: weight-only 4-bit quantization,
   // a 256-element super-block split into 8 sub-blocks of 32, each with
   // its own asymmetric (scale, min) pair re-quantized to 6-bit codes.
   // Data-free. See ApplyGgufQ4K in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gguf_q4_k_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2771,10 +2926,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // llama.cpp's GGUF Q5_K K-quant format: identical to Q4_K above except
   // a 5-bit (vs 4-bit) element code. Data-free. See ApplyGgufQ5K in
   // onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gguf_q5_k_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2788,11 +2945,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // BitNet b1.58's published absmean ternary weight quantization, as
   // shipped by llama.cpp's GGUF TQ1_0/TQ2_0 tensor types: weight-only,
   // one shared {-1, 0, +1} scale per 256-element block. Data-free. See
   // ApplyGgufTernaryQuant in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gguf_ternary_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2806,9 +2965,11 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // FP6-LLM's E3M2 6-bit floating-point weight-only quantization, one
   // scale per 64-element block. Data-free. See ApplyFp6Llm in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_fp6_llm",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2822,11 +2983,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // llama.cpp's Q6_K K-quant format: weight-only, one 8-bit sub-block
   // scale (times a shared float16 super-block scale) per 16-element
   // sub-block of a 256-element super-block. Data-free. See ApplyGgufQ6K
   // in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_gguf_q6_k_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2840,10 +3003,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // AngelSlim's LeptoQuant: outlier-aware block FP8 weight quantization,
   // one FLOAT8E4M3FN scale per 128x128 tile, grid-searched over an
   // outlier fraction. Data-free. See ApplyLeptoquant in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_leptoquant",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2857,10 +3022,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // bitsandbytes' NF4: weight-only quantization with a fixed 16-value
   // non-uniform codebook, one scale per 64-element (output-channel,
   // K-block) group. Data-free. See ApplyNF4 in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_weight_only_nf4",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2874,10 +3041,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // IF4: per (output-channel, 16-element K-block) choice between a plain
   // INT4 grid and MXFP4's own E2M1 codebook, whichever reconstructs that
   // block with lower MSE. Data-free. See ApplyIF4 in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_weight_only_if4",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2891,10 +3060,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // NVIDIA's NVFP4: shares MXFP4's E2M1 codebook, with a two-level
   // (per-tensor global scale, E4M3-rounded per-block scale) rule.
   // Data-free. See ApplyNVFP4Quantization in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_weight_only_nvfp4",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2908,11 +3079,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // DeepSeek-V3-style fine-grained block FP8 weight quantization: one
   // real FLOAT8E4M3FN round trip per 128x128 tile. Weight side only --
   // see ApplyDeepSeekFp8 in onnxsim.h for the activation-quantization
   // scope-narrowing note. Data-free.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_deepseek_fp8",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2926,11 +3099,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // K-means per-layer codebook weight quantization (Han et al., 2015,
   // "Deep Compression"): a 16-centroid codebook fit per layer via
   // Lloyd's algorithm. Data-free. See ApplyKMeansQuantization in
   // onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_kmeans_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2944,10 +3119,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // HQQ (Half-Quadratic Quantization): asymmetric affine INT4 with an
   // IRLS-refined zero-point per (output-channel, 32-element K-block)
   // group. Data-free. See ApplyHQQ in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_hqq",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2961,10 +3138,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // I-BERT's own i-GELU polynomial approximation of Erf: a
   // nonlinear-activation rewrite, not a weight quantizer -- matches any
   // standalone Erf node. Data-free. See ApplyIBertGelu in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_ibert_gelu",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2978,10 +3157,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // I-BERT's own integer-friendly Softmax exp-approximation: matches any
   // standalone Softmax node. Data-free. See ApplyIBertSoftmax in
   // onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_ibert_softmax",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -2995,10 +3176,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // AdpQ: calibration-free salient/non-salient weight split via a
   // median/MAD-based adaptive threshold. Data-free. See ApplyADPQ in
   // onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_adpq",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -3012,10 +3195,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // ICQuant: per-block single-outlier exact reconstruction plus a
   // symmetric 7-level-per-side grid for the rest. Data-free. See
   // ApplyICQuant in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_icquant",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -3029,9 +3214,11 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // OliVe: outlier-victim pair quantization. Data-free. See ApplyOlive
   // in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_olive",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -3045,9 +3232,11 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // AQLM: additive/residual multi-codebook quantization via greedy
   // residual k-means. Data-free. See ApplyAQLM in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_aqlm",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -3061,10 +3250,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Drop-by-Drop: additive multi-bitwidth codebook quantization via 4
   // importance-weighted greedy residual k-means stages. Data-free. See
   // ApplyDropByDrop in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_drop_by_drop",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -3078,10 +3269,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // LO-BCQ: block-clustered quantization -- blocks are clustered by their
   // own [mean, std] feature vector, then each cluster fits its own small
   // codebook. Data-free. See ApplyLoBcq in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_lo_bcq",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -3095,10 +3288,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // QuIP#: rotation-based incoherence processing plus E8-lattice vector
   // quantization, folded into a single replacement weight initializer.
   // Data-free. See ApplyQuipSharp in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_quip_sharp",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -3112,11 +3307,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Attention computation quantization: per-token dynamic INT8 for Q/K/V,
   // fixed-scale UINT8 for the Softmax output. Data-free. New graph nodes
   // (not a fold-to-initializer -- no constant weight is involved). See
   // ApplyAttentionQuantization in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_attention_quantization",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -3130,12 +3327,14 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // ZeroQuant (Yao et al., 2022): group-wise INT8 weight quantization paired
   // with per-token dynamic INT8 activation quantization, executed as a real
   // int8 x int8 MatMulInteger. Data-free. New graph nodes (not a
   // fold-to-initializer -- the activation's own per-token scale is a
   // runtime value). See ApplyZeroQuant in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_zeroquant",
       [](const py::bytes& model_proto_bytes, int64_t block_size,
@@ -3150,10 +3349,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "block_size"_a = 32, "epsilon"_a = 1e-12f);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // IntactKV (Liu et al., 2024): splits a KV-cache stream's own fixed-length
   // leading pivot prefix into its own always-exact stream. Data-free.
   // Companion pass, not a quantizer -- see ApplyIntactKv in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_intactkv",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -3167,10 +3368,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // KBVQ-MoE (Xu et al., 2026): KLT-shared-basis plus per-expert
   // bias-corrected vector quantization for a com.microsoft::MoE router
   // group's own experts. Data-free. See ApplyKbvqMoe in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_kbvq_moe",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -3184,10 +3387,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // LLM-FP4 (Liu et al., 2023): searched (exponent/mantissa split,
   // per-block real-valued scale) FP4 weight-only quantization. Data-free.
   // See QuantizeWeightOnlyLlmFp4 in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_weight_only_llm_fp4",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -3201,6 +3406,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // LLM-FP4 activation quantization, data-free per-token variant (Liu et
   // al., 2023): completes W4A4 for every quantize_weight_only_llm_fp4-
@@ -3211,6 +3417,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // ApplyLlmFp4ActivationQuantization in llm_fp4_activation_entry.h for
   // the full "Honesty note" and onnxsim/llm_fp4.py for the technique.
   // Data-free.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_llm_fp4_activation_quantization",
       [](const py::bytes& model_proto_bytes, double epsilon) -> py::bytes {
@@ -3224,6 +3431,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "epsilon"_a = 1e-12);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // LLM-FP4 activation quantization, calibrated per-tensor variant (Liu
   // et al., 2023): the paper's own quantizer half (the migration half is
@@ -3236,6 +3444,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // ApplyLlmFp4ActivationQuantizationPerTensor in
   // llm_fp4_activation_entry.h for the full scope and
   // onnxsim/llm_fp4.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_llm_fp4_activation_quantization_per_tensor",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -3255,6 +3464,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a,
       "clip_ratios"_a = std::nullopt);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Binary Weight-Activation PTQ (Song et al., 2025, ACL Findings), weight
   // side only (W(1+1)): binarizes every matched MatMul/vanilla-Gemm layer
@@ -3263,6 +3473,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // `calibration_data` crossing convention as apply_llm_int8's own
   // binding above. See ApplyBwaPtq in bwa_ptq_entry.h for the full scope
   // and onnxsim/bwa_ptq.py for the technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_bwa_ptq",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -3282,6 +3493,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "group_size"_a = 128,
       "max_em_iters"_a = 10);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Pruning-recovery fine-tuning: for every surviving MatMul/vanilla-Gemm
   // layer present (by node output name) in both `original_model` and
@@ -3320,6 +3532,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // QServe's QoQ quantization (Lin et al., 2024): progressive
   // (INT8-then-INT4) block-wise weight quantization. Data-free. See
   // ApplyQoq in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_qoq",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -3333,11 +3546,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // D2Quant's Dual-Scale Quantizer (Yan et al., 2026): a per-column
   // auxiliary scale for SwiGLU/GLU down-projection weights, absorbed into
   // the paired up-projection's own weight. Data-free. See ApplyDsq in
   // onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_dsq",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -3351,10 +3566,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // DAQ (Delta-Aware Quantization): data-free, but takes two full model
   // byte buffers (a base and a fine-tuned checkpoint, matched by node
   // output name) rather than one -- see ApplyDaq in daq_entry.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_daq",
       [](const py::bytes& base_model_bytes,
@@ -3378,6 +3595,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "base_model_bytes"_a, "post_trained_model_bytes"_a, "metric"_a = "cosine",
       "skip_names"_a = std::vector<std::string>{});
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // SVDQuant / Nunchaku (Li, Lin, Zhang, et al., 2024): an optional
   // SmoothQuant-style migration (ApplySmoothQuant, reused directly -- see
@@ -3391,6 +3609,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // ApplySvdquant in svdquant_entry.h for the full scope (including its own
   // accepted Jacobi-SVD divergence) and onnxsim/svdquant.py for the
   // technique this ports.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_svdquant",
       [](std::shared_ptr<PyModelExecutor> executor,
@@ -3411,11 +3630,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "executor"_a, "model_bytes"_a, "calibration_data"_a, "rank"_a = 32,
       "block_size"_a = 32, "smooth_alpha"_a = 0.5);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Low-Rank Compensation (LoRC): data-free, but takes two full model byte
   // buffers (a float model and its own INT4-quantized counterpart, matched
   // by node output name) rather than one -- see ApplyLowRankCompensation
   // in low_rank_compensation_entry.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "apply_low_rank_compensation",
       [](const py::bytes& float_model_bytes,
@@ -3434,12 +3655,14 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "float_model_bytes"_a, "quantized_model_bytes"_a, "rank"_a = 8);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Embedding-output binarization: data-free, single-model, no
   // ModelExecutor -- targets a whole graph OUTPUT declaration rather than a
   // matched node. `output_name` empty stands in for Python's own
   // `output_name=None` sentinel. See ApplyEmbeddingQuantizationBinary in
   // embedding_quantization_entry.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_embedding_binary",
       [](const py::bytes& model_proto_bytes,
@@ -3455,9 +3678,11 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "output_name"_a = "");
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "list_quantizable_activations",
       [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
@@ -3468,6 +3693,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return ListQuantizableActivations(model);
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Statically (calibration-based) quantizes MatMul/Gemm/Conv: weights to
   // INT8
@@ -3476,6 +3702,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // derived from `activation_ranges` (tensor name -> (min, max), typically
   // from list_quantizable_activations plus running the float model over
   // calibration data) -- see QuantizeStatic in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_static",
       [](const py::bytes& model_proto_bytes,
@@ -3491,10 +3718,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "activation_ranges"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Same as quantize_static, but a "W8A16" scheme: the weight stays INT8,
   // while the activation is quantized to uint16 instead of uint8 (an 8x
   // finer calibrated affine step) -- see QuantizeStaticInt16 in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_static_int16",
       [](const py::bytes& model_proto_bytes,
@@ -3510,10 +3739,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "activation_ranges"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Lists the *output* tensor names quantize_qoperator could additionally
   // quantize, on top of list_quantizable_activations' input names -- see
   // ListQOperatorQuantizableOutputs in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "list_qoperator_quantizable_outputs",
       [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
@@ -3524,6 +3755,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return ListQOperatorQuantizableOutputs(model);
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Statically (calibration-based) quantizes MatMul/Gemm into the
   // "QOperator" format (QLinearMatMul) rather than quantize_static's QDQ
@@ -3531,6 +3763,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // node's own output (see list_qoperator_quantizable_outputs) since
   // QLinearMatMul computes directly in int8, with no float intermediate --
   // see QuantizeQOperator in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_qoperator",
       [](const py::bytes& model_proto_bytes,
@@ -3546,10 +3779,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "activation_ranges"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Lists the tensor names quantize_qoperator_elementwise could quantize --
   // both operands and the output of every qualifying Add/Mul node -- see
   // ListQOperatorElementwiseQuantizableTensors in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "list_qoperator_elementwise_quantizable_tensors",
       [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
@@ -3560,6 +3795,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return ListQOperatorElementwiseQuantizableTensors(model);
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Statically (calibration-based) quantizes elementwise Add/Mul into ONNX
   // Runtime's "com.microsoft" QLinearAdd/QLinearMul contrib ops -- needs a
@@ -3567,6 +3803,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // list_qoperator_elementwise_quantizable_tensors) since these compute
   // directly in int8, with no float intermediate -- see
   // QuantizeQOperatorElementwise in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_qoperator_elementwise",
       [](const py::bytes& model_proto_bytes,
@@ -3583,10 +3820,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "activation_ranges"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Lists the tensor names quantize_qoperator_activation could quantize --
   // the input and output of every qualifying Sigmoid/LeakyRelu node -- see
   // ListQOperatorActivationQuantizableTensors in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "list_qoperator_activation_quantizable_tensors",
       [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
@@ -3597,6 +3836,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return ListQOperatorActivationQuantizableTensors(model);
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Statically (calibration-based) quantizes standalone Sigmoid/LeakyRelu
   // into ONNX Runtime's "com.microsoft" QLinearSigmoid/QLinearLeakyRelu
@@ -3604,6 +3844,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // node's own output (see list_qoperator_activation_quantizable_tensors)
   // since these compute directly in int8, with no float intermediate -- see
   // QuantizeQOperatorActivation in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_qoperator_activation",
       [](const py::bytes& model_proto_bytes,
@@ -3620,10 +3861,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "activation_ranges"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Lists the tensor names quantize_qoperator_concat could quantize -- every
   // input plus the output of every qualifying Concat node -- see
   // ListQOperatorConcatQuantizableTensors in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "list_qoperator_concat_quantizable_tensors",
       [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
@@ -3634,6 +3877,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return ListQOperatorConcatQuantizableTensors(model);
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Statically (calibration-based) quantizes Concat into ONNX Runtime's
   // "com.microsoft" QLinearConcat contrib op -- needs a calibrated range for
@@ -3641,6 +3885,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // list_qoperator_concat_quantizable_tensors) since this computes directly
   // in int8, with no float intermediate -- see QuantizeQOperatorConcat in
   // onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_qoperator_concat",
       [](const py::bytes& model_proto_bytes,
@@ -3656,6 +3901,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "activation_ranges"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Lists the tensor names quantize_qoperator_softmax could quantize -- the
   // input and output of every qualifying Softmax node -- see
@@ -3809,6 +4055,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // keep_io_types (the default true), the graph's own external input/output
   // types stay float32 via boundary Cast nodes. See QuantizeFp16 in
   // onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_fp16",
       [](const py::bytes& model_proto_bytes, bool keep_io_types) -> py::bytes {
@@ -3822,12 +4069,14 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "keep_io_types"_a = true);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Converts every float32 weight (and, by default, every internal
   // activation) to bfloat16 -- the same calibration-free, whole-graph
   // conversion as quantize_fp16 above, just to a different narrow
   // floating-point format (bfloat16 keeps float32's full exponent range, so
   // there is no clamping concern). See QuantizeBf16 in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_bf16",
       [](const py::bytes& model_proto_bytes, bool keep_io_types) -> py::bytes {
@@ -3841,6 +4090,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "keep_io_types"_a = true);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Converts every float32 weight (and, by default, every internal
   // activation) to an 8-bit floating-point format -- the same
@@ -3849,6 +4099,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // "e4m3" (E4M3FN, the default) or "e5m2" (E5M2); both convert with
   // saturation (clamping) rather than producing an infinity/NaN for an
   // out-of-range magnitude. See QuantizeFp8 in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_fp8",
       [](const py::bytes& model_proto_bytes, const std::string& format,
@@ -3863,6 +4114,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "format"_a = "e4m3", "keep_io_types"_a = true);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Static, calibration-free INT8-quantization risk analysis -- the single
   // C++ implementation (onnxsim/precision_estimator.{h,cpp}) that both this
