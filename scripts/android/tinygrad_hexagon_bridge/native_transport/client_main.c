@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "mini_rpc.h"
 
 #define GEMM_A_LEN 3481600
@@ -19,6 +20,16 @@
 #define REQUANT_C_LEN 2000000
 #define REQUANT_A_PATH "/data/local/tmp/native_transport/requant_a.bin"
 #define REQUANT_C_PATH "/data/local/tmp/native_transport/requant_c_out.bin"
+
+#define SUBGRAPH_A_LEN 3527056
+#define SUBGRAPH_C_LEN 3481600
+#define SUBGRAPH_A_PATH "/data/local/tmp/native_transport/subgraph_image_padded.bin"
+#define SUBGRAPH_C_PATH "/data/local/tmp/native_transport/subgraph_maxpool_out.bin"
+
+#define SMALL_SUBGRAPH_A_LEN 5776
+#define SMALL_SUBGRAPH_C_LEN 4096
+#define SMALL_SUBGRAPH_A_PATH "/data/local/tmp/native_transport/small_image_padded.bin"
+#define SMALL_SUBGRAPH_C_PATH "/data/local/tmp/native_transport/small_maxpool_out.bin"
 
 static unsigned char* read_file_exact(const char* path, int expect_len) {
   FILE* f = fopen(path, "rb");
@@ -106,6 +117,54 @@ int main(int argc, char** argv) {
     printf("requantize test data not found at %s, skipping\n", REQUANT_A_PATH);
   }
   free(ra);
+
+  /* Stage 2: the fused stem7x7 -> bias_add -> requantize -> layout_transform -> maxpool
+   * subgraph, real backbone.onnx weights/bias/scales, real quantized+padded image in -- only
+   * runs if the image was pushed first; skipped gracefully otherwise. Times the on-device call
+   * (the only thing crossing the RPC boundary is this input and the final maxpool output --
+   * every intermediate activation stays on-device, see subgraph_driver.c). */
+  /* Diagnostic: a tiny-scale (ih=iw=32) copy of the same pipeline, to isolate whether a
+   * full-scale failure is a real per-process memory-size limit vs. a logic bug -- run before
+   * the full-scale test so its result is available even if the full-scale one crashes. */
+  unsigned char* ssa = read_file_exact(SMALL_SUBGRAPH_A_PATH, SMALL_SUBGRAPH_A_LEN);
+  if (ssa) {
+    unsigned char* ssc = malloc(SMALL_SUBGRAPH_C_LEN);
+    printf("running SMALL-scale (32x32) subgraph diagnostic...\n");
+    int ssrc = mini_rpc_run_kernel(h, ssa, SMALL_SUBGRAPH_A_LEN, ssa, 0, ssc, SMALL_SUBGRAPH_C_LEN);
+    printf("run_small_subgraph rc=%d\n", ssrc);
+    if (ssrc == 0) {
+      FILE* out = fopen(SMALL_SUBGRAPH_C_PATH, "wb");
+      fwrite(ssc, 1, SMALL_SUBGRAPH_C_LEN, out);
+      fclose(out);
+      printf("wrote %s (%d bytes)\n", SMALL_SUBGRAPH_C_PATH, SMALL_SUBGRAPH_C_LEN);
+    }
+    free(ssc);
+  } else {
+    printf("small subgraph test data not found at %s, skipping\n", SMALL_SUBGRAPH_A_PATH);
+  }
+  free(ssa);
+
+  unsigned char* sa = read_file_exact(SUBGRAPH_A_PATH, SUBGRAPH_A_LEN);
+  if (sa) {
+    unsigned char* sc = malloc(SUBGRAPH_C_LEN);
+    printf("running real stem7x7->bias_add->requantize->maxpool subgraph...\n");
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int src = mini_rpc_run_kernel(h, sa, SUBGRAPH_A_LEN, sa, 0, sc, SUBGRAPH_C_LEN);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    printf("run_subgraph rc=%d wall_ms=%.3f\n", src, ms);
+    if (src == 0) {
+      FILE* out = fopen(SUBGRAPH_C_PATH, "wb");
+      fwrite(sc, 1, SUBGRAPH_C_LEN, out);
+      fclose(out);
+      printf("wrote %s (%d bytes) -- verify against the ORT reference host-side\n", SUBGRAPH_C_PATH, SUBGRAPH_C_LEN);
+    }
+    free(sc);
+  } else {
+    printf("subgraph test data not found at %s, skipping\n", SUBGRAPH_A_PATH);
+  }
+  free(sa);
 
   mini_rpc_close(h);
   printf("closed OK\n");
