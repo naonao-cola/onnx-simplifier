@@ -178,3 +178,42 @@ not something the compiled kernel's target string controls. With about 3.4x alre
 thread count is not the remaining bottleneck for this workload; the leads noted above (per-shape
 vrmpy tiling, MetaSchedule/AutoTVM tuning) remain the likely next gains.
 
+## Follow-up: a 21x anomaly in the FPN upsample op
+
+Looking for where the backbone's 3.68s actually goes (attempting `tvm.contrib.hexagon`'s
+`get_graph_debug_executor().run_individual()` for exact per-op timing hit a FastRPC transfer
+limit -- `hexagon_rpc_send failed: 78` -- on this 116-function graph; a genuine tool limitation
+worth noting for anyone trying real per-op profiling on this Hexagon RPC path, not something
+fixed here), a static instruction-count breakdown of the compiled `.so` pointed at 18 separate
+`layout_transform`/`resize2d` kernels (`hexagon-nm` categorised: 71 `conv2d_NCHWc` functions at
+71.4% of static instructions, `layout_transform`-family functions at ~16%). The single largest
+non-conv function (3384 static instructions) is the FPN's nearest-neighbor upsample fused with
+its layout transform.
+
+Isolated and measured directly on the phone (`relay.image.resize2d`, int8, 34x34x256 ->
+68x68x256, the P5->P4 FPN upsample shape for an 800x1088 input):
+
+| Kernel | Output size | Median wall time |
+|---|---|---:|
+| `nn.relu` (trivial elementwise baseline) | `[1,256,68,68]` int8 | 1.88 ms |
+| `image.resize2d` nearest-neighbor upsample | `[1,256,68,68]` int8 | **39.77 ms** |
+
+**21x slower than a trivial op of the identical output size**, for an operator that does *less*
+real work (index/copy, no per-element arithmetic). The compiled kernel is vectorized and does
+import `TVMBackendParallelLaunch` (144 `vmem` HVX loads/stores, one parallel-launch relocation --
+so this is not a repeat of the earlier false "parallel is broken" lead), but its disassembly
+shows `call 0x330 <ceilf@plt>` immediately before groups of vector stores: the coordinate
+transform (`half_pixel` + `round_prefer_floor` by default) computes each output row/column's
+source index with a **scalar libm `ceilf` call**, the same class of bug the Sigmoid work found
+earlier in this project (`te.floor`/`te.abs` lowering to one scalar call per lane and
+serialising an otherwise-vectorized loop -- see `../hexagon_qfloat.py`'s docstring and the
+Sigmoid section of `../README.md`). Not root-caused to a specific line of
+`topi/image/resize.py`'s `resize2d` compute in this session, and not fixed -- a good next step
+for whoever continues this: precompute the per-row/column integer source indices as a small
+vectorizable int32 loop (or, since Mask R-CNN's FPN always upsamples by exactly 2x with
+`nearest_neighbor`, special-case integer-factor nearest-neighbor resize to skip the general
+`coordinate_transformation_mode` float math entirely).
+
+With 3-4 such FPN merges in the backbone, this is on the order of 100-150 ms of the 3.68s total
+(3-4%) -- not the dominant cost, but a disproportionate, well-isolated, likely-cheap-to-fix one.
+
