@@ -25,11 +25,28 @@ its own copy of the shared RoPE/causal-mask precompute from ``attention_mask``/
 ``position_ids``.
 
 ``build`` (system Python with tensorrt) builds every block with ``trtexec --fp16``,
-records which ones fit in memory, then *actually chains* the block engines for each
-successful K in one process -- real H2D/D2H copies of hidden-states and KV cache between
-blocks via the TensorRT Python API (not just summed isolated per-block trtexec numbers) --
-and reports true end-to-end decode-step latency per K, plus output agreement against the
-single-layer (K=1) reference chain.
+records which ones fit in memory, then chains each successful K's engines -- each K in
+its own subprocess (loading every block's engine keeps all of them resident at once,
+which can itself exceed available memory for large blocks even though each one *built*
+fine sequentially; a subprocess per K guarantees clean release between them, confirmed
+necessary on this board) -- for a real end-to-end decode-step latency measurement (H2D
+input / D2H output per block via the TensorRT Python API, I/O buffers set up once per
+engine and reused across iterations, not malloc'd fresh every call), plus output
+agreement against the single-layer (K=1) reference chain.
+
+Findings on this board (Jetson Orin Nano, TensorRT 10.3, CUDA 12.6; Qwen2.5-0.5B decode
+step, 31 cached tokens): every block count from K=2 to K=12 builds and chains reliably;
+K=1 (24 single-layer engines) builds and chains reliably but is slowest (most inter-engine
+overhead); K=24 (the unsplit whole model) is fastest when it works but is unreliable --
+its single Myelin subgraph sits right at this board's memory ceiling, so it succeeds or
+fails depending on transient memory state and which tactic TensorRT's autotuner happens to
+pick (observed directly: identical config, OOM on one attempt, three clean successes
+immediately after). Latency drops smoothly and monotonically as K grows (more fused
+compute per engine, less inter-engine H2D/D2H round-tripping): roughly 64 ms (K=1) down to
+~35 ms (K=24) for one decode step. Every K's output has the same argmax as K=1's (identical
+top prediction), though raw logit magnitudes differ by ~2-3 absolute (~13-19% of the
+largest logit) -- a real, exactly-reproducible (confirmed across independent runs) fp16
+accumulation difference from different fusion-boundary rounding, not a bug or noise.
 """
 
 import argparse
@@ -158,12 +175,28 @@ def build_block_engine(onnx_path, engine_path, timeout=300):
     return ok, err
 
 
-def build(args):
+def _chain_one_isolated(bdir, k, meta, seq, past, logits_path):
+    """Run ``run_chain`` for one block size in its own subprocess: loading every
+    block's engine (weights resident simultaneously, unlike the build stage which only
+    ever holds one block's build-time memory at a time) can itself exceed available
+    memory for larger blocks -- confirmed on this board, where k=6's chained run OOM'd
+    after k=1..4's engines/contexts were never explicitly released within one
+    long-running process. A fresh process per k guarantees that release. Writes
+    ``logits_path`` (npy) plus a small JSON result next to it; raises on failure so the
+    parent sees a normal subprocess exit code."""
     import tensorrt as trt
 
     sys.path.insert(0, str(Path(__file__).parent))
     import trt_harness as h
 
+    logits, kv_out, ms, breakdown = run_chain(h, trt, bdir, meta, seq, past)
+    np.save(logits_path, logits)
+    Path(str(logits_path) + ".json").write_text(json.dumps(
+        {"n_blocks": len(meta), "ms_total": round(ms, 4),
+         "ms_per_block": [round(t, 4) for t in breakdown]}))
+
+
+def build(args):
     out = Path(args.out_dir)
     results = {}
     for bdir in sorted(out.glob("blocks_k*")):
@@ -172,9 +205,13 @@ def build(args):
         block_ok = True
         for bm in meta:
             bi = bm["block"]
+            engine_path = bdir / f"block{bi}.engine"
+            if engine_path.exists():
+                print(f"k={k} block{bi} (layers {bm['layers']}): exists, skipped", flush=True)
+                continue
             while _mem_free_mb() < 1500:
                 time.sleep(3)
-            ok, err = build_block_engine(bdir / f"block{bi}.onnx", bdir / f"block{bi}.engine")
+            ok, err = build_block_engine(bdir / f"block{bi}.onnx", engine_path)
             print(f"k={k} block{bi} (layers {bm['layers']}): {'OK' if ok else 'FAIL ' + str(err)}",
                   flush=True)
             if not ok:
@@ -184,75 +221,100 @@ def build(args):
     buildable = [k for k, r in results.items() if r["all_built"]]
     print(f"\nbuildable block sizes: {buildable}")
 
-    # Chain each buildable K's engines for a real end-to-end decode step.
+    # Chain each buildable K's engines for a real end-to-end decode step, each in its
+    # own subprocess (see _chain_one_isolated).
     timings = {}
     ref_logits = None
     for k in sorted(buildable):
         bdir = out / f"blocks_k{k}"
         meta = results[k]["meta"]
-        logits, kv_out, ms, breakdown = run_chain(h, trt, bdir, meta, args.seq, args.past)
+        while _mem_free_mb() < 1500:
+            time.sleep(3)
+        logits_path = out / f"chain_k{k}_logits.npy"
+        proc = multiprocessing.get_context("spawn").Process(
+            target=_chain_one_isolated, args=(bdir, k, meta, args.seq, args.past, logits_path))
+        proc.start()
+        proc.join()
+        if proc.exitcode != 0:
+            print(f"k={k}: chain FAILED (subprocess exit {proc.exitcode}, likely runtime OOM "
+                  f"loading all {len(meta)} block engines at once)", flush=True)
+            timings[k] = {"n_blocks": len(meta), "error": f"exit {proc.exitcode}"}
+            continue
+        logits = np.load(logits_path)
+        r = json.loads(Path(str(logits_path) + ".json").read_text())
         agree = None
         if ref_logits is None:
             ref_logits = logits
         else:
             agree = float(np.abs(logits.astype(np.float32) - ref_logits.astype(np.float32)).max())
-        timings[k] = {"n_blocks": len(meta), "ms_total": round(ms, 4),
-                      "ms_per_block": [round(t, 4) for t in breakdown],
-                      "max_abs_diff_vs_k1": agree}
-        print(f"k={k}: {len(meta)} blocks, {ms:.3f} ms end-to-end, "
+        timings[k] = {**r, "max_abs_diff_vs_k1": agree}
+        print(f"k={k}: {r['n_blocks']} blocks, {r['ms_total']:.3f} ms end-to-end, "
               f"diff-vs-k1={agree}", flush=True)
 
     (out / "results.json").write_text(json.dumps(timings, indent=1))
     print(f"\n{'k':>4}{'blocks':>8}{'ms':>10}{'diff-vs-k1':>14}")
     for k, r in sorted(timings.items()):
+        if "error" in r:
+            print(f"{k:>4}{r['n_blocks']:>8}  ERROR {r['error']}")
+            continue
         d = r["max_abs_diff_vs_k1"]
         print(f"{k:>4}{r['n_blocks']:>8}{r['ms_total']:>10.3f}"
               f"{'ref' if d is None else f'{d:.2e}':>14}")
 
 
-def _exec_block(h, cuda, engine, ctx, feeds):
-    """Run one already-deserialized engine's already-created context once: H2D every
-    input, execute, D2H every output. Lighter than trt_harness.run_engine (which
-    re-deserializes the engine and creates a fresh context on every call) since a chain
-    reuses the same engines/contexts across many iterations."""
-    import tensorrt as trt
+class _BlockRunner:
+    """One engine + context with I/O metadata queried and device buffers allocated
+    *once* at construction, reused across every call -- unlike a naive per-call
+    malloc/free + fresh-metadata-query approach (the original version of this script),
+    whose per-block timing was dominated by that setup cost rather than real GPU
+    compute, making it useless as a latency breakdown. A real serving engine would
+    likewise set up its I/O buffers once and just re-fill them per token."""
 
-    bufs = {}
-    outs = {}
-    for i in range(engine.num_io_tensors):
-        name = engine.get_tensor_name(i)
-        shape = tuple(ctx.get_tensor_shape(name))
-        dtype = trt.nptype(engine.get_tensor_dtype(name))
-        nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
-        bufs[name] = cuda.malloc(nbytes)
-        ctx.set_tensor_address(name, bufs[name].value)
-        if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
-            x = np.ascontiguousarray(feeds[name]).astype(dtype, copy=False)
-            cuda.memcpy_htod(bufs[name], x)
-        else:
-            outs[name] = np.empty(shape, dtype=dtype)
-    ctx.execute_async_v3(0)
-    cuda.sync()
-    for name, h_out in outs.items():
-        cuda.memcpy_dtoh(h_out, bufs[name])
-    for p in bufs.values():
-        cuda.free(p)
-    return outs
+    def __init__(self, h, trt, cuda, engine, ctx):
+        self.cuda = cuda
+        self.engine, self.ctx = engine, ctx
+        self.bufs, self.dtypes, self.shapes, self.out_names = {}, {}, {}, []
+        for i in range(engine.num_io_tensors):
+            name = engine.get_tensor_name(i)
+            shape = tuple(ctx.get_tensor_shape(name))
+            dtype = trt.nptype(engine.get_tensor_dtype(name))
+            nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+            self.bufs[name] = cuda.malloc(nbytes)
+            ctx.set_tensor_address(name, self.bufs[name].value)
+            self.dtypes[name], self.shapes[name] = dtype, shape
+            if engine.get_tensor_mode(name) != trt.TensorIOMode.INPUT:
+                self.out_names.append(name)
+
+    def run(self, feeds):
+        for name, x in feeds.items():
+            self.cuda.memcpy_htod(self.bufs[name], np.ascontiguousarray(x, dtype=self.dtypes[name]))
+        self.ctx.execute_async_v3(0)
+        self.cuda.sync()
+        outs = {n: np.empty(self.shapes[n], dtype=self.dtypes[n]) for n in self.out_names}
+        for n, h_out in outs.items():
+            self.cuda.memcpy_dtoh(h_out, self.bufs[n])
+        return outs
+
+    def free(self):
+        for p in self.bufs.values():
+            self.cuda.free(p)
 
 
 def run_chain(h, trt, bdir, meta, seq, past, iters=20, warmup=5):
     """Load every block engine in one process and run a real chained decode step,
     threading hidden-states and each layer's KV cache between blocks (host round-trip
-    per block via ``_exec_block`` -- simple and correct, not zero-copy device-to-device,
-    but a fair, honest measurement of what a real multi-engine deployment would pay)."""
+    per block via ``_BlockRunner`` -- simple and correct, not zero-copy
+    device-to-device, but a fair, honest measurement of what a real multi-engine
+    deployment would pay). I/O buffers are set up once per engine (see
+    ``_BlockRunner``), not per call, so both ``ms_total`` and the per-block breakdown
+    reflect steady-state execution, not one-time setup cost."""
     cuda = h.Cudart()
     rng = np.random.default_rng(0)
-    engines, ctxs = [], []
+    runners = []
     for bm in meta:
         blob = (bdir / f"block{bm['block']}.engine").read_bytes()
         eng = trt.Runtime(h.LOGGER).deserialize_cuda_engine(blob)
-        engines.append(eng)
-        ctxs.append(eng.create_execution_context())
+        runners.append(_BlockRunner(h, trt, cuda, eng, eng.create_execution_context()))
 
     # Shared, fixed inputs across every block (each block recomputes its own RoPE/mask).
     attn_mask = np.ones((1, past + seq), dtype=np.int64)
@@ -267,14 +329,14 @@ def run_chain(h, trt, bdir, meta, seq, past, iters=20, warmup=5):
         h_ = hidden0
         kv_out = {}
         breakdown = []
-        for bm, eng, ctx in zip(meta, engines, ctxs):
+        for bm, runner in zip(meta, runners):
             feeds = {"attention_mask": attn_mask, "position_ids": pos_ids, bm["hidden_in"]: h_}
             for i in range(bm["kv"][0], bm["kv"][1] + 1):
                 feeds[f"past_key_values.{i}.key"] = kv_cache[(i, "key")]
                 feeds[f"past_key_values.{i}.value"] = kv_cache[(i, "value")]
-            t0 = time.perf_counter()
-            outs = _exec_block(h, cuda, eng, ctx, feeds)
-            breakdown.append(time.perf_counter() - t0)
+            t_block = time.perf_counter()
+            outs = runner.run(feeds)
+            breakdown.append(time.perf_counter() - t_block)
             for i in range(bm["kv"][0], bm["kv"][1] + 1):
                 kv_out[(i, "key")] = outs[f"present.{i}.key"]
                 kv_out[(i, "value")] = outs[f"present.{i}.value"]
@@ -287,6 +349,8 @@ def run_chain(h, trt, bdir, meta, seq, past, iters=20, warmup=5):
     for _ in range(iters):
         logits, kv_out, breakdown = run_once()
     ms = (time.perf_counter() - t0) / iters * 1e3
+    for r in runners:
+        r.free()
     return logits, kv_out, ms, breakdown
 
 

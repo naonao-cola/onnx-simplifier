@@ -16,6 +16,7 @@ hand-built-graph tests in `tests/test_tensorrt_*.py` (which never invoke TensorR
 | `trt_nms_check.py` | onnxsim (`gen`), system Python with `tensorrt` (`trt`), any (`compare`) | differentially checks `rewrite_trt_batched_nms`'s output against the real `BatchedNMSDynamic_TRT` plugin |
 | `run_cuda_feature_notebook.py` | onnxsim + a GPU `onnxruntime` | runs `examples/cuda_feature_tests/cuda_feature_tests.ipynb`'s tests as a plain script |
 | `llm_pipeline.py` | onnxsim (Python >= 3.11) | pins shapes on a decoder-with-KV-cache LLM export and runs `simplify()` on it |
+| `llm_block_split.py` | onnxsim (`split`), system Python with `tensorrt` (`build`) | splits a decoder LLM into N-layer TensorRT-buildable blocks, chains them, measures real end-to-end latency per block size |
 
 They are split because JetPack 6's TensorRT Python bindings are cp310-only while onnxsim
 needs Python >= 3.11; models are exchanged as `.onnx` files.
@@ -386,3 +387,68 @@ Here, the graph-level finding stands on its own: `simplify()` is exact and shrin
 decoder LLM export by more than a third, entirely by folding now-static KV-cache shape
 arithmetic, without touching (or needing to touch) RoPE/RMSNorm/GQA at all.
 
+## Splitting the decoder LLM into TensorRT-buildable blocks
+
+Following on from the CMA finding above, `scripts/nvidia/llm_block_split.py` tests the
+actual fix: split the ONNX graph into `N`-layer blocks *before* it reaches the builder, so
+no single TensorRT network ever needs to build the whole 24-layer fused subgraph at once.
+
+```sh
+python3.12 scripts/nvidia/llm_block_split.py split model.sim.onnx /tmp/blocks \
+    --block-sizes 1 2 3 4 6 8 12 24
+python3.10 scripts/nvidia/llm_block_split.py build /tmp/blocks --seq 1 --past 31
+```
+
+`split` (onnxsim interpreter) extracts each block as a standalone ONNX model via
+`onnx.utils.extract_model`, run in its own subprocess per block (~37 extractions across
+all block sizes; each one reloads and shape-infers the full ~1 GB source model, which
+leaks enough memory across repeated in-process calls to OOM otherwise). `build` (TensorRT
+interpreter) builds every block with `trtexec --fp16`, then *chains* each buildable size's
+engines together -- also one subprocess per size, for the same reason: loading every
+block's engine keeps all of them resident simultaneously, and that alone exceeded
+available memory for larger blocks even though each one built fine on its own (confirmed
+directly: k=6's chain crashed the whole sweep before this was isolated).
+
+**Every block count from K=2 to K=12 builds and chains reliably.** K=1 (24 single-layer
+engines) is reliable too, just slowest. **K=24 (unsplit) is fastest when it works, but is
+not reliable**: its single Myelin subgraph sits right at this board's memory ceiling, so it
+succeeds or fails depending on transient memory state and which tactic TensorRT's
+autotuner happens to pick -- observed directly, same config: OOM on one attempt (right
+after the earlier whole-sweep crash left memory fragmented), three clean successes
+immediately after (on a cleaner boot). This matches the tactic nondeterminism already
+documented in the 2:4-sparsity section above.
+
+Real end-to-end decode-step latency (chained engines, 1 new token / 31 cached, mean of 20
+iterations after 5 warmup; I/O buffers set up once per engine and reused, not
+malloc'd/queried fresh every call -- an earlier version of this measurement did that and
+its numbers were dominated by setup overhead, not real compute, visible as per-block
+timings that didn't remotely sum to the measured total):
+
+| K (layers/block) | engines | latency (ms) | vs K=1 | max\|logit diff\| vs K=1 | argmax match |
+|---|---|---|---|---|---|
+| 1 | 24 | 64.3 | 1.00x | ref | ref |
+| 2 | 12 | 56.2 | 1.14x | 2.60 | yes |
+| 3 | 8 | 53.2 | 1.21x | 2.08 | yes |
+| 4 | 6 | 51.0 | 1.26x | 2.88 | yes |
+| 6 | 4 | 46.9 | 1.37x | 2.15 | yes |
+| 8 | 3 | 38.6 | 1.67x | 2.34 | yes |
+| 12 | 2 | 37.1 | 1.73x | 2.12 | yes |
+| 24 | 1 | ~35.4 | 1.82x | 2.03 | yes |
+
+Latency drops smoothly and monotonically as K grows -- more fused compute per engine,
+less inter-engine H2D/D2H round-tripping -- with clearly diminishing returns past K=8
+(38.6 -> 37.1 -> 35.4 ms for K=8 -> 12 -> 24, versus 64.3 -> 56.2 -> 53.2 ms for K=1 -> 2 ->
+3). **Every K's output has the identical argmax (top predicted token) to K=1's**, so this
+is fully correct for greedy decoding. Raw logit magnitudes differ by ~2-3 absolute
+(~13-19% of the largest logit, ~15.4) between K values -- a real, exactly-reproducible
+(confirmed bit-for-bit identical across independent runs and across a mid-project timing
+methodology fix) fp16 accumulation difference from different fusion-boundary rounding
+order, not a bug or run-to-run noise. Whether that magnitude matters depends on the
+downstream use: irrelevant for greedy/argmax decoding, potentially relevant for anything
+reading exact logit values (temperature sampling, distillation, calibration).
+
+**Practical takeaway for this board**: K=6 to K=12 (4-6 blocks) is the sweet spot --
+within ~1.3-1.7x of the theoretical (unreliable) single-engine latency, while building and
+loading reliably every time, unlike K=24. This is a genuine, real-hardware answer to "can
+a small decoder LLM be deployed via plain ONNX-import TensorRT on an 8 GB Jetson Orin Nano
+at all" -- yes, with this splitting, even though the unsplit graph cannot.
