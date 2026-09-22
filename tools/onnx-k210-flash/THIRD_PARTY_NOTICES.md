@@ -83,13 +83,16 @@ into the committed `.bin`.
 
 ## MaixPy-v1 and OpenMV (camera demo)
 
-`firmware/camera_demo/src/m5stickv.c` is not a copy of, but is derived from
-reading, [sipeed/MaixPy-v1](https://github.com/sipeed/MaixPy-v1) (released
-under MIT or Apache 2.0, at the reader's choice): the M5StickV pin map, the
-AXP192 register sequence (`components/boards/m5stick`), the ST7789 command
-sequence, panel offsets and M5StickV register tweaks (`components/drivers/lcd`,
-`projects/maixpy_m5stickv/builtin_py/_boot.py`), the DVP/interrupt setup
-(`components/micropython/port/src/omv/sensor.c`) and the
+`firmware/camera_demo/src/board_m5stickv.c` is not a copy of, but is derived
+from reading, [sipeed/MaixPy-v1](https://github.com/sipeed/MaixPy-v1)
+(released under MIT or Apache 2.0, at the reader's choice): the M5StickV pin
+map, the AXP192 register sequence (`components/boards/m5stick`), the ST7789
+command sequence, panel offsets and M5StickV register tweaks
+(`components/drivers/lcd`, `projects/maixpy_m5stickv/builtin_py/_boot.py`).
+
+`firmware/camera_demo/src/camera_ov7740.c` (the OV7740 camera driver, shared
+by both boards this demo supports) is likewise derived from MaixPy-v1's DVP/
+interrupt setup (`components/micropython/port/src/omv/sensor.c`) and the
 camera-through-hardware-I2C2 arrangement (`.../omv/cambus.c`).
 
 The OV7740 register table in that file (`ov7740_regs`) is OpenMV's default
@@ -101,3 +104,17 @@ This file is part of the OpenMV project.
 Copyright (c) 2013/2014 Ibrahim Abdelkader <i.abdalkader@gmail.com>
 This work is licensed under the MIT license, see the file LICENSE for details.
 ```
+
+`firmware/camera_demo/src/board_cube.c` (Maix Cube support -- work in
+progress, see `firmware/camera_demo/README.md`'s Cube status section) is
+derived from reading three independent Sipeed sources, cross-checked against
+each other rather than trusted singly: MaixPy-v1 (as above, plus
+`components/boards/config/cube.config.json` and `py_lcd.c`'s
+`DEV_CUBE_IPS_240x240` case), [sipeed/Maixduino](https://github.com/sipeed/Maixduino)
+(MIT-licensed -- `variants/sipeed_maix_cube/pins_arduino.h` and
+`cores/arduino/st7789.c`, whose octal-SPI command sequence this file's
+`board_lcd_init()`/`board_lcd_show()` matches directly), and the board's own
+schematic and the M1n module's own datasheet, both downloaded from
+dl.sipeed.com (Sipeed's own hardware documentation, not source code -- no
+license statement beyond Sipeed's copyright, used here only to confirm pin
+assignments already independently visible in the two source repos above).
