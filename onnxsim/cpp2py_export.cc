@@ -474,6 +474,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // of quantize_dynamic's separate MatMulInteger+Cast+Mul(+Add) node chain
   // -- see QuantizeDynamicMatMulIntegerToFloat in onnxsim.h. Pure graph
   // rewrite: no ModelExecutor or calibration data needed.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_dynamic_matmul_integer_to_float",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -487,12 +488,14 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Dynamically quantizes an existing "com.microsoft" Attention node (see
   // fuse_attention.h -- this does not fuse attention itself) into its
   // quantized counterpart, QAttention -- see QuantizeAttentionDynamic in
   // onnxsim.h. Pure graph rewrite: no ModelExecutor or calibration data
   // needed.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_attention_dynamic",
       [](const py::bytes& model_proto_bytes) -> py::bytes {
@@ -506,6 +509,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Dynamically quantizes MatMul/Gemm nodes whose weight is structurally
   // ternary ({-s, 0, +s} per output column, e.g. BitNet b1.58) into the same
@@ -3906,6 +3910,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // Lists the tensor names quantize_qoperator_softmax could quantize -- the
   // input and output of every qualifying Softmax node -- see
   // ListQOperatorSoftmaxQuantizableTensors in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "list_qoperator_softmax_quantizable_tensors",
       [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
@@ -3916,6 +3921,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return ListQOperatorSoftmaxQuantizableTensors(model);
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Statically (calibration-based) quantizes standalone Softmax into ONNX
   // Runtime's "com.microsoft" QLinearSoftmax contrib op -- needs a
@@ -3923,6 +3929,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // list_qoperator_softmax_quantizable_tensors) since this computes
   // directly in int8, with no float intermediate -- see
   // QuantizeQOperatorSoftmax in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_qoperator_softmax",
       [](const py::bytes& model_proto_bytes,
@@ -3938,10 +3945,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "activation_ranges"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Lists the tensor names quantize_qoperator_pool could quantize -- the
   // input and output of every qualifying AveragePool/GlobalAveragePool node
   // -- see ListQOperatorPoolQuantizableTensors in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "list_qoperator_pool_quantizable_tensors",
       [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
@@ -3952,6 +3961,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return ListQOperatorPoolQuantizableTensors(model);
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Statically (calibration-based) quantizes standalone AveragePool/
   // GlobalAveragePool into ONNX Runtime's "com.microsoft"
@@ -3960,6 +3970,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // list_qoperator_pool_quantizable_tensors) since these compute directly
   // in int8, with no float intermediate -- see QuantizeQOperatorPool in
   // onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_qoperator_pool",
       [](const py::bytes& model_proto_bytes,
@@ -3975,10 +3986,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "activation_ranges"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Lists the tensor names quantize_qoperator_where could quantize -- both
   // operands and the output of every qualifying Where node -- see
   // ListQOperatorWhereQuantizableTensors in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "list_qoperator_where_quantizable_tensors",
       [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
@@ -3989,6 +4002,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return ListQOperatorWhereQuantizableTensors(model);
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Statically (calibration-based) quantizes Where into ONNX Runtime's
   // "com.microsoft" QLinearWhere contrib op -- needs a calibrated range for
@@ -3996,6 +4010,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // list_qoperator_where_quantizable_tensors) since this computes directly
   // in int8, with no float intermediate -- see QuantizeQOperatorWhere in
   // onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_qoperator_where",
       [](const py::bytes& model_proto_bytes,
@@ -4011,10 +4026,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "activation_ranges"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Lists the tensor names quantize_qoperator_gemm could quantize -- the
   // activation and output of every qualifying Gemm node -- see
   // ListQOperatorGemmQuantizableTensors in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "list_qoperator_gemm_quantizable_tensors",
       [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
@@ -4025,6 +4042,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return ListQOperatorGemmQuantizableTensors(model);
       },
       "model_bytes"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Statically (calibration-based) quantizes Gemm into ONNX Runtime's
   // "com.microsoft" QGemm contrib op -- the fully-general analogue of
@@ -4033,6 +4051,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // own output (see list_qoperator_gemm_quantizable_tensors) since this
   // computes directly in int8, with no float intermediate -- see
   // QuantizeQOperatorGemm in onnxsim.h.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
   m.def(
       "quantize_qoperator_gemm",
       [](const py::bytes& model_proto_bytes,
@@ -4048,6 +4067,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "activation_ranges"_a);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
 
   // Converts every float32 weight (and, by default, every internal
   // activation) to float16 -- no calibration data needed, since float16 is

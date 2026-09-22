@@ -336,8 +336,11 @@ onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model);
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
 // attributes, non-float32 operands, an opset older than 11) are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeDynamicMatMulIntegerToFloat(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+
 
 // Dynamically quantizes an existing "com.microsoft" ``Attention`` node (see
 // ``passes/fuse_attention.h`` -- this does not fuse attention itself, it
@@ -359,7 +362,10 @@ onnx::ModelProto QuantizeDynamicMatMulIntegerToFloat(
 // ``Attention`` node, a non-constant or non-2-D weight, a non-float32
 // operand, an opset older than 11, or an uneven ``qkv_hidden_sizes`` split)
 // are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeAttentionDynamic(const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+
 
 // Dynamically quantizes every MatMul/"vanilla" Gemm whose constant weight is
 // *structurally ternary* -- every element of every output column is one of
@@ -2185,8 +2191,11 @@ onnx::ModelProto QuantizeQOperatorConcat(
 // ``model``: for every standalone Softmax node with exactly 1 float32 input
 // and a resolvable default-domain opset import, both the input's and the
 // node's own output's tensor names (two entries per qualifying node).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQOperatorSoftmaxQuantizableTensors(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+
 
 // Statically (calibration-based) quantizes every standalone Softmax node
 // whose input is float32, whose input name *and* whose own output name are
@@ -2213,18 +2222,24 @@ std::vector<std::string> ListQOperatorSoftmaxQuantizableTensors(
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match, or whose input/output have no entry in
 // ``activation_ranges``, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeQOperatorSoftmax(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+
 
 // Lists the tensor names ``QuantizeQOperatorPool`` could quantize in
 // ``model``: for every standalone AveragePool/GlobalAveragePool node with
 // exactly 1 float32 input and (for AveragePool) no ``dilations`` attribute,
 // both the input's and the node's own output's tensor names (two entries
 // per qualifying node).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQOperatorPoolQuantizableTensors(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+
 
 // Statically (calibration-based) quantizes every standalone AveragePool or
 // GlobalAveragePool node whose input is float32, whose input name *and*
@@ -2251,10 +2266,13 @@ std::vector<std::string> ListQOperatorPoolQuantizableTensors(
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match, or whose input/output have no entry in
 // ``activation_ranges``, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeQOperatorPool(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+
 
 // Lists the tensor names ``QuantizeQOperatorWhere`` could quantize in
 // ``model``: for every ``Where`` node whose two data operands (inputs 1
@@ -2263,8 +2281,11 @@ onnx::ModelProto QuantizeQOperatorPool(
 // ``ListQOperatorElementwiseQuantizableTensors``'s convention (no "weight"
 // role to distinguish, since neither operand is pre-quantized from its own
 // static values).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQOperatorWhereQuantizableTensors(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+
 
 // Statically (calibration-based) quantizes every ``Where`` node whose two
 // data operands are both non-constant float32 tensors, and whose two
@@ -2287,10 +2308,13 @@ std::vector<std::string> ListQOperatorWhereQuantizableTensors(
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match, or whose operands/output have no entry in
 // ``activation_ranges``, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeQOperatorWhere(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+
 
 // Lists the tensor names ``QuantizeQOperatorGemm`` could quantize in
 // ``model``: for every ``Gemm`` node whose weight B is a constant 2-D
@@ -2300,8 +2324,11 @@ onnx::ModelProto QuantizeQOperatorWhere(
 // quantized from their own static values, not calibrated, the same
 // "weight" role ``ListQuantizableActivations`` already treats Gemm/MatMul's
 // weight as elsewhere).
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 std::vector<std::string> ListQOperatorGemmQuantizableTensors(
     const onnx::ModelProto& model);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+
 
 // Statically (calibration-based) quantizes every ``Gemm`` node whose weight
 // B is a constant 2-D float32 tensor, whose bias C (if present) is a
@@ -2330,10 +2357,13 @@ std::vector<std::string> ListQOperatorGemmQuantizableTensors(
 // to a copy of ``model`` (which is left untouched) and returns the result.
 // Nodes that do not match, or whose activation/output have no entry in
 // ``activation_ranges``, are left as-is.
+#ifdef ONNXSIM_HAS_NON_CORE_FEATURES
 onnx::ModelProto QuantizeQOperatorGemm(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
+#endif  // ONNXSIM_HAS_NON_CORE_FEATURES
+
 
 // Converts every float32 weight (and, by default, every internal activation)
 // in ``model`` to float16 -- a different kind of "quantization" from every
