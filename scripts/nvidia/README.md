@@ -337,15 +337,12 @@ those dimensions at graph-run time become foldable constants outright. ORT CPU s
 load+run was also faster on the simplified model (1.9s vs 3.1s, one sample, not a
 controlled benchmark).
 
-**Could not complete a TensorRT engine build for either variant on this board** --
-this is a hardware/OS configuration limit, not an onnxsim or model-size issue at the ONNX
-graph level. TensorRT compiles this attention pattern as a single large fused ("Myelin")
-subgraph rather than decomposable layers, and its constant-weight staging buffer needs
+**Could not complete a TensorRT engine build for either variant on this board.**
+TensorRT compiles this attention pattern as a single large fused ("Myelin") subgraph
+rather than decomposable layers, and its constant-weight staging buffer needs
 **physically contiguous** GPU memory: the raw model requested a 988 MB contiguous
-allocation, the *simplified* model (fewer nodes, same weights) needed only 272 MB -- a
-real ~3.6x reduction from `simplify()` -- but this board's CMA (contiguous memory
-allocator) pool is capped at **256 MB total** (`CmaTotal` in `/proc/meminfo`; `CmaFree` was
-~86 MB at the time), so even the smaller request still fails:
+allocation, the *simplified* model (fewer nodes, same weights) needed only 272 MB at
+first -- a real ~3.6x reduction from `simplify()`:
 
 ```
 NvMapMemAllocInternalTagged: ... error 12
@@ -353,15 +350,35 @@ Error Code 1: Cuda Runtime (out of memory)
 Requested amount of GPU memory (272573440 bytes) could not be allocated.
 ```
 
-`--builderOptimizationLevel=1` and a smaller `--memPoolSize=workspace` made no difference
-(the failing allocation is the weights buffer, not workspace scratch). This is a Jetson
-kernel-boot-parameter limit (`cma=` in `/boot/extlinux/extlinux.conf`), commonly raised to
-1-2 GB for exactly this kind of workload -- **not changed here** since it needs `sudo` and
-a reboot of the user's machine. A dynamic-INT8 variant of the same model
+The board's CMA (contiguous memory allocator) pool -- `CmaTotal` in `/proc/meminfo` --
+was originally capped at **256 MB**, well under 272 MB. Raising it (`cma=` in
+`/boot/extlinux/extlinux.conf`, needs `sudo` + reboot) turned out to be more involved
+than a size fix, and **did not unblock the build**:
+
+- `cma=1024M` **failed to reserve at boot** (`dmesg`: `cma: Failed to reserve 1024 MiB`)
+  -- this board's physical memory layout has other fixed carveouts (framebuffer, VPR,
+  camera debug, PVA, ...) that a 1 GB contiguous request can't fit around -- leaving CMA
+  at **0 MB**, worse than the default.
+- `cma=512M` **did** reserve cleanly (`dmesg`: `cma: Reserved 512 MiB`, confirmed in
+  `/proc/meminfo`) -- but with CMA actually available, TensorRT's tactic autotuner
+  stopped picking the 272 MB strategy at all and consistently requested **988 MB**
+  instead (matching the raw model's original request almost exactly), which still
+  exceeds the 512 MB pool. `--noBuilderCache --noCompilationCache`,
+  `--builderOptimizationLevel=0/1/3`, and dropping the page cache before the build made
+  no difference -- this looks like a genuine TensorRT tactic-selection interaction with
+  CMA availability (a bigger contiguous pool makes a more memory-hungry fusion strategy
+  look viable to the cost model, which then doesn't fit either), not a simple
+  size-threshold problem. Not investigated further (would need TensorRT internals access
+  this write-up doesn't have); a CMA size between 256 MB and 512 MB, never tried, might
+  keep the cheaper tactic while still fitting it, but that needs another reboot per
+  attempt and was not pursued past this point.
+
+CMA was left at 512 MB (a reasonable general-purpose increase for future GPU work on
+this board) rather than reverted. A dynamic-INT8 variant of the same model
 (`model_int8.onnx`, `MatMulInteger`/`DynamicQuantizeLinear`) was fetched as a
 smaller-weights workaround attempt but not pursued: it is a substantially different graph
 shape (dynamic per-token activation quantization) that risks confounding TensorRT parser
-compatibility with the actual question, for uncertain payoff given the same CMA ceiling.
+compatibility with the actual question, for uncertain payoff given the same ceiling.
 
 **Takeaway**: on hardware with enough contiguous GPU memory, this would be worth finishing
 (TensorRT build/latency/correctness comparison, matching the CNN/ViT sections above).
