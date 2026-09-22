@@ -15,6 +15,7 @@ hand-built-graph tests in `tests/test_tensorrt_*.py` (which never invoke TensorR
 | `sparsity_check.py` | onnxsim (`gen`) then system Python with `tensorrt` (`trt`) | checks whether TensorRT's builder gives 2:4-pruned `MatMul`/`Gemm` weights sparse tactics |
 | `trt_nms_check.py` | onnxsim (`gen`), system Python with `tensorrt` (`trt`), any (`compare`) | differentially checks `rewrite_trt_batched_nms`'s output against the real `BatchedNMSDynamic_TRT` plugin |
 | `run_cuda_feature_notebook.py` | onnxsim + a GPU `onnxruntime` | runs `examples/cuda_feature_tests/cuda_feature_tests.ipynb`'s tests as a plain script |
+| `llm_pipeline.py` | onnxsim (Python >= 3.11) | pins shapes on a decoder-with-KV-cache LLM export and runs `simplify()` on it |
 
 They are split because JetPack 6's TensorRT Python bindings are cp310-only while onnxsim
 needs Python >= 3.11; models are exchanged as `.onnx` files.
@@ -305,4 +306,66 @@ multi-hour build disproportionate to this check). The script itself is unaffecte
 of this and should work as-is on a board where a GPU `onnxruntime` matching onnxsim's
 Python floor actually exists (e.g. an x86 box with `onnxruntime-gpu`, or a future JetPack
 release on CUDA 13).
+
+## Decoder LLM: Qwen2.5-0.5B-Instruct (KV cache, RoPE, GQA, RMSNorm)
+
+`scripts/nvidia/llm_pipeline.py` checks onnxsim on a real decoder-with-KV-cache export --
+a different shape of graph than any CNN/ViT above: RoPE and RMSNorm hand-decomposed into
+primitive ops, grouped-query attention (14 query heads sharing 2 KV heads), and 48
+`past_key_values.N.{key,value}` inputs / 48 `present.N.{key,value}` outputs alongside
+`input_ids`/`attention_mask`/`position_ids`. Model:
+[`onnx-community/Qwen2.5-0.5B-Instruct`](https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct)
+`onnx/model_fp16.onnx` (opset 14, IR 10, 2759 nodes, 24 layers, head_dim 64; no `If` node --
+`past_key_values` are required inputs, a length-0 cache standing in for prefill).
+
+```sh
+python3.12 scripts/nvidia/llm_pipeline.py model_fp16.onnx /tmp/llm --seq 1 --past 31   # decode step
+```
+
+Pinning `batch_size`/`sequence_length`/`past_sequence_length` to concrete values (batch 1,
+1 new token, 31 cached) and running `simplify()`:
+
+**2759 -> 1703 nodes (-38%)**, reproduced across two independent runs (bit-identical node
+counts and, per ORT CPU, bit-identical logits: `max_abs_diff = 0.0` between the raw and
+simplified fixed-shape models, argmax token matches). `RMSNorm`'s decomposition (`Pow`/
+`ReduceMean`/`Sqrt`/`Div`, 49 each) and RoPE's (`Neg`, 48) are **untouched** -- no fusion
+pass recognizes either pattern here -- so the whole reduction comes from constant-folding
+now-static shape/dtype bookkeeping (`Concat` 267 -> 96, `Expand` 54 -> 48, `Cast` 99 -> 98):
+once every KV-cache dimension is a fixed number instead of a symbolic
+`past_sequence_length`, the `Shape`/`Gather`/`Range`/`Where`/`Concat` chains that computed
+those dimensions at graph-run time become foldable constants outright. ORT CPU session
+load+run was also faster on the simplified model (1.9s vs 3.1s, one sample, not a
+controlled benchmark).
+
+**Could not complete a TensorRT engine build for either variant on this board** --
+this is a hardware/OS configuration limit, not an onnxsim or model-size issue at the ONNX
+graph level. TensorRT compiles this attention pattern as a single large fused ("Myelin")
+subgraph rather than decomposable layers, and its constant-weight staging buffer needs
+**physically contiguous** GPU memory: the raw model requested a 988 MB contiguous
+allocation, the *simplified* model (fewer nodes, same weights) needed only 272 MB -- a
+real ~3.6x reduction from `simplify()` -- but this board's CMA (contiguous memory
+allocator) pool is capped at **256 MB total** (`CmaTotal` in `/proc/meminfo`; `CmaFree` was
+~86 MB at the time), so even the smaller request still fails:
+
+```
+NvMapMemAllocInternalTagged: ... error 12
+Error Code 1: Cuda Runtime (out of memory)
+Requested amount of GPU memory (272573440 bytes) could not be allocated.
+```
+
+`--builderOptimizationLevel=1` and a smaller `--memPoolSize=workspace` made no difference
+(the failing allocation is the weights buffer, not workspace scratch). This is a Jetson
+kernel-boot-parameter limit (`cma=` in `/boot/extlinux/extlinux.conf`), commonly raised to
+1-2 GB for exactly this kind of workload -- **not changed here** since it needs `sudo` and
+a reboot of the user's machine. A dynamic-INT8 variant of the same model
+(`model_int8.onnx`, `MatMulInteger`/`DynamicQuantizeLinear`) was fetched as a
+smaller-weights workaround attempt but not pursued: it is a substantially different graph
+shape (dynamic per-token activation quantization) that risks confounding TensorRT parser
+compatibility with the actual question, for uncertain payoff given the same CMA ceiling.
+
+**Takeaway**: on hardware with enough contiguous GPU memory, this would be worth finishing
+(TensorRT build/latency/correctness comparison, matching the CNN/ViT sections above).
+Here, the graph-level finding stands on its own: `simplify()` is exact and shrinks a real
+decoder LLM export by more than a third, entirely by folding now-static KV-cache shape
+arithmetic, without touching (or needing to touch) RoPE/RMSNorm/GQA at all.
 
