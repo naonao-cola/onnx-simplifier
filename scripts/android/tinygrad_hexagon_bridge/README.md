@@ -1536,3 +1536,7 @@ when candidates differ only in raw compute-instruction mix with comparable worki
   interface, a native ARM64 client using only `libcdsprpc.so`, verified end to end on real
   hardware. See "Removing TVM as a transport dependency" above; `native_transport/build.sh`
   reproduces the whole pipeline from source.
+- `dynamic_ops_survey.md` -- a planning document (no kernel code) surveying whether the dynamic-
+  shape ops in Mask R-CNN's `rest.onnx` (proposal decode, TopK, NonMaxSuppression, RoiAlign) could
+  be ported to hand-written HVX kernels, with real shapes/dtypes/constants pulled from the actual
+  graph and a ranked, honest difficulty assessment per op.
