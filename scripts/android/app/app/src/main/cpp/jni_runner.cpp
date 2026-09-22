@@ -205,8 +205,6 @@ Java_org_onnxsim_androidtest_MainActivity_runModel(JNIEnv* env, jclass,
         if (target == "qnn-htp-fallback") {
           qnn_options["profiling_level"] = "optrace";
           qnn_options["profiling_file_path"] = output_file_path + ".optrace.csv";
-          options.AddConfigEntry("ep.context_enable", "1");
-          options.AddConfigEntry("ep.context_embed_mode", "0");
         }
       }
       options.AppendExecutionProvider_V2(ort_env, qnn_devices, qnn_options);
@@ -226,13 +224,22 @@ Java_org_onnxsim_androidtest_MainActivity_runModel(JNIEnv* env, jclass,
     const auto run_one = [&](const std::string& model, Ort::SessionOptions& run_options) {
       std::unique_ptr<Ort::Session> session;
       if (target == "qnn-htp-fallback" && &run_options == &options) {
+        // Generate an EP-context ("compiled") model via the dedicated Compile API (ORT >= 1.22,
+        // OrtCompileApi / Ort::CompileModel). The older `ep.context_enable` session config entry
+        // (designed for statically-registered EPs) is silently ignored here: constructing a plain
+        // Ort::Session with that config entry set on a plugin-EP registered via
+        // AppendExecutionProvider_V2 does not throw, but also never writes the context file --
+        // this was the root cause of "Load model from .../original.onnx.ctx.onnx failed: File
+        // doesn't exist." (see scripts/android/htp_exploration/ondevice_findings.md).
         const auto context_path = model + ".ctx.onnx";
-        run_options.AddConfigEntry("ep.context_file_path", context_path.c_str());
-        run_options.AddConfigEntry("ep.context_enable", "1");
-        {
-          Ort::Session context_session(ort_env, model.c_str(), run_options);
+        Ort::ModelCompilationOptions compile_options(ort_env, run_options);
+        compile_options.SetInputModelPath(model.c_str());
+        compile_options.SetOutputModelPath(context_path.c_str());
+        compile_options.SetEpContextEmbedMode(false);
+        Ort::Status compile_status = Ort::CompileModel(ort_env, compile_options);
+        if (!compile_status.IsOK()) {
+          throw std::runtime_error("CompileModel failed: " + compile_status.GetErrorMessage());
         }
-        run_options.AddConfigEntry("ep.context_enable", "0");
         session = std::make_unique<Ort::Session>(ort_env, context_path.c_str(), run_options);
       } else {
         session = std::make_unique<Ort::Session>(ort_env, model.c_str(), run_options);

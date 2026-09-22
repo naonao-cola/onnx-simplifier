@@ -4,6 +4,8 @@
         android:label="onnxsim device test"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+        <uses-native-library android:name="libQnnHtp.so" android:required="false" />
+        <uses-native-library android:name="libQnnHtpV69Stub.so" android:required="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true">
