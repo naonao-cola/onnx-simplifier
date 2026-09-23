@@ -42,8 +42,11 @@ def pieces(name, ckpt):
     img_net, head = M.load_official(ckpt)
     if name == "img":
         return ImgNHWC(img_net).eval(), ["img"], ["feat"], lambda z: {"img": D.normalize(z["img_u8"])}
-    return M.HeadCore(head).eval(), HEAD_IN, ["cls", "reg", "dec"], \
-        lambda z: {k: torch.from_numpy(z[k]) for k in HEAD_IN}
+    core = M.HeadCore(head).eval()
+    for layer in core.h.decoder_layers:  # headT: cross-attention transposed; headTT: self-attention too
+        layer.attentions[1].attn.transposed = name in ("headT", "headTT")
+        layer.attentions[0].attn.transposed = name == "headTT"
+    return core, HEAD_IN, ["cls", "reg", "dec"], lambda z: {k: torch.from_numpy(z[k]) for k in HEAD_IN}
 
 
 def compare(sess, mod, inputs, label):
@@ -60,7 +63,7 @@ def compare(sess, mod, inputs, label):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("piece", choices=["img", "head"])
+    ap.add_argument("piece", choices=["img", "head", "headT", "headTT"])
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--work", required=True)
     ap.add_argument("--frame", default="scene-0103/3")

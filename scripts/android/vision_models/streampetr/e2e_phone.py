@@ -95,6 +95,7 @@ def main():
     ap.add_argument("--head", default="head.sim")
     ap.add_argument("--scene", default="scene-0103")
     ap.add_argument("--thr", type=float, nargs="+", default=[0.3, 0.2])
+    ap.add_argument("--iters", type=int, default=1, help="runs per phone call (>= 3 prints medians)")
     a = ap.parse_args()
     torch.set_grad_enabled(False)
     work = Path(a.work)
@@ -105,15 +106,16 @@ def main():
     frames = sorted((work / "frames" / a.scene).glob("*.npz"), key=lambda p: int(p.stem))
     tot = {t: [0, 0, 0] for t in a.thr}
     ref_tot = {t: [0, 0, 0] for t in a.thr}
+    ms_all = []
     for i, fp in enumerate(frames):
         z = np.load(fp)
         t = M.to_torch({k: z[k] for k in ("lidar2img", "intrinsics", "ego_pose", "ego_pose_inv")} | {"timestamp": float(z["timestamp"])})
         prev = bool(z["prev"])
         gt = list(zip(z["gt_names"].tolist(), z["gt_xyz"]))
-        (feat,), ms_img = phone(work, a.img, {"img": D.normalize(z["img_u8"]).numpy()})
+        (feat,), ms_img = phone(work, a.img, {"img": D.normalize(z["img_u8"]).numpy()}, a.iters)
         feat_t = torch.from_numpy(feat.reshape(-1, M.EMBED))
         ins = {"feat": feat_t, **host.rig_inputs(t), **host.pre(t, prev)}
-        (cls, reg, dec), ms_head = phone(work, a.head, {k: v.numpy() for k, v in ins.items()})
+        (cls, reg, dec), ms_head = phone(work, a.head, {k: v.numpy() for k, v in ins.items()}, a.iters)
         cls, box = host.post(t, torch.from_numpy(cls), torch.from_numpy(reg), torch.from_numpy(dec))
         # fp32 torch chain on the torch features (validate.py's dump) for the same frame
         r_ins = {"feat": torch.from_numpy(z["feat"]), **ref_host.rig_inputs(t), **ref_host.pre(t, prev)}
@@ -129,7 +131,12 @@ def main():
             rr = D.match(rb, rs, rl, gt, thr=thr)
             ref_tot[thr] = [x + y for x, y in zip(ref_tot[thr], rr)]
             line += f" | @{thr} phone {r[0]}/{r[2]} torch {rr[0]}/{rr[2]}"
+        ms_all += [ms_img, ms_head]
         print(line, flush=True)
+    ms = [x for x in ms_all if x == x]
+    if ms:
+        print(f"median over frames: img {np.median([x for x in ms_all[0::2] if x == x]):.2f} ms, "
+              f"head {np.median([x for x in ms_all[1::2] if x == x]):.2f} ms")
     for thr in a.thr:
         print(f"total @{thr}: phone {tot[thr][0]}/{tot[thr][2]} (pred {tot[thr][1]}), "
               f"fp32 torch {ref_tot[thr][0]}/{ref_tot[thr][2]} (pred {ref_tot[thr][1]})")

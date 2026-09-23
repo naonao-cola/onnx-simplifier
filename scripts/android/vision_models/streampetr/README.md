@@ -20,7 +20,11 @@ NuImages-pretrained, 60 epochs (NDS 54.6 / mAP 44.9 on nuScenes val upstream):
 | `model.py` | plain-PyTorch rebuild: ResNet-50 + CPFPN, `load_official()` name map; `UpstreamHead` (literal transcription of the head + memory queue) and the deployment split `HeadCore` (HTP) + `HostState` (CPU) |
 | `validate.py` | runs both head paths on the same features over a scene, diffs them, matches GT; dumps per-frame inputs/outputs for export and the phone |
 | `export.py` | `img` / `head` pieces -> ONNX (opset 17) -> ORT CPU check -> onnxsim; phone inputs + torch references |
-| `e2e_phone.py` | both pieces on the HTP frame after frame (phone outputs feed the host memory queue), vs the fp32 torch chain and GT |
+| `e2e_phone.py` | both pieces on the HTP frame after frame (phone outputs feed the host memory queue), vs the fp32 torch chain and GT; quantized I/O through `<piece>.json` |
+| `quantize.py` | `onnxsim.full_qdq` whole-graph QDQ (uint8 or uint16 activations, int8 per-channel weights) + `quantized_io`, calibrated on 4 scenes x 6 frames disjoint from scene-0103 |
+| `sensitivity.py` | host (ORT CPU, no QDQ fusion) per-op-type quantization sensitivity of the head, teacher-forced on scene-0103 |
+| `tf_phone.py` | the same teacher-forced head check on the phone's HTP |
+| `profile_ops.py` | per-op-type share of an HTP execute from a QNN detailed-profiling CSV (copy of `../bevformer_tiny/`'s) |
 
 ## Deployment split
 
@@ -54,6 +58,32 @@ Phone latency (strict all-HTP, QNN EP via ORT, `partition_report.sh`, 0 refused 
 | image (6 x R50 + CPFPN, 256x704) | 55.6 ms |
 | head (6-layer decoder, 428 queries x 4224 tokens) | 29.9 ms |
 | frame (sum) | 85.5 ms (11.7 FPS) |
+
+### int8
+
+Chained on the phone, scene-0103 x 6 (latency: median over the frames' phone calls):
+
+| image piece | head piece | image ms | head ms | frame | GT @0.3 | GT @0.2 |
+|---|---|---|---|---|---|---|
+| fp16 | fp16 | 55.6 | 29.9 | 85.5 ms | 106 | 151 |
+| **int8 (uint8 NHWC in/out)** | **fp16** | **8.7** | **29.8** | **38.5 ms (26 FPS)** | **111** | **148** |
+| fp16 | W8A16 (uint16 act.) | 54.8 | 23.6 | 78.4 ms | 92 | 138 |
+| int8 | int8 | 8.7 | 17.7 | 26.4 ms | 50 | 102 |
+| (fp32 torch chain) | | | | | 105 | 149 |
+
+* **image piece**: int8 whole-graph QDQ takes it from 55.6 to 8.7 ms at no accuracy cost (feature
+  cos 0.995 vs fp32; 111/148 GT vs fp32's 105/149). Its uint8 output and the int8 head's uint8
+  `feat` input calibrate to the same scale / zero point, so the bytes could pass through as-is.
+* **head piece**: quantization is where the accuracy goes. On the host (ORT CPU, `sensitivity.py`)
+  the W8A16 head is near exact, teacher-forced worst cos cls 0.99998 / reg 0.9988 / dec 0.9998;
+  on the HTP the *same* QDQ graph gives cls 0.998 / reg 0.83 / dec 0.97 (`tf_phone.py`), so the loss
+  is the HTP's uint16 execution of some op, not the quantization choice.
+* fp16 head profile (QNN detailed profiling): MatMul 78% -- the cross-attention `A @ V`
+  ((8, 428, 4224) x (8, 4224, 32)) alone is 10.1% per layer, 60% of the head, for 0.46 GMAC per
+  layer; Softmax shows 0% (fused into it). An exact transposed formulation (scores^T, softmax over
+  the key axis, V^T A^T with a 428-wide output) is 5x *slower* on the HTP (143 ms): QNN's softmax
+  over a non-last axis. fp16 image profile: the 7x7 stem conv on 3 channels 21.7%, MaxPool 9.3%,
+  unfused Relus 16% (they fold into the int8 quantization).
 
 fp16 on the phone vs the fp32 chain: frame 0 (empty memory) cls cos 0.99999, boxes 0.99998. From
 frame 1 on, per-row cosines drop to ~0.99 / 0.82 because the 128 propagated query rows are ordered
