@@ -22,7 +22,6 @@ final class OverlayView extends View {
     private final Paint labelBg = new Paint();
     private final Paint statsBg = new Paint();
     private final Paint maskPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
-    private final Bitmap maskBmp = Bitmap.createBitmap(28, 28, Bitmap.Config.ARGB_8888);
     private final int[] maskPx = new int[784];
 
     OverlayView(Context c) {
@@ -67,8 +66,11 @@ final class OverlayView extends View {
                 float x2 = ox + r.boxes[4 * i + 2] * sc, y2 = oy + r.boxes[4 * i + 3] * sc;
                 int rgb = col & 0x00FFFFFF;
                 for (int k = 0; k < 784; k++) maskPx[k] = r.masks[784 * i + k] > 0.5f ? (0x80000000 | rgb) : 0;
-                maskBmp.setPixels(maskPx, 0, 28, 0, 0, 28, 28);
-                cv.drawBitmap(maskBmp, null, new RectF(x1, y1, x2, y2), maskPaint);
+                // A fresh bitmap per detection: a hardware canvas records draws and uploads bitmap
+                // contents at render time, so reusing one mutable bitmap would paint every box with
+                // the last detection's mask.
+                Bitmap m = Bitmap.createBitmap(maskPx, 28, 28, Bitmap.Config.ARGB_8888);
+                cv.drawBitmap(m, null, new RectF(x1, y1, x2, y2), maskPaint);
                 boxPaint.setColor(col);
                 cv.drawRect(x1, y1, x2, y2, boxPaint);
                 String t = Coco.name(r.labels[i]) + String.format(" %.2f", r.scores[i]);

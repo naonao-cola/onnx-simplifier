@@ -36,9 +36,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Live Mask R-CNN on the phone. Two modes (intent extra "mode"): "camera" (default; back camera via
  * Camera2 into a small TextureView preview, latest frame wins) and "images" (loops over the JPEGs in
- * <external files>/imgs). Intent extra "pipe" picks the pipeline file (default pipe_e_opt.txt;
+ * <files>/imgs). Intent extra "pipe" picks the pipeline file (default pipe_e_opt.txt;
  * pipe_e_opt_ctx.txt loads HTP sessions from EP-context models). Models live in
- * <external files>/models (pushed by deploy.sh).
+ * <app internal files>/models (copied in by deploy.sh via run-as).
  */
 public class MainActivity extends Activity {
     private static final String TAG = "MaskRcnnDemo";
@@ -75,7 +75,7 @@ public class MainActivity extends Activity {
     }
 
     private void runLoop(boolean cameraMode, String pipe) {
-        File models = new File(getExternalFilesDir(null), "models");
+        File models = new File(getFilesDir(), "models");
         overlay.setStats("loading models (" + pipe + ")...");
         long t0 = System.nanoTime();
         String err = Engine.nativeInit(models.getAbsolutePath(), getApplicationInfo().nativeLibraryDir,
@@ -89,11 +89,11 @@ public class MainActivity extends Activity {
         Log.i(TAG, String.format(Locale.US, "init ok in %.0f ms (%s)", initMs, pipe));
         List<File> images = new ArrayList<>();
         if (!cameraMode) {
-            File[] fs = new File(getExternalFilesDir(null), "imgs").listFiles();
+            File[] fs = new File(getFilesDir(), "imgs").listFiles();
             if (fs != null) for (File f : fs) if (f.getName().endsWith(".jpg")) images.add(f);
             Collections.sort(images);
             if (images.isEmpty()) {
-                overlay.setStats("no images in " + new File(getExternalFilesDir(null), "imgs"));
+                overlay.setStats("no images in " + new File(getFilesDir(), "imgs"));
                 return;
             }
         } else {

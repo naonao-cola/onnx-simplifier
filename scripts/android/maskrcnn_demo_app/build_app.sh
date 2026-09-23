@@ -1,6 +1,8 @@
 #!/bin/bash
 # Build the Mask R-CNN demo APK.
 #   HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... ANDROID_HOME=~/android-sdk ./build_app.sh
+# Heavy (gradle, ~1.7 GB peak); on a shared machine run it capped, e.g.
+#   systemd-run --user --wait --collect --pipe -p MemoryMax=12G -p MemorySwapMax=0 ./build_app.sh
 # 1. ORT + QNN EP + Qualcomm QNN runtime libs (Maven Central) via ../htp_exploration/qnn_shell/fetch_libs.sh
 # 2. the two Hexagon FastRPC skels + their ARM stubs, built by ../e2e_pipeline/build.sh (BUILD_ONLY)
 # 3. native/maskrcnn_engine.cpp (includes ../e2e_pipeline/e2e_run.cpp) -> libmaskrcnn_demo.so
@@ -30,5 +32,5 @@ cp "$B/e2e/rpn_fused/rpn_rpc.so" "$J/librpn_rpc.so"      # jniLibs must be lib*.
 cp "$B/e2e/roi/roialign_rpc.so" "$J/libroialign_rpc.so"
 printf 'sdk.dir=%s\n' "$ANDROID_HOME" > "$HERE/local.properties"
 GRADLE="${GRADLE:-$(ls -d "$HOME"/.gradle/wrapper/dists/gradle-*-bin/*/gradle-*/bin/gradle 2>/dev/null | tail -1)}"
-ANDROID_HOME="$ANDROID_HOME" "${GRADLE:-gradle}" --offline -q -p "$HERE" assembleDebug
+ANDROID_HOME="$ANDROID_HOME" "${GRADLE:-gradle}" --offline --no-daemon --max-workers=4 -q -p "$HERE" assembleDebug
 ls -la "$HERE/app/build/outputs/apk/debug/"*.apk

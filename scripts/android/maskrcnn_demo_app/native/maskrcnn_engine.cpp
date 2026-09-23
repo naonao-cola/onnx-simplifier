@@ -9,6 +9,7 @@
 #undef main
 
 #include <android/bitmap.h>
+#include <cerrno>
 #include <android/log.h>
 #include <dlfcn.h>
 #include <jni.h>
@@ -68,7 +69,7 @@ int init(const std::string& model_dir, const std::string& lib_dir, const std::st
   // first FastRPC session opens.
   std::string adsp = lib_dir + ";/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp";
   setenv("ADSP_LIBRARY_PATH", adsp.c_str(), 1);
-  if (chdir(model_dir.c_str())) throw std::runtime_error("chdir " + model_dir);
+  if (chdir(model_dir.c_str())) throw std::runtime_error("chdir " + model_dir + ": " + strerror(errno));
   struct remote_rpc_control_unsigned_module up = {CDSP_DOMAIN_ID, 1};
   int urc = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &up, sizeof up);
   LOGI("unsigned PD request rc=%d", urc);
@@ -79,7 +80,7 @@ int init(const std::string& model_dir, const std::string& lib_dir, const std::st
   env = std::make_unique<Ort::Env>(to, ORT_LOGGING_LEVEL_WARNING, "demo");
 
   std::ifstream pf(pipe);
-  if (!pf) throw std::runtime_error("cannot open " + pipe);
+  if (!pf) throw std::runtime_error("cannot open " + pipe + ": " + strerror(errno));
   std::string line;
   bool need_htp = false, need_rpn = false, need_roi = false;
   while (std::getline(pf, line)) {
@@ -96,6 +97,18 @@ int init(const std::string& model_dir, const std::string& lib_dir, const std::st
     need_roi |= S->op == "roialign";
     g_steps.push_back(std::move(S));
   }
+  std::string missing;
+  for (auto& S : g_steps) {
+    std::vector<std::string> files;
+    if (S->op == "ort") files.push_back(S->f[2]);
+    if (S->op == "ortpad")
+      for (auto& e : split(S->f[5], ',')) files.push_back(e.substr(e.find(':') + 1));
+    for (auto& f : files)
+      if (access(f.c_str(), R_OK)) missing += " " + f + " (" + strerror(errno) + ")";
+  }
+  for (const char* f : {"levels.txt", "model.txt"})
+    if (access(f, R_OK)) missing += std::string(" ") + f + " (" + strerror(errno) + ")";
+  if (!missing.empty()) throw std::runtime_error("model files not readable in " + model_dir + ":" + missing);
   if (g_steps.empty() || g_steps[0]->op != "quant_in") throw std::runtime_error("pipe must start with quant_in");
   if (need_htp) {
     std::string ep = lib_dir + "/libonnxruntime_providers_qnn.so";
