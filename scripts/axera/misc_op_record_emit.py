@@ -48,8 +48,18 @@ not cover raises ``ValueError``:
   the dequantize ``0x1b10`` write;
 * a ReduceSum ``0x1a90`` write that would equal the register's current value,
   which was never observed;
-* a zero-point change that adds or removes records overall. It was measured
-  only as a net-zero move.
+* a segment whose records do not end in the ``0xa2`` terminator plus 0..3
+  zero pad records (the padding rule below would be ambiguous).
+
+A zero-point change may also add or remove records overall: with ``zp_y = 0``
+the output stage's ``0x1b10 = 0`` write (and, on a later tile, the requantize
+``0x1b10 = zp_y`` write) is elided because the register already holds 0. The
+emitter applies the same elision rule and re-pads the segment: every
+decompressed segment is a whole number of 4-record (32-byte) groups, filled
+with all-zero records after the ``0xa2`` terminator. Some multi-axis
+ReduceSum programs also write ``zp_x`` packed into all four bytes
+(``zp_x * 0x01010101``) on eight lanes ``0x0d30..0x0da0``; those are
+rewritten with the zero points.
 """
 
 from __future__ import annotations
@@ -74,13 +84,17 @@ import short_unit_codec as suc  # noqa: E402
 RECORD = suc.RECORD
 LANES = 8
 LANE_BASES = (0x0F50, 0x0FD0)
+ZP_PACKED_BASE = 0x0D30  # zp_x in all four bytes, eight lanes (multi-axis ReduceSum)
+PAD_GROUP = 4  # decompressed segments are padded to whole 4-record groups
+TERMINATOR = 0xA2
 ZP_ACC = 0x1A90
 ZP_IN = 0x1B10
 FIXTURES = os.path.join(_HERE, "fixtures")
 TEMPLATE_INDEX = os.path.join(FIXTURES, "misc_op_record_emit", "index.json")
 # segment 0's slot-table records that differ between otherwise identical builds
 SEG0_NOISE = range(2, 6)
-OPS = ("ReduceSum", "Sqrt", "GreaterCast")
+OPS = ("ReduceSum", "Sqrt", "GreaterCast", "LessCast")
+CALIBRATION_FREE = ("GreaterCast", "LessCast")
 
 
 def _f32(x: float) -> float:
@@ -232,6 +246,30 @@ def _retarget_reducesum_zps(words, kinds, old_zp, new_zp) -> list[bytes]:
     return out
 
 
+def _pad_count(words) -> int:
+    """Trailing all-zero pad records after the ``0xa2`` terminator."""
+    n = 0
+    while n < len(words) and words[-1 - n] == bytes(RECORD):
+        n += 1
+    if n >= PAD_GROUP or n == len(words) or words[-1 - n][0] != TERMINATOR:
+        raise ValueError("segment does not end in a terminator plus 0..3 pad records")
+    return n
+
+
+def _retarget_packed_zp(words, old_zx: int, new_zx: int) -> list[bytes]:
+    """Rewrite the eight ``0x0d30..0x0da0`` lanes holding ``zp_x`` in every byte."""
+    old_v, new_v = old_zx * 0x01010101, new_zx * 0x01010101
+    out = list(words)
+    for i in range(len(words) - LANES + 1):
+        run = words[i : i + LANES]
+        if [_reg(w) for w in run] == [ZP_PACKED_BASE + 0x10 * k for k in range(LANES)]:
+            if any(_val(w) != old_v for w in run):
+                raise ValueError("0x0d30 lanes do not hold the template's packed zp_x")
+            for j in range(i, i + LANES):
+                out[j] = _with_val(out[j], new_v)
+    return out
+
+
 def _zp_in_word(words) -> bytes:
     """A ``0x1b10`` record of the stream's own verb/unit, value to be set."""
     for w in words:
@@ -268,12 +306,10 @@ def retarget(
             continue
         found += len(kinds)
         if op == "ReduceSum" and old_zp:
-            new = _retarget_reducesum_zps(new, kinds, old_zp, new_zp)
-            if len(new) != len(words):
-                raise ValueError(
-                    "zero-point change adds or removes records; only net-zero "
-                    "moves are measured"
-                )
+            pad = _pad_count(words)
+            new = _retarget_reducesum_zps(new[: len(new) - pad], kinds, old_zp, new_zp)
+            new = _retarget_packed_zp(new, int(old_zp["x"]), int(new_zp["x"]))
+            new += [bytes(RECORD)] * (-len(new) % PAD_GROUP)
         new_raw = b"".join(new)
         if new_raw != raw:
             mc = bose.relayout_segment(mc, si, new_raw)
@@ -313,11 +349,11 @@ def emit_model(
 ) -> onnx.ModelProto:
     """A compiled model for template ``key`` at the given calibration.
 
-    Greater -> Cast takes no calibration: its template is returned as built."""
+    Greater/Less -> Cast takes no calibration: its template is returned as built."""
     model, meta = load_template(key, index_path)
-    if meta["op"] == "GreaterCast":
+    if meta["op"] in CALIBRATION_FREE:
         if scales or zero_points:
-            raise ValueError("Greater -> Cast is not quantized; no calibration")
+            raise ValueError(f"{meta['op']} is not quantized; no calibration")
         return model
     init = mcode_initializer(model)
     init.raw_data = retarget(

@@ -39,6 +39,86 @@
    "y": 0
   }
  },
+ "misc_op_step_templates/ReduceSum_16x1000_axes0-1_k1.axmodel.gz": {
+  "scales": {
+   "x": 0.03294731304049492,
+   "y": 0.5929204225540161
+  },
+  "zero_points": {
+   "x": 129,
+   "y": 224
+  }
+ },
+ "misc_op_step_templates/ReduceSum_16x1000_axes0-1_k1__v2.axmodel.gz": {
+  "scales": {
+   "x": 0.01517077162861824,
+   "y": 6.353445053100586
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 0
+  }
+ },
+ "misc_op_step_templates/ReduceSum_16x1x128x784_axes0-3_k0.axmodel.gz": {
+  "scales": {
+   "x": 0.04104521870613098,
+   "y": 3.273888111114502
+  },
+  "zero_points": {
+   "x": 127,
+   "y": 143
+  }
+ },
+ "misc_op_step_templates/ReduceSum_16x1x128x784_axes0-3_k0__v2.axmodel.gz": {
+  "scales": {
+   "x": 0.016551097854971886,
+   "y": 5.426578521728516
+  },
+  "zero_points": {
+   "x": 118,
+   "y": 0
+  }
+ },
+ "misc_op_step_templates/ReduceSum_16x1x512x4608_axes0_k0.axmodel.gz": {
+  "scales": {
+   "x": 0.04370495676994324,
+   "y": 0.15959036350250244
+  },
+  "zero_points": {
+   "x": 123,
+   "y": 130
+  }
+ },
+ "misc_op_step_templates/ReduceSum_16x1x512x4608_axes0_k0__v2.axmodel.gz": {
+  "scales": {
+   "x": 0.01783638447523117,
+   "y": 0.06516174226999283
+  },
+  "zero_points": {
+   "x": 120,
+   "y": 110
+  }
+ },
+ "misc_op_step_templates/ReduceSum_16x1x64x147_axes0_k0.axmodel.gz": {
+  "scales": {
+   "x": 0.03972519189119339,
+   "y": 0.13025009632110596
+  },
+  "zero_points": {
+   "x": 130,
+   "y": 121
+  }
+ },
+ "misc_op_step_templates/ReduceSum_16x1x64x147_axes0_k0__v2.axmodel.gz": {
+  "scales": {
+   "x": 0.01633611135184765,
+   "y": 0.05107911676168442
+  },
+  "zero_points": {
+   "x": 120,
+   "y": 93
+  }
+ },
  "teng_register_census/reducesum_asym.axmodel.gz": {
   "scales": {
    "x": 0.007843137718737125,

@@ -62,9 +62,23 @@ Refused (`ValueError`):
 
 - `zp_x = 0`, because an omitted dequantize `0x1b10` write was never observed;
 - a `0x1a90` write that would equal the register's current value;
-- a zero-point change that adds or removes records overall. Only a net-zero move was
-  measured. The real step's calibrations, where `zp_y != zp_x` and `zp_y != 0`, are in
-  the same class as templates a to d, so this doesn't bind there.
+- a segment that doesn't end in the `0xa2` terminator plus 0 to 3 zero pad records.
+
+**Record-count changes (added after the step-shape builds).** With `zp_y = 0` the elision
+rule removes records overall: the output stage's `0x1b10 = 0` write goes (the requantize
+stage already left 0 there), and on a tiled program the next tile's requantize
+`0x1b10 = zp_y` write goes too. `[16,1000]` axes (0,1) loses 1 record and
+`[16,1,128,784]` axes (0,3) (2 tiles) loses 4. Pulsar2 then re-pads the segment: every
+decompressed segment is a whole number of 4-record (32-byte) groups, with all-zero
+records after the `0xa2` terminator (0 to 3 of them in every one of 20 ReduceSum builds).
+The emitter strips the pad, applies the same state machine, and re-pads. Both pairs (step
+calibration ↔ `zp_y = 0`) reproduce the other build record for record in both
+directions.
+
+**Packed `zp_x` lanes.** Multi-axis programs (`[16,1000]` axes (0,1), `[16,1,256,196]`
+and `[16,1,512,49]` axes (0,3)) also write `zp_x * 0x01010101` (the zero point in all
+four bytes) on eight lanes `0x0d30..0x0da0`. The emitter rewrites them with the zero
+points, and refuses if those lanes don't hold the template's own packed `zp_x`.
 
 ## Sqrt [512,512,3,3]
 
@@ -96,10 +110,10 @@ Run `python scripts/axera/misc_op_record_emit.py step.onnx` for the report.
 | op | nodes | covered now | still needs |
 | --- | --- | --- | --- |
 | Sqrt | 42 | 42 (39 via `elementwise_scale_emit`, 3 here) | -- |
-| ReduceSum | 44 | 11: `[16,1,64,576]` ax0 ×4, `[16,1,64,3136]` ax(0,3) ×4, `[16,1000]` ax0 k1 ×1, ax1 k1 ×2 | 17 shapes, batches C to E |
-| Greater | 18 | 0 | batches A and B |
-| Cast | 19 | 0 (each one follows a Greater or Less) | batches A and B |
-| Less | 1 | 0 | batch B |
+| ReduceSum | 44 | 43 | `[16,1,64,12544]` axes (0,3): Pulsar2 can't compile it standalone (below) |
+| Greater | 18 | 18 | -- |
+| Cast | 19 | 19 (each one follows a Greater or Less) | -- |
+| Less | 1 | 1 | -- |
 
 Tail ops. None of these has an emitter or a build at a step shape.
 
@@ -158,19 +172,22 @@ After A to E, ReduceSum, Greater, Less and Cast reach 44/44, 18/18, 1/1 and 19/1
 provided each new template passes the self-identity check (`test_own_calibration_is_identity`
 pattern).
 
-## Step-shape builds (in progress)
+## Step-shape builds (batches A to E)
 
-Built from `step.onnx` one at a time, each registered in `index.json`
-(fixtures under `fixtures/misc_op_step_templates/`) only after the checks
-below pass:
+Built from `step.onnx` one at a time (`fixtures/misc_op_step_templates/`), registered in
+`index.json` only after the checks pass:
 
-- `GreaterCast:16x512x7x7` (batch A): registered as built, because it is
-  not quantized. Greater 0 -> 4 of 18 nodes, Cast 0 -> 4 of 19.
-- `ReduceSum:16x1x512x4608:axes0:k0` (batch C2): passes the self-identity
-  check (retarget away and back). ReduceSum 11 -> 14 of 44 nodes.
-- `ReduceSum:16x1000:axes0,1:k1` (batch E): **not registered**. The
-  retarget to its held-out build refuses: the zero-point change adds or
-  removes records, a case the emitter has not measured. This key needs a
-  template at the step's zero-point class, or a decode of the record move.
-
-The remaining A-E builds are queued behind the MatMul templates.
+- **Greater→Cast and Less→Cast** (batches A and B, 7 builds): registered as built, since
+  they are not quantized.
+- **ReduceSum** (batches C to E, 16 templates): each passes the self-identity check
+  (retarget away and back). Four have a second build at another calibration and
+  reproduce it record for record in both directions:
+  - `[16,1,512,4608]` axis 0 and `[16,1,64,147]` axis 0 (both `zp_y != 0`);
+  - `[16,1000]` axes (0,1) k1 and `[16,1,128,784]` axes (0,3), each paired with a
+    `zp_y = 0` build that changes the record count. Before the re-pad rule above,
+    these two were refused.
+- **Not buildable:** `[16,1,64,12544]` axes (0,3) k0 (1 node). Pulsar2 fails with
+  `TileFailException: AxQuantizedReduceSum, Can not tile` (a 12.8 MB U8 input against a
+  3 MB memory limit). In the step, the reduction presumably fuses with neighbouring ops.
+  Covering it standalone would need a different decomposition, which isn't a
+  template of this op.

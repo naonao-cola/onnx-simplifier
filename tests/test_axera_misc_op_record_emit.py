@@ -30,7 +30,7 @@ def _mcode(rel: str) -> bytes:
 
 
 @pytest.mark.parametrize(
-    "key", sorted(k for k, v in INDEX.items() if v["op"] != "GreaterCast")
+    "key", sorted(k for k, v in INDEX.items() if v["op"] not in mre.CALIBRATION_FREE)
 )
 def test_own_calibration_is_identity(key):
     # Each template's lanes and zero-point records are exactly what the
@@ -72,6 +72,39 @@ def test_reducesum_matches_held_out_builds(src, dst):
     assert mre.normalized_records(got) == mre.normalized_records(_mcode(dst))
 
 
+STEP_PAIRS = sorted(
+    (k, k.replace(".axmodel.gz", "__v2.axmodel.gz"))
+    for k in HELD
+    if k.startswith("misc_op_step_templates/") and "__v2" not in k
+)
+
+
+@pytest.mark.parametrize("a,b", [p for pair in STEP_PAIRS for p in (pair, pair[::-1])])
+def test_step_template_matches_second_calibration_build(a, b):
+    # Includes zp_y = 0 targets, where elided 0x1b10 writes remove records and
+    # the segment is re-padded to whole 4-record groups (and the reverse).
+    got = mre.retarget(
+        _mcode(a),
+        "ReduceSum",
+        HELD[a]["scales"],
+        HELD[b]["scales"],
+        HELD[a]["zero_points"],
+        HELD[b]["zero_points"],
+    )
+    assert mre.normalized_records(got) == mre.normalized_records(_mcode(b))
+
+
+def test_record_removing_zero_point_change_is_measured():
+    # Both directions change the record count; the fixtures prove it is exact.
+    counts = {
+        len(mre._chunks(mre.suc.decode_segments(_mcode(k))[2]))
+        for pair in STEP_PAIRS
+        if "784" in pair[0]
+        for k in pair
+    }
+    assert len(counts) == 2
+
+
 def test_greater_cast_is_calibration_free():
     s1 = _mcode("teng_register_census/gtcast_s1.axmodel.gz")
     asym = _mcode("teng_register_census/gtcast_asym.axmodel.gz")
@@ -100,7 +133,6 @@ def test_emit_model_retargets_template():
     [
         ({"x": 0.5, "y": 2.0}, None),  # 1/s_x == s_y: lanes indistinguishable
         ({"x": 0.02, "y": 0.02}, {"x": 0, "y": 0}),  # zp_x == 0 is unmeasured
-        ({"x": 0.02, "y": 0.03}, {"x": 128, "y": 5}),  # net record insertion
     ],
 )
 def test_reducesum_refuses_unmeasured_targets(scales, zps):
@@ -132,7 +164,7 @@ def test_sqrt_refuses_zero_point_change():
 
 def test_unknown_template_is_an_error():
     with pytest.raises(ValueError):
-        mre.emit_model("ReduceSum:16x1x128x1152:axes0:k0")
+        mre.emit_model("ReduceSum:3x5x7:axes0:k0")
 
 
 def test_step_node_keys(tmp_path):
@@ -161,4 +193,4 @@ def test_step_node_keys(tmp_path):
     cov = mre.coverage(path)
     assert cov["ReduceSum"] == {"nodes": 1, "covered": 1, "missing": {}}
     assert cov["Sqrt"]["covered"] == 1
-    assert cov["Greater"]["missing"] == {"GreaterCast:16x64x56x56": 1}
+    assert cov["Greater"] == {"nodes": 1, "covered": 1, "missing": {}}
