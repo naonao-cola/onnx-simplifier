@@ -127,7 +127,9 @@ jobs:
   rustnn-webnn:
     name: rustnn WebNN (CPU / Core ML) vs. tinygrad (CPU / Metal)
     runs-on: macos-15
-    timeout-minutes: 45
+    # ~21 min of this is building onnxsim from source on the runner; the
+    # benchmark adds tinygrad BEAM=2 searches on Metal on top.
+    timeout-minutes: 60
     env:
       # Only the core simplifier is needed; skip the quantization/pruning
       # algorithm library to cut compile time (see CLAUDE.md).
