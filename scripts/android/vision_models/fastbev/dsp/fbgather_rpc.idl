@@ -1,0 +1,12 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+// Fast-BEV M0's view transform in one call: 4 time steps' uint8 feature tables ((rows + 1) * 64
+// bytes + 64 pad each; the last row is the zero point) and LUTs (160000 int32 each) -> the
+// (1, 200, 200, 1024) uint8 BEV volume. See fbgather_kernel.h.
+interface fbgather_rpc : remote_handle64 {
+  AEEResult run(in sequence<uint8> t0, in sequence<uint8> t1, in sequence<uint8> t2, in sequence<uint8> t3,
+                in sequence<int32> l0, in sequence<int32> l1, in sequence<int32> l2, in sequence<int32> l3,
+                in int32 rows, in int32 flags,  // flags bits 0-7: threads
+                rout sequence<uint8> vol, rout uint64 dsp_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};
