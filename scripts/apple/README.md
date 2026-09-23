@@ -80,6 +80,46 @@ downloads. Real models can be layered on by passing an on-disk path as
 `worker.py`'s second argument, the same way `scripts/qualcomm` and
 `scripts/regression` do.
 
+## General staged ONNX deployment benchmark
+
+`benchmark_onnx_pipeline.py` benchmarks staged ONNX deployments without
+assuming a particular task or model family. A JSON manifest names each graph,
+optional NPZ input feeds, and tensor connections between stages. This covers
+pipelines such as backbone/head, encoder/decoder, and detector/preprocessor
+graphs while leaving image transforms and task-specific input construction in
+the calling application. Unspecified feeds use deterministic values for
+static-shape smoke benchmarks; provide NPZ files for representative inputs.
+
+For example, save `image.npz` and `head_inputs.npz` with NumPy and create
+`pipeline.json`:
+
+```json
+{
+  "name": "detector",
+  "stages": [
+    {"name": "backbone", "model": "backbone.onnx", "feeds": "image.npz"},
+    {"name": "head", "model": "head.onnx", "feeds": "head_inputs.npz"}
+  ],
+  "connections": [
+    {"from": ["backbone", "features"], "to": ["head", "features"]}
+  ],
+  "backends": {"backbone": "coreml", "head": "tinygrad_metal_jit"}
+}
+```
+
+Run it on macOS with:
+
+```bash
+python scripts/apple/benchmark_onnx_pipeline.py pipeline.json \
+  --output detector-m4.json --compute-units ALL \
+  --compute-precision FLOAT32 --repeats 8
+```
+
+Each stage is reported against ONNX Runtime CPU for Core ML, eager tinygrad
+Metal, and tinygrad Metal JIT. The selected per-stage backends are then timed
+end to end, including tensor handoffs. The existing SAM-specific runner below
+adds SAM image resizing and prompt setup on top of this backend comparison.
+
 ## SAM Core ML + tinygrad Metal hybrid benchmark
 
 `benchmark_sam_hybrid.py` measures Core ML and tinygrad Metal on the two
