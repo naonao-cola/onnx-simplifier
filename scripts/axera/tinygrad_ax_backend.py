@@ -61,6 +61,7 @@ import elementwise_scale_emit as ew  # noqa: E402
 import llm_build_dtype_analysis as lbd  # noqa: E402
 import matmul_record_emit as mre  # noqa: E402
 import memory_emit  # noqa: E402
+import misc_op_record_emit as misc  # noqa: E402
 import transpose_real_shapes  # noqa: E402
 
 TOOLCHAIN = "pulsar2:7.0-lite"
@@ -869,7 +870,32 @@ def extract_step_ops(onnx_path: str) -> list[dict]:
             else:
                 rec["attrs"]["form"] = "same_shape"
         records.append(rec)
+    # ReduceSum / Sqrt / Greater->Cast / Less->Cast template keys, in node order
+    misc_keys = iter(misc.step_node_keys(onnx_path))
+    for rec in records:
+        if rec["op"] in _MISC_OPS:
+            rec["attrs"]["misc_key"] = next(misc_keys)[1]
     return records
+
+
+_MISC_OPS = ("ReduceSum", "Sqrt", "Greater", "Less", "Cast")
+
+
+def _plan_misc(rec: Mapping) -> tuple[str, str] | None:
+    """``misc_op_record_emit`` templates (step-shape ReduceSum, Greater/Less
+    -> Cast, Sqrt ``[512,512,3,3]``), or ``None`` without one."""
+    key = rec.get("attrs", {}).get("misc_key")
+    meta = misc.load_index().get(key) if key else None
+    if meta is None:
+        return None
+    if meta["op"] in misc.CALIBRATION_FREE:
+        return ("covered", "TemplateOnly (not quantized; misc_op_record_emit)")
+    return (
+        "conditional",
+        "misc_op_record_emit retarget if zp_x != 0 and the scale formulas stay "
+        "distinct"
+        + (" (zero points fixed by the template)" if meta["op"] == "Sqrt" else ""),
+    )
 
 
 def key_for_record(
@@ -927,6 +953,11 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
                     "exists for frozen-weight deployment only",
                 )
             return ("covered", "ConvWeightEdit")
+        if op in ("ReduceSum", "Greater", "Less", "Cast"):
+            return _plan_misc(rec) or (
+                "refused",
+                f"no misc_op_record_emit template for {op}",
+            )
         if op in ew.OPS:
             hits = []
             for zp in _ELEMENTWISE_ZP_CLASSES:
@@ -936,6 +967,9 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
                 except ValueError:
                     pass
             if not hits:
+                planned = _plan_misc(rec)
+                if planned:
+                    return planned
                 raise ValueError("no template at this shape")
             return (
                 "conditional",
