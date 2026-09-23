@@ -9,6 +9,13 @@ from onnxsim.accuracy import (
     quantize_auto,
     recommend_quantization,
 )
+from onnxsim.activation_sensitivity import (
+    ActivationPrecisionSearch,
+    ActivationSensitivityReport,
+    analyze_activation_sensitivity,
+    group_nodes,
+    search_activation_precision_for_budget,
+)
 from onnxsim.adaquant import apply_adaquant
 from onnxsim.adaround import apply_adaround
 from onnxsim.adpq import quantize_weight_only_adpq
@@ -632,6 +639,11 @@ __all__ = [
     "apply_mixed_precision_quantization",
     "apply_mixed_precision_quantization_cpp",
     "search_mixed_precision_for_budget",
+    "ActivationPrecisionSearch",
+    "ActivationSensitivityReport",
+    "analyze_activation_sensitivity",
+    "group_nodes",
+    "search_activation_precision_for_budget",
     "MixedPrecisionSearchResult",
     "apply_slim_llm",
     "apply_slim_llm_cpp",
