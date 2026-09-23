@@ -36,10 +36,11 @@ whole records only (``docs/axera-misc-op-record-emit.md``):
 
   * Softmax: ``1/s_x``, ``s_x``, ``1/s_y``, ``s_y``, plus one ``0x1b10 = zp_x``
     write before the first run (``zp_y`` is 0 and fixed);
-  * Log: ``1/s_x``, plus a 258-entry u8 table (two u16 entries per record,
-    registers ``0x1050..0x1850``; ``0x1850`` is written after an unrelated
-    ``0x1860..0x1a50`` block): ``clip(rint(log((q - zp_x) s_x) / s_y) + zp_y)``
-    for ``q`` in 0..255, then entry 255 again and a 0;
+  * Log: ``1/s_x`` and ``s_y`` (the dequantize lanes), plus a 258-entry u8
+    table (two u16 entries per record, registers ``0x1050..0x1850``;
+    ``0x1850`` is written after an unrelated ``0x1860..0x1a50`` block):
+    ``clip(rint(log((q - zp_x) s_x) / s_y) + zp_y)`` for ``q`` in 0..255,
+    then entry 255 again and a 0;
   * MaxPool: ``1/s_x`` and ``s_x`` (``s_y = s_x``);
   * ReduceMean: ``1/s_x``, ``s_x/(s_y*N)`` with ``N`` the reduced element
     count, and ``s_y``.
@@ -156,7 +157,9 @@ def lane_values(
     elif op == "Softmax":
         vals = {"1/s_x": 1.0 / sx, "s_x": sx, "1/s_y": 1.0 / sy, "s_y": sy}
     elif op == "Log":
-        vals = {"1/s_x": 1.0 / sx}
+        # the table lookup is dequantized with s_y (both native Log builds share
+        # one s_y, so only a device run caught it: docs/axera-emitter-device-check.md)
+        vals = {"1/s_x": 1.0 / sx, "s_y": sy}
     elif op == "MaxPool":
         if _f32(sx) != _f32(sy):
             raise ValueError("MaxPool shares one scale between input and output")
@@ -564,9 +567,10 @@ def emit_model(
         if scales or zero_points:
             raise ValueError(f"{meta['op']} is not quantized; no calibration")
         return model
-    init = mcode_initializer(model)
-    init.raw_data = retarget(
-        bytes(init.raw_data),
+    import step_recalibrate
+
+    mc = retarget(
+        bytes(mcode_initializer(model).raw_data),
         meta["op"],
         meta["scales"],
         scales or meta["scales"],
@@ -574,7 +578,9 @@ def emit_model(
         zero_points or meta["zero_points"],
         meta.get("reduce_count"),
     )
-    return model
+    # a zero-point move can change the blob length: the runtime reads the
+    # MCode size from the initializer's dims (0x80300709 on load otherwise)
+    return step_recalibrate.with_mcode(model, mc)
 
 
 # ReduceSum nodes Pulsar2 cannot tile ("Can not tile", also inside the step's

@@ -349,8 +349,23 @@ def test_tinygrad_compiler_seam():
     src = axb.build_request(_gather_key(), [axb.GatherIndexEdit(list(range(8)))])
     out = classes["AXCompiler"]().compile_cached(src)
     assert out == axb.compile_request(src)
-    with pytest.raises(NotImplementedError):
-        classes["AXProgram"](None, None)
+    from tinygrad.device import Allocator, Program
+
+    assert issubclass(classes["AXProgram"], Program)
+    assert issubclass(classes["AXAllocator"], Allocator)
+
+
+def test_ax_allocator_is_host_visible():
+    """AX buffers are host-staged: tinygrad reads and writes them without a
+    copy program, so a covered op's inputs/outputs need no device for this."""
+    pytest.importorskip("tinygrad")
+    from tinygrad.device import Buffer
+    from tinygrad.dtype import dtypes
+
+    axb.register_ax_device()
+    x = np.arange(12, dtype=np.float32)
+    buf = Buffer("AX", 12, dtypes.float32, initial_value=x.tobytes())
+    assert np.array_equal(buf.numpy(), x)
 
 
 # --------------------------------------------------------------------------

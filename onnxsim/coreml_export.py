@@ -388,8 +388,6 @@ def _lower_resize(lowerer, node, ins, attrs):
     mode = attrs.get("mode", b"nearest")
     if isinstance(mode, bytes):
         mode = mode.decode()
-    if mode != "linear":
-        raise RuntimeError(f"Resize mode {mode!r} is not supported")
     coordinate_mode = attrs.get("coordinate_transformation_mode", b"half_pixel")
     if isinstance(coordinate_mode, bytes):
         coordinate_mode = coordinate_mode.decode()
@@ -397,10 +395,6 @@ def _lower_resize(lowerer, node, ins, attrs):
         "half_pixel": "UNALIGN_CORNERS",
         "align_corners": "ALIGN_CORNERS",
     }
-    if coordinate_mode not in sampling_modes:
-        raise RuntimeError(
-            f"Resize coordinate_transformation_mode {coordinate_mode!r} is not supported"
-        )
     scales = np.asarray(ins[2].val).reshape(-1)
     if scales.size != 4 or not np.all(scales[:2] == 1):
         raise RuntimeError(
@@ -411,13 +405,56 @@ def _lower_resize(lowerer, node, ins, attrs):
         raise RuntimeError("Resize requires static spatial dimensions")
     target_height = int(round(int(height) * float(scales[-2])))
     target_width = int(round(int(width) * float(scales[-1])))
+    resize_name = lowerer.fresh_name(node)
+    if mode == "nearest":
+        nearest_mode = attrs.get("nearest_mode", b"round_prefer_floor")
+        if isinstance(nearest_mode, bytes):
+            nearest_mode = nearest_mode.decode()
+        if coordinate_mode != "asymmetric" or nearest_mode != "floor":
+            raise RuntimeError(
+                "Resize nearest only supports asymmetric coordinates with floor rounding"
+            )
+        height_indices = np.minimum(
+            np.floor(np.arange(target_height) / scales[-2]).astype(np.int32),
+            int(height) - 1,
+        )
+        width_indices = np.minimum(
+            np.floor(np.arange(target_width) / scales[-1]).astype(np.int32),
+            int(width) - 1,
+        )
+        height_index_var = lowerer.make_const(
+            resize_name + "_height_indices", height_indices
+        )
+        width_index_var = lowerer.make_const(
+            resize_name + "_width_indices", width_indices
+        )
+        resized_height = lowerer.mb.gather(
+            x=ins[0],
+            indices=height_index_var,
+            axis=2,
+            name=lowerer.fresh_name(node, "nearest_height"),
+        )
+        return [
+            lowerer.mb.gather(
+                x=resized_height,
+                indices=width_index_var,
+                axis=3,
+                name=resize_name,
+            )
+        ]
+    if mode != "linear":
+        raise RuntimeError(f"Resize mode {mode!r} is not supported")
+    if coordinate_mode not in sampling_modes:
+        raise RuntimeError(
+            f"Resize coordinate_transformation_mode {coordinate_mode!r} is not supported"
+        )
     return [
         lowerer.mb.resize_bilinear(
             x=ins[0],
             target_size_height=target_height,
             target_size_width=target_width,
             sampling_mode=sampling_modes[coordinate_mode],
-            name=lowerer.fresh_name(node),
+            name=resize_name,
         )
     ]
 

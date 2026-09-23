@@ -222,7 +222,7 @@ def test_coverage_at_the_predicted_step_calibration():
         assert report["per_op"][op] == counts, op
 
 
-_EXPECTED_TOTALS = {"conditional": 18, "covered": 449, "refused": 637}
+_EXPECTED_TOTALS = {"covered": 467, "refused": 637}
 _EXPECTED_PER_OP = {
     "Add": {"covered": 43, "refused": 101},
     "Conv": {"refused": 20},
@@ -236,8 +236,24 @@ _EXPECTED_PER_OP = {
     "Neg": {"covered": 2},
     "ReduceSum": {"covered": 44},
     "Relu": {"covered": 17},
-    "Reshape": {"conditional": 18, "covered": 135, "refused": 17},
+    "Reshape": {"covered": 153, "refused": 17},
     "Softmax": {"covered": 3},
     "Sqrt": {"covered": 42},
     "Sub": {"refused": 46},
 }
+
+
+def test_bias_flatten_reshapes_settle_through_their_reducesum_chain():
+    # Each [1,C] -> [C] bias-gradient Reshape compiles fused with the
+    # ReduceSum producing it; its template is that chain's build (or, for
+    # Reshape_475, ReduceSum_474's same-bytes equivalent, which already writes
+    # the flattened [64])
+    calib = axb.load_calibration(_STEP_CALIB)
+    flat = [
+        r for r in _step_records() if r["op"] == "Reshape" and "fused_key" in r["attrs"]
+    ]
+    assert len(flat) == 18
+    for rec in flat:
+        status, detail = axb.plan_at_calibration(rec, calib)
+        assert status == "covered", (rec["name"], detail)
+        assert "fused chain" in detail

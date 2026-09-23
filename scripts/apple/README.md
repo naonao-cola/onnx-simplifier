@@ -120,6 +120,12 @@ Metal, and tinygrad Metal JIT. The selected per-stage backends are then timed
 end to end, including tensor handoffs. The existing SAM-specific runner below
 adds SAM image resizing and prompt setup on top of this backend comparison.
 
+M4 results for the Hexagon-deployed YOLO11n, YOLO26n, and YOLO26s models are
+in [`bench/RESULTS_m4_hexagon_yolo_coreml_metal.md`](../../bench/RESULTS_m4_hexagon_yolo_coreml_metal.md).
+The Core ML translator lowers the models' static nearest-neighbor Resize
+(`asymmetric` coordinates, `floor` rounding) to constant index gathers, which
+preserves ONNX's sampling rule and avoids a Core ML resize runtime limitation.
+
 ## rustnn WebNN vs. tinygrad benchmark (`benchmark_webnn_tinygrad.py`)
 
 Times small simplified models, per node and as a whole, on rustnn's native WebNN

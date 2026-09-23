@@ -1,0 +1,291 @@
+"""A persistent AXCL session: load many ``.axmodel`` files once, run them many
+times, without one ``axcl_run_model`` process (and one ``lxc file push``)
+per call.
+
+The device side is ``vm/axcl_batch_runner.c``, a line-protocol runner built
+inside the LXD guest (``build_runner``). Tensors travel as raw files on the
+guest's virtiofs share (``/mnt/share``; the host directory is the
+``share`` disk device of ``AXCL_LXD_VM``), so a 50 MB activation costs a page
+cache write, not a pipe copy.
+
+The session holds ``/tmp/axcl-device.lock`` for its whole lifetime, so other
+agents' device runs queue behind it rather than interleaving.
+
+    with AXSession() as s:
+        m = s.load(axmodel_bytes)
+        (y,) = s.run(m, [x])
+"""
+
+from __future__ import annotations
+
+import fcntl
+import itertools
+import json
+import os
+import queue
+import shutil
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, field
+
+import numpy as np
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+RUNNER_SRC = os.path.join(_HERE, "vm", "axcl_batch_runner.c")
+LOCK = "/tmp/axcl-device.lock"
+_PROTOCOL = frozenset({"READY", "OK", "ERR", "IN", "OUT", "END"})
+
+# axclrtEngineDataType
+_DTYPES = {
+    3: np.int8,
+    4: np.uint8,
+    5: np.int16,
+    6: np.uint16,
+    7: np.int32,
+    8: np.uint32,
+    9: np.int64,
+    13: np.float16,
+    15: np.float32,
+}
+
+
+class DeviceError(RuntimeError):
+    pass
+
+
+class DeviceStall(DeviceError):
+    """The runner stopped answering: treat the card as wedged (recover it with
+    the full guest module reload, scripts/axera/vm/README.md)."""
+
+
+class DeviceUnhealthy(DeviceStall):
+    """The native health-check model returned wrong values: results since the
+    last passing check are void."""
+
+
+@dataclass
+class IOSpec:
+    name: str
+    nbytes: int
+    dtype: type
+    shape: tuple[int, ...]
+
+
+@dataclass
+class Model:
+    id: int
+    path: str
+    inputs: list[IOSpec] = field(default_factory=list)
+    outputs: list[IOSpec] = field(default_factory=list)
+
+
+def _vm_share(vm: str, device: str = "share") -> tuple[str, str]:
+    """``(host source, guest path)`` of the VM's ``share`` disk device."""
+
+    def get(key: str) -> str:
+        return subprocess.run(
+            ["lxc", "config", "device", "get", vm, device, key],
+            capture_output=True, text=True,
+        ).stdout.strip()  # fmt: skip
+
+    src, path = get("source"), get("path")
+    if not src or not path:
+        raise DeviceError(f"{vm} has no {device!r} disk device")
+    return src, path
+
+
+class AXSession:
+    def __init__(
+        self,
+        vm: str | None = None,
+        subdir: str = "step_runner",
+        timeout: float = 120.0,
+        lock: bool = True,
+    ):
+        self.vm = vm or os.environ.get("AXCL_LXD_VM") or "axcl-vm"
+        host_share, guest_share = _vm_share(self.vm)
+        self.host_dir = os.path.join(host_share, subdir)
+        self.guest_dir = f"{guest_share}/{subdir}"
+        self.timeout = timeout
+        self._lock_wanted = lock
+        self._lock_fd = None
+        self._proc = None
+        self._lines: queue.Queue = queue.Queue()
+        self._seq = itertools.count()
+        self.exec_us = 0
+        self.runs = 0
+
+    # -- lifecycle ---------------------------------------------------------
+    def build_runner(self) -> None:
+        os.makedirs(self.host_dir, exist_ok=True)
+        shutil.copy(RUNNER_SRC, os.path.join(self.host_dir, "axcl_batch_runner.c"))
+        res = subprocess.run(
+            [
+                "lxc", "exec", self.vm, "--", "gcc", "-O2", "-o",
+                f"{self.guest_dir}/axrun", f"{self.guest_dir}/axcl_batch_runner.c",
+                "-I/usr/include/axcl", "-L/usr/lib/axcl", "-laxcl_rt", "-laxcl_sys",
+                "-Wl,-rpath,/usr/lib/axcl",
+            ],
+            capture_output=True, text=True,
+        )  # fmt: skip
+        if res.returncode:
+            raise DeviceError("runner build failed: " + res.stdout + res.stderr)
+
+    def __enter__(self) -> AXSession:
+        os.makedirs(os.path.join(self.host_dir, "t"), exist_ok=True)
+        if not os.path.exists(os.path.join(self.host_dir, "axrun")):
+            self.build_runner()
+        if self._lock_wanted:
+            self._lock_fd = open(LOCK, "w")
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+        self._proc = subprocess.Popen(
+            ["lxc", "exec", self.vm, "--", f"{self.guest_dir}/axrun"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1,
+        )  # fmt: skip
+        threading.Thread(target=self._pump, daemon=True).start()
+        ready = self._line(60)
+        if not ready.startswith("READY"):
+            self.close()
+            raise DeviceError(f"runner did not start: {ready}")
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.stdin.write("QUIT\n")
+                self._proc.stdin.flush()
+                self._proc.wait(30)
+            except Exception:
+                self._proc.kill()
+            self._proc = None
+        if self._lock_fd is not None:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            self._lock_fd.close()
+            self._lock_fd = None
+
+    def _pump(self) -> None:
+        # The AXCL runtime logs to stdout too; keep only protocol lines.
+        for line in self._proc.stdout:
+            if line.split(" ", 1)[0].strip() in _PROTOCOL:
+                self._lines.put(line.rstrip("\n"))
+        self._lines.put(None)
+
+    def _line(self, timeout: float | None = None) -> str:
+        try:
+            line = self._lines.get(timeout=timeout or self.timeout)
+        except queue.Empty:
+            raise DeviceStall("runner timed out") from None
+        if line is None:
+            raise DeviceStall("runner exited")
+        return line
+
+    def _cmd(self, text: str) -> str:
+        self._proc.stdin.write(text + "\n")
+        self._proc.stdin.flush()
+        line = self._line()
+        if line.startswith("ERR"):
+            raise DeviceError(line)
+        return line
+
+    # -- models ------------------------------------------------------------
+    def load(self, model: bytes | str) -> Model:
+        n = next(self._seq)
+        name = f"m{n}.axmodel"
+        dst = os.path.join(self.host_dir, name)
+        if isinstance(model, (bytes, bytearray)):
+            with open(dst, "wb") as f:
+                f.write(model)
+        else:
+            shutil.copy(model, dst)
+        head = self._cmd(f"LOAD {self.guest_dir}/{name}")
+        m = Model(id=int(head.split()[1]), path=dst)
+        while (line := self._line()) != "END":
+            kind, _, tname, nbytes, dt, *dims = line.split()
+            spec = IOSpec(
+                tname, int(nbytes), _DTYPES.get(int(dt), np.uint8),
+                tuple(int(d) for d in dims),
+            )  # fmt: skip
+            (m.inputs if kind == "IN" else m.outputs).append(spec)
+        return m
+
+    def unload(self, m: Model) -> None:
+        self._cmd(f"UNLOAD {m.id}")
+        try:
+            os.remove(m.path)
+        except OSError:
+            pass
+
+    def run(self, m: Model, inputs: list[np.ndarray]) -> list[np.ndarray]:
+        if len(inputs) != len(m.inputs):
+            raise ValueError(f"model takes {len(m.inputs)} inputs, got {len(inputs)}")
+        ins = []
+        for k, (x, spec) in enumerate(zip(inputs, m.inputs)):
+            buf = np.ascontiguousarray(x, dtype=spec.dtype).tobytes()
+            if len(buf) != spec.nbytes:
+                raise ValueError(
+                    f"input {spec.name}: {len(buf)} bytes, model wants {spec.nbytes}"
+                )
+            p = f"t/i{k}.bin"
+            with open(os.path.join(self.host_dir, p), "wb") as f:
+                f.write(buf)
+            ins.append(f"{self.guest_dir}/{p}")
+        outs = [f"t/o{k}.bin" for k in range(len(m.outputs))]
+        line = self._cmd(
+            f"RUN {m.id} {len(ins)} {' '.join(ins)} {len(outs)} "
+            + " ".join(f"{self.guest_dir}/{p}" for p in outs)
+        )
+        self.exec_us += int(line.split()[1])
+        self.runs += 1
+        res = []
+        for p, spec in zip(outs, m.outputs):
+            a = np.fromfile(os.path.join(self.host_dir, p), dtype=spec.dtype)
+            res.append(a.reshape(spec.shape) if spec.shape else a)
+        return res
+
+
+HEALTH_MODEL = os.path.join(
+    _HERE, "fixtures", "elementwise_scale_emit", "relu_16x512x7x7_x128_y128.axmodel.gz"
+)
+HEALTH_SCALE, HEALTH_ZP = 0.007843137718737125, 128  # that template's calibration
+
+
+def health_check(s: AXSession) -> float:
+    """Run the native (unpatched) ``x128,y128`` Relu template on [-1, 1] data
+    and return its worst error in LSBs; raise ``DeviceError`` above 1 LSB (a
+    wedged runtime returns garbage or stalls)."""
+    import gzip
+
+    with gzip.open(HEALTH_MODEL, "rb") as f:
+        m = s.load(f.read())
+    try:
+        spec = m.inputs[0]
+        rng = np.random.default_rng(0)
+        x = rng.uniform(-1, 1, spec.shape).astype(np.float32)
+        (y,) = s.run(m, [x])
+        q = np.clip(np.rint(x / np.float32(HEALTH_SCALE)) + HEALTH_ZP, 0, 255)
+        want = np.maximum((q - HEALTH_ZP) * np.float32(HEALTH_SCALE), 0)
+        lsb = float(np.abs(y.astype(np.float32) - want).max() / HEALTH_SCALE)
+        if lsb > 1.01:
+            raise DeviceUnhealthy(f"health check: native Relu off by {lsb:.2f} LSB")
+        return lsb
+    finally:
+        s.unload(m)
+
+
+if __name__ == "__main__":  # smoke: python axcl_session.py model.axmodel
+    import sys
+
+    with AXSession() as s:
+        t0 = time.time()
+        mm = s.load(sys.argv[1])
+        print(json.dumps({"load_s": time.time() - t0, "in": [vars(i) for i in mm.inputs],
+                          "out": [vars(o) for o in mm.outputs]}, default=str))  # fmt: skip
+        xs = [np.random.rand(*i.shape).astype(i.dtype) for i in mm.inputs]
+        t0 = time.time()
+        ys = s.run(mm, xs)
+        print("run_s", time.time() - t0, "exec_us", s.exec_us, [y.shape for y in ys])

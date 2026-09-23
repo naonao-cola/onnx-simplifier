@@ -184,6 +184,11 @@ def _node_const(node) -> Optional[np.ndarray]:
 def _dequant_matmulnbits(node, arrays) -> np.ndarray:
     """Dense ``[N, K]`` (``F.linear``-layout) weight of a ``com.microsoft::MatMulNBits`` node.
 
+    ``accuracy_level`` is ignored: it lets ONNX Runtime's CPU kernel quantize the
+    *activations* (level 4: to int8), whereas the conversion always computes with
+    full-precision activations -- e.g. onnx-community's Llama-3.2-1B q4f16 (level 4)
+    differs from ONNX Runtime by ~3e-2 relative at level 4 but ~3e-3 at level 0.
+
     ``B`` is ``[N, k_blocks, blob]`` uint8 with ``bits``-bit values packed low bits
     first; ``scales`` has one entry per (row, block); ``zero_points`` (optional) is
     either packed like ``B`` or in the scales' type, defaulting to ``2**(bits-1)``.
@@ -238,8 +243,12 @@ def _packed_matmulnbits(node, arrays) -> Optional[Dict[str, np.ndarray]]:
         if zp.dtype == np.uint8:
             zp = zp.reshape(n, -1)
             zp = np.stack([zp & 15, zp >> 4], -1).reshape(n, -1)[:, :ng]
-        else:  # zero points in the scales' type: 4-bit values, so exact in uint8
-            zp = np.rint(zp.astype(np.float32)).reshape(n, ng)
+        else:
+            # zero points in the scales' type may be fractional: only integral ones in
+            # [0, 15] fit the kernel's uint8 zeros; otherwise dequantize instead.
+            zp = zp.astype(np.float32).reshape(n, ng)
+            if not (np.all(zp == np.rint(zp)) and zp.min() >= 0 and zp.max() <= 15):
+                return None
         out[name + "::zeros"] = np.ascontiguousarray(zp.astype(np.uint8))
     return out
 
