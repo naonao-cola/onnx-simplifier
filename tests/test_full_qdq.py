@@ -178,6 +178,19 @@ def test_precomputed_ranges_skip_calibration():
     assert float(inits[qx.input[1]]) == pytest.approx(8.0 / 255)
 
 
+def test_partial_precomputed_ranges_win_over_calibration():
+    # calibrate() reports every activation it sees; a range the caller pins (here a fixed [-8, 8]
+    # input range, wider than the data's) must not be overwritten by the calibrated one
+    m = _conv_block()
+    q = quantize_full_qdq(m, _data(), ranges={"x": (-8.0, 8.0)})
+    inits = {i.name: numpy_helper.to_array(i) for i in q.graph.initializer}
+    qx = next(
+        n for n in q.graph.node if n.op_type == "QuantizeLinear" and n.input[0] == "x"
+    )
+    assert float(inits[qx.input[1]]) == pytest.approx(16.0 / 255)
+    assert int(inits[qx.input[2]]) == 128
+
+
 def test_quantized_io_is_lossless_and_nhwc():
     m = _conv_block()
     q = quantize_full_qdq(m, _data())
