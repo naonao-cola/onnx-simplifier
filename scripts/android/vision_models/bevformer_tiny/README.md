@@ -19,6 +19,7 @@ frames, then exported and run piece by piece on the phone's HTP through QNN.
 | `sensitivity.py` | ORT CPU sweep: which op types int8 hurts (all-but-T / only-T cosines) |
 | `quantize.py` | int8 QDQ pieces with onnxsim's whole-graph quantizer (`onnxsim.full_qdq`): calibration set, backbone, mixed-precision encoder/decoder policies |
 | `bisect_precision.py`, `bisect_run.sh` | expose chosen intermediates as outputs, run on the HTP, per-tensor cosine vs ORT CPU |
+| `msda_hvx/` | the encoder split around the generic HVX MSDA kernel (`../../msda_hvx/`) and its phone runner: see "Encoder with the sampling on the HVX" below |
 
 Reproduce (each heavy step under `systemd-run --user --wait --collect --pipe -p MemoryMax=16G -p MemorySwapMax=0`):
 
@@ -152,7 +153,8 @@ execute on the HTP, `QNN_COMMON_ERROR_SYSTEM`). validate.py vs upstream: max abs
 
 After the rewrite GridSample is 56% of the layer (SCA 48%, TSA 9%), then Mul + ReduceSum over
 the sampled values (17%). The next lever is an HVX deformable-sampling kernel (the RoiAlign
-channels-last kernel is the template), not quantization.
+channels-last kernel is the template), not quantization: done below, "Encoder with the sampling
+on the HVX" (151 -> 52 ms).
 
 Mixed-precision policies (`quantize.py enc1 --policy ...`), strict all-HTP, enc1 vs fp32:
 
@@ -190,6 +192,80 @@ QDQ decoder has many more nodes, and its tensors are small.
   DQ -> Q' -> DQ' convert; GridSample's grid is exempt. Without this, QNN rejects a Gemm with a
   uint8 input and a uint16 output, and its weight DQ is stranded on the CPU.
 - Weights are quantized only for nodes that end up real QDQ units.
+
+## Encoder with the sampling on the HVX (`msda_hvx/`)
+
+The HTP spends 73% of an fp16 encoder layer building sampling grids, in GridSample, and in the
+Mul + ReduceSum after it. That whole span, per TSA and per SCA, becomes one FastRPC call to the
+generic multi-scale deformable attention kernel `../../msda_hvx/` on the CDSP's HVX; its README
+has the kernel, its C API and how it got fast. The HTP keeps everything else: the Linears,
+softmax, LayerNorm and the FFN. In the kernel's terms:
+- **TSA** is `NV = 2` value maps (the queue) with per-map offsets (`NO = 2`), averaged.
+- **SCA** is `NV = 6` cameras with shared offsets, pillar anchor `p % 4` (`R = 4`), and a
+  per-(camera, query) visibility mask. 81% of the pairs are invisible on a real frame (2863 of
+  15000 visible), and the kernel skips them.
+- Both are one level with reference points + pixel offsets (`MSDA_REF_PIX`).
+
+| file | what |
+|---|---|
+| `split.py` | BEVFormer's calls in the kernel's terms (`msda_fused`); the encoder split into 7 pieces around them (`pre`, `mid0-2`, `post0-2`). `check`: split vs `Encoder` (max abs 7e-6 on 3 frames). `dump`: real kernel calls as case directories. `export`: the pieces to ONNX + onnxsim |
+| `enc_run.cpp` | the encoder on the phone: 7 HTP pieces + 6 kernel calls in one process, all tensors in rpcmem buffers ORT writes into |
+| `e2e_msda.py` | backbone (int8) -> `enc_run` -> decoder on scene-0103's frames, like `e2e_phone.py`, in a phone directory of its own, every adb call under the host's phone lock (`PHONE_RUN`) |
+| `build.sh` | the core's skel + stub, then `enc_run` and `qnn_run_multi` |
+
+Checks:
+- `split.py check` / `dump`, then `../../msda_hvx/msda_host_check` on all 6 calls of a real frame:
+  rel <= 3.4e-6.
+- `tests/test_msda_hvx.py` checks this glue against the model's own `msda_rank5` math (TSA and
+  SCA), plus the kernel itself on BEVFormer-shaped synthetic calls.
+
+Kernel alone on the phone, real frame, 4 threads, median of 10, under the phone lock:
+- TSA 4.4 ms (4.8 wall incl. FastRPC);
+- SCA 4.0 ms (4.4 wall).
+
+Encoder on the phone (`enc_run`, frame 1, median of 10, burst, under the phone lock):
+
+| step | ms |
+|---|---|
+| `pre` (3 layers' SCA value projections + layer 0's TSA inputs) | 6.8 |
+| `mid0-2` (TSA output proj + LN + SCA offsets/weights), each | 2.3 |
+| `post0-1` (SCA output proj + LN + FFN + LN + next TSA inputs), each | 5.8-6.0 |
+| `post2` | 2.1 |
+| TSA call, each (in-DSP / wall) | 4.5 / 4.8 |
+| SCA call, each | 4.3-4.4 / 4.6 |
+| **encoder** | **55.2** (HTP pieces 27.1, kernel calls 27.9 incl. 1.4 FastRPC) |
+
+End to end (`e2e_msda.py`, scene-0103 frames 0-5, the phone's own BEV carried as prev_bev):
+- **The encoder alone** (fp32 torch on the phone's own encoder inputs vs the phone's output):
+  cos 0.999999 on every frame.
+- **Whole model:** bev cos 0.9966-0.9980 vs fp32, cls >= 0.99979. The gap is the int8
+  backbone's (feats cos 0.994), the same as with the fp16 HTP encoder.
+
+| whole model, scene-0103 frames 0-5 | backbone | encoder | decoder | total | FPS | GT matched |
+|---|---|---|---|---|---|---|
+| fp32 torch (CPU) | | | | | | 106 / 190 |
+| int8 backbone + fp16 HTP encoder + fp16 decoder (above) | 21 | 151 | 25 | 197 ms | 5.1 | 107 |
+| **int8 backbone + split encoder (HTP + HVX MSDA) + fp16 decoder** | 21 | **55** | 24 | **100 ms** | **10.0** | **107** |
+
+Reproduce (heavy host steps under `systemd-run ... MemoryMax=16G`):
+
+```sh
+cd msda_hvx
+python3 split.py check  --ckpt $C/bevformer_tiny_epoch_24.pth --work $C/work
+python3 split.py dump   --ckpt $C/bevformer_tiny_epoch_24.pth --work $C/work   # -> $C/work/msda_io/l{0,1,2}_{tsa,sca}
+python3 split.py export --ckpt $C/bevformer_tiny_epoch_24.pth --work $C/work   # -> $C/work/msda_split/*.sim.onnx
+HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... OUT=build ./build.sh
+PHONE_RUN=~/.cache/android-phone/phone-run PHONE_LOCK_OWNER=<branch> \
+  python3 e2e_msda.py --ckpt $C/bevformer_tiny_epoch_24.pth --data $C/nuscenes-mini --work $C/work --build build
+```
+
+Where the remaining 55 ms go, and the next levers:
+- **The HTP pieces' graph I/O is fp32:** ~12 MB in and out per frame. Mask R-CNN's HTP pieces
+  got faster with uint8 graph I/O instead of fp32. The kernel's value maps are the large
+  tensors, which is what a uint8 value path would address.
+- **`pre` computes all 3 layers' SCA value projections up front** (6.9 MB of fp32 output). They
+  depend only on the image features, so they could also run in the backbone's call.
+- **The kernel's multiply-accumulate phase is its larger half.** See `../../msda_hvx/README.md`.
 
 ### Why not a `scripts/android/deploy` spec (yet)
 

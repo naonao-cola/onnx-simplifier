@@ -1,0 +1,144 @@
+{
+ "GreaterCast:1x64x56x56": {
+  "file": "teng_register_census/gtcast_s1.axmodel.gz",
+  "op": "GreaterCast",
+  "shape": [
+   1,
+   64,
+   56,
+   56
+  ],
+  "source": "t_register_census/gtcast_s1"
+ },
+ "ReduceSum:16x1000:axes0:k1": {
+  "axes": [
+   0
+  ],
+  "file": "reducesum_decode/c_16x1000_ax0.axmodel.gz",
+  "keepdims": 1,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.007058156654238701,
+   "y": 0.055398836731910706
+  },
+  "shape": [
+   16,
+   1000
+  ],
+  "source": "t_reducesum_decode/c_16x1000_ax0",
+  "zero_points": {
+   "x": 127,
+   "y": 134
+  }
+ },
+ "ReduceSum:16x1000:axes1:k1": {
+  "axes": [
+   1
+  ],
+  "file": "reducesum_decode/d_16x1000_ax1.axmodel.gz",
+  "keepdims": 1,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.007058156654238701,
+   "y": 0.2727001905441284
+  },
+  "shape": [
+   16,
+   1000
+  ],
+  "source": "t_reducesum_decode/d_16x1000_ax1",
+  "zero_points": {
+   "x": 127,
+   "y": 171
+  }
+ },
+ "ReduceSum:16x1x64x3136:axes0,3:k0": {
+  "axes": [
+   0,
+   3
+  ],
+  "file": "reducesum_decode/b_16x1x64x3136_ax03.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.007058822084218264,
+   "y": 2.365309953689575
+  },
+  "shape": [
+   16,
+   1,
+   64,
+   3136
+  ],
+  "source": "t_reducesum_decode/b_16x1x64x3136_ax03",
+  "zero_points": {
+   "x": 128,
+   "y": 139
+  }
+ },
+ "ReduceSum:16x1x64x576:axes0:k0": {
+  "axes": [
+   0
+  ],
+  "file": "reducesum_decode/a_16x1x64x576_ax0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.0070588174276053905,
+   "y": 0.07025907933712006
+  },
+  "shape": [
+   16,
+   1,
+   64,
+   576
+  ],
+  "source": "t_reducesum_decode/a_16x1x64x576_ax0",
+  "zero_points": {
+   "x": 127,
+   "y": 130
+  }
+ },
+ "ReduceSum:1x1x64x3136:axes2:k0": {
+  "axes": [
+   2
+  ],
+  "file": "teng_register_census/reducesum_s1.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007840676233172417
+  },
+  "shape": [
+   1,
+   1,
+   64,
+   3136
+  ],
+  "source": "t_register_census/reducesum_s1",
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  }
+ },
+ "Sqrt:512x512x3x3": {
+  "file": "misc_op_record_emit/sqrt_512x512x3x3_t.axmodel.gz",
+  "op": "Sqrt",
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "shape": [
+   512,
+   512,
+   3,
+   3
+  ],
+  "source": "t_elementwise_scale_emit/sqrt_512x512x3x3_zp0_t",
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ }
+}
