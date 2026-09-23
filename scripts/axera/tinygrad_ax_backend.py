@@ -17,6 +17,13 @@ names, and exposes tinygrad-facing classes built on the user's tinygrad fork
   ``conv_bias_requant.py``). ``predicted_npu_params`` exposes the tile-table
   predictors (``dma_tile_predict.py``, ``add_tile_predict.py``,
   ``elementwise_two_input_tile_predict.py``) as a cross-check.
+* ``QuantPolicy`` selects each constant weight's storage type from tinygrad
+  dtypes (``dtypes.int8`` -> ``s8``, ``dtypes.bfloat16`` -> ``bf16``, ...,
+  ``"s4"``), per op type or node, or ``"auto"`` under an error budget
+  (``weight_dtype_costs`` / ``choose_weight_dtype``). Only decoded
+  (path, op, dtype, shape) combinations pass ``validate_weight_choice``;
+  ``encode_weight`` gives the stored bytes (``llm_build_dtype_analysis.py``
+  for llm_build, ``emitter.codes_of`` for S8 Conv).
 * ``plan_node`` / ``coverage_report`` map a real graph's nodes onto what the
   backend can produce today and say why the rest is refused.
 * ``tinygrad_classes()`` returns ``AXCompiler`` (a tinygrad ``Compiler`` whose
@@ -51,6 +58,7 @@ if _HERE not in sys.path:
 
 import binary_op_scale_emit as bse  # noqa: E402
 import elementwise_scale_emit as ew  # noqa: E402
+import llm_build_dtype_analysis as lbd  # noqa: E402
 import memory_emit  # noqa: E402
 import transpose_real_shapes  # noqa: E402
 
@@ -98,7 +106,10 @@ class TemplateKey:
     compiled program: ``perm`` (Transpose), ``indices`` = index count (Gather),
     ``w``/``strides``/``pads`` (Conv). ``calibration_class`` names the part of
     the calibration a value edit cannot change -- for Relu/Sqrt the zero points,
-    e.g. ``"x0,y0"``.
+    e.g. ``"x0,y0"``. ``dtypes`` are the data inputs' (activation) dtypes;
+    ``weight_dtype`` is how a constant weight is stored (``WEIGHT_DTYPES``
+    names, see ``axera_weight_dtype``). It is ``""`` for ops without a
+    constant weight, and for a Conv it means the template's own (``s8``).
     """
 
     op: str
@@ -107,6 +118,7 @@ class TemplateKey:
     dtypes: tuple[str, ...] = ("float32",)
     calibration_class: str = ""
     toolchain: str = TOOLCHAIN
+    weight_dtype: str = ""
 
     def attr(self, name: str, default=None):
         return dict(self.attrs).get(name, default)
@@ -121,6 +133,7 @@ class TemplateKey:
             "dtypes": list(self.dtypes),
             "calibration_class": self.calibration_class,
             "toolchain": self.toolchain,
+            "weight_dtype": self.weight_dtype,
         }
 
     @classmethod
@@ -138,7 +151,343 @@ class TemplateKey:
             dtypes=tuple(d.get("dtypes", ("float32",))),
             calibration_class=d.get("calibration_class", ""),
             toolchain=d.get("toolchain", TOOLCHAIN),
+            weight_dtype=d.get("weight_dtype", ""),
         )
+
+
+# --------------------------------------------------------------------------
+# Weight dtype selection (quantization choices).
+#
+# A caller picks how each constant weight is stored with tinygrad dtypes (or
+# the Axera names), per op type or per node, through ``QuantPolicy``. What the
+# two Pulsar2 paths offer, and what this repository has decoded of it:
+#
+# * ``build`` (``pulsar2 build``, the CNN / training-step path): the weight
+#   type is S8 or FP32 only. The committed Conv templates are S8, with the
+#   per-output-channel quantizer ``emitter.codes_of`` (step ``max|w|/127.5``).
+#   FP32 Conv weights have no template (a build is needed).
+# * ``llm_build`` (``pulsar2 llm_build``): s4/s8/fp16/bf16/fp8_e4m3/fp8_e5m2
+#   (and fp32) for Linear weights. ``llm_build_dtype_analysis.py`` (#1866)
+#   reproduces the stored bytes of the first six from our own builds (fp32
+#   was not built). There is no committed llm_build engine template, so this
+#   path yields weight bytes (``encode_weight``), not an ``.axmodel``.
+#
+# In the ResNet18 training step no Conv/Gemm/MatMul weight is a constant:
+# the 20 Conv, the Gemm and one MatMul take theirs from graph inputs
+# (trainable state) and the other 40 MatMuls multiply computed tensors. Those are runtime tensors,
+# quantized with the activation calibration, so a weight dtype choice changes
+# none of them; it applies to frozen-weight deployment (build Conv) and to
+# llm_build Linear layers.
+# --------------------------------------------------------------------------
+
+WEIGHT_DTYPES = ("s4", "s8", "fp8_e4m3", "fp8_e5m2", "fp16", "bf16", "fp32")
+WEIGHT_PATHS = {
+    "build": ("s8", "fp32"),
+    "llm_build": ("s4", "s8", "fp16", "bf16", "fp8_e4m3", "fp8_e5m2", "fp32"),
+}
+"""The weight types each Pulsar2 path offers at all (decoded or not)."""
+
+# (path, op) -> dtypes whose stored bytes are reproduced from our own builds.
+_VALIDATED_WEIGHT_DTYPES: dict[tuple[str, str], tuple[str, ...]] = {
+    ("build", "Conv"): ("s8",),
+    ("llm_build", "Linear"): ("s4", "s8", "fp16", "bf16", "fp8_e4m3", "fp8_e5m2"),
+}
+
+# In-feature counts each llm_build type was checked at (256-hidden layer:
+# cin 256 and 512; the intermediate=2048 build: s8, s4 and bf16 only).
+_LLM_VALIDATED_CIN = {
+    "s8": (256, 512, 2048),
+    "s4": (256, 512, 2048),
+    "bf16": (256, 512, 2048),
+    "fp16": (256, 512),
+    "fp8_e4m3": (256, 512),
+    "fp8_e5m2": (256, 512),
+}
+
+# tinygrad ``DType.name`` (onnxsim/tinygrad @ TINYGRAD_FORK_SHA) -> Axera name.
+# The fork has no 4-bit integer dtype, so s4 is chosen by name ("s4"/"int4").
+_TINYGRAD_NAMES = {
+    "float": "fp32",
+    "half": "fp16",
+    "__bf16": "bf16",
+    "signed char": "s8",
+    "float8_e4m3": "fp8_e4m3",
+    "float8_e5m2": "fp8_e5m2",
+}
+_DTYPE_ALIASES = {
+    **{d: d for d in WEIGHT_DTYPES},
+    "float32": "fp32",
+    "float16": "fp16",
+    "bfloat16": "bf16",
+    "int8": "s8",
+    "int4": "s4",
+    "fp8e4m3": "fp8_e4m3",
+    "fp8e5m2": "fp8_e5m2",
+}
+_WEIGHT_OPS = ("Conv", "Gemm", "MatMul")
+
+
+def axera_weight_dtype(dtype) -> str:
+    """The Axera weight-type name for a tinygrad ``DType`` or a name.
+
+    Accepts ``tinygrad.dtypes.{float32, float16, bfloat16, int8, fp8e4m3,
+    fp8e5m2}``, their attribute names, the Axera names in ``WEIGHT_DTYPES``,
+    and ``"int4"``/``"s4"``. Refuses everything else, including the fnuz fp8
+    variants (a different encoding from llm_build's OCP-style e4m3/e5m2) and
+    unsigned types (both paths store signed symmetric codes)."""
+    if isinstance(dtype, str):
+        out = _DTYPE_ALIASES.get(dtype)
+        if out is None:
+            raise ValueError(f"no Axera weight type for {dtype!r}")
+        return out
+    name = getattr(dtype, "name", None)
+    if name is None or getattr(dtype, "count", 1) != 1:
+        raise ValueError(f"not a scalar tinygrad dtype: {dtype!r}")
+    out = _TINYGRAD_NAMES.get(name)
+    if out is None:
+        raise ValueError(f"no Axera weight type for tinygrad dtype {name!r}")
+    return out
+
+
+def validate_weight_choice(
+    path: str, op: str, dtype, w_shape: Sequence[int] | None = None
+) -> str:
+    """Refuse a (path, op, dtype, weight shape) this repository has not
+    decoded; return the Axera dtype name otherwise. ``op`` is ``"Conv"`` on
+    the build path and ``"Linear"`` (weight ``[out_features, in_features]``)
+    on llm_build."""
+    dt = axera_weight_dtype(dtype)
+    offered = WEIGHT_PATHS.get(path)
+    if offered is None:
+        raise ValueError(f"unknown Pulsar2 path {path!r}; one of {list(WEIGHT_PATHS)}")
+    if dt not in offered:
+        raise ValueError(f"pulsar2 {path} does not offer {dt} weights, only {offered}")
+    validated = _VALIDATED_WEIGHT_DTYPES.get((path, op), ())
+    if dt not in validated:
+        raise ValueError(
+            f"{dt} {op} weights on pulsar2 {path} are not decoded "
+            f"(validated: {validated or 'none'}); that needs a Pulsar2 build"
+        )
+    if w_shape is None:
+        return dt
+    shape = _tup(w_shape)
+    if path == "build":
+        known = {_tup(k[1]) for k in _CONV_TEMPLATES}
+        if shape not in known:
+            raise ValueError(f"no validated {dt} Conv template for weight {shape}")
+    else:
+        if len(shape) != 2 or shape[0] % lbd.ROW_BLOCK:
+            raise ValueError(
+                f"Linear weight must be [out, in] with out a multiple of "
+                f"{lbd.ROW_BLOCK}, got {shape}"
+            )
+        if shape[1] not in _LLM_VALIDATED_CIN[dt]:
+            raise ValueError(
+                f"{dt} was checked at in_features {_LLM_VALIDATED_CIN[dt]}, "
+                f"not {shape[1]}"
+            )
+    return dt
+
+
+def _dequantized(w: np.ndarray, path: str, dt: str) -> np.ndarray:
+    import emitter
+
+    if path == "build":  # s8, the only validated build type
+        codes = emitter.codes_of(w).astype(np.float32) - 128.0
+        step = emitter.weight_scales(w).reshape((-1,) + (1,) * (w.ndim - 1))
+        return codes * step
+    if dt in lbd.FLOAT_TYPES:
+        return lbd.round_float(w, dt)
+    q, scale = lbd.quantize_int(w, 8 if dt == "s8" else 4)
+    return (q * scale[:, None]).astype(np.float32)
+
+
+def encode_weight(w: np.ndarray, dtype, path: str = "llm_build") -> list[bytes]:
+    """The stored weight bytes for ``w`` at the chosen dtype.
+
+    llm_build: the 32-row blocks as llm_build stores them (identical blocks
+    dropped, ``lbd.dedup_blocks``). build (S8 Conv): one element, the
+    per-output-channel uint8 codes in ``w``'s order; their placement in
+    ``npu_params`` and the requant block go through ``ConvWeightEdit``."""
+    w = np.asarray(w, np.float32)
+    op = "Conv" if path == "build" else "Linear"
+    dt = validate_weight_choice(path, op, dtype, w.shape)
+    if path == "build":
+        import emitter
+
+        return [emitter.codes_of(w).tobytes()]
+    return lbd.dedup_blocks(lbd.encode_matrix(w, dt))
+
+
+def weight_dtype_costs(
+    w: np.ndarray, path: str = "llm_build", dtypes: Sequence | None = None
+) -> list[dict]:
+    """Per-dtype storage and error for ``w`` on ``path``, to choose from.
+
+    ``bytes_per_param`` is the stored weight bytes (llm_build: whole 32-row
+    blocks including the scale/row-sum tails, before deduplication; build:
+    the uint8 codes, excluding the per-channel requant block).
+    ``rel_rms_error`` is ``rms(deq - w) / rms(w)``. Only validated dtypes
+    are listed; ``dtypes`` narrows them (and refuses unvalidated ones)."""
+    w = np.asarray(w, np.float32)
+    op = "Conv" if path == "build" else "Linear"
+    if dtypes is None:
+        names = _VALIDATED_WEIGHT_DTYPES.get((path, op), ())
+    else:
+        names = tuple(dict.fromkeys(axera_weight_dtype(d) for d in dtypes))
+    rms = float(np.sqrt(np.mean(np.square(w, dtype=np.float64))))
+    out = []
+    for dt in names:
+        validate_weight_choice(path, op, dt, w.shape)
+        if path == "build":
+            nbytes = w.size
+        else:
+            nbytes = lbd.block_bytes(dt, w.shape[1]) * (w.shape[0] // lbd.ROW_BLOCK)
+        err = _dequantized(w, path, dt).astype(np.float64) - w
+        rel = float(np.sqrt(np.mean(err * err))) / rms if rms else 0.0
+        out.append(
+            {
+                "dtype": dt,
+                "bytes_per_param": nbytes / w.size,
+                "rel_rms_error": rel,
+                "max_abs_error": float(np.abs(err).max()),
+                "sqnr_db": float(-20 * np.log10(rel)) if rel else float("inf"),
+            }
+        )
+    return out
+
+
+def choose_weight_dtype(
+    w: np.ndarray,
+    error_budget: float,
+    path: str = "llm_build",
+    dtypes: Sequence | None = None,
+) -> str:
+    """The validated dtype with the fewest stored bytes whose
+    ``rel_rms_error`` is within ``error_budget``; ties go to the smaller
+    error. On llm_build every float type stores 4 B/param, so fp8 never
+    wins over fp16/bf16 here: it saves no space and loses precision."""
+    costs = weight_dtype_costs(w, path, dtypes)
+    ok = [c for c in costs if c["rel_rms_error"] <= error_budget]
+    if not ok:
+        best = min(costs, key=lambda c: c["rel_rms_error"])
+        raise ValueError(
+            f"no validated dtype within rel_rms_error {error_budget}; "
+            f"best is {best['dtype']} at {best['rel_rms_error']:.3g}"
+        )
+    return min(ok, key=lambda c: (c["bytes_per_param"], c["rel_rms_error"]))["dtype"]
+
+
+@dataclasses.dataclass(frozen=True)
+class QuantPolicy:
+    """Which weight dtype each weight-bearing node gets.
+
+    ``default`` and the values of ``overrides`` are tinygrad dtypes, Axera
+    names, or ``"auto"`` (``choose_weight_dtype`` under ``error_budget``,
+    which needs the weights). ``overrides`` keys are node names first, then
+    op types. ``path`` is ``"build"`` or ``"llm_build"``."""
+
+    default: Any = "s8"
+    path: str = "build"
+    overrides: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    error_budget: float | None = None
+
+    def __post_init__(self):
+        if self.path not in WEIGHT_PATHS:
+            raise ValueError(f"unknown Pulsar2 path {self.path!r}")
+        norm = {k: self._norm(v) for k, v in dict(self.overrides).items()}
+        object.__setattr__(self, "overrides", norm)
+        object.__setattr__(self, "default", self._norm(self.default))
+
+    def _norm(self, dtype) -> str:
+        if dtype == "auto":
+            if self.error_budget is None:
+                raise ValueError('"auto" needs an error_budget')
+            return "auto"
+        dt = axera_weight_dtype(dtype)
+        if dt not in WEIGHT_PATHS[self.path]:
+            raise ValueError(
+                f"pulsar2 {self.path} does not offer {dt} weights, "
+                f"only {WEIGHT_PATHS[self.path]}"
+            )
+        return dt
+
+    def choice_for(self, op: str, node: str | None = None) -> str:
+        """The configured choice (a dtype name or ``"auto"``), unvalidated."""
+        if node is not None and node in self.overrides:
+            return self.overrides[node]
+        return self.overrides.get(op, self.default)
+
+    def resolve(
+        self, op: str, w: np.ndarray | None = None, node: str | None = None
+    ) -> str:
+        """The concrete, validated dtype for one node."""
+        path_op = op if self.path == "build" else "Linear"
+        choice = self.choice_for(op, node)
+        shape = None if w is None else np.shape(w)
+        if choice == "auto":
+            if w is None:
+                raise ValueError('"auto" needs the weights to choose from')
+            return choose_weight_dtype(w, self.error_budget, self.path)
+        return validate_weight_choice(self.path, path_op, choice, shape)
+
+    def to_json(self) -> dict:
+        return {
+            "default": self.default,
+            "path": self.path,
+            "overrides": dict(self.overrides),
+            "error_budget": self.error_budget,
+        }
+
+    @classmethod
+    def from_json(cls, d: Mapping) -> QuantPolicy:
+        return cls(
+            default=d.get("default", "s8"),
+            path=d.get("path", "build"),
+            overrides=dict(d.get("overrides", {})),
+            error_budget=d.get("error_budget"),
+        )
+
+
+def weight_dtype_for_record(rec: Mapping, policy: QuantPolicy) -> dict:
+    """What ``policy`` does to one graph node's weight, for ``coverage_report``:
+    ``{"weight_dtype": name or None, "note": why}``."""
+    op = rec["op"]
+    if op not in _WEIGHT_OPS:
+        return {"weight_dtype": None, "note": "no weight operand"}
+    attrs = rec.get("attrs", {})
+    source = attrs.get("weight_source")
+    if source is None and attrs.get("weight_is_graph_input"):
+        source = "graph_input"
+    if source is None:
+        return {
+            "weight_dtype": None,
+            "note": "record has no weight_source; re-run extract_step_ops",
+        }
+    if source != "initializer":
+        return {
+            "weight_dtype": None,
+            "note": f"weight is {source.replace('_', ' ')}: a runtime tensor, "
+            "quantized with the activation calibration; no weight dtype applies",
+        }
+    try:
+        if policy.path == "llm_build" and op == "Conv":
+            raise ValueError("llm_build has no Conv; use the build path")
+        path_op = op if policy.path == "build" else "Linear"
+        if path_op == "Linear" and op != "MatMul":
+            raise ValueError(
+                f"llm_build Linear weights were decoded for MatMul, not {op}"
+            )
+        choice = policy.choice_for(op, rec.get("name"))
+        if choice == "auto":
+            return {"weight_dtype": "auto", "note": "chosen when weights are given"}
+        w_shape = attrs.get("w")
+        if path_op == "Linear" and w_shape:
+            w_shape = list(w_shape)[::-1]  # ONNX MatMul B is [in, out]
+        dt = validate_weight_choice(policy.path, path_op, choice, w_shape)
+        return {"weight_dtype": dt, "note": "validated"}
+    except ValueError as exc:
+        return {"weight_dtype": None, "note": f"refused: {exc}"}
 
 
 def _zero_points_from_class(cls: str) -> dict[str, int]:
@@ -167,8 +516,15 @@ class TemplateCache:
         if key.toolchain != TOOLCHAIN:
             raise ValueError(f"no templates for toolchain {key.toolchain!r}")
         if key.dtypes != ("float32",):
-            raise ValueError(f"only float32 templates exist, got {key.dtypes}")
+            raise ValueError(
+                f"only float32-activation templates exist, got {key.dtypes} "
+                "(a weight's storage type is weight_dtype)"
+            )
         op = key.op
+        if op == "Conv":
+            validate_weight_choice("build", "Conv", key.weight_dtype or "s8")
+        elif key.weight_dtype:
+            raise ValueError(f"{op} has no constant weight; weight_dtype must be ''")
         if op == "Gather":
             (shape,) = key.shapes
             pair = (shape, key.attr("indices"))
@@ -472,9 +828,19 @@ def extract_step_ops(onnx_path: str) -> list[dict]:
     consts = {n.output[0] for n in model.graph.node if n.op_type == "Constant"}
     graph_inputs = {v.name for v in model.graph.input}
     records = []
+    producers = {o for n in model.graph.node for o in n.output}
     for node in model.graph.node:
         attrs = {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
-        rec: dict[str, Any] = {"op": node.op_type, "attrs": {}}
+        rec: dict[str, Any] = {"op": node.op_type, "name": node.name, "attrs": {}}
+        if node.op_type in _WEIGHT_OPS and len(node.input) > 1:
+            wname = node.input[1]
+            if wname in inits:
+                rec["attrs"]["weight_source"] = "initializer"
+                rec["attrs"].setdefault("w", list(inits[wname].dims))
+            elif wname in graph_inputs:
+                rec["attrs"]["weight_source"] = "graph_input"
+            elif wname in producers:
+                rec["attrs"]["weight_source"] = "computed"
         data_inputs = [i for i in node.input if i and i not in inits]
         rec["shapes"] = [shapes.get(i, []) for i in data_inputs[:1]]
         if node.op_type == "Transpose":
@@ -505,7 +871,9 @@ def extract_step_ops(onnx_path: str) -> list[dict]:
     return records
 
 
-def key_for_record(rec: Mapping, calibration_class: str = "") -> TemplateKey:
+def key_for_record(
+    rec: Mapping, calibration_class: str = "", weight_dtype: str = ""
+) -> TemplateKey:
     attrs = rec.get("attrs", {})
     keep: dict[str, Any] = {}
     if rec["op"] == "Transpose":
@@ -522,6 +890,7 @@ def key_for_record(rec: Mapping, calibration_class: str = "") -> TemplateKey:
         shapes=tuple(_tup(s) for s in rec["shapes"]),
         attrs=tuple(sorted(keep.items())),
         calibration_class=calibration_class,
+        weight_dtype=weight_dtype,
     )
 
 
@@ -602,24 +971,48 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
         return ("refused", str(exc))
 
 
-def coverage_report(records: Sequence[Mapping]) -> dict:
-    """Per-op counts of covered / conditional / refused nodes, with reasons."""
+def coverage_report(
+    records: Sequence[Mapping], policy: QuantPolicy | None = None
+) -> dict:
+    """Per-op counts of covered / conditional / refused nodes, with reasons.
+    With a ``policy``, also each node's weight dtype (``per_node``) and a
+    count of those outcomes per op (``weight_dtypes``)."""
     cache = TemplateCache()
     per_op: dict[str, Counter] = defaultdict(Counter)
     reasons: dict[str, Counter] = defaultdict(Counter)
-    for rec in records:
+    per_node = []
+    wd: dict[str, Counter] = defaultdict(Counter)
+    for i, rec in enumerate(records):
         status, detail = plan_node(rec, cache)
         per_op[rec["op"]][status] += 1
         reasons[rec["op"]][f"{status}: {detail}"] += 1
+        if policy is not None:
+            choice = weight_dtype_for_record(rec, policy)
+            per_node.append(
+                {
+                    "index": i,
+                    "op": rec["op"],
+                    "name": rec.get("name", ""),
+                    "status": status,
+                    **choice,
+                }
+            )
+            if rec["op"] in _WEIGHT_OPS:
+                wd[rec["op"]][f"{choice['weight_dtype']}: {choice['note']}"] += 1
     totals = Counter()
     for c in per_op.values():
         totals.update(c)
-    return {
+    report = {
         "nodes": len(records),
         "totals": dict(totals),
         "per_op": {op: dict(c) for op, c in sorted(per_op.items())},
         "reasons": {op: dict(c) for op, c in sorted(reasons.items())},
     }
+    if policy is not None:
+        report["policy"] = policy.to_json()
+        report["weight_dtypes"] = {op: dict(c) for op, c in sorted(wd.items())}
+        report["per_node"] = per_node
+    return report
 
 
 # --------------------------------------------------------------------------
@@ -628,18 +1021,52 @@ def coverage_report(records: Sequence[Mapping]) -> dict:
 # --------------------------------------------------------------------------
 
 
-def build_request(key: TemplateKey, edits: Sequence[Edit]) -> str:
+def build_request(
+    key: TemplateKey, edits: Sequence[Edit], node: str | None = None
+) -> str:
     """The "source" ``AXCompiler`` compiles: a JSON template request. This is
     what a graph/JIT-level hook would emit for one fused subgraph (plan section
     5: the compile unit is the fused subgraph, not a per-kernel renderer)."""
-    return json.dumps(
-        {"key": key.to_json(), "edits": [e.to_json() for e in edits]}, sort_keys=True
-    )
+    req = {"key": key.to_json(), "edits": [e.to_json() for e in edits]}
+    if node is not None:
+        req["node"] = node
+    return json.dumps(req, sort_keys=True)
 
 
-def compile_request(src: str, cache: TemplateCache | None = None) -> bytes:
+def apply_policy(
+    key: TemplateKey, policy: QuantPolicy, node: str | None = None
+) -> TemplateKey:
+    """``key`` with its weight dtype set by ``policy``. A key that already
+    names a weight dtype must agree with the policy. Templates exist only
+    for the build path, so an llm_build policy is refused here (use
+    ``encode_weight`` for llm_build weight bytes)."""
+    if key.op not in _WEIGHT_OPS:
+        if key.weight_dtype:
+            raise ValueError(f"{key.op} has no constant weight")
+        return key
+    if policy.path != "build":
+        raise ValueError(
+            "no llm_build engine templates are committed; encode_weight() "
+            "gives llm_build weight bytes"
+        )
+    choice = policy.choice_for(key.op, node)
+    if choice == "auto":
+        raise ValueError('"auto" is resolved from weights; call policy.resolve()')
+    dt = validate_weight_choice("build", key.op, choice, key.attr("w"))
+    if key.weight_dtype and key.weight_dtype != dt:
+        raise ValueError(
+            f"request asks for {key.weight_dtype} weights, policy says {dt}"
+        )
+    return dataclasses.replace(key, weight_dtype=dt)
+
+
+def compile_request(
+    src: str, cache: TemplateCache | None = None, policy: QuantPolicy | None = None
+) -> bytes:
     req = json.loads(src)
     key = TemplateKey.from_json(req["key"])
+    if policy is not None:
+        key = apply_policy(key, policy, req.get("node"))
     model = EditSet([edit_from_json(e) for e in req["edits"]]).build(key, cache)
     return model.SerializeToString()
 
@@ -652,14 +1079,25 @@ def tinygrad_classes() -> dict[str, type]:
     class AXCompiler(Compiler):
         """Architecture B's compiler: template lookup + validated edits. The
         cache key disables tinygrad's disk cache; templates are already cached
-        as fixtures."""
+        as fixtures. ``weight_dtype`` (a tinygrad dtype, e.g. ``dtypes.int8``)
+        or a full ``policy`` selects how constant weights are stored."""
 
-        def __init__(self, cache: TemplateCache | None = None):
+        def __init__(
+            self,
+            cache: TemplateCache | None = None,
+            policy: QuantPolicy | None = None,
+            weight_dtype=None,
+        ):
             super().__init__(cachekey=None)
             self.cache = cache or TemplateCache()
+            if policy is not None and weight_dtype is not None:
+                raise ValueError("pass policy or weight_dtype, not both")
+            if weight_dtype is not None:
+                policy = QuantPolicy(default=weight_dtype)
+            self.policy = policy
 
         def compile(self, src: str) -> bytes:
-            return compile_request(src, self.cache)
+            return compile_request(src, self.cache, self.policy)
 
     class AXAllocator(Allocator):
         def _alloc(self, size, options):
@@ -703,13 +1141,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     ex.add_argument("out")
     cov = sub.add_parser("coverage", help="coverage report from op records")
     cov.add_argument("records")
+    cov.add_argument("--weight-dtype", help="per-node weight dtype for this choice")
+    cov.add_argument("--path", default="build", choices=sorted(WEIGHT_PATHS))
     args = p.parse_args(argv)
     if args.cmd == "extract":
         with gzip.open(args.out, "wt") as f:
             json.dump(extract_step_ops(args.onnx), f)
         return 0
     with gzip.open(args.records, "rt") as f:
-        print(json.dumps(coverage_report(json.load(f)), indent=1))
+        records = json.load(f)
+    policy = None
+    if args.weight_dtype:
+        policy = QuantPolicy(default=args.weight_dtype, path=args.path)
+    report = coverage_report(records, policy)
+    report.pop("per_node", None)
+    print(json.dumps(report, indent=1))
     return 0
 
 
