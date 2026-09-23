@@ -9,9 +9,11 @@ interface dfa_rpc : remote_handle64 {
                 in sequence<int32> vzp,     // (4)
                 in sequence<int32> hw,      // (8)
                 in sequence<float> pts,     // (6, Q, 16, 2)
-                in sequence<float> w,       // (6, 4, Q, 8, 16)
+                in sequence<float> w,       // (6, 4, Q, 8, 16) fp32, or fp16 with flags bit 16
                 in int32 Q,
-                in int32 flags,             // bits 0-7: threads; bits 8-15: anchors per job / 16 (0: 32)
+                in int32 flags,             // bits 0-7: threads; bits 8-15: anchors per job / 16 (0: 32);
+                                    // bit 16: w holds fp16 (its length still in 4-byte words);
+                                    // bit 17: w is fp16 (Q, 8, 6*4*16) (split.py v2 layout)
                 rout sequence<float> result,   // (Q, 256)
                 rout uint64 dsp_us);
   AEEResult perf_vote(in int32 turbo, rout int32 rc);

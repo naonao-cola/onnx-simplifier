@@ -38,6 +38,10 @@ def main():
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--reps", type=int, default=8)
     ap.add_argument("--flags", default="4")
+    ap.add_argument("--models", default="", help="variant of the pre0 / mid pieces: w16 (io16.py), w2 (split.py --w-layout v2)")
+    ap.add_argument("--scene", action="store_true", help="s4d_scene: the whole scene in one process, bank on the phone")
+    ap.add_argument("--pipeline", type=int, default=0,
+                    help="with --scene: 1 = next frame's bb + pre0 on a free thread, 2 = during DFA calls 0 / 1")
     a = ap.parse_args()
     work, build = Path(a.work), Path(a.build)
     sp = work / "split"
@@ -45,14 +49,16 @@ def main():
     pc.adb("shell", f"mkdir -p {R}/split")
     for f in sorted((pc.Q / "libs").iterdir()):
         pc.push_if_changed(f, f"{R}/{f.name}")
-    for f in ("s4d_run", "dfa_rpc.so"):
+    for f in ("s4d_run", "s4d_scene", "dfa_rpc.so"):
         pc.adb("push", "-q", str(build / f), f"{R}/{f}")
-    names = ["bb.q8"] + ["pre0"] + [f"mid{k}{t}" for k in range(5) for t in "FT"] + ["postF", "postT"]
-    for n in names:
-        fn = f"{n}.onnx" if n.endswith("q8") else f"{n}.sim.onnx"
+    wp = ["pre0"] + [f"mid{k}{t}" for k in range(5) for t in "FT"]
+    files = ["bb.q8.onnx"] + [f"{n}.{a.models or 'sim'}.onnx" for n in wp] + ["postF.sim.onnx", "postT.sim.onnx"]
+    for fn in files:
         pc.push_if_changed(sp / fn, f"{R}/split/{fn}")
     for n in ("instance_feature.f32", "anchor.f32"):
         pc.push_if_changed(sp / n, f"{R}/split/{n}")
+    if a.scene:
+        return scene(a, work)
     bank = InstanceBank()
     tot = {0.3: [0, 0, 0], 0.2: [0, 0, 0]}
     times = []
@@ -71,7 +77,8 @@ def main():
             np.ascontiguousarray(v, dtype=v.dtype).tofile(p)
             pc.adb("push", "-q", str(p), f"{d}/{n}")
             p.unlink()
-        out = pc.adb("shell", f"cd {R} && ORT_SPIN=0 QNN_PERF=burst DFA_FLAGS={a.flags} LD_LIBRARY_PATH={R} "
+        out = pc.adb("shell", f"cd {R} && ORT_SPIN=0 QNN_PERF=burst DFA_FLAGS={a.flags} S4D_MODELS={a.models} "
+                     f"LD_LIBRARY_PATH={R} "
                      f"ADSP_LIBRARY_PATH='{R};/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp' "
                      f"./s4d_run split {d} {a.warmup} {a.reps} 2>&1", capture=True)
         if "PASS" not in out:
@@ -95,6 +102,47 @@ def main():
                 print("   ", line.strip())
     med = float(np.median(times))
     print(f"median over frames: {med:.1f} ms/frame ({1000 / med:.1f} FPS)")
+    for t, (tp, npred, ngt) in tot.items():
+        print(f"score >= {t}: GT matched {tp}/{ngt}, predictions {npred}")
+
+
+def scene(a, work):
+    """Push the scene's frame inputs once, run s4d_scene (instance bank on the phone), then decode and
+    GT-match its per-frame outputs on the host."""
+    frames = load_frames(work)
+    for k, fr in enumerate(frames):
+        metas = fr["metas"]
+        ins = {"rgb.u8": fr["rgb"], "proj.f32": metas["projection_mat"].numpy(),
+               "proj_n.f32": normalized_proj(metas["projection_mat"]).numpy(),
+               "meta.f64": np.concatenate([[metas["timestamp"]], np.asarray(metas["T_global"]).ravel(),
+                                           np.asarray(metas["T_global_inv"]).ravel()]).astype(np.float64)}
+        d = f"{R}/scene/f{k}"
+        pc.adb("shell", f"mkdir -p {d}")
+        for n, v in ins.items():
+            p = pc.TMP / n
+            np.ascontiguousarray(v).tofile(p)
+            pc.push_if_changed(p, f"{d}/{n}")
+            p.unlink()
+    out = pc.adb("shell", f"cd {R} && ORT_SPIN=0 QNN_PERF=burst DFA_FLAGS={a.flags} S4D_MODELS={a.models} "
+                 f"PIPELINE={a.pipeline} LD_LIBRARY_PATH={R} "
+                 f"ADSP_LIBRARY_PATH='{R};/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp' "
+                 f"./s4d_scene split {R}/scene {len(frames)} {a.warmup + a.reps} 2>&1", capture=True)
+    if "PASS" not in out:
+        raise SystemExit(f"s4d_scene failed\n{out[-3000:]}")
+    print("\n".join(line for line in out.splitlines() if line.startswith(("sessions", "frame_ms", "dfa", "frame "))))
+    tot = {0.3: [0, 0, 0], 0.2: [0, 0, 0]}
+    for k, fr in enumerate(frames):
+        res = {}
+        for n, shape in (("cls", (900, 10)), ("box", (900, 11)), ("quality", (900, 2))):
+            p = pc.TMP / f"{n}.f32"
+            subprocess.run(["adb", "-s", pc.SERIAL, "pull", "-q", f"{R}/scene/f{k}/{n}.f32", str(p)], check=True)
+            res[n] = torch.from_numpy(np.fromfile(p, np.float32).reshape(shape))
+            p.unlink()
+        boxes, scores, labels = decode(res["cls"], res["box"], res["quality"])
+        r = {t: match(boxes, scores, labels, fr["gt"], thr=t) for t in tot}
+        for t in tot:
+            tot[t] = [x + y for x, y in zip(tot[t], r[t])]
+        print(f"frame {k}: GT >=0.3 {r[0.3][0]}/{r[0.3][2]}  >=0.2 {r[0.2][0]}", flush=True)
     for t, (tp, npred, ngt) in tot.items():
         print(f"score >= {t}: GT matched {tp}/{ngt}, predictions {npred}")
 

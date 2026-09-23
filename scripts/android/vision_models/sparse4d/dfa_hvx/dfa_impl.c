@@ -45,10 +45,20 @@ int dfa_rpc_close(remote_handle64 h) {
   return 0;
 }
 
+#define MAX_THREADS 8
+#define STACK_SIZE 65536 /* the msda HVX body keeps ~24 KB on the stack */
+#define MAX_QB 256       /* anchors per job with fp16 weights (the per-thread conversion buffer) */
+static char stacks[MAX_THREADS][STACK_SIZE] __attribute__((aligned(128)));
+static float wbufs[MAX_THREADS][MAX_QB * DFA_M * DFA_P] __attribute__((aligned(128)));
+#define MAX_QB_W2 64 /* anchors per job with v2 weights: the block's transposed weights, 384 KB */
+static uint16_t stages[MAX_THREADS][MAX_QB_W2 * DFA_CAMS * DFA_LEVELS * DFA_M * DFA_P] __attribute__((aligned(128)));
+
 typedef struct {
   const dfa_args_t* a;
   volatile int* next;
   int qb, njobs;
+  float* wbuf;
+  uint16_t* stage;
 } job_t;
 
 static void thread_main(void* arg) {
@@ -58,22 +68,22 @@ static void thread_main(void* arg) {
     int k = __atomic_fetch_add(j->next, 1, __ATOMIC_RELAXED);
     if (k >= j->njobs) break;
     int q0 = k * j->qb, q1 = q0 + j->qb < j->a->Q ? q0 + j->qb : j->a->Q;
-    dfa_run(j->a, q0, q1);
+    dfa_run(j->a, q0, q1, j->wbuf, j->stage);
   }
   if (locked) qurt_hvx_unlock();
   qurt_thread_exit(0);
 }
 
-#define MAX_THREADS 8
-#define STACK_SIZE 65536 /* the msda HVX body keeps ~24 KB on the stack */
-static char stacks[MAX_THREADS][STACK_SIZE] __attribute__((aligned(128)));
-
 AEEResult dfa_rpc_run(remote_handle64 h, const uint8* v0, int v0Len, const uint8* v1, int v1Len, const uint8* v2,
                       int v2Len, const uint8* v3, int v3Len, const float* vscale, int vscaleLen, const int32* vzp,
                       int vzpLen, const int32* hw, int hwLen, const float* pts, int ptsLen, const float* w, int wLen,
                       int32 Q, int32 flags, float* out, int outLen, uint64* dsp_us) {
+  /* flags bit 16: w holds fp16 (wLen still counts 4-byte words, so half the weights); bit 17: w is
+   * fp16 in the v2 layout (Q, 8, 384) (dfa_core.h) */
+  const int w2 = (flags >> 17) & 1, w16 = w2 || ((flags >> 16) & 1);
+  const long nw = (long)DFA_CAMS * DFA_LEVELS * Q * DFA_M * DFA_P;
   if (Q < 1 || Q > MAX_Q || vscaleLen < DFA_LEVELS || vzpLen < DFA_LEVELS || hwLen < 2 * DFA_LEVELS ||
-      ptsLen < DFA_CAMS * Q * DFA_P * 2 || wLen < DFA_CAMS * DFA_LEVELS * Q * DFA_M * DFA_P || outLen < Q * DFA_C)
+      ptsLen < DFA_CAMS * Q * DFA_P * 2 || (long)wLen < (w16 ? nw / 2 : nw) || outLen < Q * DFA_C)
     return -1;
   dfa_args_t a;
   memset(&a, 0, sizeof a);
@@ -88,25 +98,31 @@ AEEResult dfa_rpc_run(remote_handle64 h, const uint8* v0, int v0Len, const uint8
     a.scale[l] = vscale[l];
     a.zp[l] = vzp[l];
   }
-  a.pts = pts; a.w = w; a.zeros = zeros; a.vis = vis; a.tmp = tmp; a.out = out;
+  a.pts = pts; a.zeros = zeros; a.vis = vis; a.tmp = tmp; a.out = out;
+  if (w2) a.w2 = (const uint16_t*)w;
+  else if (w16) a.w16 = (const uint16_t*)w;
+  else a.w = w;
   if (dfa_check(&a)) return -1;
   unsigned long long t0 = HAP_perf_get_time_us();
   volatile int next = 0;
   int qb = ((flags >> 8) & 0xff) * 16;
   if (qb < 1) qb = 32;
-  job_t j = {&a, &next, qb, (Q + qb - 1) / qb};
+  if (w16 && qb > MAX_QB) qb = MAX_QB;
+  if (w2 && qb > MAX_QB_W2) qb = MAX_QB_W2;
   int nthreads = flags & 0xff, rc = 0;
   if (nthreads < 1) nthreads = 1;
   if (nthreads > MAX_THREADS) nthreads = MAX_THREADS;
+  job_t jobs[MAX_THREADS];
   qurt_thread_t tids[MAX_THREADS];
   int started = 0;
   for (int t = 0; t < nthreads; t++) {
+    jobs[t] = (job_t){&a, &next, qb, (Q + qb - 1) / qb, wbufs[t], stages[t]};
     qurt_thread_attr_t attr;
     qurt_thread_attr_init(&attr);
     qurt_thread_attr_set_stack_addr(&attr, stacks[t]);
     qurt_thread_attr_set_stack_size(&attr, STACK_SIZE);
     qurt_thread_attr_set_priority(&attr, qurt_thread_get_priority(qurt_thread_get_id()));
-    if (qurt_thread_create(&tids[t], &attr, thread_main, &j) != QURT_EOK) { rc = -2; break; }
+    if (qurt_thread_create(&tids[t], &attr, thread_main, &jobs[t]) != QURT_EOK) { rc = -2; break; }
     started++;
   }
   for (int t = 0; t < started; t++) { int st; qurt_thread_join(tids[t], &st); }
