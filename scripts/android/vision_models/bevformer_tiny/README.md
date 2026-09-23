@@ -15,6 +15,7 @@ frames, then exported and run piece by piece on the phone's HTP through QNN.
 | `export.py` | one piece -> ONNX (TorchScript exporter, opset 17) -> ORT CPU check -> onnxsim -> check; phone inputs + fp32 reference outputs |
 | `run_phone.sh`, `compare_out.py` | partition report + strict all-HTP run of a piece (`../../vision_models_probe/partition_report.sh`), outputs vs fp32 |
 | `e2e_phone.py` | whole model on the HTP frame after frame (phone outputs chained, HTP prev_bev carried) vs fp32 torch and GT |
+| `quantize.py` | int8 QDQ pieces with onnxsim's whole-graph quantizer (`onnxsim.full_qdq`): calibration set, backbone, mixed-precision encoder/decoder policies |
 | `bisect_precision.py`, `bisect_run.sh` | expose chosen intermediates as outputs, run on the HTP, per-tensor cosine vs ORT CPU |
 
 Reproduce (each heavy step under `systemd-run --user --wait --collect --pipe -p MemoryMax=16G -p MemorySwapMax=0`):
@@ -95,3 +96,37 @@ Two independent causes, both fixed in `model.py` with exact (fp32-identical) rew
    exposing a few tensors at a time (`bisect_run.sh`): the Concat is correct, the Gemm right
    after the reshape is not. Projecting each frame separately and stacking afterwards fixes it
    (enc1 cos 0.916 -> 0.99999) and is 36% faster (165 -> 105 ms).
+
+## int8 on the HTP (`quantize.py`, `onnxsim.full_qdq`)
+
+`onnxsim.quantize_static` only wraps MatMul/Gemm/Conv *inputs* in Q/DQ, which leaves every Conv
+output (and each Relu/Add/MaxPool) as float, so the HTP runs it in fp16. `onnxsim.full_qdq`
+(new) quantizes the whole graph into QDQ node units: calibrated uint8 activations
+(`onnxsim.calibration.calibrate`), int8 per-channel weights, int32 biases, data-movement ops
+sharing their input's qparams, Relu folded into the producer's Q (zp 0), plus `quantized_io` for
+uint8 (and NHWC) graph I/O. That covers the Mask R-CNN backbone's hand rewrites
+(`../../htp_exploration/ceiling/`: int8 residual Adds, uint8 I/O, NHWC image input) by
+construction.
+
+Calibration: fp32 torch over the first 3 keyframes of scene-0061, -0553, -0757 and -1077 (night),
+chained with prev_bev: 12 samples, all disjoint from the scene-0103 evaluation frames.
+
+```sh
+C=~/.cache/onnxsim-bevformer; S="systemd-run --user --wait --collect --pipe -p MemoryMax=16G -p MemorySwapMax=0"
+$S python3 quantize.py calib --ckpt $C/bevformer_tiny_epoch_24.pth --data $C/nuscenes-mini --work $C/work
+$S python3 quantize.py backbone --work $C/work          # -> backbone6.q8.onnx (+ .json io qparams)
+adb push $C/work/backbone6.q8.onnx /data/local/tmp/bevformer_tiny/
+$S python3 e2e_phone.py --ckpt ... --data ... --work $C/work --backbone backbone6.q8
+```
+
+The backbone is calibrated on `backbone1` (one camera per batch, 72 batches; peak 4.2 GB) and
+the ranges are applied to `backbone6` (identical tensor names). Result, strict all-HTP, burst:
+
+| backbone (6 cameras) | ms | feats cos vs fp32 | e2e GT matched (6 frames, scene-0103) |
+|---|---|---|---|
+| fp16 (fp32 graph) | 126 | 1.00000 | 105 / 190 |
+| int8 QDQ, uint8 NHWC image in, uint8 feats out | **20.9** | 0.994 | **108** / 190 (fp32 torch: 106) |
+
+6.0x faster at the same detection quality (the feats cos of 0.994 becomes bev 0.997-0.998 and
+cls/bbox >= 0.9997 after the encoder). The host quantizes the normalized image
+(`round(x / 0.01866) + 114`, NHWC) where it normalizes it anyway.
