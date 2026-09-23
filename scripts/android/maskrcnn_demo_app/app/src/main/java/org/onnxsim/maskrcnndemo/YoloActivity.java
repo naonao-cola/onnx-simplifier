@@ -15,8 +15,9 @@ import java.util.Locale;
  * YOLO mode (its own process, see the manifest): a deploy-pipeline YOLO model (yolo26n / yolo11n,
  * ../deploy) on the HTP, from the camera or the test images, with boxes, labels and an FPS panel.
  * Same camera path and extras as MainActivity, plus
- *   model   yolo26n (default) or yolo11n: <files>/models/<model>.onnx
- *   opts    YoloEngine options, e.g. "conf=0.25" (post=end2end for yolo26*, nms otherwise)
+ *   model   yolo26n (default), yolo11n or rfdetr_nano: <files>/models/<model>.onnx
+ *   opts    YoloEngine options, e.g. "conf=0.25" (post=end2end for yolo26*, detr for rfdetr*,
+ *           nms otherwise)
  * The model buttons switch YOLO models in place (the engine re-inits its HTP session).
  */
 public class YoloActivity extends MainActivity {
@@ -36,7 +37,8 @@ public class YoloActivity extends MainActivity {
     String engineInit(String model, String opts) {
         return YoloEngine.nativeInit(new File(getFilesDir(), "models").getAbsolutePath(),
                 getApplicationInfo().nativeLibraryDir, model,
-                model.startsWith("yolo26") || opts.contains("post=") ? opts : "post=nms;" + opts);
+                model.startsWith("yolo26") || model.startsWith("rfdetr") || opts.contains("post=") ? opts
+                        : "post=nms;" + opts);
     }
 
     Engine.Result newResult() {
