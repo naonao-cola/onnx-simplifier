@@ -77,6 +77,8 @@ first batch (`step1_ref.pkl`) and the committed calibration
      The other 19 run on the NPU and match.
    - So `coverage_report`'s Reshape count overstates what is correct by
      those 100 nodes.
+   - Fixed since: signed Reshapes now take `Reshape -> Identity` templates,
+     which are exact on the device (`docs/axera-reshape-signed-templates.md`).
 3. **Gather templates kept their own calibration.**
    - `GatherIndexEdit` moves the indices but leaves the template's
      `(1/s, s, zp)`. On the device, Gather_57 differed from float at 26% of
@@ -105,6 +107,10 @@ first batch (`step1_ref.pkl`) and the committed calibration
      `...:reshape64` fused chain at an `s_y/s_x` of about 460.
      `--validated <report>` keeps failing segments on the host in later
      runs.
+   - The `...:reshape64` failures were `relayout_segment` shifting a scalar
+     header word (0x1000 at byte 72) when the stream re-encoded 32 bytes
+     shorter; fixed, and exact on the device
+     (`docs/axera-reshape-signed-templates.md`). Add_976 is still open.
 5. **The loss head cannot be uint8.** The device matches the simulation
    there; the damage is from quantization itself.
    - With Softmax on the NPU, the student's probabilities, which are about

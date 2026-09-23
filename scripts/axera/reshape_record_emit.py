@@ -42,6 +42,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import binary_op_scale_emit as bose  # noqa: E402
 import short_unit_codec as suc  # noqa: E402
 
 _FIXTURES = os.path.join(_HERE, "fixtures")
@@ -307,6 +308,9 @@ non-fused Reshape -> Relu writes each once with the calibrated value."""
 GATHER_ZP_REGS = frozenset(r.to_bytes(2, "little") for r in (0x1B10, 0x1A90))
 """A standalone last-axis Gather (``memory_emit``) writes its one shared zero
 point to these two only."""
+IDENTITY_ZP_REGS = GATHER_ZP_REGS
+"""A ``Reshape -> Identity`` build writes its zero point to 0x1b10/0x1a90 only
+(the Relu form's 0x1eb0 write is the Relu's own)."""
 
 
 def _lane_values(raw: bytes) -> dict[int, bytes]:
@@ -380,7 +384,10 @@ def retarget_scale(
                     4, "little"
                 )
         if bytes(new) != raw:
-            out = suc.replace_segment(out, s, bytes(new))
+            # the re-encoded stream can pad to another multiple of 32 bytes
+            # (seen on a 1024x28224 Identity build): relayout the blob as
+            # Pulsar2 does rather than refuse
+            out = bose.relayout_segment(out, s, bytes(new))
     if not seen:
         raise ValueError("no scale-lane records to retarget")
     return out
@@ -494,6 +501,21 @@ def step_template_zp0(
     return dict(entry, axmodel=os.path.join(STEP_TEMPLATE_DIR, entry["axmodel"]))
 
 
+def step_template_identity(
+    in_shape: Sequence[int], out_shape: Sequence[int], manifest: dict | None = None
+) -> dict:
+    """Like ``step_template``, for the ``Reshape -> Identity`` build of the
+    shape pair: a pure requantizing copy with no Relu, so it keeps a signed
+    input (``docs/axera-reshape-signed-templates.md``). Raises ``ValueError``
+    if none was built for that shape pair."""
+    m = manifest if manifest is not None else step_manifest()
+    key = _shape_key(in_shape, out_shape)
+    entry = m.get("identity_templates", {}).get(key)
+    if entry is None:
+        raise ValueError(f"no validated Reshape -> Identity step template for {key}")
+    return dict(entry, axmodel=os.path.join(STEP_TEMPLATE_DIR, entry["axmodel"]))
+
+
 def emit_step_reshape(
     in_shape: Sequence[int],
     out_shape: Sequence[int],
@@ -502,9 +524,14 @@ def emit_step_reshape(
     output_path: str | None = None,
 ) -> onnx.ModelProto:
     """The step template for ``in_shape -> out_shape`` retargeted to the
-    calibration ``(scale, zero_point)``. A zero point of 0 needs its own
-    template (``step_template_zp0``; a different program, see
-    ``retarget_scale``)."""
+    calibration ``(scale, zero_point)``.
+
+    A nonzero zero point means the input range goes negative, so it takes the
+    ``Reshape -> Identity`` template (``step_template_identity``): the
+    ``Reshape -> Relu`` templates of ``step_template`` clip the negative half
+    and are never emitted for it. A zero point of 0 (a nonnegative input, where
+    the Relu is the identity) takes its own template (``step_template_zp0``; a
+    different program, see ``retarget_scale``)."""
     import step_recalibrate
 
     if zero_point == 0:
@@ -512,9 +539,9 @@ def emit_step_reshape(
         model = load_axmodel(entry["axmodel"])
         mc = retarget_scale(mcode_of(model), scale)
     else:
-        entry = step_template(in_shape, out_shape)
+        entry = step_template_identity(in_shape, out_shape)
         model = load_axmodel(entry["axmodel"])
-        mc = retarget_scale(mcode_of(model), scale, zero_point)
+        mc = retarget_scale(mcode_of(model), scale, zero_point, IDENTITY_ZP_REGS)
     # re-encoding can change the blob length; the runtime reads it from dims
     model = step_recalibrate.with_mcode(model, mc)
     if output_path:

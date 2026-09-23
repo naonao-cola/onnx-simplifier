@@ -168,15 +168,54 @@ def test_step_template_refuses_a_zero_zero_point():
 
 
 def test_emit_step_reshape_and_unknown_shape(tmp_path):
-    key = sorted(_STEP_MANIFEST["templates"])[0]
-    t = _STEP_MANIFEST["templates"][key]
+    key = sorted(_STEP_MANIFEST["identity_templates"])[0]
+    t = _STEP_MANIFEST["identity_templates"][key]
     si, so = ([int(x) for x in s.split("x")] for s in key.split("->"))
     out = tmp_path / "r.axmodel"
-    m = rre.emit_step_reshape(si, so, t["check"]["scale"], 128, str(out))
-    b = _mcode(os.path.join(rre.STEP_TEMPLATE_DIR, t["check"]["axmodel"]))
+    c = t["check"]
+    m = rre.emit_step_reshape(si, so, c["scale"], c["zero_point"], str(out))
+    b = _mcode(os.path.join(rre.STEP_TEMPLATE_DIR, c["axmodel"]))
     assert _same_program(rre.mcode_of(m), b) and out.exists()
     with pytest.raises(ValueError, match="no validated step Reshape template"):
         rre.step_template([3, 5], [15])
+    with pytest.raises(ValueError, match="Reshape -> Identity"):
+        rre.emit_step_reshape([3, 5], [15], 0.01, 100)
+
+
+def _zp_regs(mc):
+    """Registers written with a nonzero value among the zero-point ones."""
+    regs = set()
+    for raw in suc.decode_segments(mc):
+        for k in range(0, len(raw), 8):
+            w = raw[k : k + 8]
+            reg = w[2] | w[3] << 8
+            if w[0] == 0xA1 and reg in (0x1B10, 0x1EB0, 0x1A90) and w[4:] != bytes(4):
+                regs.add(reg)
+    return regs
+
+
+@pytest.mark.parametrize("key", sorted(_STEP_MANIFEST["identity_templates"]))
+def test_identity_template_retargets_onto_its_other_calibration(key):
+    # docs/axera-reshape-signed-templates.md: Reshape -> Identity is a
+    # requantizing copy without the Relu form's 0x1eb0 clamp write
+    t = _STEP_MANIFEST["identity_templates"][key]
+    c = t["check"]
+    a = _mcode(os.path.join(rre.STEP_TEMPLATE_DIR, t["axmodel"]))
+    b = _mcode(os.path.join(rre.STEP_TEMPLATE_DIR, c["axmodel"]))
+    assert _zp_regs(a) == {0x1B10, 0x1A90}
+    regs = rre.IDENTITY_ZP_REGS
+    assert _same_program(rre.retarget_scale(a, c["scale"], c["zero_point"], regs), b)
+    assert _same_program(rre.retarget_scale(b, t["scale"], t["zero_point"], regs), a)
+
+
+def test_relu_template_writes_the_clamp_zero_point():
+    # why the Relu form is not emitted for a signed input: its program writes
+    # the zero point to 0x1eb0 as well, the Relu's lower clamp
+    key = sorted(_STEP_MANIFEST["identity_templates"])[0]
+    relu = _STEP_MANIFEST["templates"][key]
+    assert 0x1EB0 in _zp_regs(
+        _mcode(os.path.join(rre.STEP_TEMPLATE_DIR, relu["axmodel"]))
+    )
 
 
 @pytest.mark.parametrize("key", sorted(_STEP_MANIFEST.get("squeeze_builds", {})))

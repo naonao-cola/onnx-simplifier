@@ -333,3 +333,29 @@ def test_reducesum_equivalent_reduces_the_same_bytes(key, alt):
     assert mre.normalized_records(bytes(mre.mcode_initializer(got).raw_data)) == (
         mre.normalized_records(want)
     )
+
+
+_RELAYOUT = os.path.join(FIXTURES, "misc_op_record_emit", "relayout")
+_NOISE = range(301, 400)  # segment 0 slot table: a per-build permutation
+
+
+@pytest.mark.parametrize(
+    "name", sorted(json.load(open(os.path.join(_RELAYOUT, "index.json"))))
+)
+def test_fused_chain_at_an_extreme_ratio_matches_native_bytes(name):
+    # The C64 ReduceSum -> flatten chain at the step's s_y/s_x of ~460 re-encodes
+    # 32 bytes shorter. relayout_segment used to shift the scalar header word
+    # 0x1000 at byte 72 as if it were an offset; the model then ran 48-71 LSB
+    # off (or faulted) on the device. Pulsar2 keeps it:
+    # docs/axera-reshape-signed-templates.md.
+    meta = json.load(open(os.path.join(_RELAYOUT, "index.json")))[name]
+    with gzip.open(os.path.join(_RELAYOUT, name)) as f:
+        native = onnx.load_model_from_string(f.read())
+    got = bytes(
+        mre.mcode_initializer(
+            mre.emit_model(meta["key"], meta["scales"], meta["zero_points"])
+        ).raw_data
+    )
+    want = bytes(mre.mcode_initializer(native).raw_data)
+    assert len(got) == len(want)
+    assert [i for i in range(len(got)) if got[i] != want[i] and i not in _NOISE] == []
