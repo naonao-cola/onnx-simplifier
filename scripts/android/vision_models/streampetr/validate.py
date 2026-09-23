@@ -15,11 +15,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import numpy as np
-import torch
-
 import data as D
 import model as M
+import numpy as np
+import torch
 
 
 def main():
