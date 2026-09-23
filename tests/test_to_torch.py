@@ -557,3 +557,31 @@ def test_gqa_do_rotary_sdpa_mode_takes_position_ids():
         pytest.skip(f"onnxruntime cannot run the contrib ops: {e}")
     (got,) = mod(torch.from_numpy(feeds["input_ids"]), pos)
     np.testing.assert_allclose(got.numpy(), want, rtol=1e-4, atol=1e-4)
+
+
+def test_constant_matmul_weights_become_linear():
+    # ONNX MatMul stores [K, N] weights; the converter keeps them as [N, K] and emits
+    # F.linear -- PyTorch's layout, AutoDeploy's canonical linear, and what cuBLAS's
+    # batch-1 decode GEMV is fast on (a [K, N] weight cost Qwen3-0.6B 22% of its decode
+    # speed through AutoDeploy). Activation @ activation MatMuls (attention) stay matmul.
+    from torch.export import export
+
+    model = _decoder_model()
+    mod = onnx_to_torch(model)
+    assert "wq::T" in mod.param_names and "wq" not in mod.param_names
+    assert getattr(mod, mod.param_names["wq::T"]).shape == (HQ * HEAD, HIDDEN)
+    feeds = _feeds(2, 3, 0)
+    ep = export(
+        mod,
+        (),
+        {
+            "input_ids": torch.from_numpy(feeds["input_ids"]),
+            "position_ids": torch.from_numpy(feeds["position_ids"]),
+        },
+    )
+    lin = [
+        n
+        for n in ep.graph.nodes
+        if n.op == "call_function" and "linear" in str(n.target)
+    ]
+    assert len(lin) == 5  # q, k, v, o, lm_head (the embedding is a Gather)
