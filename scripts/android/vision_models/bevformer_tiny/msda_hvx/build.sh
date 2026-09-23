@@ -1,7 +1,8 @@
 #!/bin/bash
-# Build the msda skel (msda_rpc.idl / msda_impl.c / msda_kernel.h) + its phone bench client, push
-# them with split.py dump cases, run.   CASES: dump dirs (default: every <work>/msda_io/*),
-# THREADS: comma list, REPS, TURBO. BUILD_ONLY=1 stops after building into $OUT.
+# Build the msda skel (msda_rpc.idl / msda_impl.c / msda_kernel.h), its phone bench client and the
+# encoder chain runner enc_run (if ../../../htp_exploration/qnn_shell/libs exists: run its
+# fetch_libs.sh), then push the client + skel with split.py dump cases and run the bench.
+#   CASES: dump dirs, THREADS: comma list, REPS, TURBO. BUILD_ONLY=1 stops after building into $OUT.
 set -euo pipefail
 : "${HEXAGON_SDK_ROOT:?}" "${HEXAGON_TOOLCHAIN:?}"
 NDK_CLANG="${NDK_CLANG:-/usr/lib/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang}"
@@ -23,6 +24,13 @@ LIBPATH="$HEXAGON_TOOLCHAIN/target/hexagon/lib/$HEX_ARCH/G0"
 "$NDK_CLANG" -O2 -c "${INC[@]}" -I "$HEXAGON_SDK_ROOT/ipc/fastrpc/rpcmem/inc" -o msda_stub.o msda_rpc_stub.c
 "$NDK_CLANG" -O2 "${INC[@]}" -I "$HEXAGON_SDK_ROOT/ipc/fastrpc/rpcmem/inc" -o msda_client msda_client.c msda_stub.o \
   -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc -lm
+# the encoder chain runner (HTP pieces + msda calls), against ../../../htp_exploration/qnn_shell's ORT
+QS="$SRC/../../../htp_exploration/qnn_shell"
+if [ -d "$QS/libs" ]; then
+  "${NDK_CLANG}++" -O2 -std=c++17 -static-libstdc++ "${INC[@]}" -I "$QS/headers" -I "$HEXAGON_SDK_ROOT/ipc/fastrpc/rpcmem/inc" \
+    -o enc_run "$SRC/enc_run.cpp" msda_stub.o -L "$QS/libs" -lonnxruntime \
+    -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc
+fi
 [ -n "${BUILD_ONLY:-}" ] && exit 0
 : "${CASES:?split.py dump case dirs}"
 D=/data/local/tmp/msda
