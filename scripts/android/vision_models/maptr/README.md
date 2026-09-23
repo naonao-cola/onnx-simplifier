@@ -31,16 +31,50 @@ dense parts; the deformable attention runs on the DSP's HVX through the generic 
 `validate.py`: the rebuild vs the upstream-literal path (mmcv MSDA, SCA nonzero rebatch): max abs
 0 on all 6 frames (encoder and decoder); the ref_cam clamp to [-1, 2] is exact.
 
-| configuration | backbone | encoder | decoder | frame | polylines vs fp32 |
-|---|---|---|---|---|---|
-| fp16 pieces, all-HTP (`export.py` + `run_phone.sh`) | 127 ms | 2790 ms, bev cos 0.815 | 64.7 ms | ~2980 ms | -- |
-| fp16, encoder split around the HVX kernel (`msda_hvx/`) | 127 ms | 239 ms | 67 ms | 435 ms | 59/59 |
+| configuration | backbone | encoder | decoder | frame | FPS | polylines vs fp32 |
+|---|---|---|---|---|---|---|
+| fp16 pieces, all-HTP (`export.py` + `run_phone.sh`) | 127 ms | 2790 ms, bev cos 0.815 | 64.7 ms | ~2980 ms | 0.3 | -- |
+| fp16, encoder split around the HVX kernel | 127 ms | 239 ms | 67 ms | 435 ms | 2.3 | 59/59 |
+| int8 backbone, split encoder, decoder split too | 21.7 ms | 232 ms | 84 ms | 338 ms | 3.0 | 58/59 |
+| **int8 backbone, split encoder with CPU-built TSA inputs, HTP decoder** | **22.3 ms** | **139 ms** | **64.4 ms** | **225 ms** | **4.4** | **58/59** |
 
-The encoder on the HTP is what breaks: 20000 BEV queries x 6 cameras x 8 heads x 8 points of
-broadcast grid math and GridSample (and fp16 overflow in it). Split around the kernel it is 5
-steps (fp16 run, frame 1): `pre` 95 ms, TSA kernel 42 ms (DSP 40), `mid` 55 ms, SCA kernel 32 ms
-(DSP 30), `post` 18 ms; bev cos 0.999998 vs fp32. Only 18% of the (camera, query) pairs are
-visible, which the kernel skips.
+(`map_run`, scene-0103 x 6 frames, 8 reps after 2 warm-up, medians; every frame within 223-227 ms.)
+
+**Encoder.** On the HTP it is what breaks: 20000 BEV queries x 6 cameras x 8 heads x 8 points of
+broadcast grid math and GridSample (and fp16 overflow in it). Split around the kernel, the
+current default is (frame 1): CPU TSA inputs 4.5 ms, `prev` (SCA value maps) 1.6 ms, TSA kernel
+36.9 ms (DSP 35.4), `midc` 47.8 ms, SCA kernel 31.0 ms (DSP 29.6), `post` 17.2 ms. Only 18% of the
+(camera, query) pairs are visible, which the kernel skips. In fp16 the split encoder's bev matches
+fp32 at cos 0.999998 (59/59 polylines).
+
+**int8 backbone** (`quantize.py`, `onnxsim.full_qdq`, mse calibration on 72 images of 4 other
+scenes, uint8 NHWC image input): 127 -> 22 ms. It costs bev cos 0.998 vs fp32 (the encoder adds
+nothing: the CPU-TSA run and the HTP-TSA run agree to 4 decimals) and one polyline of 59 (a
+low-score divider on frame 4 drops under 0.4). The large worst-case point errors (3-7 m) are on
+queries decode drops; every matched polyline is within 1 m.
+
+**CPU-built TSA inputs.** TSA's value, offsets and weights depend on the frame only through the
+256-vector `c = can_bus_mlp(can_bus)` (q0 = bev_embedding + c and the Linears are linear), so
+`map_run` builds them from constants (`split.py tsa_consts`: tsa_v = V0 + Wv c, off = A + Bo c,
+w = 0.5 softmax4(Aw + Bw c)) in 4.5 ms on 4 CPU threads, straight into the kernel's rpcmem
+buffers. That replaces the `pre` HTP piece (88.8 ms, almost all of it writing 57 MB of fp32
+outputs); `midc` recomputes q0 in-graph instead of reading 20 MB.
+
+**Decoder split: slower.** 6 x (`dpre` 3.5 ms + kernel 2.9 ms (DSP 1.9) + `dpost` 1.3 ms) is
+46 ms, but `dvals` (every layer's value_proj of the BEV) writes 6 x 20 MB of fp32: 37.6 ms, so
+84 ms against 64 ms for the whole decoder on the HTP. The kernel's uint8 value path would cut
+dvals' output 4x (not tried).
+
+**Next levers** (not done): `midc` (48 ms) and `post` (17 ms) are mostly fp32 graph I/O (q1,
+sca_off/sca_w, sca_out: ~75 MB) -- uint8/fp16 boundaries or folding post into the decoder piece;
+the decoder split with uint8 value maps; overlapping frames across HTP / DSP / CPU (the
+encoder's two kernel calls are 68 ms of DSP time the HTP is idle through).
+
+**Alongside a detector.** MapTR-tiny's backbone is the same R50 + FPN at 480 x 800 as
+BEVFormer-tiny's, but with different weights, and the BEV grids differ (200 x 100 over 30 x 60 m
+vs 50 x 50 over 102.4 m), so nothing is shared without a jointly trained model. Run one after
+the other on this phone: ~225 + ~100 ms (BEVFormer-tiny, #1859) = ~3 FPS for map + boxes; both
+use the HTP and the DSP, so overlapping them buys time only where one waits on the other.
 
 **TSA folding.** Without temporal state TSA's 2-frame queue is [q, q]: both frames sample the
 same value map at the same reference points, so it is one value map with the frames' 4 + 4 points
@@ -73,6 +107,11 @@ cd msda_hvx
 python split.py check  --ckpt ... --work $C/work
 python split.py export --dec --ckpt ... --work $C/work
 python split.py host --work $C/work
+python ../export.py backbone1 --ckpt ... --work $C/work
+python ../quantize.py calib --data $D --work $C/work && python ../quantize.py backbone --work $C/work
+python ../quantize.py host --work $C/work                  # img_u8.u8 per frame
+# default piece dir: backbone.onnx -> backbone6.q8.onnx, prev/midc/post.onnx + tsa_*.f32 from
+# msda_split/, decoder.onnx -> decoder.sim.onnx (map_run takes the CPU-TSA path when prev.onnx exists)
 HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... OUT=<build> ./build.sh
 ./phone.sh <build> <piece dir> $C/work/msda_frames 2 8 0 1 2 3 4 5   # DEC=split for the decoder split
 python compare.py $C/work/msda_frames 0 1 2 3 4 5

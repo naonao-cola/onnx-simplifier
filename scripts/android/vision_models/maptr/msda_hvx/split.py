@@ -255,6 +255,7 @@ def cmd_check(a):
 
 def export_piece(mod, x, in_names, out_names, path):
     import onnx
+
     import onnxsim
 
     torch.onnx.export(mod, x, str(path), input_names=in_names, output_names=out_names, opset_version=17,

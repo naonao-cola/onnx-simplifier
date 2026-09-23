@@ -35,7 +35,7 @@ def chamfer(a, b):
 
 
 def match(ref, got):
-    (rp, rs, rl), (gp, gs, gl) = ref, got
+    (rp, _, rl), (gp, gs, gl) = ref, got
     used, n = set(), 0
     for i in np.argsort(-gs):
         best, bj = CD, -1
