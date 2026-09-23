@@ -4,8 +4,10 @@
 > concrete static cause. `patch_scales.py` matched a bfloat16 scale (`83 3a`)
 > against four LZ77 back-reference tokens and overwrote them. That
 > re-decoded three segments and grew them by 8, 8 and 16 bytes.
-> `patch_scales` now skips matches on token bytes. The fix has not been
-> re-run on the device.
+> `patch_scales` now skips matches on token bytes.
+> `docs/axera-mcode-check-decompress.md` re-ran that on the device. The fault
+> is gone. The remaining +0.113 offset is the stale output zero point, which
+> `patch_scales` does not cover.
 
 `docs/axera-conv-weight-learn-256to512.md` (PR #1777) found the ResNet18
 stage-3-to-4 downsample pair -- `Conv(x[16,256,14,14], w[512,256,1,1], stride 2)`

@@ -169,6 +169,9 @@ emitter, not a minimal fix.
 
 ## Still open
 
+> **Update:** both items below are closed in `docs/axera-mcode-check-decompress.md`. `check()` now
+> decompresses every segment, and the fixed 1x1 emission runs on the device without the fault.
+
 - **`mcode.check()` still doesn't use the codec.** It is structural and heuristic, so it passes the two
   corrupt blobs above. Adding "every compressed segment decodes `key 5` bytes to whole records" would
   catch this whole class. It's left out here to keep this change minimal.
