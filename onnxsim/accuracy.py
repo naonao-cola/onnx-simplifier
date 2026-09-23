@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import onnx
@@ -442,11 +442,12 @@ def quantize(
         )
 
     if scheme in _CALIBRATION_SCHEMES:
-        fn = {
+        fns: Dict[str, Callable[..., onnx.ModelProto]] = {
             "static": quantize_static,
             "static_int16": quantize_static_int16,
             "qoperator": quantize_qoperator,
-        }[scheme]
+        }
+        fn = fns[scheme]
         # Same single-load treatment as the int4 branch above, for the same
         # reason: apply_qat_all_blocks needs the float model as its teacher,
         # and it must be the one `fn` quantized rather than a second copy
