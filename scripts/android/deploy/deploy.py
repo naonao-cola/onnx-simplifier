@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -57,6 +58,14 @@ class Ctx:
         self.work = (work / self.name).resolve()
         self.images = (work / "_images").resolve()
         self.mem = mem
+        # `prebuilt:` = a pipeline some other script already built (models + pipe file), e.g.
+        # Mask R-CNN from ../e2e_pipeline/build_models.py; only pipe..accuracy apply to it
+        pb = self.spec.get("prebuilt")
+        self.prebuilt = {k: os.path.expandvars(v) if isinstance(v, str) else v for k, v in pb.items()} if pb else None
+        if self.prebuilt:
+            miss = [k for k, v in self.prebuilt.items() if isinstance(v, str) and "$" in v]
+            if miss:
+                raise SystemExit(f"prebuilt: set the environment variables in {miss}")
 
     def d(self, stage: str) -> Path:
         p = self.work / stage
@@ -76,17 +85,15 @@ def sha256(path: Path) -> str:
 
 
 def stamp_of(ctx: Ctx, stage: str) -> str:
-    """A stage's cache key: its own spec section, the spec keys it reads, the code, and the
-    previous stage's stamp."""
+    """A stage's cache key: the spec keys it reads, its code (the st_* function + the modules it
+    uses), and the previous stage's stamp -- so editing, say, the bench code re-runs only bench."""
     i = STAGES.index(stage)
     prev = (ctx.work / STAGES[i - 1] / "stamp.json") if i else None
     prev_s = json.loads(prev.read_text())["key"] if prev and prev.exists() else ""
-    code = hashlib.sha256()
-    for f in sorted(HERE.glob("*.py")) + sorted(HERE.glob("passes/*.py")) + sorted(HERE.glob("stages/*.py")):
-        code.update(f.read_bytes())
-    if stage in ("push", "bench"):
-        for f in sorted((HERE / "runtime").glob("*")):
-            code.update(f.read_bytes())
+    code = hashlib.sha256(inspect.getsource(FUNCS[stage]).encode())
+    for f in CODE[stage]:
+        for g in sorted(HERE.glob(f)):
+            code.update(g.read_bytes())
     keys = {"stage": stage, "spec": {k: ctx.spec.get(k) for k in DEPENDS[stage]}, "device": ctx.device
             if stage in ("partition", "push", "bench", "accuracy") else "", "prev": prev_s,
             "code": code.hexdigest()}
@@ -94,12 +101,12 @@ def stamp_of(ctx: Ctx, stage: str) -> str:
 
 
 DEPENDS = {
-    "fetch": ["fetch", "calibration", "eval"],
+    "fetch": ["fetch", "calibration", "eval", "prebuilt"],
     "simplify": ["inputs"],
     "quantize": ["quantize", "preprocess", "calibration", "inputs"],
     "rewrite": ["rewrites"],
     "post": ["postprocess"],
-    "pipe": ["pipeline", "preprocess", "eval", "inputs"],
+    "pipe": ["pipeline", "preprocess", "eval", "inputs", "prebuilt"],
     "partition": ["pipeline"],
     "push": ["pipeline"],
     "bench": ["bench"],
@@ -107,10 +114,37 @@ DEPENDS = {
 }
 
 
+RUNTIME = ["runtime/*.cpp", "runtime/*.sh"]
+CODE = {
+    "fetch": ["stages/images.py"],
+    "simplify": [],
+    "quantize": ["stages/images.py"],
+    "rewrite": ["passes/*.py"],
+    "post": ["stages/post.py"],
+    "pipe": ["stages/pipe.py", "stages/images.py"],
+    "partition": ["stages/device.py", "stages/partition.py", *RUNTIME],
+    "push": ["stages/device.py", *RUNTIME],
+    "bench": ["stages/device.py", *RUNTIME],
+    "accuracy": ["stages/accuracy.py", "stages/post.py", "stages/images.py"],
+}
+
+
 # ---------------------------------------------------------------------------------------------
 # stages (each takes ctx and writes into ctx.d(stage))
 
+PREBUILT_SKIP = {"simplify", "quantize", "rewrite", "post"}
+
+
 def st_fetch(ctx: Ctx) -> None:
+    if ctx.prebuilt:
+        from stages import pipe
+
+        files = pipe.prebuilt_files(ctx)
+        man = {f.name: f.stat().st_size for f in files}
+        (ctx.d("fetch") / "prebuilt.json").write_text(json.dumps(man, indent=1))
+        print(f"  prebuilt pipeline {ctx.prebuilt['pipe']}: {len(files)} files, "
+              f"{sum(man.values()) / 1e6:.0f} MB")
+        return
     f = ctx.section("fetch")
     out = ctx.d("fetch") / "model.onnx"
     if "url" in f:
@@ -168,7 +202,7 @@ def st_quantize(ctx: Ctx) -> None:
             f = next(self.it, None)
             return None if f is None else {in_name: imglib.preprocess(f, pre)[0][None]}
 
-    act = QuantType.QUInt8 if q.get("activation", "uint8") == "uint8" else QuantType.QInt16
+    act = {"uint8": QuantType.QUInt8, "uint16": QuantType.QUInt16}[q.get("activation", "uint8")]
     t = time.time()
     quantize_static(
         str(src), str(dst), Reader(), quant_format=QuantFormat.QDQ,
@@ -249,9 +283,12 @@ def run_stage(ctx: Ctx, stage: str, force: bool, capped: bool) -> None:
     if not force and stamp.exists() and json.loads(stamp.read_text())["key"] == key:
         print(f"[{stage}] cached")
         return
-    print(f"[{stage}]", flush=True)
     t = time.time()
-    if stage in HEAVY and capped and shutil.which("systemd-run"):
+    if ctx.prebuilt and stage in PREBUILT_SKIP:
+        print(f"[{stage}] prebuilt pipeline: skipped")
+        sd.mkdir(parents=True, exist_ok=True)
+    elif (stage in HEAVY and not ctx.prebuilt) and capped and shutil.which("systemd-run"):
+        print(f"[{stage}]", flush=True)
         cmd = ["systemd-run", "--user", "--wait", "--collect", "--pipe", "-q", "-p", f"MemoryMax={ctx.mem}",
                "-p", "MemorySwapMax=0", "-d", "-E", f"PYTHONPATH={os.environ.get('PYTHONPATH', '')}",
                sys.executable, __file__, str(ctx.spec_path), "--device", ctx.device, "--work",
@@ -260,6 +297,7 @@ def run_stage(ctx: Ctx, stage: str, force: bool, capped: bool) -> None:
         if r.returncode:
             raise SystemExit(f"[{stage}] failed (exit {r.returncode}; OOM under MemoryMax={ctx.mem}?)")
     else:
+        print(f"[{stage}]", flush=True)
         FUNCS[stage](ctx)
     stamp.write_text(json.dumps({"key": key, "seconds": round(time.time() - t, 1)}))
 

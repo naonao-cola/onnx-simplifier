@@ -23,13 +23,53 @@ from __future__ import annotations
 
 import json
 import shutil
+from pathlib import Path
 
 import numpy as np
 
 from . import images as imglib
 
 
+def prebuilt_files(ctx) -> list:
+    """The pipe file of a prebuilt pipeline + every file in its dir the steps name (models, and the
+    DSP RPN's constants: levels.txt, model.txt, l*_anchors.bin, read by the runtime from its cwd)."""
+    pb = ctx.prebuilt
+    src = Path(pb["dir"])
+    text = (src / pb["pipe"]).read_text()
+    names = {w for line in text.splitlines() for w in line.split()}
+    names |= {w.split(":", 1)[1] for n in list(names) for w in n.split(",") if ":" in w}  # ortpad buckets
+    names |= set(pb.get("extra_files", []))
+    files = [src / pb["pipe"], *sorted(src / n for n in names if (src / n).is_file() and n != pb["pipe"])]
+    if pb.get("dsp"):
+        files += sorted(src.glob("l*_anchors.bin")) + [src / "levels.txt", src / "model.txt"]
+    return list(dict.fromkeys(files))
+
+
+def write_prebuilt(ctx, d) -> None:
+    pb = ctx.prebuilt
+    for f in d.glob("*"):
+        if f.is_symlink() or f.is_file():
+            f.unlink()
+    files = prebuilt_files(ctx)
+    for f in files[1:]:
+        (d / f.name).symlink_to(f.resolve())
+    shutil.copyfile(files[0], d / "pipe.txt")
+    inp = d / "inputs"
+    shutil.rmtree(inp, ignore_errors=True)
+    inp.mkdir()
+    stems = []
+    for f in sorted(Path(pb["inputs"]).glob("*.bin")):
+        (inp / f.name).symlink_to(f.resolve())
+        stems.append(f.stem)
+    (d / "pipe_meta.json").write_text(json.dumps({
+        "prebuilt": True, "inputs": stems, "files": [f.name for f in files[1:]], "dsp": bool(pb.get("dsp")),
+        "ref": str(Path(pb["inputs"]) / "ref")}, indent=1))
+    print(f"  pipe.txt = {pb['pipe']} ({len(files) - 1} files), {len(stems)} inputs")
+
+
 def write(ctx, d) -> None:
+    if ctx.prebuilt:
+        return write_prebuilt(ctx, d)
     sp = ctx.spec
     p = sp.get("pipeline", {}) or {}
     rw_dir = ctx.work / "rewrite"

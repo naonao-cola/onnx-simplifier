@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build the phone runtime: pipe_run (this dir) and qnn_run_multi (../../htp_exploration/qnn_shell),
-# against the ORT + QNN libraries ../../htp_exploration/qnn_shell/fetch_libs.sh downloads.
+# Build the phone runtime, pipe_run (this dir), against the ORT + QNN libraries
+# ../../htp_exploration/qnn_shell/fetch_libs.sh downloads.
 #   PIPE_DSP_KERNELS=1 also links the rpn/roialign FastRPC stubs (Mask R-CNN's HVX kernels); that
 #   needs HEXAGON_SDK_ROOT/HEXAGON_TOOLCHAIN and builds their skels exactly as
 #   ../../e2e_pipeline/build.sh does (BUILD_ONLY=1 there), then links against its build dir.
@@ -26,5 +26,3 @@ else
   [ "$B/pipe_run" -nt "$HERE/pipe_run.cpp" ] ||
     "$CXX" -O2 -std=c++17 -static-libstdc++ "${INC[@]}" -o "$B/pipe_run" "$HERE/pipe_run.cpp" "${LIBS[@]}"
 fi
-[ "$B/qnn_run_multi" -nt "$QS/qnn_run_multi.cpp" ] ||
-  "$CXX" -O2 -std=c++17 -static-libstdc++ -I "$QS/headers" -o "$B/qnn_run_multi" "$QS/qnn_run_multi.cpp" -L "$QS/libs" -lonnxruntime

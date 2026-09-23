@@ -11,6 +11,9 @@ spec `accuracy:`:
                           detections, mean IoU of matches, mean |score delta| -- the metric
                           ../../maskrcnn_e2e/README.md and ../../e2e_pipeline/ use
   kind: tensor            per-output max/mean abs error and cosine similarity
+  kind: maskrcnn          prebuilt Mask R-CNN pipeline: ../e2e_pipeline/compare_results.py against
+                          the all-ORT reference prepare_inputs.py saved (score > 0.5, same label,
+                          box IoU > 0.5; box and mask IoU of the matches)
 """
 from __future__ import annotations
 
@@ -65,6 +68,16 @@ def run(ctx, d: Path) -> None:
     acc = ctx.spec.get("accuracy", {}) or {}
     kind = acc.get("kind", "tensor")
     meta = json.loads((ctx.work / "pipe" / "pipe_meta.json").read_text())
+    if kind == "maskrcnn":
+        import subprocess
+        import sys
+
+        script = Path(__file__).resolve().parents[2] / "e2e_pipeline" / "compare_results.py"
+        r = subprocess.run([sys.executable, str(script), meta["ref"], str(ctx.work / "bench"), "outputs"],
+                           capture_output=True, text=True, check=True)
+        (d / "accuracy.txt").write_text(r.stdout)
+        print("  " + r.stdout.strip().replace("\n", "\n  "))
+        return
     pdir = ctx.work / "pipe"
     phone = ctx.work / "bench" / "outputs"
     so = ort.SessionOptions()

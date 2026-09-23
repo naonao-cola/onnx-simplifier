@@ -5,7 +5,8 @@
 //   input  <name> <f32|u8> <d0,d1,...>   tensor each input file is read as (default: Mask R-CNN's
 //                                        `image f32 3,800,1088`)
 //   output <name>[,<name>...]            tensors written back per image (default: Mask R-CNN's)
-//   ort <name> <model.onnx> <htp|cpu> <qnn opts|-> <inputs> <outputs>
+//   ort <name> <model.onnx> <htp|htp-fallback|cpu> <qnn opts|-> <inputs> <outputs>
+//     (htp-fallback: QNN EP with ORT's CPU fallback allowed -- for partition reports only)
 //   ortpad <name> <htp|cpu> <qnn opts> <in> <bucket:model,...> <in> <outputs>
 //   quant_in <src f32 [C,H,W]> <dst u8 [1,H,W,C]> <scale> <zp>
 //   dq <src u8> <dst f32> <scale> <zp>
@@ -137,7 +138,7 @@ static std::unique_ptr<Ort::Session> make_session(const std::string& model, cons
   so.SetLogSeverityLevel(envi("ORT_LOG", ORT_LOGGING_LEVEL_WARNING));
   std::string path = model;
   bool ctx = false;
-  if (ep == "htp") {
+  if (ep == "htp" || ep == "htp-fallback") {
     std::unordered_map<std::string, std::string> o{{"backend_type", "htp"}};
     for (auto& kv : split(opts, ';')) {
       auto e = kv.find('=');
@@ -145,7 +146,7 @@ static std::unique_ptr<Ort::Session> make_session(const std::string& model, cons
       if (kv.substr(0, e) == "ctx") { ctx = kv.substr(e + 1) == "1"; continue; }
       o[kv.substr(0, e)] = kv.substr(e + 1);
     }
-    so.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
+    if (ep == "htp") so.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
     so.AppendExecutionProvider_V2(*env, npu, o);
     if (ctx) {
       path = model.substr(0, model.size() - 5) + ".ctx.onnx";
@@ -397,7 +398,7 @@ int main(int argc, char** argv) {
       while (ss >> w) S->f.push_back(w);
       S->op = S->f[0];
       S->name = S->op == "ort" || S->op == "ortpad" ? S->f[1] : S->op + ":" + S->f[S->op == "rpn" ? 4 : S->op == "roialign" ? 3 : 2];
-      need_htp |= (S->op == "ort" && S->f[3] == "htp") || (S->op == "ortpad" && S->f[2] == "htp");
+      need_htp |= (S->op == "ort" && S->f[3].rfind("htp", 0) == 0) || (S->op == "ortpad" && S->f[2] == "htp");
       need_rpn |= S->op == "rpn";
       need_roi |= S->op == "roialign";
       steps.push_back(std::move(S));

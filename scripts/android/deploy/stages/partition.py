@@ -37,13 +37,13 @@ def summarize(model: Path, logcat: Path, fallback_out: str, strict_out: str) -> 
         rows.append({"name": name, "op": n.op_type if n else "?", "error": err, "max_rank": r})
 
     def med(out):
-        x = re.search(r"median_ms ([0-9.]+)", out)
+        x = re.search(r"overall total_ms median ([0-9.]+)", out)  # pipe_run
         return float(x.group(1)) if x else None
 
     return {
         "model_nodes": len(g.node),
         "refused": rows,
-        "refused_by_op": dict(collections.Counter((r["op"], r["error"]) for r in rows).most_common()),
+        "refused_by_op": dict(collections.Counter(f"{r['op']} {r['error']}" for r in rows).most_common()),
         "refused_by_rank": dict(collections.Counter(r["max_rank"] for r in rows)),
         "qnn_graphs_with_fallback": len(set(re.findall(r"QnnGraph_create started for graph (\S+)", text))),
         "fallback": {"pass": "PASS" in fallback_out, "median_ms": med(fallback_out)},
@@ -55,10 +55,14 @@ def summarize(model: Path, logcat: Path, fallback_out: str, strict_out: str) -> 
 def render(rep: dict) -> str:
     s = [f"  {rep['model_nodes']} nodes; QNN refused {len(rep['refused'])}; "
          f"{rep['qnn_graphs_with_fallback']} QNN graph(s) with CPU fallback allowed"]
-    for (op, err), c in rep["refused_by_op"].items():
-        s.append(f"    refused {op:20s} {err} x{c}")
+    for op_err, c in rep["refused_by_op"].items():
+        s.append(f"    refused {op_err:30s} x{c}")
     if rep["refused"]:
         s.append(f"    refused by max tensor rank: {rep['refused_by_rank']}")
+        if rep["strict"]["pass"]:
+            # QNN validates ops before ORT's NHWC layout transformation too; a refusal that
+            # disappears after it (e.g. a Transpose that cancels against QNN's own) is harmless
+            s.append("    (strict all-HTP still PASSes: these were refused only in an intermediate form)")
     for k in ("fallback", "strict"):
         v = rep[k]
         s.append(f"  {k:8s} {'PASS' if v['pass'] else 'FAIL'} median {v['median_ms']} ms"

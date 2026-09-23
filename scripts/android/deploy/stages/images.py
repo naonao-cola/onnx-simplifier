@@ -29,11 +29,28 @@ def _paths(section: dict, cache: Path) -> list[Path]:
 
 
 def fetch_images(section: dict, cache: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
     cache.mkdir(parents=True, exist_ok=True)
-    for i in section.get("coco_val2017", []):
+
+    def get(i):  # atomic: an interrupted download never leaves a truncated .jpg behind
         p = cache / f"coco_{i:012d}.jpg"
-        if not p.exists():
-            urllib.request.urlretrieve(COCO.format(i), p)
+        if p.exists():
+            return
+        for attempt in range(4):  # the COCO image server times out now and then
+            try:
+                with urllib.request.urlopen(COCO.format(i), timeout=120) as r:
+                    data = r.read()
+                break
+            except OSError:
+                if attempt == 3:
+                    raise
+        tmp = p.with_suffix(".part")
+        tmp.write_bytes(data)
+        tmp.rename(p)
+
+    with ThreadPoolExecutor(8) as ex:  # network-bound; images.cocodataset.org is slow per request
+        list(ex.map(get, section.get("coco_val2017", [])))
     missing = [p for p in _paths(section, cache) if not p.exists()]
     if missing:
         raise SystemExit(f"missing images: {missing[:3]}")

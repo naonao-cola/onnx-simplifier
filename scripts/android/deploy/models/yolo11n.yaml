@@ -3,6 +3,7 @@ name: yolo11n
 fetch:
   # Ultralytics YOLO11n, exported without NMS: output (1, 84, 8400)
   url: https://huggingface.co/aaurelions/yolo11n.onnx/resolve/main/yolo11n.onnx
+  sha256: 5ad2aa77f7f678c06880f024444cb02f5eb53f991b4a64c819805c6c701fc9b8
 inputs:
   images: {shape: [1, 3, 640, 640]}
 preprocess: {kind: letterbox, size: [640, 640], pad: 114}
@@ -16,11 +17,20 @@ calibration:
 eval:
   coco_val2017: [7088, 7108, 7278, 7281, 7386, 7511, 7574, 7784, 7795, 7816, 7818, 7888, 7977, 7991,
                  8021, 8211, 8277, 8532, 8629, 8690]
-quantize: {enabled: true, per_channel: true, activation: uint8}
+quantize:
+  enabled: true
+  per_channel: true
+  activation: uint8
+  # output0 concatenates box pixels (0..640) with class probabilities (0..1): one uint8 scale
+  # for both (~2.5) zeroes every score. Keep that last Concat in float so each half gets its own.
+  exclude_nodes: [/model.23/Concat_5]
 rewrites:
   - {name: uint8_input, layout: nhwc}
 postprocess: {kind: yolo_detect, conf: 0.25, iou: 0.7, max_det: 300}
 pipeline:
   qnn: {htp_performance_mode: burst}
+  # the uint8 input's scale is 1/255 and zero point 0, i.e. it *is* the letterboxed RGB pixels:
+  # a camera hands those over as-is, so don't spend ~15-20 ms quantizing fp32 on the phone
+  host_quantize: true
 bench: {warmup: 3, reps: 20, cpu_threads: 4}
 accuracy: {kind: detection_match, iou: 0.5, score: 0.25}
