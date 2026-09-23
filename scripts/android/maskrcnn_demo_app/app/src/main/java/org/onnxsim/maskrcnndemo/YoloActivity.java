@@ -29,6 +29,11 @@ public class YoloActivity extends MainActivity {
     }
 
     @Override
+    boolean fastCamera() {
+        return true;
+    }
+
+    @Override
     void switchTo(String activity, String model) {
         if (activity.equals("yolo")) {
             wantModel = model;  // picked up by the loop

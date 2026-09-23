@@ -14,6 +14,40 @@ boxes, labels, instance masks and an FPS / latency / per-stage counter. It runs 
 | image preprocessing (camera YUV or RGBA -> rotated, letterboxed uint8 NHWC) | native, one pass |
 | everything else (per-class NMS, box decode, ...) | ORT CPU, 4 threads |
 
+## YOLO mode (YOLO26n / YOLO11n)
+
+The model buttons (top right) switch between Mask R-CNN and the deploy pipeline's YOLO models
+(`../deploy/models/yolo26n.yaml`, `yolo11n.yaml`; PR #1865). `YoloActivity` runs in its own
+process (`:yolo`), since each native engine holds process-wide HTP/DSP state and `onDestroy` ends its
+process; the two YOLO buttons switch models in place (the engine re-inits its HTP session).
+
+- `native/yolo_engine.cpp` (`libyolo_demo.so`): one HTP session (ORT + QNN EP, strict, EP-context
+  model `<model>.ctx0.onnx` compiled on the first launch), fed the camera YUV frame (or a test image)
+  rotated upright and letterboxed to 640x640 (centered, pad 114, as `deploy/stages/images.py`) as
+  uint8 NHWC in one native pass -- the model's input *is* the RGB bytes (scale 1/255, zero point 0).
+  The head's `(1, 84, 8400)` output is post-processed in C++: YOLO26's NMS-free two-stage top-k
+  (the deploy pipeline's `yolo_end2end`, no NMS) or YOLO11's per-class NMS (iou 0.7, conf 0.25).
+- Camera: the smallest 4:3 size covering 640 (640x480), and the fastest fixed AE frame-rate range
+  (auto-exposure otherwise drops to ~14 FPS indoors, which was the cap).
+- Models: `YOLO="<deploy work>/yolo26n/pipe/yolo26n.onnx <deploy work>/yolo11n/pipe/yolo11n.onnx" ./deploy.sh`,
+  then `adb shell am start -n org.onnxsim.maskrcnndemo/.YoloActivity [--es mode images] [--es model yolo11n]`.
+
+Measured on the phone (medians of the app's running averages, under the shared phone lock):
+
+| model, mode | end-to-end FPS | inference | pre | HTP | post |
+|---|---:|---:|---:|---:|---:|
+| YOLO26n, test images | 100-111 | 2.9 ms | 0.1 | 2.5 | 0.3 |
+| YOLO11n, test images | 91 | 3.3 ms | 0.1 | 2.6 | 0.6 |
+| YOLO26n, camera, AE default | 14.2 (camera-capped) | 9.1 ms | 5.4 | 3.0 | 0.8 |
+| YOLO11n, camera, AE default | 14.2 (camera-capped) | 10.0 ms | 5.5 | 3.0 | 1.4 |
+| **YOLO26n, camera, fixed 30 FPS AE** | **30.0-30.6 (camera-capped)** | 8.2-9.0 ms | 4.5-5.6 | 2.9 | 0.5-0.8 |
+
+Inference alone would allow ~110 FPS from the camera and ~330 FPS from decoded images; end to end is
+bounded by the camera (30 FPS) and, in images mode, by the Java JPEG decode + UI draw per frame.
+The camera preprocessing (4.5-5.6 ms at 640x480) is the column-wise plane reads of the 90-degree
+rotation, as in the Mask R-CNN path. Box placement was checked visually on COCO val2017 #139.
+YOLO26's end-to-end top-k is cheaper than YOLO11's NMS here too (0.3 vs 0.6 ms on images).
+
 ## Result
 
 Defaults since this round: `pipe_e_u8ra_ctx.txt` + `quant=lut;merge=seg2,seg4;pipeline=box_head`.

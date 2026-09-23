@@ -112,6 +112,14 @@ public class MainActivity extends Activity {
         return Engine.IN_W;
     }
 
+    /**
+     * Ask the camera for its fastest fixed frame-rate range (auto-exposure otherwise drops to ~15
+     * FPS indoors). Off for Mask R-CNN, which runs slower than the camera anyway.
+     */
+    boolean fastCamera() {
+        return false;
+    }
+
     /** Model selector: one button per entry of MODELS. */
     private android.view.View modelBar() {
         android.widget.LinearLayout bar = new android.widget.LinearLayout(this);
@@ -420,6 +428,19 @@ public class MainActivity extends Activity {
                         CaptureRequest.Builder rb = d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
                         rb.addTarget(surf);
                         rb.addTarget(reader.getSurface());
+                        if (fastCamera()) {
+                            android.util.Range<Integer> best = null;
+                            android.util.Range<Integer>[] rs = ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+                            if (rs != null)
+                                for (android.util.Range<Integer> r : rs)
+                                    if (best == null || r.getLower() > best.getLower()
+                                            || (r.getLower().equals(best.getLower()) && r.getUpper() > best.getUpper()))
+                                        best = r;
+                            if (best != null) {
+                                rb.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, best);
+                                Log.i(TAG, "camera fps range " + best);
+                            }
+                        }
                         d.createCaptureSession(Arrays.asList(surf, reader.getSurface()), new CameraCaptureSession.StateCallback() {
                             @Override public void onConfigured(CameraCaptureSession s) {
                                 try { s.setRepeatingRequest(rb.build(), null, camHandler); }
