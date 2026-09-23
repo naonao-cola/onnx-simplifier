@@ -148,7 +148,7 @@ static void msda(const std::string& value, size_t value_off_floats, const std::s
   msda_args_t A;
   memset(&A, 0, sizeof A);
   A.NV = NV; A.L = 1; A.H[0] = H; A.W[0] = W; A.start[0] = 0; A.S = H * W; A.M = 8; A.D = 32; A.P = P; A.Q = Q;
-  A.NO = NO; A.mode = MSDA_REF_PIX; A.NVR = NV; A.RL = 1; A.R = R; A.RD = 2; A.vis = (const uint8_t*)s.p;
+  A.NO = NO; A.mode = MSDA_REF_PIX; A.vdtype = MSDA_F32; A.NVR = NV; A.RL = 1; A.R = R; A.RD = 2; A.vis = (const uint8_t*)s.p;
   int32 shape[MSDA_SHAPE_LEN(1)];
   const int ns = msda_shape_pack(&A, shape);
   if ((value_off_floats + msda_n_value(&A)) * 4 > v.bytes || msda_n_ref(&A) * 4 != (long)r.bytes ||
@@ -156,7 +156,8 @@ static void msda(const std::string& value, size_t value_off_floats, const std::s
     throw std::runtime_error("msda buffer sizes don't match the shape");
   uint64 us = 0;
   int flags = getenv("MSDA_THREADS") ? atoi(getenv("MSDA_THREADS")) : 4;
-  int rc = msda_rpc_run(h_msda, (const float*)v.p + value_off_floats, (int)msda_n_value(&A), (const float*)o.p,
+  int rc = msda_rpc_run(h_msda, (const float*)v.p + value_off_floats, (int)msda_n_value(&A), nullptr, 0, nullptr, 0,
+                        nullptr, 0, (const float*)o.p,
                         (int)msda_n_loc(&A), (const float*)r.p, (int)msda_n_ref(&A), (const float*)a.p, (int)msda_n_attw(&A),
                         (const uint8*)s.p, (int)msda_n_vis(&A), shape, ns, flags, (float*)y.p, (int)msda_n_out(&A), &us);
   if (rc) throw std::runtime_error("msda_rpc_run rc=" + std::to_string(rc));
