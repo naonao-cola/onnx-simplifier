@@ -22,6 +22,8 @@ Same data and GT criteria as `../bevformer_tiny` and Fast-BEV: nuScenes-mini sce
 | `dfa_hvx/dfa_case.py`, `dfa_host_check.c`, `dfa_sim.c` | real DFA calls as cases; the scalar body on the host and the HVX body on hexagon-sim vs torch |
 | `dfa_hvx/split.py` | the 14 HTP pieces around the DFA (int8 backbone with uint8 channels-last outputs), and the same split chain in torch |
 | `dfa_hvx/s4d_run.cpp`, `phone_split.py` | the split frame on the phone (rpcmem buffers shared by ORT and the DSP), chained with the host instance bank |
+| `dfa_hvx/s4d_scene.cpp`, `s4d_common.h` | a whole scene in one phone process with the instance bank ported, optionally overlapping the next frame's front (`phone_split.py --scene [--pipeline 1]`) |
+| `dfa_hvx/io16.py` | fp16 graph outputs for the pieces' DFA weights (round 2: no gain, kept for the comparison) |
 
 ## Reproduce
 
@@ -32,6 +34,11 @@ echo "5beed4d4933ca6448d72586b0f8812863574289ff3c4192de71dc9f46a42f0ed  $C/spars
 ../bevformer_tiny/fetch_data.sh        # nuScenes-mini cameras -> ~/.cache/onnxsim-bevformer/nuscenes-mini
 $S python3 validate.py --ckpt $C/sparse4dv3_r50.pth --data ~/.cache/onnxsim-bevformer/nuscenes-mini --work $C/work
 $S python3 export.py frame --ckpt $C/sparse4dv3_r50.pth --work $C/work
+# round 2: the transpose-free weights (pre0 / mid pieces -> split/<piece>.w2.onnx), then the scene on the phone
+$S python3 dfa_hvx/split.py export --ckpt $C/sparse4dv3_r50.pth --work $C/work --w-layout v2
+OUT=$C/dfa_build ./dfa_hvx/build.sh
+PHONE_LOCK_OWNER=... ~/.cache/android-phone/phone-run python3 dfa_hvx/phone_split.py --work $C/work --build $C/dfa_build \
+  --models w2 --flags 1028 --scene --pipeline 1
 ```
 
 ## fp32 (host)
@@ -114,9 +121,62 @@ Per frame (median of 6 runs, temporal frame): 8 HTP pieces take 146 ms and the 6
 At >= 0.2 the phone finds 103 against fp32's 116 (-11%). At the 0.3 criterion used for the other
 BEV models it matches fp32 exactly.
 
+## Round 2: transpose-free DFA weights, instance bank on the phone: 276 -> 241 ms/frame
+
+Re-measured baseline after the phone's reboot: 275.7 ms/frame (the table above is from an earlier
+session). All rows: scene-0103 x 6 frames on the phone, strict all-HTP pieces, under the phone lock.
+
+| scene-0103, 6 frames chained on the phone | frame ms | FPS | HTP pieces | DFA calls (in-DSP) | GT >= 0.3 | GT >= 0.2 |
+|---|---|---|---|---|---|---|
+| fp32 torch (host) | | | | | 71 / 190 | 116 / 190 |
+| #1880 split, re-measured | 275.7 | 3.6 | 150-160 | 116-121 (107-114) | 71 / 190 | 103 / 190 |
+| + fp16 `w` at the boundary (`io16.py`) | 275.4 | 3.6 | ~151 | ~121 (~115) | 71 / 190 | 102 / 190 |
+| + transpose-free `w` (v2), per-block gather | 238.4 | 4.2 | 102.8 | 135.5 (126.5) | 71 / 190 | 101 / 190 |
+| + instance bank on the phone (`s4d_scene`) | 245.8 | 4.1 | 82.4 + bb / pre0 | 135.7 (127.9) | 71 / 190 | 103 / 190 |
+| **+ next frame's bb / pre0 on a second thread** | **241.2** | **4.1** | | | **71 / 190** | **103 / 190** |
+
+(The last two rows are `s4d_scene` scene medians over 4 passes; the others are `s4d_run` per-frame medians,
+64 anchors per DFA job (`DFA_FLAGS=1028`, 3% faster than 32 here). At >= 0.2 the rows differ by +-2
+detections from fp16 rounding of the weights; at >= 0.3 every row matches fp32.)
+
+**What the HTP pieces were spending their time on.** fp16 `w` output changed nothing, so the fp32
+boundary was not the cost here. A QNN per-op profile (`qnn_run_multi` + `../bevformer_tiny/profile_ops.py`)
+showed it was the layout of the DFA weights: the permute of `w` to (24, N, 8, 13) (28% of `pre0`, 18% of
+a mid), its 13 -> 16 pad (12%), and the transposes QNN wraps around a softmax over axis 1 of
+(N, 312, 8) (~15%).
+
+**v2 weights** (`split.py --w-layout v2`, `dfa_weights_v2`): `weights_fc` is linear, so
+`W (feat + ae + cam_c) + b = W (feat + ae) + (W cam_c + b)`: one Gemm over the anchors plus a tiny
+per-camera term, broadcast-added. The Gemm's rows are reordered to (group, level, point), with 3 zero
+rows per 13 points whose per-camera term is -30000 (exp -> exactly 0), so the softmax over (camera,
+level, point) is the last axis and nothing is transposed or concatenated. `w` leaves the HTP as fp16
+(N, 8, 6 * 4 * 16). Exact vs v1 (1.4e-4, fp16 rounding; pads exactly 0). `pre0` 12.2 -> 5.3 ms, each mid
+23 -> 16 ms.
+
+The DSP now does the transpose: per anchor block (64 anchors), the block's 24 (camera, level) chunks
+are copied once front to back into a per-thread buffer, then each (camera, level) call converts its
+rows fp16 -> fp32 (HVX). A first version that gathered strided chunks per (camera, level) (24 passes
+over the block) cost +34 ms/frame on the phone; hexagon-sim, which doesn't model DDR misses,
+showed +4%. The block copy leaves +14 ms, so the net is -37 ms.
+
+Not kept: **v3**, the weights as (N, 6, 4, 8, 16) so each (camera, level) row is contiguous, with the
+softmax spelled out as max / exp / sum over axes 1, 2, 4. It is exact on the host, but QNN can't place
+those rank-5 reductions on the HTP (strict all-HTP refuses the session).
+
+**Instance bank on the phone** (`s4d_scene.cpp`): `model.InstanceBank` ported (top-600 cache,
+confidence decay, ego-motion anchor projection); the scene runs in one process with the same GT as the
+host bank. The next frame's `bb` + `pre0` don't read the bank, so they can overlap the decoder chain:
+- on a free second thread (`PIPELINE=1`): -4.6 ms/frame. They compete with the mids for the HTP
+  (the mids' share goes from 82 to 101 ms), and the gain is the overlap with the DFA calls and the
+  host-side work.
+- started exactly when DFA calls 0 / 1 start (`PIPELINE=2`, the HTP is idle then): no gain. The front
+  joins wait the whole 31 ms: **the HTP graphs do not run while the DFA skel holds the cDSP** (all 4 HVX
+  contexts), unlike BEVFormer's pieces around its MSDA calls.
+
 **Next levers** (not done):
-- The mid pieces are fp16, with fp32 graph I/O at every boundary: pts (6, 900, 16, 2) and
-  w (24, 900, 8, 16) out, agg in. That is the EP-context fp32-boundary cost found before. uint8 or
-  fp16 I/O for those tensors, and int8 Linears in the mids, are the obvious next steps.
-- On the DSP side, the 24 calls per layer each rebuild their tap lists. A fused per-anchor loop
-  over (camera, level) would share the coordinate math.
+- The DFA is now the larger half (129 ms in the DSP, compute-bound: hexagon-sim's 74k cycles per
+  anchor match the phone). A fused per-anchor loop over (camera, level) in `dfa_hvx`, sharing the
+  tap building and accumulating in registers instead of 24 msda calls + `out += tmp`, and dropping the
+  13 -> 16 pad (19% of the taps), is the main lever left. The v2 transpose (+14 ms) would go away with it.
+- int8 Linears / FFN in the mids (16 ms each now; the graph attention's `MatMul` is ~17% of a mid).
+- More DFA threads don't help (4 HVX contexts); 64 anchors per job is the best job size.

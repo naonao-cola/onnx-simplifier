@@ -50,7 +50,8 @@ int dfa_rpc_close(remote_handle64 h) {
 #define MAX_QB 256       /* anchors per job with fp16 weights (the per-thread conversion buffer) */
 static char stacks[MAX_THREADS][STACK_SIZE] __attribute__((aligned(128)));
 static float wbufs[MAX_THREADS][MAX_QB * DFA_M * DFA_P] __attribute__((aligned(128)));
-static uint16_t stages[MAX_THREADS][MAX_QB * DFA_M * DFA_P] __attribute__((aligned(128)));
+#define MAX_QB_W2 64 /* anchors per job with v2 weights: the block's transposed weights, 384 KB */
+static uint16_t stages[MAX_THREADS][MAX_QB_W2 * DFA_CAMS * DFA_LEVELS * DFA_M * DFA_P] __attribute__((aligned(128)));
 
 typedef struct {
   const dfa_args_t* a;
@@ -98,13 +99,16 @@ AEEResult dfa_rpc_run(remote_handle64 h, const uint8* v0, int v0Len, const uint8
     a.zp[l] = vzp[l];
   }
   a.pts = pts; a.zeros = zeros; a.vis = vis; a.tmp = tmp; a.out = out;
-  if (w2) a.w2 = (const uint16_t*)w; else if (w16) a.w16 = (const uint16_t*)w; else a.w = w;
+  if (w2) a.w2 = (const uint16_t*)w;
+  else if (w16) a.w16 = (const uint16_t*)w;
+  else a.w = w;
   if (dfa_check(&a)) return -1;
   unsigned long long t0 = HAP_perf_get_time_us();
   volatile int next = 0;
   int qb = ((flags >> 8) & 0xff) * 16;
   if (qb < 1) qb = 32;
   if (w16 && qb > MAX_QB) qb = MAX_QB;
+  if (w2 && qb > MAX_QB_W2) qb = MAX_QB_W2;
   int nthreads = flags & 0xff, rc = 0;
   if (nthreads < 1) nthreads = 1;
   if (nthreads > MAX_THREADS) nthreads = MAX_THREADS;

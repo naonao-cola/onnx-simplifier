@@ -136,24 +136,27 @@ static inline void dfa_accumulate(float* out, const float* tmp, int q0, int q1) 
 /* queries [q0, q1): visibility, then 24 msda calls accumulated into out. Thread-safe on disjoint ranges.
  * With fp16 weights, wbuf ((q1 - q0) * 128 floats, 128-byte aligned, per thread) receives each
  * (camera, level)'s rows converted to fp32 right before its call; with v2 weights, stage
- * ((q1 - q0) * 128 halves, aligned, per thread) first gathers them from the (Q, 8, 384) layout. */
+ * ((q1 - q0) * 24 * 128 halves, aligned, per thread) first receives the block transposed from the
+ * (Q, 8, 384) layout to (24, q1 - q0, 8, 16), read once front to back. */
 static inline void dfa_run(const dfa_args_t* a, int q0, int q1, float* wbuf, uint16_t* stage) {
   dfa_visibility(a, q0, q1);
   memset(a->out + (long)q0 * DFA_C, 0, (size_t)(q1 - q0) * DFA_C * sizeof(float));
+  const long nb = (long)(q1 - q0) * DFA_M * DFA_P;  /* one (camera, level)'s weights for the block */
+  if (a->w2) { /* per anchor and group: 24 chunks of 16 weights, one per (camera, level), 32 bytes each */
+    const uint64_t* src = (const uint64_t*)(a->w2 + (long)q0 * DFA_M * DFA_CAMS * DFA_LEVELS * DFA_P);
+    for (int q = 0; q < q1 - q0; q++)
+      for (int g = 0; g < DFA_M; g++)
+        for (int cl = 0; cl < DFA_CAMS * DFA_LEVELS; cl++, src += DFA_P / 4) {
+          uint64_t* dst = (uint64_t*)(stage + cl * nb + ((long)q * DFA_M + g) * DFA_P);
+          dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
+        }
+  }
   msda_args_t m;
   for (int c = 0; c < DFA_CAMS; c++)
     for (int l = 0; l < DFA_LEVELS; l++) {
       dfa_msda_args(a, c, l, &m);
-      if (a->w2) { /* per anchor and group: the 16 weights of (c, l) sit contiguous (32 bytes, 8-byte aligned) */
-        const long gs = DFA_CAMS * DFA_LEVELS * DFA_P; /* 384 halves between groups */
-        for (int q = q0; q < q1; q++) {
-          const uint64_t* src = (const uint64_t*)(a->w2 + (long)q * DFA_M * gs + ((long)c * DFA_LEVELS + l) * DFA_P);
-          uint64_t* dst = (uint64_t*)(stage + (long)(q - q0) * DFA_M * DFA_P);
-          for (int g = 0; g < DFA_M; g++, src += gs / 4, dst += DFA_P / 4) {
-            dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
-          }
-        }
-        dfa_h2f(wbuf, stage, (long)(q1 - q0) * DFA_M * DFA_P);
+      if (a->w2) {
+        dfa_h2f(wbuf, stage + ((long)c * DFA_LEVELS + l) * nb, nb);
         m.attw = wbuf - (long)q0 * DFA_M * DFA_P;
       } else if (a->w16) {
         dfa_h2f(wbuf, a->w16 + (((long)c * DFA_LEVELS + l) * a->Q + q0) * DFA_M * DFA_P, (long)(q1 - q0) * DFA_M * DFA_P);

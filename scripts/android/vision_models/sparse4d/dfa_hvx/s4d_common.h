@@ -157,7 +157,7 @@ static void dfa(const std::string& src, const std::string& out, const std::strin
   uint64 us = 0;
   int flags = getenv("DFA_FLAGS") ? atoi(getenv("DFA_FLAGS")) : 4;
   if (w.type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16)  // the skel converts per block
-    flags |= w.shape.size() == 3 ? 1 << 17 : 1 << 16;    // (Q, 8, 384): split.py's v2 layout
+    flags |= w.shape.size() == 3 ? 1 << 17 : 1 << 16;  // (Q, 8, 384): split.py's v2 layout
   int rc = dfa_rpc_run(h_dfa, (const uint8*)v[0]->p, (int)v[0]->bytes, (const uint8*)v[1]->p, (int)v[1]->bytes,
                        (const uint8*)v[2]->p, (int)v[2]->bytes, (const uint8*)v[3]->p, (int)v[3]->bytes, vscale, 4, vzp, 4,
                        HW, 8, (const float*)pts.p, (int)(pts.bytes / 4), (const float*)w.p, (int)(w.bytes / 4), Q, flags,

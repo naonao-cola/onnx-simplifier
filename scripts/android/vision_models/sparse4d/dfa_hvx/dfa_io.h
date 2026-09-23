@@ -65,7 +65,7 @@ static float* dfa_use_w2(dfa_args_t* a, uint16_t** stage) {
                 dfa_f2h(a->w[((((long)c * DFA_LEVELS + l) * a->Q + q) * DFA_M + g) * DFA_P + p]);
   a->w2 = h;
   a->w = NULL;
-  *stage = (uint16_t*)dfa_zalloc((long)a->Q * DFA_M * DFA_P * 2);
+  *stage = (uint16_t*)dfa_zalloc((long)a->Q * DFA_CAMS * DFA_LEVELS * DFA_M * DFA_P * 2);
   return (float*)dfa_zalloc((long)a->Q * DFA_M * DFA_P * 4);
 }
 
