@@ -13,8 +13,8 @@ Stages, each cached under work/<name>/<stage>/ and re-run only when its inputs c
   rewrite    graph rewrites from passes/ (e.g. uint8 NHWC input, raw uint8 outputs)
   post       build the CPU post-processing graph the spec asks for (e.g. YOLO decode + NMS)
   pipe       write the pipeline file (pipe.txt) that runtime/pipe_run reads, + the host inputs
-  partition  run the HTP part on the phone with CPU fallback allowed and strict, and report every
-             op QNN refused (with tensor rank; see ../vision_models_plan.md for why rank matters)
+  partition  run the HTP model alone through pipe_run with CPU fallback allowed and strict, and
+             report every op QNN refused (with tensor rank; see ../vision_models_plan.md)
   push       build runtime/pipe_run and push it, the libs, models, pipe.txt and inputs
   bench      run pipe.txt on the phone over the eval images: per-step and total latency, FPS
   accuracy   compare the phone's outputs with fp32 ORT on the host (metric set by the spec)
@@ -22,6 +22,9 @@ Stages, each cached under work/<name>/<stage>/ and re-run only when its inputs c
 Heavy host steps (onnxsim, quantization, calibration) run in a child process under
 `systemd-run --user -p MemoryMax=<--mem, default 16G>` when systemd-run is available, one at a
 time. Nothing runs in the background.
+
+A spec with `prebuilt:` (see models/maskrcnn.yaml) points at a pipeline another script built;
+simplify..post are skipped for it and pipe..accuracy run as usual. See README.md.
 """
 from __future__ import annotations
 
