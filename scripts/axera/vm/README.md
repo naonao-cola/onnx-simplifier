@@ -68,6 +68,20 @@ python -m pytest tests/test_axera_mcode_structure.py -k on_device
 If the guest driver wedges: `lxc restart --force axcl-vm` (the card gets a
 secondary bus reset on the way), then re-run. The host is never involved.
 
+If the card's firmware died (guest `dmesg` repeats `device 3: dead!` and
+`axcl-smi` lists no card -- seen after mcode fault-injection sweeps),
+reloading `axcl_host` alone is not enough: `ax_pcie_host_dev` keeps stale
+transfer handles (`transfer handle ... already exists!`). Reload the whole
+stack in the guest, in `guest_install_axcl.sh`'s order:
+
+```sh
+modprobe -r axcl_host ax_pcie_mmb ax_pcie_msg ax_pcie_host_dev
+modprobe ax_pcie_host_dev && modprobe ax_pcie_msg && modprobe ax_pcie_mmb && modprobe axcl_host
+```
+
+then wait ~30 s and confirm the card in `axcl-smi` plus a control model run
+before any further device work.
+
 ## A host crash to never repeat (2026-09-07 19:39, kdump `202609071939`)
 
 Starting the VM while the host AXCL modules were still loaded (the blacklist
