@@ -472,6 +472,95 @@ def test_genai_contrib_ops_sdpa_mode_and_export():
     np.testing.assert_allclose(got.numpy(), want, rtol=1e-4, atol=1e-4)
 
 
+def _matmulnbits_model(zero_points, k=40, n=8, block=16, seed=7):
+    k_blocks = -(-k // block)
+    rng = np.random.default_rng(seed)
+    packed = rng.integers(0, 256, (n, k_blocks, block // 2), dtype=np.uint8)
+    scales = (rng.random(n * k_blocks) * 0.1 + 0.01).astype(np.float32)
+    zp = rng.integers(0, 256, (n * ((k_blocks + 1) // 2),), dtype=np.uint8)
+    bias = rng.standard_normal(n).astype(np.float32)
+    zp_in = "zp" if zero_points else '""'
+    model = parser.parse_model(
+        f"""
+        <ir_version: 8, opset_import: ["": 18, "com.microsoft": 1]>
+        g (float[B, S, {k}] a) => (float[B, S, {n}] y) {{
+          y = com.microsoft.MatMulNBits<K = {k}, N = {n}, bits = 4, block_size = {block}>(
+              a, w, scales, {zp_in}, "", bias)
+        }}
+        """
+    )
+    inits = [
+        numpy_helper.from_array(packed, "w"),
+        numpy_helper.from_array(scales, "scales"),
+        numpy_helper.from_array(bias, "bias"),
+    ]
+    if zero_points:
+        inits.append(numpy_helper.from_array(zp, "zp"))
+    model.graph.initializer.extend(inits)
+    return model, rng.standard_normal((2, 3, k)).astype(np.float32)
+
+
+@pytest.mark.parametrize("zero_points", [False, True])
+def test_matmulnbits_packed_mode(zero_points):
+    # matmul_nbits="packed": weights stay int4 (uint8 buffers, no dense weight) behind
+    # torch.ops.onnxsim.matmul_nbits -- the PyTorch fallback here on CPU -- and export as
+    # that one op.
+    from torch.export import export
+
+    model, x = _matmulnbits_model(zero_points)
+    try:
+        (want,) = _ort(model, {"a": x})
+    except Exception as e:
+        pytest.skip(f"onnxruntime cannot run MatMulNBits: {e}")
+    mod = onnx_to_torch(model, inputs=["a"], outputs=["y"], matmul_nbits="packed")
+    dtypes = {k: t.dtype for k, t in mod.state_dict().items()}
+    assert torch.uint8 in dtypes.values()
+    assert not any(
+        t.dim() == 2 and t.shape == (8, 40) for t in mod.state_dict().values()
+    )
+    (got,) = mod(torch.from_numpy(x))
+    np.testing.assert_allclose(got.numpy(), want, rtol=1e-4, atol=1e-4)
+    meta = onnx_to_torch(
+        model, inputs=["a"], outputs=["y"], matmul_nbits="packed", device="meta"
+    )
+    meta.load_state_dict(onnx_state_dict(meta.param_names, model), assign=True)
+    np.testing.assert_allclose(
+        meta(torch.from_numpy(x))[0].numpy(), want, rtol=1e-4, atol=1e-4
+    )
+    ep = export(mod, (torch.from_numpy(x),))
+    targets = [str(n.target) for n in ep.graph.nodes if n.op == "call_function"]
+    assert any("onnxsim.matmul_nbits" in t for t in targets), targets
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA (Triton kernel)")
+@pytest.mark.parametrize("zero_points", [False, True])
+@pytest.mark.parametrize("m", [1, 5, 16, 40])
+def test_matmulnbits_triton_kernel_matches_fallback(zero_points, m):
+    # The CUDA path (onnxsim/_triton_w4a16.py: split-K decode kernel for M <= 16, GPU
+    # dequant + cuBLAS above) against the PyTorch fallback, incl. K not a multiple of the
+    # group and group 32 (a real q4f16 export's block size).
+    pytest.importorskip("triton")
+    from onnxsim._matmul_nbits_op import dequant_packed
+
+    k, n, group = 200, 96, 32
+    kb = -(-k // group)
+    g = torch.Generator().manual_seed(m)
+    q = torch.randint(0, 16, (n, kb * group), generator=g, dtype=torch.int32)
+    packed = (q[:, 0::2] | (q[:, 1::2] << 4)).to(torch.uint8).cuda()
+    scales = (torch.rand(n, kb, generator=g) * 0.1 + 0.01).half().cuda()
+    zeros = (
+        torch.randint(0, 16, (n, kb), generator=g, dtype=torch.uint8).cuda()
+        if zero_points
+        else None
+    )
+    x = torch.randn(m, k, generator=g).half().cuda()
+    got = torch.ops.onnxsim.matmul_nbits(x, packed, scales, zeros, k, n, group, None)
+    w = dequant_packed(packed, scales, zeros, k, n, group, torch.float16)
+    want = torch.nn.functional.linear(x, w)
+    rel = ((got.float() - want.float()).norm() / want.float().norm()).item()
+    assert rel < 1e-3, rel
+
+
 @pytest.mark.parametrize("zero_points", [False, True])
 def test_matmulnbits_dequantized_matches_onnxruntime(zero_points):
     # Weight-only int4 (onnx-community q4f16 / GenAI int4 exports): dequantized once at
