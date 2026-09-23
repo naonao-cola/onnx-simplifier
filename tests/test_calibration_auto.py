@@ -101,6 +101,22 @@ def test_auto_never_clips_sigmoid_inputs_or_outputs():
     assert choices["h"] != "minmax" and ranges["h"][1] < 12.0
 
 
+def test_silu_gate_input_is_not_protected():
+    m = _model(
+        """g (float[1, 1048576] x) => (float[1, 1048576] y) {
+            h = Mul(x, k)
+            s = Sigmoid(h)
+            a = Mul(h, s)
+            y = Add(a, c)
+        }""",
+        _consts(),
+    )
+    stats = collect_calibration_stats(m, _heavy_tailed(2), tensor_names=["h", "s"])
+    _, choices = stats.auto_ranges()
+    assert choices["h"] != "minmax (protected)"  # SiLU's input: an activation
+    assert choices["s"] == "minmax (protected)"  # the Sigmoid output: bounded
+
+
 def test_auto_protects_head_tensors_and_named_tensors():
     m = _model(_SCALE, _consts())
     stats = collect_calibration_stats(m, _heavy_tailed(2), tensor_names=["h", "y"])
@@ -194,3 +210,34 @@ def test_pick_calibrates_once(monkeypatch):
     # the min/max pass and the histogram pass, shared by all six candidates
     assert runs["calib"] == 2 * len(calib)
     assert pick.auto_choices  # "auto" was a candidate: its choices are kept
+
+
+def test_pick_cross_fits_with_folds(monkeypatch):
+    m, calib, _ = _detector_case()
+    calib_ids = {id(b) for b in calib}
+    runs = {"calib": 0}
+    real_run = ort.InferenceSession.run
+
+    def counting_run(self, output_names, feed, *a, **k):
+        if id(feed) in calib_ids:
+            runs["calib"] += 1
+        return real_run(self, output_names, feed, *a, **k)
+
+    monkeypatch.setattr(ort.InferenceSession, "run", counting_run)
+    pick = onnxsim.pick_calibration(
+        m,
+        calib,
+        metric=_detections_kept,
+        candidates=("minmax", "percentile:99.99"),
+        full_graph=True,
+        folds=2,
+    )
+    assert pick.method == "minmax"
+    # each fold's batches detect their one outlier only under minmax
+    assert pick.scores == {"minmax": 2.0, "percentile:99.99": 0.0}
+    # per fold: 2 calibration passes over the other half (2 batches), its own
+    # half (2 batches) scored by the float model and both candidates; then the
+    # winner's 2 passes over all 4
+    assert runs["calib"] == 2 * (2 * 2 + 2 * 3) + 2 * len(calib)
+    with pytest.raises(ValueError):
+        onnxsim.pick_calibration(m, calib, calib, folds=2)

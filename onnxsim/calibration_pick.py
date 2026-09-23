@@ -22,6 +22,7 @@ import numpy as np
 import onnx
 
 from onnxsim.calibration import (
+    CalibrationStats,
     Tensors,
     _StaticPlan,
     collect_calibration_stats,
@@ -80,14 +81,16 @@ def run_outputs(
     data: Sequence[Tensors],
     providers: Optional[Sequence[str]] = None,
 ) -> Outputs:
-    """Every output of ``model`` on every batch, through ONNX Runtime with
-    graph optimizations **off**: ORT otherwise fuses DQ -> Conv/Gemm/MatMul
-    -> Q into u8s8 integer kernels that saturate on x86 CPUs without VNNI, so
-    the ranking would depend on the host CPU instead of the calibration."""
+    """Every output of ``model`` on every batch, through ONNX Runtime at its
+    *basic* optimization level: the extended level fuses DQ -> Conv/Gemm/
+    MatMul -> Q into u8s8 integer kernels that saturate on x86 CPUs without
+    VNNI, so the ranking would depend on the host CPU instead of the
+    calibration. Basic keeps every QDQ pair (no QLinear/integer op appears)
+    and is ~4.7x faster than no optimization on YOLO11n."""
     import onnxruntime as ort
 
     so = ort.SessionOptions()
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
     sess = ort.InferenceSession(
         model.SerializeToString(),
         so,
@@ -111,6 +114,7 @@ def pick_calibration(
     activation_type: str = "uint8",
     minmax_tensor_names: Optional[Sequence[str]] = None,
     auto_options: Optional[Dict] = None,
+    folds: int = 0,
     num_calibration_samples: int = 8,
     seed: int = 0,
     verbose: bool = False,
@@ -121,11 +125,11 @@ def pick_calibration(
     ``candidates`` method and return the one ``metric`` scores highest on
     ``eval_data``.
 
-    The model runs over ``calibration_data`` once
+    Without ``folds`` the model runs over ``calibration_data`` once
     (:func:`onnxsim.calibration.collect_calibration_stats`, two streaming
     passes); every candidate's ranges come from those statistics. Then each
     candidate's quantized model runs over ``eval_data``, as does the float
-    model once, all through ORT with graph optimizations off (see
+    model once, all through ORT without its QDQ -> integer-kernel fusion (see
     :func:`run_outputs`).
 
     :param calibration_data: batches to calibrate on (default: random, see
@@ -133,7 +137,17 @@ def pick_calibration(
             for a real distribution; pass real data)
     :param eval_data: held-out batches to score on. Defaults to
             ``calibration_data`` -- which favors whatever fits those exact
-            batches; hold some out when the data allows.
+            batches; hold some out when the data allows, or use ``folds``.
+    :param folds: ``k >= 2`` cross-fits instead of using ``eval_data``: the
+            calibration batches are split into ``k`` folds (every ``k``-th
+            batch), each fold is scored by candidates calibrated on the other
+            ``k - 1``, and a candidate's score is the size-weighted mean of
+            its fold scores; the winner is then calibrated on all the data.
+            Every batch gets scored, none by a model calibrated on it, at the
+            cost of ``k + 1`` calibration runs (each shared by all
+            candidates). On YOLO11n a single 16-image holdout ranked
+            percentile 99.99 first; 4 folds over the same 64 images ranked
+            mse first, as 128 separate images do.
     :param metric: ``metric(float_outputs, quant_outputs) -> float``, higher
             is better; each argument is a list with one
             ``{output_name: array}`` per ``eval_data`` batch. Default:
@@ -161,6 +175,8 @@ def pick_calibration(
         )
     elif not isinstance(calibration_data, Sequence):
         calibration_data = list(calibration_data)
+    if folds >= 2 and eval_data is not None:
+        raise ValueError("folds cross-fits on calibration_data: pass no eval_data")
     if eval_data is None:
         eval_data = calibration_data
     metric = metric or worst_output_sqnr
@@ -173,27 +189,56 @@ def pick_calibration(
         activation_type=activation_type,
         minmax_tensor_names=minmax_tensor_names,
     )
-    stats = collect_calibration_stats(
-        model,
-        calibration_data,
-        providers=providers,
-        tensor_names=plan.tensor_names,
-    )
-    float_out = run_outputs(model, eval_data, providers)
+    auto_kw = dict(dict(activation_type=activation_type), **(auto_options or {}))
 
+    def candidate_ranges(stats: CalibrationStats, c: str):
+        if c == "auto":
+            return stats.auto_ranges(
+                minmax_tensor_names=plan.minmax_tensor_names, **auto_kw
+            )
+        ranges = stats.ranges(
+            c, minmax_tensor_names=plan.minmax_tensor_names, **range_options
+        )
+        return ranges, {}
+
+    def calibrated(data: Sequence[Tensors]) -> CalibrationStats:
+        return collect_calibration_stats(
+            model, data, providers=providers, tensor_names=plan.tensor_names
+        )
+
+    scores: Dict[str, float] = {c: 0.0 for c in candidates}
+    if folds >= 2:
+        # Cross-fitting: fold f is scored by models calibrated on the others.
+        n = len(calibration_data)
+        if n < folds:
+            raise ValueError(f"{n} calibration batches are too few for {folds} folds")
+        for f in range(folds):
+            ev = [b for i, b in enumerate(calibration_data) if i % folds == f]
+            cal = [b for i, b in enumerate(calibration_data) if i % folds != f]
+            stats = calibrated(cal)
+            float_out = run_outputs(model, ev, providers)
+            for c in candidates:
+                q = plan.apply(candidate_ranges(stats, c)[0])
+                s = float(metric(float_out, run_outputs(q, ev, providers)))
+                scores[c] += s * len(ev) / n
+                if verbose:
+                    print(f"  fold {f} calibration {c}: {s:.6g}")
+        winner = max(candidates, key=lambda c: (scores[c], -candidates.index(c)))
+        final, final_choices = candidate_ranges(calibrated(calibration_data), winner)
+        if verbose:
+            for c in candidates:
+                print(f"  calibration {c}: {scores[c]:.6g} (mean over {folds} folds)")
+        return CalibrationPick(
+            winner, scores[winner], scores, final, plan.apply(final), final_choices
+        )
+
+    stats = calibrated(calibration_data)
+    float_out = run_outputs(model, eval_data, providers)
     best: Optional[CalibrationPick] = None
-    scores: Dict[str, float] = {}
     auto_choices: Dict[str, str] = {}
     for c in candidates:
-        if c == "auto":
-            ranges, auto_choices = stats.auto_ranges(
-                minmax_tensor_names=plan.minmax_tensor_names,
-                **dict(dict(activation_type=activation_type), **(auto_options or {})),
-            )
-        else:
-            ranges = stats.ranges(
-                c, minmax_tensor_names=plan.minmax_tensor_names, **range_options
-            )
+        ranges, choices = candidate_ranges(stats, c)
+        auto_choices = choices or auto_choices
         q = plan.apply(ranges)
         score = float(metric(float_out, run_outputs(q, eval_data, providers)))
         scores[c] = score

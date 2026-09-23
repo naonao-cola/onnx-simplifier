@@ -651,6 +651,9 @@ class CalibrationStats:
         self.bounded_outputs = bounded_outputs
         self.tail_sensitive = tail_sensitive
         self._upstream = upstream
+        # (tensor, method, *params) -> range: "auto" and a model-level pick
+        # ask for the same thresholds (entropy's search is the slow one)
+        self._range_cache: Dict[Tuple, Tuple[float, float]] = {}
 
     def _method_range(
         self,
@@ -668,15 +671,27 @@ class CalibrationStats:
         if base == "minmax" or h is None:
             return obs_min, obs_max
         if base == "percentile":
-            lo, hi = h.percentile_range(percentile if arg is None else arg)
-            return max(obs_min, lo), min(obs_max, hi)
-        if base == "entropy":
-            t = h.entropy_threshold(num_quantized_bins, entropy_min_coverage)
+            p = percentile if arg is None else arg
+            key: Tuple = (name, base, p)
+        elif base == "entropy":
+            key = (name, base, num_quantized_bins, entropy_min_coverage)
         elif base == "mse":
-            t = h.mse_threshold(num_mse_candidates, mse_min_coverage)
+            key = (name, base, num_mse_candidates, mse_min_coverage)
         else:
             raise ValueError(f"unknown calibration method: {method!r}")
-        return max(obs_min, -t), min(obs_max, t)
+        if key in self._range_cache:
+            return self._range_cache[key]
+        if base == "percentile":
+            lo, hi = h.percentile_range(p)
+            r = (max(obs_min, lo), min(obs_max, hi))
+        else:
+            if base == "entropy":
+                t = h.entropy_threshold(num_quantized_bins, entropy_min_coverage)
+            else:
+                t = h.mse_threshold(num_mse_candidates, mse_min_coverage)
+            r = (max(obs_min, -t), min(obs_max, t))
+        self._range_cache[key] = r
+        return r
 
     def head_tensors(self, depth: int) -> Set[str]:
         """Tensors at most ``depth`` producing nodes upstream of a graph
@@ -766,7 +781,9 @@ class CalibrationStats:
           and the *inputs* of Sigmoid/HardSigmoid/Softmax/LogSoftmax/Tanh --
           clipping a logit at ``T`` caps the score at ``f(T)``, which is how
           percentile/entropy calibration zeroes a detector's rare confident
-          class scores;
+          class scores. A Sigmoid that only gates its own input (SiLU's
+          ``x * sigmoid(x)``, HardSwish) is an activation, not a score: its
+          input is not protected;
         - ``protect_head_depth=N``: every tensor within ``N`` nodes upstream
           of a graph output (a detection/regression head).
 
@@ -809,6 +826,18 @@ class CalibrationStats:
         return ranges, choices
 
 
+def _is_gate(n: onnx.NodeProto, consumers: Dict[str, List[onnx.NodeProto]]) -> bool:
+    """A Sigmoid/HardSigmoid only gating its own input -- ``x * sigmoid(x)``
+    (SiLU/Swish), ``x * hardsigmoid(x)`` (HardSwish): its input is an
+    ordinary activation, not a score logit whose tail must survive."""
+    if n.op_type not in ("Sigmoid", "HardSigmoid") or not n.output[0]:
+        return False
+    uses = consumers.get(n.output[0], [])
+    return bool(uses) and all(
+        u.op_type == "Mul" and n.input[0] in u.input for u in uses
+    )
+
+
 def collect_calibration_stats(
     model: Union[str, onnx.ModelProto],
     calibration_data: Sequence[Tensors],
@@ -839,6 +868,11 @@ def collect_calibration_stats(
 
     g = model.graph
     upstream: Dict[str, List[str]] = {}
+    consumers: Dict[str, List[onnx.NodeProto]] = {}
+    for n in g.node:
+        for i in n.input:
+            if i:
+                consumers.setdefault(i, []).append(n)
     bounded: Set[str] = set()
     tail: Set[str] = set()
     for n in g.node:
@@ -848,7 +882,11 @@ def collect_calibration_stats(
                 upstream[o] = ins
         if n.op_type in _BOUNDED_OUTPUT_OPS:
             bounded |= {o for o in n.output if o}
-        if n.op_type in _TAIL_SENSITIVE_INPUT_OPS and ins:
+        if (
+            n.op_type in _TAIL_SENSITIVE_INPUT_OPS
+            and ins
+            and not _is_gate(n, consumers)
+        ):
             tail.add(ins[0])
     stats = CalibrationStats(
         {}, {}, {o.name for o in g.output}, bounded, tail, upstream
