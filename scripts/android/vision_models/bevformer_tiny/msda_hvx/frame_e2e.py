@@ -172,15 +172,19 @@ def main():
         ],
         check=True,
     )
-    sh(f"chmod 755 {R}/frame_run && rm -rf {R}/fr && mkdir -p {R}/fr/seq {R}/fr/pipe")
+    # a phone / host output directory per configuration: runs of different configs can't collide
+    fr = "fr_" + f"{a.backbone}_{a.decoder}".replace(".", "_")
+    sh(
+        f"chmod 755 {R}/frame_run && rm -rf {R}/{fr} && mkdir -p {R}/{fr}/seq {R}/{fr}/pipe"
+    )
     subprocess.run(
-        [*E.ADB, "push", "-q", *[str(d) for d in frames], f"{R}/fr/"], check=True
+        [*E.ADB, "push", "-q", *[str(d) for d in frames], f"{R}/{fr}/"], check=True
     )
     env = (
         f"cd {R} && LD_LIBRARY_PATH={R} QNN_PERF=burst "
         f"ADSP_LIBRARY_PATH='{R};/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp' "
     )
-    names = " ".join(f"fr/{d.name}" for d in frames)
+    names = " ".join(f"{fr}/{d.name}" for d in frames)
     for mode in a.modes.split(","):
         out = subprocess.run(
             [
@@ -188,7 +192,7 @@ def main():
                 "shell",
                 f"{env} ./frame_run msda_split {a.backbone}.onnx {'split' if split_dec else a.decoder + '.onnx'} "
                 f"{mode} 1 {a.reps} "
-                f"fr/{mode} {names} 2>&1",
+                f"{fr}/{mode} {names} 2>&1",
             ],
             capture_output=True,
             text=True,
@@ -204,10 +208,10 @@ def main():
         if "PASS" not in out:
             raise SystemExit(f"frame_run {mode} failed")
         if mode in ("seq", "pipe"):
-            loc = root / mode
-            loc.mkdir(exist_ok=True)
+            loc = root / fr / mode
+            loc.mkdir(parents=True, exist_ok=True)
             subprocess.run(
-                [*E.ADB, "pull", "-q", f"{R}/fr/{mode}/.", str(loc)], check=True
+                [*E.ADB, "pull", "-q", f"{R}/{fr}/{mode}/.", str(loc)], check=True
             )
             hits = {"cpu": 0, "htp": 0}
             for i, gt in enumerate(gts):

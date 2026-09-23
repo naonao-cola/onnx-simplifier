@@ -285,6 +285,32 @@ Where the remaining 55 ms go, and the next levers:
   depend only on the image features, so they could also run in the backbone's call.
 - **The kernel's multiply-accumulate phase is its larger half.** See `../../msda_hvx/README.md`.
 
+### The whole frame in one process (`msda_hvx/frame_run.cpp`, `frame_e2e.py`)
+
+`e2e_msda.py` runs each piece as its own process and carries tensors through the host. `frame_run`
+chains backbone -> feats dequantize (CPU) -> encoder -> decoder in one process, every tensor in rpcmem,
+and carries the BEV itself: prev_bev is a row gather of its own last BEV (`rot_idx.i32`, torchvision's
+nearest rotate of an index image, checked exact against `rotate_prev_bev`). The host only prepares
+per-frame inputs that don't depend on any output. Modes:
+- `seq`: one frame at a time (latency);
+- `pipe`: backbone | encoder | decoder threads, two slots between stages (throughput); its outputs are
+  compared bit for bit with seq's;
+- `conc`: the backbone / decoder alone, the 6 sampling calls alone, then each pair at once.
+
+Phone, scene-0103 frames 0-5 x 5 passes, under the phone lock (`FRAME_RUN_TABLE`):
+
+<!-- FRAME_RUN_TABLE -->
+
+Findings:
+- **The HTP and the HVX run concurrently.** The backbone takes 21.9 ms with the 6 sampling calls running
+  alongside (22.0 alone); the calls take 31.2 ms (29.4 alone).
+- **The HTP is the bottleneck of a pipelined frame:** ~75 ms of HTP pieces per frame (backbone 22,
+  encoder pieces 28, decoder 25) against ~28 ms of HVX. So pipelining alone gives little (97 vs 103
+  ms/frame); what helps is moving HTP work to the HVX.
+- **Decoder per-op profile (fp16):** the self-attention's softmax x V MatMul is 31% (the 900 x 900
+  attention of layers 1-5; layer 0's is constant and folded), the deformable sampling (GridSample,
+  the grid math, ReduceSum) ~35-40%.
+
 ### Why not a `scripts/android/deploy` spec (yet)
 
 The deploy pipeline (#1853) takes one graph through fetch -> simplify -> quantize -> rewrite ->
