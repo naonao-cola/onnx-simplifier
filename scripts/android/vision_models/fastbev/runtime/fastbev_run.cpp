@@ -138,19 +138,33 @@ static const int FH = 64, FW = 176, ROWS = 6 * FH * FW, NVOX = 200 * 200 * 4;
 // proj: (6, 3, 4) = diag(1/4, 1/4, 1) @ lidar2img[:3]; last valid camera wins; `block` maps camera i
 // to its feature block in the table (the upstream adjacent-frame camera swap, see data.py)
 static void m0_lut(const float* proj, const int* block, int32_t* lut, int v0, int v1) {
-  for (int v = v0; v < v1; v++) {
-    const int ix = v / 800, iy = (v / 4) % 200, iz = v % 4;
-    const float px = ix * 0.5f + -50.f, py = iy * 0.5f + -50.f, pz = iz * 1.5f + -4.f;
-    int32_t best = ROWS;
+  // one camera at a time over a strip of voxels, branch-free, so the compiler vectorizes it (NEON
+  // fdiv / frintn = round half to even, like torch); later cameras overwrite (last valid wins)
+  constexpr int S = 256;
+  float px[S], py[S], pz[S];
+  int32_t best[S];
+  for (int s0 = v0; s0 < v1; s0 += S) {
+    const int n = std::min(S, v1 - s0);
+    for (int j = 0; j < n; j++) {
+      const int v = s0 + j;
+      px[j] = (v / 800) * 0.5f + -50.f;
+      py[j] = ((v / 4) % 200) * 0.5f + -50.f;
+      pz[j] = (v % 4) * 1.5f + -4.f;
+      best[j] = ROWS;
+    }
     for (int c = 0; c < 6; c++) {
       const float* P = proj + c * 12;
-      const float u = ((P[0] * px + P[1] * py) + P[2] * pz) + P[3];
-      const float w = ((P[4] * px + P[5] * py) + P[6] * pz) + P[7];
-      const float d = ((P[8] * px + P[9] * py) + P[10] * pz) + P[11];
-      const float x = nearbyintf(u / d), y = nearbyintf(w / d);  // round half to even, like torch
-      if (x >= 0 && y >= 0 && x < FW && y < FH && d > 0) best = block[c] * FH * FW + (int)y * FW + (int)x;
+      const int32_t base = block[c] * FH * FW;
+      for (int j = 0; j < n; j++) {
+        const float u = ((P[0] * px[j] + P[1] * py[j]) + P[2] * pz[j]) + P[3];
+        const float w = ((P[4] * px[j] + P[5] * py[j]) + P[6] * pz[j]) + P[7];
+        const float d = ((P[8] * px[j] + P[9] * py[j]) + P[10] * pz[j]) + P[11];
+        const float x = __builtin_roundevenf(u / d), y = __builtin_roundevenf(w / d);
+        const bool ok = x >= 0.f && y >= 0.f && x < (float)FW && y < (float)FH && d > 0.f;
+        best[j] = ok ? base + (int32_t)y * FW + (int32_t)x : best[j];
+      }
     }
-    lut[v] = best;
+    memcpy(lut + s0, best, n * sizeof(int32_t));
   }
 }
 static void m0_lut_mt(const float* proj, const int* block, int32_t* lut, int nt) {

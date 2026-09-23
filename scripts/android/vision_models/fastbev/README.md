@@ -158,3 +158,23 @@ CPU-side details: `top_k_u8` picks the pre-NMS candidates on the uint8 logits (s
 monotonic) with one histogram pass, ordered like a stable sort; the rotated IoU exits early when the
 boxes' circumscribed circles don't meet (exact). Together with overlapping the LUTs these took M0
 from 45.8 to 31.9 ms and Fast-BEV++ from 30.4 to 25.2 ms.
+
+### Tried, no gain
+
+* More CPU threads for the LUTs (6-7) or fewer DSP gather threads (3): within noise (31.2-32.3 ms).
+  A strip-wise, branch-free LUT loop (`-O3`, vectorizable) takes the overlapped LUT time from 10.5
+  to 9.8 ms but the frame stays at 31.7 ms.
+* QNN EP's HTP shared-memory allocator (to drop the QNN graph-I/O copies of the 41 MB volume and
+  the feature tables): with this plugin QNN EP (onnxruntime-qnn 2.6.0) `CreateSharedAllocator` on
+  the NPU EP device rejects both memory types ("Invalid memory type for OrtEpDevice"), and a
+  session with `enable_htp_shared_memory_allocator=1` fails to create the EP ("Unknown exception
+  occurred while creating QNN EP"). Not pursued further.
+
+### Remaining levers
+
+* M0: the BEV net's first 1x1 conv (1024 -> 256 channels on 200 x 200) could run on the DSP as part
+  of the gather (gather + matmul, never writing the 41 MB volume); the HTP BEV net would then start
+  from a 10 MB tensor.
+* Pipelining frames: the encoder of frame i+1 (HTP) can overlap the DSP gather and CPU decode of
+  frame i; throughput would approach max(HTP time, ...) ~ 18 ms/frame for M0.
+

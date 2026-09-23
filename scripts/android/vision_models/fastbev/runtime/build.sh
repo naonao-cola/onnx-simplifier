@@ -23,7 +23,7 @@ QURT_INC=(-I "$SDK/rtos/qurt/compute$HEX_ARCH/include/qurt" -I "$SDK/rtos/qurt/c
 CC="$NDK_BIN/aarch64-linux-android29-clang"
 "$CC" -O2 -c "${INC[@]}" -I "$SDK/ipc/fastrpc/rpcmem/inc" fbgather_rpc_stub.c -o stub.o
 "$CC" -O2 -ffp-contract=off -c "$FB/csrc/postproc.c" -o postproc.o
-"$NDK_BIN/aarch64-linux-android29-clang++" -O2 -ffp-contract=off -std=c++17 -static-libstdc++ "${INC[@]}" \
+"$NDK_BIN/aarch64-linux-android29-clang++" -O3 -ffp-contract=off -std=c++17 -static-libstdc++ "${INC[@]}" \
   -I "$SDK/ipc/fastrpc/rpcmem/inc" -I "$Q/headers" -o fastbev_run "$SRC/fastbev_run.cpp" stub.o postproc.o \
   -L "$Q/libs" -lonnxruntime -L "$SDK/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc -lm
 echo "built $OUT/fastbev_run $OUT/fbgather_rpc.so"
