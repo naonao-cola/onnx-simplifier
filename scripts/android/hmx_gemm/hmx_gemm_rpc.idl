@@ -1,0 +1,12 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+interface hmx_gemm_rpc : remote_handle64 {
+  // bit 0 turbo, bit 1 HMX power vote (required before any HMX op)
+  long perf_vote(in long flags, rout long rc);
+  // C = A . W + bias (fp16). mode 0: full (pack A, stream W tiles, unpack C) x iters;
+  // mode 1: all W tiles resident in VTCM, time the MAC+store loop only x iters.
+  // times[0] total us, [1] pack A us, [2] MAC loop us, [3] unpack us; codes: resource rcs.
+  long gemm_f16(in long mode, in long M, in long K, in long N, in long iters, in sequence<uint16> a,
+                in sequence<uint16> wp, in sequence<uint16> bias, rout sequence<uint16> c,
+                rout sequence<uint64> times, rout sequence<long> codes);
+};
