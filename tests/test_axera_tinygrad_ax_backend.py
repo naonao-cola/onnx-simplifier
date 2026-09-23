@@ -261,13 +261,29 @@ def _step_records():
         return json.load(f)
 
 
+# misc_op_record_emit: Greater 18 + Less 1 + Cast 19 covered; ReduceSum 43,
+# Sqrt [512,512,3,3] 3, Softmax 3, Log 2, MaxPool 1 and ReduceMean 1 conditional
+_MISC_COVERED = 38
+_MISC_CONDITIONAL = 53
+
+
 def test_coverage_report_on_the_resnet18_step():
     report = axb.coverage_report(_step_records())
     assert report["nodes"] == 1104
     assert report["per_op"]["Gather"] == {"covered": 41}
     assert report["per_op"]["Transpose"] == {"covered": 41}
     assert report["per_op"]["Relu"] == {"conditional": 17}
-    assert report["per_op"]["Sqrt"] == {"conditional": 39, "refused": 3}
+    # the 3 Sqrt [512,512,3,3] and the step-shape ReduceSum / Greater / Less ->
+    # Cast nodes come from misc_op_record_emit.py; Greater/Less -> Cast is not
+    # quantized, so its template is the whole program
+    assert report["per_op"]["Sqrt"] == {"conditional": 42}
+    assert report["per_op"]["ReduceSum"] == {"conditional": 43, "refused": 1}
+    assert report["per_op"]["Greater"] == {"covered": 18}
+    assert report["per_op"]["Less"] == {"covered": 1}
+    assert report["per_op"]["Cast"] == {"covered": 19}
+    for op, n in (("Softmax", 3), ("Log", 2), ("MaxPool", 1), ("ReduceMean", 1)):
+        assert report["per_op"][op] == {"conditional": n}
+    assert report["per_op"]["Neg"] == {"refused": 2}
     man = axb.mre.step_manifest()
     live_conv = sum(
         man["templates"][e["template"]]["kind"] == "conv" for e in man["nodes"].values()
@@ -284,9 +300,9 @@ def test_coverage_report_on_the_resnet18_step():
     # refused to conditional (fixtures/matmul_step_templates/manifest.json).
     live = len(axb.mre.step_manifest()["nodes"])
     assert report["totals"] == {
-        "covered": 82,
-        "conditional": 324 + live,
-        "refused": 698 - live,
+        "covered": 82 + _MISC_COVERED,
+        "conditional": 324 + live + _MISC_CONDITIONAL,
+        "refused": 698 - live - _MISC_COVERED - _MISC_CONDITIONAL,
     }
 
 
@@ -491,9 +507,9 @@ def test_coverage_report_weight_dtypes_on_the_resnet18_step():
     # refused to conditional (fixtures/matmul_step_templates/manifest.json).
     live = len(axb.mre.step_manifest()["nodes"])
     assert report["totals"] == {
-        "covered": 82,
-        "conditional": 324 + live,
-        "refused": 698 - live,
+        "covered": 82 + _MISC_COVERED,
+        "conditional": 324 + live + _MISC_CONDITIONAL,
+        "refused": 698 - live - _MISC_COVERED - _MISC_CONDITIONAL,
     }
     assert len(report["per_node"]) == 1104
     # no weight in the training step is a constant: a weight dtype choice
