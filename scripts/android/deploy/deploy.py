@@ -29,6 +29,7 @@ simplify..post are skipped for it and pipe..accuracy run as usual. See README.md
 from __future__ import annotations
 
 import argparse
+import collections.abc
 import hashlib
 import importlib.util
 import inspect
@@ -95,14 +96,18 @@ def stamp_of(ctx: Ctx, stage: str) -> str:
     prev = (ctx.work / STAGES[i - 1] / "stamp.json") if i else None
     prev_s = json.loads(prev.read_text())["key"] if prev and prev.exists() else ""
     code = hashlib.sha256(inspect.getsource(FUNCS[stage]).encode())
-    for f in CODE[stage]:
+    depends, code_files = list(DEPENDS[stage]), list(CODE[stage])
+    if stage == "quantize" and _auto_calibration(ctx):  # the picker scores with post + accuracy
+        depends += ["accuracy", "postprocess"]
+        code_files += ["stages/accuracy.py", "stages/post.py"]
+    for f in code_files:
         for g in sorted(HERE.glob(f)):
             code.update(g.read_bytes())
     if ONNXSIM_CODE.get(stage):  # the onnxsim the child will import (PYTHONPATH included)
         spec = importlib.util.find_spec("onnxsim")
         for f in ONNXSIM_CODE[stage]:
             code.update((Path(spec.origin).parent / f).read_bytes())
-    keys = {"stage": stage, "spec": {k: ctx.spec.get(k) for k in DEPENDS[stage]}, "device": ctx.device
+    keys = {"stage": stage, "spec": {k: ctx.spec.get(k) for k in depends}, "device": ctx.device
             if stage in ("partition", "push", "bench", "accuracy") else "", "prev": prev_s,
             "code": code.hexdigest()}
     return hashlib.sha256(json.dumps(keys, sort_keys=True, default=str).encode()).hexdigest()
@@ -136,7 +141,17 @@ CODE = {
     "accuracy": ["stages/accuracy.py", "stages/post.py", "stages/images.py"],
 }
 # onnxsim modules a stage runs: a quantizer change must invalidate quantize and what follows
-ONNXSIM_CODE = {"quantize": ["calibration.py", "qdq_full_graph.py"]}
+ONNXSIM_CODE = {"quantize": ["calibration.py", "calibration_pick.py", "qdq_full_graph.py"]}
+
+
+def _auto_calibration(ctx: Ctx) -> bool:
+    q = ctx.spec.get("quantize") or {}
+    return q.get("enabled", True) and str(q.get("calibration_method", "")).lower() == "auto"
+
+
+# what `calibration_method: auto` compares (onnxsim.pick_calibration candidates); `auto` itself is
+# onnxsim's per-tensor choice
+AUTO_CANDIDATES = ["minmax", "mse", "percentile:99.999", "percentile:99.99", "entropy", "auto"]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -199,7 +214,6 @@ def st_quantize(ctx: Ctx) -> None:
         return
     import fnmatch
     import resource
-    from collections.abc import Sequence
 
     import onnx
     import onnxsim
@@ -208,35 +222,95 @@ def st_quantize(ctx: Ctx) -> None:
         if k in q:
             raise SystemExit(f"quantize.{k} is not supported (onnxsim.quantize_static); "
                              "use exclude_nodes / exclude_op_types")
-    (in_name,) = list(ctx.spec["inputs"])
     files = imglib.list_images(ctx.spec.get("calibration", {}), ctx.images)
-    pre = ctx.spec["preprocess"]
-
-    class Batches(Sequence):  # re-iterable (calibration runs twice), preprocessed on demand
-        def __len__(self):
-            return len(files)
-
-        def __getitem__(self, i):
-            return {in_name: imglib.preprocess(files[i], pre)[0][None]}
-
     method = q.get("calibration_method", "minmax").lower()
     model = onnx.load(str(src))
     tensors = {o for n in model.graph.node for o in n.output}
     keep = sorted(t for t in tensors if any(fnmatch.fnmatchcase(t, p) for p in q.get("minmax_tensors", [])))
+    opts = dict(minmax_tensor_names=keep, full_graph=True, per_channel=q.get("per_channel", True),
+                activation_type=q.get("activation", "uint8"), nodes_to_exclude=q.get("exclude_nodes", []),
+                op_types_to_exclude=q.get("exclude_op_types", []))
     t = time.time()
-    m = onnxsim.quantize_static(
-        model, Batches(), minmax_tensor_names=keep, method=method, percentile=float(q.get("percentile", 99.999)),
-        full_graph=True, per_channel=q.get("per_channel", True),
-        activation_type=q.get("activation", "uint8"),
-        nodes_to_exclude=q.get("exclude_nodes", []), op_types_to_exclude=q.get("exclude_op_types", []),
-    )
+    extra = {}
+    if method == "auto":
+        m, extra = _pick_calibration(ctx, q, model, files, opts)
+    else:
+        m = onnxsim.quantize_static(model, _ImageBatches(ctx, files), method=method,
+                                    percentile=float(q.get("percentile", 99.999)), **opts)
     onnx.save(m, str(dst))
     meta = {"method": method, "percentile": q.get("percentile", 99.999) if method == "percentile" else None,
-            "minmax_tensors": len(keep), "images": len(files), "seconds": round(time.time() - t, 1),
+            **extra, "minmax_tensors": len(keep), "images": len(files), "seconds": round(time.time() - t, 1),
             "peak_rss_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)}
     (ctx.d("quantize") / "quantize_meta.json").write_text(json.dumps(meta, indent=1))
-    print(f"  QDQ int8 ({method}) on {len(files)} calibration images in {meta['seconds']} s, "
+    shown = f"auto -> {extra['picked']}" if extra else method
+    print(f"  QDQ int8 ({shown}) on {len(files)} calibration images in {meta['seconds']} s, "
           f"peak RSS {meta['peak_rss_mb']} MB")
+
+
+class _ImageBatches:
+    """Calibration batches: re-iterable (calibration runs twice), preprocessed on demand."""
+
+    def __init__(self, ctx: Ctx, files: list):
+        (self.name,) = list(ctx.spec["inputs"])
+        self.files, self.pre = files, ctx.spec["preprocess"]
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, i):
+        if i >= len(self.files):
+            raise IndexError(i)
+        return {self.name: imglib.preprocess(self.files[i], self.pre)[0][None]}
+
+
+collections.abc.Sequence.register(_ImageBatches)
+
+
+def _pick_calibration(ctx: Ctx, q: dict, model, files: list, opts: dict):
+    """`calibration_method: auto`: onnxsim.pick_calibration over AUTO_CANDIDATES (or
+    `auto_candidates`), cross-fitted over the calibration images (`auto_folds`, default 4): each
+    fold is scored by candidates calibrated on the other folds, on host ORT against the fp32
+    model, with the spec's own accuracy kind -- detection_match runs the spec's postprocess on both
+    sides and scores matched/ref detections (worst-output SQNR only breaks ties); any other kind
+    scores by worst-output SQNR. The winner is then calibrated on all the images. The eval ids are
+    never used. (A single held-out quarter -- 16 of YOLO11n's 64 -- ranked percentile 99.99 first;
+    4 folds rank mse first, like 128 separate images do.)"""
+    import onnx
+    import onnxsim
+    from onnxsim.calibration_pick import run_outputs, worst_output_sqnr
+
+    from stages import accuracy, post
+
+    folds = int(q.get("auto_folds", 4))
+    acc = ctx.spec.get("accuracy", {}) or {}
+    metric, kind = worst_output_sqnr, "worst_output_sqnr"
+    if acc.get("kind") == "detection_match" and ctx.spec.get("postprocess"):
+        pdir = ctx.d("quantize") / "auto_post"
+        pdir.mkdir(exist_ok=True)
+        info = post.build(ctx.spec["postprocess"], ctx.work / "simplify" / "model.onnx", pdir)
+        pmodel = onnx.load(str(pdir / "post.onnx"))
+        head, outs = info["input"], info["outputs"][:3]  # boxes, scores, classes
+
+        def dets(net_outputs):
+            return [[o[k] for k in outs] for o in run_outputs(pmodel, [{head: n[head]} for n in net_outputs])]
+
+        def det_metric(f_out, q_out):
+            matched = ref = 0
+            for a, b in zip(dets(f_out), dets(q_out)):
+                r = accuracy.det_match(a, b, acc.get("iou", 0.5), acc.get("score", 0.25))
+                matched, ref = matched + r["matched"], ref + r["ref"]
+            return matched / max(ref, 1) + 1e-6 * worst_output_sqnr(f_out, q_out)
+
+        metric, kind = det_metric, "detection_match"
+    cands = [str(c) for c in q.get("auto_candidates", AUTO_CANDIDATES)]
+    pick = onnxsim.pick_calibration(model, _ImageBatches(ctx, files), metric=metric, candidates=cands,
+                                    folds=folds, verbose=True, **opts)
+    per_tensor: dict = {}
+    for c in pick.auto_choices.values():
+        per_tensor[c] = per_tensor.get(c, 0) + 1
+    return pick.model, {"picked": pick.method, "score_kind": kind,
+                        "scores": {k: round(v, 6) for k, v in pick.scores.items()},
+                        "auto_per_tensor": dict(sorted(per_tensor.items())), "folds": folds}
 
 
 def st_rewrite(ctx: Ctx) -> None:
