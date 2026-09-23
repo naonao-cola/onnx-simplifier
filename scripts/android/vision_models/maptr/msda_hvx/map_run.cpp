@@ -3,6 +3,7 @@
 // (../../../msda_hvx/). Same machinery as ../../bevformer_tiny/msda_hvx/enc_run.cpp.
 //
 //   [backbone] -> pre -> {tsa} -> mid -> {sca} -> post -> decoder            (DEC=htp, default)
+//   [backbone] -> cpu_tsa, prev -> {tsa} -> midc -> {sca} -> post -> ...      (piece dir has prev.onnx + tsa_*.f32)
 //                                                      -> dvals -> 6 x (dpre<i> -> {dec<i>} -> dpost<i>)   (DEC=split)
 //
 // Every tensor lives in one rpcmem (ION) buffer per name: ORT writes the HTP pieces' outputs straight
@@ -24,7 +25,9 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <cmath>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -176,6 +179,61 @@ static void msda(const std::string& value, size_t value_off_floats, const std::s
 
 static bool exists(const std::string& p) { return access(p.c_str(), R_OK) == 0; }
 
+// CPU_TSA (piece dir has prev.onnx): TSA's value / offsets / weights are affine in c = can_bus_mlp(can_bus)
+// (split.py tsa_consts): tsa_v = V0 + Wv c, off = A + Bo c, w = 0.5 * softmax_4(Aw + Bw c).
+static std::map<std::string, std::vector<float>> K;
+static void load_consts(const std::string& dir) {
+  const std::pair<const char*, size_t> sz[] = {{"V0", 20000 * 256}, {"Wv", 256 * 256}, {"A", 20000 * 128}, {"Bo", 128 * 256},
+                                               {"Aw", 20000 * 64}, {"Bw", 64 * 256}, {"m0w", 128 * 18}, {"m0b", 128},
+                                               {"m2w", 256 * 128}, {"m2b", 256}, {"lnw", 256}, {"lnb", 256}};
+  for (auto& [n, count] : sz) {
+    auto& v = K[n];
+    v.resize(count);
+    std::ifstream f(dir + "/tsa_" + n + ".f32", std::ios::binary);
+    f.read((char*)v.data(), (std::streamsize)(count * 4));
+    if (!f) throw std::runtime_error(std::string("short/missing tsa_") + n + ".f32");
+  }
+}
+static void matvec(const float* W, const float* x, const float* b, float* y, int rows, int cols) {
+  for (int r = 0; r < rows; ++r) {
+    float a = b ? b[r] : 0.f;
+    for (int c = 0; c < cols; ++c) a += W[r * cols + c] * x[c];
+    y[r] = a;
+  }
+}
+static void cpu_tsa(const float* can_bus, float* tsa_v, float* off, float* w, int nthreads) {
+  float h1[128], h2[256], c[256], dv[256], dof[128], dw[64];
+  matvec(K["m0w"].data(), can_bus, K["m0b"].data(), h1, 128, 18);
+  for (auto& x : h1) x = std::max(x, 0.f);
+  matvec(K["m2w"].data(), h1, K["m2b"].data(), h2, 256, 128);
+  float mean = 0, var = 0;
+  for (auto& x : h2) { x = std::max(x, 0.f); mean += x; }
+  mean /= 256;
+  for (auto x : h2) var += (x - mean) * (x - mean);
+  var /= 256;
+  for (int i = 0; i < 256; ++i) c[i] = (h2[i] - mean) / std::sqrt(var + 1e-5f) * K["lnw"][i] + K["lnb"][i];
+  matvec(K["Wv"].data(), c, nullptr, dv, 256, 256);
+  matvec(K["Bo"].data(), c, nullptr, dof, 128, 256);
+  matvec(K["Bw"].data(), c, nullptr, dw, 64, 256);
+  const float *V0 = K["V0"].data(), *A = K["A"].data(), *Aw = K["Aw"].data();
+  auto work = [&](int q0, int q1) {
+    for (int q = q0; q < q1; ++q) {
+      for (int i = 0; i < 256; ++i) tsa_v[q * 256 + i] = V0[q * 256 + i] + dv[i];
+      for (int i = 0; i < 128; ++i) off[q * 128 + i] = A[q * 128 + i] + dof[i];
+      for (int g = 0; g < 16; ++g) {  // (head, frame) groups of 4 points
+        float l[4], mx = -INFINITY, sum = 0;
+        for (int p = 0; p < 4; ++p) { l[p] = Aw[q * 64 + g * 4 + p] + dw[g * 4 + p]; mx = std::max(mx, l[p]); }
+        for (int p = 0; p < 4; ++p) { l[p] = std::exp(l[p] - mx); sum += l[p]; }
+        for (int p = 0; p < 4; ++p) w[q * 64 + g * 4 + p] = 0.5f * l[p] / sum;
+      }
+    }
+  };
+  std::vector<std::thread> ts;
+  const int Q = 20000, step = (Q + nthreads - 1) / nthreads;
+  for (int t = 0; t < nthreads; ++t) ts.emplace_back(work, t * step, std::min(Q, (t + 1) * step));
+  for (auto& t : ts) t.join();
+}
+
 static void read_into(const std::string& path, Buf& b) {
   std::ifstream f(path, std::ios::binary);
   f.read((char*)b.p, (std::streamsize)b.bytes);
@@ -215,7 +273,9 @@ int main(int argc, char** argv) {
         npu.push_back(d);
     if (npu.empty()) throw std::runtime_error("no QNN NPU ep device");
     const bool has_bb = exists(pdir + "/backbone.onnx");
-    std::vector<std::string> names = {"pre", "mid", "post"};
+    const bool cpu_tsa_path = exists(pdir + "/prev.onnx");
+    std::vector<std::string> names = cpu_tsa_path ? std::vector<std::string>{"prev", "midc", "post"}
+                                                  : std::vector<std::string>{"pre", "mid", "post"};
     if (has_bb) names.insert(names.begin(), "backbone");
     if (dec_split) {
       names.push_back("dvals");
@@ -242,6 +302,12 @@ int main(int argc, char** argv) {
     buf("tsa_ref", {1, Q, 1, 2});
     buf("ref_cam", {6, Q, 4, 2});
     buf("vis", {6, Q}, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8);
+    if (cpu_tsa_path) {
+      load_consts(pdir);
+      buf("tsa_v", {Q, 256});
+      buf("tsa_off", {Q, 8, 1, 8, 2});
+      buf("tsa_w", {Q, 8, 1, 8});
+    }
     if (dec_split) {
       read_into(pdir + "/dq0.f32", buf("dq0", {QD, 256}));
       read_into(pdir + "/dref0.f32", buf("dref0", {QD, 2}));
@@ -269,10 +335,17 @@ int main(int argc, char** argv) {
           a = b;
         };
         if (has_bb) { run(pc["backbone"]); mark("backbone", 0); }
-        run(pc["pre"]); mark("pre", 0);
+        if (cpu_tsa_path) {
+          cpu_tsa((const float*)get("can_bus").p, (float*)get("tsa_v").p, (float*)get("tsa_off").p, (float*)get("tsa_w").p,
+                  getenv("CPU_THREADS") ? atoi(getenv("CPU_THREADS")) : 4);
+          mark("cpu_tsa", 0);
+          run(pc["prev"]); mark("prev", 0);
+        } else {
+          run(pc["pre"]); mark("pre", 0);
+        }
         msda("tsa_v", 0, "tsa_ref", "tsa_off", "tsa_w", "", Q, 1, 200, 100, 1, 8, "tsa_out");
         mark("tsa", last_dsp_us / 1000.0);
-        run(pc["mid"]); mark("mid", 0);
+        if (cpu_tsa_path) { run(pc["midc"]); mark("midc", 0); } else { run(pc["mid"]); mark("mid", 0); }
         msda("sca_v", 0, "ref_cam", "sca_off", "sca_w", "vis", Q, 6, 15, 25, 4, 8, "sca_out");
         mark("sca", last_dsp_us / 1000.0);
         run(pc["post"]); mark("post", 0);
@@ -286,8 +359,8 @@ int main(int argc, char** argv) {
             msda("dv", (size_t)i * Q * 256, r, "doff", "dw", "", QD, 1, 200, 100, 1, 4, "msda_out");
             mark("dmsda" + s, last_dsp_us / 1000.0);
             const std::string nq = (i % 2) ? "qB" : "qA", nr = (i % 2) ? "refB" : "refA";
-            if (i < 5) run(pc["dpost" + s], {{"ref", r}}, {{"q", nq}, {"ref", nr}});
-            else run(pc["dpost" + s], {{"ref", r}});
+            if (i < 5) run(pc["dpost" + s], {{"ref_in", r}}, {{"q", nq}, {"ref", nr}});
+            else run(pc["dpost" + s], {{"ref_in", r}});
             mark("dpost" + s, 0);
             q = nq; r = nr;
           }

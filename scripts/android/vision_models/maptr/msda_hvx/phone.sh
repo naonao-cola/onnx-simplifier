@@ -12,7 +12,7 @@ push() {  # push if the size differs
   [ "$sz" = "$dsz" ] || "${A[@]}" push -q "$1" "$2"
 }
 "${A[@]}" shell "mkdir -p $R/pieces"
-push "$B/map_run" "$R/map_run"; push "$B/msda_rpc.so" "$R/msda_rpc.so"
+"${A[@]}" push -q "$B/map_run" "$B/msda_rpc.so" "$R/"  # always: a rebuild can keep the size
 "${A[@]}" shell "rm -f $R/pieces/*"
 for f in "$P"/*; do "${A[@]}" push -q "$(readlink -f "$f")" "$R/pieces/$(basename "$f")"; done
 dirs=()

@@ -26,7 +26,7 @@ Encoder pieces (fp32 I/O, fp16 inside on the HTP):
 Decoder pieces (--dec):
   dvals bev -> dv (6, 20000, 256) (every layer's value_proj of the BEV), q/ref init
   dpre<i>  q, ref -> q_sa (after self-attn + norm), off, attw     (i = 0..5)
-  dpost<i> msda_out, q_sa, ref -> q, ref (refined)                 (dpost5 adds cls)
+  dpost<i> msda_out, q_sa, ref_in -> q, ref (refined)              (dpost5: -> cls, pts)
 
 usage: split.py check  --ckpt <pth> --work <work>         torch split vs Encoder/Decoder on saved frames
        split.py export --ckpt <pth> --work <work>         pieces -> <work>/msda_split/*.onnx (+ onnxsim)
@@ -99,6 +99,65 @@ class Post(nn.Module):
     def forward(self, sca_out, q1):
         enc = self.enc
         return enc.norms[2](enc.ffn(enc.norms[1](enc.sca.output_proj(sca_out) + q1)))
+
+
+class PreV(nn.Module):
+    """--cpu-tsa: the only HTP part of `pre` left, the SCA value maps."""
+
+    def __init__(self, enc):
+        super().__init__()
+        self.enc = enc
+
+    def forward(self, feats):
+        return self.enc.sca.value_proj(self.enc.img_value(feats))
+
+
+class MidC(nn.Module):
+    """--cpu-tsa: `mid` recomputing q0 = bev_embedding + can_bus_mlp(can_bus) in-graph instead of
+    reading it (20 MB fp32) from `pre`."""
+
+    def __init__(self, enc):
+        super().__init__()
+        self.enc, self.mid = enc, Mid(enc)
+
+    def forward(self, tsa_out, can_bus):
+        return self.mid(tsa_out, self.enc.bev_embedding + self.enc.can_bus_mlp(can_bus[None]))
+
+
+def tsa_consts(enc):
+    """TSA's inputs are affine in c = can_bus_mlp(can_bus), one 256-vector per frame, because
+    q0 = bev_embedding + c and the Linears are linear:
+      tsa_v   = V0 + Wv c                 V0 = value_proj(bev_embedding)
+      off     = A  + (Wo[:, :E] + Wo[:, E:]) c   (sampling_offsets on cat(q0, q0 + pos))
+      logits  = A' + (Wa[:, :E] + Wa[:, E:]) c
+    so the phone builds them on the CPU (cpu_tsa below, map_run's CPU_TSA path) from these
+    constants: no HTP call, no 57 MB of fp32 graph outputs."""
+    t, pos, be = enc.tsa, enc.bev_pos(), enc.bev_embedding
+    qcat = torch.cat([be, be + pos], -1)
+    wo, wa = t.sampling_offsets.weight, t.attention_weights.weight
+    mlp = enc.can_bus_mlp
+    return {
+        "V0": t.value_proj(be), "Wv": t.value_proj.weight, "A": t.sampling_offsets(qcat),
+        "Bo": wo[:, :E] + wo[:, E:], "Aw": t.attention_weights(qcat), "Bw": wa[:, :E] + wa[:, E:],
+        "m0w": mlp[0].weight, "m0b": mlp[0].bias, "m2w": mlp[2].weight, "m2b": mlp[2].bias,
+        "lnw": mlp[4].weight, "lnb": mlp[4].bias,
+    }
+
+
+def cpu_tsa(k, can_bus):
+    """What map_run's CPU_TSA path computes (numpy mirror) -> tsa_v, tsa_off, tsa_w."""
+    k = {n: v.detach().numpy().astype(np.float32) for n, v in k.items()}
+    cb = can_bus.numpy().astype(np.float32)
+    h = np.maximum(k["m0w"] @ cb + k["m0b"], 0)
+    h = np.maximum(k["m2w"] @ h + k["m2b"], 0)
+    c = (h - h.mean()) / np.sqrt(h.var() + 1e-5) * k["lnw"] + k["lnb"]
+    v = k["V0"] + k["Wv"] @ c
+    off = k["A"] + k["Bo"] @ c
+    lg = (k["Aw"] + k["Bw"] @ c).reshape(NQ, HD * 2, M.TSA_POINTS)
+    e = np.exp(lg - lg.max(-1, keepdims=True))
+    w = 0.5 * e / e.sum(-1, keepdims=True)
+    return (torch.from_numpy(v), torch.from_numpy(off).reshape(NQ, HD, 1, 2 * M.TSA_POINTS, 2),
+            torch.from_numpy(w.astype(np.float32)).reshape(NQ, HD, 1, 2 * M.TSA_POINTS))
 
 
 def host_inputs(f):
@@ -186,6 +245,10 @@ def cmd_check(a):
     for k, f in enumerate(frames(a.work)):
         bev = run_encoder(enc, f)
         cls, pts = run_decoder(dec, f["bev"])
+        _, _, tv, to, tw = Pre(enc)(f["feats"], f["can_bus"])
+        cv, co, cw = cpu_tsa(tsa_consts(enc), f["can_bus"])
+        print(f"frame {k}: cpu_tsa vs Pre: v {(cv - tv).abs().max():.2e} off {(co - to).abs().max():.2e} "
+              f"w {(cw - tw).abs().max():.2e}")
         print(f"frame {k}: split encoder vs Encoder max abs {(bev - f['bev']).abs().max():.2e}; split decoder "
               f"cls {(cls - f['cls']).abs().max():.2e} pts {(pts - f['pts']).abs().max():.2e}")
 
@@ -215,6 +278,10 @@ def cmd_export(a):
                  ["sca_v", "q0", "tsa_v", "tsa_off", "tsa_w"], out / "pre.onnx")
     export_piece(Mid(enc), (tsa_out, q0), ["tsa_out", "q0"], ["q1", "sca_off", "sca_w"], out / "mid.onnx")
     export_piece(Post(enc), (sca_out, q1), ["sca_out", "q1"], ["bev"], out / "post.onnx")
+    export_piece(PreV(enc), (f["feats"],), ["feats"], ["sca_v"], out / "prev.onnx")
+    export_piece(MidC(enc), (tsa_out, f["can_bus"]), ["tsa_out", "can_bus"], ["q1", "sca_off", "sca_w"], out / "midc.onnx")
+    for n, v in tsa_consts(enc).items():  # map_run CPU_TSA reads <piece dir>/tsa_<name>.f32
+        v.detach().numpy().astype(np.float32).tofile(out / f"tsa_{n}.f32")
     if a.dec:
         bev = f["bev"]
         export_piece(DVals(dec), (bev,), ["bev"], ["dv"], out / "dvals.onnx")
@@ -224,7 +291,7 @@ def cmd_export(a):
             export_piece(DPre(dec, i), (q.detach(),), ["q"], ["q_sa", "doff", "dw"], out / f"dpre{i}.onnx")
             o = msda_fused(DVals(dec)(bev)[i:i + 1], (M.BEV_H, M.BEV_W), ref.reshape(1, NQD, 1, 2), off, w, None)
             names = ["cls", "pts"] if i == len(dec.layers) - 1 else ["q", "ref"]
-            export_piece(DPost(dec, i), (o, q_sa, ref.detach()), ["msda_out", "q_sa", "ref"], names, out / f"dpost{i}.onnx")
+            export_piece(DPost(dec, i), (o, q_sa, ref.detach()), ["msda_out", "q_sa", "ref_in"], names, out / f"dpost{i}.onnx")
             q, ref = DPost(dec, i)(o, q_sa, ref)
         qpos, q, ref = dec_init(dec)
         q.detach().numpy().astype(np.float32).tofile(out / "dq0.f32")
