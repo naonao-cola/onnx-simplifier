@@ -457,17 +457,38 @@ at all" -- yes, with this splitting, even though the unsplit graph cannot.
 ## TensorRT-LLM and TensorRT Edge-LLM: ONNX status and onnxsim fusion
 
 Checked 2026-09-23 against TensorRT-LLM `main` (1.3.0rc28) / 1.2.1 and TensorRT Edge-LLM
-0.10.1 (`e8b2952`), on an x86 RTX 5050 (sm_120) host.
+0.10.1 (`e8b2952`), on an x86 RTX 5050 (sm_120, driver 615.71) host.
 
 **TensorRT-LLM has no ONNX path for onnxsim to plug into.** It builds models from PyTorch
-module definitions, not ONNX. The legacy TensorRT-engine backend (and every C++ plugin,
-`GPTAttention` included) was deleted from `main` in July 2026
-([NVIDIA/TensorRT-LLM#16369](https://github.com/NVIDIA/TensorRT-LLM/pull/16369)): 1.3
-no longer links TensorRT at all and runs on the PyTorch backend only. 1.2.1, the last
-stable release with the TensorRT path, only touches ONNX in
-`tensorrt_llm/tools/onnx_utils.py::to_onnx` (a weightless `com.nvidia`-domain *debug dump*
-of a TensorRT network, not a runnable model) and a Qwen-VL vision-encoder example. sm_120
-(GeForce RTX 50 series) is a supported architecture.
+module definitions, not ONNX. The legacy TensorRT-engine backend was removed from `main` in
+July 2026 -- Python modules in
+[NVIDIA/TensorRT-LLM#15918](https://github.com/NVIDIA/TensorRT-LLM/pull/15918), C++ modules
+and every plugin (`GPTAttention` included) in
+[#16369](https://github.com/NVIDIA/TensorRT-LLM/pull/16369) -- so 1.3 no longer links
+TensorRT at all and runs on the PyTorch backend only. 1.2.1, the last stable release with
+the TensorRT path, touches ONNX in exactly two places: `network.py`/`tools/onnx_utils.py`'s
+`to_onnx` (a weightless "ONNX-like" *visualization dump* of a TensorRT network, not a
+runnable model) and `tools/multimodal_builder.py`, which exports ~20 VLMs' vision encoders
+with TorchScript `torch.onnx.export(opset_version=17)` and builds them with TensorRT's ONNX
+parser -- the only real ONNX -> TensorRT route, and deleted from `main` by #15918.
+
+TensorRT-LLM 1.2.1 (pip wheel: torch 2.9.1+cu128, TensorRT 10.14.1) **runs on the RTX 5050
+(sm_120)** via the PyTorch backend, after two workarounds:
+
+- The `LLM` API spawns its worker with `MPI_Comm_spawn`, which fails under the pip
+  `openmpi` wheel (`OPAL ERROR ... dpm.c`, then a hang). `TLLM_WORKER_USE_SINGLE_PROCESS=1`
+  runs a TP=1 worker in-process instead.
+- It then segfaults in `nvmlSystemGetConfComputeSettings`: `tensorrt_llm/_utils.py` passes
+  the ctypes struct *by value* where NVML takes a pointer (undefined behavior that crashes
+  on driver 615.71). Fixed on `main` (`byref(cc_settings)`); a 1.2.1 backport is requested
+  in issue [#18816](https://github.com/NVIDIA/TensorRT-LLM/issues/18816). Patching the one call in the
+  installed `_utils.py` the same way fixes it.
+
+`Qwen/Qwen3-0.6B` fp16, same 3 chat prompts x 128 greedy tokens as the Edge-LLM run below:
+176-195 tok/s end to end through the Python `LLM` API (Edge-LLM's C++ runtime: 212 tok/s
+wall-clock), 2.5 GB peak host RAM. Outputs match Edge-LLM's for the first 117-237
+characters (one of the three identically in full) before fp16 kernel differences diverge
+them.
 
 **TensorRT Edge-LLM is ONNX-first**: HF checkpoint -> `tensorrt-edgellm-export`
 (`torch.onnx.export(dynamo=True, optimize=True)`) -> ONNX with custom-domain plugin nodes ->
