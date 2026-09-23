@@ -1,16 +1,17 @@
 name: Apple Integration
 
 # Compiles and runs onnxsim's output through Apple's Core ML execution
-# provider to catch simplifications that break the Core ML toolchain, or
-# whose on-device result changed.
+# provider and tinygrad's Metal device backend to catch simplifications that
+# break those toolchains, or whose on-device result changed.
 #
 # Runs on a stock macOS GitHub-hosted runner: the CoreMLExecutionProvider is
-# built into the standard `onnxruntime` PyPI wheel's macOS build, so no extra
-# package or device is needed beyond the Mac itself. See
-# scripts/apple/README.md for the fidelity tiers this covers.
+# built into the standard `onnxruntime` PyPI wheel's macOS build, and Metal
+# ships as part of the OS, so no extra package or device is needed beyond
+# the Mac itself. See scripts/apple/README.md and scripts/hexagon/README.md
+# for the fidelity tiers each covers.
 #
-# Scheduled + on demand (like the Qualcomm check), plus on PRs that touch the
-# harness so it stays valid.
+# Scheduled + on demand (like the Qualcomm check), plus on PRs that touch
+# either harness so they stay valid.
 
 on:
   schedule:
@@ -20,8 +21,10 @@ on:
     paths:
       - ".github/workflows/apple-integration.yml"
       - "scripts/apple/**"
+      - "scripts/hexagon/**"
       - "scripts/common/**"
       - "tests/test_coreml_compat.py"
+      - "tests/test_tinygrad_hexagon_compat.py"
 
 concurrency:
   group: apple-integration-${{ github.ref }}
@@ -67,4 +70,43 @@ jobs:
         with:
           name: coreml-compat-report
           path: ${{ runner.temp }}/coreml-compat.csv
+          if-no-files-found: ignore
+
+  tinygrad-metal:
+    name: tinygrad Metal compatibility check
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install onnxsim + tinygrad
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pytest tinygrad
+          python3 -m pip install .
+      # Run from runner.temp, not the checkout: the repo root contains the
+      # `onnxsim/` source dir (no compiled extension), which would shadow the
+      # installed wheel on `import onnxsim`. Reference the harness by absolute
+      # $GITHUB_WORKSPACE path. Same guard the other compat workflows use.
+      - name: Show environment
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 -c "import onnxsim; print('onnxsim', onnxsim.__version__)"
+          python3 -c "import sys, os; sys.path.insert(0, os.path.join(os.environ['GITHUB_WORKSPACE'], 'scripts', 'hexagon')); import tinygrad_hexagon_backend as b; print('METAL available:', b.METAL_AVAILABLE, b.unavailable_reason('METAL') or '')"
+      - name: Run tinygrad Metal compatibility check
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/hexagon/run_hexagon_compat.py" \
+            --device METAL \
+            --require-device \
+            --output metal-compat.csv
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: metal-compat-report
+          path: ${{ runner.temp }}/metal-compat.csv
           if-no-files-found: ignore
