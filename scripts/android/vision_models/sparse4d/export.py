@@ -41,15 +41,29 @@ from model import (
 from torch import nn
 
 
-def folded_conv1(conv):
-    """conv1((x - mean) / std) == conv1'(x) for RGB x in [0, 255]."""
-    w = conv.weight.detach()
-    std = torch.tensor(STD).view(1, 3, 1, 1)
-    mean = torch.tensor(MEAN).view(1, 3, 1, 1)
-    c = nn.Conv2d(3, w.shape[0], conv.kernel_size, conv.stride, conv.padding, bias=True)
-    c.weight.data = w / std
-    c.bias.data = -(w * mean / std).sum(dim=(1, 2, 3))
-    return c
+class FoldedConv1(nn.Module):
+    """conv1((x - mean) / std) for RGB x in [0, 255], exactly, without normalizing the image.
+
+    conv1'(x) = conv(w / std, x) - sum(w * mean / std) is exact in the interior. At the border
+    conv1 zero-pads the *normalized* image (i.e. pads x with the mean), conv1' pads x with 0: the
+    difference only depends on the output position, so it's added back as a constant map."""
+
+    def __init__(self, conv, hw):
+        super().__init__()
+        w = conv.weight.detach()
+        std = torch.tensor(STD).view(1, 3, 1, 1)
+        mean = torch.tensor(MEAN).view(1, 3, 1, 1)
+        self.conv = nn.Conv2d(3, w.shape[0], conv.kernel_size, conv.stride, conv.padding, bias=True)
+        self.conv.weight.data = w / std
+        self.conv.bias.data = -(w * mean / std).sum(dim=(1, 2, 3))
+        ones = torch.ones(1, 3, *hw)
+        # true: conv(w/std, pad0(x - mean)); folded: conv(w/std, pad0(x)) - sum(w*mean/std).
+        # With x = mean everywhere the true output is 0, so the correction is -folded(mean image).
+        with torch.no_grad():
+            self.register_buffer("corr", -self.conv(ones * mean))
+
+    def forward(self, x):
+        return self.conv(x) + self.corr
 
 
 def project_mm(kp, proj):
@@ -90,7 +104,7 @@ class FrameGraph(nn.Module):
     def __init__(self, m: Sparse4D, temporal: bool):
         super().__init__()
         self.m, self.temporal = m, temporal
-        self.conv1 = folded_conv1(m.backbone.img_backbone.conv1)
+        self.conv1 = FoldedConv1(m.backbone.img_backbone.conv1, (256, 704))
 
     def backbone(self, rgb):
         bb = self.m.backbone
