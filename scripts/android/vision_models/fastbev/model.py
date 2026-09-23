@@ -6,7 +6,7 @@ official checkpoints with an explicit name map (see README for the sources and s
 Both models split into the same three kinds of piece, each an nn.Module with plain tensor inputs
 so each exports to ONNX on its own:
 
-  image encoder   6 camera images (normalized NCHW, or uint8 NHWC with `uint8_input`) -> per-pixel
+  image encoder   6 camera images (normalized NCHW, or NHWC pixels with `uint8_input`) -> per-pixel
                   features, channels-last so the view transform gathers whole rows
   view transform  a Gather with host-computed indices (geometry.py) -- Fast-Ray's lookup table.
                   `ViewM0` / `ViewPP` are the gather pieces; `geometry.backproject_*` keep the
@@ -31,8 +31,8 @@ Fast-BEV++ R50 (ymlab/advanced-fastbev configs/fastbev/paper/fastbev-r50-cbgs.py
              gathered depth probability, summed over the 7 height bins (fuse='sum')
              -> (1, 128, 128, 64) NHWC in the (Y, X) order the BEV encoder uses
   BevPP:     CustomResNet (3 x 2 BasicBlocks, 128/256/512) -> FPN_LSS -> CenterHead (shared 3x3 +
-             6 SeparateHeads) -> (1, 128, 128, 20) NHWC: heatmap 10 (logits), reg 2, height 1,
-             dim 3, rot 2, vel 2
+             6 SeparateHeads) -> 6 NHWC maps (1, 128, 128, k): heatmap 10 (logits), reg 2,
+             height 1, dim 3, rot 2, vel 2
 """
 from __future__ import annotations
 
@@ -126,14 +126,25 @@ class ResNet(nn.Module):
         return outs
 
 
-def uint8_rgb_to_normalized(x, bgr=False):
-    """(N, H, W, 3) uint8 RGB -> (N, 3, H, W) normalized float (in-graph, for the uint8 input)."""
-    mean = torch.tensor([123.675, 116.28, 103.53]).view(1, 3, 1, 1)
-    std = torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1)
-    x = x.permute(0, 3, 1, 2).float()
-    if bgr:
-        x = x.flip(1)
-    return (x - mean) / std
+MEAN = torch.tensor([123.675, 116.28, 103.53])
+STD = torch.tensor([58.395, 57.12, 57.375])
+
+
+def pixels_minus_mean(x, bgr=False):
+    """(N, H, W, 3) RGB pixel values 0..255 (float here; the quantized graph's uint8 input with
+    scale 1, zero point 0 *is* the camera's pixels) -> (N, 3, H, W) pixels minus the mean each raw
+    channel is normalized with. The 1/std and BEVDet's BGR channel swap are folded into conv1's
+    weights (`fold_input_norm`): a Slice(step -1) flip and a Div on the full-resolution images took
+    83% of Fast-BEV++'s encoder on the HTP. Exact, zero padding included (padding is 0 after the
+    mean subtraction either way)."""
+    m = MEAN.flip(0) if bgr else MEAN
+    return (x.float() - m).permute(0, 3, 1, 2)
+
+
+def fold_input_norm(conv, bgr=False):
+    """conv1 on (x - mean) / std [channel-swapped if bgr] == conv1' on pixels_minus_mean(x)."""
+    w = conv.weight.data / STD.view(1, 3, 1, 1)
+    conv.weight.data = w.flip(1) if bgr else w
 
 
 # ------------------------------------------------------------------ Fast-BEV M0
@@ -148,7 +159,7 @@ class EncoderM0(nn.Module):
 
     def forward(self, img):
         if self.uint8_input:
-            img = uint8_rgb_to_normalized(img)
+            img = pixels_minus_mean(img)
         c = self.backbone(img)
         lat = [m(x) for m, x in zip(self.lateral, c)]
         for i in range(3, 0, -1):  # mmdet FPN: nearest upsample to the previous level's size
@@ -169,7 +180,7 @@ class ViewM0(nn.Module):
         outs = []
         for f, i in zip((f0, f1, f2, f3), (i0, i1, i2, i3)):
             table = torch.cat([f.reshape(-1, 64), zero], 0)
-            outs.append(table[i.long()].reshape(X * Y, Z, 64))
+            outs.append(torch.index_select(table, 0, i).reshape(X * Y, Z, 64))  # int32 Gather
         return torch.cat(outs, 2).reshape(1, X, Y, Z * 4 * 64)
 
 
@@ -212,7 +223,7 @@ class EncoderPP(nn.Module):
     def raw(self, img):
         """depth_net output (6, 123, 16, 44): 59 depth logits then 64 features."""
         if self.uint8_input:
-            img = uint8_rgb_to_normalized(img, bgr=True)
+            img = pixels_minus_mean(img, bgr=True)
         c4, c5 = self.backbone(img)
         l4, l5 = self.lateral[0](c4), self.lateral[1](c5)
         return self.depth_net(self.fpn(l4 + F.interpolate(l5, size=l4.shape[2:], mode="nearest")))
@@ -229,7 +240,7 @@ class ViewPP(nn.Module):
     def forward(self, feats, depth, idx, didx):
         X, Y, Z = PP_GRID
         table = torch.cat([feats.reshape(-1, 64), torch.zeros(1, 64, dtype=feats.dtype)], 0)
-        f = table[idx.long()] * depth.reshape(-1)[didx.long()].unsqueeze(1)
+        f = torch.index_select(table, 0, idx) * torch.index_select(depth.reshape(-1), 0, didx).unsqueeze(1)
         return f.reshape(Y * X, Z, 64).sum(1).reshape(1, Y, X, 64)  # rank <= 4 for the HTP
 
 
@@ -265,7 +276,8 @@ class BevPP(nn.Module):
         x = self.neck_conv(x)
         x = self.neck_up2(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=True))
         x = self.shared(x)
-        return torch.cat([self.heads[n](x) for n, _ in HEAD_PP], 1).permute(0, 2, 3, 1)
+        # separate outputs (not one concat): each gets its own quantization scale
+        return tuple(self.heads[n](x).permute(0, 2, 3, 1) for n, _ in HEAD_PP)
 
 
 # ------------------------------------------------------------------ checkpoint loading
@@ -311,7 +323,10 @@ def load_m0(path, uint8_input=False):
             return k.replace("bbox_head.", "").replace("conv_dir_cls", "conv_dir")
         return None
 
-    return _load(EncoderM0(uint8_input), sd, enc), _load(BevM0(), sd, bev)
+    e = _load(EncoderM0(uint8_input), sd, enc)
+    if uint8_input:
+        fold_input_norm(e.backbone.conv1)
+    return e, _load(BevM0(), sd, bev)
 
 
 def load_pp(path, uint8_input=False):
@@ -342,4 +357,7 @@ def load_pp(path, uint8_input=False):
             return _cm(k.replace("pts_bbox_head.task_heads.0.", "heads."))
         return None
 
-    return _load(EncoderPP(uint8_input), sd, enc), _load(BevPP(), sd, bev, ("img_view_transformer.voxel_coords",))
+    e = _load(EncoderPP(uint8_input), sd, enc)
+    if uint8_input:
+        fold_input_norm(e.backbone.conv1, bgr=True)
+    return e, _load(BevPP(), sd, bev, ("img_view_transformer.voxel_coords",))

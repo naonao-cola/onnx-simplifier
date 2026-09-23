@@ -79,7 +79,7 @@ def run_pp(a, ns, toks, out):
         idx, didx = G.pp_lut(vc, f["sensor2keyego"], f["intrin"], f["post"])
         got = view(feats.reshape(-1, 64), depth.reshape(-1), idx, didx)  # (1, Y, X, 64)
         diff = float((got - ref.permute(0, 2, 3, 1)).abs().max())
-        head = bev(got)[0].numpy()
+        head = [h[0].numpy() for h in bev(got)]
         b, s, names = DEC.pp_decode(head)
         m = D.match(b[:, :2], s, names, f["gt"])
         tot += m

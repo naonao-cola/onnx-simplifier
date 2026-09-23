@@ -12,9 +12,11 @@ Fast-BEV M0 (Sense-GVT/Fast-BEV, configs/fastbev/exp/paper/fastbev_m0_r18_s256x7
     NormalizeMultiviewImage (RGB mean/std)
   * 4 time steps: the current keyframe and prev "sweeps" 1, 3, 5 of the interval-3 info list
     (tools/data_converter/nuscenes_seq_converter.py), i.e. camera frames 6, 12, 18 back along the
-    CAM_FRONT chain, other cameras by nearest timestamp. On nuScenes these are exactly the
-    previous 1, 2, 3 keyframes (checked below: every pick must be a keyframe file), with the
-    upstream clamp to the oldest one available early in a scene. The previous frames' projections
+    CAM_FRONT chain, other cameras by nearest timestamp. On the eval scene-0103 these are
+    exactly the previous 1, 2, 3 keyframes (checked: every pick must be a keyframe file, the only
+    camera images in the slice), with the upstream clamp to the oldest one available early in a
+    scene. In some other scenes a pick is a non-keyframe sweep; `keyframe_fallback` (calibration
+    only) then takes the nearest keyframe. The previous frames' projections
     are the current cameras' sensor2lidar moved by lidar_adj->lidar_cur (ego poses of the current
     lidar sample and of the adjacent CAM_FRONT frame), as get_data_info does.
   * upstream quirk, kept by default (`adj_cam_swap=True`): the adjacent frames' image list follows
@@ -148,9 +150,12 @@ class NuScenesMini:
         s2e, e2g_s, _ = self.pose(cam_sd)
         return np.linalg.inv(l2e) @ np.linalg.inv(e2g) @ e2g_s @ s2e
 
-    def _adjacent(self, sample_token, k):
+    def _adjacent(self, sample_token, k, keyframe_fallback=False):
         """Prev 'sweep' k (1, 3, 5 -> camera frames 6, 12, 18 back) as the seq converter + the
-        test-time clamp pick it: -> ({cam: sample_data}, CAM_FRONT sample_data) or None."""
+        test-time clamp pick it: -> ({cam: sample_data}, CAM_FRONT sample_data) or None.
+        The camera-only slice has keyframes only; in scenes where a pick is a sweep,
+        keyframe_fallback=True takes that camera's keyframe nearest in time instead (calibration
+        only -- the eval scene-0103's picks are all keyframes)."""
         sds = self.sd[sample_token]
         chains = {}
         for cam in M0_CAMS:
@@ -168,11 +173,17 @@ class NuScenesMini:
         for cam in M0_CAMS:
             ts = np.array([x["timestamp"] for x in chains[cam]], np.int64)
             picks[cam] = chains[cam][int(np.argmin(np.abs(ts - front["timestamp"])))]
-        for cam, s in picks.items():
-            assert s["is_key_frame"], f"adjacent frame {cam} {s['filename']} is a sweep, not in the keyframe slice"
+        for cam, s in list(picks.items()):
+            if s["is_key_frame"]:
+                continue
+            assert keyframe_fallback, f"adjacent frame {cam} {s['filename']} is a sweep, not in the keyframe slice"
+            keys = [x for x in chains[cam] if x["is_key_frame"]] or [sds[cam]]
+            picks[cam] = min(keys, key=lambda x: abs(x["timestamp"] - s["timestamp"]))
+        if not front["is_key_frame"]:
+            front = picks["CAM_FRONT"]
         return picks, front
 
-    def m0_frame(self, sample_token, adj_cam_swap=True, n_times=4, adj_ids=(1, 3, 5)):
+    def m0_frame(self, sample_token, adj_cam_swap=True, n_times=4, adj_ids=(1, 3, 5), keyframe_fallback=False):
         """-> dict(img_u8 (T, 6, 256, 704, 3) RGB, img (T*6, 3, 256, 704) normalized,
                    lidar2img (T, 6, 4, 4) incl. the image resize/crop, gt [(name, xyz lidar)])"""
         sds = self.sd[sample_token]
@@ -195,7 +206,7 @@ class NuScenesMini:
         imgs = [[resize_crop(self.root / sds[c]["filename"], top) for c in M0_CAMS]]
         l2i = [[proj(s2l[i], intr[i]) for i in range(6)]]
         for t in range(1, n_times):
-            adj = self._adjacent(sample_token, adj_ids[t - 1])
+            adj = self._adjacent(sample_token, adj_ids[t - 1], keyframe_fallback)
             if adj is None:  # scene start: repeat the current frame (see module doc)
                 imgs.append(imgs[0])
                 l2i.append(l2i[0])

@@ -127,7 +127,10 @@ def m0_decode(cls, reg, dirc, score_thr=0.05, nms_pre=1000, max_num=500):
 
 
 def pp_decode(head, K=500, score_thr=0.1):
-    """head (128, 128, 20) NHWC: heatmap 10 | reg 2 | height 1 | dim 3 | rot 2 | vel 2."""
+    """head: the 6 NHWC maps (128, 128, k) heatmap 10, reg 2, height 1, dim 3, rot 2, vel 2 (a
+    list), or one (128, 128, 20) array of them concatenated."""
+    if isinstance(head, (list, tuple)):
+        head = np.concatenate([np.asarray(h, np.float32).reshape(128, 128, -1) for h in head], -1)
     head = head.astype(np.float32)
     H, W, _ = head.shape
     heat = sigmoid(head[..., :10]).transpose(2, 0, 1).reshape(-1)  # (cls, y, x)
