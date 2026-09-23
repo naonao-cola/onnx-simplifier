@@ -59,6 +59,7 @@ if _HERE not in sys.path:
 import binary_op_scale_emit as bse  # noqa: E402
 import elementwise_scale_emit as ew  # noqa: E402
 import llm_build_dtype_analysis as lbd  # noqa: E402
+import matmul_record_emit as mre  # noqa: E402
 import memory_emit  # noqa: E402
 import transpose_real_shapes  # noqa: E402
 
@@ -903,6 +904,19 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
     op = rec["op"]
     attrs = rec.get("attrs", {})
     try:
+        live = mre.step_manifest()["nodes"].get(rec.get("name", ""))
+        if live is not None and (
+            op in ("MatMul", "Gemm")
+            or (op == "Conv" and attrs.get("weight_is_graph_input", True))
+        ):
+            # Live operands: no weight table to edit, only calibration records
+            # (matmul_record_emit.py). A live-weight Conv is served in its
+            # act_weight_conv_to_matmul form, the Gemm in its gemm_to_matmul one.
+            return (
+                "conditional",
+                f"MatMul recalibration from scales ({live['template']}) if no "
+                "zero point crosses between zero and nonzero vs the template",
+            )
         if op == "Conv":
             key = key_for_record(rec)
             cache.lookup(key)

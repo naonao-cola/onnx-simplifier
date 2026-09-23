@@ -73,6 +73,11 @@ LANE_REGS = frozenset(range(0x0F50, 0x1010, 0x10))
 """Float32 scale lanes: ``1/s`` and ``s`` groups at ``0x0f50..0x0fc0``
 (#1831) and the divisor group at ``0x0fd0..0x1000`` (#1836)."""
 ZERO_POINT_REGS = frozenset(sr.ZERO_POINT_REGS)
+OFFSET_REGS = frozenset(range(0x1EF0, 0x1F30, 0x10))
+"""A fused Add (a live bias) carries the int32 zero-point offset of
+``binary_op_scale_emit.zp_offset`` on these four lanes (#1869)."""
+SHIFT_REG = 0x1EA0
+"""... and its Q-format, ``15 - k``, on this register."""
 FULL_WRITE = 0xA1
 TENG_FLAG = 0xA8
 NOISE_REGS = frozenset({0x02B0, 0x03D0})
@@ -173,7 +178,70 @@ def evaluate(role: Role, scales: Scales) -> int:
         return _bits(-scales[role[1]][1])
     if kind == "zp":
         return int(scales[role[1]][1]) & 0xFFFFFFFF
+    if kind in ("zpoff", "qshift", "q15", "rqoff", "rqshift"):
+        return _bias_add(kind, *role[1:], scales)
     raise ValueError(f"unknown role {role!r}")
+
+
+def _bias_add(kind: str, *names_and_scales) -> int:
+    *names, scales = names_and_scales
+    if kind in ("rqoff", "rqshift"):
+        return _requant(kind, *names, scales)
+    return _add(kind, *names, scales)
+
+
+def _requant(kind: str, x: str, y: str, scales: Scales) -> int:
+    """A one-input requantize's words (``x`` into ``y``): ``rqshift`` is
+    ``0x80 | (15 - k)`` and ``rqoff`` is ``int((zp_y - zp_x*r) * 2**(15-k))``
+    with ``r = s_x/s_y`` rounded to float32, ``k`` the smallest shift that
+    brings ``r`` to at most 1. Seen on the weight's way into the Concat of a
+    3x3 Conv's taps (asymmetric uint8 to symmetric)."""
+    (sx, zx), (sy, zy) = scales[x], scales[y]
+    if x == y or zx == zy:
+        raise CalibrationError("not a requantize")
+    # r == 1 exactly (a Slice into a Concat at the same scale) keeps k = 0:
+    # offset -zp_x * 2**15 and shift 0x8f, seen on the step's stage4 conv1.
+    k = 0
+    while sx / sy * 2.0**-k > 1.0:
+        k += 1
+        if k > 15:
+            raise CalibrationError(f"requantize ratio of {y} does not fit Q15")
+    if kind == "rqshift":
+        return 0x80 | (15 - k)
+    c = zy - zx * float(np.float32(sx / sy))
+    return int(c * 2.0 ** (15 - k)) & 0xFFFFFFFF
+
+
+def _add(kind: str, x: str, z: str, y: str, scales: Scales) -> int:
+    """A fused ``y = Add(x, z)``'s calibration words, as
+    ``binary_op_scale_emit`` decoded them for a standalone Add (#1869), with
+    the Q15 shift ``k`` applied to the offset too:
+
+    * ``q15``: ``npu_params`` header, ``round(s_x/s_y * 2**(15-k))`` and
+      ``round(s_z/s_y * 2**(15-k))`` as two little-endian uint16s, ``k``
+      the smallest shift that brings both ratios below 1;
+    * ``qshift``: ``15 - k``;
+    * ``zpoff``: ``int((zp_y - zp_x*r_x - zp_z*r_z) * 2**(15-k))`` with the
+      ratios rounded to float32.
+
+    Fits the step's Gemm-as-MatMul+Add builds (``k = 1``) and #1870's
+    ``mm_add`` (``k = 0``)."""
+    (sx, zx), (sz, zz), (sy, zy) = scales[x], scales[z], scales[y]
+    k = 0
+    while max(sx / sy, sz / sy) * 2.0**-k >= 1.0:
+        k += 1
+        if k > 15:
+            raise CalibrationError(f"Add ratios of {y} do not fit Q15")
+    q = 15 - k
+    if kind == "qshift":
+        return q
+    if kind == "q15":
+        wx, wz = (int(round(r * 2.0**q)) for r in (sx / sy, sz / sy))
+        if wx == wz or not (0 <= wx < 1 << 16 and 0 <= wz < 1 << 16):
+            raise CalibrationError(f"Add header of {y} changes layout ({wx}, {wz})")
+        return wx | wz << 16
+    c = zy - zx * float(np.float32(sx / sy)) - zz * float(np.float32(sz / sy))
+    return int(c * 2.0**q) & 0xFFFFFFFF
 
 
 def float_roles(tensors: Iterable[str]) -> list[Role]:
@@ -228,11 +296,20 @@ def locate(model: onnx.ModelProto, scales: Scales) -> dict:
             elif reg in ZERO_POINT_REGS:
                 recs.append((si, off, reg, value, ztable.get(value, [])))
     params = params_of(model)
+    lanes = _param_lanes(params, ftable)
+    offsets = [
+        (si, off, reg, value)
+        for si, seg in enumerate(segs)
+        for off, verb, reg, value in _records(seg)
+        if verb == FULL_WRITE and reg in OFFSET_REGS and value
+    ]
+    if offsets:
+        recs, lanes = _locate_bias_add(segs, scales, offsets, recs, params, lanes)
     return {
         "segments": segs,
         "params_bytes": params,
         "records": recs,
-        "params": _param_lanes(params, ftable),
+        "params": lanes,
     }
 
 
@@ -267,7 +344,106 @@ def _param_lanes(params: bytes, ftable: dict[int, list[Role]]) -> list:
     return out
 
 
-PRECEDENCE = ("zp", "zpf", "nzpf", "s", "inv32", "inv", "ratio", "mult")
+def _offset_groups(segs):
+    """``(shift record, [offset records])`` per nonzero zero-point offset
+    group: the four ``OFFSET_REGS`` lanes and the ``SHIFT_REG`` write that
+    last precedes them."""
+    groups = []
+    for si, seg in enumerate(segs):
+        shift = None
+        for off, verb, reg, v in _records(seg):
+            if verb != FULL_WRITE:
+                continue
+            if reg == SHIFT_REG:
+                shift = (si, off, reg, v)
+            elif reg in OFFSET_REGS and v:
+                if (
+                    groups
+                    and groups[-1][1][-1][0] == si
+                    and groups[-1][1][-1][1] == off - 8
+                ):
+                    groups[-1][1].append((si, off, reg, v))
+                else:
+                    groups.append((shift, [(si, off, reg, v)]))
+    return groups
+
+
+def _locate_bias_add(segs, scales, offsets, recs, params, lanes):
+    """The zero-point offset groups of a fused chain, each with the
+    ``SHIFT_REG`` write before it, and a bias Add's ``npu_params`` header.
+
+    A shift with bit 7 set belongs to a one-input requantize (a Concat input
+    moving from an asymmetric to a symmetric quantization): ``rqoff`` /
+    ``rqshift`` over ``(x, y)`` pairs. Otherwise it is an Add: ``zpoff`` /
+    ``qshift`` / ``q15`` over ``(x, z, y)`` triples. Every tuple of tensors
+    that explains both the offset and the shift is kept as a role. A group
+    whose offset is 0 is not located (there is nothing to match), and
+    ``recalibrate`` cannot tell; the step templates have no such group."""
+    del offsets  # regrouped with their shift records below
+    names = sorted(scales)
+    header: dict[int, list[Role]] = {}
+    for shift, group in _offset_groups(segs):
+        if shift is None:
+            raise CalibrationError("zero-point offset lanes without a shift register")
+        v, sv = group[0][3], shift[3]
+        if sv & 0x80:
+            tuples = [("rq", x, y) for x, y in itertools.permutations(names, 2)]
+            kinds = ("rqoff", "rqshift")
+        else:
+            tuples = [("add", *t) for t in itertools.permutations(names, 3)]
+            kinds = ("zpoff", "qshift")
+        hit = []
+        for t in tuples:
+            try:
+                if _bias_add(kinds[0], *t[1:], scales) == v and (
+                    _bias_add(kinds[1], *t[1:], scales) == sv
+                ):
+                    hit.append(t[1:])
+            except CalibrationError:
+                pass
+        recs = recs + [
+            (si, off, reg, w, [(kinds[0], *t) for t in hit])
+            for si, off, reg, w in group
+        ]
+        recs.append((*shift, [(kinds[1], *t) for t in hit]))
+        if kinds[0] == "zpoff":
+            for t in hit:
+                try:
+                    header.setdefault(evaluate(("q15", *t), scales), []).append(
+                        ("q15", *t)
+                    )
+                except CalibrationError:
+                    pass
+    taken = {o + d for o, _, _ in lanes for d in range(-3, 4)}
+    found = [
+        (off, v, header[v])
+        for off in range(len(params) - 3)
+        if off not in taken
+        for v in [struct.unpack_from("<I", params, off)[0]]
+        if v in header
+    ]
+    if header and len(found) != 1:
+        raise CalibrationError(
+            f"bias Add header found {len(found)} times in npu_params, want once"
+        )
+    return recs, sorted(lanes + found)
+
+
+PRECEDENCE = (
+    "zp",
+    "zpf",
+    "nzpf",
+    "s",
+    "inv32",
+    "inv",
+    "ratio",
+    "mult",
+    "zpoff",
+    "qshift",
+    "q15",
+    "rqoff",
+    "rqshift",
+)
 """Tie-break between formulas that give the same bits at the template's
 scales. Across 174 builds, ``inv32``/``inv`` (``1/s`` in float32 or
 float64) always matched together, and so did ``s``/``mult(x, y, x)``. No
@@ -432,6 +608,54 @@ STEP_CONV_MATMULS = {
 }
 """The step's 20 live-weight Convs after ``act_weight_conv_to_matmul``: one
 MatMul each, with the taps concatenated along the contraction."""
+
+STEP_TEMPLATE_DIR = os.path.join(_HERE, "fixtures", "matmul_step_templates")
+"""One Pulsar2 build per distinct step chain, plus ``manifest.json``: which
+template serves which ``step.onnx`` node, and how the node's tensor names
+map onto the template's (``docs/axera-matmul-step-templates.md``)."""
+
+
+def step_manifest() -> dict:
+    with open(os.path.join(STEP_TEMPLATE_DIR, "manifest.json")) as f:
+        return json.load(f)
+
+
+def step_template(node: str, manifest: dict | None = None) -> dict:
+    """The template serving ``step.onnx`` node ``node``: ``axmodel`` and
+    ``quant`` paths, and ``names``, the node's tensor names mapped onto the
+    template's. A node is listed only if its chain has the template's exact
+    ops, attributes, input shapes and constants. Raises ``ValueError`` for
+    any other node."""
+    m = manifest if manifest is not None else step_manifest()
+    entry = m["nodes"].get(node)
+    if entry is None:
+        raise ValueError(f"no validated live-operand template serves node {node!r}")
+    t = m["templates"][entry["template"]]
+    return {
+        "template": entry["template"],
+        "axmodel": os.path.join(STEP_TEMPLATE_DIR, t["axmodel"]),
+        "quant": os.path.join(STEP_TEMPLATE_DIR, t["quant"]),
+        "names": dict(zip(entry["names"], t["names"])),
+        "constants": list(t.get("constants", [])),
+    }
+
+
+def step_node_scales(entry: dict, template_scales: Scales, scales: Scales) -> Scales:
+    """``scales`` (keyed by step tensor names) re-keyed onto the template's
+    names, ready for ``recalibrate``. Constants baked into the chain (Gather
+    masks) keep the template's own scale; every other template tensor must
+    be given."""
+    out: Scales = {}
+    for step_name, name in entry["names"].items():
+        if step_name in scales:
+            out[name] = scales[step_name]
+    for name in entry["constants"]:
+        if name in template_scales:
+            out[name] = template_scales[name]
+    missing = sorted(set(template_scales) - set(out))
+    if missing:
+        raise CalibrationError(f"no step scale for template tensors {missing}")
+    return out
 
 
 # --------------------------------------------------------------------------

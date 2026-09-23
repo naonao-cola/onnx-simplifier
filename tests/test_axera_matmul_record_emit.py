@@ -94,9 +94,18 @@ def test_gemm_template_every_lane_explained():
     }
     assert {("inv32", "a"), ("inv32", "b"), ("inv32", "c"), ("s", "z")} <= kinds
     assert {("zp", "z"), ("zp", "c")} <= kinds
+    # The live bias Add's zero-point offset lanes and Q-format (#1869's
+    # zp_offset, here with k = 0), and its Q15 header word in npu_params.
+    # (x and z commute in both, so both orders explain them.)
+    every = {r for *_, roles in found["records"] for r in roles}
+    assert {("zpoff", "t", "c", "z"), ("qshift", "t", "c", "z")} <= every
     lanes = {tuple(roles[:1]) for _, _, roles in found["params"]}
-    assert lanes == {(("zpf", "t"),), (("mult", "a", "b", "t"),)}
-    assert len(found["params"]) == 2 * 520
+    assert lanes == {
+        (("zpf", "t"),),
+        (("mult", "a", "b", "t"),),
+        (("q15", "t", "c", "z"),),
+    }
+    assert len(found["params"]) == 2 * 520 + 1
 
 
 def test_gemm_template_identity_and_round_trip():
@@ -143,3 +152,14 @@ def test_refuses_unexplained_and_ambiguous_values():
 def test_step_shape_tables_cover_the_step():
     assert sum(n for n, _ in mre.STEP_SHAPES.values()) == 42  # 41 MatMul + Gemm
     assert sum(mre.STEP_CONV_MATMULS.values()) == 20
+
+
+def test_requantize_offset_words():
+    # A weight slice (asymmetric, zp 127) into its taps' Concat (symmetric):
+    # at the same scale the shift stays at 15 (0x8f) and the offset is
+    # -127 * 2**15, as the step's stage4 conv1 build stores them.
+    same = {"w": (0.0019607842, 127.0), "cat": (0.0019607842, 0.0)}
+    assert mre.evaluate(("rqshift", "w", "cat"), same) == 0x8F
+    assert mre.evaluate(("rqoff", "w", "cat"), same) == 0xFFC08000
+    above = {"w": (0.0031372542, 128.0), "cat": (0.0031372522, 0.0)}
+    assert mre.evaluate(("rqshift", "w", "cat"), above) == 0x8E

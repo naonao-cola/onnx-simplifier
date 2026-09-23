@@ -268,14 +268,26 @@ def test_coverage_report_on_the_resnet18_step():
     assert report["per_op"]["Transpose"] == {"covered": 41}
     assert report["per_op"]["Relu"] == {"conditional": 17}
     assert report["per_op"]["Sqrt"] == {"conditional": 39, "refused": 3}
-    assert report["per_op"]["Conv"] == {"refused": 20}
+    man = axb.mre.step_manifest()
+    live_conv = sum(
+        man["templates"][e["template"]]["kind"] == "conv" for e in man["nodes"].values()
+    )
+    want = {"refused": 20 - live_conv, "conditional": live_conv}
+    assert report["per_op"]["Conv"] == {k: v for k, v in want.items() if v}
     # same-shape binary ops: ElementwiseScaleEdit (binary_op_scale_emit.py);
     # constant and broadcast operands stay refused
     assert report["per_op"]["Add"] == {"conditional": 101, "refused": 43}
     assert report["per_op"]["Sub"] == {"conditional": 42, "refused": 4}
     assert report["per_op"]["Mul"] == {"conditional": 63, "refused": 334}
     assert report["per_op"]["Div"] == {"conditional": 44, "refused": 8}
-    assert report["totals"] == {"covered": 82, "conditional": 324, "refused": 698}
+    # Live-operand MatMul/Gemm/Conv nodes with a step template move from
+    # refused to conditional (fixtures/matmul_step_templates/manifest.json).
+    live = len(axb.mre.step_manifest()["nodes"])
+    assert report["totals"] == {
+        "covered": 82,
+        "conditional": 324 + live,
+        "refused": 698 - live,
+    }
 
 
 def test_trainable_conv_is_refused_even_with_a_template():
@@ -475,7 +487,14 @@ def test_compile_request_applies_the_policy():
 def test_coverage_report_weight_dtypes_on_the_resnet18_step():
     policy = axb.QuantPolicy(default="s8")
     report = axb.coverage_report(_step_records(), policy)
-    assert report["totals"] == {"covered": 82, "conditional": 324, "refused": 698}
+    # Live-operand MatMul/Gemm/Conv nodes with a step template move from
+    # refused to conditional (fixtures/matmul_step_templates/manifest.json).
+    live = len(axb.mre.step_manifest()["nodes"])
+    assert report["totals"] == {
+        "covered": 82,
+        "conditional": 324 + live,
+        "refused": 698 - live,
+    }
     assert len(report["per_node"]) == 1104
     # no weight in the training step is a constant: a weight dtype choice
     # changes none of its nodes
