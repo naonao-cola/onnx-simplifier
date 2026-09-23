@@ -1696,6 +1696,128 @@ any scalar read of that buffer crashed. Copying the accumulator into an explicit
 The conv kernels themselves come from `../hex_conv3x3_fpnout_kernel.py --data fpn_out_real.npz --out
 $DATA/fpn_out_kernels.c`, which also runs all four levels under qemu against ORT.
 
+## RoiAlign, Stage 4: uint8 maps in, the heads' uint8 rows out -- one DSP call per head
+
+In the e2e pipeline (`../e2e_pipeline/`, `pipe_e_opt.txt` / `pipe_e_u8.txt`), each head's RoiAlign
+isn't one op but a span of steps:
+- 4 CPU `dq` steps turn the backbone's uint8 NHWC FPN maps into fp32;
+- 4 DSP `roialign` calls, one per FPN level;
+- a CPU ScatterND (`seg2`/`seg4`) merges the per-level outputs into the head's row order;
+- in `pipe_e_u8.txt`, a CPU `quant` then turns them back into the u8 head's input.
+
+`roialign_fast/roialign_u8_kernel.h` does that whole span in one integer kernel, as one FastRPC call
+per head:
+- It reads the uint8 maps directly.
+- It computes each sample's position and bilinear weights in fp32 with ORT's exact expressions, then
+  quantizes the weights to Q14. The 4th weight absorbs the rounding, so each sample's weights sum to
+  exactly 1.
+- It accumulates u8 x Q14 in exact int32, subtracts the input zero point once per bin, and does one
+  fixed-point requant per level to the head's input scale/zero point.
+- It writes each RoI straight into its destination row (the `*_row_index` tensors `seg2`/`seg4`
+  scatter with).
+
+The Stage 3 caveat about out-of-range samples dissolves: skipped samples add nothing, and the zero
+point is subtracted per *valid* sample.
+
+**Exactness.** The reference is QuantizeLinear(ORT fp32 RoiAlign, merged), the exact bytes today's
+CPU steps produce, captured from the real pipeline by `capture_merged_io.py`. On the 6 e2e images:
+- box: 99.93-99.95% of bytes identical;
+- mask: 99.94-99.99%;
+- **max diff 1 LSB** everywhere.
+
+Host (`roialign_u8_host_check.c`), qemu (`roialign_u8_qemu.c`, HVX build) and phone
+(`roialign_u8_client.c`) produce byte-identical outputs. The remaining 1-LSB bytes are fp32 values
+within a hair of a rounding boundary. Sweeping the weight bits (14-16) and the requant pre-shift
+didn't move the exact fraction beyond noise.
+
+End to end, `../e2e_pipeline/roialign_u8_emulate.py` replays `pipe_e_opt.txt` on the host with both
+spans replaced by the kernel. The `*_nhwc` heads start with a QuantizeLinear at the same qparams, so
+they see exactly the kernel's bytes. Against the all-ORT reference on the 6 images:
+
+| host emulation of `e_opt` | matched | box IoU | score \|d\| | mask IoU |
+|---|---:|---:|---:|---:|
+| ORT RoiAlign + dq + ScatterND (today) | 60/61 (64 dets) | 0.938 | 0.015 | 0.871 |
+| `roialign_u8` | 60/61 (64 dets) | 0.942 | 0.013 | 0.883 |
+
+**Speed on the phone.** Device `239dbd8f`, SM8475 / Hexagon V69, unsigned PD, image 139 (1000 box
+RoIs, 99 mask RoIs). Medians of 7-9 runs, 4 threads + `l2fetch` prefetch unless noted. "RPC" is the
+client-side round trip of the single call.
+
+| step (cumulative) | box DSP / RPC | mask DSP / RPC | CPU steps left in the span | span total |
+|---|---:|---:|---:|---:|
+| Stage 3 fp32 kernel, 4 calls per head (today's `e_opt`) | 19.9 / 21.4 | 6.8 / 8.0 | dq 13.1 + merges 16.6 + 6.5 | **65.6** (+ `pipe_e_u8`'s `quant` x2) |
+| uint8 merged kernel, portable vector code | 20.6 / 21.1 | 8.3 / 8.9 | none | 30.0 |
+| + `vmpyuh_acc` MAC, separable sample precompute | 12.3 / 13.4 | 4.3 / 5.1 | none | 18.5 |
+| + accumulators kept in registers | **6.4 / 6.8** | **2.1 / 2.5** | none | **9.3** |
+
+All 6 images at the last step: box 5.8-6.7 ms DSP (6.2-7.1 RPC), mask 0.5-2.2 ms (0.9-2.6 RPC).
+
+What mattered, and what didn't:
+- **The MAC instruction.** The generic int32 vector code costs ~12 HVX ops per tap per 128 channels
+  (`vunpack` + `vmpyieo`/`vmpyie`). `vzxt` u8->u16 plus two `vmpyuh_acc` (u16 x scalar u16 -> u32
+  accumulate) cost 3. The even/odd lane splits both instructions introduce go through the
+  elementwise requant untouched, and `vshuffeh`/`vshuffeb` undo them before the store.
+- **Registers, not the stack.** Indexing the accumulators by a runtime channel-half count made
+  hexagon-clang keep them on the stack (a `vmem` load/store around every MAC). Instantiating the
+  kernel for C = 128 / 256 halved the time again.
+- **Prefetch.** One bin-ahead `l2fetch` per sample row takes 1-thread box time from 30.5 to 20.1 ms.
+  With it, a real 1-thread run is as fast as a cache-hot one (every job the same RoI: 20.1 ms).
+  Neither a row-ahead variant nor prefetching the next RoI's whole footprint helped.
+- **Threads.** 4 is the sweet spot: 6 threads is slower (box 7.9 vs 6.4 ms). The locality sort (by
+  level, then y, then x) is slower too (box 9.4 vs 7.7 in the same run); contiguous per-thread
+  slices of the natural order balance better.
+- **One call vs one per level.** Merging all levels into one call saves ~1-2 ms of RPC per head
+  over 4 calls.
+- **Not needed:**
+  - A TURBO clock vote gains nothing.
+  - **VTCM:** `vtcm_probe` shows this unsigned PD can query and acquire all 8 MB
+    (`HAP_compute_res_*`). But P2 (13.9 MB, 61% of box RoIs) doesn't fit, and with prefetch the
+    kernel is no longer latency-bound, so DMA staging has little to win.
+
+**Proposed integration (not wired: `../maskrcnn_demo_app/` and `e2e_run.cpp` belong to the demo).**
+A pipeline step that replaces, per head, the `dq` x4 + `roialign` x4 + `seg2`/`seg4` + `quant` lines
+of `pipe_e_u8.txt`:
+
+    roialign_u8 MAPS QPARAMS ROIS ROWS OH OW SR S_OUT Z_OUT DST
+    # box head of pipe_e_u8.txt (levels in the roialign lines' order, P5..P2):
+    roialign_u8 391_quantized_nhwc,423_quantized_nhwc,455_quantized_nhwc,487_quantized_nhwc \
+        0.11570039391517639:129:0.03125,0.128072127699852:133:0.0625,0.12207645177841187:128:0.125,0.13543301820755005:131:0.25 \
+        2656,2639,2622,2605 2751_row_index,2723_row_index,2695_row_index,2667_row_index \
+        7 7 2 0.11669740080833435 130 2788_u8
+
+`QPARAMS` holds each map's dq `scale:zero_point:spatial_scale`. `ROWS` pairs each level with the
+`*_row_index` that seg2's ScatterND uses for that level's output. The mask head is the same with
+`6701,6684,6667,6650`, `6795_row_index,6767_row_index,6739_row_index,6711_row_index`, 14x14 and the
+mask head's `0.11957937479019165 132` into `6833_u8`. The `dq` lines go too, because the maps feed
+nothing else.
+
+The step makes one call:
+
+    roialign_u8_rpc_run(h, map0..map3 /* uint8 NHWC, rpcmem */, level_geom /* H,W,z_in x4 */,
+                        level_fparams /* s_in, spatial_scale x4 */, level_counts /* RoIs per level */,
+                        rois /* [n,4] fp32, concatenated in level order */, rows /* [n] int32 */,
+                        C, OH, OW, sr, s_out, z_out, flags /* 260 = 4 threads + prefetch */,
+                        out /* [n, OH, OW, C] uint8 = the head's input */, &dsp_us);
+
+The skel is `roialign_u8_rpc.so`: `roialign_u8_rpc_skel_handle_invoke`, unsigned PD, built by
+`roialign_fast/build_u8.sh`. `roialign_u8_cpu.c` is the same call on the CPU. Constraints:
+- C % 128 == 0 and C <= 256;
+- sr <= 4;
+- OH*sr and OW*sr <= 256.
+
+Until it's known why the demo serializes DSP skel calls, assume this call does not overlap the RPN
+kernel's.
+
+**Reproduce** (`roialign_fast/`):
+- `capture_merged_io.py E2E_OUT image.bin DEST` captures one image's maps, per-level RoIs/rows and
+  reference bytes.
+- `roialign_u8_host_check.c DEST/<img>` is the host check.
+- `roialign_u8_qemu.c` + `roialign_u8_qemu_args.py` are the qemu check.
+- `DATA=DEST/<img> build_u8.sh` does the phone build and sweep (`CONFIGS` = comma list of
+  threads + 256*prefetch + 512*sort; `CLIENT_ENV=VTCM_PROBE=1` adds the VTCM probe).
+- `../e2e_pipeline/roialign_u8_emulate.py OUT REF images` is the e2e host check.
+- The fp32 kernel and skel (`roialign_kernel.h`, `roialign_rpc.idl`, ...) are unchanged, for A/B.
+
 ## Proposal decode (RPN): bit-exact on the phone's DSP, 1.58x ONNX Runtime
 
 The easiest-ranked op in `dynamic_ops_survey.md`. Everything below comes from the real
@@ -2456,6 +2578,11 @@ here).
   (`roialign_host_check.c`, `roialign_qemu.c`) and the ORT baselines
   (`make_roialign_single_node_models.py`, `ort_roialign_bench.c`). Correct on the phone at all 8
   real calls; 27.1 ms vs ORT's 63.3 ms on the phone's CPU. See "RoiAlign, Stage 2" above.
+  Stage 4 adds the merged uint8 kernel (`roialign_u8_kernel.h`) and its skel/client/CPU build
+  (`roialign_u8_rpc.idl`, `roialign_u8_impl.c`, `roialign_u8_client.c`, `roialign_u8_cpu.c`,
+  `build_u8.sh`), capture and checks (`capture_merged_io.py`, `roialign_u8_host_check.c`,
+  `roialign_u8_qemu.c`, `roialign_u8_qemu_args.py`): the whole dq + RoiAlign + merge + quant span
+  of each head in one call, box 6.8 ms / mask 2.5 ms. See "RoiAlign, Stage 4" above.
 - `hex_conv3x3_fpnout_kernel.py` -- the FPN 3x3 output conv (vrmpybusv, `ow_tile`) with ORT's
   requantize+dequantize epilogue fused into its store, writing fp32 channels-last or NCHW. Bit-exact
   vs ORT's real backbone outputs at all four levels, under qemu and on the phone; the channels-last

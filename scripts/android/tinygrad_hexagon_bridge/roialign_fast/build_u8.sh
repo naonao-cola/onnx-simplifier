@@ -7,7 +7,7 @@ set -euo pipefail
 : "${HEXAGON_SDK_ROOT:?}" "${HEXAGON_TOOLCHAIN:?}" "${DATA:?capture_merged_io.py image directory}"
 NDK_CLANG="${NDK_CLANG:-/usr/lib/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang}"
 DEVICE_SERIAL="${DEVICE_SERIAL:-239dbd8f}"
-HEX_ARCH="${HEX_ARCH:-v73}"
+HEX_ARCH="${HEX_ARCH:-v69}"  # the test phone is SM8475 (Hexagon V69)
 REPS="${REPS:-5}"
 TURBO="${TURBO:-0}"
 CONFIGS="${CONFIGS:-1,4,6,260,262,516,518,772,774}"
