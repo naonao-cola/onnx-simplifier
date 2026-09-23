@@ -465,6 +465,31 @@ def _new_value(where: str, value: int, roles: list[Role], new: Scales) -> int:
     return got.pop()
 
 
+def _pow2_exponent(r: float) -> int | None:
+    e = float(np.log2(r))
+    return round(e) if abs(e - round(e)) < 1e-6 else None
+
+
+def _check_fixed_ratios(old: Scales, new: Scales) -> None:
+    """Refuse a calibration that changes an exact power-of-two scale ratio
+    (other than 1) between two template tensors. Pulsar2 sets a 3x3 Conv's
+    Concat input to exactly twice its uint8 source's scale, and the program
+    has no record carrying that ratio: moving the two apart independently
+    compiled to outputs 189 LSB off on the device, while keeping the ratio
+    stayed within 1-2 LSB (``docs/axera-emitter-device-check.md``)."""
+    names = sorted(t for t in old if old[t][0] > 0)
+    for i, a in enumerate(names):
+        for b in names[i + 1 :]:
+            k = _pow2_exponent(old[b][0] / old[a][0])
+            if not k:
+                continue
+            if _pow2_exponent(new[b][0] / new[a][0]) != k:
+                raise CalibrationError(
+                    f"scale of {b} is 2**{k} x {a}'s in the template; the new "
+                    "calibration breaks that ratio, which the program does not carry"
+                )
+
+
 def recalibrate(
     model: onnx.ModelProto, old: Scales, new: Scales
 ) -> tuple[onnx.ModelProto, dict]:
@@ -478,6 +503,7 @@ def recalibrate(
             f"zero point goes between zero and nonzero for {crossing}; "
             "Pulsar2 emits a different record count then"
         )
+    _check_fixed_ratios(old, new)
     found = locate(model, old)
     segs = [bytearray(s) for s in found["segments"]]
     changed: set[int] = set()
