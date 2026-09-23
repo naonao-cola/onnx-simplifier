@@ -154,15 +154,19 @@ def cmd_export(a):
 
     d = wdir(a.variant)
     p = variants.load(a.variant)
-    if a.gelu != "exact":  # an approximate-GELU encoder next to the exact export (see README)
-        n = variants.set_gelu(p.encoder, a.gelu)
+    if a.gelu != "exact" or a.upsample:  # an approximated encoder next to the exact export
+        if a.gelu != "exact":
+            n, tag = variants.set_gelu(p.encoder, a.gelu), f"gelu_{a.gelu}"
+        else:
+            n, tag = variants.set_upsample(p.encoder, a.upsample), f"up_{a.upsample}"
         enc = variants.Encoder(p).eval()
         x = torch.from_numpy(nchw(image(EVAL_IDS[0], p.size)[0]))
         torch.onnx.export(enc, (x,), d / "enc_g.onnx", input_names=["pixels"],
                           output_names=["image_embeddings"], opset_version=20, dynamo=False)
-        simplify(d / "enc_g.onnx", d / f"enc.gelu_{a.gelu}.onnx")
-        u8_nhwc_input(d / f"enc.gelu_{a.gelu}.onnx", d / f"enc.fp16_{a.gelu}.onnx", p.size)
-        print(f"{n} GELUs -> {a.gelu}: enc.fp16_{a.gelu}.onnx")
+        simplify(d / "enc_g.onnx", d / f"enc.{tag}.onnx")
+        fp16 = f"fp16_{tag.split('_', 1)[1]}"
+        u8_nhwc_input(d / f"enc.{tag}.onnx", d / f"enc.{fp16}.onnx", p.size)
+        print(f"{n} modules -> {tag}: enc.{fp16}.onnx")
         return
     enc, dec = variants.Encoder(p).eval(), variants.SamDecoder(p).eval()
     u8, valid = image(EVAL_IDS[0], p.size)
@@ -241,6 +245,13 @@ def cmd_quantize(a):
         kw["exclude_op_types"] = MIX_FLOAT
     if a.policy == "a16":
         kw["activation_dtype"] = "uint16"
+    if a.policy in ("dw8", "dw16"):  # depthwise convs (reparameterized kernels) stay fp16
+        enc_m = onnx.load(d / "enc.sim.onnx")
+        kw["exclude_nodes"] = [n.name for n in enc_m.graph.node if n.op_type == "Conv" and any(
+            at.name == "group" and at.i > 1 for at in n.attribute)]
+        if a.policy == "dw16":
+            kw["activation_dtype"] = "uint16"
+        print(f"{len(kw['exclude_nodes'])} depthwise/grouped convs kept in float")
     if a.policy == "stem8":  # int8 only for the conv stem + first stage, the rest stays fp16
         kw["exclude_nodes"] = [n.name for n in onnx.load(d / "enc.sim.onnx").graph.node
                                if not re.match(r"/(Sub|Mul|enc/patch_embed/|enc/layers\.0/)",
@@ -254,7 +265,14 @@ def cmd_quantize(a):
     onnx.save(q, d / f"enc.{tag}.onnx")
     io_all = {"enc": io}
     print(f"enc {tag}: {time.time() - t:.0f} s {io}")
-    if a.policy == "stem8":  # encoder-only policy
+    if a.policy in ("dw8", "dw16"):  # depthwise convs (reparameterized kernels) stay fp16
+        enc_m = onnx.load(d / "enc.sim.onnx")
+        kw["exclude_nodes"] = [n.name for n in enc_m.graph.node if n.op_type == "Conv" and any(
+            at.name == "group" and at.i > 1 for at in n.attribute)]
+        if a.policy == "dw16":
+            kw["activation_dtype"] = "uint16"
+        print(f"{len(kw['exclude_nodes'])} depthwise/grouped convs kept in float")
+    if a.policy in ("stem8", "dw8", "dw16"):  # encoder-only policies
         (d / f"quant_{tag}.json").write_text(json.dumps({**io_all, "dec": None}, indent=1,
                                                        default=str))
         return
@@ -309,7 +327,8 @@ def cmd_host(a):
     def dec_fp32(emb, pc, pl, i, k):
         return dec_f.run(None, {"image_embeddings": emb, "point_coords": pc, "point_labels": pl})
 
-    for g in sorted(d.glob("enc.gelu_*.onnx")):  # approximate GELU, fp32: its own cost
+    # approximated encoders (GELU form, upsample mode), fp32: the approximation's own cost
+    for g in sorted([*d.glob("enc.gelu_*.onnx"), *d.glob("enc.up_*.onnx")]):
         enc_g = ort_sess(g)
         def enc_gelu(i, _ref, s=enc_g):
             return s.run(None, {"pixels": nchw(np.load(d / "ref" / f"eval_{i}_img.npy"))})[0]
@@ -491,23 +510,57 @@ def cmd_phone(a):
     print(json.dumps(res, indent=1))
 
 
+def cmd_report(a):
+    """Markdown tables from every variant's results.json (phone medians, accuracy vs fp32)."""
+    rows, qrows = [], []
+    for d in sorted(p for p in WORK.iterdir() if (p / "results.json").exists()):
+        r = json.loads((d / "results.json").read_text())
+        ph, ex = r.get("phone", {}), json.loads((d / "export.json").read_text())
+        e16, d16, dc = ph.get("enc_fp16", {}), ph.get("dec_fp16", {}), ph.get("dec_cpu4", {})
+        first = (e16.get("median_ms") or 0) + (d16.get("median_ms") or 0)
+        rows.append(f"| {d.name} | {ex['size']} | {ex['enc_mb']} | {_ms(e16)} | "
+                    f"{_f(e16.get('emb_cos_min'), 5)} / {_f(e16.get('mask_iou_mean'), 3)} | "
+                    f"{_ms(d16)} | {_ms(dc)} | {first:.0f} ms |")
+        for k, v in ph.items():
+            if k.startswith("enc_") and k != "enc_fp16" and isinstance(v, dict):
+                qrows.append(f"| {d.name} | {k[4:]} | {_ms(v)} | {_f(v.get('emb_cos_min'), 4)} | "
+                             f"{_f(v.get('mask_iou_mean'), 3)} / {_f(v.get('mask_iou_min'), 3)} |")
+    print("| variant | input | enc MB | enc fp16 HTP | emb cos min / mask IoU | dec fp16 HTP "
+          "| dec CPU x4 | first mask |")
+    print("|---|---|---|---|---|---|---|---|")
+    print("\n".join(rows))
+    print("\n| variant | encoder | HTP | emb cos min | mask IoU mean / min |")
+    print("|---|---|---|---|---|")
+    print("\n".join(qrows))
+
+
+def _ms(e):
+    return f"{e['median_ms']:.1f} ms" if e.get("median_ms") else ("fails" if e else "-")
+
+
+def _f(x, n):
+    return "-" if x is None else f"{x:.{n}f}"
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["export", "ref", "quantize", "host", "phone"])
-    ap.add_argument("variant")
-    ap.add_argument("--policy", default="int8", choices=["int8", "mix", "a16", "stem8"])
+    ap.add_argument("cmd", choices=["export", "ref", "quantize", "host", "phone", "report"])
+    ap.add_argument("variant", nargs="?")
+    ap.add_argument("--policy", default="int8", choices=["int8", "mix", "a16", "stem8", "dw8", "dw16"])
     ap.add_argument("--method", default="minmax", choices=["minmax", "mse", "percentile",
                                                             "entropy"])
     ap.add_argument("--pieces", default="all", choices=["all", "enc", "dec"])
     ap.add_argument("--gelu", default="exact", choices=["exact", "tanh", "tanh_ops", "sigmoid"],
                     help="export: also write an approximate-GELU encoder (enc.fp16_<gelu>.onnx)")
+    ap.add_argument("--upsample", default="", choices=["", "bilinear"],
+                    help="export: also write an encoder with bilinear neck upsampling")
     ap.add_argument("--tags", default="", help="phone: only these quantized tags (comma list)")
     ap.add_argument("--calib", type=int, default=16)
     ap.add_argument("--images", type=int, default=len(EVAL_IDS))
     ap.add_argument("--iters", type=int, default=10)
     a = ap.parse_args()
     {"export": cmd_export, "ref": cmd_ref, "quantize": cmd_quantize, "host": cmd_host,
-     "phone": cmd_phone}[a.cmd](a)
+     "phone": cmd_phone, "report": cmd_report}[a.cmd](a)
 
 
 if __name__ == "__main__":
