@@ -250,13 +250,20 @@ static void exec(Step& S) {
     const int C = (int)x.shape[0], H = (int)x.shape[1], W = (int)x.shape[2];
     uint8_t* q = (uint8_t*)S.buf.get((size_t)H * W * C);
     const float* src = (const float*)x.data;
+    // QuantizeLinear: saturate(round_half_even(x / s) + z). Row-parallel, each channel plane read
+    // contiguously; __builtin_rintf is a single frintx (default rounding mode = half-to-even), and
+    // the division is kept (x * (1/s) can round differently).
     par(H, envi("DQ_THREADS", 4), [&](long a, long b) {
       for (long y = a; y < b; ++y)
-        for (int xx = 0; xx < W; ++xx)
-          for (int c = 0; c < C; ++c) {
-            float v = std::nearbyint(src[((long)c * H + y) * W + xx] / s) + z;  // QuantizeLinear
-            q[((long)y * W + xx) * C + c] = (uint8_t)std::min(255.f, std::max(0.f, v));
+        for (int c = 0; c < C; ++c) {
+          const float* in = src + ((long)c * H + y) * W;
+          uint8_t* o = q + (long)y * W * C + c;
+          for (int xx = 0; xx < W; ++xx) {
+            float v = __builtin_rintf(in[xx] / s) + (float)z;
+            v = v < 0.f ? 0.f : (v > 255.f ? 255.f : v);
+            o[(long)xx * C] = (uint8_t)v;
           }
+        }
     });
     put_raw(f[2], ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8, {1, H, W, C}, q);
   } else if (S.op == "dq") {

@@ -26,6 +26,10 @@ The backbone's QDQ pattern is converted to real integer convolutions with Relay'
 `qnn.requantize` between layers, only 14 dequantizes left at the outputs), then compiled with
 `relay.build` for Hexagon. Both halves reproduce the full model bit-exactly in ONNX Runtime.
 
+**Update:** the whole model now runs end to end on the phone in one process at **131-158 ms per
+image** (vs. ~1.0-1.5 s ORT CPU): backbone and box/mask heads on the HTP, RPN post-processing and
+RoiAlign on the HVX DSP, the rest on the CPU. See `../e2e_pipeline/README.md`.
+
 ## Results (TVM DSP backbone + ORT rest vs. full ORT model)
 
 Detections with score > 0.5, matched by label and box IoU > 0.5:
