@@ -85,6 +85,10 @@ def run_pipeline(
         stage["name"]: (manifest_path.parent / stage["model"]).resolve()
         for stage in stages
     }
+    output_names = {
+        name: [value.name for value in onnx.load(path).graph.output]
+        for name, path in paths.items()
+    }
     feeds = {
         stage["name"]: _load_feeds(stage, paths[stage["name"]], i + 1)
         for i, stage in enumerate(stages)
@@ -125,12 +129,10 @@ def run_pipeline(
                 )
                 runners[name, backend] = runner
                 out, timing = _measure(runner, stage_feeds, warmup, repeats)
-                model = onnx.load(path)
-                output_names = [v.name for v in model.graph.output]
                 reference = list(refs[name].values())
                 record["backends"][backend] = {
                     **timing,
-                    "vs_ort": _quality(out, reference, output_names),
+                    "vs_ort": _quality(out, reference, output_names[name]),
                 }
             except Exception as exc:
                 record["backends"][backend] = {"error": f"{type(exc).__name__}: {exc}"}
@@ -141,6 +143,15 @@ def run_pipeline(
         raise ValueError(f"unsupported backend in {selected}")
     pipeline_result = None
     try:
+        unavailable = [
+            f"{name}={backend}: {stage_records[name]['backends'].get(backend, {}).get('error', 'runner unavailable')}"
+            for name, backend in selected.items()
+            if (name, backend) not in runners
+        ]
+        if unavailable:
+            raise RuntimeError(
+                "selected backend unavailable: " + "; ".join(unavailable)
+            )
         selected_runners = {
             stage["name"]: runners[stage["name"], selected[stage["name"]]]
             for stage in stages
@@ -156,15 +167,13 @@ def run_pipeline(
                         stage_feeds[edge["to"][1]] = values[edge["from"][0]][
                             edge["from"][1]
                         ]
-                output_names = [v.name for v in onnx.load(paths[name]).graph.output]
                 result = selected_runners[name](stage_feeds)
-                values[name] = dict(zip(output_names, result))
+                values[name] = dict(zip(output_names[name], result))
             last = stages[-1]["name"]
             return list(values[last].values())
 
         out, timing = _measure(execute, {}, warmup, repeats)
         last_name = stages[-1]["name"]
-        last_model = onnx.load(paths[last_name])
         pipeline_result = {
             "status": "ok",
             "backends": selected,
@@ -172,7 +181,7 @@ def run_pipeline(
             "vs_ort": _quality(
                 out,
                 list(refs[last_name].values()),
-                [v.name for v in last_model.graph.output],
+                output_names[last_name],
             ),
         }
     except Exception as exc:
