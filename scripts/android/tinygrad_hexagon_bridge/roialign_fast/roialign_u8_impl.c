@@ -70,7 +70,8 @@ AEEResult roialign_u8_rpc_run(remote_handle64 h, const uint8* map0, int map0Len,
                               float s_out, int32 z_out, int32 flags, uint8* out, int outLen, uint64* dsp_us) {
   const uint8* maps[4] = {map0, map1, map2, map3};
   const int mapLens[4] = {map0Len, map1Len, map2Len, map3Len};
-  if (geomLen < 12 || fpLen < 8 || countsLen < 4 || C % 128 || C > 128 * RU8_MAX_HALVES || sr < 1 || sr > RU8_MAX_SR)
+  if (geomLen < 12 || fpLen < 8 || countsLen < 4 || C % 128 || C > 128 * RU8_MAX_HALVES || sr < 1 || sr > RU8_MAX_SR ||
+      OH * sr > RU8_MAX_AXIS || OW * sr > RU8_MAX_AXIS)
     return -1;
   unsigned long long t0 = HAP_perf_get_time_us();
   ru8_level_t lv[4];

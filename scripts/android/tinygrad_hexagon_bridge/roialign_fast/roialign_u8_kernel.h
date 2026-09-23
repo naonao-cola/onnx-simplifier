@@ -14,9 +14,11 @@
  * results differ from QuantizeLinear(fp32 RoiAlign) only where the fp32 value sits within a hair of a
  * rounding boundary (measured by roialign_u8_host_check.c).
  *
- * Header-only, plain C + clang vector extensions (no HVX intrinsics): the same code builds for the
- * host (exact semantic check), qemu (Hexagon lowering check, integer HVX only -- no qfloat) and the
- * CDSP skel. */
+ * Header-only. The multiply-accumulate has two bodies producing identical bytes: plain C vector
+ * extensions (host, exact semantic check) and, when built for 128-byte HVX, u8 -> u16 zero-extend +
+ * vmpyuh_acc (u16 x scalar u16 -> u32 accumulate, 3 ops per tap per 128 channels instead of ~12 for
+ * generic 32-bit lanes). The HVX body is integer-only, so it runs under qemu 8.2 as well as on the
+ * CDSP. */
 #ifndef ROIALIGN_U8_KERNEL_H
 #define ROIALIGN_U8_KERNEL_H
 
@@ -61,34 +63,6 @@ static inline void ru8_requant_params(float s_in, float s_out, int count, int32_
 
 static inline float ru8_maxf(float a, float b) { return a > b ? a : b; }
 
-typedef struct {
-  int valid;
-  long p1, p2, p3, p4;     /* byte offsets of the 4 taps (pixel * C) */
-  int32_t w1, w2, w3, w4;  /* Q14, summing to RU8_ONE when valid */
-} ru8_sample_t;
-
-/* ORT's pre_calc_for_bilinear_interpolate for one sample, fp32, same expression order. */
-static inline void ru8_sample(float y, float x, int H, int W, int C, ru8_sample_t* s) {
-  if (y < -1.0f || y > (float)H || x < -1.0f || x > (float)W) { s->valid = 0; return; }
-  if (y <= 0.0f) y = 0.0f;
-  if (x <= 0.0f) x = 0.0f;
-  int y_low = (int)y, x_low = (int)x, y_high, x_high;
-  if (y_low >= H - 1) { y_high = y_low = H - 1; y = (float)y_low; } else { y_high = y_low + 1; }
-  if (x_low >= W - 1) { x_high = x_low = W - 1; x = (float)x_low; } else { x_high = x_low + 1; }
-  const float ly = y - (float)y_low, lx = x - (float)x_low, hy = 1.0f - ly, hx = 1.0f - lx;
-  const float f1 = hy * hx, f2 = hy * lx, f3 = ly * hx;
-  int32_t w1 = (int32_t)(f1 * (float)RU8_ONE + 0.5f), w2 = (int32_t)(f2 * (float)RU8_ONE + 0.5f);
-  int32_t w3 = (int32_t)(f3 * (float)RU8_ONE + 0.5f);
-  int32_t w4 = RU8_ONE - w1 - w2 - w3;
-  if (w4 < 0) { w1 += w4; w4 = 0; }  /* can't happen for f4 >= 0 beyond rounding; keep the sum exact */
-  s->valid = 1;
-  s->w1 = w1; s->w2 = w2; s->w3 = w3; s->w4 = w4;
-  s->p1 = ((long)y_low * W + x_low) * C;
-  s->p2 = ((long)y_low * W + x_high) * C;
-  s->p3 = ((long)y_high * W + x_low) * C;
-  s->p4 = ((long)y_high * W + x_high) * C;
-}
-
 #ifdef __hexagon__
 static inline void ru8_l2fetch(const void* p, unsigned bytes) {
   unsigned long long ctl = ((unsigned long long)bytes << 32) | ((unsigned long long)bytes << 16) | 1ull;
@@ -99,9 +73,45 @@ static inline void ru8_l2fetch(const void* p, unsigned bytes) { (void)p; (void)b
 #endif
 
 #define RU8_MAX_SR 4
+#define RU8_MAX_AXIS 256 /* OH * sr and OW * sr */
 
-/* One RoI into one output row. prefetch: before bin b, l2fetch the 2-pixel row segments bin b+1
- * will read (same scheme as roialign_kernel.h's roialign_hwc_pf, 2*C bytes per segment). */
+/* ORT's pre_calc_for_bilinear_interpolate is separable: the y part of a sample depends only on
+ * (ph, iy), the x part only on (pw, ix). Computing each axis once per RoI (OH*sr + OW*sr evaluations
+ * instead of OH*OW*sr*sr) gives the identical y_low/x_low/ly/lx, and the weights are then formed as
+ * hy*hx, hy*lx, ly*hx in fp32 exactly like ORT. */
+typedef struct {
+  int valid, lo, hi;
+  float l, h;
+} ru8_axis_t;
+
+static inline void ru8_axis(float v, int n, ru8_axis_t* a) {
+  if (v < -1.0f || v > (float)n) { a->valid = 0; return; }
+  if (v <= 0.0f) v = 0.0f;
+  int lo = (int)v, hi;
+  if (lo >= n - 1) { hi = lo = n - 1; v = (float)lo; } else { hi = lo + 1; }
+  a->valid = 1; a->lo = lo; a->hi = hi;
+  a->l = v - (float)lo; a->h = 1.0f - a->l;
+}
+
+static inline void ru8_weights(const ru8_axis_t* y, const ru8_axis_t* x, int32_t w[4]) {
+  const float f1 = y->h * x->h, f2 = y->h * x->l, f3 = y->l * x->h;
+  w[0] = (int32_t)(f1 * (float)RU8_ONE + 0.5f);
+  w[1] = (int32_t)(f2 * (float)RU8_ONE + 0.5f);
+  w[2] = (int32_t)(f3 * (float)RU8_ONE + 0.5f);
+  w[3] = RU8_ONE - w[0] - w[1] - w[2];
+  if (w[3] < 0) { w[0] += w[3]; w[3] = 0; } /* only reachable through rounding; keeps the sum exact */
+}
+
+#if defined(__HVX__) && __HVX_LENGTH__ == 128
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+#define RU8_HVX 1
+typedef int32_t ru8_i32x32 __attribute__((vector_size(128)));
+#endif
+
+/* One RoI into one output row. prefetch: before bin b, l2fetch the rows bin b+1 will read -- per
+ * sample row (iy) one l2fetch covering the whole x span of the bin's samples (both y_low and y_high
+ * rows). */
 static void ru8_roi(const ru8_level_t* L, int C, const float* roi, int OH, int OW, int sr,
                     int z_out, int prefetch, uint8_t* out_row) {
   const int halves = C / 128;
@@ -111,47 +121,92 @@ static void ru8_roi(const ru8_level_t* L, int C, const float* roi, int OH, int O
   const float bin_w = roi_w / (float)OW, bin_h = roi_h / (float)OH;
   const uint8_t* map = L->map;
   const int H = L->H, W = L->W;
-  for (int b = 0; b < OH * OW; b++) {
-    const int ph = b / OW, pw = b % OW;
-    if (prefetch && b + 1 < OH * OW) {
-      const int nph = (b + 1) / OW, npw = (b + 1) % OW;
-      for (int iy = 0; iy < sr; iy++)
+  ru8_axis_t ya[RU8_MAX_AXIS], xa[RU8_MAX_AXIS];
+  for (int ph = 0; ph < OH; ph++)
+    for (int iy = 0; iy < sr; iy++)
+      ru8_axis(y1 + ph * bin_h + ((float)iy + 0.5f) * bin_h / (float)sr, H, &ya[ph * sr + iy]);
+  for (int pw = 0; pw < OW; pw++)
+    for (int ix = 0; ix < sr; ix++)
+      ru8_axis(x1 + pw * bin_w + ((float)ix + 0.5f) * bin_w / (float)sr, W, &xa[pw * sr + ix]);
+  const int32_t rnd_pre = 1 << (RU8_PRESHIFT - 1), rnd = (int32_t)1 << (L->shift - 1);
+  const long rowC = (long)W * C;
+  for (int ph = 0, b = 0; ph < OH; ph++) {
+    for (int pw = 0; pw < OW; pw++, b++) {
+      if (prefetch && b + 1 < OH * OW) {
+        const int nph = (b + 1) / OW, npw = (b + 1) % OW;
+        int xl = W, xh = -1;
         for (int ix = 0; ix < sr; ix++) {
-          ru8_sample_t s;
-          ru8_sample(y1 + nph * bin_h + ((float)iy + 0.5f) * bin_h / (float)sr,
-                     x1 + npw * bin_w + ((float)ix + 0.5f) * bin_w / (float)sr, H, W, C, &s);
-          if (s.valid) { ru8_l2fetch(map + s.p1, 2u * C); ru8_l2fetch(map + s.p3, 2u * C); }
+          const ru8_axis_t* x = &xa[npw * sr + ix];
+          if (x->valid) { if (x->lo < xl) xl = x->lo; if (x->hi > xh) xh = x->hi; }
         }
-    }
-    ru8_i32x128 acc[RU8_MAX_HALVES];
-    for (int h = 0; h < halves; h++) acc[h] = (ru8_i32x128){0};
-    int32_t wsum = 0;
-    for (int iy = 0; iy < sr; iy++) {
-      const float y = y1 + ph * bin_h + ((float)iy + 0.5f) * bin_h / (float)sr;
-      for (int ix = 0; ix < sr; ix++) {
-        const float x = x1 + pw * bin_w + ((float)ix + 0.5f) * bin_w / (float)sr;
-        ru8_sample_t s;
-        ru8_sample(y, x, H, W, C, &s);
-        if (!s.valid) continue;
-        wsum += RU8_ONE;
-        for (int h = 0; h < halves; h++) {
-          const ru8_u8x128 v1 = *(const ru8_u8x128*)(map + s.p1 + 128 * h);
-          const ru8_u8x128 v2 = *(const ru8_u8x128*)(map + s.p2 + 128 * h);
-          const ru8_u8x128 v3 = *(const ru8_u8x128*)(map + s.p3 + 128 * h);
-          const ru8_u8x128 v4 = *(const ru8_u8x128*)(map + s.p4 + 128 * h);
-          acc[h] += __builtin_convertvector(v1, ru8_i32x128) * s.w1 + __builtin_convertvector(v2, ru8_i32x128) * s.w2 +
-                    __builtin_convertvector(v3, ru8_i32x128) * s.w3 + __builtin_convertvector(v4, ru8_i32x128) * s.w4;
+        if (xh >= xl)
+          for (int iy = 0; iy < sr; iy++) {
+            const ru8_axis_t* y = &ya[nph * sr + iy];
+            if (!y->valid) continue;
+            ru8_l2fetch(map + y->lo * rowC + (long)xl * C, (unsigned)(xh - xl + 1) * C);
+            ru8_l2fetch(map + y->hi * rowC + (long)xl * C, (unsigned)(xh - xl + 1) * C);
+          }
+      }
+      int nvalid = 0;
+#ifdef RU8_HVX
+      /* acc[h][0] holds the even channel bytes, acc[h][1] the odd ones (vzxt splits them); within
+       * each pair, vmpyuh splits again into even/odd halfwords -- undone by the shuffles below. */
+      HVX_VectorPair acc[RU8_MAX_HALVES][2];
+      for (int h = 0; h < halves; h++) acc[h][0] = acc[h][1] = Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero());
+#else
+      ru8_i32x128 acc[RU8_MAX_HALVES];
+      for (int h = 0; h < halves; h++) acc[h] = (ru8_i32x128){0};
+#endif
+      for (int iy = 0; iy < sr; iy++) {
+        const ru8_axis_t* y = &ya[ph * sr + iy];
+        if (!y->valid) continue;
+        for (int ix = 0; ix < sr; ix++) {
+          const ru8_axis_t* x = &xa[pw * sr + ix];
+          if (!x->valid) continue;
+          nvalid++;
+          int32_t w[4];
+          ru8_weights(y, x, w);
+          const uint8_t* p[4] = {map + y->lo * rowC + (long)x->lo * C, map + y->lo * rowC + (long)x->hi * C,
+                                 map + y->hi * rowC + (long)x->lo * C, map + y->hi * rowC + (long)x->hi * C};
+          for (int h = 0; h < halves; h++) {
+#ifdef RU8_HVX
+            for (int t = 0; t < 4; t++) {
+              const HVX_VectorPair v = Q6_Wuh_vzxt_Vub(*(const HVX_Vector*)(p[t] + 128 * h));
+              const int32_t ww = w[t] | (w[t] << 16);
+              acc[h][0] = Q6_Wuw_vmpyacc_WuwVuhRuh(acc[h][0], Q6_V_lo_W(v), ww);
+              acc[h][1] = Q6_Wuw_vmpyacc_WuwVuhRuh(acc[h][1], Q6_V_hi_W(v), ww);
+            }
+#else
+            ru8_i32x128 a = acc[h];
+            for (int t = 0; t < 4; t++)
+              a += __builtin_convertvector(*(const ru8_u8x128*)(p[t] + 128 * h), ru8_i32x128) * w[t];
+            acc[h] = a;
+#endif
+          }
         }
       }
-    }
-    const int32_t zsum = L->z_in * wsum;
-    const int32_t rnd_pre = 1 << (RU8_PRESHIFT - 1), rnd = (int32_t)1 << (L->shift - 1);
-    uint8_t* o = out_row + (long)b * C;
-    for (int h = 0; h < halves; h++) {
-      ru8_i32x128 a = (acc[h] - zsum + rnd_pre) >> RU8_PRESHIFT;
-      a = ((a * L->mult + rnd) >> L->shift) + z_out;
-      a = __builtin_elementwise_min(__builtin_elementwise_max(a, (ru8_i32x128){0} + 0), (ru8_i32x128){0} + 255);
-      *(ru8_u8x128*)(o + 128 * h) = __builtin_convertvector(a, ru8_u8x128);
+      const int32_t zsum = L->z_in * nvalid * RU8_ONE;
+      uint8_t* o = out_row + (long)b * C;
+      for (int h = 0; h < halves; h++) {
+#ifdef RU8_HVX
+        ru8_i32x32 q[4] = {(ru8_i32x32)Q6_V_lo_W(acc[h][0]), (ru8_i32x32)Q6_V_hi_W(acc[h][0]),
+                           (ru8_i32x32)Q6_V_lo_W(acc[h][1]), (ru8_i32x32)Q6_V_hi_W(acc[h][1])};
+        for (int i = 0; i < 4; i++) {
+          ru8_i32x32 a = (q[i] - zsum + rnd_pre) >> RU8_PRESHIFT;
+          a = ((a * L->mult + rnd) >> L->shift) + z_out;
+          q[i] = __builtin_elementwise_min(__builtin_elementwise_max(a, (ru8_i32x32){0} + 0), (ru8_i32x32){0} + 255);
+        }
+        /* q0 = ch 4j, q1 = 4j+2, q2 = 4j+1, q3 = 4j+3 (as the low byte of each word) */
+        const HVX_Vector ev = Q6_Vh_vshuffe_VhVh((HVX_Vector)q[1], (HVX_Vector)q[0]); /* h[i] = ch 2i */
+        const HVX_Vector od = Q6_Vh_vshuffe_VhVh((HVX_Vector)q[3], (HVX_Vector)q[2]); /* h[i] = ch 2i+1 */
+        *(HVX_Vector*)(o + 128 * h) = Q6_Vb_vshuffe_VbVb(od, ev);
+#else
+        ru8_i32x128 a = (acc[h] - zsum + rnd_pre) >> RU8_PRESHIFT;
+        a = ((a * L->mult + rnd) >> L->shift) + z_out;
+        a = __builtin_elementwise_min(__builtin_elementwise_max(a, (ru8_i32x128){0} + 0), (ru8_i32x128){0} + 255);
+        *(ru8_u8x128*)(o + 128 * h) = __builtin_convertvector(a, ru8_u8x128);
+#endif
+      }
     }
   }
 }

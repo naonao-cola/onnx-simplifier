@@ -12,7 +12,7 @@ interface roialign_u8_rpc : remote_handle64 {
                 in sequence<int32> rows,          // [sum(level_counts)] destination row per RoI
                 in int32 C, in int32 OH, in int32 OW, in int32 sr, in float s_out, in int32 z_out,
                 in int32 flags,                   // bits 0-7 threads, bit 8 l2fetch prefetch, bit 9 locality sort
-                rout sequence<uint8> out,         // [N, OH, OW, C]; rows not named in `rows` are left untouched
+                rout sequence<uint8> result,        // [N, OH, OW, C]; rows not named in `rows` are left untouched
                 rout uint64 dsp_us);
   AEEResult perf_vote(in int32 turbo, rout int32 rc);
 };
