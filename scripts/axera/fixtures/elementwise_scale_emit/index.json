@@ -1,62 +1,192 @@
 {
- "Relu:16x128x28x28:zp0": {
-  "file": "relu_16x128x28x28_zp0.axmodel.gz",
-  "scale": 0.007843137718737125,
-  "zero_point": 0,
+ "Relu:16x128x28x28:x0,y0": {
+  "file": "relu_16x128x28x28_x0_y0.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   128,
+   28,
+   28
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
   "source": "relu_16x128x28x28_zp0_t"
  },
- "Relu:16x128x28x28:zp128": {
-  "file": "relu_16x128x28x28_zp128.axmodel.gz",
-  "scale": 0.007843137718737125,
-  "zero_point": 128,
+ "Relu:16x128x28x28:x128,y128": {
+  "file": "relu_16x128x28x28_x128_y128.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   128,
+   28,
+   28
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  },
   "source": "relu_16x128x28x28_zp128_t"
  },
- "Relu:16x256x14x14:zp0": {
-  "file": "relu_16x256x14x14_zp0.axmodel.gz",
-  "scale": 0.007843137718737125,
-  "zero_point": 0,
+ "Relu:16x256x14x14:x0,y0": {
+  "file": "relu_16x256x14x14_x0_y0.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   256,
+   14,
+   14
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
   "source": "relu_16x256x14x14_zp0_t"
  },
- "Relu:16x256x14x14:zp128": {
-  "file": "relu_16x256x14x14_zp128.axmodel.gz",
-  "scale": 0.007843137718737125,
-  "zero_point": 128,
+ "Relu:16x256x14x14:x128,y128": {
+  "file": "relu_16x256x14x14_x128_y128.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   256,
+   14,
+   14
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  },
   "source": "relu_16x256x14x14_zp128_t"
  },
- "Relu:16x512x7x7:zp0": {
-  "file": "relu_16x512x7x7_zp0.axmodel.gz",
-  "scale": 0.007843137718737125,
-  "zero_point": 0,
+ "Relu:16x512x7x7:x0,y0": {
+  "file": "relu_16x512x7x7_x0_y0.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   512,
+   7,
+   7
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
   "source": "relu_16x512x7x7_zp0_t"
  },
- "Relu:16x512x7x7:zp128": {
-  "file": "relu_16x512x7x7_zp128.axmodel.gz",
-  "scale": 0.007843137718737125,
-  "zero_point": 128,
+ "Relu:16x512x7x7:x128,y128": {
+  "file": "relu_16x512x7x7_x128_y128.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   512,
+   7,
+   7
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  },
   "source": "relu_16x512x7x7_zp128_t"
  },
- "Relu:16x64x112x112:zp0": {
-  "file": "relu_16x64x112x112_zp0.axmodel.gz",
-  "scale": 0.007843137718737125,
-  "zero_point": 0,
+ "Relu:16x64x112x112:x0,y0": {
+  "file": "relu_16x64x112x112_x0_y0.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   64,
+   112,
+   112
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
   "source": "relu_16x64x112x112_zp0_t"
  },
- "Relu:16x64x112x112:zp128": {
-  "file": "relu_16x64x112x112_zp128.axmodel.gz",
-  "scale": 0.007843137718737125,
-  "zero_point": 128,
+ "Relu:16x64x112x112:x128,y128": {
+  "file": "relu_16x64x112x112_x128_y128.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   64,
+   112,
+   112
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  },
   "source": "relu_16x64x112x112_zp128_t"
  },
- "Relu:16x64x56x56:zp0": {
-  "file": "relu_16x64x56x56_zp0.axmodel.gz",
-  "scale": 0.007843137718737125,
-  "zero_point": 0,
+ "Relu:16x64x56x56:x0,y0": {
+  "file": "relu_16x64x56x56_x0_y0.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   64,
+   56,
+   56
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
   "source": "relu_16x64x56x56_zp0_t"
  },
- "Relu:16x64x56x56:zp128": {
-  "file": "relu_16x64x56x56_zp128.axmodel.gz",
-  "scale": 0.007843137718737125,
-  "zero_point": 128,
+ "Relu:16x64x56x56:x128,y128": {
+  "file": "relu_16x64x56x56_x128_y128.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   64,
+   56,
+   56
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  },
   "source": "relu_16x64x56x56_zp128_t"
  }
 }

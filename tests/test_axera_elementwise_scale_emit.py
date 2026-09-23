@@ -1,7 +1,7 @@
 """No-device checks for the elementwise scale-retarget emitter.
 
 Each committed oracle is a native Pulsar2 build at a calibration held out from
-the template; emitting that calibration from the template must reproduce it
+its template; emitting that calibration from the template must reproduce it
 byte for byte (outside the known 301-325 MCode noise window)."""
 
 import gzip
@@ -23,6 +23,8 @@ import elementwise_scale_emit as E  # noqa: E402
 _ORACLES = os.path.join(E.TEMPLATE_DIR, "oracles")
 with open(os.path.join(_ORACLES, "index.json")) as _f:
     _ORACLE_INDEX = json.load(_f)
+with open(os.path.join(E.TEMPLATE_DIR, "index.json")) as _f:
+    _TEMPLATE_INDEX = json.load(_f)
 
 
 def _masked(model: onnx.ModelProto) -> bytes:
@@ -37,14 +39,25 @@ def _masked(model: onnx.ModelProto) -> bytes:
 def test_emit_reproduces_held_out_native_build(tmp_path, oracle):
     meta = _ORACLE_INDEX[oracle]
     out = tmp_path / "emitted.axmodel"
-    E.emit(meta["op"], meta["shape"], meta["scale"], meta["zero_point"], str(out))
+    E.emit(meta["op"], meta["shape"], meta["scales"], meta["zero_points"], str(out))
     with gzip.open(os.path.join(_ORACLES, oracle), "rb") as f:
         native = onnx.load_model_from_string(f.read())
     emitted = onnx.load(str(out), load_external_data=False)
     assert _masked(emitted) == _masked(native)
 
 
-def test_scale_floats_match_known_pulsar2_encoding():
+@pytest.mark.parametrize("key", sorted(_TEMPLATE_INDEX))
+def test_every_template_has_an_oracle(key):
+    meta = _TEMPLATE_INDEX[key]
+    assert any(
+        o["op"] == meta["op"]
+        and o["shape"] == meta["shape"]
+        and o["zero_points"] == meta["zero_points"]
+        for o in _ORACLE_INDEX.values()
+    )
+
+
+def test_relu_floats_match_known_pulsar2_encoding():
     # 1/255 and 1.8/255 builds: quant/dequant words read from compiled models.
     q, d = E.scale_floats(0.003921568859368563)
     assert (q.hex(), d.hex()) == ("ffff7e43", "8180803b")
@@ -68,24 +81,34 @@ def test_minmax_params_matches_pulsar2(lo, hi, scale_bits, zp):
 
 
 def test_emit_refuses_unvalidated_template(tmp_path):
+    out = str(tmp_path / "x.axmodel")
     with pytest.raises(ValueError, match="no validated template"):
-        E.emit("Relu", [16, 64, 56, 56], 0.01, 37, str(tmp_path / "x.axmodel"))
+        E.emit("Relu", [16, 64, 56, 56], {"x": 0.01}, {"x": 37, "y": 37}, out)
     with pytest.raises(ValueError, match="no validated template"):
-        E.emit("Relu", [2, 64, 56, 56], 0.01, 0, str(tmp_path / "x.axmodel"))
+        E.emit("Relu", [2, 64, 56, 56], {"x": 0.01}, {"x": 0, "y": 0}, out)
+    with pytest.raises(ValueError, match="not supported"):
+        E.emit("Tanh", [16, 64, 56, 56], {"x": 0.01}, {"x": 0, "y": 0}, out)
 
 
 def test_emit_from_reference_refuses_zero_point_change(tmp_path):
     ref = tmp_path / "ref.axmodel"
-    model, meta = E.load_template("Relu", [16, 64, 56, 56], 0)
+    zps = {"x": 0, "y": 0}
+    model, meta = E.load_template("Relu", [16, 64, 56, 56], zps)
     onnx.save(model, str(ref))
     with pytest.raises(ValueError, match="zero point change"):
         E.emit_from_reference(
-            str(ref), meta["scale"], 0, 0.01, 5, str(tmp_path / "o.axmodel")
+            str(ref),
+            "Relu",
+            meta["scales"],
+            zps,
+            {"x": 0.01},
+            {"x": 5, "y": 5},
+            str(tmp_path / "o.axmodel"),
         )
 
 
 def test_retarget_refuses_wrong_template_scale():
-    model, meta = E.load_template("Relu", [16, 64, 56, 56], 0)
+    model, meta = E.load_template("Relu", [16, 64, 56, 56], {"x": 0, "y": 0})
     mc = bytes(E._mcode_initializer(model).raw_data)
     with pytest.raises(ValueError, match="whole groups of four"):
-        E.retarget_scale(mc, meta["scale"] * 1.5, 0.01)
+        E.retarget_scale(mc, meta["scales"]["x"] * 1.5, 0.01)
