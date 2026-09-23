@@ -55,6 +55,10 @@ static int clip(const pt *p, int n, pt a, pt b, float orient, pt *out) {
 }
 
 float rbox_iou(const float *a, const float *b) {
+  /* exact early-out: boxes whose circumscribed circles don't meet cannot overlap */
+  const float dx = a[0] - b[0], dy = a[1] - b[1];
+  const float r = 0.5f * (sqrtf(a[2] * a[2] + a[3] * a[3]) + sqrtf(b[2] * b[2] + b[3] * b[3]));
+  if (dx * dx + dy * dy > r * r * 1.0001f) return 0.f;
   pt pa[4], pb[4], buf1[16], buf2[16];
   corners(a, pa);
   corners(b, pb);
