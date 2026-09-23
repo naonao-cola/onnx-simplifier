@@ -15,6 +15,7 @@ limits int8 on an NPU (ViT outliers, sampling coordinates, detector scores).
   ``/blocks.3/...``, with a topological-window fallback), or user groups.
   Data-movement nodes (Reshape, Transpose, ...) are not groups of their own:
   they share their input's quantization, so they follow their producer.
+  GridSample is a group: its sampling grid is an activation of its own.
 - :func:`analyze_activation_sensitivity` calibrates **once**
   (:func:`onnxsim.calibration.collect_calibration_stats`), then builds one
   :func:`~onnxsim.full_qdq.quantize_full_qdq` model per group from those
@@ -32,6 +33,24 @@ Every quantized model is run through ONNX Runtime at its *basic*
 optimization level (:func:`onnxsim.calibration_pick.run_outputs`): the
 extended level's fused u8s8 kernels saturate on CPUs without VNNI and would
 make the ranking depend on the host CPU.
+
+Validation against the policies the Android model ports found by hand
+(``scripts/quantization/activation_sensitivity_validate.py``, host only, MSE
+ranges, worst-output SQNR, a 20 dB search budget):
+
+- BEVFormer-tiny encoder (op-type groups): all-uint8 13.2 dB; the Gemms
+  alone reach 14.0 dB, i.e. the int8 Linears carry nearly all of the loss
+  (the port's ``lin8`` vs ``all8`` cosines, 0.985 vs 0.971), with the
+  grid-construction Add/Sub and GridSample next (24-27 dB each alone).
+- EdgeSAM encoder (35 blocks): all-uint8 9.9 dB, and keeping any single
+  block float buys back at most 1.6 dB -- the error is spread over the
+  network; the search promotes 33/35 blocks (188/204 nodes) to reach 20 dB,
+  matching the port's "post-training quantization can't fix it".
+- RF-DETR-Nano (DINOv2): all-uint8 1.8 dB and every backbone block alone
+  already ~3 dB; the search keeps 81/82 groups float -- the port's "no int8
+  policy beats fp16". (Its u8 export has unnamed Linear nodes, which block
+  grouping puts in topological windows; pass ``block_regex`` or explicit
+  groups for such graphs.)
 """
 
 import re
@@ -65,6 +84,12 @@ __all__ = [
 LEVELS = ("uint8", "uint16", "float")
 Metric = Callable[[Outputs, Outputs], float]
 GroupSpec = Union[str, Mapping[str, Sequence[str]]]
+
+# Data-movement ops whose output shares their input's quantization, so they follow their
+# producer's level instead of forming groups. GridSample is not one of them here: its grid
+# (sampling-coordinate) input is a real activation of its own, and quantizing it is exactly
+# the error a deformable-attention model is sensitive to.
+_FOLLOWERS = frozenset(_SHARED_QPARAM_OPS) - {"GridSample"}
 
 # First node-name path component that ends in an index: "blocks.3", "layers_2", "layer1".
 _BLOCK_COMPONENT = re.compile(r"[A-Za-z_]*[._]?\d+$")
@@ -133,9 +158,7 @@ def group_nodes(
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    nodes = [
-        n for n in _quantizable(_prepared(model)) if n.op_type not in _SHARED_QPARAM_OPS
-    ]
+    nodes = [n for n in _quantizable(_prepared(model)) if n.op_type not in _FOLLOWERS]
     if isinstance(groups, Mapping):
         known = {_key(n) for n in nodes}
         given: Dict[str, List[str]] = {}
@@ -191,7 +214,7 @@ def _policy(
         for x in n.input:
             consumers[x].append(n)
     level = dict(level_of)
-    movement = [n for n in qnodes if n.op_type in _SHARED_QPARAM_OPS]
+    movement = [n for n in qnodes if n.op_type in _FOLLOWERS]
     for n in movement:  # topological: producers are resolved first
         ins = _data_inputs(n)
         p = producer.get(ins[0]) if ins else None
