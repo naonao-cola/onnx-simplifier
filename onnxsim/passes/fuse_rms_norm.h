@@ -69,6 +69,21 @@
 // Requires X's and weight's element types to be known and equal to the
 // outer Cast's target, and the upcast value to feed nothing but the chain.
 //
+// Half-precision models: the eps / 2 / 1 constants of an fp16 or bf16 chain
+// are read in that type too. When the *plain* variant runs entirely in fp16
+// (no upcast), the fused node carries an explicit stash_type=FLOAT -- the
+// op's default, and what the HF reference RMSNorm does -- so the reduction
+// is computed in fp32. That is deliberately not bit-faithful to the fp16
+// chain: `Pow(x, 2)` in fp16 overflows to inf for |x| > ~255 in any runtime
+// that really computes it in fp16 (torch, GPU kernels; onnxruntime's CPU
+// provider happens to upcast internally), and real LLM residual streams
+// exceed that (onnx-community/Qwen2.5-0.5B-Instruct's fp16 export reaches
+// ~1,700 by layer 3; run in torch fp16 it generates repeated garbage --
+// scripts/nvidia/README.md). Where the fp16 chain did not
+// overflow or underflow the two agree to fp16 rounding; where it did, the
+// fused node gives the finite, intended value, so onnxsim's equivalence
+// check reports a mismatch for exactly those inputs.
+//
 // RMSNormalization reduces over *every* axis from `axis` to the last one,
 // so only a ReduceMean over the last axis (-1, or rank-1 when X's rank is
 // known) is fused; a single inner axis would otherwise silently widen into
@@ -81,6 +96,7 @@
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
+#include "passes/float16_to_float32.h"
 
 namespace ONNX_NAMESPACE {
 namespace optimization {
@@ -117,6 +133,18 @@ struct FuseRMSNorm final : public PredicateBasedPass {
     double d;
     if (FetchSoleValueOfTensor(v, d)) {
       out = static_cast<float>(d);
+      return true;
+    }
+    // fp16/bf16 models carry their eps / 2 / 1 constants in the model's own
+    // type; FetchSoleValueOfTensor<T> only matches an exact elem_type.
+    Float16 h;
+    if (FetchSoleValueOfTensor(v, h)) {
+      out = Float16BitsToFloat(h.bits);
+      return true;
+    }
+    BFloat16 b;
+    if (FetchSoleValueOfTensor(v, b)) {
+      out = static_cast<float>(b);
       return true;
     }
     return false;
@@ -334,7 +362,16 @@ struct FuseRMSNorm final : public PredicateBasedPass {
       float eps;
       std::vector<Node*> chain;
       if (MatchNorm(norm, x, axis, eps, chain)) {
-        out = Match{x, scale, axis, eps, 0, std::move(chain)};
+        // A half-precision X gets an explicit stash_type=FLOAT -- see the
+        // header comment on why that is intended.
+        const bool half = x->elemType() == TensorProto_DataType_FLOAT16 ||
+                          x->elemType() == TensorProto_DataType_BFLOAT16;
+        out = Match{x,
+                    scale,
+                    axis,
+                    eps,
+                    half ? TensorProto_DataType_FLOAT : 0,
+                    std::move(chain)};
         return true;
       }
       if (MatchUpcastNorm(norm, scale, x, axis, eps, chain)) {

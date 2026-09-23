@@ -546,3 +546,69 @@ blocks, `trtexec` with CUDA graphs) isolates the norm: 113 engine layers either 
 So for Edge-LLM on TensorRT the fusion is a graph-size/readability win, not a speed win.
 Any speed benefit would have to come from a backend without a Myelin-style fuser of its
 own that does dispatch `RMSNormalization` to a fused kernel -- not measured here.
+
+## ONNX -> TensorRT-LLM via AutoDeploy (`onnxsim.to_torch`)
+
+TensorRT-LLM has no ONNX importer, but AutoDeploy -- its path for arbitrary models -- only
+needs a PyTorch module with `forward(input_ids, position_ids) -> logits` from a *model
+factory*: it `torch.export`s it, pattern-matches attention / GQA repeat / RoPE / RMSNorm
+onto its canonical ops, and inserts TensorRT-LLM's paged-KV-cache attention kernels.
+`onnxsim/to_torch.py` supplies that module for an ONNX decoder LLM, and
+`scripts/nvidia/trtllm_autodeploy_onnx.py` registers it as an `OnnxModelForCausalLM`
+factory:
+
+```sh
+python3.12 -c "import onnx, onnxsim; m = onnx.load('model_fp16.onnx'); \
+  s, _ = onnxsim.simplify(m, target_opset_version=23, check_n=0); \
+  onnx.save(s, 'model_fp16_sim23.onnx', save_as_external_data=True)"
+python3.12 scripts/nvidia/trtllm_autodeploy_onnx.py model_fp16_sim23.onnx --tokenizer EXPORT_DIR \
+    --compile-backend torch-cudagraph                       # TensorRT-LLM venv, onnxsim --no-deps
+```
+
+`onnx_to_torch` interprets the ONNX graph op by op inside `forward`, so `torch.export`
+flattens it into plain aten ops. Shape arithmetic (`Shape` -> `Gather`/`Concat`/... ->
+`Reshape`/`Expand`) is carried as Python (Sym)ints -- note `torch.SymInt` is *not* an `int`
+subclass -- which is what keeps batch and sequence dynamic. Decoder attention
+(`MatMul(q, kT) [-> scale] [-> +mask] -> Softmax -> MatMul(., v)`, or opset-23 `Attention`)
+becomes causal `F.scaled_dot_product_attention`, `past_key_values.*` inputs are stripped
+(`Concat(past, new)` -> `new`), and everything only the mask / `present.*` outputs needed
+is dead and never traced. One non-obvious rewrite: old HF `rotary_emb` slices its cos/sin
+table to `[:past_len + seq_len]` before indexing it with `position_ids`; with the cache
+stripped that slice must become the whole table, or every decode step (seq_len 1, large
+positions) reads past the traced end.
+
+Checked on [`onnx-community/Qwen2.5-0.5B-Instruct`](https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct)
+`onnx/model_fp16.onnx` (optimum export, opset 14, 2759 nodes, 24 layers, GQA 14/2, past-KV
+inputs), TensorRT-LLM 1.2.1, RTX 5050:
+
+- **Conversion is exact.** On an fp32 copy of the model, prefill logits vs onnxruntime:
+  relative L2 4.5e-6, argmax 100%, in both `attention="exact"` (every op, KV cache kept)
+  and the default `"sdpa"` mode (cache stripped, all 24 attention blocks recognized).
+- **The fp16 export is broken in real fp16, and onnxsim fixes it.** Its RMSNorm is
+  decomposed and computed entirely in fp16; the residual stream reaches ~1,700 by layer 3,
+  so `Pow(x, 2)` overflows fp16 (max 65,504) and greedy decoding degenerates ("four, four,
+  four, ..."), both through AutoDeploy and with the converter alone (so not a cache bug).
+  (onnxruntime's CPU provider upcasts internally and does not overflow, but its fp16 path
+  is inaccurate here in the other direction: `mean(x^2)` ~ 1e-4 at the embedding hits
+  fp16 subnormals, 2.8e-2 relative error in the first RMSNorm vs 3.8e-4 for torch --
+  so it is not a usable reference for this model in fp16.) `fuse_rms_norm` fuses the chain
+  into `RMSNormalization` with an explicit `stash_type=FLOAT` -- after being taught to read
+  fp16 scalar constants, which it previously silently declined on -- and `to_torch` emits
+  that as HF's upcast RMSNorm, which AutoDeploy's `match_rmsnorm_pattern` recognizes (it
+  matched 0 of the fp16 decompositions). `simplify(target_opset_version=23)`: 2759 -> 2461
+  nodes, 49 `RMSNormalization`.
+- **AutoDeploy then recognizes everything**: 24 attention (-> cached attention), 48 GQA
+  repeats, 24 RoPE (-> its optimized RoPE), 49 RMSNorm (-> fused RMSNorm). Output is
+  coherent and matches the converter's own no-cache greedy decode.
+
+| Qwen2.5-0.5B-Instruct fp16 ONNX, 3 chat prompts, greedy, batch 1 | build | end-to-end tok/s |
+|---|---|---|
+| AutoDeploy `torch-simple` | 37 s | 130-133 |
+| AutoDeploy `torch-cudagraph` | 25 s | 181-183 |
+
+(For scale: TensorRT-LLM's own PyTorch backend on the HF `Qwen3-0.6B` checkpoint gave
+176-195 tok/s in the section above -- a different, slightly larger model.)
+`torch-cudagraph` needs `cuda_graph_batch_sizes` capped at `max_batch_size` (the script
+does this): AutoDeploy 1.2.1's default capture list includes larger batch sizes and fails
+with `Data too large for buffer 'cu_seqlen'`. `max_batch_size` must be >= 2: AutoDeploy
+traces with that batch size and `torch.export` specializes a size-1 example dimension.
