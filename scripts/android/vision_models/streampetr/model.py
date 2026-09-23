@@ -120,15 +120,33 @@ class MHA(nn.Module):
         self.in_proj_bias = nn.Parameter(torch.empty(3 * EMBED))
         self.out_proj = nn.Linear(EMBED, EMBED)
 
+    transposed = False  # export variants, set per instance: see forward
+    fold_v = False
+
     def forward(self, q, k, v):
-        """q (Lq, C), k/v (Lk, C) -> (Lq, C); ranks <= 3 throughout."""
+        """q (Lq, C), k/v (Lk, C) -> (Lq, C); ranks <= 3 throughout.
+
+        ``transposed``: the same math as scores^T = K Q^T (heads, Lk, Lq), softmax over the key axis,
+        out^T = V^T A^T (heads, d, Lq) -- the HTP runs A V with a 32-wide output (the head dim) far
+        below its matmul throughput; this puts the query count (428) on the output width instead."""
         wq, wk, wv = self.in_proj_weight.chunk(3)
         bq, bk, bv = self.in_proj_bias.chunk(3)
         d = EMBED // HEADS
+        if self.transposed:
+            qt = (F.linear(q, wq, bq) * (d ** -0.5)).view(-1, HEADS, d).permute(1, 2, 0)  # (h, d, Lq)
+            kt = F.linear(k, wk, bk).view(-1, HEADS, d).transpose(0, 1)  # (h, Lk, d)
+            vt = F.linear(v, wv, bv).view(-1, HEADS, d).permute(1, 2, 0)  # (h, d, Lk)
+            a = torch.softmax(torch.matmul(kt, qt), dim=1)  # (h, Lk, Lq)
+            return self.out_proj(torch.matmul(vt, a).permute(2, 0, 1).reshape(-1, EMBED))
         q = (F.linear(q, wq, bq) * (d ** -0.5)).view(-1, HEADS, d).transpose(0, 1)
         k = F.linear(k, wk, bk).view(-1, HEADS, d).permute(1, 2, 0)
         v = F.linear(v, wv, bv).view(-1, HEADS, d).transpose(0, 1)
         a = torch.softmax(torch.matmul(q, k), dim=-1)
+        if self.fold_v:
+            # out_proj folded into each head's values: sum_h A_h (V_h W_o,h^T) + b_o, a 256-wide batched
+            # matmul output instead of 32 (8x the MACs, no transpose of the (h, Lq, Lk) attention)
+            wo = self.out_proj.weight.view(EMBED, HEADS, d).permute(1, 2, 0)  # (h, d, C)
+            return torch.matmul(a, torch.matmul(v, wo)).sum(0) + self.out_proj.bias
         return self.out_proj(torch.matmul(a, v).transpose(0, 1).reshape(-1, EMBED))
 
 

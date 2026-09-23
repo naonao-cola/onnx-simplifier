@@ -20,7 +20,11 @@ NuImages-pretrained, 60 epochs (NDS 54.6 / mAP 44.9 on nuScenes val upstream):
 | `model.py` | plain-PyTorch rebuild: ResNet-50 + CPFPN, `load_official()` name map; `UpstreamHead` (literal transcription of the head + memory queue) and the deployment split `HeadCore` (HTP) + `HostState` (CPU) |
 | `validate.py` | runs both head paths on the same features over a scene, diffs them, matches GT; dumps per-frame inputs/outputs for export and the phone |
 | `export.py` | `img` / `head` pieces -> ONNX (opset 17) -> ORT CPU check -> onnxsim; phone inputs + torch references |
-| `e2e_phone.py` | both pieces on the HTP frame after frame (phone outputs feed the host memory queue), vs the fp32 torch chain and GT |
+| `e2e_phone.py` | both pieces on the HTP frame after frame (phone outputs feed the host memory queue), vs the fp32 torch chain and GT; quantized I/O through `<piece>.json` |
+| `quantize.py` | `onnxsim.full_qdq` whole-graph QDQ (uint8 or uint16 activations, int8 per-channel weights) + `quantized_io`, calibrated on 4 scenes x 6 frames disjoint from scene-0103 |
+| `sensitivity.py` | host (ORT CPU, no QDQ fusion) per-op-type quantization sensitivity of the head, teacher-forced on scene-0103 |
+| `tf_phone.py` | the same teacher-forced head check on the phone's HTP |
+| `profile_ops.py` | per-op-type share of an HTP execute from a QNN detailed-profiling CSV (copy of `../bevformer_tiny/`'s) |
 
 ## Deployment split
 
@@ -38,31 +42,57 @@ NuImages-pretrained, 60 epochs (NDS 54.6 / mAP 44.9 on nuScenes val upstream):
 
 ## Results
 
-GT match: scene-0103 x 6 keyframes (the same frames and criteria as `../bevformer_tiny/`: score
->= 0.3, same class, BEV center within 2 m), a scene's first frame resets the memory.
+GT match: scene-0103 x 6 keyframes -- the same frames and criteria as `../bevformer_tiny/` and
+Fast-BEV (score >= 0.3, same class, BEV center within 2 m); a scene's first frame resets the memory.
+All phone numbers are chained on the phone (each frame's phone outputs feed the host memory queue),
+strict all-HTP (QNN EP via ORT, 0 refused ops), medians under the shared phone lock.
 
-| | GT matched / 190 (score >= 0.3) | @ 0.2 | predictions >= 0.3 |
-|---|---|---|---|
-| fp32 torch, upstream-literal head | 105 | | 165 |
-| fp32 torch, deployment split | 105 | 149 | 165 |
-| **fp16 HTP, both pieces, chained on the phone** | **106** | **151** | 162 |
+| StreamPETR R50 428q, 256x704 | image piece | head piece | HTP / frame | GT @0.3 | GT @0.2 |
+|---|---|---|---|---|---|
+| fp32 torch (upstream-literal head = deployment split) | | | | 105 | 149 |
+| fp16 / fp16 | 55.6 ms | 29.9 ms | 85.5 ms | 106 | 151 |
+| **int8 raw-pixel image / fp16 head (default)** | **9.1 ms** | **29.7 ms** | **38.8 ms (25.8 FPS)** | **112** | **150** |
+| int8 (normalized uint8 input) / fp16 | 8.7 ms | 29.8 ms | 38.5 ms | 111 | 148 |
+| fp16 / W8A16 head | 54.8 ms | 23.6 ms | 78.4 ms | 92 | 138 |
+| int8 / int8 head | 8.7 ms | 17.7 ms | 26.4 ms | 50 | 102 |
 
-Phone latency (strict all-HTP, QNN EP via ORT, `partition_report.sh`, 0 refused ops, median of 10):
+For context, on the same frames and phone: BEVFormer-tiny ~100 ms/frame, 107 GT
+(`../bevformer_tiny/`); Fast-BEV M0 31.9 ms / 123, Fast-BEV++ 25.2 ms / 124 (#1873). StreamPETR's
+focal-loss scores sit lower, so the shared 0.3 threshold undercounts it: at 0.2 it matches 150/190.
 
-| piece | fp16, f32 graph I/O |
-|---|---|
-| image (6 x R50 + CPFPN, 256x704) | 55.6 ms |
-| head (6-layer decoder, 428 queries x 4224 tokens) | 29.9 ms |
-| frame (sum) | 85.5 ms (11.7 FPS) |
+Host (CPU, Python/torch, per frame): the memory queue + encodings (`HostState.pre`) ~11 ms, post +
+decode ~1 ms, not overlapped here (the image piece of frame t+1 needs no memory and could run
+during it). Rig-static encodings (position embedding through `position_encoder`, spatial-alignment
+gamma/beta): 112 ms once per camera rig.
 
-fp16 on the phone vs the fp32 chain: frame 0 (empty memory) cls cos 0.99999, boxes 0.99998. From
-frame 1 on, per-row cosines drop to ~0.99 / 0.82 because the 128 propagated query rows are ordered
-by each chain's own top-k, so rows stop lining up -- the detections still match (106 vs 105).
+### What was done, what worked
 
-Split vs upstream-literal, max |diff| over the 6 chained frames: cls logits 8e-4, boxes 4e-3 m,
-propagated memory 4e-4 (float noise accumulated through the memory queue; identical detections).
-StreamPETR's focal-loss scores sit lower than BEVFormer's: at the shared 0.3 threshold it matches
-105 (BEVFormer-tiny fp32: 106), at 0.2 it matches 149.
+* **Rebuild + split** (`model.py`): the upstream head's float64 timestamps, nerf / sine encodings and
+  4x4 ego-motion transforms stay on the host (fp16 would wreck `sin(32 * translation)`); the HTP head
+  is 325 standard ops at rank <= 3. The last decoder level's branches only (earlier levels are
+  never read at test time).
+* **int8 image piece** (`quantize.py img_raw`, `onnxsim.full_qdq` + `quantized_io`): 55.6 -> 9.1 ms,
+  accuracy-neutral (feature cos 0.992-0.995). NormalizeMultiviewImage is folded into the stem conv
+  exactly (`export.py`'s `ImgRaw`: conv(W / s, pad0(x)) plus one constant map that carries the
+  per-channel bias and the zero-padding border terms), so the uint8 NHWC input calibrates to scale
+  1.0 / zero point 0: the camera's RGB bytes are the input, no host normalize+quantize (16.4 ms in
+  numpy otherwise). Folded vs original features: max |diff| 8e-4, cos 1.000000000.
+* **The head stays fp16.** Profile (QNN detailed): MatMul 78%, the cross-attention `A @ V`
+  ((8, 428, 4224) x (8, 4224, 32), softmax fused in) alone 10.1% per layer = 60% of the head.
+  Tried, all exact, all slower on the HTP:
+  * scores transposed + softmax over the key axis + `V^T A^T` (428-wide output): 143 ms
+  * `out_proj` folded into each head's values (`sum_h A_h (V_h W_o,h^T)`, 256-wide output): 107 ms
+  * rig-static tensors baked in + uint8 `feat` input (no float image tokens over the boundary): 30.5
+    ms -- the head is compute-bound, not I/O-bound
+  * **quantization**: W8A16 (uint16 activations) is 23.6 ms but loses 13 GT; on the host (ORT CPU,
+    `sensitivity.py`) the same QDQ graph is near exact (teacher-forced worst cos cls 0.99998 / reg
+    0.9988), on the HTP it is not (reg 0.83, `tf_phone.py`). Bisected on the phone: the culprit is
+    **uint16 x uint16 MatMul** (the attention's activation-activation products) -- keeping MatMul in
+    fp16 restores cos 0.9977 but the fp16 islands in a uint16 graph make it 147 ms. uint8
+    activations break the head even with MatMul in fp16 (reg cos 0.71).
+* **Next levers** (not done): run the cross-attention `softmax(QK^T) V` as an HVX kernel (the
+  (8, 428, 4224) attention never leaves VTCM-sized tiles; fp16 on the HTP spends ~3 ms/layer on it);
+  overlap the host memory queue with the next frame's image piece; move `HostState` to numpy/C++.
 
 ## Reproduce
 
@@ -73,4 +103,11 @@ python export.py img --ckpt ... --work work; python export.py head --ckpt ... --
 # phone (wrap in ~/.cache/android-phone/phone-run when the phone is shared)
 R=/data/local/tmp/streampetr ../../vision_models_probe/partition_report.sh work/img.sim.onnx work/img.in/manifest.txt 10
 R=/data/local/tmp/streampetr python e2e_phone.py --ckpt ... --work work
+# int8 image piece (calibration dumps first), then the default chain
+python validate.py --ckpt ... --data $C/nuscenes-mini --work work --no-upstream --scene scene-0061 scene-0553 scene-0757 scene-1077
+python export.py img_raw --ckpt ... --work work && python quantize.py img_raw --work work
+python e2e_phone.py --ckpt ... --work work --img img_raw.sim.q8 --head head.sim --iters 12
+# head experiments
+python quantize.py head --act uint16 [--exclude-ops MatMul --tag=_mm]; python sensitivity.py --work work
+python tf_phone.py --work work --head head.sim head.sim.q16
 ```
