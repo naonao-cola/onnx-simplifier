@@ -36,6 +36,13 @@
 #define BLOCK1_A_PATH "/data/local/tmp/native_transport/block1_input_packed.bin"
 #define BLOCK1_C_PATH "/data/local/tmp/native_transport/block1_output.bin"
 
+#define BOXHEAD_A_LEN 3211264
+#define BOXHEAD_B_LEN 25690112
+#define BOXHEAD_C_LEN 131072
+#define BOXHEAD_A_PATH "/data/local/tmp/native_transport/boxhead_a.bin"
+#define BOXHEAD_B_PATH "/data/local/tmp/native_transport/boxhead_bp.bin"
+#define BOXHEAD_C_PATH "/data/local/tmp/native_transport/boxhead_c_out.bin"
+
 static unsigned char* read_file_exact(const char* path, int expect_len) {
   FILE* f = fopen(path, "rb");
   if (!f) return NULL;
@@ -196,6 +203,36 @@ int main(int argc, char** argv) {
     printf("block1 test data not found at %s, skipping\n", BLOCK1_A_PATH);
   }
   free(b1a);
+
+  /* Real hex_boxhead_gemm_kernel.py-generated fp32 HVX GEMM for Mask R-CNN's box-head fc6 layer
+   * (m=64,k=12544,n=512 -- k is the real fc6 reduction depth, m/n a real-shape-consistent slice
+   * chosen so the weight buffer fits under the RPC transfer wall) -- only runs if
+   * gen_boxhead_test_data.py's output was pushed first; skipped gracefully otherwise. Times the
+   * on-device call for a real fp32-vs-int8 throughput comparison against this project's other
+   * kernels. */
+  unsigned char* ba = read_file_exact(BOXHEAD_A_PATH, BOXHEAD_A_LEN);
+  unsigned char* bb = read_file_exact(BOXHEAD_B_PATH, BOXHEAD_B_LEN);
+  if (ba && bb) {
+    unsigned char* bc = malloc(BOXHEAD_C_LEN);
+    printf("running real hex_boxhead_gemm kernel (m=64,k=12544,n=512)...\n");
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int brc = mini_rpc_run_kernel(h, ba, BOXHEAD_A_LEN, bb, BOXHEAD_B_LEN, bc, BOXHEAD_C_LEN);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double bms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    printf("run_boxhead_gemm rc=%d wall_ms=%.3f\n", brc, bms);
+    if (brc == 0) {
+      FILE* out = fopen(BOXHEAD_C_PATH, "wb");
+      fwrite(bc, 1, BOXHEAD_C_LEN, out);
+      fclose(out);
+      printf("wrote %s (%d bytes) -- verify against a numpy reference host-side\n", BOXHEAD_C_PATH, BOXHEAD_C_LEN);
+    }
+    free(bc);
+  } else {
+    printf("boxhead test data not found at %s / %s, skipping real-kernel test\n", BOXHEAD_A_PATH, BOXHEAD_B_PATH);
+  }
+  free(ba);
+  free(bb);
 
   mini_rpc_close(h);
   printf("closed OK\n");

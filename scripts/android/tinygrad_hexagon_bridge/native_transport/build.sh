@@ -47,6 +47,9 @@ adb -s "$DEVICE_SERIAL" shell "chmod 755 /data/local/tmp/native_transport/mini_c
 if [ -f gemm_a.bin ] && [ -f gemm_bp.bin ]; then
   adb -s "$DEVICE_SERIAL" push gemm_a.bin gemm_bp.bin /data/local/tmp/native_transport/
 fi
+if [ -f boxhead_a.bin ] && [ -f boxhead_bp.bin ]; then
+  adb -s "$DEVICE_SERIAL" push boxhead_a.bin boxhead_bp.bin /data/local/tmp/native_transport/
+fi
 adb -s "$DEVICE_SERIAL" shell "cd /data/local/tmp/native_transport && \
   LD_LIBRARY_PATH=/vendor/lib64 ADSP_LIBRARY_PATH=/data/local/tmp/native_transport \
   ./mini_client 'file:///mini_rpc.so?mini_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp'"

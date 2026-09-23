@@ -11,3 +11,7 @@ requant_c_out.bin
 block1_input_packed.bin
 block1_ref_output.bin
 block1_output.bin
+boxhead_a.bin
+boxhead_bp.bin
+boxhead_ref.bin
+boxhead_c_out.bin
