@@ -15,13 +15,13 @@ each other exactly in both directions (records and `npu_params`):
 | --- | ---: | ---: |
 | fc (dX, dW, forward Gemm) | 3 | 3 |
 | dX | 7 of 9, plus the existing 512->512 template | 14 of 19 |
-| dW | 3 of 11 | 3 of 20 |
-| Conv | 0 of 11 | 0 of 20 |
+| dW | 7 of 11 | 8 of 20 |
+| Conv | 6 of 11 | 8 of 20 |
 
 Coverage (`tinygrad_ax_backend.coverage_report` on `step.onnx`, master's
-backend): MatMul 41 refused -> 19 conditional, 22 refused; Gemm 1 refused
--> 1 conditional; totals 82 / 324 / 698 -> 82 / 344 / 678
-(covered / conditional / refused).
+backend): MatMul 41 refused -> 24 conditional, 17 refused; Gemm 1 -> 1
+conditional; Conv 20 refused -> 8 conditional, 12 refused; totals
+82 / 324 / 698 -> 82 / 357 / 665 (covered / conditional / refused).
 
 The remaining builds are in progress, largest last.
 
@@ -50,6 +50,25 @@ touched, so its "Gemm covered offline" was wrong until this fix. The held-out
 pair is what caught it. `locate` now finds these words (`zpoff`, `qshift`
 and `q15` roles), so the Gemm and every Conv chain with a bias recalibrate
 them too.
+
+## A 3x3 Conv chain also requantizes its weight
+
+The same offset lanes appear a second time in a 3x3 Conv's legalized chain,
+behind a shift of `0x8f` or `0x8e` (bit 7 set). That group requantizes the
+weight taps, which are asymmetric `uint8`, into their `Concat`, which is
+symmetric: `rqoff = int((zp_y - zp_x*r) * 2**(15-k))` with one ratio
+`r = s_x/s_y`, and `rqshift = 0x80 | (15 - k)`. Here `k` stops at
+`r <= 1`, not `r < 1`: a slice at exactly its Concat's scale keeps `k = 0`
+(stage4 conv1's held-out build). `locate` pairs each offset group with the
+shift write before it, and picks Add triples or requantize pairs by bit 7.
+
+Two data choices keep the formulas apart in a Conv template:
+
+- **Per-tap weight ranges.** Each 3x3 tap is scaled differently, so no two
+  tap slices tie on scale or zero point.
+- **A bias comparable to the output range**, so the MatMul output, the
+  biased sum and the bias get distinct zero points. With a small bias they
+  all came out at 128, and `recalibrate` refused the tie.
 
 ## What a template is
 

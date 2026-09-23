@@ -152,3 +152,14 @@ def test_refuses_unexplained_and_ambiguous_values():
 def test_step_shape_tables_cover_the_step():
     assert sum(n for n, _ in mre.STEP_SHAPES.values()) == 42  # 41 MatMul + Gemm
     assert sum(mre.STEP_CONV_MATMULS.values()) == 20
+
+
+def test_requantize_offset_words():
+    # A weight slice (asymmetric, zp 127) into its taps' Concat (symmetric):
+    # at the same scale the shift stays at 15 (0x8f) and the offset is
+    # -127 * 2**15, as the step's stage4 conv1 build stores them.
+    same = {"w": (0.0019607842, 127.0), "cat": (0.0019607842, 0.0)}
+    assert mre.evaluate(("rqshift", "w", "cat"), same) == 0x8F
+    assert mre.evaluate(("rqoff", "w", "cat"), same) == 0xFFC08000
+    above = {"w": (0.0031372542, 128.0), "cat": (0.0031372522, 0.0)}
+    assert mre.evaluate(("rqshift", "w", "cat"), above) == 0x8E

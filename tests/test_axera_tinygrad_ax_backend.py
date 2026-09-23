@@ -268,7 +268,12 @@ def test_coverage_report_on_the_resnet18_step():
     assert report["per_op"]["Transpose"] == {"covered": 41}
     assert report["per_op"]["Relu"] == {"conditional": 17}
     assert report["per_op"]["Sqrt"] == {"conditional": 39, "refused": 3}
-    assert report["per_op"]["Conv"] == {"refused": 20}
+    man = axb.mre.step_manifest()
+    live_conv = sum(
+        man["templates"][e["template"]]["kind"] == "conv" for e in man["nodes"].values()
+    )
+    want = {"refused": 20 - live_conv, "conditional": live_conv}
+    assert report["per_op"]["Conv"] == {k: v for k, v in want.items() if v}
     # same-shape binary ops: ElementwiseScaleEdit (binary_op_scale_emit.py);
     # constant and broadcast operands stay refused
     assert report["per_op"]["Add"] == {"conditional": 101, "refused": 43}

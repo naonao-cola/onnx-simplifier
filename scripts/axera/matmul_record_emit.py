@@ -178,12 +178,41 @@ def evaluate(role: Role, scales: Scales) -> int:
         return _bits(-scales[role[1]][1])
     if kind == "zp":
         return int(scales[role[1]][1]) & 0xFFFFFFFF
-    if kind in ("zpoff", "qshift", "q15"):
+    if kind in ("zpoff", "qshift", "q15", "rqoff", "rqshift"):
         return _bias_add(kind, *role[1:], scales)
     raise ValueError(f"unknown role {role!r}")
 
 
-def _bias_add(kind: str, x: str, z: str, y: str, scales: Scales) -> int:
+def _bias_add(kind: str, *names_and_scales) -> int:
+    *names, scales = names_and_scales
+    if kind in ("rqoff", "rqshift"):
+        return _requant(kind, *names, scales)
+    return _add(kind, *names, scales)
+
+
+def _requant(kind: str, x: str, y: str, scales: Scales) -> int:
+    """A one-input requantize's words (``x`` into ``y``): ``rqshift`` is
+    ``0x80 | (15 - k)`` and ``rqoff`` is ``int((zp_y - zp_x*r) * 2**(15-k))``
+    with ``r = s_x/s_y`` rounded to float32, ``k`` the smallest shift that
+    brings ``r`` to at most 1. Seen on the weight's way into the Concat of a
+    3x3 Conv's taps (asymmetric uint8 to symmetric)."""
+    (sx, zx), (sy, zy) = scales[x], scales[y]
+    if x == y or zx == zy:
+        raise CalibrationError("not a requantize")
+    # r == 1 exactly (a Slice into a Concat at the same scale) keeps k = 0:
+    # offset -zp_x * 2**15 and shift 0x8f, seen on the step's stage4 conv1.
+    k = 0
+    while sx / sy * 2.0**-k > 1.0:
+        k += 1
+        if k > 15:
+            raise CalibrationError(f"requantize ratio of {y} does not fit Q15")
+    if kind == "rqshift":
+        return 0x80 | (15 - k)
+    c = zy - zx * float(np.float32(sx / sy))
+    return int(c * 2.0 ** (15 - k)) & 0xFFFFFFFF
+
+
+def _add(kind: str, x: str, z: str, y: str, scales: Scales) -> int:
     """A fused ``y = Add(x, z)``'s calibration words, as
     ``binary_op_scale_emit`` decoded them for a standalone Add (#1869), with
     the Q15 shift ``k`` applied to the offset too:
@@ -315,49 +344,76 @@ def _param_lanes(params: bytes, ftable: dict[int, list[Role]]) -> list:
     return out
 
 
-def _locate_bias_add(segs, scales, offsets, recs, params, lanes):
-    """The zero-point offset lanes of a fused bias Add, its Q-format register
-    and its ``npu_params`` header: every ``(x, z, y)`` triple of tensors
-    whose ``zpoff`` explains the offset lanes, and the shift and header words
-    those triples give. A template whose offset is 0 is not located (there
-    is nothing to match), and ``recalibrate`` cannot tell; the step
-    templates all have nonzero offsets."""
-    names = sorted(scales)
-    triples = []
-    for x, z, y in itertools.permutations(names, 3):
-        try:
-            if _bias_add("zpoff", x, z, y, scales) == offsets[0][3]:
-                triples.append((x, z, y))
-        except CalibrationError:
-            pass
-    roles = [("zpoff", *t) for t in triples]
-    recs = recs + [
-        (si, off, reg, v, [r for r in roles if evaluate(r, scales) == v])
-        for si, off, reg, v in offsets
-    ]
-    shift = {evaluate(("qshift", *t), scales) for t in triples}
+def _offset_groups(segs):
+    """``(shift record, [offset records])`` per nonzero zero-point offset
+    group: the four ``OFFSET_REGS`` lanes and the ``SHIFT_REG`` write that
+    last precedes them."""
+    groups = []
     for si, seg in enumerate(segs):
+        shift = None
         for off, verb, reg, v in _records(seg):
-            if verb == FULL_WRITE and reg == SHIFT_REG and v in shift:
-                recs.append(
-                    (
-                        si,
-                        off,
-                        reg,
-                        v,
-                        [
-                            ("qshift", *t)
-                            for t in triples
-                            if evaluate(("qshift", *t), scales) == v
-                        ],
-                    )
-                )
+            if verb != FULL_WRITE:
+                continue
+            if reg == SHIFT_REG:
+                shift = (si, off, reg, v)
+            elif reg in OFFSET_REGS and v:
+                if (
+                    groups
+                    and groups[-1][1][-1][0] == si
+                    and groups[-1][1][-1][1] == off - 8
+                ):
+                    groups[-1][1].append((si, off, reg, v))
+                else:
+                    groups.append((shift, [(si, off, reg, v)]))
+    return groups
+
+
+def _locate_bias_add(segs, scales, offsets, recs, params, lanes):
+    """The zero-point offset groups of a fused chain, each with the
+    ``SHIFT_REG`` write before it, and a bias Add's ``npu_params`` header.
+
+    A shift with bit 7 set belongs to a one-input requantize (a Concat input
+    moving from an asymmetric to a symmetric quantization): ``rqoff`` /
+    ``rqshift`` over ``(x, y)`` pairs. Otherwise it is an Add: ``zpoff`` /
+    ``qshift`` / ``q15`` over ``(x, z, y)`` triples. Every tuple of tensors
+    that explains both the offset and the shift is kept as a role. A group
+    whose offset is 0 is not located (there is nothing to match), and
+    ``recalibrate`` cannot tell; the step templates have no such group."""
+    del offsets  # regrouped with their shift records below
+    names = sorted(scales)
     header: dict[int, list[Role]] = {}
-    for t in triples:
-        try:
-            header.setdefault(evaluate(("q15", *t), scales), []).append(("q15", *t))
-        except CalibrationError:
-            pass
+    for shift, group in _offset_groups(segs):
+        if shift is None:
+            raise CalibrationError("zero-point offset lanes without a shift register")
+        v, sv = group[0][3], shift[3]
+        if sv & 0x80:
+            tuples = [("rq", x, y) for x, y in itertools.permutations(names, 2)]
+            kinds = ("rqoff", "rqshift")
+        else:
+            tuples = [("add", *t) for t in itertools.permutations(names, 3)]
+            kinds = ("zpoff", "qshift")
+        hit = []
+        for t in tuples:
+            try:
+                if _bias_add(kinds[0], *t[1:], scales) == v and (
+                    _bias_add(kinds[1], *t[1:], scales) == sv
+                ):
+                    hit.append(t[1:])
+            except CalibrationError:
+                pass
+        recs = recs + [
+            (si, off, reg, w, [(kinds[0], *t) for t in hit])
+            for si, off, reg, w in group
+        ]
+        recs.append((*shift, [(kinds[1], *t) for t in hit]))
+        if kinds[0] == "zpoff":
+            for t in hit:
+                try:
+                    header.setdefault(evaluate(("q15", *t), scales), []).append(
+                        ("q15", *t)
+                    )
+                except CalibrationError:
+                    pass
     taken = {o + d for o, _, _ in lanes for d in range(-3, 4)}
     found = [
         (off, v, header[v])
@@ -385,6 +441,8 @@ PRECEDENCE = (
     "zpoff",
     "qshift",
     "q15",
+    "rqoff",
+    "rqshift",
 )
 """Tie-break between formulas that give the same bits at the template's
 scales. Across 174 builds, ``inv32``/``inv`` (``1/s`` in float32 or
