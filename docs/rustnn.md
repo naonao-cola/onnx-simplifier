@@ -95,11 +95,13 @@ For each node, `tune_node` does the following:
 1. It isolates the node as a one-node model (`extract_node_model`). Constant inputs
    become initializers, and shapes come from shape inference.
 2. It times that model on rustnn for each requested WebNN device type.
-3. It times it on tinygrad (`OnnxRunner` under `TinyJit`) for each BEAM width. `0` is
-   tinygrad's untuned kernels. `N > 0` runs tinygrad's own kernel search on
-   `tinygrad_device`, which can be `CPU`, `METAL`, `CUDA`, `WEBGPU` via Dawn, and so on.
+3. It times it on tinygrad (`OnnxRunner` under `TinyJit`) for each of
+   `tinygrad_devices` (`CPU`, `METAL`, `CUDA`, `WEBGPU` via Dawn, ...; `None` is
+   tinygrad's default) at each BEAM width. `0` is tinygrad's untuned kernels. `N > 0`
+   runs tinygrad's own kernel search on that device.
 4. It checks every output against `onnx.reference.ReferenceEvaluator`.
-5. It picks the fastest backend within `atol + rtol·max|ref|`.
+5. It marks each timing `within_tolerance` of `atol + rtol·max|ref|` and picks the
+   fastest one that is.
 6. It writes the result as JSON to the node's `metadata_props["onnxsim.webnn_tinygrad_tuning"]`.
 
 Both sides are timed host to host: inputs are copied in and outputs read back, the same
@@ -116,5 +118,43 @@ Caveats:
   device through Dawn comes closest, but a winner here is evidence, not a guarantee, for
   the browser flow.
 
-Tests: `tests/test_rustnn_runtime.py` and `tests/test_webnn_tinygrad_tuning.py`. CI runs
-them in the `rustnn` job of `.github/workflows/backend-integration.yml`.
+## On Apple silicon (Core ML / Neural Engine, Metal GPU)
+
+With pywebnn 0.5.12 on macOS, the device types map as follows:
+
+| WebNN `device_type` | What rustnn runs |
+| --- | --- |
+| `cpu` | ONNX Runtime, CPU execution provider |
+| `npu` | Core ML, `MLComputeUnits.cpuAndNeuralEngine`, falling back to `.all` |
+| `gpu` | **Not a GPU.** rustnn reports `onnx_gpu`, but only registers ONNX Runtime's CPU EP |
+
+The GPU is covered by tinygrad's `METAL` device instead:
+
+```python
+t.tune_node(model, "conv_3", webnn_device_types=("cpu", "npu"),
+            tinygrad_devices=("CPU", "METAL"), atol=2e-2, rtol=2e-2)
+```
+
+Core ML computes in float16 on the Neural Engine and GPU. The default `1e-3` tolerance
+would therefore rule out `npu` results, so loosen `atol`/`rtol` when you compare it.
+
+Core ML decides per op where it actually runs. A GitHub-hosted macOS runner is a virtual
+machine and may not expose the Neural Engine at all, so an `npu` timing there shows that
+the Core ML path works, not that the ANE was used.
+
+`scripts/apple/benchmark_webnn_tinygrad.py` builds a few small models, simplifies them
+and prints a per-node Markdown table of all four configurations. `--require npu,METAL`
+makes it fail if either one produced no valid timing.
+
+## CI
+
+Tests: `tests/test_rustnn_runtime.py` and `tests/test_webnn_tinygrad_tuning.py`.
+`ONNXSIM_RUSTNN_DEVICE_TYPES` (default `cpu`) and `ONNXSIM_TINYGRAD_DEVICES` (default:
+tinygrad's default device) widen the device coverage; device types whose canary fails are
+skipped.
+
+- **Linux:** the `rustnn` job of `.github/workflows/backend-integration.yml` runs the
+  tests on `cpu`.
+- **macOS:** the `rustnn-webnn` job of `.github/workflows/apple-integration.yml` (runner
+  `macos-15`) runs them on `cpu,npu` and `CPU,METAL`. It then runs the benchmark script
+  and appends the table to the job summary.

@@ -6,7 +6,14 @@ Node extraction and result bookkeeping need neither backend. Tests that run
 tinygrad skip without it; a missing/unusable rustnn is itself part of what's
 tested (it must be recorded as an errored timing, not raise), so only the
 test that needs a real WebNN timing skips on it.
+
+``ONNXSIM_RUSTNN_DEVICE_TYPES`` / ``ONNXSIM_TINYGRAD_DEVICES`` (comma
+separated) widen that test to more WebNN device types and tinygrad devices;
+``.github/workflows/apple-integration.yml`` sets ``cpu,npu`` and
+``CPU,METAL`` on a macOS runner.
 """
+
+import os
 
 import numpy as np
 import onnx
@@ -200,24 +207,45 @@ def test_tune_node_excludes_backends_that_disagree_with_reference(monkeypatch):
     assert result.winner is not None and result.winner.backend == "tinygrad"
 
 
+def _env_list(name, default):
+    return [d.strip() for d in os.environ.get(name, default).split(",") if d.strip()]
+
+
 def test_tune_node_with_rustnn_and_beam_search():
     pytest.importorskip("tinygrad")
     pytest.importorskip(
         "webnn", reason="pywebnn (rustnn's Python bindings) is not installed"
     )
-    ok, reason = probe_rustnn("cpu")
-    if not ok:
-        pytest.skip(f"rustnn cpu context unavailable: {reason}")
+    device_types = []
+    for device_type in _env_list("ONNXSIM_RUSTNN_DEVICE_TYPES", "cpu"):
+        ok, reason = probe_rustnn(device_type)
+        if ok:
+            device_types.append(device_type)
+        elif device_type == "cpu":
+            pytest.skip(f"rustnn cpu context unavailable: {reason}")
+    tinygrad_devices = _env_list("ONNXSIM_TINYGRAD_DEVICES", "") or [None]
     model = _named(_conv_model())
 
+    # Loose enough for Core ML's float16 math to count as correct.
     result = tune_node(
-        model, "conv", webnn_device_types=("cpu",), beams=(0, 1), warmup=1, runs=3
+        model,
+        "conv",
+        webnn_device_types=device_types,
+        tinygrad_devices=tinygrad_devices,
+        beams=(0, 1),
+        warmup=1,
+        runs=3,
+        atol=2e-2,
+        rtol=2e-2,
     )
 
-    assert [t.backend for t in result.timings] == ["webnn", "tinygrad", "tinygrad"]
+    expected = ["webnn"] * len(device_types) + ["tinygrad"] * (
+        2 * len(tinygrad_devices)
+    )
+    assert [t.backend for t in result.timings] == expected
     for t in result.timings:
-        assert t.ok, t.error
-        assert t.max_abs_error < 1e-3
+        assert t.ok, (t.config, t.error)
+        assert t.max_abs_error < (1e-3 if t.config.startswith("cpu/") else 2e-2), t
         assert 0 < t.min_ms <= t.median_ms
     assert result.winner == min(result.timings, key=lambda t: t.median_ms)
 

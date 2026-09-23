@@ -5,8 +5,13 @@ against onnx's reference evaluator.
 The op-coverage check needs neither rustnn nor pywebnn; everything that
 builds a real WebNN graph skips unless ``pywebnn`` is installed and
 :func:`onnxsim.rustnn_runtime.probe_rustnn` can run its canary. The
-``rustnn`` job in ``.github/workflows/backend-integration.yml`` installs it.
+``rustnn`` job in ``.github/workflows/backend-integration.yml`` installs it
+on Linux; the ``rustnn-webnn`` job in ``.github/workflows/apple-integration.yml``
+runs the numerical tests on macOS for ``ONNXSIM_RUSTNN_DEVICE_TYPES=cpu,npu``
+(``npu`` is Core ML in pywebnn 0.5.12).
 """
+
+import os
 
 import numpy as np
 import onnx
@@ -51,6 +56,31 @@ def rustnn_cpu():
     if not ok:
         pytest.skip(f"rustnn cpu context unavailable: {reason}")
     return "cpu"
+
+
+# WebNN device types the numerical tests run on (comma separated). A type
+# whose canary fails on this machine -- e.g. "npu" off macOS -- is skipped.
+_DEVICE_TYPES = [
+    d.strip()
+    for d in os.environ.get("ONNXSIM_RUSTNN_DEVICE_TYPES", "cpu").split(",")
+    if d.strip()
+]
+
+
+@pytest.fixture(scope="module", params=_DEVICE_TYPES)
+def rustnn_device(request):
+    pytest.importorskip(
+        "webnn", reason="pywebnn (rustnn's Python bindings) is not installed"
+    )
+    ok, reason = probe_rustnn(request.param)
+    if not ok:
+        pytest.skip(f"rustnn {request.param} context unavailable: {reason}")
+    return request.param
+
+
+def _tolerance(device_type):
+    # Core ML may compute in float16 (the Neural Engine and GPU always do).
+    return 1e-4 if device_type == "cpu" else 2e-2
 
 
 def test_find_unsupported_webnn_ops_lists_uncovered_op_types():
@@ -275,23 +305,24 @@ _PARITY_CASES = {
 
 
 @pytest.mark.parametrize("case", sorted(_PARITY_CASES))
-def test_rustnn_matches_reference(rustnn_cpu, case):
+def test_rustnn_matches_reference(rustnn_device, case):
     model, shapes = _PARITY_CASES[case]
     onnx.checker.check_model(model, full_check=True)
     rng = np.random.default_rng(0)
     feeds = {k: rng.standard_normal(s).astype(np.float32) for k, s in shapes.items()}
     expected = ReferenceEvaluator(model).run(None, feeds)
 
-    session = RustnnSession(model, device_type=rustnn_cpu)
+    session = RustnnSession(model, device_type=rustnn_device)
     got = session.run(feeds)
 
     assert session.output_names == [o.name for o in model.graph.output]
+    tol = _tolerance(rustnn_device)
     for name, ref in zip(session.output_names, expected):
         assert got[name].dtype == ref.dtype
-        np.testing.assert_allclose(got[name], ref, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(got[name], ref, rtol=tol, atol=tol)
 
 
-def test_rustnn_runs_simplified_model(rustnn_cpu):
+def test_rustnn_runs_simplified_model(rustnn_device):
     # Reshape's shape comes from Shape/Gather/Concat here: WebNN has no
     # lowering for that runtime shape arithmetic, and Reshape needs a
     # constant shape, so this only lowers once onnxsim folds it.
@@ -312,13 +343,16 @@ def test_rustnn_runs_simplified_model(rustnn_cpu):
         """
     )
     with pytest.raises(WebnnLoweringError, match="'Shape'"):
-        RustnnSession(model, device_type=rustnn_cpu)
+        RustnnSession(model, device_type=rustnn_device)
 
     simplified, ok = onnxsim.simplify(model)
     assert ok
     x = np.random.default_rng(0).standard_normal((2, 3, 4)).astype(np.float32)
-    got = RustnnSession(simplified, device_type=rustnn_cpu).run({"x": x})
-    np.testing.assert_allclose(got["y"], np.maximum(x.reshape(2, 12), 0))
+    got = RustnnSession(simplified, device_type=rustnn_device).run({"x": x})
+    tol = _tolerance(rustnn_device)
+    np.testing.assert_allclose(
+        got["y"], np.maximum(x.reshape(2, 12), 0), rtol=tol, atol=tol
+    )
 
 
 def test_rustnn_rejects_non_constant_reshape_shape(rustnn_cpu):
@@ -365,7 +399,7 @@ def test_rustnn_rejects_3d_conv(rustnn_cpu):
         RustnnSession(model, device_type=rustnn_cpu)
 
 
-def test_rustnn_benchmark_reports_timing(rustnn_cpu):
+def test_rustnn_benchmark_reports_timing(rustnn_device):
     model = _model(
         """
         g (float[8,8] x) => (float[8,8] y)
@@ -375,12 +409,12 @@ def test_rustnn_benchmark_reports_timing(rustnn_cpu):
         """
     )
     x = np.eye(8, dtype=np.float32)
-    timing, out = RustnnSession(model, device_type=rustnn_cpu).benchmark(
+    timing, out = RustnnSession(model, device_type=rustnn_device).benchmark(
         {"x": x}, warmup=1, runs=3
     )
     assert timing.runs == 3
     assert 0 < timing.min_ms <= timing.median_ms
-    np.testing.assert_allclose(out["y"], x)
+    np.testing.assert_allclose(out["y"], x, atol=_tolerance(rustnn_device))
 
 
 def test_probe_rustnn_reports_missing_pywebnn(monkeypatch):

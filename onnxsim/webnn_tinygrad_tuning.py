@@ -41,7 +41,7 @@ import os
 import statistics
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -83,6 +83,10 @@ class BackendTiming:
             evaluator over all outputs (``None`` when no reference ran).
     :param error: why this backend didn't produce a timing (then the timing
             fields are ``nan``).
+    :param within_tolerance: whether ``max_abs_error`` is within the
+            ``atol``/``rtol`` the measurement was made with (``None`` when
+            there was no timing or no reference). Only timings that aren't
+            ``False`` here can be the winner.
     """
 
     backend: str
@@ -92,6 +96,7 @@ class BackendTiming:
     runs: int = 0
     max_abs_error: Optional[float] = None
     error: Optional[str] = None
+    within_tolerance: Optional[bool] = None
 
     @property
     def ok(self) -> bool:
@@ -279,6 +284,9 @@ def time_webnn(
         ), None
     try:
         session = RustnnSession(model, device_type=device_type, backend=backend)
+        # Record the backend rustnn actually picked (e.g. "npu/coreml"), not
+        # just the hint: pywebnn maps device types to backends itself.
+        config = f"{device_type}/{session.backend_info().get('backend', backend)}"
         timing, out = session.benchmark(feeds, warmup=warmup, runs=runs)
     except WebnnLoweringError as e:
         return BackendTiming(
@@ -377,7 +385,7 @@ def _measure(
     *,
     webnn_device_types: Sequence[str],
     webnn_backend: str,
-    tinygrad_device: Optional[str],
+    tinygrad_devices: Sequence[Optional[str]],
     beams: Sequence[int],
     warmup: int,
     runs: int,
@@ -396,23 +404,25 @@ def _measure(
             runs=runs,
         )
         timings.append(_with_error(t, out, ref))
-    for beam in beams:
-        t, out = time_tinygrad(
-            model, feeds, device=tinygrad_device, beam=beam, warmup=warmup, runs=runs
-        )
-        timings.append(_with_error(t, out, ref))
+    for device in tinygrad_devices:
+        for beam in beams:
+            t, out = time_tinygrad(
+                model, feeds, device=device, beam=beam, warmup=warmup, runs=runs
+            )
+            timings.append(_with_error(t, out, ref))
 
-    def within_tolerance(t: BackendTiming) -> bool:
-        if t.max_abs_error is None:
-            return True  # no reference to judge against
-        scale = (
-            max((float(np.max(np.abs(r))) for r in ref if r.size), default=0.0)
-            if ref
-            else 0.0
-        )
-        return t.max_abs_error <= atol + rtol * scale
-
-    candidates = [t for t in timings if t.ok and within_tolerance(t)]
+    scale = (
+        max((float(np.max(np.abs(r))) for r in ref if r.size), default=0.0)
+        if ref
+        else 0.0
+    )
+    timings = [
+        t
+        if t.max_abs_error is None
+        else replace(t, within_tolerance=t.max_abs_error <= atol + rtol * scale)
+        for t in timings
+    ]
+    candidates = [t for t in timings if t.ok and t.within_tolerance is not False]
     winner = min(candidates, key=lambda t: t.median_ms) if candidates else None
     return timings, winner
 
@@ -420,9 +430,7 @@ def _measure(
 def _with_error(t: BackendTiming, out, ref) -> BackendTiming:
     if not t.ok or out is None:
         return t
-    return BackendTiming(
-        t.backend, t.config, t.median_ms, t.min_ms, t.runs, _max_abs_error(out, ref)
-    )
+    return replace(t, max_abs_error=_max_abs_error(out, ref))
 
 
 def tune_node(
@@ -432,7 +440,7 @@ def tune_node(
     feeds: Optional[Mapping[str, np.ndarray]] = None,
     webnn_device_types: Sequence[str] = ("auto",),
     webnn_backend: str = "auto",
-    tinygrad_device: Optional[str] = None,
+    tinygrad_devices: Sequence[Optional[str]] = (None,),
     beams: Sequence[int] = (0, 2),
     warmup: int = 2,
     runs: int = 10,
@@ -441,10 +449,18 @@ def tune_node(
     write_back: bool = True,
 ) -> NodeTuningResult:
     """Times node ``node_name`` in isolation (:func:`extract_node_model`) on
-    rustnn for each of ``webnn_device_types`` and on tinygrad for each BEAM
+    rustnn for each of ``webnn_device_types`` and on tinygrad for each of
+    ``tinygrad_devices`` (``None`` = tinygrad's default device) at each BEAM
     width in ``beams`` (``0`` = tinygrad's untuned kernels), validates every
     output against onnx's reference evaluator, and picks the fastest one
     within ``atol + rtol * max|reference|``.
+
+    On Apple silicon, ``webnn_device_types=("cpu", "npu")`` compares ONNX
+    Runtime's CPU EP with Core ML (pywebnn 0.5.12 maps ``"npu"`` to Core ML
+    with ``CPU_AND_NE`` compute units), and ``tinygrad_devices=("CPU",
+    "METAL")`` adds the GPU through tinygrad's Metal backend. pywebnn
+    0.5.12's ``"gpu"`` is *not* a GPU on macOS: rustnn only registers ONNX
+    Runtime's CPU execution provider.
 
     :param feeds: inputs for the isolated node, keyed by the node's own
             input names; random (:func:`random_feeds`) when omitted.
@@ -459,7 +475,7 @@ def tune_node(
         feeds,
         webnn_device_types=webnn_device_types,
         webnn_backend=webnn_backend,
-        tinygrad_device=tinygrad_device,
+        tinygrad_devices=tinygrad_devices,
         beams=beams,
         warmup=warmup,
         runs=runs,
@@ -499,7 +515,7 @@ def benchmark_model(
     feeds: Optional[Mapping[str, np.ndarray]] = None,
     webnn_device_types: Sequence[str] = ("auto",),
     webnn_backend: str = "auto",
-    tinygrad_device: Optional[str] = None,
+    tinygrad_devices: Sequence[Optional[str]] = (None,),
     beams: Sequence[int] = (0, 2),
     warmup: int = 2,
     runs: int = 10,
@@ -515,7 +531,7 @@ def benchmark_model(
         feeds,
         webnn_device_types=webnn_device_types,
         webnn_backend=webnn_backend,
-        tinygrad_device=tinygrad_device,
+        tinygrad_devices=tinygrad_devices,
         beams=beams,
         warmup=warmup,
         runs=runs,
