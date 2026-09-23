@@ -200,8 +200,8 @@ def relayout_segment(mc: bytes, index: int, raw: bytes) -> bytes:
 
     * the segment's table key 2 (padded words) and key 5 (stream bytes), and
       key 3 (start word) of every later segment;
-    * the byte-vector length (``header - 12``) and total segment words
-      (``header - 8``);
+    * the total segment words (``header - 8``, or ``header - 4`` in larger
+      programs) and the byte-vector length in the word before it;
     * every header uoffset (and the root table's negative soffset) whose
       target lies past the segment.
 
@@ -218,13 +218,15 @@ def relayout_segment(mc: bytes, index: int, raw: bytes) -> bytes:
     delta = new_room - room
     header, segs = codec.mcode.segments(mc)
     ins = start + room  # end of the old slot
-    if header < 12 or _u32(mc, header - 8) != sum(s[1] for s in segs) // 8:
-        raise ValueError(
-            "unmeasured header layout (segment word count not at header-8)"
-        )
+    words = sum(s[1] for s in segs) // 8
+    # the word count sits at header-8 (a trailing word follows it) or header-4
+    wat = next((p for p in (header - 8, header - 4) if _u32(mc, p) == words), None)
+    if wat is None or wat < 4:
+        raise ValueError("unmeasured header layout (no segment word count)")
+    lat = wat - 4
     out = bytearray(mc)
     # header pointers first, while offsets still refer to the old layout
-    for o in range(0, header - 12, 4):
+    for o in range(0, lat, 4):
         v = _u32(mc, o)
         if v >= 1 << 31:
             target = o - struct.unpack_from("<i", mc, o)[0]
@@ -234,8 +236,8 @@ def relayout_segment(mc: bytes, index: int, raw: bytes) -> bytes:
                 )
         elif ins <= o + v < len(mc):
             struct.pack_into("<I", out, o, v + delta)
-    struct.pack_into("<I", out, header - 12, _u32(mc, header - 12) + delta)
-    struct.pack_into("<I", out, header - 8, _u32(mc, header - 8) + delta // 8)
+    struct.pack_into("<I", out, lat, _u32(mc, lat) + delta)
+    struct.pack_into("<I", out, wat, _u32(mc, wat) + delta // 8)
     # tables (stored in reverse stream order)
     n = len(streams)
     for k in range(index, n):
@@ -383,10 +385,19 @@ def _key(op: str, shape, zero_points: Mapping[str, int]) -> str:
     return f"{op}:{'x'.join(str(int(d)) for d in shape)}:{zps}"
 
 
+def template_shape(shape) -> list[int]:
+    """The template shape serving ``shape``. Pulsar2 cannot tile a standalone
+    rank-1 binary op (``TileFailException`` in ``AxQuantizedAdd``), so a rank-1
+    tensor is served by the ``[1, C]`` template: same elements, same contiguous
+    layout, only the declared IO shape differs."""
+    shape = [int(d) for d in shape]
+    return [1, *shape] if len(shape) == 1 else shape
+
+
 def load_template(op: str, shape, zero_points, template_dir: str = TEMPLATE_DIR):
     with open(os.path.join(template_dir, "index.json")) as f:
         index = json.load(f)
-    key = _key(op, shape, zero_points)
+    key = _key(op, template_shape(shape), zero_points)
     if key not in index:
         raise ValueError(f"no validated template for {key}; have {sorted(index)}")
     meta = index[key]
