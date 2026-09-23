@@ -301,6 +301,81 @@ def predict_mcode(rules: Rules, param: int, scale: float | None = None) -> bytes
     return bytes(buf)
 
 
+ZP_REGS = frozenset(r.to_bytes(2, "little") for r in (0x1B10, 0x1EB0, 0x1A90))
+"""Registers holding the uint8 zero point (MinMax: ``round(-lo / s)``); a
+non-fused Reshape -> Relu writes each once with the calibrated value."""
+
+
+def _lane_values(raw: bytes) -> dict[int, bytes]:
+    """Scale-lane slots (registers 0x0f50..0x0fc0, verb 0xa1) -> value."""
+    return {
+        k: raw[k * RECORD + 4 : (k + 1) * RECORD]
+        for k in range(len(raw) // RECORD)
+        if raw[k * RECORD] == 0xA1
+        and raw[k * RECORD + 2 : k * RECORD + 4] in SCALE_REGS
+    }
+
+
+def retarget_scale(mc: bytes, scale: float, zero_point: int | None = None) -> bytes:
+    """``mc`` with its calibration moved to ``(scale, zero_point)``.
+
+    Every scale-lane record holds ``1/s`` or ``s`` of the one calibration: an
+    untiled program writes one group of eight each; a tiled program repeats
+    the groups per tile. The first lane is ``1/s``. The zero-point records
+    are the nonzero writes to 0x1b10/0x1eb0/0x1a90 (the registers are also
+    written 0 around the Relu's own records); a tiled program repeats them.
+
+    A zero point of 0 compiles to a different program (the zero-point write
+    is elided and the stream changes), so moving to 0 is refused. Raises
+    ``ValueError`` when the lanes or zero points are not of that shape."""
+    s32 = struct.unpack("<f", _f32(scale))[0]
+    out, seen = mc, False
+    for s, raw in enumerate(suc.decode_segments(mc)):
+        lanes = _lane_values(raw)
+        if not lanes:
+            continue
+        seen = True
+        first = lanes[min(lanes)]
+        old_s = struct.unpack("<f", first)[0]
+        inv, fwd = first, _f32(1.0 / old_s)
+        if set(lanes.values()) - {inv, fwd} or len(lanes) % 8:
+            raise ValueError(f"segment {s}: scale lanes are not one (1/s, s) pair")
+        new = bytearray(raw)
+        for k, v in lanes.items():
+            new[k * RECORD + 4 : (k + 1) * RECORD] = (
+                _f32(1.0 / s32) if v == inv else _f32(s32)
+            )
+        if zero_point is not None:
+            zps = [
+                k
+                for k in range(len(raw) // RECORD)
+                if raw[k * RECORD] == 0xA1
+                and raw[k * RECORD + 2 : k * RECORD + 4] in ZP_REGS
+                and raw[k * RECORD + 4 : (k + 1) * RECORD] != bytes(4)
+            ]
+            regs = {raw[k * RECORD + 2 : k * RECORD + 4] for k in zps}
+            old = {
+                int.from_bytes(raw[k * RECORD + 4 : (k + 1) * RECORD], "little")
+                for k in zps
+            }
+            if regs != ZP_REGS or len(old) != 1:
+                raise ValueError(f"segment {s}: zero-point records {zps} {sorted(old)}")
+            if not 0 < zero_point < 256:
+                raise ValueError(
+                    f"zero point {zero_point} vs template {sorted(old)}: only nonzero "
+                    "uint8 zero points share the template's program"
+                )
+            for k in zps:
+                new[k * RECORD + 4 : (k + 1) * RECORD] = zero_point.to_bytes(
+                    4, "little"
+                )
+        if bytes(new) != raw:
+            out = suc.replace_segment(out, s, bytes(new))
+    if not seen:
+        raise ValueError("no scale-lane records to retarget")
+    return out
+
+
 def family_rules(name: str, exclude: Sequence[int] = ()) -> Rules:
     fam = FAMILIES[name]
     fixtures = [
@@ -356,6 +431,59 @@ def emit_axmodel(
             attr.s = json.dumps({out_name: ["FP32", out_shape]}).encode()
     if output_path:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        onnx.save(model, output_path)
+    return model
+
+
+STEP_TEMPLATE_DIR = os.path.join(_FIXTURES, "reshape_step_templates")
+"""One ``Reshape -> Relu`` build per distinct non-fused ResNet18 step Reshape
+(``in -> out`` shape pair), at a symmetric calibration range, plus a second
+build of the same shape at another range. ``manifest.json`` lists the pairs
+whose records differ only in the scale lanes and whose scale lanes retarget
+onto each other exactly (``docs/axera-reshape-step-templates.md``)."""
+
+
+def _shape_key(in_shape: Sequence[int], out_shape: Sequence[int]) -> str:
+    return "x".join(map(str, in_shape)) + "->" + "x".join(map(str, out_shape))
+
+
+def step_manifest() -> dict:
+    path = os.path.join(STEP_TEMPLATE_DIR, "manifest.json")
+    if not os.path.exists(path):
+        return {"templates": {}}
+    with open(path) as f:
+        return json.load(f)
+
+
+def step_template(
+    in_shape: Sequence[int], out_shape: Sequence[int], manifest: dict | None = None
+) -> dict:
+    """Manifest entry for the step Reshape ``in_shape -> out_shape``, with its
+    ``axmodel`` path made absolute. Raises ``ValueError`` if no validated
+    template serves that shape pair."""
+    m = manifest if manifest is not None else step_manifest()
+    entry = m["templates"].get(_shape_key(in_shape, out_shape))
+    if entry is None:
+        raise ValueError(
+            f"no validated step Reshape template for {_shape_key(in_shape, out_shape)}"
+        )
+    return dict(entry, axmodel=os.path.join(STEP_TEMPLATE_DIR, entry["axmodel"]))
+
+
+def emit_step_reshape(
+    in_shape: Sequence[int],
+    out_shape: Sequence[int],
+    scale: float,
+    zero_point: int,
+    output_path: str | None = None,
+) -> onnx.ModelProto:
+    """The step template for ``in_shape -> out_shape`` retargeted to the
+    calibration ``(scale, zero_point)``. Refuses a zero point of 0 (a
+    different program; see ``retarget_scale``)."""
+    entry = step_template(in_shape, out_shape)
+    model = load_axmodel(entry["axmodel"])
+    _neu(model).raw_data = retarget_scale(mcode_of(model), scale, zero_point)
+    if output_path:
         onnx.save(model, output_path)
     return model
 

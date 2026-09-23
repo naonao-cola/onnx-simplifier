@@ -1,0 +1,535 @@
+{
+ "templates": {
+  "128x128x3x3->1x128x128x9": {
+   "axmodel": "128x128x3x3_to_1x128x128x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "128x128x3x3_to_1x128x128x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "128x128x3x3_to_1x128x128x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "128x64x1x1->1x128x64x1": {
+   "axmodel": "128x64x1x1_to_1x128x64x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "128x64x1x1_to_1x128x64x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "128x64x1x1_to_1x128x64x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "128x64x3x3->1x128x64x9": {
+   "axmodel": "128x64x3x3_to_1x128x64x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "128x64x3x3_to_1x128x64x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "128x64x3x3_to_1x128x64x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x128x28x28->16x1x128x784": {
+   "axmodel": "16x128x28x28_to_16x1x128x784_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x128x28x28_to_16x1x128x784_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x128x28x28_to_16x1x128x784",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x128x1764->16x1x1152x196": {
+   "axmodel": "16x1x128x1764_to_16x1x1152x196_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x128x1764_to_16x1x1152x196_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x128x1764_to_16x1x1152x196",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x128x784->16x128x28x28": {
+   "axmodel": "16x1x128x784_to_16x128x28x28_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x128x784_to_16x128x28x28_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x128x784_to_16x128x28x28",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x256x1764->16x1x2304x196": {
+   "axmodel": "16x1x256x1764_to_16x1x2304x196_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x256x1764_to_16x1x2304x196_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x256x1764_to_16x1x2304x196",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x256x196->16x256x14x14": {
+   "axmodel": "16x1x256x196_to_16x256x14x14_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x256x196_to_16x256x14x14_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x256x196_to_16x256x14x14",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x256x441->16x1x2304x49": {
+   "axmodel": "16x1x256x441_to_16x1x2304x49_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x256x441_to_16x1x2304x49_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x256x441_to_16x1x2304x49",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x512x441->16x1x4608x49": {
+   "axmodel": "16x1x512x441_to_16x1x4608x49_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x512x441_to_16x1x4608x49_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x512x441_to_16x1x4608x49",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x512x49->16x512x7x7": {
+   "axmodel": "16x1x512x49_to_16x512x7x7_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x512x49_to_16x512x7x7_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x512x49_to_16x512x7x7",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x64x3136->16x64x56x56": {
+   "axmodel": "16x1x64x3136_to_16x64x56x56_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x64x3136_to_16x64x56x56_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x64x3136_to_16x64x56x56",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x64x7056->16x1x576x784": {
+   "axmodel": "16x1x64x7056_to_16x1x576x784_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x64x7056_to_16x1x576x784_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x64x7056_to_16x1x576x784",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x256x14x14->16x1x256x196": {
+   "axmodel": "16x256x14x14_to_16x1x256x196_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x256x14x14_to_16x1x256x196_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x256x14x14_to_16x1x256x196",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x3x224x224->16x1x3x50176": {
+   "axmodel": "16x3x224x224_to_16x1x3x50176_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x3x224x224_to_16x1x3x50176_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x3x224x224_to_16x1x3x50176",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x512->16x512x1x1": {
+   "axmodel": "16x512_to_16x512x1x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x512_to_16x512x1x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x512_to_16x512x1x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x512x7x7->16x1x512x49": {
+   "axmodel": "16x512x7x7_to_16x1x512x49_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x512x7x7_to_16x1x512x49_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x512x7x7_to_16x1x512x49",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x64x56x56->1024x1x3136": {
+   "axmodel": "16x64x56x56_to_1024x1x3136_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x64x56x56_to_1024x1x3136_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x64x56x56_to_1024x1x3136",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x64x56x56->16x1x64x3136": {
+   "axmodel": "16x64x56x56_to_16x1x64x3136_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x64x56x56_to_16x1x64x3136_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x64x56x56_to_16x1x64x3136",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x1152->128x128x3x3": {
+   "axmodel": "1x128x1152_to_128x128x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x128x1152_to_128x128x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x128x1152_to_128x128x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x128x9->1x1x128x1152": {
+   "axmodel": "1x128x128x9_to_1x1x128x1152_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x128x128x9_to_1x1x128x1152_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x128x128x9_to_1x1x128x1152",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x256x1->1x1x128x256": {
+   "axmodel": "1x128x256x1_to_1x1x128x256_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x128x256x1_to_1x1x128x256_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x128x256x1_to_1x1x128x256",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x256x9->1x1x128x2304": {
+   "axmodel": "1x128x256x9_to_1x1x128x2304_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x128x256x9_to_1x1x128x2304_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x128x256x9_to_1x1x128x2304",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x576->128x64x3x3": {
+   "axmodel": "1x128x576_to_128x64x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x128x576_to_128x64x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x128x576_to_128x64x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x64->128x64x1x1": {
+   "axmodel": "1x128x64_to_128x64x1x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x128x64_to_128x64x1x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x128x64_to_128x64x1x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x1152->256x128x3x3": {
+   "axmodel": "1x256x1152_to_256x128x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x256x1152_to_256x128x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x256x1152_to_256x128x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x128->256x128x1x1": {
+   "axmodel": "1x256x128_to_256x128x1x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x256x128_to_256x128x1x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x256x128_to_256x128x1x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x2304->256x256x3x3": {
+   "axmodel": "1x256x2304_to_256x256x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x256x2304_to_256x256x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x256x2304_to_256x256x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x256x9->1x1x256x2304": {
+   "axmodel": "1x256x256x9_to_1x1x256x2304_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x256x256x9_to_1x1x256x2304_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x256x256x9_to_1x1x256x2304",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x512x1->1x1x256x512": {
+   "axmodel": "1x256x512x1_to_1x1x256x512_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x256x512x1_to_1x1x256x512_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x256x512x1_to_1x1x256x512",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x512x9->1x1x256x4608": {
+   "axmodel": "1x256x512x9_to_1x1x256x4608_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x256x512x9_to_1x1x256x4608_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x256x512x9_to_1x1x256x4608",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x512x2304->512x256x3x3": {
+   "axmodel": "1x512x2304_to_512x256x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x512x2304_to_512x256x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x512x2304_to_512x256x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x512x256->512x256x1x1": {
+   "axmodel": "1x512x256_to_512x256x1x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x512x256_to_512x256x1x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x512x256_to_512x256x1x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x512x4608->512x512x3x3": {
+   "axmodel": "1x512x4608_to_512x512x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x512x4608_to_512x512x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x512x4608_to_512x512x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x512x512x9->1x1x512x4608": {
+   "axmodel": "1x512x512x9_to_1x1x512x4608_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x512x512x9_to_1x1x512x4608_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x512x512x9_to_1x1x512x4608",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x128x1->1x1x64x128": {
+   "axmodel": "1x64x128x1_to_1x1x64x128_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x64x128x1_to_1x1x64x128_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x64x128x1_to_1x1x64x128",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x128x9->1x1x64x1152": {
+   "axmodel": "1x64x128x9_to_1x1x64x1152_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x64x128x9_to_1x1x64x1152_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x64x128x9_to_1x1x64x1152",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x147->64x3x7x7": {
+   "axmodel": "1x64x147_to_64x3x7x7_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x64x147_to_64x3x7x7_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x64x147_to_64x3x7x7",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x576->64x64x3x3": {
+   "axmodel": "1x64x576_to_64x64x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x64x576_to_64x64x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x64x576_to_64x64x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x64x9->1x1x64x576": {
+   "axmodel": "1x64x64x9_to_1x1x64x576_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x64x64x9_to_1x1x64x576_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x64x64x9_to_1x1x64x576",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "256x128x1x1->1x256x128x1": {
+   "axmodel": "256x128x1x1_to_1x256x128x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "256x128x1x1_to_1x256x128x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "256x128x1x1_to_1x256x128x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "256x128x3x3->1x256x128x9": {
+   "axmodel": "256x128x3x3_to_1x256x128x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "256x128x3x3_to_1x256x128x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "256x128x3x3_to_1x256x128x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "256x256x3x3->1x256x256x9": {
+   "axmodel": "256x256x3x3_to_1x256x256x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "256x256x3x3_to_1x256x256x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "256x256x3x3_to_1x256x256x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "512x256x1x1->1x512x256x1": {
+   "axmodel": "512x256x1x1_to_1x512x256x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "512x256x1x1_to_1x512x256x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "512x256x1x1_to_1x512x256x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "512x256x3x3->1x512x256x9": {
+   "axmodel": "512x256x3x3_to_1x512x256x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "512x256x3x3_to_1x512x256x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "512x256x3x3_to_1x512x256x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "512x512x3x3->1x512x512x9": {
+   "axmodel": "512x512x3x3_to_1x512x512x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "512x512x3x3_to_1x512x512x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "512x512x3x3_to_1x512x512x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "64x64x3x3->1x64x64x9": {
+   "axmodel": "64x64x3x3_to_1x64x64x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "64x64x3x3_to_1x64x64x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "64x64x3x3_to_1x64x64x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  }
+ },
+ "zero_point_probes": {
+  "zp_1x128x64_asym": {
+   "axmodel": "zp_1x128x64_asym.axmodel.gz",
+   "scale": 0.004705882165580988,
+   "template": "1x128x64->128x64x1x1",
+   "zero_point": 64
+  },
+  "zp_1x128x64_asym2": {
+   "axmodel": "zp_1x128x64_asym2.axmodel.gz",
+   "scale": 0.0035294117406010628,
+   "template": "1x128x64->128x64x1x1",
+   "zero_point": 113
+  }
+ }
+}

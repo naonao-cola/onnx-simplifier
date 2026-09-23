@@ -125,6 +125,9 @@ So the step goes from 17 to 21 of 170 Reshapes offline-validated. The rule
 covers the whole square-fold group, `C` 40 to 64. The step only uses `C=64`
 from that range.
 
+The step's own shapes are now covered by one build per shape instead, with
+the calibration retargeted: see `docs/axera-reshape-step-templates.md`.
+
 ## 5. Emitter
 
 `scripts/axera/reshape_record_emit.py`:
