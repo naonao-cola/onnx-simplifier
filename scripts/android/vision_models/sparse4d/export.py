@@ -94,32 +94,39 @@ def project_mm(kp, proj_n):
     return torch.clamp(xy, -1.5, 2.5).reshape(CAMS, n, PTS, 2)
 
 
-def dfa_weights_r4(layer, feat, ae, proj):
-    """DFA.weights reshaped rank <= 4 straight into per-level (4, 6, 8, N*13) = (level, cam, group, anchor*pt)."""
-    n = feat.shape[0]
-    cam = layer.camera_encoder(proj[:, :3].reshape(CAMS, 12))
-    f = (feat + ae)[:, None] + cam[None]
-    w = layer.weights_fc(f).reshape(n, CAMS * LEVELS * PTS, GROUPS).softmax(dim=1)  # (N, 312, 8)
-    w = w.reshape(n, CAMS * LEVELS, PTS, GROUPS).permute(1, 3, 0, 2)  # (24, 8, N, 13)
-    return w.reshape(CAMS, LEVELS, GROUPS, n * PTS)
-
-
 def normalized_proj(proj):
     """(6, 4, 4) lidar2img -> (6, 3, 4) with x / y rows divided by the image width / height."""
     return proj[:, :3] / torch.tensor([704.0, 256.0, 1.0]).view(1, 3, 1)
 
 
+def dfa_weights_r4(layer, feat, ae, proj):
+    """DFA.weights as (6, N, 4 * 13, 8) = (cam, anchor, level x point, group), rank <= 4."""
+    n = feat.shape[0]
+    cam = layer.camera_encoder(proj[:, :3].reshape(CAMS, 12))
+    f = (feat + ae)[:, None] + cam[None]
+    w = layer.weights_fc(f).reshape(n, CAMS * LEVELS * PTS, GROUPS).softmax(dim=1)  # (N, 312, 8)
+    return w.reshape(n, CAMS, LEVELS * PTS, GROUPS).permute(1, 0, 2, 3)
+
+
 def dfa_graph(layer, fmaps, feat, anchor, ae, proj, proj_n):
-    """DFA for the graph: rank <= 4 throughout; returns the 'cat' residual (N, 512)."""
+    """DFA for the graph: rank <= 4 throughout; returns the 'cat' residual (N, 512).
+
+    The weights broadcast along the *last* axis (a head's 32 channels): (6, N*13, 8, 32) x
+    (6, N*13, 8, 1). The HTP miscomputed the first layout, which broadcast over a middle axis:
+    (6, 8, 32, N*13) x (6, 8, 1, N*13) gave cos 0.23 against ORT CPU on the phone, with both inputs
+    matching at >= 0.9998. The GridSample output is NCHW (6, 256, N, 13); the transpose to
+    (6, N, 13, 256) is the HTP's own NHWC order."""
     n = feat.shape[0]
     grid = project_mm(layer.kps_generator(anchor, feat), proj_n) * 2 - 1  # (6, N, 13, 2)
-    wl = dfa_weights_r4(layer, feat, ae, proj)
+    w = dfa_weights_r4(layer, feat, ae, proj)  # (6, N, 52, 8)
     out = 0
     for lv, fm in enumerate(fmaps):
-        s = F.grid_sample(fm, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-        s = s.reshape(CAMS, GROUPS, EMBED // GROUPS, n * PTS) * wl[:, lv][:, :, None]
-        out = out + s.sum(dim=0).reshape(EMBED, n, PTS).sum(dim=-1)
-    return layer.finish(out.transpose(0, 1), feat)
+        s = F.grid_sample(fm, grid, mode="bilinear", padding_mode="zeros", align_corners=False)  # (6, 256, N, 13)
+        s = s.permute(0, 2, 3, 1).reshape(CAMS, n * PTS, GROUPS, EMBED // GROUPS)
+        wl = w[:, :, lv * PTS:(lv + 1) * PTS].reshape(CAMS, n * PTS, GROUPS, 1)
+        s = (s * wl).reshape(CAMS, n, PTS, EMBED)
+        out = out + s.sum(dim=2).sum(dim=0)  # (N, 256)
+    return layer.finish(out, feat)
 
 
 class FrameGraph(nn.Module):

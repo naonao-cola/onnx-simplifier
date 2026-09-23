@@ -17,6 +17,7 @@ from pathlib import Path
 
 import onnx
 from data import NuScenesMini
+from export import normalized_proj
 
 from onnxsim.calibration import calibrate
 from onnxsim.full_qdq import quantize_full_qdq
@@ -51,7 +52,8 @@ def main():
     for sc in CALIB_SCENES:
         for tok in ns.scene_samples(sc)[: a.frames]:
             f = ns.frame(tok)
-            data.append({"rgb": f["rgb"], "proj": f["metas"]["projection_mat"].numpy()})
+            pm = f["metas"]["projection_mat"]
+            data.append({"rgb": f["rgb"], "proj": pm.numpy(), "proj_n": normalized_proj(pm).numpy()})
     first = onnx.load(str(work / "frame_first.sim.onnx"))
     inits = {i.name for i in first.graph.initializer}
     keep = set(backbone_nodes(first))
