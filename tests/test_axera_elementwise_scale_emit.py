@@ -88,6 +88,15 @@ def test_emit_refuses_unvalidated_template(tmp_path):
         E.emit("Relu", [2, 64, 56, 56], {"x": 0.01}, {"x": 0, "y": 0}, out)
     with pytest.raises(ValueError, match="not supported"):
         E.emit("Tanh", [16, 64, 56, 56], {"x": 0.01}, {"x": 0, "y": 0}, out)
+    for op in ("Add", "Sub", "Mul", "Div"):
+        with pytest.raises(ValueError, match="not supported"):
+            E.emit(
+                op,
+                [64, 64, 3, 3],
+                {"x": 0.01, "z": 0.01, "y": 0.02},
+                {"x": 0, "z": 0, "y": 0},
+                out,
+            )
 
 
 def test_emit_from_reference_refuses_zero_point_change(tmp_path):

@@ -28,6 +28,11 @@ it. Changing a zero point can therefore change lengths and shift every later
 back-reference distance (``docs/axera-elementwise-scale-emit.md``). A template
 serves exactly the zero points it was built with.
 
+**Binary ops (Add/Sub/Mul/Div) are refused.** Held-out builds whose input and
+output scale ratios differ from the template's change 17-53 MCode regions,
+not just float literals: back-references, distances, header bytes and (for Add
+and Sub) ``npu_params``.
+
 Everything outside the measured scope raises ``ValueError``: an op, shape or
 zero point without a validated template, a target whose float equalities differ
 from the template's, or a template whose floats do not match its recorded

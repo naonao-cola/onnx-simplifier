@@ -1,4 +1,4 @@
-# Elementwise scale-retarget emitter (work in progress)
+# Elementwise scale-retarget emitter
 
 `scripts/axera/elementwise_scale_emit.py` rewrites a compiled standalone AX650
 elementwise model for a new quantization scale without Pulsar2.
@@ -24,7 +24,21 @@ the same.
 `minmax_params(lo, hi)` reproduces Pulsar2's MinMax `(scale, zero_point)` for
 all 35 builds (the zero point uses the unrounded range, round-half-to-even).
 
-## Validated so far
+## Coverage
+
+Against the ResNet18 training step (1,104 nodes), for a new calibration at a
+template's zero points:
+
+| op | step nodes | covered nodes | shapes covered | zero-point classes | held-out byte-exact |
+| --- | --- | --- | --- | --- | --- |
+| Relu | 17 | 17 | 5/5 | x=y=0, x=y=128 | 25/25 |
+| Sqrt | 42 | 39 | 16/17 (not `[512,512,3,3]`) | x=y=0 | 48/48 on committed shapes |
+| Add, Sub, Mul, Div | 144, 46, 397, 52 | 0 | 0 | -- | refused (below) |
+
+That is 56 of the step's 1,104 nodes. Everything else raises `ValueError`:
+other ops, shapes and zero points, and Sqrt with equal input and output scales.
+
+## Validated
 
 ### Relu: every shape in the ResNet18 training step
 
@@ -111,7 +125,47 @@ So, to answer #1836 directly: **this emitter does not handle the
 variable-length compressed units.** It patches fixed-width float literals only,
 and it refuses zero-point changes.
 
-## Zero point: not handled yet
+## Binary ops: refused
+
+Controlled builds of Add, Sub, Mul and Div were made at `[64,64,3,3]`, a real
+step shape: a template and three held-out calibrations each, all zero points 0.
+The `x`/`z` ranges had different ratios (e.g. `[0,1.3]/[0,0.7]` vs
+`[0,2.1]/[0,0.9]`). They show that changing the scale *ratios* changes far more
+than float literals:
+
+| op | MCode regions differing from the template (outside 301-325) | of which plain 4-byte float swaps | `npu_params` |
+| --- | --- | --- | --- |
+| Add | 17, 47, 49 | 4, 4, 4 | differs |
+| Sub | 44, 49, 53 | 4, 4, 8 | differs |
+| Mul | 25, 34, 49 (one build 32 bytes longer) | 4, 4, 8 | same |
+| Div | 45, 46, 48 | 0, 8, 9 | same |
+
+The rest are changes of one to a few bytes:
+
+- in the compressed register writes: literal runs becoming back-references
+  and vice versa, and shifted distances;
+- in segment-table header bytes, e.g. `7a` <-> `78` at offsets 204, 232, 252
+  and 280.
+
+The floats #1837 lists do occur: for Add, `f32(1/x)` and `f32(y)` each appear
+as four lane copies. But, as #1839 found, `1/z` does not appear as a float
+when its ratio to `x` differs. The ratio-dependent fields are exactly the
+variable-length units this emitter cannot re-encode, so binary ops are refused
+at every shape. A template would only serve targets with its exact scale
+ratios. A training step calibrates each tensor independently, so its targets
+won't share those ratios, and no such narrow class is shipped.
+
+## Which fields are patched, and how
+
+- **Patched in place:** only the scale floats of Relu and Sqrt, always as whole
+  4-byte values. Some copies sit in `V`/`W` register-write records and some in
+  the 4-byte literal runs of compressed short units (see the table above). No
+  length ever changes.
+- **Not patched (part of the template key instead):** zero points, and every
+  field that depends on scale ratios (binary ops). These live in re-encoded
+  variable-length units.
+
+## Zero point: not handled
 
 A zero-point change is refused. The zero point is written through the stream's
 compressed register writes (#1836's blocker). A controlled zero-point sweep
@@ -120,4 +174,6 @@ either literal or copied from an earlier position, at a distance in 4-byte
 units. For zero points 129, 191, 200 and 254 the stream is byte-identical
 except for the single literal zero-point byte, but a value that already
 occurs earlier (e.g. 100) is back-referenced instead, which changes lengths
-and shifts later distances. Details to follow.
+and shifts later distances. Retargeting a zero point would need a full decoder,
+plus a re-encoder that makes the same literal/back-reference choices as
+Pulsar2. This emitter has neither.
