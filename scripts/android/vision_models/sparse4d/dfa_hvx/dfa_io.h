@@ -27,6 +27,48 @@ static void* dfa_zalloc(long bytes) {
   return b;
 }
 
+/* fp32 -> fp16 bits, round to nearest even; below the fp16 normal range -> 0 (what the HTP's fp16
+ * output gives the softmax weights, up to its own subnormal handling) */
+static uint16_t dfa_f2h(float f) {
+  uint32_t x;
+  memcpy(&x, &f, 4);
+  const uint32_t sign = (x >> 16) & 0x8000u;
+  const int e = (int)((x >> 23) & 0xff) - 127 + 15;
+  if (e <= 0) return (uint16_t)sign;
+  if (e >= 31) return (uint16_t)(sign | 0x7c00u);
+  uint32_t m = x & 0x7fffffu, h = ((uint32_t)e << 10) | (m >> 13);
+  const uint32_t rem = m & 0x1fffu;
+  if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) h++;
+  return (uint16_t)(sign | h);
+}
+
+/* the fp16-weights path (DFA_W16=1): w16 replaces w, wbuf is the conversion buffer (Q rows) */
+static float* dfa_use_w16(dfa_args_t* a) {
+  const long n = (long)DFA_CAMS * DFA_LEVELS * a->Q * DFA_M * DFA_P;
+  uint16_t* h = (uint16_t*)dfa_zalloc(n * 2);
+  for (long i = 0; i < n; i++) h[i] = dfa_f2h(a->w[i]);
+  a->w16 = h;
+  a->w = NULL;
+  return (float*)dfa_zalloc((long)a->Q * DFA_M * DFA_P * 4);
+}
+
+/* the v2 layout (DFA_W2=1 / sim "w2"): w2 replaces w; *stage gets the gather buffer */
+static float* dfa_use_w2(dfa_args_t* a, uint16_t** stage) {
+  const long gs = DFA_CAMS * DFA_LEVELS * DFA_P;
+  uint16_t* h = (uint16_t*)dfa_zalloc((long)a->Q * DFA_M * gs * 2);
+  for (int c = 0; c < DFA_CAMS; c++)
+    for (int l = 0; l < DFA_LEVELS; l++)
+      for (int q = 0; q < a->Q; q++)
+        for (int g = 0; g < DFA_M; g++)
+          for (int p = 0; p < DFA_P; p++)
+            h[((long)q * DFA_M + g) * gs + ((long)c * DFA_LEVELS + l) * DFA_P + p] =
+                dfa_f2h(a->w[((((long)c * DFA_LEVELS + l) * a->Q + q) * DFA_M + g) * DFA_P + p]);
+  a->w2 = h;
+  a->w = NULL;
+  *stage = (uint16_t*)dfa_zalloc((long)a->Q * DFA_M * DFA_P * 2);
+  return (float*)dfa_zalloc((long)a->Q * DFA_M * DFA_P * 4);
+}
+
 static void dfa_case_load(const char* dir, dfa_args_t* a) {
   char p[1024];
   snprintf(p, sizeof p, "%s/meta.txt", dir);

@@ -58,12 +58,43 @@ DEFORM = [i for i, op in enumerate(OPS) if op == "deformable"]  # 0, 7, 14, 21, 
 P16 = 16
 
 
+W_LAYOUT = "v1"  # "v2": w as fp16 (N, 8, 6 * 4 * 16) straight from the Gemm + softmax (see dfa_weights_v2)
+PAD_LOGIT = -30000.0  # exp() of it is 0 in fp16 and fp32: the 3 pad points get weight 0 exactly
+
+
+def dfa_weights_v2(layer, feat, ae, cam):
+    """The same softmaxed weights as v1, laid out (N, 8 groups, 6 cams * 4 levels * 16 points), fp16.
+
+    weights_fc is linear, so W (feat + ae + cam_c) + b = W (feat + ae) + (W cam_c + b): one Gemm over
+    the anchors plus a tiny per-camera term, broadcast-added. Its rows are reordered to (group, level,
+    point) with 3 zero pad rows per 13 points, whose per-camera term is PAD_LOGIT. The softmax over
+    (camera, level, point) is then the last axis, and nothing needs a transpose or a concat on the
+    HTP (v1's permute + pad were ~40% of pre0 and ~30% of every mid piece)."""
+    fc = layer.weights_fc
+    n = feat.shape[0]
+    wt = fc.weight.reshape(LEVELS, PTS, GROUPS, -1).permute(2, 0, 1, 3)  # (8, 4, 13, 256)
+    wt = torch.cat([wt, torch.zeros(GROUPS, LEVELS, P16 - PTS, wt.shape[-1])], dim=2).reshape(GROUPS * LEVELS * P16, -1)
+    b = fc.bias.reshape(LEVELS, PTS, GROUPS).permute(2, 0, 1)
+    b = torch.cat([b, torch.full((GROUPS, LEVELS, P16 - PTS), PAD_LOGIT)], dim=2).reshape(-1)
+    a = ((feat + ae) @ wt.t()).reshape(n, GROUPS, 1, LEVELS * P16)
+    bc = (cam @ wt.t() + b).reshape(CAMS, GROUPS, LEVELS * P16).permute(1, 0, 2)[None]  # (1, 8, 6, 64)
+    return (a + bc).reshape(n, GROUPS, CAMS * LEVELS * P16).softmax(dim=-1).half()
+
+
+def w_v2_to_v1(w2):
+    """(N, 8, 384) -> (24, N, 8, 16) fp32: the check chain's (and dfa_core.h v1's) layout."""
+    n = w2.shape[0]
+    return w2.float().reshape(n, GROUPS, CAMS * LEVELS, P16).permute(2, 0, 1, 3).contiguous()
+
+
 def dfa_inputs(layer, feat, anchor, ae, proj, proj_n):
-    """-> pts (6, N, 16, 2), w (24, N, 8, 16): dfa_core.h's layouts."""
+    """-> pts (6, N, 16, 2), w: (24, N, 8, 16) fp32 (v1) or (N, 8, 384) fp16 (v2), dfa_core.h's layouts."""
     n = feat.shape[0]
     pts = project_mm(layer.kps_generator(anchor, feat), proj_n)  # (6, N, 13, 2)
     pts = torch.cat([pts, torch.zeros(CAMS, n, P16 - PTS, 2)], dim=2)
     cam = layer.camera_encoder(proj[:, :3].reshape(CAMS, 12))
+    if W_LAYOUT == "v2":
+        return pts, dfa_weights_v2(layer, feat, ae, cam)
     f = (feat + ae)[:, None] + cam[None]
     w = layer.weights_fc(f).reshape(n, CAMS * LEVELS * PTS, GROUPS).softmax(dim=1)
     w = w.reshape(n, CAMS * LEVELS, PTS, GROUPS).permute(1, 0, 3, 2)  # (24, N, 8, 13)
@@ -169,6 +200,8 @@ def dfa_u8(vals, scales, zps, pts, w):
     """dfa_core.h's math in torch: vals uint8 (6, H, W, 256) per level -> (N, 256)."""
     fm = [((v.float() - z) * s).permute(0, 3, 1, 2) for v, s, z in zip(vals, scales, zps)]
     n = pts.shape[1]
+    if w.dim() == 3:  # v2
+        w = w_v2_to_v1(w)
     wk = w[..., :PTS].reshape(CAMS, LEVELS, n, GROUPS, PTS).permute(2, 0, 1, 4, 3)  # (N, 6, 4, 13, 8)
     return dfa_upstream(fm, pts[:, :, :PTS], wk)
 
@@ -228,7 +261,7 @@ def check(m, work):
         print(f"split chain (torch, uint8 value maps), score >= {t}: GT {tp}/{ngt}, predictions {npred}")
 
 
-def export(m, work):
+def export(m, work, suffix="sim"):
     import onnx
     import onnxruntime as ort
 
@@ -256,10 +289,12 @@ def export(m, work):
         hook(f"mid{k}{'T' if t else 'F'}" if k < 5 else f"post{'T' if t else 'F'}", s)
     for fr in frames[:2]:
         ch.frame(fr["rgb"], fr["metas"])
-    pieces = {"bb": (ch.bb, ((torch.from_numpy(frames[0]["rgb"]),), {}), ["rgb"], ["v0", "v1", "v2", "v3"])}
+    pieces = {} if suffix != "sim" else {"bb": (ch.bb, ((torch.from_numpy(frames[0]["rgb"]),), {}), ["rgb"], ["v0", "v1", "v2", "v3"])}
     pieces["pre0"] = (ch.pre0, rec["pre0"], ["proj", "proj_n"], ["pts", "w"])
     for (k, t), s in ch.seg.items():
         name = f"mid{k}{'T' if t else 'F'}" if k < 5 else f"post{'T' if t else 'F'}"
+        if suffix != "sim" and k == 5:
+            continue  # post has no DFA inputs: only the sim variant
         a, kw = rec[name]
         ins, outs = seg_io(k, t)
         byname = dict(zip(["agg", "feat", "anchor", "proj", "proj_n"], a), **kw)
@@ -278,7 +313,7 @@ def export(m, work):
         assert ok, name
         if name == "bb":
             u8_input_as_dq(sm)
-        onnx.save(sm, str(out / f"{name}.sim.onnx"))
+        onnx.save(sm, str(out / f"{name}.{suffix}.onnx"))
         path.unlink()
         feeds = {n: a.numpy() for n, a in zip(ins, args)}
         got = ort.InferenceSession(sm.SerializeToString(), so, providers=["CPUExecutionProvider"]).run(None, feeds)
@@ -315,12 +350,19 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--work", required=True)
     ap.add_argument("--data", default=str(Path.home() / ".cache/onnxsim-bevformer/nuscenes-mini"))
+    ap.add_argument("--w-layout", choices=["v1", "v2"], default="v1",
+                    help="v2: pre0 / mid pieces emit w as fp16 (N, 8, 384), written as <piece>.w2.onnx")
     a = ap.parse_args()
+    global W_LAYOUT
+    W_LAYOUT = a.w_layout
     torch.set_grad_enabled(False)
     if a.cmd == "quantize":
         return quantize_bb(a.work, a.data)
     m = Sparse4D().load_official(a.ckpt).eval()
-    (export if a.cmd == "export" else check)(m, a.work)
+    if a.cmd == "export":
+        export(m, a.work, "w2" if a.w_layout == "v2" else "sim")
+    else:
+        check(m, a.work)
 
 
 if __name__ == "__main__":
