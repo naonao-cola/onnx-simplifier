@@ -860,7 +860,7 @@ def extract_step_ops(onnx_path: str) -> list[dict]:
             rec["attrs"]["strides"] = list(attrs.get("strides", [1, 1]))
             rec["attrs"]["pads"] = list(attrs.get("pads", [0, 0, 0, 0]))
             rec["attrs"]["weight_is_graph_input"] = node.input[1] in graph_inputs
-        elif node.op_type == "Reshape":
+        elif node.op_type in ("Reshape", "Squeeze"):
             rec["attrs"]["out"] = shapes.get(node.output[0], [])
         elif node.op_type in bse.OPS:
             a, b = node.input[:2]
@@ -888,10 +888,24 @@ def _plan_misc(rec: Mapping) -> tuple[str, str] | None:
     ``None`` without one."""
     key = rec.get("attrs", {}).get("misc_key")
     meta = misc.load_index().get(key) if key else None
+    alt = misc.equivalent_key(key) if key else None
+    if meta is None and alt:
+        return (
+            "conditional",
+            f"same-bytes equivalent template {alt} (Pulsar2 cannot tile the node "
+            "as written) retargeted if zp_x != 0",
+        )
     if meta is None:
         return None
     if meta["op"] in misc.CALIBRATION_FREE:
         return ("covered", "TemplateOnly (not quantized; misc_op_record_emit)")
+    if meta["op"] == "Neg":
+        return (
+            "conditional",
+            "misc_op_record_emit retarget (any zp_x, zp_y = 255 - zp_x; the "
+            "scale picks one of two program templates, split at s = 1/64) if "
+            "s_y = s_x",
+        )
     fixed = {
         "ReduceSum": "",
         "Softmax": f" and zp_y = {meta['zero_points']['y']}",
@@ -967,6 +981,7 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
             "Log",
             "MaxPool",
             "ReduceMean",
+            "Neg",
         ):
             return _plan_misc(rec) or (
                 "refused",
@@ -1018,6 +1033,19 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
         if op == "Transpose":
             cache.lookup(key_for_record(rec))
             return ("covered", "TemplateOnly")
+        if op == "Squeeze":
+            # a Squeeze is the Reshape to its output shape; it takes the same
+            # step template (a standalone Squeeze trips Pulsar2's scheduler)
+            shape = rec["shapes"][0] if rec["shapes"] else []
+            try:
+                rre.step_template(shape, attrs.get("out", []))
+            except ValueError:
+                return ("refused", "Squeeze: no validated Reshape step template")
+            return (
+                "conditional",
+                "Reshape step template (Squeeze as Reshape) retargeted to the "
+                "calibration if its zero point is nonzero",
+            )
         if op == "Reshape":
             shape = rec["shapes"][0] if rec["shapes"] else []
             out = attrs.get("out", [])

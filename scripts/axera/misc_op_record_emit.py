@@ -1,6 +1,6 @@
 """Record-level emitters for the ResNet18 training step's remaining non-memory
-ops: ReduceSum, Greater/Less -> Cast, Softmax, Log, MaxPool, ReduceMean, and
-the Sqrt shape ``[512,512,3,3]`` that ``elementwise_scale_emit`` left out.
+ops: ReduceSum, Greater/Less -> Cast, Softmax, Log, MaxPool, ReduceMean, Neg,
+and the Sqrt shape ``[512,512,3,3]`` that ``elementwise_scale_emit`` left out.
 
 Every AX650 MCode segment is an LZ77 stream over 8-byte register records
 (``short_unit_codec``, PR #1850). Decompressed, a calibration change touches
@@ -45,6 +45,12 @@ whole records only (``docs/axera-misc-op-record-emit.md``):
     count, and ``s_y``.
 
   Their zero points are fixed by the template except Softmax's ``zp_x``.
+
+* **Neg** ``[1,1]`` (``s_y = s_x``, ``zp_y = 255 - zp_x``) compiles to one of
+  two programs, picked by the scale alone (float32 ``s < 1/64``: small). Each
+  has lanes ``1/s_x`` and ``s_x``, and zero-point writes on ``0x1a90``,
+  ``0x1ad0`` and ``0x1b10`` that are omitted when the register already holds
+  the value (outside register-block dumps), so any zero point retargets.
 
 * **Greater -> Cast** is not quantized at all. Builds at the same shape and
   different calibrations are record-identical except segment 0's slot table
@@ -117,11 +123,16 @@ OPS = (
     "Log",
     "MaxPool",
     "ReduceMean",
+    "Neg",
 )
-CALIBRATED = ("ReduceSum", "Sqrt", "Softmax", "Log", "MaxPool", "ReduceMean")
+CALIBRATED = ("ReduceSum", "Sqrt", "Softmax", "Log", "MaxPool", "ReduceMean", "Neg")
 LOG_TABLE_BASE = 0x1050
 LOG_TABLE_RECORDS = 129  # 258 u16 entries
 CALIBRATION_FREE = ("GreaterCast", "LessCast")
+# Neg [1,1] compiles to one of two programs depending on the scale alone
+# (zero points 0..255 on both sides): float32 s < 1/64 gives the small program,
+# s >= 1/64 the large one (0.01562 small, 0.015625 and 0.01563 large).
+NEG_PROGRAM_SCALE = 2.0**-6
 
 
 def _f32(x: float) -> float:
@@ -154,6 +165,10 @@ def lane_values(
         if not reduce_count:
             raise ValueError("ReduceMean needs its reduced element count")
         vals = {"1/s_x": 1.0 / sx, "s_x/(s_y*N)": sx / (sy * reduce_count), "s_y": sy}
+    elif op == "Neg":
+        if _f32(sx) != _f32(sy):
+            raise ValueError("Neg shares one scale between input and output")
+        vals = {"1/s_x": 1.0 / sx, "s_x": sx}
     else:
         raise ValueError(f"{op!r} has no scale lanes")
     return {k: _bits(_f32(v)) for k, v in vals.items()}
@@ -369,6 +384,50 @@ def _retarget_input_zp(words, kinds, old_zx: int, new_zx: int) -> list[bytes]:
     return out
 
 
+NEG_ZP_REGS = (ZP_ACC, 0x1AD0, ZP_IN)
+
+
+def _in_block(words, j: int) -> bool:
+    """Record ``j`` is part of a register-block dump (consecutive registers
+    ``0x10`` apart); Pulsar2 writes those whole, never eliding a record."""
+    r = _reg(words[j])
+    return (j > 0 and _reg(words[j - 1]) == r - 0x10) or (
+        j + 1 < len(words) and _reg(words[j + 1]) == r + 0x10
+    )
+
+
+def _retarget_neg_zps(words, old_zp, new_zp) -> list[bytes]:
+    """Neg's zero-point writes on ``0x1a90``/``0x1ad0``/``0x1b10``.
+
+    Each such record holds ``zp_x``, ``zp_y`` or 0. A write outside a register
+    block is omitted when the register already holds the value (registers start
+    at 0), so the template must be one where no write was omitted: both zero
+    points nonzero and distinct."""
+    zx0, zy0 = int(old_zp["x"]), int(old_zp["y"])
+    if 0 in (zx0, zy0) or zx0 == zy0:
+        raise ValueError("a Neg template needs distinct nonzero zero points")
+    subst = {zx0: int(new_zp["x"]), zy0: int(new_zp["y"]), 0: 0}
+    state = dict.fromkeys(NEG_ZP_REGS, 0)
+    out = []
+    for j, w in enumerate(words):
+        r = _reg(w)
+        if r not in NEG_ZP_REGS or w[0] != 0xA1:
+            out.append(w)
+            continue
+        if _val(w) not in subst:
+            raise ValueError(f"{r:#06x} holds {_val(w)}, not a zero point or 0")
+        v = subst[_val(w)]
+        if _in_block(words, j) or state[r] != v:
+            out.append(_with_val(w, v))
+        state[r] = v
+    return out
+
+
+def neg_program(scale: float) -> str:
+    """Which of Pulsar2's two Neg programs a calibration compiles to."""
+    return "small" if _f32(scale) < NEG_PROGRAM_SCALE else "large"
+
+
 def _zp_in_word(words) -> bytes:
     """A ``0x1b10`` record of the stream's own verb/unit, value to be set."""
     for w in words:
@@ -395,7 +454,14 @@ def retarget(
     old_zp = dict(old_zero_points or {})
     new_zp = dict(new_zero_points or old_zp)
     changed = {k for k in old_zp if int(new_zp.get(k, old_zp[k])) != int(old_zp[k])}
-    movable = {"ReduceSum": {"x", "y"}, "Softmax": {"x"}}.get(op, set())
+    movable = {"ReduceSum": {"x", "y"}, "Softmax": {"x"}, "Neg": {"x", "y"}}.get(
+        op, set()
+    )
+    if op == "Neg":
+        if int(new_zp["y"]) != 255 - int(new_zp["x"]):
+            raise ValueError("Neg's output zero point is 255 - zp_x")
+        if neg_program(old_scales["x"]) != neg_program(new_scales["x"]):
+            raise ValueError("the target scale compiles to the other Neg program")
     if changed - movable:
         raise ValueError(
             f"{op} zero points {sorted(changed - movable)} are fixed by the template"
@@ -416,6 +482,10 @@ def retarget(
             pad = _pad_count(words)
             new = _retarget_reducesum_zps(new[: len(new) - pad], kinds, old_zp, new_zp)
             new = _retarget_packed_zp(new, int(old_zp["x"]), int(new_zp["x"]))
+            new += [bytes(RECORD)] * (-len(new) % PAD_GROUP)
+        elif op == "Neg":
+            pad = _pad_count(words)
+            new = _retarget_neg_zps(new[: len(new) - pad], old_zp, new_zp)
             new += [bytes(RECORD)] * (-len(new) % PAD_GROUP)
         new_raw = b"".join(new)
         if new_raw != raw:
@@ -457,7 +527,14 @@ def emit_model(
     """A compiled model for template ``key`` at the given calibration.
 
     Greater/Less -> Cast takes no calibration: its template is returned as built."""
+    key = equivalent_key(key, index_path) or key
     model, meta = load_template(key, index_path)
+    if meta["op"] == "Neg" and scales:
+        # one template per program; the target scale picks the program
+        want = neg_program(scales["x"])
+        if want != meta["program"]:
+            key = meta["programs"][want]
+            model, meta = load_template(key, index_path)
     if meta["op"] in CALIBRATION_FREE:
         if scales or zero_points:
             raise ValueError(f"{meta['op']} is not quantized; no calibration")
@@ -473,6 +550,21 @@ def emit_model(
         meta.get("reduce_count"),
     )
     return model
+
+
+# ReduceSum nodes Pulsar2 cannot tile ("Can not tile", also inside the step's
+# own Reshape -> ReduceSum -> Reshape chain) whose reduction, over the same
+# contiguous bytes with different shape labels, does compile: [16,1,64,12544]
+# over axes (0,3) is [16,64,112,112] over axes (0,2,3), output [1,64] == [64].
+REDUCESUM_EQUIVALENTS = {
+    "ReduceSum:16x1x64x12544:axes0,3:k0": "ReduceSum:16x64x112x112:axes0,2,3:k0",
+}
+
+
+def equivalent_key(key: str, index_path: str = TEMPLATE_INDEX) -> str | None:
+    """The validated template that computes ``key`` on the same bytes, else ``None``."""
+    alt = REDUCESUM_EQUIVALENTS.get(key)
+    return alt if alt is not None and alt in load_index(index_path) else None
 
 
 def normalized_records(mc: bytes) -> list[list[bytes]]:
@@ -493,6 +585,7 @@ STEP_OPS = (
     "Log",
     "MaxPool",
     "ReduceMean",
+    "Neg",
 )
 
 
@@ -530,7 +623,7 @@ def step_node_keys(onnx_path: str) -> list[tuple[str, str]]:
                 axes = numpy_helper.to_array(src).ravel().tolist()
             axes = sorted(int(a) % len(shape) for a in axes or range(len(shape)))
             keys.append((op, template_key(op, shape, axes, attrs.get("keepdims", 1))))
-        elif op in ("Sqrt", "Log"):
+        elif op in ("Sqrt", "Log", "Neg"):
             keys.append((op, template_key(op, shape)))
         elif op == "Softmax":
             axis = int(attrs.get("axis", -1)) % len(shape)
@@ -588,7 +681,7 @@ def coverage(onnx_path: str, index_path: str = TEMPLATE_INDEX) -> dict:
     for op, key in step_node_keys(onnx_path):
         r = res.setdefault(op, {"nodes": 0, "covered": 0, "missing": {}})
         r["nodes"] += 1
-        if key in index:
+        if key in index or equivalent_key(key, index_path):
             r["covered"] += 1
         else:
             r["missing"][key] = r["missing"].get(key, 0) + 1

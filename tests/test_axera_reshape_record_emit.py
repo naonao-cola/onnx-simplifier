@@ -177,3 +177,15 @@ def test_emit_step_reshape_and_unknown_shape(tmp_path):
     assert _same_program(rre.mcode_of(m), b) and out.exists()
     with pytest.raises(ValueError, match="no validated step Reshape template"):
         rre.step_template([3, 5], [15])
+
+
+@pytest.mark.parametrize("key", sorted(_STEP_MANIFEST.get("squeeze_builds", {})))
+def test_squeeze_compiles_to_the_reshape_step_template(key):
+    # a standalone Squeeze trips Pulsar2's scheduler, but Squeeze -> Relu
+    # compiles to exactly the Reshape -> Relu program at the same calibration,
+    # so the step's Squeeze node takes the Reshape step template
+    si, so = ([int(x) for x in s.split("x")] for s in key.split("->"))
+    squeeze = _mcode(
+        os.path.join(rre.STEP_TEMPLATE_DIR, _STEP_MANIFEST["squeeze_builds"][key])
+    )
+    assert _same_program(_mcode(rre.step_template(si, so)["axmodel"]), squeeze)
