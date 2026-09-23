@@ -29,9 +29,12 @@ from tinygrad import Tensor, dtypes
 from tinygrad.helpers import Context
 from tinygrad.renderer.cstyle import ClangRenderer
 
-SHAPES = {"up": (576, 1536), "down": (1536, 576), "qo": (576, 576), "kv": (576, 192)}
+SHAPES = {"up": (576, 1536), "down": (1536, 576), "qo": (576, 576), "kv": (576, 192),
+          # one / four 32-column blocks of the packed layout: the whole-model decode (decode_impl.c) calls these per
+          # block range, so one kernel per K serves every Linear of that K and any split across HVX threads
+          "b576": (576, 32), "b1536": (1536, 32), "b576x4": (576, 128), "b1536x4": (1536, 128)}
 # row-major variants (tc, int32) only for up/down: they are the slow bytewise-gather path, kept as the before/after reference
-PACKED_ONLY = {"qo", "kv"}
+PACKED_ONLY = {"qo", "kv", "b576", "b1536", "b576x4", "b1536x4"}
 
 captured: list[str] = []
 _orig = ClangRenderer.render

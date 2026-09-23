@@ -1,0 +1,9 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+interface decode_rpc : remote_handle64 {
+  AEEResult alloc(in int32 wbytes, in int32 fbytes);
+  AEEResult load(in int32 part, in int32 offset, in sequence<octet> data);
+  AEEResult setup(in int32 a16, in int32 nthreads, in int32 blk4, in int32 vec, in int32 turbo, rout int32 rc);
+  AEEResult step(in int32 pos, in sequence<float> emb, rout sequence<float> logits, rout uint64 dsp_us,
+                 rout uint64 gemv_us, rout sequence<uint64> prof);
+};
