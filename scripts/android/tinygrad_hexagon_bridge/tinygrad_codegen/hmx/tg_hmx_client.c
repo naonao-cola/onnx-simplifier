@@ -1,5 +1,5 @@
 /* Phone client for tg_hmx_rpc: random fp16 A (MxK), B (KxN), runs the tinygrad-generated HMX kernel and checks it bit
- * for bit against the TensorCore's rounding model (fp16 accumulator, each 32-wide K block added exactly, rounded once).
+ * for bit against the rounding model of the accumulator-resident codegen: exact accumulation over all of K, rounded once.
  *   tg_hmx_client <uri> M K N [iters] */
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,10 +19,9 @@ int main(int argc, char** argv) {
   srand(1);
   for (int i = 0; i < M * K; i++) a[i] = f2h((rand() % 2001 - 1000) / 2000.0);
   for (int i = 0; i < K * N; i++) b[i] = f2h((rand() % 2001 - 1000) / 2000.0);
-  for (int m = 0; m < M; m++) for (int n = 0; n < N; n++) {
-    unsigned short acc = 0;
-    for (int k0 = 0; k0 < K; k0 += 32) { double s = h2f(acc); for (int k = k0; k < k0 + 32; k++) s += (double)h2f(a[m * K + k]) * h2f(b[k * N + n]); acc = f2h(s); }
-    r[m * N + n] = acc;
+  for (int m = 0; m < M; m++) for (int n = 0; n < N; n++) {  /* exact accumulation, one rounding (accumulator kept in HMX) */
+    double s = 0; for (int k = 0; k < K; k++) s += (double)h2f(a[m * K + k]) * h2f(b[k * N + n]);
+    r[m * N + n] = f2h(s);
   }
   unsigned long long t[4]; int codes[8];
   rc = tg_hmx_rpc_run(h, 1, a, M * K, b, K * N, c, M * N, t, 4, codes, 8);  /* warm-up + correctness */

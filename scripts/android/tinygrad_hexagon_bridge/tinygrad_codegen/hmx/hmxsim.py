@@ -15,27 +15,28 @@ import os, sys, re, subprocess, tempfile, pathlib
 import numpy as np
 from tinygrad import Tensor, dtypes
 from tinygrad.helpers import to_mv
-from tinygrad.renderer.cstyle import ClangRenderer
 from tinygrad.runtime import ops_dsp
 
 TOOLS = pathlib.Path(os.environ.get("HEXAGON_TOOLS", os.path.expanduser("~/.cache/hexagon-oa-19/Tools")))
 
 _src: list[str] = []
-_orig_render = ClangRenderer.render
+_orig_render = ops_dsp.DSPRenderer.render
 def _cap_render(self, uops):
   s = _orig_render(self, uops); _src.append(s); return s
-ClangRenderer.render = _cap_render
+ops_dsp.DSPRenderer.render = _cap_render
 _calls: list[tuple[str, list[bytes]]] = []
 _orig_init, _orig_call = ops_dsp.MockDSPProgram.__init__, ops_dsp.MockDSPProgram.__call__
 def _cap_init(self, dev, obj): _orig_init(self, dev, obj); self._src = _src[-1]
 def _cap_call(self, *bufs, vals=(), **kw):
-  if "WMMA" in self._src and not os.environ.get("HMXSIM_RUN_REF"):
+  if ("WMMA" in self._src or "__hmx_" in self._src) and not os.environ.get("HMXSIM_RUN_REF"):
     _calls.append((self._src, [bytes(to_mv(b.va_addr, b.size)) for b in bufs])); return 0.0
   return _orig_call(self, *bufs, vals=vals, **kw)
 ops_dsp.MockDSPProgram.__init__, ops_dsp.MockDSPProgram.__call__ = _cap_init, _cap_call
 
 def model(A:np.ndarray, B:np.ndarray) -> np.ndarray:
-  acc = np.zeros((A.shape[0], B.shape[1]), np.float16)
+  if os.environ.get("HMX_ACC", "1") != "0":  # accumulator kept in HMX across K: exact accumulation, one rounding per tile
+    return (A.astype(np.float64) @ B.astype(np.float64)).astype(np.float16)
+  acc = np.zeros((A.shape[0], B.shape[1]), np.float16)  # HMX_ACC=0: one tile op per K block, rounded each time
   for k0 in range(0, A.shape[1], 32):
     acc = (acc.astype(np.float64) + A[:, k0:k0+32].astype(np.float64) @ B[k0:k0+32].astype(np.float64)).astype(np.float16)
   return acc

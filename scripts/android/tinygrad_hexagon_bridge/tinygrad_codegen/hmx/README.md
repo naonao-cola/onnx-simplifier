@@ -23,33 +23,36 @@ All bit-exact (0 mismatches) against that model:
 
 | where | shapes |
 |---|---|
-| qemu, `HMX_REF` | 32^3, 64^3, 32x128x64 |
+| qemu, `HMX_REF` | 32^3, 64^3, 32x128x64, 32x2048x32 |
 | hexagon-sim `-mv69 --mhmx 1`, real data (`hmxsim.py`) | 64^3, 32x2048x32 (split load pairs), 128x576x1536 |
-| Xiaomi 12S (SM8475), turbo, `tg_hmx_client` | 64^3, 128x576x1536; `hmx_probe/run.sh health` clean after every run |
+| Xiaomi 12S (SM8475), turbo, `tg_hmx_client` | 128x576x1536; `hmx_probe/run.sh health` clean after every run |
 
-Speed, fp16 128x576x1536 (the SmolLM2 prefill projection shape), same phone session:
+The rounding model: **exact accumulation over all of K, one rounding to fp16 per output tile** (the accumulator stays in
+HMX across the reduce loop, as in `hmx_gemm/hmx_block.h`). `HMX_ACC=0` renders the earlier plain tile op instead (one
+`D = rne_fp16(C + A.B)` per K block, rounded each time); `hmxsim.py` and the tests follow the same switch.
 
-| kernel | us/call | TMAC/s |
-|---|---:|---:|
-| tinygrad-generated (this) | 17574 | 0.006 |
-| hand `hmx_gemm`, DDR-fed (mode 0) | 170 | 0.665 |
-| hand `hmx_gemm`, VTCM-resident (mode 1) | 39.4 | 2.874 |
+Speed, fp16 128x576x1536 (the SmolLM2 prefill projection shape), phone:
 
-64^3: 26.4 us/call on the phone; 7.8 MAC/cycle on hexagon-sim (128x576x1536: 5.9).
+| kernel | us/call | TMAC/s | % of hand DDR-fed |
+|---|---:|---:|---:|
+| tinygrad, plain tile op (#1937's first version) | 17574 | 0.006 | 1% |
+| **tinygrad, accumulator in HMX + HVX row packing** | **2467** | **0.046** | 7% |
+| hand `hmx_gemm`, DDR-fed (mode 0) | 170 | 0.665 | 100% |
+| hand `hmx_gemm`, VTCM-resident (mode 1) | 39.4 | 2.874 | |
 
-**Where the time goes.** hexagon-sim, 64^3, variants of the captured kernel: copying the tiles in and out without the HMX
-instructions costs the same as the full op (~4.2k cycles per 32x32x32 op), so the HMX work itself is negligible. The cost is
-tinygrad's value-semantics fragments: each 2 KB tile is built from 64-byte row pieces on the stack (~1k `valign`/shuffles),
-then copied into VTCM, and the output tile comes back the same way -- about 1 byte/cycle where HVX moves 128.
+hexagon-sim, same code: 64^3 4318 Pcycles (60.7 MAC/cycle, was ~34k), 128x576x1536 2.16M Pcycles (52.4 MAC/cycle, was 5.9).
 
-**What closing the gap needs** (tinygrad-side, not done here):
-1. tinygrad local buffers (`DEFINE_LOCAL`) mapped to VTCM on the DSP, so tiles are staged there directly by HVX loads and the
-   op takes pointers, not 2 KB values;
-2. the accumulator kept in HMX across the reduce loop (one store per output tile, not a C round trip per K block) -- which also
-   gives the hand kernel's single rounding;
-3. prepacked weight layouts the TC can match: reading `Bp` (weights stored in tile layout) through a permuted view currently
-   splits the matmul into three kernels and the reduce falls back to scalar;
-4. then the hand kernel's DMA/double-buffered weight streaming (see `hmx_gemm/README.md`).
+**What the renderer does now** (`_hmx_acc_rewrite` in tinygrad's `ops_dsp.py`, on the linearized kernel):
+1. `__hmx_begin()` before the reduce loop (bias table, clear state).
+2. Each K block: every row pair of A and B is packed straight from the row pointers into VTCM -- an aligned 128-byte `vmem`
+   (rows are 64-byte aligned, so it never leaves the row's 128-byte block), `vror`, one halfword `vshuff`, one store -- then
+   one load pair. tinygrad's 1024-lane operand values, its row loads and the accumulator loads are dropped.
+3. After the loop: one `:after.hf` store; the accumulator array is filled from the output tile with vector shuffles.
+
+**What's left** (the remaining ~15x to the hand kernel): A is re-packed for every output column tile and B for every row
+tile (the loop nest is tile-outer, K-inner, and HMX has one accumulator); the hand kernel packs A once and streams weights.
+Next: cache packed A tiles in VTCM across the N loop, take weights prepacked in tile layout, then the hand kernel's DMA /
+double-buffered weight streaming (see `hmx_gemm/README.md`).
 
 ## Files
 
