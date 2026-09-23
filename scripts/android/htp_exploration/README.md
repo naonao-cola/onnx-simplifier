@@ -139,6 +139,35 @@ Accuracy is in the same band as the TVM int8 pipeline (FPN max abs err 1.03 vs h
 `cats.jpg` all 3 detections match the all-ORT pipeline (box IoU 0.986, mask IoU 0.982). Graph
 compile costs ~6 s per process; an EP-context model cuts session creation to ~440 ms.
 
+## Result: `rest.onnx`'s heads on the HTP, the rest on the CPU (`rest_htp_findings.md`)
+
+The other half of the model (`rest.onnx`, 2405 nodes, 300 ms/image on the phone's CPU):
+
+- **Whole graph with CPU fallback: the wrong way.** Only 6 small partitions (static per-level RPN
+  arithmetic) go to the HTP; every head node is rejected with `Cannot get shape` (the RoI count
+  is dynamic inside the graph). It runs slower than CPU only (364 vs 284 ms) and perturbs the
+  proposals (box IoU 0.913 on `cats.jpg`).
+- **The heads cut out and pinned to a static batch run entirely on the HTP** (strict mode), fp32
+  `ConvTranspose` included: mask head 4.4 ms vs 79.9 ms on 4 CPU cores (18x, 32-RoI bucket); box
+  head 27.6 ms vs 36.3 ms (1.3x, opt mode 3 + burst). The split is bit-exact on the host, and end
+  to end (HTP backbone + HTP heads + CPU dynamic ops) all 3 `cats.jpg` detections match the
+  all-ORT pipeline (box IoU 0.986, mask IoU 0.980). RoiAlign is accepted by QNN too but is 2.4x
+  slower than the CPU as its own graph (it re-uploads the 55.7 MB feature map every call).
+- **The biggest CPU cost was a scatter**: 36% of `rest.onnx` is the RoiAlign level merge, an
+  element-wise `ScatterElements` over a fully broadcast index tensor. Rewriting it to a row
+  `ScatterND` (`qnn_shell/scatter_rewrite.py`) is bit-exact and cuts `rest.onnx` from 300.6 to
+  187.4 ms on the phone's CPU, no HTP involved.
+
+| Per image on the phone (4 CPU threads) | total |
+|---|---:|
+| backbone on HTP + `rest.onnx` on CPU (above) | ~358 ms |
+| + ScatterND rewrite | ~244 ms |
+| + box and mask heads on HTP | **~191 ms** (sum of measured pieces) |
+| + HVX NMS/decode/TopK/RoiAlign kernels (projection) | ~170 ms |
+
+EP-context caveat: the box head's EP-context model runs ~2x slower than the JIT-compiled one
+(52-55 vs 27-40 ms); not root-caused.
+
 ## Files
 
 - `make_tiny_qdq_conv.py` -- builds the minimal QDQ int8 conv model used to
@@ -152,3 +181,12 @@ compile costs ~6 s per process; an EP-context model cuts session creation to ~44
   ORT), `detect_compare.py` (detection-level through `rest.onnx`),
   `make_tiny_qdq_conv_f32io.py` (smoke-test model). See `qnn_shell_findings.md`.
 - `qnn_shell_findings.md` -- the working HTP path and its measurements.
+- `qnn_shell/qnn_run_multi.cpp`, `qnn_shell/run_multi.sh` -- multi-input variant of the harness
+  (manifest of `name dtype file shape`, int64 inputs, median timing, optional ORT profiling).
+- `qnn_shell/rest_split.py` -- cuts `rest.onnx` into the static box/mask heads (for the HTP) and
+  three dynamic CPU pieces, and stitches them back together with the heads on host ORT or on
+  the phone's HTP.
+- `qnn_shell/scatter_rewrite.py` -- rewrites the RoiAlign level merge from `ScatterElements`
+  over a broadcast index to `ScatterND` (bit-exact, 1.6x on `rest.onnx` on the phone's CPU).
+- `rest_htp_findings.md` -- `rest.onnx` on the HTP: partitioning, the heads, the scatter, and the
+  per-image pipeline.
