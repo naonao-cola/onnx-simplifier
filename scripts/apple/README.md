@@ -80,6 +80,84 @@ downloads. Real models can be layered on by passing an on-disk path as
 `worker.py`'s second argument, the same way `scripts/qualcomm` and
 `scripts/regression` do.
 
+## General staged ONNX deployment benchmark
+
+`benchmark_onnx_pipeline.py` benchmarks staged ONNX deployments without
+assuming a particular task or model family. A JSON manifest names each graph,
+optional NPZ input feeds, and tensor connections between stages. This covers
+pipelines such as backbone/head, encoder/decoder, and detector/preprocessor
+graphs while leaving image transforms and task-specific input construction in
+the calling application. Unspecified feeds use deterministic values for
+static-shape smoke benchmarks; provide NPZ files for representative inputs.
+
+For example, save `image.npz` and `head_inputs.npz` with NumPy and create
+`pipeline.json`:
+
+```json
+{
+  "name": "detector",
+  "stages": [
+    {"name": "backbone", "model": "backbone.onnx", "feeds": "image.npz"},
+    {"name": "head", "model": "head.onnx", "feeds": "head_inputs.npz"}
+  ],
+  "connections": [
+    {"from": ["backbone", "features"], "to": ["head", "features"]}
+  ],
+  "backends": {"backbone": "coreml", "head": "tinygrad_metal_jit"}
+}
+```
+
+Run it on macOS with:
+
+```bash
+python scripts/apple/benchmark_onnx_pipeline.py pipeline.json \
+  --output detector-m4.json --compute-units ALL \
+  --compute-precision FLOAT32 --repeats 8
+```
+
+Each stage is reported against ONNX Runtime CPU for Core ML, eager tinygrad
+Metal, and tinygrad Metal JIT. The selected per-stage backends are then timed
+end to end, including tensor handoffs. The existing SAM-specific runner below
+adds SAM image resizing and prompt setup on top of this backend comparison.
+
+## SAM Core ML + tinygrad Metal hybrid benchmark
+
+`benchmark_sam_hybrid.py` measures Core ML and tinygrad Metal on the two
+existing SAM pieces (image encoder and prompt decoder). tinygrad's eager
+`OnnxRunner` launches a Metal kernel for each op; the benchmark also measures
+`TinyJit` replay, which captures the graph and avoids that per-op launch cost.
+Each stage and the end-to-end Core ML-encoder/Metal-decoder path are compared
+against the ONNX Runtime CPU result. The Core ML input adapter exposes the SAM
+raw-pixel uint8 tensor as float32 because Core ML has no uint8 model input.
+
+First export the models as described in
+[`scripts/android/vision_models/sam/README.md`](../android/vision_models/sam/README.md),
+then run on macOS:
+
+```bash
+python scripts/apple/benchmark_sam_hybrid.py "$SAM_WORK/edgesam" \
+  --image /path/to/image.jpg --compute-units ALL --compute-precision FLOAT32 \
+  --output edgesam-m4.json --repeats 8
+```
+
+On an M4 Mac mini, with 8 measured runs after 3 warm-ups, the following
+medians include both model predictions and the encoder-to-decoder handoff.
+The reference is a single sample image and center-point prompt; see
+[`bench/RESULTS_m4_sam_hybrid.md`](../../bench/RESULTS_m4_sam_hybrid.md)
+for the full results and accuracy limits.
+
+| model | input | Core ML → Core ML | Core ML → Metal JIT | Hexagon HTP reference |
+| --- | ---: | ---: | ---: | ---: |
+| EdgeSAM | 1024² | 32.0 ms | 39.5 ms | 92.2 ms |
+| MobileSAM | 1024² | 66.6 ms | 67.5 ms | 330.7 ms |
+| EfficientViT-SAM-L0 | 512² | 30.8 ms | 36.7 ms | 52.8 ms |
+
+`Core ML → Metal JIT` keeps the heavier image encoder on Core ML and runs the
+prompt decoder through tinygrad's captured Metal graph. All results above use
+full-precision Core ML compute; default Core ML precision was faster for
+EdgeSAM (11.7 ms for both stages) but gave 0.86 thresholded mask IoU on the
+sample, so it is not included in the deployment comparison.
+
 ## LLM decode benchmark (`export_llm_to_coreml.py` / `run_llm_decode_benchmark.py`)
 
 A separate pair of tools for a different question than the compatibility

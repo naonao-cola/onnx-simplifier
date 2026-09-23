@@ -369,6 +369,101 @@ for _onnx_op, _mil_op in [
     _OP_HANDLERS[_onnx_op] = _simple_binary(_mil_op)
 
 
+@_register("Not")
+def _lower_not(lowerer, node, ins, attrs):
+    return [lowerer.mb.logical_not(x=ins[0], name=lowerer.fresh_name(node))]
+
+
+@_register("Resize")
+def _lower_resize(lowerer, node, ins, attrs):
+    """Lower static 2-D ONNX Resize ops used by CNN feature pyramids."""
+    if len(ins) < 3 or ins[2] is None or ins[2].val is None:
+        raise RuntimeError(
+            "Resize requires constant scales; dynamic sizes are not supported"
+        )
+    if len(ins[0].shape) != 4:
+        raise RuntimeError(
+            f"Resize expects NCHW rank 4 input, got rank {len(ins[0].shape)}"
+        )
+    mode = attrs.get("mode", b"nearest")
+    if isinstance(mode, bytes):
+        mode = mode.decode()
+    if mode != "linear":
+        raise RuntimeError(f"Resize mode {mode!r} is not supported")
+    coordinate_mode = attrs.get("coordinate_transformation_mode", b"half_pixel")
+    if isinstance(coordinate_mode, bytes):
+        coordinate_mode = coordinate_mode.decode()
+    sampling_modes = {
+        "half_pixel": "UNALIGN_CORNERS",
+        "align_corners": "ALIGN_CORNERS",
+    }
+    if coordinate_mode not in sampling_modes:
+        raise RuntimeError(
+            f"Resize coordinate_transformation_mode {coordinate_mode!r} is not supported"
+        )
+    scales = np.asarray(ins[2].val).reshape(-1)
+    if scales.size != 4 or not np.all(scales[:2] == 1):
+        raise RuntimeError(
+            f"Resize only supports N/C scale 1, got scales {scales.tolist()}"
+        )
+    height, width = ins[0].shape[-2:]
+    if not all(isinstance(d, (int, np.integer)) for d in (height, width)):
+        raise RuntimeError("Resize requires static spatial dimensions")
+    target_height = int(round(int(height) * float(scales[-2])))
+    target_width = int(round(int(width) * float(scales[-1])))
+    return [
+        lowerer.mb.resize_bilinear(
+            x=ins[0],
+            target_size_height=target_height,
+            target_size_width=target_width,
+            sampling_mode=sampling_modes[coordinate_mode],
+            name=lowerer.fresh_name(node),
+        )
+    ]
+
+
+@_register("DepthToSpace")
+def _lower_depth_to_space(lowerer, node, ins, attrs):
+    """Lower ONNX NCHW DepthToSpace as a reshape and axis permutation."""
+    shape = ins[0].shape
+    if len(shape) != 4 or not all(isinstance(d, (int, np.integer)) for d in shape):
+        raise RuntimeError("DepthToSpace requires a static rank-4 input")
+    n, channels, height, width = (int(d) for d in shape)
+    block = int(attrs.get("blocksize", 0))
+    if block <= 0 or channels % (block * block):
+        raise RuntimeError(f"invalid DepthToSpace blocksize {block} for shape {shape}")
+    out_channels = channels // (block * block)
+    mode = attrs.get("mode", b"DCR")
+    if isinstance(mode, bytes):
+        mode = mode.decode()
+    if mode == "DCR":
+        reshaped = lowerer.mb.reshape(
+            x=ins[0],
+            shape=[n, block, block, out_channels, height, width],
+            name=lowerer.fresh_name(node, "reshape"),
+        )
+        perm = [0, 3, 4, 1, 5, 2]
+    elif mode == "CRD":
+        reshaped = lowerer.mb.reshape(
+            x=ins[0],
+            shape=[n, out_channels, block, block, height, width],
+            name=lowerer.fresh_name(node, "reshape"),
+        )
+        perm = [0, 1, 4, 2, 5, 3]
+    else:
+        raise RuntimeError(f"DepthToSpace mode {mode!r} is not supported")
+    transposed = lowerer.mb.transpose(
+        x=reshaped, perm=perm, name=lowerer.fresh_name(node, "transpose")
+    )
+    return [
+        lowerer.mb.reshape(
+            x=transposed,
+            shape=[n, out_channels, height * block, width * block],
+            name=lowerer.fresh_name(node),
+        )
+    ]
+
+
 def _mil_dim_equal(da, db) -> bool:
     """Whether two MIL shape dims are provably the same extent."""
     if isinstance(da, (int, np.integer)) and isinstance(db, (int, np.integer)):
