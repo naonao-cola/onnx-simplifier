@@ -9,14 +9,17 @@ enc_run's latency breakdown.
 
 usage: e2e_msda.py --ckpt <pth> --data <nuscenes-mini> --work <work> [--scene scene-0103] [--frames 6]
        [--backbone backbone6.q8] [--decoder decoder.sim] [--reps 10]
-needs on the phone (R, default /data/local/tmp/bevformer_tiny): ../run_phone.sh's ORT/QNN setup and the
-backbone/decoder pieces; this script pushes enc_run, msda_rpc.so (build.sh OUT) and the split pieces
-(split.py export).
+Everything goes to a phone directory of its own (R, default /data/local/tmp/codex-android-bevformer-msda-hvx):
+this script pushes the ORT/QNN libs (../../../htp_exploration/qnn_shell/libs), build.sh's enc_run,
+qnn_run_multi and msda_rpc.so, the split pieces (split.py export) and the backbone/decoder pieces
+(export.py / quantize.py). Every adb call goes through the host's phone lock when PHONE_RUN is set
+(e.g. PHONE_RUN=~/.cache/android-phone/phone-run PHONE_LOCK_OWNER=<branch>).
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -33,13 +36,26 @@ import split as S  # noqa: E402
 from nuscenes import NuScenesMini, match, temporal_can_bus  # noqa: E402
 
 PIECES = ["pre", "mid0", "post0", "mid1", "post1", "mid2", "post2"]
+QNN_LIBS = HERE.parents[2] / "htp_exploration" / "qnn_shell" / "libs"
+E.R = os.environ.get("R", "/data/local/tmp/codex-android-bevformer-msda-hvx")
+if os.environ.get("PHONE_RUN"):
+    E.ADB = [os.environ["PHONE_RUN"], *E.ADB]
 
 
-def push_runtime(work: Path, build: Path):
+def push_runtime(work: Path, build: Path, pieces):
     R = E.R
     subprocess.run([*E.ADB, "shell", f"mkdir -p {R}/msda_split"], check=True)
-    for f in ("enc_run", "msda_rpc.so"):
+    for f in ("enc_run", "qnn_run_multi", "msda_rpc.so"):
         subprocess.run([*E.ADB, "push", "-q", str(build / f), f"{R}/{f}"], check=True)
+    subprocess.run(
+        [*E.ADB, "push", "-q", *[str(f) for f in sorted(QNN_LIBS.iterdir())], f"{R}/"],
+        check=True,
+    )
+    for p in pieces:
+        subprocess.run(
+            [*E.ADB, "push", "-q", str(work / f"{p}.onnx"), f"{R}/{p}.onnx"], check=True
+        )
+    subprocess.run([*E.ADB, "shell", f"chmod 755 {R}/qnn_run_multi"], check=True)
     for p in PIECES:
         subprocess.run(
             [
@@ -107,7 +123,7 @@ def main():
     a = ap.parse_args()
     torch.set_grad_enabled(False)
     work = Path(a.work)
-    push_runtime(work, Path(a.build))
+    push_runtime(work, Path(a.build), [a.backbone, a.decoder])
     bb, enc, dec = M.load_official(a.ckpt)
     ns = NuScenesMini(a.data)
     prev = {"cpu": None, "htp": None}

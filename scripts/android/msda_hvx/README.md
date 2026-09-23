@@ -145,5 +145,29 @@ hexagon-sim, all four kinds, HVX body: rel <= 1.5e-5, cos 1.000000000.
 
 ## Phone (Xiaomi 12S, SM8475 / V69)
 
-Measured under the host's phone lock, median of 10, 4 threads. See the table below (and
-`../vision_models/bevformer_tiny/README.md` for BEVFormer in context).
+Median of 10 under the host's phone lock. "DSP" is the kernel's time on the DSP (HAP timer);
+"wall" also includes the FastRPC call. Jobs are 32 queries unless noted. All match torch at
+rel <= 1.5e-5, cos 1.000000000.
+
+| call | shape | 1 thread | 4 threads (DSP / wall) |
+|---|---|---|---|
+| RT-DETR-r18 decoder cross-attention (synthetic) | Q 300, M 8, L 3 (80², 40², 20²), P 4, D 32, box refs | 4.07 / 4.47 | 1.34 / 1.83 (16-query jobs: 1.20 / 1.62) |
+| BEVFormer-tiny TSA (real frame) | Q 2500, 2 maps 50x50, per-map offsets, P 4 | 17.9 / 18.5 | 4.41 / 4.82 |
+| BEVFormer-tiny SCA (real frame) | Q 2500, 6 cameras 15x25, shared offsets, R 4, P 8, 19% visible | 14.1 / 14.6 | 3.98 / 4.42 |
+
+The 6-thread results are within noise of 4. What made the HVX body fast, in hexagon-sim cycles
+per point (single thread), from a first scalar version at 168 cycles:
+- **No `%` in the point loop.** `p % R` is a libcall on Hexagon, and the call spilled the HVX
+  accumulator to the stack and back on every point.
+- **The per-point coordinate and weight math runs 32 points per vector.** As scalar code it was
+  117 of the 168 cycles per point: a serial chain of dependent float ops.
+- **Per-lane constants are hoisted out of the per-query work:** level sizes, starts, map bases
+  and scales.
+- **The multiply-accumulate reads tap lists with 4 independent accumulators**, pipelined one
+  item ahead.
+
+What didn't help:
+- a head-major work order;
+- a TURBO clock vote;
+- more than 4 threads;
+- specializing `M = 8` at compile time.

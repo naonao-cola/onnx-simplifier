@@ -1,5 +1,6 @@
 // BEVFormer-tiny's 3-layer encoder on the phone, split (split.py): 7 fp16 HTP pieces (ORT + QNN EP,
-// strict all-HTP) and 6 deformable-sampling calls on the CDSP's HVX (msda skel), chained in-process:
+// strict all-HTP) and 6 deformable-sampling calls to the generic HVX MSDA skel
+// (../../../msda_hvx/), chained in-process:
 //
 //   pre -> [tsa] -> mid0 -> [sca] -> post0 -> [tsa] -> mid1 -> [sca] -> post1 -> [tsa] -> mid2 -> [sca] -> post2
 //
@@ -29,6 +30,7 @@
 
 extern "C" {
 #include "msda_rpc.h"
+#include "msda_shape.h"
 #include "remote.h"
 #include "rpcmem.h"
 }
@@ -135,19 +137,28 @@ static void run(Piece& P, const std::map<std::string, std::string>& alias = {}) 
 static remote_handle64 h_msda = 0;
 static unsigned long long last_dsp_us = 0;
 
+// One TSA / SCA call: one level (H, W), 8 heads x 32, P points, ref points + pixel offsets (mode
+// MSDA_REF_PIX), point p on ref entry p % R, NV value maps averaged over the visible ones.
 static void msda(const std::string& value, size_t value_off_floats, const std::string& ref, const std::string& off,
                  const std::string& attw, const std::string& vis, int NV, int H, int W, int R, int NO, int P,
                  const std::string& out) {
   const int Q = 2500;
   Buf &v = get(value), &r = get(ref), &o = get(off), &a = get(attw), &s = get(vis);
   Buf& y = buf(out, {Q, 256});
-  const long nvalue = (long)NV * H * W * 256;
-  if ((value_off_floats + nvalue) * 4 > v.bytes) throw std::runtime_error("value slice out of range");
+  msda_args_t A;
+  memset(&A, 0, sizeof A);
+  A.NV = NV; A.L = 1; A.H[0] = H; A.W[0] = W; A.start[0] = 0; A.S = H * W; A.M = 8; A.D = 32; A.P = P; A.Q = Q;
+  A.NO = NO; A.mode = MSDA_REF_PIX; A.NVR = NV; A.RL = 1; A.R = R; A.RD = 2; A.vis = (const uint8_t*)s.p;
+  int32 shape[MSDA_SHAPE_LEN(1)];
+  const int ns = msda_shape_pack(&A, shape);
+  if ((value_off_floats + msda_n_value(&A)) * 4 > v.bytes || msda_n_ref(&A) * 4 != (long)r.bytes ||
+      msda_n_loc(&A) * 4 != (long)o.bytes || msda_n_attw(&A) * 4 != (long)a.bytes || msda_n_vis(&A) != (long)s.bytes)
+    throw std::runtime_error("msda buffer sizes don't match the shape");
   uint64 us = 0;
   int flags = getenv("MSDA_THREADS") ? atoi(getenv("MSDA_THREADS")) : 4;
-  int rc = msda_rpc_run(h_msda, (const float*)v.p + value_off_floats, (int)nvalue, (const float*)r.p, (int)(r.bytes / 4),
-                        (const float*)o.p, (int)(o.bytes / 4), (const float*)a.p, (int)(a.bytes / 4),
-                        (const uint8*)s.p, (int)s.bytes, NV, H, W, Q, R, NO, P, flags, (float*)y.p, Q * 256, &us);
+  int rc = msda_rpc_run(h_msda, (const float*)v.p + value_off_floats, (int)msda_n_value(&A), (const float*)o.p,
+                        (int)msda_n_loc(&A), (const float*)r.p, (int)msda_n_ref(&A), (const float*)a.p, (int)msda_n_attw(&A),
+                        (const uint8*)s.p, (int)msda_n_vis(&A), shape, ns, flags, (float*)y.p, (int)msda_n_out(&A), &us);
   if (rc) throw std::runtime_error("msda_rpc_run rc=" + std::to_string(rc));
   last_dsp_us = us;
 }

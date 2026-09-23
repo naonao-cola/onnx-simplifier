@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""BEVFormer-tiny's encoder split around a fused deformable-sampling kernel (msda_kernel.h).
+"""BEVFormer-tiny's encoder split around the HVX multi-scale deformable attention kernel
+(../../../msda_hvx/, generic; this file is BEVFormer's glue).
 
 The HTP runs every Linear/softmax/LayerNorm/FFN; the DSP runs, per TSA and per SCA, the whole
 "sampling grid -> GridSample -> x attention weight -> sum over points (-> average over cameras)"
 span as one call, `msda_fused` below. That span is 73% of an fp16 encoder layer on the HTP
 (GridSample 56%, Mul + ReduceSum 17%; ../README.md "Encoder: exact rewrite first").
 
-msda_fused(value, hw, ref, off, attw, vis) -> (Q, 256), the kernel's contract:
+msda_fused(value, hw, ref, off, attw, vis) -> (Q, 256), the kernel's contract in BEVFormer's terms
+(one level, mode "pix" of ../../../msda_hvx/msda_ref.py's msda_reference):
   value (NV, H*W, 256)      channels-last value maps (NV = 6 cameras for SCA, 2 queue frames for TSA)
   ref   (NV, Q, R, 2)       reference points in [0, 1] (x, y); point p uses ref[..., p % R, :]
   off   (Q, M, NO, P, 2)    raw sampling_offsets Linear output, in pixels of the value map; NO is
@@ -39,45 +41,36 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import nn
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE.parents[2] / "msda_hvx"))
 import model as M  # noqa: E402
+import msda_ref  # noqa: E402
 
 E, HD, NQ = M.EMBED, M.HEADS, M.NQ
 D = E // HD
 
 
-def msda_fused(value, hw, ref, off, attw, vis=None):
-    """Reference semantics of the DSP kernel (see module docstring), via grid_sample."""
-    h, w = hw
-    nv = value.shape[0]
+def _generic(value, hw, ref, off, attw):
+    """BEVFormer's (off (Q, M, NO, P, 2), attw (Q, M, NO, P), ref (NV, Q, R, 2)) as the generic
+    kernel's one-level layouts."""
     q, m, no, p, _ = off.shape
-    r = ref.shape[2]
-    acc = torch.zeros(q, E, dtype=value.dtype)
-    cnt = torch.zeros(q, 1, dtype=value.dtype)
-    idx = torch.arange(p) % r
-    for c in range(nv):
-        o = off[:, :, c if no > 1 else 0]  # (Q, M, P, 2)
-        a = attw[:, :, c if no > 1 else 0]  # (Q, M, P)
-        loc = ref[c][:, idx][:, None] + o / torch.tensor(
-            [w, h], dtype=off.dtype
-        )  # (Q, M, P, 2)
-        grid = (2 * loc - 1).permute(1, 0, 2, 3)  # (M, Q, P, 2)
-        v = value[c].reshape(h, w, m, D).permute(2, 3, 0, 1)  # (M, D, H, W)
-        s = F.grid_sample(
-            v, grid, mode="bilinear", padding_mode="zeros", align_corners=False
-        )  # (M, D, Q, P)
-        out = (s * a.permute(1, 0, 2)[:, None]).sum(-1).permute(2, 0, 1).reshape(q, E)
-        vc = (
-            torch.ones(q, 1, dtype=value.dtype)
-            if vis is None
-            else vis[c].reshape(q, 1).to(value.dtype)
-        )
-        acc += out * vc
-        cnt += vc
-    return acc / cnt.clamp(min=1.0)
+    nv, _, r, _ = ref.shape
+    return (
+        off.reshape(q, m, no, 1, p, 2),
+        attw.reshape(q, m, no, 1, p),
+        ref.reshape(nv, q, 1, r, 2),
+    )
+
+
+def msda_fused(value, hw, ref, off, attw, vis=None):
+    """Reference semantics of the DSP kernel (see module docstring)."""
+    loc, aw, rf = _generic(value, hw, ref, off, attw)
+    return msda_ref.msda_reference(
+        value, [tuple(hw)], loc, aw, mode="pix", ref=rf, vis=vis
+    )
 
 
 # ---- pieces ----------------------------------------------------------------------------------
@@ -213,28 +206,16 @@ def cmd_check(a):
 
 
 def save_kernel_case(out: Path, name, args, y):
-    """One kernel call's I/O as raw little-endian files + a meta line the C checks read."""
+    """One kernel call's I/O as a msda_hvx case directory (msda_io.h reads it)."""
     value, hw, ref, off, attw, vis = args
-    nv, hwn, e = value.shape
-    q, m, no, p, _ = off.shape
-    r = ref.shape[2]
-    d = out / name
-    d.mkdir(parents=True, exist_ok=True)
-    value.contiguous().numpy().astype(np.float32).tofile(d / "value.f32")
-    ref.contiguous().numpy().astype(np.float32).tofile(d / "ref.f32")
-    off.contiguous().numpy().astype(np.float32).tofile(d / "off.f32")
-    attw.contiguous().numpy().astype(np.float32).tofile(d / "attw.f32")
-    (vis if vis is not None else torch.ones(nv, q, dtype=torch.uint8)).numpy().astype(
-        np.uint8
-    ).tofile(d / "vis.u8")
-    y.contiguous().numpy().astype(np.float32).tofile(d / "ref_out.f32")
-    (d / "meta.txt").write_text(
-        f"{nv} {hw[0]} {hw[1]} {q} {r} {no} {p} {int(vis is not None)}\n"
+    loc, aw, rf = _generic(value, hw, ref, off, attw)
+    msda_ref.save_case(
+        out / name, value, [tuple(hw)], loc, aw, y, mode="pix", ref=rf, vis=vis
     )
+    nv, q = value.shape[0], off.shape[0]
     nvis = int((vis if vis is not None else torch.ones(nv, q)).sum())
     print(
-        f"{name}: NV {nv} H {hw[0]} W {hw[1]} Q {q} R {r} NO {no} P {p}; visible (nv, q) pairs {nvis} "
-        f"of {nv * q}; out |max| {y.abs().max():.3f}"
+        f"{name}: NV {nv} HW {tuple(hw)} Q {q} P {off.shape[3]}; visible (map, query) pairs {nvis} of {nv * q}"
     )
 
 
