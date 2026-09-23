@@ -300,6 +300,22 @@ _PARITY_CASES = {
         ),
         {"x": (1, 2, 6, 6)},
     ),
+    "const_edge_pad_mul": (
+        _model(
+            """
+            g (float[1,3,4,5] x) => (float[1,3,6,8] y)
+            {
+              cp = Constant<value = int64[8] {0, 0, 1, 0, 0, 0, 1, 0}>()
+              cv = Constant<value = float {1.5}>()
+              p = Pad<mode = "constant">(x, cp, cv)
+              ep = Constant<value = int64[8] {0, 0, 0, 2, 0, 0, 0, 1}>()
+              e = Pad<mode = "edge">(p, ep)
+              y = Mul(e, e)
+            }
+            """
+        ),
+        {"x": (1, 3, 4, 5)},
+    ),
     "batched_matmul_argmax": (
         _model(
             """
@@ -320,7 +336,6 @@ _PARITY_CASES = {
 # wrongly there; see rustnn_runtime._Lowering._reject_on_coreml callers).
 _COREML_REJECTED = {
     "clip_greater_where": "Where",
-    "reflect_pad_avgpool_split": "Pad",
     "softmax_layernorm": "LayerNormalization",
     "strided_slice_reduce_mean": "Slice",
 }
