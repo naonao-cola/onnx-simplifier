@@ -1,0 +1,72 @@
+{
+ "misc_op_record_emit/sqrt_512x512x3x3_h1.axmodel.gz": {
+  "scales": {
+   "x": 0.005372548941522837,
+   "y": 0.004590078257024288
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ },
+ "misc_op_record_emit/sqrt_512x512x3x3_h2.axmodel.gz": {
+  "scales": {
+   "x": 0.012156862765550613,
+   "y": 0.006904633715748787
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ },
+ "misc_op_record_emit/sqrt_512x512x3x3_h3.axmodel.gz": {
+  "scales": {
+   "x": 0.0033333334140479565,
+   "y": 0.003615507623180747
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ },
+ "misc_op_record_emit/sqrt_512x512x3x3_t.axmodel.gz": {
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ },
+ "teng_register_census/reducesum_asym.axmodel.gz": {
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.1294105350971222
+  },
+  "zero_points": {
+   "x": 64,
+   "y": 0
+  }
+ },
+ "teng_register_census/reducesum_s1.axmodel.gz": {
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007840676233172417
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  }
+ },
+ "teng_register_census/reducesum_s4.axmodel.gz": {
+  "scales": {
+   "x": 0.0313725508749485,
+   "y": 0.03136270493268967
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  }
+ }
+}
