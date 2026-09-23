@@ -40,8 +40,13 @@ def _data(n=4, shape=(1, 4, 8, 8)):
 
 
 def _run(model, feed):
+    # No graph optimizations: ORT would otherwise fuse DQ -> Gemm/MatMul -> Q into
+    # u8s8 integer kernels, which saturate on x86 CPUs without VNNI (CI runners)
+    # and make the result depend on the host CPU rather than on the quantization.
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     return ort.InferenceSession(
-        model.SerializeToString(), providers=["CPUExecutionProvider"]
+        model.SerializeToString(), so, providers=["CPUExecutionProvider"]
     ).run(None, feed)[0]
 
 
