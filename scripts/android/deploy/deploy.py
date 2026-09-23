@@ -41,7 +41,7 @@ import yaml
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from passes import REWRITES  # noqa: E402
-from lib import images as imglib  # noqa: E402
+from stages import images as imglib  # noqa: E402
 
 STAGES = ["fetch", "simplify", "quantize", "rewrite", "post", "pipe", "partition", "push", "bench", "accuracy"]
 HEAVY = {"simplify", "quantize", "rewrite", "post", "pipe"}  # run in a memory-capped child
@@ -82,7 +82,7 @@ def stamp_of(ctx: Ctx, stage: str) -> str:
     prev = (ctx.work / STAGES[i - 1] / "stamp.json") if i else None
     prev_s = json.loads(prev.read_text())["key"] if prev and prev.exists() else ""
     code = hashlib.sha256()
-    for f in sorted(HERE.glob("*.py")) + sorted(HERE.glob("passes/*.py")) + sorted(HERE.glob("lib/*.py")):
+    for f in sorted(HERE.glob("*.py")) + sorted(HERE.glob("passes/*.py")) + sorted(HERE.glob("stages/*.py")):
         code.update(f.read_bytes())
     if stage in ("push", "bench"):
         for f in sorted((HERE / "runtime").glob("*")):
@@ -200,7 +200,7 @@ def st_rewrite(ctx: Ctx) -> None:
 
 
 def st_post(ctx: Ctx) -> None:
-    from lib import post
+    from stages import post
 
     d = ctx.d("post")
     p = ctx.spec.get("postprocess")
@@ -209,31 +209,31 @@ def st_post(ctx: Ctx) -> None:
 
 
 def st_pipe(ctx: Ctx) -> None:
-    from lib import pipe
+    from stages import pipe
 
     pipe.write(ctx, ctx.d("pipe"))
 
 
 def st_partition(ctx: Ctx) -> None:
-    from lib import device
+    from stages import device
 
     device.partition(ctx, ctx.d("partition"))
 
 
 def st_push(ctx: Ctx) -> None:
-    from lib import device
+    from stages import device
 
     device.push(ctx, ctx.d("push"))
 
 
 def st_bench(ctx: Ctx) -> None:
-    from lib import device
+    from stages import device
 
     device.bench(ctx, ctx.d("bench"))
 
 
 def st_accuracy(ctx: Ctx) -> None:
-    from lib import accuracy
+    from stages import accuracy
 
     accuracy.run(ctx, ctx.d("accuracy"))
 
