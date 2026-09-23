@@ -126,6 +126,30 @@ The 12S has no depth sensor, so the demo needs monocular geometry. Candidates:
 
 MoGe-2 ViT-S is the pick: permissive, small, and it outputs the point map MCC consumes directly.
 
+`depth.py static` makes the official dynamic ONNX static (image 640x480, `num_tokens` 1200 as a
+constant; onnxsim folds the shape math) and fuses its 12 erf-GELU chains into `Gelu` at opset 20
+(QNN has no `Erf`); outputs match the dynamic model to 1.7e-6 (model sha256
+`24eacb5dc7a2c54c7bc98f7de085ffbed79ad006ea5b664c2c2cdc02ff3a52f0`).
+
+| MoGe-2 ViT-S, 640x480, 1200 tokens | phone (strict all-HTP, fp16) | vs host fp32 |
+|---|---|---|
+| points + normals + mask + scale | **257 ms** | points cos 0.999995, mask cos 1.0 |
+
+MoGe-2 vs the demo's iPhone LiDAR cloud (quest2, same pixels, masked object):
+- frames differ: MoGe is the OpenCV camera frame (x right, y down, z forward); the demo cloud is
+  x right, y up, z toward the viewer -> `depth.py` flips y and z. A further **17.5 deg** rotation
+  remains (the demo cloud looks gravity-aligned, ARKit world frame, not camera frame).
+- depth: after the best scale, per-pixel depth error median **6.9%**, p90 17.8% (MoGe's metric
+  scale says ~1.1 m where the iPhone says 0.35 m; MCC normalizes scale away).
+- MCC's reconstruction is sensitive to that: MCC fed MoGe points vs fed iPhone points at
+  granularity 0.1 (p > 0.3): IoU 0.13 / chamfer 0.24 (camera frame), IoU 0.17 / chamfer 0.22
+  after rotating MoGe into the iPhone frame (oracle rotation, diagnostic only). No ground truth
+  here, so this measures disagreement, not which is better; an app has the gravity vector (not
+  the full ARKit pose) to reproduce a gravity-aligned frame.
+
+Phone budget for one photo -> 3D: MoGe 257 ms + MCC encoder 202 ms + ~36 x 64 ms decoder chunks
+~= **2.8 s** at granularity 0.1 (coarse-to-fine).
+
 ## Related work (why not these on the phone)
 
 - **MCC-HO** (hand-held objects, MCC + hand geometry): same decoder cost as MCC plus a hand model;
@@ -145,10 +169,18 @@ MoGe-2 ViT-S is the pick: permissive, small, and it outputs the point map MCC co
 | `validate.py` | split vs upstream forward; fp32 full-grid reference `ref_<demo>_<g>.npz` |
 | `mcc.py` | export (onnxsim, ORT check), phone runs (strict all-HTP via `phone.sh`), scoring |
 | `numcc_ref.py` | NU-MCC upstream inference on the host, same input, cost/accuracy comparison |
+| `depth.py` | MoGe-2 static-shape ONNX (+ erf-GELU -> Gelu), MCC fed MoGe vs iPhone points |
 | `queries.py` | query-reduction strategies scored exactly against the dense references |
 | `phone.sh` | one ONNX piece on the phone (ORT + QNN EP), under the shared phone lock; md5-skips unchanged inputs |
 
 ## Follow-ups
+
+- **Demo-app mode** (photo -> tap (SAM mask) -> MoGe-2 -> MCC -> rotatable colored point cloud):
+  not built here. The pieces and their phone costs are measured above; the app needs a long-lived
+  session per piece (the per-chunk process start in `phone.sh` is a benchmark artifact), the
+  host-side preprocessing (`model.prep` crop/pad/resize, XYZ window partition, coarse-to-fine
+  bookkeeping) in C++, and a gravity-aligned frame from the phone's accelerometer.
+- uint8/int8 decoder and encoder (`onnxsim.full_qdq`, uint8 NHWC image input) -- fp16 only so far.
 
 - The decoder is dense attention + MLP over many queries: a natural target for the HMX GEMM
   work (`codex/android-hmx-gemm`), not used here.
