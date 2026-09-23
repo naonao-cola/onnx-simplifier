@@ -73,6 +73,11 @@ LANE_REGS = frozenset(range(0x0F50, 0x1010, 0x10))
 """Float32 scale lanes: ``1/s`` and ``s`` groups at ``0x0f50..0x0fc0``
 (#1831) and the divisor group at ``0x0fd0..0x1000`` (#1836)."""
 ZERO_POINT_REGS = frozenset(sr.ZERO_POINT_REGS)
+OFFSET_REGS = frozenset(range(0x1EF0, 0x1F30, 0x10))
+"""A fused Add (a live bias) carries the int32 zero-point offset of
+``binary_op_scale_emit.zp_offset`` on these four lanes (#1869)."""
+SHIFT_REG = 0x1EA0
+"""... and its Q-format, ``15 - k``, on this register."""
 FULL_WRITE = 0xA1
 TENG_FLAG = 0xA8
 NOISE_REGS = frozenset({0x02B0, 0x03D0})
@@ -173,7 +178,41 @@ def evaluate(role: Role, scales: Scales) -> int:
         return _bits(-scales[role[1]][1])
     if kind == "zp":
         return int(scales[role[1]][1]) & 0xFFFFFFFF
+    if kind in ("zpoff", "qshift", "q15"):
+        return _bias_add(kind, *role[1:], scales)
     raise ValueError(f"unknown role {role!r}")
+
+
+def _bias_add(kind: str, x: str, z: str, y: str, scales: Scales) -> int:
+    """A fused ``y = Add(x, z)``'s calibration words, as
+    ``binary_op_scale_emit`` decoded them for a standalone Add (#1869), with
+    the Q15 shift ``k`` applied to the offset too:
+
+    * ``q15``: ``npu_params`` header, ``round(s_x/s_y * 2**(15-k))`` and
+      ``round(s_z/s_y * 2**(15-k))`` as two little-endian uint16s, ``k``
+      the smallest shift that brings both ratios below 1;
+    * ``qshift``: ``15 - k``;
+    * ``zpoff``: ``int((zp_y - zp_x*r_x - zp_z*r_z) * 2**(15-k))`` with the
+      ratios rounded to float32.
+
+    Fits the step's Gemm-as-MatMul+Add builds (``k = 1``) and #1870's
+    ``mm_add`` (``k = 0``)."""
+    (sx, zx), (sz, zz), (sy, zy) = scales[x], scales[z], scales[y]
+    k = 0
+    while max(sx / sy, sz / sy) * 2.0**-k >= 1.0:
+        k += 1
+        if k > 15:
+            raise CalibrationError(f"Add ratios of {y} do not fit Q15")
+    q = 15 - k
+    if kind == "qshift":
+        return q
+    if kind == "q15":
+        wx, wz = (int(round(r * 2.0**q)) for r in (sx / sy, sz / sy))
+        if wx == wz or not (0 <= wx < 1 << 16 and 0 <= wz < 1 << 16):
+            raise CalibrationError(f"Add header of {y} changes layout ({wx}, {wz})")
+        return wx | wz << 16
+    c = zy - zx * float(np.float32(sx / sy)) - zz * float(np.float32(sz / sy))
+    return int(c * 2.0**q) & 0xFFFFFFFF
 
 
 def float_roles(tensors: Iterable[str]) -> list[Role]:
@@ -228,11 +267,20 @@ def locate(model: onnx.ModelProto, scales: Scales) -> dict:
             elif reg in ZERO_POINT_REGS:
                 recs.append((si, off, reg, value, ztable.get(value, [])))
     params = params_of(model)
+    lanes = _param_lanes(params, ftable)
+    offsets = [
+        (si, off, reg, value)
+        for si, seg in enumerate(segs)
+        for off, verb, reg, value in _records(seg)
+        if verb == FULL_WRITE and reg in OFFSET_REGS and value
+    ]
+    if offsets:
+        recs, lanes = _locate_bias_add(segs, scales, offsets, recs, params, lanes)
     return {
         "segments": segs,
         "params_bytes": params,
         "records": recs,
-        "params": _param_lanes(params, ftable),
+        "params": lanes,
     }
 
 
@@ -267,7 +315,77 @@ def _param_lanes(params: bytes, ftable: dict[int, list[Role]]) -> list:
     return out
 
 
-PRECEDENCE = ("zp", "zpf", "nzpf", "s", "inv32", "inv", "ratio", "mult")
+def _locate_bias_add(segs, scales, offsets, recs, params, lanes):
+    """The zero-point offset lanes of a fused bias Add, its Q-format register
+    and its ``npu_params`` header: every ``(x, z, y)`` triple of tensors
+    whose ``zpoff`` explains the offset lanes, and the shift and header words
+    those triples give. A template whose offset is 0 is not located (there
+    is nothing to match), and ``recalibrate`` cannot tell; the step
+    templates all have nonzero offsets."""
+    names = sorted(scales)
+    triples = []
+    for x, z, y in itertools.permutations(names, 3):
+        try:
+            if _bias_add("zpoff", x, z, y, scales) == offsets[0][3]:
+                triples.append((x, z, y))
+        except CalibrationError:
+            pass
+    roles = [("zpoff", *t) for t in triples]
+    recs = recs + [
+        (si, off, reg, v, [r for r in roles if evaluate(r, scales) == v])
+        for si, off, reg, v in offsets
+    ]
+    shift = {evaluate(("qshift", *t), scales) for t in triples}
+    for si, seg in enumerate(segs):
+        for off, verb, reg, v in _records(seg):
+            if verb == FULL_WRITE and reg == SHIFT_REG and v in shift:
+                recs.append(
+                    (
+                        si,
+                        off,
+                        reg,
+                        v,
+                        [
+                            ("qshift", *t)
+                            for t in triples
+                            if evaluate(("qshift", *t), scales) == v
+                        ],
+                    )
+                )
+    header: dict[int, list[Role]] = {}
+    for t in triples:
+        try:
+            header.setdefault(evaluate(("q15", *t), scales), []).append(("q15", *t))
+        except CalibrationError:
+            pass
+    taken = {o + d for o, _, _ in lanes for d in range(-3, 4)}
+    found = [
+        (off, v, header[v])
+        for off in range(len(params) - 3)
+        if off not in taken
+        for v in [struct.unpack_from("<I", params, off)[0]]
+        if v in header
+    ]
+    if header and len(found) != 1:
+        raise CalibrationError(
+            f"bias Add header found {len(found)} times in npu_params, want once"
+        )
+    return recs, sorted(lanes + found)
+
+
+PRECEDENCE = (
+    "zp",
+    "zpf",
+    "nzpf",
+    "s",
+    "inv32",
+    "inv",
+    "ratio",
+    "mult",
+    "zpoff",
+    "qshift",
+    "q15",
+)
 """Tie-break between formulas that give the same bits at the template's
 scales. Across 174 builds, ``inv32``/``inv`` (``1/s`` in float32 or
 float64) always matched together, and so did ``s``/``mult(x, y, x)``. No

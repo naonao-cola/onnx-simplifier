@@ -94,9 +94,18 @@ def test_gemm_template_every_lane_explained():
     }
     assert {("inv32", "a"), ("inv32", "b"), ("inv32", "c"), ("s", "z")} <= kinds
     assert {("zp", "z"), ("zp", "c")} <= kinds
+    # The live bias Add's zero-point offset lanes and Q-format (#1869's
+    # zp_offset, here with k = 0), and its Q15 header word in npu_params.
+    # (x and z commute in both, so both orders explain them.)
+    every = {r for *_, roles in found["records"] for r in roles}
+    assert {("zpoff", "t", "c", "z"), ("qshift", "t", "c", "z")} <= every
     lanes = {tuple(roles[:1]) for _, _, roles in found["params"]}
-    assert lanes == {(("zpf", "t"),), (("mult", "a", "b", "t"),)}
-    assert len(found["params"]) == 2 * 520
+    assert lanes == {
+        (("zpf", "t"),),
+        (("mult", "a", "b", "t"),),
+        (("q15", "t", "c", "z"),),
+    }
+    assert len(found["params"]) == 2 * 520 + 1
 
 
 def test_gemm_template_identity_and_round_trip():

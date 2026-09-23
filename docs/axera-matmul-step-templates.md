@@ -13,13 +13,43 @@ each other exactly in both directions (records and `npu_params`):
 
 | batch | templates | step nodes served |
 | --- | ---: | ---: |
-| fc (dX, dW) | 2 | 2 |
-| dX | 6 of 9, plus the existing 512->512 template | 13 of 19 |
+| fc (dX, dW, forward Gemm) | 3 | 3 |
+| dX | 7 of 9, plus the existing 512->512 template | 14 of 19 |
+| dW | 3 of 11 | 3 of 20 |
+| Conv | 0 of 11 | 0 of 20 |
 
-Coverage (`tinygrad_ax_backend.coverage_report` on `step.onnx`): MatMul
-goes from 41 refused to 15 conditional.
+Coverage (`tinygrad_ax_backend.coverage_report` on `step.onnx`, master's
+backend): MatMul 41 refused -> 19 conditional, 22 refused; Gemm 1 refused
+-> 1 conditional; totals 82 / 324 / 698 -> 82 / 344 / 678
+(covered / conditional / refused).
 
-The remaining builds (2 dX, 11 dW, 11 Conv, the Gemm) are in progress.
+The remaining builds are in progress, largest last.
+
+## A fused bias Add has three more calibration words
+
+The first Gemm template recalibrated with 4 records and 2 `npu_params`
+bytes wrong. `recalibrate` had left them alone because they are neither
+float lanes nor zero-point registers. They are the fused bias `Add`'s words,
+the same ones `binary_op_scale_emit` decoded for a standalone Add (#1869):
+
+- registers `0x1ef0..0x1f20`: the int32 zero-point offset,
+  `int((zp_y - zp_x*r_x - zp_z*r_z) * 2**(15-k))`, with `r = s/s_y` rounded
+  to float32;
+- register `0x1ea0`: `15 - k`;
+- one `npu_params` word: `round(r_x * 2**(15-k))` and
+  `round(r_z * 2**(15-k))` as two uint16s.
+
+`k` is the smallest shift that brings both ratios below 1. The standalone
+Add builds all had `k = 0`. The Gemm has `k = 1`, because its MatMul output
+scale is a hair above the Add's output scale, so the offset is in Q14 there.
+The formula fits both Gemm builds and #1870's `mm_add` template exactly.
+
+`mm_add` has the same offset lanes (`-119879`). #1870 checked that template
+only by identity and round trip, which cannot catch lanes that are never
+touched, so its "Gemm covered offline" was wrong until this fix. The held-out
+pair is what caught it. `locate` now finds these words (`zpoff`, `qshift`
+and `q15` roles), so the Gemm and every Conv chain with a bias recalibrate
+them too.
 
 ## What a template is
 
