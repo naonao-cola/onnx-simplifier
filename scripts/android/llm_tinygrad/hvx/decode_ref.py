@@ -33,7 +33,10 @@ def load_weights():
     from safetensors.torch import load_file  # bf16 checkpoint: numpy can't read it
 
     snap = models.fetch(models.SMOLLM)
-    w = {k: v.float().numpy() for k, v in load_file(str(snap / "model.safetensors")).items()}
+    w = {
+        k: v.float().numpy()
+        for k, v in load_file(str(snap / "model.safetensors")).items()
+    }
     p = "model.layers.{}."
     layers = []
     for i in range(L):
@@ -43,9 +46,17 @@ def load_weights():
                 ln1=g("input_layernorm.weight"),
                 ln2=g("post_attention_layernorm.weight"),
                 # [K, N] (x @ W) with the fused projections concatenated along N
-                qkv=np.concatenate([g("self_attn.q_proj.weight"), g("self_attn.k_proj.weight"), g("self_attn.v_proj.weight")]).T,
+                qkv=np.concatenate(
+                    [
+                        g("self_attn.q_proj.weight"),
+                        g("self_attn.k_proj.weight"),
+                        g("self_attn.v_proj.weight"),
+                    ]
+                ).T,
                 o=g("self_attn.o_proj.weight").T,
-                gu=np.concatenate([g("mlp.gate_proj.weight"), g("mlp.up_proj.weight")]).T,
+                gu=np.concatenate(
+                    [g("mlp.gate_proj.weight"), g("mlp.up_proj.weight")]
+                ).T,
                 down=g("mlp.down_proj.weight").T,
             )
         )
@@ -85,7 +96,9 @@ class Lin:
 
 
 def rms(x, g):
-    return (x / np.sqrt(np.mean(x.astype(np.float64) ** 2) + EPS)).astype(np.float32) * g
+    return (x / np.sqrt(np.mean(x.astype(np.float64) ** 2) + EPS)).astype(
+        np.float32
+    ) * g
 
 
 def rope_tab():
@@ -108,7 +121,10 @@ class Model:
         mode, gptq = (mode[5:], True) if mode.startswith("gptq-") else (mode, False)
         pre = (lambda i, k: gq[f"{i}.{k}"]) if gptq else (lambda i, k: None)
         self.lin = [
-            {k: Lin(lw[k], "fp32" if k in skip else mode, pre(i, k)) for k in ("qkv", "o", "gu", "down")}
+            {
+                k: Lin(lw[k], "fp32" if k in skip else mode, pre(i, k))
+                for k in ("qkv", "o", "gu", "down")
+            }
             for i, lw in enumerate(w["layers"])
         ]
         self.head = Lin(w["head"], "fp32" if "head" in skip else mode, pre("h", "head"))
@@ -126,7 +142,10 @@ class Model:
             y = ln["qkv"](rms(h, lw["ln1"]))
             q = rope(y[:H].reshape(NH, HD), c, s)
             k = rope(y[H : H + NKV * HD].reshape(NKV, HD), c, s)
-            self.kc[i, :, pos], self.vc[i, :, pos] = k, y[H + NKV * HD :].reshape(NKV, HD)
+            self.kc[i, :, pos], self.vc[i, :, pos] = (
+                k,
+                y[H + NKV * HD :].reshape(NKV, HD),
+            )
             att = np.empty((NH, HD), np.float32)
             for hh in range(NH):
                 kv = hh // (NH // NKV)
@@ -179,9 +198,15 @@ def gptq_one(W, X, damp=0.01, blk=128):
 def gptq_weights(w, cache: Path):
     if cache.exists():
         z = np.load(cache)
-        return {k[:-2]: (z[k[:-2] + ".q"], z[k[:-2] + ".s"], z[k[:-2] + ".c"]) for k in z.files if k.endswith(".q")}
+        return {
+            k[:-2]: (z[k[:-2] + ".q"], z[k[:-2] + ".s"], z[k[:-2] + ".c"])
+            for k in z.files
+            if k.endswith(".q")
+        }
     m = Model(w, "fp32")
-    lins = [(f"{i}.{k}", m.lin[i][k]) for i in range(L) for k in ("qkv", "o", "gu", "down")] + [("h.head", m.head)]
+    lins = [
+        (f"{i}.{k}", m.lin[i][k]) for i in range(L) for k in ("qkv", "o", "gu", "down")
+    ] + [("h.head", m.head)]
     for _, ln in lins:
         ln.rec = []
     for ids in calib_tokens():
@@ -195,8 +220,12 @@ def gptq_weights(w, cache: Path):
     for name, ln in lins:
         out[name] = gptq_one(ln.W, np.stack(ln.rec))
         ln.rec = None
-        print(f"gptq {name}: {len(out[name][0])}x{out[name][0].shape[1]}", flush=True) if name.endswith("down") and name.startswith("29") else None
-    np.savez(cache, **{f"{k}.{t}": v[j] for k, v in out.items() for j, t in enumerate("qsc")})
+        print(
+            f"gptq {name}: {len(out[name][0])}x{out[name][0].shape[1]}", flush=True
+        ) if name.endswith("down") and name.startswith("29") else None
+    np.savez(
+        cache, **{f"{k}.{t}": v[j] for k, v in out.items() for j, t in enumerate("qsc")}
+    )
     return out
 
 
@@ -221,7 +250,10 @@ def run(model, work: Path, forced: bool):
 
 def score(work: Path, free, forced):
     refs = [
-        (np.load(work / "dec_ref" / f"gen_{i}.npy"), np.load(work / "dec_ref" / f"logits_{i}.npy"))
+        (
+            np.load(work / "dec_ref" / f"gen_{i}.npy"),
+            np.load(work / "dec_ref" / f"logits_{i}.npy"),
+        )
         for i in range(len(models.PROMPTS))
     ]
     same, lead, agree, cmin = 0, [], [], 1.0
@@ -249,7 +281,9 @@ def export(w, gq, out: Path, work: Path):
     m = Model(w, "gptq-a8" if gq is not None else "a8", gq)
     with open(out / "W.bin", "wb") as fw, open(out / "F.bin", "wb") as ff:
         for i, lw in enumerate(w["layers"]):
-            ff.write(np.concatenate([lw["ln1"], lw["ln2"]]).astype(np.float32).tobytes())
+            ff.write(
+                np.concatenate([lw["ln1"], lw["ln2"]]).astype(np.float32).tobytes()
+            )
             for k in ("qkv", "o", "gu", "down"):
                 ln = m.lin[i][k]
                 fw.write(pack(ln.q).tobytes())
@@ -261,7 +295,9 @@ def export(w, gq, out: Path, work: Path):
     w["emb"].astype(np.float16).tofile(out / "emb.f16.bin")
     for i in range(len(models.PROMPTS)):
         for n in ("prompt", "force"):
-            (out / f"{n}_{i}.bin").write_bytes((work / "dec_in" / f"{n}_{i}.bin").read_bytes())
+            (out / f"{n}_{i}.bin").write_bytes(
+                (work / "dec_in" / f"{n}_{i}.bin").read_bytes()
+            )
 
 
 def phone_score(work: Path, d: Path):
@@ -291,7 +327,12 @@ def main():
         return
     w = load_weights()
     if a.export:
-        export(w, gptq_weights(w, work / "gptq_int8.npz") if a.export == "gptq" else None, Path(a.out), work)
+        export(
+            w,
+            gptq_weights(w, work / "gptq_int8.npz") if a.export == "gptq" else None,
+            Path(a.out),
+            work,
+        )
         return
     gq = None
     for mode in a.eval or []:
@@ -302,7 +343,10 @@ def main():
             fo = run(m, work, True)
             print(f"{mode:5s}: {score(work, fo, fo)}", flush=True)
         else:
-            print(f"{mode:5s}: {score(work, run(m, work, False), run(m, work, True))}", flush=True)
+            print(
+                f"{mode:5s}: {score(work, run(m, work, False), run(m, work, True))}",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

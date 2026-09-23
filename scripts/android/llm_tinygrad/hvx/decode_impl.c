@@ -94,7 +94,7 @@ static int* int_cs(const float* cs, int N) {
 
 AEEResult decode_rpc_setup(remote_handle64 h, int32 is_a16, int32 nt, int32 b4, int32 v, int32 turbo, int32* rc) {
   if (nt < 1 || nt > MAXT) return AEE_EBADPARM;
-  a16 = is_a16; nthr = nt; blk4 = b4; vec = v && !is_a16; vflags = v > 1 ? v >> 1 : 7;
+  a16 = is_a16; nthr = nt; blk4 = b4; vec = v; vflags = v > 1 ? v >> 1 : 7;
   static void *kraw, *vraw, *traw;
   if (!kc) {
     kc = amalloc(sizeof(float) * L * NKV * MAXLEN * HD, &kraw);
@@ -164,7 +164,9 @@ static int acc[2][2 * FF] __attribute__((aligned(128)));
 static int hacc[2][V] __attribute__((aligned(128)));
 static float hbuf[H] __attribute__((aligned(128))), nbuf[H] __attribute__((aligned(128))), ybuf[2 * FF] __attribute__((aligned(128))),
     att[H] __attribute__((aligned(128))), gbuf[FF] __attribute__((aligned(128))), *logits_out;
-static float tmin[MAXT], tmax[MAXT];
+static float tmin[MAXT], tmax[MAXT], tbest[MAXT];
+static int tbi[MAXT];
+static float lbuf[V] __attribute__((aligned(128))); /* logits when the caller doesn't want them back */
 static int cur_pos;
 static qurt_barrier_t bar;
 static unsigned long long gemv_t, prof_t[8];
@@ -237,11 +239,21 @@ static inline HVX_Vector vcvt_w_sf(HVX_Vector d) {
   HVX_Vector fhi = VSUB(Q6_Vw_vadd_VwVw(hi, mi), mf), flo = VSUB(Q6_Vw_vadd_VwVw(lo, mi), mf);
   return SF(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(fhi, SPLATF(65536.0f)), flo));
 }
-/* 32 dequantized outputs n..n+31: (acc - zp*colsum) exactly in int32, then * (xs * s[n]) */
+/* 32 dequantized outputs n..n+31: (acc - zp*colsum) exactly in int32, then * (xs * s[n]). a16: the code is
+   256*hi + lo and zp = 256*zh + zl, so each pass's correction (acc_hi - zh*cs, acc_lo - zl*cs) is exact in int32 and
+   only their 256*A + B combination rounds. The second pass's accumulators sit ldo ints after the first. */
+static int acc_ld; /* distance between the hi and lo accumulators of the current GEMV */
 static inline HVX_Vector deq32(const lin_t* l, const int* a, int n) {
-  HVX_Vector zp = Q6_V_vsplat_R(xzp | (xzp << 16));
-  HVX_Vector d = Q6_Vw_vsub_VwVw(*(const HVX_Vector*)(a + n), Q6_Vw_vmpyie_VwVuh(*(const HVX_Vector*)(l->csi + n), zp));
-  return VMUL(vcvt_w_sf(d), VMUL(*(const HVX_Vector*)(l->s + n), SPLATF(xs)));
+  HVX_Vector cs = *(const HVX_Vector*)(l->csi + n);
+  HVX_Vector sc = VMUL(*(const HVX_Vector*)(l->s + n), SPLATF(xs));
+  if (!a16) {
+    HVX_Vector zp = Q6_V_vsplat_R(xzp | (xzp << 16));
+    return VMUL(vcvt_w_sf(Q6_Vw_vsub_VwVw(*(const HVX_Vector*)(a + n), Q6_Vw_vmpyie_VwVuh(cs, zp))), sc);
+  }
+  int zh = xzp >> 8, zl = xzp & 255;
+  HVX_Vector A = Q6_Vw_vsub_VwVw(*(const HVX_Vector*)(a + n), Q6_Vw_vmpyie_VwVuh(cs, Q6_V_vsplat_R(zh | (zh << 16))));
+  HVX_Vector B = Q6_Vw_vsub_VwVw(*(const HVX_Vector*)(a + acc_ld + n), Q6_Vw_vmpyie_VwVuh(cs, Q6_V_vsplat_R(zl | (zl << 16))));
+  return VMUL(SF(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(vcvt_w_sf(A), SPLATF(256.f)), vcvt_w_sf(B))), sc);
 }
 /* e^x for x in [-126 ln2, 126 ln2] (clamped): 2^round(t) * poly(t - round(t)), t = x log2 e */
 static inline HVX_Vector vexp(HVX_Vector x) {
@@ -286,7 +298,7 @@ static void vminmax(const float* x, int n, float* lo, float* hi) {
    step on every activation broke accuracy), so the magic integer is corrected to the floor with the exact fraction. */
 static void vquant(const float* x, int n, float inv, int zp) {
   const HVX_Vector vinv = SPLATF(inv), off = SPLATF((float)zp + 0.5f), mf = SPLATF(12582912.0f), mi = Q6_V_vsplat_R(0x4B400000);
-  const HVX_Vector z = Q6_V_vzero(), c255 = Q6_V_vsplat_R(255), m1 = Q6_V_vsplat_R(-1);
+  const HVX_Vector z = Q6_V_vzero(), c255 = Q6_V_vsplat_R(a16 ? 65535 : 255), m1 = Q6_V_vsplat_R(-1);
   int t[32] __attribute__((aligned(128)));
   for (int b = 0; b < n / 32; b++) {
     HVX_Vector y = SF(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(((const HVX_Vector*)x)[b], vinv), off));
@@ -295,7 +307,8 @@ static void vquant(const float* x, int n, float inv, int zp) {
     HVX_Vector frac = VSUB(y, VSUB(ti, mf)); /* y - float(q), exact */
     q = Q6_Vw_vadd_VwVw(q, Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(z, frac), m1, z));
     *(HVX_Vector*)t = Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(q, z), c255);
-    for (int k = 0; k < 32; k++) xq[0][b * 32 + k] = (unsigned char)t[k];
+    if (a16) for (int k = 0; k < 32; k++) { xq[0][b * 32 + k] = (unsigned char)(t[k] >> 8); xq[1][b * 32 + k] = (unsigned char)t[k]; }
+    else for (int k = 0; k < 32; k++) xq[0][b * 32 + k] = (unsigned char)t[k];
   }
 }
 static void vrmsnorm(float* o, const float* x, const float* g) {
@@ -312,7 +325,7 @@ static void vquant_mm(const float* x, int n, float lo, float hi) {
   if (!(vflags & 4)) { quantize(x, n, lo, hi); return; }
   if (lo > 0.f) lo = 0.f;
   if (hi < 0.f) hi = 0.f;
-  float s = (hi - lo) / 255.f;
+  float s = (hi - lo) / (a16 ? 65535.f : 255.f);
   if (s < 1e-12f) s = 1e-12f;
   int zp = (int)(-lo / s + 0.5f);
   vquant(x, n, 1.f / s, zp);
@@ -333,6 +346,7 @@ static float hmaxf(HVX_Vector v) { float t[32] __attribute__((aligned(128))); *(
   do {                                                            \
     unsigned long long t0_ = HAP_perf_get_time_us();              \
     gemv_blocks(l, out, tid, ld);                                 \
+    acc_ld = (ld);                                                \
     SYNC();                                                       \
     if (!tid) gemv_t += HAP_perf_get_time_us() - t0_;             \
   } while (0)
@@ -504,17 +518,27 @@ static void worker(void* arg) {
     }
   } else
     for (int n = V * tid / nthr; n < V * (tid + 1) / nthr; n++) logits_out[n] = deq(&head, hacc[0], hacc[1], n);
+  { /* greedy argmax over this thread's logits (first index on ties, like numpy) */
+    float bv = -3.4e38f;
+    int bi = V;
+    if (vec)
+      for (int b = tid; b < V / 32; b += nthr)
+        for (int k = 0; k < 32; k++) { float v = logits_out[b * 32 + k]; if (v > bv) { bv = v; bi = b * 32 + k; } }
+    else
+      for (int n = V * tid / nthr; n < V * (tid + 1) / nthr; n++) if (logits_out[n] > bv) { bv = logits_out[n]; bi = n; }
+    tbest[tid] = bv; tbi[tid] = bi;
+  }
   TOC(h, 6);
   qurt_hvx_unlock();
   qurt_thread_exit(0);
 }
 
 AEEResult decode_rpc_step(remote_handle64 h, int32 pos, const float* emb, int embLen, float* logits, int logitsLen,
-                          uint64* dsp_us, uint64* gemv_us, uint64* prof, int profLen) {
-  if (pos < 0 || pos >= MAXLEN || embLen != H || logitsLen != V || !Wb) return AEE_EBADPARM;
+                          int32* argmax, uint64* dsp_us, uint64* gemv_us, uint64* prof, int profLen) {
+  if (pos < 0 || pos >= MAXLEN || embLen != H || (logitsLen != V && logitsLen != 0) || !Wb) return AEE_EBADPARM;
   unsigned long long t0 = HAP_perf_get_time_us();
   memcpy(hbuf, emb, sizeof hbuf);
-  logits_out = logits;
+  logits_out = logitsLen ? logits : lbuf;
   cur_pos = pos;
   gemv_t = 0;
   memset(prof_t, 0, sizeof prof_t);
@@ -532,6 +556,10 @@ AEEResult decode_rpc_step(remote_handle64 h, int32 pos, const float* emb, int em
   }
   for (int t = 0; t < nthr; t++) { int st; qurt_thread_join(tids[t], &st); }
   qurt_barrier_destroy(&bar);
+  int best = 0;
+  for (int t = 1; t < nthr; t++)
+    if (tbest[t] > tbest[best] || (tbest[t] == tbest[best] && tbi[t] < tbi[best])) best = t;
+  *argmax = tbi[best];
   *dsp_us = HAP_perf_get_time_us() - t0;
   *gemv_us = gemv_t;
   for (int k = 0; k < profLen && k < 8; k++) prof[k] = prof_t[k];

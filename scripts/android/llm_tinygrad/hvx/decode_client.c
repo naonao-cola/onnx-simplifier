@@ -62,8 +62,8 @@ int main(int argc, char** argv) {
   float* emb = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, H * sizeof(float));
   float* lg = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, V * sizeof(float));
   static double wall[NPROMPT * (NGEN + 32) * 2], dsp[sizeof wall / sizeof wall[0]], gv[sizeof wall / sizeof wall[0]];
-  int nt_ = 0;
-  static double prof_sum[8];
+  int nt_ = 0, nl_ = 0, nw_ = 0;
+  static double prof_sum[8], wl[sizeof wall / sizeof wall[0]];
   double pre_ms = 0; int pre_n = 0;
   for (int forced = 0; forced < 2; forced++) {
     char d[256];
@@ -85,17 +85,16 @@ int main(int argc, char** argv) {
         else tok = forced ? fo[s - 1] : gen[s - 1];
         for (int k = 0; k < H; k++) emb[k] = (float)E[(size_t)tok * H + k];
         uint64 du = 0, gu = 0, pf[8] = {0};
+        int want = s >= 0 && nkeep < 9, am = -1; /* logits back only for the steps the accuracy check keeps */
         double t = now_ms();
-        int rc = decode_rpc_step(h, pos, emb, H, lg, V, &du, &gu, pf, 8);
+        int rc = decode_rpc_step(h, pos, emb, H, lg, want ? V : 0, &am, &du, &gu, pf, 8);
         if (s >= 1) for (int k = 0; k < 8; k++) prof_sum[k] += pf[k];
         t = now_ms() - t;
         if (rc) { printf("step rc=0x%x at prompt %d pos %d\n", rc, i, pos); return 1; }
         if (s < 0) { pre_ms += t; pre_n++; continue; }
-        int am = 0;
-        for (int v = 1; v < V; v++) if (lg[v] > lg[am]) am = v;
         gen[s] = am;
-        if (nkeep < 9) memcpy(keep + (size_t)nkeep++ * V, lg, sizeof(float) * V);
-        if (s >= 1) { wall[nt_] = t; dsp[nt_] = du / 1e3; gv[nt_] = gu / 1e3; nt_++; }
+        if (want) memcpy(keep + (size_t)nkeep++ * V, lg, sizeof(float) * V);
+        if (s >= 1) { wall[nt_] = t; dsp[nt_] = du / 1e3; gv[nt_] = gu / 1e3; nl_ += !want; if (!want) wl[nw_++] = t; nt_++; }
       }
       snprintf(p, sizeof p, "%s/gen_%d.bin", d, i);
       FILE* f = fopen(p, "wb"); fwrite(gen, 4, NGEN, f); fclose(f);
@@ -104,6 +103,8 @@ int main(int argc, char** argv) {
       free(keep); free(pr); free(fo);
     }
   }
+  qsort(wl, nw_, sizeof(double), cmpd);
+  printf("generation steps without logits back (argmax on the DSP) %d: wall median %.2f ms (%.1f tok/s)\n", nw_, wl[nw_ / 2], 1e3 / wl[nw_ / 2]);
   qsort(wall, nt_, sizeof(double), cmpd); qsort(dsp, nt_, sizeof(double), cmpd); qsort(gv, nt_, sizeof(double), cmpd);
   printf("decode steps %d: wall median %.2f ms (%.1f tok/s), min %.2f | DSP median %.2f ms | GEMV median %.2f ms | prompt steps %.2f ms avg\n",
          nt_, wall[nt_ / 2], 1e3 / wall[nt_ / 2], wall[0], dsp[nt_ / 2], gv[nt_ / 2], pre_ms / (pre_n ? pre_n : 1));
