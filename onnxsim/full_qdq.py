@@ -45,7 +45,7 @@ from onnx import TensorProto, helper, numpy_helper
 
 from onnxsim.calibration import Tensors, calibrate
 
-__all__ = ["quantize_full_qdq", "quantized_io"]
+__all__ = ["quantize_full_qdq", "quantized_io", "sampling_coordinate_tensors"]
 
 # Output values are a subset / convex combination of the data input's values
 # (with 0 for padding, and every range here contains 0), so the output can
@@ -202,6 +202,7 @@ def quantize_full_qdq(
     method: str = "minmax",
     providers: Optional[Sequence[str]] = None,
     ranges: Optional[Dict[str, Tuple[float, float]]] = None,
+    tensor_dtypes: Optional[Dict[str, str]] = None,
 ) -> onnx.ModelProto:
     """
     Quantize the whole graph to QDQ form for an NPU backend (see the module
@@ -224,6 +225,10 @@ def quantize_full_qdq(
     :param providers: onnxruntime providers for calibration
     :param ranges: precomputed ``{tensor: (min, max)}`` (e.g. calibrated on a
             batch-1 twin of the model); skips calibration for those tensors
+    :param tensor_dtypes: per-activation overrides of ``activation_dtype``
+            (``{tensor: "uint16"}``), e.g. 16-bit sampling coordinates in an
+            otherwise 8-bit graph. Data-movement ops pass their input's dtype
+            on unless their output is overridden too.
     :returns: the quantized ModelProto
     """
     if activation_dtype not in _DTYPES:
@@ -263,6 +268,25 @@ def quantize_full_qdq(
             if x in floats and x not in inits and x not in seen:
                 seen.add(x)
                 acts.append(x)
+    # An explicitly excluded node whose every data input is dequantized and every output
+    # quantized would itself form a QDQ node unit (and run quantized). Keep it float by leaving
+    # its outputs unquantized; its consumers then read the float value (and run float too).
+    # (A node merely outside ``op_types`` is left alone: sandwiched between quantized nodes it
+    # runs quantized, which is what an op_types list asks for everywhere else.)
+    for n in g.node:
+        if id(n) in qnode_ids or not _is_quantized_node(n, op_types, set(), set()):
+            continue
+        ins = [x for x in _data_inputs(n) if x in floats and x not in inits]
+        outs = [o for o in n.output if o and o in floats]
+        if (
+            ins
+            and outs
+            and all(x in seen for x in ins)
+            and all(o in seen for o in outs)
+        ):
+            for o in outs:
+                seen.discard(o)
+            acts = [a for a in acts if a not in outs]
 
     ranges = dict(ranges or {})
     missing = [a for a in acts if a not in ranges]
@@ -310,29 +334,45 @@ def quantize_full_qdq(
         ]
 
     # Quantization parameters, propagating through data-movement ops in topological order.
+    tensor_dtypes = dict(tensor_dtypes or {})
+    for t in set(tensor_dtypes.values()) - set(_DTYPES):
+        raise ValueError(f"unsupported dtype in tensor_dtypes: {t!r}")
     qp: Dict[str, Tuple[float, int]] = {}
+    qdt: Dict[str, str] = {}
+
+    def set_qp(x: str) -> None:
+        dt = tensor_dtypes.get(x, activation_dtype)
+        qp[x] = _qparams(*ranges[x], *_DTYPES[dt][2:])
+        qdt[x] = dt
+
+    for x in graph_inputs:
+        if x in seen and x in ranges:
+            set_qp(x)
     for n in g.node:
         if id(n) in removed:
             continue
         if n.op_type in _SHARED_QPARAM_OPS and id(n) in qnode_ids and n.input[0] in qp:
             for o in n.output:
-                if o and o in floats:
-                    qp[o] = qp[n.input[0]]
+                if o and o in floats and o not in tensor_dtypes:
+                    qp[o], qdt[o] = qp[n.input[0]], qdt[n.input[0]]
         for x in list(n.input) + list(n.output):
             if x in seen and x not in qp and x in ranges and x not in inits:
-                qp[x] = _qparams(*ranges[x], qmin, qmax)
-    for x in graph_inputs:
-        if x in seen and x not in qp and x in ranges:
-            qp[x] = _qparams(*ranges[x], qmin, qmax)
+                set_qp(x)
 
     opset = next((o.version for o in m.opset_import if o.domain in ("", "ai.onnx")), 0)
     if opset < 13:
         raise ValueError(
             "full-graph QDQ needs opset >= 13 (per-channel DequantizeLinear)"
         )
-    qdq_domain = "com.microsoft" if activation_dtype == "uint16" and opset < 21 else ""
-    if qdq_domain and not any(o.domain == qdq_domain for o in m.opset_import):
-        m.opset_import.append(helper.make_opsetid(qdq_domain, 1))
+
+    def domain_of(dt: str) -> str:
+        return "com.microsoft" if dt == "uint16" and opset < 21 else ""
+
+    qdq_domain = domain_of(activation_dtype)
+    if any(domain_of(d) for d in list(qdt.values()) + [activation_dtype]) and not any(
+        o.domain == "com.microsoft" for o in m.opset_import
+    ):
+        m.opset_import.append(helper.make_opsetid("com.microsoft", 1))
 
     new_inits: List[TensorProto] = []
     uid = [0]
@@ -353,8 +393,9 @@ def quantize_full_qdq(
         if a not in qp:
             continue
         s, zp = qp[a]
+        dom = domain_of(qdt[a])
         sn = add_init(fresh(a) + "/scale", np.array(s, np.float32))
-        zn = add_init(fresh(a) + "/zp", np.array(zp, act_np))
+        zn = add_init(fresh(a) + "/zp", np.array(zp, _DTYPES[qdt[a]][1]))
         q_out = a + "/q"
         if a in graph_inputs:
             dq_out = a + "/dq"
@@ -368,14 +409,14 @@ def quantize_full_qdq(
                     [a, sn, zn],
                     [q_out],
                     name=a + "/Q",
-                    domain=qdq_domain,
+                    domain=dom,
                 ),
                 helper.make_node(
                     "DequantizeLinear",
                     [q_out, sn, zn],
                     [dq_out],
                     name=a + "/DQ",
-                    domain=qdq_domain,
+                    domain=dom,
                 ),
             ]
         else:
@@ -387,26 +428,86 @@ def quantize_full_qdq(
                     [pre, sn, zn],
                     [q_out],
                     name=a + "/Q",
-                    domain=qdq_domain,
+                    domain=dom,
                 ),
                 helper.make_node(
                     "DequantizeLinear",
                     [q_out, sn, zn],
                     [a],
                     name=a + "/DQ",
-                    domain=qdq_domain,
+                    domain=dom,
                 ),
             ]
+
+    # Mixed 8/16-bit activations: a quantized node computes in its output's dtype, so an input
+    # of the other dtype is re-quantized for it (DQ -> Q' -> DQ', a "convert" the QNN EP maps
+    # to its Convert op). GridSample's grid is exempt: its coordinates are the reason to mix.
+    converted: Dict[Tuple[str, str], str] = {}
+    act_extra: List[str] = []
+    for n in qnodes:
+        if id(n) in removed:
+            continue
+        outs = [o for o in n.output if o in qdt]
+        if not outs:
+            continue
+        node_dt = qdt[outs[0]]
+        for k, x in enumerate(n.input):
+            src = (
+                x[: -len("/dq")]
+                if x.endswith("/dq") and x[: -len("/dq")] in graph_inputs
+                else x
+            )
+            if (
+                src not in qdt
+                or qdt[src] == node_dt
+                or (n.op_type == "GridSample" and k == 1)
+            ):
+                continue
+            ckey = (src, node_dt)
+            if ckey not in converted:
+                c = f"{src}/as_{node_dt}"
+                sc, zc = _qparams(*ranges[src], *_DTYPES[node_dt][2:])
+                qp[c], qdt[c] = (sc, zc), node_dt
+                sn = add_init(fresh(c) + "/scale", np.array(sc, np.float32))
+                zn = add_init(fresh(c) + "/zp", np.array(zc, _DTYPES[node_dt][1]))
+                dom = domain_of(node_dt)
+                act_nodes += [
+                    helper.make_node(
+                        "QuantizeLinear",
+                        [x, sn, zn],
+                        [c + "/q"],
+                        name=c + "/Q",
+                        domain=dom,
+                    ),
+                    helper.make_node(
+                        "DequantizeLinear",
+                        [c + "/q", sn, zn],
+                        [c],
+                        name=c + "/DQ",
+                        domain=dom,
+                    ),
+                ]
+                converted[ckey] = c
+                act_extra.append(c)
+            n.input[k] = converted[ckey]
 
     def act_scale(x: str) -> Optional[float]:
         if x not in qp and x.endswith("/dq"):
             x = x[: -len("/dq")]  # a graph input, rewired to its DQ above
         return qp[x][0] if x in qp else None
 
-    # Constant inputs of quantized nodes.
+    # Constant inputs of quantized nodes that form a real QDQ unit (every float activation
+    # input dequantized): a lone DQ on a weight of a float node would strand it on the CPU.
     cache: Dict[Tuple, str] = {}
+    act_set = set(acts) | set(act_extra)
     for n in qnodes:
         if id(n) in removed:
+            continue
+        if not all(
+            x in act_set and x in qp
+            for x in _data_inputs(n)
+            if x in floats and x not in inits
+        ):
             continue
         data = set(_data_inputs(n))
         for k, x in enumerate(list(n.input)):
@@ -665,3 +766,35 @@ def quantized_io(
     g.node.extend(nodes)
     _toposort(g)
     return m, info
+
+
+def sampling_coordinate_tensors(
+    model: onnx.ModelProto, stop_op_types: Iterable[str] = ("Gemm", "MatMul", "Conv")
+) -> List[str]:
+    """
+    The tensors that compute ``GridSample``'s sampling grid: a backward slice
+    from every GridSample's grid input through elementwise/data-movement ops,
+    stopping at (and including) the outputs of ``stop_op_types`` (the offset
+    projection) and graph inputs (host-computed reference points).
+
+    Sampling coordinates need far more resolution than 8 bits over their
+    range (a uint8 step of a [-1, 1] grid is ~0.4% of the feature map, i.e.
+    most of a pixel on a 25-wide map), so these are the natural
+    ``tensor_dtypes={t: "uint16" ...}`` of :func:`quantize_full_qdq` in a
+    deformable-attention model.
+    """
+    producer = {o: n for n in model.graph.node for o in n.output}
+    inits = {i.name for i in model.graph.initializer}
+    stop = set(stop_op_types)
+    out: List[str] = []
+    todo = [n.input[1] for n in model.graph.node if n.op_type == "GridSample"]
+    while todo:
+        t = todo.pop()
+        if t in out or t in inits or not t:
+            continue
+        out.append(t)
+        p = producer.get(t)
+        if p is None or p.op_type in stop or p.op_type in _NEVER_QUANTIZED:
+            continue
+        todo.extend(_data_inputs(p))
+    return out

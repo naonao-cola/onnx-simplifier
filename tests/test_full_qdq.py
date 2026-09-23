@@ -4,7 +4,11 @@ import onnxruntime as ort
 import pytest
 from onnx import numpy_helper, parser
 
-from onnxsim.full_qdq import quantize_full_qdq, quantized_io
+from onnxsim.full_qdq import (
+    quantize_full_qdq,
+    quantized_io,
+    sampling_coordinate_tensors,
+)
 
 
 def _model(body, initializer=(), opset=17):
@@ -200,3 +204,87 @@ def test_quantized_io_is_lossless_and_nhwc():
         info["y"]["scale"]
     )
     np.testing.assert_allclose(y, _run(q, {"x": x}), atol=1e-6)
+
+
+def test_excluded_node_between_quantized_nodes_stays_float():
+    m = _conv_block()
+    q = quantize_full_qdq(m, _data(), exclude_nodes=["a"])  # the Add, by output name
+    add = next(n for n in q.graph.node if n.op_type == "Add")
+    # with a Q on its output the Add would form a QDQ unit (and run quantized)
+    assert not [
+        n
+        for n in q.graph.node
+        if add.output[0] in n.input and n.op_type == "QuantizeLinear"
+    ]
+    x = _data(1)[0]
+    assert _cos(_run(m, x), _run(q, x)) > 0.999
+
+
+def test_nodes_outside_op_types_between_quantized_nodes_run_quantized():
+    rng = np.random.default_rng(3)
+    m = _model(
+        """g (float[2,8] x) => (float[2,8] y) {
+            h = Gemm<transB=1>(x, w, b)
+            r = Relu(h)
+            y = Gemm<transB=1>(r, w2, b)
+        }""",
+        [
+            numpy_helper.from_array(rng.standard_normal((8, 8)).astype(np.float32), n)
+            for n in ("w", "w2")
+        ]
+        + [numpy_helper.from_array(rng.standard_normal(8).astype(np.float32), "b")],
+    )
+    q = quantize_full_qdq(m, _data(4, (2, 8)), op_types=["Gemm"], fold_relu=False)
+    prod = _producers(q)
+    for g in (n for n in q.graph.node if n.op_type == "Gemm"):
+        # activation, int8 weight and int32 bias all dequantized: both Gemms are QDQ units
+        assert all(prod[x].op_type == "DequantizeLinear" for x in g.input), g.input
+
+
+def test_uint16_sampling_coordinates_in_a_uint8_graph():
+    rng = np.random.default_rng(4)
+    m = _model(
+        """g (float[1,4,6,6] v, float[1,5,5,2] ref, float[1,50,8] q) => (float[1,4,5,5] y) {
+            o = MatMul(q, w)
+            o2 = Reshape(o, shape)
+            grid = Add(ref, o2)
+            y = GridSample(v, grid)
+        }""",
+        [
+            numpy_helper.from_array(
+                (0.01 * rng.standard_normal((8, 1))).astype(np.float32), "w"
+            ),
+            numpy_helper.from_array(np.array([1, 5, 5, 2], np.int64), "shape"),
+        ],
+    )
+    coords = sampling_coordinate_tensors(m)
+    assert sorted(coords) == ["grid", "o", "o2", "ref"]
+
+    def batch():
+        return {
+            "v": rng.standard_normal((1, 4, 6, 6)).astype(np.float32),
+            "ref": rng.uniform(-1, 1, (1, 5, 5, 2)).astype(np.float32),
+            "q": rng.standard_normal((1, 50, 8)).astype(np.float32),
+        }
+
+    data = [batch() for _ in range(4)]
+    q = quantize_full_qdq(m, data, tensor_dtypes={t: "uint16" for t in coords})
+    inits = {i.name: numpy_helper.to_array(i) for i in q.graph.initializer}
+    zp = {
+        n.input[0]: inits[n.input[2]].dtype
+        for n in q.graph.node
+        if n.op_type == "QuantizeLinear"
+    }
+    assert (
+        zp["grid/f"] == np.uint16 and zp["o/f"] == np.uint16 and zp["y/f"] == np.uint8
+    )
+    assert zp["o2/f"] == np.uint16  # the Reshape passes its input's dtype on
+    # the MatMul computes in its output's uint16: its uint8 input is converted for it,
+    # while GridSample keeps a uint8 value input next to its uint16 grid
+    mm = next(n for n in q.graph.node if n.op_type == "MatMul")
+    assert mm.input[0] == "q/as_uint16" and zp["q/dq"] == np.uint16
+    gs = next(n for n in q.graph.node if n.op_type == "GridSample")
+    assert list(gs.input) == ["v/dq", "grid"]
+    x = data[0]
+    q8 = quantize_full_qdq(m, data)
+    assert _cos(_run(m, x), _run(q, x)) > _cos(_run(m, x), _run(q8, x))

@@ -15,6 +15,8 @@ frames, then exported and run piece by piece on the phone's HTP through QNN.
 | `export.py` | one piece -> ONNX (TorchScript exporter, opset 17) -> ORT CPU check -> onnxsim -> check; phone inputs + fp32 reference outputs |
 | `run_phone.sh`, `compare_out.py` | partition report + strict all-HTP run of a piece (`../../vision_models_probe/partition_report.sh`), outputs vs fp32 |
 | `e2e_phone.py` | whole model on the HTP frame after frame (phone outputs chained, HTP prev_bev carried) vs fp32 torch and GT |
+| `profile_ops.py` | per-op-type share of an HTP execute from a QNN detailed-profiling CSV |
+| `sensitivity.py` | ORT CPU sweep: which op types int8 hurts (all-but-T / only-T cosines) |
 | `quantize.py` | int8 QDQ pieces with onnxsim's whole-graph quantizer (`onnxsim.full_qdq`): calibration set, backbone, mixed-precision encoder/decoder policies |
 | `bisect_precision.py`, `bisect_run.sh` | expose chosen intermediates as outputs, run on the HTP, per-tensor cosine vs ORT CPU |
 
@@ -86,7 +88,7 @@ GridSamples on 2500 queries) is the next target; int8 PTQ of the backbone the ot
 Two independent causes, both fixed in `model.py` with exact (fp32-identical) rewrites:
 
 1. **ref_cam overflow.** Upstream divides projected points by `max(depth, 1e-5)`, so pillar
-   points behind a camera land at |xy| up to 6.7e6, beyond fp16's 65504. Clamping to [-5, 6] on
+   points behind a camera land at |xy| up to 6.7e6, beyond fp16's 65504. Clamping to [-1, 2] (originally [-5, 6]) on
    the host is exact (validate.py: clamped vs unclamped max abs diff 0) because such points still
    sample zero padding.
 2. **QNN miscompiles stack -> reshape -> Gemm.** TSA projects its 2-frame value queue as
@@ -130,3 +132,61 @@ the ranges are applied to `backbone6` (identical tensor names). Result, strict a
 6.0x faster at the same detection quality (the feats cos of 0.994 becomes bev 0.997-0.998 and
 cls/bbox >= 0.9997 after the encoder). The host quantizes the normalized image
 (`round(x / 0.01866) + 114`, NHWC) where it normalizes it anyway.
+
+### Encoder: exact rewrite first, then mixed precision
+
+QNN's per-op profile of one fp16 encoder layer (`QNN_EXTRA='profiling_level=detailed,
+profiling_file_path=...'` on `qnn_run_multi`, then `profile_ops.py`) shows the Linear layers
+are not the cost: **Gemm 0.6%**, GridSample 40%, and most of the rest is elementwise work on the
+SCA's (cams x queries x heads x points x 2) sampling-coordinate tensors (Gather 8.7%, Expand
+5.7%, Sub 6.6%, Mul 10.9%, ...). So int8 Linears alone cannot help. First, an exact fp16 rewrite
+of the SCA (`model.py`): build the grid in grid_sample's layout from its small factors (the
+[0, 1] -> [-1, 1] map, the anchor repeat and the head permute on ref_cam and the offsets
+*before* they broadcast), with every tensor rank <= 4 (a rank-5 broadcast version fails to
+execute on the HTP, `QNN_COMMON_ERROR_SYSTEM`). validate.py vs upstream: max abs 7e-6.
+
+| encoder | enc1 ms | enc3 ms | bev cos |
+|---|---|---|---|
+| fp16, as in #1849 | 104 | 241 | 0.99999 |
+| fp16, SCA rewrite | **55.4** | **151** | 0.99999 |
+
+After the rewrite GridSample is 56% of the layer (SCA 48%, TSA 9%), then Mul + ReduceSum over
+the sampled values (17%). The next lever is an HVX deformable-sampling kernel (the RoiAlign
+channels-last kernel is the template), not quantization.
+
+Mixed-precision policies (`quantize.py enc1 --policy ...`), strict all-HTP, enc1 vs fp32:
+
+| policy | what | ms | cos |
+|---|---|---|---|
+| fp16 | - | 55.4 | 1.00000 |
+| lin8 | Gemm/MatMul int8 only | 74.9 | 0.985 |
+| all8 | int8 except LayerNorm, Softmax, GridSample | 68.8 | 0.971 |
+| all16 | same, uint16 activations | 89.5 | 0.99998 |
+| all8gs | int8 everything but LayerNorm/Softmax (GridSample int8) | 40.9 | 0.971 -> **0.991** with the [-1, 2] ref_cam clamp |
+| all16gs | same, uint16 | 65.3 | 0.99998 |
+| mix8 | all8gs + uint16 sampling coordinates (`sampling_coordinate_tensors`) | 78.4 | 0.994 |
+
+Only an int8 GridSample beats fp16. Its uint8 grid is what costs accuracy (`sensitivity.py`: the
+Sub/Add/Reshape feeding the grid are the worst single op types), and a uint16 grid makes
+GridSample slower than fp16. Clamping ref_cam to [-1, 2] instead of [-5, 6] (still exact, max
+abs 0; [-0.5, 1.5] is not) shrinks the grid range 3.7x: all8gs cos 0.971 -> 0.991. Over three
+layers and six chained frames that is still a visible loss:
+
+| whole model, scene-0103 frames 0-5 | backbone | enc3 | decoder | total | FPS | GT matched |
+|---|---|---|---|---|---|---|
+| fp32 torch (CPU) | | | | | | 106 / 190 |
+| #1849: fp16 everywhere | 126 | 241 | 25 | 392 ms | 2.6 | 105 |
+| **int8 backbone + fp16 encoder (SCA rewrite) + fp16 decoder** | 21 | 151 | 25 | **197 ms** | **5.1** | **107** |
+| same, encoder all8gs | 21 | 121 | 25 | 167 ms | 6.0 | 103 (bev cos 0.98) |
+
+The first is the default (no accuracy cost); all8gs trades 3 GT matches for 30 ms. The decoder
+stays fp16: every policy was slower there (lin8 34 ms, mix8 42, all8gs 54 vs fp16 25). The
+QDQ decoder has many more nodes, and its tensors are small.
+
+`onnxsim.full_qdq` mixed-precision details that the HTP needs:
+- An `exclude`d node sandwiched between quantized nodes would still form a QDQ unit (DQ in, Q
+  out) and run quantized. `quantize_full_qdq` keeps its output float instead.
+- A quantized node computes in its output's dtype. An input of the other dtype gets a
+  DQ -> Q' -> DQ' convert; GridSample's grid is exempt. Without this, QNN rejects a Gemm with a
+  uint8 input and a uint16 output, and its weight DQ is stranded on the CPU.
+- Weights are quantized only for nodes that end up real QDQ units.

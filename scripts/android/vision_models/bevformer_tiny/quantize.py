@@ -40,6 +40,14 @@ POLICIES = {
     "lin16": ("uint16", {"op_types": ["Gemm", "MatMul"]}),
     # W8A16 everywhere except LayerNorm, Softmax, GridSample
     "all16": ("uint16", {"exclude_op_types": FLOAT_SENSITIVE}),
+    # the same two, with GridSample quantized too
+    "all8gs": ("uint8", {"exclude_op_types": ["LayerNormalization", "Softmax"]}),
+    "all16gs": ("uint16", {"exclude_op_types": ["LayerNormalization", "Softmax"]}),
+    # uint8 everywhere (GridSample too) except the sampling coordinates: uint16
+    # (onnxsim.full_qdq.sampling_coordinate_tensors)
+    "mix8": ("uint8", {"coords16": True}),
+    # the same, LayerNorm and Softmax in fp16
+    "mix8f": ("uint8", {"coords16": True, "exclude_op_types": ["LayerNormalization", "Softmax"]}),
 }
 
 
@@ -111,10 +119,12 @@ def attention_piece(a, F):
     import onnx
 
     work = Path(a.work)
-    names = ENC_NAMES if a.piece == "enc3" else ["bev_embed"]
+    names = ENC_NAMES if a.piece.startswith("enc") else ["bev_embed"]
     m = onnx.load(str(work / f"{a.piece}.sim.onnx"))
     dtype, kw = POLICIES[a.policy]
     kw = dict(kw)
+    if kw.pop("coords16", False):
+        kw["tensor_dtypes"] = {t: "uint16" for t in F.sampling_coordinate_tensors(m)}
     if a.exclude:
         kw["exclude_nodes"] = a.exclude.split(",")
     q = F.quantize_full_qdq(m, list(samples(work, names)), activation_dtype=dtype, method=a.method, **kw)
@@ -128,7 +138,7 @@ def attention_piece(a, F):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("piece", choices=["calib", "backbone", "enc3", "decoder"])
+    ap.add_argument("piece", choices=["calib", "backbone", "enc1", "enc3", "decoder"])
     ap.add_argument("--ckpt")
     ap.add_argument("--data")
     ap.add_argument("--work", required=True)
