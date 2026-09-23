@@ -72,7 +72,31 @@ static void call(int kern, void* o, const void* x, const void* w, int K, int N) 
     case 2: llm_down_tc(o, (void*)x, (void*)w); break;
     case 3: llm_down_int32(o, (void*)x, (void*)w); break;
     case 4: hand_gemv(o, x, w, K, N); break;
+    case 5: llm_up_tcp(o, (void*)x, (void*)w); break;
+    case 6: llm_down_tcp(o, (void*)x, (void*)w); break;
+    case 7: llm_qo_tcp(o, (void*)x, (void*)w); break;
+    case 8: llm_kv_tcp(o, (void*)x, (void*)w); break;
   }
+}
+
+#define BENCH_STACK (256 * 1024)
+typedef struct {
+  int kern, reps, K, N;
+  const unsigned char *x, *w;
+  unsigned char* result;
+  unsigned long long t[64];
+} bench_job_t;
+
+static void bench_thread(void* arg) {
+  bench_job_t* j = (bench_job_t*)arg;
+  qurt_hvx_lock(QURT_HVX_MODE_128B);
+  for (int r = 0; r < j->reps; r++) {
+    unsigned long long t0 = HAP_perf_get_time_us();
+    call(j->kern, j->result, j->x, j->w, j->K, j->N);
+    j->t[r] = HAP_perf_get_time_us() - t0;
+  }
+  qurt_hvx_unlock();
+  qurt_thread_exit(0);
 }
 
 static int cmp_u64(const void* a, const void* b) {
@@ -82,16 +106,25 @@ static int cmp_u64(const void* a, const void* b) {
 AEEResult llm_rpc_run(remote_handle64 h, int32 kern, int32 reps, int32 K, int32 N, const unsigned char* x, int xLen,
                       const unsigned char* w, int wLen, unsigned char* result, int resultLen, uint64* min_us,
                       uint64* med_us) {
-  if (kern < 0 || kern > 4 || reps < 1 || reps > 64 || K % 16 || N % 32 || wLen < K * N || resultLen < 4 * N)
+  if (kern < 0 || kern > 8 || reps < 1 || reps > 64 || K % 16 || N % 32 || wLen < K * N || resultLen < 4 * N)
     return AEE_EBADPARM;
-  unsigned long long t[64];
-  qurt_hvx_lock(QURT_HVX_MODE_128B);
-  for (int r = 0; r < reps; r++) {
-    unsigned long long t0 = HAP_perf_get_time_us();
-    call(kern, result, x, w, K, N);
-    t[r] = HAP_perf_get_time_us() - t0;
-  }
-  qurt_hvx_unlock();
+  bench_job_t j = {kern, reps, K, N, x, w, result, {0}};
+  /* on a QuRT thread of our own: the FastRPC thread's stack is too small for tinygrad's vrmpy kernels, whose
+     128-512-byte-aligned vector temporaries (and spills) crash the process there */
+  qurt_thread_attr_t attr;
+  qurt_thread_t tid;
+  int status;
+  void* stack = malloc(BENCH_STACK + 128);
+  if (!stack) return AEE_ENOMEMORY;
+  qurt_thread_attr_init(&attr);
+  qurt_thread_attr_set_name(&attr, "llm_bench");
+  qurt_thread_attr_set_stack_addr(&attr, (void*)(((uintptr_t)stack + 127) & ~(uintptr_t)127));
+  qurt_thread_attr_set_stack_size(&attr, BENCH_STACK);
+  qurt_thread_attr_set_priority(&attr, qurt_thread_get_priority(qurt_thread_get_id()) - 1);
+  if (qurt_thread_create(&tid, &attr, bench_thread, &j) != QURT_EOK) { free(stack); return AEE_EFAILED; }
+  qurt_thread_join(tid, &status);
+  free(stack);
+  unsigned long long* t = j.t;
   qsort(t, reps, sizeof t[0], cmp_u64);
   *min_us = t[0];
   *med_us = t[reps / 2];

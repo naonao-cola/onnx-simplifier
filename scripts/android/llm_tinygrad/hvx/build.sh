@@ -24,7 +24,7 @@ LIBPATH="$HEXAGON_TOOLCHAIN/target/hexagon/lib/$HEX_ARCH/G0"
 "$NDK_CLANG" -O2 "${INC[@]}" -I "$HEXAGON_SDK_ROOT/ipc/fastrpc/rpcmem/inc" -o llm_client llm_client.c llm_rpc_stub.c \
   -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc
 [ -n "${BUILD_ONLY:-}" ] && exit 0
-D=/data/local/tmp/codex-android-llm-tinygrad/hvx
+D="${D:-/data/local/tmp/codex-android-llm-tinygrad/hvx}"
 adb -s "$DEVICE_SERIAL" shell "mkdir -p $D"
 adb -s "$DEVICE_SERIAL" push llm_client llm_rpc.so "$DATA"/*.bin $D/ >/dev/null
 adb -s "$DEVICE_SERIAL" shell "chmod 755 $D/llm_client && cd $D && LD_LIBRARY_PATH=/vendor/lib64 ADSP_LIBRARY_PATH=$D \

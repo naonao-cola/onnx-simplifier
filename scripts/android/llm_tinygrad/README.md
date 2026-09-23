@@ -78,51 +78,64 @@ tokens fed back; per-step top-1 agreement and logits cosine).
 
 Decode is one W8A8 GEMV per Linear: a uint8 activation row [1,K] times int8 weights [K,N], int32
 accumulation. That is exactly Hexagon's `vrmpybusv` (u8 x s8 dot4 -> s32). `hvx/llm_kernels.py`
-writes SmolLM2's two GEMV shapes as plain tinygrad Tensor code, generates them with our HVX codegen
-(`onnxsim/tinygrad` `hvx-qfloat` = stage 1 + stage 2, `HVX_ARCH=v69`), and checks them bit-exact
-against numpy under qemu (`MOCKDSP=1`). `hvx/build.sh` runs them on the phone's CDSP through our own
-FastRPC skel (rpcmem buffers, DSP-side timing, one thread holding the HVX unit), next to a hand-written
-vrmpy GEMV as the reference. All outputs bit-exact on the phone.
+writes SmolLM2's GEMV shapes as plain tinygrad Tensor code, generates them with our HVX codegen
+(`onnxsim/tinygrad` `hvx-vrmpy-mixed` 9aa4f66a1 = stage 1 + stage 2 + the vrmpy GEMV fix, onnxsim/tinygrad#5), and
+checks them bit-exact against numpy under qemu (`MOCKDSP=1`). `hvx/build.sh` runs them on the phone's CDSP
+through our own FastRPC skel (rpcmem buffers, DSP-side timing, one QuRT thread holding the HVX unit), next to
+a hand-written vrmpy GEMV as the reference. All outputs bit-exact on the phone. Medians of 21 runs, one DSP
+thread, under the phone lock:
 
-| kernel (one DSP thread) | up: 576x1536 (gate/up proj) | down: 1536x576 (down proj) | weight stream |
-|---|---:|---:|---:|
-| tinygrad plain `x.matmul(W, dtype=int32)`, default clocks | 4.10 ms | 17.3 ms | 0.05-0.22 GB/s |
-| tinygrad, DCVS turbo | 2.30 ms | 9.09 ms | 0.10-0.38 GB/s |
-| hand vrmpy GEMV (packed weights), default clocks | 78 us | 82 us | 10.8-11.3 GB/s |
-| **hand vrmpy GEMV, DCVS turbo** | **44 us** | **41 us** | **20.1-21.6 GB/s** |
+| kernel | up 576x1536 (gate/up) | down 1536x576 | q/o 576x576 | k/v 576x192 | weight stream |
+|---|---:|---:|---:|---:|---:|
+| tinygrad at 847af7eab (before the fix), turbo | 2.30 ms | 9.09 ms | | | 0.10-0.38 GB/s |
+| tinygrad now, row-major `x.matmul(W, dtype=int32)`, turbo | 6.14 ms | 6.02 ms | | | 0.14 GB/s |
+| **tinygrad now, prepacked weights, turbo** | **95 us** | **94 us** | **35 us** | **12 us** | **9.2-9.5 GB/s** |
+| hand vrmpy GEMV (prepacked), turbo | 43 us | 42 us | 15 us | 5 us | 20.6-22.1 GB/s |
+| tinygrad now, prepacked, default clocks | 178 us | 179 us | 66 us | 22 us | 4.9-5.0 GB/s |
+| hand vrmpy, default clocks | 82 us | 85 us | 29 us | 10 us | 10.4-11.4 GB/s |
 
-**Projected full-model decode** (GEMVs only; labeled projections, not measured end to end). One
-SmolLM2 token reads 106 MB of int8 layer weights + 28 MB of int8 LM head = 134.5 MB:
+"Prepacked" is the hand kernel's weight layout, `Wp[N/32][K/4][32][4]`: one 128-byte vector per 32 outputs x 4 K.
+In tinygrad it is the same GEMV written over that layout, `(x.reshape(1,K/4,1,4) * Wp).sum((1,3), dtype=int32)`
+with `TC_OPT=1` (two reduce axes); the weights are packed once on the host (`llm_kernels.py pack()`).
+
+What was wrong and what the fix changed (onnxsim/tinygrad#5):
+
+- **The vrmpy TensorCore never matched a GEMV.** Two reasons, both verified: the TC required both MUL inputs to
+  have the same dtype, and dtype promotion turns u8 x s8 into `short(u8) * short(s8)`, for which the DSP TC list had
+  no entry; and with M=1 the activation side has no range of its own, so every TC axis choice was skipped. The fix
+  adds a (uint8, int8) TC entry (rendered as `vrmpybusv` with the 4 activation bytes splat), looks through
+  value-preserving widening casts, and lets a TC with M=1 match without an M range.
+- **Once matched, it was slower than scalar code** (row-major above: 6 ms): the 32-lane int32 accumulator round-tripped
+  through 32 scalar register-array loads/stores per vrmpy, and the weight vector was rebuilt from 32-byte pieces with
+  `vinsert` chains. tinygrad now coalesces DSP register arrays (the accumulator is one HVX register), caps DSP loads
+  in bytes rather than lanes (a vrmpy's 128 weight bytes are one `vmem`), and does no extra M/N upcast inside the
+  vrmpy's 32 lanes. The prepacked GEMV's inner loop is now one `vmem`, one `vsplat` and one `vrmpy` per 128 weight
+  bytes.
+- **Row-major weights stay slow** (the TC's B operand is 4 rows' bytes interleaved, gathered bytewise): prepack.
+- **Remaining 2.2x to the hand kernel:** a loop-carried lane permutation (`vdeal`+`vshuff`) between the register
+  accumulator's lane order and the WMMA's, plus a single accumulator chain (the hand kernel keeps 4 independent
+  accumulators). Fixing the permutation needs the TC's upcast-axis order to match the accumulator's layout in the
+  generic expander.
+- **Buffers need slack:** HVX unaligned loads (`vmemu`) touch the whole 128-byte lines they span; the client pads
+  every rpcmem buffer by 256 bytes (an exactly-sized weight buffer faulted with a TLB miss past its end).
+- **Stack:** the kernels run on a QuRT thread with a 256 KB stack; on the FastRPC thread tinygrad's kernels crashed.
+
+**Projected full-model decode** (GEMVs only, one DSP thread, turbo; projections from the per-kernel times, not
+measured end to end). One SmolLM2 token reads 106 MB of int8 layer weights (30 x q, k, v, o, gate, up, down) + 28 MB
+of int8 LM head = 134.5 MB:
 
 | path | GEMV time / token | tok/s |
 |---|---:|---:|
-| tinygrad as generated today (0.38 GB/s) | ~354 ms | ~3 |
-| hand vrmpy, one thread (20.8 GB/s) | ~6.5 ms | ~150 (projected) |
+| tinygrad at 847af7eab (0.38 GB/s) | ~354 ms | ~3 |
+| **tinygrad now, prepacked (30 x 378 us + head at 9.4 GB/s)** | **~14.3 ms** | **~70 (projected)** |
+| hand vrmpy, one thread (30 x 168 us + head at 21 GB/s) | ~6.4 ms | ~155 (projected) |
 | hand vrmpy, 4 HVX threads (bandwidth-bound at ~40-50 GB/s LPDDR5, estimate) | ~3 ms | ~300 (projected) |
 | measured HTP fp16 (270 MB fp16 weights) | 9.0 ms / step | 110 (measured, accuracy open) |
 
-What limits tinygrad today, and what fixing each would buy:
-
-- **The vrmpy TensorCore never engages for a GEMV (M=1).** Both Tensor expressions (`matmul(dtype=int32)`
-  on u8 x s8, and widening to int32 first) render as scalar-per-lane int32 multiply-adds into a
-  128-entry stack accumulator, with no `vrmpy` (checked in the generated C). The heuristic's TC path
-  only matches when both inputs have the same `dtype_in`, and the DSP TC list has uint8/int8 but no
-  u8 x s8 mixed entry, even though `vrmpybusv` is exactly that instruction. Fixing the TC match (mixed
-  dtypes, M=1 with a packed-weight layout) is the whole gap: **~50-200x**, from 0.38 to ~20 GB/s.
-- **The `down` shape is 4x slower than `up` for the same bytes:** K=1536 is the reduce axis, and
-  without a vector reduction tinygrad strides across the weight matrix column-wise. The packed layout
-  (`Wp[N/32][K/4][32][4]`, one 128-byte vector per 32 outputs x 4 K) makes every weight load
-  contiguous; that layout has to come from the weight prepack, not from the kernel's loop order.
-- **No threading (stage 3):** one of the 4 HVX contexts. Decode is bandwidth-bound, so threads help
-  until DDR saturates: ~2x more (estimate).
-- **No HMX:** the matrix unit is only reachable through QNN. It matters for prefill (compute-bound
-  GEMM), not for decode GEMVs, which are memory-bound either way.
-- **Scalar exp/sigmoid on V69:** SiLU and softmax are small next to the GEMVs at batch 1 (a few
-  thousand elements per layer), so this costs well under 1 ms per token even scalar.
-
-So the decode roofline on this DSP is ~20 GB/s per HVX thread from a one-instruction-per-128-bytes
-GEMV. Our tinygrad codegen generates correct kernels at those shapes today, but at 1-2% of that
-bandwidth, because the vrmpy path isn't selected.
+Other tinygrad limits, unchanged: no threading (stage 3: one of the 4 HVX contexts; decode is bandwidth-bound, so
+threads help until DDR saturates, ~2x estimate); no HMX (only reachable through QNN; matters for compute-bound
+prefill, not decode); scalar exp/sigmoid on V69 (SiLU/softmax are a few thousand elements per layer at batch 1,
+well under 1 ms per token even scalar).
 
 ## Files
 
@@ -136,7 +149,7 @@ bandwidth, because the vrmpy path isn't selected.
 | `export_smollm.py` | SmolLM2-135M -> prefill + KV-cache step graphs (fp32, or `--fp16-only`), fp32 greedy references |
 | `quantize_smollm.py` | CPU dynamic int8 (per-channel) and onnxsim W8A16 QDQ variants |
 | `eval_decoder.py` | free-running and teacher-forced agreement vs fp32 (phone outputs or host ORT) |
-| `hvx/llm_kernels.py` | the decode GEMVs as plain tinygrad Tensor code -> kernels.h, exact under qemu; packed weights for the hand kernel |
+| `hvx/llm_kernels.py` | the decode GEMVs as plain tinygrad Tensor code (row-major and prepacked) -> kernels.h, exact under qemu |
 | `hvx/llm_impl.c`, `llm_rpc.idl`, `llm_client.c`, `build.sh` | FastRPC skel + client timing the tinygrad and hand vrmpy GEMVs on the CDSP |
 | `run_phone.sh` | build `llm_run`, push libs/models/inputs (by md5), run, pull outputs |
 
@@ -154,11 +167,12 @@ QNN_PERF=burst ./run_phone.sh enc $W/enc.fp32.onnx htp 22 $W/enc_in 20 $W/ph_enc
 python eval_encoder.py --work $W --phone $W/ph_enc_htp_fp32
 ```
 
-tinygrad HVX kernels (`onnxsim/tinygrad` branch `hvx-qfloat`, 847af7eab; Hexagon SDK 6.4 on the host):
+tinygrad HVX kernels (`onnxsim/tinygrad` branch `hvx-vrmpy-mixed`, 9aa4f66a1; Hexagon SDK 6.4 on the host;
+`D` is the phone directory):
 
 ```
 PYTHONPATH=<tinygrad checkout> CC=clang-19 HVX_ARCH=v69 python hvx/llm_kernels.py --out $W/hvx
-TURBO=1 HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=.../Tools DATA=$W/hvx hvx/build.sh
+TURBO=1 D=/data/local/tmp/<yours>/hvx HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=.../Tools DATA=$W/hvx hvx/build.sh
 ```
 
 The ORT/QNN libraries come from `../htp_exploration/qnn_shell/fetch_libs.sh` (Maven Central, not

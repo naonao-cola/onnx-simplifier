@@ -26,9 +26,12 @@ os.environ.setdefault("DEV", "DSP")
 os.environ.setdefault("MOCKDSP", "1")
 import numpy as np
 from tinygrad import Tensor, dtypes
+from tinygrad.helpers import Context
 from tinygrad.renderer.cstyle import ClangRenderer
 
-SHAPES = {"up": (576, 1536), "down": (1536, 576)}
+SHAPES = {"up": (576, 1536), "down": (1536, 576), "qo": (576, 576), "kv": (576, 192)}
+# row-major variants (tc, int32) only for up/down: they are the slow bytewise-gather path, kept as the before/after reference
+PACKED_ONLY = {"qo", "kv"}
 
 captured: list[str] = []
 _orig = ClangRenderer.render
@@ -44,23 +47,58 @@ ClangRenderer.render = _capture
 
 
 def kernel_c(src: str, new_name: str):
+    """Split one rendered kernel into (typedefs, static-inline helpers, the kernel function renamed).
+
+    tinygrad's vector typedef names (int32 = int x32, int64, ...) clash with the Hexagon SDK's scalar
+    int32/int64 (AEEStdDef.h), so every typedef'd name gets a tg_ prefix. Helpers (the vrmpy WMMA
+    wrapper) are returned separately so kernels.h defines each one once."""
     body = src.split("/* DSP boilerplate */")[0]
     typedefs = [ln for ln in body.splitlines() if ln.startswith("typedef ")]
-    code = "\n".join(
-        ln for ln in body.splitlines() if not ln.startswith("typedef ")
-    ).strip()
+    names = [re.search(r"(\w+)\s+__attribute__", t).group(1) for t in typedefs]
+    rest = "\n".join(ln for ln in body.splitlines() if not ln.startswith("typedef "))
+    helpers = re.findall(r"static inline [^{]*\{.*?\n\}", rest, flags=re.S)
+    for h in helpers:
+        rest = rest.replace(h, "")
+    code = rest.strip()
     name = re.search(r"void\s+(\w+)\(", code).group(1)
-    return typedefs, re.sub(rf"\b{name}\b", new_name, code)
+    code = re.sub(rf"\b{name}\b", new_name, code)
+
+    def pfx(t):
+        return (
+            re.sub(r"\b(" + "|".join(map(re.escape, names)) + r")\b", r"tg_\1", t)
+            if names
+            else t
+        )
+
+    return [pfx(t) for t in typedefs], [pfx(h) for h in helpers], pfx(code)
+
+
+def pack(w: np.ndarray) -> np.ndarray:
+    """W [K,N] -> Wp [N/32][K/4][32][4]: each 128-byte row is one vrmpy's 32 outputs x 4 K (the hand kernel's layout)."""
+    K, N = w.shape
+    return np.ascontiguousarray(w.reshape(K // 4, 4, N // 32, 32).transpose(2, 0, 3, 1))
 
 
 def build(variant: str, x: np.ndarray, w: np.ndarray):
+    captured.clear()
+    if variant == "tcp":
+        # the same GEMV over the prepacked weights: out[n] = sum_k x[k] * Wp[n/32, k/4, n%32, k%4]. Two reduce axes
+        # (k/4, k%4) need TC_OPT=1; the vrmpy TC takes n%32 x k%4, i.e. one contiguous 128-byte weight vector per vrmpy
+        K, N = w.shape
+        with Context(TC_OPT=1):
+            out = (
+                (Tensor(x).reshape(1, K // 4, 1, 4) * Tensor(pack(w)))
+                .sum((1, 3), dtype=dtypes.int32)
+                .reshape(1, N)
+            )
+            got = out.realize().numpy()
+        return got, list(captured)
     X, W = Tensor(x), Tensor(w)
     out = (
         X.matmul(W, dtype=dtypes.int32)
         if variant == "tc"
         else X.cast(dtypes.int32) @ W.cast(dtypes.int32)
     )
-    captured.clear()
     got = out.realize().numpy()
     return got, list(captured)
 
@@ -68,11 +106,11 @@ def build(variant: str, x: np.ndarray, w: np.ndarray):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--ops", default="up,down")
-    ap.add_argument("--variants", default="tc,int32")
+    ap.add_argument("--ops", default="up,down,qo,kv")
+    ap.add_argument("--variants", default="tc,int32,tcp")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    typedefs, funcs = [], []
+    typedefs, helpers, funcs = [], [], []
     rng = np.random.default_rng(0)
     for op in a.ops.split(","):
         K, N = SHAPES[op]
@@ -84,9 +122,10 @@ def main():
         ref.astype(np.int32).tofile(os.path.join(a.out, f"{op}_ref.bin"))
         # the hand vrmpy kernel's layout: Wp[n/32][k/4][32 lanes][4] (each 128-byte vector = one k4 group
         # of 32 output columns), so one vrmpybusv per 128 weight bytes
-        wp = w.reshape(K // 4, 4, N // 32, 32).transpose(2, 0, 3, 1)
-        np.ascontiguousarray(wp).tofile(os.path.join(a.out, f"{op}_wp.bin"))
+        pack(w).tofile(os.path.join(a.out, f"{op}_wp.bin"))
         for v in a.variants.split(","):
+            if op in PACKED_ONLY and v != "tcp":
+                continue
             got, srcs = build(v, x, w)
             exact = bool(np.array_equal(got.astype(np.int64), ref))
             vr = any("vrmpy" in s for s in srcs)
@@ -97,15 +136,16 @@ def main():
                 sys.exit(f"{op}/{v} not exact under qemu")
             if len(srcs) != 1:
                 sys.exit(f"{op}/{v}: expected one kernel, got {len(srcs)}")
-            td, code = kernel_c(srcs[0], f"llm_{op}_{v}")
+            td, hp, code = kernel_c(srcs[0], f"llm_{op}_{v}")
             typedefs += [t for t in td if t not in typedefs]
+            helpers += [h for h in hp if h not in helpers]
             funcs.append(f"/* {op} ({K}x{N}), {v} */\n{code}")
     with open(os.path.join(a.out, "kernels.h"), "w") as f:
         f.write(
             "/* generated by llm_kernels.py -- do not edit */\n"
             + "\n".join(typedefs)
             + "\n\n"
-            + "\n\n".join(funcs)
+            + "\n\n".join(helpers + funcs)
             + "\n"
         )
     print(f"wrote {a.out}/kernels.h")
