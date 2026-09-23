@@ -25,6 +25,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <time.h>
 #include <vector>
@@ -137,7 +139,10 @@ static void run_net(Net& n, std::vector<Ort::Value>& ins, std::vector<Ort::Value
 static const int FH = 64, FW = 176, ROWS = 6 * FH * FW, NVOX = 200 * 200 * 4;
 // proj: (6, 3, 4) = diag(1/4, 1/4, 1) @ lidar2img[:3]; last valid camera wins; `block` maps camera i
 // to its feature block in the table (the upstream adjacent-frame camera swap, see data.py)
-static void m0_lut(const float* proj, const int* block, int32_t* lut, int v0, int v1) {
+// `nl` time slots at once (proj/block/lut per slot, a null lut skips that slot), so the voxel
+// coordinates of a strip are computed once and each worker thread is spawned once per frame
+static void m0_lut_n(const float* const* projs, const int* const* blocks, int32_t* const* luts, int nl, int v0,
+                     int v1) {
   // one camera at a time over a strip of voxels, branch-free, so the compiler vectorizes it (NEON
   // fdiv / frintn = round half to even, like torch); later cameras overwrite (last valid wins)
   constexpr int S = 256;
@@ -150,8 +155,13 @@ static void m0_lut(const float* proj, const int* block, int32_t* lut, int v0, in
       px[j] = (v / 800) * 0.5f + -50.f;
       py[j] = ((v / 4) % 200) * 0.5f + -50.f;
       pz[j] = (v % 4) * 1.5f + -4.f;
-      best[j] = ROWS;
     }
+    for (int l = 0; l < nl; l++) {
+    if (!luts[l]) continue;
+    const float* proj = projs[l];
+    const int* block = blocks[l];
+    int32_t* lut = luts[l];
+    for (int j = 0; j < n; j++) best[j] = ROWS;
     for (int c = 0; c < 6; c++) {
       const float* P = proj + c * 12;
       const int32_t base = block[c] * FH * FW;
@@ -165,12 +175,14 @@ static void m0_lut(const float* proj, const int* block, int32_t* lut, int v0, in
       }
     }
     memcpy(lut + s0, best, n * sizeof(int32_t));
+    }
   }
 }
-static void m0_lut_mt(const float* proj, const int* block, int32_t* lut, int nt) {
+static void m0_lut_n_mt(const float* const* projs, const int* const* blocks, int32_t* const* luts, int nl, int nt) {
   std::vector<std::thread> th;
-  const int per = (NVOX + nt - 1) / nt;
-  for (int t = 0; t < nt; t++) th.emplace_back(m0_lut, proj, block, lut, t * per, std::min(NVOX, (t + 1) * per));
+  const int per = ((NVOX + nt - 1) / nt + 255) / 256 * 256;
+  for (int t = 0; t < nt && t * per < NVOX; t++)
+    th.emplace_back(m0_lut_n, projs, blocks, luts, nl, t * per, std::min(NVOX, (t + 1) * per));
   for (auto& t : th) t.join();
 }
 
@@ -340,6 +352,55 @@ static double med(std::vector<double> v) {
   return v[v.size() / 2];
 }
 
+
+// ---------------------------------------------------------------- pipelining (PIPELINE=1)
+// Bounded single-producer single-consumer queue of frame indices (-1 = end).
+struct IdxQ {
+  std::mutex m;
+  std::condition_variable cv;
+  std::vector<int> q;
+  size_t cap;
+  explicit IdxQ(size_t c) : cap(c) {}
+  void push(int v) {
+    std::unique_lock<std::mutex> l(m);
+    cv.wait(l, [&] { return q.size() < cap; });
+    q.push_back(v);
+    cv.notify_all();
+  }
+  int pop() {
+    std::unique_lock<std::mutex> l(m);
+    cv.wait(l, [&] { return !q.empty(); });
+    int v = q.front();
+    q.erase(q.begin());
+    cv.notify_all();
+    return v;
+  }
+};
+// Runs a[j] -> b[j] -> c[j] for j = 0..n-1 on three threads (a: HTP encoder (+ CPU LUTs), b: DSP
+// gather + HTP BEV net, c: CPU decode), each stage one frame behind the previous at most two frames
+// in flight between stages: buffers indexed j % 3 (and M0's feature ring j % 6) never alias.
+template <class A, class B, class C>
+static void pipeline3(int n, A a, B b, C c) {
+  IdxQ ab(1), bc(1);
+  std::thread tb([&] {
+    for (int j; (j = ab.pop()) >= 0;) {
+      b(j);
+      bc.push(j);
+    }
+    bc.push(-1);
+  });
+  std::thread tc([&] {
+    for (int j; (j = bc.pop()) >= 0;) c(j);
+  });
+  for (int j = 0; j < n; j++) {
+    a(j);
+    ab.push(j);
+  }
+  ab.push(-1);
+  tb.join();
+  tc.join();
+}
+
 int main(int argc, char** argv) {
   if (argc < 4) {
     fprintf(stderr, "usage: %s m0|pp <dir> <n_frames> [iters]\n", argv[0]);
@@ -350,6 +411,9 @@ int main(int argc, char** argv) {
   const int lut_threads = getenv("LUT_THREADS") ? atoi(getenv("LUT_THREADS")) : 4;
   const int dsp_threads = getenv("DSP_THREADS") ? atoi(getenv("DSP_THREADS")) : 4;
   const bool htp_gather = getenv("GATHER") && std::string(getenv("GATHER")) == "htp";
+  // PIPELINE=1: frames overlap across HTP / DSP / CPU (pipeline3); writes f<i>_dets_pipe.bin
+  const bool pipe = getenv("PIPELINE") && atoi(getenv("PIPELINE"));
+  const int seq_iters = pipe ? -1 : iters;
   try {
     Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "fastbev");
     g_env = &env;
@@ -369,6 +433,15 @@ int main(int argc, char** argv) {
       times[s].push_back(n - t);
       if (std::find(stages.begin(), stages.end(), s) == stages.end()) stages.push_back(s);
       t = n;
+    };
+    // pipelined runs: frame j's latency is its decode end minus its encoder start; throughput is
+    // the wall time of the passes after the warm-up one divided by their frames
+    auto pipe_report = [&](const std::vector<double>& ts, const std::vector<double>& te) {
+      std::vector<double> lat;
+      for (size_t j = nf; j < te.size(); j++) lat.push_back(te[j] - ts[j]);
+      const double per = (te.back() - ts[nf]) / (te.size() - nf);
+      printf("pipelined per frame %.2f ms (%.1f FPS), latency median %.2f ms, n=%zu\n", per, 1000.0 / per, med(lat),
+             lat.size());
     };
     if (fam == "m0") {
       std::vector<std::vector<float>> proj(nf, std::vector<float>(4 * 6 * 12));
@@ -400,7 +473,74 @@ int main(int argc, char** argv) {
       static const int ident[6] = {0, 1, 2, 3, 4, 5}, swapped[6] = {0, 1, 2, 3, 5, 4};
       float slot0_proj[72];
       bool have_slot0 = false;
-      for (int it = 0; it <= iters; it++) {
+      if (pipe && !htp_gather) {
+        // 6 ring slots: stage a may encode frame j + 2 while stage b gathers frame j's slots j .. j - 3
+        const int RS = 6;
+        std::vector<std::unique_ptr<RpcBuf>> pring, pluts;
+        for (int k = 0; k < RS; k++) {
+          pring.emplace_back(new RpcBuf(tb));
+          memset(pring[k]->p, io.at("feats").z, tb);
+        }
+        for (int k = 0; k < 12; k++) pluts.emplace_back(new RpcBuf(NVOX * 4));  // 3 sets of 4
+        std::vector<std::vector<uint8_t>> pcls(3, cls), pdir(3, dirc);
+        std::vector<std::vector<uint16_t>> preg(3, reg);
+        float pcache[3][72];
+        bool phave[3] = {false, false, false};
+        const int n = nf * (iters + 1);
+        std::vector<double> ts(n), te(n);
+        pipeline3(
+            n,
+            [&](int j) {
+              const int i = j % nf, s3 = j % 3;
+              ts[j] = now_ms();
+              std::thread lut_th([&] {
+                const float* P[4];
+                const int* B[4];
+                int32_t* L[4];
+                for (int k = 0; k < 4; k++) {
+                  P[k] = proj[i].data() + k * 72;
+                  B[k] = ages[i][k] > 0 && ages[i][4] ? swapped : ident;
+                  L[k] = pluts[s3 * 4 + k]->as<int32_t>();
+                }
+                if (phave[s3] && !memcmp(P[0], pcache[s3], sizeof pcache[s3])) L[0] = nullptr;
+                m0_lut_n_mt(P, B, L, 4, lut_threads);
+                memcpy(pcache[s3], P[0], sizeof pcache[s3]);
+                phave[s3] = true;
+              });
+              std::vector<Ort::Value> in, out;
+              in.push_back(tensor<uint8_t>(imgs[i].data(), {6, 256, 704, 3}));
+              out.push_back(tensor<uint8_t>(pring[j % RS]->p, {6, 64, 176, 64}));
+              run_net(enc, in, out);
+              lut_th.join();
+            },
+            [&](int j) {
+              const int i = j % nf, s3 = j % 3;
+              int sl[4];
+              for (int k = 0; k < 4; k++) sl[k] = (j - ages[i][k] + 100 * RS) % RS;
+              unsigned long long du = 0;
+              int rc = fbgather_rpc_run(h, pring[sl[0]]->as<uint8_t>(), tb, pring[sl[1]]->as<uint8_t>(), tb,
+                                        pring[sl[2]]->as<uint8_t>(), tb, pring[sl[3]]->as<uint8_t>(), tb,
+                                        pluts[s3 * 4]->as<int32_t>(), NVOX, pluts[s3 * 4 + 1]->as<int32_t>(), NVOX,
+                                        pluts[s3 * 4 + 2]->as<int32_t>(), NVOX, pluts[s3 * 4 + 3]->as<int32_t>(), NVOX,
+                                        ROWS, dsp_threads, vol.as<uint8_t>(), NVOX * 256, &du);
+              if (rc) throw std::runtime_error("fbgather rc " + std::to_string(rc));
+              std::vector<Ort::Value> in, out;
+              in.push_back(tensor<uint8_t>(vol.p, {1, 200, 200, 1024}));
+              out.push_back(tensor<uint8_t>(pcls[s3].data(), {1, 100, 100, 80}));
+              out.push_back(tensor<uint16_t>(preg[s3].data(), {1, 100, 100, 72}));
+              out.push_back(tensor<uint8_t>(pdir[s3].data(), {1, 100, 100, 16}));
+              run_net(bev, in, out);
+            },
+            [&](int j) {
+              const int s3 = j % 3;
+              std::vector<Det> dets;
+              m0_decode(pcls[s3].data(), preg[s3].data(), pdir[s3].data(), io.at("cls"), io.at("reg"), dets);
+              te[j] = now_ms();
+              if (j < nf) write_dets(dir + "/f" + std::to_string(j) + "_dets_pipe.bin", dets);
+            });
+        pipe_report(ts, te);
+      }
+      for (int it = 0; it <= seq_iters; it++) {
         for (int i = 0; i < nf; i++) {
           double t = now_ms(), tf = t;
           // the LUTs don't depend on the images: compute them on the CPU while the HTP runs the
@@ -409,13 +549,18 @@ int main(int argc, char** argv) {
           double lut_ms = 0;
           std::thread lut_th([&] {
             double a = now_ms();
+            const float* P[4];
+            const int* B[4];
+            int32_t* L[4];
             for (int k = 0; k < 4; k++) {
-              const float* P = proj[i].data() + k * 72;
-              const int* blk = ages[i][k] > 0 && ages[i][4] ? swapped : ident;
-              if (k == 0 && have_slot0 && !memcmp(P, slot0_proj, sizeof slot0_proj)) continue;
-              m0_lut_mt(P, blk, luts[k]->as<int32_t>(), lut_threads);
-              if (k == 0) { memcpy(slot0_proj, P, sizeof slot0_proj); have_slot0 = true; }
+              P[k] = proj[i].data() + k * 72;
+              B[k] = ages[i][k] > 0 && ages[i][4] ? swapped : ident;
+              L[k] = luts[k]->as<int32_t>();
             }
+            if (have_slot0 && !memcmp(P[0], slot0_proj, sizeof slot0_proj)) L[0] = nullptr;
+            m0_lut_n_mt(P, B, L, 4, lut_threads);
+            memcpy(slot0_proj, P[0], sizeof slot0_proj);
+            have_slot0 = true;
             lut_ms = now_ms() - a;
           });
           {
@@ -473,7 +618,48 @@ int main(int argc, char** argv) {
       std::vector<uint8_t> feats(6 * 16 * 44 * 64), depth(6 * 16 * 44 * 59), heat(128 * 128 * 10);
       std::vector<uint16_t> reg(128 * 128 * 2), hei(128 * 128), dim(128 * 128 * 3), rot(128 * 128 * 2),
           vel(128 * 128 * 2);
-      for (int it = 0; it <= iters; it++) {
+      if (pipe) {
+        std::vector<std::vector<uint8_t>> pf(3, feats), pd(3, depth), ph(3, heat);
+        std::vector<std::vector<uint16_t>> pr(3, reg), pe(3, hei), pm(3, dim), po(3, rot), pv(3, vel);
+        const int n = nf * (iters + 1);
+        std::vector<double> ts(n), te(n);
+        pipeline3(
+            n,
+            [&](int j) {
+              const int i = j % nf, s3 = j % 3;
+              ts[j] = now_ms();
+              std::vector<Ort::Value> in, out;
+              in.push_back(tensor<uint8_t>(imgs[i].data(), {6, 256, 704, 3}));
+              out.push_back(tensor<uint8_t>(pf[s3].data(), {6, 16, 44, 64}));
+              out.push_back(tensor<uint8_t>(pd[s3].data(), {6, 16, 44, 59}));
+              run_net(enc, in, out);
+            },
+            [&](int j) {
+              const int i = j % nf, s3 = j % 3;
+              std::vector<Ort::Value> in, out;
+              in.push_back(tensor<uint8_t>(pf[s3].data(), {6 * 16 * 44, 64}));
+              in.push_back(tensor<uint8_t>(pd[s3].data(), {6 * 16 * 44 * 59}));
+              in.push_back(tensor<int32_t>(idx[i].data(), {128 * 128 * 7}));
+              in.push_back(tensor<int32_t>(didx[i].data(), {128 * 128 * 7}));
+              out.push_back(tensor<uint8_t>(ph[s3].data(), {1, 128, 128, 10}));
+              out.push_back(tensor<uint16_t>(pr[s3].data(), {1, 128, 128, 2}));
+              out.push_back(tensor<uint16_t>(pe[s3].data(), {1, 128, 128, 1}));
+              out.push_back(tensor<uint16_t>(pm[s3].data(), {1, 128, 128, 3}));
+              out.push_back(tensor<uint16_t>(po[s3].data(), {1, 128, 128, 2}));
+              out.push_back(tensor<uint16_t>(pv[s3].data(), {1, 128, 128, 2}));
+              run_net(bev, in, out);
+            },
+            [&](int j) {
+              const int s3 = j % 3;
+              std::vector<Det> dets;
+              pp_decode(ph[s3].data(), pr[s3].data(), pe[s3].data(), pm[s3].data(), po[s3].data(), pv[s3].data(), io,
+                        dets);
+              te[j] = now_ms();
+              if (j < nf) write_dets(dir + "/f" + std::to_string(j) + "_dets_pipe.bin", dets);
+            });
+        pipe_report(ts, te);
+      }
+      for (int it = 0; it <= seq_iters; it++) {
         for (int i = 0; i < nf; i++) {
           double t = now_ms(), tf = t;
           {
@@ -509,6 +695,7 @@ int main(int argc, char** argv) {
     for (auto& s : stages) printf("stage %-28s median %7.2f ms\n", s.c_str(), med(times[s]));
     for (const char* s : {"  (LUTs on the CPU, overlapped)", "  (gather on the DSP itself)"})
       if (times.count(s)) printf("stage %-28s median %7.2f ms\n", s, med(times[s]));
+    if (!times.count("total")) return 0;
     printf("total per frame median %.2f ms (%.1f FPS), n=%zu\n", med(times["total"]), 1000.0 / med(times["total"]),
            times["total"].size());
   } catch (const std::exception& e) {
