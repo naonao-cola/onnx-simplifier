@@ -1700,6 +1700,104 @@ concurrent RPCs from several clients (the scratch is static per batch slot).
 - `ort_topk_bench.c` is the phone-CPU ORT baseline.
 - `build.sh` builds and runs on the phone, and runs the ORT baseline too if `ORT_AAR` is set.
 
+## NonMaxSuppression: exact on all 85 real calls, faster than ORT for the per-level ones
+
+`dynamic_ops_survey.md` ranked NMS the hardest dynamic op (greedy selection is sequential, and it
+looked like it might need new tinygrad capability). Like RoiAlign, it doesn't need tinygrad's UOp
+path at all: `nms/` is hand-written C with HVX, bridged over its own FastRPC skel (qaic IDL +
+native client, `rpcmem` buffers, no TVM), with inputs captured from one real ONNX Runtime inference
+(`dump_real_nms_io.py`: MaskRCNN-12-qdq, COCO 000000000139).
+
+**Real semantics, confirmed from the graph and ORT's own source.** All 85 nodes are
+`center_point_box=0`, one batch, one class per call, `max_output_boxes_per_class=2000` (never
+binding), no `score_threshold` input. Two groups:
+
+| group | calls | iou | boxes per call | input order | kept |
+|---|---:|---:|---|---|---:|
+| per FPN level (RPN proposals) | 5 | 0.7 | 1000, 1000, 1000, 1000, 663 | already score-sorted (by the preceding TopK) | 1465 |
+| per class (box head) | 80 | 0.5 | 0..152, 573 in total, 63 calls empty | not sorted | 106 |
+
+ORT's CPU kernel (`onnxruntime/core/providers/cpu/object_detection/non_max_suppression.cc` +
+`non_max_suppression_helper.h`) visits candidates through a `priority_queue` (score descending,
+ties by **lower index first**), keeps a candidate unless `SuppressByIOU(candidate, kept)` is true for
+some kept box, and emits `(batch, class, index)` triples in selection order. `SuppressByIOU` is
+`intersection / union > iou_threshold` in fp32, with early `return false` for no overlap and for
+non-positive intersection/areas/union. `nms_kernel.h` copies that operation for operation (built with
+`-ffp-contract=off`), and visits candidates in the same order via a stable merge sort. The phone's
+own ORT build (stock `onnxruntime-android` 1.26 arm64) selects exactly the same boxes as host ORT on
+all 85 calls, so one reference serves both.
+
+**Two kernels.** `nms_scalar` is the greedy loop, scalar. `nms_hvx` is the same greedy loop, but tests
+each candidate against 64 already-kept boxes per step (two HVX vectors, kept boxes stored
+structure-of-arrays), with one cross-lane OR-reduction per step.
+
+**Getting HVX to agree with ORT exactly took three real findings:**
+
+1. **This phone's HVX has no IEEE fp32.** The CDSP is Hexagon V69. Built with `-mhvx-ieee-fp`, every
+   IEEE `.sf` arithmetic instruction returns 0. Only qfloat exists. (`roialign_fast/`'s kernel was
+   already using qfloat without saying so, which is why it's 6.5e-5 off ORT rather than bit-exact.)
+2. **qfloat doesn't round like IEEE, so the vector test can't decide ties.** Measured on the phone,
+   a qfloat add/sub/mul on IEEE inputs, converted back to `.sf`, is off by up to 2^-23 × the larger
+   **operand**, not the result. It is not exact under cancellation the way IEEE subtraction is:
+   `1346.5 - 1343` gives 3.50012207. Real IoUs land a few ulp from the threshold (one real per-level
+   pair has IoU 0.70000005), so the vector path only decides clear-cut pairs. It computes
+   `d = inter·(1+thr) − thr·(area1+area2)`, which is `inter − thr·union` in exact arithmetic, and
+   bounds its error by 2^-23·(2·M·(w+h) + 7·(area1+area2)), with M the largest coordinate in the call.
+   With the band half-width t at 4× that bound, a pair is *surely suppressed* if d > t, *surely not*
+   if d < −t, and anything in between is re-decided with the exact scalar `SuppressByIOU`. Box-overlap
+   tests are max/min/compare on the input coordinates, which are exact in qfloat.
+3. **clang silently undoes the careful version.** Plain vector-extension C (`a*b - c` on `float`
+   vectors) lowers to chained `vmpy(qf32, qf32)` with no renormalization, which is ~500 ulp off.
+   The first HVX build missed one real per-level call because of it: `inter` came out 880.46875 where IEEE
+   gives 880.498718. Rewriting the chain with explicit intrinsics that convert back to `.sf` after
+   every op wasn't enough either, because LLVM folds each `qf32→sf` conversion into the next op and
+   emits the same `vmpy(qf32, qf32)`: `3.50012207 × 3.00006104` came out 10.5625. An empty
+   `asm("" : "+v"(r))` after each conversion stops the folding (the objdump then has zero
+   qf32-input ops), and the same product comes out 10.5006.
+
+The band rarely fires: 9 exact rechecks in 5214 candidate tests on the real data (30 in 30719 on
+the stress sets; counted on the host's portable path, which uses the same bound). To exercise it
+harder than one image does, `gen_nms_stress_data.py` makes 80 adversarial calls (31.6k boxes):
+coordinates on a coarse grid so many IoUs sit exactly on 0.5/0.7, heavy score ties, zero-area and
+swapped-corner boxes, n from 1 to 2000, coordinates up to ~2000. Before fix 3 the HVX kernel got 12
+of those 80 wrong on the phone, including a pair with IoU exactly 0.5 in real arithmetic. After it,
+all are exact.
+
+**Verified exact (identical selected indices, in order) at every level:**
+
+| check | real data (85 calls) | stress (80 calls) |
+|---|---|---|
+| host C, both kernels (`nms_host_check.c`) | 85/85 | 80/80 |
+| qemu-hexagon, both kernels, portable fp32 path (`nms_qemu.c`) | 85/85 | 80/80 |
+| phone CDSP, `nms_scalar`, 1 and 4 threads | 85/85 | 80/80 |
+| phone CDSP, `nms_hvx` (qfloat), 1/4/5/6 threads | 85/85 | 80/80 |
+
+**Speed on the phone, real data.** Each group runs as one RPC with calls spread across QuRT threads.
+Times are medians of 9 runs. ORT is the sum of per-node medians, since that's how `rest.onnx` runs
+today. ORT's NMS is single-threaded, so its "default" thread setting changes nothing.
+
+| | per level (5 calls) | per class (80 calls) |
+|---|---:|---:|
+| ORT on the phone's CPU (1 thread / default) | 3.66 / 3.64 ms | 0.199 / 0.199 ms |
+| DSP `nms_scalar`, 1 / 4 threads (DSP time) | 16.26 / 8.47 ms | 0.21 / 0.10 ms |
+| DSP `nms_hvx`, 1 thread: DSP time / RPC round trip | 2.34 / 2.71 ms (**1.56x / 1.35x**) | 0.18 / 0.45 ms |
+| DSP `nms_hvx`, 4 threads: DSP time / RPC round trip | 0.93 / 1.26 ms (**3.9x / 2.9x**) | 0.10 / 0.28-0.47 ms |
+| DSP `nms_hvx`, 5 threads: DSP time / RPC round trip | 0.86 / 1.13 ms (**4.2x / 3.2x**) | 0.09 / 0.28-0.40 ms |
+| DSP `nms_hvx`, one RPC per node (as ORT runs them), 1 thread | 3.85 ms (~1.0x) | 18.9 ms (**95x slower**) |
+
+- **Per-level NMS is a real win:** about 3x ORT on the phone's CPU including the RPC round trip, with
+  4-5 threads. 4 threads leave one thread with two of the five calls, which is why 5 helps a little.
+- **Per-class NMS should stay on the CPU unless it's fused into a larger DSP call.** ORT does all 80
+  calls in 0.2 ms; one batched RPC already costs more than that in round trip alone, and one RPC per
+  node is 95x slower.
+- The scalar kernel is exact but 4.4x slower than ORT (the DSP's scalar core against a big ARM core).
+  It's the fallback and the correctness reference, not the fast path.
+
+Not done: fusing NMS with its neighbours (proposal decode/TopK before it, RoiAlign after) into one
+DSP call, which is where the per-class calls would stop paying a round trip each; one image's real
+calls only for timing; `score_threshold`/`center_point_box=1`/multi-class inputs aren't supported,
+since this model never uses them.
+
 ## Files
 
 - `capture_kernel.py` -- capture tinygrad's rendered Hexagon C for a shape, verified under qemu.
@@ -1806,3 +1904,10 @@ concurrent RPCs from several clients (the scratch is static per batch slot).
   trip) vs ORT-on-phone's 859 µs; the two small downstream TopKs are slower than the CPU. Also
   documents a qemu 8.2 fault in one `__builtin_reduce_or` lowering (exact on the device). See
   "TopK" above; `topk/build.sh` reproduces it.
+
+- `nms/` -- NonMaxSuppression for all 85 real `rest.onnx` calls, exact against ONNX Runtime:
+  `nms_kernel.h` (scalar and qfloat-HVX greedy kernels), its own FastRPC skel/client
+  (`nms_rpc.idl`, `nms_impl.c`, `nms_client.c`, `build.sh`), host and qemu checks, real-input capture
+  (`dump_real_nms_io.py`, `gen_nms_test_data.py`), adversarial tie/threshold stress sets
+  (`gen_nms_stress_data.py`), and host and phone ORT baselines (`make_nms_single_node_models.py`,
+  `ort_nms_bench.c`). See "NonMaxSuppression" above.
