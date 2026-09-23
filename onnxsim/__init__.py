@@ -436,6 +436,11 @@ from onnxsim.qwen_drive_planning_expert_reconstruct import (
 )
 from onnxsim.rotatekv import apply_rotatekv
 from onnxsim.rptq import apply_rptq_reorder
+from onnxsim.rustnn_runtime import (
+    RustnnSession,
+    find_unsupported_webnn_ops,
+    probe_rustnn,
+)
 from onnxsim.sam2_export import export_sam2_model
 from onnxsim.slim_llm import apply_slim_llm
 from onnxsim.smoothquant import apply_smoothquant
@@ -721,6 +726,9 @@ __all__ = [
     "split_around_node",
     "check_webnn_support",
     "estimate_webnn_islands",
+    "RustnnSession",
+    "find_unsupported_webnn_ops",
+    "probe_rustnn",
     "chain_slim",
     "chain_slim_base",
     "check_vitisai_support",
