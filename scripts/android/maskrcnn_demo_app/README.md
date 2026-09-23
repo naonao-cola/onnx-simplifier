@@ -1,5 +1,8 @@
 # Mask R-CNN live demo app (Android, Hexagon HTP + HVX)
 
+Model buttons (top): Mask R-CNN, YOLO26n, YOLO11n, RT-DETR and SAM, each engine in its own process
+(one model loaded at a time); see the YOLO, RT-DETR and SAM sections below for the newer modes.
+
 An Android app that runs the full Mask R-CNN (ONNX model zoo `MaskRCNN-12-qdq`) on the phone
 (Xiaomi 12S, Snapdragon 8+ Gen 1), frame by frame, from the camera or a set of test images, with
 boxes, labels, instance masks and an FPS / latency / per-stage counter. It runs the pipeline
@@ -13,6 +16,106 @@ boxes, labels, instance masks and an FPS / latency / per-stage counter. It runs 
 | RoiAlign + level merge, straight to the heads' uint8 input | HVX DSP, FastRPC skel `../tinygrad_hexagon_bridge/roialign_fast/roialign_u8_*` (PR #1848) |
 | image preprocessing (camera YUV or RGBA -> rotated, letterboxed uint8 NHWC) | native, one pass |
 | everything else (per-class NMS, box decode, ...) | ORT CPU, 4 threads |
+
+## YOLO mode (YOLO26n / YOLO11n)
+
+The model buttons (top right) switch between Mask R-CNN and the deploy pipeline's YOLO models
+(`../deploy/models/yolo26n.yaml`, `yolo11n.yaml`; PR #1865). `YoloActivity` runs in its own
+process (`:yolo`), since each native engine holds process-wide HTP/DSP state and `onDestroy` ends its
+process; the two YOLO buttons switch models in place (the engine re-inits its HTP session).
+
+- `native/yolo_engine.cpp` (`libyolo_demo.so`): one HTP session (ORT + QNN EP, strict, EP-context
+  model `<model>.ctx0.onnx` compiled on the first launch), fed the camera YUV frame (or a test image)
+  rotated upright and letterboxed to 640x640 (centered, pad 114, as `deploy/stages/images.py`) as
+  uint8 NHWC in one native pass -- the model's input *is* the RGB bytes (scale 1/255, zero point 0).
+  The head's `(1, 84, 8400)` output is post-processed in C++: YOLO26's NMS-free two-stage top-k
+  (the deploy pipeline's `yolo_end2end`, no NMS) or YOLO11's per-class NMS (iou 0.7, conf 0.25).
+- Camera: the smallest 4:3 size covering 640 (640x480), and the fastest fixed AE frame-rate range
+  (auto-exposure otherwise drops to ~14 FPS indoors, which was the cap).
+- Models: `YOLO="<deploy work>/yolo26n/pipe/yolo26n.onnx <deploy work>/yolo11n/pipe/yolo11n.onnx" ./deploy.sh`,
+  then `adb shell am start -n org.onnxsim.maskrcnndemo/.YoloActivity [--es mode images] [--es model yolo11n]`.
+
+Measured on the phone (medians of the app's running averages, under the shared phone lock):
+
+| model, mode | end-to-end FPS | inference | pre | HTP | post |
+|---|---:|---:|---:|---:|---:|
+| YOLO26n, test images | 100-111 | 2.9 ms | 0.1 | 2.5 | 0.3 |
+| YOLO11n, test images | 91 | 3.3 ms | 0.1 | 2.6 | 0.6 |
+| YOLO26n, camera, AE default | 14.2 (camera-capped) | 9.1 ms | 5.4 | 3.0 | 0.8 |
+| YOLO11n, camera, AE default | 14.2 (camera-capped) | 10.0 ms | 5.5 | 3.0 | 1.4 |
+| **YOLO26n, camera, fixed 30 FPS AE** | **30.0-30.6 (camera-capped)** | 8.2-9.0 ms | 4.5-5.6 | 2.9 | 0.5-0.8 |
+
+<img src="docs/yolo26n_images.jpg" width="240" alt="YOLO26n on COCO val2017 #139 in the app">
+
+Inference alone would allow ~110 FPS from the camera and ~330 FPS from decoded images; end to end is
+bounded by the camera (30 FPS) and, in images mode, by the Java JPEG decode + UI draw per frame.
+The camera preprocessing (4.5-5.6 ms at 640x480) is the column-wise plane reads of the 90-degree
+rotation, as in the Mask R-CNN path. Box placement was checked visually on COCO val2017 #139.
+YOLO26's end-to-end top-k is cheaper than YOLO11's NMS here too (0.3 vs 0.6 ms on images).
+
+## RT-DETR mode (RT-DETR-r18, NMS-free, HTP + HVX)
+
+The "RT-DETR" button (`RtDetrActivity`, process `:rtdetr`, the YOLO mode's loop with another engine)
+runs RT-DETR-r18 from `../vision_models/rtdetr` (PR #1867) the way its phone runner does: 4 strict
+HTP pieces (backbone uint8 + hybrid encoder W8A16, uint8 value maps) around 3 multi-scale deformable
+attention calls on the HVX (`../msda_hvx` skel, `MSDA_FLAGS=260`). `native/rtdetr_engine.cpp`
+`#include`s `../vision_models/rtdetr/msda_hvx/dec_run.cpp` for its rpcmem tensor store, piece
+runner and msda call; the input is the frame stretched to 640x640 (HF's processor: no letterbox),
+detections are sigmoid + top-k over queries x classes (no NMS), shown at score >= 0.4.
+Models: `RTDETR=$HOME/.cache/onnxsim-rtdetr/work/split ./deploy.sh` (`split.py export` + `quant
+--policy bb8enc16 --u8-values`).
+
+| mode | end-to-end FPS | inference | pre | HTP pieces | MSDA calls (in-DSP) |
+|---|---:|---:|---:|---:|---:|
+| test images | 34.7-35.0 | 19.4-19.7 ms | 1.1-1.2 | 15.0-15.2 | 3.3 (2.6) |
+| camera (fixed 30 FPS AE) | 29.8-30.1 (camera-capped) | 23.7-24.4 ms | 4.1-4.8 | 15.5 | 4.0 (3.3) |
+
+Same as the runner's 18.3 ms plus the app's preprocessing. Against YOLO26n (2.9 ms), RT-DETR is ~7x
+the inference per frame but needs no NMS and keeps small, crowded detections (19 on this image).
+
+<img src="docs/rtdetr_images.jpg" width="240" alt="RT-DETR-r18 on a crowded COCO image in the app">
+
+## SAM mode (tap to segment, EfficientViT-SAM-L0)
+
+The "SAM" button runs Segment Anything (`SamActivity`, its own process `:sam`,
+`native/sam_engine.cpp` -> `libsam_demo.so`): EfficientViT-SAM-L0 from `../vision_models/sam`
+(PR #1876, with its exact bicubic-as-depthwise-conv neck rewrite), encoder and decoder both strict on
+the HTP from EP-context models.
+
+- **images:** each test image is encoded once (longest side -> 512, padded bottom/right with the SAM
+  mean pixel, uint8 NHWC; normalization is in the graph); every tap runs only the decoder with that
+  point (+ a padding point), and the mask of slot 1 + argmax(iou[1:]) is overlaid (a low-res pixel =
+  2x2 encoder pixels). "Next image" moves on.
+- **camera:** a live preview (no inference); a tap freezes that frame and runs the encoder, then the
+  decoder; further taps only decode; "Live" unfreezes.
+- Models: `SAM=$HOME/.cache/onnxsim-sam/efficientvit_sam_l0 ./deploy.sh` (the `sam.py` work dir:
+  `enc.fp16.onnx`, `dec.sim.onnx`); `--es tap 0.5,0.55` taps automatically after each encode.
+
+| | ms |
+|---|---:|
+| encoder, per image / frozen frame (pre 0.3-0.4, camera 5.6) | 41.3-42.5 |
+| decoder, per tap | 11.2-13.6 |
+| first tap on a new image / frozen camera frame | ~53-60 |
+| init, first launch (compiles both HTP graphs) / later launches | 11.0 s / 0.44 s |
+
+<img src="docs/sam_l0_images.jpg" width="240" alt="SAM mode: a tap on the snow segments the slope around the skier">
+
+(phone, under the shared phone lock; the encoder matches #1876's 41.8 ms.) Each extra tap costs
+~11 ms, so segmenting feels immediate after the one-off encode.
+
+## More modes: follow-ups (not built)
+
+- **BEV replay** (Fast-BEV++, PR #1873 / #1895 pipelined): bundle a few nuScenes-mini scene-0103
+  frames (6 cameras each; nuScenes is CC BY-NC-SA 4.0, so keep it to a handful and credit it),
+  run the image piece + the in-graph view transform + BEV head on the HTP per frame, decode on the
+  CPU, and draw the 6 camera thumbnails with projected 3D boxes plus a top-down BEV view. Needs the
+  per-rig lookup table and the camera calibration shipped with the frames, and a 3D-box projection
+  in Java. A toggle for StreamPETR (#1884) / BEVFormer (#1879) on the same frames would reuse the
+  data and the drawing.
+- **LLM chat** (SmolLM2-135M fp16 on the HTP, #1886: 24.5 ms prefill for 128 tokens, 110 tok/s):
+  a text box streaming greedy tokens. Needs the prefill and single-token decode graphs with the KV
+  cache as uint8/fp16 I/O driven from a native loop, plus the tokenizer (a small BPE in C++ or
+  Java) -- the decode step graph is the piece to port from `../llm_tinygrad`.
 
 ## Result
 

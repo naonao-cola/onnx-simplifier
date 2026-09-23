@@ -50,17 +50,32 @@ final class Engine {
         return got;
     }
 
-    /** One frame's output, in model-input pixel coordinates (image top-left aligned in 1088x800). */
+    /**
+     * One frame's output, in the displayed frame's pixel coordinates (for Mask R-CNN: model-input
+     * pixels, image top-left aligned in 1088x800). Also used by the YOLO mode: no masks
+     * (masks.length == 0), its own score threshold and timing slots.
+     */
     static final class Result {
-        final float[] boxes = new float[4 * MAX_DET];
-        final int[] labels = new int[MAX_DET];
-        final float[] scores = new float[MAX_DET];
-        final float[] masks = new float[784 * MAX_DET];
-        final float[] times = new float[T_N];
+        final float[] boxes, scores, masks, times;
+        final int[] labels;
         final int[] ndet = new int[1];
+        final float thresh;
         int n;
         long id;
         Bitmap frame;   // the (resized) frame the result belongs to
+
+        Result() {
+            this(MAX_DET, true, T_N, OverlayView.SCORE_THRESH);
+        }
+
+        Result(int maxDet, boolean withMasks, int nTimes, float thresh) {
+            boxes = new float[4 * maxDet];
+            labels = new int[maxDet];
+            scores = new float[maxDet];
+            masks = new float[withMasks ? 784 * maxDet : 0];
+            times = new float[nTimes];
+            this.thresh = thresh;
+        }
     }
 
     /** Returns the finished frame's id (r filled), -1 if none yet; throws on error. */

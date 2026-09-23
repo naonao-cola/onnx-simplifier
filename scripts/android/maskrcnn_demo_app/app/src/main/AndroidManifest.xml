@@ -17,5 +17,25 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- YOLO mode in its own process: each native engine owns process-wide HTP/DSP state, and
+             onDestroy ends its process, so the model buttons switch processes cleanly. -->
+        <activity
+            android:name=".YoloActivity"
+            android:process=":yolo"
+            android:exported="true"
+            android:screenOrientation="fullUser"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden" />
+        <activity
+            android:name=".RtDetrActivity"
+            android:process=":rtdetr"
+            android:exported="true"
+            android:screenOrientation="fullUser"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden" />
+        <activity
+            android:name=".SamActivity"
+            android:process=":sam"
+            android:exported="true"
+            android:screenOrientation="fullUser"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden" />
     </application>
 </manifest>

@@ -3,7 +3,12 @@
 #   ./deploy.sh                    models copied on-device from ../e2e_pipeline's /data/local/tmp/e2e
 #   MODELS=<build_models.py --out dir> ./deploy.sh      models pushed from the host instead
 #   IMGS="a.jpg b.jpg ..." ./deploy.sh                  JPEGs for the "images" test mode
+#   YOLO="<deploy work>/yolo26n/pipe/yolo26n.onnx ..." ./deploy.sh   models for the YOLO mode
+#   RTDETR=<rtdetr split.py work dir, e.g. ~/.cache/onnxsim-rtdetr/work/split> ./deploy.sh   RT-DETR
+#   SAM=<sam.py work dir, e.g. ~/.cache/onnxsim-sam/efficientvit_sam_l0> ./deploy.sh   the SAM mode
 # Then:  adb shell am start -n org.onnxsim.maskrcnndemo/.MainActivity [--es mode images] [--es pipe pipe_e_opt.txt]
+#        adb shell am start -n org.onnxsim.maskrcnndemo/.YoloActivity [--es mode images] [--es model yolo11n]
+#        adb shell am start -n org.onnxsim.maskrcnndemo/.SamActivity [--es mode images] [--es tap 0.5,0.5]
 #
 # Files go to the app's *internal* files dir through `run-as` (the APK is debuggable): files adb
 # puts under /sdcard/Android/data/<pkg> are owned by the shell user and unreadable by the app.
@@ -13,7 +18,7 @@ A=(adb -s "$DEVICE_SERIAL")
 PKG=org.onnxsim.maskrcnndemo
 HERE="$(cd "$(dirname "$0")" && pwd)"
 APK="$HERE/app/build/outputs/apk/debug/app-debug.apk"
-STAGE=/data/local/tmp/maskrcnn_demo_stage
+STAGE="${STAGE:-/data/local/tmp/maskrcnn_demo_stage}"
 "${A[@]}" install -r -g "$APK"            # -g grants CAMERA
 "${A[@]}" shell am force-stop $PKG
 RA() { "${A[@]}" shell "run-as $PKG sh -c '$1'"; }
@@ -40,6 +45,39 @@ if [ -z "${NO_CTX:-}" ]; then
   for f in backbone_opt.ctx0.onnx backbone_opt.ctx0_qnn.bin box_head_1000_u8.ctx0.onnx box_head_1000_u8.ctx0_qnn.bin \
            mask_head_32_u8.ctx0.onnx mask_head_32_u8.ctx0_qnn.bin mask_head_100_u8.ctx0.onnx mask_head_100_u8.ctx0_qnn.bin; do
     RA "[ ! -f $SRC/$f ] || cmp -s $SRC/$f files/models/$f || cp $SRC/$f files/models/"
+  done
+fi
+# YOLO mode: deploy-pipeline YOLO models (../deploy: <work>/<name>/pipe/<name>.onnx, uint8 NHWC in,
+# the head's (1, 4+nc, N) out), e.g. YOLO="$HOME/.cache/onnxsim-deploy/yolo26n/pipe/yolo26n.onnx ..."
+# The app compiles each one's EP-context model (<name>.ctx0.onnx) on its first launch.
+if [ -n "${YOLO:-}" ]; then
+  "${A[@]}" shell "mkdir -p $STAGE/yolo"
+  for f in $YOLO; do
+    "${A[@]}" push -q "$f" "$STAGE/yolo/"
+    b=$(basename "$f")
+    RA "cmp -s $STAGE/yolo/$b files/models/$b || { cp $STAGE/yolo/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
+  done
+fi
+# SAM mode: EfficientViT-SAM-L0 from ../vision_models/sam (sam.py export + quantize; its work dir,
+# e.g. SAM=$HOME/.cache/onnxsim-sam/efficientvit_sam_l0): enc.fp16.onnx -> sam_l0_enc.onnx,
+# dec.sim.onnx -> sam_l0_dec.onnx. EP-context models are compiled on the app's first SAM launch.
+if [ -n "${SAM:-}" ]; then
+  "${A[@]}" shell "mkdir -p $STAGE/sam"
+  "${A[@]}" push -q "$SAM/enc.fp16.onnx" "$STAGE/sam/sam_l0_enc.onnx"
+  "${A[@]}" push -q "$SAM/dec.sim.onnx" "$STAGE/sam/sam_l0_dec.onnx"
+  for b in sam_l0_enc.onnx sam_l0_dec.onnx; do
+    RA "cmp -s $STAGE/sam/$b files/models/$b || { cp $STAGE/sam/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
+  done
+fi
+# RT-DETR mode: the pieces from ../vision_models/rtdetr/msda_hvx/split.py (export + quant --policy
+# bb8enc16 --u8-values), e.g. RTDETR=$HOME/.cache/onnxsim-rtdetr/work/split: pre.bb8enc16.v8.onnx,
+# mid0/mid1/post.sim.onnx -> rtdetr_{pre,mid0,mid1,post}.onnx
+if [ -n "${RTDETR:-}" ]; then
+  "${A[@]}" shell "mkdir -p $STAGE/rtdetr"
+  "${A[@]}" push -q "$RTDETR/pre.bb8enc16.v8.onnx" "$STAGE/rtdetr/rtdetr_pre.onnx"
+  for n in mid0 mid1 post; do "${A[@]}" push -q "$RTDETR/$n.sim.onnx" "$STAGE/rtdetr/rtdetr_$n.onnx"; done
+  for n in pre mid0 mid1 post; do
+    RA "cmp -s $STAGE/rtdetr/rtdetr_$n.onnx files/models/rtdetr_$n.onnx || { cp $STAGE/rtdetr/rtdetr_$n.onnx files/models/ && rm -f files/models/rtdetr_$n.ctx0*; }"
   done
 fi
 if [ -n "${IMGS:-}" ]; then
