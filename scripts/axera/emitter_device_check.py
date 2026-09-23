@@ -29,7 +29,6 @@ Usage::
 
 from __future__ import annotations
 
-import fcntl
 import gzip
 import json
 import os
@@ -228,6 +227,8 @@ def run(model: onnx.ModelProto, feeds: Mapping) -> dict:
     with tempfile.TemporaryDirectory(dir=os.environ.get("EMITTER_CHECK_TMP")) as td:
         path = os.path.join(td, "m.axmodel")
         onnx.save(model, path)
+        import fcntl  # POSIX-only; imported here so this module (and its tests) import on Windows
+
         fd = os.open(_LOCK, os.O_CREAT | os.O_RDWR, 0o666)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
