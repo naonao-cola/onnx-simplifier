@@ -72,7 +72,10 @@ import step_recalibrate as sr  # noqa: E402
 LANE_REGS = frozenset(range(0x0F50, 0x1010, 0x10))
 """Float32 scale lanes: ``1/s`` and ``s`` groups at ``0x0f50..0x0fc0``
 (#1831) and the divisor group at ``0x0fd0..0x1000`` (#1836)."""
-ZERO_POINT_REGS = frozenset(sr.ZERO_POINT_REGS)
+ZERO_POINT_REGS = frozenset(sr.ZERO_POINT_REGS) | {0x1EB0}
+"""Plus ``0x1eb0``, the third zero-point register the Reshape->Relu layout
+writes (docs/axera-step-real-calibration.md): a signed-input 3x3 Conv chain
+writes its input zero point there."""
 OFFSET_REGS = frozenset(range(0x1EF0, 0x1F30, 0x10))
 """A fused Add (a live bias) carries the int32 zero-point offset of
 ``binary_op_scale_emit.zp_offset`` on these four lanes (#1869)."""
@@ -123,12 +126,21 @@ def load_model(path: str) -> onnx.ModelProto:
     return onnx.load_model_from_string(_read(path))
 
 
+I8 = "#i8"
+"""Suffix of a tensor's second quantization: a uint8 tensor that also feeds a
+MatMul is requantized by it to symmetric int8, and that consumer's view
+(``quant_min`` -128, its own scale) is a separate scale the MatMul's lanes
+use (``1/s`` of it in a dW chain whose activation also has a uint8 use)."""
+
+
 def quant_scales(quant: dict) -> Scales:
     """``{tensor: (scale, zero_point)}`` from a Pulsar2 ``quant_axmodel.json``.
     ``tensor_configs`` names each tensor per consumer, with the hash of its
-    quantization in ``values``."""
+    quantization in ``values``. A tensor seen both as uint8 and, by a MatMul,
+    as symmetric int8 at another scale keeps the uint8 view under its name
+    and the int8 one under ``name + I8``."""
     values = quant["values"]
-    out: Scales = {}
+    views: dict[str, list[tuple[float, float, bool]]] = {}
     for per_op in quant["tensor_configs"].values():
         for name, cfg in per_op.items():
             key = str(cfg.get("dominator", cfg.get("hash")))
@@ -138,7 +150,15 @@ def quant_scales(quant: dict) -> Scales:
                 and isinstance(v.get("scale"), list)
                 and len(v["scale"]) == 1
             ):
-                out[name] = (float(v["scale"][0]), float(v["zero_point"][0]))
+                q = (float(v["scale"][0]), float(v["zero_point"][0]))
+                views.setdefault(name, []).append((*q, cfg.get("quant_min", 0) < 0))
+    out: Scales = {}
+    for name, vs in views.items():
+        u8 = [v for v in vs if not v[2]]
+        i8 = [v for v in vs if v[2]]
+        out[name] = (u8[-1] if u8 else vs[-1])[:2]
+        if u8 and i8 and i8[-1][0] != u8[-1][0]:
+            out[name + I8] = i8[-1][:2]
     return out
 
 
@@ -178,8 +198,17 @@ def evaluate(role: Role, scales: Scales) -> int:
         return _bits(-scales[role[1]][1])
     if kind == "zp":
         return int(scales[role[1]][1]) & 0xFFFFFFFF
+    if kind == "zpk":
+        return int(scales[role[1]][1]) * role[2] & 0xFFFFFFFF
+    if kind == "zp8":
+        z = int(scales[role[1]][1])
+        if not 0 < z < 256:
+            raise CalibrationError(f"zero point {z} of {role[1]} is not one byte")
+        return z
     if kind in ("zpoff", "qshift", "q15", "rqoff", "rqshift"):
         return _bias_add(kind, *role[1:], scales)
+    if kind == "cat15":
+        return _cat15(*role[1:], scales)
     raise ValueError(f"unknown role {role!r}")
 
 
@@ -208,8 +237,27 @@ def _requant(kind: str, x: str, y: str, scales: Scales) -> int:
             raise CalibrationError(f"requantize ratio of {y} does not fit Q15")
     if kind == "rqshift":
         return 0x80 | (15 - k)
-    c = zy - zx * float(np.float32(sx / sy))
+    # zp_x * r is a float32 product: with a double one, 2 of 6 native
+    # offsets (signed-input chains, zp_x 98..113) come out one too high.
+    r = np.float32(sx / sy)
+    c = zy - float(np.float32(np.float32(zx) * r))
     return int(c * 2.0 ** (15 - k)) & 0xFFFFFFFF
+
+
+def _q15_at_most_one(a: str, b: str, scales: Scales) -> int:
+    r = scales[a][0] / scales[b][0]
+    if a == b or r > 1.0:
+        raise CalibrationError(f"Concat ratio {a}/{b} = {r} is not in (0, 1]")
+    return int(round(r * 2.0**15))
+
+
+def _cat15(a: str, b: str, c: str, d: str, scales: Scales) -> int:
+    """A 3x3 Conv chain's Concat header in ``npu_params``: the activation
+    taps' ratio into their Concat (``s_a/s_b``) and the weight taps' ratio
+    into theirs (``s_c/s_d``), each ``round(r * 2**15)`` as a uint16, low
+    half first. Both ratios are at most 1 (the requantize's ``k = 0``), so a
+    ratio a hair below 1 stores 32768, one further down 32767."""
+    return _q15_at_most_one(a, b, scales) | _q15_at_most_one(c, d, scales) << 16
 
 
 def _add(kind: str, x: str, z: str, y: str, scales: Scales) -> int:
@@ -284,8 +332,12 @@ def locate(model: onnx.ModelProto, scales: Scales) -> dict:
     Param entries cover only the words that some role explains. The other
     words are shape data (DMA descriptors, padding) and stay as they are."""
     segs = codec.decode_segments(sr.get_mcode(model))
-    ftable = role_table(scales, float_roles(scales))
-    ztable = role_table(scales, [("zp", t) for t in scales])
+    ftable = role_table(scales, float_roles(_representatives(scales)))
+    ztable = role_table(
+        scales,
+        [("zp", t) for t in scales]
+        + [("zpk", t, k) for t in scales for k in POOL_WINDOWS if scales[t][1]],
+    )
     recs = []
     for si, seg in enumerate(segs):
         for off, verb, reg, value in _records(seg):
@@ -293,7 +345,8 @@ def locate(model: onnx.ModelProto, scales: Scales) -> dict:
                 continue
             if reg in LANE_REGS:
                 recs.append((si, off, reg, value, ftable.get(value, [])))
-            elif reg in ZERO_POINT_REGS:
+            elif reg in ZERO_POINT_REGS and (reg != 0x1EB0 or value in ztable):
+                # 0x1eb0 also carries non-zero-point words (0x80000000)
                 recs.append((si, off, reg, value, ztable.get(value, [])))
     params = params_of(model)
     lanes = _param_lanes(params, ftable)
@@ -305,6 +358,7 @@ def locate(model: onnx.ModelProto, scales: Scales) -> dict:
     ]
     if offsets:
         recs, lanes = _locate_bias_add(segs, scales, offsets, recs, params, lanes)
+    lanes = sorted(lanes + _zp8_lanes(params, scales, lanes))
     return {
         "segments": segs,
         "params_bytes": params,
@@ -314,6 +368,37 @@ def locate(model: onnx.ModelProto, scales: Scales) -> dict:
 
 
 MIN_LANE_RUN = 4
+
+POOL_WINDOWS = (49, 196, 784, 3136)
+"""A mean pool fused into a chain (the classifier's ReduceMean over 7x7)
+writes its input zero point times the window size to a zero-point
+register (``zpk``): 4508 = 92 * 49 in the Gemm chain. The step's global
+pools are these spatial sizes."""
+
+
+def _zp8_lanes(params: bytes, scales: Scales, taken_lanes: list) -> list:
+    """A uint8 input requantized inside the chain also leaves its zero point
+    in ``npu_params`` as a run of equal bytes (signed-input Conv chains: 9 or
+    32 bytes of ``zp_x``, not word-aligned). One ``zp8`` entry per byte of a
+    run of at least ``2 * MIN_LANE_RUN`` bytes, outside the float lanes."""
+    zps: dict[int, list[Role]] = {}
+    for t, (_, z) in scales.items():
+        if 0 < z < 256:
+            zps.setdefault(int(z), []).append(("zp8", t))
+    taken = {
+        o + d for o, v, r in taken_lanes for d in range(1 if r[0][0] == "zp8" else 4)
+    }
+    out, i = [], 0
+    while i < len(params):
+        j = i
+        while j < len(params) and params[j] == params[i]:
+            j += 1
+        if params[i] in zps and j - i >= 2 * MIN_LANE_RUN:
+            out += [
+                (o, params[i], zps[params[i]]) for o in range(i, j) if o not in taken
+            ]
+        i = j
+    return out
 
 
 def _param_lanes(params: bytes, ftable: dict[int, list[Role]]) -> list:
@@ -368,6 +453,15 @@ def _offset_groups(segs):
     return groups
 
 
+def _representatives(scales: Scales) -> list[str]:
+    """One tensor name per distinct ``(scale, zero point)``, the first in
+    sort order. A chain's taps share their source's quantization
+    (OVERLAPPED), and the stem Conv's 147 taps make the role searches (cubic
+    in names) take minutes otherwise; twins move together, so the stand-in
+    gives the same value at any calibration."""
+    return sorted({v: t for t, v in sorted(scales.items(), reverse=True)}.values())
+
+
 def _locate_bias_add(segs, scales, offsets, recs, params, lanes):
     """The zero-point offset groups of a fused chain, each with the
     ``SHIFT_REG`` write before it, and a bias Add's ``npu_params`` header.
@@ -380,8 +474,9 @@ def _locate_bias_add(segs, scales, offsets, recs, params, lanes):
     whose offset is 0 is not located (there is nothing to match), and
     ``recalibrate`` cannot tell; the step templates have no such group."""
     del offsets  # regrouped with their shift records below
-    names = sorted(scales)
+    names = _representatives(scales)
     header: dict[int, list[Role]] = {}
+    rq_pairs: set[tuple[str, str]] = set()
     for shift, group in _offset_groups(segs):
         if shift is None:
             raise CalibrationError("zero-point offset lanes without a shift register")
@@ -406,6 +501,8 @@ def _locate_bias_add(segs, scales, offsets, recs, params, lanes):
             for si, off, reg, w in group
         ]
         recs.append((*shift, [(kinds[1], *t) for t in hit]))
+        if kinds[0] == "rqoff":
+            rq_pairs.update(hit)
         if kinds[0] == "zpoff":
             for t in hit:
                 try:
@@ -426,11 +523,54 @@ def _locate_bias_add(segs, scales, offsets, recs, params, lanes):
         raise CalibrationError(
             f"bias Add header found {len(found)} times in npu_params, want once"
         )
+    if rq_pairs:
+        found += _locate_cat_header(scales, rq_pairs, params, lanes + found)
     return recs, sorted(lanes + found)
+
+
+def _locate_cat_header(scales, rq_pairs, params, taken_lanes):
+    """The Concat header of a chain that requantizes its weight taps (see
+    ``_cat15``). The weight half's ratio is one of the requantize groups'
+    ``(x, y)`` pairs; the activation half is any pair whose ratio is at most
+    1 and gives the stored value (the taps and their Concat, which usually
+    share no zero-point offset group because both zero points are 0). The
+    header must be found exactly once. The two builds of every 3x3 Conv
+    template before stage2 conv1 stored 32768 in the weight half, so a
+    missing header went unnoticed; stage2 conv1's pair is 32768 vs 32767."""
+    names = sorted(scales)
+
+    def halves(pairs):
+        out: dict[int, list[tuple[str, str]]] = {}
+        for a, b in pairs:
+            try:
+                out.setdefault(_q15_at_most_one(a, b, scales), []).append((a, b))
+            except CalibrationError:
+                pass
+        return out
+
+    hi = halves(sorted(rq_pairs))
+    lo = halves(itertools.permutations(names, 2))
+    taken = {o + d for o, _, _ in taken_lanes for d in range(-3, 4)}
+    found = []
+    for off in range(len(params) - 3):
+        if off in taken:
+            continue
+        v = struct.unpack_from("<I", params, off)[0]
+        wl, wh = v & 0xFFFF, v >> 16
+        if wh in hi and wl in lo:
+            roles = [("cat15", *p, *q) for p in lo[wl] for q in hi[wh]]
+            found.append((off, v, roles))
+    if len(found) != 1:
+        raise CalibrationError(
+            f"Concat header found {len(found)} times in npu_params, want once"
+        )
+    return found
 
 
 PRECEDENCE = (
     "zp",
+    "zp8",
+    "zpk",
     "zpf",
     "nzpf",
     "s",
@@ -443,6 +583,7 @@ PRECEDENCE = (
     "q15",
     "rqoff",
     "rqshift",
+    "cat15",
 )
 """Tie-break between formulas that give the same bits at the template's
 scales. Across 174 builds, ``inv32``/``inv`` (``1/s`` in float32 or
@@ -504,6 +645,15 @@ def recalibrate(
             "Pulsar2 emits a different record count then"
         )
     _check_fixed_ratios(old, new)
+    groups: dict[tuple, list[str]] = {}
+    for t, v in old.items():
+        groups.setdefault(v, []).append(t)
+    split = [ts for ts in groups.values() if len({new[t] for t in ts}) > 1]
+    if split:
+        raise CalibrationError(
+            f"tensors that share a quantization in the template part at the new "
+            f"scales: {sorted(split[0])[:4]}; roles name one of them for all"
+        )
     found = locate(model, old)
     segs = [bytearray(s) for s in found["segments"]]
     changed: set[int] = set()
@@ -517,7 +667,10 @@ def recalibrate(
     params = bytearray(found["params_bytes"])
     for off, value, roles in found["params"]:
         nv = _new_value(f"npu_params byte {off}", value, roles, new)
-        struct.pack_into("<I", params, off, nv)
+        if roles[0][0] == "zp8":  # one byte, not a word
+            params[off] = nv
+        else:
+            struct.pack_into("<I", params, off, nv)
     mc = sr.get_mcode(model)
     new_mc = sr.replace_segments(mc, {i: bytes(segs[i]) for i in changed})
     sr.check_relayout(new_mc, [bytes(s) for s in segs])
@@ -663,6 +816,7 @@ def step_template(node: str, manifest: dict | None = None) -> dict:
         "quant": os.path.join(STEP_TEMPLATE_DIR, t["quant"]),
         "names": dict(zip(entry["names"], t["names"])),
         "constants": list(t.get("constants", [])),
+        "aliases": dict(t.get("aliases", {})),
     }
 
 
@@ -675,9 +829,27 @@ def step_node_scales(entry: dict, template_scales: Scales, scales: Scales) -> Sc
     for step_name, name in entry["names"].items():
         if step_name in scales:
             out[name] = scales[step_name]
+        if step_name + I8 in scales and name + I8 in template_scales:
+            out[name + I8] = scales[step_name + I8]
+    # An int8 view no consumer declares in the step's calibration (the
+    # weight's view by the Reshape that starts a dX kernel path) is the
+    # quantization of the int8 tensor it overlaps: take that tensor's scale.
+    for t, v in template_scales.items():
+        if t.endswith(I8) and t not in out:
+            twins = [
+                u for u, w in template_scales.items() if w == v and u != t and u in out
+            ]
+            if twins:
+                out[t] = out[twins[0]]
     for name in entry["constants"]:
         if name in template_scales:
             out[name] = template_scales[name]
+    # A template-only side output (an Identity that keeps a chain input
+    # uint8, as its other consumers keep it in the step) shares its source's
+    # quantization.
+    for name, src in entry.get("aliases", {}).items():
+        if src in out:
+            out[name] = out[src]
     missing = sorted(set(template_scales) - set(out))
     if missing:
         raise CalibrationError(f"no step scale for template tensors {missing}")

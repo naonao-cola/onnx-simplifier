@@ -105,6 +105,38 @@ def test_mixed_use_tensor_stays_uint8_with_a_consumer_requant():
     assert q["m"]["consumer_int8_scale"] == pytest.approx(1.0 / 127.5)
 
 
+def test_passive_op_into_matmuls_requantizes_a_mixed_use_input():
+    # m has a ReduceSum use, so it stays uint8; the Reshape between m and the
+    # MatMul only feeds the MatMul, so Pulsar2 requantizes there: the Reshape
+    # output gets its own symmetric int8 parameters instead of overlapping m
+    # (the mixed_reshape_mm build).
+    q = _assign(
+        """g (float[16,64] a, float[16,64] b, float[64,32] w) => (float[4,4,32] y1, float[64] y2) {
+            m = Mul(a, b)
+            s = Constant <value = int64[3] {4, 4, 64}> ()
+            r = Reshape(m, s)
+            y1 = MatMul(r, w)
+            ax = Constant <value = int64[1] {0}> ()
+            y2 = ReduceSum <keepdims = 0> (m, ax)
+        }""",
+        {
+            "a": (-1, 2),
+            "b": (-1, 1),
+            "w": (-1, 1),
+            "m": (-0.5, 1.0),
+            "r": (-0.5, 1.0),
+            "y1": (-3, 1),
+            "y2": (-2, 4),
+        },
+    )
+    assert not q["m"]["signed"] and q["m"]["zero_point"] == 85
+    assert q["r"] == {
+        "scale": pytest.approx(1.0 / 127.5),
+        "zero_point": 0,
+        "signed": True,
+    }
+
+
 def test_relu_shares_its_input_quantization_unless_it_fuses():
     body = """g (float[8] a, float[8] b) => (float[8] r{extra_out}) {{
         s = Add(a, b)
@@ -222,21 +254,21 @@ def test_coverage_at_the_predicted_step_calibration():
         assert report["per_op"][op] == counts, op
 
 
-_EXPECTED_TOTALS = {"covered": 467, "refused": 637}
+_EXPECTED_TOTALS = {"covered": 481, "refused": 623}
 _EXPECTED_PER_OP = {
     "Add": {"covered": 43, "refused": 101},
-    "Conv": {"refused": 20},
+    "Conv": {"covered": 5, "refused": 15},
     "Div": {"covered": 1, "refused": 51},
     "Gemm": {"refused": 1},
     "Log": {"covered": 2},
-    "MatMul": {"covered": 24, "refused": 17},
+    "MatMul": {"covered": 36, "refused": 5},
     "MaxPool": {"covered": 1},
     "Mul": {"covered": 14, "refused": 383},
     "ReduceMean": {"refused": 1},
     "Neg": {"covered": 2},
     "ReduceSum": {"covered": 44},
     "Relu": {"covered": 17},
-    "Reshape": {"covered": 153, "refused": 17},
+    "Reshape": {"covered": 150, "refused": 20},
     "Softmax": {"covered": 3},
     "Sqrt": {"covered": 42},
     "Sub": {"refused": 46},

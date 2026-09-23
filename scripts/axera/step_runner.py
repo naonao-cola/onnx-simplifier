@@ -196,8 +196,16 @@ def _segment_for(
         entry = mre.step_template(name)
         tmpl = mre.load_model(entry["axmodel"])
         inv = {v: k for k, v in entry["names"].items()}
+        # Template-only tensors (docs/axera-matmul-step-templates.md): a
+        # ``__pre`` input feeds a Relu whose output is the step tensor (Relu
+        # is idempotent, so the step's Relu output goes in); ``__side``
+        # outputs only keep an input uint8 and are not step outputs.
+        aliases = entry.get("aliases", {})
+        for a, src in aliases.items():
+            if a.endswith("__pre") and src in inv:
+                inv[a] = inv[src]
         t_in = [inv[i.name] for i in tmpl.graph.input]
-        t_out = [inv[o.name] for o in tmpl.graph.output]
+        t_out = [inv[o.name] for o in tmpl.graph.output if o.name not in aliases]
         internal = [
             s
             for s, t in entry["names"].items()
@@ -215,6 +223,8 @@ def _segment_for(
                     real[step_name] = (qq["consumer_int8_scale"], 0.0)
                 else:
                     real[step_name] = (qq["scale"], float(qq["zero_point"]))
+                if "consumer_int8_scale" in qq and tname + mre.I8 in old:
+                    real[step_name + mre.I8] = (qq["consumer_int8_scale"], 0.0)
             new = mre.step_node_scales(entry, old, real)
             out, _ = mre.recalibrate(tmpl, old, new)
             return out
@@ -223,7 +233,7 @@ def _segment_for(
         old = mre.load_scales(entry["quant"])
         for t in t_in:
             qq = calib["tensors"][t]
-            tn = entry["names"][t]
+            tn = entry["names"].get(t, "")
             if "consumer_int8_scale" in qq and tn in old and old[tn][1] == 0:
                 in_q.append((float(qq["consumer_int8_scale"]), 0, True))
             else:

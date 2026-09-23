@@ -25,6 +25,12 @@ match** (scale to 1e-4 relative, zero point to ±1, signedness exactly).
   A Mul that feeds both a MatMul and a ReduceSum stays uint8 at its own
   range, and the MatMul gets a separate int8 config for it. Probe:
   `mixed_mm_rs`.
+- **A passive op whose output feeds only MatMuls, while its input has other
+  uses, requantizes.** Its output gets its own symmetric int8 parameters over
+  its own range and does not overlap its uint8 input (the `mixed_reshape_mm`
+  probe: `Mul -> {ReduceSum, Reshape -> MatMul}`, and the side-output Conv
+  builds). This is what makes the 17 MatMul-only Reshapes int8, and the
+  rearranged dX kernels too. `assign` splits the passive group there.
 - **Passive ops share parameters.** Reshape, Transpose, Squeeze, Slice, Pad,
   Relu and MaxPool outputs are `OVERLAPPED` with their input: one scale and
   zero point over the union of the ranges.
