@@ -23,6 +23,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 import android.util.Size;
 import android.view.Gravity;
@@ -68,6 +69,11 @@ public class MainActivity extends Activity {
     private volatile boolean running = true;
     private Thread worker;
 
+    // The fastest measured configuration (README "Optimizations"); pass --es pipe pipe_e_opt.txt
+    // --es opts "" for the original #1841 path.
+    static final String DEFAULT_PIPE = "pipe_e_u8_ctx.txt";
+    static final String DEFAULT_OPTS = "quant=lut;merge=seg2,seg4;pipeline=box_head";
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -81,8 +87,8 @@ public class MainActivity extends Activity {
 
         String mode = getIntent().getStringExtra("mode");
         final boolean cameraMode = mode == null || mode.equals("camera");
-        final String pipe = getIntent().getStringExtra("pipe") != null ? getIntent().getStringExtra("pipe") : "pipe_e_opt.txt";
-        final String opts = getIntent().getStringExtra("opts") != null ? getIntent().getStringExtra("opts") : "";
+        final String pipe = getIntent().getStringExtra("pipe") != null ? getIntent().getStringExtra("pipe") : DEFAULT_PIPE;
+        final String opts = getIntent().getStringExtra("opts") != null ? getIntent().getStringExtra("opts") : DEFAULT_OPTS;
         final boolean overlap = getIntent().getBooleanExtra("overlap", false);
         if (!cameraMode) preview.setVisibility(android.view.View.GONE);
         if (cameraMode && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED)
@@ -154,6 +160,8 @@ public class MainActivity extends Activity {
     private void runLoop(boolean cameraMode, String pipe, String opts, boolean overlapCapture) {
         File models = new File(getFilesDir(), "models");
         overlay.setStats("loading models (" + pipe + ")...");
+        // the camera opens (a few hundred ms, on its own thread) while the models load
+        if (cameraMode) startCamera();
         long t0 = System.nanoTime();
         String err = Engine.nativeInit(models.getAbsolutePath(), getApplicationInfo().nativeLibraryDir,
                 new File(models, pipe).getAbsolutePath(), opts);
@@ -175,8 +183,6 @@ public class MainActivity extends Activity {
                 return;
             }
             if (overlapCapture) new Thread(() -> captureLoop(images), "capture").start();
-        } else {
-            startCamera();
         }
         long[] done = new long[32];
         int nDone = 0;
@@ -232,6 +238,11 @@ public class MainActivity extends Activity {
                 return;
             }
             if (got < 0) continue;  // pipeline filling
+            if (nDone == 0 || nDone == 9) {  // startup: time to the first / tenth shown result
+                long up = SystemClock.uptimeMillis() - android.os.Process.getStartUptimeMillis();
+                Log.i(TAG, String.format(Locale.US, "startup: result %d shown %d ms after process start (init %.0f ms)",
+                        nDone + 1, up, initMs));
+            }
             final long g = got;
             r.frame = inFlight.remove(got);
             inFlight.keySet().removeIf(x -> x < g);

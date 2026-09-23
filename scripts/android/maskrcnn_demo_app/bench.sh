@@ -1,6 +1,8 @@
 #!/bin/bash
 # A/B the demo app's options on the phone: launches each configuration, lets it reach steady state,
-# and reports median FPS / latency / stage times from the app's logcat lines (frames >= SKIP).
+# and reports median FPS / latency / stage times from the app's logcat lines (frames >= SKIP), plus
+# startup: init ms (the engine's phases: env+EP, sessions+DSP, warm-up) and the first / tenth
+# shown result, counted from process start.
 #   ./bench.sh "<label>|<mode>|<pipe>|<opts>|<overlap true/false>" ...
 # e.g. ./bench.sh "base|images|pipe_e_opt.txt||false" "lut|images|pipe_e_opt.txt|quant=lut|true"
 set -euo pipefail
@@ -19,8 +21,12 @@ for spec in "$@"; do
   sleep "$RUN_S"
   "${A[@]}" logcat -d -s MaskRcnnDemo:V | python3 -c '
 import sys, re, statistics as st
-skip = int(sys.argv[2]); rows = []
+skip = int(sys.argv[2]); rows = []; start = {}; phases = ""
 for l in sys.stdin:
+    m = re.search(r"startup: result (\d+) shown (\d+) ms after process start \(init (\d+) ms\)", l)
+    if m: start[int(m.group(1))] = (int(m.group(2)), int(m.group(3)))
+    m = re.search(r"init phases: env\+ep ([\d.]+), sessions\+dsp ([\d.]+), warmup ([\d.]+)", l)
+    if m: phases = "ep %s sess %s warm %s" % m.groups()
     m = re.search(r"frame (\d+) fps ([\d.]+) lat ([\d.]+) \[([^\]]*)\]", l)
     if m and int(m.group(1)) >= skip:
         t = [float(x) for x in m.group(4).split(",")]
@@ -31,6 +37,9 @@ med = lambda i: st.median(r[i] for r in rows)
 # times: total pre backbone rpn roi heads cpu stageA stageB wait
 print("%-28s %6.2f %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f   (n=%d)" % (sys.argv[1], med(0), med(1), med(3), med(4),
       med(6), med(7), med(8), med(10), len(rows)))
+if start:
+    print("%-28s startup: init %s ms (%s), 1st result %s ms, 10th %s ms after process start" % ("", start.get(1, (0, 0))[1],
+          phases, start.get(1, ("-",))[0], start.get(10, ("-",))[0]))
 ' "$label" "$SKIP"
 done
 "${A[@]}" shell am force-stop $PKG
