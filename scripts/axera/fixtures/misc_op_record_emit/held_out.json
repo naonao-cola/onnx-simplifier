@@ -39,6 +39,72 @@
    "y": 0
   }
  },
+ "misc_op_step_templates/Log_16x1000.axmodel.gz": {
+  "op": "Log",
+  "scales": {
+   "x": 0.003921568859368563,
+   "y": 0.03611898049712181
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 255
+  }
+ },
+ "misc_op_step_templates/Log_16x1000__v2.axmodel.gz": {
+  "op": "Log",
+  "scales": {
+   "x": 0.0009803922148421407,
+   "y": 0.03611898049712181
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 255
+  }
+ },
+ "misc_op_step_templates/MaxPool_16x64x112x112.axmodel.gz": {
+  "op": "MaxPool",
+  "scales": {
+   "x": 0.02199968881905079,
+   "y": 0.02199968881905079
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ },
+ "misc_op_step_templates/MaxPool_16x64x112x112__v2.axmodel.gz": {
+  "op": "MaxPool",
+  "scales": {
+   "x": 0.06200381740927696,
+   "y": 0.06200381740927696
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ },
+ "misc_op_step_templates/ReduceMean_16x512x7x7.axmodel.gz": {
+  "op": "ReduceMean",
+  "scales": {
+   "x": 0.018699945881962776,
+   "y": 0.0032624078448861837
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ },
+ "misc_op_step_templates/ReduceMean_16x512x7x7__v2.axmodel.gz": {
+  "op": "ReduceMean",
+  "scales": {
+   "x": 0.05949512869119644,
+   "y": 0.009169379249215126
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ },
  "misc_op_step_templates/ReduceSum_16x1000_axes0-1_k1.axmodel.gz": {
   "scales": {
    "x": 0.03294731304049492,
@@ -117,6 +183,28 @@
   "zero_points": {
    "x": 120,
    "y": 93
+  }
+ },
+ "misc_op_step_templates/Softmax_16x1000.axmodel.gz": {
+  "op": "Softmax",
+  "scales": {
+   "x": 0.09794769436120987,
+   "y": 0.0034618517383933067
+  },
+  "zero_points": {
+   "x": 127,
+   "y": 0
+  }
+ },
+ "misc_op_step_templates/Softmax_16x1000__v2.axmodel.gz": {
+  "op": "Softmax",
+  "scales": {
+   "x": 0.2250576913356781,
+   "y": 0.003907125908881426
+  },
+  "zero_points": {
+   "x": 126,
+   "y": 0
   }
  },
  "teng_register_census/reducesum_asym.axmodel.gz": {

@@ -1,6 +1,6 @@
 """Record-level emitters for the ResNet18 training step's remaining non-memory
-ops: ReduceSum, Greater -> Cast, and the Sqrt shape ``[512,512,3,3]`` that
-``elementwise_scale_emit`` left out.
+ops: ReduceSum, Greater/Less -> Cast, Softmax, Log, MaxPool, ReduceMean, and
+the Sqrt shape ``[512,512,3,3]`` that ``elementwise_scale_emit`` left out.
 
 Every AX650 MCode segment is an LZ77 stream over 8-byte register records
 (``short_unit_codec``, PR #1850). Decompressed, a calibration change touches
@@ -30,6 +30,21 @@ whole records only (``docs/axera-misc-op-record-emit.md``):
   (``zp_x = 64, zp_y = 0``) is the other way round. An omitted write goes
   directly after its stage's ``0x1a90`` record. This model turns either build
   into the other exactly.
+
+* **Softmax, Log, MaxPool, ReduceMean** (the step's tail ops) follow the same
+  lane pattern, one float32 formula per lane run:
+
+  * Softmax: ``1/s_x``, ``s_x``, ``1/s_y``, ``s_y``, plus one ``0x1b10 = zp_x``
+    write before the first run (``zp_y`` is 0 and fixed);
+  * Log: ``1/s_x``, plus a 258-entry u8 table (two u16 entries per record,
+    registers ``0x1050..0x1850``; ``0x1850`` is written after an unrelated
+    ``0x1860..0x1a50`` block): ``clip(rint(log((q - zp_x) s_x) / s_y) + zp_y)``
+    for ``q`` in 0..255, then entry 255 again and a 0;
+  * MaxPool: ``1/s_x`` and ``s_x`` (``s_y = s_x``);
+  * ReduceMean: ``1/s_x``, ``s_x/(s_y*N)`` with ``N`` the reduced element
+    count, and ``s_y``.
+
+  Their zero points are fixed by the template except Softmax's ``zp_x``.
 
 * **Greater -> Cast** is not quantized at all. Builds at the same shape and
   different calibrations are record-identical except segment 0's slot table
@@ -93,7 +108,19 @@ FIXTURES = os.path.join(_HERE, "fixtures")
 TEMPLATE_INDEX = os.path.join(FIXTURES, "misc_op_record_emit", "index.json")
 # segment 0's slot-table records that differ between otherwise identical builds
 SEG0_NOISE = range(2, 6)
-OPS = ("ReduceSum", "Sqrt", "GreaterCast", "LessCast")
+OPS = (
+    "ReduceSum",
+    "Sqrt",
+    "GreaterCast",
+    "LessCast",
+    "Softmax",
+    "Log",
+    "MaxPool",
+    "ReduceMean",
+)
+CALIBRATED = ("ReduceSum", "Sqrt", "Softmax", "Log", "MaxPool", "ReduceMean")
+LOG_TABLE_BASE = 0x1050
+LOG_TABLE_RECORDS = 129  # 258 u16 entries
 CALIBRATION_FREE = ("GreaterCast", "LessCast")
 
 
@@ -105,13 +132,28 @@ def _bits(x: float) -> int:
     return struct.unpack("<I", struct.pack("<f", x))[0]
 
 
-def lane_values(op: str, scales: Mapping[str, float]) -> dict[str, int]:
-    """Float32 bit patterns of each scale-lane formula of ``op``."""
+def lane_values(
+    op: str, scales: Mapping[str, float], reduce_count: int | None = None
+) -> dict[str, int]:
+    """Float32 bit patterns of each scale-lane formula of ``op``.
+    ``reduce_count`` is ReduceMean's number of reduced elements."""
     sx, sy = float(scales["x"]), float(scales["y"])
     if op == "ReduceSum":
         vals = {"1/s_x": 1.0 / sx, "s_x/s_y": sx / sy, "s_y": sy}
     elif op == "Sqrt":
         vals = {"1/s_x": 1.0 / sx, "s_x": sx, "s_y": sy}
+    elif op == "Softmax":
+        vals = {"1/s_x": 1.0 / sx, "s_x": sx, "1/s_y": 1.0 / sy, "s_y": sy}
+    elif op == "Log":
+        vals = {"1/s_x": 1.0 / sx}
+    elif op == "MaxPool":
+        if _f32(sx) != _f32(sy):
+            raise ValueError("MaxPool shares one scale between input and output")
+        vals = {"1/s_x": 1.0 / sx, "s_x": sx}
+    elif op == "ReduceMean":
+        if not reduce_count:
+            raise ValueError("ReduceMean needs its reduced element count")
+        vals = {"1/s_x": 1.0 / sx, "s_x/(s_y*N)": sx / (sy * reduce_count), "s_y": sy}
     else:
         raise ValueError(f"{op!r} has no scale lanes")
     return {k: _bits(_f32(v)) for k, v in vals.items()}
@@ -164,9 +206,12 @@ def _check_distinct(vals: Mapping[str, int], what: str) -> None:
         raise ValueError(f"{what} scale formulas coincide: {dict(vals)}")
 
 
-def _retarget_lanes(words, op, old, new) -> tuple[list[bytes], list[tuple[int, str]]]:
+def _retarget_lanes(
+    words, op, old, new, reduce_count=None
+) -> tuple[list[bytes], list[tuple[int, str]]]:
     """Rewrite scale lanes; returns the words and each lane run's ``(index, kind)``."""
-    old_v, new_v = lane_values(op, old), lane_values(op, new)
+    old_v = lane_values(op, old, reduce_count)
+    new_v = lane_values(op, new, reduce_count)
     _check_distinct(old_v, "template")
     _check_distinct(new_v, "target")
     by_bits = {b: k for k, b in old_v.items()}
@@ -270,6 +315,60 @@ def _retarget_packed_zp(words, old_zx: int, new_zx: int) -> list[bytes]:
     return out
 
 
+def log_table(scales: Mapping[str, float], zero_points: Mapping[str, int]) -> list[int]:
+    """Log's 258-entry u8 lookup table: ``clip(rint(log((q - zp_x) * s_x) / s_y)
+    + zp_y, 0, 255)`` for ``q`` in 0..255 (``log 0`` clips to 0), then entry 255
+    repeated and a 0."""
+    sx, sy = float(np.float32(scales["x"])), float(np.float32(scales["y"]))
+    q = np.arange(256, dtype=np.float64) - int(zero_points["x"])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        v = np.rint(np.log(q * sx) / sy) + int(zero_points["y"])
+    v = np.clip(np.nan_to_num(v, nan=0.0, neginf=0.0), 0, 255).astype(int).tolist()
+    return v + [v[255], 0]
+
+
+def _retarget_log_table(words, old_sc, new_sc, zp) -> list[bytes]:
+    """Rewrite the ``0x1050..0x1850`` table (two u16 entries per record). Each
+    register is written once; ``0x1850`` (entries 256, 257) comes after the
+    unrelated ``0x1860..0x1a50`` block, so records are found by register."""
+    at: dict[int, list[int]] = {}
+    for j, w in enumerate(words):
+        r = _reg(w)
+        if (
+            LOG_TABLE_BASE <= r < LOG_TABLE_BASE + 0x10 * LOG_TABLE_RECORDS
+            and w[0] == 0xA1
+        ):
+            at.setdefault(r, []).append(j)
+    regs = [LOG_TABLE_BASE + 0x10 * k for k in range(LOG_TABLE_RECORDS)]
+    if any(len(at.get(r, [])) != 1 for r in regs):
+        raise ValueError("expected each Log table register written exactly once")
+    old_t, new_t = log_table(old_sc, zp), log_table(new_sc, zp)
+    out = list(words)
+    for k, r in enumerate(regs):
+        j = at[r][0]
+        if _val(words[j]) != old_t[2 * k] | (old_t[2 * k + 1] << 16):
+            raise ValueError("Log table does not match the template's calibration")
+        out[j] = _with_val(words[j], new_t[2 * k] | (new_t[2 * k + 1] << 16))
+    return out
+
+
+def _retarget_input_zp(words, kinds, old_zx: int, new_zx: int) -> list[bytes]:
+    """Softmax: the one ``0x1b10 = zp_x`` write before its first lane run."""
+    if old_zx == new_zx:
+        return list(words)
+    if 0 in (old_zx, new_zx):
+        raise ValueError("zp_x = 0 is not measured (0x1b10 write omission)")
+    first = kinds[0][0]
+    hits = [
+        j for j in range(first) if _reg(words[j]) == ZP_IN and _val(words[j]) == old_zx
+    ]
+    if len(hits) != 1:
+        raise ValueError(f"expected one 0x1b10 = zp_x write, found {len(hits)}")
+    out = list(words)
+    out[hits[0]] = _with_val(words[hits[0]], new_zx)
+    return out
+
+
 def _zp_in_word(words) -> bytes:
     """A ``0x1b10`` record of the stream's own verb/unit, value to be set."""
     for w in words:
@@ -285,26 +384,34 @@ def retarget(
     new_scales: Mapping[str, float],
     old_zero_points: Mapping[str, int] | None = None,
     new_zero_points: Mapping[str, int] | None = None,
+    reduce_count: int | None = None,
 ) -> bytes:
     """``mc`` with its calibration moved from ``old_*`` to ``new_*``.
 
-    Only ReduceSum may change zero points; Sqrt keeps its template's."""
-    if op not in ("ReduceSum", "Sqrt"):
+    ReduceSum may change both zero points and Softmax its ``zp_x``; every other
+    op keeps its template's."""
+    if op not in CALIBRATED:
         raise ValueError(f"no calibration edit for {op!r}")
     old_zp = dict(old_zero_points or {})
     new_zp = dict(new_zero_points or old_zp)
-    if op == "Sqrt" and {k: int(v) for k, v in new_zp.items()} != {
-        k: int(v) for k, v in old_zp.items()
-    }:
-        raise ValueError("Sqrt zero points are fixed by the template")
+    changed = {k for k in old_zp if int(new_zp.get(k, old_zp[k])) != int(old_zp[k])}
+    movable = {"ReduceSum": {"x", "y"}, "Softmax": {"x"}}.get(op, set())
+    if changed - movable:
+        raise ValueError(
+            f"{op} zero points {sorted(changed - movable)} are fixed by the template"
+        )
     segs = suc.decode_segments(mc)
     found = 0
     for si, raw in enumerate(segs):
         words = _chunks(raw)
-        new, kinds = _retarget_lanes(words, op, old_scales, new_scales)
+        new, kinds = _retarget_lanes(words, op, old_scales, new_scales, reduce_count)
         if not kinds:
             continue
         found += len(kinds)
+        if op == "Log":
+            new = _retarget_log_table(new, old_scales, new_scales, old_zp)
+        elif op == "Softmax" and old_zp:
+            new = _retarget_input_zp(new, kinds, int(old_zp["x"]), int(new_zp["x"]))
         if op == "ReduceSum" and old_zp:
             pad = _pad_count(words)
             new = _retarget_reducesum_zps(new[: len(new) - pad], kinds, old_zp, new_zp)
@@ -363,6 +470,7 @@ def emit_model(
         scales or meta["scales"],
         meta["zero_points"],
         zero_points or meta["zero_points"],
+        meta.get("reduce_count"),
     )
     return model
 
@@ -375,10 +483,23 @@ def normalized_records(mc: bytes) -> list[list[bytes]]:
     return segs
 
 
+STEP_OPS = (
+    "ReduceSum",
+    "Sqrt",
+    "Greater",
+    "Less",
+    "Cast",
+    "Softmax",
+    "Log",
+    "MaxPool",
+    "ReduceMean",
+)
+
+
 def step_node_keys(onnx_path: str) -> list[tuple[str, str]]:
-    """``(op, template key)`` for each ReduceSum, Sqrt, Greater, Less and Cast
-    node of a real graph. Greater/Less feed a Cast in the step, so both nodes
-    of a pair share the pair's key."""
+    """``(op, template key)`` for each node of a real graph whose op is in
+    ``STEP_OPS``. Greater/Less feed a Cast in the step, so both nodes of a pair
+    share the pair's key."""
     from onnx import numpy_helper, shape_inference
 
     model = shape_inference.infer_shapes(onnx.load(onnx_path, load_external_data=False))
@@ -393,7 +514,7 @@ def step_node_keys(onnx_path: str) -> list[tuple[str, str]]:
     keys = []
     for node in model.graph.node:
         op = node.op_type
-        if op not in ("ReduceSum", "Sqrt", "Greater", "Less", "Cast"):
+        if op not in STEP_OPS:
             continue
         attrs = {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
         shape = shapes.get(node.input[0], [])
@@ -409,8 +530,32 @@ def step_node_keys(onnx_path: str) -> list[tuple[str, str]]:
                 axes = numpy_helper.to_array(src).ravel().tolist()
             axes = sorted(int(a) % len(shape) for a in axes or range(len(shape)))
             keys.append((op, template_key(op, shape, axes, attrs.get("keepdims", 1))))
-        elif op == "Sqrt":
+        elif op in ("Sqrt", "Log"):
             keys.append((op, template_key(op, shape)))
+        elif op == "Softmax":
+            axis = int(attrs.get("axis", -1)) % len(shape)
+            keys.append((op, f"{template_key(op, shape)}:axis{axis}"))
+        elif op == "ReduceMean":
+            axes = sorted(
+                int(a) % len(shape) for a in attrs.get("axes", range(len(shape)))
+            )
+            keys.append(
+                (
+                    op,
+                    template_key(
+                        "ReduceSum", shape, axes, attrs.get("keepdims", 1)
+                    ).replace("ReduceSum", op, 1),
+                )
+            )
+        elif op == "MaxPool":
+            k = "x".join(map(str, attrs["kernel_shape"]))
+            st = "x".join(
+                map(str, attrs.get("strides", [1] * len(attrs["kernel_shape"])))
+            )
+            pd = ",".join(
+                map(str, attrs.get("pads", [0] * 2 * len(attrs["kernel_shape"])))
+            )
+            keys.append((op, f"{template_key(op, shape)}:k{k}:s{st}:p{pd}"))
         elif op in ("Greater", "Less"):
             keys.append((op, f"{op}Cast:{'x'.join(map(str, shape))}"))
         elif op == "Cast":

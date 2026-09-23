@@ -261,10 +261,10 @@ def _step_records():
         return json.load(f)
 
 
-# misc_op_record_emit: Greater 18 + Less 1 + Cast 19 covered; ReduceSum 43 and
-# Sqrt [512,512,3,3] 3 conditional
+# misc_op_record_emit: Greater 18 + Less 1 + Cast 19 covered; ReduceSum 43,
+# Sqrt [512,512,3,3] 3, Softmax 3, Log 2, MaxPool 1 and ReduceMean 1 conditional
 _MISC_COVERED = 38
-_MISC_CONDITIONAL = 46
+_MISC_CONDITIONAL = 53
 
 
 def test_coverage_report_on_the_resnet18_step():
@@ -281,6 +281,9 @@ def test_coverage_report_on_the_resnet18_step():
     assert report["per_op"]["Greater"] == {"covered": 18}
     assert report["per_op"]["Less"] == {"covered": 1}
     assert report["per_op"]["Cast"] == {"covered": 19}
+    for op, n in (("Softmax", 3), ("Log", 2), ("MaxPool", 1), ("ReduceMean", 1)):
+        assert report["per_op"][op] == {"conditional": n}
+    assert report["per_op"]["Neg"] == {"refused": 2}
     man = axb.mre.step_manifest()
     live_conv = sum(
         man["templates"][e["template"]]["kind"] == "conv" for e in man["nodes"].values()

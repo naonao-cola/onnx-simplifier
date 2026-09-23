@@ -115,16 +115,18 @@ Run `python scripts/axera/misc_op_record_emit.py step.onnx` for the report.
 | Cast | 19 | 19 (each one follows a Greater or Less) | -- |
 | Less | 1 | 1 | -- |
 
-Tail ops. None of these has an emitter or a build at a step shape.
+Tail ops (batch F). Each was built at its step shape at two calibrations
+(`fixtures/misc_op_step_templates/`). Each template reproduces the other build record for
+record in both directions, and reproduces itself from its own calibration.
 
-| op (nodes) | step shape | compiles standalone? | status |
+| op (nodes) | template key | calibration records | status |
 | --- | --- | --- | --- |
-| Softmax (3) | `[16,1000]` axis −1 | yes: one `AxQuantizedSoftmax` node (`test_axera_softmax_probe_hardware.py`, small shapes) | needs a step-shape build plus a second calibration to locate its lanes |
-| Log (2) | `[16,1000]` | yes, `[1,8]` battery (`pulsar2_ops.AX650_CONFIRMED_WORKING_OPS`) | same |
-| Neg (2) | `[1,1]` | yes. `tiny_emit.emit_neg` retargets the output scale on a same-shape reference, and builds exist for `[1,4]`..`[1,32]` (`t9-neg`) | needs one `[1,1]` build; then template plus `emit_neg` |
-| MaxPool (1) | `[16,64,112,112]` k3 s2 p1 | yes, single-node battery | needs a step-shape build plus a second calibration |
-| ReduceMean (1) | `[16,512,7,7]` axes (2,3) k1 | yes, `[1,8]` probe (`test_axera_reducemean_probe_hardware.py`) | needs a build. It probably follows ReduceSum's three-stage rule; unchecked |
-| Squeeze (1) | `[16,512,1,1]→[16,512]` | **no**: a standalone Squeeze hits the scheduler's ZeroDivisionError (`AX650_CONFIRMED_BROKEN_OPS`). It compiles when fused into the following Gemm (FullyConnected). | belongs to the Gemm/FC template, not a standalone emitter |
+| Softmax (3) | `Softmax:16x1000:axis1` | lanes `1/s_x`, `s_x`, `1/s_y`, `s_y`; one `0x1b10 = zp_x` before the first run | conditional: `zp_x != 0`, `zp_y = 0` (a Softmax output always calibrates to 0). The held-out pair also moves `zp_x` 127 → 126 |
+| Log (2) | `Log:16x1000` | lane `1/s_x`; a 258-entry u8 lookup table, two u16 entries per record at `0x1050..0x1850`: `clip(rint(log((q − zp_x)·s_x)/s_y) + zp_y, 0, 255)` for `q` = 0..255 (`log 0` → 0), then entry 255 again and 0. The table is exact on both builds. `0x1850` is written after an unrelated `0x1860..0x1a50` block, so the emitter finds table records by register | conditional: zero points fixed at the template's (0, 255). Log's input is a Softmax output, so `zp_x = 0` |
+| MaxPool (1) | `MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1` | lanes `1/s_x`, `s_x` (`s_y = s_x`) | conditional: zero points fixed (0; input is a Relu) |
+| ReduceMean (1) | `ReduceMean:16x512x7x7:axes2,3:k1` | lanes `1/s_x`, `s_x/(s_y·N)` (`N` = 49 reduced elements), `s_y` | conditional: zero points fixed (0; input is a Relu) |
+| Neg (2) | `[1,1]` | **refused.** Four builds (`zp_x` = 42, 246, 0, 255) gave four different register layouts: 268 records for `zp_x < 128` and 292/296 for `> 128`, and the edge zero points 0 and 255 add further write elisions. `tiny_emit.emit_neg` patches compressed bytes (from before the LZ77 decode) and isn't used | needs builds at the step's own calibration class |
+| Squeeze (1) | `[16,512,1,1]→[16,512]` | a standalone Squeeze hits the scheduler's ZeroDivisionError (`AX650_CONFIRMED_BROKEN_OPS`). It compiles fused into the following Gemm | belongs to the Gemm/FC template |
 
 ## Builds still needed (run one batch at a time)
 

@@ -870,7 +870,7 @@ def extract_step_ops(onnx_path: str) -> list[dict]:
             else:
                 rec["attrs"]["form"] = "same_shape"
         records.append(rec)
-    # ReduceSum / Sqrt / Greater->Cast / Less->Cast template keys, in node order
+    # misc_op_record_emit template keys (misc.STEP_OPS), in node order
     misc_keys = iter(misc.step_node_keys(onnx_path))
     for rec in records:
         if rec["op"] in _MISC_OPS:
@@ -878,23 +878,27 @@ def extract_step_ops(onnx_path: str) -> list[dict]:
     return records
 
 
-_MISC_OPS = ("ReduceSum", "Sqrt", "Greater", "Less", "Cast")
+_MISC_OPS = misc.STEP_OPS
 
 
 def _plan_misc(rec: Mapping) -> tuple[str, str] | None:
     """``misc_op_record_emit`` templates (step-shape ReduceSum, Greater/Less
-    -> Cast, Sqrt ``[512,512,3,3]``), or ``None`` without one."""
+    -> Cast, Sqrt ``[512,512,3,3]``, Softmax, Log, MaxPool, ReduceMean), or
+    ``None`` without one."""
     key = rec.get("attrs", {}).get("misc_key")
     meta = misc.load_index().get(key) if key else None
     if meta is None:
         return None
     if meta["op"] in misc.CALIBRATION_FREE:
         return ("covered", "TemplateOnly (not quantized; misc_op_record_emit)")
+    fixed = {
+        "ReduceSum": "",
+        "Softmax": f" and zp_y = {meta['zero_points']['y']}",
+    }.get(meta["op"], f" and zero points = {meta['zero_points']}")
     return (
         "conditional",
-        "misc_op_record_emit retarget if zp_x != 0 and the scale formulas stay "
-        "distinct"
-        + (" (zero points fixed by the template)" if meta["op"] == "Sqrt" else ""),
+        f"misc_op_record_emit retarget if zp_x != 0{fixed} and the scale "
+        "formulas stay distinct",
     )
 
 
@@ -953,7 +957,16 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
                     "exists for frozen-weight deployment only",
                 )
             return ("covered", "ConvWeightEdit")
-        if op in ("ReduceSum", "Greater", "Less", "Cast"):
+        if op in (
+            "ReduceSum",
+            "Greater",
+            "Less",
+            "Cast",
+            "Softmax",
+            "Log",
+            "MaxPool",
+            "ReduceMean",
+        ):
             return _plan_misc(rec) or (
                 "refused",
                 f"no misc_op_record_emit template for {op}",
