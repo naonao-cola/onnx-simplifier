@@ -384,6 +384,26 @@ def _retarget_input_zp(words, kinds, old_zx: int, new_zx: int) -> list[bytes]:
     return out
 
 
+def _retarget_shared_zp(words, old_zp, new_zp) -> list[bytes]:
+    """MaxPool: input and output share one zero point (MaxPool is passive).
+    A nonzero one is written as whole words to ``0x1b10`` and ``0x1a90``
+    (zero writes are elided, so 0 is a different program); rewrite both."""
+    old, new = int(old_zp["x"]), int(new_zp["x"])
+    if int(old_zp["y"]) != old or int(new_zp["y"]) != new:
+        raise ValueError("MaxPool input and output share one zero point")
+    if 0 in (old, new):
+        raise ValueError("a MaxPool zero point of 0 is a different program")
+    hits = [
+        j for j, w in enumerate(words) if _reg(w) in (ZP_IN, ZP_ACC) and _val(w) == old
+    ]
+    if {_reg(words[j]) for j in hits} != {ZP_IN, ZP_ACC}:
+        raise ValueError(f"expected 0x1b10 and 0x1a90 = {old} writes, found {hits}")
+    out = list(words)
+    for j in hits:
+        out[j] = _with_val(words[j], new)
+    return out
+
+
 NEG_ZP_REGS = (ZP_ACC, 0x1AD0, ZP_IN)
 
 
@@ -454,9 +474,12 @@ def retarget(
     old_zp = dict(old_zero_points or {})
     new_zp = dict(new_zero_points or old_zp)
     changed = {k for k in old_zp if int(new_zp.get(k, old_zp[k])) != int(old_zp[k])}
-    movable = {"ReduceSum": {"x", "y"}, "Softmax": {"x"}, "Neg": {"x", "y"}}.get(
-        op, set()
-    )
+    movable = {
+        "ReduceSum": {"x", "y"},
+        "Softmax": {"x"},
+        "MaxPool": {"x", "y"},
+        "Neg": {"x", "y"},
+    }.get(op, set())
     if op == "Neg":
         if int(new_zp["y"]) != 255 - int(new_zp["x"]):
             raise ValueError("Neg's output zero point is 255 - zp_x")
@@ -478,7 +501,9 @@ def retarget(
             new = _retarget_log_table(new, old_scales, new_scales, old_zp)
         elif op == "Softmax" and old_zp:
             new = _retarget_input_zp(new, kinds, int(old_zp["x"]), int(new_zp["x"]))
-        if op == "ReduceSum" and old_zp:
+        elif op == "MaxPool" and old_zp != new_zp:
+            new = _retarget_shared_zp(new, old_zp, new_zp)
+        if op == "ReduceSum" and old_zp and old_zp != new_zp:
             pad = _pad_count(words)
             new = _retarget_reducesum_zps(new[: len(new) - pad], kinds, old_zp, new_zp)
             new = _retarget_packed_zp(new, int(old_zp["x"]), int(new_zp["x"]))

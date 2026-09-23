@@ -664,6 +664,18 @@
    "zero_point": 128
   }
  },
+ "zero_point_0_templates": {
+  "1024x28224->1024x9x3136": {
+   "axmodel": "1024x28224_to_1024x9x3136_zp0_a.axmodel.gz",
+   "check": {
+    "axmodel": "1024x28224_to_1024x9x3136_zp0_b.axmodel.gz",
+    "scale": 0.009803921915590763,
+    "zero_point": 0
+   },
+   "scale": 0.019577646628022194,
+   "zero_point": 0
+  }
+ },
  "zero_point_probes": {
   "zp_16x1x64x3136_to_16x64x56x56": {
    "axmodel": "zp_16x1x64x3136_to_16x64x56x56.axmodel.gz",
