@@ -22,6 +22,10 @@
 
 #include <stdint.h>
 
+/* The sample positions must round exactly like ORT's (x86, unfused): no FMA contraction, which
+ * hexagon-clang would otherwise do for y1 + ph * bin_h. */
+#pragma STDC FP_CONTRACT OFF
+
 typedef uint8_t ru8_u8x128 __attribute__((vector_size(128)));
 typedef int32_t ru8_i32x128 __attribute__((vector_size(512)));
 

@@ -1,0 +1,18 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+// One call = the whole merged RoiAlign span for one head (box or mask): the 4 uint8 NHWC FPN maps,
+// every level's RoIs (concatenated in level order, level_counts[k] per level) and their destination
+// rows, straight to the head's uint8 input. See roialign_u8_kernel.h / roialign_u8_impl.c.
+interface roialign_u8_rpc : remote_handle64 {
+  AEEResult run(in sequence<uint8> map0, in sequence<uint8> map1, in sequence<uint8> map2, in sequence<uint8> map3,
+                in sequence<int32> level_geom,    // per level k: H, W, z_in                   (12)
+                in sequence<float> level_fparams, // per level k: s_in, spatial_scale          (8)
+                in sequence<int32> level_counts,  // RoIs per level                             (4)
+                in sequence<float> rois,          // [sum(level_counts), 4] x1 y1 x2 y2, image coords
+                in sequence<int32> rows,          // [sum(level_counts)] destination row per RoI
+                in int32 C, in int32 OH, in int32 OW, in int32 sr, in float s_out, in int32 z_out,
+                in int32 flags,                   // bits 0-7 threads, bit 8 l2fetch prefetch, bit 9 locality sort
+                rout sequence<uint8> out,         // [N, OH, OW, C]; rows not named in `rows` are left untouched
+                rout uint64 dsp_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};
