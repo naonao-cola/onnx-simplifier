@@ -43,6 +43,37 @@ between the phone's embedding and fp32 torch's over 20 fixed sentences (`models.
   so the masking is identical), and `quantize_minilm.py` keeps the mask path and the score Adds it
   feeds in fp16. Before the fix, W8A16 was at cos 0.0.
 
+## Decoder: SmolLM2-135M (Llama, 30 layers, hidden 576, GQA 9/3 heads), prefill 128, KV cache 256
+
+A plain-PyTorch Llama (`export_smollm.py`; prefill logits within 1.8e-5 of transformers, and greedy
+decoding identical to `transformers.generate` for 32 tokens) exported as two static graphs: a
+128-token prefill and a one-token decode step with the KV cache as graph I/O (the host writes each
+step's new K/V row). Accuracy is measured two ways over 10 fixed prompts (`models.PROMPTS`), 32
+tokens each: **free-running** (leading tokens identical to fp32 greedy) and **teacher-forced** (fp32's
+tokens fed back; per-step top-1 agreement and logits cosine).
+
+| path | prefill 128 tok | decode tok/s | free: all 32 tokens identical | forced top-1 / logits cos min | phone peak RSS |
+|---|---:|---:|---|---|---:|
+| CPU fp32, 4 threads | 258 ms | 41 | 10/10 prompts | 1.000 / 1.000 | 1.39 GB |
+| CPU ORT dynamic int8 (per-channel), 4 threads | 92 ms | 73 | 0/10 (diverge after 0-12 tokens) | 0.897 / 0.71 | 453 MB |
+| HTP fp16 (fp16 weights, activations, KV cache, logits) | 25.4 ms | 110 | 0/10 | 0.722 / **-0.28** | 2.3 GB* |
+
+\* includes compiling both EP-context caches in the same process (~21 s, once).
+
+- **The HTP is 10x faster than the CPU at prefill and 2.7x at decode,** but its fp16 run is
+  **not accurate yet**: the prefill logits are right for some prompts (cos 0.995) and wrong for
+  others (cos -0.06), and the decode steps are erratic. The same fp16 graph on host ORT is
+  accurate (32/32 tokens identical on every prompt, logits cos >= 0.999996), so this is how the HTP
+  executes it, not fp16 itself. **Open, not yet bisected.** Suspects: the -1e4 additive masks in
+  fp16 softmax, the rotary `index_select` on `pos`, and QNN's accumulation precision in the
+  576-wide RMSNorm reductions. `bisect_precision.py` in `../vision_models/bevformer_tiny/` is the tool.
+- **CPU dynamic int8 is not usable for this model** even per-channel: dynamic per-tensor activation
+  quantization breaks on the Llama residual stream's outlier channels (logits cos down to 0.71).
+- **Decode is memory-bound.** A decode step reads every weight once: 135M params = 270 MB in fp16,
+  135 MB in int8. At 110 tok/s the HTP streams ~30 GB/s of fp16 weights, near this SoC's practical
+  LPDDR5 bandwidth, so int8 or int4 weights (the next step) are what would raise decode tok/s, not
+  more compute.
+
 ## Files
 
 | file | what |
@@ -52,6 +83,9 @@ between the phone's embedding and fp32 torch's over 20 fixed sentences (`models.
 | `quantize_minilm.py` | CPU dynamic int8 and the onnxsim QDQ variants for the HTP |
 | `eval_encoder.py` | embedding cosine vs fp32 (phone outputs or host ORT) |
 | `llm_run.cpp` | phone runner: `enc` (encoder, timing + outputs), `dec` (prefill + greedy KV-cache decode) |
+| `export_smollm.py` | SmolLM2-135M -> prefill + KV-cache step graphs (fp32, or `--fp16-only`), fp32 greedy references |
+| `quantize_smollm.py` | CPU dynamic int8 (per-channel) and onnxsim W8A16 QDQ variants |
+| `eval_decoder.py` | free-running and teacher-forced agreement vs fp32 (phone outputs or host ORT) |
 | `run_phone.sh` | build `llm_run`, push libs/models/inputs (by md5), run, pull outputs |
 
 ## Reproduce
