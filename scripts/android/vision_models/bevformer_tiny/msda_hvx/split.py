@@ -29,6 +29,9 @@ Pieces (fixed shapes, fp32 I/O, fp16 inside on the HTP) of the 3-layer encoder, 
 host per frame: tsa_ref (2, Q, 1, 2) = [ref_2d + shift * has_prev, ref_2d]; ref_cam; vis = any(bev_mask).
 
 usage: split.py check  --ckpt <pth> --work <work>     torch split vs Encoder on the saved frames
+       split.py calib-tsa --ckpt <pth> --work <work>  per-layer uint8 ranges of the TSA value maps over
+                                                      quantize.py's calibration frames -> msda_split/tsa_vq.json
+       split.py export --tsa-u8 ...                   the pieces with uint8 TSA value outputs -> msda_split_u8/
        split.py dump   --ckpt <pth> --work <work>     kernel I/O of layer 0 of frame 1 -> <work>/msda_io
        split.py export --ckpt <pth> --work <work>     the pieces -> <work>/msda_split/*.onnx (+ onnxsim)
 """
@@ -230,6 +233,91 @@ def cmd_dump(a):
             save_kernel_case(out, f"l{i}_{k}", *r[k])
 
 
+def calib_frames(work):
+    """quantize.py calib's frames (other scenes than the scene-0103 evaluation): encoder inputs."""
+    import numpy as np
+
+    names = ["feats", "prev_bev", "has_prev", "shift", "can_bus", "ref_cam", "bev_mask"]
+    for p in sorted((Path(work) / "calib").glob("*.npz"), key=lambda p: int(p.stem)):
+        z = np.load(p)
+        yield tuple(torch.from_numpy(z[n]) for n in names)
+
+
+def cmd_calib_tsa(a):
+    """uint8 scale / zero point per layer for the TSA value maps (the HTP emits one per tensor),
+    from the calibration frames, and what uint8 TSA values cost the encoder's output there."""
+    import json
+
+    _, enc, _ = M.load_official(a.ckpt)
+    lo, hi = [0.0] * len(enc.layers), [0.0] * len(enc.layers)
+    ins = list(calib_frames(a.work))
+    for enc_in in ins:
+        rec = []
+        run_split(enc, enc_in, record=rec)
+        for i, r in enumerate(rec):
+            v = r["tsa"][0][0]
+            lo[i], hi[i] = min(lo[i], float(v.min())), max(hi[i], float(v.max()))
+    vq = []
+    for i in range(len(lo)):
+        s_ = (hi[i] - lo[i]) / 255.0
+        vq.append([s_, int(round(-lo[i] / s_))])
+    out = Path(a.work) / "msda_split"
+    out.mkdir(exist_ok=True)
+    (out / "tsa_vq.json").write_text(json.dumps(vq))
+    print("TSA value uint8 (scale, zero point) per layer:", vq)
+
+    calls = {"n": 0}
+
+    def sampler(value, hw, ref, off, attw, vis=None):
+        if (
+            value.shape[0] == 2
+        ):  # the TSA's 2-frame queue: quantize-dequantize with its layer's pair
+            s_, z = vq[calls["n"]]
+            calls["n"] += 1
+            value = (torch.clamp(torch.round(value / s_) + z, 0, 255) - z) * s_
+        return msda_fused(value, hw, ref, off, attw, vis)
+
+    for k, enc_in in enumerate(ins):
+        calls["n"] = 0
+        ref = run_split(enc, enc_in)
+        got = run_split(enc, enc_in, sampler=sampler)
+        r64, g64 = ref.double(), got.double()
+        cs = float((r64 * g64).sum() / (r64.norm() * g64.norm()))
+        print(f"calib frame {k}: encoder with uint8 TSA values vs fp32: cos {cs:.7f}")
+
+
+def quantize_output(model, name, scale, zp):
+    """Graph output `name` -> QuantizeLinear(scale, zp) as uint8 (the HTP emits it directly)."""
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    g = model.graph
+    inner = name + "_f"
+    for n in g.node:
+        for i, o in enumerate(n.output):
+            if o == name:
+                n.output[i] = inner
+        for i, x in enumerate(n.input):
+            if x == name:
+                n.input[i] = inner
+    g.initializer.extend(
+        [
+            numpy_helper.from_array(np.array(scale, np.float32), name + "_scale"),
+            numpy_helper.from_array(np.array(zp, np.uint8), name + "_zp"),
+        ]
+    )
+    g.node.append(
+        helper.make_node(
+            "QuantizeLinear", [inner, name + "_scale", name + "_zp"], [name]
+        )
+    )
+    for o in g.output:
+        if o.name == name:
+            o.type.tensor_type.elem_type = TensorProto.UINT8
+    onnx.checker.check_model(model)
+    return model
+
+
 def cmd_export(a):
     import onnx
     import onnxruntime as ort
@@ -305,6 +393,20 @@ def cmd_export(a):
         )
         sim, _ = onnxsim.simplify(str(raw), check_n=0)
         onnx.save(sim, str(out / f"{name}.sim.onnx"))
+        if (
+            a.tsa_u8
+        ):  # uint8 TSA value outputs (layer 0 from pre, layer i + 1 from post<i>)
+            import json
+
+            vq = json.loads((out / "tsa_vq.json").read_text())
+            outq = Path(a.work) / "msda_split_u8"
+            outq.mkdir(exist_ok=True)
+            m_ = onnx.load(str(out / f"{name}.sim.onnx"))
+            if "tsa_v" in outs:
+                layer = 0 if name == "pre" else int(name[4:]) + 1
+                m_ = quantize_output(m_, "tsa_v", *vq[layer])
+            onnx.save(m_, str(outq / f"{name}.sim.onnx"))
+            (outq / "tsa_vq.txt").write_text("".join(f"{s_!r} {z}\n" for s_, z in vq))
         ref = mod(*x)
         ref = ref if isinstance(ref, tuple) else (ref,)
         got = ort.InferenceSession(
@@ -324,12 +426,20 @@ def cmd_export(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["check", "dump", "export"])
+    ap.add_argument("cmd", choices=["check", "dump", "export", "calib-tsa"])
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--work", required=True)
+    ap.add_argument(
+        "--tsa-u8", action="store_true", help="export: also write msda_split_u8/"
+    )
     a = ap.parse_args()
     torch.set_grad_enabled(False)
-    {"check": cmd_check, "dump": cmd_dump, "export": cmd_export}[a.cmd](a)
+    {
+        "check": cmd_check,
+        "dump": cmd_dump,
+        "export": cmd_export,
+        "calib-tsa": cmd_calib_tsa,
+    }[a.cmd](a)
 
 
 if __name__ == "__main__":

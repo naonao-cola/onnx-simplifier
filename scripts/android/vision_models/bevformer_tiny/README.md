@@ -259,10 +259,28 @@ PHONE_RUN=~/.cache/android-phone/phone-run PHONE_LOCK_OWNER=<branch> \
   python3 e2e_msda.py --ckpt $C/bevformer_tiny_epoch_24.pth --data $C/nuscenes-mini --work $C/work --build build
 ```
 
+**uint8 TSA value maps: tried, no gain in the chain.** The kernel reads uint8 value maps (see
+`../../msda_hvx/README.md`), and in isolation that makes a real TSA call 9% faster (4.52 ->
+4.10 ms). So:
+- `split.py calib-tsa` measures per-layer ranges on quantize.py's 12 calibration frames (other
+  scenes). Quantizing costs nothing measurable there: encoder cos 1.0000000 vs fp32.
+- `split.py export --tsa-u8` appends a QuantizeLinear to the `tsa_v` outputs of `pre` and
+  `post0/1`, so the HTP emits them as uint8 (`msda_split_u8/`, `e2e_msda.py --pieces
+  msda_split_u8`).
+
+On the phone (scene-0103, same 6 frames) it doesn't pay off:
+- the encoder median over the 6 frames is 54.9 ms, vs 55.2 with fp32 values: within run-to-run
+  noise (55-58 ms);
+- `pre`/`post0-1` are unchanged (6.7 / 5.9 ms): the smaller outputs save nothing on the HTP side;
+- the uint8 TSA calls take 4.6-5.1 ms in the chain, vs ~4.5 ms with fp32.
+
+GT matched: 107 / 190, the same as fp32 values. fp32 values stay the default. The SCA was left on fp32: uint8 is
+slower for it even in isolation.
+
 Where the remaining 55 ms go, and the next levers:
-- **The HTP pieces' graph I/O is fp32:** ~12 MB in and out per frame. Mask R-CNN's HTP pieces
-  got faster with uint8 graph I/O instead of fp32. The kernel's value maps are the large
-  tensors, which is what a uint8 value path would address.
+- **The HTP pieces' graph I/O is fp32:** ~12 MB in and out per frame. Making the TSA value
+  outputs uint8 didn't shorten the pieces (above). The per-piece time is dominated by the
+  Linears and the fixed per-execute cost, not the output conversion.
 - **`pre` computes all 3 layers' SCA value projections up front** (6.9 MB of fp32 output). They
   depend only on the image features, so they could also run in the backbone's call.
 - **The kernel's multiply-accumulate phase is its larger half.** See `../../msda_hvx/README.md`.
