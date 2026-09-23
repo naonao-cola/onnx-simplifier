@@ -127,8 +127,10 @@ None of these estimates replaces a phone run.
   BEVFormer's 107 ms layer).
 - **Effort.** Medium. The rank rewrite is the only new piece, and it also unblocks BEVFormer.
 - **Done** (`vision_models/rtdetr/`): the exact rank <= 4 MSDA rewrite gives strict all-HTP with no
-  refused ops. fp16 runs at 30.4 ms (194/195 detections vs fp32). With the backbone and hybrid
-  encoder in int8 and the uint8 NHWC input it is **19.3 ms** (183/195).
+  refused ops. fp16 runs at 30.4 ms (194/195 detections vs fp32). The default is the backbone in
+  uint8 and the hybrid encoder in uint16 activations, with the uint8 NHWC input: **20.9 ms**
+  (190/195). An all-int8 CNN is 19.3 ms (183/195). The decoder's MSDA on the HVX kernel
+  (`../msda_hvx/`) comes to 20.5 ms for now: its value maps have to leave the HTP. See the README.
 
 ## 4. BEVFormer-tiny (primary target, hardest)
 

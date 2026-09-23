@@ -84,23 +84,21 @@ AEEResult msda_rpc_run(remote_handle64 h, const float* value, int valueLen, cons
   int nthreads = flags & 0xff, rc = 0;
   if (nthreads < 1) nthreads = 1;
   if (nthreads > MAX_THREADS) nthreads = MAX_THREADS;
-  if (nthreads == 1) {
-    work(&j);
-  } else {
-    qurt_thread_t tids[MAX_THREADS];
-    int started = 0;
-    for (int t = 0; t < nthreads; t++) {
-      qurt_thread_attr_t attr;
-      qurt_thread_attr_init(&attr);
-      qurt_thread_attr_set_stack_addr(&attr, stacks[t]);
-      qurt_thread_attr_set_stack_size(&attr, STACK_SIZE);
-      qurt_thread_attr_set_priority(&attr, qurt_thread_get_priority(qurt_thread_get_id()));
-      if (qurt_thread_create(&tids[t], &attr, thread_main, &j) != QURT_EOK) { rc = -2; break; }
-      started++;
-    }
-    for (int t = 0; t < started; t++) { int st; qurt_thread_join(tids[t], &st); }
-    if (!started) work(&j);
+  /* always on our own threads, even for 1: the HVX body needs ~24 KB of stack, more than the
+   * FastRPC thread has (running it there fails the call with AEE_EBADPERMS) */
+  qurt_thread_t tids[MAX_THREADS];
+  int started = 0;
+  for (int t = 0; t < nthreads; t++) {
+    qurt_thread_attr_t attr;
+    qurt_thread_attr_init(&attr);
+    qurt_thread_attr_set_stack_addr(&attr, stacks[t]);
+    qurt_thread_attr_set_stack_size(&attr, STACK_SIZE);
+    qurt_thread_attr_set_priority(&attr, qurt_thread_get_priority(qurt_thread_get_id()));
+    if (qurt_thread_create(&tids[t], &attr, thread_main, &j) != QURT_EOK) { rc = -2; break; }
+    started++;
   }
+  for (int t = 0; t < started; t++) { int st; qurt_thread_join(tids[t], &st); }
+  if (!started) rc = -2;
   *dsp_us = HAP_perf_get_time_us() - t0;
   return rc;
 }
