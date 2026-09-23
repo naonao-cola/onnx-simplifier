@@ -58,9 +58,32 @@ Recipe that works from an unsigned FastRPC skel on V69: `HAP_power_set` HVX + **
 `HAP_compute_res_hmx_lock` on the thread that issues HMX -> tiles in VTCM -> (optional) `bias = mxmem`
 scale table -> `{activation.* = mxmem(a,Rt):deep; weight.* = mxmem(w,Rt)}` -> `mxmem(o,0):after... = acc`.
 
+### V69 int8 tile layouts (one-hot mapping in the sim, then a random 32x32x32 check: 0/1024 mismatches, `hmx_sim_layout.c`)
+
+One `{activation.ub = mxmem(a,2047):deep; weight.b = mxmem(w,2047)}` = one 32x32 output tile, K = 32:
+
+- weight `W(k,c)` (int8): byte `128*(k/4) + 4*c + (k%4)` -- vrmpy-style 4-byte k groups; 1024 B used of the 2 KB span
+- activation `A(r,k)` (uint8): byte `128*(r/2) + 4*k + 2*(r%2) + 1` -- only odd bytes are read in this mode
+- scale table (`bias = mxmem`, 256 B): per-column word, low 16 bits = scale; `0x4000` = x1 for the `uh` store
+- output `mxmem(o,0):after:sat.uh = acc:2x1`: `C(r,c)` at uint16 index `64*(r/2) + 2*c + (r%2)`
+- `Rt = 4095` (2 tiles) gives K = 64, as expected. Larger spans gave values the 8 KB-filled harness doesn't explain yet.
+
+### Throughput on the phone (one thread, turbo, timed loop of repeated `:deep` loads + one store; health check PASS after)
+
+| load | per 32x32x32 tile | rate |
+|---|---|---|
+| int8 `ub x b`, `Rt` 2047 | 8.9 ns | **~3.7 TMAC/s** |
+| int8, `Rt` 4095 (2 tiles/load) | 17.8 ns (8.9 per tile) | ~3.7 TMAC/s |
+| fp16 `hf x hf`, `Rt` 2047 | 10.7 ns | **~3.1 TMAC/s** |
+
+Single thread, one HMX unit, the same resident tile re-loaded (no DDR traffic), so it's a compute-issue
+figure, not a GEMM. QNN's measured int8 ceiling on this phone is ~16 TMAC/s: reaching it likely needs
+both HMX units (`QURT_HMX_UNIT_0/1` exist in `qurt_hmx.h`), longer `:deep` spans, and DMA-fed tiles.
+Next: map the fp16 and multi-tile `:deep` layouts, try a second thread/unit, and build a real VTCM-fed GEMM.
+
 ## Files
 
-`hmx_rpc.idl`, `hmx_impl.c` (skel: acquire, lock, one parameterized HMX sequence, release; return
+`hmx_sim.c`/`sim.sh` (hexagon-sim HMX checks), `hmx_sim_layout.c` (int8 layout check), `hmx_rpc.idl`, `hmx_impl.c` (skel: acquire, lock, one parameterized HMX sequence, release; return
 codes), `hmx_client.c`, `build.sh` (needs `HEXAGON_SDK_ROOT` for qaic/headers and a
 `HEXAGON_TOOLCHAIN` with `-mhmx`), `run.sh` (`setup` / `probe` / `health`; run under the host's phone
 lock; `health` runs a known-good msda_hvx skel).
