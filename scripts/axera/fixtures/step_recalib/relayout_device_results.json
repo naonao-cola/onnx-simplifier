@@ -1,0 +1,32 @@
+{
+ "report": {
+  "records": {
+   "2": 570
+  },
+  "params_bytes": 92,
+  "mcode_bytes": [
+   31032,
+   31160
+  ]
+ },
+ "control_error": null,
+ "native_a_vs_native_b": {
+  "equal": false,
+  "max_abs_diff": 2789.43359375
+ },
+ "recalibrated_vs_native_b": {
+  "equal": true,
+  "max_abs_diff": 0.0,
+  "error": null
+ },
+ "recalibrated_vs_native_a": {
+  "equal": false,
+  "max_abs_diff": 2789.43359375
+ },
+ "mcode_only_vs_native_b": {
+  "equal": false,
+  "max_abs_diff": 309.109375,
+  "error": null
+ },
+ "health_after": true
+}

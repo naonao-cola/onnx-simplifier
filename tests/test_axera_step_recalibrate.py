@@ -121,3 +121,17 @@ def test_relayout_rejects_a_bad_length_prefix():
     s, n, _, _ = codec.segment_streams(b)[2]
     with pytest.raises(sr.RelayoutError, match="length prefix"):
         sr.relayout(bytes(a), 2, b[s : s + n])
+
+
+def test_committed_device_results_are_bit_identical():
+    import json
+
+    for name in (
+        "relayout_device_results.json",
+        "relayout_r18_head_device_results.json",
+    ):
+        with open(os.path.join(STEP, name)) as f:
+            res = json.load(f)
+        assert res["recalibrated_vs_native_b"]["equal"] is True
+        assert res["native_a_vs_native_b"]["equal"] is False
+        assert res["health_after"] is True
