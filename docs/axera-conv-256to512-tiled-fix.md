@@ -1,5 +1,12 @@
 # Fixing the two Conv shapes bit-permutation learning got wrong, with the tiled scaffold formula
 
+> **Update (docs/axera-mcode-segments-fix.md):** the 1x1 fault below has a
+> concrete static cause. `patch_scales.py` matched a bfloat16 scale (`83 3a`)
+> against four LZ77 back-reference tokens and overwrote them. That
+> re-decoded three segments and grew them by 8, 8 and 16 bytes.
+> `patch_scales` now skips matches on token bytes. The fix has not been
+> re-run on the device.
+
 `docs/axera-conv-weight-learn-256to512.md` (PR #1777) found the ResNet18
 stage-3-to-4 downsample pair -- `Conv(x[16,256,14,14], w[512,256,1,1], stride 2)`
 and `Conv(x[16,256,14,14], w[512,256,3,3], stride 2)` -- has a byte-exact

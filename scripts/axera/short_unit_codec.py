@@ -236,6 +236,24 @@ def records(data: bytes) -> list[dict]:
     return res
 
 
+def token_bytes(mc: bytes) -> set[int]:
+    """Absolute offsets of every LZ77 token byte (literal-run headers and
+    back-references, not literal payload) in ``mc``'s compressed segments.
+
+    An in-place patch that overwrites one of these changes how the rest of
+    the segment decompresses, not the value it meant to write."""
+    res = set()
+    for start, size, _, comp in segment_streams(mc):
+        if not comp:
+            continue
+        for tok in tokens(mc[start : start + size]):
+            if tok[0] == "L":
+                res.add(start + tok[1])
+            else:
+                res.update(range(start + tok[1], start + tok[1] + tok[4]))
+    return res
+
+
 def register_values(mc: bytes) -> list[list[dict]]:
     """``records`` of every decompressed segment of ``mc``."""
     return [records(d) for d in decode_segments(mc)]

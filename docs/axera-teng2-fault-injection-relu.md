@@ -1,5 +1,12 @@
 # Single-byte fault injection on `teng2`: a first causal-intervention pass on a real elementwise compute segment
 
+> **Correction (docs/axera-mcode-segments-fix.md):** this blob has 4 bytes of
+> tail padding, so `mcode.segments` placed every segment 4 bytes late at the
+> time. Segment 2 really spans `[376, 1784)`. Offset 380 is the `XX` byte of
+> the segment's opening `a7 00 00 XX` record, which follows an LZ77
+> literal-run token at 376. It is not the first byte of the segment. The
+> absolute offsets and their results below are unaffected.
+
 Every prior `teng2` decode attempt in this project (`docs/axera-teng2-sqrt-blocks.md`,
 `docs/axera-teng2-tiled-repeat.md`, `docs/axera-teng2-add-two-input.md`,
 `docs/axera-teng2-calibration-isolation.md`, `docs/axera-teng2-cluster-patch-refine.md`)

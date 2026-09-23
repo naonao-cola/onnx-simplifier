@@ -237,9 +237,7 @@ def emit_table(reference_table, origin, codes):
     code = np.asarray(codes, dtype=np.uint8).reshape(-1)
     origin = np.asarray(origin, dtype=np.int64).reshape(-1)
     if origin.size != table.size * 8:
-        raise ValueError(
-            f"origin has {origin.size} bits for a {table.size}-byte table"
-        )
+        raise ValueError(f"origin has {origin.size} bits for a {table.size}-byte table")
     if np.any(origin < CONST) or np.any(origin >= code.size * 8):
         raise ValueError("origin contains a code-bit index outside the code array")
 
@@ -330,11 +328,41 @@ def emit_mcode(reference_mcode, fields, y_scale, y_zero):
             "build it."
         )
     out = bytearray(np.asarray(reference_mcode, dtype=np.uint8).tobytes())
+    _refuse_token_bytes(bytes(out), fields)
     for off in fields.get("scale_offsets", ()):
         out[off : off + 4] = scale_bytes
     for off in fields.get("zero_offsets", ()):
         out[off] = zero
     return np.frombuffer(bytes(out), dtype=np.uint8)
+
+
+def _refuse_token_bytes(mc, fields):
+    """Raise if a learned field lands on an LZ77 token byte of this
+    reference rather than on literal payload.
+
+    MCode segments are LZ77-compressed (`short_unit_codec.py`). A field
+    learned across builds can sit on a token byte in one particular
+    reference, and overwriting it re-decodes the rest of the segment
+    (docs/axera-mcode-segments-fix.md; `patch_scales.py` did this to a
+    ResNet18 1x1 downsample that then faulted the AX650N). Streams the codec
+    cannot parse (e.g. synthetic test streams) are not checked."""
+    import short_unit_codec
+
+    try:
+        tokens = short_unit_codec.token_bytes(mc)
+    except Exception:  # noqa: BLE001 -- not a parseable mcode
+        return
+    written = {
+        o for off in fields.get("scale_offsets", ()) for o in range(off, off + 4)
+    }
+    written.update(fields.get("zero_offsets", ()))
+    hit = sorted(written & tokens)
+    if hit:
+        raise ValueError(
+            f"mcode offsets {hit} are LZ77 token bytes in this reference, not "
+            "literal fields; patching them would corrupt the stream. Learn the "
+            "fields on builds that share this reference's layout."
+        )
 
 
 def nudge_output_quantisation(y_min, y_max, fields, bits=8, tries=64):

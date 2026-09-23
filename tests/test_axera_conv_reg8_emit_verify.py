@@ -249,7 +249,13 @@ class TestLengthChangingCrossFixtureEmissionIsNowFixedByRetarget(unittest.TestCa
     result also passes `mcode.check()` cleanly now, where it used to
     report a real "tail: no readable segment table" error. See
     `tests/test_axera_tail_table_mechanism.py` for the mechanism this
-    fix is based on."""
+    fix is based on.
+
+    **Superseded (docs/axera-mcode-segments-fix.md):** the -2 edit lands
+    inside an LZ77 token stream, so key 5 goes stale and the tail vector
+    ends up at 3062 -- not 4-byte aligned, which a FlatBuffers vector must
+    be. `mcode.check()` now reports that, so this output is malformed, not
+    clean. The class name is kept for history."""
 
     def test_group_content_is_still_correct(self):
         base = load("conv_dilation3.mcode.gz")
@@ -259,12 +265,14 @@ class TestLengthChangingCrossFixtureEmissionIsNowFixedByRetarget(unittest.TestCa
         self.assertEqual(config_of(out), target_cfg)
 
     def test_mcode_check_is_now_clean(self):
+        # Was `hard == []`; see the class docstring.
         base = load("conv_dilation3.mcode.gz")
         target_cfg = CONFIG["conv_dilation3_rebuild0.mcode.gz"]
         out = tiny_emit.emit_conv_reg8_group(base, *target_cfg)
         errs = mcode.check(out)
         hard = [e for e in errs if not e.startswith("coverage:")]
-        self.assertEqual(hard, [])
+        self.assertEqual(len(hard), 1)
+        self.assertIn("tail vector at 3062 is not 4-byte aligned", hard[0])
 
     def test_decode_succeeds(self):
         base = load("conv_dilation3.mcode.gz")

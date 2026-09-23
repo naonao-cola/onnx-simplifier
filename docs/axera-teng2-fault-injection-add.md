@@ -1,5 +1,12 @@
 # Fault-injecting Add's `teng2`/`cv3` on real hardware: a byte-role map, and where it stopped
 
+> **Correction (docs/axera-mcode-segments-fix.md):** segment starts here were
+> 4 bytes late. `teng2` is `[432, 2064)` and `cv3` is `[2064, 2320)`, so the
+> `cv3:2320..2323` results belong to the next segment. Both segments are
+> LZ77-compressed. 66 of the 95 tested `cv3` offsets that sit on token bytes
+> faulted, against 43 of 161 on literal payload. A token-byte flip
+> re-decodes the rest of the segment rather than changing one register.
+
 Every prior `teng2`/`cv3` decode attempt in this project (`docs/axera-dma-queue.md`,
 `docs/axera-teng2-sqrt-blocks.md`, `docs/axera-teng2-tiled-repeat.md`,
 `docs/axera-teng2-add-two-input.md`, `docs/axera-add-cv3-decode.md`,

@@ -86,6 +86,17 @@ def mcode_bytes(model: onnx.ModelProto) -> Tuple[bytes, str]:
     return bytes(numpy_helper.to_array(init).tobytes()), key
 
 
+def _token_bytes(blob: bytes) -> set:
+    """LZ77 token-byte offsets of `blob`, or none if the codec cannot
+    parse it (e.g. a synthetic test stream)."""
+    import short_unit_codec
+
+    try:
+        return short_unit_codec.token_bytes(blob)
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def find_scale_slots(
     blob: bytes, old: Dict[str, float], new: Dict[str, float]
 ) -> List[Tuple[int, str, str, bytes, bytes]]:
@@ -98,8 +109,13 @@ def find_scale_slots(
     safe by construction. Overlapping matches keep the widest (a float32
     slot contains its own bfloat16 truncation as nested bytes); matches
     claimed by two different tensors are ambiguous and dropped, not
-    guessed.
+    guessed. A match that overlaps an LZ77 token byte is not a literal value
+    either and is dropped: the mcode is compressed (`short_unit_codec.py`),
+    and overwriting a token re-decodes the rest of its segment. That is what
+    made a patched ResNet18 1x1 downsample fault the AX650N
+    (docs/axera-mcode-segments-fix.md).
     """
+    tokens = _token_bytes(blob)
     hits: Dict[int, Tuple[int, str, str, bytes, bytes]] = {}
     claimed: Dict[int, set] = {}
     for tensor, old_scale in old.items():
@@ -129,6 +145,9 @@ def find_scale_slots(
                 at = blob.find(old_b, start)
                 if at < 0:
                     break
+                if tokens.intersection(range(at, at + len(old_b))):
+                    start = at + 1
+                    continue
                 claimed.setdefault(at, set()).add((tensor, new_b))
                 prev = hits.get(at)
                 if prev is None or len(old_b) > len(prev[3]):
