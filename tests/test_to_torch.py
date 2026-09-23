@@ -162,7 +162,7 @@ def _decoder_model():
     return model
 
 
-def _feeds(batch, seq, past):
+def _feeds(batch, seq, past, head=HEAD):
     rng = np.random.default_rng(batch * 100 + seq * 10 + past)
     return {
         "input_ids": rng.integers(0, VOCAB, (batch, seq)).astype(np.int64),
@@ -170,10 +170,10 @@ def _feeds(batch, seq, past):
         "position_ids": np.tile(np.arange(past, past + seq), (batch, 1)).astype(
             np.int64
         ),
-        "past_key_values_0_key": rng.standard_normal((batch, HK, past, HEAD)).astype(
+        "past_key_values_0_key": rng.standard_normal((batch, HK, past, head)).astype(
             np.float32
         ),
-        "past_key_values_0_value": rng.standard_normal((batch, HK, past, HEAD)).astype(
+        "past_key_values_0_value": rng.standard_normal((batch, HK, past, head)).astype(
             np.float32
         ),
     }
@@ -340,3 +340,169 @@ def test_unsupported_op_is_named():
     mod = onnx_to_torch(model, inputs=["x"], outputs=["y"])
     with pytest.raises(NotImplementedError, match="Hardmax"):
         mod(torch.zeros(2, 3))
+
+
+# onnxruntime's GroupQueryAttention kernel needs a head size that is a multiple of 8.
+GHEAD = 8
+
+
+def _genai_model():
+    # ONNX Runtime GenAI builder spelling (e.g. HuggingFaceTB/SmolLM2-360M-Instruct's
+    # ONNX export): contrib RotaryEmbedding / GroupQueryAttention /
+    # (Skip)SimplifiedLayerNormalization, past KV fed straight into GQA, and GQA's
+    # seqlens_k / total_sequence_length derived from attention_mask.
+    body = f"""
+    g (int64[B, S] input_ids, int64[B, T] attention_mask, int64[B, S] position_ids,
+       float[B, {HK}, P, {GHEAD}] past_key_values_0_key,
+       float[B, {HK}, P, {GHEAD}] past_key_values_0_value)
+      => (float[B, S, {VOCAB}] logits, float[B, {HK}, T, {GHEAD}] present_0_key,
+          float[B, {HK}, T, {GHEAD}] present_0_value)
+    <int64[1] one = {{1}}, int64 one_s = {{1}}>
+    {{
+      x = Gather(embed, input_ids)
+      h = SimplifiedLayerNormalization<epsilon = 1e-6>(x, ln_w)
+      q0 = MatMul(h, wq)
+      k0 = MatMul(h, wk)
+      v = MatMul(h, wv)
+      q = com.microsoft.RotaryEmbedding(q0, position_ids, cos_cache, sin_cache)
+      k = com.microsoft.RotaryEmbedding(k0, position_ids, cos_cache, sin_cache)
+      am_sum = ReduceSum(attention_mask, one)
+      am_len = Sub(am_sum, one)
+      seqlens_k = Cast<to = 6>(am_len)
+      am_shape = Shape(attention_mask)
+      total0 = Gather<axis = 0>(am_shape, one_s)
+      total = Cast<to = 6>(total0)
+      ctx, present_0_key, present_0_value = com.microsoft.GroupQueryAttention<
+          num_heads = {HQ}, kv_num_heads = {HK}, scale = 0.5>(
+          q, k, v, past_key_values_0_key, past_key_values_0_value, seqlens_k, total)
+      o = MatMul(ctx, wo)
+      res_n, mean_unused, inv_unused, res = com.microsoft.SkipSimplifiedLayerNormalization<
+          epsilon = 1e-6>(x, o, ln2_w)
+      logits = MatMul(res_n, lm_head)
+    }}
+    """
+    model = parser.parse_model(
+        f'<ir_version: 8, opset_import: ["": 18, "com.microsoft": 1]> {body}'
+    )
+    rng = np.random.default_rng(3)
+
+    def w(name, *shape, scale=0.3):
+        return numpy_helper.from_array(
+            (rng.standard_normal(shape) * scale).astype(np.float32), name
+        )
+
+    pos = np.arange(64)[:, None] / (10000 ** (np.arange(0, GHEAD, 2) / GHEAD))[None]
+    model.graph.initializer.extend(
+        [
+            w("embed", VOCAB, HIDDEN, scale=1.0),
+            w("ln_w", HIDDEN, scale=0.1),
+            w("ln2_w", HIDDEN, scale=0.1),
+            w("wq", HIDDEN, HQ * GHEAD),
+            w("wk", HIDDEN, HK * GHEAD),
+            w("wv", HIDDEN, HK * GHEAD),
+            w("wo", HQ * GHEAD, HIDDEN),
+            w("lm_head", HIDDEN, VOCAB),
+            numpy_helper.from_array(np.cos(pos).astype(np.float32), "cos_cache"),
+            numpy_helper.from_array(np.sin(pos).astype(np.float32), "sin_cache"),
+        ]
+    )
+    return model
+
+
+@pytest.mark.parametrize("past", [0, 3])
+def test_genai_contrib_ops_exact_mode(past):
+    # GQA with a real past, RoPE at offset positions: exact interpretation vs ORT's own
+    # contrib kernels.
+    model = _genai_model()
+    names = [i.name for i in model.graph.input]
+    mod = onnx_to_torch(
+        model,
+        inputs=names,
+        outputs=[o.name for o in model.graph.output],
+        strip_kv_cache=False,
+        attention="exact",
+    )
+    # onnxruntime's GQA: batch must be 1 when a multi-token input has a past.
+    feeds = _feeds(1 if past else 2, 4, past, head=GHEAD)
+    try:
+        want = _ort(model, feeds)
+    except Exception as e:  # onnxruntime build without these contrib kernels
+        pytest.skip(f"onnxruntime cannot run the contrib ops: {e}")
+    got = mod(*(torch.from_numpy(feeds[n]) for n in names))
+    for g, w in zip(got, want):
+        np.testing.assert_allclose(g.numpy(), w, rtol=1e-4, atol=1e-4)
+
+
+def test_genai_contrib_ops_sdpa_mode_and_export():
+    # Default mode: GQA's past / seqlens inputs are dropped (never fetched), and the
+    # module exports with dynamic batch and sequence.
+    from torch.export import Dim, export
+
+    model = _genai_model()
+    mod = onnx_to_torch(model)
+    feeds = _feeds(2, 5, 0, head=GHEAD)
+    try:
+        (want,) = _ort(model, feeds)[:1]
+    except Exception as e:
+        pytest.skip(f"onnxruntime cannot run the contrib ops: {e}")
+    b, s = Dim("batch", max=64), Dim("seq", max=4096)
+    ep = export(
+        mod,
+        (),
+        {
+            "input_ids": torch.from_numpy(feeds["input_ids"]),
+            "position_ids": torch.from_numpy(feeds["position_ids"]),
+        },
+        dynamic_shapes={"input_ids": {0: b, 1: s}, "position_ids": {0: b, 1: s}},
+    )
+    (got,) = ep.module()(
+        input_ids=torch.from_numpy(feeds["input_ids"]),
+        position_ids=torch.from_numpy(feeds["position_ids"]),
+    )
+    np.testing.assert_allclose(got.numpy(), want, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("zero_points", [False, True])
+def test_matmulnbits_dequantized_matches_onnxruntime(zero_points):
+    # Weight-only int4 (onnx-community q4f16 / GenAI int4 exports): dequantized once at
+    # conversion to a dense [K, N] weight. K=40 with block 16 also exercises the padded
+    # last block; the bias input is exercised too.
+    k, n, block = 40, 8, 16
+    k_blocks = -(-k // block)
+    rng = np.random.default_rng(7)
+    packed = rng.integers(0, 256, (n, k_blocks, block // 2), dtype=np.uint8)
+    scales = (rng.random(n * k_blocks) * 0.1 + 0.01).astype(np.float32)
+    zp = rng.integers(0, 256, (n * ((k_blocks + 1) // 2),), dtype=np.uint8)
+    bias = rng.standard_normal(n).astype(np.float32)
+    zp_in = "zp" if zero_points else '""'
+    model = parser.parse_model(
+        f"""
+        <ir_version: 8, opset_import: ["": 18, "com.microsoft": 1]>
+        g (float[B, S, {k}] a) => (float[B, S, {n}] y) {{
+          y = com.microsoft.MatMulNBits<K = {k}, N = {n}, bits = 4, block_size = {block}>(
+              a, w, scales, {zp_in}, "", bias)
+        }}
+        """
+    )
+    inits = [
+        numpy_helper.from_array(packed, "w"),
+        numpy_helper.from_array(scales, "scales"),
+        numpy_helper.from_array(bias, "bias"),
+    ]
+    if zero_points:
+        inits.append(numpy_helper.from_array(zp, "zp"))
+    model.graph.initializer.extend(inits)
+    x = rng.standard_normal((2, 3, k)).astype(np.float32)
+    try:
+        (want,) = _ort(model, {"a": x})
+    except Exception as e:
+        pytest.skip(f"onnxruntime cannot run MatMulNBits: {e}")
+    mod = onnx_to_torch(model, inputs=["a"], outputs=["y"])
+    assert not any(t.dtype == torch.uint8 for t in mod.state_dict().values())
+    (got,) = mod(torch.from_numpy(x))
+    np.testing.assert_allclose(got.numpy(), want, rtol=1e-4, atol=1e-4)
+    meta = onnx_to_torch(model, inputs=["a"], outputs=["y"], device="meta")
+    meta.load_state_dict(onnx_state_dict(meta.param_names, model), assign=True)
+    np.testing.assert_allclose(
+        meta(torch.from_numpy(x))[0].numpy(), want, rtol=1e-4, atol=1e-4
+    )

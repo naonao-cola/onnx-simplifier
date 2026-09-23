@@ -55,6 +55,10 @@ __all__ = ["onnx_to_torch", "onnx_state_dict"]
 # (ConstantOfShape, Range). A ContextVar rather than a module attribute: torch.export
 # rejects attributes set during forward.
 _DEVICE = contextvars.ContextVar("onnxsim_to_torch_device", default=None)
+# Per-forward-call memo of RoPE cos/sin tensors: q and k each have their own ONNX
+# RotaryEmbedding node, but must share one cos/sin (unsqueezed) value for AutoDeploy's
+# match_rope_pattern, which matches q's and k's rotation as a single pattern.
+_ROPE_MEMO: contextvars.ContextVar = contextvars.ContextVar("onnxsim_to_torch_rope")
 
 _KV_INPUT_RE = re.compile(r"^(past_key_values|past_key|past_value|past)[._]")
 
@@ -174,6 +178,44 @@ def _node_const(node) -> Optional[np.ndarray]:
     return None
 
 
+def _dequant_matmulnbits(node, arrays) -> np.ndarray:
+    """Dense ``[K, N]`` weight of a ``com.microsoft::MatMulNBits`` node.
+
+    ``B`` is ``[N, k_blocks, blob]`` uint8 with ``bits``-bit values packed low bits
+    first; ``scales`` has one entry per (row, block); ``zero_points`` (optional) is
+    either packed like ``B`` or in the scales' type, defaulting to ``2**(bits-1)``.
+    """
+    a = _attrs(node)
+    k, n, bits, block = a["K"], a["N"], a.get("bits", 4), a["block_size"]
+    if len(node.input) > 4 and node.input[4]:
+        raise NotImplementedError("MatMulNBits with g_idx (act-order)")
+    if 8 % bits:
+        raise NotImplementedError(f"MatMulNBits bits={bits}")
+    b = arrays[node.input[1]]
+    scales = arrays[node.input[2]]
+    k_blocks = -(-k // block)
+    per_byte = 8 // bits
+    mask = (1 << bits) - 1
+    b = b.reshape(n, -1)
+    q = np.stack([(b >> (bits * i)) & mask for i in range(per_byte)], -1).reshape(n, -1)
+    q = q[:, : k_blocks * block].astype(np.float32).reshape(n, k_blocks, block)
+    sc = scales.astype(np.float32).reshape(n, k_blocks, 1)
+    zp_name = node.input[3] if len(node.input) > 3 else ""
+    if zp_name:
+        zp = arrays[zp_name]
+        if zp.dtype == np.uint8:
+            zp = zp.reshape(n, -1)
+            zp = np.stack([(zp >> (bits * i)) & mask for i in range(per_byte)], -1)
+            zp = zp.reshape(n, -1)[:, :k_blocks].astype(np.float32)
+        else:
+            zp = zp.astype(np.float32).reshape(n, k_blocks)
+        zp = zp[..., None]
+    else:
+        zp = np.float32(1 << (bits - 1))
+    w = ((q - zp) * sc).reshape(n, -1)[:, :k]
+    return np.ascontiguousarray(w.T.astype(scales.dtype))
+
+
 class _AttnMatch:
     """One recognized ``softmax(scale * q @ kT [+ mask]) @ v`` block."""
 
@@ -233,7 +275,31 @@ def _build_module_class():
             # Static values: small int constants become shape values, the rest tensors.
             self._static: Dict[str, Any] = {}
             self._param_of: Dict[str, str] = {}
+            # Weight-only-quantized MatMulNBits: dequantized once, here, to a dense
+            # [K, N] parameter keyed "<B>::dequant"; the packed inputs are not kept.
+            nbits = [
+                n
+                for n in g.node
+                if n.domain == "com.microsoft" and n.op_type == "MatMulNBits"
+            ]
+            packed = {i for n in nbits for i in n.input[1:4] if i}
+            other_uses = {i for n in g.node if n not in nbits for i in n.input}
+            skip = packed - other_uses
+            self._nbits_key: Dict[str, str] = {}
+            if nbits:
+                arrays = {
+                    t.name: numpy_helper.to_array(t)
+                    for t in g.initializer
+                    if t.name in packed
+                }
+                for n in nbits:
+                    key = n.input[1] + "::dequant"
+                    if key not in self._param_of:
+                        self._register(key, _dequant_matmulnbits(n, arrays), device)
+                    self._nbits_key[n.output[0]] = key
             for t in g.initializer:
+                if t.name in skip:
+                    continue
                 arr = numpy_helper.to_array(t)
                 self._register(t.name, arr, device)
             self._nodes = []
@@ -257,6 +323,9 @@ def _build_module_class():
             if attention == "sdpa":
                 self._match_attention(producer, consumers)
             self._plan = self._schedule(producer)
+            # Inputs each planned node actually reads (see _deps); the rest -- e.g. a
+            # stripped past-KV input of GroupQueryAttention -- are passed as None.
+            self._node_deps = {id(n): set(self._deps(n)) for n in self._plan}
             self.forward = self._make_forward()
 
         # ---- construction helpers ---------------------------------------------------
@@ -418,6 +487,15 @@ def _build_module_class():
                 return [m.q, m.kt, m.v]
             if n.op_type == "Attention" and self._attention == "sdpa":
                 return [i for i in n.input[:3]]
+            if n.op_type == "MatMulNBits" and n.output[0] in self._nbits_key:
+                bias = n.input[5] if len(n.input) > 5 and n.input[5] else None
+                return [n.input[0], self._nbits_key[n.output[0]]] + (
+                    [bias] if bias else []
+                )
+            if n.op_type == "GroupQueryAttention" and self._attention == "sdpa":
+                # past KV and the seqlens_k / total_sequence_length bookkeeping (derived
+                # from attention_mask) are the cache-inserting runtime's business.
+                return [i for i in n.input[:3] if i]
             return [i for i in n.input if i]
 
         def _schedule(self, producer):
@@ -486,6 +564,7 @@ def _build_module_class():
             _DEVICE.set(
                 next((a.device for a in args if isinstance(a, torch.Tensor)), None)
             )
+            _ROPE_MEMO.set({})
             env: Dict[str, Any] = dict(self._static)
             for k, attr in self._param_of.items():
                 env[k] = getattr(self, attr)
@@ -505,7 +584,8 @@ def _build_module_class():
                         q, kt.transpose(-1, -2), v, is_causal=True, scale=m.scale
                     )
                     continue
-                ins = [get(i) for i in n.input]
+                deps = self._node_deps[id(n)]
+                ins = [get(i) if i in deps else None for i in n.input]
                 res = self._run(n, ins)
                 if not isinstance(res, tuple) or isinstance(res, _Sh):
                     res = (res,)
@@ -518,6 +598,14 @@ def _build_module_class():
         # ---- op implementations ------------------------------------------------------
 
         def _run(self, n, ins):
+            if n.domain == "com.microsoft":
+                # ONNX Runtime contrib ops (ORT GenAI builder / optimum exports).
+                fn = getattr(self, "_ms_" + n.op_type, None) or getattr(
+                    self, "_op_" + n.op_type, None
+                )
+                if fn is None:
+                    raise NotImplementedError(f"contrib op com.microsoft::{n.op_type}")
+                return fn(ins, _attrs(n), n)
             if n.domain not in ("", "ai.onnx"):
                 raise NotImplementedError(f"custom-domain op {n.domain}::{n.op_type}")
             fn = getattr(self, "_op_" + n.op_type, None)
@@ -907,18 +995,137 @@ def _build_module_class():
             ax = _norm_axis(a.get("axis", -1), x.dim())
             return F.layer_norm(x, tuple(x.shape[ax:]), w, b, a.get("epsilon", 1e-5))
 
+        @staticmethod
+        def _rms(x, w, eps, stash=TensorProto.FLOAT):
+            # Same arithmetic order as RMSNormalization's reference body and HF's
+            # *RMSNorm.forward -- also the shape AutoDeploy's rmsnorm matcher looks for.
+            xs = x.to(_dtype(stash))
+            var = xs.pow(2).mean(-1, keepdim=True)
+            return w * (xs * torch.rsqrt(var + eps)).to(x.dtype)
+
         def _op_RMSNormalization(self, ins, a, n):
-            # Same arithmetic order as RMSNormalization's reference body (and HF's
-            # *RMSNorm.forward), which is also what AutoDeploy's rmsnorm matcher looks for.
             x, w = ins
             ax = _norm_axis(a.get("axis", -1), x.dim())
             if ax != x.dim() - 1:
                 raise NotImplementedError(
                     "RMSNormalization over more than the last axis"
                 )
-            xs = x.to(_dtype(a.get("stash_type", TensorProto.FLOAT)))
-            var = xs.pow(2).mean(-1, keepdim=True)
-            return w * (xs * torch.rsqrt(var + a.get("epsilon", 1e-5))).to(x.dtype)
+            return self._rms(
+                x, w, a.get("epsilon", 1e-5), a.get("stash_type", TensorProto.FLOAT)
+            )
+
+        def _op_SimplifiedLayerNormalization(self, ins, a, n):
+            # ONNX Runtime's RMSNorm (registered in the default domain).
+            x, w = ins[0], ins[1]
+            if _norm_axis(a.get("axis", -1), x.dim()) != x.dim() - 1:
+                raise NotImplementedError("SimplifiedLayerNormalization, non-last axis")
+            return (self._rms(x, w, a.get("epsilon", 1e-5)),)
+
+        def _op_SkipSimplifiedLayerNormalization(self, ins, a, n):
+            # outputs: (RMSNorm(input + skip [+ bias]), mean, inv_std_var, the sum)
+            x = ins[0] + ins[1]
+            if len(ins) > 3 and ins[3] is not None:
+                x = x + ins[3]
+            return (self._rms(x, ins[2], a.get("epsilon", 1e-5)), None, None, x)
+
+        def _ms_RotaryEmbedding(self, ins, a, n):
+            # com.microsoft::RotaryEmbedding(input, position_ids, cos_cache, sin_cache):
+            # input [B, S, N*D] or [B, N, S, D]; cos/sin cache [max_pos, rotary_dim/2].
+            x, pos, cos_c, sin_c = ins[:4]
+            if a.get("interleaved", 0):
+                raise NotImplementedError("com.microsoft::RotaryEmbedding interleaved")
+            if a.get("scale", 1.0) != 1.0:
+                raise NotImplementedError("com.microsoft::RotaryEmbedding scale != 1")
+            rd = 2 * cos_c.shape[-1]
+            if a.get("rotary_embedding_dim", 0) not in (0, rd):
+                raise NotImplementedError("rotary_embedding_dim != cos_cache width")
+            if (
+                pos.dim() == 1
+                and pos.shape[0] == 1
+                and x.dim() == 3
+                and x.shape[1] != 1
+            ):
+                pos = pos + torch.arange(x.shape[1], device=pos.device)[None]
+            # Rotate in [B, N, S, D] with cos/sin unsqueezed at dim 1: the only layout
+            # AutoDeploy's match_rope_pattern is registered for.
+            udim = 1
+            key = (id(cos_c), id(sin_c), id(pos), udim, x.dtype)
+            memo = _ROPE_MEMO.get({})
+            if key not in memo:
+                cos = torch.cat([cos_c[pos], cos_c[pos]], -1).to(x.dtype)  # [B, S, rd]
+                sin = torch.cat([sin_c[pos], sin_c[pos]], -1).to(x.dtype)
+                memo[key] = (cos.unsqueeze(udim), sin.unsqueeze(udim))
+            cos, sin = memo[key]
+            if x.dim() == 3:
+                nh = a.get("num_heads", 0)
+                d = x.shape[-1] // nh if nh else rd
+                x4 = x.reshape(x.shape[0], x.shape[1], -1, d).transpose(1, 2)
+            else:
+                x4, d = x, x.shape[-1]
+            # Full rotary: no slicing at all -- a no-op x[..., :d] exports as aten.alias,
+            # which stops AutoDeploy's match_rope_pattern from matching.
+            xr, xp = (x4[..., :rd], x4[..., rd:]) if rd < d else (x4, None)
+            h = rd // 2
+            rot = torch.cat([-xr[..., h:], xr[..., :h]], -1)
+            y = (
+                torch.cat([xr * cos + rot * sin, xp], -1)
+                if rd < d
+                else xr * cos + rot * sin
+            )
+            if x.dim() == 3:
+                y = y.transpose(1, 2)
+            return y.reshape(x.shape)
+
+        def _ms_MatMulNBits(self, ins, a, n):
+            w = getattr(self, self._param_of[self._nbits_key[n.output[0]]])
+            y = torch.matmul(ins[0], w)
+            if len(ins) > 5 and ins[5] is not None:
+                y = y + ins[5]
+            return y
+
+        def _ms_GroupQueryAttention(self, ins, a, n):
+            # com.microsoft::GroupQueryAttention(query, key, value, past_key, past_value,
+            #   seqlens_k, total_sequence_length, [cos_cache, sin_cache, ...]):
+            # q/k/v [B, S, H*D] (key/value empty: query is packed QKV), past [B, Hkv, P, D].
+            if a.get("local_window_size", -1) != -1 or a.get("softcap", 0.0):
+                raise NotImplementedError(
+                    "GroupQueryAttention sliding window / softcap"
+                )
+            if a.get("do_rotary", 0):
+                raise NotImplementedError(
+                    "GroupQueryAttention do_rotary=1 (positions come from seqlens_k, "
+                    "not position_ids)"
+                )
+            hq, hk = a["num_heads"], a["kv_num_heads"]
+            q = ins[0]
+            k = ins[1] if len(ins) > 1 else None
+            v = ins[2] if len(ins) > 2 else None
+            b, s = q.shape[0], q.shape[1]
+            if k is None:
+                d = q.shape[-1] // (hq + 2 * hk)
+                q, k, v = torch.split(q, [hq * d, hk * d, hk * d], -1)
+            d = q.shape[-1] // hq
+            q = q.reshape(b, s, hq, d).transpose(1, 2)
+            k = k.reshape(b, s, hk, d).transpose(1, 2)
+            v = v.reshape(b, s, hk, d).transpose(1, 2)
+            past = 0
+            if self._attention == "exact" and len(ins) > 4 and ins[3] is not None:
+                past = ins[3].shape[2]
+                k, v = torch.cat([ins[3], k], 2), torch.cat([ins[4], v], 2)
+            present_k, present_v = k, v
+            if hk != hq:
+                # HF repeat_kv spelling, which AutoDeploy's match_repeat_kv recognizes.
+                rep, t = hq // hk, k.shape[2]
+                k = k[:, :, None].expand(b, hk, rep, t, d).reshape(b, hq, t, d)
+                v = v[:, :, None].expand(b, hk, rep, t, d).reshape(b, hq, t, d)
+            scale = a.get("scale", 0.0) or None
+            if self._attention == "exact" and not (isinstance(past, int) and past == 0):
+                t = k.shape[2]
+                mask = torch.ones(s, t, dtype=torch.bool, device=q.device).tril(past)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+            return (y.transpose(1, 2).reshape(b, s, hq * d), present_k, present_v)
 
         def _op_RotaryEmbedding(self, ins, a, n):
             x, cos, sin = ins[0], ins[1], ins[2]
@@ -929,11 +1136,17 @@ def _build_module_class():
                 )
             if x.dim() != 4:
                 raise NotImplementedError("RotaryEmbedding on 3-D input")
-            if pos is not None:
-                cos, sin = cos[pos], sin[pos]
-            # cos/sin: [B, S, D/2] -> broadcast over heads of x [B, N, S, D].
-            cos = torch.cat([cos, cos], -1).unsqueeze(1).to(x.dtype)
-            sin = torch.cat([sin, sin], -1).unsqueeze(1).to(x.dtype)
+            key = (id(cos), id(sin), id(pos), 1, x.dtype)
+            memo = _ROPE_MEMO.get({})
+            if key not in memo:
+                if pos is not None:
+                    cos, sin = cos[pos], sin[pos]
+                # cos/sin: [B, S, D/2] -> broadcast over heads of x [B, N, S, D].
+                memo[key] = (
+                    torch.cat([cos, cos], -1).unsqueeze(1).to(x.dtype),
+                    torch.cat([sin, sin], -1).unsqueeze(1).to(x.dtype),
+                )
+            cos, sin = memo[key]
             h = x.shape[-1] // 2
             rot = torch.cat([-x[..., h:], x[..., :h]], -1)
             return x * cos + rot * sin
@@ -1018,6 +1231,8 @@ def onnx_state_dict(module, model) -> Dict[str, Any]:
     for n in model.graph.node:
         if n.op_type == "Constant" and n.output[0] in names:
             arrays[n.output[0]] = _node_const(n)
+        if n.op_type == "MatMulNBits" and n.input[1] + "::dequant" in names:
+            arrays[n.input[1] + "::dequant"] = _dequant_matmulnbits(n, arrays)
     return {
         attr: torch.from_numpy(np.ascontiguousarray(arrays[name]).copy())
         for name, attr in names.items()
