@@ -684,11 +684,15 @@ class ElementwiseScaleEdit:
                 dict(self.scales),
                 entry.meta["zero_points"],
             )
-        init = _mcode_initializer(model)
-        init.raw_data = ew.retarget(
-            bytes(init.raw_data), key.op, entry.meta["scales"], dict(self.scales)
+        import step_recalibrate
+
+        mc = ew.retarget(
+            bytes(_mcode_initializer(model).raw_data),
+            key.op,
+            entry.meta["scales"],
+            dict(self.scales),
         )
-        return model
+        return step_recalibrate.with_mcode(model, mc)
 
     def to_json(self):
         return {"type": "elementwise_scales", "scales": dict(self.scales)}

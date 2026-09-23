@@ -75,9 +75,16 @@ transfer handles (`transfer handle ... already exists!`). Reload the whole
 stack in the guest, in `guest_install_axcl.sh`'s order:
 
 ```sh
-modprobe -r axcl_host ax_pcie_mmb ax_pcie_msg ax_pcie_host_dev
+modprobe -r axcl_host ax_pcie_mmb ax_pcie_msg ax_pcie_p2p_rc ax_pcie_host_dev
 modprobe ax_pcie_host_dev && modprobe ax_pcie_msg && modprobe ax_pcie_mmb && modprobe axcl_host
 ```
+
+`ax_pcie_p2p_rc` also holds `ax_pcie_host_dev`: leave it out of the `-r`
+list and `ax_pcie_host_dev` stays loaded ("Module ax_pcie_host_dev is in
+use"), the card keeps its stale state and is still dead after the reload.
+Do not poll with `axcl-smi` while the card is dead -- it hangs. If the
+firmware push then times out (`Handshake timeout!` after ~360 s), run the
+same reload once more; the second one came up in 5 s (2026-09-24).
 
 then wait ~30 s and confirm the card in `axcl-smi` plus a control model run
 before any further device work.
