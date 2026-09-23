@@ -31,6 +31,15 @@ for _p in (ANDROID, MSDA.parent, MSDA):
 import model as M  # noqa: E402
 import split  # noqa: E402
 
+# Don't leak BEVFormer's generic module names to the rest of the session: other tests import
+# their own ``model`` (e.g. tests/test_nanochat.py's ``from model import GPT``), which would
+# otherwise get this cached one. ``M``/``split`` keep their references; ANDROID stays on the
+# path for the lazy ``hexagon_sim_harness`` import below.
+for _name in ("model", "split"):
+    sys.modules.pop(_name, None)
+for _p in (MSDA.parent, MSDA):
+    sys.path.remove(str(_p))
+
 
 def _case(kind: str, q: int = 96, seed: int = 0):
     """Kernel args for a TSA- (NV=2, 50x50, NO=2, P=4) or SCA-shaped (NV=6, 15x25, NO=1, P=8) call."""
