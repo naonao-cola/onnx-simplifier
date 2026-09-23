@@ -9,7 +9,8 @@
   ImageNet mean/std folded into that Conv's weight and bias. The patch embed has stride == kernel
   and no padding, so every input pixel is used and the fold is exact.
 
-usage: graph.py <raw.onnx> <out.sim.onnx> <out.u8.onnx>
+usage: graph.py <raw.onnx> <out.sim.onnx> <out.u8.onnx>   (also <out.f255.onnx>: float [0, 255] NHWC
+input, the same graph before its input is quantized; quantize.py starts from it)
 """
 
 from __future__ import annotations
@@ -66,7 +67,10 @@ def fold_rank5_transposes(m: onnx.ModelProto) -> int:
     return done
 
 
-def u8_input(m: onnx.ModelProto) -> onnx.ModelProto:
+def u8_input(m: onnx.ModelProto, float_input: bool = False) -> onnx.ModelProto:
+    """float_input: the same graph but with a float [0, 255] NHWC input (no DequantizeLinear), the
+    starting point for quantize.py, which calibrates it with the fixed range (0, 255) so the
+    quantized input is again the uint8 RGB bytes (scale 1, zero point 0)."""
     m2 = onnx.ModelProto()
     m2.CopyFrom(m)
     g = m2.graph
@@ -93,21 +97,45 @@ def u8_input(m: onnx.ModelProto) -> onnx.ModelProto:
     g.initializer.append(numpy_helper.from_array(b2.astype(np.float32), "pe_b_u8"))
     g.initializer.append(numpy_helper.from_array(np.array(1.0, np.float32), "u8_scale"))
     g.initializer.append(numpy_helper.from_array(np.array(0, np.uint8), "u8_zp"))
-    new_in = helper.make_tensor_value_info(
-        "image", onnx.TensorProto.UINT8, [1, h, w, c]
-    )
+    dt = onnx.TensorProto.FLOAT if float_input else onnx.TensorProto.UINT8
+    new_in = helper.make_tensor_value_info("image", dt, [1, h, w, c])
     nodes = [
         helper.make_node(
-            "DequantizeLinear", ["image", "u8_scale", "u8_zp"], ["image_f"]
+            "Transpose",
+            ["image_f"],
+            ["image_nchw"],
+            name="image/to_nchw",
+            perm=[0, 3, 1, 2],
         ),
-        helper.make_node("Transpose", ["image_f"], ["image_nchw"], perm=[0, 3, 1, 2]),
     ]
+    if float_input:
+        nodes[0].input[0] = "image"
+    else:
+        nodes.insert(
+            0,
+            helper.make_node(
+                "DequantizeLinear",
+                ["image", "u8_scale", "u8_zp"],
+                ["image_f"],
+                name="image/dq",
+            ),
+        )
     conv.input[0] = "image_nchw"
     conv.input[1] = "pe_w_u8"
     if len(conv.input) > 2:
         conv.input[2] = "pe_b_u8"
     else:
         conv.input.append("pe_b_u8")
+    used = {x for n in g.node for x in n.input}
+    for i in [
+        i
+        for i in g.initializer
+        if i.name not in used and i.name not in ("u8_scale", "u8_zp")
+    ]:
+        g.initializer.remove(i)  # the original patch-embed weight / bias
+    if float_input:
+        for i in [i for i in g.initializer if i.name in ("u8_scale", "u8_zp")]:
+            g.initializer.remove(i)
     g.input.remove(inp)
     g.input.insert(0, new_in)
     for i, n in enumerate(nodes):
@@ -118,7 +146,7 @@ def u8_input(m: onnx.ModelProto) -> onnx.ModelProto:
 def main():
     import onnxsim
 
-    raw, out_sim, out_u8 = sys.argv[1:4]
+    raw, out_sim, out_u8 = sys.argv[1:4]  # also writes <out_u8 with .u8 -> .f255>
     m = onnx.load(raw)
     m, ok = onnxsim.simplify(m)
     assert ok
@@ -136,6 +164,7 @@ def main():
     del m.graph.value_info[:]
     onnx.save(m, out_sim)
     onnx.save(u8_input(m), out_u8)
+    onnx.save(u8_input(m, float_input=True), out_u8.replace(".u8.", ".f255."))
 
 
 if __name__ == "__main__":

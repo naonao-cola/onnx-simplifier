@@ -64,11 +64,14 @@ def _msda_forward_r4(
 
 
 def load(variant: str, patched: bool = True):
-    """Returns (core module in export mode, resolution)."""
+    """Returns (core module in export mode, resolution). `variant` is nano | small | medium,
+    optionally `@<res>` for another square resolution (RF-DETR's weight-sharing NAS: the same
+    weights run at any multiple of patch_size * num_windows, positional encodings interpolated)."""
     import rfdetr
     from rfdetr.models.ops.modules.ms_deform_attn import MSDeformAttn
 
-    m = getattr(rfdetr, VARIANTS[variant])()
+    name, _, res = variant.partition("@")
+    m = getattr(rfdetr, VARIANTS[name])(**({"resolution": int(res)} if res else {}))
     core = m.model.model.eval()
     core.export()
     if patched:

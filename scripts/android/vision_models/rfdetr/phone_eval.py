@@ -107,6 +107,11 @@ def main():
         f"export QNN_PERF=burst ORT_SPIN=0 LD_LIBRARY_PATH={R} "
         f"ADSP_LIBRARY_PATH='{R};/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp'\n"
         + (f"export QNN_EXTRA='{a.extra}'\n" if a.extra else "")
+        + (
+            f"export ORT_LOG={os.environ['ORT_LOG']}\n"
+            if os.environ.get("ORT_LOG")
+            else ""
+        )
         + f"i=0; while [ $i -lt {len(paths)} ]; do\n"
         f"  n=1; [ $i = 0 ] && n={a.iters}\n"
         f"  {R}/qnn_run_multi {model.name} m$i.txt htp $n res/out$i ctx.onnx > res/log$i.txt 2>&1\n"
