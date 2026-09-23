@@ -26,9 +26,64 @@ arXiv 2509.23324)?
 Next attempts should change one of these at a time, each followed by the health check, and only on
 a freshly recovered DSP.
 
+## Round 2 (codex/android-hmx-probe2): simulator first
+
+The v69 ISS (`libhexagonissv69.so`, `hexagon-sim -mv69 --mhmx 1`) models HMX, so sequences can be
+checked with zero risk before they touch the phone (`hmx_sim.c`, `sim.sh`; standalone, no QuRT):
+
+| sim experiment | result |
+|---|---|
+| int8 `{activation.ub=mxmem(a,2047):deep; weight.b=mxmem(w,2047)}` + `mxmem(o,0):after:sat.ub=acc`, HMX not enabled | exception 0x18 at the first load (badva = VTCM) |
+| same, SSR bit 26 set (HMX enable; QuRT's `hmx_lock` does this on the phone) | **completes**, writes 2048 B, all 0 (no scale table) -- so the missing `bias = mxmem` does **not** by itself hang |
+| int8 + `bias = mxmem` with 256 B of word `0x00004000`, store `:after:sat.uh = acc:2x1` | **0x0020 = 32** in every output = K of one all-ones tile: the int8 MAC is correct |
+| int8 scale word sweep | the low 16 bits are the per-column scale (0x4000 -> x1 for `uh`; >= 0x7fff saturates); high bits had no visible effect with this data |
+| fp16 `{activation.hf ...:deep; weight.hf ...}` of 1.0s + `mxmem(o,0):after.hf=acc`, no scale table | **0x5000 = 32.0**: fp16 HMX works on v69 in the sim |
+| fp16 + scale table word `0x3c000000` | 0x5020 = 33.0: high fp16 half acts as a bias |
+
+So the phone hang's cause is outside the ISA: the untested difference is **HMX power** --
+the first probe voted HVX power and DCVS only, never `HAP_power_set_HMX` (`power_up = 1`), which
+MNN does before any HMX use. Round 2's first phone variant changes only that (`HMX_POWER=1`).
+
+### Round 2 on the phone (each variant followed by the known-good msda health check: all PASS)
+
+| variant | change | result |
+|---|---|---|
+| P0 | step 1 + `HAP_power_set_HMX` `power_up=1` (`HMX_POWER=1`) | power vote rc 0 from the unsigned PD; lock/unlock 0 |
+| **P1** | **round 1's exact hanging int8 sequence + the HMX power vote (only change)** | **completes**: 2048 B written, all 0 (same as the sim without a scale table). **Round 1's hang = HMX not powered.** |
+| P2 | + scale table (256 B of word `0x00004000`), store `:after:sat.uh = acc:2x1` | **0x0020 = 32 in every output** -- int8 HMX MAC correct |
+| P3 | fp16: `activation.hf`/`weight.hf` of 1.0, store `:after.hf`, no scale table | **0x5000 = 32.0 in every output** -- fp16 HMX works on V69 |
+
+Recipe that works from an unsigned FastRPC skel on V69: `HAP_power_set` HVX + **`HAP_power_set_HMX`
+(`power_up = 1`)** -> `HAP_compute_res` acquire with VTCM + `attr_set_hmx_param(1)` ->
+`HAP_compute_res_hmx_lock` on the thread that issues HMX -> tiles in VTCM -> (optional) `bias = mxmem`
+scale table -> `{activation.* = mxmem(a,Rt):deep; weight.* = mxmem(w,Rt)}` -> `mxmem(o,0):after... = acc`.
+
+### V69 int8 tile layouts (one-hot mapping in the sim, then a random 32x32x32 check: 0/1024 mismatches, `hmx_sim_layout.c`)
+
+One `{activation.ub = mxmem(a,2047):deep; weight.b = mxmem(w,2047)}` = one 32x32 output tile, K = 32:
+
+- weight `W(k,c)` (int8): byte `128*(k/4) + 4*c + (k%4)` -- vrmpy-style 4-byte k groups; 1024 B used of the 2 KB span
+- activation `A(r,k)` (uint8): byte `128*(r/2) + 4*k + 2*(r%2) + 1` -- only odd bytes are read in this mode
+- scale table (`bias = mxmem`, 256 B): per-column word, low 16 bits = scale; `0x4000` = x1 for the `uh` store
+- output `mxmem(o,0):after:sat.uh = acc:2x1`: `C(r,c)` at uint16 index `64*(r/2) + 2*c + (r%2)`
+- `Rt = 4095` (2 tiles) gives K = 64, as expected. Larger spans gave values the 8 KB-filled harness doesn't explain yet.
+
+### Throughput on the phone (one thread, turbo, timed loop of repeated `:deep` loads + one store; health check PASS after)
+
+| load | per 32x32x32 tile | rate |
+|---|---|---|
+| int8 `ub x b`, `Rt` 2047 | 8.9 ns | **~3.7 TMAC/s** |
+| int8, `Rt` 4095 (2 tiles/load) | 17.8 ns (8.9 per tile) | ~3.7 TMAC/s |
+| fp16 `hf x hf`, `Rt` 2047 | 10.7 ns | **~3.1 TMAC/s** |
+
+Single thread, one HMX unit, the same resident tile re-loaded (no DDR traffic), so it's a compute-issue
+figure, not a GEMM. QNN's measured int8 ceiling on this phone is ~16 TMAC/s: reaching it likely needs
+both HMX units (`QURT_HMX_UNIT_0/1` exist in `qurt_hmx.h`), longer `:deep` spans, and DMA-fed tiles.
+Next: map the fp16 and multi-tile `:deep` layouts, try a second thread/unit, and build a real VTCM-fed GEMM.
+
 ## Files
 
-`hmx_rpc.idl`, `hmx_impl.c` (skel: acquire, lock, one parameterized HMX sequence, release; return
+`hmx_sim.c`/`sim.sh` (hexagon-sim HMX checks), `hmx_sim_layout.c` (int8 layout check), `hmx_rpc.idl`, `hmx_impl.c` (skel: acquire, lock, one parameterized HMX sequence, release; return
 codes), `hmx_client.c`, `build.sh` (needs `HEXAGON_SDK_ROOT` for qaic/headers and a
 `HEXAGON_TOOLCHAIN` with `-mhmx`), `run.sh` (`setup` / `probe` / `health`; run under the host's phone
 lock; `health` runs a known-good msda_hvx skel).

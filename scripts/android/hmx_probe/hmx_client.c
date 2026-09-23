@@ -40,7 +40,9 @@ int main(int argc, char** argv) {
   printf("unsigned_rc %d open_rc %d\n", urc, orc);
   if (orc) return 1;
   int prc = 0;
-  hmx_rpc_perf_vote(h, 1, &prc);
+  /* HMX_POWER=1: also vote HMX power-up (perf_vote bit 1) */
+  const char* hp = getenv("HMX_POWER");
+  hmx_rpc_perf_vote(h, 1 | ((hp && atoi(hp)) ? 2 : 0), &prc);
   int na, nw, nb;
   unsigned char* a = load(argv[6], &na);
   unsigned char* w = load(argv[7], &nw);
