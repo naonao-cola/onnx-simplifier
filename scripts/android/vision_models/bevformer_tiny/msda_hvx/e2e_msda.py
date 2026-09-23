@@ -36,6 +36,7 @@ import split as S  # noqa: E402
 from nuscenes import NuScenesMini, match, temporal_can_bus  # noqa: E402
 
 PIECES = ["pre", "mid0", "post0", "mid1", "post1", "mid2", "post2"]
+PIECE_DIR = "msda_split"  # --pieces
 QNN_LIBS = HERE.parents[2] / "htp_exploration" / "qnn_shell" / "libs"
 E.R = os.environ.get("R", "/data/local/tmp/codex-android-bevformer-msda-hvx")
 if os.environ.get("PHONE_RUN"):
@@ -120,7 +121,14 @@ def main():
     ap.add_argument("--backbone", default="backbone6.q8")
     ap.add_argument("--decoder", default="decoder.sim")
     ap.add_argument("--reps", type=int, default=10)
+    ap.add_argument(
+        "--pieces",
+        default="msda_split",
+        help="msda_split_u8: uint8 TSA value maps (split.py export --tsa-u8)",
+    )
     a = ap.parse_args()
+    global PIECE_DIR
+    PIECE_DIR = a.pieces
     torch.set_grad_enabled(False)
     work = Path(a.work)
     push_runtime(work, Path(a.build), [a.backbone, a.decoder])
