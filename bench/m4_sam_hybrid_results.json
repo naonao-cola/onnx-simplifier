@@ -1,0 +1,75 @@
+{
+  "hardware": "Apple M4 Mac mini",
+  "compute_units": "ALL",
+  "compute_precision": "FLOAT32",
+  "metal_runner": "tinygrad METAL with TinyJit replay",
+  "image_sample": "mask_point.jpg (MobileSAM public sample)",
+  "prompt": "positive center point",
+  "warmup_runs": 3,
+  "measured_runs": 8,
+  "models": {
+    "EdgeSAM": {
+      "input_shape": [
+        1,
+        1024,
+        1024,
+        3
+      ],
+      "encoder_ms": {
+        "coreml": 30.294,
+        "metal_jit": 34.457
+      },
+      "decoder_ms": {
+        "coreml": 9.115,
+        "metal_jit": 12.367
+      },
+      "pipeline_ms": {
+        "coreml_to_coreml": 32.04,
+        "coreml_to_metal_jit": 39.527
+      },
+      "hybrid_mask_iou_vs_ort": 0.9999647812918222
+    },
+    "MobileSAM": {
+      "input_shape": [
+        1,
+        1024,
+        1024,
+        3
+      ],
+      "encoder_ms": {
+        "coreml": 56.302,
+        "metal_jit": 147.212
+      },
+      "decoder_ms": {
+        "coreml": 5.562,
+        "metal_jit": 11.825
+      },
+      "pipeline_ms": {
+        "coreml_to_coreml": 66.611,
+        "coreml_to_metal_jit": 67.536
+      },
+      "hybrid_mask_iou_vs_ort": 1.0
+    },
+    "EfficientViT-SAM-L0": {
+      "input_shape": [
+        1,
+        512,
+        512,
+        3
+      ],
+      "encoder_ms": {
+        "coreml": 25.541,
+        "metal_jit": 53.186
+      },
+      "decoder_ms": {
+        "coreml": 6.17,
+        "metal_jit": 11.382
+      },
+      "pipeline_ms": {
+        "coreml_to_coreml": 30.777,
+        "coreml_to_metal_jit": 36.652
+      },
+      "hybrid_mask_iou_vs_ort": 0.9999380190901203
+    }
+  }
+}
