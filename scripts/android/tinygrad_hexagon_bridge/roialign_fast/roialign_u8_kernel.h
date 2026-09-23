@@ -107,14 +107,46 @@ static inline void ru8_weights(const ru8_axis_t* y, const ru8_axis_t* x, int32_t
 #include <hvx_hexagon_protos.h>
 #define RU8_HVX 1
 typedef int32_t ru8_i32x32 __attribute__((vector_size(128)));
+
+/* acc_e/acc_o += w * (the even / odd bytes of the 128 channels at p), zero-extended to u16; vmpyuh
+ * then splits each again into even/odd halfwords (lo/hi of the pair). All in registers. */
+#define RU8_MAC(acc_e, acc_o, p, ww)                                              \
+  do {                                                                            \
+    const HVX_VectorPair v_ = Q6_Wuh_vzxt_Vub(*(const HVX_Vector*)(p));            \
+    acc_e = Q6_Wuw_vmpyacc_WuwVuhRuh(acc_e, Q6_V_lo_W(v_), (ww));                  \
+    acc_o = Q6_Wuw_vmpyacc_WuwVuhRuh(acc_o, Q6_V_hi_W(v_), (ww));                  \
+  } while (0)
+
+static inline ru8_i32x32 ru8_rq(ru8_i32x32 a, int32_t zsum, int32_t rnd_pre, int32_t mult, int32_t rnd, int32_t shift,
+                                int32_t z_out) {
+  a = (a - zsum + rnd_pre) >> RU8_PRESHIFT;
+  a = ((a * mult + rnd) >> shift) + z_out;
+  return __builtin_elementwise_min(__builtin_elementwise_max(a, (ru8_i32x32){0} + 0), (ru8_i32x32){0} + 255);
+}
+
+/* Requantize one 128-channel group and restore channel order: lo(e) = ch 4j, hi(e) = 4j+2,
+ * lo(o) = 4j+1, hi(o) = 4j+3 (each value in the low byte of its word). */
+static inline HVX_Vector ru8_rq_pack(HVX_VectorPair e, HVX_VectorPair o, int32_t zsum, int32_t rnd_pre, int32_t mult,
+                                     int32_t rnd, int32_t shift, int32_t z_out) {
+  const ru8_i32x32 q0 = ru8_rq((ru8_i32x32)Q6_V_lo_W(e), zsum, rnd_pre, mult, rnd, shift, z_out);
+  const ru8_i32x32 q1 = ru8_rq((ru8_i32x32)Q6_V_hi_W(e), zsum, rnd_pre, mult, rnd, shift, z_out);
+  const ru8_i32x32 q2 = ru8_rq((ru8_i32x32)Q6_V_lo_W(o), zsum, rnd_pre, mult, rnd, shift, z_out);
+  const ru8_i32x32 q3 = ru8_rq((ru8_i32x32)Q6_V_hi_W(o), zsum, rnd_pre, mult, rnd, shift, z_out);
+  const HVX_Vector ev = Q6_Vh_vshuffe_VhVh((HVX_Vector)q1, (HVX_Vector)q0); /* h[i] = ch 2i */
+  const HVX_Vector od = Q6_Vh_vshuffe_VhVh((HVX_Vector)q3, (HVX_Vector)q2); /* h[i] = ch 2i+1 */
+  return Q6_Vb_vshuffe_VbVb(od, ev);
+}
 #endif
 
-/* One RoI into one output row. prefetch: before bin b, l2fetch the rows bin b+1 will read -- per
- * sample row (iy) one l2fetch covering the whole x span of the bin's samples (both y_low and y_high
- * rows). */
-static void ru8_roi(const ru8_level_t* L, int C, const float* roi, int OH, int OW, int sr,
-                    int z_out, int prefetch, uint8_t* out_row) {
-  const int halves = C / 128;
+/* One RoI into one output row. prefetch: before bin b, l2fetch the rows bin b+1 will
+ * read -- per sample row one l2fetch over the x span of that bin's samples (y_low and y_high rows).
+ * (A row-ahead variant -- a whole bin row of lead time -- measured no better on the phone.)
+ * `halves` (C / 128) is a compile-time constant in every instantiation below, so the accumulators
+ * and the tap loop stay in registers instead of being indexed through the stack. */
+static inline __attribute__((always_inline)) void ru8_roi_h(const ru8_level_t* L, const int halves, const float* roi,
+                                                            int OH, int OW, int sr, int z_out, int prefetch,
+                                                            uint8_t* out_row) {
+  const int C = 128 * halves;
   const float x1 = roi[0] * L->spatial_scale, y1 = roi[1] * L->spatial_scale;
   const float x2 = roi[2] * L->spatial_scale, y2 = roi[3] * L->spatial_scale;
   const float roi_w = ru8_maxf(x2 - x1, 1.0f), roi_h = ru8_maxf(y2 - y1, 1.0f);
@@ -148,11 +180,10 @@ static void ru8_roi(const ru8_level_t* L, int C, const float* roi, int OH, int O
           }
       }
       int nvalid = 0;
+      uint8_t* o = out_row + (long)b * C;
 #ifdef RU8_HVX
-      /* acc[h][0] holds the even channel bytes, acc[h][1] the odd ones (vzxt splits them); within
-       * each pair, vmpyuh splits again into even/odd halfwords -- undone by the shuffles below. */
-      HVX_VectorPair acc[RU8_MAX_HALVES][2];
-      for (int h = 0; h < halves; h++) acc[h][0] = acc[h][1] = Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero());
+      const HVX_VectorPair zero = Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero());
+      HVX_VectorPair a0e = zero, a0o = zero, a1e = zero, a1o = zero;
 #else
       ru8_i32x128 acc[RU8_MAX_HALVES];
       for (int h = 0; h < halves; h++) acc[h] = (ru8_i32x128){0};
@@ -160,55 +191,63 @@ static void ru8_roi(const ru8_level_t* L, int C, const float* roi, int OH, int O
       for (int iy = 0; iy < sr; iy++) {
         const ru8_axis_t* y = &ya[ph * sr + iy];
         if (!y->valid) continue;
+        const uint8_t* rlo = map + y->lo * rowC;
+        const uint8_t* rhi = map + y->hi * rowC;
         for (int ix = 0; ix < sr; ix++) {
           const ru8_axis_t* x = &xa[pw * sr + ix];
           if (!x->valid) continue;
           nvalid++;
           int32_t w[4];
           ru8_weights(y, x, w);
-          const uint8_t* p[4] = {map + y->lo * rowC + (long)x->lo * C, map + y->lo * rowC + (long)x->hi * C,
-                                 map + y->hi * rowC + (long)x->lo * C, map + y->hi * rowC + (long)x->hi * C};
-          for (int h = 0; h < halves; h++) {
+          const long xl = (long)x->lo * C, xh = (long)x->hi * C;
+          const uint8_t *p1 = rlo + xl, *p2 = rlo + xh, *p3 = rhi + xl, *p4 = rhi + xh;
 #ifdef RU8_HVX
-            for (int t = 0; t < 4; t++) {
-              const HVX_VectorPair v = Q6_Wuh_vzxt_Vub(*(const HVX_Vector*)(p[t] + 128 * h));
-              const int32_t ww = w[t] | (w[t] << 16);
-              acc[h][0] = Q6_Wuw_vmpyacc_WuwVuhRuh(acc[h][0], Q6_V_lo_W(v), ww);
-              acc[h][1] = Q6_Wuw_vmpyacc_WuwVuhRuh(acc[h][1], Q6_V_hi_W(v), ww);
-            }
+          const int32_t w1 = w[0] | (w[0] << 16), w2 = w[1] | (w[1] << 16);
+          const int32_t w3 = w[2] | (w[2] << 16), w4 = w[3] | (w[3] << 16);
+          RU8_MAC(a0e, a0o, p1, w1); RU8_MAC(a0e, a0o, p2, w2);
+          RU8_MAC(a0e, a0o, p3, w3); RU8_MAC(a0e, a0o, p4, w4);
+          if (halves == 2) {
+            RU8_MAC(a1e, a1o, p1 + 128, w1); RU8_MAC(a1e, a1o, p2 + 128, w2);
+            RU8_MAC(a1e, a1o, p3 + 128, w3); RU8_MAC(a1e, a1o, p4 + 128, w4);
+          }
 #else
+          const uint8_t* p[4] = {p1, p2, p3, p4};
+          for (int h = 0; h < halves; h++) {
             ru8_i32x128 a = acc[h];
             for (int t = 0; t < 4; t++)
               a += __builtin_convertvector(*(const ru8_u8x128*)(p[t] + 128 * h), ru8_i32x128) * w[t];
             acc[h] = a;
-#endif
           }
+#endif
         }
       }
       const int32_t zsum = L->z_in * nvalid * RU8_ONE;
-      uint8_t* o = out_row + (long)b * C;
-      for (int h = 0; h < halves; h++) {
 #ifdef RU8_HVX
-        ru8_i32x32 q[4] = {(ru8_i32x32)Q6_V_lo_W(acc[h][0]), (ru8_i32x32)Q6_V_hi_W(acc[h][0]),
-                           (ru8_i32x32)Q6_V_lo_W(acc[h][1]), (ru8_i32x32)Q6_V_hi_W(acc[h][1])};
-        for (int i = 0; i < 4; i++) {
-          ru8_i32x32 a = (q[i] - zsum + rnd_pre) >> RU8_PRESHIFT;
-          a = ((a * L->mult + rnd) >> L->shift) + z_out;
-          q[i] = __builtin_elementwise_min(__builtin_elementwise_max(a, (ru8_i32x32){0} + 0), (ru8_i32x32){0} + 255);
-        }
-        /* q0 = ch 4j, q1 = 4j+2, q2 = 4j+1, q3 = 4j+3 (as the low byte of each word) */
-        const HVX_Vector ev = Q6_Vh_vshuffe_VhVh((HVX_Vector)q[1], (HVX_Vector)q[0]); /* h[i] = ch 2i */
-        const HVX_Vector od = Q6_Vh_vshuffe_VhVh((HVX_Vector)q[3], (HVX_Vector)q[2]); /* h[i] = ch 2i+1 */
-        *(HVX_Vector*)(o + 128 * h) = Q6_Vb_vshuffe_VbVb(od, ev);
+      *(HVX_Vector*)o = ru8_rq_pack(a0e, a0o, zsum, rnd_pre, L->mult, rnd, L->shift, z_out);
+      if (halves == 2) *(HVX_Vector*)(o + 128) = ru8_rq_pack(a1e, a1o, zsum, rnd_pre, L->mult, rnd, L->shift, z_out);
 #else
+      for (int h = 0; h < halves; h++) {
         ru8_i32x128 a = (acc[h] - zsum + rnd_pre) >> RU8_PRESHIFT;
         a = ((a * L->mult + rnd) >> L->shift) + z_out;
         a = __builtin_elementwise_min(__builtin_elementwise_max(a, (ru8_i32x128){0} + 0), (ru8_i32x128){0} + 255);
         *(ru8_u8x128*)(o + 128 * h) = __builtin_convertvector(a, ru8_u8x128);
-#endif
       }
+#endif
     }
   }
+}
+
+static void ru8_roi_c128(const ru8_level_t* L, const float* roi, int OH, int OW, int sr, int z_out, int prefetch,
+                         uint8_t* out_row) {
+  ru8_roi_h(L, 1, roi, OH, OW, sr, z_out, prefetch, out_row);
+}
+static void ru8_roi_c256(const ru8_level_t* L, const float* roi, int OH, int OW, int sr, int z_out, int prefetch,
+                         uint8_t* out_row) {
+  ru8_roi_h(L, 2, roi, OH, OW, sr, z_out, prefetch, out_row);
+}
+static void ru8_roi(const ru8_level_t* L, int C, const float* roi, int OH, int OW, int sr, int z_out, int prefetch,
+                    uint8_t* out_row) {
+  (C == 256 ? ru8_roi_c256 : ru8_roi_c128)(L, roi, OH, OW, sr, z_out, prefetch, out_row);
 }
 
 /* A job = one RoI: its level, its box (4 floats, image coords), its destination row. */
