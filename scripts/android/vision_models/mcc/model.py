@@ -89,6 +89,36 @@ def xyz_windows(seen_xyz):
     return win.contiguous(), val.float().contiguous()
 
 
+def split_qkv(attn, x, heads):
+    """qkv projection as three linears, each (B,N,C) -> (B,heads,N,d): rank <= 4
+    (upstream/timm reshape to (B,N,3,heads,d) is rank 5)."""
+    w, b = attn.qkv.weight, attn.qkv.bias
+    c = w.shape[1]
+    bsz, n, _ = x.shape
+    out = []
+    for j in range(3):
+        y = F.linear(
+            x, w[j * c : (j + 1) * c], None if b is None else b[j * c : (j + 1) * c]
+        )
+        out.append(y.reshape(bsz, n, heads, c // heads).permute(0, 2, 1, 3))
+    return out
+
+
+def vit_block(blk, x):
+    """timm Block (norm1-attn-ls1, norm2-mlp-ls2; no drop path at eval) with rank <= 4 attention."""
+    a = blk.attn
+    h = blk.norm1(x)
+    q, k, v = split_qkv(a, h, a.num_heads)
+    if getattr(a, "q_norm", None) is not None:
+        q, k = a.q_norm(q), a.k_norm(k)
+    att = torch.softmax((q @ k.transpose(-2, -1)) * a.scale, dim=-1)
+    o = (att @ v).permute(0, 2, 1, 3).reshape(x.shape)
+    if getattr(a, "norm", None) is not None:
+        o = a.norm(o)
+    x = x + blk.ls1(a.proj(o))
+    return x + blk.ls2(blk.mlp(blk.norm2(x)))
+
+
 class Encoder(nn.Module):
     """RGB + XYZ encoders and the decoder's seen-token stream -> per-block seen K/V."""
 
@@ -102,7 +132,7 @@ class Encoder(nn.Module):
         x = m.patch_embed(img) + m.pos_embed[:, 1:, :]
         x = torch.cat([m.cls_token + m.pos_embed[:, :1, :], x], dim=1)
         for blk in m.blocks:
-            x = blk(x)
+            x = vit_block(blk, x)
         x = m.norm(x)
         # XYZPosEmbed on host-partitioned windows (upstream: boolean-indexed invalid token)
         pe = m.xyz_pos_embed
@@ -112,12 +142,12 @@ class Encoder(nn.Module):
         cls = (pe.cls_token + pe.two_d_pos_embed[:, :1, :]).expand(emb.shape[0], -1, -1)
         emb = torch.cat([cls, emb], dim=1)
         for blk in pe.blocks:
-            emb = blk(emb)
+            emb = vit_block(blk, emb)
         y = emb[:, 0][None]  # (1,196,C)
         # E_XYZ
         y = torch.cat([m.cls_token_xyz, y], dim=1)
         for blk in m.blocks_xyz:
-            y = blk(y)
+            y = vit_block(blk, y)
         y = m.norm_xyz(y)
         lat = torch.cat([x, y], dim=2)
         # decoder seen stream: seen tokens attend only to seen tokens
@@ -125,12 +155,7 @@ class Encoder(nn.Module):
         ks, vs = [], []
         for blk in m.decoder_blocks:
             a = blk.attn
-            qkv = (
-                a.qkv(blk.norm1(s))
-                .reshape(1, SEEN, 3, HEADS, HEAD_DIM)
-                .permute(2, 0, 3, 1, 4)
-            )
-            q, k, v = qkv[0], qkv[1], qkv[2]  # (1,16,197,32)
+            q, k, v = split_qkv(a, blk.norm1(s), HEADS)  # (1,16,197,32)
             ks.append(k[0])
             vs.append(v[0])
             att = torch.softmax((q @ k.transpose(-2, -1)) * a.scale, dim=-1)
@@ -143,9 +168,10 @@ class Encoder(nn.Module):
 class QueryDecoder(nn.Module):
     """A fixed-size chunk of query points against the cached seen K/V."""
 
-    def __init__(self, m):
+    def __init__(self, m, softmax="cat"):
         super().__init__()
         self.m = m
+        self.softmax = softmax  # "split" (exact in fp32) was slower and inexact on the HTP (fp16 Exp)
         self.register_buffer("levels", torch.linspace(0, 1, 256), persistent=False)
 
     def forward(self, xyz, k_all, v_all):
@@ -154,17 +180,20 @@ class QueryDecoder(nn.Module):
         x = m.decoder_xyz_pos_embed(shrink(xyz))  # (1,Q,512)
         for i, blk in enumerate(m.decoder_blocks):
             a = blk.attn
-            qkv = (
-                a.qkv(blk.norm1(x))
-                .reshape(1, n, 3, HEADS, HEAD_DIM)
-                .permute(2, 0, 3, 1, 4)
-            )
-            q, k, v = qkv[0], qkv[1], qkv[2]  # (1,16,Q,32)
-            s_seen = (q @ k_all[i][None].transpose(-2, -1)) * a.scale  # (1,16,Q,197)
-            s_self = (q * k).sum(-1, keepdim=True) * a.scale  # (1,16,Q,1)
-            p = torch.softmax(torch.cat([s_seen, s_self], dim=-1), dim=-1)
-            o = p[..., :SEEN] @ v_all[i][None] + p[..., SEEN:] * v
-            o = o.transpose(1, 2).reshape(1, n, HEADS * HEAD_DIM)
+            q, k, v = (t[0] for t in split_qkv(a, blk.norm1(x), HEADS))  # (16,Q,32)
+            s_seen = (q @ k_all[i].transpose(-2, -1)) * a.scale  # (16,Q,197)
+            s_self = (q * k).sum(-1, keepdim=True) * a.scale  # (16,Q,1)
+            if self.softmax == "split":
+                # softmax over [s_seen ; s_self] without materializing the 198-wide concat
+                mx = torch.maximum(s_seen.amax(-1, keepdim=True), s_self)
+                e_seen = torch.exp(s_seen - mx)
+                e_self = torch.exp(s_self - mx)
+                den = e_seen.sum(-1, keepdim=True) + e_self
+                o = (e_seen @ v_all[i] + e_self * v) / den
+            else:
+                p = torch.softmax(torch.cat([s_seen, s_self], dim=-1), dim=-1)
+                o = p[..., :SEEN] @ v_all[i] + p[..., SEEN:] * v
+            o = o.permute(1, 0, 2).reshape(1, n, HEADS * HEAD_DIM)
             x = x + a.proj(o)
             x = x + blk.mlp(blk.norm2(x))
         pred = m.decoder_pred(m.decoder_norm(x))  # (1,Q,769)

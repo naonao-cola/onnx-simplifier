@@ -21,7 +21,7 @@ push() {  # push if the phone copy differs (md5, not size: a re-quantized model 
   local src="$1" dst="$2"
   local a b
   a=$(md5sum "$src" | cut -d' ' -f1)
-  b=$("${A[@]}" shell "md5sum $dst 2>/dev/null" | cut -d' ' -f1 | tr -d '\r' || true)
+  b=$("${A[@]}" shell "md5sum $dst 2>/dev/null" </dev/null | cut -d' ' -f1 | tr -d '\r' || true)
   if [ "$a" != "$b" ]; then "${A[@]}" push -q "$src" "$dst"; return 0; fi
   return 1
 }
@@ -34,7 +34,7 @@ k=0
 for man in "$@"; do
   while read -r n dt f dims; do
     [ -z "${n:-}" ] && continue
-    "${A[@]}" push -q "$loc/$f" "$R/$f"
+    push "$loc/$f" "$R/$f" || true  # md5-skip: the per-chunk K/V are the same file every set
   done <"$loc/$man"
   "${A[@]}" push -q "$loc/$man" "$R/$man"
   it=1; [ "$k" = 0 ] && it="$iters"

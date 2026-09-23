@@ -48,6 +48,45 @@ color max abs 1.7e-5 -- the K/V-cache split is exact.
 | 0.1 | 216,000 | 29.6 s | 20,684 / 13,604 / 9,725 |
 | 0.05 (demo default) | 1,728,000 | 243 s | 165,139 / 108,881 / 78,007 |
 
+**Phone (Xiaomi 12S, strict all-HTP, fp16, ORT + QNN EP, medians under the phone lock):**
+
+| piece | ms | vs host fp32 |
+|---|---|---|
+| encoder (RGB + XYZ ViT-B + decoder seen stream -> K/V) | 202 | K cos 0.99997, V cos 0.9997 |
+| decoder, 512-query chunk | 38 (74 us/query) | occ cos 0.999999 |
+| **decoder, 1024-query chunk** | **65 (64 us/query)** | occ cos 0.999999, color cos 0.9998 |
+| decoder, 2048 / 4096 / 8192 | 214 / 502 / 769 | (per-query cost grows past 1024) |
+
+Rank <= 4 everywhere: upstream/timm build `(B,N,3,heads,d)` (rank 5) for q/k/v; `split_qkv` uses
+three linears instead (exact). Softmax is 44% of a decoder chunk (per-op QNN profile); an exact
+"split" softmax (max/exp/sum without the 198-wide concat) was slower (608 vs 502 ms at 4096) and
+inexact on the HTP (fp16 Exp), so the concat softmax stays. A variant that pre-scaled q before the
+concat softmax failed QNN graph finalize (`QNN_COMMON_ERROR_MEM_ALLOC`); the exported form scales
+the scores.
+
+**Query reduction** (`queries.py`, exact: each query's prediction depends only on its xyz and the
+0.4/0.2/0.1/0.05 grids nest, so a strategy only loses occupied points it never queries):
+
+| target | strategy | queries | recall of dense occupied (p > 0.3) | projected phone |
+|---|---|---|---|---|
+| 0.1 | dense | 216,000 | 1.000 | 14.0 s |
+| 0.1 | 0.2 -> 0.1, refine where p > 0.05 | 55,703 | 1.000 | 3.8 s |
+| 0.1 | **0.4 -> 0.2 -> 0.1, refine where p > 0.05** | **36,455** | **1.000** | **2.5 s** |
+| 0.1 | 0.4 -> ..., p > 0.3 | 24,132 | 0.979 | 1.8 s |
+| 0.05 | dense | 1,728,000 | 1.000 | 110.8 s |
+| 0.05 | **0.4 -> ... -> 0.05, p > 0.05** | **238,470** | **1.000** | **15.5 s** |
+| 0.05 | 0.4 -> ... -> 0.05, p > 0.2 | 164,480 | 0.997 | 10.7 s |
+
+**End to end on the phone** (`mcc.py recon`: phone encoder K/V -> adaptive coarse-to-fine phone
+decoder chunks, scored against the dense host fp32 grid):
+
+| target | queries | phone (steady state) | recall | precision | chamfer | color L1 |
+|---|---|---|---|---|---|---|
+| 0.1 (0.4 -> 0.2 -> 0.1, p > 0.05) | 36,666 | **2.47 s** (enc 204 ms + 36 x 63 ms) | 0.991 | 0.984 | 0.0013 | 0.50 / 255 |
+
+"Steady state" = encoder + chunks x per-chunk median; `phone.sh` starts one process per chunk
+set (session load dominates its wall time), an app keeps one session.
+
 ## Files
 
 | file | what |
@@ -55,7 +94,8 @@ color max abs 1.7e-5 -- the K/V-cache split is exact.
 | `model.py` | deployment split on top of the upstream module; demo preprocessing without pytorch3d |
 | `validate.py` | split vs upstream forward; fp32 full-grid reference `ref_<demo>_<g>.npz` |
 | `mcc.py` | export (onnxsim, ORT check), phone runs (strict all-HTP via `phone.sh`), scoring |
-| `phone.sh` | one ONNX piece on the phone (ORT + QNN EP), under the shared phone lock |
+| `queries.py` | query-reduction strategies scored exactly against the dense references |
+| `phone.sh` | one ONNX piece on the phone (ORT + QNN EP), under the shared phone lock; md5-skips unchanged inputs |
 
 ## Follow-ups
 
