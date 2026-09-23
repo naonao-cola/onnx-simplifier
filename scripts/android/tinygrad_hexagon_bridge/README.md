@@ -1696,6 +1696,128 @@ any scalar read of that buffer crashed. Copying the accumulator into an explicit
 The conv kernels themselves come from `../hex_conv3x3_fpnout_kernel.py --data fpn_out_real.npz --out
 $DATA/fpn_out_kernels.c`, which also runs all four levels under qemu against ORT.
 
+## RoiAlign, Stage 4: uint8 maps in, the heads' uint8 rows out -- one DSP call per head
+
+In the e2e pipeline (`../e2e_pipeline/`, `pipe_e_opt.txt` / `pipe_e_u8.txt`), each head's RoiAlign
+isn't one op but a span of steps:
+- 4 CPU `dq` steps turn the backbone's uint8 NHWC FPN maps into fp32;
+- 4 DSP `roialign` calls, one per FPN level;
+- a CPU ScatterND (`seg2`/`seg4`) merges the per-level outputs into the head's row order;
+- in `pipe_e_u8.txt`, a CPU `quant` then turns them back into the u8 head's input.
+
+`roialign_fast/roialign_u8_kernel.h` does that whole span in one integer kernel, as one FastRPC call
+per head:
+- It reads the uint8 maps directly.
+- It computes each sample's position and bilinear weights in fp32 with ORT's exact expressions, then
+  quantizes the weights to Q14. The 4th weight absorbs the rounding, so each sample's weights sum to
+  exactly 1.
+- It accumulates u8 x Q14 in exact int32, subtracts the input zero point once per bin, and does one
+  fixed-point requant per level to the head's input scale/zero point.
+- It writes each RoI straight into its destination row (the `*_row_index` tensors `seg2`/`seg4`
+  scatter with).
+
+The Stage 3 caveat about out-of-range samples dissolves: skipped samples add nothing, and the zero
+point is subtracted per *valid* sample.
+
+**Exactness.** The reference is QuantizeLinear(ORT fp32 RoiAlign, merged), the exact bytes today's
+CPU steps produce, captured from the real pipeline by `capture_merged_io.py`. On the 6 e2e images:
+- box: 99.93-99.95% of bytes identical;
+- mask: 99.94-99.99%;
+- **max diff 1 LSB** everywhere.
+
+Host (`roialign_u8_host_check.c`), qemu (`roialign_u8_qemu.c`, HVX build) and phone
+(`roialign_u8_client.c`) produce byte-identical outputs. The remaining 1-LSB bytes are fp32 values
+within a hair of a rounding boundary. Sweeping the weight bits (14-16) and the requant pre-shift
+didn't move the exact fraction beyond noise.
+
+End to end, `../e2e_pipeline/roialign_u8_emulate.py` replays `pipe_e_opt.txt` on the host with both
+spans replaced by the kernel. The `*_nhwc` heads start with a QuantizeLinear at the same qparams, so
+they see exactly the kernel's bytes. Against the all-ORT reference on the 6 images:
+
+| host emulation of `e_opt` | matched | box IoU | score \|d\| | mask IoU |
+|---|---:|---:|---:|---:|
+| ORT RoiAlign + dq + ScatterND (today) | 60/61 (64 dets) | 0.938 | 0.015 | 0.871 |
+| `roialign_u8` | 60/61 (64 dets) | 0.942 | 0.013 | 0.883 |
+
+**Speed on the phone.** Device `239dbd8f`, SM8475 / Hexagon V69, unsigned PD, image 139 (1000 box
+RoIs, 99 mask RoIs). Medians of 7-9 runs, 4 threads + `l2fetch` prefetch unless noted. "RPC" is the
+client-side round trip of the single call.
+
+| step (cumulative) | box DSP / RPC | mask DSP / RPC | CPU steps left in the span | span total |
+|---|---:|---:|---:|---:|
+| Stage 3 fp32 kernel, 4 calls per head (today's `e_opt`) | 19.9 / 21.4 | 6.8 / 8.0 | dq 13.1 + merges 16.6 + 6.5 | **65.6** (+ `pipe_e_u8`'s `quant` x2) |
+| uint8 merged kernel, portable vector code | 20.6 / 21.1 | 8.3 / 8.9 | none | 30.0 |
+| + `vmpyuh_acc` MAC, separable sample precompute | 12.3 / 13.4 | 4.3 / 5.1 | none | 18.5 |
+| + accumulators kept in registers | **6.4 / 6.8** | **2.1 / 2.5** | none | **9.3** |
+
+All 6 images at the last step: box 5.8-6.7 ms DSP (6.2-7.1 RPC), mask 0.5-2.2 ms (0.9-2.6 RPC).
+
+What mattered, and what didn't:
+- **The MAC instruction.** The generic int32 vector code costs ~12 HVX ops per tap per 128 channels
+  (`vunpack` + `vmpyieo`/`vmpyie`). `vzxt` u8->u16 plus two `vmpyuh_acc` (u16 x scalar u16 -> u32
+  accumulate) cost 3. The even/odd lane splits both instructions introduce go through the
+  elementwise requant untouched, and `vshuffeh`/`vshuffeb` undo them before the store.
+- **Registers, not the stack.** Indexing the accumulators by a runtime channel-half count made
+  hexagon-clang keep them on the stack (a `vmem` load/store around every MAC). Instantiating the
+  kernel for C = 128 / 256 halved the time again.
+- **Prefetch.** One bin-ahead `l2fetch` per sample row takes 1-thread box time from 30.5 to 20.1 ms.
+  With it, a real 1-thread run is as fast as a cache-hot one (every job the same RoI: 20.1 ms).
+  Neither a row-ahead variant nor prefetching the next RoI's whole footprint helped.
+- **Threads.** 4 is the sweet spot: 6 threads is slower (box 7.9 vs 6.4 ms). The locality sort (by
+  level, then y, then x) is slower too (box 9.4 vs 7.7 in the same run); contiguous per-thread
+  slices of the natural order balance better.
+- **One call vs one per level.** Merging all levels into one call saves ~1-2 ms of RPC per head
+  over 4 calls.
+- **Not needed:**
+  - A TURBO clock vote gains nothing.
+  - **VTCM:** `vtcm_probe` shows this unsigned PD can query and acquire all 8 MB
+    (`HAP_compute_res_*`). But P2 (13.9 MB, 61% of box RoIs) doesn't fit, and with prefetch the
+    kernel is no longer latency-bound, so DMA staging has little to win.
+
+**Proposed integration (not wired: `../maskrcnn_demo_app/` and `e2e_run.cpp` belong to the demo).**
+A pipeline step that replaces, per head, the `dq` x4 + `roialign` x4 + `seg2`/`seg4` + `quant` lines
+of `pipe_e_u8.txt`:
+
+    roialign_u8 MAPS QPARAMS ROIS ROWS OH OW SR S_OUT Z_OUT DST
+    # box head of pipe_e_u8.txt (levels in the roialign lines' order, P5..P2):
+    roialign_u8 391_quantized_nhwc,423_quantized_nhwc,455_quantized_nhwc,487_quantized_nhwc \
+        0.11570039391517639:129:0.03125,0.128072127699852:133:0.0625,0.12207645177841187:128:0.125,0.13543301820755005:131:0.25 \
+        2656,2639,2622,2605 2751_row_index,2723_row_index,2695_row_index,2667_row_index \
+        7 7 2 0.11669740080833435 130 2788_u8
+
+`QPARAMS` holds each map's dq `scale:zero_point:spatial_scale`. `ROWS` pairs each level with the
+`*_row_index` that seg2's ScatterND uses for that level's output. The mask head is the same with
+`6701,6684,6667,6650`, `6795_row_index,6767_row_index,6739_row_index,6711_row_index`, 14x14 and the
+mask head's `0.11957937479019165 132` into `6833_u8`. The `dq` lines go too, because the maps feed
+nothing else.
+
+The step makes one call:
+
+    roialign_u8_rpc_run(h, map0..map3 /* uint8 NHWC, rpcmem */, level_geom /* H,W,z_in x4 */,
+                        level_fparams /* s_in, spatial_scale x4 */, level_counts /* RoIs per level */,
+                        rois /* [n,4] fp32, concatenated in level order */, rows /* [n] int32 */,
+                        C, OH, OW, sr, s_out, z_out, flags /* 260 = 4 threads + prefetch */,
+                        out /* [n, OH, OW, C] uint8 = the head's input */, &dsp_us);
+
+The skel is `roialign_u8_rpc.so`: `roialign_u8_rpc_skel_handle_invoke`, unsigned PD, built by
+`roialign_fast/build_u8.sh`. `roialign_u8_cpu.c` is the same call on the CPU. Constraints:
+- C % 128 == 0 and C <= 256;
+- sr <= 4;
+- OH*sr and OW*sr <= 256.
+
+Until it's known why the demo serializes DSP skel calls, assume this call does not overlap the RPN
+kernel's.
+
+**Reproduce** (`roialign_fast/`):
+- `capture_merged_io.py E2E_OUT image.bin DEST` captures one image's maps, per-level RoIs/rows and
+  reference bytes.
+- `roialign_u8_host_check.c DEST/<img>` is the host check.
+- `roialign_u8_qemu.c` + `roialign_u8_qemu_args.py` are the qemu check.
+- `DATA=DEST/<img> build_u8.sh` does the phone build and sweep (`CONFIGS` = comma list of
+  threads + 256*prefetch + 512*sort; `CLIENT_ENV=VTCM_PROBE=1` adds the VTCM probe).
+- `../e2e_pipeline/roialign_u8_emulate.py OUT REF images` is the e2e host check.
+- The fp32 kernel and skel (`roialign_kernel.h`, `roialign_rpc.idl`, ...) are unchanged, for A/B.
+
 ## Proposal decode (RPN): bit-exact on the phone's DSP, 1.58x ONNX Runtime
 
 The easiest-ranked op in `dynamic_ops_survey.md`. Everything below comes from the real
@@ -2251,11 +2373,7 @@ Small shapes, `hexagon-sim --timing` (HEXSIM=1, v73, cycle-level, microseconds a
 - **Hand kernels this makes redundant** (not deleted here): `hex_add_kernel.py`, `hex_requantize_kernel.py`, and, at a
   few percent cost, `hex_maxpool_kernel.py`. The chained backbone drivers under `native_transport/` embed their
   generated C verbatim and would need regenerating to switch over.
-- **Not done: qfloat (fp32 vector math).** This phone's V69 HVX has no IEEE fp32 (see the NMS section), so float vector
-  ops need qfloat lowering (`vadd_sf`/`vconv_sf_qf32` + the asm barrier NMS needed). But the qfloat instructions start at
-  V68, tinygrad's DSP compiler targets V65, and qemu 8.2 can't decode HVX float at all, so tinygrad's own MOCKDSP test
-  path couldn't validate it. That's a target-version change plus a new validation path, not a renderer rule. Float
-  vector ops (sigmoid, RoiAlign's blend, float `max`) are still scalarized by LLVM.
+- **qfloat (fp32 vector math):** done in the next section.
 - **Not done: threading.** The hand kernels' multi-thread speedups come from `qurt` worker threads; qemu's bare-metal mode
   and `hexagon-sim`'s standalone mode (tinygrad's two DSP test paths) have no `qurt`, and tinygrad's own on-device DSP
   runtime can't reach this phone (see the top of this file). A threaded renderer variant could only be validated through
@@ -2263,6 +2381,74 @@ Small shapes, `hexagon-sim --timing` (HEXSIM=1, v73, cycle-level, microseconds a
 - **Not covered by this pass:** convolutions/GEMM (`vrmpy` still needs `custom_kernel` or the TensorCore path, whose
   devectorizer problem is described near the top of this file), and the data-dependent ops (NMS, TopK, proposal decode,
   RoiAlign fast path), which stay hand-written C.
+
+## tinygrad codegen for HVX, stage 2: float vector math as qfloat
+
+This phone's V69 HVX has no IEEE fp32; float vector math is Qualcomm's qfloat (qf32), whose results have to be converted
+back to IEEE sf (see the NMS section, which hit this first). This extends the stage-1 codegen to float kernels, in
+onnxsim/tinygrad PR https://github.com/onnxsim/tinygrad/pull/4 (branch `hvx-qfloat`, which also carries PR #3's float-max
+fix). `HVX_ARCH=v69` compiles for the phone; the default stays v65 (no HVX float), where nothing changes.
+
+### What the lowering does, and why it isn't "convert after every op"
+
+At v68+, LLVM already lowers plain float vector C (`a*b + c`) to qfloat. The question is where it loses precision. Measured
+with `tinygrad_codegen/qfloat/qfsim.py` on `hexagon-sim -mv69 --timing` (real data, output checked against numpy fp32 and
+float64), for the same plain tinygrad code under three lowerings:
+
+| kernel (plain Tensor code) | scalar | LLVM qfloat as-is | convert after every op | **chosen** |
+|---|---:|---:|---:|---:|
+| 4-tap bilinear blend, 4096x256 | 16.7M cycles | 0.93M | 1.87M | **0.93M** |
+| Horner polynomial (exp-like), 1M | 12.7M | 0.76M | 2.06M | **0.76M** |
+| `((a-b)*(c-d))*((a+b)*(c+d))`, 1M | -- | 0.76M | 1.66M | **1.39M** |
+
+| worst-case relative error | LLVM as-is | every op | chosen |
+|---|---:|---:|---:|
+| blend (max abs error vs numpy fp32) | 7.2e-7 | 7.2e-7 | 7.2e-7 |
+| polynomial | 3.6e-7 | 3.6e-7 | 3.6e-7 |
+| products of computed values | **21%** | 4.2% | 4.2% |
+
+- **Where LLVM is fine:** for adds/subs and for multiplies with an IEEE operand (a load or constant), its output is
+  *bit-identical* to converting after every op, and 2-2.7x faster.
+- **Where it isn't:** a multiply whose operands are *both* computed values. LLVM keeps both in qf32 and multiplies
+  qf32 x qf32 without renormalizing: 21% worst case. So exactly those multiplies get both operands forced to IEEE sf
+  through an empty-asm barrier (NMS's recipe) first; everything else is plain vector C.
+- **The remaining 4.2%** on that kernel is qfloat, not the lowering: qf32 add/sub error scales with the *larger operand*,
+  not the result, so cancellation (`a-b` with `a~b`, exact in IEEE) amplifies it. Code that subtracts near-equal floats
+  on this DSP needs an exact fallback, like NMS's near-threshold recheck; no lowering removes that.
+- A first version split 128-lane vectors into HVX registers through memory (`((__hvx_v*)&a)[i]`): 10x slower than
+  splitting with `__builtin_shufflevector`, which is what it does now.
+
+### On the phone
+
+`tinygrad_codegen/qfloat/build.sh` runs the captured kernels on the CDSP (compiled for v69: v73 code would use IEEE HVX
+float, which returns zeros here), `analyze.py` checks the outputs. Single DSP thread, milliseconds, min over 9 reps, two
+clean runs (the phone is shared, so a third run was disturbed and isn't counted):
+
+| kernel | time | max abs err vs numpy fp32 | max rel err vs float64 |
+|---|---:|---:|---:|
+| blend, plain tinygrad (qfloat) | 0.83 - 1.02 | 7.2e-7 | (near-zero outputs) |
+| blend, hand-written qf32 (`hand_blend.c`, same prefetch) | 0.90 - 1.23 | 7.2e-7 | |
+| blend, plain tinygrad, scalar | 11.7 - 13.4 | 3.6e-7 | |
+| products of computed values, chosen lowering | 0.91 - 0.93 | | 4.2% |
+| products of computed values, LLVM as-is | 0.73 - 0.74 | | 21% |
+| sigmoid, 163,200 elements (scalar, see below) | 12.4 - 12.5 | 1.2e-7 | 5.2e-7 |
+
+The phone's errors match hexagon-sim's exactly. The plain-tinygrad blend runs as fast as the hand-written qf32 kernel.
+
+**Sigmoid, at all five real profile shapes (663 to 163,200 elements):** correct and closer to float64 than ONNX
+Runtime's fp32 sigmoid (max rel error 5.7e-7 vs ORT's 1.8% on tiny outputs), but **still scalar**, about 76 ns/element
+on the phone. tinygrad's `exp2` does its range reduction with a float->int conversion, and V69 has no vector
+float<->int convert (`vconv_w_sf`/`vconv_sf_w` arrive in V73); it also needs vector compare/select and a reciprocal.
+Vectorizing it on V69 would mean emulating the conversion with integer bit operations, which isn't done.
+
+### Checks
+
+- tinygrad `test/unit/test_dsp_render.py`: the qf32 x qf32 multiply gets the barrier, plain arithmetic doesn't, nothing
+  changes below v68; plus the stage-1 float-max guard.
+- tinygrad `test/backend/test_ops.py` under `DEV=DSP MOCKDSP=1`: the same 38 pre-existing failures as the base branch.
+  qemu can't decode HVX float, so v69 float correctness is from hexagon-sim and the phone (above).
+- These hexagon-sim checks are meant to replace the TVM qfloat CI (`hexagon-qfloat.yml`); they go into
+  `tests/test_hexagon_tinygrad.py` once PR #1846 (the tinygrad Hexagon CI) has merged.
 
 ## Beyond the backbone: the box-head fc6 MatMul (`hex_boxhead_gemm_kernel.py`)
 
@@ -2498,6 +2684,11 @@ TINYGRAD_PATH=/path/to/onnxsim-tinygrad HEXAGON_TOOLS=/path/to/Tools HEXAGON_CLA
   (`roialign_host_check.c`, `roialign_qemu.c`) and the ORT baselines
   (`make_roialign_single_node_models.py`, `ort_roialign_bench.c`). Correct on the phone at all 8
   real calls; 27.1 ms vs ORT's 63.3 ms on the phone's CPU. See "RoiAlign, Stage 2" above.
+  Stage 4 adds the merged uint8 kernel (`roialign_u8_kernel.h`) and its skel/client/CPU build
+  (`roialign_u8_rpc.idl`, `roialign_u8_impl.c`, `roialign_u8_client.c`, `roialign_u8_cpu.c`,
+  `build_u8.sh`), capture and checks (`capture_merged_io.py`, `roialign_u8_host_check.c`,
+  `roialign_u8_qemu.c`, `roialign_u8_qemu_args.py`): the whole dq + RoiAlign + merge + quant span
+  of each head in one call, box 6.8 ms / mask 2.5 ms. See "RoiAlign, Stage 4" above.
 - `hex_conv3x3_fpnout_kernel.py` -- the FPN 3x3 output conv (vrmpybusv, `ow_tile`) with ORT's
   requantize+dequantize epilogue fused into its store, writing fp32 channels-last or NCHW. Bit-exact
   vs ORT's real backbone outputs at all four levels, under qemu and on the phone; the channels-last
@@ -2542,3 +2733,7 @@ TINYGRAD_PATH=/path/to/onnxsim-tinygrad HEXAGON_TOOLS=/path/to/Tools HEXAGON_CLA
   HVX codegen checks under qemu / hexagon-sim), `pd_selfcheck.c` (synthetic proposal-decode
   self-consistency + qemu inputs), `hexagon_divrt.c` (integer divide helpers for freestanding
   qemu builds). See "Continuous integration" above.
+- `tinygrad_codegen/qfloat/` -- stage 2: `qfsim.py` runs a plain-tinygrad float kernel with real data on hexagon-sim
+  (qemu can't decode HVX float) and reports accuracy and cycles, or `--dump`s it; `build.sh` + `qf_rpc.idl`/`qf_impl.c`/
+  `qf_client.c` run the dumps (plus `hand_blend.c`) on the phone, `analyze.py` checks them; `qf_ops.py` holds the inputs
+  and references. See "tinygrad codegen for HVX, stage 2" above.
