@@ -42,12 +42,15 @@ cp "$TG"/roialign_fast/roialign_u8_rpc.idl "$TG"/roialign_fast/roialign_u8_impl.
   "$HC" -c -O2 -fPIC -mcpu=hexagon"$HEX_ARCH" -mhvx="$HEX_ARCH" -mhvx-length=128b -Wall -I . "${INC[@]}" "${QURT_INC[@]}" \
     -o impl.o roialign_impl.c &&
   "$HEXAGON_TOOLCHAIN/bin/hexagon-link" -Bdynamic -shared -export-dynamic -o roialign_rpc.so skel.o impl.o "$LIBPATH/pic/libgcc.so")
-# the merged uint8 RoiAlign (roialign_fast/build_u8.sh's flags)
+# the merged uint8 RoiAlign (roialign_fast/build_u8.sh's flags; built for V69 = the test phone, SM8475)
+RA="${ROIU8_ARCH:-v69}"
 (cd "$B/roiu8" && "$QAIC" "${INC[@]}" roialign_u8_rpc.idl &&
-  "$HC" -c -O2 -fPIC -mcpu=hexagon"$HEX_ARCH" -I . "${INC[@]}" -o skel.o roialign_u8_rpc_skel.c &&
-  "$HC" -c -O2 -fPIC -mcpu=hexagon"$HEX_ARCH" -mhvx="$HEX_ARCH" -mhvx-length=128b -Wall -I . "${INC[@]}" "${QURT_INC[@]}" \
+  "$HC" -c -O2 -fPIC -mcpu=hexagon"$RA" -I . "${INC[@]}" -o skel.o roialign_u8_rpc_skel.c &&
+  "$HC" -c -O2 -fPIC -mcpu=hexagon"$RA" -mhvx="$RA" -mhvx-length=128b -Wall -I . "${INC[@]}" \
+    -I "$HEXAGON_SDK_ROOT/rtos/qurt/compute$RA/include/qurt" -I "$HEXAGON_SDK_ROOT/rtos/qurt/compute$RA/include/posix" \
     -o impl.o roialign_u8_impl.c &&
-  "$HEXAGON_TOOLCHAIN/bin/hexagon-link" -Bdynamic -shared -export-dynamic -o roialign_u8_rpc.so skel.o impl.o "$LIBPATH/pic/libgcc.so")
+  "$HEXAGON_TOOLCHAIN/bin/hexagon-link" -Bdynamic -shared -export-dynamic -o roialign_u8_rpc.so skel.o impl.o \
+    "$HEXAGON_TOOLCHAIN/target/hexagon/lib/$RA/G0/pic/libgcc.so")
 
 # the driver (ARM64): ORT C++ API + the three qaic stubs + rpn_glue.c (rpn_model_io.h, unchanged)
 CC="$NDK/aarch64-linux-android29-clang"
