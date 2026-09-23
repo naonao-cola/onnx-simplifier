@@ -77,8 +77,8 @@ FULL_WRITE = 0xA1
 TENG_FLAG = 0xA8
 NOISE_REGS = frozenset({0x02B0, 0x03D0})
 """Verb ``0xa8`` writes to these two registers flip between ``1/2`` and
-``3/4`` across byte-identical rebuilds (58 of 63 same-shape pairs in the
-sweeps). They are rebuild noise, not calibration."""
+``3/4`` even between rebuilds with identical calibration (``t17
+batched_r0`` vs ``r3``). They are rebuild noise, not calibration."""
 
 Scales = dict[str, tuple[float, float]]
 Role = tuple
