@@ -15,6 +15,7 @@ Policies (LayerNormalization and Softmax stay fp16 unless noted):
   bb8g16    bb8 with the GELUs quantized too, 16-bit (QNN's quantized elementwise ops are LUTs)
   bb16      backbone W8A16 (uint16 activations), GELU fp16
   bb16g     bb16 with the GELUs quantized too
+  g16       fp16 everywhere except the backbone GELUs, quantized 16-bit (SAM's GELU trick)
   bb8x16    backbone int8 with no fp16 islands: its LayerNorm/Softmax/GELU quantized, 16-bit
   bb8r16    bb8x16 plus the residual stream (the Adds / LayerScale Muls feeding Add or LayerNorm)
             16-bit: DINOv2's activation outliers live there
@@ -29,6 +30,7 @@ import argparse
 import sys
 
 import common as C
+import numpy as np
 import onnx
 
 from onnxsim import full_qdq as F
@@ -110,6 +112,12 @@ def policy(m: onnx.ModelProto, name: str) -> dict:
             )
         }
         kw["t16_nodes"] = gelu | res | {n for n in bb if ops[n] in SENS}
+    elif (
+        name == "g16"
+    ):  # only the backbone GELUs quantized (16-bit, a LUT on the HTP); rest fp16
+        kw["exclude_op_types"] = set()
+        kw["exclude_nodes"] = {n for n in ops if n not in gelu}
+        kw["t16_nodes"] = gelu
     elif name == "all8":
         kw["exclude_nodes"] = (
             qsel | gelu | {n for n in dec if ops[n] not in ("Gemm", "MatMul")}
@@ -125,6 +133,30 @@ def policy(m: onnx.ModelProto, name: str) -> dict:
     tdt["image"] = "uint8"  # the camera's RGB bytes as-is
     kw["tensor_dtypes"] = tdt
     return kw
+
+
+def float_image_to_u8(q: onnx.ModelProto) -> None:
+    """A float [0, 255] `image` input becomes uint8 via DequantizeLinear(1, 0) (exact)."""
+    from onnx import TensorProto, helper, numpy_helper
+
+    g = q.graph
+    for k, v in (
+        ("u8_scale", np.array(1.0, np.float32)),
+        ("u8_zp", np.array(0, np.uint8)),
+    ):
+        g.initializer.append(numpy_helper.from_array(v, k))
+    for n in g.node:
+        n.input[:] = ["image_f" if x == "image" else x for x in n.input]
+    g.node.insert(
+        0,
+        helper.make_node(
+            "DequantizeLinear",
+            ["image", "u8_scale", "u8_zp"],
+            ["image_f"],
+            name="image/dq",
+        ),
+    )
+    g.input[0].type.tensor_type.elem_type = TensorProto.UINT8
 
 
 def main():
@@ -146,6 +178,8 @@ def main():
     )
     q, info = F.quantized_io(q, inputs=["image"], outputs=[])
     print("io:", info)
+    if not info:  # the stem stayed float (e.g. g16)
+        float_image_to_u8(q)
     n_q = sum(n.op_type == "QuantizeLinear" for n in q.graph.node)
     tag = a.policy + ("" if a.method == "minmax" else f"-{a.method}")
     out = C.WORK / f"{a.variant}.{tag}.onnx"

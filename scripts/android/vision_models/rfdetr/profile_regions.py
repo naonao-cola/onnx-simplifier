@@ -25,6 +25,12 @@ last = (
 
 
 def region(n):
+    # the DINOv2 window partition / merge: Reshape/Transpose directly under encoder/encoder/ or
+    # embeddings/ (not inside a layer.N block)
+    if re.search(
+        r"/encoder/encoder/(embeddings/)?(Reshape|Transpose|Concat|Slice|Tile)", n
+    ):
+        return "backbone window partition / merge"
     if "/backbone/0/encoder" in n or "/backbone.0/encoder" in n:
         for k, v in [
             ("attention", "backbone attention"),
