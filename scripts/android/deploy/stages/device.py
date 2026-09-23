@@ -29,9 +29,15 @@ def adb(ctx, *args, check=True, capture=True, timeout=600):
 
 
 def push_if_changed(ctx, src: Path, dst: str) -> None:
-    size = str(src.stat().st_size)
-    got = adb(ctx, "shell", f"stat -c %s {dst} 2>/dev/null", check=False).strip()
-    if got != size:
+    # by content, not size: a re-quantized model (new scales) is often exactly the same size
+    import hashlib
+
+    h = hashlib.md5()
+    with open(src, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    got = adb(ctx, "shell", f"md5sum {dst} 2>/dev/null", check=False).split()
+    if not got or got[0] != h.hexdigest():
         adb(ctx, "push", str(src), dst)
 
 
