@@ -69,15 +69,28 @@ class FoldedConv1(nn.Module):
         return self.conv(x) + self.corr
 
 
+DEPTH_MIN = float(__import__("os").environ.get("SPARSE4D_DEPTH_MIN", "1e-2"))
+
+
 def project_mm(kp, proj):
-    """project_points without Einsum: kp (N, 13, 3), proj (6, 4, 4) -> (6, N, 13, 2) in [0, 1]."""
+    """project_points without Einsum and fp16-safe: kp (N, 13, 3), proj (6, 4, 4) -> (6, N, 13, 2).
+
+    Upstream divides by max(depth, 1e-5), so a keypoint behind a camera lands at ~1e9: past
+    fp16's 65504, which broke the fp16 HTP graph (cls cos 0.92 on frame 0). Here:
+      * x, y are divided by the image size before the depth (both are just scalings);
+      * the depth is clamped at 1 cm instead of 1e-5 m, so |x / depth| stays < ~4e3. A 10 cm
+        floor is *not* exact (a few keypoints do sit that close to a camera plane: outputs moved
+        by up to 0.35 on 3 of the 6 frames); 1 cm and 1 mm both match upstream on all 6 frames to
+        <= 9e-4 (export.py checks every frame);
+      * the normalized location is clamped to [-1.5, 2.5]: anything outside [0, 1] samples only
+        grid_sample's zero padding at every level (>= 1 level-pixel outside), so this is exact."""
     n = kp.shape[0]
     ptsx = torch.cat([kp, torch.ones_like(kp[..., :1])], dim=-1).reshape(n * PTS, 4)
     p = ptsx @ proj[:, :3].reshape(CAMS * 3, 4).transpose(0, 1)  # (N*13, 18)
     p = p.reshape(n * PTS, CAMS, 3).transpose(0, 1)  # (6, N*13, 3)
-    xy = p[..., :2] / torch.clamp(p[..., 2:3], min=1e-5)
-    wh = torch.tensor([704.0, 256.0])
-    return (xy / wh).reshape(CAMS, n, PTS, 2)
+    xy = p[..., :2] / torch.tensor([704.0, 256.0])
+    xy = xy / torch.clamp(p[..., 2:3], min=DEPTH_MIN)
+    return torch.clamp(xy, -1.5, 2.5).reshape(CAMS, n, PTS, 2)
 
 
 def dfa_weights_r4(layer, feat, ae, proj):
@@ -186,6 +199,17 @@ def frame_inputs(m, ckpt, work):
 def export_frame(m, work, recs):
     import onnxruntime as ort
 
+    # the graph's fp16-safe projection vs upstream's, through the whole model, on every frame
+    for k, rec in enumerate(recs):
+        temporal = "dt" in rec
+        g = FrameGraph(m, temporal).eval()
+        args = [torch.from_numpy(rec["rgb"]), torch.from_numpy(rec["proj"])]
+        if temporal:
+            args += [torch.from_numpy(rec["dt"]), torch.from_numpy(rec["temp_feat"]), torch.from_numpy(rec["temp_anchor"])]
+        with torch.no_grad():
+            tout = g(*args)
+        print(f"frame {k}: graph (torch) vs Runner max abs "
+              f"{['%.1e' % float(np.abs(a.numpy() - b).max()) for a, b in zip(tout[:3], rec['ref'])]}")
     for name, temporal in (("frame_first", False), ("frame_temp", True)):
         g = FrameGraph(m, temporal).eval()
         rec = recs[1] if temporal else recs[0]
