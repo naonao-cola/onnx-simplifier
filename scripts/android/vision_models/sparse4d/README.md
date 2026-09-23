@@ -17,6 +17,11 @@ Same data and GT criteria as `../bevformer_tiny` and Fast-BEV: nuScenes-mini sce
 | `quantize.py` | int8 ResNet-50 + FPN (onnxsim.full_qdq), decoder left float |
 | `phone_chain.py` | the 6-frame chain on the phone, strict all-HTP, the phone's own outputs carried through the host instance bank |
 | `bisect_phone.py` | chosen intermediates, phone vs ORT CPU (how the three bugs below were found) |
+| `dfa_hvx/dfa_core.h` | one decoder layer's DFA as 24 calls (6 cameras x 4 levels) of the unmodified `../../msda_hvx` kernel, summed |
+| `dfa_hvx/dfa_rpc.idl`, `dfa_impl.c`, `build.sh` | the FastRPC skel (one RPC per layer, QuRT threads over anchor blocks) and the `s4d_run` chain runner |
+| `dfa_hvx/dfa_case.py`, `dfa_host_check.c`, `dfa_sim.c` | real DFA calls as cases; the scalar body on the host and the HVX body on hexagon-sim vs torch |
+| `dfa_hvx/split.py` | the 14 HTP pieces around the DFA (int8 backbone with uint8 channels-last outputs), and the same split chain in torch |
+| `dfa_hvx/s4d_run.cpp`, `phone_split.py` | the split frame on the phone (rpcmem buffers shared by ORT and the DSP), chained with the host instance bank |
 
 ## Reproduce
 
@@ -70,3 +75,48 @@ Three things had to be fixed before the HTP graph was right. `bisect_phone.py` f
 The frame costs 3.3 s because the DFA runs as dense GridSample + broadcast + reduce on the HTP:
 6 layers x 4 levels x 6 cameras x 900 anchors x 13 points. That is what the HVX sampler below
 replaces.
+
+## DFA on the HVX: 3307 -> 266 ms/frame
+
+The DFA maps onto the generic MSDA kernel (`../../msda_hvx`, unmodified) as one call per (camera,
+level):
+- NV = 1, L = 1, 8 groups x 32 channels;
+- the 13 keypoints padded to 16 with zero weights;
+- mode `MSDA_REF_PIX` with all-zero offsets, and the projected points as the per-query references;
+- a per-camera visibility mask, so anchors a camera can't see cost nothing (~21% of (camera, anchor)
+  pairs are visible);
+- uint8 value maps, with one scale / zero point per FPN level.
+
+`dfa_impl.c` runs a layer's 24 calls in one RPC and sums them over cameras on the DSP.
+
+Checks against torch on real layer inputs (`dfa_case.py`):
+- host scalar body: max abs <= 7e-6;
+- HVX body on hexagon-sim: cos 0.99992, the msda kernel's Q15 weight rounding;
+- the uint8 value maps end to end (torch split chain): 72/190 GT at >= 0.3, against fp32's 71.
+
+| scene-0103, 6 frames chained on the phone | frame ms | FPS | GT >= 0.3 | GT >= 0.2 |
+|---|---|---|---|---|
+| fp32 torch (host) | | | 71 / 190 | 116 / 190 |
+| fp16, whole frame on the HTP (baseline) | 3307 | 0.3 | 71 / 190 | 114 / 190 |
+| **int8 backbone + fp16 decoder on the HTP, DFA on the HVX** | **266** | **3.8** | **71 / 190** | 103 / 190 |
+
+Per frame (median of 6 runs, temporal frame): 8 HTP pieces take 146 ms and the 6 DFA calls take
+117 ms. Of the DFA time, 109 ms is in the DSP and 8.4 ms is FastRPC.
+
+| step | ms |
+|---|---|
+| bb (int8 ResNet-50 + FPN, uint8 outputs) | 16.2 |
+| pre0 (layer 0's keypoints + weights) | 12.4 |
+| dfa0..5 (each) | 18.9 (17.5 in the DSP) |
+| mid0..4 (each: output proj, FFN, refine, graph attention, next DFA inputs) | 23.1 |
+| post | 2.0 |
+
+At >= 0.2 the phone finds 103 against fp32's 116 (-11%). At the 0.3 criterion used for the other
+BEV models it matches fp32 exactly.
+
+**Next levers** (not done):
+- The mid pieces are fp16, with fp32 graph I/O at every boundary: pts (6, 900, 16, 2) and
+  w (24, 900, 8, 16) out, agg in. That is the EP-context fp32-boundary cost found before. uint8 or
+  fp16 I/O for those tensors, and int8 Linears in the mids, are the obvious next steps.
+- On the DSP side, the 24 calls per layer each rebuild their tap lists. A fused per-anchor loop
+  over (camera, level) would share the coordinate math.

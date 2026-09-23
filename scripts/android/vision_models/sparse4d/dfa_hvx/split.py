@@ -264,6 +264,9 @@ def export(m, work):
         ins, outs = seg_io(k, t)
         byname = dict(zip(["agg", "feat", "anchor", "proj", "proj_n"], a), **kw)
         pieces[name] = (Named(s, ins), (tuple(byname[n] for n in ins), {}), ins, outs)
+    ib = m.head.instance_bank  # mid0 reads the initial instances as inputs (s4d_run loads these)
+    ib.instance_feature.detach().numpy().astype(np.float32).tofile(out / "instance_feature.f32")
+    ib.anchor.detach().numpy().astype(np.float32).tofile(out / "anchor.f32")
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     for name, (mod, (args, _), ins, outs) in pieces.items():
