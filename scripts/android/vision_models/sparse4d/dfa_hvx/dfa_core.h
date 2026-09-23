@@ -47,10 +47,11 @@ typedef struct {
   float* out;         /* (Q, 256) */
 } dfa_args_t;
 
-/* per camera: 1 if any of the anchor's 13 real points (the pads are skipped) is inside [0, 1]^2
- * with a margin of a level-0 pixel (bilinear taps reach half a pixel out) */
+/* per camera: 1 if any of the anchor's 13 real points (the pads are skipped) can touch the image.
+ * A bilinear tap reaches half a pixel outside [0, 1] at its level, so the margin is a pixel of the
+ * *coarsest* level (8 x 22 at 256 x 704; a level-0 margin dropped real contributions). */
 static inline void dfa_visibility(const dfa_args_t* a, int q0, int q1) {
-  const float mx = 1.0f / a->W[0], my = 1.0f / a->H[0];
+  const float mx = 1.0f / a->W[DFA_LEVELS - 1], my = 1.0f / a->H[DFA_LEVELS - 1];
   for (int c = 0; c < DFA_CAMS; c++)
     for (int q = q0; q < q1; q++) {
       const float* p = a->pts + ((long)c * a->Q + q) * DFA_P * 2;
