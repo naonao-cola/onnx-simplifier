@@ -65,6 +65,52 @@ inside the noise window, whose bytes come from the template (itself a native
 build), so these runs never put an untested byte pattern on the card. No lane-0
 or `W`-companion value is patched away from what Pulsar2 itself writes there.
 
+### Sqrt: 16 of 17 step shapes
+
+Sqrt carries three float groups in the TENG segment, four lane copies each:
+`f32(1/sx)`, `f32(sx)`, `f32(sy)` (`npu_params` doesn't move). When `sx == sy`
+the third group merges away and the stream is 64 bytes shorter, so a template
+with distinct scales serves the general case -- for a non-negative input
+range `[0, hi]`, `sx = hi/255` and `sy = sqrt(hi)/255` differ unless `hi = 1`,
+and the emitter refuses a target whose floats coincide. Sqrt's input and output
+are non-negative, so zero point 0 is the only class needed.
+
+Across all 17 distinct Sqrt shapes in the step (42 nodes: the Adam update's
+`sqrt(v)` for every parameter), 49 of 51 held-out calibrations were
+byte-exact. The two misses are both `[512,512,3,3]`, and they show the limit of
+this approach (next section). Templates for the 16 shapes that were 3/3 clean
+are committed (39 of the 42 Sqrt nodes); `[512,512,3,3]` is left out.
+
+### Where the patched floats live
+
+Each copy is found by value and must sit in whole groups of four lane copies
+one record apart. Per template, copies in `V`/`W` register-write records (`R`)
+vs compressed short units (`s`):
+
+| templates | quant group(s) | dequant group |
+| --- | --- | --- |
+| Relu `[16,128,28,28]`, `[16,256,14,14]`, `[16,512,7,7]` | `RRRR` | `sRRR` |
+| Relu `[16,64,56,56]`, `[16,64,112,112]` (tiled) | `RRRR` + `ssss` | `ssss` |
+
+In a short unit a float is a fixed-width 4-byte literal run
+(`[03][value32][tag][dist]`), so patching it in place never changes a length.
+
+## Limit: in-place patching assumes the encoder's choices don't move
+
+The emitter does not decompress and re-encode; it overwrites literal float bytes
+in place. That is byte-exact only when Pulsar2's own encoder would make the same
+literal/back-reference choices for the new value. In the two `[512,512,3,3]`
+Sqrt misses it did not: for the new `sx` Pulsar2 wrote each copy as three
+literal bytes plus a longer back-reference that absorbs the float's last byte
+(`3b`), because that byte and what follows already occur earlier in the
+stream. The segment content shrank by 4 bytes. Whether a given value triggers
+this depends on the shape's whole stream, so no template is guaranteed for
+every scale; the 74/76 held-out rate is the evidence, not a proof.
+
+So, to answer #1836 directly: **this emitter does not handle the
+variable-length compressed units.** It patches fixed-width float literals only,
+and it refuses zero-point changes.
+
 ## Zero point: not handled yet
 
 A zero-point change is refused. The zero point is written through the stream's
