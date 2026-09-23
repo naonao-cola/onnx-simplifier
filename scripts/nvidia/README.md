@@ -17,6 +17,7 @@ hand-built-graph tests in `tests/test_tensorrt_*.py` (which never invoke TensorR
 | `run_cuda_feature_notebook.py` | onnxsim + a GPU `onnxruntime` | runs `examples/cuda_feature_tests/cuda_feature_tests.ipynb`'s tests as a plain script |
 | `llm_pipeline.py` | onnxsim (Python >= 3.11) | pins shapes on a decoder-with-KV-cache LLM export and runs `simplify()` on it |
 | `llm_block_split.py` | onnxsim (`split`), system Python with `tensorrt` (`build`) | splits a decoder LLM into N-layer TensorRT-buildable blocks, chains them, measures real end-to-end latency per block size |
+| `edgellm_simplify.py` | onnxsim (Python >= 3.11) | runs onnxsim on a TensorRT Edge-LLM export dir for `llm_build` and checks plugin nodes / graph I/O are untouched; `rms-stack` writes a synthetic RMSNorm+MLP stack for `trtexec` |
 
 They are split because JetPack 6's TensorRT Python bindings are cp310-only while onnxsim
 needs Python >= 3.11; models are exchanged as `.onnx` files.
@@ -493,6 +494,34 @@ empty-string optional inputs); what is left is 57 decomposed RMSNorms and 28 Swi
   (onnxruntime: max |diff| 0.94 vs the decomposed graph on unit-scale input). It now only
   fuses a last-axis reduction.
 
-Not yet measured: whether TensorRT builds the fused graph into a faster engine than the
-decomposed one (its Myelin compiler may already fuse the decomposed norm), and whether
-Edge-LLM's `llm_build` accepts `RMSNormalization` -- both need a TensorRT SDK install.
+**Real TensorRT, RTX 5050 (sm_120), TensorRT 11.3.0, CUDA 13.4: the fusion is exact and
+speed-neutral.** TensorRT's Myelin compiler already fuses the *decomposed* fp32-upcast norm
+into one kernel (`__myl_CastMulMeanAddSqrtDivMulCastMul`), so both forms produce the same
+engine. Edge-LLM was built from source for sm_120 only (`CMAKE_CUDA_ARCHITECTURES=120`,
+`-DCUTE_DSL_ARTIFACT_TAG=sm_120 -DENABLE_CUTE_DSL=fmha`); its `llm_build` accepts the
+onnxsim output as-is (standard `RMSNormalization`, plugin nodes byte-identical).
+
+```sh
+python3.12 scripts/nvidia/edgellm_simplify.py EXPORT/llm SIM/llm        # onnxsim venv
+./build/examples/llm/llm_build --onnxDir SIM/llm --engineDir ENG --maxBatchSize 1 \
+    --maxInputLen 512 --maxKVCacheCapacity 1024
+python3.12 scripts/nvidia/edgellm_simplify.py rms-stack /tmp/rms       # synthetic, trtexec
+```
+
+| Qwen3-0.6B fp16, Edge-LLM `llm_build` + `llm_inference` | as exported | onnxsim |
+|---|---|---|
+| ONNX nodes | 856 | 400 |
+| engine build | 26.5 s, 4.7 GB peak | 25.8 s, 5.2 GB peak |
+| prefill | 2821 tok/s (9.22 ms) | 2854 tok/s (9.11 ms) |
+| decode | 218.0 tok/s | 218.9 tok/s |
+| greedy output, 3 prompts x 128 tokens | -- | identical |
+
+One run each (~1% differences are noise). Both builds print the same 31 TensorRT warnings
+(28 of them `Attribute xqa_jit_kernels not found in plugin node`, from the export itself,
+not onnxsim). The plugin-free `rms-stack` model (28 Qwen3-0.6B-shaped RMSNorm + SwiGLU
+blocks, `trtexec` with CUDA graphs) isolates the norm: 113 engine layers either way, decode
+1.979 vs 1.979 ms, 512-token prefill 13.71 vs 13.78 ms (decomposed vs fused, median of 500).
+
+So for Edge-LLM on TensorRT the fusion is a graph-size/readability win, not a speed win.
+Any speed benefit would have to come from a backend without a Myelin-style fuser of its
+own that does dispatch `RMSNormalization` to a fused kernel -- not measured here.
