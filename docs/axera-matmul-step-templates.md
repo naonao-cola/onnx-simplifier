@@ -15,7 +15,7 @@ each other exactly in both directions (records and `npu_params`):
 | --- | ---: | ---: |
 | fc (dX, dW, forward Gemm) | 3 | 3 |
 | dX | 7 of 9, plus the existing 512->512 template | 14 of 19 |
-| dW | 7 of 11 | 8 of 20 |
+| dW | 6 of 11 | 8 of 20 |
 | Conv | 6 of 11 | 8 of 20 |
 
 Coverage (`tinygrad_ax_backend.coverage_report` on `step.onnx`, master's
