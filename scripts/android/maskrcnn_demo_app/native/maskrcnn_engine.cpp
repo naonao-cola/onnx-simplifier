@@ -11,6 +11,7 @@
 //                    seg2/seg4 in pipe_e_opt.txt) with a native multithreaded row scatter
 //   pipeline=<step>  two-stage cross-frame pipelining: stage A = steps before <step>, stage B = the
 //                    rest, on its own thread; frame N+1's stage A runs while frame N's stage B does
+//   env.NAME=value   set an environment knob before init (e.g. env.ORT_THREADS=6)
 // The image comes from an RGBA bitmap (quantized straight to the backbone's uint8 NHWC input) and
 // results/timings go back over JNI.
 #define E2E_STORE_STORAGE static thread_local
@@ -98,6 +99,7 @@ void quant_rgba(Step& S, const uint8_t* px, int w, int h, int stride) {
 // YUV -> RGB is JFIF full-range BT.601 (what camera YUV_420_888 is), fixed point.
 struct Yuv {
   const uint8_t *y, *u, *v;
+  long ycap, ucap, vcap;  // plane buffer sizes (direct ByteBuffer capacities)
   int ys, uvs, uvps, w, h, rot;
   uint8_t* disp;  // RGBA, fw x fh, stride disp_stride (may be null)
   int disp_stride;
@@ -114,6 +116,7 @@ void quant_yuv(Step& S, const Yuv& Y) {
   const int H = 800, W = 1088, C = 3;
   uint8_t* q = (uint8_t*)S.buf.get((size_t)H * W * C);
   const uint8_t pad = qval(0.f, s, z);
+  const uint8_t *py = Y.y, *pu = Y.u, *pv = Y.v;
   int fw, fh;
   fit_dims(Y.w, Y.h, Y.rot, &fw, &fh);
   const int RW = (Y.rot % 180) ? Y.h : Y.w, RH = (Y.rot % 180) ? Y.w : Y.h;
@@ -137,9 +140,9 @@ void quant_yuv(Step& S, const Yuv& Y) {
             case 270: sx = Y.w - 1 - ry; sy = rx; break;
             default: sx = rx; sy = ry;
           }
-          const int yy = Y.y[sy * Y.ys + sx];
+          const int yy = py[sy * Y.ys + sx];
           const int ci = (sy >> 1) * Y.uvs + (sx >> 1) * Y.uvps;
-          const int uu = Y.u[ci] - 128, vv = Y.v[ci] - 128;
+          const int uu = pu[ci] - 128, vv = pv[ci] - 128;
           // x1024 fixed point: 1.402, 0.344136, 0.714136, 1.772
           int r = yy + ((1436 * vv + 512) >> 10);
           int g = yy - ((352 * uu + 731 * vv + 512) >> 10);
@@ -319,6 +322,10 @@ void init(const std::string& model_dir, const std::string& lib_dir, const std::s
     auto e = kv.find('=');
     if (e != std::string::npos) g_opt[kv.substr(0, e)] = kv.substr(e + 1);
   }
+  // "env.NAME=value" sets an environment knob e2e_run.cpp reads (ORT_THREADS, DQ_THREADS,
+  // ROI_THREADS, RPN_MODE, MERGE_THREADS), before anything reads it
+  for (auto& kv : g_opt)
+    if (kv.first.rfind("env.", 0) == 0) setenv(kv.first.substr(4).c_str(), kv.second.c_str(), 1);
   g_lut = g_opt["quant"] == "lut";
   g_merge = split(g_opt.count("merge") ? g_opt["merge"] : "-", ',');
   // The DSP loads skels (libQnnHtpV69Skel.so, librpn_rpc.so, libroialign_rpc.so) through this
@@ -561,7 +568,9 @@ extern "C" JNIEXPORT jlong JNICALL Java_org_onnxsim_maskrcnndemo_Engine_nativeRu
     jobject disp, jlong id, jfloatArray jboxes, jintArray jlabels, jfloatArray jscores, jfloatArray jmasks,
     jfloatArray jtimes, jintArray jndet) {
   Yuv Y{(const uint8_t*)e->GetDirectBufferAddress(jy), (const uint8_t*)e->GetDirectBufferAddress(ju),
-        (const uint8_t*)e->GetDirectBufferAddress(jv), ys, uvs, uvps, w, h, rot, nullptr, 0};
+        (const uint8_t*)e->GetDirectBufferAddress(jv), (long)e->GetDirectBufferCapacity(jy),
+        (long)e->GetDirectBufferCapacity(ju), (long)e->GetDirectBufferCapacity(jv), ys, uvs, uvps, w, h, rot,
+        nullptr, 0};
   AndroidBitmapInfo info;
   void* px = nullptr;
   if (!Y.y || !Y.u || !Y.v || AndroidBitmap_getInfo(e, disp, &info) ||

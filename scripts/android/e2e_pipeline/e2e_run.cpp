@@ -235,14 +235,14 @@ static void exec(Step& S) {
     for (auto& kv : S.buckets)
       if (kv.first >= n && (!B || kv.first < b)) { B = &kv.second; b = kv.first; }
     if (!B) throw std::runtime_error("no bucket for n=" + std::to_string(n));
-    size_t row = x.count() / std::max<int64_t>(n, 1) * esize(x.type);
-    if (n == 0) row = 0;
-    size_t need = (size_t)b * (row ? row : 1);
+    // row size from the trailing dims, not count()/n: with n == 0 (no RoIs) the padded input must
+    // still be b full rows, or the HTP input copy reads past the end of S.pad
+    size_t row = esize(x.type);
+    for (size_t d = 1; d < x.shape.size(); ++d) row *= (size_t)x.shape[d];
+    size_t need = (size_t)b * row;
     if (S.pad.size() < need) S.pad.assign(need, 0);
-    if (row) {
-      memcpy(S.pad.data(), x.data, n * row);
-      memset(S.pad.data() + n * row, 0, (b - n) * row);
-    }
+    if (n) memcpy(S.pad.data(), x.data, n * row);
+    memset(S.pad.data() + n * row, 0, (b - n) * row);
     Tensor tmp = x;
     tmp.data = S.pad.data();
     Ort::Value v = view(tmp, &B->in_shape[0]);
