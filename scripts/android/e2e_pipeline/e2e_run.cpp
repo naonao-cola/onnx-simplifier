@@ -9,7 +9,8 @@
 //   final outputs of the last run to <out_dir>/<stem>_<k>.bin (+ .shape) for the host comparison.
 // env: ORT_THREADS (CPU intra-op, default 4, one global pool shared by every CPU session),
 //      QNN_EP_LIB, RPN_URI, ROI_URI, RPN_MODE (default 3 = phased), ROI_THREADS (default 104 =
-//      4 threads + l2fetch prefetch), DQ_THREADS (default 4).
+//      4 threads + l2fetch prefetch), DQ_THREADS (default 4), ORT_SPIN (default 1; 0 stops the ORT
+//      pool spinning between ops, which otherwise starves the driver's own threaded passes).
 #include <onnxruntime_cxx_api.h>
 
 #include <algorithm>
@@ -27,6 +28,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <arm_neon.h>
 #include <unistd.h>
 
 extern "C" {
@@ -129,25 +131,25 @@ static std::unique_ptr<Ort::Session> make_session(const std::string& model, cons
   so.DisablePerSessionThreads();
   so.SetLogSeverityLevel(envi("ORT_LOG", ORT_LOGGING_LEVEL_WARNING));
   std::string path = model;
-  bool ctx = false;
+  int ctx = 0;  // 1: EP-context model, context binary embedded; 2: binary in a separate _qnn.bin file
   if (ep == "htp") {
     std::unordered_map<std::string, std::string> o{{"backend_type", "htp"}};
     for (auto& kv : split(opts, ';')) {
       auto e = kv.find('=');
       if (e == std::string::npos) continue;
-      if (kv.substr(0, e) == "ctx") { ctx = kv.substr(e + 1) == "1"; continue; }
+      if (kv.substr(0, e) == "ctx") { ctx = std::stoi(kv.substr(e + 1)); continue; }
       o[kv.substr(0, e)] = kv.substr(e + 1);
     }
     so.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
     so.AppendExecutionProvider_V2(*env, npu, o);
     if (ctx) {
-      path = model.substr(0, model.size() - 5) + ".ctx.onnx";
+      path = model.substr(0, model.size() - 5) + (ctx == 2 ? ".ctx0.onnx" : ".ctx.onnx");
       std::ifstream exists(path);
       if (!exists) {
         Ort::ModelCompilationOptions co(*env, so);
         co.SetInputModelPath(model.c_str());
         co.SetOutputModelPath(path.c_str());
-        co.SetEpContextEmbedMode(true);
+        co.SetEpContextEmbedMode(ctx == 1);
         Ort::Status st = Ort::CompileModel(*env, co);
         if (!st.IsOK()) throw std::runtime_error("CompileModel " + model + ": " + st.GetErrorMessage());
       }
@@ -282,6 +284,57 @@ static void exec(Step& S) {
       for (long i = a; i < b; ++i) o[i] = (float)((int)q[i] - z) * s;  // DequantizeLinear
     });
     put_raw(f[2], ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, x.shape, o);
+  } else if (S.op == "quant") {
+    // QuantizeLinear to uint8, shape kept: a head's graph-input QuantizeLinear moved off the HTP
+    // (u8_heads.py; an fp32 graph input costs the HTP far more than this pass costs the CPU)
+    Tensor& x = get(f[1]);
+    const float s = std::stof(f[3]);
+    const int z = std::stoi(f[4]);
+    const long n = (long)x.count();
+    const std::vector<int64_t> shape = x.shape;
+    uint8_t* q = (uint8_t*)S.buf.get(std::max<long>(n, 1));
+    const float* src = (const float*)x.data;
+    // NEON, 16 per iteration: the same x / s (vector fdiv), round half to even (vcvtnq, = rintf in
+    // the default rounding mode), + z and saturate to [0, 255] -- bit-identical to the scalar tail
+    const float32x4_t vs = vdupq_n_f32(s);
+    const int32x4_t vz = vdupq_n_s32(z);
+    par((n + 15) / 16, envi("DQ_THREADS", 4), [&](long a, long b) {
+      long i = a * 16;
+      const long e = std::min(n, b * 16);
+      for (; i + 16 <= e; i += 16) {
+        int32x4_t r[4];
+        for (int k = 0; k < 4; ++k) r[k] = vaddq_s32(vcvtnq_s32_f32(vdivq_f32(vld1q_f32(src + i + 4 * k), vs)), vz);
+        const int16x8_t h0 = vcombine_s16(vqmovn_s32(r[0]), vqmovn_s32(r[1]));
+        const int16x8_t h1 = vcombine_s16(vqmovn_s32(r[2]), vqmovn_s32(r[3]));
+        vst1q_u8(q + i, vcombine_u8(vqmovun_s16(h0), vqmovun_s16(h1)));
+      }
+      for (; i < e; ++i) {
+        float v = __builtin_rintf(src[i] / s) + (float)z;  // same rounding as quant_in
+        q[i] = (uint8_t)(v < 0.f ? 0.f : (v > 255.f ? 255.f : v));
+      }
+    });
+    put_raw(f[2], ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8, shape, q);
+  } else if (S.op == "mask_sel") {
+    // mask_sel LOGITS LABELS OUT scale zp: OUT[i, 0] = sigmoid(dequant(LOGITS[i, LABELS[i]])), i.e.
+    // the mask head's final DequantizeLinear + Sigmoid (moved off the HTP, u8_heads.py) fused with
+    // seg5's per-detection class gather, so only 1 of the 81 channels is ever converted. uint8 in:
+    // a 256-entry table is exact.
+    Tensor& L = get(f[1]);
+    Tensor& lab = get(f[2]);
+    const float s = std::stof(f[4]);
+    const int z = std::stoi(f[5]);
+    float lut[256];
+    for (int v = 0; v < 256; ++v) lut[v] = 1.f / (1.f + std::exp(-(float)(v - z) * s));
+    const int64_t n = L.shape[0], C = L.shape[1], H = L.shape[2], W = L.shape[3];
+    const int64_t* lb = (const int64_t*)lab.data;
+    const uint8_t* q = (const uint8_t*)L.data;
+    float* o = (float*)S.buf.get(std::max<int64_t>(n * H * W, 1) * 4);
+    for (int64_t i = 0; i < n; ++i) {
+      if (lb[i] < 0 || lb[i] >= C) throw std::runtime_error("mask_sel: label out of range");
+      const uint8_t* src = q + (i * C + lb[i]) * H * W;
+      for (int64_t k = 0; k < H * W; ++k) o[i * H * W + k] = lut[src[k]];
+    }
+    put_raw(f[3], ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, {n, 1, H, W}, o);
   } else if (S.op == "rpn") {
     int src = std::stoi(f[1]);
     auto sc = split(f[2], ','), dl = split(f[3], ',');
@@ -347,6 +400,9 @@ int main(int argc, char** argv) {
 
     Ort::ThreadingOptions to;
     to.SetGlobalIntraOpNumThreads(envi("ORT_THREADS", 4));
+    // ORT_SPIN=0: the pool's threads stop spinning after each op, so they don't hold the big cores
+    // while the pipeline's own par() work (quant, dq, scatter) runs between ORT segments
+    to.SetGlobalSpinControl(envi("ORT_SPIN", 1));
     to.SetGlobalInterOpNumThreads(1);
     env = std::make_unique<Ort::Env>(to, static_cast<OrtLoggingLevel>(envi("ORT_LOG", ORT_LOGGING_LEVEL_WARNING)), "e2e");
 
@@ -361,7 +417,7 @@ int main(int argc, char** argv) {
       std::string w;
       while (ss >> w) S->f.push_back(w);
       S->op = S->f[0];
-      S->name = S->op == "ort" || S->op == "ortpad" ? S->f[1] : S->op + ":" + S->f[S->op == "rpn" ? 4 : S->op == "roialign" ? 3 : 2];
+      S->name = S->op == "ort" || S->op == "ortpad" ? S->f[1] : S->op + ":" + S->f[S->op == "rpn" ? 4 : S->op == "roialign" || S->op == "mask_sel" ? 3 : 2];
       need_htp |= (S->op == "ort" && S->f[3] == "htp") || (S->op == "ortpad" && S->f[2] == "htp");
       need_rpn |= S->op == "rpn";
       need_roi |= S->op == "roialign";
