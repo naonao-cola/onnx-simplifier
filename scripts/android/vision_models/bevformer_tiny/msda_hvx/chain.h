@@ -10,6 +10,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -136,10 +137,12 @@ static int32_t tsa_zp[3];
 // One TSA / SCA call: one level (H, W), 8 heads x 32, P points, ref points + pixel offsets (mode
 // MSDA_REF_PIX), point p on ref entry p % R, NV value maps averaged over the visible ones.
 // uint8 value buffers (split.py export --tsa-u8) use layer `layer`'s scale / zero point.
+// The skel isn't reentrant: callers on several threads (frame_run's encoder and split decoder) take turns.
+static std::mutex msda_mu;
 static void msda(const std::string& value, size_t value_off_floats, const std::string& ref, const std::string& off,
                  const std::string& attw, const std::string& vis, int NV, int H, int W, int R, int NO, int P,
-                 const std::string& out, int layer) {
-  const int Q = 2500;
+                 const std::string& out, int layer, int Q = 2500) {
+  std::lock_guard<std::mutex> lock(msda_mu);
   Buf &v = get(value), &r = get(ref), &o = get(off), &a = get(attw), &s = get(vis);
   Buf& y = buf(out, {Q, 256});
   msda_args_t A;

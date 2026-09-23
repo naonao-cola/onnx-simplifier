@@ -6,8 +6,8 @@
       prev_bev like the real model; saves every piece's inputs to <work>/calib/<i>.npz.
   quantize.py backbone --work <work> [--method minmax]
       calibrate backbone1 (one camera per batch, 6 x frames batches) and apply the ranges to
-      backbone6 (same tensor names): <work>/backbone6.q8.onnx, uint8 NHWC image in, uint8 feats
-      out; qparams in <work>/backbone6.q8.json.
+      backbone6 and backbone1 (same tensor names): <work>/backbone{6,1}.q8.onnx, uint8 NHWC image
+      in, uint8 feats out; qparams in <work>/backbone{6,1}.q8.json, ranges in backbone.ranges.json.
   quantize.py <enc3|decoder> --work <work> --policy <policy> [--method minmax]
       quantize with a mixed-precision policy (POLICIES below): <work>/<piece>.<policy>.onnx.
 
@@ -106,13 +106,17 @@ def backbone(a, F):
     names = [o for n in one.graph.node for o in n.output] + ["img"]
     ranges = calibrate(one, data, method=a.method, extra_tensor_names=names)
     del one, data
-    six = onnx.load(str(work / "backbone6.sim.onnx"))
-    q = F.quantize_full_qdq(six, ranges=ranges)
-    q, info = F.quantized_io(q, nhwc_inputs=["img"])
-    stem = f"backbone6.q8{'' if a.method == 'minmax' else '.' + a.method}"
-    onnx.save(q, str(work / f"{stem}.onnx"))
-    (work / f"{stem}.json").write_text(json.dumps(info, indent=1))
-    print(f"{stem}: {len(q.graph.node)} nodes, io {info}")
+    sfx = "" if a.method == "minmax" else "." + a.method
+    (work / f"backbone.ranges{sfx}.json").write_text(json.dumps({k: list(v) for k, v in ranges.items()}))
+    # the same ranges at batch 6 (one execute for all cameras) and batch 1 (one per camera, so a
+    # pipelined runner can interleave the backbone with other HTP work at a finer grain)
+    for b in (6, 1):
+        q = F.quantize_full_qdq(onnx.load(str(work / f"backbone{b}.sim.onnx")), ranges=ranges)
+        q, info = F.quantized_io(q, nhwc_inputs=["img"])
+        stem = f"backbone{b}.q8{sfx}"
+        onnx.save(q, str(work / f"{stem}.onnx"))
+        (work / f"{stem}.json").write_text(json.dumps(info, indent=1))
+        print(f"{stem}: {len(q.graph.node)} nodes, io {info}")
 
 
 def attention_piece(a, F):

@@ -2,7 +2,9 @@
 // (CPU) -> encoder (7 fp16 HTP pieces + 6 HVX MSDA calls, chain.h) -> decoder (fp16 HTP), the previous
 // frame's BEV carried in-process (prev_bev = rot_idx gather of the last bev_embed, has_prev per frame).
 //
-// usage: frame_run <piece dir> <backbone.onnx> <decoder.onnx> <mode> <warmup> <reps> <out dir> <frame dir>...
+// usage: frame_run <piece dir> <backbone.onnx> <decoder.onnx|split> <mode> <warmup> <reps> <out dir> <frame dir>...
+//   decoder "split": dec_split.py's pieces (dpre, dmid0-4, dpost + dec_const/) in the piece dir, around
+//   6 more HVX MSDA calls (one 50x50 map, 900 queries); the MSDA skel is shared under a mutex.
 //   mode seq : frames one after another, each fully finished before the next; per-frame latency.
 //   mode pipe: three stage threads (backbone | encoder | decoder) with two slots between stages, so the
 //              HTP / HVX / CPU work of neighbouring frames overlaps; throughput and per-frame latency.
@@ -12,7 +14,8 @@
 //   frame dir: img.u8 (6,480,800,3; the backbone's quantized NHWC input), has_prev.f32 (1), can_bus.f32
 //              (18), tsa_ref.f32 (2,2500,1,2), ref_cam.f32 (6,2500,4,2), vis.u8 (6,2500), rot_idx.i32
 //              (2500; prev_bev row source, -1 = zero; from torchvision's own rotate, see e2e_msda.py)
-//   piece dir also holds feats_q.txt: the backbone output's "scale zero_point".
+//   piece dir also holds feats_q.txt: the backbone output's "scale zero_point". The backbone is batch 6
+//   (one execute) or batch 1 (backbone1.q8: one execute per camera).
 //   seq and pipe write <out dir>/f<i>_{bev,cls,bbox}.f32 for the last pass over the frames; pipe also
 //   prints the max |diff| to seq's outputs when those exist (the two must agree bit for bit).
 // env: MSDA_THREADS (default 4), QNN_PERF, QNN_EXTRA, ORT_LOG
@@ -149,14 +152,25 @@ int main(int argc, char** argv) {
     auto [dd, dn] = split_path(dec_path);
     Piece bb = load(bd, bn, &ms);
     create += ms;
-    Piece dec = load(dd, dn, &ms);
-    create += ms;
+    // decoder: one fp16 HTP graph, or "split" = dec_split.py's pieces around 6 HVX MSDA calls
+    const bool dsplit = dec_path == "split";
+    Piece dec;
+    std::map<std::string, Piece> dp;
+    if (dsplit) {
+      for (auto n : {"dpre", "dmid0", "dmid1", "dmid2", "dmid3", "dmid4", "dpost"}) {
+        dp[n] = load(pdir, n, &ms);
+        create += ms;
+      }
+    } else {
+      dec = load(dd, dn, &ms);
+      create += ms;
+    }
     printf("sessions create_ms %.1f\n", create);
     {
       std::ifstream q(pdir + "/feats_q.txt");
       if (!(q >> feats_scale >> feats_zp)) throw std::runtime_error("missing " + pdir + "/feats_q.txt");
     }
-    if (bb.in.size() != 1 || bb.out.size() != 1 || dec.in.size() != 1)
+    if (bb.in.size() != 1 || bb.out.size() != 1 || (!dsplit && dec.in.size() != 1))
       throw std::runtime_error("backbone: 1 in / 1 out, decoder: 1 in expected");
 
     std::vector<Frame> frames;
@@ -189,11 +203,41 @@ int main(int argc, char** argv) {
       buf("fq" + std::to_string(s), {6, 256, 15, 25}, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8);
       buf("bev" + std::to_string(s), {NQ, E});
     }
+    const int DQ = 900;
+    if (dsplit) {  // layer 0's kernel inputs are constants (dec_split.py const)
+      std::vector<std::pair<std::string, std::vector<int64_t>>> cs = {
+          {"q1", {DQ, E}}, {"doff", {DQ, 64}}, {"dw", {DQ, 32}}, {"refp", {DQ, 3}}, {"dref", {DQ, 2}}};
+      for (auto& [n, shp] : cs) {
+        Buf& b = buf("c_" + n, shp);
+        std::vector<float> v = read_vec<float>(pdir + "/dec_const/" + n + ".f32", b.bytes / 4);
+        memcpy(b.p, v.data(), b.bytes);
+      }
+      memset(buf("dvis", {1, DQ}, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8).p, 1, DQ);
+    }
     std::vector<float> last_bev(NQ * E);
     auto noop = [](double) {};
+    // a batch-1 backbone (quantize.py's backbone1.q8) runs once per camera on slices of the same
+    // buffers: six short HTP executes the pipelined runner can interleave with the encoder's pieces
+    const int64_t bb_batch = bb.s->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape()[0];
+    if (bb_batch != 1 && bb_batch != 6) throw std::runtime_error("backbone batch must be 1 or 6");
+    printf("backbone batch %lld\n", (long long)bb_batch);
     auto do_bb = [&](int f, int s) {
-      memcpy(get("img" + std::to_string(s)).p, frames[f % nf].img.data(), IMG);
-      run(bb, {{bb.in[0], "img" + std::to_string(s)}}, {{bb.out[0], "fq" + std::to_string(s)}});
+      Buf &img = get("img" + std::to_string(s)), &fq = get("fq" + std::to_string(s));
+      memcpy(img.p, frames[f % nf].img.data(), IMG);
+      if (bb_batch == 6) {
+        run(bb, {{bb.in[0], "img" + std::to_string(s)}}, {{bb.out[0], "fq" + std::to_string(s)}});
+        return;
+      }
+      const char* in_name = bb.in[0].c_str();
+      const char* out_name = bb.out[0].c_str();
+      std::vector<int64_t> xs{1, 480, 800, 3}, ys{1, 256, 15, 25};
+      for (int c = 0; c < 6; ++c) {
+        Ort::Value x = Ort::Value::CreateTensor(cpu_mem, (uint8_t*)img.p + c * (IMG / 6), IMG / 6, xs.data(), 4,
+                                                ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8);
+        Ort::Value y = Ort::Value::CreateTensor(cpu_mem, (uint8_t*)fq.p + c * (FEATS / 6), FEATS / 6, ys.data(), 4,
+                                                ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8);
+        bb.s->Run(Ort::RunOptions{nullptr}, &in_name, &x, 1, &out_name, &y, 1);
+      }
     };
     auto do_enc = [&](int f, int s_in, int s_out, auto&& mark) {
       const Frame& fr = frames[f % nf];
@@ -202,11 +246,28 @@ int main(int argc, char** argv) {
       encoder(pc, mark, "bev" + std::to_string(s_out));
       memcpy(last_bev.data(), get("bev" + std::to_string(s_out)).p, NQ * E * 4);
     };
-    auto do_dec = [&](int s) { run(dec, {{dec.in[0], "bev" + std::to_string(s)}}); };
+    auto do_dec = [&](int s) {
+      if (!dsplit) {
+        run(dec, {{dec.in[0], "bev" + std::to_string(s)}});
+        return;
+      }
+      run(dp["dpre"], {{"bev_embed", "bev" + std::to_string(s)}});
+      std::string q1 = "c_q1", rp = "c_refp", off = "c_doff", w = "c_dw", ref = "c_dref";
+      for (int l = 0; l < 6; ++l) {
+        msda("dv", (size_t)l * NQ * E, ref, off, w, "dvis", 1, 50, 50, 1, 1, 4, "dout", 0, DQ);
+        if (l == 5) {
+          run(dp["dpost"], {{"q1", q1}, {"refp", rp}});
+          break;
+        }
+        const std::string nq = "dq1_" + std::to_string(l % 2), nr = "drefp_" + std::to_string(l % 2);
+        run(dp["dmid" + std::to_string(l)], {{"q1", q1}, {"refp", rp}}, {{"q1o", nq}, {"refpo", nr}});
+        q1 = nq, rp = nr, off = "doff", w = "dw", ref = "dref";
+      }
+    };
     auto save = [&](int f, int s, const std::string& dir) {
       write_out(dir, f % nf, "bev", get("bev" + std::to_string(s)));
-      write_out(dir, f % nf, "cls", get(dec.out[0]));
-      write_out(dir, f % nf, "bbox", get(dec.out[1]));
+      write_out(dir, f % nf, "cls", get("cls_scores"));
+      write_out(dir, f % nf, "bbox", get("bbox_preds"));
     };
     // one warm frame creates every piece's output buffers before any threads start
     do_bb(0, 0);

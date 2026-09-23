@@ -72,7 +72,11 @@ def main():
     ap.add_argument("--scene", default="scene-0103")
     ap.add_argument("--frames", type=int, default=6)
     ap.add_argument("--backbone", default="backbone6.q8")
-    ap.add_argument("--decoder", default="decoder.sim")
+    ap.add_argument(
+        "--decoder",
+        default="decoder.sim",
+        help="a decoder piece, or 'split' (dec_split.py export's pieces + HVX)",
+    )
     ap.add_argument("--modes", default="seq,pipe,conc")
     ap.add_argument(
         "--reps",
@@ -127,7 +131,32 @@ def main():
         f"{fq['scale']!r} {fq['zero_point']}\n"
     )
 
-    X.push_runtime(work, Path(a.build), [a.backbone, a.decoder])
+    split_dec = a.decoder == "split"
+    X.push_runtime(
+        work, Path(a.build), [a.backbone] + ([] if split_dec else [a.decoder])
+    )
+    if split_dec:  # dec_split.py export's pieces + layer 0's constants
+        for p in ("dpre", "dmid0", "dmid1", "dmid2", "dmid3", "dmid4", "dpost"):
+            subprocess.run(
+                [
+                    *E.ADB,
+                    "push",
+                    "-q",
+                    str(work / "msda_split" / f"{p}.sim.onnx"),
+                    f"{R}/msda_split/{p}.onnx",
+                ],
+                check=True,
+            )
+        subprocess.run(
+            [
+                *E.ADB,
+                "push",
+                "-q",
+                str(work / "msda_split" / "dec_const"),
+                f"{R}/msda_split/",
+            ],
+            check=True,
+        )
     sh = lambda c: subprocess.run([*E.ADB, "shell", c], check=True)  # noqa: E731
     subprocess.run(
         [*E.ADB, "push", "-q", str(Path(a.build) / "frame_run"), f"{R}/frame_run"],
@@ -157,7 +186,8 @@ def main():
             [
                 *E.ADB,
                 "shell",
-                f"{env} ./frame_run msda_split {a.backbone}.onnx {a.decoder}.onnx {mode} 1 {a.reps} "
+                f"{env} ./frame_run msda_split {a.backbone}.onnx {'split' if split_dec else a.decoder + '.onnx'} "
+                f"{mode} 1 {a.reps} "
                 f"fr/{mode} {names} 2>&1",
             ],
             capture_output=True,
