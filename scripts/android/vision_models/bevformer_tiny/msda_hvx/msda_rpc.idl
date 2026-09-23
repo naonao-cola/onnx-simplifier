@@ -1,0 +1,16 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+// One call = one TSA or SCA deformable-sampling span (msda_kernel.h): value maps, reference points,
+// raw offsets, softmaxed weights, visibility -> (Q, 256) f32.
+interface msda_rpc : remote_handle64 {
+  AEEResult run(in sequence<float> value,  // (NV, H*W, 256)
+                in sequence<float> ref,    // (NV, Q, R, 2)
+                in sequence<float> off,    // (Q, 8, NO, P, 2)
+                in sequence<float> attw,   // (Q, 8, NO, P)
+                in sequence<uint8> vis,    // (NV, Q)
+                in int32 NV, in int32 H, in int32 W, in int32 Q, in int32 R, in int32 NO, in int32 P,
+                in int32 flags,            // bits 0-7: threads; bits 8-15: queries per job / 16 (0: 64)
+                rout sequence<float> result,  // (Q, 256)
+                rout uint64 dsp_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};
