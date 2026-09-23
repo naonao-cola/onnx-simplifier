@@ -570,13 +570,16 @@ def locate(builds: dict[str, dict], tol: float = 2e-6, header_words: int = 4) ->
         header = builds[v].get("npu_params", b"")[: 2 * header_words]
         words = struct.unpack(f"<{len(header) // 2}H", header) if header else ()
         hits: dict[str, list[str]] = {}
+        lens: dict[str, set] = {}
         for label, m in monos.items():
             locs = []
             for w in writes:
                 got = _f32(w["value"])
                 if math.isfinite(got) and abs(got - m) <= tol * abs(m):
                     locs.append(f"seg{w['seg']}:{w['kind']}:{_reg_label(w['reg'])}")
-            if 0 < m < 2:
+                    lens.setdefault(label, set()).add(f"{w['kind']}{w['length']}")
+            # A Q15 word below 64 is indistinguishable from padding/small ints.
+            if 64 / 32768 <= m < 2:
                 q15 = round(m * 32768)
                 locs += [
                     f"npu_params[w{i}]:Q15" for i, x in enumerate(words) if x == q15
@@ -590,9 +593,9 @@ def locate(builds: dict[str, dict], tol: float = 2e-6, header_words: int = 4) ->
                 abs(m - m2) <= tol * abs(m) for k2, m2 in monos.items() if k2 != label
             )
         }
-        per_variant[v] = (hits, unique, monos)
+        per_variant[v] = (hits, unique, monos, lens)
     out = {}
-    labels = sorted({label for h, _, _ in per_variant.values() for label in h})
+    labels = sorted({label for h, *_ in per_variant.values() for label in h})
     for label in labels:
         locs = sorted({x for v in variants for x in per_variant[v][0].get(label, [])})
         found = [v for v in variants if label in per_variant[v][0]]
@@ -607,6 +610,13 @@ def locate(builds: dict[str, dict], tol: float = 2e-6, header_words: int = 4) ->
             "found": len(found),
             "discriminating": len(disc),
             "calibration_dependent": len(vals) > 1,
+            # Matching records per variant (the per-lane copy count) and the
+            # record kinds+stream lengths they were encoded as (e.g. ``V8``,
+            # ``W7``, ``S7`` for a 7-byte compressed short unit).
+            "copies": {v: len(per_variant[v][0].get(label, [])) for v in found},
+            "encodings": sorted(
+                {e for v in found for e in per_variant[v][3].get(label, ())}
+            ),
         }
     return out
 
@@ -680,6 +690,7 @@ def main(argv: list[str]) -> int:
             print(
                 f"   {label}: found {d['found']}/{len(r['variants'])}"
                 f" (discriminating {d['discriminating']}) at {d['locations']}"
+                f" copies {sorted(set(d['copies'].values()))} as {d['encodings']}"
             )
         if "--located-only" in argv:
             continue
