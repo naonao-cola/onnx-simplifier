@@ -13,7 +13,7 @@ Probe scripts are in `vision_models_probe/`; they download models rather than co
 | 1 | **YOLO11n** (detect; `-seg` for masks) | whole net on HTP; box decode + NMS on CPU or our HVX NMS kernel | fp32 graph: **0 ops refused, 10.0 ms strict all-HTP** (fp16) | none known; needs static int8 PTQ | small | int8 QDQ PTQ + COCO accuracy + FPS through the new deploy pipeline (`deploy/`) |
 | 2 | **Depth Anything V2 Small** | whole net on HTP | fp32: **0 refused, 111 ms (fallback allowed) / 129 ms strict** (fp16) | int8 PTQ of a ViT (LayerNorm/Softmax/GELU accuracy); int16 activations halve throughput | medium | int8 QDQ with fp16/int16 islands for LayerNorm+Softmax; compare depth error vs fp32 |
 | 3 | **RT-DETR r18vd** | backbone + encoder on HTP; decoder too once rank is fixed; TopK on HTP/HVX | fp32: **39 of 695 ops refused, all rank-6** (deformable-attention decoder); 90.9 ms with CPU fallback, strict fails | HTP rank-5 limit in the decoder's deformable attention | medium | the same rank-5 rewrite as BEVFormer (shared work), then strict all-HTP |
-| 4 | **BEVFormer-tiny** | ResNet-50 backbone on HTP; encoder/decoder on HTP after rank-5 rewrite; deformable sampling possibly on HVX; TopK on HVX | one encoder layer at real tiny dims: rank-6 formulation **18 of 91 ops refused**, 190–215 ms with CPU fallback; rank-5 formulation **0 refused, 107 ms strict all-HTP** (fp16), but output only cos 0.986 vs fp32 | encoder speed (~15 GMAC/s effective) and an unexplained fp16 precision loss; needs a real exported checkpoint | large | per-op QNN profile of one encoder layer; bisect the precision loss |
+| 4 | **BEVFormer-tiny** | whole model on HTP (backbone, 3-layer encoder, decoder + head), fp16; TopK/decode on host | **real checkpoint, real nuScenes-mini frames: 0 refused, strict all-HTP for every piece, cos >= 0.99999 vs fp32, 105 vs 106 GT matches over 6 frames, ~392 ms/frame** (`vision_models/bevformer_tiny/`) | encoder speed (241 ms of the 392) | large (done: export + HTP fp16) | profile/speed up the encoder; int8 backbone |
 | 5 | SAM-family small encoder (MobileSAM/EfficientSAM), SegFormer, DINOv2-S | ViT/Mix-transformer: likely whole net on HTP | not probed | same ViT int8 issues as #2 | medium | reuse #2's recipe; probe with `partition_report.sh` |
 
 The order is value per unit of effort. YOLO11n is a complete, useful demo that needs nothing
@@ -128,6 +128,18 @@ None of these estimates replaces a phone run.
 - **Effort.** Medium. The rank rewrite is the only new piece, and it also unblocks BEVFormer.
 
 ## 4. BEVFormer-tiny (primary target, hardest)
+
+> **Update: the real model runs on the phone.** `vision_models/bevformer_tiny/` rebuilds
+> BEVFormer-tiny in plain PyTorch (no mmcv/mmdet3d/mmdeploy), loads the official
+> `bevformer_tiny_epoch_24.pth` with every key mapped, matches an upstream-literal path (6-D MSDA,
+> SCA `nonzero()` rebatch) exactly, and exports in pieces (peak RSS <= 2.6 GB). nuScenes-mini
+> downloads without an account. On the HTP, fp16, all pieces strict all-HTP with 0 refused ops:
+> backbone 6 cams ~126 ms, encoder 3 layers 241 ms, decoder + head 25 ms; chained over 6 real
+> frames with the HTP's own prev_bev carried: cos >= 0.99999 vs fp32 and 105 vs 106 GT matches.
+> The fp16 precision loss was two bugs, both fixed exactly: ref_cam values up to 6.7e6 for points
+> behind a camera (fp16 overflow; clamp on the host), and a QNN miscompile of
+> stack -> reshape -> Gemm in TSA's value projection (project per frame instead). The probe
+> below (and its cos 0.986) predates that; steps 2 and 4 are done, 1/3/5 remain.
 
 - **Source situation.** There's no public deployable BEVFormer ONNX (Hub search: none). Exporting
   the official checkpoint needs mmdet3d + mmcv + the BEVFormer repo, and mmdeploy's custom op for
