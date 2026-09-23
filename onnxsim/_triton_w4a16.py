@@ -11,9 +11,12 @@ Why a kernel of our own: TensorRT-LLM's weight-only int4 GEMMs
 only supports nvfp4"), AutoDeploy's int4 ops are fake-quant (dequantize the whole weight in
 PyTorch on every call), and PyTorch's ``_weight_int4pack_mm`` takes bf16 activations only.
 
-Decode (M <= 16, memory-bound) runs a split-K tile kernel that dequantizes in registers:
-~2-2.9x faster than dense fp16 on 2048x8192 layers on an RTX 5050. Prefill (larger M,
-compute-bound) dequantizes to a transient fp16 weight and calls cuBLAS.
+All shapes on an RTX 5050, with weights streamed from DRAM as in a real model (not
+L2-resident): decode (M <= 16) runs a split-K kernel that dequantizes in registers,
+1.1-2.5x faster than dense fp16; M in (16, 256] runs the same kernel as a plain tile GEMM
+(no split), which beats both a transient-dequant + cuBLAS path at every M <= 128 swept and
+dense fp16 at M = 32 (1.35-1.64x); longer prefills dequantize to a transient fp16 weight
+and call cuBLAS.
 """
 
 import torch
@@ -164,8 +167,8 @@ _NUM_SMS: dict = {}
 
 
 def w4a16_linear(x, packed, scales, zeros, k, n, group, bias=None):
-    """``F.linear(x, dequant(packed, scales, zeros))`` without materializing the weight
-    (for M <= 16)."""
+    """``F.linear(x, dequant(packed, scales, zeros))``; the weight is only materialized
+    (transiently) for M > 256."""
     if 128 % group and group % 128:
         raise ValueError(f"group size {group} must divide or be a multiple of 128")
     shape = x.shape
@@ -173,10 +176,45 @@ def w4a16_linear(x, packed, scales, zeros, k, n, group, bias=None):
     if x2.stride(-1) != 1:
         x2 = x2.contiguous()
     m = x2.shape[0]
-    if m > 16:
-        # prefill: compute-bound, cuBLAS on a transient dequantized weight wins
+    if m > 256:
+        # long prefill: compute-bound; cuBLAS on a transient dequantized weight is
+        # within ~10% of the tile kernel either way (RTX 5050 sweep)
         w = w4_dequant(packed, scales, zeros, k, n, group, x.dtype)
         return torch.nn.functional.linear(x, w, bias)
+    if m > 16:
+        # short prefill / batched decode: still memory-bound on the weight, so the
+        # tile kernel (dequantize in registers, no fp16 weight write) wins -- 1.4-1.6x
+        # faster than dense fp16 at M=32 on 2048x8192, and faster than dequant+cuBLAS
+        # at every M <= 128 swept
+        bm = 32 if m <= 32 else 64
+        bk = max(128 if m <= 32 else 64, group)
+        y = torch.empty((m, n), device=x.device, dtype=x.dtype)
+        _w4a16_kernel[(triton.cdiv(m, bm), triton.cdiv(n, 64), 1)](
+            x2,
+            packed,
+            scales,
+            zeros if zeros is not None else scales,
+            y,
+            m,
+            n,
+            k,
+            packed.shape[1],
+            scales.shape[1],
+            x2.stride(0),
+            y.stride(0),
+            triton.cdiv(k, bk) * bk,
+            HAS_Z=zeros is not None,
+            SPLIT=1,
+            GROUP=group,
+            BLOCK_M=bm,
+            BLOCK_N=64,
+            BLOCK_K=bk,
+            num_warps=4,
+            num_stages=3,
+        )
+        if bias is not None:
+            y = y + bias
+        return y.reshape(*shape[:-1], n)
     dev = x.device.index or 0
     if dev not in _NUM_SMS:
         _NUM_SMS[dev] = torch.cuda.get_device_properties(x.device).multi_processor_count
