@@ -1,5 +1,49 @@
 {
  "templates": {
+  "1024x112896->1024x9x12544": {
+   "axmodel": "1024x112896_to_1024x9x12544_a.axmodel.gz",
+   "check": {
+    "axmodel": "1024x112896_to_1024x9x12544_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1024x112896_to_1024x9x12544",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1024x12544->16x64x112x112": {
+   "axmodel": "1024x12544_to_16x64x112x112_a.axmodel.gz",
+   "check": {
+    "axmodel": "1024x12544_to_16x64x112x112_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1024x12544_to_16x64x112x112",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1024x28224->1024x9x3136": {
+   "axmodel": "1024x28224_to_1024x9x3136_a.axmodel.gz",
+   "check": {
+    "axmodel": "1024x28224_to_1024x9x3136_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1024x28224_to_1024x9x3136",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1024x9x3136->1024x28224": {
+   "axmodel": "1024x9x3136_to_1024x28224_a.axmodel.gz",
+   "check": {
+    "axmodel": "1024x9x3136_to_1024x28224_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1024x9x3136_to_1024x28224",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
   "128x128x3x3->1x128x128x9": {
    "axmodel": "128x128x3x3_to_1x128x128x9_a.axmodel.gz",
    "check": {
@@ -55,6 +99,28 @@
    "scale": 0.0070588234812021255,
    "zero_point": 128
   },
+  "16x1x128x28224->16x1x1152x3136": {
+   "axmodel": "16x1x128x28224_to_16x1x1152x3136_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x128x28224_to_16x1x1152x3136_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x128x28224_to_16x1x1152x3136",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x128x7056->16x1x1152x784": {
+   "axmodel": "16x1x128x7056_to_16x1x1152x784_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x128x7056_to_16x1x1152x784_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x128x7056_to_16x1x1152x784",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
   "16x1x128x784->16x128x28x28": {
    "axmodel": "16x1x128x784_to_16x128x28x28_a.axmodel.gz",
    "check": {
@@ -99,6 +165,39 @@
    "scale": 0.0070588234812021255,
    "zero_point": 128
   },
+  "16x1x256x7056->16x1x2304x784": {
+   "axmodel": "16x1x256x7056_to_16x1x2304x784_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x256x7056_to_16x1x2304x784_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x256x7056_to_16x1x2304x784",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x3x614656->16x1x147x12544": {
+   "axmodel": "16x1x3x614656_to_16x1x147x12544_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x3x614656_to_16x1x147x12544_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x3x614656_to_16x1x147x12544",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x512x1764->16x1x4608x196": {
+   "axmodel": "16x1x512x1764_to_16x1x4608x196_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x512x1764_to_16x1x4608x196_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x512x1764_to_16x1x4608x196",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
   "16x1x512x441->16x1x4608x49": {
    "axmodel": "16x1x512x441_to_16x1x4608x49_a.axmodel.gz",
    "check": {
@@ -118,6 +217,17 @@
     "zero_point": 128
    },
    "name": "16x1x512x49_to_16x512x7x7",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x64x28224->16x1x576x3136": {
+   "axmodel": "16x1x64x28224_to_16x1x576x3136_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x64x28224_to_16x1x576x3136_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x64x28224_to_16x1x576x3136",
    "scale": 0.0070588234812021255,
    "zero_point": 128
   },
@@ -184,6 +294,28 @@
     "zero_point": 128
    },
    "name": "16x512x7x7_to_16x1x512x49",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x64x112x112->1024x12544": {
+   "axmodel": "16x64x112x112_to_1024x12544_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x64x112x112_to_1024x12544_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x64x112x112_to_1024x12544",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x64x112x112->16x1x64x12544": {
+   "axmodel": "16x64x112x112_to_16x1x64x12544_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x64x112x112_to_16x1x64x12544_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x64x112x112_to_16x1x64x12544",
    "scale": 0.0070588234812021255,
    "zero_point": 128
   },
@@ -519,6 +651,18 @@
   }
  },
  "zero_point_probes": {
+  "zp_16x1x64x3136_to_16x64x56x56": {
+   "axmodel": "zp_16x1x64x3136_to_16x64x56x56.axmodel.gz",
+   "scale": 0.004705882165580988,
+   "template": "16x1x64x3136->16x64x56x56",
+   "zero_point": 64
+  },
+  "zp_16x64x56x56_to_16x1x64x3136": {
+   "axmodel": "zp_16x64x56x56_to_16x1x64x3136.axmodel.gz",
+   "scale": 0.004705882165580988,
+   "template": "16x64x56x56->16x1x64x3136",
+   "zero_point": 64
+  },
   "zp_1x128x64_asym": {
    "axmodel": "zp_1x128x64_asym.axmodel.gz",
    "scale": 0.004705882165580988,
@@ -530,6 +674,12 @@
    "scale": 0.0035294117406010628,
    "template": "1x128x64->128x64x1x1",
    "zero_point": 113
+  },
+  "zp_1x512x4608_to_512x512x3x3": {
+   "axmodel": "zp_1x512x4608_to_512x512x3x3.axmodel.gz",
+   "scale": 0.004705882165580988,
+   "template": "1x512x4608->512x512x3x3",
+   "zero_point": 64
   }
  }
 }

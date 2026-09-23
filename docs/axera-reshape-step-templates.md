@@ -22,14 +22,22 @@ the program can be rewritten offline.
   the scale lanes and three zero-point records, 0x1b10, 0x1eb0 and 0x1a90.
   Retargeting reproduces them. A zero point of 0 (range `[0, hi]`) compiles
   to a different, shorter program, so `retarget_scale` refuses it.
-- **Coverage.** Step coverage (`tinygrad_ax_backend.coverage_report`) goes
-  from 18 to **146** conditional Reshapes out of 170: the 18 fused bias
-  flattens plus 128 templated nodes. Totals go from 82 covered, 357
-  conditional and 665 refused to **82 / 485 / 537**. "Conditional" here
-  means covered if the node's calibrated zero point is nonzero.
-- **Not done:** nothing ran on the device. The 24 remaining Reshapes are the
-  large activation reshapes (27 to 441 MB inputs), and their builds are
-  queued.
+- **Coverage.** All 59 distinct shapes are templated, which is all 152
+  non-fused step Reshapes. `tinygrad_ax_backend.coverage_report` on the step
+  goes from 18 to **170 of 170** Reshapes conditional. The 18 are the fused
+  bias flattens. On current master (with the misc-op templates), totals go
+  from 120 covered, 410 conditional and 574 refused to **120 / 562 / 422**.
+  "Conditional" here means covered if the node's calibrated zero point is
+  nonzero.
+- **Zero-point retarget, tiled.** Asymmetric builds of three tiled shapes
+  (`[16,64,56,56]->[16,1,64,3136]`, `[1,512,4608]->[512,512,3,3]` and
+  `[16,1,64,3136]->[16,64,56,56]`, zero point 64) are reproduced from their
+  symmetric templates in both directions.
+- **Not done:** nothing ran on the device. A zero point of 0 needs a second
+  template per shape, built at a `[0, hi]` range. It applies to Reshapes
+  whose input is nonnegative (post-Relu), and no such template was built.
+  Every template's graph is `Reshape -> Relu`, the construct the earlier
+  Reshape notes used. It is not the node's fused in-step neighbourhood.
 
 ## Record-level facts
 

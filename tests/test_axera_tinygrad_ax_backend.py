@@ -315,7 +315,8 @@ def test_coverage_report_on_the_resnet18_step():
     # refused to conditional (fixtures/matmul_step_templates/manifest.json).
     live = len(axb.mre.step_manifest()["nodes"])
     rs = _step_reshape_templated()
-    assert report["per_op"]["Reshape"] == {"conditional": 18 + rs, "refused": 152 - rs}
+    want_rs = {"conditional": 18 + rs, "refused": 152 - rs}
+    assert report["per_op"]["Reshape"] == {k: v for k, v in want_rs.items() if v}
     assert report["totals"] == {
         "covered": 82 + _MISC_COVERED,
         "conditional": 324 + live + _MISC_CONDITIONAL + rs,
@@ -524,7 +525,8 @@ def test_coverage_report_weight_dtypes_on_the_resnet18_step():
     # refused to conditional (fixtures/matmul_step_templates/manifest.json).
     live = len(axb.mre.step_manifest()["nodes"])
     rs = _step_reshape_templated()
-    assert report["per_op"]["Reshape"] == {"conditional": 18 + rs, "refused": 152 - rs}
+    want_rs = {"conditional": 18 + rs, "refused": 152 - rs}
+    assert report["per_op"]["Reshape"] == {k: v for k, v in want_rs.items() if v}
     assert report["totals"] == {
         "covered": 82 + _MISC_COVERED,
         "conditional": 324 + live + _MISC_CONDITIONAL + rs,
