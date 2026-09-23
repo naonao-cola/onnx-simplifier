@@ -14,6 +14,7 @@ frames, then exported and run piece by piece on the phone's HTP through QNN.
 | `validate.py` | rank-5 path vs the upstream-literal path (6-D MSDA, SCA `nonzero()` rebatch), temporal, detections vs GT |
 | `export.py` | one piece -> ONNX (TorchScript exporter, opset 17) -> ORT CPU check -> onnxsim -> check; phone inputs + fp32 reference outputs |
 | `run_phone.sh`, `compare_out.py` | partition report + strict all-HTP run of a piece (`../../vision_models_probe/partition_report.sh`), outputs vs fp32 |
+| `e2e_phone.py` | whole model on the HTP frame after frame (phone outputs chained, HTP prev_bev carried) vs fp32 torch and GT |
 | `bisect_precision.py`, `bisect_run.sh` | expose chosen intermediates as outputs, run on the HTP, per-tensor cosine vs ORT CPU |
 
 Reproduce (each heavy step under `systemd-run --user --wait --collect --pipe -p MemoryMax=16G -p MemorySwapMax=0`):
@@ -64,7 +65,20 @@ Frame 1 of scene-0103 (has_prev = 1), median of 10, burst perf mode:
 | decoder (+head) | 0 | PASS | 25 | 1.00000 (cls and bbox) |
 
 Every piece of the real model runs entirely on the HTP (rank-5 MSDA; nothing refused).
-fp16 end to end is ~400 ms/frame (~2.5 FPS) before any int8 work.
+
+### End to end on real frames (`e2e_phone.py`, scene-0103 frames 0-5)
+
+The three pieces chained on the phone, each fed the previous piece's HTP output, with the HTP's
+own BEV carried to the next frame as prev_bev (rotated/shifted on the host):
+
+| | fp32 torch (CPU) | HTP fp16 |
+|---|---|---|
+| per-frame cos vs fp32 (feats / bev / cls / bbox) | - | 1.00000 / 0.99999 / >=0.99999 / 0.99999, no drift over 6 frames |
+| GT matched (same class, <2 m, score >= 0.3), 6 frames | 106 / 190 (273 dets) | 105 / 190 (274 dets) |
+| latency per frame | - | backbone6 126 + enc3 241 + decoder 25 = ~392 ms (2.5 FPS) |
+
+fp16 on the HTP is accuracy-neutral for BEVFormer-tiny. The encoder (60% of the time, 6
+GridSamples on 2500 queries) is the next target; int8 PTQ of the backbone the other.
 
 ### fp16 precision bisect (the "cos 0.986" of the plan's synthetic probe; 0.916 on the real model)
 
