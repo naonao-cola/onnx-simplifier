@@ -121,6 +121,48 @@
    "y": 0
   }
  },
+ "Neg:1x1": {
+  "file": "misc_op_neg/neg_L128.axmodel.gz",
+  "op": "Neg",
+  "program": "large",
+  "programs": {
+   "small": "Neg:1x1:small"
+  },
+  "scales": {
+   "x": 0.019999999552965164,
+   "y": 0.019999999552965164
+  },
+  "shape": [
+   1,
+   1
+  ],
+  "source": "t_step_leftovers/neg_L128",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
+ "Neg:1x1:small": {
+  "file": "misc_op_neg/neg_z128.axmodel.gz",
+  "op": "Neg",
+  "program": "small",
+  "programs": {
+   "large": "Neg:1x1"
+  },
+  "scales": {
+   "x": 0.009999999776482582,
+   "y": 0.009999999776482582
+  },
+  "shape": [
+   1,
+   1
+  ],
+  "source": "t_step_leftovers/neg_z128",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
  "ReduceMean:16x512x7x7:axes2,3:k1": {
   "file": "misc_op_step_templates/ReduceMean_16x512x7x7.axmodel.gz",
   "op": "ReduceMean",
@@ -596,6 +638,31 @@
   "zero_points": {
    "x": 127,
    "y": 130
+  }
+ },
+ "ReduceSum:16x64x112x112:axes0,2,3:k0": {
+  "axes": [
+   0,
+   2,
+   3
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x64x112x112_axes0-2-3_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.043196097016334534,
+   "y": 11.085447311401367
+  },
+  "shape": [
+   16,
+   64,
+   112,
+   112
+  ],
+  "source": "t_step_leftovers/rs_nchw",
+  "zero_points": {
+   "x": 132,
+   "y": 124
   }
  },
  "ReduceSum:1x1x64x3136:axes2:k0": {

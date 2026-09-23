@@ -1,0 +1,314 @@
+{
+ "neg_L000.axmodel.gz": {
+  "program": "large",
+  "scales": {
+   "x": 0.019999999552965164,
+   "y": 0.019999999552965164
+  },
+  "source": "t_step_leftovers/neg_L000",
+  "zero_points": {
+   "x": 0,
+   "y": 255
+  }
+ },
+ "neg_L060.axmodel.gz": {
+  "program": "large",
+  "scales": {
+   "x": 0.029999999329447746,
+   "y": 0.029999999329447746
+  },
+  "source": "t_step_leftovers/neg_L060",
+  "zero_points": {
+   "x": 60,
+   "y": 195
+  }
+ },
+ "neg_L128.axmodel.gz": {
+  "program": "large",
+  "scales": {
+   "x": 0.019999999552965164,
+   "y": 0.019999999552965164
+  },
+  "source": "t_step_leftovers/neg_L128",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
+ "neg_s140.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.014000000432133675,
+   "y": 0.014000000432133675
+  },
+  "source": "t_step_leftovers/neg_s140",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
+ "neg_s150.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.014999999664723873,
+   "y": 0.014999999664723873
+  },
+  "source": "t_step_leftovers/neg_s150",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
+ "neg_s160.axmodel.gz": {
+  "program": "large",
+  "scales": {
+   "x": 0.01600000075995922,
+   "y": 0.01600000075995922
+  },
+  "source": "t_step_leftovers/neg_s160",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
+ "neg_s170.axmodel.gz": {
+  "program": "large",
+  "scales": {
+   "x": 0.017000000923871994,
+   "y": 0.017000000923871994
+  },
+  "source": "t_step_leftovers/neg_s170",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
+ "neg_t1562.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.01561999972909689,
+   "y": 0.01561999972909689
+  },
+  "source": "t_step_leftovers/neg_t1562",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
+ "neg_t15625.axmodel.gz": {
+  "program": "large",
+  "scales": {
+   "x": 0.015625,
+   "y": 0.015625
+  },
+  "source": "t_step_leftovers/neg_t15625",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
+ "neg_t1562z255.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.01561999972909689,
+   "y": 0.01561999972909689
+  },
+  "source": "t_step_leftovers/neg_t1562z255",
+  "zero_points": {
+   "x": 255,
+   "y": 0
+  }
+ },
+ "neg_t1563.axmodel.gz": {
+  "program": "large",
+  "scales": {
+   "x": 0.015629999339580536,
+   "y": 0.015629999339580536
+  },
+  "source": "t_step_leftovers/neg_t1563",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
+ "neg_t1563z0.axmodel.gz": {
+  "program": "large",
+  "scales": {
+   "x": 0.015629999339580536,
+   "y": 0.015629999339580536
+  },
+  "source": "t_step_leftovers/neg_t1563z0",
+  "zero_points": {
+   "x": 0,
+   "y": 255
+  }
+ },
+ "neg_z000b.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.004699999932199717,
+   "y": 0.004699999932199717
+  },
+  "source": "t_step_leftovers/neg_z000b",
+  "zero_points": {
+   "x": 0,
+   "y": 255
+  }
+ },
+ "neg_z090.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.010999999940395355,
+   "y": 0.010999999940395355
+  },
+  "source": "t_step_leftovers/neg_z090",
+  "zero_points": {
+   "x": 90,
+   "y": 165
+  }
+ },
+ "neg_z100.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.009999999776482582,
+   "y": 0.009999999776482582
+  },
+  "source": "t_step_leftovers/neg_z100",
+  "zero_points": {
+   "x": 100,
+   "y": 155
+  }
+ },
+ "neg_z120.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.010000000707805157,
+   "y": 0.010000000707805157
+  },
+  "source": "t_step_leftovers/neg_z120",
+  "zero_points": {
+   "x": 120,
+   "y": 135
+  }
+ },
+ "neg_z127.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.009999999776482582,
+   "y": 0.009999999776482582
+  },
+  "source": "t_step_leftovers/neg_z127",
+  "zero_points": {
+   "x": 127,
+   "y": 128
+  }
+ },
+ "neg_z128.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.009999999776482582,
+   "y": 0.009999999776482582
+  },
+  "source": "t_step_leftovers/neg_z128",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
+ "neg_z129.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.009999999776482582,
+   "y": 0.009999999776482582
+  },
+  "source": "t_step_leftovers/neg_z129",
+  "zero_points": {
+   "x": 129,
+   "y": 126
+  }
+ },
+ "neg_z140.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.009999999776482582,
+   "y": 0.009999999776482582
+  },
+  "source": "t_step_leftovers/neg_z140",
+  "zero_points": {
+   "x": 140,
+   "y": 115
+  }
+ },
+ "neg_z200.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.012999999336898327,
+   "y": 0.012999999336898327
+  },
+  "source": "t_step_leftovers/neg_z200",
+  "zero_points": {
+   "x": 200,
+   "y": 55
+  }
+ },
+ "neg_z255b.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.0030999998562037945,
+   "y": 0.0030999998562037945
+  },
+  "source": "t_step_leftovers/neg_z255b",
+  "zero_points": {
+   "x": 255,
+   "y": 0
+  }
+ },
+ "step_neg.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.0090146753937006,
+   "y": 0.0090146753937006
+  },
+  "source": "t_step_misc/F_Neg_1x1",
+  "zero_points": {
+   "x": 42,
+   "y": 213
+  }
+ },
+ "step_neg__v2.axmodel.gz": {
+  "program": "large",
+  "scales": {
+   "x": 0.020656948909163475,
+   "y": 0.020656948909163475
+  },
+  "source": "t_step_misc/F_Neg_1x1__v2",
+  "zero_points": {
+   "x": 246,
+   "y": 9
+  }
+ },
+ "step_neg__v3.axmodel.gz": {
+  "program": "small",
+  "scales": {
+   "x": 0.00921606831252575,
+   "y": 0.00921606831252575
+  },
+  "source": "t_step_misc/F_Neg_1x1__v3",
+  "zero_points": {
+   "x": 0,
+   "y": 255
+  }
+ },
+ "step_neg__v4.axmodel.gz": {
+  "program": "large",
+  "scales": {
+   "x": 0.017684919759631157,
+   "y": 0.017684919759631157
+  },
+  "source": "t_step_misc/F_Neg_1x1__v4",
+  "zero_points": {
+   "x": 255,
+   "y": 0
+  }
+ }
+}

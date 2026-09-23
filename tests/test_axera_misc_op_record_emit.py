@@ -38,8 +38,10 @@ def test_own_calibration_is_identity(key):
     meta = INDEX[key]
     mc = _mcode(meta["file"])
     sc, zp, n = meta["scales"], meta["zero_points"], meta.get("reduce_count")
-    y = 1.5 if meta["op"] == "MaxPool" else 0.75  # MaxPool: one shared scale
-    shifted = {"x": sc["x"] * 1.5, "y": sc["y"] * y}
+    # MaxPool and Neg share one scale; Neg's shift stays inside its program
+    x = 1.1 if meta["op"] == "Neg" else 1.5
+    y = x if meta["op"] in ("MaxPool", "Neg") else 0.75
+    shifted = {"x": sc["x"] * x, "y": sc["y"] * y}
     moved = mre.retarget(mc, meta["op"], sc, shifted, zp, zp, n)
     assert mre.normalized_records(moved) != mre.normalized_records(mc)
     back = mre.retarget(moved, meta["op"], shifted, sc, zp, zp, n)
@@ -227,3 +229,107 @@ def test_step_node_keys(tmp_path):
     assert cov["ReduceSum"] == {"nodes": 1, "covered": 1, "missing": {}}
     assert cov["Sqrt"]["covered"] == 1
     assert cov["Greater"] == {"nodes": 1, "covered": 1, "missing": {}}
+
+
+with open(os.path.join(FIXTURES, "misc_op_neg", "sweep.json")) as _f:
+    NEG = json.load(_f)
+# a template must write every zero-point record (both zero points nonzero);
+# any build of the same program is a target
+NEG_PAIRS = [
+    (a, b)
+    for a, b in itertools.permutations(sorted(NEG), 2)
+    if NEG[a]["program"] == NEG[b]["program"]
+    and 0 not in NEG[a]["zero_points"].values()
+]
+
+
+def test_neg_program_is_picked_by_the_scale():
+    # 1/s_x >= 64 compiles the small program, below it the large one; zero
+    # points 0..255 occur on both sides
+    for meta in NEG.values():
+        assert mre.neg_program(meta["scales"]["x"]) == meta["program"]
+    zps = {
+        p: {m["zero_points"]["x"] for m in NEG.values() if m["program"] == p}
+        for p in ("small", "large")
+    }
+    assert {0, 255} <= zps["small"] and {0, 255} <= zps["large"]
+
+
+@pytest.mark.parametrize("src,dst", NEG_PAIRS)
+def test_neg_matches_every_build_of_its_program(src, dst):
+    # lanes 1/s_x and s_x; zero points on 0x1a90/0x1ad0/0x1b10, with writes of
+    # an unchanged value omitted (zp 0 and 255 targets drop records) and the
+    # segment re-padded
+    a, b = NEG[src], NEG[dst]
+    got = mre.retarget(
+        _mcode(f"misc_op_neg/{src}"),
+        "Neg",
+        a["scales"],
+        b["scales"],
+        a["zero_points"],
+        b["zero_points"],
+    )
+    assert mre.normalized_records(got) == mre.normalized_records(
+        _mcode(f"misc_op_neg/{dst}")
+    )
+
+
+def test_neg_emit_model_picks_the_program():
+    # the step's Neg: a cross-entropy input (<= 0) calibrates to zp_x = 255
+    for name, meta in NEG.items():
+        if meta["zero_points"]["x"] != 255:
+            continue
+        model = mre.emit_model("Neg:1x1", meta["scales"], meta["zero_points"])
+        got = bytes(mre.mcode_initializer(model).raw_data)
+        want = _mcode(f"misc_op_neg/{name}")
+        assert mre.normalized_records(got) == mre.normalized_records(want)
+
+
+@pytest.mark.parametrize(
+    "scales,zps",
+    [
+        ({"x": 0.02, "y": 0.02}, {"x": 100, "y": 100}),  # zp_y != 255 - zp_x
+        ({"x": 0.02, "y": 0.03}, {"x": 100, "y": 155}),  # s_y != s_x
+    ],
+)
+def test_neg_refuses_non_neg_calibrations(scales, zps):
+    with pytest.raises(ValueError):
+        mre.emit_model("Neg:1x1", scales, zps)
+
+
+def test_neg_program_boundary_is_one_sixty_fourth():
+    assert mre.neg_program(0.01562) == "small"
+    assert mre.neg_program(2.0**-6) == "large"
+    for meta in NEG.values():
+        s = meta["scales"]["x"]
+        assert (meta["program"] == "small") == (s < 2.0**-6)
+
+
+@pytest.mark.parametrize("key,alt", sorted(mre.REDUCESUM_EQUIVALENTS.items()))
+def test_reducesum_equivalent_reduces_the_same_bytes(key, alt):
+    # Pulsar2 can't tile the node as written (also not inside the step's own
+    # Reshape -> ReduceSum -> Reshape chain); the equivalent reduces the same
+    # contiguous elements into the same contiguous output
+    def parts(k):
+        _, shape, axes, _ = k.split(":")
+        dims = [int(d) for d in shape.split("x")]
+        red = [int(a) for a in axes[4:].split(",")]
+        kept = [d for i, d in enumerate(dims) if i not in red]
+        return dims, red, kept
+
+    import numpy as np
+
+    d0, r0, k0 = parts(key)
+    d1, r1, k1 = parts(alt)
+    x = np.arange(int(np.prod(d0)), dtype=np.int64) % 97
+    assert np.array_equal(
+        x.reshape(d0).sum(axis=tuple(r0)).ravel(),
+        x.reshape(d1).sum(axis=tuple(r1)).ravel(),
+    )
+    assert mre.equivalent_key(key) == alt
+    meta = INDEX[alt]
+    got = mre.emit_model(key, meta["scales"], meta["zero_points"])
+    want = _mcode(meta["file"])
+    assert mre.normalized_records(bytes(mre.mcode_initializer(got).raw_data)) == (
+        mre.normalized_records(want)
+    )

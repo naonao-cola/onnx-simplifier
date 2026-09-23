@@ -185,6 +185,26 @@
    "y": 93
   }
  },
+ "misc_op_step_templates/ReduceSum_16x64x112x112_axes0-2-3_k0.axmodel.gz": {
+  "scales": {
+   "x": 0.043196097016334534,
+   "y": 11.085447311401367
+  },
+  "zero_points": {
+   "x": 132,
+   "y": 124
+  }
+ },
+ "misc_op_step_templates/ReduceSum_16x64x112x112_axes0-2-3_k0__v2.axmodel.gz": {
+  "scales": {
+   "x": 0.13066451251506805,
+   "y": 28.984968185424805
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 121
+  }
+ },
  "misc_op_step_templates/Softmax_16x1000.axmodel.gz": {
   "op": "Softmax",
   "scales": {
