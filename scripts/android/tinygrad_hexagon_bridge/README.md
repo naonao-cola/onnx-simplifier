@@ -1798,6 +1798,123 @@ DSP call, which is where the per-class calls would stop paying a round trip each
 calls only for timing; `score_threshold`/`center_point_box=1`/multi-class inputs aren't supported,
 since this model never uses them.
 
+## Fused RPN post-processing: TopK -> decode -> NMS -> proposals in one DSP call
+
+The three kernels above each pay a FastRPC round trip of ~0.25-0.4 ms, which ate much of their
+standalone gain. `rpn_fused/` runs the whole RPN post-processing span as **one** DSP call: the
+per-level objectness scores and box deltas go in, the proposal list comes out, and every
+intermediate stays on the DSP. It includes `../proposal_decode/pd_kernel.h`,
+`../topk/topk_kernel.h` and `../nms/nms_kernel.h` unchanged; `rpn_fused/rpn_kernel.h` only adds
+the glue between them.
+
+### The real span, read out of the graph
+
+`capture_rpn_fused.py` walks `rest.onnx` and asserts every structural fact and constant instead of
+assuming it. The region is **604 non-Constant nodes**, from 10 inputs (per level: fp32 objectness
+`[1,A]` and fp32 per-anchor deltas `[1,A,4]`, today's backbone/rest boundary) to one output, tensor
+`2527`: the proposal list that feeds the box/mask heads. Per FPN level:
+
+1. TopK(objectness, k): k = 1000/1000/1000/1000/663. TopK runs *before* decode.
+2. Proposal decode of those k boxes (the 315-node region `../proposal_decode` replaces).
+3. A width/height "min-size" filter that nothing mentioned before: `w = (x2 - x1) + 1`,
+   `h = (y2 - y1) + 1`, Q/DQ'd onto their own **uint8** grid (P2-P5: the box grid's scale 5.0157;
+   P6: 5.0196), keep `!(w < 0) && !(h < 0)`, then NonZero + Gather on boxes and TopK values.
+4. NMS (iou 0.7, max 2000; the per-level 5 of the 85).
+5. `Gather(selected, 2) -> Slice[0:1000]`: the first <=1000 selections. It never binds here, since
+   each level has at most 1000 boxes.
+
+Then the 5 levels are concatenated (P2..P6), a second TopK takes the top min(1000, N) scores, and
+its indices gather the boxes. That TopK is the "post-NMS 1465 -> 1000" call in the TopK section;
+its values output is unused. The region **stops at the proposal list** because the next ops (FPN
+level assignment via sqrt/log/floor, per-level NonZero/Gather/ScatterElements around RoiAlign)
+have no DSP implementation yet. That is where the graph goes back to the CPU.
+
+Two facts make the glue simple and exact:
+- **Every box after decode sits on the single uint8 box grid** (scale 5.0157, zero point 0). The
+  graph's many later Q/DQs onto that same grid (after the Split, each Gather, the Concat) are
+  identities on grid values, so the kernel only moves boxes between decode and the output.
+- **The min-size filter can never drop a box in this model, for any input.** Its w/h grids are
+  uint8 with zero point 0, so a dequantized w/h is `q * s` with q >= 0, and `Less(., 0)` is always
+  false. On the DSP it cost ~87 us per level for nothing, so the kernel reads the boxes in place
+  when the zero point is 0; `rpn_exact_filter = 1` computes it exactly as the graph does. The host
+  check and qemu verify both paths.
+
+### Correctness: byte-exact at every level, on 5 images
+
+Five COCO images (000000000139, 632, 724, 785, 1000); each keeps 1262-1642 boxes after the per-level
+NMS, and every one ends in 1000 proposals.
+
+| check | result |
+|---|---|
+| host C (`rpn_host_check.c`): every intermediate (per-level TopK values+indices, decoded boxes, NMS selections, post-NMS TopK indices) and the proposals; both delta sources, both NMS kernels, decode's reference path, the computed filter | byte-exact on all 5 images x 6 variants |
+| qemu, Hexagon v73 (`rpn_qemu.c`, scalar build as for NMS: no qfloat in qemu 8.2) | byte-exact on all 5 images x 5 variants |
+| **phone CDSP** (`rpn_client.c`): proposals + per-level NMS kept counts, 11 configurations | **byte-exact on all 5 images x 11 configurations** |
+| ORT on the phone's CPU, the same 604 nodes (`ort_rpn_bench.c`) | matches the capture on all 5 images |
+
+### Speed on the phone
+
+Medians of 21 runs. "DSP" is `HAP_perf_get_time_us` around the whole span; "round trip" is the
+client-side time for the FastRPC call. ORT is `rpn_region.onnx` (the 604 nodes cut out of
+rest.onnx), one `Run`, stock onnxruntime-android on the phone's CPU. ORT's thread count makes no
+difference (1 thread vs default within 0.02 ms).
+
+| image | ORT CPU | fused, NCHW uint8 source: DSP / round trip | vs ORT | fused, fp32 deltas (today's boundary): DSP / round trip | vs ORT |
+|---|---:|---:|---:|---:|---:|
+| 139 | 6.72 ms | 1.48 / 1.98 ms | **3.40x** | 1.69 / 2.19 ms | **3.07x** |
+| 632 | 5.92 ms | 1.49 / 1.92 ms | **3.09x** | 1.61 / 2.08 ms | **2.84x** |
+| 724 | 6.98 ms | 2.01 / 2.49 ms | **2.80x** | 2.15 / 2.62 ms | **2.66x** |
+| 785 | 5.95 ms | 1.68 / 2.12 ms | **2.80x** | 1.83 / 2.27 ms | **2.62x** |
+| 1000 | 6.42 ms | 1.64 / 2.13 ms | **3.02x** | 1.72 / 2.19 ms | **2.93x** |
+
+Against the three standalone calls, all re-measured the same day on the same phone at each one's
+best configuration, image 139:
+
+| | DSP | round trip |
+|---|---:|---:|
+| TopK, 5 levels batched (one thread per level, P2's collect split 4 ways) | 0.37 ms | 0.78 ms |
+| + proposal decode, NCHW source, 6 threads | 0.40 ms | 0.65 ms |
+| + NMS per level, HVX, 5 threads | 0.88 ms | 1.16 ms |
+| **= sum of the three calls** | 1.65 ms | **2.59 ms** |
+| **fused, one call** (NCHW source) | **1.48 ms** | **1.98 ms (1.31x)** |
+
+The fused call also does work the three calls don't cover: the filter, the per-level cap, the
+concat, the post-NMS TopK and the final gather, ~0.1 ms of DSP time. With the fp32-delta source
+the sums are 1.76 / 2.76 ms against the fused 1.69 / 2.19 ms (1.26x).
+
+**Honest reading.** Most of the gain is the two round trips removed (~0.6 ms), plus a small DSP
+win from overlapping. The DSP work itself isn't faster than the three kernels at their best,
+because it is the same code. On today's boundary the whole span is **~2.2 ms end to end against
+~6.4 ms in ORT on the phone's CPU**.
+
+### Scheduling inside the call: what was measured
+
+The obvious layout, one QuRT thread per level running its whole chain, was the **slowest** of the
+multithreaded ones (median 1.97 ms DSP). P2's TopK collect over 163,200 scores ran 1.1-1.3 ms when the
+other four levels' decode and NMS were running alongside it, against 0.49 ms alone. Splitting it
+didn't help either, because the split parts couldn't get an HVX context while the level threads
+held them all. What worked was running the steps in phases, each with the layout its standalone
+kernel measured best:
+
+| layout (median over 5 images) | DSP | round trip |
+|---|---:|---:|
+| everything on one thread | 4.42 ms | 4.99 ms |
+| one thread per level, whole chain | 1.97 ms | 2.44 ms |
+| phased: A TopK (thread per level, P2 split 4) -> B decode split by box over 6 threads -> C NMS per level -> D merge | 1.64 ms | 2.11 ms |
+| phased, decode inside the per-level NMS phase | 1.64 ms | 2.12 ms |
+
+(NCHW source; the last two are within noise of each other, and each wins on some images.) Phase walls on image 139:
+A TopK ~0.36 ms, C decode + NMS ~1.0 ms (the slowest level's NMS, 0.5-0.65 ms, is most of it),
+D merge ~0.1 ms. Two smaller things mattered: the filter shortcut above, and decode (scalar) runs
+before its thread takes an HVX context, so the level threads don't hold every context while
+others still need one for NMS. The TURBO clock vote wasn't measured for the fused call; it changed
+nothing for any of the three standalone kernels.
+
+**Not done:** the next stretch, FPN level assignment and RoiAlign, is still on the CPU. RoiAlign
+has its own DSP kernel (`roialign_fast/`), but the level assignment and the
+NonZero/Gather/ScatterElements around it don't. Fusing those in, and taking the NCHW deltas
+straight from a DSP-resident backbone, would remove the next round trips. Only this span's
+per-level NMS is fused; the 80 per-class NMS calls come later, after the box head.
+
 ## Files
 
 - `capture_kernel.py` -- capture tinygrad's rendered Hexagon C for a shape, verified under qemu.
@@ -1911,3 +2028,11 @@ since this model never uses them.
   (`dump_real_nms_io.py`, `gen_nms_test_data.py`), adversarial tie/threshold stress sets
   (`gen_nms_stress_data.py`), and host and phone ORT baselines (`make_nms_single_node_models.py`,
   `ort_nms_bench.c`). See "NonMaxSuppression" above.
+- `rpn_fused/` -- the whole RPN post-processing span (per-level TopK -> decode -> w/h filter -> NMS
+  -> cap, then concat -> post-NMS TopK -> gather: the 604 `rest.onnx` nodes from the per-level
+  scores/deltas to the proposal list) as one FastRPC call, built from `proposal_decode/`, `topk/`
+  and `nms/`'s kernel headers unchanged. Byte-exact with ORT on host, qemu and the phone for 5 real
+  images; ~2.2 ms end to end against ~6.4 ms for ORT on the phone's CPU, and 1.31x faster than the
+  three standalone calls combined. `capture_rpn_fused.py` (span + real I/O), `rpn_kernel.h`,
+  `rpn_host_check.c`, `rpn_qemu.c`, `rpn_rpc.idl`/`rpn_impl.c`/`rpn_client.c`, `ort_rpn_bench.c`,
+  `build.sh`. See "Fused RPN post-processing" above.

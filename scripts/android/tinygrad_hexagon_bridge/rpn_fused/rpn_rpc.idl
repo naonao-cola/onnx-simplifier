@@ -1,0 +1,24 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+interface rpn_rpc : remote_handle64 {
+  /* Model constants, uploaded once and kept resident: model = raw rpn_model bytes (rpn_kernel.h);
+   * anchors = the 5 levels' [A,4] tables concatenated, P2 first. grid_mask bit l = level l's
+   * anchors verified as an exact base+stride grid (decode computes instead of gathering them). */
+  AEEResult set_model(in sequence<float> anchors, in sequence<octet> model, rout int32 grid_mask);
+  /* One inference of the whole RPN span, objectness + deltas in, proposal list out:
+   *   per level TopK -> decode -> w/h filter -> NMS -> first cap selections; concat; TopK; gather.
+   * scores: 5 levels concatenated. src 0: deltas = fp32 [A,4] per level, concatenated (today's
+   * boundary); src 1: nchw = the backbone's uint8 [12,H,W] conv outputs, concatenated.
+   * mode 0: levels one after another on the RPC thread; 1: one QuRT thread per level running its
+   * whole chain; 2: as 1, and P2's TopK collect split nsplit ways inside its thread;
+   * 3: phased -- A: TopK, thread per level + P2 split; B: decode split by box over 6 threads;
+   * C: filter + NMS, thread per level; D: merge (each step with its standalone skel's best layout);
+   * 4: phased, but decode runs per level inside phase C instead of its own split phase.
+   * nms 1: nms_hvx (qfloat + exact recheck), 0: nms_scalar.
+   * stats (RPN_STATS int32): kpost, total kept, per level {nf, ns, m}, per level phase us
+   * {topk, decode, filter, nms}, merge us, per level thread us, phase walls {A, B, C, D} us. */
+  AEEResult run(in sequence<float> scores, in sequence<float> deltas, in sequence<octet> nchw,
+                in int32 src, in int32 mode, in int32 nsplit, in int32 nms,
+                rout sequence<float> proposals, rout sequence<int32> stats, rout uint64 dsp_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};
