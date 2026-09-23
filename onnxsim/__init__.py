@@ -32,7 +32,9 @@ from onnxsim.bn_recovery import (
 from onnxsim.brecq import apply_brecq
 from onnxsim.bwa_ptq import apply_bwa_ptq
 from onnxsim.calibration import (
+    CalibrationStats,
     calibrate,
+    collect_calibration_stats,
     generate_random_calibration_data,
     load_huggingface_calibration_data,
     quantize_qoperator,
@@ -45,6 +47,11 @@ from onnxsim.calibration import (
     quantize_qoperator_where,
     quantize_static,
     quantize_static_int16,
+)
+from onnxsim.calibration_pick import (
+    CalibrationPick,
+    pick_calibration,
+    worst_output_sqnr,
 )
 from onnxsim.compile_training import TrainingLoop, compile_training_loop
 from onnxsim.coreml_export import export_coreml
@@ -847,6 +854,11 @@ __all__ = [
     "quantize_bf16",
     "quantize_fp8",
     "calibrate",
+    "CalibrationStats",
+    "collect_calibration_stats",
+    "CalibrationPick",
+    "pick_calibration",
+    "worst_output_sqnr",
     "generate_random_calibration_data",
     "load_huggingface_calibration_data",
     "estimate_quantization_precision",

@@ -112,9 +112,11 @@ class QuantizationConfig:
             schemes only; ignored if ``calibration_data`` is supplied).
     :param providers: onnxruntime execution providers to calibrate on
             (calibration-based schemes only).
-    :param calibration_method: ``"minmax"`` (default) or ``"entropy"``,
+    :param calibration_method: ``"minmax"`` (default), ``"entropy"``,
+            ``"mse"``, ``"percentile"`` or ``"auto"`` (a method per tensor),
             passed through to :func:`onnxsim.calibrate` (calibration-based
-            schemes only).
+            schemes only). To pick one method for a model by a task metric,
+            see :func:`onnxsim.pick_calibration`.
     :param keep_io_types: for ``scheme="float"`` only -- keep the model's
             external input/output types at float32 (inserting boundary
             ``Cast`` nodes) instead of redeclaring them in the target
