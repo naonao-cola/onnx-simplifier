@@ -44,6 +44,20 @@ So the phone hang's cause is outside the ISA: the untested difference is **HMX p
 the first probe voted HVX power and DCVS only, never `HAP_power_set_HMX` (`power_up = 1`), which
 MNN does before any HMX use. Round 2's first phone variant changes only that (`HMX_POWER=1`).
 
+### Round 2 on the phone (each variant followed by the known-good msda health check: all PASS)
+
+| variant | change | result |
+|---|---|---|
+| P0 | step 1 + `HAP_power_set_HMX` `power_up=1` (`HMX_POWER=1`) | power vote rc 0 from the unsigned PD; lock/unlock 0 |
+| **P1** | **round 1's exact hanging int8 sequence + the HMX power vote (only change)** | **completes**: 2048 B written, all 0 (same as the sim without a scale table). **Round 1's hang = HMX not powered.** |
+| P2 | + scale table (256 B of word `0x00004000`), store `:after:sat.uh = acc:2x1` | **0x0020 = 32 in every output** -- int8 HMX MAC correct |
+| P3 | fp16: `activation.hf`/`weight.hf` of 1.0, store `:after.hf`, no scale table | **0x5000 = 32.0 in every output** -- fp16 HMX works on V69 |
+
+Recipe that works from an unsigned FastRPC skel on V69: `HAP_power_set` HVX + **`HAP_power_set_HMX`
+(`power_up = 1`)** -> `HAP_compute_res` acquire with VTCM + `attr_set_hmx_param(1)` ->
+`HAP_compute_res_hmx_lock` on the thread that issues HMX -> tiles in VTCM -> (optional) `bias = mxmem`
+scale table -> `{activation.* = mxmem(a,Rt):deep; weight.* = mxmem(w,Rt)}` -> `mxmem(o,0):after... = acc`.
+
 ## Files
 
 `hmx_rpc.idl`, `hmx_impl.c` (skel: acquire, lock, one parameterized HMX sequence, release; return
