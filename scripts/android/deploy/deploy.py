@@ -104,6 +104,7 @@ def stamp_of(ctx: Ctx, stage: str) -> str:
             code.update((Path(spec.origin).parent / f).read_bytes())
     keys = {"stage": stage, "spec": {k: ctx.spec.get(k) for k in DEPENDS[stage]}, "device": ctx.device
             if stage in ("partition", "push", "bench", "accuracy") else "", "prev": prev_s,
+            "device_root": os.environ.get("DEPLOY_DEVICE_ROOT", "") if stage in ("partition", "push", "bench") else "",
             "code": code.hexdigest()}
     return hashlib.sha256(json.dumps(keys, sort_keys=True, default=str).encode()).hexdigest()
 
