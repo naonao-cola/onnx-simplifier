@@ -89,13 +89,91 @@ def golden(n: int) -> None:
         )
 
 
+SERIAL = os.environ.get("ANDROID_SERIAL", "239dbd8f")
+REMOTE = os.environ.get("NSS_REMOTE", "/data/local/tmp/codex-android-nss-gpu")
+LOCK = [str(Path.home() / ".cache/android-phone/phone-run")]
+QNN = HERE.parent.parent / "htp_exploration" / "qnn_shell"
+
+
+def _frames_for_phone(n: int, out: Path) -> None:
+    """golden/ inputs -> frameNNN.bin (colour, motion, depth float32 planar) + frameNNN.txt (scalars, LUT)."""
+    out.mkdir(parents=True, exist_ok=True)
+    for t in range(n):
+        z = np.load(GOLD / f"f{t:03d}.npz")
+        with open(out / f"frame{t:03d}.bin", "wb") as f:
+            for k in ("colour", "motion", "depth"):
+                f.write(np.ascontiguousarray(z[k][0], np.float32).tobytes())
+        lut = z["offset_lut"][0]
+        mh, mw = (int(v) for v in z["idx_modulo"].ravel()[:2])
+        s = [
+            *z["jitter"].ravel()[:2],
+            z["exposure"].ravel()[0],
+            *z["render_size"].ravel()[:2],
+        ]
+        s += [*z["depth_params"].ravel()[:4], z["reset"].ravel()[0]]
+        head = " ".join(repr(float(v)) for v in s) + f" {mh} {mw} {lut.shape[-1]}\n"
+        (out / f"frame{t:03d}.txt").write_text(
+            head + " ".join(repr(float(v)) for v in lut.reshape(-1)) + "\n"
+        )
+
+
+def phone(n: int, iters: int) -> None:
+    import subprocess
+
+    build = HERE / "build"
+    subprocess.run(
+        [str(HERE / "build_gpu.sh")], check=True, env={**os.environ, "OUT": str(build)}
+    )
+    stage = WORK / "phone_gpu"
+    _frames_for_phone(n, stage)
+    adb = ["adb", "-s", SERIAL]
+    env = {**os.environ, "PHONE_LOCK_OWNER": "codex/android-nss-gpu"}
+    files = [
+        build / "nss_run",
+        HERE / "nss_kernels.cl",
+        WORK / "onnx" / "cnn_int8_qat.onnx",
+    ]
+    files += sorted((QNN / "libs").glob("*.so")) + sorted(stage.glob("frame*"))
+    push = " && ".join(f"{' '.join(adb)} push -q {f} {REMOTE}/" for f in files)
+    run = (
+        f"cd {REMOTE} && LD_LIBRARY_PATH={REMOTE} ADSP_LIBRARY_PATH='{REMOTE};/vendor/dsp/cdsp;"
+        f"/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp' ./nss_run . cnn_int8_qat.onnx cnn_ctx.onnx {n} {iters}"
+    )
+    pull = " && ".join(
+        f"{' '.join(adb)} pull -q {REMOTE}/out{t:03d}.bin {stage}/" for t in range(n)
+    )
+    cmd = f'{" ".join(adb)} shell mkdir -p {REMOTE} && {push} && {" ".join(adb)} shell "{run}" && {pull}'
+    r = subprocess.run(
+        LOCK + ["bash", "-c", cmd], env=env, capture_output=True, text=True
+    )
+    print(r.stdout)
+    if r.returncode:
+        sys.exit(r.stderr[-3000:])
+    import nss_cl_check
+
+    for t in range(n):
+        z = np.load(GOLD / f"f{t:03d}.npz")
+        o = np.fromfile(stage / f"out{t:03d}.bin", np.uint8).reshape(1080, 1920, 4)[
+            ..., :3
+        ]
+        o = o.transpose(2, 0, 1).astype(np.float32) / 255
+        print(
+            f"f{t:03d} phone psnr vs GT {nss_cl_check._psnr(o, z['ground_truth'][0]):.2f} dB"
+            f" (golden {nss_cl_check._psnr(z['output'][0], z['ground_truth'][0]):.2f});"
+            f" vs golden output {nss_cl_check._psnr(o, z['output'][0]):.1f} dB (RGBA8)"
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["golden", "host-cl"])
+    ap.add_argument("cmd", choices=["golden", "host-cl", "phone"])
     ap.add_argument("--frames", type=int, default=8)
+    ap.add_argument("--iters", type=int, default=5)
     a = ap.parse_args()
     if a.cmd == "golden":
         golden(a.frames)
+    elif a.cmd == "phone":
+        phone(a.frames, a.iters)
     else:
         import nss_cl_check
 

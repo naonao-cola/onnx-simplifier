@@ -380,7 +380,7 @@ __kernel void postprocess(
     int ky = clampi((int)floor(((float)ly + 0.5f + 0.001f) * kpsy), 0, Hk - 1);
     int kx = clampi((int)floor(((float)lx + 0.5f + 0.001f) * kpsx), 0, Wk - 1);
     int ch = clampi((int)t5, 0, Kc - 1);
-    float raw = (float)kpn_u8[(ky * Wk + kx) * Kc + ch] * (1.0f / 255.0f);
+    float raw = (float)kpn_u8[(ky * Wk + kx) * Kc + ch] / 255.0f;
     float w = fmax(raw, EPS) * t2;
     for (int c = 0; c < 3; c++) {
       m1[c] = m1[c] + ct[c] * w;
@@ -406,10 +406,10 @@ __kernel void postprocess(
     int y0 = clampi((int)gy0, 0, Ht - 1), x0 = clampi((int)gx0, 0, Wt - 1);
     int y1 = clampi((int)gy1, 0, Ht - 1), x1 = clampi((int)gx1, 0, Wt - 1);
     for (int c = 0; c < 3; c++) {
-      float tl = (float)temporal_u8[(y0 * Wt + x0) * 4 + c] * (1.0f / 255.0f) * wy0 * wx0;
-      float tr = (float)temporal_u8[(y0 * Wt + x1) * 4 + c] * (1.0f / 255.0f) * wy0 * wx1;
-      float bl = (float)temporal_u8[(y1 * Wt + x0) * 4 + c] * (1.0f / 255.0f) * wy1 * wx0;
-      float br = (float)temporal_u8[(y1 * Wt + x1) * 4 + c] * (1.0f / 255.0f) * wy1 * wx1;
+      float tl = ((float)temporal_u8[(y0 * Wt + x0) * 4 + c] / 255.0f) * wy0 * wx0;
+      float tr = ((float)temporal_u8[(y0 * Wt + x1) * 4 + c] / 255.0f) * wy0 * wx1;
+      float bl = ((float)temporal_u8[(y1 * Wt + x0) * 4 + c] / 255.0f) * wy1 * wx0;
+      float br = ((float)temporal_u8[(y1 * Wt + x1) * 4 + c] / 255.0f) * wy1 * wx1;
       par[c] = tl + tr + bl + br;
     }
   }
@@ -462,4 +462,11 @@ __kernel void postprocess(
     out_rgba[p * 4 + c] = (uchar)rint(x * 255.0f);
   }
   out_rgba[p * 4 + 3] = 255;
+}
+
+// next frame's feedback_tm1 (float planar, 4 x Hp x Wp) from this frame's uint8 NHWC temporal output
+__kernel void temporal_to_feedback(__global const uchar* t, __global float* fb, int n) {
+  int i = get_global_id(0);
+  if (i >= n) return;
+  for (int c = 0; c < 4; c++) fb[c * n + i] = (float)t[i * 4 + c] / 255.0f;
 }
