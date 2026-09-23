@@ -23,7 +23,8 @@ Accuracy is measured against fp32 ORT on 10 COCO val2017 images x 4 prompts
 |---|---|---|---|---|---|---|---|
 | **EdgeSAM** (RepViT, fused) | 1024 | 21.0 | **81.3 ms** | 0.99971 / 0.995 | 10.9 ms | 44.9 ms | **92 ms** |
 | MobileSAM (TinyViT-5M) | 1024 | 26.6 | 319.8 ms | 0.99999 / 0.999 | 10.9 ms | 52.9 ms | 331 ms |
-| EfficientViT-SAM-L0 | 512 | 117.3 | 1503 ms | 0.99939 / 0.968 | 11.0 ms | 44.5 ms | 1514 ms |
+| **EfficientViT-SAM-L0** (bicubic neck as polyphase convs) | 512 | 117.3 | **41.8 ms** | 0.99939 / 0.968 | 11.0 ms | 44.5 ms | **53 ms** |
+| EfficientViT-SAM-L0, upstream bicubic `Resize` | 512 | 117.3 | 1503 ms | 0.99939 / 0.968 | 11.0 ms | 44.5 ms | 1514 ms |
 
 The decoder is the same SAM mask decoder for all three: **11 ms on the HTP in fp16** (mask IoU
 0.998-0.999 vs fp32), 45-53 ms on 4 CPU threads. So every extra click costs ~11 ms.
@@ -37,8 +38,9 @@ The decoder is the same SAM mask decoder for all three: **11 ms on the HTP in fp
 | EdgeSAM | W8A16, depthwise convs fp16 (`dw16`) | 40.9 ms | 0.972 | 0.964 / 0.639 | 2x, visible mask loss |
 | EdgeSAM | W8A16 (`a16`) | 20.5 ms | 0.944 | 0.947 / 0.508 | 4x, worse |
 | EdgeSAM | int8 (percentile) | 7.4 ms | 0.616 | 0.752 / 0.331 | unusable |
-| EfficientViT-SAM-L0 | fp16, bilinear neck upsample | 40.2 ms | 0.995 | 0.923 / 0.039 | 37x faster than bicubic, but not the trained model |
-| EfficientViT-SAM-L0 | W8A16 / int8 | 469 / 1364 ms | 0.35 / 0.24 | 0.18 / 0.22 | unusable (and still bicubic) |
+| EfficientViT-SAM-L0 | fp16, bicubic as exact polyphase convs | 41.8 ms | 0.9994 | 0.968 / - | **36x, exact (max abs 8e-7 vs upstream)** |
+| EfficientViT-SAM-L0 | fp16, bilinear neck upsample | 40.2 ms | 0.995 | 0.923 / 0.039 | superseded by polyphase (not the trained model) |
+| EfficientViT-SAM-L0 | W8A16 / int8 (polyphase upsample) | - | 0.37 / 0.24 (host) | 0.22 / 0.24 | unusable: the collapse is not the bicubic |
 | MobileSAM | fp16, sigmoid-GELU | 169.6 ms | 0.991 | 0.955 / 0.059 | 1.9x, some masks break |
 | MobileSAM | fp16, tanh-GELU (attribute) | 318.8 ms | 1.0000 | 0.999 / 0.989 | QNN ignores `approximate`: same speed |
 | MobileSAM | fp16, tanh-GELU as Mul/Tanh ops | 604.1 ms | 1.0000 | 0.999 / 0.992 | slower |
@@ -73,7 +75,12 @@ If 81 ms is too slow, the next lever is not int8 activations: EdgeSAM loses too 
     spelling tanh-GELU out as ops is 2x slower.
 - **EfficientViT-SAM-L0:**
   - The three bicubic `Resize` ops of its neck are **97% of the encoder** (each ~2.2 G cycles).
-    The HTP has no fast cubic resize.
+    The HTP has no fast cubic resize. One of them resizes 64x64 to 64x64, which is an identity.
+  - Fix, exact: an integer-factor bicubic upsample is a fixed linear map. It becomes an
+    edge pad, a (5,1) then a (1,5) depthwise conv producing the s x s output phases, then
+    DepthToSpace (CRD); the identity resize is dropped. That runs in **41.8 ms instead of 1503 ms**
+    at the same embedding (cos 0.99939). Max abs error vs PyTorch's bicubic is 7e-7
+    (`_upsample_polyphase` in `variants.py`).
   - Bilinear is 37x faster overall, but it's a different model than the trained one (mask IoU
     0.92, one prompt breaks).
   - It is also the only variant whose int8/W8A16 quantization collapses (cos 0.24-0.35).

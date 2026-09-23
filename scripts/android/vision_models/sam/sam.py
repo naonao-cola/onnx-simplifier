@@ -552,7 +552,7 @@ def main():
     ap.add_argument("--pieces", default="all", choices=["all", "enc", "dec"])
     ap.add_argument("--gelu", default="exact", choices=["exact", "tanh", "tanh_ops", "sigmoid"],
                     help="export: also write an approximate-GELU encoder (enc.fp16_<gelu>.onnx)")
-    ap.add_argument("--upsample", default="", choices=["", "bilinear"],
+    ap.add_argument("--upsample", default="", choices=["", "bilinear", "polyphase"],
                     help="export: also write an encoder with bilinear neck upsampling")
     ap.add_argument("--tags", default="", help="phone: only these quantized tags (comma list)")
     ap.add_argument("--calib", type=int, default=16)

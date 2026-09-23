@@ -22,6 +22,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -134,13 +135,62 @@ def set_gelu(module: nn.Module, mode: str) -> int:
     return n
 
 
+def _cubic_taps(s: int, A: float = -0.75):
+    """Per output phase p (0..s-1) of an integer-factor bicubic upsample (align_corners=False,
+    half_pixel: src = (dst + 0.5) / s - 0.5), the 5-tap kernel over input offsets -2..+2."""
+    def w(x):
+        x = abs(x)
+        if x <= 1:
+            return ((A + 2) * x - (A + 3)) * x * x + 1
+        if x < 2:
+            return ((A * x - 5 * A) * x + 8 * A) * x - 4 * A
+        return 0.0
+
+    import math
+    K = torch.zeros(s, 5)
+    for p in range(s):
+        src = (p + 0.5) / s - 0.5
+        f = math.floor(src)
+        t = src - f
+        for k in range(4):  # taps at f-1 .. f+2
+            K[p, f + k - 1 + 2] += w(t - (k - 1))
+    return K
+
+
+def _upsample_polyphase(self, x):
+    """EfficientViT UpSampleLayer's bicubic resize by an integer factor, exactly, as HTP-friendly
+    ops: edge pad 2, a (5,1) then (1,5) depthwise conv producing the s x s output phases, then
+    DepthToSpace (CRD). PyTorch clamps source indices at the border == edge padding. A resize to
+    the same size is the identity (t = 0: weights [0, 1, 0, 0])."""
+    import torch.nn.functional as F
+
+    H, W = (int(d) for d in x.shape[-2:])  # static under tracing: plain ints, not traced values
+    size = self.size if self.size is not None else [int(d * self.factor) for d in (H, W)]
+    if (H, W) == tuple(size):
+        return x
+    s = int(size[0]) // H
+    assert self.mode == "bicubic" and not self.align_corners
+    assert size[0] == s * H and size[1] == s * W, (size, x.shape)
+    C = int(x.shape[1])
+    K = _cubic_taps(s).numpy()  # numpy -> constant weights in the traced graph
+    kh = torch.from_numpy(np.tile(K, (C, 1)).reshape(C * s, 1, 5, 1).copy())
+    kw = torch.from_numpy(np.tile(K, (C * s, 1)).reshape(C * s * s, 1, 1, 5).copy())
+    xp = F.pad(x, (2, 2, 2, 2), mode="replicate")
+    y = F.conv2d(xp, kh, groups=C)  # (1, C*s, H, W+4): row phases
+    y = F.conv2d(y, kw, groups=C * s)  # (1, C*s*s, H, W): row x column phases
+    return F.pixel_shuffle(y, s)  # channel c*s*s + ph*s + pw -> (c, i*s+ph, j*s+pw)
+
+
 def set_upsample(module: nn.Module, mode: str) -> int:
     """Set the interpolation mode of every upsampling layer with a `mode` attribute (EfficientViT's
     UpSampleLayer: bicubic upstream)."""
     n = 0
     for m in module.modules():
-        if type(m).__name__ == "UpSampleLayer" and getattr(m, "mode", None) != mode:
-            m.mode = mode
+        if type(m).__name__ == "UpSampleLayer":
+            if mode == "polyphase":
+                m.forward = _upsample_polyphase.__get__(m)
+            elif getattr(m, "mode", None) != mode:
+                m.mode = mode
             n += 1
     return n
 
@@ -262,12 +312,14 @@ def edgesam():
 
 
 def efficientvit_sam_l0():
-    from efficientvit.models.nn import norm
+    from efficientvit.models.nn import norm, ops
     from efficientvit.sam_model_zoo import create_efficientvit_sam_model
     from segment_anything.modeling import common
 
     _patch(norm.LayerNorm2d, "forward", _layernorm2d_channels_last)
     _patch(common.LayerNorm2d, "forward", _layernorm2d_channels_last)
+    # bicubic neck upsample (97% of the encoder as a QNN Resize) as exact polyphase convs
+    _patch(ops.UpSampleLayer, "forward", _upsample_polyphase)
     ck = WEIGHTS / "efficientvit_sam_l0.pt"
     sam = create_efficientvit_sam_model("efficientvit-sam-l0", weight_url=str(ck)).eval()
     # 512x512 encoder input; prompts stay in the 1024 frame (its prompt encoder's input size)
