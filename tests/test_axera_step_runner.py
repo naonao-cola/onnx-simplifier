@@ -166,3 +166,55 @@ def test_one_segment_of_each_kind_matches_its_simulation_on_device():
     for st in stats:
         assert sr.segment_passed(vars(st)), st
 
+
+@needs_device
+def test_tinygrad_ax_device_runs_a_relu_and_a_matmul_chain():
+    tinygrad = pytest.importorskip("tinygrad")
+    import tinygrad_ax_backend as axb
+    from tinygrad.device import Buffer, Device
+
+    axb.register_ax_device()
+    dev = Device["AX"]
+    classes = axb.tinygrad_classes()
+    try:
+        # Relu: an AXCompiler request (template + ElementwiseScaleEdit)
+        s = 0.01
+        key = axb.TemplateKey("Relu", ((16, 512, 7, 7),), calibration_class="x0,y0")
+        src = axb.build_request(key, [axb.ElementwiseScaleEdit({"x": s, "y": s})])
+        prog = classes["AXProgram"](dev, classes["AXCompiler"]().compile(src))
+        x = np.random.default_rng(0).uniform(0, 2, (16, 512, 7, 7)).astype(np.float32)
+        xb = Buffer("AX", x.size, tinygrad.dtypes.float32, initial_value=x.tobytes())
+        yb = Buffer("AX", x.size, tinygrad.dtypes.float32).allocate()
+        prog(yb._buf, xb._buf, wait=True)
+        want = np.clip(np.rint(x / np.float32(s)), 0, 255) * np.float32(s)
+        assert np.abs(yb.numpy() - want.ravel()).max() <= s * 1.01
+
+        # a live-operand MatMul chain: the step's fc dX (matmul_record_emit)
+        if _HAVE_STEP:
+            model = sr.load_step()
+            calib = sr.axb.load_calibration(sr.STEP_CALIB)
+            segs, _ = sr.build_plan(
+                model, sr.load_records(), calib, kinds={"matmul_chain"}
+            )
+            seg = next(g for g in segs if g.name == "MatMul_36")
+            prog = classes["AXProgram"](dev, seg.emit().SerializeToString())
+            rng = np.random.default_rng(1)
+            ins = [
+                rng.uniform(-0.02, 0.02, sp.shape).astype(np.float32)
+                for sp in prog.model.inputs
+            ]
+            bufs = [
+                Buffer("AX", a.size, tinygrad.dtypes.float32, initial_value=a.tobytes())
+                for a in ins
+            ]
+            out = prog.model.outputs[0]
+            ob = Buffer(
+                "AX", int(np.prod(out.shape)), tinygrad.dtypes.float32
+            ).allocate()
+            prog(ob._buf, *[b._buf for b in bufs], wait=True)
+            env = dict(zip(seg.inputs, ins))
+            sim = sr.StepRunner(model, [seg])._sim(seg, env)[0]
+            lsb = np.abs(ob.numpy() - sim.ravel()).max() / seg.out_q[0][0]
+            assert lsb <= 2.01
+    finally:
+        axb.close_ax_session()
