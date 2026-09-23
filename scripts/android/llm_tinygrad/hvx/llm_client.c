@@ -12,7 +12,9 @@
 
 static long fsize(const char* p) { struct stat s; return stat(p, &s) ? -1 : (long)s.st_size; }
 static unsigned char* load(const char* p, long n) {
-  unsigned char* b = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, n);
+  /* +256: HVX unaligned vector loads (vmemu) touch the whole 128-byte lines they span, so a kernel reading the last
+     bytes of a buffer can fault on the next, unmapped page */
+  unsigned char* b = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, n + 256);
   FILE* f = fopen(p, "rb");
   if (!b || !f || fread(b, 1, n, f) != (size_t)n) { fprintf(stderr, "load %s failed\n", p); exit(1); }
   fclose(f);
@@ -29,28 +31,32 @@ int main(int argc, char** argv) {
   int vrc = -1;
   llm_rpc_perf_vote(h, turbo, &vrc);
   printf("perf_vote(turbo=%d) rc=%d\n", turbo, vrc);
-  struct { const char* op; int K, N, kerns[3]; const char* names[3]; } ops[] = {
-      {"up", 576, 1536, {0, 1, 4}, {"tinygrad-tc", "tinygrad-int32", "hand-vrmpy"}},
-      {"down", 1536, 576, {2, 3, 4}, {"tinygrad-tc", "tinygrad-int32", "hand-vrmpy"}},
+  /* kernels that read the prepacked layout Wp[N/32][K/4][32][4] (tinygrad-packed, hand-vrmpy) get wp, the others w */
+  struct { const char* op; int K, N, kerns[4], packed[4]; const char* names[4]; } ops[] = {
+      {"up", 576, 1536, {0, 1, 5, 4}, {0, 0, 1, 1}, {"tinygrad-tc", "tinygrad-int32", "tinygrad-packed", "hand-vrmpy"}},
+      {"down", 1536, 576, {2, 3, 6, 4}, {0, 0, 1, 1}, {"tinygrad-tc", "tinygrad-int32", "tinygrad-packed", "hand-vrmpy"}},
+      {"qo", 576, 576, {7, 4, -1, -1}, {1, 1, 0, 0}, {"tinygrad-packed", "hand-vrmpy", 0, 0}},
+      {"kv", 576, 192, {8, 4, -1, -1}, {1, 1, 0, 0}, {"tinygrad-packed", "hand-vrmpy", 0, 0}},
   };
   int bad = 0;
   printf("%-5s %-15s %10s %10s %9s  %s\n", "op", "kernel", "min_us", "med_us", "GB/s", "exact");
-  for (int o = 0; o < 2; o++) {
+  for (int o = 0; o < (int)(sizeof ops / sizeof ops[0]); o++) {
     char px[64], pw[64], pp[64], pr[64];
     snprintf(px, sizeof px, "%s_x.bin", ops[o].op); snprintf(pw, sizeof pw, "%s_w.bin", ops[o].op);
     snprintf(pp, sizeof pp, "%s_wp.bin", ops[o].op); snprintf(pr, sizeof pr, "%s_ref.bin", ops[o].op);
     long nx = fsize(px), nw = fsize(pw), nr = fsize(pr);
     unsigned char *x = load(px, nx), *w = load(pw, nw), *wp = load(pp, nw), *ref = load(pr, nr);
     unsigned char* out = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, nr);
-    for (int v = 0; v < 3; v++) {
+    for (int v = 0; v < 4 && ops[o].kerns[v] >= 0; v++) {
       memset(out, 0xa5, nr);
       uint64 mn = 0, md = 0;
-      int rc = llm_rpc_run(h, ops[o].kerns[v], reps, ops[o].K, ops[o].N, x, (int)nx, v == 2 ? wp : w, (int)nw, out,
+      int rc = llm_rpc_run(h, ops[o].kerns[v], reps, ops[o].K, ops[o].N, x, (int)nx, ops[o].packed[v] ? wp : w, (int)nw, out,
                            (int)nr, &mn, &md);
       int ok = rc == 0 && memcmp(out, ref, nr) == 0;
       bad += !ok;
       printf("%-5s %-15s %10llu %10llu %9.2f  %s%s\n", ops[o].op, ops[o].names[v], (unsigned long long)mn,
              (unsigned long long)md, md ? (double)nw / md / 1e3 : 0.0, ok ? "yes" : "NO", rc ? " (rc!=0)" : "");
+      if (rc) fprintf(stderr, "  rc=0x%x\n", rc);
     }
     rpcmem_free(x); rpcmem_free(w); rpcmem_free(wp); rpcmem_free(ref); rpcmem_free(out);
   }
