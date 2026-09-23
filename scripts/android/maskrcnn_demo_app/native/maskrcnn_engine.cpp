@@ -15,8 +15,9 @@
 //                    ORT's pool spinning, off by default here, see e2e_pipeline/README.md)
 //   par_load=1       create the HTP sessions in parallel threads (the DSP skels always open on
 //                    their own thread, overlapped with session creation)
-//   warmup=0         skip the warm-up inference at the end of init (default 1: one gray frame plus
-//                    every ortpad bucket, so the first camera frame is not the cold run)
+//   warmup=1         a warm-up inference at the end of init (one gray frame plus every ortpad
+//                    bucket). Off by default: it costs ~120 ms of init, more than the cold first
+//                    frame costs now, so the first results came later with it.
 // The image comes from an RGBA bitmap (quantized straight to the backbone's uint8 NHWC input) and
 // results/timings go back over JNI.
 #define E2E_STORE_STORAGE static thread_local
@@ -520,7 +521,7 @@ void init(const std::string& model_dir, const std::string& lib_dir, const std::s
   g_side.resize(g_steps.size());
   g_side_cur.assign(g_steps.size(), 0);
   const double t_sess = now_ms();
-  if (!g_opt.count("warmup") || g_opt["warmup"] != "0") warmup();
+  if (g_opt["warmup"] == "1") warmup();
   LOGI("init phases: env+ep %.1f, sessions+dsp %.1f, warmup %.1f ms (par_load %d)", t_ep - t_init, t_sess - t_ep,
        now_ms() - t_sess, (int)par_load);
   if (g_split) g_b = std::thread(stage_b_loop);

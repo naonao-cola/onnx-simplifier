@@ -1,49 +1,144 @@
 # Mask R-CNN live demo app (Android, Hexagon HTP + HVX)
 
-An Android app that runs the full Mask R-CNN (ONNX model zoo `MaskRCNN-12-qdq`) on the phone,
-frame by frame, with boxes, labels, instance masks and an FPS / latency counter. It runs exactly
-the pipeline `../e2e_pipeline/` measured (PR #1841): `native/maskrcnn_engine.cpp` `#include`s
-`../e2e_pipeline/e2e_run.cpp` unchanged and only swaps the image source and the output path.
+An Android app that runs the full Mask R-CNN (ONNX model zoo `MaskRCNN-12-qdq`) on the phone
+(Xiaomi 12S, Snapdragon 8+ Gen 1), frame by frame, from the camera or a set of test images, with
+boxes, labels, instance masks and an FPS / latency / per-stage counter. It runs the pipeline
+`../e2e_pipeline/` built and measured (PR #1841, plus the changes below): `native/maskrcnn_engine.cpp`
+`#include`s `../e2e_pipeline/e2e_run.cpp` and only swaps the image source and the output path.
 
 | region | engine |
 |---|---|
-| backbone (optimized per PR #1833), box head, mask head | HTP via ORT + QNN EP (`com.qualcomm.qti:qnn-runtime` 2.50.0, bundled) |
-| RPN post-processing (TopK, decode, NMS, merge) | HVX DSP, our FastRPC skel (`../tinygrad_hexagon_bridge/rpn_fused`) |
-| RoiAlign | HVX DSP, our FastRPC skel (`../tinygrad_hexagon_bridge/roialign_fast`) |
-| everything else | ORT CPU, 4 threads |
+| backbone (optimized per PR #1833), box head, mask head | HTP via ORT + QNN EP (`com.qualcomm.qti:qnn-runtime` 2.50.0, bundled), EP-context models with uint8 graph boundaries |
+| RPN post-processing (TopK, decode, NMS, merge) | HVX DSP, FastRPC skel `../tinygrad_hexagon_bridge/rpn_fused` |
+| RoiAlign + level merge, straight to the heads' uint8 input | HVX DSP, FastRPC skel `../tinygrad_hexagon_bridge/roialign_fast/roialign_u8_*` (PR #1848) |
+| image preprocessing (camera YUV or RGBA -> rotated, letterboxed uint8 NHWC) | native, one pass |
+| everything else (per-class NMS, box decode, ...) | ORT CPU, 4 threads |
 
-## Measured on the phone
+## Result
 
-Steady state, in the app (UI drawing and, in camera mode, the live camera running). "Latency" is one
-`nativeRun` call, from the RGBA bitmap to the four output tensors. FPS is how often a processed frame
-reaches the screen: latency plus JPEG decode or preview grab, scaling, and drawing.
+Defaults since this round: `pipe_e_u8ra_ctx.txt` + `quant=lut;merge=seg2,seg4;pipeline=box_head`.
+Steady state in the app, medians over 20-35 logged frames, with the UI drawing (and, in camera mode,
+the camera running). FPS is how often a processed frame reaches the screen; latency is capture to
+result. Startup is from process start to the first / tenth result on screen. ("Now" FPS rows were
+measured with warm-up on, which only affects startup; startup "now" is without it, the new default.)
 
-| mode | pipeline | FPS | latency per frame | startup (session setup) |
-|---|---|---:|---:|---:|
-| test images (6 COCO images, looped) | `pipe_e_opt.txt` (HTP graphs compiled at startup) | **5.5-6.2** | 127-171 ms (varies per image) | 6.5-7.8 s |
-| test images | `pipe_e_opt_ctx.txt` (HTP sessions from EP-context models) | 5.0-5.6 | 136-186 ms | **0.75 s** |
-| camera, 1440x1080 back camera | `pipe_e_opt.txt` | 4.5-5.8 | 150-190 ms | 6.5 s |
+| | FPS | latency | first result | 10th result |
+|---|---:|---:|---:|---:|
+| test images, #1843 as merged (JIT, no options) | 6.3 | 140 ms | 7.3 s | 8.8 s |
+| test images, #1843's best options (lut+merge+pipeline) | 10.1 | 175 ms | 6.5 s | 7.4 s |
+| **test images, now** | **13.6** | **118 ms** | **0.78 s** | **1.33 s** |
+| camera 1280x960, #1843's best options | 9.1 | 220 ms | 6.9 s | 7.9 s |
+| **camera, now** | **14.0-14.2** | **117-142 ms** | **0.97-1.0 s** | **1.60-1.64 s** |
 
-For comparison, the one-process `adb shell` driver (`../e2e_pipeline`, same pipeline, no UI, no
-camera) measured 130-158 ms per image JIT and 156-188 ms with EP-context models. The app matches it
-per image. Its FPS is lower than 1000/latency because frames aren't pipelined: decoding or grabbing
-the next frame waits for the previous inference.
+The same pipeline in the one-process `adb shell` driver (`../e2e_pipeline`, `ORT_SPIN=0`, no UI):
+78-88 ms per image, against 116-142 ms for #1841's `e_opt`, with 59/61 detections matched vs
+all-ONNX-Runtime (e_opt: 58/61) and mask IoU 0.887 (0.861).
 
-- **EP-context vs JIT:** the same tradeoff `../e2e_pipeline` found. EP-context models cut startup
-  from ~7 s to 0.75 s but slow the box head (by ~20 ms here). A demo that starts often should use
-  `pipe_e_opt_ctx.txt`; a long-running one should use `pipe_e_opt.txt`.
-- **Camera mode is slower** than test-image mode and drifts down over a few minutes (5.8 -> 4.6 FPS
-  within ~40 s here). The preview grab runs on the UI thread and the camera pipeline competes with
-  ORT's 4 CPU threads; thermal throttling is likely too. Not investigated further.
-- **Preprocessing:** the app quantizes the RGBA bitmap straight to the backbone's uint8 NHWC input
-  (same float math as the pipeline's `quant_in` step on `eval_common.canvas`), so no fp32 image is
-  ever built. That takes 2.5-15 ms depending on CPU contention, against ~15 ms for the e2e driver's
-  fp32 -> uint8 loop.
-- **Accuracy:** same pipeline and models as `../e2e_pipeline` (58/61 matched vs all-ONNX-Runtime on
-  its 6 images). Checked visually here: `cats.jpg` gives cat 0.99, cat 0.98, remote 0.82, and COCO
-  000000000724 gives stop sign 1.00 and truck 0.79. That matches the e2e run's 3 and 2 detections on
-  those images. The app resizes with Android's bilinear `createScaledBitmap` instead of PIL's, so
-  scores can differ slightly from the e2e numbers.
+## Optimizations, one lever at a time
+
+Each is an option, so the #1841 path stays available for A/B: `--es pipe pipe_e_opt.txt --es opts ""`.
+`./bench.sh "label|mode|pipe|opts|overlap" ...` runs configurations back to back and prints the
+table below. Images mode unless noted. All numbers are from the phone, measured when no other agent
+was using the DSP/HTP (it is shared; contended runs were discarded).
+
+| config | FPS | latency | pre | backbone | RoiAlign | heads | CPU | stage B |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1. #1843 as merged | 6.33 | 140 | 6.8 | 17.2 | 25.7 | 43.6 | 45.8 | - |
+| 2. + `quant=lut` + `merge=seg2,seg4` + `pipeline=box_head` | 10.10 | 175 | 2.2 | 30.9 | 27.0 | 48.8 | 35.0 | 68.2 |
+| 3. + ORT pool spinning off | 10.04 | 171 | 2.9 | 23.0 | 26.8 | 56.5 | 38.8 | 81.6 |
+| 4. + uint8 heads from EP-context models (`pipe_e_u8_ctx.txt`) | 9.96 | 170 | 2.4 | 19.9 | 26.1 | 37.8 | 48.1 | 69.4 |
+| 5. + uint8 RoiAlign skel (`pipe_e_u8ra_ctx.txt`), no pipelining | 9.20 | 87 | 2.4 | 17.1 | 12.0 | 34.7 | 17.8 | - |
+| **6. = 5 + `pipeline=box_head` (default)** | **13.56** | 118 | 2.8 | 20.3 | 13.3 | 36.6 | 24.2 | 57.9 |
+| camera: 2's options | 9.09 | 220 | 12.6 | 38.2 | 24.6 | 42.7 | 55.7 | 71.4 |
+| **camera: default** | **14.03** | 142 | 15.8 | 31.7 | 12.9 | 32.8 | 28.2 | 56.4 |
+
+(ms; "RoiAlign" includes the map staging, "heads" both HTP heads, "CPU" every ORT CPU segment and
+native pass. Pipelined rows run two frames at once, so stage times overlap and share the cores.)
+
+- **Frame pipelining (`pipeline=<step>`)** runs the steps before `<step>` (stage A) and the rest
+  (stage B) on two threads, so frame N+1's stage A overlaps frame N's stage B. Hand-off is one frame
+  deep; stage-A buffers alternate by frame parity so frame N+2 never overwrites what stage B reads.
+  Split points measured with the current pipe: `box_head` 13.6 FPS, `seg3` 9.0, `mask_ra` 7.8, none
+  9.2. Overlapping only the image capture/decode with inference (`--ez overlap true`) did not help:
+  the extra decode thread slowed preprocessing (12 -> 21 ms) through CPU contention.
+- **LUT quantize (`quant=lut`)**: a per-channel 256-entry table for the image quantize, exact.
+- **Native merge (`merge=seg2,seg4`)**: a 4-thread row scatter instead of the ScatterND chains. The
+  uint8 RoiAlign skel now writes merged rows itself, so this only matters for the older pipes.
+- **Camera YUV fast path:** `quant_yuv` does YUV_420_888 -> RGB (BT.601 full range, fixed point),
+  the rotation, the letterbox scale and the quantize in one native pass straight from the camera
+  planes, and also writes the displayed RGBA frame. No Java bitmap conversion. Still ~15 ms: the
+  camera planes are slow to read column-wise for the 90-degree rotation, and copying them to cached
+  memory first did not help.
+- **ORT pool spinning off** (`env.ORT_SPIN=1` restores it): ORT's global intra-op threads spin after
+  every op and hold the big cores, which starved every threaded native pass between ORT segments
+  (several times slower and noisy). In the adb driver it is worth 15 ms per frame; in the app the
+  effect shows in the steadier pre / quant times rather than in FPS.
+- **ORT threads:** 3 or 4 is best (6: 9.6 FPS vs 10.5 with the #1843 options).
+- **uint8 heads from EP-context models:** see "Startup" below; per frame it takes the heads from
+  48.8 to 37.8 ms.
+- **uint8 RoiAlign (PR #1848, by the RoiAlign work):** one DSP call per head reads the backbone's
+  uint8 maps and writes the head's uint8 input rows. It replaces the maps' dequantize, 4 RoiAlign
+  calls, the merge and the quantize, 65.6 ms of the old span on image 139, with 6.5 (box) + 2.6 (mask)
+  ms plus 1.9 ms staging the maps into rpcmem once per frame.
+- **Not done here:** CPU segment threading beyond ORT's pool. The largest CPU piece left is `seg3`
+  (per-class NMS, box decode: ~13 ms), which PR #1825 found slower on the DSP.
+
+### DSP calls are serialized
+
+Every skel call (RPN, RoiAlign, uint8 RoiAlign) takes one process-wide mutex (`exec_step`). With
+pipelining, stage A (RPN, box RoiAlign) and stage B (mask RoiAlign) would otherwise call the DSP at
+the same time. The same skel called from two threads at once failed with `rc=78`: the skels keep
+per-handle scratch state and aren't reentrant. The uint8 RoiAlign kernel also assumes it never runs
+next to the RPN kernel, since both size their HVX threads for a DSP of their own. The calls are short
+(2-7 ms), so the lock costs little.
+
+## Startup
+
+Before: the HTP graphs were compiled at every launch (6.2-7.4 s). EP-context models (precompiled
+QNN context binaries) loaded in 0.75 s but made the box head ~20 ms slower per frame, so they weren't
+the default. Root cause (details in `../e2e_pipeline/README.md`): not the compile options, but the
+heads' **fp32 graph boundaries**. The box head's 50 MB fp32 input is reshaped and quantized inside
+the HTP graph, and the mask head ends in dequantize + sigmoid to fp32; a deserialized graph is much
+slower at both. QNN's profiler puts the extra time inside the accelerator. With uint8 inputs (the
+CPU quantizes, or now the RoiAlign skel writes uint8) and uint8 mask logits (a `mask_sel` step
+dequantizes and sigmoids only the detection's class channel), the box head runs 25.3 ms from
+EP-context vs 24.6 JIT (was 48.3 vs 27.9).
+
+| images mode, pipelined | init | first result | 10th result | per-frame heads |
+|---|---:|---:|---:|---:|
+| JIT (`pipe_e_opt.txt`) | 6.2-7.4 s | 6.5-7.6 s | 7.4-8.8 s | 48.8 ms |
+| old EP-context (`pipe_e_opt_ctx.txt`, embedded) | 0.69 s | 0.96 s | 2.01 s | 88.4 ms |
+| **new EP-context, uint8 heads, embed mode 0 (default)** | **0.60-0.61 s** | **0.77-0.78 s** | **1.32-1.33 s** | 37.8-41.3 ms |
+| + warm-up (`warmup=1`) | 0.69-0.71 s | 0.84-0.86 s | 1.40-1.41 s | |
+| + parallel HTP session creation (`par_load=1`, with warm-up) | 0.67-0.68 s | 0.82-0.83 s | 1.38-1.40 s | |
+
+(two launches each for the last three rows; the first row's heads are with #1843's options.) In the
+adb driver, embed mode 0 (`ctx=2`: the context binary in its own file) creates the sessions in
+0.66 s vs 1.0 s embedded.
+
+- **DSP skels open on their own thread** while the ORT sessions are created. Not before the first
+  HTP session exists, though: opening our FastRPC sessions while QNN sets up its HTP device made that
+  setup fail ("Failed to create device ... INVALID_CONFIG"), and the session silently fell back to
+  the (disabled) CPU EP.
+- **The camera opens while the models load** (camera mode), instead of after.
+- **Warm-up doesn't pay** any more: one gray frame plus every `ortpad` bucket costs ~120 ms of init,
+  more than the first cold frame now costs, so results appeared ~80 ms later with it. Kept as
+  `warmup=1`, off by default.
+- **Parallel session creation (`par_load=1`)** saves ~30 ms of session setup (QNN seems to
+  serialize most of the context loading), inside launch-to-launch noise. Off by default.
+- **First launch on a new phone:** the EP-context files come from compiling on the device. `deploy.sh`
+  copies them if `../e2e_pipeline` already made them; otherwise the app compiles them at first
+  launch (the JIT cost, once; `NO_CTX=1 ./deploy.sh` to try) and reuses them after.
+- Models stay in internal storage (see below).
+
+## Orientation
+
+The camera frame is rotated by `(sensorOrientation - displayRotation + 360) % 360` in the native
+YUV pass, so the network always sees an upright image; boxes and masks come back in that upright
+frame and are drawn over it. The live thumbnail gets the matching `setTransform`. The activity uses
+`fullUser`, which follows the rotation lock (`fullSensor` ignores it). Images mode applies the JPEG's
+EXIF orientation. Checked on the phone at all four `user_rotation` values with auto-rotate off
+(settings restored afterwards).
 
 ## Does this work from an app, not just an adb shell? Yes.
 
@@ -72,25 +167,31 @@ One app-context gotcha: files `adb` creates under `/sdcard/Android/data/<pkg>` a
 shell user, so the app can't enter them (`chdir ... models` failed). `deploy.sh` instead copies the
 models into the app's **internal** files dir with `run-as` (the APK is debuggable).
 
+
 ## Build and run
 
 ```bash
-# 1. models: ../e2e_pipeline/README.md "Reproduce" (build_models.py). If ../e2e_pipeline/build.sh
-#    already ran on this phone, deploy.sh copies them on-device from /data/local/tmp/e2e.
+# 1. models: ../e2e_pipeline/README.md "Reproduce" (build_models.py, then u8_heads.py). If
+#    ../e2e_pipeline/build.sh already ran on this phone, deploy.sh copies them on-device from
+#    /data/local/tmp/e2e (with any EP-context files compiled there).
 # 2. build (heavy step; cap it on a shared machine)
 systemd-run --user --wait --collect --pipe -p MemoryMax=12G -p MemorySwapMax=0 \
   -E HEXAGON_SDK_ROOT=... -E HEXAGON_TOOLCHAIN=... -E ANDROID_HOME=~/android-sdk ./build_app.sh
 # 3. install + models + test images
 IMGS="cats.jpg img_000000000139.jpg ..." ./deploy.sh        # or MODELS=<build_models.py --out dir>
-# 4. run: camera mode (default) or a loop over the test images
+# 4. run: camera mode (default) or a loop over the test images; --es pipe / --es opts for A/B
 adb shell am start -n org.onnxsim.maskrcnndemo/.MainActivity --es mode images
-adb shell am start -n org.onnxsim.maskrcnndemo/.MainActivity --es pipe pipe_e_opt_ctx.txt
+adb shell am start -n org.onnxsim.maskrcnndemo/.MainActivity --es pipe pipe_e_opt.txt --es opts ""
 ```
+
+Options (`--es opts "k=v;..."`, see `native/maskrcnn_engine.cpp`): `quant=lut`, `merge=a,b`,
+`pipeline=<step>`, `par_load=1`, `warmup=1`, `env.NAME=value` (`ORT_THREADS`, `ORT_SPIN`, ...).
+Images mode logs a per-image output checksum (`check img ...`) to A/B options for equality.
 
 Toolchain used: Android SDK platform 34 + build-tools 34, NDK 27.2, AGP 8.5.2, Gradle 8.7 (offline),
 JDK 21. No CameraX: the app uses the framework Camera2 API, so it needs no extra Maven dependencies.
 
-## Two bugs found building it
+## Bugs found building it
 
 - **Wrong labels:** the first version used torchvision's 91-id COCO list, and the cats came out as
   "bird". This model (maskrcnn-benchmark lineage) uses **81 contiguous classes** (cat = 16,
@@ -98,15 +199,19 @@ JDK 21. No CameraX: the app uses the framework Camera2 API, so it needs no extra
 - **Every box had the last detection's mask:** the overlay reused one mutable 28x28 bitmap for all
   detections. A hardware-accelerated canvas records draw calls and uploads bitmap contents only at
   render time, so all masks came out as the last one drawn. It now creates one bitmap per detection.
+- **Images shown rotated 90 degrees:** the frame rotation ignored the display rotation; see
+  "Orientation".
+- **Camera-mode crash (SIGSEGV in libQnnHtp's memcpy) when no RoI survived:** `ortpad` sized its pad
+  buffer from `count / n`, which is 0 rows' worth for n = 0, while the HTP still copies a full bucket
+  from it. Only an empty camera scene hits it (the test images always have detections). Fixed in
+  `e2e_run.cpp`.
 
 ## Known limits
 
-- **No frame pipelining:** capture, inference and drawing run one after the other. Overlapping the
-  next frame's capture and preprocessing with the current inference would bring FPS closer to
-  1000/latency.
 - **The displayed image is the processed frame**, not the live preview. That keeps boxes aligned
   with what was inferred; a small live camera thumbnail sits in the corner.
 - **The APK doesn't bundle the models** (about 100 MB); `deploy.sh` copies them in with `run-as`, so
   this needs a debuggable build. A release build would download them into internal storage.
 - **Fixed 800x1088 input**, like the rest of this pipeline: frames are scaled to fit, top-left
   aligned.
+- **Camera preprocessing is ~15 ms** (vs ~2.5 ms from a bitmap), see above.
