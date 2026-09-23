@@ -2241,6 +2241,46 @@ TopK, RoiAlign, proposal decode (fundamentally dynamic-shape/control-flow ops, a
 engineering problem than every static-shape kernel in this project, deliberately out of scope
 here).
 
+## Continuous integration (no phone)
+
+`.github/workflows/hexagon-tinygrad.yml` runs `tests/test_hexagon_tinygrad.py` on a hosted
+ubuntu-24.04 runner. It replaced the TVM v0.17.0 + hexagon-sim job for `../hexagon_qfloat.py`,
+which is no longer CI-tested (see `../README.md`). Tools: upstream clang-19 + lld-19 and
+`qemu-user-static` 8.2 from apt, the Hexagon open-access toolchain 19.0.02 (cached, for
+`hexagon-sim`), and the onnxsim/tinygrad fork at a pinned commit (`TINYGRAD_SHA` in the workflow).
+Upstream clang is needed because tinygrad's `MOCKDSP` and several qemu harnesses target
+`hexagonv65`, which the toolchain's own hexagon-clang 19 no longer accepts. Every test skips when
+its tools are missing; the workflow fails on any skip except the reserved qfloat slot.
+
+- **tinygrad codegen** (`ci/codegen_check.py`, run in a subprocess so `DEV`/`MOCKDSP`/`HEXSIM`
+  never leak): add, a 3x3/s2 maxpool on packed NCHWc, and a Q31 requantize, written as plain
+  `Tensor` code and run under qemu-hexagon, must be byte-exact with NumPy. The rendered C must use
+  HVX vector types: 128 bytes or more for add and requantize, 32 for maxpool (its full-width
+  version needs a stride-2 deinterleave the codegen doesn't build yet). A float-`max` chain must
+  render linearly: before tinygrad fccd84cfa the source doubled per op. Under `hexagon-sim
+  --timing`, the vectorized add must take at least 8x fewer cycles than `NOOPT=1` scalar code
+  (about 50x measured).
+- **Hand-written kernels**, on synthetic data only (CI downloads no model):
+  - `nms/`: host and qemu checks on `gen_nms_stress_data.py` sets, with an ORT reference.
+  - `topk/`: the host check's built-in stress mode, plus qemu on the real calls' shapes with a NumPy
+    reference in ORT's tie order. qemu needs `ci/hexagon_divrt.c` for integer divide.
+    `vec-reduce_or-mask` is excluded, since it is the documented qemu-fault reproducer.
+  - `roialign_fast/`: host and qemu checks against an ORT opset-12 RoiAlign model built with
+    `onnx.parser`.
+  - `proposal_decode/`: `ci/pd_selfcheck.c` requires both delta sources, the reference path, both
+    fast paths and the off-grid fallback to agree bit for bit. It then writes `pd_qemu.c`'s inputs,
+    with the host reference output as the expected result.
+  - `rpn_fused/`: build-only. Its checks need ORT captures of the real `rest.onnx` span.
+- **qfloat**: `test_codegen_qfloat_float_ops` is a reserved, skipped slot for the tinygrad qfloat
+  lowering's tests.
+
+Locally (about 40 s, peak under 600 MB):
+
+```bash
+TINYGRAD_PATH=/path/to/onnxsim-tinygrad HEXAGON_TOOLS=/path/to/Tools HEXAGON_CLANG=clang-19 \
+  pytest -v tests/test_hexagon_tinygrad.py
+```
+
 ## Files
 
 - `capture_kernel.py` -- capture tinygrad's rendered Hexagon C for a shape, verified under qemu.
@@ -2393,3 +2433,7 @@ here).
   three standalone calls combined. `capture_rpn_fused.py` (span + real I/O), `rpn_kernel.h`,
   `rpn_host_check.c`, `rpn_qemu.c`, `rpn_rpc.idl`/`rpn_impl.c`/`rpn_client.c`, `ort_rpn_bench.c`,
   `build.sh`. See "Fused RPN post-processing" above.
+- `ci/` -- phone-free CI helpers for `tests/test_hexagon_tinygrad.py`: `codegen_check.py` (tinygrad
+  HVX codegen checks under qemu / hexagon-sim), `pd_selfcheck.c` (synthetic proposal-decode
+  self-consistency + qemu inputs), `hexagon_divrt.c` (integer divide helpers for freestanding
+  qemu builds). See "Continuous integration" above.

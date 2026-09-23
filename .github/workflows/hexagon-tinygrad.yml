@@ -1,0 +1,115 @@
+name: Hexagon tinygrad stack (qemu-hexagon + hexagon-sim)
+
+# Tests the TVM-free Hexagon deploy pipeline (scripts/android/tinygrad_hexagon_bridge/) without a phone.
+# Everything is in tests/test_hexagon_tinygrad.py:
+#
+#   1. tinygrad's own HVX codegen (the onnxsim/tinygrad fork, pinned below): add, maxpool and requantize written
+#      as plain Tensor code run under qemu-hexagon (MOCKDSP=1) and must match NumPy byte for byte and use HVX
+#      vector types; a guard against the float-max source blow-up fixed in fccd84cfa; and a hexagon-sim
+#      --timing cycle ratio (vectorized vs NOOPT=1 scalar).
+#   2. The hand-written HVX kernels (NMS, TopK, proposal decode, RoiAlign, and the fused RPN build): host-C
+#      checks and freestanding qemu-hexagon builds, on synthetic data with ONNX Runtime as the reference.
+#      No model is downloaded.
+#
+# Replaces the TVM v0.17.0 + hexagon-sim job for scripts/android/hexagon_qfloat.py, which is kept in the tree
+# but no longer CI-tested (see scripts/android/README.md). Upstream clang-19 is needed besides the Qualcomm
+# toolchain: tinygrad's MOCKDSP and several qemu harnesses target hexagonv65, which the toolchain's own
+# hexagon-clang 19 no longer accepts.
+
+on:
+  pull_request:
+    paths:
+      - "scripts/android/tinygrad_hexagon_bridge/**"
+      - "tests/test_hexagon_tinygrad.py"
+      - ".github/workflows/hexagon-tinygrad.yml"
+  push:
+    branches: [master]
+    paths:
+      - "scripts/android/tinygrad_hexagon_bridge/**"
+      - "tests/test_hexagon_tinygrad.py"
+      - ".github/workflows/hexagon-tinygrad.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hexagon-tinygrad-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # onnxsim/tinygrad branch hvx-codegen: the DSP renderer's HVX codegen + the float-MAX __auto_type fix
+  TINYGRAD_REPO: https://github.com/onnxsim/tinygrad.git
+  TINYGRAD_SHA: fccd84cfaf2e0fde4f613df7812f0303cb743e11
+  HEXAGON_TOOLCHAIN_VERSION: "19.0.02"
+  HEXAGON_TOOLCHAIN_URL: https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/Debian/19.0.02/Hexagon_open_access.Core.19.0.02.Linux-Any.tar.gz
+
+jobs:
+  hexagon-tinygrad:
+    name: tinygrad HVX codegen + HVX kernels (qemu / hexagon-sim)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install clang-19, lld, qemu-hexagon
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-19 lld-19 qemu-user-static libncurses6
+          echo "/usr/lib/llvm-19/bin" >> "$GITHUB_PATH"
+          qemu-hexagon-static -version
+          echo 'int main(void){return 0;}' | /usr/lib/llvm-19/bin/clang --target=hexagon -mcpu=hexagonv65 \
+            -mhvx=v65 -mhvx-length=128b -x c -c -o /dev/null -
+          python -m pip install numpy pytest onnx onnxruntime
+
+      - name: Fetch tinygrad (onnxsim fork, pinned)
+        run: |
+          git init -q ~/tinygrad && cd ~/tinygrad
+          git fetch -q --depth 1 "$TINYGRAD_REPO" "$TINYGRAD_SHA"
+          git checkout -q FETCH_HEAD
+          echo "TINYGRAD_PATH=$HOME/tinygrad" >> "$GITHUB_ENV"
+
+      # restore + save are separate steps so the ~1.1 GB download is kept even if the tests fail; a plain
+      # actions/cache only saves when the whole job succeeds. Same key as the old TVM job's cache.
+      - name: Restore Hexagon toolchain
+        id: toolchain-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/hexagon-toolchain
+          key: hexagon-open-access-${{ env.HEXAGON_TOOLCHAIN_VERSION }}-v1
+
+      - name: Download Hexagon open-access toolchain
+        id: toolchain-download
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/hexagon-toolchain && cd ~/hexagon-toolchain
+          curl -fsSL "$HEXAGON_TOOLCHAIN_URL" -o toolchain.tar.gz
+          tar xzf toolchain.tar.gz
+          rm toolchain.tar.gz
+
+      - name: Save Hexagon toolchain
+        if: always() && steps.toolchain-download.conclusion == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/hexagon-toolchain
+          key: ${{ steps.toolchain-cache.outputs.cache-primary-key }}
+
+      - name: Locate toolchain and verify tools
+        run: |
+          TOOLS=$(dirname "$(dirname "$(find ~/hexagon-toolchain -path '*/bin/hexagon-sim' | head -1)")")
+          echo "HEXAGON_TOOLS=$TOOLS" >> "$GITHUB_ENV"
+          ls "$TOOLS/bin" | grep -E '^hexagon-(clang|sim)$'
+
+      - name: Test
+        env:
+          HEXAGON_CLANG: clang-19
+        run: |
+          pytest -v -rs --durations=0 tests/test_hexagon_tinygrad.py | tee pytest.log
+          # every tool is installed here, so the only allowed skip is the reserved qfloat slot
+          if grep '^SKIPPED' pytest.log | grep -v 'reserved:'; then
+            echo "::error::unexpected skips (a tool was not found)"; exit 1
+          fi
