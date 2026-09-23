@@ -15,7 +15,6 @@ host-side state in `InstanceBank`, exactly as upstream's `instance_bank.py` for 
 """
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn

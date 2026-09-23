@@ -24,11 +24,21 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn
-
-from model import (CAMS, EMBED, GROUPS, LEVELS, NUM_ANCHOR, NUM_TEMP, OPS, PTS, Runner, Sparse4D, W, H, L,
-                   COS_YAW, SIN_YAW, X, Y, Z, dfa_rank4)
 from data import MEAN, STD
+from model import (
+    CAMS,
+    EMBED,
+    GROUPS,
+    LEVELS,
+    NUM_ANCHOR,
+    NUM_TEMP,
+    OPS,
+    PTS,
+    Runner,
+    Sparse4D,
+    dfa_rank4,
+)
+from torch import nn
 
 
 def folded_conv1(conv):
@@ -178,6 +188,7 @@ def export_frame(m, work, recs):
         r = [float(np.abs(a.numpy() - b).max()) for a, b in zip(tout[:3], rec["ref"])]
         print(f"{name}: ORT vs torch max abs {['%.1e' % x for x in d]}; graph vs Runner {['%.1e' % x for x in r]}")
         import onnx
+
         from onnxsim import simplify
 
         sm, ok = simplify(onnx.load(str(path)))
