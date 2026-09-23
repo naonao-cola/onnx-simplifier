@@ -2,7 +2,8 @@
 
 Device layout: /data/local/tmp/deploy/ holds the shared runtime (pipe_run, ORT +
 QNN libraries, pushed only when their size changes); /data/local/tmp/deploy/<name>/ holds one
-model's pipe.txt, models and inputs. Libraries come from
+model's pipe.txt, models and inputs. DEPLOY_DEVICE_ROOT overrides the root, so concurrent users of
+one phone (see ~/.cache/android-phone/phone-run) never load each other's files. Libraries come from
 ../../htp_exploration/qnn_shell/fetch_libs.sh (Maven Central, not committed).
 """
 from __future__ import annotations
@@ -17,7 +18,7 @@ from . import partition as part
 
 HERE = Path(__file__).resolve().parents[1]
 QS = HERE.parent / "htp_exploration" / "qnn_shell"
-ROOT = "/data/local/tmp/deploy"
+ROOT = os.environ.get("DEPLOY_DEVICE_ROOT", "/data/local/tmp/deploy")
 ADSP = f"{ROOT};/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp"
 
 

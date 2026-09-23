@@ -15,12 +15,16 @@ re-run therefore redoes only what changed: editing `bench:` re-runs bench and no
 | simplify | onnxsim with the spec's fixed input shapes (QNN needs static shapes) | `model.onnx` |
 | quantize | `onnxsim.quantize_static(full_graph=True)`: QDQ on every activation (uint8), per-channel int8 weights, int32 biases, real calibration images; `calibration_method` minmax / mse / percentile / entropy (streamed histograms: memory doesn't grow with #images), or `auto` (picks one by the spec's accuracy metric, below) | `model.onnx`, `quantize_meta.json` |
 | rewrite | passes from `passes/` (`uint8_input`, `uint8_outputs`, `script` = any existing `in.onnx out.onnx` rewrite, e.g. `../htp_exploration/ceiling/*.py`) | `model.onnx`, `rewrite_meta.json` |
-| post | CPU post-processing graph from standard ONNX ops (`yolo_detect`: decode + NonMaxSuppression) | `post.onnx` |
+| post | CPU post-processing graph from standard ONNX ops (`yolo_detect`: decode + NonMaxSuppression; `yolo_end2end`: YOLO26's NMS-free top-k) | `post.onnx` |
 | pipe | `pipe.txt` for `runtime/pipe_run` + preprocessed eval inputs | `pipe.txt`, `inputs/*.bin`, `pipe_meta.json` |
 | partition | HTP model alone, CPU fallback allowed (QNN's refusals from logcat, with tensor rank) then strict | `report.json` |
 | push | builds `runtime/pipe_run` (NDK) and pushes it, the ORT/QNN libs, the models and inputs (files whose md5 changed) | |
 | bench | `pipe_run` over every eval input: per-step and total median, FPS, cold run, session creation | `bench.json`, `outputs/` |
 | accuracy | fp32 ORT (simplified model + the same post graph) vs the host int8 graph and vs the phone outputs | `accuracy.json` |
+
+On a phone shared between several users, set `DEPLOY_DEVICE_ROOT=/data/local/tmp/<you>` (default
+`/data/local/tmp/deploy`) so nobody loads another run's files, and wrap the phone stages
+(partition, push, bench, accuracy) in the host's phone lock (`~/.cache/android-phone/phone-run`).
 
 simplify, quantize, rewrite, post and pipe run in a child process under
 `systemd-run --user -p MemoryMax=16G -p MemorySwapMax=0` (`--mem` changes the cap; `--no-cap`
@@ -100,6 +104,36 @@ linked against `../e2e_pipeline/build.sh`'s stubs). All HTP sessions are strict 
   | Mask R-CNN backbone 800x1088, 191 tensors | 16 / 64 | 6.3 / 6.3 GB | 34 / 137 GB |
 
   The remaining ~5 GB for Mask R-CNN is one image's activations, all fetched as outputs of one ORT run.
+
+**YOLO26n / YOLO26s** (`models/yolo26{n,s}.yaml`: Ultralytics' NMS-free end-to-end YOLO, AGPL-3.0 weights
+sha256-pinned and exported by `models/export_yolo26.py`; set `ULTRALYTICS_PYTHON` if the deploy
+python has no `ultralytics`). YOLO26 has no DFL (`reg_max: 1`, boxes regressed directly) and uses a
+one-to-one head, so there is no NMS: Ultralytics' export ends in a two-stage TopK (top 300 anchors by
+best class score, then the top 300 (anchor, class) pairs) and GatherElements, output (1, 300, 6).
+- **Split:** the export stops at the one-to-one head's decoded output (1, 84, 8400: x1,y1,x2,y2 +
+  sigmoid scores), which runs strict all-HTP with uint8 NHWC input. The top-k runs on the CPU as
+  `postprocess: {kind: yolo_end2end}`, which is bit-identical to Ultralytics' own end2end ONNX (max abs diff 0
+  on 10 COCO images; `tests/test_deploy_yolo_end2end_post.py` checks it against a numpy transcription).
+  Putting the top-k on the HTP too (Ultralytics' end2end export, tail kept float) also runs strict
+  all-HTP, but at **11.8 ms**, vs 2.6 ms HTP + 0.6 ms CPU with the top-k on the CPU.
+- **Calibration differs from YOLO11n.** Host int8 vs fp32 on coco128 (565 fp32 boxes): mse 458,
+  minmax 461, percentile 99.999 506 but with scores inflated (\|score Δ\| 0.22), percentile + the
+  class-logit path (`one2one_cv3.*.2` convs through the score Concat) at its exact range via
+  `minmax_tensors` 500 (\|Δ\| 0.08, the default). Keeping one block group float at a time recovers
+  at most ~30 boxes (class head, first backbone stages, box decode); the loss is spread out, not
+  one bad layer.
+- **Results** (median under the phone lock, 128 coco128 images; the 20-image set gives the same ms):
+
+  | model | HTP | CPU post | total | FPS | phone vs fp32 | host int8 vs fp32 | fp32 vs coco128 GT (recall / precision) | phone vs GT |
+  |---|---|---|---|---|---|---|---|---|
+  | YOLO11n (mse, NMS) | 2.58 ms | 0.92 ms | 3.47 ms | 289 | 596/659 (90.4%) | 615 | 484/929 (52.1%) / 73% | 468 (50.4%) |
+  | **YOLO26n** (percentile, top-k) | 2.57 ms | 0.57 ms | **3.18 ms** | **314** | 482/565 (85.3%) | 500 | 439/929 (47.3%) / 78% | 409 (44.0%) |
+  | YOLO26s (percentile, top-k) | 3.75 ms | 0.57 ms | 4.29 ms | 233 | 589/693 (85.0%) | 603 | 549/929 (59.1%) / 79% | 509 (54.8%) |
+
+  GT columns are recall/precision at score >= 0.25, IoU > 0.5, same class -- not mAP. YOLO26's
+  scores are more conservative at 0.25 (fewer, more precise boxes). The NMS-free head saves
+  ~0.3 ms of CPU per frame vs YOLO11n's NonMaxSuppression; the HTP time of the n models is the same.
+  YOLO26n loses more to int8 than YOLO11n does (85% vs 90% of fp32 boxes kept on the phone).
 
 **Mask R-CNN** (`models/maskrcnn.yaml`, #1841's `e_opt` pipeline through `prebuilt:`):
 - **Accuracy vs all-ORT:** 58/61 matched, box IoU 0.943, score |Δ| 0.019, mask IoU 0.861. This is
