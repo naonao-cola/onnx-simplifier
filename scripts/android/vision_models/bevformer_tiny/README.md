@@ -332,6 +332,39 @@ Next levers (not done here):
   int8 on the decoder's self-attention matmuls;
 - the encoder's `pre` (6.8 ms, 3 layers' SCA value projections) could fold into the backbone graph.
 
+### Follow-up levers on the frame runner (`msda_hvx/quantize_split.py`, `frame_e2e.py --pieces`)
+
+Phone, scene-0103 frames 0-5 x 5 passes, `frame_run` with backbone1 x 6 + fp16 decoder, under the phone
+lock (same session as the baseline row, which reproduces #1879's 90.5 ms):
+
+| encoder HTP pieces | host bev cos vs fp32 (scene-0103 / calib) | encoder (msda) | seq ms/frame | pipe ms/frame (FPS) | phone bev cos | GT matched |
+|---|---|---|---|---|---|---|
+| **fp16 (`msda_split`, default)** | - | **54.4 (27.4)** | **101.3** | **89.6 (11.2)** | 0.9965-0.9980 | **107 / 190** |
+| int8 except LayerNorm/Softmax (`all8`) | 0.99754 / 0.99727 | slower* | - | - | 0.9941-0.9956 | 108 / 190 |
+| `all8`, sampling offsets uint16 (`all8o16`) | 0.99810 / 0.99785 | 73.2 (27.5) | 120.2 | 108.3 (9.2) | - | 110 / 190 |
+| int8 Gemm/MatMul only (`lin8`) | 0.99821 / 0.99768 | 102.6 (28.2) | 150.1 | 137.0 (7.3) | - | 107 / 190 |
+
+\* `all8` was measured while the phone was contended (the baseline read 216 ms/frame pipelined in the
+same run), so only its accuracy counts; it is also below the 0.996 bev-cos bar.
+
+**Lever 1, int8 encoder pieces: accurate now, but slower on the HTP.** With the sampling on the HVX,
+int8 no longer costs accuracy: `all8o16` even matches 110 GT, and host bev cos is 0.998. But every int8
+variant makes the encoder slower (54 -> 73 -> 103 ms): the pieces are small (2500 x 256 Linears), their
+graph I/O is fp32, and each QDQ unit adds per-op conversion work that the int8 matmuls don't win back.
+fp16 stays the default. (Uint8 graph I/O would need frame_run to carry uint8 buffers between pieces; the
+earlier uint8 TSA-output test saved nothing on the HTP side, so it is not pursued here.)
+
+Reproduce:
+
+```sh
+cd msda_hvx
+python3 quantize_split.py quant --ckpt $C/bevformer_tiny_epoch_24.pth --work $C/work --policy all8o16
+python3 quantize_split.py eval  --ckpt $C/bevformer_tiny_epoch_24.pth --work $C/work --pieces msda_split_all8o16
+PHONE_RUN=~/.cache/android-phone/phone-run PHONE_LOCK_OWNER=<branch> R=/data/local/tmp/<dir> \
+  python3 frame_e2e.py --ckpt ... --data ... --work $C/work --build <build> --backbone backbone1.q8 \
+  --pieces msda_split_all8o16 --modes seq,pipe
+```
+
 ### Why not a `scripts/android/deploy` spec (yet)
 
 The deploy pipeline (#1853) takes one graph through fetch -> simplify -> quantize -> rewrite ->

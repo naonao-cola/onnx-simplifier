@@ -77,6 +77,11 @@ def main():
         default="decoder.sim",
         help="a decoder piece, or 'split' (dec_split.py export's pieces + HVX)",
     )
+    ap.add_argument(
+        "--pieces",
+        default="msda_split",
+        help="the encoder's HTP pieces: a <work> subdirectory of <piece>.sim.onnx (e.g. quantize_split.py's)",
+    )
     ap.add_argument("--modes", default="seq,pipe,conc")
     ap.add_argument(
         "--reps",
@@ -158,6 +163,21 @@ def main():
             check=True,
         )
     sh = lambda c: subprocess.run([*E.ADB, "shell", c], check=True)  # noqa: E731
+    if (
+        a.pieces != "msda_split"
+    ):  # push_runtime pushed msda_split/; the variant goes next to it
+        sh(f"mkdir -p {R}/{a.pieces}")
+        for p in X.PIECES:
+            subprocess.run(
+                [
+                    *E.ADB,
+                    "push",
+                    "-q",
+                    str(work / a.pieces / f"{p}.sim.onnx"),
+                    f"{R}/{a.pieces}/{p}.onnx",
+                ],
+                check=True,
+            )
     subprocess.run(
         [*E.ADB, "push", "-q", str(Path(a.build) / "frame_run"), f"{R}/frame_run"],
         check=True,
@@ -168,12 +188,14 @@ def main():
             "push",
             "-q",
             str(work / "msda_split" / "feats_q.txt"),
-            f"{R}/msda_split/feats_q.txt",
+            f"{R}/{a.pieces}/feats_q.txt",
         ],
         check=True,
     )
     # a phone / host output directory per configuration: runs of different configs can't collide
     fr = "fr_" + f"{a.backbone}_{a.decoder}".replace(".", "_")
+    if a.pieces != "msda_split":
+        fr += "_" + a.pieces.replace(".", "_")
     sh(
         f"chmod 755 {R}/frame_run && rm -rf {R}/{fr} && mkdir -p {R}/{fr}/seq {R}/{fr}/pipe"
     )
@@ -190,7 +212,7 @@ def main():
             [
                 *E.ADB,
                 "shell",
-                f"{env} ./frame_run msda_split {a.backbone}.onnx {'split' if split_dec else a.decoder + '.onnx'} "
+                f"{env} ./frame_run {a.pieces} {a.backbone}.onnx {'split' if split_dec else a.decoder + '.onnx'} "
                 f"{mode} 1 {a.reps} "
                 f"{fr}/{mode} {names} 2>&1",
             ],
