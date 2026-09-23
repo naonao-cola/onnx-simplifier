@@ -29,6 +29,13 @@ final class OverlayView extends View {
     private Bitmap extra;
     private float extraW, extraH, markX = -1, markY = -1;
     private final Paint markPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    // SR mode: `extra` shown only left of splitFrac (0..1 of the frame width, < 0 = off), the frame
+    // (the SR output) right of it, with a divider and the two labels; extraNearest: no filtering
+    private float splitFrac = -1;
+    private String splitLeft = "", splitRight = "";
+    private boolean extraNearest;
+    private final Paint nearestPaint = new Paint();
+    private final Paint dividerPaint = new Paint();
     // the last frame's placement on screen: view = o + frame * sc
     private volatile float lastOx, lastOy, lastSc = 0;
 
@@ -57,6 +64,30 @@ final class OverlayView extends View {
         markX = x;
         markY = y;
         update(r, s);
+    }
+
+    /**
+     * Split comparison: `left` (any size, stretched over the frame; nearest-neighbour if `nearest`)
+     * left of split (fraction of the frame width), the result's frame right of it.
+     */
+    void updateSplit(Engine.Result r, String s, Bitmap left, boolean nearest, float split, String leftLabel,
+                     String rightLabel) {
+        extraNearest = nearest;
+        splitFrac = split;
+        splitLeft = leftLabel;
+        splitRight = rightLabel;
+        extra = left;
+        extraW = r.frame.getWidth();
+        extraH = r.frame.getHeight();
+        markX = -1;
+        update(r, s);
+    }
+
+    /** View x -> fraction of the displayed frame's width (clamped), or -1 before the first frame. */
+    float toFrameFrac(float vx) {
+        Engine.Result r = result;
+        if (r == null || r.frame == null || lastSc == 0) return -1;
+        return Math.max(0f, Math.min(1f, (vx - lastOx) / (r.frame.getWidth() * lastSc)));
     }
 
     /** View coordinates -> the displayed frame's pixels, null if no frame yet or outside it. */
@@ -89,7 +120,27 @@ final class OverlayView extends View {
             lastOx = ox;
             lastOy = oy;
             lastSc = sc;
-            if (extra != null) cv.drawBitmap(extra, null, new RectF(ox, oy, ox + extraW * sc, oy + extraH * sc), maskPaint);
+            if (extra != null && splitFrac >= 0) {
+                float sx = ox + fw * sc * splitFrac;
+                cv.save();
+                cv.clipRect(ox, oy, sx, oy + fh * sc);
+                cv.drawBitmap(extra, null, new RectF(ox, oy, ox + fw * sc, oy + fh * sc),
+                        extraNearest ? nearestPaint : maskPaint);
+                cv.restore();
+                dividerPaint.setColor(Color.YELLOW);
+                dividerPaint.setStrokeWidth(4f);
+                cv.drawLine(sx, oy, sx, oy + fh * sc, dividerPaint);
+                textPaint.setTextSize(Math.min(40f, getWidth() / 30f));
+                float lw = textPaint.measureText(splitLeft), rw = textPaint.measureText(splitRight);
+                float ty = oy + textPaint.getTextSize() * 1.4f + 96;  // below the model buttons
+                labelBg.setColor(0xB0000000);
+                cv.drawRect(sx - lw - 24, ty - textPaint.getTextSize() - 6, sx - 8, ty + 10, labelBg);
+                cv.drawText(splitLeft, sx - lw - 16, ty, textPaint);
+                cv.drawRect(sx + 8, ty - textPaint.getTextSize() - 6, sx + rw + 24, ty + 10, labelBg);
+                cv.drawText(splitRight, sx + 16, ty, textPaint);
+            } else if (extra != null) {
+                cv.drawBitmap(extra, null, new RectF(ox, oy, ox + extraW * sc, oy + extraH * sc), maskPaint);
+            }
             if (markX >= 0) {
                 markPaint.setColor(Color.YELLOW);
                 cv.drawCircle(ox + markX * sc, oy + markY * sc, 14f, markPaint);

@@ -6,9 +6,11 @@
 #   YOLO="<deploy work>/yolo26n/pipe/yolo26n.onnx ..." ./deploy.sh   models for the YOLO mode
 #   RTDETR=<rtdetr split.py work dir, e.g. ~/.cache/onnxsim-rtdetr/work/split> ./deploy.sh   RT-DETR
 #   SAM=<sam.py work dir, e.g. ~/.cache/onnxsim-sam/efficientvit_sam_l0> ./deploy.sh   the SAM mode
+#   SR=<superres.py models dir, e.g. ~/.cache/superres/models> ./deploy.sh   the super-resolution mode
 # Then:  adb shell am start -n org.onnxsim.maskrcnndemo/.MainActivity [--es mode images] [--es pipe pipe_e_opt.txt]
 #        adb shell am start -n org.onnxsim.maskrcnndemo/.YoloActivity [--es mode images] [--es model yolo11n]
 #        adb shell am start -n org.onnxsim.maskrcnndemo/.SamActivity [--es mode images] [--es tap 0.5,0.5]
+#        adb shell am start -n org.onnxsim.maskrcnndemo/.SrActivity [--es mode images] [--es ref original]
 #
 # Files go to the app's *internal* files dir through `run-as` (the APK is debuggable): files adb
 # puts under /sdcard/Android/data/<pkg> are owned by the shell user and unreadable by the app.
@@ -78,6 +80,20 @@ if [ -n "${RTDETR:-}" ]; then
   for n in mid0 mid1 post; do "${A[@]}" push -q "$RTDETR/$n.sim.onnx" "$STAGE/rtdetr/rtdetr_$n.onnx"; done
   for n in pre mid0 mid1 post; do
     RA "cmp -s $STAGE/rtdetr/rtdetr_$n.onnx files/models/rtdetr_$n.onnx || { cp $STAGE/rtdetr/rtdetr_$n.onnx files/models/ && rm -f files/models/rtdetr_$n.ctx0*; }"
+  done
+fi
+# Super-resolution mode: x4 models from ../vision_models/superres (superres.py build <model> 270 480
+# and 480 270), e.g. SR=$HOME/.cache/superres/models: <model>_<HxW>/{int8,fp16}.onnx ->
+# sr_<name>_<prec>_<HxW>.onnx, both orientations. EP-context models are compiled on first use.
+if [ -n "${SR:-}" ]; then
+  "${A[@]}" shell "mkdir -p $STAGE/sr"
+  for spec in xlsr:xlsr:int8 quicksrnetmedium:qsrm:int8 xlsr:xlsr:fp16 realesr-animevideov3:esrgan:int8; do
+    IFS=: read -r m n p <<<"$spec"
+    for hw in 270x480 480x270; do
+      b="sr_${n}_${p}_$hw.onnx"
+      "${A[@]}" push -q "$SR/${m}_$hw/$p.onnx" "$STAGE/sr/$b"
+      RA "cmp -s $STAGE/sr/$b files/models/$b || { cp $STAGE/sr/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
+    done
   done
 fi
 if [ -n "${IMGS:-}" ]; then

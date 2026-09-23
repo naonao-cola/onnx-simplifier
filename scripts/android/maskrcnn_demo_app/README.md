@@ -1,7 +1,8 @@
 # Mask R-CNN live demo app (Android, Hexagon HTP + HVX)
 
-Model buttons (top): Mask R-CNN, YOLO26n, YOLO11n, RT-DETR and SAM, each engine in its own process
-(one model loaded at a time); see the YOLO, RT-DETR and SAM sections below for the newer modes.
+Model buttons (top): Mask R-CNN, YOLO26n, YOLO11n, RT-DETR, SAM and Super-res, each engine in its own
+process (one model loaded at a time); see the YOLO, RT-DETR, SAM and super-resolution sections below
+for the newer modes.
 
 An Android app that runs the full Mask R-CNN (ONNX model zoo `MaskRCNN-12-qdq`) on the phone
 (Xiaomi 12S, Snapdragon 8+ Gen 1), frame by frame, from the camera or a set of test images, with
@@ -102,6 +103,52 @@ the HTP from EP-context models.
 
 (phone, under the shared phone lock; the encoder matches #1876's 41.8 ms.) Each extra tap costs
 ~11 ms, so segmenting feels immediate after the one-off encode.
+
+## Super-resolution mode (x4 neural upscaling, XLSR int8 on the HTP)
+
+The "Super-res" button (`SrActivity`, its own process `:sr`, `native/sr_engine.cpp` ->
+`libsr_demo.so`) is the open, camera-usable counterpart of DLSS-style upscaling (DLSS / XeSS / FSR4 /
+MetalFX are closed; see `../vision_models/superres/README.md`). Every frame:
+
+1. the camera's centered 16:9 crop at 1920x1080 (1080x1920 upright in portrait; 1:1 sensor pixels of
+   the 1920x1440 stream) is the **original**;
+2. its 4x4 box average, 480x270 (1/16 the pixels -- what a game would render), is the **low-res**
+   input; the camera path averages Y/U/V per 4x4 block and converts once per low-res pixel;
+3. an x4 model from `../vision_models/superres` (PR #1906) upscales it back to 1920x1080 on the HTP,
+   uint8 NHWC in and out;
+4. the screen shows the **SR** output right of a draggable divider and a reference left of it:
+   **bicubic** of the same low-res input (CPU, PIL's a = -0.5, run alongside the HTP inference), the
+   **original**, or the **low-res** pixels (nearest).
+
+Buttons: the model (**XLSR int8**, the default: the best PSNR kept through int8 in #1906;
+QuickSRNet-M int8; XLSR fp16; Real-ESRGAN animevideov3 int8, GAN-trained for perceived sharpness)
+and the left-side reference. One HTP session per orientation (`<model>_270x480.onnx`,
+`<model>_480x270.onnx`), EP-context compiled on first use. Models:
+`SR=$HOME/.cache/superres/models ./deploy.sh` (from `superres.py build <model> 270 480` and
+`... 480 270`); extras `--es model sr_xlsr_int8 --es ref bicubic|original|lowres --es mode images`.
+
+Phone, under the shared phone lock (images mode: 3 nuScenes CAM_FRONT frames, center-cropped;
+camera mode: 30 FPS stream):
+
+| mode, model | reference | HTP (SR) | frame -> low-res | SR -> bitmap | end to end |
+|---|---|---:|---:|---:|---:|
+| images, XLSR int8 | original | 6.1 ms | 5.1 ms | 2.6 ms | **54 FPS** |
+| images, QuickSRNet-M int8 | original | 5.1-5.3 ms | 5.2 ms | 2.5 ms | 56-57 FPS |
+| images, XLSR fp16 | original | 15.1 ms | 6.1 ms | 2.6 ms | 35 FPS |
+| images, Real-ESRGAN int8 | original | 13.3 ms | 5.4 ms | 2.5 ms | 39 FPS |
+| images, XLSR int8 | bicubic (CPU 24-27 ms, in parallel) | 6.3 ms | 5.1 ms | 7 ms | 28 FPS |
+| camera, XLSR int8 | bicubic (CPU 31-34 ms, in parallel) | 6.2 ms | 6.9 ms | 5-8 ms | 24-26 FPS |
+| camera, XLSR int8 | original (full-res YUV -> RGB for display) | 5.8 ms | 23-27 ms | 2.6-3.7 ms | 26-30 FPS (camera-capped) |
+
+<img src="docs/sr_images.jpg" width="270" alt="Super-res mode: bicubic left of the divider, XLSR int8 right">
+<img src="docs/sr_detail.jpg" width="540" alt="1:1 detail: bicubic, XLSR int8, original">
+
+(the detail strip is a 300x200 1:1 crop, shown 2x, of the same HTP graph run on the host: bicubic
+40.90 dB vs XLSR int8 41.92 dB PSNR against the original on that frame.) The SR itself is ~6 ms of a
+33 ms camera frame; what bounds the loop is the CPU work around it (the bicubic reference, or
+converting the full-res frame when the original is shown). In the camera path the low-res input
+costs 6.9 ms since only the 130K low-res pixels are converted -- converting all 2M pixels first
+took 23 ms.
 
 ## More modes: follow-ups (not built)
 
