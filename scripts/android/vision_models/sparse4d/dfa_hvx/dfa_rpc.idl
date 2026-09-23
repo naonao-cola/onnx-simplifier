@@ -1,0 +1,18 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+// One call = one Sparse4D decoder layer's DFA (dfa_core.h): 6 cameras x 4 levels of the generic
+// msda kernel, summed. `hw` = H W per level (4 x 2); value maps uint8 channels-last (6, H, W, 256)
+// with one scale / zero point per level.
+interface dfa_rpc : remote_handle64 {
+  AEEResult run(in sequence<uint8> v0, in sequence<uint8> v1, in sequence<uint8> v2, in sequence<uint8> v3,
+                in sequence<float> vscale,  // (4)
+                in sequence<int32> vzp,     // (4)
+                in sequence<int32> hw,      // (8)
+                in sequence<float> pts,     // (6, Q, 16, 2)
+                in sequence<float> w,       // (6, 4, Q, 8, 16)
+                in int32 Q,
+                in int32 flags,             // bits 0-7: threads; bits 8-15: anchors per job / 16 (0: 32)
+                rout sequence<float> result,   // (Q, 256)
+                rout uint64 dsp_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};
