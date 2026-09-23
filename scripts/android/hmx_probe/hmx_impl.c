@@ -30,13 +30,21 @@ AEEResult hmx_rpc_perf_vote(remote_handle64 h, int32 turbo, int32* rc) {
   d.dcvs_v2.dcvs_enable = 0;
   d.dcvs_v2.set_dcvs_params = 1;
   d.dcvs_v2.dcvs_option = HAP_DCVS_V2_PERFORMANCE_MODE;
-  if (turbo) {
+  if (turbo & 1) {
     d.dcvs_v2.dcvs_params.target_corner = HAP_DCVS_VCORNER_TURBO;
     d.dcvs_v2.dcvs_params.min_corner = HAP_DCVS_VCORNER_TURBO;
     d.dcvs_v2.dcvs_params.max_corner = HAP_DCVS_VCORNER_TURBO;
   }
   int r2 = HAP_power_set(ctx, &d);
-  *rc = r1 * 1000 + r2;
+  /* turbo bit 1: also power up HMX (HAP_power_set_HMX), which the first probe never did */
+  int r3 = 0;
+  if (turbo & 2) {
+    HAP_power_request_t x = {0};
+    x.type = HAP_power_set_HMX;
+    x.hmx.power_up = 1;
+    r3 = HAP_power_set(ctx, &x) + 1;
+  }
+  *rc = r3 * 1000000 + r1 * 1000 + r2;
   return 0;
 }
 
