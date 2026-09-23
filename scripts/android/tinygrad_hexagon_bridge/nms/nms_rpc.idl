@@ -1,0 +1,8 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+interface nms_rpc : remote_handle64 {
+  AEEResult run(in sequence<float> boxes, in sequence<float> scores, in sequence<int32> n,
+                in sequence<float> thr, in sequence<int32> max_out, in int32 mode, in int32 nthreads,
+                rout sequence<int32> sel, rout sequence<int32> nsel, rout uint64 dsp_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};
