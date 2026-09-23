@@ -1696,6 +1696,475 @@ any scalar read of that buffer crashed. Copying the accumulator into an explicit
 The conv kernels themselves come from `../hex_conv3x3_fpnout_kernel.py --data fpn_out_real.npz --out
 $DATA/fpn_out_kernels.c`, which also runs all four levels under qemu against ORT.
 
+## Proposal decode (RPN): bit-exact on the phone's DSP, 1.58x ONNX Runtime
+
+The easiest-ranked op in `dynamic_ops_survey.md`. Everything below comes from the real
+`rest.onnx` graph and one real inference (COCO `000000000139.jpg`), not from assumptions.
+
+### What the region actually is
+
+Per FPN level, **TopK runs first** (on the objectness scores), then anchors and deltas are gathered
+by the top-k indices, so decode only ever sees k = 1000/1000/1000/1000/663 = **4663 boxes**, not the
+217,413 anchors. The objectness sigmoid is not in this region: it's in the backbone, before the
+reshape. The kernel replaces, per level, everything from the squeezed TopK indices to the
+grid-quantized boxes that feed the min-size filter and NMS: **315 non-Constant nodes** over the 5
+levels (50 Unsqueeze, 40 Add, 40 Mul, 35 Gather, 30 Sub, 30 Slice, 20 Clip, 20 Reshape, 15+15 Q/DQ,
+10 Concat, 10 Exp). `capture_proposal_decode.py` finds the region by walking the graph and reads
+every constant out of it:
+
+- Detectron decode: widths/heights with `+1`, dw/dh clipped at 4.1352 (= log(1000/16)), `-1` on
+  x2/y2; clip x to [0, 1279] and y to [0, 959]. Those bounds are baked into the model and are not
+  the 800x1088 canvas; they're reproduced as found.
+- The deltas are **requantized** on the way in: for P2-P4 the rest-side Q/DQ grid (e.g. P2:
+  0.018187/129) differs from the backbone's output grid (0.018761/133), so this is a real lossy
+  step and the kernel reproduces it. For P5/P6 it's an identity.
+- The final boxes are Q/DQ'd onto a uint8 grid (scale 5.0157, zero point 0), ~5 px steps.
+- Layout: the backbone turns the `[1, 12, H, W]` uint8 conv output into per-anchor rows over all
+  anchors (Reshape `[1,3,4,H,W]` -> Transpose `(0,3,4,1,2)` -> Reshape `[-1,4]`, plus Q/DQ).
+  Decode needs only k rows, so the kernel can gather straight from the NCHW conv output
+  (`a = i % 3`, `(h, w) = divmod(i / 3, W)`). Checked: this reproduces rest.onnx's delta input
+  exactly.
+
+### Correctness: bit-exact everywhere
+
+`pd_kernel.h` (one header for host, qemu and DSP) matches ONNX Runtime's real output **bit for bit**
+at all 5 levels and for both delta sources (rest.onnx's fp32 per-anchor input, and the backbone's
+NCHW uint8 conv output):
+
+| check | result |
+|---|---|
+| host C (`pd_host_check.c`) | 0 of 18,652 values differ |
+| qemu, Hexagon v73 scalar build (`pd_qemu.c`) | 0 differ |
+| **phone CDSP** (`pd_client.c`, every config below) | **0 differ** |
+
+This can be bit-exact where RoiAlign (max error 6.5e-5 on the phone) wasn't, because it's scalar
+IEEE fp32: no HVX qfloat, and it's built with `-ffp-contract=off` so there are no FMAs the graph
+doesn't have. `exp` is the kernel's own polynomial (no libm, no fp64): it's **at most 1 ulp** from
+correctly rounded over all 2.18 billion floats in [-10, 4.1352]. ORT's own `Exp` differs from it at
+ulp level, so before the grid quantization boxes differ from ORT's by up to 1.2e-4 in a few percent
+of elements (coordinates are ~1000 px, so 1 ulp is 6e-5). The ~5 px box grid then absorbs every
+one of those differences.
+
+### Speed on the phone
+
+All 5 levels in one FastRPC call; medians of two full runs, 21 reps each. ORT is the same 315 nodes
+cut out of rest.onnx (`make_pd_ort_model.py`), one `Run`, stock onnxruntime-android 1.26 arm64 C API:
+
+| | DSP kernel | roundtrip | vs ORT |
+|---|---:|---:|---:|
+| ONNX Runtime CPU on the phone (1 thread / default) | -- | 1.04 / 1.05 ms | 1.00x |
+| NCHW uint8 source, fast path, 6 threads | 0.40 ms | **0.66 ms** | **1.58x** |
+| NCHW uint8 source, fast path, 4 threads | 0.47 ms | 0.75 ms | 1.39x |
+| NCHW uint8 source, fast path, 1 thread | 1.29 ms | 1.58 ms | 0.66x |
+| fp32 per-anchor source (today's boundary), fast path, 6 threads | 0.51 ms | 0.83 ms | 1.26x |
+| division-per-element reference path, 6 threads | 0.76-0.85 ms | 1.11-1.15 ms | ~0.93x |
+
+ORT gains nothing from more threads (315 tiny nodes, dominated by per-node dispatch). The first
+bit-exact DSP version was 4.5 ms single-threaded and lost to ORT at every thread count. What
+closed the gap, with every step keeping the output bit-exact:
+
+1. **12 scalar fp32 divisions per box -> none on the common path.** The two-stage delta requant is
+   a function of the backbone's uint8 value only, so it becomes a 256-entry per-level LUT. fp32
+   deltas map back to their uint8 index with an exact on-grid check and fall back to the full chain
+   if they're ever off-grid; the host check tests that fallback with deliberately perturbed deltas.
+   The box-grid quantize multiplies by 1/scale and only does the real division when the quotient is
+   within 1e-3 of a .5 tie. That was checked exhaustively over all 1.15 billion floats in [0, 1279]:
+   0 mismatches, with 0.016% of values taking the division fallback.
+2. **Anchors computed, not gathered.** All 5 real anchor tables are exactly `base[i % 3] + (w, h,
+   w, h) * stride` with small-integer values, so they're exact in fp32. `set_model` verifies this
+   against the uploaded table on the DSP and falls back to table reads if it ever fails. The row
+   divide is a magic-number multiply, because Hexagon has no integer divide instruction and the
+   freestanding build has no helper for it.
+3. **Blocked, branch-free math plus `dcfetch` prefetch of the next block's gather addresses.** The
+   generated assembly shows the exp loop software-pipelined at 15 packets per element (about 2 fp32
+   ops per packet, the scalar FP limit), so the math is cheap. The random gathers into the
+   multi-MB maps are the real cost, which is why prefetching the next block helped (1.45 -> 1.29 ms
+   single-threaded).
+
+The TURBO clock vote changed nothing.
+
+### Honest caveats
+
+- **This region is small.** It's ~1 ms of ORT time, while the whole rest.onnx remainder costs
+  200-500 ms per image. The absolute saving is ~0.4 ms. FastRPC's fixed ~0.26 ms is about 40% of the
+  roundtrip, so a standalone call is a poor unit. The case for it is as part of a larger
+  DSP-resident rest pipeline (TopK and NMS next to it), not on its own.
+- **It needs DSP threads.** Single-threaded it loses to ORT; 4+ threads are needed to win.
+- **The NCHW source also removes the backbone's full-map layout work** (dequant + transpose over all
+  217,413 anchors, done today inside the compiled backbone). `bb_layout` prices that with a plain,
+  unvectorized C loop at 9.7 ms on 1 DSP thread / 3.6 ms on 4 (output checked equal to rest.onnx's
+  real input). That's an upper bound: the backbone's real cost for these fused layout ops wasn't
+  isolated here.
+
+### Reproduce
+
+```
+python capture_proposal_decode.py --model maskrcnn_sim.onnx --rest rest.onnx --image IMG --out DATA
+cc -O2 -ffp-contract=off -o pd_host_check pd_host_check.c && ./pd_host_check DATA   # also writes lN_params.bin
+python make_pd_ort_model.py --rest rest.onnx --data DATA
+clang-19 --target=hexagon -mcpu=hexagonv73 -O2 -ffp-contract=off -static -nostdlib -ffreestanding \
+  -fuse-ld=lld -o pdq pd_qemu.c   # then: qemu-hexagon-static pdq DATA/lN_*.bin ... A k H W
+HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... DATA=DATA ORT_AAR_DIR=<extracted onnxruntime-android aar> ./build.sh
+```
+
+## TopK: exact on the DSP, and faster than ORT for the batched per-level selections
+
+`dynamic_ops_survey.md` ranked TopK "high" difficulty: no sort/select primitive exists anywhere in
+this project. It turned out not to need the bitonic sort the survey expected. `topk/` is an exact
+TopK (values **and** int64 indices, byte-for-byte equal to ONNX Runtime's) running on the phone's
+CDSP through its own FastRPC skel, the same TVM-free pattern as `roialign_fast/`.
+
+**The real nodes.** One COCO image (`000000000139`) through the full `MaskRCNN-12-qdq` in ORT,
+capturing every TopK node's real input, k and outputs (`topk/dump_real_topk_io.py`). All seven are
+1-D, fp32, `largest=1`, `sorted=1`:
+
+| Node | Role | n | k |
+|---|---|---:|---:|
+| 908 | P2 pre-NMS select | 163,200 | 1000 |
+| 1234 | P3 pre-NMS select | 40,800 | 1000 |
+| 1560 | P4 pre-NMS select | 10,200 | 1000 |
+| 1886 | P5 pre-NMS select | 2,550 | 1000 |
+| 2212 | P6 pre-NMS select | 663 | 663 |
+| 2488 | post-NMS select (after the per-level NMS) | 1,465 (data-dependent) | 1000 |
+| 6528 | final detection cap | 106 (data-dependent) | 100 |
+
+The kernel takes n and k at call time, so the two data-dependent calls need no padding.
+
+**Ties are the normal case, and the tie order has to match ORT's.** The scores are dequantized
+int8, so the 163,200-element level has only **51 distinct values**. Across the seven calls there
+are 51 to 213. At that level the k-th value is shared by 111 elements, and 99 of them are taken.
+On all seven calls ORT orders by **value descending, then index ascending**. ORT on the phone's
+CPU reproduces the captured x86 output exactly, so the same order holds on ARM. Matching values
+alone would not be enough: the indices decide which boxes go on to NMS.
+
+### The algorithm: select first, then sort only the survivors
+
+In `topk/topk_kernel.h`, one header that builds for the host, qemu and the CDSP:
+
+1. **Key.** Each fp32 value maps to a monotone uint32 (bigger float, bigger key). -0 is mapped to
+   +0 so the two tie, as a float compare would.
+2. **Threshold.** Read 128 evenly spaced blocks of 8 contiguous values (1024 keys) and quickselect
+   the key at the rank that should leave ~1.5k survivors. Inputs with n ≤ 4k skip this step and keep
+   everything.
+3. **Collect.** One streaming HVX pass: a 32-lane `key >= t` compare, turned into a 32-bit lane mask
+   (AND with per-lane bit weights, then a rotate/OR tree). Only set bits are visited (`ctz`), and
+   a fully set mask stores the whole vector at once. Survivors are appended in index order, and an
+   `l2fetch` runs 16 KB ahead. Index ranges are independent, so a big call can split this pass
+   across threads.
+4. **Emit.** Hash the survivors' distinct keys, sort those keys descending, then do one stable
+   counting-sort pass by key rank. Stability keeps index order within a key, which is exactly ORT's
+   tie order. Above 256 distinct keys it falls back to a stable radix sort. Values are recovered
+   from the keys, so there is no random-access gather of the input, except for key 0, which +0 and
+   -0 share.
+
+**Correctness doesn't depend on the threshold.** If at least k survive, every element of the true
+top-k has a key ≥ the k-th key ≥ t, so the answer is inside the survivor set. If fewer than k
+survive, the threshold is lowered and the pass rerun; the last resort takes everything. On the
+real data the first threshold always sufficed (one pass).
+
+### Verification
+
+| Level | Result |
+|---|---|
+| Host C, all 7 real calls | values and int64 indices byte-exact vs ORT, every variant |
+| Host C, 600 randomized cases | exact. Covers heavy ties, ±0, negatives, all values tied, a layout that makes the sample miss so the retry and fallback paths run, and many distinct values (the radix fallback). Also clean under ASan/UBSan |
+| `qemu-hexagon-static`, v73 HVX build | exact on all 7 (the kernel uses only integer HVX ops, which qemu 8.2 decodes) |
+| Real CDSP, device `239dbd8f` | exact on all 7, every variant and thread setting |
+
+### Speed on the phone (medians of 31 runs; ORT is the op's current path, on the phone's CPU)
+
+DSP time is `HAP_perf_get_time_us` around the kernel. Round trip is the client-side time for the
+whole FastRPC call.
+
+| Call (n → k) | ORT CPU, 1 thread | DSP, 1 thread | DSP, collect split 6 ways |
+|---|---:|---:|---:|
+| P2 163,200 → 1000 | 435 µs | 488 µs | **235 µs** |
+| P3 40,800 → 1000 | 280 µs | 226 µs | **157 µs** |
+| P4 10,200 → 1000 | 73 µs | 185 µs | |
+| P5 2,550 → 1000 | 59 µs | 107 µs | |
+| P6 663 → 663 | 13 µs | 37 µs | |
+| post-NMS 1,465 → 1000 | 18 µs | 81 µs | |
+| final 106 → 100 | 4 µs | 20 µs | |
+
+The five per-level selections are independent, so they go to the DSP as **one** RPC:
+
+| 5 per-level TopKs | DSP time | Round trip | vs ORT (859 µs, 1 thread; 849 µs default threads) |
+|---|---:|---:|---:|
+| one after another, 1 thread | 997 µs | 1433 µs | slower |
+| one after another, big collects split 4 ways | 689 µs | 1119 µs | slower end to end |
+| concurrently, one thread per level | 557 µs | 990 µs | slower end to end |
+| **concurrently + P2's collect split 4 ways** | **369 µs** | **720 µs** | **2.3× on DSP time, ~1.2× including the round trip** |
+
+All seven calls take 470 µs of DSP time, against ORT's 880 µs. But the last two TopKs sit after
+NMS, which runs on the CPU, so they are separate RPCs, and with ~0.25 ms each the round-trip total
+is 1295 µs.
+
+**Honest reading.** The batched per-level selection beats ORT even with the FastRPC round trip. The
+two downstream TopKs (1465 → 1000, 106 → 100) are slower on the DSP than on a 3 GHz big core even
+before their ~0.25 ms round trip, so they should stay on the CPU unless the surrounding
+post-processing moves to the DSP too. The small full-sort calls (P4–P6) are also slower per call.
+The scalar core's sort work is the limit, but inside the concurrent batch they overlap with P2's
+collect, so they don't set the batch time.
+
+### What mattered, measured in order
+
+- **Scratch reuse.** A fresh 2.6 MB `malloc`/`free` per call cost 1–1.5 ms on the DSP heap, plus a
+  cold-page penalty in the kernel itself. Scratch is now allocated once per batch slot and reused.
+- **Prefetch.** The collect over 163,200 elements took 1387 µs single-threaded, only ~470 MB/s
+  (each vector load waited on DDR). An `l2fetch` 16 KB ahead cut it to 401 µs, the same lesson
+  RoiAlign learned.
+- **Threshold.** A strided scalar sample of 1024 values cost ~300 µs. Blocks of 8 values brought it
+  to ~100 µs, and a quickselect instead of sorting the sample brought it to ~40 µs. **Refuted
+  along the way:** I guessed the ~100 µs was TLB-bound (every sample line on its own page) and
+  tried packing the sample onto 32 pages. It was not faster, and the worse sample almost doubled
+  the survivors, so it was reverted. The cost was the sort.
+- **Emit.** Radix sort of ~1.5k survivors took 100–180 µs. An HVX `==` scan per distinct key was
+  tried and was *worse* on the calls with 89–213 distinct keys (181 → 387 µs). The single
+  counting-sort pass by key rank brought it to 52–87 µs.
+- **Threads.** On their own, splitting the big collects and running levels concurrently each
+  helped. Combining them (hybrid) was best, since P2 alone otherwise bounds the batch.
+- The TURBO clock vote changed nothing, as for RoiAlign.
+
+### `__builtin_reduce_or` and qemu
+
+The first vector version tested "any lane passed?" with clang's `__builtin_reduce_or` on the
+plain 0/-1 compare mask. Under qemu it silently dropped survivors on the three select-path calls:
+1533, 1159 and 1228 survivors instead of 1799, 1455 and 1618. The same C was exact on the host.
+Lane by lane, the key map and compare were correct. The inlined reduction had become a `vrmpy`
+followed by `vdeal`/`vdeal`/`vdeal`/`vshuff`, which relies on VLIW packets reading old register
+values. That sequence misses single-lane hits under qemu. The **same build is exact on the real
+CDSP**, so this is a qemu 8.2 emulation fault, not a hexagon-clang miscompile. The shipped kernel
+uses an explicit rotate/OR tree, which is exact on both. The fault is kept as an A/B variant
+(`TK_VEC_REDUCE_OR_MASK`) that the qemu harness and the phone client both run: MISMATCH under
+qemu, EXACT on the device.
+
+**Not handled:** NaN inputs (none occur), anything other than 1-D fp32 `largest=1, sorted=1`, and
+concurrent RPCs from several clients (the scratch is static per batch slot).
+
+`topk/` reproduces everything:
+- `dump_real_topk_io.py` captures the real inputs and outputs.
+- `gen_topk_test_data.py` writes the flat test files and single-node ORT models, and times host ORT.
+- `topk_host_check.c` is the real-data check plus the randomized stress test.
+- `topk_qemu.c` is the qemu harness.
+- `topk_rpc.idl`, `topk_impl.c` and `topk_client.c` are the DSP skel and client.
+- `ort_topk_bench.c` is the phone-CPU ORT baseline.
+- `build.sh` builds and runs on the phone, and runs the ORT baseline too if `ORT_AAR` is set.
+
+## NonMaxSuppression: exact on all 85 real calls, faster than ORT for the per-level ones
+
+`dynamic_ops_survey.md` ranked NMS the hardest dynamic op (greedy selection is sequential, and it
+looked like it might need new tinygrad capability). Like RoiAlign, it doesn't need tinygrad's UOp
+path at all: `nms/` is hand-written C with HVX, bridged over its own FastRPC skel (qaic IDL +
+native client, `rpcmem` buffers, no TVM), with inputs captured from one real ONNX Runtime inference
+(`dump_real_nms_io.py`: MaskRCNN-12-qdq, COCO 000000000139).
+
+**Real semantics, confirmed from the graph and ORT's own source.** All 85 nodes are
+`center_point_box=0`, one batch, one class per call, `max_output_boxes_per_class=2000` (never
+binding), no `score_threshold` input. Two groups:
+
+| group | calls | iou | boxes per call | input order | kept |
+|---|---:|---:|---|---|---:|
+| per FPN level (RPN proposals) | 5 | 0.7 | 1000, 1000, 1000, 1000, 663 | already score-sorted (by the preceding TopK) | 1465 |
+| per class (box head) | 80 | 0.5 | 0..152, 573 in total, 63 calls empty | not sorted | 106 |
+
+ORT's CPU kernel (`onnxruntime/core/providers/cpu/object_detection/non_max_suppression.cc` +
+`non_max_suppression_helper.h`) visits candidates through a `priority_queue` (score descending,
+ties by **lower index first**), keeps a candidate unless `SuppressByIOU(candidate, kept)` is true for
+some kept box, and emits `(batch, class, index)` triples in selection order. `SuppressByIOU` is
+`intersection / union > iou_threshold` in fp32, with early `return false` for no overlap and for
+non-positive intersection/areas/union. `nms_kernel.h` copies that operation for operation (built with
+`-ffp-contract=off`), and visits candidates in the same order via a stable merge sort. The phone's
+own ORT build (stock `onnxruntime-android` 1.26 arm64) selects exactly the same boxes as host ORT on
+all 85 calls, so one reference serves both.
+
+**Two kernels.** `nms_scalar` is the greedy loop, scalar. `nms_hvx` is the same greedy loop, but tests
+each candidate against 64 already-kept boxes per step (two HVX vectors, kept boxes stored
+structure-of-arrays), with one cross-lane OR-reduction per step.
+
+**Getting HVX to agree with ORT exactly took three real findings:**
+
+1. **This phone's HVX has no IEEE fp32.** The CDSP is Hexagon V69. Built with `-mhvx-ieee-fp`, every
+   IEEE `.sf` arithmetic instruction returns 0. Only qfloat exists. (`roialign_fast/`'s kernel was
+   already using qfloat without saying so, which is why it's 6.5e-5 off ORT rather than bit-exact.)
+2. **qfloat doesn't round like IEEE, so the vector test can't decide ties.** Measured on the phone,
+   a qfloat add/sub/mul on IEEE inputs, converted back to `.sf`, is off by up to 2^-23 × the larger
+   **operand**, not the result. It is not exact under cancellation the way IEEE subtraction is:
+   `1346.5 - 1343` gives 3.50012207. Real IoUs land a few ulp from the threshold (one real per-level
+   pair has IoU 0.70000005), so the vector path only decides clear-cut pairs. It computes
+   `d = inter·(1+thr) − thr·(area1+area2)`, which is `inter − thr·union` in exact arithmetic, and
+   bounds its error by 2^-23·(2·M·(w+h) + 7·(area1+area2)), with M the largest coordinate in the call.
+   With the band half-width t at 4× that bound, a pair is *surely suppressed* if d > t, *surely not*
+   if d < −t, and anything in between is re-decided with the exact scalar `SuppressByIOU`. Box-overlap
+   tests are max/min/compare on the input coordinates, which are exact in qfloat.
+3. **clang silently undoes the careful version.** Plain vector-extension C (`a*b - c` on `float`
+   vectors) lowers to chained `vmpy(qf32, qf32)` with no renormalization, which is ~500 ulp off.
+   The first HVX build missed one real per-level call because of it: `inter` came out 880.46875 where IEEE
+   gives 880.498718. Rewriting the chain with explicit intrinsics that convert back to `.sf` after
+   every op wasn't enough either, because LLVM folds each `qf32→sf` conversion into the next op and
+   emits the same `vmpy(qf32, qf32)`: `3.50012207 × 3.00006104` came out 10.5625. An empty
+   `asm("" : "+v"(r))` after each conversion stops the folding (the objdump then has zero
+   qf32-input ops), and the same product comes out 10.5006.
+
+The band rarely fires: 9 exact rechecks in 5214 candidate tests on the real data (30 in 30719 on
+the stress sets; counted on the host's portable path, which uses the same bound). To exercise it
+harder than one image does, `gen_nms_stress_data.py` makes 80 adversarial calls (31.6k boxes):
+coordinates on a coarse grid so many IoUs sit exactly on 0.5/0.7, heavy score ties, zero-area and
+swapped-corner boxes, n from 1 to 2000, coordinates up to ~2000. Before fix 3 the HVX kernel got 12
+of those 80 wrong on the phone, including a pair with IoU exactly 0.5 in real arithmetic. After it,
+all are exact.
+
+**Verified exact (identical selected indices, in order) at every level:**
+
+| check | real data (85 calls) | stress (80 calls) |
+|---|---|---|
+| host C, both kernels (`nms_host_check.c`) | 85/85 | 80/80 |
+| qemu-hexagon, both kernels, portable fp32 path (`nms_qemu.c`) | 85/85 | 80/80 |
+| phone CDSP, `nms_scalar`, 1 and 4 threads | 85/85 | 80/80 |
+| phone CDSP, `nms_hvx` (qfloat), 1/4/5/6 threads | 85/85 | 80/80 |
+
+**Speed on the phone, real data.** Each group runs as one RPC with calls spread across QuRT threads.
+Times are medians of 9 runs. ORT is the sum of per-node medians, since that's how `rest.onnx` runs
+today. ORT's NMS is single-threaded, so its "default" thread setting changes nothing.
+
+| | per level (5 calls) | per class (80 calls) |
+|---|---:|---:|
+| ORT on the phone's CPU (1 thread / default) | 3.66 / 3.64 ms | 0.199 / 0.199 ms |
+| DSP `nms_scalar`, 1 / 4 threads (DSP time) | 16.26 / 8.47 ms | 0.21 / 0.10 ms |
+| DSP `nms_hvx`, 1 thread: DSP time / RPC round trip | 2.34 / 2.71 ms (**1.56x / 1.35x**) | 0.18 / 0.45 ms |
+| DSP `nms_hvx`, 4 threads: DSP time / RPC round trip | 0.93 / 1.26 ms (**3.9x / 2.9x**) | 0.10 / 0.28-0.47 ms |
+| DSP `nms_hvx`, 5 threads: DSP time / RPC round trip | 0.86 / 1.13 ms (**4.2x / 3.2x**) | 0.09 / 0.28-0.40 ms |
+| DSP `nms_hvx`, one RPC per node (as ORT runs them), 1 thread | 3.85 ms (~1.0x) | 18.9 ms (**95x slower**) |
+
+- **Per-level NMS is a real win:** about 3x ORT on the phone's CPU including the RPC round trip, with
+  4-5 threads. 4 threads leave one thread with two of the five calls, which is why 5 helps a little.
+- **Per-class NMS should stay on the CPU unless it's fused into a larger DSP call.** ORT does all 80
+  calls in 0.2 ms; one batched RPC already costs more than that in round trip alone, and one RPC per
+  node is 95x slower.
+- The scalar kernel is exact but 4.4x slower than ORT (the DSP's scalar core against a big ARM core).
+  It's the fallback and the correctness reference, not the fast path.
+
+Not done: fusing NMS with its neighbours (proposal decode/TopK before it, RoiAlign after) into one
+DSP call, which is where the per-class calls would stop paying a round trip each; one image's real
+calls only for timing; `score_threshold`/`center_point_box=1`/multi-class inputs aren't supported,
+since this model never uses them.
+
+## Fused RPN post-processing: TopK -> decode -> NMS -> proposals in one DSP call
+
+The three kernels above each pay a FastRPC round trip of ~0.25-0.4 ms, which ate much of their
+standalone gain. `rpn_fused/` runs the whole RPN post-processing span as **one** DSP call: the
+per-level objectness scores and box deltas go in, the proposal list comes out, and every
+intermediate stays on the DSP. It includes `../proposal_decode/pd_kernel.h`,
+`../topk/topk_kernel.h` and `../nms/nms_kernel.h` unchanged; `rpn_fused/rpn_kernel.h` only adds
+the glue between them.
+
+### The real span, read out of the graph
+
+`capture_rpn_fused.py` walks `rest.onnx` and asserts every structural fact and constant instead of
+assuming it. The region is **604 non-Constant nodes**, from 10 inputs (per level: fp32 objectness
+`[1,A]` and fp32 per-anchor deltas `[1,A,4]`, today's backbone/rest boundary) to one output, tensor
+`2527`: the proposal list that feeds the box/mask heads. Per FPN level:
+
+1. TopK(objectness, k): k = 1000/1000/1000/1000/663. TopK runs *before* decode.
+2. Proposal decode of those k boxes (the 315-node region `../proposal_decode` replaces).
+3. A width/height "min-size" filter that nothing mentioned before: `w = (x2 - x1) + 1`,
+   `h = (y2 - y1) + 1`, Q/DQ'd onto their own **uint8** grid (P2-P5: the box grid's scale 5.0157;
+   P6: 5.0196), keep `!(w < 0) && !(h < 0)`, then NonZero + Gather on boxes and TopK values.
+4. NMS (iou 0.7, max 2000; the per-level 5 of the 85).
+5. `Gather(selected, 2) -> Slice[0:1000]`: the first <=1000 selections. It never binds here, since
+   each level has at most 1000 boxes.
+
+Then the 5 levels are concatenated (P2..P6), a second TopK takes the top min(1000, N) scores, and
+its indices gather the boxes. That TopK is the "post-NMS 1465 -> 1000" call in the TopK section;
+its values output is unused. The region **stops at the proposal list** because the next ops (FPN
+level assignment via sqrt/log/floor, per-level NonZero/Gather/ScatterElements around RoiAlign)
+have no DSP implementation yet. That is where the graph goes back to the CPU.
+
+Two facts make the glue simple and exact:
+- **Every box after decode sits on the single uint8 box grid** (scale 5.0157, zero point 0). The
+  graph's many later Q/DQs onto that same grid (after the Split, each Gather, the Concat) are
+  identities on grid values, so the kernel only moves boxes between decode and the output.
+- **The min-size filter can never drop a box in this model, for any input.** Its w/h grids are
+  uint8 with zero point 0, so a dequantized w/h is `q * s` with q >= 0, and `Less(., 0)` is always
+  false. On the DSP it cost ~87 us per level for nothing, so the kernel reads the boxes in place
+  when the zero point is 0; `rpn_exact_filter = 1` computes it exactly as the graph does. The host
+  check and qemu verify both paths.
+
+### Correctness: byte-exact at every level, on 5 images
+
+Five COCO images (000000000139, 632, 724, 785, 1000); each keeps 1262-1642 boxes after the per-level
+NMS, and every one ends in 1000 proposals.
+
+| check | result |
+|---|---|
+| host C (`rpn_host_check.c`): every intermediate (per-level TopK values+indices, decoded boxes, NMS selections, post-NMS TopK indices) and the proposals; both delta sources, both NMS kernels, decode's reference path, the computed filter | byte-exact on all 5 images x 6 variants |
+| qemu, Hexagon v73 (`rpn_qemu.c`, scalar build as for NMS: no qfloat in qemu 8.2) | byte-exact on all 5 images x 5 variants |
+| **phone CDSP** (`rpn_client.c`): proposals + per-level NMS kept counts, 11 configurations | **byte-exact on all 5 images x 11 configurations** |
+| ORT on the phone's CPU, the same 604 nodes (`ort_rpn_bench.c`) | matches the capture on all 5 images |
+
+### Speed on the phone
+
+Medians of 21 runs. "DSP" is `HAP_perf_get_time_us` around the whole span; "round trip" is the
+client-side time for the FastRPC call. ORT is `rpn_region.onnx` (the 604 nodes cut out of
+rest.onnx), one `Run`, stock onnxruntime-android on the phone's CPU. ORT's thread count makes no
+difference (1 thread vs default within 0.02 ms).
+
+| image | ORT CPU | fused, NCHW uint8 source: DSP / round trip | vs ORT | fused, fp32 deltas (today's boundary): DSP / round trip | vs ORT |
+|---|---:|---:|---:|---:|---:|
+| 139 | 6.72 ms | 1.48 / 1.98 ms | **3.40x** | 1.69 / 2.19 ms | **3.07x** |
+| 632 | 5.92 ms | 1.49 / 1.92 ms | **3.09x** | 1.61 / 2.08 ms | **2.84x** |
+| 724 | 6.98 ms | 2.01 / 2.49 ms | **2.80x** | 2.15 / 2.62 ms | **2.66x** |
+| 785 | 5.95 ms | 1.68 / 2.12 ms | **2.80x** | 1.83 / 2.27 ms | **2.62x** |
+| 1000 | 6.42 ms | 1.64 / 2.13 ms | **3.02x** | 1.72 / 2.19 ms | **2.93x** |
+
+Against the three standalone calls, all re-measured the same day on the same phone at each one's
+best configuration, image 139:
+
+| | DSP | round trip |
+|---|---:|---:|
+| TopK, 5 levels batched (one thread per level, P2's collect split 4 ways) | 0.37 ms | 0.78 ms |
+| + proposal decode, NCHW source, 6 threads | 0.40 ms | 0.65 ms |
+| + NMS per level, HVX, 5 threads | 0.88 ms | 1.16 ms |
+| **= sum of the three calls** | 1.65 ms | **2.59 ms** |
+| **fused, one call** (NCHW source) | **1.48 ms** | **1.98 ms (1.31x)** |
+
+The fused call also does work the three calls don't cover: the filter, the per-level cap, the
+concat, the post-NMS TopK and the final gather, ~0.1 ms of DSP time. With the fp32-delta source
+the sums are 1.76 / 2.76 ms against the fused 1.69 / 2.19 ms (1.26x).
+
+**Honest reading.** Most of the gain is the two round trips removed (~0.6 ms), plus a small DSP
+win from overlapping. The DSP work itself isn't faster than the three kernels at their best,
+because it is the same code. On today's boundary the whole span is **~2.2 ms end to end against
+~6.4 ms in ORT on the phone's CPU**.
+
+### Scheduling inside the call: what was measured
+
+The obvious layout, one QuRT thread per level running its whole chain, was the **slowest** of the
+multithreaded ones (median 1.97 ms DSP). P2's TopK collect over 163,200 scores ran 1.1-1.3 ms when the
+other four levels' decode and NMS were running alongside it, against 0.49 ms alone. Splitting it
+didn't help either, because the split parts couldn't get an HVX context while the level threads
+held them all. What worked was running the steps in phases, each with the layout its standalone
+kernel measured best:
+
+| layout (median over 5 images) | DSP | round trip |
+|---|---:|---:|
+| everything on one thread | 4.42 ms | 4.99 ms |
+| one thread per level, whole chain | 1.97 ms | 2.44 ms |
+| phased: A TopK (thread per level, P2 split 4) -> B decode split by box over 6 threads -> C NMS per level -> D merge | 1.64 ms | 2.11 ms |
+| phased, decode inside the per-level NMS phase | 1.64 ms | 2.12 ms |
+
+(NCHW source; the last two are within noise of each other, and each wins on some images.) Phase walls on image 139:
+A TopK ~0.36 ms, C decode + NMS ~1.0 ms (the slowest level's NMS, 0.5-0.65 ms, is most of it),
+D merge ~0.1 ms. Two smaller things mattered: the filter shortcut above, and decode (scalar) runs
+before its thread takes an HVX context, so the level threads don't hold every context while
+others still need one for NMS. The TURBO clock vote wasn't measured for the fused call; it changed
+nothing for any of the three standalone kernels.
+
+**Not done:** the next stretch, FPN level assignment and RoiAlign, is still on the CPU. RoiAlign
+has its own DSP kernel (`roialign_fast/`), but the level assignment and the
+NonZero/Gather/ScatterElements around it don't. Fusing those in, and taking the NCHW deltas
+straight from a DSP-resident backbone, would remove the next round trips. Only this span's
+per-level NMS is fused; the 80 per-class NMS calls come later, after the box head.
+
 ## Beyond the backbone: the box-head fc6 MatMul (`hex_boxhead_gemm_kernel.py`)
 
 Every kernel above targets `backbone.onnx` (ResNet-50/FPN/RPN, the Hexagon DSP half of the split
@@ -1897,3 +2366,30 @@ here).
   skel/client (`fpn_rpc.idl`, `fpn_impl.c`, `fpn_client.c`, `build.sh`) that prices the layout on the
   phone: separate transpose 13.3 ms (RoiAlign side 1.42x vs ORT) vs. channels-last producer +2.3 ms
   (1.94x). See "RoiAlign, Stage 3" above.
+- `proposal_decode/` -- RPN proposal decode (post-TopK gather -> delta requant -> Detectron decode ->
+  clip -> box-grid quantize), all 5 FPN levels in one FastRPC call: bit-exact with ONNX Runtime on
+  host, qemu and the phone, 1.58x ORT-on-the-phone end to end with 6 DSP threads, and able to read the
+  backbone's NCHW uint8 conv output directly instead of the full-map per-anchor layout. See
+  "Proposal decode (RPN)" above; `proposal_decode/build.sh` runs the phone side.
+
+- `topk/` -- exact TopK (values and int64 indices byte-equal to ORT, including its tie order) on
+  the CDSP via its own FastRPC skel: threshold select + HVX collect + counting sort by key rank.
+  The five batched per-level selections run in 369 µs of DSP time (720 µs including the round
+  trip) vs ORT-on-phone's 859 µs; the two small downstream TopKs are slower than the CPU. Also
+  documents a qemu 8.2 fault in one `__builtin_reduce_or` lowering (exact on the device). See
+  "TopK" above; `topk/build.sh` reproduces it.
+
+- `nms/` -- NonMaxSuppression for all 85 real `rest.onnx` calls, exact against ONNX Runtime:
+  `nms_kernel.h` (scalar and qfloat-HVX greedy kernels), its own FastRPC skel/client
+  (`nms_rpc.idl`, `nms_impl.c`, `nms_client.c`, `build.sh`), host and qemu checks, real-input capture
+  (`dump_real_nms_io.py`, `gen_nms_test_data.py`), adversarial tie/threshold stress sets
+  (`gen_nms_stress_data.py`), and host and phone ORT baselines (`make_nms_single_node_models.py`,
+  `ort_nms_bench.c`). See "NonMaxSuppression" above.
+- `rpn_fused/` -- the whole RPN post-processing span (per-level TopK -> decode -> w/h filter -> NMS
+  -> cap, then concat -> post-NMS TopK -> gather: the 604 `rest.onnx` nodes from the per-level
+  scores/deltas to the proposal list) as one FastRPC call, built from `proposal_decode/`, `topk/`
+  and `nms/`'s kernel headers unchanged. Byte-exact with ORT on host, qemu and the phone for 5 real
+  images; ~2.2 ms end to end against ~6.4 ms for ORT on the phone's CPU, and 1.31x faster than the
+  three standalone calls combined. `capture_rpn_fused.py` (span + real I/O), `rpn_kernel.h`,
+  `rpn_host_check.c`, `rpn_qemu.c`, `rpn_rpc.idl`/`rpn_impl.c`/`rpn_client.c`, `ort_rpn_bench.c`,
+  `build.sh`. See "Fused RPN post-processing" above.

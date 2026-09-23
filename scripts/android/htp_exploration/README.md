@@ -168,6 +168,35 @@ The other half of the model (`rest.onnx`, 2405 nodes, 300 ms/image on the phone'
 EP-context caveat: the box head's EP-context model runs ~2x slower than the JIT-compiled one
 (52-55 vs 27-40 ms); not root-caused.
 
+## How close to the HTP's ceiling? 18% as shipped, 60% after rewrites (`ceiling_findings.md`)
+
+The practical int8 ceiling, measured on this phone by timing chains of large QDQ conv/MatMul
+layers and differencing chain lengths, is **~16 TMAC/s** (best: 3x3 conv 256->256 @128x128,
+15.9 TMAC/s; data-independent; per-channel weights free; uint16 activations half speed). At that
+rate the backbone's 159.2 GMAC would take 10 ms, so the shipped 54 ms is **18%** of the ceiling.
+
+QNN's own profiler shows convs are only 13% of the shipped model's accelerator time. The rest is
+float glue: the model's residual shortcuts are never quantized (12 of 16 blocks pass the Relu
+output to the next Add in float), so QNN can't form int8 Add units and runs Add/Relu/Q/DQ in
+float on full-resolution tensors. Five ONNX-level rewrites, measured one at a time:
+
+| step | rewrite | wall ms | % of ceiling |
+|---|---|---:|---:|
+| 0 | as shipped | 54.3 | 18% |
+| 1 | residual Adds as int8 QDQ units (quantized shortcut; the only numeric change) | 30.4 | 33% |
+| 2 | uint8 outputs | 21.5 | 47% |
+| 3 | raw RPN conv outputs (no per-anchor layout chain) | 20.8 | 48% |
+| 4 | uint8 NHWC image input | 19.4 | 52% |
+| 5 | NHWC FPN outputs | **16.7** (EP-context cache) | **60%** |
+
+Steps 2-5 are lossless interface changes that hand out what the HTP already holds, in the forms
+this project's DSP kernels already take (NHWC FPN maps for the fast RoiAlign, raw uint8 deltas for
+the fused RPN kernel). Accuracy stays in the same int8 band (FPN max abs 0.93-1.15 vs 0.81-1.08
+unmodified; `cats.jpg` 3/3 detections, box IoU 0.969 vs 0.985).
+`htp_graph_finalization_optimization_mode=3` is 3.6 ms *slower*; `vtcm_mb` and I/O-quantization
+offload are neutral.
+What's left (~7 ms): 19 memory-bound quantized Adds (~4 ms), the cin=3 stem conv, host-side I/O.
+
 ## Files
 
 - `make_tiny_qdq_conv.py` -- builds the minimal QDQ int8 conv model used to
@@ -190,3 +219,11 @@ EP-context caveat: the box head's EP-context model runs ~2x slower than the JIT-
   over a broadcast index to `ScatterND` (bit-exact, 1.6x on `rest.onnx` on the phone's CPU).
 - `rest_htp_findings.md` -- `rest.onnx` on the HTP: partitioning, the heads, the scatter, and the
   per-image pipeline.
+- `ceiling_findings.md` -- the measured HTP int8 ceiling, where the backbone's time goes, and the
+  five rewrites that take it from 18% to 60% of that ceiling.
+- `ceiling/` -- `gen_ceiling_models.py` / `run_ceiling.sh` / `summarize_ceiling.py` (ceiling
+  sweep), `profile_backbone.sh` / `analyze_profile.py` (QNN profiling + attribution), the rewrites
+  (`quantize_residuals.py`, `quantized_outputs.py`, `raw_rpn_outputs.py`, `quantized_input.py`,
+  `nhwc_fpn_outputs.py`, chained by `make_optimized.sh`), and `compare_optimized.py` (accuracy of
+  the rewritten model against the original on host ORT). `qnn_shell/qnn_run.cpp` now also takes
+  uint8 inputs and writes non-fp32 outputs at their real element size.

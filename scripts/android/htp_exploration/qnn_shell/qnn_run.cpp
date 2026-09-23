@@ -98,14 +98,19 @@ int main(int argc, char** argv) {
     auto shape = in_info.GetShape();
     size_t n = 1;
     for (auto& d : shape) n *= (d < 0 ? 1 : d);
-    std::vector<float> input(n, 0.f);
+    // float32 input by default; uint8 if the model takes a pre-quantized image (../ceiling/)
+    const bool u8_in = in_info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+    const size_t in_bytes = n * (u8_in ? 1 : sizeof(float));
+    std::vector<unsigned char> input(in_bytes, 0);
     if (input_path != "-") {
       std::ifstream f(input_path, std::ios::binary);
-      f.read(reinterpret_cast<char*>(input.data()), n * sizeof(float));
+      f.read(reinterpret_cast<char*>(input.data()), in_bytes);
       if (!f) throw std::runtime_error("short input file");
     }
     auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-    Ort::Value x = Ort::Value::CreateTensor<float>(mem, input.data(), n, shape.data(), shape.size());
+    Ort::Value x = u8_in ? Ort::Value::CreateTensor<uint8_t>(mem, input.data(), n, shape.data(), shape.size())
+                         : Ort::Value::CreateTensor<float>(mem, reinterpret_cast<float*>(input.data()), n,
+                                                           shape.data(), shape.size());
 
     size_t nout = sess.GetOutputCount();
     std::vector<Ort::AllocatedStringPtr> out_names_hold;
@@ -127,9 +132,17 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < nout; ++i) {
       auto ti = outs[i].GetTensorTypeAndShapeInfo();
       size_t cnt = ti.GetElementCount();
+      size_t es = 4;  // float32 unless the model emits quantized outputs (../ceiling/)
+      switch (ti.GetElementType()) {
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8: es = 1; break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16: es = 2; break;
+        default: break;
+      }
       std::string p = out_prefix + "_o" + std::to_string(i) + ".bin";
       FILE* f = fopen(p.c_str(), "wb");
-      fwrite(outs[i].GetTensorData<float>(), sizeof(float), cnt, f);
+      fwrite(outs[i].GetTensorRawData(), es, cnt, f);
       fclose(f);
       printf("out %zu %s elems=%zu\n", i, out_names[i], cnt);
     }
