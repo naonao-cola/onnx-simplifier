@@ -4,8 +4,10 @@
 #   MODELS=<build_models.py --out dir> ./deploy.sh      models pushed from the host instead
 #   IMGS="a.jpg b.jpg ..." ./deploy.sh                  JPEGs for the "images" test mode
 #   YOLO="<deploy work>/yolo26n/pipe/yolo26n.onnx ..." ./deploy.sh   models for the YOLO mode
+#   SAM=<sam.py work dir, e.g. ~/.cache/onnxsim-sam/efficientvit_sam_l0> ./deploy.sh   the SAM mode
 # Then:  adb shell am start -n org.onnxsim.maskrcnndemo/.MainActivity [--es mode images] [--es pipe pipe_e_opt.txt]
 #        adb shell am start -n org.onnxsim.maskrcnndemo/.YoloActivity [--es mode images] [--es model yolo11n]
+#        adb shell am start -n org.onnxsim.maskrcnndemo/.SamActivity [--es mode images] [--es tap 0.5,0.5]
 #
 # Files go to the app's *internal* files dir through `run-as` (the APK is debuggable): files adb
 # puts under /sdcard/Android/data/<pkg> are owned by the shell user and unreadable by the app.
@@ -53,6 +55,17 @@ if [ -n "${YOLO:-}" ]; then
     "${A[@]}" push -q "$f" "$STAGE/yolo/"
     b=$(basename "$f")
     RA "cmp -s $STAGE/yolo/$b files/models/$b || { cp $STAGE/yolo/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
+  done
+fi
+# SAM mode: EfficientViT-SAM-L0 from ../vision_models/sam (sam.py export + quantize; its work dir,
+# e.g. SAM=$HOME/.cache/onnxsim-sam/efficientvit_sam_l0): enc.fp16.onnx -> sam_l0_enc.onnx,
+# dec.sim.onnx -> sam_l0_dec.onnx. EP-context models are compiled on the app's first SAM launch.
+if [ -n "${SAM:-}" ]; then
+  "${A[@]}" shell "mkdir -p $STAGE/sam"
+  "${A[@]}" push -q "$SAM/enc.fp16.onnx" "$STAGE/sam/sam_l0_enc.onnx"
+  "${A[@]}" push -q "$SAM/dec.sim.onnx" "$STAGE/sam/sam_l0_dec.onnx"
+  for b in sam_l0_enc.onnx sam_l0_dec.onnx; do
+    RA "cmp -s $STAGE/sam/$b files/models/$b || { cp $STAGE/sam/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
   done
 fi
 if [ -n "${IMGS:-}" ]; then

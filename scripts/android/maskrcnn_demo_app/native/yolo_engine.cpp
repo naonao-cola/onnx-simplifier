@@ -24,33 +24,21 @@
 #include <mutex>
 #include <numeric>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include "htp_session.h"
+#include "yuv_upright.h"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "YoloDemo", __VA_ARGS__)
 
 namespace {
 constexpr int S = 640;           // model input side
 constexpr uint8_t kPad = 114;    // Ultralytics letterbox fill
-double now_ms() {
-  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-template <class F>
-void par(long n, int threads, F f) {
-  std::vector<std::thread> th;
-  const long step = (n + threads - 1) / threads;
-  for (int t = 1; t < threads; ++t) {
-    long a = t * step, b = std::min(n, a + step);
-    if (a < b) th.emplace_back([=] { f(a, b); });
-  }
-  f(0, std::min(n, step));
-  for (auto& x : th) x.join();
-}
+using demo::now_ms;
 
-std::unique_ptr<Ort::Env> g_env;
+demo::Htp g_htp;
 std::unique_ptr<Ort::Session> g_sess;
-std::vector<Ort::ConstEpDevice> g_npu;
 std::string g_in, g_out, g_post, g_err;
 std::vector<uint8_t> g_q(S * S * 3);
 std::vector<float> g_head;
@@ -184,55 +172,13 @@ int emit(const Fit& f, float* times, double t0, JNIEnv* e, jfloatArray jb, jintA
 }
 
 void init(const std::string& dir, const std::string& lib_dir, const std::string& model, const std::string& opts) {
-  std::unordered_map<std::string, std::string> o{{"post", model.rfind("yolo26", 0) == 0 ? "end2end" : "nms"},
-                                                 {"htp_performance_mode", "burst"}};
-  size_t p = 0;
-  while (p < opts.size()) {
-    size_t q = opts.find(';', p);
-    std::string kv = opts.substr(p, q == std::string::npos ? std::string::npos : q - p);
-    size_t eq = kv.find('=');
-    if (eq != std::string::npos) o[kv.substr(0, eq)] = kv.substr(eq + 1);
-    if (q == std::string::npos) break;
-    p = q + 1;
-  }
+  auto o = demo::parse_opts(opts, {{"post", model.rfind("yolo26", 0) == 0 ? "end2end" : "nms"},
+                                   {"htp_performance_mode", "burst"}});
   g_post = o["post"];
   if (o.count("conf")) g_conf = std::stof(o["conf"]);
-  if (!g_env) {
-    std::string adsp = lib_dir + ";/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp";
-    setenv("ADSP_LIBRARY_PATH", adsp.c_str(), 1);
-    Ort::ThreadingOptions to;
-    to.SetGlobalIntraOpNumThreads(1);
-    to.SetGlobalInterOpNumThreads(1);
-    to.SetGlobalSpinControl(0);  // ORT_SPIN=0: pool spinning starves our own threads
-    g_env = std::make_unique<Ort::Env>(to, ORT_LOGGING_LEVEL_WARNING, "yolo");
-    std::string ep = lib_dir + "/libonnxruntime_providers_qnn.so";
-    g_env->RegisterExecutionProviderLibrary("QNNExecutionProvider", ep.c_str());
-    for (const auto& d : g_env->GetEpDevices())
-      if (std::string(d.EpName()) == "QNNExecutionProvider" && d.Device().Type() == OrtHardwareDeviceType_NPU)
-        g_npu.push_back(d);
-    if (g_npu.empty()) throw std::runtime_error("no QNN NPU ep device");
-  }
-  g_sess.reset();
-  Ort::SessionOptions so;
-  so.DisablePerSessionThreads();
-  so.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
-  std::unordered_map<std::string, std::string> qo{{"backend_type", "htp"},
-                                                  {"htp_performance_mode", o["htp_performance_mode"]}};
-  so.AppendExecutionProvider_V2(*g_env, g_npu, qo);
-  // EP-context model (context binary in its own file), compiled on the first launch and reused
-  const std::string src = dir + "/" + model + ".onnx", ctx = dir + "/" + model + ".ctx0.onnx";
-  if (!std::ifstream(ctx)) {
-    const double t = now_ms();
-    Ort::ModelCompilationOptions co(*g_env, so);
-    co.SetInputModelPath(src.c_str());
-    co.SetOutputModelPath(ctx.c_str());
-    co.SetEpContextEmbedMode(false);
-    Ort::Status st = Ort::CompileModel(*g_env, co);
-    if (!st.IsOK()) throw std::runtime_error("CompileModel " + src + ": " + st.GetErrorMessage());
-    LOGI("compiled %s in %.0f ms", ctx.c_str(), now_ms() - t);
-  }
-  const double t = now_ms();
-  g_sess = std::make_unique<Ort::Session>(*g_env, ctx.c_str(), so);
+  g_htp.init(lib_dir, "yolo");
+  g_sess.reset();  // one model at a time: the previous HTP session goes before the next loads
+  g_sess = g_htp.session(dir, model, o["htp_performance_mode"], "YoloDemo");
   Ort::AllocatorWithDefaultOptions a;
   g_in = g_sess->GetInputNameAllocated(0, a).get();
   g_out = g_sess->GetOutputNameAllocated(0, a).get();
@@ -241,8 +187,7 @@ void init(const std::string& dir, const std::string& lib_dir, const std::string&
   g_ch = (int)sh[1];
   g_n = (int)sh[2];
   g_head.assign((size_t)g_ch * g_n, 0.f);
-  LOGI("session %s in %.0f ms: %s -> %s (1,%d,%d), post %s", ctx.c_str(), now_ms() - t, g_in.c_str(), g_out.c_str(),
-       g_ch, g_n, g_post.c_str());
+  LOGI("%s: %s -> %s (1,%d,%d), post %s", model.c_str(), g_in.c_str(), g_out.c_str(), g_ch, g_n, g_post.c_str());
 }
 }  // namespace
 
@@ -283,51 +228,30 @@ extern "C" JNIEXPORT jint JNICALL Java_org_onnxsim_maskrcnndemo_YoloEngine_nativ
   const double t0 = now_ms();
   float times[4] = {0, 0, 0, 0};
   try {
-    const uint8_t* py = (const uint8_t*)e->GetDirectBufferAddress(jy);
-    const uint8_t* pu = (const uint8_t*)e->GetDirectBufferAddress(ju);
-    const uint8_t* pv = (const uint8_t*)e->GetDirectBufferAddress(jv);
-    const int RW = (rot % 180) ? h : w, RH = (rot % 180) ? w : h;
+    const demo::YuvPlanes P{(const uint8_t*)e->GetDirectBufferAddress(jy), (const uint8_t*)e->GetDirectBufferAddress(ju),
+                            (const uint8_t*)e->GetDirectBufferAddress(jv), ys, uvs, uvps, w, h};
+    int RW, RH;
+    demo::upright_dims(P, rot, &RW, &RH);
     const Fit f = fit(RW, RH);
     AndroidBitmapInfo bi;
     uint8_t* dp = nullptr;
     if (disp && AndroidBitmap_getInfo(e, disp, &bi) == 0 && (int)bi.width == f.fw && (int)bi.height == f.fh &&
         AndroidBitmap_lockPixels(e, disp, (void**)&dp) != 0)
       dp = nullptr;
-    std::vector<int> rxs(f.fw), rys(f.fh);
-    for (int x = 0; x < f.fw; ++x) rxs[x] = std::min(RW - 1, (int)(((long)x * RW + RW / 2) / f.fw));
-    for (int y = 0; y < f.fh; ++y) rys[y] = std::min(RH - 1, (int)(((long)y * RH + RH / 2) / f.fh));
     pad_rows(f.top, f.fh);
-    par(f.fh, 4, [&](long a, long b) {
-      for (long oy = a; oy < b; ++oy) {
-        uint8_t* o = g_q.data() + ((size_t)(f.top + oy) * S) * 3;
-        memset(o, kPad, (size_t)f.left * 3);
-        memset(o + (size_t)(f.left + f.fw) * 3, kPad, (size_t)(S - f.left - f.fw) * 3);
-        o += (size_t)f.left * 3;
-        uint8_t* d = dp ? dp + oy * bi.stride : nullptr;
-        const int ry = rys[oy];
-        for (int ox = 0; ox < f.fw; ++ox) {
-          const int rx = rxs[ox];
-          int sx, sy;
-          switch (rot) {
-            case 90: sx = ry; sy = h - 1 - rx; break;
-            case 180: sx = w - 1 - rx; sy = h - 1 - ry; break;
-            case 270: sx = w - 1 - ry; sy = rx; break;
-            default: sx = rx; sy = ry;
-          }
-          const int yy = py[sy * ys + sx];
-          const int ci = (sy >> 1) * uvs + (sx >> 1) * uvps;
-          const int uu = pu[ci] - 128, vv = pv[ci] - 128;
-          int r = yy + ((1436 * vv + 512) >> 10);
-          int g = yy - ((352 * uu + 731 * vv + 512) >> 10);
-          int bb = yy + ((1815 * uu + 512) >> 10);
-          r = r < 0 ? 0 : (r > 255 ? 255 : r);
-          g = g < 0 ? 0 : (g > 255 ? 255 : g);
-          bb = bb < 0 ? 0 : (bb > 255 ? 255 : bb);
-          o[3 * ox] = (uint8_t)r;
-          o[3 * ox + 1] = (uint8_t)g;
-          o[3 * ox + 2] = (uint8_t)bb;
-          if (d) { d[4 * ox] = (uint8_t)r; d[4 * ox + 1] = (uint8_t)g; d[4 * ox + 2] = (uint8_t)bb; d[4 * ox + 3] = 255; }
-        }
+    for (int oy = 0; oy < f.fh; ++oy) {  // the letterbox's left/right bars
+      uint8_t* o = g_q.data() + ((size_t)(f.top + oy) * S) * 3;
+      memset(o, kPad, (size_t)f.left * 3);
+      memset(o + (size_t)(f.left + f.fw) * 3, kPad, (size_t)(S - f.left - f.fw) * 3);
+    }
+    demo::yuv_upright(P, rot, f.fw, f.fh, 4, [&](int oy, int ox, uint8_t r, uint8_t g, uint8_t b) {
+      uint8_t* o = g_q.data() + ((size_t)(f.top + oy) * S + f.left + ox) * 3;
+      o[0] = r;
+      o[1] = g;
+      o[2] = b;
+      if (dp) {
+        uint8_t* d = dp + (size_t)oy * bi.stride + 4 * ox;
+        d[0] = r; d[1] = g; d[2] = b; d[3] = 255;
       }
     });
     if (dp) AndroidBitmap_unlockPixels(e, disp);

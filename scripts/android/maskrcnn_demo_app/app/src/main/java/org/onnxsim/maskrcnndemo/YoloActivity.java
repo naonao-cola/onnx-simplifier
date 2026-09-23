@@ -34,15 +34,13 @@ public class YoloActivity extends MainActivity {
     }
 
     @Override
-    void switchTo(String activity, String model) {
-        if (activity.equals("yolo")) {
-            wantModel = model;  // picked up by the loop
-            return;
-        }
-        android.content.Intent i = new android.content.Intent(this, MainActivity.class);
-        i.putExtra("mode", cameraMode ? "camera" : "images");
-        startActivity(i);
-        finish();
+    String activityKey() {
+        return "yolo";
+    }
+
+    @Override
+    void switchInPlace(String model) {
+        wantModel = model;  // picked up by the loop
     }
 
     @Override

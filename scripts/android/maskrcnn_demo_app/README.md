@@ -42,11 +42,41 @@ Measured on the phone (medians of the app's running averages, under the shared p
 | YOLO11n, camera, AE default | 14.2 (camera-capped) | 10.0 ms | 5.5 | 3.0 | 1.4 |
 | **YOLO26n, camera, fixed 30 FPS AE** | **30.0-30.6 (camera-capped)** | 8.2-9.0 ms | 4.5-5.6 | 2.9 | 0.5-0.8 |
 
+<img src="docs/yolo26n_images.jpg" width="240" alt="YOLO26n on COCO val2017 #139 in the app">
+
 Inference alone would allow ~110 FPS from the camera and ~330 FPS from decoded images; end to end is
 bounded by the camera (30 FPS) and, in images mode, by the Java JPEG decode + UI draw per frame.
 The camera preprocessing (4.5-5.6 ms at 640x480) is the column-wise plane reads of the 90-degree
 rotation, as in the Mask R-CNN path. Box placement was checked visually on COCO val2017 #139.
 YOLO26's end-to-end top-k is cheaper than YOLO11's NMS here too (0.3 vs 0.6 ms on images).
+
+## SAM mode (tap to segment, EfficientViT-SAM-L0)
+
+The "SAM" button runs Segment Anything (`SamActivity`, its own process `:sam`,
+`native/sam_engine.cpp` -> `libsam_demo.so`): EfficientViT-SAM-L0 from `../vision_models/sam`
+(PR #1876, with its exact bicubic-as-depthwise-conv neck rewrite), encoder and decoder both strict on
+the HTP from EP-context models.
+
+- **images:** each test image is encoded once (longest side -> 512, padded bottom/right with the SAM
+  mean pixel, uint8 NHWC; normalization is in the graph); every tap runs only the decoder with that
+  point (+ a padding point), and the mask of slot 1 + argmax(iou[1:]) is overlaid (a low-res pixel =
+  2x2 encoder pixels). "Next image" moves on.
+- **camera:** a live preview (no inference); a tap freezes that frame and runs the encoder, then the
+  decoder; further taps only decode; "Live" unfreezes.
+- Models: `SAM=$HOME/.cache/onnxsim-sam/efficientvit_sam_l0 ./deploy.sh` (the `sam.py` work dir:
+  `enc.fp16.onnx`, `dec.sim.onnx`); `--es tap 0.5,0.55` taps automatically after each encode.
+
+| | ms |
+|---|---:|
+| encoder, per image / frozen frame (pre 0.3-0.4, camera 5.6) | 41.3-42.5 |
+| decoder, per tap | 11.2-13.6 |
+| first tap on a new image / frozen camera frame | ~53-60 |
+| init, first launch (compiles both HTP graphs) / later launches | 11.0 s / 0.44 s |
+
+<img src="docs/sam_l0_images.jpg" width="240" alt="SAM mode: a tap on the snow segments the slope around the skier">
+
+(phone, under the shared phone lock; the encoder matches #1876's 41.8 ms.) Each extra tap costs
+~11 ms, so segmenting feels immediate after the one-off encode.
 
 ## Result
 

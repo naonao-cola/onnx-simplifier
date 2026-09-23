@@ -24,6 +24,13 @@ final class OverlayView extends View {
     private final Paint statsBg = new Paint();
     private final Paint maskPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final int[] maskPx = new int[784];
+    // SAM mode: a mask bitmap drawn over the frame rect (0, 0, extraW, extraH) in frame pixels, and
+    // the tap that produced it
+    private Bitmap extra;
+    private float extraW, extraH, markX = -1, markY = -1;
+    private final Paint markPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    // the last frame's placement on screen: view = o + frame * sc
+    private volatile float lastOx, lastOy, lastSc = 0;
 
     OverlayView(Context c) {
         super(c);
@@ -40,6 +47,25 @@ final class OverlayView extends View {
         result = r;
         stats = s;
         postInvalidate();
+    }
+
+    /** Frame + panel + an overlay bitmap covering frame pixels (0, 0, w, h) and a tap marker (x, y). */
+    void update(Engine.Result r, String s, Bitmap overlayBmp, float w, float h, float x, float y) {
+        extra = overlayBmp;
+        extraW = w;
+        extraH = h;
+        markX = x;
+        markY = y;
+        update(r, s);
+    }
+
+    /** View coordinates -> the displayed frame's pixels, null if no frame yet or outside it. */
+    float[] toFrame(float vx, float vy) {
+        Engine.Result r = result;
+        if (r == null || r.frame == null || lastSc == 0) return null;
+        float fx = (vx - lastOx) / lastSc, fy = (vy - lastOy) / lastSc;
+        if (fx < 0 || fy < 0 || fx >= r.frame.getWidth() || fy >= r.frame.getHeight()) return null;
+        return new float[] {fx, fy};
     }
 
     void setStats(String s) {
@@ -60,6 +86,14 @@ final class OverlayView extends View {
             float sc = Math.min(getWidth() / fw, getHeight() / fh);
             float ox = (getWidth() - fw * sc) / 2, oy = (getHeight() - fh * sc) / 2;
             cv.drawBitmap(r.frame, null, new RectF(ox, oy, ox + fw * sc, oy + fh * sc), null);
+            lastOx = ox;
+            lastOy = oy;
+            lastSc = sc;
+            if (extra != null) cv.drawBitmap(extra, null, new RectF(ox, oy, ox + extraW * sc, oy + extraH * sc), maskPaint);
+            if (markX >= 0) {
+                markPaint.setColor(Color.YELLOW);
+                cv.drawCircle(ox + markX * sc, oy + markY * sc, 14f, markPaint);
+            }
             for (int i = 0; i < r.n; i++) {
                 if (r.scores[i] < r.thresh) continue;
                 int col = color(r.labels[i]);

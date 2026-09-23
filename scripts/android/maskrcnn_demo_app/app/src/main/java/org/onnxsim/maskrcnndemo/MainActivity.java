@@ -71,7 +71,8 @@ public class MainActivity extends Activity {
     private Thread worker;
 
     /** The demo's models: button label, then the activity (process) that runs it and its model extra. */
-    static final String[][] MODELS = {{"Mask R-CNN", "", ""}, {"YOLO26n", "yolo", "yolo26n"}, {"YOLO11n", "yolo", "yolo11n"}};
+    static final String[][] MODELS = {{"Mask R-CNN", "", ""}, {"YOLO26n", "yolo", "yolo26n"}, {"YOLO11n", "yolo", "yolo11n"},
+            {"SAM", "sam", ""}};
 
     // The fastest measured configuration (README "Optimizations"); pass --es pipe pipe_e_opt.txt
     // --es opts "" for the original #1841 path.
@@ -134,16 +135,28 @@ public class MainActivity extends Activity {
         return bar;
     }
 
+    /** This activity's key in MODELS ("" = Mask R-CNN). */
+    String activityKey() {
+        return "";
+    }
+
+    /** Switch to another model of this same activity (YoloActivity: another YOLO). */
+    void switchInPlace(String model) {}
+
     /**
      * Switch model. Each engine runs in its own process (the native engines keep process-wide
-     * HTP/DSP state, and onDestroy ends the process), so switching between Mask R-CNN and YOLO
-     * starts the other activity and finishes this one; YoloActivity switches YOLO models in place.
+     * HTP/DSP state, and onDestroy ends the process), so one engine is loaded at a time: switching
+     * activities starts the other one and finishes (and kills) this one.
      */
-    void switchTo(String activity, String model) {
-        if (activity.isEmpty()) return;  // already Mask R-CNN
-        android.content.Intent i = new android.content.Intent(this, YoloActivity.class);
+    void switchTo(String key, String model) {
+        if (key.equals(activityKey())) {
+            switchInPlace(model);
+            return;
+        }
+        Class<?> c = key.equals("yolo") ? YoloActivity.class : key.equals("sam") ? SamActivity.class : MainActivity.class;
+        android.content.Intent i = new android.content.Intent(this, c);
         i.putExtra("mode", cameraMode ? "camera" : "images");
-        i.putExtra("model", model);
+        if (!model.isEmpty()) i.putExtra("model", model);
         startActivity(i);
         finish();
     }
