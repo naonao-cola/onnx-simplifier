@@ -674,6 +674,118 @@ def test_fuse_rms_norm_below_opset_23_untouched():
     assert ops["Mul"] == 2
 
 
+def _f16(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.float16), name)
+
+
+# HuggingFace's Qwen2/Qwen3/LLaMA ``RMSNorm.forward`` upcasts to fp32 around
+# the reduction and casts back before the weight multiply; torch's dynamo
+# exporter emits it verbatim -- it is every norm in a TensorRT Edge-LLM
+# export (scripts/nvidia/README.md's Edge-LLM section). `{extra}` lets a test
+# add a stray consumer of the upcast value.
+_UPCAST_RMS_NORM = """
+    g (float16[2,4,8] X) => (float16[2,4,8] Y{extra_out})
+    <float two = {{2.0}}, int64[1] axes = {{-1}}, float eps = {{1e-06}}>
+    {{
+      xu = Cast<to = 1>(X)
+      sq = Pow(xu, two)
+      var = ReduceMean<keepdims = 1>(sq, axes)
+      var_eps = Add(var, eps)
+      rms = Sqrt(var_eps)
+      inv_rms = Reciprocal(rms)
+      normed = Mul(xu, inv_rms)
+      normed_t = Cast<to = {down}>(normed)
+      Y = Mul(weight, normed_t)
+      {extra}
+    }}
+"""
+
+
+def test_fuse_rms_norm_fp32_upcast():
+    # The upcast variant is exactly RMSNormalization's reference body with
+    # stash_type=FLOAT (Cast X to the stash type, normalize, Cast back to T,
+    # then multiply by scale), so both Casts fold into the fused node.
+    weight = np.random.randn(8) * 0.02 + 1.0
+    model = _model(
+        _UPCAST_RMS_NORM.format(down=10, extra="", extra_out=""),
+        initializer=[_f16(weight, "weight")],
+        opset=23,
+        ir_version=11,
+    )
+    sim_model, ops = _simplify(model)
+    assert ops == {"RMSNormalization": 1}
+    (rms,) = sim_model.graph.node
+    assert list(rms.input) == ["X", "weight"]
+    attrs = {a.name: onnx.helper.get_attribute_value(a) for a in rms.attribute}
+    assert attrs["stash_type"] == onnx.TensorProto.FLOAT
+    assert attrs["axis"] == -1
+
+
+def test_fuse_rms_norm_fp32_upcast_shared_upcast_untouched():
+    # The fp32 copy of X also feeds another output: folding its Cast into
+    # the fused node would drop that consumer's input, so the pass declines.
+    weight = np.random.randn(8) * 0.02 + 1.0
+    model = _model(
+        _UPCAST_RMS_NORM.format(
+            down=10, extra="Z = Identity(xu)", extra_out=", float[2,4,8] Z"
+        ),
+        initializer=[_f16(weight, "weight")],
+        opset=23,
+        ir_version=11,
+    )
+    _, ops = _simplify(model)
+    assert ops["RMSNormalization"] == 0
+
+
+def test_fuse_rms_norm_fp32_upcast_downcast_type_mismatch_untouched():
+    # Casting back to something other than X's own type (here fp16 X,
+    # bf16 result) is not RMSNormalization's Cast-back-to-T semantics.
+    weight = np.random.randn(8) * 0.02 + 1.0
+    model = _model(
+        _UPCAST_RMS_NORM.format(down=16, extra="", extra_out="").replace(
+            "float16[2,4,8] Y", "bfloat16[2,4,8] Y"
+        ),
+        initializer=[
+            onnx.helper.make_tensor(
+                "weight", onnx.TensorProto.BFLOAT16, [8], weight.tolist()
+            )
+        ],
+        opset=23,
+        ir_version=11,
+    )
+    # check_n=0: onnxruntime's CPU provider has no bf16 Mul kernel.
+    sim_model, _ = onnxsim.simplify(model, check_n=0)
+    ops = collections.Counter(n.op_type for n in sim_model.graph.node)
+    assert ops["RMSNormalization"] == 0
+
+
+def test_fuse_rms_norm_inner_axis_untouched():
+    # RMSNormalization normalizes over *every* axis from `axis` to the last,
+    # so a mean over axis 1 alone of a rank-3 tensor has no single-node
+    # equivalent: fusing it as axis=1 would silently also reduce over axis 2.
+    weight = np.random.randn(4, 1) * 0.02 + 1.0
+    model = _model(
+        """
+        g (float[2,4,8] X) => (float[2,4,8] Y)
+        <float two = {2.0}, int64[1] axes = {1}, float eps = {1e-06}>
+        {
+          sq = Pow(X, two)
+          var = ReduceMean<keepdims = 1>(sq, axes)
+          var_eps = Add(var, eps)
+          rms = Sqrt(var_eps)
+          inv_rms = Reciprocal(rms)
+          normed = Mul(X, inv_rms)
+          Y = Mul(weight, normed)
+        }
+        """,
+        initializer=[_f32(weight, "weight")],
+        opset=23,
+        ir_version=11,
+    )
+    _, ops = _simplify(model)
+    assert ops["RMSNormalization"] == 0
+
+
 # --------------------------------------------------------------------------- #
 # fuse_rope -- HuggingFace-style "rotate_half" rotary position embedding
 # application (see fuse_rope.h's own top comment and test_mnn_llm_export.py's

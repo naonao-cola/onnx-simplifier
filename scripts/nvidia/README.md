@@ -452,3 +452,47 @@ within ~1.3-1.7x of the theoretical (unreliable) single-engine latency, while bu
 loading reliably every time, unlike K=24. This is a genuine, real-hardware answer to "can
 a small decoder LLM be deployed via plain ONNX-import TensorRT on an 8 GB Jetson Orin Nano
 at all" -- yes, with this splitting, even though the unsplit graph cannot.
+
+## TensorRT-LLM and TensorRT Edge-LLM: ONNX status and onnxsim fusion
+
+Checked 2026-09-23 against TensorRT-LLM `main` (1.3.0rc28) / 1.2.1 and TensorRT Edge-LLM
+0.10.1 (`e8b2952`), on an x86 RTX 5050 (sm_120) host.
+
+**TensorRT-LLM has no ONNX path for onnxsim to plug into.** It builds models from PyTorch
+module definitions, not ONNX. The legacy TensorRT-engine backend (and every C++ plugin,
+`GPTAttention` included) was deleted from `main` in July 2026
+([NVIDIA/TensorRT-LLM#16369](https://github.com/NVIDIA/TensorRT-LLM/pull/16369)): 1.3
+no longer links TensorRT at all and runs on the PyTorch backend only. 1.2.1, the last
+stable release with the TensorRT path, only touches ONNX in
+`tensorrt_llm/tools/onnx_utils.py::to_onnx` (a weightless `com.nvidia`-domain *debug dump*
+of a TensorRT network, not a runnable model) and a Qwen-VL vision-encoder example. sm_120
+(GeForce RTX 50 series) is a supported architecture.
+
+**TensorRT Edge-LLM is ONNX-first**: HF checkpoint -> `tensorrt-edgellm-export`
+(`torch.onnx.export(dynamo=True, optimize=True)`) -> ONNX with custom-domain plugin nodes ->
+C++ `llm_build` (TensorRT ONNX parser + its plugin library) -> C++ runtime. x86 sm_120 is a
+"Developer" platform in its support matrix; no prebuilt sm_120 CuTe DSL kernels ship, but
+`kernelSrcs/build_cutedsl.py --kernels fmha --gpu_arch sm_120` generates them in seconds.
+
+`Qwen/Qwen3-0.6B`, exported on CPU in fp16 (opset 24, 856 nodes): attention, RoPE, QK-norm
+and the paged-KV-cache update are all inside 28 `trt_edgellm::AttentionPlugin` nodes (with
+empty-string optional inputs); what is left is 57 decomposed RMSNorms and 28 SwiGLU MLPs.
+
+- onnxsim handles the custom-domain plugin nodes fine (kept verbatim, empty optional
+  inputs preserved, constants around them folded), but **before this change it was a
+  no-op: 856 -> 856 nodes**. Every norm is HF's fp32-upcast spelling
+  (`Cast(X, FLOAT) -> Pow/ReduceMean/Add/Sqrt/Reciprocal/Mul -> Cast(fp16) -> Mul(weight)`),
+  which `fuse_rms_norm` explicitly declined.
+- `fuse_rms_norm` now matches that spelling too, as
+  `RMSNormalization<stash_type=FLOAT>(X, weight)` -- exactly the op's own reference body
+  (Cast X to the stash type, normalize, Cast back to T, multiply by scale). **856 -> 400
+  nodes**: all 57 norms fused, 114 of 115 `Cast`s gone, 2.5 s, 5.7 GB peak RSS.
+- Fixed along the way: `fuse_rms_norm` accepted a `ReduceMean` over *any* single axis, but
+  `RMSNormalization` normalizes over every axis from `axis` to the last, so e.g.
+  `ReduceMean(axes=[1])` on a rank-3 tensor fused into a reduction over axes 1 *and* 2
+  (onnxruntime: max |diff| 0.94 vs the decomposed graph on unit-scale input). It now only
+  fuses a last-axis reduction.
+
+Not yet measured: whether TensorRT builds the fused graph into a faster engine than the
+decomposed one (its Myelin compiler may already fuse the decomposed norm), and whether
+Edge-LLM's `llm_build` accepts `RMSNormalization` -- both need a TensorRT SDK install.
