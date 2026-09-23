@@ -29,4 +29,4 @@ D=/data/local/tmp/roialign_u8
 adb -s "$DEVICE_SERIAL" shell "mkdir -p $D"
 adb -s "$DEVICE_SERIAL" push roialign_u8_client roialign_u8_rpc.so "$DATA"/meta.txt "$DATA"/l*_u8.bin "$DATA"/*_rois*.bin "$DATA"/*_rows*.bin "$DATA"/*_ref_u8.bin $D/ >/dev/null
 adb -s "$DEVICE_SERIAL" shell "chmod 755 $D/roialign_u8_client && cd $D && LD_LIBRARY_PATH=/vendor/lib64 ADSP_LIBRARY_PATH=$D \
-  ./roialign_u8_client 'file:///roialign_u8_rpc.so?roialign_u8_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp' $REPS $TURBO $CONFIGS"
+  ${CLIENT_ENV:-} ./roialign_u8_client 'file:///roialign_u8_rpc.so?roialign_u8_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp' $REPS $TURBO $CONFIGS"
