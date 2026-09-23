@@ -3,7 +3,7 @@
 //
 // usage: qnn_run_multi <model.onnx> <manifest.txt> <mode> <iters> <out_prefix> [ctx.onnx]
 //   mode: cpu | htp (strict, no CPU fallback) | htp-fallback
-//   manifest: one input per line, "<name> <f32|i64|i32> <file.bin> <d0,d1,...>"
+//   manifest: one input per line, "<name> <f32|i64|i32|u8|u16> <file.bin> <d0,d1,...>"
 //   outputs: <out_prefix>_o<i>.bin (raw, native dtype) + one "out <i> <name> <dtype> <shape>" line
 //   timing: prints every run, then "median_ms" over runs after the first two (warm-up).
 //   ORT_PROFILE=<prefix>: enable ORT's per-node profiler, JSON written as <prefix>_*.json
@@ -31,7 +31,9 @@ struct In {
   std::vector<char> data;
 };
 
-static size_t esize(const std::string& t) { return t == "i64" ? 8 : 4; }
+static size_t esize(const std::string& t) {
+  return t == "i64" ? 8 : t == "u8" ? 1 : t == "u16" ? 2 : 4;
+}
 
 int main(int argc, char** argv) {
   if (argc < 6) {
@@ -129,6 +131,8 @@ int main(int argc, char** argv) {
     for (auto& in : ins) {
       ONNXTensorElementDataType t = in.dtype == "i64"   ? ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
                                     : in.dtype == "i32" ? ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
+                                    : in.dtype == "u8"  ? ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8
+                                    : in.dtype == "u16" ? ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16
                                                         : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
       xs.push_back(Ort::Value::CreateTensor(mem, in.data.data(), in.data.size(), in.shape.data(),
                                             in.shape.size(), t));
@@ -166,14 +170,17 @@ int main(int argc, char** argv) {
       auto ti = outs[i].GetTensorTypeAndShapeInfo();
       size_t cnt = ti.GetElementCount();
       auto et = ti.GetElementType();
-      size_t es = et == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 ? 8 : 4;
+      size_t es = et == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64    ? 8
+                  : et == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8  ? 1
+                  : et == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16 ? 2
+                                                               : 4;
       std::string p = out_prefix + "_o" + std::to_string(i) + ".bin";
       FILE* f = fopen(p.c_str(), "wb");
       if (cnt) fwrite(outs[i].GetTensorRawData(), es, cnt, f);
       fclose(f);
       std::string sh;
       for (auto d : ti.GetShape()) sh += std::to_string(d) + ",";
-      printf("out %zu %s %s %s\n", i, out_names[i], es == 8 ? "i64" : "f32", sh.c_str());
+      printf("out %zu %s %s %s\n", i, out_names[i], es == 8 ? "i64" : es == 1 ? "u8" : es == 2 ? "u16" : "f32", sh.c_str());
     }
     printf("PASS mode=%s\n", mode.c_str());
   } catch (const std::exception& e) {

@@ -9,10 +9,12 @@ would in the app). fp32 torch runs the same frames alongside. Reports per frame:
 feats/bev/cls/bbox vs fp32, and GT matches for both.
 
 usage: e2e_phone.py --ckpt <pth> --data <nuscenes-mini> --work <work> [--scene scene-0103] [--frames 6]
+       [--backbone backbone6.q8] [--encoder enc3.lin8] [--decoder decoder.sim]  (quantize.py's variants)
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -30,27 +32,41 @@ ADB = ["adb", "-s", DEV]
 
 
 def phone(work: Path, piece: str, inputs: dict) -> tuple[list[np.ndarray], float]:
+    """Run <piece>.onnx (already on the phone) on the HTP. If <piece>.json exists (quantize.py's
+    quantized_io qparams), those inputs are quantized (and transposed to NHWC) on the host and
+    those outputs dequantized, as an app would."""
     tmp = work / "e2e_tmp"
     tmp.mkdir(exist_ok=True)
+    qio = json.loads((work / f"{piece}.json").read_text()) if (work / f"{piece}.json").exists() else {}
     lines = []
     for k, v in inputs.items():
-        v = np.ascontiguousarray(v, np.float32)
+        v, dt = np.ascontiguousarray(v, np.float32), "f32"
+        if k in qio:
+            q = qio[k]
+            hi = np.iinfo(q["dtype"]).max
+            v = np.clip(np.round(v / q["scale"]) + q["zero_point"], 0, hi).astype(q["dtype"])
+            if q.get("layout") == "nhwc":
+                v = np.ascontiguousarray(v.transpose(0, 2, 3, 1))
+            dt = {"uint8": "u8", "uint16": "u16"}[q["dtype"]]
         v.tofile(tmp / f"{k}.bin")
         subprocess.run([*ADB, "push", "-q", str(tmp / f"{k}.bin"), f"{R}/{k}.bin"], check=True)
-        lines.append(f"{k} f32 {k}.bin {','.join(map(str, v.shape))}")
+        lines.append(f"{k} {dt} {k}.bin {','.join(map(str, v.shape))}")
     (tmp / "m.txt").write_text("\n".join(lines) + "\n")
     subprocess.run([*ADB, "push", "-q", str(tmp / "m.txt"), f"{R}/e2e_{piece}.txt"], check=True)
     out = subprocess.run([*ADB, "shell", f"cd {R} && LD_LIBRARY_PATH={R} QNN_PERF=burst "
                           f"ADSP_LIBRARY_PATH='{R};/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp' "
-                          f"./qnn_run_multi {piece}.sim.onnx e2e_{piece}.txt htp 3 e2e_{piece} 2>&1"],
+                          f"./qnn_run_multi {piece}.onnx e2e_{piece}.txt htp 3 e2e_{piece} 2>&1"],
                          capture_output=True, text=True).stdout
     if "PASS" not in out:
         raise RuntimeError(f"{piece}: {out[-400:]}")
     res = []
-    for i, _, dt, shape in re.findall(r"^out (\d+) (\S+) (\S+) (\S+)", out, re.M):
+    for i, name, dt, shape in re.findall(r"^out (\d+) (\S+) (\S+) (\S+)", out, re.M):
         subprocess.run([*ADB, "pull", "-q", f"{R}/e2e_{piece}_o{i}.bin", str(tmp / f"o{i}.bin")], check=True)
         dims = [int(d) for d in re.findall(r"\d+", shape)]
-        res.append(np.fromfile(tmp / f"o{i}.bin", np.float32).reshape(dims))
+        y = np.fromfile(tmp / f"o{i}.bin", {"f32": np.float32, "u8": np.uint8, "u16": np.uint16}[dt]).reshape(dims)
+        if name in qio:
+            y = (y.astype(np.float32) - qio[name]["zero_point"]) * np.float32(qio[name]["scale"])
+        res.append(y)
     return res, float(re.search(r"median_ms ([0-9.]+)", out).group(1))
 
 
@@ -66,6 +82,9 @@ def main():
     ap.add_argument("--work", required=True)
     ap.add_argument("--scene", default="scene-0103")
     ap.add_argument("--frames", type=int, default=6)
+    ap.add_argument("--backbone", default="backbone6.sim", help="model stem in --work (and on the phone)")
+    ap.add_argument("--encoder", default="enc3.sim")
+    ap.add_argument("--decoder", default="decoder.sim")
     a = ap.parse_args()
     torch.set_grad_enabled(False)
     work = Path(a.work)
@@ -87,13 +106,13 @@ def main():
         bev = enc(feats, p_in, has_prev, shift, can_bus, ref_cam, bev_mask)
         cls, bbox = dec(bev)
         # HTP, chained on its own outputs
-        (feats_h,), t_b = phone(work, "backbone6", {"img": f["img"].numpy()})
+        (feats_h,), t_b = phone(work, a.backbone, {"img": f["img"].numpy()})
         p_h = np.zeros((M.NQ, M.EMBED), np.float32) if first else \
             M.rotate_prev_bev(torch.from_numpy(prev["htp"]), can_bus).numpy()
-        (bev_h,), t_e = phone(work, "enc3", {"feats": feats_h, "prev_bev": p_h, "has_prev": has_prev.numpy(),
+        (bev_h,), t_e = phone(work, a.encoder, {"feats": feats_h, "prev_bev": p_h, "has_prev": has_prev.numpy(),
                                              "shift": shift.numpy(), "can_bus": can_bus.numpy(),
                                              "ref_cam": ref_cam.numpy(), "bev_mask": bev_mask.numpy()})
-        (cls_h, bbox_h), t_d = phone(work, "decoder", {"bev_embed": bev_h})
+        (cls_h, bbox_h), t_d = phone(work, a.decoder, {"bev_embed": bev_h})
         r = {}
         for k, (c, b) in {"cpu": (cls, bbox), "htp": (torch.from_numpy(cls_h), torch.from_numpy(bbox_h))}.items():
             boxes, scores, labels = M.decode(c, b)
