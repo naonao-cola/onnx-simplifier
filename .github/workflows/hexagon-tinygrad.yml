@@ -38,13 +38,14 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # onnxsim/tinygrad branch hvx-codegen: the DSP renderer's HVX codegen + the float-MAX __auto_type fix
+  # onnxsim/tinygrad branch hvx-vrmpy-mixed: the DSP renderer's HVX codegen (stage 1, 3167f8b6), the
+  # float-MAX __auto_type fix (fccd84cfa), qfloat (stage 2, hvx-qfloat 847af7eab) and the vrmpy GEMV TC
+  # (9aa4f66a1, onnxsim/tinygrad#5, which test_codegen_vrmpy_gemv checks). vrmpy-hexagon-support's merge
+  # of onnxsim/tinygrad#2 (62d98031) predates the float-MAX fix, and pinning it hangs
+  # test_codegen_float_max_chain_renders_linearly until the runner dies. Move this pin to
+  # vrmpy-hexagon-support once #3/#4/#5 are merged there.
   TINYGRAD_REPO: https://github.com/onnxsim/tinygrad.git
-  # hvx-codegen head: the stage-1 HVX codegen (3167f8b6) plus the float-max source blow-up fix
-  # (fccd84cfa). vrmpy-hexagon-support's merge of onnxsim/tinygrad#2 (62d98031) predates the fix, and
-  # pinning it hangs test_codegen_float_max_chain_renders_linearly until the runner dies. Move this pin
-  # to vrmpy-hexagon-support once the fix is merged there.
-  TINYGRAD_SHA: fccd84cfaf2e0fde4f613df7812f0303cb743e11
+  TINYGRAD_SHA: 9aa4f66a1a7feedf59a5c54a44a34c15bb43c50d
   HEXAGON_TOOLCHAIN_VERSION: "19.0.02"
   HEXAGON_TOOLCHAIN_URL: https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/Debian/19.0.02/Hexagon_open_access.Core.19.0.02.Linux-Any.tar.gz
 

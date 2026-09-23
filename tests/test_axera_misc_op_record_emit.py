@@ -30,20 +30,21 @@ def _mcode(rel: str) -> bytes:
 
 
 @pytest.mark.parametrize(
-    "key", sorted(k for k, v in INDEX.items() if v["op"] != "GreaterCast")
+    "key", sorted(k for k, v in INDEX.items() if v["op"] not in mre.CALIBRATION_FREE)
 )
 def test_own_calibration_is_identity(key):
     # Each template's lanes and zero-point records are exactly what the
     # formulas give for its own calibration.
     meta = INDEX[key]
     mc = _mcode(meta["file"])
-    old = (meta["scales"], meta["zero_points"])
-    shifted = {"x": meta["scales"]["x"] * 1.5, "y": meta["scales"]["y"] * 0.75}
-    moved = mre.retarget(mc, meta["op"], *old[:1], shifted, old[1], old[1])
+    sc, zp, n = meta["scales"], meta["zero_points"], meta.get("reduce_count")
+    y = 1.5 if meta["op"] == "MaxPool" else 0.75  # MaxPool: one shared scale
+    shifted = {"x": sc["x"] * 1.5, "y": sc["y"] * y}
+    moved = mre.retarget(mc, meta["op"], sc, shifted, zp, zp, n)
     assert mre.normalized_records(moved) != mre.normalized_records(mc)
-    back = mre.retarget(moved, meta["op"], shifted, old[0], old[1], old[1])
+    back = mre.retarget(moved, meta["op"], shifted, sc, zp, zp, n)
     assert mre.normalized_records(back) == mre.normalized_records(mc)
-    assert mre.retarget(mc, meta["op"], old[0], old[0], old[1], old[1]) == mc
+    assert mre.retarget(mc, meta["op"], sc, sc, zp, zp, n) == mc
 
 
 SQRT = sorted(k for k in HELD if "sqrt_512x512x3x3" in k)
@@ -70,6 +71,71 @@ def test_reducesum_matches_held_out_builds(src, dst):
         b["zero_points"],
     )
     assert mre.normalized_records(got) == mre.normalized_records(_mcode(dst))
+
+
+STEP_PAIRS = sorted(
+    (k, k.replace(".axmodel.gz", "__v2.axmodel.gz"))
+    for k in HELD
+    if k.startswith("misc_op_step_templates/") and "__v2" not in k
+)
+
+
+@pytest.mark.parametrize("a,b", [p for pair in STEP_PAIRS for p in (pair, pair[::-1])])
+def test_step_template_matches_second_calibration_build(a, b):
+    # ReduceSum pairs include zp_y = 0 targets, where elided 0x1b10 writes
+    # remove records and the segment is re-padded to whole 4-record groups
+    # (and the reverse). Softmax's pair also moves zp_x; Log's also rewrites
+    # its lookup table.
+    op = HELD[a].get("op", "ReduceSum")
+    meta = next(
+        (m for m in INDEX.values() if m["file"] in (a, b.replace("__v2", ""))), {}
+    )
+    got = mre.retarget(
+        _mcode(a),
+        op,
+        HELD[a]["scales"],
+        HELD[b]["scales"],
+        HELD[a]["zero_points"],
+        HELD[b]["zero_points"],
+        meta.get("reduce_count"),
+    )
+    assert mre.normalized_records(got) == mre.normalized_records(_mcode(b))
+
+
+def test_record_removing_zero_point_change_is_measured():
+    # Both directions change the record count; the fixtures prove it is exact.
+    counts = {
+        len(mre._chunks(mre.suc.decode_segments(_mcode(k))[2]))
+        for pair in STEP_PAIRS
+        if "784" in pair[0]
+        for k in pair
+    }
+    assert len(counts) == 2
+
+
+def test_log_table_formula():
+    meta = INDEX["Log:16x1000"]
+    t = mre.log_table(meta["scales"], meta["zero_points"])
+    assert len(t) == 258 and t[0] == 0 and t[255] == meta["zero_points"]["y"]
+    assert t[256] == t[255] and t[257] == 0
+    assert t == sorted(t[:256]) + t[256:]  # log is monotonic
+
+
+@pytest.mark.parametrize(
+    "key,scales,zps",
+    [
+        # MaxPool shares one scale between input and output
+        ("MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1", {"x": 0.02, "y": 0.03}, None),
+        # Softmax's output zero point is fixed by the template
+        ("Softmax:16x1000:axis1", None, {"x": 127, "y": 3}),
+        # Log's zero points are fixed by the template
+        ("Log:16x1000", None, {"x": 1, "y": 255}),
+        ("ReduceMean:16x512x7x7:axes2,3:k1", None, {"x": 5, "y": 0}),
+    ],
+)
+def test_tail_ops_refuse_unmeasured_targets(key, scales, zps):
+    with pytest.raises(ValueError):
+        mre.emit_model(key, scales, zps)
 
 
 def test_greater_cast_is_calibration_free():
@@ -100,7 +166,6 @@ def test_emit_model_retargets_template():
     [
         ({"x": 0.5, "y": 2.0}, None),  # 1/s_x == s_y: lanes indistinguishable
         ({"x": 0.02, "y": 0.02}, {"x": 0, "y": 0}),  # zp_x == 0 is unmeasured
-        ({"x": 0.02, "y": 0.03}, {"x": 128, "y": 5}),  # net record insertion
     ],
 )
 def test_reducesum_refuses_unmeasured_targets(scales, zps):
@@ -132,7 +197,7 @@ def test_sqrt_refuses_zero_point_change():
 
 def test_unknown_template_is_an_error():
     with pytest.raises(ValueError):
-        mre.emit_model("ReduceSum:16x1x128x1152:axes0:k0")
+        mre.emit_model("ReduceSum:3x5x7:axes0:k0")
 
 
 def test_step_node_keys(tmp_path):
@@ -161,4 +226,4 @@ def test_step_node_keys(tmp_path):
     cov = mre.coverage(path)
     assert cov["ReduceSum"] == {"nodes": 1, "covered": 1, "missing": {}}
     assert cov["Sqrt"]["covered"] == 1
-    assert cov["Greater"]["missing"] == {"GreaterCast:16x64x56x56": 1}
+    assert cov["Greater"] == {"nodes": 1, "covered": 1, "missing": {}}

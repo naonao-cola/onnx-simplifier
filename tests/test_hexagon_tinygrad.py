@@ -224,6 +224,17 @@ def test_codegen_float_max_chain_renders_linearly():
 
 
 @needs_tinygrad
+def test_codegen_vrmpy_gemv():
+    """The LLM decode GEMV (u8 activations x s8 weights, M=1) reaches the vrmpy TensorCore as vrmpybusv, with one
+    128-byte weight vector per vrmpy and a vector accumulator (onnxsim/tinygrad#5; scripts/android/llm_tinygrad)."""
+    res = codegen("gemv")
+    assert res["exact"], "generated GEMV differs from NumPy under qemu"
+    assert res["vrmpybusv"], res
+    assert res["weight_vector_load"], res
+    assert res["vector_accumulator"], res
+
+
+@needs_tinygrad
 @pytest.mark.skipif(
     hexagon_tools() is None,
     reason="needs the Hexagon toolchain's hexagon-sim (HEXAGON_TOOLS)",

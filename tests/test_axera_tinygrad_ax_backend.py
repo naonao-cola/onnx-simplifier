@@ -5,6 +5,7 @@ output must equal what the underlying emitter already reproduces byte for byte
 (or within the tolerance that emitter's own tests document).
 """
 
+import dataclasses
 import gzip
 import json
 import os
@@ -14,6 +15,7 @@ import sys
 import numpy as np
 import onnx
 import pytest
+from onnx import numpy_helper, parser
 
 _AXERA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "axera"
@@ -21,7 +23,11 @@ _AXERA_DIR = os.path.join(
 if _AXERA_DIR not in sys.path:
     sys.path.insert(0, _AXERA_DIR)
 
+import binary_op_scale_emit as bse  # noqa: E402
+import binary_op_scale_validate as bsv  # noqa: E402
 import elementwise_scale_emit as ew  # noqa: E402
+import emitter  # noqa: E402
+import llm_build_dtype_analysis as lbd  # noqa: E402
 import tinygrad_ax_backend as axb  # noqa: E402
 
 _FIX = os.path.join(_AXERA_DIR, "fixtures")
@@ -68,6 +74,7 @@ def test_template_key_json_round_trip():
         axb.TemplateKey("Transpose", ((16, 513),), (("perm", (1, 0)),)),
         axb.TemplateKey("Relu", ((16, 64, 56, 56),), calibration_class="x1,y1"),
         axb.TemplateKey("Relu", ((16, 64, 56, 56),), dtypes=("int8",)),
+        axb.TemplateKey("Relu", ((16, 64, 56, 56),), weight_dtype="s8"),
     ],
 )
 def test_cache_refuses_unmeasured_keys(key):
@@ -133,6 +140,33 @@ def test_elementwise_scale_edit_reproduces_held_out_native_build(oracle):
     native = _load_gz(os.path.join(_ORACLES, oracle))
     assert _outside_noise(_mcode(model)) == _outside_noise(_mcode(native))
     assert _init(model, "npu_params") == _init(native, "npu_params")
+
+
+_BINARY_ORACLES = os.path.join(bse.TEMPLATE_DIR, "oracles")
+with open(os.path.join(_BINARY_ORACLES, "index.json")) as _f:
+    _BINARY_ORACLE_INDEX = json.load(_f)
+
+
+@pytest.mark.parametrize(
+    "oracle",
+    [
+        n
+        for n in sorted(_BINARY_ORACLE_INDEX)
+        if _BINARY_ORACLE_INDEX[n]["shape"] in ([16, 64, 56, 56], [16, 128, 28, 28])
+    ],
+)
+def test_elementwise_scale_edit_reproduces_held_out_binary_build(oracle):
+    meta = _BINARY_ORACLE_INDEX[oracle]
+    zp = meta["zero_points"]
+    key = axb.TemplateKey(
+        meta["op"],
+        (tuple(meta["shape"]),),
+        calibration_class=",".join(f"{k}{v}" for k, v in sorted(zp.items())),
+    )
+    model = axb.EditSet([axb.ElementwiseScaleEdit(meta["scales"])]).build(key)
+    native = _load_gz(os.path.join(_BINARY_ORACLES, oracle))
+    r = bsv.compare(model, native)
+    assert r["params"] and r["segments"], r
 
 
 def test_relu_tile_prediction_matches_template():
@@ -227,15 +261,67 @@ def _step_records():
         return json.load(f)
 
 
+# misc_op_record_emit: Greater 18 + Less 1 + Cast 19 covered; ReduceSum 43,
+# Sqrt [512,512,3,3] 3, Softmax 3, Log 2, MaxPool 1 and ReduceMean 1 conditional
+_MISC_COVERED = 38
+_MISC_CONDITIONAL = 53
+
+
+def _step_reshape_templated():
+    """Non-fused step Reshapes with a validated step template
+    (fixtures/reshape_step_templates/manifest.json)."""
+    n = 0
+    for r in _step_records():
+        if r["op"] != "Reshape":
+            continue
+        try:
+            axb.rre.step_template(r["shapes"][0], r["attrs"]["out"])
+        except ValueError:
+            continue
+        n += 1
+    return n
+
+
 def test_coverage_report_on_the_resnet18_step():
     report = axb.coverage_report(_step_records())
     assert report["nodes"] == 1104
     assert report["per_op"]["Gather"] == {"covered": 41}
     assert report["per_op"]["Transpose"] == {"covered": 41}
     assert report["per_op"]["Relu"] == {"conditional": 17}
-    assert report["per_op"]["Sqrt"] == {"conditional": 39, "refused": 3}
-    assert report["per_op"]["Conv"] == {"refused": 20}
-    assert report["totals"] == {"covered": 82, "conditional": 74, "refused": 948}
+    # the 3 Sqrt [512,512,3,3] and the step-shape ReduceSum / Greater / Less ->
+    # Cast nodes come from misc_op_record_emit.py; Greater/Less -> Cast is not
+    # quantized, so its template is the whole program
+    assert report["per_op"]["Sqrt"] == {"conditional": 42}
+    assert report["per_op"]["ReduceSum"] == {"conditional": 43, "refused": 1}
+    assert report["per_op"]["Greater"] == {"covered": 18}
+    assert report["per_op"]["Less"] == {"covered": 1}
+    assert report["per_op"]["Cast"] == {"covered": 19}
+    for op, n in (("Softmax", 3), ("Log", 2), ("MaxPool", 1), ("ReduceMean", 1)):
+        assert report["per_op"][op] == {"conditional": n}
+    assert report["per_op"]["Neg"] == {"refused": 2}
+    man = axb.mre.step_manifest()
+    live_conv = sum(
+        man["templates"][e["template"]]["kind"] == "conv" for e in man["nodes"].values()
+    )
+    want = {"refused": 20 - live_conv, "conditional": live_conv}
+    assert report["per_op"]["Conv"] == {k: v for k, v in want.items() if v}
+    # same-shape binary ops: ElementwiseScaleEdit (binary_op_scale_emit.py);
+    # constant and broadcast operands stay refused
+    assert report["per_op"]["Add"] == {"conditional": 101, "refused": 43}
+    assert report["per_op"]["Sub"] == {"conditional": 42, "refused": 4}
+    assert report["per_op"]["Mul"] == {"conditional": 63, "refused": 334}
+    assert report["per_op"]["Div"] == {"conditional": 44, "refused": 8}
+    # Live-operand MatMul/Gemm/Conv nodes with a step template move from
+    # refused to conditional (fixtures/matmul_step_templates/manifest.json).
+    live = len(axb.mre.step_manifest()["nodes"])
+    rs = _step_reshape_templated()
+    want_rs = {"conditional": 18 + rs, "refused": 152 - rs}
+    assert report["per_op"]["Reshape"] == {k: v for k, v in want_rs.items() if v}
+    assert report["totals"] == {
+        "covered": 82 + _MISC_COVERED,
+        "conditional": 324 + live + _MISC_CONDITIONAL + rs,
+        "refused": 698 - live - _MISC_COVERED - _MISC_CONDITIONAL - rs,
+    }
 
 
 def test_trainable_conv_is_refused_even_with_a_template():
@@ -256,3 +342,261 @@ def test_tinygrad_compiler_seam():
     assert out == axb.compile_request(src)
     with pytest.raises(NotImplementedError):
         classes["AXProgram"](None, None)
+
+
+# --------------------------------------------------------------------------
+# Weight dtype selection
+# --------------------------------------------------------------------------
+
+_LLM_FIX = os.path.join(_FIX, "llm_build_dtype_analysis")
+_Q_PROJ = lbd.tiny_llama_weights(512)["model.layers.0.self_attn.q_proj.weight"]
+_STAGE1 = axb.TemplateKey(
+    "Conv",
+    ((16, 64, 56, 56),),
+    (("pads", (1, 1, 1, 1)), ("strides", (1, 1)), ("w", (64, 64, 3, 3))),
+)
+
+
+class _FakeDType:
+    """Stands in for a tinygrad ``DType`` (only ``name``/``count`` are read)."""
+
+    def __init__(self, name, count=1):
+        self.name, self.count = name, count
+
+
+@pytest.mark.parametrize(
+    "dtype,want",
+    [
+        (_FakeDType("signed char"), "s8"),
+        (_FakeDType("__bf16"), "bf16"),
+        (_FakeDType("half"), "fp16"),
+        (_FakeDType("float"), "fp32"),
+        (_FakeDType("float8_e4m3"), "fp8_e4m3"),
+        (_FakeDType("float8_e5m2"), "fp8_e5m2"),
+        ("int4", "s4"),
+        ("int8", "s8"),
+        ("bfloat16", "bf16"),
+        ("fp8e5m2", "fp8_e5m2"),
+    ],
+)
+def test_axera_weight_dtype_maps_tinygrad_names(dtype, want):
+    assert axb.axera_weight_dtype(dtype) == want
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        _FakeDType("float8_e4m3fnuz"),  # different encoding from llm_build's e4m3
+        _FakeDType("unsigned char"),  # both paths store signed symmetric codes
+        _FakeDType("signed char", count=4),  # vector dtype
+        "float64",
+        "uint4",
+    ],
+)
+def test_axera_weight_dtype_refuses_the_rest(dtype):
+    with pytest.raises(ValueError):
+        axb.axera_weight_dtype(dtype)
+
+
+def test_axera_weight_dtype_on_the_real_tinygrad_fork():
+    tinygrad = pytest.importorskip("tinygrad")
+    dtypes = tinygrad.dtypes
+    got = [
+        axb.axera_weight_dtype(d)
+        for d in (dtypes.int8, dtypes.float16, dtypes.bfloat16, dtypes.float32)
+    ]
+    assert got == ["s8", "fp16", "bf16", "fp32"]
+    assert axb.axera_weight_dtype(dtypes.fp8e4m3) == "fp8_e4m3"
+
+
+@pytest.mark.parametrize(
+    "path,op,dtype,shape,match",
+    [
+        ("build", "Conv", "s4", None, "does not offer"),
+        ("build", "Conv", "bf16", None, "does not offer"),
+        ("build", "Conv", "fp32", None, "needs a Pulsar2 build"),
+        ("build", "MatMul", "s8", None, "not decoded"),
+        ("build", "Conv", "s8", (64, 64, 5, 5), "no validated s8 Conv template"),
+        ("llm_build", "Linear", "fp32", None, "not decoded"),
+        ("llm_build", "Linear", "s8", (48, 256), "multiple of 32"),
+        ("llm_build", "Linear", "s4", (64, 300), "in_features"),
+        ("llm_build", "Linear", "fp16", (64, 2048), "in_features"),
+        ("npu", "Linear", "s8", None, "unknown Pulsar2 path"),
+    ],
+)
+def test_validate_weight_choice_refuses_undecoded(path, op, dtype, shape, match):
+    with pytest.raises(ValueError, match=match):
+        axb.validate_weight_choice(path, op, dtype, shape)
+
+
+@pytest.mark.parametrize("dtype", ["s8", "s4", "fp16", "bf16", "fp8_e4m3", "fp8_e5m2"])
+def test_encode_weight_matches_llm_build_bytes(dtype):
+    got = np.load(os.path.join(_LLM_FIX, "blocks.npz"))[f"q_proj_block0_{dtype}"]
+    blocks = axb.encode_weight(_Q_PROJ, dtype, path="llm_build")
+    assert len(blocks) == len(_Q_PROJ) // 32
+    assert blocks[0][: len(got)] == got.tobytes()
+
+
+def test_encode_weight_build_conv_is_the_s8_codes():
+    w = np.random.RandomState(4).randn(64, 64, 3, 3).astype(np.float32)
+    (codes,) = axb.encode_weight(w, "int8", path="build")
+    assert codes == emitter.codes_of(w).tobytes()
+    with pytest.raises(ValueError, match="needs a Pulsar2 build"):
+        axb.encode_weight(w, "float32", path="build")
+
+
+def test_weight_dtype_costs_rank_the_llm_build_types():
+    costs = {c["dtype"]: c for c in axb.weight_dtype_costs(_Q_PROJ)}
+    assert list(costs) == ["s4", "s8", "fp16", "bf16", "fp8_e4m3", "fp8_e5m2"]
+    assert costs["s4"]["bytes_per_param"] < costs["s8"]["bytes_per_param"] < 4.0
+    assert {costs[d]["bytes_per_param"] for d in lbd.FLOAT_TYPES} == {4.0}
+    err = [costs[d]["rel_rms_error"] for d in ("fp16", "bf16", "s8", "s4")]
+    assert err == sorted(err)
+    # the byte count is the real stored block size
+    assert costs["s8"]["bytes_per_param"] == pytest.approx(
+        len(lbd.encode_block(_Q_PROJ[:32], "s8")) / (32 * 256)
+    )
+
+
+def test_choose_weight_dtype_is_smallest_within_budget():
+    assert axb.choose_weight_dtype(_Q_PROJ, 0.5) == "s4"
+    assert axb.choose_weight_dtype(_Q_PROJ, 0.05) == "s8"
+    # every float type stores 4 B/param, so the most precise one wins
+    assert axb.choose_weight_dtype(_Q_PROJ, 1e-3) == "fp16"
+    with pytest.raises(ValueError, match="no validated dtype"):
+        axb.choose_weight_dtype(_Q_PROJ, 1e-9)
+    # fp8 stores the same 4 B/param as bf16 on llm_build, so it never wins
+    assert axb.choose_weight_dtype(_Q_PROJ, 0.5, dtypes=["fp8e4m3", "bf16"]) == "bf16"
+
+
+def test_quant_policy_overrides_and_auto():
+    policy = axb.QuantPolicy(
+        default="auto",
+        path="llm_build",
+        error_budget=0.05,
+        overrides={"MatMul": "s4", "lm_head": _FakeDType("__bf16")},
+    )
+    assert policy.choice_for("MatMul") == "s4"
+    assert policy.choice_for("MatMul", "lm_head") == "bf16"
+    assert policy.choice_for("Gemm") == "auto"
+    assert policy.resolve("Gemm", _Q_PROJ) == "s8"
+    assert policy.resolve("MatMul", _Q_PROJ, node="lm_head") == "bf16"
+    assert axb.QuantPolicy.from_json(policy.to_json()) == policy
+    with pytest.raises(ValueError, match="error_budget"):
+        axb.QuantPolicy(default="auto")
+    with pytest.raises(ValueError, match="does not offer"):
+        axb.QuantPolicy(default="s4", path="build")
+
+
+def test_conv_template_key_carries_the_weight_dtype():
+    cache = axb.TemplateCache()
+    assert (
+        cache.lookup(_STAGE1).path
+        == cache.lookup(dataclasses.replace(_STAGE1, weight_dtype="s8")).path
+    )
+    with pytest.raises(ValueError, match="needs a Pulsar2 build"):
+        cache.lookup(dataclasses.replace(_STAGE1, weight_dtype="fp32"))
+    key = axb.apply_policy(_STAGE1, axb.QuantPolicy(default="int8"))
+    assert key.weight_dtype == "s8"
+    assert axb.TemplateKey.from_json(json.loads(json.dumps(key.to_json()))) == key
+    with pytest.raises(ValueError, match="needs a Pulsar2 build"):
+        axb.apply_policy(_STAGE1, axb.QuantPolicy(default="float32"))
+    with pytest.raises(ValueError, match="policy says"):
+        axb.apply_policy(
+            dataclasses.replace(_STAGE1, weight_dtype="fp32"),
+            axb.QuantPolicy(default="s8"),
+        )
+    with pytest.raises(ValueError, match="no llm_build engine templates"):
+        axb.apply_policy(_STAGE1, axb.QuantPolicy(default="s8", path="llm_build"))
+    # ops without a weight pass through untouched
+    assert axb.apply_policy(_gather_key(), axb.QuantPolicy()) == _gather_key()
+
+
+def test_compile_request_applies_the_policy():
+    src = axb.build_request(_gather_key(), [axb.GatherIndexEdit(list(range(8)))])
+    policy = axb.QuantPolicy(default="s8")
+    assert axb.compile_request(src, policy=policy) == axb.compile_request(src)
+
+
+def test_coverage_report_weight_dtypes_on_the_resnet18_step():
+    policy = axb.QuantPolicy(default="s8")
+    report = axb.coverage_report(_step_records(), policy)
+    # Live-operand MatMul/Gemm/Conv nodes with a step template move from
+    # refused to conditional (fixtures/matmul_step_templates/manifest.json).
+    live = len(axb.mre.step_manifest()["nodes"])
+    rs = _step_reshape_templated()
+    want_rs = {"conditional": 18 + rs, "refused": 152 - rs}
+    assert report["per_op"]["Reshape"] == {k: v for k, v in want_rs.items() if v}
+    assert report["totals"] == {
+        "covered": 82 + _MISC_COVERED,
+        "conditional": 324 + live + _MISC_CONDITIONAL + rs,
+        "refused": 698 - live - _MISC_COVERED - _MISC_CONDITIONAL - rs,
+    }
+    assert len(report["per_node"]) == 1104
+    # no weight in the training step is a constant: a weight dtype choice
+    # changes none of its nodes
+    assert all(n["weight_dtype"] is None for n in report["per_node"])
+    runtime = (
+        "None: weight is {}: a runtime tensor, quantized with the activation "
+        "calibration; no weight dtype applies"
+    )
+    assert report["weight_dtypes"] == {
+        "Conv": {runtime.format("graph input"): 20},
+        "Gemm": {runtime.format("graph input"): 1},
+        "MatMul": {runtime.format("computed"): 40, runtime.format("graph input"): 1},
+    }
+
+
+def _frozen_model(tmp_path):
+    model = parser.parse_model(
+        """
+        <ir_version: 8, opset_import: ["" : 17]>
+        g (float[16, 64, 56, 56] x, float[64, 256] a) => (float[16, 64, 56, 56] y,
+                                                         float[64, 64] m) {
+            y = Conv <pads = [1, 1, 1, 1], strides = [1, 1]> (x, cw, cb)
+            m = MatMul (a, lw)
+        }
+        """
+    )
+    rng = np.random.RandomState(5)
+    model.graph.initializer.extend(
+        [
+            numpy_helper.from_array(rng.randn(64, 64, 3, 3).astype(np.float32), "cw"),
+            numpy_helper.from_array(rng.randn(64).astype(np.float32), "cb"),
+            numpy_helper.from_array(rng.randn(256, 64).astype(np.float32), "lw"),
+        ]
+    )
+    path = str(tmp_path / "frozen.onnx")
+    onnx.save(model, path)
+    return axb.extract_step_ops(path)
+
+
+def test_weight_dtypes_on_frozen_weights(tmp_path):
+    conv, matmul = _frozen_model(tmp_path)
+    assert conv["attrs"]["weight_source"] == "initializer"
+    assert matmul["attrs"]["weight_source"] == "initializer"
+    assert matmul["attrs"]["w"] == [256, 64]
+    assert axb.plan_node(conv) == ("covered", "ConvWeightEdit")
+    build = axb.QuantPolicy(default="s8")
+    assert axb.weight_dtype_for_record(conv, build)["weight_dtype"] == "s8"
+    assert "not decoded" in axb.weight_dtype_for_record(matmul, build)["note"]
+    llm = axb.QuantPolicy(default="s4", path="llm_build", overrides={"Conv": "s8"})
+    assert axb.weight_dtype_for_record(matmul, llm) == {
+        "weight_dtype": "s4",
+        "note": "validated",
+    }
+    assert "llm_build has no Conv" in axb.weight_dtype_for_record(conv, llm)["note"]
+    bf16 = axb.QuantPolicy(default="bfloat16", path="llm_build")
+    assert axb.weight_dtype_for_record(matmul, bf16)["weight_dtype"] == "bf16"
+
+
+def test_tinygrad_compiler_takes_a_weight_dtype():
+    tinygrad = pytest.importorskip("tinygrad")
+    classes = axb.tinygrad_classes()
+    comp = classes["AXCompiler"](weight_dtype=tinygrad.dtypes.int8)
+    assert comp.policy.default == "s8"
+    src = axb.build_request(_gather_key(), [axb.GatherIndexEdit(list(range(8)))])
+    assert comp.compile(src) == axb.compile_request(src)
+    bad = classes["AXCompiler"](weight_dtype=tinygrad.dtypes.float32)
+    with pytest.raises(ValueError, match="needs a Pulsar2 build"):
+        bad.compile(axb.build_request(_STAGE1, [axb.TemplateOnly()], node="conv0"))

@@ -1,0 +1,1966 @@
+{
+ "nodes": {
+  "MatMul_121": {
+   "names": [
+    "distill__reshape_251",
+    "distill__gather_253",
+    "distill__mul_255",
+    "distill__reshape_257",
+    "distill__reshape_262",
+    "distill__matmul_263"
+   ],
+   "template": "dX_MatMul_121"
+  },
+  "MatMul_138": {
+   "names": [
+    "distill__reshape_213",
+    "distill__gather_287",
+    "distill__mul_289",
+    "distill__reshape_296",
+    "distill__matmul_297"
+   ],
+   "template": "dX_MatMul_138"
+  },
+  "MatMul_142": {
+   "names": [
+    "distill__gather_303",
+    "distill__transpose_308",
+    "distill__reshape_213",
+    "distill__matmul_309"
+   ],
+   "template": "dW_MatMul_142"
+  },
+  "MatMul_156": {
+   "names": [
+    "distill__reshape_326",
+    "distill__gather_328",
+    "distill__mul_330",
+    "distill__reshape_332",
+    "distill__reshape_337",
+    "distill__matmul_338"
+   ],
+   "template": "dX_MatMul_156"
+  },
+  "MatMul_163": {
+   "names": [
+    "distill__mul_346",
+    "distill__reshape_348",
+    "distill__transpose_349",
+    "distill__reshape_326",
+    "distill__matmul_350"
+   ],
+   "template": "dW_MatMul_163"
+  },
+  "MatMul_178": {
+   "names": [
+    "distill__reshape_364",
+    "distill__gather_366",
+    "distill__mul_368",
+    "distill__reshape_370",
+    "distill__reshape_375",
+    "distill__matmul_376"
+   ],
+   "template": "dX_MatMul_156"
+  },
+  "MatMul_185": {
+   "names": [
+    "distill__mul_384",
+    "distill__reshape_386",
+    "distill__transpose_387",
+    "distill__reshape_364",
+    "distill__matmul_388"
+   ],
+   "template": "dW_MatMul_163"
+  },
+  "MatMul_201": {
+   "names": [
+    "distill__reshape_405",
+    "distill__gather_407",
+    "distill__mul_409",
+    "distill__reshape_411",
+    "distill__reshape_416",
+    "distill__matmul_417"
+   ],
+   "template": "dX_MatMul_156"
+  },
+  "MatMul_208": {
+   "names": [
+    "distill__mul_425",
+    "distill__reshape_427",
+    "distill__transpose_428",
+    "distill__reshape_405",
+    "distill__matmul_429"
+   ],
+   "template": "dW_MatMul_163"
+  },
+  "MatMul_223": {
+   "names": [
+    "distill__reshape_443",
+    "distill__gather_445",
+    "distill__mul_447",
+    "distill__reshape_449",
+    "distill__reshape_454",
+    "distill__matmul_455"
+   ],
+   "template": "dX_MatMul_223"
+  },
+  "MatMul_230": {
+   "names": [
+    "distill__mul_463",
+    "distill__reshape_465",
+    "distill__transpose_466",
+    "distill__reshape_443",
+    "distill__matmul_467"
+   ],
+   "template": "dW_MatMul_230"
+  },
+  "MatMul_240": {
+   "names": [
+    "distill__reshape_405",
+    "distill__gather_479",
+    "distill__mul_481",
+    "distill__reshape_488",
+    "distill__matmul_489"
+   ],
+   "template": "dX_MatMul_240"
+  },
+  "MatMul_244": {
+   "names": [
+    "distill__gather_495",
+    "distill__transpose_500",
+    "distill__reshape_405",
+    "distill__matmul_501"
+   ],
+   "template": "dW_MatMul_244"
+  },
+  "MatMul_258": {
+   "names": [
+    "distill__reshape_518",
+    "distill__gather_520",
+    "distill__mul_522",
+    "distill__reshape_524",
+    "distill__reshape_529",
+    "distill__matmul_530"
+   ],
+   "template": "dX_MatMul_258"
+  },
+  "MatMul_280": {
+   "names": [
+    "distill__reshape_556",
+    "distill__gather_558",
+    "distill__mul_560",
+    "distill__reshape_562",
+    "distill__reshape_567",
+    "distill__matmul_568"
+   ],
+   "template": "dX_MatMul_258"
+  },
+  "MatMul_303": {
+   "names": [
+    "distill__reshape_597",
+    "distill__gather_599",
+    "distill__mul_601",
+    "distill__reshape_603",
+    "distill__reshape_608",
+    "distill__matmul_609"
+   ],
+   "template": "dX_MatMul_258"
+  },
+  "MatMul_332": {
+   "names": [
+    "distill__mul_655",
+    "distill__reshape_657",
+    "distill__transpose_658",
+    "distill__reshape_635",
+    "distill__matmul_659"
+   ],
+   "template": "dW_MatMul_332"
+  },
+  "MatMul_342": {
+   "names": [
+    "distill__reshape_597",
+    "distill__gather_671",
+    "distill__mul_673",
+    "distill__reshape_680",
+    "distill__matmul_681"
+   ],
+   "template": "dX_MatMul_342"
+  },
+  "MatMul_346": {
+   "names": [
+    "distill__gather_687",
+    "distill__transpose_692",
+    "distill__reshape_597",
+    "distill__matmul_693"
+   ],
+   "template": "dW_MatMul_346"
+  },
+  "MatMul_36": {
+   "names": [
+    "distill__add_113",
+    "resnetv15_dense0_weight",
+    "distill__matmul_115"
+   ],
+   "template": "fc_dX_MatMul_36"
+  },
+  "MatMul_38": {
+   "names": [
+    "resnetv15_pool1_fwd",
+    "flatten_170",
+    "distill__transpose_116",
+    "distill__add_113",
+    "distill__matmul_117"
+   ],
+   "template": "fc_dW_MatMul_38"
+  },
+  "MatMul_54": {
+   "names": [
+    "distill__reshape_134",
+    "distill__gather_136",
+    "distill__mul_138",
+    "distill__reshape_140",
+    "distill__reshape_145",
+    "distill__matmul_146"
+   ],
+   "template": "dX_MatMul_54"
+  },
+  "MatMul_76": {
+   "names": [
+    "distill__reshape_172",
+    "distill__gather_174",
+    "distill__mul_176",
+    "distill__reshape_178",
+    "distill__reshape_183",
+    "distill__matmul_184"
+   ],
+   "template": "dX_MatMul_54"
+  },
+  "MatMul_99": {
+   "names": [
+    "distill__reshape_213",
+    "distill__gather_215",
+    "distill__mul_217",
+    "distill__reshape_219",
+    "distill__reshape_224",
+    "distill__matmul_225"
+   ],
+   "template": "dX_MatMul_54"
+  },
+  "resnetv15_dense0_fwd": {
+   "names": [
+    "resnetv15_pool1_fwd",
+    "flatten_170",
+    "resnetv15_dense0_weight",
+    "resnetv15_dense0_fwd_bt",
+    "resnetv15_dense0_fwd_mm",
+    "resnetv15_dense0_bias",
+    "resnetv15_dense0_fwd"
+   ],
+   "template": "fc_fwd_resnetv15_dense0_fwd"
+  },
+  "resnetv15_stage2_conv2_fwd": {
+   "names": [
+    "resnetv15_stage1_activation1",
+    "resnetv15_stage2_conv2_fwd_xt",
+    "resnetv15_stage2_conv2_weight",
+    "resnetv15_stage2_conv2_fwd_wt",
+    "resnetv15_stage2_conv2_fwd_x0_0_0",
+    "resnetv15_stage2_conv2_fwd_w0_0_0",
+    "resnetv15_stage2_conv2_fwd_x0_0_1",
+    "resnetv15_stage2_conv2_fwd_w0_0_1",
+    "resnetv15_stage2_conv2_fwd_wf0_0",
+    "resnetv15_stage2_conv2_fwd_m0",
+    "resnetv15_stage2_conv2_fwd_folded_bias",
+    "resnetv15_stage2_conv2_fwd_biased",
+    "resnetv15_stage2_conv2_fwd"
+   ],
+   "template": "conv_resnetv15_stage2_conv2_fwd"
+  },
+  "resnetv15_stage3_conv0_fwd": {
+   "names": [
+    "resnetv15_stage2_activation1",
+    "resnetv15_stage3_conv0_fwd_pad",
+    "resnetv15_stage3_conv0_fwd_xt",
+    "resnetv15_stage3_conv0_weight",
+    "resnetv15_stage3_conv0_fwd_wt",
+    "resnetv15_stage3_conv0_fwd_x0_0_0",
+    "resnetv15_stage3_conv0_fwd_w0_0_0",
+    "resnetv15_stage3_conv0_fwd_x0_0_1",
+    "resnetv15_stage3_conv0_fwd_w0_0_1",
+    "resnetv15_stage3_conv0_fwd_wf0_0",
+    "resnetv15_stage3_conv0_fwd_x0_1_0",
+    "resnetv15_stage3_conv0_fwd_w0_1_0",
+    "resnetv15_stage3_conv0_fwd_x0_1_1",
+    "resnetv15_stage3_conv0_fwd_w0_1_1",
+    "resnetv15_stage3_conv0_fwd_wf0_1",
+    "resnetv15_stage3_conv0_fwd_x0_2_0",
+    "resnetv15_stage3_conv0_fwd_w0_2_0",
+    "resnetv15_stage3_conv0_fwd_x0_2_1",
+    "resnetv15_stage3_conv0_fwd_w0_2_1",
+    "resnetv15_stage3_conv0_fwd_wf0_2",
+    "resnetv15_stage3_conv0_fwd_x1_0_0",
+    "resnetv15_stage3_conv0_fwd_w1_0_0",
+    "resnetv15_stage3_conv0_fwd_x1_0_1",
+    "resnetv15_stage3_conv0_fwd_w1_0_1",
+    "resnetv15_stage3_conv0_fwd_wf1_0",
+    "resnetv15_stage3_conv0_fwd_x1_1_0",
+    "resnetv15_stage3_conv0_fwd_w1_1_0",
+    "resnetv15_stage3_conv0_fwd_x1_1_1",
+    "resnetv15_stage3_conv0_fwd_w1_1_1",
+    "resnetv15_stage3_conv0_fwd_wf1_1",
+    "resnetv15_stage3_conv0_fwd_x1_2_0",
+    "resnetv15_stage3_conv0_fwd_w1_2_0",
+    "resnetv15_stage3_conv0_fwd_x1_2_1",
+    "resnetv15_stage3_conv0_fwd_w1_2_1",
+    "resnetv15_stage3_conv0_fwd_wf1_2",
+    "resnetv15_stage3_conv0_fwd_x2_0_0",
+    "resnetv15_stage3_conv0_fwd_w2_0_0",
+    "resnetv15_stage3_conv0_fwd_x2_0_1",
+    "resnetv15_stage3_conv0_fwd_w2_0_1",
+    "resnetv15_stage3_conv0_fwd_wf2_0",
+    "resnetv15_stage3_conv0_fwd_x2_1_0",
+    "resnetv15_stage3_conv0_fwd_w2_1_0",
+    "resnetv15_stage3_conv0_fwd_x2_1_1",
+    "resnetv15_stage3_conv0_fwd_w2_1_1",
+    "resnetv15_stage3_conv0_fwd_wf2_1",
+    "resnetv15_stage3_conv0_fwd_x2_2_0",
+    "resnetv15_stage3_conv0_fwd_w2_2_0",
+    "resnetv15_stage3_conv0_fwd_x2_2_1",
+    "resnetv15_stage3_conv0_fwd_w2_2_1",
+    "resnetv15_stage3_conv0_fwd_wf2_2",
+    "resnetv15_stage3_conv0_fwd_xcat",
+    "resnetv15_stage3_conv0_fwd_wcat",
+    "resnetv15_stage3_conv0_fwd_mm",
+    "resnetv15_stage3_conv0_fwd_folded_bias",
+    "resnetv15_stage3_conv0_fwd_biased",
+    "resnetv15_stage3_conv0_fwd"
+   ],
+   "template": "conv_resnetv15_stage3_conv0_fwd"
+  },
+  "resnetv15_stage3_conv1_fwd": {
+   "names": [
+    "resnetv15_stage3_relu0_fwd",
+    "resnetv15_stage3_conv1_fwd_pad",
+    "resnetv15_stage3_conv1_fwd_xt",
+    "resnetv15_stage3_conv1_weight",
+    "resnetv15_stage3_conv1_fwd_wt",
+    "resnetv15_stage3_conv1_fwd_x0_0_0",
+    "resnetv15_stage3_conv1_fwd_w0_0_0",
+    "resnetv15_stage3_conv1_fwd_x0_0_1",
+    "resnetv15_stage3_conv1_fwd_w0_0_1",
+    "resnetv15_stage3_conv1_fwd_wf0_0",
+    "resnetv15_stage3_conv1_fwd_x0_1_0",
+    "resnetv15_stage3_conv1_fwd_w0_1_0",
+    "resnetv15_stage3_conv1_fwd_x0_1_1",
+    "resnetv15_stage3_conv1_fwd_w0_1_1",
+    "resnetv15_stage3_conv1_fwd_wf0_1",
+    "resnetv15_stage3_conv1_fwd_x0_2_0",
+    "resnetv15_stage3_conv1_fwd_w0_2_0",
+    "resnetv15_stage3_conv1_fwd_x0_2_1",
+    "resnetv15_stage3_conv1_fwd_w0_2_1",
+    "resnetv15_stage3_conv1_fwd_wf0_2",
+    "resnetv15_stage3_conv1_fwd_x1_0_0",
+    "resnetv15_stage3_conv1_fwd_w1_0_0",
+    "resnetv15_stage3_conv1_fwd_x1_0_1",
+    "resnetv15_stage3_conv1_fwd_w1_0_1",
+    "resnetv15_stage3_conv1_fwd_wf1_0",
+    "resnetv15_stage3_conv1_fwd_x1_1_0",
+    "resnetv15_stage3_conv1_fwd_w1_1_0",
+    "resnetv15_stage3_conv1_fwd_x1_1_1",
+    "resnetv15_stage3_conv1_fwd_w1_1_1",
+    "resnetv15_stage3_conv1_fwd_wf1_1",
+    "resnetv15_stage3_conv1_fwd_x1_2_0",
+    "resnetv15_stage3_conv1_fwd_w1_2_0",
+    "resnetv15_stage3_conv1_fwd_x1_2_1",
+    "resnetv15_stage3_conv1_fwd_w1_2_1",
+    "resnetv15_stage3_conv1_fwd_wf1_2",
+    "resnetv15_stage3_conv1_fwd_x2_0_0",
+    "resnetv15_stage3_conv1_fwd_w2_0_0",
+    "resnetv15_stage3_conv1_fwd_x2_0_1",
+    "resnetv15_stage3_conv1_fwd_w2_0_1",
+    "resnetv15_stage3_conv1_fwd_wf2_0",
+    "resnetv15_stage3_conv1_fwd_x2_1_0",
+    "resnetv15_stage3_conv1_fwd_w2_1_0",
+    "resnetv15_stage3_conv1_fwd_x2_1_1",
+    "resnetv15_stage3_conv1_fwd_w2_1_1",
+    "resnetv15_stage3_conv1_fwd_wf2_1",
+    "resnetv15_stage3_conv1_fwd_x2_2_0",
+    "resnetv15_stage3_conv1_fwd_w2_2_0",
+    "resnetv15_stage3_conv1_fwd_x2_2_1",
+    "resnetv15_stage3_conv1_fwd_w2_2_1",
+    "resnetv15_stage3_conv1_fwd_wf2_2",
+    "resnetv15_stage3_conv1_fwd_xcat",
+    "resnetv15_stage3_conv1_fwd_wcat",
+    "resnetv15_stage3_conv1_fwd_mm",
+    "resnetv15_stage3_conv1_fwd_folded_bias",
+    "resnetv15_stage3_conv1_fwd_biased",
+    "resnetv15_stage3_conv1_fwd"
+   ],
+   "template": "conv_resnetv15_stage3_conv1_fwd"
+  },
+  "resnetv15_stage3_conv2_fwd": {
+   "names": [
+    "resnetv15_stage2_activation1",
+    "resnetv15_stage3_conv2_fwd_xt",
+    "resnetv15_stage3_conv2_weight",
+    "resnetv15_stage3_conv2_fwd_wt",
+    "resnetv15_stage3_conv2_fwd_x0_0_0",
+    "resnetv15_stage3_conv2_fwd_w0_0_0",
+    "resnetv15_stage3_conv2_fwd_x0_0_1",
+    "resnetv15_stage3_conv2_fwd_w0_0_1",
+    "resnetv15_stage3_conv2_fwd_wf0_0",
+    "resnetv15_stage3_conv2_fwd_m0",
+    "resnetv15_stage3_conv2_fwd_folded_bias",
+    "resnetv15_stage3_conv2_fwd_biased",
+    "resnetv15_stage3_conv2_fwd"
+   ],
+   "template": "conv_resnetv15_stage3_conv2_fwd"
+  },
+  "resnetv15_stage3_conv3_fwd": {
+   "names": [
+    "resnetv15_stage3_activation0",
+    "resnetv15_stage3_conv3_fwd_pad",
+    "resnetv15_stage3_conv3_fwd_xt",
+    "resnetv15_stage3_conv3_weight",
+    "resnetv15_stage3_conv3_fwd_wt",
+    "resnetv15_stage3_conv3_fwd_x0_0_0",
+    "resnetv15_stage3_conv3_fwd_w0_0_0",
+    "resnetv15_stage3_conv3_fwd_x0_0_1",
+    "resnetv15_stage3_conv3_fwd_w0_0_1",
+    "resnetv15_stage3_conv3_fwd_wf0_0",
+    "resnetv15_stage3_conv3_fwd_x0_1_0",
+    "resnetv15_stage3_conv3_fwd_w0_1_0",
+    "resnetv15_stage3_conv3_fwd_x0_1_1",
+    "resnetv15_stage3_conv3_fwd_w0_1_1",
+    "resnetv15_stage3_conv3_fwd_wf0_1",
+    "resnetv15_stage3_conv3_fwd_x0_2_0",
+    "resnetv15_stage3_conv3_fwd_w0_2_0",
+    "resnetv15_stage3_conv3_fwd_x0_2_1",
+    "resnetv15_stage3_conv3_fwd_w0_2_1",
+    "resnetv15_stage3_conv3_fwd_wf0_2",
+    "resnetv15_stage3_conv3_fwd_x1_0_0",
+    "resnetv15_stage3_conv3_fwd_w1_0_0",
+    "resnetv15_stage3_conv3_fwd_x1_0_1",
+    "resnetv15_stage3_conv3_fwd_w1_0_1",
+    "resnetv15_stage3_conv3_fwd_wf1_0",
+    "resnetv15_stage3_conv3_fwd_x1_1_0",
+    "resnetv15_stage3_conv3_fwd_w1_1_0",
+    "resnetv15_stage3_conv3_fwd_x1_1_1",
+    "resnetv15_stage3_conv3_fwd_w1_1_1",
+    "resnetv15_stage3_conv3_fwd_wf1_1",
+    "resnetv15_stage3_conv3_fwd_x1_2_0",
+    "resnetv15_stage3_conv3_fwd_w1_2_0",
+    "resnetv15_stage3_conv3_fwd_x1_2_1",
+    "resnetv15_stage3_conv3_fwd_w1_2_1",
+    "resnetv15_stage3_conv3_fwd_wf1_2",
+    "resnetv15_stage3_conv3_fwd_x2_0_0",
+    "resnetv15_stage3_conv3_fwd_w2_0_0",
+    "resnetv15_stage3_conv3_fwd_x2_0_1",
+    "resnetv15_stage3_conv3_fwd_w2_0_1",
+    "resnetv15_stage3_conv3_fwd_wf2_0",
+    "resnetv15_stage3_conv3_fwd_x2_1_0",
+    "resnetv15_stage3_conv3_fwd_w2_1_0",
+    "resnetv15_stage3_conv3_fwd_x2_1_1",
+    "resnetv15_stage3_conv3_fwd_w2_1_1",
+    "resnetv15_stage3_conv3_fwd_wf2_1",
+    "resnetv15_stage3_conv3_fwd_x2_2_0",
+    "resnetv15_stage3_conv3_fwd_w2_2_0",
+    "resnetv15_stage3_conv3_fwd_x2_2_1",
+    "resnetv15_stage3_conv3_fwd_w2_2_1",
+    "resnetv15_stage3_conv3_fwd_wf2_2",
+    "resnetv15_stage3_conv3_fwd_xcat",
+    "resnetv15_stage3_conv3_fwd_wcat",
+    "resnetv15_stage3_conv3_fwd_mm",
+    "resnetv15_stage3_conv3_fwd_folded_bias",
+    "resnetv15_stage3_conv3_fwd_biased",
+    "resnetv15_stage3_conv3_fwd"
+   ],
+   "template": "conv_resnetv15_stage3_conv1_fwd"
+  },
+  "resnetv15_stage3_conv4_fwd": {
+   "names": [
+    "resnetv15_stage3_relu1_fwd",
+    "resnetv15_stage3_conv4_fwd_pad",
+    "resnetv15_stage3_conv4_fwd_xt",
+    "resnetv15_stage3_conv4_weight",
+    "resnetv15_stage3_conv4_fwd_wt",
+    "resnetv15_stage3_conv4_fwd_x0_0_0",
+    "resnetv15_stage3_conv4_fwd_w0_0_0",
+    "resnetv15_stage3_conv4_fwd_x0_0_1",
+    "resnetv15_stage3_conv4_fwd_w0_0_1",
+    "resnetv15_stage3_conv4_fwd_wf0_0",
+    "resnetv15_stage3_conv4_fwd_x0_1_0",
+    "resnetv15_stage3_conv4_fwd_w0_1_0",
+    "resnetv15_stage3_conv4_fwd_x0_1_1",
+    "resnetv15_stage3_conv4_fwd_w0_1_1",
+    "resnetv15_stage3_conv4_fwd_wf0_1",
+    "resnetv15_stage3_conv4_fwd_x0_2_0",
+    "resnetv15_stage3_conv4_fwd_w0_2_0",
+    "resnetv15_stage3_conv4_fwd_x0_2_1",
+    "resnetv15_stage3_conv4_fwd_w0_2_1",
+    "resnetv15_stage3_conv4_fwd_wf0_2",
+    "resnetv15_stage3_conv4_fwd_x1_0_0",
+    "resnetv15_stage3_conv4_fwd_w1_0_0",
+    "resnetv15_stage3_conv4_fwd_x1_0_1",
+    "resnetv15_stage3_conv4_fwd_w1_0_1",
+    "resnetv15_stage3_conv4_fwd_wf1_0",
+    "resnetv15_stage3_conv4_fwd_x1_1_0",
+    "resnetv15_stage3_conv4_fwd_w1_1_0",
+    "resnetv15_stage3_conv4_fwd_x1_1_1",
+    "resnetv15_stage3_conv4_fwd_w1_1_1",
+    "resnetv15_stage3_conv4_fwd_wf1_1",
+    "resnetv15_stage3_conv4_fwd_x1_2_0",
+    "resnetv15_stage3_conv4_fwd_w1_2_0",
+    "resnetv15_stage3_conv4_fwd_x1_2_1",
+    "resnetv15_stage3_conv4_fwd_w1_2_1",
+    "resnetv15_stage3_conv4_fwd_wf1_2",
+    "resnetv15_stage3_conv4_fwd_x2_0_0",
+    "resnetv15_stage3_conv4_fwd_w2_0_0",
+    "resnetv15_stage3_conv4_fwd_x2_0_1",
+    "resnetv15_stage3_conv4_fwd_w2_0_1",
+    "resnetv15_stage3_conv4_fwd_wf2_0",
+    "resnetv15_stage3_conv4_fwd_x2_1_0",
+    "resnetv15_stage3_conv4_fwd_w2_1_0",
+    "resnetv15_stage3_conv4_fwd_x2_1_1",
+    "resnetv15_stage3_conv4_fwd_w2_1_1",
+    "resnetv15_stage3_conv4_fwd_wf2_1",
+    "resnetv15_stage3_conv4_fwd_x2_2_0",
+    "resnetv15_stage3_conv4_fwd_w2_2_0",
+    "resnetv15_stage3_conv4_fwd_x2_2_1",
+    "resnetv15_stage3_conv4_fwd_w2_2_1",
+    "resnetv15_stage3_conv4_fwd_wf2_2",
+    "resnetv15_stage3_conv4_fwd_xcat",
+    "resnetv15_stage3_conv4_fwd_wcat",
+    "resnetv15_stage3_conv4_fwd_mm",
+    "resnetv15_stage3_conv4_fwd_folded_bias",
+    "resnetv15_stage3_conv4_fwd_biased",
+    "resnetv15_stage3_conv4_fwd"
+   ],
+   "template": "conv_resnetv15_stage3_conv1_fwd"
+  },
+  "resnetv15_stage4_conv0_fwd": {
+   "names": [
+    "resnetv15_stage3_activation1",
+    "resnetv15_stage4_conv0_fwd_pad",
+    "resnetv15_stage4_conv0_fwd_xt",
+    "resnetv15_stage4_conv0_weight",
+    "resnetv15_stage4_conv0_fwd_wt",
+    "resnetv15_stage4_conv0_fwd_x0_0_0",
+    "resnetv15_stage4_conv0_fwd_w0_0_0",
+    "resnetv15_stage4_conv0_fwd_x0_0_1",
+    "resnetv15_stage4_conv0_fwd_w0_0_1",
+    "resnetv15_stage4_conv0_fwd_wf0_0",
+    "resnetv15_stage4_conv0_fwd_x0_1_0",
+    "resnetv15_stage4_conv0_fwd_w0_1_0",
+    "resnetv15_stage4_conv0_fwd_x0_1_1",
+    "resnetv15_stage4_conv0_fwd_w0_1_1",
+    "resnetv15_stage4_conv0_fwd_wf0_1",
+    "resnetv15_stage4_conv0_fwd_x0_2_0",
+    "resnetv15_stage4_conv0_fwd_w0_2_0",
+    "resnetv15_stage4_conv0_fwd_x0_2_1",
+    "resnetv15_stage4_conv0_fwd_w0_2_1",
+    "resnetv15_stage4_conv0_fwd_wf0_2",
+    "resnetv15_stage4_conv0_fwd_x1_0_0",
+    "resnetv15_stage4_conv0_fwd_w1_0_0",
+    "resnetv15_stage4_conv0_fwd_x1_0_1",
+    "resnetv15_stage4_conv0_fwd_w1_0_1",
+    "resnetv15_stage4_conv0_fwd_wf1_0",
+    "resnetv15_stage4_conv0_fwd_x1_1_0",
+    "resnetv15_stage4_conv0_fwd_w1_1_0",
+    "resnetv15_stage4_conv0_fwd_x1_1_1",
+    "resnetv15_stage4_conv0_fwd_w1_1_1",
+    "resnetv15_stage4_conv0_fwd_wf1_1",
+    "resnetv15_stage4_conv0_fwd_x1_2_0",
+    "resnetv15_stage4_conv0_fwd_w1_2_0",
+    "resnetv15_stage4_conv0_fwd_x1_2_1",
+    "resnetv15_stage4_conv0_fwd_w1_2_1",
+    "resnetv15_stage4_conv0_fwd_wf1_2",
+    "resnetv15_stage4_conv0_fwd_x2_0_0",
+    "resnetv15_stage4_conv0_fwd_w2_0_0",
+    "resnetv15_stage4_conv0_fwd_x2_0_1",
+    "resnetv15_stage4_conv0_fwd_w2_0_1",
+    "resnetv15_stage4_conv0_fwd_wf2_0",
+    "resnetv15_stage4_conv0_fwd_x2_1_0",
+    "resnetv15_stage4_conv0_fwd_w2_1_0",
+    "resnetv15_stage4_conv0_fwd_x2_1_1",
+    "resnetv15_stage4_conv0_fwd_w2_1_1",
+    "resnetv15_stage4_conv0_fwd_wf2_1",
+    "resnetv15_stage4_conv0_fwd_x2_2_0",
+    "resnetv15_stage4_conv0_fwd_w2_2_0",
+    "resnetv15_stage4_conv0_fwd_x2_2_1",
+    "resnetv15_stage4_conv0_fwd_w2_2_1",
+    "resnetv15_stage4_conv0_fwd_wf2_2",
+    "resnetv15_stage4_conv0_fwd_xcat",
+    "resnetv15_stage4_conv0_fwd_wcat",
+    "resnetv15_stage4_conv0_fwd_mm",
+    "resnetv15_stage4_conv0_fwd_folded_bias",
+    "resnetv15_stage4_conv0_fwd_biased",
+    "resnetv15_stage4_conv0_fwd"
+   ],
+   "template": "conv_resnetv15_stage4_conv0_fwd"
+  },
+  "resnetv15_stage4_conv2_fwd": {
+   "names": [
+    "resnetv15_stage3_activation1",
+    "resnetv15_stage4_conv2_fwd_xt",
+    "resnetv15_stage4_conv2_weight",
+    "resnetv15_stage4_conv2_fwd_wt",
+    "resnetv15_stage4_conv2_fwd_x0_0_0",
+    "resnetv15_stage4_conv2_fwd_w0_0_0",
+    "resnetv15_stage4_conv2_fwd_x0_0_1",
+    "resnetv15_stage4_conv2_fwd_w0_0_1",
+    "resnetv15_stage4_conv2_fwd_wf0_0",
+    "resnetv15_stage4_conv2_fwd_m0",
+    "resnetv15_stage4_conv2_fwd_folded_bias",
+    "resnetv15_stage4_conv2_fwd_biased",
+    "resnetv15_stage4_conv2_fwd"
+   ],
+   "template": "conv_resnetv15_stage4_conv2_fwd"
+  }
+ },
+ "templates": {
+  "conv_resnetv15_stage2_conv2_fwd": {
+   "axmodel": "conv_resnetv15_stage2_conv2_fwd.axmodel.gz",
+   "constants": [
+    "resnetv15_stage2_conv2_fwd_SW0_0_0_axes",
+    "resnetv15_stage2_conv2_fwd_SW0_0_0_ends",
+    "resnetv15_stage2_conv2_fwd_SW0_0_0_starts",
+    "resnetv15_stage2_conv2_fwd_SW0_0_1_axes",
+    "resnetv15_stage2_conv2_fwd_SW0_0_1_ends",
+    "resnetv15_stage2_conv2_fwd_SW0_0_1_starts",
+    "resnetv15_stage2_conv2_fwd_SX0_0_0_axes",
+    "resnetv15_stage2_conv2_fwd_SX0_0_0_ends",
+    "resnetv15_stage2_conv2_fwd_SX0_0_0_starts",
+    "resnetv15_stage2_conv2_fwd_SX0_0_0_steps",
+    "resnetv15_stage2_conv2_fwd_SX0_0_1_axes",
+    "resnetv15_stage2_conv2_fwd_SX0_0_1_ends",
+    "resnetv15_stage2_conv2_fwd_SX0_0_1_starts",
+    "resnetv15_stage2_conv2_fwd_SX0_0_1_steps",
+    "resnetv15_stage2_conv2_fwd_wshape"
+   ],
+   "heldout": "conv_resnetv15_stage2_conv2_fwd__v2.axmodel.gz",
+   "heldout_quant": "conv_resnetv15_stage2_conv2_fwd__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     28,
+     28,
+     64
+    ],
+    [
+     64,
+     128
+    ]
+   ],
+   "kind": "conv",
+   "names": [
+    "resnetv15_stage1_activation1",
+    "resnetv15_stage2_conv2_fwd_xt",
+    "resnetv15_stage2_conv2_weight",
+    "resnetv15_stage2_conv2_fwd_wt",
+    "resnetv15_stage2_conv2_fwd_x0_0_0",
+    "resnetv15_stage2_conv2_fwd_w0_0_0",
+    "resnetv15_stage2_conv2_fwd_x0_0_1",
+    "resnetv15_stage2_conv2_fwd_w0_0_1",
+    "resnetv15_stage2_conv2_fwd_wf0_0",
+    "resnetv15_stage2_conv2_fwd_m0",
+    "resnetv15_stage2_conv2_fwd_folded_bias",
+    "resnetv15_stage2_conv2_fwd_biased",
+    "resnetv15_stage2_conv2_fwd"
+   ],
+   "params_words": 257,
+   "quant": "conv_resnetv15_stage2_conv2_fwd.quant.json.gz",
+   "records": 47,
+   "step_node": "resnetv15_stage2_conv2_fwd"
+  },
+  "conv_resnetv15_stage3_conv0_fwd": {
+   "axmodel": "conv_resnetv15_stage3_conv0_fwd.axmodel.gz",
+   "constants": [
+    "resnetv15_stage3_conv0_fwd_SW0_0_0_axes",
+    "resnetv15_stage3_conv0_fwd_SW0_0_0_ends",
+    "resnetv15_stage3_conv0_fwd_SW0_0_0_starts",
+    "resnetv15_stage3_conv0_fwd_SW0_0_1_axes",
+    "resnetv15_stage3_conv0_fwd_SW0_0_1_ends",
+    "resnetv15_stage3_conv0_fwd_SW0_0_1_starts",
+    "resnetv15_stage3_conv0_fwd_SW0_1_0_axes",
+    "resnetv15_stage3_conv0_fwd_SW0_1_0_ends",
+    "resnetv15_stage3_conv0_fwd_SW0_1_0_starts",
+    "resnetv15_stage3_conv0_fwd_SW0_1_1_axes",
+    "resnetv15_stage3_conv0_fwd_SW0_1_1_ends",
+    "resnetv15_stage3_conv0_fwd_SW0_1_1_starts",
+    "resnetv15_stage3_conv0_fwd_SW0_2_0_axes",
+    "resnetv15_stage3_conv0_fwd_SW0_2_0_ends",
+    "resnetv15_stage3_conv0_fwd_SW0_2_0_starts",
+    "resnetv15_stage3_conv0_fwd_SW0_2_1_axes",
+    "resnetv15_stage3_conv0_fwd_SW0_2_1_ends",
+    "resnetv15_stage3_conv0_fwd_SW0_2_1_starts",
+    "resnetv15_stage3_conv0_fwd_SW1_0_0_axes",
+    "resnetv15_stage3_conv0_fwd_SW1_0_0_ends",
+    "resnetv15_stage3_conv0_fwd_SW1_0_0_starts",
+    "resnetv15_stage3_conv0_fwd_SW1_0_1_axes",
+    "resnetv15_stage3_conv0_fwd_SW1_0_1_ends",
+    "resnetv15_stage3_conv0_fwd_SW1_0_1_starts",
+    "resnetv15_stage3_conv0_fwd_SW1_1_0_axes",
+    "resnetv15_stage3_conv0_fwd_SW1_1_0_ends",
+    "resnetv15_stage3_conv0_fwd_SW1_1_0_starts",
+    "resnetv15_stage3_conv0_fwd_SW1_1_1_axes",
+    "resnetv15_stage3_conv0_fwd_SW1_1_1_ends",
+    "resnetv15_stage3_conv0_fwd_SW1_1_1_starts",
+    "resnetv15_stage3_conv0_fwd_SW1_2_0_axes",
+    "resnetv15_stage3_conv0_fwd_SW1_2_0_ends",
+    "resnetv15_stage3_conv0_fwd_SW1_2_0_starts",
+    "resnetv15_stage3_conv0_fwd_SW1_2_1_axes",
+    "resnetv15_stage3_conv0_fwd_SW1_2_1_ends",
+    "resnetv15_stage3_conv0_fwd_SW1_2_1_starts",
+    "resnetv15_stage3_conv0_fwd_SW2_0_0_axes",
+    "resnetv15_stage3_conv0_fwd_SW2_0_0_ends",
+    "resnetv15_stage3_conv0_fwd_SW2_0_0_starts",
+    "resnetv15_stage3_conv0_fwd_SW2_0_1_axes",
+    "resnetv15_stage3_conv0_fwd_SW2_0_1_ends",
+    "resnetv15_stage3_conv0_fwd_SW2_0_1_starts",
+    "resnetv15_stage3_conv0_fwd_SW2_1_0_axes",
+    "resnetv15_stage3_conv0_fwd_SW2_1_0_ends",
+    "resnetv15_stage3_conv0_fwd_SW2_1_0_starts",
+    "resnetv15_stage3_conv0_fwd_SW2_1_1_axes",
+    "resnetv15_stage3_conv0_fwd_SW2_1_1_ends",
+    "resnetv15_stage3_conv0_fwd_SW2_1_1_starts",
+    "resnetv15_stage3_conv0_fwd_SW2_2_0_axes",
+    "resnetv15_stage3_conv0_fwd_SW2_2_0_ends",
+    "resnetv15_stage3_conv0_fwd_SW2_2_0_starts",
+    "resnetv15_stage3_conv0_fwd_SW2_2_1_axes",
+    "resnetv15_stage3_conv0_fwd_SW2_2_1_ends",
+    "resnetv15_stage3_conv0_fwd_SW2_2_1_starts",
+    "resnetv15_stage3_conv0_fwd_SX0_0_0_axes",
+    "resnetv15_stage3_conv0_fwd_SX0_0_0_ends",
+    "resnetv15_stage3_conv0_fwd_SX0_0_0_starts",
+    "resnetv15_stage3_conv0_fwd_SX0_0_0_steps",
+    "resnetv15_stage3_conv0_fwd_SX0_0_1_axes",
+    "resnetv15_stage3_conv0_fwd_SX0_0_1_ends",
+    "resnetv15_stage3_conv0_fwd_SX0_0_1_starts",
+    "resnetv15_stage3_conv0_fwd_SX0_0_1_steps",
+    "resnetv15_stage3_conv0_fwd_SX0_1_0_axes",
+    "resnetv15_stage3_conv0_fwd_SX0_1_0_ends",
+    "resnetv15_stage3_conv0_fwd_SX0_1_0_starts",
+    "resnetv15_stage3_conv0_fwd_SX0_1_0_steps",
+    "resnetv15_stage3_conv0_fwd_SX0_1_1_axes",
+    "resnetv15_stage3_conv0_fwd_SX0_1_1_ends",
+    "resnetv15_stage3_conv0_fwd_SX0_1_1_starts",
+    "resnetv15_stage3_conv0_fwd_SX0_1_1_steps",
+    "resnetv15_stage3_conv0_fwd_SX0_2_0_axes",
+    "resnetv15_stage3_conv0_fwd_SX0_2_0_ends",
+    "resnetv15_stage3_conv0_fwd_SX0_2_0_starts",
+    "resnetv15_stage3_conv0_fwd_SX0_2_0_steps",
+    "resnetv15_stage3_conv0_fwd_SX0_2_1_axes",
+    "resnetv15_stage3_conv0_fwd_SX0_2_1_ends",
+    "resnetv15_stage3_conv0_fwd_SX0_2_1_starts",
+    "resnetv15_stage3_conv0_fwd_SX0_2_1_steps",
+    "resnetv15_stage3_conv0_fwd_SX1_0_0_axes",
+    "resnetv15_stage3_conv0_fwd_SX1_0_0_ends",
+    "resnetv15_stage3_conv0_fwd_SX1_0_0_starts",
+    "resnetv15_stage3_conv0_fwd_SX1_0_0_steps",
+    "resnetv15_stage3_conv0_fwd_SX1_0_1_axes",
+    "resnetv15_stage3_conv0_fwd_SX1_0_1_ends",
+    "resnetv15_stage3_conv0_fwd_SX1_0_1_starts",
+    "resnetv15_stage3_conv0_fwd_SX1_0_1_steps",
+    "resnetv15_stage3_conv0_fwd_SX1_1_0_axes",
+    "resnetv15_stage3_conv0_fwd_SX1_1_0_ends",
+    "resnetv15_stage3_conv0_fwd_SX1_1_0_starts",
+    "resnetv15_stage3_conv0_fwd_SX1_1_0_steps",
+    "resnetv15_stage3_conv0_fwd_SX1_1_1_axes",
+    "resnetv15_stage3_conv0_fwd_SX1_1_1_ends",
+    "resnetv15_stage3_conv0_fwd_SX1_1_1_starts",
+    "resnetv15_stage3_conv0_fwd_SX1_1_1_steps",
+    "resnetv15_stage3_conv0_fwd_SX1_2_0_axes",
+    "resnetv15_stage3_conv0_fwd_SX1_2_0_ends",
+    "resnetv15_stage3_conv0_fwd_SX1_2_0_starts",
+    "resnetv15_stage3_conv0_fwd_SX1_2_0_steps",
+    "resnetv15_stage3_conv0_fwd_SX1_2_1_axes",
+    "resnetv15_stage3_conv0_fwd_SX1_2_1_ends",
+    "resnetv15_stage3_conv0_fwd_SX1_2_1_starts",
+    "resnetv15_stage3_conv0_fwd_SX1_2_1_steps",
+    "resnetv15_stage3_conv0_fwd_SX2_0_0_axes",
+    "resnetv15_stage3_conv0_fwd_SX2_0_0_ends",
+    "resnetv15_stage3_conv0_fwd_SX2_0_0_starts",
+    "resnetv15_stage3_conv0_fwd_SX2_0_0_steps",
+    "resnetv15_stage3_conv0_fwd_SX2_0_1_axes",
+    "resnetv15_stage3_conv0_fwd_SX2_0_1_ends",
+    "resnetv15_stage3_conv0_fwd_SX2_0_1_starts",
+    "resnetv15_stage3_conv0_fwd_SX2_0_1_steps",
+    "resnetv15_stage3_conv0_fwd_SX2_1_0_axes",
+    "resnetv15_stage3_conv0_fwd_SX2_1_0_ends",
+    "resnetv15_stage3_conv0_fwd_SX2_1_0_starts",
+    "resnetv15_stage3_conv0_fwd_SX2_1_0_steps",
+    "resnetv15_stage3_conv0_fwd_SX2_1_1_axes",
+    "resnetv15_stage3_conv0_fwd_SX2_1_1_ends",
+    "resnetv15_stage3_conv0_fwd_SX2_1_1_starts",
+    "resnetv15_stage3_conv0_fwd_SX2_1_1_steps",
+    "resnetv15_stage3_conv0_fwd_SX2_2_0_axes",
+    "resnetv15_stage3_conv0_fwd_SX2_2_0_ends",
+    "resnetv15_stage3_conv0_fwd_SX2_2_0_starts",
+    "resnetv15_stage3_conv0_fwd_SX2_2_0_steps",
+    "resnetv15_stage3_conv0_fwd_SX2_2_1_axes",
+    "resnetv15_stage3_conv0_fwd_SX2_2_1_ends",
+    "resnetv15_stage3_conv0_fwd_SX2_2_1_starts",
+    "resnetv15_stage3_conv0_fwd_SX2_2_1_steps",
+    "resnetv15_stage3_conv0_fwd_pads",
+    "resnetv15_stage3_conv0_fwd_wshape"
+   ],
+   "heldout": "conv_resnetv15_stage3_conv0_fwd__v2.axmodel.gz",
+   "heldout_quant": "conv_resnetv15_stage3_conv0_fwd__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     14,
+     14,
+     1152
+    ],
+    [
+     1152,
+     256
+    ]
+   ],
+   "kind": "conv",
+   "names": [
+    "resnetv15_stage2_activation1",
+    "resnetv15_stage3_conv0_fwd_pad",
+    "resnetv15_stage3_conv0_fwd_xt",
+    "resnetv15_stage3_conv0_weight",
+    "resnetv15_stage3_conv0_fwd_wt",
+    "resnetv15_stage3_conv0_fwd_x0_0_0",
+    "resnetv15_stage3_conv0_fwd_w0_0_0",
+    "resnetv15_stage3_conv0_fwd_x0_0_1",
+    "resnetv15_stage3_conv0_fwd_w0_0_1",
+    "resnetv15_stage3_conv0_fwd_wf0_0",
+    "resnetv15_stage3_conv0_fwd_x0_1_0",
+    "resnetv15_stage3_conv0_fwd_w0_1_0",
+    "resnetv15_stage3_conv0_fwd_x0_1_1",
+    "resnetv15_stage3_conv0_fwd_w0_1_1",
+    "resnetv15_stage3_conv0_fwd_wf0_1",
+    "resnetv15_stage3_conv0_fwd_x0_2_0",
+    "resnetv15_stage3_conv0_fwd_w0_2_0",
+    "resnetv15_stage3_conv0_fwd_x0_2_1",
+    "resnetv15_stage3_conv0_fwd_w0_2_1",
+    "resnetv15_stage3_conv0_fwd_wf0_2",
+    "resnetv15_stage3_conv0_fwd_x1_0_0",
+    "resnetv15_stage3_conv0_fwd_w1_0_0",
+    "resnetv15_stage3_conv0_fwd_x1_0_1",
+    "resnetv15_stage3_conv0_fwd_w1_0_1",
+    "resnetv15_stage3_conv0_fwd_wf1_0",
+    "resnetv15_stage3_conv0_fwd_x1_1_0",
+    "resnetv15_stage3_conv0_fwd_w1_1_0",
+    "resnetv15_stage3_conv0_fwd_x1_1_1",
+    "resnetv15_stage3_conv0_fwd_w1_1_1",
+    "resnetv15_stage3_conv0_fwd_wf1_1",
+    "resnetv15_stage3_conv0_fwd_x1_2_0",
+    "resnetv15_stage3_conv0_fwd_w1_2_0",
+    "resnetv15_stage3_conv0_fwd_x1_2_1",
+    "resnetv15_stage3_conv0_fwd_w1_2_1",
+    "resnetv15_stage3_conv0_fwd_wf1_2",
+    "resnetv15_stage3_conv0_fwd_x2_0_0",
+    "resnetv15_stage3_conv0_fwd_w2_0_0",
+    "resnetv15_stage3_conv0_fwd_x2_0_1",
+    "resnetv15_stage3_conv0_fwd_w2_0_1",
+    "resnetv15_stage3_conv0_fwd_wf2_0",
+    "resnetv15_stage3_conv0_fwd_x2_1_0",
+    "resnetv15_stage3_conv0_fwd_w2_1_0",
+    "resnetv15_stage3_conv0_fwd_x2_1_1",
+    "resnetv15_stage3_conv0_fwd_w2_1_1",
+    "resnetv15_stage3_conv0_fwd_wf2_1",
+    "resnetv15_stage3_conv0_fwd_x2_2_0",
+    "resnetv15_stage3_conv0_fwd_w2_2_0",
+    "resnetv15_stage3_conv0_fwd_x2_2_1",
+    "resnetv15_stage3_conv0_fwd_w2_2_1",
+    "resnetv15_stage3_conv0_fwd_wf2_2",
+    "resnetv15_stage3_conv0_fwd_xcat",
+    "resnetv15_stage3_conv0_fwd_wcat",
+    "resnetv15_stage3_conv0_fwd_mm",
+    "resnetv15_stage3_conv0_fwd_folded_bias",
+    "resnetv15_stage3_conv0_fwd_biased",
+    "resnetv15_stage3_conv0_fwd"
+   ],
+   "params_words": 65,
+   "quant": "conv_resnetv15_stage3_conv0_fwd.quant.json.gz",
+   "records": 44,
+   "step_node": "resnetv15_stage3_conv0_fwd"
+  },
+  "conv_resnetv15_stage3_conv1_fwd": {
+   "axmodel": "conv_resnetv15_stage3_conv1_fwd.axmodel.gz",
+   "constants": [
+    "resnetv15_stage3_conv1_fwd_SW0_0_0_axes",
+    "resnetv15_stage3_conv1_fwd_SW0_0_0_ends",
+    "resnetv15_stage3_conv1_fwd_SW0_0_0_starts",
+    "resnetv15_stage3_conv1_fwd_SW0_0_1_axes",
+    "resnetv15_stage3_conv1_fwd_SW0_0_1_ends",
+    "resnetv15_stage3_conv1_fwd_SW0_0_1_starts",
+    "resnetv15_stage3_conv1_fwd_SW0_1_0_axes",
+    "resnetv15_stage3_conv1_fwd_SW0_1_0_ends",
+    "resnetv15_stage3_conv1_fwd_SW0_1_0_starts",
+    "resnetv15_stage3_conv1_fwd_SW0_1_1_axes",
+    "resnetv15_stage3_conv1_fwd_SW0_1_1_ends",
+    "resnetv15_stage3_conv1_fwd_SW0_1_1_starts",
+    "resnetv15_stage3_conv1_fwd_SW0_2_0_axes",
+    "resnetv15_stage3_conv1_fwd_SW0_2_0_ends",
+    "resnetv15_stage3_conv1_fwd_SW0_2_0_starts",
+    "resnetv15_stage3_conv1_fwd_SW0_2_1_axes",
+    "resnetv15_stage3_conv1_fwd_SW0_2_1_ends",
+    "resnetv15_stage3_conv1_fwd_SW0_2_1_starts",
+    "resnetv15_stage3_conv1_fwd_SW1_0_0_axes",
+    "resnetv15_stage3_conv1_fwd_SW1_0_0_ends",
+    "resnetv15_stage3_conv1_fwd_SW1_0_0_starts",
+    "resnetv15_stage3_conv1_fwd_SW1_0_1_axes",
+    "resnetv15_stage3_conv1_fwd_SW1_0_1_ends",
+    "resnetv15_stage3_conv1_fwd_SW1_0_1_starts",
+    "resnetv15_stage3_conv1_fwd_SW1_1_0_axes",
+    "resnetv15_stage3_conv1_fwd_SW1_1_0_ends",
+    "resnetv15_stage3_conv1_fwd_SW1_1_0_starts",
+    "resnetv15_stage3_conv1_fwd_SW1_1_1_axes",
+    "resnetv15_stage3_conv1_fwd_SW1_1_1_ends",
+    "resnetv15_stage3_conv1_fwd_SW1_1_1_starts",
+    "resnetv15_stage3_conv1_fwd_SW1_2_0_axes",
+    "resnetv15_stage3_conv1_fwd_SW1_2_0_ends",
+    "resnetv15_stage3_conv1_fwd_SW1_2_0_starts",
+    "resnetv15_stage3_conv1_fwd_SW1_2_1_axes",
+    "resnetv15_stage3_conv1_fwd_SW1_2_1_ends",
+    "resnetv15_stage3_conv1_fwd_SW1_2_1_starts",
+    "resnetv15_stage3_conv1_fwd_SW2_0_0_axes",
+    "resnetv15_stage3_conv1_fwd_SW2_0_0_ends",
+    "resnetv15_stage3_conv1_fwd_SW2_0_0_starts",
+    "resnetv15_stage3_conv1_fwd_SW2_0_1_axes",
+    "resnetv15_stage3_conv1_fwd_SW2_0_1_ends",
+    "resnetv15_stage3_conv1_fwd_SW2_0_1_starts",
+    "resnetv15_stage3_conv1_fwd_SW2_1_0_axes",
+    "resnetv15_stage3_conv1_fwd_SW2_1_0_ends",
+    "resnetv15_stage3_conv1_fwd_SW2_1_0_starts",
+    "resnetv15_stage3_conv1_fwd_SW2_1_1_axes",
+    "resnetv15_stage3_conv1_fwd_SW2_1_1_ends",
+    "resnetv15_stage3_conv1_fwd_SW2_1_1_starts",
+    "resnetv15_stage3_conv1_fwd_SW2_2_0_axes",
+    "resnetv15_stage3_conv1_fwd_SW2_2_0_ends",
+    "resnetv15_stage3_conv1_fwd_SW2_2_0_starts",
+    "resnetv15_stage3_conv1_fwd_SW2_2_1_axes",
+    "resnetv15_stage3_conv1_fwd_SW2_2_1_ends",
+    "resnetv15_stage3_conv1_fwd_SW2_2_1_starts",
+    "resnetv15_stage3_conv1_fwd_SX0_0_0_axes",
+    "resnetv15_stage3_conv1_fwd_SX0_0_0_ends",
+    "resnetv15_stage3_conv1_fwd_SX0_0_0_starts",
+    "resnetv15_stage3_conv1_fwd_SX0_0_1_axes",
+    "resnetv15_stage3_conv1_fwd_SX0_0_1_ends",
+    "resnetv15_stage3_conv1_fwd_SX0_0_1_starts",
+    "resnetv15_stage3_conv1_fwd_SX0_1_0_axes",
+    "resnetv15_stage3_conv1_fwd_SX0_1_0_ends",
+    "resnetv15_stage3_conv1_fwd_SX0_1_0_starts",
+    "resnetv15_stage3_conv1_fwd_SX0_1_1_axes",
+    "resnetv15_stage3_conv1_fwd_SX0_1_1_ends",
+    "resnetv15_stage3_conv1_fwd_SX0_1_1_starts",
+    "resnetv15_stage3_conv1_fwd_SX0_2_0_axes",
+    "resnetv15_stage3_conv1_fwd_SX0_2_0_ends",
+    "resnetv15_stage3_conv1_fwd_SX0_2_0_starts",
+    "resnetv15_stage3_conv1_fwd_SX0_2_1_axes",
+    "resnetv15_stage3_conv1_fwd_SX0_2_1_ends",
+    "resnetv15_stage3_conv1_fwd_SX0_2_1_starts",
+    "resnetv15_stage3_conv1_fwd_SX1_0_0_axes",
+    "resnetv15_stage3_conv1_fwd_SX1_0_0_ends",
+    "resnetv15_stage3_conv1_fwd_SX1_0_0_starts",
+    "resnetv15_stage3_conv1_fwd_SX1_0_1_axes",
+    "resnetv15_stage3_conv1_fwd_SX1_0_1_ends",
+    "resnetv15_stage3_conv1_fwd_SX1_0_1_starts",
+    "resnetv15_stage3_conv1_fwd_SX1_1_0_axes",
+    "resnetv15_stage3_conv1_fwd_SX1_1_0_ends",
+    "resnetv15_stage3_conv1_fwd_SX1_1_0_starts",
+    "resnetv15_stage3_conv1_fwd_SX1_1_1_axes",
+    "resnetv15_stage3_conv1_fwd_SX1_1_1_ends",
+    "resnetv15_stage3_conv1_fwd_SX1_1_1_starts",
+    "resnetv15_stage3_conv1_fwd_SX1_2_0_axes",
+    "resnetv15_stage3_conv1_fwd_SX1_2_0_ends",
+    "resnetv15_stage3_conv1_fwd_SX1_2_0_starts",
+    "resnetv15_stage3_conv1_fwd_SX1_2_1_axes",
+    "resnetv15_stage3_conv1_fwd_SX1_2_1_ends",
+    "resnetv15_stage3_conv1_fwd_SX1_2_1_starts",
+    "resnetv15_stage3_conv1_fwd_SX2_0_0_axes",
+    "resnetv15_stage3_conv1_fwd_SX2_0_0_ends",
+    "resnetv15_stage3_conv1_fwd_SX2_0_0_starts",
+    "resnetv15_stage3_conv1_fwd_SX2_0_1_axes",
+    "resnetv15_stage3_conv1_fwd_SX2_0_1_ends",
+    "resnetv15_stage3_conv1_fwd_SX2_0_1_starts",
+    "resnetv15_stage3_conv1_fwd_SX2_1_0_axes",
+    "resnetv15_stage3_conv1_fwd_SX2_1_0_ends",
+    "resnetv15_stage3_conv1_fwd_SX2_1_0_starts",
+    "resnetv15_stage3_conv1_fwd_SX2_1_1_axes",
+    "resnetv15_stage3_conv1_fwd_SX2_1_1_ends",
+    "resnetv15_stage3_conv1_fwd_SX2_1_1_starts",
+    "resnetv15_stage3_conv1_fwd_SX2_2_0_axes",
+    "resnetv15_stage3_conv1_fwd_SX2_2_0_ends",
+    "resnetv15_stage3_conv1_fwd_SX2_2_0_starts",
+    "resnetv15_stage3_conv1_fwd_SX2_2_1_axes",
+    "resnetv15_stage3_conv1_fwd_SX2_2_1_ends",
+    "resnetv15_stage3_conv1_fwd_SX2_2_1_starts",
+    "resnetv15_stage3_conv1_fwd_pads",
+    "resnetv15_stage3_conv1_fwd_wshape"
+   ],
+   "heldout": "conv_resnetv15_stage3_conv1_fwd__v2.axmodel.gz",
+   "heldout_quant": "conv_resnetv15_stage3_conv1_fwd__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     14,
+     14,
+     2304
+    ],
+    [
+     2304,
+     256
+    ]
+   ],
+   "kind": "conv",
+   "names": [
+    "resnetv15_stage3_relu0_fwd",
+    "resnetv15_stage3_conv1_fwd_pad",
+    "resnetv15_stage3_conv1_fwd_xt",
+    "resnetv15_stage3_conv1_weight",
+    "resnetv15_stage3_conv1_fwd_wt",
+    "resnetv15_stage3_conv1_fwd_x0_0_0",
+    "resnetv15_stage3_conv1_fwd_w0_0_0",
+    "resnetv15_stage3_conv1_fwd_x0_0_1",
+    "resnetv15_stage3_conv1_fwd_w0_0_1",
+    "resnetv15_stage3_conv1_fwd_wf0_0",
+    "resnetv15_stage3_conv1_fwd_x0_1_0",
+    "resnetv15_stage3_conv1_fwd_w0_1_0",
+    "resnetv15_stage3_conv1_fwd_x0_1_1",
+    "resnetv15_stage3_conv1_fwd_w0_1_1",
+    "resnetv15_stage3_conv1_fwd_wf0_1",
+    "resnetv15_stage3_conv1_fwd_x0_2_0",
+    "resnetv15_stage3_conv1_fwd_w0_2_0",
+    "resnetv15_stage3_conv1_fwd_x0_2_1",
+    "resnetv15_stage3_conv1_fwd_w0_2_1",
+    "resnetv15_stage3_conv1_fwd_wf0_2",
+    "resnetv15_stage3_conv1_fwd_x1_0_0",
+    "resnetv15_stage3_conv1_fwd_w1_0_0",
+    "resnetv15_stage3_conv1_fwd_x1_0_1",
+    "resnetv15_stage3_conv1_fwd_w1_0_1",
+    "resnetv15_stage3_conv1_fwd_wf1_0",
+    "resnetv15_stage3_conv1_fwd_x1_1_0",
+    "resnetv15_stage3_conv1_fwd_w1_1_0",
+    "resnetv15_stage3_conv1_fwd_x1_1_1",
+    "resnetv15_stage3_conv1_fwd_w1_1_1",
+    "resnetv15_stage3_conv1_fwd_wf1_1",
+    "resnetv15_stage3_conv1_fwd_x1_2_0",
+    "resnetv15_stage3_conv1_fwd_w1_2_0",
+    "resnetv15_stage3_conv1_fwd_x1_2_1",
+    "resnetv15_stage3_conv1_fwd_w1_2_1",
+    "resnetv15_stage3_conv1_fwd_wf1_2",
+    "resnetv15_stage3_conv1_fwd_x2_0_0",
+    "resnetv15_stage3_conv1_fwd_w2_0_0",
+    "resnetv15_stage3_conv1_fwd_x2_0_1",
+    "resnetv15_stage3_conv1_fwd_w2_0_1",
+    "resnetv15_stage3_conv1_fwd_wf2_0",
+    "resnetv15_stage3_conv1_fwd_x2_1_0",
+    "resnetv15_stage3_conv1_fwd_w2_1_0",
+    "resnetv15_stage3_conv1_fwd_x2_1_1",
+    "resnetv15_stage3_conv1_fwd_w2_1_1",
+    "resnetv15_stage3_conv1_fwd_wf2_1",
+    "resnetv15_stage3_conv1_fwd_x2_2_0",
+    "resnetv15_stage3_conv1_fwd_w2_2_0",
+    "resnetv15_stage3_conv1_fwd_x2_2_1",
+    "resnetv15_stage3_conv1_fwd_w2_2_1",
+    "resnetv15_stage3_conv1_fwd_wf2_2",
+    "resnetv15_stage3_conv1_fwd_xcat",
+    "resnetv15_stage3_conv1_fwd_wcat",
+    "resnetv15_stage3_conv1_fwd_mm",
+    "resnetv15_stage3_conv1_fwd_folded_bias",
+    "resnetv15_stage3_conv1_fwd_biased",
+    "resnetv15_stage3_conv1_fwd"
+   ],
+   "params_words": 65,
+   "quant": "conv_resnetv15_stage3_conv1_fwd.quant.json.gz",
+   "records": 45,
+   "step_node": "resnetv15_stage3_conv1_fwd"
+  },
+  "conv_resnetv15_stage3_conv2_fwd": {
+   "axmodel": "conv_resnetv15_stage3_conv2_fwd.axmodel.gz",
+   "constants": [
+    "resnetv15_stage3_conv2_fwd_SW0_0_0_axes",
+    "resnetv15_stage3_conv2_fwd_SW0_0_0_ends",
+    "resnetv15_stage3_conv2_fwd_SW0_0_0_starts",
+    "resnetv15_stage3_conv2_fwd_SW0_0_1_axes",
+    "resnetv15_stage3_conv2_fwd_SW0_0_1_ends",
+    "resnetv15_stage3_conv2_fwd_SW0_0_1_starts",
+    "resnetv15_stage3_conv2_fwd_SX0_0_0_axes",
+    "resnetv15_stage3_conv2_fwd_SX0_0_0_ends",
+    "resnetv15_stage3_conv2_fwd_SX0_0_0_starts",
+    "resnetv15_stage3_conv2_fwd_SX0_0_0_steps",
+    "resnetv15_stage3_conv2_fwd_SX0_0_1_axes",
+    "resnetv15_stage3_conv2_fwd_SX0_0_1_ends",
+    "resnetv15_stage3_conv2_fwd_SX0_0_1_starts",
+    "resnetv15_stage3_conv2_fwd_SX0_0_1_steps",
+    "resnetv15_stage3_conv2_fwd_wshape"
+   ],
+   "heldout": "conv_resnetv15_stage3_conv2_fwd__v2.axmodel.gz",
+   "heldout_quant": "conv_resnetv15_stage3_conv2_fwd__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     14,
+     14,
+     128
+    ],
+    [
+     128,
+     256
+    ]
+   ],
+   "kind": "conv",
+   "names": [
+    "resnetv15_stage2_activation1",
+    "resnetv15_stage3_conv2_fwd_xt",
+    "resnetv15_stage3_conv2_weight",
+    "resnetv15_stage3_conv2_fwd_wt",
+    "resnetv15_stage3_conv2_fwd_x0_0_0",
+    "resnetv15_stage3_conv2_fwd_w0_0_0",
+    "resnetv15_stage3_conv2_fwd_x0_0_1",
+    "resnetv15_stage3_conv2_fwd_w0_0_1",
+    "resnetv15_stage3_conv2_fwd_wf0_0",
+    "resnetv15_stage3_conv2_fwd_m0",
+    "resnetv15_stage3_conv2_fwd_folded_bias",
+    "resnetv15_stage3_conv2_fwd_biased",
+    "resnetv15_stage3_conv2_fwd"
+   ],
+   "params_words": 513,
+   "quant": "conv_resnetv15_stage3_conv2_fwd.quant.json.gz",
+   "records": 39,
+   "step_node": "resnetv15_stage3_conv2_fwd"
+  },
+  "conv_resnetv15_stage4_conv0_fwd": {
+   "axmodel": "conv_resnetv15_stage4_conv0_fwd.axmodel.gz",
+   "constants": [
+    "resnetv15_stage4_conv0_fwd_SW0_0_0_axes",
+    "resnetv15_stage4_conv0_fwd_SW0_0_0_ends",
+    "resnetv15_stage4_conv0_fwd_SW0_0_0_starts",
+    "resnetv15_stage4_conv0_fwd_SW0_0_1_axes",
+    "resnetv15_stage4_conv0_fwd_SW0_0_1_ends",
+    "resnetv15_stage4_conv0_fwd_SW0_0_1_starts",
+    "resnetv15_stage4_conv0_fwd_SW0_1_0_axes",
+    "resnetv15_stage4_conv0_fwd_SW0_1_0_ends",
+    "resnetv15_stage4_conv0_fwd_SW0_1_0_starts",
+    "resnetv15_stage4_conv0_fwd_SW0_1_1_axes",
+    "resnetv15_stage4_conv0_fwd_SW0_1_1_ends",
+    "resnetv15_stage4_conv0_fwd_SW0_1_1_starts",
+    "resnetv15_stage4_conv0_fwd_SW0_2_0_axes",
+    "resnetv15_stage4_conv0_fwd_SW0_2_0_ends",
+    "resnetv15_stage4_conv0_fwd_SW0_2_0_starts",
+    "resnetv15_stage4_conv0_fwd_SW0_2_1_axes",
+    "resnetv15_stage4_conv0_fwd_SW0_2_1_ends",
+    "resnetv15_stage4_conv0_fwd_SW0_2_1_starts",
+    "resnetv15_stage4_conv0_fwd_SW1_0_0_axes",
+    "resnetv15_stage4_conv0_fwd_SW1_0_0_ends",
+    "resnetv15_stage4_conv0_fwd_SW1_0_0_starts",
+    "resnetv15_stage4_conv0_fwd_SW1_0_1_axes",
+    "resnetv15_stage4_conv0_fwd_SW1_0_1_ends",
+    "resnetv15_stage4_conv0_fwd_SW1_0_1_starts",
+    "resnetv15_stage4_conv0_fwd_SW1_1_0_axes",
+    "resnetv15_stage4_conv0_fwd_SW1_1_0_ends",
+    "resnetv15_stage4_conv0_fwd_SW1_1_0_starts",
+    "resnetv15_stage4_conv0_fwd_SW1_1_1_axes",
+    "resnetv15_stage4_conv0_fwd_SW1_1_1_ends",
+    "resnetv15_stage4_conv0_fwd_SW1_1_1_starts",
+    "resnetv15_stage4_conv0_fwd_SW1_2_0_axes",
+    "resnetv15_stage4_conv0_fwd_SW1_2_0_ends",
+    "resnetv15_stage4_conv0_fwd_SW1_2_0_starts",
+    "resnetv15_stage4_conv0_fwd_SW1_2_1_axes",
+    "resnetv15_stage4_conv0_fwd_SW1_2_1_ends",
+    "resnetv15_stage4_conv0_fwd_SW1_2_1_starts",
+    "resnetv15_stage4_conv0_fwd_SW2_0_0_axes",
+    "resnetv15_stage4_conv0_fwd_SW2_0_0_ends",
+    "resnetv15_stage4_conv0_fwd_SW2_0_0_starts",
+    "resnetv15_stage4_conv0_fwd_SW2_0_1_axes",
+    "resnetv15_stage4_conv0_fwd_SW2_0_1_ends",
+    "resnetv15_stage4_conv0_fwd_SW2_0_1_starts",
+    "resnetv15_stage4_conv0_fwd_SW2_1_0_axes",
+    "resnetv15_stage4_conv0_fwd_SW2_1_0_ends",
+    "resnetv15_stage4_conv0_fwd_SW2_1_0_starts",
+    "resnetv15_stage4_conv0_fwd_SW2_1_1_axes",
+    "resnetv15_stage4_conv0_fwd_SW2_1_1_ends",
+    "resnetv15_stage4_conv0_fwd_SW2_1_1_starts",
+    "resnetv15_stage4_conv0_fwd_SW2_2_0_axes",
+    "resnetv15_stage4_conv0_fwd_SW2_2_0_ends",
+    "resnetv15_stage4_conv0_fwd_SW2_2_0_starts",
+    "resnetv15_stage4_conv0_fwd_SW2_2_1_axes",
+    "resnetv15_stage4_conv0_fwd_SW2_2_1_ends",
+    "resnetv15_stage4_conv0_fwd_SW2_2_1_starts",
+    "resnetv15_stage4_conv0_fwd_SX0_0_0_axes",
+    "resnetv15_stage4_conv0_fwd_SX0_0_0_ends",
+    "resnetv15_stage4_conv0_fwd_SX0_0_0_starts",
+    "resnetv15_stage4_conv0_fwd_SX0_0_0_steps",
+    "resnetv15_stage4_conv0_fwd_SX0_0_1_axes",
+    "resnetv15_stage4_conv0_fwd_SX0_0_1_ends",
+    "resnetv15_stage4_conv0_fwd_SX0_0_1_starts",
+    "resnetv15_stage4_conv0_fwd_SX0_0_1_steps",
+    "resnetv15_stage4_conv0_fwd_SX0_1_0_axes",
+    "resnetv15_stage4_conv0_fwd_SX0_1_0_ends",
+    "resnetv15_stage4_conv0_fwd_SX0_1_0_starts",
+    "resnetv15_stage4_conv0_fwd_SX0_1_0_steps",
+    "resnetv15_stage4_conv0_fwd_SX0_1_1_axes",
+    "resnetv15_stage4_conv0_fwd_SX0_1_1_ends",
+    "resnetv15_stage4_conv0_fwd_SX0_1_1_starts",
+    "resnetv15_stage4_conv0_fwd_SX0_1_1_steps",
+    "resnetv15_stage4_conv0_fwd_SX0_2_0_axes",
+    "resnetv15_stage4_conv0_fwd_SX0_2_0_ends",
+    "resnetv15_stage4_conv0_fwd_SX0_2_0_starts",
+    "resnetv15_stage4_conv0_fwd_SX0_2_0_steps",
+    "resnetv15_stage4_conv0_fwd_SX0_2_1_axes",
+    "resnetv15_stage4_conv0_fwd_SX0_2_1_ends",
+    "resnetv15_stage4_conv0_fwd_SX0_2_1_starts",
+    "resnetv15_stage4_conv0_fwd_SX0_2_1_steps",
+    "resnetv15_stage4_conv0_fwd_SX1_0_0_axes",
+    "resnetv15_stage4_conv0_fwd_SX1_0_0_ends",
+    "resnetv15_stage4_conv0_fwd_SX1_0_0_starts",
+    "resnetv15_stage4_conv0_fwd_SX1_0_0_steps",
+    "resnetv15_stage4_conv0_fwd_SX1_0_1_axes",
+    "resnetv15_stage4_conv0_fwd_SX1_0_1_ends",
+    "resnetv15_stage4_conv0_fwd_SX1_0_1_starts",
+    "resnetv15_stage4_conv0_fwd_SX1_0_1_steps",
+    "resnetv15_stage4_conv0_fwd_SX1_1_0_axes",
+    "resnetv15_stage4_conv0_fwd_SX1_1_0_ends",
+    "resnetv15_stage4_conv0_fwd_SX1_1_0_starts",
+    "resnetv15_stage4_conv0_fwd_SX1_1_0_steps",
+    "resnetv15_stage4_conv0_fwd_SX1_1_1_axes",
+    "resnetv15_stage4_conv0_fwd_SX1_1_1_ends",
+    "resnetv15_stage4_conv0_fwd_SX1_1_1_starts",
+    "resnetv15_stage4_conv0_fwd_SX1_1_1_steps",
+    "resnetv15_stage4_conv0_fwd_SX1_2_0_axes",
+    "resnetv15_stage4_conv0_fwd_SX1_2_0_ends",
+    "resnetv15_stage4_conv0_fwd_SX1_2_0_starts",
+    "resnetv15_stage4_conv0_fwd_SX1_2_0_steps",
+    "resnetv15_stage4_conv0_fwd_SX1_2_1_axes",
+    "resnetv15_stage4_conv0_fwd_SX1_2_1_ends",
+    "resnetv15_stage4_conv0_fwd_SX1_2_1_starts",
+    "resnetv15_stage4_conv0_fwd_SX1_2_1_steps",
+    "resnetv15_stage4_conv0_fwd_SX2_0_0_axes",
+    "resnetv15_stage4_conv0_fwd_SX2_0_0_ends",
+    "resnetv15_stage4_conv0_fwd_SX2_0_0_starts",
+    "resnetv15_stage4_conv0_fwd_SX2_0_0_steps",
+    "resnetv15_stage4_conv0_fwd_SX2_0_1_axes",
+    "resnetv15_stage4_conv0_fwd_SX2_0_1_ends",
+    "resnetv15_stage4_conv0_fwd_SX2_0_1_starts",
+    "resnetv15_stage4_conv0_fwd_SX2_0_1_steps",
+    "resnetv15_stage4_conv0_fwd_SX2_1_0_axes",
+    "resnetv15_stage4_conv0_fwd_SX2_1_0_ends",
+    "resnetv15_stage4_conv0_fwd_SX2_1_0_starts",
+    "resnetv15_stage4_conv0_fwd_SX2_1_0_steps",
+    "resnetv15_stage4_conv0_fwd_SX2_1_1_axes",
+    "resnetv15_stage4_conv0_fwd_SX2_1_1_ends",
+    "resnetv15_stage4_conv0_fwd_SX2_1_1_starts",
+    "resnetv15_stage4_conv0_fwd_SX2_1_1_steps",
+    "resnetv15_stage4_conv0_fwd_SX2_2_0_axes",
+    "resnetv15_stage4_conv0_fwd_SX2_2_0_ends",
+    "resnetv15_stage4_conv0_fwd_SX2_2_0_starts",
+    "resnetv15_stage4_conv0_fwd_SX2_2_0_steps",
+    "resnetv15_stage4_conv0_fwd_SX2_2_1_axes",
+    "resnetv15_stage4_conv0_fwd_SX2_2_1_ends",
+    "resnetv15_stage4_conv0_fwd_SX2_2_1_starts",
+    "resnetv15_stage4_conv0_fwd_SX2_2_1_steps",
+    "resnetv15_stage4_conv0_fwd_pads",
+    "resnetv15_stage4_conv0_fwd_wshape"
+   ],
+   "heldout": "conv_resnetv15_stage4_conv0_fwd__v2.axmodel.gz",
+   "heldout_quant": "conv_resnetv15_stage4_conv0_fwd__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     7,
+     7,
+     2304
+    ],
+    [
+     2304,
+     512
+    ]
+   ],
+   "kind": "conv",
+   "names": [
+    "resnetv15_stage3_activation1",
+    "resnetv15_stage4_conv0_fwd_pad",
+    "resnetv15_stage4_conv0_fwd_xt",
+    "resnetv15_stage4_conv0_weight",
+    "resnetv15_stage4_conv0_fwd_wt",
+    "resnetv15_stage4_conv0_fwd_x0_0_0",
+    "resnetv15_stage4_conv0_fwd_w0_0_0",
+    "resnetv15_stage4_conv0_fwd_x0_0_1",
+    "resnetv15_stage4_conv0_fwd_w0_0_1",
+    "resnetv15_stage4_conv0_fwd_wf0_0",
+    "resnetv15_stage4_conv0_fwd_x0_1_0",
+    "resnetv15_stage4_conv0_fwd_w0_1_0",
+    "resnetv15_stage4_conv0_fwd_x0_1_1",
+    "resnetv15_stage4_conv0_fwd_w0_1_1",
+    "resnetv15_stage4_conv0_fwd_wf0_1",
+    "resnetv15_stage4_conv0_fwd_x0_2_0",
+    "resnetv15_stage4_conv0_fwd_w0_2_0",
+    "resnetv15_stage4_conv0_fwd_x0_2_1",
+    "resnetv15_stage4_conv0_fwd_w0_2_1",
+    "resnetv15_stage4_conv0_fwd_wf0_2",
+    "resnetv15_stage4_conv0_fwd_x1_0_0",
+    "resnetv15_stage4_conv0_fwd_w1_0_0",
+    "resnetv15_stage4_conv0_fwd_x1_0_1",
+    "resnetv15_stage4_conv0_fwd_w1_0_1",
+    "resnetv15_stage4_conv0_fwd_wf1_0",
+    "resnetv15_stage4_conv0_fwd_x1_1_0",
+    "resnetv15_stage4_conv0_fwd_w1_1_0",
+    "resnetv15_stage4_conv0_fwd_x1_1_1",
+    "resnetv15_stage4_conv0_fwd_w1_1_1",
+    "resnetv15_stage4_conv0_fwd_wf1_1",
+    "resnetv15_stage4_conv0_fwd_x1_2_0",
+    "resnetv15_stage4_conv0_fwd_w1_2_0",
+    "resnetv15_stage4_conv0_fwd_x1_2_1",
+    "resnetv15_stage4_conv0_fwd_w1_2_1",
+    "resnetv15_stage4_conv0_fwd_wf1_2",
+    "resnetv15_stage4_conv0_fwd_x2_0_0",
+    "resnetv15_stage4_conv0_fwd_w2_0_0",
+    "resnetv15_stage4_conv0_fwd_x2_0_1",
+    "resnetv15_stage4_conv0_fwd_w2_0_1",
+    "resnetv15_stage4_conv0_fwd_wf2_0",
+    "resnetv15_stage4_conv0_fwd_x2_1_0",
+    "resnetv15_stage4_conv0_fwd_w2_1_0",
+    "resnetv15_stage4_conv0_fwd_x2_1_1",
+    "resnetv15_stage4_conv0_fwd_w2_1_1",
+    "resnetv15_stage4_conv0_fwd_wf2_1",
+    "resnetv15_stage4_conv0_fwd_x2_2_0",
+    "resnetv15_stage4_conv0_fwd_w2_2_0",
+    "resnetv15_stage4_conv0_fwd_x2_2_1",
+    "resnetv15_stage4_conv0_fwd_w2_2_1",
+    "resnetv15_stage4_conv0_fwd_wf2_2",
+    "resnetv15_stage4_conv0_fwd_xcat",
+    "resnetv15_stage4_conv0_fwd_wcat",
+    "resnetv15_stage4_conv0_fwd_mm",
+    "resnetv15_stage4_conv0_fwd_folded_bias",
+    "resnetv15_stage4_conv0_fwd_biased",
+    "resnetv15_stage4_conv0_fwd"
+   ],
+   "params_words": 65,
+   "quant": "conv_resnetv15_stage4_conv0_fwd.quant.json.gz",
+   "records": 45,
+   "step_node": "resnetv15_stage4_conv0_fwd"
+  },
+  "conv_resnetv15_stage4_conv2_fwd": {
+   "axmodel": "conv_resnetv15_stage4_conv2_fwd.axmodel.gz",
+   "constants": [
+    "resnetv15_stage4_conv2_fwd_SW0_0_0_axes",
+    "resnetv15_stage4_conv2_fwd_SW0_0_0_ends",
+    "resnetv15_stage4_conv2_fwd_SW0_0_0_starts",
+    "resnetv15_stage4_conv2_fwd_SW0_0_1_axes",
+    "resnetv15_stage4_conv2_fwd_SW0_0_1_ends",
+    "resnetv15_stage4_conv2_fwd_SW0_0_1_starts",
+    "resnetv15_stage4_conv2_fwd_SX0_0_0_axes",
+    "resnetv15_stage4_conv2_fwd_SX0_0_0_ends",
+    "resnetv15_stage4_conv2_fwd_SX0_0_0_starts",
+    "resnetv15_stage4_conv2_fwd_SX0_0_0_steps",
+    "resnetv15_stage4_conv2_fwd_SX0_0_1_axes",
+    "resnetv15_stage4_conv2_fwd_SX0_0_1_ends",
+    "resnetv15_stage4_conv2_fwd_SX0_0_1_starts",
+    "resnetv15_stage4_conv2_fwd_SX0_0_1_steps",
+    "resnetv15_stage4_conv2_fwd_wshape"
+   ],
+   "heldout": "conv_resnetv15_stage4_conv2_fwd__v2.axmodel.gz",
+   "heldout_quant": "conv_resnetv15_stage4_conv2_fwd__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     7,
+     7,
+     256
+    ],
+    [
+     256,
+     512
+    ]
+   ],
+   "kind": "conv",
+   "names": [
+    "resnetv15_stage3_activation1",
+    "resnetv15_stage4_conv2_fwd_xt",
+    "resnetv15_stage4_conv2_weight",
+    "resnetv15_stage4_conv2_fwd_wt",
+    "resnetv15_stage4_conv2_fwd_x0_0_0",
+    "resnetv15_stage4_conv2_fwd_w0_0_0",
+    "resnetv15_stage4_conv2_fwd_x0_0_1",
+    "resnetv15_stage4_conv2_fwd_w0_0_1",
+    "resnetv15_stage4_conv2_fwd_wf0_0",
+    "resnetv15_stage4_conv2_fwd_m0",
+    "resnetv15_stage4_conv2_fwd_folded_bias",
+    "resnetv15_stage4_conv2_fwd_biased",
+    "resnetv15_stage4_conv2_fwd"
+   ],
+   "params_words": 513,
+   "quant": "conv_resnetv15_stage4_conv2_fwd.quant.json.gz",
+   "records": 47,
+   "step_node": "resnetv15_stage4_conv2_fwd"
+  },
+  "dW_MatMul_142": {
+   "axmodel": "dW_MatMul_142.axmodel.gz",
+   "constants": [],
+   "heldout": "dW_MatMul_142__v2.axmodel.gz",
+   "heldout_quant": "dW_MatMul_142__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     1,
+     512,
+     49
+    ],
+    [
+     16,
+     1,
+     49,
+     256
+    ]
+   ],
+   "kind": "dW",
+   "names": [
+    "distill__gather_303",
+    "distill__transpose_308",
+    "distill__reshape_213",
+    "distill__matmul_309"
+   ],
+   "params_words": 512,
+   "quant": "dW_MatMul_142.quant.json.gz",
+   "records": 25,
+   "step_node": "MatMul_142"
+  },
+  "dW_MatMul_163": {
+   "axmodel": "dW_MatMul_163.axmodel.gz",
+   "constants": [
+    "distill__shape_331"
+   ],
+   "heldout": "dW_MatMul_163__v2.axmodel.gz",
+   "heldout_quant": "dW_MatMul_163__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     1,
+     256,
+     196
+    ],
+    [
+     16,
+     1,
+     196,
+     2304
+    ]
+   ],
+   "kind": "dW",
+   "names": [
+    "distill__mul_346",
+    "distill__reshape_348",
+    "distill__transpose_349",
+    "distill__reshape_326",
+    "distill__matmul_350"
+   ],
+   "params_words": 576,
+   "quant": "dW_MatMul_163.quant.json.gz",
+   "records": 673,
+   "step_node": "MatMul_163"
+  },
+  "dW_MatMul_230": {
+   "axmodel": "dW_MatMul_230.axmodel.gz",
+   "constants": [
+    "distill__shape_464"
+   ],
+   "heldout": "dW_MatMul_230__v2.axmodel.gz",
+   "heldout_quant": "dW_MatMul_230__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     1,
+     256,
+     196
+    ],
+    [
+     16,
+     1,
+     196,
+     1152
+    ]
+   ],
+   "kind": "dW",
+   "names": [
+    "distill__mul_463",
+    "distill__reshape_465",
+    "distill__transpose_466",
+    "distill__reshape_443",
+    "distill__matmul_467"
+   ],
+   "params_words": 576,
+   "quant": "dW_MatMul_230.quant.json.gz",
+   "records": 419,
+   "step_node": "MatMul_230"
+  },
+  "dW_MatMul_244": {
+   "axmodel": "dW_MatMul_244.axmodel.gz",
+   "constants": [],
+   "heldout": "dW_MatMul_244__v2.axmodel.gz",
+   "heldout_quant": "dW_MatMul_244__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     1,
+     256,
+     196
+    ],
+    [
+     16,
+     1,
+     196,
+     128
+    ]
+   ],
+   "kind": "dW",
+   "names": [
+    "distill__gather_495",
+    "distill__transpose_500",
+    "distill__reshape_405",
+    "distill__matmul_501"
+   ],
+   "params_words": 256,
+   "quant": "dW_MatMul_244.quant.json.gz",
+   "records": 25,
+   "step_node": "MatMul_244"
+  },
+  "dW_MatMul_332": {
+   "axmodel": "dW_MatMul_332.axmodel.gz",
+   "constants": [
+    "distill__shape_656"
+   ],
+   "heldout": "dW_MatMul_332__v2.axmodel.gz",
+   "heldout_quant": "dW_MatMul_332__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     1,
+     128,
+     784
+    ],
+    [
+     16,
+     1,
+     784,
+     576
+    ]
+   ],
+   "kind": "dW",
+   "names": [
+    "distill__mul_655",
+    "distill__reshape_657",
+    "distill__transpose_658",
+    "distill__reshape_635",
+    "distill__matmul_659"
+   ],
+   "params_words": 64,
+   "quant": "dW_MatMul_332.quant.json.gz",
+   "records": 141,
+   "step_node": "MatMul_332"
+  },
+  "dW_MatMul_346": {
+   "axmodel": "dW_MatMul_346.axmodel.gz",
+   "constants": [],
+   "heldout": "dW_MatMul_346__v2.axmodel.gz",
+   "heldout_quant": "dW_MatMul_346__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     1,
+     128,
+     784
+    ],
+    [
+     16,
+     1,
+     784,
+     64
+    ]
+   ],
+   "kind": "dW",
+   "names": [
+    "distill__gather_687",
+    "distill__transpose_692",
+    "distill__reshape_597",
+    "distill__matmul_693"
+   ],
+   "params_words": 64,
+   "quant": "dW_MatMul_346.quant.json.gz",
+   "records": 25,
+   "step_node": "MatMul_346"
+  },
+  "dX_MatMul_121": {
+   "axmodel": "dX_MatMul_121.axmodel.gz",
+   "constants": [
+    "distill__idx_252",
+    "distill__mask_254",
+    "distill__shape_256"
+   ],
+   "heldout": "dX_MatMul_121__v2.axmodel.gz",
+   "heldout_quant": "dX_MatMul_121__v2.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     256,
+     4608
+    ],
+    [
+     16,
+     1,
+     4608,
+     196
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "distill__reshape_251",
+    "distill__gather_253",
+    "distill__mul_255",
+    "distill__reshape_257",
+    "distill__reshape_262",
+    "distill__matmul_263"
+   ],
+   "params_words": 72,
+   "quant": "dX_MatMul_121.quant.json.gz",
+   "records": 3784,
+   "step_node": "MatMul_121"
+  },
+  "dX_MatMul_138": {
+   "axmodel": "dX_MatMul_138.axmodel.gz",
+   "constants": [
+    "distill__idx_286",
+    "distill__mask_288"
+   ],
+   "heldout": "dX_MatMul_138__v2.axmodel.gz",
+   "heldout_quant": "dX_MatMul_138__v2.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     256,
+     512
+    ],
+    [
+     16,
+     1,
+     512,
+     196
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "distill__reshape_213",
+    "distill__gather_287",
+    "distill__mul_289",
+    "distill__reshape_296",
+    "distill__matmul_297"
+   ],
+   "params_words": 200,
+   "quant": "dX_MatMul_138.quant.json.gz",
+   "records": 356,
+   "step_node": "MatMul_138"
+  },
+  "dX_MatMul_156": {
+   "axmodel": "dX_MatMul_156.axmodel.gz",
+   "constants": [
+    "distill__idx_327",
+    "distill__mask_329",
+    "distill__shape_331"
+   ],
+   "heldout": "dX_MatMul_156__v2.axmodel.gz",
+   "heldout_quant": "dX_MatMul_156__v2.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     256,
+     2304
+    ],
+    [
+     16,
+     1,
+     2304,
+     196
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "distill__reshape_326",
+    "distill__gather_328",
+    "distill__mul_330",
+    "distill__reshape_332",
+    "distill__reshape_337",
+    "distill__matmul_338"
+   ],
+   "params_words": 72,
+   "quant": "dX_MatMul_156.quant.json.gz",
+   "records": 1366,
+   "step_node": "MatMul_156"
+  },
+  "dX_MatMul_223": {
+   "axmodel": "dX_MatMul_223.axmodel.gz",
+   "constants": [
+    "distill__idx_444",
+    "distill__mask_446",
+    "distill__shape_448"
+   ],
+   "heldout": "dX_MatMul_223__v2.axmodel.gz",
+   "heldout_quant": "dX_MatMul_223__v2.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     128,
+     2304
+    ],
+    [
+     16,
+     1,
+     2304,
+     784
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "distill__reshape_443",
+    "distill__gather_445",
+    "distill__mul_447",
+    "distill__reshape_449",
+    "distill__reshape_454",
+    "distill__matmul_455"
+   ],
+   "params_words": 96,
+   "quant": "dX_MatMul_223.quant.json.gz",
+   "records": 4769,
+   "step_node": "MatMul_223"
+  },
+  "dX_MatMul_240": {
+   "axmodel": "dX_MatMul_240.axmodel.gz",
+   "constants": [
+    "distill__idx_478",
+    "distill__mask_480"
+   ],
+   "heldout": "dX_MatMul_240__v2.axmodel.gz",
+   "heldout_quant": "dX_MatMul_240__v2.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     128,
+     256
+    ],
+    [
+     16,
+     1,
+     256,
+     784
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "distill__reshape_405",
+    "distill__gather_479",
+    "distill__mul_481",
+    "distill__reshape_488",
+    "distill__matmul_489"
+   ],
+   "params_words": 800,
+   "quant": "dX_MatMul_240.quant.json.gz",
+   "records": 583,
+   "step_node": "MatMul_240"
+  },
+  "dX_MatMul_258": {
+   "axmodel": "dX_MatMul_258.axmodel.gz",
+   "constants": [
+    "distill__idx_519",
+    "distill__mask_521",
+    "distill__shape_523"
+   ],
+   "heldout": "dX_MatMul_258__v2.axmodel.gz",
+   "heldout_quant": "dX_MatMul_258__v2.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     128,
+     1152
+    ],
+    [
+     16,
+     1,
+     1152,
+     784
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "distill__reshape_518",
+    "distill__gather_520",
+    "distill__mul_522",
+    "distill__reshape_524",
+    "distill__reshape_529",
+    "distill__matmul_530"
+   ],
+   "params_words": 96,
+   "quant": "dX_MatMul_258.quant.json.gz",
+   "records": 2273,
+   "step_node": "MatMul_258"
+  },
+  "dX_MatMul_342": {
+   "axmodel": "dX_MatMul_342.axmodel.gz",
+   "constants": [
+    "distill__idx_670",
+    "distill__mask_672"
+   ],
+   "heldout": "dX_MatMul_342__v2.axmodel.gz",
+   "heldout_quant": "dX_MatMul_342__v2.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     64,
+     128
+    ],
+    [
+     16,
+     1,
+     128,
+     3136
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "distill__reshape_597",
+    "distill__gather_671",
+    "distill__mul_673",
+    "distill__reshape_680",
+    "distill__matmul_681"
+   ],
+   "params_words": 896,
+   "quant": "dX_MatMul_342.quant.json.gz",
+   "records": 2533,
+   "step_node": "MatMul_342"
+  },
+  "dX_MatMul_54": {
+   "axmodel": "../gather_aggregate_real/a_reference_narrow.axmodel.gz",
+   "constants": [
+    "g_idx",
+    "mask",
+    "rs_shape"
+   ],
+   "heldout": "../gather_aggregate_real/c_wide_reference.axmodel.gz",
+   "heldout_quant": "../matmul_record_emit/gather_c_wide_reference.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     512,
+     4608
+    ],
+    [
+     16,
+     1,
+     4608,
+     49
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "x",
+    "gathered",
+    "masked",
+    "reshaped",
+    "w",
+    "y"
+   ],
+   "params_words": 98,
+   "quant": "../matmul_record_emit/gather_a_reference.quant.json.gz",
+   "records": 890,
+   "step_node": "MatMul_54"
+  },
+  "fc_dW_MatMul_38": {
+   "axmodel": "fc_dW_MatMul_38.axmodel.gz",
+   "constants": [],
+   "heldout": "fc_dW_MatMul_38__v2.axmodel.gz",
+   "heldout_quant": "fc_dW_MatMul_38__v2.quant.json.gz",
+   "key": [
+    [
+     512,
+     16
+    ],
+    [
+     16,
+     1000
+    ]
+   ],
+   "kind": "fc_dW",
+   "names": [
+    "resnetv15_pool1_fwd",
+    "flatten_170",
+    "distill__transpose_116",
+    "distill__add_113",
+    "distill__matmul_117"
+   ],
+   "params_words": 1040,
+   "quant": "fc_dW_MatMul_38.quant.json.gz",
+   "records": 25,
+   "step_node": "MatMul_38"
+  },
+  "fc_dX_MatMul_36": {
+   "axmodel": "fc_dX_MatMul_36.axmodel.gz",
+   "constants": [],
+   "heldout": "fc_dX_MatMul_36__v2.axmodel.gz",
+   "heldout_quant": "fc_dX_MatMul_36__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     1000
+    ],
+    [
+     1000,
+     512
+    ]
+   ],
+   "kind": "fc_dX",
+   "names": [
+    "distill__add_113",
+    "resnetv15_dense0_weight",
+    "distill__matmul_115"
+   ],
+   "params_words": 64,
+   "quant": "fc_dX_MatMul_36.quant.json.gz",
+   "records": 25,
+   "step_node": "MatMul_36"
+  },
+  "fc_fwd_resnetv15_dense0_fwd": {
+   "axmodel": "fc_fwd_resnetv15_dense0_fwd.axmodel.gz",
+   "constants": [],
+   "heldout": "fc_fwd_resnetv15_dense0_fwd__v2.axmodel.gz",
+   "heldout_quant": "fc_fwd_resnetv15_dense0_fwd__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     512
+    ],
+    [
+     1000,
+     512
+    ]
+   ],
+   "kind": "fc_fwd",
+   "names": [
+    "resnetv15_pool1_fwd",
+    "flatten_170",
+    "resnetv15_dense0_weight",
+    "resnetv15_dense0_fwd_bt",
+    "resnetv15_dense0_fwd_mm",
+    "resnetv15_dense0_bias",
+    "resnetv15_dense0_fwd"
+   ],
+   "params_words": 1041,
+   "quant": "fc_fwd_resnetv15_dense0_fwd.quant.json.gz",
+   "records": 39,
+   "step_node": "resnetv15_dense0_fwd"
+  }
+ }
+}
