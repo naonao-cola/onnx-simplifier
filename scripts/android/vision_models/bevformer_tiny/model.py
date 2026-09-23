@@ -160,10 +160,23 @@ class SpatialCrossAttention(nn.Module):
         vis = (bev_mask.sum(-1) > 0).to(query.dtype)  # (C, Q): camera sees any pillar point
         if reference:
             return self._upstream(query, v, off, w, ref_cam, vis)
-        # point p uses pillar anchor p % Z (offsets are laid out (point, anchor), anchor fastest)
-        idx = torch.arange(p) % Z_ANCHORS
-        ref = ref_cam.reshape(NUM_CAMS, NQ, 1, Z_ANCHORS, 2).expand(-1, -1, m, -1, -1)[:, :, :, idx]
-        out = msda_rank5(v, (FH, FW), ref + off, w.expand(NUM_CAMS, -1, -1, -1))  # (C, Q, E)
+        # point p uses pillar anchor p % Z (offsets are laid out (point, anchor), anchor fastest).
+        # Same math as msda_rank5(v, (FH, FW), ref + off, w), but the sampling grid is built in
+        # grid_sample's (C*M, Q, P, 2) layout from its small factors: the [0, 1] -> [-1, 1] map,
+        # the anchor gather and the head permute run on ref_cam (C, Q, Z, 2) and the offsets
+        # (M, Q, P, 2) before they broadcast, instead of on the (C, Q, M, P, 2) sum (on the HTP
+        # those elementwise ops cost more than all the Linears together: enc1 104 -> 55 ms, README)
+        # (every tensor stays rank <= 4: a rank-5 broadcast version fails to execute on the HTP,
+        # QNN_COMMON_ERROR_SYSTEM)
+        r = 2 * ref_cam - 1  # (C, Q, Z, 2)
+        ref = torch.cat([r] * (p // Z_ANCHORS), 2).reshape(NUM_CAMS, 1, NQ * p * 2)  # point p -> anchor p % Z
+        off2 = self.sampling_offsets(query).reshape(NQ, m, p * 2).transpose(0, 1) * torch.tensor(
+            [2.0 / FW, 2.0 / FH] * p, dtype=query.dtype)  # (M, Q, P*2)
+        grid = (ref + off2.reshape(1, m, NQ * p * 2)).reshape(NUM_CAMS * m, NQ, p, 2)
+        a = w.reshape(NQ, m, p).transpose(0, 1).reshape(1, m, NQ * p).expand(NUM_CAMS, -1, -1)
+        vv = v.reshape(NUM_CAMS, FH * FW, EMBED).transpose(1, 2).reshape(NUM_CAMS * m, EMBED // m, FH, FW)
+        s = F.grid_sample(vv, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        out = (s * a.reshape(NUM_CAMS * m, 1, NQ, p)).sum(-1).reshape(NUM_CAMS, EMBED, NQ).transpose(1, 2)
         vis = vis.reshape(NUM_CAMS, NQ, 1)
         slots = (out * vis).sum(0) / vis.sum(0).clamp(min=1.0)
         return self.output_proj(slots) + query
@@ -355,7 +368,7 @@ def decode(cls, bbox, max_num=300):
 
 
 # ---- geometry (host side; upstream BEVFormerEncoder.get_reference_points/point_sampling) ------
-REF_CAM_CLAMP = (-5.0, 6.0)
+REF_CAM_CLAMP = (-1.0, 2.0)
 
 
 def reference_points_cam(lidar2img: torch.Tensor, img_hw=(480, 800), clamp=REF_CAM_CLAMP):
@@ -364,8 +377,10 @@ def reference_points_cam(lidar2img: torch.Tensor, img_hw=(480, 800), clamp=REF_C
     Upstream divides by max(depth, 1e-5), so pillar points behind a camera land at |xy| ~ 1e7:
     past fp16's 65504, which the HTP turns into inf/NaN (encoder cos 0.916 on the phone). Such
     points are outside the image either way, and SCA offsets move a point by < 1 image width
-    (|offset| / W < 0.8 on real frames), so clamping to [-5, 6] still samples zero padding: the
-    output is unchanged (validate.py checks clamped vs unclamped). clamp=None keeps upstream values."""
+    (|offset| / W < 0.8 on real frames), so clamping to [-1, 2] still samples zero padding: the
+    output is unchanged (validate.py checks clamped vs unclamped; [-0.5, 1.5] is not exact). The
+    tight range also keeps the sampling grid quantizable (quantize.py). clamp=None keeps upstream
+    values."""
     zs = torch.linspace(0.5, 8 - 0.5, Z_ANCHORS).view(-1, 1, 1).expand(Z_ANCHORS, BEV_H, BEV_W) / 8
     xs = torch.linspace(0.5, BEV_W - 0.5, BEV_W).view(1, 1, BEV_W).expand(Z_ANCHORS, BEV_H, BEV_W) / BEV_W
     ys = torch.linspace(0.5, BEV_H - 0.5, BEV_H).view(1, BEV_H, 1).expand(Z_ANCHORS, BEV_H, BEV_W) / BEV_H
