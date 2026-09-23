@@ -29,7 +29,8 @@ def _records():
 
 def test_reference_fixture_has_the_expected_segments():
     _, _mc, header, segs = load_reference()
-    assert header == 340
+    # 336, not the 340 pinned before docs/axera-mcode-segments-fix.md.
+    assert header == 336
     sizes = {i: ln for i, (_o, ln, _t) in enumerate(segs)}
     assert sizes[2] == 1632  # teng2
     assert sizes[3] == 256  # cv3

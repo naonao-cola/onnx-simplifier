@@ -190,12 +190,15 @@ def matrix(root: str, cs) -> dict[tuple[int, int], int | None]:
 
 
 # Fields decoded for the C in {40, 56, 60, 64} sub-cluster (see the doc for the
-# {44, 48, 52} counter-examples and the un-decoded remainder).
+# {44, 48, 52} counter-examples and the un-decoded remainder). Offsets are
+# relative to segment 2's start; they are 4 more than when first measured,
+# because these blobs have 4-byte tail padding and mcode.segments used to
+# place every start 4 bytes late (docs/axera-mcode-segments-fix.md).
 FIELD_OFFSETS = {
-    "row_bytes_36c": 537,  # uint16 LE, value 36*C
-    "c_minus_1_a": 550,  # uint8, value C-1
-    "c_minus_1_b": 555,  # uint8, value C-1
-    "half_c_sq_minus_1": 825,  # uint16 LE, value C*C//2 - 1
+    "row_bytes_36c": 541,  # uint16 LE, value 36*C
+    "c_minus_1_a": 554,  # uint8, value C-1
+    "c_minus_1_b": 559,  # uint8, value C-1
+    "half_c_sq_minus_1": 829,  # uint16 LE, value C*C//2 - 1
 }
 
 

@@ -643,20 +643,39 @@ def tail_tables(mcode):
     return vec, _tables_at(mcode, vec)
 
 
+def tail_padding(mcode):
+    """Zero bytes between the last segment and the tail vector.
+
+    Segments start 8-byte aligned, but the FlatBuffers vector is only
+    4-byte aligned. When the vector sits at an offset that is 4 mod 8
+    (424 of 1,063 fixture blobs), four zero bytes of padding precede it;
+    otherwise there are none. See docs/axera-mcode-segments-fix.md."""
+    return _tail_padding(mcode, tail_vector(mcode))
+
+
+def _tail_padding(mcode, vec):
+    pad = vec % 8
+    assert pad in (0, 4), f"tail vector at {vec} is not 4-byte aligned"
+    assert mcode[vec - pad : vec] == bytes(pad), "tail padding is not zero"
+    return pad
+
+
 def segments(mcode):
     """The stream segments the tail table describes: `(offset, length,
     table)` per segment in stream order, which is *reverse* table order.
     Table field 2 is the segment length in 8-byte words; the segments tile
     the blob exactly from the end of the FlatBuffers header to the tail
-    vector. Also returns the header length."""
+    vector, less any `tail_padding` before the vector. Also returns the
+    header length."""
     vec, tables = tail_tables(mcode)
+    pad = _tail_padding(mcode, vec)
     words = [t.get(2, 0) for t in tables]
-    header = vec - 8 * sum(words)
+    header = vec - pad - 8 * sum(words)
     segs, pos = [], header
     for k in range(len(tables) - 1, -1, -1):
         segs.append((pos, 8 * words[k], tables[k]))
         pos += 8 * words[k]
-    assert pos == vec
+    assert pos == vec - pad
     return header, segs
 
 
@@ -930,10 +949,11 @@ def check(mcode, strict=True):
 
     # 1. The segment table is a loader manifest. Its word counts are
     #    load-bearing: the runtime rejects a blob whose segments do not tile
-    #    the stream exactly, from the end of the header to the tail vector.
+    #    the stream exactly, from the end of the header to the tail vector
+    #    (less the zero padding that keeps the vector 4-byte aligned).
     vec = tail_vector(mcode)
     end = segs[-1][0] + segs[-1][1]
-    if end != vec:
+    if end != vec - _tail_padding(mcode, vec):
         bad.append(f"segments: tile to {end}, tail vector is at {vec}")
     for pos, length, _ in segs:
         if length % 8:

@@ -22,12 +22,12 @@ Token grammar (``t`` is the token byte):
 Framing: a compressed segment is one whose tail table carries key 5. Key 5
 is the exact length of the token stream in bytes. The stream always starts
 with a literal token followed by the segment's ``a7 00 00 XX`` header
-record. ``mcode.segments`` tiles segments from the end of the FlatBuffers
-header, and in 424 of the 1,063 fixture blobs that places every start 4
-bytes past the true stream start. ``stream_start`` finds the true start.
-Each stream is zero-padded to a multiple of 32 bytes, which is table key 2
-in 8-byte words. Uncompressed segments (no key 5) are raw records under the
-same 0/4-byte shift.
+record. ``mcode.segments`` used to place every start 4 bytes past the true
+stream start in 424 of the 1,063 fixture blobs (those with 4 bytes of tail
+padding before the FlatBuffers vector); that is fixed, see
+``docs/axera-mcode-segments-fix.md``, and ``stream_start`` now only checks
+the header record is where ``mcode.segments`` says. Each stream is zero-padded to a multiple of 32 bytes, which is table key 2
+in 8-byte words. Uncompressed segments (no key 5) are raw records.
 """
 
 from __future__ import annotations
@@ -48,7 +48,6 @@ MAX_MATCH = 0x1F + MIN_MATCH + 0xFF  # 289
 MAX_OFFSET = 0x3FF  # 1023
 MAX_LITERAL = 0x80  # 128
 RECORD = 8
-_SHIFTS = (0, 4)
 
 # Envelope of Pulsar2's own encoder, measured over the fixture corpus; see
 # ``encode``.
@@ -180,14 +179,13 @@ def encode(raw: bytes) -> bytes:
 
 
 def stream_start(mc: bytes, pos: int, table: dict) -> int:
-    """True start of the segment that ``mcode.segments`` places at ``pos``."""
-    for shift in _SHIFTS:
-        s = pos - shift
-        if 5 in table:
-            if mc[s] < 0x80 and mc[s + 1 : s + 4] == b"\xa7\x00\x00":
-                return s
-        elif mc[s : s + 3] == b"\xa7\x00\x00":
-            return s
+    """Start of the segment that ``mcode.segments`` places at ``pos``,
+    checked against the stream's opening header record."""
+    if 5 in table:
+        if mc[pos] < 0x80 and mc[pos + 1 : pos + 4] == b"\xa7\x00\x00":
+            return pos
+    elif mc[pos : pos + 3] == b"\xa7\x00\x00":
+        return pos
     raise CodecError(f"no segment header near {pos}")
 
 
