@@ -56,17 +56,32 @@ tokens fed back; per-step top-1 agreement and logits cosine).
 |---|---:|---:|---|---|---:|
 | CPU fp32, 4 threads | 258 ms | 41 | 10/10 prompts | 1.000 / 1.000 | 1.39 GB |
 | CPU ORT dynamic int8 (per-channel), 4 threads | 92 ms | 73 | 0/10 (diverge after 0-12 tokens) | 0.897 / 0.71 | 453 MB |
-| HTP fp16 (fp16 weights, activations, KV cache, logits) | 25.4 ms | 110 | 0/10 | 0.722 / **-0.28** | 2.3 GB* |
+| **HTP fp16** (fp16 weights, activations, KV cache, logits) | **24.5 ms** | **110** | **9/10** (the 10th diverges after 2 tokens) | **0.997 / 0.99979** | 1.9 GB* |
+| HTP W8A16 (onnxsim QDQ: int8 per-channel MatMul weights, uint16 activations; fp32 graph I/O) | 58.1 ms | 74 | -- | 0.128 / -0.92 | 1.6 GB* |
 
 \* includes compiling both EP-context caches in the same process (~21 s, once).
 
-- **The HTP is 10x faster than the CPU at prefill and 2.7x at decode,** but its fp16 run is
-  **not accurate yet**: the prefill logits are right for some prompts (cos 0.995) and wrong for
-  others (cos -0.06), and the decode steps are erratic. The same fp16 graph on host ORT is
-  accurate (32/32 tokens identical on every prompt, logits cos >= 0.999996), so this is how the HTP
-  executes it, not fp16 itself. **Open, not yet bisected.** Suspects: the -1e4 additive masks in
-  fp16 softmax, the rotary `index_select` on `pos`, and QNN's accumulation precision in the
-  576-wide RMSNorm reductions. `bisect_precision.py` in `../vision_models/bevformer_tiny/` is the tool.
+- **The HTP is 10.5x faster than the CPU at prefill and 2.7x at decode, at fp16 accuracy.**
+- **Getting there took a fix to RMSNorm** (found with `bisect_llm.py`: expose intermediates, run on
+  the HTP, per-tensor cosine vs host ORT with the outlier channel excluded):
+  - From about layer 12, SmolLM2's residual stream has an **outlier channel near 2e4**. `x^2`
+    overflows fp16's 65504 on the HTP, even prescaled by 1/32 (host ORT's fp16 kernels compute
+    wider, so the same graph was exact there).
+  - Dividing each row by its max |x| instead fixes the overflow, but puts the ordinary channels
+    (~0.01-1) below fp16's smallest normal value (6.1e-5), and **the HTP flushes subnormals to zero**.
+  - What works: scale each row to max |y| = 128 (`y = x / (m / 128)`), so squares stay <= 16384 and
+    small channels stay normal. `x / rms(x) = y / rms(y)` exactly.
+  - Two QNN graph-composer limits shaped the exact form: it rejects **a constant divided by a tensor**
+    (`128 / m`), and **a ReduceMax output feeding two branches**. So `eps` is dropped:
+    `mean(y^2) >= 128^2/576`, so it can't reach zero, and fp32 greedy decoding stays identical to
+    `transformers.generate` (32/32; prefill logits move by at most 6.7e-3).
+- Before the fix: 25.4 ms / 110 tok/s but forced top-1 0.72 and logits cos down to -0.28.
+- **W8A16 is slower and wrong on the HTP, so fp16 stays.** Only the MatMuls are quantized. On host
+  ORT it reaches forced top-1 0.95; on the HTP it gets 0.13, at 74 tok/s against fp16's 110. Its
+  fp32 KV-cache I/O adds the boundary conversions fp16 I/O avoids. Not pursued further: at 135M
+  parameters the fp16 weights (270 MB) already stream at ~30 GB/s, so int8 weights could at best
+  about halve the decode step. A useful int8 decoder needs W8 with fp16 activations or weight-only
+  int4/int8, which isn't done here.
 - **CPU dynamic int8 is not usable for this model** even per-channel: dynamic per-tensor activation
   quantization breaks on the Llama residual stream's outlier channels (logits cos down to 0.71).
 - **Decode is memory-bound.** A decode step reads every weight once: 135M params = 270 MB in fp16,
@@ -151,6 +166,7 @@ well under 1 ms per token even scalar).
 | `eval_decoder.py` | free-running and teacher-forced agreement vs fp32 (phone outputs or host ORT) |
 | `hvx/llm_kernels.py` | the decode GEMVs as plain tinygrad Tensor code (row-major and prepacked) -> kernels.h, exact under qemu |
 | `hvx/llm_impl.c`, `llm_rpc.idl`, `llm_client.c`, `build.sh` | FastRPC skel + client timing the tinygrad and hand vrmpy GEMVs on the CDSP |
+| `bisect_llm.py`, `bisect_llm.sh` | expose intermediates of a decoder graph, run it on the HTP, per-tensor cosine vs host ORT |
 | `run_phone.sh` | build `llm_run`, push libs/models/inputs (by md5), run, pull outputs |
 
 ## Reproduce
