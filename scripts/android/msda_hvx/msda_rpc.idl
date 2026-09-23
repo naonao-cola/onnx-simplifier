@@ -1,0 +1,19 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+// One call = one multi-scale deformable attention (msda_kernel.h, README.md). `shape` packs
+// msda_args_t's sizes: NV L S M D P Q NO mode NVR RL R RD has_vis vdtype, then H W start per level.
+interface msda_rpc : remote_handle64 {
+  AEEResult run(in sequence<float> value,  // (NV, S, M*D) when vdtype = 0 (fp32), else empty
+                in sequence<uint8> value_u8, // (NV, S, M*D) when vdtype = 1 (uint8), else empty
+                in sequence<float> vscale, // (NV) uint8 scales, else empty
+                in sequence<int32> vzp,    // (NV) uint8 zero points, else empty
+                in sequence<float> loc,    // (Q, M, NO, L, P, 2): locations (mode 0) or raw offsets
+                in sequence<float> ref,    // (NVR, Q, RL, R, RD); empty for mode 0
+                in sequence<float> attw,   // (Q, M, NO, L, P)
+                in sequence<uint8> vis,    // (NV, Q); empty = all visible
+                in sequence<int32> shape,
+                in int32 flags,            // bits 0-7: threads; bits 8-15: queries per job / 16 (0: 32)
+                rout sequence<float> result,  // (Q, M*D)
+                rout uint64 dsp_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};
