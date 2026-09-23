@@ -1,0 +1,11 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+// One call = one StreamPETR cross-attention layer (attn_kernel.h): uint8 q (LQ, 256), k and v
+// (LK, 256) as the HTP emits them; params = LQ LK zq m16 dcl (emulate.py's exp_params); result = uint8
+// (LQ, 256) with V's (scale, zero point).
+interface attn_rpc : remote_handle64 {
+  AEEResult run(in sequence<uint8> q, in sequence<uint8> k, in sequence<uint8> v, in sequence<int32> params,
+                in int32 flags,  // bits 0-7: threads; bits 8-15: rows per job / 4 (0: 16 rows)
+                rout sequence<uint8> result, rout uint64 dsp_us, rout uint64 pack_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};
