@@ -80,8 +80,9 @@ final class OverlayView extends View {
                 cv.drawText(t, x1 + 4, y1 - 8, textPaint);
             }
         }
+        textPaint.setTextSize(Math.min(30f, getWidth() / 45f));  // fits the stats lines in portrait too
         String[] lines = stats.split("\n");
-        float lh = 36f, w = 0;
+        float lh = textPaint.getTextSize() * 1.2f, w = 0;
         for (String l : lines) w = Math.max(w, textPaint.measureText(l));
         // bottom-left, so it doesn't cover labels of boxes near the top edge
         float top = getHeight() - 16 - lh * lines.length;

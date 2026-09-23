@@ -49,7 +49,7 @@ import java.util.Locale;
  *   overlap images mode: decode/scale the next JPEG on a capture thread while the current frame
  *           runs (camera frames are always converted natively, from a latest-frame ImageReader)
  *
- * Orientation: the activity follows the device (fullSensor). Camera frames arrive in the sensor's
+ * Orientation: the activity follows the device (fullUser: all four rotations, honoring the user's rotation lock). Camera frames arrive in the sensor's
  * orientation; each frame is rotated by (sensorOrientation - displayRotation) so the model always
  * sees it gravity-up, letterboxed into its landscape 1088x800 input, in the same native pass that
  * converts YUV and quantizes. Boxes/masks come back in that upright frame's coordinates, and the
