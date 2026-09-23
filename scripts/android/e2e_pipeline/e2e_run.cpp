@@ -84,7 +84,12 @@ static size_t esize(ONNXTensorElementDataType t) {
     default: return 4;
   }
 }
-static std::map<std::string, Tensor> store;
+// The demo app's engine (../maskrcnn_demo_app) pipelines frames across threads and defines this as
+// `static thread_local` so each pipeline stage has its own tensor store; unchanged here.
+#ifndef E2E_STORE_STORAGE
+#define E2E_STORE_STORAGE static
+#endif
+E2E_STORE_STORAGE std::map<std::string, Tensor> store;
 static Tensor& get(const std::string& n) {
   auto it = store.find(n);
   if (it == store.end()) throw std::runtime_error("missing tensor " + n);
