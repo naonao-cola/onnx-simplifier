@@ -2249,7 +2249,9 @@ which is no longer CI-tested (see `../README.md`). Tools: upstream clang-19 + ll
 `qemu-user-static` 8.2 from apt, the Hexagon open-access toolchain 19.0.02 (cached, for
 `hexagon-sim`), and the onnxsim/tinygrad fork at a pinned commit (`TINYGRAD_SHA` in the workflow).
 Upstream clang is needed because tinygrad's `MOCKDSP` and several qemu harnesses target
-`hexagonv65`, which the toolchain's own hexagon-clang 19 no longer accepts. Every test skips when
+`hexagonv65`, which the toolchain's own hexagon-clang 19 no longer accepts. The freestanding qemu
+builds use the toolchain's `target/hexagon/include` for their libc headers, because upstream clang
+has no Hexagon sysroot. Every test skips when
 its tools are missing; the workflow fails on any skip except the reserved qfloat slot.
 
 - **tinygrad codegen** (`ci/codegen_check.py`, run in a subprocess so `DEV`/`MOCKDSP`/`HEXSIM`

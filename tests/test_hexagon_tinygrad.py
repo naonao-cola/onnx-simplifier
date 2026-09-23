@@ -129,8 +129,8 @@ def tinygrad_env() -> dict | None:
 
 
 needs_qemu = pytest.mark.skipif(
-    qemu() is None or clang() is None,
-    reason="needs qemu-hexagon and an LLVM clang with Hexagon + ld.lld",
+    qemu() is None or clang() is None or hexagon_tools() is None,
+    reason="needs qemu-hexagon, an LLVM clang with Hexagon + ld.lld, and the Hexagon toolchain's C headers",
 )
 needs_host_cc = pytest.mark.skipif(
     clang() is None, reason="needs an LLVM clang with Hexagon + ld.lld"
@@ -148,6 +148,10 @@ def hexagon_build(src: Path, out: Path, *flags: str, includes=(), extra=()) -> P
         "-ffreestanding",
         "-fuse-ld=lld",
     ]
+    # the kernels' <string.h>/<math.h> come from the toolchain's own target headers: upstream clang has no
+    # Hexagon sysroot and would otherwise fall back to the host's glibc headers (which only happen to work
+    # on some machines)
+    cmd += ["-isystem", hexagon_tools() / "target" / "hexagon" / "include"]
     cmd += [f"-I{i}" for i in includes] + ["-o", out, src, *extra]
     _ok(_run(cmd), f"hexagon build of {src.name}")
     return out
@@ -484,7 +488,7 @@ def test_rpn_fused_builds(tmp_path):
         "-ffp-contract=off",
         "-Wno-unused-function",
     )
-    if qemu() is not None:
+    if hexagon_tools() is not None:
         hexagon_build(
             BRIDGE / "rpn_fused" / "rpn_qemu.c",
             tmp_path / "rpnq",
