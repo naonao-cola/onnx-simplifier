@@ -109,6 +109,13 @@ def main():
     )
     ap.add_argument("--kv-fraction", type=float, default=0.5)
     ap.add_argument(
+        "--matmul-nbits",
+        choices=("dequant", "packed"),
+        default="dequant",
+        help="int4 MatMulNBits: dequantize once to fp16 (default), or keep packed int4 "
+        "and run onnxsim's Triton W4A16 kernels",
+    )
+    ap.add_argument(
         "--compile-backend",
         default="torch-simple",
         help="AutoDeploy compile backend (torch-simple, torch-cudagraph, torch-opt, ...)",
@@ -140,6 +147,7 @@ def main():
         model=args.onnx_model,
         tokenizer=tok_dir,
         model_factory="OnnxModelForCausalLM",
+        model_kwargs={"matmul_nbits": args.matmul_nbits},
         max_batch_size=args.max_batch_size,
         max_seq_len=args.max_seq_len,
         compile_backend=args.compile_backend,

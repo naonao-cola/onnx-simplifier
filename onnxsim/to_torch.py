@@ -219,6 +219,31 @@ def _dequant_matmulnbits(node, arrays) -> np.ndarray:
     return np.ascontiguousarray(w.astype(scales.dtype))  # [N, K]: F.linear layout
 
 
+def _packed_matmulnbits(node, arrays) -> Optional[Dict[str, np.ndarray]]:
+    """MatMulNBits weights in the layout ``torch.ops.onnxsim.matmul_nbits`` takes (keyed
+    ``<B>::packed`` / ``::scales`` / ``::zeros``), or None if it can't take them (only
+    4-bit, no ``g_idx``)."""
+    a = _attrs(node)
+    if a.get("bits", 4) != 4 or (len(node.input) > 4 and node.input[4]):
+        return None
+    n, name = a["N"], node.input[1]
+    out = {
+        name + "::packed": np.ascontiguousarray(arrays[name].reshape(n, -1)),
+        name + "::scales": np.ascontiguousarray(arrays[node.input[2]].reshape(n, -1)),
+    }
+    ng = out[name + "::scales"].shape[1]
+    zp_name = node.input[3] if len(node.input) > 3 else ""
+    if zp_name:
+        zp = arrays[zp_name]
+        if zp.dtype == np.uint8:
+            zp = zp.reshape(n, -1)
+            zp = np.stack([zp & 15, zp >> 4], -1).reshape(n, -1)[:, :ng]
+        else:  # zero points in the scales' type: 4-bit values, so exact in uint8
+            zp = np.rint(zp.astype(np.float32)).reshape(n, ng)
+        out[name + "::zeros"] = np.ascontiguousarray(zp.astype(np.uint8))
+    return out
+
+
 class _AttnMatch:
     """One recognized ``softmax(scale * q @ kT [+ mask]) @ v`` block."""
 
@@ -249,10 +274,13 @@ def _build_module_class():
             strip_kv_cache: bool = True,
             attention: str = "sdpa",
             device: Optional[str] = None,
+            matmul_nbits: str = "dequant",
         ):
             super().__init__()
             if attention not in ("sdpa", "exact"):
                 raise ValueError("attention must be 'sdpa' or 'exact'")
+            if matmul_nbits not in ("dequant", "packed"):
+                raise ValueError("matmul_nbits must be 'dequant' or 'packed'")
             g = model.graph
             self._opset = next(
                 (o.version for o in model.opset_import if o.domain in ("", "ai.onnx")),
@@ -306,6 +334,8 @@ def _build_module_class():
             other_uses = {i for n in g.node if n not in nbits for i in n.input}
             skip = packed - other_uses
             self._nbits_key: Dict[str, str] = {}
+            # MatMulNBits kept int4: output -> B's name (buffers "<B>::packed" etc.)
+            self._nbits_packed: Dict[str, str] = {}
             if nbits:
                 arrays = {
                     t.name: numpy_helper.to_array(t)
@@ -313,6 +343,17 @@ def _build_module_class():
                     if t.name in packed
                 }
                 for n in nbits:
+                    packed_arrays = (
+                        _packed_matmulnbits(n, arrays)
+                        if matmul_nbits == "packed"
+                        else None
+                    )
+                    if packed_arrays is not None:
+                        for key, arr in packed_arrays.items():
+                            if key not in self._param_of:
+                                self._register(key, arr, device, as_tensor=True)
+                        self._nbits_packed[n.output[0]] = n.input[1]
+                        continue
                     key = n.input[1] + "::dequant"
                     if key not in self._param_of:
                         self._register(key, _dequant_matmulnbits(n, arrays), device)
@@ -379,8 +420,8 @@ def _build_module_class():
 
         # ---- construction helpers ---------------------------------------------------
 
-        def _register(self, name: str, arr: np.ndarray, device):
-            sv = _const_value(arr)
+        def _register(self, name: str, arr: np.ndarray, device, as_tensor=False):
+            sv = None if as_tensor else _const_value(arr)
             if sv is not None:
                 self._static[name] = sv
                 return
@@ -567,6 +608,9 @@ def _build_module_class():
                 and n.input[1] in self._linear_key
             ):
                 return [n.input[0], self._linear_key[n.input[1]]]
+            if n.op_type == "MatMulNBits" and n.output[0] in self._nbits_packed:
+                bias = n.input[5] if len(n.input) > 5 and n.input[5] else None
+                return [n.input[0]] + ([bias] if bias else [])
             if n.op_type == "MatMulNBits" and n.output[0] in self._nbits_key:
                 bias = n.input[5] if len(n.input) > 5 and n.input[5] else None
                 return [n.input[0], self._nbits_key[n.output[0]]] + (
@@ -1213,6 +1257,25 @@ def _build_module_class():
             return self._contrib_rope_finish(self._rope_bnsd(x4, cos_c, sin_c, pos), x)
 
         def _ms_MatMulNBits(self, ins, a, n):
+            if n.output[0] in self._nbits_packed:
+                import onnxsim._matmul_nbits_op  # noqa: F401  registers the op
+
+                name = self._nbits_packed[n.output[0]]
+
+                def buf(suffix):
+                    attr = self._param_of.get(name + suffix)
+                    return getattr(self, attr) if attr else None
+
+                return torch.ops.onnxsim.matmul_nbits(
+                    ins[0],
+                    buf("::packed"),
+                    buf("::scales"),
+                    buf("::zeros"),
+                    a["K"],
+                    a["N"],
+                    a["block_size"],
+                    ins[5] if len(ins) > 5 else None,
+                )
             w = getattr(self, self._param_of[self._nbits_key[n.output[0]]])
             y = F.linear(ins[0], w)
             if len(ins) > 5 and ins[5] is not None:
@@ -1351,6 +1414,10 @@ def onnx_to_torch(model, **kwargs):
         attention: ``"sdpa"`` (recognize attention, emit causal SDPA) or ``"exact"``.
         device: ``"meta"`` to create weight placeholders without data (load them later with
             :func:`onnx_state_dict`), or a device to put the weights on.
+        matmul_nbits: how to run ``com.microsoft::MatMulNBits``: ``"dequant"`` (default)
+            dequantizes once to a dense ``F.linear`` weight; ``"packed"`` keeps 4-bit weights
+            packed and emits ``torch.ops.onnxsim.matmul_nbits`` (Triton W4A16 kernels on
+            CUDA, see ``onnxsim/_triton_w4a16.py``) -- int4 memory, faster batch-1 decode.
     """
     global _MODULE_CLS
     if _MODULE_CLS is None:
@@ -1379,6 +1446,8 @@ def onnx_state_dict(module, model) -> Dict[str, Any]:
             arrays[n.output[0]] = _node_const(n)
         if n.op_type == "MatMulNBits" and n.input[1] + "::dequant" in names:
             arrays[n.input[1] + "::dequant"] = _dequant_matmulnbits(n, arrays)
+        if n.op_type == "MatMulNBits" and n.input[1] + "::packed" in names:
+            arrays.update(_packed_matmulnbits(n, arrays) or {})
     for name in names:
         if name.endswith("::T") and name[:-3] in arrays:
             arrays[name] = np.ascontiguousarray(arrays[name[:-3]].T)

@@ -685,3 +685,50 @@ Numerics are unchanged (all four models still match onnxruntime at 2.5e-6 to 8.2
 | `onnx-community/Llama-3.2-1B-Instruct-ONNX` fp16 | 100-101 | **106-109** |
 | `HuggingFaceTB/SmolLM2-360M-Instruct` fp16 | 216-220 | 208-231 (3 runs; noise ~+-5%) |
 | same, `model_q4f16.onnx` (int4, dequantized) | 215-220 | 202-227 |
+
+### int4 that stays int4: `matmul_nbits="packed"` and a Triton W4A16 kernel
+
+Dequantizing `MatMulNBits` once to fp16 works but throws away what int4 is for. Real int4
+execution on this stack turned out to need a kernel of our own:
+
+- **TensorRT-LLM's weight-only int4 GEMMs refuse sm_120.** `finegrained_mixed_dtype_gemm`
+  (what its PyTorch backend's W4A16 AWQ linear calls) and `weight_only_quant_gemm` both fail
+  with `Not Implemented: SM120 GEMM only supports nvfp4` (`cutlass_heuristic.cpp`) -- the
+  consumer-Blackwell build ships NVFP4 GEMMs only on that path.
+- **AutoDeploy has no int4 kernel at all**, in 1.2.1 or on `main`: its AWQ and GPTQ int4 ops
+  (`torch_fake_quant_int4_linear`, `..._gptq_linear`) are *fake-quant* -- they dequantize
+  the whole weight in PyTorch on every call; only FP8 / NVFP4 get `fuse_*_linear` onto real
+  kernels.
+- PyTorch's `aten._weight_int4pack_mm` (tinygemm) runs on sm_120 but takes **bf16**
+  activations only; for these fp16 models that would round every int4 linear's input to bf16.
+
+So `onnx_to_torch(..., matmul_nbits="packed")` keeps 4-bit `MatMulNBits` weights in their own
+layout (`[N, K/2]` uint8, `[N, groups]` scales, unpacked zeros) and emits
+`torch.ops.onnxsim.matmul_nbits` (`onnxsim/_matmul_nbits_op.py`): a `torch.library` custom op
+with a fake implementation (AutoDeploy exports it as one opaque node, CUDA graphs capture it),
+a PyTorch dequantize-and-`F.linear` fallback, and on CUDA the Triton kernels in
+`onnxsim/_triton_w4a16.py` -- a split-K W4A16 kernel that dequantizes in registers for
+M <= 16 (decode), and a GPU dequantize + cuBLAS for larger M (prefill). Same arithmetic as
+the dequantize path (`(q - zp) * s` rounded to fp16, fp32 accumulation), different
+summation order: Llama-3.2-1B q4f16 logits agree at rel 2.4e-3 (max |diff| 0.047 of 23.7,
+argmax 100% on an 8-token decode-path input) -- enough to flip greedy near-ties (top-1/top-2
+margins of 0.016 occur), so the two modes' generations can diverge after a few tokens.
+
+Decode-kernel microbenchmark (M = 1, fp16, RTX 5050, CUDA-graph replay; timings at this scale
+are noisy -- the dense baseline itself varied up to 2x between runs as the idle GPU's
+clocks ramped): 2048x8192 and 8192x2048 layers 2.0-2.9x faster than a dense fp16 `F.linear`;
+layers up to ~1024 wide about break-even (launch overhead); prefill (M = 300) ~0.75x on the
+large layers (the transient fp16 weight's write).
+
+| AutoDeploy `torch-cudagraph`, RTX 5050, 3 prompts x 128 greedy tokens | weights on GPU | tok/s |
+|---|---|---|
+| Llama-3.2-1B `model_fp16.onnx` | ~2.5 GB fp16 | 106-109 |
+| Llama-3.2-1B `model_q4f16.onnx`, `matmul_nbits="dequant"` | ~2.5 GB fp16 | 108-109 |
+| Llama-3.2-1B `model_q4f16.onnx`, **`matmul_nbits="packed"`** | int4 + fp16 embedding | **158-159** |
+| SmolLM2-360M `model_q4f16.onnx`, `"dequant"` | 0.725 GB | 218-229 |
+| SmolLM2-360M `model_q4f16.onnx`, **`"packed"`** | **0.272 GB** | **290-349** |
+
+(`trtllm_autodeploy_onnx.py --matmul-nbits packed`. AutoDeploy's "Estimated parameters
+memory" log line counts `parameters()` only and misses the uint8 buffers -- the byte counts
+above are from the state dict.) Only 4-bit without `g_idx`, and group sizes that divide or
+are multiples of 128, take the kernel; anything else falls back to dequantizing.
