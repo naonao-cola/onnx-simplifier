@@ -72,7 +72,7 @@ public class MainActivity extends Activity {
 
     /** The demo's models: button label, then the activity (process) that runs it and its model extra. */
     static final String[][] MODELS = {{"Mask R-CNN", "", ""}, {"YOLO26n", "yolo", "yolo26n"}, {"YOLO11n", "yolo", "yolo11n"},
-            {"SAM", "sam", ""}};
+            {"RT-DETR", "rtdetr", ""}, {"SAM", "sam", ""}};
 
     // The fastest measured configuration (README "Optimizations"); pass --es pipe pipe_e_opt.txt
     // --es opts "" for the original #1841 path.
@@ -128,11 +128,16 @@ public class MainActivity extends Activity {
             android.widget.Button b = new android.widget.Button(this);
             b.setText(m[0]);
             b.setAllCaps(false);
+            b.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13);
+            b.setMinWidth(0);
+            b.setMinimumWidth(0);
             b.setAlpha(0.8f);
             b.setOnClickListener(v -> switchTo(m[1], m[2]));
             bar.addView(b);
         }
-        return bar;
+        android.widget.HorizontalScrollView sv = new android.widget.HorizontalScrollView(this);
+        sv.addView(bar);
+        return sv;  // scrolls if the buttons don't fit (portrait)
     }
 
     /** This activity's key in MODELS ("" = Mask R-CNN). */
@@ -153,7 +158,9 @@ public class MainActivity extends Activity {
             switchInPlace(model);
             return;
         }
-        Class<?> c = key.equals("yolo") ? YoloActivity.class : key.equals("sam") ? SamActivity.class : MainActivity.class;
+        Class<?> c = key.equals("yolo") ? YoloActivity.class
+                : key.equals("rtdetr") ? RtDetrActivity.class
+                : key.equals("sam") ? SamActivity.class : MainActivity.class;
         android.content.Intent i = new android.content.Intent(this, c);
         i.putExtra("mode", cameraMode ? "camera" : "images");
         if (!model.isEmpty()) i.putExtra("model", model);

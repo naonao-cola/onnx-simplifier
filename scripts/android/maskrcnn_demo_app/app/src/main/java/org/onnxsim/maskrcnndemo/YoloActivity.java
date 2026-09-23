@@ -20,12 +20,45 @@ import java.util.Locale;
  * The model buttons switch YOLO models in place (the engine re-inits its HTP session).
  */
 public class YoloActivity extends MainActivity {
-    private static final String TAG = "YoloDemo";
+    static final String TAG = "YoloDemo";
     private volatile String wantModel;
 
     @Override
     int cameraMinWidth() {
         return YoloEngine.IN;
+    }
+
+    // ---- the engine, overridden by RtDetrActivity (same loop, another detector) ----
+    String defaultModel() {
+        return "yolo26n";
+    }
+
+    String engineInit(String model, String opts) {
+        return YoloEngine.nativeInit(new File(getFilesDir(), "models").getAbsolutePath(),
+                getApplicationInfo().nativeLibraryDir, model,
+                model.startsWith("yolo26") || opts.contains("post=") ? opts : "post=nms;" + opts);
+    }
+
+    Engine.Result newResult() {
+        return new Engine.Result(YoloEngine.MAX_DET, false, YoloEngine.T_N, 0.25f);
+    }
+
+    int[] fitDims(int w, int h, int rot) {
+        return YoloEngine.fitDims(w, h, rot);
+    }
+
+    void runYuv(Image img, int rot, Bitmap disp, Engine.Result r) {
+        YoloEngine.runYuv(img, rot, disp, r);
+    }
+
+    void run(Bitmap rgba, Engine.Result r) {
+        YoloEngine.run(rgba, r);
+    }
+
+    /** One line of per-stage times from the running averages of Result.times. */
+    String stages(double[] avg) {
+        return String.format(Locale.US, "pre %.1f  htp %.2f  post %.2f ms", avg[YoloEngine.T_PRE], avg[YoloEngine.T_HTP],
+                avg[YoloEngine.T_POST]);
     }
 
     @Override
@@ -45,10 +78,9 @@ public class YoloActivity extends MainActivity {
 
     @Override
     void work(boolean cameraMode, String pipe, String opts, boolean overlap) {
-        String model = getIntent().getStringExtra("model") != null ? getIntent().getStringExtra("model") : "yolo26n";
+        String model = getIntent().getStringExtra("model") != null ? getIntent().getStringExtra("model") : defaultModel();
         String yopts = getIntent().getStringExtra("opts") != null ? getIntent().getStringExtra("opts") : "";
         wantModel = model;
-        File models = new File(getFilesDir(), "models");
         if (cameraMode) startCamera();
         List<File> images = new ArrayList<>();
         if (!cameraMode) {
@@ -64,15 +96,14 @@ public class YoloActivity extends MainActivity {
         double initMs = 0;
         long[] done = new long[32];
         int nDone = 0;
-        double[] avg = new double[YoloEngine.T_N];
+        double[] avg = null;
         long seq = 0;
         while (running) {
             String want = wantModel;
             if (!want.equals(cur)) {  // (re)load: first frame or a model button
                 overlay.setStats("loading " + want + "...");
                 long t0 = System.nanoTime();
-                String err = YoloEngine.nativeInit(models.getAbsolutePath(), getApplicationInfo().nativeLibraryDir,
-                        want, want.startsWith("yolo26") || yopts.contains("post=") ? yopts : "post=nms;" + yopts);
+                String err = engineInit(want, yopts);
                 initMs = (System.nanoTime() - t0) / 1e6;
                 if (err != null) {
                     Log.e(TAG, "init failed: " + err);
@@ -83,7 +114,8 @@ public class YoloActivity extends MainActivity {
                 cur = want;
                 nDone = 0;
             }
-            Engine.Result r = new Engine.Result(YoloEngine.MAX_DET, false, YoloEngine.T_N, 0.25f);
+            Engine.Result r = newResult();
+            if (avg == null) avg = new double[r.times.length];
             try {
                 if (cameraMode) {
                     Image img = reader != null ? reader.acquireLatestImage() : null;
@@ -92,16 +124,16 @@ public class YoloActivity extends MainActivity {
                         continue;
                     }
                     int rot = frameRotation();
-                    int[] d = YoloEngine.fitDims(img.getWidth(), img.getHeight(), rot);
+                    int[] d = fitDims(img.getWidth(), img.getHeight(), rot);
                     r.frame = Bitmap.createBitmap(d[0], d[1], Bitmap.Config.ARGB_8888);
                     try {
-                        YoloEngine.runYuv(img, rot, r.frame, r);
+                        runYuv(img, rot, r.frame, r);
                     } finally {
                         img.close();
                     }
                 } else {
-                    r.frame = decodeFit(images.get((int) (seq % images.size())), YoloEngine.IN, YoloEngine.IN);
-                    YoloEngine.run(r.frame, r);
+                    r.frame = decodeFit(images.get((int) (seq % images.size())), cameraMinWidth(), cameraMinWidth());
+                    run(r.frame, r);
                 }
                 r.id = seq++;
             } catch (RuntimeException e) {
@@ -118,19 +150,18 @@ public class YoloActivity extends MainActivity {
             done[nDone++ % done.length] = now;
             int k = Math.min(nDone, done.length);
             double fps = k > 1 ? (k - 1) / ((now - done[(nDone - k) % done.length]) / 1e9) : 0;
-            for (int i = 0; i < YoloEngine.T_N; i++) avg[i] = nDone == 1 ? r.times[i] : 0.9 * avg[i] + 0.1 * r.times[i];
+            for (int i = 0; i < avg.length; i++) avg[i] = nDone == 1 ? r.times[i] : 0.9 * avg[i] + 0.1 * r.times[i];
             int shown = 0;
             for (int i = 0; i < r.n; i++) if (r.scores[i] >= r.thresh) shown++;
             String s = String.format(Locale.US,
                     "%s  %s\nFPS %.1f (end to end)  inference %.1f ms -> %.0f FPS possible\n"
-                    + "pre %.1f  htp %.2f  post %.2f ms  detections %d%s",
-                    cur, cameraMode ? "camera" : "images", fps, avg[YoloEngine.T_TOTAL],
-                    1000.0 / Math.max(avg[YoloEngine.T_TOTAL], 1e-3), avg[YoloEngine.T_PRE], avg[YoloEngine.T_HTP],
-                    avg[YoloEngine.T_POST], shown, cameraMode ? "  rot " + frameRotation() : "");
+                    + "%s  detections %d%s",
+                    cur, cameraMode ? "camera" : "images", fps, avg[0], 1000.0 / Math.max(avg[0], 1e-3), stages(avg), shown,
+                    cameraMode ? "  rot " + frameRotation() : "");
             overlay.update(r, s);
             if (nDone % 30 == 0)
-                Log.i(TAG, String.format(Locale.US, "%s frame %d fps %.1f total %.2f pre %.2f htp %.2f post %.2f n %d",
-                        cur, r.id, fps, avg[0], avg[1], avg[2], avg[3], shown));
+                Log.i(TAG, String.format(Locale.US, "%s frame %d fps %.1f total %.2f %s n %d", cur, r.id, fps, avg[0],
+                        stages(avg), shown));
         }
     }
 }

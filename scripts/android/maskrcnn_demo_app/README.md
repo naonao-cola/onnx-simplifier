@@ -50,6 +50,28 @@ The camera preprocessing (4.5-5.6 ms at 640x480) is the column-wise plane reads 
 rotation, as in the Mask R-CNN path. Box placement was checked visually on COCO val2017 #139.
 YOLO26's end-to-end top-k is cheaper than YOLO11's NMS here too (0.3 vs 0.6 ms on images).
 
+## RT-DETR mode (RT-DETR-r18, NMS-free, HTP + HVX)
+
+The "RT-DETR" button (`RtDetrActivity`, process `:rtdetr`, the YOLO mode's loop with another engine)
+runs RT-DETR-r18 from `../vision_models/rtdetr` (PR #1867) the way its phone runner does: 4 strict
+HTP pieces (backbone uint8 + hybrid encoder W8A16, uint8 value maps) around 3 multi-scale deformable
+attention calls on the HVX (`../msda_hvx` skel, `MSDA_FLAGS=260`). `native/rtdetr_engine.cpp`
+`#include`s `../vision_models/rtdetr/msda_hvx/dec_run.cpp` for its rpcmem tensor store, piece
+runner and msda call; the input is the frame stretched to 640x640 (HF's processor: no letterbox),
+detections are sigmoid + top-k over queries x classes (no NMS), shown at score >= 0.4.
+Models: `RTDETR=$HOME/.cache/onnxsim-rtdetr/work/split ./deploy.sh` (`split.py export` + `quant
+--policy bb8enc16 --u8-values`).
+
+| mode | end-to-end FPS | inference | pre | HTP pieces | MSDA calls (in-DSP) |
+|---|---:|---:|---:|---:|---:|
+| test images | 34.7-35.0 | 19.4-19.7 ms | 1.1-1.2 | 15.0-15.2 | 3.3 (2.6) |
+| camera (fixed 30 FPS AE) | 29.8-30.1 (camera-capped) | 23.7-24.4 ms | 4.1-4.8 | 15.5 | 4.0 (3.3) |
+
+Same as the runner's 18.3 ms plus the app's preprocessing. Against YOLO26n (2.9 ms), RT-DETR is ~7x
+the inference per frame but needs no NMS and keeps small, crowded detections (19 on this image).
+
+<img src="docs/rtdetr_images.jpg" width="240" alt="RT-DETR-r18 on a crowded COCO image in the app">
+
 ## SAM mode (tap to segment, EfficientViT-SAM-L0)
 
 The "SAM" button runs Segment Anything (`SamActivity`, its own process `:sam`,

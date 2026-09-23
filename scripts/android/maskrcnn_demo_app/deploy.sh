@@ -4,6 +4,7 @@
 #   MODELS=<build_models.py --out dir> ./deploy.sh      models pushed from the host instead
 #   IMGS="a.jpg b.jpg ..." ./deploy.sh                  JPEGs for the "images" test mode
 #   YOLO="<deploy work>/yolo26n/pipe/yolo26n.onnx ..." ./deploy.sh   models for the YOLO mode
+#   RTDETR=<rtdetr split.py work dir, e.g. ~/.cache/onnxsim-rtdetr/work/split> ./deploy.sh   RT-DETR
 #   SAM=<sam.py work dir, e.g. ~/.cache/onnxsim-sam/efficientvit_sam_l0> ./deploy.sh   the SAM mode
 # Then:  adb shell am start -n org.onnxsim.maskrcnndemo/.MainActivity [--es mode images] [--es pipe pipe_e_opt.txt]
 #        adb shell am start -n org.onnxsim.maskrcnndemo/.YoloActivity [--es mode images] [--es model yolo11n]
@@ -66,6 +67,17 @@ if [ -n "${SAM:-}" ]; then
   "${A[@]}" push -q "$SAM/dec.sim.onnx" "$STAGE/sam/sam_l0_dec.onnx"
   for b in sam_l0_enc.onnx sam_l0_dec.onnx; do
     RA "cmp -s $STAGE/sam/$b files/models/$b || { cp $STAGE/sam/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
+  done
+fi
+# RT-DETR mode: the pieces from ../vision_models/rtdetr/msda_hvx/split.py (export + quant --policy
+# bb8enc16 --u8-values), e.g. RTDETR=$HOME/.cache/onnxsim-rtdetr/work/split: pre.bb8enc16.v8.onnx,
+# mid0/mid1/post.sim.onnx -> rtdetr_{pre,mid0,mid1,post}.onnx
+if [ -n "${RTDETR:-}" ]; then
+  "${A[@]}" shell "mkdir -p $STAGE/rtdetr"
+  "${A[@]}" push -q "$RTDETR/pre.bb8enc16.v8.onnx" "$STAGE/rtdetr/rtdetr_pre.onnx"
+  for n in mid0 mid1 post; do "${A[@]}" push -q "$RTDETR/$n.sim.onnx" "$STAGE/rtdetr/rtdetr_$n.onnx"; done
+  for n in pre mid0 mid1 post; do
+    RA "cmp -s $STAGE/rtdetr/rtdetr_$n.onnx files/models/rtdetr_$n.onnx || { cp $STAGE/rtdetr/rtdetr_$n.onnx files/models/ && rm -f files/models/rtdetr_$n.ctx0*; }"
   done
 fi
 if [ -n "${IMGS:-}" ]; then

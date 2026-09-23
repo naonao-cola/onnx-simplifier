@@ -26,6 +26,12 @@
             android:screenOrientation="fullUser"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden" />
         <activity
+            android:name=".RtDetrActivity"
+            android:process=":rtdetr"
+            android:exported="true"
+            android:screenOrientation="fullUser"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden" />
+        <activity
             android:name=".SamActivity"
             android:process=":sam"
             android:exported="true"
