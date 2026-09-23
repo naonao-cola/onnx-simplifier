@@ -198,9 +198,21 @@ void scatter_rows(Step& S) {
   put_raw(S.f[3], base.type, base.shape, out);
 }
 
+// Our DSP skels aren't reentrant: two stages calling the same skel at once (e.g. box RoiAlign in
+// stage A while stage B runs the mask RoiAlign) fails with rc=78. Serialize each skel's calls.
+std::mutex g_rpn_mu, g_roi_mu;
 void exec_step(Step& S) {
-  if (S.op == "scatter_rows") scatter_rows(S);
-  else exec(S);
+  if (S.op == "scatter_rows") {
+    scatter_rows(S);
+  } else if (S.op == "roialign") {
+    std::lock_guard<std::mutex> l(g_roi_mu);
+    exec(S);
+  } else if (S.op == "rpn") {
+    std::lock_guard<std::mutex> l(g_rpn_mu);
+    exec(S);
+  } else {
+    exec(S);
+  }
 }
 
 // ---- two-stage pipeline ---------------------------------------------------------------------

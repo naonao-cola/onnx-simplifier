@@ -254,6 +254,15 @@ public class MainActivity extends Activity {
             if (nDone % 10 == 0)
                 Log.i(TAG, String.format(Locale.US, "frame %d fps %.2f lat %.1f %s", got, fps, r.times[Engine.T_TOTAL],
                         Arrays.toString(r.times)));
+            if (!cameraMode) {  // per-image output checksum, to A/B pipeline options for equality
+                double cs = 0;
+                for (int i = 0; i < r.n; i++) {
+                    cs += r.scores[i] + r.labels[i];
+                    for (int j = 0; j < 4; j++) cs += r.boxes[4 * i + j];
+                    for (int j = 0; j < 784; j += 97) cs += r.masks[784 * i + j];
+                }
+                Log.i(TAG, String.format(Locale.US, "check img %d n %d sum %.6f", got % images.size(), r.n, cs));
+            }
         }
     }
 
