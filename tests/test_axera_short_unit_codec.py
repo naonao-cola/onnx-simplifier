@@ -229,6 +229,32 @@ def test_replace_segment_patches_a_value_and_key5():
     )
 
 
+def test_step_recalibration_by_reencoding_teng():
+    # docs/axera-step-recalibrate.md's blocker (c): new values change the
+    # compressed length of TENG's register writes. Decompressed, the
+    # momentum-recalibrated step's TENG program has the reference's exact
+    # length and differs in 128 whole records. Re-encoding the reference's
+    # segment with that content fits the reference's slot, which is the
+    # re-encode route the doc asks for. Bx2 moves more values; its stream
+    # needs 108 more bytes than the slot holds, so it is refused (the blob
+    # would need re-laying out).
+    step = os.path.join(_FIX, "step_recalib")
+    ref, mom, bx2 = (
+        _mcode(os.path.join(step, f"toyf_{n}.axmodel.gz"))
+        for n in ("A1", "Dmom100", "Bx2")
+    )
+    want = codec.decode_segments(mom)[TENG]
+    have = codec.decode_segments(ref)[TENG]
+    assert len(want) == len(have)
+    assert (
+        sum(want[r : r + 8] != have[r : r + 8] for r in range(0, len(have), 8)) == 128
+    )
+    patched = codec.replace_segment(ref, TENG, want)
+    assert codec.decode_segments(patched)[TENG] == want
+    with pytest.raises(codec.CodecError):
+        codec.replace_segment(ref, TENG, codec.decode_segments(bx2)[TENG])
+
+
 def test_replace_segment_is_identity_when_the_encoder_matches():
     mc = _mcode(os.path.join(_CENSUS, "div_s1.axmodel.gz"))
     for i, (_, _, _, comp) in enumerate(codec.segment_streams(mc)):
