@@ -1446,6 +1446,149 @@ sizes, blocking, working-set-sensitive reduction orders); `MOCKDSP=1` remains th
 (no real hexagon-clang/hexagon-sim round trip) when only correctness verification is needed, or
 when candidates differ only in raw compute-instruction mix with comparable working sets.
 
+## TopK: exact on the DSP, and faster than ORT for the batched per-level selections
+
+`dynamic_ops_survey.md` ranked TopK "high" difficulty: no sort/select primitive exists anywhere in
+this project. It turned out not to need the bitonic sort the survey expected. `topk/` is an exact
+TopK (values **and** int64 indices, byte-for-byte equal to ONNX Runtime's) running on the phone's
+CDSP through its own FastRPC skel, the same TVM-free pattern as `roialign_fast/`.
+
+**The real nodes.** One COCO image (`000000000139`) through the full `MaskRCNN-12-qdq` in ORT,
+capturing every TopK node's real input, k and outputs (`topk/dump_real_topk_io.py`). All seven are
+1-D, fp32, `largest=1`, `sorted=1`:
+
+| Node | Role | n | k |
+|---|---|---:|---:|
+| 908 | P2 pre-NMS select | 163,200 | 1000 |
+| 1234 | P3 pre-NMS select | 40,800 | 1000 |
+| 1560 | P4 pre-NMS select | 10,200 | 1000 |
+| 1886 | P5 pre-NMS select | 2,550 | 1000 |
+| 2212 | P6 pre-NMS select | 663 | 663 |
+| 2488 | post-NMS select (after the per-level NMS) | 1,465 (data-dependent) | 1000 |
+| 6528 | final detection cap | 106 (data-dependent) | 100 |
+
+The kernel takes n and k at call time, so the two data-dependent calls need no padding.
+
+**Ties are the normal case, and the tie order has to match ORT's.** The scores are dequantized
+int8, so the 163,200-element level has only **51 distinct values**. Across the seven calls there
+are 51 to 213. At that level the k-th value is shared by 111 elements, and 99 of them are taken.
+On all seven calls ORT orders by **value descending, then index ascending**. ORT on the phone's
+CPU reproduces the captured x86 output exactly, so the same order holds on ARM. Matching values
+alone would not be enough: the indices decide which boxes go on to NMS.
+
+### The algorithm: select first, then sort only the survivors
+
+In `topk/topk_kernel.h`, one header that builds for the host, qemu and the CDSP:
+
+1. **Key.** Each fp32 value maps to a monotone uint32 (bigger float, bigger key). -0 is mapped to
+   +0 so the two tie, as a float compare would.
+2. **Threshold.** Read 128 evenly spaced blocks of 8 contiguous values (1024 keys) and quickselect
+   the key at the rank that should leave ~1.5k survivors. Inputs with n ≤ 4k skip this step and keep
+   everything.
+3. **Collect.** One streaming HVX pass: a 32-lane `key >= t` compare, turned into a 32-bit lane mask
+   (AND with per-lane bit weights, then a rotate/OR tree). Only set bits are visited (`ctz`), and
+   a fully set mask stores the whole vector at once. Survivors are appended in index order, and an
+   `l2fetch` runs 16 KB ahead. Index ranges are independent, so a big call can split this pass
+   across threads.
+4. **Emit.** Hash the survivors' distinct keys, sort those keys descending, then do one stable
+   counting-sort pass by key rank. Stability keeps index order within a key, which is exactly ORT's
+   tie order. Above 256 distinct keys it falls back to a stable radix sort. Values are recovered
+   from the keys, so there is no random-access gather of the input, except for key 0, which +0 and
+   -0 share.
+
+**Correctness doesn't depend on the threshold.** If at least k survive, every element of the true
+top-k has a key ≥ the k-th key ≥ t, so the answer is inside the survivor set. If fewer than k
+survive, the threshold is lowered and the pass rerun; the last resort takes everything. On the
+real data the first threshold always sufficed (one pass).
+
+### Verification
+
+| Level | Result |
+|---|---|
+| Host C, all 7 real calls | values and int64 indices byte-exact vs ORT, every variant |
+| Host C, 600 randomized cases | exact. Covers heavy ties, ±0, negatives, all values tied, a layout that makes the sample miss so the retry and fallback paths run, and many distinct values (the radix fallback). Also clean under ASan/UBSan |
+| `qemu-hexagon-static`, v73 HVX build | exact on all 7 (the kernel uses only integer HVX ops, which qemu 8.2 decodes) |
+| Real CDSP, device `239dbd8f` | exact on all 7, every variant and thread setting |
+
+### Speed on the phone (medians of 31 runs; ORT is the op's current path, on the phone's CPU)
+
+DSP time is `HAP_perf_get_time_us` around the kernel. Round trip is the client-side time for the
+whole FastRPC call.
+
+| Call (n → k) | ORT CPU, 1 thread | DSP, 1 thread | DSP, collect split 6 ways |
+|---|---:|---:|---:|
+| P2 163,200 → 1000 | 435 µs | 488 µs | **235 µs** |
+| P3 40,800 → 1000 | 280 µs | 226 µs | **157 µs** |
+| P4 10,200 → 1000 | 73 µs | 185 µs | |
+| P5 2,550 → 1000 | 59 µs | 107 µs | |
+| P6 663 → 663 | 13 µs | 37 µs | |
+| post-NMS 1,465 → 1000 | 18 µs | 81 µs | |
+| final 106 → 100 | 4 µs | 20 µs | |
+
+The five per-level selections are independent, so they go to the DSP as **one** RPC:
+
+| 5 per-level TopKs | DSP time | Round trip | vs ORT (859 µs, 1 thread; 849 µs default threads) |
+|---|---:|---:|---:|
+| one after another, 1 thread | 997 µs | 1433 µs | slower |
+| one after another, big collects split 4 ways | 689 µs | 1119 µs | slower end to end |
+| concurrently, one thread per level | 557 µs | 990 µs | slower end to end |
+| **concurrently + P2's collect split 4 ways** | **369 µs** | **720 µs** | **2.3× on DSP time, ~1.2× including the round trip** |
+
+All seven calls take 470 µs of DSP time, against ORT's 880 µs. But the last two TopKs sit after
+NMS, which runs on the CPU, so they are separate RPCs, and with ~0.25 ms each the round-trip total
+is 1295 µs.
+
+**Honest reading.** The batched per-level selection beats ORT even with the FastRPC round trip. The
+two downstream TopKs (1465 → 1000, 106 → 100) are slower on the DSP than on a 3 GHz big core even
+before their ~0.25 ms round trip, so they should stay on the CPU unless the surrounding
+post-processing moves to the DSP too. The small full-sort calls (P4–P6) are also slower per call.
+The scalar core's sort work is the limit, but inside the concurrent batch they overlap with P2's
+collect, so they don't set the batch time.
+
+### What mattered, measured in order
+
+- **Scratch reuse.** A fresh 2.6 MB `malloc`/`free` per call cost 1–1.5 ms on the DSP heap, plus a
+  cold-page penalty in the kernel itself. Scratch is now allocated once per batch slot and reused.
+- **Prefetch.** The collect over 163,200 elements took 1387 µs single-threaded, only ~470 MB/s
+  (each vector load waited on DDR). An `l2fetch` 16 KB ahead cut it to 401 µs, the same lesson
+  RoiAlign learned.
+- **Threshold.** A strided scalar sample of 1024 values cost ~300 µs. Blocks of 8 values brought it
+  to ~100 µs, and a quickselect instead of sorting the sample brought it to ~40 µs. **Refuted
+  along the way:** I guessed the ~100 µs was TLB-bound (every sample line on its own page) and
+  tried packing the sample onto 32 pages. It was not faster, and the worse sample almost doubled
+  the survivors, so it was reverted. The cost was the sort.
+- **Emit.** Radix sort of ~1.5k survivors took 100–180 µs. An HVX `==` scan per distinct key was
+  tried and was *worse* on the calls with 89–213 distinct keys (181 → 387 µs). The single
+  counting-sort pass by key rank brought it to 52–87 µs.
+- **Threads.** On their own, splitting the big collects and running levels concurrently each
+  helped. Combining them (hybrid) was best, since P2 alone otherwise bounds the batch.
+- The TURBO clock vote changed nothing, as for RoiAlign.
+
+### `__builtin_reduce_or` and qemu
+
+The first vector version tested "any lane passed?" with clang's `__builtin_reduce_or` on the
+plain 0/-1 compare mask. Under qemu it silently dropped survivors on the three select-path calls:
+1533, 1159 and 1228 survivors instead of 1799, 1455 and 1618. The same C was exact on the host.
+Lane by lane, the key map and compare were correct. The inlined reduction had become a `vrmpy`
+followed by `vdeal`/`vdeal`/`vdeal`/`vshuff`, which relies on VLIW packets reading old register
+values. That sequence misses single-lane hits under qemu. The **same build is exact on the real
+CDSP**, so this is a qemu 8.2 emulation fault, not a hexagon-clang miscompile. The shipped kernel
+uses an explicit rotate/OR tree, which is exact on both. The fault is kept as an A/B variant
+(`TK_VEC_REDUCE_OR_MASK`) that the qemu harness and the phone client both run: MISMATCH under
+qemu, EXACT on the device.
+
+**Not handled:** NaN inputs (none occur), anything other than 1-D fp32 `largest=1, sorted=1`, and
+concurrent RPCs from several clients (the scratch is static per batch slot).
+
+`topk/` reproduces everything:
+- `dump_real_topk_io.py` captures the real inputs and outputs.
+- `gen_topk_test_data.py` writes the flat test files and single-node ORT models, and times host ORT.
+- `topk_host_check.c` is the real-data check plus the randomized stress test.
+- `topk_qemu.c` is the qemu harness.
+- `topk_rpc.idl`, `topk_impl.c` and `topk_client.c` are the DSP skel and client.
+- `ort_topk_bench.c` is the phone-CPU ORT baseline.
+- `build.sh` builds and runs on the phone, and runs the ORT baseline too if `ORT_AAR` is set.
+
 ## Files
 
 - `capture_kernel.py` -- capture tinygrad's rendered Hexagon C for a shape, verified under qemu.
@@ -1540,3 +1683,9 @@ when candidates differ only in raw compute-instruction mix with comparable worki
   shape ops in Mask R-CNN's `rest.onnx` (proposal decode, TopK, NonMaxSuppression, RoiAlign) could
   be ported to hand-written HVX kernels, with real shapes/dtypes/constants pulled from the actual
   graph and a ranked, honest difficulty assessment per op.
+- `topk/` -- exact TopK (values and int64 indices byte-equal to ORT, including its tie order) on
+  the CDSP via its own FastRPC skel: threshold select + HVX collect + counting sort by key rank.
+  The five batched per-level selections run in 369 µs of DSP time (720 µs including the round
+  trip) vs ORT-on-phone's 859 µs; the two small downstream TopKs are slower than the CPU. Also
+  documents a qemu 8.2 fault in one `__builtin_reduce_or` lowering (exact on the device). See
+  "TopK" above; `topk/build.sh` reproduces it.
