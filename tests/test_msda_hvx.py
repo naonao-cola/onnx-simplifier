@@ -34,6 +34,14 @@ import model as M  # noqa: E402
 import msda_ref  # noqa: E402
 import split  # noqa: E402
 
+# Don't leak these generic module names to the rest of the session: other tests import their own
+# ``model`` (e.g. tests/test_nanochat.py's ``from model import GPT``). ``M``/``msda_ref``/``split``
+# keep their references; ANDROID stays on the path for the lazy ``hexagon_sim_harness`` import.
+for _name in ("model", "split", "msda_ref"):
+    sys.modules.pop(_name, None)
+for _p in (BEV, BEV / "msda_hvx", CORE):
+    sys.path.remove(str(_p))
+
 KINDS = ["rtdetr_decoder", "bevformer_tsa", "bevformer_sca", "loc_small"]
 
 
