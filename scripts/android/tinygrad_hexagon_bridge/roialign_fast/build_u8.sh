@@ -7,7 +7,7 @@ set -euo pipefail
 : "${HEXAGON_SDK_ROOT:?}" "${HEXAGON_TOOLCHAIN:?}" "${DATA:?capture_merged_io.py image directory}"
 NDK_CLANG="${NDK_CLANG:-/usr/lib/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang}"
 DEVICE_SERIAL="${DEVICE_SERIAL:-239dbd8f}"
-HEX_ARCH="${HEX_ARCH:-v73}"
+HEX_ARCH="${HEX_ARCH:-v69}"  # the test phone is SM8475 (Hexagon V69)
 REPS="${REPS:-5}"
 TURBO="${TURBO:-0}"
 CONFIGS="${CONFIGS:-1,4,6,260,262,516,518,772,774}"
@@ -29,4 +29,4 @@ D=/data/local/tmp/roialign_u8
 adb -s "$DEVICE_SERIAL" shell "mkdir -p $D"
 adb -s "$DEVICE_SERIAL" push roialign_u8_client roialign_u8_rpc.so "$DATA"/meta.txt "$DATA"/l*_u8.bin "$DATA"/*_rois*.bin "$DATA"/*_rows*.bin "$DATA"/*_ref_u8.bin $D/ >/dev/null
 adb -s "$DEVICE_SERIAL" shell "chmod 755 $D/roialign_u8_client && cd $D && LD_LIBRARY_PATH=/vendor/lib64 ADSP_LIBRARY_PATH=$D \
-  ./roialign_u8_client 'file:///roialign_u8_rpc.so?roialign_u8_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp' $REPS $TURBO $CONFIGS"
+  ${CLIENT_ENV:-} ./roialign_u8_client 'file:///roialign_u8_rpc.so?roialign_u8_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp' $REPS $TURBO $CONFIGS"

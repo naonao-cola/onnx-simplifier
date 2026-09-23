@@ -15,4 +15,7 @@ interface roialign_u8_rpc : remote_handle64 {
                 rout sequence<uint8> result,        // [N, OH, OW, C]; rows not named in `rows` are left untouched
                 rout uint64 dsp_us);
   AEEResult perf_vote(in int32 turbo, rout int32 rc);
+  // Can this (unsigned) PD get VTCM? query rc / total / largest free block, then acquire `bytes`
+  // (acquired = 1 if HAP_compute_res_acquire returned a context and a non-null VTCM pointer).
+  AEEResult vtcm_probe(in int32 bytes, rout int32 query_rc, rout int32 total, rout int32 avail, rout int32 acquired);
 };

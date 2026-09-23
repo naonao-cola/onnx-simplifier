@@ -6,6 +6,7 @@
 #include "roialign_u8_rpc.h"
 #include "qurt.h"
 #include "HAP_power.h"
+#include "HAP_compute_res.h"
 #include "roialign_u8_kernel.h"
 
 extern unsigned long long HAP_perf_get_time_us(void);
@@ -28,6 +29,22 @@ AEEResult roialign_u8_rpc_perf_vote(remote_handle64 h, int32 turbo, int32* rc) {
   d.dcvs_v2.dcvs_params.max_corner = HAP_DCVS_VCORNER_TURBO;
   int r2 = HAP_power_set(ctx, &d);
   *rc = r1 ? r1 : r2;
+  return 0;
+}
+
+AEEResult roialign_u8_rpc_vtcm_probe(remote_handle64 h, int32 bytes, int32* query_rc, int32* total, int32* avail,
+                                     int32* acquired) {
+  unsigned int tot = 0, av = 0;
+  compute_res_vtcm_page_t tl, al;
+  *query_rc = HAP_compute_res_query_VTCM(0, &tot, &tl, &av, &al);
+  *total = (int32)tot; *avail = (int32)av; *acquired = 0;
+  compute_res_attr_t attr;
+  if (HAP_compute_res_attr_init(&attr) || HAP_compute_res_attr_set_vtcm_param(&attr, (unsigned)bytes, 0)) return 0;
+  unsigned int ctx = HAP_compute_res_acquire(&attr, 10000);
+  if (ctx) {
+    *acquired = HAP_compute_res_attr_get_vtcm_ptr(&attr) != 0;
+    HAP_compute_res_release(ctx);
+  }
   return 0;
 }
 
@@ -93,7 +110,7 @@ AEEResult roialign_u8_rpc_run(remote_handle64 h, const uint8* map0, int map0Len,
       for (int c = 0; c < 4; c++) jobs[j].box[c] = rois[4 * j + c];
     }
   if (flags & 0x200) ru8_sort_jobs(jobs, n);
-  const int prefetch = (flags >> 8) & 1;
+  const int prefetch = (flags & 0x400) ? 2 : (flags >> 8) & 1; /* bit 10: + next-RoI footprint prefetch */
   int nthreads = flags & 0xff;
   if (nthreads < 1) nthreads = 1;
   if (nthreads > MAX_THREADS) nthreads = MAX_THREADS;

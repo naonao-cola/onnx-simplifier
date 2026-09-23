@@ -36,6 +36,13 @@ int main(int argc, char** argv) {
   if (roialign_u8_rpc_open(uri, &h)) { puts("open failed"); return 1; }
   if (turbo) { int vrc = -1; roialign_u8_rpc_perf_vote(h, 1, &vrc); printf("perf_vote(TURBO) rc=%d\n", vrc); }
 
+  if (getenv("VTCM_PROBE")) {
+    for (int mb = 1; mb <= 8; mb *= 2) {
+      int q = -1, tot = 0, av = 0, got = 0;
+      int rc = roialign_u8_rpc_vtcm_probe(h, mb << 20, &q, &tot, &av, &got);
+      printf("vtcm_probe %d MB: rc=%d query_rc=%d total=%d avail=%d acquired=%d\n", mb, rc, q, tot, av, got);
+    }
+  }
   FILE* mf = fopen("meta.txt", "r");
   if (!mf) { perror("meta.txt"); return 1; }
   int geom[12], nlev[2][4] = {{0}}, N[2] = {0}, OH[2] = {0}, sr[2] = {0}, zo[2] = {0}, C = 0;
@@ -109,7 +116,7 @@ int main(int argc, char** argv) {
         if (maxd > 1) bad = 1;
         qsort(d, reps, sizeof d[0], cmp_d); qsort(rt, reps, sizeof rt[0], cmp_d);
         printf("%-4s N=%d rois=%d %-9s threads=%d prefetch=%d sort=%d dsp_ms(med)=%.2f rpc_ms(med)=%.2f rpc_ms(min)=%.2f exact=%.4f%% maxdiff=%d\n",
-               tag, N[t], n, per_level ? "per-level" : "merged", flags & 0xff, (flags >> 8) & 1, (flags >> 9) & 1,
+               tag, N[t], n, per_level ? "per-level" : "merged", flags & 0xff, (flags & 0x400) ? 2 : (flags >> 8) & 1, (flags >> 9) & 1,
                d[reps / 2] / 1e3, rt[reps / 2] / 1e3, rt[0] / 1e3, 100.0 * exact / rlen, maxd);
         fflush(stdout);
       }
