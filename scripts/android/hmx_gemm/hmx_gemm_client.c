@@ -35,6 +35,14 @@ int main(int argc, char** argv) {
   rc = hmx_gemm_rpc_gemm_f16(h, mode, M, K, N, iters, A, M * K, Wp, K * N, B, hb ? N : 0, C, M * N, t, 4, codes, 8);
   printf("vote %d rc %d codes ctx %d hvx %d hmx %d gemm %d vtcm %d thr %d big %d\n", prc, rc, codes[0], codes[1], codes[2],
          codes[3], codes[4], codes[5], codes[6]);
+  if (mode >= 2) {
+    double macs = (double)(((M + 31) / 32) * 32) * K * N * iters;
+    printf("mode %d (%d HMX thread%s) %dx%dx%d x%d: ctx %d/%d lock %d/%d; wall %llu us, per thread %llu/%llu us -> %.2f TMAC/s total\n",
+           mode, mode == 2 ? 2 : 1, mode == 2 ? "s" : "", M, K, N, iters, codes[0], codes[1], codes[4], codes[5],
+           (unsigned long long)t[0], (unsigned long long)t[1], (unsigned long long)t[2], macs * (mode == 2 ? 2 : 1) / t[0] / 1e6);
+    hmx_gemm_rpc_close(h);
+    return 0;
+  }
   double maxe = 0, maxr = 0;
   int bad = 0;
   for (int i = 0; i < M; i++)
