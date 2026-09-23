@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from data import match
+from export import normalized_proj
 from model import InstanceBank, decode
 
 HERE = Path(__file__).resolve().parent
@@ -116,7 +117,8 @@ def main():
         fr = pickle.load(open(p, "rb"))
         metas = fr["metas"]
         temp_feat, temp_anchor, dt = bank.get(metas)
-        ins = [("rgb", "u8", fr["rgb"]), ("proj", "f32", metas["projection_mat"].numpy())]
+        ins = [("rgb", "u8", fr["rgb"]), ("proj", "f32", metas["projection_mat"].numpy()),
+               ("proj_n", "f32", normalized_proj(metas["projection_mat"]).numpy())]
         if temp_feat is not None:
             ins += [("dt", "f32", np.array([float(dt)], np.float32)),
                     ("temp_feat", "f32", temp_feat.numpy()), ("temp_anchor", "f32", temp_anchor.numpy())]

@@ -35,7 +35,7 @@ def backbone_nodes(model):
             continue
         seen.add(n.name)
         todo += [x for x in n.input if x]
-    return {s for s in seen if not s.startswith("/Cast")}
+    return {s for s in seen if s != "rgb_dq"}
 
 
 def main():

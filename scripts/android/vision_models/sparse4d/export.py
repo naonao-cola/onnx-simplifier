@@ -72,12 +72,14 @@ class FoldedConv1(nn.Module):
 DEPTH_MIN = float(__import__("os").environ.get("SPARSE4D_DEPTH_MIN", "1e-2"))
 
 
-def project_mm(kp, proj):
+def project_mm(kp, proj_n):
     """project_points without Einsum and fp16-safe: kp (N, 13, 3), proj (6, 4, 4) -> (6, N, 13, 2).
 
     Upstream divides by max(depth, 1e-5), so a keypoint behind a camera lands at ~1e9: past
     fp16's 65504, which broke the fp16 HTP graph (cls cos 0.92 on frame 0). Here:
-      * x, y are divided by the image size before the depth (both are just scalings);
+      * proj_n is lidar2img[:3] with rows 0 / 1 already divided by the image width / height
+        (`normalized_proj`, host side), so the MatMul yields depth-scale values (<= ~60), not
+        pixels x depth (~4e4);
       * the depth is clamped at 1 cm instead of 1e-5 m, so |x / depth| stays < ~4e3. A 10 cm
         floor is *not* exact (a few keypoints do sit that close to a camera plane: outputs moved
         by up to 0.35 on 3 of the 6 frames); 1 cm and 1 mm both match upstream on all 6 frames to
@@ -86,10 +88,9 @@ def project_mm(kp, proj):
         grid_sample's zero padding at every level (>= 1 level-pixel outside), so this is exact."""
     n = kp.shape[0]
     ptsx = torch.cat([kp, torch.ones_like(kp[..., :1])], dim=-1).reshape(n * PTS, 4)
-    p = ptsx @ proj[:, :3].reshape(CAMS * 3, 4).transpose(0, 1)  # (N*13, 18)
+    p = ptsx @ proj_n.reshape(CAMS * 3, 4).transpose(0, 1)  # (N*13, 18)
     p = p.reshape(n * PTS, CAMS, 3).transpose(0, 1)  # (6, N*13, 3)
-    xy = p[..., :2] / torch.tensor([704.0, 256.0])
-    xy = xy / torch.clamp(p[..., 2:3], min=DEPTH_MIN)
+    xy = p[..., :2] / torch.clamp(p[..., 2:3], min=DEPTH_MIN)
     return torch.clamp(xy, -1.5, 2.5).reshape(CAMS, n, PTS, 2)
 
 
@@ -103,10 +104,15 @@ def dfa_weights_r4(layer, feat, ae, proj):
     return w.reshape(CAMS, LEVELS, GROUPS, n * PTS)
 
 
-def dfa_graph(layer, fmaps, feat, anchor, ae, proj):
+def normalized_proj(proj):
+    """(6, 4, 4) lidar2img -> (6, 3, 4) with x / y rows divided by the image width / height."""
+    return proj[:, :3] / torch.tensor([704.0, 256.0, 1.0]).view(1, 3, 1)
+
+
+def dfa_graph(layer, fmaps, feat, anchor, ae, proj, proj_n):
     """DFA for the graph: rank <= 4 throughout; returns the 'cat' residual (N, 512)."""
     n = feat.shape[0]
-    grid = project_mm(layer.kps_generator(anchor, feat), proj) * 2 - 1  # (6, N, 13, 2)
+    grid = project_mm(layer.kps_generator(anchor, feat), proj_n) * 2 - 1  # (6, N, 13, 2)
     wl = dfa_weights_r4(layer, feat, ae, proj)
     out = 0
     for lv, fm in enumerate(fmaps):
@@ -136,7 +142,7 @@ class FrameGraph(nn.Module):
             lat[i - 1] = lat[i - 1] + F.interpolate(lat[i], size=lat[i - 1].shape[2:], mode="nearest")
         return [c(t) for c, t in zip(bb.fpn, lat)]
 
-    def forward(self, rgb, proj, dt=None, temp_feat=None, temp_anchor=None):
+    def forward(self, rgb, proj, proj_n, dt=None, temp_feat=None, temp_anchor=None):
         head = self.m.head
         fmaps = self.backbone(rgb)
         feat = head.instance_bank.instance_feature
@@ -154,7 +160,7 @@ class FrameGraph(nn.Module):
             elif op in ("norm", "ffn"):
                 feat = layer(feat)
             elif op == "deformable":
-                feat = dfa_graph(layer, fmaps, feat, anchor, ae, proj)
+                feat = dfa_graph(layer, fmaps, feat, anchor, ae, proj, proj_n)
             elif op == "refine":
                 last = i == len(OPS) - 1
                 anchor, c, q = layer(feat, anchor, ae, dt, return_cls=n_pred == 0 or last)
@@ -183,7 +189,8 @@ def frame_inputs(m, ckpt, work):
         temp_feat, temp_anchor = run.bank.cached_feature, run.bank.cached_anchor
         prev = None if temp_feat is None else (run.bank.metas, temp_anchor.clone(), temp_feat.clone(), run.bank.confidence.clone())
         (_, _, _), raw = run.frame(img, metas)
-        rec = {"rgb": fr["rgb"], "proj": metas["projection_mat"].numpy(), "gt": fr["gt"], "metas": metas,
+        rec = {"rgb": fr["rgb"], "proj": metas["projection_mat"].numpy(),
+               "proj_n": normalized_proj(metas["projection_mat"]).numpy(), "gt": fr["gt"], "metas": metas,
                "ref": [t.numpy() for t in raw]}
         if prev is not None:
             # redo the bank's get() on the saved state to capture the projected anchors + dt
@@ -203,7 +210,7 @@ def export_frame(m, work, recs):
     for k, rec in enumerate(recs):
         temporal = "dt" in rec
         g = FrameGraph(m, temporal).eval()
-        args = [torch.from_numpy(rec["rgb"]), torch.from_numpy(rec["proj"])]
+        args = [torch.from_numpy(rec["rgb"]), torch.from_numpy(rec["proj"]), torch.from_numpy(rec["proj_n"])]
         if temporal:
             args += [torch.from_numpy(rec["dt"]), torch.from_numpy(rec["temp_feat"]), torch.from_numpy(rec["temp_anchor"])]
         with torch.no_grad():
@@ -213,8 +220,8 @@ def export_frame(m, work, recs):
     for name, temporal in (("frame_first", False), ("frame_temp", True)):
         g = FrameGraph(m, temporal).eval()
         rec = recs[1] if temporal else recs[0]
-        args = [torch.from_numpy(rec["rgb"]), torch.from_numpy(rec["proj"])]
-        names = ["rgb", "proj"]
+        args = [torch.from_numpy(rec["rgb"]), torch.from_numpy(rec["proj"]), torch.from_numpy(rec["proj_n"])]
+        names = ["rgb", "proj", "proj_n"]
         if temporal:
             args += [torch.from_numpy(rec["dt"]), torch.from_numpy(rec["temp_feat"]), torch.from_numpy(rec["temp_anchor"])]
             names += ["dt", "temp_feat", "temp_anchor"]
@@ -234,10 +241,28 @@ def export_frame(m, work, recs):
 
         sm, ok = simplify(onnx.load(str(path)))
         assert ok
+        u8_input_as_dq(sm)
         onnx.save(sm, str(work / f"{name}.sim.onnx"))
         sess = ort.InferenceSession(str(work / f"{name}.sim.onnx"), providers=["CPUExecutionProvider"])
         o2 = sess.run(None, {n: a.numpy() for n, a in zip(names, args)})
         print(f"  simplified: {len(sm.graph.node)} nodes, vs torch {['%.1e' % float(np.abs(a.numpy() - b).max()) for a, b in zip(tout, o2)]}")
+
+
+def u8_input_as_dq(model):
+    """Cast(uint8 rgb -> float) -> DequantizeLinear(rgb, 1.0, 0): the same values, but QNN reads a
+    uint8 graph input as a quantized tensor and needs its scale / zero point. With a plain Cast the
+    fp16 HTP graph's FPN outputs came out at cos 0.03 - 0.15 vs ORT CPU."""
+    from onnx import helper, numpy_helper
+
+    for i, n in enumerate(model.graph.node):
+        if n.op_type == "Cast" and n.input[0] == "rgb":
+            model.graph.initializer.extend([numpy_helper.from_array(np.array(1.0, np.float32), "rgb_scale"),
+                                            numpy_helper.from_array(np.array(0, np.uint8), "rgb_zp")])
+            model.graph.node.remove(n)
+            model.graph.node.insert(i, helper.make_node("DequantizeLinear", ["rgb", "rgb_scale", "rgb_zp"],
+                                                        list(n.output), name="rgb_dq"))
+            return
+    raise ValueError("no Cast of the rgb input")
 
 
 def write_inputs(work, recs):
@@ -245,7 +270,7 @@ def write_inputs(work, recs):
     for k, rec in enumerate(recs):
         d = work / "in" / str(k)
         d.mkdir(parents=True, exist_ok=True)
-        items = [("rgb", "u8", rec["rgb"]), ("proj", "f32", rec["proj"])]
+        items = [("rgb", "u8", rec["rgb"]), ("proj", "f32", rec["proj"]), ("proj_n", "f32", rec["proj_n"])]
         if "dt" in rec:
             items += [("dt", "f32", rec["dt"]), ("temp_feat", "f32", rec["temp_feat"]),
                       ("temp_anchor", "f32", rec["temp_anchor"])]
