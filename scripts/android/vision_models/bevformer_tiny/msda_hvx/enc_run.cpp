@@ -8,7 +8,9 @@
 // into them (pre-bound output tensors) and the DSP maps them without a copy.
 //
 // usage: enc_run <piece dir> <warmup> <reps> <frame dir>...
-//   piece dir: pre.onnx mid{0,1,2}.onnx post{0,1,2}.onnx (split.py export's *.sim.onnx, renamed)
+//   piece dir: pre.onnx mid{0,1,2}.onnx post{0,1,2}.onnx (split.py export's *.sim.onnx, renamed); with
+//              tsa_vq.txt (split.py export --tsa-u8: "scale zero_point" per layer) the pieces emit the
+//              TSA value maps as uint8 and the kernel reads them as such
 //   frame dir: feats.f32 (6,256,15,25) prev_bev.f32 (2500,256) has_prev.f32 (1) can_bus.f32 (18)
 //              tsa_ref.f32 (2,2500,1,2) ref_cam.f32 (6,2500,4,2) vis.u8 (6,2500)
 //   writes <frame dir>/bev.f32 (2500,256) from the last run; prints per-step and total medians.
@@ -79,6 +81,7 @@ struct Piece {
   std::unique_ptr<Ort::Session> s;
   std::vector<std::string> in, out;
   std::vector<std::vector<int64_t>> out_shape;
+  std::vector<ONNXTensorElementDataType> out_type;
 };
 
 static std::unique_ptr<Ort::Env> env;
@@ -114,6 +117,7 @@ static Piece load(const std::string& dir, const std::string& name, double* ms) {
   for (size_t i = 0; i < P.s->GetOutputCount(); ++i) {
     P.out.push_back(P.s->GetOutputNameAllocated(i, a).get());
     P.out_shape.push_back(P.s->GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo().GetShape());
+    P.out_type.push_back(P.s->GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo().GetElementType());
   }
   return P;
 }
@@ -128,7 +132,7 @@ static void run(Piece& P, const std::map<std::string, std::string>& alias = {}) 
     in_names.push_back(n.c_str());
   }
   for (size_t i = 0; i < P.out.size(); ++i) {
-    ys.push_back(view(buf(P.out[i], P.out_shape[i])));
+    ys.push_back(view(buf(P.out[i], P.out_shape[i], P.out_type[i])));
     out_names.push_back(P.out[i].c_str());
   }
   P.s->Run(Ort::RunOptions{nullptr}, in_names.data(), xs.data(), xs.size(), out_names.data(), ys.data(), ys.size());
@@ -136,28 +140,36 @@ static void run(Piece& P, const std::map<std::string, std::string>& alias = {}) 
 
 static remote_handle64 h_msda = 0;
 static unsigned long long last_dsp_us = 0;
+static float tsa_scale[3];
+static int32_t tsa_zp[3];
 
 // One TSA / SCA call: one level (H, W), 8 heads x 32, P points, ref points + pixel offsets (mode
 // MSDA_REF_PIX), point p on ref entry p % R, NV value maps averaged over the visible ones.
+// uint8 value buffers (split.py export --tsa-u8) use layer `layer`'s scale / zero point.
 static void msda(const std::string& value, size_t value_off_floats, const std::string& ref, const std::string& off,
                  const std::string& attw, const std::string& vis, int NV, int H, int W, int R, int NO, int P,
-                 const std::string& out) {
+                 const std::string& out, int layer) {
   const int Q = 2500;
   Buf &v = get(value), &r = get(ref), &o = get(off), &a = get(attw), &s = get(vis);
   Buf& y = buf(out, {Q, 256});
   msda_args_t A;
   memset(&A, 0, sizeof A);
   A.NV = NV; A.L = 1; A.H[0] = H; A.W[0] = W; A.start[0] = 0; A.S = H * W; A.M = 8; A.D = 32; A.P = P; A.Q = Q;
-  A.NO = NO; A.mode = MSDA_REF_PIX; A.vdtype = MSDA_F32; A.NVR = NV; A.RL = 1; A.R = R; A.RD = 2; A.vis = (const uint8_t*)s.p;
+  const bool u8 = v.type == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+  float vs[MSDA_MAX_NV];
+  int32 vz[MSDA_MAX_NV];
+  for (int i = 0; i < NV; i++) { vs[i] = tsa_scale[layer]; vz[i] = tsa_zp[layer]; }
+  A.NO = NO; A.mode = MSDA_REF_PIX; A.vdtype = u8 ? MSDA_U8 : MSDA_F32; A.NVR = NV; A.RL = 1; A.R = R; A.RD = 2; A.vis = (const uint8_t*)s.p;
   int32 shape[MSDA_SHAPE_LEN(1)];
   const int ns = msda_shape_pack(&A, shape);
-  if ((value_off_floats + msda_n_value(&A)) * 4 > v.bytes || msda_n_ref(&A) * 4 != (long)r.bytes ||
+  if ((value_off_floats + msda_n_value(&A)) * (u8 ? 1 : 4) > v.bytes || msda_n_ref(&A) * 4 != (long)r.bytes ||
       msda_n_loc(&A) * 4 != (long)o.bytes || msda_n_attw(&A) * 4 != (long)a.bytes || msda_n_vis(&A) != (long)s.bytes)
     throw std::runtime_error("msda buffer sizes don't match the shape");
   uint64 us = 0;
   int flags = getenv("MSDA_THREADS") ? atoi(getenv("MSDA_THREADS")) : 4;
-  int rc = msda_rpc_run(h_msda, (const float*)v.p + value_off_floats, (int)msda_n_value(&A), nullptr, 0, nullptr, 0,
-                        nullptr, 0, (const float*)o.p,
+  int rc = msda_rpc_run(h_msda, u8 ? nullptr : (const float*)v.p + value_off_floats, u8 ? 0 : (int)msda_n_value(&A),
+                        u8 ? (const uint8*)v.p + value_off_floats : nullptr, u8 ? (int)msda_n_value(&A) : 0,
+                        u8 ? vs : nullptr, u8 ? NV : 0, u8 ? vz : nullptr, u8 ? NV : 0, (const float*)o.p,
                         (int)msda_n_loc(&A), (const float*)r.p, (int)msda_n_ref(&A), (const float*)a.p, (int)msda_n_attw(&A),
                         (const uint8*)s.p, (int)msda_n_vis(&A), shape, ns, flags, (float*)y.p, (int)msda_n_out(&A), &us);
   if (rc) throw std::runtime_error("msda_rpc_run rc=" + std::to_string(rc));
@@ -202,6 +214,10 @@ int main(int argc, char** argv) {
       tot_create += ms;
     }
     printf("sessions create_ms %.1f\n", tot_create);
+    {
+      std::ifstream vq(pdir + "/tsa_vq.txt");
+      for (int i = 0; vq && i < 3; i++) vq >> tsa_scale[i] >> tsa_zp[i];
+    }
 
     // inputs
     buf("feats", {6, 256, 15, 25});
@@ -237,11 +253,11 @@ int main(int argc, char** argv) {
         mark(0);
         std::string q = "q0";
         for (int i = 0; i < 3; ++i) {
-          msda("tsa_v", 0, "tsa_ref", "tsa_off", "tsa_w", "tsa_vis", 2, 50, 50, 1, 2, 4, "tsa_out");
+          msda("tsa_v", 0, "tsa_ref", "tsa_off", "tsa_w", "tsa_vis", 2, 50, 50, 1, 2, 4, "tsa_out", i);
           mark(last_dsp_us / 1000.0);
           run(pc["mid" + std::to_string(i)], {{"q", q}});
           mark(0);
-          msda("sca_v", (size_t)i * 6 * 375 * 256, "ref_cam", "sca_off", "sca_w", "vis", 6, 15, 25, 4, 1, 8, "sca_out");
+          msda("sca_v", (size_t)i * 6 * 375 * 256, "ref_cam", "sca_off", "sca_w", "vis", 6, 15, 25, 4, 1, 8, "sca_out", i);
           mark(last_dsp_us / 1000.0);
           run(pc["post" + std::to_string(i)]);
           mark(0);
