@@ -1,0 +1,7 @@
+.qnn_run_multi
+models/
+*.onnx
+*.bin
+*.logcat
+*.out
+__pycache__/

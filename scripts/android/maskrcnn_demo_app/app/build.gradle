@@ -1,0 +1,31 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "org.onnxsim.maskrcnndemo"
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "org.onnxsim.maskrcnndemo"
+        minSdk 29
+        targetSdk 28
+        versionCode 1
+        versionName "1.0"
+        ndk { abiFilters "arm64-v8a" }
+    }
+
+    // Native code is prebuilt by build_app.sh into src/main/jniLibs (the JNI engine plus the ORT,
+    // QNN runtime and our two Hexagon FastRPC skels); gradle only packages it.
+    packaging {
+        jniLibs {
+            useLegacyPackaging true   // extract to nativeLibraryDir: the DSP loads skels by path
+            // Hexagon ELF skels: never let the (ARM) strip step touch them
+            keepDebugSymbols += ["**/libQnnHtpV69Skel.so", "**/librpn_rpc.so", "**/libroialign_rpc.so"]
+        }
+    }
+
+    buildTypes {
+        debug { debuggable true }
+    }
+}

@@ -1,0 +1,7 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+interface tgk_rpc : remote_handle64 {
+  AEEResult run(in int32 kern, in int32 reps, in sequence<octet> in0, in sequence<octet> in1,
+                rout sequence<octet> result, rout uint64 min_us, rout uint64 med_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};
