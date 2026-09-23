@@ -1,0 +1,474 @@
+{
+ "nodes": {
+  "MatMul_121": {
+   "names": [
+    "distill__reshape_251",
+    "distill__gather_253",
+    "distill__mul_255",
+    "distill__reshape_257",
+    "distill__reshape_262",
+    "distill__matmul_263"
+   ],
+   "template": "dX_MatMul_121"
+  },
+  "MatMul_138": {
+   "names": [
+    "distill__reshape_213",
+    "distill__gather_287",
+    "distill__mul_289",
+    "distill__reshape_296",
+    "distill__matmul_297"
+   ],
+   "template": "dX_MatMul_138"
+  },
+  "MatMul_156": {
+   "names": [
+    "distill__reshape_326",
+    "distill__gather_328",
+    "distill__mul_330",
+    "distill__reshape_332",
+    "distill__reshape_337",
+    "distill__matmul_338"
+   ],
+   "template": "dX_MatMul_156"
+  },
+  "MatMul_178": {
+   "names": [
+    "distill__reshape_364",
+    "distill__gather_366",
+    "distill__mul_368",
+    "distill__reshape_370",
+    "distill__reshape_375",
+    "distill__matmul_376"
+   ],
+   "template": "dX_MatMul_156"
+  },
+  "MatMul_201": {
+   "names": [
+    "distill__reshape_405",
+    "distill__gather_407",
+    "distill__mul_409",
+    "distill__reshape_411",
+    "distill__reshape_416",
+    "distill__matmul_417"
+   ],
+   "template": "dX_MatMul_156"
+  },
+  "MatMul_223": {
+   "names": [
+    "distill__reshape_443",
+    "distill__gather_445",
+    "distill__mul_447",
+    "distill__reshape_449",
+    "distill__reshape_454",
+    "distill__matmul_455"
+   ],
+   "template": "dX_MatMul_223"
+  },
+  "MatMul_240": {
+   "names": [
+    "distill__reshape_405",
+    "distill__gather_479",
+    "distill__mul_481",
+    "distill__reshape_488",
+    "distill__matmul_489"
+   ],
+   "template": "dX_MatMul_240"
+  },
+  "MatMul_258": {
+   "names": [
+    "distill__reshape_518",
+    "distill__gather_520",
+    "distill__mul_522",
+    "distill__reshape_524",
+    "distill__reshape_529",
+    "distill__matmul_530"
+   ],
+   "template": "dX_MatMul_258"
+  },
+  "MatMul_280": {
+   "names": [
+    "distill__reshape_556",
+    "distill__gather_558",
+    "distill__mul_560",
+    "distill__reshape_562",
+    "distill__reshape_567",
+    "distill__matmul_568"
+   ],
+   "template": "dX_MatMul_258"
+  },
+  "MatMul_303": {
+   "names": [
+    "distill__reshape_597",
+    "distill__gather_599",
+    "distill__mul_601",
+    "distill__reshape_603",
+    "distill__reshape_608",
+    "distill__matmul_609"
+   ],
+   "template": "dX_MatMul_258"
+  },
+  "MatMul_36": {
+   "names": [
+    "distill__add_113",
+    "resnetv15_dense0_weight",
+    "distill__matmul_115"
+   ],
+   "template": "fc_dX_MatMul_36"
+  },
+  "MatMul_38": {
+   "names": [
+    "resnetv15_pool1_fwd",
+    "flatten_170",
+    "distill__transpose_116",
+    "distill__add_113",
+    "distill__matmul_117"
+   ],
+   "template": "fc_dW_MatMul_38"
+  },
+  "MatMul_54": {
+   "names": [
+    "distill__reshape_134",
+    "distill__gather_136",
+    "distill__mul_138",
+    "distill__reshape_140",
+    "distill__reshape_145",
+    "distill__matmul_146"
+   ],
+   "template": "dX_MatMul_54"
+  },
+  "MatMul_76": {
+   "names": [
+    "distill__reshape_172",
+    "distill__gather_174",
+    "distill__mul_176",
+    "distill__reshape_178",
+    "distill__reshape_183",
+    "distill__matmul_184"
+   ],
+   "template": "dX_MatMul_54"
+  },
+  "MatMul_99": {
+   "names": [
+    "distill__reshape_213",
+    "distill__gather_215",
+    "distill__mul_217",
+    "distill__reshape_219",
+    "distill__reshape_224",
+    "distill__matmul_225"
+   ],
+   "template": "dX_MatMul_54"
+  }
+ },
+ "templates": {
+  "dX_MatMul_121": {
+   "axmodel": "dX_MatMul_121.axmodel.gz",
+   "constants": [
+    "distill__idx_252",
+    "distill__mask_254",
+    "distill__shape_256"
+   ],
+   "heldout": "dX_MatMul_121__v2.axmodel.gz",
+   "heldout_quant": "dX_MatMul_121__v2.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     256,
+     4608
+    ],
+    [
+     16,
+     1,
+     4608,
+     196
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "distill__reshape_251",
+    "distill__gather_253",
+    "distill__mul_255",
+    "distill__reshape_257",
+    "distill__reshape_262",
+    "distill__matmul_263"
+   ],
+   "params_words": 72,
+   "quant": "dX_MatMul_121.quant.json.gz",
+   "records": 3784,
+   "step_node": "MatMul_121"
+  },
+  "dX_MatMul_138": {
+   "axmodel": "dX_MatMul_138.axmodel.gz",
+   "constants": [
+    "distill__idx_286",
+    "distill__mask_288"
+   ],
+   "heldout": "dX_MatMul_138__v2.axmodel.gz",
+   "heldout_quant": "dX_MatMul_138__v2.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     256,
+     512
+    ],
+    [
+     16,
+     1,
+     512,
+     196
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "distill__reshape_213",
+    "distill__gather_287",
+    "distill__mul_289",
+    "distill__reshape_296",
+    "distill__matmul_297"
+   ],
+   "params_words": 200,
+   "quant": "dX_MatMul_138.quant.json.gz",
+   "records": 356,
+   "step_node": "MatMul_138"
+  },
+  "dX_MatMul_156": {
+   "axmodel": "dX_MatMul_156.axmodel.gz",
+   "constants": [
+    "distill__idx_327",
+    "distill__mask_329",
+    "distill__shape_331"
+   ],
+   "heldout": "dX_MatMul_156__v2.axmodel.gz",
+   "heldout_quant": "dX_MatMul_156__v2.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     256,
+     2304
+    ],
+    [
+     16,
+     1,
+     2304,
+     196
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "distill__reshape_326",
+    "distill__gather_328",
+    "distill__mul_330",
+    "distill__reshape_332",
+    "distill__reshape_337",
+    "distill__matmul_338"
+   ],
+   "params_words": 72,
+   "quant": "dX_MatMul_156.quant.json.gz",
+   "records": 1366,
+   "step_node": "MatMul_156"
+  },
+  "dX_MatMul_223": {
+   "axmodel": "dX_MatMul_223.axmodel.gz",
+   "constants": [
+    "distill__idx_444",
+    "distill__mask_446",
+    "distill__shape_448"
+   ],
+   "heldout": "dX_MatMul_223__v2.axmodel.gz",
+   "heldout_quant": "dX_MatMul_223__v2.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     128,
+     2304
+    ],
+    [
+     16,
+     1,
+     2304,
+     784
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "distill__reshape_443",
+    "distill__gather_445",
+    "distill__mul_447",
+    "distill__reshape_449",
+    "distill__reshape_454",
+    "distill__matmul_455"
+   ],
+   "params_words": 96,
+   "quant": "dX_MatMul_223.quant.json.gz",
+   "records": 4769,
+   "step_node": "MatMul_223"
+  },
+  "dX_MatMul_240": {
+   "axmodel": "dX_MatMul_240.axmodel.gz",
+   "constants": [
+    "distill__idx_478",
+    "distill__mask_480"
+   ],
+   "heldout": "dX_MatMul_240__v2.axmodel.gz",
+   "heldout_quant": "dX_MatMul_240__v2.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     128,
+     256
+    ],
+    [
+     16,
+     1,
+     256,
+     784
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "distill__reshape_405",
+    "distill__gather_479",
+    "distill__mul_481",
+    "distill__reshape_488",
+    "distill__matmul_489"
+   ],
+   "params_words": 800,
+   "quant": "dX_MatMul_240.quant.json.gz",
+   "records": 583,
+   "step_node": "MatMul_240"
+  },
+  "dX_MatMul_258": {
+   "axmodel": "dX_MatMul_258.axmodel.gz",
+   "constants": [
+    "distill__idx_519",
+    "distill__mask_521",
+    "distill__shape_523"
+   ],
+   "heldout": "dX_MatMul_258__v2.axmodel.gz",
+   "heldout_quant": "dX_MatMul_258__v2.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     128,
+     1152
+    ],
+    [
+     16,
+     1,
+     1152,
+     784
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "distill__reshape_518",
+    "distill__gather_520",
+    "distill__mul_522",
+    "distill__reshape_524",
+    "distill__reshape_529",
+    "distill__matmul_530"
+   ],
+   "params_words": 96,
+   "quant": "dX_MatMul_258.quant.json.gz",
+   "records": 2273,
+   "step_node": "MatMul_258"
+  },
+  "dX_MatMul_54": {
+   "axmodel": "../gather_aggregate_real/a_reference_narrow.axmodel.gz",
+   "constants": [
+    "g_idx",
+    "mask",
+    "rs_shape"
+   ],
+   "heldout": "../gather_aggregate_real/c_wide_reference.axmodel.gz",
+   "heldout_quant": "../matmul_record_emit/gather_c_wide_reference.quant.json.gz",
+   "key": [
+    [
+     1,
+     1,
+     512,
+     4608
+    ],
+    [
+     16,
+     1,
+     4608,
+     49
+    ]
+   ],
+   "kind": "dX",
+   "names": [
+    "x",
+    "gathered",
+    "masked",
+    "reshaped",
+    "w",
+    "y"
+   ],
+   "params_words": 98,
+   "quant": "../matmul_record_emit/gather_a_reference.quant.json.gz",
+   "records": 890,
+   "step_node": "MatMul_54"
+  },
+  "fc_dW_MatMul_38": {
+   "axmodel": "fc_dW_MatMul_38.axmodel.gz",
+   "constants": [],
+   "heldout": "fc_dW_MatMul_38__v2.axmodel.gz",
+   "heldout_quant": "fc_dW_MatMul_38__v2.quant.json.gz",
+   "key": [
+    [
+     512,
+     16
+    ],
+    [
+     16,
+     1000
+    ]
+   ],
+   "kind": "fc_dW",
+   "names": [
+    "resnetv15_pool1_fwd",
+    "flatten_170",
+    "distill__transpose_116",
+    "distill__add_113",
+    "distill__matmul_117"
+   ],
+   "params_words": 1040,
+   "quant": "fc_dW_MatMul_38.quant.json.gz",
+   "records": 25,
+   "step_node": "MatMul_38"
+  },
+  "fc_dX_MatMul_36": {
+   "axmodel": "fc_dX_MatMul_36.axmodel.gz",
+   "constants": [],
+   "heldout": "fc_dX_MatMul_36__v2.axmodel.gz",
+   "heldout_quant": "fc_dX_MatMul_36__v2.quant.json.gz",
+   "key": [
+    [
+     16,
+     1000
+    ],
+    [
+     1000,
+     512
+    ]
+   ],
+   "kind": "fc_dX",
+   "names": [
+    "distill__add_113",
+    "resnetv15_dense0_weight",
+    "distill__matmul_115"
+   ],
+   "params_words": 64,
+   "quant": "fc_dX_MatMul_36.quant.json.gz",
+   "records": 25,
+   "step_node": "MatMul_36"
+  }
+ }
+}

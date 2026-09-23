@@ -49,6 +49,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import elementwise_scale_emit as ew  # noqa: E402
+import matmul_record_emit as mre  # noqa: E402
 import memory_emit  # noqa: E402
 import transpose_real_shapes  # noqa: E402
 
@@ -443,7 +444,7 @@ def extract_step_ops(onnx_path: str) -> list[dict]:
     records = []
     for node in model.graph.node:
         attrs = {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
-        rec: dict[str, Any] = {"op": node.op_type, "attrs": {}}
+        rec: dict[str, Any] = {"op": node.op_type, "name": node.name, "attrs": {}}
         data_inputs = [i for i in node.input if i and i not in inits]
         rec["shapes"] = [shapes.get(i, []) for i in data_inputs[:1]]
         if node.op_type == "Transpose":
@@ -495,6 +496,19 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
     op = rec["op"]
     attrs = rec.get("attrs", {})
     try:
+        live = mre.step_manifest()["nodes"].get(rec.get("name", ""))
+        if live is not None and (
+            op in ("MatMul", "Gemm")
+            or (op == "Conv" and attrs.get("weight_is_graph_input", True))
+        ):
+            # Live operands: no weight table to edit, only calibration records
+            # (matmul_record_emit.py). A live-weight Conv is served in its
+            # act_weight_conv_to_matmul form, the Gemm in its gemm_to_matmul one.
+            return (
+                "conditional",
+                f"MatMul recalibration from scales ({live['template']}) if no "
+                "zero point crosses between zero and nonzero vs the template",
+            )
         if op == "Conv":
             key = key_for_record(rec)
             cache.lookup(key)

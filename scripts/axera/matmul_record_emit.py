@@ -433,6 +433,54 @@ STEP_CONV_MATMULS = {
 """The step's 20 live-weight Convs after ``act_weight_conv_to_matmul``: one
 MatMul each, with the taps concatenated along the contraction."""
 
+STEP_TEMPLATE_DIR = os.path.join(_HERE, "fixtures", "matmul_step_templates")
+"""One Pulsar2 build per distinct step chain, plus ``manifest.json``: which
+template serves which ``step.onnx`` node, and how the node's tensor names
+map onto the template's (``docs/axera-matmul-step-templates.md``)."""
+
+
+def step_manifest() -> dict:
+    with open(os.path.join(STEP_TEMPLATE_DIR, "manifest.json")) as f:
+        return json.load(f)
+
+
+def step_template(node: str, manifest: dict | None = None) -> dict:
+    """The template serving ``step.onnx`` node ``node``: ``axmodel`` and
+    ``quant`` paths, and ``names``, the node's tensor names mapped onto the
+    template's. A node is listed only if its chain has the template's exact
+    ops, attributes, input shapes and constants. Raises ``ValueError`` for
+    any other node."""
+    m = manifest if manifest is not None else step_manifest()
+    entry = m["nodes"].get(node)
+    if entry is None:
+        raise ValueError(f"no validated live-operand template serves node {node!r}")
+    t = m["templates"][entry["template"]]
+    return {
+        "template": entry["template"],
+        "axmodel": os.path.join(STEP_TEMPLATE_DIR, t["axmodel"]),
+        "quant": os.path.join(STEP_TEMPLATE_DIR, t["quant"]),
+        "names": dict(zip(entry["names"], t["names"])),
+        "constants": list(t.get("constants", [])),
+    }
+
+
+def step_node_scales(entry: dict, template_scales: Scales, scales: Scales) -> Scales:
+    """``scales`` (keyed by step tensor names) re-keyed onto the template's
+    names, ready for ``recalibrate``. Constants baked into the chain (Gather
+    masks) keep the template's own scale; every other template tensor must
+    be given."""
+    out: Scales = {}
+    for step_name, name in entry["names"].items():
+        if step_name in scales:
+            out[name] = scales[step_name]
+    for name in entry["constants"]:
+        if name in template_scales:
+            out[name] = template_scales[name]
+    missing = sorted(set(template_scales) - set(out))
+    if missing:
+        raise CalibrationError(f"no step scale for template tensors {missing}")
+    return out
+
 
 # --------------------------------------------------------------------------
 
