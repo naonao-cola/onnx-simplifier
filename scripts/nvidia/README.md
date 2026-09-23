@@ -547,6 +547,51 @@ So for Edge-LLM on TensorRT the fusion is a graph-size/readability win, not a sp
 Any speed benefit would have to come from a backend without a Myelin-style fuser of its
 own that does dispatch `RMSNormalization` to a fused kernel -- not measured here.
 
+### Edge-LLM quantized exports: fp8, int4_awq, nvfp4, mxfp8, int8_sq
+
+Every backbone quantization Edge-LLM 0.10.1 offers, on `Qwen/Qwen3-0.6B`, RTX 5050 (sm_120):
+`tensorrt-edgellm-quantize llm --quantization <q> --text_dataset wikitext --num_samples 128`
+(ModelOpt calibration on the GPU, 19 s-2 min, <= 6.1 GB host RAM) -> `tensorrt-edgellm-export`
+(CPU) -> `edgellm_simplify.py` -> `llm_build` / `llm_inference`, same 3 prompts x 128 greedy
+tokens as the fp16 run above.
+
+**onnxsim keeps every quantization scheme intact.** The graphs carry very different
+quantization machinery -- standard `QuantizeLinear`/`DequantizeLinear` with FP8 / INT8
+initializers (fp8, int8_sq), `trt::TRT_FP4DynamicQuantize` + `trt::DequantizeLinear` with
+FLOAT4E2M1 weights (nvfp4), `trt::TRT_MXFP8DynamicQuantize` / `TRT_MXFP8DequantizeLinear`
+(mxfp8), `trt_edgellm::Int4GroupwiseGemmPluginV2` + `QkvConcatPlugin` (int4_awq) -- and
+in all five no Q/DQ or plugin node is touched, the plugin attributes and graph I/O stay
+byte-identical (`edgellm_simplify.py`'s check), and the count of FP8/FP4/INT8/UINT8
+initializers is unchanged (no weight `DequantizeLinear` constant-folded into fp16). What
+changes is the same as for fp16: the 57 fp32-upcast RMSNorms fuse into `RMSNormalization`
+and redundant `Cast`s go (e.g. int4_awq 1136 -> 680 nodes, nvfp4 1752 -> 1296).
+
+| dtype | decode tok/s (orig / onnxsim) | prefill tok/s | peak GPU MB | onnxsim greedy output identical |
+|---|---|---|---|---|
+| fp16 | 218 / 219 | 2821 / 2854 | 1698 | 3/3 |
+| fp8 | 327 / 327 | 4574 / 4537 | 1266 | 3/3 |
+| int4_awq | **413 / 412** | 3847 / 3858 | **1076** | 2/3 |
+| nvfp4 | 337 / 340 | 4326 / 4322 | 1074 | 3/3 |
+| mxfp8 | 253 / 253 | 3320 / 3403 | 1272 | 0/3 |
+| int8_sq | 315 / 315 | 2660 / 2836 | 1314 | 3/3 |
+
+Speed and memory are unchanged by onnxsim (single runs; ~1-3% differences are noise).
+Where the greedy text differs it diverges late (after 172-298 characters) into equally
+fluent text; per-step log-probabilities (`llm_inference --numLogprobs 5`, mxfp8) differ by
+0.002-0.06 on average before the split, and two of the three splits are at near-exact ties
+in the original (top-1/top-2 margin 0.000 and 0.031) -- rounding-level differences in how
+TensorRT fuses the fused vs decomposed RMSNorm feeding the quantizer, amplified by MXFP8's
+dynamic block quantization (the largest single-step top-1 difference seen was 0.44). Not
+verified against an independent reference, so "equivalent quality" is inferred, not measured.
+
+**int4_awq on x86 needs the `int4_fp16_gemm` CuTe group.** With only `fmha` built (the
+quick-start default), `Int4GroupwiseGemmPluginV2` compiles with no kernels
+(`#ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED`), `llm_build` still succeeds, and inference fails
+at the first enqueue (`Custom layer callback ... failed`, `warmup enqueueV3 failed`).
+`build_cutedsl.py --kernels fmha,int4_fp16_gemm --gpu_arch sm_120` (the group targets the
+Ampere instruction set, so it runs on sm_120) plus `-DENABLE_CUTE_DSL="fmha;int4_fp16_gemm"`
+fixes it (tracked in onnxsim/onnxsim#1916).
+
 ## ONNX -> TensorRT-LLM via AutoDeploy (`onnxsim.to_torch`)
 
 TensorRT-LLM has no ONNX importer, but AutoDeploy -- its path for arbitrary models -- only
