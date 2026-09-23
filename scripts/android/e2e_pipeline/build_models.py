@@ -14,12 +14,16 @@ elsewhere (HTP heads, DSP kernels): every CPU node gets the index of the last ex
 depends on, nodes with the same index form one segment, and each segment's inputs/outputs are
 exactly the tensors that cross its boundary -- so no piece recomputes another piece's work. Step
 lines (one per line, space separated; lists are comma separated, "-" = empty):
-  ort     NAME MODEL EP OPTS IN OUT                 EP cpu|htp; OPTS k=v;k=v (QNN options, ctx=1);
+  ort     NAME MODEL EP OPTS IN OUT                 EP cpu|htp; OPTS k=v;k=v (QNN options; ctx=1|2:
+                                                    EP-context model, binary embedded | own file);
                                                     tensors bind to model inputs/outputs by name
   ortpad  NAME EP OPTS PADIN B:MODEL,B:MODEL IN OUT pad PADIN's dim 0 to the smallest bucket B >= n,
                                                     run that model, slice every OUT back to n
   quant_in SRC DST SCALE ZP                         fp32 [3,H,W] -> uint8 [1,H,W,3] (QuantizeLinear)
   dq      SRC DST SCALE ZP                          uint8 -> fp32, same layout, DSP-shared memory
+  quant   SRC DST SCALE ZP                          fp32 -> uint8, same shape (u8_heads.py)
+  mask_sel LOGITS LABELS DST SCALE ZP               DST[i,0] = sigmoid(dequant(LOGITS[i,LABELS[i]]))
+                                                    (u8_heads.py: the mask head's uint8 logits)
   rpn     SRC SCORES DELTAS OUT                     fused RPN span on the DSP (SRC 0: fp32 per-anchor
                                                     deltas, 1: the backbone's raw uint8 [12,H,W] convs)
   roialign X ROIS OUT OH OW SR SCALE                RoiAlign on the DSP over an NHWC fp32 map X; OUT

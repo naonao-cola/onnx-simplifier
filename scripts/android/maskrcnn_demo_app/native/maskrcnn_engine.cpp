@@ -11,6 +11,13 @@
 //                    seg2/seg4 in pipe_e_opt.txt) with a native multithreaded row scatter
 //   pipeline=<step>  two-stage cross-frame pipelining: stage A = steps before <step>, stage B = the
 //                    rest, on its own thread; frame N+1's stage A runs while frame N's stage B does
+//   env.NAME=value   set an environment knob before init (e.g. env.ORT_THREADS=6, env.ORT_SPIN=1:
+//                    ORT's pool spinning, off by default here, see e2e_pipeline/README.md)
+//   par_load=1       create the HTP sessions in parallel threads (the DSP skels always open on
+//                    their own thread, overlapped with session creation)
+//   warmup=1         a warm-up inference at the end of init (one gray frame plus every ortpad
+//                    bucket). Off by default: it costs ~120 ms of init, more than the cold first
+//                    frame costs now, so the first results came later with it.
 // The image comes from an RGBA bitmap (quantized straight to the backbone's uint8 NHWC input) and
 // results/timings go back over JNI.
 #define E2E_STORE_STORAGE static thread_local
@@ -31,6 +38,7 @@
 
 namespace {
 const float kMeanBgr[3] = {102.9801f, 115.9465f, 122.7717f};  // maskrcnn_e2e/eval_common.py
+const int kInH = 800, kInW = 1088;                                // the backbone's input
 
 // timing buckets returned to Java: total, preprocess, backbone, rpn, roialign, heads, cpu(other),
 // stage A, stage B, pipeline wait (stage A blocked handing off to stage B)
@@ -47,7 +55,7 @@ uint8_t g_lut_tab[3][256];
 int bucket(const Step& S) {
   if (S.op == "quant_in") return T_PRE;
   if (S.op == "rpn") return T_RPN;
-  if (S.op == "roialign") return T_ROI;
+  if (S.op == "roialign" || S.op == "roialign_u8" || S.op == "rpc_stage") return T_ROI;
   if (S.name == "backbone") return T_BACKBONE;
   if (S.name == "box_head" || S.name == "mask_head") return T_HEADS;
   return T_CPU;
@@ -64,7 +72,7 @@ uint8_t qval(float v, float s, int z) {
 void quant_rgba(Step& S, const uint8_t* px, int w, int h, int stride) {
   const float s = std::stof(S.f[3]);
   const int z = std::stoi(S.f[4]);
-  const int H = 800, W = 1088, C = 3;
+  const int H = kInH, W = kInW, C = 3;
   uint8_t* q = (uint8_t*)S.buf.get((size_t)H * W * C);
   const uint8_t pad = qval(0.f, s, z);
   par(H, envi("DQ_THREADS", 4), [&](long a, long b) {
@@ -98,6 +106,7 @@ void quant_rgba(Step& S, const uint8_t* px, int w, int h, int stride) {
 // YUV -> RGB is JFIF full-range BT.601 (what camera YUV_420_888 is), fixed point.
 struct Yuv {
   const uint8_t *y, *u, *v;
+  long ycap, ucap, vcap;  // plane buffer sizes (direct ByteBuffer capacities)
   int ys, uvs, uvps, w, h, rot;
   uint8_t* disp;  // RGBA, fw x fh, stride disp_stride (may be null)
   int disp_stride;
@@ -111,9 +120,10 @@ void fit_dims(int w, int h, int rot, int* fw, int* fh) {
 void quant_yuv(Step& S, const Yuv& Y) {
   const float s = std::stof(S.f[3]);
   const int z = std::stoi(S.f[4]);
-  const int H = 800, W = 1088, C = 3;
+  const int H = kInH, W = kInW, C = 3;
   uint8_t* q = (uint8_t*)S.buf.get((size_t)H * W * C);
   const uint8_t pad = qval(0.f, s, z);
+  const uint8_t *py = Y.y, *pu = Y.u, *pv = Y.v;
   int fw, fh;
   fit_dims(Y.w, Y.h, Y.rot, &fw, &fh);
   const int RW = (Y.rot % 180) ? Y.h : Y.w, RH = (Y.rot % 180) ? Y.w : Y.h;
@@ -137,9 +147,9 @@ void quant_yuv(Step& S, const Yuv& Y) {
             case 270: sx = Y.w - 1 - ry; sy = rx; break;
             default: sx = rx; sy = ry;
           }
-          const int yy = Y.y[sy * Y.ys + sx];
+          const int yy = py[sy * Y.ys + sx];
           const int ci = (sy >> 1) * Y.uvs + (sx >> 1) * Y.uvps;
-          const int uu = Y.u[ci] - 128, vv = Y.v[ci] - 128;
+          const int uu = pu[ci] - 128, vv = pv[ci] - 128;
           // x1024 fixed point: 1.402, 0.344136, 0.714136, 1.772
           int r = yy + ((1436 * vv + 512) >> 10);
           int g = yy - ((352 * uu + 731 * vv + 512) >> 10);
@@ -198,17 +208,17 @@ void scatter_rows(Step& S) {
   put_raw(S.f[3], base.type, base.shape, out);
 }
 
-// Our DSP skels aren't reentrant: two stages calling the same skel at once (e.g. box RoiAlign in
-// stage A while stage B runs the mask RoiAlign) fails with rc=78. Serialize each skel's calls.
-std::mutex g_rpn_mu, g_roi_mu;
+// DSP skel calls never overlap. With pipelining, stage A (RPN, box RoiAlign) and stage B (mask
+// RoiAlign) would otherwise call the DSP at the same time: the same skel twice at once failed with
+// rc=78 (the skels keep per-handle scratch state and aren't reentrant), and the uint8 RoiAlign skel
+// also assumes it never runs next to the RPN kernel (both size their HVX threads / VTCM use for a
+// DSP of their own). One mutex over every skel call covers both; the calls are short (2-11 ms).
+std::mutex g_dsp_mu;
 void exec_step(Step& S) {
   if (S.op == "scatter_rows") {
     scatter_rows(S);
-  } else if (S.op == "roialign") {
-    std::lock_guard<std::mutex> l(g_roi_mu);
-    exec(S);
-  } else if (S.op == "rpn") {
-    std::lock_guard<std::mutex> l(g_rpn_mu);
+  } else if (S.op == "roialign" || S.op == "roialign_u8" || S.op == "rpn") {
+    std::lock_guard<std::mutex> l(g_dsp_mu);
     exec(S);
   } else {
     exec(S);
@@ -314,11 +324,43 @@ void stage_b_loop() {
   }
 }
 
+// One full inference on a gray (letterbox-colored) frame, then every ortpad bucket once on zeros:
+// the first run of each HTP graph and ORT session is several times slower than the steady state,
+// and a gray frame may not reach every bucket (the mask head's 100 needs > 32 detections).
+void warmup() {
+  double t[T_N] = {0};
+  store.clear();
+  Step& S0 = *g_steps[0];
+  const float s = std::stof(S0.f[3]);
+  const int z = std::stoi(S0.f[4]);
+  uint8_t* q = (uint8_t*)S0.buf.get((size_t)kInH * kInW * 3);
+  memset(q, qval(0.f, s, z), (size_t)kInH * kInW * 3);
+  put_raw(S0.f[2], ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8, {1, kInH, kInW, 3}, q);
+  run_steps(1, g_steps.size(), t);
+  store.clear();
+  for (auto& S : g_steps)
+    for (auto& kv : S->buckets) {
+      Session& B = kv.second;
+      Tensor x;
+      x.type = B.s->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
+      x.shape = B.in_shape[0];
+      std::vector<char> zero(x.count() * esize(x.type), 0);
+      x.data = zero.data();
+      Ort::Value v = view(x);
+      run_session(B, &v);
+    }
+  store.clear();
+}
+
 void init(const std::string& model_dir, const std::string& lib_dir, const std::string& pipe, const std::string& opts) {
   for (auto& kv : split(opts, ';')) {
     auto e = kv.find('=');
     if (e != std::string::npos) g_opt[kv.substr(0, e)] = kv.substr(e + 1);
   }
+  // "env.NAME=value" sets an environment knob e2e_run.cpp reads (ORT_THREADS, DQ_THREADS,
+  // ROI_THREADS, RPN_MODE, MERGE_THREADS), before anything reads it
+  for (auto& kv : g_opt)
+    if (kv.first.rfind("env.", 0) == 0) setenv(kv.first.substr(4).c_str(), kv.second.c_str(), 1);
   g_lut = g_opt["quant"] == "lut";
   g_merge = split(g_opt.count("merge") ? g_opt["merge"] : "-", ',');
   // The DSP loads skels (libQnnHtpV69Skel.so, librpn_rpc.so, libroialign_rpc.so) through this
@@ -334,12 +376,14 @@ void init(const std::string& model_dir, const std::string& lib_dir, const std::s
   Ort::ThreadingOptions to;
   to.SetGlobalIntraOpNumThreads(envi("ORT_THREADS", 4));
   to.SetGlobalInterOpNumThreads(1);
+  to.SetGlobalSpinControl(envi("ORT_SPIN", 0));
+  const double t_init = now_ms();
   env = std::make_unique<Ort::Env>(to, ORT_LOGGING_LEVEL_WARNING, "demo");
 
   std::ifstream pf(pipe);
   if (!pf) throw std::runtime_error("cannot open " + pipe + ": " + strerror(errno));
   std::string line;
-  bool need_htp = false, need_rpn = false, need_roi = false;
+  bool need_htp = false, need_rpn = false, need_roi = false, need_roiu8 = false;
   while (std::getline(pf, line)) {
     if (line.empty()) continue;
     auto S = std::make_unique<Step>();
@@ -347,8 +391,9 @@ void init(const std::string& model_dir, const std::string& lib_dir, const std::s
     std::string w;
     while (ss >> w) S->f.push_back(w);
     S->op = S->f[0];
-    S->name = S->op == "ort" || S->op == "ortpad" ? S->f[1]
-              : S->op + ":" + S->f[S->op == "rpn" ? 4 : S->op == "roialign" ? 3 : 2];
+    S->name = S->op == "ort" || S->op == "ortpad" || S->op == "roialign_u8" || S->op == "rpc_stage"
+                  ? S->f[1]
+                  : S->op + ":" + S->f[S->op == "rpn" ? 4 : S->op == "roialign" || S->op == "mask_sel" ? 3 : 2];
     if (S->op == "ort" && std::find(g_merge.begin(), g_merge.end(), S->name) != g_merge.end()) {
       // "ort seg2 model cpu - IN OUT" -> "scatter_rows seg2 IN OUT"
       S->f = {"scatter_rows", S->name, S->f[5], S->f[6]};
@@ -357,6 +402,7 @@ void init(const std::string& model_dir, const std::string& lib_dir, const std::s
     need_htp |= (S->op == "ort" && S->f[3] == "htp") || (S->op == "ortpad" && S->f[2] == "htp");
     need_rpn |= S->op == "rpn";
     need_roi |= S->op == "roialign";
+    need_roiu8 |= S->op == "roialign_u8";
     g_steps.push_back(std::move(S));
   }
   if (g_steps.empty() || g_steps[0]->op != "quant_in") throw std::runtime_error("pipe must start with quant_in");
@@ -393,35 +439,91 @@ void init(const std::string& model_dir, const std::string& lib_dir, const std::s
     if (npu.empty()) throw std::runtime_error("no QNN NPU ep device");
     LOGI("QNN EP registered, %zu NPU device(s)", npu.size());
   }
-  if (need_rpn) {
-    if (rpn_rpc_open("file:///librpn_rpc.so?rpn_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp", &h_rpn))
-      throw std::runtime_error("rpn_rpc_open failed");
-    rpn_init();
-    LOGI("rpn skel open");
-  }
-  if (need_roi) {
-    if (roialign_rpc_open("file:///libroialign_rpc.so?roialign_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp", &h_roi))
-      throw std::runtime_error("roialign_rpc_open failed");
-    LOGI("roialign skel open");
-  }
+  const double t_ep = now_ms();
+  // The DSP skels open (and the RPN model constants upload) on their own thread while the ORT
+  // sessions are created -- but only after the first HTP session exists: opening our FastRPC
+  // sessions while QNN sets up its HTP device makes that setup fail ("Failed to create device ...
+  // INVALID_CONFIG", "Unable to acquire runtime HTP arch"), and the session then lands on the
+  // (disabled) CPU EP.
+  std::string dsp_err;
+  auto dsp_open = [&] {
+    try {
+      const double t = now_ms();
+      if (need_rpn) {
+        if (rpn_rpc_open("file:///librpn_rpc.so?rpn_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp", &h_rpn))
+          throw std::runtime_error("rpn_rpc_open failed");
+        rpn_init();
+      }
+      if (need_roi &&
+          roialign_rpc_open("file:///libroialign_rpc.so?roialign_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp", &h_roi))
+        throw std::runtime_error("roialign_rpc_open failed");
+      if (need_roiu8 &&
+          roialign_u8_rpc_open("file:///libroialign_u8_rpc.so?roialign_u8_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp",
+                               &h_roiu8))
+        throw std::runtime_error("roialign_u8_rpc_open failed");
+      LOGI("dsp skels open in %.1f ms", now_ms() - t);
+    } catch (const std::exception& ex) {
+      dsp_err = ex.what();
+    }
+  };
+  std::thread dsp;
   double t0 = now_ms();
-  for (auto& S : g_steps) {
+  // one job per session; ortpad buckets pre-sized so parallel jobs never touch a shared vector
+  std::vector<std::pair<bool, std::function<void()>>> jobs;  // (on the HTP, job)
+  std::vector<std::vector<double>> bucket_ms(g_steps.size());
+  for (size_t k = 0; k < g_steps.size(); ++k) {
+    Step* S = g_steps[k].get();
+    double* bms = nullptr;
     if (S->op == "ort") {
-      S->sess = wrap(make_session(S->f[2], S->f[3], S->f[4], &S->create_ms));
+      jobs.emplace_back(S->f[3] == "htp", [S] { S->sess = wrap(make_session(S->f[2], S->f[3], S->f[4], &S->create_ms)); });
     } else if (S->op == "ortpad") {
-      for (auto& e : split(S->f[5], ',')) {
-        auto c = e.find(':');
-        double ms = 0;
-        S->buckets.emplace_back(std::stoi(e.substr(0, c)), wrap(make_session(e.substr(c + 1), S->f[2], S->f[3], &ms)));
-        S->create_ms += ms;
+      auto bs = split(S->f[5], ',');
+      S->buckets.resize(bs.size());
+      bucket_ms[k].assign(bs.size(), 0);
+      bms = bucket_ms[k].data();
+      for (size_t i = 0; i < bs.size(); ++i) {
+        const std::string e = bs[i];
+        jobs.emplace_back(S->f[2] == "htp", [S, i, e, bms] {
+          auto c = e.find(':');
+          S->buckets[i] = {std::stoi(e.substr(0, c)), wrap(make_session(e.substr(c + 1), S->f[2], S->f[3], &bms[i]))};
+        });
       }
     }
-    if (S->create_ms > 0) LOGI("session %s create_ms %.1f", S->name.c_str(), S->create_ms);
+  }
+  const bool par_load = g_opt["par_load"] == "1";
+  std::vector<std::thread> th;
+  std::vector<std::string> errs(jobs.size());
+  size_t first_htp = jobs.size();
+  for (size_t j = 0; j < jobs.size() && first_htp == jobs.size(); ++j)
+    if (jobs[j].first) first_htp = j;
+  auto run = [&](size_t j) {
+    try { jobs[j].second(); } catch (const std::exception& ex) { errs[j] = ex.what(); }
+  };
+  if (first_htp < jobs.size()) run(first_htp);  // sets up the QNN HTP device
+  dsp = std::thread(dsp_open);
+  for (size_t j = 0; j < jobs.size(); ++j) {
+    if (j == first_htp) continue;
+    if (par_load && jobs[j].first) th.emplace_back(run, j);
+    else run(j);
+  }
+  for (auto& t : th) t.join();
+  dsp.join();
+  for (auto& e : errs)
+    if (!e.empty()) throw std::runtime_error(e);
+  if (!dsp_err.empty()) throw std::runtime_error(dsp_err);
+  for (size_t k = 0; k < g_steps.size(); ++k) {
+    Step& S = *g_steps[k];
+    for (double ms : bucket_ms[k]) S.create_ms += ms;
+    if (S.create_ms > 0) LOGI("session %s create_ms %.1f", S.name.c_str(), S.create_ms);
   }
   LOGI("setup_ms %.1f, %zu steps, split at %zu (%s)", now_ms() - t0, g_steps.size(), g_split,
        g_split ? g_steps[g_split]->name.c_str() : "none");
   g_side.resize(g_steps.size());
   g_side_cur.assign(g_steps.size(), 0);
+  const double t_sess = now_ms();
+  if (g_opt["warmup"] == "1") warmup();
+  LOGI("init phases: env+ep %.1f, sessions+dsp %.1f, warmup %.1f ms (par_load %d)", t_ep - t_init, t_sess - t_ep,
+       now_ms() - t_sess, (int)par_load);
   if (g_split) g_b = std::thread(stage_b_loop);
 }
 
@@ -561,7 +663,9 @@ extern "C" JNIEXPORT jlong JNICALL Java_org_onnxsim_maskrcnndemo_Engine_nativeRu
     jobject disp, jlong id, jfloatArray jboxes, jintArray jlabels, jfloatArray jscores, jfloatArray jmasks,
     jfloatArray jtimes, jintArray jndet) {
   Yuv Y{(const uint8_t*)e->GetDirectBufferAddress(jy), (const uint8_t*)e->GetDirectBufferAddress(ju),
-        (const uint8_t*)e->GetDirectBufferAddress(jv), ys, uvs, uvps, w, h, rot, nullptr, 0};
+        (const uint8_t*)e->GetDirectBufferAddress(jv), (long)e->GetDirectBufferCapacity(jy),
+        (long)e->GetDirectBufferCapacity(ju), (long)e->GetDirectBufferCapacity(jv), ys, uvs, uvps, w, h, rot,
+        nullptr, 0};
   AndroidBitmapInfo info;
   void* px = nullptr;
   if (!Y.y || !Y.u || !Y.v || AndroidBitmap_getInfo(e, disp, &info) ||

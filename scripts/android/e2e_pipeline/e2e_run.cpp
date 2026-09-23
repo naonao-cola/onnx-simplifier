@@ -9,7 +9,9 @@
 //   final outputs of the last run to <out_dir>/<stem>_<k>.bin (+ .shape) for the host comparison.
 // env: ORT_THREADS (CPU intra-op, default 4, one global pool shared by every CPU session),
 //      QNN_EP_LIB, RPN_URI, ROI_URI, RPN_MODE (default 3 = phased), ROI_THREADS (default 104 =
-//      4 threads + l2fetch prefetch), DQ_THREADS (default 4).
+//      4 threads + l2fetch prefetch), ROIU8_URI, ROIU8_FLAGS (default 260 = 4 threads + prefetch),
+//      DQ_THREADS (default 4), ORT_SPIN (default 1; 0 stops the ORT
+//      pool spinning between ops, which otherwise starves the driver's own threaded passes).
 #include <onnxruntime_cxx_api.h>
 
 #include <algorithm>
@@ -27,12 +29,14 @@
 #include <unordered_map>
 #include <vector>
 
+#include <arm_neon.h>
 #include <unistd.h>
 
 extern "C" {
 #include "remote.h"
 #include "rpcmem.h"
 #include "roialign_rpc.h"
+#include "roialign_u8_rpc.h"
 #include "rpn_rpc.h"
 int rpn_glue_set_model(remote_handle64 h, int* post_cap, int* lv3);  // rpn_glue.c
 }
@@ -129,25 +133,25 @@ static std::unique_ptr<Ort::Session> make_session(const std::string& model, cons
   so.DisablePerSessionThreads();
   so.SetLogSeverityLevel(envi("ORT_LOG", ORT_LOGGING_LEVEL_WARNING));
   std::string path = model;
-  bool ctx = false;
+  int ctx = 0;  // 1: EP-context model, context binary embedded; 2: binary in a separate _qnn.bin file
   if (ep == "htp") {
     std::unordered_map<std::string, std::string> o{{"backend_type", "htp"}};
     for (auto& kv : split(opts, ';')) {
       auto e = kv.find('=');
       if (e == std::string::npos) continue;
-      if (kv.substr(0, e) == "ctx") { ctx = kv.substr(e + 1) == "1"; continue; }
+      if (kv.substr(0, e) == "ctx") { ctx = std::stoi(kv.substr(e + 1)); continue; }
       o[kv.substr(0, e)] = kv.substr(e + 1);
     }
     so.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
     so.AppendExecutionProvider_V2(*env, npu, o);
     if (ctx) {
-      path = model.substr(0, model.size() - 5) + ".ctx.onnx";
+      path = model.substr(0, model.size() - 5) + (ctx == 2 ? ".ctx0.onnx" : ".ctx.onnx");
       std::ifstream exists(path);
       if (!exists) {
         Ort::ModelCompilationOptions co(*env, so);
         co.SetInputModelPath(model.c_str());
         co.SetOutputModelPath(path.c_str());
-        co.SetEpContextEmbedMode(true);
+        co.SetEpContextEmbedMode(ctx == 1);
         Ort::Status st = Ort::CompileModel(*env, co);
         if (!st.IsOK()) throw std::runtime_error("CompileModel " + model + ": " + st.GetErrorMessage());
       }
@@ -212,7 +216,7 @@ struct Step {
   unsigned long long dsp_us = 0;
 };
 
-static remote_handle64 h_rpn = 0, h_roi = 0;
+static remote_handle64 h_rpn = 0, h_roi = 0, h_roiu8 = 0;
 static int rpn_post_cap = 1000;
 static std::vector<std::array<int, 3>> rpn_lv;  // A, H, W per level
 
@@ -235,14 +239,14 @@ static void exec(Step& S) {
     for (auto& kv : S.buckets)
       if (kv.first >= n && (!B || kv.first < b)) { B = &kv.second; b = kv.first; }
     if (!B) throw std::runtime_error("no bucket for n=" + std::to_string(n));
-    size_t row = x.count() / std::max<int64_t>(n, 1) * esize(x.type);
-    if (n == 0) row = 0;
-    size_t need = (size_t)b * (row ? row : 1);
+    // row size from the trailing dims, not count()/n: with n == 0 (no RoIs) the padded input must
+    // still be b full rows, or the HTP input copy reads past the end of S.pad
+    size_t row = esize(x.type);
+    for (size_t d = 1; d < x.shape.size(); ++d) row *= (size_t)x.shape[d];
+    size_t need = (size_t)b * row;
     if (S.pad.size() < need) S.pad.assign(need, 0);
-    if (row) {
-      memcpy(S.pad.data(), x.data, n * row);
-      memset(S.pad.data() + n * row, 0, (b - n) * row);
-    }
+    if (n) memcpy(S.pad.data(), x.data, n * row);
+    memset(S.pad.data() + n * row, 0, (b - n) * row);
     Tensor tmp = x;
     tmp.data = S.pad.data();
     Ort::Value v = view(tmp, &B->in_shape[0]);
@@ -282,6 +286,57 @@ static void exec(Step& S) {
       for (long i = a; i < b; ++i) o[i] = (float)((int)q[i] - z) * s;  // DequantizeLinear
     });
     put_raw(f[2], ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, x.shape, o);
+  } else if (S.op == "quant") {
+    // QuantizeLinear to uint8, shape kept: a head's graph-input QuantizeLinear moved off the HTP
+    // (u8_heads.py; an fp32 graph input costs the HTP far more than this pass costs the CPU)
+    Tensor& x = get(f[1]);
+    const float s = std::stof(f[3]);
+    const int z = std::stoi(f[4]);
+    const long n = (long)x.count();
+    const std::vector<int64_t> shape = x.shape;
+    uint8_t* q = (uint8_t*)S.buf.get(std::max<long>(n, 1));
+    const float* src = (const float*)x.data;
+    // NEON, 16 per iteration: the same x / s (vector fdiv), round half to even (vcvtnq, = rintf in
+    // the default rounding mode), + z and saturate to [0, 255] -- bit-identical to the scalar tail
+    const float32x4_t vs = vdupq_n_f32(s);
+    const int32x4_t vz = vdupq_n_s32(z);
+    par((n + 15) / 16, envi("DQ_THREADS", 4), [&](long a, long b) {
+      long i = a * 16;
+      const long e = std::min(n, b * 16);
+      for (; i + 16 <= e; i += 16) {
+        int32x4_t r[4];
+        for (int k = 0; k < 4; ++k) r[k] = vaddq_s32(vcvtnq_s32_f32(vdivq_f32(vld1q_f32(src + i + 4 * k), vs)), vz);
+        const int16x8_t h0 = vcombine_s16(vqmovn_s32(r[0]), vqmovn_s32(r[1]));
+        const int16x8_t h1 = vcombine_s16(vqmovn_s32(r[2]), vqmovn_s32(r[3]));
+        vst1q_u8(q + i, vcombine_u8(vqmovun_s16(h0), vqmovun_s16(h1)));
+      }
+      for (; i < e; ++i) {
+        float v = __builtin_rintf(src[i] / s) + (float)z;  // same rounding as quant_in
+        q[i] = (uint8_t)(v < 0.f ? 0.f : (v > 255.f ? 255.f : v));
+      }
+    });
+    put_raw(f[2], ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8, shape, q);
+  } else if (S.op == "mask_sel") {
+    // mask_sel LOGITS LABELS OUT scale zp: OUT[i, 0] = sigmoid(dequant(LOGITS[i, LABELS[i]])), i.e.
+    // the mask head's final DequantizeLinear + Sigmoid (moved off the HTP, u8_heads.py) fused with
+    // seg5's per-detection class gather, so only 1 of the 81 channels is ever converted. uint8 in:
+    // a 256-entry table is exact.
+    Tensor& L = get(f[1]);
+    Tensor& lab = get(f[2]);
+    const float s = std::stof(f[4]);
+    const int z = std::stoi(f[5]);
+    float lut[256];
+    for (int v = 0; v < 256; ++v) lut[v] = 1.f / (1.f + std::exp(-(float)(v - z) * s));
+    const int64_t n = L.shape[0], C = L.shape[1], H = L.shape[2], W = L.shape[3];
+    const int64_t* lb = (const int64_t*)lab.data;
+    const uint8_t* q = (const uint8_t*)L.data;
+    float* o = (float*)S.buf.get(std::max<int64_t>(n * H * W, 1) * 4);
+    for (int64_t i = 0; i < n; ++i) {
+      if (lb[i] < 0 || lb[i] >= C) throw std::runtime_error("mask_sel: label out of range");
+      const uint8_t* src = q + (i * C + lb[i]) * H * W;
+      for (int64_t k = 0; k < H * W; ++k) o[i * H * W + k] = lut[src[k]];
+    }
+    put_raw(f[3], ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, {n, 1, H, W}, o);
   } else if (S.op == "rpn") {
     int src = std::stoi(f[1]);
     auto sc = split(f[2], ','), dl = split(f[3], ',');
@@ -309,6 +364,79 @@ static void exec(Step& S) {
     if (rc) throw std::runtime_error("rpn_rpc_run rc=" + std::to_string(rc));
     S.dsp_us = du;
     put_raw(f[4], ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, {st[0], 4}, out);
+  } else if (S.op == "rpc_stage") {
+    // rpc_stage NAME SRC,.. DST,..: copy up to 4 tensors into this step's rpcmem buffers (the DSP
+    // maps those instead of copying), once per frame for every later DSP call that reads them
+    auto src = split(f[2], ','), dst = split(f[3], ',');
+    RpcBuf* bufs[4] = {&S.buf, &S.buf2, &S.buf3, &S.buf4};
+    if (src.size() != dst.size() || src.size() > 4) throw std::runtime_error("rpc_stage: bad lists");
+    for (size_t i = 0; i < src.size(); ++i) {
+      Tensor t = get(src[i]);
+      const long n = (long)(t.count() * esize(t.type));
+      char* d = (char*)bufs[i]->get(std::max(n, 1L));
+      const char* sp = (const char*)t.data;
+      par((n + 65535) / 65536, envi("DQ_THREADS", 4), [&](long a, long b) {
+        const long lo = a * 65536, hi = std::min(n, b * 65536);
+        if (lo < hi) memcpy(d + lo, sp + lo, hi - lo);
+      });
+      put_raw(dst[i], t.type, t.shape, d);
+    }
+  } else if (S.op == "roialign_u8") {
+    // roialign_u8 NAME DATA OUT C OH OW SR S_OUT Z_OUT LEVELS: the merged uint8 RoiAlign skel
+    // (../tinygrad_hexagon_bridge/roialign_fast/roialign_u8_*), one call for a whole head: every
+    // FPN level's RoIs straight from the backbone's uint8 NHWC maps into the head's uint8 input
+    // rows [N, OH, OW, C] (N = DATA's dim 0, the merge's row count). Replaces the maps' dq, the 4
+    // per-level roialign steps, the ScatterND merge segment and the head's input quant. LEVELS, in
+    // the roialign lines' order: MAP:S_IN:Z_IN:SPATIAL_SCALE:ROIS:ROWS (MAP rpcmem-staged uint8).
+    const int64_t N = get(f[2]).shape[0];
+    const int C = std::stoi(f[4]), OH = std::stoi(f[5]), OW = std::stoi(f[6]), sr = std::stoi(f[7]);
+    const float s_out = std::stof(f[8]);
+    const int z_out = std::stoi(f[9]);
+    auto lv = split(f[10], ',');
+    if (lv.size() != 4) throw std::runtime_error("roialign_u8: 4 levels expected");
+    const uint8_t* maps[4];
+    int mlen[4], geom[12], counts[4];
+    float fp[8];
+    long n = 0;
+    for (int k = 0; k < 4; ++k) {
+      auto a = split(lv[k], ':');
+      Tensor& m = get(a[0]);
+      maps[k] = (const uint8_t*)m.data;
+      mlen[k] = (int)m.count();
+      geom[3 * k] = (int)m.shape[1];
+      geom[3 * k + 1] = (int)m.shape[2];
+      geom[3 * k + 2] = std::stoi(a[2]);
+      fp[2 * k] = std::stof(a[1]);
+      fp[2 * k + 1] = std::stof(a[3]);
+      counts[k] = (int)get(a[4]).shape[0];
+      n += counts[k];
+    }
+    float* rois = (float*)S.buf2.get(std::max(n, 1L) * 16);
+    int32_t* rows = (int32_t*)S.buf3.get(std::max(n, 1L) * 4);
+    long o = 0;
+    for (int k = 0; k < 4; ++k) {
+      auto a = split(lv[k], ':');
+      Tensor& r = get(a[4]);
+      Tensor& w = get(a[5]);
+      memcpy(rois + 4 * o, r.data, (size_t)counts[k] * 16);
+      if ((long)w.count() != counts[k]) throw std::runtime_error("roialign_u8: rows/rois count mismatch");
+      for (int i = 0; i < counts[k]; ++i)
+        rows[o + i] = w.type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 ? (int32_t)((const int64_t*)w.data)[i]
+                                                                     : ((const int32_t*)w.data)[i];
+      o += counts[k];
+    }
+    const long on = (long)N * OH * OW * C;
+    uint8_t* out = (uint8_t*)S.buf.get(std::max(on, 1L));
+    S.dsp_us = 0;
+    if (n) {
+      unsigned long long du = 0;
+      int rc = roialign_u8_rpc_run(h_roiu8, maps[0], mlen[0], maps[1], mlen[1], maps[2], mlen[2], maps[3], mlen[3], geom, 12,
+                                   fp, 8, counts, 4, rois, (int)(4 * n), rows, (int)n, C, OH, OW, sr, s_out, z_out,
+                                   envi("ROIU8_FLAGS", 260), out, (int)on, &du);
+      if (rc) throw std::runtime_error("roialign_u8_rpc_run rc=" + std::to_string(rc));
+      S.dsp_us = du;
+    }
+    put_raw(f[3], ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8, {N, OH, OW, C}, out);
   } else if (S.op == "roialign") {
     Tensor& x = get(f[1]);
     Tensor& r = get(f[2]);
@@ -347,13 +475,16 @@ int main(int argc, char** argv) {
 
     Ort::ThreadingOptions to;
     to.SetGlobalIntraOpNumThreads(envi("ORT_THREADS", 4));
+    // ORT_SPIN=0: the pool's threads stop spinning after each op, so they don't hold the big cores
+    // while the pipeline's own par() work (quant, dq, scatter) runs between ORT segments
+    to.SetGlobalSpinControl(envi("ORT_SPIN", 1));
     to.SetGlobalInterOpNumThreads(1);
     env = std::make_unique<Ort::Env>(to, static_cast<OrtLoggingLevel>(envi("ORT_LOG", ORT_LOGGING_LEVEL_WARNING)), "e2e");
 
     std::vector<std::unique_ptr<Step>> steps;
     std::ifstream pf(pipe);
     std::string line;
-    bool need_htp = false, need_rpn = false, need_roi = false;
+    bool need_htp = false, need_rpn = false, need_roi = false, need_roiu8 = false;
     while (std::getline(pf, line)) {
       if (line.empty()) continue;
       auto S = std::make_unique<Step>();
@@ -361,10 +492,13 @@ int main(int argc, char** argv) {
       std::string w;
       while (ss >> w) S->f.push_back(w);
       S->op = S->f[0];
-      S->name = S->op == "ort" || S->op == "ortpad" ? S->f[1] : S->op + ":" + S->f[S->op == "rpn" ? 4 : S->op == "roialign" ? 3 : 2];
+      S->name = S->op == "ort" || S->op == "ortpad" || S->op == "roialign_u8" || S->op == "rpc_stage"
+                    ? S->f[1]
+                    : S->op + ":" + S->f[S->op == "rpn" ? 4 : S->op == "roialign" || S->op == "mask_sel" ? 3 : 2];
       need_htp |= (S->op == "ort" && S->f[3] == "htp") || (S->op == "ortpad" && S->f[2] == "htp");
       need_rpn |= S->op == "rpn";
       need_roi |= S->op == "roialign";
+      need_roiu8 |= S->op == "roialign_u8";
       steps.push_back(std::move(S));
     }
     if (need_htp) {
@@ -383,6 +517,11 @@ int main(int argc, char** argv) {
     if (need_roi) {
       const char* u = getenv("ROI_URI") ? getenv("ROI_URI") : "file:///roialign_rpc.so?roialign_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp";
       if (roialign_rpc_open(u, &h_roi)) throw std::runtime_error("roialign_rpc_open failed");
+    }
+    if (need_roiu8) {
+      const char* u = getenv("ROIU8_URI") ? getenv("ROIU8_URI")
+                                          : "file:///roialign_u8_rpc.so?roialign_u8_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp";
+      if (roialign_u8_rpc_open(u, &h_roiu8)) throw std::runtime_error("roialign_u8_rpc_open failed");
     }
     double t_setup = now_ms();
     for (auto& S : steps) {
@@ -454,6 +593,7 @@ int main(int argc, char** argv) {
     }
     if (h_rpn) rpn_rpc_close(h_rpn);
     if (h_roi) roialign_rpc_close(h_roi);
+    if (h_roiu8) roialign_u8_rpc_close(h_roiu8);
     printf("PASS\n");
     fflush(stdout);
     _exit(0);  // skip static destructors: ORT's and ours tear down in an order that aborts on exit
