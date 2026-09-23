@@ -2165,6 +2165,105 @@ NonZero/Gather/ScatterElements around it don't. Fusing those in, and taking the 
 straight from a DSP-resident backbone, would remove the next round trips. Only this span's
 per-level NMS is fused; the 80 per-class NMS calls come later, after the box head.
 
+## tinygrad codegen for HVX: plain Tensor code instead of hand kernels
+
+Most kernels in this directory are either `Tensor.custom_kernel`s with hand-injected HVX C strings or plain hand-written
+C, because tinygrad's own Hexagon codegen produced scalar code even for a plain elementwise add (17.6x slower than TVM,
+see "Coverage: the elementwise add" above). This section fixes that at the codegen layer, in the `onnxsim/tinygrad`
+fork (PR https://github.com/onnxsim/tinygrad/pull/2, branch `hvx-codegen`, stacked on the `vrmpy-hexagon-support` work in PR #1), so the
+ordinary ops can be written as ordinary tinygrad code.
+
+### Why plain tinygrad code was scalar
+
+Upstream tinygrad already knows about the DSP in two places: `memory_coalescing` groups loads and stores up to 128
+lanes, and the upcast heuristic tries a 128-wide upcast. Loads and stores were vectorized. Four things weren't:
+
+1. **The ALU was split per lane and never rebuilt.** `devectorizer2` splits every elementwise op into scalars, and only
+   memory ops get regrouped, so `a+b` rendered as `(int128){(v0[0]+v1[0]),(v0[1]+v1[1]),...}`. LLVM lowers that lane by
+   lane: 1738 instructions for a small test kernel versus 181 for the same kernel written `v0+v1`. **Fix:** a bottom-up re-vectorization pass in the
+   DSP renderer, `STACK(op(a_i,b_i)) -> op(STACK(a_i), STACK(b_i))`, plus renderer rules for splats, lane slices
+   (`__builtin_shufflevector`) and vector casts (`__builtin_convertvector`). It only forms a vector op when every
+   operand column is itself vector-shaped (a lane slice of one vector, a splat, constants, or recursively the same op);
+   per-lane mixes of compares/casts stay scalar. That restriction isn't cosmetic: vectorizing one such mix crashed
+   LLVM's Hexagon backend (`Cannot select: v2i32 = bitcast (V2Q ...)`) in `test_max_pool2d_return_indices`.
+2. **`max` wasn't a native op.** Clang's renderer has no `Ops.MAX`, so it was decomposed into compare+select. It now
+   renders as `__builtin_elementwise_max` for integers (one `vmax`). Floats keep tinygrad's own `(a<b)?b:a` NaN
+   semantics, written as a statement expression that names each operand once. A plain ternary (or even
+   `__typeof__(a) _a=(a)`) repeats the operand text, and since single-use results are inlined, max chains like
+   `argmax`/`cross_entropy` grew exponentially as *source text*: over 6 GB of host memory for one test (360 MB on the
+   unmodified branch), most likely what drove this machine into global OOM kills while this was being developed.
+3. **Real shapes missed the 128-lane upcast.** The DSP branch only tried exactly 128, so `...x272` dims fell back to a
+   4-wide upcast. It now tries 128/64/32 and prefers the widest; the "nothing upcasted" fallback does the same.
+4. **Coalescing made loads wider than anything used them.** Two adjacent 32-byte loads were merged into a 64-byte one
+   that every consumer used as two 32-byte halves; LLVM split it through a stack round trip. On the DSP, loads are now
+   capped at the widest contiguous store group (the kernel's actual vector width).
+
+Plus one performance rule: a software prefetch (`dcfetch`, `HVX_PREFETCH` bytes ahead, default 2048) for every load that
+covers a full 128-byte line, one per line. That's what closed the add kernel's gap on hardware earlier in this file, and
+it's what separates a plain vector add (153k Pcycles in `hexagon-sim --timing`) from the hand kernel (76k).
+
+All changes are DSP-gated; other backends generate identical code.
+
+### Result: the same plain Tensor code, before and after
+
+`tinygrad_codegen/tgk_ops.py` writes three ops as ordinary tinygrad code, at the real shapes the hand kernels target:
+the int32 add (`[1,256,200,272]`), the uint8 3x3/stride-2 maxpool in packed NCHWc (`[1,2,402,546,32]` in), and the
+int32->uint8 requantize (2M elements, TVM's Q31 `QMultiplyShift` formula). `gen_kernels.py` generates both the plain
+version and the existing hand `custom_kernel`, checks each byte-exact against numpy under qemu, and `build.sh` runs them
+on the phone through a dedicated FastRPC skel with `rpcmem` buffers (same pattern as `roialign_fast/`), timing on the DSP.
+Everything below is byte-exact against numpy on real hardware (device `239dbd8f`), single DSP thread, default clocks.
+
+Real shapes on the phone, median of 7-9 reps, range over independent runs (ms):
+
+| op | unmodified tinygrad | **plain tinygrad, this change** | hand `custom_kernel` |
+|---|---:|---:|---:|
+| add | 103.7 | **6.8 - 7.2** | 7.0 - 7.3 |
+| maxpool | 68.9 - 69.1 | **33.8 - 36.9** | 32.9 - 36.0 |
+| requantize | 14.6 - 14.8 | **9.3 - 9.9** | 23.3 - 25.5 |
+
+Small shapes, `hexagon-sim --timing` (HEXSIM=1, v73, cycle-level, microseconds at the simulator's clock):
+
+| op | plain tinygrad | hand |
+|---|---:|---:|
+| add `[1,256,25,34]` | 74.7 | 76.2 |
+| maxpool `[1,2,52,70,32]` | 117.5 | 213.7 |
+| requantize 64k | 490.2 | 842.0 |
+
+- **add:** ~15x faster than before and at parity with the hand kernel.
+- **maxpool:** 2x faster than before, within a few percent of hand on the phone. HEXSIM (built at `-O1`) shows it well
+  ahead of hand; the phone (`-O2`) doesn't, so trust the phone number. Neither version uses HVX here: at the natural
+  32-byte channel-block width both lower to the scalar core's packed-byte `vmaxub`. Getting 128-byte HVX vectors needs
+  a stride-2 deinterleave (the gap `hex_maxpool_kernel.py`'s own docstring describes); that isn't done.
+- **requantize:** 2.5x faster than hand, but *not* because of HVX: the formula needs 64-bit products and HVX has no
+  64-bit lanes, so both versions stay scalar. The plain version wins on unrolling plus prefetch. A real HVX version
+  would use the Q31 `vmpyo`/`vmpye` multiply-high pair instead of int64 arithmetic; not done.
+
+### Checks
+
+- `test/test_tiny.py` under `DEV=DSP MOCKDSP=1`: same result as the unmodified branch (16 passed, 5 skipped).
+- `test/backend/test_ops.py` under `DEV=DSP MOCKDSP=1`: 38 failed / 381 passed / 8 skipped, the **identical** failure
+  set to the unmodified branch (all 38 pre-existing). Peak host memory 1 GB (run under a 6 GB cgroup cap).
+- `test/backend/test_ops.py` on `DEV=CPU`: 2 failed / 417 passed / 8 skipped, identical to the unmodified branch
+  (`test_clip`, `test_pad_replicate_mode`), so the shared heuristic/coalescing edits don't change other backends.
+
+### What this does and doesn't cover
+
+- **Hand kernels this makes redundant** (not deleted here): `hex_add_kernel.py`, `hex_requantize_kernel.py`, and, at a
+  few percent cost, `hex_maxpool_kernel.py`. The chained backbone drivers under `native_transport/` embed their
+  generated C verbatim and would need regenerating to switch over.
+- **Not done: qfloat (fp32 vector math).** This phone's V69 HVX has no IEEE fp32 (see the NMS section), so float vector
+  ops need qfloat lowering (`vadd_sf`/`vconv_sf_qf32` + the asm barrier NMS needed). But the qfloat instructions start at
+  V68, tinygrad's DSP compiler targets V65, and qemu 8.2 can't decode HVX float at all, so tinygrad's own MOCKDSP test
+  path couldn't validate it. That's a target-version change plus a new validation path, not a renderer rule. Float
+  vector ops (sigmoid, RoiAlign's blend, float `max`) are still scalarized by LLVM.
+- **Not done: threading.** The hand kernels' multi-thread speedups come from `qurt` worker threads; qemu's bare-metal mode
+  and `hexagon-sim`'s standalone mode (tinygrad's two DSP test paths) have no `qurt`, and tinygrad's own on-device DSP
+  runtime can't reach this phone (see the top of this file). A threaded renderer variant could only be validated through
+  a FastRPC harness like `tinygrad_codegen/`'s.
+- **Not covered by this pass:** convolutions/GEMM (`vrmpy` still needs `custom_kernel` or the TensorCore path, whose
+  devectorizer problem is described near the top of this file), and the data-dependent ops (NMS, TopK, proposal decode,
+  RoiAlign fast path), which stay hand-written C.
+
 ## Beyond the backbone: the box-head fc6 MatMul (`hex_boxhead_gemm_kernel.py`)
 
 Every kernel above targets `backbone.onnx` (ResNet-50/FPN/RPN, the Hexagon DSP half of the split
@@ -2435,6 +2534,10 @@ TINYGRAD_PATH=/path/to/onnxsim-tinygrad HEXAGON_TOOLS=/path/to/Tools HEXAGON_CLA
   three standalone calls combined. `capture_rpn_fused.py` (span + real I/O), `rpn_kernel.h`,
   `rpn_host_check.c`, `rpn_qemu.c`, `rpn_rpc.idl`/`rpn_impl.c`/`rpn_client.c`, `ort_rpn_bench.c`,
   `build.sh`. See "Fused RPN post-processing" above.
+- `tinygrad_codegen/` -- add, maxpool and requantize written as plain tinygrad Tensor code (`tgk_ops.py`), plus a
+  generator that checks them and the hand `custom_kernel`s byte-exact under qemu and emits their C (`gen_kernels.py`),
+  and a TVM-free FastRPC skel/client (`tgk_rpc.idl`, `tgk_impl.c`, `tgk_client.c`, `build.sh`) that times both on the
+  phone. See "tinygrad codegen for HVX" above.
 - `ci/` -- phone-free CI helpers for `tests/test_hexagon_tinygrad.py`: `codegen_check.py` (tinygrad
   HVX codegen checks under qemu / hexagon-sim), `pd_selfcheck.c` (synthetic proposal-decode
   self-consistency + qemu inputs), `hexagon_divrt.c` (integer divide helpers for freestanding
