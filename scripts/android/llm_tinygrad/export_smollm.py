@@ -11,8 +11,8 @@ A plain-PyTorch Llama (checked against transformers' LlamaForCausalLM) exported 
 
 Every tensor has rank <= 4 (GQA repeats K/V by reshape/expand, heads live in the batch dim). The
 decode step attends over the cache (positions < pos, the host writes row `pos` afterwards) plus the
-new token, so the graph never scatters into the cache. RMSNorm pre-scales x by 1/32 (exact, with
-eps/1024) so x^2 can't overflow fp16 on the HTP.
+new token, so the graph never scatters into the cache. RMSNorm divides each row by its max |x|
+first (exact) so x^2 can't overflow fp16 on the HTP.
 
 Also writes W/dec_in/prompt_<i>.bin and force_<i>.bin (the fp32 greedy tokens, for teacher-forced
 runs) for models.PROMPTS, and W/dec_ref/gen_<i>.npy + logits_<i>.npy (fp32 greedy decoding).
@@ -69,8 +69,18 @@ class Llama(nn.Module):
         self.register_buffer("sin", ang.sin(), persistent=False)
 
     def rms(self, x, w):
-        x = x * (1.0 / 32.0)
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps / 1024.0) * w
+        # RMSNorm that works in the HTP's fp16. SmolLM2's residual stream has an outlier channel near
+        # 2e4 (from layer ~12 on):
+        # - x^2 overflows fp16 (65504), even prescaled by 1/32;
+        # - dividing each row by its max |x| instead puts the ordinary channels (~0.01-1) below fp16's
+        #   smallest normal (6.1e-5), and the HTP flushes them to zero;
+        # so each row is scaled to max |y| = 128: y^2 <= 16384, small channels stay normal.
+        #   x / rms(x) = y / rms(y). No eps: mean(y^2) >= 128^2/576, and every eps/m^2 form made QNN
+        #   fail to compose the graph (the ReduceMax output can't feed a second branch).
+        # (x / (m / 128), not x * (128 / m): QNN won't compose a constant divided by a tensor)
+        m = x.abs().amax(-1, keepdim=True) + 1e-4
+        y = x / (m * (1.0 / 128.0))
+        return y * torch.rsqrt((y * y).mean(-1, keepdim=True)) * w
 
     def rope(self, x, cos, sin):  # x [h, S, D], cos/sin [S, D]
         x1, x2 = x[..., : self.D // 2], x[..., self.D // 2 :]
