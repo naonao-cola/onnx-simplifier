@@ -125,3 +125,9 @@ PYTHONPATH=<repo> python3 quantize.py nano bb8g16 && python3 host_eval.py nano $
 python3 phone_eval.py nano $W/nano.u8.onnx --n 1 --iters 3 --profile && \
   python3 profile_regions.py $W/nano.u8.onnx $W/phone_nano.u8/pulled/prof.csv
 ```
+
+## Demo app
+
+The demo app (`../../maskrcnn_demo_app`, "RF-DETR" button) runs Nano @320 fp16 as one strict-HTP
+graph in its YOLO activity (`post=detr`): 25-26 FPS on test images (27 ms inference), 30 FPS from
+the camera (camera-capped; 26 ms HTP + 4 ms YUV conversion). See that README's RF-DETR section.

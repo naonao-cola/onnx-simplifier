@@ -1,6 +1,6 @@
 # Mask R-CNN live demo app (Android, Hexagon HTP + HVX)
 
-Model buttons (top): Mask R-CNN, YOLO26n, YOLO11n, RT-DETR and SAM, each engine in its own process
+Model buttons (top): Mask R-CNN, YOLO26n, YOLO11n, RT-DETR, RF-DETR and SAM, each engine in its own process
 (one model loaded at a time); see the YOLO, RT-DETR and SAM sections below for the newer modes.
 
 An Android app that runs the full Mask R-CNN (ONNX model zoo `MaskRCNN-12-qdq`) on the phone
@@ -74,6 +74,33 @@ Same as the runner's 18.3 ms plus the app's preprocessing. Against YOLO26n (2.9 
 the inference per frame but needs no NMS and keeps small, crowded detections (19 on this image).
 
 <img src="docs/rtdetr_images.jpg" width="240" alt="RT-DETR-r18 on a crowded COCO image in the app">
+
+## RF-DETR mode (RF-DETR-Nano, NMS-free, all-HTP fp16)
+
+The "RF-DETR" button runs RF-DETR-Nano from `../vision_models/rfdetr` in the YOLO activity (process
+`:yolo`, model `rfdetr_nano`), as one strict-HTP fp16 graph: `native/yolo_engine.cpp`'s `post=detr`.
+- **Input:** RF-DETR is trained on a *stretched* square input (its `predict()` resizes without
+  keeping the aspect ratio), so the camera frame is converted upright at display size in the usual
+  YUV pass, then nearest-sampled to the model's S x S uint8 NHWC input; test images are stretched
+  straight from the bitmap. The normalization is folded into the model's patch-embed conv
+  (`../vision_models/rfdetr/graph.py`), so the input is the RGB bytes.
+- **Output:** `logits` (1, 300, 91) + `boxes` (1, 300, 4), decoded as RF-DETR's PostProcess
+  (sigmoid, top 300 over queries x classes, threshold 0.5 as `predict()`); boxes are normalized to
+  the stretched input, so they scale back by the frame's width and height; labels are COCO category
+  ids, mapped to `Coco.java`'s contiguous table.
+- **Model:** `RFDETR=$HOME/.cache/onnxsim-rfdetr/work/nano@320.u8.onnx ./deploy.sh` (stored as
+  `rfdetr_nano.onnx`), then `adb shell am start -n org.onnxsim.maskrcnndemo/.YoloActivity --es model
+  rfdetr_nano [--es mode images]`. Nano at 320 is the default: its 26 ms keep up with the 30 FPS
+  camera; `nano.u8.onnx` (384, 47 ms, a bit more accurate) drops in the same way.
+
+Measured on the phone under the shared phone lock (the app's running averages):
+
+| model, mode | end-to-end FPS | inference | pre | HTP | post |
+|---|---:|---:|---:|---:|---:|
+| RF-DETR-Nano @320, test images | 25-26 | 27 ms | 0.2 | 26.5 | 0.3 |
+| RF-DETR-Nano @320, camera | 30 (camera-capped) | 30 ms | 4 | 26 | 0.3 |
+
+<img src="docs/rfdetr_images.jpg" width="240" alt="RF-DETR-Nano on a COCO image in the app">
 
 ## SAM mode (tap to segment, EfficientViT-SAM-L0)
 
