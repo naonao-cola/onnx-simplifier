@@ -190,3 +190,19 @@ QDQ decoder has many more nodes, and its tensors are small.
   DQ -> Q' -> DQ' convert; GridSample's grid is exempt. Without this, QNN rejects a Gemm with a
   uint8 input and a uint16 output, and its weight DQ is stranded on the CPU.
 - Weights are quantized only for nodes that end up real QDQ units.
+
+### Why not a `scripts/android/deploy` spec (yet)
+
+The deploy pipeline (#1853) takes one graph through fetch -> simplify -> quantize -> rewrite ->
+bench -> accuracy, with images as calibration/eval data and a detection-match accuracy. Four
+things are missing for BEVFormer, none small:
+- **a chain of pieces**: backbone6 -> enc3 -> decoder, each with its own precision policy, where
+  the backbone's uint8 feats feed the encoder;
+- **host inputs per frame**: ref_cam/bev_mask from lidar2img, can_bus, shift;
+- **temporal state**: the previous BEV, rotated and shifted on the host, is an encoder input;
+- **nuScenes data and a 3D accuracy kind**: calibration/eval frames, and GT matching in the ego
+  frame.
+
+`quantize.py` + `e2e_phone.py` cover all four for this model. The piece that generalizes is the
+quantizer: the deploy spec's `quantize` section could call `onnxsim.full_qdq.quantize_full_qdq`
+(`op_types` / `exclude_nodes` / `tensor_dtypes` map directly onto spec keys).
