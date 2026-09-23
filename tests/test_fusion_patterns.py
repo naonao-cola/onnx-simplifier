@@ -712,8 +712,21 @@ def test_fuse_rms_norm_fp32_upcast():
         opset=23,
         ir_version=11,
     )
-    sim_model, ops = _simplify(model)
+    # check_n=0 plus an fp16-tolerance comparison instead of check_n's own:
+    # onnxruntime's fused RMSNormalization kernel rounds some fp16 outputs
+    # one ulp away from the decomposed graph on some platforms (seen on
+    # linux-aarch64 CI: max diff 2**-10 at values in [1, 2)), which check_n's
+    # tolerance rejects even though the rewrite is exact up to that rounding.
+    sim_model, _ = onnxsim.simplify(model, check_n=0)
+    ops = collections.Counter(n.op_type for n in sim_model.graph.node)
     assert ops == {"RMSNormalization": 1}
+    ort = pytest.importorskip("onnxruntime")
+    x = np.random.default_rng(0).standard_normal((2, 4, 8)).astype(np.float16)
+    (want,) = ort.InferenceSession(model.SerializeToString()).run(None, {"X": x})
+    (got,) = ort.InferenceSession(sim_model.SerializeToString()).run(None, {"X": x})
+    np.testing.assert_allclose(
+        got.astype(np.float32), want.astype(np.float32), rtol=2e-3, atol=2e-3
+    )
     (rms,) = sim_model.graph.node
     assert list(rms.input) == ["X", "weight"]
     attrs = {a.name: onnx.helper.get_attribute_value(a) for a in rms.attribute}
