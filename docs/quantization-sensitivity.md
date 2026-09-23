@@ -14,7 +14,7 @@ broke across unrelated trainings):
 | pattern | why | seen in |
 |---|---|---|
 | Softmax, LayerNorm/RMSNorm internals, attention scores | wide or heavy-tailed range by construction | every transformer below |
-| geometry / coordinate math (grid construction, projected points) | Sub/Add of large coordinates, then used as sample locations | BEVFormer SCA grid (worst op types in `bevformer_tiny/sensitivity.py`), Sparse4D keypoints behind a camera |
+| geometry / coordinate math (grid construction, projected points) | Sub/Add of large coordinates, then used as sample locations | BEVFormer SCA grid (worst *single op types* in `bevformer_tiny/sensitivity.py`; as whole groups the int8 Linears still carry more of the loss, see section 4), Sparse4D keypoints behind a camera |
 | one tensor mixing different units | one scale can't cover both | YOLO11 final Concat of box pixels (0-640) and class probs (0-1): keep it float |
 | score / classification heads | clipping the rare high scores kills detections while barely moving L2 | YOLO11n/YOLO26n (entropy and tight percentiles lose detections) |
 | first conv on raw pixels, prediction heads | input/output range, few channels | most detectors |
@@ -31,7 +31,8 @@ broke across unrelated trainings):
 - how concentrated the error is: EdgeSAM's int8 error is spread ~1% per
   node across the whole network (keeping 96/194 nodes in fp16 still only
   reached embedding cos 0.93), RT-DETR-r18's int8 loss splits across the
-  backbone and encoder, while BEVFormer's concentrates in the grid ops.
+  backbone and encoder, while BEVFormer's encoder concentrates in two places: the int8
+  Linears and, next, the grid-construction ops.
   YOLO11n and YOLO26n (similar architectures, different training) needed
   different calibration methods (MSE vs percentile with the score path at
   exact range).
@@ -108,7 +109,7 @@ device-specific: `scripts/android/vision_models/bevformer_tiny/bisect_precision.
 |---|---|---|---|
 | YOLO11n | final Concat (mixed units); class-score clipping | structural | Concat kept float; MSE calibration: 596/659 vs fp32 (ORT MinMax 585) |
 | YOLO26n | score path | structural + checkpoint | percentile + score path at exact range: 482/565 on the phone |
-| BEVFormer-tiny encoder | grid-construction Sub/Add/Reshape feeding GridSample | structural | int8 GridSample only viable with a tighter (exact) ref clamp; after moving sampling to HVX, int8 encoder is accurate but slower on the HTP |
+| BEVFormer-tiny encoder | int8 Linears carry most of the loss as a group (Gemms alone: 14.0 dB of the all-uint8 13.2 dB, `analyze_activation_sensitivity`); the grid-construction Sub/Add and GridSample come next (24-27 dB each alone) and were the worst *single op types* in the hand sweep | structural | int8 GridSample only viable with a tighter (exact) ref clamp; after moving sampling to HVX, int8 encoder is accurate but slower on the HTP |
 | RT-DETR-r18 | spread over backbone (~6) and encoder (~8 detections) | checkpoint | encoder at 16-bit activations: 190/195 vs 183 at int8 |
 | StreamPETR head | HTP 16x16-bit MatMul (backend) | backend | head stays fp16 |
 | SmolLM2-135M | residual outlier channel -> fp16 RMSNorm overflow (backend + outliers) | structural + backend | exact row rescale: 9/10 prompts identical over 32 tokens |
