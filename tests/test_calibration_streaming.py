@@ -249,7 +249,13 @@ def test_full_graph_exclusion_and_accuracy():
 
     x = _calib(1, seed=9)[0]
     ref = ort.InferenceSession(model.SerializeToString()).run(None, x)[0]
-    got = ort.InferenceSession(q.SerializeToString()).run(None, x)[0]
+    # No graph optimizations: ORT would otherwise fuse the QDQ Conv into a
+    # u8s8 integer kernel, which saturates on x86 CPUs without VNNI (11%
+    # error on the Windows CI runner) -- this checks the quantization
+    # parameters, not ORT's kernels.
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    got = ort.InferenceSession(q.SerializeToString(), so).run(None, x)[0]
     assert np.abs(ref - got).max() < 0.05 * np.abs(ref).max()
 
 
