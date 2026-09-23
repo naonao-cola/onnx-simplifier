@@ -1,5 +1,8 @@
 # Mask R-CNN live demo app (Android, Hexagon HTP + HVX)
 
+Model buttons (top): Mask R-CNN, YOLO26n, YOLO11n, RT-DETR and SAM, each engine in its own process
+(one model loaded at a time); see the YOLO, RT-DETR and SAM sections below for the newer modes.
+
 An Android app that runs the full Mask R-CNN (ONNX model zoo `MaskRCNN-12-qdq`) on the phone
 (Xiaomi 12S, Snapdragon 8+ Gen 1), frame by frame, from the camera or a set of test images, with
 boxes, labels, instance masks and an FPS / latency / per-stage counter. It runs the pipeline
@@ -99,6 +102,20 @@ the HTP from EP-context models.
 
 (phone, under the shared phone lock; the encoder matches #1876's 41.8 ms.) Each extra tap costs
 ~11 ms, so segmenting feels immediate after the one-off encode.
+
+## More modes: follow-ups (not built)
+
+- **BEV replay** (Fast-BEV++, PR #1873 / #1895 pipelined): bundle a few nuScenes-mini scene-0103
+  frames (6 cameras each; nuScenes is CC BY-NC-SA 4.0, so keep it to a handful and credit it),
+  run the image piece + the in-graph view transform + BEV head on the HTP per frame, decode on the
+  CPU, and draw the 6 camera thumbnails with projected 3D boxes plus a top-down BEV view. Needs the
+  per-rig lookup table and the camera calibration shipped with the frames, and a 3D-box projection
+  in Java. A toggle for StreamPETR (#1884) / BEVFormer (#1879) on the same frames would reuse the
+  data and the drawing.
+- **LLM chat** (SmolLM2-135M fp16 on the HTP, #1886: 24.5 ms prefill for 128 tokens, 110 tok/s):
+  a text box streaming greedy tokens. Needs the prefill and single-token decode graphs with the KV
+  cache as uint8/fp16 I/O driven from a native loop, plus the tokenizer (a small BPE in C++ or
+  Java) -- the decode step graph is the piece to port from `../llm_tinygrad`.
 
 ## Result
 
