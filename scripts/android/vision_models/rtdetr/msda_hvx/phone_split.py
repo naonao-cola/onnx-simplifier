@@ -41,7 +41,14 @@ def main():
     build = Path(
         os.environ.get("BUILD", Path.home() / ".cache/onnxsim-rtdetr/msda_build")
     )
-    u8 = "front8" in a.pre or "u8" in a.pre
+    import onnx
+
+    u8 = (
+        onnx.load(str(sd / a.pre), load_external_data=False)
+        .graph.input[0]
+        .type.tensor_type.elem_type
+        == onnx.TensorProto.UINT8
+    )
     rd = f"{R}/split"
     imgs = [f"img{i}" for i in range(a.n)]
     lines = ["set -e", f"adb -s {SERIAL} shell mkdir -p {rd}"]

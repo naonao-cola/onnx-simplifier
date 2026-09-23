@@ -44,7 +44,10 @@ int main(int argc, char** argv) {
       for (int r = 0; r < n + 2; r++) {
         uint64 us = 0;
         double t0 = now_ms();
-        int e = msda_rpc_run(h, a->value, (int)msda_n_value(a), a->loc, (int)msda_n_loc(a), a->ref, (int)msda_n_ref(a),
+        const int u8 = a->vdtype == MSDA_U8;
+        int e = msda_rpc_run(h, a->value, u8 ? 0 : (int)msda_n_value(a), a->value_u8, u8 ? (int)msda_n_value(a) : 0,
+                             a->vscale, u8 ? a->NV : 0, (const int32*)a->vzp, u8 ? a->NV : 0, a->loc, (int)msda_n_loc(a),
+                             a->ref, (int)msda_n_ref(a),
                              a->attw, (int)msda_n_attw(a), a->vis, a->vis ? (int)msda_n_vis(a) : 0, shape, ns, flags, a->out,
                              (int)msda_n_out(a), &us);
         double t1 = now_ms();
@@ -56,7 +59,7 @@ int main(int argc, char** argv) {
       char label[512];
       snprintf(label, sizeof label, "%s flags %d: dsp %.2f ms wall %.2f ms (min %.2f/%.2f)", argv[ci], flags, dsp[n / 2],
                wall[n / 2], dsp[0], wall[0]);
-      rc |= msda_compare(label, a->out, c.ref_out, msda_n_out(a), 5e-5);
+      rc |= msda_compare(label, a->out, c.ref_out, msda_n_out(a), msda_tol(a, 1));
     }
   }
   msda_rpc_close(h);

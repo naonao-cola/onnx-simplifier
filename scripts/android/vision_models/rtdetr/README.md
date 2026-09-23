@@ -135,43 +135,60 @@ against HF: max abs 4.7e-5, 195/195 detections. `dec_run.cpp` chains the pieces 
 in-process: rpcmem buffers, with ORT writing piece outputs straight into the buffers the DSP maps.
 `phone_split.py` pushes, runs it under the phone lock, and matches the detections.
 
-| split, 4 threads (`MSDA_FLAGS=4`) | pre | 3 msda calls (in-DSP) | mid0 + mid1 + post | total | matched |
-|---|---|---|---|---|---|
-| fp16 pre | 23.1 | 3.82 (3.08) | 3.30 | 30.8 ms | 194/195 |
-| front8 pre | 11.6 | 3.84 (3.22) | 3.11 | 19.1 ms | 182/195 |
-| **bb8enc16 pre** | 13.1 | 3.57 (2.94) | 3.07 | **20.5 ms** | **190/195** |
-| front8 pre, value_proj int8 too (`front8v`) | 11.2 | | | 18.9 ms | 173/195 |
+The value maps can go to the kernel as fp32 or as uint8 (`split.py quant --u8-values`: a per-tensor
+QuantizeLinear, min/max-calibrated at the end of `pre`'s fp16 value path; the scale and zero point
+are stored in the model's metadata, where `dec_run` reads them). The kernel's uint8 value input
+(`vdtype = MSDA_U8`) came from #1859's 89bad72e.
 
-The kernel costs 1.0 ms per layer in the DSP and 1.2 ms with FastRPC. It replaces ~31% of the
-fp16 profile (the MSDA gather and sampling), yet the split only matches all-HTP (20.5 vs 20.9 ms
-for bb8enc16). The cost moved into `pre`, which must now hand the 3 value maps (3 x 8400 x 256)
-over as graph outputs:
+| split | value maps | kernel flags | pre | 3 msda calls (in-DSP) | mid0 + mid1 + post | total | matched |
+|---|---|---|---|---|---|---|---|
+| fp16 pre | fp32 | 4 | 23.1 | 3.82 (3.08) | 3.30 | 30.8 ms | 194/195 |
+| front8 pre | fp32 | 4 | 11.6 | 3.84 (3.22) | 3.11 | 19.1 ms | 182/195 |
+| bb8enc16 pre | fp32 | 4 | 13.1 | 3.57 (2.94) | 3.07 | 20.5 ms | 190/195 |
+| **front8 pre** | **uint8** | 260 | 10.1 | 3.03 (2.41) | 3.04 | **16.6 ms** | 182/195 |
+| **bb8enc16 pre** | **uint8** | 260 | 11.8 | 3.03 (2.36) | 3.06 | **18.3 ms** | **189/195** |
+| front8 pre, value_proj int8 too (`front8v`) | fp32 | 4 | 11.2 | | | 18.9 ms | 173/195 |
+
+Flags 260 means 4 threads and 16-query jobs; with 4 threads and 32-query jobs the uint8 rows are
+0.3 ms slower. With uint8 values the kernel takes 0.8 ms per layer in the DSP and 1.0 ms with
+FastRPC (fp32: 1.0 and 1.2 ms).
+
+Where the split's time went: the kernel replaces ~31% of the fp16 profile (the MSDA gather and
+sampling), but `pre` must hand the 3 value maps (3 x 8400 x 256) over as graph outputs:
 
 | pre variant (front8), strict all-HTP | ms |
 |---|---|
 | no value maps (lower bound) | 6.67 |
-| value maps fp32 outputs (as run above) | 11.57 |
+| value maps fp32 outputs | 11.57 |
 | value maps fp16 outputs | 11.05 |
 | value maps uint8 outputs (fp16 value_proj, per-tensor Q) | 10.24 |
 | value_proj int8, value maps uint8 outputs | 8.85 (but int8 value_proj: 173/195) |
 
 - **Most of it is the value_proj compute.** The value_proj matmuls themselves (3 x 8400x256x256,
   fp16) run inside the all-HTP model too.
-- **uint8 value outputs are the lever.** For bb8enc16 they cut `pre` from 13.43 to 12.04 ms.
-- **The accuracy cost is small.** Simulated on the host with everything else fp32, per-tensor
-  uint8 value maps give 191/195 and per-channel 193/195.
+- **uint8 value maps are what makes the split win.** They cut the output bytes to a quarter and
+  make the kernel ~20% faster.
+- **They cost one detection:** 189 vs 190 for bb8enc16, and front8 is unchanged at 182. Simulated
+  on the host with everything else fp32, per-tensor uint8 value maps give 191/195 and per-channel
+  193/195, but the HTP emits per-tensor only.
 
-`split.py quant --policy bb8enc16 --u8-values` builds that pre piece (`pre.bb8enc16.v8.onnx`, value
-scale/zero point in its metadata). It waits for the kernel's uint8 value interface, which the
-kernel side is adding; with it the split should come to about 19 ms at bb8enc16's accuracy.
+### Summary: RT-DETR-r18vd on the Xiaomi 12S
+
+| configuration | frame ms | FPS | matched vs fp32 |
+|---|---|---|---|
+| fp16, all-HTP | 30.4 | 33 | 194/195 |
+| bb8enc16, all-HTP | 20.9 | 48 | 190/195 |
+| **bb8enc16 + decoder MSDA on the HVX (uint8 value maps)** | **18.3** | **55** | **189/195** |
+| front8, all-HTP | 19.3 | 52 | 183/195 |
+| front8 + decoder MSDA on the HVX (uint8 value maps) | 16.6 | 60 | 182/195 |
 
 Reproduce (after `export.py`):
 
 ```
 python3 msda_hvx/split.py check && python3 msda_hvx/split.py export && python3 msda_hvx/split.py dump
-python3 msda_hvx/split.py quant --policy bb8enc16
+python3 msda_hvx/split.py quant --policy bb8enc16 --u8-values   # -> pre.bb8enc16.v8.onnx
 HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... msda_hvx/build.sh          # skel + dec_run
-python3 msda_hvx/phone_split.py pre.bb8enc16.onnx
+MSDA_FLAGS=260 python3 msda_hvx/phone_split.py pre.bb8enc16.v8.onnx
 ```
 
 ## What a deploy spec / the demo app would need

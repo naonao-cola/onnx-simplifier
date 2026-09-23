@@ -66,14 +66,18 @@ static void thread_main(void* arg) {
 #define STACK_SIZE 65536 /* the HVX body keeps ~24 KB of tap lists and accumulators on the stack */
 static char stacks[MAX_THREADS][STACK_SIZE] __attribute__((aligned(128)));
 
-AEEResult msda_rpc_run(remote_handle64 h, const float* value, int valueLen, const float* loc, int locLen,
+AEEResult msda_rpc_run(remote_handle64 h, const float* value, int valueLen, const uint8* value_u8, int value_u8Len,
+                       const float* vscale, int vscaleLen, const int32* vzp, int vzpLen, const float* loc, int locLen,
                        const float* ref, int refLen, const float* attw, int attwLen, const uint8* vis, int visLen,
                        const int32* shape, int shapeLen, int32 flags, float* out, int outLen, uint64* dsp_us) {
   msda_args_t a;
   memset(&a, 0, sizeof a);
   const int has_vis = msda_shape_unpack(shape, shapeLen, &a);
-  a.value = value; a.loc = loc; a.ref = ref; a.attw = attw; a.vis = has_vis > 0 ? vis : 0; a.out = out;
-  if (has_vis < 0 || msda_check(&a) || valueLen < msda_n_value(&a) || locLen < msda_n_loc(&a) || refLen < msda_n_ref(&a) ||
+  a.value = value; a.value_u8 = value_u8; a.vscale = vscale; a.vzp = (const int32_t*)vzp;
+  a.loc = loc; a.ref = ref; a.attw = attw; a.vis = has_vis > 0 ? vis : 0; a.out = out;
+  const int u8 = a.vdtype == MSDA_U8;
+  if (has_vis < 0 || msda_check(&a) || (u8 ? value_u8Len : valueLen) < msda_n_value(&a) ||
+      (u8 && (vscaleLen < a.NV || vzpLen < a.NV)) || locLen < msda_n_loc(&a) || refLen < msda_n_ref(&a) ||
       attwLen < msda_n_attw(&a) || (has_vis && visLen < msda_n_vis(&a)) || outLen < msda_n_out(&a))
     return -1;
   unsigned long long t0 = HAP_perf_get_time_us();

@@ -10,6 +10,7 @@
 //   piece dir: <pre model file> (pre.sim.onnx: pixels f32 NCHW; pre.front8.onnx: uint8 NHWC image),
 //              mid0.sim.onnx mid1.sim.onnx post.sim.onnx
 //   image dir: pixels.f32 (1,3,640,640) or image.u8 (1,640,640,3), matching the pre model's input
+//   value maps: fp32, or uint8 with value{i}_scale / value{i}_zero_point in the pre model's metadata
 //   writes <image dir>/logits.f32 (300,80), boxes.f32 (300,4); prints per-step and total medians.
 // env: MSDA_URI, MSDA_FLAGS (threads | 256 * queries-per-job/16, default 4), QNN_PERF, QNN_EXTRA, ORT_LOG
 #include <onnxruntime_cxx_api.h>
@@ -153,8 +154,12 @@ static void run(Piece& P, const std::map<std::string, std::string>& alias = {}) 
 static remote_handle64 h_msda = 0;
 static unsigned long long last_dsp_us = 0;
 
+// Per value map: uint8 (scale, zero point) from the pre model's metadata (split.py --u8-values), or
+// absent for fp32 value maps.
+static std::map<std::string, std::pair<float, int32_t>> vq;
+
 // RT-DETR-r18 decoder cross-attention: 1 value map, 3 levels, 8 heads x 32, 4 points, 300 queries,
-// raw offsets + box reference points (MSDA_REF_BOX).
+// raw offsets + box reference points (MSDA_REF_BOX); fp32 or uint8 value map.
 static void msda(const std::string& value, const std::string& off, const std::string& w, const std::string& ref,
                  const std::string& out) {
   msda_args_t a;
@@ -167,16 +172,29 @@ static void msda(const std::string& value, const std::string& off, const std::st
   a.S = s;
   Buf &v = get(value), &o = get(off), &at = get(w), &r = get(ref);
   Buf& y = buf(out, {a.Q, a.M * a.D});
-  a.value = (const float*)v.p; a.loc = (const float*)o.p; a.attw = (const float*)at.p; a.ref = (const float*)r.p;
-  if ((long)v.bytes / 4 < msda_n_value(&a) || (long)o.bytes / 4 < msda_n_loc(&a) || (long)at.bytes / 4 < msda_n_attw(&a) ||
-      (long)r.bytes / 4 < msda_n_ref(&a))
+  const bool u8 = v.type == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+  float vscale = 1.0f;
+  int32 vzp = 0;
+  if (u8) {
+    auto it = vq.find(value.substr(value.find('/') + 1));
+    if (it == vq.end()) throw std::runtime_error("no uint8 scale/zero point for " + value);
+    vscale = it->second.first;
+    vzp = it->second.second;
+    a.vdtype = MSDA_U8;
+  }
+  a.loc = (const float*)o.p; a.attw = (const float*)at.p; a.ref = (const float*)r.p;
+  if ((long)v.bytes / (u8 ? 1 : 4) < msda_n_value(&a) || (long)o.bytes / 4 < msda_n_loc(&a) ||
+      (long)at.bytes / 4 < msda_n_attw(&a) || (long)r.bytes / 4 < msda_n_ref(&a))
     throw std::runtime_error("msda buffer too small");
   int32 shape[MSDA_SHAPE_LEN(MSDA_MAX_L)];
   const int ns = msda_shape_pack(&a, shape);
   uint64 us = 0;
   int flags = getenv("MSDA_FLAGS") ? atoi(getenv("MSDA_FLAGS")) : 4;
-  int rc = msda_rpc_run(h_msda, a.value, (int)msda_n_value(&a), a.loc, (int)msda_n_loc(&a), a.ref, (int)msda_n_ref(&a),
-                        a.attw, (int)msda_n_attw(&a), nullptr, 0, shape, ns, flags, (float*)y.p, (int)msda_n_out(&a), &us);
+  const long nv = msda_n_value(&a);
+  int rc = msda_rpc_run(h_msda, u8 ? nullptr : (const float*)v.p, u8 ? 0 : (int)nv, u8 ? (const uint8*)v.p : nullptr,
+                        u8 ? (int)nv : 0, u8 ? &vscale : nullptr, u8 ? 1 : 0, u8 ? &vzp : nullptr, u8 ? 1 : 0, a.loc,
+                        (int)msda_n_loc(&a), a.ref, (int)msda_n_ref(&a), a.attw, (int)msda_n_attw(&a), nullptr, 0, shape,
+                        ns, flags, (float*)y.p, (int)msda_n_out(&a), &us);
   if (rc) throw std::runtime_error("msda_rpc_run rc=" + std::to_string(rc));
   last_dsp_us = us;
 }
@@ -225,6 +243,19 @@ int main(int argc, char** argv) {
     }
     printf("sessions create_ms %.1f\n", tot_create);
     Piece& pre = pc["pre"];
+    {
+      Ort::AllocatorWithDefaultOptions al;
+      Ort::ModelMetadata md = pre.s->GetModelMetadata();
+      for (int i = 0; i < 3; ++i) {
+        const std::string v = "value" + std::to_string(i);
+        auto sc = md.LookupCustomMetadataMapAllocated((v + "_scale").c_str(), al);
+        auto zp = md.LookupCustomMetadataMapAllocated((v + "_zero_point").c_str(), al);
+        if (sc && zp) {
+          vq[v] = {strtof(sc.get(), nullptr), atoi(zp.get())};
+          printf("%s: uint8 scale %g zero point %d\n", v.c_str(), vq[v].first, vq[v].second);
+        }
+      }
+    }
     const bool u8 = pre.in_type[0] == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
     Buf& img = buf(pre.in[0], pre.in_shape[0], pre.in_type[0]);
 

@@ -25,7 +25,12 @@ int main(int argc, char** argv) {
     for (int v = 0; v < c.a.NV; v++) pts += (!c.a.vis || c.a.vis[(long)v * c.a.Q + q]) ? (long)c.a.M * c.a.L * c.a.P : 0;
   printf("%s: %d queries, %llu pcycles, %.0f per query, %.1f per point\n", argv[1], nq, t1 - t0, (double)(t1 - t0) / nq,
          (double)(t1 - t0) / (pts ? pts : 1));
-  int rc = msda_compare(argv[1], c.a.out, c.ref_out, (long)nq * c.a.M * c.a.D, 5e-5);
+#ifdef MSDA_HVX
+  const int hvx = msda_hvx_ok(&c.a);
+#else
+  const int hvx = 0;
+#endif
+  int rc = msda_compare(argv[1], c.a.out, c.ref_out, (long)nq * c.a.M * c.a.D, msda_tol(&c.a, hvx));
   printf(rc ? "FAIL\n" : "PASS\n");
   return rc;
 }

@@ -63,7 +63,11 @@ typedef struct {
   int mode;                                             /* MSDA_LOC / MSDA_REF_PIX / MSDA_REF_BOX */
   int NVR, RL, R, RD;                                   /* ref (NVR, Q, RL, R, RD): NVR 1 or NV, RL 1 or L,
                                                            point p uses entry p % R, RD 2 (x, y) or 4 (cx, cy, w, h) */
+  int vdtype;                                           /* MSDA_F32 (0): value; MSDA_U8 (1): value_u8 + vscale/vzp */
   const float* value;                                   /* (NV, S, C) channels-last */
+  const uint8_t* value_u8;                              /* (NV, S, C): real = (u8 - vzp[v]) * vscale[v] */
+  const float* vscale;                                  /* (NV) */
+  const int32_t* vzp;                                   /* (NV) */
   const float* loc;                                     /* (Q, M, NO, L, P, 2) locations (MSDA_LOC) or raw offsets */
   const float* ref;                                     /* unused for MSDA_LOC */
   const float* attw;                                    /* (Q, M, NO, L, P), softmaxed (over L*P, as the model does) */
@@ -80,16 +84,25 @@ void msda_run(const msda_args_t*, int q0, int q1);      /* queries [q0, q1); thr
 are already in this layout (`NO = 1`). The value is `value_proj(...)` channels-last per level,
 i.e. `(S, M*D)` with the levels concatenated, as mmcv's `value` is before its `.view(..., M, D)`.
 
-**Precision.** fp32 in and out; that's what the HTP pieces hand over. The HVX body computes in
-qf32, which differs from IEEE fp32 only by rounding. On real BEVFormer and synthetic RT-DETR
-calls it matches torch at rel <= 1.5e-5, cos 1.0. fp16 value maps would halve the L2 traffic and
-are the obvious next step; `vcvt` hf -> sf is V68+.
+**Precision.** Everything but the value maps is fp32 (offsets, weights, refs, output).
+
+The value maps are fp32 or uint8 (`vdtype`), with one scale / zero point per map. The HTP emits
+one per tensor, so pass the same pair for every map.
+- **fp32:** the HVX body computes in qf32, which differs from IEEE fp32 only by rounding. It
+  matches torch at rel <= 1.5e-5, cos 1.0.
+- **uint8:** reads a quarter of the bytes. The HVX body multiplies each tap's zero-extended bytes
+  by a Q15 weight into u32 accumulators (exact: sum <= 255 * 2^15 < 2^23). It dequantizes once
+  per (query, head, map): `(sum w*u8 - zp * sum w) * scale / 2^15`. Rounding each tap weight to
+  Q15 (<= 2^-16) costs up to ~2e-3 of max |out| on 100+ taps: cos >= 0.9999997 vs exact
+  dequantized math. Quantizing the values themselves costs much more: per tensor, cos 0.99985 -
+  0.99999 vs fp32 on real BEVFormer calls, 0.99994 on synthetic RT-DETR ones.
 
 **Which body runs.** `msda_run` uses the HVX body when all of these hold, else the scalar one:
 - `D == 32`, `M <= 32`;
 - `M * NO * L * P` is a multiple of 32 and at most 256;
 - every level has `H * W < 65536`;
-- `value`, `loc`, `attw` and `out` are 128-byte aligned.
+- for uint8, `C` is a multiple of 128;
+- the value buffer, `loc`, `attw` and `out` are 128-byte aligned.
 
 rpcmem buffers are page-aligned. Both bodies handle any valid shape correctly; the scalar one is
 just slow. The HVX body keeps ~24 KB on the stack; `msda_impl.c` gives its threads 64 KB. Batch > 1:
@@ -109,10 +122,11 @@ Building the next item's taps is pipelined behind the current MAC. With shared o
 ## FastRPC (`msda_rpc.idl`)
 
 ```
-run(value, loc, ref, attw, vis, shape, flags, rout result, rout dsp_us)
+run(value, value_u8, vscale, vzp, loc, ref, attw, vis, shape, flags, rout result, rout dsp_us)
 ```
-- `shape` is `msda_shape_pack()`'s int32 array: `NV L S M D P Q NO mode NVR RL R RD has_vis`,
+- `shape` is `msda_shape_pack()`'s int32 array: `NV L S M D P Q NO mode NVR RL R RD has_vis vdtype`,
   then `H W start` per level.
+- Pass `value` for fp32 and `value_u8` + `vscale` + `vzp` for uint8, the other(s) empty.
 - Pass empty sequences for `ref` (mode 0) and `vis` (all visible).
 - `flags`: bits 0-7 are threads (use 4); bits 8-15 are queries per job / 16 (default 32 queries).
 - Use rpcmem buffers so the DSP maps them instead of copying.
@@ -124,7 +138,9 @@ run(value, loc, ref, attw, vis, shape, flags, rout result, rout dsp_us)
 
 ```sh
 python3 msda_ref.py mmcv-check                                   # msda_reference vs mmcv's code
-for k in rtdetr_decoder bevformer_tsa bevformer_sca loc_small; do python3 msda_ref.py synth $k cases/$k; done
+for k in rtdetr_decoder bevformer_tsa bevformer_sca loc_small; do
+  python3 msda_ref.py synth $k cases/$k; python3 msda_ref.py synth $k cases/${k}_u8 --u8; done
+python3 msda_ref.py quantize-case <fp32 case> <out>             # a real call with uint8 values
 cc -O2 -o msda_host_check msda_host_check.c -lm && ./msda_host_check cases/*          # scalar body vs torch
 hexagon-clang -mv69 -mhvx -mhvx-length=128B -O2 msda_sim.c -o msda_sim.elf -lm -lhexagon
 hexagon-sim -mv69 --simulated_returnval msda_sim.elf -- cases/rtdetr_decoder            # HVX body vs torch
@@ -141,19 +157,28 @@ The synthetic cases mix in edge cases:
 - invisible maps;
 - a query no camera sees.
 
-hexagon-sim, all four kinds, HVX body: rel <= 1.5e-5, cos 1.000000000.
+hexagon-sim, all four kinds, HVX body:
+- fp32: rel <= 1.5e-5, cos 1.000000000.
+- uint8: within the Q15 bound above, cos >= 0.9999997.
 
 ## Phone (Xiaomi 12S, SM8475 / V69)
 
 Median of 10 under the host's phone lock. "DSP" is the kernel's time on the DSP (HAP timer);
-"wall" also includes the FastRPC call. Jobs are 32 queries unless noted. All match torch at
-rel <= 1.5e-5, cos 1.000000000.
+"wall" also includes the FastRPC call. Jobs are 32 queries unless noted. Every row matches its
+torch reference within the tolerances above.
 
-| call | shape | 1 thread | 4 threads (DSP / wall) |
-|---|---|---|---|
-| RT-DETR-r18 decoder cross-attention (synthetic) | Q 300, M 8, L 3 (80², 40², 20²), P 4, D 32, box refs | 4.07 / 4.47 | 1.34 / 1.83 (16-query jobs: 1.20 / 1.62) |
-| BEVFormer-tiny TSA (real frame) | Q 2500, 2 maps 50x50, per-map offsets, P 4 | 17.9 / 18.5 | 4.41 / 4.82 |
-| BEVFormer-tiny SCA (real frame) | Q 2500, 6 cameras 15x25, shared offsets, R 4, P 8, 19% visible | 14.1 / 14.6 | 3.98 / 4.42 |
+| call | shape | value | 1 thread DSP | 4 threads DSP / wall | 4 threads, 16-query jobs |
+|---|---|---|---|---|---|
+| RT-DETR-r18 decoder cross-attention (synthetic) | Q 300, M 8, L 3 (80², 40², 20²), P 4, D 32, box refs | fp32 | 3.94 | 1.42 / 1.74 | 1.28 / 1.60 |
+| | | **uint8** | 3.41 | **1.16 / 1.50** | **1.08 / 1.40** |
+| BEVFormer-tiny TSA (real frame) | Q 2500, 2 maps 50x50, per-map offsets, P 4 | fp32 | 17.3 | 4.52 / 4.89 | 4.89 / 5.26 |
+| | | uint8 | 12.7 | 4.10 / 4.45 | 4.34 / 4.68 |
+| BEVFormer-tiny SCA (real frame) | Q 2500, 6 cameras 15x25, shared offsets, R 4, P 8, 19% visible | fp32 | 13.5 | 4.12 / 4.47 | 4.33 / 4.69 |
+| | | uint8 | 13.1 | 4.27 / 4.63 | 4.48 / 4.84 |
+
+uint8 makes RT-DETR's decoder layer 18% faster and BEVFormer's TSA 9% faster. It also shrinks
+the value maps 4x for the HTP -> DSP handoff. The SCA is the exception (+4%): it dequantizes per
+(query, head, camera) over only 32 taps.
 
 The 6-thread results are within noise of 4. What made the HVX body fast, in hexagon-sim cycles
 per point (single thread), from a first scalar version at 168 cycles:
