@@ -1,0 +1,75 @@
+{
+ "report": {
+  "records": {
+   "0": 92,
+   "1": 91,
+   "2": 2189
+  },
+  "params_bytes": 66333,
+  "mcode_bytes": [
+   237368,
+   237272
+  ]
+ },
+ "inputs": {
+  "resnetv15_dense0_weight": [
+   1000,
+   512
+  ],
+  "resnetv15_dense0_weight__m": [
+   1000,
+   512
+  ],
+  "resnetv15_dense0_weight__v": [
+   1000,
+   512
+  ],
+  "resnetv15_dense0_bias": [
+   1000
+  ],
+  "resnetv15_dense0_bias__m": [
+   1000
+  ],
+  "resnetv15_dense0_bias__v": [
+   1000
+  ],
+  "data": [
+   16,
+   3,
+   224,
+   224
+  ],
+  "teacher_logits": [
+   16,
+   1000
+  ],
+  "labels_onehot": [
+   16,
+   1000
+  ],
+  "lr": [
+   1
+  ],
+  "m_correction": [
+   1
+  ],
+  "v_correction": [
+   1
+  ],
+  "batch_size": [
+   1
+  ]
+ },
+ "control_error": null,
+ "native_a_vs_native_b": {
+  "equal": false,
+  "max_abs_diff": 0.7812519073486328,
+  "error": null
+ },
+ "recalibrated_vs_native_b": {
+  "equal": true,
+  "max_abs_diff": 0.0,
+  "error": null
+ },
+ "health_after": true
+}
