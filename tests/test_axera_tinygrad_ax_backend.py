@@ -267,6 +267,21 @@ _MISC_COVERED = 38
 _MISC_CONDITIONAL = 53
 
 
+def _step_reshape_templated():
+    """Non-fused step Reshapes with a validated step template
+    (fixtures/reshape_step_templates/manifest.json)."""
+    n = 0
+    for r in _step_records():
+        if r["op"] != "Reshape":
+            continue
+        try:
+            axb.rre.step_template(r["shapes"][0], r["attrs"]["out"])
+        except ValueError:
+            continue
+        n += 1
+    return n
+
+
 def test_coverage_report_on_the_resnet18_step():
     report = axb.coverage_report(_step_records())
     assert report["nodes"] == 1104
@@ -299,10 +314,13 @@ def test_coverage_report_on_the_resnet18_step():
     # Live-operand MatMul/Gemm/Conv nodes with a step template move from
     # refused to conditional (fixtures/matmul_step_templates/manifest.json).
     live = len(axb.mre.step_manifest()["nodes"])
+    rs = _step_reshape_templated()
+    want_rs = {"conditional": 18 + rs, "refused": 152 - rs}
+    assert report["per_op"]["Reshape"] == {k: v for k, v in want_rs.items() if v}
     assert report["totals"] == {
         "covered": 82 + _MISC_COVERED,
-        "conditional": 324 + live + _MISC_CONDITIONAL,
-        "refused": 698 - live - _MISC_COVERED - _MISC_CONDITIONAL,
+        "conditional": 324 + live + _MISC_CONDITIONAL + rs,
+        "refused": 698 - live - _MISC_COVERED - _MISC_CONDITIONAL - rs,
     }
 
 
@@ -506,10 +524,13 @@ def test_coverage_report_weight_dtypes_on_the_resnet18_step():
     # Live-operand MatMul/Gemm/Conv nodes with a step template move from
     # refused to conditional (fixtures/matmul_step_templates/manifest.json).
     live = len(axb.mre.step_manifest()["nodes"])
+    rs = _step_reshape_templated()
+    want_rs = {"conditional": 18 + rs, "refused": 152 - rs}
+    assert report["per_op"]["Reshape"] == {k: v for k, v in want_rs.items() if v}
     assert report["totals"] == {
         "covered": 82 + _MISC_COVERED,
-        "conditional": 324 + live + _MISC_CONDITIONAL,
-        "refused": 698 - live - _MISC_COVERED - _MISC_CONDITIONAL,
+        "conditional": 324 + live + _MISC_CONDITIONAL + rs,
+        "refused": 698 - live - _MISC_COVERED - _MISC_CONDITIONAL - rs,
     }
     assert len(report["per_node"]) == 1104
     # no weight in the training step is a constant: a weight dtype choice

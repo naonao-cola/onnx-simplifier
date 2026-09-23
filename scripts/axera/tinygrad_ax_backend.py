@@ -62,6 +62,7 @@ import llm_build_dtype_analysis as lbd  # noqa: E402
 import matmul_record_emit as mre  # noqa: E402
 import memory_emit  # noqa: E402
 import misc_op_record_emit as misc  # noqa: E402
+import reshape_record_emit as rre  # noqa: E402
 import transpose_real_shapes  # noqa: E402
 
 TOOLCHAIN = "pulsar2:7.0-lite"
@@ -1026,7 +1027,17 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
                     "bias flatten fuses into its neighbour (reshape_emit.py, "
                     "Relu-neighbour pairs only)",
                 )
-            return ("refused", "non-fused Reshape emits real DMA MCode (undecoded)")
+            try:
+                rre.step_template(shape, out)
+            except ValueError:
+                return ("refused", "non-fused Reshape: no validated step template")
+            # reshape_record_emit.retarget_scale: scale lanes and zero point;
+            # a zero point of 0 compiles to a different program.
+            return (
+                "conditional",
+                "Reshape step template retargeted to the calibration if its "
+                "zero point is nonzero",
+            )
         return ("refused", f"no template or edit for {op}")
     except ValueError as exc:
         return ("refused", str(exc))

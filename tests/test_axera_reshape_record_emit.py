@@ -126,3 +126,54 @@ def test_fit_poly_needs_a_spare_point():
     assert rre.fit_poly([1, 2, 3, 4], [1, 4, 9, 16]) == [0, 0, 1]
     assert rre.fit_poly([1, 2], [5, 7]) is None
     assert rre.fit_poly([1, 2, 3], [5, 7, 9]) == [3, 2]
+
+
+# --- ResNet18 step Reshape templates (fixtures/reshape_step_templates) ---
+
+_STEP_MANIFEST = rre.step_manifest()
+
+
+def _same_program(got, want):
+    d = rre.compare_mcode(got, want)
+    return d["same_length"] and not d["record_diffs"] and not d["tail_byte_diffs"]
+
+
+@pytest.mark.parametrize("key", sorted(_STEP_MANIFEST["templates"]))
+def test_step_template_retargets_onto_its_other_calibration(key):
+    t = _STEP_MANIFEST["templates"][key]
+    a = _mcode(os.path.join(rre.STEP_TEMPLATE_DIR, t["axmodel"]))
+    b = _mcode(os.path.join(rre.STEP_TEMPLATE_DIR, t["check"]["axmodel"]))
+    assert not _same_program(a, b)
+    c = t["check"]
+    assert _same_program(rre.retarget_scale(a, c["scale"], c["zero_point"]), b)
+    assert _same_program(rre.retarget_scale(b, t["scale"], t["zero_point"]), a)
+
+
+@pytest.mark.parametrize("name", sorted(_STEP_MANIFEST["zero_point_probes"]))
+def test_step_template_retargets_to_an_asymmetric_range(name):
+    p = _STEP_MANIFEST["zero_point_probes"][name]
+    assert p["zero_point"] not in (0, 128)
+    t = _STEP_MANIFEST["templates"][p["template"]]
+    a = _mcode(os.path.join(rre.STEP_TEMPLATE_DIR, t["axmodel"]))
+    want = _mcode(os.path.join(rre.STEP_TEMPLATE_DIR, p["axmodel"]))
+    assert _same_program(rre.retarget_scale(a, p["scale"], p["zero_point"]), want)
+    assert _same_program(rre.retarget_scale(want, t["scale"], t["zero_point"]), a)
+
+
+def test_step_template_refuses_a_zero_zero_point():
+    t = _STEP_MANIFEST["templates"][sorted(_STEP_MANIFEST["templates"])[0]]
+    a = _mcode(os.path.join(rre.STEP_TEMPLATE_DIR, t["axmodel"]))
+    with pytest.raises(ValueError, match="nonzero"):
+        rre.retarget_scale(a, 0.9 / 255, 0)
+
+
+def test_emit_step_reshape_and_unknown_shape(tmp_path):
+    key = sorted(_STEP_MANIFEST["templates"])[0]
+    t = _STEP_MANIFEST["templates"][key]
+    si, so = ([int(x) for x in s.split("x")] for s in key.split("->"))
+    out = tmp_path / "r.axmodel"
+    m = rre.emit_step_reshape(si, so, t["check"]["scale"], 128, str(out))
+    b = _mcode(os.path.join(rre.STEP_TEMPLATE_DIR, t["check"]["axmodel"]))
+    assert _same_program(rre.mcode_of(m), b) and out.exists()
+    with pytest.raises(ValueError, match="no validated step Reshape template"):
+        rre.step_template([3, 5], [15])
