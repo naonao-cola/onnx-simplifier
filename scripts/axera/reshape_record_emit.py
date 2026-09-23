@@ -304,6 +304,9 @@ def predict_mcode(rules: Rules, param: int, scale: float | None = None) -> bytes
 ZP_REGS = frozenset(r.to_bytes(2, "little") for r in (0x1B10, 0x1EB0, 0x1A90))
 """Registers holding the uint8 zero point (MinMax: ``round(-lo / s)``); a
 non-fused Reshape -> Relu writes each once with the calibrated value."""
+GATHER_ZP_REGS = frozenset(r.to_bytes(2, "little") for r in (0x1B10, 0x1A90))
+"""A standalone last-axis Gather (``memory_emit``) writes its one shared zero
+point to these two only."""
 
 
 def _lane_values(raw: bytes) -> dict[int, bytes]:
@@ -316,7 +319,12 @@ def _lane_values(raw: bytes) -> dict[int, bytes]:
     }
 
 
-def retarget_scale(mc: bytes, scale: float, zero_point: int | None = None) -> bytes:
+def retarget_scale(
+    mc: bytes,
+    scale: float,
+    zero_point: int | None = None,
+    zp_regs: frozenset = ZP_REGS,
+) -> bytes:
     """``mc`` with its calibration moved to ``(scale, zero_point)``.
 
     Every scale-lane record holds ``1/s`` or ``s`` of the one calibration: an
@@ -327,7 +335,9 @@ def retarget_scale(mc: bytes, scale: float, zero_point: int | None = None) -> by
 
     A zero point of 0 compiles to a different program (the zero-point write
     is elided and the stream changes), so moving to 0 is refused. Raises
-    ``ValueError`` when the lanes or zero points are not of that shape."""
+    ``ValueError`` when the lanes or zero points are not of that shape.
+    ``zp_regs`` is the set of registers the program writes its zero point to
+    (a last-axis Gather writes only 0x1b10/0x1a90: ``GATHER_ZP_REGS``)."""
     s32 = struct.unpack("<f", _f32(scale))[0]
     out, seen = mc, False
     for s, raw in enumerate(suc.decode_segments(mc)):
@@ -335,10 +345,10 @@ def retarget_scale(mc: bytes, scale: float, zero_point: int | None = None) -> by
         if not lanes:
             continue
         seen = True
-        first = lanes[min(lanes)]
-        old_s = struct.unpack("<f", first)[0]
-        inv, fwd = first, _f32(1.0 / old_s)
-        if set(lanes.values()) - {inv, fwd} or len(lanes) % 8:
+        inv = lanes[min(lanes)]
+        # the other lane value is s; it need not be exactly f32(1 / inv)
+        # (a Gather template stores 1/s = 141.6667 next to s = 0.00705882)
+        if len(set(lanes.values()) - {inv}) > 1 or len(lanes) % 8:
             raise ValueError(f"segment {s}: scale lanes are not one (1/s, s) pair")
         new = bytearray(raw)
         for k, v in lanes.items():
@@ -350,7 +360,7 @@ def retarget_scale(mc: bytes, scale: float, zero_point: int | None = None) -> by
                 k
                 for k in range(len(raw) // RECORD)
                 if raw[k * RECORD] == 0xA1
-                and raw[k * RECORD + 2 : k * RECORD + 4] in ZP_REGS
+                and raw[k * RECORD + 2 : k * RECORD + 4] in zp_regs
                 and raw[k * RECORD + 4 : (k + 1) * RECORD] != bytes(4)
             ]
             regs = {raw[k * RECORD + 2 : k * RECORD + 4] for k in zps}
@@ -358,7 +368,7 @@ def retarget_scale(mc: bytes, scale: float, zero_point: int | None = None) -> by
                 int.from_bytes(raw[k * RECORD + 4 : (k + 1) * RECORD], "little")
                 for k in zps
             }
-            if regs != ZP_REGS or len(old) != 1:
+            if regs != zp_regs or len(old) != 1:
                 raise ValueError(f"segment {s}: zero-point records {zps} {sorted(old)}")
             if not 0 < zero_point < 256:
                 raise ValueError(
@@ -495,14 +505,18 @@ def emit_step_reshape(
     calibration ``(scale, zero_point)``. A zero point of 0 needs its own
     template (``step_template_zp0``; a different program, see
     ``retarget_scale``)."""
+    import step_recalibrate
+
     if zero_point == 0:
         entry = step_template_zp0(in_shape, out_shape)
         model = load_axmodel(entry["axmodel"])
-        _neu(model).raw_data = retarget_scale(mcode_of(model), scale)
+        mc = retarget_scale(mcode_of(model), scale)
     else:
         entry = step_template(in_shape, out_shape)
         model = load_axmodel(entry["axmodel"])
-        _neu(model).raw_data = retarget_scale(mcode_of(model), scale, zero_point)
+        mc = retarget_scale(mcode_of(model), scale, zero_point)
+    # re-encoding can change the blob length; the runtime reads it from dims
+    model = step_recalibrate.with_mcode(model, mc)
     if output_path:
         onnx.save(model, output_path)
     return model

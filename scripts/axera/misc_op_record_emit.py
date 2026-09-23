@@ -567,9 +567,10 @@ def emit_model(
         if scales or zero_points:
             raise ValueError(f"{meta['op']} is not quantized; no calibration")
         return model
-    init = mcode_initializer(model)
-    init.raw_data = retarget(
-        bytes(init.raw_data),
+    import step_recalibrate
+
+    mc = retarget(
+        bytes(mcode_initializer(model).raw_data),
         meta["op"],
         meta["scales"],
         scales or meta["scales"],
@@ -577,7 +578,9 @@ def emit_model(
         zero_points or meta["zero_points"],
         meta.get("reduce_count"),
     )
-    return model
+    # a zero-point move can change the blob length: the runtime reads the
+    # MCode size from the initializer's dims (0x80300709 on load otherwise)
+    return step_recalibrate.with_mcode(model, mc)
 
 
 # ReduceSum nodes Pulsar2 cannot tile ("Can not tile", also inside the step's
