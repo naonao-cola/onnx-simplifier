@@ -14,8 +14,12 @@ against a verbatim copy, `mmcv_msda_pytorch`), with mmcv's (Q, M, L, P) layouts 
   vis   (NV, Q) uint8 or None visibility; the output averages over the visible maps
   -> out (Q, M*D)
 
-usage: msda_ref.py synth <kind> <out dir> [--q N] [--seed S]   kind: rtdetr_decoder, bevformer_tsa,
-                                                                bevformer_sca, loc_small
+uint8 value maps (vdtype 1): `quantize(value)` gives uint8 + one scale / zero point (per tensor, as
+the HTP emits them; per map optional), `dequantize` the values the kernel sees.
+
+usage: msda_ref.py synth <kind> <out dir> [--q N] [--seed S] [--u8]   kind: rtdetr_decoder,
+                                                                bevformer_tsa, bevformer_sca, loc_small
+       msda_ref.py quantize-case <fp32 case dir> <out dir>    the same call with uint8 values (per tensor)
        msda_ref.py mmcv-check                                 msda_reference vs mmcv's code
 """
 
@@ -126,10 +130,43 @@ def mmcv_msda_pytorch(
     return output.transpose(1, 2).contiguous()
 
 
+def quantize(value, per_map=False):
+    """uint8 asymmetric quantization of value (NV, S, C): (u8, scales [NV], zero points [NV])."""
+    nv = value.shape[0]
+    groups = [value[v] for v in range(nv)] if per_map else [value]
+    qs, sc, zp = [], [], []
+    for g in groups:
+        lo, hi = min(float(g.min()), 0.0), max(float(g.max()), 0.0)
+        s_ = (hi - lo) / 255.0 or 1.0
+        z = int(round(-lo / s_))
+        qs.append(torch.clamp(torch.round(g / s_) + z, 0, 255).to(torch.uint8))
+        sc.append(s_)
+        zp.append(z)
+    u8 = torch.stack(qs) if per_map else qs[0]
+    return u8, (sc if per_map else sc * nv), (zp if per_map else zp * nv)
+
+
+def dequantize(u8, scales, zps):
+    return torch.stack(
+        [(u8[v].float() - zps[v]) * scales[v] for v in range(u8.shape[0])]
+    )
+
+
 def save_case(
-    d: Path, value, levels, loc, attw, out, mode="loc", ref=None, vis=None, starts=None
+    d: Path,
+    value,
+    levels,
+    loc,
+    attw,
+    out,
+    mode="loc",
+    ref=None,
+    vis=None,
+    starts=None,
+    vq=None,
 ):
-    """One kernel call as msda_io.h reads it."""
+    """One kernel call as msda_io.h reads it. vq = (u8, scales, zero points) for a uint8 value map
+    (value then only gives the shape)."""
     d = Path(d)
     d.mkdir(parents=True, exist_ok=True)
     nv, s, c = value.shape
@@ -141,7 +178,10 @@ def save_case(
         else (ref.shape[0], ref.shape[2], ref.shape[3], ref.shape[4])
     )
     f32 = lambda t: np.ascontiguousarray(t.detach().numpy(), np.float32)  # noqa: E731
-    f32(value).tofile(d / "value.f32")
+    if vq is None:
+        f32(value).tofile(d / "value.f32")
+    else:
+        np.ascontiguousarray(vq[0].numpy(), np.uint8).tofile(d / "value.u8")
     f32(loc).tofile(d / "loc.f32")
     f32(attw).tofile(d / "attw.f32")
     f32(out).tofile(d / "ref_out.f32")
@@ -150,10 +190,39 @@ def save_case(
     if vis is not None:
         np.ascontiguousarray(vis.numpy(), np.uint8).tofile(d / "vis.u8")
     lines = [
-        f"{nv} {nl} {s} {m} {c // m} {p} {q} {no} {MODES[mode]} {nvr} {rl} {r} {rd} {int(vis is not None)}"
+        f"{nv} {nl} {s} {m} {c // m} {p} {q} {no} {MODES[mode]} {nvr} {rl} {r} {rd} {int(vis is not None)} "
+        f"{int(vq is not None)}"
     ]
     lines += [f"{h} {w} {s0}" for (h, w), s0 in zip(levels, starts)]
+    if vq is not None:
+        lines += [f"{sc!r} {z}" for sc, z in zip(vq[1], vq[2])]
     (d / "meta.txt").write_text("\n".join(lines) + "\n")
+
+
+def load_case(d: Path):
+    """save_case's fp32 case directory -> (value, levels, loc, attw, mode, ref, vis, starts)."""
+    d = Path(d)
+    lines = (d / "meta.txt").read_text().split("\n")
+    nv, nl, s, m, dd, p, q, no, mode, nvr, rl, r, rd, has_vis, vdtype = map(
+        int, lines[0].split()
+    )
+    assert vdtype == 0, "fp32 cases only"
+    lv = [tuple(map(int, ln.split())) for ln in lines[1 : 1 + nl]]
+    levels, starts = [(h, w) for h, w, _ in lv], [s0 for _, _, s0 in lv]
+    f = lambda n, *shape: torch.from_numpy(
+        np.fromfile(d / n, np.float32).reshape(shape)
+    )  # noqa: E731
+    value = f("value.f32", nv, s, m * dd)
+    loc = f("loc.f32", q, m, no, nl, p, 2)
+    attw = f("attw.f32", q, m, no, nl, p)
+    mode_name = {v: k for k, v in MODES.items()}[mode]
+    ref = f("ref.f32", nvr, q, rl, r, rd) if mode else None
+    vis = (
+        torch.from_numpy(np.fromfile(d / "vis.u8", np.uint8).reshape(nv, q))
+        if has_vis
+        else None
+    )
+    return value, levels, loc, attw, mode_name, ref, vis, starts
 
 
 def synthetic(kind: str, q: int | None = None, seed: int = 0):
@@ -233,14 +302,42 @@ def main():
     s.add_argument("out")
     s.add_argument("--q", type=int)
     s.add_argument("--seed", type=int, default=0)
+    s.add_argument(
+        "--u8", action="store_true", help="uint8 value maps, one scale per tensor"
+    )
+    qc = sub.add_parser("quantize-case")
+    qc.add_argument("src")
+    qc.add_argument("out")
     sub.add_parser("mmcv-check")
     a = ap.parse_args()
     torch.set_grad_enabled(False)
     if a.cmd == "synth":
         value, levels, loc, attw, mode, ref, vis = synthetic(a.kind, a.q, a.seed)
+        vq, note = None, ""
+        if a.u8:
+            vq = quantize(value)
+            f = msda_reference(value, levels, loc, attw, mode, ref, vis)
+            value = dequantize(*vq)
         out = msda_reference(value, levels, loc, attw, mode, ref, vis)
-        save_case(Path(a.out), value, levels, loc, attw, out, mode, ref, vis)
-        print(f"{a.kind}: Q {loc.shape[0]} levels {levels} -> {a.out}")
+        if a.u8:
+            cs = float((out * f).sum() / (out.norm() * f.norm()))
+            note = f"; uint8 vs fp32 value: cos {cs:.6f}"
+        save_case(Path(a.out), value, levels, loc, attw, out, mode, ref, vis, vq=vq)
+        print(f"{a.kind}: Q {loc.shape[0]} levels {levels} -> {a.out}{note}")
+    elif a.cmd == "quantize-case":
+        value, levels, loc, attw, mode, ref, vis, starts = load_case(Path(a.src))
+        f = torch.from_numpy(
+            np.fromfile(Path(a.src) / "ref_out.f32", np.float32)
+        ).reshape(loc.shape[0], -1)
+        vq = quantize(value)
+        out = msda_reference(dequantize(*vq), levels, loc, attw, mode, ref, vis, starts)
+        save_case(
+            Path(a.out), value, levels, loc, attw, out, mode, ref, vis, starts, vq=vq
+        )
+        cs = float((out * f).sum() / (out.norm() * f.norm()))
+        print(
+            f"{a.out}: uint8 values (scale {vq[1][0]:.5g}, zero point {vq[2][0]}) vs fp32: cos {cs:.6f}"
+        )
     else:
         value, levels, loc, attw, _, _, _ = synthetic("loc_small")
         m = loc.shape[1]

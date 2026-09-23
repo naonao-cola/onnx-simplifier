@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
     msda_run_scalar(&c.a, 0, c.a.Q);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     printf("[%.1f ms host] ", (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
-    rc |= msda_compare(argv[i], c.a.out, c.ref_out, msda_n_out(&c.a), 5e-5);
+    rc |= msda_compare(argv[i], c.a.out, c.ref_out, msda_n_out(&c.a), msda_tol(&c.a, 0));
   }
   printf(rc ? "FAIL\n" : "PASS\n");
   return rc;

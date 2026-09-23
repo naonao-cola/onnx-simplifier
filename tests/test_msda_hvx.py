@@ -7,7 +7,8 @@
 * ``msda_kernel.h``'s scalar body (``msda_host_check.c``, host C compiler) matches the torch
   reference on synthetic model-shaped cases -- RT-DETR-r18's decoder (box references, 3 levels),
   both BEVFormer calls, mmcv's plain locations -- with edge cases mixed in: points off the map,
-  coordinates on pixel centers / borders, invisible maps, a query no map sees.
+  coordinates on pixel centers / borders, invisible maps, a query no map sees; each with fp32 and
+  with uint8 value maps (one scale / zero point per tensor, as the HTP emits).
 * The HVX qf32 body (``msda_sim.c``) on ``hexagon-sim`` for the same cases, only when
   ``HEXAGON_TOOLS`` points at a Hexagon toolchain (qemu can't decode HVX float).
 """
@@ -101,7 +102,14 @@ def _cases(tmp_path: Path) -> list[str]:
         value, levels, loc, attw, mode, ref, vis = msda_ref.synthetic(kind)
         y = msda_ref.msda_reference(value, levels, loc, attw, mode, ref, vis)
         msda_ref.save_case(tmp_path / kind, value, levels, loc, attw, y, mode, ref, vis)
-        out.append(str(tmp_path / kind))
+        vq = msda_ref.quantize(value)
+        yq = msda_ref.msda_reference(
+            msda_ref.dequantize(*vq), levels, loc, attw, mode, ref, vis
+        )
+        msda_ref.save_case(
+            tmp_path / f"{kind}_u8", value, levels, loc, attw, yq, mode, ref, vis, vq=vq
+        )
+        out += [str(tmp_path / kind), str(tmp_path / f"{kind}_u8")]
     return out
 
 
