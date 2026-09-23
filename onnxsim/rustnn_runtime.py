@@ -267,9 +267,17 @@ class _Lowering:
     only ever read as attributes) or as a WebNN ``MLOperand``."""
 
     def __init__(
-        self, builder, graph: onnx.GraphProto, input_shapes: Mapping[str, Sequence[int]]
+        self,
+        builder,
+        graph: onnx.GraphProto,
+        input_shapes: Mapping[str, Sequence[int]],
+        coreml: bool = False,
     ):
         self.b = builder
+        # rustnn 0.5.12's Core ML backend drops conv/gemm biases, needs an
+        # explicit pad value, only has int32 arg-reductions, and mis-handles
+        # a few ops outright; see _COREML_NOTES and build_webnn_graph.
+        self.coreml = coreml
         self.consts: Dict[str, np.ndarray] = {
             init.name: numpy_helper.to_array(init) for init in graph.initializer
         }
@@ -417,20 +425,37 @@ class _Lowering:
     def _op_Cast(self, node, a, x):
         return self.b.cast(x(), _webnn_dtype(a["to"]))
 
+    def _reject_on_coreml(self, node, why: str):
+        if self.coreml:
+            raise WebnnLoweringError(
+                f"{node.op_type}: not supported on rustnn's Core ML backend ({why})"
+            )
+
+    def _add_bias(self, out, bias, channel_axis: int):
+        """``out + bias`` with a 1-D ``bias`` broadcast along ``channel_axis``
+        -- the Core ML workaround for the fused bias rustnn 0.5.12 drops."""
+        shape = [1] * len(out.shape)
+        shape[channel_axis] = int(bias.shape[0])
+        return self.b.add(out, self.b.reshape(bias, shape))
+
     def _op_Where(self, node, a, x):
+        self._reject_on_coreml(node, "MIL select rejects WebNN's uint8 condition")
         return self.b.where_(x(0), x(1), x(2))
 
     def _op_Gemm(self, node, a, x):
         c = x(2) if len(node.input) > 2 and node.input[2] else None
-        return self.b.gemm(
-            x(0),
-            x(1),
-            c=c,
-            alpha=a.get("alpha", 1.0),
-            beta=a.get("beta", 1.0),
+        alpha, beta = a.get("alpha", 1.0), a.get("beta", 1.0)
+        kwargs = dict(
+            alpha=alpha,
             a_transpose=bool(a.get("transA", 0)),
             b_transpose=bool(a.get("transB", 0)),
         )
+        if self.coreml and c is not None:
+            out = self.b.gemm(x(0), x(1), **kwargs)
+            if beta != 1.0:
+                c = self.b.mul(c, self.b.constant(np.array(beta, np.float32)))
+            return self.b.add(out, c)
+        return self.b.gemm(x(0), x(1), c=c, beta=beta, **kwargs)
 
     def _spatial(
         self, node, a, kernel: Sequence[int], in_hw: Sequence[int], transpose=False
@@ -479,15 +504,16 @@ class _Lowering:
         kernel = self.shape(w)[2:]
         strides, dilations, pads = self._spatial(node, a, kernel, self.shape(inp)[2:])
         bias = x(2) if len(node.input) > 2 and node.input[2] else None
-        return self.b.conv2d(
+        out = self.b.conv2d(
             inp,
             w,
             strides=strides,
             dilations=dilations,
             pads=pads,
             groups=a.get("group", 1),
-            bias=bias,
+            bias=None if self.coreml else bias,
         )
+        return self._add_bias(out, bias, 1) if self.coreml and bias is not None else out
 
     def _op_ConvTranspose(self, node, a, x):
         inp, w = x(0), x(1)
@@ -501,7 +527,7 @@ class _Lowering:
             kwargs["output_padding"] = list(a["output_padding"])
         if "output_shape" in a:
             kwargs["output_sizes"] = list(a["output_shape"])[-2:]
-        return self.b.conv_transpose2d(
+        out = self.b.conv_transpose2d(
             inp,
             w,
             strides=strides,
@@ -509,9 +535,10 @@ class _Lowering:
             pads=pads,
             groups=a.get("group", 1),
             filter_layout="iohw",
-            bias=bias,
+            bias=None if self.coreml else bias,
             **kwargs,
         )
+        return self._add_bias(out, bias, 1) if self.coreml and bias is not None else out
 
     def _pool(self, node, a, x, fn):
         inp = x()
@@ -593,6 +620,7 @@ class _Lowering:
         )
 
     def _op_LayerNormalization(self, node, a, x):
+        self._reject_on_coreml(node, "rustnn 0.5.12 computes wrong values")
         if len([o for o in node.output if o]) > 1:
             raise WebnnLoweringError(
                 "LayerNormalization: Mean/InvStdDev outputs are not supported"
@@ -699,6 +727,8 @@ class _Lowering:
         steps = [int(v) for v in c] if c is not None else [1] * len(starts)
         full_starts, sizes, strides = [0] * len(shape), list(shape), [1] * len(shape)
         for ax, s, e, st in zip(axes, starts, ends, steps):
+            if st != 1:
+                self._reject_on_coreml(node, "rustnn ignores slice strides there")
             if st <= 0:
                 raise WebnnLoweringError(
                     "Slice: negative/zero steps are not supported by WebNN"
@@ -764,6 +794,9 @@ class _Lowering:
         kwargs = {"mode": mode}
         if value is not None and value.size:
             kwargs["value"] = float(value.reshape(-1)[0])
+        elif self.coreml:
+            # MIL pad requires constant_val; rustnn only emits it when set.
+            kwargs["value"] = 0.0
         # pywebnn takes ONNX's own [begin_0.., end_0..] layout as one list.
         return self.b.pad(inp, [int(p) for p in pads], **kwargs)
 
@@ -777,7 +810,8 @@ class _Lowering:
             inp,
             a.get("axis", 0) % len(inp.shape),
             keep_dimensions=bool(a.get("keepdims", 1)),
-            output_data_type="int64",
+            # Core ML has no int64 tensors; RustnnSession.run casts back.
+            output_data_type="int32" if self.coreml else "int64",
         )
 
     def _op_ArgMax(self, node, a, x):
@@ -787,22 +821,23 @@ class _Lowering:
         return self._arg(node, a, x, self.b.arg_min)
 
 
-def build_webnn_graph(
+def _is_coreml(context) -> bool:
+    try:
+        return context.backend_info().get("backend") == "coreml"
+    except Exception:
+        return False
+
+
+def _build(
     context,
     model: onnx.ModelProto,
-    input_shapes: Optional[Mapping[str, Sequence[int]]] = None,
-):
-    """Lowers ``model``'s main graph onto a fresh ``MLGraphBuilder`` from
-    ``context`` (a ``webnn.MLContext``) and builds it.
-
-    :param input_shapes: static shapes for graph inputs whose ONNX shape has
-            symbolic dimensions.
-    :raises WebnnLoweringError: an op, dtype, or attribute combination WebNN
-            can't express, or a shape-like input that isn't constant.
-    :returns: the built ``webnn.MLGraph``.
-    """
+    input_shapes: Optional[Mapping[str, Sequence[int]]],
+) -> Tuple[Any, Dict[str, List[int]]]:
+    """:func:`build_webnn_graph`, plus the logical shape of each graph output
+    the Core ML path flattened (see below)."""
+    coreml = _is_coreml(context)
     builder = context.create_graph_builder()
-    lowering = _Lowering(builder, model.graph, input_shapes or {})
+    lowering = _Lowering(builder, model.graph, input_shapes or {}, coreml=coreml)
     for node in model.graph.node:
         try:
             lowering.lower(node)
@@ -815,14 +850,46 @@ def build_webnn_graph(
             raise WebnnLoweringError(
                 f"rustnn rejected {node.op_type} node {label!r}: {e}"
             ) from e
-    outputs = {}
+    outputs, shapes = {}, {}
     for vi in model.graph.output:
         op = lowering.operand(vi.name)
         # WebNN graph outputs must be computed operands, not inputs/constants.
         if vi.name in lowering.consts or vi.name in lowering.input_dtypes:
             op = builder.identity(op)
+        if coreml and len(op.shape) > 1:
+            # rustnn 0.5.12 reads Core ML float32 outputs as contiguous and
+            # ignores MLMultiArray.strides, but ANE-produced outputs have
+            # 64-byte-aligned rows. A 1-D output has no row padding, so
+            # flatten here and let RustnnSession.run reshape it back.
+            shapes[vi.name] = _Lowering.shape(op)
+            op = builder.reshape(op, [int(np.prod(shapes[vi.name]))])
         outputs[vi.name] = op
-    return builder.build(outputs)
+    return builder.build(outputs), shapes
+
+
+def build_webnn_graph(
+    context,
+    model: onnx.ModelProto,
+    input_shapes: Optional[Mapping[str, Sequence[int]]] = None,
+):
+    """Lowers ``model``'s main graph onto a fresh ``MLGraphBuilder`` from
+    ``context`` (a ``webnn.MLContext``) and builds it.
+
+    On rustnn's Core ML backend (``backend_info()["backend"] == "coreml"``,
+    what pywebnn 0.5.12 picks for ``device_type="npu"``) the lowering works
+    around that backend's bugs: conv/gemm biases become explicit adds, pads
+    always carry a value, arg-reductions return int32, and every output is
+    flattened to 1-D (use :class:`RustnnSession`, which reshapes them back).
+    Ops it computes wrongly there (``Where``, ``LayerNormalization``,
+    strided ``Slice``) raise :class:`WebnnLoweringError` instead.
+
+    :param input_shapes: static shapes for graph inputs whose ONNX shape has
+            symbolic dimensions.
+    :raises WebnnLoweringError: an op, dtype, or attribute combination WebNN
+            can't express, or a shape-like input that isn't constant.
+    :returns: the built ``webnn.MLGraph``.
+    """
+    return _build(context, model, input_shapes)[0]
 
 
 @dataclass(frozen=True)
@@ -878,7 +945,7 @@ class RustnnSession:
             model = onnx.load(model)
         self.model = model
         self.context = _create_context(device_type, backend, power_preference)
-        self.graph = build_webnn_graph(self.context, model, input_shapes)
+        self.graph, self._output_shapes = _build(self.context, model, input_shapes)
         self._output_dtypes = {
             vi.name: onnx.helper.tensor_dtype_to_np_dtype(vi.type.tensor_type.elem_type)
             for vi in model.graph.output
@@ -901,7 +968,10 @@ class RustnnSession:
         )
         out = {}
         for name in self.output_names:
+            # Undo the Core ML path's output flattening (a no-op otherwise).
             arr = np.asarray(result[name])
+            if name in self._output_shapes:
+                arr = arr.reshape(self._output_shapes[name])
             dtype = self._output_dtypes.get(name)
             out[name] = arr.astype(dtype, copy=False) if dtype is not None else arr
         return out

@@ -135,6 +135,21 @@ t.tune_node(model, "conv_3", webnn_device_types=("cpu", "npu"),
             tinygrad_devices=("CPU", "METAL"), atol=2e-2, rtol=2e-2)
 ```
 
+rustnn 0.5.12's Core ML backend has several bugs. CI on an M1 runner showed them, and
+the rustnn source confirms them. So when `backend_info()["backend"] == "coreml"`,
+`build_webnn_graph` works around them:
+
+| rustnn 0.5.12 Core ML bug | What onnxsim does |
+| --- | --- |
+| Float32 outputs are read as contiguous, ignoring `MLMultiArray.strides`. Outputs the ANE produces have 64-byte-aligned rows, so every row after the first is scrambled. | Flattens every output to 1-D in the graph; `RustnnSession.run` reshapes it back. |
+| The fused `bias` of `conv2d` / `convTranspose2d` / `gemm`'s `C` is dropped. | Emits the bias as an explicit `add`. |
+| MIL `pad` is emitted without `constant_val` unless a value is given. | Always passes a pad value (0 by default). |
+| `argMax`/`argMin` can't return int64 (Core ML has none). | Requests int32; `run` casts back to ONNX's int64. |
+| `where` (MIL `select` rejects the uint8 condition), `layerNormalization` (wrong values) and strided `slice` (strides ignored) are broken. | Raises `WebnnLoweringError`, so these nodes are reported as not lowerable instead of returning wrong numbers. |
+
+`tests/test_rustnn_runtime.py` forces this Core ML path on the ONNX Runtime CPU backend,
+to check that the rewrites themselves are exact, independently of Core ML.
+
 Core ML computes in float16 on the Neural Engine and GPU. The default `1e-3` tolerance
 would therefore rule out `npu` results, so loosen `atol`/`rtol` when you compare it.
 

@@ -78,6 +78,18 @@ def rustnn_device(request):
     return request.param
 
 
+def _backend(device_type):
+    probe = _model(
+        """
+        g (float[2] x) => (float[2] y)
+        {
+          y = Relu(x)
+        }
+        """
+    )
+    return RustnnSession(probe, device_type=device_type).backend_info()["backend"]
+
+
 def _tolerance(device_type):
     # Core ML may compute in float16 (the Neural Engine and GPU always do).
     return 1e-4 if device_type == "cpu" else 2e-2
@@ -304,22 +316,60 @@ _PARITY_CASES = {
 }
 
 
-@pytest.mark.parametrize("case", sorted(_PARITY_CASES))
-def test_rustnn_matches_reference(rustnn_device, case):
+# Cases whose ops the Core ML path refuses (rustnn 0.5.12 computes them
+# wrongly there; see rustnn_runtime._Lowering._reject_on_coreml callers).
+_COREML_REJECTED = {
+    "clip_greater_where": "Where",
+    "softmax_layernorm": "LayerNormalization",
+    "strided_slice_reduce_mean": "Slice",
+}
+
+
+def _check_parity(case, device_type):
     model, shapes = _PARITY_CASES[case]
     onnx.checker.check_model(model, full_check=True)
     rng = np.random.default_rng(0)
     feeds = {k: rng.standard_normal(s).astype(np.float32) for k, s in shapes.items()}
     expected = ReferenceEvaluator(model).run(None, feeds)
 
-    session = RustnnSession(model, device_type=rustnn_device)
+    session = RustnnSession(model, device_type=device_type)
     got = session.run(feeds)
 
     assert session.output_names == [o.name for o in model.graph.output]
-    tol = _tolerance(rustnn_device)
+    tol = _tolerance(device_type)
     for name, ref in zip(session.output_names, expected):
         assert got[name].dtype == ref.dtype
         np.testing.assert_allclose(got[name], ref, rtol=tol, atol=tol)
+
+
+def _check_coreml_parity(case, device_type):
+    if case in _COREML_REJECTED:
+        model, _ = _PARITY_CASES[case]
+        with pytest.raises(WebnnLoweringError, match="Core ML backend") as e:
+            RustnnSession(model, device_type=device_type)
+        assert _COREML_REJECTED[case] in str(e.value)
+    else:
+        _check_parity(case, device_type)
+
+
+@pytest.mark.parametrize("case", sorted(_PARITY_CASES))
+def test_rustnn_matches_reference(rustnn_device, case):
+    if _backend(rustnn_device) == "coreml":
+        _check_coreml_parity(case, rustnn_device)
+    else:
+        _check_parity(case, rustnn_device)
+
+
+@pytest.mark.parametrize("case", sorted(_PARITY_CASES))
+def test_coreml_workaround_lowering_matches_reference_on_cpu(
+    rustnn_cpu, case, monkeypatch
+):
+    # The Core ML path rewrites the graph (biases as explicit adds, 1-D
+    # outputs reshaped back, int32 arg-reductions, explicit pad values).
+    # Forcing that path on ONNX Runtime's CPU backend checks the rewrites
+    # themselves are exact, independently of Core ML's own numerics.
+    monkeypatch.setattr(rustnn_runtime, "_is_coreml", lambda context: True)
+    _check_coreml_parity(case, rustnn_cpu)
 
 
 def test_rustnn_runs_simplified_model(rustnn_device):
