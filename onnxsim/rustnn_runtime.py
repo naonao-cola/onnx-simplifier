@@ -274,9 +274,9 @@ class _Lowering:
         coreml: bool = False,
     ):
         self.b = builder
-        # rustnn 0.5.12's Core ML backend drops conv/gemm biases, needs an
-        # explicit pad value, only has int32 arg-reductions, and mis-handles
-        # a few ops outright; see _COREML_NOTES and build_webnn_graph.
+        # rustnn 0.5.12's Core ML backend drops conv/gemm biases, only has
+        # int32 arg-reductions, and mis-handles a few ops outright; see
+        # build_webnn_graph and docs/rustnn.md.
         self.coreml = coreml
         self.consts: Dict[str, np.ndarray] = {
             init.name: numpy_helper.to_array(init) for init in graph.initializer
@@ -767,6 +767,7 @@ class _Lowering:
         return self.b.gather(inp, indices, axis=axis)
 
     def _op_Pad(self, node, a, x):
+        self._reject_on_coreml(node, "rustnn 0.5.12 never emits MIL pad's mode")
         inp = x()
         rank = len(inp.shape)
         pads = a.get("pads")
@@ -794,9 +795,6 @@ class _Lowering:
         kwargs = {"mode": mode}
         if value is not None and value.size:
             kwargs["value"] = float(value.reshape(-1)[0])
-        elif self.coreml:
-            # MIL pad requires constant_val; rustnn only emits it when set.
-            kwargs["value"] = 0.0
         # pywebnn takes ONNX's own [begin_0.., end_0..] layout as one list.
         return self.b.pad(inp, [int(p) for p in pads], **kwargs)
 
@@ -856,6 +854,14 @@ def _build(
         # WebNN graph outputs must be computed operands, not inputs/constants.
         if vi.name in lowering.consts or vi.name in lowering.input_dtypes:
             op = builder.identity(op)
+        if coreml and op.data_type not in ("float32", "float16"):
+            # rustnn 0.5.12 only recognizes type code 3 for Int32, but Core
+            # ML reports MLMultiArrayDataTypeInt32 as 0x20020, so int outputs
+            # fall into its Float32 branch and read back as ~0. Return them
+            # as float32 instead; RustnnSession.run casts back to the ONNX
+            # dtype (exact for integers up to 2**24, or 2048 if Core ML
+            # computes the cast in float16).
+            op = builder.cast(op, "float32")
         if coreml and len(op.shape) > 1:
             # rustnn 0.5.12 reads Core ML float32 outputs as contiguous and
             # ignores MLMultiArray.strides, but ANE-produced outputs have
@@ -877,11 +883,12 @@ def build_webnn_graph(
 
     On rustnn's Core ML backend (``backend_info()["backend"] == "coreml"``,
     what pywebnn 0.5.12 picks for ``device_type="npu"``) the lowering works
-    around that backend's bugs: conv/gemm biases become explicit adds, pads
-    always carry a value, arg-reductions return int32, and every output is
-    flattened to 1-D (use :class:`RustnnSession`, which reshapes them back).
-    Ops it computes wrongly there (``Where``, ``LayerNormalization``,
-    strided ``Slice``) raise :class:`WebnnLoweringError` instead.
+    around that backend's bugs: conv/gemm biases become explicit adds,
+    arg-reductions return int32, non-float outputs are returned as float32,
+    and every output is flattened to 1-D (use :class:`RustnnSession`, which
+    reshapes and casts them back). Ops it can't run or computes wrongly there
+    (``Pad``, ``Where``, ``LayerNormalization``, strided ``Slice``) raise
+    :class:`WebnnLoweringError` instead.
 
     :param input_shapes: static shapes for graph inputs whose ONNX shape has
             symbolic dimensions.

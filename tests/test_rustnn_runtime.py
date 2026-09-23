@@ -320,6 +320,7 @@ _PARITY_CASES = {
 # wrongly there; see rustnn_runtime._Lowering._reject_on_coreml callers).
 _COREML_REJECTED = {
     "clip_greater_where": "Where",
+    "reflect_pad_avgpool_split": "Pad",
     "softmax_layernorm": "LayerNormalization",
     "strided_slice_reduce_mean": "Slice",
 }
@@ -365,7 +366,8 @@ def test_coreml_workaround_lowering_matches_reference_on_cpu(
     rustnn_cpu, case, monkeypatch
 ):
     # The Core ML path rewrites the graph (biases as explicit adds, 1-D
-    # outputs reshaped back, int32 arg-reductions, explicit pad values).
+    # outputs reshaped back, int32 arg-reductions, non-float outputs
+    # returned as float32 and cast back).
     # Forcing that path on ONNX Runtime's CPU backend checks the rewrites
     # themselves are exact, independently of Core ML's own numerics.
     monkeypatch.setattr(rustnn_runtime, "_is_coreml", lambda context: True)

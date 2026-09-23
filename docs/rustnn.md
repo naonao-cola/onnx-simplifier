@@ -143,9 +143,9 @@ the rustnn source confirms them. So when `backend_info()["backend"] == "coreml"`
 | --- | --- |
 | Float32 outputs are read as contiguous, ignoring `MLMultiArray.strides`. Outputs the ANE produces have 64-byte-aligned rows, so every row after the first is scrambled. | Flattens every output to 1-D in the graph; `RustnnSession.run` reshapes it back. |
 | The fused `bias` of `conv2d` / `convTranspose2d` / `gemm`'s `C` is dropped. | Emits the bias as an explicit `add`. |
-| MIL `pad` is emitted without `constant_val` unless a value is given. | Always passes a pad value (0 by default). |
 | `argMax`/`argMin` can't return int64 (Core ML has none). | Requests int32; `run` casts back to ONNX's int64. |
-| `where` (MIL `select` rejects the uint8 condition), `layerNormalization` (wrong values) and strided `slice` (strides ignored) are broken. | Raises `WebnnLoweringError`, so these nodes are reported as not lowerable instead of returning wrong numbers. |
+| Integer outputs read back as ~0: rustnn only recognizes type code `3` for Int32, but Core ML reports `0x20020`, so ints fall into the Float32 branch. | Casts every non-float output to float32 in the graph; `run` casts back to the ONNX dtype. This is exact for integers up to 2^24, or 2048 if Core ML does the cast in float16. |
+| `pad` (MIL `mode` never emitted, plus `constant_val` only when a value is set), `where` (MIL `select` rejects the uint8 condition), `layerNormalization` (wrong values) and strided `slice` (strides ignored) are broken. | Raises `WebnnLoweringError`, so these nodes are reported as not lowerable instead of returning wrong numbers. |
 
 `tests/test_rustnn_runtime.py` forces this Core ML path on the ONNX Runtime CPU backend,
 to check that the rewrites themselves are exact, independently of Core ML.
