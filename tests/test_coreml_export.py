@@ -161,6 +161,36 @@ def test_convert_to_coreml_matches_export_coreml():
     assert a.description.output == b.description.output
 
 
+def test_resize_nearest_asymmetric_floor_matches_onnx():
+    x = numpy_helper.from_array(
+        np.arange(1, 5, dtype=np.float32).reshape(1, 1, 2, 2), name="x"
+    )
+    scales = numpy_helper.from_array(np.array([1, 1, 2, 2], np.float32), name="scales")
+    node = onnx.helper.make_node(
+        "Resize",
+        ["x", "", "scales"],
+        ["y"],
+        mode="nearest",
+        coordinate_transformation_mode="asymmetric",
+        nearest_mode="floor",
+    )
+    graph = onnx.helper.make_graph(
+        [node],
+        "nearest_resize",
+        [],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 4, 4])],
+        [x, scales],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 8
+    expected = np.repeat(
+        np.repeat(np.arange(1, 5, dtype=np.float32).reshape(1, 1, 2, 2), 2, 2), 2, 3
+    )
+    np.testing.assert_array_equal(_mil_const_value(model), expected)
+
+
 # ---------------------------------------------------------------------------
 # A small CNN pipeline, exercising conv/norm/pool/gemm/softmax together
 # ---------------------------------------------------------------------------
