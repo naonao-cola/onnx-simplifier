@@ -47,11 +47,29 @@ Z_ANCHORS, SCA_POINTS, TSA_POINTS = 4, 8, 4
 FFN = 512
 
 
+def msda_l1_rank5(value, hw, loc, w):
+    """Single-level multi-scale deformable attention using only rank<=5 tensors.
+
+    value (bs, H*W, m, d); loc (bs, nq, m, P, 2) in [0,1]; w (bs, nq, m, P).
+    Same math as mmcv's multi_scale_deformable_attn_pytorch for L=1, but it never materializes
+    the (bs, nq, m, L, P, 2) rank-6 layout that the HTP rejects."""
+    h, wd = hw
+    bs, _, m, d = value.shape
+    nq, p = loc.shape[1], loc.shape[3]
+    v = value.permute(0, 2, 3, 1).reshape(bs * m, d, h, wd)
+    grid = (2 * loc - 1).permute(0, 2, 1, 3, 4).reshape(bs * m, nq, p, 2)
+    s = torch.nn.functional.grid_sample(v, grid, mode="bilinear", padding_mode="zeros",
+                                        align_corners=False)  # (bs*m, d, nq, p)
+    a = w.permute(0, 2, 1, 3).reshape(bs * m, 1, nq, p)
+    return (s * a).sum(-1).reshape(bs, m * d, nq).transpose(1, 2)
+
+
 class EncoderLayer(nn.Module):
     """TSA -> norm -> SCA -> norm -> FFN -> norm (BEVFormerLayer operation_order)."""
 
-    def __init__(self):
+    def __init__(self, rank5: bool = False):
         super().__init__()
+        self.rank5 = rank5
         m, d = HEADS, EMBED // HEADS
         self.m, self.d = m, d
         # temporal self-attention: queries attend to [prev_bev, current] (2 "frames")
@@ -75,6 +93,8 @@ class EncoderLayer(nn.Module):
         self.register_buffer("ls_bev", torch.tensor([0], dtype=torch.int64))
 
     def forward(self, q, prev_bev, img_value, ref_2d, ref_cam, bev_mask):
+        if self.rank5:
+            return self.forward_rank5(q, prev_bev, img_value, ref_2d, ref_cam, bev_mask)
         m, d = self.m, self.d
         # --- temporal self-attention (bs folded to 2: prev + current) ---
         v = self.tsa_value(torch.cat([prev_bev, q], 0)).reshape(2, NQ, m, d)
@@ -101,11 +121,37 @@ class EncoderLayer(nn.Module):
         q = self.norm3(q + self.ffn2(torch.relu(self.ffn1(q))))
         return q
 
+    def forward_rank5(self, q, prev_bev, img_value, ref_2d, ref_cam, bev_mask):
+        """Same layer, every intermediate tensor at rank <= 5 (HTP's limit)."""
+        m, d, pt, ps = self.m, self.d, TSA_POINTS, SCA_POINTS
+        v = self.tsa_value(torch.cat([prev_bev, q], 0)).reshape(2, NQ, m, d)
+        qq = torch.cat([prev_bev, q], -1)
+        off = self.tsa_offsets(qq).reshape(NQ, m, 2, pt * 2).permute(2, 0, 1, 3).reshape(2, NQ, m, pt, 2)
+        w = torch.softmax(self.tsa_weights(qq).reshape(NQ, m, 2, pt), -1).permute(2, 0, 1, 3)
+        loc = ref_2d.reshape(1, NQ, 1, 1, 2) + off / torch.tensor([BEV_W, BEV_H], dtype=off.dtype)
+        t = msda_l1_rank5(v, (BEV_H, BEV_W), loc, w)
+        q = self.norm1(q + self.tsa_out(t.mean(0, keepdim=True)))
+        v = self.sca_value(img_value).reshape(NUM_CAMS, FH * FW, m, d)
+        off = self.sca_offsets(q).reshape(1, NQ, m, ps, 2)
+        w = torch.softmax(self.sca_weights(q).reshape(1, NQ, m, ps), -1).expand(NUM_CAMS, -1, -1, -1)
+        r = ref_cam.reshape(NUM_CAMS, NQ, 1, Z_ANCHORS, 2).expand(-1, -1, m, -1, -1)
+        # anchor z's reference feeds points [z*k, z*k+k) (k = ps // Z_ANCHORS), as in the
+        # custom-op variant; an index gather keeps this at rank 5.
+        idx = torch.arange(ps) // (ps // Z_ANCHORS)
+        r = r[:, :, :, idx]  # (C, NQ, m, ps, 2)
+        loc = r + off / torch.tensor([FW, FH], dtype=off.dtype)
+        s = msda_l1_rank5(v, (FH, FW), loc, w)
+        msk = bev_mask.reshape(NUM_CAMS, NQ, 1)
+        s = (s * msk).sum(0, keepdim=True) / msk.sum(0, keepdim=True).clamp(min=1.0)
+        q = self.norm2(q + self.sca_out(s))
+        q = self.norm3(q + self.ffn2(torch.relu(self.ffn1(q))))
+        return q
+
 
 class Encoder(nn.Module):
-    def __init__(self, layers: int):
+    def __init__(self, layers: int, rank5: bool = False):
         super().__init__()
-        self.layers = nn.ModuleList(EncoderLayer() for _ in range(layers))
+        self.layers = nn.ModuleList(EncoderLayer(rank5) for _ in range(layers))
 
     def forward(self, bev_queries, prev_bev, img_feats, ref_2d, ref_cam, bev_mask):
         img_value = img_feats.flatten(2).transpose(1, 2)  # (6, 375, 256)
@@ -119,10 +165,16 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--out", default=".")
+    ap.add_argument("--rank5", action="store_true",
+                    help="rank<=5 deformable attention (HTP) instead of the mmdeploy custom op path")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(0)
-    model = Encoder(a.layers).eval()
+    model = Encoder(a.layers, a.rank5).eval()
+    if a.rank5:  # same weights as the custom-op variant, to cross-check the two formulations
+        torch.manual_seed(0)
+        ref_model = Encoder(a.layers, False).eval()
+        model.load_state_dict(ref_model.state_dict())
     rng = np.random.default_rng(0)
     ins = {
         "bev_queries": rng.standard_normal((1, NQ, EMBED)).astype(np.float32) * 0.1,
@@ -136,6 +188,9 @@ def main() -> None:
     tins = tuple(torch.from_numpy(v) for v in ins.values())
     with torch.no_grad():
         ref = model(*tins).numpy()
+        if a.rank5:
+            ref_cop = ref_model(*tins).numpy()
+            print(f"rank5 vs custom-op formulation (torch): max abs diff {np.abs(ref - ref_cop).max():.3e}")
     buf = io.BytesIO()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -146,7 +201,7 @@ def main() -> None:
 
     sim, ok = onnxsim.simplify(raw, extra_optimizers=["rewrite_msdeformattn_to_gridsample"])
     assert ok
-    name = os.path.join(a.out, f"bevformer_tiny_enc{a.layers}.onnx")
+    name = os.path.join(a.out, f"bevformer_tiny_enc{a.layers}{'_rank5' if a.rank5 else ''}.onnx")
     onnx.save(sim, name)
     import onnxruntime as ort
 
