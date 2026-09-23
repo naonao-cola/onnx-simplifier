@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -22,7 +23,7 @@ import geometry as G
 import numpy as np
 import torch
 
-R = "/data/local/tmp/codex-android-fastbev"
+R = os.environ.get("FASTBEV_PHONE_DIR", "/data/local/tmp/codex-android-fastbev")
 LOCK = Path.home() / ".cache/android-phone/phone-run"
 SERIAL = "239dbd8f"
 
@@ -63,6 +64,9 @@ def main():
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--gather", default="dsp", choices=["dsp", "htp"])
     ap.add_argument("--env", default="")
+    ap.add_argument("--pipeline", action="store_true",
+                    help="also run PIPELINE=1 (frames overlapped across HTP/DSP/CPU) and check its detections are "
+                    "byte-identical to the sequential run's")
     a = ap.parse_args()
     work = Path(a.work)
     frames = [torch.load(p, weights_only=False)
@@ -84,13 +88,21 @@ adb -s {SERIAL} push -q {out}/. {R}/{a.fam}/
 adb -s {SERIAL} shell "chmod 755 {R}/fastbev_run && cd {R} && {env} ./fastbev_run {a.fam} {R}/{a.fam} {len(frames)} {a.iters}"
 for i in $(seq 0 {len(frames) - 1}); do adb -s {SERIAL} pull -q {R}/{a.fam}/f${{i}}_dets.bin {out}/; done
 """
+    if a.pipeline:
+        script += f"""adb -s {SERIAL} shell "cd {R} && {env} PIPELINE=1 ./fastbev_run {a.fam} {R}/{a.fam} {len(frames)} {a.iters}"
+for i in $(seq 0 {len(frames) - 1}); do adb -s {SERIAL} pull -q {R}/{a.fam}/f${{i}}_dets_pipe.bin {out}/; done
+"""
     r = subprocess.run([str(LOCK), "bash", "-c", script], capture_output=True, text=True,
-                       env={**__import__("os").environ, "PHONE_LOCK_OWNER": "codex/android-fastbev"})
+                       env={"PHONE_LOCK_OWNER": "codex/android-fastbev", **os.environ})
     log = r.stdout + r.stderr
-    print("\n".join(line for line in log.splitlines() if re.match(r"(stage|total|sessions|FAIL)", line)))
+    print("\n".join(line for line in log.splitlines() if re.match(r"(stage|total|pipelined|sessions|FAIL)", line)))
     if r.returncode:
         print(log[-2000:])
         raise SystemExit(1)
+    if a.pipeline:
+        same = all((out / f"f{i}_dets.bin").read_bytes() == (out / f"f{i}_dets_pipe.bin").read_bytes()
+                   for i in range(len(frames)))
+        print(f"pipelined detections byte-identical to sequential: {same}")
     names = DEC.M0_CLASSES if a.fam == "m0" else DEC.PP_CLASSES
     tot, tot_ref = np.zeros(3, int), np.zeros(3, int)
     for i, f in enumerate(frames):
