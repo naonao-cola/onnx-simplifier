@@ -332,12 +332,8 @@ def _segment_for(
             q(ins[:1]),
             q(outs),
         )
-        if calib["ranges"][ins[0]][0] < 0:
-            # the step Reshape templates are Reshape -> Relu builds (#1891):
-            # on a possibly negative input the Relu changes the values
-            seg.unsafe = (
-                "Reshape template is Reshape->Relu and the input can be negative"
-            )
+        # a signed input (nonzero zero point) is emitted from the Reshape ->
+        # Identity template; the Reshape -> Relu ones (#1891) would clip it
         return seg
 
     if detail == "GatherIndexEdit":

@@ -112,7 +112,7 @@ def test_misc_emit_keeps_the_mcode_dims_in_step():
 
 
 @needs_step
-def test_plan_covers_the_validated_nodes_and_marks_relu_reshapes_unsafe():
+def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
     model = sr.load_step()
     calib = sr.axb.load_calibration(sr.STEP_CALIB)
     records = sr.load_records()
@@ -124,8 +124,11 @@ def test_plan_covers_the_validated_nodes_and_marks_relu_reshapes_unsafe():
         == sr.axb.coverage_report(records, calibration=calib)["totals"]["covered"]
     )
     unsafe = [s for s in everything if s.unsafe]
-    assert unsafe and all(s.kind == "reshape" for s in unsafe)
-    assert sum(len(s.nodes) for s in segs) == covered - len(unsafe)
+    # signed Reshapes take the Reshape -> Identity templates, so none is unsafe
+    assert not any(s.kind == "reshape" for s in unsafe)
+    assert sum(len(s.nodes) for s in segs) == covered - sum(
+        len(s.nodes) for s in unsafe
+    )
 
 
 @needs_step
