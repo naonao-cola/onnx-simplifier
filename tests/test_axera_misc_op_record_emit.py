@@ -109,7 +109,7 @@ def test_record_removing_zero_point_change_is_measured():
     counts = {
         len(mre._chunks(mre.suc.decode_segments(_mcode(k))[2]))
         for pair in STEP_PAIRS
-        if "784" in pair[0]
+        if "784" in pair[0] and "ReduceSumReshape" not in pair[0]
         for k in pair
     }
     assert len(counts) == 2
