@@ -19,6 +19,7 @@ frames, then exported and run piece by piece on the phone's HTP through QNN.
 | `sensitivity.py` | ORT CPU sweep: which op types int8 hurts (all-but-T / only-T cosines) |
 | `quantize.py` | int8 QDQ pieces with onnxsim's whole-graph quantizer (`onnxsim.full_qdq`): calibration set, backbone, mixed-precision encoder/decoder policies |
 | `bisect_precision.py`, `bisect_run.sh` | expose chosen intermediates as outputs, run on the HTP, per-tensor cosine vs ORT CPU |
+| `msda_hvx/` | the encoder's deformable sampling as one HVX kernel on the CDSP (own FastRPC skel), the encoder split around it, and its phone runner: see "Encoder with the sampling on the HVX" below |
 
 Reproduce (each heavy step under `systemd-run --user --wait --collect --pipe -p MemoryMax=16G -p MemorySwapMax=0`):
 
@@ -152,7 +153,8 @@ execute on the HTP, `QNN_COMMON_ERROR_SYSTEM`). validate.py vs upstream: max abs
 
 After the rewrite GridSample is 56% of the layer (SCA 48%, TSA 9%), then Mul + ReduceSum over
 the sampled values (17%). The next lever is an HVX deformable-sampling kernel (the RoiAlign
-channels-last kernel is the template), not quantization.
+channels-last kernel is the template), not quantization: done below, "Encoder with the sampling
+on the HVX" (151 -> 52 ms).
 
 Mixed-precision policies (`quantize.py enc1 --policy ...`), strict all-HTP, enc1 vs fp32:
 
@@ -190,6 +192,99 @@ QDQ decoder has many more nodes, and its tensors are small.
   DQ -> Q' -> DQ' convert; GridSample's grid is exempt. Without this, QNN rejects a Gemm with a
   uint8 input and a uint16 output, and its weight DQ is stranded on the CPU.
 - Weights are quantized only for nodes that end up real QDQ units.
+
+## Encoder with the sampling on the HVX (`msda_hvx/`)
+
+The HTP spends 73% of an fp16 encoder layer building sampling grids, in GridSample, and in the
+Mul + ReduceSum after it. `msda_hvx/` moves that whole span, per TSA and per SCA, into one
+FastRPC call to an HVX kernel on the CDSP. The HTP keeps everything else: the Linears, softmax,
+LayerNorm and the FFN.
+
+| file | what |
+|---|---|
+| `split.py` | `msda_fused`: the kernel's contract in torch. The encoder is split into 7 pieces around it (`pre`, `mid0-2`, `post0-2`). `check`: split vs `Encoder` (max abs 7e-6 on 3 frames). `dump`: real kernel I/O. `export`: the pieces to ONNX + onnxsim |
+| `msda_kernel.h` | the kernel: scalar reference path + HVX qf32 path |
+| `msda_rpc.idl`, `msda_impl.c` | the skel: shape checks, query blocks across 4 QuRT threads |
+| `msda_host_check.c`, `msda_sim.c`, `msda_client.c` | kernel vs torch on the host, on `hexagon-sim` (cycles), and on the phone (timing) |
+| `enc_run.cpp` | the encoder on the phone: 7 HTP pieces + 6 kernel calls in one process, all tensors in rpcmem buffers ORT writes into |
+| `e2e_msda.py` | backbone (int8) -> `enc_run` -> decoder on scene-0103's frames, like `e2e_phone.py` |
+| `build.sh` | builds the skel, the client and `enc_run`; runs the kernel bench |
+
+One call computes, per query and head, the bilinear sample of the head's 32 channels at every
+point, weighted by the softmaxed attention weight, summed over points and value maps. It then
+divides by the number of visible maps: the 2-frame queue mean for TSA, the camera average for
+SCA. The value maps are channels-last, so one head's 32 channels are one 128-byte HVX vector. The
+SCA skips invisible (camera, query) pairs, 81% of them on a real frame (2863 of 15000 visible).
+
+What made it fast. Single-thread TSA went from 168.5 to 76 cycles per point in hexagon-sim; on
+the phone at 4 threads TSA went 8.4 -> 3.96 ms and SCA 7.0 -> 3.2 ms:
+- **No `%` in the point loop.** `p % R` is a libcall on Hexagon, and the call spilled the HVX
+  accumulator to the stack and back on every point.
+- **The per-point coordinate and weight math runs 32 points per HVX vector.** As scalar code it
+  was 117 of the 168 cycles per point: a serial chain of dependent float ops. V69 has no vector
+  float -> int convert (V73+ has one), so `floor` adds 1.5 * 2^23 in qf32, converts to sf, and
+  takes the integer from the mantissa. A +-1 fix-up on the fraction makes it exact whatever the
+  conversion's rounding.
+- **The multiply-accumulate reads a tap list with 4 independent accumulators.** Each (query, map)
+  iteration writes a list of (byte offset, weight) taps; building the next item's list is
+  pipelined behind the current item's MAC.
+- **What didn't help:**
+  - head-major work order, which only cuts the L2 working set;
+  - a TURBO clock vote;
+  - 6 threads instead of 4.
+
+Checks: `split.py check`/`dump`, then `msda_host_check.c` vs torch on all 6 calls of a real
+frame: rel <= 3.4e-6. `msda_sim.c` on hexagon-sim and `msda_client.c` on the phone agree to the
+same level. `tests/test_bevformer_msda_kernel.py` runs the C paths phone-free on synthetic edge
+cases: off-map points, pixel borders, invisible pairs. It includes the HVX path on hexagon-sim
+when `HEXAGON_TOOLS` is set.
+
+Encoder on the phone (`enc_run`, frame 1, median of 10, burst):
+
+| step | ms |
+|---|---|
+| `pre` (3 layers' SCA value projections + layer 0's TSA inputs) | 6.8 |
+| `mid0-2` (TSA output proj + LN + SCA offsets/weights), each | 2.3 |
+| `post0-1` (SCA output proj + LN + FFN + LN + next TSA inputs), each | 6.0 |
+| `post2` | 2.1 |
+| TSA call, each (in-DSP / wall) | 4.1-4.5 / 4.4-4.8 |
+| SCA call, each | 3.3-3.4 / 3.6-3.7 |
+| **encoder** | **52.2** (HTP pieces 27.6, kernel calls 24.7 incl. 1.7 FastRPC) |
+
+End to end (`e2e_msda.py`, scene-0103 frames 0-5, the phone's own BEV carried as prev_bev):
+- **The encoder alone** (fp32 torch on the phone's own encoder inputs vs the phone's output):
+  cos 0.999999 on every frame.
+- **Whole model:** bev cos 0.9966-0.9980 vs fp32, cls >= 0.99979. The gap is the int8
+  backbone's (feats cos 0.994), the same as with the fp16 HTP encoder.
+
+| whole model, scene-0103 frames 0-5 | backbone | encoder | decoder | total | FPS | GT matched |
+|---|---|---|---|---|---|---|
+| fp32 torch (CPU) | | | | | | 106 / 190 |
+| int8 backbone + fp16 HTP encoder + fp16 decoder (above) | 21 | 151 | 25 | 197 ms | 5.1 | 107 |
+| **int8 backbone + split encoder (HTP + HVX sampling) + fp16 decoder** | 21 | **52** | 24 | **97 ms** | **10.3** | **107** |
+
+Reproduce (heavy host steps under `systemd-run ... MemoryMax=16G`; the phone set up as for
+`e2e_phone.py`):
+
+```sh
+cd msda_hvx
+python3 split.py check  --ckpt $C/bevformer_tiny_epoch_24.pth --work $C/work
+python3 split.py dump   --ckpt $C/bevformer_tiny_epoch_24.pth --work $C/work   # -> $C/work/msda_io/l{0,1,2}_{tsa,sca}
+python3 split.py export --ckpt $C/bevformer_tiny_epoch_24.pth --work $C/work   # -> $C/work/msda_split/*.sim.onnx
+cc -O2 -o msda_host_check msda_host_check.c -lm && ./msda_host_check $C/work/msda_io/*
+HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... CASES="$C/work/msda_io/l0_tsa $C/work/msda_io/l0_sca" THREADS=1,4 ./build.sh
+python3 e2e_msda.py --ckpt $C/bevformer_tiny_epoch_24.pth --data $C/nuscenes-mini --work $C/work
+```
+
+Where the remaining 52 ms go, and the next levers:
+- **The HTP pieces' graph I/O is fp32:** ~12 MB in and out per frame. Mask R-CNN's HTP pieces
+  got faster with uint8 graph I/O instead of fp32. fp16 or uint8 I/O means the kernel reads fp16
+  value maps (`vcvt` hf -> sf is V68+) and halves its L2 traffic too.
+- **`pre` computes all 3 layers' SCA value projections up front** (6.9 MB of fp32 output). They
+  depend only on the image features, so they could also run in the backbone's call.
+- **The kernel's MAC phase is now its larger half.** The next step there is keeping the value
+  maps in VTCM: 8 MB is available to this unsigned PD per the RoiAlign probe, and the SCA's maps
+  are 2.3 MB.
 
 ### Why not a `scripts/android/deploy` spec (yet)
 

@@ -30,6 +30,7 @@ usage: split.py check  --ckpt <pth> --work <work>     torch split vs Encoder on 
        split.py dump   --ckpt <pth> --work <work>     kernel I/O of layer 0 of frame 1 -> <work>/msda_io
        split.py export --ckpt <pth> --work <work>     the pieces -> <work>/msda_split/*.onnx (+ onnxsim)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -60,12 +61,20 @@ def msda_fused(value, hw, ref, off, attw, vis=None):
     for c in range(nv):
         o = off[:, :, c if no > 1 else 0]  # (Q, M, P, 2)
         a = attw[:, :, c if no > 1 else 0]  # (Q, M, P)
-        loc = ref[c][:, idx][:, None] + o / torch.tensor([w, h], dtype=off.dtype)  # (Q, M, P, 2)
+        loc = ref[c][:, idx][:, None] + o / torch.tensor(
+            [w, h], dtype=off.dtype
+        )  # (Q, M, P, 2)
         grid = (2 * loc - 1).permute(1, 0, 2, 3)  # (M, Q, P, 2)
         v = value[c].reshape(h, w, m, D).permute(2, 3, 0, 1)  # (M, D, H, W)
-        s = F.grid_sample(v, grid, mode="bilinear", padding_mode="zeros", align_corners=False)  # (M, D, Q, P)
+        s = F.grid_sample(
+            v, grid, mode="bilinear", padding_mode="zeros", align_corners=False
+        )  # (M, D, Q, P)
         out = (s * a.permute(1, 0, 2)[:, None]).sum(-1).permute(2, 0, 1).reshape(q, E)
-        vc = torch.ones(q, 1, dtype=value.dtype) if vis is None else vis[c].reshape(q, 1).to(value.dtype)
+        vc = (
+            torch.ones(q, 1, dtype=value.dtype)
+            if vis is None
+            else vis[c].reshape(q, 1).to(value.dtype)
+        )
         acc += out * vc
         cnt += vc
     return acc / cnt.clamp(min=1.0)
@@ -83,7 +92,9 @@ def tsa_pre(tsa, q, pos, v_prev, v_cur):
 
 def sca_pre(sca, q1):
     off = sca.sampling_offsets(q1)  # (Q, M*P*2), laid out (M, P, xy)
-    w = torch.softmax(sca.attention_weights(q1).reshape(NQ, HD, sca.p), -1).reshape(NQ, HD * sca.p)
+    w = torch.softmax(sca.attention_weights(q1).reshape(NQ, HD, sca.p), -1).reshape(
+        NQ, HD * sca.p
+    )
     return off, w
 
 
@@ -95,8 +106,14 @@ class Pre(nn.Module):
     def forward(self, feats, prev_bev, has_prev, can_bus):
         enc = self.enc
         q0 = enc.bev_embedding + enc.can_bus_mlp(can_bus[None])
-        img_value = feats.flatten(2).transpose(1, 2) + enc.cams_embeds[:, None] + enc.level_embeds[0]
-        sca_v = torch.stack([ly.sca.value_proj(img_value) for ly in enc.layers], 0)  # (L, 6, HW, E)
+        img_value = (
+            feats.flatten(2).transpose(1, 2)
+            + enc.cams_embeds[:, None]
+            + enc.level_embeds[0]
+        )
+        sca_v = torch.stack(
+            [ly.sca.value_proj(img_value) for ly in enc.layers], 0
+        )  # (L, 6, HW, E)
         v_prev = prev_bev * has_prev + q0 * (1 - has_prev)
         v, off, w = tsa_pre(enc.layers[0].tsa, q0, enc.bev_pos(), v_prev, q0)
         return sca_v, q0, v, off, w
@@ -126,7 +143,9 @@ class Post(nn.Module):
             return q
         v_prev = prev_bev * has_prev + q * (1 - has_prev)
         v_cur = q0 * has_prev + q * (1 - has_prev)
-        v, off, w = tsa_pre(self.enc.layers[self.i + 1].tsa, q, self.enc.bev_pos(), v_prev, v_cur)
+        v, off, w = tsa_pre(
+            self.enc.layers[self.i + 1].tsa, q, self.enc.bev_pos(), v_prev, v_cur
+        )
         return q, v, off, w
 
 
@@ -148,10 +167,24 @@ def run_split(enc, enc_in, sampler=msda_fused, record=None):
     q = q0
     for i in range(n):
         tp, sp = enc.layers[i].tsa.p, enc.layers[i].sca.p
-        tsa_args = (v, (M.BEV_H, M.BEV_W), tsa_ref, off.reshape(NQ, HD, 2, tp, 2), w.reshape(NQ, HD, 2, tp), None)
+        tsa_args = (
+            v,
+            (M.BEV_H, M.BEV_W),
+            tsa_ref,
+            off.reshape(NQ, HD, 2, tp, 2),
+            w.reshape(NQ, HD, 2, tp),
+            None,
+        )
         tsa_out = sampler(*tsa_args)
         q1, soff, sw = Mid(enc.layers[i])(tsa_out, q)
-        sca_args = (sca_v[i], (M.FH, M.FW), ref_cam, soff.reshape(NQ, HD, 1, sp, 2), sw.reshape(NQ, HD, 1, sp), vis)
+        sca_args = (
+            sca_v[i],
+            (M.FH, M.FW),
+            ref_cam,
+            soff.reshape(NQ, HD, 1, sp, 2),
+            sw.reshape(NQ, HD, 1, sp),
+            vis,
+        )
         sca_out = sampler(*sca_args)
         if record is not None:
             record.append({"tsa": (tsa_args, tsa_out), "sca": (sca_args, sca_out)})
@@ -163,7 +196,10 @@ def run_split(enc, enc_in, sampler=msda_fused, record=None):
 
 
 def frames(work):
-    return [torch.load(p, weights_only=False) for p in sorted((Path(work) / "frames").glob("*.pt"))]
+    return [
+        torch.load(p, weights_only=False)
+        for p in sorted((Path(work) / "frames").glob("*.pt"))
+    ]
 
 
 def cmd_check(a):
@@ -188,12 +224,18 @@ def save_kernel_case(out: Path, name, args, y):
     ref.contiguous().numpy().astype(np.float32).tofile(d / "ref.f32")
     off.contiguous().numpy().astype(np.float32).tofile(d / "off.f32")
     attw.contiguous().numpy().astype(np.float32).tofile(d / "attw.f32")
-    (vis if vis is not None else torch.ones(nv, q, dtype=torch.uint8)).numpy().astype(np.uint8).tofile(d / "vis.u8")
+    (vis if vis is not None else torch.ones(nv, q, dtype=torch.uint8)).numpy().astype(
+        np.uint8
+    ).tofile(d / "vis.u8")
     y.contiguous().numpy().astype(np.float32).tofile(d / "ref_out.f32")
-    (d / "meta.txt").write_text(f"{nv} {hw[0]} {hw[1]} {q} {r} {no} {p} {int(vis is not None)}\n")
+    (d / "meta.txt").write_text(
+        f"{nv} {hw[0]} {hw[1]} {q} {r} {no} {p} {int(vis is not None)}\n"
+    )
     nvis = int((vis if vis is not None else torch.ones(nv, q)).sum())
-    print(f"{name}: NV {nv} H {hw[0]} W {hw[1]} Q {q} R {r} NO {no} P {p}; visible (nv, q) pairs {nvis} "
-          f"of {nv * q}; out |max| {y.abs().max():.3f}")
+    print(
+        f"{name}: NV {nv} H {hw[0]} W {hw[1]} Q {q} R {r} NO {no} P {p}; visible (nv, q) pairs {nvis} "
+        f"of {nv * q}; out |max| {y.abs().max():.3f}"
+    )
 
 
 def cmd_dump(a):
@@ -222,38 +264,81 @@ def cmd_export(a):
     out.mkdir(exist_ok=True)
     n = len(enc.layers)
     sca_v, q0, v, off, w = Pre(enc)(feats, prev_bev, has_prev, can_bus)
-    pieces = [("pre", Pre(enc), (feats, prev_bev, has_prev, can_bus), ["feats", "prev_bev", "has_prev", "can_bus"],
-               ["sca_v", "q0", "tsa_v", "tsa_off", "tsa_w"])]
+    pieces = [
+        (
+            "pre",
+            Pre(enc),
+            (feats, prev_bev, has_prev, can_bus),
+            ["feats", "prev_bev", "has_prev", "can_bus"],
+            ["sca_v", "q0", "tsa_v", "tsa_off", "tsa_w"],
+        )
+    ]
     q = q0
     for i in range(n):
         tsa_out = rec[i]["tsa"][1]
         q1, _, _ = Mid(enc.layers[i])(tsa_out, q)
-        pieces.append((f"mid{i}", Mid(enc.layers[i]), (tsa_out, q), ["tsa_out", "q"], ["q1", "sca_off", "sca_w"]))
+        pieces.append(
+            (
+                f"mid{i}",
+                Mid(enc.layers[i]),
+                (tsa_out, q),
+                ["tsa_out", "q"],
+                ["q1", "sca_off", "sca_w"],
+            )
+        )
         sca_out = rec[i]["sca"][1]
         if i == n - 1:
-            pieces.append((f"post{i}", Post(enc, i), (sca_out, q1), ["sca_out", "q1"], ["bev_embed"]))
+            pieces.append(
+                (
+                    f"post{i}",
+                    Post(enc, i),
+                    (sca_out, q1),
+                    ["sca_out", "q1"],
+                    ["bev_embed"],
+                )
+            )
         else:
-            pieces.append((f"post{i}", Post(enc, i), (sca_out, q1, q0, prev_bev, has_prev),
-                           ["sca_out", "q1", "q0", "prev_bev", "has_prev"], ["q", "tsa_v", "tsa_off", "tsa_w"]))
+            pieces.append(
+                (
+                    f"post{i}",
+                    Post(enc, i),
+                    (sca_out, q1, q0, prev_bev, has_prev),
+                    ["sca_out", "q1", "q0", "prev_bev", "has_prev"],
+                    ["q", "tsa_v", "tsa_off", "tsa_w"],
+                )
+            )
             q = Post(enc, i)(sca_out, q1, q0, prev_bev, has_prev)[0]
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     for name, mod, x, ins, outs in pieces:
         raw = out / f"{name}.onnx"
-        torch.onnx.export(mod, x, str(raw), input_names=ins, output_names=outs, opset_version=17, dynamo=False,
-                          do_constant_folding=True)
+        torch.onnx.export(
+            mod,
+            x,
+            str(raw),
+            input_names=ins,
+            output_names=outs,
+            opset_version=17,
+            dynamo=False,
+            do_constant_folding=True,
+        )
         sim, _ = onnxsim.simplify(str(raw), check_n=0)
         onnx.save(sim, str(out / f"{name}.sim.onnx"))
         ref = mod(*x)
         ref = ref if isinstance(ref, tuple) else (ref,)
-        got = ort.InferenceSession(str(out / f"{name}.sim.onnx"), so, providers=["CPUExecutionProvider"]).run(
-            None, {k: t.numpy() for k, t in zip(ins, x)})
+        got = ort.InferenceSession(
+            str(out / f"{name}.sim.onnx"), so, providers=["CPUExecutionProvider"]
+        ).run(None, {k: t.numpy() for k, t in zip(ins, x)})
         md = max(float(np.abs(r.numpy() - g).max()) for r, g in zip(ref, got))
         ops = {}
         for nd in sim.graph.node:
             ops[nd.op_type] = ops.get(nd.op_type, 0) + 1
-        print(f"{name}: {len(sim.graph.node)} nodes, ORT CPU vs torch max abs {md:.2e}; "
-              + " ".join(f"{k}:{c}" for k, c in sorted(ops.items(), key=lambda kv: -kv[1])))
+        print(
+            f"{name}: {len(sim.graph.node)} nodes, ORT CPU vs torch max abs {md:.2e}; "
+            + " ".join(
+                f"{k}:{c}" for k, c in sorted(ops.items(), key=lambda kv: -kv[1])
+            )
+        )
 
 
 def main():
