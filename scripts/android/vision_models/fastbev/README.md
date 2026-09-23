@@ -170,11 +170,50 @@ from 45.8 to 31.9 ms and Fast-BEV++ from 30.4 to 25.2 ms.
   session with `enable_htp_shared_memory_allocator=1` fails to create the EP ("Unknown exception
   occurred while creating QNN EP"). Not pursued further.
 
+### Follow-ups: pipelining, requantization (`codex/android-fastbev-opt`)
+
+Same phone, scene-0103 frames 0-5, 10 passes after a warm-up, all under the phone lock with the phone
+otherwise idle. **Note on the CPU**: after a phone reboot the prime core ran capped at 2.25 GHz and
+M0's LUTs took 27 ms (10.6 ms in the table above, measured before the reboot) -- device state this
+work may not change; the sequential and pipelined rows below were measured back to back in the
+same state.
+
+`fastbev_run` with `PIPELINE=1` (`e2e_phone.py --pipeline` runs both modes and checks the pipelined
+detections are **byte-identical** to the sequential ones -- they are, for both models): three
+threads, (encoder on the HTP + LUTs on the CPU) -> (M0: DSP gather + HTP BEV net / PP: HTP view+BEV)
+-> CPU decode, bounded queues, M0's feature ring grown to 6 slots and the LUT/output buffers to 3 sets
+so no in-flight frame aliases another's. The 4 slot LUTs are one threaded pass (`m0_lut_n_mt`).
+
+| model | sequential | **pipelined** | pipelined latency | GT / 190 | bound by |
+|---|---|---|---|---|---|
+| Fast-BEV M0 | 47.9 ms (20.9 FPS) | **25.6 ms (39.1 FPS)** | 60.7 ms | 123 | CPU LUTs (27 ms, overlapped) |
+| Fast-BEV++ R50 (view+BEV requantized) | 22.6 ms (44.3 FPS) | **21.0 ms (47.6 FPS)** | 61.1 ms | 124 | HTP (encoder 13.3 + view+BEV 8.1 ms) |
+
+* **Fast-BEV++ view+BEV requantized with today's `onnxsim.full_qdq`** (same calibration, same
+  script): 10.47 -> **8.07 ms** on the HTP, GT unchanged at 124. Re-quantizing the encoders and M0's
+  BEV net the same way changed nothing (13.25 / 7.0 / 10.8 ms).
+* **Fast-BEV++ view as one batched MatMul** (`FASTBEV_PP_VIEW=matmul`: (YX, 1, 7) @ (YX, 7, 64)
+  instead of the broadcast Mul + ReduceSum that is ~40% of the view+BEV graph): QNN runs the 16384
+  tiny batches far slower, **27.4 ms** (125 GT). Not the default.
+* View+BEV per-op profile now (36 Mcycles): Mul 33%, Resize 20% (the neck's upsamples), Gather 17%,
+  Conv 14%, ReduceSum 7%.
+* **M0: folding the BEV net's first 1x1 conv into the DSP gather -- not done, arithmetic says no.**
+  That conv is 1024 -> 256 channels over 200 x 200 cells = 10.5 GMAC per frame. At the HVX `vrmpy`
+  peak (32 lanes x 4 int8 MACs per cycle per thread, ~1 GHz, 4 threads: ~0.5 TMAC/s, before any
+  memory stalls) that is >= 21 ms, twice the HTP's *whole* BEV net (10.8 ms). The alternative of
+  projecting each feature table through the conv's 16 (height, time) weight slices before the gather
+  is 17.7 GMAC per frame plus a 277 M-element intermediate. The volume stays; the pipeline already
+  hides the gather (7.5 ms DSP) behind the HTP.
+
 ### Remaining levers
 
 * M0: the BEV net's first 1x1 conv (1024 -> 256 channels on 200 x 200) could run on the DSP as part
   of the gather (gather + matmul, never writing the 41 MB volume); the HTP BEV net would then start
   from a 10 MB tensor.
-* Pipelining frames: the encoder of frame i+1 (HTP) can overlap the DSP gather and CPU decode of
-  frame i; throughput would approach max(HTP time, ...) ~ 18 ms/frame for M0.
+* M0's LUTs on the CPU now bound its pipeline: computing them on the DSP next to the gather (the
+  projection is 3 affine maps + 2 divides per voxel and camera; exact rounding against torch has to
+  be kept) or restoring the CPU's pre-reboot clocks would bring M0 to its HTP bound (~18 ms).
+* Fast-BEV++: the neck's Resize (20% of view+BEV) as an exact depthwise ConvTranspose/DepthToSpace
+  (the trick that took EfficientViT-SAM's bicubic neck from 1503 to 42 ms), and the view's
+  Mul + ReduceSum on the DSP (a gather + weighted sum like `fbgather`, taking ~5 ms off the HTP).
 

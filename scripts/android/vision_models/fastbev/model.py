@@ -36,6 +36,8 @@ Fast-BEV++ R50 (ymlab/advanced-fastbev configs/fastbev/paper/fastbev-r50-cbgs.py
 """
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -240,8 +242,14 @@ class ViewPP(nn.Module):
     def forward(self, feats, depth, idx, didx):
         X, Y, Z = PP_GRID
         table = torch.cat([feats.reshape(-1, 64), torch.zeros(1, 64, dtype=feats.dtype)], 0)
-        f = torch.index_select(table, 0, idx) * torch.index_select(depth.reshape(-1), 0, didx).unsqueeze(1)
-        return f.reshape(Y * X, Z, 64).sum(1).reshape(1, Y, X, 64)  # rank <= 4 for the HTP
+        f = torch.index_select(table, 0, idx).reshape(Y * X, Z, 64)
+        d = torch.index_select(depth.reshape(-1), 0, didx)
+        if os.environ.get("FASTBEV_PP_VIEW") == "matmul":
+            # the same weighted sum as one batched MatMul, (YX, 1, 7) @ (YX, 7, 64). Tried because the
+            # broadcast Mul + ReduceSum is 53% of the int8 view+BEV graph on the HTP (QNN profile), but
+            # QNN runs 16384 tiny batches far slower: 27.4 vs 10.5 ms (125 vs 124 GT). Not the default.
+            return torch.matmul(d.reshape(Y * X, 1, Z), f).reshape(1, Y, X, 64)
+        return (f * d.reshape(Y * X, Z, 1)).sum(1).reshape(1, Y, X, 64)  # rank <= 4 for the HTP
 
 
 class BasicBlockDS(BasicBlock):
