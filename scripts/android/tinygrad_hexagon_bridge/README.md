@@ -1446,6 +1446,117 @@ sizes, blocking, working-set-sensitive reduction orders); `MOCKDSP=1` remains th
 (no real hexagon-clang/hexagon-sim round trip) when only correctness verification is needed, or
 when candidates differ only in raw compute-instruction mix with comparable working sets.
 
+## Proposal decode (RPN): bit-exact on the phone's DSP, 1.58x ONNX Runtime
+
+The easiest-ranked op in `dynamic_ops_survey.md`. Everything below comes from the real
+`rest.onnx` graph and one real inference (COCO `000000000139.jpg`), not from assumptions.
+
+### What the region actually is
+
+Per FPN level, **TopK runs first** (on the objectness scores), then anchors and deltas are gathered
+by the top-k indices, so decode only ever sees k = 1000/1000/1000/1000/663 = **4663 boxes**, not the
+217,413 anchors. The objectness sigmoid is not in this region: it's in the backbone, before the
+reshape. The kernel replaces, per level, everything from the squeezed TopK indices to the
+grid-quantized boxes that feed the min-size filter and NMS: **315 non-Constant nodes** over the 5
+levels (50 Unsqueeze, 40 Add, 40 Mul, 35 Gather, 30 Sub, 30 Slice, 20 Clip, 20 Reshape, 15+15 Q/DQ,
+10 Concat, 10 Exp). `capture_proposal_decode.py` finds the region by walking the graph and reads
+every constant out of it:
+
+- Detectron decode: widths/heights with `+1`, dw/dh clipped at 4.1352 (= log(1000/16)), `-1` on
+  x2/y2; clip x to [0, 1279] and y to [0, 959]. Those bounds are baked into the model and are not
+  the 800x1088 canvas; they're reproduced as found.
+- The deltas are **requantized** on the way in: for P2-P4 the rest-side Q/DQ grid (e.g. P2:
+  0.018187/129) differs from the backbone's output grid (0.018761/133), so this is a real lossy
+  step and the kernel reproduces it. For P5/P6 it's an identity.
+- The final boxes are Q/DQ'd onto a uint8 grid (scale 5.0157, zero point 0), ~5 px steps.
+- Layout: the backbone turns the `[1, 12, H, W]` uint8 conv output into per-anchor rows over all
+  anchors (Reshape `[1,3,4,H,W]` -> Transpose `(0,3,4,1,2)` -> Reshape `[-1,4]`, plus Q/DQ).
+  Decode needs only k rows, so the kernel can gather straight from the NCHW conv output
+  (`a = i % 3`, `(h, w) = divmod(i / 3, W)`). Checked: this reproduces rest.onnx's delta input
+  exactly.
+
+### Correctness: bit-exact everywhere
+
+`pd_kernel.h` (one header for host, qemu and DSP) matches ONNX Runtime's real output **bit for bit**
+at all 5 levels and for both delta sources (rest.onnx's fp32 per-anchor input, and the backbone's
+NCHW uint8 conv output):
+
+| check | result |
+|---|---|
+| host C (`pd_host_check.c`) | 0 of 18,652 values differ |
+| qemu, Hexagon v73 scalar build (`pd_qemu.c`) | 0 differ |
+| **phone CDSP** (`pd_client.c`, every config below) | **0 differ** |
+
+This can be bit-exact where RoiAlign (max error 6.5e-5 on the phone) wasn't, because it's scalar
+IEEE fp32: no HVX qfloat, and it's built with `-ffp-contract=off` so there are no FMAs the graph
+doesn't have. `exp` is the kernel's own polynomial (no libm, no fp64): it's **at most 1 ulp** from
+correctly rounded over all 2.18 billion floats in [-10, 4.1352]. ORT's own `Exp` differs from it at
+ulp level, so before the grid quantization boxes differ from ORT's by up to 1.2e-4 in a few percent
+of elements (coordinates are ~1000 px, so 1 ulp is 6e-5). The ~5 px box grid then absorbs every
+one of those differences.
+
+### Speed on the phone
+
+All 5 levels in one FastRPC call; medians of two full runs, 21 reps each. ORT is the same 315 nodes
+cut out of rest.onnx (`make_pd_ort_model.py`), one `Run`, stock onnxruntime-android 1.26 arm64 C API:
+
+| | DSP kernel | roundtrip | vs ORT |
+|---|---:|---:|---:|
+| ONNX Runtime CPU on the phone (1 thread / default) | -- | 1.04 / 1.05 ms | 1.00x |
+| NCHW uint8 source, fast path, 6 threads | 0.40 ms | **0.66 ms** | **1.58x** |
+| NCHW uint8 source, fast path, 4 threads | 0.47 ms | 0.75 ms | 1.39x |
+| NCHW uint8 source, fast path, 1 thread | 1.29 ms | 1.58 ms | 0.66x |
+| fp32 per-anchor source (today's boundary), fast path, 6 threads | 0.51 ms | 0.83 ms | 1.26x |
+| division-per-element reference path, 6 threads | 0.76-0.85 ms | 1.11-1.15 ms | ~0.93x |
+
+ORT gains nothing from more threads (315 tiny nodes, dominated by per-node dispatch). The first
+bit-exact DSP version was 4.5 ms single-threaded and lost to ORT at every thread count. What
+closed the gap, with every step keeping the output bit-exact:
+
+1. **12 scalar fp32 divisions per box -> none on the common path.** The two-stage delta requant is
+   a function of the backbone's uint8 value only, so it becomes a 256-entry per-level LUT. fp32
+   deltas map back to their uint8 index with an exact on-grid check and fall back to the full chain
+   if they're ever off-grid; the host check tests that fallback with deliberately perturbed deltas.
+   The box-grid quantize multiplies by 1/scale and only does the real division when the quotient is
+   within 1e-3 of a .5 tie. That was checked exhaustively over all 1.15 billion floats in [0, 1279]:
+   0 mismatches, with 0.016% of values taking the division fallback.
+2. **Anchors computed, not gathered.** All 5 real anchor tables are exactly `base[i % 3] + (w, h,
+   w, h) * stride` with small-integer values, so they're exact in fp32. `set_model` verifies this
+   against the uploaded table on the DSP and falls back to table reads if it ever fails. The row
+   divide is a magic-number multiply, because Hexagon has no integer divide instruction and the
+   freestanding build has no helper for it.
+3. **Blocked, branch-free math plus `dcfetch` prefetch of the next block's gather addresses.** The
+   generated assembly shows the exp loop software-pipelined at 15 packets per element (about 2 fp32
+   ops per packet, the scalar FP limit), so the math is cheap. The random gathers into the
+   multi-MB maps are the real cost, which is why prefetching the next block helped (1.45 -> 1.29 ms
+   single-threaded).
+
+The TURBO clock vote changed nothing.
+
+### Honest caveats
+
+- **This region is small.** It's ~1 ms of ORT time, while the whole rest.onnx remainder costs
+  200-500 ms per image. The absolute saving is ~0.4 ms. FastRPC's fixed ~0.26 ms is about 40% of the
+  roundtrip, so a standalone call is a poor unit. The case for it is as part of a larger
+  DSP-resident rest pipeline (TopK and NMS next to it), not on its own.
+- **It needs DSP threads.** Single-threaded it loses to ORT; 4+ threads are needed to win.
+- **The NCHW source also removes the backbone's full-map layout work** (dequant + transpose over all
+  217,413 anchors, done today inside the compiled backbone). `bb_layout` prices that with a plain,
+  unvectorized C loop at 9.7 ms on 1 DSP thread / 3.6 ms on 4 (output checked equal to rest.onnx's
+  real input). That's an upper bound: the backbone's real cost for these fused layout ops wasn't
+  isolated here.
+
+### Reproduce
+
+```
+python capture_proposal_decode.py --model maskrcnn_sim.onnx --rest rest.onnx --image IMG --out DATA
+cc -O2 -ffp-contract=off -o pd_host_check pd_host_check.c && ./pd_host_check DATA   # also writes lN_params.bin
+python make_pd_ort_model.py --rest rest.onnx --data DATA
+clang-19 --target=hexagon -mcpu=hexagonv73 -O2 -ffp-contract=off -static -nostdlib -ffreestanding \
+  -fuse-ld=lld -o pdq pd_qemu.c   # then: qemu-hexagon-static pdq DATA/lN_*.bin ... A k H W
+HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... DATA=DATA ORT_AAR_DIR=<extracted onnxruntime-android aar> ./build.sh
+```
+
 ## Files
 
 - `capture_kernel.py` -- capture tinygrad's rendered Hexagon C for a shape, verified under qemu.
@@ -1540,3 +1651,8 @@ when candidates differ only in raw compute-instruction mix with comparable worki
   shape ops in Mask R-CNN's `rest.onnx` (proposal decode, TopK, NonMaxSuppression, RoiAlign) could
   be ported to hand-written HVX kernels, with real shapes/dtypes/constants pulled from the actual
   graph and a ranked, honest difficulty assessment per op.
+- `proposal_decode/` -- RPN proposal decode (post-TopK gather -> delta requant -> Detectron decode ->
+  clip -> box-grid quantize), all 5 FPN levels in one FastRPC call: bit-exact with ONNX Runtime on
+  host, qemu and the phone, 1.58x ORT-on-the-phone end to end with 6 DSP threads, and able to read the
+  backbone's NCHW uint8 conv output directly instead of the full-map per-anchor layout. See
+  "Proposal decode (RPN)" above; `proposal_decode/build.sh` runs the phone side.
