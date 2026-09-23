@@ -83,6 +83,28 @@
    "y": 0
   }
  },
+ "misc_op_step_templates/MaxPool_16x64x112x112_zp.axmodel.gz": {
+  "op": "MaxPool",
+  "scales": {
+   "x": 0.03390980511903763,
+   "y": 0.03390980511903763
+  },
+  "zero_points": {
+   "x": 108,
+   "y": 108
+  }
+ },
+ "misc_op_step_templates/MaxPool_16x64x112x112_zp__v2.axmodel.gz": {
+  "op": "MaxPool",
+  "scales": {
+   "x": 0.016862744465470314,
+   "y": 0.016862744465470314
+  },
+  "zero_points": {
+   "x": 71,
+   "y": 71
+  }
+ },
  "misc_op_step_templates/ReduceMean_16x512x7x7.axmodel.gz": {
   "op": "ReduceMean",
   "scales": {
@@ -99,6 +121,28 @@
   "scales": {
    "x": 0.05949512869119644,
    "y": 0.009169379249215126
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ },
+ "misc_op_step_templates/ReduceSum_1024x9x3136_axes1_k1_zp0.axmodel.gz": {
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.003921568859368563,
+   "y": 0.03310549631714821
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ },
+ "misc_op_step_templates/ReduceSum_1024x9x3136_axes1_k1_zp0__v2.axmodel.gz": {
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.06672659516334534
   },
   "zero_points": {
    "x": 0,

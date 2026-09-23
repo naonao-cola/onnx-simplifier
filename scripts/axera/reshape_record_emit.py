@@ -470,6 +470,20 @@ def step_template(
     return dict(entry, axmodel=os.path.join(STEP_TEMPLATE_DIR, entry["axmodel"]))
 
 
+def step_template_zp0(
+    in_shape: Sequence[int], out_shape: Sequence[int], manifest: dict | None = None
+) -> dict:
+    """Like ``step_template``, for a zero point of 0 (a nonnegative input:
+    the zero-point writes are elided, so it is its own program). Only the
+    scale moves; ``docs/axera-step-real-calibration.md``."""
+    m = manifest if manifest is not None else step_manifest()
+    key = _shape_key(in_shape, out_shape)
+    entry = m.get("zero_point_0_templates", {}).get(key)
+    if entry is None:
+        raise ValueError(f"no validated zero-point-0 step Reshape template for {key}")
+    return dict(entry, axmodel=os.path.join(STEP_TEMPLATE_DIR, entry["axmodel"]))
+
+
 def emit_step_reshape(
     in_shape: Sequence[int],
     out_shape: Sequence[int],
@@ -478,11 +492,17 @@ def emit_step_reshape(
     output_path: str | None = None,
 ) -> onnx.ModelProto:
     """The step template for ``in_shape -> out_shape`` retargeted to the
-    calibration ``(scale, zero_point)``. Refuses a zero point of 0 (a
-    different program; see ``retarget_scale``)."""
-    entry = step_template(in_shape, out_shape)
-    model = load_axmodel(entry["axmodel"])
-    _neu(model).raw_data = retarget_scale(mcode_of(model), scale, zero_point)
+    calibration ``(scale, zero_point)``. A zero point of 0 needs its own
+    template (``step_template_zp0``; a different program, see
+    ``retarget_scale``)."""
+    if zero_point == 0:
+        entry = step_template_zp0(in_shape, out_shape)
+        model = load_axmodel(entry["axmodel"])
+        _neu(model).raw_data = retarget_scale(mcode_of(model), scale)
+    else:
+        entry = step_template(in_shape, out_shape)
+        model = load_axmodel(entry["axmodel"])
+        _neu(model).raw_data = retarget_scale(mcode_of(model), scale, zero_point)
     if output_path:
         onnx.save(model, output_path)
     return model

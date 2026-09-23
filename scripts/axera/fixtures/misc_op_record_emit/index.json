@@ -121,6 +121,26 @@
    "y": 0
   }
  },
+ "MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1:zp": {
+  "file": "misc_op_step_templates/MaxPool_16x64x112x112_zp.axmodel.gz",
+  "op": "MaxPool",
+  "scales": {
+   "x": 0.03390980511903763,
+   "y": 0.03390980511903763
+  },
+  "shape": [
+   16,
+   64,
+   112,
+   112
+  ],
+  "source": "t_step_zp/maxpool_zpA",
+  "variant_of": "MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1",
+  "zero_points": {
+   "x": 108,
+   "y": 108
+  }
+ },
  "ReduceMean:16x512x7x7:axes2,3:k1": {
   "file": "misc_op_step_templates/ReduceMean_16x512x7x7.axmodel.gz",
   "op": "ReduceMean",
@@ -183,6 +203,29 @@
   "zero_points": {
    "x": 125,
    "y": 128
+  }
+ },
+ "ReduceSum:1024x9x3136:axes1:k1:zp0": {
+  "axes": [
+   1
+  ],
+  "file": "misc_op_step_templates/ReduceSum_1024x9x3136_axes1_k1_zp0.axmodel.gz",
+  "keepdims": 1,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.003921568859368563,
+   "y": 0.03310549631714821
+  },
+  "shape": [
+   1024,
+   9,
+   3136
+  ],
+  "source": "t_step_zp/reducesum_zp0_a",
+  "variant_of": "ReduceSum:1024x9x3136:axes1:k1",
+  "zero_points": {
+   "x": 0,
+   "y": 0
   }
  },
  "ReduceSum:16x1000:axes0,1:k1": {

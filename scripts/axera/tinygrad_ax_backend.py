@@ -834,7 +834,13 @@ def extract_step_ops(onnx_path: str) -> list[dict]:
     producers = {o for n in model.graph.node for o in n.output}
     for node in model.graph.node:
         attrs = {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
-        rec: dict[str, Any] = {"op": node.op_type, "name": node.name, "attrs": {}}
+        rec: dict[str, Any] = {
+            "op": node.op_type,
+            "name": node.name,
+            "attrs": {},
+            "inputs": list(node.input),
+            "outputs": list(node.output),
+        }
         if node.op_type in _WEIGHT_OPS and len(node.input) > 1:
             wname = node.input[1]
             if wname in inits:
@@ -1043,19 +1049,231 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
         return ("refused", str(exc))
 
 
+# --------------------------------------------------------------------------
+# A real calibration (step_calibration.py) settles "conditional" nodes.
+# --------------------------------------------------------------------------
+
+
+class _NotAtCalibration(ValueError):
+    pass
+
+
+def _tensor_q(calib: Mapping, name: str) -> Mapping:
+    q = calib["tensors"].get(name)
+    if q is None:
+        raise _NotAtCalibration(f"no calibration for tensor {name!r}")
+    return q
+
+
+def _u8_zp(calib: Mapping, name: str) -> int:
+    q = _tensor_q(calib, name)
+    if q["signed"]:
+        raise _NotAtCalibration(
+            f"{name} is symmetric int8 (it only feeds MatMuls); templates are uint8"
+        )
+    return int(q["zero_point"])
+
+
+def _class_hits(
+    rec: Mapping, classes: Sequence[str], cache: TemplateCache
+) -> list[str]:
+    hits = []
+    for zp in classes:
+        try:
+            cache.lookup(key_for_record(rec, zp))
+            hits.append(zp)
+        except ValueError:
+            pass
+    return hits
+
+
+def _misc_accepts(meta: Mapping, zx: int, zy: int) -> str | None:
+    """Why template ``meta`` cannot take zero points ``(zx, zy)``, or None.
+    What each op's ``misc_op_record_emit.retarget`` can move is measured:
+    ReduceSum both zero points (while zp_x stays nonzero; a zero-point-0
+    template keeps its own), Softmax zp_x, MaxPool its one shared nonzero
+    zero point; every other zero point is fixed by the template."""
+    op, fixed = meta["op"], dict(meta.get("zero_points") or {})
+    if op == "ReduceSum" and fixed.get("x", 1) != 0:
+        return None if zx != 0 else "zp_x = 0 (a different program)"
+    if op == "Softmax":
+        if zx == 0:
+            return "zp_x = 0 (unmeasured)"
+        return None if zy == fixed["y"] else f"zp_y {zy} != template {fixed['y']}"
+    if op == "MaxPool" and fixed.get("x", 0) != 0:
+        return None if zx == zy != 0 else f"x{zx},y{zy} is not one nonzero zero point"
+    if {"x": zx, "y": zy} != fixed:
+        return f"zero points x{zx},y{zy} are fixed by the template at {fixed}"
+    return None
+
+
+def _at_calibration_misc(rec: Mapping, calib: Mapping) -> str:
+    index = misc.load_index()
+    base = rec["attrs"]["misc_key"]
+    zx = _u8_zp(calib, rec["inputs"][0])
+    zy = _u8_zp(calib, rec["outputs"][0])
+    keys = [base] + sorted(k for k, v in index.items() if v.get("variant_of") == base)
+    why = []
+    for key in keys:
+        reason = _misc_accepts(index[key], zx, zy)
+        if reason is None:
+            return f"misc_op_record_emit retarget of {key} (zero points x{zx},y{zy})"
+        why.append(f"{key}: {reason}")
+    raise _NotAtCalibration("; ".join(why))
+
+
+def _at_calibration_matmul(rec: Mapping, calib: Mapping) -> str:
+    """Actually recalibrate the node's template onto the predicted scales."""
+    entry = mre.step_template(rec["name"])
+    old = mre.load_scales(entry["quant"])
+    real: dict[str, tuple[float, float]] = {}
+    for step_name, name in entry["names"].items():
+        q = _tensor_q(calib, step_name)
+        if "consumer_int8_scale" in q and name in old and old[name][1] == 0:
+            # the MatMul's own symmetric requantization of a mixed-use tensor
+            real[step_name] = (q["consumer_int8_scale"], 0.0)
+        else:
+            real[step_name] = (q["scale"], float(q["zero_point"]))
+    try:
+        new = mre.step_node_scales(entry, old, real)
+        mre.recalibrate(mre.load_model(entry["axmodel"]), old, new)
+    except mre.CalibrationError as exc:
+        raise _NotAtCalibration(str(exc)) from exc
+    return f"matmul_record_emit.recalibrate onto the scales ({entry['template']})"
+
+
+def plan_at_calibration(
+    rec: Mapping, calib: Mapping, cache: TemplateCache | None = None
+) -> tuple[str, str]:
+    """``plan_node`` with ``"conditional"`` settled against a real calibration
+    (``step_calibration.calibrate``): ``"covered"`` when the node's predicted
+    zero points fall in its template's class (for live-operand MatMuls, when
+    ``recalibrate`` succeeds on the predicted scales), else ``"refused"``."""
+    cache = cache or TemplateCache()
+    status, detail = plan_node(rec, cache)
+    if status != "conditional":
+        return status, detail
+    op, attrs = rec["op"], rec.get("attrs", {})
+    try:
+        live = mre.step_manifest()["nodes"].get(rec.get("name", ""))
+        if live is not None and op in ("MatMul", "Gemm", "Conv"):
+            return "covered", _at_calibration_matmul(rec, calib)
+        key = attrs.get("misc_key")
+        if key and misc.load_index().get(key):
+            if op not in ew.OPS or not _class_hits(rec, _ELEMENTWISE_ZP_CLASSES, cache):
+                return "covered", _at_calibration_misc(rec, calib)
+        if op in ew.OPS:
+            zx = _u8_zp(calib, rec["inputs"][0])
+            zy = _u8_zp(calib, rec["outputs"][0])
+            cls = f"x{zx},y{zy}"
+            hits = _class_hits(rec, _ELEMENTWISE_ZP_CLASSES, cache)
+            if op == "Relu" and cls not in hits and zx == zy != 0:
+                if "x128,y128" in hits:
+                    # ew.retarget_relu_records: the zero point is a whole word
+                    return "covered", f"Relu record retarget from x128,y128 ({cls})"
+                raise _NotAtCalibration(
+                    f"zero points {cls} are not a template class {hits}"
+                )
+            return "covered", f"ElementwiseScaleEdit ({cls})"
+        if op in bse.OPS:
+            zx = _u8_zp(calib, rec["inputs"][0])
+            zz = _u8_zp(calib, rec["inputs"][1])
+            zy = _u8_zp(calib, rec["outputs"][0])
+            cls = f"x{zx},y{zy},z{zz}"
+            hits = _class_hits(rec, _BINARY_ZP_CLASSES[op], cache)
+            if cls not in hits:
+                raise _NotAtCalibration(
+                    f"zero points {cls} are not a template class {hits}"
+                )
+            return "covered", f"ElementwiseScaleEdit ({cls})"
+        if op == "Reshape" and "bias flatten" not in detail:
+            zp = _u8_zp(calib, rec["inputs"][0])
+            if zp == 0:
+                try:
+                    rre.step_template_zp0(rec["shapes"][0], attrs.get("out", []))
+                except ValueError as exc:
+                    raise _NotAtCalibration(
+                        "Reshape zero point is 0 and no zero-point-0 template "
+                        "serves this shape"
+                    ) from exc
+                return "covered", "reshape_record_emit zero-point-0 template"
+            return "covered", f"reshape_record_emit.retarget_scale (zp {zp})"
+    except _NotAtCalibration as exc:
+        return "refused", f"at calibration: {exc}"
+    return status, detail
+
+
+def chain_internal_nodes() -> dict[str, set[str]]:
+    """``{step tensor: {MatMul node}}``: tensors a live-operand MatMul step
+    template computes inside its own chain (its Gather/Mul/Reshape/Transpose
+    ops), i.e. every chain tensor that is not a template graph input."""
+    out: dict[str, set[str]] = {}
+    for node in mre.step_manifest()["nodes"]:
+        entry = mre.step_template(node)
+        inputs = {i.name for i in mre.load_model(entry["axmodel"]).graph.input}
+        for step_name, name in entry["names"].items():
+            if name not in inputs:
+                out.setdefault(step_name, set()).add(node)
+    return out
+
+
+def _absorb_into_chains(
+    records: Sequence[Mapping], plans: list[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    """Nodes computed inside a MatMul chain template that is itself covered
+    are covered by that template (their own template, if any, is moot)."""
+    by_name = {r.get("name"): p for r, p in zip(records, plans)}
+    internal = chain_internal_nodes()
+    out = []
+    for rec, (status, detail) in zip(records, plans):
+        if status != "covered" and rec["op"] not in ("MatMul", "Gemm", "Conv"):
+            chains = sorted(
+                c
+                for t in rec.get("outputs", [])
+                for c in internal.get(t, ())
+                if by_name.get(c, ("",))[0] == "covered"
+            )
+            if chains:
+                status, detail = (
+                    "covered",
+                    f"computed inside the {chains[0]} chain template",
+                )
+        out.append((status, detail))
+    return out
+
+
+def load_calibration(path: str) -> dict:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt") as f:
+        return json.load(f)
+
+
 def coverage_report(
-    records: Sequence[Mapping], policy: QuantPolicy | None = None
+    records: Sequence[Mapping],
+    policy: QuantPolicy | None = None,
+    calibration: Mapping | None = None,
 ) -> dict:
     """Per-op counts of covered / conditional / refused nodes, with reasons.
     With a ``policy``, also each node's weight dtype (``per_node``) and a
-    count of those outcomes per op (``weight_dtypes``)."""
+    count of those outcomes per op (``weight_dtypes``). With a
+    ``calibration`` (``step_calibration.calibrate``), conditional nodes are
+    settled against it (``plan_at_calibration``); records then need their
+    ``inputs``/``outputs`` tensor names (``extract_step_ops``)."""
     cache = TemplateCache()
     per_op: dict[str, Counter] = defaultdict(Counter)
     reasons: dict[str, Counter] = defaultdict(Counter)
     per_node = []
     wd: dict[str, Counter] = defaultdict(Counter)
+    plans = []
+    for rec in records:
+        if calibration is not None:
+            plans.append(plan_at_calibration(rec, calibration, cache))
+        else:
+            plans.append(plan_node(rec, cache))
+    if calibration is not None:
+        plans = _absorb_into_chains(records, plans)
     for i, rec in enumerate(records):
-        status, detail = plan_node(rec, cache)
+        status, detail = plans[i]
         per_op[rec["op"]][status] += 1
         reasons[rec["op"]][f"{status}: {detail}"] += 1
         if policy is not None:
@@ -1215,6 +1433,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     cov.add_argument("records")
     cov.add_argument("--weight-dtype", help="per-node weight dtype for this choice")
     cov.add_argument("--path", default="build", choices=sorted(WEIGHT_PATHS))
+    cov.add_argument(
+        "--calibration",
+        help="step_calibration.py JSON: settle conditional nodes against it",
+    )
     args = p.parse_args(argv)
     if args.cmd == "extract":
         with gzip.open(args.out, "wt") as f:
@@ -1225,7 +1447,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     policy = None
     if args.weight_dtype:
         policy = QuantPolicy(default=args.weight_dtype, path=args.path)
-    report = coverage_report(records, policy)
+    calib = load_calibration(args.calibration) if args.calibration else None
+    report = coverage_report(records, policy, calib)
     report.pop("per_node", None)
     print(json.dumps(report, indent=1))
     return 0

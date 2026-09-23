@@ -26,7 +26,9 @@ LZ-style compressed register writes: a value is stored as a literal byte, or,
 when an earlier record already holds the same value, as a back-reference to
 it. Changing a zero point can therefore change lengths and shift every later
 back-reference distance (``docs/axera-elementwise-scale-emit.md``). A template
-serves exactly the zero points it was built with.
+serves exactly the zero points it was built with -- except through
+``retarget_relu_records``, which works on the decompressed records
+(``short_unit_codec.py``) and moves a Relu to any nonzero zero point.
 
 **Binary ops (Add/Sub/Mul/Div) are refused.** Held-out builds whose input and
 output scale ratios differ from the template's change 17-53 MCode regions,
@@ -194,6 +196,35 @@ def retarget(mc: bytes, op: str, old_scales, new_scales) -> bytes:
 def retarget_scale(mc: bytes, old_scale: float, new_scale: float) -> bytes:
     """Relu shorthand for ``retarget``."""
     return retarget(mc, "Relu", {"x": old_scale}, {"x": new_scale})
+
+
+def retarget_relu_records(mc: bytes, scale: float, zero_point: int) -> bytes:
+    """A Relu template moved to ``(scale, zero_point)`` at the record level.
+
+    ``retarget`` above predates the MCode codec (``short_unit_codec.py``) and
+    patches float literals in the compressed stream, which is why it could not
+    move zero points. Decompressed, a standalone Relu writes its one shared
+    zero point as whole words to 0x1b10/0x1eb0/0x1a90 and its scale as
+    ``1/s``, ``s`` lanes, exactly like the Relu of a non-fused Reshape -> Relu
+    (``reshape_record_emit.retarget_scale``). Moving the ``x128,y128``
+    template to any nonzero zero point reproduces native builds record for
+    record (``docs/axera-step-real-calibration.md``); a zero point of 0 is a
+    different program (``x0,y0`` templates)."""
+    import reshape_record_emit as rre
+
+    if not 0 < int(zero_point) < 256:
+        raise ValueError(f"zero point {zero_point}: only nonzero uint8 retargets")
+    return rre.retarget_scale(mc, scale, int(zero_point))
+
+
+def emit_relu_at(shape, scale: float, zero_point: int, out_path: str) -> str:
+    """A standalone ``Relu(x[shape])`` at any nonzero shared zero point, from
+    the committed ``x128,y128`` template."""
+    model, _ = load_template("Relu", shape, {"x": 128, "y": 128})
+    mc = retarget_relu_records(
+        bytes(_mcode_initializer(model).raw_data), scale, zero_point
+    )
+    return _write(model, mc, out_path)
 
 
 def _key(op: str, shape, zero_points: Mapping[str, int]) -> str:
