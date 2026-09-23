@@ -13,7 +13,7 @@ re-run therefore redoes only what changed: editing `bench:` re-runs bench and no
 |---|---|---|
 | fetch | pinned model (url + sha256, a `script`, or a local `path`); COCO val2017 images by id | `model.onnx`, `_images/` |
 | simplify | onnxsim with the spec's fixed input shapes (QNN needs static shapes) | `model.onnx` |
-| quantize | `onnxsim.quantize_static(full_graph=True)`: QDQ on every activation (uint8), per-channel int8 weights, int32 biases, real calibration images; `calibration_method` minmax / mse / percentile / entropy (streamed histograms: memory doesn't grow with #images) | `model.onnx`, `quantize_meta.json` |
+| quantize | `onnxsim.quantize_static(full_graph=True)`: QDQ on every activation (uint8), per-channel int8 weights, int32 biases, real calibration images; `calibration_method` minmax / mse / percentile / entropy (streamed histograms: memory doesn't grow with #images), or `auto` (picks one by the spec's accuracy metric, below) | `model.onnx`, `quantize_meta.json` |
 | rewrite | passes from `passes/` (`uint8_input`, `uint8_outputs`, `script` = any existing `in.onnx out.onnx` rewrite, e.g. `../htp_exploration/ceiling/*.py`) | `model.onnx`, `rewrite_meta.json` |
 | post | CPU post-processing graph from standard ONNX ops (`yolo_detect`: decode + NonMaxSuppression) | `post.onnx` |
 | pipe | `pipe.txt` for `runtime/pipe_run` + preprocessed eval inputs | `pipe.txt`, `inputs/*.bin`, `pipe_meta.json` |
@@ -67,6 +67,31 @@ linked against `../e2e_pipeline/build.sh`'s stubs). All HTP sessions are strict 
   entropy to ~63/92 on the 20-image set, both still below minmax. Per-tensor weights
   (`per_channel: false`) drop to 63/92: per-channel it is. HTP times vary by ~0.3 ms run to run
   (shared phone).
+- **`calibration_method: auto`** (`onnxsim.pick_calibration`) quantizes once per candidate
+  (minmax, mse, percentile 99.999 / 99.99, entropy, and onnxsim's per-tensor `auto`; set
+  `auto_candidates` to change them) and keeps the best by the spec's own accuracy kind on host ORT
+  against fp32: matched detections through the spec's postprocess for `detection_match`, worst
+  per-output SQNR otherwise. It never sees the eval images. It cross-fits over the calibration
+  images (`auto_folds`, default 4): each quarter is scored by candidates calibrated on the other
+  three, then the winner is calibrated on all 64. One held-out quarter alone is not enough. On
+  YOLO11n it ranked percentile 99.99 first, which coco128 and the phone both rank below mse:
+
+  | candidate | 4 folds over the 64 calibration images | 16-image holdout | coco128 host (659 boxes) | coco128 phone |
+  |---|---|---|---|---|
+  | minmax | 0.884 | 0.865 | 559 | 585 |
+  | **mse** | **0.909** | 0.888 | **607** | **596** |
+  | percentile 99.999 | 0.877 | 0.843 | 593 | 585 |
+  | percentile 99.99 | 0.888 | **0.921** | 594 | 575 |
+  | entropy | 0.759 | 0.742 | 512 | - |
+  | per-tensor auto | 0.879 | 0.876 | 589 | - |
+
+  (coco128 host: calibrated on 48 of the 64 images, ORT at its basic level, which keeps every QDQ pair.)
+
+  `auto` picks mse, byte-identical to the default model above, in 386 s (5 calibration runs,
+  6 candidates x 64 images; cached after that) at 1.7 GB peak RSS. The per-tensor `auto`
+  minimizes each tensor's own expected uint8 error and never clips graph outputs, Sigmoid/Softmax
+  outputs or score logits (SiLU's gate excepted). That is not the task's error: it trails mse
+  (589 vs 607), which is why the model-level pick scores with the task metric.
 - **Calibration memory** (peak RSS; each tensor's histogram is 4096 int64 counts, streamed batch by batch):
 
   | model | images | peak RSS (any method) | the old keep-every-value entropy/mse would hold |
@@ -104,7 +129,9 @@ linked against `../e2e_pipeline/build.sh`'s stubs). All HTP sessions are strict 
    zeroed every score (0 detections); excluded, it gives 87% matched. Then compare
    `calibration_method`s (`minmax`, `mse`, `percentile` + `percentile: 99.999`, `entropy`) on
    more eval images than you think you need, and keep a detector's score path at its exact range
-   with `minmax_tensors` if a clipping method loses detections.
+   with `minmax_tensors` if a clipping method loses detections. `calibration_method: auto` runs
+   that comparison for you on the calibration images (cross-fitted), and writes every candidate's
+   score to `quantize/quantize_meta.json`.
 4. **If the model's uint8 input is plain pixels** (scale 1/255, zero point 0), set
    `pipeline.host_quantize: true`. The camera frame then goes in as-is: YOLO11n went from 30 to 4.8 ms,
    because the fp32->uint8 `quant_in` on the phone took 15-20 ms.
