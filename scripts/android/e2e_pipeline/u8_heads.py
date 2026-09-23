@@ -20,6 +20,12 @@ DequantizeLinear + Sigmoid moves into a `mask_sel` step that also does seg5's pe
 gather -- 1 of 81 channels converted instead of all of them, through an exact 256-entry table.
 Same quantization parameters as the graph's own nodes, so the uint8 values the HTP sees are the
 ones it computed itself before.
+
+pipe_e_u8ra.txt / pipe_e_u8ra_ctx.txt additionally use the merged uint8 RoiAlign skel
+(../tinygrad_hexagon_bridge/roialign_fast/roialign_u8_*): per head, one `roialign_u8` call reads the
+backbone's uint8 NHWC maps (staged into rpcmem once per frame by `rpc_stage`) and writes the head's
+uint8 input rows directly -- replacing the maps' dq, the 4 per-level roialign steps, the ScatterND
+merge segment (seg2/seg4) and the `quant` step.
 """
 
 import sys
@@ -133,7 +139,56 @@ def main(out):
     # EP-context variant: ctx=2 = context binary in its own file next to a small .ctx0.onnx (loads
     # faster than the embedded form); the phone compiles it on first use and reuses it after.
     (O / "pipe_e_u8_ctx.txt").write_text("\n".join(_ctx(ln) for ln in res) + "\n")
-    print("wrote", O / "pipe_e_u8.txt", O / "pipe_e_u8_ctx.txt")
+    ra = u8_roialign(res)
+    (O / "pipe_e_u8ra.txt").write_text("\n".join(ra) + "\n")
+    (O / "pipe_e_u8ra_ctx.txt").write_text("\n".join(_ctx(ln) for ln in ra) + "\n")
+    print("wrote", O / "pipe_e_u8.txt", O / "pipe_e_u8_ctx.txt", O / "pipe_e_u8ra.txt", O / "pipe_e_u8ra_ctx.txt")
+
+
+def u8_roialign(lines):
+    """pipe_e_u8 lines -> the roialign_u8 variant (see the module docstring)."""
+    F = [ln.split() for ln in lines]
+    dq = {f[2]: f for f in F if f[0] == "dq"}  # map name (e.g. 391@nhwc) -> dq line
+    ra = [f for f in F if f[0] == "roialign"]
+    maps = []
+    for f in ra:
+        if f[1] not in maps:
+            maps.append(f[1])
+    assert len(maps) == 4 and all(m in dq for m in maps), maps
+    for f in F:  # the dq outputs feed nothing but the roialign lines
+        if f[0] not in ("dq", "roialign"):
+            assert not set(",".join(f[1:]).split(",")) & set(dq), f
+    staged = {m: dq[m][1] + "@rpc" for m in maps}
+    ra_out = {f[3]: f for f in ra}
+    out, drop = [], set()
+    for f in F:
+        if f[0] == "dq":
+            if f is F[[g[0] for g in F].index("dq")]:  # first dq line: stage the maps once instead
+                out.append(f"rpc_stage maps {','.join(dq[m][1] for m in maps)} {','.join(staged[m] for m in maps)}")
+            continue
+        if f[0] == "roialign":
+            continue
+        if f[0] == "ort" and set(f[5].split(",")) & set(ra_out):
+            # the merge segment: ins = DATA, (ROWS, ROI_OUT) pairs; its output feeds a quant step
+            ins = f[5].split(",")
+            pairs = {ins[i + 1]: ins[i] for i in range(1, len(ins) - 1, 2)}
+            (q,) = [g for g in F if g[0] == "quant" and g[1] == f[6]]
+            spans = [ra_out[o] for o in ins[2::2]]
+            spans.sort(key=lambda g: maps.index(g[1]))
+            lv = []
+            for g in spans:
+                m = dq[g[1]]
+                lv.append(f"{staged[g[1]]}:{m[3]}:{m[4]}:{g[7]}:{g[2]}:{pairs[g[3]]}")
+            oh, ow, sr = spans[0][4], spans[0][5], spans[0][6]
+            C = 256  # FPN channels (the kernel checks C % 128 == 0, C <= 256)
+            name = {"7": "box_ra", "14": "mask_ra"}.get(oh, "ra_" + oh)
+            out.append(f"roialign_u8 {name} {ins[0]} {q[2]} {C} {oh} {ow} {sr} {q[3]} {q[4]} {','.join(lv)}")
+            drop.add(id(q))
+            continue
+        if id(f) in drop:
+            continue
+        out.append(" ".join(f))
+    return out
 
 
 def _ctx(ln):
