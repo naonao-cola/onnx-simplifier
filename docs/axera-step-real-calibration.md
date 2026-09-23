@@ -76,7 +76,8 @@ conditionals against the predicted calibration:
 | master's templates, conditionals settled | 395 | 18 | 691 |
 | + nodes computed inside covered MatMul chains | 426 | 18 | 660 |
 | + the zero-point work above | 446 | 18 | 640 |
-| + #1892's Neg and same-bytes ReduceSum templates, settled here | **449** | 18 | 637 |
+| + #1892's Neg and same-bytes ReduceSum templates, settled here | 449 | 18 | 637 |
+| + bias-flatten Reshapes as fused ReduceSum chains (below) | **467** | 0 | 637 |
 
 Per op, covered at the predicted calibration, before (master's templates) ->
 after:
@@ -85,15 +86,45 @@ after:
 - MaxPool 0 -> 1
 - ReduceSum 42 -> 44 (one via #1892's same-bytes `[16,64,112,112]` equivalent)
 - Neg 0 -> 2 (#1892's large-program template, zero points x255,y0)
-- Reshape 118 -> 135
+- Reshape 118 -> 153 (18 via the fused ReduceSum chains below)
 - Mul 0 -> 14 (inside MatMul chains)
 - Squeeze 0 -> 1 (inside a MatMul chain)
 
 Already at their final counts: Sqrt 42/42, Softmax 3/3, Log 2/2, Cast,
 Greater, Less, Gather and Transpose all, and MatMul 24/41.
 
-The 18 still conditional are bias-flatten Reshapes that fuse into a
-neighbour (`reshape_emit.py`).
+### The 18 bias-flatten Reshapes
+
+All 18 are Adam bias-gradient flattens, `ReduceSum -> [1,C] -> Reshape ->
+[C]`, feeding two Muls (`(1-beta1)*g` and `g*g`). They share the ReduceSum's
+quantization (a Reshape is passive), so the question is only what Pulsar2
+compiles for the pair. Measured per step `C` (`t_step_rsfused/`), each at two
+calibrations with nonzero zero points, `P = ReduceSum -> Reshape` against
+`Q = ReduceSum` alone:
+
+| C | ReduceSum input | P vs Q |
+| ---: | --- | --- |
+| 512, 256 | `[16,1,C,HW]` axes 0,3 | identical records, tables and tail (only the 301-325 segment-0 noise window differs): the Reshape compiles to nothing |
+| 1000 | `[16,1000]` axis 0, keepdims | P is 96 decompressed bytes longer |
+| 128, 64 | `[16,1,C,HW]` axes 0,3 | a different ReduceSum tiling (`npu_params` 340 vs 480 and 660 vs 720 bytes) |
+
+A rebuild of each differing P and Q reproduces itself record for record, so
+the differences are real, not rebuild noise. Either way the fused chain `P` is
+the template: `misc_op_record_emit.retarget(op="ReduceSum")` carries every P
+(and Q) build to its other calibration record for record in both directions.
+They are registered as `ReduceSum:<shape>:axes..:k..:reshape<C>` in the
+misc-op index, and `extract_step_ops` gives each flatten a `fused_key`.
+`Reshape_475` needs no chain build: `ReduceSum_474`'s same-bytes equivalent
+`[16,64,112,112]` over axes (0,2,3) already writes the flattened `[64]`. All 18
+settle as covered at the predicted calibration (every zero point nonzero) and
+emit.
+
+Two caveats. In a real step compile the ReduceSum and its flatten are one
+program, so a runner should emit the chain template for the pair rather than
+the ReduceSum's standalone template (which differs for C = 1000, 128, 64).
+And the flatten's rank-1 consumers can't compile as written: `Reshape -> Mul`
+at `[C]` fails Pulsar2's Mul tiler (`TileFailException ... tuple index out of
+range`), as #1869 found for rank-1 binary ops; those Muls run at `[1,C]`.
 
 ## What is still refused, and why
 

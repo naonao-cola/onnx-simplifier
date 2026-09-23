@@ -127,6 +127,116 @@
    "y": 0
   }
  },
+ "misc_op_step_templates/ReduceSumReshape_16x1000_axes0_k1_to_1000.axmodel.gz": {
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.03275791555643082,
+   "y": 0.10807306319475174
+  },
+  "zero_points": {
+   "x": 121,
+   "y": 128
+  }
+ },
+ "misc_op_step_templates/ReduceSumReshape_16x1000_axes0_k1_to_1000__v2.axmodel.gz": {
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.1965474784374237,
+   "y": 0.6484383344650269
+  },
+  "zero_points": {
+   "x": 113,
+   "y": 91
+  }
+ },
+ "misc_op_step_templates/ReduceSumReshape_16x1x128x784_axes0-3_k0_to_128.axmodel.gz": {
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.04185009375214577,
+   "y": 2.8142006397247314
+  },
+  "zero_points": {
+   "x": 124,
+   "y": 118
+  }
+ },
+ "misc_op_step_templates/ReduceSumReshape_16x1x128x784_axes0-3_k0_to_128__v2.axmodel.gz": {
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.2511005699634552,
+   "y": 16.885204315185547
+  },
+  "zero_points": {
+   "x": 124,
+   "y": 79
+  }
+ },
+ "misc_op_step_templates/ReduceSumReshape_16x1x256x196_axes0-3_k0_to_256.axmodel.gz": {
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.03879866376519203,
+   "y": 1.6299002170562744
+  },
+  "zero_points": {
+   "x": 121,
+   "y": 123
+  }
+ },
+ "misc_op_step_templates/ReduceSumReshape_16x1x256x196_axes0-3_k0_to_256__v2.axmodel.gz": {
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.2327919751405716,
+   "y": 9.779398918151855
+  },
+  "zero_points": {
+   "x": 120,
+   "y": 89
+  }
+ },
+ "misc_op_step_templates/ReduceSumReshape_16x1x512x49_axes0-3_k0_to_512.axmodel.gz": {
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.03908182308077812,
+   "y": 0.7188730835914612
+  },
+  "zero_points": {
+   "x": 124,
+   "y": 131
+  }
+ },
+ "misc_op_step_templates/ReduceSumReshape_16x1x512x49_axes0-3_k0_to_512__v2.axmodel.gz": {
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.23449093103408813,
+   "y": 4.313238620758057
+  },
+  "zero_points": {
+   "x": 123,
+   "y": 92
+  }
+ },
+ "misc_op_step_templates/ReduceSumReshape_16x1x64x3136_axes0-3_k0_to_64.axmodel.gz": {
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.041686978191137314,
+   "y": 4.210116386413574
+  },
+  "zero_points": {
+   "x": 131,
+   "y": 135
+  }
+ },
+ "misc_op_step_templates/ReduceSumReshape_16x1x64x3136_axes0-3_k0_to_64__v2.axmodel.gz": {
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.2501218914985657,
+   "y": 25.260696411132812
+  },
+  "zero_points": {
+   "x": 130,
+   "y": 82
+  }
+ },
  "misc_op_step_templates/ReduceSum_1024x9x3136_axes1_k1_zp0.axmodel.gz": {
   "op": "ReduceSum",
   "scales": {

@@ -882,10 +882,50 @@ def extract_step_ops(onnx_path: str) -> list[dict]:
     for rec in records:
         if rec["op"] in _MISC_OPS:
             rec["attrs"]["misc_key"] = next(misc_keys)[1]
+    # A bias-flatten Reshape compiles fused with its producing ReduceSum: key
+    # the pair's chain template (misc_op_record_emit, ``...:reshape<C>``).
+    by_output = {o: r for r in records for o in r["outputs"]}
+    for rec in records:
+        src = by_output.get(rec["inputs"][0]) if rec["op"] == "Reshape" else None
+        if (
+            src is not None
+            and src["op"] == "ReduceSum"
+            and len(rec["attrs"]["out"]) == 1
+        ):
+            rs_key = src["attrs"]["misc_key"]
+            rec["attrs"]["fused_key"] = f"{rs_key}:reshape{rec['attrs']['out'][0]}"
+            rec["attrs"]["fused_producer_key"] = rs_key
+            rec["attrs"]["fused_input"] = src["inputs"][0]
     return records
 
 
 _MISC_OPS = misc.STEP_OPS
+
+
+def _fused_reducesum_chain(rec: Mapping) -> str | None:
+    """The validated template computing a bias-flatten Reshape together with
+    its producing ReduceSum: the ``ReduceSum -> Reshape`` chain build, or the
+    producer's same-bytes equivalent, which already writes the flattened
+    ``[C]`` output (ReduceSum_474 -> Reshape_475)."""
+    attrs = rec.get("attrs", {})
+    key = attrs.get("fused_key")
+    if key is None:
+        return None
+    if key in misc.load_index():
+        return key
+    alt = misc.equivalent_key(attrs["fused_producer_key"])
+    if (
+        alt is not None
+        and misc.load_index()[alt]["shape"]
+        and [
+            d
+            for i, d in enumerate(misc.load_index()[alt]["shape"])
+            if i not in misc.load_index()[alt]["axes"]
+        ]
+        == list(attrs.get("out", []))
+    ):
+        return alt
+    return None
 
 
 def _plan_misc(rec: Mapping) -> tuple[str, str] | None:
@@ -1056,6 +1096,13 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
             shape = rec["shapes"][0] if rec["shapes"] else []
             out = attrs.get("out", [])
             if len(shape) == 2 and shape[0] == 1 and out == shape[1:]:
+                chain = _fused_reducesum_chain(rec)
+                if chain is not None:
+                    return (
+                        "conditional",
+                        f"bias flatten fused with its ReduceSum: chain template "
+                        f"{chain} retargeted (misc_op_record_emit) if zp_x != 0",
+                    )
                 return (
                     "conditional",
                     "bias flatten fuses into its neighbour (reshape_emit.py, "
@@ -1228,6 +1275,19 @@ def plan_at_calibration(
                     f"zero points {cls} are not a template class {hits}"
                 )
             return "covered", f"ElementwiseScaleEdit ({cls})"
+        chain = _fused_reducesum_chain(rec) if op == "Reshape" else None
+        if chain is not None:
+            # the chain's input is the ReduceSum's; its output this Reshape's
+            # (a Reshape shares its input's quantization)
+            zx = _u8_zp(calib, rec["attrs"]["fused_input"])
+            zy = _u8_zp(calib, rec["outputs"][0])
+            reason = _misc_accepts(misc.load_index()[chain], zx, zy)
+            if reason is not None:
+                raise _NotAtCalibration(f"{chain}: {reason}")
+            return "covered", (
+                f"misc_op_record_emit retarget of the fused chain {chain} "
+                f"(zero points x{zx},y{zy})"
+            )
         if op == "Reshape" and "bias flatten" not in detail:
             zp = _u8_zp(calib, rec["inputs"][0])
             if zp == 0:

@@ -313,6 +313,30 @@
    "y": 134
   }
  },
+ "ReduceSum:16x1000:axes0:k1:reshape1000": {
+  "axes": [
+   0
+  ],
+  "file": "misc_op_step_templates/ReduceSumReshape_16x1000_axes0_k1_to_1000.axmodel.gz",
+  "keepdims": 1,
+  "op": "ReduceSum",
+  "reshape_out": [
+   1000
+  ],
+  "scales": {
+   "x": 0.03275791555643082,
+   "y": 0.10807306319475174
+  },
+  "shape": [
+   16,
+   1000
+  ],
+  "source": "t_step_rsfused/C1000_P_v1",
+  "zero_points": {
+   "x": 121,
+   "y": 128
+  }
+ },
  "ReduceSum:16x1000:axes1:k1": {
   "axes": [
    1
@@ -427,6 +451,33 @@
    "y": 143
   }
  },
+ "ReduceSum:16x1x128x784:axes0,3:k0:reshape128": {
+  "axes": [
+   0,
+   3
+  ],
+  "file": "misc_op_step_templates/ReduceSumReshape_16x1x128x784_axes0-3_k0_to_128.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "reshape_out": [
+   128
+  ],
+  "scales": {
+   "x": 0.04185009375214577,
+   "y": 2.8142006397247314
+  },
+  "shape": [
+   16,
+   1,
+   128,
+   784
+  ],
+  "source": "t_step_rsfused/C128_P_v1",
+  "zero_points": {
+   "x": 124,
+   "y": 118
+  }
+ },
  "ReduceSum:16x1x256x1152:axes0:k0": {
   "axes": [
    0
@@ -495,6 +546,33 @@
   "zero_points": {
    "x": 130,
    "y": 118
+  }
+ },
+ "ReduceSum:16x1x256x196:axes0,3:k0:reshape256": {
+  "axes": [
+   0,
+   3
+  ],
+  "file": "misc_op_step_templates/ReduceSumReshape_16x1x256x196_axes0-3_k0_to_256.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "reshape_out": [
+   256
+  ],
+  "scales": {
+   "x": 0.03879866376519203,
+   "y": 1.6299002170562744
+  },
+  "shape": [
+   16,
+   1,
+   256,
+   196
+  ],
+  "source": "t_step_rsfused/C256_P_v1",
+  "zero_points": {
+   "x": 121,
+   "y": 123
   }
  },
  "ReduceSum:16x1x256x2304:axes0:k0": {
@@ -613,6 +691,33 @@
    "y": 129
   }
  },
+ "ReduceSum:16x1x512x49:axes0,3:k0:reshape512": {
+  "axes": [
+   0,
+   3
+  ],
+  "file": "misc_op_step_templates/ReduceSumReshape_16x1x512x49_axes0-3_k0_to_512.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "reshape_out": [
+   512
+  ],
+  "scales": {
+   "x": 0.03908182308077812,
+   "y": 0.7188730835914612
+  },
+  "shape": [
+   16,
+   1,
+   512,
+   49
+  ],
+  "source": "t_step_rsfused/C512_P_v1",
+  "zero_points": {
+   "x": 124,
+   "y": 131
+  }
+ },
  "ReduceSum:16x1x64x147:axes0:k0": {
   "axes": [
    0
@@ -658,6 +763,33 @@
   "zero_points": {
    "x": 128,
    "y": 139
+  }
+ },
+ "ReduceSum:16x1x64x3136:axes0,3:k0:reshape64": {
+  "axes": [
+   0,
+   3
+  ],
+  "file": "misc_op_step_templates/ReduceSumReshape_16x1x64x3136_axes0-3_k0_to_64.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "reshape_out": [
+   64
+  ],
+  "scales": {
+   "x": 0.041686978191137314,
+   "y": 4.210116386413574
+  },
+  "shape": [
+   16,
+   1,
+   64,
+   3136
+  ],
+  "source": "t_step_rsfused/C64_P_v1",
+  "zero_points": {
+   "x": 131,
+   "y": 135
   }
  },
  "ReduceSum:16x1x64x576:axes0:k0": {
