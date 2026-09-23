@@ -87,6 +87,56 @@ decoder chunks, scored against the dense host fp32 grid):
 "Steady state" = encoder + chunks x per-chunk median; `phone.sh` starts one process per chunk
 set (session load dominates its wall time), an app keeps one session.
 
+## NU-MCC: evaluated, MCC stays the phone target
+
+[NU-MCC](https://arxiv.org/abs/2307.09112) (Lionar et al., NeurIPS 2023; `sail-sg/numcc`, code
+Apache-2.0 -- though several utility files carry Meta headers from MCC, and the released weights
+`udf-ep99.pth` (CO3D-v2, sha256 `8e92765aefe6d81b084c5e0f495d7a11dcf9b13aeede5815986a6ddd3ab21b49`)
+have no separate license statement: treat them as research use) replaces MCC's global decoder
+with 200 predicted anchors + a neighborhood decoder, and occupancy with a repulsive UDF. The paper
+reports > 5x faster and +9.7% F1 on CO3D-v2 than MCC (upstream MCC's quadratic masked decoder).
+
+`numcc_ref.py` runs upstream's demo inference on the host, on the same quest2 input (pytorch3d,
+imported at module level but only used for training/data, is stubbed):
+
+| | MCC (this split) | NU-MCC (upstream inference) |
+|---|---|---|
+| per-query decoder, host CPU | 142 us | 227 us (kNN sorts all 12,544 seen points per query) |
+| queries at granularity 0.1 | 36.7k coarse-to-fine (lossless) / 216k dense | 106k (anchor box) + 23k candidates x 10 gradient steps + color ~= 827k forward-equivalents |
+| host time (8 threads) | 5 s coarse-to-fine / 30 s dense | 91 s |
+| phone-exportable as is | yes (static chunks) | no: the point updates use autograd (-grad UDF) through the decoder; per-query top-k over 12.5k points |
+
+NU-MCC's "5x faster" is against upstream MCC's (197+Q)^2 masked decoder; the exact K/V split here
+removes that, and coarse-to-fine removes most queries, so NU-MCC is not cheaper on this pipeline --
+and its gradient-driven point refinement would need finite differences (6 extra forwards per
+step) or a hand-written backward on the phone. Its quality gain can't be checked without CO3D
+(its points are 0.07 chamfer from MCC's occupied set on quest2 -- no ground truth there).
+**MCC stays the phone target**; NU-MCC's neighborhood gather would be an HVX-kernel job if it's
+revisited.
+
+## Depth for phone photos
+
+The 12S has no depth sensor, so the demo needs monocular geometry. Candidates:
+
+| model | license | size / shapes | output |
+|---|---|---|---|
+| **MoGe-2 ViT-S** (`Ruicheng/moge-2-vits-normal`) | MIT | DINOv2-small, official ONNX | metric point map + normals (no scale/shift fit) |
+| Depth Anything V2 Metric Small | not stated on the model card | ViT-S | metric depth (needs intrinsics to unproject) |
+| Depth Pro | Apple AMLR (research only) | ViT-L at 1536 px | metric depth + focal length; too heavy for the phone |
+
+MoGe-2 ViT-S is the pick: permissive, small, and it outputs the point map MCC consumes directly.
+
+## Related work (why not these on the phone)
+
+- **MCC-HO** (hand-held objects, MCC + hand geometry): same decoder cost as MCC plus a hand model;
+  a candidate once MCC runs, not before.
+- **TripoSR / SF3D** (Stability, feed-forward image -> mesh via triplane transformers): ~0.3-1B
+  parameters, triplane decoding + marching cubes; heavier than MCC and meshes rather than point
+  queries -- desktop-GPU class today.
+- **DUSt3R / MASt3R / VGGT** (pairwise/multi-view point maps, ViT-L/ViT-g): reconstruct the visible
+  scene from several views rather than completing an object from one; ViT-L at 512 px is several
+  x MCC's encoder, possible on the HTP but a different task.
+
 ## Files
 
 | file | what |
@@ -94,6 +144,7 @@ set (session load dominates its wall time), an app keeps one session.
 | `model.py` | deployment split on top of the upstream module; demo preprocessing without pytorch3d |
 | `validate.py` | split vs upstream forward; fp32 full-grid reference `ref_<demo>_<g>.npz` |
 | `mcc.py` | export (onnxsim, ORT check), phone runs (strict all-HTP via `phone.sh`), scoring |
+| `numcc_ref.py` | NU-MCC upstream inference on the host, same input, cost/accuracy comparison |
 | `queries.py` | query-reduction strategies scored exactly against the dense references |
 | `phone.sh` | one ONNX piece on the phone (ORT + QNN EP), under the shared phone lock; md5-skips unchanged inputs |
 
