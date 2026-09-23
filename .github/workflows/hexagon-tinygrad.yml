@@ -40,7 +40,10 @@ concurrency:
 env:
   # onnxsim/tinygrad branch hvx-codegen: the DSP renderer's HVX codegen + the float-MAX __auto_type fix
   TINYGRAD_REPO: https://github.com/onnxsim/tinygrad.git
-  TINYGRAD_SHA: fccd84cfaf2e0fde4f613df7812f0303cb743e11
+  # Head of onnxsim/tinygrad's vrmpy-hexagon-support: onnxsim/tinygrad#2 squash-merged there, so it holds
+  # the HVX codegen + the fccd84cfa float-max fix with an identical tree, and stays reachable if the
+  # hvx-codegen branch is deleted.
+  TINYGRAD_SHA: 62d98031aa84a63102b9ab9ab4a3be57a7799f09
   HEXAGON_TOOLCHAIN_VERSION: "19.0.02"
   HEXAGON_TOOLCHAIN_URL: https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/Debian/19.0.02/Hexagon_open_access.Core.19.0.02.Linux-Any.tar.gz
 
