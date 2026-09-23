@@ -114,6 +114,7 @@
 #include "passes/rewrite_gridsample_to_gather.h"
 #include "passes/rewrite_implicit_broadcast.h"
 #include "passes/rewrite_msdeformattn_to_gridsample.h"
+#include "passes/rewrite_scatterelements_to_scatternd.h"
 #include "passes/rewrite_tensor_scatter_to_scatter_elements.h"
 #include "passes/rewrite_trt_batched_nms.h"
 #include "passes/rewrite_trt_batched_rotated_nms.h"
@@ -270,6 +271,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::RewriteGridSampleToGather>(registry);
     RegisterOrReplace<p::RewriteImplicitBroadcast>(registry);
     RegisterOrReplace<p::RewriteMSDeformAttnToGridSample>(registry);
+    RegisterOrReplace<p::RewriteScatterElementsToScatterND>(registry);
     RegisterOrReplace<p::RewriteTensorScatterToScatterElements>(registry);
     RegisterOrReplace<p::RewriteTRTBatchedNMS>(registry);
     RegisterOrReplace<p::RewriteTRTBatchedRotatedNMS>(registry);
