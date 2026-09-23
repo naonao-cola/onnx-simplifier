@@ -1,0 +1,479 @@
+{
+ "Relu:16x128x28x28:x0,y0": {
+  "file": "relu_16x128x28x28_x0_y0.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   128,
+   28,
+   28
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "relu_16x128x28x28_zp0_t"
+ },
+ "Relu:16x128x28x28:x128,y128": {
+  "file": "relu_16x128x28x28_x128_y128.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   128,
+   28,
+   28
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  },
+  "source": "relu_16x128x28x28_zp128_t"
+ },
+ "Relu:16x256x14x14:x0,y0": {
+  "file": "relu_16x256x14x14_x0_y0.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   256,
+   14,
+   14
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "relu_16x256x14x14_zp0_t"
+ },
+ "Relu:16x256x14x14:x128,y128": {
+  "file": "relu_16x256x14x14_x128_y128.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   256,
+   14,
+   14
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  },
+  "source": "relu_16x256x14x14_zp128_t"
+ },
+ "Relu:16x512x7x7:x0,y0": {
+  "file": "relu_16x512x7x7_x0_y0.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   512,
+   7,
+   7
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "relu_16x512x7x7_zp0_t"
+ },
+ "Relu:16x512x7x7:x128,y128": {
+  "file": "relu_16x512x7x7_x128_y128.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   512,
+   7,
+   7
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  },
+  "source": "relu_16x512x7x7_zp128_t"
+ },
+ "Relu:16x64x112x112:x0,y0": {
+  "file": "relu_16x64x112x112_x0_y0.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   64,
+   112,
+   112
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "relu_16x64x112x112_zp0_t"
+ },
+ "Relu:16x64x112x112:x128,y128": {
+  "file": "relu_16x64x112x112_x128_y128.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   64,
+   112,
+   112
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  },
+  "source": "relu_16x64x112x112_zp128_t"
+ },
+ "Relu:16x64x56x56:x0,y0": {
+  "file": "relu_16x64x56x56_x0_y0.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   64,
+   56,
+   56
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "relu_16x64x56x56_zp0_t"
+ },
+ "Relu:16x64x56x56:x128,y128": {
+  "file": "relu_16x64x56x56_x128_y128.axmodel.gz",
+  "op": "Relu",
+  "shape": [
+   16,
+   64,
+   56,
+   56
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007843137718737125
+  },
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  },
+  "source": "relu_16x64x56x56_zp128_t"
+ },
+ "Sqrt:1000:x0,y0": {
+  "file": "sqrt_1000_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   1000
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_1000_zp0_t"
+ },
+ "Sqrt:1000x512:x0,y0": {
+  "file": "sqrt_1000x512_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   1000,
+   512
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_1000x512_zp0_t"
+ },
+ "Sqrt:128:x0,y0": {
+  "file": "sqrt_128_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   128
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_128_zp0_t"
+ },
+ "Sqrt:128x128x3x3:x0,y0": {
+  "file": "sqrt_128x128x3x3_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   128,
+   128,
+   3,
+   3
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_128x128x3x3_zp0_t"
+ },
+ "Sqrt:128x64x1x1:x0,y0": {
+  "file": "sqrt_128x64x1x1_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   128,
+   64,
+   1,
+   1
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_128x64x1x1_zp0_t"
+ },
+ "Sqrt:128x64x3x3:x0,y0": {
+  "file": "sqrt_128x64x3x3_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   128,
+   64,
+   3,
+   3
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_128x64x3x3_zp0_t"
+ },
+ "Sqrt:256:x0,y0": {
+  "file": "sqrt_256_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   256
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_256_zp0_t"
+ },
+ "Sqrt:256x128x1x1:x0,y0": {
+  "file": "sqrt_256x128x1x1_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   256,
+   128,
+   1,
+   1
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_256x128x1x1_zp0_t"
+ },
+ "Sqrt:256x128x3x3:x0,y0": {
+  "file": "sqrt_256x128x3x3_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   256,
+   128,
+   3,
+   3
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_256x128x3x3_zp0_t"
+ },
+ "Sqrt:256x256x3x3:x0,y0": {
+  "file": "sqrt_256x256x3x3_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   256,
+   256,
+   3,
+   3
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_256x256x3x3_zp0_t"
+ },
+ "Sqrt:512:x0,y0": {
+  "file": "sqrt_512_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   512
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_512_zp0_t"
+ },
+ "Sqrt:512x256x1x1:x0,y0": {
+  "file": "sqrt_512x256x1x1_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   512,
+   256,
+   1,
+   1
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_512x256x1x1_zp0_t"
+ },
+ "Sqrt:512x256x3x3:x0,y0": {
+  "file": "sqrt_512x256x3x3_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   512,
+   256,
+   3,
+   3
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_512x256x3x3_zp0_t"
+ },
+ "Sqrt:64:x0,y0": {
+  "file": "sqrt_64_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   64
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_64_zp0_t"
+ },
+ "Sqrt:64x3x7x7:x0,y0": {
+  "file": "sqrt_64x3x7x7_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   64,
+   3,
+   7,
+   7
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_64x3x7x7_zp0_t"
+ },
+ "Sqrt:64x64x3x3:x0,y0": {
+  "file": "sqrt_64x64x3x3_x0_y0.axmodel.gz",
+  "op": "Sqrt",
+  "shape": [
+   64,
+   64,
+   3,
+   3
+  ],
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  },
+  "source": "sqrt_64x64x3x3_zp0_t"
+ }
+}
