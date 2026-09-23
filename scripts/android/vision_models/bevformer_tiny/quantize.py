@@ -38,6 +38,10 @@ POLICIES = {
     "all8": ("uint8", {"exclude_op_types": FLOAT_SENSITIVE}),
     # W8A16 Linear layers
     "lin16": ("uint16", {"op_types": ["Gemm", "MatMul"]}),
+    # only the activation x activation MatMuls: in the decoder, exactly the self-attention's
+    # Q x K^T and softmax x V (layers 1-5)
+    "mm8": ("uint8", {"op_types": ["MatMul"]}),
+    "mm16": ("uint16", {"op_types": ["MatMul"]}),
     # W8A16 everywhere except LayerNorm, Softmax, GridSample
     "all16": ("uint16", {"exclude_op_types": FLOAT_SENSITIVE}),
     # the same two, with GridSample quantized too
