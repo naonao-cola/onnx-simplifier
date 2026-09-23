@@ -1,0 +1,14 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+interface topk_rpc : remote_handle64 {
+  /* Several independent TopK calls in one round trip: x is the concatenation of each call's
+   * scores (ns[i] each), outputs are the concatenation of each call's k results (ks[i] each).
+   * variant: 0 scalar collect, 1 vector collect with __builtin_reduce_or on the lane bitmask,
+   * 2 vector collect with rotate/OR (default), 3 __builtin_reduce_or on the plain compare mask
+   * (A/B reproducer, see topk_kernel.h). nthreads>1 runs calls concurrently, one QuRT thread per call.
+   * phase_us (4 per call): scratch malloc, kernel, kernel again on warm scratch, free. */
+  AEEResult run(in sequence<float> x, in sequence<int32> ns, in sequence<int32> ks, in int32 variant,
+                in int32 nthreads, rout sequence<float> vals, rout sequence<int64> idx,
+                rout sequence<int32> survivors, rout sequence<uint32> phase_us, rout uint64 dsp_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};

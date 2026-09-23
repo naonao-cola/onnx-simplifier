@@ -1,0 +1,19 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+interface pd_rpc : remote_handle64 {
+  /* Model constants, uploaded once and kept resident on the DSP:
+   *   anchors: all 5 levels concatenated;
+   *   meta: per level A,k,H,W,anchor_off,delta_off,nchw_off,out_off (8 x int32);
+   *   params: per level raw pd_params -- the DSP builds each level's pd_prep (LUT) from it. */
+  AEEResult set_model(in sequence<float> anchors, in sequence<int32> meta, in sequence<octet> params);
+  /* One inference, all 5 levels in one call. src 0 = per-anchor fp32 deltas, 1 = backbone NCHW
+   * uint8 conv output; fast 0 = reference (division per element), 1 = LUT/inverse path. */
+  AEEResult run(in sequence<int32> idx, in sequence<float> deltas, in sequence<octet> nchw,
+                in int32 src, in int32 fast, in int32 nthreads, rout sequence<float> boxes, rout uint64 dsp_us);
+  /* What the backbone does at this boundary today, over ALL anchors: NCHW uint8 -> dequant ->
+   * [H,W,3,4] fp32 per-anchor deltas. Timed to price the layout the nchw source removes. */
+  AEEResult bb_layout(in sequence<octet> nchw, in int32 nthreads, rout sequence<float> deltas, rout uint64 dsp_us);
+  /* bit l set = level l's anchor table verified as an exact base+stride grid (computed, not gathered) */
+  AEEResult anchor_grid(rout int32 mask);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};
