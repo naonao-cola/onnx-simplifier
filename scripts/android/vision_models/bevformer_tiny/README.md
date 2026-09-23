@@ -285,6 +285,53 @@ Where the remaining 55 ms go, and the next levers:
   depend only on the image features, so they could also run in the backbone's call.
 - **The kernel's multiply-accumulate phase is its larger half.** See `../../msda_hvx/README.md`.
 
+### The whole frame in one process (`msda_hvx/frame_run.cpp`, `frame_e2e.py`)
+
+`e2e_msda.py` runs each piece as its own process and carries tensors through the host. `frame_run`
+chains backbone -> feats dequantize (CPU) -> encoder -> decoder in one process, every tensor in rpcmem,
+and carries the BEV itself: prev_bev is a row gather of its own last BEV (`rot_idx.i32`, torchvision's
+nearest rotate of an index image, checked exact against `rotate_prev_bev`). The host only prepares
+per-frame inputs that don't depend on any output. Modes:
+- `seq`: one frame at a time (latency);
+- `pipe`: backbone | encoder | decoder threads, two slots between stages (throughput); its outputs are
+  compared bit for bit with seq's;
+- `conc`: the backbone / decoder alone, the 6 sampling calls alone, then each pair at once.
+
+Phone, scene-0103 frames 0-5 x 5 passes, under the phone lock (`FRAME_RUN_TABLE`):
+
+| configuration | backbone | encoder (msda) | decoder | seq ms/frame | pipe ms/frame (FPS) | pipe latency | GT matched |
+|---|---|---|---|---|---|---|---|
+| #1859 chain, one process per piece (`e2e_msda.py`) | 21 | 55 | 24 | ~100 | - | - | 107 / 190 |
+| `frame_run`, backbone6 + fp16 decoder | 22.1 | 55.6 (27.7) | 25.3 | 103.2 | 97.4 (10.3) | 222 ms | 107 / 190 |
+| **`frame_run`, backbone1 x 6 + fp16 decoder** | 21.3 | 55.1 (27.8) | 24.9 | 101.8 | **90.5 (11.1)** | 208 ms | **107 / 190** |
+| `frame_run`, backbone1 x 6 + split decoder (HVX sampling) | 21.1 | 55.1 (27.8) | 29.9 | 106.6 | 89.7 (11.2) | 275 ms | 107 / 190 |
+
+bev cos vs fp32 0.9965-0.9980 and cls >= 0.99979 on every frame in every row (the int8 backbone's
+gap, as before); `pipe` outputs are bit-identical to `seq`'s in every configuration.
+
+Findings:
+- **The HTP and the HVX run concurrently.** The backbone takes 21.9 ms with the 6 sampling calls running
+  alongside (22.0 alone); the calls take 31.2 ms (29.4 alone).
+- **The HTP is the bottleneck of a pipelined frame:** ~75 ms of HTP pieces per frame (backbone 22,
+  encoder pieces 28, decoder 25) against ~28 ms of HVX. So pipelining alone gives little (97 vs 103
+  ms/frame); what helps is moving HTP work to the HVX.
+- **A per-camera backbone pipelines better:** `quantize.py backbone` also writes `backbone1.q8` (same
+  calibrated ranges; `backbone6.q8` regenerates byte-identical). Six batch-1 executes cost the same as
+  one batch-6 (21.3 vs 22.1 ms) but let the encoder's HTP pieces interleave: 97.4 -> 90.5 ms/frame.
+- **Decoder per-op profile (fp16):** the self-attention's softmax x V MatMul is 31% (900 x 900
+  attention in layers 1-5), the deformable sampling (GridSample, grid math, ReduceSum) ~35-40%.
+- **Decoder sampling on the HVX: tried, slower.** `dec_split.py` splits the decoder like the encoder
+  (dpre, dmid0-4, dpost around 6 kernel calls; layer 0's inputs are constants; torch split vs
+  `Decoder` max abs 0). On the phone it takes 29.9 ms vs 24.9 for the fp16 graph, with the same
+  accuracy: seven fp32-I/O pieces and six RPCs cost more than the GridSample they replace at 900
+  queries x 4 points. The fp16 graph stays the default. The self-attention is the bigger decoder cost.
+
+Next levers (not done here):
+- the HTP pieces' ~75 ms/frame is the pipelined bottleneck: int8 on the encoder pieces' Linears now
+  that GridSample is off the HTP (the earlier int8-encoder loss came from the GridSample grid), and
+  int8 on the decoder's self-attention matmuls;
+- the encoder's `pre` (6.8 ms, 3 layers' SCA value projections) could fold into the backbone graph.
+
 ### Why not a `scripts/android/deploy` spec (yet)
 
 The deploy pipeline (#1853) takes one graph through fetch -> simplify -> quantize -> rewrite ->
