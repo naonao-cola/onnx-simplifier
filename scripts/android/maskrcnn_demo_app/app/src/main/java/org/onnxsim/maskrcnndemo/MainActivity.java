@@ -58,16 +58,20 @@ import java.util.Locale;
  */
 public class MainActivity extends Activity {
     private static final String TAG = "MaskRcnnDemo";
-    private OverlayView overlay;
+    OverlayView overlay;
     private TextureView preview;
     private HandlerThread camThread;
     private Handler camHandler;
     private CameraDevice camera;
-    private ImageReader reader;
+    ImageReader reader;
     private int sensorOrientation = 90;
     private Size camSize;
-    private volatile boolean running = true;
+    volatile boolean running = true;
+    boolean cameraMode;
     private Thread worker;
+
+    /** The demo's models: button label, then the activity (process) that runs it and its model extra. */
+    static final String[][] MODELS = {{"Mask R-CNN", "", ""}, {"YOLO26n", "yolo", "yolo26n"}, {"YOLO11n", "yolo", "yolo11n"}};
 
     // The fastest measured configuration (README "Optimizations"); pass --es pipe pipe_e_opt.txt
     // --es opts "" for the original #1841 path.
@@ -85,16 +89,55 @@ public class MainActivity extends Activity {
         root.addView(preview, new FrameLayout.LayoutParams(320, 240, Gravity.BOTTOM | Gravity.END));
         setContentView(root);
 
+        root.addView(modelBar(), new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.END));
         String mode = getIntent().getStringExtra("mode");
-        final boolean cameraMode = mode == null || mode.equals("camera");
+        cameraMode = mode == null || mode.equals("camera");
         final String pipe = getIntent().getStringExtra("pipe") != null ? getIntent().getStringExtra("pipe") : DEFAULT_PIPE;
         final String opts = getIntent().getStringExtra("opts") != null ? getIntent().getStringExtra("opts") : DEFAULT_OPTS;
         final boolean overlap = getIntent().getBooleanExtra("overlap", false);
         if (!cameraMode) preview.setVisibility(android.view.View.GONE);
         if (cameraMode && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED)
             requestPermissions(new String[] {Manifest.permission.CAMERA}, 1);
-        worker = new Thread(() -> runLoop(cameraMode, pipe, opts, overlap), "maskrcnn");
+        worker = new Thread(() -> work(cameraMode, pipe, opts, overlap), "worker");
         worker.start();
+    }
+
+    /** The inference loop; YoloActivity runs its own. */
+    void work(boolean cameraMode, String pipe, String opts, boolean overlap) {
+        runLoop(cameraMode, pipe, opts, overlap);
+    }
+
+    /** Smallest 4:3 camera width that still covers the model input's long side. */
+    int cameraMinWidth() {
+        return Engine.IN_W;
+    }
+
+    /** Model selector: one button per entry of MODELS. */
+    private android.view.View modelBar() {
+        android.widget.LinearLayout bar = new android.widget.LinearLayout(this);
+        for (String[] m : MODELS) {
+            android.widget.Button b = new android.widget.Button(this);
+            b.setText(m[0]);
+            b.setAllCaps(false);
+            b.setAlpha(0.8f);
+            b.setOnClickListener(v -> switchTo(m[1], m[2]));
+            bar.addView(b);
+        }
+        return bar;
+    }
+
+    /**
+     * Switch model. Each engine runs in its own process (the native engines keep process-wide
+     * HTP/DSP state, and onDestroy ends the process), so switching between Mask R-CNN and YOLO
+     * starts the other activity and finishes this one; YoloActivity switches YOLO models in place.
+     */
+    void switchTo(String activity, String model) {
+        if (activity.isEmpty()) return;  // already Mask R-CNN
+        android.content.Intent i = new android.content.Intent(this, YoloActivity.class);
+        i.putExtra("mode", cameraMode ? "camera" : "images");
+        i.putExtra("model", model);
+        startActivity(i);
+        finish();
     }
 
     private int displayRotationDegrees() {
@@ -107,13 +150,18 @@ public class MainActivity extends Activity {
     }
 
     /** Clockwise rotation that turns a back-camera sensor frame gravity-up for the current display rotation. */
-    private int frameRotation() {
+    int frameRotation() {
         return (sensorOrientation - displayRotationDegrees() + 360) % 360;
     }
 
     // ---- images mode ------------------------------------------------------------------------
     /** Decode a JPEG upright (EXIF orientation applied) and scale it to fit 1088x800 in one pass. */
     static Bitmap decodeFit(File f) {
+        return decodeFit(f, Engine.IN_W, Engine.IN_H);
+    }
+
+    /** Decode a JPEG upright and scale it to fit maxW x maxH. */
+    static Bitmap decodeFit(File f, int maxW, int maxH) {
         Bitmap src = BitmapFactory.decodeFile(f.getPath());
         if (src == null) return null;
         int deg = 0;
@@ -129,7 +177,7 @@ public class MainActivity extends Activity {
         }
         int uw = deg % 180 == 0 ? src.getWidth() : src.getHeight();
         int uh = deg % 180 == 0 ? src.getHeight() : src.getWidth();
-        float ratio = Math.min((float) Engine.IN_W / uw, (float) Engine.IN_H / uh);
+        float ratio = Math.min((float) maxW / uw, (float) maxH / uh);
         Matrix m = new Matrix();
         m.postRotate(deg);
         m.postScale(ratio, ratio);
@@ -278,7 +326,7 @@ public class MainActivity extends Activity {
     }
 
     // ---- camera -----------------------------------------------------------------------------
-    private void startCamera() {
+    void startCamera() {
         camThread = new HandlerThread("cam");
         camThread.start();
         camHandler = new Handler(camThread.getLooper());
@@ -353,10 +401,10 @@ public class MainActivity extends Activity {
             Integer so = ch.get(CameraCharacteristics.SENSOR_ORIENTATION);
             sensorOrientation = so != null ? so : 90;
             StreamConfigurationMap map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-            // smallest 4:3 YUV size that still covers the model input's long side (1088)
+            // smallest 4:3 YUV size that still covers the model input's long side
             Size best = null;
             for (Size s : map.getOutputSizes(ImageFormat.YUV_420_888)) {
-                if (s.getWidth() * 3 != s.getHeight() * 4 || s.getWidth() < 1088) continue;
+                if (s.getWidth() * 3 != s.getHeight() * 4 || s.getWidth() < cameraMinWidth()) continue;
                 if (best == null || s.getWidth() < best.getWidth()) best = s;
             }
             camSize = best != null ? best : new Size(1440, 1080);

@@ -5,7 +5,8 @@
 #   systemd-run --user --wait --collect --pipe -p MemoryMax=12G -p MemorySwapMax=0 ./build_app.sh
 # 1. ORT + QNN EP + Qualcomm QNN runtime libs (Maven Central) via ../htp_exploration/qnn_shell/fetch_libs.sh
 # 2. the three Hexagon FastRPC skels + their ARM stubs, built by ../e2e_pipeline/build.sh (BUILD_ONLY)
-# 3. native/maskrcnn_engine.cpp (includes ../e2e_pipeline/e2e_run.cpp) -> libmaskrcnn_demo.so
+# 3. native/maskrcnn_engine.cpp (includes ../e2e_pipeline/e2e_run.cpp) -> libmaskrcnn_demo.so,
+#    native/yolo_engine.cpp -> libyolo_demo.so
 # 4. everything into app/src/main/jniLibs/arm64-v8a, then gradle assembleDebug (offline).
 set -euo pipefail
 : "${HEXAGON_SDK_ROOT:?}" "${HEXAGON_TOOLCHAIN:?}"
@@ -27,6 +28,10 @@ INC=(-I "$HEXAGON_SDK_ROOT/incs" -I "$HEXAGON_SDK_ROOT/incs/stddef" -I "$HEXAGON
   "$B/e2e/rpn_glue.o" "$B/e2e/rpn_stub.o" "$B/e2e/roi_stub.o" "$B/e2e/roiu8_stub.o" \
   -L "$QS/libs" -lonnxruntime -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc \
   -ljnigraphics -llog -Wl,--no-undefined
+# YOLO mode: its own engine library (ORT + QNN EP only, no DSP skels)
+"$NDK/aarch64-linux-android29-clang++" -O2 -std=c++17 -shared -fPIC -static-libstdc++ -I "$QS/headers" \
+  -o "$J/libyolo_demo.so" "$HERE/native/yolo_engine.cpp" -L "$QS/libs" -lonnxruntime -ljnigraphics -llog \
+  -Wl,--no-undefined
 cp "$QS"/libs/*.so "$J/"
 cp "$B/e2e/rpn_fused/rpn_rpc.so" "$J/librpn_rpc.so"      # jniLibs must be lib*.so to be extracted
 cp "$B/e2e/roi/roialign_rpc.so" "$J/libroialign_rpc.so"
