@@ -623,9 +623,12 @@ derived from `attention_mask`), contrib `RotaryEmbedding` (cos/sin cache looked 
 (RMSNorm, and residual-add + RMSNorm), and for quantized files `MatMulNBits`. `to_torch`
 now converts all of them: GQA -> causal SDPA with HF's `repeat_kv` spelling (past and
 seqlens inputs are never read in `sdpa` mode), RMSNorms in HF's upcast form, and
+`GroupQueryAttention` with `do_rotary=1` (Llama-3.2's export: RoPE inside the op,
+positions derived from `seqlens_k`, and no `position_ids` graph input) takes the positions
+from `forward`'s `position_ids` -- which AutoDeploy supplies -- as a synthetic input, and
 `MatMulNBits` *dequantized once at conversion* to a dense fp16 `[K, N]` weight -- a
 working path onto TensorRT-LLM, not its int4 kernels (no int4 memory saving; the packed
-weights are not kept). `GroupQueryAttention` with `do_rotary=1`, sliding window or softcap,
+weights are not kept). `GroupQueryAttention` with sliding window or softcap,
 interleaved / scaled contrib RoPE and `MatMulNBits` with `g_idx` raise instead of guessing.
 
 All three checked against onnxruntime on an fp32 copy (prefill logits, `exact` and `sdpa`
@@ -636,6 +639,7 @@ modes), then run through AutoDeploy (`torch-cudagraph`, 3 chat prompts, greedy, 
 | `HuggingFaceTB/SmolLM2-360M-Instruct` `model_fp16.onnx` (contrib ops) | rel 5.6e-6, argmax 100% | 32 attn, 64 GQA repeat, 65 RMSNorm | 216-220 |
 | same, `model_q4f16.onnx` (int4 `MatMulNBits` x224) | rel 8.2e-6, argmax 100% | same | 215-220 |
 | `onnx-community/Qwen3-0.6B-ONNX` `model_fp16.onnx` (contrib ops, per-head q/k-norm) | -- | 28 attn, 56 GQA repeat, 113 RMSNorm | 132 |
+| `onnx-community/Llama-3.2-1B-Instruct-ONNX` `model_fp16.onnx` (RoPE *inside* GQA, no `position_ids` input) | rel 2.5e-6, argmax 100% | 16 attn, 32 GQA repeat, 33 RMSNorm | 100-101 |
 
 All outputs are coherent (the int4 SmolLM2's answers differ from fp16's, as expected).
 Qwen3 is slower than TensorRT-LLM's own path on its HF checkpoint (176-195 tok/s, above);
@@ -644,5 +648,6 @@ contrib op (0 matches, even with the rotation emitted in the `[B, N, S, D]` /
 `unsqueeze_dim=1` layout it is registered for and q/k sharing one cos/sin node), so RoPE
 runs as plain ops there -- correct, just not its fused kernel. onnxruntime's own
 `GroupQueryAttention` kernel has restrictions the conversion does not (head size a
-multiple of 8; batch 1 when a multi-token input has a past), which only matters for the
+multiple of 8, of 16 with `do_rotary`; batch 1 when a multi-token input has a past), which
+only matters for the
 tests' reference runs.

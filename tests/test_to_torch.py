@@ -342,17 +342,28 @@ def test_unsupported_op_is_named():
         mod(torch.zeros(2, 3))
 
 
-# onnxruntime's GroupQueryAttention kernel needs a head size that is a multiple of 8.
-GHEAD = 8
+# onnxruntime's GroupQueryAttention kernel needs a head size that is a multiple of 8
+# (of 16 with do_rotary=1).
+GHEAD = 16
 
 
-def _genai_model():
+def _genai_model(do_rotary=False):
     # ONNX Runtime GenAI builder spelling (e.g. HuggingFaceTB/SmolLM2-360M-Instruct's
     # ONNX export): contrib RotaryEmbedding / GroupQueryAttention /
     # (Skip)SimplifiedLayerNormalization, past KV fed straight into GQA, and GQA's
     # seqlens_k / total_sequence_length derived from attention_mask.
+    pos_in = "" if do_rotary else "int64[B, S] position_ids,"
+    if do_rotary:
+        rope = "q = Identity(q0)\n      k = Identity(k0)"
+        gqa_extra, rot_attr = ", cos_cache, sin_cache", ", do_rotary = 1"
+    else:
+        rope = (
+            "q = com.microsoft.RotaryEmbedding(q0, position_ids, cos_cache, sin_cache)\n"
+            "      k = com.microsoft.RotaryEmbedding(k0, position_ids, cos_cache, sin_cache)"
+        )
+        gqa_extra, rot_attr = "", ""
     body = f"""
-    g (int64[B, S] input_ids, int64[B, T] attention_mask, int64[B, S] position_ids,
+    g (int64[B, S] input_ids, int64[B, T] attention_mask, {pos_in}
        float[B, {HK}, P, {GHEAD}] past_key_values_0_key,
        float[B, {HK}, P, {GHEAD}] past_key_values_0_value)
       => (float[B, S, {VOCAB}] logits, float[B, {HK}, T, {GHEAD}] present_0_key,
@@ -364,8 +375,7 @@ def _genai_model():
       q0 = MatMul(h, wq)
       k0 = MatMul(h, wk)
       v = MatMul(h, wv)
-      q = com.microsoft.RotaryEmbedding(q0, position_ids, cos_cache, sin_cache)
-      k = com.microsoft.RotaryEmbedding(k0, position_ids, cos_cache, sin_cache)
+      {rope}
       am_sum = ReduceSum(attention_mask, one)
       am_len = Sub(am_sum, one)
       seqlens_k = Cast<to = 6>(am_len)
@@ -373,8 +383,8 @@ def _genai_model():
       total0 = Gather<axis = 0>(am_shape, one_s)
       total = Cast<to = 6>(total0)
       ctx, present_0_key, present_0_value = com.microsoft.GroupQueryAttention<
-          num_heads = {HQ}, kv_num_heads = {HK}, scale = 0.5>(
-          q, k, v, past_key_values_0_key, past_key_values_0_value, seqlens_k, total)
+          num_heads = {HQ}, kv_num_heads = {HK}, scale = 0.5{rot_attr}>(
+          q, k, v, past_key_values_0_key, past_key_values_0_value, seqlens_k, total{gqa_extra})
       o = MatMul(ctx, wo)
       res_n, mean_unused, inv_unused, res = com.microsoft.SkipSimplifiedLayerNormalization<
           epsilon = 1e-6>(x, o, ln2_w)
@@ -506,3 +516,44 @@ def test_matmulnbits_dequantized_matches_onnxruntime(zero_points):
     np.testing.assert_allclose(
         meta(torch.from_numpy(x))[0].numpy(), want, rtol=1e-4, atol=1e-4
     )
+
+
+@pytest.mark.parametrize("past", [0, 3])
+def test_gqa_do_rotary_exact_mode(past):
+    # GenAI builder's Llama-3.2 spelling: RoPE inside GroupQueryAttention, positions
+    # from seqlens_k, and no position_ids graph input at all.
+    model = _genai_model(do_rotary=True)
+    names = [i.name for i in model.graph.input]
+    assert "position_ids" not in names
+    mod = onnx_to_torch(
+        model,
+        inputs=names,
+        outputs=[o.name for o in model.graph.output],
+        strip_kv_cache=False,
+        attention="exact",
+    )
+    feeds = _feeds(1 if past else 2, 4, past, head=GHEAD)
+    feeds.pop("position_ids")
+    try:
+        want = _ort(model, feeds)
+    except Exception as e:
+        pytest.skip(f"onnxruntime cannot run the contrib ops: {e}")
+    got = mod(*(torch.from_numpy(feeds[n]) for n in names))
+    for g, w in zip(got, want):
+        np.testing.assert_allclose(g.numpy(), w, rtol=1e-4, atol=1e-4)
+
+
+def test_gqa_do_rotary_sdpa_mode_takes_position_ids():
+    # The cache-inserting runtime supplies position_ids; with the graph lacking the
+    # input, the default ("input_ids", "position_ids") signature still builds, and a
+    # prefill at positions 0..S-1 equals onnxruntime's.
+    model = _genai_model(do_rotary=True)
+    mod = onnx_to_torch(model)
+    feeds = _feeds(2, 5, 0, head=GHEAD)
+    pos = torch.from_numpy(feeds.pop("position_ids"))
+    try:
+        (want,) = _ort(model, feeds)[:1]
+    except Exception as e:
+        pytest.skip(f"onnxruntime cannot run the contrib ops: {e}")
+    (got,) = mod(torch.from_numpy(feeds["input_ids"]), pos)
+    np.testing.assert_allclose(got.numpy(), want, rtol=1e-4, atol=1e-4)

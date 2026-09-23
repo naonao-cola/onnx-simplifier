@@ -59,6 +59,9 @@ _DEVICE = contextvars.ContextVar("onnxsim_to_torch_device", default=None)
 # RotaryEmbedding node, but must share one cos/sin (unsqueezed) value for AutoDeploy's
 # match_rope_pattern, which matches q's and k's rotation as a single pattern.
 _ROPE_MEMO: contextvars.ContextVar = contextvars.ContextVar("onnxsim_to_torch_rope")
+# forward's position_ids, for GroupQueryAttention do_rotary=1 graphs that have no
+# position input of their own (ONNX Runtime GenAI builder, e.g. Llama-3.2).
+_POSITIONS: contextvars.ContextVar = contextvars.ContextVar("onnxsim_to_torch_pos")
 
 _KV_INPUT_RE = re.compile(r"^(past_key_values|past_key|past_value|past)[._]")
 
@@ -259,7 +262,24 @@ def _build_module_class():
             graph_inputs = [i.name for i in g.input]
             init_names = {t.name for t in g.initializer}
             real_inputs = [n for n in graph_inputs if n not in init_names]
-            missing = [n for n in inputs if n not in real_inputs]
+            # GQA with in-op rotary derives positions from seqlens_k in ONNX Runtime;
+            # a cache-inserting runtime supplies position_ids instead, so accept it as a
+            # forward input even though the graph has none.
+            self._synthetic_pos = (
+                "position_ids" in inputs
+                and "position_ids" not in real_inputs
+                and attention == "sdpa"
+                and any(
+                    n.op_type == "GroupQueryAttention" and _attrs(n).get("do_rotary", 0)
+                    for n in g.node
+                )
+            )
+            missing = [
+                n
+                for n in inputs
+                if n not in real_inputs
+                and not (n == "position_ids" and self._synthetic_pos)
+            ]
             if missing:
                 raise ValueError(
                     f"inputs {missing} not among graph inputs {real_inputs}"
@@ -495,7 +515,12 @@ def _build_module_class():
             if n.op_type == "GroupQueryAttention" and self._attention == "sdpa":
                 # past KV and the seqlens_k / total_sequence_length bookkeeping (derived
                 # from attention_mask) are the cache-inserting runtime's business.
-                return [i for i in n.input[:3] if i]
+                rotary = (
+                    [i for i in n.input[7:9] if i]
+                    if _attrs(n).get("do_rotary", 0)
+                    else []
+                )
+                return [i for i in n.input[:3] if i] + rotary
             return [i for i in n.input if i]
 
         def _schedule(self, producer):
@@ -565,6 +590,8 @@ def _build_module_class():
                 next((a.device for a in args if isinstance(a, torch.Tensor)), None)
             )
             _ROPE_MEMO.set({})
+            if self._synthetic_pos:
+                _POSITIONS.set(args[self._input_names.index("position_ids")])
             env: Dict[str, Any] = dict(self._static)
             for k, attr in self._param_of.items():
                 env[k] = getattr(self, attr)
@@ -1028,6 +1055,29 @@ def _build_module_class():
                 x = x + ins[3]
             return (self._rms(x, ins[2], a.get("epsilon", 1e-5)), None, None, x)
 
+        @staticmethod
+        def _rope_bnsd(x4, cos_c, sin_c, pos):
+            """HF rotate-half RoPE of ``x4`` [B, N, S, D] from a [max_pos, rd/2] cos/sin
+            cache gathered at ``pos`` [B, S]; the first ``rd`` dims rotate.
+
+            cos/sin are unsqueezed at dim 1 and memoized per forward call, so q and k
+            share one node each -- the shape AutoDeploy's match_rope_pattern needs.
+            """
+            rd, d = 2 * cos_c.shape[-1], x4.shape[-1]
+            key = (id(cos_c), id(sin_c), id(pos), x4.dtype)
+            memo = _ROPE_MEMO.get({})
+            if key not in memo:
+                cos = torch.cat([cos_c[pos], cos_c[pos]], -1).to(x4.dtype)  # [B, S, rd]
+                sin = torch.cat([sin_c[pos], sin_c[pos]], -1).to(x4.dtype)
+                memo[key] = (cos.unsqueeze(1), sin.unsqueeze(1))
+            cos, sin = memo[key]
+            # Full rotary: no slicing at all -- a no-op x[..., :d] exports as aten.alias.
+            xr, xp = (x4[..., :rd], x4[..., rd:]) if rd < d else (x4, None)
+            h = rd // 2
+            rot = torch.cat([-xr[..., h:], xr[..., :h]], -1)
+            y = xr * cos + rot * sin
+            return torch.cat([y, xp], -1) if rd < d else y
+
         def _ms_RotaryEmbedding(self, ins, a, n):
             # com.microsoft::RotaryEmbedding(input, position_ids, cos_cache, sin_cache):
             # input [B, S, N*D] or [B, N, S, D]; cos/sin cache [max_pos, rotary_dim/2].
@@ -1046,35 +1096,17 @@ def _build_module_class():
                 and x.shape[1] != 1
             ):
                 pos = pos + torch.arange(x.shape[1], device=pos.device)[None]
-            # Rotate in [B, N, S, D] with cos/sin unsqueezed at dim 1: the only layout
-            # AutoDeploy's match_rope_pattern is registered for.
-            udim = 1
-            key = (id(cos_c), id(sin_c), id(pos), udim, x.dtype)
-            memo = _ROPE_MEMO.get({})
-            if key not in memo:
-                cos = torch.cat([cos_c[pos], cos_c[pos]], -1).to(x.dtype)  # [B, S, rd]
-                sin = torch.cat([sin_c[pos], sin_c[pos]], -1).to(x.dtype)
-                memo[key] = (cos.unsqueeze(udim), sin.unsqueeze(udim))
-            cos, sin = memo[key]
             if x.dim() == 3:
+                # Rotate in [B, N, S, D]: the only layout AutoDeploy's rope matcher has.
                 nh = a.get("num_heads", 0)
                 d = x.shape[-1] // nh if nh else rd
                 x4 = x.reshape(x.shape[0], x.shape[1], -1, d).transpose(1, 2)
-            else:
-                x4, d = x, x.shape[-1]
-            # Full rotary: no slicing at all -- a no-op x[..., :d] exports as aten.alias,
-            # which stops AutoDeploy's match_rope_pattern from matching.
-            xr, xp = (x4[..., :rd], x4[..., rd:]) if rd < d else (x4, None)
-            h = rd // 2
-            rot = torch.cat([-xr[..., h:], xr[..., :h]], -1)
-            y = (
-                torch.cat([xr * cos + rot * sin, xp], -1)
-                if rd < d
-                else xr * cos + rot * sin
-            )
-            if x.dim() == 3:
-                y = y.transpose(1, 2)
-            return y.reshape(x.shape)
+                return (
+                    self._rope_bnsd(x4, cos_c, sin_c, pos)
+                    .transpose(1, 2)
+                    .reshape(x.shape)
+                )
+            return self._rope_bnsd(x, cos_c, sin_c, pos)
 
         def _ms_MatMulNBits(self, ins, a, n):
             w = getattr(self, self._param_of[self._nbits_key[n.output[0]]])
@@ -1091,11 +1123,8 @@ def _build_module_class():
                 raise NotImplementedError(
                     "GroupQueryAttention sliding window / softcap"
                 )
-            if a.get("do_rotary", 0):
-                raise NotImplementedError(
-                    "GroupQueryAttention do_rotary=1 (positions come from seqlens_k, "
-                    "not position_ids)"
-                )
+            if a.get("do_rotary", 0) and a.get("rotary_interleaved", 0):
+                raise NotImplementedError("GroupQueryAttention interleaved rotary")
             hq, hk = a["num_heads"], a["kv_num_heads"]
             q = ins[0]
             k = ins[1] if len(ins) > 1 else None
@@ -1111,6 +1140,19 @@ def _build_module_class():
             past = 0
             if self._attention == "exact" and len(ins) > 4 and ins[3] is not None:
                 past = ins[3].shape[2]
+            if a.get("do_rotary", 0):
+                # In-op RoPE from the cos/sin cache inputs. ONNX Runtime derives the
+                # positions from seqlens_k (past_len + arange(S), no left padding);
+                # "sdpa" mode takes them from forward's position_ids instead, which the
+                # cache-inserting runtime supplies (the graph itself has no such input).
+                cos_c, sin_c = ins[7], ins[8]
+                if self._attention == "exact":
+                    pos = past + torch.arange(s, device=q.device)[None].expand(b, s)
+                else:
+                    pos = _POSITIONS.get()
+                q = self._rope_bnsd(q, cos_c, sin_c, pos)
+                k = self._rope_bnsd(k, cos_c, sin_c, pos)
+            if self._attention == "exact" and len(ins) > 4 and ins[3] is not None:
                 k, v = torch.cat([ins[3], k], 2), torch.cat([ins[4], v], 2)
             present_k, present_v = k, v
             if hk != hq:
