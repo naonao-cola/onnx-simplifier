@@ -62,7 +62,9 @@ def test_the_1x1_holdout_emissions_re_decode_their_segments(rel):
     """Four one-byte scale writes hit back-reference tokens. That grows
     three segments' decoded output (the native holdout of the same shape
     decodes to exactly the reference's lengths) and leaves non-record words in
-    segment 1. `mcode.check` does not see any of this."""
+    segment 1. `mcode.check` used to pass it; since
+    docs/axera-mcode-check-decompress.md it decompresses every segment and
+    reports the non-record words."""
     ref, out = _neu(_REF), _neu(rel)
     native = _neu("conv_learn_256to512/c1x1_holdout_native.axmodel.gz")
     assert _decoded_lengths(ref) == [1536, 1536, 4352, 2176, 5760]
@@ -78,7 +80,12 @@ def test_the_1x1_holdout_emissions_re_decode_their_segments(rel):
     ]
     assert [i for i, _ in _non_record_words(out)] == [1, 1]
     assert _non_record_words(ref) == []
-    assert mcode.check(out) == []  # the structural checker misses all of it
+    # The decompressing check now catches it (it used to return []).
+    problems = mcode.check(out)
+    assert problems
+    assert all("not records" in p for p in problems), problems
+    assert mcode.check(ref) == []
+    assert mcode.check(native) == []
 
 
 def test_the_3x3_holdout_emission_only_touched_literals():
