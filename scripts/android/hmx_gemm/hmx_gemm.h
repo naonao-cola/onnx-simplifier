@@ -15,9 +15,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define HMX_TILE 32
-#define HMX_TILE_BYTES 2048
-#define HMX_IDX(i, j) (64 * ((i) / 2) + 2 * (j) + ((i) % 2))
+#include "hmx_block.h"
 
 /* Pack a K x N row-major fp16 weight into tile-major blocks: for each 32-column block nb, K/32 tiles
  * of W(k, c) (host or DSP; done once per weight). out holds (N/32) * (K/32) * 1024 halfwords. */
@@ -42,21 +40,9 @@ static inline void hmx_pack_a_f16(const uint16_t* A, int M, int K, int m0, uint1
 }
 
 #ifdef __hexagon__
-/* One :deep load pair covers at most 32 K-tiles (K <= 1024 fp16, Rt <= 65535; K = 1056 is already wrong
- * on hexagon-sim), so longer K is issued as consecutive <= 32-tile load pairs that keep accumulating
- * until the store. */
-#define HMX_MAX_KTILES 32
-static inline void hmx_mac_f16(const void* a, const void* w, int ktiles) {
-  const uint8_t *pa = (const uint8_t*)a, *pw = (const uint8_t*)w;
-  for (int k0 = 0; k0 < ktiles; k0 += HMX_MAX_KTILES) {
-    int n = ktiles - k0 < HMX_MAX_KTILES ? ktiles - k0 : HMX_MAX_KTILES, lim = n * HMX_TILE_BYTES - 1;
-    __asm__ volatile("{ activation.hf = mxmem(%0,%1):deep\n weight.hf = mxmem(%2,%3) }" ::"r"(pa + (size_t)k0 * HMX_TILE_BYTES),
-                     "r"(lim), "r"(pw + (size_t)k0 * HMX_TILE_BYTES), "r"(lim)
-                     : "memory");
-  }
-}
-static inline void hmx_store_f16(void* c) { __asm__ volatile("mxmem(%0,%1):after.hf = acc" ::"r"(c), "r"(0) : "memory"); }
-static inline void hmx_set_table(const void* t) { __asm__ volatile("bias = mxmem(%0)" ::"r"(t) : "memory"); }
+#define hmx_mac_f16 hmx_blk_mac_f16
+#define hmx_store_f16 hmx_blk_store_f16
+#define hmx_set_table hmx_blk_set_table
 
 /* On the phone an HMX operand span (A or W of one mxmem, Rt+1 bytes) must not cross a 256 KB VTCM
  * boundary: such a load takes a user-PD page fault at the boundary (hexagon-sim does not model this).

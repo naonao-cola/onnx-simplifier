@@ -28,13 +28,12 @@ def _harness():
     return mod
 
 
-@pytest.mark.parametrize("shape", ["32 64 64 0", "45 576 128 1", "45 1056 128 1"])
-def test_hmx_gemm_f16_on_hexagon_sim(tmp_path, shape):
+def _run_sim(tmp_path, src, args):
     harness = _harness()
     tools = harness.tools_dir()
     if tools is None:
         pytest.skip("HEXAGON_TOOLS does not point at a toolchain with hexagon-sim")
-    elf = tmp_path / "gemm_sim.elf"
+    elf = tmp_path / (src.stem + ".elf")
     subprocess.run(
         [
             str(tools / "bin" / "hexagon-clang"),
@@ -42,7 +41,7 @@ def test_hmx_gemm_f16_on_hexagon_sim(tmp_path, shape):
             "-mhmx",
             "-mhvx",
             "-O2",
-            str(GEMM / "sim" / "gemm_sim.c"),
+            str(src),
             "-o",
             str(elf),
             "-lm",
@@ -59,13 +58,25 @@ def test_hmx_gemm_f16_on_hexagon_sim(tmp_path, shape):
             "1",
             str(elf),
             "--",
-            *shape.split(),
+            *args,
         ],
         capture_output=True,
         text=True,
         env=env,
         timeout=900,
     )
-    assert "rc 0" in out.stdout and " 0 beyond fp16 rounding" in out.stdout, (
-        out.stdout[-2000:] + out.stderr[-2000:]
-    )
+    return out.stdout + out.stderr
+
+
+@pytest.mark.parametrize("shape", ["32 64 64 0", "45 576 128 1", "45 1056 128 1"])
+def test_hmx_gemm_f16_on_hexagon_sim(tmp_path, shape):
+    out = _run_sim(tmp_path, GEMM / "sim" / "gemm_sim.c", shape.split())
+    assert "rc 0" in out and " 0 beyond fp16 rounding" in out, out[-2000:]
+
+
+@pytest.mark.parametrize("ktiles", ["1", "9"])
+def test_hmx_block_bit_exact_on_hexagon_sim(tmp_path, ktiles):
+    # fp16 (rne of the exact sum + bias), int8 -> u16 and int8 -> u8 stores, bit-exact; 9 K-tiles also
+    # exercise the split of an int8 K into two load pairs (8 + 1)
+    out = _run_sim(tmp_path, GEMM / "sim" / "block_ref.c", [ktiles])
+    assert "\nPASS" in out, out[-2000:]

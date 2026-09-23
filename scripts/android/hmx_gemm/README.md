@@ -125,3 +125,58 @@ adb pull $D/llm/out/. $W/phone/ && python llm_prefill.py compare --work $W --pho
 
 `tests/test_hmx_gemm.py` runs `sim/gemm_sim.c` on hexagon-sim (32x64x64, 45x576x128 + bias,
 45x1056x128 + bias) when `HEXAGON_TOOLS` points at a Hexagon toolchain.
+
+## Handoff for code generation (tinygrad DSP backend: HMX as a TensorCore)
+
+Everything a generated kernel needs, split so the generator emits only the kernel:
+
+| file | what | emitted by a code generator? |
+|---|---|---|
+| `hmx_block.h` | the block primitive: `hmx_blk_set_table`, `hmx_blk_mac_f16` / `hmx_blk_mac_u8s8` (load K tiles, accumulating; splits K into legal load pairs), `hmx_blk_store_f16` / `_u16` / `_u8` (store one 32x32 tile with conversion, clears the accumulator); full layout + table + precondition notes in its header comment | yes -- this is the TensorCore "instruction" |
+| `hmx_runtime.h` | `hmx_rt_power` (HVX + **HMX** power vote + turbo), `hmx_rt_acquire` (VTCM + HMX context), `hmx_rt_lock/unlock` (HVX + HMX lock on the issuing thread), `hmx_rt_release` | no -- the runtime (skel) does this once |
+| `hmx_gemm.h` | reference GEMM built on the block: HVX pack/unpack, VTCM windows, weight streaming | as a reference to match |
+| `sim/block_ref.c` | **bit-exact** reference test of the three store modes (random operands, any K) | the diff target |
+
+Rules a generated kernel must follow (all measured; the first two only on the phone):
+
+1. Vote `HAP_power_set_HMX` power_up before any HMX op, and issue HMX ops only on a thread holding the
+   HVX lock and `HAP_compute_res_hmx_lock` (a QuRT worker thread with >= 64 KB stack, not the FastRPC
+   thread). Without the power vote the first tile op wedged the cDSP until a phone reboot.
+2. Operands in the HMX context's VTCM, tiles 2048-byte aligned, and **no operand span may cross a 256 KB
+   VTCM boundary** (user-PD page fault; see `hmx_valloc`).
+3. At most 32 K-tiles per fp16 load pair and 8 per int8 load pair; longer K = more load pairs before one
+   store (they accumulate).
+4. Layouts: `IDX(i, j) = 64*(i/2) + 2*j + i%2`. fp16 A(r,k) / W(k,c) / C(r,c) at halfword `IDX`;
+   int8 A(r,k) at byte `2*IDX(r,k)+1` (odd bytes, 2048 B / K-block), W(k,c) at byte
+   `128*(k/4)+4*c+k%4` (1024 B / K-block), C at u16 `IDX` (`_u16`) or byte `2*IDX+1` (`_u8`, which is the
+   int8 activation layout -- chainable).
+5. Column table (256 B, word c = column c): fp16 out = `rne_fp16(exact acc + bias_c)` with bias in the
+   high half; int8 out = `floor(acc * s_c / 2)` (`_u16`) or `floor(acc * s_c / 512)` (`_u8`), `s_c` fp16
+   in the low half, saturating, negative acc -> 0 (use the offset-K-block trick for signed products).
+
+Harness: `./sim/run.sh sim/block_ref.c <ktiles>` builds with the login-free Hexagon_open_access 19 tools
+(`HEXAGON_TOOLCHAIN`, default `~/.cache/hexagon-oa-19/Tools`; `NCSHIM` = a dir with libncurses.so.5)
+and runs `hexagon-sim -mv69 --mhmx 1`; it prints per-mode mismatch counts and PASS (K = 32, 256, 384
+all 0 mismatches). A generated kernel should replace the `hmx_blk_*` calls in it and keep PASS. Standalone
+sim code must set SSR bit 26 (HMX enable) itself; `hmx_lock` does it on the phone. `tests/test_hmx_gemm.py`
+runs `gemm_sim.c` and `block_ref.c` in CI when `HEXAGON_TOOLS` is set.
+
+Targets measured on the phone (one HMX context, turbo):
+
+| what | best |
+|---|---|
+| MAC + tile store, operands resident in VTCM (fp16, 128x576x1536 .. 1024^3) | **3.07 TMAC/s** |
+| same, int8 (`hmx_probe` issue-rate loop) | ~3.7 TMAC/s |
+| full GEMM from DDR, fp16 (512x576x1536) | 1.20 TMAC/s (weights ~22 GB/s in, C ~7 GB/s out) |
+| SmolLM2-135M prefill projections, 120 GEMMs | 20.9 ms (HTP whole prefill: 24.5 ms) |
+| QNN / HTP practical int8 ceiling on this phone | ~16 TMAC/s |
+
+What the remaining gap to QNN looks like (not implemented here): the MACs are 5-12% of a DDR-fed GEMM,
+so the win is keeping HMX fed -- (a) stream weight tiles DDR -> VTCM asynchronously while HMX works on
+the previous block (user DMA, or other HVX threads doing the copies/l2fetch while the HMX thread only
+issues MACs; the copy is ~80 us per 1.77 MB against ~13 us of MACs), double-buffered in two VTCM
+windows; (b) keep activations and outputs in VTCM across ops (fusion) instead of packing from and
+unpacking to DDR; (c) int8 weights to halve the bytes; (d) a second HMX unit: a second HMX compute_res
+acquire in the same PD is refused, so either QNN's ceiling comes from scheduling a single unit better
+or the second unit is not reachable from one unsigned PD (untested: `HAP_compute_res_hmx_lock2` with
+`HAP_COMPUTE_RES_HMX_SHARED`, as MNN's v73 code uses).
