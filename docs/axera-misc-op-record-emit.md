@@ -157,3 +157,20 @@ one.
 After A to E, ReduceSum, Greater, Less and Cast reach 44/44, 18/18, 1/1 and 19/19,
 provided each new template passes the self-identity check (`test_own_calibration_is_identity`
 pattern).
+
+## Step-shape builds (in progress)
+
+Built from `step.onnx` one at a time, each registered in `index.json`
+(fixtures under `fixtures/misc_op_step_templates/`) only after the checks
+below pass:
+
+- `GreaterCast:16x512x7x7` (batch A): registered as built, because it is
+  not quantized. Greater 0 -> 4 of 18 nodes, Cast 0 -> 4 of 19.
+- `ReduceSum:16x1x512x4608:axes0:k0` (batch C2): passes the self-identity
+  check (retarget away and back). ReduceSum 11 -> 14 of 44 nodes.
+- `ReduceSum:16x1000:axes0,1:k1` (batch E): **not registered**. The
+  retarget to its held-out build refuses: the zero-point change adds or
+  removes records, a case the emitter has not measured. This key needs a
+  template at the step's zero-point class, or a decode of the record move.
+
+The remaining A-E builds are queued behind the MatMul templates.
