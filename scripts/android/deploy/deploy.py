@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import inspect
 import json
 import os
@@ -97,6 +98,10 @@ def stamp_of(ctx: Ctx, stage: str) -> str:
     for f in CODE[stage]:
         for g in sorted(HERE.glob(f)):
             code.update(g.read_bytes())
+    if ONNXSIM_CODE.get(stage):  # the onnxsim the child will import (PYTHONPATH included)
+        spec = importlib.util.find_spec("onnxsim")
+        for f in ONNXSIM_CODE[stage]:
+            code.update((Path(spec.origin).parent / f).read_bytes())
     keys = {"stage": stage, "spec": {k: ctx.spec.get(k) for k in DEPENDS[stage]}, "device": ctx.device
             if stage in ("partition", "push", "bench", "accuracy") else "", "prev": prev_s,
             "code": code.hexdigest()}
@@ -130,6 +135,8 @@ CODE = {
     "bench": ["stages/device.py", *RUNTIME],
     "accuracy": ["stages/accuracy.py", "stages/post.py", "stages/images.py"],
 }
+# onnxsim modules a stage runs: a quantizer change must invalidate quantize and what follows
+ONNXSIM_CODE = {"quantize": ["calibration.py", "qdq_full_graph.py"]}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -190,33 +197,46 @@ def st_quantize(ctx: Ctx) -> None:
         shutil.copyfile(src, dst)
         print("  quantization disabled: fp32 graph (the HTP runs it as fp16)")
         return
-    from onnxruntime.quantization import (CalibrationDataReader, CalibrationMethod, QuantFormat,
-                                          QuantType, quantize_static)
+    import fnmatch
+    import resource
+    from collections.abc import Sequence
 
+    import onnx
+    import onnxsim
+
+    for k in ("op_types", "extra_options"):  # ORT-quantizer keys this stage no longer reads
+        if k in q:
+            raise SystemExit(f"quantize.{k} is not supported (onnxsim.quantize_static); "
+                             "use exclude_nodes / exclude_op_types")
     (in_name,) = list(ctx.spec["inputs"])
     files = imglib.list_images(ctx.spec.get("calibration", {}), ctx.images)
     pre = ctx.spec["preprocess"]
 
-    class Reader(CalibrationDataReader):
-        def __init__(self):
-            self.it = iter(files)
+    class Batches(Sequence):  # re-iterable (calibration runs twice), preprocessed on demand
+        def __len__(self):
+            return len(files)
 
-        def get_next(self):
-            f = next(self.it, None)
-            return None if f is None else {in_name: imglib.preprocess(f, pre)[0][None]}
+        def __getitem__(self, i):
+            return {in_name: imglib.preprocess(files[i], pre)[0][None]}
 
-    act = {"uint8": QuantType.QUInt8, "uint16": QuantType.QUInt16}[q.get("activation", "uint8")]
+    method = q.get("calibration_method", "minmax").lower()
+    model = onnx.load(str(src))
+    tensors = {o for n in model.graph.node for o in n.output}
+    keep = sorted(t for t in tensors if any(fnmatch.fnmatchcase(t, p) for p in q.get("minmax_tensors", [])))
     t = time.time()
-    quantize_static(
-        str(src), str(dst), Reader(), quant_format=QuantFormat.QDQ,
-        per_channel=q.get("per_channel", True), activation_type=act, weight_type=QuantType.QInt8,
-        calibrate_method=getattr(CalibrationMethod, q.get("calibration_method", "MinMax")),
-        nodes_to_exclude=q.get("exclude_nodes", []),
-        op_types_to_quantize=q.get("op_types"),
-        extra_options={"ActivationSymmetric": False, "WeightSymmetric": True,
-                       **q.get("extra_options", {})},
+    m = onnxsim.quantize_static(
+        model, Batches(), minmax_tensor_names=keep, method=method, percentile=float(q.get("percentile", 99.999)),
+        full_graph=True, per_channel=q.get("per_channel", True),
+        activation_type=q.get("activation", "uint8"),
+        nodes_to_exclude=q.get("exclude_nodes", []), op_types_to_exclude=q.get("exclude_op_types", []),
     )
-    print(f"  QDQ int8 on {len(files)} calibration images in {time.time() - t:.1f} s")
+    onnx.save(m, str(dst))
+    meta = {"method": method, "percentile": q.get("percentile", 99.999) if method == "percentile" else None,
+            "minmax_tensors": len(keep), "images": len(files), "seconds": round(time.time() - t, 1),
+            "peak_rss_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)}
+    (ctx.d("quantize") / "quantize_meta.json").write_text(json.dumps(meta, indent=1))
+    print(f"  QDQ int8 ({method}) on {len(files)} calibration images in {meta['seconds']} s, "
+          f"peak RSS {meta['peak_rss_mb']} MB")
 
 
 def st_rewrite(ctx: Ctx) -> None:

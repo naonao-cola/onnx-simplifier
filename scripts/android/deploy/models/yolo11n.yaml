@@ -19,6 +19,10 @@ eval:
                  8021, 8211, 8277, 8532, 8629, 8690]
 quantize:
   enabled: true
+  # onnxsim.quantize_static(full_graph=True). On 128 coco128 images vs fp32 (659 boxes), phone
+  # matched: mse 596, minmax 585 (= ORT's MinMax), percentile 99.999 585, entropy / 99.99 clip the
+  # class logits (see README). mse costs ~20 s more calibration, nothing on the phone.
+  calibration_method: mse
   per_channel: true
   activation: uint8
   # output0 concatenates box pixels (0..640) with class probabilities (0..1): one uint8 scale

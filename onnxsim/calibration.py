@@ -774,6 +774,7 @@ def quantize_static(
     op_types_to_exclude: Optional[Sequence[str]] = None,
     activation_type: str = "uint8",
     percentile: float = 99.999,
+    minmax_tensor_names: Optional[Sequence[str]] = None,
 ) -> onnx.ModelProto:
     """
     Statically (calibration-based) quantize every MatMul, every "vanilla"
@@ -811,8 +812,10 @@ def quantize_static(
             asymmetric), with INT8 weights and INT32 biases, instead of only
             the MatMul/Gemm/Conv inputs -- what a whole-graph integer NPU
             (e.g. the Qualcomm HTP through ORT's QNN EP) needs; see
-            :mod:`onnxsim.qdq_full_graph`. Graph inputs always keep their
-            exact observed range whatever ``method`` is.
+            :mod:`onnxsim.qdq_full_graph`. Graph inputs and the outputs of
+            bounded ops (Sigmoid, Softmax...) always keep their exact
+            observed range whatever ``method`` is -- see
+            :func:`onnxsim.qdq_full_graph.bounded_output_tensors`.
     :param per_channel: (``full_graph`` only) per-output-channel weight
             scales; the default scheme is always per channel
     :param nodes_to_exclude: (``full_graph`` only) node names left in float
@@ -820,6 +823,12 @@ def quantize_static(
     :param activation_type: (``full_graph`` only) ``"uint8"`` or ``"uint16"``
     :param percentile: (``method="percentile"`` only) passed to
             :func:`calibrate`
+    :param minmax_tensor_names: (``full_graph`` only) tensors kept at their
+            exact observed range whatever ``method`` is. A detector's score
+            path is the typical case: its logits are almost all background,
+            so the rare large logits that *are* the detections sit above any
+            percentile/entropy/mse clip (YOLO11n at the 99.99th percentile
+            clips its class logits to ~0, capping every score at ~0.5)
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -845,7 +854,9 @@ def quantize_static(
             tensor_names=qdq_full_graph.list_full_graph_activations(model, **exclude),
             minmax_tensor_names=[
                 i.name for i in model.graph.input if i.name not in inits
-            ],
+            ]
+            + qdq_full_graph.bounded_output_tensors(model)
+            + list(minmax_tensor_names or ()),
         )
         return qdq_full_graph.quantize_full_graph(
             model,
@@ -856,13 +867,14 @@ def quantize_static(
         )
     if (
         not per_channel
+        or minmax_tensor_names
         or nodes_to_exclude
         or op_types_to_exclude
         or activation_type != "uint8"
     ):
         raise ValueError(
-            "per_channel=False, nodes_to_exclude, op_types_to_exclude and "
-            "activation_type only apply with full_graph=True (use "
+            "per_channel=False, nodes_to_exclude, op_types_to_exclude, "
+            "minmax_tensor_names and activation_type only apply with full_graph=True (use "
             "quantize_static_int16 for W8A16 on the default scheme)"
         )
     ranges = calibrate(

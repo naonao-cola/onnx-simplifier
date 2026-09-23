@@ -222,6 +222,13 @@ def test_full_graph_qdq_structure():
     # Reshape's shape input stays int64
     reshape = next(n for n in g.node if n.op_type == "Reshape")
     assert inits[reshape.input[1]].dtype == np.int64
+    # value-preserving ops reuse their input's scale/zero point: no requantize
+    for n in g.node:
+        if n.op_type == "Reshape":
+            dq_in = producer[n.input[0]]
+            (q_out,) = consumers[n.output[0]]
+            assert inits[q_out.input[1]] == inits[dq_in.input[1]]
+            assert inits[q_out.input[2]] == inits[dq_in.input[2]]
 
 
 def test_full_graph_exclusion_and_accuracy():

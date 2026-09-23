@@ -15,7 +15,8 @@ quantizer does for such targets:
 
 - **Activations** (graph inputs and every float node output): uint8 (or
   uint16) asymmetric, per tensor, from the calibrated ``(min, max)`` widened
-  to include 0.
+  to include 0. Value-preserving ops (Reshape, Transpose, MaxPool, Split,
+  Slice, Resize...) reuse their input's scale and zero point instead.
 - **Conv/ConvTranspose/Gemm/MatMul weights** (constant input 1): INT8
   symmetric (zero point 0), per output channel by default.
 - **Biases** (Conv/Gemm constant input 2): INT32 with scale
@@ -76,6 +77,34 @@ _NON_DATA_INPUTS: Dict[str, Set[int]] = {
 # these produce indices or booleans or are themselves Q/DQ.
 _SKIP_OPS = {"QuantizeLinear", "DequantizeLinear", "Shape", "Size", "NonMaxSuppression"}
 
+# Ops whose output values are a subset/rearrangement of their data input's
+# (Resize: except cubic, which can overshoot).
+_SAME_SCALE_OPS = {
+    "Reshape",
+    "Transpose",
+    "Flatten",
+    "Squeeze",
+    "Unsqueeze",
+    "MaxPool",
+    "Slice",
+    "Split",
+    "Gather",
+    "Expand",
+    "Tile",
+    "DepthToSpace",
+    "SpaceToDepth",
+    "Identity",
+    "Resize",
+}
+
+
+def _attr(node: onnx.NodeProto, name: str, default):
+    for a in node.attribute:
+        if a.name == name:
+            return helper.get_attribute_value(a)
+    return default
+
+
 # (weight slot, bias slot) for ops whose constant weight is quantized INT8
 # symmetric (per channel) and whose bias is INT32 at x_scale * w_scale.
 _WEIGHT_OPS = {
@@ -109,6 +138,26 @@ def _activation_qparams(lo: float, hi: float, qmax: int) -> Tuple[float, int]:
     scale = (hi - lo) / qmax
     zp = int(np.clip(np.round(-lo / scale), 0, qmax))
     return scale, zp
+
+
+# Ops whose output range is bounded to at most [-1, 1] by construction.
+_BOUNDED_OUTPUT_OPS = {"Sigmoid", "HardSigmoid", "Softmax", "Tanh"}
+
+
+def bounded_output_tensors(model: onnx.ModelProto) -> List[str]:
+    """Outputs of Sigmoid/HardSigmoid/Softmax/Tanh, which calibration
+    should never clip: their range is already at most 1 wide (a uint8 step
+    of <= 1/255), so a percentile/entropy/mse clip saves almost no
+    resolution, while the rare values it cuts off are what a classifier
+    head's scores *are* -- YOLO11n's class Sigmoid is ~672k values per image,
+    nearly all ~0, and clipping it at its 99.99th percentile pushes every
+    score under the 0.25 detection threshold (0 detections)."""
+    return [
+        o
+        for n in model.graph.node
+        if n.op_type in _BOUNDED_OUTPUT_OPS
+        for o in n.output
+    ]
 
 
 def list_full_graph_activations(
@@ -231,6 +280,20 @@ def quantize_full_graph(
             f"no calibrated range for {len(missing)} tensors, e.g. {missing[:5]}"
         )
 
+    # Value-preserving ops share their input's scale/zero point (as ORT's QDQ
+    # quantizer does): exact (their output needs no calibrated range of its
+    # own) and no requantize op for the NPU to insert between them.
+    ranges = dict(ranges)
+    for n in g.node:
+        if (
+            n.op_type in _SAME_SCALE_OPS
+            and not _excluded(n, nodes, ops)
+            and n.input[0] in acts
+            and not (n.op_type == "Resize" and _attr(n, "mode", b"nearest") == b"cubic")
+        ):
+            for o in n.output:
+                if o in acts:
+                    ranges[o] = ranges[n.input[0]]
     inits = {t.name: t for t in g.initializer}
     types = _elem_types(m)
     graph_inputs = {i.name for i in g.input}
