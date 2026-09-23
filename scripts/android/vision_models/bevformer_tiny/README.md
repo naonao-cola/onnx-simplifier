@@ -354,6 +354,44 @@ graph I/O is fp32, and each QDQ unit adds per-op conversion work that the int8 m
 fp16 stays the default. (Uint8 graph I/O would need frame_run to carry uint8 buffers between pieces; the
 earlier uint8 TSA-output test saved nothing on the HTP side, so it is not pursued here.)
 
+**Lever 2, decoder self-attention int8 / 16-bit** (`quantize.py decoder --policy mm8|mm16`: only the
+decoder's 10 activation x activation MatMuls, i.e. Q x K^T and softmax x V of layers 1-5):
+
+| decoder | decoder ms | seq ms/frame | pipe ms/frame (FPS) | cls cos (min) | GT matched |
+|---|---|---|---|---|---|
+| **fp16 (`decoder.sim`, default)** | **25.0** | **101.9** | **90.2 (11.1)** | 0.99979 | **107 / 190** |
+| `mm8` | 24.0 | 100.9 | 90.0 (11.1) | 0.99965 | 107 / 190 |
+| `mm16` | 27.0 | 103.5 | 92.1 (10.9) | 0.99979 | 107 / 190 |
+
+`mm8` saves 1 ms of decoder time at the same GT, but the pipelined frame doesn't move (the HTP total per
+frame is ~75 ms, and 1 ms is within run-to-run noise), so fp16 stays the default.
+
+**Lever 3, fold `pre` into the backbone: bounded, not done.** Timed alone on the HTP (`qnn_run_multi`,
+median of 20): `pre` 6.46 ms, `pre` without the SCA value projections 4.97 ms, the SCA value projections
+alone 1.58 ms. Folding moves those ~1.5 ms of HTP work into the backbone graph rather than removing it,
+and makes the backbone's output 3x larger (3 layers' `sca_v` instead of `feats`). The ceiling is
+therefore < 1.5 ms of a 90 ms pipelined frame, for a frame_run change; not worth it.
+
+**Lever 4, backbone recalibration** (`quantize.py backbone --method mse|percentile`, same graph, only the
+scales change, so the speed is unchanged):
+
+| backbone calibration | phone bev cos (min / max) | GT matched |
+|---|---|---|
+| **minmax (default)** | 0.9965 / 0.9980 | **107 / 190** |
+| mse | 0.9970 / 0.9979 | 104 / 190 |
+| percentile (99.999) | 0.9971 / 0.9980 | 105 / 190 |
+
+mse and percentile raise bev cos slightly but match fewer GT boxes: minmax stays.
+
+**Where this leaves BEVFormer-tiny:** 89.6-90.2 ms/frame pipelined (11.1-11.2 FPS), 107/190 GT. The
+pipelined frame is bounded by ~75 ms of HTP work that neither int8 (slower on these small pieces) nor
+re-partitioning shrinks. The remaining lever is moving more HTP work to the HVX, where the kernel has
+headroom (~28 ms per frame).
+
+Phone-contention note: the Mask R-CNN demo app (`org.onnxsim.maskrcnndemo`) was running on the phone
+during parts of this session and slowed the HTP ~2x. Every timing in the tables above was taken with the
+app idle (checked with `top` right after each run); runs taken while it was busy were discarded.
+
 Reproduce:
 
 ```sh
