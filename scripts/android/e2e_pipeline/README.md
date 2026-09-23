@@ -153,6 +153,13 @@ segments themselves do not get slower. Full pipeline, 6 images, median ms, all w
 | e_opt | 7.6 s | 116 | 138 | 138 | 117 | 125 | 128 | 58/61 | 0.861 |
 | e_u8 | 5.7 s | 114 | 131 | 131 | 114 | 117 | 124 | 59/61 | 0.886 |
 | **e_u8_ctx** (`ctx=2`) | **0.66 s** | 116 | 133 | 134 | 113 | 120 | 126 | 59/61 | 0.887 |
+| **e_u8ra_ctx** (+ uint8 RoiAlign skel) | **0.74 s** | 78 | 86 | 88 | 79 | 84 | 87 | 59/61 | 0.887 |
+
+`e_u8ra` / `e_u8ra_ctx` (also from `u8_heads.py`) use the merged uint8 RoiAlign skel
+(`../tinygrad_hexagon_bridge/roialign_fast/roialign_u8_*`, PR #1848): per head one `roialign_u8` call
+reads the backbone's uint8 NHWC maps, staged into rpcmem once per frame by `rpc_stage`, and writes
+the head's uint8 input rows. It replaces the maps' dq, the 4 roialign steps, seg2/seg4 and the
+`quant` step: box 6.5 ms, mask 2.6 ms, staging 1.9 ms on image 139, where that span took ~66 ms.
 
 So EP-context no longer costs per-image time, and the uint8 mask output is slightly more accurate
 (the CPU's fp32 sigmoid on one channel instead of the HTP's). The first run on a device compiles
