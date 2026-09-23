@@ -66,7 +66,10 @@ def msda_rank5(value, hw, loc, w):
     h, wd = hw
     b, _, m, d = value.shape
     q, p = loc.shape[1], loc.shape[3]
-    v = value.permute(0, 2, 3, 1).reshape(b * m, d, h, wd)
+    # (B, HW, M, D) -> (B*M, D, H, W) via a rank-3 transpose: the equivalent rank-4
+    # permute(0, 2, 3, 1) + reshape comes out scrambled on the HTP (QNN 2.50; value cos 0.12
+    # vs fp32, see README "fp16 precision bisect") unless its output is also a graph output
+    v = value.reshape(b, h * wd, m * d).transpose(1, 2).reshape(b * m, d, h, wd)
     grid = (2 * loc - 1).permute(0, 2, 1, 3, 4).reshape(b * m, q, p, 2)
     s = F.grid_sample(v, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
     a = w.permute(0, 2, 1, 3).reshape(b * m, 1, q, p)
@@ -123,7 +126,9 @@ class TemporalSelfAttention(nn.Module):
         identity = query
         qp = query + bev_pos
         qcat = torch.cat([v_prev, qp], -1)  # upstream: cat([value[:bs], query + pos])
-        v = self.value_proj(torch.stack([v_prev, v_cur], 0)).reshape(2, NQ, HEADS, EMBED // HEADS)
+        # value_proj per frame, then stack (same math as projecting the stack): on the HTP,
+        # stack -> reshape (5000, 256) -> Gemm comes out scrambled (QNN 2.50, cos 0.12)
+        v = torch.stack([self.value_proj(v_prev), self.value_proj(v_cur)], 0).reshape(2, NQ, HEADS, EMBED // HEADS)
         m, p = HEADS, self.p
         # linear outputs are laid out (head, queue, level=1, point, xy) / (head, queue, point)
         off = self.sampling_offsets(qcat).reshape(NQ, m, 2, p * 2).permute(2, 0, 1, 3).reshape(2, NQ, m, p, 2)
@@ -350,8 +355,17 @@ def decode(cls, bbox, max_num=300):
 
 
 # ---- geometry (host side; upstream BEVFormerEncoder.get_reference_points/point_sampling) ------
-def reference_points_cam(lidar2img: torch.Tensor, img_hw=(480, 800)):
-    """lidar2img (6, 4, 4) -> ref_cam (6, Q, Z, 2) in [0, 1], bev_mask (6, Q, Z) float."""
+REF_CAM_CLAMP = (-5.0, 6.0)
+
+
+def reference_points_cam(lidar2img: torch.Tensor, img_hw=(480, 800), clamp=REF_CAM_CLAMP):
+    """lidar2img (6, 4, 4) -> ref_cam (6, Q, Z, 2) (in [0, 1] where visible), bev_mask (6, Q, Z).
+
+    Upstream divides by max(depth, 1e-5), so pillar points behind a camera land at |xy| ~ 1e7:
+    past fp16's 65504, which the HTP turns into inf/NaN (encoder cos 0.916 on the phone). Such
+    points are outside the image either way, and SCA offsets move a point by < 1 image width
+    (|offset| / W < 0.8 on real frames), so clamping to [-5, 6] still samples zero padding: the
+    output is unchanged (validate.py checks clamped vs unclamped). clamp=None keeps upstream values."""
     zs = torch.linspace(0.5, 8 - 0.5, Z_ANCHORS).view(-1, 1, 1).expand(Z_ANCHORS, BEV_H, BEV_W) / 8
     xs = torch.linspace(0.5, BEV_W - 0.5, BEV_W).view(1, 1, BEV_W).expand(Z_ANCHORS, BEV_H, BEV_W) / BEV_W
     ys = torch.linspace(0.5, BEV_H - 0.5, BEV_H).view(1, BEV_H, 1).expand(Z_ANCHORS, BEV_H, BEV_W) / BEV_H
@@ -368,6 +382,8 @@ def reference_points_cam(lidar2img: torch.Tensor, img_hw=(480, 800)):
     xy[..., 1] /= img_hw[0]
     mask = mask & (xy[..., 1:2] > 0) & (xy[..., 1:2] < 1) & (xy[..., 0:1] < 1) & (xy[..., 0:1] > 0)
     mask = torch.nan_to_num(mask.float())
+    if clamp is not None:
+        xy = xy.clamp(*clamp)
     return xy.permute(0, 2, 1, 3).contiguous(), mask[..., 0].permute(0, 2, 1).contiguous()
 
 

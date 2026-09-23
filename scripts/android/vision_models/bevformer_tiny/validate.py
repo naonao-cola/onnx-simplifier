@@ -73,6 +73,8 @@ def main():
         bev = encoder(*enc_in)
         te = time.time() - t
         bev_ref = encoder(*enc_in, reference=True)
+        rc_raw, _ = M.reference_points_cam(f["lidar2img"], clamp=None)
+        bev_raw = encoder(feats, prev_in, has_prev, shift, can_bus, rc_raw, bev_mask, reference=True)
         t = time.time()
         cls, bbox = decoder(bev)
         td = time.time() - t
@@ -82,6 +84,8 @@ def main():
         vis = (bev_mask.sum(-1) > 0).float().sum(0)
         print(f"frame {i} {tok[:8]} has_prev {int(has_prev)} shift {shift.tolist()} | visible cams/query "
               f"mean {vis.mean():.2f} none {int((vis == 0).sum())}")
+        print(f"  ref_cam |max| unclamped {rc_raw.abs().max():.3g}; encoder clamped vs unclamped (upstream-literal) "
+              f"max abs {(bev_ref - bev_raw).abs().max():.2e}")
         print(f"  encoder rank5 vs upstream-literal: max abs {(bev - bev_ref).abs().max():.2e}  "
               f"decoder cls {(cls - cls_r).abs().max():.2e} bbox {(bbox - bbox_r).abs().max():.2e}")
         print(f"  cpu fp32 ms: backbone(6 cams) {tb * 1e3:.0f}  encoder {te * 1e3:.0f}  decoder {td * 1e3:.0f}")
