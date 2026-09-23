@@ -112,7 +112,8 @@ def main():
         t = M.to_torch({k: z[k] for k in ("lidar2img", "intrinsics", "ego_pose", "ego_pose_inv")} | {"timestamp": float(z["timestamp"])})
         prev = bool(z["prev"])
         gt = list(zip(z["gt_names"].tolist(), z["gt_xyz"]))
-        (feat,), ms_img = phone(work, a.img, {"img": D.normalize(z["img_u8"]).numpy()}, a.iters)
+        img = z["img_u8"].transpose(0, 3, 1, 2).astype(np.float32) if "raw" in a.img else D.normalize(z["img_u8"]).numpy()
+        (feat,), ms_img = phone(work, a.img, {"img": img}, a.iters)
         feat_t = torch.from_numpy(feat.reshape(-1, M.EMBED))
         ins = {"feat": feat_t, **host.rig_inputs(t), **host.pre(t, prev)}
         (cls, reg, dec), ms_head = phone(work, a.head, {k: v.numpy() for k, v in ins.items()}, a.iters)
