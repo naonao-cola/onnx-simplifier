@@ -90,9 +90,8 @@ gamma/beta): 112 ms once per camera rig.
     **uint16 x uint16 MatMul** (the attention's activation-activation products) -- keeping MatMul in
     fp16 restores cos 0.9977 but the fp16 islands in a uint16 graph make it 147 ms. uint8
     activations break the head even with MatMul in fp16 (reg cos 0.71).
-* **Next levers** (not done): run the cross-attention `softmax(QK^T) V` as an HVX kernel (the
-  (8, 428, 4224) attention never leaves VTCM-sized tiles; fp16 on the HTP spends ~3 ms/layer on it);
-  overlap the host memory queue with the next frame's image piece; move `HostState` to numpy/C++.
+* **Next levers**: done below -- the cross-attention on the HVX (measured slower) and the host side in
+  C++ with the image piece pipelined (40 ms/frame end to end).
 
 ## Follow-up: the cross-attention on the HVX (measured: slower, stays on the HTP)
 
@@ -122,6 +121,42 @@ them (uint8, one scale / zero point per tensor) and returning uint8 in V's own q
   still shave a few ms of *throughput* in a pipelined chain, at ~13 ms extra latency per layer and a
   split head; not pursued.
 
+## Follow-up: the whole frame in one phone process (C++ host, pipelined)
+
+`runtime/`: `petr_run.cpp` runs the int8 image piece and the head on the HTP (ORT QNN EP) and does
+everything `HostState` did in Python in C++ -- the 512-entry memory queue (ego-motion transforms,
+top-128 propagation), the sine / nerf encodings, box decoding -- plus the position embedding's geometry.
+
+* **The position embedding is per frame on nuScenes**, not rig-static: `lidar2img` differs frame to
+  frame (camera / lidar ego-motion compensation; `pe` changes by up to 1.5), so `e2e_phone.py`'s
+  `HostState.rig_inputs` recomputed it every frame in Python (112 ms, not counted in the table above).
+  `export.py head_pe` moves its MLPs (`position_encoder`, `spatial_alignment`) into the head and takes
+  `pe_in` / `cone` (the C++ geometry: 6 inverse 4x4 + 4224 x 64 points) plus the image piece's uint8
+  NHWC `feat` directly (an exact `DequantizeLinear` on the graph input: a uint8 input into a plain
+  `Cast` is miscomputed by the HTP, and a DQ behind a uint8 `Reshape` falls back to the CPU).
+* **Checked against model.py** (`runtime/check_run.py`, replaying `HostState` on the phone's own head
+  outputs): memory rows exact (`mem_emb` 0, `mem_pe3d` 2.6e-5, `mem_motion` 3.9e-3 -- sines of large
+  arguments), `pe_in` 3.9e-3, boxes 3.7e-4. The top-128 is ranked by `sigmoid(logit)` in fp32 with ties
+  to the lower index, as `model.py` / torch's CPU `topk` do: ranking by the raw logit selects the same
+  rows in another order, which is equivalent but sums the fp16 attention in another order -- that
+  alone flipped one borderline detection (111 vs 112).
+* **pipe**: a second thread runs frame t+1's image piece and geometry (neither needs the memory queue)
+  while the main thread does frame t's queue update, head and post. Output files are byte-identical to
+  `seq`.
+
+Phone, scene-0103 x 6 frames x 5 passes, strict all-HTP, under the phone lock (two runs each):
+
+| StreamPETR R50 428q, int8 image / fp16 head | per frame | FPS | latency | GT @0.3 | GT @0.2 |
+|---|---|---|---|---|---|
+| #1884: e2e_phone.py (Python host; HTP time only, host ~11 ms + per-frame `pe` 112 ms not counted) | 38.8 ms HTP | (25.8) | -- | 112 | 150 |
+| **petr_run seq** (one process, C++ host, everything counted) | 52-55 ms | 18.2-19.3 | 50-56 ms | **112** | 149 |
+| **petr_run pipe** | **40.0-40.1 ms** | **24.9-25.0** | 59 ms | **112** | 149 |
+
+Per frame (medians): image 9.5 ms, geometry 6.6 ms, queue update + encodings 2.7-8.0 ms, head 31.0 ms,
+post 0.5 ms. Pipelined, the frame time is the two HTP pieces back to back (9.5 + 31; the head reads
+~36 ms there because the next frame's image piece queues on the same HTP) -- all CPU work is hidden,
+so from here on only a faster head helps, and the cross-attention section above shows the HVX isn't it.
+
 ## Reproduce
 
 ```
@@ -135,6 +170,12 @@ R=/data/local/tmp/streampetr python e2e_phone.py --ckpt ... --work work
 python validate.py --ckpt ... --data $C/nuscenes-mini --work work --no-upstream --scene scene-0061 scene-0553 scene-0757 scene-1077
 python export.py img_raw --ckpt ... --work work && python quantize.py img_raw --work work
 python e2e_phone.py --ckpt ... --work work --img img_raw.sim.q8 --head head.sim --iters 12
+# one phone process (runtime/): head with per-frame position embedding, scene data, C++ runner
+python export.py head_pe --ckpt ... --work work && python runtime/prep.py --ckpt ... --work work --out scene
+OUT=build runtime/build.sh   # then push petr_run, the two .onnx and scene/ with qnn_shell's libs
+petr_run scene img_raw.sim.q8.onnx head_pe.sim.onnx pipe 1 5 out 6   # DUMP=1 + runtime/check_run.py to verify
+# HVX cross-attention (attn_hvx/): real-layer cases, then the phone bench
+python attn_hvx/emulate.py calib|case --ckpt ... --work work; OUT=build CASES="cases/*" FLAGS=4,6 attn_hvx/build.sh
 # head experiments
 python quantize.py head --act uint16 [--exclude-ops MatMul --tag=_mm]; python sensitivity.py --work work
 python tf_phone.py --work work --head head.sim head.sim.q16
