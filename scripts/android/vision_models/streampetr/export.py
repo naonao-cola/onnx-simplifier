@@ -85,6 +85,26 @@ class HeadRig(torch.nn.Module):
         return self.core(f, self.pe, self.sa_gamma, self.sa_beta, mem_emb, mem_pe3d, mem_time, mem_motion)
 
 
+class HeadPE(torch.nn.Module):
+    """HeadCore with the per-frame position embedding's MLPs on the HTP: ``pe_in`` (T, 192) =
+    inverse_sigmoid(coords3d) and ``cone`` (T, 8) come from the host's geometry (runtime/petr_run.cpp,
+    model.py position_embedding), position_encoder / spatial_alignment's reduce, gamma, beta run here.
+    On nuScenes lidar2img changes every frame (camera/lidar ego-motion compensation), so these are
+    not rig-static there. ``feat`` is the int8 image piece's uint8 NHWC output, dequantized in-graph."""
+
+    def __init__(self, core, feat_q):
+        super().__init__()
+        self.core = core
+        self.scale, self.zp = float(feat_q["scale"]), float(feat_q["zero_point"])
+
+    def forward(self, feat, pe_in, cone, mem_emb, mem_pe3d, mem_time, mem_motion):
+        h = self.core.h
+        f = (feat.reshape(-1, M.EMBED).float() - self.zp) * self.scale
+        c = h.spatial_alignment.reduce(cone)
+        return self.core(f, h.position_encoder(pe_in), h.spatial_alignment.gamma(c), h.spatial_alignment.beta(c),
+                         mem_emb, mem_pe3d, mem_time, mem_motion)
+
+
 def pieces(name, ckpt, work=None, z=None):
     img_net, head = M.load_official(ckpt)
     if name == "img":
@@ -93,6 +113,19 @@ def pieces(name, ckpt, work=None, z=None):
         return ImgRaw(img_net).eval(), ["img"], ["feat"], \
             lambda z: {"img": torch.from_numpy(np.ascontiguousarray(z["img_u8"].transpose(0, 3, 1, 2), np.float32))}
     core = M.HeadCore(head).eval()
+    if name == "head_pe":
+        import json
+
+        fq = json.loads((work / "img_raw.sim.q8.json").read_text())["feat"]
+        mem = ["mem_emb", "mem_pe3d", "mem_time", "mem_motion"]
+
+        def inputs_of(zz):
+            f = np.clip(np.round(zz["feat"] / fq["scale"]) + fq["zero_point"], 0, 255).astype(np.uint8)
+            t = M.to_torch({k: zz[k] for k in ("lidar2img", "intrinsics", "ego_pose", "ego_pose_inv")} | {"timestamp": float(zz["timestamp"])})
+            pe_in, cone = M.position_embedding(head, t["lidar2img"], t["intrinsics"])
+            return {"feat": torch.from_numpy(f.reshape(6, 16, 44, M.EMBED)), "pe_in": pe_in, "cone": cone,
+                    **{k: torch.from_numpy(zz[k]) for k in mem}}
+        return HeadPE(core, fq).eval(), ["feat", "pe_in", "cone", *mem], ["cls", "reg", "dec"], inputs_of
     if name == "head_rig":
         import json
 
@@ -111,6 +144,38 @@ def pieces(name, ckpt, work=None, z=None):
     return core, HEAD_IN, ["cls", "reg", "dec"], lambda z: {k: torch.from_numpy(z[k]) for k in HEAD_IN}
 
 
+def cast_to_dequantize(model):
+    """uint8 -> Cast -> Sub(zp) -> Mul(scale) becomes one DequantizeLinear (exact): the HTP miscomputes
+    a uint8 graph input feeding a plain Cast (the same trap Sparse4D's backbone hit)."""
+    from onnx import helper, numpy_helper
+
+    g = model.graph
+    consts = {n.output[0]: numpy_helper.to_array(n.attribute[0].t) for n in g.node if n.op_type == "Constant"}
+    consts |= {i.name: numpy_helper.to_array(i) for i in g.initializer}
+    users = {}
+    for n in g.node:
+        for i in n.input:
+            users.setdefault(i, []).append(n)
+    for c in [n for n in g.node if n.op_type == "Cast"]:
+        (sub,) = users[c.output[0]]
+        (mul,) = users[sub.output[0]]
+        assert sub.op_type == "Sub" and mul.op_type == "Mul", (sub.op_type, mul.op_type)
+        zp, sc = float(consts[sub.input[1]]), float(consts[mul.input[1]])
+        g.initializer.extend([numpy_helper.from_array(np.array(sc, np.float32), "feat_scale"),
+                              numpy_helper.from_array(np.array(round(zp), np.uint8), "feat_zp")])
+        # dequantize the graph input itself, then reshape in float (a DQ behind a uint8 Reshape is
+        # left on the CPU by the QNN EP)
+        rs = next(n for n in g.node if c.input[0] in n.output)
+        assert rs.op_type == "Reshape" and rs.input[0] in {i.name for i in g.input}, rs.op_type
+        dq = helper.make_node("DequantizeLinear", [rs.input[0], "feat_scale", "feat_zp"], ["feat_f"], name="feat_dq")
+        rs.input[0] = "feat_f"
+        rs.output[0] = mul.output[0]
+        idx = list(g.node).index(rs)
+        for n in (c, sub, mul):
+            g.node.remove(n)
+        g.node.insert(idx, dq)
+
+
 def compare(sess, mod, inputs, label):
     with torch.no_grad():
         ref = mod(*inputs.values())
@@ -125,7 +190,7 @@ def compare(sess, mod, inputs, label):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("piece", choices=["img", "img_raw", "head", "head_rig", "headT", "headTT", "headV", "headVV"])
+    ap.add_argument("piece", choices=["img", "img_raw", "head", "head_pe", "head_rig", "headT", "headTT", "headV", "headVV"])
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--work", required=True)
     ap.add_argument("--frame", default="scene-0103/3")
@@ -147,6 +212,8 @@ def main():
 
     sim, ok = onnxsim.simplify(str(raw), check_n=0)
     assert ok
+    if a.piece == "head_pe":
+        cast_to_dequantize(sim)
     onnx.save(sim, str(simp))
     ops = {}
     for n in sim.graph.node:
