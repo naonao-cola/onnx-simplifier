@@ -714,21 +714,46 @@ summation order: Llama-3.2-1B q4f16 logits agree at rel 2.4e-3 (max |diff| 0.047
 argmax 100% on an 8-token decode-path input) -- enough to flip greedy near-ties (top-1/top-2
 margins of 0.016 occur), so the two modes' generations can diverge after a few tokens.
 
-Decode-kernel microbenchmark (M = 1, fp16, RTX 5050, CUDA-graph replay; timings at this scale
-are noisy -- the dense baseline itself varied up to 2x between runs as the idle GPU's
-clocks ramped): 2048x8192 and 8192x2048 layers 2.0-2.9x faster than a dense fp16 `F.linear`;
-layers up to ~1024 wide about break-even (launch overhead); prefill (M = 300) ~0.75x on the
-large layers (the transient fp16 weight's write).
+**Verified end to end against ONNX Runtime.** Prefill logits of the real int4 files on the
+GPU (fp16) vs ONNX Runtime on an fp32 copy of the same file (int4 weights exact):
+SmolLM2-360M q4f16 3.5e-3 relative (decode-sized input, Triton split-K kernel) / 2.7e-3
+(54-token prefill), Llama-3.2-1B q4f16 2.4e-3 / 2.7e-3, argmax 100% -- the same as the
+`dequant` path and as a plain fp16 model (2.4e-3), i.e. fp16 rounding. One trap: Llama's
+`MatMulNBits` carry `accuracy_level=4`, which lets ONNX Runtime's CPU kernel quantize the
+*activations* to int8; against that reference both paths look 10x worse (3.2e-2, argmax 97%).
+The conversion ignores `accuracy_level` and always uses full-precision activations.
+
+**Kernel speed: measure with weights that don't fit in L2.** Timing one layer in a loop
+keeps its dense fp16 weight resident in the RTX 5050's 24 MB L2 (a 2048x2048 fp16 weight is
+8 MB), which made dense look faster than int4 for every layer up to ~3072 wide at M = 2-16.
+In a model the weights stream from DRAM every token (Llama-3.2-1B: 2.5 GB), so the table
+below rotates each layer over enough copies to exceed 4x L2 (also: 2 s clock warm-up,
+7 interleaved rounds, medians, CUDA-graph replay; group 32):
+
+| layer K x N | M=1 | M=8 | M=32 | M=64 | M=128 | M=512 |
+|---|---|---|---|---|---|---|
+| 960 x 960 | 2.52x | 1.11x | 0.82x | 0.60x | 0.76x | 0.91x |
+| 2048 x 2048 | 1.64x | 1.53x | 1.31x | 0.82x | 0.71x | 0.93x |
+| 2048 x 8192 | 1.90x | 1.86x | 1.50x | 1.11x | 0.82x | 0.82x |
+| 8192 x 2048 | 1.69x | 1.64x | 1.33x | 0.85x | 0.61x | 0.82x |
+
+(int4 speedup over dense fp16 `F.linear`.) M <= 16 is the split-K decode kernel; 16 < M <= 256
+the same kernel as a plain tile GEMM (tuned from a sweep: it beat the first version's
+transient-dequant + cuBLAS path at every M <= 128, e.g. 73 vs 274 us at M = 32 on
+2048x8192); M > 256 dequantizes to a transient fp16 weight and calls cuBLAS. Decode --
+nearly all of a chat generation -- is 1.1-2.5x faster; mid-size prefills are the weak spot.
 
 | AutoDeploy `torch-cudagraph`, RTX 5050, 3 prompts x 128 greedy tokens | weights on GPU | tok/s |
 |---|---|---|
 | Llama-3.2-1B `model_fp16.onnx` | ~2.5 GB fp16 | 106-109 |
 | Llama-3.2-1B `model_q4f16.onnx`, `matmul_nbits="dequant"` | ~2.5 GB fp16 | 108-109 |
-| Llama-3.2-1B `model_q4f16.onnx`, **`matmul_nbits="packed"`** | int4 + fp16 embedding | **158-159** |
+| Llama-3.2-1B `model_q4f16.onnx`, **`matmul_nbits="packed"`** | int4 + fp16 embedding | **159-160** |
 | SmolLM2-360M `model_q4f16.onnx`, `"dequant"` | 0.725 GB | 218-229 |
-| SmolLM2-360M `model_q4f16.onnx`, **`"packed"`** | **0.272 GB** | **290-349** |
+| SmolLM2-360M `model_q4f16.onnx`, **`"packed"`** | **0.272 GB** | **347-365** (290-349 before the tile path) |
 
 (`trtllm_autodeploy_onnx.py --matmul-nbits packed`. AutoDeploy's "Estimated parameters
 memory" log line counts `parameters()` only and misses the uint8 buffers -- the byte counts
-above are from the state dict.) Only 4-bit without `g_idx`, and group sizes that divide or
-are multiples of 128, take the kernel; anything else falls back to dequantizing.
+above are from the state dict.) Only 4-bit without `g_idx`, group sizes that divide or are
+multiples of 128, and zero points that are absent, packed uint8, or integral floats in
+[0, 15] take the kernel; anything else (e.g. fractional float zero points, which
+MatMulNBits allows) falls back to dequantizing.

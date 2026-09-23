@@ -532,13 +532,52 @@ def test_matmulnbits_packed_mode(zero_points):
     assert any("onnxsim.matmul_nbits" in t for t in targets), targets
 
 
+def test_matmulnbits_packed_falls_back_on_fractional_float_zero_points():
+    # Zero points may be given in the scales' (float) type and need not be integers;
+    # the int4 kernel takes uint8 zeros, so such a node must fall back to dequantizing
+    # (exact) rather than rounding its zero points.
+    k, n, block = 32, 4, 16
+    rng = np.random.default_rng(11)
+    model = parser.parse_model(
+        f"""
+        <ir_version: 8, opset_import: ["": 18, "com.microsoft": 1]>
+        g (float[2, {k}] a) => (float[2, {n}] y) {{
+          y = com.microsoft.MatMulNBits<K = {k}, N = {n}, bits = 4, block_size = {block}>(
+              a, w, scales, zp)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            numpy_helper.from_array(
+                rng.integers(0, 256, (n, 2, block // 2), dtype=np.uint8), "w"
+            ),
+            numpy_helper.from_array(
+                (rng.random(n * 2) * 0.1 + 0.01).astype(np.float32), "scales"
+            ),
+            numpy_helper.from_array(
+                (rng.random(n * 2) * 15).astype(np.float32), "zp"
+            ),  # fractional
+        ]
+    )
+    x = rng.standard_normal((2, k)).astype(np.float32)
+    mod = onnx_to_torch(model, inputs=["a"], outputs=["y"], matmul_nbits="packed")
+    assert not mod._nbits_packed and mod._nbits_key  # dequantized, not packed
+    try:
+        (want,) = _ort(model, {"a": x})
+    except Exception as e:
+        pytest.skip(f"onnxruntime cannot run MatMulNBits: {e}")
+    (got,) = mod(torch.from_numpy(x))
+    np.testing.assert_allclose(got.numpy(), want, rtol=1e-4, atol=1e-4)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA (Triton kernel)")
 @pytest.mark.parametrize("zero_points", [False, True])
-@pytest.mark.parametrize("m", [1, 5, 16, 40])
+@pytest.mark.parametrize("m", [1, 5, 16, 40, 100, 300])
 def test_matmulnbits_triton_kernel_matches_fallback(zero_points, m):
-    # The CUDA path (onnxsim/_triton_w4a16.py: split-K decode kernel for M <= 16, GPU
-    # dequant + cuBLAS above) against the PyTorch fallback, incl. K not a multiple of the
-    # group and group 32 (a real q4f16 export's block size).
+    # The CUDA path (onnxsim/_triton_w4a16.py: split-K decode kernel for M <= 16, tile
+    # kernel up to M = 256, GPU dequant + cuBLAS above) against the PyTorch fallback,
+    # incl. K not a multiple of the group and group 32 (a real q4f16 export's block size).
     pytest.importorskip("triton")
     from onnxsim._matmul_nbits_op import dequant_packed
 
