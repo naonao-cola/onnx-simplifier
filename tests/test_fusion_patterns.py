@@ -772,6 +772,79 @@ def test_fuse_rms_norm_fp32_upcast_downcast_type_mismatch_untouched():
     assert ops["RMSNormalization"] == 0
 
 
+_FP16_RMS_NORM = """
+    g (float16[2,4,8] X) => (float16[2,4,8] Y)
+    <int64[1] axes = {-1}>
+    {
+      sq = Pow(X, two)
+      var = ReduceMean<keepdims = 1>(sq, axes)
+      var_eps = Add(var, eps)
+      rms = Sqrt(var_eps)
+      inv_rms = Div(one, rms)
+      normed = Mul(X, inv_rms)
+      Y = Mul(weight, normed)
+    }
+"""
+
+
+def _fp16_rms_norm_model(weight):
+    # The constants are fp16 scalars, as in a real fp16 export
+    # (onnx-community/Qwen2.5-0.5B-Instruct's model_fp16.onnx).
+    return _model(
+        _FP16_RMS_NORM,
+        initializer=[
+            _f16(weight, "weight"),
+            _f16(np.array(2.0), "two"),
+            _f16(np.array(1e-6), "eps"),
+            _f16(np.array(1.0), "one"),
+        ],
+        opset=23,
+        ir_version=11,
+    )
+
+
+def _rms_norm_ref(x, w):
+    x = x.astype(np.float64)
+    return w * x / np.sqrt((x**2).mean(-1, keepdims=True) + 1e-6)
+
+
+def test_fuse_rms_norm_fp16_constants():
+    # fp16 eps / 2 / 1 constants used to make the pass decline (the scalar
+    # reader only accepted float/double). A pure-fp16 chain fuses with an
+    # explicit stash_type=FLOAT.
+    weight = np.random.randn(8) * 0.02 + 1.0
+    model = _fp16_rms_norm_model(weight)
+    sim_model, _ = onnxsim.simplify(model, check_n=0)
+    ops = collections.Counter(n.op_type for n in sim_model.graph.node)
+    assert ops == {"RMSNormalization": 1}
+    (rms,) = sim_model.graph.node
+    attrs = {a.name: onnx.helper.get_attribute_value(a) for a in rms.attribute}
+    assert attrs["stash_type"] == onnx.TensorProto.FLOAT
+    ort = pytest.importorskip("onnxruntime")
+    x = np.random.default_rng(0).standard_normal((2, 4, 8)).astype(np.float16)
+    (got,) = ort.InferenceSession(sim_model.SerializeToString()).run(None, {"X": x})
+    np.testing.assert_allclose(
+        got.astype(np.float64), _rms_norm_ref(x, weight), rtol=3e-3, atol=3e-3
+    )
+
+
+def test_fuse_rms_norm_fp16_fixes_overflow():
+    # Why stash_type=FLOAT: with |x| ~ 1000 (a real LLM residual stream), the
+    # fp16 chain's Pow(x, 2) overflows to inf in any runtime that really
+    # computes it in fp16 (torch, GPU kernels; onnxruntime's CPU provider
+    # happens to upcast internally), while the fused node computes the
+    # reduction in fp32 and stays correct.
+    weight = np.random.randn(8) * 0.02 + 1.0
+    model = _fp16_rms_norm_model(weight)
+    sim_model, _ = onnxsim.simplify(model, check_n=0)
+    ort = pytest.importorskip("onnxruntime")
+    x = (np.random.default_rng(1).standard_normal((2, 4, 8)) * 1000).astype(np.float16)
+    ref = _rms_norm_ref(x, weight)
+    assert np.isinf(x * x).any()  # strict fp16 x**2, as the unfused chain has it
+    (got,) = ort.InferenceSession(sim_model.SerializeToString()).run(None, {"X": x})
+    np.testing.assert_allclose(got.astype(np.float64), ref, rtol=3e-3, atol=3e-3)
+
+
 def test_fuse_rms_norm_inner_axis_untouched():
     # RMSNormalization normalizes over *every* axis from `axis` to the last,
     # so a mean over axis 1 alone of a rank-3 tensor has no single-node
