@@ -1,0 +1,17 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+// One call = acquire VTCM (+HMX), optionally run an HMX sequence on data staged in VTCM, release.
+// codes: rc of each step (see hmx_impl.c). out: the VTCM output region after the run.
+interface hmx_rpc : remote_handle64 {
+  AEEResult probe(in int32 mode,        // 0: acquire/lock/unlock/release only; 1: one HMX op sequence; 2: timed loop
+                  in int32 variant,     // load/store form, see hmx_impl.c
+                  in int32 limit,       // Rt of the mxmem loads (bytes - 1 of the tile span)
+                  in int32 iters,       // mode 2: loop count
+                  in sequence<uint8> act,
+                  in sequence<uint8> wei,
+                  in sequence<uint8> bias,
+                  rout sequence<uint8> result,
+                  rout sequence<int32> codes,
+                  rout uint64 dsp_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};
