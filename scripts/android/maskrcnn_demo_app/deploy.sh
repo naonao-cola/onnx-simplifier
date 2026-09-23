@@ -18,7 +18,7 @@ STAGE=/data/local/tmp/maskrcnn_demo_stage
 "${A[@]}" shell am force-stop $PKG
 RA() { "${A[@]}" shell "run-as $PKG sh -c '$1'"; }
 RA "mkdir -p files/models files/imgs"
-FILES="pipe_e_u8_ctx.txt pipe_e_u8.txt pipe_e_opt.txt pipe_e_opt_ctx.txt levels.txt model.txt l0_anchors.bin l1_anchors.bin l2_anchors.bin l3_anchors.bin
+FILES="pipe_e_u8ra_ctx.txt pipe_e_u8ra.txt pipe_e_u8_ctx.txt pipe_e_u8.txt pipe_e_opt.txt pipe_e_opt_ctx.txt levels.txt model.txt l0_anchors.bin l1_anchors.bin l2_anchors.bin l3_anchors.bin
 l4_anchors.bin backbone_opt.onnx adapt_scores.onnx seg_e_opt_1.onnx seg_e_opt_2.onnx seg_e_opt_3.onnx seg_e_opt_4.onnx
 seg_e_opt_5.onnx box_head_1000_nhwc.onnx mask_head_32_nhwc.onnx mask_head_100_nhwc.onnx
 box_head_1000_u8.onnx mask_head_32_u8.onnx mask_head_100_u8.onnx"

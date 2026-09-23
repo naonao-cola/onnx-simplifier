@@ -54,7 +54,7 @@ uint8_t g_lut_tab[3][256];
 int bucket(const Step& S) {
   if (S.op == "quant_in") return T_PRE;
   if (S.op == "rpn") return T_RPN;
-  if (S.op == "roialign") return T_ROI;
+  if (S.op == "roialign" || S.op == "roialign_u8" || S.op == "rpc_stage") return T_ROI;
   if (S.name == "backbone") return T_BACKBONE;
   if (S.name == "box_head" || S.name == "mask_head") return T_HEADS;
   return T_CPU;
@@ -207,17 +207,17 @@ void scatter_rows(Step& S) {
   put_raw(S.f[3], base.type, base.shape, out);
 }
 
-// Our DSP skels aren't reentrant: two stages calling the same skel at once (e.g. box RoiAlign in
-// stage A while stage B runs the mask RoiAlign) fails with rc=78. Serialize each skel's calls.
-std::mutex g_rpn_mu, g_roi_mu;
+// DSP skel calls never overlap. With pipelining, stage A (RPN, box RoiAlign) and stage B (mask
+// RoiAlign) would otherwise call the DSP at the same time: the same skel twice at once failed with
+// rc=78 (the skels keep per-handle scratch state and aren't reentrant), and the uint8 RoiAlign skel
+// also assumes it never runs next to the RPN kernel (both size their HVX threads / VTCM use for a
+// DSP of their own). One mutex over every skel call covers both; the calls are short (2-11 ms).
+std::mutex g_dsp_mu;
 void exec_step(Step& S) {
   if (S.op == "scatter_rows") {
     scatter_rows(S);
-  } else if (S.op == "roialign") {
-    std::lock_guard<std::mutex> l(g_roi_mu);
-    exec(S);
-  } else if (S.op == "rpn") {
-    std::lock_guard<std::mutex> l(g_rpn_mu);
+  } else if (S.op == "roialign" || S.op == "roialign_u8" || S.op == "rpn") {
+    std::lock_guard<std::mutex> l(g_dsp_mu);
     exec(S);
   } else {
     exec(S);
@@ -382,7 +382,7 @@ void init(const std::string& model_dir, const std::string& lib_dir, const std::s
   std::ifstream pf(pipe);
   if (!pf) throw std::runtime_error("cannot open " + pipe + ": " + strerror(errno));
   std::string line;
-  bool need_htp = false, need_rpn = false, need_roi = false;
+  bool need_htp = false, need_rpn = false, need_roi = false, need_roiu8 = false;
   while (std::getline(pf, line)) {
     if (line.empty()) continue;
     auto S = std::make_unique<Step>();
@@ -390,8 +390,9 @@ void init(const std::string& model_dir, const std::string& lib_dir, const std::s
     std::string w;
     while (ss >> w) S->f.push_back(w);
     S->op = S->f[0];
-    S->name = S->op == "ort" || S->op == "ortpad" ? S->f[1]
-              : S->op + ":" + S->f[S->op == "rpn" ? 4 : S->op == "roialign" || S->op == "mask_sel" ? 3 : 2];
+    S->name = S->op == "ort" || S->op == "ortpad" || S->op == "roialign_u8" || S->op == "rpc_stage"
+                  ? S->f[1]
+                  : S->op + ":" + S->f[S->op == "rpn" ? 4 : S->op == "roialign" || S->op == "mask_sel" ? 3 : 2];
     if (S->op == "ort" && std::find(g_merge.begin(), g_merge.end(), S->name) != g_merge.end()) {
       // "ort seg2 model cpu - IN OUT" -> "scatter_rows seg2 IN OUT"
       S->f = {"scatter_rows", S->name, S->f[5], S->f[6]};
@@ -400,6 +401,7 @@ void init(const std::string& model_dir, const std::string& lib_dir, const std::s
     need_htp |= (S->op == "ort" && S->f[3] == "htp") || (S->op == "ortpad" && S->f[2] == "htp");
     need_rpn |= S->op == "rpn";
     need_roi |= S->op == "roialign";
+    need_roiu8 |= S->op == "roialign_u8";
     g_steps.push_back(std::move(S));
   }
   if (g_steps.empty() || g_steps[0]->op != "quant_in") throw std::runtime_error("pipe must start with quant_in");
@@ -454,6 +456,10 @@ void init(const std::string& model_dir, const std::string& lib_dir, const std::s
       if (need_roi &&
           roialign_rpc_open("file:///libroialign_rpc.so?roialign_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp", &h_roi))
         throw std::runtime_error("roialign_rpc_open failed");
+      if (need_roiu8 &&
+          roialign_u8_rpc_open("file:///libroialign_u8_rpc.so?roialign_u8_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp",
+                               &h_roiu8))
+        throw std::runtime_error("roialign_u8_rpc_open failed");
       LOGI("dsp skels open in %.1f ms", now_ms() - t);
     } catch (const std::exception& ex) {
       dsp_err = ex.what();

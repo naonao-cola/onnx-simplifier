@@ -71,7 +71,7 @@ public class MainActivity extends Activity {
 
     // The fastest measured configuration (README "Optimizations"); pass --es pipe pipe_e_opt.txt
     // --es opts "" for the original #1841 path.
-    static final String DEFAULT_PIPE = "pipe_e_u8_ctx.txt";
+    static final String DEFAULT_PIPE = "pipe_e_u8ra_ctx.txt";
     static final String DEFAULT_OPTS = "quant=lut;merge=seg2,seg4;pipeline=box_head";
 
     @Override
