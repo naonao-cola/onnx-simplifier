@@ -585,7 +585,46 @@ class _Lowering:
             raise WebnnLoweringError(
                 "AveragePool: count_include_pad=1 with padding is not supported"
             )
-        return self._pool(node, a, x, self.b.average_pool2d)
+        if not self.coreml:
+            return self._pool(node, a, x, self.b.average_pool2d)
+        inp = x()
+        self._require_2d(node, inp)
+        in_hw = self.shape(inp)[2:]
+        kernel = list(a["kernel_shape"])
+        strides, dilations, pads = self._spatial(node, a, kernel, in_hw)
+        if not any(pads):
+            return self._pool(node, a, x, self.b.average_pool2d)
+        if a.get("ceil_mode", 0):
+            raise WebnnLoweringError(
+                "AveragePool: ceil_mode=1 with padding is not supported on Core ML"
+            )
+        # rustnn 0.5.12's Core ML averagePool2d counts padding in the divisor
+        # (unlike WebNN / ONNX count_include_pad=0). Zero-pad explicitly, pool
+        # unpadded, then rescale by kernel taps / valid taps per output
+        # position: exact, and backend-independent.
+        top, bottom, left, right = pads
+        padded = self._pad_without_mil_pad(
+            inp, [0, 0, top, left, 0, 0, bottom, right], "constant", 0.0
+        )
+        out = self.b.average_pool2d(
+            padded,
+            window_dimensions=kernel,
+            strides=strides,
+            dilations=dilations,
+            pads=[0, 0, 0, 0],
+        )
+        out_hw = self.shape(out)[2:]
+        counts = []
+        for i, pb in enumerate((top, left)):
+            pos = (
+                np.arange(out_hw[i])[:, None] * strides[i]
+                - pb
+                + np.arange(kernel[i])[None, :] * dilations[i]
+            )
+            counts.append(((pos >= 0) & (pos < in_hw[i])).sum(axis=1))
+        valid = np.outer(counts[0], counts[1]).astype(np.float64)
+        scale = (kernel[0] * kernel[1] / valid).astype(np.float32)
+        return self.b.mul(out, self.b.constant(scale.reshape(1, 1, *out_hw)))
 
     def _op_GlobalAveragePool(self, node, a, x):
         inp = x()
