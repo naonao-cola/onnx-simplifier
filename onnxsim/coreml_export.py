@@ -378,9 +378,13 @@ def _lower_not(lowerer, node, ins, attrs):
 def _lower_resize(lowerer, node, ins, attrs):
     """Lower static 2-D ONNX Resize ops used by CNN feature pyramids."""
     if len(ins) < 3 or ins[2] is None or ins[2].val is None:
-        raise RuntimeError("Resize requires constant scales; dynamic sizes are not supported")
+        raise RuntimeError(
+            "Resize requires constant scales; dynamic sizes are not supported"
+        )
     if len(ins[0].shape) != 4:
-        raise RuntimeError(f"Resize expects NCHW rank 4 input, got rank {len(ins[0].shape)}")
+        raise RuntimeError(
+            f"Resize expects NCHW rank 4 input, got rank {len(ins[0].shape)}"
+        )
     mode = attrs.get("mode", b"nearest")
     if isinstance(mode, bytes):
         mode = mode.decode()
@@ -399,7 +403,9 @@ def _lower_resize(lowerer, node, ins, attrs):
         )
     scales = np.asarray(ins[2].val).reshape(-1)
     if scales.size != 4 or not np.all(scales[:2] == 1):
-        raise RuntimeError(f"Resize only supports N/C scale 1, got scales {scales.tolist()}")
+        raise RuntimeError(
+            f"Resize only supports N/C scale 1, got scales {scales.tolist()}"
+        )
     height, width = ins[0].shape[-2:]
     if not all(isinstance(d, (int, np.integer)) for d in (height, width)):
         raise RuntimeError("Resize requires static spatial dimensions")
@@ -432,13 +438,15 @@ def _lower_depth_to_space(lowerer, node, ins, attrs):
         mode = mode.decode()
     if mode == "DCR":
         reshaped = lowerer.mb.reshape(
-            x=ins[0], shape=[n, block, block, out_channels, height, width],
+            x=ins[0],
+            shape=[n, block, block, out_channels, height, width],
             name=lowerer.fresh_name(node, "reshape"),
         )
         perm = [0, 3, 4, 1, 5, 2]
     elif mode == "CRD":
         reshaped = lowerer.mb.reshape(
-            x=ins[0], shape=[n, out_channels, block, block, height, width],
+            x=ins[0],
+            shape=[n, out_channels, block, block, height, width],
             name=lowerer.fresh_name(node, "reshape"),
         )
         perm = [0, 1, 4, 2, 5, 3]
@@ -447,10 +455,13 @@ def _lower_depth_to_space(lowerer, node, ins, attrs):
     transposed = lowerer.mb.transpose(
         x=reshaped, perm=perm, name=lowerer.fresh_name(node, "transpose")
     )
-    return [lowerer.mb.reshape(
-        x=transposed, shape=[n, out_channels, height * block, width * block],
-        name=lowerer.fresh_name(node),
-    )]
+    return [
+        lowerer.mb.reshape(
+            x=transposed,
+            shape=[n, out_channels, height * block, width * block],
+            name=lowerer.fresh_name(node),
+        )
+    ]
 
 
 def _mil_dim_equal(da, db) -> bool:
