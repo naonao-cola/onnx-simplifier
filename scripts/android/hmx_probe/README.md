@@ -26,6 +26,24 @@ arXiv 2509.23324)?
 Next attempts should change one of these at a time, each followed by the health check, and only on
 a freshly recovered DSP.
 
+## Round 2 (codex/android-hmx-probe2): simulator first
+
+The v69 ISS (`libhexagonissv69.so`, `hexagon-sim -mv69 --mhmx 1`) models HMX, so sequences can be
+checked with zero risk before they touch the phone (`hmx_sim.c`, `sim.sh`; standalone, no QuRT):
+
+| sim experiment | result |
+|---|---|
+| int8 `{activation.ub=mxmem(a,2047):deep; weight.b=mxmem(w,2047)}` + `mxmem(o,0):after:sat.ub=acc`, HMX not enabled | exception 0x18 at the first load (badva = VTCM) |
+| same, SSR bit 26 set (HMX enable; QuRT's `hmx_lock` does this on the phone) | **completes**, writes 2048 B, all 0 (no scale table) -- so the missing `bias = mxmem` does **not** by itself hang |
+| int8 + `bias = mxmem` with 256 B of word `0x00004000`, store `:after:sat.uh = acc:2x1` | **0x0020 = 32** in every output = K of one all-ones tile: the int8 MAC is correct |
+| int8 scale word sweep | the low 16 bits are the per-column scale (0x4000 -> x1 for `uh`; >= 0x7fff saturates); high bits had no visible effect with this data |
+| fp16 `{activation.hf ...:deep; weight.hf ...}` of 1.0s + `mxmem(o,0):after.hf=acc`, no scale table | **0x5000 = 32.0**: fp16 HMX works on v69 in the sim |
+| fp16 + scale table word `0x3c000000` | 0x5020 = 33.0: high fp16 half acts as a bias |
+
+So the phone hang's cause is outside the ISA: the untested difference is **HMX power** --
+the first probe voted HVX power and DCVS only, never `HAP_power_set_HMX` (`power_up = 1`), which
+MNN does before any HMX use. Round 2's first phone variant changes only that (`HMX_POWER=1`).
+
 ## Files
 
 `hmx_rpc.idl`, `hmx_impl.c` (skel: acquire, lock, one parameterized HMX sequence, release; return

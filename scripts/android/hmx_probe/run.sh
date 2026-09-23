@@ -6,7 +6,7 @@
 # Run under the host's phone lock: PHONE_LOCK_OWNER=<branch> ~/.cache/android-phone/phone-run ./run.sh ...
 set -euo pipefail
 S="${ANDROID_SERIAL:-239dbd8f}"
-D="${D:-/data/local/tmp/codex-android-hmx-probe}"
+D="${D:-/data/local/tmp/codex-android-hmx-probe2}"
 B="${OUT:-$(cd "$(dirname "$0")" && pwd)/build}"
 MSDA_BUILD="${MSDA_BUILD:-$HOME/.cache/msda_generic_build}"
 MSDA_CASE="${MSDA_CASE:-$HOME/.cache/msda_generic_cases/bevformer_tsa}"
@@ -22,7 +22,7 @@ case "$1" in
   push) shift; for f in "$@"; do "${A[@]}" push "$f" $D/ >/dev/null; done ;;
   probe)
     shift
-    "${A[@]}" shell "cd $D && LD_LIBRARY_PATH=/vendor/lib64 ADSP_LIBRARY_PATH=$D timeout 60 ./hmx_client \
+    "${A[@]}" shell "cd $D && LD_LIBRARY_PATH=/vendor/lib64 ADSP_LIBRARY_PATH=$D HMX_POWER=${HMX_POWER:-0} timeout ${PROBE_TIMEOUT:-60} ./hmx_client \
       'file:///hmx_rpc.so?hmx_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp' $*; echo exit=\$?"
     ;;
   pull) "${A[@]}" pull "$D/$2" "$3" >/dev/null ;;
