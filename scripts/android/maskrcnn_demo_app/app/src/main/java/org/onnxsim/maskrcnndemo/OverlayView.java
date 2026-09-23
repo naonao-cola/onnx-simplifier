@@ -83,7 +83,9 @@ final class OverlayView extends View {
         String[] lines = stats.split("\n");
         float lh = 36f, w = 0;
         for (String l : lines) w = Math.max(w, textPaint.measureText(l));
-        cv.drawRect(8, 8, 24 + w, 16 + lh * lines.length, statsBg);
-        for (int i = 0; i < lines.length; i++) cv.drawText(lines[i], 16, 8 + lh * (i + 1) - 6, textPaint);
+        // bottom-left, so it doesn't cover labels of boxes near the top edge
+        float top = getHeight() - 16 - lh * lines.length;
+        cv.drawRect(8, top - 8, 24 + w, getHeight() - 8, statsBg);
+        for (int i = 0; i < lines.length; i++) cv.drawText(lines[i], 16, top + lh * (i + 1) - 6, textPaint);
     }
 }
