@@ -147,10 +147,71 @@ of int8 LM head = 134.5 MB:
 | hand vrmpy, 4 HVX threads (bandwidth-bound at ~40-50 GB/s LPDDR5, estimate) | ~3 ms | ~300 (projected) |
 | measured HTP fp16 (270 MB fp16 weights) | 9.0 ms / step | 110 (measured, accuracy open) |
 
-Other tinygrad limits, unchanged: no threading (stage 3: one of the 4 HVX contexts; decode is bandwidth-bound, so
-threads help until DDR saturates, ~2x estimate); no HMX (only reachable through QNN; matters for compute-bound
-prefill, not decode); scalar exp/sigmoid on V69 (SiLU/softmax are a few thousand elements per layer at batch 1,
-well under 1 ms per token even scalar).
+## tinygrad HVX: the whole decode loop on the DSP (measured)
+
+`hvx/decode_impl.c` runs **one SmolLM2-135M decode step per FastRPC call, all 30 layers and the LM head on the
+CDSP**, with the int8 weights (134.5 MB), scales, norms, RoPE tables and the KV cache resident in the DSP heap for
+the session (uploaded once, 0.2 s). The client (`hvx/decode_client.c`) sends the token's fp32 embedding and gets
+back the greedy argmax (plus the logits on the steps the accuracy check keeps). Prompt tokens go through the same
+step (no separate prefill).
+
+- **Every Linear is a tinygrad-generated GEMV.** `hvx/llm_kernels.py --ops b576,b1536,b576x4,b1536x4` emits the
+  prepacked vrmpy GEMV for one or four 32-column blocks at K=576 and K=1536 (exact under qemu). Since the packed
+  layout is block-contiguous, those two kernels serve every Linear (q/k/v fused into one N=960 GEMV, gate/up into
+  N=3072, o, down, the N=49152 head) and any split of the blocks across HVX threads.
+- **W8A8**: int8 weights, symmetric per output channel; the Linear's input quantized per token to uint8
+  (asymmetric) on the DSP, and the zero-point correction (`acc - zp * colsum`) done exactly in int32. `a16` runs
+  a 16-bit activation code as two uint8 vrmpy passes (hi and lo byte) over the same (cache-hot) weight block.
+- **Everything else in HVX qf32** (V69 has no IEEE vector float): RMSNorm, RoPE, attention over the valid KV
+  positions (K cache position-major so 32 scores per vector), SwiGLU with a vector exp and a Newton reciprocal,
+  exact int32 -> fp32 dequantization through a hi/lo split, argmax. The attention heads and the elementwise work
+  are split across the HVX threads; qurt barriers between phases.
+- `hvx/decode_ref.py` is the **numpy twin** of the same arithmetic (its fp32 path reproduces the torch greedy
+  reference 10/10); it exports the blobs and scores the phone's outputs. The phone's a16 run reproduces the twin's
+  leading-token pattern exactly.
+
+Phone (Xiaomi 12S), turbo, median over the 10 prompts x 32 generated tokens, under the phone lock:
+
+| path | decode ms / token (wall) | tok/s | of which DSP / GEMV | free: all 32 identical | forced top-1 / logits cos min |
+|---|---:|---:|---|---|---|
+| CPU fp32, 4 threads (above) | 24.4 | 41 | | 10/10 | 1.000 / 1.000 |
+| HTP fp16 (above) | 9.1 | 110 | | 9/10 | 0.997 / 0.99979 |
+| tinygrad HVX, W8A8, scalar fp32 glue, 1 thread | 44.6 | 22.4 | 43.6 / 15.4 ms | | |
+| tinygrad HVX, W8A8, scalar fp32 glue, 4 threads | 17.9 | 55.8 | 15.8 / 6.0 ms | | |
+| tinygrad HVX, W8A8, qf32 glue, 1 thread | 20.7 | 48.4 | 18.8 / 15.9 ms | | |
+| tinygrad HVX, W8A8, qf32 glue, 2 threads | 13.7 | 72.9 | 11.4 / 9.4 ms | | |
+| **tinygrad HVX, W8A8, qf32 glue, 4 threads** | **9.9** | **101** | **7.7 / 6.0 ms** | 3/10 | **0.953** / 0.854 |
+| tinygrad HVX, W8A16 (two passes), 4 threads | 14.4 | 69.3 | 12.1 / 10.0 ms | 4/10 | 0.969 / 0.989 |
+| tinygrad HVX, **GPTQ** W8A16, 4 threads | 14.4 | 69.3 | 12.1 / 10.0 ms | 5/10 | **0.975** / 0.987 |
+| tinygrad HVX, GPTQ W8A8, 4 threads | 9.0 | 111 | 7.7 / 6.0 ms | 1/10 | 0.941 / 0.941 |
+
+Host twin (`decode_ref.py --eval`), forced top-1 / free identical: fp32 1.000 / 10/10; int8 weights only (fp32
+activations) 0.978 / 4/10; W8A16 0.978 / 4/10; W8A8 0.919 / 1/10; GPTQ weights only 0.975 / 6/10 (worst logits
+cos 0.9955); GPTQ W8A16 0.975 / 6/10; GPTQ W8A8 0.947 / 2/10.
+
+- **Measured: 101 tok/s with 4 HVX threads**, against the ~70 tok/s projected from the single-thread GEMVs, and
+  on par with the HTP's 110 tok/s. The GEMVs stream 134.5 MB per token in 6.0 ms (22 GB/s over 4 threads; 16 ms
+  / 8.4 GB/s on one). Run-to-run the 4-thread wall moves between 9 and 10 ms (111-101 tok/s).
+- **The fp32 glue was the first bottleneck**, not the GEMVs: in scalar C it took 28 ms of the 44.6 ms per token
+  on one thread (a single Hexagon hardware thread's scalar float is slow; the double-precision dequant was worst).
+  In HVX qf32 it is 1.7 ms of the 7.7 ms at 4 threads.
+- **The rest of the wall time (~2.2 ms) is the FastRPC round trip**, not the logits transfer: returning the
+  196 KB of logits or only the DSP-side argmax gives the same wall time.
+- **Accuracy is bound by int8 weights, not by the tinygrad kernels** (the GEMVs are bit-exact; the twin matches
+  the phone). Per-channel int8 weights alone cost 0.978 forced agreement (fp16 on the HTP: 0.997); no single
+  Linear type explains it (sensitivity sweep: `--eval w8:skip=head` etc., 0.978-0.981). uint8 activations cost
+  another 0.03-0.06; 16-bit activations (two vrmpy passes) remove that at 1.45x the time. GPTQ (calibrated on the
+  encoder's 20 sentences plus the fp32 model's own continuations, disjoint from the eval prompts) keeps the forced
+  agreement but improves the worst logits cosine (0.981 -> 0.9955) and free-running identity (4 -> 6/10 on the
+  twin).
+- **A V69 qf32 pitfall** (found by bisecting the vector helpers): the 1.5*2^23 magic-number conversion from
+  qf32 to an integer does not round to nearest, so the vector activation quantizer biased every code by up to one
+  step (forced agreement 0.953 -> 0.881). It now corrects the magic integer to floor(x/s + zp + 0.5) with the
+  exactly computed fraction; exp and the int -> fp32 dequant are exact either way.
+- **Levers left:** the tinygrad kernels are still 2.2x slower than the hand vrmpy kernel per block (the
+  loop-carried lane permutation and single accumulator chain above); per-group weight scales (the accuracy lever
+  past per-channel int8) need K-chunked kernels; persistent DSP worker threads would save the per-token thread
+  create/join; an HTP prefill feeding the DSP's KV cache would replace the token-by-token prompt steps (~9 ms each).
 
 ## Files
 
@@ -166,6 +227,8 @@ well under 1 ms per token even scalar).
 | `eval_decoder.py` | free-running and teacher-forced agreement vs fp32 (phone outputs or host ORT) |
 | `hvx/llm_kernels.py` | the decode GEMVs as plain tinygrad Tensor code (row-major and prepacked) -> kernels.h, exact under qemu |
 | `hvx/llm_impl.c`, `llm_rpc.idl`, `llm_client.c`, `build.sh` | FastRPC skel + client timing the tinygrad and hand vrmpy GEMVs on the CDSP |
+| `hvx/decode_impl.c`, `decode_rpc.idl`, `decode_client.c`, `decode_build.sh` | the whole decode loop on the CDSP (one RPC per token, tinygrad GEMVs + HVX qf32 glue, multi-threaded) and its client |
+| `hvx/decode_ref.py` | numpy twin of the DSP decode (W8A8 / W8A16 / GPTQ), exporter of its blobs, scorer of its phone outputs |
 | `bisect_llm.py`, `bisect_llm.sh` | expose intermediates of a decoder graph, run it on the HTP, per-tensor cosine vs host ORT |
 | `run_phone.sh` | build `llm_run`, push libs/models/inputs (by md5), run, pull outputs |
 
@@ -189,6 +252,20 @@ tinygrad HVX kernels (`onnxsim/tinygrad` branch `hvx-vrmpy-mixed`, 9aa4f66a1; He
 ```
 PYTHONPATH=<tinygrad checkout> CC=clang-19 HVX_ARCH=v69 python hvx/llm_kernels.py --out $W/hvx
 TURBO=1 D=/data/local/tmp/<yours>/hvx HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=.../Tools DATA=$W/hvx hvx/build.sh
+```
+
+Whole decode loop on the DSP (`K=~/.cache/llm-decode/k`, `B=~/.cache/llm-decode/blobs`; `a16` 0/1, HVX threads,
+4-block kernels, vector glue, turbo):
+
+```
+PYTHONPATH=<tinygrad checkout> CC=clang-19 HVX_ARCH=v69 python hvx/llm_kernels.py --out $K --ops b576,b1536,b576x4,b1536x4 --variants tcp
+python hvx/decode_ref.py --work $W --eval fp32 a8 a16 gptq-a8 gptq-a16   # host twin accuracy
+python hvx/decode_ref.py --work $W --export gptq --out $B                  # or --export a8 (plain rounding)
+HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=.../Tools KERNELS=$K BLOBS=$B hvx/decode_build.sh
+adb push $B/{W.bin,F.bin,emb.f16.bin,prompt_*.bin,force_*.bin} $B/build/{decode_client,decode_rpc.so} $D/
+adb shell "cd $D && LD_LIBRARY_PATH=/vendor/lib64 ADSP_LIBRARY_PATH=$D ./decode_client \
+  'file:///decode_rpc.so?decode_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp' 0 4 1 1 1 out"
+adb pull $D/out $W/ph_dec_dsp && python hvx/decode_ref.py --work $W --phone $W/ph_dec_dsp
 ```
 
 The ORT/QNN libraries come from `../htp_exploration/qnn_shell/fetch_libs.sh` (Maven Central, not

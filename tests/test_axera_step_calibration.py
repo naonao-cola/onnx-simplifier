@@ -222,7 +222,7 @@ def test_coverage_at_the_predicted_step_calibration():
         assert report["per_op"][op] == counts, op
 
 
-_EXPECTED_TOTALS = {"conditional": 18, "covered": 446, "refused": 640}
+_EXPECTED_TOTALS = {"conditional": 18, "covered": 449, "refused": 637}
 _EXPECTED_PER_OP = {
     "Add": {"covered": 43, "refused": 101},
     "Conv": {"refused": 20},
@@ -233,7 +233,8 @@ _EXPECTED_PER_OP = {
     "MaxPool": {"covered": 1},
     "Mul": {"covered": 14, "refused": 383},
     "ReduceMean": {"refused": 1},
-    "ReduceSum": {"covered": 43, "refused": 1},
+    "Neg": {"covered": 2},
+    "ReduceSum": {"covered": 44},
     "Relu": {"covered": 17},
     "Reshape": {"conditional": 18, "covered": 135, "refused": 17},
     "Softmax": {"covered": 3},

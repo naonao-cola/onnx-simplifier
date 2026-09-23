@@ -110,7 +110,7 @@ Run `python scripts/axera/misc_op_record_emit.py step.onnx` for the report.
 | op | nodes | covered now | still needs |
 | --- | --- | --- | --- |
 | Sqrt | 42 | 42 (39 via `elementwise_scale_emit`, 3 here) | -- |
-| ReduceSum | 44 | 43 | `[16,1,64,12544]` axes (0,3): Pulsar2 can't compile it standalone (below) |
+| ReduceSum | 44 | 44 (one through a same-bytes equivalent, below) | -- |
 | Greater | 18 | 18 | -- |
 | Cast | 19 | 19 (each one follows a Greater or Less) | -- |
 | Less | 1 | 1 | -- |
@@ -125,8 +125,8 @@ record in both directions, and reproduces itself from its own calibration.
 | Log (2) | `Log:16x1000` | lane `1/s_x`; a 258-entry u8 lookup table, two u16 entries per record at `0x1050..0x1850`: `clip(rint(log((q − zp_x)·s_x)/s_y) + zp_y, 0, 255)` for `q` = 0..255 (`log 0` → 0), then entry 255 again and 0. The table is exact on both builds. `0x1850` is written after an unrelated `0x1860..0x1a50` block, so the emitter finds table records by register | conditional: zero points fixed at the template's (0, 255). Log's input is a Softmax output, so `zp_x = 0` |
 | MaxPool (1) | `MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1` | lanes `1/s_x`, `s_x` (`s_y = s_x`) | conditional: zero points fixed (0; input is a Relu) |
 | ReduceMean (1) | `ReduceMean:16x512x7x7:axes2,3:k1` | lanes `1/s_x`, `s_x/(s_y·N)` (`N` = 49 reduced elements), `s_y` | conditional: zero points fixed (0; input is a Relu) |
-| Neg (2) | `[1,1]` | **refused.** Four builds (`zp_x` = 42, 246, 0, 255) gave four different register layouts: 268 records for `zp_x < 128` and 292/296 for `> 128`, and the edge zero points 0 and 255 add further write elisions. `tiny_emit.emit_neg` patches compressed bytes (from before the LZ77 decode) and isn't used | needs builds at the step's own calibration class |
-| Squeeze (1) | `[16,512,1,1]→[16,512]` | a standalone Squeeze hits the scheduler's ZeroDivisionError (`AX650_CONFIRMED_BROKEN_OPS`). It compiles fused into the following Gemm | belongs to the Gemm/FC template |
+| Neg (2) | `Neg:1x1` (large program) and `Neg:1x1:small` | lanes `1/s_x`, `s_x` (`s_y = s_x`); zero points on `0x1a90`/`0x1ad0`/`0x1b10` with write omission (see below) | conditional: any `zp_x` (`zp_y = 255 - zp_x`) and scale (`s_y = s_x`); the scale picks the program |
+| Squeeze (1) | `[16,512,1,1]→[16,512]` | a standalone Squeeze hits the scheduler's ZeroDivisionError (`AX650_CONFIRMED_BROKEN_OPS`), but Squeeze → Relu compiles record for record to the Reshape → Relu program, so the node takes the Reshape step template `16x512x1x1->16x512` (`reshape_step_templates/`) | conditional: nonzero zero point, as every Reshape step template |
 
 ## Builds still needed (run one batch at a time)
 
@@ -188,8 +188,49 @@ Built from `step.onnx` one at a time (`fixtures/misc_op_step_templates/`), regis
   - `[16,1000]` axes (0,1) k1 and `[16,1,128,784]` axes (0,3), each paired with a
     `zp_y = 0` build that changes the record count. Before the re-pad rule above,
     these two were refused.
-- **Not buildable:** `[16,1,64,12544]` axes (0,3) k0 (1 node). Pulsar2 fails with
-  `TileFailException: AxQuantizedReduceSum, Can not tile` (a 12.8 MB U8 input against a
-  3 MB memory limit). In the step, the reduction presumably fuses with neighbouring ops.
-  Covering it standalone would need a different decomposition, which isn't a
-  template of this op.
+- **Not buildable as written:** `[16,1,64,12544]` axes (0,3) k0 (1 node,
+  `ReduceSum_474`, the stem's bias gradient). Pulsar2 fails with
+  `TileFailException: AxQuantizedReduceSum, Can not tile` (a 12.8 MB U8 input
+  against a 3 MB memory limit), standalone and also cut from the step with its
+  real neighbours (`Reshape_465 -> ReduceSum_474 -> Reshape_475`), so the step
+  itself can't compile it either. The same reduction over the same contiguous
+  bytes, `[16,64,112,112]` axes (0,2,3) k0 -> `[64]` (output bytes equal the
+  `[1,64]` result), does compile.
+  `REDUCESUM_EQUIVALENTS` maps the node's key to that template
+  (`ReduceSum:16x64x112x112:axes0,2,3:k0`), which reproduces a second native
+  build record for record in both directions. A split into two compilable
+  reductions (axis 3, then axis 0) also builds, but adds an intermediate u8
+  rounding, so it isn't used. A held-out build calibrated to `zp_y = 0` was
+  refused by the existing rule (a later tile's `0x1a90 = 0` would repeat the
+  register value, never observed), so this template is conditional on
+  `zp_y != 0` like the other multi-tile ReduceSums.
+
+## Neg: two programs picked by the scale
+
+The four batch-F builds that looked like four layouts are two programs, each
+with zero-point write omission on top. A sweep of 20+ builds of `Neg [1,1]`
+(`fixtures/misc_op_neg/`, `sweep.json`) at pinned calibrations shows:
+
+- Neg always calibrates to `s_y = s_x` and `zp_y = 255 - zp_x`, so in u8 it is
+  `q_y = 255 - q_x`; the emitter refuses any other calibration.
+- **The scale alone picks the program.** Every build with float32 `s < 1/64` compiles
+  to the small program (268 records in segment 2) and every build with
+  `s >= 1/64` to the large one (292/296 records, an extra compute block).
+  Zero points 0 and 255 occur on both sides, and `zp_x` 42..246 at fixed scale
+  never switch programs. At the boundary, `s = 0.01562` is small and
+  `s = 0.015625` (exactly `1/64`) and `0.01563` are large
+  (`misc.neg_program`).
+- **Within a program**, a calibration change touches the lanes `1/s_x` and
+  `s_x` (the small program writes `s_x` on 16 lanes, `0x0f50..0x1040`) and the
+  zero-point records on `0x1a90`, `0x1ad0` and `0x1b10`, each `zp_x`, `zp_y`
+  or 0. A write outside a register-block dump is omitted when the register
+  already holds the value (registers start at 0); block dumps
+  (`0x1b00..0x1b60`, consecutive registers) are always written in full. So
+  `zp_x = 0` or `zp_y = 0` targets drop records, and the segment is re-padded
+  to whole 4-record groups. A template must be a build with no omitted write
+  (both zero points nonzero); `Neg:1x1` is `neg_L128` and `Neg:1x1:small` is
+  `neg_z128`.
+- Every template → every other build of its program reproduces record for
+  record, including the step's own class: the step's Neg inputs are
+  cross-entropy sums (`<= 0`), which calibrate to `zp_x = 255, zp_y = 0`
+  (`step_neg__v4`, large program).

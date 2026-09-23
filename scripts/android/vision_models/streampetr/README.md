@@ -94,6 +94,34 @@ gamma/beta): 112 ms once per camera rig.
   (8, 428, 4224) attention never leaves VTCM-sized tiles; fp16 on the HTP spends ~3 ms/layer on it);
   overlap the host memory queue with the next frame's image piece; move `HostState` to numpy/C++.
 
+## Follow-up: the cross-attention on the HVX (measured: slower, stays on the HTP)
+
+`attn_hvx/`: the head's cross-attention `softmax(Q K^T) V` (8 heads x 32 dims, 428 queries x 4224
+image tokens) as one FastRPC call per layer on the cDSP's HVX, taking Q / K / V as the HTP would emit
+them (uint8, one scale / zero point per tensor) and returning uint8 in V's own qparams:
+
+* **integer contract** (`attn_contract.py`, torch-free): `s = (q - zq).(k - zk)` exact, `p =
+  round(255 e^-(max s - s) sq sk)` by a Q11 `2^-t` with a Q15 cubic (max rel err 3.6e-4), `out =
+  round(sum p v / sum p)` -- no float anywhere on the DSP. `attn_kernel.h` has a scalar and an HVX body
+  (`vrmpy` ub x ub for both `Q K^T` over packed K and `P V` over packed V, 4 query rows per vector load,
+  the exp in halfword lanes); both are **bit-exact** with the contract: host (`attn_host_check.c`),
+  hexagon-sim (`attn_sim.c`), and the phone (`attn_client`) on real layer-0 / layer-5 Q / K / V of
+  scene-0103 (`emulate.py case`), all 109568 output bytes equal. `tests/test_streampetr_attn_hvx.py`
+  runs the synthetic-case checks in CI.
+* **phone, per layer (4 threads, median)**: 13.4-15.2 ms DSP (K / V packing 3.6-5.6 ms + attention
+  ~9.6 ms), wall +1 ms FastRPC -- vs about 3.5 ms for the same step inside the fp16 HTP head (the
+  `A V` matmul is 10.1% of the 29.7 ms head per layer, `Q K^T` + softmax a bit more).
+* **why it can't win**: hexagon-sim's per-section profile (`-DATTN_PROF`): QK 4.2k / exp 5.0k / AV
+  3.6k pcycles per (row, head), about one packet per 4 cycles per hardware thread -- on V69 a thread
+  issues every ~4th cycle, so 4 threads give ~1 packet/cycle in total (the phone's 9.6 ms matches
+  428 x 8 x ~3.2k packets / 1.2 GHz). The kernel needs 2 x 1056 `vrmpy` per (row, head) plus the exp;
+  even two `vrmpy` per packet and a free exp leave >= 5.7 ms per layer, above the HTP's ~3.5 ms. Dense
+  attention belongs on the HTP's matrix unit; the HVX pays off for gathers (the deformable attention
+  of BEVFormer / RT-DETR / Sparse4D), not for `Q K^T`.
+* The HTP and HVX do run concurrently (#1879), so moving one or two layers' attention off the HTP could
+  still shave a few ms of *throughput* in a pipelined chain, at ~13 ms extra latency per layer and a
+  split head; not pursued.
+
 ## Reproduce
 
 ```

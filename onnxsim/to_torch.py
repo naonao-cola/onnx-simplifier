@@ -182,7 +182,7 @@ def _node_const(node) -> Optional[np.ndarray]:
 
 
 def _dequant_matmulnbits(node, arrays) -> np.ndarray:
-    """Dense ``[K, N]`` weight of a ``com.microsoft::MatMulNBits`` node.
+    """Dense ``[N, K]`` (``F.linear``-layout) weight of a ``com.microsoft::MatMulNBits`` node.
 
     ``B`` is ``[N, k_blocks, blob]`` uint8 with ``bits``-bit values packed low bits
     first; ``scales`` has one entry per (row, block); ``zero_points`` (optional) is
@@ -216,7 +216,7 @@ def _dequant_matmulnbits(node, arrays) -> np.ndarray:
     else:
         zp = np.float32(1 << (bits - 1))
     w = ((q - zp) * sc).reshape(n, -1)[:, :k]
-    return np.ascontiguousarray(w.T.astype(scales.dtype))
+    return np.ascontiguousarray(w.astype(scales.dtype))  # [N, K]: F.linear layout
 
 
 class _AttnMatch:
@@ -317,10 +317,38 @@ def _build_module_class():
                     if key not in self._param_of:
                         self._register(key, _dequant_matmulnbits(n, arrays), device)
                     self._nbits_key[n.output[0]] = key
+            # MatMul(x, W) with a constant [K, N] weight becomes F.linear(x, W^T): the
+            # [N, K] layout PyTorch / HF linears use, which is both AutoDeploy's
+            # canonical linear and what cuBLAS's batch-1 decode GEMV is fast on (a
+            # [K, N] weight sent one matmul per layer to a split-K kernel, ~28% of
+            # Qwen3-0.6B's decode time). Weights with any other use keep their layout.
+            mm_w = {
+                n.input[1]
+                for n in g.node
+                if n.op_type == "MatMul" and n.domain in ("", "ai.onnx")
+            }
+            non_mm_uses = {
+                i
+                for n in g.node
+                if not (n.op_type == "MatMul" and n.domain in ("", "ai.onnx"))
+                for i in n.input
+            } | {n.input[0] for n in g.node if n.op_type == "MatMul"}
+            non_mm_uses |= {o.name for o in g.output}
+            self._linear_key: Dict[str, str] = {}
             for t in g.initializer:
                 if t.name in skip:
                     continue
                 arr = numpy_helper.to_array(t)
+                if (
+                    t.name in mm_w
+                    and t.name not in non_mm_uses
+                    and arr.ndim == 2
+                    and arr.dtype.kind == "f"
+                ):
+                    key = t.name + "::T"
+                    self._register(key, np.ascontiguousarray(arr.T), device)
+                    self._linear_key[t.name] = key
+                    continue
                 self._register(t.name, arr, device)
             self._nodes = []
             for n in g.node:
@@ -343,6 +371,7 @@ def _build_module_class():
             if attention == "sdpa":
                 self._match_attention(producer, consumers)
             self._plan = self._schedule(producer)
+            self._rope_pair = self._pair_contrib_rope(producer)
             # Inputs each planned node actually reads (see _deps); the rest -- e.g. a
             # stripped past-KV input of GroupQueryAttention -- are passed as None.
             self._node_deps = {id(n): set(self._deps(n)) for n in self._plan}
@@ -490,6 +519,31 @@ def _build_module_class():
                     chain,
                 )
 
+        def _pair_contrib_rope(self, producer):
+            """q/k com.microsoft::RotaryEmbedding pairs feeding one GroupQueryAttention.
+
+            AutoDeploy replaces a matched (q, k) rotation with one op inserted where q's
+            rotation starts, so k's input must already exist there; the converter
+            therefore rotates each pair together, at whichever of the two nodes comes
+            first. Maps id(node) -> (q_node, k_node).
+            """
+            pairs = {}
+            for g in self._nodes:
+                if g.op_type != "GroupQueryAttention" or len(g.input) < 2:
+                    continue
+                q, k = producer.get(g.input[0]), producer.get(g.input[1])
+                if not all(
+                    x is not None
+                    and x.domain == "com.microsoft"
+                    and x.op_type == "RotaryEmbedding"
+                    for x in (q, k)
+                ):
+                    continue
+                if list(q.input[1:4]) != list(k.input[1:4]) or _attrs(q) != _attrs(k):
+                    continue
+                pairs[id(q)] = pairs[id(k)] = (q, k)
+            return pairs
+
         def _leads_to_matmul(self, name, producer, depth=4):
             while depth and name in producer:
                 p = producer[name]
@@ -507,6 +561,12 @@ def _build_module_class():
                 return [m.q, m.kt, m.v]
             if n.op_type == "Attention" and self._attention == "sdpa":
                 return [i for i in n.input[:3]]
+            if (
+                n.op_type == "MatMul"
+                and n.domain in ("", "ai.onnx")
+                and n.input[1] in self._linear_key
+            ):
+                return [n.input[0], self._linear_key[n.input[1]]]
             if n.op_type == "MatMulNBits" and n.output[0] in self._nbits_key:
                 bias = n.input[5] if len(n.input) > 5 and n.input[5] else None
                 return [n.input[0], self._nbits_key[n.output[0]]] + (
@@ -611,6 +671,22 @@ def _build_module_class():
                         q, kt.transpose(-1, -2), v, is_causal=True, scale=m.scale
                     )
                     continue
+                pair = self._rope_pair.get(id(n))
+                if pair is not None:
+                    qn, kn = pair
+                    if qn.output[0] in env:  # already rotated with its partner
+                        continue
+                    if (
+                        self._resolve(kn.input[0]) in env
+                        and self._resolve(qn.input[0]) in env
+                    ):
+                        env[qn.output[0]], env[kn.output[0]] = self._contrib_rope_pair(
+                            get(qn.input[0]),
+                            get(kn.input[0]),
+                            *(get(i) for i in qn.input[1:4]),
+                            _attrs(qn),
+                        )
+                        continue
                 deps = self._node_deps[id(n)]
                 ins = [get(i) if i in deps else None for i in n.input]
                 res = self._run(n, ins)
@@ -1005,6 +1081,9 @@ def _build_module_class():
             return self._reduce(ins, a, lambda x, d, k: x.amin(dim=d, keepdim=k))
 
         def _op_MatMul(self, ins, a, n):
+            if n.input[1] in self._linear_key:
+                w = getattr(self, self._param_of[self._linear_key[n.input[1]]])
+                return F.linear(ins[0], w)
             return torch.matmul(ins[0], ins[1])
 
         def _op_Gemm(self, ins, a, n):
@@ -1066,11 +1145,22 @@ def _build_module_class():
             rd, d = 2 * cos_c.shape[-1], x4.shape[-1]
             key = (id(cos_c), id(sin_c), id(pos), x4.dtype)
             memo = _ROPE_MEMO.get({})
-            if key not in memo:
+            # The gathered [B, S, rd] cos/sin are shared by every layer (outside the
+            # pattern); the unsqueeze is *inside* AutoDeploy's pattern, so it must be
+            # shared by exactly one q/k pair -- a node also used by other layers makes
+            # the matcher refuse the replacement. Hand each unsqueeze out twice.
+            if ("base",) + key not in memo:
                 cos = torch.cat([cos_c[pos], cos_c[pos]], -1).to(x4.dtype)  # [B, S, rd]
                 sin = torch.cat([sin_c[pos], sin_c[pos]], -1).to(x4.dtype)
-                memo[key] = (cos.unsqueeze(1), sin.unsqueeze(1))
-            cos, sin = memo[key]
+                memo[("base",) + key] = (cos, sin)
+            if key not in memo:
+                cos, sin = memo[("base",) + key]
+                memo[key] = [cos.unsqueeze(1), sin.unsqueeze(1), 0]
+            entry = memo[key]
+            cos, sin = entry[0], entry[1]
+            entry[2] += 1
+            if entry[2] == 2:
+                del memo[key]
             # Full rotary: no slicing at all -- a no-op x[..., :d] exports as aten.alias.
             xr, xp = (x4[..., :rd], x4[..., rd:]) if rd < d else (x4, None)
             h = rd // 2
@@ -1078,10 +1168,8 @@ def _build_module_class():
             y = xr * cos + rot * sin
             return torch.cat([y, xp], -1) if rd < d else y
 
-        def _ms_RotaryEmbedding(self, ins, a, n):
-            # com.microsoft::RotaryEmbedding(input, position_ids, cos_cache, sin_cache):
-            # input [B, S, N*D] or [B, N, S, D]; cos/sin cache [max_pos, rotary_dim/2].
-            x, pos, cos_c, sin_c = ins[:4]
+        @staticmethod
+        def _contrib_rope_prep(x, pos, cos_c, a):
             if a.get("interleaved", 0):
                 raise NotImplementedError("com.microsoft::RotaryEmbedding interleaved")
             if a.get("scale", 1.0) != 1.0:
@@ -1100,17 +1188,33 @@ def _build_module_class():
                 # Rotate in [B, N, S, D]: the only layout AutoDeploy's rope matcher has.
                 nh = a.get("num_heads", 0)
                 d = x.shape[-1] // nh if nh else rd
-                x4 = x.reshape(x.shape[0], x.shape[1], -1, d).transpose(1, 2)
-                return (
-                    self._rope_bnsd(x4, cos_c, sin_c, pos)
-                    .transpose(1, 2)
-                    .reshape(x.shape)
-                )
-            return self._rope_bnsd(x, cos_c, sin_c, pos)
+                return x.reshape(x.shape[0], x.shape[1], -1, d).transpose(1, 2), pos
+            return x, pos
+
+        @staticmethod
+        def _contrib_rope_finish(y4, x):
+            return y4.transpose(1, 2).reshape(x.shape) if x.dim() == 3 else y4
+
+        def _contrib_rope_pair(self, xq, xk, pos, cos_c, sin_c, a):
+            q4, pos = self._contrib_rope_prep(xq, pos, cos_c, a)
+            k4, _ = self._contrib_rope_prep(xk, pos, cos_c, a)
+            yq = self._rope_bnsd(q4, cos_c, sin_c, pos)
+            yk = self._rope_bnsd(k4, cos_c, sin_c, pos)
+            return (
+                self._contrib_rope_finish(yq, xq),
+                self._contrib_rope_finish(yk, xk),
+            )
+
+        def _ms_RotaryEmbedding(self, ins, a, n):
+            # com.microsoft::RotaryEmbedding(input, position_ids, cos_cache, sin_cache):
+            # input [B, S, N*D] or [B, N, S, D]; cos/sin cache [max_pos, rotary_dim/2].
+            x, pos, cos_c, sin_c = ins[:4]
+            x4, pos = self._contrib_rope_prep(x, pos, cos_c, a)
+            return self._contrib_rope_finish(self._rope_bnsd(x4, cos_c, sin_c, pos), x)
 
         def _ms_MatMulNBits(self, ins, a, n):
             w = getattr(self, self._param_of[self._nbits_key[n.output[0]]])
-            y = torch.matmul(ins[0], w)
+            y = F.linear(ins[0], w)
             if len(ins) > 5 and ins[5] is not None:
                 y = y + ins[5]
             return y
@@ -1275,6 +1379,9 @@ def onnx_state_dict(module, model) -> Dict[str, Any]:
             arrays[n.output[0]] = _node_const(n)
         if n.op_type == "MatMulNBits" and n.input[1] + "::dequant" in names:
             arrays[n.input[1] + "::dequant"] = _dequant_matmulnbits(n, arrays)
+    for name in names:
+        if name.endswith("::T") and name[:-3] in arrays:
+            arrays[name] = np.ascontiguousarray(arrays[name[:-3]].T)
     return {
         attr: torch.from_numpy(np.ascontiguousarray(arrays[name]).copy())
         for name, attr in names.items()

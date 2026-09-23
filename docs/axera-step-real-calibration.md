@@ -75,14 +75,16 @@ conditionals against the predicted calibration:
 | --- | ---: | ---: | ---: |
 | master's templates, conditionals settled | 395 | 18 | 691 |
 | + nodes computed inside covered MatMul chains | 426 | 18 | 660 |
-| + the zero-point work above | **446** | 18 | 640 |
+| + the zero-point work above | 446 | 18 | 640 |
+| + #1892's Neg and same-bytes ReduceSum templates, settled here | **449** | 18 | 637 |
 
 Per op, covered at the predicted calibration, before (master's templates) ->
 after:
 
 - Relu 0 -> 17
 - MaxPool 0 -> 1
-- ReduceSum 42 -> 43
+- ReduceSum 42 -> 44 (one via #1892's same-bytes `[16,64,112,112]` equivalent)
+- Neg 0 -> 2 (#1892's large-program template, zero points x255,y0)
 - Reshape 118 -> 135
 - Mul 0 -> 14 (inside MatMul chains)
 - Squeeze 0 -> 1 (inside a MatMul chain)
@@ -116,8 +118,6 @@ neighbour (`reshape_emit.py`).
   Reshape.
 - **ReduceMean:** its output (`pool1_fwd`) feeds only MatMuls, so it is
   int8.
-- **Also refused:** Neg (2), and ReduceSum `[16,1,64,12544]` (Pulsar2 cannot
-  tile it standalone).
 
 Reproduce: `tests/test_axera_step_calibration.py` (no device, no Pulsar2; the
 rule checks run on committed probe graphs, their ranges and their

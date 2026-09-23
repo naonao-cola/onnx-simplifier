@@ -642,12 +642,46 @@ modes), then run through AutoDeploy (`torch-cudagraph`, 3 chat prompts, greedy, 
 | `onnx-community/Llama-3.2-1B-Instruct-ONNX` `model_fp16.onnx` (RoPE *inside* GQA, no `position_ids` input) | rel 2.5e-6, argmax 100% | 16 attn, 32 GQA repeat, 33 RMSNorm | 100-101 |
 
 All outputs are coherent (the int4 SmolLM2's answers differ from fp16's, as expected).
-Qwen3 is slower than TensorRT-LLM's own path on its HF checkpoint (176-195 tok/s, above);
-not profiled. AutoDeploy's `match_rope_pattern` does not match RoPE converted from the
-contrib op (0 matches, even with the rotation emitted in the `[B, N, S, D]` /
-`unsqueeze_dim=1` layout it is registered for and q/k sharing one cos/sin node), so RoPE
-runs as plain ops there -- correct, just not its fused kernel. onnxruntime's own
-`GroupQueryAttention` kernel has restrictions the conversion does not (head size a
-multiple of 8, of 16 with `do_rotary`; batch 1 when a multi-token input has a past), which
-only matters for the
-tests' reference runs.
+onnxruntime's own `GroupQueryAttention` kernel has restrictions the conversion does not
+(head size a multiple of 8, of 16 with `do_rotary`; batch 1 when a multi-token input has a
+past), which only matters for the tests' reference runs. The speeds above are from before
+the two fixes below; updated numbers follow them.
+
+**Why AutoDeploy did not fuse the converted RoPE (fixed).** Its `match_rope_pattern` is
+one pattern over a q *and* k rotation that share one `cos.unsqueeze(1)` /
+`sin.unsqueeze(1)` node, registered only for the `[B, N, S, D]` / `unsqueeze_dim=1`
+layout. Three things had to hold, and the conversion violated each in turn: (1) q and k
+each have their own ONNX `RotaryEmbedding` node, so they must be handed the *same*
+unsqueezed cos/sin; (2) that unsqueeze is *inside* the pattern, so it must be used by
+exactly one q/k pair -- memoizing it across the whole forward call shared it with every
+layer, and the matcher refuses a replacement whose internal node has outside users;
+(3) the replacement `torch_rope(q, k, cos, sin)` is inserted where q's rotation starts, so
+k's `reshape`/`transpose` must already exist there -- i.e. q and k are prepared together
+(the converter now rotates each q/k `RotaryEmbedding` pair, found through the
+`GroupQueryAttention` consuming both, at whichever node comes first). With all three,
+every model's RoPE matches (SmolLM2 32/32, Qwen3 28/28, Llama-3.2 16/16 -- the in-op GQA
+rotary only needed (2)).
+
+**Why Qwen3 was 22% slower than the same model from its HF checkpoint (fixed).** Running
+AutoDeploy on the HF checkpoint itself (same prompts, same settings) gave 176 tok/s vs
+137 for the ONNX -- so the gap was the conversion, not AutoDeploy. An `nsys` kernel
+summary of one 128-token generation (`torch-simple`, so kernels are visible): 898 ms of
+GPU kernels vs 693 ms, and the whole difference was one extra GEMV per layer (3,556
+launches = 28 layers x 127 steps, 180 ms, ~50 us each, plus a `cublasLt::splitKreduce`
+per launch). Every matmul was plain fp16 x fp16 at the aten level; the cause was weight
+**layout**: ONNX `MatMul` stores `[K, N]` weights (`x @ W`), PyTorch linears `[N, K]`
+(`F.linear(x, W)`), and for batch-1 decode cuBLAS sent one of the seven per-layer
+`[K, N]` matmuls to a slow split-K GEMV. (A first guess -- the tied LM head computed as
+`MatMul(x, Transpose(embed))`, 311 MB transposed every step -- was tested by
+pre-transposing it in the ONNX and made no difference: the transpose is a view.) The
+converter now registers a constant 2-D `MatMul` weight transposed and emits `F.linear`
+(also AutoDeploy's canonical linear); `MatMulNBits` dequantizes straight to `[N, K]`.
+Numerics are unchanged (all four models still match onnxruntime at 2.5e-6 to 8.2e-6).
+
+| AutoDeploy `torch-cudagraph`, RTX 5050, 3 chat prompts x 128 greedy tokens | before | after both fixes |
+|---|---|---|
+| `onnx-community/Qwen3-0.6B-ONNX` fp16 | 132 | **173-175** (HF checkpoint through AutoDeploy: 176) |
+| `onnx-community/Qwen2.5-0.5B-Instruct` fp16 (optimum, via `simplify(opset 23)`) | 181-183 | **196-207** |
+| `onnx-community/Llama-3.2-1B-Instruct-ONNX` fp16 | 100-101 | **106-109** |
+| `HuggingFaceTB/SmolLM2-360M-Instruct` fp16 | 216-220 | 208-231 (3 runs; noise ~+-5%) |
+| same, `model_q4f16.onnx` (int4, dequantized) | 215-220 | 202-227 |

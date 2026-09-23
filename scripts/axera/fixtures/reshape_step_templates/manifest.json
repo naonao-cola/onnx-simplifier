@@ -1,4 +1,7 @@
 {
+ "squeeze_builds": {
+  "16x512x1x1->16x512": "squeeze_16x512x1x1_to_16x512_a.axmodel.gz"
+ },
  "templates": {
   "1024x112896->1024x9x12544": {
    "axmodel": "1024x112896_to_1024x9x12544_a.axmodel.gz",
@@ -283,6 +286,17 @@
     "zero_point": 128
    },
    "name": "16x512_to_16x512x1x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x512x1x1->16x512": {
+   "axmodel": "16x512x1x1_to_16x512_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x512x1x1_to_16x512_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x512x1x1_to_16x512",
    "scale": 0.0070588234812021255,
    "zero_point": 128
   },
