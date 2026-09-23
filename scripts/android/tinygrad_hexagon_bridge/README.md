@@ -2251,11 +2251,7 @@ Small shapes, `hexagon-sim --timing` (HEXSIM=1, v73, cycle-level, microseconds a
 - **Hand kernels this makes redundant** (not deleted here): `hex_add_kernel.py`, `hex_requantize_kernel.py`, and, at a
   few percent cost, `hex_maxpool_kernel.py`. The chained backbone drivers under `native_transport/` embed their
   generated C verbatim and would need regenerating to switch over.
-- **Not done: qfloat (fp32 vector math).** This phone's V69 HVX has no IEEE fp32 (see the NMS section), so float vector
-  ops need qfloat lowering (`vadd_sf`/`vconv_sf_qf32` + the asm barrier NMS needed). But the qfloat instructions start at
-  V68, tinygrad's DSP compiler targets V65, and qemu 8.2 can't decode HVX float at all, so tinygrad's own MOCKDSP test
-  path couldn't validate it. That's a target-version change plus a new validation path, not a renderer rule. Float
-  vector ops (sigmoid, RoiAlign's blend, float `max`) are still scalarized by LLVM.
+- **qfloat (fp32 vector math):** done in the next section.
 - **Not done: threading.** The hand kernels' multi-thread speedups come from `qurt` worker threads; qemu's bare-metal mode
   and `hexagon-sim`'s standalone mode (tinygrad's two DSP test paths) have no `qurt`, and tinygrad's own on-device DSP
   runtime can't reach this phone (see the top of this file). A threaded renderer variant could only be validated through
@@ -2263,6 +2259,74 @@ Small shapes, `hexagon-sim --timing` (HEXSIM=1, v73, cycle-level, microseconds a
 - **Not covered by this pass:** convolutions/GEMM (`vrmpy` still needs `custom_kernel` or the TensorCore path, whose
   devectorizer problem is described near the top of this file), and the data-dependent ops (NMS, TopK, proposal decode,
   RoiAlign fast path), which stay hand-written C.
+
+## tinygrad codegen for HVX, stage 2: float vector math as qfloat
+
+This phone's V69 HVX has no IEEE fp32; float vector math is Qualcomm's qfloat (qf32), whose results have to be converted
+back to IEEE sf (see the NMS section, which hit this first). This extends the stage-1 codegen to float kernels, in
+onnxsim/tinygrad PR https://github.com/onnxsim/tinygrad/pull/4 (branch `hvx-qfloat`, which also carries PR #3's float-max
+fix). `HVX_ARCH=v69` compiles for the phone; the default stays v65 (no HVX float), where nothing changes.
+
+### What the lowering does, and why it isn't "convert after every op"
+
+At v68+, LLVM already lowers plain float vector C (`a*b + c`) to qfloat. The question is where it loses precision. Measured
+with `tinygrad_codegen/qfloat/qfsim.py` on `hexagon-sim -mv69 --timing` (real data, output checked against numpy fp32 and
+float64), for the same plain tinygrad code under three lowerings:
+
+| kernel (plain Tensor code) | scalar | LLVM qfloat as-is | convert after every op | **chosen** |
+|---|---:|---:|---:|---:|
+| 4-tap bilinear blend, 4096x256 | 16.7M cycles | 0.93M | 1.87M | **0.93M** |
+| Horner polynomial (exp-like), 1M | 12.7M | 0.76M | 2.06M | **0.76M** |
+| `((a-b)*(c-d))*((a+b)*(c+d))`, 1M | -- | 0.76M | 1.66M | **1.39M** |
+
+| worst-case relative error | LLVM as-is | every op | chosen |
+|---|---:|---:|---:|
+| blend (max abs error vs numpy fp32) | 7.2e-7 | 7.2e-7 | 7.2e-7 |
+| polynomial | 3.6e-7 | 3.6e-7 | 3.6e-7 |
+| products of computed values | **21%** | 4.2% | 4.2% |
+
+- **Where LLVM is fine:** for adds/subs and for multiplies with an IEEE operand (a load or constant), its output is
+  *bit-identical* to converting after every op, and 2-2.7x faster.
+- **Where it isn't:** a multiply whose operands are *both* computed values. LLVM keeps both in qf32 and multiplies
+  qf32 x qf32 without renormalizing: 21% worst case. So exactly those multiplies get both operands forced to IEEE sf
+  through an empty-asm barrier (NMS's recipe) first; everything else is plain vector C.
+- **The remaining 4.2%** on that kernel is qfloat, not the lowering: qf32 add/sub error scales with the *larger operand*,
+  not the result, so cancellation (`a-b` with `a~b`, exact in IEEE) amplifies it. Code that subtracts near-equal floats
+  on this DSP needs an exact fallback, like NMS's near-threshold recheck; no lowering removes that.
+- A first version split 128-lane vectors into HVX registers through memory (`((__hvx_v*)&a)[i]`): 10x slower than
+  splitting with `__builtin_shufflevector`, which is what it does now.
+
+### On the phone
+
+`tinygrad_codegen/qfloat/build.sh` runs the captured kernels on the CDSP (compiled for v69: v73 code would use IEEE HVX
+float, which returns zeros here), `analyze.py` checks the outputs. Single DSP thread, milliseconds, min over 9 reps, two
+clean runs (the phone is shared, so a third run was disturbed and isn't counted):
+
+| kernel | time | max abs err vs numpy fp32 | max rel err vs float64 |
+|---|---:|---:|---:|
+| blend, plain tinygrad (qfloat) | 0.83 - 1.02 | 7.2e-7 | (near-zero outputs) |
+| blend, hand-written qf32 (`hand_blend.c`, same prefetch) | 0.90 - 1.23 | 7.2e-7 | |
+| blend, plain tinygrad, scalar | 11.7 - 13.4 | 3.6e-7 | |
+| products of computed values, chosen lowering | 0.91 - 0.93 | | 4.2% |
+| products of computed values, LLVM as-is | 0.73 - 0.74 | | 21% |
+| sigmoid, 163,200 elements (scalar, see below) | 12.4 - 12.5 | 1.2e-7 | 5.2e-7 |
+
+The phone's errors match hexagon-sim's exactly. The plain-tinygrad blend runs as fast as the hand-written qf32 kernel.
+
+**Sigmoid, at all five real profile shapes (663 to 163,200 elements):** correct and closer to float64 than ONNX
+Runtime's fp32 sigmoid (max rel error 5.7e-7 vs ORT's 1.8% on tiny outputs), but **still scalar**, about 76 ns/element
+on the phone. tinygrad's `exp2` does its range reduction with a float->int conversion, and V69 has no vector
+float<->int convert (`vconv_w_sf`/`vconv_sf_w` arrive in V73); it also needs vector compare/select and a reciprocal.
+Vectorizing it on V69 would mean emulating the conversion with integer bit operations, which isn't done.
+
+### Checks
+
+- tinygrad `test/unit/test_dsp_render.py`: the qf32 x qf32 multiply gets the barrier, plain arithmetic doesn't, nothing
+  changes below v68; plus the stage-1 float-max guard.
+- tinygrad `test/backend/test_ops.py` under `DEV=DSP MOCKDSP=1`: the same 38 pre-existing failures as the base branch.
+  qemu can't decode HVX float, so v69 float correctness is from hexagon-sim and the phone (above).
+- These hexagon-sim checks are meant to replace the TVM qfloat CI (`hexagon-qfloat.yml`); they go into
+  `tests/test_hexagon_tinygrad.py` once PR #1846 (the tinygrad Hexagon CI) has merged.
 
 ## Beyond the backbone: the box-head fc6 MatMul (`hex_boxhead_gemm_kernel.py`)
 
@@ -2496,3 +2560,7 @@ here).
   generator that checks them and the hand `custom_kernel`s byte-exact under qemu and emits their C (`gen_kernels.py`),
   and a TVM-free FastRPC skel/client (`tgk_rpc.idl`, `tgk_impl.c`, `tgk_client.c`, `build.sh`) that times both on the
   phone. See "tinygrad codegen for HVX" above.
+- `tinygrad_codegen/qfloat/` -- stage 2: `qfsim.py` runs a plain-tinygrad float kernel with real data on hexagon-sim
+  (qemu can't decode HVX float) and reports accuracy and cycles, or `--dump`s it; `build.sh` + `qf_rpc.idl`/`qf_impl.c`/
+  `qf_client.c` run the dumps (plus `hand_blend.c`) on the phone, `analyze.py` checks them; `qf_ops.py` holds the inputs
+  and references. See "tinygrad codegen for HVX, stage 2" above.
