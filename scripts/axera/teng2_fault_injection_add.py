@@ -71,7 +71,6 @@ Usage::
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import glob
 import json
 import os
@@ -107,6 +106,8 @@ def _lxc(*args: str, t: int = 120) -> subprocess.CompletedProcess:
 def device_lock():
     """Hold the shared AX8850 lock for exactly one device interaction. Other
     forks share this device; a whole sweep must never hold it continuously."""
+    import fcntl  # POSIX-only; imported here so this module (and its tests) import on Windows
+
     fh = open(_LOCK_PATH, "w")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX)

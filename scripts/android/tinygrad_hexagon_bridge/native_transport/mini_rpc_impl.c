@@ -90,6 +90,65 @@ __attribute__((noinline)) void hex_requantize(unsigned char* restrict __attribut
 #define HEX_REQUANT_A_LEN 8000000
 #define HEX_REQUANT_C_LEN 2000000
 
+/* Real hex_boxhead_gemm_kernel.py-generated fp32 HVX GEMM, for Mask R-CNN's box-head fc6 layer
+ * (rest.onnx, currently 100% ONNX Runtime CPU -- see ../README.md's box-head coverage section).
+ * Unlike every other kernel in this project, this op is fp32 (confirmed by inspecting rest.onnx's
+ * real graph: the MatMul's own inputs are DequantizeLinear outputs, not a real QLinearMatMul), so
+ * there's no vrmpy: one HVX vector FMA per K step instead of a 4-wide int8 dot product.
+ * m=64,k=12544,n=512 -- k is the real fc6 K dim (7*7*256, RoiAlign's flattened 7x7x256 crop); m
+ * and n are a real-shape-consistent SLICE (real m~1000, n=1024) chosen so the packed weight
+ * buffer (k*n*4 bytes) stays under the ~32MB/buffer RPC transfer wall this project's own
+ * native_transport/requantize work already found -- the full real weight (12544*1024*4 ~= 49MB)
+ * exceeds it regardless of m. Verified bit-exact (fp32 sequential-accumulation error only, ~2e-3
+ * at this K depth, matching a float64 reference) under qemu before being pasted here. */
+__attribute__((noinline)) void hex_boxhead_gemm(float* restrict __attribute__((align_value(128))) data0_32768, float* restrict __attribute__((align_value(128))) data1_802816, float* restrict __attribute__((align_value(128))) data2_6422528) {
+  float buf0[32];
+  for (int Lidx0 = 0; Lidx0 < 64; Lidx0++) {
+    for (int Lidx1 = 0; Lidx1 < 16; Lidx1++) {
+      *(buf0+0) = 0.0f;
+      *(buf0+1) = 0.0f;
+      *(buf0+2) = 0.0f;
+      *(buf0+3) = 0.0f;
+      *(buf0+4) = 0.0f;
+      *(buf0+5) = 0.0f;
+      *(buf0+6) = 0.0f;
+      *(buf0+7) = 0.0f;
+      *(buf0+8) = 0.0f;
+      *(buf0+9) = 0.0f;
+      *(buf0+10) = 0.0f;
+      *(buf0+11) = 0.0f;
+      *(buf0+12) = 0.0f;
+      *(buf0+13) = 0.0f;
+      *(buf0+14) = 0.0f;
+      *(buf0+15) = 0.0f;
+      *(buf0+16) = 0.0f;
+      *(buf0+17) = 0.0f;
+      *(buf0+18) = 0.0f;
+      *(buf0+19) = 0.0f;
+      *(buf0+20) = 0.0f;
+      *(buf0+21) = 0.0f;
+      *(buf0+22) = 0.0f;
+      *(buf0+23) = 0.0f;
+      *(buf0+24) = 0.0f;
+      *(buf0+25) = 0.0f;
+      *(buf0+26) = 0.0f;
+      *(buf0+27) = 0.0f;
+      *(buf0+28) = 0.0f;
+      *(buf0+29) = 0.0f;
+      *(buf0+30) = 0.0f;
+      *(buf0+31) = 0.0f;
+      for (int Ridx2 = 0; Ridx2 < 12544; Ridx2++) {
+        *(float __attribute__((vector_size(128)))*)(buf0+0) = *(float __attribute__((vector_size(128)))*)(buf0+0) + (*(float*)(data1_802816+((Lidx0*12544)+Ridx2))) * (*(float __attribute__((vector_size(128)))*)(data2_6422528+((Lidx1*401408)+(Ridx2<<5))));
+      }
+      *(float __attribute__((vector_size(128)))*)(data0_32768+((Lidx0<<9)+(Lidx1<<5))) = *(float __attribute__((vector_size(128)))*)(buf0+0);
+    }
+  }
+}
+
+#define HEX_BOXHEAD_A_LEN 3211264
+#define HEX_BOXHEAD_B_LEN 25690112
+#define HEX_BOXHEAD_C_LEN 131072
+
 int mini_rpc_run_kernel(remote_handle64 h, const unsigned char* a, int aLen,
                          const unsigned char* b, int bLen, unsigned char* c, int cLen) {
   /* Dispatch by buffer size: the original transport-PoC test (8/8/8-byte buffers, see
@@ -103,6 +162,10 @@ int mini_rpc_run_kernel(remote_handle64 h, const unsigned char* a, int aLen,
   }
   if (aLen == HEX_REQUANT_A_LEN && cLen == HEX_REQUANT_C_LEN) {
     hex_requantize(c, (int*)(void*)a);
+    return 0;
+  }
+  if (aLen == HEX_BOXHEAD_A_LEN && bLen == HEX_BOXHEAD_B_LEN && cLen == HEX_BOXHEAD_C_LEN) {
+    hex_boxhead_gemm((float*)(void*)c, (float*)(void*)a, (float*)(void*)b);
     return 0;
   }
   if (aLen == 3527056 && cLen == 3481600) {
