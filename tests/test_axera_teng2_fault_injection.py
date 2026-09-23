@@ -17,10 +17,12 @@ def test_load_reference_and_segment2_bounds():
     model, mc = tfi.load_reference()
     assert model.graph.node[0].op_type == "neu mode"
     start, end = tfi.segment2_bounds(mc)
-    # From the earlier interactive check: segment 2 is [380, 1788), content
-    # runs through byte 1785 (two trailing zero padding bytes).
-    assert start == 380
-    assert end == 1786
+    # Segment 2 is [376, 1784); its content ends at 1738, then zero padding.
+    # Before docs/axera-mcode-segments-fix.md, mcode.segments placed it at
+    # [380, 1788) -- four bytes late, running into segment 3's header -- and
+    # this test pinned start 380 / end 1786.
+    assert start == 376
+    assert end == 1738
 
 
 def test_candidate_offsets_are_within_segment2_and_sorted():

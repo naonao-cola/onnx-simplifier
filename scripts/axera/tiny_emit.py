@@ -1431,7 +1431,13 @@ def emit_gemm_reg8_group(reference_mcode: bytes, donor_mcode: bytes) -> bytes:
 
 
 def retarget_tail_vector(reference_mcode: bytes, edited_mcode: bytes) -> bytes:
-    """Fix the ONE shared root cause behind every length-changing edit's
+    """**Does not make a length-changing edit well-formed**
+    (docs/axera-mcode-segments-fix.md): segments are LZ77 token streams whose
+    length is tail-table key 5, which this leaves stale, and a delta that is
+    not a multiple of 4 leaves the FlatBuffers vector misaligned, which
+    ``mcode.check()`` reports. Use ``short_unit_codec.replace_segment``.
+
+    Fix the ONE shared root cause behind every length-changing edit's
     ``mcode.check()`` failure this session's own generator work has hit:
     ``emit_conv_reg8_group``'s length-changing reconfigurations and
     ``emit_gemm_reg8_group``'s cross-anchor-form splices both reliably
