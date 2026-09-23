@@ -117,6 +117,15 @@ class TanhGelu(nn.Module):
         return 0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
 
 
+class SigmoidCubicGelu(nn.Module):
+    """tanh-GELU rewritten exactly with a sigmoid: 0.5 x (1 + tanh(z)) = x * sigmoid(2 z),
+    z = sqrt(2/pi) (x + 0.044715 x^3). Only Mul/Add/Sigmoid (the HTP runs those fast), unlike
+    TanhGelu's Tanh or QNN's Gelu op."""
+
+    def forward(self, x):
+        return x * torch.sigmoid(x * (1.5957691216057308 + 0.0713548162726009 * x * x))
+
+
 def set_gelu(module: nn.Module, mode: str) -> int:
     """Swap every nn.GELU under `module`: "exact" (erf, upstream), "tanh" (the Gelu op's
     approximate attribute), "tanh_ops" (TanhGelu), "sigmoid" (SigmoidGelu)."""
@@ -129,6 +138,8 @@ def set_gelu(module: nn.Module, mode: str) -> int:
                 setattr(module, name, SigmoidGelu())
             elif mode == "tanh_ops":
                 setattr(module, name, TanhGelu())
+            elif mode == "sigcubic":
+                setattr(module, name, SigmoidCubicGelu())
             n += 1
         else:
             n += set_gelu(child, mode)

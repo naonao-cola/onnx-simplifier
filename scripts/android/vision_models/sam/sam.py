@@ -59,6 +59,14 @@ def ort_sess(path, opt=True, threads=0):
     return ort.InferenceSession(str(path), so, providers=["CPUExecutionProvider"])
 
 
+def ort_sess_bytes(b):
+    import onnxruntime as ort
+
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    return ort.InferenceSession(b, so, providers=["CPUExecutionProvider"])
+
+
 # ---------------------------------------------------------------- images and prompts
 def image(img_id, size):
     """-> uint8 [size, size, 3] (resize longest side, pad bottom/right), valid (h, w) in the
@@ -146,6 +154,81 @@ def simplify(src, dst):
     assert not odd, f"{src}: non-standard ops after onnxsim: {odd}"
     onnx.save(m, dst)
     Path(src).unlink()
+
+
+def fold_normalize(src, dst):
+    """Encoder with a uint8 NHWC `pixels_u8` input whose normalization lives in the input
+    DequantizeLinear: per channel scale 1/std, zero point round(mean). The graph's own
+    Sub(mean)/Mul(1/std) (MobileSAM: /Sub alone 3.7% of the HTP time) disappears; the rounding
+    residual (round(mean) - mean)/std (<= 0.006) is added to the first conv's bias, which is exact
+    except in that conv's zero-padded border (there the residual x weights is missing)."""
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    m = onnx.load(src)
+    g = m.graph
+    init = {i.name: i for i in g.initializer}
+    cons = {}
+    for n in g.node:
+        for x in n.input:
+            cons.setdefault(x, []).append(n)
+    (sub,) = cons["pixels"]
+    assert sub.op_type == "Sub", sub.op_type
+    mean = numpy_helper.to_array(init[sub.input[1]]).reshape(-1).astype(np.float64)
+    nxt = cons[sub.output[0]]
+    if len(nxt) == 1 and nxt[0].op_type == "Mul":
+        mul = nxt[0]
+        inv_std = numpy_helper.to_array(init[mul.input[1]]).reshape(-1).astype(np.float64)
+        convs = cons[mul.output[0]]
+    else:  # onnxsim already folded 1/std into the first conv's weights
+        mul, inv_std, convs = None, np.ones(3), nxt
+    assert all(c.op_type == "Conv" for c in convs), [c.op_type for c in convs]
+    zp = np.round(mean)
+    resid = (zp - mean) * inv_std  # normalized = (x - zp) * inv_std + resid
+    for c in convs:
+        w = numpy_helper.to_array(init[c.input[1]]).astype(np.float64)
+        extra = (w * resid[None, :, None, None]).sum(axis=(1, 2, 3))
+        if len(c.input) > 2 and c.input[2]:
+            b = numpy_helper.to_array(init[c.input[2]]).astype(np.float64) + extra
+            init[c.input[2]].CopyFrom(numpy_helper.from_array(b.astype(np.float32), c.input[2]))
+        else:
+            name = c.name + "_fold_bias"
+            g.initializer.append(numpy_helper.from_array(extra.astype(np.float32), name))
+            c.input.append(name)
+        c.input[0] = "pixels_norm"
+    g.node.remove(sub)
+    if mul is not None:
+        g.node.remove(mul)
+    (x,) = [i for i in g.input if i.name == "pixels"]
+    size = [d.dim_value for d in x.type.tensor_type.shape.dim][-1]
+    g.input.remove(x)
+    g.input.insert(0, helper.make_tensor_value_info("pixels_u8", TensorProto.UINT8,
+                                                    [1, size, size, 3]))
+    g.initializer.extend([
+        numpy_helper.from_array(inv_std.astype(np.float32), "pixels_u8_scale"),
+        numpy_helper.from_array(zp.astype(np.uint8), "pixels_u8_zp")])
+    g.node.insert(0, helper.make_node("Transpose", ["pixels_f"], ["pixels_norm"],
+                                      perm=[0, 3, 1, 2]))
+    g.node.insert(0, helper.make_node("DequantizeLinear",
+                                      ["pixels_u8", "pixels_u8_scale", "pixels_u8_zp"],
+                                      ["pixels_f"], axis=3))
+    onnx.save(m, dst)
+
+
+def cmd_fold(a):
+    """enc.fp16_fold.onnx (normalization folded, see fold_normalize) + its host accuracy."""
+    d = wdir(a.variant)
+    fold_normalize(d / "enc.sim.onnx", d / "enc.fp16_fold.onnx")
+    enc = ort_sess(d / "enc.fp16_fold.onnx")
+    res = eval_masks(d, lambda i, _r: enc.run(None, {"pixels_u8": np.load(
+        d / "ref" / f"eval_{i}_img.npy")[None]})[0], lambda e, pc, pl, i, k: ort_sess(
+        d / "dec.sim.onnx").run(None, {"image_embeddings": e, "point_coords": pc,
+                                       "point_labels": pl}))
+    print("fold", res)
+    p = d / "results.json"
+    cur = json.loads(p.read_text()) if p.exists() else {}
+    cur.setdefault("host", {})["fp16_fold"] = res
+    p.write_text(json.dumps(cur, indent=1))
 
 
 def cmd_export(a):
@@ -239,6 +322,17 @@ def cmd_quantize(a):
 
     d = wdir(a.variant)
     r = d / "ref"
+    if a.policy == "gelu16":  # uint16 QDQ around every Gelu only; the rest stays float (fp16)
+        data = [{"pixels": nchw(np.load(d / "ref" / f"calib_{i}_img.npy"))}
+                for i in CALIB_IDS[: a.calib]]
+        q = quantize_full_qdq(onnx.load(d / "enc.sim.onnx"), data, op_types=["Gelu"],
+                              activation_dtype="uint16", method=a.method)
+        onnx.save(q, d / "enc.gelu_q16.onnx")  # float input: host accuracy (cmd_host)
+        u8_nhwc_input(d / "enc.gelu_q16.onnx", d / "enc.fp16_gelu_q16.onnx",
+                      json.loads((d / "export.json").read_text())["size"])
+        print("enc.fp16_gelu_q16.onnx:", sum(n.op_type == "QuantizeLinear" for n in q.graph.node),
+              "Q nodes")
+        return
     tag = a.policy + ("" if a.method == "minmax" else "_" + a.method)
     kw = {"method": a.method}
     if a.policy == "mix":
@@ -329,7 +423,7 @@ def cmd_host(a):
 
     # approximated encoders (GELU form, upsample mode), fp32: the approximation's own cost
     for g in sorted([*d.glob("enc.gelu_*.onnx"), *d.glob("enc.up_*.onnx")]):
-        enc_g = ort_sess(g)
+        enc_g = ort_sess(g, opt=False)  # QDQ variants: reference math, not ORT's fusions
         def enc_gelu(i, _ref, s=enc_g):
             return s.run(None, {"pixels": nchw(np.load(d / "ref" / f"eval_{i}_img.npy"))})[0]
 
@@ -544,13 +638,13 @@ def _f(x, n):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["export", "ref", "quantize", "host", "phone", "report"])
+    ap.add_argument("cmd", choices=["export", "ref", "quantize", "host", "phone", "report", "fold"])
     ap.add_argument("variant", nargs="?")
-    ap.add_argument("--policy", default="int8", choices=["int8", "mix", "a16", "stem8", "dw8", "dw16"])
+    ap.add_argument("--policy", default="int8", choices=["int8", "mix", "a16", "stem8", "dw8", "dw16", "gelu16"])
     ap.add_argument("--method", default="minmax", choices=["minmax", "mse", "percentile",
                                                             "entropy"])
     ap.add_argument("--pieces", default="all", choices=["all", "enc", "dec"])
-    ap.add_argument("--gelu", default="exact", choices=["exact", "tanh", "tanh_ops", "sigmoid"],
+    ap.add_argument("--gelu", default="exact", choices=["exact", "tanh", "tanh_ops", "sigmoid", "sigcubic"],
                     help="export: also write an approximate-GELU encoder (enc.fp16_<gelu>.onnx)")
     ap.add_argument("--upsample", default="", choices=["", "bilinear", "polyphase"],
                     help="export: also write an encoder with bilinear neck upsampling")
@@ -560,7 +654,7 @@ def main():
     ap.add_argument("--iters", type=int, default=10)
     a = ap.parse_args()
     {"export": cmd_export, "ref": cmd_ref, "quantize": cmd_quantize, "host": cmd_host,
-     "phone": cmd_phone, "report": cmd_report}[a.cmd](a)
+     "phone": cmd_phone, "report": cmd_report, "fold": cmd_fold}[a.cmd](a)
 
 
 if __name__ == "__main__":

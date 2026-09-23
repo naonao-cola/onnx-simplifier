@@ -22,6 +22,7 @@ Accuracy is measured against fp32 ORT on 10 COCO val2017 images x 4 prompts
 | variant | encoder input | enc MB | encoder HTP | emb cos min / mask IoU | decoder HTP | decoder CPU x4 | first mask |
 |---|---|---|---|---|---|---|---|
 | **EdgeSAM** (RepViT, fused) | 1024 | 21.0 | **81.3 ms** | 0.99971 / 0.995 | 10.9 ms | 44.9 ms | **92 ms** |
+| SAM ViT-B (reference) | 1024 | 350.6 | fails (strict compile refuses nodes) | - | 10.9 ms | 44.9 ms | - |
 | MobileSAM (TinyViT-5M) | 1024 | 26.6 | 319.8 ms | 0.99999 / 0.999 | 10.9 ms | 52.9 ms | 331 ms |
 | **EfficientViT-SAM-L0** (bicubic neck as polyphase convs) | 512 | 117.3 | **41.8 ms** | 0.99939 / 0.968 | 11.0 ms | 44.5 ms | **53 ms** |
 | EfficientViT-SAM-L0, upstream bicubic `Resize` | 512 | 117.3 | 1503 ms | 0.99939 / 0.968 | 11.0 ms | 44.5 ms | 1514 ms |
@@ -47,10 +48,34 @@ The decoder is the same SAM mask decoder for all three: **11 ms on the HTP in fp
 | MobileSAM | W8A16 (`a16`) | 202.9 ms | 0.996 | 0.980 / 0.734 | 1.6x |
 | MobileSAM | int8 (percentile) | 90.3 ms | 0.907 | 0.783 / 0.000 | unusable |
 
+### Optimization levers tried (all measured on the phone, strict all-HTP)
+
+| lever | variant | before | after | accuracy | kept? |
+|---|---|---|---|---|---|
+| bicubic neck `Resize` -> exact polyphase depthwise convs + DepthToSpace | EfficientViT-SAM-L0 | 1503 ms | **41.8 ms** | emb cos 0.99939 (unchanged; max abs 7e-7 vs PyTorch) | **yes, default** |
+| same, then int8 / W8A16 | EfficientViT-SAM-L0 | - | - | emb cos 0.24 / 0.37 (host) | no: the bicubic was not why it collapses |
+| uint16 QDQ around every GELU only (QNN LUT), rest fp16 | MobileSAM | 320 ms | 298 ms | emb cos 0.99982, mask IoU 0.999 / min 0.994 | option (`quantize --policy gelu16`), -7% |
+| GELU as x*sigmoid(1.5958x + 0.07135x^3) (= tanh-GELU exactly, Mul/Add/Sigmoid only) | MobileSAM | 320 ms | 330 ms | mask IoU min 0.994 | no |
+| input normalization folded into the input `DequantizeLinear` (per-channel scale/zero point) | all three | - | fails | host exact (emb cos 0.9999999) | no: QNN rejects a per-channel uint8 DQ on the graph input (strict compile fails); the `Sub` it removes is at most 3.7% (MobileSAM) |
+| int8 + `pick_calibration` (embedding-cos metric) | EdgeSAM | - | - | best method percentile 99.99: emb cos 0.83 | - |
+| int8, K most sensitive nodes kept fp16 (per-node only-this-int8 sweep, `sensitivity.py`) | EdgeSAM | - | - | K=16: cos 0.87, min IoU 0.41; K=48: 0.89 / 0.23; K=96 (half the graph): 0.93 / 0.39 | no: each node costs ~1% cos, spread over the whole residual stream; PTQ can't reach min IoU 0.98, it needs QAT / distillation |
+
+Why GELU doesn't get faster: on MobileSAM it is 44% of the profile because stage 0 runs it on
+4x-expanded 256x256 maps. It is memory-bound elementwise work. A cheaper formula (sigmoid-cubic)
+or QNN's tanh attribute doesn't change the bytes moved. A uint16 LUT halves the bytes and gains 7%.
+The real lever would be fusing GELU into the preceding conv, which QNN doesn't do for fp16.
+
 On the host the int8 mask decoder is unusable for every variant (mask IoU 0.26-0.33 vs fp32,
 with an fp32 embedding in). Keep the decoder fp16; at 11 ms it doesn't need int8.
 
 ## Recommendation
+
+**Update:** with the exact polyphase bicubic rewrite, **EfficientViT-SAM-L0 is the fastest
+accurate encoder, at 41.8 ms**. The first mask comes 53 ms after a new image (EdgeSAM: 92 ms), at
+the trained model's accuracy (emb cos 0.9994, mask IoU 0.968 vs fp32 over the prompts). Its encoder
+is larger (117 MB) and runs at 512 px. EdgeSAM stays the pick when mask fidelity at 1024 px
+matters more (mask IoU 0.995).
+
 
 **EdgeSAM, fp16 encoder + fp16 decoder, all on the HTP.** The first mask comes 92 ms after a new
 image (81 + 11) and each further click takes 11 ms, at fp32-level accuracy (embedding cos 0.9997,
