@@ -31,28 +31,43 @@ The rounding model: **exact accumulation over all of K, one rounding to fp16 per
 HMX across the reduce loop, as in `hmx_gemm/hmx_block.h`). `HMX_ACC=0` renders the earlier plain tile op instead (one
 `D = rne_fp16(C + A.B)` per K block, rounded each time); `hmxsim.py` and the tests follow the same switch.
 
-Speed, fp16 128x576x1536 (the SmolLM2 prefill projection shape), phone:
+Speed, fp16 128x576x1536 (the SmolLM2 prefill projection shape), phone (turbo, 20 iterations, same session for the last
+three rows), each step bit-exact on qemu `HMX_REF`, hexagon-sim and the phone, `hmx_probe/run.sh health` clean after every run:
 
-| kernel | us/call | TMAC/s | % of hand DDR-fed |
-|---|---:|---:|---:|
-| tinygrad, plain tile op (#1937's first version) | 17574 | 0.006 | 1% |
-| **tinygrad, accumulator in HMX + HVX row packing** | **2467** | **0.046** | 7% |
-| hand `hmx_gemm`, DDR-fed (mode 0) | 170 | 0.665 | 100% |
-| hand `hmx_gemm`, VTCM-resident (mode 1) | 39.4 | 2.874 | |
+| tinygrad hvx-hmx | what changed | us/call | TMAC/s | vs hand DDR-fed |
+|---|---|---:|---:|---:|
+| dde173734 (#1937's first version) | plain tile op: 2 KB tiles by value, C round trip per K block | 17574 | 0.006 | 104x |
+| abce50643 | accumulator kept in HMX across K; A/B rows packed into VTCM with HVX (vmem + vror + vshuff) | 2467 | 0.046 | 14.6x |
+| 1cbdd8cbd | packed tiles of read-only operands cached in VTCM; L2 prefetch of the next K block | 1200 | 0.094 | 7.1x |
+| 8f786b268 | output-tile loop interchange (longer loop outermost) + K-indexed set-associative cache | 541 | 0.209 | 3.2x |
+| 6df798fa8 | output tile stored straight to the output rows; cache sets resolved at render time | 516 | 0.220 | 3.1x |
+| 6c177be94 | exact loop-indexed cache slots, one spanning load pair, byte-predicated row stores | 403 | 0.281 | 2.4x |
+| **d70b1cbe5** | **B tiles n, n+1 packed together from full 128-byte row lines** | **355** | **0.319** | **2.1x** |
+| hand `hmx_gemm`, DDR-fed (mode 0) | | 168.8 | 0.671 | 1x |
+| hand `hmx_gemm`, VTCM-resident (mode 1) | | 36.9 | 3.073 | |
 
-hexagon-sim, same code: 64^3 4318 Pcycles (60.7 MAC/cycle, was ~34k), 128x576x1536 2.16M Pcycles (52.4 MAC/cycle, was 5.9).
+hexagon-sim (d70b1cbe5): 64^3 4398 Pcycles, 32x2048x32 18284, 128x576x256 50052 (377 MAC/cycle).
 
-**What the renderer does now** (`_hmx_acc_rewrite` in tinygrad's `ops_dsp.py`, on the linearized kernel):
-1. `__hmx_begin()` before the reduce loop (bias table, clear state).
-2. Each K block: every row pair of A and B is packed straight from the row pointers into VTCM -- an aligned 128-byte `vmem`
-   (rows are 64-byte aligned, so it never leaves the row's 128-byte block), `vror`, one halfword `vshuff`, one store -- then
-   one load pair. tinygrad's 1024-lane operand values, its row loads and the accumulator loads are dropped.
-3. After the loop: one `:after.hf` store; the accumulator array is filled from the output tile with vector shuffles.
+**What the renderer does now** (`_hmx_acc_rewrite` in tinygrad's `ops_dsp.py`, on the linearized kernel; `HMX_ACC=0` keeps the
+plain tile op, `HMX_INTERCHANGE=0` the loop order):
+1. **Accumulator in HMX.** `__hmx_begin()` before the reduce loop; one `:after.hf` store after it; each output tile is rounded
+   once. tinygrad's 1024-lane operand values, its accumulator array and the C loads are dropped.
+2. **Rows packed straight into VTCM.** Each row pair of A/B: an aligned 128-byte `vmem` (rows are 64-byte aligned, so it never
+   leaves its 128-byte block), `vror`, one halfword `vshuff`. When the operand indexed by the outer tile loop has a
+   128-byte-multiple row stride and its next tile is the next 32 columns (checked by evaluating the index expressions at
+   sample loop values), tiles n, n+1 are packed together from full row lines with one `vshuff`.
+3. **Loop interchange + exact VTCM tile cache.** The two output-tile loops are independent; the longer one goes outermost.
+   Tiles of an operand indexed by the inner loop live at `inner*kt + k` (filled on the first outer iteration), those of one
+   indexed by the outer loop at `k` (or `(outer%2)*kt + k` when paired; filled on the first inner iteration) -- contiguous
+   in K, so **one `:deep` load pair spans all K tiles** (split at 32) right before the store. Whole K panels are l2fetch'ed on
+   their first fill. Otherwise: a tagged K-indexed cache, or plain staging with a load pair per K block.
+4. **Output.** When tinygrad only copies the accumulator array (lane permutations) to the output after the loop, the tile is
+   written straight to the output rows instead: per row pair one `vdealh` and two byte-predicated `vmem` stores (predicate
+   set in asm -- the clang q-register builtins assert in this toolchain), no read of the destination.
 
-**What's left** (the remaining ~15x to the hand kernel): A is re-packed for every output column tile and B for every row
-tile (the loop nest is tile-outer, K-inner, and HMX has one accumulator); the hand kernel packs A once and streams weights.
-Next: cache packed A tiles in VTCM across the N loop, take weights prepacked in tile layout, then the hand kernel's DMA /
-double-buffered weight streaming (see `hmx_gemm/README.md`).
+**What's left** (2.1x to the hand kernel): the hand kernel streams weights prepacked on the host (contiguous 2 KB tiles,
+120k pcycles for W) where tinygrad still packs B from row-major rows; prepacked operands through a tinygrad view still split
+the matmul into three kernels (`hmxsim.py --prepack`). Then the hand kernel's DMA double-buffering.
 
 ## Files
 

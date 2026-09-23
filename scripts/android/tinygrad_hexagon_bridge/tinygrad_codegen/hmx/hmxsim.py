@@ -43,7 +43,7 @@ def model(A:np.ndarray, B:np.ndarray) -> np.ndarray:
 
 def run_sim(src:str, bufs:list[bytes], repeat:int, work:pathlib.Path) -> tuple[bytes, int]:
   body = src.split("/* DSP boilerplate */")[0]
-  name = re.search(r"void\s+(\w+)\(", body.split("#endif")[-1]).group(1)
+  name = re.search(r"noinline\)\) void\s+(\w+)\(", body).group(1)
   for i, b in enumerate(bufs): (work / f"buf{i}.bin").write_bytes(b)
   decl = "\n".join(f"static unsigned char b{i}[{len(b)}] __attribute__((aligned(128)));" for i, b in enumerate(bufs))
   load = "\n".join(f'  {{ FILE* f = fopen("buf{i}.bin", "rb"); fread(b{i}, 1, {len(b)}, f); fclose(f); }}' for i, b in enumerate(bufs))
