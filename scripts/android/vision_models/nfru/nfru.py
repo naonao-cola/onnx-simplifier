@@ -327,12 +327,142 @@ def golden(n: int) -> None:
         )
 
 
+def _out_range():
+    """Arm's QAT output quantization (int8 scale s, zero point z) as a uint8 [lo, hi] range."""
+    import json
+
+    q = json.loads((WORK / "nfru_v1_int8_metadata.json").read_text())["outputs"][
+        "getitem"
+    ]["SINT"]
+    s, z = float(q["scale"]), int(q["zero_point"]) + 128
+    return (-z * s, (255 - z) * s), s, z
+
+
+def build() -> None:
+    """The network as ONNX (QAT weights, 16 x 270 x 480 in, 4 logits out) -> int8 QDQ (onnxsim full_qdq,
+    input pinned to [0, 1], output to Arm's QAT output quantization) with uint8 NHWC I/O."""
+    import nfru_gym
+    import onnx
+    import onnxruntime as ort
+    import torch
+    from onnx import helper
+
+    from onnxsim.full_qdq import quantize_full_qdq, quantized_io
+
+    torch.set_grad_enabled(False)
+    gold = sorted(GOLD.glob("w*.npz"))
+    if not gold:
+        sys.exit("run `nfru.py golden` first")
+    z0 = np.load(gold[0])
+    _, c, h, w = z0["net_in"].shape
+    d = WORK / "onnx"
+    d.mkdir(exist_ok=True)
+    ae = nfru_gym.build_core("qat").auto_encoder
+    fp = d / "net_qat_f32.onnx"
+    torch.onnx.export(
+        ae,
+        (torch.zeros(1, c, h, w),),
+        str(fp),
+        input_names=["x"],
+        output_names=["params"],
+        opset_version=17,
+        dynamo=False,
+    )
+    xt = torch.from_numpy(z0["net_in"])
+    s = ort.InferenceSession(str(fp), providers=["CPUExecutionProvider"])
+    print(
+        "onnx vs torch max abs",
+        float(np.abs(s.run(None, {"x": xt.numpy()})[0] - ae(xt).numpy()).max()),
+    )
+    calib = [{"x": np.load(p)["net_in"]} for p in gold]
+    (lo, hi), sc, zp = _out_range()
+    q = quantize_full_qdq(
+        onnx.load(fp), calib, method="mse", ranges={"x": (0.0, 1.0), "params": (lo, hi)}
+    )
+    m, info = quantized_io(q, nhwc_inputs=["x"])
+    g = m.graph
+    for o in list(g.output):  # uint8 NCHW -> NHWC
+        prod = {oo: n for n in g.node for oo in n.output}[o.name]
+        prod.output[:] = [
+            o.name + "_nchw" if oo == o.name else oo for oo in prod.output
+        ]
+        g.node.append(
+            helper.make_node(
+                "Transpose", [o.name + "_nchw"], [o.name], perm=[0, 2, 3, 1]
+            )
+        )
+        dims = [dd.dim_value for dd in o.type.tensor_type.shape.dim]
+        o.type.tensor_type.shape.Clear()
+        for v in (dims[0], dims[2], dims[3], dims[1]):
+            o.type.tensor_type.shape.dim.add().dim_value = v
+    print("I/O quantization:", info)
+    assert (
+        abs(info["params"]["scale"] - sc) < 1e-6 and info["params"]["zero_point"] == zp
+    ), info
+    onnx.save(m, d / "net_int8_qat.onnx")
+
+
+def host_net() -> None:
+    """Open loop on the host: every window's golden postprocess re-run with the int8 network's logits
+    (host ORT, BASIC optimizations -- no fused int8 kernels); PSNR vs the fp32 torch output and vs GT."""
+    import importlib
+
+    import nfru_gym
+    import onnxruntime as ort
+    import torch
+
+    nfru_gym._install()
+    pp = importlib.import_module(
+        "ng_model_gym.usecases.nfru.model.torch_processing.postprocess"
+    )
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    s = ort.InferenceSession(
+        str(WORK / "onnx" / "net_int8_qat.onnx"), so, providers=["CPUExecutionProvider"]
+    )
+    _, sc, zp = _out_range()
+
+    def psnr(a, b):
+        d = np.clip(a, 0, 1) - np.clip(b, 0, 1)
+        return float(10 * np.log10(1 / max(float((d * d).mean()), 1e-12)))
+
+    for p in sorted(GOLD.glob("w*.npz")):
+        z = np.load(p)
+        xu8 = np.clip(np.rint(z["net_in"][0].transpose(1, 2, 0) * 255), 0, 255).astype(
+            np.uint8
+        )[None]
+        (pu8,) = s.run(None, {"x": xu8})
+        params = (
+            torch.from_numpy((pu8.astype(np.float32) - zp) * sc)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
+        t = {k: torch.from_numpy(z[k]) for k in ("flow_t", "mv_t", "rgb_m1", "rgb_p1")}
+        out = pp.postprocess_torch(
+            warped_flow=t["flow_t"],
+            warped_mv=t["mv_t"],
+            rgb_m1=t["rgb_m1"],
+            rgb_p1=t["rgb_p1"],
+            learnt_params=params,
+            timestep=0.5,
+        ).numpy()
+        print(
+            f"{p.stem}: int8 net psnr vs GT {psnr(out, z['gt']):.2f} dB (fp32 torch {psnr(z['out'], z['gt']):.2f});"
+            f" vs fp32 output {psnr(out, z['out']):.1f} dB; logits max abs {np.abs(params.numpy() - z['params']).max():.2f}"
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["fetch", "golden"])
+    ap.add_argument("cmd", choices=["fetch", "golden", "build", "host-net"])
     ap.add_argument("--windows", type=int, default=8)
     a = ap.parse_args()
-    {"fetch": fetch, "golden": lambda: golden(a.windows)}[a.cmd]()
+    {
+        "fetch": fetch,
+        "golden": lambda: golden(a.windows),
+        "build": build,
+        "host-net": host_net,
+    }[a.cmd]()
 
 
 if __name__ == "__main__":
