@@ -91,8 +91,18 @@ int main(int argc, char** argv) try {
   char dname[256] = {0};
   p_clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof dname, dname, nullptr);
   cl_int err;
-  cl_context ctx = p_clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &err);
+  // cl_qcom_perf_hint: this context asks for high GPU clocks (an app-level hint, no system setting);
+  // NSS_PERF=normal|low|none to compare
+  const char* perf = getenv("NSS_PERF") ? getenv("NSS_PERF") : "high";
+  cl_context_properties props[] = {CL_CONTEXT_PLATFORM, (cl_context_properties)plat, 0x40C2 /* PERF_HINT */,
+                                   std::string(perf) == "low"      ? 0x40C5
+                                   : std::string(perf) == "normal" ? 0x40C4
+                                                                   : 0x40C3,
+                                   0};
+  if (std::string(perf) == "none") props[2] = 0;
+  cl_context ctx = p_clCreateContext(props, 1, &dev, nullptr, nullptr, &err);
   CK(err);
+  printf("perf hint %s\n", perf);
   cl_command_queue q = p_clCreateCommandQueue(ctx, dev, CL_QUEUE_PROFILING_ENABLE, &err);
   CK(err);
   auto src = read_file(dir + "/nss_kernels.cl");
@@ -112,6 +122,16 @@ int main(int argc, char** argv) try {
     return 1;
   }
   printf("device %s, cl build %.1f ms\n", dname, now_ms() - tb);
+  if (getenv("NSS_DEVINFO")) {
+    std::vector<char> ext(1 << 14);
+    p_clGetDeviceInfo(dev, CL_DEVICE_EXTENSIONS, ext.size(), ext.data(), nullptr);
+    cl_uint pa = 0, ba = 0;
+    p_clGetDeviceInfo(dev, CL_DEVICE_IMAGE_PITCH_ALIGNMENT, sizeof pa, &pa, nullptr);
+    p_clGetDeviceInfo(dev, CL_DEVICE_IMAGE_BASE_ADDRESS_ALIGNMENT, sizeof ba, &ba, nullptr);
+    char ver[256] = {0};
+    p_clGetDeviceInfo(dev, CL_DEVICE_VERSION, sizeof ver, ver, nullptr);
+    printf("version %s\npitch align %u px, base align %u B\nextensions %s\n", ver, pa, ba, ext.data());
+  }
   auto K = [&](const char* n) {
     cl_kernel k = p_clCreateKernel(prog, n, &err);
     CK(err);
@@ -153,11 +173,23 @@ int main(int argc, char** argv) try {
     return m;
   };
   cl_mem b_hist[2] = {IMG(Wo, Ho), IMG(Wo, Ho)};
+  cl_mem i_tmp = nullptr;  // RGBA8 image view of b_tmp (cl_khr_image2d_from_buffer), created below
   cl_mem b_deriv[2] = {B(H * W * 16), B(H * W * 16)};
   const cl_mem_flags mapped = CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR;
   cl_mem b_in_u8 = B(Hp * Wp * 12, mapped), b_code = B(H * W);
   cl_mem b_kpn = B(Hk * Wk * Kc, mapped), b_tmp = B(Ht * Wt * 4, mapped), b_rgba = B(Ho * Wo * 4, mapped);
   cl_mem nullmem = nullptr;
+  {
+    cl_image_format f{CL_RGBA, CL_UNSIGNED_INT8};
+    cl_image_desc d{};
+    d.image_type = CL_MEM_OBJECT_IMAGE2D;
+    d.image_width = Wt;
+    d.image_height = Ht;
+    d.image_row_pitch = (size_t)Wt * 4;
+    d.buffer = b_tmp;  // (mem_object) shares the memory ORT writes the temporal output into
+    i_tmp = p_clCreateImage(ctx, CL_MEM_READ_ONLY, &f, &d, nullptr, &err);
+    CK(err);
+  }
   std::vector<char> zeros(Ho * Wo * 16, 0);
   auto zero_state = [&]() {  // the gym's zero history buffers at the start of a sequence
     size_t org[3] = {0, 0, 0}, reg[3] = {(size_t)Wo, (size_t)Ho, 1};
@@ -258,7 +290,7 @@ int main(int argc, char** argv) try {
       set(k_ds, {A(b_motion), A(b_depth), A(H), A(W), A(b_recon), A(Hd), A(Wd)});
       size_t gds[2] = {(size_t)Wd, (size_t)Hd};
       CK(p_clEnqueueNDRangeKernel(q, k_ds, 2, nullptr, gds, nullptr, 0, nullptr, &e_ds));
-      set(k_pre, {A(b_color), A(b_hist[cur]), A(b_motion), A(b_depth), A(b_tmp), A(b_deriv[cur]), A(b_recon),
+      set(k_pre, {A(b_color), A(b_hist[cur]), A(b_motion), A(b_depth), A(i_tmp), A(b_deriv[cur]), A(b_recon),
                   A(H), A(W), A(Hp), A(Wp), A(Ho), A(Wo), A(Hd), A(Wd), A(jy), A(jx), A(e), A(rs0), A(rs1),
                   A(dtv), A(nullmem), A(b_in_u8), A(b_deriv[nxt]), A(nullmem), A(b_code)});
       size_t gp[2] = {(size_t)Wp, (size_t)Hp};
@@ -290,7 +322,7 @@ int main(int argc, char** argv) try {
 
       double p0 = now_ms();
       int ntaps = taps;
-      set(k_post, {A(b_color), A(b_hist[cur]), A(b_motion), A(b_code), A(b_kpn), A(b_tmp), A(b_lut), A(H), A(W),
+      set(k_post, {A(b_color), A(b_hist[cur]), A(b_motion), A(b_code), A(b_kpn), A(i_tmp), A(b_lut), A(H), A(W),
                    A(Ho), A(Wo), A(Hk), A(Wk), A(Kc), A(Ht), A(Wt), A(mh), A(mw), A(ntaps), A(e), A(reset),
                    A(b_hist[nxt]), A(b_rgba)});
       size_t go[2] = {(size_t)Wo, (size_t)Ho};

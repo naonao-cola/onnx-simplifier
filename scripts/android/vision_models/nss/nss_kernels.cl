@@ -100,18 +100,29 @@ inline float4 bil4i(__read_only image2d_t t, int H, int W, float uvy, float uvx,
          read_imagef(t, NEAREST, (int2)(b.x0, b.y1)) * b.w10 * b.w01 +
          read_imagef(t, NEAREST, (int2)(b.x1, b.y1)) * b.w10 * b.w11;
 }
+// uint8 RGBA image (the CNN's temporal output viewed as an image) -> k / 255 via the local table
+inline float4 u8i(__read_only image2d_t t, int x, int y, __local const float* u8f) {
+  uint4 v = read_imageui(t, NEAREST, (int2)(x, y));
+  return (float4)(u8f[v.x], u8f[v.y], u8f[v.z], u8f[v.w]);
+}
+inline float4 bilu8i(__read_only image2d_t t, int H, int W, float uvy, float uvx, int ce, __local const float* u8f) {
+  Bil b = bil(H, W, uvy, uvx, ce);
+  return u8i(t, b.x0, b.y0, u8f) * b.w00 * b.w01 + u8i(t, b.x1, b.y0, u8f) * b.w00 * b.w11 +
+         u8i(t, b.x0, b.y1, u8f) * b.w10 * b.w01 + u8i(t, b.x1, b.y1, u8f) * b.w10 * b.w11;
+}
 inline float2 bil2(__global const float2* t, int H, int W, float uvy, float uvx, int ce) {
   Bil b = bil(H, W, uvy, uvx, ce);
   return BIL_SUM(float2, t, W, b);
 }
-inline float4 u8x4(__global const uchar4* t, int i) {
+// uint8 -> k / 255 through a work-group-local copy of U8F: divergent __constant lookups serialize on Adreno
+inline float4 u8x4(__global const uchar4* t, int i, __local const float* u8f) {
   uchar4 v = t[i];
-  return (float4)(U8F[v.x], U8F[v.y], U8F[v.z], U8F[v.w]);
+  return (float4)(u8f[v.x], u8f[v.y], u8f[v.z], u8f[v.w]);
 }
-inline float4 bilu8(__global const uchar4* t, int H, int W, float uvy, float uvx, int ce) {
+inline float4 bilu8(__global const uchar4* t, int H, int W, float uvy, float uvx, int ce, __local const float* u8f) {
   Bil b = bil(H, W, uvy, uvx, ce);
-  return u8x4(t, b.y0 * W + b.x0) * b.w00 * b.w01 + u8x4(t, b.y0 * W + b.x1) * b.w00 * b.w11 +
-         u8x4(t, b.y1 * W + b.x0) * b.w10 * b.w01 + u8x4(t, b.y1 * W + b.x1) * b.w10 * b.w11;
+  return u8x4(t, b.y0 * W + b.x0, u8f) * b.w00 * b.w01 + u8x4(t, b.y0 * W + b.x1, u8f) * b.w00 * b.w11 +
+         u8x4(t, b.y1 * W + b.x0, u8f) * b.w10 * b.w01 + u8x4(t, b.y1 * W + b.x1, u8f) * b.w10 * b.w11;
 }
 
 inline float4 karis4(float4 c) {  // tonemap_forward(..., Karis) on rgb: x / (1 + max(x)), non-negative x
@@ -236,11 +247,14 @@ inline float ydelta(float4 a, float4 b) {
 // feedback is the previous frame's uint8 NHWC temporal CNN output (Hp x Wp x 4).
 __kernel __attribute__((reqd_work_group_size(32, 8, 1))) void preprocess(
     __global const float4* color, __read_only image2d_t history, __global const float2* motion,
-    __global const float* depth, __global const uchar4* feedback_tm1, __global const float4* derivative_tm1,
+    __global const float* depth, __read_only image2d_t feedback_tm1, __global const float4* derivative_tm1,
     __global const int* recon_depth, int H, int W, int Hp, int Wp, int Hh, int Wh, int Hd, int Wd,
     float jy, float jx, float exposure, float rs0, float rs1, float4 dtv,
     __global float* cnn_in, __global uchar* cnn_in_u8, __global float4* derivative_out,
     __global float* disocc_out, __global uchar* nearest_code) {
+  __local float u8f[256];
+  u8f[get_local_id(1) * 32 + get_local_id(0)] = U8F[get_local_id(1) * 32 + get_local_id(0)];
+  barrier(CLK_LOCAL_MEM_FENCE);
   int py = get_global_id(1), px = get_global_id(0);
   if (py >= Hp || px >= Wp) return;
   int ry = reflect1(py, H), rx = reflect1(px, W);
@@ -327,7 +341,7 @@ __kernel __attribute__((reqd_work_group_size(32, 8, 1))) void preprocess(
   state.w = lerpt(lerpt(st.w, rs.w, disb), rs.w, uninit);
   vis = lerpt(vis, 0.0f, uninit);
   // feedback, motion detector
-  float4 fb = bilu8(feedback_tm1, Hp, Wp, rppy, rppx, 0);
+  float4 fb = bilu8i(feedback_tm1, Hp, Wp, rppy, rppx, 0, u8f);
   fb = (float4)(lerpt(fb.x, 0.0f, disb), lerpt(fb.y, 0.0f, disb), lerpt(fb.z, 0.0f, disb), lerpt(fb.w, 0.0f, disb));
   float pmin = sqrt((1.0f / rs0) * (1.0f / rs0) + (1.0f / rs1) * (1.0f / rs1));
   float pmax = sqrt((200.0f / rs0) * (200.0f / rs0) + (200.0f / rs1) * (200.0f / rs1));
@@ -403,10 +417,16 @@ inline float4 catmull_rom(__read_only image2d_t t, int H, int W, float uvy, floa
 // image that is also next frame's history) and its reinhard-tonemapped RGBA8 display copy. lut: (6, mod_h * mod_w * taps).
 __kernel __attribute__((reqd_work_group_size(32, 8, 1))) void postprocess(
     __global const float4* color, __read_only image2d_t history, __global const float2* motion,
-    __global const uchar* nearest_code, __global const uchar* kpn_u8, __global const uchar4* temporal_u8,
+    __global const uchar* nearest_code, __global const uchar* kpn_u8, __read_only image2d_t temporal_u8,
     __constant float* offset_lut, int H, int W, int Ho, int Wo, int Hk, int Wk, int Kc, int Ht, int Wt,
     int mod_h, int mod_w, int taps, float exposure, float reset, __write_only image2d_t out_linear,
     __global uchar4* out_rgba) {
+  __local float u8f[256], lut[6 * 64];  // lut: up to 64 (tile, tap) pairs, 36 at 2x2 tiles x 9 taps
+  int lid = get_local_id(1) * 32 + get_local_id(0);
+  u8f[lid] = U8F[lid];
+  int nl = mod_h * mod_w * taps;
+  for (int i = lid; i < 6 * nl; i += 256) lut[i] = offset_lut[i];
+  barrier(CLK_LOCAL_MEM_FENCE);
   int oy = get_global_id(1), ox = get_global_id(0);
   if (oy >= Ho || ox >= Wo) return;
   int p0 = oy * Wo + ox;
@@ -419,7 +439,6 @@ __kernel __attribute__((reqd_work_group_size(32, 8, 1))) void postprocess(
 #else
   int li = (oy % mod_h) * mod_w + (ox % mod_w);
 #endif
-  int nl = mod_h * mod_w * taps;
   float kpsy = (float)Hk / (float)Ht, kpsx = (float)Wk / (float)Wt;
   float4 m1 = 0.0f, m2 = 0.0f, cc = 0.0f;
   float wsum = 0.0f, cv = 0.0f;
@@ -429,8 +448,8 @@ __kernel __attribute__((reqd_work_group_size(32, 8, 1))) void postprocess(
   for (int k = 0; k < taps; k++) {
 #endif
     int j = li * taps + k;
-    float t0 = offset_lut[j], t1 = offset_lut[nl + j], t2 = offset_lut[2 * nl + j];
-    float t3 = offset_lut[3 * nl + j], t4 = offset_lut[4 * nl + j], t5 = offset_lut[5 * nl + j];
+    float t0 = lut[j], t1 = lut[nl + j], t2 = lut[2 * nl + j];
+    float t3 = lut[3 * nl + j], t4 = lut[4 * nl + j], t5 = lut[5 * nl + j];
     int ly = (int)floor(((float)(oy + (int)t3) + 0.5f) * isy + 0.001f) + (int)t0;
     int lx = (int)floor(((float)(ox + (int)t4) + 0.5f) * isx + 0.001f) + (int)t1;
     ly = clampi(ly, 0, H - 1);
@@ -443,7 +462,7 @@ __kernel __attribute__((reqd_work_group_size(32, 8, 1))) void postprocess(
     int ky = clampi((int)floor(((float)ly + 0.5f + 0.001f) * kpsy), 0, Hk - 1);
     int kx = clampi((int)floor(((float)lx + 0.5f + 0.001f) * kpsx), 0, Wk - 1);
     int ch = clampi((int)t5, 0, Kc - 1);
-    float raw = U8F[kpn_u8[(ky * Wk + kx) * Kc + ch]];
+    float raw = u8f[kpn_u8[(ky * Wk + kx) * Kc + ch]];
     float w = fmax(raw, EPS) * t2;
     m1 = m1 + ct * w;
     m2 = m2 + (ct * ct) * w;
@@ -458,7 +477,7 @@ __kernel __attribute__((reqd_work_group_size(32, 8, 1))) void postprocess(
 #ifdef ABL_NOTEMPORAL
   float4 par = (float4)(0.5f);
 #else
-  float4 par = bilu8(temporal_u8, Ht, Wt, uvy * ((float)H * (1.0f / (float)Ht)), uvx * ((float)W * (1.0f / (float)Wt)), 1);
+  float4 par = bilu8i(temporal_u8, Ht, Wt, uvy * ((float)H * (1.0f / (float)Ht)), uvx * ((float)W * (1.0f / (float)Wt)), 1, u8f);
 #endif
   float theta = satf(par.x);
   float th2 = theta * theta, it = 1.0f - theta, it2 = it * it;

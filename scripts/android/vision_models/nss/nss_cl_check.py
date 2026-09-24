@@ -86,6 +86,18 @@ class NssCL:
             hostbuf=a4,
         )
 
+    def img_u8(self, a):  # (H, W, 4) uint8 -> RGBA8 unsigned-int image2d
+        cl = self.cl
+        fmt = cl.ImageFormat(cl.channel_order.RGBA, cl.channel_type.UNSIGNED_INT8)
+        a = np.ascontiguousarray(a, np.uint8)
+        return cl.Image(
+            self.ctx,
+            cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
+            fmt,
+            shape=(a.shape[1], a.shape[0]),
+            hostbuf=a,
+        )
+
     def get(self, a, b):
         self.cl.enqueue_copy(self.q, a, b)
         return a
@@ -130,7 +142,7 @@ class NssCL:
             self.img(history),
             self.buf(yx2(z["motion"][0])),
             self.buf(z["depth"]),
-            self.buf(feedback_u8),
+            self.img_u8(feedback_u8),
             self.buf(derivative_tm1),
             self.buf(recon.astype(np.int32)),
             np.int32(H),
@@ -181,7 +193,7 @@ class NssCL:
             self.buf(yx2(z["motion"][0])),
             self.buf(code),
             self.buf(kpn_u8),
-            self.buf(temporal_u8),
+            self.img_u8(temporal_u8[0]),
             self.buf(lut.reshape(6, -1)),
             np.int32(H),
             np.int32(W),
