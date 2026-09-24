@@ -1,0 +1,339 @@
+"""Arm Neural Frame Rate Upscaling (NFRU v1) -- frame generation, the DLSS-3-style counterpart of NSS --
+with the network on the HTP and the pre/post-processing on the Adreno GPU (see README.md).
+
+  nfru.py fetch                  Arm's weights + license (HF Arm/neural-frame-rate-upscaling) and the test
+                                 sequence (Arm/neural-graphics-dataset nfru/test, 2.9 GB) -> ~/.cache/arm-nfru
+  nfru.py golden [--windows N]   the gym's torch pipeline (QAT weights, torch backend) window by window;
+                                 dumps every GPU-kernel input, intermediate and output -> golden/
+"""
+
+import argparse
+import hashlib
+import os
+import sys
+import urllib.request
+from pathlib import Path
+
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+WORK = Path(os.environ.get("NFRU_WORK", Path.home() / ".cache/arm-nfru"))
+GOLD = WORK / "golden"
+HF = "https://huggingface.co/{repo}/resolve/main/{path}"
+FILES = {  # local name: (repo, path, sha256)
+    "nfru_v1_fp32.pt": ("Arm/neural-frame-rate-upscaling", "nfru_v1_fp32.pt", None),
+    "nfru_v1_int8.pt": ("Arm/neural-frame-rate-upscaling", "nfru_v1_int8.pt", None),
+    "nfru_v1_int8_metadata.json": (
+        "Arm/neural-frame-rate-upscaling",
+        "nfru_v1_int8_metadata.json",
+        None,
+    ),
+    "LICENSE_Arm_AI_Model_Community.pdf": (
+        "Arm/neural-frame-rate-upscaling",
+        "Arm_AI_Model_Community_License_v1_0_PRE-1154.pdf",
+        None,
+    ),
+    "test.safetensors": (
+        "datasets/Arm/neural-graphics-dataset",
+        "nfru/test/0000.safetensors",
+        None,
+    ),
+}
+SHA_FILE = HERE / "sha256.json"
+# the test windows: 60 fps capture, a 30 fps game -- interpolate t = n between m1 = n - 1 and p1 = n + 1
+REF_FPS, CAPTURE_FPS, MIN_OFF, MAX_OFF = 60, 30, 3, 1
+INPUTS = [
+    "rgb_linear_m1",
+    "rgb_linear_p1",
+    "depth_m1",
+    "depth_p1",
+    "mv_p1_f30_m1",
+    "sy_m1_f30_p1",
+    "mv_m1_f30_m3",
+    "sy_m1_f30_m3",
+    "exposure_p1",
+    "DepthParams_p1",
+    "NearPlane_p1",
+    "FarPlane_p1",
+    "FovY_p1",
+    "infinite_zFar_p1",
+    "ViewProj_m3",
+    "ViewProj_m1",
+    "ViewProj_p1",
+    "rgb_linear_t",
+]
+
+
+def _sha(p: Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 22), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def fetch() -> None:
+    import json
+
+    WORK.mkdir(parents=True, exist_ok=True)
+    pinned = json.loads(SHA_FILE.read_text()) if SHA_FILE.exists() else {}
+    got = {}
+    for name, (repo, path, _) in FILES.items():
+        dst = WORK / name
+        if not dst.exists():
+            print("fetch", name, flush=True)
+            urllib.request.urlretrieve(HF.format(repo=repo, path=path), dst)
+        got[name] = _sha(dst)
+        if name in pinned and pinned[name] != got[name]:
+            sys.exit(
+                f"sha256 mismatch for {name}: {got[name]} != pinned {pinned[name]}"
+            )
+    if not pinned:
+        SHA_FILE.write_text(json.dumps(got, indent=1) + "\n")
+    print("ok:", ", ".join(got))
+
+
+def windows(n: int):
+    """The test windows as the gym's NFRU test loader builds them (process_data, no augmentation)."""
+    import importlib
+
+    import nfru_gym
+    import safetensors
+    import torch
+
+    nfru_gym._install()
+    naming = importlib.import_module("ng_model_gym.usecases.nfru.data.naming")
+    proc = importlib.import_module("ng_model_gym.usecases.nfru.data.processing")
+    step = REF_FPS // CAPTURE_FPS
+    with safetensors.safe_open(
+        WORK / "test.safetensors", framework="numpy", device="cpu"
+    ) as f:
+        length = int(f.metadata()["Length"])
+        centres = list(range(MIN_OFF, length - MAX_OFF, step))[:n]
+        for c in centres:
+            start = c - MIN_OFF
+            fr = {}
+            for key in INPUTS:
+                dv = naming.DataVariable(key)
+                sk = dv.generate_non_concrete_variable(timeline_fps=REF_FPS)
+                if dv.is_mv:
+                    off = dv.ivec_from
+                else:
+                    ks = key.split("_")
+                    off = naming.convert_str_offset_to_int(ks[-1])
+                    sk = "_".join(ks[:-1])
+                fr[key] = torch.from_numpy(
+                    f.get_slice(sk)[start + MIN_OFF + off].copy()
+                ).unsqueeze(0)
+            x, y = proc.process_data(
+                fr,
+                augment=False,
+                shape_aug=False,
+                shape_aug_num_shapes=0,
+                shape_aug_max_size=0,
+                shape_aug_max_displacement=0,
+                shape_aug_probability=0.0,
+                brightness_shape_aug_probability=0.0,
+            )
+            yield (
+                c,
+                {
+                    k: v.unsqueeze(0)
+                    if v.dim() in (0, 2, 3) and k != "MotionMat"
+                    else v
+                    for k, v in x.items()
+                },
+                y,
+            )
+
+
+def _record_blockmatch():
+    """Wrap the block matcher's modules for one _resolve_flow call; returns a getter of the per-level
+    search (warped) / template / mv-hint images (uint8), vectors before the median, after the median,
+    after the joint bilateral filter, and the hint mask -- keys bm_<what><level>."""
+    import importlib
+
+    bmm = importlib.import_module(
+        "ng_model_gym.usecases.nfru.model.optical_flow.blockmatch_v321"
+    )
+    rec, lvl = {}, [-1]
+    esw, et, cv, jbf, med = (
+        bmm.ExtractSearchWindows.forward,
+        bmm.ExtractTemplates.forward,
+        bmm.CalculateVector.forward,
+        bmm.JointBilateralFilter.forward,
+        bmm.median_filter2d,
+    )
+
+    def esw_f(self, inputs, search_range):
+        lvl[0] += 1
+        rec[f"bm_search{lvl[0]}"] = inputs
+        return esw(self, inputs, search_range)
+
+    def et_f(self, inputs, dtype):
+        import torch
+
+        if (
+            dtype == torch.uint8
+        ):  # per level: [hint image (target level only), template image]
+            rec.setdefault(f"_u8{lvl[0]}", []).append(inputs)
+        return et(self, inputs, dtype)
+
+    def cv_f(self, inputs):
+        r = cv(self, inputs)
+        rec[f"bm_vec{lvl[0]}"], rec[f"bm_hintmask{lvl[0]}"] = r[0], r[2]
+        return r
+
+    def med_f(x, *a, **k):
+        rec[f"bm_premed{lvl[0]}"] = x
+        y = med(x, *a, **k)
+        rec[f"bm_med{lvl[0]}"] = y
+        return y
+
+    def jbf_f(self, inputs):
+        y = jbf(self, inputs)
+        rec[f"bm_jbf{lvl[0]}"] = y
+        return y
+
+    bmm.ExtractSearchWindows.forward, bmm.ExtractTemplates.forward = esw_f, et_f
+    (
+        bmm.CalculateVector.forward,
+        bmm.JointBilateralFilter.forward,
+        bmm.median_filter2d,
+    ) = cv_f, jbf_f, med_f
+
+    def done():
+        bmm.ExtractSearchWindows.forward, bmm.ExtractTemplates.forward = esw, et
+        (
+            bmm.CalculateVector.forward,
+            bmm.JointBilateralFilter.forward,
+            bmm.median_filter2d,
+        ) = cv, jbf, med
+        for k in [k for k in rec if k.startswith("_u8")]:
+            u8 = rec.pop(k)
+            rec[f"bm_template{k[3:]}"] = u8[-1]
+            if len(u8) == 2:
+                rec[f"bm_hintimg{k[3:]}"] = u8[0]
+        return rec
+
+    return done
+
+
+def golden(n: int) -> None:
+    import importlib
+
+    import nfru_gym
+    import torch
+
+    torch.set_grad_enabled(False)
+    GOLD.mkdir(parents=True, exist_ok=True)
+    core = nfru_gym.build_core("qat")
+    gu = importlib.import_module("ng_model_gym.core.model.graphics_utils")
+    for i, (c, x, y) in enumerate(windows(n)):
+        x = {k: v.float() for k, v in x.items()}
+        if x["MotionMat"].dim() == 3:
+            x["MotionMat"] = x["MotionMat"].unsqueeze(0)
+        for k in ("ViewProj_m3", "ViewProj_m1", "ViewProj_p1"):
+            if x[k].dim() == 3:
+                x[k] = x[k].unsqueeze(1)
+        rgb_m1 = core.color_pipeline(x["rgb_linear_m1"], x, "m1")
+        rgb_p1 = core.color_pipeline(x["rgb_linear_p1"], x, "p1")
+        gt = core.color_pipeline(y.unsqueeze(0) if y.dim() == 3 else y, x, "t")
+        depth_m1, depth_p1 = x["depth_m1"], x["depth_p1"]
+        bm = _record_blockmatch()
+        flow_raw = core._resolve_flow(x, rgb_m1, rgb_p1, depth_m1)
+        bm_rec = bm()
+        mm = x["MotionMat"]
+        mv_p1 = gu.normalize_mvs(x["mv_p1_f30_m1"])
+        mv_m1 = gu.normalize_mvs(x["mv_m1_f30_m3"])
+        flow = gu.normalize_mvs(flow_raw)
+        mm3 = x["ViewProj_m3"][:, 0] @ torch.linalg.inv(x["ViewProj_m1"][:, 0])
+        dyn = core.previous_dynamic_mask(depth_m1, mv_m1, mm3)
+        ts = 0.5
+        mv_t, next_mask, holes_t, holes_tm1 = core.warp_mv(
+            depth_m1,
+            depth_p1,
+            mv_p1,
+            dyn,
+            mm[:, 1],
+            mm[:, 0],
+            ts,
+            1,
+            list(depth_m1.shape[2:]),
+        )
+        flow_t = core.warp_flow(depth_m1, flow, 1.0 - ts, 1, list(flow.shape[2:]))
+        seed = 12345 + c
+        net_in = core.preprocess(
+            flow_t_f30_xx=flow_t,
+            mv_t_f30_m1=mv_t,
+            rgb_m1=rgb_m1,
+            rgb_p1=rgb_p1,
+            depth_m1=depth_m1,
+            depth_p1=depth_p1,
+            depth_p1_warp_t=holes_t,
+            depth_p1_warp_p1=holes_tm1,
+            motion_mat_m1p1=mm[:, 1],
+            motion_mat_p1m1=mm[:, 0],
+            depth_params=x["DepthParams_p1"].reshape(1, 4, 1, 1),
+            timestep=ts,
+            random_seed=seed,
+        )
+        params = core.auto_encoder(net_in)
+        out = core.postprocess(
+            flow_t_f30_xx=flow_t,
+            mv_t_f30_m1=mv_t,
+            rgb_m1=rgb_m1,
+            rgb_p1=rgb_p1,
+            learnt_params=params,
+            timestep=ts,
+        )
+        d = dict(
+            rgb_m1=rgb_m1,
+            rgb_p1=rgb_p1,
+            gt=gt,
+            depth_m1=depth_m1,
+            depth_p1=depth_p1,
+            sy_m1_f30_p1=x["sy_m1_f30_p1"],
+            mv_p1_f30_m1=x["mv_p1_f30_m1"],
+            mv_m1_f30_m3=x["mv_m1_f30_m3"],
+            motion_mat=mm,
+            motion_mat_m3=mm3,
+            depth_params=x["DepthParams_p1"],
+            flow_raw=flow_raw,
+            flow=flow,
+            dyn=dyn,
+            mv_t=mv_t,
+            holes_t=holes_t,
+            holes_tm1=holes_tm1,
+            flow_t=flow_t,
+            net_in=net_in,
+            params=params,
+            out=out,
+            seed=torch.tensor(seed),
+            **bm_rec,
+        )
+        np.savez(
+            GOLD / f"w{i:03d}.npz",
+            **{k: v.detach().cpu().numpy() for k, v in d.items()},
+        )
+        mse = lambda a, b: float(((a.clamp(0, 1) - b.clamp(0, 1)) ** 2).mean())  # noqa: E731
+        psnr = lambda a, b: 10 * np.log10(1 / max(mse(a, b), 1e-12))  # noqa: E731
+        print(
+            f"golden w{i:03d} (frame {c}): rgb {tuple(rgb_m1.shape)} depth {tuple(depth_m1.shape)} flow"
+            f" {tuple(flow.shape)} net_in {tuple(net_in.shape)} | psnr vs GT {psnr(out, gt):.2f} dB"
+            f" (m1 {psnr(rgb_m1, gt):.2f}, blend {psnr((rgb_m1 + rgb_p1) / 2, gt):.2f})",
+            flush=True,
+        )
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["fetch", "golden"])
+    ap.add_argument("--windows", type=int, default=8)
+    a = ap.parse_args()
+    {"fetch": fetch, "golden": lambda: golden(a.windows)}[a.cmd]()
+
+
+if __name__ == "__main__":
+    main()
