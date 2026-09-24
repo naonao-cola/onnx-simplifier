@@ -250,11 +250,38 @@ def assign(
     groups = _Groups()
     passive_edges: set[tuple[int, str]] = set()
     fused_range: dict[str, str] = {}  # member tensor -> Relu output giving the range
+    int8_memo: dict[str, bool] = {}
+
+    def int8_only(t: str) -> bool:
+        """Every use of ``t`` ends, through passive ops, in a MatMul-like
+        symmetric input (and ``t`` is not a graph output)."""
+        if t not in int8_memo:
+            int8_memo[t] = False  # cycle guard
+            uses = [t not in graph_outputs] + [
+                t in _symmetric_inputs(c, consts)
+                or (
+                    c.op_type in PASSIVE_OPS
+                    and c.input[0] == t
+                    and all(int8_only(o) for o in c.output)
+                )
+                for c in consumers.get(t, [])
+            ]
+            int8_memo[t] = bool(consumers.get(t)) and all(uses)
+        return int8_memo[t]
+
     for n in g.node:
         if n.op_type not in PASSIVE_OPS or not n.input or n.input[0] in consts:
             continue
         x, y = n.input[0], n.output[0]
         if x not in ranges or y not in ranges:
+            continue
+        if int8_only(y) and not int8_only(x):
+            # A passive op whose output only feeds MatMuls while its input
+            # has other uses (a residual Add, the optimizer update, a graph
+            # output): Pulsar2 requantizes there. The output gets its own
+            # symmetric int8 parameters over its own range; it does not
+            # overlap its uint8 input (template builds with a side output,
+            # docs/axera-matmul-step-templates.md).
             continue
         groups.union(y, x)
         passive_edges.add((id(n), x))

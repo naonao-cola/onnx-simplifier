@@ -1113,16 +1113,27 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
                     "bias flatten fuses into its neighbour (reshape_emit.py, "
                     "Relu-neighbour pairs only)",
                 )
-            try:
-                rre.step_template(shape, out)
-            except ValueError:
+            forms = []
+            for form, find in (
+                ("Identity", rre.step_template_identity),
+                ("zero-point-0", rre.step_template_zp0),
+                ("Relu", rre.step_template),
+            ):
+                try:
+                    find(shape, out)
+                    forms.append(form)
+                except ValueError:
+                    pass
+            if not forms:
                 return ("refused", "non-fused Reshape: no validated step template")
             # reshape_record_emit.retarget_scale: scale lanes and zero point;
-            # a zero point of 0 compiles to a different program.
+            # a zero point of 0 compiles to a different program, and a nonzero
+            # one (a signed input) needs the Identity form: the Relu form clips
             return (
                 "conditional",
-                "Reshape step template retargeted to the calibration if its "
-                "zero point is nonzero",
+                f"Reshape step templates ({', '.join(forms)}): the Identity one "
+                "retargeted if the zero point is nonzero, the zero-point-0 one "
+                "if it is 0",
             )
         return ("refused", f"no template or edit for {op}")
     except ValueError as exc:
@@ -1228,6 +1239,9 @@ def _at_calibration_matmul(rec: Mapping, calib: Mapping) -> str:
             real[step_name] = (q["consumer_int8_scale"], 0.0)
         else:
             real[step_name] = (q["scale"], float(q["zero_point"]))
+        if "consumer_int8_scale" in q and name + mre.I8 in old:
+            # a uint8 tensor the MatMul requantizes: its int8 view
+            real[step_name + mre.I8] = (q["consumer_int8_scale"], 0.0)
     try:
         new = mre.step_node_scales(entry, old, real)
         mre.recalibrate(mre.load_model(entry["axmodel"]), old, new)
@@ -1293,8 +1307,18 @@ def plan_at_calibration(
                 f"misc_op_record_emit retarget of the fused chain {chain} "
                 f"(zero points x{zx},y{zy})"
             )
-        if op == "Reshape" and "bias flatten" not in detail:
+        if op in ("Reshape", "Squeeze") and "bias flatten" not in detail:
             zp = _u8_zp(calib, rec["inputs"][0])
+            if zp != 0:
+                # a nonzero zero point is a signed input: only the Identity
+                # form keeps it (a Reshape -> Relu template clips it)
+                try:
+                    rre.step_template_identity(rec["shapes"][0], attrs.get("out", []))
+                except ValueError as exc:
+                    raise _NotAtCalibration(
+                        f"signed input (zp {zp}) and no Reshape -> Identity "
+                        "template serves this shape"
+                    ) from exc
             if zp == 0:
                 try:
                     rre.step_template_zp0(rec["shapes"][0], attrs.get("out", []))
@@ -1304,7 +1328,9 @@ def plan_at_calibration(
                         "serves this shape"
                     ) from exc
                 return "covered", "reshape_record_emit zero-point-0 template"
-            return "covered", f"reshape_record_emit.retarget_scale (zp {zp})"
+            return "covered", (
+                f"reshape_record_emit.retarget_scale of the Identity template (zp {zp})"
+            )
     except _NotAtCalibration as exc:
         return "refused", f"at calibration: {exc}"
     return status, detail

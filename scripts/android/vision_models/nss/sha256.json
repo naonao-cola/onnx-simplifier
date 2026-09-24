@@ -1,0 +1,6 @@
+{
+ "nss_v1_0_1_high_fp32.pt": "988530ba6f250f9af3a58c7781f3649733b812b5d59ff4cb259b5cfbb7f03905",
+ "nss_v1_0_1_high_int8.pt": "bffe1d8221cc5e46b36ed3f3f4015906df5310264307f1dbbacdc15045c005cf",
+ "LICENSE_Arm_AI_Model_Community.pdf": "e34c816e4e032194c493fa0519ea604dccbd0b3a49906abe90b42409c9a2dc58",
+ "test_sample.safetensors": "75ba4530e52c292c61919e18150dfc0c316a69dcecc128511cf8c3e3959b4152"
+}

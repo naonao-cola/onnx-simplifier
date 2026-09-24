@@ -239,6 +239,34 @@ def test_codegen_vrmpy_gemv():
     hexagon_tools() is None,
     reason="needs the Hexagon toolchain's hexagon-sim (HEXAGON_TOOLS)",
 )
+def test_codegen_hmx_fp16_matmul_bit_exact():
+    """The HMX TensorCore (onnxsim/tinygrad#6, HMX=1): an fp16 matmul is bit-exact against the TC's rounding model both
+    as MOCKDSP's scalar reference (qemu) and as real HMX on hexagon-sim -mv69 --mhmx 1 (scripts/android/
+    tinygrad_hexagon_bridge/tinygrad_codegen/hmx)."""
+    env = dict(tinygrad_env())
+    env.update(
+        CC=clang() or "clang",
+        HEXAGON_TOOLS=str(hexagon_tools()),
+        HMX="1",
+        DEV="DSP",
+        MOCKDSP="1",
+        TC="1",
+        HVX_ARCH="v69",
+    )
+    hmx = CI_DIR.parent / "tinygrad_codegen" / "hmx"
+    out = _ok(
+        _run([sys.executable, hmx / "hmxsim.py", "64", "64", "64", "--ref"], env=env),
+        "hmxsim.py 64 64 64",
+    )
+    assert "hexagon-sim HMX 0/4096 bit mismatches" in out and "(PASS)" in out, out
+    assert "MOCKDSP scalar reference: 0 mismatches" in out, out
+
+
+@needs_tinygrad
+@pytest.mark.skipif(
+    hexagon_tools() is None,
+    reason="needs the Hexagon toolchain's hexagon-sim (HEXAGON_TOOLS)",
+)
 def test_codegen_hexsim_vectorized_add_beats_scalar():
     """hexagon-sim --timing cycles: the default (HVX) codegen vs NOOPT=1 (scalar). Measured ~50x on toolchain
     19.0.04; only a generous ratio is asserted so simulator versions can't make this flaky."""

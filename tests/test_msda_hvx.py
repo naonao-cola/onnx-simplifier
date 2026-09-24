@@ -113,15 +113,29 @@ def _cases(tmp_path: Path) -> list[str]:
     return out
 
 
+def _plain_env():
+    # The sanitizer CI job runs pytest with LD_PRELOAD=libasan/LSan; a host `cc` (and the
+    # checker it builds) inheriting that exits non-zero on LeakSanitizer's own reports.
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("LD_PRELOAD", "LSAN_OPTIONS", "ASAN_OPTIONS")
+    }
+
+
 def test_scalar_body_on_host(tmp_path):
     cc = shutil.which(os.environ.get("CC", "cc"))
     if cc is None:
         pytest.skip("no host C compiler")
     exe = tmp_path / "msda_host_check"
     subprocess.run(
-        [cc, "-O2", "-o", str(exe), str(CORE / "msda_host_check.c"), "-lm"], check=True
+        [cc, "-O2", "-o", str(exe), str(CORE / "msda_host_check.c"), "-lm"],
+        check=True,
+        env=_plain_env(),
     )
-    out = subprocess.run([str(exe), *_cases(tmp_path)], capture_output=True, text=True)
+    out = subprocess.run(
+        [str(exe), *_cases(tmp_path)], capture_output=True, text=True, env=_plain_env()
+    )
     assert out.returncode == 0 and out.stdout.rstrip().endswith("PASS"), (
         out.stdout + out.stderr
     )
