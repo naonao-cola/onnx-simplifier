@@ -1,0 +1,16 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+interface mcc_hmx_rpc : remote_handle64 {
+  // bit 0 turbo, bit 1 HMX power vote (required before any HMX op)
+  long perf_vote(in long flags, rout long rc);
+  // keep block `idx`'s packed weights (ref.py pack_block) resident in the DSP heap
+  long load_block(in long idx, in sequence<uint8> blob);
+  // run blocks 0..nblocks-1 on x (Q x 512 fp16 row-major) -> y; iters repeats (x restored each time).
+  // times: [0] us per iteration (the blocks only), [1..12] pcycles per phase (mcc_block.h MB_P_*, summed
+  // over blocks, last iteration, thread 0); codes: [0] ctx, [1] hvx lock (thread 0), [2] hmx lock, [3] vtcm
+  // bytes, [4] thread create, [5] hvx lock failures on helper threads
+  // hvx: mcc_block.h MB_V_* mask (which element-wise steps run on HVX instead of scalar C);
+  // nthr: threads (each an HVX context; thread 0 also drives HMX), 1..4
+  long run(in long q, in long nblocks, in long iters, in long hvx, in long nthr, in sequence<uint16> x, rout sequence<uint16> y,
+           rout sequence<uint64> times, rout sequence<long> codes);
+};
