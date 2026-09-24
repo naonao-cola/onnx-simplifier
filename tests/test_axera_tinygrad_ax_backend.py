@@ -236,6 +236,41 @@ def test_conv_weight_edit_1x1_downsample_matches_native_outside_block():
     assert np.array_equal(got[outside], want[outside])
 
 
+def test_conv_weight_edit_stem_routes_its_shape_specific_mcode_emitter():
+    key = axb.TemplateKey(
+        "Conv",
+        ((16, 3, 224, 224),),
+        (("pads", (3, 3, 3, 3)), ("strides", (2, 2)), ("w", (64, 3, 7, 7))),
+    )
+    stem = os.path.join(_FIX, "conv_learn_stem")
+    weights = np.load(os.path.join(stem, "holdout_weights.npz"))
+
+    def q(path, tensor):
+        with gzip.open(os.path.join(stem, path), "rt") as f:
+            doc = json.load(f)
+        for cfg in doc["tensor_configs"].values():
+            if tensor in cfg:
+                value = doc["values"][str(cfg[tensor]["hash"])]
+                return float(value["scale"][0]), float(value["zero_point"][0])
+        raise KeyError(tensor)
+
+    xs, xz = q("reference_quant.json.gz", "x")
+    ys, yz = q("holdout_quant.json.gz", "y")
+    model = axb.EditSet(
+        [axb.ConvWeightEdit(weights["w"], weights["b"], xs, xz, ys, yz)]
+    ).build(key)
+    native = _load_gz(os.path.join(stem, "holdout_native.axmodel.gz"))
+    got = np.frombuffer(_init(model, "npu_params"), np.uint8)
+    want = np.frombuffer(_init(native, "npu_params"), np.uint8)
+    assert np.array_equal(got[: weights["w"].size], want[: weights["w"].size])
+    block = slice(18432, 18432 + 512)
+    assert (
+        np.max(np.abs(got[block].view(np.float32) - want[block].view(np.float32)))
+        < 1e-3
+    )
+    assert len(_mcode(model)) == len(_mcode(native))
+
+
 def test_conv_weight_edit_refuses_wrong_weight_shape():
     key = axb.TemplateKey(
         "Conv",

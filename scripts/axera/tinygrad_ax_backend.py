@@ -76,9 +76,10 @@ archive/<sha>.tar.gz"``."""
 _FIXTURES = os.path.join(_HERE, "fixtures")
 
 # (x shape, w shape, strides, pads) -> template for the Conv weight edit.
-# Only the two shapes whose full npu_params pipeline was validated against a
-# native held-out build are listed (docs/axera-conv-weight-learn-stem.md, #1769;
-# docs/axera-conv-weight-learn-downsample.md, #1771).
+# Only shapes whose full npu_params pipeline was validated against a native
+# held-out build are listed.  The stem uses its own mcode offsets and therefore
+# has a dedicated emitter, even though its weight table is the same general
+# bit-permutation family as the other Conv templates.
 _CONV_TEMPLATES: dict[tuple, dict[str, Any]] = {
     ((16, 64, 56, 56), (64, 64, 3, 3), (1, 1), (1, 1, 1, 1)): {
         "dir": "conv_weight_learn",
@@ -94,6 +95,12 @@ _CONV_TEMPLATES: dict[tuple, dict[str, Any]] = {
         "kind": "contiguous",
         "block_at": 9216,
         "block_len": 2 * 4 * 128,
+    },
+    ((16, 3, 224, 224), (64, 3, 7, 7), (2, 2), (3, 3, 3, 3)): {
+        "dir": "conv_learn_stem",
+        "model": "reference.axmodel.gz",
+        "map": "stem_map.npz",
+        "kind": "stem",
     },
 }
 
@@ -722,19 +729,37 @@ class ConvWeightEdit:
             raise ValueError("bias must have Cout elements")
 
     def apply(self, key, entry, model):
-        import conv_bias_requant
         import conv_weight_learn
+        import step_recalibrate
 
         meta = entry.meta
         origin = np.load(os.path.join(_FIXTURES, meta["dir"], meta["map"]))["origin"]
         table_init = _initializer(model, "npu_params")
         ref = np.frombuffer(bytes(table_init.raw_data), np.uint8)
         args = (self.x_scale, self.x_zero, self.y_scale, self.y_zero)
+        if meta["kind"] == "stem":
+            # The stem has a different fixed-width mcode layout from the
+            # stage-1 and downsample Conv families.  Keep that knowledge in
+            # conv_weight_learn_stem instead of applying the generic offsets.
+            import conv_weight_learn_stem
+
+            table, mc = conv_weight_learn_stem.emit_stem_conv(
+                ref,
+                bytes(_mcode_initializer(model).raw_data),
+                origin,
+                self.w,
+                self.b,
+                *args,
+            )
+            table_init.raw_data = np.asarray(table, np.uint8).tobytes()
+            return step_recalibrate.with_mcode(model, mc)
         if meta["kind"] == "biased":
             table = conv_weight_learn.emit_biased(
                 ref, origin, self.w, self.b, *args, meta["block_at"]
             )
         else:
+            import conv_bias_requant
+
             table = conv_bias_requant.emit_conv_table(
                 ref,
                 origin,
